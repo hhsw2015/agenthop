@@ -13,6 +13,10 @@
 [![A2A](https://img.shields.io/badge/protocol-A2A-8A2BE2)](https://a2a-protocol.org/latest/specification/)
 [![Stars](https://img.shields.io/github/stars/sdyuyouth/agenthop)](https://github.com/sdyuyouth/agenthop/stargazers)
 
+宣传片，2 分 37 秒，有配乐（播放器默认静音）：
+
+https://github.com/user-attachments/assets/9930e6e6-a9ce-468c-81ab-b75b99318994
+
 ## 解决什么问题
 
 你在自己电脑上开着一个 agent，对方在他的电脑上开着另一个。两边都没有公网入口，想让它们交换点东西，只能靠人把上下文复制来复制去。
