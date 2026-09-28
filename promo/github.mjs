@@ -4,13 +4,14 @@
 // encoder would otherwise spend its bits redrawing noise. The file's name is shown above the player, and GitHub
 // drops whatever in it is not ASCII, hence the English one.
 //
-//   node promo/github.mjs    → promo/out/AgentHop.mp4
+//   node promo/github.mjs [--lang en]    → promo/out[/en]/AgentHop.mp4
 import { spawnSync } from "node:child_process";
 import { rmSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const OUT = path.join(path.dirname(fileURLToPath(import.meta.url)), "out");
+const EN = process.argv.join(" ").includes("--lang en");
+const OUT = path.join(path.dirname(fileURLToPath(import.meta.url)), "out", ...(EN ? ["en"] : []));
 const LIMIT = 10e6; // bytes: the stricter reading of "10 MB"
 const AUDIO_KBPS = 96;
 const run = (cmd, args) => {
@@ -19,7 +20,7 @@ const run = (cmd, args) => {
   return r.stdout;
 };
 
-const film = path.join(OUT, "agenthop-宣传片.mp4");
+const film = path.join(OUT, EN ? "agenthop-promo.mp4" : "agenthop-宣传片.mp4");
 const copy = path.join(OUT, "AgentHop.mp4");
 const seconds = Number(run("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", film]));
 // Aim at 92% of the limit: the average lands a little over what x264 is asked for, and the container adds some.

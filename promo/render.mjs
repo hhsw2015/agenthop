@@ -2,8 +2,9 @@
 //
 //   node promo/render.mjs --stills 3,10.5,24     PNGs of single frames, for checking the picture
 //   node promo/render.mjs [--fps 60] [--workers 4] [--from 0 --to 90]
-//   node promo/render.mjs --cover                the covers, 16:9 and 3:4
+//   node promo/render.mjs --cover                the covers, 16:9 and 3:4 (Chinese only)
 //   --palette <id>                               any palette from PALETTES in index.html
+//   --lang en                                    the English cut; everything goes to out/en
 //
 // Every frame is a pure function of time (the page exposes seek(t)), so frames can be rendered
 // in any order and split across several browsers, then joined without a seam.
@@ -14,10 +15,11 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const OUT = path.join(HERE, "out");
-const CHROME = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const args = process.argv.slice(2);
 const opt = (name, fallback) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : fallback; };
+const EN = opt("lang", "zh") === "en";
+const OUT = path.join(HERE, "out", ...(EN && !args.includes("--cover") ? ["en"] : []));
+const CHROME = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const FPS = Number(opt("fps", 60));
 const WORKERS = Number(opt("workers", 4));
 const PALETTE = opt("palette", "");
@@ -57,7 +59,7 @@ class Browser {
   async load(query = "", width = 1920, height = 1080) {
     await this.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
     await this.send("Page.enable");
-    await this.send("Page.navigate", { url: `${pathToFileURL(path.join(HERE, "index.html")).href}?render${PALETTE ? `&palette=${PALETTE}` : ""}${EXTRA}${query}` });
+    await this.send("Page.navigate", { url: `${pathToFileURL(path.join(HERE, "index.html")).href}?render${PALETTE ? `&palette=${PALETTE}` : ""}${EN ? "&lang=en" : ""}${EXTRA}${query}` });
     for (let i = 0; i < 200; i++) {
       try {
         if (await this.eval("window.__ready === true")) {

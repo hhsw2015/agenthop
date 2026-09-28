@@ -2,13 +2,13 @@
 // bar, and every sound effect placed from the cues the page exported (out/cues.json), so a click
 // lands on the frame where a character appears and a whoosh follows the packet across the screen.
 //
-//   node promo/music.mjs    → promo/out/music.wav (48 kHz, stereo, 16-bit)
+//   node promo/music.mjs [--lang en]    → promo/out[/en]/music.wav (48 kHz, stereo, 16-bit)
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const OUT = path.join(HERE, "out");
+const OUT = path.join(HERE, "out", ...(process.argv.join(" ").includes("--lang en") ? ["en"] : []));
 const { duration, cues } = JSON.parse(readFileSync(path.join(OUT, "cues.json"), "utf8"));
 const SR = 48000, DUR = duration, N = Math.round(SR * DUR);
 const BPM = 96, BEAT = 60 / BPM, BAR = BEAT * 4;
@@ -30,11 +30,10 @@ function svf() { let ic1 = 0, ic2 = 0; return (x, fc, q) => { const g = Math.tan
 function blep(t, dt) { if (t < dt) { t /= dt; return t + t - t * t - 1; } if (t > 1 - dt) { t = (t - 1) / dt; return t * t + t + t + 1; } return 0; }
 
 // ---------------------------------------------------------------------------------------------
-// Harmony: one chord per 2.5-second bar, 63 bars. The acts, in film time:
-//   the chat 0–7.5 · the relay speeding up 7.5–17.5 · the name 17.5–22.5 · scenes 22.5–77.5 (the
-//   line that opens them, three scenes of 15 s, the pairs 72.5–77.5) · how it works, step by step,
-//   and a relay of your own 77.5–117.5 · contacts 117.5–130 · nothing lost 130–137.5 · getting it
-//   137.5–147.5 · end 147.5–157.5
+// Harmony: one chord per 2.5-second bar, 55 bars. The acts, in film time:
+//   the chat 0–7.5 · the relay speeding up 7.5–17.5 · the name 17.5–22.5 · scenes 22.5–75 (the
+//   question that opens them, three scenes of 15 s, the pairs 70–75) · how it works, step by step,
+//   and a relay of your own 75–107.5 · contacts 107.5–120 · getting it 120–130 · end 130–137.5
 // ---------------------------------------------------------------------------------------------
 const CH = {
   Am7: { root: 45, notes: [57, 60, 64, 67] },
@@ -50,16 +49,15 @@ const BARS = [
   "Cmaj9", "Fmaj7", "Am7", // the chat
   "Am7", "Fmaj7", "Fmaj7", "Gsus4", // faster and faster, then four become two
   "Cmaj9", "Cmaj9", // the name
-  "Fmaj7", "G6", // simple things you say yourself; the rest, let them talk
+  "G6", // what if the agents just talked?
   ...SCENES, "Fmaj7", "Gsus4", // three scenes, and the pairs
-  "Fmaj7", "G6", "Em7", "Am7", "Fmaj7", "G6", "Em7", // how it works: a room, the code, hello, confirm
-  "Am7", "Fmaj7", "G6", // talking, receipts
-  "Em7", "Am7", // files, bye
-  "Fmaj7", "G6", "Em7", "Am7", // a relay of your own
+  "Fmaj7", "G6", "Em7", "Am7", "Fmaj7", "G6", // how it works: a room, the code, hello, confirm
+  "Em7", "Am7", "Fmaj7", // talking, files
+  "G6", "Em7", // bye
+  "Am7", "Fmaj7", // a relay of your own
   "Dm9", "Fmaj7", "G6", "Em7", "Am7", // contacts
-  "Fmaj7", "G6", "Em7", // nothing lost
   "Fmaj7", "G6", "Am7", "Gsus4", // getting it
-  "Cmaj9", "Cmaj9", "Fmaj7", "Cmaj9", // end
+  "Cmaj9", "Fmaj7", "Cmaj9", // end
 ];
 if (BARS.length * BAR < DUR - 0.01) throw new Error(`${BARS.length} bars do not cover ${DUR} s`);
 const chordAt = (t) => CH[BARS[clamp(Math.floor(t / BAR), 0, BARS.length - 1)]];
@@ -75,7 +73,7 @@ const inRange = (t, ranges) => ranges.some(([a, b]) => t >= a && t < b);
     if (last && last.name === BARS[b]) last.end = (b + 1) * BAR;
     else runs.push({ name: BARS[b], start: b * BAR, end: (b + 1) * BAR });
   }
-  const level = auto([[0, 0.024], [3.5, 0.028], [7.3, 0.022], [7.5, 0.02], [14.6, 0.025], [15.0, 0.03], [17.5, 0.037], [22.5, 0.03], [27.5, 0.026], [77.4, 0.026], [77.5, 0.027], [117.5, 0.034], [122.5, 0.027], [130, 0.025], [147.5, 0.037], [157.5, 0.037]]);
+  const level = auto([[0, 0.024], [3.5, 0.028], [7.3, 0.022], [7.5, 0.02], [14.6, 0.025], [15.0, 0.03], [17.5, 0.037], [22.5, 0.03], [25, 0.026], [74.9, 0.026], [75, 0.027], [107.5, 0.034], [112.5, 0.027], [120, 0.025], [130, 0.037], [137.5, 0.037]]);
   for (const run of runs) {
     const attack = run.start < 17.5 ? 1.2 : 0.35, release = 1.1;
     for (const note of CH[run.name].notes) {
@@ -95,7 +93,7 @@ const inRange = (t, ranges) => ranges.some(([a, b]) => t >= a && t < b);
       });
     }
   }
-  const cutoff = auto([[0, 900], [3.5, 1500], [7.0, 2200], [7.4, 1000], [7.5, 600], [14.6, 1100], [17.4, 2500], [17.5, 4000], [22.5, 2800], [77.0, 3000], [77.4, 2300], [117.5, 2000], [118.2, 1000], [122.5, 1800], [129.8, 3000], [130, 2600], [147.3, 3400], [147.5, 4200], [157.5, 1600]]);
+  const cutoff = auto([[0, 900], [3.5, 1500], [7.0, 2200], [7.4, 1000], [7.5, 600], [14.6, 1100], [17.4, 2500], [17.5, 4000], [22.5, 2800], [74.5, 3000], [74.9, 2300], [107.5, 2000], [108.2, 1000], [112.5, 1800], [119.8, 3000], [120, 2600], [129.8, 3400], [130, 4200], [137.5, 1600]]);
   const fl = svf(), fr = svf();
   for (let i = 0; i < N; i++) { const t = i / SR, c = cutoff(t) * (1 + 0.12 * Math.sin(t * 0.7)); pad[0][i] = fl(pad[0][i], c, 0.8).lp; pad[1][i] = fr(pad[1][i], c * 1.03, 0.8).lp; }
   for (let i = 0; i < N; i++) { send[0][i] += pad[0][i] * 0.35; send[1][i] += pad[1][i] * 0.35; }
@@ -133,26 +131,22 @@ function clap(t, amp = 0.2) {
 for (let b = 0; b < BARS.length; b++) {
   for (let s = 0; s < 16; s++) {
     const t = b * BAR + (s * BEAT) / 4, beat = s / 4;
-    const on8 = s % 2 === 0, off8 = s % 4 === 2, quarter = s % 4 === 0;
+    const on8 = s % 2 === 0, off8 = s % 4 === 2;
     // You in the middle: a clock that speeds up with the copying, then silence under the headline.
     if (t >= 8.75 && t < 12.5 && on8) hat(t, 0.028 + 0.012 * (s % 4 === 0), s % 4 === 0 ? -0.2 : 0.2);
     if (t >= 12.5 && t < 14.7) hat(t, 0.03 + 0.02 * ((t - 12.5) / 2.2), s % 2 ? 0.25 : -0.25);
     // The scenes: lighter and brighter than the machinery that follows.
-    if (inRange(t, [[27.5, 77.2]])) {
+    if (inRange(t, [[25, 74.7]])) {
       if (beat === 0 || beat === 2) kick(t, 0.3);
       if (beat === 1 || beat === 3) clap(t, 0.12);
       if (off8) hat(t, 0.04, 0.15);
       else if (!on8) hat(t, 0.014, s % 4 === 1 ? -0.3 : 0.3);
     }
     // Grooves.
-    const grooveA = inRange(t, [[80, 117.5], [122.5, 130], [137.5, 145]]);
-    const grooveB = inRange(t, [[130, 137.5]]);
+    const grooveA = inRange(t, [[77.5, 107.5], [112.5, 127.5]]);
     if (grooveA && (beat === 0 || beat === 2)) kick(t, 0.33);
     if (grooveA && off8) hat(t, 0.045, 0.15);
-    if (grooveA && t >= 137.5 && (beat === 1 || beat === 3)) clap(t, 0.16);
-    if (grooveB && quarter) kick(t, 0.38);
-    if (grooveB && (beat === 1 || beat === 3)) clap(t, 0.2);
-    if (grooveB) hat(t, s % 4 === 2 ? 0.05 : 0.026, s % 2 ? 0.25 : -0.25);
+    if (grooveA && t >= 120 && (beat === 1 || beat === 3)) clap(t, 0.16);
   }
 }
 // Sidechain: the pad and the bass breathe with the kick.
@@ -190,9 +184,9 @@ function bassNote(t, len, midi, amp) {
 }
 for (let b = 0; b < BARS.length; b++) {
   const t0 = b * BAR, root = CH[BARS[b]].root - 12;
-  if (inRange(t0, [[27.5, 77.5], [77.5, 117.5], [122.5, 145]])) {
+  if (inRange(t0, [[25, 107.5], [112.5, 127.5]])) {
     for (const [beat, len] of [[0, 0.7], [1.5, 0.4], [2, 0.7], [3.5, 0.4]]) bassNote(t0 + beat * BEAT, len * BEAT, root, 0.115);
-  } else if (inRange(t0, [[17.5, 27.5], [147.5, 157.5], [117.5, 122.5]])) {
+  } else if (inRange(t0, [[17.5, 25], [130, 137.5], [107.5, 112.5]])) {
     bassNote(t0, BAR * 0.95, root, 0.06);
   } else if (inRange(t0, [[0, 7.5]])) {
     bassNote(t0, BAR * 0.95, root, 0.045);
@@ -214,8 +208,8 @@ const ORDER = [0, 1, 2, 3, 2, 1, 2, 3];
 for (let b = 0; b < BARS.length; b++) {
   const t0 = b * BAR, notes = CH[BARS[b]].notes;
   // In the scenes the pluck steps back a little: the bubbles are the melody there.
-  const dense = inRange(t0, [[82.5, 117.5], [120, 145], [27.5, 77.5]]), soft = inRange(t0, [[27.5, 77.5]]) ? 0.75 : 1;
-  const shimmer = inRange(t0, [[0, 7.5], [17.5, 22.5], [147.5, 157.5]]);
+  const dense = inRange(t0, [[80, 107.5], [110, 127.5], [25, 75]]), soft = inRange(t0, [[25, 75]]) ? 0.75 : 1;
+  const shimmer = inRange(t0, [[0, 7.5], [17.5, 22.5], [130, 137.5]]);
   for (let s = 0; s < 16; s++) {
     const t = t0 + (s * BEAT) / 4;
     if (dense) pluck(t, notes[ORDER[s % 8]] + 12, (s % 4 === 0 ? 0.046 : 0.03) * soft, s % 2 ? 0.35 : -0.35);
