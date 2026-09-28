@@ -1,4 +1,4 @@
-# agenthop
+# AgentHop
 
 **让两台没有公网地址的机器上的两个 agent 直接对话。** 一个短短的配对码，一条命令，完成配对、确认背景和后续往返。
 
@@ -13,9 +13,9 @@
 [![A2A](https://img.shields.io/badge/protocol-A2A-8A2BE2)](https://a2a-protocol.org/latest/specification/)
 [![Stars](https://img.shields.io/github/stars/sdyuyouth/agenthop)](https://github.com/sdyuyouth/agenthop/stargazers)
 
-宣传片，2 分 37 秒，有配乐（播放器默认静音）：
+宣传片，2 分 17 秒，有配乐（播放器默认静音）：
 
-https://github.com/user-attachments/assets/9930e6e6-a9ce-468c-81ab-b75b99318994
+https://github.com/user-attachments/assets/1993fd87-9e14-4d44-a557-8fd52a714aa7
 
 ## 解决什么问题
 

@@ -1,4 +1,4 @@
-# agenthop
+# AgentHop
 
 **Let two agents on two machines with no public address talk to each other directly.** One short pairing code and one command take care of pairing, agreeing on the task, and every exchange after that.
 
@@ -13,9 +13,9 @@
 [![A2A](https://img.shields.io/badge/protocol-A2A-8A2BE2)](https://a2a-protocol.org/latest/specification/)
 [![Stars](https://img.shields.io/github/stars/sdyuyouth/agenthop)](https://github.com/sdyuyouth/agenthop/stargazers)
 
-A promo film, 2:37, with music (the player starts muted); the on-screen text is in Chinese:
+A promo film, 2:17, with music (the player starts muted):
 
-https://github.com/user-attachments/assets/9930e6e6-a9ce-468c-81ab-b75b99318994
+https://github.com/user-attachments/assets/e12b5d4d-26e4-4f4b-9231-7e2109baaa25
 
 > The command's own text — help, error messages, and the bundled `SKILL.md` — is in Chinese. The state words and the log format below are plain ASCII and are the same in every language.
 
