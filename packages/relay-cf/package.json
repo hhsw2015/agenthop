@@ -1,6 +1,7 @@
 {
   "name": "@agenthop/relay-cf",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "test": "vitest run --config vitest.config.ts && vitest run --config vitest.live.config.ts",
