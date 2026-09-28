@@ -2,7 +2,7 @@
 
 每个版本的完整说明在 [Releases](https://github.com/sdyuyouth/agenthop/releases)。这里只留下变了什么。
 
-## 未发布
+## v0.6.0
 
 - **默认说英文，可选中文**。帮助、提示、错误、MCP 的工具说明和返回的话、装进 agent 的技能，现在默认都是英文。`agenthop install --lang zh` 换成中文并记在 `~/.agenthop/install.json` 里（`--lang en` 换回来），之后 `agenthop update` 写回的技能也是中文；只想这一次用中文，设 `AGENTHOP_LANG=zh`。状态词和日志格式不变，对话两边不必用同一种语言。**从旧版本升级上来、想继续用中文的，跑一次 `agenthop install --lang zh`**；还没选过语言时，`install` 和 `update` 的输出里会有一行中英双语的提示。
 - 发回给对方的拒绝理由（座位被占、缺密钥、不是被邀请的人……）两种语言一起发，旧版本照样认得出是哪一种。
