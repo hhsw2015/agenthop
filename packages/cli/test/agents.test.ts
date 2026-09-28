@@ -27,7 +27,7 @@ describe("plugging into agents as an MCP server", () => {
     const file = path.join(dir, ".cursor", "mcp.json");
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, JSON.stringify({ mcpServers: { other: { command: "x" } }, theme: "dark" }));
-    expect(registerMcp(["cursor"], BIN, dir)[0]).toContain("已写入");
+    expect(registerMcp(["cursor"], BIN, dir)[0]).toContain("written to");
     const config = JSON.parse(await readFile(file, "utf8"));
     expect(config.theme).toBe("dark");
     expect(config.mcpServers.other).toEqual({ command: "x" });
@@ -48,8 +48,8 @@ describe("plugging into agents as an MCP server", () => {
     const original = '{ // a comment\n  "theme": "dark" }';
     await writeFile(file, original);
     const [result] = registerMcp(["gemini"], BIN, dir);
-    expect(result).toContain("没有写成");
-    expect(result).toContain("手动做");
+    expect(result).toContain("not written");
+    expect(result).toContain("Do it by hand");
     expect(await readFile(file, "utf8")).toBe(original);
   });
 
@@ -59,7 +59,7 @@ describe("plugging into agents as an MCP server", () => {
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, 'model = "o4"\n');
     registerMcp(["codex"], BIN, dir);
-    expect(registerMcp(["codex"], BIN, dir)[0]).toContain("已经有 agenthop 了");
+    expect(registerMcp(["codex"], BIN, dir)[0]).toContain("already has agenthop");
     const text = await readFile(file, "utf8");
     expect(text.startsWith('model = "o4"\n')).toBe(true);
     expect(text.match(/\[mcp_servers\.agenthop\]/g)).toHaveLength(1);
@@ -68,12 +68,12 @@ describe("plugging into agents as an MCP server", () => {
 
   it("names an agent it does not know instead of guessing", async () => {
     const dir = await home();
-    expect(registerMcp(["vscode"], BIN, dir)[0]).toContain("不认识的 agent");
+    expect(registerMcp(["vscode"], BIN, dir)[0]).toContain("Unknown agent");
     expect(existsSync(path.join(dir, ".vscode"))).toBe(false);
   });
 
   it("takes --mcp more than once", () => {
     expect(parseArgs(["install", "--mcp", "grok", "--mcp", "cursor"]).flags.mcpAgents).toEqual(["grok", "cursor"]);
-    expect(() => parseArgs(["install", "--mcp"])).toThrow(/--mcp 后面要跟/);
+    expect(() => parseArgs(["install", "--mcp"])).toThrow(/--mcp takes/);
   });
 });

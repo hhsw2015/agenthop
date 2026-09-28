@@ -25,6 +25,6 @@ describe("a refused line in the log", () => {
     expect(brief("多\n行\n文本")).toBe("多 行 文本");
     const flood = brief("x".repeat(5000));
     expect(flood.length).toBeLessThan(120);
-    expect(flood).toContain("共 5000 字");
+    expect(flood).toContain("5000 characters in all");
   });
 });

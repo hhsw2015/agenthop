@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { connect, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -28,11 +28,11 @@ afterEach(async () => {
  * per line on standard input and output. Every line it writes is kept, so a test can check that
  * nothing but the protocol ever reached standard output.
  */
-function server(relay: string, home: string) {
+function server(relay: string, home: string, env: Record<string, string> = {}) {
   // AGENTHOP_BIN points this at a compiled binary, which is what people actually run.
   const binary = process.env.AGENTHOP_BIN;
   const child = spawn(binary ?? process.execPath, [...(binary ? [] : [launcher]), "mcp", "--relay", relay], {
-    env: { ...process.env, HOME: home, USERPROFILE: home },
+    env: { ...process.env, HOME: home, USERPROFILE: home, ...env },
     detached: true,
   });
   started.push(child);
@@ -101,9 +101,9 @@ describe("agenthop mcp as a process", () => {
       expect(await joiner.call("agenthop_wait", { timeout_seconds: 15 })).toContain("第一行\n第二行");
       await joiner.call("agenthop_working", { text: "在看" });
       await writeFile(path.join(dir, "a.txt"), "附件内容");
-      expect(await joiner.call("agenthop_send_file", { path: path.join(dir, "a.txt") })).toContain("已送达");
-      expect(await creator.call("agenthop_wait", { timeout_seconds: 15 })).toContain("对方 files");
-      expect(await creator.call("agenthop_bye", { text: "再见" })).toContain("对话结束了");
+      expect(await joiner.call("agenthop_send_file", { path: path.join(dir, "a.txt") })).toContain("Delivered");
+      expect(await creator.call("agenthop_wait", { timeout_seconds: 15 })).toContain("peer files");
+      expect(await creator.call("agenthop_bye", { text: "再见" })).toContain("Conversation over");
       await joiner.call("agenthop_wait", { timeout_seconds: 15 });
 
       // The protocol and nothing else. One log line here would have broken the harness.
@@ -120,7 +120,7 @@ describe("agenthop mcp as a process", () => {
         }
       }
       // And the log still went where it always goes.
-      const log = created.match(/日志：(\S+?\.create\.log)/)?.[1];
+      const log = created.match(/Log: (\S+?\.create\.log)/)?.[1];
       expect(log && existsSync(log), created).toBe(true);
     },
     120_000,
@@ -145,11 +145,11 @@ describe("agenthop mcp as a process", () => {
       await bob.call("agenthop_save_contact", { name: "alice" });
       await alice.call("agenthop_bye");
       await bob.call("agenthop_wait", { timeout_seconds: 15 });
-      for (let i = 0; i < 100 && !(await bob.call("agenthop_status")).includes("收件地址：在线"); i++) await new Promise((resolve) => setTimeout(resolve, 100));
+      for (let i = 0; i < 100 && !(await bob.call("agenthop_status")).includes("Inbox: online"); i++) await new Promise((resolve) => setTimeout(resolve, 100));
 
-      expect(await alice.call("agenthop_invite", { name: "bob", background: "按名字找你" })).toContain("邀请已经送到 bob");
-      expect(await bob.call("agenthop_wait", { timeout_seconds: 15 })).toContain("alice 邀请你对话");
-      expect(await bob.call("agenthop_accept", { from: "alice" })).toContain("对方身份：alice（联系人");
+      expect(await alice.call("agenthop_invite", { name: "bob", background: "按名字找你" })).toContain("Invitation delivered to bob");
+      expect(await bob.call("agenthop_wait", { timeout_seconds: 15 })).toContain("alice invites you to talk");
+      expect(await bob.call("agenthop_accept", { from: "alice" })).toContain("Their identity: alice (contact");
       await bob.call("agenthop_say", { text: "来了" });
       expect(await alice.call("agenthop_wait", { timeout_seconds: 15 })).toContain("来了");
       await alice.call("agenthop_bye");
@@ -221,5 +221,25 @@ describe("agenthop mcp as a process", () => {
       proxy.close();
     },
     120_000,
+  );
+
+  it(
+    "speaks the language install chose for good",
+    async () => {
+      const relay = await startRelay();
+      relays.push(relay);
+      const home = await mkdtemp(path.join(tmpdir(), "agenthop-mcp-stdio-"));
+      await mkdir(path.join(home, ".agenthop"), { recursive: true });
+      await writeFile(path.join(home, ".agenthop", "install.json"), JSON.stringify({ skillDirs: [], lang: "zh" }));
+      // The tests pin English through the environment; this process has only install.json to go on.
+      const chosen = server(relay.url, home, { AGENTHOP_LANG: "" });
+      await chosen.start();
+      expect(await chosen.call("agenthop_status")).toContain("现在没有对话");
+      // And the environment still wins, for one process.
+      const english = server(relay.url, home, { AGENTHOP_LANG: "en" });
+      await english.start();
+      expect(await english.call("agenthop_status")).toContain("No conversation right now");
+    },
+    60_000,
   );
 });

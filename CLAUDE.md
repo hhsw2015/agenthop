@@ -53,7 +53,7 @@ tunnel ─┬─ relay-node（自建中继，ws + node:http）
 - **工具参数是字，不是命令**：`agenthop_say("/bye")` 会被拒并指向 `agenthop_bye`，不会意外结束对话。
 - `wait` 只在轮到你时返回（`TURN`：hello / confirm / say / files / bye），其余动静（对方的 working、这边的 throttled 等）随结果一起给出；自己刚做的事（say、working、files）不回显，工具调用本身已经报过了。
 - 参数分类（反引号、年份开头那些）在 MCP 模式下整类不存在：创建和加入是两个工具。`agenthop_join` 仍然过一遍 `classifyInput`，因为 agent 照样会包反引号。
-- **装着旧技能的 agent 会绕过 MCP**。实测 grok 同时有 MCP 工具和 v0.4 的 SKILL.md 时，照技能走了命令行 + `tail | grep`。所以 SKILL.md 开头第一节就是"先看有没有 agenthop 工具"，改技能时别把它挪下去。
+- **装着旧技能的 agent 会绕过 MCP**。实测 grok 同时有 MCP 工具和 v0.4 的 SKILL.md 时，照技能走了命令行 + `tail | grep`。所以两份技能开头第一节都是"先看有没有 agenthop 工具"，改技能时别把它挪下去。
 - **联系人和邀请**（`identity.ts`、`invite.ts`、`inbox.ts`）。身份是每个家目录一对 X25519 密钥；加入方的 `connect` 正文带自己的公钥，创建方**只对带了公钥的加入方**在 hello 之前回一句 `[[agenthop:identity]]`——旧版本两边都一个字不多收。收件地址是由公钥派生的普通房间地址，中继不用改；它的 host 令牌由私钥派生（`startHost` 的 `token`），否则 MCP server 一重启，旧令牌的哈希还挂在中继上，要等房间过期才拿得回来；它不对外提供队列（`serveQueue: false`）。邀请是 Noise IK 的第一条消息的形状，发件人的公钥也封在里面。`accept` 解开并核对（联系人、十分钟、见过的 id），`onEvent` 再解一次把它交给 MCP——`open` 是纯函数，解两次没关系。邀请对话里 `expectPeer` 让两边再核对一次对方是不是邀请里的那个人。MCP 只在有联系人时挂收件地址。
 - **每个 WebSocket 都要一直挂着 `error` 监听**。编译出的 Bun 程序在中继突然消失时会在 socket 上多抛一次错误；没人听，进程就退出了——v0.5.0 发布的二进制就是这样，Node 下的测试一次都没碰到过。重连靠的是随后的 `close`。`mcp-stdio.test.ts` 里"让中继消失几秒"那个用例要带 `AGENTHOP_BIN` 跑一次才算数。
 - **告别之后房间要留到对方读到为止**（`host.handedOver()`），不是固定几秒：经过真实中继，加入方光发出 bye 就要一秒多。
@@ -108,13 +108,14 @@ tunnel ─┬─ relay-node（自建中继，ws + node:http）
 
 ## 需要记住的约定
 
-- **SKILL.md 是生成源**：`skill/SKILL.md` 由 `scripts/build-release.mjs` 转成 `packages/cli/src/skill-text.ts`（被 `agenthop install` 写盘）。改技能文案后要跑一次 build，否则二进制里还是旧文本。README、`bin.ts` 的 `printHelp`、`skill/SKILL.md` 三处说法必须一致，**以 SKILL.md 为准**。`README.en.md` 是 `README.md` 的英文版，**逐节对应**：改一个就改另一个，状态表两边的行必须一样多。
+- **技能有两份，都是生成源**：`skill/SKILL.md`（英文）和 `skill/SKILL.zh-CN.md`（中文）由 `scripts/build-release.mjs` 转成 `packages/cli/src/skill-text.ts` 的 `skillMarkdown` / `skillMarkdownZh`（被 `agenthop install` 按当前语言写盘）。改技能文案后要重新生成（只要这一个文件：`node scripts/build-release.mjs --skill-text`），否则二进制里还是旧文本。README、`bin.ts` 的 `printHelp`、技能三处说法必须一致，**以技能为准**，而且每处都有中英两份（帮助是 `helpEn` / `helpZh`）。`README.md` 是英文、`README.zh-CN.md` 是中文，**逐节对应**：改一个就改另一个，状态表两边的行必须一样多。`README.en.md` 只剩一个指路的存根，因为外面已经有链接指着它。
+- **默认英文，可选中文**（`lang.ts`）。语言按 `AGENTHOP_LANG` → `~/.agenthop/install.json` 的 `lang`（`agenthop install --lang zh|en` 写进去）→ 英文 的顺序决定。每句面向人和 agent 的话写成 `t(英文, 中文)`，**在用到的地方调用**——存进模块级常量就会定格在模块加载那一刻的语言（MCP 的 `instructions` 和各种提示因此都是函数）。只换词，不换结构：状态词、日志格式、wire 都不变，两边可以各说各的语言。**发回给对方的拒绝理由两种语言一起发**（`both(英文, 中文)`，`session.ts` 的 `Reason` 是一对）：v0.5 及更早的加入方靠在理由里找到原来那句中文来区分"座位被占"和"码打错了"，`edges.test.ts` 钉着那句原文，改中文那一半之前先想清楚；新版本收到后用 `ours()` 只显示自己这一半。测试在 `vitest.config.ts` 里把 `AGENTHOP_LANG` 钉成 `en`，否则一台选了中文的机器会让一半断言失败；要测中文就 `setLang("zh")`，`afterEach` 里改回来。
 - **文案写正面规则，不要堆禁令**。真正的要求只有两条：一个进程从头跑到尾，整个过程用户看得见。不要再去点名某个具体错法（某某命令、某某文件名）——那是在描述一次事故，不是在描述规则。老的 flag 和命令在 `args.ts` 的 `RETIRED_FLAGS` / `RETIRED_COMMANDS` 里给迁移提示，这是唯一该出现旧名字的地方。
 - **版本号在 `packages/cli/src/version.ts`**，`agenthop update` 拿它和中继 `/latest` 比较。发版要改它。
 - **两个上限不要再对不上**：`packages/agent` 的 `MAX_ATTACHMENT_BYTES` 是 512 KiB，但 express 的 JSON body 默认只有 100 KiB，于是 96 KiB 的附件就会撞上一个 HTML 413。`host.ts` 现在先挂 `express.json({ limit: "2mb" })`（body-parser 见到 `req._body` 就不会再解析一次），512 KiB 才真的能过。改任一处都要把另一处一起看。
 - **中继对同一个房间的写入限速**在 `tunnel` 的 `PostCounter`（60/分钟），两个中继共用；**读取不计**，因为加入方每秒轮询一次。
 - **更新要校验**：`scripts/build-release.mjs` 生成 `dist/SHA256SUMS`，它是 release 的第六个资产，也在 Worker 的 `RELEASE_FILES` 白名单里（漏了白名单，取不到校验和的用户就更新不了）。`update` 先拿校验和再下程序（流式写盘、边写边算 sha256，不把 90 MiB 读进内存），对不上就丢掉不替换。**校验和优先从 GitHub 取、程序从中继取**，这样单独一方换不掉你的程序；GitHub 取不到才退回中继那份并说明。`AGENTHOP_RELEASES_BASE` 可以改校验和来源（测试在用）。
-- **技能跟着程序一起更新**：`install --skill-dir` 把目录记到 `~/.agenthop/install.json`，`update` 换完程序后再跑一次**新程序**的 `install --skill-only` 把新 SKILL.md 写回去——技能文本编译在二进制里，旧进程手里只有旧文本。写不成时打印手动命令，不要静默留一个过期的技能文件。
+- **技能跟着程序一起更新**：`install --skill-dir` 把目录记到 `~/.agenthop/install.json`，`update` 换完程序后再跑一次**新程序**的 `install --skill-only` 把新 SKILL.md 写回去（用 install.json 里记着的语言）——技能文本编译在二进制里，旧进程手里只有旧文本。写不成时打印手动命令，不要静默留一个过期的技能文件。
 - **不要把程序复制到它自己身上**。`install` 从已安装位置运行时 source 和 dest 是同一个文件，copyFileSync 会把它删掉；路径字符串比较不够，家目录经过符号链接时同一个文件有两种写法。用 `isSameFile`（inode+dev），复制走 `placeCommand`（先写 `.new` 再改名）。这个 bug 在 v0.2.0/v0.2.1 上真的删过用户的命令。
 - **默认中继 `https://agenthop.imatrix.tech` 写在 `host.ts: DEFAULT_RELAY`**；换中继是运行时的事（`--relay` / `AGENTHOP_RELAY`），不要为了改默认地址发版。
 - Worker 在鉴权之前还兼职发布分发：`/latest`（读 GitHub releases/latest 的重定向 Location 取 tag，因为 Worker 里调 GitHub API 失败过）和 `/download/<asset>`，白名单在 `RELEASE_FILES`。
@@ -130,4 +131,4 @@ tunnel ─┬─ relay-node（自建中继，ws + node:http）
 - **中继能读的队列不许带出解封后的东西**：`host.ts: overTheRelay` 只让"创建方发出的文件"以 `sealed` 的名字和封好的字节出现在 `/agenthop/queue` 里。加入方发来的文件，其真实名字和创建方本机的收件路径是解封**之后**才写进房间日志的，原样吐出去等于把名字和路径交给任何拿到房间地址的人。本机的 control server 不受影响，它要完整信息。
 - **一句说要发文件、却没带文件的 `file` 消息，要写 `peer refused`**。没有文件就不走 `noteFiles`，而分发里又没有 `file` 分支——它曾经就这样一声不响地消失过。
 - **`outbox.flush` 的 `send` 直接传，不要包成 `(wire) => send(wire)`**。第二个参数是文件字节，包一层就丢了——加入方发的文件真的因此从来没到过，而日志写着 `local files` 以为送到了。
-- 注释和 commit message 用英文，README / SKILL.md / CLI 帮助文本用中文（`README.en.md` 除外）。
+- 注释和 commit message 用英文。README、技能、CLI 说的话都是中英两份，默认英文。

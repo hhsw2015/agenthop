@@ -58,8 +58,8 @@ describe("identity inside a conversation", () => {
     const joinerKey = loadIdentity(conversation.joinerHome).publicKey;
     const creatorLog = await conversation.log("creator");
     const joinerLog = await conversation.log("joiner");
-    expect(creatorLog).toContain(`peer identity 不在联系人里，指纹 ${fingerprint(joinerKey)}`);
-    expect(joinerLog).toContain(`peer identity 不在联系人里，指纹 ${fingerprint(creatorKey)}`);
+    expect(creatorLog).toContain(`peer identity not a contact, fingerprint ${fingerprint(joinerKey)}`);
+    expect(joinerLog).toContain(`peer identity not a contact, fingerprint ${fingerprint(creatorKey)}`);
     expect(joinerLog.indexOf("peer identity")).toBeLessThan(joinerLog.indexOf("peer hello"));
     expect(creatorLog).not.toContain("peer other");
     expect(joinerLog).not.toContain("peer other");
@@ -74,7 +74,7 @@ describe("identity inside a conversation", () => {
     saveContact(path.join(base, "creator"), "bob", joinerKey);
     const stop = new AbortController();
     const conversation = await pair(url, base, { creator: { signal: stop.signal }, joiner: { signal: stop.signal } });
-    expect(await conversation.log("creator")).toContain(`peer identity bob（联系人，指纹 ${fingerprint(joinerKey)}）`);
+    expect(await conversation.log("creator")).toContain(`peer identity bob (contact, fingerprint ${fingerprint(joinerKey)})`);
     stop.abort();
     await Promise.allSettled([conversation.creator, conversation.joiner]);
   });
@@ -112,9 +112,9 @@ describe("identity inside a conversation", () => {
     const code = await waitForText(creatorHome, "waiting");
 
     // Someone who got hold of the code, but is not the one it was meant for.
-    await expect(runSession({ code, lines: lineQueue(), relay: url, home: intruderHome, signal: stop.signal })).rejects.toThrow(/不是被邀请的那个人/);
+    await expect(runSession({ code, lines: lineQueue(), relay: url, home: intruderHome, signal: stop.signal })).rejects.toThrow(/not the one invited/);
     const creatorLog = () => readFile(sessionPath(creatorHome, addressOf(code), "create"), "utf8");
-    expect(await creatorLog()).toContain("peer refused 这个房间是为邀请开的");
+    expect(await creatorLog()).toContain("peer refused This room was opened for an invitation");
 
     // The seat is still free for the right one.
     const joinerLines = lineQueue();
@@ -137,7 +137,7 @@ describe("identity inside a conversation", () => {
     const code = await waitForText(creatorHome, "waiting");
     await runSession({ code, lines: lineQueue(), relay: url, home: joinerHome, expectPeer: expected });
     const joinerLog = await readFile(sessionPath(joinerHome, addressOf(code), "join"), "utf8");
-    expect(joinerLog).toContain("peer refused 开这个房间的不是发邀请的那个人");
+    expect(joinerLog).toContain("peer refused Whoever opened this room is not the one who sent the invitation");
     expect(joinerLog).not.toContain("peer hello");
     stop.abort();
     await creator;
@@ -169,7 +169,7 @@ describe("inbox", () => {
     const { alice, bob, mallory } = await people();
     const received: Received[] = [];
     const inbox = open(url, bob, received);
-    await until(() => inbox.state() === "在线");
+    await until(() => inbox.state() === "online");
 
     await deliverInvitation({ sender: alice.identity, to: { name: "bob", publicKey: bob.identity.publicKey, added: "" }, invitation: invitation("one"), relay: url });
     await until(() => received.length === 1);
@@ -178,15 +178,15 @@ describe("inbox", () => {
     // Mallory knows bob's key, but bob never saved mallory.
     await expect(
       deliverInvitation({ sender: mallory.identity, to: { name: "bob", publicKey: bob.identity.publicKey, added: "" }, invitation: invitation("two"), relay: url }),
-    ).rejects.toThrow(/联系人里没有你/);
+    ).rejects.toThrow(/not among their contacts/);
 
     // The relay handing the same invitation over twice, and one that has gone stale.
     const sealed = sealInvitation(alice.identity, bob.identity.publicKey, invitation("three"));
     await sendMessage({ code: inboxAddress(bob.identity.publicKey), text: sealed, relay: url });
-    await expect(sendMessage({ code: inboxAddress(bob.identity.publicKey), text: sealed, relay: url })).rejects.toThrow(/已经收过/);
+    await expect(sendMessage({ code: inboxAddress(bob.identity.publicKey), text: sealed, relay: url })).rejects.toThrow(/already received/);
     await expect(
       deliverInvitation({ sender: alice.identity, to: { name: "bob", publicKey: bob.identity.publicKey, added: "" }, invitation: invitation("four", Date.now() - 11 * 60_000), relay: url }),
-    ).rejects.toThrow(/过期/);
+    ).rejects.toThrow(/has expired/);
     await delay(200);
     expect(received.map((item) => item.id)).toEqual(["one", "three"]);
 
@@ -200,19 +200,19 @@ describe("inbox", () => {
     const { alice, bob } = await people();
     await expect(
       deliverInvitation({ sender: alice.identity, to: { name: "bob", publicKey: bob.identity.publicKey, added: "" }, invitation: invitation("x"), relay: url }),
-    ).rejects.toThrow(/bob 现在不在线/);
+    ).rejects.toThrow(/bob is not online/);
   });
 
   it("takes its address straight back after a restart", async () => {
     const url = await relay();
     const { alice, bob } = await people();
     const first = open(url, bob, []);
-    await until(() => first.state() === "在线");
+    await until(() => first.state() === "online");
     await first.close();
     const received: Received[] = [];
     const second = open(url, bob, received);
     // A random token would be turned away here until the relay forgot the first one.
-    await until(() => second.state() === "在线", 5_000);
+    await until(() => second.state() === "online", 5_000);
     await deliverInvitation({ sender: alice.identity, to: { name: "bob", publicKey: bob.identity.publicKey, added: "" }, invitation: invitation("again"), relay: url });
     await until(() => received.length === 1);
   });
@@ -242,19 +242,19 @@ async function acquaint(alice: Agent, bob: Agent): Promise<void> {
   const created = await alice.call("agenthop_create", { background: "第一次见面" });
   const code = created.text.match(/\d{4}-[a-z]+-[a-z]+-[a-z]+-[a-z2-7]{26}/)?.[0];
   const joined = await bob.call("agenthop_join", { code });
-  expect(joined.text).toContain("对方身份：不在联系人里");
+  expect(joined.text).toContain("Their identity: not a contact");
   await bob.call("agenthop_say", { text: "你好" });
   const confirmed = await alice.call("agenthop_wait", { timeout_seconds: 10 });
-  expect(confirmed.text).toContain("对方 identity：不在联系人里");
-  expect((await alice.call("agenthop_save_contact", { name: "bob" })).text).toContain("已存为联系人 bob");
-  expect((await bob.call("agenthop_save_contact", { name: "alice" })).text).toContain("已存为联系人 alice");
-  expect((await alice.call("agenthop_bye")).text).toContain("对话结束了");
+  expect(confirmed.text).toContain("peer identity: not a contact");
+  expect((await alice.call("agenthop_save_contact", { name: "bob" })).text).toContain("Saved bob as a contact");
+  expect((await bob.call("agenthop_save_contact", { name: "alice" })).text).toContain("Saved alice as a contact");
+  expect((await alice.call("agenthop_bye")).text).toContain("Conversation over");
   await bob.call("agenthop_wait", { timeout_seconds: 10 });
 }
 
 async function waitForInbox(side: Agent): Promise<void> {
   const deadline = Date.now() + 15_000;
-  while (!(await side.call("agenthop_status")).text.includes("收件地址：在线")) {
+  while (!(await side.call("agenthop_status")).text.includes("Inbox: online")) {
     if (Date.now() > deadline) throw new Error("inbox never came up");
     await delay(100);
   }
@@ -269,30 +269,30 @@ describe("contacts over MCP", () => {
     await acquaint(alice, bob);
     await waitForInbox(bob);
 
-    expect((await alice.call("agenthop_contacts")).text).toMatch(/bob {2}指纹 [a-z2-7-]{19}/);
+    expect((await alice.call("agenthop_contacts")).text).toMatch(/bob {2}fingerprint [a-z2-7-]{19}/);
 
     const invited = await alice.call("agenthop_invite", { name: "bob", background: "上次说的分页，再对一下" });
     expect(invited.isError, invited.text).toBe(false);
     expect(invited.text).not.toMatch(/\d{4}-[a-z]+-[a-z]+-[a-z]+-[a-z2-7]{26}/);
 
     const heard = await bob.call("agenthop_wait", { timeout_seconds: 10 });
-    expect(heard.text).toContain("alice 邀请你对话");
+    expect(heard.text).toContain("alice invites you to talk");
     expect(heard.text).toContain("上次说的分页，再对一下");
-    expect(heard.text).toContain("先把邀请告诉用户");
-    expect((await bob.call("agenthop_status")).text).toContain("待处理的邀请：alice");
+    expect(heard.text).toContain("Tell the user about the invitation first");
+    expect((await bob.call("agenthop_status")).text).toContain("Pending invitations: alice");
 
     const accepted = await bob.call("agenthop_accept", { from: "alice" });
     expect(accepted.isError, accepted.text).toBe(false);
-    expect(accepted.text).toContain("对方身份：alice（联系人");
+    expect(accepted.text).toContain("Their identity: alice (contact");
     expect(accepted.text).toContain("上次说的分页，再对一下");
     await bob.call("agenthop_say", { text: "相符" });
     const confirmed = await alice.call("agenthop_wait", { timeout_seconds: 10 });
-    expect(confirmed.text).toContain("对方 identity：bob（联系人");
+    expect(confirmed.text).toContain("peer identity: bob (contact");
     expect(confirmed.text).toContain("相符");
 
     await alice.call("agenthop_say", { text: "页码从 1 开始吗" });
     expect((await bob.call("agenthop_wait", { timeout_seconds: 10 })).text).toContain("页码从 1 开始吗");
-    expect((await bob.call("agenthop_bye", { text: "对完了" })).text).toContain("对话结束了");
+    expect((await bob.call("agenthop_bye", { text: "对完了" })).text).toContain("Conversation over");
     expect((await alice.call("agenthop_wait", { timeout_seconds: 10 })).text).toContain("对完了");
   }, 90_000);
 
@@ -306,10 +306,10 @@ describe("contacts over MCP", () => {
 
     await alice.call("agenthop_invite", { name: "bob", background: "现在有空吗" });
     await bob.call("agenthop_wait", { timeout_seconds: 10 });
-    expect((await bob.call("agenthop_decline", { reason: "在开会，一小时后" })).text).toContain("已经回绝了 alice");
+    expect((await bob.call("agenthop_decline", { reason: "在开会，一小时后" })).text).toContain("Declined alice's invitation");
     const told = await alice.call("agenthop_wait", { timeout_seconds: 10 });
     expect(told.text).toContain("在开会，一小时后");
-    expect(told.text).toContain("对方告别了");
+    expect(told.text).toContain("They said goodbye");
   }, 90_000);
 
   it("says who is not there, and who is not a contact", async () => {
@@ -322,18 +322,18 @@ describe("contacts over MCP", () => {
 
     const offline = await alice.call("agenthop_invite", { name: "bob", background: "在吗" });
     expect(offline.isError).toBe(true);
-    expect(offline.text).toContain("bob 现在不在线");
-    expect((await alice.call("agenthop_status")).text).toContain("已结束");
+    expect(offline.text).toContain("bob is not online");
+    expect((await alice.call("agenthop_status")).text).toContain("Step: over");
 
     const stranger = await alice.call("agenthop_invite", { name: "carol", background: "在吗" });
     expect(stranger.isError).toBe(true);
-    expect(stranger.text).toContain("现有的联系人：bob");
+    expect(stranger.text).toContain("Contacts: bob");
 
     // Back after a restart, at the same address, straight away.
     const again = await agent(url, path.join(base, "bob"));
     await waitForInbox(again);
     expect((await alice.call("agenthop_invite", { name: "bob", background: "现在呢" })).isError).toBe(false);
-    expect((await again.call("agenthop_wait", { timeout_seconds: 10 })).text).toContain("alice 邀请你对话");
+    expect((await again.call("agenthop_wait", { timeout_seconds: 10 })).text).toContain("alice invites you to talk");
   }, 90_000);
 
   it("closes the room when nobody takes the invitation", async () => {
@@ -345,8 +345,8 @@ describe("contacts over MCP", () => {
     await waitForInbox(bob);
     await alice.call("agenthop_invite", { name: "bob", background: "没人理" });
     const expired = await alice.call("agenthop_wait", { timeout_seconds: 10 });
-    expect(expired.text).toContain("没有接受邀请，房间已经关掉");
-    expect(expired.text).toContain("对话已经结束");
+    expect(expired.text).toContain("did not accept the invitation");
+    expect(expired.text).toContain("The conversation is over");
   }, 90_000);
 
   it("has nothing to wait for with no conversation and nobody who could invite", async () => {

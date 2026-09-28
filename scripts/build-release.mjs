@@ -6,8 +6,15 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+// The skill in both languages: install writes the one the program speaks (see lang.ts).
 const skill = readFileSync(join(root, "skill/SKILL.md"), "utf8");
-writeFileSync(join(root, "packages/cli/src/skill-text.ts"), `export const skillMarkdown = ${JSON.stringify(skill)};\n`);
+const skillZh = readFileSync(join(root, "skill/SKILL.zh-CN.md"), "utf8");
+writeFileSync(
+  join(root, "packages/cli/src/skill-text.ts"),
+  `export const skillMarkdown = ${JSON.stringify(skill)};\nexport const skillMarkdownZh = ${JSON.stringify(skillZh)};\n`,
+);
+// --skill-text: regenerate skill-text.ts only, without compiling the binaries.
+if (process.argv.includes("--skill-text")) process.exit(0);
 
 const targets = [
   ["bun-darwin-arm64", "agenthop-macos-arm64"],

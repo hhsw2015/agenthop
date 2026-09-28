@@ -16,7 +16,8 @@ import { homedir, platform } from "node:os";
 import { delimiter, dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mcpHints, registerMcp } from "./agents.js";
-import { skillMarkdown } from "./skill-text.js";
+import { chosenLang, lang, setLang, t, type Lang } from "./lang.js";
+import { skillMarkdown, skillMarkdownZh } from "./skill-text.js";
 
 const windows = platform() === "win32";
 
@@ -27,30 +28,45 @@ export type InstallOptions = {
   skillOnly?: boolean;
   /** Agents to register agenthop with as an MCP server. Without this it only says how. */
   mcp?: string[];
+  /** The language to speak from now on. Kept in install.json, and the skill is written in it. */
+  lang?: Lang;
 };
 
 /** Copy this program onto PATH and write the skill. No repository and no package install. */
 export function installAgenthop(options: InstallOptions = {}): void {
-  const dirs = rememberSkillDirs(options.skillDirs ?? []);
+  if (options.lang) setLang(options.lang);
+  const dirs = rememberSkillDirs(options.skillDirs ?? [], homedir(), options.lang);
   const command = options.skillOnly ? "" : installCommand();
   const skills = writeSkillFiles(dirs);
   if (command) console.log(command);
   for (const skill of skills) console.log(skill);
+  console.log(languageNote());
   if (!command) return;
   if (options.mcp?.length) {
     for (const line of registerMcp(options.mcp, command)) console.log(line);
     return;
   }
-  console.log("\n接入 MCP，agent 就能直接用 agenthop 的工具，不用往进程的标准输入里写字：");
+  console.log(t("\nAdd agenthop as an MCP server and the agent can use its tools directly, with nothing to write into a process's standard input:", "\n接入 MCP，agent 就能直接用 agenthop 的工具，不用往进程的标准输入里写字："));
   for (const line of mcpHints(command)) console.log(line);
-  console.log("  或者让它替你写：agenthop install --mcp <claude|grok|codex|cursor|gemini>");
+  console.log(t("  Or have it written for you: agenthop install --mcp <claude|grok|codex|cursor|gemini>", "  或者让它替你写：agenthop install --mcp <claude|grok|codex|cursor|gemini>"));
+}
+
+/**
+ * Which language this is, and how to change it. Until someone chooses, it is said in both:
+ * everything before English spoke Chinese, and `update` — which runs `install --skill-only` and
+ * prints what it says — is where someone used to that finds out.
+ */
+function languageNote(): string {
+  if (chosenLang()) return t("Language: English (agenthop install --lang zh switches to Chinese)", "语言：中文（agenthop install --lang en 改回英文）");
+  return "Language: English. 要用中文：agenthop install --lang zh";
 }
 
 /**
  * Where SKILL.md goes. Directories named on the command line are added to the ones a previous
- * install recorded, so `update` can refresh every copy without being told again.
+ * install recorded, so `update` can refresh every copy without being told again. The language is
+ * kept beside them, and so is anything else already in the file.
  */
-export function rememberSkillDirs(named: string[], home = homedir()): string[] {
+export function rememberSkillDirs(named: string[], home = homedir(), chosen?: Lang): string[] {
   // A directory that is gone was removed on purpose. Refreshing the skill must not bring it back.
   const dirs = new Set(readSkillDirs(home).filter(isDirectory));
   for (const dir of named) {
@@ -60,8 +76,17 @@ export function rememberSkillDirs(named: string[], home = homedir()): string[] {
   const kept = [...dirs];
   const file = join(home, ".agenthop", "install.json");
   ensureDir(dirname(file));
-  writeFileSync(file, `${JSON.stringify({ skillDirs: kept }, null, 2)}\n`);
+  writeFileSync(file, `${JSON.stringify({ ...readInstall(home), skillDirs: kept, ...(chosen ? { lang: chosen } : {}) }, null, 2)}\n`);
   return kept;
+}
+
+function readInstall(home: string): Record<string, unknown> {
+  try {
+    const body = JSON.parse(readFileSync(join(home, ".agenthop", "install.json"), "utf8")) as unknown;
+    return body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
 
 export function readSkillDirs(home = homedir()): string[] {
@@ -83,7 +108,7 @@ export function writeSkillFiles(skillDirs: string[], home = homedir()): string[]
   }
   for (const file of files) {
     ensureDir(dirname(file));
-    writeFileSync(file, skillMarkdown);
+    writeFileSync(file, lang() === "zh" ? skillMarkdownZh : skillMarkdown);
   }
   return files;
 }

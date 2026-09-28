@@ -1,4 +1,5 @@
 import { isPairingCode, isRoomAddress, normalizeCode } from "@agenthop/tunnel";
+import { parseLang, t, type Lang } from "./lang.js";
 
 export type Flags = {
   relay?: string;
@@ -12,6 +13,8 @@ export type Flags = {
   acceptFiles: boolean;
   help: boolean;
   version: boolean;
+  /** `install --lang`: the language to speak from now on. */
+  lang?: Lang;
 };
 
 export type Parsed = { flags: Flags; positionals: string[] };
@@ -23,16 +26,22 @@ const VALUE_FLAGS: Record<string, keyof Pick<Flags, "relay" | "pass" | "listen">
 };
 
 /** Flags that older releases documented. Naming them beats "unknown option". */
-const RETIRED_FLAGS: Record<string, string> = {
-  "--agent": "现在不需要把另一个 agent 填进来：agenthop 自己一直跑着，对方的话在标准输出，要说的话写进标准输入。",
-  "--on-receive": "现在不需要每条消息拉起一条命令：同一个 agenthop 进程会把对方的话写到标准输出。",
-  "--ask": "现在每一行都是同一条对话里的一句话，不再分提问和回答。",
-  "--answer": "现在每一行都是同一条对话里的一句话，不再分提问和回答。",
-  "--supplement": "现在每一行都是同一条对话里的一句话，补充直接再写一行。",
-  "--file": "发文件现在是在标准输入里写一行 /file <路径>，或者用 MCP 的 agenthop_send_file。",
-  "--out": "这一版的对话只走文本。",
-  "--text": "正文直接写进标准输入，一行就是一句。",
-  "--json": "输出格式就是日志那一行：<时间> <local|peer> <状态> <正文>。",
+const RETIRED_FLAGS: Record<string, readonly [en: string, zh: string]> = {
+  "--agent": [
+    "There is no other agent to name any more: agenthop keeps running by itself, the other side's words are on its standard output, and yours go into its standard input.",
+    "现在不需要把另一个 agent 填进来：agenthop 自己一直跑着，对方的话在标准输出，要说的话写进标准输入。",
+  ],
+  "--on-receive": [
+    "No command is started for each message any more: the same agenthop process writes the other side's words to its standard output.",
+    "现在不需要每条消息拉起一条命令：同一个 agenthop 进程会把对方的话写到标准输出。",
+  ],
+  "--ask": ["Every line is now one message in the same conversation; there are no separate questions and answers.", "现在每一行都是同一条对话里的一句话，不再分提问和回答。"],
+  "--answer": ["Every line is now one message in the same conversation; there are no separate questions and answers.", "现在每一行都是同一条对话里的一句话，不再分提问和回答。"],
+  "--supplement": ["Every line is now one message in the same conversation; to add something, write another line.", "现在每一行都是同一条对话里的一句话，补充直接再写一行。"],
+  "--file": ["To send a file, write a line /file <path> on standard input, or use agenthop_send_file over MCP.", "发文件现在是在标准输入里写一行 /file <路径>，或者用 MCP 的 agenthop_send_file。"],
+  "--out": ["Conversations in this version are text only.", "这一版的对话只走文本。"],
+  "--text": ["Write the text straight into standard input; one line is one message.", "正文直接写进标准输入，一行就是一句。"],
+  "--json": ["The output format is the log line: <time> <local|peer> <state> <text>.", "输出格式就是日志那一行：<时间> <local|peer> <状态> <正文>。"],
 };
 
 /** Commands that older releases documented. */
@@ -48,24 +57,28 @@ export function parseArgs(args: string[]): Parsed {
     const valueFlag = VALUE_FLAGS[arg];
     if (valueFlag) {
       const value = args[++i];
-      if (!value) throw new Error(`${arg} 后面要跟一个值`);
+      if (!value) throw new Error(t(`${arg} takes a value`, `${arg} 后面要跟一个值`));
       flags[valueFlag] = value;
     } else if (arg === "--skill-dir") {
       const value = args[++i];
-      if (!value) throw new Error("--skill-dir 后面要跟一个目录");
+      if (!value) throw new Error(t("--skill-dir takes a directory", "--skill-dir 后面要跟一个目录"));
       flags.skillDirs.push(value);
     } else if (arg === "--mcp") {
       const value = args[++i];
-      if (!value) throw new Error("--mcp 后面要跟一个 agent 的名字：claude、grok、codex、cursor 或 gemini");
+      if (!value) throw new Error(t("--mcp takes an agent's name: claude, grok, codex, cursor or gemini", "--mcp 后面要跟一个 agent 的名字：claude、grok、codex、cursor 或 gemini"));
       flags.mcpAgents.push(value);
+    } else if (arg === "--lang") {
+      const value = parseLang(args[++i]);
+      if (!value) throw new Error(t("--lang takes en or zh", "--lang 后面要跟 en 或 zh"));
+      flags.lang = value;
     } else if (arg === "--accept-files") flags.acceptFiles = true;
     else if (arg === "--skill-only") flags.skillOnly = true;
     else if (arg === "--check") flags.check = true;
     else if (arg === "--force") flags.force = true;
     else if (arg === "--help" || arg === "-h") flags.help = true;
     else if (arg === "--version" || arg === "-v") flags.version = true;
-    else if (RETIRED_FLAGS[arg]) throw new Error(`${arg} 已经没有了。${RETIRED_FLAGS[arg]}\n${usageHint()}`);
-    else if (arg.startsWith("-")) throw new Error(`不认识的选项 ${arg}。\n${usageHint()}`);
+    else if (RETIRED_FLAGS[arg]) throw new Error(t(`${arg} is gone. ${RETIRED_FLAGS[arg][0]}\n${usageHint()}`, `${arg} 已经没有了。${RETIRED_FLAGS[arg][1]}\n${usageHint()}`));
+    else if (arg.startsWith("-")) throw new Error(t(`Unknown option ${arg}.\n${usageHint()}`, `不认识的选项 ${arg}。\n${usageHint()}`));
     else positionals.push(arg);
   }
   return { flags, positionals };
@@ -85,7 +98,7 @@ export type Input =
 export function classifyInput(positionals: string[]): Input {
   const first = positionals[0] ?? "";
   if (COMMANDS.has(first)) return { kind: "command", name: first, words: positionals.slice(1) };
-  if (RETIRED_COMMANDS.has(first)) throw new Error(`agenthop ${first} 已经没有了。\n${usageHint()}`);
+  if (RETIRED_COMMANDS.has(first)) throw new Error(t(`agenthop ${first} is gone.\n${usageHint()}`, `agenthop ${first} 已经没有了。\n${usageHint()}`));
   if (positionals.length === 0) return { kind: "help" };
   const joined = positionals.join(" ");
   const attempt = codeAttempt(joined);
@@ -95,15 +108,24 @@ export function classifyInput(positionals: string[]): Input {
     // way over. Both are worth saying out loud, because neither looks like a typo.
     if (isRoomAddress(code)) {
       throw new Error(
-        `这个配对码少了最后一段密钥：${code}\n` +
-          `可能是复制的时候被截断了，也可能对方还在用 v0.3。从 v0.4 起配对码有五段，最后一段是 26 位的密钥，` +
-          `没有它读不到对话。请对方先 agenthop update，再把 waiting 那一行整行发过来。`,
+        t(
+          `This pairing code is missing its last part, the key: ${code}\n` +
+            "It may have been cut off when it was copied, or the other side is still on v0.3. Since v0.4 a pairing code has five parts, " +
+            "the last a 26-character key, and nothing can be read without it. Ask the other side to run agenthop update, then send the whole waiting line.",
+          `这个配对码少了最后一段密钥：${code}\n` +
+            `可能是复制的时候被截断了，也可能对方还在用 v0.3。从 v0.4 起配对码有五段，最后一段是 26 位的密钥，` +
+            `没有它读不到对话。请对方先 agenthop update，再把 waiting 那一行整行发过来。`,
+        ),
       );
     }
     if (!isPairingCode(code)) {
       throw new Error(
-        `这不像一个配对码：${abbreviate(joined)}\n` +
-          `配对码是四位数字、三个英文词，再加一段 26 位的密钥，例如 1720-spiny-patch-easel-k7f3q2mbxz4a6tu5wnhjy2pc3d。`,
+        t(
+          `This does not look like a pairing code: ${abbreviate(joined)}\n` +
+            "A pairing code is four digits and three English words, then a 26-character key, e.g. 1720-spiny-patch-easel-k7f3q2mbxz4a6tu5wnhjy2pc3d.",
+          `这不像一个配对码：${abbreviate(joined)}\n` +
+            `配对码是四位数字、三个英文词，再加一段 26 位的密钥，例如 1720-spiny-patch-easel-k7f3q2mbxz4a6tu5wnhjy2pc3d。`,
+        ),
       );
     }
     return { kind: "join", code };
@@ -169,5 +191,8 @@ function abbreviate(text: string): string {
 }
 
 function usageHint(): string {
-  return '现在创建房间是 agenthop "<任务背景>"，加入是 agenthop <配对码>。完整用法看 agenthop help。';
+  return t(
+    'To open a room: agenthop "<background>". To join one: agenthop <pairing code>. agenthop help has the rest.',
+    '现在创建房间是 agenthop "<任务背景>"，加入是 agenthop <配对码>。完整用法看 agenthop help。',
+  );
 }

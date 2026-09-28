@@ -7,5 +7,8 @@ export default defineConfig({
     // starves them of CPU and turns waiting for a line into a timeout.
     fileParallelism: false,
     testTimeout: 40000,
+    // The language comes from the environment, then from ~/.agenthop/install.json. Pin it, so a
+    // machine where someone chose Chinese runs the same tests as everyone else.
+    env: { AGENTHOP_LANG: "en" },
   },
 });

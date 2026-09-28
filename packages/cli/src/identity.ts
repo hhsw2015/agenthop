@@ -2,6 +2,7 @@ import { createHash, createPrivateKey, createPublicKey, diffieHellman, generateK
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { isRoomAddress, WORDLIST } from "@agenthop/tunnel";
+import { t } from "./lang.js";
 
 /**
  * Who this machine is, and who it knows. A conversation by pairing code proves that both sides
@@ -42,7 +43,12 @@ export function loadIdentity(home: string): Identity {
     if (typeof stored.publicKey === "string" && typeof stored.privateKey === "string" && isPublicKey(stored.publicKey)) {
       return { publicKey: stored.publicKey, privateKey: stored.privateKey };
     }
-    throw new Error(`${file} 不是一个有效的身份文件。挪走它，下次会生成一个新的（原来的联系人要重新互存）。`);
+    throw new Error(
+      t(
+        `${file} is not a valid identity file. Move it away and a new one is made next time (contacts then need saving again on both sides).`,
+        `${file} 不是一个有效的身份文件。挪走它，下次会生成一个新的（原来的联系人要重新互存）。`,
+      ),
+    );
   }
   const pair = generateKeyPairSync("x25519");
   const jwk = pair.privateKey.export({ format: "jwk" });
@@ -132,12 +138,13 @@ export function contactByKey(home: string, publicKey: string): Contact | undefin
 /** Keep `publicKey` under `name`. A name already given to someone else is not taken from them. */
 export function saveContact(home: string, name: string, publicKey: string): { saved: Contact; renamedFrom?: string } | string {
   const cleaned = contactName(name);
-  if (!cleaned) return "名字不能为空、不能换行，最长 40 个字。";
-  if (!isPublicKey(publicKey)) return "对方的身份不是一个有效的公钥。";
+  if (!cleaned) return t("A name cannot be empty or hold a line break, and is at most 40 characters.", "名字不能为空、不能换行，最长 40 个字。");
+  if (!isPublicKey(publicKey)) return t("The other side's identity is not a valid public key.", "对方的身份不是一个有效的公钥。");
   const contacts = loadContacts(home);
   const holder = contacts.find((contact) => contact.name === cleaned);
   if (holder && holder.publicKey !== publicKey) {
-    return `"${cleaned}" 已经是另一个人了（指纹 ${fingerprint(holder.publicKey)}）。换一个名字，或者先 forget 掉原来那个。`;
+    const print = fingerprint(holder.publicKey);
+    return t(`"${cleaned}" is already someone else (fingerprint ${print}). Pick another name, or forget that one first.`, `"${cleaned}" 已经是另一个人了（指纹 ${print}）。换一个名字，或者先 forget 掉原来那个。`);
   }
   if (holder) return { saved: holder };
   const previous = contacts.find((contact) => contact.publicKey === publicKey);

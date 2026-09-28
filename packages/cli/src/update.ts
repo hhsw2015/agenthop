@@ -7,6 +7,7 @@ import { basename, dirname, join } from "node:path";
 import { DEFAULT_RELAY } from "./host.js";
 import { ensureDir, readSkillDirs } from "./install.js";
 import { version } from "./version.js";
+import { t } from "./lang.js";
 
 const ASSETS: Record<string, string> = {
   "darwin-arm64": "agenthop-macos-arm64",
@@ -50,16 +51,21 @@ export async function updateAgenthop(options: { check?: boolean; force?: boolean
   if (!latest.assets.includes(asset)) throw new Error(`release ${latest.tag} has no ${asset}`);
   const sums = await readSums(base, latest.tag);
   const expected = sums.hashes.get(asset);
-  if (!expected) throw new Error(`release ${latest.tag} 没有 ${asset} 的校验和，不敢装`);
+  if (!expected) throw new Error(t(`release ${latest.tag} has no checksum for ${asset}; not installing it`, `release ${latest.tag} 没有 ${asset} 的校验和，不敢装`));
   const target = options.target ?? installTarget();
   const downloaded = `${target}.download`;
   ensureDir(dirname(target));
   const actual = await download(`${base}/download/${asset}`, downloaded);
   if (actual !== expected) {
     rmSync(downloaded, { force: true });
-    throw new Error(`下载回来的文件和 ${sums.from} 上的校验和对不上，已经丢弃，没有替换现在的程序。\n  期望 ${expected}\n  实际 ${actual}`);
+    throw new Error(
+      t(
+        `The download does not match the checksum from ${sums.from}. Discarded it and kept the current program.\n  expected ${expected}\n  actual   ${actual}`,
+        `下载回来的文件和 ${sums.from} 上的校验和对不上，已经丢弃，没有替换现在的程序。\n  期望 ${expected}\n  实际 ${actual}`,
+      ),
+    );
   }
-  console.log(`sha256 ${actual} (校验和来自 ${sums.from})`);
+  console.log(t(`sha256 ${actual} (checksum from ${sums.from})`, `sha256 ${actual} (校验和来自 ${sums.from})`));
   replaceExecutable(target, downloaded);
   console.log(target);
   refreshSkill(target);
@@ -84,7 +90,10 @@ export function skillReminder(target: string, home = homedir()): string {
   const dirs = readSkillDirs(home);
   const named = dirs.map((dir) => ` --skill-dir ${dir}`).join("");
   return [
-    "SKILL.md 没有一起更新。技能文本在程序里面，要再跑一次安装才会写出来：",
+    t(
+      "SKILL.md was not updated with it. The skill text lives inside the program; run the install once more to write it:",
+      "SKILL.md 没有一起更新。技能文本在程序里面，要再跑一次安装才会写出来：",
+    ),
     `  ${target} install${named}`,
   ].join("\n");
 }
@@ -102,7 +111,7 @@ function relayHeaders(): Record<string, string> {
 export async function readSums(base: string, tag: string): Promise<{ hashes: Map<string, string>; from: string }> {
   const sources = [
     { from: "github.com", url: `${releasesBase()}/${tag}/SHA256SUMS` },
-    { from: "中继（与程序同源）", url: `${base}/download/SHA256SUMS` },
+    { from: t("the relay (where the program came from)", "中继（与程序同源）"), url: `${base}/download/SHA256SUMS` },
   ];
   let last = "";
   for (const source of sources) {
@@ -114,12 +123,12 @@ export async function readSums(base: string, tag: string): Promise<{ hashes: Map
       }
       const hashes = parseSums(await response.text());
       if (hashes.size > 0) return { hashes, from: source.from };
-      last = `${source.url} → 空文件`;
+      last = `${source.url} → ${t("empty file", "空文件")}`;
     } catch (error) {
       last = `${source.url} → ${error instanceof Error ? error.message : error}`;
     }
   }
-  throw new Error(`拿不到校验和，没有替换现在的程序。${last}`);
+  throw new Error(t(`Could not get the checksums; kept the current program. ${last}`, `拿不到校验和，没有替换现在的程序。${last}`));
 }
 
 export function parseSums(body: string): Map<string, string> {

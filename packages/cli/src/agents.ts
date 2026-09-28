@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
+import { t } from "./lang.js";
 
 /**
  * The agents agenthop knows how to plug into as an MCP server. `install` finds the ones on this
@@ -43,28 +44,28 @@ const agents: Agent[] = [
     id: "codex",
     name: "Codex",
     present: (home) => existsSync(join(home, ".codex")) || onPath("codex"),
-    hint: (bin, home) => `在 ${join(home, ".codex", "config.toml")} 里加上：\n${codexBlock(bin)}`,
+    hint: (bin, home) => t(`Add to ${join(home, ".codex", "config.toml")}:\n${codexBlock(bin)}`, `在 ${join(home, ".codex", "config.toml")} 里加上：\n${codexBlock(bin)}`),
     register: (bin, home) => {
       const file = join(home, ".codex", "config.toml");
       const existing = existsSync(file) ? readFileSync(file, "utf8") : "";
-      if (/^\[mcp_servers\.agenthop\]/m.test(existing)) return `${file} 里已经有 agenthop 了，没有改动`;
+      if (/^\[mcp_servers\.agenthop\]/m.test(existing)) return t(`${file} already has agenthop; nothing changed`, `${file} 里已经有 agenthop 了，没有改动`);
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${existing ? "\n" : ""}${codexBlock(bin)}\n`);
-      return `已写入 ${file}`;
+      return t(`written to ${file}`, `已写入 ${file}`);
     },
   },
   {
     id: "cursor",
     name: "Cursor",
     present: (home) => existsSync(join(home, ".cursor")),
-    hint: (bin, home) => `在 ${join(home, ".cursor", "mcp.json")} 的 mcpServers 里加上：${JSON.stringify(entry(bin))}`,
+    hint: (bin, home) => t(`Add to mcpServers in ${join(home, ".cursor", "mcp.json")}: ${JSON.stringify(entry(bin))}`, `在 ${join(home, ".cursor", "mcp.json")} 的 mcpServers 里加上：${JSON.stringify(entry(bin))}`),
     register: (bin, home) => mergeJson(join(home, ".cursor", "mcp.json"), bin),
   },
   {
     id: "gemini",
     name: "Gemini CLI",
     present: (home) => existsSync(join(home, ".gemini")) || onPath("gemini"),
-    hint: (bin, home) => `在 ${join(home, ".gemini", "settings.json")} 的 mcpServers 里加上：${JSON.stringify(entry(bin))}`,
+    hint: (bin, home) => t(`Add to mcpServers in ${join(home, ".gemini", "settings.json")}: ${JSON.stringify(entry(bin))}`, `在 ${join(home, ".gemini", "settings.json")} 的 mcpServers 里加上：${JSON.stringify(entry(bin))}`),
     register: (bin, home) => mergeJson(join(home, ".gemini", "settings.json"), bin),
   },
 ];
@@ -72,17 +73,18 @@ const agents: Agent[] = [
 /** How to register agenthop with each agent found here, or with all of them if none is. */
 export function mcpHints(bin: string, home = homedir()): string[] {
   const found = agents.filter((agent) => agent.present(home));
-  return (found.length > 0 ? found : agents).map((agent) => `  ${agent.name}：${agent.hint(bin, home).replace(/\n/g, "\n    ")}`);
+  return (found.length > 0 ? found : agents).map((agent) => `  ${agent.name}${t(": ", "：")}${agent.hint(bin, home).replace(/\n/g, "\n    ")}`);
 }
 
 export function registerMcp(ids: string[], bin: string, home = homedir()): string[] {
   return ids.map((id) => {
     const agent = agents.find((candidate) => candidate.id === id);
-    if (!agent) return `不认识的 agent：${id}。可以是 ${AGENT_IDS.join("、")}。`;
+    if (!agent) return t(`Unknown agent: ${id}. It can be ${AGENT_IDS.join(", ")}.`, `不认识的 agent：${id}。可以是 ${AGENT_IDS.join("、")}。`);
     try {
-      return `${agent.name}：${agent.register(bin, home)}`;
+      return `${agent.name}${t(": ", "：")}${agent.register(bin, home)}`;
     } catch (error) {
-      return `${agent.name}：没有写成（${error instanceof Error ? error.message : String(error)}）。手动做：${agent.hint(bin, home)}`;
+      const why = error instanceof Error ? error.message : String(error);
+      return t(`${agent.name}: not written (${why}). Do it by hand: ${agent.hint(bin, home)}`, `${agent.name}：没有写成（${why}）。手动做：${agent.hint(bin, home)}`);
     }
   });
 }
@@ -105,21 +107,21 @@ function mergeJson(file: string, bin: string): string {
     try {
       config = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
     } catch {
-      throw new Error(`${file} 不是纯 JSON，没有动它`);
+      throw new Error(t(`${file} is not plain JSON; left it alone`, `${file} 不是纯 JSON，没有动它`));
     }
   }
   const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
   config.mcpServers = { ...servers, ...entry(bin) };
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`);
-  return `已写入 ${file}`;
+  return t(`written to ${file}`, `已写入 ${file}`);
 }
 
 function run(command: string, args: string[], name: string): string {
-  if (!onPath(command)) throw new Error(`找不到 ${command} 命令`);
+  if (!onPath(command)) throw new Error(t(`No ${command} command found`, `找不到 ${command} 命令`));
   const result = spawnSync(command, args, { encoding: "utf8" });
-  if (result.status !== 0) throw new Error((result.stderr || result.stdout || `${command} 退出码 ${result.status}`).trim());
-  return `已注册到 ${name}`;
+  if (result.status !== 0) throw new Error((result.stderr || result.stdout || t(`${command} exited with ${result.status}`, `${command} 退出码 ${result.status}`)).trim());
+  return t(`registered with ${name}`, `已注册到 ${name}`);
 }
 
 function onPath(command: string): boolean {

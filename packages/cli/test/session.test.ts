@@ -141,7 +141,7 @@ describe("session", () => {
     await creator;
     const log = await readFile(sessionPath(path.join(dir, "creator"), addressOf(code), "create"), "utf8");
     expect(log).toContain("local bye");
-    expect(log).toContain("peer gone 对方没有把告别说回来");
+    expect(log).toContain("peer gone The other side did not say goodbye back");
     await relay.close();
   });
 
@@ -187,7 +187,7 @@ describe("session", () => {
     await creator;
     const log = await readFile(sessionPath(path.join(dir, "creator"), addressOf(code), "create"), "utf8");
     expect(log).not.toContain("peer gone");
-    expect(log).toContain("配对码");
+    expect(log).toContain("Nobody joined with this pairing code");
   });
 
   it("writes down what it could not send instead of losing it", async () => {
@@ -237,15 +237,16 @@ describe("session", () => {
 
     const address = addressOf(code);
     // Someone who only knows the room address, and so cannot seal anything. They are told they
-    // were turned away rather than left believing they had spoken.
+    // were turned away rather than left believing they had spoken — in both languages, because a
+    // version from before English knows the reason by its Chinese words.
     await expect(
       sendMessage({ code: address, text: "[[agenthop:say:stranger]] 我是第三个人", relay: relay.url }),
-    ).rejects.toThrow(/密钥/);
+    ).rejects.toThrow(/without the key.* \/ .*密钥/);
     // And someone who guessed a secret for the same address, which reads no better.
     const guesser = channel(`${address}-aaaaaaaaaaaaaaaaaaaaaaaaaa`, "join");
     await expect(
       sendMessage({ code: address, text: guesser.seal("[[agenthop:say:stranger]] 我也是"), relay: relay.url }),
-    ).rejects.toThrow(/密钥/);
+    ).rejects.toThrow(/without the key/);
     await waitForText(path.join(dir, "creator"), "peer refused");
     const log = await readFile(sessionPath(path.join(dir, "creator"), address, "create"), "utf8");
     expect(log).not.toContain("peer say 我是第三个人");
@@ -438,7 +439,7 @@ describe("session", () => {
     const queue = await readQueue(roomBase(relay.url, addressOf(code)));
     const replayed = queue.events.filter((event) => event.from === "peer").at(-1)!.text;
     await sendMessage({ code: addressOf(code), text: replayed, relay: relay.url });
-    await waitForText(path.join(dir, "creator"), "peer refused 重复的消息");
+    await waitForText(path.join(dir, "creator"), "peer refused A repeated message");
 
     joinerLines.push("/bye");
     await Promise.all([creator, joiner]);
@@ -532,7 +533,7 @@ describe("session", () => {
 
     // The refusal arrives the moment the socket is accepted, before anything has been sent.
     const started = Date.now();
-    await expect(startHost({ relay: relay.url, code, home: path.join(dir, "second") })).rejects.toThrow(/已经被另一个进程占着/);
+    await expect(startHost({ relay: relay.url, code, home: path.join(dir, "second") })).rejects.toThrow(/Another process is holding this room/);
     expect(Date.now() - started).toBeLessThan(5000);
 
     await held.close();

@@ -8,6 +8,7 @@ import { readQueue, roomBase, sendMessage, Throttled } from "./send.js";
 import { RECOVER_MS, startHost, type RunningHost } from "./host.js";
 import { channel, SEALED_TYPE, type Channel } from "./seal.js";
 import { contactByKey, fingerprint, isPublicKey, loadIdentity, type Identity } from "./identity.js";
+import { both, ours, t } from "./lang.js";
 import { type SessionEvent } from "./talk.js";
 
 /** Written on stdin to end the conversation on purpose. */
@@ -25,11 +26,16 @@ export const FILE = "/file";
 /** What one line may carry, as the person writes it. The room measures ciphertext, which is larger. */
 export const MAX_LINE_BYTES = 64 * 1024;
 
-// Why a line was turned away. The sender reads these, so each says what actually happened.
-const REFUSE_NO_KEY = "有人用这个房间地址说话，但拿不出配对码里的密钥，已经忽略";
-const REFUSE_SEAT_TAKEN = "已经有人用这个配对码加入了，一个房间只接一个对端";
-const REFUSE_NOT_PEER = "这一句拿着完整的配对码，却不是已经加入的那一方发的，已经忽略";
-const REFUSE_NOT_INVITED = "这个房间是为邀请开的，加入的不是被邀请的那个人";
+// Why a line was turned away. They go back to the sender, so each says what actually happened —
+// in both languages, because versions before English know three of them by their Chinese words
+// (see joinFailure), and a joining side told nothing better goes looking for a typo.
+type Reason = readonly [en: string, zh: string];
+const REFUSE_NO_KEY: Reason = ["Someone spoke in this room without the key from the pairing code; ignored", "有人用这个房间地址说话，但拿不出配对码里的密钥，已经忽略"];
+const REFUSE_SEAT_TAKEN: Reason = ["Someone has already joined with this pairing code; a room takes one peer", "已经有人用这个配对码加入了，一个房间只接一个对端"];
+const REFUSE_NOT_PEER: Reason = ["This line holds the whole pairing code but does not come from the side that joined; ignored", "这一句拿着完整的配对码，却不是已经加入的那一方发的，已经忽略"];
+const REFUSE_NOT_INVITED: Reason = ["This room was opened for an invitation, and whoever joined is not the one invited", "这个房间是为邀请开的，加入的不是被邀请的那个人"];
+const said = (reason: Reason): string => both(...reason);
+const heard = (detail: string, reason: Reason): boolean => detail.includes(reason[0]) || detail.includes(reason[1]);
 
 const LOCAL_POLL_MS = 200;
 const RELAY_POLL_MS = 1000;
@@ -119,8 +125,8 @@ function ownIdentity(home: string): Identity | false {
 
 async function createSession(options: SessionOptions, home: string): Promise<void> {
   const hello = options.hello?.trim() ?? "";
-  if (!hello) throw new Error("usage: agenthop <任务背景>");
-  if (tooLong(hello)) throw new Error("任务背景超过 64 KiB。写一段简短的背景，细节留到对话里再说。");
+  if (!hello) throw new Error(t("usage: agenthop <background>", "usage: agenthop <任务背景>"));
+  if (tooLong(hello)) throw new Error(t("The background is over 64 KiB. Write a short one and leave the details for the conversation.", "任务背景超过 64 KiB。写一段简短的背景，细节留到对话里再说。"));
   // The code is made here rather than in the host, because only this side may hold both halves
   // of it. The host is handed the address alone and never learns the secret.
   const pairingCode = generateCode();
@@ -156,27 +162,29 @@ async function hostConversation(
       try {
         wire = parseWire(box.open(text).wire);
       } catch {
-        return REFUSE_NO_KEY;
+        return said(REFUSE_NO_KEY);
       }
       if (peerId === undefined) {
         if (wire.kind !== "connect") return true;
         // An invitation's code was sealed to one person. Someone else arriving with it is refused
         // before they take the seat, so the right one can still come in after them.
-        if (options.expectPeer && wire.text !== options.expectPeer) return REFUSE_NOT_INVITED;
+        if (options.expectPeer && wire.text !== options.expectPeer) return said(REFUSE_NOT_INVITED);
         peerId = wire.id;
         return true;
       }
       // Both of these hold the secret, so neither is a stranger — and telling them they are
       // would send someone looking for a typo in a code that is right.
-      if (wire.kind === "connect") return REFUSE_SEAT_TAKEN;
-      return wire.id === peerId ? true : REFUSE_NOT_PEER;
+      if (wire.kind === "connect") return said(REFUSE_SEAT_TAKEN);
+      return wire.id === peerId ? true : said(REFUSE_NOT_PEER);
     },
     onRefused: (reason, text) => {
       const shown = readable(box, text);
-      write(logFile(), "peer", "refused", shown ? `${reason}：${shown}` : reason);
+      const why = ours(reason);
+      write(logFile(), "peer", "refused", shown ? `${why}${t(": ", "：")}${shown}` : why);
     },
-    onReconnecting: (reason) => write(logFile(), "local", "reconnecting", `${reason}，正在用同一个配对码把房间接回来`),
-    onReconnected: () => write(logFile(), "local", "reconnected", "房间接回来了，对话可以继续"),
+    onReconnecting: (reason) =>
+      write(logFile(), "local", "reconnecting", t(`${reason}; bringing the room back with the same pairing code`, `${reason}，正在用同一个配对码把房间接回来`)),
+    onReconnected: () => write(logFile(), "local", "reconnected", t("The room is back; the conversation can go on", "房间接回来了，对话可以继续")),
     onGone: (reason) => {
       lost = reason;
     },
@@ -200,7 +208,7 @@ async function hostConversation(
       if (lost) {
         out.reportUnsent();
         if (phase === "wait-connect") {
-          write(log, "local", "expired", `没有人用这个配对码加入，房间已经过期（${lost}）。重新执行 agenthop "<任务背景>" 拿一个新配对码。`);
+          write(log, "local", "expired", t(`Nobody joined with this pairing code and the room has expired (${lost}). Run agenthop "<background>" again for a new code.`, `没有人用这个配对码加入，房间已经过期（${lost}）。重新执行 agenthop "<任务背景>" 拿一个新配对码。`));
         } else {
           write(log, "peer", "gone", lost);
         }
@@ -244,7 +252,7 @@ async function hostConversation(
         } else if (wire.kind === "file" && event.files.length === 0) {
           // The line arrived and the bytes did not. Saying nothing would leave the other side
           // believing the file was delivered.
-          write(log, "peer", "refused", "对方说要发一个文件，但文件本身没有到");
+          write(log, "peer", "refused", t("The other side said it was sending a file, but the file never arrived", "对方说要发一个文件，但文件本身没有到"));
         } else if (wire.kind === "other") {
           write(log, "peer", "other", brief(wire.text));
         }
@@ -252,7 +260,7 @@ async function hostConversation(
       if (!saidBye && phase === "ready" && (await out.flush(say))) saidBye = Date.now();
       if (saidBye && Date.now() - saidBye > (options.byeWaitMs ?? BYE_WAIT_MS)) {
         out.reportUnsent();
-        write(log, "peer", "gone", "对方没有把告别说回来");
+        write(log, "peer", "gone", t("The other side did not say goodbye back", "对方没有把告别说回来"));
         return;
       }
       await delay(LOCAL_POLL_MS);
@@ -310,16 +318,16 @@ async function joinConversation(options: SessionOptions, home: string, code: str
     let events: SessionEvent[];
     try {
       events = (await readQueue(base, after, options.pass)).events;
-      if (failingSince) write(log, "local", "reconnected", "又能读到房间了，对话可以继续");
+      if (failingSince) write(log, "local", "reconnected", t("The room can be read again; the conversation can go on", "又能读到房间了，对话可以继续"));
       failingSince = 0;
     } catch {
       if (!failingSince) {
         failingSince = Date.now();
-        write(log, "local", "reconnecting", "读不到房间了，正在重试");
+        write(log, "local", "reconnecting", t("Cannot read the room; trying again", "读不到房间了，正在重试"));
       }
       if (Date.now() - failingSince > (options.recoverMs ?? RECOVER_MS)) {
         reportUnsent();
-        write(log, "peer", "gone", "房间已经不在了，对方可能已经退出，或者房间空闲超过十分钟");
+        write(log, "peer", "gone", t("The room is gone: the other side may have left, or it sat idle for over ten minutes", "房间已经不在了，对方可能已经退出，或者房间空闲超过十分钟"));
         return;
       }
       await delay(RELAY_POLL_MS);
@@ -340,7 +348,7 @@ async function joinConversation(options: SessionOptions, home: string, code: str
       if (phase === "wait-hello" && wire.kind === "identity" && !hostKey && isPublicKey(wire.text)) {
         hostKey = wire.text;
         if (options.expectPeer && hostKey !== options.expectPeer) {
-          write(log, "peer", "refused", `开这个房间的不是发邀请的那个人（指纹 ${fingerprint(hostKey)}），已经离开`);
+          write(log, "peer", "refused", t(`Whoever opened this room is not the one who sent the invitation (fingerprint ${fingerprint(hostKey)}); left`, `开这个房间的不是发邀请的那个人（指纹 ${fingerprint(hostKey)}），已经离开`));
           reportUnsent();
           return;
         }
@@ -348,7 +356,7 @@ async function joinConversation(options: SessionOptions, home: string, code: str
         options.onPeerKey?.(hostKey);
       } else if (phase === "wait-hello" && wire.kind === "hello") {
         if (options.expectPeer && !hostKey) {
-          write(log, "peer", "refused", "开这个房间的一方没有表明身份，对不上发邀请的人，已经离开");
+          write(log, "peer", "refused", t("Whoever opened this room did not say who they are, so they cannot be matched with the one who invited; left", "开这个房间的一方没有表明身份，对不上发邀请的人，已经离开"));
           reportUnsent();
           return;
         }
@@ -372,7 +380,7 @@ async function joinConversation(options: SessionOptions, home: string, code: str
     while (phase === "wait-confirm" && !saidBye && typed.length > 0) {
       const next = typed.shift() ?? "";
       if (isFile(next)) {
-        write(log, "local", "undelivered", `${next}（通道还没打开，确认之后再发文件）`);
+        write(log, "local", "undelivered", labelled(next, t("the channel is not open yet; send files after the confirmation", "通道还没打开，确认之后再发文件")));
         continue;
       }
       const bye = isBye(next);
@@ -406,7 +414,7 @@ async function joinConversation(options: SessionOptions, home: string, code: str
     if (!saidBye && phase === "ready" && (await out.flush(send, typed, id))) saidBye = Date.now();
     if (saidBye && Date.now() - saidBye > (options.byeWaitMs ?? BYE_WAIT_MS)) {
       reportUnsent();
-      write(log, "peer", "gone", "对方没有把告别说回来");
+      write(log, "peer", "gone", t("The other side did not say goodbye back", "对方没有把告别说回来"));
       return;
     }
     await delay(RELAY_POLL_MS);
@@ -453,7 +461,7 @@ function outbox(lines: LineSource, logFile: string): Outbox {
         if (file) {
           const loaded = await loadFile(file.text);
           if (typeof loaded === "string") {
-            write(logFile, "local", "undelivered", `${text}（${loaded}）`);
+            write(logFile, "local", "undelivered", labelled(text, loaded));
             continue;
           }
           attached = loaded;
@@ -471,7 +479,7 @@ function outbox(lines: LineSource, logFile: string): Outbox {
             holdUntil = Date.now() + THROTTLE_RETRY_MS;
             if (!throttleNoted) {
               throttleNoted = true;
-              write(logFile, "local", "throttled", `中继这一分钟不再收这个房间的消息了，还有 ${backlog.length} 句在排队，稍后按原来的顺序自动发出`);
+              write(logFile, "local", "throttled", t(`The relay is taking no more messages for this room this minute; ${backlog.length} lines are queued and will go out shortly in their original order`, `中继这一分钟不再收这个房间的消息了，还有 ${backlog.length} 句在排队，稍后按原来的顺序自动发出`));
             }
             return false;
           }
@@ -486,12 +494,12 @@ function outbox(lines: LineSource, logFile: string): Outbox {
           return true;
         }
         if (working) write(logFile, "local", "working", working.text);
-        else if (attached) write(logFile, "local", "files", `${attached.name}（${size(attached.bytes.byteLength)}）`);
+        else if (attached) write(logFile, "local", "files", labelled(attached.name, size(attached.bytes.byteLength)));
         else write(logFile, "local", "say", text);
       }
       if (lines.ended() && !noted) {
         noted = true;
-        write(logFile, "local", "input-closed", `标准输入已关闭，这一方只能收听。要结束对话，写一行 ${BYE}`);
+        write(logFile, "local", "input-closed", t(`Standard input is closed, so this side can only listen. To end the conversation, write a line ${BYE}`, `标准输入已关闭，这一方只能收听。要结束对话，写一行 ${BYE}`));
       }
       return false;
     },
@@ -556,18 +564,18 @@ function unseal(box: Channel, logFile: string, text: string): Wire | undefined {
   try {
     opened = box.open(text);
   } catch {
-    write(logFile, "peer", "refused", `这一句解不开（密钥不对或被篡改）：${brief(text)}`);
+    write(logFile, "peer", "refused", t(`A line that cannot be opened (wrong key, or tampered with): ${brief(text)}`, `这一句解不开（密钥不对或被篡改）：${brief(text)}`));
     return undefined;
   }
   // The relay carries these lines and could hand one over twice, putting an old answer under a
   // new question. Counters only ever go up; a gap is a send that failed, a repeat is a replay.
   if (!box.fresh(opened.counter)) {
-    write(logFile, "peer", "refused", `重复的消息，已经忽略（可能是中继重放）：${brief(opened.wire)}`);
+    write(logFile, "peer", "refused", t(`A repeated message, ignored (possibly replayed by the relay): ${brief(opened.wire)}`, `重复的消息，已经忽略（可能是中继重放）：${brief(opened.wire)}`));
     return undefined;
   }
   const wire = parseWire(opened.wire);
   if (wire.kind === "sealed") {
-    write(logFile, "peer", "refused", "一层里面还是一层，已经忽略");
+    write(logFile, "peer", "refused", t("A seal inside a seal; ignored", "一层里面还是一层，已经忽略"));
     return undefined;
   }
   return wire;
@@ -579,7 +587,7 @@ function readable(box: Channel, text: string): string {
   try {
     return brief(box.open(text).wire);
   } catch {
-    return "（无法解密）";
+    return t("(cannot be decrypted)", "（无法解密）");
   }
 }
 
@@ -589,7 +597,7 @@ function readable(box: Channel, text: string): string {
  */
 export function brief(text: string, max = 80): string {
   const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max)}…（共 ${flat.length} 字）`;
+  return flat.length <= max ? flat : `${flat.slice(0, max)}…${t(` (${flat.length} characters in all)`, `（共 ${flat.length} 字）`)}`;
 }
 
 /** Who the other side is, as far as this machine knows: a contact's name, or a fingerprint to check. */
@@ -601,7 +609,7 @@ function introduce(logFile: string, home: string, publicKey: string): void {
     known = undefined;
   }
   const print = fingerprint(publicKey);
-  write(logFile, "peer", "identity", known ? `${known}（联系人，指纹 ${print}）` : `不在联系人里，指纹 ${print}`);
+  write(logFile, "peer", "identity", known ? t(`${known} (contact, fingerprint ${print})`, `${known}（联系人，指纹 ${print}）`) : t(`not a contact, fingerprint ${print}`, `不在联系人里，指纹 ${print}`));
 }
 
 /** Attachments are not written to disk unless the person asked for that, so say what arrived. */
@@ -609,7 +617,7 @@ function noteFiles(logFile: string, event: SessionEvent, kept: boolean): void {
   if (event.files.length === 0) return;
   const names = event.files.map((file) => file.name).join(" ");
   if (kept) write(logFile, "peer", "files", event.files.map((file) => file.path).join(" "));
-  else write(logFile, "peer", "files", `对方带了 ${event.files.length} 个文件，没有保存（${KEEP_HINT}）：${names}`);
+  else write(logFile, "peer", "files", t(`The other side sent ${event.files.length} ${event.files.length === 1 ? "file" : "files"}, not saved (${keepHint()}): ${names}`, `对方带了 ${event.files.length} 个文件，没有保存（${keepHint()}）：${names}`));
 }
 
 async function sayLocal(host: RunningHost, text: string, sealed?: Buffer): Promise<void> {
@@ -630,17 +638,27 @@ async function pollLocal(host: RunningHost, after: number): Promise<SessionEvent
 
 function joinFailure(error: unknown): string {
   const detail = error instanceof Error ? error.message : String(error);
-  // The room answered and said no. Say what it said, rather than guess at a typo.
-  if (detail.includes(REFUSE_SEAT_TAKEN)) {
-    return `加入房间失败：${REFUSE_SEAT_TAKEN}。配对码本身没有问题。如果是你之前加入过又退出了，请对方重新执行 agenthop "<任务背景>" 开一个新房间。`;
+  // The room answered and said no. Say what it said, rather than guess at a typo. Either language
+  // will do: the other side may be older, or speak the other one.
+  if (heard(detail, REFUSE_SEAT_TAKEN)) {
+    return t(
+      `Could not join: ${REFUSE_SEAT_TAKEN[0]}. The pairing code itself is fine. If you joined before and left, ask the other side to run agenthop "<background>" again for a new room.`,
+      `加入房间失败：${REFUSE_SEAT_TAKEN[1]}。配对码本身没有问题。如果是你之前加入过又退出了，请对方重新执行 agenthop "<任务背景>" 开一个新房间。`,
+    );
   }
-  if (detail.includes(REFUSE_NOT_INVITED)) {
-    return `加入房间失败：${REFUSE_NOT_INVITED}。`;
+  if (heard(detail, REFUSE_NOT_INVITED)) {
+    return t(`Could not join: ${REFUSE_NOT_INVITED[0]}.`, `加入房间失败：${REFUSE_NOT_INVITED[1]}。`);
   }
-  if (detail.includes(REFUSE_NO_KEY)) {
-    return "加入房间失败：配对码最后一段的密钥对不上，多半是复制的时候漏了或多了字符。请对方把 waiting 那一行整行重新发一遍。";
+  if (heard(detail, REFUSE_NO_KEY)) {
+    return t(
+      "Could not join: the key at the end of the pairing code does not match. Most likely characters were lost or added when it was copied. Ask the other side to send the whole waiting line again.",
+      "加入房间失败：配对码最后一段的密钥对不上，多半是复制的时候漏了或多了字符。请对方把 waiting 那一行整行重新发一遍。",
+    );
   }
-  return `加入房间失败。配对码可能打错了，或者房间已经过期（十分钟没有对话就会消失）。请对方重新执行 agenthop "<任务背景>" 拿一个新配对码。\n${detail}`;
+  return t(
+    `Could not join. The pairing code may be mistyped, or the room has expired (it disappears after ten minutes without a message). Ask the other side to run agenthop "<background>" again for a new code.\n${ours(detail)}`,
+    `加入房间失败。配对码可能打错了，或者房间已经过期（十分钟没有对话就会消失）。请对方重新执行 agenthop "<任务背景>" 拿一个新配对码。\n${ours(detail)}`,
+  );
 }
 
 export type Seat = "create" | "join";
@@ -729,7 +747,14 @@ function isFile(text: string): { text: string } | undefined {
   return found?.text ? found : undefined;
 }
 
-const KEEP_HINT = "要保存，开房间或加入时允许接收文件：命令行加 --accept-files，MCP 传 accept_files";
+function keepHint(): string {
+  return t("to keep files, allow them when opening or joining: --accept-files on the command line, accept_files over MCP", "要保存，开房间或加入时允许接收文件：命令行加 --accept-files，MCP 传 accept_files");
+}
+
+/** Something with a note after it, the way each language writes that. */
+export function labelled(text: string, note: string): string {
+  return t(`${text} (${note})`, `${text}（${note}）`);
+}
 
 /** What a file line says about the sealed bytes that travel with it. */
 type FileHeader = { name: string; type: string; size: number; sha256: string };
@@ -755,15 +780,19 @@ function fileHeader(parsed: Wire): FileHeader | undefined {
 async function loadFile(filePath: string): Promise<HopFile | string> {
   try {
     const [file] = await filesFromPaths([filePath]);
-    return file ?? "没有读到内容";
+    return file ?? t("nothing was read", "没有读到内容");
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return "找不到这个文件";
-    if (code === "EISDIR") return "这是一个目录，只能发单个文件";
-    if (error instanceof Error && /exceed/.test(error.message)) return `超过单个文件 ${MAX_ATTACHMENT_BYTES / 1024} KiB 的上限`;
+    if (code === "ENOENT") return t("no such file", "找不到这个文件");
+    if (code === "EISDIR") return t("this is a directory; only single files can be sent", "这是一个目录，只能发单个文件");
+    if (error instanceof Error && /exceed/.test(error.message)) return t(`over the ${MAX_ATTACHMENT_BYTES / 1024} KiB limit for one file`, `超过单个文件 ${MAX_ATTACHMENT_BYTES / 1024} KiB 的上限`);
     return error instanceof Error ? error.message : String(error);
   }
 }
+
+const ATTACHMENT_MISMATCH: Reason = ["The attachment does not match the line that announced it; ignored", "附件和说明它的那一句对不上，已经忽略"];
+const ATTACHMENT_SEALED: Reason = ["The attachment cannot be opened (wrong key, or tampered with); ignored", "附件解不开（密钥不对或被篡改），已经忽略"];
+const ATTACHMENT_HASH: Reason = ["The attachment does not match the line that announced it (hash differs); ignored", "附件和说明它的那一句对不上（哈希不符），已经忽略"];
 
 /**
  * Sealed bytes that arrived, opened and checked against the sealed line that announced them.
@@ -774,16 +803,16 @@ function openFiles(box: Channel, text: string, files: HopFile[]): HopFile[] | st
   try {
     header = fileHeader(parseWire(box.open(text).wire));
   } catch {
-    return REFUSE_NO_KEY;
+    return said(REFUSE_NO_KEY);
   }
-  if (!header || files.length !== 1) return "附件和说明它的那一句对不上，已经忽略";
+  if (!header || files.length !== 1) return said(ATTACHMENT_MISMATCH);
   let bytes: Buffer;
   try {
     bytes = box.openBytes(files[0]!.bytes);
   } catch {
-    return "附件解不开（密钥不对或被篡改），已经忽略";
+    return said(ATTACHMENT_SEALED);
   }
-  if (sha256(bytes) !== header.sha256) return "附件和说明它的那一句对不上（哈希不符），已经忽略";
+  if (sha256(bytes) !== header.sha256) return said(ATTACHMENT_HASH);
   return [{ name: safeName(header.name), mediaType: header.type, bytes }];
 }
 
@@ -792,23 +821,23 @@ function receiveFile(box: Channel, logFile: string, event: SessionEvent, parsed:
   const header = fileHeader(parsed);
   const blob = event.files.find((file) => file.data);
   if (!header || !blob?.data) {
-    write(logFile, "peer", "refused", "附件和说明它的那一句对不上，已经忽略");
+    write(logFile, "peer", "refused", t(...ATTACHMENT_MISMATCH));
     return;
   }
   let bytes: Buffer;
   try {
     bytes = box.openBytes(Buffer.from(blob.data, "base64"));
   } catch {
-    write(logFile, "peer", "refused", "附件解不开（密钥不对或被篡改），已经忽略");
+    write(logFile, "peer", "refused", t(...ATTACHMENT_SEALED));
     return;
   }
   if (sha256(bytes) !== header.sha256) {
-    write(logFile, "peer", "refused", "附件和说明它的那一句对不上（哈希不符），已经忽略");
+    write(logFile, "peer", "refused", t(...ATTACHMENT_HASH));
     return;
   }
   const name = safeName(header.name);
   if (!keep) {
-    write(logFile, "peer", "files", `对方带了 1 个文件，没有保存（${KEEP_HINT}）：${name}（${size(bytes.byteLength)}）`);
+    write(logFile, "peer", "files", t(`The other side sent 1 file, not saved (${keepHint()}): ${labelled(name, size(bytes.byteLength))}`, `对方带了 1 个文件，没有保存（${keepHint()}）：${labelled(name, size(bytes.byteLength))}`));
     return;
   }
   const folder = path.join(inbox, event.id);
@@ -832,7 +861,8 @@ function tooLong(text: string): boolean {
 
 /** An oversized line is described, not copied whole into the log. */
 function oversized(text: string): string {
-  return `${brief(text)}（${Math.ceil(Buffer.byteLength(text) / 1024)} KiB，超过单条 64 KiB 的上限，没有发出。拆成几句再发）`;
+  const kib = Math.ceil(Buffer.byteLength(text) / 1024);
+  return labelled(brief(text), t(`${kib} KiB, over the 64 KiB limit for one line; not sent. Split it into several`, `${kib} KiB，超过单条 64 KiB 的上限，没有发出。拆成几句再发`));
 }
 
 /** A line that never went, as it is written down: in full, unless it is too long to be useful. */

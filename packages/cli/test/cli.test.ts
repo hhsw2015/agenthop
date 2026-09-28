@@ -1,10 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { startRelay, type RunningRelay } from "@agenthop/relay-node";
+import { skillMarkdown, skillMarkdownZh } from "../src/skill-text.js";
 
 const launcher = fileURLToPath(new URL("../bin/agenthop.mjs", import.meta.url));
 const started: ChildProcessWithoutNullStreams[] = [];
@@ -53,7 +54,7 @@ describe("the command itself", () => {
       const child = run(["host"], "http://127.0.0.1:1", await mkdtemp(path.join(tmpdir(), "agenthop-cli-")));
       const output = collect(child);
       expect(await exitOf(child)).toBe(1);
-      expect(output()).toContain("agenthop host 已经没有了");
+      expect(output()).toContain("agenthop host is gone");
     },
     20000,
   );
@@ -78,11 +79,38 @@ describe("the command itself", () => {
     },
     40000,
   );
+
+  it(
+    "tells someone who never chose a language how to have Chinese, and keeps the one they choose",
+    async () => {
+      // What `update` runs with the new program. Everything before English spoke Chinese, so
+      // this line is where someone used to that finds out.
+      const home = await mkdtemp(path.join(tmpdir(), "agenthop-cli-"));
+      const skill = path.join(home, ".agenthop", "SKILL.md");
+      const unchosen = run(["install", "--skill-only"], "http://127.0.0.1:1", home, { AGENTHOP_LANG: "" });
+      const said = collect(unchosen);
+      expect(await closeOf(unchosen)).toBe(0);
+      expect(said()).toContain("要用中文：agenthop install --lang zh");
+      expect(await readFile(skill, "utf8")).toBe(skillMarkdown);
+
+      const chosen = run(["install", "--skill-only", "--lang", "zh"], "http://127.0.0.1:1", home, { AGENTHOP_LANG: "" });
+      const saidZh = collect(chosen);
+      expect(await closeOf(chosen)).toBe(0);
+      expect(saidZh()).toContain("语言：中文");
+      expect(await readFile(skill, "utf8")).toBe(skillMarkdownZh);
+
+      // The next update names no language and keeps the one chosen.
+      const again = run(["install", "--skill-only"], "http://127.0.0.1:1", home, { AGENTHOP_LANG: "" });
+      expect(await closeOf(again)).toBe(0);
+      expect(await readFile(skill, "utf8")).toBe(skillMarkdownZh);
+    },
+    40000,
+  );
 });
 
-function run(args: string[], relay: string, home: string): ChildProcessWithoutNullStreams {
+function run(args: string[], relay: string, home: string, env: Record<string, string> = {}): ChildProcessWithoutNullStreams {
   const child = spawn(process.execPath, [launcher, ...args], {
-    env: { ...process.env, AGENTHOP_RELAY: relay, HOME: home, USERPROFILE: home },
+    env: { ...process.env, AGENTHOP_RELAY: relay, HOME: home, USERPROFILE: home, ...env },
     stdio: ["pipe", "pipe", "pipe"],
     detached: true,
   });
@@ -114,6 +142,11 @@ function waitFor(child: ChildProcessWithoutNullStreams, pattern: RegExp): Promis
     child.stdout.on("data", read);
     child.stderr.on("data", read);
   });
+}
+
+/** The exit code, once everything the process wrote has been read. */
+function closeOf(child: ChildProcessWithoutNullStreams): Promise<number | null> {
+  return new Promise((resolve) => child.on("close", (code) => resolve(code)));
 }
 
 function exitOf(child: ChildProcessWithoutNullStreams): Promise<number | null> {

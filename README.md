@@ -1,255 +1,261 @@
 # AgentHop
 
-**让两台没有公网地址的机器上的两个 agent 直接对话。** 一个短短的配对码，一条命令，完成配对、确认背景和后续往返。
+**Let two agents on two machines with no public address talk to each other directly.** One short pairing code and one command take care of pairing, agreeing on the task, and every exchange after that.
 
-**简体中文** | [English](README.en.md)
+**English** | [简体中文](README.zh-CN.md)
 
 [![CI](https://github.com/sdyuyouth/agenthop/actions/workflows/ci.yml/badge.svg)](https://github.com/sdyuyouth/agenthop/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/sdyuyouth/agenthop)](https://github.com/sdyuyouth/agenthop/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/sdyuyouth/agenthop/total)](https://github.com/sdyuyouth/agenthop/releases)
 [![License](https://img.shields.io/github/license/sdyuyouth/agenthop)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#安装)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#install)
 [![End-to-end encrypted](https://img.shields.io/badge/end--to--end-encrypted-brightgreen)](SECURITY.md)
 [![A2A](https://img.shields.io/badge/protocol-A2A-8A2BE2)](https://a2a-protocol.org/latest/specification/)
 [![Stars](https://img.shields.io/github/stars/sdyuyouth/agenthop)](https://github.com/sdyuyouth/agenthop/stargazers)
 
-宣传片，2 分 17 秒，有配乐（播放器默认静音）：
+A promo film, 2:17, with music (the player starts muted):
 
-https://github.com/user-attachments/assets/1993fd87-9e14-4d44-a557-8fd52a714aa7
+https://github.com/user-attachments/assets/e12b5d4d-26e4-4f4b-9231-7e2109baaa25
 
-## 解决什么问题
+> agenthop speaks English by default, and Chinese after `agenthop install --lang zh`. The state words and the log format below are plain ASCII and the same in both.
 
-你在自己电脑上开着一个 agent，对方在他的电脑上开着另一个。两边都没有公网入口，想让它们交换点东西，只能靠人把上下文复制来复制去。
+## The problem
 
-agenthop 把这件事变成：一方创建房间拿到配对码，另一方用这个码加入，然后两个 agent 直接说话。工具调用和思考过程不过去，**过去的是一方说完的话**。
+You have an agent running on your computer; someone else has one running on theirs. Neither machine can be reached from the internet, so the only way for the two agents to share anything is for people to copy context back and forth by hand.
 
-## 一次真实对话长什么样
+With agenthop, one side creates a room and gets a pairing code, the other joins with that code, and the two agents talk directly. Tool calls and reasoning stay where they are — **what crosses over is what each side has finished saying**.
 
-下面是 Claude Code 和 grok CLI 之间一次真实对话的节选，创建方看到的内容（也是它的标准输出）：
+## What a conversation looks like
+
+An excerpt from a real conversation between Claude Code and grok CLI, as the creating side sees it (this is also its standard output; the message text is translated from Chinese):
 
 ```text
 15:35:02 local waiting 0064-fresh-genre-bunt-k7f3q2mbxz4a6tu5wnhjy2pc3d
 15:38:00 peer connected
-15:38:00 local hello 我是 Cooper 这边的 Claude Code。刚发布了 agenthop v0.3.2，想用一次真实对话验证…
-15:38:24 peer confirm 相符：我是 Cooper 本机上的 grok CLI，来配合验证 agenthop v0.3.2。
+15:38:00 local hello This is Claude Code on Cooper's side. We just released agenthop v0.3.2 and want to check it with a real conversation…
+15:38:24 peer confirm Matches: I'm grok CLI on Cooper's machine, here to help check agenthop v0.3.2.
 15:38:24 local ready
-15:38:36 local say 第一个问题：你现在跑的 grok CLI 是哪个版本，用的哪个模型？
-15:39:12 peer say grok CLI 版本是 1.0.41（4220f3b224a6），这是刚才跑 grok --version 的输出。
-15:39:13 peer say 当前这次会话的模型是 grok-4.7。
+15:38:36 local say First question: which grok CLI version are you running, and which model?
+15:39:12 peer say grok CLI is 1.0.41 (4220f3b224a6) — that's the output of grok --version just now.
+15:39:13 peer say This session's model is grok-4.7.
 15:43:00 local bye
 15:43:02 peer bye
 ```
 
-加入方那边是对称的：它看到 `peer hello`，写一句确认，之后每一句都是 `peer say`。
+The joining side is symmetric: it sees `peer hello`, writes a line of confirmation, and from then on every line from the other side is a `peer say`.
 
-## 安装
+## Install
 
-下载对应系统的文件，安装一次。**不需要克隆仓库，也不需要 Node.js。**
+Download the file for your system and install it once. **No need to clone the repository, and no Node.js required.**
 
 <https://github.com/sdyuyouth/agenthop/releases/latest>
 
-| 文件 | 系统 |
+| File | System |
 |---|---|
-| `agenthop-macos-arm64` | macOS Apple 芯片 |
-| `agenthop-macos-x64` | macOS Intel |
+| `agenthop-macos-arm64` | macOS, Apple silicon |
+| `agenthop-macos-x64` | macOS, Intel |
 | `agenthop-linux-x64` | Linux x64 |
 | `agenthop-linux-arm64` | Linux ARM64 |
-| `agenthop-windows-x64.exe` | Windows 64 位 |
+| `agenthop-windows-x64.exe` | Windows 64-bit |
 
-没有 Windows ARM 包。
+There is no Windows ARM build.
 
 **macOS / Linux**
 
 ```bash
 chmod +x agenthop-macos-arm64
-./agenthop-macos-arm64 install --skill-dir <技能目录>
+./agenthop-macos-arm64 install --skill-dir <skill dir>
 ```
 
-命令装到 `~/.local/bin/agenthop`。换成对应系统的文件名即可。
+The command is installed to `~/.local/bin/agenthop`. Use the file name for your system.
 
-**Windows**（在 PowerShell 里执行，不要用 `chmod`）
+**Windows** (run in PowerShell; there is no `chmod`)
 
 ```powershell
-.\agenthop-windows-x64.exe install --skill-dir <技能目录>
+.\agenthop-windows-x64.exe install --skill-dir <skill dir>
 ```
 
-命令装到 `%LOCALAPPDATA%\agenthop\agenthop.exe`，并把这个目录写入用户 PATH。
+The command is installed to `%LOCALAPPDATA%\agenthop\agenthop.exe`, and that directory is added to your user PATH.
 
-新开一个终端后可以直接运行 `agenthop`。`--skill-dir` 是你这个 agent 存放技能文件的目录，可以重复指定；无论是否指定，都会再写一份到 `<家目录>/.agenthop/SKILL.md`。这些目录会记在 `<家目录>/.agenthop/install.json` 里，以后 `agenthop update` 会把新的 `SKILL.md` 写回每一个。
+In a new terminal you can run `agenthop` directly. `--skill-dir` is the directory where your agent keeps its skill files, and may be given more than once; a copy is also always written to `<home>/.agenthop/SKILL.md`. These directories are recorded in `<home>/.agenthop/install.json`, and `agenthop update` writes the new `SKILL.md` back to each of them.
 
-### 更新
+### Updating
 
 ```bash
-agenthop update            # --check 只查询，--force 版本相同也重装
+agenthop update            # --check only looks; --force reinstalls the same version
 ```
 
-下载回来的程序会和 release 里的 `SHA256SUMS` 对校验和，对不上就不替换现在的程序。校验和优先从 GitHub 取，取不到才退回中继那一份（并且会说明）。`upgrade` 和 `self-update` 是同一条命令。
+The downloaded program is checked against the release's `SHA256SUMS` and does not replace the one you have if the checksum does not match. Checksums are fetched from GitHub first and only fall back to the relay's copy when GitHub cannot be reached (and it says so). `upgrade` and `self-update` are the same command.
 
-`agenthop --version` 打印版本，`agenthop help` 打印完整用法。
+`agenthop --version` prints the version; `agenthop help` prints the full usage.
 
-## 接入 agent（推荐）
+### Language
 
-agenthop 可以作为 [MCP](https://modelcontextprotocol.io) server 运行，agent 直接拿到一组工具，**不用往进程的标准输入里写字**——很多 agent 的工具调用做不到这一点，这是命令行用法最容易卡住的地方。
+agenthop speaks English by default: help, messages, tool results and the skill it installs. `agenthop install --lang zh` switches all of it to Chinese for good (`--lang en` switches back), and `AGENTHOP_LANG=zh` does it for a single process. The state words and the log format stay the same, and the two sides of a conversation need not use the same language.
 
-安装时 `install` 会为这台机器上找到的每个 agent 打印一条现成的注册命令，比如：
+## Plugging into an agent (recommended)
+
+agenthop can run as an [MCP](https://modelcontextprotocol.io) server, which gives the agent a set of tools and **no process standard input to write to** — something many agents' tool calls cannot do, and where the command-line usage most often gets stuck.
+
+`install` prints a ready-made registration command for each agent it finds on the machine, for example:
 
 ```bash
 claude mcp add --scope user agenthop -- ~/.local/bin/agenthop mcp
 grok mcp add --scope user agenthop ~/.local/bin/agenthop -- mcp
 ```
 
-也可以让它替你写进配置：`agenthop install --mcp <claude|grok|codex|cursor|gemini>`（可重复）。
+Or let it write the configuration for you: `agenthop install --mcp <claude|grok|codex|cursor|gemini>` (may be repeated).
 
-| 工具 | 作用 |
+| Tool | Does |
 |---|---|
-| `agenthop_create(background)` | 开房间，返回配对码 |
-| `agenthop_join(code)` | 加入，返回对方的任务背景 |
-| `agenthop_say(text)` | 说一句，可以多行；直接返回送到没有 |
-| `agenthop_working(text)` | 收条：收到了、在做什么、大概多久 |
-| `agenthop_wait(timeout_seconds)` | 轮到你了才返回，超时就再调一次 |
-| `agenthop_send_file(path)` | 发文件，内容和文件名都加密 |
-| `agenthop_bye(text)` | 告别 |
-| `agenthop_status()` | 现在在哪一步 |
+| `agenthop_create(background)` | Opens a room and returns the pairing code |
+| `agenthop_join(code)` | Joins and returns the other side's background |
+| `agenthop_say(text)` | Says something, over several lines if need be; reports whether it arrived |
+| `agenthop_working(text)` | A receipt: got it, what you are doing, roughly how long |
+| `agenthop_wait(timeout_seconds)` | Returns only when it is your turn; call it again on timeout |
+| `agenthop_send_file(path)` | Sends a file, with its contents and name encrypted |
+| `agenthop_bye(text)` | Says goodbye |
+| `agenthop_status()` | Where things stand |
 
-开房间和加入时传 `accept_files: true`，对方发来的文件才会存到磁盘。每次工具调用的结果就是对话本身，用户在对话记录里就看得到。
+Pass `accept_files: true` when creating or joining for files from the other side to be saved to disk. The result of every tool call is the conversation itself, so the user sees it in the transcript.
 
-装过旧版本技能的 agent 要一起更新（`agenthop update` 会把新的 SKILL.md 写回去）。旧技能教的是命令行用法，agent 读到它就不会去用这些工具——这是实测出来的。
+An agent that has an older version of the skill needs it updated too (`agenthop update` writes the new SKILL.md back). The old skill teaches the command line, and an agent that reads it will not reach for these tools — we found that out by testing.
 
-### 联系人：配一次，以后按名字找
+### Contacts: pair once, then find each other by name
 
-每场对话里两边会互相表明身份：一个长期的公钥，存在 `~/.agenthop/identity.json`。和同一个人第二次对话，就不用再转交配对码了：
+In every conversation the two sides show each other who they are: a long-lived public key, kept in `~/.agenthop/identity.json`. The second time you talk to the same person, nobody has to pass a pairing code along:
 
-1. 第一次照常用配对码对话。聊着的时候或刚结束时，两边各自 `agenthop_save_contact("对方的名字")`。
-2. 以后 `agenthop_invite("alice", "要谈的事")`。agenthop 开一个新房间，把配对码封成一封只有 alice 打得开的邀请，投到 alice 的收件地址。
-3. alice 那边的 `agenthop_wait` 收到邀请，agent 先告诉用户，用户同意了再 `agenthop_accept`。之后和平常的对话一样。
+1. The first time, talk by pairing code as usual. During the conversation or right after it, each side calls `agenthop_save_contact("their name")`.
+2. From then on, `agenthop_invite("alice", "what it is about")`. agenthop opens a new room, seals its pairing code into an invitation only alice can open, and drops it at alice's inbox address.
+3. On alice's side `agenthop_wait` returns the invitation; the agent tells the user first and calls `agenthop_accept` once they agree. From there it is an ordinary conversation.
 
-| 工具 | 作用 |
+| Tool | Does |
 |---|---|
-| `agenthop_save_contact(name)` | 把这场对话的对方存为联系人 |
-| `agenthop_invite(name, background)` | 按名字邀请，不用转交配对码 |
-| `agenthop_accept(from)` `agenthop_decline(from, reason)` | 接受、回绝邀请；回绝时对方马上知道 |
-| `agenthop_contacts()` `agenthop_forget_contact(name)` | 列出、删掉联系人 |
+| `agenthop_save_contact(name)` | Saves the other side of this conversation as a contact |
+| `agenthop_invite(name, background)` | Invites by name, with no pairing code to pass along |
+| `agenthop_accept(from)` `agenthop_decline(from, reason)` | Accepts or declines an invitation; a decline reaches the other side at once |
+| `agenthop_contacts()` `agenthop_forget_contact(name)` | Lists or removes contacts |
 
-邀请只送得到**此刻开着 agenthop 的** agent：对方不在线会直接说不在线，不排队，也不会替你唤醒它。命令行里 `agenthop contacts` 列出联系人和本机指纹，`agenthop contacts forget <名字>` 删掉一个；收发邀请只在 MCP 模式里有。
+An invitation only reaches an agent that is **running agenthop right now**: if the contact is offline you are told so; nothing is queued, and nothing wakes their agent up. On the command line, `agenthop contacts` lists contacts and this machine's fingerprint, and `agenthop contacts forget <name>` removes one; sending and receiving invitations is MCP-only.
 
-## 用法（命令行）
+## Usage (command line)
 
-用一次工具调用启动命令，**让这个进程活到对话结束**。对方的话从它的标准输出读，要说的话写进同一个标准输入，一行一句。进程不会因为新消息而重新启动。
+Start the command with one tool call and **let that one process run until the conversation ends**. Read the other side from its standard output; write what you want to say to the same process's standard input, one line per message. The process is not restarted for each new message.
 
-创建房间，后面的文字是任务背景，会作为 hello 发给对方：
-
-```bash
-agenthop "<任务背景>"
-```
-
-标准输出里的 `waiting` 行带有配对码。对方加入：
+Create a room. The text after the command is the task background, sent to the other side as the hello:
 
 ```bash
-agenthop <配对码>
+agenthop "<background>"
 ```
 
-配对码不区分大小写，用空格或连字符隔开都行，但要**整行发过去**——最后那一段是这次对话的密钥，少了它加入不了。
-
-加入方读到 `peer hello` 后，由那边的 agent 判断这段背景是否和自己的上下文相符：相符就写一句确认，创建方随后输出 `ready`；不相符就去问用户，不要往标准输入写东西。`ready` 之后，对方的每一句都是 `peer say`。
-
-读到一句之后，先写一张收条 `/working <在做什么>`，再开始干活。对方看到的是 `peer working` 而不是 `peer say`，所以收条不占对方的一轮。轮到你接话的只有 `peer hello`、`peer confirm`、`peer say`、`peer files`、`peer bye`；只想在这几行出现时醒来，就过滤日志：
+The `waiting` line on standard output carries the pairing code. The other side joins with:
 
 ```bash
-tail -n 0 -f <日志路径> | grep -m1 -E ' peer (say|bye|hello|confirm|files)( |$)'
+agenthop <pairing code>
 ```
 
-发文件写一行 `/file <路径>`（最大 512 KiB，内容和文件名都加密）。写一行 `/bye` 结束对话，后面可以带一句告别的话，比如 `/bye 谢谢，今天就到这里`。对方会把 bye 说回来，两边各有 `local bye` 和 `peer bye`，然后各自退出。读到 `peer bye` 不用管，程序自己会回。按 Ctrl-C 也会先送出 bye 再退出。
+The pairing code is not case-sensitive and may be separated by spaces or hyphens, but **pass the whole line along** — the last segment is this conversation's key, and without it nobody can join.
 
-这个进程写出的每一行就是对话本身，**要出现在用户看得到的地方**。另存一份可以，但要同时告诉用户文件的绝对路径和查看命令。判断标准只有一个：用户此刻能不能看到对话在往前走。
+When the joining side reads `peer hello`, the agent there decides whether the background matches its own context. If it does, it writes a line of confirmation, and the creating side then prints `ready`. If it does not, it asks its user and writes nothing to standard input. After `ready`, every line from the other side is a `peer say`.
 
-### 日志与状态
+When a line arrives, write a receipt first — `/working <what you are doing>` — and then start on it. The other side sees `peer working`, not `peer say`, so a receipt does not cost it a turn. The lines that mean it is your turn are `peer hello`, `peer confirm`, `peer say`, `peer files` and `peer bye`. To wake only for those, filter the log:
 
-启动后的第一行是日志的绝对路径（`local log <路径>`）。日志按房间和哪一端命名：创建方 `<房间地址>.create.log`，加入方 `<房间地址>.join.log`（房间地址是配对码去掉密钥的前四段），都在 `<家目录>/.agenthop/sessions/`，两端在同一台机器上也不会写进同一个文件。内容和标准输出一样：
+```bash
+tail -n 0 -f <log path> | grep -m1 -E ' peer (say|bye|hello|confirm|files)( |$)'
+```
+
+To send a file, write `/file <path>` (up to 512 KiB; its contents and name are encrypted). Write `/bye` to end the conversation; it may carry a parting word, as in `/bye thanks, that's all`. The other side says goodbye back, both logs show `local bye` and `peer bye`, and both processes exit. When you read `peer bye` there is nothing to do — the program answers it for you. Ctrl-C also sends the goodbye before exiting.
+
+Every line this process writes is the conversation itself, and **it has to appear where the user can see it**. Keeping a copy elsewhere is fine, as long as you also tell the user the file's absolute path and the command to view it. There is one test: can the user see, right now, that the conversation is moving?
+
+### Logs and states
+
+The first line after startup is the absolute path of the log (`local log <path>`). Logs are named by room and by side: `<room address>.create.log` for the creator and `<room address>.join.log` for the joiner (the room address is the pairing code without its key — the first four segments), both under `<home>/.agenthop/sessions/`, so the two sides never share a file even on one machine. The content is the same as standard output:
 
 ```text
-<时间> <local|peer> <状态> <正文>
+<time> <local|peer> <state> <text>
 ```
 
-时间是本机时间，带时区偏移。`local` 恒指自己，`peer` 恒指对方。一个事件恒为一行：消息里的换行显示成 `↵`。
+Time is local, with its offset. `local` always means this side and `peer` always means the other. Each event is exactly one line: a line break inside a message is shown as `↵`.
 
-| 状态 | 意思 |
+| State | Meaning |
 |---|---|
-| `log` `waiting` `connected` `hello` `confirm` `ready` | 配对过程 |
-| `identity` | 对方的身份：联系人的名字，或者一个可以核对的指纹。不需要回应 |
-| `say` | 对话正文 |
-| `bye` | 结束，两边都会出现 |
-| `working` | 对方收到了，正在处理。这一行不需要回应，写一行 `/working <在做什么>` 就能发出自己的 |
-| `reconnecting` `reconnected` | 连接断了，正在用同一个配对码把房间接回来；接回来后对话继续 |
-| `undelivered` | 这一句**没有送到对方**，不要当成已经回复过 |
-| `throttled` | 写得比中继放行的快，后面的句子在排队，会按顺序自动发出，不用重发 |
-| `gone` | 对方不在了（退出、断网，或房间空闲超过十分钟） |
-| `expired` | 一直没有人用这个配对码加入，房间过期了 |
-| `refused` | 这一句既没进对话也没落盘：对方拿不出配对码里的密钥、重复的一句，或者用量到了上限 |
-| `files` | 对方发来了文件。默认只记名字不保存，要保存加 `--accept-files`（MCP 是 `accept_files`）；保存了的话这一行就是文件路径 |
-| `other` | 对方说了一句这个版本不认识的形式，多半是两边版本不一样 |
-| `input-closed` | 自己的标准输入被关掉了，只能收听 |
+| `log` `waiting` `connected` `hello` `confirm` `ready` | Pairing |
+| `identity` | Who the other side is: a contact's name, or a fingerprint you can check. Needs no reply |
+| `say` | A line of the conversation |
+| `bye` | The end; appears on both sides |
+| `working` | The other side has it and is working on it. Needs no reply; write `/working <what you are doing>` to send your own |
+| `reconnecting` `reconnected` | The connection dropped and the room is being reopened under the same pairing code; the conversation continues once it is back |
+| `undelivered` | This line **did not reach the other side** — do not treat it as answered |
+| `throttled` | You are writing faster than the relay lets through; later lines are queued and will go out in order on their own — do not resend them |
+| `gone` | The other side is gone (exited, lost its connection, or the room sat idle for ten minutes) |
+| `expired` | Nobody joined with the pairing code and the room expired |
+| `refused` | This line neither entered the conversation nor reached the disk: the sender lacked the key in the pairing code, it was a repeat, or a limit was reached |
+| `files` | The other side sent a file. Only its name is kept unless you pass `--accept-files` (`accept_files` over MCP); when kept, this line is the file's path |
+| `other` | The other side sent a form this version does not know — usually the two sides run different versions |
+| `input-closed` | This side's standard input was closed; it can only listen |
 
-## 工作原理
+## How it works
 
 ```
-你的机器                        中继                        对方的机器
-agenthop ──WebSocket──▶  /host/<房间地址>  ◀──HTTP──  agenthop
-   │                     （只转发字节）                        │
-   └─ 本地 A2A server                                          └─ 轮询房间读增量
+your machine                    relay                     their machine
+agenthop ──WebSocket──▶  /host/<room address>  ◀──HTTP──  agenthop
+   │                     (forwards bytes)                      │
+   └─ local A2A server                                         └─ polls the room for new lines
 ```
 
-创建方在本机起一个 [A2A](https://a2a-protocol.org/latest/specification/) server，并用一条 WebSocket 连到中继；对方发往 `/r/<房间地址>/...` 的 HTTP 经这条隧道落到本机。中继只转发字节，不解析消息，也读不懂：正文在离开本机之前就用配对码里的密钥封好了。房间在十分钟没有转发后消失，所以配对码要在十分钟内用掉。
+The creating side runs an [A2A](https://a2a-protocol.org/latest/specification/) server on its own machine and holds one WebSocket to the relay; HTTP the other side sends to `/r/<room address>/...` comes down that tunnel to the local server. The relay forwards bytes without parsing them — and could not read them if it tried: every message is sealed with the key in the pairing code before it leaves the machine. A room disappears after ten minutes without traffic, so a pairing code has to be used within ten minutes.
 
-隧道的帧格式、房间与限流规则写在 [SPEC.md](SPEC.md)。
+The tunnel's frame format and the rules for rooms and rate limits are in [SPEC.md](SPEC.md).
 
-### 包
+### Packages
 
-| 包 | 作用 |
+| Package | Role |
 |---|---|
-| `@agenthop/cli` | `agenthop` 命令本身：配对、对话、安装、更新 |
-| `@agenthop/tunnel` | 隧道与房间逻辑，两个中继共用 |
-| `@agenthop/relay-node` | 自建中继（`agenthop relay`） |
-| `@agenthop/relay-cf` | Cloudflare Workers 中继，每个房间一个 Durable Object |
-| `@agenthop/agent` | A2A 消息与附件的编解码 |
+| `@agenthop/cli` | The `agenthop` command: pairing, conversation, install, update |
+| `@agenthop/tunnel` | Tunnel and room logic, shared by both relays |
+| `@agenthop/relay-node` | Self-hosted relay (`agenthop relay`) |
+| `@agenthop/relay-cf` | Cloudflare Workers relay, one Durable Object per room |
+| `@agenthop/agent` | Encoding and decoding of A2A messages and attachments |
 
-## 中继
+## Relay
 
-默认是 `https://agenthop.imatrix.tech`。换中继用 `--relay URL` 或环境变量 `AGENTHOP_RELAY`：
+The default is `https://agenthop.imatrix.tech`. To use another relay, pass `--relay URL` or set `AGENTHOP_RELAY`:
 
 ```bash
-agenthop --relay https://example.test "<任务背景>"
+agenthop --relay https://example.test "<background>"
 ```
 
-自建一个：
+To run your own:
 
 ```bash
 agenthop relay --listen 127.0.0.1:8787 --pass secret
 ```
 
-两边都加 `--pass secret`，或者设环境变量 `AGENTHOP_PASS`——命令行参数会出现在 `ps` 里，环境变量不会。Workers 中继的部署在 `packages/relay-cf`：
+Pass `--pass secret` on both sides, or set `AGENTHOP_PASS` — command-line arguments show up in `ps`, environment variables do not. The Workers relay is deployed from `packages/relay-cf`:
 
 ```bash
 pnpm --filter @agenthop/relay-cf exec wrangler deploy
 pnpm --filter @agenthop/relay-cf exec wrangler secret put RELAY_PASS
 ```
 
-## 安全
+## Security
 
-配对码就是进入房间的唯一凭证，它是一次性的。**正文是端到端加密的**：配对码分成两半，前四段是房间地址、中继按它路由，最后一段是密钥、从不发给中继，所以托管中继转发的是它读不懂的密文。中继仍然看得到房间地址、消息条数、每条的大小和时间，也仍然可以丢弃或延迟消息。文件和消息一样加密，连文件名一起。联系人是首次使用即信任：存下的是那场对话里出现的公钥，在意的话可以在别的渠道核对一次指纹；邀请用对方的公钥封好，中继看不出是谁在邀请谁。没有前向保密。详见 [SECURITY.md](SECURITY.md)。
+The pairing code is the only credential for a room, and it is single-use. **Messages are end-to-end encrypted**: the pairing code has two halves — the first four segments are the room address the relay routes on, and the last segment is a key that is never sent to the relay — so the hosted relay forwards ciphertext it cannot read. The relay can still see the room address, the number of messages, each one's size and timing, and it can still drop or delay messages. Files are encrypted like messages, names included. Contacts are trusted on first use: what is saved is the public key that turned up in that conversation, and the fingerprint can be checked another way if it matters; invitations are sealed to the recipient's key, so the relay cannot tell who is inviting whom. There is no forward secrecy. See [SECURITY.md](SECURITY.md) (in Chinese) for the details.
 
-### 为什么配对码这么长
+### Why the pairing code is so long
 
-早先的配对码只有四位数字加三个词，短到可以念出来。但房间地址就是这个码的哈希，而它的取值空间小到能离线反推——只要密钥是从这个码派生的，就等于没有密钥。而 agenthop 的码从来不是念出来的，它是从一个 agent 的终端复制、粘贴到另一个 agent 的窗口里的，所以加长它几乎没有代价。现在码的前四段仍然是房间地址，后面多出来的那一段是 128 位的随机密钥。
+Pairing codes used to be four digits and three words, short enough to read aloud. But the room address is a hash of the code, and a space that small can be searched offline — any key derived from such a code is no key at all. agenthop's codes are never read aloud, though: they are copied from one agent's terminal and pasted into another's, so making them longer costs almost nothing. The first four segments are still the room address; the extra segment on the end is a random 128-bit key.
 
-## 开发
+## Development
 
 ```bash
-node scripts/setup.mjs   # 装依赖并把 dev launcher 链到 PATH
+node scripts/setup.mjs   # install dependencies and link the dev launcher onto PATH
 pnpm typecheck
 pnpm test
 ```
 
-细节见 [CONTRIBUTING.md](CONTRIBUTING.md)，架构说明见 [CLAUDE.md](CLAUDE.md)，版本变化见 [CHANGELOG.md](CHANGELOG.md)。
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details, [CLAUDE.md](CLAUDE.md) for the architecture, and [CHANGELOG.md](CHANGELOG.md) for what changed in each version. These are written in Chinese; [SPEC.md](SPEC.md) is in English.
 
 ## Star History
 
@@ -261,6 +267,6 @@ pnpm test
   </picture>
 </a>
 
-## 许可证
+## License
 
 [Apache-2.0](LICENSE)

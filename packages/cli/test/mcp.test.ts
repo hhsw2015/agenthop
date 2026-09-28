@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { startRelay } from "@agenthop/relay-node";
+import { setLang } from "../src/lang.js";
 import { startMcpServer } from "../src/mcp.js";
 
 type Result = { text: string; isError: boolean };
@@ -70,13 +71,13 @@ describe("agenthop as an MCP server", () => {
     const joined = await joiner.call("agenthop_join", { code: `\`${code}\`` });
     expect(joined.text).toContain("我想问一下接口的分页参数");
 
-    expect((await joiner.call("agenthop_say", { text: "相符，我这边是后端" })).text).toContain("通道打开了");
+    expect((await joiner.call("agenthop_say", { text: "相符，我这边是后端" })).text).toContain("Channel open");
     const confirmed = await creator.call("agenthop_wait", { timeout_seconds: 10 });
     expect(confirmed.text).toContain("相符，我这边是后端");
-    expect(confirmed.text).toContain("轮到你了");
+    expect(confirmed.text).toContain("Your turn");
 
     // More than one line, as one message. The command line cannot do this; a tool argument can.
-    expect((await creator.call("agenthop_say", { text: "两个问题：\n1. 页码从 0 还是 1 开始？\n2. 最大页长多少？" })).text).toContain("已送达");
+    expect((await creator.call("agenthop_say", { text: "两个问题：\n1. 页码从 0 还是 1 开始？\n2. 最大页长多少？" })).text).toContain("Delivered");
     const asked = await joiner.call("agenthop_wait", { timeout_seconds: 10 });
     expect(asked.text).toContain("两个问题：\n1. 页码从 0 还是 1 开始？\n2. 最大页长多少？");
 
@@ -84,18 +85,18 @@ describe("agenthop as an MCP server", () => {
     expect((await joiner.call("agenthop_working", { text: "收到，我去翻一下代码" })).isError).toBe(false);
     const meanwhile = await creator.call("agenthop_wait", { timeout_seconds: 3 });
     expect(meanwhile.text).toContain("收到，我去翻一下代码");
-    expect(meanwhile.text).toContain("对方还在处理");
+    expect(meanwhile.text).toContain("They are still working on it");
 
     await joiner.call("agenthop_say", { text: "从 1 开始，最大 100" });
     const answered = await creator.call("agenthop_wait", { timeout_seconds: 10 });
     expect(answered.text).toContain("从 1 开始，最大 100");
-    expect(answered.text).toContain("轮到你了");
+    expect(answered.text).toContain("Your turn");
 
     const left = await creator.call("agenthop_bye", { text: "谢谢" });
-    expect(left.text).toContain("对话结束了");
+    expect(left.text).toContain("Conversation over");
     const heard = await joiner.call("agenthop_wait", { timeout_seconds: 10 });
     expect(heard.text).toContain("谢谢");
-    expect(heard.text).toMatch(/告别|结束/);
+    expect(heard.text).toMatch(/goodbye|over/);
     await relay.close();
   });
 
@@ -110,20 +111,20 @@ describe("agenthop as an MCP server", () => {
     const log = Buffer.from("ERROR 2026-09-26 连接超时\n  at retry (net.ts:42)\n");
     await writeFile(path.join(dir, "error.log"), log);
     const sent = await joiner.call("agenthop_send_file", { path: path.join(dir, "error.log") });
-    expect(sent.text, sent.text).toContain("已送达：error.log");
+    expect(sent.text, sent.text).toContain("Delivered: error.log");
     const got = await creator.call("agenthop_wait", { timeout_seconds: 10 });
-    expect(got.text).toContain("轮到你了");
-    const saved = got.text.match(/对方 files：(\S+)/)?.[1];
+    expect(got.text).toContain("Your turn");
+    const saved = got.text.match(/peer files: (\S+)/)?.[1];
     expect((await readFile(saved!)).equals(log), got.text).toBe(true);
 
     await writeFile(path.join(dir, "fix.diff"), "- retry(3)\n+ retry(5)\n");
-    expect((await creator.call("agenthop_send_file", { path: path.join(dir, "fix.diff") })).text).toContain("已送达");
+    expect((await creator.call("agenthop_send_file", { path: path.join(dir, "fix.diff") })).text).toContain("Delivered");
     const back = await joiner.call("agenthop_wait", { timeout_seconds: 10 });
-    expect(await readFile(back.text.match(/对方 files：(\S+)/)![1]!, "utf8")).toBe("- retry(3)\n+ retry(5)\n");
+    expect(await readFile(back.text.match(/peer files: (\S+)/)![1]!, "utf8")).toBe("- retry(3)\n+ retry(5)\n");
 
     const missing = await joiner.call("agenthop_send_file", { path: path.join(dir, "nope.txt") });
     expect(missing.isError).toBe(true);
-    expect(missing.text).toContain("找不到这个文件");
+    expect(missing.text).toContain("no such file");
     await joiner.call("agenthop_bye");
     await relay.close();
   });
@@ -138,7 +139,7 @@ describe("agenthop as an MCP server", () => {
     const slipped = await joiner.call("agenthop_say", { text: "/bye" });
     expect(slipped.isError).toBe(true);
     expect(slipped.text).toContain("agenthop_bye");
-    expect((await joiner.call("agenthop_status")).text).toContain("对话中");
+    expect((await joiner.call("agenthop_status")).text).toContain("Step: talking");
 
     // One conversation at a time per server.
     const second = await creator.call("agenthop_create", { background: "另一件事" });
@@ -151,7 +152,7 @@ describe("agenthop as an MCP server", () => {
     const { relay, joiner } = await room();
     const old = await joiner.call("agenthop_join", { code: "1720-spiny-patch-easel" });
     expect(old.isError).toBe(true);
-    expect(old.text).toContain("少了最后一段密钥");
+    expect(old.text).toContain("missing its last part, the key");
     const nothing = await joiner.call("agenthop_say", { text: "你好" });
     expect(nothing.isError).toBe(true);
     await relay.close();
@@ -170,7 +171,7 @@ describe("agenthop as an MCP server", () => {
     await writeFile(file, "终稿");
     await creator.call("agenthop_send_file", { path: file });
     const got = await joiner.call("agenthop_wait", { timeout_seconds: 10 });
-    const saved = got.text.match(/对方 files：(.+\.txt)/)?.[1];
+    const saved = got.text.match(/peer files: (.+\.txt)/)?.[1];
     expect(saved && path.basename(saved), got.text).toBe("报告 v2（终稿）.txt");
     expect(await readFile(saved!, "utf8")).toBe("终稿");
 
@@ -188,7 +189,7 @@ describe("agenthop as an MCP server", () => {
     // then would never go; it is refused rather than accepted into a queue nobody drains.
     const late = await creator.call("agenthop_say", { text: "还在吗" });
     expect(late.isError).toBe(true);
-    expect(late.text).toContain("已经结束");
+    expect(late.text).toContain("is over");
     await relay.close();
   });
 
@@ -205,11 +206,25 @@ describe("agenthop as an MCP server", () => {
     const texts = ["并发第 1 句", "并发第 2 句", "x".repeat(64 * 1024 + 1), "并发第 4 句", "并发第 5 句"];
     const replies = await Promise.all(texts.map((text) => joiner.call("agenthop_say", { text })));
     expect(replies.map((r) => r.isError)).toEqual([false, false, true, false, false]);
-    expect(replies[2]!.text).toContain("超过单条 64 KiB");
-    expect(replies.filter((r) => !r.isError).every((r) => r.text.includes("已送达"))).toBe(true);
+    expect(replies[2]!.text).toContain("over the 64 KiB limit for one line");
+    expect(replies.filter((r) => !r.isError).every((r) => r.text.includes("Delivered"))).toBe(true);
     let heard = "";
     for (let i = 0; i < 10 && !heard.includes("并发第 5 句"); i++) heard += (await creator.call("agenthop_wait", { timeout_seconds: 5 })).text;
     expect([...heard.matchAll(/并发第 (\d) 句/g)].map((m) => m[1])).toEqual(["1", "2", "4", "5"]);
     await relay.close();
+  });
+
+  it("speaks Chinese to the agent once Chinese is chosen", async () => {
+    setLang("zh");
+    try {
+      const { relay, creator } = await room();
+      expect(creator.client.getInstructions()).toContain("agenthop 让你和另一台机器上的 agent 对话");
+      const { tools } = await creator.client.listTools();
+      expect(tools.find((tool) => tool.name === "agenthop_create")?.description).toContain("开一个房间");
+      expect((await creator.call("agenthop_say", { text: "你好" })).text).toContain("现在没有对话");
+      await relay.close();
+    } finally {
+      setLang("en");
+    }
   });
 });

@@ -32,11 +32,12 @@ pnpm --filter @agenthop/cli exec vitest run -t "says goodbye"    # 单个用例
 
 ## 几条这个仓库特有的规矩
 
-- **`skill/SKILL.md` 是生成源。** 它由 `scripts/build-release.mjs` 转成 `packages/cli/src/skill-text.ts` 编进程序。改了技能文案就要重新生成，否则程序里还是旧文本。
-- **三处说法必须一致**：`skill/SKILL.md`、`README.md`、`packages/cli/src/bin.ts` 里的 `printHelp`。以 SKILL.md 为准。
+- **程序默认说英文，`agenthop install --lang zh` 之后说中文。** 面向人和 agent 的每一句都用 `t(英文, 中文)` 写两遍（`packages/cli/src/lang.ts`），在用到的地方调用，不要存进模块级常量。发回给对方的拒绝理由两种语言一起发（`both`），因为旧版本靠其中的中文认出它们。
+- **技能有两份，都是生成源**：`skill/SKILL.md`（英文）和 `skill/SKILL.zh-CN.md`（中文），由 `scripts/build-release.mjs` 转成 `packages/cli/src/skill-text.ts` 编进程序（只重新生成这一个文件：`node scripts/build-release.mjs --skill-text`）。改了技能文案就要重新生成，否则程序里还是旧文本。
+- **三处说法必须一致**：技能、README、`packages/cli/src/bin.ts` 里的 `printHelp`，以技能为准。每一处都有中英两份：`README.md` 是英文、`README.zh-CN.md` 是中文，逐节对应。
 - **中继逻辑写在 `@agenthop/tunnel`**，两个中继（Node 和 Cloudflare Workers）共用它，不要在两边各写一遍。
 - **stdout 的每一行就是对外接口**，agent 靠它工作。改格式等于改契约，要连文档一起改。
-- 代码注释和 commit message 用英文；README、SKILL.md、CLI 帮助文本用中文。
+- 代码注释和 commit message 用英文。
 
 `CLAUDE.md` 里有更细的架构说明，写给在这个仓库里干活的人和 agent。
 

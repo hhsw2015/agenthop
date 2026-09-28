@@ -10,6 +10,7 @@ import {
 } from "@a2a-js/sdk/server";
 import { filesFromPaths, messageFromParts, partsFromMessage, safeName, type HopFile, type HopMessage } from "@agenthop/agent";
 import { Talk, type SessionEvent, type SessionFile, type Side } from "./talk.js";
+import { both } from "./lang.js";
 
 /** What one conversation may spend. Anyone holding the code can post, so the room counts. */
 export type RoomLimits = { bytes: number; messages: number; textBytes: number };
@@ -115,16 +116,18 @@ export class Room {
   private refuse(message: HopMessage): string | undefined {
     const verdict = this.options.accept?.(message.text) ?? true;
     if (typeof verdict === "string") return verdict;
-    if (!verdict) return "这一句不属于这场对话，已经忽略";
+    if (!verdict) return both("This line does not belong to this conversation; ignored", "这一句不属于这场对话，已经忽略");
     const size = Buffer.byteLength(message.text) + message.files.reduce((sum, file) => sum + file.bytes.byteLength, 0);
     if (Buffer.byteLength(message.text) > this.limits.textBytes) {
-      return `一条消息的正文超过 ${Math.round(this.limits.textBytes / 1024)} KiB，已经拒绝`;
+      const kib = Math.round(this.limits.textBytes / 1024);
+      return both(`A message's text is over ${kib} KiB; refused`, `一条消息的正文超过 ${kib} KiB，已经拒绝`);
     }
     if (this.spent.messages + 1 > this.limits.messages) {
-      return `这次会话的消息条数已经到上限 ${this.limits.messages}，后面的都拒绝`;
+      return both(`This session has reached its limit of ${this.limits.messages} messages; everything after is refused`, `这次会话的消息条数已经到上限 ${this.limits.messages}，后面的都拒绝`);
     }
     if (this.spent.bytes + size > this.limits.bytes) {
-      return `这次会话的总量已经到上限 ${Math.round(this.limits.bytes / 1024 / 1024)} MiB，后面的都拒绝`;
+      const mib = Math.round(this.limits.bytes / 1024 / 1024);
+      return both(`This session has reached its limit of ${mib} MiB; everything after is refused`, `这次会话的总量已经到上限 ${mib} MiB，后面的都拒绝`);
     }
     this.spent.messages += 1;
     this.spent.bytes += size;

@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { startRelay } from "@agenthop/relay-node";
+import { addressOf } from "@agenthop/tunnel";
+import { channel } from "../src/seal.js";
+import { sendMessage } from "../src/send.js";
 import { lineQueue, runSession } from "../src/session.js";
 import { failures, pair, resetFailures, waitForText } from "./harness.js";
 
@@ -194,12 +197,26 @@ describe("a second joiner", () => {
       (error: Error) => error.message,
     );
     expect(failure).toBeDefined();
-    expect(failure).toMatch(/已经有人/);
-    expect(failure).not.toMatch(/打错|密钥对不上|拿不出/);
-    expect(await p.log("creator")).toMatch(/peer refused .*已经有人/);
+    expect(failure).toMatch(/already joined/);
+    expect(failure).not.toMatch(/mistyped|does not match|without the key/);
+    expect(await p.log("creator")).toMatch(/peer refused .*already joined/);
 
     p.joinerLines.push("我还在");
     await waitForText(p.creatorHome, "peer say 我还在");
+    p.joinerLines.push("/bye");
+    await Promise.all([p.creator, p.joiner]);
+    await relay.close();
+  });
+
+  it("is turned away in words a version from before English still knows", async () => {
+    const { dir, relay } = await room();
+    const p = await pair(relay.url, dir);
+    // v0.5 and earlier tell "the seat is taken" from "the code is wrong" by finding this exact
+    // sentence in the refusal. Without it they send the person looking for a typo.
+    const second = channel(p.code, "join");
+    await expect(
+      sendMessage({ code: addressOf(p.code), text: second.seal("[[agenthop:connect:second1]]"), relay: relay.url }),
+    ).rejects.toThrow("已经有人用这个配对码加入了，一个房间只接一个对端");
     p.joinerLines.push("/bye");
     await Promise.all([p.creator, p.joiner]);
     await relay.close();
@@ -375,9 +392,6 @@ describe("nothing typed is lost without a word", () => {
     const { dir, relay } = await room();
     const creatorHome = path.join(dir, "creator");
     const creatorLines = lineQueue();
-    const { channel } = await import("../src/seal.js");
-    const { sendMessage } = await import("../src/send.js");
-    const { addressOf } = await import("@agenthop/tunnel");
     const creator = runSession({ hello: "背景", lines: creatorLines, relay: relay.url, home: creatorHome, byeWaitMs: 800 });
     const code = await waitForText(creatorHome, "waiting");
     const peer = channel(code, "join");

@@ -8,4 +8,4 @@
 
 - [ ] `pnpm typecheck`
 - [ ] `pnpm test`
-- [ ] 改了 `skill/SKILL.md` 的话，`README.md` 和 `bin.ts` 的 `printHelp` 也一起改了
+- [ ] 改了技能的话，中英两份（`skill/SKILL.md`、`skill/SKILL.zh-CN.md`）、两份 README 和 `bin.ts` 的 `printHelp` 也一起改了

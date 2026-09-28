@@ -1,5 +1,6 @@
 import { createCipheriv, createDecipheriv, generateKeyPairSync, hkdfSync, randomBytes } from "node:crypto";
 import { agree, type Identity } from "./identity.js";
+import { both } from "./lang.js";
 
 /**
  * An invitation: a fresh pairing code, sealed so that only the contact it is addressed to can
@@ -46,16 +47,16 @@ export function sealInvitation(sender: Identity, recipient: string, invitation: 
 }
 
 export function openInvitation(recipient: Identity, text: string): OpenedInvitation {
-  if (!text.startsWith(INVITE_PREFIX)) throw new InviteError("这不是一封邀请");
+  if (!text.startsWith(INVITE_PREFIX)) throw new InviteError(both("This is not an invitation", "这不是一封邀请"));
   const raw = Buffer.from(text.slice(INVITE_PREFIX.length), "base64url");
-  if (raw.byteLength < KEY_BYTES + SENDER_BYTES + NONCE_BYTES + TAG_BYTES) throw new InviteError("邀请不完整");
+  if (raw.byteLength < KEY_BYTES + SENDER_BYTES + NONCE_BYTES + TAG_BYTES) throw new InviteError(both("The invitation is incomplete", "邀请不完整"));
   const e = raw.subarray(0, KEY_BYTES);
   const r = Buffer.from(recipient.publicKey, "base64url");
   let es: Buffer;
   try {
     es = agree(recipient, e.toString("base64url"));
   } catch {
-    throw new InviteError("邀请解不开");
+    throw new InviteError(both("The invitation cannot be opened", "邀请解不开"));
   }
   const s = open(derive(es, Buffer.concat([e, r]), "agenthop invite sender v1"), raw.subarray(KEY_BYTES, KEY_BYTES + SENDER_BYTES));
   const from = s.toString("base64url");
@@ -63,17 +64,17 @@ export function openInvitation(recipient: Identity, text: string): OpenedInvitat
   try {
     ss = agree(recipient, from);
   } catch {
-    throw new InviteError("邀请解不开");
+    throw new InviteError(both("The invitation cannot be opened", "邀请解不开"));
   }
   const body = open(derive(Buffer.concat([es, ss]), Buffer.concat([e, r, s]), "agenthop invite body v1"), raw.subarray(KEY_BYTES + SENDER_BYTES));
   let invitation: Partial<Invitation>;
   try {
     invitation = JSON.parse(body.toString("utf8")) as Partial<Invitation>;
   } catch {
-    throw new InviteError("邀请的内容不对");
+    throw new InviteError(both("The invitation's contents are wrong", "邀请的内容不对"));
   }
   if (typeof invitation.code !== "string" || typeof invitation.background !== "string" || typeof invitation.at !== "number" || typeof invitation.id !== "string") {
-    throw new InviteError("邀请的内容不对");
+    throw new InviteError(both("The invitation's contents are wrong", "邀请的内容不对"));
   }
   return { code: invitation.code, background: invitation.background, at: invitation.at, id: invitation.id, from };
 }
@@ -91,13 +92,13 @@ function seal(key: Buffer, plain: Buffer): Buffer {
 }
 
 function open(key: Buffer, raw: Buffer): Buffer {
-  if (raw.byteLength < NONCE_BYTES + TAG_BYTES) throw new InviteError("邀请不完整");
+  if (raw.byteLength < NONCE_BYTES + TAG_BYTES) throw new InviteError(both("The invitation is incomplete", "邀请不完整"));
   const decipher = createDecipheriv("aes-256-gcm", key, raw.subarray(0, NONCE_BYTES));
   decipher.setAAD(AAD);
   decipher.setAuthTag(raw.subarray(raw.byteLength - TAG_BYTES));
   try {
     return Buffer.concat([decipher.update(raw.subarray(NONCE_BYTES, raw.byteLength - TAG_BYTES)), decipher.final()]);
   } catch {
-    throw new InviteError("邀请解不开");
+    throw new InviteError(both("The invitation cannot be opened", "邀请解不开"));
   }
 }

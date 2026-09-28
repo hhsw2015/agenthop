@@ -9,6 +9,7 @@ import { addressOf, decodeControl, generateCode, relayEndpoints } from "@agentho
 import express from "express";
 import { WebSocket } from "ws";
 import { HostBridge } from "./bridge.js";
+import { t } from "./lang.js";
 import { listenControl, Room, type RoomLimits, type RoomOptions } from "./room.js";
 import { type SessionEvent } from "./talk.js";
 import { version } from "./version.js";
@@ -113,7 +114,7 @@ export async function startHost(options: HostOptions = {}): Promise<RunningHost>
   function openRoom(): Promise<{ ws: WebSocket; url: string }> {
     // One deadline over the whole thing: a relay that takes the connection and then goes quiet,
     // at any step, must not leave the command sitting there with nothing on screen.
-    return withDeadline(connectRoom(), HANDSHAKE_MS, `中继 ${relay} 没有把房间开起来，${HANDSHAKE_MS / 1000} 秒后放弃`);
+    return withDeadline(connectRoom(), HANDSHAKE_MS, t(`The relay ${relay} did not open the room; gave up after ${HANDSHAKE_MS / 1000} seconds`, `中继 ${relay} 没有把房间开起来，${HANDSHAKE_MS / 1000} 秒后放弃`));
   }
 
   async function connectRoom(): Promise<{ ws: WebSocket; url: string }> {
@@ -152,7 +153,7 @@ export async function startHost(options: HostOptions = {}): Promise<RunningHost>
         bridge.onFrame(new Uint8Array(data as Buffer));
       });
       ws.on("close", () => {
-        if (socket === ws && !closing) void recover("中继连接断开");
+        if (socket === ws && !closing) void recover(t("The connection to the relay dropped", "中继连接断开"));
       });
       return { ws, url: opened };
     } catch (error) {
@@ -179,7 +180,8 @@ export async function startHost(options: HostOptions = {}): Promise<RunningHost>
         wait = Math.min(wait * 2, 5000);
       }
     }
-    if (!closing) options.onGone?.(`${reason}，${Math.round((options.recoverMs ?? RECOVER_MS) / 1000)} 秒内没能把房间接回来`);
+    const seconds = Math.round((options.recoverMs ?? RECOVER_MS) / 1000);
+    if (!closing) options.onGone?.(t(`${reason}; could not bring the room back within ${seconds} seconds`, `${reason}，${seconds} 秒内没能把房间接回来`));
   }
 
   const first = await openRoom();
@@ -236,13 +238,15 @@ function delay(ms: number): Promise<void> {
 
 function relayError(error: unknown, relay: string): Error {
   const detail = error instanceof Error ? error.message : String(error);
-  return new Error(`连不上中继 ${relay}：${detail}`);
+  return new Error(t(`Cannot reach the relay ${relay}: ${detail}`, `连不上中继 ${relay}：${detail}`));
 }
 
 function openError(code: string): string {
-  if (code === "room_taken") return "这个房间已经被另一个进程占着了。如果不是你自己开的第二个，就换一个新的配对码";
-  if (code === "unauthorized") return "中继需要密码，两边都要加 --pass";
-  if (code === "rate_limited") return "开房太频繁，等一分钟再试";
+  if (code === "room_taken") {
+    return t("Another process is holding this room. Unless you opened a second one yourself, use a new pairing code", "这个房间已经被另一个进程占着了。如果不是你自己开的第二个，就换一个新的配对码");
+  }
+  if (code === "unauthorized") return t("The relay needs a password; add --pass on both sides", "中继需要密码，两边都要加 --pass");
+  if (code === "rate_limited") return t("Opening rooms too often; wait a minute and try again", "开房太频繁，等一分钟再试");
   return code;
 }
 

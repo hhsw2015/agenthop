@@ -38,7 +38,7 @@ describe("what the room refuses", () => {
       // The sender is told, rather than being left to believe the line went through.
       await expect(
         sendMessage({ code: host.code, text: "theirs", files: [payload], relay: relay.url }),
-      ).rejects.toThrow(/已经忽略/);
+      ).rejects.toThrow(/does not belong to this conversation/);
     }
     expect(refusals).toHaveLength(5);
     expect(existsSync(path.join(home, "inbox"))).toBe(false);
@@ -63,8 +63,8 @@ describe("what the room refuses", () => {
     await sendMessage({ code: host.code, text: "一", relay: relay.url });
     await sendMessage({ code: host.code, text: "二", relay: relay.url });
     await sendMessage({ code: host.code, text: "三", relay: relay.url });
-    await expect(sendMessage({ code: host.code, text: "四", relay: relay.url })).rejects.toThrow(/消息条数已经到上限/);
-    expect(refusals.join(" ")).toContain("消息条数已经到上限");
+    await expect(sendMessage({ code: host.code, text: "四", relay: relay.url })).rejects.toThrow(/limit of 3 messages/);
+    expect(refusals.join(" ")).toContain("limit of 3 messages");
 
     const long = await startHost({
       relay: relay.url,
@@ -73,8 +73,8 @@ describe("what the room refuses", () => {
       onRefused: (reason) => refusals.push(reason),
     });
     hosts.push(long);
-    await expect(sendMessage({ code: long.code, text: "x".repeat(64), relay: relay.url })).rejects.toThrow(/正文超过/);
-    expect(refusals.join(" ")).toContain("正文超过");
+    await expect(sendMessage({ code: long.code, text: "x".repeat(64), relay: relay.url })).rejects.toThrow(/text is over/);
+    expect(refusals.join(" ")).toContain("text is over");
   });
 
   it("counts posts into one room per minute, and does not count reads", () => {

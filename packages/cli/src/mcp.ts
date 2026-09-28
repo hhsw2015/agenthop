@@ -8,6 +8,7 @@ import { z } from "zod";
 import { MAX_ATTACHMENT_BYTES } from "@agenthop/agent";
 import { classifyInput } from "./args.js";
 import { brief, BYE, FILE, lineQueue, runSession, WORKING, write, type LogEntry, type SessionOptions } from "./session.js";
+import { t } from "./lang.js";
 import { findContact, fingerprint, forgetContact, loadContacts, loadIdentity, saveContact, type Identity } from "./identity.js";
 import { deliverInvitation, INVITE_TTL_MS, startInbox, type Inbox, type Received } from "./inbox.js";
 import { version } from "./version.js";
@@ -58,7 +59,21 @@ type Conversation = {
 
 type Pending = Received & { reported: boolean };
 
-const INSTRUCTIONS = `agenthop 让你和另一台机器上的 agent 对话，消息端到端加密。
+/** What the server tells the agent at the start, in the language this process speaks. */
+function instructions(): string {
+  return t(
+    `agenthop lets you talk to an agent on another machine; messages are end-to-end encrypted.
+
+Open a room: agenthop_create(background), then hand the whole pairing code it returns to the user to pass on.
+Join: agenthop_join(code). Read the other side's background and check that it matches your context: if it does, confirm with one line via agenthop_say; if not, ask the user.
+After that: agenthop_wait waits for the other side (it returns only when it is your turn), and agenthop_say replies. When a line arrives, send a receipt with agenthop_working before you start the work, so the other side knows you have not dropped.
+To finish: agenthop_bye.
+
+Contacts: in a conversation the other side shows who it is (peer identity). If the user wants to find them by name later, save them with agenthop_save_contact. Once both sides have saved each other, agenthop_invite(name, background) invites them directly, with no pairing code to pass on, as long as their agent has agenthop running at that moment.
+With no conversation going, agenthop_wait waits for invitations. When one arrives, tell the user first; call agenthop_accept only once they agree, or agenthop_decline if not, unless the user said beforehand to accept anyone who calls.
+
+Each tool result is the conversation itself, so let the user see it; the path of the log file is given when you open or join a room.`,
+    `agenthop 让你和另一台机器上的 agent 对话，消息端到端加密。
 
 开房间：agenthop_create(background)，把返回的配对码整串交给用户转给对方。
 加入：agenthop_join(code)，读到对方的背景后判断是否和你的上下文相符；相符就用 agenthop_say 写一句确认，不相符就问用户。
@@ -68,10 +83,12 @@ const INSTRUCTIONS = `agenthop 让你和另一台机器上的 agent 对话，消
 联系人：对话里对方会表明身份（peer identity）。用户想以后按名字找它，就用 agenthop_save_contact 存下；两边互相存过之后，agenthop_invite(名字, 背景) 就能直接邀请，不用再转交配对码，前提是对方的 agent 此刻开着 agenthop。
 没有对话时 agenthop_wait 等的是别人的邀请。收到邀请先告诉用户，用户同意再 agenthop_accept，不接就 agenthop_decline；用户事先说过"有人找就接"的除外。
 
-每次工具调用的结果就是对话本身，要让用户看得到；日志文件的路径在开房间或加入时给出。`;
+每次工具调用的结果就是对话本身，要让用户看得到；日志文件的路径在开房间或加入时给出。`,
+  );
+}
 
 export async function startMcpServer(options: McpOptions = {}, transport: Transport = new StdioServerTransport()): Promise<McpServer> {
-  const server = new McpServer({ name: "agenthop", version }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: "agenthop", version }, { instructions: instructions() });
   const home = options.home ?? path.join(homedir(), ".agenthop");
   const waitCapMs = options.waitCapMs ?? MAX_WAIT_S * 1000;
   const inviteTtlMs = options.inviteTtlMs ?? INVITE_TTL_MS;
@@ -119,10 +136,12 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
   /** The invitation meant by `from`, taken off the list, or why there is none. */
   function take(from: string | undefined): Pending | string {
     const list = pending();
-    if (list.length === 0) return "没有待处理的邀请。";
+    if (list.length === 0) return t("No pending invitations.", "没有待处理的邀请。");
     const matches = from?.trim() ? list.filter((invitation) => invitation.name === from.trim()) : list;
-    if (matches.length === 0) return `没有来自"${from}"的邀请。待处理的：${names(list)}。`;
-    if (!from?.trim() && new Set(matches.map((invitation) => invitation.name)).size > 1) return `有几个人在邀请你：${names(list)}。说明接哪一个。`;
+    if (matches.length === 0) return t(`No invitation from "${from}". Pending: ${names(list)}.`, `没有来自"${from}"的邀请。待处理的：${names(list)}。`);
+    if (!from?.trim() && new Set(matches.map((invitation) => invitation.name)).size > 1) {
+      return t(`Several people are inviting you: ${names(list)}. Say which one.`, `有几个人在邀请你：${names(list)}。说明接哪一个。`);
+    }
     const chosen = matches[matches.length - 1]!;
     for (let i = invitations.length - 1; i >= 0; i--) if (invitations[i]!.name === chosen.name) invitations.splice(i, 1);
     return chosen;
@@ -160,24 +179,26 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
   }
 
   function busy(): string | undefined {
-    if (current && !over(current)) return "已经有一场对话在进行。先用 agenthop_bye 结束它，再开下一场。";
+    if (current && !over(current)) return t("A conversation is already going. End it with agenthop_bye before starting another.", "已经有一场对话在进行。先用 agenthop_bye 结束它，再开下一场。");
     return undefined;
   }
 
   function active(): Conversation | string {
-    if (!current) return NO_CONVERSATION;
-    if (over(current)) return `这场对话已经结束了。${current.failure ? `\n${current.failure}` : ""}`;
+    if (!current) return noConversation();
+    if (over(current)) return `${t("This conversation is over.", "这场对话已经结束了。")}${current.failure ? `\n${current.failure}` : ""}`;
     return current;
   }
 
   server.registerTool(
     "agenthop_create",
     {
-      description:
+      description: t(
+        "Open a room and return its pairing code. Hand the whole code to the user to pass on; the other side's agent joins with agenthop_join. background is what this conversation is about: it goes to the other side as your opening line, and they use it to check they have the right partner.",
         "开一个房间，返回配对码。把配对码整串交给用户，由用户转给对方；对方的 agent 用 agenthop_join 加入。background 是这次要谈的事，会作为开场白发给对方，对方据此判断是不是找对了人。",
+      ),
       inputSchema: {
-        background: z.string().describe("这次对话的任务背景"),
-        accept_files: z.boolean().optional().describe("是否把对方发来的文件存到磁盘（默认不存，只记文件名）"),
+        background: z.string().describe(t("What this conversation is about", "这次对话的任务背景")),
+        accept_files: z.boolean().optional().describe(acceptFilesNote()),
       },
     },
     async ({ background, accept_files }) => {
@@ -187,13 +208,13 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
         runSession({ ...sessionOptions(c), hello: background, keepFiles: accept_files === true }),
       );
       const code = await until(conversation, (entry) => entry.side === "local" && entry.state === "waiting", 20_000);
-      if (!code) return failure(conversation.failure ?? "房间没有开起来。");
+      if (!code) return failure(conversation.failure ?? t("The room did not open.", "房间没有开起来。"));
       const log = logPath(conversation);
       return reply(
-        `房间开好了。配对码：\n${code.text}\n\n` +
-          "把这一整串原样交给对方，最后一段是这次对话的密钥，少了它对方进不来。" +
-          "对方加入并确认之后，用 agenthop_wait 等它说话。" +
-          (log ? `\n日志：${log}（看实时进展：tail -f ${log}）` : ""),
+        t(
+          `Room open. Pairing code:\n${code.text}\n\nHand this whole string to the other side exactly as it is. The last part is this conversation's key; without it they cannot get in. Once they have joined and confirmed, use agenthop_wait to wait for them to speak.`,
+          `房间开好了。配对码：\n${code.text}\n\n把这一整串原样交给对方，最后一段是这次对话的密钥，少了它对方进不来。对方加入并确认之后，用 agenthop_wait 等它说话。`,
+        ) + logNote(log),
       );
     },
   );
@@ -201,11 +222,13 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
   server.registerTool(
     "agenthop_join",
     {
-      description:
+      description: t(
+        "Join the other side's room with its pairing code; returns once their opening line (the task background) arrives. Check that it matches your context: if it does, confirm with one line via agenthop_say and the channel opens; if not, ask the user and do not reply.",
         "用配对码加入对方的房间，等到对方的开场白（任务背景）后返回。读完后判断它是否和你的上下文相符：相符就用 agenthop_say 写一句确认，通道随即打开；不相符就问用户，不要回复。",
+      ),
       inputSchema: {
-        code: z.string().describe("对方给的配对码，整串"),
-        accept_files: z.boolean().optional().describe("是否把对方发来的文件存到磁盘（默认不存，只记文件名）"),
+        code: z.string().describe(t("The whole pairing code the other side gave you", "对方给的配对码，整串")),
+        accept_files: z.boolean().optional().describe(acceptFilesNote()),
       },
     },
     async ({ code, accept_files }) => {
@@ -214,7 +237,9 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
       let normalized: string;
       try {
         const input = classifyInput([code]);
-        if (input.kind !== "join") return failure("这不像一个配对码。配对码是四位数字、三个英文词，再加一段 26 位的密钥。");
+        if (input.kind !== "join") {
+          return failure(t("That does not look like a pairing code. A pairing code is four digits and three English words, then a 26-character key.", "这不像一个配对码。配对码是四位数字、三个英文词，再加一段 26 位的密钥。"));
+        }
         normalized = input.code;
       } catch (error) {
         return failure(error instanceof Error ? error.message : String(error));
@@ -223,23 +248,25 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
         runSession({ ...sessionOptions(c), code: normalized, keepFiles: accept_files === true }),
       );
       const hello = await until(conversation, (entry) => entry.side === "peer" && entry.state === "hello", 30_000);
-      if (!hello) return failure(conversation.failure ?? refusal(conversation) ?? "等了 30 秒没等到对方的开场白。房间可能已经过期，请对方重新开一个。");
+      if (!hello) {
+        return failure(
+          conversation.failure ?? refusal(conversation) ?? t("No opening line from the other side after 30 seconds. The room may have expired; ask them to open a new one.", "等了 30 秒没等到对方的开场白。房间可能已经过期，请对方重新开一个。"),
+        );
+      }
       conversation.seen = conversation.entries.length;
       const log = logPath(conversation);
-      return reply(
-        `已加入。${introduction(conversation)}对方的任务背景：\n${hello.text}\n\n` +
-          "判断它和你的上下文是否相符。相符就用 agenthop_say 写一句确认；不相符就问用户，不要回复。" +
-          (log ? `\n日志：${log}（看实时进展：tail -f ${log}）` : ""),
-      );
+      return reply(t(`Joined. ${introduction(conversation)}Their task:\n${hello.text}\n\n`, `已加入。${introduction(conversation)}对方的任务背景：\n${hello.text}\n\n`) + checkIt() + logNote(log));
     },
   );
 
   server.registerTool(
     "agenthop_say",
     {
-      description:
+      description: t(
+        "Say something to the other side; it may span several lines. Returns whether it was delivered. The joining side's first line is its confirmation of the opening line. Use agenthop_working for receipts and agenthop_bye to finish.",
         "对对方说一句话，可以多行。返回是否送达。加入方的第一句就是对开场白的确认。收条用 agenthop_working，结束用 agenthop_bye。",
-      inputSchema: { text: z.string().describe("要说的话") },
+      ),
+      inputSchema: { text: z.string().describe(t("What to say", "要说的话")) },
     },
     async ({ text }) => {
       const conversation = active();
@@ -247,9 +274,12 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
       // A line on the command line may be a command; a line handed to `say` is always words.
       const first = text.trim().split("\n")[0] ?? "";
       for (const [command, tool] of [[BYE, "agenthop_bye"], [WORKING, "agenthop_working"], [FILE, "agenthop_send_file"]] as const) {
-        if (first === command || first.startsWith(`${command} `)) return failure(`要${tool === "agenthop_bye" ? "结束对话" : tool === "agenthop_working" ? "发收条" : "发文件"}请用 ${tool}。`);
+        if (first === command || first.startsWith(`${command} `)) {
+          const what = tool === "agenthop_bye" ? t("end the conversation", "结束对话") : tool === "agenthop_working" ? t("send a receipt", "发收条") : t("send a file", "发文件");
+          return failure(t(`To ${what}, use ${tool}.`, `要${what}请用 ${tool}。`));
+        }
       }
-      if (!text.trim()) return failure("没有内容可说。");
+      if (!text.trim()) return failure(t("Nothing to say.", "没有内容可说。"));
       const mark = conversation.entries.length;
       const line = text.trim();
       conversation.lines.push(line);
@@ -257,21 +287,32 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
       if (outcome) conversation.told.add(outcome);
       if (!outcome) {
         const open = conversation.entries.some((entry) => entry.state === "ready");
-        return reply(open ? "还没发出去，结果会出现在 agenthop_wait 里。" : "通道还没打开（对方还没确认），这句会在打开后按顺序发出。");
+        return reply(
+          open
+            ? t("Not sent yet; the outcome will show up in agenthop_wait.", "还没发出去，结果会出现在 agenthop_wait 里。")
+            : t("The channel is not open yet (the other side has not confirmed); this line goes out in order once it opens.", "通道还没打开（对方还没确认），这句会在打开后按顺序发出。"),
+        );
       }
-      if (outcome.state === "confirm") return reply("确认已送达，通道打开了。用 agenthop_wait 等对方说话。");
-      if (outcome.state === "say") return reply("已送达。用 agenthop_wait 等对方回复。");
-      if (outcome.state === "throttled") return reply(`${outcome.text}。不用重发。`);
-      return failure(`没有送到对方：${outcome.text}`);
+      if (outcome.state === "confirm") return reply(t("Confirmed. Channel open. Use agenthop_wait to wait for them to speak.", "确认已送达，通道打开了。用 agenthop_wait 等对方说话。"));
+      if (outcome.state === "say") return reply(t("Delivered. Use agenthop_wait for their reply.", "已送达。用 agenthop_wait 等对方回复。"));
+      if (outcome.state === "throttled") return reply(t(`${outcome.text}. No need to resend.`, `${outcome.text}。不用重发。`));
+      return failure(t(`Not delivered: ${outcome.text}`, `没有送到对方：${outcome.text}`));
     },
   );
 
   server.registerTool(
     "agenthop_working",
     {
-      description:
+      description: t(
+        "Send a receipt: tell the other side you got their line, are working on it, and roughly how long it will take. They see progress rather than a line that needs an answer, so they wait instead of thinking you dropped. Call it right after a line arrives, before starting the work.",
         "回一张收条：告诉对方你收到了、正在处理，以及大概要多久。对方看到的是进度而不是一句需要回应的话，它会安心等着，不会以为你掉线了。收到对方一句后先调用它，再开始干活。",
-      inputSchema: { text: z.string().describe("在做什么、大概多久，例如：收到，我去查这三个文件，大概两三分钟").optional() },
+      ),
+      inputSchema: {
+        text: z
+          .string()
+          .describe(t("What you are doing and roughly how long, e.g.: Got it, checking those three files, two or three minutes", "在做什么、大概多久，例如：收到，我去查这三个文件，大概两三分钟"))
+          .optional(),
+      },
     },
     async ({ text }) => {
       const conversation = active();
@@ -282,17 +323,20 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
       conversation.lines.push(line);
       const outcome = await settle(conversation, mark, (entry) => (entry.state === "working" && entry.text === note) || (entry.state === "undelivered" && unsentAs(entry, line)), 15_000);
       if (outcome) conversation.told.add(outcome);
-      if (outcome?.state === "undelivered") return failure(`收条没有送到：${outcome.text}`);
-      if (outcome?.state === "throttled") return reply(`${outcome.text}。收条排在里面，会按顺序发出。`);
-      return reply("收条已发出。");
+      if (outcome?.state === "undelivered") return failure(t(`The receipt was not delivered: ${outcome.text}`, `收条没有送到：${outcome.text}`));
+      if (outcome?.state === "throttled") return reply(t(`${outcome.text}. The receipt is queued and will go out in order.`, `${outcome.text}。收条排在里面，会按顺序发出。`));
+      return reply(t("Receipt sent.", "收条已发出。"));
     },
   );
 
   server.registerTool(
     "agenthop_send_file",
     {
-      description: `发一个文件给对方（最大 ${MAX_ATTACHMENT_BYTES / 1024} KiB），文件内容和文件名都端到端加密，中继看不到。对方要在开房间或加入时允许接收文件才会存到磁盘，否则只记下文件名。`,
-      inputSchema: { path: z.string().describe("本机文件的路径") },
+      description: t(
+        `Send a file to the other side (at most ${MAX_ATTACHMENT_BYTES / 1024} KiB). Its contents and name are end-to-end encrypted; the relay sees neither. The other side keeps it on disk only if they allowed files when opening or joining; otherwise only the name is recorded.`,
+        `发一个文件给对方（最大 ${MAX_ATTACHMENT_BYTES / 1024} KiB），文件内容和文件名都端到端加密，中继看不到。对方要在开房间或加入时允许接收文件才会存到磁盘，否则只记下文件名。`,
+      ),
+      inputSchema: { path: z.string().describe(t("Path to a file on this machine", "本机文件的路径")) },
     },
     async ({ path: filePath }) => {
       const conversation = active();
@@ -301,22 +345,24 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
       const line = `${FILE} ${path.resolve(filePath)}`;
       const name = path.basename(filePath);
       conversation.lines.push(line);
-      const outcome = await settle(conversation, mark, (entry) => (entry.state === "files" && entry.text.startsWith(`${name}（`)) || (entry.state === "undelivered" && unsentAs(entry, line)), 30_000);
+      const outcome = await settle(conversation, mark, (entry) => (entry.state === "files" && entry.text.startsWith(`${name}${t(" (", "（")}`)) || (entry.state === "undelivered" && unsentAs(entry, line)), 30_000);
       if (outcome) conversation.told.add(outcome);
-      if (!outcome) return reply("文件还没发出去（对方可能还没确认），结果会出现在 agenthop_wait 里。");
-      if (outcome.state === "files") return reply(`已送达：${outcome.text}`);
-      if (outcome.state === "throttled") return reply(`${outcome.text}。不用重发。`);
-      return failure(`没有送到对方：${outcome.text}`);
+      if (!outcome) return reply(t("The file has not gone yet (the other side may not have confirmed); the outcome will show up in agenthop_wait.", "文件还没发出去（对方可能还没确认），结果会出现在 agenthop_wait 里。"));
+      if (outcome.state === "files") return reply(t(`Delivered: ${outcome.text}`, `已送达：${outcome.text}`));
+      if (outcome.state === "throttled") return reply(t(`${outcome.text}. No need to resend.`, `${outcome.text}。不用重发。`));
+      return failure(t(`Not delivered: ${outcome.text}`, `没有送到对方：${outcome.text}`));
     },
   );
 
   server.registerTool(
     "agenthop_wait",
     {
-      description:
+      description: t(
+        "Wait for the other side. Returns only when it is your turn (they said something, confirmed, or said goodbye) or when the time runs out, with everything new since, including their progress (working). If nothing came in time, call it again. With no conversation going, it waits for invitations from contacts.",
         "等对方说话。只在轮到你时返回（对方说了话、确认了、或告别了），或者等到超时。返回这期间的所有新动静，包括对方的进度（working）。超时没等到就再调一次。没有进行中的对话时，等的是联系人发来的邀请。",
+      ),
       inputSchema: {
-        timeout_seconds: z.number().int().min(1).max(MAX_WAIT_S).optional().describe(`最多等几秒，默认 ${DEFAULT_WAIT_S}`),
+        timeout_seconds: z.number().int().min(1).max(MAX_WAIT_S).optional().describe(t(`The most seconds to wait, ${DEFAULT_WAIT_S} by default`, `最多等几秒，默认 ${DEFAULT_WAIT_S}`)),
       },
     },
     async ({ timeout_seconds }) => {
@@ -324,7 +370,7 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
       const ms = Math.min((timeout_seconds ?? DEFAULT_WAIT_S) * 1000, waitCapMs);
       const settled = !conversation || (conversation.done && conversation.seen >= conversation.entries.length);
       if (settled && inbox) return reply(await waitForInvitations(ms));
-      if (!conversation) return failure(NO_CONVERSATION);
+      if (!conversation) return failure(noConversation());
       const deadline = Date.now() + ms;
       while (Date.now() < deadline && !conversation.done && !turnSince(conversation)) await delay(100);
       const fresh = conversation.entries.slice(conversation.seen);
@@ -333,15 +379,16 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
       const body = shown.map(describe).join("\n");
       let status: string;
       if (conversation.done || shown.some((entry) => OVER.has(entry.state))) {
-        status = `对话已经结束。${conversation.failure ?? ""}`.trim();
+        status = `${t("The conversation is over.", "对话已经结束。")} ${conversation.failure ?? ""}`.trim();
       } else if (shown.some((entry) => entry.side === "peer" && entry.state === "bye")) {
-        status = "对方告别了，对话结束。";
+        status = t("They said goodbye. Conversation over.", "对方告别了，对话结束。");
       } else if (shown.some((entry) => entry.side === "peer" && TURN.has(entry.state))) {
-        status = "轮到你了。";
+        status = t("Your turn.", "轮到你了。");
       } else if (shown.some((entry) => entry.side === "peer" && entry.state === "working")) {
-        status = "对方还在处理，再调一次 agenthop_wait 接着等。";
+        status = t("They are still working on it; call agenthop_wait again to keep waiting.", "对方还在处理，再调一次 agenthop_wait 接着等。");
       } else {
-        status = `${Math.round(ms / 1000)} 秒内没有新消息，再调一次 agenthop_wait 接着等。`;
+        const seconds = Math.round(ms / 1000);
+        status = t(`Nothing new in ${seconds} seconds; call agenthop_wait again to keep waiting.`, `${seconds} 秒内没有新消息，再调一次 agenthop_wait 接着等。`);
       }
       const also = invitationNews();
       return reply([body, status, also].filter(Boolean).join("\n\n"));
@@ -351,8 +398,11 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
   server.registerTool(
     "agenthop_bye",
     {
-      description: "结束对话，可以带一句告别的话。对方会把告别说回来，然后两边各自结束。",
-      inputSchema: { text: z.string().describe("告别的话").optional() },
+      description: t(
+        "End the conversation, optionally with a parting line. The other side says goodbye back, then both sides finish.",
+        "结束对话，可以带一句告别的话。对方会把告别说回来，然后两边各自结束。",
+      ),
+      inputSchema: { text: z.string().describe(t("A parting line", "告别的话")).optional() },
     },
     async ({ text }) => {
       const conversation = active();
@@ -363,31 +413,43 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
       const fresh = conversation.entries.slice(conversation.seen).filter((entry) => !conversation.told.has(entry) && (entry.side === "peer" || LOCAL_WORTH_SAYING.has(entry.state)));
       conversation.seen = conversation.entries.length;
       const body = fresh.map(describe).join("\n");
-      const status = conversation.done ? "对话结束了。" : "告别已发出，还在等对方说回来。";
+      const status = conversation.done ? t("Conversation over.", "对话结束了。") : t("Goodbye sent; waiting for theirs.", "告别已发出，还在等对方说回来。");
       return reply(body ? `${body}\n\n${status}` : status);
     },
   );
 
   server.registerTool(
     "agenthop_status",
-    { description: "看当前对话的状态：在哪一步、配对码、日志在哪；以及本机的身份、收件地址和待处理的邀请。" },
+    {
+      description: t(
+        "Show where the current conversation is: which step, the pairing code, where the log is; and this machine's identity, its inbox and pending invitations.",
+        "看当前对话的状态：在哪一步、配对码、日志在哪；以及本机的身份、收件地址和待处理的邀请。",
+      ),
+    },
     async () => {
-      if (!current) return reply(["现在没有对话。", ...standing()].join("\n"));
+      if (!current) return reply([t("No conversation right now.", "现在没有对话。"), ...standing()].join("\n"));
       const c = current;
       const has = (side: string, state: string) => c.entries.some((entry) => entry.side === side && entry.state === state);
       const phase = over(c)
-        ? "已结束"
+        ? t("over", "已结束")
         : has("local", "ready")
-          ? "对话中"
+          ? t("talking", "对话中")
           : c.seat === "create"
             ? has("peer", "connected")
-              ? "对方已加入，等它确认"
-              : "等对方用配对码加入"
-            : "等你确认对方的背景";
+              ? t("they joined; waiting for their confirmation", "对方已加入，等它确认")
+              : t("waiting for the other side to join with the pairing code", "等对方用配对码加入")
+            : t("waiting for you to confirm their background", "等你确认对方的背景");
       const code = c.entries.find((entry) => entry.side === "local" && entry.state === "waiting")?.text;
       const log = logPath(c);
       return reply(
-        [`这一端：${c.seat === "create" ? "创建方" : "加入方"}`, `阶段：${phase}`, code ? `配对码：${code}` : "", log ? `日志：${log}` : "", c.failure ?? "", ...standing()]
+        [
+          t(`This side: ${c.seat === "create" ? "creator" : "joiner"}`, `这一端：${c.seat === "create" ? "创建方" : "加入方"}`),
+          t(`Step: ${phase}`, `阶段：${phase}`),
+          code ? t(`Pairing code: ${code}`, `配对码：${code}`) : "",
+          log ? t(`Log: ${log}`, `日志：${log}`) : "",
+          c.failure ?? "",
+          ...standing(),
+        ]
           .filter(Boolean)
           .join("\n"),
       );
@@ -398,72 +460,107 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
   server.registerTool(
     "agenthop_save_contact",
     {
-      description:
+      description: t(
+        "Save the other side of this conversation (ongoing or just finished) as a contact. Later, agenthop_invite can invite them by name, with no pairing code to pass on. They must save you as a contact too, or your invitations will not be taken.",
         "把这场对话（进行中或刚结束的）里的对方存为联系人。以后用 agenthop_invite 按名字邀请它，不用再转交配对码。对方也要把你存为联系人，邀请才会被收下。",
-      inputSchema: { name: z.string().describe("给对方起的名字，例如 alice 或 小王的电脑") },
+      ),
+      inputSchema: { name: z.string().describe(t("A name for them, e.g. alice or Sam's laptop", "给对方起的名字，例如 alice 或 小王的电脑")) },
     },
     async ({ name }) => {
-      if (!current) return failure("现在没有对话，没有可以存的人。联系人是从一场对话里存下的：先用配对码对话一次。");
-      if (!current.peerKey) return failure("这场对话里对方没有表明身份（多半是 v0.5 之前的版本），存不了。请对方 agenthop update 之后再对话一次。");
+      if (!current) {
+        return failure(t("No conversation right now, so there is nobody to save. Contacts are saved from a conversation: talk once with a pairing code first.", "现在没有对话，没有可以存的人。联系人是从一场对话里存下的：先用配对码对话一次。"));
+      }
+      if (!current.peerKey) {
+        return failure(
+          t(
+            "The other side did not say who they are in this conversation (most likely a version before 0.5), so they cannot be saved. Ask them to run agenthop update and talk once more.",
+            "这场对话里对方没有表明身份（多半是 v0.5 之前的版本），存不了。请对方 agenthop update 之后再对话一次。",
+          ),
+        );
+      }
       let saved: ReturnType<typeof saveContact>;
       try {
         saved = saveContact(home, name, current.peerKey);
       } catch (error) {
-        return failure(`没有存成：${error instanceof Error ? error.message : String(error)}`);
+        return failure(t(`Not saved: ${error instanceof Error ? error.message : String(error)}`, `没有存成：${error instanceof Error ? error.message : String(error)}`));
       }
       if (typeof saved === "string") return failure(saved);
       syncInbox();
-      const renamed = saved.renamedFrom && saved.renamedFrom !== saved.saved.name ? `（原来叫 ${saved.renamedFrom}）` : "";
+      const kept = saved.saved.name, print = fingerprint(saved.saved.publicKey);
+      const was = saved.renamedFrom && saved.renamedFrom !== kept ? saved.renamedFrom : "";
       return reply(
-        `已存为联系人 ${saved.saved.name}${renamed}，指纹 ${fingerprint(saved.saved.publicKey)}。\n` +
-          `以后用 agenthop_invite("${saved.saved.name}", 背景) 直接邀请它。对方也要把你存为联系人，邀请才会被收下。\n` +
-          "这个身份是从这场对话里认下的。在意的话，可以请对方在别的渠道念一遍它的指纹核对（它用 agenthop_contacts 能看到自己的）。",
+        t(
+          `Saved ${kept}${was ? ` (was ${was})` : ""} as a contact, fingerprint ${print}.\n` +
+            `From now on, agenthop_invite("${kept}", background) invites them directly. They must save you as a contact too, or the invitation will not be taken.\n` +
+            "This identity was learned in this conversation. If that matters, ask them to read out their fingerprint over another channel and compare (they can see their own with agenthop_contacts).",
+          `已存为联系人 ${kept}${was ? `（原来叫 ${was}）` : ""}，指纹 ${print}。\n` +
+            `以后用 agenthop_invite("${kept}", 背景) 直接邀请它。对方也要把你存为联系人，邀请才会被收下。\n` +
+            "这个身份是从这场对话里认下的。在意的话，可以请对方在别的渠道念一遍它的指纹核对（它用 agenthop_contacts 能看到自己的）。",
+        ),
       );
     },
   );
 
   server.registerTool(
     "agenthop_contacts",
-    { description: "列出联系人（名字、指纹），以及本机自己的指纹、收件地址是否在线、待处理的邀请。" },
+    {
+      description: t(
+        "List contacts (name, fingerprint), this machine's own fingerprint, whether its inbox is online, and pending invitations.",
+        "列出联系人（名字、指纹），以及本机自己的指纹、收件地址是否在线、待处理的邀请。",
+      ),
+    },
     async () => {
       let contacts: ReturnType<typeof loadContacts>;
       try {
         contacts = loadContacts(home);
       } catch (error) {
-        return failure(`读不了联系人：${error instanceof Error ? error.message : String(error)}`);
+        return failure(unreadableContacts(error));
       }
-      const rows = contacts.map((contact) => `  ${contact.name}  指纹 ${fingerprint(contact.publicKey)}  存于 ${contact.added.slice(0, 10)}`);
-      return reply(
-        [contacts.length > 0 ? `联系人：\n${rows.join("\n")}` : "还没有联系人。和对方用配对码对话一次，再用 agenthop_save_contact 存下。", ...standing()].join("\n"),
-      );
+      const rows = contacts.map((contact) => {
+        const print = fingerprint(contact.publicKey), day = contact.added.slice(0, 10);
+        return t(`  ${contact.name}  fingerprint ${print}  saved ${day}`, `  ${contact.name}  指纹 ${print}  存于 ${day}`);
+      });
+      const listed =
+        contacts.length > 0
+          ? t(`Contacts:\n${rows.join("\n")}`, `联系人：\n${rows.join("\n")}`)
+          : t("No contacts yet. Talk with someone once using a pairing code, then save them with agenthop_save_contact.", "还没有联系人。和对方用配对码对话一次，再用 agenthop_save_contact 存下。");
+      return reply([listed, ...standing()].join("\n"));
     },
   );
 
   server.registerTool(
     "agenthop_forget_contact",
-    { description: "删掉一个联系人。之后它的邀请不会再被收下，你也不能再按名字邀请它。", inputSchema: { name: z.string().describe("联系人的名字") } },
+    {
+      description: t(
+        "Delete a contact. Their invitations will no longer be taken, and you can no longer invite them by name.",
+        "删掉一个联系人。之后它的邀请不会再被收下，你也不能再按名字邀请它。",
+      ),
+      inputSchema: { name: z.string().describe(t("The contact's name", "联系人的名字")) },
+    },
     async ({ name }) => {
       let gone: ReturnType<typeof forgetContact>;
       try {
         gone = forgetContact(home, name);
       } catch (error) {
-        return failure(`没有删成：${error instanceof Error ? error.message : String(error)}`);
+        return failure(t(`Not deleted: ${error instanceof Error ? error.message : String(error)}`, `没有删成：${error instanceof Error ? error.message : String(error)}`));
       }
-      if (!gone) return failure(`联系人里没有"${name}"。`);
+      if (!gone) return failure(t(`No contact named "${name}".`, `联系人里没有"${name}"。`));
       syncInbox();
-      return reply(`已删掉联系人 ${gone.name}（指纹 ${fingerprint(gone.publicKey)}）。`);
+      return reply(t(`Deleted the contact ${gone.name} (fingerprint ${fingerprint(gone.publicKey)}).`, `已删掉联系人 ${gone.name}（指纹 ${fingerprint(gone.publicKey)}）。`));
     },
   );
 
   server.registerTool(
     "agenthop_invite",
     {
-      description:
+      description: t(
+        "Invite a contact to talk, by name, with no pairing code to pass on. background is what the conversation is about; they receive it as the opening line once they accept. Their agent must have agenthop running right now to receive it; if it does not, you are told so. Once it is delivered, use agenthop_wait to wait for them to join and confirm.",
         "按名字邀请一个联系人对话，不用转交配对码。background 是这次要谈的事，对方接受后会作为开场白收到。对方的 agent 此刻要开着 agenthop 才收得到；不在线会直接告诉你。送到之后用 agenthop_wait 等它加入并确认。",
+      ),
       inputSchema: {
-        name: z.string().describe("联系人的名字"),
-        background: z.string().describe("这次对话的任务背景"),
-        accept_files: z.boolean().optional().describe("是否把对方发来的文件存到磁盘（默认不存，只记文件名）"),
+        name: z.string().describe(t("The contact's name", "联系人的名字")),
+        background: z.string().describe(t("What this conversation is about", "这次对话的任务背景")),
+        accept_files: z.boolean().optional().describe(acceptFilesNote()),
       },
     },
     async ({ name, background, accept_files }) => {
@@ -473,37 +570,45 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
       try {
         contact = findContact(home, name);
       } catch (error) {
-        return failure(`读不了联系人：${error instanceof Error ? error.message : String(error)}`);
+        return failure(unreadableContacts(error));
       }
-      if (!contact) return failure(`联系人里没有"${name}"。${contactNames()}`);
+      if (!contact) return failure(t(`No contact named "${name}". ${contactNames()}`, `联系人里没有"${name}"。${contactNames()}`));
       const me = self();
-      if (!me) return failure("本机的身份文件读不了，发不了邀请。");
+      if (!me) return failure(t("This machine's identity file cannot be read, so no invitation can be sent.", "本机的身份文件读不了，发不了邀请。"));
       const to = contact;
       const conversation = begin("create", (c) =>
         runSession({ ...sessionOptions(c), hello: background, keepFiles: accept_files === true, expectPeer: to.publicKey }),
       );
       const waiting = await until(conversation, (entry) => entry.side === "local" && entry.state === "waiting", 20_000);
-      if (!waiting) return failure(conversation.failure ?? "房间没有开起来。");
+      if (!waiting) return failure(conversation.failure ?? t("The room did not open.", "房间没有开起来。"));
       const log = logPath(conversation);
       try {
         await deliverInvitation({ sender: me, to, invitation: { code: waiting.text, background, at: Date.now(), id: randomUUID() }, relay: options.relay, pass: options.pass });
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        if (log) write(log, "local", "undelivered", `给 ${to.name} 的邀请：${reason}`);
+        if (log) write(log, "local", "undelivered", t(`The invitation to ${to.name}: ${reason}`, `给 ${to.name} 的邀请：${reason}`));
         conversation.stop.abort();
         await until(conversation, () => false, 5_000);
         conversation.seen = conversation.entries.length;
-        return failure(`${reason}\n刚开的房间已经关掉。可以晚点再邀请，或者用 agenthop_create 开房间、把配对码交给用户转过去。`);
+        return failure(
+          t(
+            `${reason}\nThe room just opened has been closed. Invite them again later, or open a room with agenthop_create and have the user pass the pairing code on.`,
+            `${reason}\n刚开的房间已经关掉。可以晚点再邀请，或者用 agenthop_create 开房间、把配对码交给用户转过去。`,
+          ),
+        );
       }
       // Nobody can take the invitation after it goes stale at the other end, so neither is the room kept.
       setTimeout(() => {
         if (conversation.done || conversation.entries.some((entry) => entry.side === "peer" && entry.state === "connected")) return;
-        if (log) write(log, "local", "expired", `${to.name} 在 ${Math.round(inviteTtlMs / 60_000)} 分钟内没有接受邀请，房间已经关掉`);
+        const minutes = Math.round(inviteTtlMs / 60_000);
+        if (log) write(log, "local", "expired", t(`${to.name} did not accept the invitation within ${minutes} minutes; the room has been closed`, `${to.name} 在 ${minutes} 分钟内没有接受邀请，房间已经关掉`));
         conversation.stop.abort();
       }, inviteTtlMs).unref();
       return reply(
-        `邀请已经送到 ${to.name}。它那边的 agent 通常要先问过用户才会接受。用 agenthop_wait 等它加入并确认。` +
-          (log ? `\n日志：${log}（看实时进展：tail -f ${log}）` : ""),
+        t(
+          `Invitation delivered to ${to.name}. Their agent will usually check with its user before accepting. Use agenthop_wait to wait for them to join and confirm.`,
+          `邀请已经送到 ${to.name}。它那边的 agent 通常要先问过用户才会接受。用 agenthop_wait 等它加入并确认。`,
+        ) + logNote(log),
       );
     },
   );
@@ -511,11 +616,13 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
   server.registerTool(
     "agenthop_accept",
     {
-      description:
+      description: t(
+        "Accept a contact's invitation: join the room they opened and return their opening line (the task background). Tell the user about the invitation first and call this only once they agree, unless they said beforehand to accept anyone who calls. Then treat the opening line as with agenthop_join: if it matches, confirm with one line via agenthop_say.",
         "接受一个联系人的邀请：加入它开的房间，返回它的开场白（任务背景）。先把邀请告诉用户，用户同意了再调用，除非用户事先说过有人找就接。读完开场白的做法和 agenthop_join 一样：相符就用 agenthop_say 写一句确认。",
+      ),
       inputSchema: {
-        from: z.string().optional().describe("发邀请的联系人名字；只有一个人在邀请时可以不填"),
-        accept_files: z.boolean().optional().describe("是否把对方发来的文件存到磁盘（默认不存，只记文件名）"),
+        from: z.string().optional().describe(fromNote()),
+        accept_files: z.boolean().optional().describe(acceptFilesNote()),
       },
     },
     async ({ from, accept_files }) => {
@@ -527,13 +634,19 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
         runSession({ ...sessionOptions(c), code: invitation.code, keepFiles: accept_files === true, expectPeer: invitation.from }),
       );
       const hello = await until(conversation, (entry) => entry.side === "peer" && entry.state === "hello", 30_000);
-      if (!hello) return failure(conversation.failure ?? refusal(conversation) ?? `等了 30 秒没等到 ${invitation.name} 的开场白，它可能已经不等了。`);
+      if (!hello) {
+        return failure(
+          conversation.failure ??
+            refusal(conversation) ??
+            t(`No opening line from ${invitation.name} after 30 seconds; they may have stopped waiting.`, `等了 30 秒没等到 ${invitation.name} 的开场白，它可能已经不等了。`),
+        );
+      }
       conversation.seen = conversation.entries.length;
       const log = logPath(conversation);
       return reply(
-        `已接受 ${invitation.name} 的邀请。${introduction(conversation)}对方的任务背景：\n${hello.text}\n\n` +
-          "判断它和你的上下文是否相符。相符就用 agenthop_say 写一句确认；不相符就问用户，不要回复。" +
-          (log ? `\n日志：${log}（看实时进展：tail -f ${log}）` : ""),
+        t(`Accepted ${invitation.name}'s invitation. ${introduction(conversation)}Their task:\n${hello.text}\n\n`, `已接受 ${invitation.name} 的邀请。${introduction(conversation)}对方的任务背景：\n${hello.text}\n\n`) +
+          checkIt() +
+          logNote(log),
       );
     },
   );
@@ -541,10 +654,13 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
   server.registerTool(
     "agenthop_decline",
     {
-      description: "回绝一个联系人的邀请，可以带一句理由。对方会马上知道，不用干等。",
+      description: t(
+        "Decline a contact's invitation, optionally with a reason. They know right away instead of waiting.",
+        "回绝一个联系人的邀请，可以带一句理由。对方会马上知道，不用干等。",
+      ),
       inputSchema: {
-        from: z.string().optional().describe("发邀请的联系人名字；只有一个人在邀请时可以不填"),
-        reason: z.string().optional().describe("回绝的理由，例如：现在在忙，一小时后再找我"),
+        from: z.string().optional().describe(fromNote()),
+        reason: z.string().optional().describe(t("Why, e.g.: busy right now, try me in an hour", "回绝的理由，例如：现在在忙，一小时后再找我")),
       },
     },
     async ({ from, reason }) => {
@@ -552,7 +668,7 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
       if (typeof invitation === "string") return failure(invitation);
       // Its own short conversation, apart from `current`: join, say goodbye with the reason, leave.
       const lines = lineQueue();
-      lines.push(`${BYE} ${reason?.trim() || "现在不方便"}`);
+      lines.push(`${BYE} ${reason?.trim() || t("Not a good time right now", "现在不方便")}`);
       let finished = false;
       const run = runSession({ code: invitation.code, lines, emit: () => undefined, relay: options.relay, pass: options.pass, home, identity: self() ?? false, expectPeer: invitation.from }).then(
         () => {
@@ -563,14 +679,25 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
         },
       );
       await Promise.race([run, delay(25_000)]);
-      return reply(finished ? `已经回绝了 ${invitation.name}，它那边会看到你的理由。` : `回绝已经发出，还没等到 ${invitation.name} 那边回应。`);
+      return reply(
+        finished
+          ? t(`Declined ${invitation.name}'s invitation; they will see your reason.`, `已经回绝了 ${invitation.name}，它那边会看到你的理由。`)
+          : t(`Your decline has been sent; no answer from ${invitation.name} yet.`, `回绝已经发出，还没等到 ${invitation.name} 那边回应。`),
+      );
     },
   );
 
   async function waitForInvitations(ms: number): Promise<string> {
     const deadline = Date.now() + ms;
     while (Date.now() < deadline && !pending().some((invitation) => !invitation.reported)) await delay(100);
-    return invitationNews() || `${Math.round(ms / 1000)} 秒内没有邀请，再调一次 agenthop_wait 接着等。（收件地址：${inbox?.state() ?? "没有挂着"}）`;
+    const seconds = Math.round(ms / 1000);
+    return (
+      invitationNews() ||
+      t(
+        `No invitations in ${seconds} seconds; call agenthop_wait again to keep waiting. (Inbox: ${inbox?.state() ?? "not connected"})`,
+        `${seconds} 秒内没有邀请，再调一次 agenthop_wait 接着等。（收件地址：${inbox?.state() ?? "没有挂着"}）`,
+      )
+    );
   }
 
   /** Invitations not yet reported, as the agent should read them; each is reported once. */
@@ -578,13 +705,23 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
     const fresh = pending().filter((invitation) => !invitation.reported);
     if (fresh.length === 0) return "";
     for (const invitation of fresh) invitation.reported = true;
-    const lines = fresh.map((invitation) => `${invitation.name} 邀请你对话（${clock(invitation.at)}，指纹 ${fingerprint(invitation.from)}）：\n${readable(invitation.background)}`);
+    const lines = fresh.map((invitation) => {
+      const when = clock(invitation.at), print = fingerprint(invitation.from), background = readable(invitation.background);
+      return t(`${invitation.name} invites you to talk (${when}, fingerprint ${print}):\n${background}`, `${invitation.name} 邀请你对话（${when}，指纹 ${print}）：\n${background}`);
+    });
     const busyNow = current && !current.done;
+    const latest = fresh[fresh.length - 1]!.name;
     return (
       `${lines.join("\n\n")}\n\n` +
       (busyNow
-        ? "你正在另一场对话里。先告诉用户有这个邀请；要接的话先 agenthop_bye 结束手上这场，再 agenthop_accept。"
-        : `先把邀请告诉用户，用户同意了再 agenthop_accept("${fresh[fresh.length - 1]!.name}")；不接就 agenthop_decline 带一句理由。用户事先说过有人找就接的，可以直接接受。`)
+        ? t(
+            "You are in another conversation. Tell the user about this invitation first; to take it, end the current one with agenthop_bye, then call agenthop_accept.",
+            "你正在另一场对话里。先告诉用户有这个邀请；要接的话先 agenthop_bye 结束手上这场，再 agenthop_accept。",
+          )
+        : t(
+            `Tell the user about the invitation first, and call agenthop_accept("${latest}") once they agree; to turn it down, agenthop_decline with a reason. If the user said beforehand to accept anyone who calls, you can accept right away.`,
+            `先把邀请告诉用户，用户同意了再 agenthop_accept("${latest}")；不接就 agenthop_decline 带一句理由。用户事先说过有人找就接的，可以直接接受。`,
+          ))
     );
   }
 
@@ -593,16 +730,17 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
     const me = self();
     const waiting = pending();
     return [
-      me ? `本机指纹：${fingerprint(me.publicKey)}` : "",
-      inbox ? `收件地址：${inbox.state()}` : "",
-      waiting.length > 0 ? `待处理的邀请：${names(waiting)}` : "",
+      me ? t(`This machine's fingerprint: ${fingerprint(me.publicKey)}`, `本机指纹：${fingerprint(me.publicKey)}`) : "",
+      inbox ? t(`Inbox: ${inbox.state()}`, `收件地址：${inbox.state()}`) : "",
+      waiting.length > 0 ? t(`Pending invitations: ${names(waiting)}`, `待处理的邀请：${names(waiting)}`) : "",
     ].filter(Boolean);
   }
 
   function contactNames(): string {
     try {
       const contacts = loadContacts(home);
-      return contacts.length > 0 ? `现有的联系人：${contacts.map((contact) => contact.name).join("、")}。` : "还没有联系人。";
+      if (contacts.length === 0) return t("No contacts yet.", "还没有联系人。");
+      return t(`Contacts: ${contacts.map((contact) => contact.name).join(", ")}.`, `现有的联系人：${contacts.map((contact) => contact.name).join("、")}。`);
     } catch {
       return "";
     }
@@ -618,10 +756,40 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
   return server;
 }
 
-const NO_CONVERSATION = "现在没有对话。先用 agenthop_create 开房间、agenthop_join 加入，或用 agenthop_invite 邀请联系人。";
+function noConversation(): string {
+  return t(
+    "No conversation right now. Open a room with agenthop_create, join one with agenthop_join, or invite a contact with agenthop_invite.",
+    "现在没有对话。先用 agenthop_create 开房间、agenthop_join 加入，或用 agenthop_invite 邀请联系人。",
+  );
+}
+
+function acceptFilesNote(): string {
+  return t("Save files the other side sends to disk (by default only their names are recorded)", "是否把对方发来的文件存到磁盘（默认不存，只记文件名）");
+}
+
+function fromNote(): string {
+  return t("Name of the contact who sent the invitation; may be left out when only one is inviting", "发邀请的联系人名字；只有一个人在邀请时可以不填");
+}
+
+/** What to do with an opening line, after join or accept. */
+function checkIt(): string {
+  return t(
+    "Check whether it matches your context. If it does, confirm with one line via agenthop_say; if not, ask the user and do not reply.",
+    "判断它和你的上下文是否相符。相符就用 agenthop_say 写一句确认；不相符就问用户，不要回复。",
+  );
+}
+
+function logNote(log: string | undefined): string {
+  return log ? t(`\nLog: ${log} (to follow it live: tail -f ${log})`, `\n日志：${log}（看实时进展：tail -f ${log}）`) : "";
+}
+
+function unreadableContacts(error: unknown): string {
+  const why = error instanceof Error ? error.message : String(error);
+  return t(`Cannot read contacts: ${why}`, `读不了联系人：${why}`);
+}
 
 function names(invitations: Received[]): string {
-  return [...new Set(invitations.map((invitation) => invitation.name))].join("、");
+  return [...new Set(invitations.map((invitation) => invitation.name))].join(t(", ", "、"));
 }
 
 function clock(at: number): string {
@@ -631,13 +799,13 @@ function clock(at: number): string {
 /** Why a conversation ended before the hello, when the other side was turned away. */
 function refusal(conversation: Conversation): string | undefined {
   const refused = conversation.entries.filter((entry) => entry.side === "peer" && entry.state === "refused").at(-1);
-  return refused ? `没有加入：${refused.text}` : undefined;
+  return refused ? t(`Did not join: ${refused.text}`, `没有加入：${refused.text}`) : undefined;
 }
 
 /** Who the other side turned out to be, when it said. */
 function introduction(conversation: Conversation): string {
   const shown = conversation.entries.find((entry) => entry.side === "peer" && entry.state === "identity");
-  return shown ? `对方身份：${shown.text}。\n` : "";
+  return shown ? t(`Their identity: ${shown.text}.\n`, `对方身份：${shown.text}。\n`) : "";
 }
 
 /**
@@ -683,7 +851,7 @@ function holding(conversation: Conversation): LogEntry | undefined {
 
 /** Whether an `undelivered` line is this one. Long lines are written down shortened. */
 function unsentAs(entry: LogEntry, line: string): boolean {
-  return entry.text === line || entry.text.startsWith(`${line}（`) || entry.text.startsWith(brief(line));
+  return entry.text === line || entry.text.startsWith(`${line}${t(" (", "（")}`) || entry.text.startsWith(brief(line));
 }
 
 /** Wait for an entry after `from` that satisfies `match`, or for the conversation to end. */
@@ -709,9 +877,9 @@ function logPath(conversation: Conversation): string | undefined {
 
 /** A log entry as the agent reads it. The text keeps its line breaks; the log file is where they become ↵. */
 function describe(entry: LogEntry): string {
-  const who = entry.side === "peer" ? "对方" : "这边";
+  const who = entry.side === "peer" ? t("peer", "对方") : t("local", "这边");
   const clock = entry.time.slice(11, 19);
-  return `[${clock}] ${who} ${entry.state}${entry.text ? `：${readable(entry.text)}` : ""}`;
+  return `[${clock}] ${who} ${entry.state}${entry.text ? `${t(": ", "：")}${readable(entry.text)}` : ""}`;
 }
 
 /** Line breaks stay; what would drive a terminal or reorder text on screen does not. */

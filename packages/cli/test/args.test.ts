@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { classifyInput, parseArgs } from "../src/args.js";
+import { setLang } from "../src/lang.js";
+
+afterEach(() => setLang("en"));
 
 describe("arguments", () => {
   it("joins a room however the pairing code was written down", () => {
@@ -19,17 +22,17 @@ describe("arguments", () => {
   it("tells a code from before the secret apart from one that was typed wrong", () => {
     // A code that stops after the words is a v0.3 code, or one that got cut short on the way
     // over. Calling that a typo would send someone looking for the wrong mistake.
-    expect(() => classifyInput(["1720-spiny-patch-easel"])).toThrow(/少了最后一段密钥/);
-    expect(() => classifyInput(["1720 spiny patch easel"])).toThrow(/少了最后一段密钥/);
+    expect(() => classifyInput(["1720-spiny-patch-easel"])).toThrow(/missing its last part, the key/);
+    expect(() => classifyInput(["1720 spiny patch easel"])).toThrow(/missing its last part, the key/);
   });
 
   it("refuses something that starts like a code instead of opening a room with it", () => {
-    expect(() => classifyInput(["1720-spiny-patch"])).toThrow(/不像一个配对码/);
-    expect(() => classifyInput(["1720-spiny-patch-easel-extra"])).toThrow(/不像一个配对码/);
+    expect(() => classifyInput(["1720-spiny-patch"])).toThrow(/does not look like a pairing code/);
+    expect(() => classifyInput(["1720-spiny-patch-easel-extra"])).toThrow(/does not look like a pairing code/);
     // Right shape, wrong alphabet, and one character short or long.
-    expect(() => classifyInput(["1720-spiny-patch-easel-k7f3q2mbxz4a6tu5wnhjy2pc31"])).toThrow(/不像一个配对码/);
-    expect(() => classifyInput(["1720-spiny-patch-easel-k7f3q2mbxz4a6tu5wnhjy2pc3"])).toThrow(/不像一个配对码/);
-    expect(() => classifyInput(["1720-spiny-patch-easel-k7f3q2mbxz4a6tu5wnhjy2pc3dd"])).toThrow(/不像一个配对码/);
+    expect(() => classifyInput(["1720-spiny-patch-easel-k7f3q2mbxz4a6tu5wnhjy2pc31"])).toThrow(/does not look like a pairing code/);
+    expect(() => classifyInput(["1720-spiny-patch-easel-k7f3q2mbxz4a6tu5wnhjy2pc3"])).toThrow(/does not look like a pairing code/);
+    expect(() => classifyInput(["1720-spiny-patch-easel-k7f3q2mbxz4a6tu5wnhjy2pc3dd"])).toThrow(/does not look like a pairing code/);
   });
 
   describe("a code the way agents actually pass it along", () => {
@@ -100,20 +103,36 @@ describe("arguments", () => {
   });
 
   it("rejects an unknown option rather than sending it as a hello", () => {
-    expect(() => parseArgs(["--verison"])).toThrow(/不认识的选项/);
-    expect(() => parseArgs(["--relay"])).toThrow(/要跟一个值/);
+    expect(() => parseArgs(["--verison"])).toThrow(/Unknown option/);
+    expect(() => parseArgs(["--relay"])).toThrow(/takes a value/);
   });
 
   it("names the flags and commands older releases documented", () => {
-    expect(() => parseArgs(["--agent", "claude -p"])).toThrow(/--agent 已经没有了/);
-    expect(() => parseArgs(["--on-receive", "cat"])).toThrow(/--on-receive 已经没有了/);
-    expect(() => classifyInput(["host"])).toThrow(/agenthop host 已经没有了/);
-    expect(() => classifyInput(["send", "hi"])).toThrow(/已经没有了/);
+    expect(() => parseArgs(["--agent", "claude -p"])).toThrow(/--agent is gone/);
+    expect(() => parseArgs(["--on-receive", "cat"])).toThrow(/--on-receive is gone/);
+    expect(() => classifyInput(["host"])).toThrow(/agenthop host is gone/);
+    expect(() => classifyInput(["send", "hi"])).toThrow(/is gone/);
   });
 
   it("reads --version and the commands that stay", () => {
     expect(parseArgs(["--version"]).flags.version).toBe(true);
     expect(classifyInput(["update"])).toEqual({ kind: "command", name: "update", words: [] });
     expect(classifyInput([])).toEqual({ kind: "help" });
+  });
+
+  it("reads the language to install", () => {
+    expect(parseArgs(["install", "--lang", "zh"]).flags.lang).toBe("zh");
+    expect(parseArgs(["install", "--lang", "zh_CN"]).flags.lang).toBe("zh");
+    expect(parseArgs(["install", "--lang", "EN"]).flags.lang).toBe("en");
+    expect(() => parseArgs(["install", "--lang", "fr"])).toThrow(/--lang takes en or zh/);
+    expect(() => parseArgs(["install", "--lang"])).toThrow(/--lang takes en or zh/);
+  });
+
+  it("says the same things in Chinese once Chinese is chosen", () => {
+    setLang("zh");
+    expect(() => classifyInput(["1720-spiny-patch-easel"])).toThrow(/少了最后一段密钥/);
+    expect(() => classifyInput(["1720-spiny-patch"])).toThrow(/不像一个配对码/);
+    expect(() => parseArgs(["--verison"])).toThrow(/不认识的选项/);
+    expect(() => parseArgs(["--agent", "claude -p"])).toThrow(/--agent 已经没有了/);
   });
 });

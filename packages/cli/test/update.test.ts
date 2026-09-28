@@ -57,7 +57,7 @@ describe("update", () => {
 
     refreshSkill("/home/me/.local/bin/agenthop", vi.fn().mockReturnValue({ status: 1, stdout: "", stderr: "old" }) as never);
 
-    expect(printed.join("\n")).toContain("SKILL.md 没有一起更新");
+    expect(printed.join("\n")).toContain("SKILL.md was not updated with it");
     expect(printed.join("\n")).toContain("install");
   });
 
@@ -97,7 +97,7 @@ describe("update", () => {
     });
     process.env.AGENTHOP_RELEASES_BASE = base;
 
-    await expect(updateAgenthop({ base, target, force: true })).rejects.toThrow(/校验和对不上/);
+    await expect(updateAgenthop({ base, target, force: true })).rejects.toThrow(/does not match the checksum/);
     expect(await readFile(target, "utf8")).toBe("the program that works");
     expect(existsSync(`${target}.download`)).toBe(false);
   });

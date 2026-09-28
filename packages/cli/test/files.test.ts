@@ -61,7 +61,7 @@ describe("sending a file", () => {
     const p = await pair(relay.url, dir);
     p.joinerLines.push(`/file ${await fixture(dir, "notes.md", "# 笔记")}`);
     await waitForText(p.creatorHome, "peer files");
-    expect(await p.log("creator")).toMatch(/peer files 对方带了 1 个文件，没有保存.*notes\.md/);
+    expect(await p.log("creator")).toMatch(/peer files The other side sent 1 file, not saved.*notes\.md/);
     p.joinerLines.push("/bye");
     await Promise.all([p.creator, p.joiner]);
     await relay.close();
@@ -77,9 +77,9 @@ describe("sending a file", () => {
     p.joinerLines.push("文件之后的一句");
     await waitForText(p.creatorHome, "peer say 文件之后的一句");
     const log = await p.log("joiner");
-    expect(log).toMatch(/local undelivered \/file .*no-such-file\.txt（找不到这个文件）/);
-    expect(log).toMatch(/local undelivered \/file .*big\.bin（超过单个文件 512 KiB 的上限）/);
-    expect(log).toMatch(/local undelivered \/file .*（这是一个目录，只能发单个文件）/);
+    expect(log).toMatch(/local undelivered \/file .*no-such-file\.txt \(no such file\)/);
+    expect(log).toMatch(/local undelivered \/file .*big\.bin \(over the 512 KiB limit for one file\)/);
+    expect(log).toMatch(/local undelivered \/file .* \(this is a directory; only single files can be sent\)/);
     p.joinerLines.push("/bye");
     await Promise.all([p.creator, p.joiner]);
     await relay.close();

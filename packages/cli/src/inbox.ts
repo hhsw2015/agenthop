@@ -3,6 +3,7 @@ import path from "node:path";
 import { AGENT_CARD_PATH } from "@a2a-js/sdk";
 import { contactByKey, inboxAddress, inboxToken, type Contact, type Identity } from "./identity.js";
 import { InviteError, openInvitation, sealInvitation, type Invitation, type OpenedInvitation } from "./invite.js";
+import { both, ours, t } from "./lang.js";
 import { startHost, type RunningHost } from "./host.js";
 import { sendMessage } from "./send.js";
 import { oneLine, stamp } from "./session.js";
@@ -49,7 +50,7 @@ export function startInbox(options: InboxOptions): Inbox {
   let host: RunningHost | undefined;
   let keepalive: NodeJS.Timeout | undefined;
   let closed = false;
-  let state = "正在挂上";
+  let state = t("connecting", "正在挂上");
 
   const note = (side: "local" | "peer", word: string, text = "") => {
     try {
@@ -66,12 +67,14 @@ export function startInbox(options: InboxOptions): Inbox {
     try {
       invitation = openInvitation(identity, text);
     } catch (error) {
-      return error instanceof InviteError ? error.message : "邀请解不开";
+      return error instanceof InviteError ? error.message : both("The invitation cannot be opened", "邀请解不开");
     }
-    if (!contactByKey(home, invitation.from)) return "对方的联系人里没有你，邀请没有收下";
-    if (Math.abs(Date.now() - invitation.at) > INVITE_TTL_MS) return "邀请已经过期了（超过十分钟，或者两边的时钟差得太多）";
+    if (!contactByKey(home, invitation.from)) return both("You are not among their contacts, so the invitation was not taken", "对方的联系人里没有你，邀请没有收下");
+    if (Math.abs(Date.now() - invitation.at) > INVITE_TTL_MS) {
+      return both("The invitation has expired (over ten minutes old, or the two clocks are too far apart)", "邀请已经过期了（超过十分钟，或者两边的时钟差得太多）");
+    }
     // Marked here rather than once it is kept: two copies in flight would both pass otherwise.
-    if (seen.has(invitation.id)) return "这封邀请已经收过了";
+    if (seen.has(invitation.id)) return both("This invitation was already received", "这封邀请已经收过了");
     seen.add(invitation.id);
     return true;
   };
@@ -102,14 +105,14 @@ export function startInbox(options: InboxOptions): Inbox {
             }
             const contact = contactByKey(home, invitation.from);
             if (!contact) return;
-            note("peer", "invite", `${contact.name}：${invitation.background}`);
+            note("peer", "invite", `${contact.name}${t(": ", "：")}${invitation.background}`);
             options.onInvitation({ ...invitation, name: contact.name });
           },
           onReconnecting: (reason) => {
-            state = `断开了（${reason}），正在接回来`;
+            state = t(`dropped (${reason}); reconnecting`, `断开了（${reason}），正在接回来`);
           },
           onReconnected: () => {
-            state = "在线";
+            state = t("online", "在线");
           },
         });
         if (closed) {
@@ -117,13 +120,14 @@ export function startInbox(options: InboxOptions): Inbox {
           return;
         }
         host = opened;
-        state = "在线";
+        state = t("online", "在线");
         note("local", "online", address);
         keepalive = setInterval(() => void ping(opened), KEEPALIVE_MS);
         keepalive.unref();
         return;
       } catch (error) {
-        state = `没挂上（${error instanceof Error ? error.message : String(error)}），${Math.round(wait / 1000)} 秒后再试`;
+        const why = error instanceof Error ? error.message : String(error);
+        state = t(`not connected (${why}); trying again in ${Math.round(wait / 1000)} seconds`, `没挂上（${why}），${Math.round(wait / 1000)} 秒后再试`);
         await delay(wait);
         wait = Math.min(wait * 2, MAX_RETRY_MS);
       }
@@ -163,8 +167,10 @@ export async function deliverInvitation(options: { sender: Identity; to: Contact
     await sendMessage({ code: inboxAddress(options.to.publicKey), text, relay: options.relay, pass: options.pass });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    if (/\b404\b|not found/i.test(detail)) throw new Error(`${options.to.name} 现在不在线：它那边没有开着带 agenthop 的 agent。`);
-    throw new Error(`邀请没有送到 ${options.to.name}：${detail}`);
+    if (/\b404\b|not found/i.test(detail)) {
+      throw new Error(t(`${options.to.name} is not online: no agent with agenthop is running on their side.`, `${options.to.name} 现在不在线：它那边没有开着带 agenthop 的 agent。`));
+    }
+    throw new Error(t(`The invitation did not reach ${options.to.name}: ${ours(detail)}`, `邀请没有送到 ${options.to.name}：${ours(detail)}`));
   }
 }
 

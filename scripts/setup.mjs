@@ -19,7 +19,8 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const launcher = join(root, "packages", "cli", "bin", "agenthop.mjs");
-const skillFile = join(root, "skill", "SKILL.md");
+// The skill in the language agenthop speaks here: AGENTHOP_LANG, else what `install --lang` kept.
+const skillFile = join(root, "skill", chosenLang() === "zh" ? "SKILL.zh-CN.md" : "SKILL.md");
 const skillDirs = readSkillDirs(process.argv.slice(2));
 const windows = platform() === "win32";
 const installed = [];
@@ -77,6 +78,17 @@ function installSkills() {
   }
 }
 
+function chosenLang() {
+  let kept;
+  try {
+    kept = JSON.parse(readFileSync(join(homedir(), ".agenthop", "install.json"), "utf8")).lang;
+  } catch {
+    kept = undefined;
+  }
+  const value = String(process.env.AGENTHOP_LANG || kept || "").trim().toLowerCase();
+  return value === "zh" || value === "cn" || /^zh[-_]/.test(value) ? "zh" : "en";
+}
+
 function readSkillDirs(args) {
   const dirs = [];
   for (let i = 0; i < args.length; i++) {
@@ -106,7 +118,7 @@ function placeSkill(file) {
 function verify() {
   const result = spawnSync(process.execPath, [launcher], { encoding: "utf8" });
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-  if (result.status !== 0 || !output.includes("agenthop <配对码>")) {
+  if (result.status !== 0 || !/agenthop <(pairing code|配对码)>/.test(output)) {
     console.error(output);
     console.error("agenthop: setup finished but the command did not print its usage");
     process.exit(1);

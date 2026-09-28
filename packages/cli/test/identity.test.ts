@@ -57,7 +57,7 @@ describe("contacts", () => {
     const saved = saveContact(dir, " alice ", alice);
     expect(typeof saved === "object" && saved.saved.name).toBe("alice");
     if (process.platform !== "win32") expect(statSync(path.join(dir, "contacts.json")).mode & 0o777).toBe(0o600);
-    expect(saveContact(dir, "alice", mallory)).toMatch(/已经是另一个人了/);
+    expect(saveContact(dir, "alice", mallory)).toMatch(/already someone else/);
     expect(loadContacts(dir).map((contact) => contact.publicKey)).toEqual([alice]);
 
     // The same person under a new name is a rename, not a second contact.
@@ -65,7 +65,7 @@ describe("contacts", () => {
     expect(typeof renamed === "object" && renamed.renamedFrom).toBe("alice");
     expect(loadContacts(dir).map((contact) => contact.name)).toEqual(["Alice 的电脑"]);
 
-    expect(saveContact(dir, "两行\n名字", mallory)).toMatch(/不能换行/);
+    expect(saveContact(dir, "两行\n名字", mallory)).toMatch(/line break/);
     expect(forgetContact(dir, "Alice 的电脑")?.publicKey).toBe(alice);
     expect(loadContacts(dir)).toEqual([]);
   });
