@@ -43,6 +43,9 @@ export type Directory = {
 
 const ANNOUNCE_MS = 60_000;
 const TTL_MS = 150_000;
+// How long our own just-sent announce may go unseen before we treat the read cursor as stale. Must
+// exceed a normal announce->read round trip (a couple of 5s polls); well under the roster TTL.
+const STALE_GRACE_MS = 12_000;
 const PRESENCE_PREFIX = "[[agenthop:bus-presence]] ";
 
 /** The room presence is gathered in, derived from the public namespace id (never the secret). */
@@ -80,12 +83,17 @@ export function startDirectory(options: DirectoryOptions): Directory {
   let closed = false;
   let electing = false;
   let after = 0;
-  // The cursor value as of the previous announce beat. In a live team the cursor advances every beat
-  // (every session, us included, announces each interval and we read it back), so if it has NOT moved
-  // across a whole beat the log was reset under a new keeper we never saw a 404 for — time to rewind.
-  let afterAtLastBeat = 0;
+  // The ts of our latest announce that we have not yet read back, and when we sent it. Our own writes
+  // always come back from a healthy keeper; if this one does not within STALE_GRACE_MS, our writes are
+  // landing on a keeper the reads no longer see (the room was taken over and the log restarted at a low
+  // seq that our cursor skips) — the cue to resync from the start of the new (small) log. No relay head
+  // query or generation id exists, so watching our own write is the cheapest reliable reset signal.
+  let pendingSelfTs: number | undefined;
+  let pendingSince = 0;
 
   const remember = (peer: RemotePeer): void => {
+    // Reading our own latest announce back confirms the current keeper sees our writes: cursor is fresh.
+    if (peer.id === self.id && peer.ts === pendingSelfTs) pendingSelfTs = undefined;
     const prev = seen.get(peer.id);
     if (!prev || peer.ts >= prev.ts) seen.set(peer.id, peer);
   };
@@ -134,9 +142,17 @@ export function startDirectory(options: DirectoryOptions): Directory {
   async function announce(): Promise<void> {
     if (closed) return;
     const entry: RemotePeer = { ...self, ts: Date.now() };
+    // Register the watch BEFORE sending. The room stores the log entry and only then acks the POST, so
+    // an independent GET can read our announce back before sendMessage resolves; setting the marker only
+    // after the await would let that read miss it, and the marker would then time out on a healthy log.
+    // With it set first, a concurrent read clears it (remember()); we leave it as-is on success and only
+    // clear it here if the send itself failed.
+    pendingSelfTs = entry.ts;
+    pendingSince = Date.now();
     try {
       await sendMessage({ code: address, text: PRESENCE_PREFIX + sealEntry(team.nsKey, JSON.stringify(entry)), relay: options.relay, pass: options.pass });
     } catch (error) {
+      if (pendingSelfTs === entry.ts) pendingSelfTs = undefined; // send failed: nothing to watch for
       // No room there (keeper gone or never was): the log restarts under the next keeper, so reset our
       // read cursor (#5) before taking it over; the next tick announces.
       if (/\b404\b|not found/i.test(error instanceof Error ? error.message : String(error))) {
@@ -148,6 +164,10 @@ export function startDirectory(options: DirectoryOptions): Directory {
 
   async function pull(): Promise<void> {
     if (closed) return;
+    // Our own recent announce never came back: the room was taken over and the new keeper's log starts
+    // at a low seq our cursor skips. Rewind to read the fresh (small) log from the start. This is the
+    // no-404 handover case; the 404 path below also rewinds when the room is briefly unhosted.
+    if (pendingSelfTs !== undefined && Date.now() - pendingSince > STALE_GRACE_MS) after = 0;
     try {
       const { events } = await readQueue(base, after, options.pass);
       for (const event of events) {
@@ -167,14 +187,6 @@ export function startDirectory(options: DirectoryOptions): Directory {
     void pull();
   });
   const beat = setInterval(() => {
-    // Safety net for a keeper change we never saw a 404 for (handover completed between our 5s polls):
-    // if the cursor has not advanced across a whole announce interval, the new keeper restarted the log
-    // at a lower seq and our cursor is stale — rewind so this beat's pull re-reads it. Comparing the
-    // cursor VALUE (not "saw any event") means old-keeper events read just before the handover can't
-    // mask the stall, so recovery lands within a single beat. In a live team the cursor always advances
-    // (everyone announces each interval and we read our own back), so this never fires in steady state.
-    if (after !== 0 && after === afterAtLastBeat) after = 0;
-    afterAtLastBeat = after;
     void announce();
     void pull();
   }, ANNOUNCE_MS);
