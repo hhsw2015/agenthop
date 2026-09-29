@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { startBridge, type Bridge } from "../src/bridge.js";
@@ -80,6 +80,16 @@ test("never steals a lock held by a live process, reclaims it once that process 
   const b = await p;
   expect(b).toBeDefined();
   started.push(b!);
+}, 15000);
+
+test("gives up on a permanent lock error instead of spinning forever", async () => {
+  writeFileSync(`${sock}.lock`, "2147483646"); // a dead-pid lock -> reclaim is attempted
+  chmodSync(home, 0o500); // read-only dir: the reclaim rename fails EACCES (a permanent error)
+  try {
+    expect(await startBridge({ home })).toBeUndefined(); // election ends, does not hang
+  } finally {
+    chmodSync(home, 0o700);
+  }
 }, 15000);
 
 test("close is idempotent, concurrent-safe, and hands the socket back cleanly", async () => {
