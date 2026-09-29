@@ -182,6 +182,37 @@ importers:
         specifier: ^3.2.4
         version: 3.2.7(@types/node@24.13.6)(supports-color@10.2.2)(tsx@4.23.15)
 
+  packages/bus:
+    dependencies:
+      '@agenthop/cli':
+        specifier: workspace:*
+        version: link:../cli
+      '@agenthop/tunnel':
+        specifier: workspace:*
+        version: link:../tunnel
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.30.1
+        version: 1.30.1(supports-color@10.2.2)(zod@4.6.5)
+      tsx:
+        specifier: ^4.20.5
+        version: 4.23.15
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      '@agenthop/relay-node':
+        specifier: workspace:*
+        version: link:../relay-node
+      '@types/node':
+        specifier: ^24.5.2
+        version: 24.13.6
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@24.13.6)(supports-color@10.2.2)(tsx@4.23.15)
+
   packages/cli:
     dependencies:
       '@a2a-js/sdk':

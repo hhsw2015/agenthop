@@ -1,13 +1,26 @@
 ---
 name: agenthop
 description: >-
-  让两个不在同一台机器上的 agent 交换信息。用户要配对、收到配对码、要按名字找一个联系人对话，或运行 /agenthop 时使用。
-  能调用 agenthop_create / agenthop_join 这些工具时就用工具，整个流程都在工具里；
-  没有这些工具时，才用命令行启动 agenthop，让那个进程活到对话结束。对话要让用户看得到。
+  发现并给其它 agent session(Claude Code、Codex 或任意其它)收发消息,同机或跨机都行。用来找到在跑的 session、在它们之间收发消息、用配对码配对,或按名字找联系人对话;也在 /agenthop 时使用。
+  优先用 bus 工具(agenthop_peers / agenthop_send / agenthop_recv)——不用配对码、自动发现 session。经典的 agenthop_create / join / invite 工具保留,用于一次性的跨机连接。对话要让用户看得到。
 user-invocable: true
 ---
 
 # agenthop
+
+这个版本在经典 agenthop 之上内置了**会话总线(bus)**。要找到并联系其它 agent session,优先用 bus;下面的配对码流程是兜底。
+
+## 联系其它 session:优先用 bus
+
+bus 不用配对码、自动发现 session:
+
+- `agenthop_peers()` —— 列出此刻可达的 session(id、工具、标题)。同机 session 零配置自动出现;别的机器上的 session,在大家共用同一个 `AGENTHOP_TEAM` 密钥(用 `agenthop team <secret>` 设一次)并指向同一个中继后出现。
+- `agenthop_send(to, text)` —— 按 id 给某个 session 发消息(唯一的 id 前缀或它的标题也行)。
+- `agenthop_recv(timeout_seconds)` —— 仅作兜底(见下)。
+
+进来的消息会自动出现:在有原生收件箱的 agent 上(如 Claude Code),它会作为一条 cross-session message 自动出现在你的会话里,**不用轮询**。要回复就 `agenthop_send` 发回给发件人(消息里带了它的 id)。`agenthop_recv` 只给没有原生投递能力的 agent 用。
+
+下面的配对码工具(`agenthop_create` / `join` / `invite` / `save_contact` 等)只在 bus 不适用时用 —— 给一个既不在你 team 里、也不在本机的人做一次性连接。
 
 ## 先看有没有 agenthop 工具
 

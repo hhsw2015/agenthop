@@ -1,0 +1,120 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { z } from "zod";
+import { startBusCore, type BusCore, type UnifiedPeer } from "./core.js";
+import { version } from "./version.js";
+
+/**
+ * The bus tools — agenthop_peers / send / recv — that make every session discoverable and reachable
+ * with no pairing code, across Claude Code, Codex or anything else, on this machine and (with a team
+ * secret) others. registerBusTools puts them on any server, so the enhanced agenthop carries these
+ * and the classic conversation tools together.
+ */
+
+const DEFAULT_WAIT_S = 30;
+const MAX_WAIT_S = 290;
+
+export type BusMcpOptions = { home?: string; relay?: string; pass?: string };
+
+export function busInstructions(): string {
+  return `Discover and message other agent sessions (Claude Code, Codex, or any other) with no pairing code:
+
+- agenthop_peers(): list sessions reachable now, each shown by its handle (tool:dir-<shortSessionId>, e.g. codex:Work-01a0ead5). Same-machine sessions appear automatically; other machines appear when a shared AGENTHOP_TEAM is set.
+- agenthop_send(to, text): message a session by its handle (a prefix like "codex:Work" works when unambiguous; the native session id also works). The handle is restart-stable, so you can reach the same session again after it restarts without being told.
+- agenthop_recv(timeout_seconds): fallback only — see below.
+
+Incoming messages arrive on their own: on agents with a native inbox (e.g. Claude Code) they surface in your session automatically as a cross-session message — you do NOT need to poll. To reply, agenthop_send back to the sender (its id is shown with the message). agenthop_recv is only for agents without native delivery.`;
+}
+
+/** Put the bus tools on an existing server. Returns a cleanup to run when the server closes. */
+export function registerBusTools(server: McpServer, options: BusMcpOptions = {}): () => void {
+  const core: BusCore = startBusCore(options);
+
+  server.registerTool(
+    "agenthop_peers",
+    {
+      description: "List agent sessions reachable right now (Claude Code, Codex, or any other) with no pairing code. Same-machine sessions are automatic; other machines appear with a shared AGENTHOP_TEAM.",
+      inputSchema: {},
+    },
+    async (_args, extra) => {
+      noteCodex(core, extra);
+      return reply(roster(core.peers(), core.self.id, core.status()));
+    },
+  );
+
+  server.registerTool(
+    "agenthop_send",
+    {
+      description: "Send a message to another session with no pairing code. `to` is a session id (a unique id prefix or the session's title also work). The peer receives it on its next agenthop_recv.",
+      inputSchema: {
+        to: z.string().describe("Target session: its handle tool:dir-<shortSessionId> (a prefix like 'codex:Work' works when unambiguous), or the native session id (see agenthop_peers)"),
+        text: z.string().describe("The message to send"),
+      },
+    },
+    async ({ to, text }, extra) => {
+      noteCodex(core, extra);
+      if (!text.trim()) return failure("Nothing to send.");
+      const result = await core.send(to, text);
+      if (result.ok) return reply(`Sent to ${result.label}.`);
+      return failure(`${result.error ?? "Not sent."}\n${roster(core.peers(), core.self.id, core.status())}`);
+    },
+  );
+
+  server.registerTool(
+    "agenthop_recv",
+    {
+      description: "Wait for and return messages other sessions have sent you. Returns as soon as anything arrives, or when the timeout elapses.",
+      inputSchema: {
+        timeout_seconds: z.number().int().min(1).max(MAX_WAIT_S).optional().describe(`Seconds to wait, ${DEFAULT_WAIT_S} by default`),
+      },
+    },
+    async ({ timeout_seconds }, extra) => {
+      noteCodex(core, extra);
+      const secs = timeout_seconds ?? DEFAULT_WAIT_S;
+      const batch = await core.recv(secs * 1000);
+      if (batch.length === 0) return reply(`No messages in ${secs}s; call agenthop_recv again to keep waiting.`);
+      return reply(batch.map((m) => `[from ${m.fromLabel}${m.via === "relay" ? "" : ""}] ${m.text}`).join("\n\n"));
+    },
+  );
+
+  return () => void core.close();
+}
+
+/** Standalone bus MCP server (bus tools only). The enhanced agenthop composes registerBusTools instead. */
+export async function startBusMcp(options: BusMcpOptions = {}, transport: Transport = new StdioServerTransport()): Promise<McpServer> {
+  const server = new McpServer({ name: "agenthop", version }, { instructions: busInstructions() });
+  const cleanup = registerBusTools(server, options);
+  server.server.onclose = cleanup;
+  await server.connect(transport);
+  return server;
+}
+
+/** Codex tags every MCP call with x-codex-turn-metadata; capture the caller's own thread id so we
+ *  can push inbound messages into it with `codex queue`. No-op for agents that don't send it. */
+function noteCodex(core: BusCore, extra: unknown): void {
+  const meta = (extra as { _meta?: Record<string, unknown> } | undefined)?._meta;
+  const tm = meta?.["x-codex-turn-metadata"] as { thread_id?: string; session_id?: string } | undefined;
+  const tid = tm?.thread_id ?? tm?.session_id;
+  if (typeof tid === "string") core.noteThread(tid);
+}
+
+function roster(peers: UnifiedPeer[], selfId: string, status: string): string {
+  const rows = peers.map((p) => {
+    const mine = p.id === selfId ? " (you)" : "";
+    const where = p.via === "relay" ? `@${p.machine ?? "remote"}` : "";
+    // Lead with the readable, restart-stable handle (title = tool:dir-<shortSessionId>) — that is what
+    // you address. cwd for context; the per-run id/pid in parens are only to pick a live session now.
+    const run = `${p.id.slice(0, 8)}${p.pid ? ` pid ${p.pid}` : ""}`;
+    return `  ${p.title}${where}${mine}  ${p.cwd}  (run ${run})`;
+  });
+  return `${status}\n${rows.length ? rows.join("\n") : "  (no sessions)"}`;
+}
+
+function reply(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
+
+function failure(text: string) {
+  return { content: [{ type: "text" as const, text }], isError: true };
+}
