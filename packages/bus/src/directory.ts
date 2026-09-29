@@ -46,6 +46,11 @@ const TTL_MS = 150_000;
 // How long our own just-sent announce may go unseen before we treat the read cursor as stale. Must
 // exceed a normal announce->read round trip (a couple of 5s polls); well under the roster TTL.
 const STALE_GRACE_MS = 12_000;
+// Read-side backstop: in a healthy room our own announce echoes at least once per announce interval, so
+// a fresh read arrives at least that often. If known peers exist yet nothing fresh has been read for
+// longer than this, the cursor is likely stale (keeper changed). Kept just above ANNOUNCE_MS so a
+// normal quiet gap never trips it, giving a second, slightly earlier detector than the own-announce one.
+const SILENCE_MS = ANNOUNCE_MS + 8_000;
 const PRESENCE_PREFIX = "[[agenthop:bus-presence]] ";
 
 /** The room presence is gathered in, derived from the public namespace id (never the secret). */
@@ -90,6 +95,8 @@ export function startDirectory(options: DirectoryOptions): Directory {
   // query or generation id exists, so watching our own write is the cheapest reliable reset signal.
   let pendingSelfTs: number | undefined;
   let pendingSince = 0;
+  // When we last read any fresh event (our own announce echo counts). Drives the read-side backstop.
+  let lastFreshReadAt = Date.now();
 
   const remember = (peer: RemotePeer): void => {
     // Reading our own latest announce back confirms the current keeper sees our writes: cursor is fresh.
@@ -164,12 +171,17 @@ export function startDirectory(options: DirectoryOptions): Directory {
 
   async function pull(): Promise<void> {
     if (closed) return;
-    // Our own recent announce never came back: the room was taken over and the new keeper's log starts
-    // at a low seq our cursor skips. Rewind to read the fresh (small) log from the start. This is the
-    // no-404 handover case; the 404 path below also rewinds when the room is briefly unhosted.
-    if (pendingSelfTs !== undefined && Date.now() - pendingSince > STALE_GRACE_MS) after = 0;
+    const now = Date.now();
+    // Two independent staleness signals rewind the cursor to re-read a new keeper's log from the start
+    // (its log restarts at a low seq our cursor would skip). (1) own-announce: our recent announce never
+    // came back. (2) read-side backstop: known peers exist yet nothing fresh has been read for longer
+    // than SILENCE_MS. This is the no-404 handover case; the 404 path below covers the unhosted gap.
+    const stalePending = pendingSelfTs !== undefined && now - pendingSince > STALE_GRACE_MS;
+    const staleReads = after !== 0 && now - lastFreshReadAt > SILENCE_MS && [...seen.values()].some((p) => p.id !== self.id);
+    if (stalePending || staleReads) after = 0;
     try {
       const { events } = await readQueue(base, after, options.pass);
+      if (events.length > 0) lastFreshReadAt = Date.now();
       for (const event of events) {
         after = Math.max(after, event.seq ?? after);
         if (typeof event.text === "string") accept(event.text);
