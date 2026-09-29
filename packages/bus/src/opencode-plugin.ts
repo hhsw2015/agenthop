@@ -43,11 +43,15 @@ type ToolContext = { sessionID: string };
 type SessionBus = { local: LocalBus; self: SelfInfo; queue: Inbound[]; bridge?: BridgeClient };
 
 /** Talks to the cross-machine gateway for one session. Lean: a socket, a cached roster, a send RPC. */
+type SendResult = "sent" | "failed" | "unknown";
 type BridgeClient = {
   /** Latest remote roster the gateway pushed (empty until it connects). */
   roster(): UnifiedPeer[];
-  /** Seal+relay to a remote peer's public key via the gateway. false if it did not go. */
-  send(pub: string, text: string): Promise<boolean>;
+  /**
+   * Seal+relay to a remote peer's public key via the gateway. "sent"/"failed" are confirmed by the
+   * gateway; "unknown" means no ack within the timeout — it may or may not have been delivered.
+   */
+  send(pub: string, text: string): Promise<SendResult>;
   close(): void;
 };
 
@@ -70,14 +74,15 @@ function agenthopBin(): string {
   return "agenthop";
 }
 
-function startBridgeClient(self: SelfInfo, onInbound: (from: string, text: string) => void): BridgeClient {
+function startBridgeClient(self: SelfInfo, onInbound: (from: string, text: string) => void, teamId: string): BridgeClient {
   const sock = bridgeSocketPath();
   let socket: net.Socket | undefined;
   let closed = false;
+  let rejected = false; // the gateway serves a different team -> stop reconnecting (fail safe)
   let roster: UnifiedPeer[] = [];
   let lastSpawn = 0;
   let rid = 0;
-  const pending = new Map<number, (ok: boolean) => void>();
+  const pending = new Map<number, { resolve: (r: SendResult) => void; timer: NodeJS.Timeout }>();
 
   const onLine = (line: string): void => {
     let msg: { t?: string; peers?: UnifiedPeer[]; from?: string; text?: string; rid?: number; ok?: boolean };
@@ -88,11 +93,16 @@ function startBridgeClient(self: SelfInfo, onInbound: (from: string, text: strin
     }
     if (msg.t === "roster" && Array.isArray(msg.peers)) roster = msg.peers;
     else if (msg.t === "inbound" && typeof msg.text === "string") onInbound(String(msg.from ?? ""), msg.text);
-    else if (msg.t === "sent" && typeof msg.rid === "number") {
-      const resolve = pending.get(msg.rid);
-      if (resolve) {
+    else if (msg.t === "rejected") {
+      rejected = true; // a different-team gateway holds the socket; do not fight it
+      roster = [];
+      socket?.destroy();
+    } else if (msg.t === "sent" && typeof msg.rid === "number") {
+      const p = pending.get(msg.rid);
+      if (p) {
+        clearTimeout(p.timer);
         pending.delete(msg.rid);
-        resolve(!!msg.ok);
+        p.resolve(msg.ok ? "sent" : "failed");
       }
     }
   };
@@ -103,22 +113,31 @@ function startBridgeClient(self: SelfInfo, onInbound: (from: string, text: strin
     if (Date.now() - lastSpawn < 3_000) return;
     lastSpawn = Date.now();
     try {
-      spawn(agenthopBin(), ["bus-bridge"], { detached: true, stdio: "ignore" }).unref();
+      const child = spawn(agenthopBin(), ["bus-bridge"], { detached: true, stdio: "ignore" });
+      // A ChildProcess emits 'error' asynchronously (e.g. the binary is missing/not executable); with
+      // no listener that becomes an uncaught exception in the host. Swallow it — the reconnect retries.
+      child.on("error", () => undefined);
+      child.unref();
     } catch {
       // best effort; the next reconnect tries again
     }
   };
 
   const connect = (): void => {
-    if (closed) return;
+    if (closed || rejected) return;
     const s = net.connect(sock);
+    socket = s; // track immediately, so close() before 'connect' still tears this socket down
     let buffer = "";
     s.setEncoding("utf8");
     s.on("connect", () => {
-      socket = s;
-      s.write(`${JSON.stringify({ t: "hello", self })}\n`);
+      if (closed) {
+        s.destroy();
+        return;
+      }
+      s.write(`${JSON.stringify({ t: "hello", self, team: teamId })}\n`);
     });
     s.on("data", (chunk: string) => {
+      if (closed) return;
       buffer += chunk;
       let nl: number;
       while ((nl = buffer.indexOf("\n")) !== -1) {
@@ -131,7 +150,7 @@ function startBridgeClient(self: SelfInfo, onInbound: (from: string, text: strin
     s.once("close", () => {
       if (socket === s) socket = undefined;
       roster = [];
-      if (closed) return;
+      if (closed || rejected) return;
       ensureBridge(); // no bridge there (or it died) -> (re)spawn, then retry
       setTimeout(connect, 500);
     });
@@ -141,23 +160,29 @@ function startBridgeClient(self: SelfInfo, onInbound: (from: string, text: strin
   return {
     roster: () => roster,
     send: (pub, text) =>
-      new Promise<boolean>((resolve) => {
-        if (!socket || socket.destroyed) {
-          resolve(false);
+      new Promise<SendResult>((resolve) => {
+        if (!socket || socket.destroyed || closed) {
+          resolve("failed");
           return;
         }
         const id = ++rid;
-        pending.set(id, resolve);
-        socket.write(`${JSON.stringify({ t: "send", rid: id, pub, text })}\n`);
-        setTimeout(() => {
-          if (pending.delete(id)) resolve(false);
+        // Timeout resolves "unknown", never "failed": the gateway may have delivered it and only the
+        // ack is slow, so the caller must not be told it certainly failed (which would invite a
+        // duplicate resend). Cleared when the ack arrives.
+        const timer = setTimeout(() => {
+          if (pending.delete(id)) resolve("unknown");
         }, 10_000);
+        pending.set(id, { resolve, timer });
+        socket.write(`${JSON.stringify({ t: "send", rid: id, pub, text })}\n`);
       }),
     close: () => {
       closed = true;
-      for (const resolve of pending.values()) resolve(false);
+      for (const p of pending.values()) {
+        clearTimeout(p.timer);
+        p.resolve("failed");
+      }
       pending.clear();
-      socket?.destroy();
+      socket?.destroy(); // destroys a connected OR still-connecting socket
       socket = undefined;
     },
   };
@@ -218,8 +243,10 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
       });
     };
     b.local = startLocalBus(self, undefined, (m) => deliver(m.from, m.payload));
-    // Cross-machine is opt-in: only when a team secret exists (env or ~/.agenthop/bus.json).
-    if (loadTeam()) b.bridge = startBridgeClient(self, deliver);
+    // Cross-machine is opt-in: only when a team secret exists (env or ~/.agenthop/bus.json). The
+    // team's public nsId (not the secret) is handed to the gateway so it only serves our own team.
+    const team = loadTeam();
+    if (team) b.bridge = startBridgeClient(self, deliver, team.nsId);
     buses.set(sessionID, b);
     return b;
   };
@@ -272,8 +299,10 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
           if ("error" in peer) return peer.error;
           if (peer.via === "relay") {
             if (!b.bridge || !peer.pub) return `Cannot reach ${peer.title} — no team relay configured here (set AGENTHOP_TEAM).`;
-            const ok = await b.bridge.send(peer.pub, text);
-            return ok ? `Sent to ${peer.title}.` : `Not sent — ${peer.title} is not reachable right now.`;
+            const r = await b.bridge.send(peer.pub, text);
+            if (r === "sent") return `Sent to ${peer.title}.`;
+            if (r === "unknown") return `Sent to ${peer.title}, but no delivery confirmation within 10s — it may or may not have arrived; check before resending.`;
+            return `Not sent — ${peer.title} is not reachable right now.`;
           }
           const ok = b.local.send(peer.id, text);
           return ok ? `Sent to ${peer.title}.` : `Not sent — ${peer.title} is not reachable right now.`;

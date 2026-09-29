@@ -40,10 +40,14 @@ const targets = [
   ["bun-windows-x64", "agenthop-windows-x64.exe"],
 ];
 mkdirSync(join(root, "dist"), { recursive: true });
+// The released program is the ENHANCED entry (packages/bus/src/bin.ts): classic agenthop plus the
+// session bus (the `mcp` server carries the bus tools) plus the `team` and `bus-bridge` commands. The
+// classic packages/cli/src/bin.ts has none of those, so a build of it could not run the bus at all —
+// the plugin's `agenthop bus-bridge` would fall through to the classic create-session path.
 for (const [target, name] of targets) {
   const result = spawnSync(
     "bun",
-    ["build", "packages/cli/src/bin.ts", "--compile", `--target=${target}`, `--outfile=dist/${name}`],
+    ["build", "packages/bus/src/bin.ts", "--compile", `--target=${target}`, `--outfile=dist/${name}`],
     { cwd: root, stdio: "inherit" },
   );
   if (result.status !== 0) process.exit(result.status ?? 1);

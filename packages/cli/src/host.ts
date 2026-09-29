@@ -188,7 +188,17 @@ export async function startHost(options: HostOptions = {}): Promise<RunningHost>
     if (!closing) options.onGone?.(t(`${reason}; could not bring the room back within ${seconds} seconds`, `${reason}，${seconds} 秒内没能把房间接回来`));
   }
 
-  const first = await openRoom();
+  let first: { ws: WebSocket; url: string };
+  try {
+    first = await openRoom();
+  } catch (error) {
+    // The room could not be opened (commonly room_taken while electing a directory keeper). The control
+    // and HTTP servers created above would otherwise leak — harmless once, but the long-lived bus bridge
+    // elects on every session, so a failed start must roll them back fully.
+    await control.close().catch(() => undefined);
+    await new Promise<void>((resolve) => localUrl.server.close(() => resolve()));
+    throw error;
+  }
   socket = first.ws;
   let closed: Promise<void> | undefined;
 

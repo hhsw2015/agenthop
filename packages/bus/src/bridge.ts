@@ -20,18 +20,24 @@ import { dbg } from "./debug.js";
  * Self-joining tools (Claude, Codex) do not use the bridge; they run their own relay in-process.
  *
  * One bridge per machine: it binds the socket, and a second launch that finds a live one just exits.
- * With no team configured there is nothing to gateway, so it does not start.
+ * It serves exactly the team it started with — a session whose team namespace differs is refused, so a
+ * differently-configured session is never silently published to the wrong group. With no team
+ * configured there is nothing to gateway, so it does not start.
+ *
+ * Trust is the same as the broker's: any process of this OS user can reach the socket. It is not an
+ * authentication boundary between users; OS/path permissions decide who can connect at all.
  *
  * Wire (plugin -> bridge / bridge -> plugin), newline-delimited JSON. One session per connection.
  */
 
 type FromPlugin =
-  | { t: "hello"; self: SelfInfo }
+  | { t: "hello"; self: SelfInfo; team?: string }
   | { t: "send"; rid: number; pub: string; text: string };
 type ToPlugin =
   | { t: "roster"; peers: UnifiedPeer[] }
   | { t: "inbound"; from: string; text: string }
-  | { t: "sent"; rid: number; ok: boolean };
+  | { t: "sent"; rid: number; ok: boolean }
+  | { t: "rejected"; reason: string };
 
 export type Bridge = { socketPath: string; close: () => Promise<void> };
 export type BridgeOptions = RelayOptions & {
@@ -48,7 +54,8 @@ export type BridgeOptions = RelayOptions & {
  * team (nothing to do) or a live bridge already holds the socket (this launch is redundant).
  */
 export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undefined> {
-  if (!loadTeam(options.home)) return Promise.resolve(undefined);
+  const team = loadTeam(options.home);
+  if (!team) return Promise.resolve(undefined);
   const sock = bridgeSocketPath(options.home);
   const rosterMs = options.rosterMs ?? 5_000;
   const idleMs = options.idleMs ?? 30_000;
@@ -61,32 +68,63 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
       resolve(value);
     };
 
+    let closed = false;
     let sessions = 0;
     let idleTimer: NodeJS.Timeout | undefined;
+    const conns = new Set<net.Socket>();
+
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
-      if (sessions > 0 || !options.onIdle) return;
+      idleTimer = undefined;
+      if (closed || sessions > 0 || !options.onIdle) return;
       idleTimer = setTimeout(() => {
-        if (sessions === 0) options.onIdle?.();
+        if (!closed && sessions === 0) options.onIdle?.();
       }, idleMs);
       idleTimer.unref();
     };
 
     const server = net.createServer((socket) => {
+      if (closed) {
+        socket.destroy();
+        return;
+      }
+      conns.add(socket);
       let relay: Relay | undefined;
+      let registered = false; // this connection's hello was accepted and counts toward `sessions`
       let roster: NodeJS.Timeout | undefined;
       const write = (msg: ToPlugin): void => {
         if (!socket.destroyed) socket.write(`${JSON.stringify(msg)}\n`);
       };
       readLines(socket, (msg) => {
+        if (closed) return;
         if (msg.t === "hello") {
-          if (relay) return; // one session per connection; ignore a duplicate hello
+          if (registered) return; // one session per connection; ignore a duplicate hello
+          // Serve only this machine's team — never publish a differently-configured session to the
+          // wrong remote group. nsId is the public team hash, safe to compare over the socket.
+          if (msg.team !== team.nsId) {
+            write({ t: "rejected", reason: "team-mismatch" });
+            socket.destroy();
+            return;
+          }
+          const r = startRelay(msg.self, (from, text) => write({ t: "inbound", from, text }), options);
+          if (!r) {
+            // Team vanished between our start and this hello: nothing to gateway for it.
+            write({ t: "rejected", reason: "no-team" });
+            socket.destroy();
+            return;
+          }
+          // Count ONLY once a relay actually exists, so a refused/failed hello can never leave the
+          // session count stuck above zero and defeat idle-exit.
+          relay = r;
+          registered = true;
           sessions++;
-          if (idleTimer) clearTimeout(idleTimer);
-          relay = startRelay(msg.self, (from, text) => write({ t: "inbound", from, text }), options);
-          dbg(`bridge: session ${msg.self.title} joined (relay=${relay ? "on" : "off"})`);
+          if (idleTimer) {
+            clearTimeout(idleTimer);
+            idleTimer = undefined;
+          }
+          dbg(`bridge: session ${msg.self.title} joined (sessions=${sessions})`);
           const push = (): void => {
-            if (relay) write({ t: "roster", peers: relay.roster() });
+            if (relay && !socket.destroyed) write({ t: "roster", peers: relay.roster() });
           };
           push();
           roster = setInterval(push, rosterMs);
@@ -100,29 +138,65 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
         }
       });
       const teardown = (): void => {
-        if (roster) clearInterval(roster);
+        if (roster) {
+          clearInterval(roster);
+          roster = undefined;
+        }
+        conns.delete(socket);
         const had = relay;
         relay = undefined;
-        if (had) {
+        if (registered) {
+          registered = false;
           sessions = Math.max(0, sessions - 1);
-          void had.close();
           armIdle();
         }
+        void had?.close();
       };
       socket.on("close", teardown);
       socket.on("error", teardown);
     });
 
+    const close = async (): Promise<void> => {
+      if (closed) return; // idempotent: a second close must not unlink a successor's socket
+      closed = true;
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = undefined;
+      }
+      // Drop clients first: server.close() waits for open connections, and destroying them is also
+      // what tears down their relays (via the socket 'close' handler).
+      for (const s of conns) s.destroy();
+      conns.clear();
+      await new Promise<void>((r) => server.close(() => r()));
+      try {
+        if (existsSync(sock)) unlinkSync(sock);
+      } catch {
+        // best effort
+      }
+    };
+
+    // Bind, mirroring the broker's stale-socket handling: try to listen; on EADDRINUSE probe the path —
+    // a live bridge means this launch is redundant (exit), a dead file is stale (remove it and retry).
+    const tryListen = (): void => {
+      if (closed) return;
+      server.listen(sock, () => {
+        armIdle();
+        done({ socketPath: sock, close });
+      });
+    };
     server.on("error", (err: NodeJS.ErrnoException) => {
+      if (closed) {
+        done(undefined);
+        return;
+      }
       if (err.code !== "EADDRINUSE") {
         done(undefined);
         return;
       }
-      // Someone holds the socket. A live bridge means this launch is redundant; a dead file is stale.
       const probe = net.connect(sock);
       probe.once("connect", () => {
         probe.destroy();
-        done(undefined); // a live bridge is already serving this machine
+        done(undefined); // a live bridge already serves this machine
       });
       probe.once("error", () => {
         probe.destroy();
@@ -131,11 +205,9 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
         } catch {
           // best effort
         }
-        try {
-          server.listen(sock);
-        } catch {
-          done(undefined);
-        }
+        // Retry after a short jittered wait. If someone bound in the meantime, listen re-EADDRINUSEs
+        // and the next probe finds them live, so we exit rather than fight over the path.
+        setTimeout(tryListen, 40 + Math.floor(Math.random() * 80));
       });
     });
 
@@ -144,21 +216,7 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
     } catch {
       // dir may already exist
     }
-    server.listen(sock, () => {
-      armIdle();
-      done({
-        socketPath: sock,
-        async close() {
-          if (idleTimer) clearTimeout(idleTimer);
-          await new Promise<void>((r) => server.close(() => r()));
-          try {
-            if (existsSync(sock)) unlinkSync(sock);
-          } catch {
-            // best effort
-          }
-        },
-      });
-    });
+    tryListen();
   });
 }
 

@@ -6,7 +6,11 @@ import path from "node:path";
 import { startRelay, type RunningRelay } from "@agenthop/relay-node";
 import { startBridge, type Bridge } from "../src/bridge.js";
 import { startBusCore, type BusCore, type BusMessage } from "../src/core.js";
+import { deriveTeam } from "../src/team.js";
 import type { SelfInfo } from "../src/label.js";
+
+const TEAM_SECRET = "bridge-secret-7";
+const TEAM_ID = deriveTeam(TEAM_SECRET).nsId;
 
 /**
  * The cross-machine gateway, end to end over a real (local) stock relay. An OpenCode session cannot
@@ -22,7 +26,7 @@ const homes: string[] = [];
 
 beforeEach(async () => {
   relay = await startRelay();
-  process.env.AGENTHOP_TEAM = "bridge-secret-7";
+  process.env.AGENTHOP_TEAM = TEAM_SECRET;
   delete process.env.CLAUDE_CODE_MESSAGING_SOCKET; // node A's inbound must land in its recv queue
   process.env.AGENTHOP_NO_CODEX = "1";
 });
@@ -54,15 +58,17 @@ async function until(cond: () => boolean, ms: number): Promise<boolean> {
 
 /** A stand-in for the OpenCode plugin's bridge client: one connection, one session identity. */
 type RemoteRow = { id: string; pub?: string; title: string; via: string };
-function mockPlugin(sock: string, self: SelfInfo) {
+function mockPlugin(sock: string, self: SelfInfo, teamId: string = TEAM_ID) {
   const socket = net.connect(sock);
   let roster: RemoteRow[] = [];
+  let rejected = false;
   const inbound: Array<{ from: string; text: string }> = [];
   const sent = new Map<number, (ok: boolean) => void>();
   let rid = 0;
   let buffer = "";
   socket.setEncoding("utf8");
-  socket.on("connect", () => socket.write(`${JSON.stringify({ t: "hello", self })}\n`));
+  socket.on("connect", () => socket.write(`${JSON.stringify({ t: "hello", self, team: teamId })}\n`));
+  socket.on("error", () => undefined);
   socket.on("data", (chunk: string) => {
     buffer += chunk;
     let nl: number;
@@ -74,11 +80,13 @@ function mockPlugin(sock: string, self: SelfInfo) {
       if (msg.t === "roster") roster = msg.peers;
       else if (msg.t === "inbound") inbound.push({ from: msg.from, text: msg.text });
       else if (msg.t === "sent") sent.get(msg.rid)?.(msg.ok);
+      else if (msg.t === "rejected") rejected = true;
     }
   });
   return {
     roster: () => roster,
     inbound: () => inbound,
+    rejected: () => rejected,
     send: (pub: string, text: string) =>
       new Promise<boolean>((resolve) => {
         const id = ++rid;
@@ -136,3 +144,30 @@ test("an OpenCode session reaches another machine through the gateway, both ways
     await a.close();
   }
 }, 60000);
+
+test("the gateway refuses a session whose team namespace differs", async () => {
+  const homeB = freshHome();
+  const bridgeSock = path.join(homeB, "bridge.sock");
+  process.env.AGENTHOP_BRIDGE_SOCK = bridgeSock;
+  bridge = await startBridge({ home: homeB, relay: relay.url });
+  expect(bridge).toBeDefined();
+
+  const selfC: SelfInfo = {
+    id: "run-c-1",
+    stableId: "opencode-session-c",
+    tool: "opencode",
+    cwd: "/tmp/projC",
+    pid: process.pid,
+    title: "opencode:projC-opencode",
+    startedAt: Date.now(),
+  };
+  // A different team's nsId: the gateway serves TEAM_SECRET, so this must be rejected, not relayed.
+  const plugin = mockPlugin(bridgeSock, selfC, deriveTeam("some-other-team").nsId);
+  try {
+    const wasRejected = await until(() => plugin.rejected(), 5000);
+    expect(wasRejected).toBe(true);
+    expect(plugin.roster()).toEqual([]);
+  } finally {
+    plugin.close();
+  }
+}, 30000);
