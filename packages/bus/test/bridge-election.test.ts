@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "vitest";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -54,6 +55,32 @@ test("clears a stale leftover at the socket path and binds", async () => {
   started.push(b!);
   expect(statSync(sock).isSocket()).toBe(true);
 });
+
+test("reclaims a lock whose owner process is dead", async () => {
+  writeFileSync(`${sock}.lock`, "2147483646"); // a pid that does not exist -> the lock is reclaimable
+  const b = await startBridge({ home });
+  expect(b).toBeDefined();
+  started.push(b!);
+  expect(statSync(sock).isSocket()).toBe(true);
+});
+
+test("never steals a lock held by a live process, reclaims it once that process dies", async () => {
+  const child = spawn("sleep", ["30"]);
+  await new Promise((r) => setTimeout(r, 50)); // let it get a real pid
+  writeFileSync(`${sock}.lock`, String(child.pid));
+  const p = startBridge({ home });
+  // While the owner lives, election must NOT resolve — a live owner's lock is never stolen.
+  const early = await Promise.race([
+    p.then(() => "resolved" as const),
+    new Promise<"pending">((r) => setTimeout(() => r("pending"), 700)),
+  ]);
+  expect(early).toBe("pending");
+  // The owner dies -> its lock becomes reclaimable -> the pending election now completes.
+  child.kill("SIGKILL");
+  const b = await p;
+  expect(b).toBeDefined();
+  started.push(b!);
+}, 15000);
 
 test("close is idempotent, concurrent-safe, and hands the socket back cleanly", async () => {
   const b = await startBridge({ home });

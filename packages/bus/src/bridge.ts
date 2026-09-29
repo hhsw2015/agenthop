@@ -1,5 +1,5 @@
 import net from "node:net";
-import { closeSync, existsSync, mkdirSync, openSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { bridgeSocketPath } from "./broker.js";
 import { loadTeam } from "./team.js";
@@ -19,8 +19,12 @@ import { dbg } from "./debug.js";
  * session would. Inbound DMs are pushed back down the socket to the session; the plugin injects them.
  * Self-joining tools (Claude, Codex) do not use the bridge; they run their own relay in-process.
  *
- * One bridge per machine. Election is serialized by an O_EXCL lock file next to the socket: only the
- * lock holder ever clears a stale socket and binds, so two racing launches cannot both end up live.
+ * One bridge per machine. Election is serialized by an owner lock file next to the socket, whose owner
+ * is identified by pid: a live owner's lock is NEVER stolen (so two live bridges cannot both hold it),
+ * and a dead owner's lock is reclaimed by an atomic rename so only one reclaimer wins. The lock is held
+ * for the bridge's whole life and released on close (or reclaimed after a crash). The socket bind is
+ * the ultimate mutex — a launcher that loses the race fails to bind and exits.
+ *
  * The bridge serves exactly the team it started with — a session whose team namespace differs is
  * refused (checked and published under the SAME frozen team, even if the on-disk config changes). With
  * no team configured there is nothing to gateway, so it does not start.
@@ -50,9 +54,10 @@ export type BridgeOptions = RelayOptions & {
   idleMs?: number;
 };
 
-// A lock held only during the brief clear-stale-socket-and-bind step; a crash leaves it at most this
-// stale before another launcher may steal it.
-const LOCK_STALE_MS = 3_000;
+// Backstop against pid reuse: a live owner is normally identified by its pid, but if that pid was
+// recycled by an unrelated process, a lock older than this (no legitimate owner holds it that long
+// without the socket also being live) may still be reclaimed.
+const LOCK_BACKSTOP_MS = 60_000;
 
 export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undefined> {
   const team = loadTeam(options.home);
@@ -62,6 +67,7 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
   const relayOptions: RelayOptions = { ...options, team };
   const sock = bridgeSocketPath(options.home);
   const lockPath = `${sock}.lock`;
+  const owner = String(process.pid);
   const rosterMs = options.rosterMs ?? 5_000;
   const idleMs = options.idleMs ?? 30_000;
 
@@ -79,35 +85,7 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
     let idleTimer: NodeJS.Timeout | undefined;
     const conns = new Set<net.Socket>();
     const relays = new Set<Relay>();
-
-    // Election lock: held only during the brief clear-stale-socket-and-bind step (and, best effort,
-    // while close releases the socket) so exactly one launcher ever unlinks + binds the path. A crash
-    // leaves it stale for at most LOCK_STALE_MS before another launcher may steal it.
-    const takeLock = (): boolean => {
-      try {
-        closeSync(openSync(lockPath, "wx"));
-        return true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
-        try {
-          if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
-            unlinkSync(lockPath); // the holder crashed mid-election; steal it
-            closeSync(openSync(lockPath, "wx"));
-            return true;
-          }
-        } catch {
-          // lost the race to steal it; treat as not held by us
-        }
-        return false;
-      }
-    };
-    const dropLock = (): void => {
-      try {
-        unlinkSync(lockPath);
-      } catch {
-        // best effort
-      }
-    };
+    const cleanups = new Set<Promise<unknown>>(); // relay.close() promises from normal disconnects
 
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
@@ -119,6 +97,72 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
       idleTimer.unref();
     };
 
+    // --- Owner lock -------------------------------------------------------------------------------
+    const pidAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "EPERM"; // exists but not ours == still alive
+      }
+    };
+    const lockIsStale = (): boolean => {
+      try {
+        const pid = Number(readFileSync(lockPath, "utf8").trim());
+        if (Number.isInteger(pid) && pid > 0 && pidAlive(pid)) {
+          // A live owner: only the pid-reuse backstop may reclaim it, never a brief-hold timeout.
+          return Date.now() - statSync(lockPath).mtimeMs > LOCK_BACKSTOP_MS;
+        }
+        return true; // dead pid, or an unparseable/foreign lock -> reclaimable
+      } catch {
+        return true; // vanished/unreadable
+      }
+    };
+    /** "acquired" (we own it), "held" (a live owner holds it), or "error" (a permanent fs error). */
+    const takeLock = (): "acquired" | "held" | "error" => {
+      try {
+        writeFileSync(lockPath, owner, { flag: "wx" }); // atomic create == the ownership mutex
+        return "acquired";
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") return "error"; // EACCES etc: do not spin
+      }
+      if (!lockIsStale()) return "held";
+      // Reclaim a stale lock by atomically renaming IT away; only one reclaimer wins the rename, and a
+      // fresh create by anyone else still loses to the create-wx below. Never unlinks a lock in place.
+      const claim = `${lockPath}.dead-${owner}-${Date.now()}`;
+      try {
+        renameSync(lockPath, claim);
+      } catch {
+        return "held"; // someone else reclaimed/holds it; back off
+      }
+      try {
+        unlinkSync(claim);
+      } catch {
+        // best effort
+      }
+      try {
+        writeFileSync(lockPath, owner, { flag: "wx" });
+        return "acquired";
+      } catch {
+        return "held"; // another launcher created it in the gap
+      }
+    };
+    const ownLock = (): boolean => {
+      try {
+        return readFileSync(lockPath, "utf8").trim() === owner;
+      } catch {
+        return false;
+      }
+    };
+    const dropLock = (): void => {
+      try {
+        if (ownLock()) unlinkSync(lockPath); // only ever remove a lock that is still ours
+      } catch {
+        // best effort
+      }
+    };
+
+    // --- Connections ------------------------------------------------------------------------------
     const server = net.createServer((socket) => {
       if (closed) {
         socket.destroy();
@@ -189,7 +233,10 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
         }
         if (had) {
           relays.delete(had);
-          void had.close();
+          // Track the in-flight close so a concurrent Bridge.close() waits for it to settle.
+          const p = had.close();
+          cleanups.add(p);
+          void p.finally(() => cleanups.delete(p));
         }
       };
       socket.on("close", teardown);
@@ -197,26 +244,25 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
     });
 
     const doClose = async (): Promise<void> => {
-      closed = true;
+      closed = true; // makes teardown a no-op for relay shutdown; close() owns it from here
       if (idleTimer) {
         clearTimeout(idleTimer);
         idleTimer = undefined;
       }
-      // Hold the election lock while we release the socket, so a launcher racing us cannot bind the same
-      // path mid-teardown (server.close() unlinks the socket file itself). Best effort: if a launcher is
-      // already electing we proceed anyway rather than block shutdown.
-      const held = takeLock();
-      for (const s of conns) s.destroy(); // also stops server.close() from waiting on open connections
+      for (const s of conns) s.destroy(); // also stops server.close() waiting on open connections
       conns.clear();
       await new Promise<void>((r) => server.close(() => r()));
+      // Wait for BOTH relays still registered at close and any close already in flight from a normal
+      // disconnect, so nothing is left shutting down after we return.
       await Promise.allSettled([...relays].map((r) => r.close()));
+      await Promise.allSettled([...cleanups]);
       relays.clear();
-      if (held) dropLock();
+      dropLock(); // we held it for our whole life; release it (only if still ours)
     };
     // Shared promise: a second (even concurrent) close awaits the same shutdown instead of returning early.
     const close = (): Promise<void> => (closePromise ??= doClose());
 
-    // Election, serialized by the O_EXCL lock so exactly one launcher clears a stale socket and binds.
+    // --- Election ---------------------------------------------------------------------------------
     const elect = (): void => {
       if (closed) {
         done(undefined);
@@ -234,11 +280,16 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
           done(undefined);
           return;
         }
-        if (!takeLock()) {
-          setTimeout(elect, 40 + Math.floor(Math.random() * 80)); // someone is electing; retry
+        const lock = takeLock();
+        if (lock === "error") {
+          done(undefined); // a permanent lock error (e.g. EACCES): give up rather than spin forever
           return;
         }
-        // Under the lock, re-probe: a winner may have bound between our probe and acquiring the lock.
+        if (lock === "held") {
+          setTimeout(elect, 40 + Math.floor(Math.random() * 80)); // a live owner holds it; retry
+          return;
+        }
+        // We hold the lock (for our whole life). Re-probe: a prior owner may have a live socket.
         const reprobe = net.connect(sock);
         reprobe.once("connect", () => {
           reprobe.destroy();
@@ -247,8 +298,13 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
         });
         reprobe.once("error", () => {
           reprobe.destroy();
+          if (closed || !ownLock()) {
+            dropLock();
+            done(undefined); // lost the lock or closed -> never unlink/bind
+            return;
+          }
           try {
-            if (existsSync(sock)) unlinkSync(sock); // clear the confirmed-dead socket, we hold the lock
+            if (existsSync(sock)) unlinkSync(sock); // clear the confirmed-dead socket; we hold the lock
           } catch {
             // best effort
           }
@@ -259,9 +315,8 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
           server.once("error", onErr);
           server.listen(sock, () => {
             server.removeListener("error", onErr);
-            dropLock();
             armIdle();
-            done({ socketPath: sock, close });
+            done({ socketPath: sock, close }); // keep the lock held for the bridge's lifetime
           });
         });
       });
