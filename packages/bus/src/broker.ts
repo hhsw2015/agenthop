@@ -44,6 +44,14 @@ export function socketPath(home: string = path.join(homedir(), ".agenthop")): st
   return process.env.AGENTHOP_BUS_SOCK ?? path.join(home, "bus.sock");
 }
 
+/**
+ * Where the cross-machine gateway (bridge.ts) listens. Kept here beside socketPath so the lean
+ * OpenCode plugin can find the bridge without importing bridge.ts (which pulls in the relay/express).
+ */
+export function bridgeSocketPath(home: string = path.join(homedir(), ".agenthop")): string {
+  return process.env.AGENTHOP_BRIDGE_SOCK ?? path.join(home, "bridge.sock");
+}
+
 export function startLocalBus(self: SelfInfo, home?: string, onInbound?: (msg: Inbound) => void): LocalBus {
   const sock = socketPath(home);
   let role: Role = "connecting";
