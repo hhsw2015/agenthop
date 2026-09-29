@@ -1,6 +1,6 @@
 import { hostname } from "node:os";
 import { ephemeralKeys } from "./dm.js";
-import { loadTeam } from "./team.js";
+import { loadTeam, type Team } from "./team.js";
 import { startDirectory, type RemotePeer } from "./directory.js";
 import { startMailbox } from "./mailbox.js";
 import type { SelfInfo } from "./label.js";
@@ -28,14 +28,24 @@ export type Relay = {
   close(): Promise<void>;
 };
 
-export type RelayOptions = { home?: string; relay?: string; pass?: string };
+export type RelayOptions = {
+  home?: string;
+  relay?: string;
+  pass?: string;
+  /**
+   * Use this exact Team rather than reading the config now. The gateway passes the Team it validated a
+   * session's handshake against, so the team it CHECKS and the team it PUBLISHES to are always the same
+   * even if the on-disk config changes between them.
+   */
+  team?: Team;
+};
 
 export function startRelay(
   self: SelfInfo,
   onInbound: (from: string, text: string) => void,
   options: RelayOptions = {},
 ): Relay | undefined {
-  const team = loadTeam(options.home);
+  const team = options.team ?? loadTeam(options.home);
   if (!team) return undefined;
   const keys = ephemeralKeys();
   let relayMe: RemotePeer = {

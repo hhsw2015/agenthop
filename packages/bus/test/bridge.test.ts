@@ -145,6 +145,39 @@ test("an OpenCode session reaches another machine through the gateway, both ways
   }
 }, 60000);
 
+test("relays under the team frozen at startup, not a later config change", async () => {
+  const homeB = freshHome();
+  const bridgeSock = path.join(homeB, "bridge.sock");
+  process.env.AGENTHOP_BRIDGE_SOCK = bridgeSock;
+  bridge = await startBridge({ home: homeB, relay: relay.url }); // freezes team = TEAM_SECRET
+  expect(bridge).toBeDefined();
+
+  // An observer on the ORIGINAL team, constructed while the env still names it.
+  const observer: BusCore = startBusCore({ home: freshHome(), relay: relay.url });
+
+  // The team config now changes out from under the already-running gateway.
+  process.env.AGENTHOP_TEAM = "a-totally-different-team";
+
+  const selfD: SelfInfo = {
+    id: "run-d-1",
+    stableId: "opencode-session-d",
+    tool: "opencode",
+    cwd: "/tmp/projD",
+    pid: process.pid,
+    title: "opencode:projD-opencode",
+    startedAt: Date.now(),
+  };
+  const plugin = mockPlugin(bridgeSock, selfD, TEAM_ID); // hello carries the ORIGINAL nsId -> accepted
+  try {
+    // The session is published under the FROZEN original team, so the original-team observer sees it.
+    const seen = await until(() => observer.peers().some((p) => p.id === selfD.id && p.via === "relay"), 20000);
+    expect(seen).toBe(true);
+  } finally {
+    plugin.close();
+    await observer.close();
+  }
+}, 60000);
+
 test("the gateway refuses a session whose team namespace differs", async () => {
   const homeB = freshHome();
   const bridgeSock = path.join(homeB, "bridge.sock");

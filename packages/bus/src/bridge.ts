@@ -1,5 +1,5 @@
 import net from "node:net";
-import { existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, statSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { bridgeSocketPath } from "./broker.js";
 import { loadTeam } from "./team.js";
@@ -19,10 +19,11 @@ import { dbg } from "./debug.js";
  * session would. Inbound DMs are pushed back down the socket to the session; the plugin injects them.
  * Self-joining tools (Claude, Codex) do not use the bridge; they run their own relay in-process.
  *
- * One bridge per machine: it binds the socket, and a second launch that finds a live one just exits.
- * It serves exactly the team it started with — a session whose team namespace differs is refused, so a
- * differently-configured session is never silently published to the wrong group. With no team
- * configured there is nothing to gateway, so it does not start.
+ * One bridge per machine. Election is serialized by an O_EXCL lock file next to the socket: only the
+ * lock holder ever clears a stale socket and binds, so two racing launches cannot both end up live.
+ * The bridge serves exactly the team it started with — a session whose team namespace differs is
+ * refused (checked and published under the SAME frozen team, even if the on-disk config changes). With
+ * no team configured there is nothing to gateway, so it does not start.
  *
  * Trust is the same as the broker's: any process of this OS user can reach the socket. It is not an
  * authentication boundary between users; OS/path permissions decide who can connect at all.
@@ -49,14 +50,18 @@ export type BridgeOptions = RelayOptions & {
   idleMs?: number;
 };
 
-/**
- * Start the gateway. Resolves to a handle once the socket is bound, or to undefined if there is no
- * team (nothing to do) or a live bridge already holds the socket (this launch is redundant).
- */
+// A lock held only during the brief clear-stale-socket-and-bind step; a crash leaves it at most this
+// stale before another launcher may steal it.
+const LOCK_STALE_MS = 3_000;
+
 export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undefined> {
   const team = loadTeam(options.home);
   if (!team) return Promise.resolve(undefined);
+  // Every relay this gateway runs uses THIS frozen team, so the team a handshake is checked against is
+  // always the team its session is published to, even if the config file changes afterwards.
+  const relayOptions: RelayOptions = { ...options, team };
   const sock = bridgeSocketPath(options.home);
+  const lockPath = `${sock}.lock`;
   const rosterMs = options.rosterMs ?? 5_000;
   const idleMs = options.idleMs ?? 30_000;
 
@@ -69,9 +74,40 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
     };
 
     let closed = false;
+    let closePromise: Promise<void> | undefined;
     let sessions = 0;
     let idleTimer: NodeJS.Timeout | undefined;
     const conns = new Set<net.Socket>();
+    const relays = new Set<Relay>();
+
+    // Election lock: held only during the brief clear-stale-socket-and-bind step (and, best effort,
+    // while close releases the socket) so exactly one launcher ever unlinks + binds the path. A crash
+    // leaves it stale for at most LOCK_STALE_MS before another launcher may steal it.
+    const takeLock = (): boolean => {
+      try {
+        closeSync(openSync(lockPath, "wx"));
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+        try {
+          if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+            unlinkSync(lockPath); // the holder crashed mid-election; steal it
+            closeSync(openSync(lockPath, "wx"));
+            return true;
+          }
+        } catch {
+          // lost the race to steal it; treat as not held by us
+        }
+        return false;
+      }
+    };
+    const dropLock = (): void => {
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // best effort
+      }
+    };
 
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
@@ -106,9 +142,8 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
             socket.destroy();
             return;
           }
-          const r = startRelay(msg.self, (from, text) => write({ t: "inbound", from, text }), options);
+          const r = startRelay(msg.self, (from, text) => write({ t: "inbound", from, text }), relayOptions);
           if (!r) {
-            // Team vanished between our start and this hello: nothing to gateway for it.
             write({ t: "rejected", reason: "no-team" });
             socket.destroy();
             return;
@@ -116,6 +151,7 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
           // Count ONLY once a relay actually exists, so a refused/failed hello can never leave the
           // session count stuck above zero and defeat idle-exit.
           relay = r;
+          relays.add(r);
           registered = true;
           sessions++;
           if (idleTimer) {
@@ -143,6 +179,7 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
           roster = undefined;
         }
         conns.delete(socket);
+        if (closed) return; // close() owns relay shutdown and the session count during shutdown
         const had = relay;
         relay = undefined;
         if (registered) {
@@ -150,73 +187,92 @@ export function startBridge(options: BridgeOptions = {}): Promise<Bridge | undef
           sessions = Math.max(0, sessions - 1);
           armIdle();
         }
-        void had?.close();
+        if (had) {
+          relays.delete(had);
+          void had.close();
+        }
       };
       socket.on("close", teardown);
       socket.on("error", teardown);
     });
 
-    const close = async (): Promise<void> => {
-      if (closed) return; // idempotent: a second close must not unlink a successor's socket
+    const doClose = async (): Promise<void> => {
       closed = true;
       if (idleTimer) {
         clearTimeout(idleTimer);
         idleTimer = undefined;
       }
-      // Drop clients first: server.close() waits for open connections, and destroying them is also
-      // what tears down their relays (via the socket 'close' handler).
-      for (const s of conns) s.destroy();
+      // Hold the election lock while we release the socket, so a launcher racing us cannot bind the same
+      // path mid-teardown (server.close() unlinks the socket file itself). Best effort: if a launcher is
+      // already electing we proceed anyway rather than block shutdown.
+      const held = takeLock();
+      for (const s of conns) s.destroy(); // also stops server.close() from waiting on open connections
       conns.clear();
       await new Promise<void>((r) => server.close(() => r()));
-      try {
-        if (existsSync(sock)) unlinkSync(sock);
-      } catch {
-        // best effort
-      }
+      await Promise.allSettled([...relays].map((r) => r.close()));
+      relays.clear();
+      if (held) dropLock();
     };
+    // Shared promise: a second (even concurrent) close awaits the same shutdown instead of returning early.
+    const close = (): Promise<void> => (closePromise ??= doClose());
 
-    // Bind, mirroring the broker's stale-socket handling: try to listen; on EADDRINUSE probe the path —
-    // a live bridge means this launch is redundant (exit), a dead file is stale (remove it and retry).
-    const tryListen = (): void => {
-      if (closed) return;
-      server.listen(sock, () => {
-        armIdle();
-        done({ socketPath: sock, close });
-      });
-    };
-    server.on("error", (err: NodeJS.ErrnoException) => {
+    // Election, serialized by the O_EXCL lock so exactly one launcher clears a stale socket and binds.
+    const elect = (): void => {
       if (closed) {
         done(undefined);
         return;
       }
-      if (err.code !== "EADDRINUSE") {
-        done(undefined);
-        return;
-      }
+      // Is a live bridge already serving this machine? (A missing socket errors here too -> proceed.)
       const probe = net.connect(sock);
       probe.once("connect", () => {
         probe.destroy();
-        done(undefined); // a live bridge already serves this machine
+        done(undefined);
       });
       probe.once("error", () => {
         probe.destroy();
-        try {
-          if (existsSync(sock)) unlinkSync(sock);
-        } catch {
-          // best effort
+        if (closed) {
+          done(undefined);
+          return;
         }
-        // Retry after a short jittered wait. If someone bound in the meantime, listen re-EADDRINUSEs
-        // and the next probe finds them live, so we exit rather than fight over the path.
-        setTimeout(tryListen, 40 + Math.floor(Math.random() * 80));
+        if (!takeLock()) {
+          setTimeout(elect, 40 + Math.floor(Math.random() * 80)); // someone is electing; retry
+          return;
+        }
+        // Under the lock, re-probe: a winner may have bound between our probe and acquiring the lock.
+        const reprobe = net.connect(sock);
+        reprobe.once("connect", () => {
+          reprobe.destroy();
+          dropLock();
+          done(undefined);
+        });
+        reprobe.once("error", () => {
+          reprobe.destroy();
+          try {
+            if (existsSync(sock)) unlinkSync(sock); // clear the confirmed-dead socket, we hold the lock
+          } catch {
+            // best effort
+          }
+          const onErr = (): void => {
+            dropLock();
+            done(undefined);
+          };
+          server.once("error", onErr);
+          server.listen(sock, () => {
+            server.removeListener("error", onErr);
+            dropLock();
+            armIdle();
+            done({ socketPath: sock, close });
+          });
+        });
       });
-    });
+    };
 
     try {
       mkdirSync(path.dirname(sock), { recursive: true });
     } catch {
       // dir may already exist
     }
-    tryListen();
+    elect();
   });
 }
 

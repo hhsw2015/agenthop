@@ -179,7 +179,9 @@ function startBridgeClient(self: SelfInfo, onInbound: (from: string, text: strin
       closed = true;
       for (const p of pending.values()) {
         clearTimeout(p.timer);
-        p.resolve("failed");
+        // These were written to the gateway and may well have been delivered; closing before the ack is
+        // "unknown", not a confirmed failure — the caller must not be told it certainly did not send.
+        p.resolve("unknown");
       }
       pending.clear();
       socket?.destroy(); // destroys a connected OR still-connecting socket
