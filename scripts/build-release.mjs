@@ -13,7 +13,23 @@ writeFileSync(
   join(root, "packages/cli/src/skill-text.ts"),
   `export const skillMarkdown = ${JSON.stringify(skill)};\nexport const skillMarkdownZh = ${JSON.stringify(skillZh)};\n`,
 );
-// --skill-text: regenerate skill-text.ts only, without compiling the binaries.
+
+// The OpenCode bus plugin, embedded in the program like the skill so `install --mcp opencode` can
+// write it to ~/.config/opencode/plugin/ with nothing to download. Built here so the committed
+// opencode-plugin-text.ts always matches the plugin source.
+const pluginOut = join(root, "packages/bus/dist-plugin/agenthop-bus.js");
+const pluginBuild = spawnSync(
+  "bun",
+  ["build", "packages/bus/src/opencode-plugin.ts", "--target=bun", "--format=esm", "--external", "@opencode-ai/plugin", `--outfile=${pluginOut}`],
+  { cwd: root, stdio: "inherit" },
+);
+if (pluginBuild.status !== 0) process.exit(pluginBuild.status ?? 1);
+writeFileSync(
+  join(root, "packages/cli/src/opencode-plugin-text.ts"),
+  `export const opencodePluginJs = ${JSON.stringify(readFileSync(pluginOut, "utf8"))};\n`,
+);
+
+// --skill-text: regenerate the embedded texts only, without compiling the binaries.
 if (process.argv.includes("--skill-text")) process.exit(0);
 
 const targets = [

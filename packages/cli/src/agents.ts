@@ -3,14 +3,20 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { t } from "./lang.js";
+import { opencodePluginJs } from "./opencode-plugin-text.js";
 
 /**
  * The agents agenthop knows how to plug into as an MCP server. `install` finds the ones on this
  * machine and prints how to register it with each — writing into another tool's configuration
  * is a lasting change, so it only does that when asked by name (`--mcp <agent>`).
+ *
+ * OpenCode is the exception: an MCP subprocess there gets no session id or server url, so it can't
+ * auto-surface an inbound message. Its bus node is a server PLUGIN instead — the same one embedded
+ * in this program (opencode-plugin-text.ts) — so "registering" OpenCode means writing that plugin
+ * file, not editing an mcpServers block.
  */
 
-export const AGENT_IDS = ["claude", "grok", "codex", "cursor", "gemini"] as const;
+export const AGENT_IDS = ["claude", "grok", "codex", "cursor", "gemini", "opencode"] as const;
 export type AgentId = (typeof AGENT_IDS)[number];
 
 type Agent = {
@@ -68,7 +74,27 @@ const agents: Agent[] = [
     hint: (bin, home) => t(`Add to mcpServers in ${join(home, ".gemini", "settings.json")}: ${JSON.stringify(entry(bin))}`, `在 ${join(home, ".gemini", "settings.json")} 的 mcpServers 里加上：${JSON.stringify(entry(bin))}`),
     register: (bin, home) => mergeJson(join(home, ".gemini", "settings.json"), bin),
   },
+  {
+    id: "opencode",
+    name: "OpenCode",
+    present: (home) => existsSync(join(home, ".config", "opencode")),
+    hint: (_bin, home) => t(`Write the bus plugin to ${opencodePluginPath(home)} (OpenCode auto-loads it)`, `把总线插件写到 ${opencodePluginPath(home)}（OpenCode 会自动加载）`),
+    register: (_bin, home) => writeOpencodePlugin(home),
+  },
 ];
+
+/** Where the OpenCode bus plugin lives. OpenCode auto-loads every *.js under this directory. */
+export function opencodePluginPath(home = homedir()): string {
+  return join(home, ".config", "opencode", "plugin", "agenthop-bus.js");
+}
+
+/** Write (or refresh) the embedded OpenCode bus plugin. Idempotent — it is our own file. */
+export function writeOpencodePlugin(home = homedir()): string {
+  const file = opencodePluginPath(home);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, opencodePluginJs);
+  return t(`written to ${file}`, `已写入 ${file}`);
+}
 
 /** How to register agenthop with each agent found here, or with all of them if none is. */
 export function mcpHints(bin: string, home = homedir()): string[] {

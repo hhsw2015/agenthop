@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
@@ -15,7 +16,7 @@ import {
 import { homedir, platform } from "node:os";
 import { delimiter, dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mcpHints, registerMcp } from "./agents.js";
+import { mcpHints, opencodePluginPath, registerMcp, writeOpencodePlugin } from "./agents.js";
 import { chosenLang, lang, setLang, t, type Lang } from "./lang.js";
 import { skillMarkdown, skillMarkdownZh } from "./skill-text.js";
 
@@ -41,6 +42,12 @@ export function installAgenthop(options: InstallOptions = {}): void {
   if (command) console.log(command);
   for (const skill of skills) console.log(skill);
   console.log(languageNote());
+  // Keep an already-installed OpenCode plugin current on every install/update (update runs
+  // `install --skill-only`). First-time setup stays explicit via `install --mcp opencode`, so a
+  // machine that never opted in is left untouched.
+  if (!options.mcp?.includes("opencode") && existsSync(opencodePluginPath())) {
+    console.log(`OpenCode${t(": ", "：")}${writeOpencodePlugin()}`);
+  }
   if (!command) return;
   if (options.mcp?.length) {
     for (const line of registerMcp(options.mcp, command)) console.log(line);
@@ -48,7 +55,7 @@ export function installAgenthop(options: InstallOptions = {}): void {
   }
   console.log(t("\nAdd agenthop as an MCP server and the agent can use its tools directly, with nothing to write into a process's standard input:", "\n接入 MCP，agent 就能直接用 agenthop 的工具，不用往进程的标准输入里写字："));
   for (const line of mcpHints(command)) console.log(line);
-  console.log(t("  Or have it written for you: agenthop install --mcp <claude|grok|codex|cursor|gemini>", "  或者让它替你写：agenthop install --mcp <claude|grok|codex|cursor|gemini>"));
+  console.log(t("  Or have it written for you: agenthop install --mcp <claude|grok|codex|cursor|gemini|opencode>", "  或者让它替你写：agenthop install --mcp <claude|grok|codex|cursor|gemini|opencode>"));
 }
 
 /**
