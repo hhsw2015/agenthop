@@ -1,34 +1,28 @@
 {
-  "name": "@agenthop/cli",
+  "name": "@agenthop/bus",
   "version": "0.1.0",
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "agenthop": "./bin/agenthop.mjs"
+    "agenthop-bus": "./bin/agenthop-bus.mjs"
   },
   "exports": {
-    ".": "./src/index.ts",
-    "./bin": "./src/bin.ts"
+    ".": "./src/index.ts"
   },
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@a2a-js/sdk": "^1.1.0",
-    "@agenthop/agent": "workspace:*",
-    "@agenthop/relay-node": "workspace:*",
+    "@agenthop/cli": "workspace:*",
     "@agenthop/tunnel": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.30.1",
-    "express": "^5.1.0",
     "tsx": "^4.20.5",
-    "ws": "^8.18.3",
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/express": "^5.0.3",
+    "@agenthop/relay-node": "workspace:*",
     "@types/node": "^24.5.2",
-    "@types/ws": "^8.18.1",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   }

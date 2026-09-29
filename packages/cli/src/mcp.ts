@@ -89,6 +89,16 @@ Each tool result is the conversation itself, so let the user see it; the path of
 
 export async function startMcpServer(options: McpOptions = {}, transport: Transport = new StdioServerTransport()): Promise<McpServer> {
   const server = new McpServer({ name: "agenthop", version }, { instructions: instructions() });
+  registerAgenthopTools(server, options);
+  await server.connect(transport);
+  return server;
+}
+
+/**
+ * Register all of agenthop's conversation and contact tools on an existing server. Split out from
+ * startMcpServer so an enhanced build can put these and the bus tools on one server.
+ */
+export function registerAgenthopTools(server: McpServer, options: McpOptions = {}): void {
   const home = options.home ?? path.join(homedir(), ".agenthop");
   const waitCapMs = options.waitCapMs ?? MAX_WAIT_S * 1000;
   const inviteTtlMs = options.inviteTtlMs ?? INVITE_TTL_MS;
@@ -751,9 +761,7 @@ export async function startMcpServer(options: McpOptions = {}, transport: Transp
     inbox = undefined;
     current?.stop.abort();
   };
-  await server.connect(transport);
   syncInbox();
-  return server;
 }
 
 function noConversation(): string {

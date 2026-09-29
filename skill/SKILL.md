@@ -1,13 +1,26 @@
 ---
 name: agenthop
 description: >-
-  Let two agents on different machines exchange information. Use it when the user wants to pair, has received a pairing code, wants to talk with a contact by name, or runs /agenthop.
-  When the agenthop_create / agenthop_join tools are available, use them; the whole flow lives in the tools.
-  Only without those tools, start agenthop on the command line and keep that process running until the conversation ends. The conversation must stay visible to the user.
+  Discover and message other agent sessions (Claude Code, Codex, or any other), on this machine or across machines. Use it to find running sessions, send and receive messages between them, pair by code, or talk to a contact by name; also on /agenthop.
+  Prefer the bus tools (agenthop_peers / agenthop_send / agenthop_recv) — they need no pairing code and find sessions automatically. The classic agenthop_create / join / invite tools remain for a one-off cross-machine link. The conversation must stay visible to the user.
 user-invocable: true
 ---
 
 # agenthop
+
+This build has a built-in **session bus** on top of classic agenthop. To reach other agent sessions, use the bus first; the pairing-code flow below is the fallback.
+
+## Reaching other sessions: use the bus first
+
+The bus needs no pairing code and finds sessions automatically:
+
+- `agenthop_peers()` — list sessions reachable right now (id, tool, title). Same-machine sessions appear automatically with zero setup. Sessions on other machines appear once everyone shares one `AGENTHOP_TEAM` secret (set it once with `agenthop team <secret>`) and points at the same relay.
+- `agenthop_send(to, text)` — message a session by id (a unique id prefix or its title also work).
+- `agenthop_recv(timeout_seconds)` — fallback only (see below).
+
+Incoming messages arrive on their own: on an agent with a native inbox (e.g. Claude Code) they surface in your session automatically as a cross-session message — no polling. To reply, `agenthop_send` back to the sender (its id is shown with the message). `agenthop_recv` is only for agents without native delivery.
+
+Use the pairing-code tools below (`agenthop_create` / `join` / `invite` / `save_contact` …) only when the bus does not apply — a one-off link to someone who is not on your team and not on this machine.
 
 ## First, check for the agenthop tools
 
