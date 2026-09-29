@@ -90,6 +90,13 @@ export function startDirectory(options: DirectoryOptions): Directory {
   // query or generation id exists, so watching our own write is the cheapest reliable reset signal.
   let pendingSelfTs: number | undefined;
   let pendingSince = 0;
+  // The current keeper's per-instance generation id (from the queue response). When it changes, a new
+  // keeper took over and its log restarts at seq 1 — precise detection of the takeover.
+  let keeperGeneration: string | undefined;
+  // Bumped on every cursor reset. Pulls can overlap (the 5s poll and 60s beat coincide, or a slow
+  // read), so a pull tags its read with the current epoch and discards its response if a reset happened
+  // meanwhile — otherwise a late response from the OLD keeper could roll the cursor back over a reset.
+  let epoch = 0;
 
   const remember = (peer: RemotePeer): void => {
     // Reading our own latest announce back confirms the current keeper sees our writes: cursor is fresh.
@@ -164,21 +171,43 @@ export function startDirectory(options: DirectoryOptions): Directory {
 
   async function pull(): Promise<void> {
     if (closed) return;
-    // Our own recent announce never came back: the room was taken over and the new keeper's log starts
-    // at a low seq our cursor skips. Rewind to read the fresh (small) log from the start. This is the
-    // no-404 handover case; the 404 path below also rewinds when the room is briefly unhosted.
-    if (pendingSelfTs !== undefined && Date.now() - pendingSince > STALE_GRACE_MS) after = 0;
+    // Own-announce fallback (for a keeper without the generation field): our recent announce never came
+    // back -> taken over -> resync. Rarely fires once the generation check is active (that resets sooner).
+    if (pendingSelfTs !== undefined && Date.now() - pendingSince > STALE_GRACE_MS) {
+      after = 0;
+      epoch++;
+      pendingSelfTs = undefined; // act once; don't re-trigger every poll while it stays unechoed
+    }
+    const startEpoch = epoch;
     try {
-      const { events } = await readQueue(base, after, options.pass);
-      for (const event of events) {
+      const resp = await readQueue(base, after, options.pass);
+      // A reset happened while we were awaiting (a concurrent pull, or our own above): this response
+      // predates it, so drop it — never let a late old-keeper response roll the cursor back over a reset.
+      if (epoch !== startEpoch) return;
+      const generation = (resp as { generation?: string }).generation;
+      if (generation && keeperGeneration !== undefined && generation !== keeperGeneration) {
+        // New keeper: its log restarts at a low seq our cursor skips. Reset and let the next poll read
+        // it from the start (~5s); do not apply this response's old-cursor events.
+        keeperGeneration = generation;
+        after = 0;
+        epoch++;
+        pendingSelfTs = undefined; // a pending announce to the old keeper is moot; don't let it thrash
+        return;
+      }
+      if (generation) keeperGeneration = generation;
+      // No await past this point, so the cursor/roster commit is atomic against other pulls.
+      for (const event of resp.events) {
         after = Math.max(after, event.seq ?? after);
         if (typeof event.text === "string") accept(event.text);
       }
     } catch (error) {
-      // The room is between keepers (404) and the next keeper restarts the log at seq 1 — our cursor
-      // would be stale and skip every new announce, so rewind to re-read the fresh log from the start
-      // (accept() is idempotent). announce() handles reclaiming. (#5)
-      if (/\b404\b|not found/i.test(error instanceof Error ? error.message : String(error))) after = 0;
+      // Room briefly unhosted between keepers (404): rewind, bump epoch, forget the generation so the
+      // next keeper's is adopted cleanly. The next keeper restarts the log at seq 1. (accept() idempotent.)
+      if (/\b404\b|not found/i.test(error instanceof Error ? error.message : String(error))) {
+        after = 0;
+        epoch++;
+        keeperGeneration = undefined;
+      }
     }
   }
 

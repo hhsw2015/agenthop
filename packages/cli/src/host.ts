@@ -92,6 +92,10 @@ export async function startHost(options: HostOptions = {}): Promise<RunningHost>
   const card = agentCard(localUrl.url);
   const handler = new DefaultRequestHandler(card, new InMemoryTaskStore(), room.executor());
   let served = 0;
+  // A per-host-instance id. A new keeper (a fresh host taking over the same room code) gets a new one,
+  // so a reader can tell its cursor now points at a different, freshly-restarted log (seq back at 1)
+  // and re-read from the start. Additive and ignored by readers that don't look for it.
+  const generation = randomBytes(8).toString("hex");
   app.get("/agenthop/queue", (request, response) => {
     if (options.serveQueue === false) {
       response.status(404).end();
@@ -99,7 +103,7 @@ export async function startHost(options: HostOptions = {}): Promise<RunningHost>
     }
     const events = room.since(Number(request.query.after ?? 0));
     served = Math.max(served, events.at(-1)?.seq ?? 0);
-    response.json({ events: events.map(overTheRelay) });
+    response.json({ events: events.map(overTheRelay), generation });
   });
   app.use(`/${AGENT_CARD_PATH}`, agentCardHandler({ agentCardProvider: handler }));
   app.use(jsonRpcHandler({ requestHandler: handler, userBuilder: UserBuilder.noAuthentication }));
