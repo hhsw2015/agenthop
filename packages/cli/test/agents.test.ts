@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { mcpHints, registerMcp } from "../src/agents.js";
+import { mcpHints, opencodePluginPath, registerMcp } from "../src/agents.js";
 import { parseArgs } from "../src/args.js";
 
 const BIN = "/Users/someone/.local/bin/agenthop";
@@ -70,6 +70,24 @@ describe("plugging into agents as an MCP server", () => {
     const dir = await home();
     expect(registerMcp(["vscode"], BIN, dir)[0]).toContain("Unknown agent");
     expect(existsSync(path.join(dir, ".vscode"))).toBe(false);
+  });
+
+  it("registers OpenCode by writing the embedded bus plugin, not an mcpServers block", async () => {
+    const dir = await home();
+    await mkdir(path.join(dir, ".config", "opencode"), { recursive: true });
+    const [result] = registerMcp(["opencode"], BIN, dir);
+    expect(result).toContain("written to");
+    const plugin = await readFile(opencodePluginPath(dir), "utf8");
+    expect(plugin).toContain("AgenthopBusPlugin");
+    expect(plugin).toContain("@opencode-ai/plugin");
+    // A plugin, not an MCP entry: the agenthop binary path is never baked into it.
+    expect(plugin).not.toContain(BIN);
+  });
+
+  it("offers to write the OpenCode plugin when OpenCode is present", async () => {
+    const dir = await home();
+    await mkdir(path.join(dir, ".config", "opencode"), { recursive: true });
+    expect(mcpHints(BIN, dir).join("\n")).toContain("OpenCode");
   });
 
   it("takes --mcp more than once", () => {
