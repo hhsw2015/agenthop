@@ -1,4 +1,5 @@
 import { startAgenthop } from "./agenthop.js";
+import { startBridge } from "./bridge.js";
 import { setTeam } from "./team.js";
 import { version } from "./version.js";
 
@@ -23,6 +24,15 @@ async function main(): Promise<void> {
     setTeam(secret);
     console.log("Team secret saved. Sessions that share it discover each other across machines.");
     return;
+  }
+
+  if (cmd === "bus-bridge") {
+    // The per-machine cross-machine gateway for plugin-based tools (OpenCode). A plugin spawns this
+    // when a team is set; it exits on its own once the last session has been gone for a grace period,
+    // or immediately if there is no team or a live bridge already holds the socket.
+    const bridge = await startBridge({ onIdle: () => process.exit(0) });
+    if (!bridge) process.exit(0);
+    return; // the socket server keeps the process alive until idle-exit
   }
 
   if (cmd === "mcp") {

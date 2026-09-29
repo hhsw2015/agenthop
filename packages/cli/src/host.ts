@@ -118,13 +118,21 @@ export async function startHost(options: HostOptions = {}): Promise<RunningHost>
   function openRoom(): Promise<{ ws: WebSocket; url: string }> {
     // One deadline over the whole thing: a relay that takes the connection and then goes quiet,
     // at any step, must not leave the command sitting there with nothing on screen.
-    return withDeadline(connectRoom(), HANDSHAKE_MS, t(`The relay ${relay} did not open the room; gave up after ${HANDSHAKE_MS / 1000} seconds`, `中继 ${relay} 没有把房间开起来，${HANDSHAKE_MS / 1000} 秒后放弃`));
+    let ws: WebSocket | undefined;
+    return withDeadline(connectRoom((w) => (ws = w)), HANDSHAKE_MS, t(`The relay ${relay} did not open the room; gave up after ${HANDSHAKE_MS / 1000} seconds`, `中继 ${relay} 没有把房间开起来，${HANDSHAKE_MS / 1000} 秒后放弃`)).catch((error) => {
+      // The deadline races past connectRoom's own error handling, which would otherwise leave a
+      // black-hole socket OPEN (a relay that accepts the connection and never sends ready). Terminate
+      // the socket we opened so a repeatedly-electing caller (the long-lived bridge) leaks none.
+      ws?.terminate();
+      throw error;
+    });
   }
 
-  async function connectRoom(): Promise<{ ws: WebSocket; url: string }> {
+  async function connectRoom(expose?: (ws: WebSocket) => void): Promise<{ ws: WebSocket; url: string }> {
     const ws = new WebSocket(hostUrl, {
       headers: options.pass ? { authorization: `Bearer ${options.pass}` } : undefined,
     });
+    expose?.(ws);
     // An error on a socket with nobody listening ends the process. The relay going away
     // abruptly — killed, restarted, a network blip — raises one, sometimes more than one, and the
     // compiled binary died of it mid-conversation. The close that follows is what reopens the room.
@@ -188,7 +196,17 @@ export async function startHost(options: HostOptions = {}): Promise<RunningHost>
     if (!closing) options.onGone?.(t(`${reason}; could not bring the room back within ${seconds} seconds`, `${reason}，${seconds} 秒内没能把房间接回来`));
   }
 
-  const first = await openRoom();
+  let first: { ws: WebSocket; url: string };
+  try {
+    first = await openRoom();
+  } catch (error) {
+    // The room could not be opened (commonly room_taken while electing a directory keeper). The control
+    // and HTTP servers created above would otherwise leak — harmless once, but the long-lived bus bridge
+    // elects on every session, so a failed start must roll them back fully.
+    await control.close().catch(() => undefined);
+    await new Promise<void>((resolve) => localUrl.server.close(() => resolve()));
+    throw error;
+  }
   socket = first.ws;
   let closed: Promise<void> | undefined;
 

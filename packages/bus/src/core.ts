@@ -1,10 +1,6 @@
-import { hostname } from "node:os";
 import { selfInfo, sessionTitle, type SelfInfo } from "./label.js";
 import { startLocalBus, type LocalBus } from "./broker.js";
-import { ephemeralKeys, type SessionKeys } from "./dm.js";
-import { loadTeam } from "./team.js";
-import { startDirectory, type Directory, type RemotePeer } from "./directory.js";
-import { startMailbox, type Mailbox } from "./mailbox.js";
+import { startRelay, type Relay } from "./relay.js";
 import { pushToHost } from "./push.js";
 import { startCodexDaemon, type CodexDaemon } from "./codex.js";
 import { resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -86,13 +82,6 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
 
   const local: LocalBus = startLocalBus(self, options.home, (m) => handleInbound(m.from, m.payload, "local"));
 
-  const team = loadTeam(options.home);
-  let keys: SessionKeys | undefined;
-  let directory: Directory | undefined;
-  let mailbox: Mailbox | undefined;
-  // Our cross-machine presence entry (mutable: a late-learned stableId refreshes it, mirroring local).
-  let relayMe: RemotePeer | undefined;
-
   // Codex has no native session id in its env, so we adopt the thread id as our stableId the first
   // time we learn it (from an MCP call's metadata or the daemon). This also refreshes the readable
   // handle (tool:dir-<shortId>) and re-announces it — on both the local broker and the relay directory
@@ -111,26 +100,16 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     self.title = sessionTitle(self.tool, self.cwd, id);
     stableIdAuthoritative = authoritative;
     local.updateSelf(self);
-    if (relayMe && directory) {
-      relayMe = { ...relayMe, stableId: self.stableId, title: self.title, ts: Date.now() };
-      directory.updateSelf(relayMe);
-    }
+    relay?.updateSelf(self);
   };
 
-  if (team) {
-    keys = ephemeralKeys();
-    relayMe = { id: self.id, stableId: self.stableId, tool: self.tool, cwd: self.cwd, title: self.title, machine: hostname(), pub: keys.publicKey, ts: Date.now() };
-    directory = startDirectory({ team, self: relayMe, relay: options.relay, pass: options.pass });
-    mailbox = startMailbox({ keys, relay: options.relay, pass: options.pass, onInbound: (m) => handleInbound(m.from, m.payload, "relay") });
-  }
+  const relay: Relay | undefined = startRelay(self, (from, text) => handleInbound(from, text, "relay"), options);
 
   const unified = (): UnifiedPeer[] => {
     const out = new Map<string, UnifiedPeer>();
     for (const p of local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid });
-    if (directory) {
-      for (const p of directory.roster()) {
-        if (!out.has(p.id)) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "relay", machine: p.machine, pub: p.pub });
-      }
+    if (relay) {
+      for (const p of relay.roster()) if (!out.has(p.id)) out.set(p.id, p);
     }
     return [...out.values()];
   };
@@ -154,7 +133,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       const peer = resolve(to);
       if ("error" in peer) return { ok: false, error: peer.error };
       if (peer.via === "local") return { ok: local.send(peer.id, text), label: labelFor(peer.id) };
-      if (mailbox && peer.pub) return { ok: await mailbox.send(peer.pub, text), label: labelFor(peer.id) };
+      if (relay && peer.pub) return { ok: await relay.send(peer.pub, text), label: labelFor(peer.id) };
       return { ok: false, error: "That peer is on another machine but no team relay is configured here (set AGENTHOP_TEAM)." };
     },
     async recv(timeoutMs) {
@@ -168,15 +147,14 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       return batch;
     },
     status() {
-      const relay = options.relay ?? process.env.AGENTHOP_RELAY ?? "default relay";
-      const team_ = team ? `team on (${relay})` : "team off (same-machine only; set AGENTHOP_TEAM for cross-machine)";
+      const relayUrl = options.relay ?? process.env.AGENTHOP_RELAY ?? "default relay";
+      const team_ = relay ? `team on (${relayUrl})` : "team off (same-machine only; set AGENTHOP_TEAM for cross-machine)";
       return `local broker: ${local.role()}; ${team_}; ${unified().filter((p) => p.id !== self.id).length} other session(s)`;
     },
     async close() {
       codexDaemon?.close();
       await local.close();
-      await directory?.close();
-      await mailbox?.close();
+      await relay?.close();
     },
   };
 }
