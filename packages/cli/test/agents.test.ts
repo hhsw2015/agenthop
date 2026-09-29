@@ -1,9 +1,9 @@
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { existsSync, lstatSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { mcpHints, opencodePluginPath, registerMcp } from "../src/agents.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { mcpHints, opencodeConfigDir, opencodePluginPath, registerMcp, writeOpencodePlugin } from "../src/agents.js";
 import { parseArgs } from "../src/args.js";
 
 const BIN = "/Users/someone/.local/bin/agenthop";
@@ -11,6 +11,13 @@ const BIN = "/Users/someone/.local/bin/agenthop";
 async function home() {
   return mkdtemp(path.join(tmpdir(), "agenthop-agents-"));
 }
+
+// One test sets XDG_CONFIG_HOME; restore it so it never leaks into the others.
+const ORIGINAL_XDG = process.env.XDG_CONFIG_HOME;
+afterEach(() => {
+  if (ORIGINAL_XDG === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = ORIGINAL_XDG;
+});
 
 describe("plugging into agents as an MCP server", () => {
   it("says how to register with the agents it finds, using the installed path", async () => {
@@ -74,7 +81,7 @@ describe("plugging into agents as an MCP server", () => {
 
   it("registers OpenCode by writing the embedded bus plugin, not an mcpServers block", async () => {
     const dir = await home();
-    await mkdir(path.join(dir, ".config", "opencode"), { recursive: true });
+    await mkdir(opencodeConfigDir(dir), { recursive: true });
     const [result] = registerMcp(["opencode"], BIN, dir);
     expect(result).toContain("written to");
     const plugin = await readFile(opencodePluginPath(dir), "utf8");
@@ -86,8 +93,31 @@ describe("plugging into agents as an MCP server", () => {
 
   it("offers to write the OpenCode plugin when OpenCode is present", async () => {
     const dir = await home();
-    await mkdir(path.join(dir, ".config", "opencode"), { recursive: true });
+    await mkdir(opencodeConfigDir(dir), { recursive: true });
     expect(mcpHints(BIN, dir).join("\n")).toContain("OpenCode");
+  });
+
+  it("honors XDG_CONFIG_HOME for the OpenCode plugin location", async () => {
+    const dir = await home();
+    const xdg = path.join(dir, "xdg");
+    process.env.XDG_CONFIG_HOME = xdg;
+    expect(opencodePluginPath(dir)).toBe(path.join(xdg, "opencode", "plugin", "agenthop-bus.js"));
+    await mkdir(opencodeConfigDir(dir), { recursive: true });
+    registerMcp(["opencode"], BIN, dir);
+    expect(existsSync(path.join(xdg, "opencode", "plugin", "agenthop-bus.js"))).toBe(true);
+  });
+
+  it("refreshes the plugin without following a symlink at its path", async () => {
+    const dir = await home();
+    const pluginPath = opencodePluginPath(dir);
+    await mkdir(path.dirname(pluginPath), { recursive: true });
+    const target = path.join(dir, "elsewhere.js");
+    await writeFile(target, "PRECIOUS");
+    await symlink(target, pluginPath);
+    writeOpencodePlugin(dir);
+    expect(await readFile(target, "utf8")).toBe("PRECIOUS"); // the link target is left intact
+    expect(lstatSync(pluginPath).isSymbolicLink()).toBe(false); // the link was replaced by a real file
+    expect(await readFile(pluginPath, "utf8")).toContain("AgenthopBusPlugin");
   });
 
   it("takes --mcp more than once", () => {

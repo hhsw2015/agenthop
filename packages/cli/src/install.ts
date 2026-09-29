@@ -44,9 +44,15 @@ export function installAgenthop(options: InstallOptions = {}): void {
   console.log(languageNote());
   // Keep an already-installed OpenCode plugin current on every install/update (update runs
   // `install --skill-only`). First-time setup stays explicit via `install --mcp opencode`, so a
-  // machine that never opted in is left untouched.
+  // machine that never opted in is left untouched. Isolate any failure here: this optional refresh
+  // must never abort the install or block the explicit --mcp registrations that follow.
   if (!options.mcp?.includes("opencode") && existsSync(opencodePluginPath())) {
-    console.log(`OpenCode${t(": ", "：")}${writeOpencodePlugin()}`);
+    try {
+      console.log(`OpenCode${t(": ", "：")}${writeOpencodePlugin()}`);
+    } catch (error) {
+      const why = error instanceof Error ? error.message : String(error);
+      console.log(t(`OpenCode: could not refresh the bus plugin (${why})`, `OpenCode：刷新总线插件失败（${why}）`));
+    }
   }
   if (!command) return;
   if (options.mcp?.length) {
