@@ -38,7 +38,12 @@ jobs:
           tag="${{ github.event.release.tag_name || github.event.inputs.tag }}"
           version="v$(node -p "require('node:fs').readFileSync('packages/cli/src/version.ts','utf8').match(/\"(.*)\"/)[1]")"
           echo "tag=$tag version=$version"
-          test "$tag" = "$version"
+          # Allow a release suffix (e.g. v0.6.0-bus.3) on top of the base version, so the enhanced
+          # bus builds can ship through CI without bumping the upstream version file.
+          case "$tag" in
+            "$version"|"$version"-*) echo "tag matches base version (suffix allowed)";;
+            *) echo "tag $tag does not match version $version"; exit 1;;
+          esac
 
       - run: node scripts/build-release.mjs
 

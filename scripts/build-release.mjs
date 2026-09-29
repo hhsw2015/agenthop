@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -59,3 +59,8 @@ const sums = targets
   .join("\n");
 writeFileSync(join(root, "dist", "SHA256SUMS"), `${sums}\n`);
 console.log(sums);
+
+// Ship the OpenCode bus plugin as a release asset too. It is already embedded in the binary (install
+// --mcp opencode writes it), but publishing it is handy for manual installs and transparency. Not in
+// SHA256SUMS, which lists only the self-update targets `agenthop update` verifies.
+copyFileSync(join(root, "packages/bus/dist-plugin/agenthop-bus.js"), join(root, "dist", "agenthop-bus.js"));
