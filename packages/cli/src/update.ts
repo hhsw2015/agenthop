@@ -4,7 +4,6 @@ import { chmodSync, createWriteStream, lstatSync, readFileSync, renameSync, rmSy
 import { once } from "node:events";
 import { homedir, platform, arch } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { DEFAULT_RELAY } from "./host.js";
 import { ensureDir, readSkillDirs } from "./install.js";
 import { version } from "./version.js";
 import { t } from "./lang.js";
@@ -19,7 +18,12 @@ const ASSETS: Record<string, string> = {
 
 export type ReleaseInfo = { tag: string; assets: string[] };
 
-const GITHUB_RELEASES = "https://github.com/sdyuyouth/agenthop/releases/download";
+// This fork ships its own enhanced (session-bus) releases. Update pulls them straight from GitHub by
+// default; AGENTHOP_REPO overrides the repo, and AGENTHOP_UPDATE_BASE (a relay that serves /latest and
+// /download) overrides the whole source for private-relay setups.
+const GITHUB_REPO = process.env.AGENTHOP_REPO ?? "hhsw2015/agenthop";
+const GITHUB_RELEASES = `https://github.com/${GITHUB_REPO}/releases/download`;
+const GITHUB_API_LATEST = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
 
 function releasesBase(): string {
   return (process.env.AGENTHOP_RELEASES_BASE ?? GITHUB_RELEASES).replace(/\/$/, "");
@@ -36,7 +40,10 @@ export function sameRelease(local: string, remote: string): boolean {
 }
 
 export async function updateAgenthop(options: { check?: boolean; force?: boolean; base?: string; target?: string } = {}): Promise<void> {
-  const base = (options.base ?? process.env.AGENTHOP_UPDATE_BASE ?? DEFAULT_RELAY).replace(/\/$/, "");
+  // A relay base (explicit or AGENTHOP_UPDATE_BASE) serves /latest and /download/<asset>; with none,
+  // update goes straight to the fork's GitHub releases.
+  const rawBase = options.base ?? process.env.AGENTHOP_UPDATE_BASE;
+  const base = rawBase ? rawBase.replace(/\/$/, "") : undefined;
   const latest = await readLatest(base);
   const asset = releaseAsset();
   if (options.check) {
@@ -55,7 +62,8 @@ export async function updateAgenthop(options: { check?: boolean; force?: boolean
   const target = options.target ?? installTarget();
   const downloaded = `${target}.download`;
   ensureDir(dirname(target));
-  const actual = await download(`${base}/download/${asset}`, downloaded);
+  const assetUrl = base ? `${base}/download/${asset}` : `${GITHUB_RELEASES}/${latest.tag}/${asset}`;
+  const actual = await download(assetUrl, downloaded);
   if (actual !== expected) {
     rmSync(downloaded, { force: true });
     throw new Error(
@@ -108,10 +116,10 @@ function relayHeaders(): Record<string, string> {
   return pass ? { authorization: `Bearer ${pass}` } : {};
 }
 
-export async function readSums(base: string, tag: string): Promise<{ hashes: Map<string, string>; from: string }> {
+export async function readSums(base: string | undefined, tag: string): Promise<{ hashes: Map<string, string>; from: string }> {
   const sources = [
     { from: "github.com", url: `${releasesBase()}/${tag}/SHA256SUMS` },
-    { from: t("the relay (where the program came from)", "中继（与程序同源）"), url: `${base}/download/SHA256SUMS` },
+    ...(base ? [{ from: t("the relay (where the program came from)", "中继（与程序同源）"), url: `${base}/download/SHA256SUMS` }] : []),
   ];
   let last = "";
   for (const source of sources) {
@@ -144,17 +152,26 @@ export function sha256(file: string): string {
   return createHash("sha256").update(readFileSync(file)).digest("hex");
 }
 
-async function readLatest(base: string): Promise<ReleaseInfo> {
-  const response = await fetch(`${base}/latest`, { headers: relayHeaders() });
+async function readLatest(base: string | undefined): Promise<ReleaseInfo> {
+  if (base) {
+    // A relay mirrors releases at /latest as { tag, assets }.
+    const response = await fetch(`${base}/latest`, { headers: relayHeaders() });
+    if (!response.ok) throw new Error(`update lookup failed (${response.status})`);
+    const body = (await response.json()) as { tag?: string; assets?: string[] };
+    if (!body.tag) throw new Error("update lookup returned no tag");
+    return { tag: body.tag, assets: body.assets ?? [] };
+  }
+  // Straight from the GitHub releases API for this fork.
+  const response = await fetch(GITHUB_API_LATEST, { headers: { "user-agent": "agenthop", accept: "application/vnd.github+json" } });
   if (!response.ok) throw new Error(`update lookup failed (${response.status})`);
-  const body = (await response.json()) as { tag?: string; assets?: string[] };
-  if (!body.tag) throw new Error("update lookup returned no tag");
-  return { tag: body.tag, assets: body.assets ?? [] };
+  const body = (await response.json()) as { tag_name?: string; assets?: Array<{ name?: string }> };
+  if (!body.tag_name) throw new Error("update lookup returned no tag");
+  return { tag: body.tag_name, assets: (body.assets ?? []).map((a) => a.name).filter((name): name is string => !!name) };
 }
 
 /** Streamed to disk and hashed on the way, so a 90 MiB program is never held in memory. */
 async function download(url: string, file: string): Promise<string> {
-  const response = await fetch(url, { headers: relayHeaders() });
+  const response = await fetch(url, { headers: { "user-agent": "agenthop", ...relayHeaders() } });
   if (!response.ok || !response.body) throw new Error(`update download failed (${response.status})`);
   const digest = createHash("sha256");
   const out = createWriteStream(file);
