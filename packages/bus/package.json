@@ -11,7 +11,8 @@
   },
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:opencode-plugin": "bun build src/opencode-plugin.ts --outfile dist-plugin/agenthop-bus.js --target=bun --format=esm --external @opencode-ai/plugin"
   },
   "dependencies": {
     "@agenthop/cli": "workspace:*",

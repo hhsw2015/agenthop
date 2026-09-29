@@ -1,4 +1,6 @@
 {
   "extends": "../../tsconfig.base.json",
-  "include": ["src", "test"]
+  "include": ["src", "test"],
+  "comment": "opencode-plugin.ts imports @opencode-ai/plugin (an OpenCode-provided module, not a bus dep) and is built separately with bun; exclude it from tsc.",
+  "exclude": ["src/opencode-plugin.ts"]
 }
