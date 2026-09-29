@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { t } from "./lang.js";
@@ -77,22 +77,45 @@ const agents: Agent[] = [
   {
     id: "opencode",
     name: "OpenCode",
-    present: (home) => existsSync(join(home, ".config", "opencode")),
+    present: (home) => existsSync(opencodeConfigDir(home)),
     hint: (_bin, home) => t(`Write the bus plugin to ${opencodePluginPath(home)} (OpenCode auto-loads it)`, `把总线插件写到 ${opencodePluginPath(home)}（OpenCode 会自动加载）`),
     register: (_bin, home) => writeOpencodePlugin(home),
   },
 ];
 
-/** Where the OpenCode bus plugin lives. OpenCode auto-loads every *.js under this directory. */
-export function opencodePluginPath(home = homedir()): string {
-  return join(home, ".config", "opencode", "plugin", "agenthop-bus.js");
+/**
+ * OpenCode's config directory. OpenCode resolves it through XDG (XDG_CONFIG_HOME, else ~/.config),
+ * so we must too — otherwise, with XDG_CONFIG_HOME set, we would write the plugin where OpenCode
+ * never looks and the refresh check would miss the real one.
+ */
+export function opencodeConfigDir(home = homedir()): string {
+  const base = process.env.XDG_CONFIG_HOME?.trim() || join(home, ".config");
+  return join(base, "opencode");
 }
 
-/** Write (or refresh) the embedded OpenCode bus plugin. Idempotent — it is our own file. */
+/** Where the OpenCode bus plugin lives. OpenCode auto-loads every *.js under this directory. */
+export function opencodePluginPath(home = homedir()): string {
+  return join(opencodeConfigDir(home), "plugin", "agenthop-bus.js");
+}
+
+/**
+ * Write (or refresh) the embedded OpenCode bus plugin. Idempotent — it is our own file. Written to a
+ * sibling temp then renamed into place, so a short or failed write never truncates a working plugin,
+ * and a symlink at the destination is replaced rather than its target overwritten. Same idiom as
+ * placeCommand()/setTeam().
+ */
 export function writeOpencodePlugin(home = homedir()): string {
   const file = opencodePluginPath(home);
   mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, opencodePluginJs);
+  const staged = `${file}.new`;
+  rmSync(staged, { force: true });
+  writeFileSync(staged, opencodePluginJs);
+  try {
+    renameSync(staged, file);
+  } catch (error) {
+    rmSync(staged, { force: true });
+    throw error;
+  }
   return t(`written to ${file}`, `已写入 ${file}`);
 }
 
