@@ -54,6 +54,9 @@ const agents: Agent[] = [
     register: (bin, home) => {
       const file = join(home, ".codex", "config.toml");
       const existing = existsSync(file) ? readFileSync(file, "utf8") : "";
+      // Existing installs are left byte-for-byte alone (no fragile TOML rewriting). A spawned Codex still
+      // gets AGENTHOP_LAUNCH_ID forwarded because agenthop_spawn passes it per-launch via `codex -c
+      // mcp_servers.agenthop.env_vars=[...]` (see spawn.ts) — so migration of an old block is unnecessary.
       if (/^\[mcp_servers\.agenthop\]/m.test(existing)) return t(`${file} already has agenthop; nothing changed`, `${file} 里已经有 agenthop 了，没有改动`);
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${existing ? "\n" : ""}${codexBlock(bin)}\n`);
@@ -143,6 +146,9 @@ function entry(bin: string) {
 }
 
 function codexBlock(bin: string): string {
+  // Just the server registration. A spawned Codex session receives its AGENTHOP_LAUNCH_ID via a
+  // per-launch `codex -c mcp_servers.agenthop.env.AGENTHOP_LAUNCH_ID=...` (see spawn.ts) — so no env
+  // config is needed here, and existing installs need no migration.
   return `[mcp_servers.agenthop]\ncommand = ${JSON.stringify(bin)}\nargs = ["mcp"]`;
 }
 

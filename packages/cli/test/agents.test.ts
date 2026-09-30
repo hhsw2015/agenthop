@@ -73,6 +73,18 @@ describe("plugging into agents as an MCP server", () => {
     expect(text).toContain(`command = "${BIN}"`);
   });
 
+  it("leaves an existing agenthop block byte-for-byte alone (no fragile TOML rewriting)", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".codex", "config.toml");
+    await mkdir(path.dirname(file), { recursive: true });
+    // An old install without env_vars: we do NOT edit it (a spawned Codex gets forwarding via `codex -c`
+    // at launch instead). Rewriting existing TOML risks corrupting it.
+    const before = `[mcp_servers.agenthop]\ncommand = "/old/agenthop"\nargs = ["mcp"]\n\n[mcp_servers.other]\ncommand = "x"\n`;
+    await writeFile(file, before);
+    expect(registerMcp(["codex"], BIN, dir)[0]).toContain("already has agenthop");
+    expect(await readFile(file, "utf8")).toBe(before); // untouched
+  });
+
   it("names an agent it does not know instead of guessing", async () => {
     const dir = await home();
     expect(registerMcp(["vscode"], BIN, dir)[0]).toContain("Unknown agent");
