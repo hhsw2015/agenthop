@@ -26,14 +26,6 @@ export type SelfInfo = {
   /** Human label for the roster, e.g. "codex:agenthop". */
   title: string;
   startedAt: number;
-  /**
-   * If this session was launched by agenthop_spawn, the AGENTHOP_LAUNCH_ID that was injected into its
-   * env. It is the ONLY durable proof of "which spawned window this live session is": a Ghostty window
-   * id is an object address that gets reused after the window closes, so despawn confirms ownership by
-   * checking a live peer still carries this launchId before closing the stored id. Undefined for
-   * sessions a person opened themselves.
-   */
-  launchId?: string;
 };
 
 /** The host's native session id if it publishes one in the env at startup. Extensible per tool. */
@@ -85,6 +77,5 @@ export function selfInfo(env: NodeJS.ProcessEnv = process.env, cwd: string = pro
   // filled in later once known (Codex learns its thread id on connect). id stays a fresh per-run token.
   const stableId = nativeSessionId(env);
   const title = sessionTitle(tool, cwd, stableId, env);
-  const launchId = env.AGENTHOP_LAUNCH_ID?.trim() || undefined;
-  return { id: randomUUID(), stableId, tool, cwd, pid: process.pid, title, startedAt: Date.now(), launchId };
+  return { id: randomUUID(), stableId, tool, cwd, pid: process.pid, title, startedAt: Date.now() };
 }

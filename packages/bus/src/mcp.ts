@@ -4,7 +4,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import { startBusCore, type BusCore, type UnifiedPeer } from "./core.js";
 import { formatHandoff } from "./handoff.js";
-import { despawnAgent, isLaunchAlive, readRegistry, spawnAgent } from "./spawn.js";
+import { despawnAgent, readRegistry, spawnAgent } from "./spawn.js";
 import { omniwmctl, splitArgs } from "./wm.js";
 import { version } from "./version.js";
 
@@ -162,9 +162,9 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
     },
     async ({ window_id }, extra) => {
       noteCodex(core, extra);
-      // Ownership proof: only close while a live bus peer still carries this window's launchId (see
-      // spawn.ts). A Ghostty window id is a reusable object address, so the id alone is not enough.
-      const result = await despawnAgent(window_id, { isAlive: (lid) => isLaunchAlive(core.peers(), lid) });
+      // Safe by construction: despawn closes the recorded Ghostty surface UUID (unique, never reused),
+      // not the window id — see spawn.ts. It can only ever hit the surface agenthop spawned.
+      const result = await despawnAgent(window_id);
       return result.ok ? reply(result.note) : failure(result.note);
     },
   );

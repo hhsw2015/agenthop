@@ -9,7 +9,6 @@ import {
   codexTrustArgs,
   diffNewWindowIds,
   forgetSpawn,
-  isLaunchAlive,
   isSpawnedWindow,
   launchId,
   moveArgv,
@@ -70,7 +69,7 @@ describe("buildCommand", () => {
 });
 
 describe("buildAppleScript", () => {
-  it("sets command, cwd, env list and returns the window id", () => {
+  it("sets command, cwd, env list and returns window id + surface UUID (one script, no capture race)", () => {
     const s = buildAppleScript({ command: "/abs/codex --yolo", cwd: "/tmp/proj", env: ["PATH=/x", "AGENTHOP_LAUNCH_ID=abc"] });
     expect(s).toContain('tell application "Ghostty"');
     expect(s).toContain("new surface configuration");
@@ -78,7 +77,8 @@ describe("buildAppleScript", () => {
     expect(s).toContain('set initial working directory of c to "/tmp/proj"');
     expect(s).toContain('set environment variables of c to {"PATH=/x", "AGENTHOP_LAUNCH_ID=abc"}');
     expect(s).toContain("new window with configuration c");
-    expect(s).toContain("return id of w");
+    // The surface UUID is read in the SAME script that creates the window — no separate query to race.
+    expect(s).toContain("return (id of w) & tab & (id of (first terminal of w))");
   });
 
   it("escapes quotes/backslashes so a crafted cwd cannot break out of the string", () => {
@@ -116,32 +116,18 @@ describe("codexTrustArgs", () => {
   });
 });
 
-describe("isLaunchAlive", () => {
-  const peers = [
-    { via: "local", launchId: "L1", pid: 111 },
-    { via: "relay", launchId: "L3", pid: 333 },
-  ];
-  it("true only for a LOCAL peer whose pid is alive now (bypasses roster drop-lag)", () => {
-    expect(isLaunchAlive(peers, "L1", (pid) => pid === 111)).toBe(true);
-    // Still listed in the roster but its process already exited (the ~25ms lag) ⇒ not alive ⇒ no close.
-    expect(isLaunchAlive(peers, "L1", () => false)).toBe(false);
-    expect(isLaunchAlive(peers, "unknown", () => true)).toBe(false);
-    // A relay peer is on another machine we cannot despawn — never counts, even if "alive".
-    expect(isLaunchAlive(peers, "L3", () => true)).toBe(false);
-  });
-});
-
 describe("spawn registry (per-launch files; only despawn windows we spawned)", () => {
   it("records, recognizes by window id, forgets by launch id, keeps pending, skips malformed", () => {
     const home = mkdtempSync(path.join(tmpdir(), "ah-reg-"));
     try {
       // A window we never spawned is not despawnable.
       expect(isSpawnedWindow("window-USERS-OWN", home)).toBe(false);
-      recordSpawn({ windowId: "window-abc", launchId: "lid1", tool: "codex", cwd: "/x", ts: 1 }, home);
-      recordSpawn({ windowId: null, launchId: "lid2", tool: "claude", cwd: "/y", ts: 2 }, home); // pending (no id yet)
+      recordSpawn({ windowId: "window-abc", surfaceId: "FA9BC882-UUID", launchId: "lid1", tool: "codex", cwd: "/x", ts: 1 }, home);
+      recordSpawn({ windowId: null, surfaceId: null, launchId: "lid2", tool: "claude", cwd: "/y", ts: 2 }, home); // pending (no id yet)
       expect(isSpawnedWindow("window-abc", home)).toBe(true);
       expect(isSpawnedWindow("window-USERS-OWN", home)).toBe(false); // still refused
       expect(recordForWindow("window-abc", home)?.launchId).toBe("lid1");
+      expect(recordForWindow("window-abc", home)?.surfaceId).toBe("FA9BC882-UUID");
       expect(readRegistry(home).map((r) => r.launchId).sort()).toEqual(["lid1", "lid2"]);
 
       // A junk file in the registry dir is ignored, never throws.
