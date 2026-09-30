@@ -17,24 +17,24 @@ import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
  * (claude --dangerously-skip-permissions, codex --dangerously-bypass-approvals-and-sandbox,
  * opencode --auto). Override the flags per tool with AGENTHOP_SPAWN_ARGS_<TOOL>.
  *
- * SAFETY — despawn closes ONLY a terminal SURFACE agenthop recorded, addressed by that surface's
- * Ghostty UUID (random, unique, NEVER reused — unlike a window id, which is an ObjectIdentifier address
- * Ghostty reuses after a window closes). Concretely:
- *   - A session the user opened themselves is a different window that is never in the registry, so
- *     despawn refuses it outright. This is the property the user asked for.
- *   - despawn issues `close <terminal whose id is UUID>` — it closes that one surface, never a whole
- *     window by its reusable id; if the surface is gone, nothing is closed.
- *   - The surface UUID is captured in the SAME AppleScript that creates the window, from a snapshot of
- *     the window's terminals, and ONLY when there is exactly one (a concurrent split ⇒ ambiguous ⇒ we
- *     record no surface and despawn refuses, rather than mis-bind).
- * KNOWN RESIDUAL (documented, deferred to Phase 2): the count==1 snapshot proves uniqueness, not
- * provenance. If, in the sub-millisecond window of that one creation script, an AUTOMATED client both
- * splits our brand-new window and closes our initial surface, the snapshot could bind the intruder's
- * surface. A human cannot do this; env/command are not readable so the dispatcher cannot verify
- * provenance. The airtight fix is a Phase-2 claim: the spawned child (the authoritative owner of its
- * surface) self-registers its surface UUID; despawn would then close only a child-claimed surface. The
- * injected AGENTHOP_LAUNCH_ID is the seed for that claim, and is recorded so agenthop_spawned can tell
- * concurrent launches apart.
+ * SAFETY — what despawn actually does (stated without over-claiming):
+ *   - An identifier not matching a recorded launch is refused. A matching record closes ONLY that
+ *     record's terminal SURFACE, by the surface's Ghostty UUID — never a whole window by its window id
+ *     (a window id is an ObjectIdentifier address Ghostty reuses after a window closes; a surface UUID
+ *     is unique and not reused). If that surface is gone, nothing is closed.
+ *   - So despawn never closes a window by a reusable id, and a session with an id agenthop never
+ *     recorded is refused. What it CANNOT fully guarantee is provenance of the recorded surface itself
+ *     (below).
+ * KNOWN RESIDUAL (Phase-1 limitation, deferred to Phase 2): the surface UUID is captured right after
+ * creation from a snapshot of the new window's terminals, and only when there is exactly one — but a
+ * single member proves uniqueness, not that it is the surface we created. If the window's terminal set
+ * changes between creation and the snapshot (e.g. a concurrent split then a close of our initial
+ * surface, or the window id having been reused), the snapshot can bind a surface that is not ours, which
+ * despawn would then close. The frequency of this race is unverified. env/command are not readable per
+ * live terminal, so the dispatcher cannot verify provenance here. The intended closure is a Phase-2
+ * claim: the spawned child (the authoritative owner of its surface) self-registers its surface UUID and
+ * despawn closes only a child-claimed surface; AGENTHOP_LAUNCH_ID is the seed for that claim and is
+ * recorded so agenthop_spawned can tell concurrent launches apart.
  */
 
 export const AGENTS: Record<string, string[]> = {
@@ -122,10 +122,10 @@ export function buildCommand(argv: string[], scrub: string[] = SCRUB_ENV): strin
 
 /**
  * Build the osascript that opens one Ghostty window and returns "<windowId>\t<surfaceUUID>". The surface
- * id is taken from a SNAPSHOT of the new window's terminals and ONLY when there is exactly one — a fresh
- * window has exactly its initial (our) surface, so count==1 binds our surface deterministically; if a
- * concurrent split raced a second leaf in (SplitTree inserts new leaves first), count!=1 and we return
- * an empty surface id rather than mis-bind the user's split. Pure.
+ * id is taken from a SNAPSHOT of the new window's terminals and ONLY when there is exactly one. A fresh
+ * window normally has just its initial surface, so count==1 is the common, unambiguous case; count!=1
+ * (e.g. a concurrent split raced a second leaf in) returns an empty surface id rather than pick one.
+ * Note: count==1 proves uniqueness, not provenance — see the SAFETY note above for the residual. Pure.
  */
 export function buildAppleScript(cfg: { command: string; cwd: string; env: string[] }): string {
   const envList = cfg.env.map((e) => `"${asEsc(e)}"`).join(", ");
@@ -398,7 +398,7 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
     };
   }
   // The script returns "<windowId>\t<surfaceUUID>" — the surface id came from a single-terminal snapshot
-  // of the new window (empty if a concurrent split made it ambiguous; we never mis-bind).
+  // of the new window (empty if the window did not have exactly one terminal at snapshot time).
   const [windowId, surfaceRaw] = r.out.trim().split("\t");
   const surfaceId = surfaceRaw && surfaceRaw.trim() ? surfaceRaw.trim() : undefined;
   let recordOk = true;

@@ -157,13 +157,13 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
     "agenthop_despawn",
     {
       description:
-        "Close a sub-agent that agenthop spawned, by its window id or launch id (from agenthop_spawn / agenthop_spawned). It closes only the exact terminal surface it recorded (by that surface's stable UUID), never a whole window by its reusable id. A session you opened yourself is a different window that is never in agenthop's registry, so it is refused. Prefer the launch id if a window id is ambiguous.",
+        "Close a sub-agent that agenthop spawned, by its window id or launch id (from agenthop_spawn / agenthop_spawned). It closes only the exact terminal surface it recorded (by that surface's stable UUID), never a whole window by its reusable window id; an id it never recorded is refused. Prefer the launch id if a window id is ambiguous.",
       inputSchema: { window_id: z.string().describe("The window id or launch id from agenthop_spawn / agenthop_spawned") },
     },
     async ({ window_id }, extra) => {
       noteCodex(core, extra);
-      // Safe by construction: despawn closes the recorded Ghostty surface UUID (unique, never reused),
-      // not the window id — see spawn.ts. It can only ever hit the surface agenthop spawned.
+      // despawn closes only the recorded surface UUID (never a window by its reusable id); an
+      // unrecorded id is refused. See spawn.ts for the capture-provenance residual (Phase-1 limitation).
       const result = await despawnAgent(window_id);
       return result.ok ? reply(result.note) : failure(result.note);
     },
