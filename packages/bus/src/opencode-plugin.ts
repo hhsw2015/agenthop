@@ -11,7 +11,9 @@ import { bridgeSocketPath, startLocalBus, type Inbound, type LocalBus } from "./
 import { formatHandoff } from "./handoff.js";
 import { sessionTitle, type SelfInfo } from "./label.js";
 import { resolvePeer, type UnifiedPeer } from "./resolve.js";
+import { despawnAgent, readRegistry, spawnAgent } from "./spawn.js";
 import { loadTeam } from "./team.js";
+import { omniwmctl, splitArgs } from "./wm.js";
 
 /**
  * The agenthop session bus, as an OpenCode server plugin. It makes each OpenCode session a first-class
@@ -345,6 +347,45 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
           }
           if (batch.length === 0) return `No messages in ${secs}s.`;
           return batch.map((m) => `[from ${labelFor(b, m.from)}] ${m.payload}`).join("\n\n");
+        },
+      }),
+      agenthop_spawn: tool({
+        description:
+          "Launch another agent CLI (claude | codex | opencode) in a VISIBLE terminal window on this machine, best-effort arranged via the window manager. The new session joins the bus on its own — hand it work with agenthop_handoff once it appears in agenthop_peers. Sub-agents start in no-confirmation mode so they run unattended. macOS + Ghostty.",
+        args: {
+          tool: tool.schema.string().describe("Which agent to launch: claude | codex | opencode"),
+          cwd: tool.schema.string().optional().describe("Working directory for the new session (default: this session's dir)"),
+          workspace: tool.schema.string().optional().describe("WM workspace to move it to (default: current; or AGENTHOP_SPAWN_WORKSPACE)"),
+        },
+        async execute({ tool: agent, cwd: dir, workspace }: { tool: string; cwd?: string; workspace?: string }): Promise<string> {
+          const r = await spawnAgent({ tool: agent, cwd: dir ?? cwd, workspace });
+          return r.windowId ? `${r.note} (window ${r.windowId} — close later with agenthop_despawn)` : r.note;
+        },
+      }),
+      agenthop_spawned: tool({
+        description: "List the sub-agent windows agenthop dispatched on this machine (window id, tool, cwd) — the only ones agenthop_despawn may close.",
+        args: {},
+        async execute(): Promise<string> {
+          const rows = readRegistry().map((r) => `  ${r.windowId}  ${r.tool}  ${r.cwd}`);
+          return rows.length ? `spawned windows:\n${rows.join("\n")}` : "No agents spawned by agenthop on this machine.";
+        },
+      }),
+      agenthop_despawn: tool({
+        description:
+          "Close a sub-agent window agenthop spawned, by its window id (from agenthop_spawn / agenthop_spawned). Refuses any id agenthop did not spawn — never closes a session you opened yourself.",
+        args: { window_id: tool.schema.string().describe("The window id agenthop_spawn returned (see agenthop_spawned)") },
+        async execute({ window_id }: { window_id: string }): Promise<string> {
+          const r = await despawnAgent(window_id);
+          return r.note;
+        },
+      }),
+      agenthop_wm: tool({
+        description:
+          'Drive the OmniWM window manager (macOS) to arrange windows — pass an omniwmctl command line, e.g. "query windows", "command focus left", "window move-to-workspace <id> 2", "workspace focus-name agents". One-shot only (no subscribe/watch). Includes window-closing ops; acts on your live desktop.',
+        args: { args: tool.schema.string().describe('omniwmctl arguments, e.g. "query windows" or "window move-to-workspace <id> 2"') },
+        async execute({ args }: { args: string }): Promise<string> {
+          const r = await omniwmctl(splitArgs(args));
+          return r.output;
         },
       }),
     },

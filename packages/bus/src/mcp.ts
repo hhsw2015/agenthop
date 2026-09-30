@@ -4,6 +4,8 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import { startBusCore, type BusCore, type UnifiedPeer } from "./core.js";
 import { formatHandoff } from "./handoff.js";
+import { despawnAgent, readRegistry, spawnAgent } from "./spawn.js";
+import { omniwmctl, splitArgs } from "./wm.js";
 import { version } from "./version.js";
 
 /**
@@ -25,6 +27,8 @@ export function busInstructions(): string {
 - agenthop_send(to, text): message a session by its handle (a prefix like "codex:Work" works when unambiguous; the native session id also works). The handle is restart-stable, so you can reach the same session again after it restarts without being told.
 - agenthop_handoff(to, summary, next?): hand a task to another session so it continues where you left off — you write the summary, the bus attaches a git snapshot of your working directory. Use it instead of send when passing work along, not just chatting.
 - agenthop_recv(timeout_seconds): fallback only — see below.
+- agenthop_spawn(tool, cwd?, workspace?): launch another agent (claude/codex/opencode) in a VISIBLE window on this machine; it joins the bus on its own, then hand it work with agenthop_handoff. Any session can dispatch — a decentralized, visible orchestration center.
+- agenthop_wm(args): drive the OmniWM window manager (macOS) to arrange windows — a passthrough to omniwmctl (e.g. "query windows", "window move-to-workspace <id> 2").
 
 Incoming messages arrive on their own: on agents with a native inbox (e.g. Claude Code) they surface in your session automatically as a cross-session message — you do NOT need to poll. To reply, agenthop_send back to the sender (its id is shown with the message). agenthop_recv is only for agents without native delivery.`;
 }
@@ -98,6 +102,68 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       const batch = await core.recv(secs * 1000);
       if (batch.length === 0) return reply(`No messages in ${secs}s; call agenthop_recv again to keep waiting.`);
       return reply(batch.map((m) => `[from ${m.fromLabel}${m.via === "relay" ? "" : ""}] ${m.text}`).join("\n\n"));
+    },
+  );
+
+  server.registerTool(
+    "agenthop_spawn",
+    {
+      description:
+        "Launch another agent CLI (claude | codex | opencode) in a VISIBLE terminal window on this machine, and best-effort arrange it via the window manager. The new session joins the bus on its own — give it work with agenthop_handoff once it shows up in agenthop_peers. Sub-agents start in no-confirmation mode so they run unattended. macOS + Ghostty.",
+      inputSchema: {
+        tool: z.string().describe("Which agent to launch: claude | codex | opencode"),
+        cwd: z.string().optional().describe("Working directory for the new session (default: this session's cwd)"),
+        workspace: z.string().optional().describe("WM workspace to move it to (default: current; or set AGENTHOP_SPAWN_WORKSPACE)"),
+      },
+    },
+    async ({ tool, cwd, workspace }, extra) => {
+      noteCodex(core, extra);
+      const result = await spawnAgent({ tool, cwd, workspace });
+      const note = result.windowId ? `${result.note} (window ${result.windowId} — close later with agenthop_despawn)` : result.note;
+      return result.ok ? reply(note) : failure(note);
+    },
+  );
+
+  server.registerTool(
+    "agenthop_wm",
+    {
+      description:
+        'Drive the OmniWM window manager (macOS) to arrange windows — pass an omniwmctl command line, e.g. "query windows", "command focus left", "window move-to-workspace <id> 2", "workspace focus-name agents". One-shot only (no subscribe/watch). Note: includes window-closing ops and acts on your live desktop.',
+      inputSchema: {
+        args: z.string().describe('omniwmctl arguments, e.g. "query windows" or "window move-to-workspace <id> 2"'),
+      },
+    },
+    async ({ args }, extra) => {
+      noteCodex(core, extra);
+      const result = await omniwmctl(splitArgs(args));
+      return result.ok ? reply(result.output) : failure(result.output);
+    },
+  );
+
+  server.registerTool(
+    "agenthop_spawned",
+    {
+      description: "List the sub-agent windows THIS machine's agenthop dispatched (window id, tool, cwd) — the only ones agenthop_despawn may close.",
+      inputSchema: {},
+    },
+    async (_args, extra) => {
+      noteCodex(core, extra);
+      const rows = readRegistry().map((r) => `  ${r.windowId}  ${r.tool}  ${r.cwd}`);
+      return reply(rows.length ? `spawned windows:\n${rows.join("\n")}` : "No agents spawned by agenthop on this machine.");
+    },
+  );
+
+  server.registerTool(
+    "agenthop_despawn",
+    {
+      description:
+        "Close a sub-agent window that agenthop spawned, by its window id (from agenthop_spawn / agenthop_spawned). Refuses any id agenthop did not spawn — it never closes a session you opened yourself.",
+      inputSchema: { window_id: z.string().describe("The window id agenthop_spawn returned (see agenthop_spawned)") },
+    },
+    async ({ window_id }, extra) => {
+      noteCodex(core, extra);
+      const result = await despawnAgent(window_id);
+      return result.ok ? reply(result.note) : failure(result.note);
     },
   );
 
