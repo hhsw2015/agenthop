@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import { startBusCore, type BusCore, type UnifiedPeer } from "./core.js";
+import { formatHandoff } from "./handoff.js";
 import { version } from "./version.js";
 
 /**
@@ -22,6 +23,7 @@ export function busInstructions(): string {
 
 - agenthop_peers(): list sessions reachable now, each shown by its handle (tool:dir-<shortSessionId>, e.g. codex:Work-01a0ead5). Same-machine sessions appear automatically; other machines appear when a shared AGENTHOP_TEAM is set.
 - agenthop_send(to, text): message a session by its handle (a prefix like "codex:Work" works when unambiguous; the native session id also works). The handle is restart-stable, so you can reach the same session again after it restarts without being told.
+- agenthop_handoff(to, summary, next?): hand a task to another session so it continues where you left off — you write the summary, the bus attaches a git snapshot of your working directory. Use it instead of send when passing work along, not just chatting.
 - agenthop_recv(timeout_seconds): fallback only — see below.
 
 Incoming messages arrive on their own: on agents with a native inbox (e.g. Claude Code) they surface in your session automatically as a cross-session message — you do NOT need to poll. To reply, agenthop_send back to the sender (its id is shown with the message). agenthop_recv is only for agents without native delivery.`;
@@ -57,6 +59,27 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       if (!text.trim()) return failure("Nothing to send.");
       const result = await core.send(to, text);
       if (result.ok) return reply(`Sent to ${result.label}.`);
+      return failure(`${result.error ?? "Not sent."}\n${roster(core.peers(), core.self.id, core.status())}`);
+    },
+  );
+
+  server.registerTool(
+    "agenthop_handoff",
+    {
+      description:
+        "Hand a task off to another session so it can continue where you left off. You write the summary (goal, what's done, current state — the visible context the receiver needs); the bus adds a git snapshot of your working directory and delivers it as a message that surfaces in the target session. Cross-tool handoff carries only what you write plus git state, never your hidden context. `to` is a session handle/prefix or id (see agenthop_peers).",
+      inputSchema: {
+        to: z.string().describe("Target session: handle tool:dir-<shortId>, a prefix like 'codex:Work', or the session id"),
+        summary: z.string().describe("The task: its goal, what you've done, and the current state — the visible context the receiver needs to continue"),
+        next: z.string().optional().describe("Explicit next steps for the receiver (optional)"),
+      },
+    },
+    async ({ to, summary, next }, extra) => {
+      noteCodex(core, extra);
+      if (!summary.trim()) return failure("Nothing to hand off (empty summary).");
+      const text = formatHandoff(core.self.title, { summary, next }, core.self.cwd);
+      const result = await core.send(to, text);
+      if (result.ok) return reply(`Handed off to ${result.label}.`);
       return failure(`${result.error ?? "Not sent."}\n${roster(core.peers(), core.self.id, core.status())}`);
     },
   );

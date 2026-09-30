@@ -8,6 +8,7 @@ import net from "node:net";
 // build. This file is excluded from the package tsconfig since @opencode-ai/plugin isn't a bus dep.
 import { tool } from "@opencode-ai/plugin";
 import { bridgeSocketPath, startLocalBus, type Inbound, type LocalBus } from "./broker.js";
+import { formatHandoff } from "./handoff.js";
 import { sessionTitle, type SelfInfo } from "./label.js";
 import { resolvePeer, type UnifiedPeer } from "./resolve.js";
 import { loadTeam } from "./team.js";
@@ -223,6 +224,22 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
     return `${p.title}${p.via === "relay" ? `@${p.machine ?? "remote"}` : ""}`;
   };
 
+  // Resolve `to` and deliver `text` (local broker or the cross-machine gateway). `label` phrases the
+  // result ("Sent" / "Handed off"). Shared by agenthop_send and agenthop_handoff.
+  const deliver = async (b: SessionBus, to: string, text: string, label: string): Promise<string> => {
+    const peer = resolvePeer(unified(b), b.self.id, to);
+    if ("error" in peer) return peer.error;
+    if (peer.via === "relay") {
+      if (!b.bridge || !peer.pub) return `Cannot reach ${peer.title} — no team relay configured here (set AGENTHOP_TEAM).`;
+      const r = await b.bridge.send(peer.pub, text);
+      if (r === "sent") return `${label} to ${peer.title}.`;
+      if (r === "unknown") return `${label} to ${peer.title}, but no delivery confirmation within 10s — it may or may not have arrived; check before resending.`;
+      return `Not delivered to ${peer.title} — not reachable right now.`;
+    }
+    const ok = b.local.send(peer.id, text);
+    return ok ? `${label} to ${peer.title}.` : `Not delivered to ${peer.title} — not reachable right now.`;
+  };
+
   // Lazily create a distinct bus peer for a session. Its identity IS the session id (handle
   // opencode:<dir>-<shortId>), its inbound injects only into that same session, and — when a team is
   // configured — it joins the cross-machine gateway under that same identity.
@@ -296,18 +313,21 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
         },
         async execute({ to, text }: { to: string; text: string }, context: ToolContext): Promise<string> {
           if (!text || !text.trim()) return "Nothing to send.";
+          return deliver(busFor(context.sessionID), to, text, "Sent");
+        },
+      }),
+      agenthop_handoff: tool({
+        description:
+          "Hand a task off to another agent session so it can continue where you left off. You write the summary (goal, what's done, current state); the bus attaches a git snapshot of this session's directory and delivers it — it surfaces in the target session automatically. `to` is a session handle/prefix or session id (see agenthop_peers).",
+        args: {
+          to: tool.schema.string().describe("Target: a session handle/prefix or session id (see agenthop_peers)"),
+          summary: tool.schema.string().describe("The task: goal, what you've done, and current state — the visible context the receiver needs to continue"),
+          next: tool.schema.string().optional().describe("Explicit next steps for the receiver (optional)"),
+        },
+        async execute({ to, summary, next }: { to: string; summary: string; next?: string }, context: ToolContext): Promise<string> {
+          if (!summary || !summary.trim()) return "Nothing to hand off (empty summary).";
           const b = busFor(context.sessionID);
-          const peer = resolvePeer(unified(b), b.self.id, to);
-          if ("error" in peer) return peer.error;
-          if (peer.via === "relay") {
-            if (!b.bridge || !peer.pub) return `Cannot reach ${peer.title} — no team relay configured here (set AGENTHOP_TEAM).`;
-            const r = await b.bridge.send(peer.pub, text);
-            if (r === "sent") return `Sent to ${peer.title}.`;
-            if (r === "unknown") return `Sent to ${peer.title}, but no delivery confirmation within 10s — it may or may not have arrived; check before resending.`;
-            return `Not sent — ${peer.title} is not reachable right now.`;
-          }
-          const ok = b.local.send(peer.id, text);
-          return ok ? `Sent to ${peer.title}.` : `Not sent — ${peer.title} is not reachable right now.`;
+          return deliver(b, to, formatHandoff(b.self.title, { summary, next }, cwd), "Handed off");
         },
       }),
       agenthop_recv: tool({
