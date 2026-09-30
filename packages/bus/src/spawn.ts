@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import path from "node:path";
 import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
@@ -11,17 +11,19 @@ import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
  *
  * Backend: Ghostty's AppleScript scripting (`new window with configuration`). Unlike `open -na` it makes
  * exactly ONE window in the running instance, applies a command + working directory + injected env, and
- * returns a stable window id. The launched window is a normal Ghostty window OmniWM tiles; to move it to
- * a specific workspace we diff OmniWM's window list before/after (no fragile title/pid matching).
+ * returns a window id. The launched window is a normal Ghostty window OmniWM tiles.
  *
  * Sub-agents launch in NO-CONFIRMATION mode at the user's explicit request so they run unattended
  * (claude --dangerously-skip-permissions, codex --dangerously-bypass-approvals-and-sandbox,
- * opencode --auto), and per-CLI first-run "trust this folder" gates are pre-cleared (codex: a
- * config.toml trust entry). Override the flags per tool with AGENTHOP_SPAWN_ARGS_<TOOL>.
+ * opencode --auto). Override the flags per tool with AGENTHOP_SPAWN_ARGS_<TOOL>.
  *
- * Phase 1: launch + arrange only. The spawned session joins the bus on its own; assign it work with
- * agenthop_handoff once it appears in agenthop_peers. (A launchId is injected as AGENTHOP_LAUNCH_ID for
- * a future claim/ready handshake, but is not yet used to auto-deliver a task.)
+ * SAFETY — despawn only ever closes a window agenthop spawned, never a session the user opened. That
+ * guarantee cannot rest on the window id alone: a Ghostty window id is `ObjectIdentifier(window)` (an
+ * object address) that is REUSED after the window closes, so a stale record could otherwise authorize
+ * closing a later user window that reused the address. Instead every spawn injects a unique
+ * AGENTHOP_LAUNCH_ID; the spawned session republishes it on the bus (SelfInfo.launchId), and despawn
+ * closes the stored window id ONLY while a live peer still carries that launchId (alive ⇒ our window
+ * never closed ⇒ the id is still valid and still ours). No live peer ⇒ never send a close.
  */
 
 export const AGENTS: Record<string, string[]> = {
@@ -30,8 +32,21 @@ export const AGENTS: Record<string, string[]> = {
   opencode: ["--auto"],
 };
 
+/**
+ * Session-identity / messaging env vars stripped from the child (via `env -u`) so a spawned agent can
+ * never inherit the DISPATCHER's identity from the running Ghostty app environment and mis-join the bus
+ * as its parent. Auth/config vars (CODEX_HOME, AGENTHOP_TEAM, ...) are deliberately NOT stripped.
+ */
+export const SCRUB_ENV = [
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_CODE_MESSAGING_SOCKET",
+  "CLAUDE_CODE_MESSAGING_TOKEN",
+  "AGENTHOP_TITLE",
+  "AGENTHOP_TOOL",
+];
+
 export type SpawnInput = { tool: string; cwd?: string; workspace?: string };
-export type SpawnResult = { ok: boolean; windowId?: string; omniwmId?: string; arranged: boolean; workspace?: string; note: string };
+export type SpawnResult = { ok: boolean; windowId?: string; omniwmId?: string; arranged: boolean; workspace?: string; launchId?: string; note: string };
 
 function resolveBin(name: string, env: NodeJS.ProcessEnv): string | undefined {
   const fixed = [path.join(homedir(), ".local", "bin", name), `/usr/local/bin/${name}`, `/opt/homebrew/bin/${name}`];
@@ -56,24 +71,39 @@ function resolveBin(name: string, env: NodeJS.ProcessEnv): string | undefined {
 
 /** The argv (absolute command + args) to run for a tool, or an error if not allowed. Pure. */
 export function resolveCli(tool: string, env: NodeJS.ProcessEnv = process.env): { argv: string[] } | { error: string } {
-  const known = tool in AGENTS;
+  const known = Object.hasOwn(AGENTS, tool); // own-key check: `"constructor" in AGENTS` is a false positive
   if (!known && env.AGENTHOP_SPAWN_ALLOW_CMD !== "1") {
     return { error: `Unknown tool "${tool}". Allowed: ${Object.keys(AGENTS).join(", ")} (or set AGENTHOP_SPAWN_ALLOW_CMD=1 for a raw command).` };
   }
   const key = tool.toUpperCase().replace(/[^A-Z0-9]/g, "_");
   const bin = env[`AGENTHOP_SPAWN_BIN_${key}`] || resolveBin(tool, env) || tool;
   const argsOverride = env[`AGENTHOP_SPAWN_ARGS_${key}`];
-  const args = argsOverride !== undefined ? argsOverride.split(/\s+/).filter(Boolean) : (AGENTS[tool] ?? []);
+  const args = argsOverride !== undefined ? argsOverride.split(/\s+/).filter(Boolean) : known ? AGENTS[tool]! : [];
   return { argv: [bin, ...args] };
 }
 
-/** A unique per-launch id, injected as AGENTHOP_LAUNCH_ID for a future claim/ready handshake. Pure. */
+/** A unique per-launch id, injected as AGENTHOP_LAUNCH_ID; the spawned session republishes it on the
+ *  bus so despawn can prove ownership before closing a (reusable) window id. Pure. */
 export function launchId(tool: string): string {
   return `agenthop-spawn:${tool}:${randomBytes(4).toString("hex")}`;
 }
 
 function asEsc(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/** POSIX single-quote a shell word so metacharacters cannot be re-interpreted. Pure. */
+export function shquote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * The shell command line Ghostty runs. Ghostty sets a surface `command` as `.shell`, i.e. the string
+ * is shell-interpreted — so a bare argv.join(" ") breaks on any space/metachar in a path or arg. We
+ * quote every element, and prefix `env -u` to strip inherited identity before exec. Pure.
+ */
+export function buildCommand(argv: string[], scrub: string[] = SCRUB_ENV): string {
+  return ["/usr/bin/env", ...scrub.map((v) => `-u ${v}`), ...argv.map(shquote)].join(" ");
 }
 
 /** Build the osascript that opens one Ghostty window with a command, cwd, and env. Pure. */
@@ -115,21 +145,25 @@ export function moveArgv(id: string, workspace: string): string[] {
   return ["window", "move-to-workspace", id, workspace];
 }
 
-/** Whether codex's config still lacks a trust entry for `cwd` (so it would prompt). Pure. */
-export function codexTrustNeeded(configText: string, cwd: string): boolean {
-  return !configText.includes(`[projects."${cwd}"]`);
+/** TOML basic-string escaping for a path used inside a codex `-c` config override. Pure. */
+export function tomlBasicString(s: string): string {
+  return s
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\t/g, "\\t");
 }
 
-/** Pre-trust `cwd` for codex so it does not show the first-run "Trust this folder?" prompt. */
-export function ensureCodexTrust(cwd: string, home: string = homedir()): void {
-  const p = path.join(home, ".codex", "config.toml");
-  try {
-    const s = existsSync(p) ? readFileSync(p, "utf8") : "";
-    if (!codexTrustNeeded(s, cwd)) return;
-    appendFileSync(p, `\n[projects."${cwd}"]\ntrust_level = "trusted"\n`);
-  } catch {
-    // best effort — if we cannot write, codex will just prompt once
-  }
+/**
+ * codex CLI args that pre-trust `cwd` via a per-invocation config override, so the spawned session
+ * skips the first-run "Trust this folder?" prompt WITHOUT mutating the user's global ~/.codex/config.toml.
+ * `-c` produces the same effective config as a `[projects."<cwd>"] trust_level="trusted"` file entry
+ * (verified: codex 0.159.2 accepts a quoted path key), but per-invocation, so there is no file to
+ * corrupt, no concurrent-write race, and no config-injection surface. Pure.
+ */
+export function codexTrustArgs(cwd: string): string[] {
+  return ["-c", `projects."${tomlBasicString(cwd)}".trust_level="trusted"`];
 }
 
 function ghosttyPresent(): boolean {
@@ -137,29 +171,47 @@ function ghosttyPresent(): boolean {
 }
 
 // --- Spawn registry: the ONLY windows despawn may close -------------------------------------------
-// Every window agenthop_spawn creates is recorded here; despawn refuses any id that is not in this
-// list, so it can never close a session the user opened themselves.
-export type SpawnRecord = { windowId: string; launchId: string; tool: string; cwd: string; ts: number };
+// One file per launch under ~/.agenthop/spawned/<launchId>.json, so concurrent spawns from different
+// bus sessions never lose each other's records to a shared read-modify-write (a single JSON array
+// could). A record is written with windowId=null BEFORE the window is opened (so a lost/timed-out
+// launch is still discoverable) and updated with the id on success.
+export type SpawnRecord = { windowId: string | null; launchId: string; tool: string; cwd: string; ts: number };
 
-function registryPath(home: string): string {
-  return path.join(home, ".agenthop", "spawned.json");
+function registryDir(home: string): string {
+  return path.join(home, ".agenthop", "spawned");
+}
+function recordFile(home: string, lid: string): string {
+  const safe = lid.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return path.join(registryDir(home), `${safe}.json`);
+}
+function isRecord(r: unknown): r is SpawnRecord {
+  if (!r || typeof r !== "object") return false;
+  const o = r as Record<string, unknown>;
+  return typeof o.launchId === "string" && typeof o.tool === "string" && typeof o.cwd === "string" && (o.windowId === null || typeof o.windowId === "string");
 }
 export function readRegistry(home: string = homedir()): SpawnRecord[] {
+  let files: string[];
   try {
-    const data = JSON.parse(readFileSync(registryPath(home), "utf8"));
-    return Array.isArray(data) ? (data as SpawnRecord[]) : [];
+    files = readdirSync(registryDir(home)).filter((f) => f.endsWith(".json"));
   } catch {
-    return [];
+    return []; // no dir yet
   }
-}
-function writeRegistry(home: string, list: SpawnRecord[]): void {
-  const p = registryPath(home);
-  mkdirSync(path.dirname(p), { recursive: true });
-  writeFileSync(p, `${JSON.stringify(list, null, 2)}\n`);
+  const out: SpawnRecord[] = [];
+  for (const f of files) {
+    try {
+      const r = JSON.parse(readFileSync(path.join(registryDir(home), f), "utf8"));
+      if (isRecord(r)) out.push(r);
+    } catch {
+      // skip a malformed / partially-written record
+    }
+  }
+  return out;
 }
 export function recordSpawn(rec: SpawnRecord, home: string = homedir()): void {
   try {
-    writeRegistry(home, [...readRegistry(home).filter((r) => r.windowId !== rec.windowId), rec]);
+    const p = recordFile(home, rec.launchId);
+    mkdirSync(path.dirname(p), { recursive: true });
+    writeFileSync(p, `${JSON.stringify(rec, null, 2)}\n`); // one file per launch — no cross-process RMW
   } catch {
     // best effort; a lost record just means despawn won't manage that window
   }
@@ -167,9 +219,12 @@ export function recordSpawn(rec: SpawnRecord, home: string = homedir()): void {
 export function isSpawnedWindow(windowId: string, home: string = homedir()): boolean {
   return readRegistry(home).some((r) => r.windowId === windowId);
 }
-export function forgetSpawn(windowId: string, home: string = homedir()): void {
+export function recordForWindow(windowId: string, home: string = homedir()): SpawnRecord | undefined {
+  return readRegistry(home).find((r) => r.windowId === windowId);
+}
+export function forgetSpawn(launchId: string, home: string = homedir()): void {
   try {
-    writeRegistry(home, readRegistry(home).filter((r) => r.windowId !== windowId));
+    rmSync(recordFile(home, launchId), { force: true });
   } catch {
     // best effort
   }
@@ -183,24 +238,35 @@ function runOsascript(script: string): Promise<{ ok: boolean; out: string; err: 
   });
 }
 
-async function omniwmWindowIds(bin: string): Promise<string[]> {
+/** Tri-state existence check for a Ghostty window id (yes / no / unknown-when-unreachable). */
+async function ghosttyWindowExists(id: string): Promise<"yes" | "no" | "unknown"> {
+  const r = await runOsascript(`tell application "Ghostty" to return (exists (first window whose id is "${asEsc(id)}"))`);
+  if (!r.ok) return "unknown";
+  const v = r.out.trim();
+  return v === "true" ? "yes" : v === "false" ? "no" : "unknown";
+}
+
+async function omniwmWindowIds(bin: string): Promise<string[] | undefined> {
   const r = await runOmniwmctl(bin, ["query", "windows", "--app", "Ghostty", "--fields", "id", "--format", "json"], 3000);
-  if (r.code !== 0) return [];
+  if (r.code !== 0) return undefined; // a FAILED query is unknown, not "no windows" — never treat as []
   try {
     const ws = (JSON.parse(r.stdout) as { result?: { payload?: { windows?: Array<{ id?: string }> } } })?.result?.payload?.windows ?? [];
     return ws.map((w) => w.id).filter((id): id is string => typeof id === "string");
   } catch {
-    return [];
+    return undefined;
   }
 }
 
-async function pollNewWindowId(bin: string, before: string[], ms: number): Promise<string | undefined> {
+/** Poll until EXACTLY ONE new window appears (return its id) — 0 or >1 stays ambiguous (undefined), so
+ *  a concurrent spawn or an unrelated new window is never grabbed and moved. */
+async function pollSingleNewWindowId(bin: string, before: string[], ms: number): Promise<string | undefined> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     const r = await runOmniwmctl(bin, ["query", "windows", "--app", "Ghostty", "--fields", "id", "--format", "json"], 3000);
     if (r.code === 0) {
       const fresh = diffNewWindowIds(before, r.stdout);
-      if (fresh.length > 0) return fresh[0];
+      if (fresh.length === 1) return fresh[0];
+      if (fresh.length > 1) return undefined; // ambiguous — refuse to guess
     }
     await new Promise((s) => setTimeout(s, 200));
   }
@@ -214,56 +280,107 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
   if (platform() !== "darwin") return { ok: false, arranged: false, note: "agenthop_spawn currently supports macOS + Ghostty only." };
   if (!ghosttyPresent()) return { ok: false, arranged: false, note: "Ghostty.app not found; agenthop_spawn needs Ghostty." };
   const cwd = input.cwd && input.cwd.trim() ? path.resolve(input.cwd) : process.cwd();
-  if (!existsSync(cwd)) return { ok: false, arranged: false, note: `cwd does not exist: ${cwd}` };
+  let st: ReturnType<typeof statSync>;
+  try {
+    st = statSync(cwd);
+  } catch {
+    return { ok: false, arranged: false, note: `cwd does not exist: ${cwd}` };
+  }
+  if (!st.isDirectory()) return { ok: false, arranged: false, note: `cwd is not a directory: ${cwd}` };
 
-  // Per-CLI unattended setup: clear codex's first-run folder-trust gate for this cwd.
-  if (input.tool === "codex") ensureCodexTrust(cwd);
-
+  // codex: pre-trust this folder per-invocation via `-c` (no global config write).
+  const argv = input.tool === "codex" ? [cli.argv[0]!, ...codexTrustArgs(cwd), ...cli.argv.slice(1)] : cli.argv;
   const lid = launchId(input.tool);
-  const command = cli.argv.join(" "); // absolute bin + flags (our values contain no spaces)
-  // Inject only PATH/HOME (so the CLI finds node etc. under the GUI launch env) + the launch id. The
-  // child does NOT inherit this process's identity env, so it never mis-identifies as the parent.
+  const command = buildCommand(argv);
+  // Inject PATH/HOME (so the CLI finds node etc. under the GUI launch env) + the launch id. Inherited
+  // identity is stripped by `env -u` in the command (see buildCommand / SCRUB_ENV).
   const injectEnv = [`PATH=${env.PATH ?? ""}`, `HOME=${env.HOME ?? homedir()}`, `AGENTHOP_LAUNCH_ID=${lid}`];
+
+  // Record the launch REQUEST before any side effect, so a window opened but not confirmed (lost or
+  // timed-out AppleScript reply) is still discoverable in agenthop_spawned rather than a silent orphan.
+  recordSpawn({ windowId: null, launchId: lid, tool: input.tool, cwd, ts: Date.now() });
 
   const bin = omniwmctlBin(env);
   const canArrange = bin ? await omniwmReady(bin) : false;
-  const before = bin && canArrange ? await omniwmWindowIds(bin) : [];
+  const before = bin && canArrange ? await omniwmWindowIds(bin) : undefined; // undefined = snapshot unknown
 
   const r = await runOsascript(buildAppleScript({ command, cwd, env: injectEnv }));
-  if (!r.ok) return { ok: false, arranged: false, note: `Failed to open a Ghostty window via AppleScript: ${r.err || "unknown error"}` };
+  if (!r.ok) {
+    // The Apple Event and its reply are separate; a killed/timed-out osascript does NOT prove the app
+    // did nothing. Keep the pending record and tell the caller not to blindly retry.
+    return {
+      ok: false,
+      arranged: false,
+      launchId: lid,
+      note: `Could not confirm a Ghostty window opened (${r.err || "unknown error"}). A window MAY have opened (launchId ${lid}) — check agenthop_peers / agenthop_spawned before retrying; do not blindly re-spawn.`,
+    };
+  }
   const windowId = r.out.trim() || undefined;
-  // Register this window as agenthop-spawned so despawn may (only) close it later.
   if (windowId) recordSpawn({ windowId, launchId: lid, tool: input.tool, cwd, ts: Date.now() });
 
   const workspace = (input.workspace && input.workspace.trim()) || env.AGENTHOP_SPAWN_WORKSPACE?.trim();
   const tail = "It will appear in agenthop_peers shortly; use agenthop_handoff to give it a task.";
+  const idNote = windowId ? `` : ` (Ghostty returned no window id, so it can't be despawned by id — launchId ${lid}.)`;
   if (!workspace) {
-    return { ok: true, arranged: false, windowId, note: `Launched ${input.tool} in a visible Ghostty window on the current workspace. ${tail}` };
+    return { ok: true, arranged: false, windowId, launchId: lid, note: `Launched ${input.tool} in a visible Ghostty window on the current workspace.${idNote} ${tail}` };
   }
   if (!bin || !canArrange) {
-    return { ok: true, arranged: false, windowId, workspace, note: `Launched ${input.tool}; OmniWM not reachable, so it stays on the current workspace (wanted ${workspace}). ${tail}` };
+    return { ok: true, arranged: false, windowId, workspace, launchId: lid, note: `Launched ${input.tool}; OmniWM not reachable, so it stays on the current workspace (wanted ${workspace}). ${tail}` };
   }
-  const omniwmId = await pollNewWindowId(bin, before, 4000);
-  if (!omniwmId) return { ok: true, arranged: false, windowId, workspace, note: `Launched ${input.tool}; could not locate its window within 4s to move it to ${workspace} (it stays on the current workspace). ${tail}` };
+  if (before === undefined) {
+    return { ok: true, arranged: false, windowId, workspace, launchId: lid, note: `Launched ${input.tool}; could not snapshot windows before launch, so nothing is moved (moving a guessed window could move one of yours). It stays on the current workspace. ${tail}` };
+  }
+  const omniwmId = await pollSingleNewWindowId(bin, before, 4000);
+  if (!omniwmId) {
+    return { ok: true, arranged: false, windowId, workspace, launchId: lid, note: `Launched ${input.tool}; could not UNIQUELY identify its window within 4s (0 or several new windows appeared), so it stays put — moving a guessed window risks moving one of yours. ${tail}` };
+  }
   const mv = await runOmniwmctl(bin, moveArgv(omniwmId, workspace));
   if (mv.code !== 0) {
-    return { ok: true, arranged: false, windowId, omniwmId, workspace, note: `Launched ${input.tool}; move to ${workspace} failed (${(mv.stderr || mv.stdout).trim()}). ${tail}` };
+    return { ok: true, arranged: false, windowId, omniwmId, workspace, launchId: lid, note: `Launched ${input.tool}; move to ${workspace} failed (${(mv.stderr || mv.stdout).trim()}). ${tail}` };
   }
-  return { ok: true, arranged: true, windowId, omniwmId, workspace, note: `Launched ${input.tool} and moved it to workspace ${workspace}. ${tail}` };
+  return { ok: true, arranged: true, windowId, omniwmId, workspace, launchId: lid, note: `Launched ${input.tool} and moved it to workspace ${workspace}. ${tail}` };
 }
 
-/** Close a window agenthop spawned — and ONLY such a window. Refuses any id not in the registry, so it
- *  can never close a session the user opened. Focus-independent (targets the exact window id). */
-export async function despawnAgent(windowId: string, home: string = homedir()): Promise<{ ok: boolean; note: string }> {
+export type DespawnOptions = { isAlive?: (launchId: string) => boolean; home?: string };
+
+/**
+ * Close a window agenthop spawned — and ONLY such a window. Refuses any id not in the registry, and,
+ * critically, only sends a close while a live bus peer still carries the record's launchId: a live
+ * peer proves OUR session is up, which proves its window never closed, which proves the stored id is
+ * still valid and still ours (Ghostty reuses a closed window's id). With no live peer we NEVER close —
+ * the id may now belong to a window the user opened.
+ */
+export async function despawnAgent(windowId: string, opts: DespawnOptions = {}): Promise<{ ok: boolean; note: string }> {
+  const home = opts.home ?? homedir();
   const id = windowId.trim();
   if (!id) return { ok: false, note: "No window id given." };
   if (platform() !== "darwin") return { ok: false, note: "agenthop_despawn currently supports macOS + Ghostty only." };
-  if (!isSpawnedWindow(id, home)) {
+  const rec = recordForWindow(id, home);
+  if (!rec) {
     return { ok: false, note: `Refusing to close "${id}": it is not a window agenthop dispatched. agenthop only ever closes agents it spawned, never sessions you opened. (See agenthop_spawned for ids I can close.)` };
   }
+
+  const alive = opts.isAlive?.(rec.launchId) ?? false;
+  if (!alive) {
+    // Cannot prove ownership from the id alone (it is reusable). Do NOT close. At most, forget a record
+    // whose window is provably gone.
+    const exists = await ghosttyWindowExists(id);
+    if (exists === "no") {
+      forgetSpawn(rec.launchId, home);
+      return { ok: true, note: `Session ${rec.launchId} is gone and no window ${id} exists; removed its stale record. (Did not send a close — a closed window's id can be reused by a later window.)` };
+    }
+    if (exists === "unknown") {
+      return { ok: false, note: `Could not verify window "${id}" (Ghostty not reachable / permission). Its session is not on the bus, so I will not close by id — the id may have been reused. Record kept; retry once Ghostty is reachable.` };
+    }
+    return { ok: false, note: `Not closing "${id}": its spawned session is not on the bus, so I cannot confirm this window is still the one agenthop opened (a window id can be reused after close). If it is a stuck spawn, close it manually. Record kept.` };
+  }
+
+  // Alive ⇒ our window is still open ⇒ id is valid and ours ⇒ safe to close by exact id.
   const r = await runOsascript(`tell application "Ghostty" to close window (first window whose id is "${asEsc(id)}")`);
-  forgetSpawn(id, home);
-  return r.ok
-    ? { ok: true, note: `Closed spawned window ${id}.` }
-    : { ok: true, note: `Removed ${id} from the registry (it may already be closed): ${r.err || "no live window"}.` };
+  if (r.ok) {
+    forgetSpawn(rec.launchId, home);
+    return { ok: true, note: `Closed spawned window ${id}.` };
+  }
+  // A permission/TCC/script error is NOT proof it closed — keep the record so a retry is still possible.
+  return { ok: false, note: `Failed to close ${id} (${r.err || "unknown error"}). Record kept — fix the error (e.g. grant Automation permission) and retry; not assuming it closed.` };
 }

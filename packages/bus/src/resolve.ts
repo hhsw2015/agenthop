@@ -16,6 +16,9 @@ export type UnifiedPeer = {
   pub?: string;
   /** Present for local peers: the OS process id, to tell apart sessions that share a title. */
   pid?: number;
+  /** Present for a local peer that agenthop_spawn launched: its injected AGENTHOP_LAUNCH_ID, used by
+   *  despawn to confirm the session is still alive before closing its (reusable) window id. */
+  launchId?: string;
 };
 
 /**

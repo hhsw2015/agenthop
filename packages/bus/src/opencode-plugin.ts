@@ -215,7 +215,7 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
   // wins over a relay row with the same id (dedup), matching core.ts's unified().
   const unified = (b: SessionBus): UnifiedPeer[] => {
     const out = new Map<string, UnifiedPeer>();
-    for (const p of b.local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid });
+    for (const p of b.local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid, launchId: p.launchId });
     if (b.bridge) for (const p of b.bridge.roster()) if (!out.has(p.id)) out.set(p.id, p);
     return [...out.values()];
   };
@@ -358,7 +358,10 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
           workspace: tool.schema.string().optional().describe("WM workspace to move it to (default: current; or AGENTHOP_SPAWN_WORKSPACE)"),
         },
         async execute({ tool: agent, cwd: dir, workspace }: { tool: string; cwd?: string; workspace?: string }): Promise<string> {
-          const r = await spawnAgent({ tool: agent, cwd: dir ?? cwd, workspace });
+          // Resolve a relative cwd against THIS session's project dir, not the OpenCode server's cwd
+          // (which may be elsewhere and hold a same-named subdir → wrong project).
+          const resolved = dir ? path.resolve(cwd, dir) : cwd;
+          const r = await spawnAgent({ tool: agent, cwd: resolved, workspace });
           return r.windowId ? `${r.note} (window ${r.windowId} — close later with agenthop_despawn)` : r.note;
         },
       }),
@@ -366,7 +369,7 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
         description: "List the sub-agent windows agenthop dispatched on this machine (window id, tool, cwd) — the only ones agenthop_despawn may close.",
         args: {},
         async execute(): Promise<string> {
-          const rows = readRegistry().map((r) => `  ${r.windowId}  ${r.tool}  ${r.cwd}`);
+          const rows = readRegistry().map((r) => `  ${r.windowId ?? "(pending)"}  ${r.tool}  ${r.cwd}`);
           return rows.length ? `spawned windows:\n${rows.join("\n")}` : "No agents spawned by agenthop on this machine.";
         },
       }),
@@ -375,7 +378,9 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
           "Close a sub-agent window agenthop spawned, by its window id (from agenthop_spawn / agenthop_spawned). Refuses any id agenthop did not spawn — never closes a session you opened yourself.",
         args: { window_id: tool.schema.string().describe("The window id agenthop_spawn returned (see agenthop_spawned)") },
         async execute({ window_id }: { window_id: string }): Promise<string> {
-          const r = await despawnAgent(window_id);
+          // Only close while a live bus peer still carries this window's launchId (reusable id → id
+          // alone is not ownership proof; see spawn.ts).
+          const r = await despawnAgent(window_id, { isAlive: (lid) => b.local.peers().some((p) => p.launchId === lid) });
           return r.note;
         },
       }),

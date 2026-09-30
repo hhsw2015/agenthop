@@ -148,7 +148,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
     },
     async (_args, extra) => {
       noteCodex(core, extra);
-      const rows = readRegistry().map((r) => `  ${r.windowId}  ${r.tool}  ${r.cwd}`);
+      const rows = readRegistry().map((r) => `  ${r.windowId ?? "(pending)"}  ${r.tool}  ${r.cwd}`);
       return reply(rows.length ? `spawned windows:\n${rows.join("\n")}` : "No agents spawned by agenthop on this machine.");
     },
   );
@@ -162,7 +162,9 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
     },
     async ({ window_id }, extra) => {
       noteCodex(core, extra);
-      const result = await despawnAgent(window_id);
+      // Ownership proof: only close while a live bus peer still carries this window's launchId (see
+      // spawn.ts). A Ghostty window id is a reusable object address, so the id alone is not enough.
+      const result = await despawnAgent(window_id, { isAlive: (lid) => core.peers().some((p) => p.launchId === lid) });
       return result.ok ? reply(result.note) : failure(result.note);
     },
   );

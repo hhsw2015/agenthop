@@ -107,7 +107,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
 
   const unified = (): UnifiedPeer[] => {
     const out = new Map<string, UnifiedPeer>();
-    for (const p of local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid });
+    for (const p of local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid, launchId: p.launchId });
     if (relay) {
       for (const p of relay.roster()) if (!out.has(p.id)) out.set(p.id, p);
     }

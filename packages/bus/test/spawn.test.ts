@@ -1,8 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { AGENTS, buildAppleScript, codexTrustNeeded, diffNewWindowIds, forgetSpawn, isSpawnedWindow, launchId, moveArgv, readRegistry, recordSpawn, resolveCli } from "../src/spawn.js";
+import {
+  AGENTS,
+  buildAppleScript,
+  buildCommand,
+  codexTrustArgs,
+  diffNewWindowIds,
+  forgetSpawn,
+  isSpawnedWindow,
+  launchId,
+  moveArgv,
+  readRegistry,
+  recordForWindow,
+  recordSpawn,
+  resolveCli,
+  shquote,
+  tomlBasicString,
+} from "../src/spawn.js";
 
 const env = (over: Record<string, string | undefined>): NodeJS.ProcessEnv => ({ PATH: "", ...over }) as NodeJS.ProcessEnv;
 
@@ -18,6 +34,11 @@ describe("resolveCli", () => {
     expect("argv" in resolveCli("rm-rf", env({ AGENTHOP_SPAWN_ALLOW_CMD: "1" }))).toBe(true);
   });
 
+  it("rejects an inherited-prototype key (own-key check, not `in`)", () => {
+    // `"constructor" in AGENTS` is true; an `in` check would wrongly accept it then blow up on spread.
+    expect("error" in resolveCli("constructor", env({}))).toBe(true);
+  });
+
   it("honors per-tool bin and args overrides", () => {
     const r = resolveCli("claude", env({ AGENTHOP_SPAWN_BIN_CLAUDE: "/opt/claude", AGENTHOP_SPAWN_ARGS_CLAUDE: "--foo bar" }));
     expect("argv" in r && r.argv).toEqual(["/opt/claude", "--foo", "bar"]);
@@ -29,6 +50,21 @@ describe("launchId", () => {
     const a = launchId("codex");
     expect(a.startsWith("agenthop-spawn:codex:")).toBe(true);
     expect(a).not.toBe(launchId("codex"));
+  });
+});
+
+describe("buildCommand", () => {
+  it("shell-quotes each argv element so a space in a path stays one word", () => {
+    // Ghostty runs the surface command via a shell, so a bare join would split "/my agent/codex".
+    expect(buildCommand(["/opt/my agent/codex", "--flag", "a b"], [])).toBe("/usr/bin/env '/opt/my agent/codex' '--flag' 'a b'");
+  });
+
+  it("strips inherited identity env with `env -u`", () => {
+    expect(buildCommand(["/bin/x"], ["CLAUDE_CODE_SESSION_ID", "AGENTHOP_TITLE"])).toBe("/usr/bin/env -u CLAUDE_CODE_SESSION_ID -u AGENTHOP_TITLE '/bin/x'");
+  });
+
+  it("neutralizes a single-quote metacharacter in an argument", () => {
+    expect(shquote("a'b")).toBe("'a'\\''b'");
   });
 });
 
@@ -65,27 +101,38 @@ describe("moveArgv", () => {
   });
 });
 
-describe("codexTrustNeeded", () => {
-  it("is false when a trust entry for the path already exists", () => {
-    const cfg = '[projects."/a/b"]\ntrust_level = "trusted"\n';
-    expect(codexTrustNeeded(cfg, "/a/b")).toBe(false);
-    expect(codexTrustNeeded(cfg, "/a/c")).toBe(true);
-    expect(codexTrustNeeded("", "/a/b")).toBe(true);
+describe("codexTrustArgs", () => {
+  it("pre-trusts via a per-invocation -c override (no global config write)", () => {
+    expect(codexTrustArgs("/a/b")).toEqual(["-c", 'projects."/a/b".trust_level="trusted"']);
+  });
+
+  it("TOML-escapes a nasty path so it cannot break the override or inject config", () => {
+    expect(tomlBasicString('/a"b\\c\n')).toBe('/a\\"b\\\\c\\n');
+    expect(codexTrustArgs('/a"b')).toEqual(["-c", 'projects."/a\\"b".trust_level="trusted"']);
   });
 });
 
-describe("spawn registry (only despawn windows we spawned)", () => {
-  it("records, recognizes, and forgets spawned windows; refuses unknown ids", () => {
+describe("spawn registry (per-launch files; only despawn windows we spawned)", () => {
+  it("records, recognizes by window id, forgets by launch id, keeps pending, skips malformed", () => {
     const home = mkdtempSync(path.join(tmpdir(), "ah-reg-"));
     try {
       // A window we never spawned is not despawnable.
       expect(isSpawnedWindow("window-USERS-OWN", home)).toBe(false);
       recordSpawn({ windowId: "window-abc", launchId: "lid1", tool: "codex", cwd: "/x", ts: 1 }, home);
+      recordSpawn({ windowId: null, launchId: "lid2", tool: "claude", cwd: "/y", ts: 2 }, home); // pending (no id yet)
       expect(isSpawnedWindow("window-abc", home)).toBe(true);
       expect(isSpawnedWindow("window-USERS-OWN", home)).toBe(false); // still refused
-      expect(readRegistry(home).map((r) => r.windowId)).toEqual(["window-abc"]);
-      forgetSpawn("window-abc", home);
+      expect(recordForWindow("window-abc", home)?.launchId).toBe("lid1");
+      expect(readRegistry(home).map((r) => r.launchId).sort()).toEqual(["lid1", "lid2"]);
+
+      // A junk file in the registry dir is ignored, never throws.
+      writeFileSync(path.join(home, ".agenthop", "spawned", "junk.json"), "not json{");
+      writeFileSync(path.join(home, ".agenthop", "spawned", "nullrec.json"), "null");
+      expect(readRegistry(home).map((r) => r.launchId).sort()).toEqual(["lid1", "lid2"]);
+
+      forgetSpawn("lid1", home);
       expect(isSpawnedWindow("window-abc", home)).toBe(false);
+      expect(readRegistry(home).map((r) => r.launchId)).toEqual(["lid2"]);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

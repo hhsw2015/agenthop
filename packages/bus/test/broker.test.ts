@@ -80,6 +80,23 @@ test("updateSelf re-announces a session's learned stable handle to peers", async
   }
 });
 
+test("a spawned session's launchId reaches peers (the signal despawn checks before closing)", async () => {
+  // The safety guarantee (never close a user window) depends on despawn seeing a live peer that still
+  // carries the record's launchId. Prove that a session started with a launchId publishes it to peers.
+  const home = mkdtempSync(path.join(tmpdir(), "bus-"));
+  const dispatcher = startLocalBus(mk("aaaaaaaa-1"), home);
+  const spawned = startLocalBus({ ...mk("bbbbbbbb-2"), launchId: "agenthop-spawn:codex:deadbeef" }, home);
+  try {
+    expect(await until(() => dispatcher.peers().some((p) => p.launchId === "agenthop-spawn:codex:deadbeef"))).toBe(true);
+    // And a launchId that no live peer carries is (correctly) not found — despawn would refuse to close.
+    expect(dispatcher.peers().some((p) => p.launchId === "agenthop-spawn:codex:notreal")).toBe(false);
+  } finally {
+    await dispatcher.close();
+    await spawned.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("closing an already-closed broker does not unlink the successor's socket", async () => {
   const home = mkdtempSync(path.join(tmpdir(), "bus-"));
   const a = startLocalBus(mk("aaaaaaaa-1"), home);
