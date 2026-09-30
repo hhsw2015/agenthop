@@ -20,6 +20,7 @@ import {
   resolveDespawnTarget,
   shquote,
   tomlBasicString,
+  writeClaim,
 } from "../src/spawn.js";
 
 const env = (over: Record<string, string | undefined>): NodeJS.ProcessEnv => ({ PATH: "", ...over }) as NodeJS.ProcessEnv;
@@ -125,12 +126,16 @@ describe("spawn registry (per-launch files; only despawn windows we spawned)", (
     try {
       // A window we never spawned is not despawnable.
       expect(isSpawnedWindow("window-USERS-OWN", home)).toBe(false);
-      recordSpawn({ windowId: "window-abc", surfaceId: "FA9BC882-UUID", launchId: "lid1", tool: "codex", cwd: "/x", ts: 1 }, home);
-      recordSpawn({ windowId: null, surfaceId: null, launchId: "lid2", tool: "claude", cwd: "/y", ts: 2 }, home); // pending (no id yet)
+      recordSpawn({ windowId: "window-abc", surfaceId: null, launchId: "lid1", tool: "codex", cwd: "/x", ts: 1 }, home);
+      writeClaim("lid1", "FA9BC882-UUID", home); // the child's separate claim file
+      recordSpawn({ windowId: null, surfaceId: null, launchId: "lid2", tool: "claude", cwd: "/y", ts: 2 }, home); // pending, unclaimed
       expect(isSpawnedWindow("window-abc", home)).toBe(true);
       expect(isSpawnedWindow("window-USERS-OWN", home)).toBe(false); // still refused
-      expect(recordForWindow("window-abc", home)?.launchId).toBe("lid1");
-      expect(recordForWindow("window-abc", home)?.surfaceId).toBe("FA9BC882-UUID");
+      const abc = recordForWindow("window-abc", home)!;
+      expect(abc.launchId).toBe("lid1");
+      expect(abc.surfaceId).toBe("FA9BC882-UUID"); // merged from the claim file
+      expect(abc.claimed).toBe(true);
+      expect(readRegistry(home).find((r) => r.launchId === "lid2")?.claimed).toBe(false); // pending is unclaimed
       expect(readRegistry(home).map((r) => r.launchId).sort()).toEqual(["lid1", "lid2"]);
 
       // A junk file in the registry dir is ignored, never throws.
@@ -146,13 +151,19 @@ describe("spawn registry (per-launch files; only despawn windows we spawned)", (
     }
   });
 
-  it("rejects a record whose surfaceId is a non-string (would crash despawn's asEsc)", () => {
+  it("ignores a claim whose surfaceId is a non-string (would crash despawn's asEsc)", () => {
     const home = mkdtempSync(path.join(tmpdir(), "ah-reg-"));
     try {
       const dir = path.join(home, ".agenthop", "spawned");
-      recordSpawn({ windowId: "w-ok", surfaceId: "UUID-OK", launchId: "ok", tool: "codex", cwd: "/x", ts: 1 }, home);
-      writeFileSync(path.join(dir, "bad.json"), JSON.stringify({ windowId: "w-bad", surfaceId: 73, launchId: "bad", tool: "codex", cwd: "/y", ts: 2 }));
-      expect(readRegistry(home).map((r) => r.launchId)).toEqual(["ok"]); // the surfaceId:73 record is skipped
+      recordSpawn({ windowId: "w1", surfaceId: null, launchId: "good", tool: "codex", cwd: "/x", ts: 1 }, home);
+      writeClaim("good", "UUID-GOOD", home);
+      recordSpawn({ windowId: "w2", surfaceId: null, launchId: "corrupt", tool: "codex", cwd: "/y", ts: 2 }, home);
+      writeFileSync(path.join(dir, "corrupt.claim.json"), JSON.stringify({ launchId: "corrupt", surfaceId: 73, claimed: true }));
+      const recs = Object.fromEntries(readRegistry(home).map((r) => [r.launchId, r]));
+      expect(recs.good!.surfaceId).toBe("UUID-GOOD");
+      expect(recs.good!.claimed).toBe(true);
+      expect(recs.corrupt!.surfaceId).toBeNull(); // corrupt claim ignored → stays unclaimed, never crashes despawn
+      expect(recs.corrupt!.claimed).toBe(false);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -194,8 +205,10 @@ describe("resolveDespawnTarget", () => {
     const home = mkdtempSync(path.join(tmpdir(), "ah-reg-"));
     try {
       // Two launches whose window id was reused by the OS across them (same windowId, different surface).
-      recordSpawn({ windowId: "win-1", surfaceId: "UUID-A", launchId: "lidA", tool: "codex", cwd: "/x", ts: 1 }, home);
-      recordSpawn({ windowId: "win-1", surfaceId: "UUID-B", launchId: "lidB", tool: "claude", cwd: "/y", ts: 2 }, home);
+      recordSpawn({ windowId: "win-1", surfaceId: null, launchId: "lidA", tool: "codex", cwd: "/x", ts: 1 }, home);
+      writeClaim("lidA", "UUID-A", home);
+      recordSpawn({ windowId: "win-1", surfaceId: null, launchId: "lidB", tool: "claude", cwd: "/y", ts: 2 }, home);
+      writeClaim("lidB", "UUID-B", home);
 
       const byLaunch = resolveDespawnTarget("lidB", home);
       expect("rec" in byLaunch && byLaunch.rec.surfaceId).toBe("UUID-B"); // unique launchId wins exactly

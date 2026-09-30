@@ -4,7 +4,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import { startBusCore, type BusCore, type UnifiedPeer } from "./core.js";
 import { formatHandoff } from "./handoff.js";
-import { claimOwnSpawn, despawnAgent, readRegistry, spawnAgent } from "./spawn.js";
+import { despawnAgent, readRegistry, spawnAgent, startClaimRetry } from "./spawn.js";
 import { omniwmctl, splitArgs } from "./wm.js";
 import { version } from "./version.js";
 
@@ -38,8 +38,8 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   const core: BusCore = startBusCore(options);
 
   // If THIS session was launched by agenthop_spawn, self-register the Ghostty surface it runs in so
-  // despawn has an authoritative (agent-claimed) target. Fire-and-forget; a no-op unless spawned.
-  void claimOwnSpawn().catch(() => {});
+  // despawn has an authoritative (agent-claimed) target. Bounded retry; a no-op unless spawned.
+  startClaimRetry();
 
   server.registerTool(
     "agenthop_peers",

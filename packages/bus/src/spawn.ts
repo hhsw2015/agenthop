@@ -205,58 +205,90 @@ function ghosttyPresent(): boolean {
 // surface UUID). despawn only ever closes a claimed surface. surfaceId from the dispatcher is not used.
 export type SpawnRecord = { windowId: string | null; surfaceId: string | null; launchId: string; tool: string; cwd: string; ts: number; claimed?: boolean };
 
+// TWO writers, TWO files, never a shared read-modify-write: the DISPATCHER owns the main record
+// (<launchId>.json — window id/tool/cwd), the spawned CHILD owns the claim (<launchId>.claim.json — its
+// authoritative surface UUID). readRegistry merges them. Because neither writer touches the other's file,
+// a concurrent dispatcher write and child claim can never clobber each other (an RMW on one shared file
+// could, and temp+rename would not save it).
+type MainRecord = { windowId: string | null; launchId: string; tool: string; cwd: string; ts: number };
+type ClaimRecord = { launchId: string; surfaceId: string; claimed: true };
+
 function registryDir(home: string): string {
   return path.join(home, ".agenthop", "spawned");
 }
-function recordFile(home: string, lid: string): string {
-  const safe = lid.replace(/[^a-zA-Z0-9._-]/g, "_");
-  return path.join(registryDir(home), `${safe}.json`);
+function safeName(lid: string): string {
+  return lid.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
-function isRecord(r: unknown): r is SpawnRecord {
+function mainFile(home: string, lid: string): string {
+  return path.join(registryDir(home), `${safeName(lid)}.json`);
+}
+function claimFile(home: string, lid: string): string {
+  return path.join(registryDir(home), `${safeName(lid)}.claim.json`);
+}
+function isMain(r: unknown): r is MainRecord {
   if (!r || typeof r !== "object") return false;
   const o = r as Record<string, unknown>;
   const windowOk = o.windowId === null || typeof o.windowId === "string";
-  // surfaceId may be absent/null (unclaimed) but a non-string value is a corrupt record — reject it
-  // rather than let despawn hit asEsc(<non-string>) and throw.
-  const surfaceOk = o.surfaceId === undefined || o.surfaceId === null || typeof o.surfaceId === "string";
-  const claimedOk = o.claimed === undefined || typeof o.claimed === "boolean";
-  return typeof o.launchId === "string" && typeof o.tool === "string" && typeof o.cwd === "string" && windowOk && surfaceOk && claimedOk;
+  return typeof o.launchId === "string" && typeof o.tool === "string" && typeof o.cwd === "string" && windowOk;
 }
+function readClaim(home: string, lid: string): ClaimRecord | undefined {
+  try {
+    const r = JSON.parse(readFileSync(claimFile(home, lid), "utf8")) as Record<string, unknown>;
+    // A non-string surfaceId is a corrupt claim — ignore it rather than let despawn asEsc(<non-string>).
+    if (r && typeof r === "object" && typeof r.surfaceId === "string" && r.claimed === true) return { launchId: lid, surfaceId: r.surfaceId, claimed: true };
+  } catch {
+    // no claim yet / malformed
+  }
+  return undefined;
+}
+function atomicWriteJson(p: string, data: unknown): boolean {
+  const tmp = `${p}.tmp.${randomBytes(4).toString("hex")}`;
+  try {
+    mkdirSync(path.dirname(p), { recursive: true });
+    writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
+    renameSync(tmp, p); // atomic replace — a failed/partial write never truncates the existing file
+    return true;
+  } catch {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // leftover temp is harmless (readRegistry ignores *.tmp.*)
+    }
+    return false;
+  }
+}
+
 export function readRegistry(home: string = homedir()): SpawnRecord[] {
   let files: string[];
   try {
-    files = readdirSync(registryDir(home)).filter((f) => f.endsWith(".json"));
+    files = readdirSync(registryDir(home)).filter((f) => f.endsWith(".json") && !f.endsWith(".claim.json"));
   } catch {
     return []; // no dir yet
   }
   const out: SpawnRecord[] = [];
   for (const f of files) {
     try {
-      const r = JSON.parse(readFileSync(path.join(registryDir(home), f), "utf8"));
-      if (isRecord(r)) out.push(r);
+      const m = JSON.parse(readFileSync(path.join(registryDir(home), f), "utf8"));
+      if (!isMain(m)) continue;
+      const claim = readClaim(home, m.launchId); // merge the child's claim, if any
+      out.push({ windowId: m.windowId, launchId: m.launchId, tool: m.tool, cwd: m.cwd, ts: m.ts, surfaceId: claim?.surfaceId ?? null, claimed: claim?.claimed ?? false });
     } catch {
       // skip a malformed / partially-written record
     }
   }
   return out;
 }
+
+/** Dispatcher-owned main record (window id/tool/cwd/ts). Never writes the child's claim fields. */
 export function recordSpawn(rec: SpawnRecord, home: string = homedir()): boolean {
-  const p = recordFile(home, rec.launchId);
-  const tmp = `${p}.tmp.${randomBytes(4).toString("hex")}`;
-  try {
-    mkdirSync(path.dirname(p), { recursive: true });
-    writeFileSync(tmp, `${JSON.stringify(rec, null, 2)}\n`);
-    renameSync(tmp, p); // atomic replace — a failed/partial write never truncates the existing record
-    return true;
-  } catch {
-    try {
-      rmSync(tmp, { force: true });
-    } catch {
-      // leftover temp is harmless (readRegistry only reads *.json)
-    }
-    return false;
-  }
+  return atomicWriteJson(mainFile(home, rec.launchId), { windowId: rec.windowId, launchId: rec.launchId, tool: rec.tool, cwd: rec.cwd, ts: rec.ts } satisfies MainRecord);
 }
+
+/** Child-owned claim: the authoritative surface UUID for this launch, in its OWN file (no RMW race). */
+export function writeClaim(launchId: string, surfaceId: string, home: string = homedir()): boolean {
+  return atomicWriteJson(claimFile(home, launchId), { launchId, surfaceId, claimed: true } satisfies ClaimRecord);
+}
+
 export function isSpawnedWindow(windowId: string, home: string = homedir()): boolean {
   return readRegistry(home).some((r) => r.windowId === windowId);
 }
@@ -280,10 +312,12 @@ export function resolveDespawnTarget(handle: string, home: string = homedir()): 
   return { error: `"${handle}" is not a window agenthop dispatched. agenthop only ever closes agents it spawned, never sessions you opened. (See agenthop_spawned for ids I can close.)` };
 }
 export function forgetSpawn(launchId: string, home: string = homedir()): void {
-  try {
-    rmSync(recordFile(home, launchId), { force: true });
-  } catch {
-    // best effort
+  for (const p of [mainFile(home, launchId), claimFile(home, launchId)]) {
+    try {
+      rmSync(p, { force: true });
+    } catch {
+      // best effort
+    }
   }
 }
 
@@ -319,6 +353,33 @@ function psTtyPpid(pid: number): Promise<{ tty?: string; ppid?: number }> {
   });
 }
 
+function psEnv(pid: number): Promise<string> {
+  return new Promise((resolve) => {
+    execFile("ps", ["eww", "-p", String(pid)], { timeout: 3000, maxBuffer: 4 << 20, encoding: "utf8" }, (err, stdout) => resolve(err ? "" : (stdout ?? "")));
+  });
+}
+
+/**
+ * The AGENTHOP_LAUNCH_ID for this session: our own env if present, else an ANCESTOR's env (read via
+ * `ps eww`). Codex clears its MCP subprocess env (so our bus node's own env loses it), but the codex CLI
+ * ancestor still carries the value we injected into the window — so an ancestor walk recovers it without
+ * any per-tool config forwarding. Undefined when this is not a spawned session.
+ */
+async function discoverLaunchId(env: NodeJS.ProcessEnv, pid: number, maxHops = 6): Promise<string | undefined> {
+  const own = env.AGENTHOP_LAUNCH_ID?.trim();
+  if (own) return own;
+  let cur = pid;
+  for (let i = 0; i < maxHops && cur > 1; i++) {
+    const out = await psEnv(cur);
+    const m = out.match(/AGENTHOP_LAUNCH_ID=(agenthop-spawn:[^\s]+)/);
+    if (m) return m[1];
+    const { ppid } = await psTtyPpid(cur);
+    if (!ppid) break;
+    cur = ppid;
+  }
+  return undefined;
+}
+
 /** This process's controlling tty (e.g. "ttys008"), walking up ppid across the MCP/pipe boundary since
  *  a bus node's own stdio are pipes but it inherits the surface's controlling terminal. Undefined if none. */
 async function controllingTty(pid: number, maxHops = 6): Promise<string | undefined> {
@@ -350,35 +411,46 @@ end tell`);
   return r.ok && id ? id : undefined;
 }
 
-export type ClaimOptions = { home?: string; env?: NodeJS.ProcessEnv; discover?: () => Promise<string | undefined> };
+export type ClaimOptions = { home?: string; env?: NodeJS.ProcessEnv; discover?: () => Promise<string | undefined>; launchId?: string };
 
 /**
- * If this process was launched by agenthop_spawn (AGENTHOP_LAUNCH_ID is set), self-register the Ghostty
- * surface UUID it actually runs in, with claimed=true, on its own launch record — the authoritative
- * binding despawn requires before it will close. Idempotent, best-effort, macOS-only. Returns whether a
- * claim was written. `discover` is injectable for tests.
+ * If this process was launched by agenthop_spawn, self-register (claimed=true) the Ghostty surface UUID
+ * it actually runs in, on its own launch's claim file — the authoritative binding despawn requires. The
+ * launchId is taken from opts.launchId, else this process's own AGENTHOP_LAUNCH_ID env (ancestor lookup
+ * is done by startClaimRetry). Idempotent, best-effort. Returns whether a claim was written. `discover`
+ * is injectable for tests.
  */
 export async function claimOwnSpawn(opts: ClaimOptions = {}): Promise<boolean> {
-  const env = opts.env ?? process.env;
-  const lid = env.AGENTHOP_LAUNCH_ID?.trim();
+  const lid = opts.launchId?.trim() || (opts.env ?? process.env).AGENTHOP_LAUNCH_ID?.trim();
   if (!lid) return false; // not a spawned session
-  const home = opts.home ?? homedir();
   // The default discovery is macOS-only (osascript); off-macOS it returns undefined and we no-op.
   const surfaceId = await (opts.discover ?? discoverOwnSurfaceId)();
   if (!surfaceId) return false;
-  const existing = readRegistry(home).find((r) => r.launchId === lid);
-  return recordSpawn(
-    {
-      windowId: existing?.windowId ?? null,
-      surfaceId,
-      launchId: lid,
-      tool: existing?.tool ?? lid.split(":")[1] ?? "unknown",
-      cwd: existing?.cwd ?? process.cwd(),
-      ts: existing?.ts ?? Date.now(),
-      claimed: true,
-    },
-    home,
-  );
+  // Write ONLY the claim file — never the dispatcher's main record — so the two writers never race.
+  return writeClaim(lid, surfaceId, opts.home ?? homedir());
+}
+
+/**
+ * Claim on startup with bounded retry. First it resolves the launchId (own env, else an ancestor's env
+ * via ps eww — so it works even when codex clears the MCP subprocess env); if this is not a spawned
+ * session it does nothing. Then it claims, retrying with backoff if the surface/tty is not queryable yet
+ * (Ghostty still settling, permissions warming up), stopping on the first success. Non-blocking; timers
+ * unref so they never keep the process alive.
+ */
+export function startClaimRetry(opts: ClaimOptions = {}): void {
+  const env = opts.env ?? process.env;
+  void discoverLaunchId(env, process.pid).then((lid) => {
+    if (!lid) return; // not a spawned session → nothing to claim, no retries
+    let attempt = 0;
+    const tryOnce = (): void => {
+      void claimOwnSpawn({ ...opts, launchId: lid }).then((ok) => {
+        if (ok || attempt >= 5) return; // claimed, or gave up after ~1 min of backoff
+        const timer = setTimeout(tryOnce, 1000 * 2 ** attempt++);
+        if (typeof timer.unref === "function") timer.unref();
+      });
+    };
+    tryOnce();
+  });
 }
 
 async function omniwmWindowIds(bin: string): Promise<string[] | undefined> {
@@ -462,20 +534,11 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
     };
   }
   const windowId = r.out.trim() || undefined;
-  // Fill in the window id, but PRESERVE any claim the child may already have written (it self-registers
-  // its surface UUID + claimed=true on startup; a merge here avoids clobbering an early claim).
+  // Fill in the window id on the dispatcher's OWN main record. The child's claim lives in a separate
+  // file, so this write can never clobber a claim that already arrived (no shared read-modify-write).
   let recordOk = true;
   if (windowId) {
-    const existing = readRegistry().find((rec) => rec.launchId === lid);
-    recordOk = recordSpawn({
-      windowId,
-      surfaceId: existing?.surfaceId ?? null,
-      launchId: lid,
-      tool: input.tool,
-      cwd,
-      ts: existing?.ts ?? Date.now(),
-      claimed: existing?.claimed ?? false,
-    });
+    recordOk = recordSpawn({ windowId, surfaceId: null, launchId: lid, tool: input.tool, cwd, ts: Date.now() });
   }
 
   const workspace = (input.workspace && input.workspace.trim()) || env.AGENTHOP_SPAWN_WORKSPACE?.trim();
