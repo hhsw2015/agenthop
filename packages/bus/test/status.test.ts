@@ -92,3 +92,26 @@ test("status is isolated per session identity (multiplexed Codex threads don't s
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("a wait for one identity is NOT satisfied by another identity of the same run", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ah-status-sw-"));
+  const a = startBusCore({ home });
+  const b = startBusCore({ home });
+  try {
+    // a adopts native identity A and is working; b sees that identity.
+    a.noteThread("native-A");
+    a.setStatus("working", { seq: 100 });
+    expect(await until(() => b.peers().find((p) => p.stableId === "native-A")?.status === "working")).toBe(true);
+
+    // b starts waiting for native-A to go idle (resolves + pins identity A synchronously here).
+    const waiting = b.waitForStatus("native-A", ["idle"], 800);
+    // a now multiplexes to native identity B and reports B idle — must NOT satisfy the wait for A.
+    a.noteThread("native-B");
+    a.setStatus("idle", { seq: 1 });
+    expect(await waiting).toMatchObject({ reached: false }); // B's idle did not count as A reaching idle
+  } finally {
+    await a.close();
+    await b.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});

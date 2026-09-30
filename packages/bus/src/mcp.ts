@@ -148,7 +148,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       if (r.error) return failure(`${r.error}\n${roster(core.peers(), core.self.id, core.status())}`);
       if (r.gone) return reply(`${r.label ?? to} is gone (left the bus) before reaching ${states.join("/")}.`);
       if (r.reached) return reply(`${r.label ?? to} is now ${r.status}.`);
-      return reply(`Timed out after ${secs}s; ${r.label ?? to} is ${r.status ?? "unknown"}. Call agenthop_wait again to keep waiting.`);
+      return reply(`Timed out after ${secs}s; ${r.label ?? to} is ${r.status ?? "unknown"}. Call agenthop_wait_peer again to keep waiting.`);
     },
   );
 

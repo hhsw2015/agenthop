@@ -242,15 +242,20 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
     const peer = resolvePeer(unified(b), b.self.id, target);
     if ("error" in peer) return { reached: false, error: peer.error };
     const pin = peer.id; // the exact run; a restart or same-stableId sibling won't satisfy the wait
+    const pinIdentity = peer.stableId; // the native identity resolved; guards a mid-wait identity switch
     const label = labelFor(b, peer.id);
     const wanted = new Set(until);
     const deadline = Date.now() + timeoutMs;
+    let last: AgentStatus | undefined;
     for (;;) {
       const now = unified(b).find((p) => p.id === pin);
       if (!now) return { reached: false, gone: true, label };
-      const cur = now.status ?? "unknown"; // an unreported peer is "unknown", and matchable as such
-      if (wanted.has(cur)) return { reached: true, status: cur, label };
-      if (Date.now() >= deadline) return { reached: false, status: cur, label };
+      const sameIdentity = pinIdentity === undefined || now.stableId === undefined || now.stableId === pinIdentity;
+      if (sameIdentity) {
+        last = now.status ?? "unknown"; // an unreported peer is "unknown", and matchable as such
+        if (wanted.has(last)) return { reached: true, status: last, label };
+      }
+      if (Date.now() >= deadline) return { reached: false, status: last, label };
       await new Promise((r) => setTimeout(r, 200));
     }
   };
@@ -369,7 +374,7 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
           if (r.error) return r.error;
           if (r.gone) return `${r.label ?? to} is gone (left the bus) before reaching ${states.join("/")}.`;
           if (r.reached) return `${r.label ?? to} is now ${r.status}.`;
-          return `Timed out after ${secs}s; ${r.label ?? to} is ${r.status ?? "unknown"}. Call agenthop_wait again to keep waiting.`;
+          return `Timed out after ${secs}s; ${r.label ?? to} is ${r.status ?? "unknown"}. Call agenthop_wait_peer again to keep waiting.`;
         },
       }),
       agenthop_send: tool({

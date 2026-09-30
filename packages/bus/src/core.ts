@@ -189,18 +189,26 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     async waitForStatus(target, until, timeoutMs) {
       const peer = resolve(target);
       if ("error" in peer) return { reached: false, error: peer.error };
-      // Pin the resolved EXACT run (per-run id). The id is stable even as the run later learns its
-      // stableId, and a restart (new run id) or a same-stableId sibling won't satisfy the wait.
+      // Pin the resolved EXACT run (per-run id) AND the native identity it represented at resolve time.
+      // The run id survives a restart-as-new check; the identity guard handles a multiplexing run that
+      // switches to another native thread mid-wait — its (different identity's) status must not satisfy us.
       const pin = peer.id;
+      const pinIdentity = peer.stableId; // undefined if it had not adopted a durable identity yet
       const label = labelFor(peer.id);
       const wanted = new Set(until);
       const deadline = Date.now() + timeoutMs;
+      let last: AgentStatus | undefined;
       for (;;) {
         const now = unified().find((p) => p.id === pin);
         if (!now) return { reached: false, gone: true, label };
-        const cur = now.status ?? "unknown"; // an unreported peer is "unknown", and matchable as such
-        if (wanted.has(cur)) return { reached: true, status: cur, label };
-        if (Date.now() >= deadline) return { reached: false, status: cur, label };
+        // Read the published status only while the run still represents the identity we resolved. A pin
+        // with no identity (pre-adoption) accepts the first adoption; a switch A→B is skipped, not matched.
+        const sameIdentity = pinIdentity === undefined || now.stableId === undefined || now.stableId === pinIdentity;
+        if (sameIdentity) {
+          last = now.status ?? "unknown"; // an unreported peer is "unknown", and matchable as such
+          if (wanted.has(last)) return { reached: true, status: last, label };
+        }
+        if (Date.now() >= deadline) return { reached: false, status: last, label };
         await delay(200);
       }
     },
