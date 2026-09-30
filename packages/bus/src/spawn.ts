@@ -192,6 +192,17 @@ export function codexTrustArgs(cwd: string): string[] {
   return ["-c", `projects={"${tomlBasicString(cwd)}"={trust_level="trusted"}}`];
 }
 
+/**
+ * codex CLI args that make it forward AGENTHOP_LAUNCH_ID from its own env into the agenthop MCP
+ * subprocess (which codex otherwise clears), so the spawned session can self-register its window for
+ * despawn. Done per-invocation via `-c` (merges with the file's command/args — verified) so NO config
+ * file needs editing or migrating for existing installs. Overrides the agenthop server's env_vars for
+ * this launch only; agenthop is our own server, so replacing its (normally empty) env_vars is safe. Pure.
+ */
+export function codexEnvForwardArgs(): string[] {
+  return ["-c", `mcp_servers.agenthop.env_vars=["AGENTHOP_LAUNCH_ID"]`];
+}
+
 function ghosttyPresent(): boolean {
   return existsSync("/Applications/Ghostty.app") || existsSync(path.join(homedir(), "Applications", "Ghostty.app"));
 }
@@ -477,8 +488,9 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
     // keep the resolved path if realpath fails (e.g. permissions) — trust may then not match, but safe
   }
 
-  // codex: pre-trust this folder per-invocation via `-c` (no global config write).
-  const argv = input.tool === "codex" ? [cli.argv[0]!, ...codexTrustArgs(cwd), ...cli.argv.slice(1)] : cli.argv;
+  // codex: per-invocation `-c` overrides — pre-trust this folder (no global config write) AND forward
+  // AGENTHOP_LAUNCH_ID into the agenthop MCP subprocess so this session can self-register its window.
+  const argv = input.tool === "codex" ? [cli.argv[0]!, ...codexTrustArgs(cwd), ...codexEnvForwardArgs(), ...cli.argv.slice(1)] : cli.argv;
   const lid = launchId(input.tool);
   const command = buildCommand(argv);
   // Inject PATH/HOME (so the CLI finds node etc. under the GUI launch env) + the launch id. Inherited

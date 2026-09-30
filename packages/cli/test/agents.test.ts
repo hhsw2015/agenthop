@@ -76,31 +76,16 @@ describe("plugging into agents as an MCP server", () => {
     expect(text).toContain('env_vars = ["AGENTHOP_LAUNCH_ID"]');
   });
 
-  it("migrates an existing agenthop block that predates env_vars, preserving other fields", async () => {
+  it("leaves an existing agenthop block byte-for-byte alone (no fragile TOML rewriting)", async () => {
     const dir = await home();
     const file = path.join(dir, ".codex", "config.toml");
     await mkdir(path.dirname(file), { recursive: true });
-    // An install from before env_vars existed, plus a following table that must be left intact.
-    await writeFile(file, `[mcp_servers.agenthop]\ncommand = "/old/agenthop"\nargs = ["mcp"]\n\n[mcp_servers.other]\ncommand = "x"\n`);
-    const msg = registerMcp(["codex"], BIN, dir)[0]!;
-    expect(msg).toContain("forward AGENTHOP_LAUNCH_ID");
-    const text = await readFile(file, "utf8");
-    expect(text.match(/\[mcp_servers\.agenthop\]/g)).toHaveLength(1); // no duplicate block
-    expect(text).toContain('env_vars = ["AGENTHOP_LAUNCH_ID"]');
-    expect(text).toContain('command = "/old/agenthop"'); // existing fields preserved
-    expect(text).toContain("[mcp_servers.other]"); // following table untouched
-    // Idempotent: running again changes nothing.
-    expect(registerMcp(["codex"], BIN, dir)[0]).toContain("already has agenthop with launchId forwarding");
-  });
-
-  it("appends AGENTHOP_LAUNCH_ID to an existing env_vars list without dropping the user's names", async () => {
-    const dir = await home();
-    const file = path.join(dir, ".codex", "config.toml");
-    await mkdir(path.dirname(file), { recursive: true });
-    await writeFile(file, `[mcp_servers.agenthop]\ncommand = "/old/agenthop"\nargs = ["mcp"]\nenv_vars = ["MY_CUSTOM_ENV"]\n`);
-    registerMcp(["codex"], BIN, dir);
-    const text = await readFile(file, "utf8");
-    expect(text).toContain('env_vars = ["MY_CUSTOM_ENV", "AGENTHOP_LAUNCH_ID"]');
+    // An old install without env_vars: we do NOT edit it (a spawned Codex gets forwarding via `codex -c`
+    // at launch instead). Rewriting existing TOML risks corrupting it.
+    const before = `[mcp_servers.agenthop]\ncommand = "/old/agenthop"\nargs = ["mcp"]\n\n[mcp_servers.other]\ncommand = "x"\n`;
+    await writeFile(file, before);
+    expect(registerMcp(["codex"], BIN, dir)[0]).toContain("already has agenthop");
+    expect(await readFile(file, "utf8")).toBe(before); // untouched
   });
 
   it("names an agent it does not know instead of guessing", async () => {

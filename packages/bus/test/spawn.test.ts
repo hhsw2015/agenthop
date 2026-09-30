@@ -7,6 +7,7 @@ import {
   buildAppleScript,
   buildCommand,
   claimOwnSpawn,
+  codexEnvForwardArgs,
   codexTrustArgs,
   diffNewWindowIds,
   forgetSpawn,
@@ -117,6 +118,13 @@ describe("codexTrustArgs", () => {
     expect(tomlBasicString('/a"b\\c\n')).toBe('/a\\"b\\\\c\\n');
     expect(tomlBasicString("\u0001")).toBe("\\u0001");
     expect(codexTrustArgs('/a"b')).toEqual(["-c", 'projects={"/a\\"b"={trust_level="trusted"}}']);
+  });
+});
+
+describe("codexEnvForwardArgs", () => {
+  it("forwards AGENTHOP_LAUNCH_ID via a per-launch -c (merges with the file's command/args)", () => {
+    // codex clears the MCP subprocess env; this makes it pass the launch id through so the child can claim.
+    expect(codexEnvForwardArgs()).toEqual(["-c", 'mcp_servers.agenthop.env_vars=["AGENTHOP_LAUNCH_ID"]']);
   });
 });
 
