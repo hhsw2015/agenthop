@@ -9,7 +9,7 @@ import net from "node:net";
 import { tool } from "@opencode-ai/plugin";
 import { bridgeSocketPath, startLocalBus, type Inbound, type LocalBus } from "./broker.js";
 import { formatHandoff } from "./handoff.js";
-import { sessionTitle, type SelfInfo } from "./label.js";
+import { sessionTitle, type AgentStatus, type SelfInfo } from "./label.js";
 import { resolvePeer, type UnifiedPeer } from "./resolve.js";
 import { despawnAgent, readRegistry, spawnAgent, startClaimRetry } from "./spawn.js";
 import { loadTeam } from "./team.js";
@@ -219,9 +219,38 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
   // wins over a relay row with the same id (dedup), matching core.ts's unified().
   const unified = (b: SessionBus): UnifiedPeer[] => {
     const out = new Map<string, UnifiedPeer>();
-    for (const p of b.local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid });
+    for (const p of b.local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid, status: p.status, statusSeq: p.statusSeq, statusText: p.statusText, statusAt: p.statusAt });
     if (b.bridge) for (const p of b.bridge.roster()) if (!out.has(p.id)) out.set(p.id, p);
     return [...out.values()];
+  };
+
+  // Set this session's own work state; it rides the roster to peers. Monotonic seq drops stale reports.
+  const setStatus = (b: SessionBus, state: AgentStatus, opts?: { seq?: number; text?: string }): { ok: boolean; seq?: number } => {
+    const seq = opts?.seq;
+    if (seq !== undefined && b.self.statusSeq !== undefined && seq <= b.self.statusSeq) return { ok: false, seq: b.self.statusSeq };
+    b.self.status = state;
+    b.self.statusSeq = seq ?? (b.self.statusSeq ?? 0) + 1;
+    b.self.statusText = opts?.text?.trim() || undefined;
+    b.self.statusAt = Date.now();
+    b.local.updateSelf(b.self); // local roster; cross-machine status propagation is a follow-up
+    return { ok: true, seq: b.self.statusSeq };
+  };
+
+  // Wait until `target` reaches one of `until` states (or vanishes / times out), pinning its identity.
+  const waitForStatus = async (b: SessionBus, target: string, until: AgentStatus[], timeoutMs: number): Promise<{ status?: AgentStatus; reached: boolean; gone?: boolean; error?: string; label?: string }> => {
+    const peer = resolvePeer(unified(b), b.self.id, target);
+    if ("error" in peer) return { reached: false, error: peer.error };
+    const pin = peer.stableId ?? peer.id;
+    const label = labelFor(b, peer.id);
+    const wanted = new Set(until);
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const now = unified(b).find((p) => (p.stableId ?? p.id) === pin);
+      if (!now) return { reached: false, gone: true, label };
+      if (now.status && wanted.has(now.status)) return { reached: true, status: now.status, label };
+      if (Date.now() >= deadline) return { reached: false, status: now.status, label };
+      await new Promise((r) => setTimeout(r, 200));
+    }
   };
 
   const labelFor = (b: SessionBus, id: string): string => {
@@ -305,9 +334,39 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
           const b = busFor(context.sessionID);
           const rows = unified(b)
             .filter((p) => p.id !== b.self.id)
-            .map((p) => `  ${p.title}${p.via === "relay" ? `@${p.machine ?? "remote"}` : ""}  ${p.cwd}  (run ${p.id.slice(0, 8)})`);
+            .map((p) => `  ${p.title}${p.via === "relay" ? `@${p.machine ?? "remote"}` : ""}  [${p.status ?? "unknown"}${p.statusText ? `: ${p.statusText}` : ""}]  ${p.cwd}  (run ${p.id.slice(0, 8)})`);
           const scope = b.bridge ? "broker + team relay" : "broker (same-machine)";
           return `${b.local.role()} bus; ${scope}; ${rows.length} other session(s)\n${rows.join("\n") || "  (no other sessions)"}`;
+        },
+      }),
+      agenthop_status: tool({
+        description:
+          "Report THIS session's work state to peers (working | idle | blocked | unknown). Shows in agenthop_peers and lets a dispatcher agenthop_wait on it. `blocked` = needs input (permission/approval/question).",
+        args: {
+          state: tool.schema.enum(["working", "idle", "blocked", "unknown"]).describe("This session's work state"),
+          note: tool.schema.string().optional().describe("Optional short detail"),
+        },
+        async execute({ state, note }: { state: AgentStatus; note?: string }, context: ToolContext): Promise<string> {
+          const r = setStatus(busFor(context.sessionID), state, { text: note });
+          return r.ok ? `Status set to ${state} (seq ${r.seq}).` : `Ignored: a newer status (seq ${r.seq}) is already set.`;
+        },
+      }),
+      agenthop_wait: tool({
+        description:
+          "Wait until another session reaches a work state — e.g. a sub-agent you dispatched goes idle (done) or blocked (needs input). Returns when it reaches one of the states, vanishes, or times out. Pins the target's identity.",
+        args: {
+          to: tool.schema.string().describe("Target session: handle/prefix or id (see agenthop_peers)"),
+          until: tool.schema.array(tool.schema.enum(["working", "idle", "blocked", "unknown"])).optional().describe("States to wait for (default: idle, blocked)"),
+          timeout_seconds: tool.schema.number().int().min(1).max(290).optional().describe("Seconds to wait, 30 by default"),
+        },
+        async execute({ to, until, timeout_seconds }: { to: string; until?: AgentStatus[]; timeout_seconds?: number }, context: ToolContext): Promise<string> {
+          const states: AgentStatus[] = until && until.length ? until : ["idle", "blocked"];
+          const secs = timeout_seconds ?? 30;
+          const r = await waitForStatus(busFor(context.sessionID), to, states, secs * 1000);
+          if (r.error) return r.error;
+          if (r.gone) return `${r.label ?? to} is gone (left the bus) before reaching ${states.join("/")}.`;
+          if (r.reached) return `${r.label ?? to} is now ${r.status}.`;
+          return `Timed out after ${secs}s; ${r.label ?? to} is ${r.status ?? "unknown"}. Call agenthop_wait again to keep waiting.`;
         },
       }),
       agenthop_send: tool({

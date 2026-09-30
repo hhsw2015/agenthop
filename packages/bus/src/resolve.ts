@@ -16,6 +16,12 @@ export type UnifiedPeer = {
   pub?: string;
   /** Present for local peers: the OS process id, to tell apart sessions that share a title. */
   pid?: number;
+  /** Self-reported work state (working|idle|blocked|unknown) and its monotonic sequence, for
+   *  orchestration (agenthop_peers display / agenthop_wait). Absent means unknown. */
+  status?: "working" | "idle" | "blocked" | "unknown";
+  statusSeq?: number;
+  statusText?: string;
+  statusAt?: number;
 };
 
 /**

@@ -1,4 +1,4 @@
-import { selfInfo, sessionTitle, type SelfInfo } from "./label.js";
+import { selfInfo, sessionTitle, type AgentStatus, type SelfInfo } from "./label.js";
 import { startLocalBus, type LocalBus } from "./broker.js";
 import { startRelay, type Relay } from "./relay.js";
 import { pushToHost } from "./push.js";
@@ -25,6 +25,12 @@ export type BusCore = {
   /** Record this Codex thread id (from x-codex-turn-metadata) so inbound can be pushed to it. */
   noteThread(id: string): void;
   status(): string;
+  /** Set this session's own work state (working|idle|blocked|unknown); it rides the roster to peers.
+   *  A monotonic `seq` (explicit or auto-incremented) drops a stale/duplicate report. */
+  setStatus(state: AgentStatus, opts?: { seq?: number; text?: string }): { ok: boolean; seq?: number; ignored?: boolean };
+  /** Wait until `target` reaches one of `until` states (or vanishes / times out). Pins the resolved
+   *  session's stable identity so a different session cannot satisfy the wait. */
+  waitForStatus(target: string, until: AgentStatus[], timeoutMs: number): Promise<{ status?: AgentStatus; reached: boolean; gone?: boolean; error?: string; label?: string }>;
   close(): Promise<void>;
 };
 
@@ -107,7 +113,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
 
   const unified = (): UnifiedPeer[] => {
     const out = new Map<string, UnifiedPeer>();
-    for (const p of local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid });
+    for (const p of local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid, status: p.status, statusSeq: p.statusSeq, statusText: p.statusText, statusAt: p.statusAt });
     if (relay) {
       for (const p of relay.roster()) if (!out.has(p.id)) out.set(p.id, p);
     }
@@ -145,6 +151,35 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
         batch = queue.splice(0, queue.length);
       }
       return batch;
+    },
+    setStatus(state, opts) {
+      const seq = opts?.seq;
+      // Monotonic guard: never apply a report that is not newer than the last (out-of-order / duplicate).
+      if (seq !== undefined && self.statusSeq !== undefined && seq <= self.statusSeq) return { ok: false, ignored: true, seq: self.statusSeq };
+      self.status = state;
+      self.statusSeq = seq ?? (self.statusSeq ?? 0) + 1;
+      self.statusText = opts?.text?.trim() || undefined;
+      self.statusAt = Date.now();
+      local.updateSelf(self);
+      relay?.updateSelf(self);
+      return { ok: true, seq: self.statusSeq };
+    },
+    async waitForStatus(target, until, timeoutMs) {
+      const peer = resolve(target);
+      if ("error" in peer) return { reached: false, error: peer.error };
+      // Pin the resolved session's durable identity so a different (or restarted-as-new) session can't
+      // satisfy the wait; fall back to the per-run id when there is no stableId yet.
+      const pin = peer.stableId ?? peer.id;
+      const label = labelFor(peer.id);
+      const wanted = new Set(until);
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const now = unified().find((p) => (p.stableId ?? p.id) === pin);
+        if (!now) return { reached: false, gone: true, label };
+        if (now.status && wanted.has(now.status)) return { reached: true, status: now.status, label };
+        if (Date.now() >= deadline) return { reached: false, status: now.status, label };
+        await delay(200);
+      }
     },
     status() {
       const relayUrl = options.relay ?? process.env.AGENTHOP_RELAY ?? "default relay";
