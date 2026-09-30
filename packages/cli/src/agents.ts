@@ -54,7 +54,15 @@ const agents: Agent[] = [
     register: (bin, home) => {
       const file = join(home, ".codex", "config.toml");
       const existing = existsSync(file) ? readFileSync(file, "utf8") : "";
-      if (/^\[mcp_servers\.agenthop\]/m.test(existing)) return t(`${file} already has agenthop; nothing changed`, `${file} 里已经有 agenthop 了，没有改动`);
+      if (/^\[mcp_servers\.agenthop\]/m.test(existing)) {
+        // Already registered — but an install predating env_vars would leave a spawned Codex unable to
+        // learn its launch id. Migrate the existing block to forward AGENTHOP_LAUNCH_ID, preserving any
+        // other fields and env_vars names the user set.
+        const migrated = ensureCodexLaunchIdForward(existing);
+        if (!migrated) return t(`${file} already has agenthop with launchId forwarding; nothing changed`, `${file} 里已有 agenthop 且已转发 launchId，没有改动`);
+        placeFile(file, migrated);
+        return t(`updated agenthop in ${file} to forward AGENTHOP_LAUNCH_ID`, `已更新 ${file} 里的 agenthop，转发 AGENTHOP_LAUNCH_ID`);
+      }
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${existing ? "\n" : ""}${codexBlock(bin)}\n`);
       return t(`written to ${file}`, `已写入 ${file}`);
@@ -147,6 +155,48 @@ function codexBlock(bin: string): string {
   // otherwise clears it). That is how a spawned Codex session learns its launch id and can self-register
   // its window for agenthop_despawn. Harmless when the var is unset (normal, non-spawned sessions).
   return `[mcp_servers.agenthop]\ncommand = ${JSON.stringify(bin)}\nargs = ["mcp"]\nenv_vars = ["AGENTHOP_LAUNCH_ID"]`;
+}
+
+/**
+ * Idempotently make an existing `[mcp_servers.agenthop]` block forward AGENTHOP_LAUNCH_ID. Returns the
+ * updated text, or undefined if it already forwards it (no change). Edits ONLY that one block (bounded by
+ * its header and the next table header / EOF) and preserves any other keys and env_vars names. Regex
+ * surgery, but confined to our own known block — a config that does not have the block is not touched.
+ */
+export function ensureCodexLaunchIdForward(text: string): string | undefined {
+  const header = text.match(/^\[mcp_servers\.agenthop\][^\n]*\n/m);
+  if (!header) return undefined; // no block to migrate
+  const start = header.index!;
+  const afterHeader = start + header[0].length;
+  const nextTable = text.slice(afterHeader).search(/^\[/m);
+  const end = nextTable === -1 ? text.length : afterHeader + nextTable;
+  const block = text.slice(start, end);
+
+  const envVars = block.match(/^[ \t]*env_vars[ \t]*=[ \t]*\[([^\]]*)\]/m);
+  if (envVars) {
+    if (/["']AGENTHOP_LAUNCH_ID["']/.test(envVars[1])) return undefined; // already forwards it
+    const inner = envVars[1].trim();
+    const list = inner ? `[${inner.replace(/,\s*$/, "")}, "AGENTHOP_LAUNCH_ID"]` : `["AGENTHOP_LAUNCH_ID"]`;
+    const newBlock = block.replace(/^([ \t]*env_vars[ \t]*=[ \t]*)\[[^\]]*\]/m, `$1${list}`);
+    return text.slice(0, start) + newBlock + text.slice(end);
+  }
+  // No env_vars line — add one right after the header.
+  return text.slice(0, afterHeader) + `env_vars = ["AGENTHOP_LAUNCH_ID"]\n` + text.slice(afterHeader);
+}
+
+/** Write a file via a sibling temp + rename, so a short/failed write never truncates the original and a
+ *  symlink is replaced rather than its target overwritten. Same idiom as writeOpencodePlugin/setTeam. */
+function placeFile(file: string, content: string): void {
+  mkdirSync(dirname(file), { recursive: true });
+  const staged = `${file}.new`;
+  rmSync(staged, { force: true });
+  writeFileSync(staged, content);
+  try {
+    renameSync(staged, file);
+  } catch (error) {
+    rmSync(staged, { force: true });
+    throw error;
+  }
 }
 
 /**
