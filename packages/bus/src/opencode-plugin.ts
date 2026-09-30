@@ -11,7 +11,7 @@ import { bridgeSocketPath, startLocalBus, type Inbound, type LocalBus } from "./
 import { formatHandoff } from "./handoff.js";
 import { sessionTitle, type SelfInfo } from "./label.js";
 import { resolvePeer, type UnifiedPeer } from "./resolve.js";
-import { despawnAgent, readRegistry, spawnAgent } from "./spawn.js";
+import { despawnAgent, isLaunchAlive, readRegistry, spawnAgent } from "./spawn.js";
 import { loadTeam } from "./team.js";
 import { omniwmctl, splitArgs } from "./wm.js";
 
@@ -256,6 +256,9 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
       pid: process.pid,
       title: sessionTitle("opencode", cwd, sessionID),
       startedAt: Date.now(),
+      // If this OpenCode server was itself spawned by agenthop_spawn, republish its launchId so despawn
+      // can confirm ownership before closing its window (see spawn.ts). Undefined otherwise.
+      launchId: process.env.AGENTHOP_LAUNCH_ID?.trim() || undefined,
     };
     const b = { self, queue: [] as Inbound[] } as SessionBus;
     const deliver = (from: string, text: string): void => {
@@ -369,7 +372,7 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
         description: "List the sub-agent windows agenthop dispatched on this machine (window id, tool, cwd) — the only ones agenthop_despawn may close.",
         args: {},
         async execute(): Promise<string> {
-          const rows = readRegistry().map((r) => `  ${r.windowId ?? "(pending)"}  ${r.tool}  ${r.cwd}`);
+          const rows = readRegistry().map((r) => `  ${r.windowId ?? "(pending)"}  ${r.launchId}  ${r.tool}  ${r.cwd}`);
           return rows.length ? `spawned windows:\n${rows.join("\n")}` : "No agents spawned by agenthop on this machine.";
         },
       }),
@@ -377,10 +380,11 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
         description:
           "Close a sub-agent window agenthop spawned, by its window id (from agenthop_spawn / agenthop_spawned). Refuses any id agenthop did not spawn — never closes a session you opened yourself.",
         args: { window_id: tool.schema.string().describe("The window id agenthop_spawn returned (see agenthop_spawned)") },
-        async execute({ window_id }: { window_id: string }): Promise<string> {
-          // Only close while a live bus peer still carries this window's launchId (reusable id → id
-          // alone is not ownership proof; see spawn.ts).
-          const r = await despawnAgent(window_id, { isAlive: (lid) => b.local.peers().some((p) => p.launchId === lid) });
+        async execute({ window_id }: { window_id: string }, context: ToolContext): Promise<string> {
+          // Only close while a live bus peer still carries this window's launchId AND its process is up
+          // (reusable id → id alone is not ownership proof; see spawn.ts / isLaunchAlive).
+          const b = busFor(context.sessionID);
+          const r = await despawnAgent(window_id, { isAlive: (lid) => isLaunchAlive(b.local.peers(), lid) });
           return r.note;
         },
       }),

@@ -9,6 +9,7 @@ import {
   codexTrustArgs,
   diffNewWindowIds,
   forgetSpawn,
+  isLaunchAlive,
   isSpawnedWindow,
   launchId,
   moveArgv,
@@ -102,13 +103,31 @@ describe("moveArgv", () => {
 });
 
 describe("codexTrustArgs", () => {
-  it("pre-trusts via a per-invocation -c override (no global config write)", () => {
-    expect(codexTrustArgs("/a/b")).toEqual(["-c", 'projects."/a/b".trust_level="trusted"']);
+  it("pre-trusts via a per-invocation inline-table -c override (no global config write)", () => {
+    // Must be an inline table: codex's -c key parser splits on `.` and ignores quotes, so a quoted
+    // dotted key (projects."x".trust_level) misparses and does NOT trust.
+    expect(codexTrustArgs("/a/b")).toEqual(["-c", 'projects={"/a/b"={trust_level="trusted"}}']);
   });
 
-  it("TOML-escapes a nasty path so it cannot break the override or inject config", () => {
+  it("TOML-escapes a nasty path (quotes, backslash, control chars) so it cannot break the override", () => {
     expect(tomlBasicString('/a"b\\c\n')).toBe('/a\\"b\\\\c\\n');
-    expect(codexTrustArgs('/a"b')).toEqual(["-c", 'projects."/a\\"b".trust_level="trusted"']);
+    expect(tomlBasicString("\u0001")).toBe("\\u0001");
+    expect(codexTrustArgs('/a"b')).toEqual(["-c", 'projects={"/a\\"b"={trust_level="trusted"}}']);
+  });
+});
+
+describe("isLaunchAlive", () => {
+  const peers = [
+    { via: "local", launchId: "L1", pid: 111 },
+    { via: "relay", launchId: "L3", pid: 333 },
+  ];
+  it("true only for a LOCAL peer whose pid is alive now (bypasses roster drop-lag)", () => {
+    expect(isLaunchAlive(peers, "L1", (pid) => pid === 111)).toBe(true);
+    // Still listed in the roster but its process already exited (the ~25ms lag) ⇒ not alive ⇒ no close.
+    expect(isLaunchAlive(peers, "L1", () => false)).toBe(false);
+    expect(isLaunchAlive(peers, "unknown", () => true)).toBe(false);
+    // A relay peer is on another machine we cannot despawn — never counts, even if "alive".
+    expect(isLaunchAlive(peers, "L3", () => true)).toBe(false);
   });
 });
 

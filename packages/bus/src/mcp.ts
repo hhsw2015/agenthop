@@ -4,7 +4,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import { startBusCore, type BusCore, type UnifiedPeer } from "./core.js";
 import { formatHandoff } from "./handoff.js";
-import { despawnAgent, readRegistry, spawnAgent } from "./spawn.js";
+import { despawnAgent, isLaunchAlive, readRegistry, spawnAgent } from "./spawn.js";
 import { omniwmctl, splitArgs } from "./wm.js";
 import { version } from "./version.js";
 
@@ -148,7 +148,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
     },
     async (_args, extra) => {
       noteCodex(core, extra);
-      const rows = readRegistry().map((r) => `  ${r.windowId ?? "(pending)"}  ${r.tool}  ${r.cwd}`);
+      const rows = readRegistry().map((r) => `  ${r.windowId ?? "(pending)"}  ${r.launchId}  ${r.tool}  ${r.cwd}`);
       return reply(rows.length ? `spawned windows:\n${rows.join("\n")}` : "No agents spawned by agenthop on this machine.");
     },
   );
@@ -164,7 +164,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       noteCodex(core, extra);
       // Ownership proof: only close while a live bus peer still carries this window's launchId (see
       // spawn.ts). A Ghostty window id is a reusable object address, so the id alone is not enough.
-      const result = await despawnAgent(window_id, { isAlive: (lid) => core.peers().some((p) => p.launchId === lid) });
+      const result = await despawnAgent(window_id, { isAlive: (lid) => isLaunchAlive(core.peers(), lid) });
       return result.ok ? reply(result.note) : failure(result.note);
     },
   );

@@ -38,6 +38,10 @@ export const AGENTS: Record<string, string[]> = {
  * as its parent. Auth/config vars (CODEX_HOME, AGENTHOP_TEAM, ...) are deliberately NOT stripped.
  */
 export const SCRUB_ENV = [
+  // tool markers detectTool() keys on — a child that inherits a parent's marker would mis-identify as
+  // that tool (e.g. codex spawned from a claude window would look like claude).
+  "CLAUDECODE",
+  "CLAUDE_CODE_ENTRYPOINT",
   "CLAUDE_CODE_SESSION_ID",
   "CLAUDE_CODE_MESSAGING_SOCKET",
   "CLAUDE_CODE_MESSAGING_TOKEN",
@@ -145,25 +149,36 @@ export function moveArgv(id: string, workspace: string): string[] {
   return ["window", "move-to-workspace", id, workspace];
 }
 
-/** TOML basic-string escaping for a path used inside a codex `-c` config override. Pure. */
+/** Full TOML basic-string escaping (quotes, backslash, and every control char) for a path embedded in
+ *  a codex `-c` inline-table override. Pure. */
 export function tomlBasicString(s: string): string {
-  return s
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "\\r")
-    .replace(/\t/g, "\\t");
+  let out = "";
+  for (const ch of s) {
+    const c = ch.codePointAt(0)!;
+    if (ch === "\\") out += "\\\\";
+    else if (ch === '"') out += '\\"';
+    else if (ch === "\b") out += "\\b";
+    else if (ch === "\t") out += "\\t";
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\f") out += "\\f";
+    else if (ch === "\r") out += "\\r";
+    else if (c < 0x20 || c === 0x7f) out += `\\u${c.toString(16).padStart(4, "0").toUpperCase()}`;
+    else out += ch;
+  }
+  return out;
 }
 
 /**
  * codex CLI args that pre-trust `cwd` via a per-invocation config override, so the spawned session
  * skips the first-run "Trust this folder?" prompt WITHOUT mutating the user's global ~/.codex/config.toml.
- * `-c` produces the same effective config as a `[projects."<cwd>"] trust_level="trusted"` file entry
- * (verified: codex 0.159.2 accepts a quoted path key), but per-invocation, so there is no file to
- * corrupt, no concurrent-write race, and no config-injection surface. Pure.
+ * The value MUST be a full inline table: codex's `-c` key parser splits on `.` and does NOT honor quotes,
+ * so `projects."<path>".trust_level=...` misparses and does NOT trust — the working form (verified on
+ * 0.159.2 by isolating the effective feature list) sets the whole `projects` table as an inline-table
+ * value, where the path is a quoted TOML key. Per-invocation ⇒ no file to corrupt, no write race, no
+ * config-injection surface. Pure.
  */
 export function codexTrustArgs(cwd: string): string[] {
-  return ["-c", `projects."${tomlBasicString(cwd)}".trust_level="trusted"`];
+  return ["-c", `projects={"${tomlBasicString(cwd)}"={trust_level="trusted"}}`];
 }
 
 function ghosttyPresent(): boolean {
@@ -207,14 +222,36 @@ export function readRegistry(home: string = homedir()): SpawnRecord[] {
   }
   return out;
 }
-export function recordSpawn(rec: SpawnRecord, home: string = homedir()): void {
+export function recordSpawn(rec: SpawnRecord, home: string = homedir()): boolean {
   try {
     const p = recordFile(home, rec.launchId);
     mkdirSync(path.dirname(p), { recursive: true });
     writeFileSync(p, `${JSON.stringify(rec, null, 2)}\n`); // one file per launch — no cross-process RMW
+    return true;
   } catch {
-    // best effort; a lost record just means despawn won't manage that window
+    return false;
   }
+}
+
+type AliveProbe = (pid: number | undefined) => boolean;
+function defaultPidAlive(pid: number | undefined): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM"; // exists but not ours to signal ⇒ still alive
+  }
+}
+
+/**
+ * Whether a LOCAL peer still carries `launchId` AND its OS process is alive right now. The pid probe
+ * bypasses the broker roster's drop lag — a dead session can linger in the roster for tens of ms, and a
+ * bare "is it in the roster" check would then let despawn close a window whose process already exited.
+ * Same-machine only (a relay peer is on a machine we cannot despawn). Pure given the probe (injectable).
+ */
+export function isLaunchAlive(peers: Array<{ via?: string; launchId?: string; pid?: number }>, launchId: string, pidAlive: AliveProbe = defaultPidAlive): boolean {
+  return peers.some((p) => p.via === "local" && p.launchId === launchId && pidAlive(p.pid));
 }
 export function isSpawnedWindow(windowId: string, home: string = homedir()): boolean {
   return readRegistry(home).some((r) => r.windowId === windowId);
@@ -250,8 +287,9 @@ async function omniwmWindowIds(bin: string): Promise<string[] | undefined> {
   const r = await runOmniwmctl(bin, ["query", "windows", "--app", "Ghostty", "--fields", "id", "--format", "json"], 3000);
   if (r.code !== 0) return undefined; // a FAILED query is unknown, not "no windows" — never treat as []
   try {
-    const ws = (JSON.parse(r.stdout) as { result?: { payload?: { windows?: Array<{ id?: string }> } } })?.result?.payload?.windows ?? [];
-    return ws.map((w) => w.id).filter((id): id is string => typeof id === "string");
+    const ws = (JSON.parse(r.stdout) as { result?: { payload?: { windows?: unknown } } })?.result?.payload?.windows;
+    if (!Array.isArray(ws)) return undefined; // exit 0 but no windows array = unknown snapshot, not "none"
+    return ws.map((w) => (w as { id?: unknown })?.id).filter((id): id is string => typeof id === "string");
   } catch {
     return undefined;
   }
@@ -298,7 +336,10 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
 
   // Record the launch REQUEST before any side effect, so a window opened but not confirmed (lost or
   // timed-out AppleScript reply) is still discoverable in agenthop_spawned rather than a silent orphan.
-  recordSpawn({ windowId: null, launchId: lid, tool: input.tool, cwd, ts: Date.now() });
+  // If we cannot even record it, do NOT open a window — an untracked window despawn could never close.
+  if (!recordSpawn({ windowId: null, launchId: lid, tool: input.tool, cwd, ts: Date.now() })) {
+    return { ok: false, arranged: false, launchId: lid, note: `Could not write a launch record under ~/.agenthop/spawned; not opening a window (an untracked window could never be despawned). Check that ~/.agenthop is writable.` };
+  }
 
   const bin = omniwmctlBin(env);
   const canArrange = bin ? await omniwmReady(bin) : false;
@@ -338,7 +379,7 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
   if (mv.code !== 0) {
     return { ok: true, arranged: false, windowId, omniwmId, workspace, launchId: lid, note: `Launched ${input.tool}; move to ${workspace} failed (${(mv.stderr || mv.stdout).trim()}). ${tail}` };
   }
-  return { ok: true, arranged: true, windowId, omniwmId, workspace, launchId: lid, note: `Launched ${input.tool} and moved it to workspace ${workspace}. ${tail}` };
+  return { ok: true, arranged: true, windowId, omniwmId, workspace, launchId: lid, note: `Launched ${input.tool} and moved the newly-appeared window to workspace ${workspace} (best-effort: matched as the single new window, not a hard binding). ${tail}` };
 }
 
 export type DespawnOptions = { isAlive?: (launchId: string) => boolean; home?: string };
