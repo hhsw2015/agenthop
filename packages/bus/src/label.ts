@@ -26,7 +26,23 @@ export type SelfInfo = {
   /** Human label for the roster, e.g. "codex:agenthop". */
   title: string;
   startedAt: number;
+  /**
+   * Self-reported work state, for orchestration (an idea borrowed from herdr). A session sets its own
+   * status (via agenthop_status / hooks); it rides the roster like the rest of SelfInfo. `statusSeq` is
+   * a per-session monotonic counter so an out-of-order or duplicate report is dropped (never applied on
+   * top of a newer one). All optional: absent means "unknown".
+   */
+  status?: AgentStatus;
+  statusSeq?: number;
+  statusText?: string;
+  statusAt?: number;
 };
+
+/** Working = actively doing a turn; idle = waiting for its next instruction; blocked = needs input
+ *  (a permission/approval/question prompt); unknown = not reported. */
+export type AgentStatus = "working" | "idle" | "blocked" | "unknown";
+
+export const AGENT_STATUSES: readonly AgentStatus[] = ["working", "idle", "blocked", "unknown"];
 
 /** The host's native session id if it publishes one in the env at startup. Extensible per tool. */
 export function nativeSessionId(env: NodeJS.ProcessEnv = process.env): string | undefined {

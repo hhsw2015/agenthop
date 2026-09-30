@@ -1,4 +1,4 @@
-import { selfInfo, sessionTitle, type SelfInfo } from "./label.js";
+import { selfInfo, sessionTitle, type AgentStatus, type SelfInfo } from "./label.js";
 import { startLocalBus, type LocalBus } from "./broker.js";
 import { startRelay, type Relay } from "./relay.js";
 import { pushToHost } from "./push.js";
@@ -25,6 +25,12 @@ export type BusCore = {
   /** Record this Codex thread id (from x-codex-turn-metadata) so inbound can be pushed to it. */
   noteThread(id: string): void;
   status(): string;
+  /** Set this session's own work state (working|idle|blocked|unknown); it rides the roster to peers.
+   *  A monotonic `seq` (explicit or auto-incremented) drops a stale/duplicate report. */
+  setStatus(state: AgentStatus, opts?: { seq?: number; text?: string }): { ok: boolean; seq?: number; ignored?: boolean };
+  /** Wait until `target` reaches one of `until` states (or vanishes / times out). Pins the resolved
+   *  session's stable identity so a different session cannot satisfy the wait. */
+  waitForStatus(target: string, until: AgentStatus[], timeoutMs: number): Promise<{ status?: AgentStatus; reached: boolean; gone?: boolean; error?: string; label?: string }>;
   close(): Promise<void>;
 };
 
@@ -50,6 +56,11 @@ export function codexDeliveryThread(
 export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const self = selfInfo();
   const queue: BusMessage[] = [];
+  // Work-status is per SESSION IDENTITY, not per MCP-server process: one Codex daemon-backed server can
+  // adopt several thread identities over its life (see learnStableId), and each must keep its own status
+  // and its own monotonic seq — otherwise thread A's seq would gate thread B's reports.
+  type StatusEntry = { status: AgentStatus; seq: number; text?: string; at: number };
+  const statusByIdentity = new Map<string, StatusEntry>();
   // The Codex thread currently driving this (daemon-level) MCP server, learned from each call's
   // x-codex-turn-metadata. Most precise; the daemon client is the fallback for receive-first.
   let ownCodexThread: string | undefined;
@@ -96,9 +107,20 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // always wins: it may correct an earlier guess, and it keeps the published identity EQUAL to the
     // real delivery target — a stale stableId while delivery moved to another thread was the bug.
     if (!authoritative && self.stableId) return;
+    const hadStableId = self.stableId !== undefined;
+    const oldKey = self.stableId ?? self.id;
     self.stableId = id;
     self.title = sessionTitle(self.tool, self.cwd, id);
     stableIdAuthoritative = authoritative;
+    // Status follows the identity. On the FIRST adoption (bootstrap: no stableId yet) carry a status the
+    // same run already reported under its per-run id; on a later thread SWITCH (A→B) do NOT carry — keep
+    // identities isolated. Then publish the new identity's own status.
+    if (!hadStableId && statusByIdentity.has(oldKey) && !statusByIdentity.has(id)) statusByIdentity.set(id, statusByIdentity.get(oldKey)!);
+    const e = statusByIdentity.get(id);
+    self.status = e?.status;
+    self.statusSeq = e?.seq;
+    self.statusText = e?.text;
+    self.statusAt = e?.at;
     local.updateSelf(self);
     relay?.updateSelf(self);
   };
@@ -107,7 +129,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
 
   const unified = (): UnifiedPeer[] => {
     const out = new Map<string, UnifiedPeer>();
-    for (const p of local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid });
+    for (const p of local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid, status: p.status, statusSeq: p.statusSeq, statusText: p.statusText, statusAt: p.statusAt });
     if (relay) {
       for (const p of relay.roster()) if (!out.has(p.id)) out.set(p.id, p);
     }
@@ -145,6 +167,53 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
         batch = queue.splice(0, queue.length);
       }
       return batch;
+    },
+    setStatus(state, opts) {
+      const key = self.stableId ?? self.id;
+      const prev = statusByIdentity.get(key);
+      const seq = opts?.seq;
+      // Monotonic guard (per identity): never apply a report that is not newer than the last.
+      if (seq !== undefined && prev && seq <= prev.seq) return { ok: false, ignored: true, seq: prev.seq };
+      // Auto-increment must strictly advance and stay a safe integer.
+      if (seq === undefined && prev && prev.seq >= Number.MAX_SAFE_INTEGER) return { ok: false, ignored: true, seq: prev.seq };
+      const entry: StatusEntry = { status: state, seq: seq ?? (prev?.seq ?? 0) + 1, text: opts?.text?.trim() || undefined, at: Date.now() };
+      statusByIdentity.set(key, entry);
+      self.status = entry.status;
+      self.statusSeq = entry.seq;
+      self.statusText = entry.text;
+      self.statusAt = entry.at;
+      local.updateSelf(self);
+      relay?.updateSelf(self);
+      return { ok: true, seq: entry.seq };
+    },
+    async waitForStatus(target, until, timeoutMs) {
+      const peer = resolve(target);
+      if ("error" in peer) return { reached: false, error: peer.error };
+      // Pin the resolved EXACT run (per-run id) AND the native identity it represented at resolve time.
+      // The run id survives a restart-as-new check; the identity guard handles a multiplexing run that
+      // switches to another native thread mid-wait — its (different identity's) status must not satisfy us.
+      const pin = peer.id;
+      let pinIdentity = peer.stableId; // undefined if it had not adopted a durable identity yet
+      const label = labelFor(peer.id);
+      const wanted = new Set(until);
+      const deadline = Date.now() + timeoutMs;
+      let last: AgentStatus | undefined;
+      for (;;) {
+        const now = unified().find((p) => p.id === pin);
+        if (!now) return { reached: false, gone: true, label };
+        // Lock onto the first concrete identity observed if we resolved before adoption — otherwise a
+        // later switch to a DIFFERENT identity would still satisfy (pinIdentity===undefined forever).
+        if (pinIdentity === undefined && now.stableId !== undefined) pinIdentity = now.stableId;
+        // Read the published status only while the run still represents the pinned identity. A switch
+        // A→B is skipped (kept waiting), not matched.
+        const sameIdentity = pinIdentity === undefined || now.stableId === undefined || now.stableId === pinIdentity;
+        if (sameIdentity) {
+          last = now.status ?? "unknown"; // an unreported peer is "unknown", and matchable as such
+          if (wanted.has(last)) return { reached: true, status: last, label };
+        }
+        if (Date.now() >= deadline) return { reached: false, status: last, label };
+        await delay(200);
+      }
     },
     status() {
       const relayUrl = options.relay ?? process.env.AGENTHOP_RELAY ?? "default relay";

@@ -26,6 +26,8 @@ export function busInstructions(): string {
 - agenthop_peers(): list sessions reachable now, each shown by its handle (tool:dir-<shortSessionId>, e.g. codex:Work-01a0ead5). Same-machine sessions appear automatically; other machines appear when a shared AGENTHOP_TEAM is set.
 - agenthop_send(to, text): message a session by its handle (a prefix like "codex:Work" works when unambiguous; the native session id also works). The handle is restart-stable, so you can reach the same session again after it restarts without being told.
 - agenthop_handoff(to, summary, next?): hand a task to another session so it continues where you left off — you write the summary, the bus attaches a git snapshot of your working directory. Use it instead of send when passing work along, not just chatting.
+- agenthop_report_status(state): report THIS session's work state (working/idle/blocked/unknown) to peers; shows in agenthop_peers.
+- agenthop_wait_peer(to, until?): wait until another session reaches a state — e.g. a sub-agent you dispatched goes idle (done) or blocked (needs input).
 - agenthop_recv(timeout_seconds): fallback only — see below.
 - agenthop_spawn(tool, cwd?, workspace?): launch another agent (claude/codex/opencode) in a VISIBLE window on this machine; it joins the bus on its own, then hand it work with agenthop_handoff. Any session can dispatch — a decentralized, visible orchestration center.
 - agenthop_wm(args): drive the OmniWM window manager (macOS) to arrange windows — a passthrough to omniwmctl (e.g. "query windows", "window move-to-workspace <id> 2").
@@ -106,6 +108,47 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       const batch = await core.recv(secs * 1000);
       if (batch.length === 0) return reply(`No messages in ${secs}s; call agenthop_recv again to keep waiting.`);
       return reply(batch.map((m) => `[from ${m.fromLabel}${m.via === "relay" ? "" : ""}] ${m.text}`).join("\n\n"));
+    },
+  );
+
+  server.registerTool(
+    "agenthop_report_status",
+    {
+      description:
+        "Report THIS session's work state to peers (working | idle | blocked | unknown). It shows in agenthop_peers and lets a dispatcher agenthop_wait_peer on it. `blocked` means you need input (a permission/approval/question). Usually driven by hooks, but an agent may set it directly.",
+      inputSchema: {
+        state: z.enum(["working", "idle", "blocked", "unknown"]).describe("This session's work state"),
+        note: z.string().optional().describe("Optional short detail, e.g. what you're blocked on"),
+        seq: z.number().int().optional().describe("Optional monotonic sequence (e.g. a timestamp); a report not newer than the last is ignored"),
+      },
+    },
+    async ({ state, note, seq }, extra) => {
+      noteCodex(core, extra);
+      const r = core.setStatus(state, { text: note, seq });
+      return reply(r.ok ? `Status set to ${state} (seq ${r.seq}).` : `Ignored: a newer status (seq ${r.seq}) is already set.`);
+    },
+  );
+
+  server.registerTool(
+    "agenthop_wait_peer",
+    {
+      description:
+        "Wait until another session reaches a work state — e.g. wait for a sub-agent you dispatched to go idle (done) or blocked (needs input). Returns as soon as it reaches one of the states, or when it vanishes or the timeout elapses. Pins the target's exact run so a different/restarted session can't satisfy the wait.",
+      inputSchema: {
+        to: z.string().describe("Target session: handle/prefix or id (see agenthop_peers)"),
+        until: z.array(z.enum(["working", "idle", "blocked", "unknown"])).optional().describe("States to wait for (default: idle, blocked)"),
+        timeout_seconds: z.number().int().min(1).max(MAX_WAIT_S).optional().describe(`Seconds to wait, ${DEFAULT_WAIT_S} by default`),
+      },
+    },
+    async ({ to, until, timeout_seconds }, extra) => {
+      noteCodex(core, extra);
+      const states = until && until.length ? until : (["idle", "blocked"] as const);
+      const secs = timeout_seconds ?? DEFAULT_WAIT_S;
+      const r = await core.waitForStatus(to, [...states], secs * 1000);
+      if (r.error) return failure(`${r.error}\n${roster(core.peers(), core.self.id, core.status())}`);
+      if (r.gone) return reply(`${r.label ?? to} is gone (left the bus) before reaching ${states.join("/")}.`);
+      if (r.reached) return reply(`${r.label ?? to} is now ${r.status}.`);
+      return reply(`Timed out after ${secs}s; ${r.label ?? to} is ${r.status ?? "unknown"}. Call agenthop_wait_peer again to keep waiting.`);
     },
   );
 
@@ -199,9 +242,11 @@ function roster(peers: UnifiedPeer[], selfId: string, status: string): string {
     const mine = p.id === selfId ? " (you)" : "";
     const where = p.via === "relay" ? `@${p.machine ?? "remote"}` : "";
     // Lead with the readable, restart-stable handle (title = tool:dir-<shortSessionId>) — that is what
-    // you address. cwd for context; the per-run id/pid in parens are only to pick a live session now.
+    // you address. A [state] badge shows the self-reported work state. cwd for context; the per-run
+    // id/pid in parens are only to pick a live session now.
+    const state = p.status ? `[${p.status}${p.statusText ? `: ${p.statusText}` : ""}]` : "[unknown]";
     const run = `${p.id.slice(0, 8)}${p.pid ? ` pid ${p.pid}` : ""}`;
-    return `  ${p.title}${where}${mine}  ${p.cwd}  (run ${run})`;
+    return `  ${p.title}${where}${mine}  ${state}  ${p.cwd}  (run ${run})`;
   });
   return `${status}\n${rows.length ? rows.join("\n") : "  (no sessions)"}`;
 }
