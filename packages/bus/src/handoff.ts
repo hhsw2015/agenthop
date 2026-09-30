@@ -42,9 +42,16 @@ export function gitSnapshotText(cwd: string): string | undefined {
   if (head.ok && head.out.trim()) {
     headLine = `${branchName ?? "(detached)"} @ ${head.out.trim()}`;
   } else {
-    // Unborn HEAD (a fresh repo with no commit yet): the rev-parses fail, but status still matters.
-    const sym = git(["symbolic-ref", "--short", "HEAD"]);
-    headLine = `${sym.ok && sym.out.trim() ? sym.out.trim() : "(no branch)"} @ (no commits yet)`;
+    // rev-parse HEAD failed. Only call it "no commits yet" when POSITIVELY confirmed unborn — HEAD is a
+    // symbolic ref to a branch AND the repo has zero commits anywhere. A broken HEAD (e.g. a corrupt
+    // branch ref) fails both checks and must not be misreported as unborn; say "unknown" instead.
+    const sym = git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    const anyCommit = git(["rev-list", "-n", "1", "--all"]);
+    if (sym.ok && sym.out.trim() && anyCommit.ok && anyCommit.out.trim() === "") {
+      headLine = `${sym.out.trim()} @ (no commits yet)`;
+    } else {
+      headLine = "HEAD: unknown";
+    }
   }
 
   const status = git(["status", "--porcelain"]);

@@ -69,4 +69,27 @@ describe("handoff", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("does not call a broken HEAD 'no commits yet'", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "ah-broken-"));
+    const g = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "ignore"] });
+    try {
+      g("init", "-q");
+      g("config", "user.email", "t@t");
+      g("config", "user.name", "t");
+      writeFileSync(path.join(dir, "a.txt"), "hi\n");
+      g("add", ".");
+      g("commit", "-qm", "init");
+      // Corrupt the current branch ref so HEAD is broken (has commits, but cannot resolve) — not unborn.
+      const branch = execFileSync("git", ["branch", "--show-current"], { cwd: dir, encoding: "utf8" }).trim();
+      rmSync(path.join(dir, ".git", "packed-refs"), { force: true });
+      writeFileSync(path.join(dir, ".git", "refs", "heads", branch), "invalid-ref");
+      const snap = gitSnapshotText(dir);
+      expect(snap).toBeDefined(); // still inside a work tree
+      expect(snap!).toContain("HEAD: unknown");
+      expect(snap!).not.toContain("no commits yet");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
