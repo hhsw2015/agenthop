@@ -6,6 +6,7 @@ import {
   AGENTS,
   buildAppleScript,
   buildCommand,
+  claimOwnSpawn,
   codexTrustArgs,
   diffNewWindowIds,
   forgetSpawn,
@@ -78,11 +79,9 @@ describe("buildAppleScript", () => {
     expect(s).toContain('set initial working directory of c to "/tmp/proj"');
     expect(s).toContain('set environment variables of c to {"PATH=/x", "AGENTHOP_LAUNCH_ID=abc"}');
     expect(s).toContain("new window with configuration c");
-    // Surface id from a single-terminal SNAPSHOT of the new window (never mis-bind a raced-in split),
-    // read in the SAME script that creates the window — no separate query to race.
-    expect(s).toContain("set terms to terminals of w");
-    expect(s).toContain("if (count of terms) is 1 then");
-    expect(s).toContain("return (id of w) & tab & sid");
+    // The dispatcher only returns the window id; the surface identity is claimed by the child itself.
+    expect(s).toContain("return id of w");
+    expect(s).not.toContain("terminals of w");
   });
 
   it("escapes quotes/backslashes so a crafted cwd cannot break out of the string", () => {
@@ -154,6 +153,36 @@ describe("spawn registry (per-launch files; only despawn windows we spawned)", (
       recordSpawn({ windowId: "w-ok", surfaceId: "UUID-OK", launchId: "ok", tool: "codex", cwd: "/x", ts: 1 }, home);
       writeFileSync(path.join(dir, "bad.json"), JSON.stringify({ windowId: "w-bad", surfaceId: 73, launchId: "bad", tool: "codex", cwd: "/y", ts: 2 }));
       expect(readRegistry(home).map((r) => r.launchId)).toEqual(["ok"]); // the surfaceId:73 record is skipped
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("claimOwnSpawn (child self-registers its authoritative surface UUID)", () => {
+  it("writes surfaceId + claimed=true onto its own launch record, merging with the pending record", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "ah-claim-"));
+    try {
+      const lid = "agenthop-spawn:codex:abcd1234";
+      // dispatcher's pending record (window filled, not yet claimed)
+      recordSpawn({ windowId: "win-1", surfaceId: null, launchId: lid, tool: "codex", cwd: "/proj", ts: 5 }, home);
+      const ok = await claimOwnSpawn({ home, env: { AGENTHOP_LAUNCH_ID: lid } as NodeJS.ProcessEnv, discover: async () => "SURFACE-UUID-1" });
+      expect(ok).toBe(true);
+      const rec = recordForWindow("win-1", home)!;
+      expect(rec.surfaceId).toBe("SURFACE-UUID-1");
+      expect(rec.claimed).toBe(true);
+      expect(rec.cwd).toBe("/proj"); // merged from the pending record, not clobbered
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("is a no-op when not a spawned session, or when discovery fails", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "ah-claim-"));
+    try {
+      expect(await claimOwnSpawn({ home, env: {} as NodeJS.ProcessEnv, discover: async () => "X" })).toBe(false); // no launch id
+      expect(await claimOwnSpawn({ home, env: { AGENTHOP_LAUNCH_ID: "agenthop-spawn:codex:z" } as NodeJS.ProcessEnv, discover: async () => undefined })).toBe(false); // discovery failed
+      expect(readRegistry(home)).toEqual([]);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

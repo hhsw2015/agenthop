@@ -4,7 +4,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import { startBusCore, type BusCore, type UnifiedPeer } from "./core.js";
 import { formatHandoff } from "./handoff.js";
-import { despawnAgent, readRegistry, spawnAgent } from "./spawn.js";
+import { claimOwnSpawn, despawnAgent, readRegistry, spawnAgent } from "./spawn.js";
 import { omniwmctl, splitArgs } from "./wm.js";
 import { version } from "./version.js";
 
@@ -36,6 +36,10 @@ Incoming messages arrive on their own: on agents with a native inbox (e.g. Claud
 /** Put the bus tools on an existing server. Returns a cleanup to run when the server closes. */
 export function registerBusTools(server: McpServer, options: BusMcpOptions = {}): () => void {
   const core: BusCore = startBusCore(options);
+
+  // If THIS session was launched by agenthop_spawn, self-register the Ghostty surface it runs in so
+  // despawn has an authoritative (agent-claimed) target. Fire-and-forget; a no-op unless spawned.
+  void claimOwnSpawn().catch(() => {});
 
   server.registerTool(
     "agenthop_peers",

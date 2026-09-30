@@ -17,24 +17,21 @@ import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
  * (claude --dangerously-skip-permissions, codex --dangerously-bypass-approvals-and-sandbox,
  * opencode --auto). Override the flags per tool with AGENTHOP_SPAWN_ARGS_<TOOL>.
  *
- * SAFETY — what despawn actually does (stated without over-claiming):
- *   - An identifier not matching a recorded launch is refused. A matching record closes ONLY that
- *     record's terminal SURFACE, by the surface's Ghostty UUID — never a whole window by its window id
- *     (a window id is an ObjectIdentifier address Ghostty reuses after a window closes; a surface UUID
- *     is unique and not reused). If that surface is gone, nothing is closed.
- *   - So despawn never closes a window by a reusable id, and a session with an id agenthop never
- *     recorded is refused. What it CANNOT fully guarantee is provenance of the recorded surface itself
- *     (below).
- * KNOWN RESIDUAL (Phase-1 limitation, deferred to Phase 2): the surface UUID is captured right after
- * creation from a snapshot of the new window's terminals, and only when there is exactly one — but a
- * single member proves uniqueness, not that it is the surface we created. If the window's terminal set
- * changes between creation and the snapshot (e.g. a concurrent split then a close of our initial
- * surface, or the window id having been reused), the snapshot can bind a surface that is not ours, which
- * despawn would then close. The frequency of this race is unverified. env/command are not readable per
- * live terminal, so the dispatcher cannot verify provenance here. The intended closure is a Phase-2
- * claim: the spawned child (the authoritative owner of its surface) self-registers its surface UUID and
- * despawn closes only a child-claimed surface; AGENTHOP_LAUNCH_ID is the seed for that claim and is
- * recorded so agenthop_spawned can tell concurrent launches apart.
+ * SAFETY — despawn closes ONLY a surface the spawned agent CLAIMED as its own, so it can never close a
+ * surface the dispatcher merely guessed at:
+ *   - The dispatcher cannot prove which surface it created: `new window` returns a window, not a surface,
+ *     and a terminal's env/command are not readable, so any read-back from the window's terminal set can
+ *     be fooled by a concurrent change (that was the old capture residual).
+ *   - So provenance comes from the CHILD, the authoritative owner of its own surface. On startup a
+ *     spawned bus node (one carrying our injected AGENTHOP_LAUNCH_ID) finds its controlling tty (via ps,
+ *     walking ppid across the MCP/pipe boundary), maps that tty to its Ghostty surface UUID
+ *     (`terminal whose tty is …`, requiring a unique match), and records that UUID with claimed=true on
+ *     its own launch record. This binds (this launch)→(the real surface it runs in) from the one process
+ *     that cannot be wrong about it.
+ *   - despawn closes `terminal whose id is <claimed UUID>` (a UUID is unique and never reused) and ONLY
+ *     when claimed=true. An unclaimed record (agent not up yet, or killed before claiming) is refused,
+ *     never closed by the reusable window id. If the surface is gone, nothing is closed.
+ * Net: a surface an agenthop-spawned agent never claimed is never closed by despawn.
  */
 
 export const AGENTS: Record<string, string[]> = {
@@ -121,11 +118,9 @@ export function buildCommand(argv: string[], scrub: string[] = SCRUB_ENV): strin
 }
 
 /**
- * Build the osascript that opens one Ghostty window and returns "<windowId>\t<surfaceUUID>". The surface
- * id is taken from a SNAPSHOT of the new window's terminals and ONLY when there is exactly one. A fresh
- * window normally has just its initial surface, so count==1 is the common, unambiguous case; count!=1
- * (e.g. a concurrent split raced a second leaf in) returns an empty surface id rather than pick one.
- * Note: count==1 proves uniqueness, not provenance — see the SAFETY note above for the residual. Pure.
+ * Build the osascript that opens one Ghostty window and returns its window id. The surface identity is
+ * NOT read back here (a dispatcher read-back cannot prove provenance) — the spawned agent claims its own
+ * surface UUID later via claimOwnSpawn. Pure.
  */
 export function buildAppleScript(cfg: { command: string; cwd: string; env: string[] }): string {
   const envList = cfg.env.map((e) => `"${asEsc(e)}"`).join(", ");
@@ -137,13 +132,7 @@ export function buildAppleScript(cfg: { command: string; cwd: string; env: strin
     `  set environment variables of c to {${envList}}`,
     "  set wait after command of c to true",
     "  set w to new window with configuration c",
-    "  set terms to terminals of w",
-    "  if (count of terms) is 1 then",
-    "    set sid to id of (item 1 of terms)",
-    "  else",
-    '    set sid to ""',
-    "  end if",
-    "  return (id of w) & tab & sid",
+    "  return id of w",
     "end tell",
   ].join("\n");
 }
@@ -212,7 +201,9 @@ function ghosttyPresent(): boolean {
 // bus sessions never lose each other's records to a shared read-modify-write. A record is written with
 // windowId=null BEFORE the window is opened (so a lost/timed-out launch is still discoverable) and
 // updated with the window id + surface UUID on success. despawn closes by the surface UUID.
-export type SpawnRecord = { windowId: string | null; surfaceId: string | null; launchId: string; tool: string; cwd: string; ts: number };
+// claimed=true means the spawned agent itself confirmed this surfaceId (its own controlling tty →
+// surface UUID). despawn only ever closes a claimed surface. surfaceId from the dispatcher is not used.
+export type SpawnRecord = { windowId: string | null; surfaceId: string | null; launchId: string; tool: string; cwd: string; ts: number; claimed?: boolean };
 
 function registryDir(home: string): string {
   return path.join(home, ".agenthop", "spawned");
@@ -225,10 +216,11 @@ function isRecord(r: unknown): r is SpawnRecord {
   if (!r || typeof r !== "object") return false;
   const o = r as Record<string, unknown>;
   const windowOk = o.windowId === null || typeof o.windowId === "string";
-  // surfaceId may be absent/null (older or unbound record) but a non-string value is a corrupt record —
-  // reject it rather than let despawn hit asEsc(<non-string>) and throw.
+  // surfaceId may be absent/null (unclaimed) but a non-string value is a corrupt record — reject it
+  // rather than let despawn hit asEsc(<non-string>) and throw.
   const surfaceOk = o.surfaceId === undefined || o.surfaceId === null || typeof o.surfaceId === "string";
-  return typeof o.launchId === "string" && typeof o.tool === "string" && typeof o.cwd === "string" && windowOk && surfaceOk;
+  const claimedOk = o.claimed === undefined || typeof o.claimed === "boolean";
+  return typeof o.launchId === "string" && typeof o.tool === "string" && typeof o.cwd === "string" && windowOk && surfaceOk && claimedOk;
 }
 export function readRegistry(home: string = homedir()): SpawnRecord[] {
   let files: string[];
@@ -317,6 +309,78 @@ end tell`);
   return v === "closed" || v === "absent" ? v : "unknown";
 }
 
+function psTtyPpid(pid: number): Promise<{ tty?: string; ppid?: number }> {
+  return new Promise((resolve) => {
+    execFile("ps", ["-o", "tty=,ppid=", "-p", String(pid)], { timeout: 3000, encoding: "utf8" }, (err, stdout) => {
+      if (err) return resolve({});
+      const m = (stdout ?? "").trim().match(/^(\S+)\s+(\d+)$/);
+      resolve(m ? { tty: m[1], ppid: Number(m[2]) } : {});
+    });
+  });
+}
+
+/** This process's controlling tty (e.g. "ttys008"), walking up ppid across the MCP/pipe boundary since
+ *  a bus node's own stdio are pipes but it inherits the surface's controlling terminal. Undefined if none. */
+async function controllingTty(pid: number, maxHops = 6): Promise<string | undefined> {
+  let cur = pid;
+  for (let i = 0; i < maxHops && cur > 1; i++) {
+    const { tty, ppid } = await psTtyPpid(cur);
+    if (tty && tty !== "??" && tty !== "?") return tty.trim();
+    if (!ppid) break;
+    cur = ppid;
+  }
+  return undefined;
+}
+
+/** Discover the Ghostty surface UUID this process runs in: controlling tty → the surface with that tty
+ *  (requiring a UNIQUE match). This is authoritative — the process genuinely runs on that tty. */
+async function discoverOwnSurfaceId(pid: number = process.pid): Promise<string | undefined> {
+  const tty = await controllingTty(pid);
+  if (!tty) return undefined;
+  const dev = tty.startsWith("/dev/") ? tty : `/dev/${tty}`;
+  const r = await runOsascript(`tell application "Ghostty"
+  set m to (terminals whose tty is "${asEsc(dev)}")
+  if (count of m) is 1 then
+    return id of (item 1 of m)
+  else
+    return ""
+  end if
+end tell`);
+  const id = r.out.trim();
+  return r.ok && id ? id : undefined;
+}
+
+export type ClaimOptions = { home?: string; env?: NodeJS.ProcessEnv; discover?: () => Promise<string | undefined> };
+
+/**
+ * If this process was launched by agenthop_spawn (AGENTHOP_LAUNCH_ID is set), self-register the Ghostty
+ * surface UUID it actually runs in, with claimed=true, on its own launch record — the authoritative
+ * binding despawn requires before it will close. Idempotent, best-effort, macOS-only. Returns whether a
+ * claim was written. `discover` is injectable for tests.
+ */
+export async function claimOwnSpawn(opts: ClaimOptions = {}): Promise<boolean> {
+  const env = opts.env ?? process.env;
+  const lid = env.AGENTHOP_LAUNCH_ID?.trim();
+  if (!lid) return false; // not a spawned session
+  const home = opts.home ?? homedir();
+  // The default discovery is macOS-only (osascript); off-macOS it returns undefined and we no-op.
+  const surfaceId = await (opts.discover ?? discoverOwnSurfaceId)();
+  if (!surfaceId) return false;
+  const existing = readRegistry(home).find((r) => r.launchId === lid);
+  return recordSpawn(
+    {
+      windowId: existing?.windowId ?? null,
+      surfaceId,
+      launchId: lid,
+      tool: existing?.tool ?? lid.split(":")[1] ?? "unknown",
+      cwd: existing?.cwd ?? process.cwd(),
+      ts: existing?.ts ?? Date.now(),
+      claimed: true,
+    },
+    home,
+  );
+}
+
 async function omniwmWindowIds(bin: string): Promise<string[] | undefined> {
   const r = await runOmniwmctl(bin, ["query", "windows", "--app", "Ghostty", "--fields", "id", "--format", "json"], 3000);
   if (r.code !== 0) return undefined; // a FAILED query is unknown, not "no windows" — never treat as []
@@ -397,25 +461,31 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
       note: `Could not confirm a Ghostty window opened (${r.err || "unknown error"}). A window MAY have opened (launchId ${lid}) — check agenthop_peers / agenthop_spawned before retrying; do not blindly re-spawn.`,
     };
   }
-  // The script returns "<windowId>\t<surfaceUUID>" — the surface id came from a single-terminal snapshot
-  // of the new window (empty if the window did not have exactly one terminal at snapshot time).
-  const [windowId, surfaceRaw] = r.out.trim().split("\t");
-  const surfaceId = surfaceRaw && surfaceRaw.trim() ? surfaceRaw.trim() : undefined;
+  const windowId = r.out.trim() || undefined;
+  // Fill in the window id, but PRESERVE any claim the child may already have written (it self-registers
+  // its surface UUID + claimed=true on startup; a merge here avoids clobbering an early claim).
   let recordOk = true;
   if (windowId) {
-    recordOk = recordSpawn({ windowId, surfaceId: surfaceId ?? null, launchId: lid, tool: input.tool, cwd, ts: Date.now() });
+    const existing = readRegistry().find((rec) => rec.launchId === lid);
+    recordOk = recordSpawn({
+      windowId,
+      surfaceId: existing?.surfaceId ?? null,
+      launchId: lid,
+      tool: input.tool,
+      cwd,
+      ts: existing?.ts ?? Date.now(),
+      claimed: existing?.claimed ?? false,
+    });
   }
 
   const workspace = (input.workspace && input.workspace.trim()) || env.AGENTHOP_SPAWN_WORKSPACE?.trim();
   const warn = !windowId
     ? ` (Ghostty returned no window id — launchId ${lid}.)`
-    : !surfaceId
-      ? ` (warning: could not uniquely capture the surface id at launch, so agenthop_despawn can't close it safely — launchId ${lid}; close it manually if needed.)`
-      : !recordOk
-        ? ` (warning: could not persist the window record, so agenthop_despawn may not find it — launchId ${lid}.)`
-        : "";
-  const tail = `It will appear in agenthop_peers shortly; use agenthop_handoff to give it a task.${warn}`;
-  const base = { windowId, surfaceId: surfaceId || undefined, launchId: lid } as const;
+    : !recordOk
+      ? ` (warning: could not persist the window record, so agenthop_despawn may not find it — launchId ${lid}.)`
+      : "";
+  const tail = `It will appear in agenthop_peers shortly and self-confirm its window for despawn once it's up; use agenthop_handoff to give it a task.${warn}`;
+  const base = { windowId, launchId: lid } as const;
   if (!workspace) {
     return { ok: true, arranged: false, ...base, note: `Launched ${input.tool} in a visible Ghostty window on the current workspace. ${tail}` };
   }
@@ -458,9 +528,10 @@ export async function despawnAgent(handle: string, opts: DespawnOptions = {}): P
     return { ok: false, note: `Window id "${key}" matches ${target.ambiguous.length} spawned records (its id was reused across launches). Despawn one by its launch id instead: ${ids}. (See agenthop_spawned.)` };
   }
   const rec = target.rec;
-  if (!rec.surfaceId) {
-    // No surface UUID captured — we will NOT fall back to closing by the reusable window id.
-    return { ok: false, note: `Cannot safely close "${key}": no surface id was captured at spawn (launchId ${rec.launchId}). agenthop won't close by a reusable window id. Close it manually if needed; the record is kept.` };
+  if (!rec.claimed || !rec.surfaceId) {
+    // The agent has not self-confirmed which surface it runs in (still starting up, or killed before it
+    // could). We will NOT fall back to closing by the reusable window id.
+    return { ok: false, note: `Cannot close "${key}" yet: the spawned agent has not confirmed its own window (launchId ${rec.launchId}). agenthop only closes a surface the agent itself claimed — wait a moment for it to come up and retry, or close it manually. The record is kept.` };
   }
   const res = await closeSurface(rec.surfaceId);
   if (res === "closed") {

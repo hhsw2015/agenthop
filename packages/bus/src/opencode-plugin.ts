@@ -11,7 +11,7 @@ import { bridgeSocketPath, startLocalBus, type Inbound, type LocalBus } from "./
 import { formatHandoff } from "./handoff.js";
 import { sessionTitle, type SelfInfo } from "./label.js";
 import { resolvePeer, type UnifiedPeer } from "./resolve.js";
-import { despawnAgent, readRegistry, spawnAgent } from "./spawn.js";
+import { claimOwnSpawn, despawnAgent, readRegistry, spawnAgent } from "./spawn.js";
 import { loadTeam } from "./team.js";
 import { omniwmctl, splitArgs } from "./wm.js";
 
@@ -196,6 +196,10 @@ function startBridgeClient(self: SelfInfo, onInbound: (from: string, text: strin
 export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
   const cwd = directory || process.cwd();
   const buses = new Map<string, SessionBus>();
+
+  // If this OpenCode server was launched by agenthop_spawn, self-register the Ghostty surface it runs in
+  // so despawn has an authoritative (agent-claimed) target. Fire-and-forget; a no-op unless spawned.
+  void claimOwnSpawn().catch(() => {});
 
   const inject = async (sessionID: string, from: string, text: string): Promise<boolean> => {
     try {
