@@ -36,8 +36,17 @@ const agents: Agent[] = [
     id: "claude",
     name: "Claude Code",
     present: (home) => existsSync(join(home, ".claude")) || onPath("claude"),
-    hint: (bin) => `claude mcp add --scope user ${SERVER} -- ${quote(bin)} mcp`,
-    register: (bin) => run("claude", ["mcp", "add", "--scope", "user", SERVER, "--", bin, "mcp"], "Claude Code"),
+    hint: (bin) => `claude mcp add --scope user ${SERVER} -- ${quote(bin)} mcp   (+ status hooks in ~/.claude/settings.json)`,
+    register: (bin, home) => {
+      const mcp = run("claude", ["mcp", "add", "--scope", "user", SERVER, "--", bin, "mcp"], "Claude Code");
+      let hooks: string;
+      try {
+        hooks = installClaudeStatusHooks(bin, home);
+      } catch (error) {
+        hooks = t(`status hooks not installed (${error instanceof Error ? error.message : String(error)}); add them by hand`, `状态 hook 没装上（${error instanceof Error ? error.message : String(error)}），手动加`);
+      }
+      return `${mcp}; ${hooks}`;
+    },
   },
   {
     id: "grok",
@@ -143,6 +152,62 @@ export function registerMcp(ids: string[], bin: string, home = homedir()): strin
 
 function entry(bin: string) {
   return { [SERVER]: { command: bin, args: ["mcp"] } };
+}
+
+/**
+ * Install Claude Code hooks that auto-report this session's work state to the bus (Phase 3 slice B):
+ * UserPromptSubmit→working, Stop→idle, PermissionRequest→blocked (the instant approval signal). All are
+ * async fire-and-forget and side-effect-only (output suppressed, `|| true`), so they can never block a
+ * turn, inject context, or fail. `agenthop report-status` reads CLAUDE_CODE_SESSION_ID from the hook env.
+ * Idempotent: skips any event that already has an agenthop status hook; preserves the user's other hooks
+ * and the rest of settings.json (parse → merge → atomic write). ~/.claude/settings.json is JSON, so this
+ * is a safe structured edit (unlike codex's TOML). Returns what changed.
+ */
+export function installClaudeStatusHooks(bin: string, home = homedir()): string {
+  const file = join(home, ".claude", "settings.json");
+  let config: Record<string, unknown> = {};
+  if (existsSync(file)) {
+    try {
+      config = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    } catch {
+      throw new Error(t(`${file} is not plain JSON; left it alone`, `${file} 不是纯 JSON，没有动它`));
+    }
+  }
+  const q = JSON.stringify(bin); // JSON-quoted path — the double quotes are literal (and safe) in the shell string
+  const cmd = (state: string): string => `${q} report-status ${state} >/dev/null 2>&1 || true`;
+  const groups: Record<string, { matcher?: string; hooks: Array<{ type: string; command: string; async: boolean }> }> = {
+    UserPromptSubmit: { hooks: [{ type: "command", command: cmd("working"), async: true }] },
+    Stop: { hooks: [{ type: "command", command: cmd("idle"), async: true }] },
+    PermissionRequest: { hooks: [{ type: "command", command: cmd("blocked"), async: true }] },
+  };
+  const hooks = (config.hooks ??= {}) as Record<string, unknown>;
+  let added = 0;
+  for (const [event, group] of Object.entries(groups)) {
+    const arr = (hooks[event] ??= []) as unknown[];
+    if (!Array.isArray(arr)) continue; // unexpected shape for this event — leave it alone
+    // Dedup: skip if this event already has an agenthop status hook (marker: the report-status command).
+    const already = arr.some((g) => Array.isArray((g as { hooks?: unknown[] })?.hooks) && (g as { hooks: unknown[] }).hooks.some((h) => typeof (h as { command?: unknown })?.command === "string" && ((h as { command: string }).command.includes("report-status"))));
+    if (already) continue;
+    arr.push(group);
+    added++;
+  }
+  if (added === 0) return t(`${file} already has agenthop status hooks; nothing changed`, `${file} 里已有 agenthop 状态 hook，没有改动`);
+  placeJson(file, config);
+  return t(`installed ${added} status hook(s) into ${file}`, `已装 ${added} 个状态 hook 到 ${file}`);
+}
+
+/** Write JSON via a sibling temp + rename (never truncate the original on a short/failed write). */
+function placeJson(file: string, config: unknown): void {
+  mkdirSync(dirname(file), { recursive: true });
+  const staged = `${file}.new`;
+  rmSync(staged, { force: true });
+  writeFileSync(staged, `${JSON.stringify(config, null, 2)}\n`);
+  try {
+    renameSync(staged, file);
+  } catch (error) {
+    rmSync(staged, { force: true });
+    throw error;
+  }
 }
 
 function codexBlock(bin: string): string {

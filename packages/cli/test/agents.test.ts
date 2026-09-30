@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { mcpHints, opencodeConfigDir, opencodePluginPath, registerMcp, writeOpencodePlugin } from "../src/agents.js";
+import { installClaudeStatusHooks, mcpHints, opencodeConfigDir, opencodePluginPath, registerMcp, writeOpencodePlugin } from "../src/agents.js";
 import { parseArgs } from "../src/args.js";
 
 const BIN = "/Users/someone/.local/bin/agenthop";
@@ -83,6 +83,35 @@ describe("plugging into agents as an MCP server", () => {
     await writeFile(file, before);
     expect(registerMcp(["codex"], BIN, dir)[0]).toContain("already has agenthop");
     expect(await readFile(file, "utf8")).toBe(before); // untouched
+  });
+
+  it("installs Claude status hooks (working/idle/blocked), idempotent, preserving other settings", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "my-logger" }] }] } }));
+
+    expect(installClaudeStatusHooks(BIN, dir)).toContain("installed");
+    const cfg = JSON.parse(await readFile(file, "utf8"));
+    expect(cfg.model).toBe("opus"); // unrelated key preserved
+    const cmds = (event: string) => (cfg.hooks[event] as { hooks: { command: string }[] }[]).flatMap((g) => g.hooks.map((h) => h.command));
+    expect(cmds("UserPromptSubmit").some((c) => c.includes("report-status working"))).toBe(true);
+    expect(cmds("Stop").some((c) => c.includes("report-status idle"))).toBe(true);
+    expect(cmds("Stop").some((c) => c.includes("my-logger"))).toBe(true); // user's own hook kept
+    expect(cmds("PermissionRequest").some((c) => c.includes("report-status blocked"))).toBe(true);
+
+    expect(installClaudeStatusHooks(BIN, dir)).toContain("already has agenthop status hooks"); // idempotent
+    const cfg2 = JSON.parse(await readFile(file, "utf8"));
+    expect((cfg2.hooks.Stop as unknown[]).length).toBe(2); // user's + ours, no duplicate
+  });
+
+  it("refuses to touch a non-JSON settings.json", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, "not json {");
+    expect(() => installClaudeStatusHooks(BIN, dir)).toThrow();
+    expect(await readFile(file, "utf8")).toBe("not json {"); // left untouched
   });
 
   it("names an agent it does not know instead of guessing", async () => {
