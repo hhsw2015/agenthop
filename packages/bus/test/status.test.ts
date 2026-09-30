@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { startBusCore, type BusCore } from "../src/core.js";
+import { startBusCore } from "../src/core.js";
 
 // Force codexDaemonPresent() false so a real Codex daemon on this machine isn't contacted, and clear
 // the inherited native-session env so the two in-process cores get DISTINCT identities (in production two
@@ -31,7 +31,7 @@ async function until(cond: () => boolean, ms = 3000): Promise<boolean> {
   return cond();
 }
 
-test("self-reported status rides the roster, monotonic seq drops stale, wait pins + reaches", async () => {
+test("status rides the roster, monotonic seq drops stale, wait pins the run + reaches", async () => {
   const home = mkdtempSync(path.join(tmpdir(), "ah-status-"));
   const a = startBusCore({ home });
   const b = startBusCore({ home });
@@ -39,32 +39,56 @@ test("self-reported status rides the roster, monotonic seq drops stale, wait pin
   try {
     expect(await until(() => a.peers().length === 2 && b.peers().length === 2)).toBe(true);
 
+    // Before any report, a peer is "unknown" — and matchable as such.
+    expect((await b.waitForStatus(aId, ["unknown"], 1000)).reached).toBe(true);
+
     // a reports blocked (with detail); b sees it on the shared roster.
     a.setStatus("blocked", { text: "needs approval" });
     expect(await until(() => b.peers().find((p) => p.id === aId)?.status === "blocked")).toBe(true);
     expect(b.peers().find((p) => p.id === aId)?.statusText).toBe("needs approval");
 
-    // Monotonic seq: a newer seq applies; an older/equal one is ignored (never applied on top of newer).
+    // Monotonic seq: a newer seq applies; an older/equal one is ignored (never on top of newer).
     expect(a.setStatus("idle", { seq: 10 }).ok).toBe(true);
     expect(a.setStatus("working", { seq: 5 })).toMatchObject({ ok: false, ignored: true, seq: 10 });
     expect(a.self.status).toBe("idle"); // stale report did not take effect
     expect(a.setStatus("working", { seq: 11 }).ok).toBe(true);
-    expect(a.self.status).toBe("working");
 
     // b waits for a to reach idle — resolves as soon as a reports it.
     a.setStatus("idle", { seq: 20 });
-    const reached = await b.waitForStatus(aId, ["idle"], 3000);
-    expect(reached).toMatchObject({ reached: true, status: "idle" });
+    expect(await b.waitForStatus(aId, ["idle"], 3000)).toMatchObject({ reached: true, status: "idle" });
 
-    // wait times out when the wanted state never comes (a is idle, we ask for blocked).
-    const timedOut = await b.waitForStatus(aId, ["blocked"], 400);
-    expect(timedOut.reached).toBe(false);
-
-    // an unknown target is an error, not a silent hang.
-    expect((await b.waitForStatus("no-such-session", ["idle"], 400)).error).toBeTruthy();
+    // times out when the wanted state never comes; an unknown target is an error, not a hang.
+    expect((await b.waitForStatus(aId, ["blocked"], 300)).reached).toBe(false);
+    expect((await b.waitForStatus("no-such-session", ["idle"], 300)).error).toBeTruthy();
   } finally {
     await a.close();
     await b.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("status is isolated per session identity (multiplexed Codex threads don't share seq/state)", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ah-status-id-"));
+  const a = startBusCore({ home });
+  try {
+    // Thread A adopts its identity and reports idle at a high seq.
+    a.noteThread("thread-A");
+    expect(a.setStatus("idle", { seq: 100, text: "A done" }).ok).toBe(true);
+    expect(a.self.status).toBe("idle");
+
+    // Switch to thread B: its status starts fresh (not A's), and a LOW seq is NOT gated by A's 100.
+    a.noteThread("thread-B");
+    expect(a.self.status).toBeUndefined();
+    expect(a.setStatus("working", { seq: 1 }).ok).toBe(true);
+    expect(a.self.status).toBe("working");
+
+    // Switching back to A restores A's own status (each identity keeps its own).
+    a.noteThread("thread-A");
+    expect(a.self.status).toBe("idle");
+    expect(a.self.statusSeq).toBe(100);
+    expect(a.self.statusText).toBe("A done");
+  } finally {
+    await a.close();
     rmSync(home, { recursive: true, force: true });
   }
 });

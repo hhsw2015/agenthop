@@ -26,8 +26,8 @@ export function busInstructions(): string {
 - agenthop_peers(): list sessions reachable now, each shown by its handle (tool:dir-<shortSessionId>, e.g. codex:Work-01a0ead5). Same-machine sessions appear automatically; other machines appear when a shared AGENTHOP_TEAM is set.
 - agenthop_send(to, text): message a session by its handle (a prefix like "codex:Work" works when unambiguous; the native session id also works). The handle is restart-stable, so you can reach the same session again after it restarts without being told.
 - agenthop_handoff(to, summary, next?): hand a task to another session so it continues where you left off — you write the summary, the bus attaches a git snapshot of your working directory. Use it instead of send when passing work along, not just chatting.
-- agenthop_status(state): report THIS session's work state (working/idle/blocked/unknown) to peers; shows in agenthop_peers.
-- agenthop_wait(to, until?): wait until another session reaches a state — e.g. a sub-agent you dispatched goes idle (done) or blocked (needs input).
+- agenthop_report_status(state): report THIS session's work state (working/idle/blocked/unknown) to peers; shows in agenthop_peers.
+- agenthop_wait_peer(to, until?): wait until another session reaches a state — e.g. a sub-agent you dispatched goes idle (done) or blocked (needs input).
 - agenthop_recv(timeout_seconds): fallback only — see below.
 - agenthop_spawn(tool, cwd?, workspace?): launch another agent (claude/codex/opencode) in a VISIBLE window on this machine; it joins the bus on its own, then hand it work with agenthop_handoff. Any session can dispatch — a decentralized, visible orchestration center.
 - agenthop_wm(args): drive the OmniWM window manager (macOS) to arrange windows — a passthrough to omniwmctl (e.g. "query windows", "window move-to-workspace <id> 2").
@@ -112,10 +112,10 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   );
 
   server.registerTool(
-    "agenthop_status",
+    "agenthop_report_status",
     {
       description:
-        "Report THIS session's work state to peers (working | idle | blocked | unknown). It shows in agenthop_peers and lets a dispatcher agenthop_wait on it. `blocked` means you need input (a permission/approval/question). Usually driven by hooks, but an agent may set it directly.",
+        "Report THIS session's work state to peers (working | idle | blocked | unknown). It shows in agenthop_peers and lets a dispatcher agenthop_wait_peer on it. `blocked` means you need input (a permission/approval/question). Usually driven by hooks, but an agent may set it directly.",
       inputSchema: {
         state: z.enum(["working", "idle", "blocked", "unknown"]).describe("This session's work state"),
         note: z.string().optional().describe("Optional short detail, e.g. what you're blocked on"),
@@ -130,10 +130,10 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   );
 
   server.registerTool(
-    "agenthop_wait",
+    "agenthop_wait_peer",
     {
       description:
-        "Wait until another session reaches a work state — e.g. wait for a sub-agent you dispatched to go idle (done) or blocked (needs input). Returns as soon as it reaches one of the states, or when it vanishes or the timeout elapses. Pins the target's identity so a different/restarted session can't satisfy the wait.",
+        "Wait until another session reaches a work state — e.g. wait for a sub-agent you dispatched to go idle (done) or blocked (needs input). Returns as soon as it reaches one of the states, or when it vanishes or the timeout elapses. Pins the target's exact run so a different/restarted session can't satisfy the wait.",
       inputSchema: {
         to: z.string().describe("Target session: handle/prefix or id (see agenthop_peers)"),
         until: z.array(z.enum(["working", "idle", "blocked", "unknown"])).optional().describe("States to wait for (default: idle, blocked)"),

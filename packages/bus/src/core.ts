@@ -56,6 +56,11 @@ export function codexDeliveryThread(
 export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const self = selfInfo();
   const queue: BusMessage[] = [];
+  // Work-status is per SESSION IDENTITY, not per MCP-server process: one Codex daemon-backed server can
+  // adopt several thread identities over its life (see learnStableId), and each must keep its own status
+  // and its own monotonic seq — otherwise thread A's seq would gate thread B's reports.
+  type StatusEntry = { status: AgentStatus; seq: number; text?: string; at: number };
+  const statusByIdentity = new Map<string, StatusEntry>();
   // The Codex thread currently driving this (daemon-level) MCP server, learned from each call's
   // x-codex-turn-metadata. Most precise; the daemon client is the fallback for receive-first.
   let ownCodexThread: string | undefined;
@@ -102,9 +107,20 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // always wins: it may correct an earlier guess, and it keeps the published identity EQUAL to the
     // real delivery target — a stale stableId while delivery moved to another thread was the bug.
     if (!authoritative && self.stableId) return;
+    const hadStableId = self.stableId !== undefined;
+    const oldKey = self.stableId ?? self.id;
     self.stableId = id;
     self.title = sessionTitle(self.tool, self.cwd, id);
     stableIdAuthoritative = authoritative;
+    // Status follows the identity. On the FIRST adoption (bootstrap: no stableId yet) carry a status the
+    // same run already reported under its per-run id; on a later thread SWITCH (A→B) do NOT carry — keep
+    // identities isolated. Then publish the new identity's own status.
+    if (!hadStableId && statusByIdentity.has(oldKey) && !statusByIdentity.has(id)) statusByIdentity.set(id, statusByIdentity.get(oldKey)!);
+    const e = statusByIdentity.get(id);
+    self.status = e?.status;
+    self.statusSeq = e?.seq;
+    self.statusText = e?.text;
+    self.statusAt = e?.at;
     local.updateSelf(self);
     relay?.updateSelf(self);
   };
@@ -153,31 +169,38 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       return batch;
     },
     setStatus(state, opts) {
+      const key = self.stableId ?? self.id;
+      const prev = statusByIdentity.get(key);
       const seq = opts?.seq;
-      // Monotonic guard: never apply a report that is not newer than the last (out-of-order / duplicate).
-      if (seq !== undefined && self.statusSeq !== undefined && seq <= self.statusSeq) return { ok: false, ignored: true, seq: self.statusSeq };
-      self.status = state;
-      self.statusSeq = seq ?? (self.statusSeq ?? 0) + 1;
-      self.statusText = opts?.text?.trim() || undefined;
-      self.statusAt = Date.now();
+      // Monotonic guard (per identity): never apply a report that is not newer than the last.
+      if (seq !== undefined && prev && seq <= prev.seq) return { ok: false, ignored: true, seq: prev.seq };
+      // Auto-increment must strictly advance and stay a safe integer.
+      if (seq === undefined && prev && prev.seq >= Number.MAX_SAFE_INTEGER) return { ok: false, ignored: true, seq: prev.seq };
+      const entry: StatusEntry = { status: state, seq: seq ?? (prev?.seq ?? 0) + 1, text: opts?.text?.trim() || undefined, at: Date.now() };
+      statusByIdentity.set(key, entry);
+      self.status = entry.status;
+      self.statusSeq = entry.seq;
+      self.statusText = entry.text;
+      self.statusAt = entry.at;
       local.updateSelf(self);
       relay?.updateSelf(self);
-      return { ok: true, seq: self.statusSeq };
+      return { ok: true, seq: entry.seq };
     },
     async waitForStatus(target, until, timeoutMs) {
       const peer = resolve(target);
       if ("error" in peer) return { reached: false, error: peer.error };
-      // Pin the resolved session's durable identity so a different (or restarted-as-new) session can't
-      // satisfy the wait; fall back to the per-run id when there is no stableId yet.
-      const pin = peer.stableId ?? peer.id;
+      // Pin the resolved EXACT run (per-run id). The id is stable even as the run later learns its
+      // stableId, and a restart (new run id) or a same-stableId sibling won't satisfy the wait.
+      const pin = peer.id;
       const label = labelFor(peer.id);
       const wanted = new Set(until);
       const deadline = Date.now() + timeoutMs;
       for (;;) {
-        const now = unified().find((p) => (p.stableId ?? p.id) === pin);
+        const now = unified().find((p) => p.id === pin);
         if (!now) return { reached: false, gone: true, label };
-        if (now.status && wanted.has(now.status)) return { reached: true, status: now.status, label };
-        if (Date.now() >= deadline) return { reached: false, status: now.status, label };
+        const cur = now.status ?? "unknown"; // an unreported peer is "unknown", and matchable as such
+        if (wanted.has(cur)) return { reached: true, status: cur, label };
+        if (Date.now() >= deadline) return { reached: false, status: cur, label };
         await delay(200);
       }
     },

@@ -228,6 +228,7 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
   const setStatus = (b: SessionBus, state: AgentStatus, opts?: { seq?: number; text?: string }): { ok: boolean; seq?: number } => {
     const seq = opts?.seq;
     if (seq !== undefined && b.self.statusSeq !== undefined && seq <= b.self.statusSeq) return { ok: false, seq: b.self.statusSeq };
+    if (seq === undefined && b.self.statusSeq !== undefined && b.self.statusSeq >= Number.MAX_SAFE_INTEGER) return { ok: false, seq: b.self.statusSeq };
     b.self.status = state;
     b.self.statusSeq = seq ?? (b.self.statusSeq ?? 0) + 1;
     b.self.statusText = opts?.text?.trim() || undefined;
@@ -240,15 +241,16 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
   const waitForStatus = async (b: SessionBus, target: string, until: AgentStatus[], timeoutMs: number): Promise<{ status?: AgentStatus; reached: boolean; gone?: boolean; error?: string; label?: string }> => {
     const peer = resolvePeer(unified(b), b.self.id, target);
     if ("error" in peer) return { reached: false, error: peer.error };
-    const pin = peer.stableId ?? peer.id;
+    const pin = peer.id; // the exact run; a restart or same-stableId sibling won't satisfy the wait
     const label = labelFor(b, peer.id);
     const wanted = new Set(until);
     const deadline = Date.now() + timeoutMs;
     for (;;) {
-      const now = unified(b).find((p) => (p.stableId ?? p.id) === pin);
+      const now = unified(b).find((p) => p.id === pin);
       if (!now) return { reached: false, gone: true, label };
-      if (now.status && wanted.has(now.status)) return { reached: true, status: now.status, label };
-      if (Date.now() >= deadline) return { reached: false, status: now.status, label };
+      const cur = now.status ?? "unknown"; // an unreported peer is "unknown", and matchable as such
+      if (wanted.has(cur)) return { reached: true, status: cur, label };
+      if (Date.now() >= deadline) return { reached: false, status: cur, label };
       await new Promise((r) => setTimeout(r, 200));
     }
   };
@@ -339,21 +341,22 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
           return `${b.local.role()} bus; ${scope}; ${rows.length} other session(s)\n${rows.join("\n") || "  (no other sessions)"}`;
         },
       }),
-      agenthop_status: tool({
+      agenthop_report_status: tool({
         description:
-          "Report THIS session's work state to peers (working | idle | blocked | unknown). Shows in agenthop_peers and lets a dispatcher agenthop_wait on it. `blocked` = needs input (permission/approval/question).",
+          "Report THIS session's work state to peers (working | idle | blocked | unknown). Shows in agenthop_peers and lets a dispatcher agenthop_wait_peer on it. `blocked` = needs input (permission/approval/question).",
         args: {
           state: tool.schema.enum(["working", "idle", "blocked", "unknown"]).describe("This session's work state"),
           note: tool.schema.string().optional().describe("Optional short detail"),
+          seq: tool.schema.number().int().optional().describe("Optional monotonic sequence (e.g. a timestamp); a report not newer than the last is ignored"),
         },
-        async execute({ state, note }: { state: AgentStatus; note?: string }, context: ToolContext): Promise<string> {
-          const r = setStatus(busFor(context.sessionID), state, { text: note });
+        async execute({ state, note, seq }: { state: AgentStatus; note?: string; seq?: number }, context: ToolContext): Promise<string> {
+          const r = setStatus(busFor(context.sessionID), state, { text: note, seq });
           return r.ok ? `Status set to ${state} (seq ${r.seq}).` : `Ignored: a newer status (seq ${r.seq}) is already set.`;
         },
       }),
-      agenthop_wait: tool({
+      agenthop_wait_peer: tool({
         description:
-          "Wait until another session reaches a work state — e.g. a sub-agent you dispatched goes idle (done) or blocked (needs input). Returns when it reaches one of the states, vanishes, or times out. Pins the target's identity.",
+          "Wait until another session reaches a work state — e.g. a sub-agent you dispatched goes idle (done) or blocked (needs input). Returns when it reaches one of the states, vanishes, or times out. Pins the target's exact run.",
         args: {
           to: tool.schema.string().describe("Target session: handle/prefix or id (see agenthop_peers)"),
           until: tool.schema.array(tool.schema.enum(["working", "idle", "blocked", "unknown"])).optional().describe("States to wait for (default: idle, blocked)"),
