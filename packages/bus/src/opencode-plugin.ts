@@ -242,7 +242,7 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
     const peer = resolvePeer(unified(b), b.self.id, target);
     if ("error" in peer) return { reached: false, error: peer.error };
     const pin = peer.id; // the exact run; a restart or same-stableId sibling won't satisfy the wait
-    const pinIdentity = peer.stableId; // the native identity resolved; guards a mid-wait identity switch
+    let pinIdentity = peer.stableId; // the native identity resolved; guards a mid-wait identity switch
     const label = labelFor(b, peer.id);
     const wanted = new Set(until);
     const deadline = Date.now() + timeoutMs;
@@ -250,6 +250,9 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
     for (;;) {
       const now = unified(b).find((p) => p.id === pin);
       if (!now) return { reached: false, gone: true, label };
+      // Lock onto the first concrete identity observed if we resolved before adoption (else a later
+      // switch to a different identity would still satisfy).
+      if (pinIdentity === undefined && now.stableId !== undefined) pinIdentity = now.stableId;
       const sameIdentity = pinIdentity === undefined || now.stableId === undefined || now.stableId === pinIdentity;
       if (sameIdentity) {
         last = now.status ?? "unknown"; // an unreported peer is "unknown", and matchable as such

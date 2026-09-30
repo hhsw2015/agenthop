@@ -115,3 +115,28 @@ test("a wait for one identity is NOT satisfied by another identity of the same r
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("a wait that started before adoption LOCKS the first identity it observes", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ah-status-lock-"));
+  const a = startBusCore({ home });
+  const b = startBusCore({ home });
+  const aId = a.self.id;
+  try {
+    expect(await until(() => b.peers().length === 2)).toBe(true);
+    // a has NOT adopted a native identity yet; b resolves it by run id (pinIdentity starts undefined).
+    const waiting = b.waitForStatus(aId, ["idle"], 1500);
+    // a adopts A and is working; let the wait observe (and lock onto) identity A.
+    a.noteThread("id-A");
+    a.setStatus("working", { seq: 7 });
+    expect(await until(() => b.peers().find((p) => p.id === aId)?.stableId === "id-A" && b.peers().find((p) => p.id === aId)?.status === "working")).toBe(true);
+    await new Promise((r) => setTimeout(r, 300)); // ensure the wait polled and locked A
+    // a switches to B and reports idle — must NOT satisfy the wait that locked onto A.
+    a.noteThread("id-B");
+    a.setStatus("idle", { seq: 1 });
+    expect(await waiting).toMatchObject({ reached: false });
+  } finally {
+    await a.close();
+    await b.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});

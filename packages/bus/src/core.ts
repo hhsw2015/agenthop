@@ -193,7 +193,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // The run id survives a restart-as-new check; the identity guard handles a multiplexing run that
       // switches to another native thread mid-wait — its (different identity's) status must not satisfy us.
       const pin = peer.id;
-      const pinIdentity = peer.stableId; // undefined if it had not adopted a durable identity yet
+      let pinIdentity = peer.stableId; // undefined if it had not adopted a durable identity yet
       const label = labelFor(peer.id);
       const wanted = new Set(until);
       const deadline = Date.now() + timeoutMs;
@@ -201,8 +201,11 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       for (;;) {
         const now = unified().find((p) => p.id === pin);
         if (!now) return { reached: false, gone: true, label };
-        // Read the published status only while the run still represents the identity we resolved. A pin
-        // with no identity (pre-adoption) accepts the first adoption; a switch A→B is skipped, not matched.
+        // Lock onto the first concrete identity observed if we resolved before adoption — otherwise a
+        // later switch to a DIFFERENT identity would still satisfy (pinIdentity===undefined forever).
+        if (pinIdentity === undefined && now.stableId !== undefined) pinIdentity = now.stableId;
+        // Read the published status only while the run still represents the pinned identity. A switch
+        // A→B is skipped (kept waiting), not matched.
         const sameIdentity = pinIdentity === undefined || now.stableId === undefined || now.stableId === pinIdentity;
         if (sameIdentity) {
           last = now.status ?? "unknown"; // an unreported peer is "unknown", and matchable as such
