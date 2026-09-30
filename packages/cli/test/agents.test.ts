@@ -71,6 +71,9 @@ describe("plugging into agents as an MCP server", () => {
     expect(text.startsWith('model = "o4"\n')).toBe(true);
     expect(text.match(/\[mcp_servers\.agenthop\]/g)).toHaveLength(1);
     expect(text).toContain(`command = "${BIN}"`);
+    // Forwards AGENTHOP_LAUNCH_ID into the MCP subprocess (Codex clears it otherwise) so a spawned
+    // Codex session can self-register its window for despawn.
+    expect(text).toContain('env_vars = ["AGENTHOP_LAUNCH_ID"]');
   });
 
   it("names an agent it does not know instead of guessing", async () => {

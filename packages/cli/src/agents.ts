@@ -143,7 +143,10 @@ function entry(bin: string) {
 }
 
 function codexBlock(bin: string): string {
-  return `[mcp_servers.agenthop]\ncommand = ${JSON.stringify(bin)}\nargs = ["mcp"]`;
+  // env_vars forwards AGENTHOP_LAUNCH_ID from Codex's own environment into the MCP subprocess (Codex
+  // otherwise clears it). That is how a spawned Codex session learns its launch id and can self-register
+  // its window for agenthop_despawn. Harmless when the var is unset (normal, non-spawned sessions).
+  return `[mcp_servers.agenthop]\ncommand = ${JSON.stringify(bin)}\nargs = ["mcp"]\nenv_vars = ["AGENTHOP_LAUNCH_ID"]`;
 }
 
 /**

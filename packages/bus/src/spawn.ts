@@ -353,33 +353,6 @@ function psTtyPpid(pid: number): Promise<{ tty?: string; ppid?: number }> {
   });
 }
 
-function psEnv(pid: number): Promise<string> {
-  return new Promise((resolve) => {
-    execFile("ps", ["eww", "-p", String(pid)], { timeout: 3000, maxBuffer: 4 << 20, encoding: "utf8" }, (err, stdout) => resolve(err ? "" : (stdout ?? "")));
-  });
-}
-
-/**
- * The AGENTHOP_LAUNCH_ID for this session: our own env if present, else an ANCESTOR's env (read via
- * `ps eww`). Codex clears its MCP subprocess env (so our bus node's own env loses it), but the codex CLI
- * ancestor still carries the value we injected into the window — so an ancestor walk recovers it without
- * any per-tool config forwarding. Undefined when this is not a spawned session.
- */
-async function discoverLaunchId(env: NodeJS.ProcessEnv, pid: number, maxHops = 6): Promise<string | undefined> {
-  const own = env.AGENTHOP_LAUNCH_ID?.trim();
-  if (own) return own;
-  let cur = pid;
-  for (let i = 0; i < maxHops && cur > 1; i++) {
-    const out = await psEnv(cur);
-    const m = out.match(/AGENTHOP_LAUNCH_ID=(agenthop-spawn:[^\s]+)/);
-    if (m) return m[1];
-    const { ppid } = await psTtyPpid(cur);
-    if (!ppid) break;
-    cur = ppid;
-  }
-  return undefined;
-}
-
 /** This process's controlling tty (e.g. "ttys008"), walking up ppid across the MCP/pipe boundary since
  *  a bus node's own stdio are pipes but it inherits the surface's controlling terminal. Undefined if none. */
 async function controllingTty(pid: number, maxHops = 6): Promise<string | undefined> {
@@ -431,26 +404,27 @@ export async function claimOwnSpawn(opts: ClaimOptions = {}): Promise<boolean> {
 }
 
 /**
- * Claim on startup with bounded retry. First it resolves the launchId (own env, else an ancestor's env
- * via ps eww — so it works even when codex clears the MCP subprocess env); if this is not a spawned
- * session it does nothing. Then it claims, retrying with backoff if the surface/tty is not queryable yet
- * (Ghostty still settling, permissions warming up), stopping on the first success. Non-blocking; timers
- * unref so they never keep the process alive.
+ * Claim on startup with bounded retry. The launchId comes from this process's OWN env — each host
+ * delivers it through a structured channel (Claude Code inherits the env into the MCP subprocess; Codex
+ * needs `env_vars = ["AGENTHOP_LAUNCH_ID"]` in its mcp_servers config; the OpenCode plugin runs in the
+ * server process, which inherits it). We deliberately do NOT scrape an ancestor's env: macOS `ps eww`
+ * concatenates argv and env without clean delimiters, so a stale/unrelated occurrence could bind the
+ * wrong launch. If this is not a spawned session it does nothing; otherwise it claims, retrying with
+ * backoff while the surface/tty is not queryable yet (Ghostty settling / permissions), stopping on the
+ * first success. Non-blocking; timers unref so they never keep the process alive.
  */
 export function startClaimRetry(opts: ClaimOptions = {}): void {
-  const env = opts.env ?? process.env;
-  void discoverLaunchId(env, process.pid).then((lid) => {
-    if (!lid) return; // not a spawned session → nothing to claim, no retries
-    let attempt = 0;
-    const tryOnce = (): void => {
-      void claimOwnSpawn({ ...opts, launchId: lid }).then((ok) => {
-        if (ok || attempt >= 5) return; // claimed, or gave up after ~1 min of backoff
-        const timer = setTimeout(tryOnce, 1000 * 2 ** attempt++);
-        if (typeof timer.unref === "function") timer.unref();
-      });
-    };
-    tryOnce();
-  });
+  const lid = (opts.env ?? process.env).AGENTHOP_LAUNCH_ID?.trim();
+  if (!lid) return; // not a spawned session (or the host did not deliver the id) → nothing to claim
+  let attempt = 0;
+  const tryOnce = (): void => {
+    void claimOwnSpawn({ ...opts, launchId: lid }).then((ok) => {
+      if (ok || attempt >= 5) return; // claimed, or gave up after ~1 min of backoff
+      const timer = setTimeout(tryOnce, 1000 * 2 ** attempt++);
+      if (typeof timer.unref === "function") timer.unref();
+    });
+  };
+  tryOnce();
 }
 
 async function omniwmWindowIds(bin: string): Promise<string[] | undefined> {
@@ -534,10 +508,12 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
     };
   }
   const windowId = r.out.trim() || undefined;
-  // Fill in the window id on the dispatcher's OWN main record. The child's claim lives in a separate
-  // file, so this write can never clobber a claim that already arrived (no shared read-modify-write).
+  // Fill in the window id on the dispatcher's OWN main record — but only if the pending record still
+  // exists. If a despawn already tore this launch down (main+claim removed) while the create ACK was in
+  // flight, do NOT resurrect an unclaimed ghost record that could never be cleared. The child's claim is
+  // a separate file, so this write can never clobber a claim (no shared read-modify-write).
   let recordOk = true;
-  if (windowId) {
+  if (windowId && readRegistry().some((rec) => rec.launchId === lid)) {
     recordOk = recordSpawn({ windowId, surfaceId: null, launchId: lid, tool: input.tool, cwd, ts: Date.now() });
   }
 
