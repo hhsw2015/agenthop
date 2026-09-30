@@ -16,6 +16,7 @@ import {
   recordForWindow,
   recordSpawn,
   resolveCli,
+  resolveDespawnTarget,
   shquote,
   tomlBasicString,
 } from "../src/spawn.js";
@@ -77,8 +78,11 @@ describe("buildAppleScript", () => {
     expect(s).toContain('set initial working directory of c to "/tmp/proj"');
     expect(s).toContain('set environment variables of c to {"PATH=/x", "AGENTHOP_LAUNCH_ID=abc"}');
     expect(s).toContain("new window with configuration c");
-    // The surface UUID is read in the SAME script that creates the window — no separate query to race.
-    expect(s).toContain("return (id of w) & tab & (id of (first terminal of w))");
+    // Surface id from a single-terminal SNAPSHOT of the new window (never mis-bind a raced-in split),
+    // read in the SAME script that creates the window — no separate query to race.
+    expect(s).toContain("set terms to terminals of w");
+    expect(s).toContain("if (count of terms) is 1 then");
+    expect(s).toContain("return (id of w) & tab & sid");
   });
 
   it("escapes quotes/backslashes so a crafted cwd cannot break out of the string", () => {
@@ -138,6 +142,39 @@ describe("spawn registry (per-launch files; only despawn windows we spawned)", (
       forgetSpawn("lid1", home);
       expect(isSpawnedWindow("window-abc", home)).toBe(false);
       expect(readRegistry(home).map((r) => r.launchId)).toEqual(["lid2"]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a record whose surfaceId is a non-string (would crash despawn's asEsc)", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "ah-reg-"));
+    try {
+      const dir = path.join(home, ".agenthop", "spawned");
+      recordSpawn({ windowId: "w-ok", surfaceId: "UUID-OK", launchId: "ok", tool: "codex", cwd: "/x", ts: 1 }, home);
+      writeFileSync(path.join(dir, "bad.json"), JSON.stringify({ windowId: "w-bad", surfaceId: 73, launchId: "bad", tool: "codex", cwd: "/y", ts: 2 }));
+      expect(readRegistry(home).map((r) => r.launchId)).toEqual(["ok"]); // the surfaceId:73 record is skipped
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resolveDespawnTarget", () => {
+  it("prefers the unique launchId, disambiguates a reused window id, rejects unknown", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "ah-reg-"));
+    try {
+      // Two launches whose window id was reused by the OS across them (same windowId, different surface).
+      recordSpawn({ windowId: "win-1", surfaceId: "UUID-A", launchId: "lidA", tool: "codex", cwd: "/x", ts: 1 }, home);
+      recordSpawn({ windowId: "win-1", surfaceId: "UUID-B", launchId: "lidB", tool: "claude", cwd: "/y", ts: 2 }, home);
+
+      const byLaunch = resolveDespawnTarget("lidB", home);
+      expect("rec" in byLaunch && byLaunch.rec.surfaceId).toBe("UUID-B"); // unique launchId wins exactly
+
+      const byWindow = resolveDespawnTarget("win-1", home);
+      expect("ambiguous" in byWindow && byWindow.ambiguous.length).toBe(2); // reused window id → ambiguous
+
+      expect("error" in resolveDespawnTarget("nope", home)).toBe(true);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

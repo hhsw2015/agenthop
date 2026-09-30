@@ -375,8 +375,8 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
       }),
       agenthop_despawn: tool({
         description:
-          "Close a sub-agent window agenthop spawned, by its window id (from agenthop_spawn / agenthop_spawned). Refuses any id agenthop did not spawn, and before closing verifies the window's terminal still matches the one it launched (ids get reused, so a reused id is refused) — never closes a window you opened yourself.",
-        args: { window_id: tool.schema.string().describe("The window id agenthop_spawn returned (see agenthop_spawned)") },
+          "Close a sub-agent agenthop spawned, by its window id or launch id (from agenthop_spawn / agenthop_spawned). Closes only the exact terminal surface it launched (by that surface's stable UUID), so it never closes a window you opened — a reused window id has a different surface UUID and is refused; a split/tab you added survives. Prefer the launch id if a window id is ambiguous.",
+        args: { window_id: tool.schema.string().describe("The window id or launch id from agenthop_spawn / agenthop_spawned") },
         async execute({ window_id }: { window_id: string }): Promise<string> {
           // Safe by construction: despawn closes the recorded Ghostty surface UUID (unique, never
           // reused), not the window id — see spawn.ts.

@@ -114,7 +114,13 @@ export function buildCommand(argv: string[], scrub: string[] = SCRUB_ENV): strin
   return ["/usr/bin/env", ...scrub.map((v) => `-u ${v}`), ...argv.map(shquote)].join(" ");
 }
 
-/** Build the osascript that opens one Ghostty window and returns "<windowId>\t<surfaceUUID>". Pure. */
+/**
+ * Build the osascript that opens one Ghostty window and returns "<windowId>\t<surfaceUUID>". The surface
+ * id is taken from a SNAPSHOT of the new window's terminals and ONLY when there is exactly one — a fresh
+ * window has exactly its initial (our) surface, so count==1 binds our surface deterministically; if a
+ * concurrent split raced a second leaf in (SplitTree inserts new leaves first), count!=1 and we return
+ * an empty surface id rather than mis-bind the user's split. Pure.
+ */
 export function buildAppleScript(cfg: { command: string; cwd: string; env: string[] }): string {
   const envList = cfg.env.map((e) => `"${asEsc(e)}"`).join(", ");
   return [
@@ -125,7 +131,13 @@ export function buildAppleScript(cfg: { command: string; cwd: string; env: strin
     `  set environment variables of c to {${envList}}`,
     "  set wait after command of c to true",
     "  set w to new window with configuration c",
-    "  return (id of w) & tab & (id of (first terminal of w))",
+    "  set terms to terminals of w",
+    "  if (count of terms) is 1 then",
+    "    set sid to id of (item 1 of terms)",
+    "  else",
+    '    set sid to ""',
+    "  end if",
+    "  return (id of w) & tab & sid",
     "end tell",
   ].join("\n");
 }
@@ -206,7 +218,11 @@ function recordFile(home: string, lid: string): string {
 function isRecord(r: unknown): r is SpawnRecord {
   if (!r || typeof r !== "object") return false;
   const o = r as Record<string, unknown>;
-  return typeof o.launchId === "string" && typeof o.tool === "string" && typeof o.cwd === "string" && (o.windowId === null || typeof o.windowId === "string");
+  const windowOk = o.windowId === null || typeof o.windowId === "string";
+  // surfaceId may be absent/null (older or unbound record) but a non-string value is a corrupt record —
+  // reject it rather than let despawn hit asEsc(<non-string>) and throw.
+  const surfaceOk = o.surfaceId === undefined || o.surfaceId === null || typeof o.surfaceId === "string";
+  return typeof o.launchId === "string" && typeof o.tool === "string" && typeof o.cwd === "string" && windowOk && surfaceOk;
 }
 export function readRegistry(home: string = homedir()): SpawnRecord[] {
   let files: string[];
@@ -248,6 +264,22 @@ export function isSpawnedWindow(windowId: string, home: string = homedir()): boo
 }
 export function recordForWindow(windowId: string, home: string = homedir()): SpawnRecord | undefined {
   return readRegistry(home).find((r) => r.windowId === windowId);
+}
+
+/**
+ * Resolve a despawn target from a caller-supplied handle, preferring the UNIQUE launchId (one file per
+ * launch) so a reused window id can never pick the wrong record. Falls back to windowId, but a window id
+ * shared by several records (the OS reused it across two of our launches) is reported as ambiguous
+ * rather than silently resolved to the first.
+ */
+export function resolveDespawnTarget(handle: string, home: string = homedir()): { rec: SpawnRecord } | { error: string } | { ambiguous: SpawnRecord[] } {
+  const all = readRegistry(home);
+  const byLaunch = all.find((r) => r.launchId === handle); // launchId is the file key ⇒ at most one
+  if (byLaunch) return { rec: byLaunch };
+  const byWindow = all.filter((r) => r.windowId === handle);
+  if (byWindow.length === 1) return { rec: byWindow[0]! };
+  if (byWindow.length > 1) return { ambiguous: byWindow };
+  return { error: `"${handle}" is not a window agenthop dispatched. agenthop only ever closes agents it spawned, never sessions you opened. (See agenthop_spawned for ids I can close.)` };
 }
 export function forgetSpawn(launchId: string, home: string = homedir()): void {
   try {
@@ -359,8 +391,10 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
       note: `Could not confirm a Ghostty window opened (${r.err || "unknown error"}). A window MAY have opened (launchId ${lid}) — check agenthop_peers / agenthop_spawned before retrying; do not blindly re-spawn.`,
     };
   }
-  // The script returns "<windowId>\t<surfaceUUID>", both read in the same execution as creation.
-  const [windowId, surfaceId] = r.out.trim().split("\t");
+  // The script returns "<windowId>\t<surfaceUUID>" — the surface id came from a single-terminal snapshot
+  // of the new window (empty if a concurrent split made it ambiguous; we never mis-bind).
+  const [windowId, surfaceRaw] = r.out.trim().split("\t");
+  const surfaceId = surfaceRaw && surfaceRaw.trim() ? surfaceRaw.trim() : undefined;
   let recordOk = true;
   if (windowId) {
     recordOk = recordSpawn({ windowId, surfaceId: surfaceId ?? null, launchId: lid, tool: input.tool, cwd, ts: Date.now() });
@@ -370,7 +404,7 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
   const warn = !windowId
     ? ` (Ghostty returned no window id — launchId ${lid}.)`
     : !surfaceId
-      ? ` (warning: captured no surface id, so agenthop_despawn cannot close it safely — launchId ${lid}; close it manually if needed.)`
+      ? ` (warning: could not uniquely capture the surface id at launch, so agenthop_despawn can't close it safely — launchId ${lid}; close it manually if needed.)`
       : !recordOk
         ? ` (warning: could not persist the window record, so agenthop_despawn may not find it — launchId ${lid}.)`
         : "";
@@ -399,33 +433,37 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
 export type DespawnOptions = { home?: string };
 
 /**
- * Close a surface agenthop spawned — and ONLY that surface. Looks up the record by the window id the
- * caller was given, then closes by the recorded Ghostty surface UUID (unique, never reused, captured
- * atomically at creation). A user window that reused the window id has a different surface UUID and is
- * never matched; a split/tab the user added to our window survives. If the surface is gone, nothing is
- * closed. Never closes by the reusable window id.
+ * Close a surface agenthop spawned — and ONLY that surface. `handle` is the launchId (unique) or the
+ * window id agenthop_spawn returned; a window id shared by several records is reported as ambiguous
+ * (pick a launchId) rather than silently resolved. Closes by the recorded Ghostty surface UUID (unique,
+ * never reused, captured from a single-terminal snapshot at creation). A user window that reused the
+ * window id has a different surface UUID and is never matched; a split/tab the user added to our window
+ * survives. If the surface is gone, nothing is closed. Never closes by the reusable window id.
  */
-export async function despawnAgent(windowId: string, opts: DespawnOptions = {}): Promise<{ ok: boolean; note: string }> {
+export async function despawnAgent(handle: string, opts: DespawnOptions = {}): Promise<{ ok: boolean; note: string }> {
   const home = opts.home ?? homedir();
-  const id = windowId.trim();
-  if (!id) return { ok: false, note: "No window id given." };
+  const key = handle.trim();
+  if (!key) return { ok: false, note: "No window id or launch id given." };
   if (platform() !== "darwin") return { ok: false, note: "agenthop_despawn currently supports macOS + Ghostty only." };
-  const rec = recordForWindow(id, home);
-  if (!rec) {
-    return { ok: false, note: `Refusing to close "${id}": it is not a window agenthop dispatched. agenthop only ever closes agents it spawned, never sessions you opened. (See agenthop_spawned for ids I can close.)` };
+  const target = resolveDespawnTarget(key, home);
+  if ("error" in target) return { ok: false, note: target.error };
+  if ("ambiguous" in target) {
+    const ids = target.ambiguous.map((r) => r.launchId).join(", ");
+    return { ok: false, note: `Window id "${key}" matches ${target.ambiguous.length} spawned records (its id was reused across launches). Despawn one by its launch id instead: ${ids}. (See agenthop_spawned.)` };
   }
+  const rec = target.rec;
   if (!rec.surfaceId) {
     // No surface UUID captured — we will NOT fall back to closing by the reusable window id.
-    return { ok: false, note: `Cannot safely close "${id}": no surface id was captured at spawn (launchId ${rec.launchId}). agenthop won't close by a reusable window id. Close it manually if needed; the record is kept.` };
+    return { ok: false, note: `Cannot safely close "${key}": no surface id was captured at spawn (launchId ${rec.launchId}). agenthop won't close by a reusable window id. Close it manually if needed; the record is kept.` };
   }
   const res = await closeSurface(rec.surfaceId);
   if (res === "closed") {
     forgetSpawn(rec.launchId, home);
-    return { ok: true, note: `Closed the spawned terminal (window ${id}).` };
+    return { ok: true, note: `Closed the spawned terminal (launchId ${rec.launchId}).` };
   }
   if (res === "absent") {
     forgetSpawn(rec.launchId, home);
     return { ok: true, note: `That spawned terminal is already gone; removed its record. (Closed nothing.)` };
   }
-  return { ok: false, note: `Could not close the spawned terminal for ${id} (Ghostty unreachable or permission). Record kept; retry once reachable.` };
+  return { ok: false, note: `Could not close the spawned terminal (launchId ${rec.launchId}): Ghostty unreachable or permission denied. Record kept; retry once reachable.` };
 }
