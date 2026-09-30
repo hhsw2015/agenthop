@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import path from "node:path";
 import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
@@ -19,11 +19,16 @@ import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
  *
  * SAFETY — despawn only ever closes a window agenthop spawned, never a session the user opened. That
  * guarantee cannot rest on the window id alone: a Ghostty window id is `ObjectIdentifier(window)` (an
- * object address) that is REUSED after the window closes, so a stale record could otherwise authorize
- * closing a later user window that reused the address. Instead every spawn injects a unique
- * AGENTHOP_LAUNCH_ID; the spawned session republishes it on the bus (SelfInfo.launchId), and despawn
- * closes the stored window id ONLY while a live peer still carries that launchId (alive ⇒ our window
- * never closed ⇒ the id is still valid and still ours). No live peer ⇒ never send a close.
+ * object address) REUSED after the window closes, so a stale record could otherwise authorize closing
+ * a later user window that reused the address. So at spawn we also record the new window's terminal
+ * `tty` (a device path stable for the window's whole life), and despawn closes in a SINGLE AppleScript
+ * that closes `window whose id is <id>` ONLY IF its terminal's tty still equals the recorded tty —
+ * read and compared in the same script execution as the close, so there is no check→close gap to
+ * exploit. A user window reusing the id has a different tty ⇒ never closed. (Residual: the id AND the
+ * exact tty device both reused by a replacement window within that one script execution — a double
+ * coincidence, same self-healing class as the broker/bridge locks.) A unique AGENTHOP_LAUNCH_ID is
+ * also injected and republished on the bus (SelfInfo.launchId); it gates a fallback for the rare record
+ * that has no tty, and lets agenthop_peers show which live session is which spawn.
  */
 
 export const AGENTS: Record<string, string[]> = {
@@ -190,7 +195,7 @@ function ghosttyPresent(): boolean {
 // bus sessions never lose each other's records to a shared read-modify-write (a single JSON array
 // could). A record is written with windowId=null BEFORE the window is opened (so a lost/timed-out
 // launch is still discoverable) and updated with the id on success.
-export type SpawnRecord = { windowId: string | null; launchId: string; tool: string; cwd: string; ts: number };
+export type SpawnRecord = { windowId: string | null; launchId: string; tool: string; cwd: string; ts: number; tty?: string | null };
 
 function registryDir(home: string): string {
   return path.join(home, ".agenthop", "spawned");
@@ -223,12 +228,19 @@ export function readRegistry(home: string = homedir()): SpawnRecord[] {
   return out;
 }
 export function recordSpawn(rec: SpawnRecord, home: string = homedir()): boolean {
+  const p = recordFile(home, rec.launchId);
+  const tmp = `${p}.tmp.${randomBytes(4).toString("hex")}`;
   try {
-    const p = recordFile(home, rec.launchId);
     mkdirSync(path.dirname(p), { recursive: true });
-    writeFileSync(p, `${JSON.stringify(rec, null, 2)}\n`); // one file per launch — no cross-process RMW
+    writeFileSync(tmp, `${JSON.stringify(rec, null, 2)}\n`);
+    renameSync(tmp, p); // atomic replace — a failed/partial write never truncates the existing record
     return true;
   } catch {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // leftover temp is harmless (readRegistry only reads *.json)
+    }
     return false;
   }
 }
@@ -283,6 +295,39 @@ async function ghosttyWindowExists(id: string): Promise<"yes" | "no" | "unknown"
   return v === "true" ? "yes" : v === "false" ? "no" : "unknown";
 }
 
+/** The tty device path of a window's terminal, captured at spawn as a stable per-window identity. */
+async function ghosttyTerminalTty(id: string): Promise<string | undefined> {
+  const r = await runOsascript(`tell application "Ghostty"
+  set matches to (windows whose id is "${asEsc(id)}")
+  if matches is {} then return ""
+  return tty of (first terminal of (item 1 of matches))
+end tell`);
+  const t = r.out.trim();
+  return r.ok && t ? t : undefined;
+}
+
+/**
+ * Atomically close the window `id` ONLY IF its terminal's tty still equals `tty` — the read and the
+ * close happen in one AppleScript execution, so a window-id reuse cannot slip in between (no TOCTOU).
+ * "mismatch" ⇒ the id now names a different window (ours is gone); we closed nothing.
+ */
+async function closeWindowIfTty(id: string, tty: string): Promise<"closed" | "mismatch" | "absent" | "unknown"> {
+  const r = await runOsascript(`tell application "Ghostty"
+  set matches to (windows whose id is "${asEsc(id)}")
+  if matches is {} then return "absent"
+  set target to item 1 of matches
+  if (tty of (first terminal of target)) is "${asEsc(tty)}" then
+    close target
+    return "closed"
+  else
+    return "mismatch"
+  end if
+end tell`);
+  if (!r.ok) return "unknown";
+  const v = r.out.trim();
+  return v === "closed" || v === "mismatch" || v === "absent" ? v : "unknown";
+}
+
 async function omniwmWindowIds(bin: string): Promise<string[] | undefined> {
   const r = await runOmniwmctl(bin, ["query", "windows", "--app", "Ghostty", "--fields", "id", "--format", "json"], 3000);
   if (r.code !== 0) return undefined; // a FAILED query is unknown, not "no windows" — never treat as []
@@ -317,7 +362,7 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
   if ("error" in cli) return { ok: false, arranged: false, note: cli.error };
   if (platform() !== "darwin") return { ok: false, arranged: false, note: "agenthop_spawn currently supports macOS + Ghostty only." };
   if (!ghosttyPresent()) return { ok: false, arranged: false, note: "Ghostty.app not found; agenthop_spawn needs Ghostty." };
-  const cwd = input.cwd && input.cwd.trim() ? path.resolve(input.cwd) : process.cwd();
+  let cwd = input.cwd && input.cwd.trim() ? path.resolve(input.cwd) : process.cwd();
   let st: ReturnType<typeof statSync>;
   try {
     st = statSync(cwd);
@@ -325,6 +370,13 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
     return { ok: false, arranged: false, note: `cwd does not exist: ${cwd}` };
   }
   if (!st.isDirectory()) return { ok: false, arranged: false, note: `cwd is not a directory: ${cwd}` };
+  // Use the PHYSICAL path: codex keys folder-trust on the realpath, so a /tmp alias or a symlinked cwd
+  // would otherwise be launched under a path the trust entry does not cover (codex would still prompt).
+  try {
+    cwd = realpathSync(cwd);
+  } catch {
+    // keep the resolved path if realpath fails (e.g. permissions) — trust may then not match, but safe
+  }
 
   // codex: pre-trust this folder per-invocation via `-c` (no global config write).
   const argv = input.tool === "codex" ? [cli.argv[0]!, ...codexTrustArgs(cwd), ...cli.argv.slice(1)] : cli.argv;
@@ -357,13 +409,22 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
     };
   }
   const windowId = r.out.trim() || undefined;
-  if (windowId) recordSpawn({ windowId, launchId: lid, tool: input.tool, cwd, ts: Date.now() });
+  // Capture the window's terminal tty NOW — it is the stable identity despawn verifies before closing.
+  let recordOk = true;
+  if (windowId) {
+    const tty = await ghosttyTerminalTty(windowId);
+    recordOk = recordSpawn({ windowId, launchId: lid, tool: input.tool, cwd, ts: Date.now(), tty: tty ?? null });
+  }
 
   const workspace = (input.workspace && input.workspace.trim()) || env.AGENTHOP_SPAWN_WORKSPACE?.trim();
-  const tail = "It will appear in agenthop_peers shortly; use agenthop_handoff to give it a task.";
-  const idNote = windowId ? `` : ` (Ghostty returned no window id, so it can't be despawned by id — launchId ${lid}.)`;
+  const warn = !windowId
+    ? ` (Ghostty returned no window id, so it can't be despawned by id — launchId ${lid}.)`
+    : !recordOk
+      ? ` (warning: could not persist the window record, so agenthop_despawn may not find it — launchId ${lid}.)`
+      : "";
+  const tail = `It will appear in agenthop_peers shortly; use agenthop_handoff to give it a task.${warn}`;
   if (!workspace) {
-    return { ok: true, arranged: false, windowId, launchId: lid, note: `Launched ${input.tool} in a visible Ghostty window on the current workspace.${idNote} ${tail}` };
+    return { ok: true, arranged: false, windowId, launchId: lid, note: `Launched ${input.tool} in a visible Ghostty window on the current workspace. ${tail}` };
   }
   if (!bin || !canArrange) {
     return { ok: true, arranged: false, windowId, workspace, launchId: lid, note: `Launched ${input.tool}; OmniWM not reachable, so it stays on the current workspace (wanted ${workspace}). ${tail}` };
@@ -401,6 +462,27 @@ export async function despawnAgent(windowId: string, opts: DespawnOptions = {}):
     return { ok: false, note: `Refusing to close "${id}": it is not a window agenthop dispatched. agenthop only ever closes agents it spawned, never sessions you opened. (See agenthop_spawned for ids I can close.)` };
   }
 
+  // PRIMARY path: verify the window's terminal tty matches what we recorded at spawn, atomically with
+  // the close (single AppleScript). A user window that reused the id has a different tty ⇒ never closed.
+  if (rec.tty) {
+    const res = await closeWindowIfTty(id, rec.tty);
+    if (res === "closed") {
+      forgetSpawn(rec.launchId, home);
+      return { ok: true, note: `Closed spawned window ${id}.` };
+    }
+    if (res === "absent") {
+      forgetSpawn(rec.launchId, home);
+      return { ok: true, note: `Window ${id} is already gone; removed its record. (Closed nothing.)` };
+    }
+    if (res === "mismatch") {
+      forgetSpawn(rec.launchId, home);
+      return { ok: true, note: `Window id ${id} now belongs to a DIFFERENT window (its terminal no longer matches the one agenthop spawned), so agenthop's window is already gone. Closed nothing and removed the stale record — this is exactly the guard that prevents closing a window you opened.` };
+    }
+    return { ok: false, note: `Could not verify/close ${id} (Ghostty unreachable or permission). Record kept; retry once reachable.` };
+  }
+
+  // FALLBACK (record predates tty capture, or the tty query failed at spawn): gate on a live peer whose
+  // process is up, then close by id. Weaker than the tty check, but never closes a provably-dead session.
   const alive = opts.isAlive?.(rec.launchId) ?? false;
   if (!alive) {
     // Cannot prove ownership from the id alone (it is reusable). Do NOT close. At most, forget a record

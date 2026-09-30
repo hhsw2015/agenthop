@@ -378,7 +378,7 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
       }),
       agenthop_despawn: tool({
         description:
-          "Close a sub-agent window agenthop spawned, by its window id (from agenthop_spawn / agenthop_spawned). Refuses any id agenthop did not spawn — never closes a session you opened yourself.",
+          "Close a sub-agent window agenthop spawned, by its window id (from agenthop_spawn / agenthop_spawned). Refuses any id agenthop did not spawn, and before closing verifies the window's terminal still matches the one it launched (ids get reused, so a reused id is refused) — never closes a window you opened yourself.",
         args: { window_id: tool.schema.string().describe("The window id agenthop_spawn returned (see agenthop_spawned)") },
         async execute({ window_id }: { window_id: string }, context: ToolContext): Promise<string> {
           // Only close while a live bus peer still carries this window's launchId AND its process is up

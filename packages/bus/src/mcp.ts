@@ -157,7 +157,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
     "agenthop_despawn",
     {
       description:
-        "Close a sub-agent window that agenthop spawned, by its window id (from agenthop_spawn / agenthop_spawned). Refuses any id agenthop did not spawn — it never closes a session you opened yourself.",
+        "Close a sub-agent window that agenthop spawned, by its window id (from agenthop_spawn / agenthop_spawned). Refuses any id agenthop did not spawn, and before closing verifies the window's terminal still matches the one it launched (window ids get reused, so a reused id is refused) — it can never close a window you opened yourself.",
       inputSchema: { window_id: z.string().describe("The window id agenthop_spawn returned (see agenthop_spawned)") },
     },
     async ({ window_id }, extra) => {
