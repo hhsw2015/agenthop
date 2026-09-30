@@ -17,18 +17,24 @@ import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
  * (claude --dangerously-skip-permissions, codex --dangerously-bypass-approvals-and-sandbox,
  * opencode --auto). Override the flags per tool with AGENTHOP_SPAWN_ARGS_<TOOL>.
  *
- * SAFETY — despawn closes ONLY the terminal SURFACE agenthop spawned, addressed by its Ghostty surface
- * UUID. This is what makes "never close a window you opened" actually hold:
- *   - A window id is an ObjectIdentifier (object address) Ghostty REUSES after a window closes, so it
- *     cannot identify our window later. A surface UUID is random, unique, and never reused — a user
- *     window that reused our window id has a different surface UUID, so it is never matched.
- *   - The UUID is captured in the SAME AppleScript that creates the window (no separate query), so there
- *     is no create→capture gap in which a reused id could bind the wrong surface.
- *   - despawn issues Ghostty's `close <terminal whose id is UUID>`, which closes just that surface — a
- *     split or tab the user later added to our window is NOT taken down with it. If the surface is gone,
- *     nothing is closed. No window-id, tty, or liveness guess is involved.
- * A unique AGENTHOP_LAUNCH_ID is still injected (a Phase-2 claim/ready seed) and recorded so
- * agenthop_spawned can tell concurrent same-dir launches apart.
+ * SAFETY — despawn closes ONLY a terminal SURFACE agenthop recorded, addressed by that surface's
+ * Ghostty UUID (random, unique, NEVER reused — unlike a window id, which is an ObjectIdentifier address
+ * Ghostty reuses after a window closes). Concretely:
+ *   - A session the user opened themselves is a different window that is never in the registry, so
+ *     despawn refuses it outright. This is the property the user asked for.
+ *   - despawn issues `close <terminal whose id is UUID>` — it closes that one surface, never a whole
+ *     window by its reusable id; if the surface is gone, nothing is closed.
+ *   - The surface UUID is captured in the SAME AppleScript that creates the window, from a snapshot of
+ *     the window's terminals, and ONLY when there is exactly one (a concurrent split ⇒ ambiguous ⇒ we
+ *     record no surface and despawn refuses, rather than mis-bind).
+ * KNOWN RESIDUAL (documented, deferred to Phase 2): the count==1 snapshot proves uniqueness, not
+ * provenance. If, in the sub-millisecond window of that one creation script, an AUTOMATED client both
+ * splits our brand-new window and closes our initial surface, the snapshot could bind the intruder's
+ * surface. A human cannot do this; env/command are not readable so the dispatcher cannot verify
+ * provenance. The airtight fix is a Phase-2 claim: the spawned child (the authoritative owner of its
+ * surface) self-registers its surface UUID; despawn would then close only a child-claimed surface. The
+ * injected AGENTHOP_LAUNCH_ID is the seed for that claim, and is recorded so agenthop_spawned can tell
+ * concurrent launches apart.
  */
 
 export const AGENTS: Record<string, string[]> = {

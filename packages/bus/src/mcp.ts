@@ -157,7 +157,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
     "agenthop_despawn",
     {
       description:
-        "Close a sub-agent that agenthop spawned, by its window id or launch id (from agenthop_spawn / agenthop_spawned). It closes only the exact terminal surface it launched (by that surface's stable UUID), so it can never close a window you opened — a reused window id has a different surface UUID and is refused; a split/tab you added to its window survives. Prefer the launch id if a window id is ambiguous.",
+        "Close a sub-agent that agenthop spawned, by its window id or launch id (from agenthop_spawn / agenthop_spawned). It closes only the exact terminal surface it recorded (by that surface's stable UUID), never a whole window by its reusable id. A session you opened yourself is a different window that is never in agenthop's registry, so it is refused. Prefer the launch id if a window id is ambiguous.",
       inputSchema: { window_id: z.string().describe("The window id or launch id from agenthop_spawn / agenthop_spawned") },
     },
     async ({ window_id }, extra) => {
