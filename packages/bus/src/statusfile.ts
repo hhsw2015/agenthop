@@ -1,5 +1,5 @@
 import { watch, type FSWatcher } from "node:fs";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -38,18 +38,47 @@ export function readStatusFile(home: string, key: string): StatusFile | undefine
   return undefined;
 }
 
+/** Best-effort short sleep for the write lock (this runs in the short-lived `report-status` process). */
+function sleepMs(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    // SharedArrayBuffer unavailable — skip the wait; the retry loop just spins a little faster
+  }
+}
+
 /**
- * Write a session's status atomically (temp + rename). The seq is a monotonic timestamp: at least the
- * previous seq + 1, so two writes in the same millisecond still advance and the reader's monotonic guard
- * never wrongly drops a newer report. Returns whether it was written.
+ * Write a session's status atomically (temp + rename), under a per-key O_EXCL lock so concurrent
+ * `report-status` processes (async hooks fire in parallel) serialize. The `seq` is the EVENT time (the
+ * moment the hook fired / report-status started) — NOT the write time — so an out-of-order or delayed
+ * write carries an OLDER seq and is dropped by the reader's monotonic guard rather than clobbering a
+ * newer state. Under the lock we also refuse to regress: a state already on disk with a >= seq wins.
+ * Returns whether the intended state is (now, or already was) the recorded one.
  */
 export function writeStatusFile(home: string, key: string, state: string, opts?: { seq?: number; text?: string }): boolean {
   if (!STATES.has(state)) return false;
   const p = statusFile(home, key);
-  const tmp = `${p}.tmp.${randomBytes(4).toString("hex")}`;
+  const lock = `${p}.lock`;
+  const seq = opts?.seq ?? Date.now(); // event time; do NOT bump above the previous — ordering is by event
   try {
     mkdirSync(path.dirname(p), { recursive: true });
-    const seq = opts?.seq ?? Math.max(Date.now(), (readStatusFile(home, key)?.seq ?? 0) + 1);
+  } catch {
+    return false;
+  }
+  // Acquire the lock (bounded); if we can't, fall through and write anyway (best-effort status).
+  let held = false;
+  for (let i = 0; i < 20 && !held; i++) {
+    try {
+      closeSync(openSync(lock, "wx"));
+      held = true;
+    } catch {
+      sleepMs(15);
+    }
+  }
+  const tmp = `${p}.tmp.${randomBytes(4).toString("hex")}`;
+  try {
+    const prev = readStatusFile(home, key);
+    if (prev && prev.seq >= seq) return true; // a newer (or equal) event is already recorded — don't regress
     const rec: StatusFile = { state, seq, ...(opts?.text?.trim() ? { text: opts.text.trim() } : {}) };
     writeFileSync(tmp, `${JSON.stringify(rec, null, 2)}\n`);
     renameSync(tmp, p);
@@ -61,6 +90,14 @@ export function writeStatusFile(home: string, key: string, state: string, opts?:
       // leftover temp is harmless
     }
     return false;
+  } finally {
+    if (held) {
+      try {
+        rmSync(lock, { force: true });
+      } catch {
+        // best effort
+      }
+    }
   }
 }
 
@@ -79,6 +116,9 @@ export function watchStatusDir(home: string, onChange: () => void): () => void {
   let watcher: FSWatcher | undefined;
   try {
     watcher = watch(dir, () => onChange());
+    // A watcher 'error' (e.g. EIO) would be an uncaught exception that kills the process; swallow it and
+    // let the poll fallback below keep working.
+    watcher.on("error", () => {});
   } catch {
     // fall back to the poll below
   }

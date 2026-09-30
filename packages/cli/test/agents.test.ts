@@ -91,7 +91,7 @@ describe("plugging into agents as an MCP server", () => {
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "my-logger" }] }] } }));
 
-    expect(installClaudeStatusHooks(BIN, dir)).toContain("installed");
+    expect(installClaudeStatusHooks(BIN, dir)).toContain("wrote");
     const cfg = JSON.parse(await readFile(file, "utf8"));
     expect(cfg.model).toBe("opus"); // unrelated key preserved
     const cmds = (event: string) => (cfg.hooks[event] as { hooks: { command: string }[] }[]).flatMap((g) => g.hooks.map((h) => h.command));
@@ -103,6 +103,26 @@ describe("plugging into agents as an MCP server", () => {
     expect(installClaudeStatusHooks(BIN, dir)).toContain("already has agenthop status hooks"); // idempotent
     const cfg2 = JSON.parse(await readFile(file, "utf8"));
     expect((cfg2.hooks.Stop as unknown[]).length).toBe(2); // user's + ours, no duplicate
+  });
+
+  it("refreshes the agenthop hook command when the binary path changes, without duplicating", async () => {
+    const dir = await home();
+    installClaudeStatusHooks("/old/path/agenthop", dir);
+    const msg = installClaudeStatusHooks("/new/path/agenthop", dir);
+    expect(msg).toContain("wrote"); // refreshed, not "already has"
+    const cfg = JSON.parse(await readFile(path.join(dir, ".claude", "settings.json"), "utf8"));
+    const stop = cfg.hooks.Stop as { hooks: { command: string }[] }[];
+    expect(stop.length).toBe(1); // refreshed in place, no duplicate group
+    expect(stop[0].hooks[0].command).toContain("/new/path/agenthop");
+    expect(stop[0].hooks[0].command).not.toContain("/old/path/agenthop");
+  });
+
+  it("shell-single-quotes the binary path so metacharacters can't be expanded", async () => {
+    const dir = await home();
+    installClaudeStatusHooks("/opt/a b/$(touch pwned)/agenthop", dir);
+    const cfg = JSON.parse(await readFile(path.join(dir, ".claude", "settings.json"), "utf8"));
+    const cmd = (cfg.hooks.Stop as { hooks: { command: string }[] }[])[0].hooks[0].command;
+    expect(cmd.startsWith("'/opt/a b/$(touch pwned)/agenthop' report-status idle")).toBe(true); // single-quoted, inert
   });
 
   it("refuses to touch a non-JSON settings.json", async () => {

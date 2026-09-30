@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { t } from "./lang.js";
@@ -162,6 +163,14 @@ function entry(bin: string) {
  * Idempotent: skips any event that already has an agenthop status hook; preserves the user's other hooks
  * and the rest of settings.json (parse → merge → atomic write). ~/.claude/settings.json is JSON, so this
  * is a safe structured edit (unlike codex's TOML). Returns what changed.
+ *
+ * Known limitations (inherent to the hook set, documented, not bugs):
+ *  - There is no "unblocked"/"interrupted" hook event, so `blocked` clears at the NEXT turn boundary
+ *    (Stop / UserPromptSubmit), not the instant approval is granted. Spawned sub-agents run unattended
+ *    (no permission prompts) so they rarely enter `blocked` at all.
+ *  - `/clear` changes a session's id but the already-running MCP bus node keeps its startup id, so
+ *    status auto-updates stop until the session/MCP restarts — a pre-existing identity-model limit, not
+ *    specific to hooks.
  */
 export function installClaudeStatusHooks(bin: string, home = homedir()): string {
   const file = join(home, ".claude", "settings.json");
@@ -173,36 +182,63 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
       throw new Error(t(`${file} is not plain JSON; left it alone`, `${file} 不是纯 JSON，没有动它`));
     }
   }
-  const q = JSON.stringify(bin); // JSON-quoted path — the double quotes are literal (and safe) in the shell string
+  const q = shQuote(bin); // POSIX single-quote so a path with $()/backtick/space can't be expanded by the shell
   const cmd = (state: string): string => `${q} report-status ${state} >/dev/null 2>&1 || true`;
-  const groups: Record<string, { matcher?: string; hooks: Array<{ type: string; command: string; async: boolean }> }> = {
-    UserPromptSubmit: { hooks: [{ type: "command", command: cmd("working"), async: true }] },
-    Stop: { hooks: [{ type: "command", command: cmd("idle"), async: true }] },
-    PermissionRequest: { hooks: [{ type: "command", command: cmd("blocked"), async: true }] },
-  };
+  // Per-event marker (`report-status <state>`) — specific enough not to collide with an unrelated user
+  // hook, and lets us REFRESH the command if the agenthop path changed (upgrade) instead of duplicating.
+  const events: Array<{ event: string; state: string }> = [
+    { event: "UserPromptSubmit", state: "working" },
+    { event: "Stop", state: "idle" },
+    { event: "PermissionRequest", state: "blocked" },
+  ];
   const hooks = (config.hooks ??= {}) as Record<string, unknown>;
-  let added = 0;
-  for (const [event, group] of Object.entries(groups)) {
+  let changed = 0;
+  for (const { event, state } of events) {
     const arr = (hooks[event] ??= []) as unknown[];
     if (!Array.isArray(arr)) continue; // unexpected shape for this event — leave it alone
-    // Dedup: skip if this event already has an agenthop status hook (marker: the report-status command).
-    const already = arr.some((g) => Array.isArray((g as { hooks?: unknown[] })?.hooks) && (g as { hooks: unknown[] }).hooks.some((h) => typeof (h as { command?: unknown })?.command === "string" && ((h as { command: string }).command.includes("report-status"))));
-    if (already) continue;
-    arr.push(group);
-    added++;
+    const marker = `report-status ${state}`;
+    const want = cmd(state);
+    const ours = arr.find((g) => Array.isArray((g as { hooks?: unknown[] })?.hooks) && (g as { hooks: unknown[] }).hooks.some((h) => typeof (h as { command?: unknown })?.command === "string" && (h as { command: string }).command.includes(marker)));
+    if (ours) {
+      // Refresh the command in place (e.g. the agenthop path changed) without adding a duplicate.
+      for (const h of (ours as { hooks: Array<{ command?: string }> }).hooks) {
+        if (typeof h.command === "string" && h.command.includes(marker) && h.command !== want) {
+          h.command = want;
+          changed++;
+        }
+      }
+      continue;
+    }
+    arr.push({ hooks: [{ type: "command", command: want, async: true }] });
+    changed++;
   }
-  if (added === 0) return t(`${file} already has agenthop status hooks; nothing changed`, `${file} 里已有 agenthop 状态 hook，没有改动`);
+  if (changed === 0) return t(`${file} already has agenthop status hooks; nothing changed`, `${file} 里已有 agenthop 状态 hook，没有改动`);
   placeJson(file, config);
-  return t(`installed ${added} status hook(s) into ${file}`, `已装 ${added} 个状态 hook 到 ${file}`);
+  return t(`wrote ${changed} status hook change(s) to ${file}`, `已写 ${changed} 处状态 hook 改动到 ${file}`);
 }
 
-/** Write JSON via a sibling temp + rename (never truncate the original on a short/failed write). */
+/** POSIX single-quote a shell word (used in a hook command string). */
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Write JSON via a sibling temp + rename (never truncate the original on a short/failed write). Preserves
+ * the original file's permission mode (a rename would otherwise reset it to the umask default, widening a
+ * 0600 config to 0644). Uses a random temp name so concurrent writers don't consume each other's staging.
+ */
 function placeJson(file: string, config: unknown): void {
   mkdirSync(dirname(file), { recursive: true });
-  const staged = `${file}.new`;
-  rmSync(staged, { force: true });
+  const staged = `${file}.new.${randomBytes(4).toString("hex")}`;
   writeFileSync(staged, `${JSON.stringify(config, null, 2)}\n`);
   try {
+    let mode: number | undefined;
+    try {
+      mode = statSync(file).mode & 0o777;
+    } catch {
+      // no existing file — leave the temp's default mode
+    }
+    if (mode !== undefined) chmodSync(staged, mode);
     renameSync(staged, file);
   } catch (error) {
     rmSync(staged, { force: true });

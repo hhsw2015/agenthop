@@ -29,19 +29,20 @@ async function until(cond: () => boolean, ms = 3000): Promise<boolean> {
   return cond();
 }
 
-test("status file: round-trip, strictly-advancing seq, invalid state rejected", () => {
+test("status file: round-trip, event-seq wins, no regress, invalid state rejected", () => {
   const home = mkdtempSync(path.join(tmpdir(), "ah-sf-"));
   try {
-    expect(writeStatusFile(home, "k", "working")).toBe(true);
-    const first = readStatusFile(home, "k")!;
-    expect(first.state).toBe("working");
-    writeStatusFile(home, "k", "idle", { text: "done" });
-    const second = readStatusFile(home, "k")!;
-    expect(second.state).toBe("idle");
-    expect(second.text).toBe("done");
-    expect(second.seq).toBeGreaterThan(first.seq); // monotonic even within the same millisecond
-    expect(writeStatusFile(home, "k", "bogus")).toBe(false); // not a known state
-    expect(readStatusFile(home, "k")!.state).toBe("idle"); // unchanged by the rejected write
+    expect(writeStatusFile(home, "k", "working", { seq: 100 })).toBe(true);
+    expect(readStatusFile(home, "k")).toMatchObject({ state: "working", seq: 100 });
+    // A NEWER event (higher seq) wins.
+    writeStatusFile(home, "k", "idle", { seq: 200, text: "done" });
+    expect(readStatusFile(home, "k")).toMatchObject({ state: "idle", seq: 200, text: "done" });
+    // An OLDER event (lower seq — e.g. a delayed async write) must NOT regress the recorded state.
+    expect(writeStatusFile(home, "k", "working", { seq: 150 })).toBe(true); // returns ok (nothing to do)
+    expect(readStatusFile(home, "k")).toMatchObject({ state: "idle", seq: 200 }); // unchanged
+    // Invalid state rejected, disk untouched.
+    expect(writeStatusFile(home, "k", "bogus", { seq: 300 })).toBe(false);
+    expect(readStatusFile(home, "k")!.state).toBe("idle");
     expect(readStatusFile(home, "missing")).toBeUndefined();
   } finally {
     rmSync(home, { recursive: true, force: true });
