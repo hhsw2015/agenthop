@@ -21,26 +21,49 @@ export type HandoffInput = { summary: string; next?: string };
 
 /** A short, human-readable git snapshot of `cwd`, or undefined if it is not a git repo / git is absent. */
 export function gitSnapshotText(cwd: string): string | undefined {
-  const run = (args: string[]): string | undefined => {
+  // Return success separately from output: an empty-but-successful `status` (clean tree) must never be
+  // conflated with a FAILED status (a failure would otherwise be misreported as "clean"). Give git a
+  // generous buffer so a large-but-normal status is read rather than hitting ENOBUFS -> failure.
+  const git = (args: string[]): { ok: boolean; out: string } => {
     try {
-      return execFileSync("git", args, { cwd, encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim() || undefined;
+      const out = execFileSync("git", args, { cwd, encoding: "utf8", timeout: 3000, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+      return { ok: true, out };
     } catch {
-      return undefined;
+      return { ok: false, out: "" };
     }
   };
-  const head = run(["rev-parse", "--short", "HEAD"]);
-  const branch = run(["rev-parse", "--abbrev-ref", "HEAD"]);
-  if (!head && !branch) return undefined; // not a git repo, or git unavailable
-  const status = run(["status", "--porcelain"]);
-  const lines = status ? status.split("\n").filter(Boolean) : [];
-  let out = `${branch && branch !== "HEAD" ? branch : "(detached)"} @ ${head ?? "?"}`;
-  if (lines.length === 0) {
-    out += "\nworking tree: clean";
+
+  if (!git(["rev-parse", "--is-inside-work-tree"]).ok) return undefined; // not a git repo, or git absent
+
+  const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]);
+  const head = git(["rev-parse", "--short", "HEAD"]);
+  const branchName = branch.ok && branch.out.trim() && branch.out.trim() !== "HEAD" ? branch.out.trim() : undefined;
+  let headLine: string;
+  if (head.ok && head.out.trim()) {
+    headLine = `${branchName ?? "(detached)"} @ ${head.out.trim()}`;
   } else {
-    const shown = lines.slice(0, STATUS_LINES).join("\n").slice(0, STATUS_CAP);
-    out += `\nworking tree: ${lines.length} changed\n${shown}${lines.length > STATUS_LINES ? "\n  …" : ""}`;
+    // Unborn HEAD (a fresh repo with no commit yet): the rev-parses fail, but status still matters.
+    const sym = git(["symbolic-ref", "--short", "HEAD"]);
+    headLine = `${sym.ok && sym.out.trim() ? sym.out.trim() : "(no branch)"} @ (no commits yet)`;
   }
-  return out;
+
+  const status = git(["status", "--porcelain"]);
+  let treeLine: string;
+  if (!status.ok) {
+    treeLine = "working tree: unknown (git status failed)"; // never claim clean when we could not read it
+  } else {
+    // Strip ONLY a trailing newline — porcelain's leading status columns (e.g. " M file") are meaningful,
+    // so the whole output must not be trimmed.
+    const body = status.out.replace(/\n+$/, "");
+    const lines = body ? body.split("\n") : [];
+    if (lines.length === 0) {
+      treeLine = "working tree: clean";
+    } else {
+      const shown = lines.slice(0, STATUS_LINES).join("\n").slice(0, STATUS_CAP);
+      treeLine = `working tree: ${lines.length} changed\n${shown}${lines.length > STATUS_LINES ? "\n  …" : ""}`;
+    }
+  }
+  return `${headLine}\n${treeLine}`;
 }
 
 /** Build the handoff message the receiver will see. `from` is the sender's handle; `cwd` is snapshotted. */

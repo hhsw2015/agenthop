@@ -33,7 +33,7 @@ describe("handoff", () => {
     }
   });
 
-  it("reports a clean vs changed working tree", () => {
+  it("reports a clean vs changed working tree and preserves the porcelain status column", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "ah-git-"));
     const g = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "ignore"] });
     try {
@@ -47,7 +47,24 @@ describe("handoff", () => {
       writeFileSync(path.join(dir, "a.txt"), "hi\nmore\n");
       const snap = gitSnapshotText(dir)!;
       expect(snap).toContain("working tree: 1 changed");
-      expect(snap).toContain("a.txt");
+      // The leading " M" status column must survive (not be trimmed to "M a.txt").
+      expect(snap).toContain(" M a.txt");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still reports state for an unborn HEAD (a repo with no commit yet)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "ah-unborn-"));
+    const g = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "ignore"] });
+    try {
+      g("init", "-q");
+      writeFileSync(path.join(dir, "task.txt"), "todo\n");
+      const snap = gitSnapshotText(dir);
+      expect(snap).toBeDefined();
+      expect(snap!).toContain("no commits yet"); // not omitted just because HEAD is unborn
+      expect(snap!).toContain("task.txt"); // the untracked file still shows
+      expect(snap!).not.toContain("working tree: clean");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
