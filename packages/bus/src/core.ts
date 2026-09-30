@@ -157,11 +157,15 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // Auto-increment must strictly advance and stay a safe integer.
     if (seq === undefined && prev && prev.seq >= Number.MAX_SAFE_INTEGER) return { ok: false, ignored: true, seq: prev.seq };
     const entry: StatusEntry = { status: state, seq: seq ?? (prev?.seq ?? 0) + 1, text: opts?.text?.trim() || undefined, at: Date.now() };
+    const unchanged = entry.status === self.status && entry.text === self.statusText;
     statusByIdentity.set(key, entry);
     self.status = entry.status;
     self.statusSeq = entry.seq;
     self.statusText = entry.text;
     self.statusAt = entry.at;
+    // Skip the re-announce when neither state nor text changed (only the seq advanced) — a frequent
+    // PostToolUse→working report while already working must not spam the roster.
+    if (unchanged) return { ok: true, seq: entry.seq };
     local.updateSelf(self);
     relay?.updateSelf(self);
     return { ok: true, seq: entry.seq };

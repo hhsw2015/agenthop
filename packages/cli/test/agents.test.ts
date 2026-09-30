@@ -96,6 +96,7 @@ describe("plugging into agents as an MCP server", () => {
     expect(cfg.model).toBe("opus"); // unrelated key preserved
     const cmds = (event: string) => (cfg.hooks[event] as { hooks: { command: string }[] }[]).flatMap((g) => g.hooks.map((h) => h.command));
     expect(cmds("UserPromptSubmit").some((c) => c.includes("report-status working"))).toBe(true);
+    expect(cmds("PostToolUse").some((c) => c.includes("report-status working"))).toBe(true); // recovers from blocked
     expect(cmds("Stop").some((c) => c.includes("report-status idle"))).toBe(true);
     expect(cmds("Stop").some((c) => c.includes("my-logger"))).toBe(true); // user's own hook kept
     expect(cmds("PermissionRequest").some((c) => c.includes("report-status blocked"))).toBe(true);
@@ -103,6 +104,21 @@ describe("plugging into agents as an MCP server", () => {
     expect(installClaudeStatusHooks(BIN, dir)).toContain("already has agenthop status hooks"); // idempotent
     const cfg2 = JSON.parse(await readFile(file, "utf8"));
     expect((cfg2.hooks.Stop as unknown[]).length).toBe(2); // user's + ours, no duplicate
+  });
+
+  it("does not clobber a user hook that merely mentions report-status (ownership via sentinel)", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    await mkdir(path.dirname(file), { recursive: true });
+    // A user's own logger whose command contains the text "report-status idle" but not our sentinel.
+    await writeFile(file, JSON.stringify({ hooks: { Stop: [{ matcher: "Bash", hooks: [{ type: "command", command: "/bin/echo report-status idle", async: false }] }] } }));
+    installClaudeStatusHooks(BIN, dir);
+    const stop = (JSON.parse(await readFile(file, "utf8")).hooks.Stop) as { matcher?: string; hooks: { command: string; async?: boolean }[] }[];
+    expect(stop.length).toBe(2); // user's logger + ours, added not overwritten
+    const userGroup = stop.find((g) => g.matcher === "Bash")!;
+    expect(userGroup.hooks[0].command).toBe("/bin/echo report-status idle"); // untouched
+    expect(userGroup.hooks[0].async).toBe(false); // its fields untouched
+    expect(stop.some((g) => g.hooks.some((h) => h.command.includes("agenthop-status-hook:idle")))).toBe(true); // ours added
   });
 
   it("refreshes the agenthop hook command when the binary path changes, without duplicating", async () => {

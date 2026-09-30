@@ -1,5 +1,5 @@
 import { watch, type FSWatcher } from "node:fs";
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -38,45 +38,25 @@ export function readStatusFile(home: string, key: string): StatusFile | undefine
   return undefined;
 }
 
-/** Best-effort short sleep for the write lock (this runs in the short-lived `report-status` process). */
-function sleepMs(ms: number): void {
-  try {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  } catch {
-    // SharedArrayBuffer unavailable — skip the wait; the retry loop just spins a little faster
-  }
-}
-
 /**
- * Write a session's status atomically (temp + rename), under a per-key O_EXCL lock so concurrent
- * `report-status` processes (async hooks fire in parallel) serialize. The `seq` is the EVENT time (the
- * moment the hook fired / report-status started) — NOT the write time — so an out-of-order or delayed
- * write carries an OLDER seq and is dropped by the reader's monotonic guard rather than clobbering a
- * newer state. Under the lock we also refuse to regress: a state already on disk with a >= seq wins.
- * Returns whether the intended state is (now, or already was) the recorded one.
+ * Write a session's status atomically (temp + rename). Correctness rests on the SEQ being the EVENT time
+ * (the moment the hook fired / report-status started — see bin.ts), NOT the write time: a delayed or
+ * reordered write then carries an OLDER seq, so (a) writeStatusFile refuses to regress a disk entry that
+ * already has a >= seq, and (b) the reader's per-identity monotonic guard drops it even if a concurrent
+ * write momentarily lands it on disk. So no lock is needed: a "losing" concurrent write is by definition
+ * an older event, harmless to a live reader, and corrected by the next event. (Residual, same self-healing
+ * class as the broker/bridge locks: a fresh reader starting in the exact sub-millisecond of a concurrent
+ * write could read the older entry; two DISTINCT events in the same millisecond can't be ordered by a
+ * ms clock and the later may be dropped — turn-boundary events are seconds apart in practice.)
+ * Returns whether the intended state is now, or already was, the recorded one.
  */
 export function writeStatusFile(home: string, key: string, state: string, opts?: { seq?: number; text?: string }): boolean {
   if (!STATES.has(state)) return false;
   const p = statusFile(home, key);
-  const lock = `${p}.lock`;
   const seq = opts?.seq ?? Date.now(); // event time; do NOT bump above the previous — ordering is by event
-  try {
-    mkdirSync(path.dirname(p), { recursive: true });
-  } catch {
-    return false;
-  }
-  // Acquire the lock (bounded); if we can't, fall through and write anyway (best-effort status).
-  let held = false;
-  for (let i = 0; i < 20 && !held; i++) {
-    try {
-      closeSync(openSync(lock, "wx"));
-      held = true;
-    } catch {
-      sleepMs(15);
-    }
-  }
   const tmp = `${p}.tmp.${randomBytes(4).toString("hex")}`;
   try {
+    mkdirSync(path.dirname(p), { recursive: true });
     const prev = readStatusFile(home, key);
     if (prev && prev.seq >= seq) return true; // a newer (or equal) event is already recorded — don't regress
     const rec: StatusFile = { state, seq, ...(opts?.text?.trim() ? { text: opts.text.trim() } : {}) };
@@ -90,14 +70,6 @@ export function writeStatusFile(home: string, key: string, state: string, opts?:
       // leftover temp is harmless
     }
     return false;
-  } finally {
-    if (held) {
-      try {
-        rmSync(lock, { force: true });
-      } catch {
-        // best effort
-      }
-    }
   }
 }
 

@@ -183,11 +183,16 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
     }
   }
   const q = shQuote(bin); // POSIX single-quote so a path with $()/backtick/space can't be expanded by the shell
-  const cmd = (state: string): string => `${q} report-status ${state} >/dev/null 2>&1 || true`;
-  // Per-event marker (`report-status <state>`) — specific enough not to collide with an unrelated user
-  // hook, and lets us REFRESH the command if the agenthop path changed (upgrade) instead of duplicating.
+  // A trailing shell comment is our OWNERSHIP marker: unique per event, so we identify (and refresh) only
+  // OUR hook and never a user's command that merely mentions report-status. The shell ignores the comment.
+  const sentinel = (state: string): string => `# ${HOOK_SENTINEL}:${state}`;
+  const cmd = (state: string): string => `${q} report-status ${state} >/dev/null 2>&1 || true ${sentinel(state)}`;
+  // working on prompt-submit; working after each tool (recovers from `blocked` once an approval's tool
+  // runs, since there is no dedicated "unblocked" event); idle on stop; blocked the instant approval is
+  // requested. All events with no matcher fire always; PostToolUse with no matcher fires for every tool.
   const events: Array<{ event: string; state: string }> = [
     { event: "UserPromptSubmit", state: "working" },
+    { event: "PostToolUse", state: "working" },
     { event: "Stop", state: "idle" },
     { event: "PermissionRequest", state: "blocked" },
   ];
@@ -196,13 +201,13 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
   for (const { event, state } of events) {
     const arr = (hooks[event] ??= []) as unknown[];
     if (!Array.isArray(arr)) continue; // unexpected shape for this event — leave it alone
-    const marker = `report-status ${state}`;
+    const mark = sentinel(state);
     const want = cmd(state);
-    const ours = arr.find((g) => Array.isArray((g as { hooks?: unknown[] })?.hooks) && (g as { hooks: unknown[] }).hooks.some((h) => typeof (h as { command?: unknown })?.command === "string" && (h as { command: string }).command.includes(marker)));
+    const ours = arr.find((g) => Array.isArray((g as { hooks?: unknown[] })?.hooks) && (g as { hooks: unknown[] }).hooks.some((h) => typeof (h as { command?: unknown })?.command === "string" && (h as { command: string }).command.includes(mark)));
     if (ours) {
-      // Refresh the command in place (e.g. the agenthop path changed) without adding a duplicate.
+      // Refresh our command in place (e.g. the agenthop path changed) without adding a duplicate.
       for (const h of (ours as { hooks: Array<{ command?: string }> }).hooks) {
-        if (typeof h.command === "string" && h.command.includes(marker) && h.command !== want) {
+        if (typeof h.command === "string" && h.command.includes(mark) && h.command !== want) {
           h.command = want;
           changed++;
         }
@@ -217,6 +222,8 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
   return t(`wrote ${changed} status hook change(s) to ${file}`, `已写 ${changed} 处状态 hook 改动到 ${file}`);
 }
 
+const HOOK_SENTINEL = "agenthop-status-hook";
+
 /** POSIX single-quote a shell word (used in a hook command string). */
 function shQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
@@ -229,15 +236,17 @@ function shQuote(s: string): string {
  */
 function placeJson(file: string, config: unknown): void {
   mkdirSync(dirname(file), { recursive: true });
-  const staged = `${file}.new.${randomBytes(4).toString("hex")}`;
-  writeFileSync(staged, `${JSON.stringify(config, null, 2)}\n`);
+  let mode: number | undefined;
   try {
-    let mode: number | undefined;
-    try {
-      mode = statSync(file).mode & 0o777;
-    } catch {
-      // no existing file — leave the temp's default mode
-    }
+    mode = statSync(file).mode & 0o777; // preserve the existing file's permissions
+  } catch {
+    // no existing file — the temp keeps its default (umask) mode
+  }
+  const staged = `${file}.new.${randomBytes(4).toString("hex")}`;
+  // Create the temp at the target mode from the start (not 0644-then-chmod) so it is never briefly wider
+  // than the original. writeFileSync's mode is applied at O_CREAT (masked by umask); chmod makes it exact.
+  writeFileSync(staged, `${JSON.stringify(config, null, 2)}\n`, mode !== undefined ? { mode } : {});
+  try {
     if (mode !== undefined) chmodSync(staged, mode);
     renameSync(staged, file);
   } catch (error) {

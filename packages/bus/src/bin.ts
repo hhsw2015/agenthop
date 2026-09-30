@@ -12,6 +12,9 @@ import { version } from "./version.js";
  */
 
 async function main(): Promise<void> {
+  // Captured as early as possible: for `report-status`, this is our best proxy for the EVENT time (when
+  // the hook fired), so a delayed write still carries an older seq and can't clobber a newer state.
+  const startedAt = Date.now();
   const argv = process.argv.slice(2);
   const cmd = argv[0];
 
@@ -47,7 +50,7 @@ async function main(): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    writeStatusFile(statusHome(), key, state, { text: note });
+    writeStatusFile(statusHome(), key, state, { text: note, seq: startedAt });
     return;
   }
 
