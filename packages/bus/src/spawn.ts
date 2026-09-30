@@ -193,14 +193,15 @@ export function codexTrustArgs(cwd: string): string[] {
 }
 
 /**
- * codex CLI args that make it forward AGENTHOP_LAUNCH_ID from its own env into the agenthop MCP
- * subprocess (which codex otherwise clears), so the spawned session can self-register its window for
- * despawn. Done per-invocation via `-c` (merges with the file's command/args — verified) so NO config
- * file needs editing or migrating for existing installs. Overrides the agenthop server's env_vars for
- * this launch only; agenthop is our own server, so replacing its (normally empty) env_vars is safe. Pure.
+ * codex CLI args that set AGENTHOP_LAUNCH_ID in the agenthop MCP subprocess's environment (which codex
+ * otherwise clears), so the spawned session can self-register its window for despawn. Done per-invocation
+ * via `-c` on the `env` TABLE LEAF (not the `env_vars` passthrough array): this MERGES — it preserves the
+ * user's env_vars (e.g. an AGENTHOP_TEAM forward for cross-machine) and any other env keys, and needs no
+ * config-file edit/migration (verified against codex 0.159.2). We inject the actual launch id value
+ * (known at spawn time), so it does not depend on codex's own environment carrying it. Pure.
  */
-export function codexEnvForwardArgs(): string[] {
-  return ["-c", `mcp_servers.agenthop.env_vars=["AGENTHOP_LAUNCH_ID"]`];
+export function codexEnvForwardArgs(lid: string): string[] {
+  return ["-c", `mcp_servers.agenthop.env.AGENTHOP_LAUNCH_ID="${lid}"`];
 }
 
 function ghosttyPresent(): boolean {
@@ -488,10 +489,10 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
     // keep the resolved path if realpath fails (e.g. permissions) — trust may then not match, but safe
   }
 
-  // codex: per-invocation `-c` overrides — pre-trust this folder (no global config write) AND forward
-  // AGENTHOP_LAUNCH_ID into the agenthop MCP subprocess so this session can self-register its window.
-  const argv = input.tool === "codex" ? [cli.argv[0]!, ...codexTrustArgs(cwd), ...codexEnvForwardArgs(), ...cli.argv.slice(1)] : cli.argv;
   const lid = launchId(input.tool);
+  // codex: per-invocation `-c` overrides — pre-trust this folder (no global config write) AND set
+  // AGENTHOP_LAUNCH_ID in the agenthop MCP subprocess's env so this session can self-register its window.
+  const argv = input.tool === "codex" ? [cli.argv[0]!, ...codexTrustArgs(cwd), ...codexEnvForwardArgs(lid), ...cli.argv.slice(1)] : cli.argv;
   const command = buildCommand(argv);
   // Inject PATH/HOME (so the CLI finds node etc. under the GUI launch env) + the launch id. Inherited
   // identity is stripped by `env -u` in the command (see buildCommand / SCRUB_ENV).

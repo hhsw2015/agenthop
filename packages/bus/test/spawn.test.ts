@@ -122,9 +122,10 @@ describe("codexTrustArgs", () => {
 });
 
 describe("codexEnvForwardArgs", () => {
-  it("forwards AGENTHOP_LAUNCH_ID via a per-launch -c (merges with the file's command/args)", () => {
-    // codex clears the MCP subprocess env; this makes it pass the launch id through so the child can claim.
-    expect(codexEnvForwardArgs()).toEqual(["-c", 'mcp_servers.agenthop.env_vars=["AGENTHOP_LAUNCH_ID"]']);
+  it("sets the launch id in the env TABLE LEAF (merges; preserves the user's env_vars/env)", () => {
+    // Must target env.<KEY>, NOT the env_vars array — overriding env_vars would drop a user's
+    // AGENTHOP_TEAM passthrough (cross-machine team). Verified against codex 0.159.2 that this merges.
+    expect(codexEnvForwardArgs("agenthop-spawn:codex:abcd")).toEqual(["-c", 'mcp_servers.agenthop.env.AGENTHOP_LAUNCH_ID="agenthop-spawn:codex:abcd"']);
   });
 });
 
