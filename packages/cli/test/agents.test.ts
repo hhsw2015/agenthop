@@ -108,6 +108,8 @@ describe("plugging into agents as an MCP server", () => {
     expect(group("PermissionRequest").hooks[0].command).toContain("report-status blocked");
     expect(group("Stop").hooks[0].command).toContain("report-status idle");
     expect(group("Interrupt").hooks[0].command).toContain("report-status idle"); // Codex-only event clears blocked
+    expect(group("SessionStart").hooks[0].command).toContain("report-status idle"); // seed: no [unknown] at start
+    expect(group("UserPromptSubmit").hooks[0].command).toContain("report-status working");
     // Shared command: event-time --seq + ours-sentinel; session id comes from stdin (no --session needed).
     expect(group("Stop").hooks[0].command.startsWith("_ahT=$(")).toBe(true);
     expect(group("Stop").hooks[0].command).toContain("--seq");
@@ -171,6 +173,7 @@ describe("plugging into agents as an MCP server", () => {
     const cfg = JSON.parse(await readFile(file, "utf8"));
     expect(cfg.model).toBe("opus"); // unrelated key preserved
     const cmds = (event: string) => (cfg.hooks[event] as { hooks: { command: string }[] }[]).flatMap((g) => g.hooks.map((h) => h.command));
+    expect(cmds("SessionStart").some((c) => c.includes("report-status idle"))).toBe(true); // seed: no [unknown] at start
     expect(cmds("UserPromptSubmit").some((c) => c.includes("report-status working"))).toBe(true);
     expect(cmds("PostToolUse").some((c) => c.includes("report-status working"))).toBe(true); // recovers from blocked
     expect(cmds("Stop").some((c) => c.includes("report-status idle"))).toBe(true);

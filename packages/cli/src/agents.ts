@@ -167,9 +167,10 @@ function entry(bin: string) {
 
 /**
  * Install Claude Code hooks that auto-report this session's work state to the bus (Phase 3 slice B):
- * UserPromptSubmit→working, Stop→idle, PermissionRequest→blocked (the instant approval signal). All are
- * async fire-and-forget and side-effect-only (output suppressed, `|| true`), so they can never block a
- * turn, inject context, or fail. `agenthop report-status` reads CLAUDE_CODE_SESSION_ID from the hook env.
+ * SessionStart→idle (seed), UserPromptSubmit→working, Stop→idle, PermissionRequest→blocked (the instant
+ * approval signal). All are async fire-and-forget and side-effect-only (output suppressed, `|| true`), so
+ * they can never block a turn, inject context, or fail. `agenthop report-status` reads
+ * CLAUDE_CODE_SESSION_ID from the hook env.
  * Idempotent: skips any event that already has an agenthop status hook; preserves the user's other hooks
  * and the rest of settings.json (parse → merge → atomic write). ~/.claude/settings.json is JSON, so this
  * is a safe structured edit (unlike codex's TOML). Returns what changed.
@@ -185,11 +186,13 @@ function entry(bin: string) {
 export function installClaudeStatusHooks(bin: string, home = homedir()): string {
   const file = join(home, ".claude", "settings.json");
   const config = readJsonConfig(file); // throws (file left alone) if present but not plain JSON
-  // working on prompt-submit and after each tool (the latter recovers from `blocked` once an approval's tool
-  // runs — success or failure — there is no dedicated "unblocked" event); idle on stop, including a turn that
-  // ended on an API error (StopFailure) so it never sticks at `working`; blocked the instant an approval is
-  // requested. (All event names verified against the Claude Code hooks reference.)
+  // idle at session start (a freshly started/resumed session otherwise shows [unknown] until its first
+  // event); working on prompt-submit and after each tool (the latter recovers from `blocked` once an
+  // approval's tool runs — success or failure — there is no dedicated "unblocked" event); idle on stop,
+  // including a turn that ended on an API error (StopFailure) so it never sticks at `working`; blocked the
+  // instant an approval is requested. (All event names verified against the Claude Code hooks reference.)
   const events = [
+    { event: "SessionStart", state: "idle" },
     { event: "UserPromptSubmit", state: "working" },
     { event: "PostToolUse", state: "working" },
     { event: "PostToolUseFailure", state: "working" },
@@ -219,7 +222,10 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
 export function installCodexStatusHooks(bin: string, home = homedir()): string {
   const file = join(codexHome(home), "hooks.json"); // honor $CODEX_HOME — Codex reads hooks.json there, not always ~/.codex
   const config = readJsonConfig(file); // throws (file left alone) if present but not plain JSON
+  // SessionStart→idle seeds a fresh session's status (else it shows [unknown] until its first event);
+  // the event is in Codex's HookEventNameWire enum, same as Claude Code's (see the research doc).
   const events = [
+    { event: "SessionStart", state: "idle" },
     { event: "UserPromptSubmit", state: "working" },
     { event: "PostToolUse", state: "working" },
     { event: "Stop", state: "idle" },
