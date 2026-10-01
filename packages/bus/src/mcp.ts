@@ -29,7 +29,7 @@ export function busInstructions(): string {
 - agenthop_report_status(state): report THIS session's work state (working/idle/blocked/unknown) to peers; shows in agenthop_peers.
 - agenthop_wait_peer(to, until?): wait until another session reaches a state — e.g. a sub-agent you dispatched goes idle (done) or blocked (needs input).
 - agenthop_recv(timeout_seconds): fallback only — see below.
-- agenthop_spawn(tool, cwd?, workspace?): launch another agent (claude/codex/opencode) in a VISIBLE window on this machine; it joins the bus on its own, then hand it work with agenthop_handoff. Any session can dispatch — a decentralized, visible orchestration center.
+- agenthop_spawn(tool, cwd?, workspace?, visible?, task?): launch another agent (claude/codex/opencode) on this machine. YOU pick the mode per task: visible (default) = a VISIBLE window the user can watch — it joins the bus on its own, then hand it work with agenthop_handoff; visible:false = HEADLESS, no window — a detached one-shot run of the tool's non-interactive mode with the task argument as the prompt, output to a per-launch log file (the result channel), stoppable with agenthop_despawn. Rule of thumb: important or long-running work the user may want to watch → visible; minor/bulk/fire-and-forget checks, or a desktop already full of windows → headless. Any session can dispatch — a decentralized orchestration center.
 - agenthop_wm(args): drive the OmniWM window manager (macOS) to arrange windows — a passthrough to omniwmctl (e.g. "query windows", "window move-to-workspace <id> 2").
 
 Choosing a channel: agenthop reaches EVERY tool on the bus (Claude Code, Codex, OpenCode). If your host also has its OWN cross-session messaging (e.g. Claude Code's built-in), that only sees other sessions of the SAME tool — it cannot reach Codex or OpenCode. So use the host's native messaging for same-tool peers if you like, but use agenthop for ANY cross-tool peer: it is the only channel that bridges them, and agenthop_peers is where a different-tool session shows up at all.
@@ -158,16 +158,18 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
     "agenthop_spawn",
     {
       description:
-        "Launch another agent CLI (claude | codex | opencode) in a VISIBLE terminal window on this machine, and best-effort arrange it via the window manager. The new session joins the bus on its own — give it work with agenthop_handoff once it shows up in agenthop_peers. Sub-agents start in no-confirmation mode so they run unattended. macOS + Ghostty.",
+        "Launch another agent CLI (claude | codex | opencode) on this machine. YOU choose the mode per task: visible (default) opens a VISIBLE terminal window the user can watch (macOS + Ghostty), the session joins the bus — give it work with agenthop_handoff; visible:false runs it HEADLESS (no window, any platform) in the tool's native non-interactive mode with `task` as its prompt, output streaming to a per-launch log file. Prefer visible for important/watchable work, headless for minor/bulk runs or a full desktop. Sub-agents start in no-confirmation mode so they run unattended.",
       inputSchema: {
         tool: z.string().describe("Which agent to launch: claude | codex | opencode"),
         cwd: z.string().optional().describe("Working directory for the new session (default: this session's cwd)"),
-        workspace: z.string().optional().describe("WM workspace to move it to (default: current; or set AGENTHOP_SPAWN_WORKSPACE)"),
+        workspace: z.string().optional().describe("Visible only: WM workspace to move it to (default: current; or set AGENTHOP_SPAWN_WORKSPACE)"),
+        visible: z.boolean().optional().describe("true (default) = visible terminal window; false = headless detached background run (requires task)"),
+        task: z.string().optional().describe("The task. Headless: REQUIRED, becomes the one-shot prompt. Visible: not auto-delivered — send it with agenthop_handoff once the session appears in agenthop_peers"),
       },
     },
-    async ({ tool, cwd, workspace }, extra) => {
+    async ({ tool, cwd, workspace, visible, task }, extra) => {
       noteCodex(core, extra);
-      const result = await spawnAgent({ tool, cwd, workspace });
+      const result = await spawnAgent({ tool, cwd, workspace, visible, task });
       const note = result.windowId ? `${result.note} (window ${result.windowId} — close later with agenthop_despawn)` : result.note;
       return result.ok ? reply(note) : failure(note);
     },
@@ -192,13 +194,19 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_spawned",
     {
-      description: "List the sub-agent windows THIS machine's agenthop dispatched (window id, tool, cwd) — the only ones agenthop_despawn may close.",
+      description: "List the sub-agents THIS machine's agenthop dispatched — visible windows (window id, tool, cwd) and headless runs (pid, exit state, output log). The only ones agenthop_despawn may close.",
       inputSchema: {},
     },
     async (_args, extra) => {
       noteCodex(core, extra);
-      const rows = readRegistry().map((r) => `  ${r.windowId ?? "(pending)"}  ${r.launchId}  ${r.tool}  ${r.cwd}`);
-      return reply(rows.length ? `spawned windows:\n${rows.join("\n")}` : "No agents spawned by agenthop on this machine.");
+      const rows = readRegistry().map((r) => {
+        if (r.mode === "headless") {
+          const state = r.exitedAt !== undefined ? `exited(${r.exitCode ?? "?"})` : `running pid ${r.pid ?? "?"}`;
+          return `  [headless ${state}]  ${r.launchId}  ${r.tool}  ${r.cwd}${r.outputFile ? `  log: ${r.outputFile}` : ""}`;
+        }
+        return `  ${r.windowId ?? "(pending)"}  ${r.launchId}  ${r.tool}  ${r.cwd}`;
+      });
+      return reply(rows.length ? `spawned agents:\n${rows.join("\n")}` : "No agents spawned by agenthop on this machine.");
     },
   );
 
@@ -206,7 +214,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
     "agenthop_despawn",
     {
       description:
-        "Close a sub-agent that agenthop spawned, by its window id or launch id (from agenthop_spawn / agenthop_spawned). It closes only the exact terminal surface it recorded (by that surface's stable UUID), never a whole window by its reusable window id; an id it never recorded is refused. Prefer the launch id if a window id is ambiguous.",
+        "Close a sub-agent that agenthop spawned, by its window id or launch id (from agenthop_spawn / agenthop_spawned). Visible: closes only the exact terminal surface it recorded (by that surface's stable UUID), never a whole window by its reusable window id. Headless: terminates exactly the recorded pid after verifying it is still the launched process, never by name. An id it never recorded is refused. Prefer the launch id if a window id is ambiguous.",
       inputSchema: { window_id: z.string().describe("The window id or launch id from agenthop_spawn / agenthop_spawned") },
     },
     async ({ window_id }, extra) => {
