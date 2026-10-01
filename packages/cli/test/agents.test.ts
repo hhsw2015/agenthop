@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { installClaudeStatusHooks, mcpHints, opencodeConfigDir, opencodePluginPath, registerMcp, writeOpencodePlugin } from "../src/agents.js";
+import { installClaudeStatusHooks, installCodexStatusHooks, mcpHints, opencodeConfigDir, opencodePluginPath, registerMcp, writeOpencodePlugin } from "../src/agents.js";
 import { parseArgs } from "../src/args.js";
 
 const BIN = "/Users/someone/.local/bin/agenthop";
@@ -73,16 +73,75 @@ describe("plugging into agents as an MCP server", () => {
     expect(text).toContain(`command = "${BIN}"`);
   });
 
-  it("leaves an existing agenthop block byte-for-byte alone (no fragile TOML rewriting)", async () => {
+  it("never rewrites an existing agenthop MCP block; only appends the feature-enable (no fragile TOML rewriting)", async () => {
     const dir = await home();
     const file = path.join(dir, ".codex", "config.toml");
     await mkdir(path.dirname(file), { recursive: true });
-    // An old install without env_vars: we do NOT edit it (a spawned Codex gets forwarding via `codex -c`
-    // at launch instead). Rewriting existing TOML risks corrupting it.
+    // An old install with a different binary path: we do NOT rewrite that block (a spawned Codex gets
+    // forwarding via `codex -c` at launch instead). Rewriting existing TOML risks corrupting it.
     const before = `[mcp_servers.agenthop]\ncommand = "/old/agenthop"\nargs = ["mcp"]\n\n[mcp_servers.other]\ncommand = "x"\n`;
     await writeFile(file, before);
     expect(registerMcp(["codex"], BIN, dir)[0]).toContain("already has agenthop");
-    expect(await readFile(file, "utf8")).toBe(before); // untouched
+    const after = await readFile(file, "utf8");
+    expect(after.startsWith(before)).toBe(true); // existing bytes untouched (the old block is NOT rewritten)
+    expect(after).toContain('command = "/old/agenthop"'); // old path preserved, not bumped to BIN
+    expect(after).toContain("[features]\nhooks = true"); // feature-enable appended (required for hooks to run)
+    // hooks.json was written alongside (the actual status hooks).
+    const hooks = JSON.parse(await readFile(path.join(dir, ".codex", "hooks.json"), "utf8"));
+    expect(hooks.hooks.Stop[0].hooks[0].command).toContain("report-status idle");
+  });
+
+  it("installs Codex status hooks (hooks.json schema, async, stdin session id), enables the feature, flags trust", async () => {
+    const dir = await home();
+    const msg = installCodexStatusHooks(BIN, dir);
+    const hooks = JSON.parse(await readFile(path.join(dir, ".codex", "hooks.json"), "utf8"));
+    const group = (event: string) => hooks.hooks[event][0] as { matcher: string; hooks: { command: string; type: string; timeout: number; async?: boolean }[] };
+    // Same Claude-Code hooks.json schema: matcher-group + timeout (seconds); async so a slow report-status
+    // can't stall the approval UI.
+    expect(group("PermissionRequest").matcher).toBe("");
+    expect(group("PermissionRequest").hooks[0].timeout).toBe(10);
+    expect(group("PermissionRequest").hooks[0].async).toBe(true);
+    expect(group("PermissionRequest").hooks[0].command).toContain("report-status blocked");
+    expect(group("Stop").hooks[0].command).toContain("report-status idle");
+    expect(group("Interrupt").hooks[0].command).toContain("report-status idle"); // Codex-only event clears blocked
+    // Shared command: event-time --seq + ours-sentinel; session id comes from stdin (no --session needed).
+    expect(group("Stop").hooks[0].command.startsWith("_ahT=$(")).toBe(true);
+    expect(group("Stop").hooks[0].command).toContain("--seq");
+    expect(group("Stop").hooks[0].command.trimEnd().endsWith("# agenthop-status-hook:idle")).toBe(true);
+    // config.toml feature enabled (no prior [features] -> appended) + trust caveat surfaced.
+    expect(await readFile(path.join(dir, ".codex", "config.toml"), "utf8")).toContain("[features]\nhooks = true");
+    expect(msg).toContain("trust");
+    // Idempotent: a second run changes nothing in hooks.json and reports the feature already on.
+    const msg2 = installCodexStatusHooks(BIN, dir);
+    expect(msg2).toContain("already has agenthop status hooks");
+    expect(msg2).toContain("already enabled");
+  });
+
+  it("merges Codex status hooks beside another consumer's hooks and won't touch non-JSON hooks.json", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".codex", "hooks.json");
+    await mkdir(path.dirname(file), { recursive: true });
+    // Another tool already stacks a Stop hook (the real ~/.codex/hooks.json does this); we add beside it.
+    await writeFile(file, JSON.stringify({ hooks: { Stop: [{ matcher: "", hooks: [{ type: "command", command: "/other/logger", timeout: 5 }] }] } }));
+    installCodexStatusHooks(BIN, dir);
+    const stop = (JSON.parse(await readFile(file, "utf8")).hooks.Stop) as { hooks: { command: string }[] }[];
+    expect(stop.length).toBe(2); // other logger + ours
+    expect(stop.some((g) => g.hooks.some((h) => h.command === "/other/logger"))).toBe(true); // untouched
+    expect(stop.some((g) => g.hooks.some((h) => h.command.includes("agenthop-status-hook:idle")))).toBe(true); // ours
+    // A non-JSON hooks.json is refused (left byte-for-byte alone), surfaced via the register fallback.
+    await writeFile(file, "not json {");
+    expect(() => installCodexStatusHooks(BIN, dir)).toThrow();
+    expect(await readFile(file, "utf8")).toBe("not json {");
+  });
+
+  it("does not auto-edit an existing [features] table; asks the user to add the one line", async () => {
+    const dir = await home();
+    const toml = path.join(dir, ".codex", "config.toml");
+    await mkdir(path.dirname(toml), { recursive: true });
+    await writeFile(toml, "[features]\nweb_search = true\n");
+    const msg = installCodexStatusHooks(BIN, dir);
+    expect(msg).toContain("add 'hooks = true'"); // manual instruction, not an in-place edit
+    expect(await readFile(toml, "utf8")).toBe("[features]\nweb_search = true\n"); // TOML untouched
   });
 
   it("installs Claude status hooks (working/idle/blocked), idempotent, preserving other settings", async () => {
