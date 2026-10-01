@@ -40,7 +40,8 @@ export function readStatusFile(home: string, key: string): StatusFile | undefine
 
 /**
  * Write a session's status atomically (temp + rename). Correctness rests on the SEQ being the EVENT time
- * (the moment the hook fired / report-status started — see bin.ts), NOT the write time: a delayed or
+ * (captured in the hook shell and passed as --seq — see installClaudeStatusHooks; a manual or degraded
+ * run falls back to report-status's own start time), NOT the write time: a delayed or
  * reordered write then carries an OLDER seq, so (a) writeStatusFile refuses to regress a disk entry that
  * already has a >= seq, and (b) the reader's per-identity monotonic guard drops it even if a concurrent
  * write momentarily lands it on disk. So no lock is needed: a "losing" concurrent write is by definition

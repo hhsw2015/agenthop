@@ -183,17 +183,29 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
     }
   }
   const q = shQuote(bin); // POSIX single-quote so a path with $()/backtick/space can't be expanded by the shell
-  // A trailing shell comment is our OWNERSHIP marker: unique per event, so we identify (and refresh) only
-  // OUR hook and never a user's command that merely mentions report-status. The shell ignores the comment.
+  // Capture the EVENT time in the hook shell (not in `report-status`, whose node startup varies by tens of
+  // ms and can reorder two near-simultaneous events — e.g. a turn's last PostToolUse vs its Stop). `--seq`
+  // carries that instant so writeStatusFile's no-regress and the bus node's monotonic guard order by when
+  // the event fired. macOS `date` has no sub-second `%N`, so use perl (always present); GNU `date` elsewhere.
+  // If the time tool is missing, `_ahT` stays empty, `--seq` is omitted, and report-status falls back to its
+  // own start time (only manual/degraded paths, which never race).
+  const timeMs = process.platform === "darwin" ? `perl -MTime::HiRes=time -e 'printf "%.0f",time()*1000'` : "date +%s%3N";
+  // A TRAILING shell comment is our OWNERSHIP marker: unique per event, matched with endsWith so we refresh
+  // only OUR hook and never a user's command that merely CONTAINS the text (e.g. `printf '# ...:idle'`, where
+  // it is quoted data, not a trailing comment). The shell ignores the comment.
   const sentinel = (state: string): string => `# ${HOOK_SENTINEL}:${state}`;
-  const cmd = (state: string): string => `${q} report-status ${state} >/dev/null 2>&1 || true ${sentinel(state)}`;
-  // working on prompt-submit; working after each tool (recovers from `blocked` once an approval's tool
-  // runs, since there is no dedicated "unblocked" event); idle on stop; blocked the instant approval is
-  // requested. All events with no matcher fire always; PostToolUse with no matcher fires for every tool.
+  const ownedBy = (command: unknown, mark: string): command is string => typeof command === "string" && command.trimEnd().endsWith(mark);
+  const cmd = (state: string): string => `_ahT=$(${timeMs} 2>/dev/null); ${q} report-status ${state} \${_ahT:+--seq "\$_ahT"} >/dev/null 2>&1 || true ${sentinel(state)}`;
+  // working on prompt-submit and after each tool (the latter recovers from `blocked` once an approval's tool
+  // runs — success or failure — since there is no dedicated "unblocked" event); idle on stop, including a
+  // turn that ended on an API error (StopFailure) so it never sticks at `working`; blocked the instant an
+  // approval is requested. Events with no matcher fire always; PostToolUse* with no matcher fire per tool.
   const events: Array<{ event: string; state: string }> = [
     { event: "UserPromptSubmit", state: "working" },
     { event: "PostToolUse", state: "working" },
+    { event: "PostToolUseFailure", state: "working" },
     { event: "Stop", state: "idle" },
+    { event: "StopFailure", state: "idle" },
     { event: "PermissionRequest", state: "blocked" },
   ];
   const hooks = (config.hooks ??= {}) as Record<string, unknown>;
@@ -203,11 +215,11 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
     if (!Array.isArray(arr)) continue; // unexpected shape for this event — leave it alone
     const mark = sentinel(state);
     const want = cmd(state);
-    const ours = arr.find((g) => Array.isArray((g as { hooks?: unknown[] })?.hooks) && (g as { hooks: unknown[] }).hooks.some((h) => typeof (h as { command?: unknown })?.command === "string" && (h as { command: string }).command.includes(mark)));
+    const ours = arr.find((g) => Array.isArray((g as { hooks?: unknown[] })?.hooks) && (g as { hooks: unknown[] }).hooks.some((h) => ownedBy((h as { command?: unknown })?.command, mark)));
     if (ours) {
       // Refresh our command in place (e.g. the agenthop path changed) without adding a duplicate.
       for (const h of (ours as { hooks: Array<{ command?: string }> }).hooks) {
-        if (typeof h.command === "string" && h.command.includes(mark) && h.command !== want) {
+        if (ownedBy(h.command, mark) && h.command !== want) {
           h.command = want;
           changed++;
         }

@@ -138,7 +138,35 @@ describe("plugging into agents as an MCP server", () => {
     installClaudeStatusHooks("/opt/a b/$(touch pwned)/agenthop", dir);
     const cfg = JSON.parse(await readFile(path.join(dir, ".claude", "settings.json"), "utf8"));
     const cmd = (cfg.hooks.Stop as { hooks: { command: string }[] }[])[0].hooks[0].command;
-    expect(cmd.startsWith("'/opt/a b/$(touch pwned)/agenthop' report-status idle")).toBe(true); // single-quoted, inert
+    expect(cmd.startsWith("_ahT=$(")).toBe(true); // event time captured in the hook shell, before report-status
+    expect(cmd).toContain("'/opt/a b/$(touch pwned)/agenthop' report-status idle"); // single-quoted, inert
+  });
+
+  it("captures event time in the hook (--seq) and covers tool/turn failure events", async () => {
+    const dir = await home();
+    installClaudeStatusHooks(BIN, dir);
+    const cfg = JSON.parse(await readFile(path.join(dir, ".claude", "settings.json"), "utf8"));
+    const cmds = (event: string) => (cfg.hooks[event] as { hooks: { command: string }[] }[]).flatMap((g) => g.hooks.map((h) => h.command));
+    // The ordering key is the event time captured in the shell, not this process's start time (node-startup jitter).
+    for (const e of ["UserPromptSubmit", "PostToolUse", "Stop", "PermissionRequest"]) {
+      expect(cmds(e).every((c) => c.startsWith("_ahT=$(") && c.includes("--seq"))).toBe(true);
+    }
+    expect(cmds("PostToolUseFailure").some((c) => c.includes("report-status working"))).toBe(true); // recover from blocked when the approved tool errors
+    expect(cmds("StopFailure").some((c) => c.includes("report-status idle"))).toBe(true); // never stick at working if the turn dies on an API error
+  });
+
+  it("treats the sentinel as ownership only when it is the trailing comment (endsWith, not includes)", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    await mkdir(path.dirname(file), { recursive: true });
+    // The user's command CONTAINS our marker as quoted DATA (a trailing quote follows it), not as a trailing comment.
+    const userCmd = "printf '%s\\n' '# agenthop-status-hook:idle'";
+    await writeFile(file, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: userCmd, async: false }] }] } }));
+    installClaudeStatusHooks(BIN, dir);
+    const stop = (JSON.parse(await readFile(file, "utf8")).hooks.Stop) as { hooks: { command: string }[] }[];
+    expect(stop.length).toBe(2); // user's printf not mistaken for ours — ours added alongside it
+    expect(stop.some((g) => g.hooks.some((h) => h.command === userCmd))).toBe(true); // user's command byte-for-byte
+    expect(stop.some((g) => g.hooks.some((h) => h.command.trimEnd().endsWith("# agenthop-status-hook:idle") && h.command.includes("report-status idle")))).toBe(true); // ours
   });
 
   it("refuses to touch a non-JSON settings.json", async () => {

@@ -39,9 +39,15 @@ async function main(): Promise<void> {
     const rest = argv.slice(2);
     const sessionArg = valueOf(rest, "--session");
     const note = valueOf(rest, "--note");
+    // The hook captures the EVENT time in its shell and passes it here (see installClaudeStatusHooks); it is
+    // a far better ordering key than this process's start time, which node-startup jitter can reorder. Fall
+    // back to startedAt only when absent (manual runs / no time tool) — those never race.
+    const seqArg = valueOf(rest, "--seq");
+    const seqNum = seqArg !== undefined ? Number(seqArg) : Number.NaN;
+    const seq = Number.isFinite(seqNum) && seqNum > 0 ? seqNum : startedAt;
     const key = sessionArg || process.env.AGENTHOP_SESSION?.trim() || process.env.CLAUDE_CODE_SESSION_ID?.trim();
     if (!state || !["working", "idle", "blocked", "unknown"].includes(state)) {
-      console.error("Usage: agenthop report-status <working|idle|blocked|unknown> [--session <id>] [--note <text>]");
+      console.error("Usage: agenthop report-status <working|idle|blocked|unknown> [--session <id>] [--note <text>] [--seq <ms>]");
       process.exitCode = 1;
       return;
     }
@@ -50,7 +56,7 @@ async function main(): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    writeStatusFile(statusHome(), key, state, { text: note, seq: startedAt });
+    writeStatusFile(statusHome(), key, state, { text: note, seq });
     return;
   }
 
