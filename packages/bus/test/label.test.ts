@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { detectTool, sessionTitle, shortId } from "../src/label.js";
+import { detectTool, selfInfo, sessionTitle, shortId } from "../src/label.js";
 
 /**
  * detectTool must identify the ACTUAL host. The trap (Codex re-verification #1): a Codex daemon may be
@@ -41,9 +41,19 @@ test("sessionTitle is a readable, restart-stable handle: tool:dir-<shortSessionI
   expect(sessionTitle("codex", "/a/Work", "01a0ead5-xxxx", env)).not.toBe(sessionTitle("codex", "/a/Work", "beef1234-yyyy", env));
 });
 
-test("sessionTitle falls back to tool:dir before a stableId is known, and AGENTHOP_TITLE overrides", () => {
+test("sessionTitle falls back to tool:dir only when given no id, and AGENTHOP_TITLE overrides", () => {
   expect(sessionTitle("codex", "/Users/x/Work", undefined, {} as NodeJS.ProcessEnv)).toBe("codex:Work");
   expect(sessionTitle("codex", "/Users/x/Work", "01a0ead5", { AGENTHOP_TITLE: "my-name" } as NodeJS.ProcessEnv)).toBe("my-name");
+});
+
+test("selfInfo NEVER produces a bare tool:dir handle — it suffixes with the run id before a stableId is known", () => {
+  // No CLAUDE_CODE_SESSION_ID in env -> no stableId yet (the Codex-before-thread case). The handle must
+  // still carry a unique suffix (the per-run id), so it can't exact-match and silently shadow a suffixed
+  // same-dir sibling in resolvePeer. (AGENTHOP_NO_CODEX from beforeEach -> tool resolves to "unknown".)
+  const self = selfInfo({} as NodeJS.ProcessEnv, "/Users/x/Work");
+  expect(self.stableId).toBeUndefined();
+  expect(self.title).not.toBe("unknown:Work"); // NOT bare
+  expect(self.title).toBe(`unknown:Work-${shortId(self.id)}`); // suffixed with the run id
 });
 
 test("shortId is the first 8 alphanumerics", () => {

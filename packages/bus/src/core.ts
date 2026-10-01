@@ -112,7 +112,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     const hadStableId = self.stableId !== undefined;
     const oldKey = self.stableId ?? self.id;
     self.stableId = id;
-    self.title = sessionTitle(self.tool, self.cwd, id);
+    self.title = sessionTitle(self.tool, self.cwd, id ?? self.id); // never bare tool:dir (would shadow a sibling)
     stableIdAuthoritative = authoritative;
     // Status follows the identity. On the FIRST adoption (bootstrap: no stableId yet) carry a status the
     // same run already reported under its per-run id; on a later thread SWITCH (A→B) do NOT carry — keep

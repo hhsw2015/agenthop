@@ -49,6 +49,17 @@ test("prefix resolves one but is ambiguous for several", () => {
   expect(resolvePeer([A, B], "self", "codex:Work")).toHaveProperty("error");
 });
 
+test("two same-dir sessions (distinct suffixes) make the bare prefix ambiguous; each full handle resolves", () => {
+  // The production trap we hit: a reviewer Codex + a freshly-spawned same-dir Codex. Because label.ts now
+  // suffixes EVERY handle (the run id until a stableId is learned), neither title is the bare "codex:Work",
+  // so the bare prefix can't silently exact-match the wrong one — it's ambiguous, and the full handles resolve.
+  const reviewer = peer({ id: "run-rev", stableId: "01a0ead5-x", title: "codex:Work-01a0ead5" });
+  const fresh = peer({ id: "run-new", stableId: undefined, title: "codex:Work-c5224706" }); // run-id suffix, no stableId yet
+  expect(resolvePeer([reviewer, fresh], "self", "codex:Work")).toHaveProperty("error");
+  expect(ok(resolvePeer([reviewer, fresh], "self", "codex:Work-01a0ead5")).id).toBe("run-rev");
+  expect(ok(resolvePeer([reviewer, fresh], "self", "codex:Work-c5224706")).id).toBe("run-new");
+});
+
 test("self is never a candidate", () => {
   expect(resolvePeer([A], "run-a", "codex:Work-01a0ead5")).toHaveProperty("error");
 });
