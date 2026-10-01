@@ -98,11 +98,13 @@ function cliEnvAndRun(tool: RailwayTool, task: string, cpaBase: string, token: s
 }
 
 /**
- * Strip the box's bundled-agent telemetry: remove any hook group that mentions `express-agent` from
- * ~/.claude/settings.json and ~/.codex/hooks.json so the box doesn't phone home `latestPrompt`. Best-effort
- * (a box without the file is a no-op). Pure node — the box has node24.
+ * Strip the box's bundled-agent telemetry so it doesn't phone home `latestPrompt`. VERIFIED LIVE on a Railway
+ * box: the express-agent telemetry is registered as **MCP servers** (railway / railway-context / railway-machine
+ * in ~/.claude/settings.json `mcp_servers`), NOT as `hooks` — plus a possible `lifecycle_hook`. So remove any
+ * mcp_servers entry / lifecycle_hook / hook group that references `express-agent`, from the claude settings and
+ * the codex hooks file. Best-effort (a missing file is a no-op). Pure node — the box has node24.
  */
-const TELEMETRY_STRIP = `node -e 'const fs=require("fs"),os=require("os"),p=require("path");for(const f of [p.join(os.homedir(),".claude","settings.json"),p.join(os.homedir(),".codex","hooks.json")]){try{const j=JSON.parse(fs.readFileSync(f,"utf8"));if(j&&j.hooks){for(const k of Object.keys(j.hooks)){j.hooks[k]=(j.hooks[k]||[]).filter(g=>!JSON.stringify(g).includes("express-agent"));if(!j.hooks[k].length)delete j.hooks[k];}fs.writeFileSync(f,JSON.stringify(j,null,2));}}catch{}}' 2>/dev/null || true`;
+const TELEMETRY_STRIP = `node -e 'const fs=require("fs"),os=require("os"),p=require("path");const strip=o=>{let c=false;if(o&&typeof o==="object"){if(Array.isArray(o.mcp_servers)){const n=o.mcp_servers.filter(s=>!JSON.stringify(s).includes("express-agent"));if(n.length!==o.mcp_servers.length){o.mcp_servers=n;c=true;}}if(o.lifecycle_hook&&JSON.stringify(o.lifecycle_hook).includes("express-agent")){delete o.lifecycle_hook;c=true;}if(o.hooks&&typeof o.hooks==="object"){for(const k of Object.keys(o.hooks)){if(Array.isArray(o.hooks[k])){const n=o.hooks[k].filter(g=>!JSON.stringify(g).includes("express-agent"));if(n.length!==o.hooks[k].length)c=true;o.hooks[k]=n;if(!o.hooks[k].length)delete o.hooks[k];}}}}return c;};for(const f of [p.join(os.homedir(),".claude","settings.json"),p.join(os.homedir(),".codex","hooks.json")]){try{const j=JSON.parse(fs.readFileSync(f,"utf8"));if(strip(j))fs.writeFileSync(f,JSON.stringify(j,null,2));}catch{}}' 2>/dev/null || true`;
 
 export type VmBootstrapInput = {
   tool: RailwayTool;
@@ -160,6 +162,9 @@ export type RunRailwayTaskInput = {
   remotePath?: string;
   run?: Run;
   home?: string;
+  /** Reuse an already-allocated box by its launchId (same throwaway key → same live box, ≤60 min) instead of
+   *  allocating a fresh one — avoids the per-IP anonymous limit when iterating. Skips keygen. */
+  reuseLaunchId?: string;
 };
 
 export type RunRailwayTaskResult = { launchId: string; code: string; result?: string };
@@ -174,11 +179,13 @@ export async function runRailwayTask(input: RunRailwayTaskInput): Promise<RunRai
   const run = input.run ?? defaultRun;
   const cpaBase = input.cpaBase ?? process.env.AGENTHOP_CPA_BASE;
   if (!cpaBase) throw new Error("runRailwayTask: cpaBase required (option or AGENTHOP_CPA_BASE)");
-  const launchId = newLaunchId();
+  const launchId = input.reuseLaunchId ?? newLaunchId();
   const token = mintEphToken({ sub: launchId, ttlSec: input.ttlSec, secret: input.secret ?? readEphSecret() });
   const { argv: keygenArgv, keyPath, knownHostsPath } = genKeyArgv(launchId);
-  mkdirSync(keyDir(launchId), { recursive: true, mode: 0o700 }); // ssh-keygen won't create the parent dir
-  await run("ssh-keygen", keygenArgv);
+  if (!input.reuseLaunchId) {
+    mkdirSync(keyDir(launchId), { recursive: true, mode: 0o700 }); // ssh-keygen won't create the parent dir
+    await run("ssh-keygen", keygenArgv); // reuse mode: the key (and its box) already exist — skip
+  }
   const room = await openTaskRoom({ relay: input.relay });
   try {
     const remotePath = input.remotePath ?? "/tmp/ah-report.mjs";

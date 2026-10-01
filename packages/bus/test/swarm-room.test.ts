@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { startRelay, type RunningRelay } from "@agenthop/relay-node";
-import { openTaskRoom, reportResult } from "../src/swarm/room.js";
+import { openTaskRoom, pullMessages, reportResult, SWARM_CMD_PREFIX } from "../src/swarm/room.js";
 
 /**
  * The networked swarm return, proven over a real (local) stock relay: the dispatcher opens a per-task room,
@@ -23,6 +23,21 @@ test("a VM posts a sealed result and the dispatcher collects + decrypts it", asy
     await reportResult({ code: room.code, keyHex: room.keyHex, text: "task done: the answer is 42", relay: relay.url });
     const results = await room.collect(15000);
     expect(results).toContain("task done: the answer is 42");
+  } finally {
+    await room.close();
+  }
+}, 60000);
+
+test("two-way: a dispatcher command is pulled by the VM and the VM's reply is collected", async () => {
+  const room = await openTaskRoom({ relay: relay.url });
+  try {
+    // dispatcher -> VM
+    await room.send("reply with your hostname");
+    const { messages } = await pullMessages({ code: room.code, keyHex: room.keyHex, relay: relay.url, prefix: SWARM_CMD_PREFIX });
+    expect(messages).toContain("reply with your hostname");
+    // VM -> dispatcher
+    await reportResult({ code: room.code, keyHex: room.keyHex, text: "host-abc", relay: relay.url });
+    expect(await room.collect(15000)).toContain("host-abc");
   } finally {
     await room.close();
   }

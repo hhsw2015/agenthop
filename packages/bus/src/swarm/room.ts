@@ -15,8 +15,10 @@ type RunningHost = Awaited<ReturnType<typeof startHost>>;
  * so garbage posts simply fail openEntry and are skipped. The address is injected to exactly one VM.
  */
 
-/** Tags a sealed result entry in the per-task room (lets collect() skip anything else). */
+/** Tags a sealed result entry (VM → dispatcher) in the per-task room. */
 export const SWARM_RESULT_PREFIX = "[[agenthop:swarm-result]] ";
+/** Tags a sealed command entry (dispatcher → VM) — the other direction over the same room (two-way networking). */
+export const SWARM_CMD_PREFIX = "[[agenthop:swarm-cmd]] ";
 
 const RESULT_TEXT_BYTES = 64 * 1024; // small results / notify ride the room; large artifacts go to GitHub (per the contract)
 
@@ -29,6 +31,8 @@ export type TaskRoom = {
   relay: string;
   /** Poll the room until a result arrives (decrypted) or the timeout elapses. Returns all results seen. */
   collect(timeoutMs: number): Promise<string[]>;
+  /** Post a command to the VM (the dispatcher→VM direction) — sealed under the per-launch key. Two-way networking. */
+  send(text: string): Promise<void>;
   /** Stop hosting the room. */
   close(): Promise<void>;
 };
@@ -82,11 +86,36 @@ export async function openTaskRoom(options: OpenTaskRoomOptions = {}): Promise<T
       }
       return out;
     },
+    async send(text: string): Promise<void> {
+      await sendMessage({ code, text: SWARM_CMD_PREFIX + sealEntry(nsKey, text), relay, pass: options.pass });
+    },
     async close(): Promise<void> {
       closed = true;
       await host.close();
     },
   };
+}
+
+/** Read the per-task room once and return decrypted entries carrying `prefix` (newest last). Used VM-side to pull
+ *  dispatcher commands (SWARM_CMD_PREFIX) and dispatcher-side to read results — one-shot, no hosting. */
+export async function pullMessages(options: { code: string; keyHex: string; relay?: string; prefix: string; after?: number; pass?: string }): Promise<{ messages: string[]; after: number }> {
+  const nsKey = Buffer.from(options.keyHex, "hex");
+  if (nsKey.length !== 32) throw new Error("pullMessages: keyHex must be 32 bytes (64 hex chars)");
+  const relay = options.relay ?? process.env.AGENTHOP_RELAY ?? DEFAULT_RELAY;
+  const base = relayEndpoints(relay, normalizeCode(options.code)).publicBase;
+  let after = options.after ?? 0;
+  const messages: string[] = [];
+  const resp = await readQueue(base, after, options.pass);
+  for (const event of resp.events) {
+    after = Math.max(after, event.seq ?? after);
+    if (typeof event.text !== "string" || !event.text.startsWith(options.prefix)) continue;
+    try {
+      messages.push(openEntry(nsKey, event.text.slice(options.prefix.length)));
+    } catch {
+      // not ours — skip
+    }
+  }
+  return { messages, after };
 }
 
 /**

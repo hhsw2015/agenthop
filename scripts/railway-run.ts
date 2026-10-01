@@ -16,12 +16,13 @@ const flag = (name: string): string | undefined => {
 const tool = (flag("--tool") ?? "claude") as RailwayTool;
 const task = flag("--task");
 const ttl = flag("--ttl");
+const reuseLaunchId = flag("--reuse"); // reuse an already-allocated box (its launchId) instead of a new one
 if (!task) {
-  process.stderr.write('usage: --task "<text>" [--tool claude|codex|opencode] [--ttl <seconds>]\n');
+  process.stderr.write('usage: --task "<text>" [--tool claude|codex|opencode] [--ttl <seconds>] [--reuse <launchId>]\n');
   process.exit(1);
 }
 
-runRailwayTask({ tool, task, ttlSec: ttl ? Number(ttl) : undefined })
+runRailwayTask({ tool, task, ttlSec: ttl ? Number(ttl) : undefined, reuseLaunchId })
   .then((r) => {
     process.stdout.write(`launch ${r.launchId}  room ${r.code}\n--- result ---\n${r.result ?? "(no result collected before timeout)"}\n`);
     process.exit(0);
