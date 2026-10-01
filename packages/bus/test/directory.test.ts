@@ -134,9 +134,9 @@ test("a late lower-seq announce at the same ts keeps the status watermark (P2-6)
 
 test("nextInstanceEpoch is strictly increasing even for restarts within the same ms (filename max-register)", () => {
   const home = mkdtempSync(path.join(tmpdir(), "ah-epoch-"));
-  const e1 = nextInstanceEpoch(home);
-  const e2 = nextInstanceEpoch(home);
-  const e3 = nextInstanceEpoch(home);
+  const e1 = nextInstanceEpoch(home)!;
+  const e2 = nextInstanceEpoch(home)!;
+  const e3 = nextInstanceEpoch(home)!;
   expect(e2).toBeGreaterThan(e1); // max(now, maxSeen+1) advances even when the clock does not
   expect(e3).toBeGreaterThan(e2);
 });
@@ -150,7 +150,16 @@ test("nextInstanceEpoch never allocates at/below a published high-water mark —
   writeFileSync(path.join(dir, String(high - 1000)), ""); // a stale LOW create landing after the high mark
   // Reads the true max over filenames, so neither the lower file nor a now-regressed clock can produce a
   // value <= high (which the epoch gate would reject forever).
-  expect(nextInstanceEpoch(home)).toBeGreaterThan(high);
+  expect(nextInstanceEpoch(home)!).toBeGreaterThan(high);
+});
+
+test("nextInstanceEpoch OMITS the epoch (undefined) instead of publishing a possibly-low value when it can't establish the on-disk max (P2 degrade)", () => {
+  // home is a FILE, so creating/reading <home>/.agenthop/epoch fails — the allocator must NOT fall back to a bare
+  // clock (which could sit below a prior instance's epoch and strand it); it returns undefined so the announce
+  // omits the epoch and mergePresence falls back to rev/ts (bounded, never a permanent strand).
+  const fileHome = path.join(mkdtempSync(path.join(tmpdir(), "ah-epoch-")), "not-a-dir");
+  writeFileSync(fileHome, "x");
+  expect(nextInstanceEpoch(fileHome)).toBeUndefined();
 });
 
 test("capStatusText truncates an oversized note so a sealed presence can't exceed the relay limit (P3)", () => {

@@ -168,35 +168,46 @@ export function mergePresence(prev: RemotePeer | undefined, next: RemotePeer): R
  * clock regressed) can ever allocate an epoch at or below a prior instance's. Lower files are pruned best-effort
  * once a higher one is in place (never the max), so the dir stays ~1 file. Exported for tests.
  *
- * Degraded ONLY when `<home>/.agenthop/epoch` can't be created/written (a read-only home — a node with bigger
- * problems): it falls back to the bare clock, which under a rollback could still strand. Recorded, accepted.
+ * EVERY failure path returns `undefined`, never a bare clock value: if the register's dir can't be created or
+ * read, a write errors, or the contention budget is exhausted, we OMIT the epoch rather than publish one that
+ * might sit BELOW a watermark we failed to see. The announce then carries no epoch and mergePresence falls back
+ * to rev/ts (the pre-epoch ordering: bounded recovery, never a permanent strand). So no return path ever yields
+ * an epoch at or below a prior instance's — it either allocates a provably-monotonic one or omits it entirely.
  */
-export function nextInstanceEpoch(home: string = process.env.HOME || homedir()): number {
+export function nextInstanceEpoch(home: string = process.env.HOME || homedir()): number | undefined {
   const dir = path.join(home, ".agenthop", "epoch");
-  const maxSeen = (): number => {
-    let max = 0;
+  // `undefined` = "could not READ the register" (a real error), kept DISTINCT from `0` = "no prior epoch yet".
+  // Swallowing a read error as 0 would let us allocate below a max we merely failed to see (the #P2 Codex found:
+  // a writable-but-unlistable dir), so an EACCES/etc read failure must propagate, not masquerade as empty.
+  const maxSeen = (): number | undefined => {
+    let names: string[];
     try {
-      for (const name of readdirSync(dir)) {
-        const n = Number(name);
-        if (Number.isSafeInteger(n) && n > max) max = n;
-      }
-    } catch {
-      // dir not created yet — no prior epoch on this machine
+      names = readdirSync(dir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return 0; // genuinely no dir yet → no history
+      return undefined; // EACCES/etc: the max is UNKNOWN → caller must omit, not risk a low value
+    }
+    let max = 0;
+    for (const name of names) {
+      const n = Number(name);
+      if (Number.isSafeInteger(n) && n > max) max = n;
     }
     return max;
   };
   try {
     mkdirSync(dir, { recursive: true });
   } catch {
-    return Date.now(); // read-only home: degrade to the bare clock (documented)
+    return undefined; // can't create the register → omit the epoch (announce falls back to rev/ts)
   }
   for (let attempt = 0; attempt < 1000; attempt++) {
-    const candidate = Math.max(Date.now(), maxSeen() + 1);
+    const seen = maxSeen();
+    if (seen === undefined) return undefined; // couldn't read the max → omit rather than publish a possibly-low value
+    const candidate = Math.max(Date.now(), seen + 1);
     try {
       writeFileSync(path.join(dir, String(candidate)), "", { flag: "wx" }); // O_EXCL: fail if the name exists
     } catch (error) {
       if ((error as NodeJS.ErrnoException)?.code === "EEXIST") continue; // raced a same-value allocator — re-read and bump
-      return Date.now(); // other I/O error: degrade to the bare clock (documented)
+      return undefined; // other write error → omit the epoch
     }
     // Our file is now the on-disk max; drop strictly-lower leftovers so the dir doesn't grow without bound. Safe
     // under concurrency: we only ever remove names BELOW ours, never the max, so no reader can regress.
@@ -210,7 +221,7 @@ export function nextInstanceEpoch(home: string = process.env.HOME || homedir()):
     }
     return candidate;
   }
-  return Date.now(); // pathological contention: degrade (documented)
+  return undefined; // contention budget exhausted → omit rather than publish an un-allocated low value
 }
 
 export function startDirectory(options: DirectoryOptions): Directory {
@@ -239,10 +250,11 @@ export function startDirectory(options: DirectoryOptions): Directory {
   // read), so a pull tags its read with the current epoch and discards its response if a reset happened
   // meanwhile — otherwise a late response from the OLD keeper could roll the cursor back over a reset.
   let epoch = 0;
-  // This relay instance's epoch + a per-announce revision, both stamped on every announce. epoch is constant
-  // for the instance and STRICTLY higher on every re-instantiation of this run (restart/reconnect → fresh node,
-  // new pub) — persisted-monotonic so even a clock rollback cannot lower it (see nextInstanceEpoch). rev
-  // strictly increases within the instance. Remote peers merge by (epoch, rev) — see mergePresence.
+  // This relay instance's epoch + a per-announce revision, both stamped on every announce. epoch is constant for
+  // the instance and STRICTLY higher on every re-instantiation of this run — persisted-monotonic (nextInstanceEpoch)
+  // so even a clock rollback cannot lower it; `undefined` if a safe epoch can't be allocated, in which case every
+  // announce omits it and mergePresence falls back to rev/ts. rev strictly increases within the instance. Remote
+  // peers merge by (epoch, rev) — see mergePresence.
   const instanceEpoch = nextInstanceEpoch();
   let announceRev = 0;
 
