@@ -221,9 +221,11 @@ export function pruneStaleStatusFiles(home: string, opts?: { ttlMs?: number; now
       continue; // the max vanished mid-scan — next pass
     }
     if (now - maxMtime >= ttlMs) {
-      // The MAX itself is untouched past the TTL ⇒ the whole session is dead ⇒ remove every version TOGETHER.
-      // (Deleting the max alone while a lower sibling with a newer mtime survived is exactly the P2-8 regression.)
-      for (const f of files) unlink(f.name);
+      // The MAX itself is untouched past the TTL ⇒ the whole session is dead ⇒ remove every version. Delete
+      // LOWEST-seq FIRST, the max LAST, so there is never a moment where only a lower version remains (a reader
+      // in between still sees the max), and if a delete fails mid-way (EACCES) the MAX is the one left, never a
+      // lower one — so the on-disk winner can never regress.
+      for (const f of [...files].reverse()) unlink(f.name);
       continue;
     }
     // Max is fresh ⇒ never touch it; prune only stale LOWER-seq leftovers. A sub-max file can never be the

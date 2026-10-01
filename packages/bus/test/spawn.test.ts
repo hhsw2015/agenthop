@@ -14,7 +14,6 @@ import {
   diffNewWindowIds,
   forgetSpawn,
   headlessArgv,
-  headlessOwnedByMe,
   isSpawnedWindow,
   launchId,
   moveArgv,
@@ -250,18 +249,6 @@ describe("scrubbedEnv (headless child must not inherit identity or a launch id)"
   });
 });
 
-describe("headless ownership (only kill our own still-live direct child)", () => {
-  it("owns a pid only when its live parent is this spawner process", () => {
-    expect(headlessOwnedByMe(4242, 4242)).toBe(true); // live parent == us → our child → safe to signal
-  });
-
-  it("refuses when the live parent is NOT us (pid reused, or our restart reparented the child)", () => {
-    expect(headlessOwnedByMe(1, 4242)).toBe(false); // reparented to init after our restart
-    expect(headlessOwnedByMe(9999, 4242)).toBe(false); // some other process is its parent (reused pid)
-    expect(headlessOwnedByMe(undefined, 4242)).toBe(false); // ppid unknown → never guess
-    expect(headlessOwnedByMe(0, 4242)).toBe(false);
-  });
-});
 
 describe("headless registry records", () => {
   it("round-trips mode/pid/bin/outputFile/exit fields; old records default to visible", () => {
@@ -359,15 +346,35 @@ describe("spawnHeadlessAgent / despawnAgent (headless)", () => {
     }
   });
 
-  it("never signals a pid it cannot own: a foreign/unsignalable pid is removed without a kill", async () => {
+  it("never signals a pid it holds no live handle for: a live unhandled pid is refused (record kept)", async () => {
     const home = mkdtempSync(path.join(tmpdir(), "ah-hl-"));
     try {
-      // pid 1 is alive but EPERM for us — provably not our child (we can always signal our own child).
+      // A record with NO in-memory handle (e.g. written by a now-dead node). pid 1 is alive but unsignalable
+      // by us — we hold no handle, so we must never signal it; refuse and KEEP the record (never guess).
       recordSpawn({ windowId: null, surfaceId: null, launchId: "h-foreign", tool: "codex", cwd: "/x", ts: 1, mode: "headless", pid: 1, bin: "/bin/codex" }, home);
       const d = await despawnAgent("h-foreign", { home });
+      expect(d.ok).toBe(false);
+      expect(d.note).toContain("no live handle");
+      expect(readRegistry(home).map((r) => r.launchId)).toEqual(["h-foreign"]); // kept, not guessed-away
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans up a dead orphan record (no handle, pid gone) via a harmless signal-0 probe", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "ah-hl-"));
+    try {
+      // Launch + kill a real child to obtain a pid that is now provably gone (ESRCH), with no handle on record.
+      const r = await spawnHeadlessAgent({ tool: "sleep", visible: false, task: "30" }, headlessEnv, home);
+      await despawnAgent(r.launchId!, { home }); // kills it (via handle) and forgets the record
+      const deadPid = r.pid!;
+      await new Promise((s) => setTimeout(s, 200));
+      // Re-record the now-dead pid with NO handle (simulating a stale record from a previous process).
+      recordSpawn({ windowId: null, surfaceId: null, launchId: "h-orphan", tool: "codex", cwd: "/x", ts: 1, mode: "headless", pid: deadPid, bin: "/bin/codex" }, home);
+      const d = await despawnAgent("h-orphan", { home });
       expect(d.ok).toBe(true);
-      expect(d.note).toContain("Killed nothing");
-      expect(readRegistry(home)).toEqual([]);
+      expect(d.note).toContain("already gone");
+      expect(readRegistry(home)).toEqual([]); // dead orphan cleaned
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

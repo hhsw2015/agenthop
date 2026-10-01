@@ -215,6 +215,20 @@ describe("plugging into agents as an MCP server", () => {
     expect(stop[0].hooks[0].command).not.toContain("/old/path/agenthop");
   });
 
+  it("upgrades an OLD agenthop SessionStart group that lacks a matcher — adds startup|resume (P2-9 upgrade path)", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    await mkdir(path.dirname(file), { recursive: true });
+    // An old install: OUR SessionStart hook is present but has NO matcher, so it would also fire on compact.
+    const oldCmd = `'${BIN}' report-status idle >/dev/null 2>&1 || true # agenthop-status-hook:idle`;
+    await writeFile(file, JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: oldCmd, async: true }] }] } }));
+    expect(installClaudeStatusHooks(BIN, dir)).toContain("wrote"); // a refresh happened (matcher added)
+    const cfg = JSON.parse(await readFile(file, "utf8"));
+    const ourGroup = (cfg.hooks.SessionStart as { matcher?: string; hooks: { command: string }[] }[]).find((g) => g.hooks.some((h) => h.command.includes("agenthop-status-hook:idle")))!;
+    expect(ourGroup.matcher).toBe("startup|resume"); // matcher synced in place on the existing group, not duplicated
+    expect((cfg.hooks.SessionStart as unknown[]).length).toBe(1); // no duplicate group added
+  });
+
   it("shell-single-quotes the binary path so metacharacters can't be expanded", async () => {
     const dir = await home();
     installClaudeStatusHooks("/opt/a b/$(touch pwned)/agenthop", dir);

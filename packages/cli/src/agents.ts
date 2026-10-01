@@ -319,6 +319,12 @@ function mergeStatusHookEvents(config: Record<string, unknown>, events: Array<{ 
           changed++;
         }
       }
+      // Also sync the group's matcher when this event declares one (e.g. SessionStart's "startup|resume"):
+      // an OLD install's group may predate the matcher and would otherwise keep firing on compact (#P2-9).
+      if (matcher !== undefined && (ours as { matcher?: unknown }).matcher !== matcher) {
+        (ours as { matcher?: string }).matcher = matcher;
+        changed++;
+      }
       continue;
     }
     arr.push(makeGroup(want, matcher));

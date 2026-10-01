@@ -74,6 +74,14 @@ test("a different identity starts fresh: no status (or seq gate) leaks across a 
   expect(merged.statusSeq).toBe(1); // thread A's seq 100 must not gate thread B's low seq
 });
 
+test("a different identity is adopted ONLY when strictly newer by ts — a late/same-ts cross-identity announce keeps prev (P2-6 ext)", () => {
+  const b = peer({ stableId: "thread-B", ts: 1_010_000, status: "working", statusSeq: 1 });
+  const olderA = peer({ stableId: "thread-A", ts: 1_000_000, status: "idle", statusSeq: 5 });
+  expect(mergePresence(b, olderA)).toBe(b); // older cross-identity announce must NOT replace the newer entry...
+  const sameTsA = peer({ stableId: "thread-A", ts: 1_010_000, status: "idle", statusSeq: 5 });
+  expect(mergePresence(b, sameTsA)).toBe(b); // ...nor a same-ms one (can't be ordered → keep prev, no flip-flop)
+});
+
 test("identity falls back to the run id when no stableId was adopted", () => {
   const prev = peer({ stableId: undefined, status: "working", statusSeq: 8 });
   const replay = peer({ stableId: undefined, ts: 2000, status: "idle", statusSeq: 2 });

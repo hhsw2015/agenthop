@@ -279,18 +279,6 @@ export function headlessArgv(tool: string, cliArgv: string[], task: string, env:
   return { argv: [cliArgv[0]!, ...mode, ...cliArgv.slice(1), task] };
 }
 
-/**
- * Headless ownership — the ONLY sound proof that a recorded pid is the process agenthop launched, and
- * therefore safe to signal: it must still be OUR DIRECT CHILD right now, i.e. its live parent pid equals
- * this (the spawner) process. A reused pid, or this bus node having restarted (the detached child then
- * reparents to init), breaks the match — so we refuse rather than risk signalling a user's process.
- * Command text and start-time windows are NOT ownership proof (a reused pid, or a user's own same-tool
- * run, can match them), which is why they were dropped. Pure.
- */
-export function headlessOwnedByMe(livePpid: number | undefined, spawnerPid: number): boolean {
-  return livePpid !== undefined && livePpid === spawnerPid;
-}
-
 // --- Spawn registry: the ONLY surfaces/processes despawn may close --------------------------------
 // One file per launch under ~/.agenthop/spawned/<launchId>.json, so concurrent spawns from different
 // bus sessions never lose each other's records to a shared read-modify-write. A record is written with
@@ -772,6 +760,7 @@ function launchDetached(argv: string[], cwd: string, outFile: string, env: NodeJ
  *  unless a despawn already removed the record (never resurrect a forgotten launch). unref'd. */
 function watchHeadlessExit(child: ReturnType<typeof spawn>, rec: SpawnRecord, home: string): void {
   child.once("exit", (code) => {
+    headlessChildren.delete(rec.launchId); // the handle is dead — despawn now reports "already exited"
     if (!readRegistry(home).some((r) => r.launchId === rec.launchId)) return;
     recordSpawn({ ...rec, exitCode: code ?? null, exitedAt: Date.now() }, home);
   });
@@ -814,6 +803,7 @@ export async function spawnHeadlessAgent(input: SpawnInput, env: NodeJS.ProcessE
   }
   const rec: SpawnRecord = { ...pending, pid: launched.pid };
   const recorded = recordSpawn(rec, home);
+  headlessChildren.set(lid, launched.child); // the live handle is the ONLY thing despawn will kill through
   watchHeadlessExit(launched.child, rec, home);
   const warn = recorded ? "" : ` (warning: could not persist the pid on the record, so agenthop_despawn may refuse this launch — launchId ${lid}.)`;
   return {
@@ -832,88 +822,91 @@ export async function spawnHeadlessAgent(input: SpawnInput, env: NodeJS.ProcessE
 
 // --- Headless despawn ------------------------------------------------------------------------------
 
-function aliveState(pid: number): "alive" | "gone" | "not-ours" {
-  try {
-    process.kill(pid, 0);
-    return "alive";
-  } catch (e) {
-    // ESRCH: no such process. Anything else (EPERM): a live pid we cannot signal — it can NOT be our
-    // child (we could always signal our own child), so the pid was reused by someone else's process.
-    return (e as NodeJS.ErrnoException).code === "ESRCH" ? "gone" : "not-ours";
-  }
-}
+// Live ChildProcess handles for headless launches made by THIS bus node — the ONLY authority to kill one.
+// Node binds a handle to the exact child it spawned: after that child exits, handle.kill() is a no-op and can
+// NEVER signal a pid the OS has since reused. So we never kill by a bare recorded pid (a ps / kill(pid,0)
+// snapshot is racy — the pid can be reused between the check and the signal). Keyed by launchId; set at launch,
+// deleted on exit/despawn.
+const headlessChildren = new Map<string, ReturnType<typeof spawn>>();
 
-async function waitGone(pid: number, ms: number): Promise<boolean> {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    if (aliveState(pid) !== "alive") return true;
-    await new Promise((s) => setTimeout(s, 100));
-  }
-  return aliveState(pid) !== "alive";
+const childExited = (child: ReturnType<typeof spawn>): boolean => child.exitCode !== null || child.signalCode !== null;
+
+/** Resolve once the child has exited (by its OWN handle state — never a reusable pid), or after `ms`. */
+function waitChildExit(child: ReturnType<typeof spawn>, ms: number): Promise<boolean> {
+  if (childExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const onExit = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      child.off("exit", onExit);
+      resolve(childExited(child));
+    }, ms);
+    child.once("exit", onExit);
+  });
 }
 
 /**
- * Terminate a HEADLESS launch: kill EXACTLY the pid recorded under this launchId — never a process by
- * name, never anything agenthop did not spawn. Ownership is proven the only sound way: the live process
- * must still be OUR DIRECT CHILD (its live parent pid == this spawner process). A reused pid, or this bus
- * node having restarted (the detached child reparents away), fails that check and is REFUSED — not guessed
- * from command text or a start-time window, which a user's own same-tool run could match. A one-shot
- * headless run (claude -p / codex exec / opencode run) exits on its own, so refusing an un-ownable one is safe.
+ * Terminate a HEADLESS launch — and ONLY the exact child agenthop launched. The authority is the in-memory
+ * ChildProcess HANDLE (headlessChildren), never the recorded pid: Node ties the handle to that specific
+ * child, so a signal through it can never hit a pid the OS reused, and once the child exits handle.kill() is
+ * inert. No handle ⇒ this node did not launch it (another session did, or this node restarted and the
+ * detached child reparented away) ⇒ REFUSE rather than risk a bare-pid signal — a one-shot headless run
+ * exits on its own. The detached child leads its own process GROUP; we also signal the group (-pid) but ONLY
+ * while the leader's exitCode is still null, so even the group signal can never land on a reused pid. A
+ * helper the CLI re-parented into a NEW group before our SIGKILL is the lone residual (same class as
+ * visible-mode lifecycle edges) — reported honestly, not silently claimed killed.
  */
 async function despawnHeadless(rec: SpawnRecord, home: string): Promise<{ ok: boolean; note: string }> {
   const out = rec.outputFile ? ` Its output log is kept at ${rec.outputFile}.` : "";
-  if (!rec.pid) {
-    return { ok: false, note: `Launch ${rec.launchId} has no recorded pid (the launch likely failed before the pid was persisted), so there is nothing agenthop can SAFELY kill. Record kept; remove the process manually if one is running.` };
-  }
-  if (rec.exitedAt !== undefined) {
-    forgetSpawn(rec.launchId, home);
-    return { ok: true, note: `That headless run already exited (code ${rec.exitCode ?? "unknown"}); removed its record, killed nothing.${out}` };
-  }
-  const state = aliveState(rec.pid);
-  if (state === "gone") {
-    forgetSpawn(rec.launchId, home);
-    return { ok: true, note: `That headless run is already gone; removed its record, killed nothing.${out}` };
-  }
-  if (state === "not-ours") {
-    forgetSpawn(rec.launchId, home);
-    return { ok: true, note: `pid ${rec.pid} now belongs to a process agenthop cannot even signal — our child is gone and the OS reused its pid. Killed nothing; record removed.${out}` };
-  }
-  // Ownership proof: the live process must still be OUR DIRECT CHILD (its live parent == this process). Only
-  // the bus node that spawned it, still running, is its parent; after our restart it reparents to init, and a
-  // reused pid has some other parent — both fail here and are refused (command/start-time are NOT proof).
-  const { ppid } = await psTtyPpid(rec.pid);
-  if (!headlessOwnedByMe(ppid, process.pid)) {
-    const why = rec.spawnerPid && rec.spawnerPid !== process.pid
-      ? `it was spawned by pid ${rec.spawnerPid}, not this session (${process.pid})`
-      : `its spawner likely restarted, or the OS reused the pid (live parent ${ppid ?? "unknown"} ≠ ${process.pid})`;
-    return { ok: false, note: `Refusing to signal pid ${rec.pid}: agenthop only kills a headless run that is still its OWN direct child, but ${why}. The one-shot ${rec.tool} run exits on its own. Record kept.${out}` };
-  }
-  // Verified our child. It was spawned detached (its own session ⇒ its own process GROUP rooted at this pid),
-  // so signalling -pid reaches the CLI's own sub-processes too — all created by our launch. Fall back to the
-  // single pid if the group signal fails.
-  const signal = (sig: NodeJS.Signals): void => {
-    try {
-      process.kill(-rec.pid!, sig);
-    } catch {
+  const child = headlessChildren.get(rec.launchId);
+  if (!child) {
+    // No live handle in THIS node. Probe existence with signal 0 (harmless — it can never affect the target):
+    // if the recorded pid is gone (ESRCH), the record is a dead orphan we can safely forget; if it is still
+    // alive we must NOT signal it (we hold no handle ⇒ cannot prove it is ours and a bare pid may be reused).
+    if (rec.pid) {
       try {
-        process.kill(rec.pid!, sig);
+        process.kill(rec.pid, 0);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ESRCH") {
+          forgetSpawn(rec.launchId, home);
+          return { ok: true, note: `That headless ${rec.tool} run is already gone; removed its record, killed nothing.${out}` };
+        }
+        // EPERM etc: alive but unsignalable by us ⇒ definitely not our child ⇒ fall through to refuse.
+      }
+    }
+    return { ok: false, note: `agenthop can stop a headless run only from the SAME bus node that launched it, and this node holds no live handle for ${rec.launchId} (another session launched it, or this node restarted). Signalling a bare recorded pid is unsafe — it may have been reused — so nothing was killed; the one-shot ${rec.tool} run exits on its own. Record kept.${out}` };
+  }
+  if (childExited(child)) {
+    headlessChildren.delete(rec.launchId);
+    forgetSpawn(rec.launchId, home);
+    return { ok: true, note: `That headless ${rec.tool} run already exited (code ${child.exitCode ?? `signal ${child.signalCode}`}); removed its record, killed nothing.${out}` };
+  }
+  const killGroup = (sig: NodeJS.Signals): void => {
+    // Group signal ONLY while the leader is still alive (exitCode null), so -pid can never hit a reused pid.
+    if (child.exitCode === null && typeof child.pid === "number") {
+      try {
+        process.kill(-child.pid, sig);
       } catch {
-        // raced its exit — waitGone below observes it
+        // group already gone / no permission — the handle signal is the primary path
       }
     }
   };
-  signal("SIGTERM");
-  let ended = await waitGone(rec.pid, 2000);
+  child.kill("SIGTERM");
+  killGroup("SIGTERM");
+  let ended = await waitChildExit(child, 2000);
   if (!ended) {
-    signal("SIGKILL");
-    ended = await waitGone(rec.pid, 2000);
+    child.kill("SIGKILL");
+    killGroup("SIGKILL");
+    ended = await waitChildExit(child, 2000);
   }
   if (!ended) {
-    // Both signals sent, still alive (uninterruptible / escaped its group) — report honestly, keep the record.
-    return { ok: false, note: `Sent SIGTERM then SIGKILL to the headless ${rec.tool} run (pid ${rec.pid}) but it is still alive; agenthop could not terminate it. Record kept — stop it manually.${out}` };
+    return { ok: false, note: `Sent SIGTERM then SIGKILL (to the ${rec.tool} run and its process group) but pid ${child.pid} is still alive; agenthop could not terminate it. Record kept — stop it manually.${out}` };
   }
+  headlessChildren.delete(rec.launchId);
   forgetSpawn(rec.launchId, home);
-  return { ok: true, note: `Terminated the headless ${rec.tool} run (launchId ${rec.launchId}, pid ${rec.pid}).${out}` };
+  return { ok: true, note: `Terminated the headless ${rec.tool} run (launchId ${rec.launchId}, pid ${child.pid}).${out}` };
 }
 
 export type DespawnOptions = { home?: string };

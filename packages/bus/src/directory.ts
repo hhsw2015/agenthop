@@ -107,8 +107,13 @@ export function capStatusText(text: string | undefined): string | undefined {
  * across a thread switch. Pure, exported for tests.
  */
 export function mergePresence(prev: RemotePeer | undefined, next: RemotePeer): RemotePeer {
-  if (!prev || identityOf(prev) !== identityOf(next)) return next;
-  // Two INDEPENDENT clocks, merged separately so neither can discard the other's advance:
+  if (!prev) return next;
+  // A DIFFERENT identity in this run slot (a Codex run multiplexing thread A→B) is adopted ONLY when the
+  // announce is STRICTLY newer by ts. A same-ts or older cross-identity announce can't be ordered by the
+  // clock, so keep prev — otherwise a late/replayed OLD-identity announce would overwrite the newer entry
+  // (and the swapped-in older ts could then age the whole peer past its TTL and drop it).
+  if (identityOf(prev) !== identityOf(next)) return next.ts > prev.ts ? next : prev;
+  // Same identity: two INDEPENDENT clocks, merged separately so neither can discard the other's advance:
   //  - PRESENCE fields (where/when this run last spoke) follow the higher wall-clock `ts`;
   //  - STATUS fields follow the higher per-identity monotonic `statusSeq` (core.ts setStatusImpl).
   // Gating status on `ts` lost data: a clock rollback or a same-ms reorder can carry a HIGHER statusSeq on a
@@ -147,10 +152,12 @@ export function startDirectory(options: DirectoryOptions): Directory {
   let epoch = 0;
 
   const remember = (peer: RemotePeer): void => {
-    // Reading our own latest announce back confirms the current keeper sees our writes: cursor is fresh.
-    if (peer.id === self.id && peer.ts === pendingSelfTs) {
+    // Reading back ANY of our own announces at/after the grace-clock start confirms the keeper sees our
+    // writes → disarm. Matching only the LATEST ts was wrong: a healthy keeper whose echo lags behind newer
+    // announces never cleared, so the stale-keeper fallback fired spuriously (#P2-7).
+    if (peer.id === self.id && pendingSelfTs !== undefined && peer.ts >= pendingSince) {
       pendingSelfTs = undefined;
-      pendingSince = 0; // our writes are echoing → disarm the stale-keeper grace clock
+      pendingSince = 0;
     }
     // No outer ts gate: mergePresence merges the two axes independently (presence by ts, status by
     // statusSeq), so a lower-ts entry carrying a higher statusSeq still advances the status, and a stale
@@ -208,10 +215,11 @@ export function startDirectory(options: DirectoryOptions): Directory {
     // With it set first, a concurrent read clears it (remember()); we leave it as-is on success and only
     // clear it here if the send itself failed.
     pendingSelfTs = entry.ts;
-    // Start the stale-keeper grace clock on the FIRST unechoed announce only. A routine re-announce (every
-    // status change, ~10s) must NOT keep pushing pendingSince forward, or the >STALE_GRACE_MS fallback never
+    // Start the stale-keeper grace clock on the FIRST unechoed announce only, and anchor it to entry.ts so an
+    // echoed announce (peer.ts === entry.ts) clears it via `peer.ts >= pendingSince`. A routine re-announce
+    // (every status change, ~10s) must NOT push pendingSince forward, or the >STALE_GRACE_MS fallback never
     // fires and a taken-over keeper goes undetected until a live peer has aged past its TTL (#P2-7).
-    if (pendingSince === 0) pendingSince = Date.now();
+    if (pendingSince === 0) pendingSince = entry.ts;
     try {
       await sendMessage({ code: address, text: PRESENCE_PREFIX + sealEntry(team.nsKey, JSON.stringify(entry)), relay: options.relay, pass: options.pass });
     } catch (error) {
