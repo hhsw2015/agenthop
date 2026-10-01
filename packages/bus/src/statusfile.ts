@@ -1,5 +1,5 @@
 import { watch, type FSWatcher } from "node:fs";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -21,48 +21,102 @@ function statusDir(home: string): string {
 function safeKey(key: string): string {
   return key.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
-function statusFile(home: string, key: string): string {
-  return path.join(statusDir(home), `${safeKey(key)}.json`);
+/** The fixed prefix every versioned status file for a key shares: "<safeKey>.json". */
+function baseName(key: string): string {
+  return `${safeKey(key)}.json`;
 }
 
-/** Read a session's current status file, or undefined if absent/malformed. Pure. */
-export function readStatusFile(home: string, key: string): StatusFile | undefined {
+/**
+ * This key's on-disk versions as {seq, name}, newest first. Each status write lands in its OWN file named
+ * `<safeKey>.json.<seq>` (see writeStatusFile), so the current status is the highest-seq version. Pure; []
+ * on any error. Entries whose suffix is not all-digits (e.g. a `.tmp.<rand>` staging file) are skipped.
+ */
+function versions(home: string, key: string): Array<{ seq: number; name: string }> {
+  const prefix = `${baseName(key)}.`;
+  let names: string[];
   try {
-    const r = JSON.parse(readFileSync(statusFile(home, key), "utf8")) as Record<string, unknown>;
-    if (r && typeof r === "object" && typeof r.state === "string" && STATES.has(r.state) && typeof r.seq === "number" && Number.isFinite(r.seq)) {
-      return { state: r.state, seq: r.seq, text: typeof r.text === "string" ? r.text : undefined };
-    }
+    names = readdirSync(statusDir(home));
   } catch {
-    // absent / partial / invalid
+    return [];
+  }
+  const out: Array<{ seq: number; name: string }> = [];
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    const rem = name.slice(prefix.length);
+    if (!/^\d+$/.test(rem)) continue; // skip staging temps and anything non-numeric
+    const seq = Number(rem);
+    if (Number.isSafeInteger(seq)) out.push({ seq, name });
+  }
+  out.sort((a, b) => b.seq - a.seq);
+  return out;
+}
+
+/** Read a session's current status (the highest-seq version), or undefined if absent/malformed. Pure. */
+export function readStatusFile(home: string, key: string): StatusFile | undefined {
+  const dir = statusDir(home);
+  for (const { name } of versions(home, key)) {
+    try {
+      const r = JSON.parse(readFileSync(path.join(dir, name), "utf8")) as Record<string, unknown>;
+      if (r && typeof r === "object" && typeof r.state === "string" && STATES.has(r.state) && typeof r.seq === "number" && Number.isFinite(r.seq)) {
+        return { state: r.state, seq: r.seq, text: typeof r.text === "string" ? r.text : undefined };
+      }
+    } catch {
+      // this version is truncated/partial/invalid — fall through to the next-newest
+    }
   }
   return undefined;
 }
 
 /**
- * Write a session's status atomically (temp + rename). Correctness rests on the SEQ being the EVENT time
- * (captured in the hook shell and passed as --seq — see installClaudeStatusHooks; a manual or degraded
- * run falls back to report-status's own start time), NOT the write time: a delayed or
- * reordered write then carries an OLDER seq, so (a) writeStatusFile refuses to regress a disk entry that
- * already has a >= seq, and (b) the reader's per-identity monotonic guard drops it even if a concurrent
- * write momentarily lands it on disk. So no lock is needed: a "losing" concurrent write is by definition
- * an older event, harmless to a live reader, and corrected by the next event. (Residual, same self-healing
- * class as the broker/bridge locks: a fresh reader starting in the exact sub-millisecond of a concurrent
- * write could read the older entry; two DISTINCT events in the same millisecond can't be ordered by a
- * ms clock and the later may be dropped — turn-boundary events are seconds apart in practice.)
- * Returns whether the intended state is now, or already was, the recorded one.
+ * Record a session's status as a LOCK-FREE monotonic max-register. Each event writes its OWN immutable file
+ * `<safeKey>.json.<seq>` (staged temp + atomic rename), and readStatusFile returns the highest-seq version.
+ *
+ * Why not one file overwritten in place: that has a read→check→rename TOCTOU — a stale (lower-seq) writer
+ * that already passed the no-regress check can still rename AFTER a newer writer, leaving an OLDER state on
+ * disk that a reader which never saw the newer value then accepts, with no next event to correct it. Writing
+ * each seq to its own name removes that race entirely: two writers never target the same path, and the
+ * on-disk max is provably non-decreasing — the globally-highest-seq writer always leaves its file present
+ * (it writes it unless an even-higher one already exists), and a lower-seq writer only ever prunes versions
+ * strictly below its own contribution, so it can never remove the max. A reader therefore never regresses.
+ *
+ * The SEQ is the EVENT time (captured in the hook shell and passed as --seq — see installClaudeStatusHooks;
+ * a manual or degraded run falls back to report-status's own start time). Residual: two DISTINCT events in
+ * the same millisecond cannot be ordered by a ms clock, so the later may be dropped — turn-boundary events
+ * are seconds apart in practice. Returns false only on invalid input or an I/O failure.
  */
 export function writeStatusFile(home: string, key: string, state: string, opts?: { seq?: number; text?: string }): boolean {
   if (!STATES.has(state)) return false;
-  const p = statusFile(home, key);
-  const seq = opts?.seq ?? Date.now(); // event time; do NOT bump above the previous — ordering is by event
-  const tmp = `${p}.tmp.${randomBytes(4).toString("hex")}`;
+  const seq = opts?.seq ?? Date.now(); // event time; ordering is by event, never bumped
+  if (!Number.isSafeInteger(seq) || seq < 0) return false;
+  const dir = statusDir(home);
+  const base = baseName(key);
+  const tmp = path.join(dir, `${base}.${seq}.tmp.${randomBytes(4).toString("hex")}`);
   try {
-    mkdirSync(path.dirname(p), { recursive: true });
-    const prev = readStatusFile(home, key);
-    if (prev && prev.seq >= seq) return true; // a newer (or equal) event is already recorded — don't regress
-    const rec: StatusFile = { state, seq, ...(opts?.text?.trim() ? { text: opts.text.trim() } : {}) };
-    writeFileSync(tmp, `${JSON.stringify(rec, null, 2)}\n`);
-    renameSync(tmp, p);
+    mkdirSync(dir, { recursive: true });
+    const existing = versions(home, key);
+    const maxSeq = existing.length ? existing[0].seq : -1;
+    // Only write when ours is strictly newer than every version present. An equal/older seq is redundant —
+    // the max already holds the winning state — and skipping it is just an optimization; correctness comes
+    // from readStatusFile taking the max, not from this check.
+    if (maxSeq < seq) {
+      const rec: StatusFile = { state, seq, ...(opts?.text?.trim() ? { text: opts.text.trim() } : {}) };
+      writeFileSync(tmp, `${JSON.stringify(rec, null, 2)}\n`);
+      renameSync(tmp, path.join(dir, `${base}.${seq}`));
+    }
+    // Prune every version below the one that now wins. Best-effort and safe under concurrency: `keep` is at
+    // most the on-disk max we observed, so we never unlink the winning version; a failed unlink just leaves
+    // harmless clutter that the next write prunes. A lower-seq writer racing in afterward can re-create a
+    // sub-max file, but that never shadows the max (reader takes the max) and is cleaned on the next event.
+    const keep = Math.max(maxSeq, seq);
+    for (const v of existing) {
+      if (v.seq < keep) {
+        try {
+          rmSync(path.join(dir, v.name), { force: true });
+        } catch {
+          // harmless clutter — the reader still takes the max
+        }
+      }
+    }
     return true;
   } catch {
     try {

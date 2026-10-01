@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { readStatusFile, writeStatusFile } from "../src/statusfile.js";
@@ -44,6 +44,30 @@ test("status file: round-trip, event-seq wins, no regress, invalid state rejecte
     expect(writeStatusFile(home, "k", "bogus", { seq: 300 })).toBe(false);
     expect(readStatusFile(home, "k")!.state).toBe("idle");
     expect(readStatusFile(home, "missing")).toBeUndefined();
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("status file: a lower-seq version never shadows a newer one, even with both on disk (lock-free max register)", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ah-sf-race-"));
+  try {
+    const dir = path.join(home, ".agenthop", "status");
+    mkdirSync(dir, { recursive: true });
+    // Two versions coexist on disk — exactly what a stale (lower-seq) writer renaming last could leave. The
+    // single-file overwrite scheme lost this race; the reader must take the MAX seq so the stale one can't win.
+    writeFileSync(path.join(dir, "k.json.100"), JSON.stringify({ state: "working", seq: 100 }));
+    writeFileSync(path.join(dir, "k.json.200"), JSON.stringify({ state: "idle", seq: 200 }));
+    expect(readStatusFile(home, "k")).toMatchObject({ state: "idle", seq: 200 });
+    // A genuinely newer event wins and prunes every older version.
+    expect(writeStatusFile(home, "k", "blocked", { seq: 300 })).toBe(true);
+    expect(readStatusFile(home, "k")).toMatchObject({ state: "blocked", seq: 300 });
+    expect(existsSync(path.join(dir, "k.json.100"))).toBe(false);
+    expect(existsSync(path.join(dir, "k.json.200"))).toBe(false);
+    // A truncated NEWEST version (a crashed writer's partial file) must not blank out status — fall through
+    // to the next-newest valid version instead.
+    writeFileSync(path.join(dir, "k.json.400"), "{ not json");
+    expect(readStatusFile(home, "k")).toMatchObject({ state: "blocked", seq: 300 });
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
