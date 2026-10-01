@@ -1,9 +1,11 @@
+import { homedir } from "node:os";
 import { selfInfo, sessionTitle, type AgentStatus, type SelfInfo } from "./label.js";
 import { startLocalBus, type LocalBus } from "./broker.js";
 import { startRelay, type Relay } from "./relay.js";
 import { pushToHost } from "./push.js";
 import { startCodexDaemon, type CodexDaemon } from "./codex.js";
 import { resolvePeer, type UnifiedPeer } from "./resolve.js";
+import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { dbg } from "./debug.js";
 
 export { resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -110,7 +112,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     const hadStableId = self.stableId !== undefined;
     const oldKey = self.stableId ?? self.id;
     self.stableId = id;
-    self.title = sessionTitle(self.tool, self.cwd, id);
+    self.title = sessionTitle(self.tool, self.cwd, id ?? self.id); // never bare tool:dir (would shadow a sibling)
     stableIdAuthoritative = authoritative;
     // Status follows the identity. On the FIRST adoption (bootstrap: no stableId yet) carry a status the
     // same run already reported under its per-run id; on a later thread SWITCH (A→B) do NOT carry — keep
@@ -144,6 +146,42 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
 
   const resolve = (to: string): UnifiedPeer | { error: string } => resolvePeer(unified(), self.id, to);
 
+  // Set this session's own status, keyed per identity (see statusByIdentity). Shared by the MCP tool
+  // and the file watcher below.
+  const setStatusImpl = (state: AgentStatus, opts?: { seq?: number; text?: string }): { ok: boolean; seq?: number; ignored?: boolean } => {
+    const key = self.stableId ?? self.id;
+    const prev = statusByIdentity.get(key);
+    const seq = opts?.seq;
+    // Monotonic guard (per identity): never apply a report that is not newer than the last.
+    if (seq !== undefined && prev && seq <= prev.seq) return { ok: false, ignored: true, seq: prev.seq };
+    // Auto-increment must strictly advance and stay a safe integer.
+    if (seq === undefined && prev && prev.seq >= Number.MAX_SAFE_INTEGER) return { ok: false, ignored: true, seq: prev.seq };
+    const entry: StatusEntry = { status: state, seq: seq ?? (prev?.seq ?? 0) + 1, text: opts?.text?.trim() || undefined, at: Date.now() };
+    const unchanged = entry.status === self.status && entry.text === self.statusText;
+    statusByIdentity.set(key, entry);
+    self.status = entry.status;
+    self.statusSeq = entry.seq;
+    self.statusText = entry.text;
+    self.statusAt = entry.at;
+    // Skip the re-announce when neither state nor text changed (only the seq advanced) — a frequent
+    // PostToolUse→working report while already working must not spam the roster.
+    if (unchanged) return { ok: true, seq: entry.seq };
+    local.updateSelf(self);
+    relay?.updateSelf(self);
+    return { ok: true, seq: entry.seq };
+  };
+
+  // Slice B: pick up status that an EXTERNAL hook wrote for this session (via `agenthop report-status`
+  // → ~/.agenthop/status/<key>.json) and apply it through the same monotonic path. Keyed by the current
+  // identity, re-read on every change so a Codex thread id learned late still lines up.
+  const statusHome = options.home ?? homedir();
+  const applyStatusFromFile = (): void => {
+    const f = readStatusFile(statusHome, self.stableId ?? self.id);
+    if (f) setStatusImpl(f.state as AgentStatus, { seq: f.seq, text: f.text });
+  };
+  const stopStatusWatch = watchStatusDir(statusHome, applyStatusFromFile);
+  applyStatusFromFile(); // pick up a file that already exists at startup
+
   return {
     self,
     peers: unified,
@@ -168,24 +206,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       }
       return batch;
     },
-    setStatus(state, opts) {
-      const key = self.stableId ?? self.id;
-      const prev = statusByIdentity.get(key);
-      const seq = opts?.seq;
-      // Monotonic guard (per identity): never apply a report that is not newer than the last.
-      if (seq !== undefined && prev && seq <= prev.seq) return { ok: false, ignored: true, seq: prev.seq };
-      // Auto-increment must strictly advance and stay a safe integer.
-      if (seq === undefined && prev && prev.seq >= Number.MAX_SAFE_INTEGER) return { ok: false, ignored: true, seq: prev.seq };
-      const entry: StatusEntry = { status: state, seq: seq ?? (prev?.seq ?? 0) + 1, text: opts?.text?.trim() || undefined, at: Date.now() };
-      statusByIdentity.set(key, entry);
-      self.status = entry.status;
-      self.statusSeq = entry.seq;
-      self.statusText = entry.text;
-      self.statusAt = entry.at;
-      local.updateSelf(self);
-      relay?.updateSelf(self);
-      return { ok: true, seq: entry.seq };
-    },
+    setStatus: setStatusImpl,
     async waitForStatus(target, until, timeoutMs) {
       const peer = resolve(target);
       if ("error" in peer) return { reached: false, error: peer.error };
@@ -221,6 +242,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       return `local broker: ${local.role()}; ${team_}; ${unified().filter((p) => p.id !== self.id).length} other session(s)`;
     },
     async close() {
+      stopStatusWatch();
       codexDaemon?.close();
       await local.close();
       await relay?.close();

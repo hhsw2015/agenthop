@@ -24,13 +24,15 @@ export function busInstructions(): string {
   return `Discover and message other agent sessions (Claude Code, Codex, or any other) with no pairing code:
 
 - agenthop_peers(): list sessions reachable now, each shown by its handle (tool:dir-<shortSessionId>, e.g. codex:Work-01a0ead5). Same-machine sessions appear automatically; other machines appear when a shared AGENTHOP_TEAM is set.
-- agenthop_send(to, text): message a session by its handle (a prefix like "codex:Work" works when unambiguous; the native session id also works). The handle is restart-stable, so you can reach the same session again after it restarts without being told.
+- agenthop_send(to, text): message a session by its handle (a prefix like "codex:Work" works when unambiguous; the native session id also works). Address by the STABLE PREFIX, not a full handle you memorized: a handle's short id comes from the session's native id, and for Codex that is its thread id, which changes on restart or a new thread — the prefix (e.g. "codex:Work") still finds it, the old full handle will not.
 - agenthop_handoff(to, summary, next?): hand a task to another session so it continues where you left off — you write the summary, the bus attaches a git snapshot of your working directory. Use it instead of send when passing work along, not just chatting.
 - agenthop_report_status(state): report THIS session's work state (working/idle/blocked/unknown) to peers; shows in agenthop_peers.
 - agenthop_wait_peer(to, until?): wait until another session reaches a state — e.g. a sub-agent you dispatched goes idle (done) or blocked (needs input).
 - agenthop_recv(timeout_seconds): fallback only — see below.
 - agenthop_spawn(tool, cwd?, workspace?): launch another agent (claude/codex/opencode) in a VISIBLE window on this machine; it joins the bus on its own, then hand it work with agenthop_handoff. Any session can dispatch — a decentralized, visible orchestration center.
 - agenthop_wm(args): drive the OmniWM window manager (macOS) to arrange windows — a passthrough to omniwmctl (e.g. "query windows", "window move-to-workspace <id> 2").
+
+Choosing a channel: agenthop reaches EVERY tool on the bus (Claude Code, Codex, OpenCode). If your host also has its OWN cross-session messaging (e.g. Claude Code's built-in), that only sees other sessions of the SAME tool — it cannot reach Codex or OpenCode. So use the host's native messaging for same-tool peers if you like, but use agenthop for ANY cross-tool peer: it is the only channel that bridges them, and agenthop_peers is where a different-tool session shows up at all.
 
 Incoming messages arrive on their own: on agents with a native inbox (e.g. Claude Code) they surface in your session automatically as a cross-session message — you do NOT need to poll. To reply, agenthop_send back to the sender (its id is shown with the message). agenthop_recv is only for agents without native delivery.`;
 }

@@ -229,10 +229,15 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
     const seq = opts?.seq;
     if (seq !== undefined && b.self.statusSeq !== undefined && seq <= b.self.statusSeq) return { ok: false, seq: b.self.statusSeq };
     if (seq === undefined && b.self.statusSeq !== undefined && b.self.statusSeq >= Number.MAX_SAFE_INTEGER) return { ok: false, seq: b.self.statusSeq };
+    const text = opts?.text?.trim() || undefined;
+    const unchanged = state === b.self.status && text === b.self.statusText;
     b.self.status = state;
     b.self.statusSeq = seq ?? (b.self.statusSeq ?? 0) + 1;
-    b.self.statusText = opts?.text?.trim() || undefined;
+    b.self.statusText = text;
     b.self.statusAt = Date.now();
+    // Skip the roster re-announce when neither state nor text changed (only the seq advanced) — a repeated
+    // session.status(busy)/working signal from the event feed must not spam peers.
+    if (unchanged) return { ok: true, seq: b.self.statusSeq };
     b.local.updateSelf(b.self); // local roster; cross-machine status propagation is a follow-up
     return { ok: true, seq: b.self.statusSeq };
   };
@@ -325,14 +330,45 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
     "chat.message": async (input: { sessionID: string }): Promise<void> => {
       busFor(input.sessionID);
     },
-    // Tear a session's bus peer down when the session is deleted, so it leaves the roster promptly.
-    event: async ({ event }: { event: { type: string; properties?: { info?: { id?: string } } } }): Promise<void> => {
-      if (event?.type !== "session.deleted") return;
-      const id = event.properties?.info?.id;
-      const b = id ? buses.get(id) : undefined;
-      if (b && id) {
-        buses.delete(id);
-        await closeBus(b);
+    // OpenCode's in-process event firehose. Two jobs: (1) tear a deleted session's bus down so it leaves the
+    // roster promptly; (2) Slice B's status feed — map session/permission events to this session's work state
+    // (fully in-process, no external hook or file — see docs/research/codex-opencode-hooks.md). Every
+    // session-scoped event carries its own sessionID, so each updates exactly one peer.
+    event: async ({ event }: { event: { type: string; properties?: { sessionID?: string; info?: { id?: string }; status?: { type?: string } } } }): Promise<void> => {
+      const type = event?.type;
+      const props = event?.properties ?? {};
+      if (type === "session.deleted") {
+        const id = props.info?.id;
+        const b = id ? buses.get(id) : undefined;
+        if (b && id) {
+          buses.delete(id);
+          await closeBus(b);
+        }
+        return;
+      }
+      const sid = props.sessionID;
+      if (typeof sid !== "string" || !sid) return;
+      const apply = (state: AgentStatus): void => void setStatus(busFor(sid), state);
+      switch (type) {
+        case "session.idle":
+          apply("idle"); // turn finished
+          break;
+        // A permission is being awaited. The event name drifts across OpenCode SDK versions — the installed
+        // 1.18.x emits "permission.asked" (older v1 d.ts had "permission.updated", the v2 union adds
+        // "permission.v2.asked"), so accept all three to stay version-robust.
+        case "permission.asked":
+        case "permission.updated":
+        case "permission.v2.asked":
+          apply("blocked");
+          break;
+        case "permission.replied":
+        case "permission.v2.replied":
+          apply("working"); // approval answered -> back to work
+          break;
+        case "session.status":
+          if (props.status?.type === "busy") apply("working");
+          else if (props.status?.type === "idle") apply("idle");
+          break;
       }
     },
     tool: {

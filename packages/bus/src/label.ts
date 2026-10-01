@@ -75,23 +75,29 @@ export function shortId(id: string): string {
 }
 
 /**
- * The readable, restart-stable handle for a session: `tool:dir-<shortSessionId>`, e.g.
- * `codex:Work-01a0ead5`. The dir makes it legible; the short native session id makes it unique across
- * concurrent same-dir sessions and the SAME across a restart/resume. Falls back to `tool:dir` until a
- * stableId is known, and to AGENTHOP_TITLE when set. Kept in sync when a session learns its stableId.
+ * The readable handle for a session: `tool:dir-<shortId>`, e.g. `codex:Work-01a0ead5`. The dir makes it
+ * legible; the short id makes it unique across concurrent same-dir sessions. `idForSuffix` should be the
+ * most durable id available — the native session id when known (then the handle is the SAME across a
+ * restart/resume), else the per-run id as a fallback so the handle is STILL uniquely suffixed. This matters
+ * for resolution: a bare `tool:dir` (no suffix) would exact-match — and silently shadow — a suffixed sibling
+ * in resolvePeer's title tier, so callers must always pass an id (stableId ?? runId), never nothing. Falls
+ * back to bare `tool:dir` only if no id at all is given, and to AGENTHOP_TITLE when set.
  */
-export function sessionTitle(tool: string, cwd: string, stableId?: string, env: NodeJS.ProcessEnv = process.env): string {
+export function sessionTitle(tool: string, cwd: string, idForSuffix?: string, env: NodeJS.ProcessEnv = process.env): string {
   const explicit = env.AGENTHOP_TITLE?.trim();
   if (explicit) return explicit;
   const base = `${tool}:${basename(cwd) || cwd}`;
-  return stableId ? `${base}-${shortId(stableId)}` : base;
+  return idForSuffix ? `${base}-${shortId(idForSuffix)}` : base;
 }
 
 export function selfInfo(env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): SelfInfo {
   const tool = detectTool(env);
-  // stableId is the host's native session id when it is in the env (Claude Code); otherwise it is
-  // filled in later once known (Codex learns its thread id on connect). id stays a fresh per-run token.
+  // stableId is the host's native session id when it is in the env (Claude Code); otherwise it is filled in
+  // later once known (Codex learns its thread id on connect). id stays a fresh per-run token.
   const stableId = nativeSessionId(env);
-  const title = sessionTitle(tool, cwd, stableId, env);
-  return { id: randomUUID(), stableId, tool, cwd, pid: process.pid, title, startedAt: Date.now() };
+  const id = randomUUID();
+  // Suffix the handle with the native session id when known (restart-stable), else the per-run id — NEVER a
+  // bare `tool:dir`, which would exact-match and silently shadow a suffixed same-dir sibling in resolution.
+  const title = sessionTitle(tool, cwd, stableId ?? id, env);
+  return { id, stableId, tool, cwd, pid: process.pid, title, startedAt: Date.now() };
 }
