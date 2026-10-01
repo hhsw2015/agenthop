@@ -58,16 +58,20 @@ test("every bus tool declares all four hints, and the safety-critical ones are c
       }
     }
     const hints = (name: string) => tools.find((t) => t.name === name)?.annotations;
-    // Safety-critical: a client that asks before acting must see the window/process closers as destructive.
-    expect(hints("agenthop_despawn")?.destructiveHint).toBe(true);
-    expect(hints("agenthop_wm")?.destructiveHint).toBe(true);
-    // Read-only observers must not look like mutations.
+    // Safety-critical: a client that gates auto-approval must see every NON-additive mutation as destructive —
+    // the window/process closers AND spawn (runs an autonomous no-confirm task), recv (drains the inbox),
+    // report_status (overwrites our state).
+    for (const n of ["agenthop_despawn", "agenthop_wm", "agenthop_spawn", "agenthop_recv", "agenthop_report_status"]) {
+      expect(hints(n)?.destructiveHint, `${n} destructive`).toBe(true);
+    }
+    // Pure observers are read-only; additive delivery is not read-only but also not destructive.
     expect(hints("agenthop_peers")?.readOnlyHint).toBe(true);
-    expect(hints("agenthop_recv")?.readOnlyHint).toBe(true);
     expect(hints("agenthop_wait_peer")?.readOnlyHint).toBe(true);
-    // Outward actions are not read-only; and only a local-registry read is closed-world.
+    expect(hints("agenthop_spawned")?.readOnlyHint).toBe(true);
     expect(hints("agenthop_send")?.readOnlyHint).toBe(false);
-    expect(hints("agenthop_spawn")?.readOnlyHint).toBe(false);
+    expect(hints("agenthop_send")?.destructiveHint).toBe(false); // additive: adds a message, destroys nothing
+    expect(hints("agenthop_recv")?.readOnlyHint).toBe(false); // consumes the inbox batch
+    // openWorld: only a local-registry read is closed-world.
     expect(hints("agenthop_spawned")?.openWorldHint).toBe(false);
     expect(hints("agenthop_peers")?.openWorldHint).toBe(true);
   } finally {

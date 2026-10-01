@@ -20,17 +20,18 @@ const MAX_WAIT_S = 290;
 
 /**
  * Every bus tool declares all four MCP hints, as booleans — some directories reject a tool with any missing
- * (the same convention the classic tools adopted in cli/mcp.ts). `openWorldHint` = the tool touches the relay /
- * other sessions / the OS desktop; it is false only for a tool that reads our own local registry. Defined here
+ * (the same convention the classic tools adopted in cli/mcp.ts). Per the spec: for a non-readOnly tool,
+ * `destructiveHint` is true when the update is NOT purely additive (it overwrites/removes/runs arbitrary
+ * effects), and `idempotentHint` is true when a repeat with the same args has no further effect. `openWorldHint`
+ * = the tool reaches the relay / other sessions / the OS, vs reading only our own local registry. Defined here
  * (not imported) so @agenthop/bus stays decoupled from the classic cli tool surface.
  */
-const ACTS = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }; // send/handoff/spawn: a one-shot outward action, each call distinct
-const WAITS = { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true }; // recv/wait_peer: reads/waits on the outside
+const ACTS = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }; // send/handoff: ADDITIVE outward delivery (adds a message, destroys nothing)
+const WAITS = { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true }; // wait_peer: observes a peer, consumes nothing
 const SCANS = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }; // peers: a read-only snapshot of other sessions
-const PUBLISHES = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }; // report_status: sets OUR own state; the same state again is a no-op
 const LOOKS = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }; // spawned: reads our own local registry only
-const DRIVES = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }; // wm: mutates the desktop, INCLUDING window-closing ops
-const CLOSES = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true }; // despawn: closes a window/process we spawned (a closed one stays closed)
+const MUTATES = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }; // recv (drains the inbox), report_status (overwrites our state + bumps seq), spawn (runs an autonomous no-confirm task that can modify/delete), wm (drives the desktop incl. window-closing) — each a NON-additive mutation reaching outside
+const CLOSES = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true }; // despawn: closes a window/process we spawned (a closed one stays closed → idempotent)
 
 export type BusMcpOptions = { home?: string; relay?: string; pass?: string };
 
@@ -116,7 +117,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_recv",
     {
-      annotations: WAITS,
+      annotations: MUTATES,
       description: "Wait for and return messages other sessions have sent you. Returns as soon as anything arrives, or when the timeout elapses.",
       inputSchema: {
         timeout_seconds: z.number().int().min(1).max(MAX_WAIT_S).optional().describe(`Seconds to wait, ${DEFAULT_WAIT_S} by default`),
@@ -134,7 +135,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_report_status",
     {
-      annotations: PUBLISHES,
+      annotations: MUTATES,
       description:
         "Report THIS session's work state to peers (working | idle | blocked | unknown). It shows in agenthop_peers and lets a dispatcher agenthop_wait_peer on it. `blocked` means you need input (a permission/approval/question). Usually driven by hooks, but an agent may set it directly.",
       inputSchema: {
@@ -177,7 +178,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_spawn",
     {
-      annotations: ACTS,
+      annotations: MUTATES,
       description:
         "Launch another agent CLI (claude | codex | opencode) on this machine. YOU choose the mode per task: visible (default) opens a VISIBLE terminal window the user can watch (macOS + Ghostty), the session joins the bus — give it work with agenthop_handoff; visible:false runs it HEADLESS (no window, any platform) in the tool's native non-interactive mode with `task` as its prompt, output streaming to a per-launch log file. Prefer visible for important/watchable work, headless for minor/bulk runs or a full desktop. Sub-agents start in no-confirmation mode so they run unattended.",
       inputSchema: {
@@ -199,7 +200,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_wm",
     {
-      annotations: DRIVES,
+      annotations: MUTATES,
       description:
         'Drive the OmniWM window manager (macOS) to arrange windows — pass an omniwmctl command line, e.g. "query windows", "command focus left", "window move-to-workspace <id> 2", "workspace focus-name agents". One-shot only (no subscribe/watch). Note: includes window-closing ops and acts on your live desktop.',
       inputSchema: {
