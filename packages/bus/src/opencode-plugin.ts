@@ -137,7 +137,12 @@ function startBridgeClient(self: SelfInfo, onInbound: (from: string, text: strin
         s.destroy();
         return;
       }
-      s.write(`${JSON.stringify({ t: "hello", self, team: teamId })}\n`);
+      // Publish cross-machine WITHOUT a work-status: the plugin's setStatus only updates the local roster
+      // (outbound cross-machine status is a bus.8 follow-up), so a status carried here would be stale and
+      // frozen at hello time — and a remote agenthop_wait_peer could then be FALSELY satisfied by it. Send it
+      // as unknown (fields stripped) so cross-machine shows "unknown" and no wait matches a stale value.
+      const crossMachineSelf: SelfInfo = { ...self, status: undefined, statusSeq: undefined, statusText: undefined, statusAt: undefined };
+      s.write(`${JSON.stringify({ t: "hello", self: crossMachineSelf, team: teamId })}\n`);
     });
     s.on("data", (chunk: string) => {
       if (closed) return;
