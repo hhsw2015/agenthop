@@ -100,6 +100,26 @@ test("GC: prunes a dead session's stale file by mtime TTL, keeps fresh ones, nev
   }
 });
 
+test("GC: never regresses to a lower seq — the max (written first, older mtime) is not deleted while a newer-mtime sibling survives (P2-8)", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ah-sf-gc-race-"));
+  try {
+    const dir = path.join(home, ".agenthop", "status");
+    mkdirSync(dir, { recursive: true });
+    // The race the old per-file-mtime GC lost: a concurrent pair leaves the MAX (200) with an OLDER mtime
+    // than a lower sibling (100). Pruning by per-file mtime would delete 200 and regress the reader to 100.
+    const old = new Date(Date.now() - STATUS_FILE_TTL_MS - 60_000);
+    writeFileSync(path.join(dir, "race.json.200"), JSON.stringify({ state: "idle", seq: 200 }));
+    utimesSync(path.join(dir, "race.json.200"), old, old); // max, but OLDER mtime
+    writeFileSync(path.join(dir, "race.json.100"), JSON.stringify({ state: "working", seq: 100 })); // sub-max, FRESH mtime
+    pruneStaleStatusFiles(home);
+    const r = readStatusFile(home, "race");
+    expect(r === undefined || r.seq === 200).toBe(true); // NEVER the stale lower 100 — no regression
+    expect(existsSync(path.join(dir, "race.json.100"))).toBe(false); // when the max is pruned, the whole dead key goes
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("GC: an explicit ttl/now makes it deterministic; nothing younger than the TTL is touched", () => {
   const home = mkdtempSync(path.join(tmpdir(), "ah-sf-gc2-"));
   try {

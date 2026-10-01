@@ -109,6 +109,7 @@ describe("plugging into agents as an MCP server", () => {
     expect(group("Stop").hooks[0].command).toContain("report-status idle");
     expect(group("Interrupt").hooks[0].command).toContain("report-status idle"); // Codex-only event clears blocked
     expect(group("SessionStart").hooks[0].command).toContain("report-status idle"); // seed: no [unknown] at start
+    expect(group("SessionStart").matcher).toBe("startup|resume"); // NOT on compact (would wrongly idle a live turn)
     expect(group("UserPromptSubmit").hooks[0].command).toContain("report-status working");
     // Shared command: event-time --seq + ours-sentinel; session id comes from stdin (no --session needed).
     expect(group("Stop").hooks[0].command.startsWith("_ahT=$(")).toBe(true);
@@ -174,6 +175,8 @@ describe("plugging into agents as an MCP server", () => {
     expect(cfg.model).toBe("opus"); // unrelated key preserved
     const cmds = (event: string) => (cfg.hooks[event] as { hooks: { command: string }[] }[]).flatMap((g) => g.hooks.map((h) => h.command));
     expect(cmds("SessionStart").some((c) => c.includes("report-status idle"))).toBe(true); // seed: no [unknown] at start
+    // SessionStart→idle must be scoped to startup/resume, never compact (else a mid-turn compaction idles a live turn).
+    expect((cfg.hooks.SessionStart as { matcher?: string }[]).some((g) => g.matcher === "startup|resume")).toBe(true);
     expect(cmds("UserPromptSubmit").some((c) => c.includes("report-status working"))).toBe(true);
     expect(cmds("PostToolUse").some((c) => c.includes("report-status working"))).toBe(true); // recovers from blocked
     expect(cmds("Stop").some((c) => c.includes("report-status idle"))).toBe(true);

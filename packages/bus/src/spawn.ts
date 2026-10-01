@@ -279,33 +279,16 @@ export function headlessArgv(tool: string, cliArgv: string[], task: string, env:
   return { argv: [cliArgv[0]!, ...mode, ...cliArgv.slice(1), task] };
 }
 
-/** Parse `ps -p <pid> -o lstart=,command=` output: first 5 tokens are the start timestamp, the rest
- *  the command line. startMs is undefined when the date does not parse. Pure. */
-export function parsePsIdentity(psOut: string): { startMs?: number; command: string } | undefined {
-  const line = psOut.split("\n").find((l) => l.trim());
-  if (!line) return undefined;
-  const m = line.trim().match(/^(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
-  if (!m) return undefined;
-  const startMs = Date.parse(m[1]!.replace(/\s+/g, " "));
-  return { startMs: Number.isFinite(startMs) ? startMs : undefined, command: m[2]! };
-}
-
 /**
- * Does the live process at a recorded pid still look like the one agenthop launched? "match" when the
- * command line contains the recorded binary, OR (interpreter may rewrite argv) its start time is within
- * a window around the recorded launch ts. "mismatch" = provably a DIFFERENT process (pid reused) — never
- * kill it. "unknown" = cannot tell — never kill either. Pure.
+ * Headless ownership — the ONLY sound proof that a recorded pid is the process agenthop launched, and
+ * therefore safe to signal: it must still be OUR DIRECT CHILD right now, i.e. its live parent pid equals
+ * this (the spawner) process. A reused pid, or this bus node having restarted (the detached child then
+ * reparents to init), breaks the match — so we refuse rather than risk signalling a user's process.
+ * Command text and start-time windows are NOT ownership proof (a reused pid, or a user's own same-tool
+ * run, can match them), which is why they were dropped. Pure.
  */
-export function headlessIdentity(psOut: string | undefined, bin: string, launchTs: number): "match" | "mismatch" | "unknown" {
-  if (!psOut) return "unknown";
-  const parsed = parsePsIdentity(psOut);
-  if (!parsed) return "unknown";
-  if (bin && parsed.command.includes(bin)) return "match";
-  if (parsed.startMs === undefined) return "unknown";
-  // Started up to 15s before (clock skew) or 120s after the record was written = our child.
-  const skewBeforeMs = 15_000;
-  const startupWindowMs = 120_000;
-  return parsed.startMs >= launchTs - skewBeforeMs && parsed.startMs <= launchTs + startupWindowMs ? "match" : "mismatch";
+export function headlessOwnedByMe(livePpid: number | undefined, spawnerPid: number): boolean {
+  return livePpid !== undefined && livePpid === spawnerPid;
 }
 
 // --- Spawn registry: the ONLY surfaces/processes despawn may close --------------------------------
@@ -328,6 +311,9 @@ export type SpawnRecord = {
   claimed?: boolean;
   mode?: SpawnMode;
   pid?: number;
+  /** The pid of the bus node that spawned this headless child — only that live process is its parent, so
+   *  only it can prove ownership at despawn (see despawnHeadless). */
+  spawnerPid?: number;
   bin?: string;
   outputFile?: string;
   exitCode?: number | null;
@@ -348,6 +334,7 @@ type MainRecord = {
   ts: number;
   mode?: SpawnMode;
   pid?: number;
+  spawnerPid?: number;
   bin?: string;
   outputFile?: string;
   exitCode?: number | null;
@@ -373,6 +360,8 @@ function isMain(r: unknown): r is MainRecord {
   const windowOk = o.windowId === null || typeof o.windowId === "string";
   const modeOk = o.mode === undefined || o.mode === "visible" || o.mode === "headless";
   const pidOk = o.pid === undefined || (typeof o.pid === "number" && Number.isInteger(o.pid) && o.pid > 0);
+  const spawnerPidOk = o.spawnerPid === undefined || (typeof o.spawnerPid === "number" && Number.isInteger(o.spawnerPid) && o.spawnerPid > 0);
+  if (!spawnerPidOk) return false;
   return typeof o.launchId === "string" && typeof o.tool === "string" && typeof o.cwd === "string" && windowOk && modeOk && pidOk;
 }
 function readClaim(home: string, lid: string): ClaimRecord | undefined {
@@ -425,6 +414,7 @@ export function readRegistry(home: string = homedir()): SpawnRecord[] {
         claimed: claim?.claimed ?? false,
         mode: m.mode ?? "visible", // records from before headless existed are all visible launches
         pid: m.pid,
+        spawnerPid: m.spawnerPid,
         bin: m.bin,
         outputFile: m.outputFile,
         exitCode: m.exitCode,
@@ -448,6 +438,7 @@ export function recordSpawn(rec: SpawnRecord, home: string = homedir()): boolean
     ts: rec.ts,
     ...(rec.mode !== undefined ? { mode: rec.mode } : {}),
     ...(rec.pid !== undefined ? { pid: rec.pid } : {}),
+    ...(rec.spawnerPid !== undefined ? { spawnerPid: rec.spawnerPid } : {}),
     ...(rec.bin !== undefined ? { bin: rec.bin } : {}),
     ...(rec.outputFile !== undefined ? { outputFile: rec.outputFile } : {}),
     ...(rec.exitCode !== undefined ? { exitCode: rec.exitCode } : {}),
@@ -810,7 +801,7 @@ export async function spawnHeadlessAgent(input: SpawnInput, env: NodeJS.ProcessE
 
   const lid = launchId(input.tool);
   const outputFile = headlessOutputFile(home, lid);
-  const pending: SpawnRecord = { windowId: null, surfaceId: null, launchId: lid, tool: input.tool, cwd, ts: Date.now(), mode: "headless", bin: cli.argv[0]!, outputFile };
+  const pending: SpawnRecord = { windowId: null, surfaceId: null, launchId: lid, tool: input.tool, cwd, ts: Date.now(), mode: "headless", spawnerPid: process.pid, bin: cli.argv[0]!, outputFile };
   // Record BEFORE launching: an untracked process could never be despawned, so if we cannot record,
   // we do not launch (mirrors the visible flow).
   if (!recordSpawn(pending, home)) {
@@ -852,14 +843,6 @@ function aliveState(pid: number): "alive" | "gone" | "not-ours" {
   }
 }
 
-function psIdentityRaw(pid: number): Promise<string | undefined> {
-  return new Promise((resolve) => {
-    execFile("ps", ["-p", String(pid), "-o", "lstart=,command="], { timeout: 3000, encoding: "utf8" }, (err, stdout) => {
-      resolve(err ? undefined : (stdout ?? ""));
-    });
-  });
-}
-
 async function waitGone(pid: number, ms: number): Promise<boolean> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
@@ -871,9 +854,11 @@ async function waitGone(pid: number, ms: number): Promise<boolean> {
 
 /**
  * Terminate a HEADLESS launch: kill EXACTLY the pid recorded under this launchId — never a process by
- * name, never anything agenthop did not spawn. Before killing, verify the live process still matches
- * the recorded identity (binary on its command line, or started inside the launch window): a reused
- * pid is provably not our child and is never signalled; an unverifiable one is refused, not guessed.
+ * name, never anything agenthop did not spawn. Ownership is proven the only sound way: the live process
+ * must still be OUR DIRECT CHILD (its live parent pid == this spawner process). A reused pid, or this bus
+ * node having restarted (the detached child reparents away), fails that check and is REFUSED — not guessed
+ * from command text or a start-time window, which a user's own same-tool run could match. A one-shot
+ * headless run (claude -p / codex exec / opencode run) exits on its own, so refusing an un-ownable one is safe.
  */
 async function despawnHeadless(rec: SpawnRecord, home: string): Promise<{ ok: boolean; note: string }> {
   const out = rec.outputFile ? ` Its output log is kept at ${rec.outputFile}.` : "";
@@ -893,17 +878,19 @@ async function despawnHeadless(rec: SpawnRecord, home: string): Promise<{ ok: bo
     forgetSpawn(rec.launchId, home);
     return { ok: true, note: `pid ${rec.pid} now belongs to a process agenthop cannot even signal — our child is gone and the OS reused its pid. Killed nothing; record removed.${out}` };
   }
-  const identity = headlessIdentity(await psIdentityRaw(rec.pid), rec.bin ?? "", rec.ts);
-  if (identity === "mismatch") {
-    forgetSpawn(rec.launchId, home);
-    return { ok: true, note: `pid ${rec.pid} is now a DIFFERENT process than the one agenthop launched (pid reused); killed nothing — agenthop never kills a process it did not spawn. Record removed.${out}` };
+  // Ownership proof: the live process must still be OUR DIRECT CHILD (its live parent == this process). Only
+  // the bus node that spawned it, still running, is its parent; after our restart it reparents to init, and a
+  // reused pid has some other parent — both fail here and are refused (command/start-time are NOT proof).
+  const { ppid } = await psTtyPpid(rec.pid);
+  if (!headlessOwnedByMe(ppid, process.pid)) {
+    const why = rec.spawnerPid && rec.spawnerPid !== process.pid
+      ? `it was spawned by pid ${rec.spawnerPid}, not this session (${process.pid})`
+      : `its spawner likely restarted, or the OS reused the pid (live parent ${ppid ?? "unknown"} ≠ ${process.pid})`;
+    return { ok: false, note: `Refusing to signal pid ${rec.pid}: agenthop only kills a headless run that is still its OWN direct child, but ${why}. The one-shot ${rec.tool} run exits on its own. Record kept.${out}` };
   }
-  if (identity === "unknown") {
-    return { ok: false, note: `Could not verify that pid ${rec.pid} is still the ${rec.tool} run agenthop launched (ps unavailable/unparseable); refusing to kill an unverified process. Record kept — retry, or stop it manually.` };
-  }
-  // The child was spawned detached (its own session ⇒ its own process GROUP, rooted at this pid), so
-  // signalling -pid reaches the CLI's own sub-processes too — still only processes our launch created.
-  // The leader's identity was verified just above; fall back to the single pid if the group signal fails.
+  // Verified our child. It was spawned detached (its own session ⇒ its own process GROUP rooted at this pid),
+  // so signalling -pid reaches the CLI's own sub-processes too — all created by our launch. Fall back to the
+  // single pid if the group signal fails.
   const signal = (sig: NodeJS.Signals): void => {
     try {
       process.kill(-rec.pid!, sig);
@@ -916,10 +903,17 @@ async function despawnHeadless(rec: SpawnRecord, home: string): Promise<{ ok: bo
     }
   };
   signal("SIGTERM");
-  const ended = await waitGone(rec.pid, 2000);
-  if (!ended) signal("SIGKILL");
+  let ended = await waitGone(rec.pid, 2000);
+  if (!ended) {
+    signal("SIGKILL");
+    ended = await waitGone(rec.pid, 2000);
+  }
+  if (!ended) {
+    // Both signals sent, still alive (uninterruptible / escaped its group) — report honestly, keep the record.
+    return { ok: false, note: `Sent SIGTERM then SIGKILL to the headless ${rec.tool} run (pid ${rec.pid}) but it is still alive; agenthop could not terminate it. Record kept — stop it manually.${out}` };
+  }
   forgetSpawn(rec.launchId, home);
-  return { ok: true, note: `Terminated the headless ${rec.tool} run (launchId ${rec.launchId}, pid ${rec.pid})${ended ? "" : " — SIGKILL after the SIGTERM grace expired"}.${out}` };
+  return { ok: true, note: `Terminated the headless ${rec.tool} run (launchId ${rec.launchId}, pid ${rec.pid}).${out}` };
 }
 
 export type DespawnOptions = { home?: string };

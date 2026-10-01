@@ -14,11 +14,10 @@ import {
   diffNewWindowIds,
   forgetSpawn,
   headlessArgv,
-  headlessIdentity,
+  headlessOwnedByMe,
   isSpawnedWindow,
   launchId,
   moveArgv,
-  parsePsIdentity,
   readRegistry,
   recordForWindow,
   recordSpawn,
@@ -251,30 +250,16 @@ describe("scrubbedEnv (headless child must not inherit identity or a launch id)"
   });
 });
 
-describe("headless pid identity (never kill a reused pid)", () => {
-  // Real `ps -p <pid> -o lstart=,command=` shape on macOS.
-  const ps = "Wed Oct  1 10:00:05 2026 /Users/u/.local/bin/codex exec do thing\n";
-
-  it("parses lstart + command", () => {
-    const p = parsePsIdentity(ps)!;
-    expect(p.command).toBe("/Users/u/.local/bin/codex exec do thing");
-    expect(p.startMs).toBe(Date.parse("Wed Oct 1 10:00:05 2026"));
+describe("headless ownership (only kill our own still-live direct child)", () => {
+  it("owns a pid only when its live parent is this spawner process", () => {
+    expect(headlessOwnedByMe(4242, 4242)).toBe(true); // live parent == us → our child → safe to signal
   });
 
-  it("matches when the recorded binary is on the live command line", () => {
-    expect(headlessIdentity(ps, "/Users/u/.local/bin/codex", 0)).toBe("match");
-  });
-
-  it("matches by start-time window when argv was rewritten, mismatches outside it", () => {
-    const started = Date.parse("Wed Oct 1 10:00:05 2026");
-    expect(headlessIdentity(ps, "/other/bin", started - 5_000)).toBe("match"); // started 5s after record
-    expect(headlessIdentity(ps, "/other/bin", started - 600_000)).toBe("mismatch"); // record 10 min older → reused pid
-    expect(headlessIdentity(ps, "/other/bin", started + 600_000)).toBe("mismatch"); // record newer than process
-  });
-
-  it("is unknown (refuse, don't guess) when ps output is missing or unparseable", () => {
-    expect(headlessIdentity(undefined, "/bin/x", 0)).toBe("unknown");
-    expect(headlessIdentity("", "/bin/x", 0)).toBe("unknown");
+  it("refuses when the live parent is NOT us (pid reused, or our restart reparented the child)", () => {
+    expect(headlessOwnedByMe(1, 4242)).toBe(false); // reparented to init after our restart
+    expect(headlessOwnedByMe(9999, 4242)).toBe(false); // some other process is its parent (reused pid)
+    expect(headlessOwnedByMe(undefined, 4242)).toBe(false); // ppid unknown → never guess
+    expect(headlessOwnedByMe(0, 4242)).toBe(false);
   });
 });
 

@@ -192,7 +192,9 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
   // including a turn that ended on an API error (StopFailure) so it never sticks at `working`; blocked the
   // instant an approval is requested. (All event names verified against the Claude Code hooks reference.)
   const events = [
-    { event: "SessionStart", state: "idle" },
+    // SessionStart only on startup/resume — NOT compact (a mid-turn compaction fires SessionStart too, and
+    // an unmatched idle would flip a working turn to idle and wrongly satisfy a wait-for-idle).
+    { event: "SessionStart", state: "idle", matcher: "startup|resume" },
     { event: "UserPromptSubmit", state: "working" },
     { event: "PostToolUse", state: "working" },
     { event: "PostToolUseFailure", state: "working" },
@@ -200,7 +202,7 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
     { event: "StopFailure", state: "idle" },
     { event: "PermissionRequest", state: "blocked" },
   ];
-  const changed = mergeStatusHookEvents(config, events, bin, (command) => ({ hooks: [{ type: "command", command, async: true }] }));
+  const changed = mergeStatusHookEvents(config, events, bin, (command, matcher) => ({ ...(matcher ? { matcher } : {}), hooks: [{ type: "command", command, async: true }] }));
   if (changed === 0) return t(`${file} already has agenthop status hooks; nothing changed`, `${file} 里已有 agenthop 状态 hook，没有改动`);
   placeJson(file, config);
   return t(`wrote ${changed} status hook change(s) to ${file}`, `已写 ${changed} 处状态 hook 改动到 ${file}`);
@@ -225,7 +227,8 @@ export function installCodexStatusHooks(bin: string, home = homedir()): string {
   // SessionStart→idle seeds a fresh session's status (else it shows [unknown] until its first event);
   // the event is in Codex's HookEventNameWire enum, same as Claude Code's (see the research doc).
   const events = [
-    { event: "SessionStart", state: "idle" },
+    // SessionStart only on startup/resume — not a compaction's SessionStart (same reasoning as Claude).
+    { event: "SessionStart", state: "idle", matcher: "startup|resume" },
     { event: "UserPromptSubmit", state: "working" },
     { event: "PostToolUse", state: "working" },
     { event: "Stop", state: "idle" },
@@ -233,7 +236,7 @@ export function installCodexStatusHooks(bin: string, home = homedir()): string {
     { event: "PermissionRequest", state: "blocked" },
   ];
   // async:true so a slow/hung report-status can never stall Codex's approval UI; timeout is in SECONDS.
-  const changed = mergeStatusHookEvents(config, events, bin, (command) => ({ matcher: "", hooks: [{ type: "command", command, timeout: 10, async: true }] }));
+  const changed = mergeStatusHookEvents(config, events, bin, (command, matcher) => ({ matcher: matcher ?? "", hooks: [{ type: "command", command, timeout: 10, async: true }] }));
   let wrote: string;
   if (changed === 0) {
     wrote = t(`${file} already has agenthop status hooks`, `${file} 里已有 agenthop 状态 hook`);
@@ -299,10 +302,10 @@ function statusHookCommand(bin: string, state: string): string {
  * never touching a user's own hooks. `makeGroup` supplies the host-specific group wrapper (Claude Code:
  * `{hooks:[…]}`; Codex: `{matcher:"",hooks:[…]}` with a timeout). Returns the number of changes made.
  */
-function mergeStatusHookEvents(config: Record<string, unknown>, events: Array<{ event: string; state: string }>, bin: string, makeGroup: (command: string) => unknown): number {
+function mergeStatusHookEvents(config: Record<string, unknown>, events: Array<{ event: string; state: string; matcher?: string }>, bin: string, makeGroup: (command: string, matcher?: string) => unknown): number {
   const hooks = (config.hooks ??= {}) as Record<string, unknown>;
   let changed = 0;
-  for (const { event, state } of events) {
+  for (const { event, state, matcher } of events) {
     const arr = (hooks[event] ??= []) as unknown[];
     if (!Array.isArray(arr)) continue; // unexpected shape for this event — leave it alone
     const mark = sentinelFor(state);
@@ -318,7 +321,7 @@ function mergeStatusHookEvents(config: Record<string, unknown>, events: Array<{ 
       }
       continue;
     }
-    arr.push(makeGroup(want));
+    arr.push(makeGroup(want, matcher));
     changed++;
   }
   return changed;

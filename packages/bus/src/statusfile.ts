@@ -172,8 +172,14 @@ const STATUS_GC_INTERVAL_MS = 10 * 60 * 1000;
  * cross-process jobs are (a) carrying a NEW event from a hook to the node — such a file is written (fresh
  * mtime) moments before pickup, nowhere near the TTL — and (b) seeding a RESTARTED node at startup — and a
  * seed untouched for hours is stale noise there anyway (the SessionStart hook re-seeds a fresh session).
- * Best-effort and concurrency-safe: a file that vanishes mid-scan is skipped, and a failed unlink is
- * harmless clutter for the next pass. Returns how many files were removed.
+ *
+ * The decision is PER KEY, keyed on the MAX-seq file's mtime — NOT per file. A key can hold several
+ * `<key>.json.<seq>` versions, and a concurrent write can leave a LOWER-seq file with a NEWER mtime than
+ * the max (two writers that each saw an empty dir). Pruning by per-file mtime would then delete the max and
+ * regress the key to the stale lower version. Instead: if a key's max-seq file is older than the TTL the
+ * whole session is dead → remove every version; if the max is fresh → keep them all (writeStatusFile prunes
+ * sub-max versions on its next write). Best-effort and concurrency-safe: a file that vanishes mid-scan is
+ * skipped and a failed unlink is harmless clutter for the next pass. Returns how many files were removed.
  */
 export function pruneStaleStatusFiles(home: string, opts?: { ttlMs?: number; now?: number }): number {
   const ttlMs = opts?.ttlMs ?? STATUS_FILE_TTL_MS;
@@ -186,17 +192,58 @@ export function pruneStaleStatusFiles(home: string, opts?: { ttlMs?: number; now
   } catch {
     return 0; // no dir, nothing to prune
   }
-  let pruned = 0;
+  // Group versioned files (<key>.json.<seq>) by key; anything else (e.g. a leftover `.tmp.` stage) is loose.
+  const groups = new Map<string, Array<{ name: string; seq: number }>>();
+  const loose: string[] = [];
   for (const name of names) {
-    const file = path.join(dir, name);
+    const m = name.match(/^(.*\.json)\.(\d+)$/);
+    if (m) (groups.get(m[1]!) ?? groups.set(m[1]!, []).get(m[1]!)!).push({ name, seq: Number(m[2]) });
+    else loose.push(name);
+  }
+  let pruned = 0;
+  const unlink = (name: string): void => {
     try {
-      const stat = statSync(file);
-      if (!stat.isFile()) continue; // only our flat status files — never recurse into anything else
-      if (now - stat.mtimeMs < ttlMs) continue; // fresh — possibly live, never touched
-      rmSync(file, { force: true });
+      rmSync(path.join(dir, name), { force: true });
       pruned++;
     } catch {
-      // vanished mid-scan or unlink refused — either way, leave it for the next pass
+      // vanished mid-scan or unlink refused — leave it for the next pass
+    }
+  };
+  for (const files of groups.values()) {
+    files.sort((a, b) => b.seq - a.seq);
+    const [max, ...subMax] = files; // the MAX-seq version is the authoritative current state
+    let maxMtime: number;
+    try {
+      const s = statSync(path.join(dir, max!.name));
+      if (!s.isFile()) continue;
+      maxMtime = s.mtimeMs;
+    } catch {
+      continue; // the max vanished mid-scan — next pass
+    }
+    if (now - maxMtime >= ttlMs) {
+      // The MAX itself is untouched past the TTL ⇒ the whole session is dead ⇒ remove every version TOGETHER.
+      // (Deleting the max alone while a lower sibling with a newer mtime survived is exactly the P2-8 regression.)
+      for (const f of files) unlink(f.name);
+      continue;
+    }
+    // Max is fresh ⇒ never touch it; prune only stale LOWER-seq leftovers. A sub-max file can never be the
+    // winning state (the reader always takes the max), so removing a stale one can never regress anything.
+    for (const f of subMax) {
+      try {
+        const s = statSync(path.join(dir, f.name));
+        if (s.isFile() && now - s.mtimeMs >= ttlMs) unlink(f.name);
+      } catch {
+        // vanished mid-scan — skip
+      }
+    }
+  }
+  for (const name of loose) {
+    try {
+      const s = statSync(path.join(dir, name));
+      if (!s.isFile() || now - s.mtimeMs < ttlMs) continue;
+      unlink(name);
+    } catch {
+      // skip
     }
   }
   return pruned;
