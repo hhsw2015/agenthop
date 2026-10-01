@@ -1,5 +1,5 @@
 import { watch, type FSWatcher } from "node:fs";
-import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -154,10 +154,114 @@ export function writeStatusFile(home: string, key: string, state: string, opts?:
   }
 }
 
+/** How long an untouched status file lives before GC may prune it. Generous on purpose: a live session's
+ *  file is rewritten on every hook event, so hours of silence means the session is dead or long-idle — and
+ *  for a long-idle LIVE session the file is already redundant (see pruneStaleStatusFiles). */
+export const STATUS_FILE_TTL_MS = 6 * 60 * 60 * 1000;
+
+/** How often watchStatusDir's poll runs the GC (stat-ing every file each 1s tick would be waste). */
+const STATUS_GC_INTERVAL_MS = 10 * 60 * 1000;
+
+/**
+ * Prune status files (and leftover `.tmp.` staging files) whose mtime is older than the TTL — the
+ * leftovers of DEAD sessions, which otherwise accumulate forever: writeStatusFile only prunes versions
+ * WITHIN its own key, so a session that exits leaves its last file behind for good.
+ *
+ * Why an mtime TTL can never hurt a live session: a live node keeps its applied status IN MEMORY (the
+ * monotonic statusByIdentity path), so removing a file regresses nothing that is running. The file's only
+ * cross-process jobs are (a) carrying a NEW event from a hook to the node — such a file is written (fresh
+ * mtime) moments before pickup, nowhere near the TTL — and (b) seeding a RESTARTED node at startup — and a
+ * seed untouched for hours is stale noise there anyway (the SessionStart hook re-seeds a fresh session).
+ *
+ * The decision is PER KEY, keyed on the MAX-seq file's mtime — NOT per file. A key can hold several
+ * `<key>.json.<seq>` versions, and a concurrent write can leave a LOWER-seq file with a NEWER mtime than
+ * the max (two writers that each saw an empty dir). Pruning by per-file mtime would then delete the max and
+ * regress the key to the stale lower version. Instead: if a key's max-seq file is older than the TTL the
+ * whole session is dead → remove every version; if the max is fresh → keep them all (writeStatusFile prunes
+ * sub-max versions on its next write). Best-effort and concurrency-safe: a file that vanishes mid-scan is
+ * skipped and a failed unlink is harmless clutter for the next pass. Returns how many files were removed.
+ */
+export function pruneStaleStatusFiles(home: string, opts?: { ttlMs?: number; now?: number }): number {
+  const ttlMs = opts?.ttlMs ?? STATUS_FILE_TTL_MS;
+  const now = opts?.now ?? Date.now();
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) return 0;
+  const dir = statusDir(home);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return 0; // no dir, nothing to prune
+  }
+  // Group versioned files (<key>.json.<seq>) by key; anything else (e.g. a leftover `.tmp.` stage) is loose.
+  const groups = new Map<string, Array<{ name: string; seq: number }>>();
+  const loose: string[] = [];
+  for (const name of names) {
+    const m = name.match(/^(.*\.json)\.(\d+)$/);
+    if (m) (groups.get(m[1]!) ?? groups.set(m[1]!, []).get(m[1]!)!).push({ name, seq: Number(m[2]) });
+    else loose.push(name);
+  }
+  let pruned = 0;
+  const unlink = (name: string): boolean => {
+    try {
+      rmSync(path.join(dir, name), { force: true }); // force:true ignores ENOENT but still throws on EACCES
+      pruned++;
+      return true;
+    } catch {
+      return false; // vanished mid-scan or unlink refused — leave it for the next pass
+    }
+  };
+  for (const files of groups.values()) {
+    files.sort((a, b) => b.seq - a.seq);
+    const [max, ...subMax] = files; // the MAX-seq version is the authoritative current state
+    let maxMtime: number;
+    try {
+      const s = statSync(path.join(dir, max!.name));
+      if (!s.isFile()) continue;
+      maxMtime = s.mtimeMs;
+    } catch {
+      continue; // the max vanished mid-scan — next pass
+    }
+    if (now - maxMtime >= ttlMs) {
+      // The MAX itself is untouched past the TTL ⇒ the whole session is dead ⇒ remove every version. Delete
+      // the LOWER versions first; only once EVERY one of them is confirmed gone do we remove the max. If any
+      // lower unlink fails (e.g. EACCES, then perms later restored), we KEEP the max — otherwise deleting the
+      // max while a lower survives would regress the on-disk winner to that lower version (the #8 hazard).
+      let allLowersGone = true;
+      for (const f of [...subMax].reverse()) {
+        if (!unlink(f.name)) allLowersGone = false; // lowest seq first
+      }
+      if (allLowersGone) unlink(max!.name); // safe: no lower version is left to regress to
+      continue;
+    }
+    // Max is fresh ⇒ never touch it; prune only stale LOWER-seq leftovers. A sub-max file can never be the
+    // winning state (the reader always takes the max), so removing a stale one can never regress anything.
+    for (const f of subMax) {
+      try {
+        const s = statSync(path.join(dir, f.name));
+        if (s.isFile() && now - s.mtimeMs >= ttlMs) unlink(f.name);
+      } catch {
+        // vanished mid-scan — skip
+      }
+    }
+  }
+  for (const name of loose) {
+    try {
+      const s = statSync(path.join(dir, name));
+      if (!s.isFile() || now - s.mtimeMs < ttlMs) continue;
+      unlink(name);
+    } catch {
+      // skip
+    }
+  }
+  return pruned;
+}
+
 /**
  * Watch the status directory and call `onChange` whenever any status file changes (writes are atomic
  * renames, so watching the DIR is more reliable than watching one file). The caller re-reads the file
- * for its current key inside `onChange`. Returns a close fn; a no-op if the dir can't be watched.
+ * for its current key inside `onChange`. Also runs the dead-session GC opportunistically (every
+ * STATUS_GC_INTERVAL_MS, first pass on the first tick) — every bus node is a janitor, so the directory
+ * stays clean without a dedicated process. Returns a close fn; a no-op if the dir can't be watched.
  */
 export function watchStatusDir(home: string, onChange: () => void): () => void {
   const dir = statusDir(home);
@@ -178,7 +282,14 @@ export function watchStatusDir(home: string, onChange: () => void): () => void {
   // Poll fallback: fs.watch can miss events under load or on some filesystems. A low-frequency re-read
   // guarantees pickup within ~1s; a re-read that hasn't changed is dropped by the monotonic seq guard,
   // so this never re-broadcasts. unref so it never keeps the process alive.
-  const timer = setInterval(() => onChange(), 1000);
+  let lastGc = 0;
+  const timer = setInterval(() => {
+    onChange();
+    if (Date.now() - lastGc >= STATUS_GC_INTERVAL_MS) {
+      lastGc = Date.now();
+      pruneStaleStatusFiles(home);
+    }
+  }, 1000);
   if (typeof timer.unref === "function") timer.unref();
   return () => {
     try {

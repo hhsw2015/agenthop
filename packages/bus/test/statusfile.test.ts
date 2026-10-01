@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { readStatusFile, writeStatusFile } from "../src/statusfile.js";
+import { pruneStaleStatusFiles, readStatusFile, STATUS_FILE_TTL_MS, writeStatusFile } from "../src/statusfile.js";
 import { startBusCore } from "../src/core.js";
 
 const saved: Record<string, string | undefined> = {};
@@ -68,6 +68,73 @@ test("status file: a lower-seq version never shadows a newer one, even with both
     // to the next-newest valid version instead.
     writeFileSync(path.join(dir, "k.json.400"), "{ not json");
     expect(readStatusFile(home, "k")).toMatchObject({ state: "blocked", seq: 300 });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("GC: prunes a dead session's stale file by mtime TTL, keeps fresh ones, never the current max", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ah-sf-gc-"));
+  try {
+    const dir = path.join(home, ".agenthop", "status");
+    // Two sessions: "dead" last wrote hours ago, "live" wrote just now.
+    writeStatusFile(home, "dead", "idle", { seq: 100 });
+    writeStatusFile(home, "live", "working", { seq: 200 });
+    const old = new Date(Date.now() - STATUS_FILE_TTL_MS - 60_000);
+    utimesSync(path.join(dir, "dead.json.100"), old, old);
+    expect(pruneStaleStatusFiles(home)).toBe(1);
+    expect(readStatusFile(home, "dead")).toBeUndefined(); // the dead session's leftover is gone
+    expect(readStatusFile(home, "live")).toMatchObject({ state: "working", seq: 200 }); // fresh file kept
+    // A key's CURRENT max is never removed while fresh — even when an older sibling version is stale.
+    writeFileSync(path.join(dir, "live.json.150"), JSON.stringify({ state: "idle", seq: 150 }));
+    utimesSync(path.join(dir, "live.json.150"), old, old);
+    expect(pruneStaleStatusFiles(home)).toBe(1); // only the stale sibling
+    expect(readStatusFile(home, "live")).toMatchObject({ state: "working", seq: 200 });
+    // Leftover staging temps age out too; a missing dir is a clean no-op.
+    writeFileSync(path.join(dir, "live.json.1.tmp.abcd1234"), "partial");
+    utimesSync(path.join(dir, "live.json.1.tmp.abcd1234"), old, old);
+    expect(pruneStaleStatusFiles(home)).toBe(1);
+    expect(pruneStaleStatusFiles(path.join(home, "no-such-home"))).toBe(0); // missing dir = clean no-op
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("GC: never regresses to a lower seq — the max (written first, older mtime) is not deleted while a newer-mtime sibling survives (P2-8)", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ah-sf-gc-race-"));
+  try {
+    const dir = path.join(home, ".agenthop", "status");
+    mkdirSync(dir, { recursive: true });
+    // The race the old per-file-mtime GC lost: a concurrent pair leaves the MAX (200) with an OLDER mtime
+    // than a lower sibling (100). Pruning by per-file mtime would delete 200 and regress the reader to 100.
+    const old = new Date(Date.now() - STATUS_FILE_TTL_MS - 60_000);
+    writeFileSync(path.join(dir, "race.json.200"), JSON.stringify({ state: "idle", seq: 200 }));
+    utimesSync(path.join(dir, "race.json.200"), old, old); // max, but OLDER mtime
+    writeFileSync(path.join(dir, "race.json.100"), JSON.stringify({ state: "working", seq: 100 })); // sub-max, FRESH mtime
+    pruneStaleStatusFiles(home);
+    const r = readStatusFile(home, "race");
+    expect(r === undefined || r.seq === 200).toBe(true); // NEVER the stale lower 100 — no regression
+    expect(existsSync(path.join(dir, "race.json.100"))).toBe(false); // when the max is pruned, the whole dead key goes
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("GC: an explicit ttl/now makes it deterministic; nothing younger than the TTL is touched", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ah-sf-gc2-"));
+  try {
+    writeStatusFile(home, "k", "idle", { seq: 1 });
+    // With `now` barely past the write, nothing is old enough.
+    expect(pruneStaleStatusFiles(home, { ttlMs: 1000, now: Date.now() + 500 })).toBe(0);
+    expect(readStatusFile(home, "k")).toMatchObject({ state: "idle", seq: 1 });
+    // Push `now` beyond the ttl and the same file is pruned.
+    expect(pruneStaleStatusFiles(home, { ttlMs: 1000, now: Date.now() + 5000 })).toBe(1);
+    expect(readStatusFile(home, "k")).toBeUndefined();
+    // A nonsensical ttl is refused rather than treated as "prune everything".
+    writeStatusFile(home, "k", "idle", { seq: 2 });
+    expect(pruneStaleStatusFiles(home, { ttlMs: 0 })).toBe(0);
+    expect(pruneStaleStatusFiles(home, { ttlMs: Number.NaN })).toBe(0);
+    expect(readStatusFile(home, "k")).toMatchObject({ seq: 2 });
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

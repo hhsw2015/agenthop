@@ -108,6 +108,9 @@ describe("plugging into agents as an MCP server", () => {
     expect(group("PermissionRequest").hooks[0].command).toContain("report-status blocked");
     expect(group("Stop").hooks[0].command).toContain("report-status idle");
     expect(group("Interrupt").hooks[0].command).toContain("report-status idle"); // Codex-only event clears blocked
+    expect(group("SessionStart").hooks[0].command).toContain("report-status idle"); // seed: no [unknown] at start
+    expect(group("SessionStart").matcher).toBe("startup|resume"); // NOT on compact (would wrongly idle a live turn)
+    expect(group("UserPromptSubmit").hooks[0].command).toContain("report-status working");
     // Shared command: event-time --seq + ours-sentinel; session id comes from stdin (no --session needed).
     expect(group("Stop").hooks[0].command.startsWith("_ahT=$(")).toBe(true);
     expect(group("Stop").hooks[0].command).toContain("--seq");
@@ -171,6 +174,9 @@ describe("plugging into agents as an MCP server", () => {
     const cfg = JSON.parse(await readFile(file, "utf8"));
     expect(cfg.model).toBe("opus"); // unrelated key preserved
     const cmds = (event: string) => (cfg.hooks[event] as { hooks: { command: string }[] }[]).flatMap((g) => g.hooks.map((h) => h.command));
+    expect(cmds("SessionStart").some((c) => c.includes("report-status idle"))).toBe(true); // seed: no [unknown] at start
+    // SessionStart→idle must be scoped to startup/resume, never compact (else a mid-turn compaction idles a live turn).
+    expect((cfg.hooks.SessionStart as { matcher?: string }[]).some((g) => g.matcher === "startup|resume")).toBe(true);
     expect(cmds("UserPromptSubmit").some((c) => c.includes("report-status working"))).toBe(true);
     expect(cmds("PostToolUse").some((c) => c.includes("report-status working"))).toBe(true); // recovers from blocked
     expect(cmds("Stop").some((c) => c.includes("report-status idle"))).toBe(true);
@@ -207,6 +213,38 @@ describe("plugging into agents as an MCP server", () => {
     expect(stop.length).toBe(1); // refreshed in place, no duplicate group
     expect(stop[0].hooks[0].command).toContain("/new/path/agenthop");
     expect(stop[0].hooks[0].command).not.toContain("/old/path/agenthop");
+  });
+
+  it("upgrades an OLD agenthop SessionStart group that lacks a matcher — adds startup|resume (P2-9 upgrade path)", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    await mkdir(path.dirname(file), { recursive: true });
+    // An old install: OUR SessionStart hook is present but has NO matcher, so it would also fire on compact.
+    const oldCmd = `'${BIN}' report-status idle >/dev/null 2>&1 || true # agenthop-status-hook:idle`;
+    await writeFile(file, JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: oldCmd, async: true }] }] } }));
+    expect(installClaudeStatusHooks(BIN, dir)).toContain("wrote"); // a refresh happened (matcher added)
+    const cfg = JSON.parse(await readFile(file, "utf8"));
+    const ourGroup = (cfg.hooks.SessionStart as { matcher?: string; hooks: { command: string }[] }[]).find((g) => g.hooks.some((h) => h.command.includes("agenthop-status-hook:idle")))!;
+    expect(ourGroup.matcher).toBe("startup|resume"); // matcher synced in place on the existing group, not duplicated
+    expect((cfg.hooks.SessionStart as unknown[]).length).toBe(1); // no duplicate group added
+  });
+
+  it("extracts our hook from a group SHARED with a user hook — never changes the user hook's matcher (P2-9 shared-group)", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    await mkdir(path.dirname(file), { recursive: true });
+    const ourOldCmd = `'${BIN}' report-status idle >/dev/null 2>&1 || true # agenthop-status-hook:idle`;
+    const userCmd = "/my/compact-context-logger"; // a user hook that intentionally fires on compact (no matcher)
+    // ONE SessionStart group holding BOTH the user's hook and ours, matcher absent.
+    await writeFile(file, JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: userCmd }, { type: "command", command: ourOldCmd, async: true }] }] } }));
+    installClaudeStatusHooks(BIN, dir);
+    const groups = (JSON.parse(await readFile(file, "utf8")).hooks.SessionStart) as { matcher?: string; hooks: { command: string }[] }[];
+    const userGroup = groups.find((g) => g.hooks.some((h) => h.command === userCmd))!;
+    const ourGroup = groups.find((g) => g.hooks.some((h) => h.command.includes("agenthop-status-hook:idle")))!;
+    expect(userGroup).not.toBe(ourGroup); // ours was MOVED to its own group, not left sharing
+    expect(userGroup.matcher).toBeUndefined(); // user's hook untouched — still fires on compact as they intended
+    expect(userGroup.hooks.some((h) => h.command.includes("agenthop-status-hook"))).toBe(false); // ours removed from the shared group
+    expect(ourGroup.matcher).toBe("startup|resume"); // ours gets the matcher in its OWN group
   });
 
   it("shell-single-quotes the binary path so metacharacters can't be expanded", async () => {

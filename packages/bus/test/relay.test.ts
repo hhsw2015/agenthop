@@ -70,3 +70,32 @@ test("two machines on a team discover and message each other over the relay", as
     await b.close();
   }
 }, 60000);
+
+test("work status propagates across machines through the relay directory", async () => {
+  const a = core();
+  const b = core();
+  const aId = a.self.id;
+  try {
+    // Wait for discovery first; before any report the remote peer carries no status.
+    expect(await until(() => b.peers().some((p) => p.id === aId && p.via === "relay"), 20000)).toBe(true);
+    expect(b.peers().find((p) => p.id === aId)?.status).toBeUndefined();
+
+    // a reports working; b (another machine: separate home, relay-only view of a) sees state, seq,
+    // and text on its roster. updateSelf announces immediately, so this lands within a poll (~5s).
+    expect(a.setStatus("working", { seq: 10, text: "crunching" }).ok).toBe(true);
+    expect(await until(() => b.peers().find((p) => p.id === aId)?.status === "working", 20000)).toBe(true);
+    const seen = b.peers().find((p) => p.id === aId)!;
+    expect(seen.via).toBe("relay");
+    expect(seen.statusSeq).toBe(10);
+    expect(seen.statusText).toBe("crunching");
+    expect(seen.statusAt).toBeTypeOf("number");
+
+    // A later state change follows, and a cross-machine wait resolves on it.
+    expect(a.setStatus("idle", { seq: 20 }).ok).toBe(true);
+    expect(await b.waitForStatus(aId, ["idle"], 20000)).toMatchObject({ reached: true, status: "idle" });
+    expect(b.peers().find((p) => p.id === aId)?.statusSeq).toBe(20);
+  } finally {
+    await a.close();
+    await b.close();
+  }
+}, 90000);

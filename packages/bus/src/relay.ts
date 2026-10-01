@@ -57,6 +57,10 @@ export function startRelay(
     machine: hostname(),
     pub: keys.publicKey,
     ts: Date.now(),
+    status: self.status,
+    statusSeq: self.statusSeq,
+    statusText: self.statusText,
+    statusAt: self.statusAt,
   };
   const directory = startDirectory({ team, self: relayMe, relay: options.relay, pass: options.pass });
   const mailbox = startMailbox({ keys, relay: options.relay, pass: options.pass, onInbound: (m) => onInbound(m.from, m.payload) });
@@ -72,10 +76,26 @@ export function startRelay(
         via: "relay" as const,
         machine: p.machine,
         pub: p.pub,
+        status: p.status,
+        statusSeq: p.statusSeq,
+        statusText: p.statusText,
+        statusAt: p.statusAt,
       })),
     send: (pub, text) => mailbox.send(pub, text),
     updateSelf(next) {
-      relayMe = { ...relayMe, stableId: next.stableId, title: next.title, ts: Date.now() };
+      // Carry the work-status fields too: core.ts pushes every status change through here, and the
+      // directory announce is what a peer on another machine sees (its monotonic statusSeq rides along
+      // so a replayed announce can never roll it back — see directory.ts mergePresence).
+      relayMe = {
+        ...relayMe,
+        stableId: next.stableId,
+        title: next.title,
+        ts: Date.now(),
+        status: next.status,
+        statusSeq: next.statusSeq,
+        statusText: next.statusText,
+        statusAt: next.statusAt,
+      };
       directory.updateSelf(relayMe);
     },
     async close() {

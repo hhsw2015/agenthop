@@ -137,7 +137,12 @@ function startBridgeClient(self: SelfInfo, onInbound: (from: string, text: strin
         s.destroy();
         return;
       }
-      s.write(`${JSON.stringify({ t: "hello", self, team: teamId })}\n`);
+      // Publish cross-machine WITHOUT a work-status: the plugin's setStatus only updates the local roster
+      // (outbound cross-machine status is a bus.8 follow-up), so a status carried here would be stale and
+      // frozen at hello time — and a remote agenthop_wait_peer could then be FALSELY satisfied by it. Send it
+      // as unknown (fields stripped) so cross-machine shows "unknown" and no wait matches a stale value.
+      const crossMachineSelf: SelfInfo = { ...self, status: undefined, statusSeq: undefined, statusText: undefined, statusAt: undefined };
+      s.write(`${JSON.stringify({ t: "hello", self: crossMachineSelf, team: teamId })}\n`);
     });
     s.on("data", (chunk: string) => {
       if (closed) return;
@@ -337,6 +342,15 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
     event: async ({ event }: { event: { type: string; properties?: { sessionID?: string; info?: { id?: string }; status?: { type?: string } } } }): Promise<void> => {
       const type = event?.type;
       const props = event?.properties ?? {};
+      // A fresh session starts idle (else it shows [unknown] until its first event). Like session.deleted,
+      // session.created carries the id under properties.info (a full Session), not sessionID — the shape in
+      // the installed SDK's EventSessionCreated (types.gen.d.ts, 1.18.26). Also creates the bus peer early,
+      // so the session is on the roster before its first message.
+      if (type === "session.created") {
+        const id = props.info?.id;
+        if (typeof id === "string" && id) setStatus(busFor(id), "idle");
+        return;
+      }
       if (type === "session.deleted") {
         const id = props.info?.id;
         const b = id ? buses.get(id) : undefined;
