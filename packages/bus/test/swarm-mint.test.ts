@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { expect, test } from "vitest";
-import { MAX_TTL_SEC, mintEphToken } from "../src/swarm/mint.js";
+import { MAX_TTL_SEC, mintEphToken, normalizeEphSecret } from "../src/swarm/mint.js";
 
 const SECRET = "test-eph-secret-not-the-real-one"; // never the real /Users/.cpa_eph_secret
 
@@ -62,6 +62,13 @@ test("optional reserved claims (budget_usd, models) are signed in when present, 
   const withClaims = mintEphToken({ sub: "x", budgetUsd: 5, models: ["claude-opus-5"], now, secret: SECRET });
   expect(decode(withClaims)).toMatchObject({ budget_usd: 5, models: ["claude-opus-5"] });
   expect(cpaVerify(withClaims, SECRET, now).ok).toBe(true); // still verifies (claims are inside the signed payload)
+});
+
+test("normalizeEphSecret extracts the raw value from a dotenv-formatted file or a bare value", () => {
+  const hex = "a".repeat(64);
+  expect(normalizeEphSecret(`${hex}\n`)).toBe(hex); // bare value + newline
+  expect(normalizeEphSecret(`CPA_EPH_SECRET=${hex}\n`)).toBe(hex); // dotenv line (the live-mismatch root cause)
+  expect(normalizeEphSecret(`CPA_EPH_SECRET = ${hex}`)).toBe(hex); // tolerant of spaces
 });
 
 test("matches the reference minter's construction byte-for-byte for a pinned input", () => {

@@ -164,6 +164,7 @@ export async function runRailwayTask(input: RunRailwayTaskInput): Promise<RunRai
   const launchId = newLaunchId();
   const token = mintEphToken({ sub: launchId, ttlSec: input.ttlSec, secret: input.secret ?? readEphSecret() });
   const { argv: keygenArgv, keyPath, knownHostsPath } = genKeyArgv(launchId);
+  mkdirSync(keyDir(launchId), { recursive: true, mode: 0o700 }); // ssh-keygen won't create the parent dir
   await run("ssh-keygen", keygenArgv);
   const room = await openTaskRoom({ relay: input.relay });
   try {

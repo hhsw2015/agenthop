@@ -51,12 +51,23 @@ export function mintEphToken(input: MintInput): string {
   return `${signing}.${sig}`;
 }
 
-/** The dispatcher's copy of the shared secret: `CPA_EPH_SECRET` env, else `~/.cpa_eph_secret` (trimmed). Never inject this into a VM. */
+/**
+ * Normalize a secret source to the raw value: trim, and tolerate a `CPA_EPH_SECRET=<value>` dotenv line (the
+ * dispatcher file was once dotenv-formatted and the prefix leaked into the HMAC — a real mismatch we hit live).
+ * CPA verifies against the VALUE after `=`, so we extract it here too.
+ */
+export function normalizeEphSecret(raw: string): string {
+  const trimmed = raw.trim();
+  const dotenv = /^CPA_EPH_SECRET\s*=\s*(.*)$/s.exec(trimmed);
+  return (dotenv ? dotenv[1]! : trimmed).trim();
+}
+
+/** The dispatcher's copy of the shared secret: `CPA_EPH_SECRET` env, else `~/.cpa_eph_secret`. Never inject this into a VM. */
 export function readEphSecret(): string {
-  const env = process.env.CPA_EPH_SECRET?.trim();
-  if (env) return env;
+  const env = process.env.CPA_EPH_SECRET;
+  if (env && env.trim()) return normalizeEphSecret(env);
   try {
-    const fromFile = readFileSync(path.join(homedir(), ".cpa_eph_secret"), "utf8").trim();
+    const fromFile = normalizeEphSecret(readFileSync(path.join(homedir(), ".cpa_eph_secret"), "utf8"));
     if (fromFile) return fromFile;
   } catch {
     // fall through to the error below
