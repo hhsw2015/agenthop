@@ -1,4 +1,7 @@
 import { hkdfSync } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 import { isRoomAddress, normalizeCode, relayEndpoints, WORDLIST } from "@agenthop/tunnel";
 import { DEFAULT_RELAY, readQueue, sendMessage, startHost } from "@agenthop/cli";
 import { openEntry, sealEntry, type Team } from "./team.js";
@@ -146,6 +149,38 @@ export function mergePresence(prev: RemotePeer | undefined, next: RemotePeer): R
   return { ...presenceBase, status: statusFrom.status, statusSeq: statusFrom.statusSeq, statusText: statusFrom.statusText, statusAt: statusFrom.statusAt };
 }
 
+/**
+ * A per-INSTANCE epoch that is MONOTONIC across restarts even when the wall clock regresses. `Date.now()`
+ * alone is NOT enough: an NTP step-back, a VM/snapshot restore, or a bad RTC can make a restarted instance's
+ * clock lower than the one a remote still remembers, and mergePresence's epoch gate then rejects the new
+ * instance FOREVER (a lower epoch loses at the gate; ts/rev catching up never helps, and the remote's `seen`
+ * watermark is only TTL-filtered, never deleted) — the peer silently drops at TTL and never comes back until
+ * some instance finally lands a higher epoch. Persisting `max(now, last+1)` makes each successive instance
+ * strictly greater than every prior one on this machine, so a clock rollback can no longer strand a peer.
+ *
+ * A single shared counter per home is enough: the epoch only has to order restarts of the SAME identity, and
+ * those are sequential (old process exits, new one starts → sequential read-then-write → strictly increasing).
+ * Two DIFFERENT identities starting at the same ms may read the same `last` and collide on one value, but that
+ * is harmless — equal epochs skip the epoch gate and fall through to the per-identity axes. Exported for tests.
+ */
+export function nextInstanceEpoch(home: string = process.env.HOME || homedir()): number {
+  const file = path.join(home, ".agenthop", "dir-epoch");
+  let last = 0;
+  try {
+    last = Number.parseInt(readFileSync(file, "utf8"), 10) || 0;
+  } catch {
+    // first run / unreadable — start from the clock
+  }
+  const epoch = Math.max(Date.now(), last + 1);
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, String(epoch));
+  } catch {
+    // read-only home: use the in-memory value (degraded — a later rollback could still strand this peer)
+  }
+  return epoch;
+}
+
 export function startDirectory(options: DirectoryOptions): Directory {
   const { team } = options;
   // Mutable: a Codex session learns its native id after startup and refreshes its presence via updateSelf.
@@ -173,9 +208,10 @@ export function startDirectory(options: DirectoryOptions): Directory {
   // meanwhile — otherwise a late response from the OLD keeper could roll the cursor back over a reset.
   let epoch = 0;
   // This relay instance's epoch + a per-announce revision, both stamped on every announce. epoch is constant
-  // for the instance and higher on every re-instantiation of this run (restart/reconnect → fresh node, new
-  // pub); rev strictly increases within the instance. Remote peers merge by (epoch, rev) — see mergePresence.
-  const instanceEpoch = Date.now();
+  // for the instance and STRICTLY higher on every re-instantiation of this run (restart/reconnect → fresh node,
+  // new pub) — persisted-monotonic so even a clock rollback cannot lower it (see nextInstanceEpoch). rev
+  // strictly increases within the instance. Remote peers merge by (epoch, rev) — see mergePresence.
+  const instanceEpoch = nextInstanceEpoch();
   let announceRev = 0;
 
   const remember = (peer: RemotePeer): void => {

@@ -1,5 +1,8 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { expect, test } from "vitest";
-import { capStatusText, mergePresence, type RemotePeer } from "../src/directory.js";
+import { capStatusText, mergePresence, nextInstanceEpoch, type RemotePeer } from "../src/directory.js";
 
 /**
  * The no-regress rule for cross-machine status, tested pure: the directory room's log REPLAYS old
@@ -127,6 +130,18 @@ test("a late lower-seq announce at the same ts keeps the status watermark (P2-6)
   const merged = mergePresence(prev, late);
   expect(merged.status).toBe("idle"); // the higher per-identity seq (2) wins regardless of the equal ts
   expect(merged.statusSeq).toBe(2);
+});
+
+test("nextInstanceEpoch is strictly increasing across restarts even when the wall clock would not advance (P2 clock-rollback)", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ah-epoch-"));
+  const e1 = nextInstanceEpoch(home);
+  const e2 = nextInstanceEpoch(home);
+  expect(e2).toBeGreaterThan(e1); // two restarts within the same ms still advance (persisted last+1)
+  // Simulate a clock that jumped FAR into the future for a prior instance, then rolled back: the persisted
+  // high-water mark must still win, so the epoch gate can never reject the restarted instance.
+  const future = e2 + 1_000_000;
+  writeFileSync(path.join(home, ".agenthop", "dir-epoch"), String(future));
+  expect(nextInstanceEpoch(home)).toBeGreaterThan(future);
 });
 
 test("capStatusText truncates an oversized note so a sealed presence can't exceed the relay limit (P3)", () => {
