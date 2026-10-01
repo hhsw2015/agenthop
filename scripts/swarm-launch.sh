@@ -12,7 +12,12 @@
 # Usage:  scripts/swarm-launch.sh [claude|codex|opencode] [swarm-team-secret] [new]
 #   env: AGENTHOP_SSH_PROXY (default 127.0.0.1:10808), AGENTHOP_RELAY, AGENTHOP_CPA_BASE, AGENTHOP_REPO,
 #        AGENTHOP_SWARM_NEW=1 (force allocate)
-# Prereqs: a working SOCKS proxy for ALLOCATION only (fresh egress IP), CPA_EPH_SECRET (or ~/.cpa_eph_secret), tsx.
+#   cf-proxy (auto-started for ALLOCATION when creds are in env; skipped on reuse):
+#        CF_PROXY_TOKEN   = the ECH worker token (the one real secret — supply via env, never committed)
+#        CF_PROXY_CONFIG  = path to a CPA proxy-pool yaml; the worker domains + edge IP are read from it
+#        (or set CF_PROXY_WORKERS=d1:443,d2:443 and CF_PROXY_IP=... directly instead of CF_PROXY_CONFIG)
+# Prereqs: for a NEW box, a clean egress (cf-proxy or any SOCKS on $PROXY); reuse needs none. Plus CPA_EPH_SECRET
+#          (or ~/.cpa_eph_secret) and tsx.
 set -euo pipefail
 
 TOOL="${1:-claude}"
@@ -109,6 +114,29 @@ SSH=(ssh -i "$KEYDIR/id" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHo
      -o "UserKnownHostsFile=$KEYDIR/known_hosts" -o ConnectTimeout=30 "${ALGO_OPTS[@]}")
 
 if [ -z "$REUSED" ]; then
+  # Auto-start the CF-Worker SOCKS proxy for THIS allocation when worker creds are supplied via env
+  # (CF_PROXY_WORKERS, CF_PROXY_TOKEN[, CF_PROXY_IP]) and nothing is already listening on $PROXY. Creds stay in
+  # env — never hardcoded/committed. If CF_PROXY_WORKERS is unset we assume $PROXY already points at a running
+  # SOCKS. The proxy is only needed to allocate (IP-gated); reuse never reaches here, so it costs nothing then.
+  CF_PROXY_PID=""; CF_HOST="${PROXY%%:*}"; CF_PORT="${PROXY##*:}"
+  # Convenience: derive the worker domains + edge IP from a CPA proxy-pool config (CF_PROXY_CONFIG) so the operator
+  # need only supply the TOKEN (the one real secret) in env — the 21 domains come from the file, nothing committed.
+  if [ -z "${CF_PROXY_WORKERS:-}" ] && [ -n "${CF_PROXY_CONFIG:-}" ] && [ -f "${CF_PROXY_CONFIG:-}" ]; then
+    CF_PROXY_WORKERS="$(awk '/^proxy-pool:/{f=1;next} f&&/^[^[:space:]]/{exit} f&&/[[:space:]]domain:/{gsub(/.*domain:[[:space:]]*"?/,"");gsub(/".*/,"");print}' "$CF_PROXY_CONFIG" | paste -sd, -)"
+    : "${CF_PROXY_IP:=$(awk '/^proxy-pool:/{f=1;next} f&&/^[^[:space:]]/{exit} f&&/[[:space:]]ip:/{gsub(/.*ip:[[:space:]]*"?/,"");gsub(/".*/,"");print; exit}' "$CF_PROXY_CONFIG")}"
+    export CF_PROXY_WORKERS CF_PROXY_IP
+    echo "cf-proxy workers from $CF_PROXY_CONFIG: $(printf '%s' "$CF_PROXY_WORKERS" | tr ',' '\n' | wc -l | tr -d ' ') domains, ip=$CF_PROXY_IP"
+  fi
+  if [ -n "${CF_PROXY_WORKERS:-}" ] && [ -n "${CF_PROXY_TOKEN:-}" ] && ! nc -z "$CF_HOST" "$CF_PORT" 2>/dev/null; then
+    echo "== start cf-proxy (CF Worker SOCKS) on $PROXY =="
+    CF_PROXY_PORT="$CF_PORT" npx tsx "$HERE/packages/bus/src/swarm/cf-proxy.ts" >"/tmp/cf-proxy-$$.log" 2>&1 &
+    CF_PROXY_PID=$!
+    trap '[ -n "${CF_PROXY_PID:-}" ] && kill "$CF_PROXY_PID" 2>/dev/null || true' EXIT
+    for _ in $(seq 1 40); do nc -z "$CF_HOST" "$CF_PORT" 2>/dev/null && break; sleep 0.3; done
+    if nc -z "$CF_HOST" "$CF_PORT" 2>/dev/null; then echo "cf-proxy up (pid $CF_PROXY_PID)"; else
+      echo "cf-proxy failed to start; see /tmp/cf-proxy-$$.log" >&2; exit 4; fi
+  fi
+
   # Allocation is the ONLY step that must exit via a clean IP (proxy). Keep it minimal — a bare command — so the
   # ~30MB binary download does NOT crawl through the WS tunnel; that happens on the direct install below.
   echo "== allocate NEW box (via proxy, minimal) =="
