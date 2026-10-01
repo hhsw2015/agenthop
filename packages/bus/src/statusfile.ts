@@ -54,15 +54,34 @@ function versions(home: string, key: string): Array<{ seq: number; name: string 
 /** Read a session's current status (the highest-seq version), or undefined if absent/malformed. Pure. */
 export function readStatusFile(home: string, key: string): StatusFile | undefined {
   const dir = statusDir(home);
-  for (const { name } of versions(home, key)) {
-    try {
-      const r = JSON.parse(readFileSync(path.join(dir, name), "utf8")) as Record<string, unknown>;
-      if (r && typeof r === "object" && typeof r.state === "string" && STATES.has(r.state) && typeof r.seq === "number" && Number.isFinite(r.seq)) {
-        return { state: r.state, seq: r.seq, text: typeof r.text === "string" ? r.text : undefined };
+  // Re-list on a VANISHED file: versions() is a one-shot directory snapshot, and a concurrent writer renames
+  // the new max into place BEFORE pruning the old (see writeStatusFile), so if the version we picked was GC'd
+  // out from under this read, re-listing is guaranteed to find the newer one. Bounded against a pathological
+  // write storm. A parse error (a corrupt/partial version) instead falls through to the next-newest in the
+  // CURRENT listing — without it, a torn newest file could mask a good older one.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let vanished = false;
+    for (const { name } of versions(home, key)) {
+      let raw: string;
+      try {
+        raw = readFileSync(path.join(dir, name), "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+          vanished = true; // GC'd under us — a newer version exists; re-list to find it
+          break;
+        }
+        continue; // some other read error on this version — try the next-newest
       }
-    } catch {
-      // this version is truncated/partial/invalid — fall through to the next-newest
+      try {
+        const r = JSON.parse(raw) as Record<string, unknown>;
+        if (r && typeof r === "object" && typeof r.state === "string" && STATES.has(r.state) && typeof r.seq === "number" && Number.isFinite(r.seq)) {
+          return { state: r.state, seq: r.seq, text: typeof r.text === "string" ? r.text : undefined };
+        }
+      } catch {
+        // truncated/partial/invalid — fall through to the next-newest version
+      }
     }
+    if (!vanished) break; // finished the listing with no vanished-file race — nothing newer to chase
   }
   return undefined;
 }
@@ -79,10 +98,13 @@ export function readStatusFile(home: string, key: string): StatusFile | undefine
  * (it writes it unless an even-higher one already exists), and a lower-seq writer only ever prunes versions
  * strictly below its own contribution, so it can never remove the max. A reader therefore never regresses.
  *
- * The SEQ is the EVENT time (captured in the hook shell and passed as --seq — see installClaudeStatusHooks;
- * a manual or degraded run falls back to report-status's own start time). Residual: two DISTINCT events in
- * the same millisecond cannot be ordered by a ms clock, so the later may be dropped — turn-boundary events
- * are seconds apart in practice. Returns false only on invalid input or an I/O failure.
+ * The SEQ only APPROXIMATES the event time: it is sampled as early as a self-reported hook can — in the
+ * hook shell, passed as --seq (see installClaudeStatusHooks; a manual/degraded run falls back to
+ * report-status's own start time). It is NOT the kernel-level event instant: a hook shell scheduled out
+ * before it samples can still carry a later seq than a strictly-later event, so ordering is best-effort, not
+ * total. The reader's per-identity monotonic guard, the ~1s re-read, and the next turn-boundary event
+ * re-settle any transient inversion; the only unrecovered residual is a session whose VERY LAST event is a
+ * reordered one (the same class herdr absorbs with debounce). Returns false only on invalid input or I/O.
  */
 export function writeStatusFile(home: string, key: string, state: string, opts?: { seq?: number; text?: string }): boolean {
   if (!STATES.has(state)) return false;

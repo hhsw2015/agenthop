@@ -353,10 +353,16 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
         case "session.idle":
           apply("idle"); // turn finished
           break;
+        // A permission is being awaited. The event name drifts across OpenCode SDK versions — the installed
+        // 1.18.x emits "permission.asked" (older v1 d.ts had "permission.updated", the v2 union adds
+        // "permission.v2.asked"), so accept all three to stay version-robust.
+        case "permission.asked":
         case "permission.updated":
-          apply("blocked"); // an approval is being awaited
+        case "permission.v2.asked":
+          apply("blocked");
           break;
         case "permission.replied":
+        case "permission.v2.replied":
           apply("working"); // approval answered -> back to work
           break;
         case "session.status":

@@ -59,10 +59,10 @@ const agents: Agent[] = [
   {
     id: "codex",
     name: "Codex",
-    present: (home) => existsSync(join(home, ".codex")) || onPath("codex"),
-    hint: (bin, home) => t(`Add to ${join(home, ".codex", "config.toml")}:\n${codexBlock(bin)}\n(+ status hooks in ~/.codex/hooks.json, with [features] hooks = true)`, `在 ${join(home, ".codex", "config.toml")} 里加上：\n${codexBlock(bin)}\n（外加 ~/.codex/hooks.json 里的状态 hook，并 [features] hooks = true）`),
+    present: (home) => existsSync(codexHome(home)) || onPath("codex"),
+    hint: (bin, home) => t(`Add to ${join(codexHome(home), "config.toml")}:\n${codexBlock(bin)}\n(+ status hooks in ${join(codexHome(home), "hooks.json")}, and enable [features] hooks = true)`, `在 ${join(codexHome(home), "config.toml")} 里加上：\n${codexBlock(bin)}\n（外加 ${join(codexHome(home), "hooks.json")} 里的状态 hook，并启用 [features] hooks = true）`),
     register: (bin, home) => {
-      const file = join(home, ".codex", "config.toml");
+      const file = join(codexHome(home), "config.toml");
       const existing = existsSync(file) ? readFileSync(file, "utf8") : "";
       // The MCP block is only ever APPENDED (no fragile TOML rewriting of an existing one). A spawned Codex
       // still gets AGENTHOP_LAUNCH_ID forwarded per-launch via `codex -c mcp_servers.agenthop.env.…` (spawn.ts).
@@ -217,7 +217,7 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
  *    corruption-proof); if [features] exists we ask the user to add the one line, never rewriting their TOML.
  */
 export function installCodexStatusHooks(bin: string, home = homedir()): string {
-  const file = join(home, ".codex", "hooks.json");
+  const file = join(codexHome(home), "hooks.json"); // honor $CODEX_HOME — Codex reads hooks.json there, not always ~/.codex
   const config = readJsonConfig(file); // throws (file left alone) if present but not plain JSON
   const events = [
     { event: "UserPromptSubmit", state: "working" },
@@ -235,39 +235,31 @@ export function installCodexStatusHooks(bin: string, home = homedir()): string {
     placeJson(file, config);
     wrote = t(`wrote ${changed} status hook change(s) to ${file}`, `已写 ${changed} 处状态 hook 改动到 ${file}`);
   }
-  const feature = ensureCodexHooksFeature(home);
-  const trust = t(
-    "Codex won't run the hook until you approve it once (it will prompt) or launch with --dangerously-bypass-hook-trust",
-    "需在 Codex 里批准一次该 hook 才会运行（它会提示），或用 --dangerously-bypass-hook-trust 启动",
+  // Activation is a MANUAL step, deliberately: Codex needs the feature flag AND a one-time hook-trust
+  // approval, and we never machine-edit config.toml (TOML with comments / quoted or dotted headers / inline
+  // tables can't be safely rewritten without a real parser — a wrong guess corrupts a working config).
+  const activate = t(
+    `then enable it: add [features]\\nhooks = true to ${join(codexHome(home), "config.toml")}, and approve the hook once in Codex (or launch with --dangerously-bypass-hook-trust)`,
+    `然后手动启用：在 ${join(codexHome(home), "config.toml")} 加上 [features]\\nhooks = true，并在 Codex 里批准一次该 hook（或用 --dangerously-bypass-hook-trust 启动）`,
   );
-  return `${wrote}; ${feature}; ${trust}`;
+  return `${wrote}; ${activate}`;
 }
 
-/**
- * Ensure `[features] hooks = true` in Codex's config.toml. Corruption-proof: if there is no [features] table
- * we append a fresh one (TOML tables are order-independent); if [features] already exists we do NOT rewrite
- * it — editing inside an existing table without a real parser risks corrupting it — we just report the one
- * line to add. Idempotent once `hooks = true` is present.
- */
-function ensureCodexHooksFeature(home: string): string {
-  const file = join(home, ".codex", "config.toml");
-  const existing = existsSync(file) ? readFileSync(file, "utf8") : "";
-  if (/^\s*hooks\s*=\s*true\s*(#.*)?$/m.test(existing)) return t("hooks feature already enabled", "hooks 特性已启用");
-  if (/^\s*\[features\]\s*$/m.test(existing)) {
-    return t(`add 'hooks = true' under [features] in ${file}`, `请在 ${file} 的 [features] 下手动加一行 'hooks = true'`);
-  }
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${existing ? "\n" : ""}[features]\nhooks = true\n`);
-  return t(`enabled [features] hooks = true in ${file}`, `已在 ${file} 启用 [features] hooks = true`);
+/** Codex's config/data dir. Codex resolves it through $CODEX_HOME (default ~/.codex), so we must too — else
+ *  with CODEX_HOME set we'd write hooks.json where Codex never reads it and report a success that is inert. */
+function codexHome(home: string): string {
+  return process.env.CODEX_HOME?.trim() || join(home, ".codex");
 }
 
 const HOOK_SENTINEL = "agenthop-status-hook";
 
-/** The time-capture shell word for a status hook. Node startup varies by tens of ms and can reorder two
- *  near-simultaneous events (a turn's last PostToolUse vs its Stop), so the EVENT time is captured in the
- *  hook shell and passed to `report-status --seq`, not sampled at node start. macOS `date` has no sub-second
- *  `%N`, so use perl (always present); GNU `date` elsewhere. If the tool is missing the capture is empty,
- *  `--seq` is omitted, and report-status falls back to its own start time (manual/degraded paths never race). */
+/** The time-capture shell word for a status hook. The seq is sampled AS EARLY AS a self-reported hook can —
+ *  in the hook shell — which is closer to the event than node start (node startup varies by tens of ms and
+ *  would reorder a turn's last PostToolUse vs its Stop). It is still NOT the exact event instant: a shell
+ *  scheduled out before it samples can carry a later seq than a strictly-later event, so ordering is
+ *  best-effort (see the writeStatusFile note in statusfile.ts). macOS `date` has no sub-second `%N`, so use
+ *  perl (always present); GNU `date` elsewhere. If the tool is missing the capture is empty, `--seq` is
+ *  omitted, and report-status falls back to its own start time (manual/degraded paths never race). */
 function statusHookTimeMs(): string {
   return process.platform === "darwin" ? `perl -MTime::HiRes=time -e 'printf "%.0f",time()*1000'` : "date +%s%3N";
 }

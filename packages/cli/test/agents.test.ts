@@ -2,7 +2,7 @@ import { existsSync, lstatSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { installClaudeStatusHooks, installCodexStatusHooks, mcpHints, opencodeConfigDir, opencodePluginPath, registerMcp, writeOpencodePlugin } from "../src/agents.js";
 import { parseArgs } from "../src/args.js";
 
@@ -12,11 +12,18 @@ async function home() {
   return mkdtemp(path.join(tmpdir(), "agenthop-agents-"));
 }
 
-// One test sets XDG_CONFIG_HOME; restore it so it never leaks into the others.
+// Restore env that individual tests set, and ISOLATE CODEX_HOME — this machine has a real one set, and
+// codexHome() prefers it, so without clearing it the codex tests would write into the real Codex dir.
 const ORIGINAL_XDG = process.env.XDG_CONFIG_HOME;
+const ORIGINAL_CODEX_HOME = process.env.CODEX_HOME;
+beforeEach(() => {
+  delete process.env.CODEX_HOME; // tests target the passed-in temp home, not a machine-level CODEX_HOME
+});
 afterEach(() => {
   if (ORIGINAL_XDG === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = ORIGINAL_XDG;
+  if (ORIGINAL_CODEX_HOME === undefined) delete process.env.CODEX_HOME;
+  else process.env.CODEX_HOME = ORIGINAL_CODEX_HOME;
 });
 
 describe("plugging into agents as an MCP server", () => {
@@ -73,25 +80,22 @@ describe("plugging into agents as an MCP server", () => {
     expect(text).toContain(`command = "${BIN}"`);
   });
 
-  it("never rewrites an existing agenthop MCP block; only appends the feature-enable (no fragile TOML rewriting)", async () => {
+  it("never rewrites an existing agenthop MCP block and never machine-edits config.toml (no fragile TOML rewriting)", async () => {
     const dir = await home();
     const file = path.join(dir, ".codex", "config.toml");
     await mkdir(path.dirname(file), { recursive: true });
     // An old install with a different binary path: we do NOT rewrite that block (a spawned Codex gets
-    // forwarding via `codex -c` at launch instead). Rewriting existing TOML risks corrupting it.
+    // forwarding via `codex -c` at launch instead), and we never touch config.toml at all for the feature flag.
     const before = `[mcp_servers.agenthop]\ncommand = "/old/agenthop"\nargs = ["mcp"]\n\n[mcp_servers.other]\ncommand = "x"\n`;
     await writeFile(file, before);
     expect(registerMcp(["codex"], BIN, dir)[0]).toContain("already has agenthop");
-    const after = await readFile(file, "utf8");
-    expect(after.startsWith(before)).toBe(true); // existing bytes untouched (the old block is NOT rewritten)
-    expect(after).toContain('command = "/old/agenthop"'); // old path preserved, not bumped to BIN
-    expect(after).toContain("[features]\nhooks = true"); // feature-enable appended (required for hooks to run)
-    // hooks.json was written alongside (the actual status hooks).
+    expect(await readFile(file, "utf8")).toBe(before); // byte-for-byte untouched (no rewrite, no [features] append)
+    // hooks.json was written alongside (the actual status hooks); that is JSON, safe to merge.
     const hooks = JSON.parse(await readFile(path.join(dir, ".codex", "hooks.json"), "utf8"));
     expect(hooks.hooks.Stop[0].hooks[0].command).toContain("report-status idle");
   });
 
-  it("installs Codex status hooks (hooks.json schema, async, stdin session id), enables the feature, flags trust", async () => {
+  it("installs Codex status hooks (hooks.json schema, async, stdin session id) and instructs manual activation", async () => {
     const dir = await home();
     const msg = installCodexStatusHooks(BIN, dir);
     const hooks = JSON.parse(await readFile(path.join(dir, ".codex", "hooks.json"), "utf8"));
@@ -108,13 +112,23 @@ describe("plugging into agents as an MCP server", () => {
     expect(group("Stop").hooks[0].command.startsWith("_ahT=$(")).toBe(true);
     expect(group("Stop").hooks[0].command).toContain("--seq");
     expect(group("Stop").hooks[0].command.trimEnd().endsWith("# agenthop-status-hook:idle")).toBe(true);
-    // config.toml feature enabled (no prior [features] -> appended) + trust caveat surfaced.
-    expect(await readFile(path.join(dir, ".codex", "config.toml"), "utf8")).toContain("[features]\nhooks = true");
-    expect(msg).toContain("trust");
-    // Idempotent: a second run changes nothing in hooks.json and reports the feature already on.
+    // Activation is MANUAL (feature flag + one-time hook trust): never machine-edit config.toml.
+    expect(existsSync(path.join(dir, ".codex", "config.toml"))).toBe(false); // config.toml not created/edited
+    expect(msg).toContain("[features]");
+    expect(msg).toContain("hooks = true");
+    expect(msg).toContain("--dangerously-bypass-hook-trust");
+    // Idempotent: a second run changes nothing in hooks.json.
     const msg2 = installCodexStatusHooks(BIN, dir);
     expect(msg2).toContain("already has agenthop status hooks");
-    expect(msg2).toContain("already enabled");
+  });
+
+  it("honors CODEX_HOME for the hooks.json location", async () => {
+    const dir = await home();
+    const ch = path.join(dir, "custom-codex");
+    process.env.CODEX_HOME = ch;
+    installCodexStatusHooks(BIN, dir);
+    expect(existsSync(path.join(ch, "hooks.json"))).toBe(true); // written where Codex actually reads it
+    expect(existsSync(path.join(dir, ".codex", "hooks.json"))).toBe(false); // NOT the default dir
   });
 
   it("merges Codex status hooks beside another consumer's hooks and won't touch non-JSON hooks.json", async () => {
@@ -134,14 +148,17 @@ describe("plugging into agents as an MCP server", () => {
     expect(await readFile(file, "utf8")).toBe("not json {");
   });
 
-  it("does not auto-edit an existing [features] table; asks the user to add the one line", async () => {
+  it("never machine-edits config.toml for the feature, even a tricky existing [features] table", async () => {
     const dir = await home();
     const toml = path.join(dir, ".codex", "config.toml");
     await mkdir(path.dirname(toml), { recursive: true });
-    await writeFile(toml, "[features]\nweb_search = true\n");
+    // A [features] header with a trailing comment — the kind a naive append-if-no-[features] regex misreads
+    // as "no table" and then corrupts with a duplicate [features]. We must leave it byte-for-byte.
+    const before = "[features]  # my features\nweb_search = true\n";
+    await writeFile(toml, before);
     const msg = installCodexStatusHooks(BIN, dir);
-    expect(msg).toContain("add 'hooks = true'"); // manual instruction, not an in-place edit
-    expect(await readFile(toml, "utf8")).toBe("[features]\nweb_search = true\n"); // TOML untouched
+    expect(await readFile(toml, "utf8")).toBe(before); // TOML untouched (no corruption)
+    expect(msg).toContain("hooks = true"); // just instructs
   });
 
   it("installs Claude status hooks (working/idle/blocked), idempotent, preserving other settings", async () => {

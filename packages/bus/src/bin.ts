@@ -50,7 +50,9 @@ async function main(): Promise<void> {
     // back to startedAt only when absent (manual runs / no time tool) — those never race.
     const seqArg = valueOf(rest, "--seq");
     const seqNum = seqArg !== undefined ? Number(seqArg) : Number.NaN;
-    const seq = Number.isFinite(seqNum) && seqNum > 0 ? seqNum : startedAt;
+    // Accept only what writeStatusFile accepts (a positive safe integer) so a malformed --seq (1.5, 1e18)
+    // falls back to startedAt and still writes, rather than being accepted here then silently dropped there.
+    const seq = Number.isSafeInteger(seqNum) && seqNum > 0 ? seqNum : startedAt;
     let key = sessionArg || process.env.AGENTHOP_SESSION?.trim() || process.env.CLAUDE_CODE_SESSION_ID?.trim();
     if (!key) {
       const payload = await readStdinJson(); // Codex hook channel
