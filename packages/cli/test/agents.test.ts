@@ -229,6 +229,24 @@ describe("plugging into agents as an MCP server", () => {
     expect((cfg.hooks.SessionStart as unknown[]).length).toBe(1); // no duplicate group added
   });
 
+  it("extracts our hook from a group SHARED with a user hook — never changes the user hook's matcher (P2-9 shared-group)", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    await mkdir(path.dirname(file), { recursive: true });
+    const ourOldCmd = `'${BIN}' report-status idle >/dev/null 2>&1 || true # agenthop-status-hook:idle`;
+    const userCmd = "/my/compact-context-logger"; // a user hook that intentionally fires on compact (no matcher)
+    // ONE SessionStart group holding BOTH the user's hook and ours, matcher absent.
+    await writeFile(file, JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: userCmd }, { type: "command", command: ourOldCmd, async: true }] }] } }));
+    installClaudeStatusHooks(BIN, dir);
+    const groups = (JSON.parse(await readFile(file, "utf8")).hooks.SessionStart) as { matcher?: string; hooks: { command: string }[] }[];
+    const userGroup = groups.find((g) => g.hooks.some((h) => h.command === userCmd))!;
+    const ourGroup = groups.find((g) => g.hooks.some((h) => h.command.includes("agenthop-status-hook:idle")))!;
+    expect(userGroup).not.toBe(ourGroup); // ours was MOVED to its own group, not left sharing
+    expect(userGroup.matcher).toBeUndefined(); // user's hook untouched — still fires on compact as they intended
+    expect(userGroup.hooks.some((h) => h.command.includes("agenthop-status-hook"))).toBe(false); // ours removed from the shared group
+    expect(ourGroup.matcher).toBe("startup|resume"); // ours gets the matcher in its OWN group
+  });
+
   it("shell-single-quotes the binary path so metacharacters can't be expanded", async () => {
     const dir = await home();
     installClaudeStatusHooks("/opt/a b/$(touch pwned)/agenthop", dir);

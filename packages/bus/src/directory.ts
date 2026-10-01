@@ -30,8 +30,13 @@ export type RemotePeer = {
   machine: string;
   /** The session's public key, so a DM can be sealed to it. */
   pub: string;
-  /** Sender's clock, ms. Used to drop stale entries. */
+  /** Sender's clock, ms. Used for roster TTL freshness — NOT for ordering a run's announces (clocks skew). */
   ts: number;
+  /** Per-RUN monotonic presence revision: strictly increases on every announce from this run, independent of
+   *  the wall clock. It — not `ts` — orders a run's announces (including identity switches), so a clock
+   *  rollback or a same-ms reorder can neither drop a newer announce nor let an older one overwrite it. Absent
+   *  for peers predating this field (merge then falls back to `ts`). */
+  rev?: number;
   /**
    * Self-reported work state (see SelfInfo): rides the presence blob so remote peers see it too.
    * `statusSeq` is the per-identity monotonic counter; mergePresence uses it so a replayed or
@@ -108,18 +113,21 @@ export function capStatusText(text: string | undefined): string | undefined {
  */
 export function mergePresence(prev: RemotePeer | undefined, next: RemotePeer): RemotePeer {
   if (!prev) return next;
-  // A DIFFERENT identity in this run slot (a Codex run multiplexing thread A→B) is adopted ONLY when the
-  // announce is STRICTLY newer by ts. A same-ts or older cross-identity announce can't be ordered by the
-  // clock, so keep prev — otherwise a late/replayed OLD-identity announce would overwrite the newer entry
-  // (and the swapped-in older ts could then age the whole peer past its TTL and drop it).
-  if (identityOf(prev) !== identityOf(next)) return next.ts > prev.ts ? next : prev;
-  // Same identity: two INDEPENDENT clocks, merged separately so neither can discard the other's advance:
-  //  - PRESENCE fields (where/when this run last spoke) follow the higher wall-clock `ts`;
-  //  - STATUS fields follow the higher per-identity monotonic `statusSeq` (core.ts setStatusImpl).
-  // Gating status on `ts` lost data: a clock rollback or a same-ms reorder can carry a HIGHER statusSeq on a
-  // LOWER-ts entry (and vice versa). So pick the presence base by ts and the status by statusSeq, each on
-  // its own axis. A defined statusSeq always beats an undefined one; equal/undefined keeps prev's status.
-  const presenceBase = next.ts >= prev.ts ? next : prev;
+  // Order a run's announces by its MONOTONIC presence revision (`rev`) when both carry one — it, not the
+  // wall clock, is the truth. Fall back to `ts` only for peers that predate `rev`.
+  const haveRev = next.rev !== undefined && prev.rev !== undefined;
+  const nextStrictlyNewer = haveRev ? next.rev! > prev.rev! : next.ts > prev.ts;
+  const nextNotOlder = haveRev ? next.rev! >= prev.rev! : next.ts >= prev.ts;
+  // A DIFFERENT identity in this run slot (a Codex run multiplexing thread A→B) is adopted ONLY by a STRICTLY
+  // newer announce. By `rev` this both rejects a late/replayed OLDER-identity announce (it would otherwise
+  // overwrite the current entry and could age the whole peer past its TTL) AND adopts a legitimate same-ms
+  // switch (its revision is higher even when the clock tie makes ts useless).
+  if (identityOf(prev) !== identityOf(next)) return nextStrictlyNewer ? next : prev;
+  // Same identity: two INDEPENDENT axes, merged separately so neither discards the other's advance —
+  //  - PRESENCE fields follow the newer announce (by rev, else ts);
+  //  - STATUS fields follow the higher per-identity monotonic `statusSeq` (core.ts setStatusImpl),
+  // so an older-revision announce carrying a higher statusSeq still advances the status, and vice versa.
+  const presenceBase = nextNotOlder ? next : prev;
   const statusFrom = next.statusSeq !== undefined && (prev.statusSeq === undefined || next.statusSeq > prev.statusSeq) ? next : prev;
   return { ...presenceBase, status: statusFrom.status, statusSeq: statusFrom.statusSeq, statusText: statusFrom.statusText, statusAt: statusFrom.statusAt };
 }
@@ -150,6 +158,9 @@ export function startDirectory(options: DirectoryOptions): Directory {
   // read), so a pull tags its read with the current epoch and discards its response if a reset happened
   // meanwhile — otherwise a late response from the OLD keeper could roll the cursor back over a reset.
   let epoch = 0;
+  // Per-run monotonic presence revision stamped on every announce — the clock-independent order key remote
+  // peers merge by (see mergePresence / RemotePeer.rev).
+  let announceRev = 0;
 
   const remember = (peer: RemotePeer): void => {
     // Reading back ANY of our own announces at/after the grace-clock start confirms the keeper sees our
@@ -208,7 +219,7 @@ export function startDirectory(options: DirectoryOptions): Directory {
 
   async function announce(): Promise<void> {
     if (closed) return;
-    const entry: RemotePeer = { ...self, ts: Date.now(), statusText: capStatusText(self.statusText) };
+    const entry: RemotePeer = { ...self, ts: Date.now(), rev: ++announceRev, statusText: capStatusText(self.statusText) };
     // Register the watch BEFORE sending. The room stores the log entry and only then acks the POST, so
     // an independent GET can read our announce back before sendMessage resolves; setting the marker only
     // after the await would let that read miss it, and the marker would then time out on a healthy log.

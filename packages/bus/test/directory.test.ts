@@ -82,6 +82,14 @@ test("a different identity is adopted ONLY when strictly newer by ts — a late/
   expect(mergePresence(b, sameTsA)).toBe(b); // ...nor a same-ms one (can't be ordered → keep prev, no flip-flop)
 });
 
+test("per-run revision adopts a legitimate same-ms identity switch (by rev, not rejected by equal ts), rejects an older-rev replay (P2-6 rev)", () => {
+  const a = peer({ stableId: "thread-A", ts: 1000, rev: 5, status: "idle", statusSeq: 2 });
+  const bSwitch = peer({ stableId: "thread-B", ts: 1000, rev: 6, status: "working", statusSeq: 1 }); // same ms, NEXT revision
+  expect(mergePresence(a, bSwitch).stableId).toBe("thread-B"); // the real switch is adopted by rev, despite the equal ts
+  const lateA = peer({ stableId: "thread-A", ts: 1000, rev: 5, status: "idle", statusSeq: 2 }); // an older-rev replay
+  expect(mergePresence(bSwitch, lateA)).toBe(bSwitch); // lower rev ⇒ keep B (no regression to the prior identity)
+});
+
 test("identity falls back to the run id when no stableId was adopted", () => {
   const prev = peer({ stableId: undefined, status: "working", statusSeq: 8 });
   const replay = peer({ stableId: undefined, ts: 2000, status: "idle", statusSeq: 2 });

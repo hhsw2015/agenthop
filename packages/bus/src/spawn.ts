@@ -883,30 +883,26 @@ async function despawnHeadless(rec: SpawnRecord, home: string): Promise<{ ok: bo
     forgetSpawn(rec.launchId, home);
     return { ok: true, note: `That headless ${rec.tool} run already exited (code ${child.exitCode ?? `signal ${child.signalCode}`}); removed its record, killed nothing.${out}` };
   }
-  const killGroup = (sig: NodeJS.Signals): void => {
-    // Group signal ONLY while the leader is still alive (exitCode null), so -pid can never hit a reused pid.
-    if (child.exitCode === null && typeof child.pid === "number") {
-      try {
-        process.kill(-child.pid, sig);
-      } catch {
-        // group already gone / no permission — the handle signal is the primary path
-      }
-    }
-  };
+  // Signal ONLY through the ChildProcess HANDLE — this is the airtight path: Node binds the handle to this
+  // exact child, so a signal through it can NEVER reach a reused pid and is a no-op once the child has exited.
+  // We deliberately do NOT send a process-GROUP signal (process.kill(-pid)): a bare -pid is not handle-bound,
+  // and on some runtimes (e.g. Bun) the handle's exitCode can still read null at the instant of exit, so -pid
+  // could momentarily land on a reused pid — a risk the #1 rule forbids. Managed-process cancel (airtight) is
+  // kept SEPARATE from group cleanup (which we do not guarantee): a sub-process the CLI spawned that OUTLIVES
+  // its parent — whether it ignored SIGTERM in the original group or re-parented to a new one — is NOT
+  // force-killed (rare for a one-shot run, which exits with its children). Reported honestly, never claimed clean.
   child.kill("SIGTERM");
-  killGroup("SIGTERM");
   let ended = await waitChildExit(child, 2000);
   if (!ended) {
     child.kill("SIGKILL");
-    killGroup("SIGKILL");
     ended = await waitChildExit(child, 2000);
   }
   if (!ended) {
-    return { ok: false, note: `Sent SIGTERM then SIGKILL (to the ${rec.tool} run and its process group) but pid ${child.pid} is still alive; agenthop could not terminate it. Record kept — stop it manually.${out}` };
+    return { ok: false, note: `Sent SIGTERM then SIGKILL to the ${rec.tool} run's process handle but pid ${child.pid} is still alive; agenthop could not terminate it. Record kept — stop it manually.${out}` };
   }
   headlessChildren.delete(rec.launchId);
   forgetSpawn(rec.launchId, home);
-  return { ok: true, note: `Terminated the headless ${rec.tool} run (launchId ${rec.launchId}, pid ${child.pid}).${out}` };
+  return { ok: true, note: `Stopped the headless ${rec.tool} run's main process (launchId ${rec.launchId}, pid ${child.pid}). agenthop signals only the exact process it launched — a sub-process that CLI spawned and that outlives it is not force-killed.${out}` };
 }
 
 export type DespawnOptions = { home?: string };

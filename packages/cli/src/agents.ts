@@ -312,17 +312,29 @@ function mergeStatusHookEvents(config: Record<string, unknown>, events: Array<{ 
     const want = statusHookCommand(bin, state);
     const ours = arr.find((g) => Array.isArray((g as { hooks?: unknown[] })?.hooks) && (g as { hooks: unknown[] }).hooks.some((h) => ownedBy((h as { command?: unknown })?.command, mark)));
     if (ours) {
-      // Refresh our command in place (e.g. the agenthop path changed) without adding a duplicate.
-      for (const h of (ours as { hooks: Array<{ command?: string }> }).hooks) {
+      const group = ours as { matcher?: string; hooks: Array<{ command?: string }> };
+      const sharedWithUser = group.hooks.some((h) => !ownedBy(h.command, mark));
+      if (matcher !== undefined && sharedWithUser) {
+        // Our hook shares a group with a USER's hook, and this event needs a specific matcher. Setting the
+        // shared group's matcher would silently change the user's hook too (e.g. stop their compact-context
+        // hook firing). So EXTRACT our hook into its own new group (with the matcher) and leave the user's
+        // group — hooks AND matcher — exactly as it was.
+        group.hooks = group.hooks.filter((h) => !ownedBy(h.command, mark));
+        arr.push(makeGroup(want, matcher));
+        changed++;
+        continue;
+      }
+      // Our own (or matcher-less) group: refresh the command in place without adding a duplicate.
+      for (const h of group.hooks) {
         if (ownedBy(h.command, mark) && h.command !== want) {
           h.command = want;
           changed++;
         }
       }
-      // Also sync the group's matcher when this event declares one (e.g. SessionStart's "startup|resume"):
-      // an OLD install's group may predate the matcher and would otherwise keep firing on compact (#P2-9).
-      if (matcher !== undefined && (ours as { matcher?: unknown }).matcher !== matcher) {
-        (ours as { matcher?: string }).matcher = matcher;
+      // Sync the matcher only on a group that is exclusively ours (an OLD install's group may predate it and
+      // would otherwise keep firing on compact — #P2-9).
+      if (matcher !== undefined && group.matcher !== matcher) {
+        group.matcher = matcher;
         changed++;
       }
       continue;

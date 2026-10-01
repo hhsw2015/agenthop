@@ -201,12 +201,13 @@ export function pruneStaleStatusFiles(home: string, opts?: { ttlMs?: number; now
     else loose.push(name);
   }
   let pruned = 0;
-  const unlink = (name: string): void => {
+  const unlink = (name: string): boolean => {
     try {
-      rmSync(path.join(dir, name), { force: true });
+      rmSync(path.join(dir, name), { force: true }); // force:true ignores ENOENT but still throws on EACCES
       pruned++;
+      return true;
     } catch {
-      // vanished mid-scan or unlink refused — leave it for the next pass
+      return false; // vanished mid-scan or unlink refused — leave it for the next pass
     }
   };
   for (const files of groups.values()) {
@@ -222,10 +223,14 @@ export function pruneStaleStatusFiles(home: string, opts?: { ttlMs?: number; now
     }
     if (now - maxMtime >= ttlMs) {
       // The MAX itself is untouched past the TTL ⇒ the whole session is dead ⇒ remove every version. Delete
-      // LOWEST-seq FIRST, the max LAST, so there is never a moment where only a lower version remains (a reader
-      // in between still sees the max), and if a delete fails mid-way (EACCES) the MAX is the one left, never a
-      // lower one — so the on-disk winner can never regress.
-      for (const f of [...files].reverse()) unlink(f.name);
+      // the LOWER versions first; only once EVERY one of them is confirmed gone do we remove the max. If any
+      // lower unlink fails (e.g. EACCES, then perms later restored), we KEEP the max — otherwise deleting the
+      // max while a lower survives would regress the on-disk winner to that lower version (the #8 hazard).
+      let allLowersGone = true;
+      for (const f of [...subMax].reverse()) {
+        if (!unlink(f.name)) allLowersGone = false; // lowest seq first
+      }
+      if (allLowersGone) unlink(max!.name); // safe: no lower version is left to regress to
       continue;
     }
     // Max is fresh ⇒ never touch it; prune only stale LOWER-seq leftovers. A sub-max file can never be the
