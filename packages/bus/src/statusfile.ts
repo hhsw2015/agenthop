@@ -1,5 +1,5 @@
 import { watch, type FSWatcher } from "node:fs";
-import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -154,10 +154,60 @@ export function writeStatusFile(home: string, key: string, state: string, opts?:
   }
 }
 
+/** How long an untouched status file lives before GC may prune it. Generous on purpose: a live session's
+ *  file is rewritten on every hook event, so hours of silence means the session is dead or long-idle — and
+ *  for a long-idle LIVE session the file is already redundant (see pruneStaleStatusFiles). */
+export const STATUS_FILE_TTL_MS = 6 * 60 * 60 * 1000;
+
+/** How often watchStatusDir's poll runs the GC (stat-ing every file each 1s tick would be waste). */
+const STATUS_GC_INTERVAL_MS = 10 * 60 * 1000;
+
+/**
+ * Prune status files (and leftover `.tmp.` staging files) whose mtime is older than the TTL — the
+ * leftovers of DEAD sessions, which otherwise accumulate forever: writeStatusFile only prunes versions
+ * WITHIN its own key, so a session that exits leaves its last file behind for good.
+ *
+ * Why an mtime TTL can never hurt a live session: a live node keeps its applied status IN MEMORY (the
+ * monotonic statusByIdentity path), so removing a file regresses nothing that is running. The file's only
+ * cross-process jobs are (a) carrying a NEW event from a hook to the node — such a file is written (fresh
+ * mtime) moments before pickup, nowhere near the TTL — and (b) seeding a RESTARTED node at startup — and a
+ * seed untouched for hours is stale noise there anyway (the SessionStart hook re-seeds a fresh session).
+ * Best-effort and concurrency-safe: a file that vanishes mid-scan is skipped, and a failed unlink is
+ * harmless clutter for the next pass. Returns how many files were removed.
+ */
+export function pruneStaleStatusFiles(home: string, opts?: { ttlMs?: number; now?: number }): number {
+  const ttlMs = opts?.ttlMs ?? STATUS_FILE_TTL_MS;
+  const now = opts?.now ?? Date.now();
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) return 0;
+  const dir = statusDir(home);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return 0; // no dir, nothing to prune
+  }
+  let pruned = 0;
+  for (const name of names) {
+    const file = path.join(dir, name);
+    try {
+      const stat = statSync(file);
+      if (!stat.isFile()) continue; // only our flat status files — never recurse into anything else
+      if (now - stat.mtimeMs < ttlMs) continue; // fresh — possibly live, never touched
+      rmSync(file, { force: true });
+      pruned++;
+    } catch {
+      // vanished mid-scan or unlink refused — either way, leave it for the next pass
+    }
+  }
+  return pruned;
+}
+
 /**
  * Watch the status directory and call `onChange` whenever any status file changes (writes are atomic
  * renames, so watching the DIR is more reliable than watching one file). The caller re-reads the file
- * for its current key inside `onChange`. Returns a close fn; a no-op if the dir can't be watched.
+ * for its current key inside `onChange`. Also runs the dead-session GC opportunistically (every
+ * STATUS_GC_INTERVAL_MS, first pass on the first tick) — every bus node is a janitor, so the directory
+ * stays clean without a dedicated process. Returns a close fn; a no-op if the dir can't be watched.
  */
 export function watchStatusDir(home: string, onChange: () => void): () => void {
   const dir = statusDir(home);
@@ -178,7 +228,14 @@ export function watchStatusDir(home: string, onChange: () => void): () => void {
   // Poll fallback: fs.watch can miss events under load or on some filesystems. A low-frequency re-read
   // guarantees pickup within ~1s; a re-read that hasn't changed is dropped by the monotonic seq guard,
   // so this never re-broadcasts. unref so it never keeps the process alive.
-  const timer = setInterval(() => onChange(), 1000);
+  let lastGc = 0;
+  const timer = setInterval(() => {
+    onChange();
+    if (Date.now() - lastGc >= STATUS_GC_INTERVAL_MS) {
+      lastGc = Date.now();
+      pruneStaleStatusFiles(home);
+    }
+  }, 1000);
   if (typeof timer.unref === "function") timer.unref();
   return () => {
     try {

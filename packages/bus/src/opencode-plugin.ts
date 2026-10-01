@@ -337,6 +337,15 @@ export const AgenthopBusPlugin = async ({ client, directory }: PluginInput) => {
     event: async ({ event }: { event: { type: string; properties?: { sessionID?: string; info?: { id?: string }; status?: { type?: string } } } }): Promise<void> => {
       const type = event?.type;
       const props = event?.properties ?? {};
+      // A fresh session starts idle (else it shows [unknown] until its first event). Like session.deleted,
+      // session.created carries the id under properties.info (a full Session), not sessionID — the shape in
+      // the installed SDK's EventSessionCreated (types.gen.d.ts, 1.18.26). Also creates the bus peer early,
+      // so the session is on the roster before its first message.
+      if (type === "session.created") {
+        const id = props.info?.id;
+        if (typeof id === "string" && id) setStatus(busFor(id), "idle");
+        return;
+      }
       if (type === "session.deleted") {
         const id = props.info?.id;
         const b = id ? buses.get(id) : undefined;
