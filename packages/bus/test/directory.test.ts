@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { mergePresence, type RemotePeer } from "../src/directory.js";
+import { capStatusText, mergePresence, type RemotePeer } from "../src/directory.js";
 
 /**
  * The no-regress rule for cross-machine status, tested pure: the directory room's log REPLAYS old
@@ -83,5 +83,30 @@ test("identity falls back to the run id when no stableId was adopted", () => {
 test("a previous entry without any seq is simply replaced", () => {
   const prev = peer(); // never reported
   const next = peer({ ts: 2000, status: "working", statusSeq: 1 });
-  expect(mergePresence(prev, next)).toBe(next);
+  expect(mergePresence(prev, next)).toEqual(next); // value-equal (merge builds a fresh object)
+});
+
+test("a clock rollback (lower ts) never discards a higher statusSeq (P2-5)", () => {
+  const prev = peer({ ts: 1000, status: "working", statusSeq: 1 });
+  const next = peer({ ts: 500, status: "idle", statusSeq: 2 }); // sender's wall clock went backwards
+  const merged = mergePresence(prev, next);
+  expect(merged.status).toBe("idle"); // status advances by seq, NOT gated by the lower ts
+  expect(merged.statusSeq).toBe(2);
+  expect(merged.ts).toBe(1000); // presence keeps the fresher (higher) ts
+});
+
+test("a late lower-seq announce at the same ts keeps the status watermark (P2-6)", () => {
+  const prev = peer({ ts: 1000, status: "idle", statusSeq: 2 });
+  const late = peer({ ts: 1000, status: "working", statusSeq: 1 }); // same ms, lower seq, arrives after
+  const merged = mergePresence(prev, late);
+  expect(merged.status).toBe("idle"); // the higher per-identity seq (2) wins regardless of the equal ts
+  expect(merged.statusSeq).toBe(2);
+});
+
+test("capStatusText truncates an oversized note so a sealed presence can't exceed the relay limit (P3)", () => {
+  expect(capStatusText(undefined)).toBeUndefined();
+  expect(capStatusText("short")).toBe("short");
+  const capped = capStatusText("x".repeat(50_000))!;
+  expect(Buffer.byteLength(capped, "utf8")).toBeLessThanOrEqual(2 * 1024 + 4); // ≤ cap (+ the "…" marker's bytes)
+  expect(capped.endsWith("…")).toBe(true);
 });

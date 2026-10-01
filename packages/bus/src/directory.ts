@@ -84,6 +84,18 @@ export type DirectoryOptions = {
 /** The durable identity a status belongs to: the native session id when known, else the run id. */
 const identityOf = (peer: RemotePeer): string => peer.stableId ?? peer.id;
 
+/** Cap the only free-text, caller-controlled presence field so a sealed presence blob can never exceed the
+ *  relay's per-message limit (a ~50 KB note sealed to ~67 KB blew past the 64 KiB cap and every heartbeat
+ *  then failed). A status note is meant to be short; 2 KiB is generous and keeps the sealed blob tiny. */
+const MAX_STATUS_TEXT_BYTES = 2 * 1024;
+export function capStatusText(text: string | undefined): string | undefined {
+  if (text === undefined) return undefined;
+  const buf = Buffer.from(text, "utf8");
+  if (buf.length <= MAX_STATUS_TEXT_BYTES) return text;
+  // Truncate on the byte limit; a cut multi-byte char decodes to a trailing U+FFFD, which we strip, then mark.
+  return `${buf.subarray(0, MAX_STATUS_TEXT_BYTES).toString("utf8").replace(/�+$/, "")}…`;
+}
+
 /**
  * Fold a newer presence entry over the one already on the roster, without letting its status fields
  * roll back. The room log replays old entries (a cursor reset re-reads it from the start) and sender
@@ -96,10 +108,15 @@ const identityOf = (peer: RemotePeer): string => peer.stableId ?? peer.id;
  */
 export function mergePresence(prev: RemotePeer | undefined, next: RemotePeer): RemotePeer {
   if (!prev || identityOf(prev) !== identityOf(next)) return next;
-  if (prev.statusSeq === undefined) return next;
-  if (next.statusSeq !== undefined && next.statusSeq > prev.statusSeq) return next;
-  // Stale (<= seq) or status-less replay of the same identity: take its presence, keep the newer status.
-  return { ...next, status: prev.status, statusSeq: prev.statusSeq, statusText: prev.statusText, statusAt: prev.statusAt };
+  // Two INDEPENDENT clocks, merged separately so neither can discard the other's advance:
+  //  - PRESENCE fields (where/when this run last spoke) follow the higher wall-clock `ts`;
+  //  - STATUS fields follow the higher per-identity monotonic `statusSeq` (core.ts setStatusImpl).
+  // Gating status on `ts` lost data: a clock rollback or a same-ms reorder can carry a HIGHER statusSeq on a
+  // LOWER-ts entry (and vice versa). So pick the presence base by ts and the status by statusSeq, each on
+  // its own axis. A defined statusSeq always beats an undefined one; equal/undefined keeps prev's status.
+  const presenceBase = next.ts >= prev.ts ? next : prev;
+  const statusFrom = next.statusSeq !== undefined && (prev.statusSeq === undefined || next.statusSeq > prev.statusSeq) ? next : prev;
+  return { ...presenceBase, status: statusFrom.status, statusSeq: statusFrom.statusSeq, statusText: statusFrom.statusText, statusAt: statusFrom.statusAt };
 }
 
 export function startDirectory(options: DirectoryOptions): Directory {
@@ -131,11 +148,14 @@ export function startDirectory(options: DirectoryOptions): Directory {
 
   const remember = (peer: RemotePeer): void => {
     // Reading our own latest announce back confirms the current keeper sees our writes: cursor is fresh.
-    if (peer.id === self.id && peer.ts === pendingSelfTs) pendingSelfTs = undefined;
-    const prev = seen.get(peer.id);
-    // Presence freshness by sender clock; status freshness by its own monotonic seq (mergePresence) —
-    // a replayed log entry that passes the ts check must still not roll a newer status back.
-    if (!prev || peer.ts >= prev.ts) seen.set(peer.id, mergePresence(prev, peer));
+    if (peer.id === self.id && peer.ts === pendingSelfTs) {
+      pendingSelfTs = undefined;
+      pendingSince = 0; // our writes are echoing → disarm the stale-keeper grace clock
+    }
+    // No outer ts gate: mergePresence merges the two axes independently (presence by ts, status by
+    // statusSeq), so a lower-ts entry carrying a higher statusSeq still advances the status, and a stale
+    // one never rolls presence back (it keeps the fresher ts). Gating here on ts dropped such updates.
+    seen.set(peer.id, mergePresence(seen.get(peer.id), peer));
   };
 
   /** Accept any presence blob we can open with the team key; ignore the rest. Keeper-side. */
@@ -181,18 +201,24 @@ export function startDirectory(options: DirectoryOptions): Directory {
 
   async function announce(): Promise<void> {
     if (closed) return;
-    const entry: RemotePeer = { ...self, ts: Date.now() };
+    const entry: RemotePeer = { ...self, ts: Date.now(), statusText: capStatusText(self.statusText) };
     // Register the watch BEFORE sending. The room stores the log entry and only then acks the POST, so
     // an independent GET can read our announce back before sendMessage resolves; setting the marker only
     // after the await would let that read miss it, and the marker would then time out on a healthy log.
     // With it set first, a concurrent read clears it (remember()); we leave it as-is on success and only
     // clear it here if the send itself failed.
     pendingSelfTs = entry.ts;
-    pendingSince = Date.now();
+    // Start the stale-keeper grace clock on the FIRST unechoed announce only. A routine re-announce (every
+    // status change, ~10s) must NOT keep pushing pendingSince forward, or the >STALE_GRACE_MS fallback never
+    // fires and a taken-over keeper goes undetected until a live peer has aged past its TTL (#P2-7).
+    if (pendingSince === 0) pendingSince = Date.now();
     try {
       await sendMessage({ code: address, text: PRESENCE_PREFIX + sealEntry(team.nsKey, JSON.stringify(entry)), relay: options.relay, pass: options.pass });
     } catch (error) {
-      if (pendingSelfTs === entry.ts) pendingSelfTs = undefined; // send failed: nothing to watch for
+      if (pendingSelfTs === entry.ts) {
+        pendingSelfTs = undefined; // send failed: nothing to watch for
+        pendingSince = 0;
+      }
       // No room there (keeper gone or never was): the log restarts under the next keeper, so reset our
       // read cursor (#5) before taking it over; the next tick announces.
       if (/\b404\b|not found/i.test(error instanceof Error ? error.message : String(error))) {
@@ -206,10 +232,11 @@ export function startDirectory(options: DirectoryOptions): Directory {
     if (closed) return;
     // Own-announce fallback (for a keeper without the generation field): our recent announce never came
     // back -> taken over -> resync. Rarely fires once the generation check is active (that resets sooner).
-    if (pendingSelfTs !== undefined && Date.now() - pendingSince > STALE_GRACE_MS) {
+    if (pendingSelfTs !== undefined && pendingSince !== 0 && Date.now() - pendingSince > STALE_GRACE_MS) {
       after = 0;
       epoch++;
       pendingSelfTs = undefined; // act once; don't re-trigger every poll while it stays unechoed
+      pendingSince = 0;
     }
     const startEpoch = epoch;
     try {
@@ -225,6 +252,7 @@ export function startDirectory(options: DirectoryOptions): Directory {
         after = 0;
         epoch++;
         pendingSelfTs = undefined; // a pending announce to the old keeper is moot; don't let it thrash
+        pendingSince = 0;
         return;
       }
       if (generation) keeperGeneration = generation;
