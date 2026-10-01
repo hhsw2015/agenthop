@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
@@ -160,6 +160,16 @@ test("nextInstanceEpoch OMITS the epoch (undefined) instead of publishing a poss
   const fileHome = path.join(mkdtempSync(path.join(tmpdir(), "ah-epoch-")), "not-a-dir");
   writeFileSync(fileHome, "x");
   expect(nextInstanceEpoch(fileHome)).toBeUndefined();
+});
+
+test("nextInstanceEpoch omits at the numeric ceiling rather than create an unsafe-integer name that would drop the real max (P3)", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ah-epoch-"));
+  const dir = path.join(home, ".agenthop", "epoch");
+  mkdirSync(dir, { recursive: true });
+  const ceiling = String(Number.MAX_SAFE_INTEGER); // an adversarial pre-placed ceiling value
+  writeFileSync(path.join(dir, ceiling), "");
+  expect(nextInstanceEpoch(home)).toBeUndefined(); // candidate = seen+1 is unsafe → omit, never create/prune
+  expect(existsSync(path.join(dir, ceiling))).toBe(true); // the real max is untouched (returned before any create)
 });
 
 test("capStatusText truncates an oversized note so a sealed presence can't exceed the relay limit (P3)", () => {

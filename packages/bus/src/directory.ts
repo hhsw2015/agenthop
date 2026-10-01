@@ -169,10 +169,11 @@ export function mergePresence(prev: RemotePeer | undefined, next: RemotePeer): R
  * once a higher one is in place (never the max), so the dir stays ~1 file. Exported for tests.
  *
  * EVERY failure path returns `undefined`, never a bare clock value: if the register's dir can't be created or
- * read, a write errors, or the contention budget is exhausted, we OMIT the epoch rather than publish one that
- * might sit BELOW a watermark we failed to see. The announce then carries no epoch and mergePresence falls back
- * to rev/ts (the pre-epoch ordering: bounded recovery, never a permanent strand). So no return path ever yields
- * an epoch at or below a prior instance's — it either allocates a provably-monotonic one or omits it entirely.
+ * read, a write errors, the contention budget is exhausted, or the numeric ceiling is hit, we OMIT the epoch
+ * rather than publish one that might sit BELOW a watermark we failed to see. The announce then carries no epoch
+ * and mergePresence falls back to rev/ts — this avoids the PERMANENT low-epoch gate-lock; recovery is then paced
+ * by rev catch-up (bounded by the prior rev gap, NOT instant). So every NON-undefined return is strictly greater
+ * than any prior instance's epoch — the allocator yields a provably-monotonic value or omits it entirely.
  */
 export function nextInstanceEpoch(home: string = process.env.HOME || homedir()): number | undefined {
   const dir = path.join(home, ".agenthop", "epoch");
@@ -203,6 +204,9 @@ export function nextInstanceEpoch(home: string = process.env.HOME || homedir()):
     const seen = maxSeen();
     if (seen === undefined) return undefined; // couldn't read the max → omit rather than publish a possibly-low value
     const candidate = Math.max(Date.now(), seen + 1);
+    // Numeric-ceiling guard: at seen === MAX_SAFE_INTEGER, candidate would be an UNSAFE integer that maxSeen then
+    // ignores — creating it would drop the real max. Omit instead (absurd in practice; only an adversarial name).
+    if (!Number.isSafeInteger(candidate)) return undefined;
     try {
       writeFileSync(path.join(dir, String(candidate)), "", { flag: "wx" }); // O_EXCL: fail if the name exists
     } catch (error) {
