@@ -90,6 +90,16 @@ test("per-run revision adopts a legitimate same-ms identity switch (by rev, not 
   expect(mergePresence(bSwitch, lateA)).toBe(bSwitch); // lower rev ⇒ keep B (no regression to the prior identity)
 });
 
+test("a new relay INSTANCE (higher epoch) is adopted wholesale despite a reset rev — reconnect switches to the live pub; an old-epoch replay cannot reclaim (P2 reconnect)", () => {
+  const oldInst = peer({ ts: 1000, epoch: 100, rev: 10, pub: "pubA", status: "idle", statusSeq: 5 });
+  const newInst = peer({ ts: 1001, epoch: 200, rev: 1, pub: "pubB", status: "working", statusSeq: 1 }); // reconnect: new epoch, rev reset, NEW pub
+  const merged = mergePresence(oldInst, newInst);
+  expect(merged.pub).toBe("pubB"); // adopt the live mailbox at once, even though rev went 10 → 1
+  expect(merged.epoch).toBe(200);
+  expect(merged.statusSeq).toBe(1); // the fresh instance's status is taken too (not gated by the old seq)
+  expect(mergePresence(newInst, oldInst)).toBe(newInst); // the closed old instance's replay can't reclaim
+});
+
 test("identity falls back to the run id when no stableId was adopted", () => {
   const prev = peer({ stableId: undefined, status: "working", statusSeq: 8 });
   const replay = peer({ stableId: undefined, ts: 2000, status: "idle", statusSeq: 2 });

@@ -32,10 +32,17 @@ export type RemotePeer = {
   pub: string;
   /** Sender's clock, ms. Used for roster TTL freshness — NOT for ordering a run's announces (clocks skew). */
   ts: number;
-  /** Per-RUN monotonic presence revision: strictly increases on every announce from this run, independent of
-   *  the wall clock. It — not `ts` — orders a run's announces (including identity switches), so a clock
-   *  rollback or a same-ms reorder can neither drop a newer announce nor let an older one overwrite it. Absent
-   *  for peers predating this field (merge then falls back to `ts`). */
+  /** Per-INSTANCE epoch: the relay instance's creation stamp (Date.now()), constant for that instance and
+   *  strictly higher on each re-instantiation of the same logical run (a restart / socket reconnect makes a
+   *  fresh relay node with a NEW pub+mailbox). It orders INSTANCES: a higher epoch wins wholesale (adopt the
+   *  new pub + fresh status), so a reconnect is picked up at once instead of the remote clinging to the old,
+   *  now-closed mailbox until TTL; an older-epoch replay is rejected. `rev` orders announces WITHIN an epoch.
+   *  Absent for peers predating this field (merge falls back to `rev`, then `ts`). */
+  epoch?: number;
+  /** Per-RUN monotonic presence revision: strictly increases on every announce from this instance, independent
+   *  of the wall clock. Within one epoch it — not `ts` — orders a run's announces (including identity
+   *  switches), so a clock rollback or a same-ms reorder can neither drop a newer announce nor let an older
+   *  one overwrite it. Absent for peers predating this field (merge then falls back to `ts`). */
   rev?: number;
   /**
    * Self-reported work state (see SelfInfo): rides the presence blob so remote peers see it too.
@@ -113,8 +120,15 @@ export function capStatusText(text: string | undefined): string | undefined {
  */
 export function mergePresence(prev: RemotePeer | undefined, next: RemotePeer): RemotePeer {
   if (!prev) return next;
-  // Order a run's announces by its MONOTONIC presence revision (`rev`) when both carry one — it, not the
-  // wall clock, is the truth. Fall back to `ts` only for peers that predate `rev`.
+  // INSTANCE epoch first: a different epoch means a different relay INSTANCE of this run (a restart/reconnect
+  // made a fresh node with a NEW pub+mailbox). The higher epoch wins WHOLESALE — adopt its pub and its fresh
+  // status/rev at once — so the remote switches to the live mailbox immediately instead of clinging to the old,
+  // now-closed one until TTL; an older-epoch replay can never reclaim. (Within one epoch, fall through to rev.)
+  if (next.epoch !== undefined && prev.epoch !== undefined && next.epoch !== prev.epoch) {
+    return next.epoch > prev.epoch ? next : prev;
+  }
+  // Same instance (same epoch, or a peer predating epoch): order a run's announces by its MONOTONIC `rev` when
+  // both carry one — it, not the wall clock, is the truth. Fall back to `ts` only for peers that predate it.
   const haveRev = next.rev !== undefined && prev.rev !== undefined;
   const nextStrictlyNewer = haveRev ? next.rev! > prev.rev! : next.ts > prev.ts;
   const nextNotOlder = haveRev ? next.rev! >= prev.rev! : next.ts >= prev.ts;
@@ -158,8 +172,10 @@ export function startDirectory(options: DirectoryOptions): Directory {
   // read), so a pull tags its read with the current epoch and discards its response if a reset happened
   // meanwhile — otherwise a late response from the OLD keeper could roll the cursor back over a reset.
   let epoch = 0;
-  // Per-run monotonic presence revision stamped on every announce — the clock-independent order key remote
-  // peers merge by (see mergePresence / RemotePeer.rev).
+  // This relay instance's epoch + a per-announce revision, both stamped on every announce. epoch is constant
+  // for the instance and higher on every re-instantiation of this run (restart/reconnect → fresh node, new
+  // pub); rev strictly increases within the instance. Remote peers merge by (epoch, rev) — see mergePresence.
+  const instanceEpoch = Date.now();
   let announceRev = 0;
 
   const remember = (peer: RemotePeer): void => {
@@ -219,7 +235,7 @@ export function startDirectory(options: DirectoryOptions): Directory {
 
   async function announce(): Promise<void> {
     if (closed) return;
-    const entry: RemotePeer = { ...self, ts: Date.now(), rev: ++announceRev, statusText: capStatusText(self.statusText) };
+    const entry: RemotePeer = { ...self, ts: Date.now(), epoch: instanceEpoch, rev: ++announceRev, statusText: capStatusText(self.statusText) };
     // Register the watch BEFORE sending. The room stores the log entry and only then acks the POST, so
     // an independent GET can read our announce back before sendMessage resolves; setting the marker only
     // after the await would let that read miss it, and the marker would then time out on a healthy log.
