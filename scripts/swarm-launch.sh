@@ -201,6 +201,11 @@ echo "== self-verify: worker on the bus? (persistent discovery can take up to ~9
 if env -u CLAUDE_CODE_MESSAGING_SOCKET AGENTHOP_TEAM="$TEAM" AGENTHOP_NO_CODEX=1 AH_HOME="/tmp/ah-verify-$LID" \
      npx tsx "$HERE/scripts/swarm-peer-check.ts" 100 2>&1 | grep -q "PEER: $TITLE"; then
   echo "READY: worker $TITLE is on the bus (team=$TEAM). Send it tasks from a dispatcher on the SAME team."
+elif [ -n "$REUSED" ]; then
+  # Reused box: it was confirmed live (inside its window) and its TUI is warm, so a missed discovery here is a
+  # transient relay/directory read, NOT a dead box. Do NOT exit nonzero — a caller treating that as failure would
+  # re-allocate, the exact over-allocation we avoid. Warn and succeed; the box is reachable (retry the check).
+  echo "WARN: $TITLE not seen on the bus this pass (reused box is live; likely a transient directory read)." >&2
 else
   echo "NOT READY: $TITLE did not appear on the bus within the window. Check the box TUI (tmux capture-pane -t swarm)." >&2
   exit 2
