@@ -2,6 +2,7 @@ import { hkdfSync } from "node:crypto";
 import { isRoomAddress, normalizeCode, relayEndpoints, WORDLIST } from "@agenthop/tunnel";
 import { DEFAULT_RELAY, readQueue, sendMessage, startHost } from "@agenthop/cli";
 import { openEntry, sealEntry, type Team } from "./team.js";
+import type { AgentStatus } from "./label.js";
 
 type RunningHost = Awaited<ReturnType<typeof startHost>>;
 
@@ -31,6 +32,15 @@ export type RemotePeer = {
   pub: string;
   /** Sender's clock, ms. Used to drop stale entries. */
   ts: number;
+  /**
+   * Self-reported work state (see SelfInfo): rides the presence blob so remote peers see it too.
+   * `statusSeq` is the per-identity monotonic counter; mergePresence uses it so a replayed or
+   * reordered announce can never roll a fresher status back. All optional: absent = never reported.
+   */
+  status?: AgentStatus;
+  statusSeq?: number;
+  statusText?: string;
+  statusAt?: number;
 };
 
 export type Directory = {
@@ -71,6 +81,27 @@ export type DirectoryOptions = {
   pass?: string;
 };
 
+/** The durable identity a status belongs to: the native session id when known, else the run id. */
+const identityOf = (peer: RemotePeer): string => peer.stableId ?? peer.id;
+
+/**
+ * Fold a newer presence entry over the one already on the roster, without letting its status fields
+ * roll back. The room log replays old entries (a cursor reset re-reads it from the start) and sender
+ * clocks only order entries approximately, so `next` being accepted does not prove its STATUS is the
+ * freshest — only `statusSeq` (the per-identity monotonic counter, see core.ts setStatusImpl) does.
+ * Rule: `next` wins the presence fields; its status fields win only when STRICTLY newer by seq (the
+ * same `seq <= prev` guard core.ts setStatusImpl applies locally), or when they are the first seq seen
+ * for this identity. A different identity starts fresh — statuses are per-identity and must never leak
+ * across a thread switch. Pure, exported for tests.
+ */
+export function mergePresence(prev: RemotePeer | undefined, next: RemotePeer): RemotePeer {
+  if (!prev || identityOf(prev) !== identityOf(next)) return next;
+  if (prev.statusSeq === undefined) return next;
+  if (next.statusSeq !== undefined && next.statusSeq > prev.statusSeq) return next;
+  // Stale (<= seq) or status-less replay of the same identity: take its presence, keep the newer status.
+  return { ...next, status: prev.status, statusSeq: prev.statusSeq, statusText: prev.statusText, statusAt: prev.statusAt };
+}
+
 export function startDirectory(options: DirectoryOptions): Directory {
   const { team } = options;
   // Mutable: a Codex session learns its native id after startup and refreshes its presence via updateSelf.
@@ -102,7 +133,9 @@ export function startDirectory(options: DirectoryOptions): Directory {
     // Reading our own latest announce back confirms the current keeper sees our writes: cursor is fresh.
     if (peer.id === self.id && peer.ts === pendingSelfTs) pendingSelfTs = undefined;
     const prev = seen.get(peer.id);
-    if (!prev || peer.ts >= prev.ts) seen.set(peer.id, peer);
+    // Presence freshness by sender clock; status freshness by its own monotonic seq (mergePresence) —
+    // a replayed log entry that passes the ts check must still not roll a newer status back.
+    if (!prev || peer.ts >= prev.ts) seen.set(peer.id, mergePresence(prev, peer));
   };
 
   /** Accept any presence blob we can open with the team key; ignore the rest. Keeper-side. */
@@ -230,7 +263,11 @@ export function startDirectory(options: DirectoryOptions): Directory {
       return [...seen.values()].filter((peer) => peer.ts >= cutoff && peer.id !== self.id);
     },
     updateSelf(next) {
-      self = next; // next announce (and roster self-filter) uses the refreshed identity
+      self = next; // the roster self-filter and every later announce use the refreshed presence
+      // Announce right away too (mirrors the local broker's re-hello): a late-learned identity or a
+      // work-status change should reach other machines within one poll (~5s), not one beat (60s).
+      // setStatusImpl already suppresses no-change calls, so this stays at state-change cadence.
+      void announce();
     },
     async close() {
       closed = true;
