@@ -18,6 +18,20 @@ import { version } from "./version.js";
 const DEFAULT_WAIT_S = 30;
 const MAX_WAIT_S = 290;
 
+/**
+ * Every bus tool declares all four MCP hints, as booleans — some directories reject a tool with any missing
+ * (the same convention the classic tools adopted in cli/mcp.ts). `openWorldHint` = the tool touches the relay /
+ * other sessions / the OS desktop; it is false only for a tool that reads our own local registry. Defined here
+ * (not imported) so @agenthop/bus stays decoupled from the classic cli tool surface.
+ */
+const ACTS = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }; // send/handoff/spawn: a one-shot outward action, each call distinct
+const WAITS = { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true }; // recv/wait_peer: reads/waits on the outside
+const SCANS = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }; // peers: a read-only snapshot of other sessions
+const PUBLISHES = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }; // report_status: sets OUR own state; the same state again is a no-op
+const LOOKS = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }; // spawned: reads our own local registry only
+const DRIVES = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }; // wm: mutates the desktop, INCLUDING window-closing ops
+const CLOSES = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true }; // despawn: closes a window/process we spawned (a closed one stays closed)
+
 export type BusMcpOptions = { home?: string; relay?: string; pass?: string };
 
 export function busInstructions(): string {
@@ -48,6 +62,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_peers",
     {
+      annotations: SCANS,
       description: "List agent sessions reachable right now (Claude Code, Codex, or any other) with no pairing code. Same-machine sessions are automatic; other machines appear with a shared AGENTHOP_TEAM.",
       inputSchema: {},
     },
@@ -60,6 +75,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_send",
     {
+      annotations: ACTS,
       description: "Send a message to another session with no pairing code. `to` is a session id (a unique id prefix or the session's title also work). The peer receives it on its next agenthop_recv.",
       inputSchema: {
         to: z.string().describe("Target session: its handle tool:dir-<shortSessionId> (a prefix like 'codex:Work' works when unambiguous), or the native session id (see agenthop_peers)"),
@@ -78,6 +94,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_handoff",
     {
+      annotations: ACTS,
       description:
         "Hand a task off to another session so it can continue where you left off. You write the summary (goal, what's done, current state — the visible context the receiver needs); the bus adds a git snapshot of your working directory and delivers it as a message that surfaces in the target session. Cross-tool handoff carries only what you write plus git state, never your hidden context. `to` is a session handle/prefix or id (see agenthop_peers).",
       inputSchema: {
@@ -99,6 +116,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_recv",
     {
+      annotations: WAITS,
       description: "Wait for and return messages other sessions have sent you. Returns as soon as anything arrives, or when the timeout elapses.",
       inputSchema: {
         timeout_seconds: z.number().int().min(1).max(MAX_WAIT_S).optional().describe(`Seconds to wait, ${DEFAULT_WAIT_S} by default`),
@@ -116,6 +134,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_report_status",
     {
+      annotations: PUBLISHES,
       description:
         "Report THIS session's work state to peers (working | idle | blocked | unknown). It shows in agenthop_peers and lets a dispatcher agenthop_wait_peer on it. `blocked` means you need input (a permission/approval/question). Usually driven by hooks, but an agent may set it directly.",
       inputSchema: {
@@ -134,6 +153,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_wait_peer",
     {
+      annotations: WAITS,
       description:
         "Wait until another session reaches a work state — e.g. wait for a sub-agent you dispatched to go idle (done) or blocked (needs input). Returns as soon as it reaches one of the states, or when it vanishes or the timeout elapses. Pins the target's exact run so a different/restarted session can't satisfy the wait.",
       inputSchema: {
@@ -157,6 +177,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_spawn",
     {
+      annotations: ACTS,
       description:
         "Launch another agent CLI (claude | codex | opencode) on this machine. YOU choose the mode per task: visible (default) opens a VISIBLE terminal window the user can watch (macOS + Ghostty), the session joins the bus — give it work with agenthop_handoff; visible:false runs it HEADLESS (no window, any platform) in the tool's native non-interactive mode with `task` as its prompt, output streaming to a per-launch log file. Prefer visible for important/watchable work, headless for minor/bulk runs or a full desktop. Sub-agents start in no-confirmation mode so they run unattended.",
       inputSchema: {
@@ -178,6 +199,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_wm",
     {
+      annotations: DRIVES,
       description:
         'Drive the OmniWM window manager (macOS) to arrange windows — pass an omniwmctl command line, e.g. "query windows", "command focus left", "window move-to-workspace <id> 2", "workspace focus-name agents". One-shot only (no subscribe/watch). Note: includes window-closing ops and acts on your live desktop.',
       inputSchema: {
@@ -194,6 +216,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_spawned",
     {
+      annotations: LOOKS,
       description: "List the sub-agents THIS machine's agenthop dispatched — visible windows (window id, tool, cwd) and headless runs (pid, exit state, output log). The only ones agenthop_despawn may close.",
       inputSchema: {},
     },
@@ -213,6 +236,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
   server.registerTool(
     "agenthop_despawn",
     {
+      annotations: CLOSES,
       description:
         "Close a sub-agent that agenthop spawned, by its window id or launch id (from agenthop_spawn / agenthop_spawned). Visible: closes only the exact terminal surface it recorded (by that surface's stable UUID), never a whole window by its reusable window id. Headless: terminates exactly the recorded pid after verifying it is still the launched process, never by name. An id it never recorded is refused. Prefer the launch id if a window id is ambiguous.",
       inputSchema: { window_id: z.string().describe("The window id or launch id from agenthop_spawn / agenthop_spawned") },
