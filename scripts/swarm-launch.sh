@@ -4,9 +4,15 @@
 # bus before declaring ready. The worker then stays warm: discovery + MCP-join are paid ONCE, so per-task latency
 # is just the model (the slow step was warmup/discovery, not compute — see the swarm notes).
 #
-# Usage:  scripts/swarm-launch.sh [claude|codex|opencode] [swarm-team-secret]
-#   env: AGENTHOP_SSH_PROXY (default 127.0.0.1:10808), AGENTHOP_RELAY, AGENTHOP_CPA_BASE, AGENTHOP_REPO
-# Prereqs: a working SOCKS proxy (fresh egress IP per box), CPA_EPH_SECRET (or ~/.cpa_eph_secret), tsx.
+# Reuse-first: by default it REUSES the newest box still inside its ~60-min life (keyed by the throwaway SSH
+# key, reached directly, no proxy) instead of allocating — so repeated runs do not burn the IP-gated allocation
+# quota. Pass `new` (3rd arg) or AGENTHOP_SWARM_NEW=1 to force a brand-new box and grow the fleet (each VM is
+# only ~2 vCPU, so the swarm scales by adding boxes).
+#
+# Usage:  scripts/swarm-launch.sh [claude|codex|opencode] [swarm-team-secret] [new]
+#   env: AGENTHOP_SSH_PROXY (default 127.0.0.1:10808), AGENTHOP_RELAY, AGENTHOP_CPA_BASE, AGENTHOP_REPO,
+#        AGENTHOP_SWARM_NEW=1 (force allocate)
+# Prereqs: a working SOCKS proxy for ALLOCATION only (fresh egress IP), CPA_EPH_SECRET (or ~/.cpa_eph_secret), tsx.
 set -euo pipefail
 
 TOOL="${1:-claude}"
@@ -26,12 +32,38 @@ case "$TOOL" in
   *) echo "unknown tool: $TOOL" >&2; exit 1 ;;
 esac
 
-LID="rw-$(openssl rand -hex 4)"
+# --- Reuse-first VM resolution ----------------------------------------------
+# A box is bound to its SSH key and lives <=60 min; `ssh railway.new` with a key routes to that key's LIVE box,
+# but with a DEAD key it ALLOCATES a fresh one. So we must NOT "probe" liveness by SSHing (that would itself
+# over-allocate, from our raw IP). Instead gate reuse on a time window: reuse the newest box still well inside
+# its life. Default = reuse (avoids burning the IP-gated allocation quota — over-allocation is the main cause
+# of "Anonymous visitors are limited"). Force a brand-new box with `new` as the 3rd arg or AGENTHOP_SWARM_NEW=1:
+# the swarm grows by ADDING boxes, since each VM has only ~2 vCPU.
+# ponytail: fixed 55m window; swap for a real box-liveness ping if Railway ever exposes one.
+REUSE_WINDOW_SEC=3300
+FORCE_NEW="${AGENTHOP_SWARM_NEW:-}"; [ "${3:-}" = "new" ] && FORCE_NEW=1
+
+LID=""; KEYDIR=""; REUSED=""
+if [ -z "$FORCE_NEW" ]; then
+  now="$(date +%s)"
+  mapfile -t KDS < <(ls -dt /tmp/ah-rwkey-rw-* 2>/dev/null || true)
+  for kd in "${KDS[@]}"; do
+    [ -f "$kd/id" ] && [ -f "$kd/alloc-ts" ] || continue
+    age=$(( now - $(cat "$kd/alloc-ts") ))
+    [ "$age" -lt "$REUSE_WINDOW_SEC" ] || continue
+    KEYDIR="$kd"; LID="$(basename "$kd" | sed 's/^ah-rwkey-//')"; REUSED=1
+    echo "reuse live box $LID (age ${age}s < ${REUSE_WINDOW_SEC}s; direct, no proxy)"
+    break
+  done
+fi
+
+if [ -z "$LID" ]; then
+  LID="rw-$(openssl rand -hex 4)"; KEYDIR="/tmp/ah-rwkey-$LID"; mkdir -p "$KEYDIR"
+  ssh-keygen -t ed25519 -f "$KEYDIR/id" -N "" -q
+  echo "allocate NEW box $LID (via proxy $PROXY)"
+fi
 TITLE="railway:$TOOL-${LID#rw-}"
-KEYDIR="/tmp/ah-rwkey-$LID"
-mkdir -p "$KEYDIR"
-ssh-keygen -t ed25519 -f "$KEYDIR/id" -N "" -q
-echo "launch $LID  tool=$TOOL  model=$MODEL  title=$TITLE"
+echo "launch $LID  tool=$TOOL  model=$MODEL  title=$TITLE  reused=${REUSED:-0}"
 
 # Latest release binary for the box (linux-x64) + the CPA eph token (sub = launchId), minted on the dispatcher.
 URL="https://github.com/$REPO/releases/latest/download/agenthop-linux-x64"
@@ -64,30 +96,61 @@ ALGO_OPTS=()
 for kv in $PROF; do ALGO_OPTS+=(-o "$kv"); done
 echo "hassh profile: $PROF (bound to $LID)"
 
-# Isolated-key ssh through the proxy so Railway sees a chosen egress IP (per-IP anonymous limit).
-# Algorithm options randomize the HASSH fingerprint per launch.
-SSH=(ssh -i "$KEYDIR/id" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new
+# TWO ssh paths, because Railway gates ALLOCATION by source-IP reputation but binds a live box to the SSH KEY:
+#   ALLOC_SSH — the ONE `ssh railway.new` that creates the box — MUST exit via a clean IP (CF ECH proxy), or
+#               Railway refuses ("Anonymous visitors are limited").
+#   SSH       — every call AFTER the box exists (install, scp, TUI, reconnect) — the box is bound to our key,
+#               so it is reachable from ANY IP. Direct is faster + needs no proxy.
+# Algorithm options randomize the HASSH fingerprint per box (bound per-VM above).
+ALLOC_SSH=(ssh -i "$KEYDIR/id" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new
      -o "UserKnownHostsFile=$KEYDIR/known_hosts" -o "ProxyCommand=nc -X 5 -x $PROXY %h %p" -o ConnectTimeout=30
      "${ALGO_OPTS[@]}")
+SSH=(ssh -i "$KEYDIR/id" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new
+     -o "UserKnownHostsFile=$KEYDIR/known_hosts" -o ConnectTimeout=30 "${ALGO_OPTS[@]}")
 
-echo "== allocate + install (tmux, agenthop, mcp config with the scoped team) =="
-# The mcp.json carries the AGENTHOP env — Claude Code does NOT pass the parent env to MCP servers, so the team
-# must be set here or the node joins teamless (invisible cross-machine). This was the discovery-failure bug.
-"${SSH[@]}" railway.new "
-  apt-get install -y tmux >/dev/null 2>&1 || (apt-get update -qq >/dev/null 2>&1 && apt-get install -y tmux >/dev/null 2>&1)
-  curl -sL -o /tmp/agenthop '$URL' && chmod +x /tmp/agenthop
-  printf '%s' '{\"mcpServers\":{\"agenthop\":{\"command\":\"/tmp/agenthop\",\"args\":[\"mcp\"],\"env\":{\"AGENTHOP_TEAM\":\"$TEAM\",\"AGENTHOP_RELAY\":\"$RELAY\",\"AGENTHOP_NO_CODEX\":\"1\",\"AGENTHOP_TITLE\":\"$TITLE\"}}}}' > /tmp/ah-mcp.json
-  echo setup-ok
-" 2>&1 | grep -vi 'human_claim_url\|trial_starting\|preview_url' | tail -3
+if [ -z "$REUSED" ]; then
+  # Allocation is the ONLY step that must exit via a clean IP (proxy). Keep it minimal — a bare command — so the
+  # ~30MB binary download does NOT crawl through the WS tunnel; that happens on the direct install below.
+  echo "== allocate NEW box (via proxy, minimal) =="
+  ALLOC_OUT="$("${ALLOC_SSH[@]}" railway.new 'echo alloc-ok' 2>&1 || true)"
+  echo "$ALLOC_OUT" | grep -vi 'human_claim_url\|trial_starting\|preview_url' | tail -2 || true
+  if ! echo "$ALLOC_OUT" | grep -q alloc-ok; then
+    echo "ALLOC FAILED for $LID (proxy $PROXY) — box not created; not stamping reuse window." >&2
+    exit 3
+  fi
+  date +%s > "$KEYDIR/alloc-ts"   # box confirmed live: start the reuse window from here
 
-echo "== launch persistent $TOOL TUI in tmux (bypass perms, CPA, model=$MODEL) =="
+  # Install direct — the box is now bound to our key, reachable from any IP, and direct is far faster than SOCKS.
+  # The mcp.json carries the AGENTHOP env — Claude Code does NOT pass the parent env to MCP servers, so the team
+  # must be set here or the node joins teamless (invisible cross-machine). This was the discovery-failure bug.
+  echo "== install (direct: tmux, agenthop, mcp config with the scoped team) =="
+  "${SSH[@]}" railway.new "
+    apt-get install -y tmux >/dev/null 2>&1 || (apt-get update -qq >/dev/null 2>&1 && apt-get install -y tmux >/dev/null 2>&1)
+    curl -sL -o /tmp/agenthop '$URL' && chmod +x /tmp/agenthop
+    printf '%s' '{\"mcpServers\":{\"agenthop\":{\"command\":\"/tmp/agenthop\",\"args\":[\"mcp\"],\"env\":{\"AGENTHOP_TEAM\":\"$TEAM\",\"AGENTHOP_RELAY\":\"$RELAY\",\"AGENTHOP_NO_CODEX\":\"1\",\"AGENTHOP_TITLE\":\"$TITLE\"}}}}' > /tmp/ah-mcp.json
+    echo setup-ok
+  " 2>&1 | grep -vi 'human_claim_url\|trial_starting\|preview_url' | tail -3 || true
+else
+  echo "== reuse: skip allocation + install (box already provisioned) =="
+fi
+
+# On reuse, a still-running `swarm` tmux session is already warm (MCP joined, discovery done) — the whole point
+# of persistence. Keep it; relaunching would throw the warmup away. Only launch when there is no warm TUI.
+WARM=""
+if [ -n "$REUSED" ] && "${SSH[@]}" railway.new 'tmux has-session -t swarm 2>/dev/null && echo __warm__' 2>/dev/null | grep -q __warm__; then
+  WARM=1; echo "== reuse warm TUI (swarm session already running — warmup preserved) =="
+else
+  echo "== launch persistent $TOOL TUI in tmux (bypass perms, CPA, model=$MODEL) =="
+fi
 # THEORETICAL-FASTEST per-task: after warmup (discovery + MCP-join paid ONCE by staying persistent), the only
 # remaining per-task cost is model turns. The worker must reply in ONE turn — answer + a single agenthop_send to
 # the sender (whose handle is in the message's from=), with NO agenthop_peers lookup. This system prompt enforces
 # that; it cut the earlier 3-tool-call dance to 1. (Delivery is push, so it is already near-instant.)
 SYS='You are a persistent swarm worker on the agenthop bus. When a task arrives as a cross-session bus message, do it and reply to the SENDER with a SINGLE agenthop_send call (the sender handle is the message from= attribute) in ONE turn. Never call agenthop_peers — you already have the sender. Keep replies concise, no preamble.'
 # claude path (proven). codex/opencode use their own flags for model + MCP (same pattern; fill when tested).
-if [ "$TOOL" = "claude" ]; then
+if [ -n "$WARM" ]; then
+  :  # warm TUI kept above; nothing to launch
+elif [ "$TOOL" = "claude" ]; then
   "${SSH[@]}" railway.new "
     tmux kill-session -t swarm 2>/dev/null || true; sleep 1
     tmux new-session -d -s swarm -x 200 -y 50 \
@@ -99,7 +162,7 @@ if [ "$TOOL" = "claude" ]; then
     tmux send-keys -t swarm Down; sleep 0.5; tmux send-keys -t swarm Enter   # accept bypass mode
     sleep 8
     tmux capture-pane -t swarm -p | grep -iE 'bypass permissions on' | tail -1
-  " 2>&1 | grep -vi 'human_claim_url\|trial_starting\|preview_url' | tail -3
+  " 2>&1 | grep -vi 'human_claim_url\|trial_starting\|preview_url' | tail -3 || true
 else
   echo "NOTE: $TOOL launch not yet implemented in this script (claude is proven). Same pattern: install agenthop," \
        "write the tool's MCP config with the scoped team env, launch its TUI with --model $MODEL repointed at CPA." >&2
