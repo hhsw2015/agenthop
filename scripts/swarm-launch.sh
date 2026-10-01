@@ -16,6 +16,7 @@ RELAY="${AGENTHOP_RELAY:-https://agenthop.imatrix.tech}"
 CPA="${AGENTHOP_CPA_BASE:-https://headroom.geeker.indevs.in}"
 REPO="${AGENTHOP_REPO:-hhsw2015/agenthop}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$HERE"
 
 # Per-tool default model (user-set): claude/opencode -> OPUS 4.8; codex -> gpt-6-astra.
 case "$TOOL" in
@@ -34,7 +35,7 @@ echo "launch $LID  tool=$TOOL  model=$MODEL  title=$TITLE"
 
 # Latest release binary for the box (linux-x64) + the CPA eph token (sub = launchId), minted on the dispatcher.
 URL="https://github.com/$REPO/releases/latest/download/agenthop-linux-x64"
-TOKEN="$(npx --prefix "$HERE" tsx "$HERE/scripts/cpa-mint.ts" --sub "$LID" --ttl 3600)"
+TOKEN="$(npx tsx "$HERE/scripts/cpa-mint.ts" --sub "$LID" --ttl 3600)"
 
 # Isolated-key ssh through the proxy so Railway sees a chosen egress IP (per-IP anonymous limit).
 SSH=(ssh -i "$KEYDIR/id" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new
@@ -78,7 +79,7 @@ fi
 echo "== self-verify: worker on the bus? (persistent discovery can take up to ~90s cold) =="
 # A single short-lived check (not a loop of ephemeral nodes — those churn the directory keeper and slow discovery).
 if env -u CLAUDE_CODE_MESSAGING_SOCKET AGENTHOP_TEAM="$TEAM" AGENTHOP_NO_CODEX=1 AH_HOME="/tmp/ah-verify-$LID" \
-     npx --prefix "$HERE" tsx "$HERE/scripts/swarm-peer-check.ts" 100 2>&1 | grep -q "PEER: $TITLE"; then
+     npx tsx "$HERE/scripts/swarm-peer-check.ts" 100 2>&1 | grep -q "PEER: $TITLE"; then
   echo "READY: worker $TITLE is on the bus (team=$TEAM). Send it tasks from a dispatcher on the SAME team."
 else
   echo "NOT READY: $TITLE did not appear on the bus within the window. Check the box TUI (tmux capture-pane -t swarm)." >&2
