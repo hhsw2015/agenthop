@@ -1,5 +1,5 @@
 import { hkdfSync } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { isRoomAddress, normalizeCode, relayEndpoints, WORDLIST } from "@agenthop/tunnel";
@@ -150,35 +150,67 @@ export function mergePresence(prev: RemotePeer | undefined, next: RemotePeer): R
 }
 
 /**
- * A per-INSTANCE epoch that is MONOTONIC across restarts even when the wall clock regresses. `Date.now()`
- * alone is NOT enough: an NTP step-back, a VM/snapshot restore, or a bad RTC can make a restarted instance's
- * clock lower than the one a remote still remembers, and mergePresence's epoch gate then rejects the new
- * instance FOREVER (a lower epoch loses at the gate; ts/rev catching up never helps, and the remote's `seen`
+ * A per-INSTANCE epoch that is MONOTONIC across restarts AND across concurrent local starts. `Date.now()`
+ * alone is NOT enough: an NTP step-back, a VM/snapshot restore, or a skewed microVM clock can make a restarted
+ * instance's clock lower than the one a remote still remembers, and mergePresence's epoch gate then rejects the
+ * new instance FOREVER (a lower epoch loses at the gate; ts/rev catching up never helps, and the remote's `seen`
  * watermark is only TTL-filtered, never deleted) — the peer silently drops at TTL and never comes back until
- * some instance finally lands a higher epoch. Persisting `max(now, last+1)` makes each successive instance
- * strictly greater than every prior one on this machine, so a clock rollback can no longer strand a peer.
+ * some instance finally lands a higher epoch.
  *
- * A single shared counter per home is enough: the epoch only has to order restarts of the SAME identity, and
- * those are sequential (old process exits, new one starts → sequential read-then-write → strictly increasing).
- * Two DIFFERENT identities starting at the same ms may read the same `last` and collide on one value, but that
- * is harmless — equal epochs skip the epoch gate and fall through to the per-identity axes. Exported for tests.
+ * Implemented as a filename-encoded max-register (the same lock-free shape as statusfile.ts's status register):
+ * each allocation reads the MAX value over the files already in `<home>/.agenthop/epoch/`, computes
+ * `max(now, maxSeen+1)`, and CREATES its own immutable file named by that value via O_EXCL (retrying one higher
+ * on a name clash). Because the value lives in the FILENAME (never in rewritten content) and files are
+ * create-only, the two races a single rewritten counter has are gone by construction: (a) no 0-byte truncation
+ * window to read empty from — we read directory NAMES, not content; and (b) no shared file a stalled writer can
+ * overwrite BELOW a high-water mark another writer already published — a late create only ADDS a low name, it
+ * cannot lower the max. The on-disk max is therefore provably non-decreasing, so no restart (even one whose
+ * clock regressed) can ever allocate an epoch at or below a prior instance's. Lower files are pruned best-effort
+ * once a higher one is in place (never the max), so the dir stays ~1 file. Exported for tests.
+ *
+ * Degraded ONLY when `<home>/.agenthop/epoch` can't be created/written (a read-only home — a node with bigger
+ * problems): it falls back to the bare clock, which under a rollback could still strand. Recorded, accepted.
  */
 export function nextInstanceEpoch(home: string = process.env.HOME || homedir()): number {
-  const file = path.join(home, ".agenthop", "dir-epoch");
-  let last = 0;
+  const dir = path.join(home, ".agenthop", "epoch");
+  const maxSeen = (): number => {
+    let max = 0;
+    try {
+      for (const name of readdirSync(dir)) {
+        const n = Number(name);
+        if (Number.isSafeInteger(n) && n > max) max = n;
+      }
+    } catch {
+      // dir not created yet — no prior epoch on this machine
+    }
+    return max;
+  };
   try {
-    last = Number.parseInt(readFileSync(file, "utf8"), 10) || 0;
+    mkdirSync(dir, { recursive: true });
   } catch {
-    // first run / unreadable — start from the clock
+    return Date.now(); // read-only home: degrade to the bare clock (documented)
   }
-  const epoch = Math.max(Date.now(), last + 1);
-  try {
-    mkdirSync(path.dirname(file), { recursive: true });
-    writeFileSync(file, String(epoch));
-  } catch {
-    // read-only home: use the in-memory value (degraded — a later rollback could still strand this peer)
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    const candidate = Math.max(Date.now(), maxSeen() + 1);
+    try {
+      writeFileSync(path.join(dir, String(candidate)), "", { flag: "wx" }); // O_EXCL: fail if the name exists
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "EEXIST") continue; // raced a same-value allocator — re-read and bump
+      return Date.now(); // other I/O error: degrade to the bare clock (documented)
+    }
+    // Our file is now the on-disk max; drop strictly-lower leftovers so the dir doesn't grow without bound. Safe
+    // under concurrency: we only ever remove names BELOW ours, never the max, so no reader can regress.
+    try {
+      for (const name of readdirSync(dir)) {
+        const n = Number(name);
+        if (Number.isSafeInteger(n) && n < candidate) rmSync(path.join(dir, name), { force: true });
+      }
+    } catch {
+      // harmless clutter — the next allocation still reads the true max
+    }
+    return candidate;
   }
-  return epoch;
+  return Date.now(); // pathological contention: degrade (documented)
 }
 
 export function startDirectory(options: DirectoryOptions): Directory {

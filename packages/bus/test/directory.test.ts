@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "vitest";
@@ -132,16 +132,25 @@ test("a late lower-seq announce at the same ts keeps the status watermark (P2-6)
   expect(merged.statusSeq).toBe(2);
 });
 
-test("nextInstanceEpoch is strictly increasing across restarts even when the wall clock would not advance (P2 clock-rollback)", () => {
+test("nextInstanceEpoch is strictly increasing even for restarts within the same ms (filename max-register)", () => {
   const home = mkdtempSync(path.join(tmpdir(), "ah-epoch-"));
   const e1 = nextInstanceEpoch(home);
   const e2 = nextInstanceEpoch(home);
-  expect(e2).toBeGreaterThan(e1); // two restarts within the same ms still advance (persisted last+1)
-  // Simulate a clock that jumped FAR into the future for a prior instance, then rolled back: the persisted
-  // high-water mark must still win, so the epoch gate can never reject the restarted instance.
-  const future = e2 + 1_000_000;
-  writeFileSync(path.join(home, ".agenthop", "dir-epoch"), String(future));
-  expect(nextInstanceEpoch(home)).toBeGreaterThan(future);
+  const e3 = nextInstanceEpoch(home);
+  expect(e2).toBeGreaterThan(e1); // max(now, maxSeen+1) advances even when the clock does not
+  expect(e3).toBeGreaterThan(e2);
+});
+
+test("nextInstanceEpoch never allocates at/below a published high-water mark — a stale low file or clock rollback can't strand a restart (P2 concurrent)", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "ah-epoch-"));
+  const dir = path.join(home, ".agenthop", "epoch");
+  mkdirSync(dir, { recursive: true });
+  const high = Date.now() + 5_000_000; // a prior instance whose (skewed) clock ran far ahead
+  writeFileSync(path.join(dir, String(high)), "");
+  writeFileSync(path.join(dir, String(high - 1000)), ""); // a stale LOW create landing after the high mark
+  // Reads the true max over filenames, so neither the lower file nor a now-regressed clock can produce a
+  // value <= high (which the epoch gate would reject forever).
+  expect(nextInstanceEpoch(home)).toBeGreaterThan(high);
 });
 
 test("capStatusText truncates an oversized note so a sealed presence can't exceed the relay limit (P3)", () => {
