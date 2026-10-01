@@ -101,10 +101,14 @@ export function readStatusFile(home: string, key: string): StatusFile | undefine
  * The SEQ only APPROXIMATES the event time: it is sampled as early as a self-reported hook can — in the
  * hook shell, passed as --seq (see installClaudeStatusHooks; a manual/degraded run falls back to
  * report-status's own start time). It is NOT the kernel-level event instant: a hook shell scheduled out
- * before it samples can still carry a later seq than a strictly-later event, so ordering is best-effort, not
- * total. The reader's per-identity monotonic guard, the ~1s re-read, and the next turn-boundary event
- * re-settle any transient inversion; the only unrecovered residual is a session whose VERY LAST event is a
- * reordered one (the same class herdr absorbs with debounce). Returns false only on invalid input or I/O.
+ * before it samples can carry a LATER seq than a strictly-later event, so ordering is best-effort, not total.
+ * ACCEPTED LIMIT (not self-healing): when that happens the higher-seq but semantically-older value wins and
+ * PERSISTS — the ~1s poll only re-reads the current MAX, it does not reorder, so the wrong value stands until
+ * a genuinely newer event (higher seq) arrives; and a waitForStatus that already returned `reached` on it is
+ * never retracted. This is not limited to a session's last event — any reordered pair where the stale side
+ * got the higher seq is affected. It is the inherent cost of self-reported hooks without a kernel event
+ * timestamp (the class herdr absorbs with debounce), recorded as accepted risk. Returns false on invalid
+ * input or I/O.
  */
 export function writeStatusFile(home: string, key: string, state: string, opts?: { seq?: number; text?: string }): boolean {
   if (!STATES.has(state)) return false;
