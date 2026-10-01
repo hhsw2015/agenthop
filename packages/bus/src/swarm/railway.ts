@@ -52,6 +52,17 @@ export function genKeyArgv(launchId: string): { argv: string[]; keyPath: string;
   return { argv: ["-t", "ed25519", "-f", keyPath, "-N", "", "-q"], keyPath, knownHostsPath: path.join(dir, "known_hosts") };
 }
 
+/**
+ * Optional SOCKS5 proxy for ssh/scp so Railway sees a chosen egress IP (the per-IP anonymous limit is per source
+ * IP). AGENTHOP_SSH_PROXY = "host:port" or "socks5://host:port" (e.g. 127.0.0.1:10808). Uses nc's SOCKS5 support.
+ */
+export function proxyOpts(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env.AGENTHOP_SSH_PROXY?.trim();
+  if (!raw) return [];
+  const hostPort = raw.replace(/^socks5?:\/\//i, "");
+  return ["-o", `ProxyCommand=nc -X 5 -x ${hostPort} %h %p`];
+}
+
 /** The isolated-key ssh options (per railway-ephemeral-vm.md) — never touch the user's agent/known_hosts. */
 function isolatedKeyOpts(keyPath: string, knownHostsPath: string): string[] {
   return [
@@ -60,6 +71,7 @@ function isolatedKeyOpts(keyPath: string, knownHostsPath: string): string[] {
     "-o", "IdentityAgent=none",
     "-o", "StrictHostKeyChecking=accept-new",
     "-o", `UserKnownHostsFile=${knownHostsPath}`,
+    ...proxyOpts(),
   ];
 }
 
@@ -111,7 +123,8 @@ export function buildVmBootstrap(o: VmBootstrapInput): string {
     TELEMETRY_STRIP,
     ...env,
     // Capture output (and errors) but never abort before reporting — the box must always post SOMETHING back.
-    `_ahout=$(${runCmd} 2>&1 || true)`,
+    // `< /dev/null` so the headless CLI never blocks waiting on stdin (claude -p warns + stalls ~3s otherwise).
+    `_ahout=$(${runCmd} < /dev/null 2>&1 || true)`,
     `printf '%s' "$_ahout" | node ${shquote(o.reportPath)} --code ${shquote(o.roomCode)} --key ${shquote(o.keyHex)} --relay ${shquote(o.relay)}`,
   ].join("\n");
 }
