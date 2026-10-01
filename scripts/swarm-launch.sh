@@ -49,11 +49,20 @@ PROFILES=(
   "KexAlgorithms=curve25519-sha256,ecdh-sha2-nistp256 Ciphers=aes128-ctr,aes192-ctr,aes256-ctr MACs=hmac-sha2-256"
   "KexAlgorithms=diffie-hellman-group14-sha256,diffie-hellman-group16-sha512 Ciphers=aes256-ctr,aes192-ctr MACs=hmac-sha2-512"
 )
-PROF="${PROFILES[$((RANDOM % ${#PROFILES[@]}))]}"
+# The profile is per-VM (per launchId), NOT per-connection: once a box is allocated with profile X, every
+# reconnect uses X. A mid-session HASSH change on the same key is MORE suspicious than a consistent one.
+# Persist alongside the throwaway key so reuse reads it back.
+PROF_FILE="$KEYDIR/hassh-profile"
+if [ -f "$PROF_FILE" ]; then
+  PROF="$(cat "$PROF_FILE")"
+else
+  PROF="${PROFILES[$((RANDOM % ${#PROFILES[@]}))]}"
+  printf '%s' "$PROF" > "$PROF_FILE"
+fi
 # Parse "Key=Value Key=Value" into -o flags.
 ALGO_OPTS=()
 for kv in $PROF; do ALGO_OPTS+=(-o "$kv"); done
-echo "hassh profile: $PROF"
+echo "hassh profile: $PROF (bound to $LID)"
 
 # Isolated-key ssh through the proxy so Railway sees a chosen egress IP (per-IP anonymous limit).
 # Algorithm options randomize the HASSH fingerprint per launch.
