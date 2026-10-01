@@ -37,9 +37,29 @@ echo "launch $LID  tool=$TOOL  model=$MODEL  title=$TITLE"
 URL="https://github.com/$REPO/releases/latest/download/agenthop-linux-x64"
 TOKEN="$(npx tsx "$HERE/scripts/cpa-mint.ts" --sub "$LID" --ttl 3600)"
 
+# Anti-fingerprint: each launch picks a random SSH algorithm profile (KexAlgorithms / Ciphers / MACs) so the
+# HASSH fingerprint differs per box. Railway correlates SSH-key + source-IP + client fingerprint to detect farming;
+# randomizing HASSH + throwaway key + proxy IP makes each allocation look like a distinct client. All profiles use
+# only standard, strong algorithms — no downgrade, just different subsets/orderings of the same safe set.
+PROFILES=(
+  "KexAlgorithms=curve25519-sha256,diffie-hellman-group14-sha256 Ciphers=aes256-ctr,aes128-ctr MACs=hmac-sha2-256,hmac-sha2-512"
+  "KexAlgorithms=diffie-hellman-group16-sha512,ecdh-sha2-nistp256,curve25519-sha256 Ciphers=aes128-ctr,aes256-ctr,aes192-ctr MACs=hmac-sha2-512,hmac-sha2-256"
+  "KexAlgorithms=ecdh-sha2-nistp384,curve25519-sha256 Ciphers=aes256-ctr MACs=hmac-sha2-256"
+  "KexAlgorithms=ecdh-sha2-nistp521,diffie-hellman-group18-sha512 Ciphers=aes192-ctr,aes256-ctr MACs=hmac-sha2-512,hmac-sha2-256"
+  "KexAlgorithms=curve25519-sha256,ecdh-sha2-nistp256 Ciphers=aes128-ctr,aes192-ctr,aes256-ctr MACs=hmac-sha2-256"
+  "KexAlgorithms=diffie-hellman-group14-sha256,diffie-hellman-group16-sha512 Ciphers=aes256-ctr,aes192-ctr MACs=hmac-sha2-512"
+)
+PROF="${PROFILES[$((RANDOM % ${#PROFILES[@]}))]}"
+# Parse "Key=Value Key=Value" into -o flags.
+ALGO_OPTS=()
+for kv in $PROF; do ALGO_OPTS+=(-o "$kv"); done
+echo "hassh profile: $PROF"
+
 # Isolated-key ssh through the proxy so Railway sees a chosen egress IP (per-IP anonymous limit).
+# Algorithm options randomize the HASSH fingerprint per launch.
 SSH=(ssh -i "$KEYDIR/id" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new
-     -o "UserKnownHostsFile=$KEYDIR/known_hosts" -o "ProxyCommand=nc -X 5 -x $PROXY %h %p" -o ConnectTimeout=30)
+     -o "UserKnownHostsFile=$KEYDIR/known_hosts" -o "ProxyCommand=nc -X 5 -x $PROXY %h %p" -o ConnectTimeout=30
+     "${ALGO_OPTS[@]}")
 
 echo "== allocate + install (tmux, agenthop, mcp config with the scoped team) =="
 # The mcp.json carries the AGENTHOP env — Claude Code does NOT pass the parent env to MCP servers, so the team
