@@ -172,8 +172,10 @@ export function mergePresence(prev: RemotePeer | undefined, next: RemotePeer): R
  * read, a write errors, the contention budget is exhausted, or the numeric ceiling is hit, we OMIT the epoch
  * rather than publish one that might sit BELOW a watermark we failed to see. The announce then carries no epoch
  * and mergePresence falls back to rev/ts — this avoids the PERMANENT low-epoch gate-lock; recovery is then paced
- * by rev catch-up (bounded by the prior rev gap, NOT instant). So every NON-undefined return is strictly greater
- * than any prior instance's epoch — the allocator yields a provably-monotonic value or omits it entirely.
+ * by rev catch-up (bounded by the prior rev gap, NOT instant). The guarantee is scoped to what the epoch gate
+ * needs: the on-disk max never decreases, and a SAME-IDENTITY restart never allocates at/below its OWN prior
+ * epoch. It is NOT a global order across concurrent DIFFERENT-identity allocations (a late one may return a lower
+ * value — fine, mergePresence compares those by the identity gate, not epoch). Allocate such a value, or omit.
  */
 export function nextInstanceEpoch(home: string = process.env.HOME || homedir()): number | undefined {
   const dir = path.join(home, ".agenthop", "epoch");
