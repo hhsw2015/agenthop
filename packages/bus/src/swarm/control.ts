@@ -49,6 +49,9 @@ export type ControlRecord = {
   sha?: string;
   /** Opaque manifest ref/summary describing the recoverable artifact set at `sha`. */
   manifest?: string;
+  /** Monotonic checkpoint sequence from the box supervisor. A receipt advances CONTROL only when its seq exceeds
+   *  this, so a replayed/older receipt can never roll `sha` back (Codex impl-review bug 2). */
+  lastSeq?: number;
   /** Dispatcher instance id holding the claim (CLAIMED/ALLOCATING). */
   owner?: string;
   /** Epoch seconds the claim lease expires; past it, another dispatcher may reclaim. */
@@ -75,16 +78,20 @@ export type ControlRecord = {
 };
 
 export type ControlEvent =
-  | { type: "milestone"; sha: string; manifest?: string }
+  | { type: "milestone"; sha: string; seq: number; manifest?: string }
   | { type: "drain" }
-  | { type: "checkpoint"; sha: string; manifest?: string }
+  | { type: "checkpoint"; sha: string; seq: number; manifest?: string }
   | { type: "claim"; owner: string; generation: number; leaseUntil: number }
   | { type: "reclaim"; owner: string; generation: number; leaseUntil: number }
   | { type: "allocating"; attempt: string }
   | { type: "alloc_unknown" }
+  // reconcile a reclaimed in-flight allocation: its box was found DEAD (clear the attempt, allocate fresh) or ALIVE
+  // (adopt it as the successor — sha-checked — and move to RESUMED).
+  | { type: "reconcile_dead" }
+  | { type: "reconcile_alive"; successor: string; sha: string }
   | { type: "resumed"; successor: string; sha: string; generation: number; attempt: string }
   | { type: "retire" }
-  | { type: "done"; sha: string }
+  | { type: "done"; sha: string; seq: number }
   | { type: "expire"; lastConfirmedSha?: string };
 
 export type AdvanceResult = { ok: true; record: ControlRecord } | { ok: false; error: string };
@@ -136,17 +143,20 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
 
   if (FROZEN.has(record.state)) return bad(`state ${record.state} is terminal and accepts no events`);
 
+  const seqOf = (r: ControlRecord): number => r.lastSeq ?? 0;
   switch (event.type) {
     case "milestone":
       if (record.state !== "RUNNING") return bad(`milestone only in RUNNING, not ${record.state}`);
-      return ok({ sha: event.sha, manifest: event.manifest ?? record.manifest });
+      if (event.seq <= seqOf(record)) return bad(`stale milestone seq ${event.seq} <= ${seqOf(record)}`); // no rollback
+      return ok({ sha: event.sha, lastSeq: event.seq, manifest: event.manifest ?? record.manifest });
     case "drain":
       if (record.state === "DRAINING") return ok({}); // idempotent
       if (record.state !== "RUNNING") return bad(`drain only from RUNNING, not ${record.state}`);
       return ok({ state: "DRAINING" });
     case "checkpoint":
       if (record.state !== "DRAINING") return bad(`final checkpoint only from DRAINING, not ${record.state}`);
-      return ok({ state: "CHECKPOINTED", sha: event.sha, manifest: event.manifest ?? record.manifest });
+      if (event.seq <= seqOf(record)) return bad(`stale checkpoint seq ${event.seq} <= ${seqOf(record)}`);
+      return ok({ state: "CHECKPOINTED", sha: event.sha, lastSeq: event.seq, manifest: event.manifest ?? record.manifest });
     case "claim":
       if (record.state !== "CHECKPOINTED" && record.state !== "EXPIRED")
         return bad(`claim only from CHECKPOINTED/EXPIRED, not ${record.state}`);
@@ -161,25 +171,42 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
     }
     case "allocating":
       if (record.state !== "CLAIMED") return bad(`allocating only from CLAIMED, not ${record.state}`);
+      if (record.attempt !== undefined) return bad("allocating blocked: a prior in-flight attempt must be reconciled first");
       if (allocExhausted(record)) return bad(`allocation attempt cap (${MAX_ALLOC_ATTEMPTS}) reached`);
       return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false });
     case "alloc_unknown":
       // Allocation request sent, result unknown. Stay ALLOCATING; mark it so a reclaimer reconciles this attempt.
       if (record.state !== "ALLOCATING") return bad(`alloc_unknown only from ALLOCATING, not ${record.state}`);
       return ok({ resultUnknown: true });
-    case "resumed":
+    case "reconcile_dead":
+      // Reconcile found the in-flight allocation's box DEAD: clear the attempt so a fresh allocate can proceed.
+      if (record.state !== "CLAIMED" || record.attempt === undefined) return bad(`reconcile_dead needs CLAIMED with an attempt, not ${record.state}`);
+      return ok({ attempt: undefined, resultUnknown: false });
+    case "reconcile_alive": {
+      // Reconcile found the box ALIVE: adopt it as the successor (sha-checked), move straight to RESUMED.
+      if (record.state !== "CLAIMED" || record.attempt === undefined) return bad(`reconcile_alive needs CLAIMED with an attempt, not ${record.state}`);
+      const expected = record.sha ?? record.lastConfirmedSha;
+      if (expected !== undefined && event.sha !== expected) return bad(`reconcile_alive sha ${event.sha} != expected ${expected}`);
+      return ok({ state: "RESUMED", successor: event.successor, sha: event.sha });
+    }
+    case "resumed": {
       if (record.state !== "ALLOCATING") return bad(`resumed only from ALLOCATING, not ${record.state}`);
-      // Reject a stale successor's ACK: it must match the CURRENT generation AND the CURRENT attempt.
+      // Reject a stale successor's ACK: it must match the CURRENT generation AND the CURRENT attempt...
       if (event.generation !== record.generation) return bad(`resumed generation ${event.generation} != ${record.generation}`);
       if (event.attempt !== record.attempt) return bad(`resumed attempt ${event.attempt} != ${record.attempt}`);
+      // ...and it must have resumed from the EXACT checkpoint we handed off (Codex impl-review bug 3).
+      const expected = record.sha ?? record.lastConfirmedSha;
+      if (expected !== undefined && event.sha !== expected) return bad(`resumed sha ${event.sha} != expected ${expected}`);
       return ok({ state: "RESUMED", successor: event.successor, sha: event.sha });
+    }
     case "retire":
       if (record.state !== "RESUMED") return bad(`retire only from RESUMED, not ${record.state}`);
       return ok({ state: "RETIRED" });
     case "done":
       if (record.state !== "RUNNING" && record.state !== "DRAINING" && record.state !== "CHECKPOINTED")
         return bad(`done only from RUNNING/DRAINING/CHECKPOINTED, not ${record.state}`);
-      return ok({ state: "DONE", sha: event.sha });
+      if (event.seq <= seqOf(record)) return bad(`stale done seq ${event.seq} <= ${seqOf(record)}`);
+      return ok({ state: "DONE", sha: event.sha, lastSeq: event.seq });
     case "expire":
       // Any non-frozen state can expire (box died). Preserve the last confirmed sha for successor allocation.
       return ok({ state: "EXPIRED", lastConfirmedSha: event.lastConfirmedSha ?? record.sha });
@@ -229,11 +256,12 @@ export function nextAction(record: ControlRecord, nowSec: number, ctx: DispatchC
         if (allocExhausted(record)) return "give_up";
         return "allocate";
       }
-      if (leaseExpired(record, nowSec)) return slotFree ? "reclaim" : "none";
+      // Reclaim takes over an ALREADY-counted reservation — it does NOT consume a new slot, so it is NOT cap-gated.
+      if (leaseExpired(record, nowSec)) return "reclaim";
       return "none"; // held by someone else with a valid lease
     case "ALLOCATING":
       if (record.owner === ctx.self && !leaseExpired(record, nowSec)) return "await_resume";
-      if (leaseExpired(record, nowSec)) return slotFree ? "reclaim" : "none";
+      if (leaseExpired(record, nowSec)) return "reclaim";
       return "none";
     case "RESUMED":
       return "retire_predecessor"; // successor confirmed; safe to retire+scrub the old box

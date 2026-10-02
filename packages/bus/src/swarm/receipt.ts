@@ -22,6 +22,9 @@ export type Receipt = {
   generation: number;
   /** Stable id for this checkpoint request; the SAME requestId retried must carry the SAME sha (idempotency). */
   requestId: string;
+  /** Monotonic sequence from the box supervisor (persisted across its restarts). CONTROL advances only on
+   *  seq > lastSeq, so a replayed/older receipt can NEVER roll a confirmed sha back (Codex impl-review bug 2). */
+  seq: number;
   kind: ReceiptKind;
   /** The confirmed remote artifact sha (git commit). Required and non-empty — a receipt without it is meaningless. */
   sha: string;
@@ -41,6 +44,7 @@ export function encodeReceipt(r: Receipt): string {
     launchId: r.launchId,
     generation: r.generation,
     requestId: r.requestId,
+    seq: r.seq,
     kind: r.kind,
     sha: r.sha,
     ...(r.manifest !== undefined ? { manifest: r.manifest } : {}),
@@ -63,6 +67,7 @@ export function parseReceipt(text: string): Receipt | null {
   if (typeof o.launchId !== "string" || !o.launchId) return null;
   if (typeof o.generation !== "number" || !Number.isInteger(o.generation) || o.generation < 0) return null;
   if (typeof o.requestId !== "string" || !o.requestId) return null;
+  if (typeof o.seq !== "number" || !Number.isInteger(o.seq) || o.seq < 1) return null;
   if (typeof o.kind !== "string" || !KINDS.has(o.kind)) return null;
   if (typeof o.sha !== "string" || !SHA_RE.test(o.sha)) return null;
   if (o.manifest !== undefined && typeof o.manifest !== "string") return null;
@@ -71,6 +76,7 @@ export function parseReceipt(text: string): Receipt | null {
     launchId: o.launchId,
     generation: o.generation,
     requestId: o.requestId,
+    seq: o.seq,
     kind: o.kind as ReceiptKind,
     sha: o.sha,
     manifest: o.manifest as string | undefined,
@@ -109,22 +115,29 @@ export function receiptToEvent(record: ControlRecord, receipt: Receipt): Receipt
   const acc = receiptAcceptable(record, receipt);
   if (!acc.accept) return { kind: "reject", reason: acc.reason };
 
+  const lastSeq = record.lastSeq ?? 0;
+  // Exact replay of the already-applied checkpoint: idempotent no-op.
+  const isExactReplay = receipt.seq === lastSeq && receipt.sha === record.sha;
+  // Any seq <= lastSeq that is NOT the exact replay is a rollback/conflict attempt — reject, never apply.
+  const isStale = receipt.seq <= lastSeq;
+
   switch (receipt.kind) {
     case "milestone":
       if (record.state !== "RUNNING") return { kind: "reject", reason: `milestone receipt but state is ${record.state}` };
-      if (record.sha === receipt.sha) return { kind: "duplicate" }; // same confirmed sha already recorded
-      return { kind: "advance", event: { type: "milestone", sha: receipt.sha, manifest: receipt.manifest } };
+      if (isExactReplay) return { kind: "duplicate" };
+      if (isStale) return { kind: "reject", reason: `stale/rollback milestone seq ${receipt.seq} <= ${lastSeq}` };
+      return { kind: "advance", event: { type: "milestone", sha: receipt.sha, seq: receipt.seq, manifest: receipt.manifest } };
     case "final":
-      // A final checkpoint is only valid once the box has drained. If a final receipt arrives while still RUNNING,
-      // the box drained-and-checkpointed in one step from its side; require the drain first (reject, let it retry
-      // after emitting drain) so the state chain stays honest.
-      if (record.state === "CHECKPOINTED" && record.sha === receipt.sha) return { kind: "duplicate" };
+      if (record.state === "CHECKPOINTED" && isExactReplay) return { kind: "duplicate" };
       if (record.state !== "DRAINING") return { kind: "reject", reason: `final receipt but state is ${record.state} (need DRAINING)` };
-      return { kind: "advance", event: { type: "checkpoint", sha: receipt.sha, manifest: receipt.manifest } };
+      if (isStale) return { kind: "reject", reason: `stale/rollback final seq ${receipt.seq} <= ${lastSeq}` };
+      return { kind: "advance", event: { type: "checkpoint", sha: receipt.sha, seq: receipt.seq, manifest: receipt.manifest } };
     case "done":
-      if (record.state === "DONE") return { kind: "duplicate" };
+      if (record.state === "DONE" && isExactReplay) return { kind: "duplicate" };
+      if (record.state === "DONE") return { kind: "reject", reason: "conflicting done receipt" };
       if (record.state !== "RUNNING" && record.state !== "DRAINING" && record.state !== "CHECKPOINTED")
         return { kind: "reject", reason: `done receipt but state is ${record.state}` };
-      return { kind: "advance", event: { type: "done", sha: receipt.sha } };
+      if (isStale) return { kind: "reject", reason: `stale/rollback done seq ${receipt.seq} <= ${lastSeq}` };
+      return { kind: "advance", event: { type: "done", sha: receipt.sha, seq: receipt.seq } };
   }
 }

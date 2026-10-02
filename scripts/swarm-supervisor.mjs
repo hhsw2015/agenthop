@@ -37,7 +37,22 @@ const POLL_MS = 5000;
 
 const REQ_FILE = path.join(RUNTIME_DIR, "milestone.req"); // worker writes {requestId, manifest}
 const ACK_FILE = path.join(RUNTIME_DIR, "milestone.ack"); // supervisor writes {requestId, status, sha, error}
+const SEQ_FILE = path.join(RUNTIME_DIR, "seq"); // persisted monotonic checkpoint counter (survives a supervisor restart)
 const RECEIPT_DIR_REL = ".swarm/receipts"; // inside the work repo, pushed with the checkpoint
+
+/** Monotonic, restart-safe checkpoint sequence. Persisted so a restarted supervisor never reuses/rewrites a seq —
+ *  CONTROL only advances on seq > lastSeq, so a replayed receipt can't roll a confirmed sha back. */
+function nextSeq() {
+  let cur = 0;
+  try {
+    cur = parseInt(readFileSync(SEQ_FILE, "utf8").trim(), 10) || 0;
+  } catch {
+    cur = 0;
+  }
+  const next = cur + 1;
+  atomicWrite(SEQ_FILE, String(next));
+  return next;
+}
 
 function must(k) {
   const v = env[k];
@@ -111,6 +126,7 @@ function doCheckpoint(kind, requestId, manifest) {
     launchId: LID,
     generation: GEN,
     requestId,
+    seq: nextSeq(),
     kind,
     sha,
     ...(manifest ? { manifest } : {}),
@@ -210,8 +226,9 @@ function main() {
   mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
   log(`up: budget=${BUDGET_SEC}s deadlineWall=${DEADLINE_WALL} branch=${BRANCH} work=${WORK_DIR}`);
   tick();
-  const timer = setInterval(tick, POLL_MS);
-  timer.unref?.();
+  // Do NOT unref: this interval is the only thing keeping the supervisor alive; unref'd, an idle start exits
+  // immediately (Codex impl-review bug 1).
+  setInterval(tick, POLL_MS);
 }
 
 main();
