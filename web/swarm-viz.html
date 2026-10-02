@@ -890,7 +890,7 @@
       const width = Math.max(0.8, Math.min(100 - left, pct(b) - left));
       const dur = dur2(b - a);
       const who = t.assignees.length > 1 ? `${t.assignees.length} assignees` : (t.assignees[0] ?? "(none)");
-      const done = t.results.filter((r) => !isFailure2(r.state)).length;
+      const done = t.results.filter((r) => isFinishedResult(r.state)).length;
       const counter = t.assignees.length > 1 ? ` ${done}/${t.assignees.length}` : "";
       return `<div class="rrow">
         <div class="who" title="${esc(t.taskId)}">${esc(t.taskId)}<span class="st">${esc(who)}${counter} \u00b7 ${dur}</span></div>
@@ -920,6 +920,15 @@
   /** States the river must not colour as a clean finish. */
   function isTroubled(st) { return String(st ?? "").toUpperCase() === "EXPIRED"; }
   function isFailure2(st) { const x = String(st ?? "").toLowerCase(); return x.includes("fail") || x.includes("error") || x.includes("cancel"); }
+  /**
+   * Whether one assignee's reported state counts as finished. The parent's states are an UPPERCASE enum
+   * (DONE/RUNNING/...), but a per-assignee result carries whatever the worker reported in its own casing
+   * ("done", "working", "error"). Comparing them case-sensitively made every counter read 0/N.
+   */
+  function isFinishedResult(st) {
+    const x = String(st ?? "").trim().toLowerCase();
+    return x === "done" || x === "complete" || x === "completed" || x === "ok" || x === "success" || x === "succeeded" || x === "retired";
+  }
   function dur2(ms) {
     const sec = Math.max(0, Math.round(ms / 1000));
     if (sec < 60) return sec + "s";
@@ -962,7 +971,7 @@
     parts.push(`<div class="panel"><h4>Tasks <span class="n">${tasks.length}</span></h4>${
       tasks.length
         ? tasks.map((t) => {
-            const done = t.results.filter((r) => r.state === "DONE" || r.state === "RETIRED").length;
+            const done = t.results.filter((r) => isFinishedResult(r.state)).length;
             const counter = t.assignees.length > 1 ? `<span class="v">${done}/${t.assignees.length}</span>` : "";
             return `<div class="prow"><span class="state-chip ${esc(t.state)}">${esc(t.state)}</span>
               <span class="k">${esc(t.taskId)}</span>${counter}</div>`;

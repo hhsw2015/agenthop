@@ -75,8 +75,17 @@ export function isTerminal(state: TaskState): boolean {
 // Paths
 // ---------------------------------------------------------------------------------------------
 
-/** <home>/.agenthop/swarm/tasks — `home` is the home DIR, ".agenthop" appended here. */
+/**
+ * <home>/.agenthop/swarm/tasks — `home` is the home DIR, ".agenthop" appended here.
+ *
+ * SWARM_TASK_DIR relocates it. That exists so a fixture or a test can put task records somewhere else
+ * WITHOUT moving the bus home: AH_HOME also determines which sessions are discovered, so repointing it to
+ * show sample tasks makes a running bus see no peers, and the result reads as a broken observer rather
+ * than as a test setup.
+ */
 export function taskLogDir(home: string = homedir()): string {
+  const explicit = process.env.SWARM_TASK_DIR;
+  if (explicit) return path.isAbsolute(explicit) ? explicit : path.join(home, explicit);
   return path.join(home, ".agenthop", "swarm", "tasks");
 }
 
