@@ -88,7 +88,10 @@ export async function handoffStep(
     r = apply(r, { type: "drain" }, ops);
     ops.log(`${r.launchId} DRAINING (T-${deadline - ops.nowSec()}s)`);
   }
-  if (r.state !== "RETIRED" && r.state !== "DONE" && r.state !== "EXPIRED" && likelyExpired(r, ops.nowSec())) {
+  // Only a box that is still RUNNING/DRAINING can newly EXPIRE. Once CLAIMED/ALLOCATING/RESUMED the record is the
+  // dispatcher's RECOVERY process (the box is already known-gone); re-expiring it every pass reset the recovery to
+  // EXPIRED -> claim -> gen++ forever, never allocating (Codex). Terminal states are also skipped.
+  if ((r.state === "RUNNING" || r.state === "DRAINING") && likelyExpired(r, ops.nowSec())) {
     r = apply(r, { type: "expire" }, ops);
     ops.notify(`box ${r.launchId} expired; recoverySha=${r.sha ?? "none"}`);
   }
