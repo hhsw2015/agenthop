@@ -133,15 +133,23 @@ function scratchPath(launchId: string): string { return path.join(HOME, ".agenth
 
 // --- handoff-action IO (Phase 2). observe/clock/record are LIVE; allocate/resume spawn the box-side scripts and are
 // gated behind SWARM_EXEC (default off). Live-validated only in the gated run. ---
+// repo slug (owner/name) from a git URL or an already-slug value, so swarm-task (which wants a slug + builds the URL)
+// gets a slug even though the dispatcher holds WORK_REPO as a git URL for ls-remote (Codex: URL-vs-slug double-prefix).
+function repoSlug(repo: string): string {
+  return repo.replace(/\.git$/, "").replace(/^.*[:/]([^/]+\/[^/]+)$/, "$1");
+}
+const SCRIPT_TIMEOUT_MS = 300_000; // bound a box-provisioning spawn so a hung swarm-launch/swarm-task can't block forever
 function runScript(file: string, args: string[], extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn("bash", [file, ...args], { env: { ...process.env, ...extraEnv } });
     let stdout = "", stderr = "", done = false;
     const finish = (code: number) => { if (!done) { done = true; resolve({ code, stdout, stderr }); } };
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} finish(-1); }, SCRIPT_TIMEOUT_MS);
+    timer.unref?.();
     child.stdout?.on("data", (d) => { stdout += d; });
     child.stderr?.on("data", (d) => { stderr += d; });
-    child.on("error", () => finish(-1));
-    child.on("close", (c) => finish(c ?? -1));
+    child.on("error", () => { clearTimeout(timer); finish(-1); });
+    child.on("close", (c) => { clearTimeout(timer); finish(c ?? -1); });
   });
 }
 async function allocateSuccessor(_pred: ControlRecord, successorId: string): Promise<"ok" | "clean-fail" | "unknown"> {
@@ -156,8 +164,10 @@ async function allocateSuccessor(_pred: ControlRecord, successorId: string): Pro
   return "unknown";
 }
 async function resumeSuccessor(a: { successor: string; handoffSha: string; generation: number; branch: string }): Promise<boolean> {
-  // swarm-task --resume seeds the successor branch at a resume-marker from handoffSha + starts supervisor/worker.
-  const r = await runScript(SWARM_TASK, [a.successor, "--resume", a.handoffSha, String(a.generation)]);
+  // swarm-task --resume seeds the successor branch at handoffSha + starts supervisor/worker. Pass the repo as a SLUG
+  // (swarm-task builds the URL itself) even though WORK_REPO here is a git URL for ls-remote (Codex URL-vs-slug fix).
+  const r = await runScript(SWARM_TASK, [a.successor, "--resume", a.handoffSha, String(a.generation)],
+    WORK_REPO ? { SWARM_WORK_REPO: repoSlug(WORK_REPO) } : {});
   if (r.code !== 0) { log(`resumeSuccessor ${a.successor}: swarm-task --resume failed (code ${r.code}): ${(r.stderr || r.stdout).trim().slice(0, 200)}`); return false; }
   return true;
 }
