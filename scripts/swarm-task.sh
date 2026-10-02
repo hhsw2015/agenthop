@@ -44,19 +44,21 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Fresh-only (Codex P2-1): a destructive setup (kill writers + rm checkout/runtime) must never blow away another
 # lifecycle's work, and READY must not be satisfied by an OLD in-flight push. TWO guards BEFORE any side-effect:
-#  (a) a persistent LOCAL lifecycle marker rejects a same-launchId re-run even before its first push has landed — a
-#      branch-absent remote does NOT prove freshness, since an earlier run's push may still be in flight server-side;
+#  (a) ATOMICALLY acquire this lifecycle — `mkdir` is a single atomic create, so a concurrent same-launchId run loses
+#      the race and refuses (no check-then-write gap). A branch-absent remote does NOT prove freshness (an earlier
+#      run's push may still be in flight server-side); the lock dir persists (a launchId is one-shot);
 #  (b) the remote branch must not already exist (confirmed prior work). To re-run, allocate a FRESH box (new launchId).
-# P3b: the deploy-key path is quoted INSIDE GSC_RO (git runs it via `sh -c`), so a path with spaces stays one arg.
 # Residual (documented, exactly-once is impossible here): binding READY to THIS run's incarnation needs a manifest
-# nonce (shared-schema change) — tracked; the local marker + branch guard close the practical same-LID re-run paths.
+# nonce (shared-schema change) — tracked; the local lock + branch guard close the practical same-LID re-run paths.
 LIFECYCLE="/tmp/ah-swarm-task-$LID.lifecycle"
-[ -e "$LIFECYCLE" ] && { echo "REFUSING: lifecycle for $LID already started ($LIFECYCLE) — a same-launchId re-run can false-READY on a late old push; allocate a fresh box (Codex P2-1)." >&2; exit 8; }
-GSC_RO="ssh -i \"$DEPLOY_KEY\" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
+mkdir "$LIFECYCLE" 2>/dev/null || { echo "REFUSING: lifecycle for $LID already held ($LIFECYCLE) — a concurrent/prior same-launchId run owns it; allocate a fresh box (Codex P2-1)." >&2; exit 8; }
+# P3: single-quote the deploy-key path INSIDE GSC_RO with POSIX escaping (git runs GSC_RO via `sh -c`). Double quotes
+# would let sh EXPAND $()/backticks in a filename; single quotes make it one literal arg regardless of metacharacters.
+dkq=${DEPLOY_KEY//\'/\'\\\'\'}
+GSC_RO="ssh -i '$dkq' -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
 EXIST="$(GIT_SSH_COMMAND="$GSC_RO" git ls-remote "$WORK_URL" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1{print $1}')" || {
   echo "FATAL: cannot query $BRANCH on $WORK_REPO (deploy key / network) — refusing to proceed blind (Codex P2-1)." >&2; exit 7; }
 [ -z "$EXIST" ] || { echo "REFUSING: $BRANCH already exists (${EXIST:0:12}) — this lifecycle already ran. Allocate a fresh box (new launchId) or use an explicit resume; not destructively resetting confirmed work (Codex P2-1)." >&2; exit 8; }
-: > "$LIFECYCLE"   # register THIS lifecycle before the first destructive side-effect (one-shot launchId; handoff always allocates a new one)
 
 # Direct SSH/SCP with the box's throwaway key + its per-VM HASSH profile (no proxy — box is bound to the key).
 PROF="$(cat "$KEYDIR/hassh-profile" 2>/dev/null || true)"
@@ -169,16 +171,28 @@ echo "== verify first confirmed publish on $BRANCH (up to 60s) =="
 # that found the branch still ABSENT (keep waiting) from a CONFIRMED sha. Bound total wait by an absolute deadline and
 # each query by ssh ConnectTimeout, so a hung network can't exceed the budget. Because P2-1 verified the branch was
 # ABSENT at start, any sha observed here is THIS run's first publish.
-# P2-2: ConnectTimeout only bounds the connect/handshake, not the full ls-remote; wrap each query in a REAL total
-# timeout where available (timeout/gtimeout) and RE-CHECK the deadline AFTER the query, so a query that overran can
-# never be accepted late.
-QTO=""; for c in timeout gtimeout; do command -v "$c" >/dev/null 2>&1 && { QTO="$c 25"; break; }; done
+# P2-2: ConnectTimeout only bounds the connect/handshake, not the full ls-remote, so bound EACH query by a real total
+# timeout via a portable watchdog (no dependency on timeout/gtimeout): run it in the background, hard-kill after `secs`,
+# return its stdout. Per-query budget = min(remaining, 25s) and the loop re-checks the absolute deadline AFTER each
+# query, so the whole gate stays within ~60s even across retries and an overrun can never be accepted late.
+qrun() {  # qrun <secs> <cmd...> : stdout of <cmd>, hard-killed after <secs>
+  local secs=$1; shift
+  local out rc=0; out=$(mktemp)
+  "$@" >"$out" 2>/dev/null & local p=$!
+  ( sleep "$secs"; kill -TERM "$p" 2>/dev/null; sleep 1; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
+  wait "$p" 2>/dev/null || rc=$?
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+  cat "$out"; rm -f "$out"
+  return "$rc"
+}
 CONFIRMED=""; QDEADLINE=$(( $(date +%s) + 60 ))
-while [ "$(date +%s)" -lt "$QDEADLINE" ]; do
+while :; do
+  rem=$(( QDEADLINE - $(date +%s) )); [ "$rem" -gt 0 ] || break
+  per=$(( rem < 25 ? rem : 25 ))   # min(remaining budget, 25s)
   SHA=""; QRC=0
-  SHA="$($QTO env GIT_SSH_COMMAND="$GSC_RO" git ls-remote "$WORK_URL" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1{print $1}')" || QRC=$?
-  [ "$(date +%s)" -lt "$QDEADLINE" ] || break   # a query that overran the budget must NOT be accepted late (P2-2)
-  if [ "$QRC" -ne 0 ]; then echo "  (ls-remote query error; retry within deadline)" >&2; sleep 2; continue; fi
+  SHA="$(qrun "$per" env GIT_SSH_COMMAND="$GSC_RO" git ls-remote "$WORK_URL" "refs/heads/$BRANCH" | awk 'NR==1{print $1}')" || QRC=$?
+  [ "$(date +%s)" -lt "$QDEADLINE" ] || break   # a query that overran must NOT be accepted late (P2-2)
+  if [ "$QRC" -ne 0 ]; then echo "  (ls-remote query error/timeout; retry within deadline)" >&2; sleep 2; continue; fi
   if [ -n "$SHA" ]; then CONFIRMED="$SHA"; break; fi
   sleep 2
 done
