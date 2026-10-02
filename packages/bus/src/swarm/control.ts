@@ -268,8 +268,10 @@ export function nextAction(record: ControlRecord, nowSec: number, ctx: DispatchC
     case "EXPIRED":
       // An in-flight attempt (retained across expire) must still be RECONCILED even at the cap — the attempt cap
       // forbids a NEW allocation, not CHECKING whether the Nth VM is actually alive (Codex #5). Claim to take
-      // ownership, then the CLAIMED branch returns "reconcile".
-      if (record.attempt !== undefined) return slotFree ? "claim" : "none";
+      // ownership (claim preserves the attempt), then the CLAIMED branch returns "reconcile". NOT slotFree-gated
+      // (Codex P2): claiming to reconcile an ALREADY-counted reservation is not a new slot, so gating it on
+      // slotFree deadlocked an at-cap EXPIRED/CHECKPOINTED record (reconcile could never run to free the slot).
+      if (record.attempt !== undefined) return "claim";
       if (allocExhausted(record)) return "give_up";
       return slotFree ? "claim" : "none";
     case "CLAIMED":

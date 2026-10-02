@@ -281,3 +281,28 @@ describe("math + parse", () => {
     expect(parseHandoff("NEED HANDOFF: goal=y")?.repo).toBeUndefined();
   });
 });
+
+describe("at-cap reconciliation of a retained in-flight attempt (Codex P2)", () => {
+  test("EXPIRED with an attempt reconciles even at the cap (claim -> CLAIMED keeps attempt -> reconcile)", () => {
+    const expired = advance(toAllocating("fin9", "n", 1), { type: "expire" }, T0 + 10);
+    expect(expired.ok).toBe(true);
+    if (expired.ok) {
+      expect(expired.record.attempt).toBe("att-1"); // expire retains the in-flight attempt
+      // At the cap a NEW allocation is forbidden, but reconciling the ALREADY-counted attempt must still proceed.
+      expect(nextAction(expired.record, T0 + 11, { self: "n", cap: 3, liveCount: 3 })).toBe("claim");
+      const claimed = advance(expired.record, { type: "claim", owner: "n", generation: 2, leaseUntil: T0 + 311 }, T0 + 12);
+      expect(claimed.ok && claimed.record.attempt === "att-1").toBe(true); // claim from EXPIRED preserves the attempt
+      if (claimed.ok) expect(nextAction(claimed.record, T0 + 13, { self: "n", cap: 3, liveCount: 3 })).toBe("reconcile");
+    }
+  });
+
+  test("EXPIRED WITHOUT an attempt stays cap-gated (a fresh claim IS a new slot)", () => {
+    const expired = advance(rec({ sha: "s1" }), { type: "expire" }, T0 + 10);
+    expect(expired.ok).toBe(true);
+    if (expired.ok) {
+      expect(expired.record.attempt).toBeUndefined();
+      expect(nextAction(expired.record, T0 + 11, { self: "n", cap: 3, liveCount: 3 })).toBe("none");  // at cap -> wait
+      expect(nextAction(expired.record, T0 + 11, { self: "n", cap: 3, liveCount: 2 })).toBe("claim"); // slot free -> claim
+    }
+  });
+});
