@@ -181,59 +181,6 @@ export function msgLogSize(home: string, at: number = Date.now()): number {
   }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Self-check: `node --test`-free, runs via tsx (tsx src/msglog.ts). Keeps the invariants honest.
-// ---------------------------------------------------------------------------------------------
-if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1]))) {
-  const assert = (name: string, cond: boolean) => {
-    if (!cond) throw new Error(`msglog selftest FAILED: ${name}`);
-    console.log(`ok  ${name}`);
-  };
-  const OFF = {} as NodeJS.ProcessEnv;
-  const ON = { AGENTHOP_MSGLOG: "1" } as NodeJS.ProcessEnv;
-  const PAY = { AGENTHOP_MSGLOG: "1", AGENTHOP_MSGLOG_PAYLOAD: "1" } as NodeJS.ProcessEnv;
-
-  const e: MsgLogEntry = { ts: 1000, from: "a", to: "b", via: "local", direction: "out", size: 5, text: "hi" };
-  assert("logging is off by default", msgLogEnabled(OFF) === false && writeMsgLog("/tmp/nope", e, OFF) === false);
-  assert("payload needs its own flag", payloadLoggingEnabled(ON) === false && payloadLoggingEnabled(PAY) === true);
-  assert("text is stripped without the payload flag", sanitize(e, false)?.text === undefined);
-  assert("text is kept with the payload flag", sanitize(e, true)?.text === "hi");
-  assert("a bad direction is rejected", sanitize({ ...e, direction: "sideways" as "in" }, false) === undefined);
-  assert("an empty from is rejected", sanitize({ ...e, from: "   " }, false) === undefined);
-  assert("kind and size survive", sanitize({ ...e, kind: " task " }, false)?.kind === "task");
-  assert(
-    "a torn last line is dropped, good lines survive",
-    parseMsgLog(`${JSON.stringify(e)}\n{"ts":1,"from":"x"`).length === 1,
-  );
-  assert("blank lines are dropped", parseMsgLog("\n\n").length === 0);
-  assert("read of an absent journal is empty, not an error", readMsgLog("/tmp/definitely-not-here-xyz").length === 0);
-  console.log("msglog selftests passed");
-}
-
-// Round-trip against a real temp dir (run with `tsx src/msglog.ts`).
-if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1]))) {
-  const { mkdtempSync, rmSync, existsSync } = await import("node:fs");
-  const { tmpdir } = await import("node:os");
-  const rt = (name: string, cond: boolean) => {
-    if (!cond) throw new Error(`msglog roundtrip FAILED: ${name}`);
-    console.log(`ok  ${name}`);
-  };
-  const home = mkdtempSync(path.join(tmpdir(), "ah-msglog-"));
-  try {
-    const ON = { AGENTHOP_MSGLOG: "1" } as NodeJS.ProcessEnv;
-    const day = Date.now();
-    rt("nothing is written while the flag is off", !writeMsgLog(home, { ts: day, from: "a", to: "b", via: "local", direction: "out" }, {}) && !existsSync(msgLogDir(home)));
-    rt("a write lands with the flag on", writeMsgLog(home, { ts: day, from: "a", to: "b", via: "local", direction: "out", size: 3 }, ON));
-    rt("payload survives only with the payload flag", writeMsgLog(home, { ts: day + 1, from: "b", to: "a", via: "relay", direction: "in", text: "secret" }, ON));
-    const got = readMsgLog(home, day);
-    rt("both lines read back", got.length === 2);
-    rt("newest first", got[0]!.ts > got[1]!.ts);
-    rt("the body was NOT written without the payload flag", got.every((e) => e.text === undefined));
-    rt("a multi-day read finds the same day", readMsgLogDays(home, 2, day).length === 2);
-    rt("the day is listed as present", msgLogDaysPresent(home).length === 1);
-    rt("size reports the file we wrote", msgLogSize(home, day) > 0);
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
-  console.log("msglog roundtrip passed");
-}
+// Self-tests live in test/msglog.test.ts (vitest) — this module MUST have NO top-level side effects: core.ts
+// imports it, and when the bus is bundled to a single file an import.meta/argv entry-guard fires on every startup,
+// printing to stdout (which corrupts the MCP protocol). Keep it side-effect-free. (Codex P1.)
