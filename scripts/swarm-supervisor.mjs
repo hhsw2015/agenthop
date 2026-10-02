@@ -39,9 +39,18 @@ const ALLOWLIST = (must("SWARM_ALLOWLIST")).split(/[\n,]/).map((s) => s.trim()).
 // AND git pathspec magic (a leading ":" like :(top)** escapes to the whole tree). A list that filtered down to
 // EMPTY (e.g. SWARM_ALLOWLIST=",") is also rejected — must() only checks the raw string was non-empty.
 if (ALLOWLIST.length === 0) { console.error("swarm-supervisor: SWARM_ALLOWLIST resolved to an empty set"); process.exit(2); }
+// LITERAL paths only. Reject: "." / "./"; a leading "./" (e.g. "./out"); absolute; ".." or "." path segments; git
+// pathspec magic (a leading ":" like :(top)**); and ANY glob metachar *?[] anywhere (Codex P2: the old check only
+// caught an exact "*", so "**", "out/*", "out/**" slipped through and would publish far more than the artifact set).
 for (const p of ALLOWLIST) {
-  if (p === "." || p === "./" || p === "*" || p.startsWith("/") || p.startsWith(":") || p.includes(":") || p.split("/").includes("..")) {
-    console.error(`swarm-supervisor: unsafe allowlist entry ${JSON.stringify(p)} (no '.' './' '*' absolute '..' or ':' pathspec magic)`);
+  const segs = p.split("/");
+  const bad =
+    p === "." || p === "./" || p.startsWith("/") || p.startsWith("./") ||
+    p.startsWith(":") || p.includes(":") ||
+    /[*?[\]]/.test(p) ||
+    segs.includes("..") || segs.includes(".");
+  if (bad) {
+    console.error(`swarm-supervisor: unsafe allowlist entry ${JSON.stringify(p)} (literal paths only: no '.', './', globs *?[], absolute, '..', or ':' pathspec magic)`);
     process.exit(2);
   }
 }
@@ -104,10 +113,19 @@ let git = realGit;
 
 // --- the publish pipeline: stage allowlist+manifest into the PRIVATE index -> write-tree -> (skip if unchanged) ->
 // commit-tree onto the current branch tip -> update local ref -> non-force push. Returns { ok, sha }.
-// Each field capped so that even worst-case JSON escaping (~2x) of BOTH fields + overhead stays under the 16KB
-// bound parseManifest enforces — no runtime size surprise (Codex #10).
-const MANIFEST_FIELD_CAP = 3000;
-function clampStr(s, max) { return s.length > max ? `${s.slice(0, max)}…[truncated]` : s; }
+// Each field capped by its JSON-ENCODED length, not character count (Codex P2): a control char like U+0001 encodes
+// to 6 chars (\u0001), so a 3000-CHARACTER cap could still emit ~18KB and blow the 16KB bound parseManifest enforces
+// — after which the old fallback SILENTLY dropped goal+next. Encoded caps keep both fields + overhead under MAX while
+// preserving a visible …[truncated] marker instead of a silent drop.
+const MANIFEST_FIELD_MAX_ENCODED = 6000; // 2 fields * 6000 + overhead stays < MAX_MANIFEST_BYTES even worst-case
+function encodedLen(s) { return JSON.stringify(s).length - 2; } // length this string ADDS to the doc (minus its quotes)
+function clampEncoded(s, maxBytes) {
+  if (encodedLen(s) <= maxBytes) return s;
+  const marker = "…[truncated]";
+  let lo = 0, hi = s.length;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (encodedLen(s.slice(0, mid) + marker) <= maxBytes) lo = mid; else hi = mid - 1; }
+  return s.slice(0, lo) + marker;
+}
 // Coerce goal/next to a STRING (the worker's req JSON could carry a non-string) so a non-string can never produce a
 // manifest the dispatcher's parseManifest rejects (Codex #10).
 function asStr(v) { return v === undefined || v === null ? undefined : typeof v === "string" ? v : JSON.stringify(v); }
@@ -115,10 +133,10 @@ function buildManifest(kind, goal, next) {
   // NO createdAt: a changing timestamp each publish would defeat the "skip if unchanged" idempotency (Codex).
   const g0 = asStr(goal);
   const n0 = asStr(next);
-  const g = g0 ? clampStr(g0, MANIFEST_FIELD_CAP) : undefined;
-  const n = n0 ? clampStr(n0, MANIFEST_FIELD_CAP) : undefined;
+  const g = g0 ? clampEncoded(g0, MANIFEST_FIELD_MAX_ENCODED) : undefined;
+  const n = n0 ? clampEncoded(n0, MANIFEST_FIELD_MAX_ENCODED) : undefined;
   const s = JSON.stringify({ schemaVersion: 1, launchId: LID, generation: GEN, kind, ...(g ? { goal: g } : {}), ...(n ? { next: n } : {}) });
-  // Belt-and-suspenders: if still over (pathological), drop to the minimal valid manifest.
+  // With per-field encoded caps this always fits; keep the minimal-manifest backstop for a truly pathological case.
   return s.length > MAX_MANIFEST_BYTES ? JSON.stringify({ schemaVersion: 1, launchId: LID, generation: GEN, kind }) : s;
 }
 
@@ -179,10 +197,15 @@ async function publish(kind, { goal, next } = {}) {
   //    artifact snapshot, not a mirror of the worker's checkout.
   const empty = await git(["read-tree", "--empty"], { indexFile: PRIVATE_INDEX });
   if (empty.code !== 0) return { ok: false, error: `read-tree --empty: ${empty.stderr.trim()}` };
-  // Add each path individually, tolerating "pathspec did not match" (git add has no --ignore-unmatch). An allowlist
-  // entry whose file was DELETED (or a now-empty dir) simply matches nothing; with the empty index that correctly
-  // leaves it ABSENT from the published tree — a deletion, not an error (Codex #7). A real add error still fails.
-  for (const p of [MANIFEST_REL, ...ALLOWLIST]) {
+  // MANIFEST_REL is MANDATORY — we wrote it in step 1, so a "did not match" here means the manifest is missing: a HARD
+  // error, never tolerated (Codex P2). Publishing a snapshot with no manifest would leave the dispatcher unable to read
+  // the phase/summary from the pinned sha.
+  const am = await git(["add", "--", MANIFEST_REL], { indexFile: PRIVATE_INDEX });
+  if (am.code !== 0) return { ok: false, error: `git add manifest ${MANIFEST_REL}: ${am.stderr.trim() || "pathspec did not match (manifest missing)"}` };
+  // Add each ALLOWLIST path individually, tolerating "pathspec did not match" (git add has no --ignore-unmatch). An
+  // allowlist entry whose file was DELETED (or a now-empty dir) simply matches nothing; with the empty index that
+  // correctly leaves it ABSENT from the published tree — a deletion, not an error (Codex #7). A real add error fails.
+  for (const p of ALLOWLIST) {
     const a = await git(["add", "--", p], { indexFile: PRIVATE_INDEX });
     if (a.code !== 0 && !/did not match/i.test(a.stderr)) return { ok: false, error: `git add ${p}: ${a.stderr.trim()}` };
   }

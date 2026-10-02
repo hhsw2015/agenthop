@@ -14,6 +14,8 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const WORK_DIR = mkdtempSync(path.join(os.tmpdir(), "sup-work-"));
 const BRANCH = "swarm/rw-test-g0";
@@ -34,7 +36,7 @@ const sup = await import("./swarm-supervisor.mjs");
 
 // --- scripted git model: answers only what publish() calls; remote tip + commit graph live in `m`. ---
 function makeGit() {
-  const m = { remoteTip: "", commits: {}, unreadable: new Set(), pushMode: "ok", lsFail: false, n: 0 };
+  const m = { remoteTip: "", commits: {}, unreadable: new Set(), pushMode: "ok", lsFail: false, manifestAddFails: false, n: 0 };
   const manifestNow = () => readFileSync(path.join(WORK_DIR, MANIFEST_REL), "utf8");
   const treeOf = (buf) => "tree-" + createHash("sha1").update(buf).digest("hex").slice(0, 12);
   const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
@@ -53,7 +55,11 @@ function makeGit() {
       if (m.unreadable.has(sha)) return err("fatal: path exists on disk, but not in commit", 128);
       return m.commits[sha] ? ok(m.commits[sha].manifest) : err("fatal: not a valid object", 128);
     }
-    if (cmd === "read-tree" || cmd === "add") return ok();
+    if (cmd === "read-tree") return ok();
+    if (cmd === "add") {
+      if (args[2] === MANIFEST_REL && m.manifestAddFails) return err("fatal: pathspec '.swarm/manifest.json' did not match any files");
+      return ok();
+    }
     if (cmd === "write-tree") return ok(treeOf(manifestNow()));
     if (cmd === "commit-tree") {
       const tree = a1;
@@ -155,4 +161,46 @@ test("P1-A: unknown parent phase (unreadable manifest) is refused, not published
     assert.equal(sup.__state().finalized, false);
     assert.equal(m.remoteTip, cG, "remote untouched");
   });
+});
+
+// --- P2 hardening ---
+
+test("P2-b: a missing MANDATORY manifest (git add did-not-match) is a hard error, not tolerated", async () => {
+  await withModel(async (m) => {
+    sup.__reset();
+    m.manifestAddFails = true;
+    const r = await sup.publish("milestone", { next: "x" });
+    assert.equal(r.ok, false, "publish refuses without the manifest");
+    assert.match(r.error, /manifest/i);
+    assert.equal(m.remoteTip, "", "nothing pushed");
+  });
+});
+
+test("P2-c: a control-char goal is truncated by ENCODED length, kept under MAX, never silently dropped", async () => {
+  await withModel(async () => {
+    sup.__reset();
+    const r = await sup.publish("milestone", { goal: "\u0001".repeat(5000) }); // ~30KB if capped by char count
+    assert.ok(r.ok, "publishes");
+    const raw = readFileSync(path.join(WORK_DIR, MANIFEST_REL), "utf8");
+    assert.ok(raw.length <= 16 * 1024, `manifest within MAX (got ${raw.length})`);
+    const man = JSON.parse(raw); // must still be valid JSON
+    assert.ok(typeof man.goal === "string" && man.goal.length > 0, "goal is KEPT, not dropped to a minimal manifest");
+    assert.match(man.goal, /\[truncated\]/, "truncation is marked, not silent");
+  });
+});
+
+test("P2-a: unsafe allowlist entries are rejected at import (exit 2); literal paths pass", () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const modUrl = pathToFileURL(path.join(here, "swarm-supervisor.mjs")).href;
+  const run = (allowlist) => {
+    const env = { ...process.env,
+      SWARM_LAUNCH_ID: "rw-test", SWARM_GENERATION: "0", SWARM_BUDGET_SEC: "3480",
+      SWARM_DEADLINE_WALL: String(Math.floor(Date.now() / 1000) + 3480),
+      SWARM_WORK_DIR: WORK_DIR, SWARM_BRANCH: BRANCH,
+      SWARM_RUNTIME_DIR: mkdtempSync(path.join(os.tmpdir(), "sup-rt-")), SWARM_ALLOWLIST: allowlist };
+    try { execFileSync(process.execPath, ["-e", `import(${JSON.stringify(modUrl)})`], { env, stdio: "pipe" }); return 0; }
+    catch (e) { return e.status ?? -1; }
+  };
+  for (const bad of ["out/**", "**", "out/*", "./out", "a:b", "../x", "."]) assert.equal(run(bad), 2, `rejected: ${bad}`);
+  for (const good of ["out", "dist/bundle.js", "src/gen"]) assert.equal(run(good), 0, `accepted: ${good}`);
 });
