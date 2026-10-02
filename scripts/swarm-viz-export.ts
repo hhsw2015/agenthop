@@ -20,6 +20,8 @@ import { homedir, hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startBusCore } from "../packages/bus/src/core.js";
+import { readMsgLogDays, msgLogEnabled, payloadLoggingEnabled, type MsgLogEntry as BusMsgLogEntry } from "../packages/bus/src/msglog.js";
+import { readTasks } from "../packages/bus/src/tasklog.js";
 import type { UnifiedPeer } from "../packages/bus/src/resolve.js";
 
 // ---------------------------------------------------------------------------------------------
@@ -61,18 +63,8 @@ export type VizNode = UnifiedPeer & {
   lastPeerId?: string;
 };
 
-/** One line of the opt-in, metadata-only message journal. NO payload by default (see the bus contract). */
-export type MsgLogEntry = {
-  ts: number;
-  from: string;
-  to: string;
-  via?: "local" | "relay";
-  direction: "in" | "out";
-  kind?: string;
-  size?: number;
-  /** Only ever present when payload logging was explicitly enabled on the bus side. */
-  text?: string;
-};
+/** One line of the opt-in, metadata-only message journal (shared definition lives in the bus). */
+export type MsgLogEntry = BusMsgLogEntry;
 
 /** A directed flow between two peers, folded from the journal. */
 export type VizFlow = {
@@ -168,6 +160,8 @@ export type Snapshot = {
   events: MsgLogEntry[];
   /** True when the journal carried payloads — lets the page say why bodies are missing. */
   payloadLogged: boolean;
+  /** Whether the bus has message logging switched on here. Distinguishes "off" from "on but quiet". */
+  msgLogEnabled: boolean;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -287,62 +281,6 @@ export function readLocalAllocs(): Map<string, number> {
 // Message journal (metadata only) and future task envelopes
 // ---------------------------------------------------------------------------------------------
 
-function msgLogDir(home: string): string {
-  return path.join(home, ".agenthop", "msglog");
-}
-function taskDir(home: string): string {
-  return path.join(home, ".agenthop", "swarm", "tasks");
-}
-
-/**
- * Read today's message journal. Contract with the bus owner: one JSON object per line at
- * <home>/.agenthop/msglog/<YYYY-MM-DD>.jsonl, METADATA ONLY ({ts, from, to, via, direction, kind?, size?});
- * a payload `text` is present only when the bus was explicitly told to log payloads. Absent dir -> [].
- * Malformed lines are skipped rather than failing the whole read.
- */
-export function readMsgLog(home: string, date = new Date()): MsgLogEntry[] {
-  const name = `${date.toISOString().slice(0, 10)}.jsonl`;
-  let raw: string;
-  try {
-    raw = readFileSync(path.join(msgLogDir(home), name), "utf8");
-  } catch {
-    return []; // journal not wired by the bus yet
-  }
-  const out: MsgLogEntry[] = [];
-  for (const line of raw.split("\n")) {
-    const t = line.trim();
-    if (!t) continue;
-    try {
-      const e = JSON.parse(t) as MsgLogEntry;
-      if (e && typeof e.ts === "number" && typeof e.from === "string" && typeof e.to === "string") out.push(e);
-    } catch {
-      // a torn last line while the writer appends — skip it
-    }
-  }
-  return out;
-}
-
-/** Future task-envelope files. Absent dir -> []. Malformed file skipped. */
-export function readTaskFiles(home: string): TaskFile[] {
-  let names: string[];
-  try {
-    names = readdirSync(taskDir(home));
-  } catch {
-    return [];
-  }
-  const out: TaskFile[] = [];
-  for (const name of names) {
-    if (!name.endsWith(".json") || name.includes(".tmp.")) continue;
-    try {
-      const t = JSON.parse(readFileSync(path.join(taskDir(home), name), "utf8")) as TaskFile;
-      if (t && typeof t.taskId === "string") out.push(t);
-    } catch {
-      // skip a torn/partial file
-    }
-  }
-  return out;
-}
-
 /** Fold journal lines into directed per-pair flows, newest activity last. Pure. */
 export function foldFlows(entries: MsgLogEntry[], limit = 60): VizFlow[] {
   const byPair = new Map<string, VizFlow>();
@@ -413,7 +351,8 @@ export function buildSnapshot(
   }
 
   // Message flows. Empty until the bus writes the journal; the page shows that honestly.
-  const msgLog = readMsgLog(home);
+  // Two days so a session that ran across midnight does not lose the earlier half.
+  const msgLog = readMsgLogDays(home, 2) as MsgLogEntry[];
   const flows = foldFlows(msgLog);
 
   // Departures: a peer in the previous snapshot that is absent now. An event, not just a missing row —
@@ -423,7 +362,7 @@ export function buildSnapshot(
     .filter((p) => !nowIds.has(p.id))
     .map((p) => ({ id: p.id, title: p.title, machine: p.machine, lastSeen: p.statusAt ?? prev?.generatedAt ?? Date.now() }));
 
-  const tasks = tasksFromSources(controls, readTaskFiles(home));
+  const tasks = tasksFromSources(controls, readTasks(home) as unknown as TaskFile[]);
 
   return {
     generatedAt: Date.now(),
@@ -441,6 +380,7 @@ export function buildSnapshot(
     tasks,
     events: msgLog,
     payloadLogged: msgLog.some((e) => typeof e.text === "string" && e.text.length > 0),
+    msgLogEnabled: msgLogEnabled(),
   };
 }
 
