@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>swarm-viz</title>
+<style>
+  :root {
+    --bg: #0f1117; --card: #171a23; --line: #262a36; --ink: #e6e8ef; --dim: #8b90a0;
+    --working: #4ea1ff; --idle: #46c98b; --blocked: #ff5c5c; --unknown: #6b7080;
+    --relay: #c58fff; --local: #46c98b; --warn: #ffb454;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px 24px 60px; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  h1 { font-size: 15px; font-weight: 600; margin: 0 0 2px; letter-spacing: .02em; }
+  h2 { font-size: 12px; font-weight: 600; color: var(--dim); text-transform: uppercase;
+    letter-spacing: .09em; margin: 28px 0 10px; }
+  .meta { color: var(--dim); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .stale { color: var(--warn); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-left-width: 3px; border-radius: 8px;
+    padding: 12px 14px; }
+  .card.working { border-left-color: var(--working); }
+  .card.idle { border-left-color: var(--idle); }
+  .card.blocked { border-left-color: var(--blocked); }
+  .card.unknown { border-left-color: var(--unknown); }
+  .row { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+  .title { font-weight: 600; overflow-wrap: anywhere; }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+    background: #22262f; color: var(--ink); }
+  .pill.working { background: #12324f; color: var(--working); }
+  .pill.idle { background: #123528; color: var(--idle); }
+  .pill.blocked { background: #3d1a1a; color: var(--blocked); }
+  .pill.unknown { background: #23262e; color: var(--unknown); }
+  .via { font-size: 11px; }
+  .via.relay { color: var(--relay); }
+  .via.local { color: var(--local); }
+  .kv { display: grid; grid-template-columns: 74px 1fr; gap: 2px 10px; margin-top: 9px; font-size: 12px; }
+  .kv dt { color: var(--dim); }
+  .kv dd { margin: 0; overflow-wrap: anywhere; }
+  .text { margin-top: 9px; padding: 7px 9px; background: #10131a; border-radius: 6px; font-size: 12px;
+    color: #cdd2e0; overflow-wrap: anywhere; }
+  .clock { font-size: 11px; color: var(--dim); }
+  .clock.warn { color: var(--warn); }
+  .count { font-size: 15px; font-variant-numeric: tabular-nums; }
+  .count.warn { color: var(--warn); }
+  .count.dead { color: var(--blocked); }
+  .state { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: #22262f; color: var(--dim); }
+  .state.RUNNING { color: var(--working); } .state.RESUMED { color: var(--idle); }
+  .state.DRAINING, .state.CHECKPOINTED, .state.CLAIMED, .state.ALLOCATING { color: var(--warn); }
+  .state.RETIRED, .state.DONE, .state.EXPIRED { color: var(--unknown); }
+  .empty { color: var(--dim); padding: 18px 0; font-size: 13px; }
+  .err { color: var(--blocked); font-size: 12px; }
+  .edge { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  .edge b { color: var(--idle); font-weight: 600; }
+  footer { margin-top: 28px; color: var(--dim); font-size: 11px; line-height: 1.7; }
+  code { color: #cdd2e0; }
+</style>
+</head>
+<body>
+  <h1>swarm-viz</h1>
+  <div class="meta" id="meta"><span>connecting…</span></div>
+  <div id="err" class="err"></div>
+  <h2>Nodes <span id="ncount" style="color:var(--dim)"></span></h2>
+  <div id="nodes" class="grid"></div>
+  <h2>Boxes <span id="bcount" style="color:var(--dim)"></span></h2>
+  <div id="boxes" class="grid"></div>
+  <footer>
+    <div>countdown ticks locally every 1s from a fixed epoch; the snapshot is polled every <span id="pollMs">2</span>s</div>
+    <div>relay peers announce every 60s (TTL 150s), so a remote <em>status</em> pill can lag up to 60s — read the "changed" clock, not the poll rate</div>
+    <div>the local lifecycle mirror is written by the dispatcher and is fresh, so a box countdown is accurate even when its node pill is stale</div>
+    <div id="observer"></div>
+  </footer>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let state = null;
+
+    function ago(ms) {
+      if (ms == null) return "—";
+      const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+      if (s < 60) return s + "s ago";
+      const m = Math.floor(s / 60);
+      if (m < 60) return m + "m " + (s % 60) + "s ago";
+      return Math.floor(m / 60) + "h " + (m % 60) + "m ago";
+    }
+    function fmtCountdown(epochSec) {
+      if (epochSec == null) return { text: "—", cls: "" };
+      const left = Math.round(epochSec - Date.now() / 1000);
+      if (left <= 0) return { text: "expired " + dur(-left) + " ago", cls: "dead" };
+      return { text: dur(left), cls: left < 300 ? "warn" : "" };
+    }
+    function dur(sec) {
+      const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+      if (h > 0) return h + "h " + m + "m";
+      if (m > 0) return m + "m " + s + "s";
+      return s + "s";
+    }
+    const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+    function nodeCard(n) {
+      const status = n.status || "unknown";
+      const stale = n.via === "relay" && n.statusAt && Date.now() - n.statusAt > 60000;
+      return `<div class="card ${status}">
+        <div class="row"><span class="title">${esc(n.title)}</span>
+          <span class="pill ${status}">${esc(status)}</span></div>
+        <div class="row" style="margin-top:4px">
+          <span class="via ${n.via}">${n.via}${n.machine ? " @ " + esc(n.machine) : ""}</span>
+          <span class="clock ${stale ? "warn" : ""}">${n.statusAt ? "changed " + ago(n.statusAt) : "no status"}</span>
+        </div>
+        <dl class="kv">
+          <dt>tool</dt><dd>${esc(n.tool)}</dd>
+          <dt>cwd</dt><dd>${esc(n.cwd)}</dd>
+          ${n.pid != null ? `<dt>pid</dt><dd>${n.pid}</dd>` : ""}
+          ${n.stableId ? `<dt>session</dt><dd>${esc(n.stableId)}</dd>` : ""}
+          ${n.statusSeq != null ? `<dt>seq</dt><dd>${n.statusSeq}</dd>` : ""}
+        </dl>
+        ${n.statusText ? `<div class="text">${esc(n.statusText)}</div>` : ""}
+      </div>`;
+    }
+
+    function boxCard(b) {
+      const c = b.control;
+      const node = b.nodeIndex >= 0 ? state.nodes[b.nodeIndex] : null;
+      const cd = fmtCountdown(b.deadlineEpoch);
+      const src = { record: "control record", "alloc-ts": "local alloc-ts + 1h", none: "unknown" }[b.deadlineSource];
+      return `<div class="card ${c ? "unknown" : ""}">
+        <div class="row"><span class="title">${esc(b.launchId)}</span>
+          ${c ? `<span class="state ${esc(c.state)}">${esc(c.state)}</span>` : `<span class="state">no control record</span>`}</div>
+        <div class="row" style="margin-top:6px">
+          <span class="count ${cd.cls}">${cd.text}</span>
+          <span class="clock">${src}</span>
+        </div>
+        <dl class="kv">
+          ${node ? `<dt>node</dt><dd>${esc(node.title)}</dd>` : `<dt>node</dt><dd>— no bus peer matched</dd>`}
+          ${b.allocStart ? `<dt>alloc</dt><dd>${new Date(b.allocStart * 1000).toLocaleTimeString()}</dd>` : ""}
+          ${c && c.generation != null ? `<dt>gen</dt><dd>${c.generation}</dd>` : ""}
+          ${c && c.sha ? `<dt>sha</dt><dd>${esc(c.sha.slice(0, 12))}</dd>` : ""}
+          ${c && c.owner ? `<dt>owner</dt><dd>${esc(c.owner)}</dd>` : ""}
+          ${c && c.updatedAt ? `<dt>updated</dt><dd>${ago(c.updatedAt * 1000)}</dd>` : ""}
+        </dl>
+        ${c && c.successor ? `<div class="edge">handoff → <b>${esc(c.successor)}</b></div>` : ""}
+        ${c && c.manifest ? `<div class="text">${esc(c.manifest)}</div>` : ""}
+      </div>`;
+    }
+
+    function render() {
+      const s = state;
+      $("meta").innerHTML =
+        `<span>snapshot ${ago(s.generatedAt)}</span>` +
+        `<span>${s.nodes.length} node(s), ${s.boxes.length} box(es)</span>` +
+        `<span>relay staleness ceiling ${s.relayStaleMs / 1000}s</span>`;
+      $("pollMs").textContent = (s.pollMs / 1000).toFixed(0);
+      $("observer").innerHTML = `observer bus id <code>${esc(s.observerId)}</code> (filtered out of the node list)`;
+      $("ncount").textContent = `(${s.nodes.length})`;
+      $("bcount").textContent = `(${s.boxes.length})`;
+      $("nodes").innerHTML = s.nodes.length
+        ? s.nodes.map(nodeCard).join("")
+        : `<div class="empty">No peers on the roster. Same-machine sessions appear automatically; run with AGENTHOP_TEAM set to see other machines.</div>`;
+      $("boxes").innerHTML = s.boxes.length
+        ? s.boxes.map(boxCard).join("")
+        : `<div class="empty">No boxes known. A box shows up here once a dispatcher writes ~/.agenthop/swarm/control/&lt;launchId&gt;.json, or a local /tmp/ah-rwkey-&lt;launchId&gt;/alloc-ts exists.</div>`;
+    }
+
+    async function tick() {
+      try {
+        const r = await fetch("/state.json", { cache: "no-store" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        state = await r.json();
+        $("err").textContent = "";
+        render();
+      } catch (e) {
+        $("err").textContent = "exporter unreachable: " + e.message;
+      }
+    }
+
+    tick();
+    setInterval(tick, 2000);
+    // Re-render the local clocks (countdown + ago) every second without a fetch.
+    setInterval(() => { if (state) render(); }, 1000);
+  </script>
+</body>
+</html>
