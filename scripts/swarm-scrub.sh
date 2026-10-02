@@ -31,6 +31,10 @@ fi
 literals=(
   "$RUNTIME_DIR"
   "$WORK_DIR"
+  "/root/.swarm/deploy-key"
+  "/root/.swarm/sup-env"
+  "/root/.swarm/start-sup.sh"
+  "${SWARM_ASKPASS:-}"
   "/tmp/ah-mcp.json"
   "$HOME/.config/gh"
   "$HOME/.git-credentials"
