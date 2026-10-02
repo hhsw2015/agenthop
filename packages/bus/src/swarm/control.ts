@@ -94,7 +94,11 @@ export type ControlEvent =
   | { type: "resumed"; successor: string; sha: string; generation: number; attempt: string }
   | { type: "retire" }
   | { type: "done"; sha: string }
-  | { type: "expire"; lastConfirmedSha?: string };
+  | { type: "expire"; lastConfirmedSha?: string }
+  // A newer confirmed WORK-branch tip observed AFTER the VM already EXPIRED: update the recovery point so a
+  // successor resumes from the newest confirmed work (Codex #10 — push-ok-but-CONTROL-lost recovery). VM stays
+  // terminal; only the recovery sha advances.
+  | { type: "recover_sha"; sha: string };
 
 export type AdvanceResult = { ok: true; record: ControlRecord } | { ok: false; error: string };
 
@@ -208,6 +212,9 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
     case "expire":
       // Any non-frozen state can expire (box died). Preserve the last confirmed sha for successor allocation.
       return ok({ state: "EXPIRED", lastConfirmedSha: event.lastConfirmedSha ?? record.sha });
+    case "recover_sha":
+      if (record.state !== "EXPIRED") return bad(`recover_sha only in EXPIRED, not ${record.state}`);
+      return ok({ lastConfirmedSha: event.sha });
   }
 }
 
