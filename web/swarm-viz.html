@@ -141,6 +141,8 @@
   .edge.comms { stroke: var(--working); opacity: .8; marker-end: url(#arrowblue); }
   /* invisible wide companion so a thin arc is still clickable */
   .edge-hit { fill: none; stroke: transparent; stroke-width: 16; cursor: pointer; }
+  .talkpip { stroke: #0b0d13; stroke-width: 1.5; animation: talkblip 1.6s ease-in-out infinite; }
+  @keyframes talkblip { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
   .edge-hit:hover + .edge.comms, .edge.comms:hover { stroke-width: 4 !important; }
 
   /* ---------- drawer ---------- */
@@ -469,6 +471,14 @@
     const m = el("text", { class: "t", "text-anchor": "middle", y: 38 });
     m.textContent = clip(shortName(d), 16);
     g.appendChild(m);
+    // Spoke within the last 30s: a small filled pip, so "who is actually talking" is visible at a glance.
+    const act = activityOf(d);
+    if (act && Date.now() - act.at < 30000) {
+      g.appendChild(el("circle", { class: "talkpip", cx: 15, cy: -15, r: 4.5, fill: "var(--working)" }));
+      const tt = el("title", {});
+      tt.textContent = `talking now \u2014 ${act.count} message(s), last with ${counterpartName(act.withKey)}`;
+      g.appendChild(tt);
+    }
     if (d.via === "relay") {
       g.appendChild(el("rect", { class: "badge", x: -21, y: -36, width: 42, height: 14, rx: 7 }));
       const bt = el("text", { class: "badge-t", "text-anchor": "middle", y: -26 });
@@ -562,6 +572,19 @@
       else byOther.set(otherKey, { otherKey, count: f.count, lastTs: f.lastTs });
     }
     return [...byOther.values()];
+  }
+
+  /**
+   * Latest message activity for a peer, derived from the journal flows we already fold — so no roster
+   * field is required (agreed with the bus owner: one fewer core.ts change, same result). Returns the
+   * most recent exchange, whichever direction, and who it was with.
+   */
+  function activityOf(d) {
+    const mine = flowsFor(d);
+    if (!mine.length) return null;
+    let best = mine[0];
+    for (const f of mine) if (f.lastTs > best.lastTs) best = f;
+    return { at: best.lastTs, withKey: best.otherKey, count: mine.reduce((n, f) => n + f.count, 0) };
   }
 
   /** Display name for a model item id, so the drawer names the counterpart instead of a hash. */
@@ -700,7 +723,8 @@
     // Reuse the SAME loose endpoint matching as the map arcs — the journal may key on a short id while
     // the roster carries the full one, and a strict compare made the drawer contradict the map.
     const mine = flowsFor(d).map((f) => ({ from: short(f.otherKey), to: "you", count: f.count, lastTs: f.lastTs, other: f.otherKey }));
-    const talking = d.lastMessageAt && Date.now() - d.lastMessageAt < 30000;
+    const act = activityOf(d);
+    const talking = act && Date.now() - act.at < 30000;
     return `
       <div class="close">x</div>
       <h3>${esc(d.title)}</h3>
@@ -715,7 +739,7 @@
         ${d.stableId ? `<dt>session id</dt><dd>${esc(d.stableId)}</dd>` : ""}
         <dt>bus id</dt><dd>${esc(d.id)}</dd>
         ${d.statusSeq != null ? `<dt>status seq</dt><dd>${d.statusSeq}</dd>` : ""}
-        ${d.lastMessageAt ? `<dt>last msg</dt><dd>${ago(d.lastMessageAt)}</dd>` : ""}
+        ${act ? `<dt>last msg</dt><dd>${ago(act.at)} with ${esc(counterpartName(act.withKey))}</dd>` : ""}
       </dl>
       ${d.statusText ? `<div class="note">${esc(d.statusText)}</div>` : ""}
       ${mine.length
