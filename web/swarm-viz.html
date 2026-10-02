@@ -204,7 +204,7 @@
   .legend {
     position: absolute; left: 20px; bottom: 18px; display: flex; gap: 15px; flex-wrap: wrap; align-items: center;
     color: var(--faint); font-size: 11px; background: var(--panel); border: 1px solid var(--line);
-    border-radius: 11px; padding: 9px 14px; max-width: calc(100% - 40px); z-index: 3;
+    border-radius: 11px; padding: 9px 14px; max-width: calc(100% - 330px); z-index: 3; right: auto;
     backdrop-filter: blur(14px);
   }
   .legend i { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
@@ -212,9 +212,33 @@
   .empty { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; color: var(--ink-dim); padding: 40px; }
   .empty b { color: var(--ink); display: block; margin-bottom: 8px; font-size: 14px; }
   .offline { color: var(--blocked); }
-  .hint { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); color: var(--faint);
+  .hint { position: absolute; right: 20px; bottom: 18px; color: var(--faint); white-space: nowrap;
     font-size: 10.5px; background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 5px 13px;
     backdrop-filter: blur(14px); z-index: 2; }
+
+  /* ---------- light theme ---------- */
+  html[data-theme="light"] {
+    --bg0: #f7f8fb; --bg1: #eef1f7; --panel: rgba(255,255,255,.82); --panel-solid: #ffffff;
+    --line: rgba(15,23,42,.10); --line-soft: rgba(15,23,42,.06);
+    --ink: #131722; --ink-dim: #565e72; --faint: #8a92a6;
+    --shadow: 0 1px 0 rgba(255,255,255,.6) inset, 0 12px 28px rgba(15,23,42,.10);
+  }
+  html[data-theme="light"] body {
+    background:
+      radial-gradient(1100px 620px at 78% -12%, rgba(110,168,254,.14), transparent 60%),
+      radial-gradient(900px 520px at 12% 8%, rgba(185,139,255,.10), transparent 62%),
+      linear-gradient(180deg, var(--bg1), var(--bg0));
+  }
+  html[data-theme="light"] .grp rect { fill: rgba(15,23,42,.022); }
+  html[data-theme="light"] .grp.local rect { fill: rgba(63,208,138,.06); }
+  html[data-theme="light"] .node .ring { fill: rgba(255,255,255,.92); stroke: rgba(15,23,42,.12); }
+  html[data-theme="light"] .node .glyph { fill: #fff; }
+  html[data-theme="light"] .boxnode .body { fill: rgba(255,180,84,.14); }
+  html[data-theme="light"] .boxnode .ring { fill: rgba(255,255,255,.92); }
+  html[data-theme="light"] .empty-note, html[data-theme="light"] .legend { color: var(--ink-dim); }
+  .themebtn { border: 1px solid var(--line); background: rgba(255,255,255,.04); color: var(--ink-dim);
+    border-radius: 9px; width: 30px; height: 28px; cursor: pointer; font-size: 13px; line-height: 1; }
+  .themebtn:hover { color: var(--ink); border-color: rgba(255,255,255,.2); }
 </style>
 </head>
 <body>
@@ -229,6 +253,7 @@
     <div class="spacer"></div>
     <div class="filters" id="filters"></div>
     <input class="search" id="search" placeholder="Search sessions, cwd, machine…" />
+    <button class="themebtn" id="theme" title="Toggle light / dark">◐</button>
   </header>
   <div id="stage">
     <svg id="svg"><defs>
@@ -252,7 +277,7 @@
       <span class="sep"></span>
       <span id="stale-info"></span>
     </div>
-    <div class="hint">drag to pan · scroll to zoom · click a node for detail</div>
+    <div class="hint">drag to pan · scroll to zoom · click a node for detail · <b>/</b> search · <b>esc</b> clear</div>
     <aside id="drawer"></aside>
   </div>
 </div>
@@ -651,7 +676,9 @@
         ? flows.slice(0, 12).map((f) => `<div class="flowrow">
             <span class="who">${esc(short(f.from))}</span><span class="arrow">→</span><span class="who">${esc(short(f.to))}</span>
             <span class="v">${f.count}× · ${ago(f.lastTs)}</span></div>`).join("")
-        : `<div class="empty-note">No message journal yet. The bus records no message metadata today; this panel lights up when it does. Nothing is inferred here.</div>`
+        : s.msgLogEnabled
+          ? `<div class="empty-note">Message logging is ON, but nothing has been exchanged yet. Traffic appears here as it happens.</div>`
+          : `<div class="empty-note">Message logging is OFF, so the bus writes no journal and there is nothing to show. Start bus sessions with <code>AGENTHOP_MSGLOG=1</code> to record who talks to whom (metadata only; bodies need <code>AGENTHOP_MSGLOG_PAYLOAD=1</code>). Nothing is inferred here.</div>`
     }</div>`);
 
     // DEPARTURES — peers seen before, gone now.
@@ -709,7 +736,9 @@
       <div class="kind">message history \u00b7 ${evs.length} event(s)</div>
       ${evs.length
         ? `<div class="tl">${rows}</div>`
-        : `<div class="empty-note">No messages recorded between these two. The bus keeps no message history today, so nothing is shown rather than guessed.</div>`}
+        : `<div class="empty-note">${state.msgLogEnabled
+            ? "No messages between these two in the journal window. They may be talking before the window, or not at all."
+            : "Message logging is OFF, so no history exists to show. Start sessions with <code>AGENTHOP_MSGLOG=1</code> to record it."}</div>`}
       ${state.payloadLogged
         ? ""
         : `<div class="note" style="margin-top:14px">Metadata only (time, direction, size). Message bodies are not logged by the bus, so no text is shown here — this is not a missing feature on the page.</div>`}
@@ -744,7 +773,9 @@
       ${d.statusText ? `<div class="note">${esc(d.statusText)}</div>` : ""}
       ${mine.length
         ? `<div class="sec">message flow</div>${mine.map((f) => `<div class="flowrow"><span class="who">${esc(counterpartName(f.other))}</span><span class="v">${f.count}x &middot; ${ago(f.lastTs)}</span></div>`).join("")}`
-        : `<div class="sec">message flow</div><div class="empty-note">No traffic recorded. The bus keeps no message history today, so nothing is shown rather than guessed.</div>`}
+        : `<div class="sec">message flow</div><div class="empty-note">${state.msgLogEnabled
+            ? "No traffic for this session in the journal window."
+            : "Message logging is OFF \u2014 no history exists to show."}</div>`}
       ${d.via === "relay" ? `<div class="note" style="margin-top:12px">Remote peer: presence is announced every 60s, so this status can lag up to a minute. Read "changed", not the poll rate.</div>` : ""}
     `;
   }
@@ -876,9 +907,12 @@
   }
 
   const svg = $("svg");
+  let userMoved = false;
+  window.addEventListener("resize", () => { if (!userMoved) fit(); });
   let drag = null;
   svg.addEventListener("mousedown", (e) => {
     if (e.target.closest(".node")) return;
+    userMoved = true;
     drag = { x: e.clientX - view.x, y: e.clientY - view.y };
     svg.classList.add("grabbing");
   });
@@ -889,6 +923,7 @@
   window.addEventListener("mouseup", () => { drag = null; svg.classList.remove("grabbing"); });
   svg.addEventListener("wheel", (e) => {
     e.preventDefault();
+    userMoved = true;
     const rect = svg.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     const k2 = Math.min(2.6, Math.max(0.3, view.k * (e.deltaY < 0 ? 1.1 : 0.9)));
@@ -899,6 +934,18 @@
   svg.addEventListener("click", () => { if (sel) { sel = null; render(); } });
 
   $("search").addEventListener("input", (e) => { query = e.target.value.trim().toLowerCase(); render(); });
+
+  // Keyboard: Esc clears the selection, / focuses search. Both keep the hands on the keyboard during a
+  // long watch session, which is the main way this page is actually used.
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      if (sel || pair) { sel = null; pair = null; render(); }
+      else if (query) { $("search").value = ""; query = ""; render(); }
+    } else if (e.key === "/" && document.activeElement !== $("search")) {
+      e.preventDefault();
+      $("search").focus();
+    }
+  });
 
   // ---------------------------------------------------------------- poll + local clock tick
   async function tick() {
@@ -913,6 +960,17 @@
   }
 
   wireFilters();
+  // Theme persists across reloads; default follows the OS preference on first visit.
+  (() => {
+    const saved = localStorage.getItem("swarm-viz-theme");
+    const initial = saved || (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    document.documentElement.setAttribute("data-theme", initial);
+    $("theme").onclick = () => {
+      const next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+      document.documentElement.setAttribute("data-theme", next);
+      localStorage.setItem("swarm-viz-theme", next);
+    };
+  })();
   tick();
   setInterval(tick, 2000);
   // Re-render local clocks (countdown, ago) every second without a refetch.
