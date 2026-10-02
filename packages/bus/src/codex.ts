@@ -19,8 +19,10 @@ import { dbg } from "./debug.js";
  */
 
 export type CodexDaemon = {
-  /** The thread to deliver into: the most recently active one, else the first loaded. */
-  activeThread(): string | undefined;
+  /** The thread to deliver into. Given the caller's own cwd, the loaded thread whose session cwd matches
+   *  it (unambiguously) — so an IDLE session that never touched the bus is still reachable. Falls back to
+   *  the sole loaded thread when there is only one, else undefined. */
+  activeThread(cwd?: string): string | undefined;
   close(): void;
 };
 
@@ -69,6 +71,9 @@ export function startCodexDaemon(): CodexDaemon | undefined {
 
   let closed = false;
   let loaded: string[] = [];
+  // threadId -> its session's cwd (immutable per thread), read once from the daemon. Lets a node pin ITS
+  // OWN thread by matching self.cwd, so delivery works even to a session that never called the bus.
+  const cwdByThread = new Map<string, string>();
   let lastActive: string | undefined;
   let current: net.Socket | undefined;
   let ready = false;
@@ -164,6 +169,13 @@ export function startCodexDaemon(): CodexDaemon | undefined {
           } else if (method === "thread/loaded/list") {
             loaded = pickThreads(m.result);
             dbg(`daemon loaded=${JSON.stringify(loaded)}`);
+            // Learn each loaded thread's cwd once (immutable), and drop entries that have unloaded.
+            for (const id of [...cwdByThread.keys()]) if (!loaded.includes(id)) cwdByThread.delete(id);
+            for (const id of loaded) if (!cwdByThread.has(id)) request("thread/read", { threadId: id });
+          } else if (method === "thread/read") {
+            const t = (m.result as { thread?: { id?: string; environments?: { environmentId?: string; cwd?: string }[] } } | undefined)?.thread;
+            const cwd = t?.environments?.find((e) => e.environmentId === "local")?.cwd ?? t?.environments?.[0]?.cwd;
+            if (t?.id && typeof cwd === "string") { cwdByThread.set(t.id, cwd); dbg(`daemon thread ${t.id} cwd=${cwd}`); }
           }
         }
       }
@@ -183,12 +195,15 @@ export function startCodexDaemon(): CodexDaemon | undefined {
   refresh.unref?.();
 
   return {
-    // Deliver only to a thread we can pin unambiguously. The daemon is shared across every Codex
-    // session for this user, so "most recently active" is a GLOBAL guess that can push a message
-    // into the wrong session (cross-talk). The precise binding is ownCodexThread (the thread that
-    // called this bus, tracked in core); here we only auto-surface when exactly one thread is loaded
-    // — no ambiguity possible. Otherwise return undefined so the message stays for agenthop_recv.
-    activeThread: () => (loaded.length === 1 ? loaded[0] : undefined),
+    // Deliver only to a thread we can pin unambiguously. The daemon is shared across every Codex session
+    // for this user, so a global "most recently active" guess can push a message into the wrong session
+    // (cross-talk). Two unambiguous pins, in order: (1) the loaded thread whose session cwd equals the
+    // caller's own cwd — a correct binding even for an IDLE session that never called the bus, as long as
+    // exactly one loaded thread sits in that cwd; (2) the sole loaded thread when there is only one. Any
+    // ambiguity (no cwd match, or several threads share the cwd) returns undefined, so the message stays
+    // durably queued for agenthop_recv rather than risk the wrong session. The authoritative binding is
+    // still ownCodexThread (the thread that actually called this bus), handled in core before this.
+    activeThread: (cwd) => pickThreadForCwd(loaded, cwdByThread, cwd),
     close: () => {
       closed = true;
       clearInterval(refresh);
@@ -263,6 +278,21 @@ function readFrame(buf: Buffer): { fin: boolean; opcode: number; payloadBuf: Buf
     payload = out;
   }
   return { fin, opcode, payloadBuf: Buffer.from(payload), rest: buf.subarray(offset + maskLen + len) };
+}
+
+/**
+ * Choose the Codex thread to deliver into, avoiding cross-talk between sessions that share one daemon:
+ *  1. the loaded thread whose session cwd UNIQUELY equals the caller's own cwd (reaches an idle session
+ *     that never touched the bus — as long as exactly one loaded thread sits in that cwd);
+ *  2. otherwise the sole loaded thread, when there is only one;
+ *  3. otherwise undefined — ambiguous, so the message stays durably queued rather than risk misdelivery.
+ */
+export function pickThreadForCwd(loaded: string[], cwdByThread: Map<string, string>, cwd?: string): string | undefined {
+  if (cwd) {
+    const matches = loaded.filter((id) => cwdByThread.get(id) === cwd);
+    if (matches.length === 1) return matches[0];
+  }
+  return loaded.length === 1 ? loaded[0] : undefined;
 }
 
 /** thread/loaded/list data is id strings on Codex 0.158; be lenient about object shapes too. */

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, releaseInbox, writeInbox } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox } from "../src/inbox.js";
 
 let HOME: string;
 beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-inbox-")); });
@@ -47,5 +47,26 @@ describe("durable inbox", () => {
 
   test("empty / missing inbox -> no claims, no throw", () => {
     expect(claimInbox(HOME, ["nope"], "p")).toEqual([]);
+  });
+
+  test("recoverStaleClaims rescues a message a dead claimer orphaned", () => {
+    writeInbox(HOME, "s1", msg("stranded", 1000));
+    // Simulate a drainer that claimed then died (never ack'd/released): rename .json -> .claim-<deadpid>.
+    const c = claimInbox(HOME, ["s1"], "999999"); // pid 999999 is not running
+    expect(c.length).toBe(1);
+    // Still claimed -> a fresh claim sees nothing (claimInbox only looks at .json).
+    expect(claimInbox(HOME, ["s1"], "p2").length).toBe(0);
+    // Recovery releases the dead pid's claim; now it is claimable again.
+    recoverStaleClaims(HOME, ["s1"]);
+    const again = claimInbox(HOME, ["s1"], "p2");
+    expect(again.length).toBe(1);
+    expect(again[0].msg.text).toBe("stranded");
+  });
+
+  test("recoverStaleClaims leaves a LIVE claimer's message alone", () => {
+    writeInbox(HOME, "s1", msg("inflight", 1000));
+    claimInbox(HOME, ["s1"], String(process.pid)); // claimed by us (alive)
+    recoverStaleClaims(HOME, ["s1"]); // must NOT steal it
+    expect(claimInbox(HOME, ["s1"], "p2").length).toBe(0);
   });
 });

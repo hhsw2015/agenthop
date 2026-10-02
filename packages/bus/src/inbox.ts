@@ -66,3 +66,31 @@ export function ackInbox(file: string): void {
 export function releaseInbox(file: string): void {
   try { renameSync(file, file.replace(/\.claim-[^.]+$/, "")); } catch { /* best-effort */ }
 }
+
+/**
+ * Release claims whose holder process is gone. A drainer that crashed/restarted (or broke out of its flush
+ * loop) mid-delivery leaves the file as `.claim-<pid>`; claimInbox only sees `.json`, so without this sweep
+ * that message is stranded forever — the exact loss the durable inbox exists to prevent. A claim held by a
+ * LIVE pid is left alone (it is being delivered right now). Run at startup, before the first flush.
+ */
+export function recoverStaleClaims(home: string, keys: string[]): void {
+  const seen = new Set<string>();
+  for (const key of keys) {
+    const dir = inboxDir(home, key);
+    if (seen.has(dir) || !existsSync(dir)) continue;
+    seen.add(dir);
+    let names: string[];
+    try { names = readdirSync(dir); } catch { continue; }
+    for (const n of names) {
+      const m = n.match(/\.claim-(\d+)$/);
+      if (!m || alive(Number(m[1]))) continue;
+      try { renameSync(path.join(dir, n), path.join(dir, n.replace(/\.claim-\d+$/, ""))); } catch { /* best-effort */ }
+    }
+  }
+}
+
+/** True while the pid is a running process — including one we may not signal (EPERM). */
+function alive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}

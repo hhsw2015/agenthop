@@ -8,7 +8,7 @@ import { resolvePeer, type UnifiedPeer } from "./resolve.js";
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
-import { ackInbox, claimInbox, releaseInbox, writeInbox } from "./inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox } from "./inbox.js";
 
 export { resolvePeer, type UnifiedPeer } from "./resolve.js";
 
@@ -92,11 +92,16 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     if (flushing) return;
     flushing = true;
     try {
-      const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread());
-      for (const c of claimInbox(home, inboxKeys(), String(process.pid))) {
-        const ok = await pushToHost(c.msg.fromLabel, c.msg.text, { codexThread });
-        if (ok) ackInbox(c.file);
-        else { releaseInbox(c.file); break; }
+      const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
+      // claimInbox claims the WHOLE pending batch up front. On the first push failure (channel not ready) we
+      // must release this one AND every still-unprocessed claim — otherwise they are orphaned as .claim-<pid>
+      // files that no later flush reclaims (claimInbox only sees .json), stranding the message for good.
+      const claimed = claimInbox(home, inboxKeys(), String(process.pid));
+      for (let i = 0; i < claimed.length; i++) {
+        const ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread });
+        if (ok) { ackInbox(claimed[i].file); continue; }
+        for (let j = i; j < claimed.length; j++) releaseInbox(claimed[j].file);
+        break;
       }
     } finally {
       flushing = false;
@@ -108,13 +113,13 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const handleInbound = (from: string, text: string, via: "local" | "relay"): void => {
     // Delivery is locked to this session's learned identity (codexDeliveryThread), so it never diverges from the
     // published stableId. Learn from the SAME value: authoritative from call metadata, a guess from the daemon.
-    const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread());
+    const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
     learnStableId(codexThread, ownCodexThread !== undefined);
     const label = labelFor(from);
     // Metadata-only comms journal for swarm observability. Gated so Buffer.byteLength + the call are skipped entirely
     // when AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
     if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from, to: self.id, via, direction: "in", size: Buffer.byteLength(text), text });
-    dbg(`inbound via=${via} from=${from} own=${ownCodexThread} stable=${self.stableId} daemon=${codexDaemon?.activeThread()} -> codexThread=${codexThread}`);
+    dbg(`inbound via=${via} from=${from} own=${ownCodexThread} stable=${self.stableId} daemon=${codexDaemon?.activeThread(self.cwd)} -> codexThread=${codexThread}`);
     void pushToHost(label, text, { codexThread }).then((ok) => {
       dbg(`pushToHost ok=${ok}`);
       if (ok) void flushInbox(); // channel works -> also deliver any durable backlog (keeps order)
@@ -211,9 +216,11 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const stopStatusWatch = watchStatusDir(statusHome, applyStatusFromFile);
   applyStatusFromFile(); // pick up a file that already exists at startup
 
-  // Durable-inbox retry: deliver anything queued while the native channel was not ready. Flush once now to pick up
-  // messages a previous MCP-subprocess run persisted (restart durability). Unref'd — the broker socket keeps the
-  // process alive; this timer must not by itself.
+  // Durable-inbox retry: deliver anything queued while the native channel was not ready. First release any claims
+  // a previous run left behind when it died/broke mid-flush (otherwise they are stranded forever), then flush once
+  // to pick up messages a previous MCP-subprocess run persisted (restart durability). Unref'd — the broker socket
+  // keeps the process alive; this timer must not by itself.
+  recoverStaleClaims(home, inboxKeys());
   void flushInbox();
   const flushTimer = setInterval(() => void flushInbox(), 5000);
   flushTimer.unref?.();
