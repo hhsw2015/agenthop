@@ -143,6 +143,10 @@
   .boxnode .cd.warn { fill: var(--warn); }
   .boxnode .cd.dead { fill: var(--expired); }
   .boxnode .glyph { fill: var(--warn); }
+  /* Allocation attempts exhausted: needs a human, so it reads as an alarm rather than a state. */
+  .boxnode.stuck .body { stroke: var(--blocked); }
+  .boxnode.stuck .ring { stroke: rgba(255,95,109,.5); stroke-dasharray: 3 3; }
+  .boxnode.stuck .st { fill: var(--blocked); }
 
   /* edges */
   .edge { fill: none; stroke: var(--relay); stroke-width: 1.8; opacity: .55; marker-end: url(#arrow); }
@@ -648,7 +652,8 @@
   function renderBox(it) {
     const b = it.data;
     const state_ = b.control?.state ?? "no-record";
-    const g = el("g", { class: `node boxnode st-${state_}`, "data-status": "unknown" });
+    const stuck = it.data.allocExhausted ? " stuck" : "";
+    const g = el("g", { class: `node boxnode st-${state_}${stuck}`, "data-status": "unknown" });
     g.appendChild(el("title", {})).textContent = `${b.launchId}\n${state_}${b.deadlineEpoch ? "\ndeadline " + new Date(b.deadlineEpoch * 1000).toLocaleString() : ""}`;
     g.appendChild(el("circle", { class: "halo", r: 38 }));
     g.appendChild(el("rect", { class: "ring", x: -27, y: -27, width: 54, height: 54, rx: 14 }));
@@ -1129,6 +1134,7 @@
         ${c && c.owner ? `<dt>owner</dt><dd>${esc(c.owner)}</dd>` : ""}
         ${c && c.updatedAt ? `<dt>updated</dt><dd>${ago(c.updatedAt * 1000)}</dd>` : ""}
       </dl>
+      ${b.allocExhausted ? `<div class="recover">Allocation attempts exhausted (${b.attemptCount ?? "?"} of the cap) — this launch is stuck and needs a human. Derived from attemptCount, not a field in the record.</div>` : ""}
       ${b.recoverable ? `<div class="recover">VM expired, but this task is recoverable — the checkpoint sha above is still canonical, so a successor can resume from it.</div>` : ""}
       ${lineage(b)}
       ${flows.length ? `<div class="sec">message flow</div>${flows.map((f) => `<div class="flowrow"><span class="who">${esc(short(f.from))}</span><span class="arrow">→</span><span class="who">${esc(short(f.to))}</span><span class="v">${f.count}× · ${ago(f.lastTs)}</span></div>`).join("")}` : ""}
@@ -1155,7 +1161,9 @@
     for (let i = 0; i < 12; i++) {
       const nextId = cur.control?.successor;
       const next = nextId ? byId.get(nextId) : null;
-      if (!next) { if (nextId) chain.push({ launchId: nextId, control: null, sha: null, generation: null, shortId: nextId }); break; }
+      // A successor that names no existing record is a DANGLING link (the contract's samples have some).
+      // Render it as explicitly missing rather than as a record-less row, so a broken chain reads as broken.
+      if (!next) { if (nextId) chain.push({ launchId: nextId, control: null, sha: null, generation: null, shortId: nextId, dangling: true }); break; }
       chain.push(next);
       cur = next;
     }
@@ -1163,7 +1171,7 @@
     return `<div class="sec">lineage · generation chain</div><div class="tl">${
       chain.map((x) => `<div class="tl-item${x.launchId === b.launchId ? "" : " muted"}">
         <div>${esc(x.launchId)}${x.generation != null ? ` <span class="when">gen ${x.generation}</span>` : ""}</div>
-        <div class="when">${x.control ? esc(x.control.state) : "no record"}${x.sha ? ` · ${esc(String(x.sha).slice(0, 10))}` : ""}</div>
+        <div class="when">${x.dangling ? "<span style=\"color:var(--blocked)\">record missing (dangling successor)</span>" : x.control ? esc(x.control.state) : "no record"}${x.sha ? ` · ${esc(String(x.sha).slice(0, 10))}` : ""}</div>
       </div>`).join("")
     }</div>`;
   }

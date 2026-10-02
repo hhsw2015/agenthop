@@ -15,8 +15,8 @@
 // session (that is how discovery works), so it appears on other machines' rosters as a phantom node; we
 // drop our own row from the snapshot and export observerId so the page can label it.
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startBusCore } from "../packages/bus/src/core.js";
@@ -114,6 +114,8 @@ export type VizBox = {
   handoffSha: string | null;
   /** EXPIRED is a VM terminal state but the task is still RECOVERABLE (its sha stays canonical). */
   recoverable: boolean;
+  /** DERIVED from attemptCount vs the cap — not a field the record carries. Needs a human. */
+  allocExhausted: boolean;
 };
 
 /** One "task" as it can be known TODAY: the lifecycle of a single launch. The richer fan-out / gather /
@@ -202,6 +204,24 @@ export function matchNode(peers: Pick<UnifiedPeer, "title">[], launchId: string)
   if (full >= 0) return full;
   const short = shortId(launchId);
   return peers.findIndex((p) => p.title.includes(short));
+}
+
+/** Allocation attempts beyond which a launch is considered stuck (contract: MAX_ALLOC_ATTEMPTS). */
+export function maxAllocAttempts(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number(env.SWARM_MAX_ALLOC_ATTEMPTS);
+  return Number.isFinite(n) && n > 0 ? n : 3;
+}
+
+/**
+ * True when a launch has burned every allocation attempt without progressing. The ControlRecord has no
+ * explicit giveUp field — the contract says to infer it from attemptCount against the cap — so this is the
+ * one derived (not reported) signal on the page, and the UI labels it as such.
+ */
+export function isAllocExhausted(control: ControlSlot | undefined, cap = maxAllocAttempts()): boolean {
+  if (!control) return false;
+  // Only meaningful while still trying: a RETIRED/DONE/EXPIRED launch is not "stuck", it is finished.
+  const active = control.state === "CLAIMED" || control.state === "ALLOCATING" || control.state === "DRAINING";
+  return active && (control.attemptCount ?? 0) >= cap;
 }
 
 /** The display short id for a launchId: the segment after the last "-". */
@@ -299,22 +319,31 @@ export function readControlRecords(home: string): Map<string, ControlSlot> {
   return out;
 }
 
-/** launchIds that have a local allocation keydir on this machine, with their alloc timestamp (epoch s). */
-export function readLocalAllocs(): Map<string, number> {
+/**
+ * launchIds that have a local allocation keydir on this machine, with their alloc timestamp (epoch s).
+ *
+ * The directory name is NOT a reliable launchId on its own: the launcher's convention is
+ * `ah-rwkey-<launchId>`, but that prefix also catches hand-made test dirs (`ah-rwkey-diag`, ...), and a
+ * plain `startsWith` turned every one of them into a phantom box on the graph. A real keydir is identified
+ * by its contents, not its name: it holds an `alloc-ts` written when the box was confirmed live. Require
+ * that file AND the rw- id shape, so a scratch directory cannot impersonate a box.
+ */
+export function readLocalAllocs(tmpDir = "/tmp"): Map<string, number> {
   const out = new Map<string, number>();
   let names: string[];
   try {
-    names = readdirSync("/tmp").filter((n) => n.startsWith("ah-rwkey-"));
+    names = readdirSync(tmpDir).filter((n) => n.startsWith("ah-rwkey-"));
   } catch {
     return out;
   }
   for (const name of names) {
     const launchId = name.replace(/^ah-rwkey-/, "");
+    if (!/^rw-[A-Za-z0-9._-]+$/.test(launchId)) continue; // not a launcher-minted id
     try {
-      const ts = Number(readFileSync(path.join("/tmp", name, "alloc-ts"), "utf8").trim());
+      const ts = Number(readFileSync(path.join(tmpDir, name, "alloc-ts"), "utf8").trim());
       if (Number.isFinite(ts)) out.set(launchId, ts);
     } catch {
-      // no alloc-ts yet (keydir created, box not confirmed)
+      // no alloc-ts yet (keydir created, box not confirmed) — correctly not a box
     }
   }
   return out;
@@ -392,6 +421,7 @@ export function buildSnapshot(
       attemptCount: control?.attemptCount ?? null,
       handoffSha: control?.handoffSha ?? null,
       recoverable: control?.state === "EXPIRED",
+      allocExhausted: isAllocExhausted(control),
     });
   }
 
@@ -577,6 +607,36 @@ function selftest(): void {
   t("a file task is marked as such", tasks.find((x) => x.taskId === "t1")!.fromControlMirror === false);
   t("the mirror task is marked as such", tasks.find((x) => x.taskId === "rw-b")!.fromControlMirror === true);
   t("a covered launchId is not duplicated from the mirror", tasks.filter((x) => x.taskId === "rw-a" && x.fromControlMirror).length === 0);
+
+  // Allocation exhaustion: inferred, so it gets its own assertions.
+  t("attempts under the cap -> not exhausted", !isAllocExhausted({ launchId: "x", state: "CLAIMED", attemptCount: 2 }));
+  t("attempts AT the cap while active -> exhausted", isAllocExhausted({ launchId: "x", state: "CLAIMED", attemptCount: 3 }));
+  t("over the cap -> exhausted", isAllocExhausted({ launchId: "x", state: "ALLOCATING", attemptCount: 4 }));
+  t("a finished launch is never 'stuck'", !isAllocExhausted({ launchId: "x", state: "RETIRED", attemptCount: 9 }));
+  t("EXPIRED is finished, not stuck", !isAllocExhausted({ launchId: "x", state: "EXPIRED", attemptCount: 9 }));
+  t("no record -> not exhausted", !isAllocExhausted(null));
+  t("no attemptCount -> not exhausted", !isAllocExhausted({ launchId: "x", state: "CLAIMED" }));
+  t("the cap is overridable", isAllocExhausted({ launchId: "x", state: "CLAIMED", attemptCount: 5 }, 5));
+  t("the default cap is 3", maxAllocAttempts({} as NodeJS.ProcessEnv) === 3 && maxAllocAttempts({ SWARM_MAX_ALLOC_ATTEMPTS: "7" } as NodeJS.ProcessEnv) === 7);
+
+  // Keydir detection: a real one is identified by CONTENT (an alloc-ts), not by its name. Every
+  // /tmp/ah-rwkey-* used to become a phantom box, including hand-made scratch dirs.
+  {
+    const dir = mkdtempSync(path.join(tmpdir(), "ah-keydirs-"));
+    try {
+      mkdirSync(path.join(dir, "ah-rwkey-rw-real1")); writeFileSync(path.join(dir, "ah-rwkey-rw-real1", "alloc-ts"), "1700000000");
+      mkdirSync(path.join(dir, "ah-rwkey-diag")); writeFileSync(path.join(dir, "ah-rwkey-diag", "alloc-ts"), "1700000001"); // scratch dir WITH a ts
+      mkdirSync(path.join(dir, "ah-rwkey-rw-real2")); // id-shaped but no alloc-ts -> not confirmed live
+      mkdirSync(path.join(dir, "ah-rwkey-direct-test")); writeFileSync(path.join(dir, "ah-rwkey-direct-test", "id"), "x"); // scratch, no ts
+      const got = readLocalAllocs(dir);
+      t("a confirmed keydir is a box", got.has("rw-real1"));
+      t("a scratch dir with a ts is still not a box (id shape required)", !got.has("diag") && !got.has("direct-test"));
+      t("an id-shaped dir with no alloc-ts is not confirmed live", !got.has("rw-real2"));
+      t("exactly one box found", got.size === 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
 
   console.log("all selftests passed");
 }
