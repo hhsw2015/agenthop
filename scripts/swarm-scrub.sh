@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Box-side self-scrub, invoked by swarm-supervisor.mjs from its OWN session (NOT the worker's tmux), after work is
+# confirmed on the remote / at the deadline. HONEST SCOPE (Codex P2-4): this is BEST-EFFORT local deletion, not a
+# "no trace / credentials invalidated" guarantee. The real boundary is short-lived, least-privilege, server-side-
+# revocable credentials: the CPA eph token expires <=60min and the GitHub token should be a fine-grained, single-
+# repo, short-expiry PAT. `rm` cannot un-copy a token that already leaked, cannot scrub another process's argv
+# except by killing it, and same-UID env remains readable while a process lives. We therefore: stop the writers
+# first (kill the worker session -> drops its in-memory CPA/GitHub tokens), then delete the on-disk secret-bearing
+# paths, then return so the supervisor can exit itself last.
+set -u
+
+SESSION="${SWARM_TMUX_SESSION:-swarm}"
+WORK_DIR="${SWARM_WORK_DIR:-}"
+RUNTIME_DIR="${SWARM_RUNTIME_DIR:-}"   # holds the GIT_ASKPASS token file + req/ack
+
+log() { echo "[scrub] $*" >&2; }
+
+# 1. Stop the writers FIRST. Killing the worker tmux session terminates the Claude TUI (and any children), dropping
+#    the CPA + GitHub tokens that were in its process environment/argv. The supervisor lives in a different session,
+#    so this does not kill the scrubber.
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  log "killing worker session $SESSION"
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+fi
+
+# 2. Delete on-disk secret/trace-bearing paths (each guarded; best-effort).
+for p in \
+  "$RUNTIME_DIR" \
+  "$WORK_DIR" \
+  /tmp/ah-mcp.json \
+  /tmp/swarm-* \
+  "$HOME/.config/gh" \
+  "$HOME/.git-credentials"; do
+  [ -n "$p" ] || continue
+  for match in $p; do
+    [ -e "$match" ] || continue
+    log "rm -rf $match"
+    rm -rf "$match" 2>/dev/null || true
+  done
+done
+
+# 3. Best-effort: clear this shell's view of the tokens (does not touch other live processes).
+unset GITHUB_TOKEN ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY GIT_ASKPASS 2>/dev/null || true
+
+log "scrub complete (best-effort; credential expiry/revocation is the real boundary)"
