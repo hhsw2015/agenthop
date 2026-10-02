@@ -32,6 +32,10 @@ const RUNTIME_DIR = must("SWARM_RUNTIME_DIR");
 const TMUX_SESSION = env.SWARM_TMUX_SESSION || "swarm";
 const SCRUB = env.SWARM_SCRUB || "";
 const GOAL = env.SWARM_GOAL || "";
+// Resume seed (set by swarm-task --resume): this successor's branch was seeded AT the predecessor's handoffSha, whose
+// manifest is a `final`. That seed tip must NOT be treated as OUR final (it would freeze us) — build the first
+// milestone on top of it instead. Empty for a fresh (non-resume) box.
+let RESUME_FROM = env.SWARM_RESUME_FROM || "";
 // Allowlist is REQUIRED and must not be "." (Codex P1-3: "." / a shared index publishes logs/creds). Each entry is
 // a pathspec relative to the work tree; the private index means only these (plus the manifest) are ever committed.
 const ALLOWLIST = (must("SWARM_ALLOWLIST")).split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
@@ -186,11 +190,12 @@ async function publish(kind, { goal, next } = {}) {
     if (pm.code !== 0) return { ok: false, error: `parent ${parent.slice(0, 8)} manifest unreadable (phase unknown); refusing to publish past a possibly-final tip` };
     let parentKind;
     try { parentKind = JSON.parse(pm.stdout).kind; } catch { return { ok: false, error: `parent ${parent.slice(0, 8)} manifest parse failed (phase unknown); refusing` }; }
-    if (parentKind === "final") {
+    if (parentKind === "final" && parent !== RESUME_FROM) {
       finalized = true;            // freeze: never build past a confirmed final, even if we forgot we finalized
       lastPushedSha = parent;      // (no attemptedShas.clear(): this is a READ, not a confirmed push — see below)
       return { ok: true, sha: parent, unchanged: true, hitFinal: true };
     }
+    // else: parent === RESUME_FROM -> the resume seed (predecessor's final we were told to build ON), not our freeze.
   }
 
   // 3. build the tree from an EMPTY private index + ONLY the allowlist (+manifest). Starting empty means a
@@ -357,6 +362,9 @@ async function recoverFromRemote() {
   if (ls.code !== 0) { log(`startup: ls-remote failed (${ls.stderr.trim()}); proceeding without recovery`); return; }
   const tip = (ls.stdout.split(/\s+/)[0] || "").trim();
   if (!tip) return; // branch absent: fresh
+  // Resume seed: the branch tip IS the handoffSha we were told to build on. Adopt it as ours but do NOT run the
+  // finalized check below (its manifest is the predecessor's `final`; treating it as our final would freeze us).
+  if (tip === RESUME_FROM) { lastPushedSha = tip; log(`startup: resume seed ${tip.slice(0, 8)} — building on it (not finalizing)`); return; }
   lastPushedSha = tip; // single-publisher: the remote tip is ours
   let f = await git(["fetch", "-q", "origin", tip]);
   if (f.code !== 0) f = await git(["fetch", "-q", "origin", `refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}`]);
@@ -388,6 +396,7 @@ export function __state() { return { lastPushedSha, finalized, attempted: [...at
 export function __reset(s = {}) {
   lastPushedSha = s.lastPushedSha ?? "";
   finalized = s.finalized ?? false;
+  RESUME_FROM = s.resumeFrom ?? "";
   attemptedShas.clear();
   for (const x of s.attempted ?? []) attemptedShas.add(x);
 }

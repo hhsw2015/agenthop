@@ -212,3 +212,18 @@ test("P2-a: unsafe allowlist entries are rejected at import (exit 2); literal pa
   for (const bad of ["out/**", "**", "out/*", "./out", "a:b", "../x", "."]) assert.equal(run(bad), 2, `rejected: ${bad}`);
   for (const good of ["out", "dist/bundle.js", "src/gen"]) assert.equal(run(good), 0, `accepted: ${good}`);
 });
+
+test("resume: a branch seeded AT handoffSha (a final) is built upon, not frozen, when RESUME_FROM matches", async () => {
+  await withModel(async (m) => {
+    const cF = "cF";
+    m.commits[cF] = { tree: "tree-final", parent: "", manifest: JSON.stringify({ schemaVersion: 1, launchId: "rw-pred", generation: 0, kind: "final" }) };
+    m.remoteTip = cF;
+    sup.__reset({ lastPushedSha: cF, resumeFrom: cF }); // successor's branch seeded at handoffSha=cF (a predecessor final)
+    const r = await sup.publish("milestone", { next: "resumed work" });
+    assert.ok(r.ok, "publishes");
+    assert.ok(!r.hitFinal, "did NOT freeze on the seed final");
+    assert.equal(sup.__state().finalized, false, "not finalized");
+    assert.ok(m.remoteTip !== cF, "a new commit was pushed on top of the seed");
+    assert.equal(m.commits[m.remoteTip].parent, cF, "built directly on the seed (handoffSha)");
+  });
+});

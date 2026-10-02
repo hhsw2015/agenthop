@@ -110,6 +110,7 @@ sqadd SWARM_RUNTIME_DIR '/root/.swarm-rt'
 sqadd SWARM_ALLOWLIST "$ALLOWLIST"
 sqadd SWARM_SCRUB '/root/.swarm/swarm-scrub.sh'
 sqadd SWARM_TMUX_SESSION 'swarm'
+sqadd SWARM_RESUME_FROM "$RESUME_SHA"   # empty for --demo; the handoffSha seed for --resume (supervisor builds on it)
 
 # 1. ship the deploy key + sup-env + supervisor + scrub + demo worker to a private dir on the box.
 "${SSH[@]}" railway.new 'mkdir -p /root/.swarm && chmod 700 /root/.swarm' 2>&1 | filt | tail -1
@@ -149,14 +150,14 @@ SH
   echo setup-ok
 " 2>&1 | filt | tail -3
 
-# 2b. RESUME seed (only for --resume): create a resume-marker commit = handoffSha's TREE + a fresh milestone manifest
-#     for THIS successor, parent handoffSha; push it as the successor branch; seed the worktree (out/) from it. Then the
-#     successor's publishes DESCEND from handoffSha (ancestry proof for the dispatcher's resumed-ACK) and the supervisor
-#     does NOT freeze (the tip is a milestone, not the predecessor's final). Built LOCALLY + scp'd (validated hex/int
-#     values only; no remote expansion) — same safety pattern as sup-env.
+# 2b. RESUME seed (only for --resume): point the successor branch AT handoffSha and materialize that tree into the
+#     worktree. Then (a) the worktree really has out/ + manifest to continue from (git checkout, NOT a no-op read-tree),
+#     (b) the supervisor builds the first milestone ON handoffSha (SWARM_RESUME_FROM tells it not to freeze on that
+#     `final` seed), so its publishes descend from handoffSha, and (c) the dispatcher's resumed-ACK only fires on a REAL
+#     successor milestone (manifest.launchId = this successor), never on the seed (whose manifest is the predecessor's).
+#     Built LOCALLY + scp'd (validated hex/int values only; no remote expansion) — same safety pattern as sup-env.
 if [ -n "$RESUME_SHA" ]; then
-  echo "== resume: seed $BRANCH at a marker from ${RESUME_SHA:0:12} (gen $GEN) =="
-  MJSON="{\"schemaVersion\":1,\"launchId\":\"$LID\",\"generation\":$GEN,\"kind\":\"milestone\",\"next\":\"resumed from ${RESUME_SHA:0:12}\"}"
+  echo "== resume: seed $BRANCH at handoffSha ${RESUME_SHA:0:12} + materialize worktree (gen $GEN) =="
   RSEED="$(mktemp)"; trap 'rm -f "$SUPENV" "$RSEED"' EXIT
   cat > "$RSEED" <<SEED
 #!/bin/sh
@@ -164,16 +165,10 @@ set -e
 export GIT_SSH_COMMAND='ssh -i /root/.swarm/deploy-key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
 cd /root/work
 git fetch -q origin $RESUME_SHA
-midx="\$(mktemp)"
-GIT_INDEX_FILE="\$midx" git read-tree $RESUME_SHA
-mblob="\$(printf '%s' '$MJSON' | git hash-object -w --stdin)"
-GIT_INDEX_FILE="\$midx" git update-index --add --cacheinfo 100644 "\$mblob" .swarm/manifest.json
-mtree="\$(GIT_INDEX_FILE="\$midx" git write-tree)"
-marker="\$(git commit-tree "\$mtree" -p $RESUME_SHA -m 'swarm resume g$GEN')"
-git push -q origin "\$marker:refs/heads/$BRANCH"
-GIT_INDEX_FILE="\$midx" git read-tree -u -m "\$mtree"
-rm -f "\$midx"
-echo "resume-seeded \$marker"
+git push -q origin $RESUME_SHA:refs/heads/$BRANCH   # branch now points AT handoffSha (the seed)
+git checkout -q -B $BRANCH $RESUME_SHA              # materialize out/ + manifest into the worktree (real checkout)
+test -f .swarm/manifest.json || { echo "resume-seed: worktree not materialized" >&2; exit 5; }
+echo "resume-seeded $RESUME_SHA -> $BRANCH"
 SEED
   "${SCP[@]}" "$RSEED" railway.new:/root/.swarm/resume-seed.sh >/dev/null
   "${SSH[@]}" railway.new "sh /root/.swarm/resume-seed.sh" 2>&1 | filt | tail -2
