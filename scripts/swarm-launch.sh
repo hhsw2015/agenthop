@@ -47,6 +47,9 @@ esac
 # ponytail: fixed 55m window; swap for a real box-liveness ping if Railway ever exposes one.
 REUSE_WINDOW_SEC=3300
 FORCE_NEW="${AGENTHOP_SWARM_NEW:-}"; [ "${3:-}" = "new" ] && FORCE_NEW=1
+# allocate-only: allocate + stamp + key-bind a FRESH box, then stop (no agenthop/worker install). Used by the handoff
+# dispatcher so a successor box is provisioned by swarm-task --resume instead of swarm-launch's Claude worker TUI.
+ALLOC_ONLY="${AGENTHOP_ALLOCATE_ONLY:-}"; [ -n "$ALLOC_ONLY" ] && FORCE_NEW=1
 
 # Cleanup trap (set BEFORE any keydir is created, so even an early failure is covered). On exit it (a) tears down
 # the alloc-only cf-proxy and (b) removes a NEWLY-created keydir whose allocation was never CONFIRMED (no alloc-ts
@@ -187,6 +190,11 @@ if [ -z "$REUSED" ]; then
     echo "$ALLOC_OUT" | tail -3 >&2
     exit 6
   fi
+
+  # allocate-only: a successor box for a handoff is provisioned by swarm-task --resume (its own git/tmux/supervisor), so
+  # skip swarm-launch's agenthop-binary install + Claude worker TUI + self-verify. The box is allocated + key-bound +
+  # stamped — all the dispatcher needs before swarm-task --resume. "NEW box $LID" keeps the launchId parseable.
+  if [ -n "$ALLOC_ONLY" ]; then echo "allocate-only: NEW box $LID ready (skipped install/worker)"; exit 0; fi
 
   # Install direct — the box is now bound to our key, reachable from any IP, and direct is far faster than SOCKS.
   # The mcp.json carries the AGENTHOP env — Claude Code does NOT pass the parent env to MCP servers, so the team

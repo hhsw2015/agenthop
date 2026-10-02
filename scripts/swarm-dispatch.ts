@@ -131,9 +131,9 @@ function scratchPath(launchId: string): string { return path.join(HOME, ".agenth
 
 // --- handoff-action IO (Phase 2). observe/clock/record are LIVE; allocate/resume spawn the box-side scripts and are
 // gated behind SWARM_EXEC (default off). Live-validated only in the gated run. ---
-function runScript(file: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+function runScript(file: string, args: string[], extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn("bash", [file, ...args], { env: process.env });
+    const child = spawn("bash", [file, ...args], { env: { ...process.env, ...extraEnv } });
     let stdout = "", stderr = "", done = false;
     const finish = (code: number) => { if (!done) { done = true; resolve({ code, stdout, stderr }); } };
     child.stdout?.on("data", (d) => { stdout += d; });
@@ -143,11 +143,11 @@ function runScript(file: string, args: string[]): Promise<{ code: number; stdout
   });
 }
 async function allocateSuccessor(_pred: ControlRecord): Promise<string | null> {
-  // Allocate a fresh box via swarm-launch (new); parse the minted launchId from its "NEW box rw-..." decision line.
-  // NOTE: swarm-launch also warms a worker; an --allocate-only primitive (skip the worker) is a follow-up so a resume
-  // box doesn't transiently start one. Requires SWARM_TEAM so the successor joins the same team (else it is invisible).
-  if (!SWARM_TEAM) log("allocateSuccessor: SWARM_TEAM is unset — the successor would join teamless/invisible");
-  const r = await runScript(SWARM_LAUNCH, ["claude", SWARM_TEAM, "new"]);
+  // Allocate a fresh box via swarm-launch with AGENTHOP_ALLOCATE_ONLY (allocate + key-bind + stamp, no worker TUI —
+  // the successor is provisioned by swarm-task --resume). Parse the minted launchId from its "NEW box rw-..." line.
+  // SWARM_TEAM still matters for swarm-task --resume (the successor's worker joins the team); warn if unset.
+  if (!SWARM_TEAM) log("allocateSuccessor: SWARM_TEAM is unset — the resumed successor would join teamless/invisible");
+  const r = await runScript(SWARM_LAUNCH, ["claude", SWARM_TEAM, "new"], { AGENTHOP_ALLOCATE_ONLY: "1" });
   const m = (r.stdout + r.stderr).match(/NEW box (rw-[0-9a-f]+)/);
   if (r.code !== 0 || !m) { log(`allocateSuccessor: swarm-launch failed (code ${r.code})`); return null; }
   log(`allocateSuccessor: allocated ${m[1]}`);
