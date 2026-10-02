@@ -29,6 +29,9 @@ export type HandoffOps = {
   cap: number;
   budgetSec: number;
   handoffLeadSec: number;
+  /** Gate the handoff ACTIONS (claim/allocate/resume/reconcile/retire). When false, observe + authoritative clock
+   *  (drain/expire) still run and record progress, but no VM is allocated/retired — a safe default until SWARM_EXEC. */
+  execEnabled: boolean;
   /** Observe a WORK branch tip for `launchId` (pin sha, read manifest FROM it, ancestry vs lastSha). null = none/err. */
   observeTip: (branch: string, lastSha: string | undefined, launchId: string) => Promise<ObservedTip | null>;
   /** Allocate a FRESH successor box; returns its launchId, or null on failure (runs swarm-launch new). */
@@ -93,7 +96,11 @@ export async function handoffStep(
   // 3) Handoff EXEC via the pure decision. liveCount is a snapshot of non-terminal records (incl. in-flight successors).
   const liveCount = [...records.values()].filter((x) => x.state !== "RETIRED" && x.state !== "DONE").length;
   const action = nextAction(r, ops.nowSec(), { self: ops.self, cap: ops.cap, liveCount });
-  r = await runAction(r, action, records, ops);
+  if (ops.execEnabled) {
+    r = await runAction(r, action, records, ops);
+  } else if (action !== "none") {
+    ops.log(`${r.launchId}: would ${action} (handoff exec gated — set SWARM_EXEC=1 to enable)`);
+  }
 
   records.set(r.launchId, r);
   return r;

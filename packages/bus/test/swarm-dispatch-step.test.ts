@@ -31,6 +31,7 @@ function makeOps(over: Partial<HandoffOps> = {}) {
     cap: 3,
     budgetSec: BUDGET,
     handoffLeadSec: LEAD,
+    execEnabled: true,
     observeTip: async (branch) => state.tips.get(branch) ?? null,
     allocateSuccessor: async () => { state.allocCalls++; return state.allocReturn; },
     resumeSuccessor: async () => { state.resumeCalls++; return state.resumeReturn; },
@@ -167,6 +168,23 @@ describe("handoffStep: crash / failure edges", () => {
       expect(out.state).toBe("ALLOCATING");
       expect(out.attempt).toBe("att-1");
     }
+  });
+
+  test("execEnabled=false: observe + clock still run, but no handoff action is executed (safe default)", async () => {
+    const { ops, state } = makeOps({ execEnabled: false });
+    state.now = T0 + BUDGET - LEAD;
+    const records = new Map<string, ControlRecord>();
+    let a = rec();
+    records.set(a.launchId, a);
+    state.tips.set(branchFor("rw-aaaa", 0), tip("m1", "rw-aaaa", 0, "milestone"));
+    a = await handoffStep(a, records, ops);
+    expect(a.state).toBe("DRAINING"); // clock still ran (drain)
+    expect(a.sha).toBe("m1");         // observe still accepted
+    // advance to CHECKPOINTED; nextAction would be "claim" but exec is gated -> stays CHECKPOINTED, no allocate
+    state.tips.set(branchFor("rw-aaaa", 0), tip("fin0", "rw-aaaa", 0, "final", { desc: true }));
+    a = await handoffStep(a, records, ops);
+    expect(a.state).toBe("CHECKPOINTED");
+    expect(state.allocCalls).toBe(0);
   });
 
   test("give_up: attempt cap exhausted -> notified, no allocate", async () => {

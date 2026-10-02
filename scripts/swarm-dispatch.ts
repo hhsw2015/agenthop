@@ -22,15 +22,11 @@ import { spawn } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import {
-  advance,
-  type ControlEvent,
-  type ControlRecord,
-  likelyExpired,
-  nextAction,
-} from "../packages/bus/src/swarm/control.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { type ControlRecord } from "../packages/bus/src/swarm/control.js";
 import { parseManifest } from "../packages/bus/src/swarm/manifest.js";
 import { type ObservedTip, tipToEvent } from "../packages/bus/src/swarm/acceptance.js";
+import { type HandoffOps, handoffStep } from "../packages/bus/src/swarm/dispatch-step.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
 const MIRROR_DIR = path.join(HOME, ".agenthop", "swarm", "control");
@@ -41,6 +37,13 @@ const BUDGET_SEC = Number(process.env.SWARM_BUDGET_SEC || "3480");
 const HANDOFF_LEAD_SEC = Number(process.env.SWARM_HANDOFF_LEAD_SEC || "180");
 const WORK_REPO = process.env.SWARM_WORK_REPO || "";
 const GIT_TIMEOUT_MS = 25_000;
+const SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url));
+const SWARM_LAUNCH = process.env.SWARM_LAUNCH || path.join(SCRIPTS_DIR, "swarm-launch.sh");
+const SWARM_TASK = process.env.SWARM_TASK || path.join(SCRIPTS_DIR, "swarm-task.sh");
+const SWARM_TEAM = process.env.SWARM_TEAM || "";
+// Gate the handoff ACTIONS (claim/allocate/resume/retire). Default OFF: the dispatcher observes + drives the
+// lifecycle record (drain/expire/milestone/checkpoint) to the mirror, but allocates no VM until SWARM_EXEC=1.
+const EXEC_ENABLED = !!process.env.SWARM_EXEC;
 
 function log(m: string): void { console.error(`[dispatch ${SELF}] ${m}`); }
 function nowSec(): number { return Math.floor(Date.now() / 1000); }
@@ -106,13 +109,6 @@ function loadMirror(): Map<string, ControlRecord> {
 }
 function saveRecord(r: ControlRecord): void { mkdirSync(MIRROR_DIR, { recursive: true }); atomicWrite(mirrorPath(r.launchId), JSON.stringify(r)); }
 
-function applyEvent(r: ControlRecord, ev: ControlEvent): ControlRecord {
-  const res = advance(r, ev, nowSec());
-  if (!res.ok) { log(`event ${ev.type} on ${r.launchId} rejected: ${res.error}`); return r; }
-  saveRecord(res.record);
-  return res.record;
-}
-
 // --- discover boxes this dispatcher launched (keydirs carry launchId + alloc-ts) ---
 function discoverBoxes(): Array<{ launchId: string; allocTs: number }> {
   const out: Array<{ launchId: string; allocTs: number }> = [];
@@ -131,7 +127,24 @@ function notifyUser(msg: string): void {
   if (process.platform === "darwin") spawn("osascript", ["-e", `display notification ${JSON.stringify(msg)} with title "swarm"`]).unref?.();
 }
 
-function branchFor(r: ControlRecord): string { return `swarm/${r.launchId}-g${r.generation}`; }
+function scratchPath(launchId: string): string { return path.join(HOME, ".agenthop", "swarm", "scratch", launchId); }
+
+// --- handoff-action IO. Phase-1c: observe/clock/record are LIVE; the allocate/resume/scrub box-side wiring (a fresh
+// box that RESUMES from handoffSha via swarm-task --resume) lands in Phase 2, so these are honest stubs for now and are
+// gated OFF by default (EXEC_ENABLED). ---
+async function allocateSuccessor(_pred: ControlRecord): Promise<string | null> {
+  log("allocateSuccessor: box-resume wiring is Phase 2 (swarm-task --resume); not allocating a successor yet");
+  return null;
+}
+async function resumeSuccessor(_a: { successor: string; handoffSha: string; generation: number; branch: string }): Promise<boolean> {
+  log("resumeSuccessor: Phase 2 (swarm-task --resume) pending");
+  return false;
+}
+async function scrubBox(launchId: string): Promise<void> {
+  // The box self-scrubs on its own deadline (swarm-scrub, driven by the supervisor). A dispatcher-driven scrub needs
+  // box access (the railway key or the tailcat channel) and lands with that wiring. Best-effort no-op for now.
+  log(`scrubBox ${launchId}: box self-scrubs on deadline; dispatcher-driven scrub pending`);
+}
 
 // --- the --observe-once dev mode (offline-smoke-testable) ---
 async function observeOnce(argv: string[]): Promise<void> {
@@ -142,70 +155,56 @@ async function observeOnce(argv: string[]): Promise<void> {
   console.log(JSON.stringify({ tip, decision: tip ? tipToEvent(record, tip) : null }, null, 2));
 }
 
-// --- one control-loop pass (observe + authoritative clock + nextAction) ---
-async function pass(records: Map<string, ControlRecord>): Promise<void> {
+// --- one control-loop pass: discover boxes + persisted records, step each through handoffStep (observe + authoritative
+//     clock + gated handoff EXEC). handoffStep reads liveCount from `records` and mutates it (adds successors). ---
+async function pass(records: Map<string, ControlRecord>, ops: HandoffOps): Promise<void> {
   const boxes = new Map(discoverBoxes().map((b) => [b.launchId, b]));
-  // Iterate the UNION of keydir-discovered boxes AND persisted mirror records (Codex #7): a box whose keydir
-  // vanished but whose record is still non-terminal (e.g. EXPIRED needing a successor) must still be processed,
-  // including after a same-machine restart.
+  // UNION of keydir-discovered boxes AND persisted mirror records (Codex #7): a box whose keydir vanished but whose
+  // record is still non-terminal (e.g. EXPIRED needing a successor) must still be processed, incl. after a restart.
   const ids = new Set<string>([...boxes.keys(), ...records.keys()]);
-  const liveCount = [...records.values()].filter((r) => r.state !== "RETIRED" && r.state !== "DONE").length;
-
   for (const launchId of ids) {
     const box = boxes.get(launchId);
     let r = records.get(launchId);
     if (!r) {
-      if (!box) continue; // id came from neither source somehow
+      if (!box) continue;
       r = { launchId, state: "RUNNING", generation: 0, allocStart: box.allocTs, budgetSec: BUDGET_SEC, updatedAt: nowSec(), deadlineEpoch: box.allocTs + BUDGET_SEC };
+      records.set(launchId, r);
+      saveRecord(r);
     }
-    records.set(launchId, r);
-    if (r.state === "RETIRED" || r.state === "DONE") continue; // terminal: nothing to do
-
-    // 1) observe the WORK branch and accept forward progress. `sha` is the single canonical confirmed checkpoint
-    //    (monotonic via the dispatcher's ancestry guard; recover_sha advances it even after EXPIRED).
-    if (WORK_REPO) {
-      const tip = await observeTip(WORK_REPO, branchFor(r), r.sha, path.join(HOME, ".agenthop", "swarm", "scratch", r.launchId));
-      if (tip) {
-        const dec = tipToEvent(r, tip);
-        if (dec.kind === "advance") r = applyEvent(r, dec.event);
-      }
+    try {
+      await handoffStep(r, records, ops);
+    } catch (e) {
+      log(`handoffStep ${launchId} error: ${e instanceof Error ? e.message : e}`);
     }
-
-    // 2) authoritative clock: near the (dispatcher-owned) deadline, begin draining for handoff
-    const deadline = r.allocStart + r.budgetSec;
-    if (r.state === "RUNNING" && nowSec() >= deadline - HANDOFF_LEAD_SEC) {
-      r = applyEvent(r, { type: "drain" });
-      log(`${r.launchId} entering DRAINING (T-${deadline - nowSec()}s)`);
-      // nudge the worker over the bus to drain+final (best-effort; the supervisor also rescues independently)
-    }
-    // 3) if the box is likely physically gone, record EXPIRED so recovery still runs
-    if (r.state !== "RETIRED" && r.state !== "DONE" && r.state !== "EXPIRED" && likelyExpired(r, nowSec())) {
-      r = applyEvent(r, { type: "expire" });
-      notifyUser(`box ${r.launchId} expired; recoverySha=${r.sha ?? "none"}`);
-    }
-
-    // 4) drive handoff via the pure decision
-    const action = nextAction(r, nowSec(), { self: SELF, cap: CAP, liveCount });
-    if (action === "claim") { log(`${r.launchId}: would claim + allocate successor (handoff exec — gated live wiring)`); }
-    else if (action === "give_up") { notifyUser(`box ${r.launchId}: allocation attempts exhausted; manual attention`); }
-    // claim/allocate/reconcile/retire EXEC (swarm-launch + resumed-ACK barrier) lands with the launcher wiring.
-
-    // Persist the ADVANCED record back into the Map so the next pass sees DRAINING/CHECKPOINTED/... (Codex #3:
-    // without this the Map kept the stale RUNNING record and re-DRAINed forever, never accepting a final).
-    records.set(launchId, r);
   }
+}
+
+function buildOps(): HandoffOps {
+  return {
+    nowSec, self: SELF, cap: CAP, budgetSec: BUDGET_SEC, handoffLeadSec: HANDOFF_LEAD_SEC, execEnabled: EXEC_ENABLED,
+    observeTip: (branch, lastSha, launchId) =>
+      WORK_REPO ? observeTip(WORK_REPO, branch, lastSha, scratchPath(launchId)) : Promise.resolve(null),
+    allocateSuccessor,
+    resumeSuccessor,
+    scrubBox,
+    notify: notifyUser,
+    persist: saveRecord,
+    log,
+  };
 }
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv[0] === "--observe-once") { await observeOnce(argv.slice(1)); return; }
 
-  log(`single-active dispatcher up (cap=${CAP}, budget=${BUDGET_SEC}s, workRepo=${WORK_REPO || "<unset>"})`);
+  log(`single-active dispatcher up (cap=${CAP}, budget=${BUDGET_SEC}s, workRepo=${WORK_REPO || "<unset>"}, exec=${EXEC_ENABLED})`);
   const records = loadMirror();
+  const ops = buildOps();
   for (;;) {
-    try { await pass(records); } catch (e) { log(`pass error: ${e instanceof Error ? e.message : e}`); }
+    try { await pass(records, ops); } catch (e) { log(`pass error: ${e instanceof Error ? e.message : e}`); }
     await new Promise((res) => setTimeout(res, 5000));
   }
 }
 
-void main();
+// Run the loop only when executed directly (not when imported, e.g. by a test).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) void main();
