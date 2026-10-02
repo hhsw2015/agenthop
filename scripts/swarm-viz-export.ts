@@ -108,6 +108,11 @@ export type VizTask = {
   assignees: string[];
   state: string;
   createdAt: number | null;
+  /** Last state change. The task river draws a band from createdAt to here; without it a finished
+   *  task has no span and collapses to a zero-width sliver. */
+  updatedAt: number | null;
+  goal?: string;
+  role?: string;
   results: Array<{ launchId: string; state: string; sha?: string; costUsd?: number }>;
   /** True for a row synthesized from the control mirror — the only kind that exists today. */
   fromControlMirror: boolean;
@@ -121,6 +126,9 @@ export type TaskFile = {
   assignees?: string[];
   state?: string;
   createdAt?: number;
+  updatedAt?: number;
+  goal?: string;
+  role?: string;
   results?: Array<{
     launchId: string;
     state: string;
@@ -299,6 +307,14 @@ export function foldFlows(entries: MsgLogEntry[], limit = 60): VizFlow[] {
   return [...byPair.values()].sort((a, b) => b.lastTs - a.lastTs).slice(0, limit);
 }
 
+/** The newest result timestamp in ms epoch, or undefined. Task files carry seconds for the control
+ *  mirror and ms for envelope files; callers normalize before passing. Pure. */
+export function newestResultAt(results?: Array<{ at?: number; ts?: number }>): number | undefined {
+  if (!Array.isArray(results) || !results.length) return undefined;
+  const vals = results.map((r) => (typeof r.ts === "number" ? r.ts : r.at)).filter((v): v is number => typeof v === "number");
+  return vals.length ? Math.max(...vals) : undefined;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Snapshot assembly
 // ---------------------------------------------------------------------------------------------
@@ -398,6 +414,10 @@ export function tasksFromSources(controls: Map<string, ControlSlot>, files: Task
       assignees: f.assignees ?? [],
       state: f.state ?? "unknown",
       createdAt: f.createdAt ?? null,
+      // Fall back to the newest result time when a file lacks updatedAt — an end is what the band needs.
+      updatedAt: f.updatedAt ?? newestResultAt(f.results) ?? f.createdAt ?? null,
+      ...(f.goal ? { goal: f.goal } : {}),
+      ...(f.role ? { role: f.role } : {}),
       results: (f.results ?? []).map((r) => ({ launchId: r.launchId, state: r.state, sha: r.sha, costUsd: r.usage?.costUsd })),
       fromControlMirror: false,
     });
@@ -409,7 +429,8 @@ export function tasksFromSources(controls: Map<string, ControlSlot>, files: Task
       taskId: launchId,
       assignees: [launchId],
       state: control?.state ?? "unknown",
-      createdAt: control?.allocStart ?? null,
+      createdAt: control?.allocStart != null ? control.allocStart * 1000 : null,
+      updatedAt: control?.updatedAt != null ? control.updatedAt * 1000 : null,
       results: control ? [{ launchId, state: control.state, sha: control.sha ?? control.lastConfirmedSha }] : [],
       fromControlMirror: true,
     });

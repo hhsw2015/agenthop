@@ -76,7 +76,9 @@
   .chip.on[data-f="box"] { color: var(--warn); border-color: var(--warn); background: rgba(255,180,84,.13); }
 
   /* ---------- stage ---------- */
-  #stage { position: relative; overflow: hidden; }
+  #stage { position: relative; overflow: hidden; transition: padding-bottom .18s ease; padding-bottom: 0; }
+  #stage.river-open { padding-bottom: 232px; }
+  #stage > svg { position: absolute; inset: 0; height: 100%; width: 100%; }
   svg { display: block; width: 100%; height: 100%; cursor: grab; }
   svg.grabbing { cursor: grabbing; }
 
@@ -86,7 +88,8 @@
     filter: drop-shadow(0 12px 28px rgba(0,0,0,.35));
   }
   .grp.local rect { fill: rgba(63,208,138,.028); stroke: rgba(63,208,138,.16); }
-  .grp.remote rect { fill: rgba(185,139,255,.03); stroke: rgba(185,139,255,.16); }
+  .grp.remote rect { fill: rgba(185,139,255,.03); stroke: rgba(185,139,255,.28); stroke-dasharray: 5 4; }
+  .grp .gremote { fill: var(--relay); font-size: 9px; font-weight: 650; letter-spacing: .12em; opacity: .75; }
   .grp .glabel { fill: var(--ink-dim); font-size: 10.5px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; }
   .grp .gsub { fill: var(--faint); font-size: 10px; }
   .grp .gdot { }
@@ -144,6 +147,35 @@
   .talkpip { stroke: #0b0d13; stroke-width: 1.5; animation: talkblip 1.6s ease-in-out infinite; }
   @keyframes talkblip { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
   .edge-hit:hover + .edge.comms, .edge.comms:hover { stroke-width: 4 !important; }
+
+  /* ---------- task river: time runs left -> right, one band per task ---------- */
+  .river { position: absolute; left: 20px; right: 20px; bottom: 8px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 12px; backdrop-filter: blur(14px); z-index: 4;
+    max-height: 40%; display: flex; flex-direction: column; }
+  .river.collapsed .rbody { display: none; }
+  .rtitle { display: flex; align-items: center; gap: 10px; padding: 9px 14px;
+    border-bottom: 1px solid var(--line); font-size: 10px; font-weight: 650; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--faint); }
+  .rtitle .rsub { text-transform: none; letter-spacing: 0; color: var(--ink-dim); font-weight: 500; flex: 1; }
+  .rcollapse { border: 1px solid var(--line); background: rgba(255,255,255,.04); color: var(--ink-dim);
+    border-radius: 7px; width: 24px; height: 22px; cursor: pointer; font-size: 10px; }
+  .rcollapse:hover { color: var(--ink); }
+  .rbody { padding: 10px 14px 14px; overflow-y: auto; }
+  .rbody.empty-river { padding: 8px 14px 12px; }
+  .rrow { display: grid; grid-template-columns: 190px 1fr; gap: 10px; align-items: center; padding: 3px 0; }
+  .rrow .who { font-size: 11px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rrow .who .st { color: var(--faint); font-size: 9.5px; margin-left: 6px; }
+  .rtrack { position: relative; height: 16px; background: rgba(255,255,255,.035); border-radius: 4px; }
+  .rtrack .band { position: absolute; top: 3px; height: 10px; border-radius: 3px; opacity: .95; }
+  .rtrack .band.PENDING { background: var(--unknown); }
+  .rtrack .band.RUNNING { background: var(--working); }
+  .rtrack .band.DONE { background: var(--idle); }
+  .rtrack .band.FAILED { background: var(--blocked); }
+  .rtrack .band.CANCELLED { background: var(--faint); }
+  .rtrack .nowline { position: absolute; top: -2px; bottom: -2px; width: 1px; background: var(--expired); opacity: .5; }
+  .rax { position: relative; height: 14px; grid-column: 2; }
+  .rax span { position: absolute; font-size: 9px; color: var(--faint); transform: translateX(-50%); white-space: nowrap; }
+  #rsub { max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* ---------- drawer ---------- */
   aside {
@@ -279,6 +311,10 @@
     </div>
     <div class="hint">drag to pan · scroll to zoom · click a node for detail · <b>/</b> search · <b>esc</b> clear</div>
     <aside id="drawer"></aside>
+    <div class="river" id="river">
+      <div class="rtitle"><span>Task river</span><span class="rsub" id="rsub"></span><button class="rcollapse" id="rcollapse" title="Collapse / expand">▾</button></div>
+      <div class="rbody" id="rbody"></div>
+    </div>
   </div>
 </div>
 <script>
@@ -302,6 +338,25 @@
   function layout(snap) {
     // Stable ring placement from a string hash, so re-renders do not reshuffle.
     const hash = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0) / 4294967296; };
+
+    // A machine's SLOT in the grid is sticky: once "MacBook-Pro" is top-left it stays there for the rest
+    // of the session, so a user builds a spatial memory of the cluster. Without this, one machine joining
+    // or leaving reshuffles every box and the picture has to be re-learned from scratch.
+    const slotOf = (() => {
+      let slots = [];
+      try { slots = JSON.parse(localStorage.getItem("swarm-viz-slots") || "[]"); } catch { slots = []; }
+      if (!Array.isArray(slots)) slots = [];
+      return {
+        get(machine) {
+          const i = slots.indexOf(machine);
+          if (i >= 0) return i;
+          slots.push(machine);
+          this.save();
+          return slots.length - 1;
+        },
+        save() { try { localStorage.setItem("swarm-viz-slots", JSON.stringify(slots.slice(0, 200))); } catch { /* private mode */ } },
+      };
+    })();
 
     const groups = new Map(); // machine -> items
     const items = [];
@@ -348,6 +403,9 @@
       };
       clusters.push(box);
     }
+
+    // Order by the sticky slot so a machine never changes place; new machines append.
+    clusters.sort((a, b) => slotOf.get(a.name) - slotOf.get(b.name));
 
     // Pack clusters into a grid: cols scaled to total area, then place row by row.
     const totalArea = clusters.reduce((s, c) => s + c.w * c.h, 0);
@@ -408,6 +466,13 @@
       const g = el("g", { class: `grp${c.local ? " local" : " remote"}` });
       g.appendChild(el("rect", { x: c.x, y: c.y, width: Math.max(c.w, 200), height: Math.max(c.h, 150) }));
       const dot = el("circle", { class: "gdot", cx: c.x + 20, cy: c.y + 22, r: 3.5, fill: c.isBoxes ? "var(--warn)" : c.local ? "var(--idle)" : "var(--relay)" });
+      // Cross-machine cost is real (a relay hop, up to 60s stale). Mark remote clusters so the eye
+      // separates "same box, cheap" from "over the wire, slow" without reading a label.
+      if (!c.local && !c.isBoxes) {
+        const tag = el("text", { class: "gremote", x: c.x + c.w - 14, y: c.y + 26, "text-anchor": "end" });
+        tag.textContent = "REMOTE";
+        g.appendChild(tag);
+      }
       g.appendChild(dot);
       const lbl = el("text", { class: "glabel", x: c.x + 30, y: c.y + 26 });
       lbl.textContent = c.isBoxes ? "railway box" : c.local ? c.name + " · this machine" : c.name;
@@ -473,9 +538,13 @@
       view.appendChild(node);
     }
     draw();
-    if (!didFit) { didFit = true; fit(); }
     renderDrawer();
     renderPanels();
+    const reserved = renderRiver();
+    // Fit LAST, once the river has claimed its space, and again whenever that space changes. The first
+    // render used to fit before the river existed and then never re-fit, so the graph stayed oversized.
+    if (reserved !== lastReserved) { lastReserved = reserved; fit(); }
+    else if (!didFit) { didFit = true; fit(); }
   }
 
   function renderPeer(it) {
@@ -548,16 +617,25 @@
   // ---------------------------------------------------------------- pannable view transform + zoom
   let view = { x: 0, y: 0, k: 1 };
   let didFit = false;
+  let lastReserved = -1; // last river-reserved height the view was fitted against
   function fit() {
     if (!model || !model.bounds) return;
     const b = model.bounds;
     if (!Number.isFinite(b.x0)) return;
     const rect = svg.getBoundingClientRect();
+    // The river reserves room at the bottom of the stage, but the SVG itself keeps the full height (a
+    // generic `svg { height: 100% }` outranks the absolute rule). So fit into the space that is actually
+    // free, and centre there — otherwise the graph centres behind the river and its bottom rows hide.
+    const reserved = parseFloat(getComputedStyle($("stage")).paddingBottom) || 0;
+    const availH = Math.max(120, rect.height - reserved);
     const w = b.x1 - b.x0, h = b.y1 - b.y0;
-    const k = Math.min(1.2, Math.max(0.25, Math.min(rect.width / (w + 80), rect.height / (h + 80))));
+    // Captions hang above/below the cluster rect (node names, box launchIds and countdowns), so the drawn
+    // extent is taller than `bounds`. Reserve for that or the fit still clips the label rows.
+    const padX = 90, padY = 130;
+    const k = Math.max(0.18, Math.min(1.2, Math.min(rect.width / (w + padX), availH / (h + padY))));
     view.k = k;
     view.x = rect.width / 2 - ((b.x0 + b.x1) / 2) * k;
-    view.y = rect.height / 2 - ((b.y0 + b.y1) / 2) * k;
+    view.y = availH / 2 - ((b.y0 + b.y1) / 2) * k;
     draw();
   }
   function draw() {
@@ -627,6 +705,78 @@
   }
   // ---------------------------------------------------------------- side panels (tasks / flows / departures)
   const short = (id) => String(id ?? "").slice(0, 10);
+
+  // ---------------------------------------------------------------- task river
+  // Time runs left -> right. One band per task, from creation to its last update; a running task extends
+  // to NOW. This is the view that answers "who is doing what, for how long, and did it land" — the static
+  // graph cannot, because it shows capability rather than work in flight.
+  function renderRiver() {
+    const s = state;
+    const tasks = (s.tasks ?? []).slice().sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+    const body = $("rbody");
+    if (!tasks.length) {
+      $("rsub").textContent = "no tasks";
+      body.innerHTML = `<div class="empty-note">No tasks to draw. One row per launch appears here from the lifecycle mirror; the richer fan-out view (one band per dispatched task) lands with the task envelope.</div>`;
+      // Nothing to draw yet: keep the strip small so it does not steal the graph's room.
+      body.classList.remove("empty-river");
+      $("stage").classList.remove("river-open");
+      return 0;
+    }
+
+    // Window: earliest creation -> now (or the newest update, if that is later).
+    const now = Date.now();
+    const starts = tasks.map((t) => t.createdAt ?? now);
+    const ends = tasks.map((t) => {
+      const u = t.updatedAt ?? t.createdAt ?? now;
+      return isOpen(t.state) ? now : u;
+    });
+    const t0 = Math.min(...starts);
+    const t1 = Math.max(now, ...ends);
+    const span = Math.max(1, t1 - t0);
+    const pct = (v) => ((v - t0) / span) * 100;
+
+    const rows = tasks.slice(0, 40).map((t) => {
+      const a = t.createdAt ?? now;
+      const b = isOpen(t.state) ? now : (t.updatedAt ?? a);
+      const left = Math.max(0, Math.min(100, pct(a)));
+      const width = Math.max(0.8, Math.min(100 - left, pct(b) - left));
+      const dur = dur2(b - a);
+      const who = t.assignees.length > 1 ? `${t.assignees.length} assignees` : (t.assignees[0] ?? "(none)");
+      const done = t.results.filter((r) => !isFailure2(r.state)).length;
+      const counter = t.assignees.length > 1 ? ` ${done}/${t.assignees.length}` : "";
+      return `<div class="rrow">
+        <div class="who" title="${esc(t.taskId)}">${esc(t.taskId)}<span class="st">${esc(who)}${counter} \u00b7 ${dur}</span></div>
+        <div class="rtrack">
+          <div class="band ${esc(t.state)}" style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%" title="${esc(t.state)} \u00b7 ${dur}"></div>
+          <div class="nowline" style="left:100%"></div>
+        </div>
+      </div>`;
+    }).join("");
+
+    // A compact axis: oldest, middle, now.
+    const mid = (t0 + t1) / 2;
+    const axis = `<div class="rrow"><div class="who"></div><div class="rax">
+      <span style="left:0%">${clock(t0)}</span>
+      <span style="left:50%">${clock(mid)}</span>
+      <span style="left:100%">now</span>
+    </div></div>`;
+
+    $("rsub").textContent = `${tasks.length} task(s) \u00b7 window ${dur2(span)}`;
+    body.innerHTML = rows + axis;
+    $("stage").classList.add("river-open");
+    return 232; // must match #stage.river-open padding-bottom
+  }
+
+  function isOpen(st) { return st === "PENDING" || st === "RUNNING"; }
+  function isFailure2(st) { const x = String(st ?? "").toLowerCase(); return x.includes("fail") || x.includes("error") || x.includes("cancel"); }
+  function dur2(ms) {
+    const sec = Math.max(0, Math.round(ms / 1000));
+    if (sec < 60) return sec + "s";
+    const m = Math.floor(sec / 60);
+    if (m < 60) return m + "m " + (sec % 60) + "s";
+    return Math.floor(m / 60) + "h " + (m % 60) + "m";
+  }
+  function clock(ms) { return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
 
   // -------- per-pair message history (clicked from an arc) --------
   let pair = null; // { a, b } model item ids
@@ -960,6 +1110,14 @@
   }
 
   wireFilters();
+  $("rcollapse").onclick = () => {
+    const r = $("river");
+    r.classList.toggle("collapsed");
+    const collapsed = r.classList.contains("collapsed");
+    $("rcollapse").textContent = collapsed ? "\u25b8" : "\u25be";
+    $("stage").classList.toggle("river-open", !collapsed);
+    requestAnimationFrame(() => { if (model) fit(); });
+  };
   // Theme persists across reloads; default follows the OS preference on first visit.
   (() => {
     const saved = localStorage.getItem("swarm-viz-theme");
