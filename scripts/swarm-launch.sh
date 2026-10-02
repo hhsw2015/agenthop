@@ -48,24 +48,43 @@ esac
 REUSE_WINDOW_SEC=3300
 FORCE_NEW="${AGENTHOP_SWARM_NEW:-}"; [ "${3:-}" = "new" ] && FORCE_NEW=1
 
+# Cleanup trap (set BEFORE any keydir is created, so even an early failure is covered). On exit it (a) tears down
+# the alloc-only cf-proxy and (b) removes a NEWLY-created keydir whose allocation was never CONFIRMED (no alloc-ts
+# written). A failed/aborted allocation otherwise leaves an orphan throwaway key that both piles up AND is a
+# re-allocation hazard (ssh to a dead key RE-ALLOCATES, so a stale key invites an accidental new box). It NEVER
+# touches a REUSED box's keydir (NEW_KEYDIR stays empty on reuse) nor a CONFIRMED one (alloc-ts present).
+NEW_KEYDIR=""
+cleanup() {
+  [ -n "${CF_PROXY_PID:-}" ] && kill "$CF_PROXY_PID" 2>/dev/null || true
+  if [ -n "${NEW_KEYDIR:-}" ] && [ ! -f "$NEW_KEYDIR/alloc-ts" ]; then
+    rm -rf "$NEW_KEYDIR" 2>/dev/null || true
+    echo "cleanup: removed unconfirmed keydir $NEW_KEYDIR (allocation never confirmed — no alloc-ts)" >&2
+  fi
+}
+trap cleanup EXIT
+
 LID=""; KEYDIR=""; REUSED=""
 if [ -z "$FORCE_NEW" ]; then
-  now="$(date +%s)"
+  now="$(date +%s)"; SCANNED=0
   mapfile -t KDS < <(ls -dt /tmp/ah-rwkey-rw-* 2>/dev/null || true)
   for kd in "${KDS[@]}"; do
-    [ -f "$kd/id" ] && [ -f "$kd/alloc-ts" ] || continue
+    [ -f "$kd/id" ] && [ -f "$kd/alloc-ts" ] || continue  # unconfirmed/failed keydir: never reusable
+    SCANNED=$((SCANNED + 1))
     age=$(( now - $(cat "$kd/alloc-ts") ))
     [ "$age" -lt "$REUSE_WINDOW_SEC" ] || continue
     KEYDIR="$kd"; LID="$(basename "$kd" | sed 's/^ah-rwkey-//')"; REUSED=1
-    echo "reuse live box $LID (age ${age}s < ${REUSE_WINDOW_SEC}s; direct, no proxy)"
+    echo "alloc-decision: REUSE $LID (age ${age}s < ${REUSE_WINDOW_SEC}s window; direct, no proxy)"
     break
   done
+  [ -z "$REUSED" ] && echo "alloc-decision: no reusable box (${SCANNED} confirmed candidate(s), none inside ${REUSE_WINDOW_SEC}s window) -> allocating new"
+else
+  echo "alloc-decision: FORCE_NEW set -> allocating new to grow the fleet (ignoring any live box)"
 fi
 
 if [ -z "$LID" ]; then
-  LID="rw-$(openssl rand -hex 4)"; KEYDIR="/tmp/ah-rwkey-$LID"; mkdir -p "$KEYDIR"
+  LID="rw-$(openssl rand -hex 4)"; KEYDIR="/tmp/ah-rwkey-$LID"; NEW_KEYDIR="$KEYDIR"; mkdir -p "$KEYDIR"
   ssh-keygen -t ed25519 -f "$KEYDIR/id" -N "" -q
-  echo "allocate NEW box $LID (via proxy $PROXY)"
+  echo "alloc-decision: NEW box $LID (via proxy $PROXY); its keydir is removed on exit unless allocation is confirmed"
 fi
 TITLE="railway:$TOOL-${LID#rw-}"
 echo "launch $LID  tool=$TOOL  model=$MODEL  title=$TITLE  reused=${REUSED:-0}"
@@ -130,8 +149,7 @@ if [ -z "$REUSED" ]; then
   if [ -n "${CF_PROXY_WORKERS:-}" ] && [ -n "${CF_PROXY_TOKEN:-}" ] && ! nc -z "$CF_HOST" "$CF_PORT" 2>/dev/null; then
     echo "== start cf-proxy (CF Worker SOCKS) on $PROXY =="
     CF_PROXY_PORT="$CF_PORT" npx tsx "$HERE/packages/bus/src/swarm/cf-proxy.ts" >"/tmp/cf-proxy-$$.log" 2>&1 &
-    CF_PROXY_PID=$!
-    trap '[ -n "${CF_PROXY_PID:-}" ] && kill "$CF_PROXY_PID" 2>/dev/null || true' EXIT
+    CF_PROXY_PID=$!   # torn down by the unified cleanup trap set above
     for _ in $(seq 1 40); do nc -z "$CF_HOST" "$CF_PORT" 2>/dev/null && break; sleep 0.3; done
     if nc -z "$CF_HOST" "$CF_PORT" 2>/dev/null; then echo "cf-proxy up (pid $CF_PROXY_PID)"; else
       echo "cf-proxy failed to start; see /tmp/cf-proxy-$$.log" >&2; exit 4; fi
