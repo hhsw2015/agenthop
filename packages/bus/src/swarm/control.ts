@@ -49,9 +49,6 @@ export type ControlRecord = {
   sha?: string;
   /** Opaque manifest ref/summary describing the recoverable artifact set at `sha`. */
   manifest?: string;
-  /** Monotonic checkpoint sequence from the box supervisor. A receipt advances CONTROL only when its seq exceeds
-   *  this, so a replayed/older receipt can never roll `sha` back (Codex impl-review bug 2). */
-  lastSeq?: number;
   /** Dispatcher instance id holding the claim (CLAIMED/ALLOCATING). */
   owner?: string;
   /** Epoch seconds the claim lease expires; past it, another dispatcher may reclaim. */
@@ -77,21 +74,26 @@ export type ControlRecord = {
   updatedAt: number;
 };
 
+// `sha` on milestone/checkpoint/done is the published git commit on the WORK branch. Ordering + no-rollback is NOT
+// enforced here (git ancestry can't be checked in a pure fn): the DISPATCHER verifies, for the pinned SHA it
+// fetched, that it is a descendant of the last-accepted sha (merge-base --is-ancestor) and the current generation,
+// BEFORE emitting these events. See the git-channel pivot (docs/swarm/phase2-design-review*.md).
 export type ControlEvent =
-  | { type: "milestone"; sha: string; seq: number; manifest?: string }
+  | { type: "milestone"; sha: string; manifest?: string }
   | { type: "drain" }
-  | { type: "checkpoint"; sha: string; seq: number; manifest?: string }
+  | { type: "checkpoint"; sha: string; manifest?: string }
   | { type: "claim"; owner: string; generation: number; leaseUntil: number }
   | { type: "reclaim"; owner: string; generation: number; leaseUntil: number }
   | { type: "allocating"; attempt: string }
   | { type: "alloc_unknown" }
   // reconcile a reclaimed in-flight allocation: its box was found DEAD (clear the attempt, allocate fresh) or ALIVE
-  // (adopt it as the successor — sha-checked — and move to RESUMED).
+  // (re-enter the await-resume wait reusing the SAME attempt — "alive" is NOT recovery-complete; only a real
+  // `resumed` ACK with the expected generation/attempt/sha finishes the handoff).
   | { type: "reconcile_dead" }
-  | { type: "reconcile_alive"; successor: string; sha: string }
+  | { type: "reconcile_alive" }
   | { type: "resumed"; successor: string; sha: string; generation: number; attempt: string }
   | { type: "retire" }
-  | { type: "done"; sha: string; seq: number }
+  | { type: "done"; sha: string }
   | { type: "expire"; lastConfirmedSha?: string };
 
 export type AdvanceResult = { ok: true; record: ControlRecord } | { ok: false; error: string };
@@ -143,20 +145,18 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
 
   if (FROZEN.has(record.state)) return bad(`state ${record.state} is terminal and accepts no events`);
 
-  const seqOf = (r: ControlRecord): number => r.lastSeq ?? 0;
   switch (event.type) {
     case "milestone":
+      // No-rollback/ordering is the dispatcher's job (git ancestry, pre-checked). Here: record the confirmed sha.
       if (record.state !== "RUNNING") return bad(`milestone only in RUNNING, not ${record.state}`);
-      if (event.seq <= seqOf(record)) return bad(`stale milestone seq ${event.seq} <= ${seqOf(record)}`); // no rollback
-      return ok({ sha: event.sha, lastSeq: event.seq, manifest: event.manifest ?? record.manifest });
+      return ok({ sha: event.sha, manifest: event.manifest ?? record.manifest });
     case "drain":
       if (record.state === "DRAINING") return ok({}); // idempotent
       if (record.state !== "RUNNING") return bad(`drain only from RUNNING, not ${record.state}`);
       return ok({ state: "DRAINING" });
     case "checkpoint":
       if (record.state !== "DRAINING") return bad(`final checkpoint only from DRAINING, not ${record.state}`);
-      if (event.seq <= seqOf(record)) return bad(`stale checkpoint seq ${event.seq} <= ${seqOf(record)}`);
-      return ok({ state: "CHECKPOINTED", sha: event.sha, lastSeq: event.seq, manifest: event.manifest ?? record.manifest });
+      return ok({ state: "CHECKPOINTED", sha: event.sha, manifest: event.manifest ?? record.manifest });
     case "claim":
       if (record.state !== "CHECKPOINTED" && record.state !== "EXPIRED")
         return bad(`claim only from CHECKPOINTED/EXPIRED, not ${record.state}`);
@@ -182,13 +182,12 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       // Reconcile found the in-flight allocation's box DEAD: clear the attempt so a fresh allocate can proceed.
       if (record.state !== "CLAIMED" || record.attempt === undefined) return bad(`reconcile_dead needs CLAIMED with an attempt, not ${record.state}`);
       return ok({ attempt: undefined, resultUnknown: false });
-    case "reconcile_alive": {
-      // Reconcile found the box ALIVE: adopt it as the successor (sha-checked), move straight to RESUMED.
+    case "reconcile_alive":
+      // Reconcile found the in-flight box ALIVE. That is NOT recovery-complete (Codex): re-enter the await-resume
+      // wait reusing the SAME attempt (no attemptCount bump). Only a real `resumed` ACK carrying the expected
+      // generation/attempt/sha finishes the handoff.
       if (record.state !== "CLAIMED" || record.attempt === undefined) return bad(`reconcile_alive needs CLAIMED with an attempt, not ${record.state}`);
-      const expected = record.sha ?? record.lastConfirmedSha;
-      if (expected !== undefined && event.sha !== expected) return bad(`reconcile_alive sha ${event.sha} != expected ${expected}`);
-      return ok({ state: "RESUMED", successor: event.successor, sha: event.sha });
-    }
+      return ok({ state: "ALLOCATING" });
     case "resumed": {
       if (record.state !== "ALLOCATING") return bad(`resumed only from ALLOCATING, not ${record.state}`);
       // Reject a stale successor's ACK: it must match the CURRENT generation AND the CURRENT attempt...
@@ -205,8 +204,7 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
     case "done":
       if (record.state !== "RUNNING" && record.state !== "DRAINING" && record.state !== "CHECKPOINTED")
         return bad(`done only from RUNNING/DRAINING/CHECKPOINTED, not ${record.state}`);
-      if (event.seq <= seqOf(record)) return bad(`stale done seq ${event.seq} <= ${seqOf(record)}`);
-      return ok({ state: "DONE", sha: event.sha, lastSeq: event.seq });
+      return ok({ state: "DONE", sha: event.sha });
     case "expire":
       // Any non-frozen state can expire (box died). Preserve the last confirmed sha for successor allocation.
       return ok({ state: "EXPIRED", lastConfirmedSha: event.lastConfirmedSha ?? record.sha });
