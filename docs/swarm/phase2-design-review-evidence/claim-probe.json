@@ -1,0 +1,32 @@
+{
+  "scope": "local Git fixture, no GitHub or VM access",
+  "precheck_both_absent": true,
+  "same_checkpoint_oid": "61c5ad9f3bed8122bec30abe74495cf4a7212262",
+  "pushes": [
+    {
+      "claimant": "A",
+      "exit": 0,
+      "stderr": "To /tmp/ah-swarm-lifecycle-design-review/claim-probe-2hpg9nz4/remote.git\n * [new branch]      61c5ad9f3bed8122bec30abe74495cf4a7212262 -> swarm/fixture.claimed"
+    },
+    {
+      "claimant": "B",
+      "exit": 0,
+      "stderr": "Everything up-to-date"
+    }
+  ],
+  "result": "ordinary push exit-success is not unique ownership; B reports up-to-date and succeeds",
+  "unique_owner_expected_absent_cas": [
+    {
+      "owner": "A",
+      "sha": "8eb5008430e9c624680c11dba2e6b41a01130ae2",
+      "exit": 0,
+      "stderr": "To /tmp/ah-swarm-lifecycle-design-review/claim-probe-2hpg9nz4/remote.git\n * [new branch]      8eb5008430e9c624680c11dba2e6b41a01130ae2 -> swarm/fixed.claimed"
+    },
+    {
+      "owner": "B",
+      "sha": "1bdb8a6f15bd6c01d35ca01af1275337d279dcd7",
+      "exit": 1,
+      "stderr": "To /tmp/ah-swarm-lifecycle-design-review/claim-probe-2hpg9nz4/remote.git\n ! [rejected]        1bdb8a6f15bd6c01d35ca01af1275337d279dcd7 -> swarm/fixed.claimed (stale info)\nerror: failed to push some refs to '/tmp/ah-swarm-lifecycle-design-review/claim-probe-2hpg9nz4/remote.git'"
+    }
+  ]
+}
