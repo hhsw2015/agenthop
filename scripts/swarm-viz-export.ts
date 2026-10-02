@@ -15,7 +15,7 @@
 // session (that is how discovery works), so it appears on other machines' rosters as a phantom node; we
 // drop our own row from the snapshot and export observerId so the page can label it.
 import { createServer } from "node:http";
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,7 +40,11 @@ export type ControlRecord = {
   owner?: string;
   leaseUntil?: number;
   attempt?: string;
+  /** How many allocation attempts this launch has made. */
+  attemptCount?: number;
   successor?: string;
+  /** The target sha this handoff pinned — the artifact the successor must continue from. */
+  handoffSha?: string;
   lastConfirmedSha?: string;
   allocStart?: number;
   budgetSec?: number;
@@ -105,6 +109,11 @@ export type VizBox = {
   /** repo@branch this box is working on, when the record carries it. */
   repo: string | null;
   branch: string | null;
+  /** Allocation attempts so far, and the sha a handoff pinned. */
+  attemptCount: number | null;
+  handoffSha: string | null;
+  /** EXPIRED is a VM terminal state but the task is still RECOVERABLE (its sha stays canonical). */
+  recoverable: boolean;
 };
 
 /** One "task" as it can be known TODAY: the lifecycle of a single launch. The richer fan-out / gather /
@@ -243,8 +252,28 @@ export function resolveHome(): string {
   return process.env.AH_HOME || homedir();
 }
 
-function controlDir(home: string): string {
-  return path.join(home, ".agenthop", "swarm", "control");
+/**
+ * Where the lifecycle mirror lives. Order: an explicit SWARM_CONTROL_DIR, else the live dispatcher's
+ * mirror, else the synthetic sample set, so a dev machine with no dispatcher still has something to draw.
+ * Returns the first directory that exists; the live path when none does (an empty read is the honest
+ * answer then).
+ */
+export function controlDir(home: string): string {
+  const explicit = process.env.SWARM_CONTROL_DIR;
+  if (explicit) return path.isAbsolute(explicit) ? explicit : path.join(home, explicit);
+  const live = path.join(home, ".agenthop", "swarm", "control");
+  if (existsSync(live) && readdirSafe(live).some((n) => n.endsWith(".json"))) return live;
+  const samples = path.join(home, ".agenthop", "swarm", "control-samples");
+  if (existsSync(samples) && readdirSafe(samples).some((n) => n.endsWith(".json"))) return samples;
+  return live;
+}
+
+function readdirSafe(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
 }
 
 /** Every readable control record, keyed by launchId. Absent dir / malformed file -> skipped. */
@@ -360,6 +389,9 @@ export function buildSnapshot(
       sha: control?.sha ?? control?.lastConfirmedSha ?? null,
       repo: typeof (control as Record<string, unknown> | null)?.repo === "string" ? ((control as Record<string, unknown>).repo as string) : null,
       branch: typeof (control as Record<string, unknown> | null)?.branch === "string" ? ((control as Record<string, unknown>).branch as string) : null,
+      attemptCount: control?.attemptCount ?? null,
+      handoffSha: control?.handoffSha ?? null,
+      recoverable: control?.state === "EXPIRED",
     });
   }
 

@@ -256,7 +256,10 @@
   .state-chip.RUNNING { color: var(--working); background: rgba(90,169,255,.12); }
   .state-chip.RESUMED { color: var(--idle); background: rgba(63,208,138,.12); }
   .state-chip.DRAINING, .state-chip.CHECKPOINTED, .state-chip.CLAIMED, .state-chip.ALLOCATING { color: var(--warn); background: rgba(255,180,84,.12); }
-  .state-chip.RETIRED, .state-chip.DONE, .state-chip.EXPIRED { color: var(--faint); background: rgba(255,255,255,.04); }
+  .state-chip.RETIRED, .state-chip.DONE { color: var(--faint); background: rgba(255,255,255,.04); }
+  /* EXPIRED: the VM is gone but the work is recoverable — warn, do not grey it out as finished. */
+  .state-chip.EXPIRED { color: var(--expired); background: rgba(255,107,107,.12); }
+  .recover { color: var(--expired); font-size: 10.5px; margin-top: 6px; }
   .empty-note { color: var(--faint); font-size: 10.7px; line-height: 1.6; }
   .flowrow { display: flex; align-items: center; gap: 6px; padding: 5px 0; font-size: 11px; }
   .flowrow .arrow { color: var(--relay); }
@@ -887,7 +890,7 @@
       return `<div class="rrow">
         <div class="who" title="${esc(t.taskId)}">${esc(t.taskId)}<span class="st">${esc(who)}${counter} \u00b7 ${dur}</span></div>
         <div class="rtrack">
-          <div class="band ${esc(t.state)}" style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%" title="${esc(t.state)} \u00b7 ${dur}"></div>
+          ${isTroubled(t.state) ? `<div class="band EXPIRED" style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%;opacity:.55" title="${esc(t.state)} \u00b7 ${dur} \u00b7 recoverable"></div>` : `<div class="band ${esc(t.state)}" style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%" title="${esc(t.state)} \u00b7 ${dur}"></div>`}
           <div class="nowline" style="left:100%"></div>
         </div>
       </div>`;
@@ -907,7 +910,10 @@
     return 232; // must match #stage.river-open padding-bottom
   }
 
+  // A stopped-but-recoverable state still needs its band drawn to the last update, not extended to now.
   function isOpen(st) { return st === "PENDING" || st === "RUNNING"; }
+  /** States the river must not colour as a clean finish. */
+  function isTroubled(st) { return String(st ?? "").toUpperCase() === "EXPIRED"; }
   function isFailure2(st) { const x = String(st ?? "").toLowerCase(); return x.includes("fail") || x.includes("error") || x.includes("cancel"); }
   function dur2(ms) {
     const sec = Math.max(0, Math.round(ms / 1000));
@@ -1118,9 +1124,12 @@
         ${b.repo ? `<dt>repo</dt><dd>${esc(b.repo)}</dd>` : ""}
         ${b.branch ? `<dt>branch</dt><dd>${esc(b.branch)}</dd>` : ""}
         ${b.sha ? `<dt>checkpoint</dt><dd>${esc(b.sha)}</dd>` : ""}
+        ${b.handoffSha ? `<dt>handoff sha</dt><dd>${esc(b.handoffSha)}</dd>` : ""}
+        ${b.attemptCount != null ? `<dt>attempts</dt><dd>${b.attemptCount}</dd>` : ""}
         ${c && c.owner ? `<dt>owner</dt><dd>${esc(c.owner)}</dd>` : ""}
         ${c && c.updatedAt ? `<dt>updated</dt><dd>${ago(c.updatedAt * 1000)}</dd>` : ""}
       </dl>
+      ${b.recoverable ? `<div class="recover">VM expired, but this task is recoverable — the checkpoint sha above is still canonical, so a successor can resume from it.</div>` : ""}
       ${lineage(b)}
       ${flows.length ? `<div class="sec">message flow</div>${flows.map((f) => `<div class="flowrow"><span class="who">${esc(short(f.from))}</span><span class="arrow">→</span><span class="who">${esc(short(f.to))}</span><span class="v">${f.count}× · ${ago(f.lastTs)}</span></div>`).join("")}` : ""}
       ${c && c.manifest ? `<div class="sec">manifest</div><div class="note">${esc(c.manifest)}</div>` : ""}
