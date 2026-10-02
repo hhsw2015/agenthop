@@ -1,0 +1,13 @@
+{
+  "extends": "../tsconfig.base.json",
+  "include": [
+    "*.ts",
+    "*.mts"
+  ],
+  "comment": "The swarm-viz scripts were unverified by any typecheck before this existed. They run under tsx, which strips types without checking them, so a type error here was invisible until runtime. Keep them in scope.",
+  "compilerOptions": {
+    "typeRoots": [
+      "../packages/bus/node_modules/@types"
+    ]
+  }
+}

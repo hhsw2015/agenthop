@@ -387,14 +387,6 @@ export function foldFlows(entries: MsgLogEntry[], limit = 60): VizFlow[] {
   return [...byPair.values()].sort((a, b) => b.lastTs - a.lastTs).slice(0, limit);
 }
 
-/** The newest result timestamp in ms epoch, or undefined. Task files carry seconds for the control
- *  mirror and ms for envelope files; callers normalize before passing. Pure. */
-export function newestResultAt(results?: Array<{ at?: number; ts?: number }>): number | undefined {
-  if (!Array.isArray(results) || !results.length) return undefined;
-  const vals = results.map((r) => (typeof r.ts === "number" ? r.ts : r.at)).filter((v): v is number => typeof v === "number");
-  return vals.length ? Math.max(...vals) : undefined;
-}
-
 // ---------------------------------------------------------------------------------------------
 // Snapshot assembly
 // ---------------------------------------------------------------------------------------------
@@ -513,8 +505,10 @@ export function tasksFromSources(controls: Map<string, ControlSlot>, files: Task
       assignees: f.assignees ?? [],
       state: f.state ?? "unknown",
       createdAt: f.createdAt ?? null,
-      // Fall back to the newest result time when a file lacks updatedAt — an end is what the band needs.
-      updatedAt: f.updatedAt ?? newestResultAt(f.results) ?? f.createdAt ?? null,
+      // Fall back to creation when a file lacks updatedAt. (A result carries no timestamp in the task
+      // envelope's shape, so there is nothing finer to fall back to — the band then shows a zero-length
+      // event rather than a wrong span.)
+      updatedAt: f.updatedAt ?? f.createdAt ?? null,
       ...(f.goal ? { goal: f.goal } : {}),
       ...(f.role ? { role: f.role } : {}),
       results: (f.results ?? []).map((r) => ({ launchId: r.launchId, state: r.state, sha: r.sha, costUsd: r.usage?.costUsd })),
@@ -582,9 +576,9 @@ function selftest(): void {
 
   // Message flows: fold journal lines into directed per-pair counts, newest first.
   const j: MsgLogEntry[] = [
-    { ts: 100, from: "a", to: "b", direction: "out", size: 10 },
-    { ts: 200, from: "a", to: "b", direction: "out", size: 5 },
-    { ts: 300, from: "b", to: "a", direction: "in", size: 2 },
+    { ts: 100, from: "a", to: "b", via: "local", direction: "out", size: 10 },
+    { ts: 200, from: "a", to: "b", via: "local", direction: "out", size: 5 },
+    { ts: 300, from: "b", to: "a", via: "local", direction: "in", size: 2 },
   ];
   const flows = foldFlows(j);
   t("foldFlows makes one entry per ordered pair", flows.length === 2);
