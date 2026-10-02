@@ -6,6 +6,7 @@ import { pushToHost } from "./push.js";
 import { startCodexDaemon, type CodexDaemon } from "./codex.js";
 import { resolvePeer, type UnifiedPeer } from "./resolve.js";
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
+import { writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 
 export { resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -57,6 +58,7 @@ export function codexDeliveryThread(
 
 export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const self = selfInfo();
+  const home = options.home ?? homedir(); // resolved early: used by handleInbound (below) + status watch (later)
   const queue: BusMessage[] = [];
   // Work-status is per SESSION IDENTITY, not per MCP-server process: one Codex daemon-backed server can
   // adopt several thread identities over its life (see learnStableId), and each must keep its own status
@@ -86,6 +88,8 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread());
     learnStableId(codexThread, ownCodexThread !== undefined);
     const label = labelFor(from);
+    // Metadata-only comms journal for swarm observability. No-op unless AGENTHOP_MSGLOG is set; never throws.
+    writeMsgLog(home, { ts: Date.now(), from, to: self.id, via, direction: "in", size: Buffer.byteLength(text), text });
     dbg(`inbound via=${via} from=${from} own=${ownCodexThread} stable=${self.stableId} daemon=${codexDaemon?.activeThread()} -> codexThread=${codexThread}`);
     void pushToHost(label, text, { codexThread }).then((ok) => {
       dbg(`pushToHost ok=${ok}`);
@@ -174,7 +178,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // Slice B: pick up status that an EXTERNAL hook wrote for this session (via `agenthop report-status`
   // → ~/.agenthop/status/<key>.json) and apply it through the same monotonic path. Keyed by the current
   // identity, re-read on every change so a Codex thread id learned late still lines up.
-  const statusHome = options.home ?? homedir();
+  const statusHome = home;
   const applyStatusFromFile = (): void => {
     const f = readStatusFile(statusHome, self.stableId ?? self.id);
     if (f) setStatusImpl(f.state as AgentStatus, { seq: f.seq, text: f.text });
@@ -192,8 +196,11 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     async send(to, text) {
       const peer = resolve(to);
       if ("error" in peer) return { ok: false, error: peer.error };
-      if (peer.via === "local") return { ok: local.send(peer.id, text), label: labelFor(peer.id) };
-      if (relay && peer.pub) return { ok: await relay.send(peer.pub, text), label: labelFor(peer.id) };
+      // Log an "out" entry only on confirmed delivery. No-op unless AGENTHOP_MSGLOG is set; never throws.
+      const logOut = (via: "local" | "relay"): void =>
+        void writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via, direction: "out", size: Buffer.byteLength(text), text });
+      if (peer.via === "local") { const ok = local.send(peer.id, text); if (ok) logOut("local"); return { ok, label: labelFor(peer.id) }; }
+      if (relay && peer.pub) { const ok = await relay.send(peer.pub, text); if (ok) logOut("relay"); return { ok, label: labelFor(peer.id) }; }
       return { ok: false, error: "That peer is on another machine but no team relay is configured here (set AGENTHOP_TEAM)." };
     },
     async recv(timeoutMs) {
