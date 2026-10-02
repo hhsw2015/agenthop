@@ -104,6 +104,22 @@ describe("handoff target pinning (per ATTEMPT, not per claim — Codex #4)", () 
     if (done.ok) expect(done.record.sha).toBe("fin0"); // canonical unchanged by resumed
   });
 
+  test("allocating pins the successor launchId (per attempt) so a restart re-reads who is taking over", () => {
+    const claimed = run(rec(), [
+      [{ type: "drain" }, T0 + 1],
+      [{ type: "checkpoint", sha: "fin0" }, T0 + 2],
+      [{ type: "claim", owner: "d", generation: 1, leaseUntil: T0 + 300 }, T0 + 3],
+    ]);
+    const allocating = run(claimed, [[{ type: "allocating", attempt: "a", successor: "rw-succ" }, T0 + 4]]);
+    expect(allocating.handoffSha).toBe("fin0");
+    expect(allocating.successor).toBe("rw-succ"); // pinned at allocating, survives the local mirror across a restart
+    const done = advance(allocating, { type: "resumed", successor: "rw-succ", sha: "fin0", generation: 1, attempt: "a" }, T0 + 5);
+    expect(done.ok && done.record.state === "RESUMED" && done.record.successor === "rw-succ").toBe(true);
+    // omitting successor (older call shape) still works: it just stays undefined
+    const noSucc = run(claimed, [[{ type: "allocating", attempt: "b" }, T0 + 6]]);
+    expect(noSucc.successor).toBeUndefined();
+  });
+
   test("reconcile_alive keeps the attempt's original pin even after a later recover advanced canonical sha", () => {
     // drain->checkpoint(cp)->claim->allocating(X) pins handoffSha=cp; expire; recover B (sha=B, pin stays cp);
     // a reclaim (SAME generation path not needed — we only assert the pin is preserved, not re-pinned to B).

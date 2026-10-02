@@ -85,7 +85,7 @@ export type ControlEvent =
   | { type: "checkpoint"; sha: string; manifest?: string }
   | { type: "claim"; owner: string; generation: number; leaseUntil: number }
   | { type: "reclaim"; owner: string; generation: number; leaseUntil: number }
-  | { type: "allocating"; attempt: string }
+  | { type: "allocating"; attempt: string; successor?: string }
   | { type: "alloc_unknown" }
   // reconcile a reclaimed in-flight allocation: its box was found DEAD (clear the attempt, allocate fresh) or ALIVE
   // (re-enter the await-resume wait reusing the SAME attempt — "alive" is NOT recovery-complete; only a real
@@ -185,7 +185,9 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       if (allocExhausted(record)) return bad(`allocation attempt cap (${MAX_ALLOC_ATTEMPTS}) reached`);
       // PIN handoffSha to the CURRENT canonical sha for THIS new attempt (Codex #4): the successor this attempt
       // creates is told to resume from here; a later recover_sha advancing `sha` must NOT move this attempt's target.
-      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false, handoffSha: record.sha });
+      // The successor launchId is pinned here too (per-attempt), so a dispatcher restart re-reads WHICH box is taking
+      // over from the mirror instead of a lost in-memory side-map. resumed later re-asserts the same successor.
+      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false, handoffSha: record.sha, ...(event.successor ? { successor: event.successor } : {}) });
     case "alloc_unknown":
       // Allocation request sent, result unknown. Stay ALLOCATING; mark it so a reclaimer reconciles this attempt.
       if (record.state !== "ALLOCATING") return bad(`alloc_unknown only from ALLOCATING, not ${record.state}`);
