@@ -19,6 +19,7 @@
 import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const env = process.env;
 const LID = must("SWARM_LAUNCH_ID");
@@ -81,7 +82,7 @@ function remainingSec() {
 }
 
 // --- async, bounded git (so the setInterval deadline tick keeps firing during IO) ---
-function git(args, { timeoutMs = GIT_TIMEOUT_MS, indexFile } = {}) {
+function realGit(args, { timeoutMs = GIT_TIMEOUT_MS, indexFile } = {}) {
   return new Promise((resolve) => {
     const child = spawn("git", args, {
       cwd: WORK_DIR,
@@ -97,6 +98,9 @@ function git(args, { timeoutMs = GIT_TIMEOUT_MS, indexFile } = {}) {
     child.on("close", (code) => { clearTimeout(timer); finish(code ?? -1); });
   });
 }
+// Reassignable so the regression test can inject a scripted in-memory git model and drive the REAL publish() —
+// no copied function body to drift. Production always uses realGit (the box never calls __setGit).
+let git = realGit;
 
 // --- the publish pipeline: stage allowlist+manifest into the PRIVATE index -> write-tree -> (skip if unchanged) ->
 // commit-tree onto the current branch tip -> update local ref -> non-force push. Returns { ok, sha }.
@@ -348,4 +352,18 @@ async function main() {
   setInterval(tick, POLL_MS);
 }
 
-void main();
+// Run the loop only when executed as the box script, NOT when imported by the regression test (which would otherwise
+// start the deadline interval + real recoverFromRemote and never exit).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) void main();
+
+// --- test hooks (inert when run as the box script; swarm-supervisor.test.mjs uses them to drive the REAL publish()
+//     against a scripted in-memory git model). Never invoked in production. ---
+export { publish, realGit };
+export function __setGit(fn) { git = fn; }
+export function __state() { return { lastPushedSha, finalized, attempted: [...attemptedShas] }; }
+export function __reset(s = {}) {
+  lastPushedSha = s.lastPushedSha ?? "";
+  finalized = s.finalized ?? false;
+  attemptedShas.clear();
+  for (const x of s.attempted ?? []) attemptedShas.add(x);
+}
