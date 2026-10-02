@@ -42,15 +42,21 @@ AGE=$(( $(date +%s) - ALLOCTS ))
 DEADLINE_WALL=$((ALLOCTS + BUDGET))
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Fresh-only (Codex P2-1): REFUSE if this task lifecycle's branch already exists on the WORK repo. The destructive
-# setup below (kill writers + rm the checkout/runtime) must NOT blow away confirmed work on swarm/<lid>-g<gen>: a
-# retry after a failed start would otherwise fast-forward reset-to-step-1 content onto the real branch, or get frozen
-# by an old final. To re-run, allocate a FRESH box (new launchId) or add an explicit resume (deferred). Read-only query
-# via the deploy key; a QUERY FAILURE is fatal too (refuse to destructively proceed when freshness can't be verified).
-GSC_RO="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
+# Fresh-only (Codex P2-1): a destructive setup (kill writers + rm checkout/runtime) must never blow away another
+# lifecycle's work, and READY must not be satisfied by an OLD in-flight push. TWO guards BEFORE any side-effect:
+#  (a) a persistent LOCAL lifecycle marker rejects a same-launchId re-run even before its first push has landed — a
+#      branch-absent remote does NOT prove freshness, since an earlier run's push may still be in flight server-side;
+#  (b) the remote branch must not already exist (confirmed prior work). To re-run, allocate a FRESH box (new launchId).
+# P3b: the deploy-key path is quoted INSIDE GSC_RO (git runs it via `sh -c`), so a path with spaces stays one arg.
+# Residual (documented, exactly-once is impossible here): binding READY to THIS run's incarnation needs a manifest
+# nonce (shared-schema change) — tracked; the local marker + branch guard close the practical same-LID re-run paths.
+LIFECYCLE="/tmp/ah-swarm-task-$LID.lifecycle"
+[ -e "$LIFECYCLE" ] && { echo "REFUSING: lifecycle for $LID already started ($LIFECYCLE) — a same-launchId re-run can false-READY on a late old push; allocate a fresh box (Codex P2-1)." >&2; exit 8; }
+GSC_RO="ssh -i \"$DEPLOY_KEY\" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
 EXIST="$(GIT_SSH_COMMAND="$GSC_RO" git ls-remote "$WORK_URL" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1{print $1}')" || {
   echo "FATAL: cannot query $BRANCH on $WORK_REPO (deploy key / network) — refusing to proceed blind (Codex P2-1)." >&2; exit 7; }
 [ -z "$EXIST" ] || { echo "REFUSING: $BRANCH already exists (${EXIST:0:12}) — this lifecycle already ran. Allocate a fresh box (new launchId) or use an explicit resume; not destructively resetting confirmed work (Codex P2-1)." >&2; exit 8; }
+: > "$LIFECYCLE"   # register THIS lifecycle before the first destructive side-effect (one-shot launchId; handoff always allocates a new one)
 
 # Direct SSH/SCP with the box's throwaway key + its per-VM HASSH profile (no proxy — box is bound to the key).
 PROF="$(cat "$KEYDIR/hassh-profile" 2>/dev/null || true)"
@@ -163,10 +169,15 @@ echo "== verify first confirmed publish on $BRANCH (up to 60s) =="
 # that found the branch still ABSENT (keep waiting) from a CONFIRMED sha. Bound total wait by an absolute deadline and
 # each query by ssh ConnectTimeout, so a hung network can't exceed the budget. Because P2-1 verified the branch was
 # ABSENT at start, any sha observed here is THIS run's first publish.
+# P2-2: ConnectTimeout only bounds the connect/handshake, not the full ls-remote; wrap each query in a REAL total
+# timeout where available (timeout/gtimeout) and RE-CHECK the deadline AFTER the query, so a query that overran can
+# never be accepted late.
+QTO=""; for c in timeout gtimeout; do command -v "$c" >/dev/null 2>&1 && { QTO="$c 25"; break; }; done
 CONFIRMED=""; QDEADLINE=$(( $(date +%s) + 60 ))
 while [ "$(date +%s)" -lt "$QDEADLINE" ]; do
   SHA=""; QRC=0
-  SHA="$(GIT_SSH_COMMAND="$GSC_RO" git ls-remote "$WORK_URL" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1{print $1}')" || QRC=$?
+  SHA="$($QTO env GIT_SSH_COMMAND="$GSC_RO" git ls-remote "$WORK_URL" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1{print $1}')" || QRC=$?
+  [ "$(date +%s)" -lt "$QDEADLINE" ] || break   # a query that overran the budget must NOT be accepted late (P2-2)
   if [ "$QRC" -ne 0 ]; then echo "  (ls-remote query error; retry within deadline)" >&2; sleep 2; continue; fi
   if [ -n "$SHA" ]; then CONFIRMED="$SHA"; break; fi
   sleep 2

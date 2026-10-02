@@ -36,6 +36,9 @@ export type Manifest = {
 /** Whole-manifest serialized size cap. A manifest is a short summary, not a payload; reject anything larger at
  *  BOTH ends so the box can never publish one the dispatcher would refuse. */
 export const MAX_MANIFEST_BYTES = 16 * 1024;
+// Bound by real UTF-8 BYTES, not JS code units (Codex P3): a CJK/emoji field is ~3-4 bytes/char, so a code-unit count
+// under-measures the committed blob. Producer (validateForPublish) and reader (parseManifest) use the SAME measure.
+const byteLen = (s: string): number => new TextEncoder().encode(s).length;
 const KINDS: ReadonlySet<string> = new Set(["milestone", "final", "rescue"]);
 
 /** Canonical JSON (fixed key order) so an unchanged manifest serializes byte-identically — lets the publisher skip
@@ -71,7 +74,7 @@ function validate(o: Record<string, unknown>, serializedLen: number): ManifestCh
 /** Parse + validate a manifest read from a pinned commit. Returns null for anything malformed/oversize/partial
  *  (a reader catching a mid-write file degrades to null, never throws). */
 export function parseManifest(text: string): Manifest | null {
-  if (!text || text.length > MAX_MANIFEST_BYTES) return null;
+  if (!text || byteLen(text) > MAX_MANIFEST_BYTES) return null;
   let v: unknown;
   try {
     v = JSON.parse(text);
@@ -80,7 +83,7 @@ export function parseManifest(text: string): Manifest | null {
   }
   if (typeof v !== "object" || v === null) return null;
   const o = v as Record<string, unknown>;
-  if (!validate(o, text.length).ok) return null;
+  if (!validate(o, byteLen(text)).ok) return null;
   return {
     schemaVersion: 1,
     launchId: o.launchId as string,
@@ -96,5 +99,5 @@ export function parseManifest(text: string): Manifest | null {
  *  dispatcher's parseManifest would reject (identical bound). */
 export function validateForPublish(m: Manifest): ManifestCheck {
   const encoded = encodeManifest(m);
-  return validate(m as unknown as Record<string, unknown>, encoded.length);
+  return validate(m as unknown as Record<string, unknown>, byteLen(encoded));
 }

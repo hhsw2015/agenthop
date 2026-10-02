@@ -59,9 +59,12 @@ cleanup() {
   # Delete ONLY a definitively-failed keydir: no alloc-ts AND not marked `unknown`. An UNKNOWN result (Codex P2-5) may
   # have created a live box whose ACK we lost; deleting its only key would orphan that VM (unreachable + un-scrubbable),
   # so an unknown keydir is RETAINED (and already excluded from reuse/discovery, which both require alloc-ts).
-  if [ -n "${NEW_KEYDIR:-}" ] && [ ! -f "$NEW_KEYDIR/alloc-ts" ] && [ ! -f "$NEW_KEYDIR/unknown" ]; then
+  # Retain on ANY retain-signal: alloc-ts (confirmed), unknown (maybe-live), or inflight (request may have been sent —
+  # Codex P2-3). Delete ONLY a keydir with none of them (the request was never sent, or a recognized clean refusal
+  # cleared inflight). Default-retain means a death/bookkeeping-failure after the request can never orphan a live box.
+  if [ -n "${NEW_KEYDIR:-}" ] && [ ! -f "$NEW_KEYDIR/alloc-ts" ] && [ ! -f "$NEW_KEYDIR/unknown" ] && [ ! -f "$NEW_KEYDIR/inflight" ]; then
     rm -rf "$NEW_KEYDIR" 2>/dev/null || true
-    echo "cleanup: removed unconfirmed keydir $NEW_KEYDIR (clean failure — no alloc-ts, not unknown)" >&2
+    echo "cleanup: removed keydir $NEW_KEYDIR (request never sent / clean refusal — no alloc-ts, inflight, or unknown)" >&2
   fi
 }
 trap cleanup EXIT
@@ -161,25 +164,29 @@ if [ -z "$REUSED" ]; then
   # Allocation is the ONLY step that must exit via a clean IP (proxy). Keep it minimal — a bare command — so the
   # ~30MB binary download does NOT crawl through the WS tunnel; that happens on the direct install below.
   echo "== allocate NEW box (via proxy, minimal) =="
+  : > "$KEYDIR/inflight"   # register BEFORE the request (Codex P2-3): any death/bookkeeping-failure AFTER this defaults to RETAIN
   ALLOC_OUT="$("${ALLOC_SSH[@]}" railway.new 'echo alloc-ok' 2>&1 || true)"
   echo "$ALLOC_OUT" | grep -vi 'human_claim_url\|trial_starting\|preview_url' | tail -2 || true
-  if ! echo "$ALLOC_OUT" | grep -q alloc-ok; then
-    # Distinguish a CLEAN REFUSAL (box NOT created -> safe to delete the key) from an UNKNOWN result (box MAYBE created,
-    # ACK/output lost -> MUST retain the key, Codex P2-5). Default to UNKNOWN: only a RECOGNIZED refusal deletes.
-    if echo "$ALLOC_OUT" | grep -qiE 'anonymous visitors are limited|too many|rate.?limit|quota|limit exceeded|forbidden|permission denied|access denied'; then
-      echo "ALLOC REFUSED for $LID (clean refusal; box not created) — proxy=$PROXY." >&2
+  if echo "$ALLOC_OUT" | grep -q alloc-ok; then
+    # Confirmed: stamp the reuse window, THEN clear in-flight. If the stamp WRITE fails, KEEP inflight so cleanup still
+    # retains the key — an alloc-ok (live) box must never be deleted on a local bookkeeping failure (Codex P2-3).
+    if date +%s > "$KEYDIR/alloc-ts" 2>/dev/null; then rm -f "$KEYDIR/inflight"
+    else echo "WARN: alloc-ts stamp failed for $LID — keeping inflight marker so the (live) box's key is retained." >&2; fi
+  else
+    # Only a RECOGNIZED PRE-PROVISION refusal proves the box was NOT created (Codex P2-4): Railway's IP-gate message.
+    # Generic quota/permission/etc substrings can be POST-provision shell/fs/login errors — NOT deletion evidence, so
+    # everything else stays UNKNOWN and RETAINS the key (box may be live).
+    if echo "$ALLOC_OUT" | grep -qi 'anonymous visitors are limited'; then
+      rm -f "$KEYDIR/inflight"   # clean pre-provision refusal -> allow cleanup to delete (definitively not created)
+      echo "ALLOC REFUSED for $LID (provider IP-gate refusal; box not created) — proxy=$PROXY." >&2
       echo "$ALLOC_OUT" | tail -3 >&2
-      exit 3   # cleanup deletes the keydir: definitively not created
+      exit 3
     fi
-    # UNKNOWN: retain the key so a possibly-live box can be reconciled / left to physical (<=60m) expiry. Mark it so the
-    # cleanup trap does NOT delete it; it is already out of reuse/discovery (both require alloc-ts). ponytail: a reaper
-    # of unknown keydirs older than the budget is a future add; for now they are rare and expire physically.
-    : > "$KEYDIR/unknown"
+    : > "$KEYDIR/unknown"   # UNKNOWN: box may be live; RETAIN (inflight also still set). Reconcile or physical (<=60m) expiry.
     echo "ALLOC RESULT UNKNOWN for $LID — retaining keydir (box may be live); excluded from reuse. Reconcile or let it expire." >&2
     echo "$ALLOC_OUT" | tail -3 >&2
     exit 6
   fi
-  date +%s > "$KEYDIR/alloc-ts"   # box confirmed live: start the reuse window from here
 
   # Install direct — the box is now bound to our key, reachable from any IP, and direct is far faster than SOCKS.
   # The mcp.json carries the AGENTHOP env — Claude Code does NOT pass the parent env to MCP servers, so the team
