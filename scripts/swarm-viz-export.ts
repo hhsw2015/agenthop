@@ -23,6 +23,7 @@ import { startBusCore } from "../packages/bus/src/core.js";
 import { readMsgLogDays, msgLogEnabled, payloadLoggingEnabled, type MsgLogEntry as BusMsgLogEntry } from "../packages/bus/src/msglog.js";
 import { readTasks } from "../packages/bus/src/tasklog.js";
 import type { UnifiedPeer } from "../packages/bus/src/resolve.js";
+import { codexRolloutPath, readNodeActivity, transcriptPath, type NodeActivity } from "./node-activity.js";
 
 // ---------------------------------------------------------------------------------------------
 // Types
@@ -61,6 +62,11 @@ export type VizNode = UnifiedPeer & {
    */
   lastMessageAt?: number;
   lastPeerId?: string;
+  /**
+   * What this node is doing, from its host transcript. LOCAL ONLY: a remote peer's transcript is not on
+   * this machine, so a relay row carries no activity and its detail stays whatever statusText says.
+   */
+  activity?: NodeActivity;
 };
 
 /** One line of the opt-in, metadata-only message journal (shared definition lives in the bus). */
@@ -362,7 +368,22 @@ export function buildSnapshot(
     if (p.id === observerId) continue; // do not show ourselves as a swarm node
     const boxIndex = boxes.findIndex((b) => matchNode([p], b.launchId) === 0);
     if (boxIndex >= 0) boxes[boxIndex]!.nodeIndex = nodes.length;
-    nodes.push({ ...p, machine: p.machine ?? "local", boxIndex });
+    const node: VizNode = { ...p, machine: p.machine ?? "local", boxIndex };
+    // LOCAL peers only: a remote session's transcript lives on its own machine.
+    if (p.via !== "relay" && p.stableId) {
+      // Claude: id + cwd locate the transcript. Codex: the thread id is in the rollout FILENAME, and its
+      // rollouts live under CODEX_HOME (a symlink to shared storage here), so the cwd is not needed.
+      const file = p.tool === "claude" && p.cwd ? transcriptPath(p.stableId, p.cwd) : p.tool === "codex" ? codexRolloutPath(p.stableId) : undefined;
+      if (file) {
+        try {
+          const act = readNodeActivity(file);
+          if (act) node.activity = act;
+        } catch {
+          // an unreadable transcript must never break the snapshot
+        }
+      }
+    }
+    nodes.push(node);
   }
 
   // Handoff edges: the full predecessor -> successor SET, not just the first. A record whose successor

@@ -223,6 +223,11 @@
   dd { margin: 0; overflow-wrap: anywhere; }
   .note { background: rgba(255,255,255,.03); border: 1px solid var(--line-soft); border-radius: 10px;
     padding: 10px 12px; font-size: 12px; color: #ccd2e2; overflow-wrap: anywhere; margin-bottom: 12px; line-height: 1.6; }
+  .act { display: grid; grid-template-columns: 62px 1fr auto; gap: 8px; align-items: baseline;
+    padding: 4px 0; font-size: 11px; border-bottom: 1px solid var(--line-soft); }
+  .act .an { color: var(--working); font-weight: 600; font-size: 10.5px; }
+  .act .at { color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .act .aw { color: var(--faint); font-size: 10px; white-space: nowrap; }
   .sec { color: var(--faint); font-size: 10px; font-weight: 650; letter-spacing: .14em; text-transform: uppercase; margin: 20px 0 9px; }
   .bar { height: 3px; border-radius: 2px; background: rgba(255,255,255,.06); overflow: hidden; margin: 4px 0 16px; }
   .bar i { display: block; height: 100%; border-radius: 2px; transition: width .3s; }
@@ -1041,6 +1046,7 @@
         ${act ? `<dt>last msg</dt><dd>${ago(act.at)} with ${esc(counterpartName(act.withKey))}</dd>` : ""}
       </dl>
       ${d.statusText ? `<div class="note">${esc(d.statusText)}</div>` : ""}
+      ${activitySection(d)}
       ${mine.length
         ? `<div class="sec">message flow</div>${mine.map((f) => `<div class="flowrow"><span class="who">${esc(counterpartName(f.other))}</span><span class="v">${f.count}x &middot; ${ago(f.lastTs)}</span></div>`).join("")}`
         : `<div class="sec">message flow</div><div class="empty-note">${state.msgLogEnabled
@@ -1049,6 +1055,34 @@
       ${d.via === "relay" ? `<div class="note" style="margin-top:12px">Remote peer: presence is announced every 60s, so this status can lag up to a minute. Read "changed", not the poll rate.</div>` : ""}
     `;
   }
+
+  /** What this node is doing right now, from its host transcript (local peers only). */
+  function activitySection(d) {
+    const a = d.activity;
+    if (!a) {
+      return d.via === "relay"
+        ? `<div class="sec">doing now</div><div class="empty-note">A remote session's transcript is on its own machine, so its detail is limited to the status above.</div>`
+        : `<div class="sec">doing now</div><div class="empty-note">No transcript found for this session. Claude sessions expose one; other hosts do not (yet).</div>`;
+    }
+    const rec = (a.recent ?? []).map((x) => `<div class="act">
+        <span class="an">${esc(x.name)}</span>
+        <span class="at">${esc(x.target || "—")}</span>
+        <span class="aw">${x.ts ? ago(x.ts) : ""}</span>
+      </div>`).join("");
+    const u = a.usage;
+    const cost = u ? `<dl style="margin-top:10px">
+        <dt>context in</dt><dd>${fmtNum(u.inputTokens)}</dd>
+        <dt>cache read</dt><dd>${fmtNum(u.cacheReadTokens)}</dd>
+        <dt>cache write</dt><dd>${fmtNum(u.cacheWriteTokens)}</dd>
+        <dt>out</dt><dd>${fmtNum(u.outputTokens)}</dd>
+      </dl>` : "";
+    return `<div class="sec">doing now</div>
+      <div class="note">Last activity ${ago(a.lastAt)}.</div>
+      ${rec || `<div class="empty-note">No tool calls in the recent transcript window.</div>`}
+      ${cost}`;
+  }
+
+  function fmtNum(n) { return (n ?? 0).toLocaleString(); }
 
   function boxDrawer(b) {
     const c = b.control;
