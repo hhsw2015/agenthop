@@ -34,6 +34,14 @@ const GOAL = env.SWARM_GOAL || "";
 // Allowlist is REQUIRED and must not be "." (Codex P1-3: "." / a shared index publishes logs/creds). Each entry is
 // a pathspec relative to the work tree; the private index means only these (plus the manifest) are ever committed.
 const ALLOWLIST = (must("SWARM_ALLOWLIST")).split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+// Validate the allowlist is a real artifact set, not the whole tree (Codex #8): "." / "./" / "*" / absolute / ".."
+// would publish untracked logs/creds. An empty list is already rejected by must().
+for (const p of ALLOWLIST) {
+  if (p === "." || p === "./" || p === "*" || p.startsWith("/") || p.split("/").includes("..")) {
+    console.error(`swarm-supervisor: unsafe allowlist entry ${JSON.stringify(p)} (no '.' './' '*' absolute or '..')`);
+    process.exit(2);
+  }
+}
 
 const THRESHOLDS = [300, 120]; // T-5, T-2 (matches control.ts CHECKPOINT_THRESHOLDS_SEC)
 const POLL_MS = 5000;
@@ -90,15 +98,18 @@ function git(args, { timeoutMs = GIT_TIMEOUT_MS, indexFile } = {}) {
 
 // --- the publish pipeline: stage allowlist+manifest into the PRIVATE index -> write-tree -> (skip if unchanged) ->
 // commit-tree onto the current branch tip -> update local ref -> non-force push. Returns { ok, sha }.
+const MANIFEST_FIELD_CAP = 6000; // keeps goal+next+overhead under MAX_MANIFEST_BYTES while preserving semantics
+function clampStr(s, max) { return s.length > max ? `${s.slice(0, max)}…[truncated]` : s; }
 function buildManifest(kind, goal, next) {
   // NO createdAt: a changing timestamp each publish would defeat the "skip if unchanged" idempotency (Codex).
-  const m = { schemaVersion: 1, launchId: LID, generation: GEN, kind, ...(goal ? { goal } : {}), ...(next ? { next } : {}) };
+  // TRUNCATE goal/next to fit the shared size bound rather than silently dropping them and reporting success
+  // (Codex #9): a "…[truncated]" marker preserves partial semantics + keeps the manifest parseable.
+  const g = goal ? clampStr(goal, MANIFEST_FIELD_CAP) : undefined;
+  const n = next ? clampStr(next, MANIFEST_FIELD_CAP) : undefined;
+  const m = { schemaVersion: 1, launchId: LID, generation: GEN, kind, ...(g ? { goal: g } : {}), ...(n ? { next: n } : {}) };
   const s = JSON.stringify(m);
-  if (s.length > MAX_MANIFEST_BYTES) {
-    // Producer enforces the SAME bound the dispatcher's parseManifest uses (Codex #13) — drop next/goal to fit.
-    return JSON.stringify({ schemaVersion: 1, launchId: LID, generation: GEN, kind });
-  }
-  return s;
+  // Belt-and-suspenders: if still over (pathological), drop to the minimal valid manifest.
+  return s.length > MAX_MANIFEST_BYTES ? JSON.stringify({ schemaVersion: 1, launchId: LID, generation: GEN, kind }) : s;
 }
 
 async function publish(kind, { goal, next } = {}) {
@@ -107,34 +118,49 @@ async function publish(kind, { goal, next } = {}) {
   mkdirSync(path.dirname(manifestAbs), { recursive: true });
   atomicWrite(manifestAbs, buildManifest(kind, goal || GOAL, next), 0o644);
 
-  // 2. stage ONLY the allowlist + the manifest into the PRIVATE index (never the worker's index). Seed the private
-  //    index from the branch tip so unlisted tracked files are preserved but worker-staged junk is not inherited.
-  const parent = (await git(["rev-parse", "-q", "--verify", BRANCH])).stdout.trim();
-  if (parent) await git(["read-tree", parent], { indexFile: PRIVATE_INDEX });
+  // 2. parent = the REMOTE publish-branch tip (NOT the worker's local branch). ls-remote first so a QUERY FAILURE
+  //    (network) is NOT mistaken for "branch absent" (Codex): on failure we abort + retry next tick. Single-publisher
+  //    guard: if the remote advanced to something WE did not push, refuse to blind-rebase onto a foreign commit.
+  const ls = await git(["ls-remote", "origin", `refs/heads/${BRANCH}`]);
+  if (ls.code !== 0) return { ok: false, error: `ls-remote: ${ls.stderr.trim()}` };
+  const remoteTip = (ls.stdout.split(/\s+/)[0] || "").trim(); // empty => branch genuinely absent
+  if (remoteTip && lastPushedSha && remoteTip !== lastPushedSha)
+    return { ok: false, error: `foreign tip ${remoteTip.slice(0, 8)} != ours ${lastPushedSha.slice(0, 8)}; refusing blind rebase (single-publisher violated)` };
+  let parent = "";
+  if (remoteTip) {
+    const f = await git(["fetch", "-q", "origin", `refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}`]);
+    if (f.code !== 0) return { ok: false, error: `fetch: ${f.stderr.trim()}` };
+    parent = (await git(["rev-parse", "-q", "--verify", `refs/remotes/origin/${BRANCH}`])).stdout.trim();
+  }
+
+  // 3. build the tree from an EMPTY private index + ONLY the allowlist (+manifest). Starting empty means a
+  //    worker-committed out-of-tree .env can NEVER be inherited (Codex #2); the publish branch is a curated
+  //    artifact snapshot, not a mirror of the worker's checkout.
+  const empty = await git(["read-tree", "--empty"], { indexFile: PRIVATE_INDEX });
+  if (empty.code !== 0) return { ok: false, error: `read-tree --empty: ${empty.stderr.trim()}` };
   const add = await git(["add", "--", MANIFEST_REL, ...ALLOWLIST], { indexFile: PRIVATE_INDEX });
   if (add.code !== 0) return { ok: false, error: `git add: ${add.stderr.trim()}` };
-
-  // 3. write-tree; skip the commit entirely if the tree is unchanged (idempotent latest-snapshot, no churn).
   const wt = await git(["write-tree"], { indexFile: PRIVATE_INDEX });
   if (wt.code !== 0) return { ok: false, error: `write-tree: ${wt.stderr.trim()}` };
   const tree = wt.stdout.trim();
+
+  // 4. skip only if the REMOTE parent already carries this exact tree (then the remote truly has our snapshot).
   if (parent) {
     const parentTree = (await git(["rev-parse", `${parent}^{tree}`])).stdout.trim();
-    if (parentTree === tree) return { ok: true, sha: parent, unchanged: true };
+    if (parentTree === tree) { lastPushedSha = parent; return { ok: true, sha: parent, unchanged: true }; } // remote already has this tree
   }
 
-  // 4. commit-tree onto the fixed parent (no HEAD/worktree mutation), update the local branch ref, non-force push.
+  // 5. commit-tree onto the remote parent, then push the COMMIT OBJECT directly (no update-ref -> the worker's
+  //    HEAD/branch is never touched). Non-force so the remote only fast-forwards.
   const ct = await git(["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", `swarm ${kind} g${GEN}`]);
   if (ct.code !== 0) return { ok: false, error: `commit-tree: ${ct.stderr.trim()}` };
   const sha = ct.stdout.trim();
-  const upd = await git(["update-ref", `refs/heads/${BRANCH}`, sha, ...(parent ? [parent] : [])]);
-  if (upd.code !== 0) return { ok: false, error: `update-ref: ${upd.stderr.trim()}` };
-  const push = await git(["push", "origin", `refs/heads/${BRANCH}:refs/heads/${BRANCH}`]); // non-force: remote only fast-forwards
+  const push = await git(["push", "origin", `${sha}:refs/heads/${BRANCH}`]);
   if (push.code !== 0) {
-    // Do NOT force/rebase. Leave the local ref; a later tick retries. On an ambiguous failure the dispatcher
-    // reconciles from whatever the remote ref actually is (Codex: read the ref, don't assume not-pushed).
+    // Do NOT force/rebase. A later tick re-fetches the remote tip and retries from there (never masks a failure).
     return { ok: false, error: `push: ${push.stderr.trim()}`, sha };
   }
+  lastPushedSha = sha; // record OUR tip so the single-publisher guard can spot a foreign writer next time
   return { ok: true, sha };
 }
 
@@ -155,19 +181,35 @@ function writeAck(obj) { atomicWrite(ACK_FILE, JSON.stringify(obj)); }
 
 // --- worker-driven checkpoint requests (cooperative freeze: worker quiesces writes BEFORE writing REQ_FILE, resumes
 // only after a terminal ack). kind "milestone" stays mid-task; kind "final" is the drained, frozen handoff point. ---
-let lastReq = "";
+let lastPushedSha = "";   // OUR last published tip (single-publisher guard in publish())
+let lastReq = "";         // the last requestId we CONFIRMED (permanent skip)
+let processingReq = "";   // the requestId currently in flight (coalesce: don't re-enqueue it every tick)
+let finalized = false;    // a `final` has been confirmed -> freeze: publish nothing more until retire/scrub (Codex #6)
 function checkRequest() {
+  if (ending || finalized) return; // once dying or finalized, stop accepting new work (Codex #5/#6)
   if (!existsSync(REQ_FILE)) return;
   let req;
   try { req = JSON.parse(readFileSync(REQ_FILE, "utf8")); } catch { return; }
-  if (!req || typeof req.requestId !== "string" || req.requestId === lastReq) return;
-  const kind = req.kind === "final" ? "final" : "milestone";
+  if (!req || typeof req.requestId !== "string") return;
   const requestId = req.requestId;
+  // Coalesce: skip if already confirmed OR already in flight. Without the in-flight guard, every 5s tick re-enqueued
+  // the SAME request while the first was still publishing, and a queued duplicate would capture AFTER the worker's
+  // terminal ACK ended its freeze (Codex #5).
+  if (requestId === lastReq || requestId === processingReq) return;
+  const kind = req.kind === "final" ? "final" : "milestone";
+  processingReq = requestId;
   writeAck({ requestId, status: "capturing" }); // "received", not "frozen-proven" — freeze is the worker's contract
   runExclusive(async () => {
     const r = await publish(kind, { goal: req.goal, next: req.next });
-    if (r.ok) { lastReq = requestId; writeAck({ requestId, status: "confirmed", sha: r.sha }); log(`${kind} ${requestId} -> ${r.sha}${r.unchanged ? " (unchanged)" : ""}`); }
-    else writeAck({ requestId, status: "error", error: r.error }); // leave lastReq unset so the worker may retry the same id
+    if (r.ok) {
+      lastReq = requestId;
+      if (kind === "final") finalized = true; // freeze the handoff point; no later rescue can move the tip past it
+      writeAck({ requestId, status: "confirmed", sha: r.sha });
+      log(`${kind} ${requestId} -> ${r.sha}${r.unchanged ? " (unchanged)" : ""}`);
+    } else {
+      writeAck({ requestId, status: "error", error: r.error }); // leave lastReq unset so the worker may retry the same id
+    }
+    processingReq = ""; // clear in-flight (retryable on error; a confirmed id is already skipped via lastReq)
   });
 }
 
@@ -181,8 +223,11 @@ function tick() {
   if (rem <= 0 && !ending) {
     ending = true;
     runExclusive(async () => {
-      const r = await publish("rescue", { next: "deadline reached; box expiring" }); // best-effort, NOT a clean final
-      log(r.ok ? `deadline rescue -> ${r.sha}` : `deadline rescue FAILED: ${r.error}`);
+      // If a clean final was already confirmed, do NOT publish a rescue past it (keep the frozen handoff tip).
+      if (!finalized) {
+        const r = await publish("rescue", { next: "deadline reached; box expiring" }); // best-effort, NOT a clean final
+        log(r.ok ? `deadline rescue -> ${r.sha}` : `deadline rescue FAILED: ${r.error}`);
+      } else log("deadline: finalized, keeping frozen final tip");
       if (SCRUB) { log("scrub"); spawn("bash", [SCRUB], { env, stdio: "ignore" }).unref?.(); }
       setTimeout(() => process.exit(0), 2000);
     });
@@ -192,8 +237,9 @@ function tick() {
   for (const t of THRESHOLDS.filter((t) => rem <= t && !fired.has(t)).sort((a, b) => a - b)) {
     fired.add(t);
     const mins = Math.max(1, Math.round(t / 60));
+    pokeWorker(mins); // advisory nudge regardless
+    if (finalized) { log(`T-${mins}m: finalized, no rescue (frozen final tip)`); continue; }
     log(`T-${mins}m (rem=${Math.round(rem)}s): poke + rescue publish`);
-    pokeWorker(mins);
     runExclusive(async () => {
       const r = await publish("rescue", { next: `T-${mins}m safety snapshot` });
       log(r.ok ? `rescue -> ${r.sha}` : `rescue FAILED: ${r.error}`);

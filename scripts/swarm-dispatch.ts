@@ -144,16 +144,27 @@ async function observeOnce(argv: string[]): Promise<void> {
 
 // --- one control-loop pass (observe + authoritative clock + nextAction) ---
 async function pass(records: Map<string, ControlRecord>): Promise<void> {
-  const boxes = discoverBoxes();
+  const boxes = new Map(discoverBoxes().map((b) => [b.launchId, b]));
+  // Iterate the UNION of keydir-discovered boxes AND persisted mirror records (Codex #7): a box whose keydir
+  // vanished but whose record is still non-terminal (e.g. EXPIRED needing a successor) must still be processed,
+  // including after a same-machine restart.
+  const ids = new Set<string>([...boxes.keys(), ...records.keys()]);
   const liveCount = [...records.values()].filter((r) => r.state !== "RETIRED" && r.state !== "DONE").length;
 
-  for (const box of boxes) {
-    let r = records.get(box.launchId) ?? { launchId: box.launchId, state: "RUNNING", generation: 0, allocStart: box.allocTs, budgetSec: BUDGET_SEC, updatedAt: nowSec(), deadlineEpoch: box.allocTs + BUDGET_SEC };
-    records.set(box.launchId, r);
+  for (const launchId of ids) {
+    const box = boxes.get(launchId);
+    let r = records.get(launchId);
+    if (!r) {
+      if (!box) continue; // id came from neither source somehow
+      r = { launchId, state: "RUNNING", generation: 0, allocStart: box.allocTs, budgetSec: BUDGET_SEC, updatedAt: nowSec(), deadlineEpoch: box.allocTs + BUDGET_SEC };
+    }
+    records.set(launchId, r);
+    if (r.state === "RETIRED" || r.state === "DONE") continue; // terminal: nothing to do
 
-    // 1) observe the WORK branch and accept forward progress
+    // 1) observe the WORK branch and accept forward progress. `sha` is the single canonical confirmed checkpoint
+    //    (monotonic via the dispatcher's ancestry guard; recover_sha advances it even after EXPIRED).
     if (WORK_REPO) {
-      const tip = await observeTip(WORK_REPO, branchFor(r), r.sha ?? r.lastConfirmedSha, path.join(HOME, ".agenthop", "swarm", "scratch", r.launchId));
+      const tip = await observeTip(WORK_REPO, branchFor(r), r.sha, path.join(HOME, ".agenthop", "swarm", "scratch", r.launchId));
       if (tip) {
         const dec = tipToEvent(r, tip);
         if (dec.kind === "advance") r = applyEvent(r, dec.event);
@@ -170,7 +181,7 @@ async function pass(records: Map<string, ControlRecord>): Promise<void> {
     // 3) if the box is likely physically gone, record EXPIRED so recovery still runs
     if (r.state !== "RETIRED" && r.state !== "DONE" && r.state !== "EXPIRED" && likelyExpired(r, nowSec())) {
       r = applyEvent(r, { type: "expire" });
-      notifyUser(`box ${r.launchId} expired; lastConfirmedSha=${r.lastConfirmedSha ?? r.sha ?? "none"}`);
+      notifyUser(`box ${r.launchId} expired; recoverySha=${r.sha ?? "none"}`);
     }
 
     // 4) drive handoff via the pure decision
@@ -178,6 +189,10 @@ async function pass(records: Map<string, ControlRecord>): Promise<void> {
     if (action === "claim") { log(`${r.launchId}: would claim + allocate successor (handoff exec — gated live wiring)`); }
     else if (action === "give_up") { notifyUser(`box ${r.launchId}: allocation attempts exhausted; manual attention`); }
     // claim/allocate/reconcile/retire EXEC (swarm-launch + resumed-ACK barrier) lands with the launcher wiring.
+
+    // Persist the ADVANCED record back into the Map so the next pass sees DRAINING/CHECKPOINTED/... (Codex #3:
+    // without this the Map kept the stale RUNNING record and re-DRAINed forever, never accepting a final).
+    records.set(launchId, r);
   }
 }
 

@@ -35,8 +35,8 @@ export function tipToEvent(record: ControlRecord, tip: ObservedTip): Acceptance 
   if (m.launchId !== record.launchId) return { kind: "skip", reason: `launchId ${m.launchId} != ${record.launchId}` };
   if (!isCurrentGeneration(record, m.generation)) return { kind: "skip", reason: `stale generation ${m.generation} != ${record.generation}` };
   if (!tip.isDescendantOfAccepted) return { kind: "skip", reason: "tip not a descendant of last accepted sha (no-rollback)" };
-  // Idempotent: we have already recorded this exact sha.
-  if (record.sha === tip.sha || record.lastConfirmedSha === tip.sha) return { kind: "skip", reason: "already accepted" };
+  // Idempotent: we have already recorded this exact sha (sha is the single canonical confirmed checkpoint).
+  if (record.sha === tip.sha) return { kind: "skip", reason: "already accepted" };
 
   // VM already dead, but a newer confirmed tip exists -> advance ONLY the recovery sha (Codex #10), stay EXPIRED.
   if (record.state === "EXPIRED") return { kind: "advance", event: { type: "recover_sha", sha: tip.sha } };

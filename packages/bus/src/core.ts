@@ -6,7 +6,7 @@ import { pushToHost } from "./push.js";
 import { startCodexDaemon, type CodexDaemon } from "./codex.js";
 import { resolvePeer, type UnifiedPeer } from "./resolve.js";
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
-import { writeMsgLog } from "./msglog.js";
+import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 
 export { resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -88,8 +88,9 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread());
     learnStableId(codexThread, ownCodexThread !== undefined);
     const label = labelFor(from);
-    // Metadata-only comms journal for swarm observability. No-op unless AGENTHOP_MSGLOG is set; never throws.
-    writeMsgLog(home, { ts: Date.now(), from, to: self.id, via, direction: "in", size: Buffer.byteLength(text), text });
+    // Metadata-only comms journal for swarm observability. Gated so Buffer.byteLength + the call are skipped
+    // entirely when AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
+    if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from, to: self.id, via, direction: "in", size: Buffer.byteLength(text), text });
     dbg(`inbound via=${via} from=${from} own=${ownCodexThread} stable=${self.stableId} daemon=${codexDaemon?.activeThread()} -> codexThread=${codexThread}`);
     void pushToHost(label, text, { codexThread }).then((ok) => {
       dbg(`pushToHost ok=${ok}`);
@@ -196,9 +197,11 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     async send(to, text) {
       const peer = resolve(to);
       if ("error" in peer) return { ok: false, error: peer.error };
-      // Log an "out" entry only on confirmed delivery. No-op unless AGENTHOP_MSGLOG is set; never throws.
-      const logOut = (via: "local" | "relay"): void =>
-        void writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via, direction: "out", size: Buffer.byteLength(text), text });
+      // Log an "out" entry only on confirmed delivery. Gated so Buffer.byteLength + the call are skipped when
+      // AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
+      const logOut = (via: "local" | "relay"): void => {
+        if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via, direction: "out", size: Buffer.byteLength(text), text });
+      };
       if (peer.via === "local") { const ok = local.send(peer.id, text); if (ok) logOut("local"); return { ok, label: labelFor(peer.id) }; }
       if (relay && peer.pub) { const ok = await relay.send(peer.pub, text); if (ok) logOut("relay"); return { ok, label: labelFor(peer.id) }; }
       return { ok: false, error: "That peer is on another machine but no team relay is configured here (set AGENTHOP_TEAM)." };

@@ -21,7 +21,7 @@
  * State chain:
  *   RUNNING -> DRAINING -> CHECKPOINTED(sha,manifest) -> CLAIMED(owner,gen) -> ALLOCATING(attempt) ->
  *   RESUMED(successor,sha) -> RETIRED
- * Branches: DONE(sha) (task finished), EXPIRED(lastConfirmedSha) (VM died — VM-terminal, NOT task-terminal),
+ * Branches: DONE(sha) (task finished), EXPIRED (VM died — VM-terminal, NOT task-terminal; `sha` stays the canonical
  * lease-timeout reclaim of a CLAIMED/ALLOCATING record (owner gone), and allocation-result-unknown (retained).
  *
  * RPO = milestone-based: a `milestone` event updates `sha` but KEEPS state RUNNING; only the post-DRAIN
@@ -62,8 +62,9 @@ export type ControlRecord = {
   resultUnknown?: boolean;
   /** Successor launchId recorded at RESUMED. */
   successor?: string;
-  /** EXPIRED carries the last confirmed sha so a successor can still be allocated from it. */
-  lastConfirmedSha?: string;
+  /** The expected resume SHA, PINNED at claim/reclaim for THIS handoff attempt. A later checkpoint advances `sha`
+   *  but must NOT move the target a successor is being verified against (Codex). Undefined => no prior work. */
+  handoffSha?: string;
   /** Lifetime base: epoch seconds of the allocation REQUEST start (not the alloc ACK — that is already late). */
   allocStart: number;
   /** Bounded lifetime budget (s) from allocStart; provider expiry if known, else conservative. */
@@ -94,10 +95,10 @@ export type ControlEvent =
   | { type: "resumed"; successor: string; sha: string; generation: number; attempt: string }
   | { type: "retire" }
   | { type: "done"; sha: string }
-  | { type: "expire"; lastConfirmedSha?: string }
-  // A newer confirmed WORK-branch tip observed AFTER the VM already EXPIRED: update the recovery point so a
-  // successor resumes from the newest confirmed work (Codex #10 — push-ok-but-CONTROL-lost recovery). VM stays
-  // terminal; only the recovery sha advances.
+  | { type: "expire" }
+  // A newer confirmed WORK-branch tip observed AFTER the VM already EXPIRED: advance the canonical `sha` so a
+  // successor resumes from the newest confirmed work (Codex #10). VM stays terminal; the dispatcher ancestry-guards
+  // the new sha, so it only moves forward and re-expire can never regress it.
   | { type: "recover_sha"; sha: string };
 
 export type AdvanceResult = { ok: true; record: ControlRecord } | { ok: false; error: string };
@@ -164,14 +165,17 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
     case "claim":
       if (record.state !== "CHECKPOINTED" && record.state !== "EXPIRED")
         return bad(`claim only from CHECKPOINTED/EXPIRED, not ${record.state}`);
-      return ok({ state: "CLAIMED", owner: event.owner, generation: event.generation, leaseUntil: event.leaseUntil });
+      // PIN the handoff target to the canonical sha NOW, so a later checkpoint can't move what the successor is
+      // verified against (Codex). handoffSha stays undefined if there is no confirmed work yet (successor starts fresh).
+      return ok({ state: "CLAIMED", owner: event.owner, generation: event.generation, leaseUntil: event.leaseUntil, handoffSha: record.sha });
     case "reclaim": {
       // Take over a CLAIMED/ALLOCATING record whose owner's lease lapsed. RETAIN attempt/attemptCount/resultUnknown
-      // so the new owner RECONCILES the in-flight allocation instead of blind-retrying or freeing the slot.
+      // so the new owner RECONCILES the in-flight allocation instead of blind-retrying or freeing the slot. Re-pin
+      // handoffSha to the canonical sha (unchanged by reclaim).
       if (record.state !== "CLAIMED" && record.state !== "ALLOCATING")
         return bad(`reclaim only from CLAIMED/ALLOCATING, not ${record.state}`);
       if (!leaseExpired(record, nowSec)) return bad("reclaim rejected: lease still valid");
-      return ok({ state: "CLAIMED", owner: event.owner, generation: event.generation, leaseUntil: event.leaseUntil });
+      return ok({ state: "CLAIMED", owner: event.owner, generation: event.generation, leaseUntil: event.leaseUntil, handoffSha: record.handoffSha ?? record.sha });
     }
     case "allocating":
       if (record.state !== "CLAIMED") return bad(`allocating only from CLAIMED, not ${record.state}`);
@@ -197,9 +201,10 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       // Reject a stale successor's ACK: it must match the CURRENT generation AND the CURRENT attempt...
       if (event.generation !== record.generation) return bad(`resumed generation ${event.generation} != ${record.generation}`);
       if (event.attempt !== record.attempt) return bad(`resumed attempt ${event.attempt} != ${record.attempt}`);
-      // ...and it must have resumed from the EXACT checkpoint we handed off (Codex impl-review bug 3).
-      const expected = record.sha ?? record.lastConfirmedSha;
-      if (expected !== undefined && event.sha !== expected) return bad(`resumed sha ${event.sha} != expected ${expected}`);
+      // ...and it must have resumed from the sha we PINNED for this handoff attempt (handoffSha), NOT the live sha,
+      // so a late checkpoint cannot silently change this ACK's target (Codex). Undefined handoffSha = no prior work,
+      // successor starts fresh, any sha accepted.
+      if (record.handoffSha !== undefined && event.sha !== record.handoffSha) return bad(`resumed sha ${event.sha} != pinned handoff ${record.handoffSha}`);
       return ok({ state: "RESUMED", successor: event.successor, sha: event.sha });
     }
     case "retire":
@@ -210,11 +215,12 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
         return bad(`done only from RUNNING/DRAINING/CHECKPOINTED, not ${record.state}`);
       return ok({ state: "DONE", sha: event.sha });
     case "expire":
-      // Any non-frozen state can expire (box died). Preserve the last confirmed sha for successor allocation.
-      return ok({ state: "EXPIRED", lastConfirmedSha: event.lastConfirmedSha ?? record.sha });
+      // Any non-frozen state can expire (box died). `sha` is already the last confirmed checkpoint — leave it as the
+      // single canonical recovery anchor (re-expire therefore cannot regress it).
+      return ok({ state: "EXPIRED" });
     case "recover_sha":
       if (record.state !== "EXPIRED") return bad(`recover_sha only in EXPIRED, not ${record.state}`);
-      return ok({ lastConfirmedSha: event.sha });
+      return ok({ sha: event.sha }); // dispatcher ancestry-guards, so this only advances
   }
 }
 

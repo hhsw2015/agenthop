@@ -88,11 +88,41 @@ describe("illegal transitions rejected", () => {
   });
 });
 
-describe("expire branch: VM-terminal, task recoverable", () => {
-  test("expire preserves last confirmed sha and still needs recovery", () => {
+describe("handoff target pinning", () => {
+  test("claim pins handoffSha to the canonical sha; resumed verifies against the pin, not a later sha", () => {
+    const claimed = run(rec(), [
+      [{ type: "drain" }, T0 + 1],
+      [{ type: "checkpoint", sha: "fin0" }, T0 + 2],
+      [{ type: "claim", owner: "d", generation: 1, leaseUntil: T0 + 300 }, T0 + 3],
+    ]);
+    expect(claimed.handoffSha).toBe("fin0");
+    const allocating = run(claimed, [[{ type: "allocating", attempt: "a" }, T0 + 4]]);
+    expect(advance(allocating, { type: "resumed", successor: "x", sha: "OTHER", generation: 1, attempt: "a" }, T0 + 5).ok).toBe(false);
+    expect(advance(allocating, { type: "resumed", successor: "x", sha: "fin0", generation: 1, attempt: "a" }, T0 + 5).ok).toBe(true);
+  });
+});
+
+describe("expire branch: VM-terminal, task recoverable; sha is the single canonical anchor", () => {
+  test("expire keeps the canonical sha and still needs recovery", () => {
     const r = run(rec(), [[{ type: "milestone", sha: "saved7" }, T0 + 60]]);
     const e = advance(r, { type: "expire" }, T0 + 1800);
-    expect(e.ok && e.record.state === "EXPIRED" && e.record.lastConfirmedSha === "saved7" && needsRecovery(e.record)).toBe(true);
+    expect(e.ok && e.record.state === "EXPIRED" && e.record.sha === "saved7" && needsRecovery(e.record)).toBe(true);
+  });
+
+  test("recovery invariant: expire(A) -> recover_sha(B) -> claim -> expire keeps B, never regresses to A (Codex)", () => {
+    const r = run(rec(), [
+      [{ type: "milestone", sha: "A" }, T0 + 10],
+      [{ type: "expire" }, T0 + 20],
+      [{ type: "recover_sha", sha: "B" }, T0 + 30],
+      [{ type: "claim", owner: "d", generation: 1, leaseUntil: T0 + 330 }, T0 + 40],
+      [{ type: "expire" }, T0 + 50], // re-expire from CLAIMED
+    ]);
+    expect(r.state).toBe("EXPIRED");
+    expect(r.sha).toBe("B"); // NOT regressed to A
+  });
+
+  test("recover_sha only advances in EXPIRED; rejected elsewhere", () => {
+    expect(advance(rec({ sha: "A" }), { type: "recover_sha", sha: "B" }, T0).ok).toBe(false); // RUNNING
   });
 });
 
@@ -153,10 +183,10 @@ describe("crash timelines", () => {
     expect(advance(claimed, { type: "reclaim", owner: "disp2", generation: 2, leaseUntil: T0 + 600 }, T0 + 100).ok).toBe(false);
   });
 
-  test("DRAINING that never checkpoints then EXPIREs is recovered from lastConfirmedSha", () => {
+  test("DRAINING that never checkpoints then EXPIREs is recovered from the canonical sha", () => {
     const draining = run(rec(), [[{ type: "milestone", sha: "m9" }, T0 + 50], [{ type: "drain" }, T0 + 3000]]);
     const e = advance(draining, { type: "expire" }, T0 + 3480);
-    expect(e.ok && e.record.state === "EXPIRED" && e.record.lastConfirmedSha === "m9").toBe(true);
+    expect(e.ok && e.record.state === "EXPIRED" && e.record.sha === "m9").toBe(true);
   });
 
   test("attempt cap bounds re-allocation: give_up after MAX", () => {

@@ -57,19 +57,19 @@ describe("advance mapping", () => {
   });
 });
 
-describe("EXPIRED recovery (#10): a late confirmed tip updates the recovery sha without un-expiring", () => {
-  test("recover_sha advances lastConfirmedSha, stays EXPIRED", () => {
-    const expired = rec({ state: "EXPIRED", sha: "s1", lastConfirmedSha: "s1" });
+describe("EXPIRED recovery (#10): a late confirmed tip advances the canonical sha without un-expiring", () => {
+  test("recover_sha advances sha, stays EXPIRED", () => {
+    const expired = rec({ state: "EXPIRED", sha: "s1" });
     const out = tipToEvent(expired, tip({ sha: "s2", manifest: man({ kind: "milestone" }) }));
     expect(out.kind).toBe("advance");
     if (out.kind === "advance") {
       expect(out.event.type).toBe("recover_sha");
       const res = advance(expired, out.event, T0 + 1);
-      expect(res.ok && res.record.state === "EXPIRED" && res.record.lastConfirmedSha === "s2").toBe(true);
+      expect(res.ok && res.record.state === "EXPIRED" && res.record.sha === "s2").toBe(true);
     }
   });
   test("a non-descendant late tip is still rejected even in EXPIRED", () => {
-    const expired = rec({ state: "EXPIRED", sha: "s1", lastConfirmedSha: "s1" });
+    const expired = rec({ state: "EXPIRED", sha: "s1" });
     expect(tipToEvent(expired, tip({ sha: "evil", isDescendantOfAccepted: false })).kind).toBe("skip");
   });
 });
