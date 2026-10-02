@@ -175,14 +175,25 @@ echo "== verify first confirmed publish on $BRANCH (up to 60s) =="
 # timeout via a portable watchdog (no dependency on timeout/gtimeout): run it in the background, hard-kill after `secs`,
 # return its stdout. Per-query budget = min(remaining, 25s) and the loop re-checks the absolute deadline AFTER each
 # query, so the whole gate stays within ~60s even across retries and an overrun can never be accepted late.
-qrun() {  # qrun <secs> <cmd...> : stdout of <cmd>, hard-killed after <secs>
+TO_BIN=""; for c in timeout gtimeout; do command -v "$c" >/dev/null 2>&1 && { TO_BIN="$c"; break; }; done
+qrun() {  # qrun <secs> <cmd...> : stdout of <cmd>, bounded to <secs>
   local secs=$1; shift
-  local out rc=0; out=$(mktemp)
-  "$@" >"$out" 2>/dev/null & local p=$!
-  ( sleep "$secs"; kill -TERM "$p" 2>/dev/null; sleep 1; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
-  wait "$p" 2>/dev/null || rc=$?
-  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
-  cat "$out"; rm -f "$out"
+  # Prefer the OS timeout tool: a single-owner supervisor that signals AND reaps its own child correctly.
+  if [ -n "$TO_BIN" ]; then local rct=0; "$TO_BIN" "$secs" "$@" 2>/dev/null || rct=$?; return "$rct"; fi
+  # Fallback (Codex P1 fix): the PARENT is the SOLE signaller and reaps p ITSELF, so p is never signalled after being
+  # reaped — a recycled PID can't be hit (the previous detached watchdog held a bare PID and could TERM an unrelated
+  # process after p was reaped). A completion sentinel avoids waiting on a zombie. An orphaned git self-terminates via
+  # ssh ConnectTimeout, so a missed child kill is a brief leak, never a wrong-process signal.
+  local out done rc=0 w=0; out=$(mktemp); done="$out.done"
+  { "$@" >"$out" 2>/dev/null; : > "$done"; } & local p=$!
+  while [ ! -e "$done" ] && [ "$w" -lt "$secs" ]; do sleep 1; w=$((w + 1)); done
+  if [ ! -e "$done" ]; then
+    kill -TERM "$p" 2>/dev/null                                   # p not yet waited -> running/zombie, PID reserved: safe
+    local g=0; while [ ! -e "$done" ] && [ "$g" -lt 2 ]; do sleep 1; g=$((g + 1)); done
+    [ -e "$done" ] || kill -KILL "$p" 2>/dev/null
+  fi
+  wait "$p" 2>/dev/null || rc=$?                                  # only now is p reaped / its PID freed
+  cat "$out"; rm -f "$out" "$done"
   return "$rc"
 }
 CONFIRMED=""; QDEADLINE=$(( $(date +%s) + 60 ))
