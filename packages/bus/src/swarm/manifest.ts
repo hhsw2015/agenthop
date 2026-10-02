@@ -27,8 +27,10 @@ export type Manifest = {
   goal?: string;
   /** What remains to do — the resume instruction for a successor. */
   next?: string;
-  /** Epoch seconds the box wrote it (box clock; informational only — never used for deadlines/ordering). */
-  createdAt: number;
+  /** Epoch seconds the box wrote it (box clock; informational only). OPTIONAL and normally OMITTED: a changing
+   *  timestamp every publish would make the committed tree differ each round and defeat the "skip if unchanged"
+   *  idempotency (Codex). The dispatcher uses the git commit's own time if it needs one. */
+  createdAt?: number;
 };
 
 /** Whole-manifest serialized size cap. A manifest is a short summary, not a payload; reject anything larger at
@@ -46,7 +48,7 @@ export function encodeManifest(m: Manifest): string {
     kind: m.kind,
     ...(m.goal !== undefined ? { goal: m.goal } : {}),
     ...(m.next !== undefined ? { next: m.next } : {}),
-    createdAt: m.createdAt,
+    ...(m.createdAt !== undefined ? { createdAt: m.createdAt } : {}),
   };
   return JSON.stringify(ordered);
 }
@@ -62,7 +64,7 @@ function validate(o: Record<string, unknown>, serializedLen: number): ManifestCh
   if (typeof o.kind !== "string" || !KINDS.has(o.kind)) return { ok: false, reason: "kind" };
   if (o.goal !== undefined && typeof o.goal !== "string") return { ok: false, reason: "goal" };
   if (o.next !== undefined && typeof o.next !== "string") return { ok: false, reason: "next" };
-  if (typeof o.createdAt !== "number" || !Number.isFinite(o.createdAt)) return { ok: false, reason: "createdAt" };
+  if (o.createdAt !== undefined && (typeof o.createdAt !== "number" || !Number.isFinite(o.createdAt))) return { ok: false, reason: "createdAt" };
   return { ok: true };
 }
 
@@ -86,7 +88,7 @@ export function parseManifest(text: string): Manifest | null {
     kind: o.kind as ManifestKind,
     goal: o.goal as string | undefined,
     next: o.next as string | undefined,
-    createdAt: o.createdAt as number,
+    createdAt: o.createdAt as number | undefined,
   };
 }
 

@@ -1,23 +1,22 @@
 #!/usr/bin/env node
-// Box-side swarm supervisor. Runs on a Railway box as a SEPARATE, long-lived process (launched via setsid in its
-// OWN session, NOT inside the worker's tmux) so it survives + can scrub the worker's session without killing
-// itself. It owns the deadline and the checkpoint/push/receipt pipeline; the worker (Claude TUI) only REQUESTS a
-// milestone and supplies a semantic manifest. Self-contained: Node stdlib only (the box has node, nothing else is
-// guaranteed). See docs/swarm/phase2-design-review*.md + plan v3 for why each piece exists.
+// Box-side swarm supervisor (git-channel pivot). Runs on a Railway box as a SEPARATE, long-lived process (launched
+// via setsid in its OWN session, NOT inside the worker's tmux) so it survives + can scrub the worker's session.
+// It is the SINGLE PUBLISHER of the box's WORK branch: it stages an explicit artifact allowlist into a PRIVATE
+// git index (never the worker's index/HEAD), commits via plumbing onto a fixed parent, and does a non-force push
+// (so the remote only ever fast-forwards). The git branch IS the durable/ordered/idempotent channel — no receipts,
+// no seq, no request journal. A small manifest.json committed WITH the artifacts carries the semantic summary.
+// The DISPATCHER (trusted off-box clock) is the authority on the hard deadline; this box timer is best-effort.
+// See docs/swarm/phase2-design-review*.md + plan v3.
 //
-// Config (all via env, injected by swarm-launch.sh):
+// Config (env, injected by swarm-launch.sh):
 //   SWARM_LAUNCH_ID, SWARM_GENERATION, SWARM_BUDGET_SEC (remaining at injection), SWARM_DEADLINE_WALL (abs epoch s,
-//   this incarnation), SWARM_WORK_DIR (git clone), SWARM_BRANCH, SWARM_TMUX_SESSION (worker session, default
-//   "swarm"), SWARM_RUNTIME_DIR (private 0700 dir for req/ack + askpass; MUST be outside SWARM_WORK_DIR),
-//   SWARM_ALLOWLIST (newline/comma list of paths to stage; default "."), SWARM_SCRUB (path to swarm-scrub.sh),
-//   GIT_ASKPASS (already exported for git auth; token never on argv).
-//
-// Timing: conservative min of a MONOTONIC source (process.hrtime, immune to wall steps; stalls on suspend) and the
-// WALL deadline (advances across suspend). Whichever says less time remains wins. Mirrors + is unit-tested by
-// packages/bus/src/swarm/supervisor-logic.ts (conservativeRemainingSec). UNDER-counting here loses the box, so we
-// bias early.
+//   this incarnation), SWARM_WORK_DIR (a clone of the WORK repo; remote=origin, branch=SWARM_BRANCH),
+//   SWARM_BRANCH (e.g. swarm/<lid>-g<gen>), SWARM_ALLOWLIST (REQUIRED, newline/comma paths to publish — NOT "."),
+//   SWARM_RUNTIME_DIR (private 0700 dir OUTSIDE the work tree: private index, req/ack, askpass),
+//   SWARM_TMUX_SESSION (worker session, default "swarm"), SWARM_SCRUB (path to swarm-scrub.sh),
+//   GIT_ASKPASS (already exported; token never on argv), SWARM_GOAL (optional task description for the manifest).
 
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import path from "node:path";
 
@@ -28,62 +27,118 @@ const BUDGET_SEC = Number(must("SWARM_BUDGET_SEC"));
 const DEADLINE_WALL = Number(must("SWARM_DEADLINE_WALL"));
 const WORK_DIR = must("SWARM_WORK_DIR");
 const BRANCH = must("SWARM_BRANCH");
-const TMUX_SESSION = env.SWARM_TMUX_SESSION || "swarm";
 const RUNTIME_DIR = must("SWARM_RUNTIME_DIR");
+const TMUX_SESSION = env.SWARM_TMUX_SESSION || "swarm";
 const SCRUB = env.SWARM_SCRUB || "";
-const ALLOWLIST = (env.SWARM_ALLOWLIST || ".").split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
-const THRESHOLDS = [300, 120]; // T-5, T-2 (seconds before deadline) — matches control.ts CHECKPOINT_THRESHOLDS_SEC
+const GOAL = env.SWARM_GOAL || "";
+// Allowlist is REQUIRED and must not be "." (Codex P1-3: "." / a shared index publishes logs/creds). Each entry is
+// a pathspec relative to the work tree; the private index means only these (plus the manifest) are ever committed.
+const ALLOWLIST = (must("SWARM_ALLOWLIST")).split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+
+const THRESHOLDS = [300, 120]; // T-5, T-2 (matches control.ts CHECKPOINT_THRESHOLDS_SEC)
 const POLL_MS = 5000;
+const GIT_TIMEOUT_MS = 25_000; // bound every git call so one hung push can't eat the lifetime (Codex P1-2)
+const PRIVATE_INDEX = path.join(RUNTIME_DIR, "index"); // GIT_INDEX_FILE — isolates staging from the worker's index
+const MANIFEST_REL = ".swarm/manifest.json"; // committed WITH the artifacts; read by the dispatcher from the pinned sha
+const REQ_FILE = path.join(RUNTIME_DIR, "checkpoint.req"); // worker writes {requestId, kind:"milestone"|"final", goal?, next?}
+const ACK_FILE = path.join(RUNTIME_DIR, "checkpoint.ack"); // supervisor writes {requestId, status, sha?, error?}
 
-const REQ_FILE = path.join(RUNTIME_DIR, "milestone.req"); // worker writes {requestId, manifest}
-const ACK_FILE = path.join(RUNTIME_DIR, "milestone.ack"); // supervisor writes {requestId, status, sha, error}
-const SEQ_FILE = path.join(RUNTIME_DIR, "seq"); // persisted monotonic checkpoint counter (survives a supervisor restart)
-const RECEIPT_DIR_REL = ".swarm/receipts"; // inside the work repo, pushed with the checkpoint
-
-/** Monotonic, restart-safe checkpoint sequence. Persisted so a restarted supervisor never reuses/rewrites a seq —
- *  CONTROL only advances on seq > lastSeq, so a replayed receipt can't roll a confirmed sha back. */
-function nextSeq() {
-  let cur = 0;
-  try {
-    cur = parseInt(readFileSync(SEQ_FILE, "utf8").trim(), 10) || 0;
-  } catch {
-    cur = 0;
-  }
-  const next = cur + 1;
-  atomicWrite(SEQ_FILE, String(next));
-  return next;
-}
+// manifest.ts schema mirror (box has no bus import). Keep in sync with packages/bus/src/swarm/manifest.ts.
+const MAX_MANIFEST_BYTES = 16 * 1024;
 
 function must(k) {
   const v = env[k];
-  if (!v) {
-    console.error(`swarm-supervisor: missing required env ${k}`);
-    process.exit(2);
-  }
+  if (!v) { console.error(`swarm-supervisor: missing required env ${k}`); process.exit(2); }
   return v;
 }
-function log(msg) {
-  console.error(`[sup ${LID} gen${GEN}] ${msg}`);
-}
-function git(args, opts = {}) {
-  return spawnSync("git", args, { cwd: WORK_DIR, encoding: "utf8", ...opts });
-}
-function nowWallSec() {
-  return Math.floor(Date.now() / 1000);
+function log(m) { console.error(`[sup ${LID} g${GEN}] ${m}`); }
+function nowWallSec() { return Math.floor(Date.now() / 1000); }
+function atomicWrite(file, data, mode = 0o600) {
+  const tmp = `${file}.tmp.${process.pid}`;
+  writeFileSync(tmp, data, { mode });
+  renameSync(tmp, file);
 }
 
-// --- conservative deadline (see supervisor-logic.ts / its test) ---
+// --- conservative deadline: min(monotonic-remaining, wall-remaining). Mirrors supervisor-logic.ts (unit-tested).
+// Best-effort only: the dispatcher's trusted clock is the hard authority. monoStart resets on a supervisor restart,
+// but DEADLINE_WALL is incarnation-bound and persisted by the launcher, so it still caps a restart. The combined
+// suspend+wall-rollback case is covered by the dispatcher, not here (documented limit).
 const monoStart = process.hrtime.bigint();
-function monotonicElapsedSec() {
-  return Number(process.hrtime.bigint() - monoStart) / 1e9;
-}
 function remainingSec() {
-  const byMonotonic = BUDGET_SEC - monotonicElapsedSec();
+  const byMono = BUDGET_SEC - Number(process.hrtime.bigint() - monoStart) / 1e9;
   const byWall = DEADLINE_WALL - nowWallSec();
-  return Math.min(byMonotonic, byWall);
+  return Math.min(byMono, byWall);
 }
 
-// --- serial checkpoint writer (one in-flight at a time; milestone + thresholds share it) ---
+// --- async, bounded git (so the setInterval deadline tick keeps firing during IO) ---
+function git(args, { timeoutMs = GIT_TIMEOUT_MS, indexFile } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn("git", args, {
+      cwd: WORK_DIR,
+      env: indexFile ? { ...env, GIT_INDEX_FILE: indexFile } : env,
+    });
+    let stdout = "", stderr = "", done = false;
+    const finish = (code) => { if (!done) { done = true; resolve({ code, stdout, stderr }); } };
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} finish(-1); }, timeoutMs);
+    timer.unref?.();
+    child.stdout?.on("data", (d) => { stdout += d; });
+    child.stderr?.on("data", (d) => { stderr += d; });
+    child.on("error", () => finish(-1));
+    child.on("close", (code) => { clearTimeout(timer); finish(code ?? -1); });
+  });
+}
+
+// --- the publish pipeline: stage allowlist+manifest into the PRIVATE index -> write-tree -> (skip if unchanged) ->
+// commit-tree onto the current branch tip -> update local ref -> non-force push. Returns { ok, sha }.
+function buildManifest(kind, goal, next) {
+  // NO createdAt: a changing timestamp each publish would defeat the "skip if unchanged" idempotency (Codex).
+  const m = { schemaVersion: 1, launchId: LID, generation: GEN, kind, ...(goal ? { goal } : {}), ...(next ? { next } : {}) };
+  const s = JSON.stringify(m);
+  if (s.length > MAX_MANIFEST_BYTES) {
+    // Producer enforces the SAME bound the dispatcher's parseManifest uses (Codex #13) — drop next/goal to fit.
+    return JSON.stringify({ schemaVersion: 1, launchId: LID, generation: GEN, kind });
+  }
+  return s;
+}
+
+async function publish(kind, { goal, next } = {}) {
+  // 1. write the manifest into the work tree at a fixed, supervisor-owned path (NOT something the worker writes).
+  const manifestAbs = path.join(WORK_DIR, MANIFEST_REL);
+  mkdirSync(path.dirname(manifestAbs), { recursive: true });
+  atomicWrite(manifestAbs, buildManifest(kind, goal || GOAL, next), 0o644);
+
+  // 2. stage ONLY the allowlist + the manifest into the PRIVATE index (never the worker's index). Seed the private
+  //    index from the branch tip so unlisted tracked files are preserved but worker-staged junk is not inherited.
+  const parent = (await git(["rev-parse", "-q", "--verify", BRANCH])).stdout.trim();
+  if (parent) await git(["read-tree", parent], { indexFile: PRIVATE_INDEX });
+  const add = await git(["add", "--", MANIFEST_REL, ...ALLOWLIST], { indexFile: PRIVATE_INDEX });
+  if (add.code !== 0) return { ok: false, error: `git add: ${add.stderr.trim()}` };
+
+  // 3. write-tree; skip the commit entirely if the tree is unchanged (idempotent latest-snapshot, no churn).
+  const wt = await git(["write-tree"], { indexFile: PRIVATE_INDEX });
+  if (wt.code !== 0) return { ok: false, error: `write-tree: ${wt.stderr.trim()}` };
+  const tree = wt.stdout.trim();
+  if (parent) {
+    const parentTree = (await git(["rev-parse", `${parent}^{tree}`])).stdout.trim();
+    if (parentTree === tree) return { ok: true, sha: parent, unchanged: true };
+  }
+
+  // 4. commit-tree onto the fixed parent (no HEAD/worktree mutation), update the local branch ref, non-force push.
+  const ct = await git(["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", `swarm ${kind} g${GEN}`]);
+  if (ct.code !== 0) return { ok: false, error: `commit-tree: ${ct.stderr.trim()}` };
+  const sha = ct.stdout.trim();
+  const upd = await git(["update-ref", `refs/heads/${BRANCH}`, sha, ...(parent ? [parent] : [])]);
+  if (upd.code !== 0) return { ok: false, error: `update-ref: ${upd.stderr.trim()}` };
+  const push = await git(["push", "origin", `refs/heads/${BRANCH}:refs/heads/${BRANCH}`]); // non-force: remote only fast-forwards
+  if (push.code !== 0) {
+    // Do NOT force/rebase. Leave the local ref; a later tick retries. On an ambiguous failure the dispatcher
+    // reconciles from whatever the remote ref actually is (Codex: read the ref, don't assume not-pushed).
+    return { ok: false, error: `push: ${push.stderr.trim()}`, sha };
+  }
+  return { ok: true, sha };
+}
+
+// --- serial checkpoint writer (one publish in flight; milestone/rescue/final never overlap) ---
 let chain = Promise.resolve();
 function runExclusive(fn) {
   const next = chain.then(fn, fn);
@@ -91,119 +146,45 @@ function runExclusive(fn) {
   return next;
 }
 
-/**
- * The checkpoint pipeline: stage the allowlist, commit IF there is something to commit, push the branch (separately
- * from commit — a clean tree with an unpushed commit must still push), then publish a receipt commit that records
- * the confirmed work sha, and push that. Returns { ok, sha } where sha is the confirmed WORK commit.
- * NOTE: `git add -A` is deliberately avoided (Codex P2-4: it would ingest creds/logs) — stage only the allowlist.
- */
-function doCheckpoint(kind, requestId, manifest) {
-  // 1. stage only the allowlisted paths
-  const add = git(["add", "--", ...ALLOWLIST]);
-  if (add.status !== 0) return { ok: false, error: `git add: ${add.stderr?.trim()}` };
-
-  // 2. commit only if staged changes exist (don't let an empty commit fail the pipeline)
-  const staged = git(["diff", "--cached", "--quiet"]);
-  if (staged.status === 1) {
-    const c = git(["commit", "-q", "-m", `swarm: ${kind} ${requestId}`]);
-    if (c.status !== 0) return { ok: false, error: `git commit: ${c.stderr?.trim()}` };
-  } else if (staged.status !== 0) {
-    return { ok: false, error: `git diff --cached: ${staged.stderr?.trim()}` };
-  }
-
-  // 3. push the branch regardless (covers clean-tree-but-unpushed-commit). Commit and push are judged separately.
-  const push1 = git(["push", "origin", `HEAD:${BRANCH}`]);
-  if (push1.status !== 0) return { ok: false, error: `git push work: ${push1.stderr?.trim()}` };
-
-  // 4. confirmed work sha
-  const rev = git(["rev-parse", "HEAD"]);
-  if (rev.status !== 0) return { ok: false, error: `git rev-parse: ${rev.stderr?.trim()}` };
-  const sha = rev.stdout.trim();
-
-  // 5. publish an immutable receipt pointing at the confirmed sha, then push it. The dispatcher scans receipts and
-  //    CAS-advances CONTROL — the box never holds a CONTROL-write token. Shape must match receipt.ts.
-  const receipt = {
-    launchId: LID,
-    generation: GEN,
-    requestId,
-    seq: nextSeq(),
-    kind,
-    sha,
-    ...(manifest ? { manifest } : {}),
-    createdAt: nowWallSec(),
-  };
-  const relPath = path.join(RECEIPT_DIR_REL, `${GEN}-${requestId}.json`);
-  const absPath = path.join(WORK_DIR, relPath);
-  mkdirSync(path.dirname(absPath), { recursive: true });
-  atomicWrite(absPath, JSON.stringify(receipt));
-  const addR = git(["add", "--", relPath]);
-  if (addR.status !== 0) return { ok: false, error: `git add receipt: ${addR.stderr?.trim()}` };
-  const cR = git(["commit", "-q", "-m", `swarm: receipt ${GEN}-${requestId}`]);
-  if (cR.status !== 0) return { ok: false, error: `git commit receipt: ${cR.stderr?.trim()}` };
-  const push2 = git(["push", "origin", `HEAD:${BRANCH}`]);
-  if (push2.status !== 0) return { ok: false, error: `git push receipt: ${push2.stderr?.trim()}` };
-
-  return { ok: true, sha };
-}
-
-function atomicWrite(file, data) {
-  const tmp = `${file}.tmp.${process.pid}`;
-  writeFileSync(tmp, data, { mode: 0o600 });
-  renameSync(tmp, file);
-}
-
 function pokeWorker(minsLeft) {
-  // Advisory only — tmux send-keys is NOT a reliable RPC (Codex P1-1). The supervisor's OWN safety checkpoint below
-  // is what guarantees the save; this just gives the worker a chance to produce a semantic final summary.
-  const line = `[[swarm:checkpoint]] ${minsLeft}min left — checkpoint now; reply NEED HANDOFF if not done`;
-  spawnSync("tmux", ["send-keys", "-t", TMUX_SESSION, line, "Enter"], { encoding: "utf8" });
+  // Advisory only (tmux send-keys is not a reliable RPC). The supervisor's own rescue publish below is the guarantee.
+  spawn("tmux", ["send-keys", "-t", TMUX_SESSION,
+    `[[swarm:checkpoint]] ${minsLeft}min left — drain+checkpoint now; reply NEED HANDOFF if not done`, "Enter"]);
 }
+function writeAck(obj) { atomicWrite(ACK_FILE, JSON.stringify(obj)); }
 
-// --- worker-driven milestone requests (snapshot-freeze handshake via req/ack files) ---
+// --- worker-driven checkpoint requests (cooperative freeze: worker quiesces writes BEFORE writing REQ_FILE, resumes
+// only after a terminal ack). kind "milestone" stays mid-task; kind "final" is the drained, frozen handoff point. ---
 let lastReq = "";
-function checkMilestoneRequest() {
+function checkRequest() {
   if (!existsSync(REQ_FILE)) return;
   let req;
-  try {
-    req = JSON.parse(readFileSync(REQ_FILE, "utf8"));
-  } catch {
-    return; // partial write mid temp+rename; try next tick
-  }
+  try { req = JSON.parse(readFileSync(REQ_FILE, "utf8")); } catch { return; }
   if (!req || typeof req.requestId !== "string" || req.requestId === lastReq) return;
-  lastReq = req.requestId;
+  const kind = req.kind === "final" ? "final" : "milestone";
   const requestId = req.requestId;
-  const manifest = typeof req.manifest === "string" ? req.manifest : undefined;
-  // The worker, before writing REQ_FILE, is expected to have quiesced its writes (snapshot-freeze). We ack
-  // "capturing" immediately, run the checkpoint, then ack the confirmed sha so the worker may resume writing.
-  writeAck({ requestId, status: "capturing" });
-  runExclusive(() => {
-    const r = doCheckpoint("milestone", requestId, manifest);
-    writeAck(r.ok ? { requestId, status: "confirmed", sha: r.sha } : { requestId, status: "error", error: r.error });
-    log(r.ok ? `milestone ${requestId} confirmed ${r.sha}` : `milestone ${requestId} FAILED: ${r.error}`);
+  writeAck({ requestId, status: "capturing" }); // "received", not "frozen-proven" — freeze is the worker's contract
+  runExclusive(async () => {
+    const r = await publish(kind, { goal: req.goal, next: req.next });
+    if (r.ok) { lastReq = requestId; writeAck({ requestId, status: "confirmed", sha: r.sha }); log(`${kind} ${requestId} -> ${r.sha}${r.unchanged ? " (unchanged)" : ""}`); }
+    else writeAck({ requestId, status: "error", error: r.error }); // leave lastReq unset so the worker may retry the same id
   });
 }
-function writeAck(obj) {
-  atomicWrite(ACK_FILE, JSON.stringify(obj));
-}
 
-// --- near-death safety checkpoints (worker-INDEPENDENT) + scrub ---
+// --- near-death safety (worker-INDEPENDENT) + scrub ---
 const fired = new Set();
-let scrubbed = false;
+let ending = false;
 
 function tick() {
   const rem = remainingSec();
 
-  if (rem <= 0 && !scrubbed) {
-    scrubbed = true;
-    runExclusive(() => {
-      // Last-chance independent save of whatever is on disk, then scrub (from outside the worker tmux).
-      const r = doCheckpoint("final", `deadline-${Date.now()}`, "near-death safety push");
-      log(r.ok ? `final safety checkpoint ${r.sha}` : `final safety checkpoint FAILED: ${r.error}`);
-      if (SCRUB) {
-        log("running scrub");
-        spawnSync("bash", [SCRUB], { encoding: "utf8", env });
-      }
-      process.exit(0);
+  if (rem <= 0 && !ending) {
+    ending = true;
+    runExclusive(async () => {
+      const r = await publish("rescue", { next: "deadline reached; box expiring" }); // best-effort, NOT a clean final
+      log(r.ok ? `deadline rescue -> ${r.sha}` : `deadline rescue FAILED: ${r.error}`);
+      if (SCRUB) { log("scrub"); spawn("bash", [SCRUB], { env, stdio: "ignore" }).unref?.(); }
+      setTimeout(() => process.exit(0), 2000);
     });
     return;
   }
@@ -211,23 +192,22 @@ function tick() {
   for (const t of THRESHOLDS.filter((t) => rem <= t && !fired.has(t)).sort((a, b) => a - b)) {
     fired.add(t);
     const mins = Math.max(1, Math.round(t / 60));
-    log(`threshold T-${mins}m crossed (rem=${Math.round(rem)}s): poke worker + independent safety checkpoint`);
+    log(`T-${mins}m (rem=${Math.round(rem)}s): poke + rescue publish`);
     pokeWorker(mins);
-    runExclusive(() => {
-      const r = doCheckpoint("final", `safety-${t}`, `T-${mins}m safety push`);
-      log(r.ok ? `safety checkpoint ${r.sha}` : `safety checkpoint FAILED: ${r.error}`);
+    runExclusive(async () => {
+      const r = await publish("rescue", { next: `T-${mins}m safety snapshot` });
+      log(r.ok ? `rescue -> ${r.sha}` : `rescue FAILED: ${r.error}`);
     });
   }
 
-  checkMilestoneRequest();
+  checkRequest();
 }
 
 function main() {
   mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
-  log(`up: budget=${BUDGET_SEC}s deadlineWall=${DEADLINE_WALL} branch=${BRANCH} work=${WORK_DIR}`);
+  log(`up: budget=${BUDGET_SEC}s deadlineWall=${DEADLINE_WALL} branch=${BRANCH} allowlist=[${ALLOWLIST.join(",")}]`);
   tick();
-  // Do NOT unref: this interval is the only thing keeping the supervisor alive; unref'd, an idle start exits
-  // immediately (Codex impl-review bug 1).
+  // NOT unref'd: this interval keeps the supervisor alive (Codex P1-1). git is async so the tick still fires during IO.
   setInterval(tick, POLL_MS);
 }
 

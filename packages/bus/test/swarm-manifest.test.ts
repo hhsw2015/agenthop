@@ -36,6 +36,17 @@ describe("producer/parser agree on the size bound (Codex #13)", () => {
   });
 });
 
+describe("createdAt is optional (omitted for idempotency)", () => {
+  test("a manifest without createdAt round-trips and is byte-stable across rebuilds", () => {
+    const m = man({ goal: "g", next: "n" });
+    delete (m as { createdAt?: number }).createdAt;
+    const once = encodeManifest(m);
+    expect(parseManifest(once)).toEqual(m);
+    expect(once).toBe(encodeManifest({ ...m })); // same inputs -> identical bytes -> no redundant commit
+    expect(once.includes("createdAt")).toBe(false);
+  });
+});
+
 describe("kind distinguishes final from best-effort rescue", () => {
   test("all three kinds round-trip", () => {
     for (const kind of ["milestone", "final", "rescue"] as const) {
