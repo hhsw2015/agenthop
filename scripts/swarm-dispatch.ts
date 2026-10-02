@@ -129,16 +129,35 @@ function notifyUser(msg: string): void {
 
 function scratchPath(launchId: string): string { return path.join(HOME, ".agenthop", "swarm", "scratch", launchId); }
 
-// --- handoff-action IO. Phase-1c: observe/clock/record are LIVE; the allocate/resume/scrub box-side wiring (a fresh
-// box that RESUMES from handoffSha via swarm-task --resume) lands in Phase 2, so these are honest stubs for now and are
-// gated OFF by default (EXEC_ENABLED). ---
-async function allocateSuccessor(_pred: ControlRecord): Promise<string | null> {
-  log("allocateSuccessor: box-resume wiring is Phase 2 (swarm-task --resume); not allocating a successor yet");
-  return null;
+// --- handoff-action IO (Phase 2). observe/clock/record are LIVE; allocate/resume spawn the box-side scripts and are
+// gated behind SWARM_EXEC (default off). Live-validated only in the gated run. ---
+function runScript(file: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn("bash", [file, ...args], { env: process.env });
+    let stdout = "", stderr = "", done = false;
+    const finish = (code: number) => { if (!done) { done = true; resolve({ code, stdout, stderr }); } };
+    child.stdout?.on("data", (d) => { stdout += d; });
+    child.stderr?.on("data", (d) => { stderr += d; });
+    child.on("error", () => finish(-1));
+    child.on("close", (c) => finish(c ?? -1));
+  });
 }
-async function resumeSuccessor(_a: { successor: string; handoffSha: string; generation: number; branch: string }): Promise<boolean> {
-  log("resumeSuccessor: Phase 2 (swarm-task --resume) pending");
-  return false;
+async function allocateSuccessor(_pred: ControlRecord): Promise<string | null> {
+  // Allocate a fresh box via swarm-launch (new); parse the minted launchId from its "NEW box rw-..." decision line.
+  // NOTE: swarm-launch also warms a worker; an --allocate-only primitive (skip the worker) is a follow-up so a resume
+  // box doesn't transiently start one. Requires SWARM_TEAM so the successor joins the same team (else it is invisible).
+  if (!SWARM_TEAM) log("allocateSuccessor: SWARM_TEAM is unset — the successor would join teamless/invisible");
+  const r = await runScript(SWARM_LAUNCH, ["claude", SWARM_TEAM, "new"]);
+  const m = (r.stdout + r.stderr).match(/NEW box (rw-[0-9a-f]+)/);
+  if (r.code !== 0 || !m) { log(`allocateSuccessor: swarm-launch failed (code ${r.code})`); return null; }
+  log(`allocateSuccessor: allocated ${m[1]}`);
+  return m[1];
+}
+async function resumeSuccessor(a: { successor: string; handoffSha: string; generation: number; branch: string }): Promise<boolean> {
+  // swarm-task --resume seeds the successor branch at a resume-marker from handoffSha + starts supervisor/worker.
+  const r = await runScript(SWARM_TASK, [a.successor, "--resume", a.handoffSha, String(a.generation)]);
+  if (r.code !== 0) { log(`resumeSuccessor ${a.successor}: swarm-task --resume failed (code ${r.code}): ${(r.stderr || r.stdout).trim().slice(0, 200)}`); return false; }
+  return true;
 }
 async function scrubBox(launchId: string): Promise<void> {
   // The box self-scrubs on its own deadline (swarm-scrub, driven by the supervisor). A dispatcher-driven scrub needs

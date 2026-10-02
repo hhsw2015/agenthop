@@ -16,9 +16,21 @@ set -euo pipefail
 
 LID="${1:?usage: swarm-task.sh <launchId> [--demo | --task \"goal\"]}"
 MODE="${2:---demo}"
-GOAL="${3:-demo task}"
-# Reject an unsupported mode BEFORE any box side-effect (Codex #8: --task is deferred; don't clone/start then bail).
-[ "$MODE" = "--demo" ] || { echo "only --demo is supported here (--task/Claude worker is deferred)" >&2; exit 2; }
+# --demo: pure-bash worker (gen 0). --resume <handoffSha> <generation>: a SUCCESSOR box continuing a handed-off task
+# from the pinned handoffSha — it seeds a resume-marker branch (handoffSha's tree + a fresh milestone manifest, parent
+# handoffSha) so its publishes descend from handoffSha AND the supervisor does not freeze on a `final` tip. --task
+# (Claude worker) still deferred. Reject anything else BEFORE any box side-effect (Codex #8).
+RESUME_SHA=""; GEN=0
+case "$MODE" in
+  --demo) GOAL="${3:-demo task}" ;;
+  --resume)
+    RESUME_SHA="${3:?usage: swarm-task.sh <launchId> --resume <handoffSha> <generation>}"
+    GEN="${4:?usage: swarm-task.sh <launchId> --resume <handoffSha> <generation>}"
+    case "$RESUME_SHA" in *[!0-9a-f]*|'') echo "bad handoffSha $RESUME_SHA (expect hex)" >&2; exit 2 ;; esac
+    case "$GEN" in *[!0-9]*|'') echo "bad generation $GEN (expect int)" >&2; exit 2 ;; esac
+    GOAL="resume from ${RESUME_SHA:0:12}" ;;
+  *) echo "only --demo and --resume are supported here (--task/Claude worker is deferred)" >&2; exit 2 ;;
+esac
 # Validate the WHOLE launchId (Codex P2-4): the old glob rw-[0-9a-f]* matched "rw-" + one hex + ANY suffix, so
 # rw-a'bad / rw-a-not-hex passed and could inject into paths / git refs. Anchor the full string to rw-<hex-only>.
 [[ "$LID" =~ ^rw-[0-9a-f]+$ ]] || { echo "bad launchId $LID (expect rw-<hex>, full string)" >&2; exit 2; }
@@ -33,8 +45,7 @@ DEPLOY_KEY="${SWARM_DEPLOY_KEY:-$HOME/.agenthop/swarm/swarm-work-deploy}"
 [ -f "$DEPLOY_KEY" ] || { echo "no deploy key at $DEPLOY_KEY" >&2; exit 1; }
 BUDGET="${SWARM_BUDGET_SEC:-3480}"
 ALLOWLIST="${SWARM_ALLOWLIST:-out}"
-GEN=0
-BRANCH="swarm/$LID-g$GEN"
+BRANCH="swarm/$LID-g$GEN"   # GEN set by the mode case above (0 for --demo; the handoff generation for --resume)
 ALLOCTS="$(cat "$KEYDIR/alloc-ts")"
 case "$ALLOCTS" in *[!0-9]*|'') echo "corrupt alloc-ts for $LID" >&2; exit 1 ;; esac
 AGE=$(( $(date +%s) - ALLOCTS ))
@@ -138,6 +149,36 @@ SH
   echo setup-ok
 " 2>&1 | filt | tail -3
 
+# 2b. RESUME seed (only for --resume): create a resume-marker commit = handoffSha's TREE + a fresh milestone manifest
+#     for THIS successor, parent handoffSha; push it as the successor branch; seed the worktree (out/) from it. Then the
+#     successor's publishes DESCEND from handoffSha (ancestry proof for the dispatcher's resumed-ACK) and the supervisor
+#     does NOT freeze (the tip is a milestone, not the predecessor's final). Built LOCALLY + scp'd (validated hex/int
+#     values only; no remote expansion) — same safety pattern as sup-env.
+if [ -n "$RESUME_SHA" ]; then
+  echo "== resume: seed $BRANCH at a marker from ${RESUME_SHA:0:12} (gen $GEN) =="
+  MJSON="{\"schemaVersion\":1,\"launchId\":\"$LID\",\"generation\":$GEN,\"kind\":\"milestone\",\"next\":\"resumed from ${RESUME_SHA:0:12}\"}"
+  RSEED="$(mktemp)"; trap 'rm -f "$SUPENV" "$RSEED"' EXIT
+  cat > "$RSEED" <<SEED
+#!/bin/sh
+set -e
+export GIT_SSH_COMMAND='ssh -i /root/.swarm/deploy-key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
+cd /root/work
+git fetch -q origin $RESUME_SHA
+midx="\$(mktemp)"
+GIT_INDEX_FILE="\$midx" git read-tree $RESUME_SHA
+mblob="\$(printf '%s' '$MJSON' | git hash-object -w --stdin)"
+GIT_INDEX_FILE="\$midx" git update-index --add --cacheinfo 100644 "\$mblob" .swarm/manifest.json
+mtree="\$(GIT_INDEX_FILE="\$midx" git write-tree)"
+marker="\$(git commit-tree "\$mtree" -p $RESUME_SHA -m 'swarm resume g$GEN')"
+git push -q origin "\$marker:refs/heads/$BRANCH"
+GIT_INDEX_FILE="\$midx" git read-tree -u -m "\$mtree"
+rm -f "\$midx"
+echo "resume-seeded \$marker"
+SEED
+  "${SCP[@]}" "$RSEED" railway.new:/root/.swarm/resume-seed.sh >/dev/null
+  "${SSH[@]}" railway.new "sh /root/.swarm/resume-seed.sh" 2>&1 | filt | tail -2
+fi
+
 # 3. start the supervisor in its OWN tmux session "sup" (NOT the worker's "swarm" session, so a scrub that kills the
 #    worker session cannot kill the scrubber). tmux persists across ssh-close here; setsid/nohup do not. A box-side
 #    start script avoids triple-nested quoting (bash -> ssh -> tmux -> sh).
@@ -153,8 +194,8 @@ printf '%s\n' "$SUP_OUT"
 # Propagate the failure (Codex P2-2): a text-only FAILED must not slide through to a false READY.
 echo "$SUP_OUT" | grep -q supervisor-started || { echo "FATAL: supervisor did not start on $LID — aborting, not READY (Codex P2-2)." >&2; exit 4; }
 
-# 4. the worker.
-if [ "$MODE" = "--demo" ]; then
+# 4. the worker (same bash demo worker for --demo and --resume; on resume it continues from the seeded out/).
+if [ "$MODE" = "--demo" ] || [ "$MODE" = "--resume" ]; then
   echo "== demo worker (bash; no model cost) in tmux session 'swarm' — writes out/, signals milestones =="
   WK_OUT="$("${SSH[@]}" railway.new "
     tmux kill-session -t swarm 2>/dev/null || true
