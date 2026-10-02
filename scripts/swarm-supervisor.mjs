@@ -130,9 +130,12 @@ async function publish(kind, { goal, next } = {}) {
   const ls = await git(["ls-remote", "origin", `refs/heads/${BRANCH}`]);
   if (ls.code !== 0) return { ok: false, error: `ls-remote: ${ls.stderr.trim()}` };
   const remoteTip = (ls.stdout.split(/\s+/)[0] || "").trim(); // empty => branch genuinely absent
-  // #2 lost-ACK: if our previous push LANDED but the client lost the ACK/returned failure, the remote now sits at the
-  //    sha we last TRIED (pendingSha) while lastPushedSha still lags. Adopt it — it's ours, not a foreign writer.
-  if (remoteTip && pendingSha && remoteTip === pendingSha) lastPushedSha = remoteTip;
+  // Lost-ACK / unresolved-push reconciliation (Codex P1-B): a push whose ACK we lost (returned failure/timeout)
+  // may still have LANDED, so the remote can sit at ANY sha we attempted since our last confirmed tip. Adopt it as
+  // ours BEFORE the foreign guard. Tracking the whole SET (not a single pendingSha) fixes the self-lock: A ok, B
+  // times out (unknown), next round still sees A and builds C overwriting B's pending; then B lands -> remote=B,
+  // which with only pendingSha=C looked "foreign" forever. With the set, B is still recognized as ours.
+  if (remoteTip && (remoteTip === lastPushedSha || attemptedShas.has(remoteTip))) lastPushedSha = remoteTip;
   if (remoteTip && lastPushedSha && remoteTip !== lastPushedSha)
     return { ok: false, error: `foreign tip ${remoteTip.slice(0, 8)} != ours ${lastPushedSha.slice(0, 8)}; refusing blind rebase (single-publisher violated)` };
   // #6 parent is the CHECKED remoteTip, never a post-fetch re-read of the branch (a foreign writer could advance it
@@ -148,6 +151,24 @@ async function publish(kind, { goal, next } = {}) {
       if (after !== remoteTip) return { ok: false, error: `remote advanced during fetch (${after.slice(0, 8)} != ${remoteTip.slice(0, 8)}); retry` };
     }
     parent = remoteTip;
+  }
+
+  // 2b. recover the publish PHASE from the parent's fixed manifest on EVERY publish (Codex P1-A). Startup recovery
+  //     can MISS a remote `final` (transient ls/fetch/show failure, or a final whose ACK was lost), leaving in-memory
+  //     finalized=false; a rescue/milestone would then build PAST a confirmed final and move the frozen handoff tip.
+  //     Reading the parent's kind here makes the freeze self-correcting. Unknown phase (manifest unreadable/unparsable)
+  //     is treated as possibly-final: refuse rather than risk publishing past a final; a later tick retries.
+  if (parent) {
+    const pm = await git(["show", `${parent}:${MANIFEST_REL}`]);
+    if (pm.code !== 0) return { ok: false, error: `parent ${parent.slice(0, 8)} manifest unreadable (phase unknown); refusing to publish past a possibly-final tip` };
+    let parentKind;
+    try { parentKind = JSON.parse(pm.stdout).kind; } catch { return { ok: false, error: `parent ${parent.slice(0, 8)} manifest parse failed (phase unknown); refusing` }; }
+    if (parentKind === "final") {
+      finalized = true;            // freeze: never build past a confirmed final, even if we forgot we finalized
+      lastPushedSha = parent;
+      attemptedShas.clear();
+      return { ok: true, sha: parent, unchanged: true, hitFinal: true };
+    }
   }
 
   // 3. build the tree from an EMPTY private index + ONLY the allowlist (+manifest). Starting empty means a
@@ -169,7 +190,7 @@ async function publish(kind, { goal, next } = {}) {
   // 4. skip only if the REMOTE parent already carries this exact tree (then the remote truly has our snapshot).
   if (parent) {
     const parentTree = (await git(["rev-parse", `${parent}^{tree}`])).stdout.trim();
-    if (parentTree === tree) { lastPushedSha = parent; return { ok: true, sha: parent, unchanged: true }; } // remote already has this tree
+    if (parentTree === tree) { lastPushedSha = parent; attemptedShas.clear(); return { ok: true, sha: parent, unchanged: true }; } // remote already has this tree
   }
 
   // 5. commit-tree onto the remote parent, then push the COMMIT OBJECT directly (no update-ref -> the worker's
@@ -177,14 +198,15 @@ async function publish(kind, { goal, next } = {}) {
   const ct = await git(["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", `swarm ${kind} g${GEN}`]);
   if (ct.code !== 0) return { ok: false, error: `commit-tree: ${ct.stderr.trim()}` };
   const sha = ct.stdout.trim();
-  pendingSha = sha; // record the sha we are ABOUT to push, so a lost-ACK next tick is recognized as ours (#2)
+  attemptedShas.add(sha); // track BEFORE the push: if the ACK is lost but it landed, next round recognizes it as ours (P1-B)
   const push = await git(["push", "origin", `${sha}:refs/heads/${BRANCH}`]);
   if (push.code !== 0) {
-    // Do NOT force/rebase. A later tick re-fetches the remote tip; if OUR push actually landed, remoteTip===pendingSha
+    // Do NOT force/rebase. A later tick re-fetches the remote tip; if OUR push actually landed it is in attemptedShas
     // and we adopt it; otherwise we retry. Never masks a failure.
     return { ok: false, error: `push: ${push.stderr.trim()}`, sha };
   }
-  lastPushedSha = sha; // record OUR tip so the single-publisher guard can spot a foreign writer next time
+  lastPushedSha = sha;   // OUR confirmed tip (single-publisher guard spots a foreign writer next time)
+  attemptedShas.clear(); // confirmed FF: every earlier attempt is now moot (remote can only fast-forward) (P1-B)
   return { ok: true, sha };
 }
 
@@ -205,8 +227,9 @@ function writeAck(obj) { atomicWrite(ACK_FILE, JSON.stringify(obj)); }
 
 // --- worker-driven checkpoint requests (cooperative freeze: worker quiesces writes BEFORE writing REQ_FILE, resumes
 // only after a terminal ack). kind "milestone" stays mid-task; kind "final" is the drained, frozen handoff point. ---
-let lastPushedSha = "";   // OUR last CONFIRMED published tip (single-publisher guard in publish())
-let pendingSha = "";      // the sha we last ATTEMPTED to push (adopt it if a lost-ACK left the remote there) (#2)
+let lastPushedSha = "";          // OUR last CONFIRMED published tip (single-publisher guard in publish())
+const attemptedShas = new Set(); // shas we've tried to push since the last CONFIRMED tip; a lost-ACK push still
+                                 // landed, so the remote showing any of these is OURS, not foreign (Codex P1-B).
 let lastReq = "";         // the last requestId we CONFIRMED (permanent skip)
 let processingReq = "";   // the requestId currently in flight (coalesce: don't re-enqueue it every tick)
 let finalized = false;    // a `final` has been confirmed -> freeze: publish nothing more until retire/scrub (Codex #6)
