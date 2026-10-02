@@ -50,14 +50,22 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 #  (b) the remote branch must not already exist (confirmed prior work). To re-run, allocate a FRESH box (new launchId).
 # Residual (documented, exactly-once is impossible here): binding READY to THIS run's incarnation needs a manifest
 # nonce (shared-schema change) — tracked; the local lock + branch guard close the practical same-LID re-run paths.
+# Bounded query runner (used by the pre-check below AND the confirm poll). Use the OS timeout/gtimeout — the only
+# correct single-owner supervisor that signals AND reaps its own child. A pure-bash kill-watchdog is unsafe here: bash
+# reaps background children asynchronously (SIGCHLD), so a PID can be recycled before an explicit wait and a late kill
+# could hit an unrelated process (Codex P1). `-k 5` hard-KILLs a command that ignores TERM; timeout propagates the
+# command's real exit status (124 on timeout). Require it rather than ship a racy fallback; fail fast before any side-effect.
+TO_BIN=""; for c in timeout gtimeout; do command -v "$c" >/dev/null 2>&1 && { TO_BIN="$c"; break; }; done
+[ -n "$TO_BIN" ] || { echo "FATAL: need 'timeout' or 'gtimeout' (GNU coreutils) to bound git queries safely — install it." >&2; exit 9; }
+qrun() { local s=$1; shift; "$TO_BIN" -k 5 "$s" "$@" 2>/dev/null; }  # qrun <secs> <cmd...>: bounded, status-propagating
 LIFECYCLE="/tmp/ah-swarm-task-$LID.lifecycle"
 mkdir "$LIFECYCLE" 2>/dev/null || { echo "REFUSING: lifecycle for $LID already held ($LIFECYCLE) — a concurrent/prior same-launchId run owns it; allocate a fresh box (Codex P2-1)." >&2; exit 8; }
 # P3: single-quote the deploy-key path INSIDE GSC_RO with POSIX escaping (git runs GSC_RO via `sh -c`). Double quotes
 # would let sh EXPAND $()/backticks in a filename; single quotes make it one literal arg regardless of metacharacters.
 dkq=${DEPLOY_KEY//\'/\'\\\'\'}
 GSC_RO="ssh -i '$dkq' -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
-EXIST="$(GIT_SSH_COMMAND="$GSC_RO" git ls-remote "$WORK_URL" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1{print $1}')" || {
-  echo "FATAL: cannot query $BRANCH on $WORK_REPO (deploy key / network) — refusing to proceed blind (Codex P2-1)." >&2; exit 7; }
+EXIST="$(qrun 25 env GIT_SSH_COMMAND="$GSC_RO" git ls-remote "$WORK_URL" "refs/heads/$BRANCH" | awk 'NR==1{print $1}')" || {
+  echo "FATAL: cannot query $BRANCH on $WORK_REPO (deploy key / network / timeout) — refusing to proceed blind (Codex P2-1/P2)." >&2; exit 7; }
 [ -z "$EXIST" ] || { echo "REFUSING: $BRANCH already exists (${EXIST:0:12}) — this lifecycle already ran. Allocate a fresh box (new launchId) or use an explicit resume; not destructively resetting confirmed work (Codex P2-1)." >&2; exit 8; }
 
 # Direct SSH/SCP with the box's throwaway key + its per-VM HASSH profile (no proxy — box is bound to the key).
@@ -171,31 +179,8 @@ echo "== verify first confirmed publish on $BRANCH (up to 60s) =="
 # that found the branch still ABSENT (keep waiting) from a CONFIRMED sha. Bound total wait by an absolute deadline and
 # each query by ssh ConnectTimeout, so a hung network can't exceed the budget. Because P2-1 verified the branch was
 # ABSENT at start, any sha observed here is THIS run's first publish.
-# P2-2: ConnectTimeout only bounds the connect/handshake, not the full ls-remote, so bound EACH query by a real total
-# timeout via a portable watchdog (no dependency on timeout/gtimeout): run it in the background, hard-kill after `secs`,
-# return its stdout. Per-query budget = min(remaining, 25s) and the loop re-checks the absolute deadline AFTER each
-# query, so the whole gate stays within ~60s even across retries and an overrun can never be accepted late.
-TO_BIN=""; for c in timeout gtimeout; do command -v "$c" >/dev/null 2>&1 && { TO_BIN="$c"; break; }; done
-qrun() {  # qrun <secs> <cmd...> : stdout of <cmd>, bounded to <secs>
-  local secs=$1; shift
-  # Prefer the OS timeout tool: a single-owner supervisor that signals AND reaps its own child correctly.
-  if [ -n "$TO_BIN" ]; then local rct=0; "$TO_BIN" "$secs" "$@" 2>/dev/null || rct=$?; return "$rct"; fi
-  # Fallback (Codex P1 fix): the PARENT is the SOLE signaller and reaps p ITSELF, so p is never signalled after being
-  # reaped — a recycled PID can't be hit (the previous detached watchdog held a bare PID and could TERM an unrelated
-  # process after p was reaped). A completion sentinel avoids waiting on a zombie. An orphaned git self-terminates via
-  # ssh ConnectTimeout, so a missed child kill is a brief leak, never a wrong-process signal.
-  local out done rc=0 w=0; out=$(mktemp); done="$out.done"
-  { "$@" >"$out" 2>/dev/null; : > "$done"; } & local p=$!
-  while [ ! -e "$done" ] && [ "$w" -lt "$secs" ]; do sleep 1; w=$((w + 1)); done
-  if [ ! -e "$done" ]; then
-    kill -TERM "$p" 2>/dev/null                                   # p not yet waited -> running/zombie, PID reserved: safe
-    local g=0; while [ ! -e "$done" ] && [ "$g" -lt 2 ]; do sleep 1; g=$((g + 1)); done
-    [ -e "$done" ] || kill -KILL "$p" 2>/dev/null
-  fi
-  wait "$p" 2>/dev/null || rc=$?                                  # only now is p reaped / its PID freed
-  cat "$out"; rm -f "$out" "$done"
-  return "$rc"
-}
+# P2-2/P2-3: each query is bounded by qrun (timeout -k, defined above) so a post-connect server stall can't exceed the
+# per-query budget; the loop re-checks the absolute deadline AFTER each query so an overrun is never accepted late.
 CONFIRMED=""; QDEADLINE=$(( $(date +%s) + 60 ))
 while :; do
   rem=$(( QDEADLINE - $(date +%s) )); [ "$rem" -gt 0 ] || break
