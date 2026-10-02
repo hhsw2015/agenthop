@@ -2,7 +2,7 @@
 // polls the unified peer roster every ~2s, merges in any local lifecycle records, and serves a live
 // snapshot to a single-file page.
 //
-//   tsx scripts/swarm-viz-export.ts                 # http://127.0.0.1:8790
+//   tsx scripts/swarm-viz-export.ts                 # http://127.0.0.1:8791
 //   tsx scripts/swarm-viz-export.ts --port 9000     # different port
 //   tsx scripts/swarm-viz-export.ts --once          # write the snapshot file and exit
 //   tsx scripts/swarm-viz-export.ts --selftest      # pure-logic checks, no bus
@@ -16,7 +16,7 @@
 // drop our own row from the snapshot and export observerId so the page can label it.
 import { createServer } from "node:http";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startBusCore } from "../packages/bus/src/core.js";
@@ -48,10 +48,10 @@ export type ControlRecord = {
 export type ControlSlot = ControlRecord | null;
 
 export type VizNode = UnifiedPeer & {
+  /** Which machine card this node sits in (hostname, or "local"). */
+  machine: string;
   /** Index into the boxes array when this peer maps to a Railway box, else -1. */
   boxIndex: number;
-  /** True for the observer's own row (filtered out before serialization; kept in the type for clarity). */
-  isObserver: boolean;
 };
 
 export type VizBox = {
@@ -69,15 +69,23 @@ export type VizBox = {
   nodeIndex: number;
 };
 
+export type VizEdge = {
+  from: string; // launchId
+  to: string; // successor launchId
+};
+
 export type Snapshot = {
   generatedAt: number;
   observerId: string;
-  parser: "swarm-viz/1";
+  parser: "swarm-viz/2";
+  /** The machine this exporter runs on, so the page can label the local group. */
+  localMachine: string;
   /** Declared staleness ceiling for relay (cross-machine) presence; the page must label clocks apart. */
   relayStaleMs: number;
   pollMs: number;
   nodes: VizNode[];
   boxes: VizBox[];
+  edges: VizEdge[];
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -229,18 +237,25 @@ export function buildSnapshot(
     if (p.id === observerId) continue; // do not show ourselves as a swarm node
     const boxIndex = boxes.findIndex((b) => matchNode([p], b.launchId) === 0);
     if (boxIndex >= 0) boxes[boxIndex]!.nodeIndex = nodes.length;
-    nodes.push({ ...p, boxIndex, isObserver: false });
+    nodes.push({ ...p, machine: p.machine ?? "local", boxIndex });
   }
-  // A box with no matching peer still counts as a node-less box (nodeIndex stays -1).
+
+  // Handoff edges: a control record's successor is the launchId a box handed off to.
+  const edges: VizEdge[] = [];
+  for (const b of boxes) {
+    if (b.control?.successor) edges.push({ from: b.launchId, to: b.control.successor });
+  }
 
   return {
     generatedAt: Date.now(),
     observerId,
-    parser: "swarm-viz/1",
+    parser: "swarm-viz/2",
+    localMachine: hostname(),
     relayStaleMs: 60_000, // directory ANNOUNCE_MS — remote status/statusText lag up to this
     pollMs,
     nodes,
     boxes,
+    edges,
   };
 }
 
@@ -270,9 +285,10 @@ function selftest(): void {
 
   t("shortId takes the last segment", shortId("rw-edde1885") === "edde1885" && shortId("edde1885") === "edde1885");
   t(
-    "matchNode finds the peer whose title contains the launchId",
+    "matchNode finds the peer whose title carries the short id",
     matchNode([{ title: "railway:claude-edde1885" }, { title: "claude:Work-01a0" }], "rw-edde1885") === 0,
   );
+  t("matchNode also accepts a title carrying the full launchId", matchNode([{ title: "box rw-edde1885" }], "rw-edde1885") === 0);
   t("matchNode misses cleanly", matchNode([{ title: "claude:Work-01a0" }], "rw-nope") === -1);
 
   const rec: ControlRecord = { launchId: "rw-x", state: "RUNNING", allocStart: 1000, budgetSec: 3600 };
@@ -293,6 +309,16 @@ function selftest(): void {
 // main
 // ---------------------------------------------------------------------------------------------
 
+function writeSnapshot(snap: Snapshot): void {
+  const file = path.join(resolveHome(), ".agenthop", "swarm-viz.json");
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, `${JSON.stringify(snap, null, 2)}\n`);
+  } catch (error) {
+    console.error(`could not write ${file}:`, error);
+  }
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.includes("--selftest")) {
@@ -300,10 +326,11 @@ async function main(): Promise<void> {
     return;
   }
   const portArg = args.indexOf("--port");
-  const port = portArg >= 0 ? Number(args[portArg + 1]) : Number(process.env.SWARM_VIZ_PORT ?? 8790);
+  const port = portArg >= 0 ? Number(args[portArg + 1]) : Number(process.env.SWARM_VIZ_PORT ?? 8791);
   const once = args.includes("--once");
   const pollMs = 2000;
   const home = resolveHome();
+
   if (once) {
     const core = startBusCore({ home: process.env.AH_HOME });
     // A brief settle so the local broker + one relay announce land before we read the roster.
@@ -316,12 +343,13 @@ async function main(): Promise<void> {
 
   const core = startBusCore({ home: process.env.AH_HOME });
   let latest: Snapshot = buildSnapshot(core.peers(), core.self.id, home, pollMs);
-  const page = loadPage();
 
   const server = createServer((req, res) => {
     if (req.url === "/" || req.url?.startsWith("/index")) {
+      // Read per request, not once at startup: editing the page then reloading the browser is the whole
+      // edit loop, and a cached copy silently serves the old layout.
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      res.end(page);
+      res.end(loadPage());
       return;
     }
     if (req.url?.startsWith("/state.json")) {
@@ -332,12 +360,16 @@ async function main(): Promise<void> {
     res.writeHead(404, { "content-type": "text/plain" });
     res.end("not found\n");
   });
+
+  const shutdown = async () => {
+    clearInterval(timer);
+    server.close();
+    await core.close();
+    process.exit(0);
+  };
   server.on("error", (error: NodeJS.ErrnoException) => {
-    if (error.code === "EADDRINUSE") {
-      console.error(`port ${port} is in use — pick another with --port <n>`);
-    } else {
-      console.error("server error:", error);
-    }
+    if (error.code === "EADDRINUSE") console.error(`port ${port} is in use — pick another with --port <n>`);
+    else console.error("server error:", error);
     void shutdown();
   });
   server.listen(port, "127.0.0.1", () => {
@@ -358,25 +390,8 @@ async function main(): Promise<void> {
     }
   }, pollMs);
 
-  const shutdown = async () => {
-    clearInterval(timer);
-    server.close();
-    await core.close();
-    process.exit(0);
-  };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
-}
-
-function writeSnapshot(snap: Snapshot): void {
-  const home = snap.observerId ? resolveHome() : homedir();
-  const file = path.join(home, ".agenthop", "swarm-viz.json");
-  try {
-    mkdirSync(path.dirname(file), { recursive: true });
-    writeFileSync(file, `${JSON.stringify(snap, null, 2)}\n`);
-  } catch (error) {
-    console.error(`could not write ${file}:`, error);
-  }
 }
 
 // Only run when invoked directly (allow importing the pure functions in a test).

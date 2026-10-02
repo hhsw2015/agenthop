@@ -6,178 +6,630 @@
 <title>swarm-viz</title>
 <style>
   :root {
-    --bg: #0f1117; --card: #171a23; --line: #262a36; --ink: #e6e8ef; --dim: #8b90a0;
-    --working: #4ea1ff; --idle: #46c98b; --blocked: #ff5c5c; --unknown: #6b7080;
-    --relay: #c58fff; --local: #46c98b; --warn: #ffb454;
+    --bg0: #07090f; --bg1: #0c0f17; --panel: rgba(15,18,27,.72); --panel-solid: #0f1219;
+    --line: rgba(255,255,255,.07); --line-soft: rgba(255,255,255,.045);
+    --ink: #eef1f8; --ink-dim: #9aa3b8; --faint: #5b6478;
+    --working: #5aa9ff; --idle: #3fd08a; --blocked: #ff5f6d; --unknown: #6b7280;
+    --relay: #b98bff; --local: #3fd08a; --warn: #ffb454; --expired: #ff6b6b;
+    --accent: #6ea8fe;
+    --r: 14px;
+    --shadow: 0 1px 0 rgba(255,255,255,.04) inset, 0 12px 32px rgba(0,0,0,.4);
   }
   * { box-sizing: border-box; }
-  body { margin: 0; padding: 20px 24px 60px; background: var(--bg); color: var(--ink);
-    font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  h1 { font-size: 15px; font-weight: 600; margin: 0 0 2px; letter-spacing: .02em; }
-  h2 { font-size: 12px; font-weight: 600; color: var(--dim); text-transform: uppercase;
-    letter-spacing: .09em; margin: 28px 0 10px; }
-  .meta { color: var(--dim); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; }
-  .stale { color: var(--warn); }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-left-width: 3px; border-radius: 8px;
-    padding: 12px 14px; }
-  .card.working { border-left-color: var(--working); }
-  .card.idle { border-left-color: var(--idle); }
-  .card.blocked { border-left-color: var(--blocked); }
-  .card.unknown { border-left-color: var(--unknown); }
-  .row { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
-  .title { font-weight: 600; overflow-wrap: anywhere; }
-  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; white-space: nowrap;
-    background: #22262f; color: var(--ink); }
-  .pill.working { background: #12324f; color: var(--working); }
-  .pill.idle { background: #123528; color: var(--idle); }
-  .pill.blocked { background: #3d1a1a; color: var(--blocked); }
-  .pill.unknown { background: #23262e; color: var(--unknown); }
-  .via { font-size: 11px; }
-  .via.relay { color: var(--relay); }
-  .via.local { color: var(--local); }
-  .kv { display: grid; grid-template-columns: 74px 1fr; gap: 2px 10px; margin-top: 9px; font-size: 12px; }
-  .kv dt { color: var(--dim); }
-  .kv dd { margin: 0; overflow-wrap: anywhere; }
-  .text { margin-top: 9px; padding: 7px 9px; background: #10131a; border-radius: 6px; font-size: 12px;
-    color: #cdd2e0; overflow-wrap: anywhere; }
-  .clock { font-size: 11px; color: var(--dim); }
-  .clock.warn { color: var(--warn); }
-  .count { font-size: 15px; font-variant-numeric: tabular-nums; }
-  .count.warn { color: var(--warn); }
-  .count.dead { color: var(--blocked); }
-  .state { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: #22262f; color: var(--dim); }
-  .state.RUNNING { color: var(--working); } .state.RESUMED { color: var(--idle); }
-  .state.DRAINING, .state.CHECKPOINTED, .state.CLAIMED, .state.ALLOCATING { color: var(--warn); }
-  .state.RETIRED, .state.DONE, .state.EXPIRED { color: var(--unknown); }
-  .empty { color: var(--dim); padding: 18px 0; font-size: 13px; }
-  .err { color: var(--blocked); font-size: 12px; }
-  .edge { color: var(--dim); font-size: 12px; margin-top: 8px; }
-  .edge b { color: var(--idle); font-weight: 600; }
-  footer { margin-top: 28px; color: var(--dim); font-size: 11px; line-height: 1.7; }
-  code { color: #cdd2e0; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; color: var(--ink); overflow: hidden;
+    font: 13px/1.55 "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", ui-sans-serif, system-ui, sans-serif;
+    background:
+      radial-gradient(1100px 620px at 78% -12%, rgba(110,168,254,.10), transparent 60%),
+      radial-gradient(900px 520px at 12% 8%, rgba(185,139,255,.07), transparent 62%),
+      linear-gradient(180deg, var(--bg1), var(--bg0));
+    -webkit-font-smoothing: antialiased;
+  }
+  #app { display: grid; grid-template-rows: 58px 1fr; height: 100%; }
+
+  /* ---------- top bar ---------- */
+  header {
+    display: flex; align-items: center; gap: 18px; padding: 0 20px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel); backdrop-filter: blur(16px) saturate(1.4);
+    z-index: 5;
+  }
+  .brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -.01em; font-size: 13.5px; }
+  .logo {
+    width: 22px; height: 22px; border-radius: 7px; display: grid; place-items: center;
+    background: linear-gradient(140deg, var(--accent), var(--relay));
+    box-shadow: 0 0 18px rgba(110,168,254,.35);
+  }
+  .logo svg { width: 12px; height: 12px; }
+  .live { display: inline-flex; align-items: center; gap: 6px; color: var(--idle); font-size: 11px; font-weight: 550;
+    padding: 3px 9px; border-radius: 999px; background: rgba(63,208,138,.09); border: 1px solid rgba(63,208,138,.2); }
+  .live .blip { width: 6px; height: 6px; border-radius: 50%; background: var(--idle); animation: blip 2.2s infinite; }
+  @keyframes blip { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+
+  .stats { display: flex; gap: 20px; color: var(--ink-dim); font-size: 12px; }
+  .stats b { color: var(--ink); font-weight: 650; font-variant-numeric: tabular-nums; }
+  .spacer { flex: 1; }
+
+  .search {
+    background: rgba(255,255,255,.035); border: 1px solid var(--line); color: var(--ink);
+    border-radius: 10px; padding: 7px 12px 7px 32px; font: inherit; font-size: 12px; width: 230px;
+    outline: none; transition: border-color .15s, background .15s;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%235b6478' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: 10px center; background-size: 14px;
+  }
+  .search:focus { border-color: rgba(110,168,254,.5); background-color: rgba(110,168,254,.05); }
+  .search::placeholder { color: var(--faint); }
+
+  .filters { display: flex; gap: 5px; }
+  .chip {
+    border: 1px solid var(--line); background: rgba(255,255,255,.03); color: var(--ink-dim);
+    border-radius: 999px; padding: 5px 11px; font: inherit; font-size: 11px; font-weight: 500; cursor: pointer;
+    transition: all .15s;
+  }
+  .chip:hover { color: var(--ink); border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.06); }
+  .chip.on { background: rgba(110,168,254,.13); border-color: rgba(110,168,254,.45); color: var(--ink); }
+  .chip.on[data-f="working"] { color: var(--working); border-color: var(--working); background: rgba(90,169,255,.13); }
+  .chip.on[data-f="idle"] { color: var(--idle); border-color: var(--idle); background: rgba(63,208,138,.13); }
+  .chip.on[data-f="blocked"] { color: var(--blocked); border-color: var(--blocked); background: rgba(255,95,109,.13); }
+  .chip.on[data-f="relay"] { color: var(--relay); border-color: var(--relay); background: rgba(185,139,255,.13); }
+  .chip.on[data-f="box"] { color: var(--warn); border-color: var(--warn); background: rgba(255,180,84,.13); }
+
+  /* ---------- stage ---------- */
+  #stage { position: relative; overflow: hidden; }
+  svg { display: block; width: 100%; height: 100%; cursor: grab; }
+  svg.grabbing { cursor: grabbing; }
+
+  /* cluster cards */
+  .grp rect {
+    fill: rgba(255,255,255,.018); stroke: var(--line); stroke-width: 1; rx: 18;
+    filter: drop-shadow(0 12px 28px rgba(0,0,0,.35));
+  }
+  .grp.local rect { fill: rgba(63,208,138,.028); stroke: rgba(63,208,138,.16); }
+  .grp.remote rect { fill: rgba(185,139,255,.03); stroke: rgba(185,139,255,.16); }
+  .grp .glabel { fill: var(--ink-dim); font-size: 10.5px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; }
+  .grp .gsub { fill: var(--faint); font-size: 10px; }
+  .grp .gdot { }
+  .grp .gkind { font-size: 9.5px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; }
+
+  /* nodes */
+  .node { cursor: pointer; }
+  .node .halo { fill: none; stroke-width: 1.5; opacity: 0; transition: opacity .15s; }
+  .node .ring { fill: rgba(10,12,18,.85); stroke: rgba(255,255,255,.09); stroke-width: 1; }
+  .node .body { stroke-width: 2; transition: filter .15s; }
+  .node .glyph { font-size: 11px; font-weight: 700; letter-spacing: .02em; fill: #fff; }
+  .node text.t { fill: var(--ink); font-size: 11px; font-weight: 600; }
+  .node text.m { fill: var(--ink-dim); font-size: 10px; }
+  .node text.stext { fill: var(--faint); font-size: 9.5px; font-style: italic; }
+  .node.sel .halo { opacity: 1; }
+  .node.sel .ring { stroke: rgba(255,255,255,.35); }
+  .node.dim { opacity: .12; pointer-events: none; }
+  .node:hover .ring { stroke: rgba(255,255,255,.3); }
+  .node .pulse { fill: none; stroke-width: 1.5; opacity: 0; }
+
+  .node[data-status="working"] .body { stroke: var(--working); }
+  .node[data-status="idle"] .body { stroke: var(--idle); }
+  .node[data-status="blocked"] .body { stroke: var(--blocked); }
+  .node[data-status="unknown"] .body { stroke: var(--unknown); }
+  .node[data-status="working"] .halo { stroke: var(--working); }
+  .node[data-status="idle"] .halo { stroke: var(--idle); }
+  .node[data-status="blocked"] .halo { stroke: var(--blocked); }
+  .node[data-status="unknown"] .halo { stroke: var(--unknown); }
+  .node[data-status="working"] .pulse { stroke: var(--working); animation: pulse 2.4s cubic-bezier(.2,.6,.3,1) infinite; }
+  .node[data-status="blocked"] .pulse { stroke: var(--blocked); animation: pulse 1.2s cubic-bezier(.2,.6,.3,1) infinite; }
+  @keyframes pulse { 0% { opacity: .5; r: 21; } 100% { opacity: 0; r: 46; } }
+
+  .node .badge { fill: rgba(185,139,255,.14); stroke: rgba(185,139,255,.4); }
+  .node .badge-t { fill: var(--relay); font-size: 8.5px; font-weight: 650; letter-spacing: .08em; }
+  .node.relay .ring { stroke-dasharray: 2.5 3; stroke: rgba(185,139,255,.32); }
+
+  .boxnode .body { fill: rgba(255,180,84,.06); stroke: var(--warn); }
+  .boxnode .ring { fill: rgba(10,12,18,.85); stroke: rgba(255,180,84,.22); }
+  .boxnode.st-expired .body, .boxnode.st-DONE .body, .boxnode.st-RETIRED .body { stroke: var(--faint); }
+  .boxnode.st-expired .ring, .boxnode.st-DONE .ring, .boxnode.st-RETIRED .ring { stroke: rgba(255,255,255,.09); }
+  .boxnode .st { fill: var(--warn); font-size: 9px; font-weight: 650; letter-spacing: .06em; }
+  .boxnode.st-expired .st, .boxnode.st-DONE .st, .boxnode.st-RETIRED .st { fill: var(--faint); }
+  .boxnode .cd { fill: var(--ink); font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .boxnode .cd.warn { fill: var(--warn); }
+  .boxnode .cd.dead { fill: var(--expired); }
+  .boxnode .glyph { fill: var(--warn); }
+
+  /* edges */
+  .edge { fill: none; stroke: var(--relay); stroke-width: 1.8; opacity: .55; marker-end: url(#arrow); }
+  .edge.hi { opacity: 1; stroke-width: 2.4; }
+
+  /* ---------- drawer ---------- */
+  aside {
+    position: absolute; top: 0; right: 0; width: 372px; height: 100%; overflow-y: auto;
+    background: var(--panel); backdrop-filter: blur(20px) saturate(1.4);
+    border-left: 1px solid var(--line); box-shadow: -24px 0 60px rgba(0,0,0,.4);
+    transform: translateX(102%); transition: transform .26s cubic-bezier(.32,.72,0,1); padding: 22px;
+    z-index: 4;
+  }
+  aside.open { transform: none; }
+  aside h3 { margin: 0 0 3px; font-size: 15px; font-weight: 650; letter-spacing: -.01em; overflow-wrap: anywhere; }
+  aside .kind { color: var(--ink-dim); font-size: 11.5px; margin-bottom: 16px; display: flex; align-items: center; gap: 7px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  aside .close { position: absolute; top: 18px; right: 20px; cursor: pointer; color: var(--faint); font-size: 15px;
+    width: 24px; height: 24px; display: grid; place-items: center; border-radius: 7px; transition: all .15s; }
+  aside .close:hover { color: var(--ink); background: rgba(255,255,255,.07); }
+  dl { display: grid; grid-template-columns: 88px 1fr; gap: 8px 14px; margin: 0 0 16px; font-size: 12px; }
+  dt { color: var(--faint); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  .note { background: rgba(255,255,255,.03); border: 1px solid var(--line-soft); border-radius: 10px;
+    padding: 10px 12px; font-size: 12px; color: #ccd2e2; overflow-wrap: anywhere; margin-bottom: 12px; line-height: 1.6; }
+  .sec { color: var(--faint); font-size: 10px; font-weight: 650; letter-spacing: .14em; text-transform: uppercase; margin: 20px 0 9px; }
+  .bar { height: 3px; border-radius: 2px; background: rgba(255,255,255,.06); overflow: hidden; margin: 4px 0 16px; }
+  .bar i { display: block; height: 100%; border-radius: 2px; transition: width .3s; }
+
+  /* ---------- legend ---------- */
+  .legend {
+    position: absolute; left: 20px; bottom: 18px; display: flex; gap: 15px; flex-wrap: wrap; align-items: center;
+    color: var(--faint); font-size: 11px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 11px; padding: 9px 14px; max-width: calc(100% - 40px); z-index: 3;
+    backdrop-filter: blur(14px);
+  }
+  .legend i { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .legend .sep { width: 1px; height: 12px; background: var(--line); }
+  .empty { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; color: var(--ink-dim); padding: 40px; }
+  .empty b { color: var(--ink); display: block; margin-bottom: 8px; font-size: 14px; }
+  .offline { color: var(--blocked); }
+  .hint { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); color: var(--faint);
+    font-size: 10.5px; background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 5px 13px;
+    backdrop-filter: blur(14px); z-index: 2; }
 </style>
 </head>
 <body>
-  <h1>swarm-viz</h1>
-  <div class="meta" id="meta"><span>connecting…</span></div>
-  <div id="err" class="err"></div>
-  <h2>Nodes <span id="ncount" style="color:var(--dim)"></span></h2>
-  <div id="nodes" class="grid"></div>
-  <h2>Boxes <span id="bcount" style="color:var(--dim)"></span></h2>
-  <div id="boxes" class="grid"></div>
-  <footer>
-    <div>countdown ticks locally every 1s from a fixed epoch; the snapshot is polled every <span id="pollMs">2</span>s</div>
-    <div>relay peers announce every 60s (TTL 150s), so a remote <em>status</em> pill can lag up to 60s — read the "changed" clock, not the poll rate</div>
-    <div>the local lifecycle mirror is written by the dispatcher and is fresh, so a box countdown is accurate even when its node pill is stale</div>
-    <div id="observer"></div>
-  </footer>
-  <script>
-    const $ = (id) => document.getElementById(id);
-    let state = null;
+<div id="app">
+  <header>
+    <div class="brand">
+      <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7.6 7.4 10.6 16M16.4 7.4 13.4 16M8 6h8"/></svg></div>
+      swarm-viz
+      <span class="live"><span class="blip"></span>live</span>
+    </div>
+    <div class="stats" id="stats"></div>
+    <div class="spacer"></div>
+    <div class="filters" id="filters"></div>
+    <input class="search" id="search" placeholder="Search sessions, cwd, machine…" />
+  </header>
+  <div id="stage">
+    <svg id="svg"><defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#c58fff" />
+      </marker>
+    </defs>
+    <g id="view"></g></svg>
+    <div class="legend">
+      <span><i style="background:var(--working)"></i>working</span>
+      <span><i style="background:var(--idle)"></i>idle</span>
+      <span><i style="background:var(--blocked)"></i>blocked</span>
+      <span><i style="background:var(--unknown)"></i>unknown</span>
+      <span class="sep"></span>
+      <span><i style="background:var(--relay)"></i>cross-machine</span>
+      <span><i style="background:var(--warn)"></i>box</span>
+      <span class="sep"></span>
+      <span id="stale-info"></span>
+    </div>
+    <div class="hint">drag to pan · scroll to zoom · click a node for detail</div>
+    <aside id="drawer"></aside>
+  </div>
+</div>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  let state = null;         // latest snapshot
+  let model = null;         // laid-out graph
+  let sel = null;           // selected node id
+  let query = "";
+  const filters = new Set(); // active status/via/box filters
 
-    function ago(ms) {
-      if (ms == null) return "—";
-      const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
-      if (s < 60) return s + "s ago";
-      const m = Math.floor(s / 60);
-      if (m < 60) return m + "m " + (s % 60) + "s ago";
-      return Math.floor(m / 60) + "h " + (m % 60) + "m ago";
-    }
-    function fmtCountdown(epochSec) {
-      if (epochSec == null) return { text: "—", cls: "" };
-      const left = Math.round(epochSec - Date.now() / 1000);
-      if (left <= 0) return { text: "expired " + dur(-left) + " ago", cls: "dead" };
-      return { text: dur(left), cls: left < 300 ? "warn" : "" };
-    }
-    function dur(sec) {
-      const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-      if (h > 0) return h + "h " + m + "m";
-      if (m > 0) return m + "m " + s + "s";
-      return s + "s";
-    }
-    const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const STATUS_COLOR = { working: "#4ea1ff", idle: "#46c98b", blocked: "#ff5c5c", unknown: "#6b7080" };
+  const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-    function nodeCard(n) {
-      const status = n.status || "unknown";
-      const stale = n.via === "relay" && n.statusAt && Date.now() - n.statusAt > 60000;
-      return `<div class="card ${status}">
-        <div class="row"><span class="title">${esc(n.title)}</span>
-          <span class="pill ${status}">${esc(status)}</span></div>
-        <div class="row" style="margin-top:4px">
-          <span class="via ${n.via}">${n.via}${n.machine ? " @ " + esc(n.machine) : ""}</span>
-          <span class="clock ${stale ? "warn" : ""}">${n.statusAt ? "changed " + ago(n.statusAt) : "no status"}</span>
-        </div>
-        <dl class="kv">
-          <dt>tool</dt><dd>${esc(n.tool)}</dd>
-          <dt>cwd</dt><dd>${esc(n.cwd)}</dd>
-          ${n.pid != null ? `<dt>pid</dt><dd>${n.pid}</dd>` : ""}
-          ${n.stableId ? `<dt>session</dt><dd>${esc(n.stableId)}</dd>` : ""}
-          ${n.statusSeq != null ? `<dt>seq</dt><dd>${n.statusSeq}</dd>` : ""}
-        </dl>
-        ${n.statusText ? `<div class="text">${esc(n.statusText)}</div>` : ""}
-      </div>`;
-    }
+  // ---------------------------------------------------------------- layout (deterministic packed grid)
+  // Machines become clusters. Nodes inside a cluster sit on a ring; clusters are packed into a grid by
+  // their own size. Deterministic on purpose: a force sim drifted clusters to the corners and forced a
+  // tiny auto-fit zoom, which read worse than a tidy grid. Node positions key off the item id so a node
+  // does not jump when the roster changes.
+  function layout(snap) {
+    // Stable ring placement from a string hash, so re-renders do not reshuffle.
+    const hash = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0) / 4294967296; };
 
-    function boxCard(b) {
-      const c = b.control;
-      const node = b.nodeIndex >= 0 ? state.nodes[b.nodeIndex] : null;
-      const cd = fmtCountdown(b.deadlineEpoch);
-      const src = { record: "control record", "alloc-ts": "local alloc-ts + 1h", none: "unknown" }[b.deadlineSource];
-      return `<div class="card ${c ? "unknown" : ""}">
-        <div class="row"><span class="title">${esc(b.launchId)}</span>
-          ${c ? `<span class="state ${esc(c.state)}">${esc(c.state)}</span>` : `<span class="state">no control record</span>`}</div>
-        <div class="row" style="margin-top:6px">
-          <span class="count ${cd.cls}">${cd.text}</span>
-          <span class="clock">${src}</span>
-        </div>
-        <dl class="kv">
-          ${node ? `<dt>node</dt><dd>${esc(node.title)}</dd>` : `<dt>node</dt><dd>— no bus peer matched</dd>`}
-          ${b.allocStart ? `<dt>alloc</dt><dd>${new Date(b.allocStart * 1000).toLocaleTimeString()}</dd>` : ""}
-          ${c && c.generation != null ? `<dt>gen</dt><dd>${c.generation}</dd>` : ""}
-          ${c && c.sha ? `<dt>sha</dt><dd>${esc(c.sha.slice(0, 12))}</dd>` : ""}
-          ${c && c.owner ? `<dt>owner</dt><dd>${esc(c.owner)}</dd>` : ""}
-          ${c && c.updatedAt ? `<dt>updated</dt><dd>${ago(c.updatedAt * 1000)}</dd>` : ""}
-        </dl>
-        ${c && c.successor ? `<div class="edge">handoff → <b>${esc(c.successor)}</b></div>` : ""}
-        ${c && c.manifest ? `<div class="text">${esc(c.manifest)}</div>` : ""}
-      </div>`;
+    const groups = new Map(); // machine -> items
+    const items = [];
+    for (const n of snap.nodes) {
+      const it = { kind: "peer", id: n.id, data: n, machine: n.machine, r: 20, x: 0, y: 0 };
+      items.push(it);
+      if (!groups.has(n.machine)) groups.set(n.machine, []);
+      groups.get(n.machine).push(it);
+    }
+    for (const b of snap.boxes) {
+      const linked = b.nodeIndex >= 0 ? snap.nodes[b.nodeIndex] : null;
+      const it = { kind: "box", id: "box:" + b.launchId, data: b, machine: linked ? linked.machine : b.launchId, r: 26, x: 0, y: 0 };
+      items.push(it);
+      if (!groups.has(it.machine)) groups.set(it.machine, []);
+      groups.get(it.machine).push(it);
     }
 
-    function render() {
-      const s = state;
-      $("meta").innerHTML =
-        `<span>snapshot ${ago(s.generatedAt)}</span>` +
-        `<span>${s.nodes.length} node(s), ${s.boxes.length} box(es)</span>` +
-        `<span>relay staleness ceiling ${s.relayStaleMs / 1000}s</span>`;
-      $("pollMs").textContent = (s.pollMs / 1000).toFixed(0);
-      $("observer").innerHTML = `observer bus id <code>${esc(s.observerId)}</code> (filtered out of the node list)`;
-      $("ncount").textContent = `(${s.nodes.length})`;
-      $("bcount").textContent = `(${s.boxes.length})`;
-      $("nodes").innerHTML = s.nodes.length
-        ? s.nodes.map(nodeCard).join("")
-        : `<div class="empty">No peers on the roster. Same-machine sessions appear automatically; run with AGENTHOP_TEAM set to see other machines.</div>`;
-      $("boxes").innerHTML = s.boxes.length
-        ? s.boxes.map(boxCard).join("")
-        : `<div class="empty">No boxes known. A box shows up here once a dispatcher writes ~/.agenthop/swarm/control/&lt;launchId&gt;.json, or a local /tmp/ah-rwkey-&lt;launchId&gt;/alloc-ts exists.</div>`;
+    // Lay out each cluster locally: peers on a ring, boxes just below the ring center.
+    const clusters = [];
+    for (const [machine, list] of groups) {
+      const peers = list.filter((i) => i.kind === "peer");
+      const boxes = list.filter((i) => i.kind === "box");
+      const ringR = peers.length <= 1 ? 0 : Math.max(72, 30 * Math.sqrt(peers.length) + 34);
+      peers.forEach((it, i) => {
+        const a = (i / Math.max(1, peers.length)) * Math.PI * 2 + hash(it.id) * 0.6;
+        it.x = Math.cos(a) * ringR;
+        it.y = Math.sin(a) * ringR;
+      });
+      boxes.forEach((it, i) => {
+        it.x = (i - (boxes.length - 1) / 2) * 96;
+        it.y = ringR + 108;
+      });
+      const padX = 78, padTop = boxes.length && !peers.length ? 92 : 62, padBottom = 52;
+      const xs = list.map((n) => n.x), ys = list.map((n) => n.y);
+      const box = {
+        name: machine,
+        isBoxes: boxes.length > 0 && peers.length === 0,
+        local: machine === "local" || machine === snap.localMachine,
+        w: Math.max(230, Math.max(...xs) - Math.min(...xs) + padX * 2),
+        h: Math.max(190, Math.max(...ys) - Math.min(...ys) + padTop + padBottom),
+        _ox: Math.min(...xs) - padX,
+        _oy: Math.min(...ys) - padTop,
+        list,
+      };
+      clusters.push(box);
     }
 
-    async function tick() {
-      try {
-        const r = await fetch("/state.json", { cache: "no-store" });
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        state = await r.json();
-        $("err").textContent = "";
-        render();
-      } catch (e) {
-        $("err").textContent = "exporter unreachable: " + e.message;
+    // Pack clusters into a grid: cols scaled to total area, then place row by row.
+    const totalArea = clusters.reduce((s, c) => s + c.w * c.h, 0);
+    const cols = Math.max(1, Math.round(Math.sqrt(totalArea) / 340) || 1);
+    const rowH = [];
+    let x = 0, y = 0;
+    clusters.forEach((c, i) => {
+      const col = i % cols;
+      if (col === 0) { x = 0; if (i > 0) y += (rowH[(i / cols - 1) | 0] ?? 0) + 40; }
+      c.x = x; c.y = y;
+      rowH[(i / cols) | 0] = Math.max(rowH[(i / cols) | 0] ?? 0, c.h);
+      x += c.w + 40;
+    });
+    const totalW = Math.max(...clusters.map((c) => c.x + c.w), 1);
+    const totalH = Math.max(...clusters.map((c) => c.y + c.h), 1);
+
+    // Translate local node coords into the packed grid.
+    for (const c of clusters) {
+      for (const it of c.list) { it.x += c.x - c._ox; it.y += c.y - c._oy; }
+    }
+
+    const byId = new Map(items.map((it) => [it.id, it]));
+    const edges = [];
+    for (const e of snap.edges) {
+      const a = byId.get("box:" + e.from), b = byId.get("box:" + e.to);
+      if (a && b) edges.push({ a, b });
+    }
+    return { items, clusters, edges, bounds: { x0: 0, y0: 0, x1: totalW, y1: totalH } };
+  }
+
+  // ---------------------------------------------------------------- filters
+  function matches(it) {
+    const d = it.data;
+    const title = it.kind === "box" ? d.launchId : d.title;
+    if (query) {
+      const hay = (title + " " + (d.cwd ?? "") + " " + (it.machine ?? "")).toLowerCase();
+      if (!hay.includes(query)) return false;
+    }
+    if (filters.size) {
+      if (it.kind === "box") { if (!filters.has("box")) return false; }
+      else {
+        const ok = filters.has(d.status ?? "unknown") || filters.has(d.via ?? "local");
+        if (!ok) return false;
       }
     }
+    return true;
+  }
 
-    tick();
-    setInterval(tick, 2000);
-    // Re-render the local clocks (countdown + ago) every second without a fetch.
-    setInterval(() => { if (state) render(); }, 1000);
-  </script>
+  // ---------------------------------------------------------------- render
+  function render() {
+    const snap = state;
+    if (!snap) return;
+    model = layout(snap);
+    document.querySelectorAll("#svg > g#view > *").forEach((n) => n.remove());
+    const view = $("view");
+
+    for (const c of model.clusters) {
+      const g = el("g", { class: `grp${c.local ? " local" : " remote"}` });
+      g.appendChild(el("rect", { x: c.x, y: c.y, width: Math.max(c.w, 200), height: Math.max(c.h, 150) }));
+      const dot = el("circle", { class: "gdot", cx: c.x + 20, cy: c.y + 22, r: 3.5, fill: c.isBoxes ? "var(--warn)" : c.local ? "var(--idle)" : "var(--relay)" });
+      g.appendChild(dot);
+      const lbl = el("text", { class: "glabel", x: c.x + 30, y: c.y + 26 });
+      lbl.textContent = c.isBoxes ? "railway box" : c.local ? c.name + " · this machine" : c.name;
+      g.appendChild(lbl);
+      const sub = el("text", { class: "gsub", x: c.x + 20, y: c.y + 43 });
+      sub.textContent = c.isBoxes ? "no session attached" : `${c.list.length} session${c.list.length === 1 ? "" : "s"}`;
+      g.appendChild(sub);
+      view.appendChild(g);
+    }
+
+    for (const e of model.edges) {
+      view.appendChild(el("path", { class: "edge", d: curve(e.a, e.b) }));
+    }
+
+    for (const it of model.items) {
+      const ok = matches(it);
+      const node = it.kind === "box" ? renderBox(it) : renderPeer(it);
+      if (!ok) node.classList.add("dim");
+      if (sel === it.id) node.classList.add("sel");
+      node.setAttribute("transform", `translate(${it.x},${it.y})`);
+      node.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        sel = sel === it.id ? null : it.id;
+        render(); draw();
+      });
+      view.appendChild(node);
+    }
+    draw();
+    if (!didFit) { didFit = true; fit(); }
+    renderDrawer();
+  }
+
+  function renderPeer(it) {
+    const d = it.data;
+    const status = d.status ?? "unknown";
+    const g = el("g", { class: `node peer${d.via === "relay" ? " relay" : ""}`, "data-status": status });
+    // Full identity in a native tooltip; the in-graph caption is kept short so it cannot overrun the
+    // cluster card (a long cwd-derived title does not fit under a 21px ring).
+    g.appendChild(el("title", {})).textContent = `${d.title}\n${d.cwd}\n${d.tool} · ${d.via} · ${status}`;
+    g.appendChild(el("circle", { class: "pulse", r: 21 }));
+    g.appendChild(el("circle", { class: "halo", r: 31 }));
+    g.appendChild(el("circle", { class: "ring", r: 21 }));
+    g.appendChild(el("circle", { class: "body", r: 18, fill: STATUS_COLOR[status] + "1f" }));
+    const t = el("text", { class: "glyph", "text-anchor": "middle", y: 4 });
+    t.textContent = initials(d.tool);
+    t.setAttribute("fill", STATUS_COLOR[status]);
+    g.appendChild(t);
+    const m = el("text", { class: "t", "text-anchor": "middle", y: 38 });
+    m.textContent = clip(shortName(d), 16);
+    g.appendChild(m);
+    if (d.via === "relay") {
+      g.appendChild(el("rect", { class: "badge", x: -21, y: -36, width: 42, height: 14, rx: 7 }));
+      const bt = el("text", { class: "badge-t", "text-anchor": "middle", y: -26 });
+      bt.textContent = "REMOTE";
+      g.appendChild(bt);
+    }
+    return g;
+  }
+
+  /** The compact caption for a node: the part of the title after "tool:", so "claude:Work-20cab0a5"
+   *  reads as "Work-20cab0a5". Falls back to the raw title. */
+  function shortName(d) {
+    const t = String(d.title ?? "");
+    const i = t.indexOf(":");
+    return i >= 0 ? t.slice(i + 1) : t;
+  }
+
+  function renderBox(it) {
+    const b = it.data;
+    const state_ = b.control?.state ?? "no-record";
+    const g = el("g", { class: `node boxnode st-${state_}`, "data-status": "unknown" });
+    g.appendChild(el("title", {})).textContent = `${b.launchId}\n${state_}${b.deadlineEpoch ? "\ndeadline " + new Date(b.deadlineEpoch * 1000).toLocaleString() : ""}`;
+    g.appendChild(el("circle", { class: "halo", r: 38 }));
+    g.appendChild(el("rect", { class: "ring", x: -27, y: -27, width: 54, height: 54, rx: 14 }));
+    g.appendChild(el("rect", { class: "body", x: -24, y: -24, width: 48, height: 48, rx: 12 }));
+    g.appendChild(el("path", { class: "glyph-box", d: "M-11,-9 h22 M-11,-1 h22 M-11,7 h22", stroke: "var(--warn)", "stroke-width": 2.2, "stroke-linecap": "round", fill: "none", opacity: .9 }));
+    // The launchId is the node caption (it sits ABOVE the card, below the cluster heading); state and
+    // countdown sit below. Nothing overlaps because each has its own band.
+    const nm = el("text", { class: "t", "text-anchor": "middle", y: -38 });
+    nm.textContent = b.launchId;
+    g.appendChild(nm);
+    const st = el("text", { class: "st", "text-anchor": "middle", y: 46 });
+    st.textContent = state_ === "no-record" ? "NO CONTROL RECORD" : state_;
+    g.appendChild(st);
+    const cd = el("text", { class: "cd", "text-anchor": "middle", y: 62 });
+    const c = countdown(b.deadlineEpoch);
+    cd.textContent = c.text; cd.setAttribute("class", "cd " + (c.cls ?? ""));
+    g.appendChild(cd);
+    return g;
+  }
+
+  // ---------------------------------------------------------------- pannable view transform + zoom
+  let view = { x: 0, y: 0, k: 1 };
+  let didFit = false;
+  function fit() {
+    if (!model || !model.bounds) return;
+    const b = model.bounds;
+    if (!Number.isFinite(b.x0)) return;
+    const rect = svg.getBoundingClientRect();
+    const w = b.x1 - b.x0, h = b.y1 - b.y0;
+    const k = Math.min(1.2, Math.max(0.25, Math.min(rect.width / (w + 80), rect.height / (h + 80))));
+    view.k = k;
+    view.x = rect.width / 2 - ((b.x0 + b.x1) / 2) * k;
+    view.y = rect.height / 2 - ((b.y0 + b.y1) / 2) * k;
+    draw();
+  }
+  function draw() {
+    $("view").setAttribute("transform", `translate(${view.x},${view.y}) scale(${view.k})`);
+  }
+
+  // ---------------------------------------------------------------- drawer
+  function renderDrawer() {
+    const aside = $("drawer");
+    if (!sel || !model) { aside.classList.remove("open"); aside.innerHTML = ""; return; }
+    const it = model.items.find((x) => x.id === sel);
+    if (!it) { aside.classList.remove("open"); return; }
+    aside.classList.add("open");
+    if (it.kind === "box") aside.innerHTML = boxDrawer(it.data);
+    else aside.innerHTML = peerDrawer(it.data);
+    aside.querySelector(".close").onclick = () => { sel = null; render(); };
+  }
+
+  function peerDrawer(d) {
+    const status = d.status ?? "unknown";
+    const cls = d.statusAt ? staleLabel(d) : "";
+    return `
+      <div class="close">✕</div>
+      <h3>${esc(d.title)}</h3>
+      <div class="kind">session · ${esc(d.tool)} · via ${esc(d.via)}</div>
+      <div class="bar"><i style="width:100%;background:${STATUS_COLOR[status]}"></i></div>
+      <dl>
+        <dt>status</dt><dd style="color:${STATUS_COLOR[status]}">${esc(status)}</dd>
+        <dt>changed</dt><dd>${esc(cls)}</dd>
+        <dt>machine</dt><dd>${esc(d.machine ?? "local")}</dd>
+        <dt>cwd</dt><dd>${esc(d.cwd)}</dd>
+        ${d.pid != null ? `<dt>pid</dt><dd>${d.pid}</dd>` : ""}
+        ${d.stableId ? `<dt>session id</dt><dd>${esc(d.stableId)}</dd>` : ""}
+        <dt>bus id</dt><dd>${esc(d.id)}</dd>
+        ${d.statusSeq != null ? `<dt>status seq</dt><dd>${d.statusSeq}</dd>` : ""}
+      </dl>
+      ${d.statusText ? `<div class="note">${esc(d.statusText)}</div>` : ""}
+      ${d.via === "relay" ? `<div class="note">Remote peer: presence is announced every 60s, so this status can lag up to a minute. Read “changed”, not the poll rate.</div>` : ""}
+    `;
+  }
+
+  function boxDrawer(b) {
+    const c = b.control;
+    const cd = countdown(b.deadlineEpoch);
+    const src = { record: "control record", "alloc-ts": "local alloc-ts + 1h", none: "unknown" }[b.deadlineSource];
+    return `
+      <div class="close">✕</div>
+      <h3>${esc(b.launchId)}</h3>
+      <div class="kind">railway box · ${c ? esc(c.state) : "no control record yet"}</div>
+      <div class="bar"><i style="width:100%;background:${cd.cls === "dead" ? "var(--expired)" : cd.cls === "warn" ? "var(--warn)" : "var(--idle)"}"></i></div>
+      <dl>
+        <dt>window</dt><dd class="${cd.cls}">${esc(cd.text)}</dd>
+        <dt>deadline</dt><dd>${b.deadlineEpoch ? new Date(b.deadlineEpoch * 1000).toLocaleString() : "—"}</dd>
+        <dt>source</dt><dd>${esc(src)}</dd>
+        ${b.allocStart ? `<dt>allocated</dt><dd>${new Date(b.allocStart * 1000).toLocaleString()}</dd>` : ""}
+        ${c && c.generation != null ? `<dt>generation</dt><dd>${c.generation}</dd>` : ""}
+        ${c && c.sha ? `<dt>sha</dt><dd>${esc(c.sha)}</dd>` : ""}
+        ${c && c.owner ? `<dt>owner</dt><dd>${esc(c.owner)}</dd>` : ""}
+        ${c && c.updatedAt ? `<dt>updated</dt><dd>${ago(c.updatedAt * 1000)}</dd>` : ""}
+      </dl>
+      ${c && c.successor ? `<div class="sec">handoff</div><div class="note">→ ${esc(c.successor)}</div>` : ""}
+      ${c && c.manifest ? `<div class="sec">manifest</div><div class="note">${esc(c.manifest)}</div>` : ""}
+      ${!c ? `<div class="note">No <code>~/.agenthop/swarm/control/${esc(b.launchId)}.json</code> yet — showing the local allocation window only. Lifecycle state appears here once the phase-2 dispatcher writes it.</div>` : ""}
+    `;
+  }
+
+  // ---------------------------------------------------------------- helpers
+  function el(tag, attrs) {
+    const n = document.createElementNS(SVG_NS, tag);
+    for (const k in attrs) n.setAttribute(k, attrs[k]);
+    return n;
+  }
+  function curve(a, b) {
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2 - 40;
+    return `M${a.x},${a.y} Q${mx},${my} ${b.x},${b.y}`;
+  }
+  function initials(tool) { return (tool || "?").slice(0, 2).toUpperCase(); }
+  function clip(s, n) { s = String(s ?? ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+  function dur(sec) {
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    if (h > 0) return h + "h " + m + "m";
+    if (m > 0) return m + "m " + s + "s";
+    return s + "s";
+  }
+  function ago(ms) {
+    if (ms == null) return "—";
+    const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    return s < 60 ? s + "s ago" : Math.floor(s / 60) + "m " + (s % 60) + "s ago";
+  }
+  function staleLabel(d) {
+    const t = ago(d.statusAt);
+    return d.via === "relay" && Date.now() - d.statusAt > 60000 ? t + " (stale)" : t;
+  }
+  function countdown(epochSec) {
+    if (epochSec == null) return { text: "—", cls: "" };
+    const left = Math.round(epochSec - Date.now() / 1000);
+    if (left <= 0) return { text: "expired " + dur(-left) + " ago", cls: "dead" };
+    return { text: dur(left) + " left", cls: left < 300 ? "warn" : "" };
+  }
+
+  // ---------------------------------------------------------------- header
+  function renderHeader() {
+    const s = state;
+    const byStatus = {};
+    for (const n of s.nodes) byStatus[n.status ?? "unknown"] = (byStatus[n.status ?? "unknown"] ?? 0) + 1;
+    const relayN = s.nodes.filter((n) => n.via === "relay").length;
+    const live = s.boxes.filter((b) => b.deadlineEpoch && b.deadlineEpoch * 1000 > Date.now()).length;
+    $("stats").innerHTML =
+      `<span><b>${s.nodes.length}</b> sessions</span>` +
+      `<span><b>${relayN}</b> remote</span>` +
+      `<span><b>${s.boxes.length}</b> boxes</span>` +
+      `<span><b>${live}</b> live boxes</span>` +
+      `<span>${Object.entries(byStatus).map(([k, v]) => `<b style="color:${STATUS_COLOR[k]}">${v}</b> ${esc(k)}`).join(", ")}</span>` +
+      `<span>snap ${ago(s.generatedAt)}</span>`;
+    $("stale-info").textContent = `remote presence lags up to ${s.relayStaleMs / 1000}s`;
+    for (const c of document.querySelectorAll(".chip")) {
+      c.classList.toggle("on", filters.has(c.dataset.f));
+    }
+  }
+
+  // ---------------------------------------------------------------- events
+  function wireFilters() {
+    const defs = [["working", "working"], ["idle", "idle"], ["blocked", "blocked"], ["relay", "remote"], ["box", "boxes"]];
+    const box = $("filters");
+    for (const [k, label] of defs) {
+      const b = document.createElement("button");
+      b.className = "chip"; b.dataset.f = k; b.textContent = label;
+      b.onclick = () => { filters.has(k) ? filters.delete(k) : filters.add(k); render(); renderHeader(); };
+      box.appendChild(b);
+    }
+  }
+
+  const svg = $("svg");
+  let drag = null;
+  svg.addEventListener("mousedown", (e) => {
+    if (e.target.closest(".node")) return;
+    drag = { x: e.clientX - view.x, y: e.clientY - view.y };
+    svg.classList.add("grabbing");
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!drag) return;
+    view.x = e.clientX - drag.x; view.y = e.clientY - drag.y; draw();
+  });
+  window.addEventListener("mouseup", () => { drag = null; svg.classList.remove("grabbing"); });
+  svg.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const k2 = Math.min(2.6, Math.max(0.3, view.k * (e.deltaY < 0 ? 1.1 : 0.9)));
+    view.x = mx - ((mx - view.x) / view.k) * k2;
+    view.y = my - ((my - view.y) / view.k) * k2;
+    view.k = k2; draw();
+  }, { passive: false });
+  svg.addEventListener("click", () => { if (sel) { sel = null; render(); } });
+
+  $("search").addEventListener("input", (e) => { query = e.target.value.trim().toLowerCase(); render(); });
+
+  // ---------------------------------------------------------------- poll + local clock tick
+  async function tick() {
+    try {
+      const r = await fetch("/state.json", { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      state = await r.json();
+      render(); renderHeader();
+    } catch (e) {
+      $("stats").innerHTML = `<span class="offline">exporter unreachable: ${esc(e.message)}</span>`;
+    }
+  }
+
+  wireFilters();
+  tick();
+  setInterval(tick, 2000);
+  // Re-render local clocks (countdown, ago) every second without a refetch.
+  setInterval(() => {
+    if (!state) return;
+    for (const it of (model?.items ?? [])) {
+      if (it.kind !== "box") continue;
+      const t = countdown(it.data.deadlineEpoch);
+      const node = $("view").querySelector(`[transform="translate(${it.x},${it.y})"] .cd`);
+      if (node) { node.textContent = t.text; node.setAttribute("class", "cd " + (t.cls ?? "")); }
+    }
+    renderHeader();
+    if (sel) renderDrawer();
+  }, 1000);
+})();
+</script>
 </body>
 </html>
