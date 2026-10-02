@@ -267,62 +267,6 @@ export function taskCost(rec: TaskRecord): { inputTokens: number; outputTokens: 
 // ---------------------------------------------------------------------------------------------
 // Self-check: run with `tsx src/tasklog.ts`
 // ---------------------------------------------------------------------------------------------
-if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1]))) {
-  const assert = (name: string, cond: boolean) => {
-    if (!cond) throw new Error(`tasklog selftest FAILED: ${name}`);
-    console.log(`ok  ${name}`);
-  };
-  const A: TaskResult = { launchId: "rw-a", state: "done", at: 1 };
-  const B: TaskResult = { launchId: "rw-b", state: "done", at: 2 };
-
-  assert("nobody reported -> PENDING", deriveState(["rw-a", "rw-b"], []) === "PENDING");
-  assert("one of two -> RUNNING", deriveState(["rw-a", "rw-b"], [A]) === "RUNNING");
-  assert("all reported -> DONE", deriveState(["rw-a", "rw-b"], [A, B]) === "DONE");
-  assert("one failure -> FAILED even with the rest done", deriveState(["rw-a", "rw-b"], [A, { ...B, state: "error" }]) === "FAILED");
-  assert("a late failure flips a would-be DONE", deriveState(["rw-a"], [{ launchId: "rw-a", state: "failed", at: 3 }]) === "FAILED");
-  assert("cancel outranks inference", deriveState(["rw-a"], [], "CANCELLED") === "CANCELLED");
-  assert("no assignees does not crash", deriveState([], []) === "PENDING");
-
-  assert("a safe id passes", isSafeTaskId("t-abc-123"));
-  assert("a traversal id is refused", !isSafeTaskId("../etc/passwd") && !isSafeTaskId("a/b") && !isSafeTaskId(".."));
-  assert("a minted id is safe and sortable-prefixed", isSafeTaskId(mintTaskId(1000)) && mintTaskId(1000).startsWith("t-"));
-
-  const cost = taskCost({ ...({} as TaskRecord), results: [{ ...A, usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.2 } }, B] });
-  assert("cost sums what reported and ignores what did not", cost?.inputTokens === 10 && cost?.costUsd === 0.2);
-  assert("no usage anywhere -> undefined, not zero", taskCost({ ...({} as TaskRecord), results: [A] }) === undefined);
-
-  assert("a malformed record is refused", parseTask("{ not json") === undefined);
-  assert("a record with no taskId is refused", parseTask('{"dispatchedBy":"x","assignees":[],"results":[],"createdAt":1,"updatedAt":1}') === undefined);
-  console.log("tasklog selftests passed");
-}
-
-// Round-trip against a real temp dir (run with `tsx src/tasklog.ts`).
-if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1]))) {
-  const { mkdtempSync, rmSync } = await import("node:fs");
-  const { tmpdir } = await import("node:os");
-  const rt = (name: string, cond: boolean) => {
-    if (!cond) throw new Error(`tasklog roundtrip FAILED: ${name}`);
-    console.log(`ok  ${name}`);
-  };
-  const home = mkdtempSync(path.join(tmpdir(), "ah-tasklog-"));
-  try {
-    const t = createTask(home, { dispatchedBy: "disp", assignees: ["rw-a", "rw-b"], goal: "review", role: "critic" });
-    rt("a task is created", !!t && t.state === "PENDING" && t.assignees.length === 2);
-    rt("it reads back", readTask(home, t!.taskId)?.goal === "review");
-    rt("role is carried", readTask(home, t!.taskId)?.role === "critic");
-    const r1 = applyResult(home, t!.taskId, { launchId: "rw-a", state: "done", sha: "abc123" });
-    rt("one of two -> RUNNING with the sha recorded", r1?.state === "RUNNING" && r1.results[0]?.sha === "abc123");
-    const r2 = applyResult(home, t!.taskId, { launchId: "rw-b", state: "done", usage: { costUsd: 0.5, inputTokens: 100 } });
-    rt("both done -> DONE and closed", r2?.state === "DONE" && r2.closed === true);
-    rt("cost rolls up", taskCost(r2!)?.costUsd === 0.5);
-    const late = applyResult(home, t!.taskId, { launchId: "rw-a", state: "failed" });
-    rt("a closed task does not reopen", late?.state === "DONE");
-    const t2 = createTask(home, { dispatchedBy: "disp", assignees: ["rw-c"] });
-    rt("cancel wins instantly", cancelTask(home, t2!.taskId)?.state === "CANCELLED");
-    rt("both tasks are listed, newest first", readTasks(home).length === 2);
-    rt("an unknown task reads as undefined", readTask(home, "t-nope") === undefined);
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
-  console.log("tasklog roundtrip passed");
-}
+// Assertions live in test/tasklog.test.ts, not here: an in-module self-test behind a process.argv guard
+// still fires when this file is bundled into a single-file binary, printing to stdout on import. Same
+// reason as msglog.ts — no top-level side effects in a module the bus imports.
