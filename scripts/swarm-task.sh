@@ -88,9 +88,15 @@ ENV
   # only a tmux session persists (proven live). Install it (update first); fail setup if it is still missing.
   command -v tmux >/dev/null 2>&1 || (apt-get update -qq >/dev/null 2>&1; apt-get install -y tmux >/dev/null 2>&1)
   command -v tmux >/dev/null 2>&1 || { echo 'tmux required but unavailable' >&2; exit 3; }
+  # Fresh-only (Codex #2): stop any PRIOR writers (supervisor + worker) BEFORE removing the checkout / runtime dir, so
+  # we never rm /root/work while an old supervisor is still publishing from it, nor reuse /root/.swarm-rt while a
+  # worker is writing checkpoint.req/ack. On a fresh box these are no-ops; on a REUSED box they prevent the race.
+  tmux kill-session -t sup 2>/dev/null || true
+  tmux kill-session -t swarm 2>/dev/null || true
   rm -rf /root/work
   git clone -q git@github.com:$WORK_REPO.git /root/work
   git -C /root/work config user.email swarm@box; git -C /root/work config user.name swarm-box
+  rm -rf /root/.swarm-rt   # fresh runtime dir: a leftover generation's checkpoint.req/ack must not be re-read (Codex #2)
   mkdir -p /root/work/out /root/.swarm-rt && chmod 700 /root/.swarm-rt
   chmod 600 /root/.swarm/sup-env   # scp'd from the dispatcher (built locally; no remote heredoc expansion)
   cat > /root/.swarm/start-sup.sh <<SH
@@ -129,6 +135,24 @@ else
   exit 2
 fi
 
-echo "READY: $LID is publishing to $WORK_REPO branch $BRANCH."
+# 5. verify a FIRST CONFIRMED publish on the WORK branch before declaring READY (Codex #7). "tmux session exists" only
+#    proves the processes STARTED, not that the supervisor actually pushed a snapshot — a bad deploy key / branch /
+#    network would leave it silently producing nothing. Poll the remote branch tip via the SAME deploy key (held
+#    locally on the dispatcher), up to ~60s, so a success exit reflects real published work, not just a live process.
+echo "== verify first confirmed publish on $BRANCH (up to 60s) =="
+CONFIRMED=""
+for _ in $(seq 1 30); do
+  SHA="$(GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new" \
+         git ls-remote "git@github.com:$WORK_REPO.git" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1{print $1}')"
+  [ -n "$SHA" ] && { CONFIRMED="$SHA"; break; }
+  sleep 2
+done
+if [ -z "$CONFIRMED" ]; then
+  echo "WARN: $LID started but produced NO confirmed publish on $BRANCH within 60s — supervisor may be failing to push." >&2
+  echo "  check: ssh ... railway.new 'cat /root/.swarm/sup.log'" >&2
+  exit 5
+fi
+
+echo "READY: $LID confirmed publishing to $WORK_REPO branch $BRANCH (first sha ${CONFIRMED:0:12})."
 echo "Observe:  SWARM_WORK_REPO=git@github.com:$WORK_REPO.git npx tsx $HERE/scripts/swarm-dispatch.ts --observe-once git@github.com:$WORK_REPO.git $BRANCH $LID $GEN"
 echo "Box logs: ssh ... railway.new 'cat /root/.swarm/sup.log'   (supervisor)   tmux capture-pane -t swarm -p   (worker)"
