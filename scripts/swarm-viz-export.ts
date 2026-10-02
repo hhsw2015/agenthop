@@ -163,6 +163,11 @@ export type Snapshot = {
   departures: VizDeparture[];
   /** Tasks. Today these are the lifecycle mirror, one per launchId; richer fan-out lands in tasks/*.json. */
   tasks: VizTask[];
+  /** The raw journal lines for today, so the page can show a per-pair history without a second endpoint.
+   *  Metadata only; `text` is present only when the bus was explicitly told to log payloads. */
+  events: MsgLogEntry[];
+  /** True when the journal carried payloads — lets the page say why bodies are missing. */
+  payloadLogged: boolean;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -434,6 +439,8 @@ export function buildSnapshot(
     msgLogCount: msgLog.length,
     departures,
     tasks,
+    events: msgLog,
+    payloadLogged: msgLog.some((e) => typeof e.text === "string" && e.text.length > 0),
   };
 }
 

@@ -137,6 +137,11 @@
   /* edges */
   .edge { fill: none; stroke: var(--relay); stroke-width: 1.8; opacity: .55; marker-end: url(#arrow); }
   .edge.hi { opacity: 1; stroke-width: 2.4; }
+  /* comms arcs: drawn on selection, weighted by volume, faded by recency */
+  .edge.comms { stroke: var(--working); opacity: .8; marker-end: url(#arrowblue); }
+  /* invisible wide companion so a thin arc is still clickable */
+  .edge-hit { fill: none; stroke: transparent; stroke-width: 16; cursor: pointer; }
+  .edge-hit:hover + .edge.comms, .edge.comms:hover { stroke-width: 4 !important; }
 
   /* ---------- drawer ---------- */
   aside {
@@ -227,6 +232,9 @@
     <svg id="svg"><defs>
       <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
         <path d="M0,0 L10,5 L0,10 z" fill="#c58fff" />
+      </marker>
+      <marker id="arrowblue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#5aa9ff" />
       </marker>
     </defs>
     <g id="view"></g></svg>
@@ -387,10 +395,47 @@
       view.appendChild(el("path", { class: "edge", d: curve(e.a, e.b) }));
     }
 
+    // Comms focus: selecting a node draws an arc to every peer it has exchanged messages with, so
+    // "who has this node talked to" is one click. Arcs are weighted by volume and faded by recency.
+    const focus = sel ? commsFocus() : null;
+    const connected = focus ? new Set(focus.map((f) => f.otherKey)) : null;
+    if (focus) {
+      const byId = new Map(model.items.map((it) => [it.id, it]));
+      const center = byId.get(sel);
+      if (center) {
+        for (const f of focus) {
+          const other = byId.get(f.otherKey);
+          if (!other) continue;
+          // Stronger for more messages; opaquer for more recent activity.
+          const w = Math.min(3.4, 1.1 + Math.log2(1 + f.count) * 0.9);
+          const fresh = Math.max(0.25, 1 - (Date.now() - f.lastTs) / (10 * 60 * 1000));
+          const arc = el("path", {
+            class: "edge comms",
+            d: curve(center, other),
+            "stroke-width": w.toFixed(2),
+            "stroke-opacity": (0.35 + 0.55 * fresh).toFixed(2),
+          });
+          // Clickable: a wide transparent companion catches the pointer on a thin stroke.
+          const hit = el("path", { class: "edge-hit", d: curve(center, other) });
+          hit.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            showPairHistory(sel, f.otherKey);
+          });
+          const ttl = el("title", {});
+          ttl.textContent = `${f.count} message(s) with ${counterpartName(f.otherKey)}\nclick for history`;
+          hit.appendChild(ttl);
+          view.appendChild(arc);
+          view.appendChild(hit);
+        }
+      }
+    }
+
     for (const it of model.items) {
       const ok = matches(it);
       const node = it.kind === "box" ? renderBox(it) : renderPeer(it);
       if (!ok) node.classList.add("dim");
+      // In comms focus, fade everyone the selected node has NOT talked to — the subgraph is the point.
+      else if (connected && it.id !== sel && !connected.has(it.id)) node.classList.add("dim");
       if (sel === it.id) node.classList.add("sel");
       node.setAttribute("transform", `translate(${it.x},${it.y})`);
       node.addEventListener("click", (ev) => {
@@ -484,8 +529,79 @@
     $("view").setAttribute("transform", `translate(${view.x},${view.y}) scale(${view.k})`);
   }
 
+  // ---------------------------------------------------------------- comms focus
+  /**
+   * Resolve the selected node against the journal's flow endpoints. The journal carries whatever id the
+   * bus recorded (a bus id, a stable id, or the short form), so match loosely: exact id, exact stableId,
+   * title, or a prefix of any of them. Returns one entry per counterpart, folded across pairs.
+   */
+  /** Which peers a given peer exchanged messages with, folded across pairs. Shared by the map arcs and
+   *  the drawer so the two can never disagree. Returns [] when the journal is absent. */
+  function flowsFor(d) {
+    if (!d) return [];
+    const keys = new Set([d.id, d.stableId, d.title].filter(Boolean));
+    const isMe = (v) => !!v && [...keys].some((k) => k === v || String(v).startsWith(String(k)) || String(k).startsWith(String(v)));
+    const resolveItem = (v) => {
+      if (!v) return null;
+      const hit = (model?.items ?? []).find((it) => {
+        if (it.kind !== "peer") return false;
+        const p = it.data;
+        return [p.id, p.stableId, p.title].some((x) => x && (x === v || String(x).startsWith(String(v)) || String(v).startsWith(String(x))));
+      });
+      return hit?.id ?? null;
+    };
+    const byOther = new Map();
+    for (const f of state.flows ?? []) {
+      const fromMe = isMe(f.from);
+      const toMe = isMe(f.to);
+      if (!fromMe && !toMe) continue;
+      const otherKey = fromMe ? resolveItem(f.to) : resolveItem(f.from);
+      if (!otherKey || otherKey === d.id) continue;
+      const prev = byOther.get(otherKey);
+      if (prev) { prev.count += f.count; prev.lastTs = Math.max(prev.lastTs, f.lastTs); }
+      else byOther.set(otherKey, { otherKey, count: f.count, lastTs: f.lastTs });
+    }
+    return [...byOther.values()];
+  }
+
+  /** Display name for a model item id, so the drawer names the counterpart instead of a hash. */
+  function counterpartName(id) {
+    const it = (model?.items ?? []).find((x) => x.id === id);
+    return it ? shortName(it.data) : short(id);
+  }
+
+  function commsFocus() {
+    if (!model || !sel) return null;
+    const me = model.items.find((it) => it.id === sel);
+    if (!me || me.kind !== "peer") return null; // boxes do not exchange messages
+    const mine = flowsFor(me.data);
+    return mine.length ? mine : null;
+  }
   // ---------------------------------------------------------------- side panels (tasks / flows / departures)
   const short = (id) => String(id ?? "").slice(0, 10);
+
+  // -------- per-pair message history (clicked from an arc) --------
+  let pair = null; // { a, b } model item ids
+
+  function showPairHistory(a, b) {
+    pair = { a, b };
+    sel = null;
+    renderDrawer();
+  }
+
+  /** Journal lines between two peers, newest first. Metadata only unless the bus logged payloads. */
+  function pairEvents(a, b) {
+    const items = model?.items ?? [];
+    const da = items.find((i) => i.id === a)?.data;
+    const db = items.find((i) => i.id === b)?.data;
+    if (!da || !db) return [];
+    const keysOf = (d) => new Set([d.id, d.stableId, d.title].filter(Boolean));
+    const match = (keys) => (v) => !!v && [...keys].some((k) => k === v || String(v).startsWith(String(k)) || String(k).startsWith(String(v)));
+    const ka = match(keysOf(da)), kb = match(keysOf(db));
+    return (state.events ?? [])
+      .filter((e) => (ka(e.from) && kb(e.to)) || (kb(e.from) && ka(e.to)))
+      .sort((x, y) => y.ts - x.ts);
+  }
 
   function renderPanels() {
     const s = state;
@@ -529,7 +645,20 @@
   // ---------------------------------------------------------------- drawer
   function renderDrawer() {
     const aside = $("drawer");
-    if (!sel || !model) { aside.classList.remove("open"); aside.innerHTML = ""; return; }
+    if (!model) { aside.classList.remove("open"); aside.innerHTML = ""; return; }
+    // Pair-history view takes precedence: it was opened from an arc, not a node.
+    if (pair) {
+      const a = model.items.find((x) => x.id === pair.a);
+      const b = model.items.find((x) => x.id === pair.b);
+      if (a && b) {
+        aside.classList.add("open");
+        aside.innerHTML = pairDrawer(a.data, b.data);
+        aside.querySelector(".close").onclick = () => { pair = null; renderDrawer(); };
+        return;
+      }
+      pair = null;
+    }
+    if (!sel) { aside.classList.remove("open"); aside.innerHTML = ""; return; }
     const it = model.items.find((x) => x.id === sel);
     if (!it) { aside.classList.remove("open"); return; }
     aside.classList.add("open");
@@ -538,11 +667,39 @@
     aside.querySelector(".close").onclick = () => { sel = null; render(); };
   }
 
+  /** The conversation history between two peers, from the journal. Newest first. */
+  function pairDrawer(a, b) {
+    const evs = pairEvents(pair.a, pair.b);
+    const rows = evs.map((e) => {
+      const dir = e.direction === "out" ? "\u2197" : "\u2199";
+      const color = e.direction === "out" ? "var(--working)" : "var(--idle)";
+      return `<div class="tl-item muted">
+        <div><span style="color:${color}">${dir}</span> ${esc(e.direction === "out" ? "sent" : "received")}${e.kind ? ` <span class="state-chip">${esc(e.kind)}</span>` : ""}</div>
+        <div class="when">${new Date(e.ts).toLocaleTimeString()}${e.size ? ` \u00b7 ${e.size} B` : ""}${e.via ? ` \u00b7 ${esc(e.via)}` : ""}</div>
+        ${e.text ? `<div class="note" style="margin-top:6px">${esc(e.text)}</div>` : ""}
+      </div>`;
+    }).join("");
+    return `
+      <div class="close">x</div>
+      <h3>${esc(shortName(a))} &harr; ${esc(shortName(b))}</h3>
+      <div class="kind" style="margin-top:-10px">${esc(counterpartName(pair.b))} &middot; ${esc(a.machine ?? "")}</div>
+      <div class="kind">message history \u00b7 ${evs.length} event(s)</div>
+      ${evs.length
+        ? `<div class="tl">${rows}</div>`
+        : `<div class="empty-note">No messages recorded between these two. The bus keeps no message history today, so nothing is shown rather than guessed.</div>`}
+      ${state.payloadLogged
+        ? ""
+        : `<div class="note" style="margin-top:14px">Metadata only (time, direction, size). Message bodies are not logged by the bus, so no text is shown here — this is not a missing feature on the page.</div>`}
+    `;
+  }
+
   function peerDrawer(d) {
     const status = d.status ?? "unknown";
     const cls = d.statusAt ? staleLabel(d) : "";
     // This peer's own traffic, both directions, from the journal (empty until the bus writes it).
-    const mine = (state.flows ?? []).filter((f) => f.from === d.id || f.to === d.id || f.from === d.stableId || f.to === d.stableId);
+    // Reuse the SAME loose endpoint matching as the map arcs — the journal may key on a short id while
+    // the roster carries the full one, and a strict compare made the drawer contradict the map.
+    const mine = flowsFor(d).map((f) => ({ from: short(f.otherKey), to: "you", count: f.count, lastTs: f.lastTs, other: f.otherKey }));
     const talking = d.lastMessageAt && Date.now() - d.lastMessageAt < 30000;
     return `
       <div class="close">x</div>
@@ -562,7 +719,7 @@
       </dl>
       ${d.statusText ? `<div class="note">${esc(d.statusText)}</div>` : ""}
       ${mine.length
-        ? `<div class="sec">message flow</div>${mine.map((f) => `<div class="flowrow"><span class="who">${esc(short(f.from))}</span><span class="arrow">&rarr;</span><span class="who">${esc(short(f.to))}</span><span class="v">${f.count}x &middot; ${ago(f.lastTs)}</span></div>`).join("")}`
+        ? `<div class="sec">message flow</div>${mine.map((f) => `<div class="flowrow"><span class="who">${esc(counterpartName(f.other))}</span><span class="v">${f.count}x &middot; ${ago(f.lastTs)}</span></div>`).join("")}`
         : `<div class="sec">message flow</div><div class="empty-note">No traffic recorded. The bus keeps no message history today, so nothing is shown rather than guessed.</div>`}
       ${d.via === "relay" ? `<div class="note" style="margin-top:12px">Remote peer: presence is announced every 60s, so this status can lag up to a minute. Read "changed", not the poll rate.</div>` : ""}
     `;
