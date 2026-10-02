@@ -292,7 +292,13 @@ export function readLocalAllocs(): Map<string, number> {
 /** Fold journal lines into directed per-pair flows, newest activity last. Pure. */
 export function foldFlows(entries: MsgLogEntry[], limit = 60): VizFlow[] {
   const byPair = new Map<string, VizFlow>();
+  // Both ends write a line for the same delivery when they share a home (sender "out", receiver "in"), so
+  // fold each delivery once or every count and byte total reads 2x.
+  const seen = new Set<string>();
   for (const e of entries) {
+    const dk = `${e.from}|${e.to}|${e.size ?? ""}|${Math.round((e.ts ?? 0) / 500)}`;
+    if (seen.has(dk)) continue;
+    seen.add(dk);
     const via = e.via ?? "local";
     const key = `${e.from}\u0000${e.to}`;
     const prev = byPair.get(key);
@@ -492,6 +498,20 @@ function selftest(): void {
   t("foldFlows counts repeats and sums bytes", flows.find((f) => f.from === "a" && f.to === "b")!.count === 2 && flows.find((f) => f.from === "a" && f.to === "b")!.bytes === 15);
   t("foldFlows orders by last activity", flows[0]!.from === "b" && flows[0]!.to === "a");
   t("a direction is preserved (a->b is not the same flow as b->a)", flows.every((f) => f.from !== f.to));
+
+  // A shared-home exchange is logged twice (sender "out", receiver "in"); folding must count it once.
+  const dup = foldFlows([
+    { ts: 500, from: "a", to: "b", direction: "out", size: 10, via: "local" },
+    { ts: 520, from: "a", to: "b", direction: "in", size: 10, via: "local" },
+  ]);
+  t("a double-logged delivery folds to ONE flow", dup.length === 1);
+  t("its count is 1, not 2", dup[0]!.count === 1);
+  t("its bytes are not doubled", dup[0]!.bytes === 10);
+  const far = foldFlows([
+    { ts: 500, from: "a", to: "b", direction: "out", size: 10, via: "local" },
+    { ts: 9000, from: "a", to: "b", direction: "out", size: 10, via: "local" },
+  ]);
+  t("two genuinely separate sends are NOT merged", far[0]!.count === 2);
 
   // Tasks: files win over the control mirror; a covered assignee is not duplicated.
   const files: TaskFile[] = [{ taskId: "t1", assignees: ["rw-a"], state: "RUNNING", results: [{ launchId: "rw-a", state: "working" }] }];

@@ -148,6 +148,32 @@
   @keyframes talkblip { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
   .edge-hit:hover + .edge.comms, .edge.comms:hover { stroke-width: 4 !important; }
 
+  /* ---------- event ticker: one chronological strip, newest at the top ---------- */
+  .ticker { position: absolute; right: 20px; top: 16px; width: 300px; z-index: 3;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    backdrop-filter: blur(14px); display: flex; flex-direction: column;
+    max-height: calc(100% - 300px); }
+  .ticker.collapsed .tbody { display: none; }
+  .ttitle { display: flex; align-items: center; gap: 10px; padding: 10px 13px;
+    border-bottom: 1px solid var(--line); font-size: 10px; font-weight: 650; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--faint); }
+  .ttitle .tsub { text-transform: none; letter-spacing: 0; color: var(--ink-dim); font-weight: 500;
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tbody { padding: 6px 4px 10px; overflow-y: auto; }
+  .ev { display: grid; grid-template-columns: 14px 40px 1fr; gap: 7px; align-items: baseline;
+    padding: 5px 9px; border-radius: 7px; font-size: 11px; }
+  .ev:hover { background: rgba(255,255,255,.04); }
+  .ev .g { text-align: center; font-size: 11px; }
+  .ev .t { color: var(--faint); font-variant-numeric: tabular-nums; font-size: 10px; }
+  .ev .d { color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ev .d b { color: var(--ink); font-weight: 600; }
+  .ev.kind-msg .g { color: var(--working); }
+  .ev.kind-task .g { color: var(--warn); }
+  .ev.kind-lifecycle .g { color: var(--relay); }
+  .ev.kind-gone .g { color: var(--blocked); }
+  .ev.warn .d { color: var(--warn); }
+  .ev.bad .d { color: var(--blocked); }
+
   /* ---------- task river: time runs left -> right, one band per task ---------- */
   .river { position: absolute; left: 20px; right: 20px; bottom: 8px; background: var(--panel);
     border: 1px solid var(--line); border-radius: 12px; backdrop-filter: blur(14px); z-index: 4;
@@ -298,6 +324,11 @@
     </defs>
     <g id="view"></g></svg>
     <div class="panels" id="panels"></div>
+    <div class="ticker" id="ticker">
+      <div class="ttitle"><span>Events</span><span class="tsub" id="tsub"></span>
+        <button class="rcollapse" id="tcollapse" title="Collapse / expand">▾</button></div>
+      <div class="tbody" id="tbody"></div>
+    </div>
     <div class="legend">
       <span><i style="background:var(--working)"></i>working</span>
       <span><i style="background:var(--idle)"></i>idle</span>
@@ -540,6 +571,7 @@
     draw();
     renderDrawer();
     renderPanels();
+    renderTicker();
     const reserved = renderRiver();
     // Fit LAST, once the river has claimed its space, and again whenever that space changes. The first
     // render used to fit before the river existed and then never re-fit, so the graph stayed oversized.
@@ -705,6 +737,94 @@
   }
   // ---------------------------------------------------------------- side panels (tasks / flows / departures)
   const short = (id) => String(id ?? "").slice(0, 10);
+
+  // ---------------------------------------------------------------- event ticker
+  // One chronological strip merging every event source we have, so CAUSALITY is visible: a dispatch, then
+  // the work, then the result, then the handoff. The individual panels show state; this shows sequence.
+  //
+  // Client-side only: the exporter ships the raw journal lines and the task list, and we diff task states
+  // between polls to synthesize the lifecycle events. No new endpoint, no new durable store.
+  const seenTaskStates = new Map(); // taskId -> last state we announced
+  const seenNodes = new Set();      // peer ids we have already shown as "joined"
+  let joinedAnnounced = false;
+
+  /** Normalize a timestamp that may be epoch seconds or ms. Task files use seconds, the journal ms. */
+  function toMs(v) {
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return null;
+    return v < 1e12 ? Math.round(v * 1000) : Math.round(v);
+  }
+
+  /** Build the event list from the current snapshot. Pure w.r.t. inputs; mutates only the seen* maps. */
+  function collectEvents(s) {
+    const out = [];
+
+    // 1. Messages (newest window the journal holds), de-duplicated.
+    // A local exchange is logged TWICE — the sender writes "out" and the receiver writes "in" for the same
+    // message — so the raw journal holds two lines per delivery. Collapse them, or the ticker doubles every
+    // row and the per-pair counters read 2x.
+    const seenMsg = new Set();
+    for (const e of s.events ?? []) {
+      const ts = toMs(e.ts);
+      if (ts === null) continue;
+      const key = `${e.from}|${e.to}|${e.size ?? ""}|${Math.round(ts / 500)}`; // 500ms bucket absorbs clock skew
+      if (seenMsg.has(key)) continue;
+      seenMsg.add(key);
+      out.push({
+        ts, kind: "msg", glyph: e.direction === "out" ? "\u2197" : "\u2199",
+        html: `${esc(short(e.from))} \u2192 ${esc(short(e.to))}${e.size ? ` <b>${e.size}B</b>` : ""}`,
+        raw: e,
+      });
+    }
+
+    // 2. Task lifecycle. A state change between polls is the event; the first sighting is a "dispatched".
+    for (const t of s.tasks ?? []) {
+      const ts = toMs(t.updatedAt ?? t.createdAt);
+      const prev = seenTaskStates.get(t.taskId);
+      if (prev === undefined) {
+        out.push({ ts: toMs(t.createdAt) ?? Date.now(), kind: "task", glyph: "\u25c6",
+          html: `task <b>${esc(t.taskId)}</b> \u2192 ${esc(t.state)}`, raw: t });
+      } else if (prev !== t.state) {
+        out.push({ ts: ts ?? Date.now(), kind: "task", glyph: "\u25c6",
+          html: `task <b>${esc(t.taskId)}</b> ${esc(prev)} \u2192 ${esc(t.state)}`,
+          cls: isFailure2(t.state) ? "bad" : "", raw: t });
+      }
+      seenTaskStates.set(t.taskId, t.state);
+    }
+
+    // 3. Departures (a peer that was here and is gone).
+    for (const d of s.departures ?? []) {
+      out.push({ ts: toMs(d.lastSeen) ?? Date.now(), kind: "gone", glyph: "\u2715",
+        html: `<b>${esc(d.title)}</b> left`, cls: "warn", raw: d });
+    }
+
+    // 4. A one-shot "joined" line per peer, so the strip has a beginning on a fresh page load.
+    if (!joinedAnnounced) {
+      for (const n of s.nodes ?? []) {
+        if (!seenNodes.has(n.id)) { seenNodes.add(n.id); out.push({ ts: s.generatedAt, kind: "lifecycle", glyph: "\u25cb", html: `<b>${esc(shortName(n))}</b> on ${esc(n.machine)}`, raw: n }); }
+      }
+      if ((s.nodes ?? []).length) joinedAnnounced = true;
+    }
+
+    return out.sort((a, b) => b.ts - a.ts).slice(0, 150);
+  }
+
+  function renderTicker() {
+    const s = state;
+    const evs = collectEvents(s);
+    const body = $("tbody");
+    if (!evs.length) {
+      $("tsub").textContent = "nothing yet";
+      body.innerHTML = `<div class="empty-note">No events yet. Messages appear here when the bus journal is on (<code>AGENTHOP_MSGLOG=1</code>); task and departure events appear as they happen.</div>`;
+      return;
+    }
+    const counts = evs.reduce((m, e) => (m[e.kind] = (m[e.kind] ?? 0) + 1, m), {});
+    $("tsub").textContent = `${evs.length} shown` + (counts.msg ? ` \u00b7 ${counts.msg} msg` : "");
+    body.innerHTML = evs.map((e) => `<div class="ev kind-${e.kind} ${e.cls ?? ""}" title="${esc(new Date(e.ts).toLocaleString())}">
+      <span class="g">${e.glyph}</span>
+      <span class="t">${new Date(e.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+      <span class="d">${e.html}</span>
+    </div>`).join("");
+  }
 
   // ---------------------------------------------------------------- task river
   // Time runs left -> right. One band per task, from creation to its last update; a running task extends
@@ -1110,6 +1230,11 @@
   }
 
   wireFilters();
+  $("tcollapse").onclick = () => {
+    const t = $("ticker");
+    t.classList.toggle("collapsed");
+    $("tcollapse").textContent = t.classList.contains("collapsed") ? "\u25b8" : "\u25be";
+  };
   $("rcollapse").onclick = () => {
     const r = $("river");
     r.classList.toggle("collapsed");
