@@ -65,6 +65,10 @@ export type ControlRecord = {
   /** The expected resume SHA, PINNED at claim/reclaim for THIS handoff attempt. A later checkpoint advances `sha`
    *  but must NOT move the target a successor is being verified against (Codex). Undefined => no prior work. */
   handoffSha?: string;
+  /** The generation the SUCCESSOR publishes at, PINNED at `allocating` (= the owner generation then). A later reclaim
+   *  bumps `generation` (owner), but the already-allocated successor still publishes to swarm/<successor>-g<successorGen>,
+   *  so reconcile / await-resume must observe THAT branch, not the bumped owner generation (Codex). */
+  successorGen?: number;
   /** Lifetime base: epoch seconds of the allocation REQUEST start (not the alloc ACK — that is already late). */
   allocStart: number;
   /** Bounded lifetime budget (s) from allocStart; provider expiry if known, else conservative. */
@@ -87,6 +91,10 @@ export type ControlEvent =
   | { type: "reclaim"; owner: string; generation: number; leaseUntil: number }
   | { type: "allocating"; attempt: string; successor?: string }
   | { type: "alloc_unknown" }
+  // alloc_failed: a RELIABLE clean failure (provider refused; box definitively NOT created) — clear attempt+successor,
+  // back to CLAIMED for an immediate fresh allocate (attemptCount kept, so the cap still bounds retries). An UNKNOWN
+  // result uses alloc_unknown instead (retained, reconciled later).
+  | { type: "alloc_failed" }
   // reconcile a reclaimed in-flight allocation: its box was found DEAD (clear the attempt, allocate fresh) or ALIVE
   // (re-enter the await-resume wait reusing the SAME attempt — "alive" is NOT recovery-complete; only a real
   // `resumed` ACK with the expected generation/attempt/sha finishes the handoff).
@@ -187,11 +195,16 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       // creates is told to resume from here; a later recover_sha advancing `sha` must NOT move this attempt's target.
       // The successor launchId is pinned here too (per-attempt), so a dispatcher restart re-reads WHICH box is taking
       // over from the mirror instead of a lost in-memory side-map. resumed later re-asserts the same successor.
-      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false, handoffSha: record.sha, ...(event.successor ? { successor: event.successor } : {}) });
+      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false, handoffSha: record.sha, successorGen: record.generation, ...(event.successor ? { successor: event.successor } : {}) });
     case "alloc_unknown":
       // Allocation request sent, result unknown. Stay ALLOCATING; mark it so a reclaimer reconciles this attempt.
       if (record.state !== "ALLOCATING") return bad(`alloc_unknown only from ALLOCATING, not ${record.state}`);
       return ok({ resultUnknown: true });
+    case "alloc_failed":
+      // RELIABLE clean failure (box definitively NOT created): clear attempt/successor/successorGen back to CLAIMED so a
+      // fresh allocate runs immediately. attemptCount is KEPT (the cap still bounds retries). NOT for unknown results.
+      if (record.state !== "ALLOCATING") return bad(`alloc_failed only from ALLOCATING, not ${record.state}`);
+      return ok({ state: "CLAIMED", attempt: undefined, successor: undefined, successorGen: undefined, resultUnknown: false });
     case "reconcile_dead":
       // Reconcile found the in-flight allocation's box DEAD: clear the attempt so a fresh allocate can proceed.
       if (record.state !== "CLAIMED" || record.attempt === undefined) return bad(`reconcile_dead needs CLAIMED with an attempt, not ${record.state}`);

@@ -322,3 +322,37 @@ describe("at-cap reconciliation of a retained in-flight attempt (Codex P2)", () 
     }
   });
 });
+
+describe("successorGen pin + alloc_failed (Codex recovery protocol)", () => {
+  const toAlloc = (succ = "rw-s") => run(rec(), [
+    [{ type: "drain" }, T0 + 1],
+    [{ type: "checkpoint", sha: "c" }, T0 + 2],
+    [{ type: "claim", owner: "d", generation: 1, leaseUntil: T0 + 300 }, T0 + 3],
+    [{ type: "allocating", attempt: "a", successor: succ }, T0 + 4],
+  ]);
+
+  test("allocating pins successorGen = owner generation; a reclaim bumps generation but NOT successorGen", () => {
+    const allocating = toAlloc();
+    expect(allocating.successorGen).toBe(1);
+    expect(allocating.generation).toBe(1);
+    const un = advance(allocating, { type: "alloc_unknown" }, T0 + 5);
+    const reclaimed = advance(un.ok ? un.record : allocating, { type: "reclaim", owner: "e", generation: 2, leaseUntil: T0 + 700 }, T0 + 400);
+    // owner generation advances to 2, but the already-allocated successor still publishes at g1
+    expect(reclaimed.ok && reclaimed.record.generation === 2 && reclaimed.record.successorGen === 1).toBe(true);
+  });
+
+  test("alloc_failed: ALLOCATING -> CLAIMED, clears attempt/successor/successorGen, keeps attemptCount; rejected elsewhere", () => {
+    const allocating = toAlloc();
+    expect(allocating.attemptCount).toBe(1);
+    const failed = advance(allocating, { type: "alloc_failed" }, T0 + 5);
+    expect(failed.ok).toBe(true);
+    if (failed.ok) {
+      expect(failed.record.state).toBe("CLAIMED");
+      expect(failed.record.attempt).toBeUndefined();
+      expect(failed.record.successor).toBeUndefined();
+      expect(failed.record.successorGen).toBeUndefined();
+      expect(failed.record.attemptCount).toBe(1); // cap still bounds retries
+    }
+    expect(advance(rec({ state: "CLAIMED" }), { type: "alloc_failed" }, T0 + 6).ok).toBe(false); // not from CLAIMED
+  });
+});
