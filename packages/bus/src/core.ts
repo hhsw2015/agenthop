@@ -8,6 +8,7 @@ import { resolvePeer, type UnifiedPeer } from "./resolve.js";
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
+import { ackInbox, claimInbox, releaseInbox, writeInbox } from "./inbox.js";
 
 export { resolvePeer, type UnifiedPeer } from "./resolve.js";
 
@@ -59,7 +60,12 @@ export function codexDeliveryThread(
 export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const self = selfInfo();
   const home = options.home ?? homedir(); // resolved early: used by handleInbound (below) + status watch (later)
-  const queue: BusMessage[] = [];
+  // Durable inbox: a message that cannot be pushed to the host's live UI yet (channel not ready) is persisted to disk
+  // and retried, instead of sitting in a volatile array only agenthop_recv drains. Keys: the stable identity (survives
+  // an MCP-subprocess restart) plus the per-run id (used before stableId was learned).
+  const inboxKey = (): string => self.stableId ?? self.id;
+  const inboxKeys = (): string[] => (self.stableId && self.stableId !== self.id ? [self.stableId, self.id] : [self.id]);
+  let flushing = false;
   // Work-status is per SESSION IDENTITY, not per MCP-server process: one Codex daemon-backed server can
   // adopt several thread identities over its life (see learnStableId), and each must keep its own status
   // and its own monotonic seq — otherwise thread A's seq would gate thread B's reports.
@@ -79,22 +85,40 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const codexDaemon: CodexDaemon | undefined =
     !process.env.CLAUDE_CODE_MESSAGING_SOCKET && self.tool === "codex" ? startCodexDaemon() : undefined;
 
-  // A message has arrived for us. Try the host's native inbox first (surfaces in the live TUI with
-  // no hook and no poll); only if there is none do we keep it for agenthop_recv.
+  // Re-attempt delivery of durably-queued messages whenever the native channel may have become ready (e.g. a Codex
+  // session that just took its first turn now has a rollout for `codex queue`). Claim/ack/release so the retry timer
+  // and an explicit recv never double-deliver; stop at the first failure (channel still not ready) and retry later.
+  const flushInbox = async (): Promise<void> => {
+    if (flushing) return;
+    flushing = true;
+    try {
+      const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread());
+      for (const c of claimInbox(home, inboxKeys(), String(process.pid))) {
+        const ok = await pushToHost(c.msg.fromLabel, c.msg.text, { codexThread });
+        if (ok) ackInbox(c.file);
+        else { releaseInbox(c.file); break; }
+      }
+    } finally {
+      flushing = false;
+    }
+  };
+
+  // A message has arrived for us. Try the host's native inbox first (surfaces in the live TUI with no hook and no
+  // poll); if the channel is not ready, persist it to the DURABLE inbox so the retry below delivers it later.
   const handleInbound = (from: string, text: string, via: "local" | "relay"): void => {
-    // Delivery is locked to this session's learned identity (codexDeliveryThread), so it never diverges
-    // from the published stableId. Learn from the SAME value: authoritative when it came from call
-    // metadata, a guess when only the daemon bootstrapped it.
+    // Delivery is locked to this session's learned identity (codexDeliveryThread), so it never diverges from the
+    // published stableId. Learn from the SAME value: authoritative from call metadata, a guess from the daemon.
     const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread());
     learnStableId(codexThread, ownCodexThread !== undefined);
     const label = labelFor(from);
-    // Metadata-only comms journal for swarm observability. Gated so Buffer.byteLength + the call are skipped
-    // entirely when AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
+    // Metadata-only comms journal for swarm observability. Gated so Buffer.byteLength + the call are skipped entirely
+    // when AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
     if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from, to: self.id, via, direction: "in", size: Buffer.byteLength(text), text });
     dbg(`inbound via=${via} from=${from} own=${ownCodexThread} stable=${self.stableId} daemon=${codexDaemon?.activeThread()} -> codexThread=${codexThread}`);
     void pushToHost(label, text, { codexThread }).then((ok) => {
       dbg(`pushToHost ok=${ok}`);
-      if (!ok) queue.push({ from, fromLabel: label, text, via });
+      if (ok) void flushInbox(); // channel works -> also deliver any durable backlog (keeps order)
+      else writeInbox(home, inboxKey(), { from, fromLabel: label, text, via, ts: Date.now() });
     });
   };
 
@@ -187,12 +211,20 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const stopStatusWatch = watchStatusDir(statusHome, applyStatusFromFile);
   applyStatusFromFile(); // pick up a file that already exists at startup
 
+  // Durable-inbox retry: deliver anything queued while the native channel was not ready. Flush once now to pick up
+  // messages a previous MCP-subprocess run persisted (restart durability). Unref'd — the broker socket keeps the
+  // process alive; this timer must not by itself.
+  void flushInbox();
+  const flushTimer = setInterval(() => void flushInbox(), 5000);
+  flushTimer.unref?.();
+
   return {
     self,
     peers: unified,
     noteThread(id) {
       ownCodexThread = id;
       learnStableId(id, true); // call metadata is authoritative for both identity and delivery
+      void flushInbox(); // a Codex session just took a turn -> its rollout now exists -> flush anything pending to it
     },
     async send(to, text) {
       const peer = resolve(to);
@@ -207,12 +239,18 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       return { ok: false, error: "That peer is on another machine but no team relay is configured here (set AGENTHOP_TEAM)." };
     },
     async recv(timeoutMs) {
-      // Only messages with no native host inbox land here; native ones already surfaced in the TUI.
+      // Explicit pull: drain the DURABLE inbox (messages the push channel could not surface). Claim+ack so the retry
+      // timer never re-delivers the same message.
       const deadline = Date.now() + timeoutMs;
-      let batch = queue.splice(0, queue.length);
+      const drain = (): BusMessage[] =>
+        claimInbox(home, inboxKeys(), String(process.pid)).map((c) => {
+          ackInbox(c.file);
+          return { from: c.msg.from, fromLabel: c.msg.fromLabel, text: c.msg.text, via: c.msg.via };
+        });
+      let batch = drain();
       while (batch.length === 0 && Date.now() < deadline) {
         await delay(120);
-        batch = queue.splice(0, queue.length);
+        batch = drain();
       }
       return batch;
     },
@@ -252,6 +290,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       return `local broker: ${local.role()}; ${team_}; ${unified().filter((p) => p.id !== self.id).length} other session(s)`;
     },
     async close() {
+      clearInterval(flushTimer);
       stopStatusWatch();
       codexDaemon?.close();
       await local.close();
