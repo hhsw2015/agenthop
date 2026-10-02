@@ -15,29 +15,37 @@ RUNTIME_DIR="${SWARM_RUNTIME_DIR:-}"   # holds the GIT_ASKPASS token file + req/
 
 log() { echo "[scrub] $*" >&2; }
 
-# 1. Stop the writers FIRST. Killing the worker tmux session terminates the Claude TUI (and any children), dropping
-#    the CPA + GitHub tokens that were in its process environment/argv. The supervisor lives in a different session,
-#    so this does not kill the scrubber.
+# 1. Stop the writers FIRST. Killing the worker tmux session terminates the Claude TUI and the processes IN that
+#    session, dropping the CPA + GitHub tokens that were in their environment/argv. The supervisor lives in a
+#    different session, so this does not kill the scrubber. HONEST LIMIT (Codex P2-6): kill-session does NOT prove a
+#    detached/nohup/double-forked writer has exited — it is not waited on. The real guarantee is credential
+#    expiry/revocation (short-lived CPA token + fine-grained GitHub token), not that every writer is gone.
 if tmux has-session -t "$SESSION" 2>/dev/null; then
-  log "killing worker session $SESSION"
+  log "killing worker session $SESSION (does not guarantee detached writers exit)"
   tmux kill-session -t "$SESSION" 2>/dev/null || true
 fi
 
-# 2. Delete on-disk secret/trace-bearing paths (each guarded; best-effort).
-for p in \
-  "$RUNTIME_DIR" \
-  "$WORK_DIR" \
-  /tmp/ah-mcp.json \
-  /tmp/swarm-* \
-  "$HOME/.config/gh" \
-  "$HOME/.git-credentials"; do
-  [ -n "$p" ] || continue
-  for match in $p; do
-    [ -e "$match" ] || continue
-    log "rm -rf $match"
-    rm -rf "$match" 2>/dev/null || true
-  done
+# 2. Delete on-disk secret/trace-bearing paths. LITERAL paths are quoted so a path with spaces is one argument
+#    (Codex P2-6: an unquoted `for match in $p` word-splits '/a/owned dir' into '/a/owned' + 'dir' and deletes the
+#    wrong directory). The one intentional glob is expanded separately under nullglob.
+literals=(
+  "$RUNTIME_DIR"
+  "$WORK_DIR"
+  "/tmp/ah-mcp.json"
+  "$HOME/.config/gh"
+  "$HOME/.git-credentials"
+)
+for p in "${literals[@]}"; do
+  [ -n "$p" ] && [ -e "$p" ] || continue
+  log "rm -rf -- $p"
+  rm -rf -- "$p" 2>/dev/null || true
 done
+shopt -s nullglob
+for p in /tmp/swarm-*; do
+  log "rm -rf -- $p"
+  rm -rf -- "$p" 2>/dev/null || true
+done
+shopt -u nullglob
 
 # 3. Best-effort: clear this shell's view of the tokens (does not touch other live processes).
 unset GITHUB_TOKEN ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY GIT_ASKPASS 2>/dev/null || true
