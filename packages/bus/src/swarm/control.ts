@@ -1,23 +1,31 @@
 /**
  * Swarm lifecycle control: the PURE state machine + coordination decisions behind phase-2 VM-lifetime management
- * and near-death handoff. No IO — every function is a pure, immutable transform so the crash-timeline cases Codex
- * flagged (dispatcher dies at each stage, claim winner crashes, lease expiry, over-cap) are unit-testable without
+ * and near-death handoff. No IO — every function is a pure, immutable transform so the crash-timeline cases from
+ * Codex's two design reviews (dispatcher dies at each stage, claim winner crashes, lease expiry, allocation-result-
+ * unknown, successor dies before/after ACK, over-cap, work-deadline != VM-destroyed) are unit-testable without
  * touching Railway / GitHub / the relay.
  *
+ * SUBSTRATE LIMIT (Codex, confirmed): Railway allocation has no fencing/idempotency key, so Git CAS + lease can
+ * serialize the RECORD but cannot stop a paused-then-resumed old instance from SSH-allocating, nor un-create a VM.
+ * Exactly-once allocation / airtight single-active are impossible here. Scope (user-chosen) is therefore
+ * AT-LEAST-ONCE with generation-ISOLATED OUTPUT: honest claim is "may duplicate, each VM eventually expires" and
+ * "old output never overwrites ACCEPTED new output" — duplicate EXECUTION is not magically safe; shared
+ * un-idempotent external side-effects are an explicit NON-GOAL. This module gives the record/decision logic;
+ * output isolation + command rejection are enforced at the execution end (box/dispatcher), keyed on `generation`.
+ *
  * The authoritative record for one launchId lives in a persistent GitHub CONTROL repo (written by a constrained
- * identity, NOT the worker's contents token). The IO layer (swarm-dispatch.ts) enforces the expected-OID
- * conditional update (git ref CAS / force-with-lease) when it writes a transition this module computed — Codex
- * proved a plain same-OID push lets two writers both exit 0, so "push ok" is not a lock; the CAS is what serializes.
+ * identity, never the worker's work token — the box publishes a RECEIPT to its own work space and the dispatcher
+ * verifies + CAS-advances CONTROL). The IO layer enforces the expected-OID conditional update when it writes a
+ * transition this module computed — a plain same-OID push is NOT a lock (Codex proved both writers exit 0).
  *
- * State chain (Codex-reviewed):
- *   RUNNING -> DRAINING -> CHECKPOINTED(sha,manifest) -> CLAIMED(owner,gen) -> ALLOCATING(attempt)
- *           -> RESUMED(successor,sha) -> RETIRED
- * Branches: DONE (task finished), EXPIRED(lastConfirmedSha) (box died without a clean handoff), and lease-timeout
- * reclaim of a CLAIMED/ALLOCATING record whose owner went away.
+ * State chain:
+ *   RUNNING -> DRAINING -> CHECKPOINTED(sha,manifest) -> CLAIMED(owner,gen) -> ALLOCATING(attempt) ->
+ *   RESUMED(successor,sha) -> RETIRED
+ * Branches: DONE(sha) (task finished), EXPIRED(lastConfirmedSha) (VM died — VM-terminal, NOT task-terminal),
+ * lease-timeout reclaim of a CLAIMED/ALLOCATING record (owner gone), and allocation-result-unknown (retained).
  *
- * RPO = milestone-based: a `milestone` event updates `sha` but KEEPS state RUNNING (routine save); only the
- * post-DRAIN `checkpoint` advances to CHECKPOINTED (the handoff cue). Only artifacts written to disk and confirmed
- * (sha recorded) are recoverable — model context is not.
+ * RPO = milestone-based: a `milestone` event updates `sha` but KEEPS state RUNNING; only the post-DRAIN
+ * `checkpoint` advances to CHECKPOINTED. RPO wording is "work after the last CONFIRMED checkpoint may be lost".
  */
 
 export type SwarmState =
@@ -34,7 +42,8 @@ export type SwarmState =
 export type ControlRecord = {
   launchId: string;
   state: SwarmState;
-  /** Owner generation; bumped on each claim so a stale predecessor can't act as the current owner. */
+  /** Owner generation; bumped on each (re)claim so a stale predecessor can't act as the current owner. The
+   *  execution end rejects any resume/retire/receipt whose generation != this. */
   generation: number;
   /** Last CONFIRMED immutable checkpoint sha (milestone or final). Undefined until the first confirmed push. */
   sha?: string;
@@ -44,8 +53,13 @@ export type ControlRecord = {
   owner?: string;
   /** Epoch seconds the claim lease expires; past it, another dispatcher may reclaim. */
   leaseUntil?: number;
-  /** Allocation attempt id (idempotency / reconciliation of an unknown-result allocate). */
+  /** Allocation attempt id. RETAINED across reclaim so an unknown-result allocation is reconciled, not re-fired. */
   attempt?: string;
+  /** Count of allocation attempts for this task; gates the attempt cap so "may duplicate" stays bounded. */
+  attemptCount?: number;
+  /** An allocation whose result is UNKNOWN (response lost / dispatcher crashed mid-allocate). Retained until a
+   *  reclaiming owner reconciles it — the slot is NOT freed on timeout alone. */
+  resultUnknown?: boolean;
   /** Successor launchId recorded at RESUMED. */
   successor?: string;
   /** EXPIRED carries the last confirmed sha so a successor can still be allocated from it. */
@@ -54,6 +68,8 @@ export type ControlRecord = {
   allocStart: number;
   /** Bounded lifetime budget (s) from allocStart; provider expiry if known, else conservative. */
   budgetSec: number;
+  /** Absolute deadline for display/dispatcher view (the BOX uses CLOCK_BOOTTIME locally, not this wall value). */
+  deadlineEpoch?: number;
   /** Epoch seconds of the last write. */
   updatedAt: number;
 };
@@ -65,42 +81,63 @@ export type ControlEvent =
   | { type: "claim"; owner: string; generation: number; leaseUntil: number }
   | { type: "reclaim"; owner: string; generation: number; leaseUntil: number }
   | { type: "allocating"; attempt: string }
-  | { type: "resumed"; successor: string; sha: string }
+  | { type: "alloc_unknown" }
+  | { type: "resumed"; successor: string; sha: string; generation: number; attempt: string }
   | { type: "retire" }
   | { type: "done"; sha: string }
   | { type: "expire"; lastConfirmedSha?: string };
 
 export type AdvanceResult = { ok: true; record: ControlRecord } | { ok: false; error: string };
 
-const TERMINAL: ReadonlySet<SwarmState> = new Set(["RETIRED", "DONE"]);
+/** Truly terminal for RECOVERY: a task here needs nothing more. EXPIRED is deliberately NOT here (VM died but the
+ *  task may be unfinished — it must stay in the recovery scan). */
+const TASK_TERMINAL: ReadonlySet<SwarmState> = new Set(["RETIRED", "DONE"]);
+/** States that accept no further events at all. */
+const FROZEN: ReadonlySet<SwarmState> = new Set(["RETIRED", "DONE"]);
 
 export function isTerminal(state: SwarmState): boolean {
-  return TERMINAL.has(state);
+  return TASK_TERMINAL.has(state);
+}
+
+/** A record the dispatcher's startup scan must still act on: anything not RETIRED/DONE — crucially incl. EXPIRED. */
+export function needsRecovery(record: ControlRecord): boolean {
+  return !TASK_TERMINAL.has(record.state);
 }
 
 export function leaseExpired(record: ControlRecord, nowSec: number): boolean {
   return record.leaseUntil === undefined || nowSec >= record.leaseUntil;
 }
 
+/** Execution-end fence: a resume/retire command or a receipt is honored only for the CURRENT generation. */
+export function isCurrentGeneration(record: ControlRecord, generation: number): boolean {
+  return generation === record.generation;
+}
+
 /** Default claim lease: long enough to allocate a box + confirm a successor, short enough to recover a dead owner. */
 export const DEFAULT_LEASE_SEC = 300;
+/** Per-task allocation attempt cap so at-least-once stays BOUNDED (not an infinite realloc loop). */
+export const MAX_ALLOC_ATTEMPTS = 3;
 /** Checkpoint thresholds (seconds before deadline) for the supervisor's near-death safety push. */
 export const CHECKPOINT_THRESHOLDS_SEC = [300, 120] as const;
 
+export function allocExhausted(record: ControlRecord, cap = MAX_ALLOC_ATTEMPTS): boolean {
+  return (record.attemptCount ?? 0) >= cap;
+}
+
 /**
  * Apply an event to a record, enforcing legal transitions. Pure + immutable: returns a NEW record or an error.
- * Illegal transitions are rejected (not silently coerced) so a buggy/duplicated event can't corrupt the chain.
+ * Illegal/stale events are rejected (not silently coerced) so a duplicated or superseded event can't corrupt the
+ * chain or roll back a confirmed sha.
  */
 export function advance(record: ControlRecord, event: ControlEvent, nowSec: number): AdvanceResult {
   const base = { ...record, updatedAt: nowSec };
   const bad = (error: string): AdvanceResult => ({ ok: false, error });
   const ok = (patch: Partial<ControlRecord>): AdvanceResult => ({ ok: true, record: { ...base, ...patch } });
 
-  if (isTerminal(record.state)) return bad(`terminal state ${record.state} accepts no events`);
+  if (FROZEN.has(record.state)) return bad(`state ${record.state} is terminal and accepts no events`);
 
   switch (event.type) {
     case "milestone":
-      // Routine save: record the confirmed sha, stay RUNNING. Legal only while actively running.
       if (record.state !== "RUNNING") return bad(`milestone only in RUNNING, not ${record.state}`);
       return ok({ sha: event.sha, manifest: event.manifest ?? record.manifest });
     case "drain":
@@ -108,24 +145,33 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       if (record.state !== "RUNNING") return bad(`drain only from RUNNING, not ${record.state}`);
       return ok({ state: "DRAINING" });
     case "checkpoint":
-      // Final (post-drain) checkpoint = the handoff cue.
       if (record.state !== "DRAINING") return bad(`final checkpoint only from DRAINING, not ${record.state}`);
       return ok({ state: "CHECKPOINTED", sha: event.sha, manifest: event.manifest ?? record.manifest });
     case "claim":
       if (record.state !== "CHECKPOINTED" && record.state !== "EXPIRED")
         return bad(`claim only from CHECKPOINTED/EXPIRED, not ${record.state}`);
       return ok({ state: "CLAIMED", owner: event.owner, generation: event.generation, leaseUntil: event.leaseUntil });
-    case "reclaim":
-      // Take over a CLAIMED/ALLOCATING record whose owner's lease lapsed (owner crashed/partitioned).
+    case "reclaim": {
+      // Take over a CLAIMED/ALLOCATING record whose owner's lease lapsed. RETAIN attempt/attemptCount/resultUnknown
+      // so the new owner RECONCILES the in-flight allocation instead of blind-retrying or freeing the slot.
       if (record.state !== "CLAIMED" && record.state !== "ALLOCATING")
         return bad(`reclaim only from CLAIMED/ALLOCATING, not ${record.state}`);
       if (!leaseExpired(record, nowSec)) return bad("reclaim rejected: lease still valid");
-      return ok({ state: "CLAIMED", owner: event.owner, generation: event.generation, leaseUntil: event.leaseUntil, attempt: undefined });
+      return ok({ state: "CLAIMED", owner: event.owner, generation: event.generation, leaseUntil: event.leaseUntil });
+    }
     case "allocating":
       if (record.state !== "CLAIMED") return bad(`allocating only from CLAIMED, not ${record.state}`);
-      return ok({ state: "ALLOCATING", attempt: event.attempt });
+      if (allocExhausted(record)) return bad(`allocation attempt cap (${MAX_ALLOC_ATTEMPTS}) reached`);
+      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false });
+    case "alloc_unknown":
+      // Allocation request sent, result unknown. Stay ALLOCATING; mark it so a reclaimer reconciles this attempt.
+      if (record.state !== "ALLOCATING") return bad(`alloc_unknown only from ALLOCATING, not ${record.state}`);
+      return ok({ resultUnknown: true });
     case "resumed":
       if (record.state !== "ALLOCATING") return bad(`resumed only from ALLOCATING, not ${record.state}`);
+      // Reject a stale successor's ACK: it must match the CURRENT generation AND the CURRENT attempt.
+      if (event.generation !== record.generation) return bad(`resumed generation ${event.generation} != ${record.generation}`);
+      if (event.attempt !== record.attempt) return bad(`resumed attempt ${event.attempt} != ${record.attempt}`);
       return ok({ state: "RESUMED", successor: event.successor, sha: event.sha });
     case "retire":
       if (record.state !== "RESUMED") return bad(`retire only from RESUMED, not ${record.state}`);
@@ -135,7 +181,7 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
         return bad(`done only from RUNNING/DRAINING/CHECKPOINTED, not ${record.state}`);
       return ok({ state: "DONE", sha: event.sha });
     case "expire":
-      // Any non-terminal state can expire (box died). Preserve the last confirmed sha for successor allocation.
+      // Any non-frozen state can expire (box died). Preserve the last confirmed sha for successor allocation.
       return ok({ state: "EXPIRED", lastConfirmedSha: event.lastConfirmedSha ?? record.sha });
   }
 }
@@ -144,23 +190,26 @@ export type DispatchAction =
   | "none"
   | "claim"
   | "reclaim"
+  | "reconcile"
   | "allocate"
   | "await_resume"
-  | "retire_predecessor";
+  | "retire_predecessor"
+  | "give_up";
 
 export type DispatchContext = {
   /** This dispatcher instance id. */
   self: string;
   /** Global cap on concurrent boxes. */
   cap: number;
-  /** Current count of live boxes (RUNNING/DRAINING/... non-terminal, incl. in-flight allocations). */
+  /** Current count of live boxes (non-terminal, incl. in-flight allocations). */
   liveCount: number;
 };
 
 /**
  * What the single-active dispatcher should attempt next for one record, given the clock + cap. Pure decision; the
  * IO layer performs it under an expected-OID conditional write and re-reads on CAS failure. A claim/reclaim is the
- * ONLY slot-consuming step, so the cap is enforced there.
+ * only slot-consuming step, so the cap is enforced there. `reconcile` means an in-flight allocation (attempt set)
+ * must be checked BEFORE any new allocate; `give_up` means the attempt cap is hit (dispatcher should alert + park).
  */
 export function nextAction(record: ControlRecord, nowSec: number, ctx: DispatchContext): DispatchAction {
   if (isTerminal(record.state)) return "none";
@@ -169,12 +218,17 @@ export function nextAction(record: ControlRecord, nowSec: number, ctx: DispatchC
   switch (record.state) {
     case "RUNNING":
     case "DRAINING":
-      return "none"; // box is managing itself; wait for CHECKPOINTED (handoff cue) or EXPIRED
+      return "none"; // box manages itself; wait for CHECKPOINTED (handoff cue) or EXPIRED
     case "CHECKPOINTED":
     case "EXPIRED":
-      return slotFree ? "claim" : "none"; // needs a successor; consume a slot only if the cap allows
+      if (allocExhausted(record)) return "give_up";
+      return slotFree ? "claim" : "none";
     case "CLAIMED":
-      if (record.owner === ctx.self && !leaseExpired(record, nowSec)) return "allocate";
+      if (record.owner === ctx.self && !leaseExpired(record, nowSec)) {
+        if (record.attempt !== undefined) return "reconcile"; // carried over from a reclaimed in-flight alloc
+        if (allocExhausted(record)) return "give_up";
+        return "allocate";
+      }
       if (leaseExpired(record, nowSec)) return slotFree ? "reclaim" : "none";
       return "none"; // held by someone else with a valid lease
     case "ALLOCATING":
@@ -189,10 +243,10 @@ export function nextAction(record: ControlRecord, nowSec: number, ctx: DispatchC
 }
 
 /**
- * Dispatcher-side liveness estimate for a box, from wall clocks with a skew allowance. Conservative: a box is
- * "likely dead" only once now exceeds its deadline PLUS the allowance (never retire early on a fast dispatcher
- * clock). The box itself uses a monotonic sleep-accumulator for its own deadline — this is only the dispatcher's
- * outside view for recovery decisions.
+ * Dispatcher-side liveness estimate from wall clocks with a skew allowance. Conservative: "likely dead" only once
+ * now exceeds deadline PLUS the allowance — a work-deadline is NOT proof the physical VM is destroyed, so this must
+ * never be used to free a physical slot early (Codex pass 2). The box itself uses CLOCK_BOOTTIME for its own
+ * deadline; this is only the dispatcher's outside estimate.
  */
 export function likelyExpired(record: ControlRecord, nowSec: number, skewSec = 120): boolean {
   return nowSec > record.allocStart + record.budgetSec + skewSec;
@@ -213,9 +267,9 @@ export const SWARM_CHECKPOINT_PREFIX = "[[swarm:checkpoint]] ";
 export const SWARM_RESUME_PREFIX = "[[swarm:resume]] ";
 export const SWARM_HANDOFF_PREFIX = "NEED HANDOFF:";
 
-export type Handoff = { summary: string; repo?: string; branch?: string; sha?: string };
+export type Handoff = { summary: string; repo?: string; branch?: string; sha?: string; generation?: number };
 
-/** Parse a worker's `NEED HANDOFF: goal=... next=... repo=owner/repo@branch sha=<hex>` broadcast. */
+/** Parse a worker's `NEED HANDOFF: goal=... next=... repo=owner/repo@branch sha=<hex> gen=<n>` broadcast. */
 export function parseHandoff(text: string): Handoff | null {
   const i = text.indexOf(SWARM_HANDOFF_PREFIX);
   if (i < 0) return null;
@@ -223,6 +277,7 @@ export function parseHandoff(text: string): Handoff | null {
   if (!body) return null;
   const repoMatch = /\brepo=(\S+)/.exec(body);
   const shaMatch = /\bsha=([0-9a-fA-F]{7,64})\b/.exec(body);
+  const genMatch = /\bgen=(\d+)\b/.exec(body);
   let repo: string | undefined;
   let branch: string | undefined;
   if (repoMatch) {
@@ -230,5 +285,5 @@ export function parseHandoff(text: string): Handoff | null {
     repo = r;
     branch = b;
   }
-  return { summary: body, repo, branch, sha: shaMatch?.[1] };
+  return { summary: body, repo, branch, sha: shaMatch?.[1], generation: genMatch ? Number(genMatch[1]) : undefined };
 }
