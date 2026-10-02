@@ -118,7 +118,7 @@ let git = realGit;
 // — after which the old fallback SILENTLY dropped goal+next. Encoded caps keep both fields + overhead under MAX while
 // preserving a visible …[truncated] marker instead of a silent drop.
 const MANIFEST_FIELD_MAX_ENCODED = 6000; // 2 fields * 6000 + overhead stays < MAX_MANIFEST_BYTES even worst-case
-function encodedLen(s) { return JSON.stringify(s).length - 2; } // length this string ADDS to the doc (minus its quotes)
+function encodedLen(s) { return Buffer.byteLength(JSON.stringify(s)) - 2; } // UTF-8 BYTES this string adds (minus its 2 quote bytes) — a true byte bound, not JS code units (Codex P3)
 function clampEncoded(s, maxBytes) {
   if (encodedLen(s) <= maxBytes) return s;
   const marker = "…[truncated]";
@@ -137,7 +137,8 @@ function buildManifest(kind, goal, next) {
   const n = n0 ? clampEncoded(n0, MANIFEST_FIELD_MAX_ENCODED) : undefined;
   const s = JSON.stringify({ schemaVersion: 1, launchId: LID, generation: GEN, kind, ...(g ? { goal: g } : {}), ...(n ? { next: n } : {}) });
   // With per-field encoded caps this always fits; keep the minimal-manifest backstop for a truly pathological case.
-  return s.length > MAX_MANIFEST_BYTES ? JSON.stringify({ schemaVersion: 1, launchId: LID, generation: GEN, kind }) : s;
+  // Bound by real UTF-8 byteLength (Codex P3), so MAX_MANIFEST_BYTES is an honest byte limit, not a code-unit count.
+  return Buffer.byteLength(s) > MAX_MANIFEST_BYTES ? JSON.stringify({ schemaVersion: 1, launchId: LID, generation: GEN, kind }) : s;
 }
 
 async function publish(kind, { goal, next } = {}) {

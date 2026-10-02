@@ -182,10 +182,18 @@ test("P2-c: a control-char goal is truncated by ENCODED length, kept under MAX, 
     const r = await sup.publish("milestone", { goal: "\u0001".repeat(5000) }); // ~30KB if capped by char count
     assert.ok(r.ok, "publishes");
     const raw = readFileSync(path.join(WORK_DIR, MANIFEST_REL), "utf8");
-    assert.ok(raw.length <= 16 * 1024, `manifest within MAX (got ${raw.length})`);
+    assert.ok(Buffer.byteLength(raw) <= 16 * 1024, `manifest within MAX bytes (got ${Buffer.byteLength(raw)})`);
     const man = JSON.parse(raw); // must still be valid JSON
     assert.ok(typeof man.goal === "string" && man.goal.length > 0, "goal is KEPT, not dropped to a minimal manifest");
     assert.match(man.goal, /\[truncated\]/, "truncation is marked, not silent");
+
+    // CJK (3 bytes/char): .length and byteLength DIFFER, so this proves a true UTF-8 BYTE bound, not code units (P3).
+    sup.__reset();
+    const r2 = await sup.publish("milestone", { goal: "好".repeat(8000) }); // 8000 chars -> 24KB UTF-8
+    assert.ok(r2.ok, "publishes CJK");
+    const raw2 = readFileSync(path.join(WORK_DIR, MANIFEST_REL), "utf8");
+    assert.ok(Buffer.byteLength(raw2) <= 16 * 1024, `CJK manifest within MAX bytes (got ${Buffer.byteLength(raw2)})`);
+    assert.match(JSON.parse(raw2).goal, /\[truncated\]/, "CJK goal truncated, not dropped");
   });
 });
 

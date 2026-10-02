@@ -19,14 +19,16 @@ MODE="${2:---demo}"
 GOAL="${3:-demo task}"
 # Reject an unsupported mode BEFORE any box side-effect (Codex #8: --task is deferred; don't clone/start then bail).
 [ "$MODE" = "--demo" ] || { echo "only --demo is supported here (--task/Claude worker is deferred)" >&2; exit 2; }
-# Validate the launchId shape so it can't inject into paths / git refs (Codex #6).
-case "$LID" in rw-[0-9a-f]*) : ;; *) echo "bad launchId $LID (expect rw-<hex>)" >&2; exit 2 ;; esac
+# Validate the WHOLE launchId (Codex P2-4): the old glob rw-[0-9a-f]* matched "rw-" + one hex + ANY suffix, so
+# rw-a'bad / rw-a-not-hex passed and could inject into paths / git refs. Anchor the full string to rw-<hex-only>.
+[[ "$LID" =~ ^rw-[0-9a-f]+$ ]] || { echo "bad launchId $LID (expect rw-<hex>, full string)" >&2; exit 2; }
 KEYDIR="/tmp/ah-rwkey-$LID"
 [ -f "$KEYDIR/id" ] || { echo "no keydir for $LID — allocate a box with swarm-launch.sh first" >&2; exit 1; }
 # Require a VALID allocation record within the box's life. ssh to a DEAD key implicitly RE-ALLOCATES (Railway binds
 # by key), so never treat ssh as a side-effect-free liveness probe (Codex #4): demand alloc-ts + a remaining window.
 [ -f "$KEYDIR/alloc-ts" ] || { echo "no alloc-ts for $LID — not a confirmed allocation; refusing (ssh could re-allocate)" >&2; exit 1; }
 WORK_REPO="${SWARM_WORK_REPO:-hhsw2015/swarm-work}"
+WORK_URL="git@github.com:$WORK_REPO.git"
 DEPLOY_KEY="${SWARM_DEPLOY_KEY:-$HOME/.agenthop/swarm/swarm-work-deploy}"
 [ -f "$DEPLOY_KEY" ] || { echo "no deploy key at $DEPLOY_KEY" >&2; exit 1; }
 BUDGET="${SWARM_BUDGET_SEC:-3480}"
@@ -39,6 +41,16 @@ AGE=$(( $(date +%s) - ALLOCTS ))
 [ "$AGE" -lt "$BUDGET" ] || { echo "box $LID past its window (age ${AGE}s >= ${BUDGET}s) — likely dead; refusing to ssh (would re-allocate)" >&2; exit 1; }
 DEADLINE_WALL=$((ALLOCTS + BUDGET))
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Fresh-only (Codex P2-1): REFUSE if this task lifecycle's branch already exists on the WORK repo. The destructive
+# setup below (kill writers + rm the checkout/runtime) must NOT blow away confirmed work on swarm/<lid>-g<gen>: a
+# retry after a failed start would otherwise fast-forward reset-to-step-1 content onto the real branch, or get frozen
+# by an old final. To re-run, allocate a FRESH box (new launchId) or add an explicit resume (deferred). Read-only query
+# via the deploy key; a QUERY FAILURE is fatal too (refuse to destructively proceed when freshness can't be verified).
+GSC_RO="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
+EXIST="$(GIT_SSH_COMMAND="$GSC_RO" git ls-remote "$WORK_URL" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1{print $1}')" || {
+  echo "FATAL: cannot query $BRANCH on $WORK_REPO (deploy key / network) — refusing to proceed blind (Codex P2-1)." >&2; exit 7; }
+[ -z "$EXIST" ] || { echo "REFUSING: $BRANCH already exists (${EXIST:0:12}) — this lifecycle already ran. Allocate a fresh box (new launchId) or use an explicit resume; not destructively resetting confirmed work (Codex P2-1)." >&2; exit 8; }
 
 # Direct SSH/SCP with the box's throwaway key + its per-VM HASSH profile (no proxy — box is bound to the key).
 PROF="$(cat "$KEYDIR/hassh-profile" 2>/dev/null || true)"
@@ -54,21 +66,23 @@ filt() { grep -viE 'human_claim_url|trial_starting|preview_url' || true; }
 echo "== phase-2 setup on $LID: branch=$BRANCH deadlineWall=$DEADLINE_WALL repo=$WORK_REPO =="
 
 # Build the supervisor env LOCALLY (values resolved here) and scp it as file bytes — NEVER via a remote heredoc,
-# whose unquoted expansion would execute $()/vars embedded in a value (Codex #6).
+# whose unquoted expansion would execute $()/vars embedded in a value (Codex #6). Every value is single-quote-escaped
+# (Codex P2-4): a value containing a ' (a legal allowlist path like out/team's, or any configured secret) must not
+# break the sourced file or inject shell syntax. sqadd rewrites each ' as '\'' (close quote, escaped quote, reopen).
 SUPENV="$(mktemp)"; trap 'rm -f "$SUPENV"' EXIT
-cat > "$SUPENV" <<ENV
-export GIT_SSH_COMMAND='ssh -i /root/.swarm/deploy-key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
-export SWARM_LAUNCH_ID='$LID'
-export SWARM_GENERATION='$GEN'
-export SWARM_BUDGET_SEC='$BUDGET'
-export SWARM_DEADLINE_WALL='$DEADLINE_WALL'
-export SWARM_WORK_DIR='/root/work'
-export SWARM_BRANCH='$BRANCH'
-export SWARM_RUNTIME_DIR='/root/.swarm-rt'
-export SWARM_ALLOWLIST='$ALLOWLIST'
-export SWARM_SCRUB='/root/.swarm/swarm-scrub.sh'
-export SWARM_TMUX_SESSION='swarm'
-ENV
+: > "$SUPENV"
+sqadd() { local v=${2//\'/\'\\\'\'}; printf "export %s='%s'\n" "$1" "$v" >> "$SUPENV"; }
+sqadd GIT_SSH_COMMAND 'ssh -i /root/.swarm/deploy-key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
+sqadd SWARM_LAUNCH_ID "$LID"
+sqadd SWARM_GENERATION "$GEN"
+sqadd SWARM_BUDGET_SEC "$BUDGET"
+sqadd SWARM_DEADLINE_WALL "$DEADLINE_WALL"
+sqadd SWARM_WORK_DIR '/root/work'
+sqadd SWARM_BRANCH "$BRANCH"
+sqadd SWARM_RUNTIME_DIR '/root/.swarm-rt'
+sqadd SWARM_ALLOWLIST "$ALLOWLIST"
+sqadd SWARM_SCRUB '/root/.swarm/swarm-scrub.sh'
+sqadd SWARM_TMUX_SESSION 'swarm'
 
 # 1. ship the deploy key + sup-env + supervisor + scrub + demo worker to a private dir on the box.
 "${SSH[@]}" railway.new 'mkdir -p /root/.swarm && chmod 700 /root/.swarm' 2>&1 | filt | tail -1
@@ -111,25 +125,30 @@ SH
 # 3. start the supervisor in its OWN tmux session "sup" (NOT the worker's "swarm" session, so a scrub that kills the
 #    worker session cannot kill the scrubber). tmux persists across ssh-close here; setsid/nohup do not. A box-side
 #    start script avoids triple-nested quoting (bash -> ssh -> tmux -> sh).
-"${SSH[@]}" railway.new "
+SUP_OUT="$("${SSH[@]}" railway.new "
   tmux kill-session -t sup 2>/dev/null || true
   : > /root/.swarm/sup.log
   tmux new-session -d -s sup 'sh /root/.swarm/start-sup.sh >/root/.swarm/sup.log 2>&1'
   sleep 3
   tmux has-session -t sup 2>/dev/null && echo supervisor-started || echo supervisor-FAILED
   tail -2 /root/.swarm/sup.log 2>/dev/null || true
-" 2>&1 | filt | tail -4
+" 2>&1 | filt | tail -4)" || true
+printf '%s\n' "$SUP_OUT"
+# Propagate the failure (Codex P2-2): a text-only FAILED must not slide through to a false READY.
+echo "$SUP_OUT" | grep -q supervisor-started || { echo "FATAL: supervisor did not start on $LID — aborting, not READY (Codex P2-2)." >&2; exit 4; }
 
 # 4. the worker.
 if [ "$MODE" = "--demo" ]; then
   echo "== demo worker (bash; no model cost) in tmux session 'swarm' — writes out/, signals milestones =="
-  "${SSH[@]}" railway.new "
+  WK_OUT="$("${SSH[@]}" railway.new "
     tmux kill-session -t swarm 2>/dev/null || true
     chmod +x /root/.swarm/swarm-demo-worker.sh
     tmux new-session -d -s swarm 'env SWARM_WORK_DIR=/root/work SWARM_RUNTIME_DIR=/root/.swarm-rt sh /root/.swarm/swarm-demo-worker.sh >/root/.swarm/worker.log 2>&1'
     sleep 1
     tmux has-session -t swarm 2>/dev/null && echo demo-worker-started || echo demo-worker-FAILED
-  " 2>&1 | filt | tail -2
+  " 2>&1 | filt | tail -2)" || true
+  printf '%s\n' "$WK_OUT"
+  echo "$WK_OUT" | grep -q demo-worker-started || { echo "FATAL: demo worker did not start on $LID — aborting, not READY (Codex P2-2)." >&2; exit 4; }
 else
   echo "NOTE: --task (Claude worker) not wired yet; use --demo for the first live validation." >&2
   exit 2
@@ -140,11 +159,16 @@ fi
 #    network would leave it silently producing nothing. Poll the remote branch tip via the SAME deploy key (held
 #    locally on the dispatcher), up to ~60s, so a success exit reflects real published work, not just a live process.
 echo "== verify first confirmed publish on $BRANCH (up to 60s) =="
-CONFIRMED=""
-for _ in $(seq 1 30); do
-  SHA="$(GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=accept-new" \
-         git ls-remote "git@github.com:$WORK_REPO.git" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1{print $1}')"
-  [ -n "$SHA" ] && { CONFIRMED="$SHA"; break; }
+# Codex P2-3: distinguish a transient QUERY ERROR (retry, do NOT let errexit kill the script) from a SUCCESSFUL query
+# that found the branch still ABSENT (keep waiting) from a CONFIRMED sha. Bound total wait by an absolute deadline and
+# each query by ssh ConnectTimeout, so a hung network can't exceed the budget. Because P2-1 verified the branch was
+# ABSENT at start, any sha observed here is THIS run's first publish.
+CONFIRMED=""; QDEADLINE=$(( $(date +%s) + 60 ))
+while [ "$(date +%s)" -lt "$QDEADLINE" ]; do
+  SHA=""; QRC=0
+  SHA="$(GIT_SSH_COMMAND="$GSC_RO" git ls-remote "$WORK_URL" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1{print $1}')" || QRC=$?
+  if [ "$QRC" -ne 0 ]; then echo "  (ls-remote query error; retry within deadline)" >&2; sleep 2; continue; fi
+  if [ -n "$SHA" ]; then CONFIRMED="$SHA"; break; fi
   sleep 2
 done
 if [ -z "$CONFIRMED" ]; then

@@ -56,9 +56,12 @@ FORCE_NEW="${AGENTHOP_SWARM_NEW:-}"; [ "${3:-}" = "new" ] && FORCE_NEW=1
 NEW_KEYDIR=""
 cleanup() {
   [ -n "${CF_PROXY_PID:-}" ] && kill "$CF_PROXY_PID" 2>/dev/null || true
-  if [ -n "${NEW_KEYDIR:-}" ] && [ ! -f "$NEW_KEYDIR/alloc-ts" ]; then
+  # Delete ONLY a definitively-failed keydir: no alloc-ts AND not marked `unknown`. An UNKNOWN result (Codex P2-5) may
+  # have created a live box whose ACK we lost; deleting its only key would orphan that VM (unreachable + un-scrubbable),
+  # so an unknown keydir is RETAINED (and already excluded from reuse/discovery, which both require alloc-ts).
+  if [ -n "${NEW_KEYDIR:-}" ] && [ ! -f "$NEW_KEYDIR/alloc-ts" ] && [ ! -f "$NEW_KEYDIR/unknown" ]; then
     rm -rf "$NEW_KEYDIR" 2>/dev/null || true
-    echo "cleanup: removed unconfirmed keydir $NEW_KEYDIR (allocation never confirmed — no alloc-ts)" >&2
+    echo "cleanup: removed unconfirmed keydir $NEW_KEYDIR (clean failure — no alloc-ts, not unknown)" >&2
   fi
 }
 trap cleanup EXIT
@@ -161,8 +164,20 @@ if [ -z "$REUSED" ]; then
   ALLOC_OUT="$("${ALLOC_SSH[@]}" railway.new 'echo alloc-ok' 2>&1 || true)"
   echo "$ALLOC_OUT" | grep -vi 'human_claim_url\|trial_starting\|preview_url' | tail -2 || true
   if ! echo "$ALLOC_OUT" | grep -q alloc-ok; then
-    echo "ALLOC FAILED for $LID (proxy $PROXY) — box not created; not stamping reuse window." >&2
-    exit 3
+    # Distinguish a CLEAN REFUSAL (box NOT created -> safe to delete the key) from an UNKNOWN result (box MAYBE created,
+    # ACK/output lost -> MUST retain the key, Codex P2-5). Default to UNKNOWN: only a RECOGNIZED refusal deletes.
+    if echo "$ALLOC_OUT" | grep -qiE 'anonymous visitors are limited|too many|rate.?limit|quota|limit exceeded|forbidden|permission denied|access denied'; then
+      echo "ALLOC REFUSED for $LID (clean refusal; box not created) — proxy=$PROXY." >&2
+      echo "$ALLOC_OUT" | tail -3 >&2
+      exit 3   # cleanup deletes the keydir: definitively not created
+    fi
+    # UNKNOWN: retain the key so a possibly-live box can be reconciled / left to physical (<=60m) expiry. Mark it so the
+    # cleanup trap does NOT delete it; it is already out of reuse/discovery (both require alloc-ts). ponytail: a reaper
+    # of unknown keydirs older than the budget is a future add; for now they are rare and expire physically.
+    : > "$KEYDIR/unknown"
+    echo "ALLOC RESULT UNKNOWN for $LID — retaining keydir (box may be live); excluded from reuse. Reconcile or let it expire." >&2
+    echo "$ALLOC_OUT" | tail -3 >&2
+    exit 6
   fi
   date +%s > "$KEYDIR/alloc-ts"   # box confirmed live: start the reuse window from here
 
