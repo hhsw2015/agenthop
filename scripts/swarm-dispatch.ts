@@ -23,6 +23,7 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, exists
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { randomBytes } from "node:crypto";
 import { type ControlRecord } from "../packages/bus/src/swarm/control.js";
 import { parseManifest } from "../packages/bus/src/swarm/manifest.js";
 import { type ObservedTip, tipToEvent } from "../packages/bus/src/swarm/acceptance.js";
@@ -143,16 +144,16 @@ function runScript(file: string, args: string[], extraEnv: Record<string, string
     child.on("close", (c) => finish(c ?? -1));
   });
 }
-async function allocateSuccessor(_pred: ControlRecord): Promise<string | null> {
-  // Allocate a fresh box via swarm-launch with AGENTHOP_ALLOCATE_ONLY (allocate + key-bind + stamp, no worker TUI —
-  // the successor is provisioned by swarm-task --resume). Parse the minted launchId from its "NEW box rw-..." line.
-  // SWARM_TEAM still matters for swarm-task --resume (the successor's worker joins the team); warn if unset.
+async function allocateSuccessor(_pred: ControlRecord, successorId: string): Promise<"ok" | "clean-fail" | "unknown"> {
+  // Allocate the PRE-GENERATED successor box via swarm-launch (allocate-only, given launchId). Map swarm-launch's exit
+  // codes to a reliability status: 0 = created, 3 = provider refusal (reliably NOT created), anything else = unknown
+  // (box may exist). SWARM_TEAM still matters for swarm-task --resume (the successor's worker joins the team).
   if (!SWARM_TEAM) log("allocateSuccessor: SWARM_TEAM is unset — the resumed successor would join teamless/invisible");
-  const r = await runScript(SWARM_LAUNCH, ["claude", SWARM_TEAM, "new"], { AGENTHOP_ALLOCATE_ONLY: "1" });
-  const m = (r.stdout + r.stderr).match(/NEW box (rw-[0-9a-f]+)/);
-  if (r.code !== 0 || !m) { log(`allocateSuccessor: swarm-launch failed (code ${r.code})`); return null; }
-  log(`allocateSuccessor: allocated ${m[1]}`);
-  return m[1];
+  const r = await runScript(SWARM_LAUNCH, ["claude", SWARM_TEAM, "new"], { AGENTHOP_ALLOCATE_ONLY: "1", AGENTHOP_LAUNCH_ID: successorId });
+  if (r.code === 0) { log(`allocateSuccessor: allocated ${successorId}`); return "ok"; }
+  if (r.code === 3) { log(`allocateSuccessor ${successorId}: clean refusal (not created)`); return "clean-fail"; }
+  log(`allocateSuccessor ${successorId}: result unknown (exit ${r.code})`);
+  return "unknown";
 }
 async function resumeSuccessor(a: { successor: string; handoffSha: string; generation: number; branch: string }): Promise<boolean> {
   // swarm-task --resume seeds the successor branch at a resume-marker from handoffSha + starts supervisor/worker.
@@ -202,6 +203,7 @@ async function pass(records: Map<string, ControlRecord>, ops: HandoffOps): Promi
 function buildOps(): HandoffOps {
   return {
     nowSec, self: SELF, cap: CAP, budgetSec: BUDGET_SEC, handoffLeadSec: HANDOFF_LEAD_SEC, execEnabled: EXEC_ENABLED,
+    newLaunchId: () => `rw-${randomBytes(4).toString("hex")}`,
     observeTip: (branch, lastSha, launchId) =>
       WORK_REPO ? observeTip(WORK_REPO, branch, lastSha, scratchPath(launchId)) : Promise.resolve(null),
     allocateSuccessor,

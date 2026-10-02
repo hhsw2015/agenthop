@@ -91,7 +91,12 @@ else
 fi
 
 if [ -z "$LID" ]; then
-  LID="rw-$(openssl rand -hex 4)"; KEYDIR="/tmp/ah-rwkey-$LID"; NEW_KEYDIR="$KEYDIR"; mkdir -p "$KEYDIR"
+  # Accept a dispatcher-provided launchId (AGENTHOP_LAUNCH_ID) so a handoff can pre-generate it CAS-then-IO; else mint
+  # one. Validate the WHOLE string as rw-<hex> so it can't inject into paths / git refs.
+  LID="${AGENTHOP_LAUNCH_ID:-rw-$(openssl rand -hex 4)}"
+  case "$LID" in rw-*) : ;; *) echo "bad AGENTHOP_LAUNCH_ID $LID (expect rw-<hex>)" >&2; exit 2 ;; esac
+  case "${LID#rw-}" in *[!0-9a-f]*|'') echo "bad AGENTHOP_LAUNCH_ID $LID (expect rw-<hex>)" >&2; exit 2 ;; esac
+  KEYDIR="/tmp/ah-rwkey-$LID"; NEW_KEYDIR="$KEYDIR"; mkdir -p "$KEYDIR"
   ssh-keygen -t ed25519 -f "$KEYDIR/id" -N "" -q
   echo "alloc-decision: NEW box $LID (via proxy $PROXY); its keydir is removed on exit unless allocation is confirmed"
 fi

@@ -5,11 +5,16 @@
  * reconcile / give_up crash edges). All IO is behind an injected `ops` layer so the whole handoff is unit-testable
  * offline; scripts/swarm-dispatch.ts wires the real IO (git observe, swarm-launch, swarm-task --resume, scrub).
  *
- * Generation model: `record.generation` is the OWNER generation (bumped on each claim/reclaim). A successor publishes
- * at that bumped generation (swarm-task --resume sets SWARM_GENERATION accordingly), so a box's branch is always
- * swarm/<launchId>-g<generation> and the manifest's generation matches the record it belongs to. The successor is a
- * SEPARATE record (two-record model): the predecessor advances RUNNING->...->RESUMED->RETIRED; the successor is a
- * fresh RUNNING record that resumes from the predecessor's pinned handoffSha.
+ * Generation model: `record.generation` is the OWNER generation (bumped on claim/reclaim). The SUCCESSOR's publish
+ * generation is pinned per-attempt in `record.successorGen` at `allocating` — a reclaim bumps the owner generation but
+ * the already-allocated successor still publishes at swarm/<successor>-g<successorGen>, so reconcile/await-resume
+ * observe THAT branch. Two-record model: the predecessor advances RUNNING->...->RESUMED->RETIRED; the successor is a
+ * fresh RUNNING record resumed from the predecessor's pinned handoffSha.
+ *
+ * Recovery discipline (Codex): CAS-then-IO (persist the attempt BEFORE the allocate IO, so a crash leaves a
+ * reconcilable ALLOCATING, never a silent re-alloc); the Map is synced on every persisted transition; the attempt is
+ * cleared ONLY on a RELIABLE clean failure (alloc_failed) or physical death (reconcile_dead), never on a transient
+ * query error / not-yet-published; the successor slot is RESERVED at claim so the cap is never exceeded.
  */
 
 import {
@@ -29,13 +34,15 @@ export type HandoffOps = {
   cap: number;
   budgetSec: number;
   handoffLeadSec: number;
-  /** Gate the handoff ACTIONS (claim/allocate/resume/reconcile/retire). When false, observe + authoritative clock
-   *  (drain/expire) still run and record progress, but no VM is allocated/retired — a safe default until SWARM_EXEC. */
+  /** Gate the handoff ACTIONS (claim/allocate/resume/reconcile/retire). When false, observe + clock still run. */
   execEnabled: boolean;
+  /** Mint a fresh successor launchId BEFORE the allocate IO (so the attempt is recorded CAS-then-IO). */
+  newLaunchId: () => string;
   /** Observe a WORK branch tip for `launchId` (pin sha, read manifest FROM it, ancestry vs lastSha). null = none/err. */
   observeTip: (branch: string, lastSha: string | undefined, launchId: string) => Promise<ObservedTip | null>;
-  /** Allocate a FRESH successor box; returns its launchId, or null on failure (runs swarm-launch new). */
-  allocateSuccessor: (predecessor: ControlRecord) => Promise<string | null>;
+  /** Allocate the given successor box (runs swarm-launch allocate-only). "ok" = created; "clean-fail" = RELIABLY not
+   *  created (provider refusal); "unknown" = result lost (box may exist). */
+  allocateSuccessor: (predecessor: ControlRecord, successorId: string) => Promise<"ok" | "clean-fail" | "unknown">;
   /** Tell the successor to resume from handoffSha, publishing to `branch` at `generation` (runs swarm-task --resume).
    *  true = resume command accepted; false = result unknown (reconcile next pass). */
   resumeSuccessor: (a: { successor: string; handoffSha: string; generation: number; branch: string }) => Promise<boolean>;
@@ -51,18 +58,34 @@ export function branchFor(launchId: string, generation: number): string {
   return `swarm/${launchId}-g${generation}`;
 }
 
-function apply(r: ControlRecord, ev: ControlEvent, ops: HandoffOps): ControlRecord {
+/** Advance + persist + sync the in-memory Map in ONE place, so a later IO throw can never leave the Map on a stale
+ *  pre-transition state that a next pass would re-execute (Codex P1-5). Returns the updated record (or the old one on
+ *  a rejected transition). */
+function apply(r: ControlRecord, ev: ControlEvent, ops: HandoffOps, records: Map<string, ControlRecord>): ControlRecord {
   const res = advance(r, ev, ops.nowSec());
   if (!res.ok) {
     ops.log(`event ${ev.type} on ${r.launchId} rejected: ${res.error}`);
     return r;
   }
-  ops.persist(res.record);
+  ops.persist(res.record); // may throw -> caller/pass() catches; the Map is NOT yet updated, consistent with no IO run
+  records.set(res.record.launchId, res.record);
   return res.record;
 }
 
-/** Drive ONE record through observe -> clock -> nextAction EXEC. Mutates `records` (adds the successor on allocate,
- *  advances the predecessor). Returns the updated record. */
+/** Non-terminal records count toward the cap; a CLAIMED record without a successor yet RESERVES one more slot (it will
+ *  allocate a successor), so two predecessors can't both claim the last slot (Codex P1-6). */
+function effectiveLive(records: Map<string, ControlRecord>): number {
+  let live = 0;
+  let reservations = 0;
+  for (const x of records.values()) {
+    if (x.state === "RETIRED" || x.state === "DONE") continue;
+    live++;
+    if (x.state === "CLAIMED" && !x.successor) reservations++;
+  }
+  return live + reservations;
+}
+
+/** Drive ONE record through observe -> clock -> gated nextAction EXEC. Mutates `records`. Returns the updated record. */
 export async function handoffStep(
   rIn: ControlRecord,
   records: Map<string, ControlRecord>,
@@ -71,34 +94,30 @@ export async function handoffStep(
   let r = rIn;
   if (r.state === "RETIRED" || r.state === "DONE") return r;
 
-  // 1) Observe this box's OWN branch and accept forward progress — only in states where it still publishes
-  //    (RUNNING/DRAINING) or where a late tip advances recovery (EXPIRED). Once CLAIMED/ALLOCATING/RESUMED the box's
-  //    work is frozen at handoffSha; its branch would be queried at the new owner generation and is not expected.
+  // 1) Observe this box's OWN branch and accept forward progress — only while it still publishes (RUNNING/DRAINING) or
+  //    a late tip advances recovery (EXPIRED). Once CLAIMED/ALLOCATING/RESUMED its work is frozen at handoffSha.
   if (r.state === "RUNNING" || r.state === "DRAINING" || r.state === "EXPIRED") {
     const tip = await ops.observeTip(branchFor(r.launchId, r.generation), r.sha, r.launchId);
     if (tip) {
       const dec = tipToEvent(r, tip);
-      if (dec.kind === "advance") r = apply(r, dec.event, ops);
+      if (dec.kind === "advance") r = apply(r, dec.event, ops, records);
     }
   }
 
-  // 2) Authoritative clock: drain near the deadline; expire if the box is likely physically gone.
+  // 2) Authoritative clock: drain near the deadline (RUNNING only); expire ONLY a still-live box (RUNNING/DRAINING) —
+  //    a CLAIMED/ALLOCATING/RESUMED record is the recovery process, not the box, and must not be re-expired (Codex).
   const deadline = r.allocStart + r.budgetSec;
   if (r.state === "RUNNING" && ops.nowSec() >= deadline - ops.handoffLeadSec) {
-    r = apply(r, { type: "drain" }, ops);
+    r = apply(r, { type: "drain" }, ops, records);
     ops.log(`${r.launchId} DRAINING (T-${deadline - ops.nowSec()}s)`);
   }
-  // Only a box that is still RUNNING/DRAINING can newly EXPIRE. Once CLAIMED/ALLOCATING/RESUMED the record is the
-  // dispatcher's RECOVERY process (the box is already known-gone); re-expiring it every pass reset the recovery to
-  // EXPIRED -> claim -> gen++ forever, never allocating (Codex). Terminal states are also skipped.
   if ((r.state === "RUNNING" || r.state === "DRAINING") && likelyExpired(r, ops.nowSec())) {
-    r = apply(r, { type: "expire" }, ops);
+    r = apply(r, { type: "expire" }, ops, records);
     ops.notify(`box ${r.launchId} expired; recoverySha=${r.sha ?? "none"}`);
   }
 
-  // 3) Handoff EXEC via the pure decision. liveCount is a snapshot of non-terminal records (incl. in-flight successors).
-  const liveCount = [...records.values()].filter((x) => x.state !== "RETIRED" && x.state !== "DONE").length;
-  const action = nextAction(r, ops.nowSec(), { self: ops.self, cap: ops.cap, liveCount });
+  // 3) Handoff EXEC via the pure decision (gated).
+  const action = nextAction(r, ops.nowSec(), { self: ops.self, cap: ops.cap, liveCount: effectiveLive(records) });
   if (ops.execEnabled) {
     r = await runAction(r, action, records, ops);
   } else if (action !== "none") {
@@ -120,18 +139,18 @@ async function runAction(
     case "none":
       return r;
     case "claim":
-      return apply(r, { type: "claim", owner: ops.self, generation: r.generation + 1, leaseUntil: lease() }, ops);
+      return apply(r, { type: "claim", owner: ops.self, generation: r.generation + 1, leaseUntil: lease() }, ops, records);
     case "reclaim":
-      return apply(r, { type: "reclaim", owner: ops.self, generation: r.generation + 1, leaseUntil: lease() }, ops);
+      return apply(r, { type: "reclaim", owner: ops.self, generation: r.generation + 1, leaseUntil: lease() }, ops, records);
     case "reconcile":
-      return reconcile(r, ops);
+      return reconcile(r, records, ops);
     case "allocate":
       return allocate(r, records, ops);
     case "await_resume":
-      return awaitResume(r, ops);
+      return awaitResume(r, records, ops);
     case "retire_predecessor":
       await ops.scrubBox(r.launchId);
-      return apply(r, { type: "retire" }, ops);
+      return apply(r, { type: "retire" }, ops, records);
     case "give_up":
       ops.notify(`box ${r.launchId}: allocation attempts exhausted (${r.attemptCount ?? 0}); needs manual attention`);
       return r;
@@ -141,22 +160,25 @@ async function runAction(
 }
 
 async function allocate(r: ControlRecord, records: Map<string, ControlRecord>, ops: HandoffOps): Promise<ControlRecord> {
-  // Resume from the CONFIRMED checkpoint sha. handoffSha is pinned BY the allocating event (= record.sha) and is still
-  // undefined at CLAIMED, so gate on r.sha here, not r.handoffSha.
-  const handoffSha = r.sha;
+  const handoffSha = r.sha; // resume from the CONFIRMED checkpoint; the allocating event pins it as handoffSha
   if (handoffSha === undefined) {
     ops.log(`${r.launchId}: allocate with no confirmed sha to resume from; skipping`);
     return r;
   }
-  const successor = await ops.allocateSuccessor(r);
-  if (!successor) {
-    ops.notify(`${r.launchId}: successor allocation failed; will retry next pass`);
-    return r; // stays CLAIMED; nextAction re-issues allocate
+  const gen = r.generation;
+  const successor = ops.newLaunchId();
+  // CAS-then-IO: record the attempt + successor (and pin successorGen=gen) FIRST and persist, BEFORE any IO. A throw in
+  // persist leaves no box created (IO not reached); a throw AFTER leaves a durable ALLOCATING the next pass reconciles.
+  r = apply(r, { type: "allocating", attempt: `att-${gen}-${successor}`, successor }, ops, records);
+  if (r.state !== "ALLOCATING") return r; // transition rejected -> do not run IO
+
+  const res = await ops.allocateSuccessor(r, successor);
+  if (res === "clean-fail") {
+    // RELIABLY not created -> clear the attempt (bounded immediate retry); no successor record, no phantom slot.
+    ops.log(`${r.launchId}: successor ${successor} clean-fail; clearing attempt for retry`);
+    return apply(r, { type: "alloc_failed" }, ops, records);
   }
-  const gen = r.generation; // successor publishes at the owner generation
-  // Record the attempt + successor on the predecessor (allocating pins handoffSha=r.sha + successor), THEN resume IO.
-  r = apply(r, { type: "allocating", attempt: `att-${gen}-${ops.nowSec()}`, successor }, ops);
-  // Create the successor's OWN RUNNING record so its branch is observed going forward and it survives a restart.
+  // ok OR unknown: a box may exist publishing to swarm/<successor>-g<gen>. Create its record (reserve slot + pin gen).
   const succ: ControlRecord = {
     launchId: successor,
     state: "RUNNING",
@@ -169,31 +191,47 @@ async function allocate(r: ControlRecord, records: Map<string, ControlRecord>, o
   };
   records.set(successor, succ);
   ops.persist(succ);
+  if (res === "unknown") {
+    ops.log(`${r.launchId}: successor ${successor} allocate UNKNOWN; retained, will reconcile`);
+    return apply(r, { type: "alloc_unknown" }, ops, records);
+  }
+  // res === "ok": tell the successor to resume from handoffSha.
   const ok = await ops.resumeSuccessor({ successor, handoffSha, generation: gen, branch: branchFor(successor, gen) });
   if (!ok) {
-    r = apply(r, { type: "alloc_unknown" }, ops); // result unknown -> reconciled next pass, not blind-retried
     ops.log(`${r.launchId}: resume IO result unknown; will reconcile`);
+    return apply(r, { type: "alloc_unknown" }, ops, records);
   }
   return r;
 }
 
-async function reconcile(r: ControlRecord, ops: HandoffOps): Promise<ControlRecord> {
-  // Did the in-flight successor actually come up? Check its branch: a confirmed descendant commit => ALIVE (re-enter
-  // await-resume), else => DEAD (clear the attempt so a fresh allocate can run).
-  if (!r.successor) return apply(r, { type: "reconcile_dead" }, ops);
-  const tip = await ops.observeTip(branchFor(r.successor, r.generation), r.handoffSha, r.successor);
-  if (tip && tip.manifest && tip.manifest.launchId === r.successor) return apply(r, { type: "reconcile_alive" }, ops);
-  return apply(r, { type: "reconcile_dead" }, ops);
+async function reconcile(r: ControlRecord, records: Map<string, ControlRecord>, ops: HandoffOps): Promise<ControlRecord> {
+  if (!r.successor) return apply(r, { type: "reconcile_dead" }, ops, records); // nothing pinned to reconcile
+  const sgen = r.successorGen ?? r.generation; // the successor publishes at its pinned gen, NOT the bumped owner gen
+  const tip = await ops.observeTip(branchFor(r.successor, sgen), undefined, r.successor);
+  if (tip && tip.manifest && tip.manifest.launchId === r.successor && tip.manifest.generation === sgen) {
+    return apply(r, { type: "reconcile_alive" }, ops, records); // the successor published -> ALIVE
+  }
+  // Not observed publishing. Declare DEAD only on RELIABLE evidence — the successor is physically past its deadline.
+  // A transient git error / not-yet-published must NOT clear the attempt (Codex: don't judge a live box dead).
+  const succ = records.get(r.successor);
+  if (succ && likelyExpired(succ, ops.nowSec())) return apply(r, { type: "reconcile_dead" }, ops, records);
+  ops.log(`${r.launchId}: reconcile ${r.successor} inconclusive (not published, not expired) — retaining attempt`);
+  return r;
 }
 
-async function awaitResume(r: ControlRecord, ops: HandoffOps): Promise<ControlRecord> {
+async function awaitResume(r: ControlRecord, records: Map<string, ControlRecord>, ops: HandoffOps): Promise<ControlRecord> {
   if (!r.successor || r.handoffSha === undefined || r.attempt === undefined) return r;
-  const tip = await ops.observeTip(branchFor(r.successor, r.generation), r.handoffSha, r.successor);
-  if (!tip || !tip.manifest || tip.manifest.launchId !== r.successor) return r; // not published yet -> keep waiting
-  if (!tip.isDescendantOfAccepted) {
-    ops.log(`${r.launchId}: successor ${r.successor} tip ${tip.sha.slice(0, 8)} not a descendant of handoffSha; ignoring`);
+  const sgen = r.successorGen ?? r.generation;
+  const tip = await ops.observeTip(branchFor(r.successor, sgen), r.handoffSha, r.successor);
+  if (!tip || !tip.manifest) return r;                   // not published / transient -> keep waiting
+  if (tip.manifest.launchId !== r.successor) return r;   // the seed (predecessor's manifest) -> not resumed yet
+  if (tip.manifest.generation !== sgen) { ops.log(`${r.launchId}: successor tip gen ${tip.manifest.generation} != pinned ${sgen}; ignoring`); return r; }
+  if (tip.manifest.kind !== "milestone" && tip.manifest.kind !== "final") {
+    // A supervisor auto-rescue is NOT proof the worker took over — require a worker-driven milestone/final (Codex).
+    ops.log(`${r.launchId}: successor tip kind=${tip.manifest.kind} (not worker-driven) — not a resumed-ACK yet`);
     return r;
   }
-  // Successor published its first snapshot descending from handoffSha -> resumed-ACK (verified against the pinned sha).
-  return apply(r, { type: "resumed", successor: r.successor, sha: r.handoffSha, generation: r.generation, attempt: r.attempt }, ops);
+  if (!tip.isDescendantOfAccepted) { ops.log(`${r.launchId}: successor tip not a descendant of handoffSha; ignoring`); return r; }
+  // A REAL successor milestone at the pinned publish-generation, descending from handoffSha -> resumed-ACK.
+  return apply(r, { type: "resumed", successor: r.successor, sha: r.handoffSha, generation: r.generation, attempt: r.attempt }, ops, records);
 }
