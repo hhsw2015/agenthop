@@ -15,6 +15,16 @@
 // session (that is how discovery works), so it appears on other machines' rosters as a phantom node; we
 // drop our own row from the snapshot and export observerId so the page can label it.
 import { createServer } from "node:http";
+
+/**
+ * The exporter is a NEW bus session, not a proxy for the shell that launched it. Inheriting
+ * CLAUDE_CODE_SESSION_ID made every exporter instance adopt the SAME native id as the session it was
+ * started from, so three processes advertised one identity (observed: two distinct titles sharing stableId
+ * 90b58f9c, and a peer unable to tell which was which). Clearing it here makes the exporter come up with
+ * its own per-run identity — what label.ts falls back to when no native id is present — so it can never
+ * be confused with the session that spawned it.
+ */
+delete process.env.CLAUDE_CODE_SESSION_ID;
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
