@@ -52,7 +52,40 @@ export type VizNode = UnifiedPeer & {
   machine: string;
   /** Index into the boxes array when this peer maps to a Railway box, else -1. */
   boxIndex: number;
+  /**
+   * OPTIONAL bus-provided activity, absent until the bus records message metadata. When present the page
+   * draws a live directional edge and a "talking now" indicator. Contract agreed with the bus owner:
+   * added to the roster alongside the msglog writer.
+   */
+  lastMessageAt?: number;
+  lastPeerId?: string;
 };
+
+/** One line of the opt-in, metadata-only message journal. NO payload by default (see the bus contract). */
+export type MsgLogEntry = {
+  ts: number;
+  from: string;
+  to: string;
+  via?: "local" | "relay";
+  direction: "in" | "out";
+  kind?: string;
+  size?: number;
+  /** Only ever present when payload logging was explicitly enabled on the bus side. */
+  text?: string;
+};
+
+/** A directed flow between two peers, folded from the journal. */
+export type VizFlow = {
+  from: string;
+  to: string;
+  via: "local" | "relay";
+  count: number;
+  lastTs: number;
+  bytes: number;
+};
+
+/** A node that was present in the previous snapshot and is gone now — an event, not a missing row. */
+export type VizDeparture = { id: string; title: string; machine: string; lastSeen: number };
 
 export type VizBox = {
   launchId: string;
@@ -67,6 +100,42 @@ export type VizBox = {
   control: ControlSlot;
   /** Index of the peer node for this box, or -1 when no bus peer matched. */
   nodeIndex: number;
+  /** Lifecycle generation, folded here so the page does not dig into control. */
+  generation: number | null;
+  /** Last confirmed checkpoint sha, for display. */
+  sha: string | null;
+  /** repo@branch this box is working on, when the record carries it. */
+  repo: string | null;
+  branch: string | null;
+};
+
+/** One "task" as it can be known TODAY: the lifecycle of a single launch. The richer fan-out / gather /
+ *  verdict layer (roadmap Layer 1/2) has no data yet — see TaskFile for the slot it will land in. */
+export type VizTask = {
+  taskId: string;
+  assignees: string[];
+  state: string;
+  createdAt: number | null;
+  results: Array<{ launchId: string; state: string; sha?: string; costUsd?: number }>;
+  /** True for a row synthesized from the control mirror — the only kind that exists today. */
+  fromControlMirror: boolean;
+};
+
+/** The future task-envelope file (roadmap Layer 1/2), read as a passthrough so the page renders it the
+ *  moment it appears. Shape agreed with the bus owner: metadata-only, at <home>/.agenthop/swarm/tasks/. */
+export type TaskFile = {
+  taskId: string;
+  dispatchedBy?: string;
+  assignees?: string[];
+  state?: string;
+  createdAt?: number;
+  results?: Array<{
+    launchId: string;
+    state: string;
+    sha?: string;
+    usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number };
+  }>;
+  [k: string]: unknown;
 };
 
 export type VizEdge = {
@@ -77,7 +146,7 @@ export type VizEdge = {
 export type Snapshot = {
   generatedAt: number;
   observerId: string;
-  parser: "swarm-viz/2";
+  parser: "swarm-viz/3";
   /** The machine this exporter runs on, so the page can label the local group. */
   localMachine: string;
   /** Declared staleness ceiling for relay (cross-machine) presence; the page must label clocks apart. */
@@ -86,6 +155,14 @@ export type Snapshot = {
   nodes: VizNode[];
   boxes: VizBox[];
   edges: VizEdge[];
+  /** Message journal folded into per-pair flows. Empty until the bus writes the journal. */
+  flows: VizFlow[];
+  /** Total journal lines considered (0 when the journal does not exist yet). */
+  msgLogCount: number;
+  /** Peers seen in the previous snapshot and absent now. */
+  departures: VizDeparture[];
+  /** Tasks. Today these are the lifecycle mirror, one per launchId; richer fan-out lands in tasks/*.json. */
+  tasks: VizTask[];
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -202,6 +279,84 @@ export function readLocalAllocs(): Map<string, number> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Message journal (metadata only) and future task envelopes
+// ---------------------------------------------------------------------------------------------
+
+function msgLogDir(home: string): string {
+  return path.join(home, ".agenthop", "msglog");
+}
+function taskDir(home: string): string {
+  return path.join(home, ".agenthop", "swarm", "tasks");
+}
+
+/**
+ * Read today's message journal. Contract with the bus owner: one JSON object per line at
+ * <home>/.agenthop/msglog/<YYYY-MM-DD>.jsonl, METADATA ONLY ({ts, from, to, via, direction, kind?, size?});
+ * a payload `text` is present only when the bus was explicitly told to log payloads. Absent dir -> [].
+ * Malformed lines are skipped rather than failing the whole read.
+ */
+export function readMsgLog(home: string, date = new Date()): MsgLogEntry[] {
+  const name = `${date.toISOString().slice(0, 10)}.jsonl`;
+  let raw: string;
+  try {
+    raw = readFileSync(path.join(msgLogDir(home), name), "utf8");
+  } catch {
+    return []; // journal not wired by the bus yet
+  }
+  const out: MsgLogEntry[] = [];
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const e = JSON.parse(t) as MsgLogEntry;
+      if (e && typeof e.ts === "number" && typeof e.from === "string" && typeof e.to === "string") out.push(e);
+    } catch {
+      // a torn last line while the writer appends — skip it
+    }
+  }
+  return out;
+}
+
+/** Future task-envelope files. Absent dir -> []. Malformed file skipped. */
+export function readTaskFiles(home: string): TaskFile[] {
+  let names: string[];
+  try {
+    names = readdirSync(taskDir(home));
+  } catch {
+    return [];
+  }
+  const out: TaskFile[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json") || name.includes(".tmp.")) continue;
+    try {
+      const t = JSON.parse(readFileSync(path.join(taskDir(home), name), "utf8")) as TaskFile;
+      if (t && typeof t.taskId === "string") out.push(t);
+    } catch {
+      // skip a torn/partial file
+    }
+  }
+  return out;
+}
+
+/** Fold journal lines into directed per-pair flows, newest activity last. Pure. */
+export function foldFlows(entries: MsgLogEntry[], limit = 60): VizFlow[] {
+  const byPair = new Map<string, VizFlow>();
+  for (const e of entries) {
+    const via = e.via ?? "local";
+    const key = `${e.from}\u0000${e.to}`;
+    const prev = byPair.get(key);
+    if (prev) {
+      prev.count++;
+      prev.bytes += e.size ?? 0;
+      if (e.ts > prev.lastTs) prev.lastTs = e.ts;
+    } else {
+      byPair.set(key, { from: e.from, to: e.to, via, count: 1, lastTs: e.ts, bytes: e.size ?? 0 });
+    }
+  }
+  return [...byPair.values()].sort((a, b) => b.lastTs - a.lastTs).slice(0, limit);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Snapshot assembly
 // ---------------------------------------------------------------------------------------------
 
@@ -210,6 +365,7 @@ export function buildSnapshot(
   observerId: string,
   home: string,
   pollMs: number,
+  prev?: Snapshot,
 ): Snapshot {
   const controls = readControlRecords(home);
   const allocs = readLocalAllocs();
@@ -229,6 +385,10 @@ export function buildSnapshot(
       allocStart: control?.allocStart ?? allocTs,
       control,
       nodeIndex: -1,
+      generation: control?.generation ?? null,
+      sha: control?.sha ?? control?.lastConfirmedSha ?? null,
+      repo: typeof (control as Record<string, unknown> | null)?.repo === "string" ? ((control as Record<string, unknown>).repo as string) : null,
+      branch: typeof (control as Record<string, unknown> | null)?.branch === "string" ? ((control as Record<string, unknown>).branch as string) : null,
     });
   }
 
@@ -240,23 +400,74 @@ export function buildSnapshot(
     nodes.push({ ...p, machine: p.machine ?? "local", boxIndex });
   }
 
-  // Handoff edges: a control record's successor is the launchId a box handed off to.
+  // Handoff edges: the full predecessor -> successor SET, not just the first. A record whose successor
+  // also has a record produces a chain the page can walk.
   const edges: VizEdge[] = [];
   for (const b of boxes) {
     if (b.control?.successor) edges.push({ from: b.launchId, to: b.control.successor });
   }
 
+  // Message flows. Empty until the bus writes the journal; the page shows that honestly.
+  const msgLog = readMsgLog(home);
+  const flows = foldFlows(msgLog);
+
+  // Departures: a peer in the previous snapshot that is absent now. An event, not just a missing row —
+  // without this the page cannot distinguish "left" from "was never there".
+  const nowIds = new Set(nodes.map((n) => n.id));
+  const departures: VizDeparture[] = (prev?.nodes ?? [])
+    .filter((p) => !nowIds.has(p.id))
+    .map((p) => ({ id: p.id, title: p.title, machine: p.machine, lastSeen: p.statusAt ?? prev?.generatedAt ?? Date.now() }));
+
+  const tasks = tasksFromSources(controls, readTaskFiles(home));
+
   return {
     generatedAt: Date.now(),
     observerId,
-    parser: "swarm-viz/2",
+    parser: "swarm-viz/3",
     localMachine: hostname(),
     relayStaleMs: 60_000, // directory ANNOUNCE_MS — remote status/statusText lag up to this
     pollMs,
     nodes,
     boxes,
     edges,
+    flows,
+    msgLogCount: msgLog.length,
+    departures,
+    tasks,
   };
+}
+
+/**
+ * Tasks from the two sources that exist: the richer task-envelope files (empty today) and the control
+ * mirror (one task per launchId). Files win; a launchId that already has a file task is not duplicated
+ * from the mirror. Pure, so it is selftest-covered.
+ */
+export function tasksFromSources(controls: Map<string, ControlSlot>, files: TaskFile[]): VizTask[] {
+  const out: VizTask[] = [];
+  const covered = new Set<string>();
+  for (const f of files) {
+    out.push({
+      taskId: f.taskId,
+      assignees: f.assignees ?? [],
+      state: f.state ?? "unknown",
+      createdAt: f.createdAt ?? null,
+      results: (f.results ?? []).map((r) => ({ launchId: r.launchId, state: r.state, sha: r.sha, costUsd: r.usage?.costUsd })),
+      fromControlMirror: false,
+    });
+    for (const a of f.assignees ?? []) covered.add(a);
+  }
+  for (const [launchId, control] of controls) {
+    if (covered.has(launchId)) continue;
+    out.push({
+      taskId: launchId,
+      assignees: [launchId],
+      state: control?.state ?? "unknown",
+      createdAt: control?.allocStart ?? null,
+      results: control ? [{ launchId, state: control.state, sha: control.sha ?? control.lastConfirmedSha }] : [],
+      fromControlMirror: true,
+    });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -301,6 +512,30 @@ function selftest(): void {
   t("parseControl rejects malformed JSON", parseControl("{ not json") === null);
   t("parseControl rejects a missing id", parseControl('{"state":"RUNNING"}') === null);
   t("parseControl accepts a record", parseControl('{"launchId":"rw-z","state":"RUNNING"}')?.launchId === "rw-z");
+
+  // Message flows: fold journal lines into directed per-pair counts, newest first.
+  const j: MsgLogEntry[] = [
+    { ts: 100, from: "a", to: "b", direction: "out", size: 10 },
+    { ts: 200, from: "a", to: "b", direction: "out", size: 5 },
+    { ts: 300, from: "b", to: "a", direction: "in", size: 2 },
+  ];
+  const flows = foldFlows(j);
+  t("foldFlows makes one entry per ordered pair", flows.length === 2);
+  t("foldFlows counts repeats and sums bytes", flows.find((f) => f.from === "a" && f.to === "b")!.count === 2 && flows.find((f) => f.from === "a" && f.to === "b")!.bytes === 15);
+  t("foldFlows orders by last activity", flows[0]!.from === "b" && flows[0]!.to === "a");
+  t("a direction is preserved (a->b is not the same flow as b->a)", flows.every((f) => f.from !== f.to));
+
+  // Tasks: files win over the control mirror; a covered assignee is not duplicated.
+  const files: TaskFile[] = [{ taskId: "t1", assignees: ["rw-a"], state: "RUNNING", results: [{ launchId: "rw-a", state: "working" }] }];
+  const controls = new Map<string, ControlSlot>([
+    ["rw-a", { launchId: "rw-a", state: "RUNNING" }],
+    ["rw-b", { launchId: "rw-b", state: "EXPIRED" }],
+  ]);
+  const tasks = tasksFromSources(controls, files);
+  t("task files win; the mirror fills the rest", tasks.length === 2);
+  t("a file task is marked as such", tasks.find((x) => x.taskId === "t1")!.fromControlMirror === false);
+  t("the mirror task is marked as such", tasks.find((x) => x.taskId === "rw-b")!.fromControlMirror === true);
+  t("a covered launchId is not duplicated from the mirror", tasks.filter((x) => x.taskId === "rw-a" && x.fromControlMirror).length === 0);
 
   console.log("all selftests passed");
 }
@@ -379,7 +614,7 @@ async function main(): Promise<void> {
   let lastWrite = 0;
   const timer = setInterval(() => {
     try {
-      latest = buildSnapshot(core.peers(), core.self.id, home, pollMs);
+      latest = buildSnapshot(core.peers(), core.self.id, home, pollMs, latest);
       // Persist at most every 2s so headless viewers see the same data.
       if (Date.now() - lastWrite >= 2000) {
         writeSnapshot(latest);
