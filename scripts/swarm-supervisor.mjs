@@ -165,8 +165,7 @@ async function publish(kind, { goal, next } = {}) {
     try { parentKind = JSON.parse(pm.stdout).kind; } catch { return { ok: false, error: `parent ${parent.slice(0, 8)} manifest parse failed (phase unknown); refusing` }; }
     if (parentKind === "final") {
       finalized = true;            // freeze: never build past a confirmed final, even if we forgot we finalized
-      lastPushedSha = parent;
-      attemptedShas.clear();
+      lastPushedSha = parent;      // (no attemptedShas.clear(): this is a READ, not a confirmed push — see below)
       return { ok: true, sha: parent, unchanged: true, hitFinal: true };
     }
   }
@@ -190,7 +189,10 @@ async function publish(kind, { goal, next } = {}) {
   // 4. skip only if the REMOTE parent already carries this exact tree (then the remote truly has our snapshot).
   if (parent) {
     const parentTree = (await git(["rev-parse", `${parent}^{tree}`])).stdout.trim();
-    if (parentTree === tree) { lastPushedSha = parent; attemptedShas.clear(); return { ok: true, sha: parent, unchanged: true }; } // remote already has this tree
+    // Do NOT clear attemptedShas here: "unchanged" means the ref we READ has this tree, NOT that our in-flight
+    // pushes resolved. A timed-out B (parent A) can still FF over the still-at-A remote after this read; clearing
+    // would forget B and later judge remote=B foreign (Codex: clear only on a CONFIRMED push, not a read).
+    if (parentTree === tree) { lastPushedSha = parent; return { ok: true, sha: parent, unchanged: true }; } // remote already has this tree
   }
 
   // 5. commit-tree onto the remote parent, then push the COMMIT OBJECT directly (no update-ref -> the worker's
@@ -206,7 +208,10 @@ async function publish(kind, { goal, next } = {}) {
     return { ok: false, error: `push: ${push.stderr.trim()}`, sha };
   }
   lastPushedSha = sha;   // OUR confirmed tip (single-publisher guard spots a foreign writer next time)
-  attemptedShas.clear(); // confirmed FF: every earlier attempt is now moot (remote can only fast-forward) (P1-B)
+  // Clear ONLY here (a CONFIRMED FF push): the remote just FF'd to `sha`, so every earlier attempt is a sibling that
+  // can no longer FF over it and will be rejected non-FF forever. Read-only returns (unchanged / final-hit) must NOT
+  // clear — the remote hasn't moved there, so an in-flight timed-out push can still land (Codex P1-B residual).
+  attemptedShas.clear();
   return { ok: true, sha };
 }
 
