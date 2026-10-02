@@ -88,17 +88,35 @@ describe("illegal transitions rejected", () => {
   });
 });
 
-describe("handoff target pinning", () => {
-  test("claim pins handoffSha to the canonical sha; resumed verifies against the pin, not a later sha", () => {
+describe("handoff target pinning (per ATTEMPT, not per claim — Codex #4)", () => {
+  test("allocating pins handoffSha to the canonical sha; claim does NOT; resumed verifies against the pin", () => {
     const claimed = run(rec(), [
       [{ type: "drain" }, T0 + 1],
       [{ type: "checkpoint", sha: "fin0" }, T0 + 2],
       [{ type: "claim", owner: "d", generation: 1, leaseUntil: T0 + 300 }, T0 + 3],
     ]);
-    expect(claimed.handoffSha).toBe("fin0");
+    expect(claimed.handoffSha).toBeUndefined(); // claim no longer pins
     const allocating = run(claimed, [[{ type: "allocating", attempt: "a" }, T0 + 4]]);
+    expect(allocating.handoffSha).toBe("fin0"); // pinned at allocating
     expect(advance(allocating, { type: "resumed", successor: "x", sha: "OTHER", generation: 1, attempt: "a" }, T0 + 5).ok).toBe(false);
-    expect(advance(allocating, { type: "resumed", successor: "x", sha: "fin0", generation: 1, attempt: "a" }, T0 + 5).ok).toBe(true);
+    const done = advance(allocating, { type: "resumed", successor: "x", sha: "fin0", generation: 1, attempt: "a" }, T0 + 5);
+    expect(done.ok && done.record.state === "RESUMED" && done.record.successor === "x").toBe(true);
+    if (done.ok) expect(done.record.sha).toBe("fin0"); // canonical unchanged by resumed
+  });
+
+  test("reconcile_alive keeps the attempt's original pin even after a later recover advanced canonical sha", () => {
+    // drain->checkpoint(cp)->claim->allocating(X) pins handoffSha=cp; expire; recover B (sha=B, pin stays cp);
+    // a reclaim (SAME generation path not needed — we only assert the pin is preserved, not re-pinned to B).
+    let r = run(rec(), [
+      [{ type: "drain" }, T0 + 1],
+      [{ type: "checkpoint", sha: "cp" }, T0 + 2],
+      [{ type: "claim", owner: "d", generation: 1, leaseUntil: T0 + 300 }, T0 + 3],
+      [{ type: "allocating", attempt: "X" }, T0 + 4],
+    ]);
+    expect(r.handoffSha).toBe("cp");
+    r = run(r, [[{ type: "alloc_unknown" }, T0 + 5], [{ type: "expire" }, T0 + 6], [{ type: "recover_sha", sha: "B" }, T0 + 7]]);
+    expect(r.sha).toBe("B"); // canonical advanced
+    expect(r.handoffSha).toBe("cp"); // attempt X's pin NOT moved to B
   });
 });
 

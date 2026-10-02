@@ -165,23 +165,27 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
     case "claim":
       if (record.state !== "CHECKPOINTED" && record.state !== "EXPIRED")
         return bad(`claim only from CHECKPOINTED/EXPIRED, not ${record.state}`);
-      // PIN the handoff target to the canonical sha NOW, so a later checkpoint can't move what the successor is
-      // verified against (Codex). handoffSha stays undefined if there is no confirmed work yet (successor starts fresh).
-      return ok({ state: "CLAIMED", owner: event.owner, generation: event.generation, leaseUntil: event.leaseUntil, handoffSha: record.sha });
+      // handoffSha is NOT pinned here — it is pinned per ATTEMPT at `allocating` (Codex #4). A claim/reclaim is an
+      // ownership change, not a new successor; re-pinning here would move the target out from under an in-flight
+      // attempt (e.g. after EXPIRED+recover, a still-alive attempt that resumed from the OLD sha would be wrongly
+      // rejected). base preserves any existing handoffSha.
+      return ok({ state: "CLAIMED", owner: event.owner, generation: event.generation, leaseUntil: event.leaseUntil });
     case "reclaim": {
       // Take over a CLAIMED/ALLOCATING record whose owner's lease lapsed. RETAIN attempt/attemptCount/resultUnknown
-      // so the new owner RECONCILES the in-flight allocation instead of blind-retrying or freeing the slot. Re-pin
-      // handoffSha to the canonical sha (unchanged by reclaim).
+      // AND handoffSha (base preserves them) so the new owner RECONCILES the SAME in-flight attempt against its
+      // original pinned target, instead of blind-retrying or re-pinning.
       if (record.state !== "CLAIMED" && record.state !== "ALLOCATING")
         return bad(`reclaim only from CLAIMED/ALLOCATING, not ${record.state}`);
       if (!leaseExpired(record, nowSec)) return bad("reclaim rejected: lease still valid");
-      return ok({ state: "CLAIMED", owner: event.owner, generation: event.generation, leaseUntil: event.leaseUntil, handoffSha: record.handoffSha ?? record.sha });
+      return ok({ state: "CLAIMED", owner: event.owner, generation: event.generation, leaseUntil: event.leaseUntil });
     }
     case "allocating":
       if (record.state !== "CLAIMED") return bad(`allocating only from CLAIMED, not ${record.state}`);
       if (record.attempt !== undefined) return bad("allocating blocked: a prior in-flight attempt must be reconciled first");
       if (allocExhausted(record)) return bad(`allocation attempt cap (${MAX_ALLOC_ATTEMPTS}) reached`);
-      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false });
+      // PIN handoffSha to the CURRENT canonical sha for THIS new attempt (Codex #4): the successor this attempt
+      // creates is told to resume from here; a later recover_sha advancing `sha` must NOT move this attempt's target.
+      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false, handoffSha: record.sha });
     case "alloc_unknown":
       // Allocation request sent, result unknown. Stay ALLOCATING; mark it so a reclaimer reconciles this attempt.
       if (record.state !== "ALLOCATING") return bad(`alloc_unknown only from ALLOCATING, not ${record.state}`);
@@ -205,7 +209,10 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       // so a late checkpoint cannot silently change this ACK's target (Codex). Undefined handoffSha = no prior work,
       // successor starts fresh, any sha accepted.
       if (record.handoffSha !== undefined && event.sha !== record.handoffSha) return bad(`resumed sha ${event.sha} != pinned handoff ${record.handoffSha}`);
-      return ok({ state: "RESUMED", successor: event.successor, sha: event.sha });
+      // Do NOT move `sha`: it is the canonical confirmed checkpoint (may be NEWER than handoffSha after a recover).
+      // The successor is a separate record that progresses from handoffSha; writing event.sha here could regress the
+      // canonical anchor (Codex #4). Just record the successor.
+      return ok({ state: "RESUMED", successor: event.successor });
     }
     case "retire":
       if (record.state !== "RESUMED") return bad(`retire only from RESUMED, not ${record.state}`);
@@ -259,6 +266,10 @@ export function nextAction(record: ControlRecord, nowSec: number, ctx: DispatchC
       return "none"; // box manages itself; wait for CHECKPOINTED (handoff cue) or EXPIRED
     case "CHECKPOINTED":
     case "EXPIRED":
+      // An in-flight attempt (retained across expire) must still be RECONCILED even at the cap — the attempt cap
+      // forbids a NEW allocation, not CHECKING whether the Nth VM is actually alive (Codex #5). Claim to take
+      // ownership, then the CLAIMED branch returns "reconcile".
+      if (record.attempt !== undefined) return slotFree ? "claim" : "none";
       if (allocExhausted(record)) return "give_up";
       return slotFree ? "claim" : "none";
     case "CLAIMED":

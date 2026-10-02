@@ -34,11 +34,13 @@ const GOAL = env.SWARM_GOAL || "";
 // Allowlist is REQUIRED and must not be "." (Codex P1-3: "." / a shared index publishes logs/creds). Each entry is
 // a pathspec relative to the work tree; the private index means only these (plus the manifest) are ever committed.
 const ALLOWLIST = (must("SWARM_ALLOWLIST")).split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
-// Validate the allowlist is a real artifact set, not the whole tree (Codex #8): "." / "./" / "*" / absolute / ".."
-// would publish untracked logs/creds. An empty list is already rejected by must().
+// Validate the allowlist is a real artifact set, not the whole tree (Codex #8/#9): reject "." "./" "*" absolute ".."
+// AND git pathspec magic (a leading ":" like :(top)** escapes to the whole tree). A list that filtered down to
+// EMPTY (e.g. SWARM_ALLOWLIST=",") is also rejected — must() only checks the raw string was non-empty.
+if (ALLOWLIST.length === 0) { console.error("swarm-supervisor: SWARM_ALLOWLIST resolved to an empty set"); process.exit(2); }
 for (const p of ALLOWLIST) {
-  if (p === "." || p === "./" || p === "*" || p.startsWith("/") || p.split("/").includes("..")) {
-    console.error(`swarm-supervisor: unsafe allowlist entry ${JSON.stringify(p)} (no '.' './' '*' absolute or '..')`);
+  if (p === "." || p === "./" || p === "*" || p.startsWith("/") || p.startsWith(":") || p.includes(":") || p.split("/").includes("..")) {
+    console.error(`swarm-supervisor: unsafe allowlist entry ${JSON.stringify(p)} (no '.' './' '*' absolute '..' or ':' pathspec magic)`);
     process.exit(2);
   }
 }
@@ -98,16 +100,20 @@ function git(args, { timeoutMs = GIT_TIMEOUT_MS, indexFile } = {}) {
 
 // --- the publish pipeline: stage allowlist+manifest into the PRIVATE index -> write-tree -> (skip if unchanged) ->
 // commit-tree onto the current branch tip -> update local ref -> non-force push. Returns { ok, sha }.
-const MANIFEST_FIELD_CAP = 6000; // keeps goal+next+overhead under MAX_MANIFEST_BYTES while preserving semantics
+// Each field capped so that even worst-case JSON escaping (~2x) of BOTH fields + overhead stays under the 16KB
+// bound parseManifest enforces — no runtime size surprise (Codex #10).
+const MANIFEST_FIELD_CAP = 3000;
 function clampStr(s, max) { return s.length > max ? `${s.slice(0, max)}…[truncated]` : s; }
+// Coerce goal/next to a STRING (the worker's req JSON could carry a non-string) so a non-string can never produce a
+// manifest the dispatcher's parseManifest rejects (Codex #10).
+function asStr(v) { return v === undefined || v === null ? undefined : typeof v === "string" ? v : JSON.stringify(v); }
 function buildManifest(kind, goal, next) {
   // NO createdAt: a changing timestamp each publish would defeat the "skip if unchanged" idempotency (Codex).
-  // TRUNCATE goal/next to fit the shared size bound rather than silently dropping them and reporting success
-  // (Codex #9): a "…[truncated]" marker preserves partial semantics + keeps the manifest parseable.
-  const g = goal ? clampStr(goal, MANIFEST_FIELD_CAP) : undefined;
-  const n = next ? clampStr(next, MANIFEST_FIELD_CAP) : undefined;
-  const m = { schemaVersion: 1, launchId: LID, generation: GEN, kind, ...(g ? { goal: g } : {}), ...(n ? { next: n } : {}) };
-  const s = JSON.stringify(m);
+  const g0 = asStr(goal);
+  const n0 = asStr(next);
+  const g = g0 ? clampStr(g0, MANIFEST_FIELD_CAP) : undefined;
+  const n = n0 ? clampStr(n0, MANIFEST_FIELD_CAP) : undefined;
+  const s = JSON.stringify({ schemaVersion: 1, launchId: LID, generation: GEN, kind, ...(g ? { goal: g } : {}), ...(n ? { next: n } : {}) });
   // Belt-and-suspenders: if still over (pathological), drop to the minimal valid manifest.
   return s.length > MAX_MANIFEST_BYTES ? JSON.stringify({ schemaVersion: 1, launchId: LID, generation: GEN, kind }) : s;
 }
@@ -124,13 +130,24 @@ async function publish(kind, { goal, next } = {}) {
   const ls = await git(["ls-remote", "origin", `refs/heads/${BRANCH}`]);
   if (ls.code !== 0) return { ok: false, error: `ls-remote: ${ls.stderr.trim()}` };
   const remoteTip = (ls.stdout.split(/\s+/)[0] || "").trim(); // empty => branch genuinely absent
+  // #2 lost-ACK: if our previous push LANDED but the client lost the ACK/returned failure, the remote now sits at the
+  //    sha we last TRIED (pendingSha) while lastPushedSha still lags. Adopt it — it's ours, not a foreign writer.
+  if (remoteTip && pendingSha && remoteTip === pendingSha) lastPushedSha = remoteTip;
   if (remoteTip && lastPushedSha && remoteTip !== lastPushedSha)
     return { ok: false, error: `foreign tip ${remoteTip.slice(0, 8)} != ours ${lastPushedSha.slice(0, 8)}; refusing blind rebase (single-publisher violated)` };
+  // #6 parent is the CHECKED remoteTip, never a post-fetch re-read of the branch (a foreign writer could advance it
+  //    between our check and the fetch). Fetch that exact object; if fetch-by-sha is unsupported, fetch the ref but
+  //    VERIFY it still equals remoteTip, else abort.
   let parent = "";
   if (remoteTip) {
-    const f = await git(["fetch", "-q", "origin", `refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}`]);
-    if (f.code !== 0) return { ok: false, error: `fetch: ${f.stderr.trim()}` };
-    parent = (await git(["rev-parse", "-q", "--verify", `refs/remotes/origin/${BRANCH}`])).stdout.trim();
+    let f = await git(["fetch", "-q", "origin", remoteTip]);
+    if (f.code !== 0) {
+      f = await git(["fetch", "-q", "origin", `refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}`]);
+      if (f.code !== 0) return { ok: false, error: `fetch: ${f.stderr.trim()}` };
+      const after = (await git(["rev-parse", "-q", "--verify", `refs/remotes/origin/${BRANCH}`])).stdout.trim();
+      if (after !== remoteTip) return { ok: false, error: `remote advanced during fetch (${after.slice(0, 8)} != ${remoteTip.slice(0, 8)}); retry` };
+    }
+    parent = remoteTip;
   }
 
   // 3. build the tree from an EMPTY private index + ONLY the allowlist (+manifest). Starting empty means a
@@ -138,8 +155,13 @@ async function publish(kind, { goal, next } = {}) {
   //    artifact snapshot, not a mirror of the worker's checkout.
   const empty = await git(["read-tree", "--empty"], { indexFile: PRIVATE_INDEX });
   if (empty.code !== 0) return { ok: false, error: `read-tree --empty: ${empty.stderr.trim()}` };
-  const add = await git(["add", "--", MANIFEST_REL, ...ALLOWLIST], { indexFile: PRIVATE_INDEX });
-  if (add.code !== 0) return { ok: false, error: `git add: ${add.stderr.trim()}` };
+  // Add each path individually, tolerating "pathspec did not match" (git add has no --ignore-unmatch). An allowlist
+  // entry whose file was DELETED (or a now-empty dir) simply matches nothing; with the empty index that correctly
+  // leaves it ABSENT from the published tree — a deletion, not an error (Codex #7). A real add error still fails.
+  for (const p of [MANIFEST_REL, ...ALLOWLIST]) {
+    const a = await git(["add", "--", p], { indexFile: PRIVATE_INDEX });
+    if (a.code !== 0 && !/did not match/i.test(a.stderr)) return { ok: false, error: `git add ${p}: ${a.stderr.trim()}` };
+  }
   const wt = await git(["write-tree"], { indexFile: PRIVATE_INDEX });
   if (wt.code !== 0) return { ok: false, error: `write-tree: ${wt.stderr.trim()}` };
   const tree = wt.stdout.trim();
@@ -155,9 +177,11 @@ async function publish(kind, { goal, next } = {}) {
   const ct = await git(["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", `swarm ${kind} g${GEN}`]);
   if (ct.code !== 0) return { ok: false, error: `commit-tree: ${ct.stderr.trim()}` };
   const sha = ct.stdout.trim();
+  pendingSha = sha; // record the sha we are ABOUT to push, so a lost-ACK next tick is recognized as ours (#2)
   const push = await git(["push", "origin", `${sha}:refs/heads/${BRANCH}`]);
   if (push.code !== 0) {
-    // Do NOT force/rebase. A later tick re-fetches the remote tip and retries from there (never masks a failure).
+    // Do NOT force/rebase. A later tick re-fetches the remote tip; if OUR push actually landed, remoteTip===pendingSha
+    // and we adopt it; otherwise we retry. Never masks a failure.
     return { ok: false, error: `push: ${push.stderr.trim()}`, sha };
   }
   lastPushedSha = sha; // record OUR tip so the single-publisher guard can spot a foreign writer next time
@@ -181,7 +205,8 @@ function writeAck(obj) { atomicWrite(ACK_FILE, JSON.stringify(obj)); }
 
 // --- worker-driven checkpoint requests (cooperative freeze: worker quiesces writes BEFORE writing REQ_FILE, resumes
 // only after a terminal ack). kind "milestone" stays mid-task; kind "final" is the drained, frozen handoff point. ---
-let lastPushedSha = "";   // OUR last published tip (single-publisher guard in publish())
+let lastPushedSha = "";   // OUR last CONFIRMED published tip (single-publisher guard in publish())
+let pendingSha = "";      // the sha we last ATTEMPTED to push (adopt it if a lost-ACK left the remote there) (#2)
 let lastReq = "";         // the last requestId we CONFIRMED (permanent skip)
 let processingReq = "";   // the requestId currently in flight (coalesce: don't re-enqueue it every tick)
 let finalized = false;    // a `final` has been confirmed -> freeze: publish nothing more until retire/scrub (Codex #6)
@@ -200,16 +225,24 @@ function checkRequest() {
   processingReq = requestId;
   writeAck({ requestId, status: "capturing" }); // "received", not "frozen-proven" — freeze is the worker's contract
   runExclusive(async () => {
-    const r = await publish(kind, { goal: req.goal, next: req.next });
-    if (r.ok) {
-      lastReq = requestId;
-      if (kind === "final") finalized = true; // freeze the handoff point; no later rescue can move the tip past it
-      writeAck({ requestId, status: "confirmed", sha: r.sha });
-      log(`${kind} ${requestId} -> ${r.sha}${r.unchanged ? " (unchanged)" : ""}`);
-    } else {
-      writeAck({ requestId, status: "error", error: r.error }); // leave lastReq unset so the worker may retry the same id
+    try {
+      if (finalized) { writeAck({ requestId, status: "error", error: "finalized" }); return; } // exec-time: a req queued before final (#3)
+      const r = await publish(kind, { goal: req.goal, next: req.next });
+      if (r.ok) {
+        lastReq = requestId;
+        if (kind === "final") finalized = true; // freeze the handoff point; no later rescue can move the tip past it
+        writeAck({ requestId, status: "confirmed", sha: r.sha });
+        log(`${kind} ${requestId} -> ${r.sha}${r.unchanged ? " (unchanged)" : ""}`);
+      } else {
+        writeAck({ requestId, status: "error", error: r.error }); // leave lastReq unset so the worker may retry the same id
+      }
+    } catch (err) {
+      // publish THREW (e.g. a transient fs/IO error). Without this the request would be stuck "capturing" forever
+      // and the same id skipped (processingReq never cleared) — Codex #8. Report an error so the worker can retry.
+      writeAck({ requestId, status: "error", error: `exception: ${err instanceof Error ? err.message : String(err)}` });
+    } finally {
+      processingReq = ""; // ALWAYS clear in-flight (retryable on error; a confirmed id is already skipped via lastReq)
     }
-    processingReq = ""; // clear in-flight (retryable on error; a confirmed id is already skipped via lastReq)
   });
 }
 
@@ -223,13 +256,19 @@ function tick() {
   if (rem <= 0 && !ending) {
     ending = true;
     runExclusive(async () => {
-      // If a clean final was already confirmed, do NOT publish a rescue past it (keep the frozen handoff tip).
-      if (!finalized) {
-        const r = await publish("rescue", { next: "deadline reached; box expiring" }); // best-effort, NOT a clean final
-        log(r.ok ? `deadline rescue -> ${r.sha}` : `deadline rescue FAILED: ${r.error}`);
-      } else log("deadline: finalized, keeping frozen final tip");
-      if (SCRUB) { log("scrub"); spawn("bash", [SCRUB], { env, stdio: "ignore" }).unref?.(); }
-      setTimeout(() => process.exit(0), 2000);
+      try {
+        // If a clean final was already confirmed, do NOT publish a rescue past it (keep the frozen handoff tip).
+        if (!finalized) {
+          const r = await publish("rescue", { next: "deadline reached; box expiring" }); // best-effort, NOT a clean final
+          log(r.ok ? `deadline rescue -> ${r.sha}` : `deadline rescue FAILED: ${r.error}`);
+        } else log("deadline: finalized, keeping frozen final tip");
+      } catch (err) {
+        log(`deadline rescue threw: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        // Scrub + exit MUST happen even if the rescue publish threw (Codex #8) — the box is dying regardless.
+        if (SCRUB) { log("scrub"); spawn("bash", [SCRUB], { env, stdio: "ignore" }).unref?.(); }
+        setTimeout(() => process.exit(0), 2000);
+      }
     });
     return;
   }
@@ -241,20 +280,44 @@ function tick() {
     if (finalized) { log(`T-${mins}m: finalized, no rescue (frozen final tip)`); continue; }
     log(`T-${mins}m (rem=${Math.round(rem)}s): poke + rescue publish`);
     runExclusive(async () => {
-      const r = await publish("rescue", { next: `T-${mins}m safety snapshot` });
-      log(r.ok ? `rescue -> ${r.sha}` : `rescue FAILED: ${r.error}`);
+      if (finalized) return; // exec-time re-check: a final confirmed while this was queued (#3) — don't publish past it
+      try {
+        const r = await publish("rescue", { next: `T-${mins}m safety snapshot` });
+        log(r.ok ? `rescue -> ${r.sha}` : `rescue FAILED: ${r.error}`);
+      } catch (err) {
+        log(`rescue threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
     });
   }
 
   checkRequest();
 }
 
-function main() {
+// Startup recovery (Codex #3): a restarted supervisor must learn, from the REMOTE, (a) our last published tip
+// (so the first publish's single-publisher guard doesn't flag it as foreign) and (b) whether a `final` was already
+// published — in which case freeze, so we never rescue over a remote final after a restart.
+async function recoverFromRemote() {
+  const ls = await git(["ls-remote", "origin", `refs/heads/${BRANCH}`]);
+  if (ls.code !== 0) { log(`startup: ls-remote failed (${ls.stderr.trim()}); proceeding without recovery`); return; }
+  const tip = (ls.stdout.split(/\s+/)[0] || "").trim();
+  if (!tip) return; // branch absent: fresh
+  lastPushedSha = tip; // single-publisher: the remote tip is ours
+  let f = await git(["fetch", "-q", "origin", tip]);
+  if (f.code !== 0) f = await git(["fetch", "-q", "origin", `refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}`]);
+  if (f.code !== 0) { log("startup: could not fetch tip; skipping finalized check"); return; }
+  const show = await git(["show", `${tip}:${MANIFEST_REL}`]);
+  if (show.code === 0) {
+    try { if (JSON.parse(show.stdout).kind === "final") { finalized = true; log("startup: recovered finalized=true from remote final tip"); } } catch {}
+  }
+}
+
+async function main() {
   mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
   log(`up: budget=${BUDGET_SEC}s deadlineWall=${DEADLINE_WALL} branch=${BRANCH} allowlist=[${ALLOWLIST.join(",")}]`);
+  await recoverFromRemote();
   tick();
   // NOT unref'd: this interval keeps the supervisor alive (Codex P1-1). git is async so the tick still fires during IO.
   setInterval(tick, POLL_MS);
 }
 
-main();
+void main();
