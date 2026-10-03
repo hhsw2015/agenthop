@@ -341,6 +341,9 @@ export type Projection = {
   conflicts: Array<{ eventId: string; reason: string }>;
   /** split events seen, with whether they separated a multi-incarnation entity (P2-5). */
   splits: Array<{ eventId: string; of: string; applied: boolean }>;
+  /** claims whose attribution was genuinely ambiguous — recorded for audit, excluded from all resolution,
+   *  never attached to a resolvable entity (review P1-3). */
+  undecided: Claim[];
   /** the projection may be missing events (a read error, or committed corruption was present). */
   incomplete: boolean;
 };
@@ -368,6 +371,10 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
   // cross-run copies of the same source assertion retire consistently, without touching a same-source hard run
   // (review P1-4).
   const correctedAssertions: Array<{ value: string; form: Form; source: string }> = [];
+  // claims whose attribution is genuinely ambiguous (several candidate parents / unknown binding) — held in an
+  // isolated pool that is NEVER a generation (so no later bootstrap can claim it) and never enters determinate
+  // resolution, yet still participates in the global revoke/correction invalidation below (review P1-3/P1-4).
+  const undecidedClaims: Claim[] = [];
 
   // 2. Generations per run. The transport (run) and the logical thread are different axes: an observe/learn
   //    routes to the run's generation that already holds its native (thread), adopting into a pre-native
@@ -450,23 +457,37 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
         // A no-native snapshot joins a pre-native generation; else, if it names its source root, it rejoins
         // THAT generation (a late pre-bootstrap snapshot of its own lineage); else it is an independent late
         // snapshot — NEVER the current thread, which there is no evidence it belongs to (review P1-3).
-        // Route EACH claim by its ORIGINAL binding, never by where a copy happens to sit. A derivative goes to
-        // the generation holding its explicit PARENT assertion (value + form), preferring the parent that shares
-        // its source; a non-derivative goes to the generation its source EVENT created. A tie (several candidate
-        // generations) or no binding stays undecided → residual, which joins a pre-native generation, else a
-        // fresh independent one — never the current thread or a copy's generation by default (review P1-3).
-        const uniqueGen = (cands: Gen[]): Gen | undefined => (cands.length === 1 ? cands[0] : undefined);
-        const routeDerivative = (c: Claim): Gen | undefined => {
-          const holders = gens.filter((x) => genClaims(x).some((p) => !p.superseded && p.value === c.derivedFrom!.value && p.form === c.derivedFrom!.form));
-          const sameSrc = c.source ? holders.filter((x) => genClaims(x).some((p) => p.value === c.derivedFrom!.value && p.form === c.derivedFrom!.form && p.source === c.source)) : [];
-          return uniqueGen(sameSrc.length > 0 ? sameSrc : holders);
+        // Route EACH claim of a no-native observe by its ORIGINAL binding (value+form+source), never by where a
+        // copy of that source happens to sit. A unique binding routes; SEVERAL candidate generations, or a
+        // derivative whose parent is unknown, is genuinely UNDECIDED (an isolated pool, excluded from
+        // resolution and never claimed by a later bootstrap); only a wholly-unbound claim is residual.
+        const routeClaim = (c: Claim): Gen | "undecided" | null => {
+          if (c.derivedFrom) {
+            // a DERIVATIVE joins the generation holding its explicit parent (value+form), same source preferred;
+            // a superseded parent still counts (a known-but-retired parent is NOT "no parent", review P1-3).
+            const holders = gens.filter((x) => genClaims(x).some((p) => p.value === c.derivedFrom!.value && p.form === c.derivedFrom!.form));
+            const sameSrc = c.source ? holders.filter((x) => genClaims(x).some((p) => p.value === c.derivedFrom!.value && p.form === c.derivedFrom!.form && p.source === c.source)) : [];
+            const cand = sameSrc.length > 0 ? sameSrc : holders;
+            return cand.length === 1 ? cand[0] : "undecided"; // ambiguous or unknown parent -> undecided, never residual
+          }
+          if (c.source) {
+            // a NON-DERIVATIVE joins the generation holding the same (value,form,source) ORIGINAL assertion, else
+            // the generation its source EVENT created -- a copy must not spawn a phantom owner (review P1-3).
+            const holders = gens.filter((x) => genClaims(x).some((p) => p.value === c.value && p.form === c.form && p.source === c.source));
+            if (holders.length === 1) return holders[0];
+            if (holders.length > 1) return "undecided";
+            const created = gens.find((x) => x.createdBy === c.source);
+            if (created) return created;
+          }
+          return null; // no source/parent binding -> a genuinely new pre-native snapshot -> residual
         };
         const byTarget = new Map<Gen, Claim[]>();
         const bucket = (g: Gen, c: Claim) => (byTarget.get(g) ?? byTarget.set(g, []).get(g)!).push(c);
         const residual: Claim[] = [];
         for (const c of src.claims) {
-          const tgt = c.derivedFrom ? routeDerivative(c) : (c.source ? gens.find((x) => x.createdBy === c.source) : undefined);
-          if (tgt) bucket(tgt, c);
+          const r = routeClaim(c);
+          if (r === "undecided") undecidedClaims.push({ ...c, source: c.source ?? e.eventId }); // excluded from resolution; never claimed by a later bootstrap
+          else if (r) bucket(r, c);
           else residual.push(c);
         }
         if (residual.length) {
@@ -498,9 +519,12 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
         const target = possible.length === 1 ? possible[0] : (possible.length === 0 && hard2.length === 1 ? hard2[0] : undefined);
         let g: Gen;
         if (target) {
-          const guess = genClaims(target).find((c) => c.form === e.form && c.value === e.from && !c.superseded);
-          if (guess?.source) correctedAssertions.push({ value: e.from, form: e.form, source: guess.source });
+          // Record EVERY source of the `from` native that is retired locally, so the cross-generation
+          // invalidation set matches the local retirement set exactly (review P1-4): all copied sources' late
+          // and cross-run copies retire, not just the first one found.
+          const sources = new Set(genClaims(target).filter((c) => c.form === e.form && c.value === e.from && !c.superseded).map((c) => c.source).filter((s): s is string => !!s));
           supersedeClosure(target, e.from, e.form);
+          for (const s of sources) correctedAssertions.push({ value: e.from, form: e.form, source: s });
           g = target;
         } else {
           g = gens.find((x) => !genHasHardNative(x)) ?? newGen(runKey, e.eventId);
@@ -515,17 +539,31 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
     // revoke/split handled structurally (revoke below; split after materialize).
   }
 
-  // 3. Post-fold invalidation + transitive derivation closure (review P1-4):
-  //  (a) a corrected guess invalidates its source assertion (value+form+source) in EVERY generation, so late
-  //      and cross-run copies retire consistently — scoped tightly so a same-source hard run is never caught;
-  //  (b) a revoke withdraws every claim carrying a revoked source;
-  //  then the derivation closure cascades both down the explicit parent edges, per generation.
-  for (const ca of correctedAssertions) {
-    for (const g of allGens) for (const c of genClaims(g)) if (!c.superseded && c.value === ca.value && c.form === ca.form && c.source === ca.source) c.superseded = true;
+  // 3. GLOBAL invalidation fixpoint over every claim — generations AND the undecided pool (review P1-4). A
+  //    claim is withdrawn when (a) its source was revoked, (b) its (value,form,source) matches a corrected
+  //    guess assertion, or (c) it is already superseded (a correction's local closure); then invalidation
+  //    propagates DOWN the explicit derivedFrom edge (same source) across ALL generations — so a copy that
+  //    carries only a derivative, whose parent lives and was retired in another generation, retires too. The
+  //    (value,form,source) scope keeps a same-source hard run untouched.
+  const invKey = (v: string, f: Form, src: string) => `${v}\u0000${f}\u0000${src}`;
+  const corrected = new Set(correctedAssertions.map((ca) => invKey(ca.value, ca.form, ca.source)));
+  const allClaims: Claim[] = [...allGens.flatMap((g) => genClaims(g)), ...undecidedClaims];
+  const invalid = new Set<string>();
+  for (const c of allClaims) {
+    if (c.source && (revokedEventIds.has(c.source) || corrected.has(invKey(c.value, c.form, c.source)))) c.superseded = true;
+    if (c.superseded && c.source) invalid.add(invKey(c.value, c.form, c.source));
   }
-  for (const g of allGens) {
-    for (const c of genClaims(g)) if (c.source && revokedEventIds.has(c.source)) c.superseded = true;
-    closeDerived(g);
+  let invChanged = true;
+  while (invChanged) {
+    invChanged = false;
+    for (const c of allClaims) {
+      if (c.superseded || !c.derivedFrom || !c.source) continue;
+      if (invalid.has(invKey(c.derivedFrom.value, c.derivedFrom.form, c.source))) {
+        c.superseded = true;
+        invalid.add(invKey(c.value, c.form, c.source));
+        invChanged = true;
+      }
+    }
   }
 
   // 4. Materialize entities — one per generation. entityId derived from the generation key ⇒ STABLE (P2-5).
@@ -589,7 +627,7 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
   }
 
   const incomplete = !!opts.incomplete || corruption.length > 0 || conflicts.length > 0;
-  return { entities, aliasIndex, possibleIndex, pidIndex, corruption, collisions, conflicts, splits, incomplete };
+  return { entities, aliasIndex, possibleIndex, pidIndex, corruption, collisions, conflicts, splits, undecided: undecidedClaims, incomplete };
 }
 
 function overlaps(a: Incarnation, b: Incarnation): boolean {
