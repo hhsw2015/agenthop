@@ -25,7 +25,7 @@ const revoke = (targetEventId: string, ts = 3): import("./bus-identity.js").Iden
 const split = (of: string, ts = 4): import("./bus-identity.js").IdentityEvent => ({ v: 1, eventId: mintEventId(() => `s-${of}-${ts}`), ts, type: "split", of, reason: "test" });
 const hard = (value: string, form: Claim["form"]): Claim => ({ value, form, confidence: "hard", provenance: "same-announce" });
 const poss = (value: string, form: Claim["form"]): Claim => ({ value, form, confidence: "possible", provenance: "heuristic" });
-const srcClaim = (value: string, form: Claim["form"], source: string, derivedFrom?: string): Claim => ({ value, form, confidence: "hard", provenance: "same-announce", source, ...(derivedFrom ? { derivedFrom } : {}) });
+const srcClaim = (value: string, form: Claim["form"], source: string, derivedFrom?: string, parentForm: Claim["form"] = "native"): Claim => ({ value, form, confidence: "hard", provenance: "same-announce", source, ...(derivedFrom ? { derivedFrom: { value: derivedFrom, form: parentForm } } : {}) });
 
 // --- ACCEPTANCE: 01a0ead5 (native) + 673c6525 (run) co-occur in ONE announce → one entity (must survive) ---
 {
@@ -128,10 +128,10 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
 {
   // P1-3 round-4: an explicit source beats an UNRELATED pre-native generation U (no "pre-native wins" default).
   const ev = [
-    obs("R", [hard("R", "run"), hard("A", "native"), { value: "old-A-handle", form: "handle", confidence: "hard", provenance: "same-announce", derivedFrom: "A" }], { ts: 1, eventId: "Aroot" }),
+    obs("R", [hard("R", "run"), hard("A", "native"), { value: "old-A-handle", form: "handle", confidence: "hard", provenance: "same-announce", derivedFrom: { value: "A", form: "native" } }], { ts: 1, eventId: "Aroot" }),
     learn("R", "A", "B", "thread-switch", true, { ts: 2, eventId: "Bswitch" }),
     obs("R", [hard("R", "run")], { ts: 3, eventId: "Uobs" }),                                   // no-native, no source → creates independent pre-native U
-    obs("R", [{ value: "old-A-handle", form: "handle", confidence: "hard", provenance: "same-announce", source: "Aroot", derivedFrom: "A" }], { ts: 4, eventId: "lateA" }), // source=Aroot → A, NOT U
+    obs("R", [{ value: "old-A-handle", form: "handle", confidence: "hard", provenance: "same-announce", source: "Aroot", derivedFrom: { value: "A", form: "native" } }], { ts: 4, eventId: "lateA" }), // source=Aroot → A, NOT U
   ];
   const proj = buildProjection(ev);
   const wh = whois(proj, "old-A-handle");
@@ -141,7 +141,7 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   // P1-3 round-4: routing is order-independent — a mixed-source no-native observe sends each claim to its own
   // source's generation regardless of claim order.
   const runC = { value: "R", form: "run" as const, confidence: "hard" as const, provenance: "same-announce" as const, source: "Bswitch" };
-  const hC = { value: "old-A-handle", form: "handle" as const, confidence: "hard" as const, provenance: "same-announce" as const, source: "Aroot", derivedFrom: "A" };
+  const hC = { value: "old-A-handle", form: "handle" as const, confidence: "hard" as const, provenance: "same-announce" as const, source: "Aroot", derivedFrom: { value: "A", form: "native" } };
   const base = (order: Claim[]) => [
     obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1, eventId: "Aroot" }),
     learn("R", "A", "B", "thread-switch", true, { ts: 2, eventId: "Bswitch" }),
@@ -158,6 +158,30 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   const w = whois(proj, idA);
   t("R4-P2-1: entityId that is also another entity's hard alias → candidates, not shadowed", w.kind === "candidates" && w.entities.length === 2);
 }
+{
+  // P1-3 round-5: a derivative routes to the generation holding its explicit PARENT (native A), NOT a
+  // generation that merely copied the same source's run claim.
+  const ev = [
+    obs("R", [hard("R", "run"), hard("Bnat", "native")], { ts: 1, eventId: "Bcreate" }),            // gen B (native Bnat)
+    obs("R", [srcClaim("R", "run", "S"), srcClaim("A", "native", "S")], { ts: 2, eventId: "S" }),    // A's announce S: native A + run R, source=S → gen A
+    obs("R", [srcClaim("R", "run", "S"), hard("Bnat", "native")], { ts: 3, eventId: "Bcopy" }),      // B copies run R source=S (with-native Bnat → B's gen)
+    obs("R", [srcClaim("H", "handle", "S", "A")], { ts: 4, eventId: "lateH" }),                      // late H: source=S, derivedFrom={A,native} → must route to A
+  ];
+  const proj = buildProjection(ev);
+  t("P1-3: a derivative routes by its parent native, not a generation that copied the source's run", eidOf(whois(proj, "H")) !== "" && eidOf(whois(proj, "H")) === eidOf(whois(proj, "A")) && eidOf(whois(proj, "H")) !== eidOf(whois(proj, "Bnat")));
+}
+{
+  // P1-3 round-5: a correction targets the POSSIBLE guess, never an independent hard identity of another thread.
+  const ev = [
+    obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1, eventId: "hardA" }),  // old independent hard A
+    obs("R", [srcClaim("R", "run", "uobs")], { ts: 2, eventId: "uobs" }),             // no-native residual → pre-native U
+    learn("R", undefined, "A", "bootstrap", false, { ts: 3 }),                         // U gains the only possible A
+    learn("R", "A", "C", "correction", true, { ts: 4 }),                               // correct A→C: must hit U's guess
+  ];
+  const proj = buildProjection(ev);
+  const idHardA = eidOf(whois(buildProjection([obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1, eventId: "hardA" })]), "A"));
+  t("P1-3: correction hits the possible guess, the independent hard A keeps its identity", whois(proj, "A").kind === "entity" && eidOf(whois(proj, "A")) === idHardA && whois(proj, "C").kind === "entity" && eidOf(whois(proj, "C")) !== idHardA);
+}
 
 // --- P1-4: source-scoped, transitive revoke/correction (no global value blacklist) ---
 {
@@ -168,15 +192,15 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   t("P1-4: the revoked run no longer resolves", whois(proj, "R").kind === "not-seen");
 }
 {
-  const handle: Claim = { value: "tool:dir-A", form: "handle", confidence: "hard", provenance: "same-announce", derivedFrom: "A" };
+  const handle: Claim = { value: "tool:dir-A", form: "handle", confidence: "hard", provenance: "same-announce", derivedFrom: { value: "A", form: "native" } };
   const e1 = obs("R", [hard("R", "run"), hard("A", "native"), handle], { ts: 1 });
   const proj = buildProjection([e1, revoke(e1.eventId)]);
   t("P1-4: revoked source's native + derived handle both gone", whois(proj, "A").kind === "not-seen" && whois(proj, "tool:dir-A").kind === "not-seen");
 }
 {
   // correction cascades transitively: native A → handle H (derivedFrom A) → presence P (derivedFrom H).
-  const H: Claim = { value: "H", form: "handle", confidence: "hard", provenance: "same-announce", derivedFrom: "A" };
-  const P: Claim = { value: "P", form: "presence", confidence: "hard", provenance: "same-announce", derivedFrom: "H" };
+  const H: Claim = { value: "H", form: "handle", confidence: "hard", provenance: "same-announce", derivedFrom: { value: "A", form: "native" } };
+  const P: Claim = { value: "P", form: "presence", confidence: "hard", provenance: "same-announce", derivedFrom: { value: "H", form: "handle" } };
   const proj = buildProjection([obs("R", [hard("R", "run"), hard("A", "native"), H, P], { ts: 1 }), learn("R", "A", "B", "correction", true, { ts: 2 })]);
   t("P1-4 correction_cascades_transitive_derivatives: A, H, P all retired", whois(proj, "A").kind === "not-seen" && whois(proj, "H").kind === "not-seen" && whois(proj, "P").kind === "not-seen");
   t("P1-4: the corrected value resolves", whois(proj, "B").kind === "entity");
@@ -211,7 +235,7 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   // P1-4 residual: closeDerived must cascade down the derivation EDGE, not across a bare literal. S1/S2 (same
   // run R) each independently hard native A; H derives from S2's A; C1 copies A with source=S1; revoke S1 →
   // S2's A and its H both survive (only the S1-sourced copy is withdrawn).
-  const S2 = obs("R", [hard("R", "run"), hard("A", "native"), { value: "H", form: "handle", confidence: "hard", provenance: "same-announce", source: "S2", derivedFrom: "A" }], { ts: 2, eventId: "S2", busPid: 1 });
+  const S2 = obs("R", [hard("R", "run"), hard("A", "native"), { value: "H", form: "handle", confidence: "hard", provenance: "same-announce", source: "S2", derivedFrom: { value: "A", form: "native" } }], { ts: 2, eventId: "S2", busPid: 1 });
   const C1 = obs("R", [srcClaim("A", "native", "S1")], { ts: 3, eventId: "C1", busPid: 1 });
   const proj = buildProjection([obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1, eventId: "S1", busPid: 1 }), S2, C1, revoke("S1")]);
   t("P1-4 independent source: revoking S1 leaves S2's hard A resolvable", whois(proj, "A").kind === "entity");
@@ -221,7 +245,7 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   // P1-4 (round-4 P2, other direction): a corrected guess's derivatives must RETIRE even when an INDEPENDENT
   // same-literal claim is live — they are retired with their OWN parent (same source), not by the bare literal.
   const ev = [
-    obs("Rg", [hard("Rg", "run"), poss("A", "native"), { value: "guess-H", form: "handle", confidence: "possible", provenance: "heuristic", derivedFrom: "A" }, { value: "guess-P", form: "presence", confidence: "possible", provenance: "heuristic", derivedFrom: "guess-H" }], { ts: 1, eventId: "gobs" }),
+    obs("Rg", [hard("Rg", "run"), poss("A", "native"), { value: "guess-H", form: "handle", confidence: "possible", provenance: "heuristic", derivedFrom: { value: "A", form: "native" } }, { value: "guess-P", form: "presence", confidence: "possible", provenance: "heuristic", derivedFrom: { value: "guess-H", form: "handle" } }], { ts: 1, eventId: "gobs" }),
     learn("Rg", "A", "B", "correction", true, { ts: 2 }),
     obs("Rind", [hard("Rind", "run"), hard("A", "native")], { ts: 1 }),
   ];
@@ -231,6 +255,47 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   const gH = claims.find((c) => c.value === "guess-H"), gP = claims.find((c) => c.value === "guess-P");
   t("P1-4 (P2): a corrected guess's derivatives retire even with an independent live same-literal", !!gH && gH.superseded === true && !!gP && gP.superseded === true);
   t("P1-4 (P2): the independent live A is unaffected", whois(proj, "Rind").kind === "entity" && whois(proj, "A").kind === "entity");
+}
+{
+  // P1-4 round-5: a correction's invalidation reaches LATE copies of the corrected source assertion.
+  const gp = (v: string, f: Claim["form"], df?: { value: string; form: Claim["form"] }): Claim => ({ value: v, form: f, confidence: "possible", provenance: "heuristic", source: "gsrc", ...(df ? { derivedFrom: df } : {}) });
+  const ev = [
+    obs("Rg", [hard("Rg", "run"), gp("A", "native"), gp("H", "handle", { value: "A", form: "native" })], { ts: 1, eventId: "gobs" }),
+    learn("Rg", "A", "B", "correction", true, { ts: 2 }),
+    obs("Rg", [gp("A", "native")], { ts: 3, eventId: "lateA" }),                        // late copy of the corrected guess A (source gsrc)
+    obs("Rg", [gp("H", "handle", { value: "A", form: "native" })], { ts: 4, eventId: "lateH" }), // late copy of its derivative
+  ];
+  const proj = buildProjection(ev);
+  const rg = whois(proj, "Rg");
+  const claims = rg.kind === "entity" ? rg.entity.incarnations.flatMap((i) => i.claims) : [];
+  const guessClaims = claims.filter((c) => (c.value === "A" && c.form === "native") || (c.value === "H" && c.form === "handle"));
+  t("P1-4 (P2): late copies of a corrected guess (and derivatives) all retire", guessClaims.length >= 3 && guessClaims.every((c) => c.superseded === true) && whois(proj, "B").kind === "entity");
+}
+{
+  // P1-4 round-5: the invalidation also reaches a CROSS-RUN copy of the corrected source assertion.
+  const gp = (v: string, f: Claim["form"], df?: { value: string; form: Claim["form"] }): Claim => ({ value: v, form: f, confidence: "possible", provenance: "heuristic", source: "xsrc", ...(df ? { derivedFrom: df } : {}) });
+  const ev = [
+    obs("Rorig", [hard("Rorig", "run"), gp("A", "native"), gp("H", "handle", { value: "A", form: "native" })], { ts: 1, eventId: "oobs" }),
+    obs("Rother", [hard("Rother", "run"), gp("A", "native"), gp("H", "handle", { value: "A", form: "native" })], { ts: 2, eventId: "copyobs" }),
+    learn("Rorig", "A", "B", "correction", true, { ts: 3 }),
+  ];
+  const proj = buildProjection(ev);
+  const other = whois(proj, "Rother");
+  const oc = other.kind === "entity" ? other.entity.incarnations.flatMap((i) => i.claims) : [];
+  const oA = oc.find((c) => c.value === "A" && c.form === "native"), oH = oc.find((c) => c.value === "H" && c.form === "handle");
+  t("P1-4 (P2): a cross-run copy of the corrected guess + its derivative retire", !!oA && oA.superseded === true && !!oH && oH.superseded === true);
+}
+{
+  // P1-4 round-5: within one observe where run and native share a literal+source, the native's handle retires
+  // with the NATIVE (matched by form), and the hard run of the same literal is preserved.
+  const ev = [
+    obs("X", [{ value: "X", form: "run", confidence: "hard", provenance: "same-announce" }, { value: "X", form: "native", confidence: "possible", provenance: "heuristic" }, { value: "H", form: "handle", confidence: "possible", provenance: "heuristic", derivedFrom: { value: "X", form: "native" } }], { ts: 1, eventId: "obs1" }),
+    learn("X", "X", "B", "correction", true, { ts: 2 }),
+  ];
+  const w = whois(buildProjection(ev), "X");
+  const claims = w.kind === "entity" ? w.entity.incarnations.flatMap((i) => i.claims) : [];
+  const runX = claims.find((c) => c.value === "X" && c.form === "run"), natX = claims.find((c) => c.value === "X" && c.form === "native"), h = claims.find((c) => c.value === "H" && c.form === "handle");
+  t("P1-4 (P2): same-literal — native retired + handle retired, hard run preserved", !!runX && !runX.superseded && !!natX && natX.superseded === true && !!h && h.superseded === true);
 }
 {
   const proj = buildProjection([obs("R", [hard("R", "run"), poss("A", "native")], { ts: 1 }), learn("R", "A", "A", "correction", true, { ts: 2 })]);

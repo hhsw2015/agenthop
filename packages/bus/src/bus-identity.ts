@@ -67,9 +67,11 @@ export type Claim = {
   /** The ROOT assertion (eventId) this claim came from — the anchor for source-scoped, replayable revoke.
    *  A propagated copy keeps the origin's source, so revoking the origin withdraws the copy too (review P1-4). */
   source?: string;
-  /** The value this claim was derived from (e.g. a handle built from a native) — the edge a revoke/correction
-   *  cascades down, transitively (native → handle → presence) (review P1-4). */
-  derivedFrom?: string;
+  /** An EXPLICIT reference to the parent assertion this claim was derived from — its value AND form (e.g. a
+   *  handle built from a native is `{ value: <nativeValue>, form: "native" }`; an initial handle built from a
+   *  run is `{ value: <runId>, form: "run" }`). Routing and revoke/correction cascade follow this edge
+   *  precisely, so a same-literal claim of a DIFFERENT form is never mistaken for the parent (review P1-3/P1-4). */
+  derivedFrom?: { value: string; form: Form };
   /** Retired by a thread-switch's old generation keeping history, a correction, or a revoke; kept for the
    *  record but excluded from all resolution. */
   superseded?: boolean;
@@ -169,10 +171,15 @@ export function isValidEvent(x: unknown): x is IdentityEvent {
 function isValidClaim(c: unknown): boolean {
   if (typeof c !== "object" || c === null) return false;
   const k = c as Record<string, unknown>;
-  return typeof k.value === "string" && k.value !== ""
+  if (!(typeof k.value === "string" && k.value !== ""
     && typeof k.form === "string" && FORMS.has(k.form)
     && typeof k.confidence === "string" && CONFIDENCES.has(k.confidence)
-    && typeof k.provenance === "string" && PROVENANCES.has(k.provenance);
+    && typeof k.provenance === "string" && PROVENANCES.has(k.provenance))) return false;
+  if (k.derivedFrom !== undefined) { // the parent reference, when present, must name a value AND a valid form
+    const d = k.derivedFrom as Record<string, unknown> | null;
+    if (typeof d !== "object" || d === null || typeof d.value !== "string" || d.value === "" || typeof d.form !== "string" || !FORMS.has(d.form)) return false;
+  }
+  return true;
 }
 function isPosInt(n: unknown): boolean {
   return typeof n === "number" && Number.isInteger(n) && n > 0;
@@ -294,7 +301,7 @@ export function hostPidFrom(env: NodeJS.ProcessEnv = process.env): number | unde
 export function recordSelfObserve(home: string, self: SelfLike, nativeAuthoritative: boolean, scope: Scope = "local", env: NodeJS.ProcessEnv = process.env): boolean {
   const claims: Claim[] = [
     { value: self.id, form: "run", confidence: "hard", provenance: "same-announce" },
-    { value: self.title, form: "handle", confidence: nativeAuthoritative || !self.stableId ? "hard" : "possible", provenance: "same-announce", ...(self.stableId ? { derivedFrom: self.stableId } : {}) },
+    { value: self.title, form: "handle", confidence: nativeAuthoritative || !self.stableId ? "hard" : "possible", provenance: "same-announce", ...(self.stableId ? { derivedFrom: { value: self.stableId, form: "native" as Form } } : {}) },
   ];
   if (self.stableId) claims.push({ value: self.stableId, form: "native", confidence: nativeAuthoritative ? "hard" : "possible", provenance: "same-announce" });
   return appendEvent(home, {
@@ -357,6 +364,10 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
   // 1. Revoked event ids (the targets of revoke events).
   const revokedEventIds = new Set<string>();
   for (const e of ordered) if (e.type === "revoke") revokedEventIds.add(e.targetEventId);
+  // corrected guess assertions (value+form+source) — invalidated across ALL generations post-fold so late and
+  // cross-run copies of the same source assertion retire consistently, without touching a same-source hard run
+  // (review P1-4).
+  const correctedAssertions: Array<{ value: string; form: Form; source: string }> = [];
 
   // 2. Generations per run. The transport (run) and the logical thread are different axes: an observe/learn
   //    routes to the run's generation that already holds its native (thread), adopting into a pre-native
@@ -395,22 +406,20 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
   };
   const closeDerived = (g: Gen) => {
     const all = genClaims(g);
-    const everExisted = new Set(all.map((c) => c.value));
     let changed = true;
     while (changed) {
       changed = false;
       for (const c of all) {
         if (c.superseded || !c.derivedFrom) continue;
-        // Cascade down the SPECIFIC parent edge. Prefer the parent assertion that shares this claim's source
-        // (same origin event): a derivative is retired with ITS parent, so a corrected guess's handle retires
-        // even while an INDEPENDENT same-literal claim stays live — and an independent source's handle is not
-        // killed by a different source's revoke (review P1-4, both directions). Only when no same-source parent
-        // exists do we fall back to "the value is fully dead".
-        const sameSource = all.filter((p) => p !== c && p.value === c.derivedFrom && p.source === c.source);
-        const retire = sameSource.length > 0
-          ? sameSource.every((p) => p.superseded)
-          : everExisted.has(c.derivedFrom) && !all.some((p) => !p.superseded && p.value === c.derivedFrom);
-        if (retire) { c.superseded = true; changed = true; }
+        // Cascade down the EXPLICIT parent edge: the parent is the claim matching the derivedFrom reference by
+        // BOTH value and form — so a same-literal claim of a different form (a hard run next to the native it
+        // shares a literal with) is never mistaken for the parent (review P1-4). Prefer the parent sharing this
+        // claim's source (same origin assertion): a derivative retires with ITS parent even while an
+        // independent same-literal claim stays live, and is not killed by a different source's revoke.
+        const parents = all.filter((p) => p !== c && p.value === c.derivedFrom!.value && p.form === c.derivedFrom!.form);
+        const sameSource = parents.filter((p) => p.source === c.source);
+        const effective = sameSource.length > 0 ? sameSource : parents;
+        if (effective.length > 0 && effective.every((p) => p.superseded)) { c.superseded = true; changed = true; }
       }
     }
   };
@@ -441,17 +450,22 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
         // A no-native snapshot joins a pre-native generation; else, if it names its source root, it rejoins
         // THAT generation (a late pre-bootstrap snapshot of its own lineage); else it is an independent late
         // snapshot — NEVER the current thread, which there is no evidence it belongs to (review P1-3).
-        // Route EACH claim to the generation its OWN explicit source names — an explicit, verifiable root
-        // beats any pre-native guess, the result is order-independent, and claims whose sources name different
-        // logical identities stay with their own (never forced into one). Claims without a source, or whose
-        // source names no existing generation, form a residual that joins a pre-native generation, else a
-        // fresh independent one — never the current thread by default (review P1-3).
-        const findBySource = (s: string): Gen | undefined => gens.find((x) => x.createdBy === s) ?? gens.find((x) => genClaims(x).some((c) => c.source === s));
+        // Route EACH claim by its ORIGINAL binding, never by where a copy happens to sit. A derivative goes to
+        // the generation holding its explicit PARENT assertion (value + form), preferring the parent that shares
+        // its source; a non-derivative goes to the generation its source EVENT created. A tie (several candidate
+        // generations) or no binding stays undecided → residual, which joins a pre-native generation, else a
+        // fresh independent one — never the current thread or a copy's generation by default (review P1-3).
+        const uniqueGen = (cands: Gen[]): Gen | undefined => (cands.length === 1 ? cands[0] : undefined);
+        const routeDerivative = (c: Claim): Gen | undefined => {
+          const holders = gens.filter((x) => genClaims(x).some((p) => !p.superseded && p.value === c.derivedFrom!.value && p.form === c.derivedFrom!.form));
+          const sameSrc = c.source ? holders.filter((x) => genClaims(x).some((p) => p.value === c.derivedFrom!.value && p.form === c.derivedFrom!.form && p.source === c.source)) : [];
+          return uniqueGen(sameSrc.length > 0 ? sameSrc : holders);
+        };
         const byTarget = new Map<Gen, Claim[]>();
         const bucket = (g: Gen, c: Claim) => (byTarget.get(g) ?? byTarget.set(g, []).get(g)!).push(c);
         const residual: Claim[] = [];
         for (const c of src.claims) {
-          const tgt = c.source ? findBySource(c.source) : undefined;
+          const tgt = c.derivedFrom ? routeDerivative(c) : (c.source ? gens.find((x) => x.createdBy === c.source) : undefined);
           if (tgt) bucket(tgt, c);
           else residual.push(c);
         }
@@ -474,18 +488,41 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
         const inc = lastInc(g, e.ts);
         addClaim(inc, { value: runKey, form: "run", confidence: "hard", provenance: "same-announce", source: e.eventId });
         addClaim(inc, { value: e.to, form: e.form, confidence: conf, provenance, source: e.eventId });
+      } else if (e.kind === "correction" && e.from && e.from !== e.to) {
+        // Locate the SPECIFIC guess being corrected: the run's generation holding `from` as a non-superseded
+        // POSSIBLE native. Prefer that; else a single HARD holder (a legitimate same-identity re-correction).
+        // If zero or several candidates, stay undecided — record `to` WITHOUT retiring a hard identity that may
+        // belong to another logical thread (review P1-3). Never fall back to "first holder".
+        const held = (want: Confidence) => gens.filter((x) => genClaims(x).some((c) => c.form === e.form && c.value === e.from && c.confidence === want && !c.superseded));
+        const possible = held("possible"), hard2 = held("hard");
+        const target = possible.length === 1 ? possible[0] : (possible.length === 0 && hard2.length === 1 ? hard2[0] : undefined);
+        let g: Gen;
+        if (target) {
+          const guess = genClaims(target).find((c) => c.form === e.form && c.value === e.from && !c.superseded);
+          if (guess?.source) correctedAssertions.push({ value: e.from, form: e.form, source: guess.source });
+          supersedeClosure(target, e.from, e.form);
+          g = target;
+        } else {
+          g = gens.find((x) => !genHasHardNative(x)) ?? newGen(runKey, e.eventId);
+        }
+        addClaim(lastInc(g, e.ts), { value: e.to, form: e.form, confidence: conf, provenance, source: e.eventId });
       } else {
-        // bootstrap / correction / self-confirm — stay on the thread's own generation.
-        let g = (e.from ? gens.find((x) => genHeldNative(x, e.from!)) : undefined) ?? gens.find((x) => !genHasHardNative(x));
-        if (!g) g = newGen(runKey, e.eventId);
-        if (e.kind === "correction" && e.from && e.from !== e.to) supersedeClosure(g, e.from, e.form);
+        // bootstrap / self-confirm (from === to) / no-from — stay on the thread's own generation.
+        const g = (e.from ? gens.find((x) => genHeldNative(x, e.from!)) : undefined) ?? gens.find((x) => !genHasHardNative(x)) ?? newGen(runKey, e.eventId);
         addClaim(lastInc(g, e.ts), { value: e.to, form: e.form, confidence: conf, provenance, source: e.eventId });
       }
     }
     // revoke/split handled structurally (revoke below; split after materialize).
   }
 
-  // 3. Source-scoped revoke (across events) + transitive derivation closure (review P1-4).
+  // 3. Post-fold invalidation + transitive derivation closure (review P1-4):
+  //  (a) a corrected guess invalidates its source assertion (value+form+source) in EVERY generation, so late
+  //      and cross-run copies retire consistently — scoped tightly so a same-source hard run is never caught;
+  //  (b) a revoke withdraws every claim carrying a revoked source;
+  //  then the derivation closure cascades both down the explicit parent edges, per generation.
+  for (const ca of correctedAssertions) {
+    for (const g of allGens) for (const c of genClaims(g)) if (!c.superseded && c.value === ca.value && c.form === ca.form && c.source === ca.source) c.superseded = true;
+  }
   for (const g of allGens) {
     for (const c of genClaims(g)) if (c.source && revokedEventIds.has(c.source)) c.superseded = true;
     closeDerived(g);
