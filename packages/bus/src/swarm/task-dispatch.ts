@@ -1,0 +1,111 @@
+/**
+ * task-dispatch — the PURE dispatch-side decider for the swarm-dispatch taskPass (brain §4.5-6). Mirrors
+ * dispatch-step.ts: all decisions are pure over injected/parameter inputs; scripts/swarm-dispatch.ts does the git O1
+ * scan, commitControl, token mint and box IO around it.
+ *
+ * This file is the DISPATCH half (ready task -> what to send). The ACCEPT half (observation -> verdict -> state
+ * changes) is judgeObservation, added alongside once the commit seq/event conventions are pinned. Seqs are PARAMETERS
+ * (the state modules never invent seqs — the caller passes the commit seq), so this stays unit-testable offline.
+ */
+
+import type { TaskPlan } from "./task-plan.js";
+import {
+  type TaskAttempt, type ExecutionBinding, attemptIdOf, bindingIdOf, createAttempt, makeSuccessionAttempt,
+} from "./task-state.js";
+import type { ReadyTask } from "./task-ready.js";
+import { buildAssignment, tokenFits, type Assignment } from "./task-assignment.js";
+import { buildDispatchIntent, type IntentTiming } from "./task-intent.js";
+import type { DispatchIntent } from "./control-log.js";
+
+export type DispatchParams = {
+  /** The fresh box's remaining life (for the token gate + the assignment soft deadline). */
+  remainingLifeSec: number;
+  checkpointBudgetSec: number;
+  handoffMarginSec: number;
+  /** Token-margin headroom (§4.5-3). */
+  tokenMarginSec: number;
+  /** Work budget: workDeadline = nowSec + budgetSec. */
+  budgetSec: number;
+  nowSec: number;
+  /** The commit seq the new attempt/binding reference (caller's convention — see control-log). */
+  atSeq: number;
+};
+
+export type PreparedDispatch =
+  | {
+      ok: true;
+      attempt: TaskAttempt;
+      /** Set only on a retry succession: the old RETRY_WAIT attempt turned ABANDONED (commit in the SAME batch). */
+      abandonedOld?: TaskAttempt;
+      binding: ExecutionBinding;
+      assignment: Assignment;
+      intent: DispatchIntent;
+    }
+  | { ok: false; reason: string };
+
+/**
+ * Prepare ONE ready node for dispatch: pick the attempt (fresh, or a succession inheriting retriesUsed from an expired
+ * RETRY_WAIT predecessor), open its first ExecutionBinding, build the assignment + the pre-IO DispatchIntent. Refuses
+ * (ok:false) when the node is absent from the plan or the token would not outlive the estimated runtime + margin.
+ */
+export function prepareDispatch(
+  plan: TaskPlan,
+  ready: ReadyTask,
+  attempts: TaskAttempt[],
+  launchId: string,
+  assignmentId: string,
+  params: DispatchParams,
+): PreparedDispatch {
+  const spec = plan.nodes.find((n) => n.nodeId === ready.nodeId);
+  if (!spec) return { ok: false, reason: `node ${ready.nodeId} not in plan` };
+
+  const fit = tokenFits({ remainingLifeSec: params.remainingLifeSec, estimatedRuntimeSec: spec.estimatedRuntimeSec, marginSec: params.tokenMarginSec });
+  if (!fit.fits) {
+    return { ok: false, reason: `token margin: effective ttl ${fit.effectiveTtlSec}s < est ${spec.estimatedRuntimeSec}s + margin ${params.tokenMarginSec}s` };
+  }
+
+  const nodeAttempts = attempts.filter((a) => a.nodeId === ready.nodeId);
+  const n = nodeAttempts.length;
+  const attemptId = attemptIdOf(plan.jobId, ready.nodeId, n);
+  const binding: ExecutionBinding = {
+    bindingId: bindingIdOf(attemptId, 0),
+    assignmentId,
+    launchId,
+    publishGeneration: 0,
+    openedAtSeq: params.atSeq,
+  };
+  const baseSourceCommit = spec.outputContract.baseSourceCommit;
+
+  // A ready node with an EXPIRED RETRY_WAIT predecessor is a retry succession (inherit retriesUsed, abandon the old in
+  // the same batch); anything else is a fresh attempt. readyTasks only surfaces an expired RETRY_WAIT or a truly fresh
+  // node, so at most one such predecessor exists.
+  const retryOld = nodeAttempts.find((a) => a.status === "RETRY_WAIT" && a.retryAt !== undefined && params.nowSec >= a.retryAt);
+  let attempt: TaskAttempt;
+  let abandonedOld: TaskAttempt | undefined;
+  if (retryOld) {
+    const s = makeSuccessionAttempt(retryOld, {
+      n, specDigest: spec.specDigest, inputBindings: ready.proposedBindings,
+      ...(baseSourceCommit !== undefined ? { baseSourceCommit } : {}),
+      firstBinding: binding, createdAtSeq: params.atSeq,
+    });
+    if ("error" in s) return { ok: false, reason: `succession: ${s.error}` };
+    attempt = s.next;
+    abandonedOld = s.abandonedOld;
+  } else {
+    attempt = createAttempt({
+      jobId: plan.jobId, nodeId: ready.nodeId, n, planRevision: plan.planRevision, specDigest: spec.specDigest,
+      inputBindings: ready.proposedBindings,
+      ...(baseSourceCommit !== undefined ? { baseSourceCommit } : {}),
+      firstBinding: binding, createdAtSeq: params.atSeq,
+    });
+  }
+
+  const assignment = buildAssignment({
+    attempt, spec, binding,
+    remainingLifeSec: params.remainingLifeSec, checkpointBudgetSec: params.checkpointBudgetSec, handoffMarginSec: params.handoffMarginSec,
+  });
+  const timing: IntentTiming = { allocRequestStartSec: params.nowSec, workDeadlineSec: params.nowSec + params.budgetSec };
+  const intent = buildDispatchIntent(assignment, timing);
+
+  return { ok: true, attempt, ...(abandonedOld ? { abandonedOld } : {}), binding, assignment, intent };
+}
