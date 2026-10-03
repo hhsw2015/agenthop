@@ -24,11 +24,13 @@ function changes(wait: WaitRecord, n: number): Change[] {
   return [{ put: "wait", wait, operationId: `wait:${wait.waitId}#${n}`, expectedEntityRevision: n - 1 } as Change];
 }
 function doneLog(): CommittedBatch[] {
+  // Resolved terminal is reached via close (subject completion), not action_done — a timeout action only re-arms
+  // (§0b erratum 94284fc2). The intermediate action_pending is still exercised (begin_action), then close resolves.
   const open = w();
   const pending = advanceWait(open, { type: "begin_action", pendingAction: action });
   if (!pending.ok) throw new Error("begin");
-  const done = advanceWait(pending.wait, { type: "action_done", resolution: { outcome: "bypassed", reason: "confirmed", sourceOperationId: "a1" } });
-  if (!done.ok) throw new Error("done");
+  const done = advanceWait(pending.wait, { type: "close", resolution: { outcome: "subject-completed", reason: "confirmed", sourceOperationId: "a1" } });
+  if (!done.ok) throw new Error("close");
   return [{ seq: 1, changes: changes(open, 1) }, { seq: 2, changes: changes(pending.wait, 2) }, { seq: 3, changes: changes(done.wait, 3) }];
 }
 const waitBody = (s: ReturnType<typeof initialLogState>, key: string): WaitRecord => {

@@ -26,15 +26,24 @@ describe("openWait", () => {
 });
 
 describe("three-phase decide->execute->confirm (P1-1 crash windows)", () => {
-  test("reversible wait: open -> begin_action -> action_pending (intent persisted) -> action_done -> resolved", () => {
+  test("reversible wait: action_done RE-ARMS (open + new deadline + escalatedAt), it does NOT resolve (§0b erratum 94284fc2)", () => {
     const o = mkWait();
     const p = advanceWait(o, { type: "begin_action", pendingAction: bypass });
     expect(p.ok && p.wait.state === "action_pending" && p.wait.pendingAction?.actionId === "b1").toBe(true);
-    const d = advanceWait(p.ok ? p.wait : o, { type: "action_done", resolution: res("bypassed") });
-    expect(d.ok && d.wait.state === "resolved" && d.wait.pendingAction === undefined && d.wait.resolution?.outcome === "bypassed").toBe(true);
+    const rearmed = advanceWait(p.ok ? p.wait : o, { type: "action_done", newDeadlineSec: 300, nowSec: 150 });
+    expect(rearmed.ok).toBe(true);
+    if (rearmed.ok) {
+      expect(rearmed.wait.state).toBe("open"); // NOT resolved — a bypass delivery is not completion evidence
+      expect(rearmed.wait.deadlineSec).toBe(300);
+      expect(rearmed.wait.escalatedAt).toBe(150);
+      expect(rearmed.wait.pendingAction).toBeUndefined();
+    }
+    // a reversible wait resolves ONLY when the subject completes (close).
+    const resolved = advanceWait(rearmed.ok ? rearmed.wait : o, { type: "close", resolution: res("subject-completed") });
+    expect(resolved.ok && resolved.wait.state === "resolved").toBe(true);
   });
   test("cannot confirm without a committed intent: action_done only from action_pending; begin_action only from open", () => {
-    expect(advanceWait(mkWait(), { type: "action_done" }).ok).toBe(false); // open -> action_done is illegal
+    expect(advanceWait(mkWait(), { type: "action_done", newDeadlineSec: 200 }).ok).toBe(false); // open -> action_done is illegal
     const ap = advanceWait(mkWait(), { type: "begin_action", pendingAction: bypass });
     expect(ap.ok && advanceWait(ap.wait, { type: "begin_action", pendingAction: bypass }).ok === false).toBe(true); // double begin
   });
@@ -55,10 +64,6 @@ describe("approval: resolved != granted; escalation notice does NOT end the appr
       expect(done.wait.pendingAction).toBeUndefined();
       expect(done.wait.grantRef).toBeUndefined(); // escalation never grants
     }
-  });
-  test("action_done on a still-pending approval WITHOUT newDeadlineSec is rejected (would drop supervision)", () => {
-    const p = advanceWait(mkApproval(), { type: "begin_action", pendingAction: notice });
-    expect(p.ok && advanceWait(p.wait, { type: "action_done" }).ok === false).toBe(true);
   });
   test("only a real terminal decision resolves an approval; granted records the grant", () => {
     const granted = advanceWait(mkApproval(), { type: "decide", decision: "granted", grantRef: "g1", resolution: res("approved") });
@@ -86,7 +91,7 @@ describe("close (P2-1 race) + terminal guards", () => {
   test("no transition out of resolved (a late action completion is a no-op for the caller)", () => {
     const r = advanceWait(mkWait(), { type: "close", resolution: res("done") });
     const resolved = r.ok ? r.wait : mkWait();
-    for (const ev of [{ type: "begin_action", pendingAction: bypass }, { type: "action_done" }, { type: "decide", decision: "granted" }, { type: "close", resolution: res("x") }] as const) {
+    for (const ev of [{ type: "begin_action", pendingAction: bypass }, { type: "action_done", newDeadlineSec: 200 }, { type: "decide", decision: "granted" }, { type: "close", resolution: res("x") }] as const) {
       expect(advanceWait(resolved, ev).ok).toBe(false);
     }
   });
