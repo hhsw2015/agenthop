@@ -100,7 +100,12 @@ function jobBudgetExhausted(usage: JobUsage, plan: TaskPlan): boolean {
 }
 
 /** A node has an active attempt when a same-task (specDigest-matching) attempt is RUNNING / RESULT_PENDING_VALIDATION
- *  / RETRY_WAIT-not-yet-due. An EXPIRED RETRY_WAIT is NOT active (the node becomes ready for a succession). */
+ *  / RETRY_WAIT not-yet-due. A RETRY_WAIT counts ACTIVE unless it is DEFINITELY expired (retryAt set AND now past it);
+ *  an attempt with an (ill-formed) undefined retryAt is treated as active — conservative, so readyTasks never
+ *  dispatches a second attempt while the old one is still RETRY_WAIT and un-superseded (fe0376cd T2 review #1, the
+ *  "at most one active attempt" invariant hole; option i, matching the flat-record runtime-guard style of control.ts).
+ *  advanceAttempt always writes retryAt on the RETRY_WAIT transitions, so a defined retryAt is the normal case; an
+ *  EXPIRED RETRY_WAIT is the ONLY not-active RETRY_WAIT, and it is exactly the one readyTasks hands to a succession. */
 function hasActiveAttempt(node: TaskSpec, ctx: Ctx, now: number): boolean {
   return ctx.attempts.some(
     (a) =>
@@ -108,7 +113,7 @@ function hasActiveAttempt(node: TaskSpec, ctx: Ctx, now: number): boolean {
       a.specDigest === node.specDigest &&
       (a.status === "RUNNING" ||
         a.status === "RESULT_PENDING_VALIDATION" ||
-        (a.status === "RETRY_WAIT" && a.retryAt !== undefined && now < a.retryAt)),
+        (a.status === "RETRY_WAIT" && !(a.retryAt !== undefined && now >= a.retryAt))),
   );
 }
 
@@ -163,6 +168,11 @@ export function jobStatus(input: SchedInput & { now: number; jobUsage: JobUsage 
 
   const ready = readyTasks(input);
   const anyActive = input.plan.nodes.some((n) => hasActiveAttempt(n, ctx, input.now));
-  if (ready.length === 0 && !anyActive) return { status: "blocked", note: "no ready task and no active attempt" };
+  if (ready.length === 0 && !anyActive) {
+    // Name a stuck required node so ops knows WHERE it is wedged (e.g. a required node depending on a non-required
+    // node that terminally failed — §4.4 leaves that to repair / a human; blocked is the signal).
+    const stuck = required.find((n) => !nodeComplete(n.nodeId, ctx, memo));
+    return { status: "blocked", note: `no ready task and no active attempt${stuck ? `; stuck required node ${stuck.nodeId}` : ""}` };
+  }
   return { status: "running" };
 }

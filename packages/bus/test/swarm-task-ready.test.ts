@@ -113,6 +113,11 @@ describe("readyTasks step 2: an un-expired RETRY_WAIT counts as active (prior-ar
     const r = ids(readyTasks({ plan, attempts: [cA, pRetry], acceptedResults: [cR], now: 1500, jobUsage: ZERO }));
     expect(r).toContain("P");
   });
+  test("an ill-formed RETRY_WAIT with undefined retryAt counts ACTIVE, never re-dispatched (invariant hole closed)", () => {
+    const pNoAt = att(plan, "P", 1, [boundTo(cR)], "RETRY_WAIT", { retriesUsed: 1 }); // retryAt deliberately omitted
+    const r = ids(readyTasks({ plan, attempts: [cA, pNoAt], acceptedResults: [cR], now: 9_999_999, jobUsage: ZERO }));
+    expect(r).not.toContain("P"); // active (conservative) => no second attempt while the old one is still RETRY_WAIT
+  });
 });
 
 describe("jobStatus", () => {
@@ -136,5 +141,6 @@ describe("jobStatus", () => {
     const zFail = att(plan, "Z", 1, [], "FAILED"); // inputBindingDigest == resolveInputs(Z) (no deps)
     const s = jobStatus({ plan, attempts: [xA, zFail], acceptedResults: [xR], now: 0, jobUsage: ZERO });
     expect(s.status).toBe("blocked");
+    expect(s.note).toContain("Y"); // names the stuck required node for ops
   });
 });
