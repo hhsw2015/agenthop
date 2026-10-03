@@ -72,21 +72,29 @@ export async function sweepPass(ops: SweepOps): Promise<void> {
       continue;
     }
 
-    // Rule — EXPIRED (owner alive) ⇒ bypass / escalation (scenario A).
+    // Rule — EXPIRED (owner alive) ⇒ bypass (reversible) / escalation (§0b sweep rules 2+3). SAFETY RED LINE
+    // (§0b pendingApprovals): an approval is NEVER auto-resolved or bypassed on timeout — the completed escalation NOTICE
+    // REOPENS it with a fresh deadline + escalatedAt (supervision transfers; only a real `decide` grants/denies, 终审②).
+    // Only a reversible `wait` resolves on timeout. (A1 auto-extension budget is the round-2 draft — not implemented here.)
     if (live === "alive" && ops.nowSec() >= w.deadlineSec) {
-      const kind = w.timeoutPolicy === "bypass" ? "bypass" : "escalation";
+      const isApproval = w.kind === "approval" && (w.decision ?? "pending") === "pending";
+      const kind = isApproval || w.timeoutPolicy !== "bypass" ? "escalation" : "bypass"; // an approval always escalates
       const action: PendingAction = { actionId: ops.newActionId(), actionKind: kind, target: subjectTarget(w), expectedSubjectVersion: 0 };
       const begun = advanceWait(w, { type: "begin_action", pendingAction: action });
       if (!begun.ok) { ops.log(`sweep ${w.waitId}: begin ${kind} rejected: ${begun.error}`); continue; }
       state = ops.commit(state, [{ put: "wait", wait: begun.wait }]).state;            // CAS: open → action_pending (BEFORE IO)
       const delivered = await ops.doAction(begun.wait, action);                        // IO: send the ping / escalation notice (R5)
       if (!delivered) { ops.log(`sweep ${w.waitId}: ${kind} unconfirmed — holding action_pending, retry next tick`); continue; }
-      // kind:"wait" is reversible ⇒ action_done resolves it; an approval still-pending would instead reopen with a fresh
-      // deadline (the reducer enforces that + requires newDeadlineSec — handled when the approval rules land).
-      const done = advanceWait(begun.wait, { type: "action_done", resolution: { outcome: kind, reason: `deadline passed; ${kind} sent`, sourceOperationId: action.actionId } });
+      // Approval (decision pending): the escalation NOTICE reopens with a fresh deadline (never resolves, never grants —
+      // safety red line). Reversible wait: action_done resolves with evidence.
+      const done = isApproval
+        ? advanceWait(begun.wait, { type: "action_done", newDeadlineSec: ops.freshDeadlineSec(), nowSec: ops.nowSec() })
+        : advanceWait(begun.wait, { type: "action_done", resolution: { outcome: kind, reason: `deadline passed; ${kind} sent`, sourceOperationId: action.actionId } });
       if (!done.ok) { ops.log(`sweep ${w.waitId}: action_done rejected: ${done.error}`); continue; }
       state = ops.commit(state, [{ put: "wait", wait: done.wait }]).state;
-      ops.log(`sweep ${w.waitId}: expired ⇒ ${kind} sent, resolved`);
+      ops.log(isApproval
+        ? `sweep ${w.waitId}: approval expired ⇒ escalation sent, REOPENED (deadline ${done.wait.deadlineSec}, escalatedAt ${done.wait.escalatedAt})`
+        : `sweep ${w.waitId}: expired ⇒ ${kind} sent, resolved`);
     }
   }
 }

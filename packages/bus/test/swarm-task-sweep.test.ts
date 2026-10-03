@@ -110,3 +110,48 @@ describe("sweep scenario B — owner dead ⇒ reassign (close old + open new, sa
     expect(order).toEqual([]);
   });
 });
+
+describe("sweep scenario C — expired APPROVAL ⇒ escalation REOPENS, never resolves (§0b 终审②, safety red line)", () => {
+  const approval = (p: Partial<WaitRecord> & { waitId: string }): WaitRecord =>
+    openWait({ waitId: p.waitId, kind: "approval", subject: p.subject ?? { jobId: "job" }, deadlineSec: p.deadlineSec ?? 1000, owner: p.owner ?? "claude:owner", timeoutPolicy: p.timeoutPolicy ?? "escalate" });
+
+  test("expired approval (decision pending) ⇒ begin → escalation → REOPEN with fresh deadline + escalatedAt (not resolved, not granted)", async () => {
+    const stateRef = { s: mkState([approval({ waitId: "a1", deadlineSec: 1000 })]) };
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order));
+    expect(order).toEqual(["commit:wait:action_pending", "doAction:escalation", "commit:wait:open"]); // reopened, NOT resolved
+    const live = liveWaits(stateRef.s);
+    expect(live).toHaveLength(1);                 // still open — supervision transferred, approval did not vanish
+    expect(live[0]!.state).toBe("open");
+    expect(live[0]!.deadlineSec).toBe(9999);      // fresh deadline (freshDeadlineSec)
+    expect(live[0]!.escalatedAt).toBe(2000);      // nowSec
+    expect(live[0]!.decision).toBe("pending");    // never auto-granted — only a real `decide` ends an approval
+  });
+
+  test("safety red line: an approval with timeoutPolicy=bypass is STILL escalated, never bypass-resolved (no auto-grant on timeout)", async () => {
+    const stateRef = { s: mkState([approval({ waitId: "a1", deadlineSec: 1000, timeoutPolicy: "bypass" })]) };
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order));
+    expect(order).toContain("doAction:escalation");
+    expect(order).not.toContain("doAction:bypass"); // bypass policy MUST NOT auto-resolve a privileged approval
+    const live = liveWaits(stateRef.s);
+    expect(live).toHaveLength(1);
+    expect(live[0]!.state).toBe("open");
+    expect(live[0]!.decision).toBe("pending");
+  });
+
+  test("escalation notice unconfirmed ⇒ held in action_pending, retried next tick (no reopen)", async () => {
+    const stateRef = { s: mkState([approval({ waitId: "a1", deadlineSec: 1000 })]) };
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { doAction: async (_w, a) => { order.push(`doAction:${a.actionKind}`); return false; } }));
+    expect(order).toEqual(["commit:wait:action_pending", "doAction:escalation"]); // no reopen commit
+    expect(liveWaits(stateRef.s)[0]!.state).toBe("action_pending");
+  });
+
+  test("a non-expired approval is untouched", async () => {
+    const stateRef = { s: mkState([approval({ waitId: "a1", deadlineSec: 5000 })]) };
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order));
+    expect(order).toEqual([]);
+  });
+});
