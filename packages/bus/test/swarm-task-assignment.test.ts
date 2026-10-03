@@ -54,6 +54,7 @@ describe("buildAssignment — field projection (§4.5-1)", () => {
     const a = mk();
     expect(a.assignmentId).toBe(BINDING.assignmentId); // intentId = assignmentId = binding.assignmentId
     expect(a.jobId).toBe("job");
+    expect(a.planRevision).toBe(1);
     expect(a.nodeId).toBe("build");
     expect(a.attemptId).toBe(ATTEMPT.attemptId); // "job/build/a0"
     expect(a.bindingId).toBe(BINDING.bindingId);

@@ -5,13 +5,15 @@
 # in its OWN session (setsid, NOT the worker tmux so a scrub can't kill the scrubber), and a task worker. The box
 # then publishes curated artifact snapshots to the WORK branch swarm/<launchId>-g<gen>; swarm-dispatch.ts observes.
 #
-# Usage: scripts/swarm-task.sh <launchId> [--demo | --task "<goal>"]
+# Usage: scripts/swarm-task.sh <launchId> [--demo | --resume <sha> <gen> | --task ["<goal>"]]
 #   env: SWARM_WORK_REPO (default hhsw2015/swarm-work), SWARM_DEPLOY_KEY (default ~/.agenthop/swarm/swarm-work-deploy),
 #        SWARM_BUDGET_SEC (default 3480), SWARM_ALLOWLIST (default "out").
-# NOTE: --demo runs a pure-bash worker (no model cost) to validate the pipeline end to end. --task (a Claude worker
-#       repointed at CPA) is the real mode; it is NOT wired here yet — it needs the CPA token sourced from a 0600
-#       env file (the sup-env pattern below), never inlined into the tmux/claude argv (the Phase-1 swarm-launch.sh
-#       CPA-token-in-argv leak Codex flagged is fixed the same way when that worker lands).
+#   --task env: SWARM_ASSIGNMENT=<path to assignment.json the dispatcher built>, SWARM_WORKER_ENV=<path to a 0600 file
+#        exporting ANTHROPIC_BASE_URL + the ephemeral CPA token> (optional but required for real model calls).
+# NOTE: --demo runs a pure-bash worker (no model cost) to validate the pipeline end to end. --task runs a headless
+#       Claude worker repointed at CPA: the assignment + the CPA token ride scp'd 0600 FILES (never argv/heredoc — the
+#       sup-env pattern, the Codex #6 argv-leak lesson). The result.json identity is taken from the assignment, not the
+#       worker (swarm-build-result.mjs), so a lying worker cannot forge identity. Live-gated (ssh+claude+CPA).
 set -euo pipefail
 
 LID="${1:?usage: swarm-task.sh <launchId> [--demo | --task \"goal\"]}"
@@ -21,6 +23,7 @@ MODE="${2:---demo}"
 # handoffSha) so its publishes descend from handoffSha AND the supervisor does not freeze on a `final` tip. --task
 # (Claude worker) still deferred. Reject anything else BEFORE any box side-effect (Codex #8).
 RESUME_SHA=""; GEN=0
+ASSIGN_SRC=""; WORKER_ENV_SRC="${SWARM_WORKER_ENV:-}"   # set by --task / --resume; kept defined for `set -u`
 case "$MODE" in
   --demo) GOAL="${3:-demo task}" ;;
   --resume)
@@ -28,8 +31,16 @@ case "$MODE" in
     GEN="${4:?usage: swarm-task.sh <launchId> --resume <handoffSha> <generation>}"
     case "$RESUME_SHA" in *[!0-9a-f]*|'') echo "bad handoffSha $RESUME_SHA (expect hex)" >&2; exit 2 ;; esac
     case "$GEN" in *[!0-9]*|'') echo "bad generation $GEN (expect int)" >&2; exit 2 ;; esac
-    GOAL="resume from ${RESUME_SHA:0:12}" ;;
-  *) echo "only --demo and --resume are supported here (--task/Claude worker is deferred)" >&2; exit 2 ;;
+    # --resume runs the REAL Claude worker too (§4.5-6b) when a successor assignment is present; the demo worker is kept
+    # only for pipeline validation (SWARM_RESUME_DEMO=1). The dispatcher writes a fresh assignment for the successor
+    # binding (same attemptId) and passes it via SWARM_ASSIGNMENT, so the business task actually continues.
+    GOAL="resume from ${RESUME_SHA:0:12}"
+    ASSIGN_SRC="${SWARM_ASSIGNMENT:-}" ;;
+  --task)
+    GOAL="${3:-}"   # the assignment is authoritative; an argv goal is only an operator convenience/override
+    ASSIGN_SRC="${SWARM_ASSIGNMENT:?--task needs SWARM_ASSIGNMENT=<path to assignment.json the dispatcher built>}"
+    [ -f "$ASSIGN_SRC" ] || { echo "no assignment.json at $ASSIGN_SRC" >&2; exit 2; } ;;
+  *) echo "only --demo, --resume and --task are supported here" >&2; exit 2 ;;
 esac
 # Validate the WHOLE launchId (Codex P2-4): the old glob rw-[0-9a-f]* matched "rw-" + one hex + ANY suffix, so
 # rw-a'bad / rw-a-not-hex passed and could inject into paths / git refs. Anchor the full string to rw-<hex-only>.
@@ -116,7 +127,8 @@ sqadd SWARM_RESUME_FROM "$RESUME_SHA"   # empty for --demo; the handoffSha seed 
 "${SSH[@]}" railway.new 'mkdir -p /root/.swarm && chmod 700 /root/.swarm' 2>&1 | filt | tail -1
 "${SCP[@]}" "$DEPLOY_KEY" railway.new:/root/.swarm/deploy-key >/dev/null
 "${SCP[@]}" "$SUPENV" railway.new:/root/.swarm/sup-env >/dev/null
-"${SCP[@]}" "$HERE/scripts/swarm-supervisor.mjs" "$HERE/scripts/swarm-scrub.sh" "$HERE/scripts/swarm-demo-worker.sh" railway.new:/root/.swarm/ >/dev/null
+"${SCP[@]}" "$HERE/scripts/swarm-supervisor.mjs" "$HERE/scripts/swarm-scrub.sh" "$HERE/scripts/swarm-demo-worker.sh" \
+            "$HERE/scripts/swarm-claude-worker.sh" "$HERE/scripts/swarm-build-result.mjs" railway.new:/root/.swarm/ >/dev/null
 
 # 2. clone the WORK repo via the deploy key (SSH), configure origin + GIT_SSH_COMMAND, make the runtime dir, and
 #    write the supervisor env to a 0600 file (sourced, never argv). The worker's checkout and the supervisor's
@@ -174,6 +186,23 @@ SEED
   "${SSH[@]}" railway.new "sh /root/.swarm/resume-seed.sh" 2>&1 | filt | tail -2
 fi
 
+# 2c. --task / business --resume: ship the assignment + the CPA worker-env as 0600 FILES (never argv/heredoc — the
+#     sup-env/Codex #6 pattern). The assignment carries the authoritative identity; the worker-env exports
+#     ANTHROPIC_BASE_URL + the ephemeral token, sourced by the claude worker. Absence of a worker-env is allowed (the
+#     worker then produces a failure result rather than making unauthenticated calls).
+if [ -n "$ASSIGN_SRC" ]; then
+  [ -f "$ASSIGN_SRC" ] || { echo "FATAL: SWARM_ASSIGNMENT=$ASSIGN_SRC not found" >&2; exit 2; }
+  "${SCP[@]}" "$ASSIGN_SRC" railway.new:/root/.swarm/assignment.json >/dev/null
+  "${SSH[@]}" railway.new 'chmod 600 /root/.swarm/assignment.json' 2>&1 | filt | tail -1
+  if [ -n "$WORKER_ENV_SRC" ]; then
+    [ -f "$WORKER_ENV_SRC" ] || { echo "FATAL: SWARM_WORKER_ENV=$WORKER_ENV_SRC not found" >&2; exit 2; }
+    "${SCP[@]}" "$WORKER_ENV_SRC" railway.new:/root/.swarm/worker-env >/dev/null
+    "${SSH[@]}" railway.new 'chmod 600 /root/.swarm/worker-env' 2>&1 | filt | tail -1
+  else
+    echo "NOTE: no SWARM_WORKER_ENV — the claude worker will have no CPA token and will produce a failure result." >&2
+  fi
+fi
+
 # 3. start the supervisor in its OWN tmux session "sup" (NOT the worker's "swarm" session, so a scrub that kills the
 #    worker session cannot kill the scrubber). tmux persists across ssh-close here; setsid/nohup do not. A box-side
 #    start script avoids triple-nested quoting (bash -> ssh -> tmux -> sh).
@@ -189,22 +218,28 @@ printf '%s\n' "$SUP_OUT"
 # Propagate the failure (Codex P2-2): a text-only FAILED must not slide through to a false READY.
 echo "$SUP_OUT" | grep -q supervisor-started || { echo "FATAL: supervisor did not start on $LID — aborting, not READY (Codex P2-2)." >&2; exit 4; }
 
-# 4. the worker (same bash demo worker for --demo and --resume; on resume it continues from the seeded out/).
-if [ "$MODE" = "--demo" ] || [ "$MODE" = "--resume" ]; then
-  echo "== demo worker (bash; no model cost) in tmux session 'swarm' — writes out/, signals milestones =="
-  WK_OUT="$("${SSH[@]}" railway.new "
-    tmux kill-session -t swarm 2>/dev/null || true
-    chmod +x /root/.swarm/swarm-demo-worker.sh
-    tmux new-session -d -s swarm 'env SWARM_WORK_DIR=/root/work SWARM_RUNTIME_DIR=/root/.swarm-rt sh /root/.swarm/swarm-demo-worker.sh >/root/.swarm/worker.log 2>&1'
-    sleep 1
-    tmux has-session -t swarm 2>/dev/null && echo demo-worker-started || echo demo-worker-FAILED
-  " 2>&1 | filt | tail -2)" || true
-  printf '%s\n' "$WK_OUT"
-  echo "$WK_OUT" | grep -q demo-worker-started || { echo "FATAL: demo worker did not start on $LID — aborting, not READY (Codex P2-2)." >&2; exit 4; }
+# 4. the worker. --task (and a business --resume carrying an assignment) run the REAL headless Claude worker; --demo
+#    (and a pipeline-validation --resume: SWARM_RESUME_DEMO=1, or a --resume with no assignment) run the bash demo
+#    worker. Both use tmux session "swarm"; the READY gate below is identical (first confirmed publish).
+USE_CLAUDE=0
+[ "$MODE" = "--task" ] && USE_CLAUDE=1
+[ "$MODE" = "--resume" ] && [ -n "$ASSIGN_SRC" ] && [ "${SWARM_RESUME_DEMO:-0}" != "1" ] && USE_CLAUDE=1
+if [ "$USE_CLAUDE" = "1" ]; then
+  echo "== claude worker (headless, CPA) in tmux session 'swarm' — executes the assignment, writes result.json =="
+  WORKER_SH="swarm-claude-worker.sh"; STARTED="claude-worker-started"; FAILED="claude-worker-FAILED"
 else
-  echo "NOTE: --task (Claude worker) not wired yet; use --demo for the first live validation." >&2
-  exit 2
+  echo "== demo worker (bash; no model cost) in tmux session 'swarm' — writes out/, signals milestones =="
+  WORKER_SH="swarm-demo-worker.sh"; STARTED="demo-worker-started"; FAILED="demo-worker-FAILED"
 fi
+WK_OUT="$("${SSH[@]}" railway.new "
+  tmux kill-session -t swarm 2>/dev/null || true
+  chmod +x /root/.swarm/$WORKER_SH
+  tmux new-session -d -s swarm 'env SWARM_WORK_DIR=/root/work SWARM_RUNTIME_DIR=/root/.swarm-rt sh /root/.swarm/$WORKER_SH >/root/.swarm/worker.log 2>&1'
+  sleep 1
+  tmux has-session -t swarm 2>/dev/null && echo $STARTED || echo $FAILED
+" 2>&1 | filt | tail -2)" || true
+printf '%s\n' "$WK_OUT"
+echo "$WK_OUT" | grep -q "$STARTED" || { echo "FATAL: worker did not start on $LID — aborting, not READY (Codex P2-2)." >&2; exit 4; }
 
 # 5. verify a FIRST CONFIRMED publish on the WORK branch before declaring READY (Codex #7). "tmux session exists" only
 #    proves the processes STARTED, not that the supervisor actually pushed a snapshot — a bad deploy key / branch /

@@ -23,6 +23,7 @@ export type Assignment = {
   /** = DispatchIntent.intentId = binding.assignmentId. One assignment ⇔ one intent ⇔ one (box, attempt) send. */
   assignmentId: string;
   jobId: string;
+  planRevision: number;
   nodeId: string;
   attemptId: string;
   /** The ExecutionBinding this send realizes (§2.3 seam). */
@@ -79,6 +80,7 @@ export function buildAssignment(i: BuildAssignmentInput): Assignment {
   const core = {
     assignmentId: binding.assignmentId,
     jobId: attempt.jobId,
+    planRevision: attempt.planRevision,
     nodeId: attempt.nodeId,
     attemptId: attempt.attemptId,
     bindingId: binding.bindingId,
