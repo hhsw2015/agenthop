@@ -18,11 +18,14 @@
  *                   BEFORE any IO. A rejected commit blocks the IO and never claims success (P1-1 — the barrier is checked,
  *                   not merely ordered).
  *   PHASE 2 fire  : fire the IO for EVERY action_pending wait — fresh begins AND crash/unconfirmed residue (recovery,
- *                   P1-2) — CONCURRENTLY within a bounded window (P1-3). The IO is idempotent by actionId; an IO that is
- *                   unconfirmed within the window is LEFT action_pending and re-fired next tick. One slow IO never blocks
- *                   another's fire or the loop (no serial await-per-wait).
- *   PHASE 3 confirm: for each DELIVERED action, RE-READ the current wait (a concurrent close/decide wins — P2-1), apply
- *                   the confirm transition by actionKind, and commit. Undelivered ⇒ untouched (recovered next tick).
+ *                   P1-2) — CONCURRENTLY within a bounded window (P1-3), EXCEPT frozen entities (op-conflict ⇒ repair, R5).
+ *                   Delivery is AT-LEAST-ONCE (the message carries actionId for receiver dedup, R6 — not transport-
+ *                   idempotent); an IO unconfirmed within the window is LEFT action_pending and re-fired next tick. One
+ *                   slow IO never blocks another's fire or the loop (no serial await-per-wait).
+ *   PHASE 3 confirm: for each DELIVERED action, RE-READ the current wait and confirm ONLY if its pending action is STILL
+ *                   the one we fired (actionId match, R2) and unfrozen — a concurrent close/decide/re-begin must not be
+ *                   confirmed with a stale result (P2-1). Commit the confirm transition by actionKind. Undelivered ⇒
+ *                   untouched (recovered next tick).
  * isAlive is injected (bus-identity owns the impl + its known defects). PendingAction.target carries the IO DESTINATION
  * (reassignee / new validator location) so the confirm + routing are reconstructable from the durable intent alone.
  */
@@ -51,8 +54,9 @@ export type SweepOps = {
   /** Deadline for a freshly re-armed / reassigned / moved wait. */
   freshDeadlineSec: () => number;
   /** The bounded supervised IO (bypass ping / escalation notice / reassign / move-validator notify) via an R5 channel;
-   *  resolves true when delivered with evidence. Idempotent by action.actionId (safe to re-fire). The intent is ALREADY
-   *  committed (begin_action) before this runs. */
+   *  resolves true when delivered. AT-LEAST-ONCE delivery: the intent is committed (begin_action) before this runs and a
+   *  recovery may re-fire it, so the message MUST carry action.actionId for the receiver to self-dedup — this is NOT
+   *  exactly-once and NOT idempotent at the transport (durable dedup is bus-identity's I3). */
   doAction: (wait: WaitRecord, action: PendingAction) => Promise<boolean>;
   /** Bounded window (ms) for a single action's IO per tick — a slower IO is left action_pending and re-fired next tick,
    *  so one slow action never blocks the sweep (P1-3 bounded delay). */
@@ -73,13 +77,16 @@ function indexEntities(state: LogState): Indexed {
   return { waits, runs };
 }
 
-/** Bound a single IO: resolve the delivered flag, or false if it doesn't settle within ms (left action_pending → next tick). */
-function withTimeout(p: Promise<boolean>, ms: number): Promise<boolean> {
+/** Bound a single IO: resolve its delivered flag, or false if it doesn't settle within ms (left action_pending → next
+ *  tick). Takes a THUNK so the timer is armed BEFORE the action is invoked (R1 — no eager argument evaluation). NOTE: this
+ *  bounds the ASYNC delivery wait only; a synchronous-blocking adapter cannot be interrupted by a JS timer, so action
+ *  adapters must stay async (and the real writeInbox is a fast sync write). */
+function withTimeout(thunk: () => Promise<boolean>, ms: number): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
     const done = (v: boolean) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
     const timer = setTimeout(() => done(false), ms);
-    p.then((v) => done(v), () => done(false));
+    Promise.resolve().then(thunk).then((v) => done(v), () => done(false));
   });
 }
 
@@ -171,21 +178,29 @@ export async function sweepPass(ops: SweepOps): Promise<void> {
     commitOk([{ put: "wait", wait: begun.wait }], `${w.waitId} begin ${action.actionKind}`); // CAS BEFORE IO (phase 2)
   }
 
-  // PHASE 2 — fire (bounded, concurrent): every action_pending wait (fresh + crash/unconfirmed residue) gets its IO
-  // re-fired idempotently within a bounded window. Unsettled ⇒ left action_pending, re-fired next tick.
+  // PHASE 2 — fire (bounded, concurrent): every action_pending wait (fresh + crash/unconfirmed residue — recovery) gets
+  // its IO re-fired within a bounded window (at-least-once; the receiver dedups by actionId). Unsettled ⇒ left
+  // action_pending, re-fired next tick. A FROZEN entity (op-conflict) is NOT auto-fired — it needs repair (R5).
   state = ops.loadState();
-  const pending = indexEntities(state).waits.filter((w) => w.state === "action_pending" && w.pendingAction);
-  const fired = await Promise.all(pending.map((w) =>
-    withTimeout(ops.doAction(w, w.pendingAction as PendingAction), ops.actionTimeoutMs).then((delivered) => ({ waitId: w.waitId, delivered })),
-  ));
+  const frozen = new Set(state.frozen);
+  const allPending = indexEntities(state).waits.filter((w) => w.state === "action_pending" && w.pendingAction);
+  for (const w of allPending) if (frozen.has(`wait:${w.waitId}`)) ops.log(`sweep ${w.waitId}: action_pending but FROZEN (op-conflict) — skipping IO, needs repair/investigation`);
+  const pending = allPending.filter((w) => !frozen.has(`wait:${w.waitId}`));
+  const fired = await Promise.all(pending.map((w) => {
+    const action = w.pendingAction as PendingAction;
+    return withTimeout(() => ops.doAction(w, action), ops.actionTimeoutMs).then((delivered) => ({ waitId: w.waitId, actionId: action.actionId, delivered }));
+  }));
 
-  // PHASE 3 — confirm: for each DELIVERED action, re-read the current wait (P2-1) and commit its confirm transition.
+  // PHASE 3 — confirm: for each DELIVERED action, re-read the current wait and confirm ONLY if its pending action is STILL
+  // the exact one we fired (actionId match, R2) and the entity is not frozen (R5) — a concurrent close/decide/re-begin
+  // must not be confirmed with this stale result (P2-1). Commit the confirm transition per actionKind.
   state = ops.loadState();
   for (const f of fired) {
     if (!f.delivered) continue; // undelivered/timed-out ⇒ stays action_pending, recovered next tick
     const { waits, runs } = indexEntities(state);
     const w = waits.find((x) => x.waitId === f.waitId);
-    if (!w || w.state !== "action_pending" || !w.pendingAction) continue; // concurrently resolved/changed — skip (P2-1)
+    if (!w || w.state !== "action_pending" || w.pendingAction?.actionId !== f.actionId) continue; // moved on — stale result
+    if (state.frozen.includes(`wait:${w.waitId}`)) { ops.log(`sweep ${w.waitId}: confirm skipped — entity frozen`); continue; }
     const changes = confirmChanges(w, w.pendingAction, runs, state.seq + 1, ops);
     if (!changes) continue;
     if (commitOk(changes, `${w.waitId} ${w.pendingAction.actionKind} confirm`))

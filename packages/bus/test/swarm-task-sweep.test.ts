@@ -267,6 +267,42 @@ describe("sweep P1-3 — bounded delay: a slow IO never blocks another wait or t
   });
 });
 
+describe("sweep recovery safety — frozen pending (R5) + stale-result actionId match (R2)", () => {
+  function toActionPending(s: LogState, waitId: string, actionId: string): LogState {
+    const key = `wait:${waitId}`; const rev = s.revisions[key] ?? 0;
+    const w = allWaits(s).find((x) => x.waitId === waitId)!;
+    return commit(s, s.seq, [{ put: "wait", wait: { ...w, state: "action_pending", pendingAction: { actionId, actionKind: "bypass", target: "job", expectedSubjectVersion: 0 } }, operationId: `${key}#${rev + 1}`, expectedEntityRevision: rev }]).state;
+  }
+
+  test("R5: a FROZEN action_pending wait is NOT auto-fired — it needs repair (confirm-failure is not the guard)", async () => {
+    let s = toActionPending(mkState([wait({ waitId: "w1", deadlineSec: 1000 })]), "w1", "a");
+    s = { ...s, frozen: [...s.frozen, "wait:w1"] }; // op-conflict froze the entity
+    const stateRef = { s }; const order: string[] = []; const logs: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { log: (m) => logs.push(m) }));
+    expect(order).toEqual([]);                                  // no IO fired on a frozen subject
+    expect(logs.some((m) => m.includes("FROZEN"))).toBe(true);  // surfaced for repair
+    expect(liveWaits(stateRef.s)[0]!.state).toBe("action_pending");
+  });
+
+  test("R2: a stale delivered result does NOT confirm a wait that moved to a NEW action (actionId match)", async () => {
+    const stateRef = { s: mkState([wait({ waitId: "w1", deadlineSec: 1000 })]) };
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, {
+      doAction: async (_w, a) => {
+        order.push(`doAction:${a.actionKind}`);
+        // during A's delivery, a legal concurrent transition re-begins the wait with a DIFFERENT actionId (B)
+        const cur = liveWaits(stateRef.s).find((x) => x.waitId === "w1")!;
+        const key = "wait:w1"; const rev = stateRef.s.revisions[key] ?? 0;
+        stateRef.s = commit(stateRef.s, stateRef.s.seq, [{ put: "wait", wait: { ...cur, pendingAction: { ...cur.pendingAction!, actionId: "B-different" } }, operationId: `${key}#${rev + 1}`, expectedEntityRevision: rev }]).state;
+        return true; // A reports delivered AFTER the wait already moved on
+      },
+    }));
+    const w = liveWaits(stateRef.s).find((x) => x.waitId === "w1")!;
+    expect(w.state).toBe("action_pending");                 // the stale A result did NOT re-arm/confirm it
+    expect(w.pendingAction!.actionId).toBe("B-different");  // B's intent is intact, not overwritten by A's confirm
+  });
+});
+
 describe("sweep P1-1 — a REJECTED commit blocks IO and never logs success (commit→IO barrier is checked, not just ordered)", () => {
   test("begin commit rejected ⇒ NO doAction, wait untouched, honest 'commit rejected' log", async () => {
     const stateRef = { s: mkState([wait({ waitId: "w1", deadlineSec: 1000 })]) };
