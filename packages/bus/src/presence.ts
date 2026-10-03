@@ -1,4 +1,5 @@
 import net from "node:net";
+import { rmSync, writeFileSync } from "node:fs";
 import { startBusCore, type BusCoreOptions } from "./core.js";
 import { dbg } from "./debug.js";
 
@@ -10,49 +11,90 @@ import { dbg } from "./debug.js";
  * inbound message to the host's live channel (Claude cc-socks / Codex `codex queue` via cwd-match) or persists it to
  * the durable inbox — exactly what the MCP node does, minus the MCP tool surface.
  *
- * Launch model: the SessionStart hook backgrounds this (a plain `&`, NOT setsid). A bun --compile binary with no
- * controlling terminal (setsid/new session) drains its event loop and exits, so it must stay in the hook's session;
- * a non-interactive shell does not SIGHUP its background children on exit, so it survives the hook. SessionEnd stops it
- * by pid, and the orphan guard self-exits if the host's live channel is gone for a while.
+ * Launch model: the SessionStart hook runs the NON-compiled bundle (~/.agenthop/presence.mjs) via bun/node, and the
+ * ENTRY (presence-entry.ts) immediately re-spawns itself DETACHED (new session via setsid) and exits — because a plain
+ * `&` child stays in the hook's process group, which the host tears down when the hook returns (Codex 0.160 waits for
+ * the group, hanging a sync hook, or kills it; Claude is similar). The detached grandchild escapes that group and lives
+ * independently. A non-compiled bun/node script with a ref'd keep-alive survives with no controlling terminal (unlike a
+ * bun --compile binary, which drains its loop and exits).
+ *
+ * Not leaking: the daemon is detached, so it does NOT die with the terminal — three independent stops cover that.
+ * (1) SessionEnd hook kills it by the pid the entry recorded. (2) Host-pid guard: it polls the host process (the hook's
+ * $PPID, passed as AGENTHOP_HOST_PID) and self-exits once that process is gone — covers a crash / SessionEnd not firing.
+ * (3) Claude also keeps a cc-socks probe as a second signal. So a clean exit, a crash, and a closed terminal each stop
+ * it; the broker drops the roster entry the moment it exits.
  *
  * Coexistence with the lazily-spawned MCP node is safe: they share one session identity, core.unified() collapses the
  * two local nodes into one roster entry (so resolve isn't "ambiguous"), and the atomic durable-inbox claim + unicast
  * DM routing mean a message is delivered exactly once even while both run.
  */
 export function runPresence(opts: BusCoreOptions = {}): void {
+  // Record our pid as EARLY as possible. This doubles as the bootstrap's handshake: the detached-spawn parent polls for
+  // this file to confirm the daemon is up in its own session before it exits (see presence-entry.ts). SessionEnd reads
+  // it to stop us; we remove it on shutdown. We are already post-setsid here (the child runs after detached spawn).
+  const pidFile = process.env.AGENTHOP_PID_FILE;
+  if (pidFile) {
+    try {
+      writeFileSync(pidFile, String(process.pid));
+    } catch {
+      // best effort — the host-pid guard + SessionEnd are the other stops
+    }
+  }
   const core = startBusCore(opts);
   dbg(`presence up: ${core.self.title} (tool=${core.self.tool} stable=${core.self.stableId ?? "-"})`);
-  // Keep the process alive. A bun --compile binary with no controlling terminal (backgrounded/detached by the hook)
-  // drains its event loop and exits even with a ref'd timer + open sockets — UNLESS it is actively reading an open
-  // stdin (the same reason the `mcp` server survives: Claude holds its stdin pipe). So resume stdin: the SessionStart
-  // hook feeds it a never-EOF stdin (`tail -f /dev/null |`), and this active read holds the loop open with no tty.
-  try { process.stdin.resume(); } catch { /* no stdin — the timer is the fallback */ }
+  // Keep the process alive. The daemon is detached (its own session, no controlling terminal, stdio ignored), so a
+  // ref'd timer is what holds the event loop open — a non-compiled bun/node script stays up on that alone.
   const keepAlive = setInterval(() => {}, 60000);
 
   let closing = false;
-  let guard: ReturnType<typeof setInterval> | undefined;
+  const timers: Array<ReturnType<typeof setInterval>> = [keepAlive];
   const shutdown = (code = 0): void => {
     if (closing) return;
     closing = true;
-    clearInterval(keepAlive);
-    if (guard) clearInterval(guard);
+    for (const tmr of timers) clearInterval(tmr);
+    // Remove our own pid file (the entry wrote it, the SessionEnd hook also removes it — harmless to do both).
+    const pidFile = process.env.AGENTHOP_PID_FILE;
+    if (pidFile) {
+      try {
+        rmSync(pidFile, { force: true });
+      } catch {
+        // best effort
+      }
+    }
     void core.close().finally(() => process.exit(code));
   };
   process.on("SIGTERM", () => shutdown(0));
   process.on("SIGINT", () => shutdown(0));
 
-  // Orphan guard: if the host's live channel is gone for several consecutive checks, the session ended without the
-  // SessionEnd hook stopping us (crash / closed terminal) — self-exit so we don't linger as a ghost presence. Only for
-  // Claude's cc-socks (a connect probe); Codex has no equivalent per-session socket, so its presence relies on the
-  // SessionEnd hook (the broker drops it the moment it exits).
+  // Orphan guard #1 (universal): poll the host process. The SessionStart hook passes its own $PPID — the host process
+  // that owns this session (codex / claude) — as AGENTHOP_HOST_PID. When that process is gone, the session ended (incl.
+  // a crash or a SessionEnd that never fired), so self-exit. ponytail: a reused pid could mask death until the next
+  // check; SessionEnd + cc-socks are the other two signals, and same-pid reuse within a session's life is unlikely.
+  const hostPid = Number(process.env.AGENTHOP_HOST_PID);
+  if (Number.isInteger(hostPid) && hostPid > 1) {
+    const hostGuard = setInterval(() => {
+      try {
+        process.kill(hostPid, 0); // signal 0 = liveness check, sends nothing
+      } catch {
+        dbg(`presence orphan guard: host pid ${hostPid} gone, exiting`);
+        shutdown(0);
+      }
+    }, 30000);
+    hostGuard.unref?.();
+    timers.push(hostGuard);
+  }
+
+  // Orphan guard #2 (Claude only): if the host's cc-socks channel is unreachable for several consecutive checks, the
+  // session ended. Codex has no equivalent per-session socket, so it relies on guard #1 + the SessionEnd hook.
   const sock = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
   if (sock) {
     let misses = 0;
-    guard = setInterval(() => {
+    const guard = setInterval(() => {
       const probe = net.connect(sock);
       probe.once("connect", () => { misses = 0; probe.destroy(); });
       probe.once("error", () => { probe.destroy(); if (++misses >= 3) { dbg("presence orphan guard: host channel gone, exiting"); shutdown(0); } });
     }, 30000);
     guard.unref?.();
+    timers.push(guard);
   }
 }

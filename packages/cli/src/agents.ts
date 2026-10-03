@@ -227,14 +227,18 @@ const PRESENCE_END_MARK = `# ${HOOK_SENTINEL_PRESENCE}:end`;
 /**
  * The SessionStart command that brings up this session's always-on bus PRESENCE node (see presence.ts), so the session
  * is findable + reachable on the bus FROM STARTUP — not only after it first calls an agenthop tool. It runs the NON-
- * compiled presence bundle (~/.agenthop/presence.mjs) via bun or node, backgrounded — NOT the bun --compile binary,
- * which exits when it has no controlling terminal (a plain bun/node script with a ref'd keep-alive survives that).
- * Started at most once (skipped if the recorded pid is alive); the pid is recorded so SessionEnd can stop it. A non-
- * interactive shell does not SIGHUP its background children, so it survives the hook. Side-effect-only (`|| true`,
- * output suppressed) so it can never block or fail a turn; a no-op if neither bun nor node nor the bundle is present.
+ * compiled presence bundle (~/.agenthop/presence.mjs) via bun or node; the entry then re-spawns itself DETACHED (its own
+ * session) and exits, so the daemon escapes the hook's process group (which the host tears down when the hook returns)
+ * instead of being killed with it. Run in the FOREGROUND (no trailing `&`): the short-lived bootstrap must finish
+ * spawning the detached daemon before the hook returns, else the host tears the group down mid-spawn and nothing starts.
+ * Started at most once (skipped if the recorded pid is alive). We pass AGENTHOP_PID_FILE
+ * (the entry writes the real detached-daemon pid there, so SessionEnd can stop it — the hook's own `$!` is just the
+ * short-lived bootstrap) and AGENTHOP_HOST_PID="$PPID" (the host process, so the daemon self-exits if the session dies
+ * without SessionEnd firing — no leak). Side-effect-only (`|| true`, output suppressed) so it can never block or fail a
+ * turn; a no-op if neither bun nor node nor the bundle is present.
  */
 function presenceStartCommand(): string {
-  return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; elif [ -f "\$_mjs" ]; then _rt="\$(command -v bun || command -v node)"; if [ -n "\$_rt" ]; then "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1 & echo \$! > "\$_pf"; fi; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
+  return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; elif [ -f "\$_mjs" ]; then _rt="\$(command -v bun || command -v node)"; if [ -n "\$_rt" ]; then AGENTHOP_PID_FILE="\$_pf" AGENTHOP_HOST_PID="\$PPID" "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1; fi; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
 }
 
 /** The SessionEnd command that stops this session's presence node (by the pid agenthop recorded) and removes the file. */
@@ -286,7 +290,7 @@ const CODEX_SID_FROM_STDIN = `_in=$(cat 2>/dev/null); _sid=$(printf '%s' "\$_in"
 /** Codex SessionStart: parse the session id from stdin, then launch the presence bundle via bun/node with it injected
  *  as AGENTHOP_SESSION (so the daemon's identity = that thread id). Same non-compiled-bundle reasoning as Claude. */
 function codexPresenceStartCommand(): string {
-  return `${CODEX_SID_FROM_STDIN}; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; elif [ -f "\$_mjs" ]; then _rt="\$(command -v bun || command -v node)"; if [ -n "\$_rt" ]; then AGENTHOP_SESSION="\$_sid" "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1 & echo \$! > "\$_pf"; fi; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
+  return `${CODEX_SID_FROM_STDIN}; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; elif [ -f "\$_mjs" ]; then _rt="\$(command -v bun || command -v node)"; if [ -n "\$_rt" ]; then AGENTHOP_SESSION="\$_sid" AGENTHOP_PID_FILE="\$_pf" AGENTHOP_HOST_PID="\$PPID" "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1; fi; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
 }
 
 /** Codex SessionEnd: parse the session id from stdin + stop that presence daemon. */
@@ -303,11 +307,20 @@ export function installCodexPresenceHooks(home = homedir()): string {
   const file = join(codexHome(home), "hooks.json");
   const config = readJsonConfig(file); // throws (file left alone) if present but not plain JSON
   let changed = 0;
-  changed += mergePresenceHook(config, "SessionStart", codexPresenceStartCommand(), PRESENCE_START_MARK, "startup|resume", 10);
+  // matcher "" (match-all), NOT "startup|resume": Claude filters SessionStart by `source`, but there is no evidence
+  // Codex matches SessionStart against source — a non-empty matcher may match nothing and the hook never fires. The
+  // launch command is idempotent (pidfile + kill -0 guard), so running on every SessionStart source is harmless.
+  changed += mergePresenceHook(config, "SessionStart", codexPresenceStartCommand(), PRESENCE_START_MARK, "", 10);
   changed += mergePresenceHook(config, "SessionEnd", codexPresenceEndCommand(), PRESENCE_END_MARK, "", 10);
   if (changed === 0) return t(`${file} already has agenthop presence hooks; nothing changed`, `${file} 里已有 agenthop presence hook，没有改动`);
   placeJson(file, config);
-  return t(`wrote ${changed} presence hook change(s) to ${file}`, `已写 ${changed} 处 presence hook 改动到 ${file}`);
+  // Editing hooks.json invalidates Codex's per-hook trust (trusted_hash in config.toml), so NO hook (status OR
+  // presence) runs until re-approved — surface it, the user must act (research doc: codex-opencode-hooks.md).
+  const retrust = t(
+    `IMPORTANT: editing hooks.json invalidated Codex hook trust — approve the hooks once in Codex (or launch with --dangerously-bypass-hook-trust) or they will not run`,
+    `重要：改动 hooks.json 会让 Codex 的 hook 信任失效 —— 需在 Codex 里重新批准一次(或用 --dangerously-bypass-hook-trust 启动),否则所有 hook 都不会跑`,
+  );
+  return `${t(`wrote ${changed} presence hook change(s) to ${file}`, `已写 ${changed} 处 presence hook 改动到 ${file}`)}; ${retrust}`;
 }
 
 /**
