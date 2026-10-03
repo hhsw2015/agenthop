@@ -8,11 +8,13 @@
  * evidence. Never resolve-then-IO, never IO-then-record; a crash in action_pending leaves a recoverable intent.
  *
  * Rules the R2 review turned into counterexamples (each pinned by a test):
- *  - P1-2 / P2-A: for an APPROVAL wait, resolved != granted, and completing the escalation NOTICE does NOT end the
- *    approval. A notice ACK ends only that action; if the decision is still pending the wait goes BACK to open with a
- *    fresh deadline + escalatedAt — supervision transfers, it never vanishes. Only a real terminal decision
- *    (granted/denied/cancelled), or the subject being closed, ends an approval wait.
- *  - escalation only ever produces a notice, never a grant (decide is the only path to granted).
+ *  - §0b erratum 2026-10-03 (team-collab SHA 94284fc2): ANY timeout action's completion ends only THAT action and NEVER
+ *    resolves the wait — a wait represents the awaited work/reply itself, and a reminder/bypass delivery is not
+ *    completion evidence. So action_done ALWAYS re-arms: back to open with a fresh deadline + escalatedAt (supervision
+ *    transfers, never vanishes), for a reversible `wait` and an approval alike. (Before the erratum a reversible
+ *    action_done resolved; that was the over-wide resolve scope the erratum tightened.)
+ *  - resolved comes ONLY from close (subject normal completion / reassignment / budget-exhausted) — and, for an
+ *    approval, from decide reaching a terminal decision (the approval subject completing). escalation never grants.
  *  - P2-1 race: a normal completion/cancel of the subject closes the wait (from open OR action_pending); a late action
  *    completion on an already-resolved wait is a no-op for the caller (rejected here).
  */
@@ -57,10 +59,9 @@ export function openWait(i: NewWait): WaitRecord {
 export type WaitEvent =
   // timeout handling, phase "execute": CAS the recoverable action intent BEFORE the IO.
   | { type: "begin_action"; pendingAction: PendingAction }
-  // phase "confirm": the action finished with evidence. For a reversible `wait` -> resolved. For an approval whose
-  // decision is still pending, the completed action was an escalation NOTICE -> back to open with newDeadlineSec +
-  // escalatedAt (supervision transfers, P2-A). newDeadlineSec is REQUIRED in that case.
-  | { type: "action_done"; resolution?: WaitResolution; newDeadlineSec?: number; nowSec?: number }
+  // phase "confirm": the timeout action finished. It ends only THAT action and re-arms the wait (open + newDeadlineSec +
+  // escalatedAt) for EVERY wait kind — it never resolves (§0b erratum 94284fc2). newDeadlineSec is REQUIRED.
+  | { type: "action_done"; newDeadlineSec: number; nowSec?: number }
   // the real approval decision arrived (approval only). A terminal decision ENDS the wait.
   | { type: "decide"; decision: Exclude<ApprovalDecision, "pending">; grantRef?: string; resolution?: WaitResolution }
   // the subject completed/cancelled/was replaced normally -> close the wait (P2-1; committed same-batch as the subject).
@@ -79,14 +80,11 @@ export function advanceWait(w: WaitRecord, event: WaitEvent): WaitAdvance {
 
     case "action_done": {
       if (w.state !== "action_pending") return bad(`action_done from ${w.state}`);
-      // Approval whose decision is still pending: the finished action was an escalation notice — it does NOT resolve the
-      // approval. Transfer supervision: back to open, fresh deadline, record escalatedAt (P1-2 / P2-A, §0b 终审②).
-      if (w.kind === "approval" && (w.decision ?? "pending") === "pending") {
-        if (event.newDeadlineSec === undefined) return bad("action_done on a still-pending approval requires newDeadlineSec (escalation transfers supervision, never resolves)");
-        return ok({ state: "open", deadlineSec: event.newDeadlineSec, escalatedAt: event.nowSec, pendingAction: undefined });
-      }
-      // Reversible wait (or approval already decided): the action completed -> resolved with evidence.
-      return ok({ state: "resolved", pendingAction: undefined, ...(event.resolution !== undefined ? { resolution: event.resolution } : {}) });
+      // A timeout action's completion ends only THAT action and NEVER resolves the wait (§0b erratum 94284fc2) — a
+      // reminder/bypass delivery is not completion evidence. Re-arm for EVERY kind: back to open, fresh deadline,
+      // escalatedAt (supervision transfers, never vanishes). resolved comes only from close (or decide, for approval).
+      if (event.newDeadlineSec === undefined) return bad("action_done requires newDeadlineSec (re-arm never resolves)");
+      return ok({ state: "open", deadlineSec: event.newDeadlineSec, escalatedAt: event.nowSec, pendingAction: undefined });
     }
 
     case "decide": {
