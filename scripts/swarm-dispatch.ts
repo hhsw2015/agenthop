@@ -36,6 +36,10 @@ import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
 import { taskPass, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
+import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
+import { fileIsAlive, resolveSession, listSessions, makeFileLiveness } from "../packages/bus/src/swarm/task-liveness.js";
+import type { WaitRecord } from "../packages/bus/src/swarm/control-log.js";
+import { writeInbox } from "../packages/bus/src/inbox.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
 const MIRROR_DIR = path.join(HOME, ".agenthop", "swarm", "control");
@@ -67,6 +71,11 @@ const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
 const CHECKPOINT_BUDGET_SEC = Number(process.env.SWARM_CHECKPOINT_BUDGET_SEC || "300");
 const TOKEN_MARGIN_SEC = Number(process.env.SWARM_TOKEN_MARGIN_SEC || "300");
+// liveness sweep (team-collab §0b R2) — the coordinator-replacement pass step. Gated on SWARM_SWEEP (it writes to peer
+// inboxes). SWARM_WAIT_SEED = a JSON file of {put:"wait"} entries to seed the control-log (the migrated coordinator waits).
+const SWEEP_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_SWEEP ?? "");
+const WAIT_SEED_FILE = process.env.SWARM_WAIT_SEED || "";
+const SWEEP_STALE_MS = Number(process.env.SWARM_SWEEP_STALE_MS || "120000");
 
 function log(m: string): void { console.error(`[dispatch ${SELF}] ${m}`); }
 function nowSec(): number { return Math.floor(Date.now() / 1000); }
@@ -387,6 +396,48 @@ function buildTaskOps(stateRef: { s: LogState }, planCommittedAtSec: number): Ta
   };
 }
 
+// Seed the control-log with migrated {put:"wait"} entries (the coordinator's real waits) once, if absent (first input).
+function loadWaitSeed(stateRef: { s: LogState }): void {
+  if (!WAIT_SEED_FILE) return;
+  try {
+    const entries = JSON.parse(readFileSync(WAIT_SEED_FILE, "utf8")) as Array<{ put: string; wait: WaitRecord }>;
+    for (const e of entries) {
+      if (e.put !== "wait" || !e.wait?.waitId) continue;
+      if (stateRef.s.revisions[`wait:${e.wait.waitId}`] !== undefined) continue; // already in the log
+      stateRef.s = commitTask(stateRef.s, [{ put: "wait", wait: e.wait }]).state;
+      log(`wait seed: loaded ${e.wait.waitId} (owner ${e.wait.owner})`);
+    }
+  } catch (e) { log(`wait seed ${WAIT_SEED_FILE}: ${e instanceof Error ? e.message : e}`); }
+}
+
+function buildSweepOps(stateRef: { s: LogState }): SweepOps {
+  const liveness = makeFileLiveness(HOME);
+  return {
+    nowSec,
+    loadState: () => stateRef.s,
+    commit: (state, bodies) => { const r = commitTask(state, bodies); stateRef.s = r.state; return r; },
+    // Two-evidence file liveness (task-liveness; bus-identity replaces the impl). An unresolvable owner ⇒ dead.
+    isAlive: (owner) => { const sid = resolveSession(owner, listSessions(HOME)); return sid ? fileIsAlive(sid, liveness, SWEEP_STALE_MS) : "dead"; },
+    // v1: no idle-same-role picker yet (that is the R8 overload rule, next) ⇒ a dead owner is left for escalation.
+    pickReassignee: () => null,
+    newWaitId: (base) => `${base}/r-${randomBytes(3).toString("hex")}`,
+    newActionId: () => `swp-${randomBytes(4).toString("hex")}`,
+    freshDeadlineSec: () => nowSec() + 1800,
+    // R5 channel: deliver the ping/escalation/reassign-notice to the owner's durable inbox (filesystem — part of bus
+    // delivery; the owner's bus node claims it). Thin v1; bus-identity formalizes handle→delivery.
+    doAction: async (w, action) => {
+      const sid = resolveSession(w.owner, listSessions(HOME));
+      if (!sid) return false;
+      const text = action.actionKind === "bypass" ? `[sweep] progress on ${w.waitId}? (subject ${JSON.stringify(w.subject)}) — past deadline`
+        : action.actionKind === "escalation" ? `[sweep] ESCALATION: ${w.waitId} past deadline, needs a decision`
+        : `[sweep] ${w.waitId}: ${action.actionKind}`;
+      try { writeInbox(HOME, sid, { from: SELF, fromLabel: "swarm-sweep", text, via: "local", ts: Date.now() }); return true; }
+      catch (e) { log(`sweep doAction ${w.waitId}: inbox write failed: ${e instanceof Error ? e.message : e}`); return false; }
+    },
+    log,
+  };
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv[0] === "--observe-once") { await observeOnce(argv.slice(1)); return; }
@@ -398,6 +449,9 @@ async function main(): Promise<void> {
   const ops = buildOps();
   const taskStateRef = { s: loadControlLog(CONTROL_LOG_DIR) };
   const taskOps = plan ? buildTaskOps(taskStateRef, jobStartSec(plan.jobId)) : null;
+  loadWaitSeed(taskStateRef); // seed the migrated coordinator waits (first sweep input), if any
+  const sweepOps = buildSweepOps(taskStateRef);
+  if (SWEEP_ENABLED) log(`liveness sweep ON (staleMs=${SWEEP_STALE_MS}${WAIT_SEED_FILE ? `, seed=${WAIT_SEED_FILE}` : ""})`);
   for (;;) {
     try { await pass(records, ops); } catch (e) { log(`pass error: ${e instanceof Error ? e.message : e}`); }
     // The business-task pass runs AFTER the lifecycle handoff pass (§4.5: handoff advances lifecycle, then task pass
@@ -409,6 +463,12 @@ async function main(): Promise<void> {
     if (plan && taskOn && taskOps) {
       try { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
       catch (e) { log(`taskPass error: ${e instanceof Error ? e.message : e}`); }
+    }
+    // The liveness sweep (§0b R2) runs after the task pass: scan durable waits + member liveness, auto-handle expired
+    // waits (ping/escalate) + dead owners (reassign). This is the coordinator-replacement step. Gated on SWARM_SWEEP.
+    if (SWEEP_ENABLED) {
+      try { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await sweepPass(sweepOps); }
+      catch (e) { log(`sweep error: ${e instanceof Error ? e.message : e}`); }
     }
     await new Promise((res) => setTimeout(res, 5000));
   }

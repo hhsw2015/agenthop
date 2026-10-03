@@ -46,3 +46,37 @@ export function resolveSession(ownerHandle: string, sessionIds: string[]): strin
   if (!tail) return null;
   return sessionIds.find((id) => id === tail || id.startsWith(tail)) ?? null;
 }
+
+// --- real-fs binding (the TEMPORARY v1; bus-identity replaces it). Thin; the testable decisions are above. -------------
+import { readFileSync, readdirSync } from "node:fs";
+import path from "node:path";
+
+/** Native sessionIds that have a presence pid file under <home>/.agenthop/presence/<id>.pid (for resolveSession). */
+export function listSessions(home: string): string[] {
+  try { return readdirSync(path.join(home, ".agenthop", "presence")).filter((f) => f.endsWith(".pid")).map((f) => f.slice(0, -4)); }
+  catch { return []; }
+}
+
+/** LivenessIO backed by the real filesystem + process signals (two-evidence: presence pid + status files). */
+export function makeFileLiveness(home: string): LivenessIO {
+  const base = path.join(home, ".agenthop");
+  return {
+    readPid: (sessionId) => {
+      try { const n = Number(readFileSync(path.join(base, "presence", `${sessionId}.pid`), "utf8").trim()); return Number.isInteger(n) && n > 0 ? n : null; }
+      catch { return null; }
+    },
+    procAlive: (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } }, // signal 0 = existence check
+    latestStatus: (sessionId) => {
+      try {
+        const dir = path.join(base, "status");
+        const mine = readdirSync(dir).filter((f) => f.startsWith(`${sessionId}.json.`));
+        if (mine.length === 0) return null;
+        const newest = mine.map((f) => ({ f, seq: Number(f.slice(f.lastIndexOf(".") + 1)) })).filter((x) => Number.isFinite(x.seq)).sort((a, b) => b.seq - a.seq)[0];
+        if (!newest) return null;
+        const j = JSON.parse(readFileSync(path.join(dir, newest.f), "utf8")) as { state?: unknown };
+        return { state: typeof j.state === "string" ? j.state : "unknown", seq: newest.seq };
+      } catch { return null; }
+    },
+    nowMs: () => Date.now(),
+  };
+}
