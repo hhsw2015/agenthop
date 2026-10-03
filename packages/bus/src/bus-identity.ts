@@ -399,12 +399,18 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
     let changed = true;
     while (changed) {
       changed = false;
-      // Cascade down a DERIVATION EDGE, not across a bare literal: a derivative is withdrawn only when its
-      // origin value is FULLY dead (no live claim carries it). So revoking one source's A does not kill a
-      // handle derived from an INDEPENDENT source's still-live A (review P1-4).
-      const live = new Set(all.filter((c) => !c.superseded).map((c) => c.value));
       for (const c of all) {
-        if (!c.superseded && c.derivedFrom && everExisted.has(c.derivedFrom) && !live.has(c.derivedFrom)) { c.superseded = true; changed = true; }
+        if (c.superseded || !c.derivedFrom) continue;
+        // Cascade down the SPECIFIC parent edge. Prefer the parent assertion that shares this claim's source
+        // (same origin event): a derivative is retired with ITS parent, so a corrected guess's handle retires
+        // even while an INDEPENDENT same-literal claim stays live — and an independent source's handle is not
+        // killed by a different source's revoke (review P1-4, both directions). Only when no same-source parent
+        // exists do we fall back to "the value is fully dead".
+        const sameSource = all.filter((p) => p !== c && p.value === c.derivedFrom && p.source === c.source);
+        const retire = sameSource.length > 0
+          ? sameSource.every((p) => p.superseded)
+          : everExisted.has(c.derivedFrom) && !all.some((p) => !p.superseded && p.value === c.derivedFrom);
+        if (retire) { c.superseded = true; changed = true; }
       }
     }
   };
@@ -421,21 +427,40 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
       const runKey = src.key;
       const obsNative = src.claims.find((c) => c.form === "native")?.value;
       const gens = gensOf(runKey);
-      let g: Gen | undefined;
+      const pushInc = (g: Gen, claims: Claim[]) => {
+        const inc: Incarnation = { key: g.key, claims: [], scope: src.scope, busPid: src.busPid, hostPid: src.hostPid, birth: src.birth, tool: src.tool, cwd: src.cwd, firstSeenSec: e.ts, lastSeenSec: e.ts };
+        for (const c of claims) addClaim(inc, { ...c, source: c.source ?? e.eventId }); // keep an explicit root source (P1-4)
+        g.incarnations.push(inc);
+      };
       if (obsNative) {
-        g = gens.find((x) => genHeldNative(x, obsNative)) ?? gens.find((x) => !genHasHardNative(x));
+        // The native is the thread identity: the whole snapshot joins the generation that holds it, adopts a
+        // pre-native one, else starts a fresh generation.
+        const g = gens.find((x) => genHeldNative(x, obsNative)) ?? gens.find((x) => !genHasHardNative(x)) ?? newGen(runKey, e.eventId);
+        pushInc(g, src.claims);
       } else {
         // A no-native snapshot joins a pre-native generation; else, if it names its source root, it rejoins
         // THAT generation (a late pre-bootstrap snapshot of its own lineage); else it is an independent late
         // snapshot — NEVER the current thread, which there is no evidence it belongs to (review P1-3).
-        const srcLink = src.claims.map((c) => c.source).find((s): s is string => !!s);
-        g = gens.find((x) => !genHasHardNative(x))
-          ?? (srcLink ? gens.find((x) => x.createdBy === srcLink || genClaims(x).some((c) => c.source === srcLink)) : undefined);
+        // Route EACH claim to the generation its OWN explicit source names — an explicit, verifiable root
+        // beats any pre-native guess, the result is order-independent, and claims whose sources name different
+        // logical identities stay with their own (never forced into one). Claims without a source, or whose
+        // source names no existing generation, form a residual that joins a pre-native generation, else a
+        // fresh independent one — never the current thread by default (review P1-3).
+        const findBySource = (s: string): Gen | undefined => gens.find((x) => x.createdBy === s) ?? gens.find((x) => genClaims(x).some((c) => c.source === s));
+        const byTarget = new Map<Gen, Claim[]>();
+        const bucket = (g: Gen, c: Claim) => (byTarget.get(g) ?? byTarget.set(g, []).get(g)!).push(c);
+        const residual: Claim[] = [];
+        for (const c of src.claims) {
+          const tgt = c.source ? findBySource(c.source) : undefined;
+          if (tgt) bucket(tgt, c);
+          else residual.push(c);
+        }
+        if (residual.length) {
+          const rg = gens.find((x) => !genHasHardNative(x)) ?? newGen(runKey, e.eventId);
+          for (const c of residual) bucket(rg, c);
+        }
+        for (const [g, claims] of byTarget) pushInc(g, claims);
       }
-      if (!g) g = newGen(runKey, e.eventId);
-      const inc: Incarnation = { key: g.key, claims: [], scope: src.scope, busPid: src.busPid, hostPid: src.hostPid, birth: src.birth, tool: src.tool, cwd: src.cwd, firstSeenSec: e.ts, lastSeenSec: e.ts };
-      for (const c of src.claims) addClaim(inc, { ...c, source: c.source ?? e.eventId }); // keep an explicit root source (P1-4)
-      g.incarnations.push(inc);
     } else if (e.type === "learn") {
       if (revokedEventIds.has(e.eventId)) continue; // a revoked learn (correction/switch) does not act (P1-4d)
       const runKey = e.incarnationKey;
@@ -557,28 +582,32 @@ export type WhoisResult =
 export function whois(proj: Projection, id: string): WhoisResult {
   const q = id.trim();
   if (!q) return { kind: "not-seen" };
+  const toEnts = (ids: Iterable<string>): IdentityEntity[] => [...new Set(ids)].map((e) => proj.entities.get(e)).filter((e): e is IdentityEntity => !!e);
 
-  // A published entityId is itself queryable — so an id handed out by whois stays resolvable for its history,
-  // even after later events (review P2-5). entityIds ("ent-<hash>") don't collide with real id forms.
-  const direct = proj.entities.get(q);
-  if (direct) return { kind: "entity", entity: direct };
-
-  let hitIds = proj.aliasIndex.get(q);
-  if (!hitIds || hitIds.size === 0) {
-    const pref = new Set<string>();
-    for (const [value, ents] of proj.aliasIndex) if (value.startsWith(q)) for (const e of ents) pref.add(e);
-    hitIds = pref;
+  // EXACT tier. A published entityId and a hard alias are BOTH exact evidence — collect and dedup by entity,
+  // then judge unique vs ambiguous. Neither shadows the other: if one entity's published id is literally
+  // another entity's hard alias, the query is ambiguous, not silently one of them (review R4-P2-1). Exact
+  // always beats prefix. The entityId stays queryable for its history (review P2-5).
+  const exact = new Set<string>(proj.aliasIndex.get(q) ?? []);
+  if (proj.entities.has(q)) exact.add(q);
+  const exactEnts = toEnts(exact);
+  if (exactEnts.length === 1) {
+    const collisionOn = [...proj.collisions.entries()].find(([, ids]) => ids.includes(exactEnts[0]!.entityId))?.[0];
+    return { kind: "entity", entity: exactEnts[0]!, collisionOn };
   }
-  const ents = [...(hitIds ?? [])].map((e) => proj.entities.get(e)).filter((e): e is IdentityEntity => !!e);
-  if (ents.length === 1) {
-    const collisionOn = [...proj.collisions.entries()].find(([, ids]) => ids.includes(ents[0]!.entityId))?.[0];
-    return { kind: "entity", entity: ents[0]!, collisionOn };
-  }
-  if (ents.length > 1) return { kind: "candidates", entities: ents, on: q };
+  if (exactEnts.length > 1) return { kind: "candidates", entities: exactEnts, on: q };
 
+  // PREFIX tier (hard aliases only; only when nothing matched exactly).
+  const pref = new Set<string>();
+  for (const [value, ents] of proj.aliasIndex) if (value.startsWith(q)) for (const e of ents) pref.add(e);
+  const prefEnts = toEnts(pref);
+  if (prefEnts.length === 1) return { kind: "entity", entity: prefEnts[0]! };
+  if (prefEnts.length > 1) return { kind: "candidates", entities: prefEnts, on: q };
+
+  // PID tier: unverified historical.
   const pidHits = proj.pidIndex.get(q);
   if (pidHits && pidHits.size > 0) {
-    const pents = [...pidHits].map((e) => proj.entities.get(e)).filter((e): e is IdentityEntity => !!e);
+    const pents = toEnts(pidHits);
     if (pents.length > 0) return { kind: "pid", entities: pents, on: q };
   }
   return { kind: "not-seen" };
