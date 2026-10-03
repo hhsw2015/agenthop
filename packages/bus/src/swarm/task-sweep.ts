@@ -109,8 +109,13 @@ function decideAction(w: WaitRecord, runs: Map<string, ValidationRun>, live: Liv
     if (to === null) { ops.log(`sweep ${w.waitId}: owner ${w.owner} dead, no reassignee — leaving for escalation`); return null; }
     return { actionId: ops.newActionId(), actionKind: "reassign", target: to, expectedSubjectVersion: 0 };
   }
-  // EXPIRED (owner alive) ⇒ bypass (reversible) / escalation (approval). An approval ALWAYS escalates, never bypass.
-  if (live === "alive" && ops.nowSec() >= w.deadlineSec) {
+  // EXPIRED ⇒ bypass (reversible) / escalation (approval). Fires for a NOT-dead owner — a DEAD owner was already handled by
+  // the reassign branch above, and a SUSPECTED owner's expired wait must still re-arm: supervision never silently
+  // evaporates (§0b R2 / P1-4 / F17 — "suspected is not convicted" includes not stopping its supervision). This is what
+  // keeps expiry handling live under the bus-identity liveness kernel, which in v1 (no birth collection) returns suspected
+  // for every owner; a truly-dead owner misjudged suspected gets harmless repeated re-arm/ping (at-least-once) until birth
+  // collection + a picker enable a real reassign. (An approval ALWAYS escalates, never bypass.)
+  if (ops.nowSec() >= w.deadlineSec) { // live is alive|suspected here (dead returned above) — expiry fires for any not-dead owner
     const isApproval = w.kind === "approval" && (w.decision ?? "pending") === "pending";
     const kind = isApproval || w.timeoutPolicy !== "bypass" ? "escalation" : "bypass";
     return { actionId: ops.newActionId(), actionKind: kind, target: subjectTarget(w), expectedSubjectVersion: 0 };

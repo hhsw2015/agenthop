@@ -8,6 +8,7 @@ import { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
+import { recordSelfObserve, recordLearn } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox } from "./inbox.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -166,6 +167,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     if (!authoritative && self.stableId) return;
     const hadStableId = self.stableId !== undefined;
     const oldKey = self.stableId ?? self.id;
+    const wasAuthoritative = stableIdAuthoritative; // capture BEFORE the reassign below — distinguishes thread-switch vs correction
     self.stableId = id;
     self.title = sessionTitle(self.tool, self.cwd, id ?? self.id); // never bare tool:dir (would shadow a sibling)
     stableIdAuthoritative = authoritative;
@@ -180,9 +182,16 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     self.statusAt = e?.at;
     local.updateSelf(self);
     relay?.updateSelf(self);
+    // Record the identity learn to the durable alias-log (bus-identity): bootstrap (first adoption) / thread-switch (an
+    // authoritative id replacing an authoritative one) / correction (authoritative replacing a guess). authoritative flows
+    // through as the confidence source; a correction's fold undoes the corrected old value. Append-only, fails soft.
+    recordLearn(home, self.id, hadStableId ? oldKey : undefined, id, hadStableId ? (wasAuthoritative ? "thread-switch" : "correction") : "bootstrap", authoritative);
   };
 
   const relay: Relay | undefined = startRelay(self, (from, text) => handleInbound(from, text, "relay"), options);
+  // Record one self-observe to the alias-log at startup (run/handle/native[hard|possible by authority]/busPid/hostPid) so
+  // whois can resolve this session + probe its liveness. Append-only, fails soft; only on identity change thereafter (learn).
+  recordSelfObserve(home, self, stableIdAuthoritative, "local");
 
   const unified = (): UnifiedPeer[] => {
     // Collapse this machine's duplicate nodes for ONE session (startup presence daemon + lazily-spawned MCP node share

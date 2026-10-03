@@ -113,11 +113,20 @@ describe("sweep scenario B — owner dead ⇒ reassign (close old + open new, sa
     expect(live[0]!.owner).toBe("claude:successor");
     expect(live[0]!.waitId).not.toBe("w1");
   });
-  test("single 'suspected' is NOT dead ⇒ untouched (F17: weak predicate disabled)", async () => {
-    const stateRef = { s: mkState([wait({ waitId: "w1", deadlineSec: 1000, owner: "claude:maybe" })]) };
+  test("single 'suspected' is NOT dead ⇒ never reassigned (F17); a non-expired suspected wait is untouched", async () => {
+    const stateRef = { s: mkState([wait({ waitId: "w1", deadlineSec: 5000, owner: "claude:maybe" })]) }; // not expired
     const order: string[] = [];
     await sweepPass(mkOps(stateRef, order, { isAlive: () => "suspected" }));
-    expect(order).toEqual([]); // not reassigned, and expiry rule only fires for alive owners
+    expect(order).toEqual([]); // suspected ⇒ no reassign; not expired ⇒ no action
+  });
+  test("suspected owner + EXPIRED ⇒ re-arms (supervision continues, P1-4/F17), NOT reassigned", async () => {
+    const stateRef = { s: mkState([wait({ waitId: "w1", deadlineSec: 1000, owner: "claude:maybe" })]) }; // expired
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { isAlive: () => "suspected" }));
+    expect(order).toEqual(["commit:wait:action_pending", "doAction:bypass", "commit:wait:open"]); // re-armed, NOT reassigned
+    const live = liveWaits(stateRef.s);
+    expect(live[0]!.state).toBe("open");       // supervision continues (not stalled, not reassigned)
+    expect(live[0]!.deadlineSec).toBe(9999);
   });
   test("dead owner but no reassignee ⇒ left for escalation (no change)", async () => {
     const stateRef = { s: mkState([wait({ waitId: "w1", deadlineSec: 1000, owner: "claude:gone" })]) };

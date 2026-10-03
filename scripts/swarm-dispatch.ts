@@ -40,7 +40,8 @@ import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.j
 import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
 import { validSeedWait } from "../packages/bus/src/swarm/wait-seed.js";
 import { runDispatchLoops } from "../packages/bus/src/swarm/dispatch-loops.js";
-import { fileIsAlive, resolveSession, listSessions, makeFileLiveness } from "../packages/bus/src/swarm/task-liveness.js";
+import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
+import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox } from "../packages/bus/src/inbox.js";
 
@@ -422,14 +423,30 @@ function loadWaitSeed(stateRef: { s: LogState }): void {
 }
 
 function buildSweepOps(stateRef: { s: LogState }): SweepOps {
-  const liveness = makeFileLiveness(HOME);
+  // Owner liveness via the bus-identity whois + three-state liveness kernel (batch B). v1 has no birth collection ⇒
+  // birthOk undefined ⇒ liveness returns "suspected" for every owner (never alive/dead) — the sweep rules handle that
+  // (expired fires for not-dead; reassign only on a trustworthy dead, which v1 never produces + picker is null).
+  const kill0 = (pid: number): ProbeResultKind => { try { process.kill(pid, 0); return "present"; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM" ? "eperm" : "absent"; } };
   return {
     nowSec,
     loadState: () => stateRef.s,
     commit: (state, bodies) => { const r = commitTask(state, bodies); stateRef.s = r.state; return r; },
     // Two-evidence file liveness (task-liveness; bus-identity replaces the impl). An unresolvable owner ⇒ dead.
-    // Unresolvable owner (no unique session match, F16) ⇒ suspected, NOT dead (P2-3): bus-not-visible is not a death fact.
-    isAlive: (owner) => { const sid = resolveSession(owner, listSessions(HOME)); return sid ? fileIsAlive(sid, liveness) : "suspected"; },
+    isAlive: (owner) => {
+      // ponytail: read + project the (small) identity log per call; a per-tick cache is a later optimization if it matters.
+      const log = readIdentityLog(HOME);
+      const r = whois(buildProjection(log.events, log.corruption), owner);
+      if (r.kind !== "entity") return "suspected"; // not-seen / candidates (ambiguous, F16) / pid-only (unverified) ⇒ don't convict
+      const t = probeTargets(r.entity);
+      const now = Date.now();
+      const facts: ProbeFact[] = [];
+      if (t.scope === "relay") facts.push({ target: "remote", result: "stale", at: now }); // remote: reported freshness only (v1 stale) ⇒ never alive/dead
+      else {
+        if (t.hostPid) facts.push({ target: "hostPid", result: kill0(t.hostPid), at: now, pid: t.hostPid }); // birthOk undefined (v1) ⇒ never alive/dead
+        if (t.busPid) facts.push({ target: "busPid", result: kill0(t.busPid), at: now, pid: t.busPid });
+      }
+      return busLiveness(facts, "unknown").state; // output "unknown" (no confirmed-no-output signal) ⇒ never promoted to dead
+    },
     // v1: no idle-same-role picker yet (that is the R8 overload rule, next) ⇒ a dead owner is left for escalation.
     pickReassignee: () => null,
     // v1: no validator-roster picker yet (needs bus-identity) ⇒ a stuck/dead RPV validator is left for escalation.
