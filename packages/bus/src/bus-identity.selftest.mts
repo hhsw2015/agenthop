@@ -377,6 +377,27 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   t("P1-4 (P2): a copied derivative retires when its parent is corrected (no active copy anywhere)", whois(proj, "H").kind === "not-seen" && whois(proj, "B").kind === "entity");
 }
 {
+  // P1-4 round-7: a copy that keeps the same (value,form,source) but DROPS the optional derivedFrom still
+  // retires — the fixpoint propagates by the claim's OWN signature, not only its parent edge.
+  const mk = (v: string, f: Claim["form"], src: string, d?: { value: string; form: Claim["form"] }): Claim => ({ value: v, form: f, confidence: "possible", provenance: "heuristic", source: src, ...(d ? { derivedFrom: d } : {}) });
+  const run = (order: "copy-after" | "copy-before") => {
+    const sObs = obs("R", [hard("R", "run"), mk("A", "native", "S"), mk("H", "handle", "S", { value: "A", form: "native" })], { ts: 1, eventId: "S" });
+    const qObs = obs("Q", [hard("Q", "run"), mk("H", "handle", "S")], { ts: 2, eventId: "qobs" }); // same (H,handle,S,possible), NO derivedFrom
+    const corr = learn("R", "A", "B", "correction", true, { ts: 3 });
+    const ev = order === "copy-after" ? [sObs, corr, qObs] : [sObs, qObs, corr];
+    return buildProjection(ev);
+  };
+  const findH = (proj: ReturnType<typeof buildProjection>): Claim | undefined => {
+    const inEnts = [...proj.entities.values()].flatMap((e) => e.incarnations).flatMap((i) => i.claims);
+    return [...inEnts, ...proj.undecided].find((c) => c.value === "H" && c.form === "handle" && c.source === "S" && c.derivedFrom === undefined);
+  };
+  for (const order of ["copy-before", "copy-after"] as const) {
+    const proj = run(order);
+    const qH = findH(proj);
+    t(`P1-4 (P2): a derivedFrom-less same-signature copy retires (${order})`, !!qH && qH.superseded === true);
+  }
+}
+{
   const proj = buildProjection([obs("R", [hard("R", "run"), poss("A", "native")], { ts: 1 }), learn("R", "A", "A", "correction", true, { ts: 2 })]);
   t("P1-4: from==to self-confirmation resolves (not globally blocked)", whois(proj, "A").kind === "entity");
 }
