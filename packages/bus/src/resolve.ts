@@ -8,6 +8,9 @@ export type UnifiedPeer = {
   /** The host's native session id: a durable, restart-stable address (see SelfInfo.stableId). */
   stableId?: string;
   tool: string;
+  /** The host's permission mode (Claude vocab: default|acceptEdits|plan|bypassPermissions); used to stamp from-mode on
+   *  a delivered cross-session frame so a bypass receiver doesn't gate a bypass sender. Absent => unknown => "default". */
+  mode?: string;
   cwd: string;
   title: string;
   via: "local" | "relay";

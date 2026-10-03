@@ -103,7 +103,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // files that no later flush reclaims (claimInbox only sees .json), stranding the message for good.
       const claimed = claimInbox(home, inboxKeys(), String(process.pid));
       for (let i = 0; i < claimed.length; i++) {
-        const ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread, codexHome: codexDaemon?.codexHome() });
+        const ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread, codexHome: codexDaemon?.codexHome(), fromMode: claimed[i].msg.fromMode, to: self.title });
         if (ok) { ackInbox(claimed[i].file); continue; }
         for (let j = i; j < claimed.length; j++) releaseInbox(claimed[j].file);
         break;
@@ -121,6 +121,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
     learnStableId(codexThread, ownCodexThread !== undefined);
     const label = labelFor(from);
+    const fromMode = modeFor(from); // the sender's real permission mode for the host frame (from-mode)
     // Bind the delivery identity's inbox key + arrival time NOW, before the async push. If the push fails, the fallback
     // persist must use the SAME identity this message was resolved for — not whatever identity a concurrent noteThread
     // switched us to by the time the callback runs, which would file A's message into B's inbox (Codex P2-7).
@@ -130,10 +131,11 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // when AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
     if (msgLogEnabled()) writeMsgLog(home, { ts, from, to: self.id, via, direction: "in", size: Buffer.byteLength(text), text });
     dbg(`inbound via=${via} from=${from} own=${ownCodexThread} stable=${self.stableId} daemon=${codexDaemon?.activeThread(self.cwd)} -> codexThread=${codexThread}`);
-    void pushToHost(label, text, { codexThread, codexHome: codexDaemon?.codexHome() }).then((ok) => {
+    // `to: self.title` = THIS session's own address, shown email-style so the user can see which of their sessions got it.
+    void pushToHost(label, text, { codexThread, codexHome: codexDaemon?.codexHome(), fromMode, to: self.title }).then((ok) => {
       dbg(`pushToHost ok=${ok}`);
       if (ok) void flushInbox(); // channel works -> also deliver any durable backlog (keeps order)
-      else writeInbox(home, key, { from, fromLabel: label, text, via, ts });
+      else writeInbox(home, key, { from, fromLabel: label, fromMode, text, via, ts });
     });
   };
 
@@ -178,7 +180,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // a stableId) so resolve isn't ambiguous and the roster shows it once (dedupLocalPeers; delivery stays exactly-once
     // via the atomic inbox + unicast DM). Then merge relay peers that aren't already present locally.
     const out = new Map<string, UnifiedPeer>();
-    for (const p of dedupLocalPeers(local.peers().map((p) => ({ id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid, status: p.status, statusSeq: p.statusSeq, statusText: p.statusText, statusAt: p.statusAt })))) {
+    for (const p of dedupLocalPeers(local.peers().map((p) => ({ id: p.id, stableId: p.stableId, tool: p.tool, mode: p.mode, cwd: p.cwd, title: p.title, via: "local", pid: p.pid, status: p.status, statusSeq: p.statusSeq, statusText: p.statusText, statusAt: p.statusAt })))) {
       out.set(p.id, p);
     }
     if (relay) {
@@ -192,6 +194,12 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     if (!p) return idOrPub.slice(0, 8);
     return `${p.title}${p.via === "relay" ? `@${p.machine ?? "remote"}` : ""}`;
   };
+
+  // The sender's REAL permission mode from the roster, so a delivery to a Claude host stamps it on the cross-session
+  // frame (from-mode) instead of a hardcoded "default" (which made a bypass receiver gate every peer message). Undefined
+  // when the sender isn't resolvable -> pushClaude defaults to "default" (the safe, gated side).
+  const modeFor = (idOrPub: string): string | undefined =>
+    unified().find((x) => x.id === idOrPub || x.stableId === idOrPub || x.pub === idOrPub)?.mode;
 
   const resolve = (to: string): UnifiedPeer | { error: string } => resolvePeer(unified(), self.id, to);
 

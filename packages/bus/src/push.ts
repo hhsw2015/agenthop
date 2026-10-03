@@ -43,22 +43,32 @@ function codexBin(): string {
  *
  * Returns true if handed to a native channel; false means keep it in the pull queue for agenthop_recv.
  */
-export async function pushToHost(from: string, text: string, opts: { codexThread?: string; codexHome?: string } = {}): Promise<boolean> {
+export async function pushToHost(
+  from: string,
+  text: string,
+  opts: { codexThread?: string; codexHome?: string; fromMode?: string; to?: string } = {},
+): Promise<boolean> {
   const sock = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
-  if (sock) return pushClaude(sock, process.env.CLAUDE_CODE_MESSAGING_TOKEN, from, text);
+  if (sock) return pushClaude(sock, process.env.CLAUDE_CODE_MESSAGING_TOKEN, from, text, { fromMode: opts.fromMode, to: opts.to });
   // Codex: the caller passes the active thread id (from x-codex-turn-metadata or the daemon client).
-  if (opts.codexThread) return pushCodex(opts.codexThread, from, text, opts.codexHome);
+  if (opts.codexThread) return pushCodex(opts.codexThread, from, text, opts.codexHome, opts.to);
   dbg(`pushToHost: no channel (no cc-socks, no codexThread) from=${from}`);
   return false;
 }
 
-/** codex queue delivers as if the user typed it (no sender field), so we prefix the sender. */
-function pushCodex(thread: string, from: string, text: string, codexHome?: string): Promise<boolean> {
+/** Email-style From→To header prepended to a delivered bus message so the agent (and the user) can see which address
+ *  sent it AND which of their sessions received it. `from`/`to` are stable handles (the agent's "email address"). */
+function busHeader(from: string, to?: string): string {
+  return to ? `[bus] ${from} → ${to}\n` : `[bus] ${from}\n`;
+}
+
+/** codex queue delivers as if the user typed it (no sender field), so we prefix an email-style From→To header. */
+function pushCodex(thread: string, from: string, text: string, codexHome?: string, to?: string): Promise<boolean> {
   return new Promise((resolve) => {
     // CODEX_HOME must be passed explicitly: `codex queue` reads the thread's rollout from it, but the MCP
     // subprocess Codex spawns does not inherit CODEX_HOME — without it the queue fails "no rollout found".
     const env = codexHome ? { ...process.env, CODEX_HOME: codexHome } : process.env;
-    const child = spawn(codexBin(), ["queue", "--thread", thread, "--message", `[bus] ${from}: ${text}`], { stdio: ["ignore", "pipe", "pipe"], env });
+    const child = spawn(codexBin(), ["queue", "--thread", thread, "--message", `${busHeader(from, to)}${text}`], { stdio: ["ignore", "pipe", "pipe"], env });
     let out = "";
     let err = "";
     child.stdout?.on("data", (d) => (out += d));
@@ -74,12 +84,21 @@ function pushCodex(thread: string, from: string, text: string, codexHome?: strin
   });
 }
 
-function pushClaude(sockPath: string, token: string | undefined, from: string, text: string): Promise<boolean> {
-  // Attribute order is load-bearing: the receiver round-trips from, from-session, hop-chain,
-  // from-name, from-mode and rejects a different order.
+function pushClaude(
+  sockPath: string,
+  token: string | undefined,
+  from: string,
+  text: string,
+  opts: { fromMode?: string; to?: string } = {},
+): Promise<boolean> {
+  // from-mode carries the SENDER's REAL permission mode (Claude vocab, learned by the sender's presence hook; absent =>
+  // "default" = the safe gated side). Hardcoding "default" made a bypass receiver gate every peer message for approval
+  // regardless of the sender's trust level (Codex from-mode review). The To address rides the BODY (email-style): the
+  // frame's attribute set/order is load-bearing (the receiver round-trips from, from-session, hop-chain, from-name,
+  // from-mode and rejects a different order), so a "to" attribute would be rejected — put the recipient in the text.
   const content =
     `<cross-session-message from="${attr(from)}" from-session="agenthop-bus" hop-chain="" ` +
-    `from-name="${attr(from)}" from-mode="default">${xml(text)}</cross-session-message>`;
+    `from-name="${attr(from)}" from-mode="${attr(opts.fromMode || "default")}">${xml(`${busHeader(from, opts.to)}${text}`)}</cross-session-message>`;
   const frames = [
     JSON.stringify({ type: "auth", token: token ?? "" }),
     JSON.stringify({ type: "user", message: { role: "user", content }, priority: "now", file_attachments: [] }),

@@ -12,7 +12,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-export type InboxMsg = { from: string; fromLabel: string; text: string; via: "local" | "relay"; ts: number };
+export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: "local" | "relay"; ts: number };
 export type Claimed = { file: string; msg: InboxMsg };
 
 function sanitize(key: string): string {

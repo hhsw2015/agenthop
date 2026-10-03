@@ -237,8 +237,13 @@ const PRESENCE_END_MARK = `# ${HOOK_SENTINEL_PRESENCE}:end`;
  * without SessionEnd firing — no leak). Side-effect-only (`|| true`, output suppressed) so it can never block or fail a
  * turn; a no-op if neither bun nor node nor the bundle is present.
  */
+/** Extract the host's permission_mode from the SessionStart hook's STDIN JSON (both Claude Code and Codex put it there),
+ *  so the presence daemon can publish the session's REAL mode (SelfInfo.mode) and a delivery stamps it on the
+ *  cross-session frame's from-mode instead of a hardcoded "default". Best-effort sed; empty => unknown => "default". */
+const MODE_FROM_STDIN = `_mode=$(printf '%s' "\$_in" | sed -n 's/.*"permission_mode"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -1)`;
+
 function presenceStartCommand(): string {
-  return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; elif [ -f "\$_mjs" ]; then _rt="\$(command -v bun || command -v node)"; if [ -n "\$_rt" ]; then AGENTHOP_PID_FILE="\$_pf" AGENTHOP_HOST_PID="\$PPID" "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1; fi; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
+  return `_in=$(cat 2>/dev/null); ${MODE_FROM_STDIN}; _sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; elif [ -f "\$_mjs" ]; then _rt="\$(command -v bun || command -v node)"; if [ -n "\$_rt" ]; then AGENTHOP_PID_FILE="\$_pf" AGENTHOP_HOST_PID="\$PPID" AGENTHOP_MODE="\$_mode" "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1; fi; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
 }
 
 /** The SessionEnd command that stops this session's presence node (by the pid agenthop recorded) and removes the file. */
@@ -290,7 +295,7 @@ const CODEX_SID_FROM_STDIN = `_in=$(cat 2>/dev/null); _sid=$(printf '%s' "\$_in"
 /** Codex SessionStart: parse the session id from stdin, then launch the presence bundle via bun/node with it injected
  *  as AGENTHOP_SESSION (so the daemon's identity = that thread id). Same non-compiled-bundle reasoning as Claude. */
 function codexPresenceStartCommand(): string {
-  return `${CODEX_SID_FROM_STDIN}; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; elif [ -f "\$_mjs" ]; then _rt="\$(command -v bun || command -v node)"; if [ -n "\$_rt" ]; then AGENTHOP_SESSION="\$_sid" AGENTHOP_PID_FILE="\$_pf" AGENTHOP_HOST_PID="\$PPID" "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1; fi; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
+  return `${CODEX_SID_FROM_STDIN}; ${MODE_FROM_STDIN}; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; elif [ -f "\$_mjs" ]; then _rt="\$(command -v bun || command -v node)"; if [ -n "\$_rt" ]; then AGENTHOP_SESSION="\$_sid" AGENTHOP_PID_FILE="\$_pf" AGENTHOP_HOST_PID="\$PPID" AGENTHOP_MODE="\$_mode" "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1; fi; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
 }
 
 /** Codex SessionEnd: parse the session id from stdin + stop that presence daemon. */

@@ -52,6 +52,7 @@ export function startRelay(
     id: self.id,
     stableId: self.stableId,
     tool: self.tool,
+    mode: self.mode,
     cwd: self.cwd,
     title: self.title,
     machine: hostname(),
@@ -71,6 +72,7 @@ export function startRelay(
         id: p.id,
         stableId: p.stableId,
         tool: p.tool,
+        mode: p.mode,
         cwd: p.cwd,
         title: p.title,
         via: "relay" as const,
@@ -89,6 +91,7 @@ export function startRelay(
       relayMe = {
         ...relayMe,
         stableId: next.stableId,
+        mode: next.mode,
         title: next.title,
         ts: Date.now(),
         status: next.status,
