@@ -361,7 +361,7 @@ async function observeGitFor(a: { attempt: TaskAttempt; spec: TaskSpec; binding:
   const resolveFile = async (p: string): Promise<void> => {
     // --literal-pathspecs: a declared path is a LITERAL filename, never a pathspec — so a path like ":(literal)out/x"
     // can't be magic-matched to a DIFFERENT real file (Codex round-3 ls-tree/pathspec mismatch).
-    const t = await git(["ls-tree", "--literal-pathspecs", sha, "--", p], { cwd: scratch });
+    const t = await git(["--literal-pathspecs", "ls-tree", sha, "--", p], { cwd: scratch }); // global opt BEFORE subcommand
     if (t.code !== 0) { incomplete = true; return; }       // query error ⇒ unknown (not a clean absence)
     const lines = t.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
     if (lines.length === 0) return;                        // cleanly absent ⇒ left out of the closure (missing)
