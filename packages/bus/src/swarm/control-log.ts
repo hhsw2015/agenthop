@@ -42,17 +42,21 @@ export type DispatchIntent = {
   status: "pending" | "confirmed" | "abandoned";
 };
 
-/** A result observed on a WORK branch by O1 (§4.2), before validation. */
+/** A result observed on a WORK branch by O1 (§4.2), before validation. Carries bindingId + workCommit so V3's binding
+ *  check and F5's "registered before cutoff" can be answered from the log, and closureFiles (the sorted (path,blobOid)
+ *  raw material) so the V6 closure + the P2-1 evidence are pinned at observe time (not recomputed later). The closure
+ *  digest is DERIVED from resultBlobOid + closureFiles via computeResultClosureDigest — not stored, to avoid drift. */
 export type ResultObserved = {
   observedId: string;
   attemptId: string;
   nodeId: string;
+  bindingId: string;
   launchId: string;
   generation: number;
   observedWorkCommit: string;
   resultPath: string;
   resultBlobOid: string;
-  resultClosureDigest: string;
+  closureFiles: Array<{ path: string; blobOid: string }>;
 };
 
 /** A rejected candidate written for audit (§2.5). */
@@ -132,7 +136,17 @@ function applyChanges(state: LogState, changes: Change[]): LogState {
     const key = entityKeyOf(c);
     revisions[key] = (revisions[key] ?? 0) + 1;
     operations[c.operationId] = payloadDigestOf(c);
-    entities[key] = bodyOf(c);
+    if (c.put === "supersede") {
+      // supersede keys to accepted:<id> — it MUTATES that AcceptedResult's superseded flag, it does NOT replace the
+      // entity body with the supersede op (which would lose observedWorkCommit/resultPath/decidedAtSeq and break both
+      // currentAccepted and the results.json projection — fe0376cd T2 review #2 P1). Target existence is validated in
+      // commit(); on the replay path a valid log guarantees the accepted was put first, so a miss here is a corrupt log.
+      const existing = entities[key];
+      if (existing === undefined || existing.put !== "accepted") throw new Error(`supersede target ${key} missing or not an accepted`);
+      entities[key] = { put: "accepted", accepted: { ...existing.accepted, superseded: true } };
+    } else {
+      entities[key] = bodyOf(c);
+    }
   }
   return { ...state, seq: state.seq + 1, revisions, operations, entities };
 }
@@ -175,10 +189,15 @@ export function commit(state: LogState, expectedSeq: number, changes: Change[]):
     seen.add(key);
   }
 
-  // 3. each new op must match the entity's current revision, and the entity must not be frozen.
+  // 3. each new op must match the entity's current revision, the entity must not be frozen, and a supersede must
+  //    target an existing accepted (superseding a nonexistent/non-accepted entity is a caller bug — fail-fast).
   for (const c of changes) {
     const key = entityKeyOf(c);
     if (state.frozen.includes(key)) return { result: { ok: false, reason: "batch", detail: `entity ${key} is frozen` }, state };
+    if (c.put === "supersede") {
+      const existing = state.entities[key];
+      if (existing === undefined || existing.put !== "accepted") return { result: { ok: false, reason: "batch", detail: `supersede target ${key} missing or not an accepted` }, state };
+    }
     const current = state.revisions[key] ?? 0;
     if (c.expectedEntityRevision !== current) return { result: { ok: false, reason: "stale-entity", entityKey: key, currentRevision: current }, state };
   }
