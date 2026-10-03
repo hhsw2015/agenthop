@@ -214,6 +214,26 @@
   .rax span { position: absolute; font-size: 9px; color: var(--faint); transform: translateX(-50%); white-space: nowrap; }
   #rsub { max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+  /* ---------- task-logical (DAG) view ---------- */
+  .viewbtn { border: 1px solid var(--line); background: rgba(110,168,254,.10); color: var(--accent);
+    border-radius: 9px; padding: 0 12px; height: 28px; cursor: pointer; font: inherit; font-size: 11px; font-weight: 600; }
+  .viewbtn:hover { border-color: var(--accent); }
+  .dagedge { fill: none; stroke: var(--line); stroke-width: 1.6; }
+  html[data-theme="light"] .dagedge { stroke: rgba(15,23,42,.18); }
+  .dagnode { cursor: pointer; }
+  .dagnode .body { stroke-width: 2.5; transition: filter .15s; }
+  .dagnode:hover .body { filter: brightness(1.3); }
+  .dagnode.sel .body { stroke-width: 3.5; }
+  .dagnode .nid { fill: var(--ink); font-size: 12px; font-weight: 700; }
+  .dagnode .nsub { fill: var(--dim); font-size: 10px; }
+  .dagnode .nexec { fill: var(--faint); font-size: 9.5px; }
+  /* "was green, now stale": a dashed halo + animated so it reads as an alarm, not a finish. */
+  .dagnode.stale .stale-ring { stroke-dasharray: 3 3; animation: pulse 2s ease-out infinite; opacity: .9; }
+  .muted { color: var(--faint); }
+  /* In the task-logical view the topology-only overlays would both cover the DAG and show a second,
+     confusing task representation (the placeholder tasklog panel + river). Hide them. */
+  body.jobs-view #panels, body.jobs-view #river, body.jobs-view #ticker { display: none; }
+
   /* ---------- drawer ---------- */
   aside {
     position: absolute; top: 0; right: 0; width: 372px; height: 100%; overflow-y: auto;
@@ -337,6 +357,7 @@
     <div class="spacer"></div>
     <div class="filters" id="filters"></div>
     <input class="search" id="search" placeholder="Search sessions, cwd, machine…" />
+    <button class="viewbtn" id="viewtoggle" title="Topology (by machine) ⇄ Jobs (by task DAG)">jobs ▸</button>
     <button class="themebtn" id="theme" title="Toggle light / dark">◐</button>
   </header>
   <div id="stage">
@@ -383,8 +404,17 @@
   let sel = null;           // selected node id
   let query = "";
   const filters = new Set(); // active status/via/box filters
+  let viewMode = "topology"; // "topology" (by machine) | "jobs" (by task DAG)
+  let selJob = null;         // selected jobId in jobs view (null = first)
+  let jobSel = null;         // selected nodeId in jobs view
 
   const STATUS_COLOR = { working: "#4ea1ff", idle: "#46c98b", blocked: "#ff5c5c", unknown: "#6b7080" };
+  // Acceptance colors for the task-logical view — chosen so the two lies the brain guards against are
+  // visually loud: RESULT_PENDING_VALIDATION (claimed, not accepted) and SUCCEEDED-but-stale.
+  const ACCEPT_COLOR = {
+    SUCCEEDED: "#46c98b", RUNNING: "#4ea1ff", RESULT_PENDING_VALIDATION: "#ffb454",
+    RETRY_WAIT: "#c58fff", FAILED: "#ff5c5c", ABANDONED: "#6b7080", "no-attempt": "#3a4050",
+  };
   const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
   // ---------------------------------------------------------------- layout (deterministic packed grid)
@@ -512,9 +542,97 @@
   }
 
   // ---------------------------------------------------------------- render
+  // ---------------------------------------------------------------- task-logical (DAG) view
+  /** The job currently shown in the jobs view: the selected one, else the first. */
+  function currentJob() {
+    const jobs = state?.projection?.jobs ?? [];
+    if (!jobs.length) return null;
+    return jobs.find((j) => j.plan.jobId === selJob) ?? jobs[0];
+  }
+
+  /**
+   * Render one job as its dependency DAG. x = layer (dependency depth, left→right); y = order within the
+   * layer (siblings in a layer with no path between them are PARALLEL work). Edges are dependsOn. Node
+   * colour = acceptance state from the projection (never re-derived). The "was green, now stale" case
+   * (SUCCEEDED && !complete) gets its own striped treatment — the brain's whole point made visible.
+   */
+  function renderJobsView() {
+    document.querySelectorAll("#svg > g#view > *").forEach((n) => n.remove());
+    const view = $("view");
+    const job = currentJob();
+    if (!job) return;
+    const nodes = job.plan.nodes;
+
+    // Group by layer; position within layer by stable nodeId order.
+    const layers = new Map();
+    for (const n of nodes) { const L = n.layer ?? 0; (layers.get(L) ?? layers.set(L, []).get(L)).push(n); }
+    const COLW = 200, ROWH = 104, R = 30;
+    const pos = new Map();
+    let maxRow = 0;
+    for (const [L, group] of [...layers.entries()].sort((a, b) => a[0] - b[0])) {
+      group.sort((a, b) => a.nodeId.localeCompare(b.nodeId));
+      group.forEach((n, i) => { pos.set(n.nodeId, { x: 60 + L * COLW, y: 70 + i * ROWH }); maxRow = Math.max(maxRow, i); });
+    }
+
+    // Edges first (under the nodes).
+    for (const n of nodes) {
+      for (const dep of n.dependsOn) {
+        const a = pos.get(dep), b = pos.get(n.nodeId);
+        if (!a || !b) continue;
+        view.appendChild(el("path", { class: "dagedge", d: `M${a.x + R},${a.y} C${a.x + R + 60},${a.y} ${b.x - R - 60},${b.y} ${b.x - R},${b.y}` }));
+      }
+    }
+
+    // Nodes.
+    for (const n of nodes) {
+      const p = pos.get(n.nodeId);
+      const att = job.attempts[n.nodeId]?.current;
+      const status = att?.status ?? "no-attempt";
+      const color = ACCEPT_COLOR[status] ?? "#6b7080";
+      const stale = status === "SUCCEEDED" && att && att.complete === false; // was green, now stale
+      const g = el("g", { class: `dagnode${jobSel === n.nodeId ? " sel" : ""}${stale ? " stale" : ""}`, transform: `translate(${p.x},${p.y})` });
+      g.appendChild(el("title", {})).textContent =
+        `${n.nodeId} (${n.kind}${n.required ? "" : ", optional"})\n${n.goal ?? ""}\n${status}${att?.complete === false && status === "SUCCEEDED" ? " — but upstream superseded (stale)" : ""}`;
+      // Shape by kind: a diamond for fan-in (integration/synthesis/review/repair), a circle for work.
+      const fanIn = n.kind !== "work";
+      if (fanIn) g.appendChild(el("rect", { class: "body", x: -R + 4, y: -R + 4, width: (R - 4) * 2, height: (R - 4) * 2, rx: 7, transform: "rotate(45)", fill: color + "22", stroke: color }));
+      else g.appendChild(el("circle", { class: "body", r: R - 4, fill: color + "22", stroke: color }));
+      if (stale) g.appendChild(el("circle", { class: "stale-ring", r: R - 1, fill: "none", stroke: color }));
+      const t = el("text", { class: "nid", "text-anchor": "middle", y: 4 });
+      t.textContent = n.nodeId;
+      g.appendChild(t);
+      // kind + executor line under the node.
+      const sub = el("text", { class: "nsub", "text-anchor": "middle", y: R + 14 });
+      sub.textContent = n.kind + (n.required ? "" : " ·opt");
+      g.appendChild(sub);
+      const ex = att?.executionBindings?.[0]?.executor;
+      if (ex) {
+        const exl = el("text", { class: "nexec", "text-anchor": "middle", y: R + 27 });
+        exl.textContent = ex.kind === "box" ? "▦ " + ex.launchId : "☺ " + (ex.memberId.split(":").pop() || ex.memberId);
+        g.appendChild(exl);
+      }
+      g.addEventListener("click", (e) => { e.stopPropagation(); jobSel = jobSel === n.nodeId ? null : n.nodeId; sel = null; render(); draw(); });
+      view.appendChild(g);
+    }
+
+    // Fit the DAG into the stage (respecting the river reserve, like the topology fit).
+    model = { bounds: { x0: 0, y0: 0, x1: 60 + ([...layers.keys()].length) * COLW + 60, y1: 70 + (maxRow + 1) * ROWH + 40 } };
+    if (!didFit || lastView !== "jobs") { didFit = true; lastView = "jobs"; fit(); }
+  }
+
   function render() {
     const snap = state;
     if (!snap) return;
+    // Task-logical (DAG) view is a different ORGANIZING AXIS of the same stage: topology = by machine,
+    // jobs = by dependency. It renders only when the brain projection is present.
+    if (viewMode === "jobs" && snap.projection && snap.projection.present) {
+      document.body.classList.add("jobs-view");
+      renderJobsView();
+      renderDrawer();
+      renderHeader();
+      return;
+    }
+    document.body.classList.remove("jobs-view");
     model = layout(snap);
     document.querySelectorAll("#svg > g#view > *").forEach((n) => n.remove());
     const view = $("view");
@@ -677,6 +795,7 @@
   // ---------------------------------------------------------------- pannable view transform + zoom
   let view = { x: 0, y: 0, k: 1 };
   let didFit = false;
+  let lastView = "topology"; // re-fit when switching between topology and jobs
   let lastReserved = -1; // last river-reserved height the view was fitted against
   function fit() {
     if (!model || !model.bounds) return;
@@ -1003,8 +1122,54 @@
   }
 
   // ---------------------------------------------------------------- drawer
+  function dagNodeDrawer(job, node) {
+    const att = job.attempts[node.nodeId]?.current;
+    const hist = job.attempts[node.nodeId]?.history ?? [];
+    const status = att?.status ?? "no-attempt";
+    const color = ACCEPT_COLOR[status] ?? "#6b7080";
+    const stale = status === "SUCCEEDED" && att && att.complete === false;
+    const ex = att?.executionBindings ?? [];
+    const execLine = (b) => {
+      const e = b.executor;
+      const who = e.kind === "box" ? `box ${esc(e.launchId)}` : `member ${esc(e.memberId)}`;
+      const chain = b.continuationOf ? ` ← ${esc(short(b.continuationOf))}` : "";
+      return `<div class="flowrow"><span class="who">${who}</span><span class="v">${esc(b.state ?? "")}${b.publishGeneration != null ? " ·g" + b.publishGeneration : ""}${chain}</span></div>`;
+    };
+    return `
+      <div class="close">✕</div>
+      <h3>${esc(node.nodeId)}</h3>
+      <div class="kind"><span class="dot" style="background:${color}"></span>${esc(node.kind)}${node.required ? "" : " · optional"} · job ${esc(job.plan.jobId)}</div>
+      <div class="bar"><i style="width:100%;background:${color}"></i></div>
+      <dl>
+        <dt>status</dt><dd style="color:${color}">${esc(status)}</dd>
+        <dt>complete</dt><dd>${att ? (att.complete ? "yes" : "no") : "—"}</dd>
+        ${att?.role ? `<dt>role</dt><dd>${esc(att.role)}</dd>` : ""}
+        ${att?.retriesUsed != null ? `<dt>retries</dt><dd>${att.retriesUsed}</dd>` : ""}
+        ${att?.failureClass ? `<dt>failure</dt><dd>${esc(att.failureClass)}</dd>` : ""}
+        <dt>depends on</dt><dd>${node.dependsOn.length ? node.dependsOn.map(esc).join(", ") : "— (root)"}</dd>
+      </dl>
+      ${att?.statusNote ? `<div class="note">${esc(att.statusNote)}</div>` : ""}
+      ${stale ? `<div class="recover">Was accepted (green), but an upstream was superseded — this node is now stale and will rerun. SUCCEEDED is the historical fact; complete=false is current validity.</div>` : ""}
+      ${node.goal ? `<div class="sec">goal</div><div class="note">${esc(node.goal)}</div>` : ""}
+      ${ex.length ? `<div class="sec">executor</div>${ex.map(execLine).join("")}` : `<div class="sec">executor</div><div class="empty-note">No binding yet — not dispatched.</div>`}
+      ${att?.inputBindings?.length ? `<div class="sec">inputs (frozen)</div>${att.inputBindings.map((b) => `<div class="flowrow"><span class="who">${esc(b.depNodeId)}</span><span class="v">${esc(short(b.acceptedResultId))}</span></div>`).join("")}` : ""}
+      ${hist.length ? `<div class="sec">attempt history</div>${hist.map((h) => `<div class="flowrow"><span class="who">${esc(short(h.attemptId))}</span><span class="v">${esc(h.status)}${h.failureClass ? " · " + esc(h.failureClass) : ""}</span></div>`).join("")}` : ""}
+    `;
+  }
+
   function renderDrawer() {
     const aside = $("drawer");
+    // Jobs view: a selected DAG node shows its attempt detail.
+    if (viewMode === "jobs" && jobSel) {
+      const job = currentJob();
+      const node = job?.plan.nodes.find((n) => n.nodeId === jobSel);
+      if (job && node) {
+        aside.classList.add("open");
+        aside.innerHTML = dagNodeDrawer(job, node);
+        aside.querySelector(".close").onclick = () => { jobSel = null; render(); };
+        return;
+      }
+    }
     if (!model) { aside.classList.remove("open"); aside.innerHTML = ""; return; }
     // Pair-history view takes precedence: it was opened from an arc, not a node.
     if (pair) {
@@ -1220,8 +1385,40 @@
   }
 
   // ---------------------------------------------------------------- header
+  function renderJobsHeader() {
+    const job = currentJob();
+    if (!job) return;
+    const jobs = state.projection.jobs;
+    const b = job.budget || {};
+    const bud = b.jobBudget || {}, used = b.used || {};
+    const nodes = job.plan.nodes;
+    const done = nodes.filter((n) => job.attempts[n.nodeId]?.current?.complete).length;
+    const stale = nodes.filter((n) => { const a = job.attempts[n.nodeId]?.current; return a && a.status === "SUCCEEDED" && a.complete === false; }).length;
+    const pct = (u, m) => (m ? Math.min(100, Math.round((u / m) * 100)) : 0);
+    const statusColor = { running: "var(--working)", succeeded: "var(--idle)", failed: "var(--blocked)", blocked: "var(--warn)" }[job.plan.jobStatus] || "var(--dim)";
+    const jobPick = jobs.length > 1
+      ? `<select id="jobpick" class="search" style="width:auto;padding:4px 8px">${jobs.map((j) => `<option value="${esc(j.plan.jobId)}"${j.plan.jobId === job.plan.jobId ? " selected" : ""}>${esc(j.plan.jobId)}</option>`).join("")}</select>`
+      : `<b>${esc(job.plan.jobId)}</b>`;
+    $("stats").innerHTML =
+      `<span>${jobPick}</span>` +
+      `<span style="color:${statusColor}">● ${esc(job.plan.jobStatus)}</span>` +
+      `<span><b>${done}/${nodes.length}</b> complete</span>` +
+      (stale ? `<span style="color:var(--warn)"><b>${stale}</b> stale</span>` : "") +
+      `<span>attempts <b>${used.totalAttempts ?? 0}</b>/${bud.maxTotalAttempts ?? "?"}</span>` +
+      `<span>wall <b>${Math.round((used.wallClockSec ?? 0) / 60)}</b>/${bud.maxWallClockSec ? Math.round(bud.maxWallClockSec / 60) : "?"}m</span>` +
+      (bud.maxModelUsd != null || used.modelUsd != null ? `<span>$<b>${(used.modelUsd ?? 0).toFixed(2)}</b></span>` : `<span class="muted">$ n/a</span>`) +
+      (job.plan.jobStatusNote ? `<span class="muted">${esc(job.plan.jobStatusNote)}</span>` : "");
+    const jp = document.getElementById("jobpick");
+    if (jp) jp.onchange = (e) => { selJob = e.target.value; jobSel = null; didFit = false; render(); };
+  }
+
   function renderHeader() {
     const s = state;
+    // Toggle is only meaningful once a projection exists; dim it otherwise.
+    const hasProj = !!(s.projection && s.projection.present && (s.projection.jobs || []).length);
+    const vt = $("viewtoggle");
+    if (vt) { vt.style.display = hasProj ? "" : "none"; if (!hasProj && viewMode === "jobs") { viewMode = "topology"; } }
+    if (viewMode === "jobs" && hasProj) { renderJobsHeader(); return; }
     const byStatus = {};
     for (const n of s.nodes) byStatus[n.status ?? "unknown"] = (byStatus[n.status ?? "unknown"] ?? 0) + 1;
     const relayN = s.nodes.filter((n) => n.via === "relay").length;
@@ -1329,6 +1526,13 @@
       localStorage.setItem("swarm-viz-theme", next);
     };
   })();
+  $("viewtoggle").onclick = () => {
+    viewMode = viewMode === "jobs" ? "topology" : "jobs";
+    $("viewtoggle").textContent = viewMode === "jobs" ? "◂ topology" : "jobs ▸";
+    didFit = false; // re-fit for the new axis
+    jobSel = null; sel = null;
+    render();
+  };
   // Pause everything while the tab is hidden — timers keep firing in a background tab, so an
   // all-day-open page would otherwise animate and re-render for nobody.
   document.addEventListener("visibilitychange", () => {

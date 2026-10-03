@@ -34,6 +34,7 @@ import { readMsgLogDays, msgLogEnabled, payloadLoggingEnabled, type MsgLogEntry 
 import { readTasks } from "../packages/bus/src/tasklog.js";
 import type { UnifiedPeer } from "../packages/bus/src/resolve.js";
 import { codexRolloutPath, readNodeActivity, transcriptPath, type NodeActivity } from "./node-activity.js";
+import { readProjection, type Projection } from "./projection.js";
 
 // ---------------------------------------------------------------------------------------------
 // Types
@@ -197,6 +198,9 @@ export type Snapshot = {
   payloadLogged: boolean;
   /** Whether the bus has message logging switched on here. Distinguishes "off" from "on but quiet". */
   msgLogEnabled: boolean;
+  /** The swarm-brain projection: job DAGs, attempts, acceptance, members. present:false until the brain
+   *  writes one (brain §4.3 step A). The task-logical view renders from this; never re-derives judgment. */
+  projection: Projection;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -486,6 +490,7 @@ export function buildSnapshot(
     departures,
     tasks,
     events: msgLog,
+    projection: readProjection(home),
     payloadLogged: msgLog.some((e) => typeof e.text === "string" && e.text.length > 0),
     msgLogEnabled: msgLogEnabled(),
   };
