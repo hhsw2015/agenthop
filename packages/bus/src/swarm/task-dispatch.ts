@@ -83,10 +83,15 @@ export function prepareDispatch(
   };
   const baseSourceCommit = spec.outputContract.baseSourceCommit;
 
-  // A ready node with an EXPIRED RETRY_WAIT predecessor is a retry succession (inherit retriesUsed, abandon the old in
-  // the same batch); anything else is a fresh attempt. readyTasks only surfaces an expired RETRY_WAIT or a truly fresh
-  // node, so at most one such predecessor exists.
-  const retryOld = nodeAttempts.find((a) => a.status === "RETRY_WAIT" && a.retryAt !== undefined && params.nowSec >= a.retryAt);
+  // retriesUsed is a per-node LINEAGE counter that must survive from the DURABLE history, not from a lingering RETRY_WAIT
+  // (Codex P1-1): a clean-fail (infra, not business) retires the old attempt in the SAME batch as the new one (§3.1
+  // atomicity), so there is never a RETRY_WAIT left alive to carry the count — we take it from max(retriesUsed) over the
+  // node's attempts instead. An infra failure does not consume a business retry, so the new attempt inherits that max.
+  const lineageRetries = nodeAttempts.reduce((m, a) => Math.max(m, a.retriesUsed), 0);
+  // The succession source is the HIGHEST-retriesUsed expired RETRY_WAIT (not merely the first found — Codex P1-1: with
+  // any residual coexistence, picking the first could inherit the lower count). undefined ⇒ resurrect a fresh attempt.
+  const retryCandidates = nodeAttempts.filter((a) => a.status === "RETRY_WAIT" && a.retryAt !== undefined && params.nowSec >= a.retryAt);
+  const retryOld = retryCandidates.length ? retryCandidates.reduce((best, a) => (a.retriesUsed > best.retriesUsed ? a : best)) : undefined;
   let attempt: TaskAttempt;
   let abandonedOld: TaskAttempt | undefined;
   if (retryOld) {
@@ -104,6 +109,8 @@ export function prepareDispatch(
       inputBindings: ready.proposedBindings,
       ...(baseSourceCommit !== undefined ? { baseSourceCommit } : {}),
       firstBinding: binding, createdAtSeq: params.atSeq,
+      // Resurrect the lineage count after a clean-fail retired the prior attempt(s) (no live RETRY_WAIT to inherit from).
+      ...(lineageRetries > 0 ? { retriesUsed: lineageRetries } : {}),
     });
   }
 

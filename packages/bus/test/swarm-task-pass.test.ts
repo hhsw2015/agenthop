@@ -7,7 +7,7 @@ import { loadPlan, type TaskPlan } from "../src/swarm/task-plan.js";
 import { commit, entityKeyOf, initialLogState, liveEntities, type ChangeBody, type LogState } from "../src/swarm/control-log.js";
 import { jobStatus } from "../src/swarm/task-ready.js";
 import { createAttempt, type TaskAttempt } from "../src/swarm/task-state.js";
-import { taskPass, buildSched, type TaskOps, type GitFacts } from "../src/swarm/task-pass.js";
+import { taskPass, buildSched, resultMatchesAssignment, requiredFilesPresent, type TaskOps, type GitFacts } from "../src/swarm/task-pass.js";
 
 /** Find the single DispatchIntent in the projection (tests have one job/one node). */
 function theIntent(state: LogState): { status: string; allocOutcome: string } | undefined {
@@ -136,28 +136,61 @@ describe("taskPass dispatch — alloc created but worker not delivered (Codex P2
   });
 });
 
-describe("taskPass dispatch — clean-fail preserves retry lineage (Codex P1-3)", () => {
-  test("a succession whose alloc clean-fails leaves the old RETRY_WAIT intact so retriesUsed survives", async () => {
-    const plan = plan1(); // node build, retryBudget 2
-    const stateRef = { s: initialLogState() };
-    // seed a0 = RETRY_WAIT (retriesUsed 1, retryAt past) for node build.
+describe("taskPass dispatch — retry lineage survives clean-fail + unknown (Codex P1-1 round-2)", () => {
+  function seedRetryWait(stateRef: { s: LogState }, plan: TaskPlan, retriesUsed: number): void {
     const a0: TaskAttempt = {
       ...createAttempt({ jobId: "job", nodeId: "build", n: 0, planRevision: 1, specDigest: plan.nodes[0]!.specDigest, inputBindings: [], firstBinding: { bindingId: "job/build/a0/b0", assignmentId: "as0", launchId: "rw-old", publishGeneration: 0, openedAtSeq: 1 }, createdAtSeq: 1 }),
-      status: "RETRY_WAIT", retriesUsed: 1, retryAt: 500,
+      status: "RETRY_WAIT", retriesUsed, retryAt: 500,
     };
     stateRef.s = stampCommit(stateRef.s, [{ put: "attempt", attempt: a0 }]).state;
+  }
 
-    // pass 1: succession a1 dispatched, alloc clean-fails ⇒ a1 abandoned, a0 STILL RETRY_WAIT.
+  test("clean-fail: old retired in the SAME batch (§3.1), count preserved via durable max — not a lingering RETRY_WAIT", async () => {
+    const plan = plan1();
+    const stateRef = { s: initialLogState() };
+    seedRetryWait(stateRef, plan, 1);
     await taskPass(plan, mkOps({ stateRef, order: [], startTask: async () => ({ alloc: "clean-fail", delivered: false }) }));
     const after1 = Object.fromEntries(attemptsOf(plan, stateRef.s).map((a) => [a.attemptId, a]));
-    expect(after1["job/build/a0"]!.status).toBe("RETRY_WAIT"); // NOT abandoned — lineage preserved
+    expect(after1["job/build/a0"]!.status).toBe("ABANDONED"); // retired atomically with a1 — no coexistence window
     expect(after1["job/build/a1"]!.status).toBe("ABANDONED");
+    await taskPass(plan, mkOps({ stateRef, order: [] })); // alloc created
+    const a2 = attemptsOf(plan, stateRef.s).find((a) => a.attemptId === "job/build/a2");
+    expect(a2?.retriesUsed).toBe(1); // resurrected from max(retriesUsed) over the node's attempts, not a live RETRY_WAIT
+    expect(a2?.status).toBe("RUNNING");
+  });
 
-    // pass 2: alloc created ⇒ succession a2 inherits retriesUsed=1 (not reset to 0), a0 now retired.
+  test("unknown then business-fail: succession inherits the HIGHER count, never the stale a0 (the fixed regression)", async () => {
+    const plan = plan1();
+    const stateRef = { s: initialLogState() };
+    seedRetryWait(stateRef, plan, 1);
+    // pass 1: alloc=unknown ⇒ a0 retired same-batch, a1 RUNNING (not two live attempts).
+    await taskPass(plan, mkOps({ stateRef, order: [], startTask: async () => ({ alloc: "unknown", delivered: false }) }));
+    const m = Object.fromEntries(attemptsOf(plan, stateRef.s).map((a) => [a.attemptId, a]));
+    expect(m["job/build/a0"]!.status).toBe("ABANDONED");
+    expect(m["job/build/a1"]!.status).toBe("RUNNING");
+    // the worker then business-fails a1 to RETRY_WAIT(2).
+    stateRef.s = stampCommit(stateRef.s, [{ put: "attempt", attempt: { ...m["job/build/a1"]!, status: "RETRY_WAIT", retriesUsed: 2, retryAt: 600 } }]).state;
+    // pass 2: created ⇒ succession picks a1(2), NOT the stale a0(1); a2 inherits 2 (the bug gave 1 ⇒ an extra retry).
     await taskPass(plan, mkOps({ stateRef, order: [] }));
     const a2 = attemptsOf(plan, stateRef.s).find((a) => a.attemptId === "job/build/a2");
-    expect(a2?.retriesUsed).toBe(1); // the bug was a2 starting at 0
-    expect(a2?.status).toBe("RUNNING");
+    expect(a2?.retriesUsed).toBe(2);
+  });
+});
+
+describe("observeGit pure helpers (Codex P1-3 / P2-6 round-2)", () => {
+  test("resultMatchesAssignment: own id matches, foreign + unparseable rejected", () => {
+    expect(resultMatchesAssignment(JSON.stringify({ assignmentId: "A" }), "A")).toBe(true);
+    expect(resultMatchesAssignment(JSON.stringify({ assignmentId: "B" }), "A")).toBe(false); // foreign — must not mask
+    expect(resultMatchesAssignment("{not json", "A")).toBe(false);
+  });
+  test("requiredFilesPresent: a declared output OR evidence file missing ⇒ false (missing is detectable)", () => {
+    const outputs = [{ path: "out/r.md" }];
+    const evidence = [{ summaryPath: "out/e.txt" }];
+    expect(requiredFilesPresent(outputs, evidence, [{ path: "out/r.md" }, { path: "out/e.txt" }])).toBe(true);
+    expect(requiredFilesPresent(outputs, evidence, [{ path: "out/r.md" }])).toBe(false); // evidence file missing/errored
+    expect(requiredFilesPresent(outputs, evidence, [{ path: "out/e.txt" }])).toBe(false); // output missing
+    expect(requiredFilesPresent([], [], [])).toBe(true); // nothing declared
+    expect(requiredFilesPresent([null as unknown as { path?: unknown }], [], [])).toBe(true); // null entry ignored (V1 handles)
   });
 });
 

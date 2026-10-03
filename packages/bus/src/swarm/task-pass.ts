@@ -55,6 +55,27 @@ export type TaskOps = {
   log: (m: string) => void;
 };
 
+/** Does this result.json belong to the given binding's assignment? O1 must SKIP a foreign result (wrong assignmentId)
+ *  so it can't mask a legit older one — the scan keeps advancing (Codex P1-3). This does NOT relax the pure-layer V2
+ *  identity check; it only stops the IO observer from parking on a candidate that isn't this attempt's. */
+export function resultMatchesAssignment(resultText: string, assignmentId: string): boolean {
+  try { return (JSON.parse(resultText) as { assignmentId?: unknown }).assignmentId === assignmentId; }
+  catch { return false; }
+}
+
+/** Every DECLARED file (outputs + validationEvidence.summaryPath) must be present in the observed closure. A missing OR
+ *  query-errored declared file ⇒ incomplete observation ⇒ false (Codex P2-6: "in the closure hash" ≠ "a missing one is
+ *  detectable"). closureFiles holds only files whose blob was readable, so a declared path absent from it = missing/errored. */
+export function requiredFilesPresent(
+  outputs: Array<{ path?: unknown }>, evidence: Array<{ summaryPath?: unknown }>, closureFiles: Array<{ path: string }>,
+): boolean {
+  const declared = [
+    ...outputs.filter((o) => o && typeof o.path === "string").map((o) => o.path as string),
+    ...evidence.filter((e) => e && typeof e.summaryPath === "string").map((e) => e.summaryPath as string),
+  ];
+  return declared.every((p) => closureFiles.some((c) => c.path === p));
+}
+
 /** attempts + acceptedResults projected from the control-log for the scheduler (pure). */
 export function buildSched(plan: TaskPlan, state: LogState): SchedInput {
   const attempts: TaskAttempt[] = [];
@@ -160,21 +181,23 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
     if (!prep.ok) { ops.log(`dispatch ${task.nodeId}: skipped — ${prep.reason}`); continue; }
 
     // CAS-then-IO: persist the intent (pending) + the NEW attempt BEFORE the allocate IO, so a crash leaves a
-    // reconcilable record, never a silent box with no intent. The retry-succession's abandonment of the OLD attempt is
-    // NOT committed here — only AFTER a confirmed alloc (Codex P1): if the alloc clean-fails we revoke the new attempt
-    // and leave the old RETRY_WAIT intact, so its retriesUsed lineage survives for the next succession.
-    state = ops.commit(state, [{ put: "intent", intent: prep.intent }, { put: "attempt", attempt: prep.attempt }]).state;
+    // reconcilable record, never a silent box with no intent. The retry-succession retires the OLD attempt in this SAME
+    // batch (§3.1 succession atomicity, Codex P1-1): never two live attempts after a crash/unknown. The lineage's
+    // retriesUsed survives a later clean-fail via prepareDispatch's durable max(retriesUsed), NOT via a lingering
+    // RETRY_WAIT — so retiring the old here is safe.
+    const preBodies: ChangeBody[] = [{ put: "intent", intent: prep.intent }, { put: "attempt", attempt: prep.attempt }];
+    if (prep.abandonedOld) preBodies.push({ put: "attempt", attempt: prep.abandonedOld });
+    state = ops.commit(state, preBodies).state;
 
     const { alloc, delivered } = await ops.startTask({ assignment: prep.assignment, launchId });
     const resolved = resolveAllocOutcome(prep.intent, alloc, { nowSec: ops.nowSec() });
     // created+delivered => confirm; created+!delivered => leave resolved (box occupies via creation-bound expiry, but the
     // worker never started, so do NOT confirm — observation/expiry reconciles); clean-fail => abandon intent + revoke the
-    // never-run attempt AND (if a succession) abandon the old now that we know it succeeded nowhere; unknown => leave.
+    // never-run NEW attempt (the old was already retired atomically above); unknown => leave pending.
     const postBodies: ChangeBody[] = [{
       put: "intent",
       intent: alloc === "created" ? (delivered ? confirmIntent(resolved) : resolved) : alloc === "clean-fail" ? abandonIntent(resolved) : resolved,
     }];
-    if (alloc === "created" && prep.abandonedOld) postBodies.push({ put: "attempt", attempt: prep.abandonedOld }); // confirmed succession retires the old
     if (alloc === "clean-fail") postBodies.push({ put: "attempt", attempt: { ...prep.attempt, status: "ABANDONED", abandonReason: "intent-revoked" } });
     state = ops.commit(state, postBodies).state;
     // created (delivered or not) + unknown hold a slot; clean-fail reliably took none.

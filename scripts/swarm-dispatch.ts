@@ -33,7 +33,7 @@ import { entityKeyOf, type ChangeBody, type CommitResult, type LogState } from "
 import { loadPlan, type TaskPlan, type TaskSpec } from "../packages/bus/src/swarm/task-plan.js";
 import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/task-state.js";
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
-import { taskPass, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
+import { taskPass, resultMatchesAssignment, requiredFilesPresent, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
@@ -335,11 +335,15 @@ async function observeGitFor(a: { attempt: TaskAttempt; spec: TaskSpec; binding:
   for (const c of rl.stdout.split("\n").map((s) => s.trim()).filter(Boolean)) {
     const show = await git(["show", `${c}:${resultPath}`], { cwd: scratch });
     if (show.code !== 0) continue;
+    // Skip a result that isn't THIS binding's (wrong assignmentId) so a foreign/newer result can't mask a legit older
+    // one — keep advancing the scan (Codex P1-3 reason B). A genuinely-mismatched result for this attempt is handled by
+    // the pure V2 check; here we only refuse to park the observer on someone else's candidate.
+    if (!resultMatchesAssignment(show.stdout, a.binding.assignmentId)) continue;
     const rev = await git(["rev-parse", `${c}:${resultPath}`], { cwd: scratch });
     sha = c; resultText = show.stdout; resultBlobOid = rev.code === 0 ? rev.stdout.trim() : "";
     break;
   }
-  if (!sha) return null; // no result.json anywhere on the first-parent history yet
+  if (!sha) return null; // no result.json for this binding on the first-parent history yet (deep >200 pagination = T2)
   let outputs: Array<{ path?: unknown }> = [];
   let evidence: Array<{ summaryPath?: unknown }> = [];
   try {
@@ -359,8 +363,9 @@ async function observeGitFor(a: { attempt: TaskAttempt; spec: TaskSpec; binding:
   for (const e of evidence) if (e && typeof e.summaryPath === "string") await addFile(e.summaryPath);
   const dt = await git(["diff-tree", "--no-commit-id", "--name-only", "-r", sha], { cwd: scratch });
   const cumulativeChangedPaths = dt.code === 0 ? dt.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
-  const declaredPaths = outputs.filter((o) => o && typeof o.path === "string").map((o) => o.path as string);
-  const requiredOutputsPresent = declaredPaths.length === 0 ? true : declaredPaths.every((p) => closureFiles.some((c) => c.path === p));
+  // Declared outputs AND declared evidence summaryPaths must all be present; a missing/errored declared file ⇒ false
+  // (Codex P2-6 — a deleted evidence file was silently accepted when only outputs were checked).
+  const requiredOutputsPresent = requiredFilesPresent(outputs, evidence, closureFiles);
   return {
     observedWorkCommit: sha, resultText, resultBlobOid, closureFiles, cumulativeChangedPaths,
     contract: { requiredOutputsPresent, patchAppliesClean: true }, // T1: no patch node; V7 git-apply-check is T2
