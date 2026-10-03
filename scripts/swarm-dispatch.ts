@@ -38,6 +38,8 @@ import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
 import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
+import { validSeedWait } from "../packages/bus/src/swarm/wait-seed.js";
+import { runDispatchLoops } from "../packages/bus/src/swarm/dispatch-loops.js";
 import { fileIsAlive, resolveSession, listSessions, makeFileLiveness } from "../packages/bus/src/swarm/task-liveness.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox } from "../packages/bus/src/inbox.js";
@@ -399,33 +401,16 @@ function buildTaskOps(stateRef: { s: LogState }, planCommittedAtSec: number): Ta
   };
 }
 
-// A seed WaitRecord must carry every field the sweep later dereferences. A malformed entry (e.g. missing owner) must NOT
-// reach the log: it would commit once, then crash resolveSession on EVERY tick (owner.slice on undefined), starving all
-// later valid waits, and the seed can't self-heal (revision exists) — a permanent poison (P2-5). Validate BEFORE commit;
-// accept a bare WaitRecord or a {put:"wait",wait} wrapper; reject + report bad entries in isolation (one bad entry never
-// blocks the good ones). Returns the validated WaitRecord or a reason string.
-function validSeedWait(raw: Record<string, unknown>): WaitRecord | string {
-  const w = (raw.put === "wait" && raw.wait ? raw.wait : raw) as Record<string, unknown>;
-  const str = (v: unknown): v is string => typeof v === "string" && v.length > 0;
-  if (!str(w.waitId)) return "missing/invalid waitId";
-  if (w.kind !== "wait" && w.kind !== "approval") return `bad kind ${String(w.kind)}`;
-  const subj = w.subject as Record<string, unknown> | undefined;
-  if (typeof subj !== "object" || subj === null || !str(subj.jobId)) return "missing subject.jobId";
-  if (w.state !== "open" && w.state !== "action_pending" && w.state !== "resolved") return `bad state ${String(w.state)}`;
-  if (typeof w.deadlineSec !== "number" || !Number.isFinite(w.deadlineSec)) return "missing/invalid deadlineSec";
-  if (!str(w.owner)) return "missing/invalid owner";
-  if (w.timeoutPolicy !== "bypass" && w.timeoutPolicy !== "escalate") return `bad timeoutPolicy ${String(w.timeoutPolicy)}`;
-  return w as unknown as WaitRecord;
-}
-
-// Seed the control-log with migrated wait entities (the coordinator's real waits) once, if absent (first input).
+// Seed the control-log with migrated wait entities (the coordinator's real waits) once, if absent (first input). Each
+// entry is validated BEFORE commit (validSeedWait, shared + tested in the bus package); bad entries are rejected in
+// isolation (one bad/null entry never blocks the good ones — P2-5/R3).
 function loadWaitSeed(stateRef: { s: LogState }): void {
   if (!WAIT_SEED_FILE) return;
   let entries: unknown;
   try { entries = JSON.parse(readFileSync(WAIT_SEED_FILE, "utf8")); }
   catch (e) { log(`wait seed ${WAIT_SEED_FILE}: unreadable/invalid JSON — ignored: ${e instanceof Error ? e.message : e}`); return; }
   if (!Array.isArray(entries)) { log(`wait seed ${WAIT_SEED_FILE}: not a JSON array — ignored`); return; }
-  for (const raw of entries as Array<Record<string, unknown>>) {
+  for (const raw of entries as unknown[]) {
     const v = validSeedWait(raw);
     if (typeof v === "string") { log(`wait seed: REJECTED entry (${v}) — not committed`); continue; } // bad entry isolated
     if (stateRef.s.revisions[`wait:${v.waitId}`] !== undefined) continue; // already in the log
@@ -468,7 +453,8 @@ function buildSweepOps(stateRef: { s: LogState }): SweepOps {
         : action.actionKind === "reassign" ? `[sweep] REASSIGN: ${w.waitId} (subject ${JSON.stringify(w.subject)}) — you are the new owner`
         : action.actionKind === "move-validator" ? `[sweep] VALIDATE: ${w.waitId} (run ${w.subject.validationRunId ?? "?"}) — you are the new validator seat`
         : `[sweep] ${w.waitId}: ${action.actionKind}`;
-      try { writeInbox(HOME, sid, { from: SELF, fromLabel: "swarm-sweep", text, via: "local", ts: Date.now() }); return true; }
+      // R6: at-least-once delivery — carry actionId so a re-fired duplicate is self-evident to the receiver (no transport dedup).
+      try { writeInbox(HOME, sid, { from: SELF, fromLabel: "swarm-sweep", text: `${text} [actionId:${action.actionId}]`, via: "local", ts: Date.now(), actionId: action.actionId }); return true; }
       catch (e) { log(`sweep doAction ${w.waitId}: inbox write failed: ${e instanceof Error ? e.message : e}`); return false; }
     },
     log,
@@ -510,28 +496,29 @@ async function main(): Promise<void> {
   const taskStateRef = { s: loadControlLog(CONTROL_LOG_DIR) };
   const taskOps = plan ? buildTaskOps(taskStateRef, jobStartSec(plan.jobId)) : null;
   loadWaitSeed(taskStateRef); // seed the migrated coordinator waits (first sweep input), if any
-  const sweepOps = buildSweepOps(taskStateRef);
+  // The sweep runs on its OWN loop with its OWN state ref (reloaded each tick) so a slow lifecycle/task pass never starves
+  // it (R1 bounded scheduling). Single-writer safety across the two in-process loops = control-store disk-CAS (never
+  // overwrite a committed seq) + the actionId-matched confirm; a stale commit is rejected + retried next tick.
+  const sweepStateRef = { s: loadControlLog(CONTROL_LOG_DIR) };
+  const sweepOps = buildSweepOps(sweepStateRef);
   if (SWEEP_ENABLED) log(`liveness sweep ON${WAIT_SEED_FILE ? ` (seed=${WAIT_SEED_FILE})` : ""}`);
-  for (;;) {
-    try { await pass(records, ops); } catch (e) { log(`pass error: ${e instanceof Error ? e.message : e}`); }
-    // The business-task pass runs AFTER the lifecycle handoff pass (§4.5: handoff advances lifecycle, then task pass
-    // observes/accepts/dispatches). Gated on a plan + SWARM_TASK_EXEC (allocates boxes). Reloads the log each round so a
-    // crash-restart picks up where it left off.
-    // T1.5 RED LINE (fe0376cd): until the resume adapter + lifecycle→commitControl migration land, do NOT enable --task
-    // dispatch for any task that may undergo a handoff — the lifecycle resume half is not yet wired to continue the
-    // business task. Live gating (SWARM_TASK_EXEC) is off by default, so this is a zero-cost operational constraint.
-    if (plan && taskOn && taskOps) {
-      try { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
-      catch (e) { log(`taskPass error: ${e instanceof Error ? e.message : e}`); }
-    }
-    // The liveness sweep (§0b R2) runs after the task pass: scan durable waits + member liveness, auto-handle expired
-    // waits (ping/escalate) + dead owners (reassign). This is the coordinator-replacement step. Gated on SWARM_SWEEP.
-    if (SWEEP_ENABLED) {
-      try { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await sweepPass(sweepOps); }
-      catch (e) { log(`sweep error: ${e instanceof Error ? e.message : e}`); }
-    }
-    await new Promise((res) => setTimeout(res, 5000));
-  }
+  await runDispatchLoops({
+    // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
+    // dispatches). T1.5 RED LINE (fe0376cd): --task dispatch stays off (SWARM_TASK_EXEC) until the resume adapter +
+    // lifecycle→commitControl migration land — a handoff's resume half is not yet wired to continue the business task.
+    passTick: async () => {
+      await pass(records, ops);
+      if (plan && taskOn && taskOps) { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
+    },
+    // The liveness sweep (§0b R2) — scan durable waits + member liveness, auto-handle expired waits (ping/escalate/re-arm)
+    // + dead owners (reassign) + stuck validators (move). The coordinator-replacement step; gated on SWARM_SWEEP.
+    sweepTick: async () => { if (!SWEEP_ENABLED) return; sweepStateRef.s = loadControlLog(CONTROL_LOG_DIR); await sweepPass(sweepOps); },
+    sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
+    passIntervalMs: 5000,
+    sweepIntervalMs: 5000,
+    shouldStop: () => false,
+    onError: (where, e) => log(`${where} error: ${e instanceof Error ? e.message : e}`),
+  });
 }
 
 // Run the loop only when executed directly (not when imported, e.g. by a test).
