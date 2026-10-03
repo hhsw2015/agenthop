@@ -557,8 +557,16 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
   while (invChanged) {
     invChanged = false;
     for (const c of allClaims) {
-      if (c.superseded || !c.derivedFrom || !c.source) continue;
-      if (invalid.has(invKey(c.derivedFrom.value, c.derivedFrom.form, c.source))) {
+      if (c.superseded || !c.source) continue;
+      // Withdraw a claim when its OWN assertion signature is already invalid (any copy of an invalidated
+      // assertion — even one that dropped the optional derivedFrom), OR when its explicit parent edge is
+      // invalid (a derivative). Both propagate across all generations and the undecided pool; the
+      // (value,form,source) scope isolates independent sources and a same-source hard run (review P1-4).
+      const selfInvalid = invalid.has(invKey(c.value, c.form, c.source));
+      const parentInvalid = c.derivedFrom !== undefined && invalid.has(invKey(c.derivedFrom.value, c.derivedFrom.form, c.source));
+      if (selfInvalid || parentInvalid) {
+        // Only ever flips a NON-superseded claim to superseded (the guard above skips already-retired ones),
+        // so the pass is monotonic and terminates regardless of claim order.
         c.superseded = true;
         invalid.add(invKey(c.value, c.form, c.source));
         invChanged = true;
