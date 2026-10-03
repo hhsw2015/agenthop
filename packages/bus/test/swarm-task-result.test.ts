@@ -272,6 +272,19 @@ describe("Codex re-review fixes", () => {
     const r = validateResult(vin({ source: "rescue", cumulativeChangedPaths: ["out/report.md", "src/secret.ts"] }));
     expect(r.decision === "reject" && r.rule === "scope" && r.failureClass === "inconsistent-snapshot").toBe(true);
   });
+  test("R2 item 7: a meta-job that wrote the landing-spot but did NOT fix the counterexample must NOT pass (V7 structural != V8 fixed)", () => {
+    // The implement-level meta goal's acceptance is the original counterexample regression. V7 (the landing-spot doc
+    // exists) passing is not enough — V8 (counterexample actually fixed) must pass too.
+    const metaSpec = buildSpec({ acceptance: [{ check: "counterexample-regression", args: { probe: "P2-A" } }] });
+    const metaAtt = mkAttempt(metaSpec);
+    const metaResult = resultJson({ validationEvidence: [{ check: "counterexample-regression", exitCode: 1 }] }, metaAtt);
+    // landing spot written (requiredOutputsPresent=true) but counterexample still fails (acceptancePassed=false):
+    const notFixed = validateResult(vin({ attempt: metaAtt, attemptSpec: metaSpec, currentSpecDigest: metaSpec.specDigest, resultText: metaResult, contract: { requiredOutputsPresent: true, patchAppliesClean: true }, acceptancePassed: false }));
+    expect(notFixed.decision === "reject" && notFixed.rule === "V8").toBe(true); // not accepted => node not SUCCEEDED
+    // actually fixed + verified:
+    const fixed = validateResult(vin({ attempt: metaAtt, attemptSpec: metaSpec, currentSpecDigest: metaSpec.specDigest, resultText: metaResult, contract: { requiredOutputsPresent: true, patchAppliesClean: true }, acceptancePassed: true }));
+    expect(fixed.decision).toBe("accept");
+  });
   test("(d) sourceWriteScope violation is source-classed too", () => {
     const pspec = buildSpec({ outputContract: { requiredOutputs: [{ logicalName: "patch", kind: "patch" }], baseSourceCommit: "base1" }, sourceWriteScope: ["src/"] });
     const patt = mkAttempt(pspec);
