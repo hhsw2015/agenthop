@@ -1,7 +1,9 @@
 import { describe, expect, test } from "vitest";
 import { loadPlan, computeSpecDigest, computePlanDigest, type TaskSpec, type TaskPlan } from "../src/swarm/task-plan.js";
 
-function spec(p: Partial<TaskSpec> = {}): TaskSpec {
+// Returns raw JSON-shaped input (not a typed TaskSpec) so tests can omit `required` / inject bad fields — it all
+// goes through loadPlan(unknown) anyway.
+function spec(p: Partial<TaskSpec> = {}): Record<string, unknown> {
   return {
     nodeId: "n1",
     kind: "work",
@@ -12,11 +14,12 @@ function spec(p: Partial<TaskSpec> = {}): TaskSpec {
     artifactScope: ["out/"],
     estimatedRuntimeSec: 600,
     retryBudget: 2,
+    // `required` deliberately omitted — defaulting is under test.
     specDigest: "", // recomputed by loadPlan
     ...p,
   };
 }
-function plan(nodes: TaskSpec[], p: Partial<TaskPlan> = {}): unknown {
+function plan(nodes: Record<string, unknown>[], p: Partial<TaskPlan> = {}): unknown {
   return {
     jobId: "job1",
     planRevision: 1,
@@ -119,13 +122,29 @@ describe("loadPlan — shape validation at the boundary", () => {
 });
 
 describe("digests — canonical, deterministic, content-addressed", () => {
+  const asSpec = (o: Record<string, unknown>): TaskSpec => ({ required: true, ...o } as unknown as TaskSpec);
   test("specDigest ignores key order and any provided specDigest field", () => {
-    const a = computeSpecDigest(spec({ specDigest: "bogus" }));
-    const b = computeSpecDigest(spec({ specDigest: "different-bogus" }));
+    const a = computeSpecDigest(asSpec(spec({ specDigest: "bogus" })));
+    const b = computeSpecDigest(asSpec(spec({ specDigest: "different-bogus" })));
     expect(a).toBe(b);
   });
   test("changing goal changes specDigest", () => {
-    expect(computeSpecDigest(spec({ goal: "x" }))).not.toBe(computeSpecDigest(spec({ goal: "y" })));
+    expect(computeSpecDigest(asSpec(spec({ goal: "x" })))).not.toBe(computeSpecDigest(asSpec(spec({ goal: "y" }))));
+  });
+  test("required defaults to true and is stored explicitly", () => {
+    const r = loadPlan(plan([spec()]));
+    expect(r.ok && r.plan.nodes[0]!.required === true).toBe(true);
+  });
+  test("required:false is respected and changes specDigest vs default-true (it IS a hashed spec field)", () => {
+    const def = loadPlan(plan([spec()]));
+    const explicitTrue = loadPlan(plan([spec({ required: true })]));
+    const falsy = loadPlan(plan([spec({ required: false })]));
+    expect(def.ok && explicitTrue.ok && def.plan.nodes[0]!.specDigest === explicitTrue.plan.nodes[0]!.specDigest).toBe(true);
+    expect(def.ok && falsy.ok && def.plan.nodes[0]!.specDigest !== falsy.plan.nodes[0]!.specDigest).toBe(true);
+    expect(falsy.ok && falsy.plan.nodes[0]!.required === false).toBe(true);
+  });
+  test("non-boolean required rejected", () => {
+    expect(loadPlan(plan([spec({ required: "yes" as unknown as boolean })])).ok).toBe(false);
   });
   test("planDigest stable across node array identity, changes when a node changes", () => {
     const p1 = loadPlan(plan([spec({ nodeId: "A" }), spec({ nodeId: "B", dependsOn: ["A"] })]));

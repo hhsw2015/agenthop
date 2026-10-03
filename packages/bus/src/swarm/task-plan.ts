@@ -50,6 +50,10 @@ export type TaskSpec = {
   sourceWriteScope?: string[];
   estimatedRuntimeSec: number;
   retryBudget: number;
+  /** Is this node necessary for job success (§4.4 "必需节点,默认全部"; projection viz-gap 2). Defaults to true when
+   *  omitted; loadPlan stores it EXPLICITLY so two semantically-equal specs hash identically. It IS part of specDigest
+   *  (added at T1 on purpose — adding it at T2 would drift every stored specDigest). */
+  required: boolean;
   /** canonical-JSON SHA-256 of this spec's fields (excluding specDigest). Set by loadPlan. */
   specDigest: string;
 };
@@ -127,6 +131,8 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
   if (o.sourceWriteScope !== undefined && !isStringArray(o.sourceWriteScope)) return { reason: `${where}.sourceWriteScope` };
   if (!isNumAtLeast(o.estimatedRuntimeSec, 0)) return { reason: `${where}.estimatedRuntimeSec` };
   if (!isIntAtLeast(o.retryBudget, 0)) return { reason: `${where}.retryBudget must be an integer >= 0` };
+  if (o.required !== undefined && typeof o.required !== "boolean") return { reason: `${where}.required must be a boolean` };
+  const required = o.required === undefined ? true : o.required;
 
   const spec: TaskSpec = {
     nodeId: o.nodeId,
@@ -149,6 +155,7 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
     ...(o.sourceWriteScope !== undefined ? { sourceWriteScope: [...(o.sourceWriteScope as string[])] } : {}),
     estimatedRuntimeSec: o.estimatedRuntimeSec,
     retryBudget: o.retryBudget,
+    required,
     specDigest: "",
   };
   return { spec };

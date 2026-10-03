@@ -15,6 +15,11 @@ describe("canonicalJson", () => {
   test("omits undefined fields (same as absent) but keeps null", () => {
     expect(canonicalJson({ a: undefined, b: null, c: 1 })).toBe('{"b":null,"c":1}');
   });
+  test("array undefined elements serialize as null (JSON.stringify parity) — PINNED: do NOT 'fix' this, it would drift every digest (fe0376cd review #1 finding 2)", () => {
+    expect(canonicalJson([undefined])).toBe("[null]");
+    expect(canonicalJson([undefined])).toBe(canonicalJson([null]));
+    expect(canonicalJson([1, undefined, 2])).toBe("[1,null,2]");
+  });
   test("stable regardless of insertion order for the same logical value", () => {
     const o1: Record<string, number> = {};
     o1.z = 1; o1.a = 2; o1.m = 3;
