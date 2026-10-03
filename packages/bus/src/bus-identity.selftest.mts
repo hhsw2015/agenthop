@@ -141,7 +141,7 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   // P1-3 round-4: routing is order-independent — a mixed-source no-native observe sends each claim to its own
   // source's generation regardless of claim order.
   const runC = { value: "R", form: "run" as const, confidence: "hard" as const, provenance: "same-announce" as const, source: "Bswitch" };
-  const hC = { value: "old-A-handle", form: "handle" as const, confidence: "hard" as const, provenance: "same-announce" as const, source: "Aroot", derivedFrom: { value: "A", form: "native" } };
+  const hC = { value: "old-A-handle", form: "handle" as const, confidence: "hard" as const, provenance: "same-announce" as const, source: "Aroot", derivedFrom: { value: "A", form: "native" as const } };
   const base = (order: Claim[]) => [
     obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1, eventId: "Aroot" }),
     learn("R", "A", "B", "thread-switch", true, { ts: 2, eventId: "Bswitch" }),
@@ -296,6 +296,85 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   const claims = w.kind === "entity" ? w.entity.incarnations.flatMap((i) => i.claims) : [];
   const runX = claims.find((c) => c.value === "X" && c.form === "run"), natX = claims.find((c) => c.value === "X" && c.form === "native"), h = claims.find((c) => c.value === "H" && c.form === "handle");
   t("P1-4 (P2): same-literal — native retired + handle retired, hard run preserved", !!runX && !runX.superseded && !!natX && natX.superseded === true && !!h && h.superseded === true);
+}
+{
+  // P1-3 round-6: an ambiguous-parent derivative (two hard A generations, no disambiguating source) stays
+  // UNDECIDED — never dumped into a residual generation a later unrelated bootstrap (C) can claim.
+  const ev = [
+    obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1, eventId: "a0" }),
+    learn("R", "A", "B", "thread-switch", true, { ts: 2, eventId: "sw1" }),
+    learn("R", "B", "A", "thread-switch", true, { ts: 3, eventId: "sw2" }),           // A->B->A: two hard A generations
+    obs("R", [srcClaim("R", "run", "uobs")], { ts: 4, eventId: "uobs" }),             // unrelated no-native -> pre-native U
+    obs("R", [{ value: "Hx", form: "handle", confidence: "hard", provenance: "same-announce", derivedFrom: { value: "A", form: "native" } }], { ts: 5, eventId: "hobs" }), // parent {A,native}, NO source
+    learn("R", undefined, "C", "bootstrap", true, { ts: 6 }),                          // U bootstraps C
+  ];
+  const proj = buildProjection(ev);
+  t("P1-3: an ambiguous-parent derivative stays undecided, never claimed by an unrelated bootstrap", whois(proj, "Hx").kind === "not-seen" && whois(proj, "C").kind === "entity" && proj.undecided.some((c) => c.value === "Hx"));
+}
+{
+  // P1-3 round-6: a non-derivative copy rejoins the ORIGINAL binding's generation; a non-creating event does
+  // not spawn a phantom owner.
+  const ev = [
+    obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1, eventId: "aroot" }),
+    obs("R", [hard("R", "run"), hard("A", "native"), hard("P", "presence")], { ts: 2, eventId: "S" }), // S: non-creating observe on A, records P (source defaults to S)
+    learn("R", "A", "B", "thread-switch", true, { ts: 3, eventId: "sw" }),
+    obs("R", [srcClaim("P", "presence", "S")], { ts: 4, eventId: "copy" }),                            // copy P source=S -> rejoin A's gen, no phantom
+  ];
+  const proj = buildProjection(ev);
+  const w = whois(proj, "P");
+  t("P1-3: a non-derivative copy rejoins its original binding (no phantom owner)", w.kind === "entity" && eidOf(w) === eidOf(whois(proj, "A")));
+}
+{
+  // P1-3 round-6: a late derivative of a KNOWN-but-RETIRED parent rejoins that generation (no phantom), retires.
+  const ev = [
+    obs("Rk", [hard("Rk", "run"), poss("A", "native"), { value: "Hk", form: "handle", confidence: "possible", provenance: "heuristic", source: "ks", derivedFrom: { value: "A", form: "native" } }], { ts: 1, eventId: "ks" }),
+    learn("Rk", "A", "B", "correction", true, { ts: 2 }),
+    obs("Rk", [{ value: "Hk2", form: "handle", confidence: "hard", provenance: "same-announce", source: "ks", derivedFrom: { value: "A", form: "native" } }], { ts: 3, eventId: "late" }),
+  ];
+  const proj = buildProjection(ev);
+  t("P1-3: a late derivative of a known-retired parent rejoins its generation (no phantom) and retires", whois(proj, "Hk2").kind === "not-seen" && proj.entities.size === 1 && whois(proj, "B").kind === "entity");
+}
+{
+  // P1-4 round-6: a correction retiring possible A from MULTIPLE sources records ALL of them, so every source's
+  // cross-run copies retire (not just the first).
+  const mk = (v: string, f: Claim["form"], src: string, d?: { value: string; form: Claim["form"] }): Claim => ({ value: v, form: f, confidence: "possible", provenance: "heuristic", source: src, ...(d ? { derivedFrom: d } : {}) });
+  const ev = [
+    obs("R", [hard("R", "run"), mk("A", "native", "S1")], { ts: 1, eventId: "o1" }), // possible A, source S1
+    obs("R", [mk("A", "native", "S2")], { ts: 2, eventId: "o2" }),                    // possible A, source S2 (same generation, second incarnation)
+    learn("R", "A", "B", "correction", true, { ts: 3 }),
+    obs("Rx", [hard("Rx", "run"), mk("A", "native", "S2"), mk("H", "handle", "S2", { value: "A", form: "native" })], { ts: 4, eventId: "copy2" }), // cross-run copy of the SECOND source
+  ];
+  const proj = buildProjection(ev);
+  const other = whois(proj, "Rx");
+  const oc = other.kind === "entity" ? other.entity.incarnations.flatMap((i) => i.claims) : [];
+  const oA = oc.find((c) => c.value === "A" && c.form === "native"), oH = oc.find((c) => c.value === "H" && c.form === "handle");
+  t("P1-4 (P2): all retired sources recorded — a second source's cross-run copy also retires", !!oA && oA.superseded === true && !!oH && oH.superseded === true);
+}
+{
+  // P1-4 round-6: the undecided pool participates in global invalidation — an undecided claim whose source is
+  // revoked is withdrawn, not left dangling.
+  const ev = [
+    obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1, eventId: "a0" }),
+    learn("R", "A", "B", "thread-switch", true, { ts: 2, eventId: "sw1" }),
+    learn("R", "B", "A", "thread-switch", true, { ts: 3, eventId: "sw2" }),           // two hard A gens -> Hx ambiguous
+    obs("R", [{ value: "Hx", form: "handle", confidence: "hard", provenance: "same-announce", source: "S", derivedFrom: { value: "A", form: "native" } }], { ts: 4, eventId: "hobs" }),
+    revoke("S"),
+  ];
+  const proj = buildProjection(ev);
+  const uH = proj.undecided.find((c) => c.value === "Hx");
+  t("P1-4 (P2): the undecided pool participates in revoke invalidation", !!uH && uH.superseded === true);
+}
+{
+  // P1-4 round-6: a derivative copied in another run's observe retires when its parent is corrected (global
+  // consistency; no active copy survives).
+  const mk = (v: string, f: Claim["form"], src: string, d?: { value: string; form: Claim["form"] }): Claim => ({ value: v, form: f, confidence: "possible", provenance: "heuristic", source: src, ...(d ? { derivedFrom: d } : {}) });
+  const ev = [
+    obs("R", [hard("R", "run"), mk("A", "native", "proot"), mk("H", "handle", "proot", { value: "A", form: "native" })], { ts: 1, eventId: "proot" }),
+    obs("Q", [hard("Q", "run"), mk("H", "handle", "proot", { value: "A", form: "native" })], { ts: 2, eventId: "qobs" }),
+    learn("R", "A", "B", "correction", true, { ts: 3 }),
+  ];
+  const proj = buildProjection(ev);
+  t("P1-4 (P2): a copied derivative retires when its parent is corrected (no active copy anywhere)", whois(proj, "H").kind === "not-seen" && whois(proj, "B").kind === "entity");
 }
 {
   const proj = buildProjection([obs("R", [hard("R", "run"), poss("A", "native")], { ts: 1 }), learn("R", "A", "A", "correction", true, { ts: 2 })]);
