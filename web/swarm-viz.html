@@ -233,6 +233,20 @@
   /* In the task-logical view the topology-only overlays would both cover the DAG and show a second,
      confusing task representation (the placeholder tasklog panel + river). Hide them. */
   body.jobs-view #panels, body.jobs-view #river, body.jobs-view #ticker { display: none; }
+  .dagnode .nverdict { font-size: 9.5px; font-weight: 600; }
+  .dagnode .nrecall { fill: var(--warn); font-size: 9px; font-weight: 600; }
+  .dagnode.recalled .body { stroke-dasharray: 4 3; }
+  /* jobs-view members strip (G5/F1) — hidden outside jobs view */
+  .jobsmembers { display: none; }
+  body.jobs-view .jobsmembers { display: block; position: absolute; left: 16px; top: 16px; width: 232px; z-index: 3;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; backdrop-filter: blur(14px); padding: 10px 12px; }
+  .jm-title { font-size: 10px; font-weight: 650; letter-spacing: .14em; text-transform: uppercase; color: var(--faint); margin-bottom: 8px; }
+  .jm-row { display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: 11px; border-bottom: 1px solid var(--line-soft); }
+  .jm-id { color: var(--ink); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .jm-reach.ok { color: var(--idle); font-size: 9.5px; }
+  .jm-reach.suspected { color: var(--warn); font-size: 9.5px; }
+  .jm-drift { color: var(--warn); font-size: 10px; font-weight: 600; }
+  .jm-active { color: var(--dim); font-size: 9.5px; }
 
   /* ---------- drawer ---------- */
   aside {
@@ -371,6 +385,7 @@
     </defs>
     <g id="view"></g></svg>
     <div class="panels" id="panels"></div>
+    <div class="jobsmembers" id="jobsmembers"></div>
     <div class="ticker" id="ticker">
       <div class="ttitle"><span>Events</span><span class="tsub" id="tsub"></span>
         <button class="rcollapse" id="tcollapse" title="Collapse / expand">▾</button></div>
@@ -543,6 +558,52 @@
 
   // ---------------------------------------------------------------- render
   // ---------------------------------------------------------------- task-logical (DAG) view
+  /** The members strip for the jobs view: durable employees with reachability + identity drift (G5/F1).
+   *  runDrift.count>0 is the thing the user asked to see — an employee whose underlying run id changed. */
+  function renderJobsMembers() {
+    const box = $("jobsmembers");
+    const members = state?.projection?.members ?? [];
+    if (!members.length) { box.innerHTML = ""; return; }
+    box.innerHTML = `<div class="jm-title">Members</div>` + members.map((m) => {
+      const reach = m.reachability === "suspected" ? '<span class="jm-reach suspected" title="suspected gone (≠ dead)">suspected</span>' : '<span class="jm-reach ok">ok</span>';
+      const drift = (m.runDrift?.count ?? 0) > 0
+        ? `<span class="jm-drift" title="identity drift: run id changed ${m.runDrift.count}×${m.runDrift.lastChangeAtSec ? ", last " + ago(m.runDrift.lastChangeAtSec * 1000) : ""}">⟳ ${m.runDrift.count}</span>`
+        : "";
+      const active = (m.activeBindings?.length ?? 0) > 0 ? `<span class="jm-active">${m.activeBindings.length} active</span>` : "";
+      return `<div class="jm-row"><span class="jm-id">${esc(memberLabel(m.memberId))}</span>${reach}${drift}${active}</div>`;
+    }).join("");
+  }
+
+  /** Per-node verdicts/observed, folded from job.results. Observed is keyed by attemptId, so a commit
+   *  belongs to a node when its attemptId is `${jobId}/${nodeId}/...`. */
+  function resultsByNode(job) {
+    const r = job.results || {};
+    const jid = job.plan.jobId;
+    const idx = {};
+    const bucket = (nid) => (idx[nid] = idx[nid] || { accepted: [], rejected: [], observed: [] });
+    for (const a of r.accepted || []) bucket(a.nodeId).accepted.push(a);
+    for (const x of r.rejected || []) bucket(x.nodeId).rejected.push(x);
+    for (const o of r.observed || []) {
+      const m = String(o.attemptId || "").split("/");
+      const nid = m[0] === jid ? m[1] : null; // jobId/nodeId/aN
+      if (nid) bucket(nid).observed.push(o);
+    }
+    return idx;
+  }
+
+  /** A member handle kept DISTINCT: never strip the tool prefix (codex:Work vs claude:Work-20cab0a5 both
+   *  collapsed to "Work" otherwise — the dual-judge structure went ambiguous). */
+  function memberLabel(id) {
+    const s = String(id || "");
+    return s.length > 22 ? s.slice(0, 21) + "…" : s;
+  }
+  /** Just the tool for a compact verdict chip (codex / claude / …). */
+  function judgeShort(id) {
+    const s = String(id || "");
+    const tool = s.includes(":") ? s.split(":")[0] : s;
+    return tool || s;
+  }
+
   /** The job currently shown in the jobs view: the selected one, else the first. */
   function currentJob() {
     const jobs = state?.projection?.jobs ?? [];
@@ -562,6 +623,7 @@
     const job = currentJob();
     if (!job) return;
     const nodes = job.plan.nodes;
+    const rIdx = resultsByNode(job);
 
     // Group by layer; position within layer by stable nodeId order.
     const layers = new Map();
@@ -608,13 +670,36 @@
       const ex = att?.executionBindings?.[0]?.executor;
       if (ex) {
         const exl = el("text", { class: "nexec", "text-anchor": "middle", y: R + 27 });
-        exl.textContent = ex.kind === "box" ? "▦ " + ex.launchId : "☺ " + (ex.memberId.split(":").pop() || ex.memberId);
+        exl.textContent = ex.kind === "box" ? "▦ " + ex.launchId : "☺ " + memberLabel(ex.memberId);
         g.appendChild(exl);
+      }
+      // Verdict line (G1/G2): who accepted / rejected this node — the dual-judge trace, compact.
+      const nr = rIdx[n.nodeId];
+      if (nr && (nr.accepted.length || nr.rejected.length)) {
+        const parts = [];
+        const acc = nr.accepted.find((a) => !a.superseded) || nr.accepted[0];
+        if (acc?.decidedBy) parts.push(`<tspan fill="var(--idle)">✓${esc(judgeShort(acc.decidedBy))}</tspan>`);
+        for (const rj of nr.rejected) parts.push(`<tspan fill="var(--blocked)">✗${esc(judgeShort(rj.decidedBy))}</tspan>`);
+        if (parts.length) {
+          const v = el("text", { class: "nverdict", "text-anchor": "middle", y: R + 40 });
+          v.innerHTML = parts.join(" ");
+          g.appendChild(v);
+        }
+        // Supersede/recall badge (G3): accepted but recalled by a judge. Issuer is a member (not a DAG
+        // node), so this is a node badge, not an edge.
+        const recalled = nr.accepted.find((a) => a.superseded && a.supersededBy?.issuedBy);
+        if (recalled) {
+          g.classList.add("recalled");
+          const b = el("text", { class: "nrecall", "text-anchor": "middle", y: -R - 10 });
+          b.textContent = "⟲ recalled by " + judgeShort(recalled.supersededBy.issuedBy);
+          g.appendChild(b);
+        }
       }
       g.addEventListener("click", (e) => { e.stopPropagation(); jobSel = jobSel === n.nodeId ? null : n.nodeId; sel = null; render(); draw(); });
       view.appendChild(g);
     }
 
+    renderJobsMembers();
     // Fit the DAG into the stage (respecting the river reserve, like the topology fit).
     model = { bounds: { x0: 0, y0: 0, x1: 60 + ([...layers.keys()].length) * COLW + 60, y1: 70 + (maxRow + 1) * ROWH + 40 } };
     if (!didFit || lastView !== "jobs") { didFit = true; lastView = "jobs"; fit(); }
@@ -807,13 +892,16 @@
     // free, and centre there — otherwise the graph centres behind the river and its bottom rows hide.
     const reserved = parseFloat(getComputedStyle($("stage")).paddingBottom) || 0;
     const availH = Math.max(120, rect.height - reserved);
+    // Jobs view shows a members strip on the left; inset the fit so the leftmost DAG column clears it.
+    const leftInset = viewMode === "jobs" && (state?.projection?.members?.length ?? 0) ? 260 : 0;
+    const availW = Math.max(160, rect.width - leftInset);
     const w = b.x1 - b.x0, h = b.y1 - b.y0;
     // Captions hang above/below the cluster rect (node names, box launchIds and countdowns), so the drawn
     // extent is taller than `bounds`. Reserve for that or the fit still clips the label rows.
     const padX = 90, padY = 130;
-    const k = Math.max(0.18, Math.min(1.2, Math.min(rect.width / (w + padX), availH / (h + padY))));
+    const k = Math.max(0.18, Math.min(1.2, Math.min(availW / (w + padX), availH / (h + padY))));
     view.k = k;
-    view.x = rect.width / 2 - ((b.x0 + b.x1) / 2) * k;
+    view.x = leftInset + availW / 2 - ((b.x0 + b.x1) / 2) * k;
     view.y = availH / 2 - ((b.y0 + b.y1) / 2) * k;
     draw();
   }
@@ -1152,9 +1240,27 @@
       ${stale ? `<div class="recover">Was accepted (green), but an upstream was superseded — this node is now stale and will rerun. SUCCEEDED is the historical fact; complete=false is current validity.</div>` : ""}
       ${node.goal ? `<div class="sec">goal</div><div class="note">${esc(node.goal)}</div>` : ""}
       ${ex.length ? `<div class="sec">executor</div>${ex.map(execLine).join("")}` : `<div class="sec">executor</div><div class="empty-note">No binding yet — not dispatched.</div>`}
+      ${verdictsSection(job, node)}
       ${att?.inputBindings?.length ? `<div class="sec">inputs (frozen)</div>${att.inputBindings.map((b) => `<div class="flowrow"><span class="who">${esc(b.depNodeId)}</span><span class="v">${esc(short(b.acceptedResultId))}</span></div>`).join("")}` : ""}
       ${hist.length ? `<div class="sec">attempt history</div>${hist.map((h) => `<div class="flowrow"><span class="who">${esc(short(h.attemptId))}</span><span class="v">${esc(h.status)}${h.failureClass ? " · " + esc(h.failureClass) : ""}</span></div>`).join("")}` : ""}
     `;
+  }
+
+  /** Acceptance verdicts (who accepted/rejected — G1/G2), recall detail (G3), and observed commits (G4)
+   *  for one node, folded from job.results. The dual-judge structure lives here. */
+  function verdictsSection(job, node) {
+    const nr = resultsByNode(job)[node.nodeId];
+    if (!nr || (!nr.accepted.length && !nr.rejected.length && !nr.observed.length)) return "";
+    const acc = nr.accepted.map((a) => `<div class="flowrow">
+        <span class="who"><span style="color:var(--idle)">✓ accepted</span>${a.superseded ? ' <span style="color:var(--warn)">· superseded</span>' : ""}</span>
+        <span class="v">${esc(a.decidedBy || "?")}</span></div>${a.supersededBy?.issuedBy ? `<div class="empty-note" style="margin:2px 0 6px">⟲ recalled by ${esc(a.supersededBy.issuedBy)}${a.supersededBy.atSeq != null ? " @seq " + a.supersededBy.atSeq : ""}</div>` : ""}`).join("");
+    const rej = nr.rejected.map((r) => `<div class="flowrow">
+        <span class="who"><span style="color:var(--blocked)">✗ rejected</span></span>
+        <span class="v">${esc(r.decidedBy || "?")}</span></div>${r.reason ? `<div class="empty-note" style="margin:2px 0 6px">${esc(r.reason)}</div>` : ""}`).join("");
+    const obs = nr.observed.length
+      ? `<div class="sec">observed commits</div>${nr.observed.map((o) => `<div class="flowrow"><span class="who">${esc(String(o.observedWorkCommit).slice(0, 9))}</span><span class="v">${esc(o.resultPath || "")}</span></div>${o.note ? `<div class="empty-note" style="margin:2px 0 6px">${esc(o.note)}</div>` : ""}`).join("")}`
+      : "";
+    return `<div class="sec">verdicts</div>${acc}${rej}${obs}`;
   }
 
   function renderDrawer() {
@@ -1407,6 +1513,7 @@
       `<span>attempts <b>${used.totalAttempts ?? 0}</b>/${bud.maxTotalAttempts ?? "?"}</span>` +
       `<span>wall <b>${Math.round((used.wallClockSec ?? 0) / 60)}</b>/${bud.maxWallClockSec ? Math.round(bud.maxWallClockSec / 60) : "?"}m</span>` +
       (bud.maxModelUsd != null || used.modelUsd != null ? `<span>$<b>${(used.modelUsd ?? 0).toFixed(2)}</b></span>` : `<span class="muted">$ n/a</span>`) +
+      ((job.results?.candidates?.length || job.results?.peerLate) ? `<span class="muted">cand ${job.results.candidates?.length || 0} · peerLate ${job.results.peerLate || 0}</span>` : "") +
       (job.plan.jobStatusNote ? `<span class="muted">${esc(job.plan.jobStatusNote)}</span>` : "");
     const jp = document.getElementById("jobpick");
     if (jp) jp.onchange = (e) => { selJob = e.target.value; jobSel = null; didFit = false; render(); };

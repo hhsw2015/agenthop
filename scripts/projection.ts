@@ -89,9 +89,19 @@ export type AttemptRecord = {
 };
 
 export type JobResults = {
-  accepted?: Array<{ acceptedResultId: string; nodeId: string; attemptId?: string; observedWorkCommit?: string; resultPath?: string; superseded?: boolean; decidedAtSeq?: number }>;
-  rejected?: Array<{ nodeId: string; attemptId?: string; reason?: string; atSeq?: number }>;
+  accepted?: Array<{
+    acceptedResultId: string; nodeId: string; attemptId?: string; observedWorkCommit?: string; resultPath?: string;
+    superseded?: boolean;
+    /** rev2: who accepted it — the dual-judge structure (fe=conformance, codex=adversarial). */
+    decidedBy?: string;
+    /** rev2 (S8): the recall — who issued the supersede, and when. */
+    supersededBy?: { issuedBy?: string; atSeq?: number } | null;
+    decidedAtSeq?: number;
+  }>;
+  rejected?: Array<{ nodeId: string; attemptId?: string; reason?: string; decidedBy?: string; atSeq?: number }>;
   candidates?: Array<{ nodeId: string; attemptId?: string; note?: string }>;
+  /** rev2 (S2): per-attempt observed commits — an attempt can land several (keyed by attemptId). */
+  observed?: Array<{ attemptId: string; observedWorkCommit: string; resultPath?: string; note?: string }>;
   peerLate?: number;
 };
 
@@ -108,6 +118,8 @@ export type Member = {
   reachability?: "ok" | "suspected";
   role?: string;
   activeBindings?: string[];
+  /** rev2 (S5/F1): identity drift — how many times this member's underlying run id changed. */
+  runDrift?: { count?: number; lastChangeAtSec?: number | null };
 };
 
 export type ProjectionMeta = { schemaVersion?: number; lastAppliedSeq?: number; rebuiltAt?: number };
