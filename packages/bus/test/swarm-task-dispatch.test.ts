@@ -12,7 +12,7 @@ function buildPlan(nodeOver: Record<string, unknown> = {}): TaskPlan {
     nodes: [{
       nodeId: "build", kind: "work", goal: "do it", dependsOn: [],
       outputContract: { requiredOutputs: [{ logicalName: "r", kind: "report" }] },
-      acceptance: [{ check: "c" }], artifactScope: ["out/"], estimatedRuntimeSec: 1800, retryBudget: 2,
+      acceptance: [], artifactScope: ["out/"], estimatedRuntimeSec: 1800, retryBudget: 2,
       required: true, runtime: "ephemeral", ...nodeOver,
     }],
     jobBudget: { maxTotalAttempts: 10, maxWallClockSec: 100000 },
@@ -60,6 +60,11 @@ describe("prepareDispatch — refusals", () => {
     const r = prepareDispatch(buildPlan(), { nodeId: "ghost", proposedBindings: [], inputBindingDigest: "x" }, [], "rw", "asg", P);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("not in plan");
+  });
+  test("a node with non-empty acceptance is refused (T1 can't execute checks — Codex P2)", () => {
+    const r = prepareDispatch(buildPlan({ acceptance: [{ check: "tests-pass" }] }), READY, [], "rw", "asg", P);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain("acceptance");
   });
 });
 

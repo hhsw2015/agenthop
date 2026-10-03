@@ -4,9 +4,17 @@
 // and frees the slot, an observed success is accepted, and the cap bounds concurrent dispatches.
 import { describe, expect, test } from "vitest";
 import { loadPlan, type TaskPlan } from "../src/swarm/task-plan.js";
-import { commit, entityKeyOf, initialLogState, type ChangeBody, type LogState } from "../src/swarm/control-log.js";
+import { commit, entityKeyOf, initialLogState, liveEntities, type ChangeBody, type LogState } from "../src/swarm/control-log.js";
 import { jobStatus } from "../src/swarm/task-ready.js";
+import { createAttempt, type TaskAttempt } from "../src/swarm/task-state.js";
 import { taskPass, buildSched, type TaskOps, type GitFacts } from "../src/swarm/task-pass.js";
+
+/** Find the single DispatchIntent in the projection (tests have one job/one node). */
+function theIntent(state: LogState): { status: string; allocOutcome: string } | undefined {
+  for (const b of Object.values(liveEntities(state))) if (b.put === "intent") return b.intent;
+  return undefined;
+}
+function attemptsOf(plan: TaskPlan, state: LogState): TaskAttempt[] { return buildSched(plan, state).attempts; }
 
 function plan1(): TaskPlan {
   const res = loadPlan({
@@ -39,7 +47,7 @@ function mkOps(over: Partial<TaskOps> & { stateRef: { s: LogState }; order: stri
     loadState: () => stateRef.s,
     commit: (state, bodies) => { order.push(`commit:${bodies.map((b) => b.put).join("+")}`); const r = stampCommit(state, bodies); stateRef.s = r.state; return r; },
     observeGit: async () => null,
-    startTask: async () => { order.push("startTask"); return "created"; },
+    startTask: async () => { order.push("startTask"); return { alloc: "created", delivered: true }; },
     log: () => {},
     ...over,
   };
@@ -61,7 +69,7 @@ describe("taskPass dispatch — clean-fail revokes the attempt + frees the slot"
   test("a provider refusal abandons the never-run attempt (intent-revoked)", async () => {
     const stateRef = { s: initialLogState() };
     const order: string[] = [];
-    await taskPass(plan1(), mkOps({ stateRef, order, startTask: async () => { order.push("startTask"); return "clean-fail"; } }));
+    await taskPass(plan1(), mkOps({ stateRef, order, startTask: async () => { order.push("startTask"); return { alloc: "clean-fail", delivered: false }; } }));
     const a = buildSched(plan1(), stateRef.s).attempts[0]!;
     expect(a.status).toBe("ABANDONED");
     expect(a.abandonReason).toBe("intent-revoked");
@@ -100,6 +108,56 @@ describe("taskPass — job wall-clock budget (fix A: wallClockSec from planCommi
     const s = jobStatus({ ...buildSched(plan, stateRef.s), now: 1000, jobUsage: { totalAttempts: 0, wallClockSec: 36001 } });
     expect(s.status).toBe("failed");
     expect(s.note).toContain("budget");
+  });
+});
+
+describe("taskPass dispatch — job maxTotalAttempts bounds the loop (Codex P1-4)", () => {
+  test("3 ready, cap 3, maxTotalAttempts 1 ⇒ only ONE allocated (budget re-checked per dispatch)", async () => {
+    const res = loadPlan({
+      jobId: "job", planRevision: 1,
+      nodes: ["a", "b", "c"].map((nodeId) => ({ nodeId, kind: "work", goal: "g", dependsOn: [], outputContract: { requiredOutputs: [{ logicalName: "o", kind: "report" }] }, acceptance: [], artifactScope: ["out/"], estimatedRuntimeSec: 600, retryBudget: 2, required: true, runtime: "ephemeral" })),
+      jobBudget: { maxTotalAttempts: 1, maxWallClockSec: 36000 },
+    });
+    if (!res.ok) throw new Error(res.reason);
+    const stateRef = { s: initialLogState() };
+    await taskPass(res.plan, mkOps({ stateRef, order: [], cap: 3 }));
+    expect(attemptsOf(res.plan, stateRef.s)).toHaveLength(1);
+  });
+});
+
+describe("taskPass dispatch — alloc created but worker not delivered (Codex P2)", () => {
+  test("created+!delivered ⇒ box occupies but intent is NOT confirmed", async () => {
+    const stateRef = { s: initialLogState() };
+    await taskPass(plan1(), mkOps({ stateRef, order: [], startTask: async () => ({ alloc: "created", delivered: false }) }));
+    const intent = theIntent(stateRef.s);
+    expect(intent?.allocOutcome).toBe("created"); // box exists (creation-bound occupancy)
+    expect(intent?.status).toBe("pending"); // but NOT confirmed — the worker never started
+    expect(attemptsOf(plan1(), stateRef.s)[0]!.status).toBe("RUNNING"); // slot held; observation/expiry reconciles
+  });
+});
+
+describe("taskPass dispatch — clean-fail preserves retry lineage (Codex P1-3)", () => {
+  test("a succession whose alloc clean-fails leaves the old RETRY_WAIT intact so retriesUsed survives", async () => {
+    const plan = plan1(); // node build, retryBudget 2
+    const stateRef = { s: initialLogState() };
+    // seed a0 = RETRY_WAIT (retriesUsed 1, retryAt past) for node build.
+    const a0: TaskAttempt = {
+      ...createAttempt({ jobId: "job", nodeId: "build", n: 0, planRevision: 1, specDigest: plan.nodes[0]!.specDigest, inputBindings: [], firstBinding: { bindingId: "job/build/a0/b0", assignmentId: "as0", launchId: "rw-old", publishGeneration: 0, openedAtSeq: 1 }, createdAtSeq: 1 }),
+      status: "RETRY_WAIT", retriesUsed: 1, retryAt: 500,
+    };
+    stateRef.s = stampCommit(stateRef.s, [{ put: "attempt", attempt: a0 }]).state;
+
+    // pass 1: succession a1 dispatched, alloc clean-fails ⇒ a1 abandoned, a0 STILL RETRY_WAIT.
+    await taskPass(plan, mkOps({ stateRef, order: [], startTask: async () => ({ alloc: "clean-fail", delivered: false }) }));
+    const after1 = Object.fromEntries(attemptsOf(plan, stateRef.s).map((a) => [a.attemptId, a]));
+    expect(after1["job/build/a0"]!.status).toBe("RETRY_WAIT"); // NOT abandoned — lineage preserved
+    expect(after1["job/build/a1"]!.status).toBe("ABANDONED");
+
+    // pass 2: alloc created ⇒ succession a2 inherits retriesUsed=1 (not reset to 0), a0 now retired.
+    await taskPass(plan, mkOps({ stateRef, order: [] }));
+    const a2 = attemptsOf(plan, stateRef.s).find((a) => a.attemptId === "job/build/a2");
+    expect(a2?.retriesUsed).toBe(1); // the bug was a2 starting at 0
+    expect(a2?.status).toBe("RUNNING");
   });
 });
 

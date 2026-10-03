@@ -64,6 +64,12 @@ export function prepareDispatch(
   if (!fit.fits) {
     return { ok: false, reason: `token margin: effective ttl ${fit.effectiveTtlSec}s < est ${spec.estimatedRuntimeSec}s + margin ${params.tokenMarginSec}s` };
   }
+  // T1 cannot execute acceptance checks on the dispatcher yet (V8 command execution is T2), and observeGitFor reports a
+  // non-empty acceptance as FAILED — which would burn every retry on a node that might actually pass. Refuse to dispatch
+  // a node we cannot validate, rather than dispatch-and-always-fail (Codex P2). A T1 plan uses empty acceptance.
+  if (spec.acceptance.length > 0) {
+    return { ok: false, reason: `node ${ready.nodeId} has ${spec.acceptance.length} acceptance check(s); dispatcher-side execution is T2 — refusing to dispatch a node that cannot be validated` };
+  }
 
   const nodeAttempts = attempts.filter((a) => a.nodeId === ready.nodeId);
   const n = nodeAttempts.length;

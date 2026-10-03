@@ -48,8 +48,10 @@ export type TaskOps = {
   commit: (state: LogState, bodies: ChangeBody[]) => { state: LogState; result: CommitResult };
   /** O1: observe a binding's WORK branch for a result candidate. null = no candidate / query error (stay put). */
   observeGit: (a: { attempt: TaskAttempt; spec: TaskSpec; binding: ExecutionBinding }) => Promise<GitFacts | null>;
-  /** startTask IO: mint token + scp assignment/worker-env + swarm-launch allocate-only + swarm-task --task. */
-  startTask: (a: { assignment: Assignment; launchId: string }) => Promise<"created" | "clean-fail" | "unknown">;
+  /** startTask IO: mint token + scp assignment/worker-env + swarm-launch allocate-only + swarm-task --task. `alloc` is
+   *  the BOX outcome; `delivered` says the worker actually started. created+!delivered = box exists (occupies, creation-
+   *  bound expiry) but no worker ⇒ do NOT confirm the intent (Codex P2: alloc success ≠ delivery success). */
+  startTask: (a: { assignment: Assignment; launchId: string }) => Promise<{ alloc: "created" | "clean-fail" | "unknown"; delivered: boolean }>;
   log: (m: string) => void;
 };
 
@@ -141,31 +143,43 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
   let free = Math.max(0, ops.cap - occupied(sched.attempts));
   for (const task of ready) {
     if (free <= 0) { ops.log(`dispatch: cap reached, ${ready.length} ready deferred`); break; }
+    // Re-check the job budget against the CURRENT state before each dispatch (Codex P1): readyTasks + usage were computed
+    // once, so without this a cap-sized burst of ready nodes would all allocate past maxTotalAttempts / the wall-clock.
+    const liveAttempts = buildSched(plan, state).attempts;
+    if (liveAttempts.length >= plan.jobBudget.maxTotalAttempts || Math.max(0, ops.nowSec() - ops.planCommittedAtSec) >= plan.jobBudget.maxWallClockSec) {
+      ops.log(`dispatch: job budget reached (attempts ${liveAttempts.length}/${plan.jobBudget.maxTotalAttempts}), ${ready.length} ready deferred`);
+      break;
+    }
     const launchId = ops.newLaunchId();
     const assignmentId = `${launchId}@${task.nodeId}`;
     const params: DispatchParams = {
       remainingLifeSec: ops.remainingLifeSec, checkpointBudgetSec: ops.checkpointBudgetSec, handoffMarginSec: ops.handoffMarginSec,
       tokenMarginSec: ops.tokenMarginSec, budgetSec: ops.budgetSec, nowSec: ops.nowSec(), atSeq: state.seq + 1,
     };
-    const prep = prepareDispatch(plan, task, buildSched(plan, state).attempts, launchId, assignmentId, params);
+    const prep = prepareDispatch(plan, task, liveAttempts, launchId, assignmentId, params);
     if (!prep.ok) { ops.log(`dispatch ${task.nodeId}: skipped — ${prep.reason}`); continue; }
 
-    // CAS-then-IO: persist the intent (pending) + the attempt BEFORE the allocate IO, so a crash leaves a reconcilable
-    // record, never a silent box with no intent. Abandoned-old (retry succession) rides the SAME batch (§3.1).
-    const preBodies: ChangeBody[] = [{ put: "intent", intent: prep.intent }, { put: "attempt", attempt: prep.attempt }];
-    if (prep.abandonedOld) preBodies.push({ put: "attempt", attempt: prep.abandonedOld });
-    state = ops.commit(state, preBodies).state;
+    // CAS-then-IO: persist the intent (pending) + the NEW attempt BEFORE the allocate IO, so a crash leaves a
+    // reconcilable record, never a silent box with no intent. The retry-succession's abandonment of the OLD attempt is
+    // NOT committed here — only AFTER a confirmed alloc (Codex P1): if the alloc clean-fails we revoke the new attempt
+    // and leave the old RETRY_WAIT intact, so its retriesUsed lineage survives for the next succession.
+    state = ops.commit(state, [{ put: "intent", intent: prep.intent }, { put: "attempt", attempt: prep.attempt }]).state;
 
-    const outcome = await ops.startTask({ assignment: prep.assignment, launchId });
-    const resolved = resolveAllocOutcome(prep.intent, outcome, { nowSec: ops.nowSec() });
-    // created => confirm the dispatch; clean-fail => abandon the intent AND revoke the never-run attempt (F1); unknown =>
-    // leave pending/unknown (conservative occupancy, reconciled by observing the WORK branch).
-    const postBodies: ChangeBody[] = [{ put: "intent", intent: outcome === "created" ? confirmIntent(resolved) : outcome === "clean-fail" ? abandonIntent(resolved) : resolved }];
-    if (outcome === "clean-fail") postBodies.push({ put: "attempt", attempt: { ...prep.attempt, status: "ABANDONED", abandonReason: "intent-revoked" } });
+    const { alloc, delivered } = await ops.startTask({ assignment: prep.assignment, launchId });
+    const resolved = resolveAllocOutcome(prep.intent, alloc, { nowSec: ops.nowSec() });
+    // created+delivered => confirm; created+!delivered => leave resolved (box occupies via creation-bound expiry, but the
+    // worker never started, so do NOT confirm — observation/expiry reconciles); clean-fail => abandon intent + revoke the
+    // never-run attempt AND (if a succession) abandon the old now that we know it succeeded nowhere; unknown => leave.
+    const postBodies: ChangeBody[] = [{
+      put: "intent",
+      intent: alloc === "created" ? (delivered ? confirmIntent(resolved) : resolved) : alloc === "clean-fail" ? abandonIntent(resolved) : resolved,
+    }];
+    if (alloc === "created" && prep.abandonedOld) postBodies.push({ put: "attempt", attempt: prep.abandonedOld }); // confirmed succession retires the old
+    if (alloc === "clean-fail") postBodies.push({ put: "attempt", attempt: { ...prep.attempt, status: "ABANDONED", abandonReason: "intent-revoked" } });
     state = ops.commit(state, postBodies).state;
-    // created + unknown hold a slot (unknown conservatively); clean-fail reliably took none, so it does NOT consume one.
-    if (outcome !== "clean-fail") free -= 1;
-    ops.log(`dispatch ${task.nodeId}: ${launchId} alloc=${outcome}`);
+    // created (delivered or not) + unknown hold a slot; clean-fail reliably took none.
+    if (alloc !== "clean-fail") free -= 1;
+    ops.log(`dispatch ${task.nodeId}: ${launchId} alloc=${alloc} delivered=${delivered}`);
   }
 
   const finalSched = buildSched(plan, state);

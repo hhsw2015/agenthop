@@ -317,44 +317,63 @@ async function observeGitFor(a: { attempt: TaskAttempt; spec: TaskSpec; binding:
   const scratch = scratchPath(a.binding.launchId);
   const ls = await git(["ls-remote", WORK_REPO, `refs/heads/${branch}`]);
   if (ls.code !== 0) return null;
-  const sha = ls.stdout.split(/\s+/)[0]?.trim();
-  if (!sha) return null;
+  const tip = ls.stdout.split(/\s+/)[0]?.trim();
+  if (!tip) return null;
   mkdirSync(scratch, { recursive: true });
   if (!existsSync(path.join(scratch, "HEAD"))) await git(["init", "-q", "--bare", scratch]);
-  const fetch = await git(["fetch", "-q", WORK_REPO, sha], { cwd: scratch });
-  if (fetch.code !== 0) {
-    const fb = await git(["fetch", "-q", WORK_REPO, `refs/heads/${branch}:refs/heads/${branch}`], { cwd: scratch });
-    if (fb.code !== 0) return null;
-  }
+  let fetched = await git(["fetch", "-q", WORK_REPO, tip], { cwd: scratch });
+  if (fetched.code !== 0) fetched = await git(["fetch", "-q", WORK_REPO, `refs/heads/${branch}:refs/heads/${branch}`], { cwd: scratch });
+  if (fetched.code !== 0) return null;
   const resultPath = `out/results/${a.attempt.attemptId}/result.json`;
-  const show = await git(["show", `${sha}:${resultPath}`], { cwd: scratch });
-  if (show.code !== 0) return null; // no result.json published yet
-  const resultText = show.stdout;
-  const blobRev = await git(["rev-parse", `${sha}:${resultPath}`], { cwd: scratch });
-  const resultBlobOid = blobRev.code === 0 ? blobRev.stdout.trim() : "";
-  let outputs: Array<{ path?: unknown }> = [];
-  try { const r = JSON.parse(resultText) as { outputs?: unknown }; if (Array.isArray(r.outputs)) outputs = r.outputs as Array<{ path?: unknown }>; } catch { /* V1 will reject below */ }
-  const closureFiles: Array<{ path: string; blobOid: string }> = [];
-  for (const o of outputs) {
-    if (!o || typeof o.path !== "string") continue;
-    const rp = await git(["rev-parse", `${sha}:${o.path}`], { cwd: scratch });
-    if (rp.code === 0) closureFiles.push({ path: o.path, blobOid: rp.stdout.trim() });
+  // O1 first-parent history scan (Codex P1 / F6): a valid result at an ANCESTOR must not be lost when a later commit
+  // removes it from the tip tree. Walk newest->oldest along first-parent and take the newest commit that still carries a
+  // readable result.json. A persisted scan cursor (so we don't re-walk every pass) is T2 ({put:"scan"}); the -n bound
+  // keeps a single pass cheap meanwhile.
+  const rl = await git(["rev-list", "--first-parent", "-n", "200", tip], { cwd: scratch });
+  if (rl.code !== 0) return null;
+  let sha = "", resultText = "", resultBlobOid = "";
+  for (const c of rl.stdout.split("\n").map((s) => s.trim()).filter(Boolean)) {
+    const show = await git(["show", `${c}:${resultPath}`], { cwd: scratch });
+    if (show.code !== 0) continue;
+    const rev = await git(["rev-parse", `${c}:${resultPath}`], { cwd: scratch });
+    sha = c; resultText = show.stdout; resultBlobOid = rev.code === 0 ? rev.stdout.trim() : "";
+    break;
   }
+  if (!sha) return null; // no result.json anywhere on the first-parent history yet
+  let outputs: Array<{ path?: unknown }> = [];
+  let evidence: Array<{ summaryPath?: unknown }> = [];
+  try {
+    const r = JSON.parse(resultText) as { outputs?: unknown; validationEvidence?: unknown };
+    if (Array.isArray(r.outputs)) outputs = r.outputs as Array<{ path?: unknown }>;
+    if (Array.isArray(r.validationEvidence)) evidence = r.validationEvidence as Array<{ summaryPath?: unknown }>;
+  } catch { /* V1 will reject the unparseable result below */ }
+  // Closure = result blob + EVERY referenced file (outputs AND validationEvidence.summaryPath — Codex P2: evidence files
+  // must be in the closure digest, else a changed/missing evidence file is invisible to V6/acceptance). Null entries are
+  // skipped (Codex P2: a malformed outputs:[null] must not throw — V1 rejects it from the frozen result text).
+  const closureFiles: Array<{ path: string; blobOid: string }> = [];
+  const addFile = async (p: string): Promise<void> => {
+    const rp = await git(["rev-parse", `${sha}:${p}`], { cwd: scratch });
+    if (rp.code === 0) closureFiles.push({ path: p, blobOid: rp.stdout.trim() });
+  };
+  for (const o of outputs) if (o && typeof o.path === "string") await addFile(o.path);
+  for (const e of evidence) if (e && typeof e.summaryPath === "string") await addFile(e.summaryPath);
   const dt = await git(["diff-tree", "--no-commit-id", "--name-only", "-r", sha], { cwd: scratch });
   const cumulativeChangedPaths = dt.code === 0 ? dt.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
-  const declaredPaths = outputs.filter((o) => typeof o.path === "string").map((o) => o.path as string);
+  const declaredPaths = outputs.filter((o) => o && typeof o.path === "string").map((o) => o.path as string);
   const requiredOutputsPresent = declaredPaths.length === 0 ? true : declaredPaths.every((p) => closureFiles.some((c) => c.path === p));
   return {
     observedWorkCommit: sha, resultText, resultBlobOid, closureFiles, cumulativeChangedPaths,
     contract: { requiredOutputsPresent, patchAppliesClean: true }, // T1: no patch node; V7 git-apply-check is T2
-    acceptancePassed: a.spec.acceptance.length === 0, // T1: empty acceptance passes; real check execution is T2
+    acceptancePassed: a.spec.acceptance.length === 0, // T1: empty acceptance passes; non-empty is refused at dispatch
     withinCutoffAncestry: true, // open binding ignores this in validateResult
   };
 }
 
 // startTask IO: mint the CPA token, write assignment.json + worker-env as 0600 temp files, swarm-launch allocate-only,
-// then (only if created) fire swarm-task --task. The token rides a FILE (never argv — §4.5-3).
-async function startTaskIO(a: { assignment: Assignment; launchId: string }): Promise<"created" | "clean-fail" | "unknown"> {
+// then (only if created) fire swarm-task --task. The token rides a FILE (never argv — §4.5-3). Returns the BOX outcome
+// (alloc) AND whether the worker actually STARTED (delivered) separately (Codex P2): alloc exit 0 but swarm-task failing
+// before the worker starts = a box that occupies a slot with no worker — it must NOT be reported as a confirmed dispatch.
+async function startTaskIO(a: { assignment: Assignment; launchId: string }): Promise<{ alloc: "created" | "clean-fail" | "unknown"; delivered: boolean }> {
   let token = "";
   try { token = mintEphToken({ sub: a.launchId, ttlSec: VM_LIFETIME_SEC, secret: readEphSecret() }); }
   catch (e) { log(`startTask ${a.launchId}: token mint failed (worker will have no CPA token): ${e instanceof Error ? e.message : e}`); }
@@ -367,16 +386,18 @@ async function startTaskIO(a: { assignment: Assignment; launchId: string }): Pro
       const sq = (v: string) => v.replace(/'/g, "'\\''");
       writeFileSync(envPath, `export ANTHROPIC_BASE_URL='${sq(CPA_BASE_URL)}'\nexport ANTHROPIC_AUTH_TOKEN='${sq(token)}'\n`, { mode: 0o600 });
     }
-    const alloc = await runScript(SWARM_LAUNCH, ["claude", SWARM_TEAM, "new"], { AGENTHOP_ALLOCATE_ONLY: "1", AGENTHOP_LAUNCH_ID: a.launchId });
-    const outcome: "created" | "clean-fail" | "unknown" = alloc.code === 0 ? "created" : alloc.code === 3 ? "clean-fail" : "unknown";
-    if (outcome === "created") {
+    const allocRes = await runScript(SWARM_LAUNCH, ["claude", SWARM_TEAM, "new"], { AGENTHOP_ALLOCATE_ONLY: "1", AGENTHOP_LAUNCH_ID: a.launchId });
+    const alloc: "created" | "clean-fail" | "unknown" = allocRes.code === 0 ? "created" : allocRes.code === 3 ? "clean-fail" : "unknown";
+    let delivered = false;
+    if (alloc === "created") {
       const env: Record<string, string> = { SWARM_ASSIGNMENT: asgPath };
       if (token && CPA_BASE_URL) env.SWARM_WORKER_ENV = envPath;
       if (WORK_REPO) env.SWARM_WORK_REPO = repoSlug(WORK_REPO);
       const t = await runScript(SWARM_TASK, [a.launchId, "--task"], env);
-      if (t.code !== 0) log(`startTask ${a.launchId}: swarm-task --task exit ${t.code}: ${(t.stderr || t.stdout).trim().slice(0, 200)}`);
+      delivered = t.code === 0;
+      if (!delivered) log(`startTask ${a.launchId}: box created but swarm-task --task exit ${t.code} (worker not started): ${(t.stderr || t.stdout).trim().slice(0, 200)}`);
     }
-    return outcome;
+    return { alloc, delivered };
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
