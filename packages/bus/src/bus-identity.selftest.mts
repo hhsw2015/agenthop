@@ -125,6 +125,39 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   const wh = whois(withLate, "old-run-handle");
   t("P1-3 no-native late snapshot rejoins its source lineage (A), never the current thread B", wh.kind === "entity" && wh.entity.entityId === idA && idB !== "" && wh.entity.entityId !== idB);
 }
+{
+  // P1-3 round-4: an explicit source beats an UNRELATED pre-native generation U (no "pre-native wins" default).
+  const ev = [
+    obs("R", [hard("R", "run"), hard("A", "native"), { value: "old-A-handle", form: "handle", confidence: "hard", provenance: "same-announce", derivedFrom: "A" }], { ts: 1, eventId: "Aroot" }),
+    learn("R", "A", "B", "thread-switch", true, { ts: 2, eventId: "Bswitch" }),
+    obs("R", [hard("R", "run")], { ts: 3, eventId: "Uobs" }),                                   // no-native, no source → creates independent pre-native U
+    obs("R", [{ value: "old-A-handle", form: "handle", confidence: "hard", provenance: "same-announce", source: "Aroot", derivedFrom: "A" }], { ts: 4, eventId: "lateA" }), // source=Aroot → A, NOT U
+  ];
+  const proj = buildProjection(ev);
+  const wh = whois(proj, "old-A-handle");
+  t("P1-3: explicit source beats an unrelated pre-native generation (resolves to A, not candidates/U)", wh.kind === "entity" && wh.entity.entityId === eidOf(whois(proj, "A")));
+}
+{
+  // P1-3 round-4: routing is order-independent — a mixed-source no-native observe sends each claim to its own
+  // source's generation regardless of claim order.
+  const runC = { value: "R", form: "run" as const, confidence: "hard" as const, provenance: "same-announce" as const, source: "Bswitch" };
+  const hC = { value: "old-A-handle", form: "handle" as const, confidence: "hard" as const, provenance: "same-announce" as const, source: "Aroot", derivedFrom: "A" };
+  const base = (order: Claim[]) => [
+    obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1, eventId: "Aroot" }),
+    learn("R", "A", "B", "thread-switch", true, { ts: 2, eventId: "Bswitch" }),
+    obs("R", order, { ts: 3, eventId: "mixed" }),
+  ];
+  const p1 = buildProjection(base([runC, hC])), p2 = buildProjection(base([hC, runC]));
+  t("P1-3: order-independent — old handle resolves to A under both claim orders", eidOf(whois(p1, "old-A-handle")) !== "" && eidOf(whois(p1, "old-A-handle")) === eidOf(whois(p1, "A")) && eidOf(whois(p2, "old-A-handle")) === eidOf(whois(p2, "A")));
+}
+{
+  // R4-P2-1: an entityId that is literally another entity's hard alias must NOT be shadowed — it is ambiguous.
+  const baseA = [obs("RA", [hard("RA", "run")], { ts: 1 })];
+  const idA = eidOf(whois(buildProjection(baseA), "RA"));
+  const proj = buildProjection([...baseA, obs("RB", [hard("RB", "run"), hard(idA, "presence")], { ts: 2 })]);
+  const w = whois(proj, idA);
+  t("R4-P2-1: entityId that is also another entity's hard alias → candidates, not shadowed", w.kind === "candidates" && w.entities.length === 2);
+}
 
 // --- P1-4: source-scoped, transitive revoke/correction (no global value blacklist) ---
 {
@@ -183,6 +216,21 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   const proj = buildProjection([obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1, eventId: "S1", busPid: 1 }), S2, C1, revoke("S1")]);
   t("P1-4 independent source: revoking S1 leaves S2's hard A resolvable", whois(proj, "A").kind === "entity");
   t("P1-4 independent source: S2's derived H is NOT collaterally killed", whois(proj, "H").kind === "entity");
+}
+{
+  // P1-4 (round-4 P2, other direction): a corrected guess's derivatives must RETIRE even when an INDEPENDENT
+  // same-literal claim is live — they are retired with their OWN parent (same source), not by the bare literal.
+  const ev = [
+    obs("Rg", [hard("Rg", "run"), poss("A", "native"), { value: "guess-H", form: "handle", confidence: "possible", provenance: "heuristic", derivedFrom: "A" }, { value: "guess-P", form: "presence", confidence: "possible", provenance: "heuristic", derivedFrom: "guess-H" }], { ts: 1, eventId: "gobs" }),
+    learn("Rg", "A", "B", "correction", true, { ts: 2 }),
+    obs("Rind", [hard("Rind", "run"), hard("A", "native")], { ts: 1 }),
+  ];
+  const proj = buildProjection(ev);
+  const rg = whois(proj, "Rg");
+  const claims = rg.kind === "entity" ? rg.entity.incarnations.flatMap((i) => i.claims) : [];
+  const gH = claims.find((c) => c.value === "guess-H"), gP = claims.find((c) => c.value === "guess-P");
+  t("P1-4 (P2): a corrected guess's derivatives retire even with an independent live same-literal", !!gH && gH.superseded === true && !!gP && gP.superseded === true);
+  t("P1-4 (P2): the independent live A is unaffected", whois(proj, "Rind").kind === "entity" && whois(proj, "A").kind === "entity");
 }
 {
   const proj = buildProjection([obs("R", [hard("R", "run"), poss("A", "native")], { ts: 1 }), learn("R", "A", "A", "correction", true, { ts: 2 })]);
