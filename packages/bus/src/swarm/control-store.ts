@@ -12,22 +12,28 @@
  * power loss (Codex review P2-6: the fsyncs are what make the claimed barrier real). Cross-machine CONTROL = step B / T3.
  */
 
-import { mkdirSync, readdirSync, readFileSync, renameSync, existsSync, openSync, writeSync, fsyncSync, closeSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, existsSync, openSync, writeSync, fsyncSync, closeSync, linkSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import {
   commit, replayLog, initialLogState,
   type Change, type CommitResult, type CommittedBatch, type LogState,
 } from "./control-log.js";
 
-function atomicWrite(file: string, data: string): void {
-  const tmp = `${file}.tmp.${process.pid}`;
-  // Write + fsync the data, then rename, then fsync the directory so the rename's directory entry also survives power
-  // loss. Only with both fsyncs is this the durable barrier the step-A contract claims (P2-6).
+/** Atomic + durable publish of a NEW file; throws EEXIST if it already exists — a disk-level CAS so a stale in-memory
+ *  writer can NEVER overwrite an already-committed <seq>.json (R2). temp → fsync → hard-link into place → dir fsync. Any
+ *  failure PROPAGATES (R4: a non-durable barrier must fail the commit, not be swallowed). */
+function atomicWriteNew(file: string, data: string): void {
+  const tmp = `${file}.tmp.${process.pid}.${Date.now().toString(36)}`;
   const fd = openSync(tmp, "w", 0o600);
   try { writeSync(fd, data); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(tmp, file);
-  try { const dfd = openSync(path.dirname(file), "r"); try { fsyncSync(dfd); } finally { closeSync(dfd); } }
-  catch { /* directory fsync is best-effort — some platforms disallow fsync on a dir fd; the file fsync is the barrier */ }
+  try { linkSync(tmp, file); } finally { try { unlinkSync(tmp); } catch { /* tmp already gone */ } } // atomic; EEXIST ⇒ seq taken
+  const dfd = openSync(path.dirname(file), "r");
+  try { fsyncSync(dfd); } finally { closeSync(dfd); }
+}
+
+function maxSeqOnDisk(dir: string): number {
+  try { return readdirSync(dir).filter((f) => /^\d+\.json$/.test(f)).reduce((m, f) => Math.max(m, Number(f.slice(0, -".json".length))), 0); }
+  catch { return 0; }
 }
 
 /** Rebuild LogState from the on-disk log. A missing dir = the initial (seq 0) state. */
@@ -51,7 +57,15 @@ export function commitControl(dir: string, state: LogState, changes: Change[]): 
   if (r.result.ok && !r.result.replay) {
     mkdirSync(dir, { recursive: true });
     const batch: CommittedBatch = { seq: r.result.newSeq, changes };
-    atomicWrite(path.join(dir, `${r.result.newSeq}.json`), JSON.stringify(batch));
+    try { atomicWriteNew(path.join(dir, `${r.result.newSeq}.json`), JSON.stringify(batch)); }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+        // disk-CAS conflict (R2): another writer already committed this seq — our in-memory snapshot is stale. Do NOT
+        // overwrite; report a seq conflict with the on-disk head so the caller reloads + retries. State returned unadvanced.
+        return { result: { ok: false, reason: "seq", currentSeq: maxSeqOnDisk(dir) }, state };
+      }
+      throw e; // a real durable-write failure (R4) — propagate; never report ok on a non-durable barrier
+    }
   }
   return r;
 }

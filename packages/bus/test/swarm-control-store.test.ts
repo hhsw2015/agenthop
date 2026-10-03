@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach } from "vitest";
-import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { initialLogState, type Change } from "../src/swarm/control-log.js";
@@ -69,5 +69,26 @@ describe("commitControl — persist + reload roundtrip", () => {
     const s = commitControl(DIR, loadControlLog(DIR), [intent("i1", "op1", 0)]).state;
     writeFileSync(path.join(DIR, "2.json.tmp.9999"), "garbage"); // crashed partial write
     expect(loadControlLog(DIR)).toEqual(s); // only 1.json replayed, tmp ignored
+  });
+
+  test("R2 disk-CAS: a stale writer at an already-committed seq does NOT overwrite — reports a seq conflict", () => {
+    const s0 = loadControlLog(DIR); // seq 0
+    const a = commitControl(DIR, s0, [intent("i1", "op1", 0)]); // writes 1.json
+    expect(a.result.ok).toBe(true);
+    // a stale writer still holding the seq-0 snapshot commits — it would target 1.json, which already exists on disk
+    const stale = commitControl(DIR, s0, [intent("i2", "op2", 0)]);
+    expect(stale.result).toMatchObject({ ok: false, reason: "seq" });
+    expect(files()).toEqual(["1.json"]);        // the committed batch was NOT overwritten
+    expect(loadControlLog(DIR).seq).toBe(1);     // intact
+  });
+
+  test("R4: a durable-write failure PROPAGATES (throws) — never ok=true on a non-durable barrier", () => {
+    const s = commitControl(DIR, loadControlLog(DIR), [intent("i1", "op1", 0)]).state; // seq 1 ok (creates dir)
+    chmodSync(DIR, 0o500); // read-only dir: the next atomic write cannot complete
+    let threw = false;
+    try { commitControl(DIR, s, [intent("i2", "op2", 0)]); } catch { threw = true; } finally { chmodSync(DIR, 0o700); }
+    if (!threw) { /* running as root ignores the mode — can't exercise the failure here */ return; }
+    expect(threw).toBe(true);                 // failure propagated (did NOT swallow + return ok)
+    expect(loadControlLog(DIR).seq).toBe(1);  // the failed batch was not persisted
   });
 });

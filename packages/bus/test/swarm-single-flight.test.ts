@@ -40,8 +40,26 @@ describe("acquireSingleFlight", () => {
   test("an unreadable/garbage holder is treated as reclaimable (dead)", () => {
     const p = lockPath();
     writeFileSync(p, "not-a-pid");
-    const release = acquireSingleFlight(p, { pidAlive: () => true }); // pidAlive(NaN→0) path: holder<=0 ⇒ reclaim
+    const release = acquireSingleFlight(p, { pidAlive: () => true }); // holder NaN (not > 0) ⇒ reclaim
     expect(release).not.toBeNull();
     release!();
+  });
+
+  test("the lock is published already holding our pid — never observed empty (#2)", () => {
+    const p = lockPath();
+    const release = acquireSingleFlight(p, { pidAlive: () => true });
+    expect(readFileSync(p, "utf8").trim()).toBe(String(process.pid)); // born with the pid, no empty window
+    release!();
+  });
+
+  test("release is ownership-checked + idempotent: a double release does NOT delete a successor's lock (#3)", () => {
+    const p = lockPath();
+    const release = acquireSingleFlight(p, { pidAlive: () => true });
+    expect(release).not.toBeNull();
+    release!();                                     // A releases — its lock removed
+    writeFileSync(p, "999999");                     // a successor B now holds the lock (different pid)
+    release!();                                     // A's STALE double-release must be a no-op for B
+    expect(existsSync(p)).toBe(true);               // B's lock intact
+    expect(readFileSync(p, "utf8").trim()).toBe("999999");
   });
 });
