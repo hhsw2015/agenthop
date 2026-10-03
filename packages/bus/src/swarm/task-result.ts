@@ -15,8 +15,10 @@
  *  - V6 (unique) compares resultClosureDigest — result.json content AND its referenced outputs/evidence blobs — not a
  *    single blob OID: a changed patch with byte-identical result.json is a NEW candidate (Codex P2-2).
  *  - V4 (input) compares the inputBindingDigest AND requires every bound acceptedResultId to still be the dep's
- *    CURRENT accepted (a single value per dep; T2 resolves it by decidedAtSeq among non-superseded). "Binding points
- *    at the old one while a newer accepted exists" => stale-input (fe0376cd).
+ *    CURRENT accepted. currentDepResults is a single value per dep, but it MUST be the output of the recursive
+ *    currentAccepted (this node's specDigest match AND every input recursively still current — §3.1 / task-ready), NOT
+ *    a plain "latest non-superseded" query; and it must come from the SAME control state as currentSpecDigest (P3-1).
+ *    "Binding points at the old one while a newer accepted exists" => stale-input (fe0376cd).
  */
 
 import { digestOf } from "./digest.js";
@@ -82,7 +84,8 @@ export type ValidationInput = {
   attemptSpec: TaskSpec;
   /** The CURRENT plan revision's specDigest for this nodeId (null = node removed) — V5. */
   currentSpecDigest: string | null;
-  /** dep nodeId -> its CURRENT accepted id (single value; null if the dep has no current) — V4. */
+  /** dep nodeId -> its CURRENT accepted id (null if the dep has no current) — V4. MUST be the recursive currentAccepted
+   *  output (not a bare latest-non-superseded lookup) and from the same control state as currentSpecDigest (P3-1). */
   currentDepResults: Record<string, string | null>;
   observed: { launchId: string; generation: number; workCommit: string; resultBlobOid: string; resultPath: string };
   /** For a closing/closed matched binding: is this candidate within the cutoffTip ancestry / registered before close
@@ -94,7 +97,9 @@ export type ValidationInput = {
   contract: { requiredOutputsPresent: boolean; patchAppliesClean: boolean };
   /** V8 IO outcome — consulted only when outcome=success. */
   acceptancePassed: boolean;
-  /** V8 patch sourceWriteScope check: the file set a patch output touches when applied in isolation (optional). */
+  /** V8 patch sourceWriteScope check: the file set a patch output touches when applied in isolation. REQUIRED whenever
+   *  the candidate carries a patch output that applied clean — omitting it for such a candidate is a caller bug (throw),
+   *  not a silent pass. Unused when there is no patch. */
   patchDiffPaths?: string[];
   /** Cumulative added/changed/deleted paths over the binding's commits since its start — scope-violation (§4.2 v3). */
   cumulativeChangedPaths: string[];
@@ -156,8 +161,17 @@ export function parseTaskResult(text: string): TaskResult | null {
   for (const raw of o.validationEvidence) {
     if (typeof raw !== "object" || raw === null) return null;
     const ve = raw as Record<string, unknown>;
-    if (!isString(ve.check)) return null;
-    evidence.push({ check: ve.check, ...(ve.cmd !== undefined ? { cmd: ve.cmd as string } : {}), ...(ve.exitCode !== undefined ? { exitCode: ve.exitCode as number } : {}), ...(ve.summaryPath !== undefined ? { summaryPath: ve.summaryPath as string } : {}) });
+    // Optional fields validated per-item into narrowed consts, not cast (Codex P2-2): a non-string cmd/summaryPath or
+    // non-number exitCode is malformed input — degrade to null rather than carry a lie through the type.
+    const check = ve.check;
+    const cmd = ve.cmd;
+    const exitCode = ve.exitCode;
+    const summaryPath = ve.summaryPath;
+    if (!isString(check)) return null;
+    if (cmd !== undefined && !isString(cmd)) return null;
+    if (summaryPath !== undefined && !isString(summaryPath)) return null;
+    if (exitCode !== undefined && (typeof exitCode !== "number" || !Number.isFinite(exitCode))) return null;
+    evidence.push({ check, ...(cmd !== undefined ? { cmd } : {}), ...(exitCode !== undefined ? { exitCode } : {}), ...(summaryPath !== undefined ? { summaryPath } : {}) });
   }
   return {
     schemaVersion: 1,
@@ -186,18 +200,22 @@ export function validateResult(i: ValidationInput): Verdict {
   const elig = candidateEligibility(binding, i.withinCutoffAncestry);
   if (!elig.eligible) return { decision: "discard", rule: "V3", reason: elig.reason };
 
-  // V1: parse/schema/size, then declared outputs within artifactScope. Classified by source.
+  // V1a: parse/schema/size (can't read identity without parsing). Classified by source.
   const result = parseTaskResult(i.resultText);
   if (!result) return { decision: "reject", rule: "V1", failureClass: bySource(false), reason: "result.json unparseable/oversize/invalid schema" };
+
+  // V2: identity BEFORE any attempt-level (scope/content) check. A wrong-identity candidate must be DISCARDED
+  // (candidate-level), never upgraded into an attempt-level permanent by a scope/declared-output check — that is the
+  // P2-1 attack shape (Codex re-review). Once it parses, verify whose result it is first.
+  if (result.jobId !== attempt.jobId || result.nodeId !== attempt.nodeId || result.attemptId !== attempt.attemptId || result.assignmentId !== binding.assignmentId) {
+    return { decision: "discard", rule: "V2", reason: "identity mismatch (job/node/attempt/assignment)" };
+  }
+
+  // V1b: declared outputs must be within artifactScope.
   for (const out of result.outputs) {
     if (!inArtifactScope(out.path, attemptSpec.artifactScope)) {
       return { decision: "reject", rule: "V1", failureClass: bySource(false), reason: `declared output ${out.path} outside artifactScope` };
     }
-  }
-
-  // V2: identity must match the attempt (and the matched binding's assignment). Candidate-level discard.
-  if (result.jobId !== attempt.jobId || result.nodeId !== attempt.nodeId || result.attemptId !== attempt.attemptId || result.assignmentId !== binding.assignmentId) {
-    return { decision: "discard", rule: "V2", reason: "identity mismatch (job/node/attempt/assignment)" };
   }
 
   // V5: the current plan still has this node with the attempt's specDigest, else the task itself changed -> stale.
@@ -213,11 +231,13 @@ export function validateResult(i: ValidationInput): Verdict {
   }
 
   // Scope-violation: cumulative changes over the binding may not touch anything outside artifactScope (+ the always
-  // -allowed .swarm/manifest.json and out/results/<attemptId>/). Structural -> permanent.
+  // -allowed .swarm/manifest.json and out/results/<attemptId>/). Classified by SOURCE like V1/F11 — a rescue (near-
+  // death, per-file staged) that caught a mid-write intermediate file is inconsistent-snapshot (candidate-level, no
+  // retry charge), NOT a protocol violation; only a milestone is permanent (Codex re-review d).
   for (const p of i.cumulativeChangedPaths) {
     if (p === ".swarm/manifest.json") continue;
     if (underPrefix(p, `out/results/${attempt.attemptId}`)) continue;
-    if (!inArtifactScope(p, attemptSpec.artifactScope)) return { decision: "reject", rule: "scope", failureClass: "permanent", reason: `cumulative change ${p} outside artifactScope` };
+    if (!inArtifactScope(p, attemptSpec.artifactScope)) return { decision: "reject", rule: "scope", failureClass: bySource(false), reason: `cumulative change ${p} outside artifactScope` };
   }
 
   // A worker that self-reports failure carries failure evidence -> business-fail. Skip V6/V7/V8.
@@ -232,15 +252,21 @@ export function validateResult(i: ValidationInput): Verdict {
     return { decision: "discard", rule: "V6", reason: "duplicate: different closure, attempt already accepted" };
   }
 
-  // V7: required outputs present + patch applies clean to its base. IO outcomes passed in.
+  // V7: required outputs present + EVERY actual patch output applies clean to its base. hasPatch counts patches the
+  // RESULT actually carries, not just the ones the contract required — a non-required patch output must not escape the
+  // apply-clean and sourceWriteScope checks (Codex re-review a).
   if (!i.contract.requiredOutputsPresent) return { decision: "reject", rule: "V7", failureClass: bySource(true), reason: "required outputs missing from tree" };
-  const hasPatch = attemptSpec.outputContract.requiredOutputs.some((o) => o.kind === "patch");
+  const hasPatch = attemptSpec.outputContract.requiredOutputs.some((o) => o.kind === "patch") || result.outputs.some((o) => o.kind === "patch");
   if (hasPatch && !i.contract.patchAppliesClean) return { decision: "reject", rule: "V7", failureClass: bySource(true), reason: "patch does not apply clean to baseSourceCommit" };
 
-  // V8: project acceptance checks + patch sourceWriteScope (the patch may only edit source under sourceWriteScope).
-  if (hasPatch && attemptSpec.sourceWriteScope && i.patchDiffPaths) {
+  // V8: patch sourceWriteScope (the patch may only edit source under sourceWriteScope) + project acceptance checks.
+  // When a (clean-applying) patch exists AND the spec bounds its source writes, patchDiffPaths is REQUIRED — a missing
+  // diff set is undecidable, a caller bug (it must run `git apply` and diff), never a silent pass (Codex P1-1). Scope
+  // violation is source-classed (rescue ⇒ inconsistent-snapshot, milestone ⇒ permanent).
+  if (hasPatch && attemptSpec.sourceWriteScope) {
+    if (i.patchDiffPaths === undefined) throw new Error("validateResult: patchDiffPaths is required for a patch candidate with a sourceWriteScope");
     for (const p of i.patchDiffPaths) {
-      if (!inArtifactScope(p, attemptSpec.sourceWriteScope)) return { decision: "reject", rule: "scope", failureClass: "permanent", reason: `patch edits ${p} outside sourceWriteScope` };
+      if (!inArtifactScope(p, attemptSpec.sourceWriteScope)) return { decision: "reject", rule: "scope", failureClass: bySource(false), reason: `patch edits ${p} outside sourceWriteScope` };
     }
   }
   if (!i.acceptancePassed) return { decision: "reject", rule: "V8", failureClass: bySource(true), reason: "acceptance checks failed" };

@@ -17,6 +17,17 @@
  *     the caller re-reads and recomputes.
  *  4. Batches are GROUP-ATOMIC (all changes visible or none) and may not put the same entity twice (caller bug,
  *     fail-fast).
+ *
+ * Caller (IO shell) obligations — this pure engine does not enforce them, so they are stated here (P3):
+ *  - SEQ STAMPING: a record's own seq field (createdAtSeq / openedAtSeq / decidedAtSeq / atSeq) is the seq of the batch
+ *    that commits it = (currentState.seq + 1). Compute it before building the payload and stamp it in; all records in
+ *    one batch share that seq (decidedAtSeq is the cross-task total order; within a batch, order by plan for tie-break).
+ *  - OPERATION ID: one id PER LOGICAL TRANSITION, minted once and PERSISTED before the commit IO, then reused verbatim
+ *    if a crash forces a resubmit (that is what makes recovery idempotent). NOT per pass. Do NOT mint a fresh id for an
+ *    unchanged entity — skip the commit entirely when nothing changed (a frequent lifecycle pass with no delta writes
+ *    nothing); operationId idempotency is the crash-mid-commit safety net, not a license to log every pass.
+ *  - expectedEntityRevision = currentState.revisions[entityKey] ?? 0 (a brand-new entity is 0).
+ *  - CAS-then-IO: commit (persist) FIRST, then perform the side effect (startTask/allocate). Recovery replays the log.
  */
 
 import { digestOf } from "./digest.js";
@@ -214,6 +225,20 @@ export function replayLog(batches: CommittedBatch[]): LogState {
     state = applyChanges(state, b.changes);
   }
   return state;
+}
+
+/** F17 (§4.3 step B): after a `git push --force-with-lease` to the CONTROL repo, read the ref back and decide. A lease
+ *  can report "up-to-date" success on a stale same-target push, so "push ok" ≠ "I wrote it". Compare the batch already
+ *  on the chain to the batch we intended: identical operation identities (operationId → payload digest) ⇒ ADVANCE
+ *  (idempotent — whoever wrote it, same op + same digest is equivalent, §2.6); any difference ⇒ HALT (a second active
+ *  dispatcher is a deploy accident — stop, do not split-brain). Pure; shares payloadDigestOf with the local engine so
+ *  "equivalent" means exactly what a replay means. */
+export function reconcilePush(intended: Change[], onChain: Change[]): "advance" | "halt" {
+  const fingerprint = (changes: Change[]): string => {
+    const ops = changes.map((c) => `${c.operationId}=${payloadDigestOf(c)}`).sort();
+    return digestOf(ops);
+  };
+  return fingerprint(intended) === fingerprint(onChain) ? "advance" : "halt";
 }
 
 /** The projection minus tombstoned lifecycle records and the tombstone markers themselves. Discovery MUST consult

@@ -78,6 +78,8 @@ export type TaskAttempt = {
   failureClass?: FailureClass;
   /** Audit of WHY an attempt is ABANDONED (§2.2). Not a failure taxonomy — that is failureClass. */
   abandonReason?: AbandonReason;
+  /** Free-form audit note, e.g. the conflict detail when an op-conflict terminated this attempt (§2.6). */
+  note?: string;
   createdAtSeq: number;
 };
 
@@ -179,7 +181,8 @@ export type AttemptEvent =
   | { type: "transient_infra"; jitterSec?: number }                  // all bindings dead, no result
   | { type: "stale"; which: "input" | "plan" }                       // V4 / V5 reject (at validation time, from RPV)
   | { type: "inconsistent_snapshot" }                                // V7/V8 on an inconsistent rescue snapshot
-  | { type: "permanent" }                                            // V1 / scope-violation / conflict / budget
+  | { type: "permanent" }                                            // V1 / scope-violation on a milestone (structural)
+  | { type: "conflict"; note?: string }                              // §2.6 op-conflict terminates the victim attempt
   | { type: "revoke"; reason: "intent-revoked" | "stale-input" }      // abandon a RUNNING, never-activated attempt
   | { type: "add_binding"; binding: ExecutionBinding };               // VM handoff continuation (X2)
 
@@ -210,7 +213,11 @@ export function advanceAttempt(a: TaskAttempt, event: AttemptEvent, nowSec: numb
 
     case "transient_infra":
       if (a.status !== "RUNNING") return bad(`transient_infra from ${a.status}`);
-      // retriesUsed UNCHANGED (VM side is already bounded by MAX_ALLOC_ATTEMPTS).
+      // retriesUsed UNCHANGED (VM side is already bounded by MAX_ALLOC_ATTEMPTS). There is deliberately NO per-attempt
+      // "job budget exhausted" terminal event: when a RUNNING attempt's bindings are all dead with no result AND the
+      // job budget is spent, the attempt stays in RETRY_WAIT (audit) and job-level termination is expressed by
+      // jobStatus=failed — readyTasks won't re-dispatch it (budgetGone). The §3.1 "预算尽→FAILED" is the retryBudget
+      // path inside business_fail, already implemented (fe0376cd ruling reconciling the frozen §3.1 line; Codex P2-3).
       return ok({ status: "RETRY_WAIT", failureClass: "transient-infra", retryAt: nowSec + 60 + (event.jitterSec ?? 0) });
 
     case "stale":
@@ -227,10 +234,20 @@ export function advanceAttempt(a: TaskAttempt, event: AttemptEvent, nowSec: numb
       if (a.status !== "RESULT_PENDING_VALIDATION") return bad(`permanent from ${a.status}`);
       return ok({ status: "FAILED", failureClass: "permanent" });
 
+    case "conflict":
+      // §2.6: an operation conflict (control-log froze the entity) terminates the victim attempt. Legal from any live
+      // state — the conflicting op could arrive while the attempt is RUNNING, pending validation, or waiting to retry.
+      if (a.status !== "RUNNING" && a.status !== "RESULT_PENDING_VALIDATION" && a.status !== "RETRY_WAIT") return bad(`conflict from ${a.status}`);
+      return ok({ status: "FAILED", failureClass: "permanent", ...(event.note !== undefined ? { note: event.note } : {}) });
+
     case "revoke":
       // Abandon a RUNNING attempt that never started executing: F1 (intent committed, startTask IO never happened —
       // recovery abandons) and supersede-cascade #2 (an un-dispatched attempt → ABANDONED(stale-input)). Legal ONLY
       // while every binding is still un-activated; an attempt with live execution must go the closing route, not here.
+      // CALLER PRECONDITION (P3-1): "no activated binding" is NOT proof "nothing ran" — a box may be executing with its
+      // activation ACK still in flight. The caller must hold positive evidence of not-sent / reliable alloc failure, or
+      // an authorized logical-revocation basis, and must independently keep the physical-occupancy / closing / owner-
+      // generation obligations; this structural guard alone does not establish non-execution.
       if (a.status !== "RUNNING") return bad(`revoke from ${a.status}`);
       if (a.executionBindings.some((b) => b.activatedAtSeq !== undefined)) return bad("revoke of an attempt with an activated binding");
       // retriesUsed UNCHANGED — nothing ran.

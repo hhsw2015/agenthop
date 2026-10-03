@@ -5,6 +5,7 @@ import {
   replayLog,
   liveEntities,
   entityKeyOf,
+  reconcilePush,
   type Change,
   type ChangeBody,
   type DispatchIntent,
@@ -147,6 +148,20 @@ describe("supersede mutates the AcceptedResult, never replaces the entity (fe037
     // After supersede: projected accepted has superseded:true -> currentAccepted null.
     s = commit(s, 1, [ch({ put: "supersede", acceptedResultId: acc1.acceptedResultId }, "op2", 1)]).state;
     expect(currentAccepted("C", { plan: plan.plan, attempts: [attempt], acceptedResults: projected(s) })).toBeNull();
+  });
+});
+
+describe("reconcilePush (F17, §4.3 step B)", () => {
+  test("same operation identities on-chain => advance (idempotent, whoever wrote it)", () => {
+    const intended = [ch(scan("b1", null), "op1", 0), ch({ put: "intent", intent }, "op2", 0)];
+    const onChain = [ch({ put: "intent", intent }, "op2", 0), ch(scan("b1", null), "op1", 0)]; // different array order, same ops
+    expect(reconcilePush(intended, onChain)).toBe("advance");
+  });
+  test("different content on-chain => halt (second active dispatcher = split-brain)", () => {
+    const intended = [ch(scan("b1", null), "op1", 0)];
+    const onChain = [ch(scan("b1", "DIFFERENT"), "op1", 0)];
+    expect(reconcilePush(intended, onChain)).toBe("halt");
+    expect(reconcilePush(intended, [ch(scan("b2", null), "op9", 0)])).toBe("halt");
   });
 });
 

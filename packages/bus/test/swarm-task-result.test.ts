@@ -234,4 +234,49 @@ describe("parseTaskResult", () => {
     expect(parseTaskResult(JSON.stringify({ schemaVersion: 2 }))).toBeNull();
     expect(parseTaskResult("{")).toBeNull();
   });
+  test("malformed validationEvidence optional fields => null (Codex P2-2)", () => {
+    expect(parseTaskResult(resultJson({ validationEvidence: [{ check: "c", exitCode: "nope" }] }))).toBeNull();
+    expect(parseTaskResult(resultJson({ validationEvidence: [{ check: "c", cmd: 5 }] }))).toBeNull();
+    expect(parseTaskResult(resultJson({ validationEvidence: [{ check: "c", summaryPath: {} }] }))).toBeNull();
+    expect(parseTaskResult(resultJson({ validationEvidence: [{ check: "c", exitCode: 0, cmd: "x" }] }))?.validationEvidence).toHaveLength(1);
+  });
+});
+
+describe("Codex re-review fixes", () => {
+  test("(a) a NON-required patch output still goes through V7 apply-clean (does not escape to accept)", () => {
+    // spec requires only a report; the result ALSO carries a patch output that does not apply clean.
+    const presult = resultJson({ outputs: [{ logicalName: "o", kind: "report", path: "out/report.md" }, { logicalName: "extra", kind: "patch", path: "out/extra.diff", baseSourceCommit: "base1" }] });
+    const v = validateResult(vin({ resultText: presult, contract: { requiredOutputsPresent: true, patchAppliesClean: false } }));
+    expect(v.decision === "reject" && v.rule === "V7").toBe(true);
+  });
+  test("(a) a NON-required patch is scope-checked against sourceWriteScope", () => {
+    const spec2 = buildSpec({ sourceWriteScope: ["src/"] }); // report required + a sourceWriteScope
+    const att2 = mkAttempt(spec2);
+    const presult = resultJson({ outputs: [{ logicalName: "o", kind: "report", path: "out/report.md" }, { logicalName: "extra", kind: "patch", path: "out/extra.diff", baseSourceCommit: "base1" }] }, att2);
+    const v = validateResult(vin({ attempt: att2, attemptSpec: spec2, currentSpecDigest: spec2.specDigest, resultText: presult, patchDiffPaths: ["docs/x.md"] }));
+    expect(v.decision === "reject" && v.rule === "scope").toBe(true);
+  });
+  test("(b) a patch candidate under a sourceWriteScope with NO patchDiffPaths observation throws (caller bug, not silent pass)", () => {
+    const pspec = buildSpec({ outputContract: { requiredOutputs: [{ logicalName: "patch", kind: "patch" }], baseSourceCommit: "base1" }, sourceWriteScope: ["src/"] });
+    const patt = mkAttempt(pspec);
+    const presult = resultJson({ outputs: [{ logicalName: "patch", kind: "patch", path: "out/patch.diff", baseSourceCommit: "base1" }] }, patt);
+    expect(() => validateResult(vin({ attempt: patt, attemptSpec: pspec, currentSpecDigest: pspec.specDigest, resultText: presult, patchDiffPaths: undefined }))).toThrow();
+  });
+  test("(c) wrong identity + out-of-scope declared output => DISCARD V2, not an attempt-level V1 permanent (P2-1 shape)", () => {
+    const v = validateResult(vin({ resultText: resultJson({ assignmentId: "asX", outputs: [{ logicalName: "o", kind: "report", path: "src/evil.ts" }] }) }));
+    expect(v.decision === "discard" && v.rule === "V2").toBe(true);
+  });
+  test("(d) cumulative scope violation is source-classed: rescue => inconsistent-snapshot, milestone => permanent", () => {
+    const m = validateResult(vin({ cumulativeChangedPaths: ["out/report.md", "src/secret.ts"] }));
+    expect(m.decision === "reject" && m.rule === "scope" && m.failureClass === "permanent").toBe(true);
+    const r = validateResult(vin({ source: "rescue", cumulativeChangedPaths: ["out/report.md", "src/secret.ts"] }));
+    expect(r.decision === "reject" && r.rule === "scope" && r.failureClass === "inconsistent-snapshot").toBe(true);
+  });
+  test("(d) sourceWriteScope violation is source-classed too", () => {
+    const pspec = buildSpec({ outputContract: { requiredOutputs: [{ logicalName: "patch", kind: "patch" }], baseSourceCommit: "base1" }, sourceWriteScope: ["src/"] });
+    const patt = mkAttempt(pspec);
+    const presult = resultJson({ outputs: [{ logicalName: "patch", kind: "patch", path: "out/patch.diff", baseSourceCommit: "base1" }] }, patt);
+    const r = validateResult(vin({ source: "rescue", attempt: patt, attemptSpec: pspec, currentSpecDigest: pspec.specDigest, resultText: presult, patchDiffPaths: ["docs/x.md"] }));
+    expect(r.decision === "reject" && r.rule === "scope" && r.failureClass === "inconsistent-snapshot").toBe(true);
+  });
 });
