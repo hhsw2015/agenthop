@@ -11,6 +11,10 @@ import {
   type CommittedBatch,
 } from "../src/swarm/control-log.js";
 import type { ControlRecord } from "../src/swarm/control.js";
+import type { AcceptedResult } from "../src/swarm/task-result.js";
+import { loadPlan } from "../src/swarm/task-plan.js";
+import { createAttempt } from "../src/swarm/task-state.js";
+import { currentAccepted } from "../src/swarm/task-ready.js";
 
 function ch(body: ChangeBody, operationId: string, expectedEntityRevision = 0): Change {
   return { ...body, operationId, expectedEntityRevision } as Change;
@@ -106,6 +110,43 @@ describe("replayLog (projection rebuild / crash recovery)", () => {
   });
   test("a seq gap throws", () => {
     expect(() => replayLog([{ seq: 2, changes: [ch(scan("b1", null), "op1")] }])).toThrow();
+  });
+});
+
+describe("supersede mutates the AcceptedResult, never replaces the entity (fe0376cd T2 review #2 P1)", () => {
+  const accepted: AcceptedResult = {
+    acceptedResultId: "job/C/a1/r1", attemptId: "job/C/a1", nodeId: "C", jobId: "job", planRevision: 1,
+    observedWorkCommit: "wc-C", resultPath: "out/results/job/C/a1/result.json", resultBlobOid: "b",
+    resultClosureDigest: "cd", inputBindingDigest: "d", validatorVersion: "brain-v1", decision: "accepted", decidedAtSeq: 5,
+  };
+  test("flips superseded:true and PRESERVES the original content", () => {
+    const s1 = commit(initialLogState(), 0, [ch({ put: "accepted", accepted }, "op1")]).state;
+    const sup = commit(s1, 1, [ch({ put: "supersede", acceptedResultId: accepted.acceptedResultId }, "op2", 1)]);
+    expect(sup.result.ok).toBe(true);
+    const body = sup.state.entities["accepted:job/C/a1/r1"];
+    expect(body?.put).toBe("accepted");
+    if (body?.put === "accepted") {
+      expect(body.accepted.superseded).toBe(true);
+      expect(body.accepted.observedWorkCommit).toBe("wc-C"); // original NOT lost
+      expect(body.accepted.decidedAtSeq).toBe(5);
+    }
+  });
+  test("superseding a nonexistent accepted is rejected (caller bug)", () => {
+    const bad = commit(initialLogState(), 0, [ch({ put: "supersede", acceptedResultId: "ghost/r1" }, "op1")]);
+    expect(bad.result.ok === false && bad.result.reason === "batch").toBe(true);
+  });
+  test("end-to-end: the projected superseded AcceptedResult makes currentAccepted(C) null", () => {
+    const plan = loadPlan({ jobId: "job", planRevision: 1, nodes: [{ nodeId: "C", kind: "work", goal: "c", dependsOn: [], outputContract: { requiredOutputs: [{ logicalName: "o", kind: "report" }] }, acceptance: [], artifactScope: ["out/"], estimatedRuntimeSec: 60, retryBudget: 2 }], jobBudget: { maxTotalAttempts: 10, maxWallClockSec: 1000 } });
+    if (!plan.ok) throw new Error(plan.reason);
+    const attempt = { ...createAttempt({ jobId: "job", nodeId: "C", n: 1, planRevision: 1, specDigest: plan.plan.nodes[0]!.specDigest, inputBindings: [], firstBinding: { bindingId: "job/C/a1/b0", assignmentId: "as", launchId: "rw-1", publishGeneration: 0, openedAtSeq: 1 }, createdAtSeq: 1 }), status: "SUCCEEDED" as const };
+    const acc1: AcceptedResult = { ...accepted, inputBindingDigest: attempt.inputBindingDigest };
+    let s = commit(initialLogState(), 0, [ch({ put: "accepted", accepted: acc1 }, "op1")]).state;
+    // Before supersede: C is current.
+    const projected = (st: typeof s): AcceptedResult[] => Object.values(liveEntities(st)).flatMap((b) => (b.put === "accepted" ? [b.accepted] : []));
+    expect(currentAccepted("C", { plan: plan.plan, attempts: [attempt], acceptedResults: projected(s) })?.acceptedResultId).toBe(acc1.acceptedResultId);
+    // After supersede: projected accepted has superseded:true -> currentAccepted null.
+    s = commit(s, 1, [ch({ put: "supersede", acceptedResultId: acc1.acceptedResultId }, "op2", 1)]).state;
+    expect(currentAccepted("C", { plan: plan.plan, attempts: [attempt], acceptedResults: projected(s) })).toBeNull();
   });
 });
 
