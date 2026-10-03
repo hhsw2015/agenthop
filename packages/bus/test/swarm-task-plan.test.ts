@@ -175,3 +175,31 @@ describe("digests — canonical, deterministic, content-addressed", () => {
     if (r.ok) expect(r.plan.planDigest).toBe(computePlanDigest(r.plan));
   });
 });
+
+describe("Codex re-review fixes", () => {
+  test("(f) omitted retryBudget defaults to 2 (§2.1); explicit invalid still rejected", () => {
+    const s = spec(); delete (s as Record<string, unknown>).retryBudget;
+    const r = loadPlan(plan([s]));
+    expect(r.ok && r.plan.nodes[0]!.retryBudget === 2).toBe(true);
+    expect(loadPlan(plan([spec({ retryBudget: -1 })])).ok).toBe(false);
+  });
+  test("(g) the loaded plan shares no mutable reference with the input (mutating input args does not change it)", () => {
+    const args = { threshold: 1 };
+    const input = plan([spec({ acceptance: [{ check: "lint", args }] })]);
+    const r = loadPlan(input);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      const before = r.plan.planDigest;
+      args.threshold = 999; // mutate the caller's object AFTER load
+      expect((r.plan.nodes[0]!.acceptance[0]!.args as { threshold: number }).threshold).toBe(1); // unchanged
+      expect(computePlanDigest(r.plan)).toBe(before); // digest stable
+    }
+  });
+  test("(h) a non-finite number in the plan is a whole reject, not a thrown exception", () => {
+    expect(() => {
+      const r = loadPlan(plan([spec({ acceptance: [{ check: "c", args: { x: Infinity } }] })]));
+      expect(r.ok).toBe(false);
+      expect(r.ok === false && /non-finite/.test(r.reason)).toBe(true);
+    }).not.toThrow();
+  });
+});

@@ -144,7 +144,8 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
   if (!isStringArray(o.artifactScope)) return { reason: `${where}.artifactScope must be a string[]` };
   if (o.sourceWriteScope !== undefined && !isStringArray(o.sourceWriteScope)) return { reason: `${where}.sourceWriteScope` };
   if (!isNumAtLeast(o.estimatedRuntimeSec, 0)) return { reason: `${where}.estimatedRuntimeSec` };
-  if (!isIntAtLeast(o.retryBudget, 0)) return { reason: `${where}.retryBudget must be an integer >= 0` };
+  if (o.retryBudget !== undefined && !isIntAtLeast(o.retryBudget, 0)) return { reason: `${where}.retryBudget must be an integer >= 0` };
+  const retryBudget = o.retryBudget === undefined ? 2 : o.retryBudget; // §2.1 "默认 2": omission is legal, explicit invalid is not
   if (o.required !== undefined && typeof o.required !== "boolean") return { reason: `${where}.required must be a boolean` };
   const required = o.required === undefined ? true : o.required;
   if (o.runtime !== undefined && (!isString(o.runtime) || !RUNTIMES.has(o.runtime))) return { reason: `${where}.runtime must be ephemeral|durable` };
@@ -174,7 +175,7 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
     artifactScope: [...o.artifactScope],
     ...(o.sourceWriteScope !== undefined ? { sourceWriteScope: [...(o.sourceWriteScope as string[])] } : {}),
     estimatedRuntimeSec: o.estimatedRuntimeSec,
-    retryBudget: o.retryBudget,
+    retryBudget,
     required,
     runtime,
     ...(o.visibility !== undefined ? { visibility: o.visibility as "visible" | "headless" } : {}),
@@ -239,7 +240,6 @@ export function loadPlan(raw: unknown): LoadResult {
   const cyc = findCycle(specs);
   if (cyc) return { ok: false, reason: `plan has a cycle (through ${cyc})` };
 
-  for (const s of specs) s.specDigest = computeSpecDigest(s);
   const plan: TaskPlan = {
     jobId: o.jobId,
     planRevision: o.planRevision,
@@ -251,6 +251,16 @@ export function loadPlan(raw: unknown): LoadResult {
     },
     planDigest: "",
   };
-  plan.planDigest = computePlanDigest(plan);
-  return { ok: true, plan };
+  // Digests canonicalize the whole spec (including arbitrary acceptance.args), so a non-finite number smuggled in via
+  // JSON.parse("1e400") => Infinity surfaces HERE. loadPlan's contract is "a legal plan or a whole reject" — it must
+  // never throw, so catch it and reject (Codex re-review h).
+  try {
+    for (const s of specs) s.specDigest = computeSpecDigest(s);
+    plan.planDigest = computePlanDigest(plan);
+  } catch {
+    return { ok: false, reason: "non-finite or unserializable value in plan" };
+  }
+  // Deep-clone so the returned plan shares NO mutable reference with the caller's input (acceptance.args etc.): a later
+  // mutation of the input must not change the loaded plan or invalidate its digests (Codex re-review g).
+  return { ok: true, plan: structuredClone(plan) };
 }

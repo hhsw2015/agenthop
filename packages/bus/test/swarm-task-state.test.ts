@@ -177,6 +177,13 @@ describe("advanceAttempt (§3.1)", () => {
   test("revoke illegal from RPV (that is the stale route)", () => {
     expect(advanceAttempt({ ...mkAttempt(), status: "RESULT_PENDING_VALIDATION" }, { type: "revoke", reason: "stale-input" }, 1000).ok).toBe(false);
   });
+  test("conflict (§2.6): RUNNING/RPV/RETRY_WAIT -> FAILED permanent with a note; illegal from a terminal state", () => {
+    for (const status of ["RUNNING", "RESULT_PENDING_VALIDATION", "RETRY_WAIT"] as const) {
+      const r = advanceAttempt({ ...mkAttempt(), status }, { type: "conflict", note: "op digest mismatch" }, 1000);
+      expect(r.ok && r.attempt.status === "FAILED" && r.attempt.failureClass === "permanent" && r.attempt.note === "op digest mismatch").toBe(true);
+    }
+    expect(advanceAttempt({ ...mkAttempt(), status: "SUCCEEDED" }, { type: "conflict" }, 1000).ok).toBe(false);
+  });
 });
 
 describe("handoff continuation (X2, §3.2) — T1 acceptance", () => {
