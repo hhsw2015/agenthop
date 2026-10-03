@@ -19,8 +19,8 @@
 //      SWARM_HANDOFF_LEAD_SEC (180), SWARM_LAUNCH (scripts/swarm-launch.sh), AH_HOME, SWARM_SELF.
 
 import { spawn } from "node:child_process";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync, statSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync, statSync, unlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomBytes } from "node:crypto";
@@ -28,6 +28,13 @@ import { type ControlRecord, PROVIDER_LIFETIME_SEC } from "../packages/bus/src/s
 import { parseManifest } from "../packages/bus/src/swarm/manifest.js";
 import { type ObservedTip, tipToEvent } from "../packages/bus/src/swarm/acceptance.js";
 import { type HandoffOps, handoffStep } from "../packages/bus/src/swarm/dispatch-step.js";
+import { loadControlLog, commitControl } from "../packages/bus/src/swarm/control-store.js";
+import { entityKeyOf, type ChangeBody, type CommitResult, type LogState } from "../packages/bus/src/swarm/control-log.js";
+import { loadPlan, type TaskPlan, type TaskSpec } from "../packages/bus/src/swarm/task-plan.js";
+import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/task-state.js";
+import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
+import { taskPass, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
+import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
 const MIRROR_DIR = path.join(HOME, ".agenthop", "swarm", "control");
@@ -49,6 +56,16 @@ const SWARM_TEAM = process.env.SWARM_TEAM || "";
 // lifecycle record (drain/expire/milestone/checkpoint) to the mirror, but allocates no VM until SWARM_EXEC=1.
 // Only explicit enabling values count — `!!"0"`/`!!"false"` are truthy, so SWARM_EXEC=0 must NOT enable (Codex P1).
 const EXEC_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_EXEC ?? "");
+
+// --- business-task layer (brain §4.5). The control-log is authoritative for the task axis (intents/attempts/accepted);
+// the per-record mirror above stays the LIFECYCLE axis for now (its migration to commitControl is a separate step). The
+// task pass runs only with a plan AND SWARM_TASK_EXEC (it allocates real boxes + mints CPA tokens — opt-in like SWARM_EXEC).
+const CONTROL_LOG_DIR = path.join(HOME, ".agenthop", "swarm", "control-log");
+const PLAN_FILE = process.env.SWARM_PLAN || "";
+const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
+const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
+const CHECKPOINT_BUDGET_SEC = Number(process.env.SWARM_CHECKPOINT_BUDGET_SEC || "300");
+const TOKEN_MARGIN_SEC = Number(process.env.SWARM_TOKEN_MARGIN_SEC || "300");
 
 function log(m: string): void { console.error(`[dispatch ${SELF}] ${m}`); }
 function nowSec(): number { return Math.floor(Date.now() / 1000); }
@@ -269,15 +286,136 @@ function buildOps(): HandoffOps {
   };
 }
 
+// --- business-task IO (the real TaskOps wired to git / mint / scp / swarm-launch / swarm-task + the control-log) ---
+
+/** Stamp operationId (= entityKey#targetRev, deterministic + replay-idempotent) + expectedEntityRevision, persist. */
+function commitTask(state: LogState, bodies: ChangeBody[]): { state: LogState; result: CommitResult } {
+  const changes = bodies.map((b) => {
+    const key = entityKeyOf(b);
+    const rev = state.revisions[key] ?? 0;
+    return { ...b, operationId: `${key}#${rev + 1}`, expectedEntityRevision: rev };
+  });
+  const r = commitControl(CONTROL_LOG_DIR, state, changes);
+  return { state: r.state, result: r.result };
+}
+
+function loadPlanFile(): TaskPlan | null {
+  if (!PLAN_FILE) return null;
+  try {
+    const res = loadPlan(JSON.parse(readFileSync(PLAN_FILE, "utf8")));
+    if (!res.ok) { log(`plan ${PLAN_FILE}: ${res.reason}`); return null; }
+    return res.plan;
+  } catch (e) { log(`plan read ${PLAN_FILE}: ${e instanceof Error ? e.message : e}`); return null; }
+}
+
+// O1: observe a binding's WORK branch tip for a result.json candidate. Reads the pinned sha, the result blob + its
+// referenced output blobs (closure), the tip's changed paths. T1 scope: no patch (patchAppliesClean true) and acceptance
+// runs only when empty (real acceptance-command execution on the dispatcher is T2); cumulative scope is the tip commit.
+async function observeGitFor(a: { attempt: TaskAttempt; spec: TaskSpec; binding: ExecutionBinding }): Promise<GitFacts | null> {
+  if (!WORK_REPO) return null;
+  const branch = `swarm/${a.binding.launchId}-g${a.binding.publishGeneration}`;
+  const scratch = scratchPath(a.binding.launchId);
+  const ls = await git(["ls-remote", WORK_REPO, `refs/heads/${branch}`]);
+  if (ls.code !== 0) return null;
+  const sha = ls.stdout.split(/\s+/)[0]?.trim();
+  if (!sha) return null;
+  mkdirSync(scratch, { recursive: true });
+  if (!existsSync(path.join(scratch, "HEAD"))) await git(["init", "-q", "--bare", scratch]);
+  const fetch = await git(["fetch", "-q", WORK_REPO, sha], { cwd: scratch });
+  if (fetch.code !== 0) {
+    const fb = await git(["fetch", "-q", WORK_REPO, `refs/heads/${branch}:refs/heads/${branch}`], { cwd: scratch });
+    if (fb.code !== 0) return null;
+  }
+  const resultPath = `out/results/${a.attempt.attemptId}/result.json`;
+  const show = await git(["show", `${sha}:${resultPath}`], { cwd: scratch });
+  if (show.code !== 0) return null; // no result.json published yet
+  const resultText = show.stdout;
+  const blobRev = await git(["rev-parse", `${sha}:${resultPath}`], { cwd: scratch });
+  const resultBlobOid = blobRev.code === 0 ? blobRev.stdout.trim() : "";
+  let outputs: Array<{ path?: unknown }> = [];
+  try { const r = JSON.parse(resultText) as { outputs?: unknown }; if (Array.isArray(r.outputs)) outputs = r.outputs as Array<{ path?: unknown }>; } catch { /* V1 will reject below */ }
+  const closureFiles: Array<{ path: string; blobOid: string }> = [];
+  for (const o of outputs) {
+    if (!o || typeof o.path !== "string") continue;
+    const rp = await git(["rev-parse", `${sha}:${o.path}`], { cwd: scratch });
+    if (rp.code === 0) closureFiles.push({ path: o.path, blobOid: rp.stdout.trim() });
+  }
+  const dt = await git(["diff-tree", "--no-commit-id", "--name-only", "-r", sha], { cwd: scratch });
+  const cumulativeChangedPaths = dt.code === 0 ? dt.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+  const declaredPaths = outputs.filter((o) => typeof o.path === "string").map((o) => o.path as string);
+  const requiredOutputsPresent = declaredPaths.length === 0 ? true : declaredPaths.every((p) => closureFiles.some((c) => c.path === p));
+  return {
+    observedWorkCommit: sha, resultText, resultBlobOid, closureFiles, cumulativeChangedPaths,
+    contract: { requiredOutputsPresent, patchAppliesClean: true }, // T1: no patch node; V7 git-apply-check is T2
+    acceptancePassed: a.spec.acceptance.length === 0, // T1: empty acceptance passes; real check execution is T2
+    withinCutoffAncestry: true, // open binding ignores this in validateResult
+  };
+}
+
+// startTask IO: mint the CPA token, write assignment.json + worker-env as 0600 temp files, swarm-launch allocate-only,
+// then (only if created) fire swarm-task --task. The token rides a FILE (never argv — §4.5-3).
+async function startTaskIO(a: { assignment: Assignment; launchId: string }): Promise<"created" | "clean-fail" | "unknown"> {
+  let token = "";
+  try { token = mintEphToken({ sub: a.launchId, ttlSec: VM_LIFETIME_SEC, secret: readEphSecret() }); }
+  catch (e) { log(`startTask ${a.launchId}: token mint failed (worker will have no CPA token): ${e instanceof Error ? e.message : e}`); }
+  const dir = mkdtempSync(path.join(tmpdir(), "ah-task-"));
+  const asgPath = path.join(dir, "assignment.json");
+  const envPath = path.join(dir, "worker-env");
+  try {
+    writeFileSync(asgPath, JSON.stringify(a.assignment), { mode: 0o600 });
+    if (token && CPA_BASE_URL) {
+      const sq = (v: string) => v.replace(/'/g, "'\\''");
+      writeFileSync(envPath, `export ANTHROPIC_BASE_URL='${sq(CPA_BASE_URL)}'\nexport ANTHROPIC_AUTH_TOKEN='${sq(token)}'\n`, { mode: 0o600 });
+    }
+    const alloc = await runScript(SWARM_LAUNCH, ["claude", SWARM_TEAM, "new"], { AGENTHOP_ALLOCATE_ONLY: "1", AGENTHOP_LAUNCH_ID: a.launchId });
+    const outcome: "created" | "clean-fail" | "unknown" = alloc.code === 0 ? "created" : alloc.code === 3 ? "clean-fail" : "unknown";
+    if (outcome === "created") {
+      const env: Record<string, string> = { SWARM_ASSIGNMENT: asgPath };
+      if (token && CPA_BASE_URL) env.SWARM_WORKER_ENV = envPath;
+      if (WORK_REPO) env.SWARM_WORK_REPO = repoSlug(WORK_REPO);
+      const t = await runScript(SWARM_TASK, [a.launchId, "--task"], env);
+      if (t.code !== 0) log(`startTask ${a.launchId}: swarm-task --task exit ${t.code}: ${(t.stderr || t.stdout).trim().slice(0, 200)}`);
+    }
+    return outcome;
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+}
+
+function buildTaskOps(stateRef: { s: LogState }): TaskOps {
+  return {
+    nowSec, cap: CAP, budgetSec: BUDGET_SEC, remainingLifeSec: VM_LIFETIME_SEC,
+    checkpointBudgetSec: CHECKPOINT_BUDGET_SEC, handoffMarginSec: HANDOFF_LEAD_SEC, tokenMarginSec: TOKEN_MARGIN_SEC,
+    jitterSec: () => 0, // deterministic (single-node T1; a non-zero thundering-herd jitter is sampled+persisted at T2)
+    newLaunchId: () => `rw-${randomBytes(4).toString("hex")}`,
+    loadState: () => stateRef.s,
+    commit: (state, bodies) => { const r = commitTask(state, bodies); stateRef.s = r.state; return r; },
+    observeGit: observeGitFor,
+    startTask: startTaskIO,
+    log,
+  };
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv[0] === "--observe-once") { await observeOnce(argv.slice(1)); return; }
 
-  log(`single-active dispatcher up (cap=${CAP}, budget=${BUDGET_SEC}s, workRepo=${WORK_REPO || "<unset>"}, exec=${EXEC_ENABLED})`);
+  const plan = loadPlanFile();
+  const taskOn = plan !== null && TASK_EXEC;
+  log(`single-active dispatcher up (cap=${CAP}, budget=${BUDGET_SEC}s, workRepo=${WORK_REPO || "<unset>"}, exec=${EXEC_ENABLED}, task=${taskOn ? `on:${plan!.jobId}` : "off"})`);
   const records = loadMirror();
   const ops = buildOps();
+  const taskStateRef = { s: loadControlLog(CONTROL_LOG_DIR) };
+  const taskOps = buildTaskOps(taskStateRef);
   for (;;) {
     try { await pass(records, ops); } catch (e) { log(`pass error: ${e instanceof Error ? e.message : e}`); }
+    // The business-task pass runs AFTER the lifecycle handoff pass (§4.5: handoff advances lifecycle, then task pass
+    // observes/accepts/dispatches). Gated on a plan + SWARM_TASK_EXEC (allocates boxes). Reloads the log each round so a
+    // crash-restart picks up where it left off.
+    if (plan && taskOn) {
+      try { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
+      catch (e) { log(`taskPass error: ${e instanceof Error ? e.message : e}`); }
+    }
     await new Promise((res) => setTimeout(res, 5000));
   }
 }
