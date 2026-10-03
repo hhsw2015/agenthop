@@ -1,0 +1,124 @@
+import { describe, expect, test } from "vitest";
+import {
+  initialLogState,
+  commit,
+  replayLog,
+  liveEntities,
+  entityKeyOf,
+  type Change,
+  type ChangeBody,
+  type DispatchIntent,
+  type CommittedBatch,
+} from "../src/swarm/control-log.js";
+import type { ControlRecord } from "../src/swarm/control.js";
+
+function ch(body: ChangeBody, operationId: string, expectedEntityRevision = 0): Change {
+  return { ...body, operationId, expectedEntityRevision } as Change;
+}
+const scan = (branch: string, cursor: string | null): ChangeBody => ({ put: "scan", branch, cursor });
+const rec = (launchId: string): ControlRecord => ({ launchId, state: "RUNNING", generation: 0, allocStart: 0, budgetSec: 3480, updatedAt: 0 });
+const intent: DispatchIntent = { intentId: "as1", attemptId: "job/P/a1", nodeId: "P", launchId: "rw-1", bindingId: "job/P/a1/b0", assignmentDigest: "ad", allocRequestStartSec: 100, workDeadlineSec: 200, allocOutcome: "pending", status: "pending" };
+
+describe("commit — basics", () => {
+  test("empty batch rejected", () => {
+    expect(commit(initialLogState(), 0, []).result).toEqual({ ok: false, reason: "batch", detail: "empty batch" });
+  });
+  test("a new change applies: seq +1, entity revision 1, projected", () => {
+    const { result, state } = commit(initialLogState(), 0, [ch(scan("b1", null), "op1")]);
+    expect(result).toEqual({ ok: true, newSeq: 1, replay: false });
+    expect(state.seq).toBe(1);
+    expect(state.revisions["scan:b1"]).toBe(1);
+    expect(state.entities["scan:b1"]).toEqual(scan("b1", null));
+  });
+  test("intent change keys to intent:<id> and projects", () => {
+    const { state } = commit(initialLogState(), 0, [ch({ put: "intent", intent }, "opI")]);
+    expect(state.entities["intent:as1"]).toBeDefined();
+    expect(entityKeyOf({ put: "intent", intent })).toBe("intent:as1");
+  });
+});
+
+describe("decision order (Codex §2.6 v2; fe0376cd traps)", () => {
+  test("REPLAY (same opId, same digest) is a no-op — and precedes the seq check", () => {
+    const s1 = commit(initialLogState(), 0, [ch(scan("b1", null), "op1")]).state;
+    // Re-submit the SAME op with a STALE expectedSeq (0, but state.seq is 1): still a replay, not a seq conflict.
+    const again = commit(s1, 0, [ch(scan("b1", null), "op1")]);
+    expect(again.result).toEqual({ ok: true, newSeq: 1, replay: true });
+    expect(again.state.seq).toBe(1); // no double-apply
+    expect(again.state.revisions["scan:b1"]).toBe(1);
+  });
+  test("REPLAY precedes the expectedEntityRevision check (crash-recovery resend after the entity advanced)", () => {
+    let s = commit(initialLogState(), 0, [ch(scan("b1", null), "op1", 0)]).state; // rev 1
+    s = commit(s, 1, [ch(scan("b1", "c1"), "op2", 1)]).state; // scan:b1 now rev 2
+    // Re-submit op1 (expectedEntityRevision 0) — revision is now 2, but replay must win, NOT stale-entity.
+    const replay = commit(s, 99, [ch(scan("b1", null), "op1", 0)]);
+    expect(replay.result).toEqual({ ok: true, newSeq: 2, replay: true });
+  });
+  test("OP-CONFLICT (same opId, different digest) freezes the entity; no latest-wins", () => {
+    const s1 = commit(initialLogState(), 0, [ch(scan("b1", null), "op1")]).state;
+    const conflict = commit(s1, 1, [ch(scan("b1", "DIFFERENT"), "op1")]);
+    expect(conflict.result).toEqual({ ok: false, reason: "op-conflict", operationId: "op1", entityKey: "scan:b1" });
+    expect(conflict.state.frozen).toContain("scan:b1");
+    // a subsequent new op on the frozen entity is refused
+    const after = commit(conflict.state, conflict.state.seq, [ch(scan("b1", "c2"), "op9", 1)]);
+    expect(after.result.ok).toBe(false);
+    expect(after.result.ok === false && after.result.reason === "batch").toBe(true);
+  });
+  test("stale expectedEntityRevision (new op) is NOT a conflict — caller recomputes", () => {
+    const s1 = commit(initialLogState(), 0, [ch(scan("b1", null), "op1", 0)]).state; // rev 1
+    const stale = commit(s1, 1, [ch(scan("b1", "c2"), "op2", 0)]); // expected 0 but current 1
+    expect(stale.result).toEqual({ ok: false, reason: "stale-entity", entityKey: "scan:b1", currentRevision: 1 });
+    expect(stale.state).toBe(s1); // unchanged
+  });
+  test("expectedSeq mismatch (all-new batch) returns the current seq", () => {
+    const s1 = commit(initialLogState(), 0, [ch(scan("b1", null), "op1")]).state; // seq 1
+    const bad = commit(s1, 0, [ch(scan("b2", null), "op2")]);
+    expect(bad.result).toEqual({ ok: false, reason: "seq", currentSeq: 1 });
+  });
+});
+
+describe("batch group-atomicity", () => {
+  test("same entity put twice in one batch rejected (caller bug)", () => {
+    const bad = commit(initialLogState(), 0, [ch(scan("b1", null), "op1"), ch(scan("b1", "c"), "op2")]);
+    expect(bad.result.ok).toBe(false);
+    expect(bad.result.ok === false && /twice/.test((bad.result as { detail?: string }).detail ?? "")).toBe(true);
+  });
+  test("a batch where any change fails applies NOTHING", () => {
+    const batch = [ch(scan("b2", null), "op2", 0), ch(scan("b3", null), "op3", 5)]; // op3 expects rev 5, actual 0
+    const out = commit(initialLogState(), 0, batch);
+    expect(out.result.ok === false && out.result.reason === "stale-entity").toBe(true);
+    expect(out.state.entities["scan:b2"]).toBeUndefined(); // first change NOT applied
+    expect(out.state.seq).toBe(0);
+  });
+});
+
+describe("replayLog (projection rebuild / crash recovery)", () => {
+  test("folds an ordered log back into the same state as sequential commits", () => {
+    let s = initialLogState();
+    const batches: CommittedBatch[] = [];
+    const b1 = [ch(scan("b1", null), "op1")];
+    s = commit(s, 0, b1).state; batches.push({ seq: 1, changes: b1 });
+    const b2 = [ch(scan("b1", "c1"), "op2", 1), ch({ put: "lifecycle", record: rec("L") }, "op3", 0)];
+    s = commit(s, 1, b2).state; batches.push({ seq: 2, changes: b2 });
+    const rebuilt = replayLog(batches);
+    expect(rebuilt.seq).toBe(s.seq);
+    expect(rebuilt.revisions).toEqual(s.revisions);
+    expect(rebuilt.entities).toEqual(s.entities);
+  });
+  test("a seq gap throws", () => {
+    expect(() => replayLog([{ seq: 2, changes: [ch(scan("b1", null), "op1")] }])).toThrow();
+  });
+});
+
+describe("tombstone (§4.3)", () => {
+  test("liveEntities drops a tombstoned lifecycle record and the tombstone marker", () => {
+    let s = commit(initialLogState(), 0, [ch({ put: "lifecycle", record: rec("L") }, "op1")]).state;
+    s = commit(s, 1, [ch({ put: "tombstone", launchId: "L" }, "op2")]).state;
+    const live = liveEntities(s);
+    expect(live["lifecycle:L"]).toBeUndefined();
+    expect(live["tombstone:L"]).toBeUndefined();
+  });
+  test("a non-tombstoned lifecycle record stays live", () => {
+    const s = commit(initialLogState(), 0, [ch({ put: "lifecycle", record: rec("M") }, "op1")]).state;
+    expect(liveEntities(s)["lifecycle:M"]).toBeDefined();
+  });
+});
