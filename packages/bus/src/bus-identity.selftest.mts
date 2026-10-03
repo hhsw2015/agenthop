@@ -70,6 +70,18 @@ const hard = (value: string, form: Claim["form"]): Claim => ({ value, form, conf
   t("a guessed native is possible, does NOT merge R into the hard-A entity", entOfR !== entOfA || entOfA === "many");
 }
 
+// --- P1-2: a CORRECTION revokes the guessed value's resolvable association (§2.3) ---
+{
+  const ev: IdentityEvent[] = [
+    obs("R", [hard("R", "run")], { busPid: 9, cwd: "/q", ts: 1 }),
+    { v: 1, eventId: "lg", ts: 2, type: "learn", incarnationKey: "R", to: "Aguess", form: "native", kind: "bootstrap", authoritative: false },
+    { v: 1, eventId: "lc", ts: 3, type: "learn", incarnationKey: "R", from: "Aguess", to: "Btrue", form: "native", kind: "correction", authoritative: true },
+  ];
+  const proj = buildProjection(ev);
+  t("the corrected guess no longer resolves", whois(proj, "Aguess").kind === "not-seen");
+  t("the authoritative corrected value resolves", whois(proj, "Btrue").kind === "entity");
+}
+
 // --- revoke withdraws a claim from resolution ---
 {
   const ev: IdentityEvent[] = [

@@ -215,12 +215,20 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
     }
   }
 
-  // Build the revoked (value,form) set from revoked observe/learn events.
+  // Build the revoked (value,form) set.
   const revoked = new Set<string>();
+  //  - explicit revoke events
   for (const e of events) {
     if (!revokedEventIds.has(e.eventId)) continue;
     if (e.type === "observe") for (const c of e.incarnation.claims) revoked.add(`${c.value}\u0000${c.form}`);
     else if (e.type === "learn") revoked.add(`${e.to}\u0000${e.form}`);
+  }
+  //  - a CORRECTION of a guess revokes the guessed value's resolvable association (design §2.3): the
+  //    daemon guessed `from`, authoritative metadata later proved `to`; the guess must stop resolving, not
+  //    be left as a live `possible` alias. No eventId bookkeeping needed at the call site — the correction
+  //    event names the superseded value.
+  for (const e of events) {
+    if (e.type === "learn" && e.kind === "correction" && e.from) revoked.add(`${e.from}\u0000${e.form}`);
   }
 
   // 2. Merge incarnations into entities, ONLY on a shared HARD native claim, and NOT across a collision.
