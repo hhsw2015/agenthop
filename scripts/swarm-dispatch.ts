@@ -37,12 +37,16 @@ import { taskPass, type TaskOps, type GitFacts } from "../packages/bus/src/swarm
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
+import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
 import { fileIsAlive, resolveSession, listSessions, makeFileLiveness } from "../packages/bus/src/swarm/task-liveness.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox } from "../packages/bus/src/inbox.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
 const MIRROR_DIR = path.join(HOME, ".agenthop", "swarm", "control");
+// Single-active-dispatcher lock (P2-1): one sweep/writer in flight at a time (a 2nd dispatcher or an overlapping
+// --sweep-once would double-deliver + overwrite same-seq batches).
+const DISPATCHER_LOCK = path.join(HOME, ".agenthop", "swarm", "dispatcher.lock");
 const KEYDIR_GLOB = "/tmp"; // throwaway keydirs live at /tmp/ah-rwkey-rw-*
 const SELF = process.env.SWARM_SELF || `disp-${process.pid}`;
 const CAP = Number(process.env.SWARM_CAP || "3");
@@ -395,20 +399,41 @@ function buildTaskOps(stateRef: { s: LogState }, planCommittedAtSec: number): Ta
   };
 }
 
-// Seed the control-log with migrated {put:"wait"} entries (the coordinator's real waits) once, if absent (first input).
+// A seed WaitRecord must carry every field the sweep later dereferences. A malformed entry (e.g. missing owner) must NOT
+// reach the log: it would commit once, then crash resolveSession on EVERY tick (owner.slice on undefined), starving all
+// later valid waits, and the seed can't self-heal (revision exists) — a permanent poison (P2-5). Validate BEFORE commit;
+// accept a bare WaitRecord or a {put:"wait",wait} wrapper; reject + report bad entries in isolation (one bad entry never
+// blocks the good ones). Returns the validated WaitRecord or a reason string.
+function validSeedWait(raw: Record<string, unknown>): WaitRecord | string {
+  const w = (raw.put === "wait" && raw.wait ? raw.wait : raw) as Record<string, unknown>;
+  const str = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+  if (!str(w.waitId)) return "missing/invalid waitId";
+  if (w.kind !== "wait" && w.kind !== "approval") return `bad kind ${String(w.kind)}`;
+  const subj = w.subject as Record<string, unknown> | undefined;
+  if (typeof subj !== "object" || subj === null || !str(subj.jobId)) return "missing subject.jobId";
+  if (w.state !== "open" && w.state !== "action_pending" && w.state !== "resolved") return `bad state ${String(w.state)}`;
+  if (typeof w.deadlineSec !== "number" || !Number.isFinite(w.deadlineSec)) return "missing/invalid deadlineSec";
+  if (!str(w.owner)) return "missing/invalid owner";
+  if (w.timeoutPolicy !== "bypass" && w.timeoutPolicy !== "escalate") return `bad timeoutPolicy ${String(w.timeoutPolicy)}`;
+  return w as unknown as WaitRecord;
+}
+
+// Seed the control-log with migrated wait entities (the coordinator's real waits) once, if absent (first input).
 function loadWaitSeed(stateRef: { s: LogState }): void {
   if (!WAIT_SEED_FILE) return;
-  try {
-    const entries = JSON.parse(readFileSync(WAIT_SEED_FILE, "utf8")) as Array<Record<string, unknown>>;
-    for (const raw of entries) {
-      // Accept either a bare WaitRecord or a {put:"wait", wait} wrapper.
-      const wait = (raw.put === "wait" && raw.wait ? raw.wait : raw) as WaitRecord;
-      if (!wait?.waitId) continue;
-      if (stateRef.s.revisions[`wait:${wait.waitId}`] !== undefined) continue; // already in the log
-      stateRef.s = commitTask(stateRef.s, [{ put: "wait", wait }]).state;
-      log(`wait seed: loaded ${wait.waitId} (owner ${wait.owner})`);
-    }
-  } catch (e) { log(`wait seed ${WAIT_SEED_FILE}: ${e instanceof Error ? e.message : e}`); }
+  let entries: unknown;
+  try { entries = JSON.parse(readFileSync(WAIT_SEED_FILE, "utf8")); }
+  catch (e) { log(`wait seed ${WAIT_SEED_FILE}: unreadable/invalid JSON — ignored: ${e instanceof Error ? e.message : e}`); return; }
+  if (!Array.isArray(entries)) { log(`wait seed ${WAIT_SEED_FILE}: not a JSON array — ignored`); return; }
+  for (const raw of entries as Array<Record<string, unknown>>) {
+    const v = validSeedWait(raw);
+    if (typeof v === "string") { log(`wait seed: REJECTED entry (${v}) — not committed`); continue; } // bad entry isolated
+    if (stateRef.s.revisions[`wait:${v.waitId}`] !== undefined) continue; // already in the log
+    const r = commitTask(stateRef.s, [{ put: "wait", wait: v }]);
+    if (!r.result.ok) { log(`wait seed ${v.waitId}: commit rejected (${r.result.reason}) — not loaded`); continue; } // P1-1: only log loaded on success
+    stateRef.s = r.state;
+    log(`wait seed: loaded ${v.waitId} (owner ${v.owner})`);
+  }
 }
 
 function buildSweepOps(stateRef: { s: LogState }): SweepOps {
@@ -449,13 +474,26 @@ async function main(): Promise<void> {
   // --sweep-once: seed waits, run ONE sweep pass, print the resulting live waits, exit (deterministic validation — the
   // "first real wait handled" milestone without the infinite loop; mirrors --observe-once).
   if (argv[0] === "--sweep-once") {
-    const ref = { s: loadControlLog(CONTROL_LOG_DIR) };
-    loadWaitSeed(ref);
-    await sweepPass(buildSweepOps(ref));
-    const live = Object.values(liveEntities(ref.s)).filter((b) => b.put === "wait").map((b) => (b as { wait: WaitRecord }).wait);
-    console.log(JSON.stringify({ seq: ref.s.seq, liveWaits: live.map((w) => ({ waitId: w.waitId, state: w.state, owner: w.owner, resolution: w.resolution })) }, null, 2));
+    mkdirSync(path.dirname(DISPATCHER_LOCK), { recursive: true });
+    const release = acquireSingleFlight(DISPATCHER_LOCK); // P2-1: never overlap a live dispatcher's sweep
+    if (!release) { log("--sweep-once: a dispatcher holds the single-flight lock — skipping (no concurrent sweep)"); return; }
+    try {
+      const ref = { s: loadControlLog(CONTROL_LOG_DIR) };
+      loadWaitSeed(ref);
+      await sweepPass(buildSweepOps(ref));
+      const live = Object.values(liveEntities(ref.s)).filter((b) => b.put === "wait").map((b) => (b as { wait: WaitRecord }).wait);
+      console.log(JSON.stringify({ seq: ref.s.seq, liveWaits: live.map((w) => ({ waitId: w.waitId, state: w.state, owner: w.owner, resolution: w.resolution })) }, null, 2));
+    } finally { release(); }
     return;
   }
+
+  // Single-active-dispatcher guard (P2-1): refuse to start a second concurrent dispatcher (double delivery + same-seq
+  // overwrite). The lock is held for the whole process and released on exit/signal.
+  mkdirSync(path.dirname(DISPATCHER_LOCK), { recursive: true });
+  const releaseLock = acquireSingleFlight(DISPATCHER_LOCK);
+  if (!releaseLock) { log("dispatcher: another active dispatcher holds the single-flight lock — refusing to start a second"); return; }
+  process.on("exit", () => releaseLock());
+  for (const sig of ["SIGTERM", "SIGINT"] as const) process.on(sig, () => { releaseLock(); process.exit(0); });
 
   const plan = loadPlanFile();
   const taskOn = plan !== null && TASK_EXEC;
