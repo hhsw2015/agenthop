@@ -1,48 +1,72 @@
 import { describe, expect, test } from "vitest";
-import { fileIsAlive, resolveSession, type LivenessIO } from "../src/swarm/task-liveness.js";
+import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileIsAlive, resolveSession, makeFileLiveness, listSessions, type LivenessIO } from "../src/swarm/task-liveness.js";
 
 /**
- * Two-evidence liveness (§0b R2 §4, F17 code-ification). Both faces required; a single face / single tick never convicts.
+ * File liveness (§0b R2, TEMP sweep-side; bus-identity replaces it). Codex review fixes pinned here:
+ *  - P1-4/P2-2: status AGE is NOT a heartbeat (event-driven) and is not read; pid + signal 0 only; never convict on a
+ *    weak signal (F17) — no pid ⇒ suspected (not dead), EPERM ⇒ alive (exists), only ESRCH ⇒ dead, other errno ⇒ suspected.
+ *  - P2-3/F16: resolveSession demands a UNIQUE match; ambiguous short-id ⇒ null (never guess which session = misrouted inbox).
  */
 
 const io = (over: Partial<LivenessIO>): LivenessIO => ({
   readPid: () => 123,
-  procAlive: () => true,
-  latestStatus: () => ({ state: "working", seq: 10_000 }),
-  nowMs: () => 10_050,
+  procAlive: () => "alive",
   ...over,
 });
-const STALE = 120_000;
 
-describe("fileIsAlive — two-evidence consensus", () => {
-  test("pid alive + fresh working/idle ⇒ alive", () => {
-    expect(fileIsAlive("s", io({ latestStatus: () => ({ state: "working", seq: 10_000 }), nowMs: () => 10_050 }), STALE)).toBe("alive");
-    expect(fileIsAlive("s", io({ latestStatus: () => ({ state: "idle", seq: 10_000 }), nowMs: () => 10_050 }), STALE)).toBe("alive");
+describe("fileIsAlive — pid + signal 0 only; status age never downgrades (P1-4), weak signal never convicts (F17/P2-2)", () => {
+  test("pid present + process alive ⇒ alive (no status consulted — a silent healthy session stays alive)", () => {
+    expect(fileIsAlive("s", io({}))).toBe("alive");
   });
-  test("no pid file ⇒ dead", () => {
-    expect(fileIsAlive("s", io({ readPid: () => null }), STALE)).toBe("dead");
+  test("no presence pid ⇒ suspected, NOT dead (bus-not-visible / daemon absent ≠ session died — P2-2)", () => {
+    expect(fileIsAlive("s", io({ readPid: () => null }))).toBe("suspected");
   });
-  test("pid file present but process gone (kill -0 fails) ⇒ dead — the FILE is not proof (F17 corpse)", () => {
-    expect(fileIsAlive("s", io({ readPid: () => 123, procAlive: () => false }), STALE)).toBe("dead");
+  test("signal 0 ⇒ ESRCH (no such process) ⇒ dead (the one strong death signal)", () => {
+    expect(fileIsAlive("s", io({ procAlive: () => "dead" }))).toBe("dead");
   });
-  test("pid alive but NEVER wrote a status ⇒ suspected, not dead (defect ②)", () => {
-    expect(fileIsAlive("s", io({ latestStatus: () => null }), STALE)).toBe("suspected");
+  test("signal 0 ⇒ EPERM (process exists, not ours to signal) ⇒ alive, not dead (EPERM ≠ ESRCH — P2-2)", () => {
+    // makeFileLiveness maps EPERM → "alive"; at the decision layer that is simply procAlive="alive".
+    expect(fileIsAlive("s", io({ procAlive: () => "alive" }))).toBe("alive");
   });
-  test("pid alive but status stale ⇒ suspected (process up, no heartbeat — maybe stuck; one tick never convicts)", () => {
-    expect(fileIsAlive("s", io({ latestStatus: () => ({ state: "working", seq: 10_000 }), nowMs: () => 10_000 + STALE + 1 }), STALE)).toBe("suspected");
-  });
-  test("pid alive + fresh but a non-active state ⇒ suspected (only working/idle is alive)", () => {
-    expect(fileIsAlive("s", io({ latestStatus: () => ({ state: "blocked", seq: 10_000 }), nowMs: () => 10_050 }), STALE)).toBe("suspected");
+  test("signal 0 ⇒ any other errno ⇒ suspected (unknown — leave for investigation, never dead; F17)", () => {
+    expect(fileIsAlive("s", io({ procAlive: () => "unknown" }))).toBe("suspected");
   });
 });
 
-describe("resolveSession — handle → sessionId by short-id tail (v1)", () => {
+describe("resolveSession — unique match only; ambiguity rejected (F16/P2-3)", () => {
   const ids = ["20cab0a5-b30e-4723-8399", "4fd84f9f-aaaa", "726d408c"];
-  test("matches the handle's tail short-id as a prefix", () => {
-    expect(resolveSession("claude:swarm-brain-io-20cab0a5", ids)).toBe("20cab0a5-b30e-4723-8399");
+  test("exact id match is unambiguous", () => {
     expect(resolveSession("codex:happycapy-726d408c", ids)).toBe("726d408c");
   });
-  test("no match ⇒ null (⇒ treated dead by the caller)", () => {
-    expect(resolveSession("claude:ghost-deadbeef", ids)).toBeNull();
+  test("a unique prefix match resolves", () => {
+    expect(resolveSession("claude:swarm-brain-io-20cab0a5", ids)).toBe("20cab0a5-b30e-4723-8399");
+  });
+  test("ambiguous short-id (two native ids share the prefix) ⇒ null — never guess (F16)", () => {
+    const amb = ["deadbeef-1111", "deadbeef-2222"]; // two different sessions, same 8-hex short id
+    expect(resolveSession("codex:Other-deadbeef", amb)).toBeNull();
+  });
+  test("no match ⇒ null (⇒ caller treats owner as unresolvable/suspected, not dead)", () => {
+    expect(resolveSession("claude:ghost-00000000", ids)).toBeNull();
+  });
+  test("empty tail ⇒ null", () => {
+    expect(resolveSession("nodash", [])).toBe(null); // "nodash" has no '-', tail is the whole string; no match ⇒ null
+  });
+});
+
+describe("makeFileLiveness — real fs/proc binding (status deliberately not read)", () => {
+  test("readPid round-trips a presence file; missing ⇒ null; self pid ⇒ alive", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "liveness-"));
+    mkdirSync(path.join(home, ".agenthop", "presence"), { recursive: true });
+    writeFileSync(path.join(home, ".agenthop", "presence", "sess-1.pid"), `${process.pid}\n`);
+    const io2 = makeFileLiveness(home);
+    expect(io2.readPid("sess-1")).toBe(process.pid);
+    expect(io2.readPid("missing")).toBeNull();
+    expect(io2.procAlive(process.pid)).toBe("alive"); // signal 0 to ourselves succeeds
+    expect(listSessions(home)).toEqual(["sess-1"]);
+    // end-to-end: our own live session reads alive
+    expect(fileIsAlive("sess-1", io2)).toBe("alive");
   });
 });

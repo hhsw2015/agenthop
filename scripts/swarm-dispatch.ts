@@ -75,7 +75,6 @@ const TOKEN_MARGIN_SEC = Number(process.env.SWARM_TOKEN_MARGIN_SEC || "300");
 // inboxes). SWARM_WAIT_SEED = a JSON file of {put:"wait"} entries to seed the control-log (the migrated coordinator waits).
 const SWEEP_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_SWEEP ?? "");
 const WAIT_SEED_FILE = process.env.SWARM_WAIT_SEED || "";
-const SWEEP_STALE_MS = Number(process.env.SWARM_SWEEP_STALE_MS || "120000");
 
 function log(m: string): void { console.error(`[dispatch ${SELF}] ${m}`); }
 function nowSec(): number { return Math.floor(Date.now() / 1000); }
@@ -419,7 +418,8 @@ function buildSweepOps(stateRef: { s: LogState }): SweepOps {
     loadState: () => stateRef.s,
     commit: (state, bodies) => { const r = commitTask(state, bodies); stateRef.s = r.state; return r; },
     // Two-evidence file liveness (task-liveness; bus-identity replaces the impl). An unresolvable owner ⇒ dead.
-    isAlive: (owner) => { const sid = resolveSession(owner, listSessions(HOME)); return sid ? fileIsAlive(sid, liveness, SWEEP_STALE_MS) : "dead"; },
+    // Unresolvable owner (no unique session match, F16) ⇒ suspected, NOT dead (P2-3): bus-not-visible is not a death fact.
+    isAlive: (owner) => { const sid = resolveSession(owner, listSessions(HOME)); return sid ? fileIsAlive(sid, liveness) : "suspected"; },
     // v1: no idle-same-role picker yet (that is the R8 overload rule, next) ⇒ a dead owner is left for escalation.
     pickReassignee: () => null,
     // v1: no validator-roster picker yet (needs bus-identity) ⇒ a stuck/dead RPV validator is left for escalation.
@@ -466,7 +466,7 @@ async function main(): Promise<void> {
   const taskOps = plan ? buildTaskOps(taskStateRef, jobStartSec(plan.jobId)) : null;
   loadWaitSeed(taskStateRef); // seed the migrated coordinator waits (first sweep input), if any
   const sweepOps = buildSweepOps(taskStateRef);
-  if (SWEEP_ENABLED) log(`liveness sweep ON (staleMs=${SWEEP_STALE_MS}${WAIT_SEED_FILE ? `, seed=${WAIT_SEED_FILE}` : ""})`);
+  if (SWEEP_ENABLED) log(`liveness sweep ON${WAIT_SEED_FILE ? ` (seed=${WAIT_SEED_FILE})` : ""}`);
   for (;;) {
     try { await pass(records, ops); } catch (e) { log(`pass error: ${e instanceof Error ? e.message : e}`); }
     // The business-task pass runs AFTER the lifecycle handoff pass (§4.5: handoff advances lifecycle, then task pass

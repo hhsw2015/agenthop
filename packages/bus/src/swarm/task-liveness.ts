@@ -1,53 +1,59 @@
 /**
- * Thin file-based member liveness (team-collab §0b R2 §4) — the FIRST code-ification of F17's two-evidence rule. isAlive
- * needs TWO evidence faces, never one:
- *   face 1 (process):     ~/.agenthop/presence/<sessionId>.pid + `kill -0` (the FILE existing is not proof — F17: it can
- *                         be a corpse; the process must actually answer signal 0).
- *   face 2 (self-report): the newest ~/.agenthop/status/<sessionId>.json.<seq> (seq = a ms timestamp suffix) — its
- *                         freshness + state.
- * Mapping (two-face consensus): pid-alive & fresh & state∈{working,idle} ⇒ alive; pid-alive & stale ⇒ suspected (process
- * up but no heartbeat = maybe stuck on a long action; a SINGLE tick never convicts); no pid / kill -0 fails ⇒ dead.
+ * Thin file-based member liveness (team-collab §0b R2) — the TEMP sweep-side consumer of member liveness; bus-identity's
+ * whois owns the real implementation + the fine-grained "pid alive but truly hung" judgement (its liveness-probe face).
  *
- * TEMPORARY: bus-identity (the formal project) owns the real implementation + its two known defects, which live ONLY
- * here as comments so the sweep doesn't carry them:
- *   defect ① the key is the NATIVE session id, not the bus handle (F18 dual-ID). wait.owner is a handle, so resolveSession
- *     maps handle→sessionId by the handle's short-id tail (v1 peers-roster semantics); a real alias table is bus-identity.
- *   defect ② a session with a pid but that NEVER wrote a status file reads as suspected, not dead (today's roster unknowns).
+ * TEMP RULING (fe0376cd, Codex review P1-4/P2-2): a member's STATUS file (working/idle/blocked) is EVENT-driven — written
+ * on SessionStart/Tool/Stop/… — NOT a periodic heartbeat, and presence's keep-alive timer does not refresh it. So status
+ * AGE is not a liveness signal: a healthy idle/working session can be silent for minutes. Liveness here uses ONLY the
+ * presence pid + signal 0, and never convicts on a weak signal (F17):
+ *   - no presence pid (file missing/unreadable)            ⇒ suspected (bus-not-visible / daemon absent ≠ the session died)
+ *   - signal 0 ⇒ ESRCH (no such process)                   ⇒ dead      (the ONE strong death signal)
+ *   - signal 0 ⇒ ok, or EPERM (exists, not ours to signal) ⇒ alive     (EPERM ≠ ESRCH — the process EXISTS)
+ *   - signal 0 ⇒ any other errno                           ⇒ suspected (unknown — leave for investigation, never dead)
+ * status is NOT read here at all (dropped with P2-4's buggy staging-file reader): working/idle load info, when needed,
+ * comes from the bus-identity roster, not this file. A "suspected" owner is NOT reassigned (only a trustworthy "dead" is);
+ * a to-expire wait under a suspected owner waits for the bus-identity suspected×binding check (future), not a false
+ * conviction.
+ *
+ * bus-identity (the formal project) replaces all of this. Its two known seams live ONLY here as comments:
+ *   defect ① the key is the NATIVE session id, not the bus handle (F18 dual-ID). resolveSession maps handle→sessionId by
+ *     the handle's short-id tail; it demands a UNIQUE match and REJECTS ambiguity (F16 — never guess which session).
+ *   defect ② real whois replaces this pid heuristic with an authoritative liveness probe.
  * All fs/proc access is injected (LivenessIO) so this is unit-tested with fixtures.
  */
 
 export type Liveness = "alive" | "suspected" | "dead";
 
 export type LivenessIO = {
-  /** pid from ~/.agenthop/presence/<sessionId>.pid, or null if the file is missing/unparseable. */
+  /** pid from ~/.agenthop/presence/<sessionId>.pid, or null if the file is missing/unreadable/unparseable. */
   readPid: (sessionId: string) => number | null;
-  /** `kill -0` — true iff that pid is a live process. */
-  procAlive: (pid: number) => boolean;
-  /** The newest status for a session: max-seq ~/.agenthop/status/<sessionId>.json.<seq>, or null if none. */
-  latestStatus: (sessionId: string) => { state: string; seq: number } | null;
-  nowMs: () => number;
+  /** `kill -0` tri-state: "alive" (exists — ok or EPERM), "dead" (ESRCH only), "unknown" (any other errno; F17: don't convict). */
+  procAlive: (pid: number) => "alive" | "dead" | "unknown";
 };
 
-export function fileIsAlive(sessionId: string, io: LivenessIO, staleMs: number): Liveness {
+export function fileIsAlive(sessionId: string, io: LivenessIO): Liveness {
   const pid = io.readPid(sessionId);
-  if (pid === null || !io.procAlive(pid)) return "dead"; // face 1 fails ⇒ no process ⇒ dead
-  const st = io.latestStatus(sessionId);
-  if (st === null) return "suspected"; // pid up but never self-reported (defect ②) — not convicted on one face
-  const fresh = io.nowMs() - st.seq < staleMs;
-  if (fresh && (st.state === "working" || st.state === "idle")) return "alive";
-  return "suspected"; // stale heartbeat, or a non-active fresh state — maybe stuck; a single tick never convicts
+  if (pid === null) return "suspected"; // no presence pid ⇒ bus-not-visible, NOT convicted dead (P2-2/F17)
+  const proc = io.procAlive(pid);
+  if (proc === "dead") return "dead";       // ESRCH — the only strong death signal
+  if (proc === "unknown") return "suspected";
+  return "alive";                           // pid exists; status age is NOT a heartbeat, so it never downgrades (P1-4)
 }
 
-/** Map a bus handle (e.g. "claude:swarm-brain-io-20cab0a5") to a native sessionId among the known ids, by the handle's
- *  short-id tail (v1 peers-roster semantics — a real alias table is bus-identity's job). null = no match (⇒ treated dead).
- *  The tail after the last '-' is the short id; match a sessionId that starts with it. */
+/** Map a bus handle (e.g. "claude:swarm-brain-io-20cab0a5") to a native sessionId. The tail after the last '-' is the
+ *  short id; an EXACT id match wins; otherwise a UNIQUE prefix match; 0 or >1 ⇒ null — ambiguity is REJECTED, never
+ *  guessed (F16: two different handles can share a short-id prefix; guessing misroutes the inbox). bus-identity's alias
+ *  table replaces this. null ⇒ the caller treats the owner as unresolvable (suspected), not dead. */
 export function resolveSession(ownerHandle: string, sessionIds: string[]): string | null {
   const tail = ownerHandle.slice(ownerHandle.lastIndexOf("-") + 1).trim();
   if (!tail) return null;
-  return sessionIds.find((id) => id === tail || id.startsWith(tail)) ?? null;
+  const exact = sessionIds.find((id) => id === tail);
+  if (exact) return exact; // an exact id match is unambiguous
+  const prefix = sessionIds.filter((id) => id.startsWith(tail));
+  return prefix.length === 1 ? prefix[0]! : null; // unique prefix only — 0 or >1 ⇒ reject (never guess, F16)
 }
 
-// --- real-fs binding (the TEMPORARY v1; bus-identity replaces it). Thin; the testable decisions are above. -------------
+// --- real-fs binding (the TEMP v1; bus-identity replaces it). Thin; the testable decisions are above. -------------
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 
@@ -57,7 +63,7 @@ export function listSessions(home: string): string[] {
   catch { return []; }
 }
 
-/** LivenessIO backed by the real filesystem + process signals (two-evidence: presence pid + status files). */
+/** LivenessIO backed by the real filesystem + process signals (presence pid + signal 0; status is deliberately NOT read). */
 export function makeFileLiveness(home: string): LivenessIO {
   const base = path.join(home, ".agenthop");
   return {
@@ -65,18 +71,14 @@ export function makeFileLiveness(home: string): LivenessIO {
       try { const n = Number(readFileSync(path.join(base, "presence", `${sessionId}.pid`), "utf8").trim()); return Number.isInteger(n) && n > 0 ? n : null; }
       catch { return null; }
     },
-    procAlive: (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } }, // signal 0 = existence check
-    latestStatus: (sessionId) => {
-      try {
-        const dir = path.join(base, "status");
-        const mine = readdirSync(dir).filter((f) => f.startsWith(`${sessionId}.json.`));
-        if (mine.length === 0) return null;
-        const newest = mine.map((f) => ({ f, seq: Number(f.slice(f.lastIndexOf(".") + 1)) })).filter((x) => Number.isFinite(x.seq)).sort((a, b) => b.seq - a.seq)[0];
-        if (!newest) return null;
-        const j = JSON.parse(readFileSync(path.join(dir, newest.f), "utf8")) as { state?: unknown };
-        return { state: typeof j.state === "string" ? j.state : "unknown", seq: newest.seq };
-      } catch { return null; }
+    procAlive: (pid) => {
+      try { process.kill(pid, 0); return "alive"; } // signal 0 = existence check
+      catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === "EPERM") return "alive"; // process EXISTS, just not ours to signal (EPERM != ESRCH, P2-2)
+        if (code === "ESRCH") return "dead";  // no such process — the only strong death signal
+        return "unknown";                     // any other errno: do not convict (F17)
+      }
     },
-    nowMs: () => Date.now(),
   };
 }
