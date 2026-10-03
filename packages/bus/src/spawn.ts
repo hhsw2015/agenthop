@@ -43,9 +43,13 @@ import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
  * Net: a surface an agenthop-spawned agent never claimed is never closed by despawn.
  */
 
+// An agenthop-SPAWNED agent runs fully autonomous, so it also TRUSTS its own hooks: a dispatched Codex must run its
+// agenthop presence/status hooks (and any just-(re)installed ones) immediately, not sit behind the per-hook trust
+// prompt that a freshly written/edited hooks.json otherwise requires — hence --dangerously-bypass-hook-trust alongside
+// --dangerously-bypass-approvals-and-sandbox. This applies ONLY to agents WE launch, never the user's own sessions.
 export const AGENTS: Record<string, string[]> = {
   claude: ["--dangerously-skip-permissions"],
-  codex: ["--dangerously-bypass-approvals-and-sandbox"],
+  codex: ["--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust"],
   opencode: ["--auto"],
 };
 
