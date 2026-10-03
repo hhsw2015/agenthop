@@ -22,7 +22,11 @@ import { dbg } from "./debug.js";
 export function runPresence(opts: BusCoreOptions = {}): void {
   const core = startBusCore(opts);
   dbg(`presence up: ${core.self.title} (tool=${core.self.tool} stable=${core.self.stableId ?? "-"})`);
-  // A ref'd heartbeat so the process stays alive regardless of socket state (reconnect windows, broker failover).
+  // Keep the process alive. A bun --compile binary with no controlling terminal (backgrounded/detached by the hook)
+  // drains its event loop and exits even with a ref'd timer + open sockets — UNLESS it is actively reading an open
+  // stdin (the same reason the `mcp` server survives: Claude holds its stdin pipe). So resume stdin: the SessionStart
+  // hook feeds it a never-EOF stdin (`tail -f /dev/null |`), and this active read holds the loop open with no tty.
+  try { process.stdin.resume(); } catch { /* no stdin — the timer is the fallback */ }
   const keepAlive = setInterval(() => {}, 60000);
 
   let closing = false;

@@ -48,7 +48,7 @@ const agents: Agent[] = [
       }
       let presence: string;
       try {
-        presence = installClaudePresenceHooks(bin, home);
+        presence = installClaudePresenceHooks(home);
       } catch (error) {
         presence = t(`presence hooks not installed (${error instanceof Error ? error.message : String(error)}); add them by hand`, `presence hook 没装上（${error instanceof Error ? error.message : String(error)}），手动加`);
       }
@@ -220,15 +220,15 @@ const PRESENCE_END_MARK = `# ${HOOK_SENTINEL_PRESENCE}:end`;
 
 /**
  * The SessionStart command that brings up this session's always-on bus PRESENCE node (see presence.ts), so the session
- * is findable + reachable on the bus FROM STARTUP — not only after it first calls an agenthop tool. Backgrounded with a
- * plain `&` (NOT setsid: a bun --compile binary with no controlling terminal drains its loop and exits), stdin from
- * /dev/null, started at most once (skipped if the recorded pid is alive); the pid is recorded so SessionEnd can stop it.
- * A non-interactive shell does not SIGHUP its background children on exit, so the daemon survives the hook. Side-effect-
- * only (`|| true`, output suppressed) so it can never block or fail a turn.
+ * is findable + reachable on the bus FROM STARTUP — not only after it first calls an agenthop tool. It runs the NON-
+ * compiled presence bundle (~/.agenthop/presence.mjs) via bun or node, backgrounded — NOT the bun --compile binary,
+ * which exits when it has no controlling terminal (a plain bun/node script with a ref'd keep-alive survives that).
+ * Started at most once (skipped if the recorded pid is alive); the pid is recorded so SessionEnd can stop it. A non-
+ * interactive shell does not SIGHUP its background children, so it survives the hook. Side-effect-only (`|| true`,
+ * output suppressed) so it can never block or fail a turn; a no-op if neither bun nor node nor the bundle is present.
  */
-function presenceStartCommand(bin: string): string {
-  const q = shQuote(bin);
-  return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; else ${q} presence </dev/null >/dev/null 2>&1 & echo \$! > "\$_pf"; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
+function presenceStartCommand(): string {
+  return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; elif [ -f "\$_mjs" ]; then _rt="\$(command -v bun || command -v node)"; if [ -n "\$_rt" ]; then "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1 & echo \$! > "\$_pf"; fi; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
 }
 
 /** The SessionEnd command that stops this session's presence node (by the pid agenthop recorded) and removes the file. */
@@ -242,11 +242,11 @@ function presenceEndCommand(): string {
  * first agenthop tool use). Idempotent (refreshes OUR command in place by a trailing sentinel; never touches a user's
  * other hooks); preserves the rest of settings.json. Returns what changed.
  */
-export function installClaudePresenceHooks(bin: string, home = homedir()): string {
+export function installClaudePresenceHooks(home = homedir()): string {
   const file = join(home, ".claude", "settings.json");
   const config = readJsonConfig(file); // throws (file left alone) if present but not plain JSON
   let changed = 0;
-  changed += mergePresenceHook(config, "SessionStart", presenceStartCommand(bin), PRESENCE_START_MARK, "startup|resume");
+  changed += mergePresenceHook(config, "SessionStart", presenceStartCommand(), PRESENCE_START_MARK, "startup|resume");
   changed += mergePresenceHook(config, "SessionEnd", presenceEndCommand(), PRESENCE_END_MARK);
   if (changed === 0) return t(`${file} already has agenthop presence hooks; nothing changed`, `${file} 里已有 agenthop presence hook，没有改动`);
   placeJson(file, config);
