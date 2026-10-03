@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { branchFor, effectiveLive, handoffStep, type HandoffOps } from "../src/swarm/dispatch-step.js";
 import type { ControlRecord } from "../src/swarm/control.js";
-import { MAX_ALLOC_ATTEMPTS } from "../src/swarm/control.js";
+import { MAX_ALLOC_ATTEMPTS, PROVIDER_LIFETIME_SEC } from "../src/swarm/control.js";
 import type { ObservedTip } from "../src/swarm/acceptance.js";
 import type { Manifest, ManifestKind } from "../src/swarm/manifest.js";
 
@@ -33,6 +33,7 @@ function makeOps(over: Partial<HandoffOps> = {}) {
     self: "disp1",
     cap: 3,
     budgetSec: BUDGET,
+    physicalLifetimeSec: PROVIDER_LIFETIME_SEC,
     handoffLeadSec: LEAD,
     execEnabled: true,
     newLaunchId: () => state.nextLid,
@@ -318,5 +319,85 @@ describe("handoffStep: cap reservation + gate + give_up", () => {
     expect(out.state).toBe("CLAIMED");
     expect(state.allocCalls).toBe(0);
     expect(state.notes.some((n) => /exhausted/.test(n))).toBe(true);
+  });
+});
+
+describe("recovery-protocol re-review fixes (Codex 01ea35b: P1-1/P1-2/P1-3, P2-2, P2-5)", () => {
+  test("P1-2: a short work budget does NOT free the physical slot early (physical lifetime governs occupancy)", () => {
+    const recs = new Map<string, ControlRecord>();
+    // work budget 60s, but the provider VM lives ~PROVIDER_LIFETIME_SEC: past the work budget it must STILL occupy.
+    recs.set("a", rec({ launchId: "a", state: "RUNNING", allocStart: T0, budgetSec: 60, physicalLifetimeSec: PROVIDER_LIFETIME_SEC }));
+    expect(effectiveLive(recs, T0 + 300)).toBe(1); // 300 > work 60+120, but << physical -> still occupies (P1-2)
+    expect(effectiveLive(recs, T0 + PROVIDER_LIFETIME_SEC + 200)).toBe(0); // past physical lifetime + skew -> freed
+  });
+
+  test("P1-1: a reclaimed CLAIMED that retained attempt+successor reserves the slot while the successor record is missing", () => {
+    const recs = new Map<string, ControlRecord>();
+    // post-reclaim: CLAIMED (owner gen bumped), attempt+successor retained, but the successor's own record is lost (crash).
+    recs.set("p", rec({ launchId: "p", state: "CLAIMED", allocStart: T0, attempt: "att-1", successor: "ghost", successorGen: 1 }));
+    expect(effectiveLive(recs, T0 + 10)).toBe(2); // parent(1) + reservation for the maybe-alive successor VM(1)
+    recs.set("ghost", rec({ launchId: "ghost", state: "RUNNING", allocStart: T0 }));
+    expect(effectiveLive(recs, T0 + 10)).toBe(2); // the successor record now counts; no double reservation
+  });
+
+  test("P2-2: an attempt-cap-exhausted CLAIMED (give_up) reserves NO successor slot", () => {
+    const recs = new Map<string, ControlRecord>();
+    recs.set("a", rec({ launchId: "a", state: "CLAIMED", allocStart: T0, attemptCount: MAX_ALLOC_ATTEMPTS }));
+    expect(effectiveLive(recs, T0 + 10)).toBe(1); // its own box only — no phantom "about to allocate" reservation
+  });
+
+  test("P1-3: a dead child's confirmed recovery point is carried onto the parent before the record is removed", async () => {
+    const { ops, state } = makeOps();
+    state.now = T0 + 10;
+    const records = new Map<string, ControlRecord>();
+    const a = rec({ launchId: "rw-aaaa", state: "CLAIMED", generation: 2, sha: "fin0", handoffSha: "fin0", successor: "rw-bbbb", successorGen: 1, attempt: "att-1", owner: "disp1", leaseUntil: T0 + 300 });
+    records.set(a.launchId, a);
+    // the successor advanced to its OWN confirmed milestone "b5" (anchored earlier from a verified tip), then its VM died
+    records.set("rw-bbbb", rec({ launchId: "rw-bbbb", state: "RUNNING", generation: 1, handoffSha: "fin0", sha: "b5", allocStart: T0 - PROVIDER_LIFETIME_SEC - 500 }));
+    const out = await handoffStep(a, records, ops); // no tip -> not alive; past physical deadline -> dead
+    expect(out.state).toBe("CLAIMED");
+    expect(out.attempt).toBeUndefined();        // attempt cleared (declared dead)
+    expect(out.sha).toBe("b5");                 // the child's newest confirmed work carried forward, not stale fin0 (P1-3)
+    expect(state.removed).toContain("rw-bbbb");
+  });
+
+  test("P2-5a: a persist failure on the child anchor leaves the parent ALLOCATING (retryable barrier, no RESUMED)", async () => {
+    let throwOnce = true;
+    const { ops, state } = makeOps({ persist: (r) => { if (throwOnce && r.launchId === "rw-bbbb") { throwOnce = false; throw new Error("disk full"); } } });
+    state.now = T0 + 10;
+    const records = new Map<string, ControlRecord>();
+    const a = rec({ launchId: "rw-aaaa", state: "ALLOCATING", generation: 1, sha: "fin0", handoffSha: "fin0", successor: "rw-bbbb", successorGen: 1, attempt: "att-1", owner: "disp1", leaseUntil: T0 + 300 });
+    records.set(a.launchId, a);
+    records.set("rw-bbbb", rec({ launchId: "rw-bbbb", state: "RUNNING", generation: 1, handoffSha: "fin0", allocStart: T0 }));
+    state.tips.set(branchFor("rw-bbbb", 1), tip("b1", "rw-bbbb", 1, "milestone", { desc: true }));
+    await expect(handoffStep(a, records, ops)).rejects.toThrow("disk full"); // propagates -> pass() catches + retries
+    expect(records.get("rw-aaaa")?.state).toBe("ALLOCATING");  // parent NOT retired on a stranded anchor
+    expect(records.get("rw-bbbb")?.sha).toBeUndefined();        // Map not updated (persist-first)
+  });
+
+  test("P2-5c: a missing child record is rebuilt + anchored before the parent goes RESUMED", async () => {
+    const { ops, state } = makeOps();
+    state.now = T0 + 10;
+    const records = new Map<string, ControlRecord>();
+    const a = rec({ launchId: "rw-aaaa", state: "ALLOCATING", generation: 1, sha: "fin0", handoffSha: "fin0", successor: "rw-bbbb", successorGen: 1, attempt: "att-1", attemptStartSec: T0, owner: "disp1", leaseUntil: T0 + 300 });
+    records.set(a.launchId, a); // NO rw-bbbb record (crash lost it)
+    state.tips.set(branchFor("rw-bbbb", 1), tip("b1", "rw-bbbb", 1, "milestone", { desc: true }));
+    const out = await handoffStep(a, records, ops);
+    expect(out.state).toBe("RESUMED");
+    expect(records.get("rw-bbbb")?.sha).toBe("b1");      // rebuilt + anchored at the verified tip (P2-5c)
+    expect(records.get("rw-bbbb")?.state).toBe("RUNNING");
+  });
+
+  test("P2-5b: a child already at a NON-SEED sha still advances to a newer verified tip (not blocked by 'non-seed')", async () => {
+    const { ops, state } = makeOps();
+    state.now = T0 + 10;
+    const records = new Map<string, ControlRecord>();
+    const a = rec({ launchId: "rw-aaaa", state: "ALLOCATING", generation: 1, sha: "fin0", handoffSha: "fin0", successor: "rw-bbbb", successorGen: 1, attempt: "att-1", owner: "disp1", leaseUntil: T0 + 300 });
+    records.set(a.launchId, a);
+    records.set("rw-bbbb", rec({ launchId: "rw-bbbb", state: "RUNNING", generation: 1, handoffSha: "fin0", sha: "c3", allocStart: T0 })); // non-seed anchor
+    state.tips.set(branchFor("rw-bbbb", 1), tip("c7", "rw-bbbb", 1, "milestone", { desc: true }));
+    const out = await handoffStep(a, records, ops);
+    expect(out.state).toBe("RESUMED");
+    expect(records.get("rw-bbbb")?.sha).toBe("c7"); // advanced past the non-seed anchor (old code skipped this)
   });
 });

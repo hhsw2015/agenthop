@@ -71,8 +71,13 @@ export type ControlRecord = {
   successorGen?: number;
   /** Lifetime base: epoch seconds of the allocation REQUEST start (not the alloc ACK — that is already late). */
   allocStart: number;
-  /** Bounded lifetime budget (s) from allocStart; provider expiry if known, else conservative. */
+  /** Bounded WORK budget (s) from allocStart: drives drain/checkpoint timing only. NOT the VM's physical lifetime — a
+   *  short work budget must trigger an EARLIER handoff, never free the physical slot early (Codex P1-2). */
   budgetSec: number;
+  /** The PROVIDER's physical VM lifetime upper-bound (s) from allocStart, pinned per attempt. Independent of budgetSec:
+   *  physical death (physicallyOccupies / likelyExpired / reconcile) is proven by THIS, so a configurable work budget
+   *  can never declare a VM dead while the provider still runs it (Codex P1-2 / P2-1). Absent => PROVIDER_LIFETIME_SEC. */
+  physicalLifetimeSec?: number;
   /** Absolute deadline for display/dispatcher view (the BOX uses CLOCK_BOOTTIME locally, not this wall value). */
   deadlineEpoch?: number;
   /** Epoch seconds the CURRENT allocation attempt was REQUESTED (pinned at `allocating`, = the successor's lifetime
@@ -97,7 +102,7 @@ export type ControlEvent =
   | { type: "checkpoint"; sha: string; manifest?: string }
   | { type: "claim"; owner: string; generation: number; leaseUntil: number }
   | { type: "reclaim"; owner: string; generation: number; leaseUntil: number }
-  | { type: "allocating"; attempt: string; successor?: string }
+  | { type: "allocating"; attempt: string; successor?: string; physicalLifetimeSec?: number }
   | { type: "alloc_unknown" }
   // alloc_failed: a RELIABLE clean failure (provider refused; box definitively NOT created) — clear attempt+successor,
   // back to CLAIMED for an immediate fresh allocate (attemptCount kept, so the cap still bounds retries). An UNKNOWN
@@ -106,7 +111,10 @@ export type ControlEvent =
   // reconcile a reclaimed in-flight allocation: its box was found DEAD (clear the attempt, allocate fresh) or ALIVE
   // (re-enter the await-resume wait reusing the SAME attempt — "alive" is NOT recovery-complete; only a real
   // `resumed` ACK with the expected generation/attempt/sha finishes the handoff).
-  | { type: "reconcile_dead" }
+  // reconcile_dead may carry the dead successor's confirmed recovery point (a verified descendant of handoffSha the
+  // caller anchored): it is transferred onto the parent's canonical `sha` so the replacement attempt resumes from the
+  // newest confirmed work, not the stale handoffSha (Codex P1-3). Omitted => no newer recovery point to carry.
+  | { type: "reconcile_dead"; recoverySha?: string }
   | { type: "reconcile_alive" }
   | { type: "resumed"; successor: string; sha: string; generation: number; attempt: string }
   // retire the logical task. `reliablyTerminated` is true ONLY when the scrub confirmed the physical VM is gone; absent
@@ -147,6 +155,11 @@ export function isCurrentGeneration(record: ControlRecord, generation: number): 
 
 /** Default claim lease: long enough to allocate a box + confirm a successor, short enough to recover a dead owner. */
 export const DEFAULT_LEASE_SEC = 300;
+/** The provider's physical VM lifetime upper-bound (seconds). Railway free microVMs live ~60 min; a VM is only proven
+ *  PHYSICALLY gone after this (+ skew) from its request, regardless of a (possibly much shorter) work budget. Used to
+ *  free a physical slot / declare a box dead — never the work budget (Codex P1-2). Overridable per record/attempt via
+ *  `physicalLifetimeSec`; the IO layer may seed it from SWARM_VM_LIFETIME_SEC. */
+export const PROVIDER_LIFETIME_SEC = 3600;
 /** Per-task allocation attempt cap so at-least-once stays BOUNDED (not an infinite realloc loop). */
 export const MAX_ALLOC_ATTEMPTS = 3;
 /** Checkpoint thresholds (seconds before deadline) for the supervisor's near-death safety push. */
@@ -205,7 +218,10 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       // creates is told to resume from here; a later recover_sha advancing `sha` must NOT move this attempt's target.
       // The successor launchId is pinned here too (per-attempt), so a dispatcher restart re-reads WHICH box is taking
       // over from the mirror instead of a lost in-memory side-map. resumed later re-asserts the same successor.
-      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false, handoffSha: record.sha, successorGen: record.generation, attemptStartSec: nowSec, ...(event.successor ? { successor: event.successor } : {}) });
+      // Pin the attempt's PHYSICAL lifetime here too (= the successor VM's provider bound), so a reconcile in the crash
+      // window where the successor record was never persisted bounds the attempt by a FIXED deadline, not the dispatcher's
+      // current (possibly-changed) config (Codex P2-1). Falls back to any existing value, else PROVIDER_LIFETIME_SEC.
+      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false, handoffSha: record.sha, successorGen: record.generation, attemptStartSec: nowSec, physicalLifetimeSec: event.physicalLifetimeSec ?? record.physicalLifetimeSec, ...(event.successor ? { successor: event.successor } : {}) });
     case "alloc_unknown":
       // Allocation request sent, result unknown. Stay ALLOCATING; mark it so a reclaimer reconciles this attempt.
       if (record.state !== "ALLOCATING") return bad(`alloc_unknown only from ALLOCATING, not ${record.state}`);
@@ -221,7 +237,11 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       // points at a phantom successor (Codex P2-2; the dead successor's own record is removed by the caller). attemptCount
       // is KEPT (the cap still bounds retries).
       if (record.state !== "CLAIMED" || record.attempt === undefined) return bad(`reconcile_dead needs CLAIMED with an attempt, not ${record.state}`);
-      return ok({ attempt: undefined, resultUnknown: false, successor: undefined, successorGen: undefined, attemptStartSec: undefined });
+      // Carry the dead child's confirmed recovery point forward onto the parent's canonical `sha` BEFORE clearing the
+      // attempt, so the next allocate pins handoffSha = this newest confirmed work instead of the stale old sha and the
+      // child's results are not orphaned (Codex P1-3). The caller only supplies a verified descendant of handoffSha; we
+      // never regress (only set when it differs from the current sha). attemptPhysical pin (physicalLifetimeSec) stays.
+      return ok({ attempt: undefined, resultUnknown: false, successor: undefined, successorGen: undefined, attemptStartSec: undefined, ...(event.recoverySha !== undefined && event.recoverySha !== record.sha ? { sha: event.recoverySha } : {}) });
     case "reconcile_alive":
       // Reconcile found the in-flight box ALIVE. That is NOT recovery-complete (Codex): re-enter the await-resume
       // wait reusing the SAME attempt (no attemptCount bump). Only a real `resumed` ACK carrying the expected
@@ -325,13 +345,15 @@ export function nextAction(record: ControlRecord, nowSec: number, ctx: DispatchC
 }
 
 /**
- * Dispatcher-side liveness estimate from wall clocks with a skew allowance. Conservative: "likely dead" only once
- * now exceeds deadline PLUS the allowance — a work-deadline is NOT proof the physical VM is destroyed, so this must
- * never be used to free a physical slot early (Codex pass 2). The box itself uses CLOCK_BOOTTIME for its own
- * deadline; this is only the dispatcher's outside estimate.
+ * Dispatcher-side PHYSICAL-death estimate from wall clocks with a skew allowance. "Likely dead" only once now exceeds
+ * the PROVIDER's physical lifetime (not the work budget) plus the allowance: a work deadline is NOT proof the VM is
+ * destroyed, so freeing a slot on the work budget would over-cap when the budget is shorter than the VM's life (Codex
+ * P1-2). We use max(budgetSec, physicalLifetime) so a budget longer than the provider bound still can't free early.
+ * The box itself uses CLOCK_BOOTTIME for its own deadline; this is only the dispatcher's conservative outside estimate.
  */
 export function likelyExpired(record: ControlRecord, nowSec: number, skewSec = 120): boolean {
-  return nowSec > record.allocStart + record.budgetSec + skewSec;
+  const lifetime = Math.max(record.budgetSec, record.physicalLifetimeSec ?? PROVIDER_LIFETIME_SEC);
+  return nowSec > record.allocStart + lifetime + skewSec;
 }
 
 /**

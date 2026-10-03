@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomBytes } from "node:crypto";
-import { type ControlRecord } from "../packages/bus/src/swarm/control.js";
+import { type ControlRecord, PROVIDER_LIFETIME_SEC } from "../packages/bus/src/swarm/control.js";
 import { parseManifest } from "../packages/bus/src/swarm/manifest.js";
 import { type ObservedTip, tipToEvent } from "../packages/bus/src/swarm/acceptance.js";
 import { type HandoffOps, handoffStep } from "../packages/bus/src/swarm/dispatch-step.js";
@@ -35,6 +35,9 @@ const KEYDIR_GLOB = "/tmp"; // throwaway keydirs live at /tmp/ah-rwkey-rw-*
 const SELF = process.env.SWARM_SELF || `disp-${process.pid}`;
 const CAP = Number(process.env.SWARM_CAP || "3");
 const BUDGET_SEC = Number(process.env.SWARM_BUDGET_SEC || "3480");
+// The PROVIDER's physical VM lifetime bound (s) — SEPARATE from the work budget: physical death / slot-free is proven by
+// this, never the (possibly shorter) work budget (Codex P1-2). Default = PROVIDER_LIFETIME_SEC (Railway ~60min).
+const VM_LIFETIME_SEC = Number(process.env.SWARM_VM_LIFETIME_SEC || String(PROVIDER_LIFETIME_SEC));
 const HANDOFF_LEAD_SEC = Number(process.env.SWARM_HANDOFF_LEAD_SEC || "180");
 const WORK_REPO = process.env.SWARM_WORK_REPO || "";
 const GIT_TIMEOUT_MS = 25_000;
@@ -110,9 +113,36 @@ function loadMirror(): Map<string, ControlRecord> {
   return m;
 }
 function saveRecord(r: ControlRecord): void { mkdirSync(MIRROR_DIR, { recursive: true }); atomicWrite(mirrorPath(r.launchId), JSON.stringify(r)); }
-// Remove a record from the mirror (a successor whose box was RELIABLY never created, or a dead in-flight allocation).
-// Best-effort: a missing file is already the desired state.
-function removeRecord(launchId: string): void { try { const p = mirrorPath(launchId); if (existsSync(p)) unlinkSync(p); } catch (e) { log(`removeRecord ${launchId}: ${e instanceof Error ? e.message : e}`); } }
+
+// A TOMBSTONE suppresses keydir-driven RESURRECTION of a deliberately-removed record: discovery re-reads the box's
+// alloc-ts keydir every pass, so without this a just-removed dead/never-created successor is immediately recreated as a
+// fresh RUNNING record (Codex P2-3). The tombstone lives exactly as long as the stale keydir — gcTombstones drops it
+// once the keydir is gone (no resurrection source left), so tombstones don't accumulate.
+function tombstonePath(launchId: string): string { return path.join(MIRROR_DIR, `${launchId}.tombstone`); }
+function isTombstoned(launchId: string): boolean { return existsSync(tombstonePath(launchId)); }
+function writeTombstone(launchId: string): void { mkdirSync(MIRROR_DIR, { recursive: true }); atomicWrite(tombstonePath(launchId), String(nowSec())); }
+function gcTombstones(liveBoxIds: Set<string>): void {
+  if (!existsSync(MIRROR_DIR)) return;
+  for (const f of readdirSync(MIRROR_DIR)) {
+    if (!f.endsWith(".tombstone")) continue;
+    const id = f.slice(0, -".tombstone".length);
+    if (!liveBoxIds.has(id)) { try { unlinkSync(tombstonePath(id)); } catch {} } // discovery source gone -> safe to forget
+  }
+}
+
+// Remove a record from the mirror (a successor whose box was RELIABLY never created, or a dead in-flight allocation) and
+// tombstone it so discovery can't resurrect it. A non-ENOENT unlink failure (EACCES/EIO) is NOT success — it is thrown
+// so the caller does NOT advance the dependent transition / register the delete as done (the disk record would survive a
+// restart and be reloaded); the pass() try/catch logs + retries next pass (Codex P2-4).
+function removeRecord(launchId: string): void {
+  try {
+    unlinkSync(mirrorPath(launchId));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e instanceof Error ? e : new Error(String(e));
+    // ENOENT => already absent (the desired state); fall through to the tombstone so resurrection is still suppressed.
+  }
+  writeTombstone(launchId);
+}
 
 // --- discover boxes this dispatcher launched (keydirs carry launchId + alloc-ts) ---
 function discoverBoxes(): Array<{ launchId: string; allocTs: number }> {
@@ -187,7 +217,7 @@ async function scrubBox(launchId: string): Promise<boolean> {
 async function observeOnce(argv: string[]): Promise<void> {
   const [workRepo, branch, launchId, genStr, lastSha] = argv;
   if (!workRepo || !branch || !launchId || !genStr) { console.error("usage: --observe-once <workRepo> <branch> <launchId> <generation> [lastSha]"); process.exit(2); }
-  const record: ControlRecord = { launchId: launchId!, state: "RUNNING", generation: Number(genStr), allocStart: nowSec(), budgetSec: BUDGET_SEC, updatedAt: nowSec(), sha: lastSha };
+  const record: ControlRecord = { launchId: launchId!, state: "RUNNING", generation: Number(genStr), allocStart: nowSec(), budgetSec: BUDGET_SEC, physicalLifetimeSec: VM_LIFETIME_SEC, updatedAt: nowSec(), sha: lastSha };
   const tip = await observeTip(workRepo!, branch!, lastSha, path.join(HOME, ".agenthop", "swarm", "scratch", launchId!));
   console.log(JSON.stringify({ tip, decision: tip ? tipToEvent(record, tip) : null }, null, 2));
 }
@@ -196,6 +226,7 @@ async function observeOnce(argv: string[]): Promise<void> {
 //     clock + gated handoff EXEC). handoffStep reads liveCount from `records` and mutates it (adds successors). ---
 async function pass(records: Map<string, ControlRecord>, ops: HandoffOps): Promise<void> {
   const boxes = new Map(discoverBoxes().map((b) => [b.launchId, b]));
+  gcTombstones(new Set(boxes.keys())); // drop tombstones whose keydir is gone — no resurrection source left (Codex P2-3)
   // UNION of keydir-discovered boxes AND persisted mirror records (Codex #7): a box whose keydir vanished but whose
   // record is still non-terminal (e.g. EXPIRED needing a successor) must still be processed, incl. after a restart.
   const ids = new Set<string>([...boxes.keys(), ...records.keys()]);
@@ -204,7 +235,8 @@ async function pass(records: Map<string, ControlRecord>, ops: HandoffOps): Promi
     let r = records.get(launchId);
     if (!r) {
       if (!box) continue;
-      r = { launchId, state: "RUNNING", generation: 0, allocStart: box.allocTs, budgetSec: BUDGET_SEC, updatedAt: nowSec(), deadlineEpoch: box.allocTs + BUDGET_SEC };
+      if (isTombstoned(launchId)) continue; // deliberately removed (dead/never-created) — do NOT resurrect it (Codex P2-3)
+      r = { launchId, state: "RUNNING", generation: 0, allocStart: box.allocTs, budgetSec: BUDGET_SEC, physicalLifetimeSec: VM_LIFETIME_SEC, updatedAt: nowSec(), deadlineEpoch: box.allocTs + BUDGET_SEC };
       records.set(launchId, r);
       saveRecord(r);
     }
@@ -218,7 +250,7 @@ async function pass(records: Map<string, ControlRecord>, ops: HandoffOps): Promi
 
 function buildOps(): HandoffOps {
   return {
-    nowSec, self: SELF, cap: CAP, budgetSec: BUDGET_SEC, handoffLeadSec: HANDOFF_LEAD_SEC, execEnabled: EXEC_ENABLED,
+    nowSec, self: SELF, cap: CAP, budgetSec: BUDGET_SEC, physicalLifetimeSec: VM_LIFETIME_SEC, handoffLeadSec: HANDOFF_LEAD_SEC, execEnabled: EXEC_ENABLED,
     newLaunchId: () => `rw-${randomBytes(4).toString("hex")}`,
     observeTip: (branch, lastSha, launchId) =>
       WORK_REPO ? observeTip(WORK_REPO, branch, lastSha, scratchPath(launchId)) : Promise.resolve(null),

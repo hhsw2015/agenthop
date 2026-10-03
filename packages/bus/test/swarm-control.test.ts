@@ -12,6 +12,7 @@ import {
   needsRecovery,
   nextAction,
   parseHandoff,
+  PROVIDER_LIFETIME_SEC,
   thresholdsDue,
 } from "../src/swarm/control.js";
 
@@ -271,10 +272,19 @@ describe("cap + retire", () => {
 });
 
 describe("math + parse", () => {
-  test("likelyExpired only past deadline + skew", () => {
-    const r = rec({ allocStart: T0, budgetSec: 3480 });
-    expect(likelyExpired(r, T0 + 3480 + 120, 120)).toBe(false);
-    expect(likelyExpired(r, T0 + 3480 + 121, 120)).toBe(true);
+  test("likelyExpired uses the PHYSICAL lifetime (not the work budget) + skew (Codex P1-2)", () => {
+    // max(budgetSec, physicalLifetimeSec) + skew: here budget 3480 < physical 3600, so physical governs.
+    const r = rec({ allocStart: T0, budgetSec: 3480, physicalLifetimeSec: 3600 });
+    expect(likelyExpired(r, T0 + 3600 + 120, 120)).toBe(false);
+    expect(likelyExpired(r, T0 + 3600 + 121, 120)).toBe(true);
+    // a SHORT work budget must NOT expire the VM early — the provider lifetime governs physical death.
+    const short = rec({ allocStart: T0, budgetSec: 60, physicalLifetimeSec: 3600 });
+    expect(likelyExpired(short, T0 + 60 + 500, 120)).toBe(false);   // well past the work budget, VM still alive
+    expect(likelyExpired(short, T0 + 3600 + 121, 120)).toBe(true);  // past the physical lifetime -> dead
+    // absent physicalLifetimeSec defaults to PROVIDER_LIFETIME_SEC (conservative).
+    const dflt = rec({ allocStart: T0, budgetSec: 100 });
+    expect(likelyExpired(dflt, T0 + PROVIDER_LIFETIME_SEC - 10, 120)).toBe(false);
+    expect(likelyExpired(dflt, T0 + PROVIDER_LIFETIME_SEC + 121, 120)).toBe(true);
   });
   test("isCurrentGeneration / leaseExpired / thresholds / constants", () => {
     expect(isCurrentGeneration(rec({ generation: 5 }), 5)).toBe(true);

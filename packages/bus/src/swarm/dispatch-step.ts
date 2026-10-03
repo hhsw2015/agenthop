@@ -19,6 +19,7 @@
 
 import {
   advance,
+  allocExhausted,
   DEFAULT_LEASE_SEC,
   type ControlEvent,
   type ControlRecord,
@@ -26,6 +27,7 @@ import {
   likelyExpired,
   nextAction,
   physicallyOccupies,
+  PROVIDER_LIFETIME_SEC,
 } from "./control.js";
 import { type ObservedTip, tipToEvent } from "./acceptance.js";
 
@@ -34,6 +36,9 @@ export type HandoffOps = {
   self: string;
   cap: number;
   budgetSec: number;
+  /** The PROVIDER's physical VM lifetime bound (s), pinned per attempt onto records so physical death is proven by the
+   *  provider's lifetime, never the (shorter, configurable) work budget (Codex P1-2). */
+  physicalLifetimeSec: number;
   handoffLeadSec: number;
   /** Gate the handoff ACTIONS (claim/allocate/resume/reconcile/retire). When false, observe + clock still run. */
   execEnabled: boolean;
@@ -80,17 +85,23 @@ function apply(r: ControlRecord, ev: ControlEvent, ops: HandoffOps, records: Map
  * Boxes counting against the cap = PHYSICAL occupancy, not task state (Codex P1-2: cap is concurrent boxes). A record
  * occupies a slot while its VM may still be alive (physicallyOccupies: not reliably scrubbed, not past deadline) —
  * including a RETIRED/DONE box whose scrub did not confirm termination. On top of counted records, RESERVE a slot for a
- * successor VM that exists (or may exist) but has no counted record yet:
- *  - a CLAIMED record without a successor is ABOUT to allocate one (Codex P1-6);
- *  - an ALLOCATING record whose pinned successor has no record is the crash window between pinning and persisting the
- *    successor placeholder — its VM may already exist, so it must still count (Codex P1-1).
+ * successor VM that exists (or may exist) but has no counted record of its own yet:
+ *  - an IN-FLIGHT attempt (ALLOCATING, or a reclaimed CLAIMED that RETAINED attempt+successor) whose pinned successor
+ *    has no record — the crash/reclaim window where the successor VM may already exist but its placeholder was lost or
+ *    not yet persisted; it must still count across CLAIMED and ALLOCATING, else a reclaim drops it (Codex P1-1);
+ *  - a CLAIMED record with NO attempt that is ABOUT to allocate a fresh successor (Codex P1-6) — but NOT once the
+ *    attempt cap is exhausted, since nextAction is then give_up and no successor is ever allocated (no phantom slot,
+ *    Codex P2-2).
  */
 export function effectiveLive(records: Map<string, ControlRecord>, nowSec: number): number {
   let count = 0;
   for (const x of records.values()) {
     if (physicallyOccupies(x, nowSec)) count++;
-    if (x.state === "CLAIMED" && !x.successor) count++; // about to allocate a successor
-    if (x.state === "ALLOCATING" && x.successor && !records.has(x.successor)) count++; // successor VM may exist, record lost
+    if (x.successor && !records.has(x.successor)) {
+      if (x.state === "ALLOCATING" || (x.state === "CLAIMED" && x.attempt !== undefined)) count++; // in-flight successor, record missing (P1-1)
+    } else if (x.state === "CLAIMED" && !x.successor && x.attempt === undefined && !allocExhausted(x)) {
+      count++; // about to allocate a fresh successor (P1-6), unless give_up (P2-2)
+    }
   }
   return count;
 }
@@ -183,7 +194,7 @@ async function allocate(r: ControlRecord, records: Map<string, ControlRecord>, o
   const reqStart = ops.nowSec(); // the attempt's lifetime base = REQUEST start, not the post-IO ACK (Codex P2-3)
   // CAS-then-IO: record the attempt + successor (pin successorGen=gen and attemptStartSec=reqStart) FIRST and persist,
   // BEFORE any IO. A throw in persist leaves no box created (IO not reached); a throw AFTER leaves a durable ALLOCATING.
-  r = apply(r, { type: "allocating", attempt: `att-${gen}-${successor}`, successor }, ops, records);
+  r = apply(r, { type: "allocating", attempt: `att-${gen}-${successor}`, successor, physicalLifetimeSec: ops.physicalLifetimeSec }, ops, records);
   if (r.state !== "ALLOCATING") return r; // transition rejected -> do not run IO
 
   // Pre-create the successor PLACEHOLDER record BEFORE the allocate IO (Codex P1-1): once persisted it is counted
@@ -244,14 +255,21 @@ async function reconcile(r: ControlRecord, records: Map<string, ControlRecord>, 
   // else the parent's pinned attemptStartSec (the crash window where the placeholder was never persisted, Codex P1-1),
   // so an unknown allocation cannot stay inconclusive forever. A transient error before the deadline retains the attempt.
   const succ = records.get(r.successor);
+  // The attempt is physically dead only past the PROVIDER's lifetime, FIXED per attempt — never the current (possibly
+  // changed) work budget (Codex P2-1). From the successor record when it exists, else the parent's pinned attempt base +
+  // the pinned physicalLifetimeSec (the crash window where the placeholder was never persisted, Codex P1-1).
   const expired = succ
     ? likelyExpired(succ, ops.nowSec())
-    : r.attemptStartSec !== undefined && ops.nowSec() > r.attemptStartSec + ops.budgetSec + 120;
+    : r.attemptStartSec !== undefined && ops.nowSec() > r.attemptStartSec + (r.physicalLifetimeSec ?? PROVIDER_LIFETIME_SEC) + 120;
   if (expired) {
     ops.log(`${r.launchId}: successor ${r.successor} past deadline, no qualified takeover — declaring dead`);
-    ops.removeRecord(r.successor); // terminate the dead successor's record + physical occupancy (Codex P2-2)
+    // Carry the dead child's confirmed recovery point (anchored from a verified descendant of handoffSha in awaitResume)
+    // forward to the parent BEFORE removing it, so the replacement resumes from the newest confirmed work, not the stale
+    // handoffSha (Codex P1-3). An empty placeholder (sha === handoffSha / unset) has no newer point — nothing to carry.
+    const recoverySha = succ?.sha !== undefined && succ.sha !== r.handoffSha ? succ.sha : undefined;
+    ops.removeRecord(r.successor); // terminate the dead successor's record + physical occupancy (Codex P2-2); may throw (P2-4)
     records.delete(r.successor);
-    return apply(r, { type: "reconcile_dead" }, ops, records);
+    return apply(r, { type: "reconcile_dead", recoverySha }, ops, records);
   }
   ops.log(`${r.launchId}: reconcile ${r.successor} inconclusive (not published, not expired) — retaining attempt`);
   return r;
@@ -260,7 +278,12 @@ async function reconcile(r: ControlRecord, records: Map<string, ControlRecord>, 
 async function awaitResume(r: ControlRecord, records: Map<string, ControlRecord>, ops: HandoffOps): Promise<ControlRecord> {
   if (!r.successor || r.handoffSha === undefined || r.attempt === undefined) return r;
   const sgen = r.successorGen ?? r.generation;
-  const tip = await ops.observeTip(branchFor(r.successor, sgen), r.handoffSha, r.successor);
+  // Observe against the child's CURRENT anchor (or handoffSha if none): a qualified tip is then a verified descendant of
+  // whatever the child has already confirmed, so the recovery point only moves FORWARD — "not the seed" is NOT proof of
+  // newer (Codex P2-5b). This base is itself >= handoffSha, so the resume-ACK bar (descendant of handoffSha) still holds.
+  const child0 = records.get(r.successor);
+  const acceptedBase = child0?.sha ?? r.handoffSha;
+  const tip = await ops.observeTip(branchFor(r.successor, sgen), acceptedBase, r.successor);
   if (!tip || !tip.manifest) return r;                   // not published / transient -> keep waiting
   if (tip.manifest.launchId !== r.successor) return r;   // the seed (predecessor's manifest) -> not resumed yet
   if (tip.manifest.generation !== sgen) { ops.log(`${r.launchId}: successor tip gen ${tip.manifest.generation} != pinned ${sgen}; ignoring`); return r; }
@@ -269,16 +292,25 @@ async function awaitResume(r: ControlRecord, records: Map<string, ControlRecord>
     ops.log(`${r.launchId}: successor tip kind=${tip.manifest.kind} (not worker-driven) — not a resumed-ACK yet`);
     return r;
   }
-  if (!tip.isDescendantOfAccepted) { ops.log(`${r.launchId}: successor tip not a descendant of handoffSha; ignoring`); return r; }
-  // Before the predecessor goes RESUMED (then RETIRED), persist the VERIFIED recovery point onto the SUCCESSOR record,
-  // so an ACK-then-crash leaves the child anchored at its own confirmed milestone (not only handoffSha) and auto-recovery
-  // can resume from the newest confirmed work (Codex P2-5). Never regress a child that already advanced past this tip.
-  const child = records.get(r.successor);
-  if (child && (child.sha === undefined || child.sha === r.handoffSha)) {
-    const anchored = { ...child, sha: tip.sha, updatedAt: ops.nowSec() };
+  if (!tip.isDescendantOfAccepted) { ops.log(`${r.launchId}: successor tip not a descendant of the child's anchor; ignoring`); return r; }
+  // Persist the VERIFIED recovery point onto the SUCCESSOR record as a RETRYABLE BARRIER, BEFORE the predecessor goes
+  // RESUMED (then RETIRED): persist FIRST, then update the Map, so a persist throw leaves disk==RAM (anchor not moved)
+  // and the barrier simply retries next pass instead of stranding disk at the old sha while the parent retires (P2-5a).
+  // A child record lost to a crash is REBUILT + persisted here, so recovery always has a durable child anchor (P2-5c).
+  if (!child0) {
+    const base = r.attemptStartSec ?? ops.nowSec();
+    const rebuilt: ControlRecord = {
+      launchId: r.successor, state: "RUNNING", generation: sgen, handoffSha: r.handoffSha, sha: tip.sha,
+      allocStart: base, budgetSec: ops.budgetSec, physicalLifetimeSec: r.physicalLifetimeSec ?? ops.physicalLifetimeSec,
+      deadlineEpoch: base + ops.budgetSec, updatedAt: ops.nowSec(),
+    };
+    ops.persist(rebuilt);        // barrier: a throw is caught by pass(), retried next pass; parent NOT yet RESUMED
+    records.set(r.successor, rebuilt);
+  } else if (child0.sha !== tip.sha) { // acceptedBase check already proved tip is a forward descendant of child0.sha
+    const anchored = { ...child0, sha: tip.sha, updatedAt: ops.nowSec() };
+    ops.persist(anchored);       // persist FIRST (retryable barrier), then the Map
     records.set(r.successor, anchored);
-    ops.persist(anchored);
   }
-  // A REAL successor milestone at the pinned publish-generation, descending from handoffSha -> resumed-ACK.
+  // A REAL successor milestone at the pinned publish-generation, descending from the child's anchor -> resumed-ACK.
   return apply(r, { type: "resumed", successor: r.successor, sha: r.handoffSha, generation: r.generation, attempt: r.attempt }, ops, records);
 }
