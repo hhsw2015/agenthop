@@ -163,6 +163,49 @@ export function readIdentityLog(home: string): LogReadResult {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Feed helpers (batch B call sites use ONLY these — the provenance/confidence mapping stays here, so
+// core.ts/directory.ts need just an import + a one-line call, and the logic lives in this reviewed module)
+// ---------------------------------------------------------------------------------------------
+
+/** The subset of SelfInfo the feed needs (structural, so this module stays standalone). */
+export type SelfLike = { id: string; stableId?: string; title: string; tool: string; cwd: string; pid: number };
+
+/** Read the host pid the presence hook passed (AGENTHOP_HOST_PID) — the process whose life actually
+ *  answers "is the session alive" (design §2.4). busPid is this bus process; hostPid is the host. */
+export function hostPidFrom(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const n = Number(env.AGENTHOP_HOST_PID);
+  return Number.isInteger(n) && n > 1 ? n : undefined;
+}
+
+/**
+ * Record this session's own identity forms as one `observe` (batch-B call site: once at startBusCore, and
+ * any time self is re-announced). `nativeAuthoritative` = is self.stableId from the env/metadata (hard) or
+ * a daemon guess (possible) — propagation here never raises it; the caller passes the source truth.
+ */
+export function recordSelfObserve(home: string, self: SelfLike, nativeAuthoritative: boolean, scope: Scope = "local", env: NodeJS.ProcessEnv = process.env): boolean {
+  const claims: Claim[] = [
+    { value: self.id, form: "run", confidence: "hard", provenance: "same-announce" },
+    { value: self.title, form: "handle", confidence: nativeAuthoritative || !self.stableId ? "hard" : "possible", provenance: "same-announce" },
+  ];
+  if (self.stableId) claims.push({ value: self.stableId, form: "native", confidence: nativeAuthoritative ? "hard" : "possible", provenance: "same-announce" });
+  return appendEvent(home, {
+    v: 1, eventId: mintEventId(), ts: Math.floor(Date.now() / 1000), type: "observe",
+    incarnation: { key: self.id, claims, scope, busPid: self.pid, hostPid: hostPidFrom(env), tool: self.tool, cwd: self.cwd },
+  });
+}
+
+/**
+ * Record a stableId transition (batch-B call site: inside learnStableId). `kind`:
+ *   - "bootstrap"   : first stableId this run ever had (from undefined)
+ *   - "correction"  : a prior GUESS is being replaced by an authoritative value (revokes the guess)
+ *   - "thread-switch": one authoritative thread id replaced by another (A→B; NOT equivalence)
+ * `authoritative` is passed straight from core's own flag — the source truth for confidence.
+ */
+export function recordLearn(home: string, runKey: string, from: string | undefined, to: string, kind: "bootstrap" | "correction" | "thread-switch", authoritative: boolean, form: Form = "native"): boolean {
+  return appendEvent(home, { v: 1, eventId: mintEventId(), ts: Math.floor(Date.now() / 1000), type: "learn", incarnationKey: runKey, from, to, form, kind, authoritative });
+}
+
+// ---------------------------------------------------------------------------------------------
 // Fold: events → entities + alias index (design §2.2/§2.3/§3)
 // ---------------------------------------------------------------------------------------------
 
