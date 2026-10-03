@@ -338,7 +338,7 @@ export type Projection = {
   incomplete: boolean;
 };
 
-type Gen = { key: string; runKey: string; idx: number; incarnations: Incarnation[] };
+type Gen = { key: string; runKey: string; createdBy: string; incarnations: Incarnation[] };
 
 /** Build entities (one per run/thread generation) + resolution indexes from the event log. */
 export function buildProjection(events: IdentityEvent[], corruption: LogReadResult["corruption"] = [], opts: { incomplete?: boolean } = {}): Projection {
@@ -364,9 +364,11 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
   const runGens = new Map<string, Gen[]>();
   const allGens: Gen[] = [];
   const gensOf = (runKey: string): Gen[] => runGens.get(runKey) ?? [];
-  const newGen = (runKey: string, seed?: Incarnation): Gen => {
+  const newGen = (runKey: string, createdBy: string, seed?: Incarnation): Gen => {
     const arr = runGens.get(runKey) ?? runGens.set(runKey, []).get(runKey)!;
-    const g: Gen = { key: `${runKey}#${arr.length}`, runKey, idx: arr.length, incarnations: [] };
+    // keyed by the IMMUTABLE creating eventId, not a positional index — so revoking/reordering other events
+    // never retargets this generation's published entityId or lets another entity reuse it (review P2-5).
+    const g: Gen = { key: `${runKey}#${createdBy}`, runKey, createdBy, incarnations: [] };
     arr.push(g); allGens.push(g);
     if (seed) { // thread-switch inherits the transport facts of the old generation
       g.incarnations.push({ key: g.key, claims: [], scope: seed.scope, busPid: seed.busPid, hostPid: seed.hostPid, birth: seed.birth, tool: seed.tool, cwd: seed.cwd, firstSeenSec: seed.lastSeenSec, lastSeenSec: seed.lastSeenSec });
@@ -392,11 +394,18 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
     closeDerived(g);
   };
   const closeDerived = (g: Gen) => {
+    const all = genClaims(g);
+    const everExisted = new Set(all.map((c) => c.value));
     let changed = true;
     while (changed) {
       changed = false;
-      const dead = new Set(genClaims(g).filter((c) => c.superseded).map((c) => c.value));
-      for (const c of genClaims(g)) if (!c.superseded && c.derivedFrom && dead.has(c.derivedFrom)) { c.superseded = true; changed = true; }
+      // Cascade down a DERIVATION EDGE, not across a bare literal: a derivative is withdrawn only when its
+      // origin value is FULLY dead (no live claim carries it). So revoking one source's A does not kill a
+      // handle derived from an INDEPENDENT source's still-live A (review P1-4).
+      const live = new Set(all.filter((c) => !c.superseded).map((c) => c.value));
+      for (const c of all) {
+        if (!c.superseded && c.derivedFrom && everExisted.has(c.derivedFrom) && !live.has(c.derivedFrom)) { c.superseded = true; changed = true; }
+      }
     }
   };
   const lastInc = (g: Gen, ts: number): Incarnation => {
@@ -413,9 +422,17 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
       const obsNative = src.claims.find((c) => c.form === "native")?.value;
       const gens = gensOf(runKey);
       let g: Gen | undefined;
-      if (obsNative) g = gens.find((x) => genHeldNative(x, obsNative)) ?? gens.find((x) => !genHasHardNative(x));
-      else g = gens.find((x) => !genHasHardNative(x)) ?? gens[gens.length - 1];
-      if (!g) g = newGen(runKey);
+      if (obsNative) {
+        g = gens.find((x) => genHeldNative(x, obsNative)) ?? gens.find((x) => !genHasHardNative(x));
+      } else {
+        // A no-native snapshot joins a pre-native generation; else, if it names its source root, it rejoins
+        // THAT generation (a late pre-bootstrap snapshot of its own lineage); else it is an independent late
+        // snapshot — NEVER the current thread, which there is no evidence it belongs to (review P1-3).
+        const srcLink = src.claims.map((c) => c.source).find((s): s is string => !!s);
+        g = gens.find((x) => !genHasHardNative(x))
+          ?? (srcLink ? gens.find((x) => x.createdBy === srcLink || genClaims(x).some((c) => c.source === srcLink)) : undefined);
+      }
+      if (!g) g = newGen(runKey, e.eventId);
       const inc: Incarnation = { key: g.key, claims: [], scope: src.scope, busPid: src.busPid, hostPid: src.hostPid, birth: src.birth, tool: src.tool, cwd: src.cwd, firstSeenSec: e.ts, lastSeenSec: e.ts };
       for (const c of src.claims) addClaim(inc, { ...c, source: c.source ?? e.eventId }); // keep an explicit root source (P1-4)
       g.incarnations.push(inc);
@@ -428,14 +445,14 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
       if (e.kind === "thread-switch" && e.from && e.from !== e.to) {
         // fork a NEW generation for the new thread; the old generation keeps `from` as its own identity.
         const old = gens.find((x) => genHeldNative(x, e.from!));
-        const g = newGen(runKey, old?.incarnations[old.incarnations.length - 1]);
+        const g = newGen(runKey, e.eventId, old?.incarnations[old.incarnations.length - 1]);
         const inc = lastInc(g, e.ts);
         addClaim(inc, { value: runKey, form: "run", confidence: "hard", provenance: "same-announce", source: e.eventId });
         addClaim(inc, { value: e.to, form: e.form, confidence: conf, provenance, source: e.eventId });
       } else {
         // bootstrap / correction / self-confirm — stay on the thread's own generation.
         let g = (e.from ? gens.find((x) => genHeldNative(x, e.from!)) : undefined) ?? gens.find((x) => !genHasHardNative(x));
-        if (!g) g = newGen(runKey);
+        if (!g) g = newGen(runKey, e.eventId);
         if (e.kind === "correction" && e.from && e.from !== e.to) supersedeClosure(g, e.from, e.form);
         addClaim(lastInc(g, e.ts), { value: e.to, form: e.form, confidence: conf, provenance, source: e.eventId });
       }
@@ -451,33 +468,26 @@ export function buildProjection(events: IdentityEvent[], corruption: LogReadResu
 
   // 4. Materialize entities — one per generation. entityId derived from the generation key ⇒ STABLE (P2-5).
   const entities = new Map<string, IdentityEntity>();
-  const genEntityId = new Map<string, string>();
   for (const g of allGens) {
     if (g.incarnations.every((inc) => inc.claims.length === 0 && inc.busPid == null && inc.hostPid == null)) continue;
     const entityId = `ent-${shortHash(g.key)}`;
-    genEntityId.set(g.key, entityId);
     const tool = g.incarnations.find((i) => i.tool)?.tool;
     const cwd = g.incarnations.find((i) => i.cwd)?.cwd;
     entities.set(entityId, { entityId, incarnations: g.incarnations, possibleRelated: [], tool, cwd });
   }
 
-  // 5. split — an event-level entity separation (review P2-5). If the target entity carries more than one
-  //    incarnation, detach the most recent one into a new entity; the old entityId is preserved with its
-  //    remaining history (both stay resolvable → the shared id reads as candidates). v1's generation model
-  //    already keeps different threads apart, so a single-incarnation entity has nothing to separate — the
-  //    split is recorded as applied=false rather than silently clearing annotations.
+  // 5. split — recognized and recorded, but INERT in v1 (applied: false; review P2-5 scope note). The
+  //    generation model already keeps distinct threads apart (the A/B mis-merge premise the reviewer
+  //    acknowledged is gone), so there is no mis-merged entity for an event-level split to separate. A
+  //    mutating detach could not honour "a committed split decision is immutable under later append/revoke"
+  //    without a richer per-incarnation split target; rather than claim closure with a fragile detach that
+  //    later events rewrite, split is a no-op that NEVER retargets a published entityId, loses history, or
+  //    clears annotations. The real lifecycle guarantee it was conflated with — an entityId that survives
+  //    revoke/reorder — is delivered by the eventId-anchored generation keys above. Active split is vNext.
   const splits: Array<{ eventId: string; of: string; applied: boolean }> = [];
   for (const e of ordered) {
     if (e.type !== "split" || revokedEventIds.has(e.eventId)) continue;
-    const ent = entities.get(e.of);
-    if (ent && ent.incarnations.length >= 2) {
-      const detached = ent.incarnations.pop()!;
-      const newId = `ent-${shortHash(`${e.of}~split~${e.eventId}`)}`;
-      entities.set(newId, { entityId: newId, incarnations: [detached], possibleRelated: [], tool: detached.tool, cwd: detached.cwd });
-      splits.push({ eventId: e.eventId, of: e.of, applied: true });
-    } else {
-      splits.push({ eventId: e.eventId, of: e.of, applied: false });
-    }
+    splits.push({ eventId: e.eventId, of: e.of, applied: false });
   }
 
   // 6. Resolution indexes: aliasIndex = HARD non-superseded claims; possibleIndex = possible; pidIndex = pids.
@@ -547,6 +557,11 @@ export type WhoisResult =
 export function whois(proj: Projection, id: string): WhoisResult {
   const q = id.trim();
   if (!q) return { kind: "not-seen" };
+
+  // A published entityId is itself queryable — so an id handed out by whois stays resolvable for its history,
+  // even after later events (review P2-5). entityIds ("ent-<hash>") don't collide with real id forms.
+  const direct = proj.entities.get(q);
+  if (direct) return { kind: "entity", entity: direct };
 
   let hitIds = proj.aliasIndex.get(q);
   if (!hitIds || hitIds.size === 0) {
