@@ -78,6 +78,50 @@ export type RejectedResult = {
   atSeq: number;
 };
 
+/** Wait/Approval — a first-class CONTROL entity so every pause is durable and swept, not held in a coordinator's memory
+ *  (team-collab §0b R2). Type lives HERE (co-located with Change); transitions are in task-wait.ts. The three states are
+ *  decide → execute → confirm, each durable (P1-1): a timeout handler CAS-commits pendingAction BEFORE the IO and only
+ *  resolves with evidence — never resolve-then-IO, never IO-then-record. */
+export type WaitKind = "wait" | "approval";
+export type WaitState = "open" | "action_pending" | "resolved";
+export type ApprovalDecision = "pending" | "granted" | "denied" | "cancelled";
+
+/** Typed anchoring (P2-1): a wait binds a concrete execution object; a stale wait must not act on a new binding/attempt. */
+export type WaitSubject = {
+  jobId: string;
+  attemptId?: string;
+  bindingId?: string;
+  observedResultId?: string;
+  validationRunId?: string;
+  approvalRequestId?: string;
+};
+
+export type PendingAction = { actionId: string; actionKind: string; target: string; expectedSubjectVersion: number };
+export type WaitResolution = { outcome: string; reason: string; sourceOperationId: string };
+
+export type WaitRecord = {
+  waitId: string;
+  kind: WaitKind;
+  subject: WaitSubject;
+  state: WaitState;
+  deadlineSec: number;
+  owner: string;
+  /** Predefined policy ref: a reversible/non-privileged wait may bypass on timeout; a privileged/irreversible one escalates. */
+  timeoutPolicy: "bypass" | "escalate";
+  pendingAction?: PendingAction;
+  resolution?: WaitResolution;
+  escalatedAt?: number;
+  // --- approval branch (kind="approval"): resolved != granted (P1-2). ---
+  actionRef?: string;
+  paramsDigest?: string;
+  approvalAuthority?: string;
+  decision?: ApprovalDecision;
+  grantRef?: string;
+  preauthorizationRef?: string;
+  /** R3: explanatory audit only — NOT the authority fact (a missing reason is a malformed request, never auto-grant). */
+  approvalReason?: string;
+};
+
 export type ChangeBody =
   | { put: "plan"; plan: TaskPlan }
   | { put: "attempt"; attempt: TaskAttempt }
@@ -86,6 +130,7 @@ export type ChangeBody =
   | { put: "rejected"; rejected: RejectedResult }
   | { put: "supersede"; acceptedResultId: string }
   | { put: "intent"; intent: DispatchIntent }
+  | { put: "wait"; wait: WaitRecord }
   | { put: "lifecycle"; record: ControlRecord }
   | { put: "scan"; branch: string; cursor: string | null }
   | { put: "tombstone"; launchId: string };
@@ -124,6 +169,7 @@ export function entityKeyOf(c: ChangeBody): string {
     case "rejected": return `rejected:${c.rejected.attemptId}:${c.rejected.atSeq}`;
     case "supersede": return `accepted:${c.acceptedResultId}`; // modifies that accepted entity
     case "intent": return `intent:${c.intent.intentId}`;
+    case "wait": return `wait:${c.wait.waitId}`;
     case "lifecycle": return `lifecycle:${c.record.launchId}`;
     case "scan": return `scan:${c.branch}`;
     case "tombstone": return `tombstone:${c.launchId}`;
