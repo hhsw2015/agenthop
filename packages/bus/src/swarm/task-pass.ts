@@ -182,6 +182,7 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
     if (out.error) { ops.log(`judge ${attempt.attemptId}: ${out.error}`); continue; }
     if (out.changes.length === 0) continue; // candidate-level discard / idempotent replay
     const r = ops.commit(state, out.changes);
+    if (!r.result.ok) { ops.log(`task accept-pass ${attempt.attemptId}: commit rejected (${r.result.reason}) — re-observe next tick`); continue; } // disk-CAS consumer contract: a rejected commit is not success
     state = r.state;
     ops.log(`task accept-pass ${attempt.attemptId}: ${out.verdict.decision}`);
   }
@@ -216,9 +217,17 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
     // RETRY_WAIT — so retiring the old here is safe.
     const preBodies: ChangeBody[] = [{ put: "intent", intent: prep.intent }, { put: "attempt", attempt: prep.attempt }];
     for (const retired of prep.retired) preBodies.push({ put: "attempt", attempt: retired });
-    state = ops.commit(state, preBodies).state;
+    // disk-CAS consumer contract (round-3 P1): a REJECTED pre-IO commit means a concurrent loop advanced the log, so our
+    // state (and the whole ready/cap computation) is stale — abandon this dispatch WITHOUT starting the box (never an
+    // allocate IO with no durable intent) and recompute next tick. The already-committed intents stand.
+    const pre = ops.commit(state, preBodies);
+    if (!pre.result.ok) { ops.log(`dispatch ${task.nodeId}: pre-IO commit rejected (${pre.result.reason}) — not starting, recompute next tick`); break; }
+    state = pre.state;
 
     const { alloc, delivered } = await ops.startTask({ assignment: prep.assignment, launchId });
+    // A concurrent sweep loop (R1) may have advanced the log DURING the allocate IO — reload so the outcome commits against
+    // the current head (the intent entity's revision is untouched by the sweep, so the outcome still applies cleanly).
+    state = ops.loadState();
     const resolved = resolveAllocOutcome(prep.intent, alloc, { nowSec: ops.nowSec() });
     // created+delivered => confirm; created+!delivered => leave resolved (box occupies via creation-bound expiry, but the
     // worker never started, so do NOT confirm — observation/expiry reconciles); clean-fail => abandon intent + revoke the
@@ -228,7 +237,12 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
       intent: alloc === "created" ? (delivered ? confirmIntent(resolved) : resolved) : alloc === "clean-fail" ? abandonIntent(resolved) : resolved,
     }];
     if (alloc === "clean-fail") postBodies.push({ put: "attempt", attempt: { ...prep.attempt, status: "ABANDONED", abandonReason: "intent-revoked" } });
-    state = ops.commit(state, postBodies).state;
+    // The box is already allocated; its intent is durable (pending) from the pre-IO commit. If the outcome commit still
+    // conflicts, do NOT discard it and keep dispatching — stop and let the next tick reconcile the pending intent (via
+    // observation / creation-bound expiry), so we never leave a box with a lost outcome while allocating more.
+    const post = ops.commit(state, postBodies);
+    if (!post.result.ok) { ops.log(`dispatch ${task.nodeId}: outcome commit rejected (${post.result.reason}) — box allocated, intent durable pending; reconcile next tick`); break; }
+    state = post.state;
     // created (delivered or not) + unknown hold a slot; clean-fail reliably took none.
     if (alloc !== "clean-fail") free -= 1;
     ops.log(`dispatch ${task.nodeId}: ${launchId} alloc=${alloc} delivered=${delivered}`);

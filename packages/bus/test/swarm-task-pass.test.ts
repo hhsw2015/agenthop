@@ -53,6 +53,37 @@ function mkOps(over: Partial<TaskOps> & { stateRef: { s: LogState }; order: stri
   };
 }
 
+describe("taskPass — disk-CAS consumer contract (R1/R2 round-3 P1): a rejected commit never proceeds to IO", () => {
+  test("a rejected pre-IO commit does NOT startTask (never a box without a durable intent)", async () => {
+    const stateRef = { s: initialLogState() };
+    const order: string[] = [];
+    await taskPass(plan1(), mkOps({
+      stateRef, order,
+      commit: (state, bodies) => {
+        order.push(`commit:${bodies.map((b) => b.put).join("+")}`);
+        if (bodies.some((b) => b.put === "intent")) return { state, result: { ok: false, reason: "seq", currentSeq: state.seq + 99 } }; // disk-CAS reject the pre-IO commit
+        const r = stampCommit(state, bodies); stateRef.s = r.state; return r;
+      },
+    }));
+    expect(order).toContain("commit:intent+attempt"); // the pre-IO commit was attempted
+    expect(order).not.toContain("startTask");          // rejected ⇒ NO allocate IO
+    expect(theIntent(stateRef.s)).toBeUndefined();     // nothing persisted
+  });
+
+  test("the outcome is committed against a RELOADED state (reload AFTER the allocate IO)", async () => {
+    const stateRef = { s: initialLogState() };
+    const order: string[] = [];
+    await taskPass(plan1(), mkOps({
+      stateRef, order,
+      loadState: () => { order.push("loadState"); return stateRef.s; },
+    }));
+    const iStart = order.indexOf("startTask");
+    expect(iStart).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("loadState", iStart)).toBeGreaterThan(iStart);        // reloaded after the IO
+    expect(order.indexOf("commit:intent", iStart)).toBeGreaterThan(order.indexOf("loadState", iStart)); // outcome commits after the reload
+  });
+});
+
 describe("taskPass dispatch — CAS-then-IO ordering", () => {
   test("commits intent+attempt BEFORE startTask, then commits the confirmed outcome", async () => {
     const stateRef = { s: initialLogState() };
