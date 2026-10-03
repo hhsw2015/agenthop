@@ -219,18 +219,19 @@ const PRESENCE_START_MARK = `# ${HOOK_SENTINEL_PRESENCE}:start`;
 const PRESENCE_END_MARK = `# ${HOOK_SENTINEL_PRESENCE}:end`;
 
 /**
- * The SessionStart command that launches this session's always-on bus PRESENCE node (see presence.ts), so the session
- * is findable + reachable on the bus FROM STARTUP — not only after it first calls an agenthop tool. Detached + started
- * at most once (skipped if its pid is already alive); pid recorded so SessionEnd can stop it. setsid fully detaches on
- * Linux; macOS has no setsid, where a plain background job in a non-interactive shell already survives the hook's exit.
- * Side-effect-only (`|| true`, output suppressed) so it can never block or fail a turn.
+ * The SessionStart command that brings up this session's always-on bus PRESENCE node (see presence.ts), so the session
+ * is findable + reachable on the bus FROM STARTUP — not only after it first calls an agenthop tool. Backgrounded with a
+ * plain `&` (NOT setsid: a bun --compile binary with no controlling terminal drains its loop and exits), stdin from
+ * /dev/null, started at most once (skipped if the recorded pid is alive); the pid is recorded so SessionEnd can stop it.
+ * A non-interactive shell does not SIGHUP its background children on exit, so the daemon survives the hook. Side-effect-
+ * only (`|| true`, output suppressed) so it can never block or fail a turn.
  */
 function presenceStartCommand(bin: string): string {
   const q = shQuote(bin);
-  return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; else if command -v setsid >/dev/null 2>&1; then setsid ${q} presence </dev/null >/dev/null 2>&1 & else ${q} presence </dev/null >/dev/null 2>&1 & fi; echo \$! > "\$_pf"; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
+  return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; else ${q} presence </dev/null >/dev/null 2>&1 & echo \$! > "\$_pf"; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
 }
 
-/** The SessionEnd command that stops this session's presence node (by the recorded pid) and removes its pid file. */
+/** The SessionEnd command that stops this session's presence node (by the pid agenthop recorded) and removes the file. */
 function presenceEndCommand(): string {
   return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pf="\$HOME/.agenthop/presence/\$_sid.pid"; [ -f "\$_pf" ] && kill "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; rm -f "\$_pf"; fi >/dev/null 2>&1 || true ${PRESENCE_END_MARK}`;
 }

@@ -10,38 +10,38 @@ import { dbg } from "./debug.js";
  * inbound message to the host's live channel (Claude cc-socks / Codex `codex queue` via cwd-match) or persists it to
  * the durable inbox — exactly what the MCP node does, minus the MCP tool surface.
  *
+ * Launch model: the SessionStart hook backgrounds this (a plain `&`, NOT setsid). A bun --compile binary with no
+ * controlling terminal (setsid/new session) drains its event loop and exits, so it must stay in the hook's session;
+ * a non-interactive shell does not SIGHUP its background children on exit, so it survives the hook. SessionEnd stops it
+ * by pid, and the orphan guard self-exits if the host's live channel is gone for a while.
+ *
  * Coexistence with the lazily-spawned MCP node is safe: they share one session identity, core.unified() collapses the
  * two local nodes into one roster entry (so resolve isn't "ambiguous"), and the atomic durable-inbox claim + unicast
  * DM routing mean a message is delivered exactly once even while both run.
- *
- * Lifecycle: SIGTERM/SIGINT (the SessionEnd hook) stops it. An orphan guard self-exits if the host's messaging socket
- * is gone for several checks — so a session that ended without its SessionEnd hook firing does not leave a ghost on
- * the bus.
  */
 export function runPresence(opts: BusCoreOptions = {}): void {
   const core = startBusCore(opts);
   dbg(`presence up: ${core.self.title} (tool=${core.self.tool} stable=${core.self.stableId ?? "-"})`);
-  // A ref'd timer so the process stays alive independent of socket state (reconnect windows, broker failover).
-  const keepAlive = setInterval(() => {}, 1 << 30);
+  // A ref'd heartbeat so the process stays alive regardless of socket state (reconnect windows, broker failover).
+  const keepAlive = setInterval(() => {}, 60000);
 
   let closing = false;
+  let guard: ReturnType<typeof setInterval> | undefined;
   const shutdown = (code = 0): void => {
     if (closing) return;
     closing = true;
     clearInterval(keepAlive);
-    stopOrphanGuard();
+    if (guard) clearInterval(guard);
     void core.close().finally(() => process.exit(code));
   };
   process.on("SIGTERM", () => shutdown(0));
   process.on("SIGINT", () => shutdown(0));
 
   // Orphan guard: if the host's live channel is gone for several consecutive checks, the session ended without the
-  // SessionEnd hook killing us (crash / closed terminal) — self-exit so we don't linger as a ghost presence. Only for
+  // SessionEnd hook stopping us (crash / closed terminal) — self-exit so we don't linger as a ghost presence. Only for
   // Claude's cc-socks (a connect probe); Codex has no equivalent per-session socket, so its presence relies on the
-  // SessionEnd hook (its daemon is cheap + the broker drops it the moment it exits).
+  // SessionEnd hook (the broker drops it the moment it exits).
   const sock = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
-  let guard: ReturnType<typeof setInterval> | undefined;
-  const stopOrphanGuard = (): void => { if (guard) clearInterval(guard); };
   if (sock) {
     let misses = 0;
     guard = setInterval(() => {
