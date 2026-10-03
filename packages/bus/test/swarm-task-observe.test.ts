@@ -80,4 +80,34 @@ describe("observeResultOnBranch (real git)", () => {
     writeFileSync(path.join(repo, "readme"), "x"); commit("empty");
     expect(await observe()).toBeNull();
   });
+
+  // ---- coverage follow-up (reviewer): fold the passed probes into formal regression ----
+
+  test("a result >200 commits deep is still found — guards against re-adding an -n depth cap", async () => {
+    writeValidResult(); const deep = commit("deep-result");
+    rmSync(path.join(repo, RESULT_PATH)); commit("remove");
+    for (let i = 0; i < 205; i++) execFileSync("git", ["commit", "-q", "--allow-empty", "-m", `e${i}`], { cwd: repo });
+    const f = await observe();
+    expect(f!.observedWorkCommit).toBe(deep); // walked past 206 commits to the ancestor (no cap)
+  }, 30_000); // inherently ~400 git spawns (205 setup + full-history scan); generous timeout for the real-depth guard
+
+  test("a declared path with pathspec magic is treated literally (guards the --literal-pathspecs fix)", async () => {
+    // result declares an output whose literal name contains magic — it does NOT exist as a literal file, so it must read
+    // as absent (not magic-match a different real file).
+    mkdirSync(path.join(repo, "out/results/job/build/a0"), { recursive: true });
+    writeFileSync(path.join(repo, RESULT_PATH), JSON.stringify({ schemaVersion: 1, jobId: "job", planRevision: 1, nodeId: "build", attemptId: "job/build/a0", assignmentId: "as0", inputBindingDigest: "ibd", outcome: "success", outputs: [{ logicalName: "r", kind: "report", path: ":(literal)out/report.md" }], validationEvidence: [] }));
+    writeFileSync(path.join(repo, "out/report.md"), "report"); // the REAL file exists, but the declared literal name does not
+    commit("magic-path");
+    const f = await observe();
+    expect(f).not.toBeNull();
+    expect(f!.contract.requiredOutputsPresent).toBe(false); // literal declared path absent ⇒ not magic-matched to out/report.md
+  });
+
+  test("a git query error on a declared file ⇒ null (incomplete), never a business-fail (P2-3)", async () => {
+    writeValidResult(); commit("r");
+    // inject an ls-tree error for the evidence file only; everything else runs real git.
+    const flaky: GitRun = async (args, cwd) => (args[0] === "--literal-pathspecs" && args.includes("out/evidence.txt")) ? { code: 128, stdout: "", stderr: "boom" } : gitRun(args, cwd);
+    const f = await observeResultOnBranch({ git: flaky, workRepo: repo, scratch, branch: BRANCH, resultPath: RESULT_PATH, identity: IDENT, acceptanceEmpty: true });
+    expect(f).toBeNull(); // incomplete observation ⇒ re-read next pass, not a fabricated reject
+  });
 });
