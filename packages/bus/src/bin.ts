@@ -1,5 +1,6 @@
 import { startAgenthop } from "./agenthop.js";
 import { startBridge } from "./bridge.js";
+import { runPresence } from "./presence.js";
 import { setTeam } from "./team.js";
 import { statusHome, writeStatusFile } from "./statusfile.js";
 import { version } from "./version.js";
@@ -83,6 +84,14 @@ async function main(): Promise<void> {
     process.stdin.once("end", () => process.exit(0));
     process.stdin.once("close", () => process.exit(0));
     return;
+  }
+
+  if (cmd === "presence") {
+    // The always-on bus node a SessionStart hook BACKGROUNDS (plain `&`, not setsid — see presence.ts), so this session
+    // is on the bus from startup. It lives until SIGTERM (SessionEnd) or its orphan guard fires; it does NOT exit on
+    // stdin end (unlike `mcp`) since the hook gives it stdin=/dev/null.
+    runPresence({});
+    return; // the bus node + keep-alive timer keep the process alive
   }
 
   if (cmd === "--version" || cmd === "-v") {

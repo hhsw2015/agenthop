@@ -1,0 +1,8 @@
+{
+  "probe": "sleep accumulator with bounded in-loop work, local process only",
+  "nominal_accumulator_seconds": 0.05,
+  "measured_monotonic_elapsed_seconds": 0.28232541599936667,
+  "model_deadline_seconds": 0.15,
+  "accumulator_says_expired": false,
+  "monotonic_says_expired": true
+}

@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { codexDeliveryThread, resolvePeer, type UnifiedPeer } from "../src/core.js";
+import { codexDeliveryThread, dedupLocalPeers, resolvePeer, type UnifiedPeer } from "../src/core.js";
 
 /**
  * Recipient selection (identity-review #2/#5): a silent wrong pick is a misdelivered message, so
@@ -75,6 +75,30 @@ test("two runs sharing a stableId still disambiguate via the unique run id", () 
   }
   // ...and addressing by the unique run id resolves cleanly.
   expect(ok(resolvePeer([x, y], "self", "run-y")).id).toBe("run-y");
+});
+
+test("dedupLocalPeers collapses a session's presence daemon + MCP node into one resolvable entry", () => {
+  // Same session, two local nodes sharing the stableId (the startup presence daemon + the lazily-spawned MCP node).
+  const daemon = peer({ id: "run-daemon", stableId: "sess-1", title: "claude:Work-sess1", statusAt: 100 });
+  const mcp = peer({ id: "run-mcp", stableId: "sess-1", title: "claude:Work-sess1", statusAt: 200 }); // more recent
+  const other = peer({ id: "run-other", stableId: "sess-2", title: "claude:Other-sess2" });
+  const out = dedupLocalPeers([daemon, mcp, other]);
+  expect(out.length).toBe(2); // sess-1 collapsed to one, sess-2 kept
+  const sess1 = out.filter((p) => p.stableId === "sess-1");
+  expect(sess1.length).toBe(1);
+  expect(sess1[0]!.id).toBe("run-mcp"); // kept the more recently active node
+  // and now a send by that stableId resolves cleanly (no "ambiguous") instead of matching two
+  expect(ok(resolvePeer(out, "self", "sess-1")).id).toBe("run-mcp");
+});
+
+test("dedupLocalPeers keeps the earlier node when the later one has no newer status; stableId-less peers untouched", () => {
+  const a = peer({ id: "run-a1", stableId: "s", statusAt: 500 });
+  const b = peer({ id: "run-b1", stableId: "s" }); // no statusAt -> not newer, do not replace
+  const noStable1 = peer({ id: "run-n1", stableId: undefined });
+  const noStable2 = peer({ id: "run-n2", stableId: undefined });
+  const out = dedupLocalPeers([a, b, noStable1, noStable2]);
+  expect(out.filter((p) => p.stableId === "s").map((p) => p.id)).toEqual(["run-a1"]); // kept the one with status
+  expect(out.filter((p) => p.stableId === undefined).length).toBe(2); // stableId-less peers never collapsed
 });
 
 test("codexDeliveryThread locks delivery to the learned identity", () => {

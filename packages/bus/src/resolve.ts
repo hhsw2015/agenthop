@@ -8,6 +8,9 @@ export type UnifiedPeer = {
   /** The host's native session id: a durable, restart-stable address (see SelfInfo.stableId). */
   stableId?: string;
   tool: string;
+  /** The host's permission mode (Claude vocab: default|acceptEdits|plan|bypassPermissions); used to stamp from-mode on
+   *  a delivered cross-session frame so a bypass receiver doesn't gate a bypass sender. Absent => unknown => "default". */
+  mode?: string;
   cwd: string;
   title: string;
   via: "local" | "relay";
@@ -23,6 +26,36 @@ export type UnifiedPeer = {
   statusText?: string;
   statusAt?: number;
 };
+
+/**
+ * Collapse the SAME session's multiple LOCAL bus nodes into one roster entry. A session has two nodes while its
+ * startup PRESENCE daemon and its lazily-spawned MCP node both run — they share one `stableId`. Without this, a
+ * send by that stableId is "ambiguous" (two matches) and the roster shows the session twice. Keeping one is safe:
+ * both nodes push to the same host channel, and the atomic durable-inbox claim + unicast DM routing already prevent
+ * double delivery. The more recently active node (higher `statusAt`) is kept as the representative. Peers with no
+ * stableId (e.g. a Codex node before it has learned its thread id) are left as-is — they cannot be collapsed safely.
+ */
+export function dedupLocalPeers(peers: UnifiedPeer[]): UnifiedPeer[] {
+  const out = new Map<string, UnifiedPeer>();
+  const keyByStable = new Map<string, string>();
+  for (const peer of peers) {
+    if (peer.stableId) {
+      const prevKey = keyByStable.get(peer.stableId);
+      if (prevKey !== undefined) {
+        const prev = out.get(prevKey)!;
+        if ((peer.statusAt ?? 0) > (prev.statusAt ?? 0)) {
+          out.delete(prevKey);
+          out.set(peer.id, peer);
+          keyByStable.set(peer.stableId, peer.id);
+        }
+        continue; // drop the duplicate (older) node of the same session
+      }
+      keyByStable.set(peer.stableId, peer.id);
+    }
+    out.set(peer.id, peer);
+  }
+  return [...out.values()];
+}
 
 /**
  * Pick the peer a `to` string addresses, or an error. Pure, so it can be tested directly — this is

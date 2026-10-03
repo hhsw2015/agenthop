@@ -21,6 +21,15 @@ export type SelfInfo = {
   stableId?: string;
   /** claude | codex | gemini | cursor | grok | unknown. Cosmetic. */
   tool: string;
+  /**
+   * The host's PERMISSION MODE in Claude Code's vocabulary (default | acceptEdits | plan | bypassPermissions). Codex
+   * reports the same strings on its hook stdin (it adopted CC's hook schema), so no mapping is needed. Learned by the
+   * presence hook from the SessionStart stdin `permission_mode` and injected as AGENTHOP_MODE. Rides the roster so a
+   * delivery to a Claude host can stamp the SENDER's real mode on the cross-session frame (from-mode) instead of a
+   * hardcoded "default" — otherwise a bypass receiver gates every peer message for approval regardless of the sender's
+   * actual trust level. Undefined => unknown => treated as "default" (the safe, gated side).
+   */
+  mode?: string;
   cwd: string;
   pid: number;
   /** Human label for the roster, e.g. "codex:agenthop". */
@@ -44,9 +53,12 @@ export type AgentStatus = "working" | "idle" | "blocked" | "unknown";
 
 export const AGENT_STATUSES: readonly AgentStatus[] = ["working", "idle", "blocked", "unknown"];
 
-/** The host's native session id if it publishes one in the env at startup. Extensible per tool. */
+/** The host's native session id if it publishes one in the env at startup. Extensible per tool. Claude Code exposes
+ *  CLAUDE_CODE_SESSION_ID in the env; Codex has none, so its SessionStart presence hook parses the id from the hook's
+ *  stdin JSON and passes it as AGENTHOP_SESSION — the one durable identity a Codex presence daemon has at startup
+ *  (before it has made any MCP call), which equals its thread id, so delivery via `codex queue --thread` works. */
 export function nativeSessionId(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  return env.CLAUDE_CODE_SESSION_ID?.trim() || undefined;
+  return env.CLAUDE_CODE_SESSION_ID?.trim() || env.AGENTHOP_SESSION?.trim() || undefined;
 }
 
 /** Best-effort: an explicit override wins, otherwise a few known env markers, otherwise unknown. */
@@ -99,5 +111,7 @@ export function selfInfo(env: NodeJS.ProcessEnv = process.env, cwd: string = pro
   // Suffix the handle with the native session id when known (restart-stable), else the per-run id — NEVER a
   // bare `tool:dir`, which would exact-match and silently shadow a suffixed same-dir sibling in resolution.
   const title = sessionTitle(tool, cwd, stableId ?? id, env);
-  return { id, stableId, tool, cwd, pid: process.pid, title, startedAt: Date.now() };
+  // The host permission mode the presence hook learned from SessionStart stdin (see SelfInfo.mode). Undefined = unknown.
+  const mode = env.AGENTHOP_MODE?.trim() || undefined;
+  return { id, stableId, tool, mode, cwd, pid: process.pid, title, startedAt: Date.now() };
 }

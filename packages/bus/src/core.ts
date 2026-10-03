@@ -4,11 +4,13 @@ import { startLocalBus, type LocalBus } from "./broker.js";
 import { startRelay, type Relay } from "./relay.js";
 import { pushToHost } from "./push.js";
 import { startCodexDaemon, type CodexDaemon } from "./codex.js";
-import { resolvePeer, type UnifiedPeer } from "./resolve.js";
+import { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
+import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox } from "./inbox.js";
 
-export { resolvePeer, type UnifiedPeer } from "./resolve.js";
+export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 
 /**
  * The one thing the tools talk to. It joins two transports behind a single roster and a single
@@ -57,7 +59,13 @@ export function codexDeliveryThread(
 
 export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const self = selfInfo();
-  const queue: BusMessage[] = [];
+  const home = options.home ?? homedir(); // resolved early: used by handleInbound (below) + status watch (later)
+  // Durable inbox: a message that cannot be pushed to the host's live UI yet (channel not ready) is persisted to disk
+  // and retried, instead of sitting in a volatile array only agenthop_recv drains. Keys: the stable identity (survives
+  // an MCP-subprocess restart) plus the per-run id (used before stableId was learned).
+  const inboxKey = (): string => self.stableId ?? self.id;
+  const inboxKeys = (): string[] => (self.stableId && self.stableId !== self.id ? [self.stableId, self.id] : [self.id]);
+  let flushing = false;
   // Work-status is per SESSION IDENTITY, not per MCP-server process: one Codex daemon-backed server can
   // adopt several thread identities over its life (see learnStableId), and each must keep its own status
   // and its own monotonic seq — otherwise thread A's seq would gate thread B's reports.
@@ -77,23 +85,70 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const codexDaemon: CodexDaemon | undefined =
     !process.env.CLAUDE_CODE_MESSAGING_SOCKET && self.tool === "codex" ? startCodexDaemon() : undefined;
 
-  // A message has arrived for us. Try the host's native inbox first (surfaces in the live TUI with
-  // no hook and no poll); only if there is none do we keep it for agenthop_recv.
-  const handleInbound = (from: string, text: string, via: "local" | "relay"): void => {
-    // Delivery is locked to this session's learned identity (codexDeliveryThread), so it never diverges
-    // from the published stableId. Learn from the SAME value: authoritative when it came from call
-    // metadata, a guess when only the daemon bootstrapped it.
-    const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread());
+  // Re-attempt delivery of durably-queued messages whenever the native channel may have become ready (e.g. a Codex
+  // session that just took its first turn now has a rollout for `codex queue`). Claim/ack/release so the retry timer
+  // and an explicit recv never double-deliver; stop at the first failure (channel still not ready) and retry later.
+  const flushInbox = async (): Promise<void> => {
+    if (flushing) return;
+    flushing = true;
+    try {
+      // Recover claims a dead/previous run left behind, for the CURRENT identity's keys. Crucial after a LATE identity
+      // adoption (Codex learns its native id only after its first turn): a message orphaned as `.json.claim-<oldpid>`
+      // under the just-adopted stableId would otherwise never be reclaimed (claimInbox only sees `.json`), staying stuck
+      // across the restart/adoption (Codex P2-8). Cheap + safe: only a dead pid's claim is released.
+      recoverStaleClaims(home, inboxKeys());
+      const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
+      // claimInbox claims the WHOLE pending batch up front. On the first push failure (channel not ready) we
+      // must release this one AND every still-unprocessed claim — otherwise they are orphaned as .claim-<pid>
+      // files that no later flush reclaims (claimInbox only sees .json), stranding the message for good.
+      const claimed = claimInbox(home, inboxKeys(), String(process.pid));
+      for (let i = 0; i < claimed.length; i++) {
+        const ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread, codexHome: codexDaemon?.codexHome(), fromMode: claimed[i].msg.fromMode, to: self.title });
+        if (ok) { ackInbox(claimed[i].file); continue; }
+        for (let j = i; j < claimed.length; j++) releaseInbox(claimed[j].file);
+        break;
+      }
+    } finally {
+      flushing = false;
+    }
+  };
+
+  // A message has arrived for us. Try the host's native inbox first (surfaces in the live TUI with no hook and no
+  // poll); if the channel is not ready, persist it to the DURABLE inbox so the retry below delivers it later.
+  // `carried` = the sender's OWN address (handle) + permission mode, stamped into the local envelope at send (email
+  // "From:"). Preferred over a roster lookup, which misses when the sender's per-run `from` id isn't in our roster (its
+  // run changed / it has >1 node) — the bug that showed a bare run-id prefix + "default". Relay has no carry yet → it
+  // falls back to resolving by the roster (labelFor/modeFor).
+  const handleInbound = (from: string, text: string, via: "local" | "relay", carried?: { label?: string; mode?: string }): void => {
+    // Delivery is locked to this session's learned identity (codexDeliveryThread), so it never diverges from the
+    // published stableId. Learn from the SAME value: authoritative from call metadata, a guess from the daemon.
+    const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
     learnStableId(codexThread, ownCodexThread !== undefined);
-    const label = labelFor(from);
-    dbg(`inbound via=${via} from=${from} own=${ownCodexThread} stable=${self.stableId} daemon=${codexDaemon?.activeThread()} -> codexThread=${codexThread}`);
-    void pushToHost(label, text, { codexThread }).then((ok) => {
+    const label = carried?.label ?? labelFor(from); // the sender's stamped address, else resolve via roster
+    const fromMode = carried?.mode ?? modeFor(from); // the sender's stamped mode, else resolve via roster
+    // Bind the delivery identity's inbox key + arrival time NOW, before the async push. If the push fails, the fallback
+    // persist must use the SAME identity this message was resolved for — not whatever identity a concurrent noteThread
+    // switched us to by the time the callback runs, which would file A's message into B's inbox (Codex P2-7).
+    const key = inboxKey();
+    const ts = Date.now();
+    // Metadata-only comms journal for swarm observability. Gated so Buffer.byteLength + the call are skipped entirely
+    // when AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
+    if (msgLogEnabled()) writeMsgLog(home, { ts, from, to: self.id, via, direction: "in", size: Buffer.byteLength(text), text });
+    dbg(`inbound via=${via} from=${from} own=${ownCodexThread} stable=${self.stableId} daemon=${codexDaemon?.activeThread(self.cwd)} -> codexThread=${codexThread}`);
+    // `to: self.title` = THIS session's own address, shown email-style so the user can see which of their sessions got it.
+    void pushToHost(label, text, { codexThread, codexHome: codexDaemon?.codexHome(), fromMode, to: self.title }).then((ok) => {
       dbg(`pushToHost ok=${ok}`);
-      if (!ok) queue.push({ from, fromLabel: label, text, via });
+      if (ok) void flushInbox(); // channel works -> also deliver any durable backlog (keeps order)
+      else writeInbox(home, key, { from, fromLabel: label, fromMode, text, via, ts });
+    }).catch((e) => {
+      // A push that THREW (not just returned false) must still fall back to the durable inbox, never drop the message —
+      // an unhandled rejection would also crash the node (Codex P1-05). Persist under the identity bound above.
+      dbg(`pushToHost threw: ${e instanceof Error ? e.message : String(e)}`);
+      try { writeInbox(home, key, { from, fromLabel: label, fromMode, text, via, ts }); } catch { /* best effort */ }
     });
   };
 
-  const local: LocalBus = startLocalBus(self, options.home, (m) => handleInbound(m.from, m.payload, "local"));
+  const local: LocalBus = startLocalBus(self, options.home, (m) => handleInbound(m.from, m.payload, "local", { label: m.fromLabel, mode: m.fromMode }));
 
   // Codex has no native session id in its env, so we adopt the thread id as our stableId the first
   // time we learn it (from an MCP call's metadata or the daemon). This also refreshes the readable
@@ -130,8 +185,13 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const relay: Relay | undefined = startRelay(self, (from, text) => handleInbound(from, text, "relay"), options);
 
   const unified = (): UnifiedPeer[] => {
+    // Collapse this machine's duplicate nodes for ONE session (startup presence daemon + lazily-spawned MCP node share
+    // a stableId) so resolve isn't ambiguous and the roster shows it once (dedupLocalPeers; delivery stays exactly-once
+    // via the atomic inbox + unicast DM). Then merge relay peers that aren't already present locally.
     const out = new Map<string, UnifiedPeer>();
-    for (const p of local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid, status: p.status, statusSeq: p.statusSeq, statusText: p.statusText, statusAt: p.statusAt });
+    for (const p of dedupLocalPeers(local.peers().map((p) => ({ id: p.id, stableId: p.stableId, tool: p.tool, mode: p.mode, cwd: p.cwd, title: p.title, via: "local", pid: p.pid, status: p.status, statusSeq: p.statusSeq, statusText: p.statusText, statusAt: p.statusAt })))) {
+      out.set(p.id, p);
+    }
     if (relay) {
       for (const p of relay.roster()) if (!out.has(p.id)) out.set(p.id, p);
     }
@@ -142,6 +202,16 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     const p = unified().find((x) => x.id === idOrPub || x.stableId === idOrPub || x.pub === idOrPub);
     if (!p) return idOrPub.slice(0, 8);
     return `${p.title}${p.via === "relay" ? `@${p.machine ?? "remote"}` : ""}`;
+  };
+
+  // The sender's REAL permission mode, used only to stamp from-mode on a delivery (unknown -> "default", the safe/gated
+  // side). LOCAL peers ONLY: a same-OS-user peer could change this machine's config anyway, so trusting its self-reported
+  // mode grants no new power; but a REMOTE same-team member must NOT be able to self-attest "bypassPermissions" and so
+  // skip the receiver's approval gate — team membership proves membership, not a permission mode (Codex P1-04). A relay
+  // sender therefore resolves to undefined -> "default" -> gated unless the receiver itself opts in (crossSessionInbound).
+  const modeFor = (idOrPub: string): string | undefined => {
+    const p = unified().find((x) => x.id === idOrPub || x.stableId === idOrPub || x.pub === idOrPub);
+    return p?.via === "local" ? p.mode : undefined;
   };
 
   const resolve = (to: string): UnifiedPeer | { error: string } => resolvePeer(unified(), self.id, to);
@@ -174,7 +244,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // Slice B: pick up status that an EXTERNAL hook wrote for this session (via `agenthop report-status`
   // → ~/.agenthop/status/<key>.json) and apply it through the same monotonic path. Keyed by the current
   // identity, re-read on every change so a Codex thread id learned late still lines up.
-  const statusHome = options.home ?? homedir();
+  const statusHome = home;
   const applyStatusFromFile = (): void => {
     const f = readStatusFile(statusHome, self.stableId ?? self.id);
     if (f) setStatusImpl(f.state as AgentStatus, { seq: f.seq, text: f.text });
@@ -182,27 +252,47 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const stopStatusWatch = watchStatusDir(statusHome, applyStatusFromFile);
   applyStatusFromFile(); // pick up a file that already exists at startup
 
+  // Durable-inbox retry: deliver anything queued while the native channel was not ready, and pick up messages a previous
+  // MCP-subprocess run persisted (restart durability). flushInbox itself first recovers stale claims for the current
+  // identity's keys (Codex P2-8), so this covers both the initial run-id and any later-adopted stableId. Unref'd — the
+  // broker socket keeps the process alive; this timer must not by itself.
+  void flushInbox();
+  const flushTimer = setInterval(() => void flushInbox(), 5000);
+  flushTimer.unref?.();
+
   return {
     self,
     peers: unified,
     noteThread(id) {
       ownCodexThread = id;
       learnStableId(id, true); // call metadata is authoritative for both identity and delivery
+      void flushInbox(); // a Codex session just took a turn -> its rollout now exists -> flush anything pending to it
     },
     async send(to, text) {
       const peer = resolve(to);
       if ("error" in peer) return { ok: false, error: peer.error };
-      if (peer.via === "local") return { ok: local.send(peer.id, text), label: labelFor(peer.id) };
-      if (relay && peer.pub) return { ok: await relay.send(peer.pub, text), label: labelFor(peer.id) };
+      // Log an "out" entry only on confirmed delivery. Gated so Buffer.byteLength + the call are skipped when
+      // AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
+      const logOut = (via: "local" | "relay"): void => {
+        if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via, direction: "out", size: Buffer.byteLength(text), text });
+      };
+      if (peer.via === "local") { const ok = local.send(peer.id, text); if (ok) logOut("local"); return { ok, label: labelFor(peer.id) }; }
+      if (relay && peer.pub) { const ok = await relay.send(peer.pub, text); if (ok) logOut("relay"); return { ok, label: labelFor(peer.id) }; }
       return { ok: false, error: "That peer is on another machine but no team relay is configured here (set AGENTHOP_TEAM)." };
     },
     async recv(timeoutMs) {
-      // Only messages with no native host inbox land here; native ones already surfaced in the TUI.
+      // Explicit pull: drain the DURABLE inbox (messages the push channel could not surface). Claim+ack so the retry
+      // timer never re-delivers the same message.
       const deadline = Date.now() + timeoutMs;
-      let batch = queue.splice(0, queue.length);
+      const drain = (): BusMessage[] =>
+        claimInbox(home, inboxKeys(), String(process.pid)).map((c) => {
+          ackInbox(c.file);
+          return { from: c.msg.from, fromLabel: c.msg.fromLabel, text: c.msg.text, via: c.msg.via };
+        });
+      let batch = drain();
       while (batch.length === 0 && Date.now() < deadline) {
         await delay(120);
-        batch = queue.splice(0, queue.length);
+        batch = drain();
       }
       return batch;
     },
@@ -242,6 +332,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       return `local broker: ${local.role()}; ${team_}; ${unified().filter((p) => p.id !== self.id).length} other session(s)`;
     },
     async close() {
+      clearInterval(flushTimer);
       stopStatusWatch();
       codexDaemon?.close();
       await local.close();

@@ -1,0 +1,8 @@
+{
+  "plan_sha_matches": true,
+  "report_covers_six_focuses": true,
+  "ordinary_claim_both_succeed": true,
+  "unique_conditional_claim_one_winner": true,
+  "scope_limit_explicit": true,
+  "tracked_repository_unchanged": true
+}
