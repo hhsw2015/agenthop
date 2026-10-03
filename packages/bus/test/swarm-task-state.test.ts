@@ -163,6 +163,20 @@ describe("advanceAttempt (§3.1)", () => {
     const r = advanceAttempt(rpv, { type: "permanent" }, 1000);
     expect(r.ok && r.attempt.status === "FAILED" && r.attempt.failureClass === "permanent").toBe(true);
   });
+  test("revoke (F1 / supersede-cascade #2): RUNNING + never-activated binding -> ABANDONED, retriesUsed unchanged", () => {
+    const a = mkAttempt(); // firstBinding has no activatedAtSeq
+    const f1 = advanceAttempt(a, { type: "revoke", reason: "intent-revoked" }, 1000);
+    expect(f1.ok && f1.attempt.status === "ABANDONED" && f1.attempt.abandonReason === "intent-revoked" && f1.attempt.retriesUsed === 0).toBe(true);
+    const si = advanceAttempt(a, { type: "revoke", reason: "stale-input" }, 1000);
+    expect(si.ok && si.attempt.abandonReason === "stale-input").toBe(true);
+  });
+  test("revoke rejected once a binding has been activated (live execution goes the closing route, not revoke)", () => {
+    const a = createAttempt({ jobId: "job", nodeId: "P", n: 1, planRevision: 1, specDigest: "sd", inputBindings: [ib()], firstBinding: activateBinding(bind(), SEQ + 1), createdAtSeq: SEQ });
+    expect(advanceAttempt(a, { type: "revoke", reason: "intent-revoked" }, 1000).ok).toBe(false);
+  });
+  test("revoke illegal from RPV (that is the stale route)", () => {
+    expect(advanceAttempt({ ...mkAttempt(), status: "RESULT_PENDING_VALIDATION" }, { type: "revoke", reason: "stale-input" }, 1000).ok).toBe(false);
+  });
 });
 
 describe("handoff continuation (X2, §3.2) — T1 acceptance", () => {

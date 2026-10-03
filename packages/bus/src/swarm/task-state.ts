@@ -108,7 +108,9 @@ export type Eligibility = { eligible: boolean; reason: string };
  *  membership (launchId+generation) and, for a closing/closed binding, whether the candidate commit is within the
  *  cutoffTip ancestry — that is git IO, passed in as `withinCutoffAncestry`. Pure decision over §2.3's three states:
  *  open => always; closing => inside cutoffTip ancestry; closed => only what was registered before close (same
- *  predicate: registration happened during the cutoffTip-ancestry scan). "empty" cutoff => nothing is eligible. */
+ *  predicate: registration happened during the cutoffTip-ancestry scan). "empty" cutoff => nothing is eligible.
+ *  NOTE for closed bindings: `withinCutoffAncestry` must mean "was this candidate REGISTERED before closedAtSeq"
+ *  (a fact the caller reads from CONTROL), NOT a fresh git ancestry computation — after close O1 no longer scans. */
 export function candidateEligibility(b: ExecutionBinding, withinCutoffAncestry: boolean): Eligibility {
   const st = bindingState(b);
   if (st === "open") return { eligible: true, reason: "open binding" };
@@ -168,14 +170,17 @@ export function createAttempt(i: NewAttempt): TaskAttempt {
   };
 }
 
+// jitterSec: the caller samples it ONCE and persists it in the operation payload; a crash-recovery REPLAY must reuse
+// the same value, never re-sample (§2.2 retryAt "采样一次持久,重放不再随机"). This pure layer only applies it.
 export type AttemptEvent =
   | { type: "observed" }                                              // non-closed binding ResultObserved
   | { type: "accepted" }                                             // validation passed
   | { type: "business_fail"; retryBudget: number; jitterSec?: number } // outcome=failure / V7/V8 on a consistent snapshot
   | { type: "transient_infra"; jitterSec?: number }                  // all bindings dead, no result
-  | { type: "stale"; which: "input" | "plan" }                       // V4 / V5 reject
+  | { type: "stale"; which: "input" | "plan" }                       // V4 / V5 reject (at validation time, from RPV)
   | { type: "inconsistent_snapshot" }                                // V7/V8 on an inconsistent rescue snapshot
   | { type: "permanent" }                                            // V1 / scope-violation / conflict / budget
+  | { type: "revoke"; reason: "intent-revoked" | "stale-input" }      // abandon a RUNNING, never-activated attempt
   | { type: "add_binding"; binding: ExecutionBinding };               // VM handoff continuation (X2)
 
 export type AttemptAdvance = { ok: true; attempt: TaskAttempt } | { ok: false; error: string };
@@ -221,6 +226,15 @@ export function advanceAttempt(a: TaskAttempt, event: AttemptEvent, nowSec: numb
     case "permanent":
       if (a.status !== "RESULT_PENDING_VALIDATION") return bad(`permanent from ${a.status}`);
       return ok({ status: "FAILED", failureClass: "permanent" });
+
+    case "revoke":
+      // Abandon a RUNNING attempt that never started executing: F1 (intent committed, startTask IO never happened —
+      // recovery abandons) and supersede-cascade #2 (an un-dispatched attempt → ABANDONED(stale-input)). Legal ONLY
+      // while every binding is still un-activated; an attempt with live execution must go the closing route, not here.
+      if (a.status !== "RUNNING") return bad(`revoke from ${a.status}`);
+      if (a.executionBindings.some((b) => b.activatedAtSeq !== undefined)) return bad("revoke of an attempt with an activated binding");
+      // retriesUsed UNCHANGED — nothing ran.
+      return ok({ status: "ABANDONED", abandonReason: event.reason });
 
     case "add_binding":
       if (a.status !== "RUNNING" && a.status !== "RESULT_PENDING_VALIDATION") return bad(`add_binding from ${a.status}`);
