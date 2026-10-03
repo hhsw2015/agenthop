@@ -4,7 +4,7 @@
 // propagation-doesn't-raise-confidence (P1-2/§2.3), pid/liveness three-state (P1-3/P1-4/§5),
 // revoke, and the log commit/recovery rules incl. the round-3 newline-terminated-corrupt boundary (§2.5).
 import {
-  appendEvent, buildProjection, eventDigest, identityDir, liveness, mintEventId, readIdentityLog, readLog, whois,
+  appendEvent, buildProjection, eventDigest, hostPidFrom, identityDir, liveness, mintEventId, readIdentityLog, readLog, recordLearn, recordSelfObserve, whois,
   type Claim, type IdentityEvent, type ProbeFact,
 } from "./bus-identity.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -151,6 +151,28 @@ const hard = (value: string, form: Claim["form"]): Claim => ({ value, form, conf
     // a torn tail on disk is reported as recoverable, not corruption
     writeFileSync(path.join(identityDir(home), "alias-log.jsonl"), JSON.stringify(obs("k", [hard("k", "run")])) + "\n" + '{"torn":');
     t("on-disk torn tail is recoverable, not corruption", (() => { const r = readIdentityLog(home); return r.uncommittedTail !== null && r.corruption.length === 0; })());
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+// --- feed helpers: recordSelfObserve + recordLearn produce a resolvable entity ---
+{
+  const home = mkdtempSync(path.join(tmpdir(), "ah-ident-feed-"));
+  try {
+    const self = { id: "run-xyz", stableId: "nat-xyz", title: "codex:Work-nat-xyz", tool: "codex", cwd: "/w", pid: 4242 };
+    recordSelfObserve(home, self, true, "local", { AGENTHOP_HOST_PID: "4000" } as NodeJS.ProcessEnv);
+    const r = readIdentityLog(home);
+    const proj = buildProjection(r.events);
+    t("feed: run id resolves", whois(proj, "run-xyz").kind === "entity");
+    t("feed: native resolves to same entity", (() => { const a = whois(proj, "run-xyz"), b = whois(proj, "nat-xyz"); return a.kind === "entity" && b.kind === "entity" && a.entity.entityId === b.entity.entityId; })());
+    t("feed: busPid and hostPid both indexed", whois(proj, "4242").kind === "entity" && whois(proj, "4000").kind === "entity");
+    t("hostPidFrom reads AGENTHOP_HOST_PID", hostPidFrom({ AGENTHOP_HOST_PID: "77" } as NodeJS.ProcessEnv) === 77 && hostPidFrom({} as NodeJS.ProcessEnv) === undefined);
+    // a guess bootstrap then correction via the helpers
+    recordLearn(home, "run-xyz", undefined, "guessN", "bootstrap", false);
+    recordLearn(home, "run-xyz", "guessN", "trueN", "correction", true);
+    const proj2 = buildProjection(readIdentityLog(home).events);
+    t("feed: corrected guess does not resolve", whois(proj2, "guessN").kind === "not-seen");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
