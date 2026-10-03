@@ -4,13 +4,15 @@
  * batch and REBUILDS state from the on-disk log. Local-only (one dispatcher machine); the cross-machine CONTROL ref +
  * awaitable barrier are step B / Phase T3.
  *
- * Persistence model: one file per batch, `<seq>.json` = CommittedBatch {seq, changes}, written atomically (temp+rename,
- * 0600). A fresh process enumerates + replays them (replayLog asserts contiguous seq, catching a gap/corruption). The
- * synchronous write IS the CAS-then-IO barrier for step A ("本机 fsync 即屏障"): commitControl persists before it
- * returns, so a caller that does `commitControl(...); startTask(...)` has the intent durable BEFORE the allocate IO.
+ * Persistence model: one file per batch, `<seq>.json` = CommittedBatch {seq, changes}, written atomically + durably
+ * (temp → fsync → rename → dir fsync, 0600). A fresh process enumerates + replays them (replayLog asserts contiguous seq,
+ * catching a gap/corruption). The write IS the CAS-then-IO barrier for step A ("本机 fsync 即屏障"): commitControl fsyncs
+ * the batch to disk before it returns, so a caller that does `commitControl(...); startTask(...)` has the intent durable
+ * BEFORE the allocate IO — a sync return alone proves program order + atomic visibility, NOT on-disk survival across a
+ * power loss (Codex review P2-6: the fsyncs are what make the claimed barrier real). Cross-machine CONTROL = step B / T3.
  */
 
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, existsSync, openSync, writeSync, fsyncSync, closeSync } from "node:fs";
 import path from "node:path";
 import {
   commit, replayLog, initialLogState,
@@ -19,8 +21,13 @@ import {
 
 function atomicWrite(file: string, data: string): void {
   const tmp = `${file}.tmp.${process.pid}`;
-  writeFileSync(tmp, data, { mode: 0o600 });
+  // Write + fsync the data, then rename, then fsync the directory so the rename's directory entry also survives power
+  // loss. Only with both fsyncs is this the durable barrier the step-A contract claims (P2-6).
+  const fd = openSync(tmp, "w", 0o600);
+  try { writeSync(fd, data); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, file);
+  try { const dfd = openSync(path.dirname(file), "r"); try { fsyncSync(dfd); } finally { closeSync(dfd); } }
+  catch { /* directory fsync is best-effort — some platforms disallow fsync on a dir fd; the file fsync is the barrier */ }
 }
 
 /** Rebuild LogState from the on-disk log. A missing dir = the initial (seq 0) state. */
