@@ -98,7 +98,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // files that no later flush reclaims (claimInbox only sees .json), stranding the message for good.
       const claimed = claimInbox(home, inboxKeys(), String(process.pid));
       for (let i = 0; i < claimed.length; i++) {
-        const ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread });
+        const ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread, codexHome: codexDaemon?.codexHome() });
         if (ok) { ackInbox(claimed[i].file); continue; }
         for (let j = i; j < claimed.length; j++) releaseInbox(claimed[j].file);
         break;
@@ -120,7 +120,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // when AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
     if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from, to: self.id, via, direction: "in", size: Buffer.byteLength(text), text });
     dbg(`inbound via=${via} from=${from} own=${ownCodexThread} stable=${self.stableId} daemon=${codexDaemon?.activeThread(self.cwd)} -> codexThread=${codexThread}`);
-    void pushToHost(label, text, { codexThread }).then((ok) => {
+    void pushToHost(label, text, { codexThread, codexHome: codexDaemon?.codexHome() }).then((ok) => {
       dbg(`pushToHost ok=${ok}`);
       if (ok) void flushInbox(); // channel works -> also deliver any durable backlog (keeps order)
       else writeInbox(home, inboxKey(), { from, fromLabel: label, text, via, ts: Date.now() });

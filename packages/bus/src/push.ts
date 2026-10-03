@@ -43,19 +43,22 @@ function codexBin(): string {
  *
  * Returns true if handed to a native channel; false means keep it in the pull queue for agenthop_recv.
  */
-export async function pushToHost(from: string, text: string, opts: { codexThread?: string } = {}): Promise<boolean> {
+export async function pushToHost(from: string, text: string, opts: { codexThread?: string; codexHome?: string } = {}): Promise<boolean> {
   const sock = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
   if (sock) return pushClaude(sock, process.env.CLAUDE_CODE_MESSAGING_TOKEN, from, text);
   // Codex: the caller passes the active thread id (from x-codex-turn-metadata or the daemon client).
-  if (opts.codexThread) return pushCodex(opts.codexThread, from, text);
+  if (opts.codexThread) return pushCodex(opts.codexThread, from, text, opts.codexHome);
   dbg(`pushToHost: no channel (no cc-socks, no codexThread) from=${from}`);
   return false;
 }
 
 /** codex queue delivers as if the user typed it (no sender field), so we prefix the sender. */
-function pushCodex(thread: string, from: string, text: string): Promise<boolean> {
+function pushCodex(thread: string, from: string, text: string, codexHome?: string): Promise<boolean> {
   return new Promise((resolve) => {
-    const child = spawn(codexBin(), ["queue", "--thread", thread, "--message", `[bus] ${from}: ${text}`], { stdio: ["ignore", "pipe", "pipe"] });
+    // CODEX_HOME must be passed explicitly: `codex queue` reads the thread's rollout from it, but the MCP
+    // subprocess Codex spawns does not inherit CODEX_HOME — without it the queue fails "no rollout found".
+    const env = codexHome ? { ...process.env, CODEX_HOME: codexHome } : process.env;
+    const child = spawn(codexBin(), ["queue", "--thread", thread, "--message", `[bus] ${from}: ${text}`], { stdio: ["ignore", "pipe", "pipe"], env });
     let out = "";
     let err = "";
     child.stdout?.on("data", (d) => (out += d));

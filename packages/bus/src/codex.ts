@@ -23,6 +23,9 @@ export type CodexDaemon = {
    *  it (unambiguously) — so an IDLE session that never touched the bus is still reachable. Falls back to
    *  the sole loaded thread when there is only one, else undefined. */
   activeThread(cwd?: string): string | undefined;
+  /** The daemon's CODEX_HOME (from the initialize handshake). `codex queue` needs it to find the thread's
+   *  rollout; the MCP subprocess's own env does not carry it. Undefined until the handshake completes. */
+  codexHome(): string | undefined;
   close(): void;
 };
 
@@ -74,6 +77,9 @@ export function startCodexDaemon(): CodexDaemon | undefined {
   // threadId -> its session's cwd (immutable per thread), read once from the daemon. Lets a node pin ITS
   // OWN thread by matching self.cwd, so delivery works even to a session that never called the bus.
   const cwdByThread = new Map<string, string>();
+  // The daemon's CODEX_HOME, learned from the initialize result. Passed to `codex queue` so it can find
+  // the thread's rollout — the MCP subprocess Codex spawns does not get CODEX_HOME in its own env.
+  let codexHome: string | undefined;
   let lastActive: string | undefined;
   let current: net.Socket | undefined;
   let ready = false;
@@ -162,6 +168,8 @@ export function startCodexDaemon(): CodexDaemon | undefined {
           const method = pending.get(m.id)!;
           pending.delete(m.id);
           if (method === "initialize") {
+            codexHome = (m.result as { codexHome?: string } | undefined)?.codexHome ?? codexHome;
+            dbg(`daemon codexHome=${codexHome}`);
             sendText(s, JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} }));
             ready = true;
             dbg("daemon initialized; requesting thread/loaded/list");
@@ -204,6 +212,7 @@ export function startCodexDaemon(): CodexDaemon | undefined {
     // durably queued for agenthop_recv rather than risk the wrong session. The authoritative binding is
     // still ownCodexThread (the thread that actually called this bus), handled in core before this.
     activeThread: (cwd) => pickThreadForCwd(loaded, cwdByThread, cwd),
+    codexHome: () => codexHome,
     close: () => {
       closed = true;
       clearInterval(refresh);
