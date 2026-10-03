@@ -194,7 +194,7 @@ async function allocate(r: ControlRecord, records: Map<string, ControlRecord>, o
   const reqStart = ops.nowSec(); // the attempt's lifetime base = REQUEST start, not the post-IO ACK (Codex P2-3)
   // CAS-then-IO: record the attempt + successor (pin successorGen=gen and attemptStartSec=reqStart) FIRST and persist,
   // BEFORE any IO. A throw in persist leaves no box created (IO not reached); a throw AFTER leaves a durable ALLOCATING.
-  r = apply(r, { type: "allocating", attempt: `att-${gen}-${successor}`, successor, physicalLifetimeSec: ops.physicalLifetimeSec }, ops, records);
+  r = apply(r, { type: "allocating", attempt: `att-${gen}-${successor}`, successor, attemptPhysicalSec: ops.physicalLifetimeSec }, ops, records);
   if (r.state !== "ALLOCATING") return r; // transition rejected -> do not run IO
 
   // Pre-create the successor PLACEHOLDER record BEFORE the allocate IO (Codex P1-1): once persisted it is counted
@@ -209,6 +209,8 @@ async function allocate(r: ControlRecord, records: Map<string, ControlRecord>, o
     // never faces an empty sha and skips allocate forever; its own observe advances it as it publishes (Codex P2-5).
     allocStart: reqStart,
     budgetSec: ops.budgetSec,
+    physicalLifetimeSec: ops.physicalLifetimeSec, // the successor VM's OWN physical lifetime, else likelyExpired defaults
+    // to 3600 and could free a still-live VM early / let reconcile over-cap (Codex P1-02: the normal create path missed it).
     deadlineEpoch: reqStart + ops.budgetSec,
     updatedAt: reqStart,
   };
@@ -257,19 +259,23 @@ async function reconcile(r: ControlRecord, records: Map<string, ControlRecord>, 
   const succ = records.get(r.successor);
   // The attempt is physically dead only past the PROVIDER's lifetime, FIXED per attempt — never the current (possibly
   // changed) work budget (Codex P2-1). From the successor record when it exists, else the parent's pinned attempt base +
-  // the pinned physicalLifetimeSec (the crash window where the placeholder was never persisted, Codex P1-1).
+  // the pinned attemptPhysicalSec (the crash window where the placeholder was never persisted, Codex P1-1/P1-02).
   const expired = succ
     ? likelyExpired(succ, ops.nowSec())
-    : r.attemptStartSec !== undefined && ops.nowSec() > r.attemptStartSec + (r.physicalLifetimeSec ?? PROVIDER_LIFETIME_SEC) + 120;
+    : r.attemptStartSec !== undefined && ops.nowSec() > r.attemptStartSec + (r.attemptPhysicalSec ?? PROVIDER_LIFETIME_SEC) + 120;
   if (expired) {
     ops.log(`${r.launchId}: successor ${r.successor} past deadline, no qualified takeover — declaring dead`);
     // Carry the dead child's confirmed recovery point (anchored from a verified descendant of handoffSha in awaitResume)
-    // forward to the parent BEFORE removing it, so the replacement resumes from the newest confirmed work, not the stale
-    // handoffSha (Codex P1-3). An empty placeholder (sha === handoffSha / unset) has no newer point — nothing to carry.
+    // forward to the parent, so the replacement resumes from the newest confirmed work, not the stale handoffSha (P1-3).
+    // Order matters (Codex P1-01): PERSIST the parent's carried recovery point FIRST (apply persists), THEN delete the
+    // child's only durable copy. If apply throws, the child JSON still exists → next pass retries, nothing lost. If the
+    // delete throws after, the parent already holds the recovery sha. The reverse order (old code) lost C on a parent
+    // write failure. An empty placeholder (sha === handoffSha / unset) has no newer point — nothing to carry.
     const recoverySha = succ?.sha !== undefined && succ.sha !== r.handoffSha ? succ.sha : undefined;
-    ops.removeRecord(r.successor); // terminate the dead successor's record + physical occupancy (Codex P2-2); may throw (P2-4)
+    const advanced = apply(r, { type: "reconcile_dead", recoverySha }, ops, records); // persists parent (sha=recoverySha)
+    ops.removeRecord(r.successor); // only now terminate the dead successor's record + occupancy (may throw, P2-4)
     records.delete(r.successor);
-    return apply(r, { type: "reconcile_dead", recoverySha }, ops, records);
+    return advanced;
   }
   ops.log(`${r.launchId}: reconcile ${r.successor} inconclusive (not published, not expired) — retaining attempt`);
   return r;
@@ -301,13 +307,17 @@ async function awaitResume(r: ControlRecord, records: Map<string, ControlRecord>
     const base = r.attemptStartSec ?? ops.nowSec();
     const rebuilt: ControlRecord = {
       launchId: r.successor, state: "RUNNING", generation: sgen, handoffSha: r.handoffSha, sha: tip.sha,
-      allocStart: base, budgetSec: ops.budgetSec, physicalLifetimeSec: r.physicalLifetimeSec ?? ops.physicalLifetimeSec,
+      allocStart: base, budgetSec: ops.budgetSec, physicalLifetimeSec: r.attemptPhysicalSec ?? ops.physicalLifetimeSec,
       deadlineEpoch: base + ops.budgetSec, updatedAt: ops.nowSec(),
     };
     ops.persist(rebuilt);        // barrier: a throw is caught by pass(), retried next pass; parent NOT yet RESUMED
     records.set(r.successor, rebuilt);
-  } else if (child0.sha !== tip.sha) { // acceptedBase check already proved tip is a forward descendant of child0.sha
-    const anchored = { ...child0, sha: tip.sha, updatedAt: ops.nowSec() };
+  } else if (child0.sha !== tip.sha || child0.generation !== sgen) {
+    // advance the recovery point AND correct the generation to the pinned sgen: the generic discovery (swarm-dispatch
+    // pass) may have recreated a crash-lost child as generation 0 (it doesn't know the parent's pinned successorGen),
+    // which would make the child observe swarm/<child>-g0 forever while the worker publishes at sgen — losing every
+    // later checkpoint (Codex P1-03). acceptedBase already proved tip is a forward descendant of child0.sha.
+    const anchored = { ...child0, generation: sgen, sha: tip.sha, updatedAt: ops.nowSec() };
     ops.persist(anchored);       // persist FIRST (retryable barrier), then the Map
     records.set(r.successor, anchored);
   }

@@ -96,9 +96,12 @@ function pushClaude(
   // regardless of the sender's trust level (Codex from-mode review). The To address rides the BODY (email-style): the
   // frame's attribute set/order is load-bearing (the receiver round-trips from, from-session, hop-chain, from-name,
   // from-mode and rejects a different order), so a "to" attribute would be rejected — put the recipient in the text.
+  // Guard to a non-empty STRING: fromMode can originate from a peer's JSON presence (untyped), so a number/object must
+  // never reach attr()/xml()'s .replace and throw (that rejection would lose the message — Codex P1-05). Unknown => default.
+  const fromMode = typeof opts.fromMode === "string" && opts.fromMode ? opts.fromMode : "default";
   const content =
     `<cross-session-message from="${attr(from)}" from-session="agenthop-bus" hop-chain="" ` +
-    `from-name="${attr(from)}" from-mode="${attr(opts.fromMode || "default")}">${xml(`${busHeader(from, opts.to)}${text}`)}</cross-session-message>`;
+    `from-name="${attr(from)}" from-mode="${attr(fromMode)}">${xml(`${busHeader(from, opts.to)}${text}`)}</cross-session-message>`;
   const frames = [
     JSON.stringify({ type: "auth", token: token ?? "" }),
     JSON.stringify({ type: "user", message: { role: "user", content }, priority: "now", file_attachments: [] }),

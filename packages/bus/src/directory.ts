@@ -28,9 +28,6 @@ export type RemotePeer = {
   /** The host's native session id: a durable, restart-stable address (see SelfInfo.stableId). */
   stableId?: string;
   tool: string;
-  /** The host's permission mode (Claude vocab); rides the presence announce so a peer can stamp the sender's real mode
-   *  on a cross-session frame instead of a hardcoded default. Static presence field (merged via presenceBase). */
-  mode?: string;
   cwd: string;
   title: string;
   machine: string;

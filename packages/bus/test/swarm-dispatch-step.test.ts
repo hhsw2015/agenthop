@@ -401,3 +401,43 @@ describe("recovery-protocol re-review fixes (Codex 01ea35b: P1-1/P1-2/P1-3, P2-2
     expect(records.get("rw-bbbb")?.sha).toBe("c7"); // advanced past the non-seed anchor (old code skipped this)
   });
 });
+
+describe("recovery re-review round 2 (Codex: P1-01 persist-order, P1-02 lifetime pin, P1-03 gen correction)", () => {
+  test("P1-01: reconcile persists the parent's recovery point BEFORE deleting the child (no loss if delete fails)", async () => {
+    const { ops, state } = makeOps({ removeRecord: () => { throw new Error("unlink EACCES"); } });
+    state.now = T0 + 10;
+    const records = new Map<string, ControlRecord>();
+    const a = rec({ launchId: "rw-aaaa", state: "CLAIMED", generation: 2, sha: "fin0", handoffSha: "fin0", successor: "rw-bbbb", successorGen: 1, attempt: "att-1", owner: "disp1", leaseUntil: T0 + 300 });
+    records.set(a.launchId, a);
+    records.set("rw-bbbb", rec({ launchId: "rw-bbbb", state: "RUNNING", generation: 1, handoffSha: "fin0", sha: "b5", allocStart: T0 - PROVIDER_LIFETIME_SEC - 500 })); // confirmed point b5, physically dead
+    await expect(handoffStep(a, records, ops)).rejects.toThrow("unlink EACCES"); // delete throws AFTER the parent advanced
+    expect(records.get("rw-aaaa")?.sha).toBe("b5");         // parent already carries the recovery point (persisted first)
+    expect(records.get("rw-aaaa")?.attempt).toBeUndefined(); // attempt cleared on the parent before the failed delete
+  });
+
+  test("P1-02: a normally-allocated successor placeholder gets the attempt's physical lifetime; parent's own is untouched", async () => {
+    const { ops, state } = makeOps({ physicalLifetimeSec: 7200 });
+    state.now = T0 + 10;
+    const records = new Map<string, ControlRecord>();
+    const a = rec({ launchId: "rw-aaaa", state: "CLAIMED", generation: 1, sha: "fin0", owner: "disp1", leaseUntil: T0 + 300 });
+    records.set(a.launchId, a);
+    await handoffStep(a, records, ops); // allocate -> creates the successor placeholder
+    expect(records.get("rw-bbbb")?.physicalLifetimeSec).toBe(7200);  // the VM's own lifetime, not the 3600 default (P1-02a)
+    expect(records.get("rw-aaaa")?.attemptPhysicalSec).toBe(7200);   // attempt lifetime pinned in its OWN field
+    expect(records.get("rw-aaaa")?.physicalLifetimeSec).toBeUndefined(); // parent's own VM lifetime NOT overwritten (P1-02b)
+  });
+
+  test("P1-03: a discovery-created gen0 child is corrected to the pinned successorGen on ACK", async () => {
+    const { ops, state } = makeOps();
+    state.now = T0 + 10;
+    const records = new Map<string, ControlRecord>();
+    const a = rec({ launchId: "rw-aaaa", state: "ALLOCATING", generation: 1, sha: "fin0", handoffSha: "fin0", successor: "rw-bbbb", successorGen: 1, attempt: "att-1", owner: "disp1", leaseUntil: T0 + 300 });
+    records.set(a.launchId, a);
+    records.set("rw-bbbb", rec({ launchId: "rw-bbbb", state: "RUNNING", generation: 0, allocStart: T0 })); // discovery recreated it at gen 0
+    state.tips.set(branchFor("rw-bbbb", 1), tip("b1", "rw-bbbb", 1, "milestone", { desc: true }));
+    const out = await handoffStep(a, records, ops);
+    expect(out.state).toBe("RESUMED");
+    expect(records.get("rw-bbbb")?.generation).toBe(1); // corrected 0 -> pinned sgen so it observes the right branch (P1-03)
+    expect(records.get("rw-bbbb")?.sha).toBe("b1");
+  });
+});

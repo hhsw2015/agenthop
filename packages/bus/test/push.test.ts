@@ -48,4 +48,10 @@ describe("pushToHost cc-socks frame", () => {
     expect(raw).toContain('from-mode="default"');
     expect(raw).toContain("codex:x → claude:y");
   });
+
+  test("a non-string mode is coerced to 'default', never crashing delivery (Codex P1-05)", async () => {
+    const raw = await capture("codex:x", "hi", { fromMode: 1 as unknown as string, to: "claude:y" });
+    expect(raw).toContain('from-mode="default"'); // number coerced, no attr()/.replace throw -> message still delivered
+    expect(raw).toContain("hi");
+  });
 });

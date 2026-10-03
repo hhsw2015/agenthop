@@ -74,10 +74,15 @@ export type ControlRecord = {
   /** Bounded WORK budget (s) from allocStart: drives drain/checkpoint timing only. NOT the VM's physical lifetime — a
    *  short work budget must trigger an EARLIER handoff, never free the physical slot early (Codex P1-2). */
   budgetSec: number;
-  /** The PROVIDER's physical VM lifetime upper-bound (s) from allocStart, pinned per attempt. Independent of budgetSec:
-   *  physical death (physicallyOccupies / likelyExpired / reconcile) is proven by THIS, so a configurable work budget
-   *  can never declare a VM dead while the provider still runs it (Codex P1-2 / P2-1). Absent => PROVIDER_LIFETIME_SEC. */
+  /** The PROVIDER's physical VM lifetime upper-bound (s) for THIS record's OWN VM, from allocStart. Independent of
+   *  budgetSec: physical death (physicallyOccupies / likelyExpired) is proven by THIS, so a configurable work budget
+   *  can never declare a VM dead while the provider still runs it (Codex P1-2). Absent => PROVIDER_LIFETIME_SEC. */
   physicalLifetimeSec?: number;
+  /** The physical VM lifetime (s) of the CURRENT successor ATTEMPT, pinned at `allocating` (= the successor VM's bound).
+   *  Kept SEPARATE from physicalLifetimeSec so a new attempt never overwrites this record's own VM lifetime (Codex
+   *  P1-02): a reconcile in the crash window where the successor record was never persisted bounds the attempt by THIS
+   *  fixed value, not the current config (P2-1). Cleared when the attempt clears. Absent => PROVIDER_LIFETIME_SEC. */
+  attemptPhysicalSec?: number;
   /** Absolute deadline for display/dispatcher view (the BOX uses CLOCK_BOOTTIME locally, not this wall value). */
   deadlineEpoch?: number;
   /** Epoch seconds the CURRENT allocation attempt was REQUESTED (pinned at `allocating`, = the successor's lifetime
@@ -102,7 +107,7 @@ export type ControlEvent =
   | { type: "checkpoint"; sha: string; manifest?: string }
   | { type: "claim"; owner: string; generation: number; leaseUntil: number }
   | { type: "reclaim"; owner: string; generation: number; leaseUntil: number }
-  | { type: "allocating"; attempt: string; successor?: string; physicalLifetimeSec?: number }
+  | { type: "allocating"; attempt: string; successor?: string; attemptPhysicalSec?: number }
   | { type: "alloc_unknown" }
   // alloc_failed: a RELIABLE clean failure (provider refused; box definitively NOT created) — clear attempt+successor,
   // back to CLAIMED for an immediate fresh allocate (attemptCount kept, so the cap still bounds retries). An UNKNOWN
@@ -218,10 +223,11 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       // creates is told to resume from here; a later recover_sha advancing `sha` must NOT move this attempt's target.
       // The successor launchId is pinned here too (per-attempt), so a dispatcher restart re-reads WHICH box is taking
       // over from the mirror instead of a lost in-memory side-map. resumed later re-asserts the same successor.
-      // Pin the attempt's PHYSICAL lifetime here too (= the successor VM's provider bound), so a reconcile in the crash
-      // window where the successor record was never persisted bounds the attempt by a FIXED deadline, not the dispatcher's
-      // current (possibly-changed) config (Codex P2-1). Falls back to any existing value, else PROVIDER_LIFETIME_SEC.
-      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false, handoffSha: record.sha, successorGen: record.generation, attemptStartSec: nowSec, physicalLifetimeSec: event.physicalLifetimeSec ?? record.physicalLifetimeSec, ...(event.successor ? { successor: event.successor } : {}) });
+      // Pin the ATTEMPT's PHYSICAL lifetime in its OWN field (attemptPhysicalSec), NOT physicalLifetimeSec — the latter
+      // is THIS record's own VM lifetime and must not be overwritten by a new successor attempt (Codex P1-02). So a
+      // reconcile in the crash window (successor record never persisted) bounds the attempt by this FIXED value, not the
+      // current (possibly-changed) config (P2-1). Falls back to any existing value, else PROVIDER_LIFETIME_SEC.
+      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false, handoffSha: record.sha, successorGen: record.generation, attemptStartSec: nowSec, attemptPhysicalSec: event.attemptPhysicalSec ?? record.attemptPhysicalSec, ...(event.successor ? { successor: event.successor } : {}) });
     case "alloc_unknown":
       // Allocation request sent, result unknown. Stay ALLOCATING; mark it so a reclaimer reconciles this attempt.
       if (record.state !== "ALLOCATING") return bad(`alloc_unknown only from ALLOCATING, not ${record.state}`);
@@ -230,7 +236,7 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       // RELIABLE clean failure (box definitively NOT created): clear attempt/successor/successorGen back to CLAIMED so a
       // fresh allocate runs immediately. attemptCount is KEPT (the cap still bounds retries). NOT for unknown results.
       if (record.state !== "ALLOCATING") return bad(`alloc_failed only from ALLOCATING, not ${record.state}`);
-      return ok({ state: "CLAIMED", attempt: undefined, successor: undefined, successorGen: undefined, resultUnknown: false, attemptStartSec: undefined });
+      return ok({ state: "CLAIMED", attempt: undefined, successor: undefined, successorGen: undefined, resultUnknown: false, attemptStartSec: undefined, attemptPhysicalSec: undefined });
     case "reconcile_dead":
       // Reconcile found the in-flight allocation's box DEAD: clear the WHOLE attempt — attempt id, the dangling
       // successor link/gen, and the attempt's request-start — so a fresh allocate can proceed and the parent no longer
@@ -241,7 +247,7 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       // attempt, so the next allocate pins handoffSha = this newest confirmed work instead of the stale old sha and the
       // child's results are not orphaned (Codex P1-3). The caller only supplies a verified descendant of handoffSha; we
       // never regress (only set when it differs from the current sha). attemptPhysical pin (physicalLifetimeSec) stays.
-      return ok({ attempt: undefined, resultUnknown: false, successor: undefined, successorGen: undefined, attemptStartSec: undefined, ...(event.recoverySha !== undefined && event.recoverySha !== record.sha ? { sha: event.recoverySha } : {}) });
+      return ok({ attempt: undefined, resultUnknown: false, successor: undefined, successorGen: undefined, attemptStartSec: undefined, attemptPhysicalSec: undefined, ...(event.recoverySha !== undefined && event.recoverySha !== record.sha ? { sha: event.recoverySha } : {}) });
     case "reconcile_alive":
       // Reconcile found the in-flight box ALIVE. That is NOT recovery-complete (Codex): re-enter the await-resume
       // wait reusing the SAME attempt (no attemptCount bump). Only a real `resumed` ACK carrying the expected

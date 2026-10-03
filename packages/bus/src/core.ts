@@ -140,6 +140,11 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       dbg(`pushToHost ok=${ok}`);
       if (ok) void flushInbox(); // channel works -> also deliver any durable backlog (keeps order)
       else writeInbox(home, key, { from, fromLabel: label, fromMode, text, via, ts });
+    }).catch((e) => {
+      // A push that THREW (not just returned false) must still fall back to the durable inbox, never drop the message —
+      // an unhandled rejection would also crash the node (Codex P1-05). Persist under the identity bound above.
+      dbg(`pushToHost threw: ${e instanceof Error ? e.message : String(e)}`);
+      try { writeInbox(home, key, { from, fromLabel: label, fromMode, text, via, ts }); } catch { /* best effort */ }
     });
   };
 
@@ -199,11 +204,15 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     return `${p.title}${p.via === "relay" ? `@${p.machine ?? "remote"}` : ""}`;
   };
 
-  // The sender's REAL permission mode from the roster, so a delivery to a Claude host stamps it on the cross-session
-  // frame (from-mode) instead of a hardcoded "default" (which made a bypass receiver gate every peer message). Undefined
-  // when the sender isn't resolvable -> pushClaude defaults to "default" (the safe, gated side).
-  const modeFor = (idOrPub: string): string | undefined =>
-    unified().find((x) => x.id === idOrPub || x.stableId === idOrPub || x.pub === idOrPub)?.mode;
+  // The sender's REAL permission mode, used only to stamp from-mode on a delivery (unknown -> "default", the safe/gated
+  // side). LOCAL peers ONLY: a same-OS-user peer could change this machine's config anyway, so trusting its self-reported
+  // mode grants no new power; but a REMOTE same-team member must NOT be able to self-attest "bypassPermissions" and so
+  // skip the receiver's approval gate — team membership proves membership, not a permission mode (Codex P1-04). A relay
+  // sender therefore resolves to undefined -> "default" -> gated unless the receiver itself opts in (crossSessionInbound).
+  const modeFor = (idOrPub: string): string | undefined => {
+    const p = unified().find((x) => x.id === idOrPub || x.stableId === idOrPub || x.pub === idOrPub);
+    return p?.via === "local" ? p.mode : undefined;
+  };
 
   const resolve = (to: string): UnifiedPeer | { error: string } => resolvePeer(unified(), self.id, to);
 

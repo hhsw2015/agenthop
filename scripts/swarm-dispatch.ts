@@ -121,12 +121,17 @@ function saveRecord(r: ControlRecord): void { mkdirSync(MIRROR_DIR, { recursive:
 function tombstonePath(launchId: string): string { return path.join(MIRROR_DIR, `${launchId}.tombstone`); }
 function isTombstoned(launchId: string): boolean { return existsSync(tombstonePath(launchId)); }
 function writeTombstone(launchId: string): void { mkdirSync(MIRROR_DIR, { recursive: true }); atomicWrite(tombstonePath(launchId), String(nowSec())); }
-function gcTombstones(liveBoxIds: Set<string>): void {
+/** The discovery keydir that would resurrect a removed record (discoverBoxes reads /tmp/ah-rwkey-<launchId>/alloc-ts). */
+function keydirPath(launchId: string): string { return path.join(KEYDIR_GLOB, `ah-rwkey-${launchId}`); }
+function gcTombstones(): void {
   if (!existsSync(MIRROR_DIR)) return;
   for (const f of readdirSync(MIRROR_DIR)) {
     if (!f.endsWith(".tombstone")) continue;
     const id = f.slice(0, -".tombstone".length);
-    if (!liveBoxIds.has(id)) { try { unlinkSync(tombstonePath(id)); } catch {} } // discovery source gone -> safe to forget
+    // GC only when the keydir ITSELF is gone (no resurrection source). Keying off the SUCCESSFULLY-read box set would
+    // drop the tombstone on a transient alloc-ts read failure (EACCES/IO) while the keydir still exists, then the next
+    // readable pass resurrects the removed record as generation 0 (Codex P2-01). Existence, not readability.
+    if (!existsSync(keydirPath(id))) { try { unlinkSync(tombstonePath(id)); } catch {} }
   }
 }
 
@@ -226,7 +231,7 @@ async function observeOnce(argv: string[]): Promise<void> {
 //     clock + gated handoff EXEC). handoffStep reads liveCount from `records` and mutates it (adds successors). ---
 async function pass(records: Map<string, ControlRecord>, ops: HandoffOps): Promise<void> {
   const boxes = new Map(discoverBoxes().map((b) => [b.launchId, b]));
-  gcTombstones(new Set(boxes.keys())); // drop tombstones whose keydir is gone — no resurrection source left (Codex P2-3)
+  gcTombstones(); // drop tombstones whose keydir is actually gone (by existence, not a readable-this-pass set) (Codex P2-3/P2-01)
   // UNION of keydir-discovered boxes AND persisted mirror records (Codex #7): a box whose keydir vanished but whose
   // record is still non-terminal (e.g. EXPIRED needing a successor) must still be processed, incl. after a restart.
   const ids = new Set<string>([...boxes.keys(), ...records.keys()]);
