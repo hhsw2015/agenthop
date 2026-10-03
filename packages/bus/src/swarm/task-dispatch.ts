@@ -10,12 +10,13 @@
 
 import type { TaskPlan } from "./task-plan.js";
 import {
-  type TaskAttempt, type ExecutionBinding, attemptIdOf, bindingIdOf, createAttempt, makeSuccessionAttempt,
+  type TaskAttempt, type ExecutionBinding, type AttemptEvent, attemptIdOf, bindingIdOf, createAttempt, makeSuccessionAttempt, advanceAttempt,
 } from "./task-state.js";
 import type { ReadyTask } from "./task-ready.js";
 import { buildAssignment, tokenFits, type Assignment } from "./task-assignment.js";
 import { buildDispatchIntent, type IntentTiming } from "./task-intent.js";
-import type { DispatchIntent } from "./control-log.js";
+import { validateResult, type ValidationInput, type Verdict } from "./task-result.js";
+import type { DispatchIntent, ResultObserved, ChangeBody } from "./control-log.js";
 
 export type DispatchParams = {
   /** The fresh box's remaining life (for the token gate + the assignment soft deadline). */
@@ -108,4 +109,74 @@ export function prepareDispatch(
   const intent = buildDispatchIntent(assignment, timing);
 
   return { ok: true, attempt, ...(abandonedOld ? { abandonedOld } : {}), binding, assignment, intent };
+}
+
+// ---- the ACCEPT half: an observed candidate -> verdict -> state changes (§4.2 / §4.5-6) -------------------------------
+
+export type JudgeInput = {
+  /** Everything validateResult needs (the shell gathers the git/acceptance IO facts). */
+  validation: ValidationInput;
+  /** The full {put:"observed"} payload the shell built from the git observation (recorded on accept/reject/stale). */
+  observed: ResultObserved;
+  nowSec: number;
+  /** Commit seq for the {put:"rejected"} audit entity key (caller convention). */
+  atSeq: number;
+  /** business_fail backoff jitter — the caller samples it ONCE and persists it so a replay reuses the same value. */
+  jitterSec?: number;
+};
+
+export type JudgeOutput = {
+  verdict: Verdict;
+  /** ChangeBodies to commit (the shell stamps operationId + expectedEntityRevision — its commit conventions). Empty for
+   *  a candidate-level discard / an idempotent replay. */
+  changes: ChangeBody[];
+  /** The transitioned attempt (accept/reject/stale/inconsistent-snapshot); absent for discard/replay. */
+  nextAttempt?: TaskAttempt;
+  /** Set when a required state transition was illegal (e.g. a candidate validated against an already-terminal attempt);
+   *  the shell logs it and makes no change. */
+  error?: string;
+};
+
+/** Map a Verdict to the attempt event that realizes it (null = candidate-level, attempt untouched). validateResult
+ *  never emits a reject with failureClass "transient-infra" (that is the no-result/all-dead path, not a validation),
+ *  so only business-fail / permanent / inconsistent-snapshot appear here. */
+function verdictEvent(v: Verdict, retryBudget: number, jitterSec?: number): AttemptEvent | null {
+  switch (v.decision) {
+    case "accept": return { type: "accepted" };
+    case "stale": return { type: "stale", which: v.which };
+    case "reject":
+      if (v.failureClass === "permanent") return { type: "permanent" };
+      if (v.failureClass === "inconsistent-snapshot") return { type: "inconsistent_snapshot" };
+      return { type: "business_fail", retryBudget, ...(jitterSec !== undefined ? { jitterSec } : {}) };
+    case "discard":
+    case "replay":
+      return null;
+  }
+}
+
+/**
+ * Judge one observed candidate: validate it, then (for accept/reject/stale) move the attempt RUNNING -> RPV (the
+ * `observed` transition advanceAttempt requires) and apply the verdict in the SAME pass, emitting ONE {put:"attempt"}
+ * with the final state (observe + validate are synchronous here, so the intermediate RPV never needs its own commit).
+ * A candidate-level discard or an idempotent replay touches nothing.
+ */
+export function judgeObservation(i: JudgeInput): JudgeOutput {
+  const verdict = validateResult(i.validation);
+  const attempt = i.validation.attempt;
+  const event = verdictEvent(verdict, i.validation.attemptSpec.retryBudget, i.jitterSec);
+  if (event === null) return { verdict, changes: [] }; // discard / replay — attempt untouched
+
+  // RUNNING -> RPV (no-op if already RPV), then the verdict transition.
+  const toRpv = advanceAttempt(attempt, { type: "observed" }, i.nowSec);
+  if (!toRpv.ok) return { verdict, changes: [], error: `pre-validation transition: ${toRpv.error}` };
+  const final = advanceAttempt(toRpv.attempt, event, i.nowSec);
+  if (!final.ok) return { verdict, changes: [], error: `verdict transition: ${final.error}` };
+
+  const changes: ChangeBody[] = [{ put: "observed", observed: i.observed }];
+  if (verdict.decision === "accept") changes.push({ put: "accepted", accepted: verdict.accepted });
+  changes.push({ put: "attempt", attempt: final.attempt });
+  if (verdict.decision === "reject" || verdict.decision === "stale") {
+    changes.push({ put: "rejected", rejected: { attemptId: attempt.attemptId, nodeId: attempt.nodeId, reason: verdict.reason, atSeq: i.atSeq } });
+  }
+  return { verdict, changes, nextAttempt: final.attempt };
 }
