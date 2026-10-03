@@ -7,7 +7,7 @@ import { loadPlan, type TaskPlan } from "../src/swarm/task-plan.js";
 import { commit, entityKeyOf, initialLogState, liveEntities, type ChangeBody, type LogState } from "../src/swarm/control-log.js";
 import { jobStatus } from "../src/swarm/task-ready.js";
 import { createAttempt, type TaskAttempt } from "../src/swarm/task-state.js";
-import { taskPass, buildSched, resultMatchesAssignment, requiredFilesPresent, type TaskOps, type GitFacts } from "../src/swarm/task-pass.js";
+import { taskPass, buildSched, isForeignResult, requiredFilesPresent, type TaskOps, type GitFacts } from "../src/swarm/task-pass.js";
 
 /** Find the single DispatchIntent in the projection (tests have one job/one node). */
 function theIntent(state: LogState): { status: string; allocOutcome: string } | undefined {
@@ -177,11 +177,14 @@ describe("taskPass dispatch — retry lineage survives clean-fail + unknown (Cod
   });
 });
 
-describe("observeGit pure helpers (Codex P1-3 / P2-6 round-2)", () => {
-  test("resultMatchesAssignment: own id matches, foreign + unparseable rejected", () => {
-    expect(resultMatchesAssignment(JSON.stringify({ assignmentId: "A" }), "A")).toBe(true);
-    expect(resultMatchesAssignment(JSON.stringify({ assignmentId: "B" }), "A")).toBe(false); // foreign — must not mask
-    expect(resultMatchesAssignment("{not json", "A")).toBe(false);
+describe("observeGit pure helpers (Codex P1-3 / P2-2 / P2-6 round-3)", () => {
+  test("isForeignResult: confirmed-foreign only; unparseable + schema-invalid surface to V1", () => {
+    expect(isForeignResult(JSON.stringify({ assignmentId: "A", attemptId: "T" }), "A", "T")).toBe(false); // ours
+    expect(isForeignResult(JSON.stringify({ assignmentId: "B", attemptId: "T" }), "A", "T")).toBe(true); // wrong assignment
+    expect(isForeignResult(JSON.stringify({ assignmentId: "A", attemptId: "X" }), "A", "T")).toBe(true); // wrong attempt (P1-3 B)
+    expect(isForeignResult("{not json", "A", "T")).toBe(false); // unparseable ⇒ surface to V1 (P2-2)
+    expect(isForeignResult(JSON.stringify({ attemptId: "T" }), "A", "T")).toBe(false); // missing assignmentId ⇒ schema-invalid ⇒ V1 (P2-2)
+    expect(isForeignResult("null", "A", "T")).toBe(false); // non-object ⇒ surface to V1
   });
   test("requiredFilesPresent: a declared output OR evidence file missing ⇒ false (missing is detectable)", () => {
     const outputs = [{ path: "out/r.md" }];

@@ -55,12 +55,21 @@ export type TaskOps = {
   log: (m: string) => void;
 };
 
-/** Does this result.json belong to the given binding's assignment? O1 must SKIP a foreign result (wrong assignmentId)
- *  so it can't mask a legit older one — the scan keeps advancing (Codex P1-3). This does NOT relax the pure-layer V2
- *  identity check; it only stops the IO observer from parking on a candidate that isn't this attempt's. */
-export function resultMatchesAssignment(resultText: string, assignmentId: string): boolean {
-  try { return (JSON.parse(resultText) as { assignmentId?: unknown }).assignmentId === assignmentId; }
-  catch { return false; }
+/** Is this result.json CONFIRMED to belong to a DIFFERENT attempt/binding? Only a PARSEABLE result whose identity
+ *  (assignmentId AND attemptId) mismatches is foreign — O1 skips it + keeps advancing so it can't mask a legit older one
+ *  (Codex P1-3, incl. the right-assignmentId/wrong-attemptId case). An UNPARSEABLE or schema-invalid result is NOT
+ *  confirmed-foreign (we can't prove it isn't ours), so it is SURFACED for the pure V1 to classify + reject, never
+ *  silently dropped (Codex P2-2). This does not relax the pure-layer V1/V2 checks; it only decides what the IO observer
+ *  may skip. */
+export function isForeignResult(resultText: string, assignmentId: string, attemptId: string): boolean {
+  let r: unknown;
+  try { r = JSON.parse(resultText); } catch { return false; } // unparseable ⇒ not confirmed-foreign ⇒ surface to V1
+  if (typeof r !== "object" || r === null) return false; // not an object ⇒ schema-invalid ⇒ surface to V1
+  const { assignmentId: aId, attemptId: tId } = r as { assignmentId?: unknown; attemptId?: unknown };
+  // A MISSING/non-string id is schema-invalid, not confirmed-foreign — surface it so V1 rejects it (Codex P2-2). Only a
+  // result bearing BOTH ids as strings that DIFFER from ours is confirmed to belong to another attempt (skip it).
+  if (typeof aId !== "string" || typeof tId !== "string") return false;
+  return aId !== assignmentId || tId !== attemptId;
 }
 
 /** Every DECLARED file (outputs + validationEvidence.summaryPath) must be present in the observed closure. A missing OR

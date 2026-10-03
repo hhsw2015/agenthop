@@ -33,7 +33,7 @@ import { entityKeyOf, type ChangeBody, type CommitResult, type LogState } from "
 import { loadPlan, type TaskPlan, type TaskSpec } from "../packages/bus/src/swarm/task-plan.js";
 import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/task-state.js";
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
-import { taskPass, resultMatchesAssignment, requiredFilesPresent, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
+import { taskPass, isForeignResult, requiredFilesPresent, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
@@ -325,25 +325,25 @@ async function observeGitFor(a: { attempt: TaskAttempt; spec: TaskSpec; binding:
   if (fetched.code !== 0) fetched = await git(["fetch", "-q", WORK_REPO, `refs/heads/${branch}:refs/heads/${branch}`], { cwd: scratch });
   if (fetched.code !== 0) return null;
   const resultPath = `out/results/${a.attempt.attemptId}/result.json`;
-  // O1 first-parent history scan (Codex P1 / F6): a valid result at an ANCESTOR must not be lost when a later commit
-  // removes it from the tip tree. Walk newest->oldest along first-parent and take the newest commit that still carries a
-  // readable result.json. A persisted scan cursor (so we don't re-walk every pass) is T2 ({put:"scan"}); the -n bound
-  // keeps a single pass cheap meanwhile.
-  const rl = await git(["rev-list", "--first-parent", "-n", "200", tip], { cwd: scratch });
+  // O1 first-parent history scan (Codex P1-3 / F6): a valid result at an ANCESTOR must not be lost when a later commit
+  // removes it from the tip tree. Scan the COMPLETE first-parent history of the FIXED tip — no depth cap: a bounded -n
+  // only defers the >200 counterexample (fe0376cd ruled ONLY the persistent cursor is T2, not a depth limit). Take the
+  // newest commit carrying a result for THIS binding, skipping confirmed-foreign candidates so they can't mask it.
+  const rl = await git(["rev-list", "--first-parent", tip], { cwd: scratch });
   if (rl.code !== 0) return null;
   let sha = "", resultText = "", resultBlobOid = "";
   for (const c of rl.stdout.split("\n").map((s) => s.trim()).filter(Boolean)) {
     const show = await git(["show", `${c}:${resultPath}`], { cwd: scratch });
-    if (show.code !== 0) continue;
-    // Skip a result that isn't THIS binding's (wrong assignmentId) so a foreign/newer result can't mask a legit older
-    // one — keep advancing the scan (Codex P1-3 reason B). A genuinely-mismatched result for this attempt is handled by
-    // the pure V2 check; here we only refuse to park the observer on someone else's candidate.
-    if (!resultMatchesAssignment(show.stdout, a.binding.assignmentId)) continue;
+    if (show.code !== 0) continue; // no result.json at this commit — keep walking
+    // Skip ONLY a CONFIRMED-foreign result (parseable + assignmentId/attemptId mismatch) so it can't mask a legit older
+    // one, and keep advancing (Codex P1-3, incl. right-assignment/wrong-attempt). An unparseable/schema-invalid result
+    // is NOT skipped — it is surfaced below for the pure V1 to classify + reject (Codex P2-2), never silently dropped.
+    if (isForeignResult(show.stdout, a.binding.assignmentId, a.attempt.attemptId)) continue;
     const rev = await git(["rev-parse", `${c}:${resultPath}`], { cwd: scratch });
     sha = c; resultText = show.stdout; resultBlobOid = rev.code === 0 ? rev.stdout.trim() : "";
     break;
   }
-  if (!sha) return null; // no result.json for this binding on the first-parent history yet (deep >200 pagination = T2)
+  if (!sha) return null; // no result for this binding anywhere on the first-parent history yet
   let outputs: Array<{ path?: unknown }> = [];
   let evidence: Array<{ summaryPath?: unknown }> = [];
   try {
@@ -351,20 +351,28 @@ async function observeGitFor(a: { attempt: TaskAttempt; spec: TaskSpec; binding:
     if (Array.isArray(r.outputs)) outputs = r.outputs as Array<{ path?: unknown }>;
     if (Array.isArray(r.validationEvidence)) evidence = r.validationEvidence as Array<{ summaryPath?: unknown }>;
   } catch { /* V1 will reject the unparseable result below */ }
-  // Closure = result blob + EVERY referenced file (outputs AND validationEvidence.summaryPath — Codex P2: evidence files
-  // must be in the closure digest, else a changed/missing evidence file is invisible to V6/acceptance). Null entries are
-  // skipped (Codex P2: a malformed outputs:[null] must not throw — V1 rejects it from the frozen result text).
+  // Closure = result blob + EVERY referenced file (outputs AND validationEvidence.summaryPath). Resolve each DECLARED
+  // file via ls-tree to distinguish THREE states (Codex P2-3): present ⇒ into the closure; cleanly ABSENT ⇒ a real
+  // missing output (⇒ V7 reject); a QUERY ERROR ⇒ the observation is INCOMPLETE/unknown — return null so the attempt +
+  // retriesUsed are untouched and we re-read next pass, never faking a transient read error into a business failure.
+  // Null entries are skipped (a malformed outputs:[null] ⇒ V1 rejects it from the frozen result text, Codex P2-5).
   const closureFiles: Array<{ path: string; blobOid: string }> = [];
-  const addFile = async (p: string): Promise<void> => {
-    const rp = await git(["rev-parse", `${sha}:${p}`], { cwd: scratch });
-    if (rp.code === 0) closureFiles.push({ path: p, blobOid: rp.stdout.trim() });
+  let incomplete = false;
+  const resolveFile = async (p: string): Promise<void> => {
+    const t = await git(["ls-tree", sha, "--", p], { cwd: scratch });
+    if (t.code !== 0) { incomplete = true; return; }       // query error ⇒ unknown (not a clean absence)
+    const line = t.stdout.trim();
+    if (!line) return;                                     // cleanly absent ⇒ left out of the closure (missing)
+    const oid = line.split(/\s+/)[2];                      // "<mode> blob <oid>\t<path>"
+    if (oid) closureFiles.push({ path: p, blobOid: oid }); else incomplete = true;
   };
-  for (const o of outputs) if (o && typeof o.path === "string") await addFile(o.path);
-  for (const e of evidence) if (e && typeof e.summaryPath === "string") await addFile(e.summaryPath);
+  for (const o of outputs) if (o && typeof o.path === "string") await resolveFile(o.path);
+  for (const e of evidence) if (e && typeof e.summaryPath === "string") await resolveFile(e.summaryPath);
+  if (incomplete) return null; // a declared-file query errored (not a clean absence) ⇒ unknown, re-read next pass (P2-3)
   const dt = await git(["diff-tree", "--no-commit-id", "--name-only", "-r", sha], { cwd: scratch });
   const cumulativeChangedPaths = dt.code === 0 ? dt.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
-  // Declared outputs AND declared evidence summaryPaths must all be present; a missing/errored declared file ⇒ false
-  // (Codex P2-6 — a deleted evidence file was silently accepted when only outputs were checked).
+  // All declared outputs + evidence files cleanly present? A clean absence ⇒ false ⇒ V7 reject (Codex P2-6); a query
+  // error already returned null above, so a false here is a genuine missing deliverable, not a transient read failure.
   const requiredOutputsPresent = requiredFilesPresent(outputs, evidence, closureFiles);
   return {
     observedWorkCommit: sha, resultText, resultBlobOid, closureFiles, cumulativeChangedPaths,

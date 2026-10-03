@@ -83,14 +83,17 @@ export function prepareDispatch(
   };
   const baseSourceCommit = spec.outputContract.baseSourceCommit;
 
-  // retriesUsed is a per-node LINEAGE counter that must survive from the DURABLE history, not from a lingering RETRY_WAIT
-  // (Codex P1-1): a clean-fail (infra, not business) retires the old attempt in the SAME batch as the new one (§3.1
-  // atomicity), so there is never a RETRY_WAIT left alive to carry the count — we take it from max(retriesUsed) over the
-  // node's attempts instead. An infra failure does not consume a business retry, so the new attempt inherits that max.
-  const lineageRetries = nodeAttempts.reduce((m, a) => Math.max(m, a.retriesUsed), 0);
-  // The succession source is the HIGHEST-retriesUsed expired RETRY_WAIT (not merely the first found — Codex P1-1: with
-  // any residual coexistence, picking the first could inherit the lower count). undefined ⇒ resurrect a fresh attempt.
-  const retryCandidates = nodeAttempts.filter((a) => a.status === "RETRY_WAIT" && a.retryAt !== undefined && params.nowSec >= a.retryAt);
+  // retriesUsed is the LINEAGE counter of the SAME task identity — same specDigest AND same frozen inputs
+  // (inputBindingDigest). A spec or input change is a NEW identity that must start fresh at 0; a node's whole-history
+  // failures are NOT a shared retry pool (Codex P2-1). Cross-identity total consumption is bounded by
+  // job.maxTotalAttempts, never by node-lifetime retry carry-over. Within the identity: a clean-fail (infra) retires the
+  // old attempt in the SAME batch (§3.1), so the count can't live on a lingering RETRY_WAIT — take it from the durable
+  // max over the SAME-IDENTITY attempts (Codex P1-1, infra failures don't consume a business retry).
+  const sameIdentity = nodeAttempts.filter((a) => a.specDigest === spec.specDigest && a.inputBindingDigest === ready.inputBindingDigest);
+  const lineageRetries = sameIdentity.reduce((m, a) => Math.max(m, a.retriesUsed), 0);
+  // The succession source is the HIGHEST-retriesUsed expired RETRY_WAIT of THIS identity (not merely the first found, and
+  // never an old-identity one — Codex P1-1/P2-1). undefined ⇒ resurrect a fresh attempt of this identity.
+  const retryCandidates = sameIdentity.filter((a) => a.status === "RETRY_WAIT" && a.retryAt !== undefined && params.nowSec >= a.retryAt);
   const retryOld = retryCandidates.length ? retryCandidates.reduce((best, a) => (a.retriesUsed > best.retriesUsed ? a : best)) : undefined;
   let attempt: TaskAttempt;
   let abandonedOld: TaskAttempt | undefined;

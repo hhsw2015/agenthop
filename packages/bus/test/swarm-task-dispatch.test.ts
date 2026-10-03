@@ -89,6 +89,34 @@ describe("prepareDispatch — retry succession", () => {
   });
 });
 
+describe("prepareDispatch — no cross-identity retry pollution (Codex P2-1 round-3)", () => {
+  test("a prior FAILED attempt of a DIFFERENT specDigest does not seed retriesUsed into the fresh identity", () => {
+    const plan = buildPlan();
+    const oldSpecFailed: TaskAttempt = {
+      ...createAttempt({ jobId: "job", nodeId: "build", n: 0, planRevision: 1, specDigest: "OLD-SPEC", inputBindings: [], firstBinding: { bindingId: "job/build/a0/b0", assignmentId: "as0", launchId: "rw-old", publishGeneration: 0, openedAtSeq: 1 }, createdAtSeq: 1 }),
+      status: "FAILED", retriesUsed: 3,
+    };
+    const r = prepareDispatch(plan, READY, [oldSpecFailed], "rw-new", "asg-new", P);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.attempt.attemptId).toBe("job/build/a1"); // n counts all node attempts
+    expect(r.attempt.retriesUsed).toBe(0); // fresh identity — NOT polluted by the old-spec FAILED(3)
+  });
+
+  test("a prior attempt with a DIFFERENT inputBindingDigest also starts fresh", () => {
+    const plan = buildPlan();
+    const otherInput: InputBinding = { depNodeId: "dep", acceptedResultId: "r1", workCommit: "wc", resultPath: "out/x" };
+    const oldInputFailed: TaskAttempt = {
+      ...createAttempt({ jobId: "job", nodeId: "build", n: 0, planRevision: 1, specDigest: plan.nodes[0]!.specDigest, inputBindings: [otherInput], firstBinding: { bindingId: "job/build/a0/b0", assignmentId: "as0", launchId: "rw-old", publishGeneration: 0, openedAtSeq: 1 }, createdAtSeq: 1 }),
+      status: "FAILED", retriesUsed: 2,
+    };
+    const r = prepareDispatch(plan, READY, [oldInputFailed], "rw-new", "asg-new", P); // READY has empty inputs ⇒ different digest
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.attempt.retriesUsed).toBe(0); // different frozen inputs ⇒ fresh identity
+  });
+});
+
 // ---- judgeObservation (accept half) ---------------------------------------------------------------------------------
 
 function judgeSpec(): TaskSpec {
