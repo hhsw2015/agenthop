@@ -57,6 +57,16 @@ export async function sweepPass(ops: SweepOps): Promise<void> {
     else if (body.put === "validationRun") runs.set(body.validationRun.validationRunId, body.validationRun);
   }
 
+  // Commit-then-IO barrier (P1-1): a REJECTED commit must NOT proceed to IO and must NOT be logged as success. Ordering
+  // the calls commit→IO is not enough — the result must be checked. Advance local state only on ok; on reject, log
+  // honestly and return false so the caller bails (the durable record is left recoverable — it never claims success).
+  const commitOk = (bodies: ChangeBody[], ctx: string): boolean => {
+    const r = ops.commit(state, bodies);
+    if (!r.result.ok) { ops.log(`sweep ${ctx}: commit rejected (${r.result.reason}) — no IO, no completion claim`); return false; }
+    state = r.state;
+    return true;
+  };
+
   for (const w of waits) {
     if (!isLive(w)) continue;                     // resolved — nothing to supervise
     if (w.state === "action_pending") continue;   // an action is already in flight (begin committed) — bounded delay: skip re-begin
@@ -78,7 +88,7 @@ export async function sweepPass(ops: SweepOps): Promise<void> {
       const action: PendingAction = { actionId: ops.newActionId(), actionKind: "move-validator", target: run.validationRunId, expectedSubjectVersion: run.generation };
       const begun = advanceWait(w, { type: "begin_action", pendingAction: action });
       if (!begun.ok) { ops.log(`sweep ${w.waitId}: begin move-validator rejected: ${begun.error}`); continue; }
-      state = ops.commit(state, [{ put: "wait", wait: begun.wait }]).state;            // CAS: open → action_pending (BEFORE IO)
+      if (!commitOk([{ put: "wait", wait: begun.wait }], `${w.waitId} begin move-validator`)) continue; // CAS BEFORE IO
       const delivered = await ops.doAction(begun.wait, action);                        // IO: notify the new validator seat (R5)
       if (!delivered) { ops.log(`sweep ${w.waitId}: move-validator notify unconfirmed — holding action_pending, retry next tick`); continue; }
       const atSeq = state.seq + 1;                                                     // the batch seq the moved run/wait commit at
@@ -87,12 +97,12 @@ export async function sweepPass(ops: SweepOps): Promise<void> {
       const closedWait = advanceWait(begun.wait, { type: "close", resolution: { outcome: "validator-moved", reason: `validator ${run.validatorLocation} stuck/dead → ${to}`, sourceOperationId: action.actionId } });
       if (!closedWait.ok) { ops.log(`sweep ${w.waitId}: close(validator-moved) rejected: ${closedWait.error}`); continue; }
       const freshWait = openWait({ waitId: ops.newWaitId(w.waitId), kind: w.kind, subject: { ...w.subject, validationRunId: moved.next.validationRunId }, deadlineSec: ops.freshDeadlineSec(), owner: to, timeoutPolicy: w.timeoutPolicy });
-      state = ops.commit(state, [
+      if (!commitOk([
         { put: "validationRun", validationRun: moved.closedOld },  // old run → closed (fences its late verdict)
         { put: "validationRun", validationRun: moved.next },       // new run, gen+1, SAME pinned candidate
         { put: "wait", wait: closedWait.wait },                    // old validation-wait resolved
         { put: "wait", wait: freshWait },                          // new validation-wait for the new run, same batch
-      ]).state;
+      ], `${w.waitId} move-validator confirm`)) continue;
       ops.log(`sweep ${w.waitId}: RPV stuck ⇒ moveValidator ${run.validatorLocation} → ${to} (run ${run.validationRunId}→${moved.next.validationRunId} gen ${moved.next.generation}, new wait ${freshWait.waitId})`);
       continue;
     }
@@ -105,13 +115,13 @@ export async function sweepPass(ops: SweepOps): Promise<void> {
       const action: PendingAction = { actionId: ops.newActionId(), actionKind: "reassign", target: subjectTarget(w), expectedSubjectVersion: 0 };
       const begun = advanceWait(w, { type: "begin_action", pendingAction: action });
       if (!begun.ok) { ops.log(`sweep ${w.waitId}: begin reassign rejected: ${begun.error}`); continue; }
-      state = ops.commit(state, [{ put: "wait", wait: begun.wait }]).state;            // CAS: open → action_pending
+      if (!commitOk([{ put: "wait", wait: begun.wait }], `${w.waitId} begin reassign`)) continue;         // CAS BEFORE IO
       const delivered = await ops.doAction(begun.wait, action);                        // IO: notify the new owner (R5)
       if (!delivered) { ops.log(`sweep ${w.waitId}: reassign notify unconfirmed — holding action_pending, retry next tick`); continue; }
       const closed = advanceWait(begun.wait, { type: "close", resolution: { outcome: "owner-dead", reason: `owner ${w.owner} unreachable`, sourceOperationId: action.actionId } });
       if (!closed.ok) { ops.log(`sweep ${w.waitId}: close(owner-dead) rejected: ${closed.error}`); continue; }
       const fresh = openWait({ waitId: ops.newWaitId(w.waitId), kind: w.kind, subject: w.subject, deadlineSec: ops.freshDeadlineSec(), owner: to, timeoutPolicy: w.timeoutPolicy });
-      state = ops.commit(state, [{ put: "wait", wait: closed.wait }, { put: "wait", wait: fresh }]).state; // close old + open new, same batch
+      if (!commitOk([{ put: "wait", wait: closed.wait }, { put: "wait", wait: fresh }], `${w.waitId} reassign confirm`)) continue; // close old + open new, same batch
       ops.log(`sweep ${w.waitId}: owner-dead ⇒ reassigned ${w.owner} → ${to} (new ${fresh.waitId})`);
       continue;
     }
@@ -126,7 +136,7 @@ export async function sweepPass(ops: SweepOps): Promise<void> {
       const action: PendingAction = { actionId: ops.newActionId(), actionKind: kind, target: subjectTarget(w), expectedSubjectVersion: 0 };
       const begun = advanceWait(w, { type: "begin_action", pendingAction: action });
       if (!begun.ok) { ops.log(`sweep ${w.waitId}: begin ${kind} rejected: ${begun.error}`); continue; }
-      state = ops.commit(state, [{ put: "wait", wait: begun.wait }]).state;            // CAS: open → action_pending (BEFORE IO)
+      if (!commitOk([{ put: "wait", wait: begun.wait }], `${w.waitId} begin ${kind}`)) continue;          // CAS BEFORE IO
       const delivered = await ops.doAction(begun.wait, action);                        // IO: send the ping / escalation notice (R5)
       if (!delivered) { ops.log(`sweep ${w.waitId}: ${kind} unconfirmed — holding action_pending, retry next tick`); continue; }
       // Approval (decision pending): the escalation NOTICE reopens with a fresh deadline (never resolves, never grants —
@@ -135,7 +145,7 @@ export async function sweepPass(ops: SweepOps): Promise<void> {
         ? advanceWait(begun.wait, { type: "action_done", newDeadlineSec: ops.freshDeadlineSec(), nowSec: ops.nowSec() })
         : advanceWait(begun.wait, { type: "action_done", resolution: { outcome: kind, reason: `deadline passed; ${kind} sent`, sourceOperationId: action.actionId } });
       if (!done.ok) { ops.log(`sweep ${w.waitId}: action_done rejected: ${done.error}`); continue; }
-      state = ops.commit(state, [{ put: "wait", wait: done.wait }]).state;
+      if (!commitOk([{ put: "wait", wait: done.wait }], `${w.waitId} ${kind} confirm`)) continue;
       ops.log(isApproval
         ? `sweep ${w.waitId}: approval expired ⇒ escalation sent, REOPENED (deadline ${done.wait.deadlineSec}, escalatedAt ${done.wait.escalatedAt})`
         : `sweep ${w.waitId}: expired ⇒ ${kind} sent, resolved`);

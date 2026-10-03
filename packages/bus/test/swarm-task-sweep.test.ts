@@ -229,3 +229,37 @@ describe("sweep scenario D — RPV validation-wait: stuck/dead validator ⇒ mov
     expect(liveWaits(stateRef.s)[0]!.state).toBe("action_pending");
   });
 });
+
+describe("sweep P1-1 — a REJECTED commit blocks IO and never logs success (commit→IO barrier is checked, not just ordered)", () => {
+  test("begin commit rejected ⇒ NO doAction, wait untouched, honest 'commit rejected' log", async () => {
+    const stateRef = { s: mkState([wait({ waitId: "w1", deadlineSec: 1000 })]) };
+    const order: string[] = [];
+    const logs: string[] = [];
+    await sweepPass(mkOps(stateRef, order, {
+      commit: (state) => ({ state, result: { ok: false, reason: "seq", currentSeq: state.seq } }), // every commit rejected
+      log: (m) => logs.push(m),
+    }));
+    expect(order).toEqual([]);                                   // no IO at all — reject bailed before doAction
+    expect(liveWaits(stateRef.s)[0]!.state).toBe("open");        // unchanged — not advanced
+    expect(logs.some((m) => m.includes("commit rejected"))).toBe(true);
+  });
+
+  test("confirm commit rejected ⇒ IO happened but wait is NOT logged resolved; held action_pending (recoverable)", async () => {
+    const stateRef = { s: mkState([wait({ waitId: "w1", deadlineSec: 1000 })]) };
+    const order: string[] = [];
+    const logs: string[] = [];
+    let n = 0;
+    await sweepPass(mkOps(stateRef, order, {
+      commit: (state, bodies) => {
+        n += 1;
+        if (n === 1) { order.push("commit:begin"); const r = stampCommit(state, bodies); stateRef.s = r.state; return r; } // begin ok
+        order.push("commit:confirm-attempt"); return { state, result: { ok: false, reason: "stale-entity", entityKey: "wait:w1", currentRevision: 99 } }; // confirm rejected
+      },
+      log: (m) => logs.push(m),
+    }));
+    expect(order).toEqual(["commit:begin", "doAction:bypass", "commit:confirm-attempt"]); // IO did happen (begin succeeded)
+    expect(logs.some((m) => m.includes("resolved"))).toBe(false);       // never claimed success on a failed confirm
+    expect(logs.some((m) => m.includes("commit rejected"))).toBe(true);
+    expect(liveWaits(stateRef.s)[0]!.state).toBe("action_pending");     // held recoverable, not falsely resolved
+  });
+});
