@@ -209,6 +209,8 @@ AcceptedResult {
 
 PlanPut 的操作身份包含 `(jobId, planRevision)`，不只 jobId。happycapy 黑板查重不比 payload hash（先验研究 §2.5），此处是修正后的规则。
 
+**非语义修订不触发 supersede/级联(增补 2026-10-03,dogfood S9)**:上游产物的修订若**不改变其 specDigest 所覆盖的任务身份语义**(措辞澄清、勘误、注释——消费者行为不需要变),就不是 supersede,不走业务作废通道,下游 currentAccepted 不受影响。判据与 §2.1/§2.2 的身份切分同源:specDigest 不变 ⇒ 无级联。实证:冻结契约自身的两段勘误(3bf23c→0c06c91c)期间,按原文本建成的 T1 实现无需返工——勘误若被建模为 supersede,级联会错误地把整个 T1 判为失效。真正的灰区(文本变了、语义边界吃不准)按保守侧:发起 review 节点裁决,而不是默认级联。
+
 ---
 
 ## 3. 三条状态轴与交互规则
