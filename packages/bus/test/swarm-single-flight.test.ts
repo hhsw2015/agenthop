@@ -52,6 +52,22 @@ describe("acquireSingleFlight", () => {
     release!();
   });
 
+  test("stale takeover (#1): a lock REFRESHED between our judge and our reclaim does NOT yield two owners", () => {
+    const p = lockPath();
+    writeFileSync(p, "77"); // a stale holder, 77
+    let refreshed = false;
+    const io = {
+      pidAlive: (pid: number) => {
+        if (pid === 77 && !refreshed) { refreshed = true; writeFileSync(p, "202"); return false; } // we judge 77 dead; meanwhile 202 takes over
+        if (pid === 202) return true; // 202 is a live holder
+        return false;
+      },
+    };
+    const got = acquireSingleFlight(p, io);
+    expect(got).toBeNull();                              // we must NOT acquire — 202's live lock has to survive
+    expect(readFileSync(p, "utf8").trim()).toBe("202");  // 202's lock intact (restored, not clobbered/reclaimed)
+  });
+
   test("release is ownership-checked + idempotent: a double release does NOT delete a successor's lock (#3)", () => {
     const p = lockPath();
     const release = acquireSingleFlight(p, { pidAlive: () => true });

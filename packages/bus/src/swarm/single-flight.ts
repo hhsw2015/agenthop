@@ -4,8 +4,11 @@
  * same-seq batches. This makes the single-writer precondition a MECHANISM.
  *
  * The naive "create empty, write pid, check pid, unlink-if-dead" had three races the review pinned (each closed here):
- *   #1 stale-reclaim race : two racers both see a dead holder, both unlink + recreate ⇒ two owners. FIX: reclaim is an
- *      atomic rename (only ONE racer renames the stale lock aside; the loser gets ENOENT and simply retries).
+ *   #1 stale-reclaim race : two racers both see a dead holder and both reclaim ⇒ two owners. rename alone is NOT enough —
+ *      it moves whatever the path points to NOW, which may be a lock another racer already REFRESHED between our read and
+ *      our rename. FIX: rename-aside then VERIFY the moved content is byte-identical to the holder we judged; if it changed
+ *      (a live lock slipped in), restore it + retry; only the exact stale lock we judged is removed. (A rare 3-way restore
+ *      race remains — a full fix needs an OS flock/lease, not in the Node stdlib; this closes the 2-racer reflex.)
  *   #2 empty-file window  : A's O_EXCL create made an EMPTY file before writing its pid; B read holder=0, called it stale,
  *      and took over. FIX: publish atomically via hard-link of a temp that ALREADY holds the pid — the lock file is never
  *      observed empty.
@@ -37,7 +40,7 @@ export function acquireSingleFlight(lockPath: string, io: LockIO = realLockIO): 
     catch { /* lock gone or unreadable — nothing of ours to remove */ }
   };
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
     const tmp = uniq(lockPath, "acq");
     writeFileSync(tmp, String(process.pid), { mode: 0o600 }); // stage the pid BEFORE publishing (no empty-file window, #2)
     try {
@@ -47,12 +50,19 @@ export function acquireSingleFlight(lockPath: string, io: LockIO = realLockIO): 
     } catch (e) {
       safeUnlink(tmp);
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; // a real fs error — surface it
-      let holder = 0;
-      try { holder = Number(readFileSync(lockPath, "utf8").trim()); } catch { /* unreadable ⇒ treat as reclaimable */ }
+      let holderRaw = "";
+      try { holderRaw = readFileSync(lockPath, "utf8").trim(); } catch { /* unreadable ⇒ treat as reclaimable */ }
+      const holder = Number(holderRaw);
       if (holder > 0 && io.pidAlive(holder)) return null; // a live holder owns it — back off
-      // stale (dead/garbage holder): claim the reclaim atomically — only one racer wins the rename (#1); then retry.
-      try { const aside = uniq(lockPath, "stale"); renameSync(lockPath, aside); safeUnlink(aside); }
-      catch { /* ENOENT: another racer already reclaimed it — just retry the link */ }
+      // stale (dead/garbage holder): rename-aside, then VERIFY it is the SAME lock we judged (#1). rename is atomic but
+      // judge-then-reclaim is not, so a racer may have refreshed the lock in between — if the moved content changed, we
+      // grabbed a LIVE lock ⇒ restore it; only the exact stale lock we judged is removed. Then retry the link.
+      const aside = uniq(lockPath, "stale");
+      try { renameSync(lockPath, aside); } catch { continue; } // ENOENT: another racer already moved it — retry
+      let movedRaw = "";
+      try { movedRaw = readFileSync(aside, "utf8").trim(); } catch { /* unreadable */ }
+      if (movedRaw === holderRaw) safeUnlink(aside); // exactly the stale lock we judged — reclaimed
+      else { try { renameSync(aside, lockPath); } catch { safeUnlink(aside); } } // a live lock slipped in — restore it
     }
   }
   return null; // lost the reclaim race repeatedly — back off rather than risk two writers
