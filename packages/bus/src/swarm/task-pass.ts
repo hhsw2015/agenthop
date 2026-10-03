@@ -61,15 +61,18 @@ export type TaskOps = {
  *  confirmed-foreign (we can't prove it isn't ours), so it is SURFACED for the pure V1 to classify + reject, never
  *  silently dropped (Codex P2-2). This does not relax the pure-layer V1/V2 checks; it only decides what the IO observer
  *  may skip. */
-export function isForeignResult(resultText: string, assignmentId: string, attemptId: string): boolean {
+export type ResultIdentity = { jobId: string; nodeId: string; attemptId: string; assignmentId: string };
+export function isForeignResult(resultText: string, expect: ResultIdentity): boolean {
   let r: unknown;
   try { r = JSON.parse(resultText); } catch { return false; } // unparseable ⇒ not confirmed-foreign ⇒ surface to V1
   if (typeof r !== "object" || r === null) return false; // not an object ⇒ schema-invalid ⇒ surface to V1
-  const { assignmentId: aId, attemptId: tId } = r as { assignmentId?: unknown; attemptId?: unknown };
-  // A MISSING/non-string id is schema-invalid, not confirmed-foreign — surface it so V1 rejects it (Codex P2-2). Only a
-  // result bearing BOTH ids as strings that DIFFER from ours is confirmed to belong to another attempt (skip it).
-  if (typeof aId !== "string" || typeof tId !== "string") return false;
-  return aId !== assignmentId || tId !== attemptId;
+  const o = r as Record<string, unknown>;
+  // A MISSING/non-string identity field is schema-invalid, not confirmed-foreign — surface it so V1 rejects it (Codex
+  // P2-2). Only a result bearing ALL FOUR identity fields as strings that DIFFER from ours is confirmed to belong to a
+  // different attempt (skip + keep advancing). Checking all four catches the right-ids/wrong-jobId-or-nodeId case that
+  // V2 would discard-and-stall on (Codex P1-3 residual).
+  for (const k of ["jobId", "nodeId", "attemptId", "assignmentId"] as const) if (typeof o[k] !== "string") return false;
+  return o.jobId !== expect.jobId || o.nodeId !== expect.nodeId || o.attemptId !== expect.attemptId || o.assignmentId !== expect.assignmentId;
 }
 
 /** Every DECLARED file (outputs + validationEvidence.summaryPath) must be present in the observed closure. A missing OR
@@ -195,7 +198,7 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
     // retriesUsed survives a later clean-fail via prepareDispatch's durable max(retriesUsed), NOT via a lingering
     // RETRY_WAIT — so retiring the old here is safe.
     const preBodies: ChangeBody[] = [{ put: "intent", intent: prep.intent }, { put: "attempt", attempt: prep.attempt }];
-    if (prep.abandonedOld) preBodies.push({ put: "attempt", attempt: prep.abandonedOld });
+    for (const retired of prep.retired) preBodies.push({ put: "attempt", attempt: retired });
     state = ops.commit(state, preBodies).state;
 
     const { alloc, delivered } = await ops.startTask({ assignment: prep.assignment, launchId });

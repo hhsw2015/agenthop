@@ -178,13 +178,16 @@ describe("taskPass dispatch — retry lineage survives clean-fail + unknown (Cod
 });
 
 describe("observeGit pure helpers (Codex P1-3 / P2-2 / P2-6 round-3)", () => {
-  test("isForeignResult: confirmed-foreign only; unparseable + schema-invalid surface to V1", () => {
-    expect(isForeignResult(JSON.stringify({ assignmentId: "A", attemptId: "T" }), "A", "T")).toBe(false); // ours
-    expect(isForeignResult(JSON.stringify({ assignmentId: "B", attemptId: "T" }), "A", "T")).toBe(true); // wrong assignment
-    expect(isForeignResult(JSON.stringify({ assignmentId: "A", attemptId: "X" }), "A", "T")).toBe(true); // wrong attempt (P1-3 B)
-    expect(isForeignResult("{not json", "A", "T")).toBe(false); // unparseable ⇒ surface to V1 (P2-2)
-    expect(isForeignResult(JSON.stringify({ attemptId: "T" }), "A", "T")).toBe(false); // missing assignmentId ⇒ schema-invalid ⇒ V1 (P2-2)
-    expect(isForeignResult("null", "A", "T")).toBe(false); // non-object ⇒ surface to V1
+  test("isForeignResult: confirmed-foreign only (all 4 identity fields); unparseable + schema-invalid surface to V1", () => {
+    const id = { jobId: "J", nodeId: "N", attemptId: "J/N/a0", assignmentId: "A" };
+    const j = (o: Record<string, unknown>): string => JSON.stringify(o);
+    expect(isForeignResult(j({ jobId: "J", nodeId: "N", attemptId: "J/N/a0", assignmentId: "A" }), id)).toBe(false); // ours
+    expect(isForeignResult(j({ jobId: "J", nodeId: "N", attemptId: "J/N/a0", assignmentId: "B" }), id)).toBe(true); // wrong assignment
+    expect(isForeignResult(j({ jobId: "J", nodeId: "N", attemptId: "J/N/a9", assignmentId: "A" }), id)).toBe(true); // wrong attempt
+    expect(isForeignResult(j({ jobId: "OTHER", nodeId: "N", attemptId: "J/N/a0", assignmentId: "A" }), id)).toBe(true); // wrong jobId (P1-3 residual)
+    expect(isForeignResult("{not json", id)).toBe(false); // unparseable ⇒ surface to V1 (P2-2)
+    expect(isForeignResult(j({ nodeId: "N", attemptId: "J/N/a0", assignmentId: "A" }), id)).toBe(false); // missing jobId ⇒ schema-invalid ⇒ V1
+    expect(isForeignResult("null", id)).toBe(false); // non-object ⇒ surface to V1
   });
   test("requiredFilesPresent: a declared output OR evidence file missing ⇒ false (missing is detectable)", () => {
     const outputs = [{ path: "out/r.md" }];

@@ -338,7 +338,7 @@ async function observeGitFor(a: { attempt: TaskAttempt; spec: TaskSpec; binding:
     // Skip ONLY a CONFIRMED-foreign result (parseable + assignmentId/attemptId mismatch) so it can't mask a legit older
     // one, and keep advancing (Codex P1-3, incl. right-assignment/wrong-attempt). An unparseable/schema-invalid result
     // is NOT skipped — it is surfaced below for the pure V1 to classify + reject (Codex P2-2), never silently dropped.
-    if (isForeignResult(show.stdout, a.binding.assignmentId, a.attempt.attemptId)) continue;
+    if (isForeignResult(show.stdout, { jobId: a.attempt.jobId, nodeId: a.attempt.nodeId, attemptId: a.attempt.attemptId, assignmentId: a.binding.assignmentId })) continue;
     const rev = await git(["rev-parse", `${c}:${resultPath}`], { cwd: scratch });
     sha = c; resultText = show.stdout; resultBlobOid = rev.code === 0 ? rev.stdout.trim() : "";
     break;
@@ -359,12 +359,19 @@ async function observeGitFor(a: { attempt: TaskAttempt; spec: TaskSpec; binding:
   const closureFiles: Array<{ path: string; blobOid: string }> = [];
   let incomplete = false;
   const resolveFile = async (p: string): Promise<void> => {
-    const t = await git(["ls-tree", sha, "--", p], { cwd: scratch });
+    // --literal-pathspecs: a declared path is a LITERAL filename, never a pathspec — so a path like ":(literal)out/x"
+    // can't be magic-matched to a DIFFERENT real file (Codex round-3 ls-tree/pathspec mismatch).
+    const t = await git(["ls-tree", "--literal-pathspecs", sha, "--", p], { cwd: scratch });
     if (t.code !== 0) { incomplete = true; return; }       // query error ⇒ unknown (not a clean absence)
-    const line = t.stdout.trim();
-    if (!line) return;                                     // cleanly absent ⇒ left out of the closure (missing)
-    const oid = line.split(/\s+/)[2];                      // "<mode> blob <oid>\t<path>"
-    if (oid) closureFiles.push({ path: p, blobOid: oid }); else incomplete = true;
+    const lines = t.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (lines.length === 0) return;                        // cleanly absent ⇒ left out of the closure (missing)
+    const m = /^\d+\s+blob\s+(\S+)\t(.+)$/.exec(lines[0]!); // "<mode> blob <oid>\t<path>"
+    if (lines.length === 1 && m && m[2] === p) { closureFiles.push({ path: p, blobOid: m[1]! }); return; } // exact single file
+    // Otherwise p is a directory (ls-tree listed its children) — use the content-addressed object id AT the exact path
+    // (its TREE oid), so a change to ANY file under it changes the closure (Codex: taking one child's oid missed the rest).
+    const rp = await git(["rev-parse", `${sha}:${p}`], { cwd: scratch });
+    if (rp.code !== 0) { incomplete = true; return; }
+    closureFiles.push({ path: p, blobOid: rp.stdout.trim() });
   };
   for (const o of outputs) if (o && typeof o.path === "string") await resolveFile(o.path);
   for (const e of evidence) if (e && typeof e.summaryPath === "string") await resolveFile(e.summaryPath);

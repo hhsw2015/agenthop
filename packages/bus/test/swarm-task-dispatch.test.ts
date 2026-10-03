@@ -33,7 +33,7 @@ describe("prepareDispatch — fresh attempt", () => {
     expect(r.attempt.attemptId).toBe("job/build/a0");
     expect(r.attempt.status).toBe("RUNNING");
     expect(r.attempt.createdAtSeq).toBe(5);
-    expect(r.abandonedOld).toBeUndefined();
+    expect(r.retired).toHaveLength(0);
     expect(r.binding.bindingId).toBe("job/build/a0/b0");
     expect(r.binding.launchId).toBe("rw-abc");
     expect(r.binding.publishGeneration).toBe(0);
@@ -84,8 +84,43 @@ describe("prepareDispatch — retry succession", () => {
     expect(r.attempt.attemptId).toBe("job/build/a1");
     expect(r.attempt.status).toBe("RUNNING");
     expect(r.attempt.retriesUsed).toBe(1); // inherited, NOT +1
-    expect(r.abandonedOld?.status).toBe("ABANDONED");
-    expect(r.abandonedOld?.abandonReason).toBe("retry-succession");
+    expect(r.retired).toHaveLength(1);
+    expect(r.retired[0]!.status).toBe("ABANDONED");
+    expect(r.retired[0]!.abandonReason).toBe("retry-succession");
+  });
+});
+
+describe("prepareDispatch — §3.1 single-active: retire a different-identity live attempt in-batch (Codex round-3 R2)", () => {
+  test("an old-spec non-terminal attempt is retired as stale-plan when a new-identity attempt is dispatched", () => {
+    const plan = buildPlan();
+    // an old-spec RUNNING attempt lingers (plan revision changed the node's specDigest); readyTasks lets the new identity
+    // through (it only counts current-spec actives), so prepareDispatch must retire the old live-state in the SAME batch.
+    const oldSpecLive: TaskAttempt = {
+      ...createAttempt({ jobId: "job", nodeId: "build", n: 0, planRevision: 1, specDigest: "OLD-SPEC", inputBindings: [], firstBinding: { bindingId: "job/build/a0/b0", assignmentId: "as0", launchId: "rw-old", publishGeneration: 0, openedAtSeq: 1 }, createdAtSeq: 1 }),
+      status: "RUNNING",
+    };
+    const r = prepareDispatch(plan, READY, [oldSpecLive], "rw-new", "asg-new", P);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.attempt.status).toBe("RUNNING");
+    expect(r.attempt.retriesUsed).toBe(0); // fresh identity
+    expect(r.retired).toHaveLength(1); // the old live-state retired same-batch (no double-active)
+    expect(r.retired[0]!.attemptId).toBe("job/build/a0");
+    expect(r.retired[0]!.status).toBe("ABANDONED");
+    expect(r.retired[0]!.abandonReason).toBe("stale-plan");
+  });
+
+  test("a terminal (FAILED) old attempt is NOT retired (nothing to abandon)", () => {
+    const plan = buildPlan();
+    const oldFailed: TaskAttempt = {
+      ...createAttempt({ jobId: "job", nodeId: "build", n: 0, planRevision: 1, specDigest: "OLD-SPEC", inputBindings: [], firstBinding: { bindingId: "job/build/a0/b0", assignmentId: "as0", launchId: "rw-old", publishGeneration: 0, openedAtSeq: 1 }, createdAtSeq: 1 }),
+      status: "FAILED", retriesUsed: 3,
+    };
+    const r = prepareDispatch(plan, READY, [oldFailed], "rw-new", "asg-new", P);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.retired).toHaveLength(0);
+    expect(r.attempt.retriesUsed).toBe(0);
   });
 });
 

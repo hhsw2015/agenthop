@@ -10,7 +10,7 @@
 
 import type { TaskPlan } from "./task-plan.js";
 import {
-  type TaskAttempt, type ExecutionBinding, type AttemptEvent, attemptIdOf, bindingIdOf, createAttempt, makeSuccessionAttempt, advanceAttempt,
+  type TaskAttempt, type ExecutionBinding, type AttemptEvent, type AbandonReason, attemptIdOf, bindingIdOf, createAttempt, makeSuccessionAttempt, advanceAttempt,
 } from "./task-state.js";
 import type { ReadyTask } from "./task-ready.js";
 import { buildAssignment, tokenFits, type Assignment } from "./task-assignment.js";
@@ -36,8 +36,10 @@ export type PreparedDispatch =
   | {
       ok: true;
       attempt: TaskAttempt;
-      /** Set only on a retry succession: the old RETRY_WAIT attempt turned ABANDONED (commit in the SAME batch). */
-      abandonedOld?: TaskAttempt;
+      /** Every OTHER non-terminal attempt of this node, turned ABANDONED, to commit in the SAME batch as the new attempt
+       *  (§3.1 single-active per node — Codex P2 round-3): the same-identity retry source as retry-succession, a
+       *  different-identity live-state as stale-plan/stale-input. Usually empty in T1 (no mid-flight identity change). */
+      retired: TaskAttempt[];
       binding: ExecutionBinding;
       assignment: Assignment;
       intent: DispatchIntent;
@@ -96,7 +98,7 @@ export function prepareDispatch(
   const retryCandidates = sameIdentity.filter((a) => a.status === "RETRY_WAIT" && a.retryAt !== undefined && params.nowSec >= a.retryAt);
   const retryOld = retryCandidates.length ? retryCandidates.reduce((best, a) => (a.retriesUsed > best.retriesUsed ? a : best)) : undefined;
   let attempt: TaskAttempt;
-  let abandonedOld: TaskAttempt | undefined;
+  const retired: TaskAttempt[] = [];
   if (retryOld) {
     const s = makeSuccessionAttempt(retryOld, {
       n, specDigest: spec.specDigest, inputBindings: ready.proposedBindings,
@@ -105,7 +107,7 @@ export function prepareDispatch(
     });
     if ("error" in s) return { ok: false, reason: `succession: ${s.error}` };
     attempt = s.next;
-    abandonedOld = s.abandonedOld;
+    retired.push(s.abandonedOld);
   } else {
     attempt = createAttempt({
       jobId: plan.jobId, nodeId: ready.nodeId, n, planRevision: plan.planRevision, specDigest: spec.specDigest,
@@ -117,6 +119,17 @@ export function prepareDispatch(
     });
   }
 
+  // §3.1 single-active per node (identity-agnostic, fe0376cd): retire EVERY OTHER non-terminal attempt in THIS batch — a
+  // different-identity live-state as stale (stale-plan if the spec changed, else stale-input), any same-identity leftover
+  // as retry-succession. No count flows from a stale identity (lineageRetries is already identity-scoped). The full
+  // supersede cascade (scrubbing the orphan box) is T2; this only keeps the control state single-active.
+  for (const a of nodeAttempts) {
+    if (retryOld && a.attemptId === retryOld.attemptId) continue; // already retired by the succession above
+    if (a.status !== "RUNNING" && a.status !== "RESULT_PENDING_VALIDATION" && a.status !== "RETRY_WAIT") continue; // terminal
+    const reason: AbandonReason = a.specDigest !== spec.specDigest ? "stale-plan" : a.inputBindingDigest !== ready.inputBindingDigest ? "stale-input" : "retry-succession";
+    retired.push({ ...a, status: "ABANDONED", abandonReason: reason });
+  }
+
   const assignment = buildAssignment({
     attempt, spec, binding,
     remainingLifeSec: params.remainingLifeSec, checkpointBudgetSec: params.checkpointBudgetSec, handoffMarginSec: params.handoffMarginSec,
@@ -124,7 +137,7 @@ export function prepareDispatch(
   const timing: IntentTiming = { allocRequestStartSec: params.nowSec, workDeadlineSec: params.nowSec + params.budgetSec };
   const intent = buildDispatchIntent(assignment, timing);
 
-  return { ok: true, attempt, ...(abandonedOld ? { abandonedOld } : {}), binding, assignment, intent };
+  return { ok: true, attempt, retired, binding, assignment, intent };
 }
 
 // ---- the ACCEPT half: an observed candidate -> verdict -> state changes (§4.2 / §4.5-6) -------------------------------
