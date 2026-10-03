@@ -10,9 +10,11 @@
  *   - the WALL clock vs an absolute deadline (Date.now()); wall DOES advance across a suspend, so it catches the
  *     case the monotonic clock misses, and the monotonic clock catches a backward wall step that would otherwise
  *     extend the box's life.
- * Taking the min of the two remaining estimates means neither a suspend (monotonic under-count) nor a wall
- * rollback (wall over-count) can make us believe we have more time than we do. CLOCK_BOOTTIME would fold both into
- * one source; prefer it IF verified on the target VM, but this min-of-two is correct without it.
+ * Taking the min of the two remaining estimates covers a suspend (monotonic stalls -> wall catches it) OR a wall
+ * rollback (wall stalls -> monotonic catches it) INDIVIDUALLY. It is NOT safe against BOTH at once: a VM suspend
+ * during which the wall clock also steps backward can still over-report remaining time (Codex P3-1). This helper is
+ * therefore best-effort; the dispatcher's authoritative OFF-box clock is the real deadline backstop. CLOCK_BOOTTIME
+ * would fold both into one monotonic-across-suspend source; prefer it IF verified on the target VM.
  */
 
 export type RemainingInput = {
@@ -28,8 +30,8 @@ export type RemainingInput = {
 
 /**
  * Conservative remaining seconds = min(budget - monotonicElapsed, wallDeadline - wallNow). Can go negative (past
- * due). Whichever clock reports less time wins, so suspend (monotonic stalls) and wall rollback (wall stalls) are
- * both covered.
+ * due). Whichever clock reports less time wins, covering a suspend OR a wall rollback individually — but NOT both at
+ * once (best-effort; the dispatcher's authoritative time is the backstop). See the header note (Codex P3-1).
  */
 export function conservativeRemainingSec(i: RemainingInput): number {
   const byMonotonic = i.budgetSec - i.monotonicElapsedSec;

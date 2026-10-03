@@ -92,6 +92,11 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     if (flushing) return;
     flushing = true;
     try {
+      // Recover claims a dead/previous run left behind, for the CURRENT identity's keys. Crucial after a LATE identity
+      // adoption (Codex learns its native id only after its first turn): a message orphaned as `.json.claim-<oldpid>`
+      // under the just-adopted stableId would otherwise never be reclaimed (claimInbox only sees `.json`), staying stuck
+      // across the restart/adoption (Codex P2-8). Cheap + safe: only a dead pid's claim is released.
+      recoverStaleClaims(home, inboxKeys());
       const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
       // claimInbox claims the WHOLE pending batch up front. On the first push failure (channel not ready) we
       // must release this one AND every still-unprocessed claim — otherwise they are orphaned as .claim-<pid>
@@ -116,14 +121,19 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
     learnStableId(codexThread, ownCodexThread !== undefined);
     const label = labelFor(from);
+    // Bind the delivery identity's inbox key + arrival time NOW, before the async push. If the push fails, the fallback
+    // persist must use the SAME identity this message was resolved for — not whatever identity a concurrent noteThread
+    // switched us to by the time the callback runs, which would file A's message into B's inbox (Codex P2-7).
+    const key = inboxKey();
+    const ts = Date.now();
     // Metadata-only comms journal for swarm observability. Gated so Buffer.byteLength + the call are skipped entirely
     // when AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
-    if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from, to: self.id, via, direction: "in", size: Buffer.byteLength(text), text });
+    if (msgLogEnabled()) writeMsgLog(home, { ts, from, to: self.id, via, direction: "in", size: Buffer.byteLength(text), text });
     dbg(`inbound via=${via} from=${from} own=${ownCodexThread} stable=${self.stableId} daemon=${codexDaemon?.activeThread(self.cwd)} -> codexThread=${codexThread}`);
     void pushToHost(label, text, { codexThread, codexHome: codexDaemon?.codexHome() }).then((ok) => {
       dbg(`pushToHost ok=${ok}`);
       if (ok) void flushInbox(); // channel works -> also deliver any durable backlog (keeps order)
-      else writeInbox(home, inboxKey(), { from, fromLabel: label, text, via, ts: Date.now() });
+      else writeInbox(home, key, { from, fromLabel: label, text, via, ts });
     });
   };
 
@@ -216,11 +226,10 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const stopStatusWatch = watchStatusDir(statusHome, applyStatusFromFile);
   applyStatusFromFile(); // pick up a file that already exists at startup
 
-  // Durable-inbox retry: deliver anything queued while the native channel was not ready. First release any claims
-  // a previous run left behind when it died/broke mid-flush (otherwise they are stranded forever), then flush once
-  // to pick up messages a previous MCP-subprocess run persisted (restart durability). Unref'd — the broker socket
-  // keeps the process alive; this timer must not by itself.
-  recoverStaleClaims(home, inboxKeys());
+  // Durable-inbox retry: deliver anything queued while the native channel was not ready, and pick up messages a previous
+  // MCP-subprocess run persisted (restart durability). flushInbox itself first recovers stale claims for the current
+  // identity's keys (Codex P2-8), so this covers both the initial run-id and any later-adopted stableId. Unref'd — the
+  // broker socket keeps the process alive; this timer must not by itself.
   void flushInbox();
   const flushTimer = setInterval(() => void flushInbox(), 5000);
   flushTimer.unref?.();

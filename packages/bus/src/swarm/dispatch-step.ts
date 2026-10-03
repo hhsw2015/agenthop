@@ -194,6 +194,8 @@ async function allocate(r: ControlRecord, records: Map<string, ControlRecord>, o
     state: "RUNNING",
     generation: gen,
     handoffSha,
+    sha: handoffSha, // confirmed anchor from the start (handoffSha IS a confirmed checkpoint) so recovery of the child
+    // never faces an empty sha and skips allocate forever; its own observe advances it as it publishes (Codex P2-5).
     allocStart: reqStart,
     budgetSec: ops.budgetSec,
     deadlineEpoch: reqStart + ops.budgetSec,
@@ -268,6 +270,15 @@ async function awaitResume(r: ControlRecord, records: Map<string, ControlRecord>
     return r;
   }
   if (!tip.isDescendantOfAccepted) { ops.log(`${r.launchId}: successor tip not a descendant of handoffSha; ignoring`); return r; }
+  // Before the predecessor goes RESUMED (then RETIRED), persist the VERIFIED recovery point onto the SUCCESSOR record,
+  // so an ACK-then-crash leaves the child anchored at its own confirmed milestone (not only handoffSha) and auto-recovery
+  // can resume from the newest confirmed work (Codex P2-5). Never regress a child that already advanced past this tip.
+  const child = records.get(r.successor);
+  if (child && (child.sha === undefined || child.sha === r.handoffSha)) {
+    const anchored = { ...child, sha: tip.sha, updatedAt: ops.nowSec() };
+    records.set(r.successor, anchored);
+    ops.persist(anchored);
+  }
   // A REAL successor milestone at the pinned publish-generation, descending from handoffSha -> resumed-ACK.
   return apply(r, { type: "resumed", successor: r.successor, sha: r.handoffSha, generation: r.generation, attempt: r.attempt }, ops, records);
 }

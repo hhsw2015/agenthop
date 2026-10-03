@@ -34,4 +34,12 @@ describe("pickThreadForCwd", () => {
   test("cwd known for a thread that is not currently loaded is ignored", () => {
     expect(pickThreadForCwd([B], cwds, "/work/happycapy")).toBe(B); // A matches cwd but isn't loaded -> fall back to sole loaded
   });
+
+  test("incomplete cwd map (a loaded thread's cwd not read yet) -> no unique match, no false pin (P1-3)", () => {
+    // A's cwd is known and matches, but B is loaded with its cwd NOT read yet -> must NOT declare A the unique match
+    // (a pending read is not "a different cwd"). >1 loaded so the fallback is undefined -> message waits, no misdeliver.
+    expect(pickThreadForCwd([A, B], new Map([[A, "/work/happycapy"]]), "/work/happycapy")).toBeUndefined();
+    // once B's cwd is known (and differs), A becomes the unambiguous unique match
+    expect(pickThreadForCwd([A, B], new Map([[A, "/work/happycapy"], [B, "/work/other"]]), "/work/happycapy")).toBe(A);
+  });
 });

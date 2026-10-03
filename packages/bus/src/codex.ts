@@ -297,7 +297,11 @@ function readFrame(buf: Buffer): { fin: boolean; opcode: number; payloadBuf: Buf
  *  3. otherwise undefined — ambiguous, so the message stays durably queued rather than risk misdelivery.
  */
 export function pickThreadForCwd(loaded: string[], cwdByThread: Map<string, string>, cwd?: string): string | undefined {
-  if (cwd) {
+  // Only trust a cwd match when EVERY loaded thread's cwd is known. A pending/failed thread/read is NOT "a different
+  // cwd" — treating it so would let an incomplete map name a false unique match and then pin the wrong session's
+  // identity (Codex P1-3). When the map is incomplete, fall through (do NOT guess by cwd); authoritative call metadata
+  // still corrects/learns the real identity later, and until then the message waits rather than misdeliver.
+  if (cwd && loaded.length > 0 && loaded.every((id) => cwdByThread.has(id))) {
     const matches = loaded.filter((id) => cwdByThread.get(id) === cwd);
     if (matches.length === 1) return matches[0];
   }
