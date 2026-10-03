@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -66,6 +66,30 @@ for (const [target, name] of targets) {
     { cwd: root, stdio: "inherit" },
   );
   if (result.status !== 0) process.exit(result.status ?? 1);
+}
+
+// Smoke-test the compiled binary that matches THIS build host, before we trust it (write SHA256SUMS / install it).
+// Guards against a TRUNCATED or CORRUPT compile output — a half-written/partial binary won't exec or prints nothing.
+// `--version` is a short, tty-independent command, so a healthy binary MUST print its version; a non-zero exit or
+// empty output means a bad build → abort rather than publish/install it. (This does NOT catch transient install-time
+// races, e.g. a binary read while it is mid-replacement — those are an install-atomicity concern, not a build defect.)
+// Only the host-native target is runnable here (cross-targets rely on the compiler's exit code); CI runs on linux so
+// it smoke-tests the linux binary, a local macOS build smoke-tests the macOS one — the ones most likely installed.
+const hostTarget = { "darwin|arm64": "agenthop-macos-arm64", "darwin|x64": "agenthop-macos-x64", "linux|x64": "agenthop-linux-x64", "linux|arm64": "agenthop-linux-arm64", "win32|x64": "agenthop-windows-x64.exe" }[`${process.platform}|${process.arch}`];
+if (hostTarget) {
+  const bin = join(root, "dist", hostTarget);
+  let out = "";
+  try {
+    out = execFileSync(bin, ["--version"], { encoding: "utf8", timeout: 30000 });
+  } catch (error) {
+    console.error(`smoke test FAILED: ${hostTarget} --version errored (corrupt build?): ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
+  if (!/agenthop/i.test(out)) {
+    console.error(`smoke test FAILED: ${hostTarget} --version printed no version (corrupt build) -> ${JSON.stringify(out)}`);
+    process.exit(1);
+  }
+  console.log(`smoke ok: ${hostTarget} -> ${out.trim()}`);
 }
 
 // `agenthop update` refuses a program whose hash is not in here.
