@@ -122,6 +122,28 @@ export type WaitRecord = {
   approvalReason?: string;
 };
 
+/** A validation execution record (team-collab §0b, R2 P2-2): when a candidate is observed but can't be VALIDATED (V8
+ *  environment broke / timed out), this does NOT become business transient-infra — the pinned candidate is fine, only
+ *  the validator is stuck. We open a new validation run at a different validator location, re-using the SAME pinned
+ *  candidate (business is NOT re-run), and fence the old validator's late reply by generation (peer-late analog to the
+ *  ExecutionBinding (launchId,generation) seam). Durable so run/candidate identity survives a crash (impl obligation 3).
+ *  Type lives here (co-located with Change); transitions are in task-validation.ts. */
+export type ValidationRunState = "running" | "verdict_pending" | "closed";
+export type ValidationCandidateRef = { observedResultId: string; observedWorkCommit: string; resultClosureDigest: string };
+export type ValidationRun = {
+  validationRunId: string;
+  attemptId: string;
+  /** The PINNED candidate — identical across every run for this attempt (business is never re-run). */
+  candidateRef: ValidationCandidateRef;
+  /** Monotonic; a new validator execution location = a new generation. A verdict from an older generation is fenced. */
+  generation: number;
+  validatorLocation: string;
+  state: ValidationRunState;
+  openedAtSeq: number;
+  closedAtSeq?: number;
+  closeReason?: "verdict-accepted" | "superseded" | "cancelled";
+};
+
 export type ChangeBody =
   | { put: "plan"; plan: TaskPlan }
   | { put: "attempt"; attempt: TaskAttempt }
@@ -131,6 +153,7 @@ export type ChangeBody =
   | { put: "supersede"; acceptedResultId: string }
   | { put: "intent"; intent: DispatchIntent }
   | { put: "wait"; wait: WaitRecord }
+  | { put: "validationRun"; validationRun: ValidationRun }
   | { put: "lifecycle"; record: ControlRecord }
   | { put: "scan"; branch: string; cursor: string | null }
   | { put: "tombstone"; launchId: string };
@@ -170,6 +193,7 @@ export function entityKeyOf(c: ChangeBody): string {
     case "supersede": return `accepted:${c.acceptedResultId}`; // modifies that accepted entity
     case "intent": return `intent:${c.intent.intentId}`;
     case "wait": return `wait:${c.wait.waitId}`;
+    case "validationRun": return `validationRun:${c.validationRun.validationRunId}`;
     case "lifecycle": return `lifecycle:${c.record.launchId}`;
     case "scan": return `scan:${c.branch}`;
     case "tombstone": return `tombstone:${c.launchId}`;
