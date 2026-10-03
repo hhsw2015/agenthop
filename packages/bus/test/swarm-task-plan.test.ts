@@ -131,20 +131,36 @@ describe("digests — canonical, deterministic, content-addressed", () => {
   test("changing goal changes specDigest", () => {
     expect(computeSpecDigest(asSpec(spec({ goal: "x" })))).not.toBe(computeSpecDigest(asSpec(spec({ goal: "y" }))));
   });
-  test("required defaults to true and is stored explicitly", () => {
+  test("required defaults true and is stored explicitly; runtime defaults ephemeral", () => {
     const r = loadPlan(plan([spec()]));
-    expect(r.ok && r.plan.nodes[0]!.required === true).toBe(true);
+    expect(r.ok && r.plan.nodes[0]!.required === true && r.plan.nodes[0]!.runtime === "ephemeral").toBe(true);
   });
-  test("required:false is respected and changes specDigest vs default-true (it IS a hashed spec field)", () => {
-    const def = loadPlan(plan([spec()]));
-    const explicitTrue = loadPlan(plan([spec({ required: true })]));
-    const falsy = loadPlan(plan([spec({ required: false })]));
-    expect(def.ok && explicitTrue.ok && def.plan.nodes[0]!.specDigest === explicitTrue.plan.nodes[0]!.specDigest).toBe(true);
-    expect(def.ok && falsy.ok && def.plan.nodes[0]!.specDigest !== falsy.plan.nodes[0]!.specDigest).toBe(true);
-    expect(falsy.ok && falsy.plan.nodes[0]!.required === false).toBe(true);
+  test("flipping required/runtime does NOT change specDigest but DOES change planDigest — role annotations, not task identity (PINNED fe0376cd review #2)", () => {
+    const base = loadPlan(plan([spec({ nodeId: "A" })]));
+    const reqFalse = loadPlan(plan([spec({ nodeId: "A", required: false })]));
+    const durable = loadPlan(plan([spec({ nodeId: "A", runtime: "durable" })]));
+    expect(base.ok && reqFalse.ok && durable.ok).toBe(true);
+    if (base.ok && reqFalse.ok && durable.ok) {
+      const sd = base.plan.nodes[0]!.specDigest;
+      expect(reqFalse.plan.nodes[0]!.specDigest).toBe(sd);
+      expect(durable.plan.nodes[0]!.specDigest).toBe(sd);
+      expect(reqFalse.plan.planDigest).not.toBe(base.plan.planDigest);
+      expect(durable.plan.planDigest).not.toBe(base.plan.planDigest);
+    }
   });
   test("non-boolean required rejected", () => {
     expect(loadPlan(plan([spec({ required: "yes" as unknown as boolean })])).ok).toBe(false);
+  });
+  test("runtime must be ephemeral|durable", () => {
+    expect(loadPlan(plan([spec({ runtime: "cloud" as unknown as "durable" })])).ok).toBe(false);
+  });
+  test("visibility allowed only when runtime=durable", () => {
+    expect(loadPlan(plan([spec({ runtime: "durable", visibility: "visible" })])).ok).toBe(true);
+    expect(loadPlan(plan([spec({ runtime: "ephemeral", visibility: "headless" })])).ok).toBe(false);
+    expect(loadPlan(plan([spec({ visibility: "headless" })])).ok).toBe(false); // runtime defaults ephemeral
+  });
+  test("invalid visibility value rejected", () => {
+    expect(loadPlan(plan([spec({ runtime: "durable", visibility: "ghost" as unknown as "visible" })])).ok).toBe(false);
   });
   test("planDigest stable across node array identity, changes when a node changes", () => {
     const p1 = loadPlan(plan([spec({ nodeId: "A" }), spec({ nodeId: "B", dependsOn: ["A"] })]));

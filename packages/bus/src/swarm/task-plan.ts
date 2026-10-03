@@ -50,11 +50,20 @@ export type TaskSpec = {
   sourceWriteScope?: string[];
   estimatedRuntimeSec: number;
   retryBudget: number;
-  /** Is this node necessary for job success (§4.4 "必需节点,默认全部"; projection viz-gap 2). Defaults to true when
-   *  omitted; loadPlan stores it EXPLICITLY so two semantically-equal specs hash identically. It IS part of specDigest
-   *  (added at T1 on purpose — adding it at T2 would drift every stored specDigest). */
+  // --- plan/dispatch ROLE ANNOTATIONS. NOT part of specDigest (task identity) — only planDigest. Flipping any of
+  //     these must NOT V5-invalidate a running attempt: retagging a node required/durable did not change the TASK
+  //     (§4.2 V5 = "the task itself changed"; fe0376cd review #2). They ARE in planDigest, so §2.6 PlanPut conflict
+  //     detection still sees the change.
+  /** Necessary for job success (§4.4 "必需节点,默认全部"; projection viz-gap 2). Default true, stored explicitly. */
   required: boolean;
-  /** canonical-JSON SHA-256 of this spec's fields (excluding specDigest). Set by loadPlan. */
+  /** Who executes it: an ephemeral box (outsourced) or a durable member (employee). team-collab §2 node annotation.
+   *  Default "ephemeral", stored explicitly. */
+  runtime: "ephemeral" | "durable";
+  /** Member visibility — only meaningful for a durable member (a box is always headless), so only allowed when
+   *  runtime=durable. Optional; absent otherwise. */
+  visibility?: "visible" | "headless";
+  /** canonical-JSON SHA-256 of the TASK IDENTITY fields — everything EXCEPT specDigest and the role annotations
+   *  required/runtime/visibility. Set by loadPlan. */
   specDigest: string;
 };
 
@@ -77,11 +86,16 @@ export type LoadResult = { ok: true; plan: TaskPlan } | { ok: false; reason: str
 
 const TASK_KINDS: ReadonlySet<string> = new Set(["work", "integration", "synthesis", "review", "repair"]);
 const OUTPUT_KINDS: ReadonlySet<string> = new Set(["patch", "files", "report", "notes"]);
+const RUNTIMES: ReadonlySet<string> = new Set(["ephemeral", "durable"]);
+const VISIBILITIES: ReadonlySet<string> = new Set(["visible", "headless"]);
 
-/** specDigest = canonical-JSON SHA-256 of the spec WITHOUT its own specDigest field (self-reference impossible). */
+/** specDigest = canonical-JSON SHA-256 of the TASK IDENTITY fields. Omits specDigest (self-reference) AND the
+ *  plan/dispatch role annotations required/runtime/visibility: specDigest answers "what must the worker do and what
+ *  counts as acceptable", so V5 invalidates an attempt ONLY when the task itself changed — never when a node is
+ *  retagged required/durable/visible (§4.2 V5; fe0376cd review #2). */
 export function computeSpecDigest(spec: TaskSpec): string {
-  const { specDigest: _omit, ...rest } = spec;
-  return digestOf(rest);
+  const { specDigest: _d, required: _r, runtime: _rt, visibility: _v, ...identity } = spec;
+  return digestOf(identity);
 }
 
 /** planDigest = canonical-JSON SHA-256 of the plan WITHOUT its own planDigest field. Node specDigests are part of
@@ -133,6 +147,12 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
   if (!isIntAtLeast(o.retryBudget, 0)) return { reason: `${where}.retryBudget must be an integer >= 0` };
   if (o.required !== undefined && typeof o.required !== "boolean") return { reason: `${where}.required must be a boolean` };
   const required = o.required === undefined ? true : o.required;
+  if (o.runtime !== undefined && (!isString(o.runtime) || !RUNTIMES.has(o.runtime))) return { reason: `${where}.runtime must be ephemeral|durable` };
+  const runtime = (o.runtime === undefined ? "ephemeral" : o.runtime) as "ephemeral" | "durable";
+  if (o.visibility !== undefined) {
+    if (!isString(o.visibility) || !VISIBILITIES.has(o.visibility)) return { reason: `${where}.visibility must be visible|headless` };
+    if (runtime !== "durable") return { reason: `${where}.visibility only allowed when runtime=durable` };
+  }
 
   const spec: TaskSpec = {
     nodeId: o.nodeId,
@@ -156,6 +176,8 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
     estimatedRuntimeSec: o.estimatedRuntimeSec,
     retryBudget: o.retryBudget,
     required,
+    runtime,
+    ...(o.visibility !== undefined ? { visibility: o.visibility as "visible" | "headless" } : {}),
     specDigest: "",
   };
   return { spec };
