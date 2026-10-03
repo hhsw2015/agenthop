@@ -382,9 +382,21 @@ async function startTaskIO(a: { assignment: Assignment; launchId: string }): Pro
   }
 }
 
-function buildTaskOps(stateRef: { s: LogState }): TaskOps {
+// The job wall-clock budget start = when the plan was first committed (PlanPut), PERSISTED so a dispatcher restart does
+// NOT reset it (fe0376cd T1 review A / T2 review #1). Write-once per jobId; later reads return the original epoch.
+function jobStartSec(jobId: string): number {
+  const dir = path.join(HOME, ".agenthop", "swarm", "jobs");
+  const file = path.join(dir, `${jobId}.started`);
+  try { const v = Number(readFileSync(file, "utf8").trim()); if (Number.isFinite(v) && v > 0) return v; } catch { /* first run */ }
+  const now = nowSec();
+  mkdirSync(dir, { recursive: true });
+  atomicWrite(file, String(now));
+  return now;
+}
+
+function buildTaskOps(stateRef: { s: LogState }, planCommittedAtSec: number): TaskOps {
   return {
-    nowSec, cap: CAP, budgetSec: BUDGET_SEC, remainingLifeSec: VM_LIFETIME_SEC,
+    nowSec, cap: CAP, budgetSec: BUDGET_SEC, planCommittedAtSec, remainingLifeSec: VM_LIFETIME_SEC,
     checkpointBudgetSec: CHECKPOINT_BUDGET_SEC, handoffMarginSec: HANDOFF_LEAD_SEC, tokenMarginSec: TOKEN_MARGIN_SEC,
     jitterSec: () => 0, // deterministic (single-node T1; a non-zero thundering-herd jitter is sampled+persisted at T2)
     newLaunchId: () => `rw-${randomBytes(4).toString("hex")}`,
@@ -406,13 +418,16 @@ async function main(): Promise<void> {
   const records = loadMirror();
   const ops = buildOps();
   const taskStateRef = { s: loadControlLog(CONTROL_LOG_DIR) };
-  const taskOps = buildTaskOps(taskStateRef);
+  const taskOps = plan ? buildTaskOps(taskStateRef, jobStartSec(plan.jobId)) : null;
   for (;;) {
     try { await pass(records, ops); } catch (e) { log(`pass error: ${e instanceof Error ? e.message : e}`); }
     // The business-task pass runs AFTER the lifecycle handoff pass (§4.5: handoff advances lifecycle, then task pass
     // observes/accepts/dispatches). Gated on a plan + SWARM_TASK_EXEC (allocates boxes). Reloads the log each round so a
     // crash-restart picks up where it left off.
-    if (plan && taskOn) {
+    // T1.5 RED LINE (fe0376cd): until the resume adapter + lifecycle→commitControl migration land, do NOT enable --task
+    // dispatch for any task that may undergo a handoff — the lifecycle resume half is not yet wired to continue the
+    // business task. Live gating (SWARM_TASK_EXEC) is off by default, so this is a zero-cost operational constraint.
+    if (plan && taskOn && taskOps) {
       try { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
       catch (e) { log(`taskPass error: ${e instanceof Error ? e.message : e}`); }
     }

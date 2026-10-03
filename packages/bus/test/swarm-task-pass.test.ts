@@ -5,6 +5,7 @@
 import { describe, expect, test } from "vitest";
 import { loadPlan, type TaskPlan } from "../src/swarm/task-plan.js";
 import { commit, entityKeyOf, initialLogState, type ChangeBody, type LogState } from "../src/swarm/control-log.js";
+import { jobStatus } from "../src/swarm/task-ready.js";
 import { taskPass, buildSched, type TaskOps, type GitFacts } from "../src/swarm/task-pass.js";
 
 function plan1(): TaskPlan {
@@ -32,7 +33,7 @@ function mkOps(over: Partial<TaskOps> & { stateRef: { s: LogState }; order: stri
   const { stateRef, order } = over;
   let lid = 0;
   return {
-    nowSec: () => 1000, cap: 3, budgetSec: 3480, remainingLifeSec: 3000, checkpointBudgetSec: 300, handoffMarginSec: 180,
+    nowSec: () => 1000, cap: 3, budgetSec: 3480, planCommittedAtSec: 1000, remainingLifeSec: 3000, checkpointBudgetSec: 300, handoffMarginSec: 180,
     tokenMarginSec: 600, jitterSec: () => 0,
     newLaunchId: () => `rw-t${++lid}`,
     loadState: () => stateRef.s,
@@ -84,6 +85,21 @@ describe("taskPass dispatch — cap bounds concurrency", () => {
     const order: string[] = [];
     await taskPass(plan, mkOps({ stateRef, order, cap: 1 }));
     expect(buildSched(plan, stateRef.s).attempts).toHaveLength(1); // only one box allocated
+  });
+});
+
+describe("taskPass — job wall-clock budget (fix A: wallClockSec from planCommittedAtSec)", () => {
+  test("once elapsed >= maxWallClockSec, nothing is dispatched and jobStatus is failed(budget)", async () => {
+    const plan = plan1(); // maxWallClockSec 36000
+    const stateRef = { s: initialLogState() };
+    const order: string[] = [];
+    // plan committed 36001s before now (nowSec 1000) ⇒ wallClockSec 36001 >= 36000 ⇒ budget exhausted.
+    await taskPass(plan, mkOps({ stateRef, order, planCommittedAtSec: 1000 - 36001 }));
+    expect(buildSched(plan, stateRef.s).attempts).toHaveLength(0); // readyTasks empty ⇒ no startTask
+    expect(order).not.toContain("startTask");
+    const s = jobStatus({ ...buildSched(plan, stateRef.s), now: 1000, jobUsage: { totalAttempts: 0, wallClockSec: 36001 } });
+    expect(s.status).toBe("failed");
+    expect(s.note).toContain("budget");
   });
 });
 

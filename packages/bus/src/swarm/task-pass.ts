@@ -33,6 +33,9 @@ export type TaskOps = {
   nowSec: () => number;
   cap: number;
   budgetSec: number;
+  /** Epoch seconds the job's plan was first committed (PlanPut) — PERSISTED, recovery does NOT reset it. Drives the job
+   *  wall-clock budget: wallClockSec = now - this. (fe0376cd T1 review A / T2 review #1: the budget start lives here.) */
+  planCommittedAtSec: number;
   remainingLifeSec: number;
   checkpointBudgetSec: number;
   handoffMarginSec: number;
@@ -70,7 +73,10 @@ function branchOf(binding: ExecutionBinding): string {
   return `swarm/${binding.launchId}-g${binding.publishGeneration}`;
 }
 
-/** The newest OPEN binding of an attempt (the one currently executing / publishing). */
+/** The newest OPEN binding of an attempt (the one currently executing / publishing). T1: one binding per attempt, so
+ *  "last non-closed" is unambiguous. T1.5 (resume/handoff adds a second binding + the closing cutoff protocol): revisit
+ *  — a closing binding still needs O1 observation until closedAtSeq, so this must not skip a closing-but-not-closed one
+ *  (fe0376cd T1 review, filed note). */
 function liveBinding(a: TaskAttempt): ExecutionBinding | undefined {
   for (let i = a.executionBindings.length - 1; i >= 0; i--) {
     const b = a.executionBindings[i]!;
@@ -130,7 +136,7 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
 
   // ---- DISPATCH: ready set -> prepare -> commit intent+attempt (CAS) -> box IO -> commit outcome --------------------
   const sched = buildSched(plan, state);
-  const usage: JobUsage = { totalAttempts: sched.attempts.length, wallClockSec: 0 };
+  const usage: JobUsage = { totalAttempts: sched.attempts.length, wallClockSec: Math.max(0, ops.nowSec() - ops.planCommittedAtSec) };
   const ready = readyTasks({ ...sched, now: ops.nowSec(), jobUsage: usage });
   let free = Math.max(0, ops.cap - occupied(sched.attempts));
   for (const task of ready) {
@@ -155,15 +161,14 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
     // created => confirm the dispatch; clean-fail => abandon the intent AND revoke the never-run attempt (F1); unknown =>
     // leave pending/unknown (conservative occupancy, reconciled by observing the WORK branch).
     const postBodies: ChangeBody[] = [{ put: "intent", intent: outcome === "created" ? confirmIntent(resolved) : outcome === "clean-fail" ? abandonIntent(resolved) : resolved }];
-    if (outcome === "clean-fail") {
-      postBodies.push({ put: "attempt", attempt: { ...prep.attempt, status: "ABANDONED", abandonReason: "intent-revoked" } });
-      free += 1; // the slot was never taken
-    }
+    if (outcome === "clean-fail") postBodies.push({ put: "attempt", attempt: { ...prep.attempt, status: "ABANDONED", abandonReason: "intent-revoked" } });
     state = ops.commit(state, postBodies).state;
-    free -= 1;
+    // created + unknown hold a slot (unknown conservatively); clean-fail reliably took none, so it does NOT consume one.
+    if (outcome !== "clean-fail") free -= 1;
     ops.log(`dispatch ${task.nodeId}: ${launchId} alloc=${outcome}`);
   }
 
-  const status = jobStatus({ ...buildSched(plan, state), now: ops.nowSec(), jobUsage: { totalAttempts: buildSched(plan, state).attempts.length, wallClockSec: 0 } });
+  const finalSched = buildSched(plan, state);
+  const status = jobStatus({ ...finalSched, now: ops.nowSec(), jobUsage: { totalAttempts: finalSched.attempts.length, wallClockSec: Math.max(0, ops.nowSec() - ops.planCommittedAtSec) } });
   ops.log(`job ${plan.jobId}: ${status.status}${status.note ? ` (${status.note})` : ""}`);
 }
