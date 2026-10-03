@@ -33,7 +33,8 @@ import { entityKeyOf, type ChangeBody, type CommitResult, type LogState } from "
 import { loadPlan, type TaskPlan, type TaskSpec } from "../packages/bus/src/swarm/task-plan.js";
 import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/task-state.js";
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
-import { taskPass, isForeignResult, requiredFilesPresent, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
+import { taskPass, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
+import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
@@ -308,85 +309,22 @@ function loadPlanFile(): TaskPlan | null {
   } catch (e) { log(`plan read ${PLAN_FILE}: ${e instanceof Error ? e.message : e}`); return null; }
 }
 
-// O1: observe a binding's WORK branch tip for a result.json candidate. Reads the pinned sha, the result blob + its
-// referenced output blobs (closure), the tip's changed paths. T1 scope: no patch (patchAppliesClean true) and acceptance
-// runs only when empty (real acceptance-command execution on the dispatcher is T2); cumulative scope is the tip commit.
+// O1: observe a binding's WORK branch for a result candidate. Thin wrapper — the logic lives in task-observe.ts
+// (observeResultOnBranch) so it is exercised against REAL git in tests; here we only bind the real git() + scratch dir.
 async function observeGitFor(a: { attempt: TaskAttempt; spec: TaskSpec; binding: ExecutionBinding }): Promise<GitFacts | null> {
   if (!WORK_REPO) return null;
   const branch = `swarm/${a.binding.launchId}-g${a.binding.publishGeneration}`;
   const scratch = scratchPath(a.binding.launchId);
-  const ls = await git(["ls-remote", WORK_REPO, `refs/heads/${branch}`]);
-  if (ls.code !== 0) return null;
-  const tip = ls.stdout.split(/\s+/)[0]?.trim();
-  if (!tip) return null;
   mkdirSync(scratch, { recursive: true });
-  if (!existsSync(path.join(scratch, "HEAD"))) await git(["init", "-q", "--bare", scratch]);
-  let fetched = await git(["fetch", "-q", WORK_REPO, tip], { cwd: scratch });
-  if (fetched.code !== 0) fetched = await git(["fetch", "-q", WORK_REPO, `refs/heads/${branch}:refs/heads/${branch}`], { cwd: scratch });
-  if (fetched.code !== 0) return null;
-  const resultPath = `out/results/${a.attempt.attemptId}/result.json`;
-  // O1 first-parent history scan (Codex P1-3 / F6): a valid result at an ANCESTOR must not be lost when a later commit
-  // removes it from the tip tree. Scan the COMPLETE first-parent history of the FIXED tip — no depth cap: a bounded -n
-  // only defers the >200 counterexample (fe0376cd ruled ONLY the persistent cursor is T2, not a depth limit). Take the
-  // newest commit carrying a result for THIS binding, skipping confirmed-foreign candidates so they can't mask it.
-  const rl = await git(["rev-list", "--first-parent", tip], { cwd: scratch });
-  if (rl.code !== 0) return null;
-  let sha = "", resultText = "", resultBlobOid = "";
-  for (const c of rl.stdout.split("\n").map((s) => s.trim()).filter(Boolean)) {
-    const show = await git(["show", `${c}:${resultPath}`], { cwd: scratch });
-    if (show.code !== 0) continue; // no result.json at this commit — keep walking
-    // Skip ONLY a CONFIRMED-foreign result (parseable + assignmentId/attemptId mismatch) so it can't mask a legit older
-    // one, and keep advancing (Codex P1-3, incl. right-assignment/wrong-attempt). An unparseable/schema-invalid result
-    // is NOT skipped — it is surfaced below for the pure V1 to classify + reject (Codex P2-2), never silently dropped.
-    if (isForeignResult(show.stdout, { jobId: a.attempt.jobId, nodeId: a.attempt.nodeId, attemptId: a.attempt.attemptId, assignmentId: a.binding.assignmentId })) continue;
-    const rev = await git(["rev-parse", `${c}:${resultPath}`], { cwd: scratch });
-    sha = c; resultText = show.stdout; resultBlobOid = rev.code === 0 ? rev.stdout.trim() : "";
-    break;
-  }
-  if (!sha) return null; // no result for this binding anywhere on the first-parent history yet
-  let outputs: Array<{ path?: unknown }> = [];
-  let evidence: Array<{ summaryPath?: unknown }> = [];
-  try {
-    const r = JSON.parse(resultText) as { outputs?: unknown; validationEvidence?: unknown };
-    if (Array.isArray(r.outputs)) outputs = r.outputs as Array<{ path?: unknown }>;
-    if (Array.isArray(r.validationEvidence)) evidence = r.validationEvidence as Array<{ summaryPath?: unknown }>;
-  } catch { /* V1 will reject the unparseable result below */ }
-  // Closure = result blob + EVERY referenced file (outputs AND validationEvidence.summaryPath). Resolve each DECLARED
-  // file via ls-tree to distinguish THREE states (Codex P2-3): present ⇒ into the closure; cleanly ABSENT ⇒ a real
-  // missing output (⇒ V7 reject); a QUERY ERROR ⇒ the observation is INCOMPLETE/unknown — return null so the attempt +
-  // retriesUsed are untouched and we re-read next pass, never faking a transient read error into a business failure.
-  // Null entries are skipped (a malformed outputs:[null] ⇒ V1 rejects it from the frozen result text, Codex P2-5).
-  const closureFiles: Array<{ path: string; blobOid: string }> = [];
-  let incomplete = false;
-  const resolveFile = async (p: string): Promise<void> => {
-    // --literal-pathspecs: a declared path is a LITERAL filename, never a pathspec — so a path like ":(literal)out/x"
-    // can't be magic-matched to a DIFFERENT real file (Codex round-3 ls-tree/pathspec mismatch).
-    const t = await git(["--literal-pathspecs", "ls-tree", sha, "--", p], { cwd: scratch }); // global opt BEFORE subcommand
-    if (t.code !== 0) { incomplete = true; return; }       // query error ⇒ unknown (not a clean absence)
-    const lines = t.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
-    if (lines.length === 0) return;                        // cleanly absent ⇒ left out of the closure (missing)
-    const m = /^\d+\s+blob\s+(\S+)\t(.+)$/.exec(lines[0]!); // "<mode> blob <oid>\t<path>"
-    if (lines.length === 1 && m && m[2] === p) { closureFiles.push({ path: p, blobOid: m[1]! }); return; } // exact single file
-    // Otherwise p is a directory (ls-tree listed its children) — use the content-addressed object id AT the exact path
-    // (its TREE oid), so a change to ANY file under it changes the closure (Codex: taking one child's oid missed the rest).
-    const rp = await git(["rev-parse", `${sha}:${p}`], { cwd: scratch });
-    if (rp.code !== 0) { incomplete = true; return; }
-    closureFiles.push({ path: p, blobOid: rp.stdout.trim() });
-  };
-  for (const o of outputs) if (o && typeof o.path === "string") await resolveFile(o.path);
-  for (const e of evidence) if (e && typeof e.summaryPath === "string") await resolveFile(e.summaryPath);
-  if (incomplete) return null; // a declared-file query errored (not a clean absence) ⇒ unknown, re-read next pass (P2-3)
-  const dt = await git(["diff-tree", "--no-commit-id", "--name-only", "-r", sha], { cwd: scratch });
-  const cumulativeChangedPaths = dt.code === 0 ? dt.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
-  // All declared outputs + evidence files cleanly present? A clean absence ⇒ false ⇒ V7 reject (Codex P2-6); a query
-  // error already returned null above, so a false here is a genuine missing deliverable, not a transient read failure.
-  const requiredOutputsPresent = requiredFilesPresent(outputs, evidence, closureFiles);
-  return {
-    observedWorkCommit: sha, resultText, resultBlobOid, closureFiles, cumulativeChangedPaths,
-    contract: { requiredOutputsPresent, patchAppliesClean: true }, // T1: no patch node; V7 git-apply-check is T2
-    acceptancePassed: a.spec.acceptance.length === 0, // T1: empty acceptance passes; non-empty is refused at dispatch
-    withinCutoffAncestry: true, // open binding ignores this in validateResult
-  };
+  return observeResultOnBranch({
+    git: (args, cwd) => git(args, cwd ? { cwd } : {}),
+    workRepo: WORK_REPO,
+    scratch,
+    branch,
+    resultPath: `out/results/${a.attempt.attemptId}/result.json`,
+    identity: { jobId: a.attempt.jobId, nodeId: a.attempt.nodeId, attemptId: a.attempt.attemptId, assignmentId: a.binding.assignmentId },
+    acceptanceEmpty: a.spec.acceptance.length === 0,
+  });
 }
 
 // startTask IO: mint the CPA token, write assignment.json + worker-env as 0600 temp files, swarm-launch allocate-only,

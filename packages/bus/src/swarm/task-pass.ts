@@ -99,9 +99,26 @@ export function buildSched(plan: TaskPlan, state: LogState): SchedInput {
   return { plan, attempts, acceptedResults };
 }
 
-/** A box-occupying attempt (RUNNING / RESULT_PENDING_VALIDATION) holds a slot. */
-function occupied(attempts: TaskAttempt[]): number {
-  return attempts.filter((a) => a.status === "RUNNING" || a.status === "RESULT_PENDING_VALIDATION").length;
+/** Physical slots held = DispatchIntents whose BOX physically occupies a slot (Codex P1: business retirement ≠ VM
+ *  death — an ABANDONED/retired attempt whose box is still alive must still count, or the cap over-allocates). An intent
+ *  counts unless it is abandoned / clean-fail (no box created) or past an EVIDENCE-BACKED physicalExpiresAtSec (proven
+ *  dead); an unknown/pending intent with no expiry evidence counts conservatively (F1/F2). This mirrors the lifecycle
+ *  layer's physical-occupancy accounting; freeing a slot early via scrub is T2. Counted off intents, NOT attempt status. */
+export function physicalSlotsOccupied(state: LogState, nowSec: number): number {
+  const launches = new Set<string>();
+  for (const body of Object.values(liveEntities(state))) {
+    if (body.put !== "intent") continue;
+    const i = body.intent;
+    // Release a slot ONLY on trustworthy non-existence or evidence-backed death:
+    if (i.allocOutcome === "clean-fail") continue;                               // provider reliably refused — no box
+    if (i.allocOutcome === "pending" && i.status === "abandoned") continue;      // revoked BEFORE any allocate IO — never created
+    if (i.physicalExpiresAtSec !== undefined && i.physicalEvidence != null && nowSec >= i.physicalExpiresAtSec) continue; // proven dead
+    // Everything else occupies — INCLUDING a created/unknown intent that was merely logically abandoned (its VM is still
+    // alive; status=abandoned alone is NOT proof of non-existence — Codex). workDeadline never frees a slot. Dedupe by
+    // launchId so a resend (same box) counts once.
+    launches.add(i.launchId);
+  }
+  return launches.size;
 }
 
 function branchOf(binding: ExecutionBinding): string {
@@ -173,7 +190,7 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
   const sched = buildSched(plan, state);
   const usage: JobUsage = { totalAttempts: sched.attempts.length, wallClockSec: Math.max(0, ops.nowSec() - ops.planCommittedAtSec) };
   const ready = readyTasks({ ...sched, now: ops.nowSec(), jobUsage: usage });
-  let free = Math.max(0, ops.cap - occupied(sched.attempts));
+  let free = Math.max(0, ops.cap - physicalSlotsOccupied(state, ops.nowSec()));
   for (const task of ready) {
     if (free <= 0) { ops.log(`dispatch: cap reached, ${ready.length} ready deferred`); break; }
     // Re-check the job budget against the CURRENT state before each dispatch (Codex P1): readyTasks + usage were computed

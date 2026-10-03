@@ -4,10 +4,10 @@
 // and frees the slot, an observed success is accepted, and the cap bounds concurrent dispatches.
 import { describe, expect, test } from "vitest";
 import { loadPlan, type TaskPlan } from "../src/swarm/task-plan.js";
-import { commit, entityKeyOf, initialLogState, liveEntities, type ChangeBody, type LogState } from "../src/swarm/control-log.js";
+import { commit, entityKeyOf, initialLogState, liveEntities, type ChangeBody, type LogState, type DispatchIntent } from "../src/swarm/control-log.js";
 import { jobStatus } from "../src/swarm/task-ready.js";
 import { createAttempt, type TaskAttempt } from "../src/swarm/task-state.js";
-import { taskPass, buildSched, isForeignResult, requiredFilesPresent, type TaskOps, type GitFacts } from "../src/swarm/task-pass.js";
+import { taskPass, buildSched, isForeignResult, requiredFilesPresent, physicalSlotsOccupied, type TaskOps, type GitFacts } from "../src/swarm/task-pass.js";
 
 /** Find the single DispatchIntent in the projection (tests have one job/one node). */
 function theIntent(state: LogState): { status: string; allocOutcome: string } | undefined {
@@ -174,6 +174,39 @@ describe("taskPass dispatch — retry lineage survives clean-fail + unknown (Cod
     await taskPass(plan, mkOps({ stateRef, order: [] }));
     const a2 = attemptsOf(plan, stateRef.s).find((a) => a.attemptId === "job/build/a2");
     expect(a2?.retriesUsed).toBe(2);
+  });
+});
+
+describe("physicalSlotsOccupied — physical cap accounting (Codex P1 round-4)", () => {
+  const mkState = (intents: DispatchIntent[]): LogState => {
+    let s = initialLogState();
+    for (const intent of intents) s = stampCommit(s, [{ put: "intent", intent }]).state;
+    return s;
+  };
+  const intent = (p: Partial<DispatchIntent> & { intentId: string; launchId: string }): DispatchIntent => ({
+    attemptId: "a", nodeId: "n", bindingId: "b", assignmentDigest: "d",
+    allocRequestStartSec: 0, workDeadlineSec: 100, allocOutcome: "created", status: "confirmed", ...p,
+  });
+
+  test("a created box counts even when its attempt was business-abandoned (retire/retry) — business ≠ VM death", () => {
+    const s = mkState([intent({ intentId: "i1", launchId: "rw-1", status: "abandoned", allocOutcome: "created", physicalExpiresAtSec: 4720, physicalEvidence: "creation-bound" })]);
+    expect(physicalSlotsOccupied(s, 1000)).toBe(1);
+  });
+  test("dedupe by launchId — a resend (same box) counts once", () => {
+    const s = mkState([
+      intent({ intentId: "i1", launchId: "rw-1", physicalExpiresAtSec: 4720, physicalEvidence: "creation-bound" }),
+      intent({ intentId: "i1-resend", launchId: "rw-1", physicalExpiresAtSec: 4720, physicalEvidence: "creation-bound" }),
+    ]);
+    expect(physicalSlotsOccupied(s, 1000)).toBe(1);
+  });
+  test("freed only on EVIDENCE-backed physical expiry; a no-evidence expiry still occupies", () => {
+    expect(physicalSlotsOccupied(mkState([intent({ intentId: "i1", launchId: "rw-1", physicalExpiresAtSec: 500, physicalEvidence: "creation-bound" })]), 1000)).toBe(0); // 1000 > 500, evidence ⇒ freed
+    expect(physicalSlotsOccupied(mkState([intent({ intentId: "i1", launchId: "rw-1", allocOutcome: "unknown", physicalExpiresAtSec: 500, physicalEvidence: null })]), 1000)).toBe(1); // no evidence ⇒ still occupies
+  });
+  test("clean-fail and pending+abandoned free the slot; created+abandoned does NOT", () => {
+    expect(physicalSlotsOccupied(mkState([intent({ intentId: "i1", launchId: "rw-1", allocOutcome: "clean-fail", status: "abandoned" })]), 1000)).toBe(0);
+    expect(physicalSlotsOccupied(mkState([intent({ intentId: "i1", launchId: "rw-1", allocOutcome: "pending", status: "abandoned" })]), 1000)).toBe(0);
+    expect(physicalSlotsOccupied(mkState([intent({ intentId: "i1", launchId: "rw-1", allocOutcome: "created", status: "abandoned", physicalExpiresAtSec: 4720, physicalEvidence: "creation-bound" })]), 1000)).toBe(1);
   });
 });
 
