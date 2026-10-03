@@ -44,9 +44,12 @@ export type AgentStatus = "working" | "idle" | "blocked" | "unknown";
 
 export const AGENT_STATUSES: readonly AgentStatus[] = ["working", "idle", "blocked", "unknown"];
 
-/** The host's native session id if it publishes one in the env at startup. Extensible per tool. */
+/** The host's native session id if it publishes one in the env at startup. Extensible per tool. Claude Code exposes
+ *  CLAUDE_CODE_SESSION_ID in the env; Codex has none, so its SessionStart presence hook parses the id from the hook's
+ *  stdin JSON and passes it as AGENTHOP_SESSION — the one durable identity a Codex presence daemon has at startup
+ *  (before it has made any MCP call), which equals its thread id, so delivery via `codex queue --thread` works. */
 export function nativeSessionId(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  return env.CLAUDE_CODE_SESSION_ID?.trim() || undefined;
+  return env.CLAUDE_CODE_SESSION_ID?.trim() || env.AGENTHOP_SESSION?.trim() || undefined;
 }
 
 /** Best-effort: an explicit override wins, otherwise a few known env markers, otherwise unknown. */

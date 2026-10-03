@@ -18,6 +18,7 @@ import { delimiter, dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mcpHints, opencodePluginPath, registerMcp, writeOpencodePlugin } from "./agents.js";
 import { chosenLang, lang, setLang, t, type Lang } from "./lang.js";
+import { presenceMjs } from "./presence-text.js";
 import { skillMarkdown, skillMarkdownZh } from "./skill-text.js";
 
 const windows = platform() === "win32";
@@ -42,6 +43,13 @@ export function installAgenthop(options: InstallOptions = {}): void {
   if (command) console.log(command);
   for (const skill of skills) console.log(skill);
   console.log(languageNote());
+  // The startup presence daemon bundle, written on every install AND update (update runs install --skill-only), so a
+  // machine always has the current ~/.agenthop/presence.mjs the SessionStart hooks run. Isolated: never abort install.
+  try {
+    console.log(`Presence${t(": ", "：")}${writePresenceBundle()}`);
+  } catch (error) {
+    console.log(t(`Presence: could not write the bundle (${error instanceof Error ? error.message : String(error)})`, `Presence：写入 bundle 失败（${error instanceof Error ? error.message : String(error)}）`));
+  }
   // Keep an already-installed OpenCode plugin current on every install/update (update runs
   // `install --skill-only`). First-time setup stays explicit via `install --mcp opencode`, so a
   // machine that never opted in is left untouched. Isolate any failure here: this optional refresh
@@ -110,6 +118,20 @@ export function readSkillDirs(home = homedir()): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Write the embedded presence daemon bundle to ~/.agenthop/presence.mjs (what the SessionStart hooks run via bun/node).
+ * Atomic (sibling temp + rename) so a short/failed write never truncates a working bundle. Idempotent — our own file.
+ */
+export function writePresenceBundle(home = homedir()): string {
+  const file = join(home, ".agenthop", "presence.mjs");
+  ensureDir(dirname(file));
+  const staged = `${file}.new`;
+  rmSync(staged, { force: true });
+  writeFileSync(staged, presenceMjs);
+  renameSync(staged, file);
+  return t(`wrote ${file}`, `已写入 ${file}`);
 }
 
 /** Write SKILL.md under the home directory and into each directory the caller provides. */

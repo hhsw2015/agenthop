@@ -86,7 +86,13 @@ const agents: Agent[] = [
       } catch (error) {
         hooks = t(`status hooks not installed (${error instanceof Error ? error.message : String(error)}); add them by hand`, `状态 hook 没装上（${error instanceof Error ? error.message : String(error)}），手动加`);
       }
-      return `${mcp}; ${hooks}`;
+      let presence: string;
+      try {
+        presence = installCodexPresenceHooks(home);
+      } catch (error) {
+        presence = t(`presence hooks not installed (${error instanceof Error ? error.message : String(error)}); add them by hand`, `presence hook 没装上（${error instanceof Error ? error.message : String(error)}），手动加`);
+      }
+      return `${mcp}; ${hooks}; ${presence}`;
     },
   },
   {
@@ -254,8 +260,10 @@ export function installClaudePresenceHooks(home = homedir()): string {
 }
 
 /** Merge ONE presence hook (a fixed command, not the per-state status builder) into an event, idempotently by its
- *  trailing sentinel: refresh our command in place if it changed, keep the matcher in sync, else add our group. */
-function mergePresenceHook(config: Record<string, unknown>, event: string, command: string, mark: string, matcher?: string): number {
+ *  trailing sentinel: refresh our command in place if it changed, keep the matcher in sync, else add our group.
+ *  `matcher` undefined omits it (Claude's shape); "" sets an empty matcher (Codex always carries one). `timeout`
+ *  (seconds) is added to the hook entry when given (Codex uses it). */
+function mergePresenceHook(config: Record<string, unknown>, event: string, command: string, mark: string, matcher?: string, timeout?: number): number {
   const hooks = (config.hooks ??= {}) as Record<string, unknown>;
   const arr = (hooks[event] ??= []) as unknown[];
   if (!Array.isArray(arr)) return 0; // unexpected shape — leave it alone
@@ -267,8 +275,39 @@ function mergePresenceHook(config: Record<string, unknown>, event: string, comma
     if (matcher !== undefined && group.matcher !== matcher && group.hooks.every((h) => ownedBy(h.command, mark))) { group.matcher = matcher; changed++; }
     return changed;
   }
-  arr.push({ ...(matcher ? { matcher } : {}), hooks: [{ type: "command", command, async: true }] });
+  arr.push({ ...(matcher !== undefined ? { matcher } : {}), hooks: [{ type: "command", command, async: true, ...(timeout !== undefined ? { timeout } : {}) }] });
   return 1;
+}
+
+/** Shell to extract session_id from a Codex hook's STDIN JSON (Codex passes {session_id,...} on stdin, no env). Best-
+ *  effort sed; the session id doubles as the bus stableId (= thread id), so `codex queue --thread` delivery works. */
+const CODEX_SID_FROM_STDIN = `_in=$(cat 2>/dev/null); _sid=$(printf '%s' "\$_in" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -1)`;
+
+/** Codex SessionStart: parse the session id from stdin, then launch the presence bundle via bun/node with it injected
+ *  as AGENTHOP_SESSION (so the daemon's identity = that thread id). Same non-compiled-bundle reasoning as Claude. */
+function codexPresenceStartCommand(): string {
+  return `${CODEX_SID_FROM_STDIN}; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; elif [ -f "\$_mjs" ]; then _rt="\$(command -v bun || command -v node)"; if [ -n "\$_rt" ]; then AGENTHOP_SESSION="\$_sid" "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1 & echo \$! > "\$_pf"; fi; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
+}
+
+/** Codex SessionEnd: parse the session id from stdin + stop that presence daemon. */
+function codexPresenceEndCommand(): string {
+  return `${CODEX_SID_FROM_STDIN}; if [ -n "\$_sid" ]; then _pf="\$HOME/.agenthop/presence/\$_sid.pid"; [ -f "\$_pf" ] && kill "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; rm -f "\$_pf"; fi >/dev/null 2>&1 || true ${PRESENCE_END_MARK}`;
+}
+
+/**
+ * Install Codex presence hooks into $CODEX_HOME/hooks.json: SessionStart→launch the presence bundle, SessionEnd→stop it
+ * — so a Codex session is on the bus from startup (the MCP node alone is lazy). Same idempotent merge as the status
+ * hooks; Codex groups carry a matcher + timeout. Like the status hooks, this needs the hook feature enabled + trusted.
+ */
+export function installCodexPresenceHooks(home = homedir()): string {
+  const file = join(codexHome(home), "hooks.json");
+  const config = readJsonConfig(file); // throws (file left alone) if present but not plain JSON
+  let changed = 0;
+  changed += mergePresenceHook(config, "SessionStart", codexPresenceStartCommand(), PRESENCE_START_MARK, "startup|resume", 10);
+  changed += mergePresenceHook(config, "SessionEnd", codexPresenceEndCommand(), PRESENCE_END_MARK, "", 10);
+  if (changed === 0) return t(`${file} already has agenthop presence hooks; nothing changed`, `${file} 里已有 agenthop presence hook，没有改动`);
+  placeJson(file, config);
+  return t(`wrote ${changed} presence hook change(s) to ${file}`, `已写 ${changed} 处 presence hook 改动到 ${file}`);
 }
 
 /**

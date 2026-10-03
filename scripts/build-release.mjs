@@ -29,6 +29,21 @@ writeFileSync(
   `export const opencodePluginJs = ${JSON.stringify(readFileSync(pluginOut, "utf8"))};\n`,
 );
 
+// The startup PRESENCE daemon, embedded like the skill/plugin so `install` can write it to ~/.agenthop/presence.mjs
+// with nothing to download. It MUST be a NON-compiled bundle (a bun --compile binary exits without a controlling
+// terminal; a bun/node script survives), run by the SessionStart hook via bun or node. --target=node so either works.
+const presenceOut = join(root, "packages/bus/dist-presence/presence.mjs");
+const presenceBuild = spawnSync(
+  "bun",
+  ["build", "packages/bus/src/presence-entry.ts", "--target=node", "--format=esm", `--outfile=${presenceOut}`],
+  { cwd: root, stdio: "inherit" },
+);
+if (presenceBuild.status !== 0) process.exit(presenceBuild.status ?? 1);
+writeFileSync(
+  join(root, "packages/cli/src/presence-text.ts"),
+  `export const presenceMjs = ${JSON.stringify(readFileSync(presenceOut, "utf8"))};\n`,
+);
+
 // --skill-text: regenerate the embedded texts only, without compiling the binaries.
 if (process.argv.includes("--skill-text")) process.exit(0);
 
