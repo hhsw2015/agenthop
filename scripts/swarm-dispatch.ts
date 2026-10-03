@@ -38,7 +38,7 @@ import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
 import { fileIsAlive, resolveSession, listSessions, makeFileLiveness } from "../packages/bus/src/swarm/task-liveness.js";
-import type { WaitRecord } from "../packages/bus/src/swarm/control-log.js";
+import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox } from "../packages/bus/src/inbox.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
@@ -441,6 +441,16 @@ function buildSweepOps(stateRef: { s: LogState }): SweepOps {
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv[0] === "--observe-once") { await observeOnce(argv.slice(1)); return; }
+  // --sweep-once: seed waits, run ONE sweep pass, print the resulting live waits, exit (deterministic validation — the
+  // "first real wait handled" milestone without the infinite loop; mirrors --observe-once).
+  if (argv[0] === "--sweep-once") {
+    const ref = { s: loadControlLog(CONTROL_LOG_DIR) };
+    loadWaitSeed(ref);
+    await sweepPass(buildSweepOps(ref));
+    const live = Object.values(liveEntities(ref.s)).filter((b) => b.put === "wait").map((b) => (b as { wait: WaitRecord }).wait);
+    console.log(JSON.stringify({ seq: ref.s.seq, liveWaits: live.map((w) => ({ waitId: w.waitId, state: w.state, owner: w.owner, resolution: w.resolution })) }, null, 2));
+    return;
+  }
 
   const plan = loadPlanFile();
   const taskOn = plan !== null && TASK_EXEC;
