@@ -580,9 +580,10 @@
     const r = job.results || {};
     const jid = job.plan.jobId;
     const idx = {};
-    const bucket = (nid) => (idx[nid] = idx[nid] || { accepted: [], rejected: [], observed: [] });
+    const bucket = (nid) => (idx[nid] = idx[nid] || { accepted: [], rejected: [], observed: [], candidates: [] });
     for (const a of r.accepted || []) bucket(a.nodeId).accepted.push(a);
     for (const x of r.rejected || []) bucket(x.nodeId).rejected.push(x);
+    for (const c of r.candidates || []) bucket(c.nodeId).candidates.push(c);
     for (const o of r.observed || []) {
       const m = String(o.attemptId || "").split("/");
       const nid = m[0] === jid ? m[1] : null; // jobId/nodeId/aN
@@ -1250,7 +1251,7 @@
    *  for one node, folded from job.results. The dual-judge structure lives here. */
   function verdictsSection(job, node) {
     const nr = resultsByNode(job)[node.nodeId];
-    if (!nr || (!nr.accepted.length && !nr.rejected.length && !nr.observed.length)) return "";
+    if (!nr || (!nr.accepted.length && !nr.rejected.length && !nr.observed.length && !(nr.candidates || []).length)) return "";
     const acc = nr.accepted.map((a) => `<div class="flowrow">
         <span class="who"><span style="color:var(--idle)">✓ accepted</span>${a.superseded ? ' <span style="color:var(--warn)">· superseded</span>' : ""}</span>
         <span class="v">${esc(a.decidedBy || "?")}</span></div>${a.supersededBy?.issuedBy ? `<div class="empty-note" style="margin:2px 0 6px">⟲ recalled by ${esc(a.supersededBy.issuedBy)}${a.supersededBy.atSeq != null ? " @seq " + a.supersededBy.atSeq : ""}</div>` : ""}`).join("");
@@ -1260,7 +1261,12 @@
     const obs = nr.observed.length
       ? `<div class="sec">observed commits</div>${nr.observed.map((o) => `<div class="flowrow"><span class="who">${esc(String(o.observedWorkCommit).slice(0, 9))}</span><span class="v">${esc(o.resultPath || "")}</span></div>${o.note ? `<div class="empty-note" style="margin:2px 0 6px">${esc(o.note)}</div>` : ""}`).join("")}`
       : "";
-    return `<div class="sec">verdicts</div>${acc}${rej}${obs}`;
+    // Candidates: results that are NOT superseding the current accepted (e.g. a non-semantic erratum whose
+    // specDigest is unchanged — S9 v2). Shown so "new candidate, accepted stands" is legible, not a recall.
+    const cand = (nr.candidates || []).length
+      ? `<div class="sec">candidates (not superseding)</div>${nr.candidates.map((c) => `<div class="empty-note" style="margin:2px 0 6px">⊕ ${esc(c.note || c.attemptId || "candidate")}</div>`).join("")}`
+      : "";
+    return `<div class="sec">verdicts</div>${acc}${rej}${obs}${cand}`;
   }
 
   function renderDrawer() {
