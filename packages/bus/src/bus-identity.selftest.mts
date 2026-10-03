@@ -110,6 +110,21 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   t("P1-3 thread_switch_A_B_A_keeps_B_history: B still resolves after switching back", whois(proj, "B").kind === "entity");
   t("P1-3 A→B→A: A resolves too (its generations are candidates)", whois(proj, "A").kind === "candidates" || whois(proj, "A").kind === "entity");
 }
+{
+  // P1-3 residual: a late no-native pre-bootstrap snapshot naming its source root rejoins its OWN lineage (A),
+  // never the current thread B (no default-to-last-generation).
+  const ev = [
+    obs("R", [hard("R", "run"), hard("old-run-handle", "handle")], { ts: 1, eventId: "rootObs" }), // pre-native: run + handle, no native
+    learn("R", undefined, "A", "bootstrap", true, { ts: 2 }),                                       // R#rootObs gains native A
+    learn("R", "A", "B", "thread-switch", true, { ts: 3 }),                                         // forks a new generation (native B)
+  ];
+  const noLate = buildProjection(ev);
+  const idA = eidOf(whois(noLate, "A")), idB = eidOf(whois(noLate, "B"));
+  const late = obs("R", [{ value: "old-run-handle", form: "handle", confidence: "hard", provenance: "same-announce", source: "rootObs" }], { ts: 4, eventId: "lateSnap" });
+  const withLate = buildProjection([...ev, late]);
+  const wh = whois(withLate, "old-run-handle");
+  t("P1-3 no-native late snapshot rejoins its source lineage (A), never the current thread B", wh.kind === "entity" && wh.entity.entityId === idA && idB !== "" && wh.entity.entityId !== idB);
+}
 
 // --- P1-4: source-scoped, transitive revoke/correction (no global value blacklist) ---
 {
@@ -160,6 +175,16 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   t("P1-4 simple: the corrected guess no longer resolves, the authoritative value does", whois(proj, "Aguess").kind === "not-seen" && whois(proj, "Btrue").kind === "entity");
 }
 {
+  // P1-4 residual: closeDerived must cascade down the derivation EDGE, not across a bare literal. S1/S2 (same
+  // run R) each independently hard native A; H derives from S2's A; C1 copies A with source=S1; revoke S1 →
+  // S2's A and its H both survive (only the S1-sourced copy is withdrawn).
+  const S2 = obs("R", [hard("R", "run"), hard("A", "native"), { value: "H", form: "handle", confidence: "hard", provenance: "same-announce", source: "S2", derivedFrom: "A" }], { ts: 2, eventId: "S2", busPid: 1 });
+  const C1 = obs("R", [srcClaim("A", "native", "S1")], { ts: 3, eventId: "C1", busPid: 1 });
+  const proj = buildProjection([obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1, eventId: "S1", busPid: 1 }), S2, C1, revoke("S1")]);
+  t("P1-4 independent source: revoking S1 leaves S2's hard A resolvable", whois(proj, "A").kind === "entity");
+  t("P1-4 independent source: S2's derived H is NOT collaterally killed", whois(proj, "H").kind === "entity");
+}
+{
   const proj = buildProjection([obs("R", [hard("R", "run"), poss("A", "native")], { ts: 1 }), learn("R", "A", "A", "correction", true, { ts: 2 })]);
   t("P1-4: from==to self-confirmation resolves (not globally blocked)", whois(proj, "A").kind === "entity");
 }
@@ -197,21 +222,22 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   t("P2-5 late_collision_does_not_retarget_published_key", idBefore !== "" && idBefore === idAfter);
 }
 {
-  // event-level split: an entity with two incarnations (a reconnect) is separated; old key preserved.
-  const base = [obs("R", [hard("R", "run"), hard("A", "native")], { busPid: 1, ts: 1 }), obs("R", [hard("R", "run"), hard("A", "native")], { busPid: 2, ts: 2 })];
-  const pre = buildProjection(base);
-  const eid = eidOf(whois(pre, "A"));
-  t("P2-5 split pre: one entity with two incarnations", pre.entities.size === 1 && (whois(pre, "A").kind === "entity"));
-  const post = buildProjection([...base, split(eid)]);
-  t("P2-5 split: the entity is separated into two", post.entities.size === 2 && post.splits.some((s) => s.applied));
-  t("P2-5 split: the old entity key is preserved and still resolvable", post.entities.has(eid) && whois(post, "A").kind === "candidates");
-}
-{
-  // split on a single-incarnation entity is recorded as not-applied (nothing to separate), never annotation-clearing.
+  // P2-5: a published entityId is directly queryable (history-queryable), and split is INERT — recorded,
+  // never mutating/retargeting an entity.
   const base = [obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1 })];
   const eid = eidOf(whois(buildProjection(base), "A"));
   const post = buildProjection([...base, split(eid)]);
-  t("P2-5 split: single-incarnation entity → recorded not-applied, still resolvable", post.splits.some((s) => !s.applied) && whois(post, "A").kind === "entity");
+  t("P2-5: a published entityId is directly queryable (not not-seen)", whois(post, eid).kind === "entity");
+  t("P2-5: split is inert — applied=false, entity unchanged and still resolvable", post.splits.length === 1 && !post.splits[0]!.applied && post.entities.has(eid) && whois(post, "A").kind === "entity");
+}
+{
+  // P2-5.3: revoking an earlier thread-switch must NOT renumber/reuse a later entity's published id.
+  const ev = [obs("R", [hard("R", "run"), hard("A", "native")], { ts: 1 }), learn("R", "A", "B", "thread-switch", true, { ts: 2, eventId: "switchB" }), learn("R", "B", "C", "thread-switch", true, { ts: 3, eventId: "switchC" })];
+  const before = buildProjection(ev);
+  const idB = eidOf(whois(before, "B")), idC = eidOf(whois(before, "C"));
+  const after = buildProjection([...ev, revoke("switchB")]);
+  t("P2-5.3: C's entityId survives revoking an earlier switch (eventId-anchored, not positional)", idC !== "" && idC === eidOf(whois(after, "C")));
+  t("P2-5.3: C does NOT reuse the revoked B's old entityId", idB !== "" && eidOf(whois(after, "C")) !== idB && whois(after, "B").kind === "not-seen");
 }
 
 // --- P2-4: event identity — replay no-op vs same-id-different-payload conflict ---
