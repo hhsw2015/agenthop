@@ -115,13 +115,17 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
 
   // A message has arrived for us. Try the host's native inbox first (surfaces in the live TUI with no hook and no
   // poll); if the channel is not ready, persist it to the DURABLE inbox so the retry below delivers it later.
-  const handleInbound = (from: string, text: string, via: "local" | "relay"): void => {
+  // `carried` = the sender's OWN address (handle) + permission mode, stamped into the local envelope at send (email
+  // "From:"). Preferred over a roster lookup, which misses when the sender's per-run `from` id isn't in our roster (its
+  // run changed / it has >1 node) — the bug that showed a bare run-id prefix + "default". Relay has no carry yet → it
+  // falls back to resolving by the roster (labelFor/modeFor).
+  const handleInbound = (from: string, text: string, via: "local" | "relay", carried?: { label?: string; mode?: string }): void => {
     // Delivery is locked to this session's learned identity (codexDeliveryThread), so it never diverges from the
     // published stableId. Learn from the SAME value: authoritative from call metadata, a guess from the daemon.
     const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
     learnStableId(codexThread, ownCodexThread !== undefined);
-    const label = labelFor(from);
-    const fromMode = modeFor(from); // the sender's real permission mode for the host frame (from-mode)
+    const label = carried?.label ?? labelFor(from); // the sender's stamped address, else resolve via roster
+    const fromMode = carried?.mode ?? modeFor(from); // the sender's stamped mode, else resolve via roster
     // Bind the delivery identity's inbox key + arrival time NOW, before the async push. If the push fails, the fallback
     // persist must use the SAME identity this message was resolved for — not whatever identity a concurrent noteThread
     // switched us to by the time the callback runs, which would file A's message into B's inbox (Codex P2-7).
@@ -139,7 +143,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     });
   };
 
-  const local: LocalBus = startLocalBus(self, options.home, (m) => handleInbound(m.from, m.payload, "local"));
+  const local: LocalBus = startLocalBus(self, options.home, (m) => handleInbound(m.from, m.payload, "local", { label: m.fromLabel, mode: m.fromMode }));
 
   // Codex has no native session id in its env, so we adopt the thread id as our stableId the first
   // time we learn it (from an MCP call's metadata or the daemon). This also refreshes the readable

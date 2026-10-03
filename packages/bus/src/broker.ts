@@ -19,7 +19,11 @@ import type { SelfInfo } from "./label.js";
 
 export type Role = "broker" | "client" | "connecting";
 export type Peer = SelfInfo & { via: "local" };
-export type Inbound = { from: string; payload: string; via: "local" };
+// fromLabel/fromMode = the SENDER's OWN address (handle) + permission mode, stamped into the envelope at send (email
+// "From:"), so the receiver shows which SESSION sent it and reflects the real mode even when the sender's per-run id is
+// not in the receiver's roster (its run changed / it has >1 node — the roster-resolve miss that showed a bare prefix +
+// "default"). Optional for back-compat with an older peer that omits them (falls back to roster resolve).
+export type Inbound = { from: string; fromLabel?: string; fromMode?: string; payload: string; via: "local" };
 
 export type LocalBus = {
   role(): Role;
@@ -35,7 +39,7 @@ export type LocalBus = {
 
 type Wire =
   | { t: "hello"; self: SelfInfo }
-  | { t: "dm"; to: string; from: string; payload: string }
+  | { t: "dm"; to: string; from: string; fromLabel?: string; fromMode?: string; payload: string }
   | { t: "peers"; peers: SelfInfo[] };
 
 const RETRY_MS = 300;
@@ -82,14 +86,14 @@ export function startLocalBus(self: SelfInfo, home?: string, onInbound?: (msg: I
     for (const socket of clients.keys()) if (!socket.destroyed) socket.write(line);
   };
 
-  const routeDm = (to: string, from: string, payload: string): void => {
+  const routeDm = (to: string, from: string, payload: string, fromLabel?: string, fromMode?: string): void => {
     if (to === self.id) {
-      deliver({ from, payload, via: "local" });
+      deliver({ from, fromLabel, fromMode, payload, via: "local" });
       return;
     }
     for (const [socket, info] of clients) {
       if (info?.id === to && !socket.destroyed) {
-        socket.write(`${JSON.stringify({ t: "dm", to, from, payload } satisfies Wire)}\n`);
+        socket.write(`${JSON.stringify({ t: "dm", to, from, fromLabel, fromMode, payload } satisfies Wire)}\n`);
         return;
       }
     }
@@ -109,7 +113,7 @@ export function startLocalBus(self: SelfInfo, home?: string, onInbound?: (msg: I
           clients.set(socket, msg.self);
           broadcastPeers();
         } else if (msg.t === "dm") {
-          routeDm(msg.to, msg.from, msg.payload);
+          routeDm(msg.to, msg.from, msg.payload, msg.fromLabel, msg.fromMode);
         }
       });
       const drop = (): void => {
@@ -190,7 +194,7 @@ export function startLocalBus(self: SelfInfo, home?: string, onInbound?: (msg: I
     });
     readLines(socket, (msg) => {
       if (msg.t === "peers") roster = msg.peers;
-      else if (msg.t === "dm") deliver({ from: msg.from, payload: msg.payload, via: "local" });
+      else if (msg.t === "dm") deliver({ from: msg.from, fromLabel: msg.fromLabel, fromMode: msg.fromMode, payload: msg.payload, via: "local" });
     });
     socket.on("error", () => undefined); // handled by 'close'
     socket.once("close", () => {
@@ -211,13 +215,13 @@ export function startLocalBus(self: SelfInfo, home?: string, onInbound?: (msg: I
     send: (to, payload) => {
       if (!roster.some((info) => info.id === to)) return false;
       if (role === "broker") {
-        routeDm(to, self.id, payload);
+        routeDm(to, self.id, payload, self.title, self.mode); // stamp our own address + mode (email From:)
         return true;
       }
       // Client path: during a broker failover the roster can still list peers while our connection
       // is gone and we are re-electing. Report that honestly instead of a silent drop that looks ok.
       if (client) {
-        client.write(`${JSON.stringify({ t: "dm", to, from: self.id, payload } satisfies Wire)}\n`);
+        client.write(`${JSON.stringify({ t: "dm", to, from: self.id, fromLabel: self.title, fromMode: self.mode, payload } satisfies Wire)}\n`);
         return true;
       }
       return false;
