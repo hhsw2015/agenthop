@@ -4,22 +4,32 @@
  * ⇒ job stalls forever" can't happen without a code path catching it. R2: progress is a property of the LOOP, not any
  * member's memory — a member may die/idle/forget; the loop + durable records move it forward.
  *
- * This increment implements the two highest-value rules (fe0376cd's acceptance scenarios A/B):
- *   - EXPIRED wait (owner alive)    → begin_action (bypass|escalation) → IO → action_done   [scenario A]
- *   - owner DEAD (isAlive)          → reassign: begin_action → IO → close old + open new    [scenario B]
- * Remaining rules (blocked×approval reminder, overload×idle R8, validation RPV-timeout moveValidator, idle×ready which
- * taskPass already covers) layer on next. All decisions are pure; all IO + liveness are injected (SweepOps), so the
- * ordering (CAS-then-IO, bounded delay, single suspected ≠ dead) is offline-testable.
+ * Rules matched (per OPEN wait, owner liveness via injected isAlive):
+ *   - RPV validation-wait (subject.validationRunId) stuck/dead validator → moveValidator (close old gen + open gen+1 over
+ *     the SAME pinned candidate; business never re-run). [§0b RPV / P2-2]
+ *   - owner DEAD                                     → reassign (close old + open new for a successor).            [R5]
+ *   - EXPIRED (owner alive)                          → bypass (reversible) / escalation (approval), then RE-ARM.   [rules 2+3]
+ * A single "suspected" never convicts (no action). EXPIRED/approval RE-ARM, never resolve (§0b erratum 94284fc2): a
+ * timeout action ends only THAT action and re-opens the wait with a fresh deadline + escalatedAt; resolved comes only from
+ * a real subject close or an approval decide. All decisions are pure; all IO + liveness are injected (SweepOps).
  *
- * CAS-then-IO + bounded delay (P2-3): a timeout handler CAS-commits the recoverable action intent (open→action_pending)
- * BEFORE the IO, and an already-action_pending wait is SKIPPED this tick (its IO is in flight / will be confirmed) — a
- * slow supervised action never blocks the sweep from running. isAlive is injected (bus-identity owns the impl + its
- * known defects, §4); a SINGLE "suspected" is NOT dead (only a trustworthy "dead" reassigns).
+ * ACTION LIFECYCLE — begin → fire → confirm, each tick, in three phases (P1-1/P1-2/P1-3):
+ *   PHASE 1 begin : for each OPEN wait needing an action, CAS-commit the recoverable intent (open → action_pending)
+ *                   BEFORE any IO. A rejected commit blocks the IO and never claims success (P1-1 — the barrier is checked,
+ *                   not merely ordered).
+ *   PHASE 2 fire  : fire the IO for EVERY action_pending wait — fresh begins AND crash/unconfirmed residue (recovery,
+ *                   P1-2) — CONCURRENTLY within a bounded window (P1-3). The IO is idempotent by actionId; an IO that is
+ *                   unconfirmed within the window is LEFT action_pending and re-fired next tick. One slow IO never blocks
+ *                   another's fire or the loop (no serial await-per-wait).
+ *   PHASE 3 confirm: for each DELIVERED action, RE-READ the current wait (a concurrent close/decide wins — P2-1), apply
+ *                   the confirm transition by actionKind, and commit. Undelivered ⇒ untouched (recovered next tick).
+ * isAlive is injected (bus-identity owns the impl + its known defects). PendingAction.target carries the IO DESTINATION
+ * (reassignee / new validator location) so the confirm + routing are reconstructable from the durable intent alone.
  */
 
 import { liveEntities, type WaitRecord, type PendingAction, type LogState, type ChangeBody, type CommitResult, type ValidationRun } from "./control-log.js";
-import { advanceWait, openWait, isLive } from "./task-wait.js";
-import { moveValidator } from "./task-validation.js";
+import { advanceWait, openWait } from "./task-wait.js";
+import { moveValidatorAction, moveValidatorWithWait } from "./task-rpv.js";
 
 export type Liveness = "alive" | "suspected" | "dead";
 
@@ -38,28 +48,106 @@ export type SweepOps = {
   newWaitId: (base: string) => string;
   newValidationRunId: (base: string) => string;
   newActionId: () => string;
-  /** Deadline for a freshly reassigned wait. */
+  /** Deadline for a freshly re-armed / reassigned / moved wait. */
   freshDeadlineSec: () => number;
-  /** The bounded supervised IO (bypass ping / escalation notice / reassign notify) via an R5 channel; resolves true when
-   *  delivered with evidence. The action intent is ALREADY committed (begin_action) before this runs. */
+  /** The bounded supervised IO (bypass ping / escalation notice / reassign / move-validator notify) via an R5 channel;
+   *  resolves true when delivered with evidence. Idempotent by action.actionId (safe to re-fire). The intent is ALREADY
+   *  committed (begin_action) before this runs. */
   doAction: (wait: WaitRecord, action: PendingAction) => Promise<boolean>;
+  /** Bounded window (ms) for a single action's IO per tick — a slower IO is left action_pending and re-fired next tick,
+   *  so one slow action never blocks the sweep (P1-3 bounded delay). */
+  actionTimeoutMs: number;
   log: (m: string) => void;
 };
 
 const subjectTarget = (w: WaitRecord): string => w.subject.attemptId ?? w.subject.bindingId ?? w.subject.jobId;
 
-export async function sweepPass(ops: SweepOps): Promise<void> {
-  let state = ops.loadState();
+type Indexed = { waits: WaitRecord[]; runs: Map<string, ValidationRun> };
+function indexEntities(state: LogState): Indexed {
   const waits: WaitRecord[] = [];
   const runs = new Map<string, ValidationRun>();
-  for (const body of Object.values(liveEntities(state))) {
-    if (body.put === "wait") waits.push(body.wait);
-    else if (body.put === "validationRun") runs.set(body.validationRun.validationRunId, body.validationRun);
+  for (const b of Object.values(liveEntities(state))) {
+    if (b.put === "wait") waits.push(b.wait);
+    else if (b.put === "validationRun") runs.set(b.validationRun.validationRunId, b.validationRun);
   }
+  return { waits, runs };
+}
 
-  // Commit-then-IO barrier (P1-1): a REJECTED commit must NOT proceed to IO and must NOT be logged as success. Ordering
-  // the calls commit→IO is not enough — the result must be checked. Advance local state only on ok; on reject, log
-  // honestly and return false so the caller bails (the durable record is left recoverable — it never claims success).
+/** Bound a single IO: resolve the delivered flag, or false if it doesn't settle within ms (left action_pending → next tick). */
+function withTimeout(p: Promise<boolean>, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v: boolean) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
+    const timer = setTimeout(() => done(false), ms);
+    p.then((v) => done(v), () => done(false));
+  });
+}
+
+/** PURE-ish decision for an OPEN wait: the PendingAction it needs now, or null (no action / deferred). Mirrors the §0b
+ *  rules; target carries the IO destination so the confirm is reconstructable. May log a deferral reason. */
+function decideAction(w: WaitRecord, runs: Map<string, ValidationRun>, live: Liveness, ops: SweepOps): PendingAction | null {
+  // RPV validation-wait: a DEAD or ALIVE-but-expired validator ⇒ moveValidator. A single "suspected" never convicts.
+  if (w.subject.validationRunId !== undefined) {
+    if (live === "suspected") return null;
+    if (live === "alive" && ops.nowSec() < w.deadlineSec) return null; // validator working within deadline — leave it
+    const run = runs.get(w.subject.validationRunId);
+    if (!run) { ops.log(`sweep ${w.waitId}: validation-wait references unknown run ${w.subject.validationRunId} — skipping`); return null; }
+    const to = ops.pickValidator(w, run);
+    if (to === null) { ops.log(`sweep ${w.waitId}: validator ${run.validatorLocation} stuck/dead, no replacement — leaving for escalation`); return null; }
+    return moveValidatorAction({ actionId: ops.newActionId(), newValidatorLocation: to, expectedSubjectVersion: run.generation });
+  }
+  // owner DEAD ⇒ reassign (target = the successor; routing + confirm use it). A single "suspected" is NOT dead.
+  if (live === "dead") {
+    const to = ops.pickReassignee(w);
+    if (to === null) { ops.log(`sweep ${w.waitId}: owner ${w.owner} dead, no reassignee — leaving for escalation`); return null; }
+    return { actionId: ops.newActionId(), actionKind: "reassign", target: to, expectedSubjectVersion: 0 };
+  }
+  // EXPIRED (owner alive) ⇒ bypass (reversible) / escalation (approval). An approval ALWAYS escalates, never bypass.
+  if (live === "alive" && ops.nowSec() >= w.deadlineSec) {
+    const isApproval = w.kind === "approval" && (w.decision ?? "pending") === "pending";
+    const kind = isApproval || w.timeoutPolicy !== "bypass" ? "escalation" : "bypass";
+    return { actionId: ops.newActionId(), actionKind: kind, target: subjectTarget(w), expectedSubjectVersion: 0 };
+  }
+  return null;
+}
+
+/** Confirm transition for a DELIVERED action, by actionKind ⇒ the ChangeBody[] to commit, or null (log + skip). */
+function confirmChanges(w: WaitRecord, action: PendingAction, runs: Map<string, ValidationRun>, atSeq: number, ops: SweepOps): ChangeBody[] | null {
+  switch (action.actionKind) {
+    case "bypass":
+    case "escalation": {
+      // Re-arm (erratum 94284fc2): the ping/notice ended only THAT action; re-open with a fresh deadline + escalatedAt.
+      const done = advanceWait(w, { type: "action_done", newDeadlineSec: ops.freshDeadlineSec(), nowSec: ops.nowSec() });
+      if (!done.ok) { ops.log(`sweep ${w.waitId}: action_done rejected: ${done.error}`); return null; }
+      return [{ put: "wait", wait: done.wait }];
+    }
+    case "reassign": {
+      const closed = advanceWait(w, { type: "close", resolution: { outcome: "owner-dead", reason: `owner ${w.owner} unreachable → ${action.target}`, sourceOperationId: action.actionId } });
+      if (!closed.ok) { ops.log(`sweep ${w.waitId}: close(owner-dead) rejected: ${closed.error}`); return null; }
+      const fresh = openWait({ waitId: ops.newWaitId(w.waitId), kind: w.kind, subject: w.subject, deadlineSec: ops.freshDeadlineSec(), owner: action.target, timeoutPolicy: w.timeoutPolicy });
+      return [{ put: "wait", wait: closed.wait }, { put: "wait", wait: fresh }];
+    }
+    case "move-validator": {
+      const run = w.subject.validationRunId ? runs.get(w.subject.validationRunId) : undefined;
+      if (!run) { ops.log(`sweep ${w.waitId}: move-validator confirm — run ${w.subject.validationRunId ?? "?"} missing`); return null; }
+      const moved = moveValidatorWithWait(run, w, {
+        newValidationRunId: ops.newValidationRunId(run.validationRunId), validatorLocation: action.target, openedAtSeq: atSeq, atSeq,
+        newWaitId: ops.newWaitId(w.waitId), deadlineSec: ops.freshDeadlineSec(), owner: action.target, timeoutPolicy: w.timeoutPolicy,
+        resolution: { outcome: "validator-moved", reason: `validator ${run.validatorLocation} stuck/dead → ${action.target}`, sourceOperationId: action.actionId },
+      });
+      if ("error" in moved) { ops.log(`sweep ${w.waitId}: moveValidatorWithWait rejected: ${moved.error}`); return null; }
+      return moved.changes;
+    }
+    default:
+      ops.log(`sweep ${w.waitId}: unknown actionKind ${action.actionKind} — skipping confirm`);
+      return null;
+  }
+}
+
+export async function sweepPass(ops: SweepOps): Promise<void> {
+  let state = ops.loadState();
+  // Commit-then-IO barrier (P1-1): a REJECTED commit must NOT proceed and must NOT be logged as success. Advance local
+  // state only on ok; on reject log honestly and return false so the caller bails (record left recoverable).
   const commitOk = (bodies: ChangeBody[], ctx: string): boolean => {
     const r = ops.commit(state, bodies);
     if (!r.result.ok) { ops.log(`sweep ${ctx}: commit rejected (${r.result.reason}) — no IO, no completion claim`); return false; }
@@ -67,84 +155,34 @@ export async function sweepPass(ops: SweepOps): Promise<void> {
     return true;
   };
 
-  for (const w of waits) {
-    if (!isLive(w)) continue;                     // resolved — nothing to supervise
-    if (w.state === "action_pending") continue;   // an action is already in flight (begin committed) — bounded delay: skip re-begin
-    const live = ops.isAlive(w.owner);
+  // PHASE 1 — begin: CAS-commit a recoverable intent for each OPEN wait that needs an action (no IO here).
+  for (const w of indexEntities(state).waits) {
+    if (w.state !== "open") continue; // action_pending residue is handled in phase 2 (recovery); resolved is done
+    const action = decideAction(w, indexEntities(state).runs, ops.isAlive(w.owner), ops);
+    if (!action) continue;
+    const begun = advanceWait(w, { type: "begin_action", pendingAction: action });
+    if (!begun.ok) { ops.log(`sweep ${w.waitId}: begin ${action.actionKind} rejected: ${begun.error}`); continue; }
+    commitOk([{ put: "wait", wait: begun.wait }], `${w.waitId} begin ${action.actionKind}`); // CAS BEFORE IO (phase 2)
+  }
 
-    // Rule — RPV validation-wait (subject.validationRunId set) ⇒ moveValidator (§0b RPV / P2-2). A validation-wait tracks a
-    // stuck validator seat, not a normal owner: a validator that is DEAD (gone) or ALIVE-but-past-deadline (env broke /
-    // too slow) is replaced by opening a fresh run+wait at a new location over the SAME pinned candidate — business is
-    // NEVER re-run, and the old generation's late verdict is fenced. This is NOT bypass (never auto-accepts a candidate)
-    // and NOT owner-reassign (that keeps the same subject). A single "suspected" is not convicted; pickValidator v1 may
-    // return null ⇒ defer to escalation. The validation-wait's deadline is the recoverable absolute clock (anchor (b)).
-    if (w.subject.validationRunId !== undefined) {
-      if (live === "suspected") continue;
-      if (live === "alive" && ops.nowSec() < w.deadlineSec) continue; // validator working within deadline — leave it
-      const run = runs.get(w.subject.validationRunId);
-      if (!run) { ops.log(`sweep ${w.waitId}: validation-wait references unknown run ${w.subject.validationRunId} — skipping`); continue; }
-      const to = ops.pickValidator(w, run);
-      if (to === null) { ops.log(`sweep ${w.waitId}: validator ${run.validatorLocation} stuck/dead, no replacement — leaving for escalation`); continue; }
-      const action: PendingAction = { actionId: ops.newActionId(), actionKind: "move-validator", target: run.validationRunId, expectedSubjectVersion: run.generation };
-      const begun = advanceWait(w, { type: "begin_action", pendingAction: action });
-      if (!begun.ok) { ops.log(`sweep ${w.waitId}: begin move-validator rejected: ${begun.error}`); continue; }
-      if (!commitOk([{ put: "wait", wait: begun.wait }], `${w.waitId} begin move-validator`)) continue; // CAS BEFORE IO
-      const delivered = await ops.doAction(begun.wait, action);                        // IO: notify the new validator seat (R5)
-      if (!delivered) { ops.log(`sweep ${w.waitId}: move-validator notify unconfirmed — holding action_pending, retry next tick`); continue; }
-      const atSeq = state.seq + 1;                                                     // the batch seq the moved run/wait commit at
-      const moved = moveValidator(run, { validationRunId: ops.newValidationRunId(run.validationRunId), validatorLocation: to, openedAtSeq: atSeq, atSeq });
-      if ("error" in moved) { ops.log(`sweep ${w.waitId}: moveValidator rejected: ${moved.error}`); continue; }
-      const closedWait = advanceWait(begun.wait, { type: "close", resolution: { outcome: "validator-moved", reason: `validator ${run.validatorLocation} stuck/dead → ${to}`, sourceOperationId: action.actionId } });
-      if (!closedWait.ok) { ops.log(`sweep ${w.waitId}: close(validator-moved) rejected: ${closedWait.error}`); continue; }
-      const freshWait = openWait({ waitId: ops.newWaitId(w.waitId), kind: w.kind, subject: { ...w.subject, validationRunId: moved.next.validationRunId }, deadlineSec: ops.freshDeadlineSec(), owner: to, timeoutPolicy: w.timeoutPolicy });
-      if (!commitOk([
-        { put: "validationRun", validationRun: moved.closedOld },  // old run → closed (fences its late verdict)
-        { put: "validationRun", validationRun: moved.next },       // new run, gen+1, SAME pinned candidate
-        { put: "wait", wait: closedWait.wait },                    // old validation-wait resolved
-        { put: "wait", wait: freshWait },                          // new validation-wait for the new run, same batch
-      ], `${w.waitId} move-validator confirm`)) continue;
-      ops.log(`sweep ${w.waitId}: RPV stuck ⇒ moveValidator ${run.validatorLocation} → ${to} (run ${run.validationRunId}→${moved.next.validationRunId} gen ${moved.next.generation}, new wait ${freshWait.waitId})`);
-      continue;
-    }
+  // PHASE 2 — fire (bounded, concurrent): every action_pending wait (fresh + crash/unconfirmed residue) gets its IO
+  // re-fired idempotently within a bounded window. Unsettled ⇒ left action_pending, re-fired next tick.
+  state = ops.loadState();
+  const pending = indexEntities(state).waits.filter((w) => w.state === "action_pending" && w.pendingAction);
+  const fired = await Promise.all(pending.map((w) =>
+    withTimeout(ops.doAction(w, w.pendingAction as PendingAction), ops.actionTimeoutMs).then((delivered) => ({ waitId: w.waitId, delivered })),
+  ));
 
-    // Rule — owner DEAD ⇒ reassign (close old + open new, same batch), regardless of deadline (R5 / scenario B). A single
-    // "suspected" is NOT dead (fe0376cd §4): we leave it. "alive" falls through to the expiry check.
-    if (live === "dead") {
-      const to = ops.pickReassignee(w);
-      if (to === null) { ops.log(`sweep ${w.waitId}: owner ${w.owner} dead, no reassignee — leaving for escalation`); continue; }
-      const action: PendingAction = { actionId: ops.newActionId(), actionKind: "reassign", target: subjectTarget(w), expectedSubjectVersion: 0 };
-      const begun = advanceWait(w, { type: "begin_action", pendingAction: action });
-      if (!begun.ok) { ops.log(`sweep ${w.waitId}: begin reassign rejected: ${begun.error}`); continue; }
-      if (!commitOk([{ put: "wait", wait: begun.wait }], `${w.waitId} begin reassign`)) continue;         // CAS BEFORE IO
-      const delivered = await ops.doAction(begun.wait, action);                        // IO: notify the new owner (R5)
-      if (!delivered) { ops.log(`sweep ${w.waitId}: reassign notify unconfirmed — holding action_pending, retry next tick`); continue; }
-      const closed = advanceWait(begun.wait, { type: "close", resolution: { outcome: "owner-dead", reason: `owner ${w.owner} unreachable`, sourceOperationId: action.actionId } });
-      if (!closed.ok) { ops.log(`sweep ${w.waitId}: close(owner-dead) rejected: ${closed.error}`); continue; }
-      const fresh = openWait({ waitId: ops.newWaitId(w.waitId), kind: w.kind, subject: w.subject, deadlineSec: ops.freshDeadlineSec(), owner: to, timeoutPolicy: w.timeoutPolicy });
-      if (!commitOk([{ put: "wait", wait: closed.wait }, { put: "wait", wait: fresh }], `${w.waitId} reassign confirm`)) continue; // close old + open new, same batch
-      ops.log(`sweep ${w.waitId}: owner-dead ⇒ reassigned ${w.owner} → ${to} (new ${fresh.waitId})`);
-      continue;
-    }
-
-    // Rule — EXPIRED (owner alive) ⇒ bypass (reversible) / escalation (approval). §0b erratum 94284fc2: a timeout action
-    // NEVER resolves the wait — the completed bypass ping / escalation notice ends only THAT action and RE-ARMS the wait
-    // (open + fresh deadline + escalatedAt); supervision transfers, it never vanishes on a single nudge. resolved comes
-    // only from a real subject `close` or an approval `decide`. (A1 auto-extension budget bounds the re-arms — round-3.)
-    if (live === "alive" && ops.nowSec() >= w.deadlineSec) {
-      const isApproval = w.kind === "approval" && (w.decision ?? "pending") === "pending";
-      const kind = isApproval || w.timeoutPolicy !== "bypass" ? "escalation" : "bypass"; // an approval always escalates (never bypass)
-      const action: PendingAction = { actionId: ops.newActionId(), actionKind: kind, target: subjectTarget(w), expectedSubjectVersion: 0 };
-      const begun = advanceWait(w, { type: "begin_action", pendingAction: action });
-      if (!begun.ok) { ops.log(`sweep ${w.waitId}: begin ${kind} rejected: ${begun.error}`); continue; }
-      if (!commitOk([{ put: "wait", wait: begun.wait }], `${w.waitId} begin ${kind}`)) continue;          // CAS BEFORE IO
-      const delivered = await ops.doAction(begun.wait, action);                        // IO: send the ping / escalation notice (R5)
-      if (!delivered) { ops.log(`sweep ${w.waitId}: ${kind} unconfirmed — holding action_pending, retry next tick`); continue; }
-      // Re-arm for EVERY kind (erratum 94284fc2): the action completed, so back to open with a fresh deadline + escalatedAt
-      // — never resolved, never granted. An approval stays decision=pending; only `decide`/`close` ends a wait.
-      const done = advanceWait(begun.wait, { type: "action_done", newDeadlineSec: ops.freshDeadlineSec(), nowSec: ops.nowSec() });
-      if (!done.ok) { ops.log(`sweep ${w.waitId}: action_done rejected: ${done.error}`); continue; }
-      if (!commitOk([{ put: "wait", wait: done.wait }], `${w.waitId} ${kind} confirm`)) continue;
-      ops.log(`sweep ${w.waitId}: expired ⇒ ${kind} sent, RE-ARMED (deadline ${done.wait.deadlineSec}, escalatedAt ${done.wait.escalatedAt})`);
-    }
+  // PHASE 3 — confirm: for each DELIVERED action, re-read the current wait (P2-1) and commit its confirm transition.
+  state = ops.loadState();
+  for (const f of fired) {
+    if (!f.delivered) continue; // undelivered/timed-out ⇒ stays action_pending, recovered next tick
+    const { waits, runs } = indexEntities(state);
+    const w = waits.find((x) => x.waitId === f.waitId);
+    if (!w || w.state !== "action_pending" || !w.pendingAction) continue; // concurrently resolved/changed — skip (P2-1)
+    const changes = confirmChanges(w, w.pendingAction, runs, state.seq + 1, ops);
+    if (!changes) continue;
+    if (commitOk(changes, `${w.waitId} ${w.pendingAction.actionKind} confirm`))
+      ops.log(`sweep ${w.waitId}: ${w.pendingAction.actionKind} confirmed`);
   }
 }

@@ -455,11 +455,18 @@ function buildSweepOps(stateRef: { s: LogState }): SweepOps {
     freshDeadlineSec: () => nowSec() + 1800,
     // R5 channel: deliver the ping/escalation/reassign-notice to the owner's durable inbox (filesystem — part of bus
     // delivery; the owner's bus node claims it). Thin v1; bus-identity formalizes handle→delivery.
+    // Bound a single action's IO per tick (P1-3): a slower delivery is left action_pending + re-fired next tick.
+    actionTimeoutMs: Number(process.env.SWARM_ACTION_TIMEOUT_MS || "5000"),
     doAction: async (w, action) => {
-      const sid = resolveSession(w.owner, listSessions(HOME));
-      if (!sid) return false;
+      // Route to the DESTINATION: reassign / move-validator notify the NEW owner / validator seat (action.target carries
+      // it, so routing is reconstructable from the durable intent); bypass / escalation ping the current owner.
+      const recipient = action.actionKind === "reassign" || action.actionKind === "move-validator" ? action.target : w.owner;
+      const sid = resolveSession(recipient, listSessions(HOME));
+      if (!sid) { log(`sweep doAction ${w.waitId}: recipient ${recipient} unresolved — not delivered`); return false; }
       const text = action.actionKind === "bypass" ? `[sweep] progress on ${w.waitId}? (subject ${JSON.stringify(w.subject)}) — past deadline`
         : action.actionKind === "escalation" ? `[sweep] ESCALATION: ${w.waitId} past deadline, needs a decision`
+        : action.actionKind === "reassign" ? `[sweep] REASSIGN: ${w.waitId} (subject ${JSON.stringify(w.subject)}) — you are the new owner`
+        : action.actionKind === "move-validator" ? `[sweep] VALIDATE: ${w.waitId} (run ${w.subject.validationRunId ?? "?"}) — you are the new validator seat`
         : `[sweep] ${w.waitId}: ${action.actionKind}`;
       try { writeInbox(HOME, sid, { from: SELF, fromLabel: "swarm-sweep", text, via: "local", ts: Date.now() }); return true; }
       catch (e) { log(`sweep doAction ${w.waitId}: inbox write failed: ${e instanceof Error ? e.message : e}`); return false; }

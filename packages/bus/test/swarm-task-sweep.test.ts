@@ -49,6 +49,7 @@ function mkOps(stateRef: { s: LogState }, order: string[], over: Partial<SweepOp
     newActionId: () => `act${++n}`,
     freshDeadlineSec: () => 9999,
     doAction: async (_w, action) => { order.push(`doAction:${action.actionKind}`); return true; },
+    actionTimeoutMs: 1000,
     log: () => {},
     ...over,
   };
@@ -80,14 +81,17 @@ describe("sweep scenario A — expired wait ⇒ begin_action (CAS) → IO → ac
     await sweepPass(mkOps(stateRef, order));
     expect(order).toEqual([]);
   });
-  test("bounded delay: an action_pending wait is skipped this tick (no re-begin)", async () => {
-    // seed a wait already in action_pending.
+  test("recovery (P1-2): an action_pending residue is RE-FIRED (idempotent, same actionId) + confirmed, not skipped forever", async () => {
+    // seed a wait already in action_pending — e.g. a crash after begin, before the IO/confirm.
     let s = mkState([wait({ waitId: "w1", deadlineSec: 1000 })]);
     const key = "wait:w1"; const rev = s.revisions[key] ?? 0;
     s = commit(s, s.seq, [{ put: "wait", wait: { ...liveWaits(s)[0]!, state: "action_pending", pendingAction: { actionId: "a", actionKind: "bypass", target: "job", expectedSubjectVersion: 0 } }, operationId: `${key}#${rev + 1}`, expectedEntityRevision: rev }]).state;
     const stateRef = { s }; const order: string[] = [];
     await sweepPass(mkOps(stateRef, order));
-    expect(order).toEqual([]); // skipped — its IO is already in flight
+    expect(order).toEqual(["doAction:bypass", "commit:wait:open"]); // re-fired its stored intent, then confirmed (re-arm)
+    const live = liveWaits(stateRef.s);
+    expect(live[0]!.state).toBe("open");      // recovered — no longer stranded in action_pending
+    expect(live[0]!.deadlineSec).toBe(9999);  // re-armed with a fresh deadline
   });
   test("IO unconfirmed ⇒ held in action_pending (not resolved), retried next tick", async () => {
     const stateRef = { s: mkState([wait({ waitId: "w1", deadlineSec: 1000 })]) };
@@ -180,7 +184,7 @@ describe("sweep scenario D — RPV validation-wait: stuck/dead validator ⇒ mov
     const stateRef = seed(vrun(), vwait({ deadlineSec: 1000 }));
     const order: string[] = [];
     await sweepPass(mkOps(stateRef, order, { isAlive: () => "alive", pickValidator: () => "codex:val2" }));
-    expect(order).toEqual(["commit:wait:action_pending", "doAction:move-validator", "commit:validationRun:closed,validationRun:running,wait:resolved,wait:open"]);
+    expect(order).toEqual(["commit:wait:action_pending", "doAction:move-validator", "commit:wait:resolved,validationRun:closed,validationRun:running,wait:open"]);
     const runs = allRuns(stateRef.s);
     expect(runs.find((r) => r.validationRunId === "vr1")!.state).toBe("closed");  // old run fenced (late verdict can't double-accept)
     const next = runs.find((r) => r.validationRunId !== "vr1")!;
@@ -231,6 +235,22 @@ describe("sweep scenario D — RPV validation-wait: stuck/dead validator ⇒ mov
     expect(order).toEqual(["commit:wait:action_pending", "doAction:move-validator"]);
     expect(allRuns(stateRef.s).find((r) => r.validationRunId === "vr1")!.state).toBe("running"); // not fenced until IO confirmed
     expect(liveWaits(stateRef.s)[0]!.state).toBe("action_pending");
+  });
+});
+
+describe("sweep P1-3 — bounded delay: a slow IO never blocks another wait or the loop", () => {
+  test("one wait's IO never settles (bounded by actionTimeoutMs) while another's completes this tick", async () => {
+    const stateRef = { s: mkState([wait({ waitId: "slow", deadlineSec: 1000 }), wait({ waitId: "fast", deadlineSec: 1000 })]) };
+    const order: string[] = [];
+    const start = Date.now();
+    await sweepPass(mkOps(stateRef, order, {
+      actionTimeoutMs: 30,
+      doAction: async (w) => { order.push(`doAction:${w.waitId}`); if (w.waitId === "slow") return new Promise<boolean>(() => {}); return true; }, // slow never resolves
+    }));
+    expect(Date.now() - start).toBeLessThan(2000);       // bounded — did NOT block on the never-settling IO
+    const byId = Object.fromEntries(liveWaits(stateRef.s).map((w) => [w.waitId, w]));
+    expect(byId["fast"]!.state).toBe("open");            // fast confirmed (re-armed) despite slow still in flight
+    expect(byId["slow"]!.state).toBe("action_pending");  // slow left recoverable, re-fired next tick (P1-2)
   });
 });
 
