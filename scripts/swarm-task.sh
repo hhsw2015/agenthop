@@ -225,10 +225,21 @@ while :; do
   SHA="$(qrun "$per" env GIT_SSH_COMMAND="$GSC_RO" git ls-remote "$WORK_URL" "refs/heads/$BRANCH" | awk 'NR==1{print $1}')" || QRC=$?
   [ "$(date +%s)" -lt "$QDEADLINE" ] || break   # a query that overran must NOT be accepted late (P2-2)
   if [ "$QRC" -ne 0 ]; then echo "  (ls-remote query error/timeout; retry within deadline)" >&2; sleep 2; continue; fi
-  if [ -n "$SHA" ]; then CONFIRMED="$SHA"; break; fi
+  if [ -n "$SHA" ]; then
+    # --resume SEEDS the branch at handoffSha, so the seed sha is NOT a successor publish (Codex P2-4): keep waiting for
+    # a sha BEYOND the seed (the successor's own first milestone). --demo had an ABSENT branch, so any sha is the first.
+    if [ -n "$RESUME_SHA" ] && [ "$SHA" = "$RESUME_SHA" ]; then :; else CONFIRMED="$SHA"; break; fi
+  fi
   sleep 2
 done
 if [ -z "$CONFIRMED" ]; then
+  if [ -n "$RESUME_SHA" ]; then
+    # Codex P2-4: do NOT declare "confirmed publishing" off the seed. The resume started and the seed is in place, but the
+    # successor has not published its OWN milestone yet — the dispatcher's await-resume is what confirms that (manifest
+    # launchId = this successor, kind milestone/final, descending from handoffSha). Report the narrower bootstrap status.
+    echo "BOOTSTRAP: $LID resume started; seed ${RESUME_SHA:0:12} in place on $BRANCH; resume-ACK pending (dispatcher confirms the successor's first milestone)."
+    exit 0
+  fi
   echo "WARN: $LID started but produced NO confirmed publish on $BRANCH within 60s — supervisor may be failing to push." >&2
   echo "  check: ssh ... railway.new 'cat /root/.swarm/sup.log'" >&2
   exit 5

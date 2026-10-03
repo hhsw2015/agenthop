@@ -19,7 +19,7 @@
 //      SWARM_HANDOFF_LEAD_SEC (180), SWARM_LAUNCH (scripts/swarm-launch.sh), AH_HOME, SWARM_SELF.
 
 import { spawn } from "node:child_process";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync, statSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -110,6 +110,9 @@ function loadMirror(): Map<string, ControlRecord> {
   return m;
 }
 function saveRecord(r: ControlRecord): void { mkdirSync(MIRROR_DIR, { recursive: true }); atomicWrite(mirrorPath(r.launchId), JSON.stringify(r)); }
+// Remove a record from the mirror (a successor whose box was RELIABLY never created, or a dead in-flight allocation).
+// Best-effort: a missing file is already the desired state.
+function removeRecord(launchId: string): void { try { const p = mirrorPath(launchId); if (existsSync(p)) unlinkSync(p); } catch (e) { log(`removeRecord ${launchId}: ${e instanceof Error ? e.message : e}`); } }
 
 // --- discover boxes this dispatcher launched (keydirs carry launchId + alloc-ts) ---
 function discoverBoxes(): Array<{ launchId: string; allocTs: number }> {
@@ -171,10 +174,13 @@ async function resumeSuccessor(a: { successor: string; handoffSha: string; gener
   if (r.code !== 0) { log(`resumeSuccessor ${a.successor}: swarm-task --resume failed (code ${r.code}): ${(r.stderr || r.stdout).trim().slice(0, 200)}`); return false; }
   return true;
 }
-async function scrubBox(launchId: string): Promise<void> {
+async function scrubBox(launchId: string): Promise<boolean> {
   // The box self-scrubs on its own deadline (swarm-scrub, driven by the supervisor). A dispatcher-driven scrub needs
-  // box access (the railway key or the tailcat channel) and lands with that wiring. Best-effort no-op for now.
-  log(`scrubBox ${launchId}: box self-scrubs on deadline; dispatcher-driven scrub pending`);
+  // box access (the railway key or the tailcat channel) and lands with that wiring. We CANNOT confirm termination here,
+  // so return false: the slot stays occupied until the box's deadline passes rather than be freed on an unproven scrub
+  // (Codex P1-2). When dispatcher-driven termination lands, return true on a confirmed kill.
+  log(`scrubBox ${launchId}: box self-scrubs on deadline; dispatcher-driven scrub pending (slot held until deadline)`);
+  return false;
 }
 
 // --- the --observe-once dev mode (offline-smoke-testable) ---
@@ -221,6 +227,7 @@ function buildOps(): HandoffOps {
     scrubBox,
     notify: notifyUser,
     persist: saveRecord,
+    removeRecord,
     log,
   };
 }

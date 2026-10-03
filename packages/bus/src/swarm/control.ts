@@ -75,6 +75,14 @@ export type ControlRecord = {
   budgetSec: number;
   /** Absolute deadline for display/dispatcher view (the BOX uses CLOCK_BOOTTIME locally, not this wall value). */
   deadlineEpoch?: number;
+  /** Epoch seconds the CURRENT allocation attempt was REQUESTED (pinned at `allocating`, = the successor's lifetime
+   *  base). Kept on the PARENT so a reconcile can bound the attempt's lifetime even in the crash window where the
+   *  successor's own record was not persisted yet (Codex P1-1). Cleared when the attempt clears. */
+  attemptStartSec?: number;
+  /** Set only when the physical VM is RELIABLY gone (scrub confirmed termination, or provider-confirmed). Logical task
+   *  retirement (RETIRED) does NOT imply this — a scrubbed box may still be alive until its deadline, so the slot stays
+   *  occupied until this is true or the physical deadline passes (Codex P1-2). */
+  reliablyTerminated?: boolean;
   /** Epoch seconds of the last write. */
   updatedAt: number;
 };
@@ -101,7 +109,9 @@ export type ControlEvent =
   | { type: "reconcile_dead" }
   | { type: "reconcile_alive" }
   | { type: "resumed"; successor: string; sha: string; generation: number; attempt: string }
-  | { type: "retire" }
+  // retire the logical task. `reliablyTerminated` is true ONLY when the scrub confirmed the physical VM is gone; absent
+  // / false keeps the physical slot occupied until the box's deadline passes (Codex P1-2: retire != VM destroyed).
+  | { type: "retire"; reliablyTerminated?: boolean }
   | { type: "done"; sha: string }
   | { type: "expire" }
   // A newer confirmed WORK-branch tip observed AFTER the VM already EXPIRED: advance the canonical `sha` so a
@@ -195,7 +205,7 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       // creates is told to resume from here; a later recover_sha advancing `sha` must NOT move this attempt's target.
       // The successor launchId is pinned here too (per-attempt), so a dispatcher restart re-reads WHICH box is taking
       // over from the mirror instead of a lost in-memory side-map. resumed later re-asserts the same successor.
-      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false, handoffSha: record.sha, successorGen: record.generation, ...(event.successor ? { successor: event.successor } : {}) });
+      return ok({ state: "ALLOCATING", attempt: event.attempt, attemptCount: (record.attemptCount ?? 0) + 1, resultUnknown: false, handoffSha: record.sha, successorGen: record.generation, attemptStartSec: nowSec, ...(event.successor ? { successor: event.successor } : {}) });
     case "alloc_unknown":
       // Allocation request sent, result unknown. Stay ALLOCATING; mark it so a reclaimer reconciles this attempt.
       if (record.state !== "ALLOCATING") return bad(`alloc_unknown only from ALLOCATING, not ${record.state}`);
@@ -204,11 +214,14 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
       // RELIABLE clean failure (box definitively NOT created): clear attempt/successor/successorGen back to CLAIMED so a
       // fresh allocate runs immediately. attemptCount is KEPT (the cap still bounds retries). NOT for unknown results.
       if (record.state !== "ALLOCATING") return bad(`alloc_failed only from ALLOCATING, not ${record.state}`);
-      return ok({ state: "CLAIMED", attempt: undefined, successor: undefined, successorGen: undefined, resultUnknown: false });
+      return ok({ state: "CLAIMED", attempt: undefined, successor: undefined, successorGen: undefined, resultUnknown: false, attemptStartSec: undefined });
     case "reconcile_dead":
-      // Reconcile found the in-flight allocation's box DEAD: clear the attempt so a fresh allocate can proceed.
+      // Reconcile found the in-flight allocation's box DEAD: clear the WHOLE attempt — attempt id, the dangling
+      // successor link/gen, and the attempt's request-start — so a fresh allocate can proceed and the parent no longer
+      // points at a phantom successor (Codex P2-2; the dead successor's own record is removed by the caller). attemptCount
+      // is KEPT (the cap still bounds retries).
       if (record.state !== "CLAIMED" || record.attempt === undefined) return bad(`reconcile_dead needs CLAIMED with an attempt, not ${record.state}`);
-      return ok({ attempt: undefined, resultUnknown: false });
+      return ok({ attempt: undefined, resultUnknown: false, successor: undefined, successorGen: undefined, attemptStartSec: undefined });
     case "reconcile_alive":
       // Reconcile found the in-flight box ALIVE. That is NOT recovery-complete (Codex): re-enter the await-resume
       // wait reusing the SAME attempt (no attemptCount bump). Only a real `resumed` ACK carrying the expected
@@ -231,7 +244,9 @@ export function advance(record: ControlRecord, event: ControlEvent, nowSec: numb
     }
     case "retire":
       if (record.state !== "RESUMED") return bad(`retire only from RESUMED, not ${record.state}`);
-      return ok({ state: "RETIRED" });
+      // RETIRED is the LOGICAL end; the physical slot is freed only when the VM is reliably gone (scrub confirmed) or
+      // its deadline passes — so carry the scrub's confirmation, defaulting to NOT-terminated (Codex P1-2).
+      return ok({ state: "RETIRED", reliablyTerminated: event.reliablyTerminated ?? false });
     case "done":
       if (record.state !== "RUNNING" && record.state !== "DRAINING" && record.state !== "CHECKPOINTED")
         return bad(`done only from RUNNING/DRAINING/CHECKPOINTED, not ${record.state}`);
@@ -317,6 +332,19 @@ export function nextAction(record: ControlRecord, nowSec: number, ctx: DispatchC
  */
 export function likelyExpired(record: ControlRecord, nowSec: number, skewSec = 120): boolean {
   return nowSec > record.allocStart + record.budgetSec + skewSec;
+}
+
+/**
+ * Does this record still (possibly) hold a physical VM slot? This — NOT the task state — is what the cap counts
+ * (Codex P1-2: cap = concurrent boxes). A VM may be alive from its request until it is RELIABLY terminated (scrub
+ * confirmed) or past its physical deadline. So a RETIRED/DONE box still occupies until one of those, while an EXPIRED
+ * record (the dispatcher's VM-gone belief) and a reliably-scrubbed one do not. Conservative by design: when unsure,
+ * assume the VM is still up so the cap is never silently exceeded.
+ */
+export function physicallyOccupies(record: ControlRecord, nowSec: number): boolean {
+  if (record.reliablyTerminated) return false;
+  if (record.state === "EXPIRED") return false; // VM believed gone (set past deadline+skew); task may still need recovery
+  return !likelyExpired(record, nowSec);
 }
 
 /** Thresholds newly crossed (<= remaining) and not yet fired; most-urgent first. Caller records all returned as fired. */

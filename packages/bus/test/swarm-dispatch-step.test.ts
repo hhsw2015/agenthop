@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { branchFor, handoffStep, type HandoffOps } from "../src/swarm/dispatch-step.js";
+import { branchFor, effectiveLive, handoffStep, type HandoffOps } from "../src/swarm/dispatch-step.js";
 import type { ControlRecord } from "../src/swarm/control.js";
 import { MAX_ALLOC_ATTEMPTS } from "../src/swarm/control.js";
 import type { ObservedTip } from "../src/swarm/acceptance.js";
@@ -21,7 +21,9 @@ function makeOps(over: Partial<HandoffOps> = {}) {
     nextLid: "rw-bbbb",
     allocReturn: "ok" as "ok" | "clean-fail" | "unknown",
     resumeReturn: true,
+    scrubReturn: false, // scrub is best-effort; true only when it RELIABLY terminated the VM
     scrubbed: [] as string[],
+    removed: [] as string[],
     allocCalls: 0,
     resumeCalls: 0,
     notes: [] as string[],
@@ -37,9 +39,10 @@ function makeOps(over: Partial<HandoffOps> = {}) {
     observeTip: async (branch) => state.tips.get(branch) ?? null,
     allocateSuccessor: async () => { state.allocCalls++; return state.allocReturn; },
     resumeSuccessor: async () => { state.resumeCalls++; return state.resumeReturn; },
-    scrubBox: async (lid) => { state.scrubbed.push(lid); },
+    scrubBox: async (lid) => { state.scrubbed.push(lid); return state.scrubReturn; },
     notify: (m) => state.notes.push(m),
     persist: () => {},
+    removeRecord: (lid) => { state.removed.push(lid); },
     log: () => {},
     ...over,
   };
@@ -206,6 +209,65 @@ describe("handoffStep: reconcile retains unless RELIABLE death; uses the pinned 
     expect(out.state).toBe("CLAIMED");
     expect(out.attempt).toBeUndefined(); // reliable death -> cleared
   });
+
+  test("a historical RESCUE tip does NOT mask the deadline; past deadline + only-rescue -> dead + successor removed (P2-1/P2-2)", async () => {
+    const { ops, state } = makeOps();
+    state.now = T0 + 10;
+    const { a, records } = reclaimedWithAttempt(1);
+    records.set("rw-bbbb", { ...records.get("rw-bbbb")!, allocStart: T0 - BUDGET - 500 }); // physically expired
+    state.tips.set(branchFor("rw-bbbb", 1), tip("r1", "rw-bbbb", 1, "rescue")); // only a supervisor rescue tip
+    const out = await handoffStep(a, records, ops);
+    expect(out.state).toBe("CLAIMED");
+    expect(out.attempt).toBeUndefined();        // not trapped alive-by-rescue -> declared dead
+    expect(out.successor).toBeUndefined();       // dangling successor link cleared (P2-2)
+    expect(state.removed).toContain("rw-bbbb");  // dead successor record removed from the mirror
+    expect(records.has("rw-bbbb")).toBe(false);
+  });
+
+  test("unknown allocation whose successor RECORD was lost still terminates via parent attemptStartSec (P1-1)", async () => {
+    const { ops, state } = makeOps();
+    state.now = T0 + 10;
+    const records = new Map<string, ControlRecord>();
+    // CLAIMED with a retained attempt but NO successor record (crash between pinning + placeholder persist); the attempt
+    // was requested long ago, so its pinned attemptStartSec is already past the deadline.
+    const a = rec({ state: "CLAIMED", generation: 2, sha: "fin0", handoffSha: "fin0", successor: "rw-ghost", successorGen: 1, attempt: "att-1", attemptStartSec: T0 - BUDGET - 500, owner: "disp1", leaseUntil: T0 + 300 });
+    records.set(a.launchId, a);
+    const out = await handoffStep(a, records, ops);
+    expect(out.state).toBe("CLAIMED");
+    expect(out.attempt).toBeUndefined(); // terminated via parent attemptStartSec, not inconclusive forever
+  });
+});
+
+describe("effectiveLive: physical-slot occupancy, not task state (Codex P1-1/P1-2)", () => {
+  test("RETIRED box still occupies until reliable termination; DONE/past-deadline frees", () => {
+    const recs = new Map<string, ControlRecord>();
+    recs.set("a", rec({ launchId: "a", state: "RETIRED", allocStart: T0 }));
+    expect(effectiveLive(recs, T0 + 10)).toBe(1); // RETIRED but VM may still be alive -> occupies (P1-2)
+    recs.set("a", { ...recs.get("a")!, reliablyTerminated: true });
+    expect(effectiveLive(recs, T0 + 10)).toBe(0); // scrub confirmed termination -> freed
+    recs.set("a", rec({ launchId: "a", state: "DONE", allocStart: T0 - BUDGET - 500 }));
+    expect(effectiveLive(recs, T0 + 10)).toBe(0); // DONE + past physical deadline -> freed
+  });
+
+  test("EXPIRED frees the slot (VM believed gone) even though the task still needs recovery", () => {
+    const recs = new Map<string, ControlRecord>();
+    recs.set("a", rec({ launchId: "a", state: "EXPIRED", allocStart: T0 }));
+    expect(effectiveLive(recs, T0 + 10)).toBe(0);
+  });
+
+  test("ALLOCATING with a pinned successor but no successor record reserves a slot; no double-count once the record exists (P1-1)", () => {
+    const recs = new Map<string, ControlRecord>();
+    recs.set("p", rec({ launchId: "p", state: "ALLOCATING", successor: "ghost", attemptStartSec: T0, allocStart: T0 }));
+    expect(effectiveLive(recs, T0 + 10)).toBe(2); // parent(1) + reservation for the maybe-existing successor VM(1)
+    recs.set("ghost", rec({ launchId: "ghost", state: "RUNNING", allocStart: T0 }));
+    expect(effectiveLive(recs, T0 + 10)).toBe(2); // parent(1) + successor record(1); reservation no longer added
+  });
+
+  test("CLAIMED without a successor reserves the slot it is about to allocate (P1-6)", () => {
+    const recs = new Map<string, ControlRecord>();
+    recs.set("p", rec({ launchId: "p", state: "CLAIMED", allocStart: T0 }));
+    expect(effectiveLive(recs, T0 + 10)).toBe(2); // self + reservation
+  });
 });
 
 describe("handoffStep: cap reservation + gate + give_up", () => {
@@ -221,8 +283,9 @@ describe("handoffStep: cap reservation + gate + give_up", () => {
     // effectiveLive = 3 (rw-live, a, b) -> already at cap -> neither claims
     const oa = await handoffStep(a, records, ops);
     expect(oa.state).toBe("CHECKPOINTED");
-    // free a slot: rw-live done
-    records.set("rw-live", { ...records.get("rw-live")!, state: "DONE" });
+    // free a slot: rw-live's VM is now past its physical deadline. NOTE task-DONE alone does NOT free the slot anymore
+    // (Codex P1-2: cap = physical boxes, held until reliable termination / deadline), so we also expire it physically.
+    records.set("rw-live", { ...records.get("rw-live")!, state: "DONE", allocStart: T0 - BUDGET - 500 });
     const oa2 = await handoffStep(records.get("rw-aaaa")!, records, ops); // effectiveLive now 2 -> a claims
     expect(oa2.state).toBe("CLAIMED");
     // now a is CLAIMED (reserves its successor) -> b sees effectiveLive 3 -> cannot claim

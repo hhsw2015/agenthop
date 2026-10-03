@@ -25,6 +25,7 @@ import {
   type DispatchAction,
   likelyExpired,
   nextAction,
+  physicallyOccupies,
 } from "./control.js";
 import { type ObservedTip, tipToEvent } from "./acceptance.js";
 
@@ -46,11 +47,14 @@ export type HandoffOps = {
   /** Tell the successor to resume from handoffSha, publishing to `branch` at `generation` (runs swarm-task --resume).
    *  true = resume command accepted; false = result unknown (reconcile next pass). */
   resumeSuccessor: (a: { successor: string; handoffSha: string; generation: number; branch: string }) => Promise<boolean>;
-  /** Best-effort scrub of a retired predecessor box. */
-  scrubBox: (launchId: string) => Promise<void>;
+  /** Best-effort scrub of a retired predecessor box. Returns true ONLY if it RELIABLY terminated the VM (so the slot
+   *  can be freed now); false = best-effort / unconfirmed, so the slot stays occupied until the box's deadline. */
+  scrubBox: (launchId: string) => Promise<boolean>;
   notify: (msg: string) => void;
   /** Persist a record to the durable mirror. */
   persist: (r: ControlRecord) => void;
+  /** Remove a record from the durable mirror + Map (a successor whose box was RELIABLY never created / is dead). */
+  removeRecord: (launchId: string) => void;
   log: (m: string) => void;
 };
 
@@ -72,17 +76,23 @@ function apply(r: ControlRecord, ev: ControlEvent, ops: HandoffOps, records: Map
   return res.record;
 }
 
-/** Non-terminal records count toward the cap; a CLAIMED record without a successor yet RESERVES one more slot (it will
- *  allocate a successor), so two predecessors can't both claim the last slot (Codex P1-6). */
-function effectiveLive(records: Map<string, ControlRecord>): number {
-  let live = 0;
-  let reservations = 0;
+/**
+ * Boxes counting against the cap = PHYSICAL occupancy, not task state (Codex P1-2: cap is concurrent boxes). A record
+ * occupies a slot while its VM may still be alive (physicallyOccupies: not reliably scrubbed, not past deadline) —
+ * including a RETIRED/DONE box whose scrub did not confirm termination. On top of counted records, RESERVE a slot for a
+ * successor VM that exists (or may exist) but has no counted record yet:
+ *  - a CLAIMED record without a successor is ABOUT to allocate one (Codex P1-6);
+ *  - an ALLOCATING record whose pinned successor has no record is the crash window between pinning and persisting the
+ *    successor placeholder — its VM may already exist, so it must still count (Codex P1-1).
+ */
+export function effectiveLive(records: Map<string, ControlRecord>, nowSec: number): number {
+  let count = 0;
   for (const x of records.values()) {
-    if (x.state === "RETIRED" || x.state === "DONE") continue;
-    live++;
-    if (x.state === "CLAIMED" && !x.successor) reservations++;
+    if (physicallyOccupies(x, nowSec)) count++;
+    if (x.state === "CLAIMED" && !x.successor) count++; // about to allocate a successor
+    if (x.state === "ALLOCATING" && x.successor && !records.has(x.successor)) count++; // successor VM may exist, record lost
   }
-  return live + reservations;
+  return count;
 }
 
 /** Drive ONE record through observe -> clock -> gated nextAction EXEC. Mutates `records`. Returns the updated record. */
@@ -117,7 +127,7 @@ export async function handoffStep(
   }
 
   // 3) Handoff EXEC via the pure decision (gated).
-  const action = nextAction(r, ops.nowSec(), { self: ops.self, cap: ops.cap, liveCount: effectiveLive(records) });
+  const action = nextAction(r, ops.nowSec(), { self: ops.self, cap: ops.cap, liveCount: effectiveLive(records, ops.nowSec()) });
   if (ops.execEnabled) {
     r = await runAction(r, action, records, ops);
   } else if (action !== "none") {
@@ -148,9 +158,12 @@ async function runAction(
       return allocate(r, records, ops);
     case "await_resume":
       return awaitResume(r, records, ops);
-    case "retire_predecessor":
-      await ops.scrubBox(r.launchId);
-      return apply(r, { type: "retire" }, ops, records);
+    case "retire_predecessor": {
+      // scrub is best-effort; only a CONFIRMED termination frees the physical slot now. Otherwise the box stays counted
+      // until its deadline (Codex P1-2) — fine in practice, since a handed-off predecessor is already near its deadline.
+      const terminated = await ops.scrubBox(r.launchId);
+      return apply(r, { type: "retire", reliablyTerminated: terminated }, ops, records);
+    }
     case "give_up":
       ops.notify(`box ${r.launchId}: allocation attempts exhausted (${r.attemptCount ?? 0}); needs manual attention`);
       return r;
@@ -167,32 +180,38 @@ async function allocate(r: ControlRecord, records: Map<string, ControlRecord>, o
   }
   const gen = r.generation;
   const successor = ops.newLaunchId();
-  // CAS-then-IO: record the attempt + successor (and pin successorGen=gen) FIRST and persist, BEFORE any IO. A throw in
-  // persist leaves no box created (IO not reached); a throw AFTER leaves a durable ALLOCATING the next pass reconciles.
+  const reqStart = ops.nowSec(); // the attempt's lifetime base = REQUEST start, not the post-IO ACK (Codex P2-3)
+  // CAS-then-IO: record the attempt + successor (pin successorGen=gen and attemptStartSec=reqStart) FIRST and persist,
+  // BEFORE any IO. A throw in persist leaves no box created (IO not reached); a throw AFTER leaves a durable ALLOCATING.
   r = apply(r, { type: "allocating", attempt: `att-${gen}-${successor}`, successor }, ops, records);
   if (r.state !== "ALLOCATING") return r; // transition rejected -> do not run IO
 
-  const res = await ops.allocateSuccessor(r, successor);
-  if (res === "clean-fail") {
-    // RELIABLY not created -> clear the attempt (bounded immediate retry); no successor record, no phantom slot.
-    ops.log(`${r.launchId}: successor ${successor} clean-fail; clearing attempt for retry`);
-    return apply(r, { type: "alloc_failed" }, ops, records);
-  }
-  // ok OR unknown: a box may exist publishing to swarm/<successor>-g<gen>. Create its record (reserve slot + pin gen).
+  // Pre-create the successor PLACEHOLDER record BEFORE the allocate IO (Codex P1-1): once persisted it is counted
+  // against the cap and carries a reconcilable deadline (allocStart = reqStart), so a crash mid-allocate leaves a
+  // slot that is both bounded and terminable — not a phantom with no deadline. Removed again only on a clean-fail.
   const succ: ControlRecord = {
     launchId: successor,
     state: "RUNNING",
     generation: gen,
     handoffSha,
-    allocStart: ops.nowSec(),
+    allocStart: reqStart,
     budgetSec: ops.budgetSec,
-    deadlineEpoch: ops.nowSec() + ops.budgetSec,
-    updatedAt: ops.nowSec(),
+    deadlineEpoch: reqStart + ops.budgetSec,
+    updatedAt: reqStart,
   };
   records.set(successor, succ);
   ops.persist(succ);
+
+  const res = await ops.allocateSuccessor(r, successor);
+  if (res === "clean-fail") {
+    // RELIABLY not created -> remove the placeholder (no phantom slot) and clear the attempt (bounded immediate retry).
+    ops.log(`${r.launchId}: successor ${successor} clean-fail; removing placeholder + clearing attempt for retry`);
+    ops.removeRecord(successor);
+    records.delete(successor);
+    return apply(r, { type: "alloc_failed" }, ops, records);
+  }
   if (res === "unknown") {
-    ops.log(`${r.launchId}: successor ${successor} allocate UNKNOWN; retained, will reconcile`);
+    ops.log(`${r.launchId}: successor ${successor} allocate UNKNOWN; placeholder retained, will reconcile`);
     return apply(r, { type: "alloc_unknown" }, ops, records);
   }
   // res === "ok": tell the successor to resume from handoffSha.
@@ -207,14 +226,31 @@ async function allocate(r: ControlRecord, records: Map<string, ControlRecord>, o
 async function reconcile(r: ControlRecord, records: Map<string, ControlRecord>, ops: HandoffOps): Promise<ControlRecord> {
   if (!r.successor) return apply(r, { type: "reconcile_dead" }, ops, records); // nothing pinned to reconcile
   const sgen = r.successorGen ?? r.generation; // the successor publishes at its pinned gen, NOT the bumped owner gen
-  const tip = await ops.observeTip(branchFor(r.successor, sgen), undefined, r.successor);
-  if (tip && tip.manifest && tip.manifest.launchId === r.successor && tip.manifest.generation === sgen) {
-    return apply(r, { type: "reconcile_alive" }, ops, records); // the successor published -> ALIVE
-  }
-  // Not observed publishing. Declare DEAD only on RELIABLE evidence — the successor is physically past its deadline.
-  // A transient git error / not-yet-published must NOT clear the attempt (Codex: don't judge a live box dead).
+  const tip = await ops.observeTip(branchFor(r.successor, sgen), r.handoffSha, r.successor);
+  // QUALIFIED takeover evidence = a real worker-driven milestone/final at the pinned gen, descending from handoffSha —
+  // the SAME bar as awaitResume. A historical/supervisor rescue tip is NOT proof of a live instance, so it must not win
+  // over the physical deadline and trap the attempt in an alive->reject->reclaim loop (Codex P2-1).
+  const qualified =
+    !!tip && !!tip.manifest &&
+    tip.manifest.launchId === r.successor &&
+    tip.manifest.generation === sgen &&
+    (tip.manifest.kind === "milestone" || tip.manifest.kind === "final") &&
+    tip.isDescendantOfAccepted === true;
+  if (qualified) return apply(r, { type: "reconcile_alive" }, ops, records); // real takeover in progress -> ALIVE
+
+  // Not qualified. Declare DEAD only on RELIABLE physical-deadline evidence — from the successor record if it exists,
+  // else the parent's pinned attemptStartSec (the crash window where the placeholder was never persisted, Codex P1-1),
+  // so an unknown allocation cannot stay inconclusive forever. A transient error before the deadline retains the attempt.
   const succ = records.get(r.successor);
-  if (succ && likelyExpired(succ, ops.nowSec())) return apply(r, { type: "reconcile_dead" }, ops, records);
+  const expired = succ
+    ? likelyExpired(succ, ops.nowSec())
+    : r.attemptStartSec !== undefined && ops.nowSec() > r.attemptStartSec + ops.budgetSec + 120;
+  if (expired) {
+    ops.log(`${r.launchId}: successor ${r.successor} past deadline, no qualified takeover — declaring dead`);
+    ops.removeRecord(r.successor); // terminate the dead successor's record + physical occupancy (Codex P2-2)
+    records.delete(r.successor);
+    return apply(r, { type: "reconcile_dead" }, ops, records);
+  }
   ops.log(`${r.launchId}: reconcile ${r.successor} inconclusive (not published, not expired) — retaining attempt`);
   return r;
 }
