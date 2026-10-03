@@ -400,12 +400,14 @@ function buildTaskOps(stateRef: { s: LogState }, planCommittedAtSec: number): Ta
 function loadWaitSeed(stateRef: { s: LogState }): void {
   if (!WAIT_SEED_FILE) return;
   try {
-    const entries = JSON.parse(readFileSync(WAIT_SEED_FILE, "utf8")) as Array<{ put: string; wait: WaitRecord }>;
-    for (const e of entries) {
-      if (e.put !== "wait" || !e.wait?.waitId) continue;
-      if (stateRef.s.revisions[`wait:${e.wait.waitId}`] !== undefined) continue; // already in the log
-      stateRef.s = commitTask(stateRef.s, [{ put: "wait", wait: e.wait }]).state;
-      log(`wait seed: loaded ${e.wait.waitId} (owner ${e.wait.owner})`);
+    const entries = JSON.parse(readFileSync(WAIT_SEED_FILE, "utf8")) as Array<Record<string, unknown>>;
+    for (const raw of entries) {
+      // Accept either a bare WaitRecord or a {put:"wait", wait} wrapper.
+      const wait = (raw.put === "wait" && raw.wait ? raw.wait : raw) as WaitRecord;
+      if (!wait?.waitId) continue;
+      if (stateRef.s.revisions[`wait:${wait.waitId}`] !== undefined) continue; // already in the log
+      stateRef.s = commitTask(stateRef.s, [{ put: "wait", wait }]).state;
+      log(`wait seed: loaded ${wait.waitId} (owner ${wait.owner})`);
     }
   } catch (e) { log(`wait seed ${WAIT_SEED_FILE}: ${e instanceof Error ? e.message : e}`); }
 }
