@@ -57,12 +57,16 @@ const wait = (p: Partial<WaitRecord> & { waitId: string }): WaitRecord =>
   openWait({ waitId: p.waitId, kind: p.kind ?? "wait", subject: p.subject ?? { jobId: "job" }, deadlineSec: p.deadlineSec ?? 1000, owner: p.owner ?? "claude:owner", timeoutPolicy: p.timeoutPolicy ?? "bypass" });
 
 describe("sweep scenario A — expired wait ⇒ begin_action (CAS) → IO → action_done", () => {
-  test("bypass: commits begin BEFORE the IO, then action_done ⇒ resolved", async () => {
+  test("bypass: begin BEFORE the IO, then action_done ⇒ RE-ARM (open, not resolved — §0b erratum 94284fc2)", async () => {
     const stateRef = { s: mkState([wait({ waitId: "w1", deadlineSec: 1000, timeoutPolicy: "bypass" })]) };
     const order: string[] = [];
     await sweepPass(mkOps(stateRef, order));
-    expect(order).toEqual(["commit:wait:action_pending", "doAction:bypass", "commit:wait:resolved"]); // CAS strictly before IO
-    expect(liveWaits(stateRef.s)).toHaveLength(0); // resolved
+    expect(order).toEqual(["commit:wait:action_pending", "doAction:bypass", "commit:wait:open"]); // CAS before IO; re-arm, not resolve
+    const live = liveWaits(stateRef.s);
+    expect(live).toHaveLength(1);                 // still live — a single bypass ping never resolves the wait
+    expect(live[0]!.state).toBe("open");
+    expect(live[0]!.deadlineSec).toBe(9999);      // fresh deadline (freshDeadlineSec)
+    expect(live[0]!.escalatedAt).toBe(2000);      // nowSec — supervision transferred
   });
   test("escalate policy sends an escalation action", async () => {
     const stateRef = { s: mkState([wait({ waitId: "w1", deadlineSec: 1000, timeoutPolicy: "escalate" })]) };
