@@ -93,7 +93,12 @@ TaskAttempt {
   jobId, planRevision, nodeId
   status: "RUNNING" | "RESULT_PENDING_VALIDATION" | "SUCCEEDED" | "RETRY_WAIT" | "FAILED" | "ABANDONED"
                              // BLOCKED_BY_DEPS/READY 不落盘——它们是 readyTasks() 的派生值，见 §3.1
-                             // FAILED 只写终败：permanent / retryBudget 耗尽 / job 预算尽（Codex P1-2）
+                             // FAILED 只写终败：permanent / retryBudget 耗尽（勘误 2026-10-03:原文此处还列
+                             // 「job 预算尽」——与 §3.1 的判定下沉矛盾:job 预算是 job 层事实,由 jobStatus=failed
+                             // 表达(readyTasks 对预算尽一律不放行),不逐个改写 attempt 终态;否则预算尽瞬间要原子
+                             // 改写全部在途 attempt,且它们随审计语义是「停格」而非「业务终败」。§3.1 终败判定第二
+                             // 分支「或 job 预算尽」同步勘误删除。T1 实现复验时 Codex 核出注释与原文不一致,裁定
+                             // 记录于 brain-T1-pure-rereview-2026-10-03.md）
                              // ABANDONED = 作废（stale-input/stale-plan/重试接替/intent 撤销）：不算成功也不算终败，
                              // 历史 attempt 一律只作审计；节点的完成/终败判定见 §3.1，不看历史 attempt 状态
   inputBindings: Array<{     // 创建 attempt 时一次性解析、冻结
@@ -204,6 +209,8 @@ AcceptedResult {
 
 PlanPut 的操作身份包含 `(jobId, planRevision)`，不只 jobId。happycapy 黑板查重不比 payload hash（先验研究 §2.5），此处是修正后的规则。
 
+**非语义修订不触发 supersede/级联(增补 2026-10-03,dogfood S9)**:上游产物的修订若**不改变其 specDigest 所覆盖的任务身份语义**(措辞澄清、勘误、注释——消费者行为不需要变),就不是 supersede,不走业务作废通道,下游 currentAccepted 不受影响。判据与 §2.1/§2.2 的身份切分同源:specDigest 不变 ⇒ 无级联。实证:冻结契约自身的两段勘误(3bf23c→0c06c91c)期间,按原文本建成的 T1 实现无需返工——勘误若被建模为 supersede,级联会错误地把整个 T1 判为失效。真正的灰区(文本变了、语义边界吃不准)按保守侧:发起 review 节点裁决,而不是默认级联。
+
 ---
 
 ## 3. 三条状态轴与交互规则
@@ -216,11 +223,11 @@ READY ──startTask 派发成功（attempt 创建+binding 打开）──▶ R
 RUNNING ──当前未截止 binding 的 ResultObserved──▶ RESULT_PENDING_VALIDATION（已截止 binding 的候选只审计，不动 attempt，Codex P2-1）
 RESULT_PENDING_VALIDATION ──验收通过──▶ SUCCEEDED
 RESULT_PENDING_VALIDATION ──business-fail（outcome=failure / V7 / V8 拒）──▶ RETRY_WAIT（retriesUsed+1，retryAt 持久）
-RESULT_PENDING_VALIDATION ──permanent（milestone 来源的 V1/scope-violation、冲突）或预算尽──▶ FAILED（V2/V3 是候选级丢弃,不出现在这里——Codex v2-P3-1）
+RESULT_PENDING_VALIDATION ──permanent（milestone 来源的 V1/scope-violation、冲突）或 **retryBudget** 耗尽──▶ FAILED（V2/V3 是候选级丢弃,不出现在这里——Codex v2-P3-1;「预算尽」勘误明确为 retryBudget,job 预算不写 attempt 终态）
 RESULT_PENDING_VALIDATION ──stale（V4/V5 拒：输入/计划已变）──▶ ABANDONED（不耗重试；节点随新绑定重新就绪）
 RESULT_PENDING_VALIDATION ──inconsistent-snapshot（rescue 不完整，§4.2）──▶ RUNNING（等一致快照；不耗重试）
 RETRY_WAIT ──retryAt 到期──▶ (派生) READY（新 attempt **原样继承** retriesUsed + 旧 attempt 转 ABANDONED(retry-succession)，同一批提交——计数只在进 RETRY_WAIT 时加,接替不再加,Codex v2-P2-3）
-RUNNING ──attempt 全部 binding 截止且无已观察结果──▶ RETRY_WAIT（transient-infra，不耗 retriesUsed；FAILED 仅当 job 预算尽）
+RUNNING ──attempt 全部 binding 截止且无已观察结果──▶ RETRY_WAIT（transient-infra，不耗 retriesUsed;勘误 2026-10-03:原句尾「FAILED 仅当 job 预算尽」删除——job 预算尽由 jobStatus=failed 表达,不写 attempt 终态）
 ```
 
 任一时刻一个 node 至多一个「活」attempt（RUNNING / RESULT_PENDING_VALIDATION / RETRY_WAIT）；重试接替的新建与旧 attempt 转 ABANDONED 同批提交，不出现两个活 attempt；FAILED 只在终败时写入（Codex P1-2 反例 B：v1 把被接替也写成 FAILED，a2 作废后回看 a1 会误判终败）。
@@ -239,7 +246,7 @@ currentAccepted(node, plan, acceptedResults) -> AcceptedResult | null   // 递�
 
 - 完成 ⇔ `currentAccepted(node) != null`。上游 spec 一改,上游的 current 变 null,所有下游递归变 null——PlanPut 无需原子级联置位,有效性函数自动传播（显式 Supersede 仍保留,用于 spec 没变但结果被裁决作废的场合）。
 - readyTasks 第 4 步、V4、job 成功全部用同一个 currentAccepted,不得各查各的 superseded 位。
-- 终败 ⇔ 存在 FAILED attempt：specDigest == 当前 spec **且** inputBindingDigest == 此刻按 currentAccepted 解析出的绑定 digest；或 job 预算尽。spec 或输入变了，旧 FAILED 不挡新执行。
+- 终败 ⇔ 存在 FAILED attempt：specDigest == 当前 spec **且** inputBindingDigest == 此刻按 currentAccepted 解析出的绑定 digest（勘误 2026-10-03:原文此处还有「或 job 预算尽」,随 §2.2 状态注释的同次勘误删除——job 预算尽由 jobStatus=failed 表达,不构成单节点终败）。spec 或输入变了，旧 FAILED 不挡新执行。
 - 历史 SUCCEEDED / FAILED / ABANDONED 一律只作审计。
 
 持久化的只有 attempt 的 status（§2.2）；BLOCKED/READY 每轮由 `readyTasks()` 重算。
@@ -330,7 +337,7 @@ V8 的执行者：**默认由 dispatcher 本机在隔离目录执行**（checkou
 | business-fail | outcome=failure；V7/V8 对**一致快照**的拒绝 | retriesUsed+1;超 node.retryBudget 则 FAILED,否则 RETRY_WAIT,retryAt = now + min(60·2^retriesUsed, 1800) + jitter（采样一次持久,重放不重掷） |
 | inconsistent-snapshot | V7/V8 拒,且候选来自 rescue 且闭包不完整/自相矛盾（Codex P2-2:rescue 逐文件暂存可得「新 result.json + 旧 patch」的混合版） | **不耗** retriesUsed;attempt 回 RUNNING 等一致快照（worker 冻结后的 milestone）;binding 全部截止仍无一致结果才转 transient-infra |
 | stale | V4/V5 拒绝（输入/计划已变——不是任务的错） | attempt 转 ABANDONED,**不耗** retriesUsed;节点随新绑定重新就绪,新 attempt 计入 job maxTotalAttempts |
-| permanent | V1/scope-violation 拒绝（结构坏——重跑同样坏）；冲突（§2.6）；预算尽 | 直接 FAILED |
+| permanent | **milestone 来源的** V1/scope-violation 拒绝（结构坏——重跑同样坏;rescue 来源按 inconsistent-snapshot 行,与 F11 一致——勘误 2026-10-03,T1 实现复审发现本行原文漏来源限定与 §4.2 分层/F11 矛盾,裁定记录于 brain-T1-pure-review-2026-10-03.md）；冲突（§2.6）；**retryBudget** 耗尽（勘误:job 预算不在此列,由 jobStatus 表达） | 直接 FAILED |
 
 三种预算彻底分开：allocation cap（每 ControlRecord 链 3 次 [F]）／node retryBudget（业务重试）／job 预算（总 attempt 数 + 墙钟 + 可选模型费）。successor 新记录不继承父记录 attemptCount（dispatch-step.ts:192 [F]）,所以 allocation cap 从来不是全局预算——全局停止条件只能由 job 预算承担。
 

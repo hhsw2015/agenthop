@@ -272,6 +272,20 @@ describe("Codex re-review fixes", () => {
     const r = validateResult(vin({ source: "rescue", cumulativeChangedPaths: ["out/report.md", "src/secret.ts"] }));
     expect(r.decision === "reject" && r.rule === "scope" && r.failureClass === "inconsistent-snapshot").toBe(true);
   });
+  test("R2 item 7 (catches M4): worker self-reports success (exitCode 0) but TRUSTED validation fails => reject V8", () => {
+    // The implement-level meta goal's acceptance is the original counterexample regression. V7 (the landing-spot doc
+    // exists) passing is not enough, and the worker's OWN evidence (outcome=success, validationEvidence exitCode 0) must
+    // NOT override the trusted validator: if acceptancePassed=false the candidate is rejected at V8. This is the two-layer
+    // rule — the first layer (worker self-report) is evidence only, never a conclusion.
+    const metaSpec = buildSpec({ acceptance: [{ check: "counterexample-regression", args: { probe: "P2-A" } }] });
+    const metaAtt = mkAttempt(metaSpec);
+    const claimedPass = resultJson({ outcome: "success", validationEvidence: [{ check: "counterexample-regression", exitCode: 0 }] }, metaAtt);
+    const notFixed = validateResult(vin({ attempt: metaAtt, attemptSpec: metaSpec, currentSpecDigest: metaSpec.specDigest, resultText: claimedPass, contract: { requiredOutputsPresent: true, patchAppliesClean: true }, acceptancePassed: false }));
+    expect(notFixed.decision === "reject" && notFixed.rule === "V8").toBe(true); // self-reported exit0 does NOT get accepted
+    // actually fixed + verified by the trusted validator:
+    const fixed = validateResult(vin({ attempt: metaAtt, attemptSpec: metaSpec, currentSpecDigest: metaSpec.specDigest, resultText: claimedPass, contract: { requiredOutputsPresent: true, patchAppliesClean: true }, acceptancePassed: true }));
+    expect(fixed.decision).toBe("accept");
+  });
   test("(d) sourceWriteScope violation is source-classed too", () => {
     const pspec = buildSpec({ outputContract: { requiredOutputs: [{ logicalName: "patch", kind: "patch" }], baseSourceCommit: "base1" }, sourceWriteScope: ["src/"] });
     const patt = mkAttempt(pspec);

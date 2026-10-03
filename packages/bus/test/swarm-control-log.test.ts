@@ -151,6 +151,23 @@ describe("supersede mutates the AcceptedResult, never replaces the entity (fe037
   });
 });
 
+describe("wait Change (team-collab §0b)", () => {
+  const wait = { waitId: "w1", kind: "approval" as const, subject: { jobId: "job", approvalRequestId: "ar1" }, state: "open" as const, deadlineSec: 100, owner: "disp", timeoutPolicy: "escalate" as const, decision: "pending" as const };
+  test("a wait Change keys to wait:<waitId> and projects", () => {
+    expect(entityKeyOf({ put: "wait", wait })).toBe("wait:w1");
+    const { state } = commit(initialLogState(), 0, [ch({ put: "wait", wait }, "op1")]);
+    expect(state.entities["wait:w1"]?.put).toBe("wait");
+    expect(state.revisions["wait:w1"]).toBe(1);
+  });
+  test("a state transition is a new revision on the same entity", () => {
+    let s = commit(initialLogState(), 0, [ch({ put: "wait", wait }, "op1")]).state;
+    s = commit(s, 1, [ch({ put: "wait", wait: { ...wait, state: "resolved", decision: "granted" } }, "op2", 1)]).state;
+    expect(s.revisions["wait:w1"]).toBe(2);
+    const body = s.entities["wait:w1"];
+    expect(body?.put === "wait" && body.wait.decision === "granted").toBe(true);
+  });
+});
+
 describe("reconcilePush (F17, §4.3 step B)", () => {
   test("same operation identities on-chain => advance (idempotent, whoever wrote it)", () => {
     const intended = [ch(scan("b1", null), "op1", 0), ch({ put: "intent", intent }, "op2", 0)];
