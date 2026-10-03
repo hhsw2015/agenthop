@@ -4,13 +4,13 @@ import { startLocalBus, type LocalBus } from "./broker.js";
 import { startRelay, type Relay } from "./relay.js";
 import { pushToHost } from "./push.js";
 import { startCodexDaemon, type CodexDaemon } from "./codex.js";
-import { resolvePeer, type UnifiedPeer } from "./resolve.js";
+import { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox } from "./inbox.js";
 
-export { resolvePeer, type UnifiedPeer } from "./resolve.js";
+export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 
 /**
  * The one thing the tools talk to. It joins two transports behind a single roster and a single
@@ -174,8 +174,13 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const relay: Relay | undefined = startRelay(self, (from, text) => handleInbound(from, text, "relay"), options);
 
   const unified = (): UnifiedPeer[] => {
+    // Collapse this machine's duplicate nodes for ONE session (startup presence daemon + lazily-spawned MCP node share
+    // a stableId) so resolve isn't ambiguous and the roster shows it once (dedupLocalPeers; delivery stays exactly-once
+    // via the atomic inbox + unicast DM). Then merge relay peers that aren't already present locally.
     const out = new Map<string, UnifiedPeer>();
-    for (const p of local.peers()) out.set(p.id, { id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid, status: p.status, statusSeq: p.statusSeq, statusText: p.statusText, statusAt: p.statusAt });
+    for (const p of dedupLocalPeers(local.peers().map((p) => ({ id: p.id, stableId: p.stableId, tool: p.tool, cwd: p.cwd, title: p.title, via: "local", pid: p.pid, status: p.status, statusSeq: p.statusSeq, statusText: p.statusText, statusAt: p.statusAt })))) {
+      out.set(p.id, p);
+    }
     if (relay) {
       for (const p of relay.roster()) if (!out.has(p.id)) out.set(p.id, p);
     }

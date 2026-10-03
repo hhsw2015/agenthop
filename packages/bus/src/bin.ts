@@ -85,6 +85,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (cmd === "presence") {
+    // The always-on bus node a SessionStart hook launches, so this session is on the bus FROM STARTUP (not only after
+    // it first uses an agenthop tool). Unlike `mcp`, it does NOT exit on stdin end — it lives until SIGTERM (SessionEnd)
+    // or its orphan guard fires. See presence.ts.
+    const { runPresence } = await import("./presence.js");
+    runPresence({});
+    return; // the bus node + keep-alive timer keep the process alive
+  }
+
   if (cmd === "--version" || cmd === "-v") {
     console.log(`agenthop v${version} (with session bus)`);
     return;

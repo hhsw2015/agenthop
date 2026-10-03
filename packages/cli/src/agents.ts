@@ -46,7 +46,13 @@ const agents: Agent[] = [
       } catch (error) {
         hooks = t(`status hooks not installed (${error instanceof Error ? error.message : String(error)}); add them by hand`, `状态 hook 没装上（${error instanceof Error ? error.message : String(error)}），手动加`);
       }
-      return `${mcp}; ${hooks}`;
+      let presence: string;
+      try {
+        presence = installClaudePresenceHooks(bin, home);
+      } catch (error) {
+        presence = t(`presence hooks not installed (${error instanceof Error ? error.message : String(error)}); add them by hand`, `presence hook 没装上（${error instanceof Error ? error.message : String(error)}），手动加`);
+      }
+      return `${mcp}; ${hooks}; ${presence}`;
     },
   },
   {
@@ -206,6 +212,62 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
   if (changed === 0) return t(`${file} already has agenthop status hooks; nothing changed`, `${file} 里已有 agenthop 状态 hook，没有改动`);
   placeJson(file, config);
   return t(`wrote ${changed} status hook change(s) to ${file}`, `已写 ${changed} 处状态 hook 改动到 ${file}`);
+}
+
+const HOOK_SENTINEL_PRESENCE = "agenthop-presence-hook";
+const PRESENCE_START_MARK = `# ${HOOK_SENTINEL_PRESENCE}:start`;
+const PRESENCE_END_MARK = `# ${HOOK_SENTINEL_PRESENCE}:end`;
+
+/**
+ * The SessionStart command that launches this session's always-on bus PRESENCE node (see presence.ts), so the session
+ * is findable + reachable on the bus FROM STARTUP — not only after it first calls an agenthop tool. Detached + started
+ * at most once (skipped if its pid is already alive); pid recorded so SessionEnd can stop it. setsid fully detaches on
+ * Linux; macOS has no setsid, where a plain background job in a non-interactive shell already survives the hook's exit.
+ * Side-effect-only (`|| true`, output suppressed) so it can never block or fail a turn.
+ */
+function presenceStartCommand(bin: string): string {
+  const q = shQuote(bin);
+  return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; else if command -v setsid >/dev/null 2>&1; then setsid ${q} presence </dev/null >/dev/null 2>&1 & else ${q} presence </dev/null >/dev/null 2>&1 & fi; echo \$! > "\$_pf"; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
+}
+
+/** The SessionEnd command that stops this session's presence node (by the recorded pid) and removes its pid file. */
+function presenceEndCommand(): string {
+  return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pf="\$HOME/.agenthop/presence/\$_sid.pid"; [ -f "\$_pf" ] && kill "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; rm -f "\$_pf"; fi >/dev/null 2>&1 || true ${PRESENCE_END_MARK}`;
+}
+
+/**
+ * Install Claude Code presence hooks: SessionStart(startup|resume)→launch the presence node, SessionEnd→stop it. This
+ * is what makes a Claude session appear on the bus the moment it starts (the MCP node alone is lazy — spawned only on
+ * first agenthop tool use). Idempotent (refreshes OUR command in place by a trailing sentinel; never touches a user's
+ * other hooks); preserves the rest of settings.json. Returns what changed.
+ */
+export function installClaudePresenceHooks(bin: string, home = homedir()): string {
+  const file = join(home, ".claude", "settings.json");
+  const config = readJsonConfig(file); // throws (file left alone) if present but not plain JSON
+  let changed = 0;
+  changed += mergePresenceHook(config, "SessionStart", presenceStartCommand(bin), PRESENCE_START_MARK, "startup|resume");
+  changed += mergePresenceHook(config, "SessionEnd", presenceEndCommand(), PRESENCE_END_MARK);
+  if (changed === 0) return t(`${file} already has agenthop presence hooks; nothing changed`, `${file} 里已有 agenthop presence hook，没有改动`);
+  placeJson(file, config);
+  return t(`wrote ${changed} presence hook change(s) to ${file}`, `已写 ${changed} 处 presence hook 改动到 ${file}`);
+}
+
+/** Merge ONE presence hook (a fixed command, not the per-state status builder) into an event, idempotently by its
+ *  trailing sentinel: refresh our command in place if it changed, keep the matcher in sync, else add our group. */
+function mergePresenceHook(config: Record<string, unknown>, event: string, command: string, mark: string, matcher?: string): number {
+  const hooks = (config.hooks ??= {}) as Record<string, unknown>;
+  const arr = (hooks[event] ??= []) as unknown[];
+  if (!Array.isArray(arr)) return 0; // unexpected shape — leave it alone
+  const ours = arr.find((g) => Array.isArray((g as { hooks?: unknown[] })?.hooks) && (g as { hooks: unknown[] }).hooks.some((h) => ownedBy((h as { command?: unknown })?.command, mark)));
+  if (ours) {
+    const group = ours as { matcher?: string; hooks: Array<{ command?: string }> };
+    let changed = 0;
+    for (const h of group.hooks) if (ownedBy(h.command, mark) && h.command !== command) { h.command = command; changed++; }
+    if (matcher !== undefined && group.matcher !== matcher && group.hooks.every((h) => ownedBy(h.command, mark))) { group.matcher = matcher; changed++; }
+    return changed;
+  }
+  arr.push({ ...(matcher ? { matcher } : {}), hooks: [{ type: "command", command, async: true }] });
+  return 1;
 }
 
 /**
