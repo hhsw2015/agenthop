@@ -124,7 +124,13 @@ function confirmChanges(w: WaitRecord, action: PendingAction, runs: Map<string, 
     case "reassign": {
       const closed = advanceWait(w, { type: "close", resolution: { outcome: "owner-dead", reason: `owner ${w.owner} unreachable → ${action.target}`, sourceOperationId: action.actionId } });
       if (!closed.ok) { ops.log(`sweep ${w.waitId}: close(owner-dead) rejected: ${closed.error}`); return null; }
-      const fresh = openWait({ waitId: ops.newWaitId(w.waitId), kind: w.kind, subject: w.subject, deadlineSec: ops.freshDeadlineSec(), owner: action.target, timeoutPolicy: w.timeoutPolicy });
+      // Carry the approval context (what needs deciding) to the successor — the new owner inherits the SAME request; only
+      // the decider changed. Dropping actionRef/paramsDigest/authority/reason would silently strip an approval (report
+      // conditional note). decision resets to pending via openWait (a fresh decider), which is correct.
+      const approvalCtx = w.kind === "approval"
+        ? { actionRef: w.actionRef, paramsDigest: w.paramsDigest, approvalAuthority: w.approvalAuthority, approvalReason: w.approvalReason }
+        : {};
+      const fresh = openWait({ waitId: ops.newWaitId(w.waitId), kind: w.kind, subject: w.subject, deadlineSec: ops.freshDeadlineSec(), owner: action.target, timeoutPolicy: w.timeoutPolicy, ...approvalCtx });
       return [{ put: "wait", wait: closed.wait }, { put: "wait", wait: fresh }];
     }
     case "move-validator": {

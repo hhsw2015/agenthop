@@ -125,6 +125,19 @@ describe("sweep scenario B — owner dead ⇒ reassign (close old + open new, sa
     await sweepPass(mkOps(stateRef, order, { isAlive: () => "dead", pickReassignee: () => null }));
     expect(order).toEqual([]);
   });
+  test("reassigning an APPROVAL wait carries the approval context to the successor (no silent strip)", async () => {
+    const appr = openWait({ waitId: "ap1", kind: "approval", subject: { jobId: "job" }, deadlineSec: 5000, owner: "claude:gone", timeoutPolicy: "escalate", actionRef: "act-ref", paramsDigest: "pd-123", approvalAuthority: "user", approvalReason: "needs human" });
+    const stateRef = { s: mkState([appr]) };
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { isAlive: () => "dead", pickReassignee: () => "claude:successor" }));
+    const live = liveWaits(stateRef.s);
+    expect(live).toHaveLength(1);
+    expect(live[0]!.owner).toBe("claude:successor");
+    expect(live[0]!.actionRef).toBe("act-ref");          // what needs deciding — carried
+    expect(live[0]!.paramsDigest).toBe("pd-123");
+    expect(live[0]!.approvalAuthority).toBe("user");
+    expect(live[0]!.decision).toBe("pending");            // fresh decider
+  });
 });
 
 describe("sweep scenario C — expired APPROVAL ⇒ escalation REOPENS, never resolves (§0b 终审②, safety red line)", () => {
