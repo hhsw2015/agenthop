@@ -272,17 +272,18 @@ describe("Codex re-review fixes", () => {
     const r = validateResult(vin({ source: "rescue", cumulativeChangedPaths: ["out/report.md", "src/secret.ts"] }));
     expect(r.decision === "reject" && r.rule === "scope" && r.failureClass === "inconsistent-snapshot").toBe(true);
   });
-  test("R2 item 7: a meta-job that wrote the landing-spot but did NOT fix the counterexample must NOT pass (V7 structural != V8 fixed)", () => {
+  test("R2 item 7 (catches M4): worker self-reports success (exitCode 0) but TRUSTED validation fails => reject V8", () => {
     // The implement-level meta goal's acceptance is the original counterexample regression. V7 (the landing-spot doc
-    // exists) passing is not enough — V8 (counterexample actually fixed) must pass too.
+    // exists) passing is not enough, and the worker's OWN evidence (outcome=success, validationEvidence exitCode 0) must
+    // NOT override the trusted validator: if acceptancePassed=false the candidate is rejected at V8. This is the two-layer
+    // rule — the first layer (worker self-report) is evidence only, never a conclusion.
     const metaSpec = buildSpec({ acceptance: [{ check: "counterexample-regression", args: { probe: "P2-A" } }] });
     const metaAtt = mkAttempt(metaSpec);
-    const metaResult = resultJson({ validationEvidence: [{ check: "counterexample-regression", exitCode: 1 }] }, metaAtt);
-    // landing spot written (requiredOutputsPresent=true) but counterexample still fails (acceptancePassed=false):
-    const notFixed = validateResult(vin({ attempt: metaAtt, attemptSpec: metaSpec, currentSpecDigest: metaSpec.specDigest, resultText: metaResult, contract: { requiredOutputsPresent: true, patchAppliesClean: true }, acceptancePassed: false }));
-    expect(notFixed.decision === "reject" && notFixed.rule === "V8").toBe(true); // not accepted => node not SUCCEEDED
-    // actually fixed + verified:
-    const fixed = validateResult(vin({ attempt: metaAtt, attemptSpec: metaSpec, currentSpecDigest: metaSpec.specDigest, resultText: metaResult, contract: { requiredOutputsPresent: true, patchAppliesClean: true }, acceptancePassed: true }));
+    const claimedPass = resultJson({ outcome: "success", validationEvidence: [{ check: "counterexample-regression", exitCode: 0 }] }, metaAtt);
+    const notFixed = validateResult(vin({ attempt: metaAtt, attemptSpec: metaSpec, currentSpecDigest: metaSpec.specDigest, resultText: claimedPass, contract: { requiredOutputsPresent: true, patchAppliesClean: true }, acceptancePassed: false }));
+    expect(notFixed.decision === "reject" && notFixed.rule === "V8").toBe(true); // self-reported exit0 does NOT get accepted
+    // actually fixed + verified by the trusted validator:
+    const fixed = validateResult(vin({ attempt: metaAtt, attemptSpec: metaSpec, currentSpecDigest: metaSpec.specDigest, resultText: claimedPass, contract: { requiredOutputsPresent: true, patchAppliesClean: true }, acceptancePassed: true }));
     expect(fixed.decision).toBe("accept");
   });
   test("(d) sourceWriteScope violation is source-classed too", () => {

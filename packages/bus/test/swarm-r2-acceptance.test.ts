@@ -1,96 +1,100 @@
-// R2 minimal-acceptance-set pure-layer pinning (team-collab §0b). Items 1/3/4/6 are covered by swarm-task-wait /
-// swarm-task-validation; this file adds the three that need a COMBINATION (control-log replay + wait, wait ordering):
-//   item 2 — a timeout action survives crashes around commit/IO and never multiplies into infinite new actions;
-//   item 5 — a long action on one wait does not block handling a shorter-deadline wait;
-//   (item 7 — meta-job "wrote the landing spot but didn't fix the counterexample" must NOT pass — in swarm-task-result.)
+// R2 minimal-acceptance pure-layer pinning (team-collab §0b). Items 1/3/4/6 are covered by swarm-task-wait /
+// swarm-task-validation. This file pins the crash-window and shared-log behaviours that the pure layer CAN prove.
+//
+// Honesty about layers (Codex 1cfa162 review): the FULL liveness guarantee needs a real persistence/action adapter and
+// the sweep's scheduler — those are the IO batch, not the pure layer. Specifically:
+//   - W1 (intent-persist fails / ACK unknown => zero action IO) and W4 (IO succeeded, action_done not yet durable =>
+//     recover by querying external evidence) need a persistence barrier + action adapter. NOT asserted here; they are
+//     explicitly the IO batch's job. Faking them in the pure layer would be a lie.
+//   - R2 item 5 (a slow action must not delay a shorter-deadline wait's handling) is a SCHEDULER property proved with
+//     virtual time in the sweep batch. Here we pin only the pure prerequisite it rests on: single-record independence
+//     in the shared log (one wait's pending action never evicts another from the projection).
+// What the pure layer DOES prove below: a committed intent survives a crash via replayLog with its FULL payload (W0/W2),
+// a durably-resolved action stays resolved after restart (W5), and re-submitting any committed op is a bounded replay
+// no-op (W6) — so recovery never loses an intent nor multiplies it into new actions.
 import { describe, expect, test } from "vitest";
-import { initialLogState, commit, replayLog, type Change, type ChangeBody, type CommittedBatch, type WaitRecord, type PendingAction } from "../src/swarm/control-log.js";
-import { openWait, advanceWait, type NewWait } from "../src/swarm/task-wait.js";
+import { initialLogState, commit, replayLog, type Change, type CommittedBatch, type WaitRecord } from "../src/swarm/control-log.js";
+import { openWait, advanceWait } from "../src/swarm/task-wait.js";
 
-function ch(body: ChangeBody, operationId: string, expectedEntityRevision = 0): Change {
-  return { ...body, operationId, expectedEntityRevision } as Change;
+const action = { actionId: "a1", actionKind: "bypass", target: "job/P/a1", expectedSubjectVersion: 7 };
+const w = (id = "w1"): WaitRecord => openWait({ waitId: id, kind: "wait", subject: { jobId: "job", attemptId: "job/P/a1" }, owner: "disp", deadlineSec: 100, timeoutPolicy: "bypass" });
+// Deterministic per-transition operationId (entityKey-style `#rev`), matching the IO-side convention — so a replayed
+// batch is a full no-op.
+function changes(wait: WaitRecord, n: number): Change[] {
+  return [{ put: "wait", wait, operationId: `wait:${wait.waitId}#${n}`, expectedEntityRevision: n - 1 } as Change];
 }
-function mkWait(p: Partial<NewWait> = {}): WaitRecord {
-  return openWait({ waitId: "w1", kind: "wait", subject: { jobId: "job", attemptId: "job/P/a1" }, deadlineSec: 100, owner: "disp", timeoutPolicy: "bypass", ...p });
+function doneLog(): CommittedBatch[] {
+  const open = w();
+  const pending = advanceWait(open, { type: "begin_action", pendingAction: action });
+  if (!pending.ok) throw new Error("begin");
+  const done = advanceWait(pending.wait, { type: "action_done", resolution: { outcome: "bypassed", reason: "confirmed", sourceOperationId: "a1" } });
+  if (!done.ok) throw new Error("done");
+  return [{ seq: 1, changes: changes(open, 1) }, { seq: 2, changes: changes(pending.wait, 2) }, { seq: 3, changes: changes(done.wait, 3) }];
 }
-const bypass: PendingAction = { actionId: "b1", actionKind: "bypass", target: "job/P/a1", expectedSubjectVersion: 1 };
-const res = { outcome: "bypassed", reason: "timeout", sourceOperationId: "op" };
+const waitBody = (s: ReturnType<typeof initialLogState>, key: string): WaitRecord => {
+  const b = s.entities[key];
+  if (!b || b.put !== "wait") throw new Error(`no wait at ${key}`);
+  return b.wait;
+};
 
-describe("R2 item 2: a timeout action survives crashes and never multiplies (control-log replay + wait)", () => {
-  test("intent committed before IO is recoverable, and re-submitting it is a no-op (not a new action)", () => {
-    const open = mkWait();
-    const b1: Change[] = [ch({ put: "wait", wait: open }, "wait:w1#1", 0)];
-    const s1 = commit(initialLogState(), 0, b1).state;
-
-    // open -> action_pending: CAS the recoverable intent BEFORE the IO.
-    const pending = advanceWait(open, { type: "begin_action", pendingAction: bypass });
+describe("R2 item 2 crash windows (pure layer: control-log replay + task-wait)", () => {
+  test("W0: recovery re-discovers an overdue open from the REPLAY-REBUILT entity, not a pre-crash object; begin is bounded", () => {
+    const open = w();
+    const rebuilt = replayLog([{ seq: 1, changes: changes(open, 1) }]); // crash before begin_action committed
+    expect(waitBody(rebuilt, "wait:w1").state).toBe("open");
+    const recovered = waitBody(rebuilt, "wait:w1"); // continue from the rebuilt entity
+    const pending = advanceWait(recovered, { type: "begin_action", pendingAction: action });
     expect(pending.ok).toBe(true);
-    const b2: Change[] = [ch({ put: "wait", wait: pending.ok ? pending.wait : open }, "wait:w1#2", 1)];
-    const s2 = commit(s1, 1, b2).state;
-
-    // CRASH after the intent commit, before the IO: recovery replays the log -> action is NOT lost.
-    const batches: CommittedBatch[] = [{ seq: 1, changes: b1 }, { seq: 2, changes: b2 }];
-    const rebuilt = replayLog(batches);
-    const body = rebuilt.entities["wait:w1"];
-    expect(body?.put === "wait" && body.wait.state === "action_pending" && body.wait.pendingAction?.actionId === "b1").toBe(true);
-
-    // Recovery re-submits the SAME begin_action op -> full replay no-op: seq unchanged, revision unchanged, NO new action.
-    const again = commit(rebuilt, 99, b2); // even a stale expectedSeq: replay precedes the seq check
-    expect(again.result).toEqual({ ok: true, newSeq: 2, replay: true });
-    expect(again.state.revisions["wait:w1"]).toBe(2);
-  });
-
-  test("crash BEFORE the intent commit -> re-detect -> begin ONCE (bounded, not infinite)", () => {
-    const open = mkWait();
-    const b1: Change[] = [ch({ put: "wait", wait: open }, "wait:w1#1", 0)];
-    // Only b1 landed (crash before begin_action committed): replay -> wait still open, intent not yet taken.
-    const rebuilt = replayLog([{ seq: 1, changes: b1 }]);
-    expect((rebuilt.entities["wait:w1"] as { wait: WaitRecord }).wait.state).toBe("open");
-    // Sweep re-detects the timeout and commits begin_action once.
-    const pending = advanceWait(open, { type: "begin_action", pendingAction: bypass });
-    const b2: Change[] = [ch({ put: "wait", wait: pending.ok ? pending.wait : open }, "wait:w1#2", 1)];
+    const b2 = changes(pending.ok ? pending.wait : recovered, 2);
     const first = commit(rebuilt, 1, b2);
-    expect(first.result.ok && !("replay" in first.result && false)).toBe(true);
-    // A double-submit during recovery is absorbed (replay), so it cannot become two/infinite actions.
-    const second = commit(first.state, 2, b2);
-    expect(second.result.ok === true && "replay" in second.result && second.result.replay === true).toBe(true);
+    expect(first.result.ok).toBe(true);
+    const again = commit(first.state, 2, b2); // recovery double-submit
+    expect(again.result.ok === true && "replay" in again.result && again.result.replay === true).toBe(true);
   });
 
-  test("crash BETWEEN begin_action and action_done -> recover in action_pending, still resolvable (nothing lost)", () => {
-    const open = mkWait();
-    const b1: Change[] = [ch({ put: "wait", wait: open }, "wait:w1#1", 0)];
-    const pending = advanceWait(open, { type: "begin_action", pendingAction: bypass });
-    const pendingWait = pending.ok ? pending.wait : open;
-    const b2: Change[] = [ch({ put: "wait", wait: pendingWait }, "wait:w1#2", 1)];
-    // action_done (b3) never committed (crash). Replay stops at action_pending.
-    const rebuilt = replayLog([{ seq: 1, changes: b1 }, { seq: 2, changes: b2 }]);
-    expect((rebuilt.entities["wait:w1"] as { wait: WaitRecord }).wait.state).toBe("action_pending");
-    // Recovery can still confirm from action_pending.
-    const done = advanceWait(pendingWait, { type: "action_done", resolution: res });
-    expect(done.ok && done.wait.state === "resolved").toBe(true);
+  test("W2 (catches M1): replay restores the FULL action payload (kind/target/version), not only actionId", () => {
+    const open = w();
+    const pending = advanceWait(open, { type: "begin_action", pendingAction: action });
+    expect(pending.ok).toBe(true);
+    const log = [{ seq: 1, changes: changes(open, 1) }, { seq: 2, changes: changes(pending.ok ? pending.wait : open, 2) }];
+    const rebuilt = replayLog(JSON.parse(JSON.stringify(log))); // durable round-trip, not in-memory objects
+    expect(waitBody(rebuilt, "wait:w1").pendingAction).toEqual(action);
+  });
+
+  test("W5 (catches M2): a durably-committed resolved batch is replayed; restart stays resolved", () => {
+    const log = doneLog();
+    let state = initialLogState();
+    for (const b of log) {
+      const c = commit(state, state.seq, b.changes);
+      expect(c.result.ok).toBe(true);
+      state = c.state;
+    }
+    const rebuilt = replayLog(JSON.parse(JSON.stringify(log)));
+    expect(rebuilt.entities["wait:w1"]).toEqual(state.entities["wait:w1"]); // replay projection == committed projection
+    expect(waitBody(rebuilt, "wait:w1").state).toBe("resolved");
+  });
+
+  test("W6: after resolved, re-submitting the completion op OR a late begin op is a no-op (terminal + revision unchanged)", () => {
+    const log = doneLog();
+    let state = initialLogState();
+    for (const b of log) state = commit(state, state.seq, b.changes).state;
+    const revBefore = state.revisions["wait:w1"];
+    const r3 = commit(state, 99, log[2]!.changes); // re-submit the completion op
+    expect(r3.result.ok === true && "replay" in r3.result && r3.result.replay === true).toBe(true);
+    expect(r3.state.revisions["wait:w1"]).toBe(revBefore);
+    const r2 = commit(state, 99, log[1]!.changes); // late re-submit of the begin op
+    expect(r2.result.ok === true && "replay" in r2.result && r2.result.replay === true).toBe(true);
+    expect(waitBody(r2.state, "wait:w1").state).toBe("resolved");
   });
 });
 
-describe("R2 item 5: a long action on one wait does not block a shorter-deadline wait", () => {
-  test("begin_action is not mutually exclusive; the short wait is handled while the long one sits action_pending", () => {
-    const wShort = mkWait({ waitId: "wShort", deadlineSec: 100 });
-    const wLong = mkWait({ waitId: "wLong", deadlineSec: 1000 });
-    const now = 150;
-    // deadline order: the short wait is due, the long one is not.
-    expect(now >= wShort.deadlineSec && now < wLong.deadlineSec).toBe(true);
-
-    // A long validation/IO action begins on wLong.
-    const longAction: PendingAction = { actionId: "long1", actionKind: "revalidate", target: "job/Q/a1", expectedSubjectVersion: 1 };
-    const longPending = advanceWait(wLong, { type: "begin_action", pendingAction: longAction });
-    expect(longPending.ok && longPending.wait.state === "action_pending").toBe(true);
-
-    // wShort is UNTOUCHED by the long action (immutability) and can be handled to completion independently.
-    expect(wShort.state).toBe("open");
-    const sp = advanceWait(wShort, { type: "begin_action", pendingAction: { ...bypass, actionId: "s1" } });
-    const sd = sp.ok ? advanceWait(sp.wait, { type: "action_done", resolution: res }) : { ok: false as const };
-    expect(sd.ok && sd.wait.state === "resolved").toBe(true);
-
-    // The long action is still in flight — it was neither forced nor did it block the short wait.
-    expect(longPending.ok && longPending.wait.state === "action_pending").toBe(true);
+describe("R2 item 5 is a scheduler property (sweep batch); here we pin only its pure prerequisite", () => {
+  test("single-record independence (catches M3): one wait's pending action does not evict another from the shared log", () => {
+    let s = commit(initialLogState(), 0, [...changes(w("short"), 1), ...changes(w("long"), 1)]).state;
+    const lp = advanceWait(w("long"), { type: "begin_action", pendingAction: { ...action, actionId: "long-action" } });
+    expect(lp.ok).toBe(true);
+    s = commit(s, 1, changes(lp.ok ? lp.wait : w("long"), 2)).state;
+    expect(waitBody(s, "wait:short").state).toBe("open"); // the short wait survives untouched
+    expect(waitBody(s, "wait:long").state).toBe("action_pending");
   });
 });
