@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
-import { commit, entityKeyOf, initialLogState, liveEntities, type ChangeBody, type LogState, type WaitRecord } from "../src/swarm/control-log.js";
+import { commit, entityKeyOf, initialLogState, liveEntities, type ChangeBody, type LogState, type WaitRecord, type ValidationRun } from "../src/swarm/control-log.js";
 import { openWait, isLive } from "../src/swarm/task-wait.js";
+import { openValidationRun } from "../src/swarm/task-validation.js";
 import { sweepPass, type SweepOps } from "../src/swarm/task-sweep.js";
 
 /**
@@ -29,15 +30,22 @@ function allWaits(state: LogState): WaitRecord[] {
   for (const b of Object.values(liveEntities(state))) if (b.put === "wait") out.push(b.wait);
   return out;
 }
+function allRuns(state: LogState): ValidationRun[] {
+  const out: ValidationRun[] = [];
+  for (const b of Object.values(liveEntities(state))) if (b.put === "validationRun") out.push(b.validationRun);
+  return out;
+}
 function mkOps(stateRef: { s: LogState }, order: string[], over: Partial<SweepOps> = {}): SweepOps {
   let n = 0;
   return {
     nowSec: () => 2000,
     loadState: () => stateRef.s,
-    commit: (state, bodies) => { order.push(`commit:${bodies.map((b) => b.put + ":" + ((b as { wait?: WaitRecord }).wait?.state ?? "")).join(",")}`); const r = stampCommit(state, bodies); stateRef.s = r.state; return r; },
+    commit: (state, bodies) => { order.push(`commit:${bodies.map((b) => b.put + ":" + ((b as { wait?: WaitRecord }).wait?.state ?? (b as { validationRun?: ValidationRun }).validationRun?.state ?? "")).join(",")}`); const r = stampCommit(state, bodies); stateRef.s = r.state; return r; },
     isAlive: () => "alive",
     pickReassignee: () => "claude:successor",
+    pickValidator: () => "codex:val2",
     newWaitId: (base) => `${base}/r${++n}`,
+    newValidationRunId: (base) => `${base}/g${++n}`,
     newActionId: () => `act${++n}`,
     freshDeadlineSec: () => 9999,
     doAction: async (_w, action) => { order.push(`doAction:${action.actionKind}`); return true; },
@@ -153,5 +161,71 @@ describe("sweep scenario C — expired APPROVAL ⇒ escalation REOPENS, never re
     const order: string[] = [];
     await sweepPass(mkOps(stateRef, order));
     expect(order).toEqual([]);
+  });
+});
+
+describe("sweep scenario D — RPV validation-wait: stuck/dead validator ⇒ moveValidator (same pinned candidate, gen+1)", () => {
+  const CAND = { observedResultId: "obs1", observedWorkCommit: "c0ffee", resultClosureDigest: "dig1" };
+  const vrun = (over: Partial<ValidationRun> = {}): ValidationRun =>
+    openValidationRun({ validationRunId: over.validationRunId ?? "vr1", attemptId: "att1", candidateRef: CAND, generation: over.generation ?? 0, validatorLocation: over.validatorLocation ?? "codex:val1", openedAtSeq: 1 });
+  const vwait = (over: { waitId?: string; deadlineSec?: number; owner?: string; timeoutPolicy?: WaitRecord["timeoutPolicy"]; validationRunId?: string } = {}): WaitRecord =>
+    openWait({ waitId: over.waitId ?? "vw1", kind: "wait", subject: { jobId: "job", attemptId: "att1", validationRunId: over.validationRunId ?? "vr1" }, deadlineSec: over.deadlineSec ?? 1000, owner: over.owner ?? "codex:val1", timeoutPolicy: over.timeoutPolicy ?? "escalate" });
+  const seed = (vr: ValidationRun, vw: WaitRecord) => ({ s: stampCommit(initialLogState(), [{ put: "validationRun", validationRun: vr }, { put: "wait", wait: vw }]).state });
+
+  test("expired RPV (validator alive but over deadline) ⇒ begin → notify → close old run+wait + open new gen run+wait (same batch)", async () => {
+    const stateRef = seed(vrun(), vwait({ deadlineSec: 1000 }));
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { isAlive: () => "alive", pickValidator: () => "codex:val2" }));
+    expect(order).toEqual(["commit:wait:action_pending", "doAction:move-validator", "commit:validationRun:closed,validationRun:running,wait:resolved,wait:open"]);
+    const runs = allRuns(stateRef.s);
+    expect(runs.find((r) => r.validationRunId === "vr1")!.state).toBe("closed");  // old run fenced (late verdict can't double-accept)
+    const next = runs.find((r) => r.validationRunId !== "vr1")!;
+    expect(next.generation).toBe(1);                                             // gen+1
+    expect(next.candidateRef).toEqual(CAND);                                     // PINNED — business is NOT re-run
+    expect(next.validatorLocation).toBe("codex:val2");
+    const live = liveWaits(stateRef.s);
+    expect(live).toHaveLength(1);                                                // old wait resolved, new open
+    expect(live[0]!.owner).toBe("codex:val2");
+    expect(live[0]!.subject.validationRunId).toBe(next.validationRunId);
+  });
+
+  test("dead validator (regardless of deadline) ⇒ moveValidator, NOT the owner-reassign path", async () => {
+    const stateRef = seed(vrun(), vwait({ deadlineSec: 5000 })); // not even expired
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { isAlive: () => "dead", pickValidator: () => "codex:val2" }));
+    expect(order).toContain("doAction:move-validator");
+    expect(order).not.toContain("doAction:reassign");          // a validation-wait never takes the owner-reassign branch
+    expect(allRuns(stateRef.s).find((r) => r.validationRunId !== "vr1")!.generation).toBe(1);
+  });
+
+  test("no replacement validator (pickValidator null) ⇒ left for escalation (no change)", async () => {
+    const stateRef = seed(vrun(), vwait({ deadlineSec: 1000 }));
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { pickValidator: () => null }));
+    expect(order).toEqual([]);
+    expect(allRuns(stateRef.s).find((r) => r.validationRunId === "vr1")!.state).toBe("running"); // untouched
+  });
+
+  test("validator alive + within deadline ⇒ untouched (not moved)", async () => {
+    const stateRef = seed(vrun(), vwait({ deadlineSec: 5000 }));
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { isAlive: () => "alive", pickValidator: () => "codex:val2" }));
+    expect(order).toEqual([]);
+  });
+
+  test("single 'suspected' validator ⇒ not convicted (no move; a weak predicate never fences a candidate)", async () => {
+    const stateRef = seed(vrun(), vwait({ deadlineSec: 1000 }));
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { isAlive: () => "suspected", pickValidator: () => "codex:val2" }));
+    expect(order).toEqual([]);
+  });
+
+  test("notify unconfirmed ⇒ held in action_pending, old run NOT yet superseded (CAS strictly before the move)", async () => {
+    const stateRef = seed(vrun(), vwait({ deadlineSec: 1000 }));
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { pickValidator: () => "codex:val2", doAction: async (_w, a) => { order.push(`doAction:${a.actionKind}`); return false; } }));
+    expect(order).toEqual(["commit:wait:action_pending", "doAction:move-validator"]);
+    expect(allRuns(stateRef.s).find((r) => r.validationRunId === "vr1")!.state).toBe("running"); // not fenced until IO confirmed
+    expect(liveWaits(stateRef.s)[0]!.state).toBe("action_pending");
   });
 });

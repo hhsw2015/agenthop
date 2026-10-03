@@ -17,8 +17,9 @@
  * known defects, §4); a SINGLE "suspected" is NOT dead (only a trustworthy "dead" reassigns).
  */
 
-import { liveEntities, type WaitRecord, type PendingAction, type LogState, type ChangeBody, type CommitResult } from "./control-log.js";
+import { liveEntities, type WaitRecord, type PendingAction, type LogState, type ChangeBody, type CommitResult, type ValidationRun } from "./control-log.js";
 import { advanceWait, openWait, isLive } from "./task-wait.js";
+import { moveValidator } from "./task-validation.js";
 
 export type Liveness = "alive" | "suspected" | "dead";
 
@@ -31,7 +32,11 @@ export type SweepOps = {
   isAlive: (memberId: string) => Liveness;
   /** An idle same-role successor for a dead owner's wait; null = none available ⇒ don't reassign (leave for escalation). */
   pickReassignee: (wait: WaitRecord) => string | null;
+  /** A fresh validator execution location for a stuck/dead RPV validator; null = none ⇒ leave for escalation (v1, same
+   *  convention as pickReassignee — the real picker needs the validator roster, owned by bus-identity). */
+  pickValidator: (wait: WaitRecord, run: ValidationRun) => string | null;
   newWaitId: (base: string) => string;
+  newValidationRunId: (base: string) => string;
   newActionId: () => string;
   /** Deadline for a freshly reassigned wait. */
   freshDeadlineSec: () => number;
@@ -46,12 +51,51 @@ const subjectTarget = (w: WaitRecord): string => w.subject.attemptId ?? w.subjec
 export async function sweepPass(ops: SweepOps): Promise<void> {
   let state = ops.loadState();
   const waits: WaitRecord[] = [];
-  for (const body of Object.values(liveEntities(state))) if (body.put === "wait") waits.push(body.wait);
+  const runs = new Map<string, ValidationRun>();
+  for (const body of Object.values(liveEntities(state))) {
+    if (body.put === "wait") waits.push(body.wait);
+    else if (body.put === "validationRun") runs.set(body.validationRun.validationRunId, body.validationRun);
+  }
 
   for (const w of waits) {
     if (!isLive(w)) continue;                     // resolved — nothing to supervise
     if (w.state === "action_pending") continue;   // an action is already in flight (begin committed) — bounded delay: skip re-begin
     const live = ops.isAlive(w.owner);
+
+    // Rule — RPV validation-wait (subject.validationRunId set) ⇒ moveValidator (§0b RPV / P2-2). A validation-wait tracks a
+    // stuck validator seat, not a normal owner: a validator that is DEAD (gone) or ALIVE-but-past-deadline (env broke /
+    // too slow) is replaced by opening a fresh run+wait at a new location over the SAME pinned candidate — business is
+    // NEVER re-run, and the old generation's late verdict is fenced. This is NOT bypass (never auto-accepts a candidate)
+    // and NOT owner-reassign (that keeps the same subject). A single "suspected" is not convicted; pickValidator v1 may
+    // return null ⇒ defer to escalation. The validation-wait's deadline is the recoverable absolute clock (anchor (b)).
+    if (w.subject.validationRunId !== undefined) {
+      if (live === "suspected") continue;
+      if (live === "alive" && ops.nowSec() < w.deadlineSec) continue; // validator working within deadline — leave it
+      const run = runs.get(w.subject.validationRunId);
+      if (!run) { ops.log(`sweep ${w.waitId}: validation-wait references unknown run ${w.subject.validationRunId} — skipping`); continue; }
+      const to = ops.pickValidator(w, run);
+      if (to === null) { ops.log(`sweep ${w.waitId}: validator ${run.validatorLocation} stuck/dead, no replacement — leaving for escalation`); continue; }
+      const action: PendingAction = { actionId: ops.newActionId(), actionKind: "move-validator", target: run.validationRunId, expectedSubjectVersion: run.generation };
+      const begun = advanceWait(w, { type: "begin_action", pendingAction: action });
+      if (!begun.ok) { ops.log(`sweep ${w.waitId}: begin move-validator rejected: ${begun.error}`); continue; }
+      state = ops.commit(state, [{ put: "wait", wait: begun.wait }]).state;            // CAS: open → action_pending (BEFORE IO)
+      const delivered = await ops.doAction(begun.wait, action);                        // IO: notify the new validator seat (R5)
+      if (!delivered) { ops.log(`sweep ${w.waitId}: move-validator notify unconfirmed — holding action_pending, retry next tick`); continue; }
+      const atSeq = state.seq + 1;                                                     // the batch seq the moved run/wait commit at
+      const moved = moveValidator(run, { validationRunId: ops.newValidationRunId(run.validationRunId), validatorLocation: to, openedAtSeq: atSeq, atSeq });
+      if ("error" in moved) { ops.log(`sweep ${w.waitId}: moveValidator rejected: ${moved.error}`); continue; }
+      const closedWait = advanceWait(begun.wait, { type: "close", resolution: { outcome: "validator-moved", reason: `validator ${run.validatorLocation} stuck/dead → ${to}`, sourceOperationId: action.actionId } });
+      if (!closedWait.ok) { ops.log(`sweep ${w.waitId}: close(validator-moved) rejected: ${closedWait.error}`); continue; }
+      const freshWait = openWait({ waitId: ops.newWaitId(w.waitId), kind: w.kind, subject: { ...w.subject, validationRunId: moved.next.validationRunId }, deadlineSec: ops.freshDeadlineSec(), owner: to, timeoutPolicy: w.timeoutPolicy });
+      state = ops.commit(state, [
+        { put: "validationRun", validationRun: moved.closedOld },  // old run → closed (fences its late verdict)
+        { put: "validationRun", validationRun: moved.next },       // new run, gen+1, SAME pinned candidate
+        { put: "wait", wait: closedWait.wait },                    // old validation-wait resolved
+        { put: "wait", wait: freshWait },                          // new validation-wait for the new run, same batch
+      ]).state;
+      ops.log(`sweep ${w.waitId}: RPV stuck ⇒ moveValidator ${run.validatorLocation} → ${to} (run ${run.validationRunId}→${moved.next.validationRunId} gen ${moved.next.generation}, new wait ${freshWait.waitId})`);
+      continue;
+    }
 
     // Rule — owner DEAD ⇒ reassign (close old + open new, same batch), regardless of deadline (R5 / scenario B). A single
     // "suspected" is NOT dead (fe0376cd §4): we leave it. "alive" falls through to the expiry check.
