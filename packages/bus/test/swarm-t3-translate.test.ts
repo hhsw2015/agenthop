@@ -125,9 +125,10 @@ describe("R4 decision table (two orthogonal axes + 3-state risk, c790ff1d)", () 
     expect(r.outcome === "loadable" && designOf(r) !== undefined).toBe(true);
   });
   test("broad scope fans out to nested domains/frozen (not read as a single point)", () => {
+    // single covering role so the role resolves cleanly and the outcome isolates the OWNER fan-out -> design
     const wide = fc({
       ownerDomainPolicy: { version: "w", ownerByPrefix: [{ prefix: "src/", domain: "core" }, { prefix: "src/io/", domain: "io" }], frozenScopePrefixes: ["src/protocol/"] },
-      roleCatalog: { version: "wr", roles: { core: { floor: "standard", fileDomain: ["src/"] }, io: { floor: "standard", fileDomain: ["src/io/"] } } },
+      roleCatalog: { version: "wr", roles: { fullstack: { floor: "standard", fileDomain: ["src/"] } } },
     });
     const r = translateDraft(draft([task({ sourceWriteScope: ["src/"] })]), wide);
     expect(r.outcome === "loadable" && designOf(r) !== undefined).toBe(true); // touches core+io (2) AND frozen
@@ -172,10 +173,18 @@ describe("R4 decision table (two orthogonal axes + 3-state risk, c790ff1d)", () 
   test("seam#1: a broad scope over partially-mapped area flags unknown ownership -> design", () => {
     const partial = fc({
       ownerDomainPolicy: { version: "p", ownerByPrefix: [{ prefix: "src/known/", domain: "core" }], frozenScopePrefixes: [] },
-      roleCatalog: { version: "r", roles: { core: { floor: "standard", fileDomain: ["src/known/"] } } },
+      roleCatalog: { version: "r", roles: { core: { floor: "standard", fileDomain: ["src/"] } } }, // covering role -> resolves; isolates owner behavior
     });
     const r = translateDraft(draft([task({ sourceWriteScope: ["src/"] })]), partial); // src/ touches src/known/ (core) AND unmapped area
     expect(r.outcome === "loadable" && designOf(r) !== undefined).toBe(true);
+  });
+  test("3b corrected: an unresolved role is needsRole EVEN WHEN design is required (gate does not backfill the role)", () => {
+    const wide = fc({
+      ownerDomainPolicy: { version: "w", ownerByPrefix: [{ prefix: "src/", domain: "core" }, { prefix: "src/io/", domain: "io" }], frozenScopePrefixes: [] },
+      roleCatalog: { version: "wr", roles: { core: { floor: "standard", fileDomain: ["src/"] }, io: { floor: "standard", fileDomain: ["src/io/"] } } },
+    });
+    // scope src/ spans core+io -> designRequired, AND spans role subdomains -> role ambiguous -> needsRole wins (not loadable+design)
+    expect(translateDraft(draft([task({ sourceWriteScope: ["src/"] })]), wide).outcome).toBe("needsRole");
   });
   test("seam#2: a broad scope hitting BOTH irreversible and undecidable keeps the unknown fact", () => {
     const both = fc({

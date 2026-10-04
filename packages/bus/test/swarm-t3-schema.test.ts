@@ -90,6 +90,18 @@ describe("F-T3-2 identity classification: role annotations OUT of specDigest, co
     expect(computeSpecDigest(fullSpec({ criticalPath: true }))).toBe(computeSpecDigest(fullSpec({ criticalPath: false })));
     expect(computeSpecDigest(fullSpec({ criticalPath: true }))).toBe(computeSpecDigest(fullSpec()));
   });
+  test("① criticalPath bool round-trips through loadPlan (preserved, non-bool rejected)", () => {
+    const r = loadPlan(plan([raw({ criticalPath: true })]));
+    expect(r.ok && r.plan.nodes[0]!.criticalPath === true).toBe(true);
+    expect(loadPlan(plan([raw({ criticalPath: "yes" })])).ok).toBe(false);
+  });
+  test("③ flipping criticalPath on a known-risk node: specDigest unchanged, planDigest changed", () => {
+    const a = loadPlan(plan([raw({ nodeId: "M", criticalPath: false })]));
+    const b = loadPlan(plan([raw({ nodeId: "M", criticalPath: true })]));
+    if (!a.ok || !b.ok) throw new Error("expected ok");
+    expect(a.plan.nodes[0]!.specDigest).toBe(b.plan.nodes[0]!.specDigest);
+    expect(a.plan.planDigest).not.toBe(b.plan.planDigest);
+  });
 });
 
 describe("managed-t3 critical∧unknown rejection (errata 0b966a11): loader re-verifies the clarify branch", () => {
@@ -103,6 +115,17 @@ describe("managed-t3 critical∧unknown rejection (errata 0b966a11): loader re-v
     const opts = { mode: "managed-t3" as const, ownerDomainPolicy: { version: "op1", ownerByPrefix: [], frozenScopePrefixes: [] }, riskPolicy: { version: "rp1", irreversiblePrefixes: [], undecidablePrefixes: ["experimental/"] }, expectedFrozenRefs: refs };
     const r = loadPlan(p, opts);
     expect(r.ok === false && /criticalPath|needsClarification/.test(r.reason)).toBe(true);
+  });
+  test("② same unknown-risk node: criticalPath false -> loadable, true -> rejected; field preserved either way", () => {
+    const opts = { mode: "managed-t3" as const, ownerDomainPolicy: { version: "op1", ownerByPrefix: [], frozenScopePrefixes: [] }, riskPolicy: { version: "rp1", irreversiblePrefixes: [], undecidablePrefixes: ["experimental/"] }, expectedFrozenRefs: refs };
+    const mD = computeSpecDigest(fullSpec({ nodeId: "M", dependsOn: ["design-gate"], sourceWriteScope: ["experimental/x.ts"] })); // criticalPath excluded -> same digest for false/true
+    const mk = (critical: boolean) => loadPlan(plan([
+      raw({ nodeId: "design-gate", kind: "design", dependsOn: [], coveredSpecDigests: [mD] }),
+      raw({ nodeId: "M", dependsOn: ["design-gate"], sourceWriteScope: ["experimental/x.ts"], criticalPath: critical }),
+    ], { frozenRefs: refs }), opts);
+    const falsey = mk(false);
+    expect(falsey.ok && falsey.plan.nodes.find((n) => n.nodeId === "M")!.criticalPath === false).toBe(true); // loadable + field preserved
+    expect(mk(true).ok).toBe(false); // flipping to true -> loader rejects (should be needsClarification)
   });
 });
 

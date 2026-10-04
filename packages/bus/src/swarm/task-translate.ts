@@ -162,7 +162,7 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
   if (!(typeof bp.maxModelUsd === "number" && Number.isFinite(bp.maxModelUsd) && bp.maxModelUsd > 0)) return R(`budget maxModelUsd cap must be a finite positive number (policy ${bp.version})`);
 
   const missingRoles: string[] = []; // hallucinated explicit roles -> always needsRole
-  const unresolvedInferredRoleNodes: string[] = []; // ambiguous/no-role inference -> needsRole ONLY if not design-gated
+  const unresolvedInferredRoleNodes: string[] = []; // ambiguous/no-role inference -> ALWAYS needsRole (a design gate does not backfill a role; reviewer 3b)
   const nodes: TaskSpec[] = [];
   const criticalNodeIds = new Set<string>();
   let complexitySum = 0;
@@ -292,9 +292,10 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
     }
     return { outcome: "needsClarification", reason: "unknown risk on a requester-critical node — reversibility must be answered before planning", questions };
   }
-  // Role blockers: hallucinated explicit roles ALWAYS block; an unresolved inferred role blocks only when no design gate
-  // will cover the node (if R4 gates it, the design review sorts the role).
-  const roleBlockers = [...missingRoles, ...(assess.designRequired ? [] : unresolvedInferredRoleNodes.map((id) => `no unique role for node ${id}`))];
+  // Role blockers: ALWAYS needsRole for any unresolved role (hallucinated explicit, or ambiguous/no-role inference). A
+  // design gate reviews the approach; its verdict does NOT backfill M's roleProfile/floor, and T3a has no role-resolution
+  // /continuation step — so an impl node with no resolved role is never executable, gate or not (reviewer 3b).
+  const roleBlockers = [...missingRoles, ...unresolvedInferredRoleNodes.map((id) => `no unique role for node ${id}`)];
   if (roleBlockers.length > 0) return { outcome: "needsRole", missingRoles: [...new Set(roleBlockers)], reason: `unresolved role(s) (catalog ${fc.roleCatalog.version}): ${[...new Set(roleBlockers)].join("; ")}` };
 
   let allNodes = nodes;
