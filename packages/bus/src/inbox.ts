@@ -9,7 +9,7 @@
  * Concurrency: a drainer CLAIMS a message by atomically renaming its file, delivers, then ACKs (removes) on success or
  * RELEASES (renames back) on failure — so the retry timer and an explicit recv never deliver the same message twice.
  */
-import { appendFileSync, existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 
@@ -70,11 +70,13 @@ export function quarantineInbox(home: string, claimedFile: string, reason: strin
     // deliverable .json set; recoverStaleClaims + the next claim re-attempt the quarantine. Never throw (don't kill flush).
     // ENOENT is AMBIGUOUS (review bb6dad5-P2-4-A): linkSync raises it both when the SOURCE is gone (truly "vanished") AND
     // when the destination quarantine/ dir was removed between mkdir and link while the source .claim-<pid> is fully
-    // present. errno alone can't tell them apart — so only "vanished" when the source is REALLY gone; otherwise the move
+    // present. errno alone can't tell them apart — so only "vanished" when the source is CONFIRMED gone; otherwise the move
     // failed with the source still in hand and the caller MUST release it (reporting "vanished" would skip recovery and
-    // strand a live-pid claim, re-opening P2-4).
-    if ((e as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(claimedFile)) return "vanished";
-    return "failed"; // FS err (or ENOENT with source still present) ⇒ caller releases to retry (P2-2/P2-4-A)
+    // strand a live-pid claim, re-opening P2-4). The re-check MUST preserve the errno class (review 6c4c33a-P2): existsSync
+    // folds a query failure (EACCES on the source dir's search bit, EIO, ...) into `false`, which would mislabel an
+    // unconfirmable source as "vanished" and drop the retry obligation — only a definite ENOENT from lstat is "gone".
+    if ((e as NodeJS.ErrnoException).code === "ENOENT" && sourceConfirmedGone(claimedFile)) return "vanished";
+    return "failed"; // FS err, or an ENOENT whose source is present/unconfirmable ⇒ caller releases to retry (P2-2/P2-4-A, 6c4c33a-P2)
   }
   // The file is REALLY quarantined now ⇒ record the dead-letter audit line. Best-effort: if the append fails the bytes are
   // still safely preserved in quarantine/ (the durable evidence), so a lost audit line never risks re-delivery or a crash.
@@ -191,6 +193,15 @@ export function recoverStaleClaims(home: string, keys: string[]): void {
       try { renameSync(path.join(dir, n), path.join(dir, n.replace(/\.claim-\d+$/, ""))); } catch { /* best-effort */ }
     }
   }
+}
+
+/** True ONLY when the source is CONFIRMED gone (a definite ENOENT from lstat). A present file ⇒ false; any other errno
+ *  (EACCES on the dir's search bit, EIO, ...) ⇒ "can't confirm" ⇒ false, so the caller keeps the retry obligation instead
+ *  of treating an unverifiable source as vanished (review 6c4c33a-P2). lstat (not stat) so a broken symlink still counts as
+ *  present, and no following into a dir we may not be able to traverse. */
+function sourceConfirmedGone(file: string): boolean {
+  try { lstatSync(file); return false; } // source present -> not gone
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT"; } // only a definite ENOENT = gone; EACCES/EIO = unconfirmable = NOT gone
 }
 
 /** True while the pid is a running process — including one we may not signal (EPERM). */
