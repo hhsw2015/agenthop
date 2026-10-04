@@ -31,7 +31,9 @@ import { jobStatus, currentAccepted, type SchedInput, type JobUsage } from "./ta
 export const PROJECTION_SCHEMA_VERSION = 1;
 
 export type ProjectionFile = { relPath: string; json: unknown };
-export type ProjectOpts = { nowSec: number; jobStartSec?: (jobId: string) => number | undefined };
+/** livenessVerdict (cluster-liveness §1d): the INV-1 verdict (OK|UNVERIFIABLE|STALL) the dispatcher computes per tick, surfaced
+ *  in meta.json so viz renders a STALL red. Opaque here (the kernel owns its shape); absent until the first tick computes it. */
+export type ProjectOpts = { nowSec: number; jobStartSec?: (jobId: string) => number | undefined; livenessVerdict?: unknown };
 
 const HISTORY_MAX = 8;   // Open question 1: last 8 attempts + count.
 const OBSERVED_MAX = 8;  // §8b observed[]: recent N per attempt.
@@ -91,7 +93,7 @@ function attemptView(a: TaskAttempt) {
 /** Build every projection file for the current control-log state. Pure; the caller writes them atomically. */
 export function buildProjectionFiles(state: LogState, opts: ProjectOpts): ProjectionFile[] {
   const out: ProjectionFile[] = [];
-  out.push({ relPath: "meta.json", json: { schemaVersion: PROJECTION_SCHEMA_VERSION, lastAppliedSeq: state.seq, rebuiltAt: new Date(opts.nowSec * 1000).toISOString() } });
+  out.push({ relPath: "meta.json", json: { schemaVersion: PROJECTION_SCHEMA_VERSION, lastAppliedSeq: state.seq, rebuiltAt: new Date(opts.nowSec * 1000).toISOString(), ...(opts.livenessVerdict !== undefined ? { livenessVerdict: opts.livenessVerdict } : {}) } });
   // members.json — empty placeholder (v1): the durable roster is the bus peers() view, not control-log data; viz merges it
   // (schema §6). NOT written by the dispatcher from a roster in this batch; do not read this as "the roster is wired".
   out.push({ relPath: "members.json", json: { members: [] as unknown[] } });

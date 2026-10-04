@@ -207,6 +207,14 @@ describe("projection review fixes", () => {
     expect(JSON.parse(readFileSync(path.join(root, "members.json"), "utf8"))).toMatchObject({ members: [] }); // real file written
   });
 
+  test("L1b: meta.json carries livenessVerdict when provided, omits it otherwise (§1d)", () => {
+    let s = initialLogState(); s = stamp(s, [planBody(plan1())]);
+    const withV = byPath(buildProjectionFiles(s, { nowSec: 1000, livenessVerdict: { verdict: "STALL", why: "no holder" } }), "meta.json");
+    expect(withV.livenessVerdict).toMatchObject({ verdict: "STALL" });
+    const without = byPath(buildProjectionFiles(s, { nowSec: 1000 }), "meta.json");
+    expect("livenessVerdict" in without).toBe(false);
+  });
+
   test("re-review P2b: a waitId containing '/' is projected under a percent-encoded flat filename (not dropped)", () => {
     const w: WaitRecord = { waitId: "w/r-123abc", kind: "wait", subject: { jobId: "j" }, state: "open", deadlineSec: 5000, owner: "claude:owner", timeoutPolicy: "escalate" };
     let s = initialLogState(); s = stamp(s, [{ put: "wait", wait: w }]);

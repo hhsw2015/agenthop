@@ -42,6 +42,8 @@ import { validSeedWait } from "../packages/bus/src/swarm/wait-seed.js";
 import { runDispatchLoops } from "../packages/bus/src/swarm/dispatch-loops.js";
 import { writeProjection } from "../packages/bus/src/swarm/projection.js";
 import { beatStart, beatEnd } from "../packages/bus/src/swarm/heartbeat.js";
+import { buildControlCut, heartbeatObservations } from "../packages/bus/src/swarm/liveness-review.js";
+import { assertLiveness } from "../packages/bus/src/swarm/task-liveness-inv1.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
@@ -79,6 +81,8 @@ const CONTROL_LOG_DIR = path.join(HOME, ".agenthop", "swarm", "control-log");
 const PROJECTION_DIR = path.join(HOME, ".agenthop", "swarm", "projection");
 // Per-loop dispatcher heartbeat (cluster-liveness L1 subset); each loop records its own tick independently (fail-soft).
 const HEARTBEAT_FILE = path.join(HOME, ".agenthop", "swarm", "heartbeat.json");
+// How long a heartbeat sample is treated as fresh (INV-1 observation window). A loop ticks ~every 5s; a gap beyond this ⇒ stale ⇒ UNVERIFIABLE.
+const LIVENESS_WINDOW_SEC = Number(process.env.SWARM_LIVENESS_WINDOW_SEC || "120");
 const PLAN_FILE = process.env.SWARM_PLAN || "";
 const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
@@ -550,9 +554,21 @@ async function main(): Promise<void> {
       await pass(records, ops);
       if (plan && taskOn && taskOps) { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
       // P2-1 catch-up refresh: rewrite the projection every tick (not only on commit) so a failed projection write retries
-      // and now-dependent judgments (wall-clock jobStatus/budget) stay current WITHOUT needing a new business commit. Fail-soft.
-      try { writeProjection(PROJECTION_DIR, loadControlLog(CONTROL_LOG_DIR), { nowSec: nowSec(), jobStartSec }); }
-      catch (e) { log(`projection refresh failed: ${e instanceof Error ? e.message : e}`); }
+      // and now-dependent judgments (wall-clock jobStatus/budget) stay current WITHOUT needing a new business commit. Also
+      // computes the INV-1 livenessVerdict (L1b) from the current cut + heartbeat and surfaces it in projection meta (§1d).
+      try {
+        const st = loadControlLog(CONTROL_LOG_DIR);
+        let livenessVerdict: unknown;
+        if (plan) {
+          try {
+            const hb = JSON.parse(readFileSync(HEARTBEAT_FILE, "utf8"));
+            const cut = buildControlCut(plan, st, nowSec(), { jobStartSec: jobStartSec(plan.jobId) });
+            const obs = heartbeatObservations(hb, LIVENESS_WINDOW_SEC);
+            livenessVerdict = assertLiveness({ controlCut: cut, observations: obs, modes: { sweepOn: SWEEP_ENABLED, taskExecOn: taskOn, passInstance: SELF, sweepInstance: SELF } }, nowSec());
+          } catch { /* no heartbeat yet / parse error ⇒ omit the verdict this tick (viz shows unknown), filled next tick */ }
+        }
+        writeProjection(PROJECTION_DIR, st, { nowSec: nowSec(), jobStartSec, livenessVerdict });
+      } catch (e) { log(`projection refresh failed: ${e instanceof Error ? e.message : e}`); }
     },
     // The liveness sweep (§0b R2) — scan durable waits + member liveness, auto-handle expired waits (ping/escalate/re-arm)
     // + dead owners (reassign) + stuck validators (move). The coordinator-replacement step; gated on SWARM_SWEEP.
