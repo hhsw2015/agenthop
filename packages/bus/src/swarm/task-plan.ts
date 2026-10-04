@@ -17,7 +17,7 @@
  */
 
 import { digestOf } from "./digest.js";
-import { evaluateR4, type OwnerDomainPolicy, type RiskPolicy } from "./task-r4.js";
+import { evaluateR4, overlapsAny, type OwnerDomainPolicy, type RiskPolicy } from "./task-r4.js";
 
 // "design" (team-collab §0b R4): an adversarial-review GATE node a planner auto-prepends for a high-stakes change —
 // kind IS task identity (in specDigest), so it is a first-class kind, not a role annotation.
@@ -77,8 +77,13 @@ export type TaskSpec = {
    *  mapping is part of the design task's IDENTITY (changing what it must cover changes the task; design D / P2-3).
    *  Only meaningful on a kind=design node; absent elsewhere. */
   coveredSpecDigests?: string[];
+  /** Requester-declared criticality (T3 c790ff1d / errata 0b966a11): a critical node makes unknown-risk worth ASKING.
+   *  Annotation class — EXCLUDED from specDigest (a dispatch/supervision attribute, not task identity; same family as
+   *  modelTier/roleProfile), kept in planDigest. Persisted so the managed loader can re-verify the unknown∧critical ->
+   *  needsClarification decision instead of trusting the planner. */
+  criticalPath?: boolean;
   /** canonical-JSON SHA-256 of the TASK IDENTITY fields — everything EXCEPT specDigest and the role annotations
-   *  required/runtime/visibility/modelTier/roleProfile (coveredSpecDigests stays IN: it is identity). Set by loadPlan. */
+   *  required/runtime/visibility/modelTier/roleProfile/criticalPath (coveredSpecDigests stays IN: it is identity). */
   specDigest: string;
 };
 
@@ -135,7 +140,7 @@ const VISIBILITIES: ReadonlySet<string> = new Set(["visible", "headless"]);
  *  retagged required/durable/visible/retiered/restaffed (§4.2 V5; fe0376cd review #2; T3 F-T3-2). coveredSpecDigests
  *  is NOT excluded — a design node's coverage set is part of its identity. */
 export function computeSpecDigest(spec: TaskSpec): string {
-  const { specDigest: _d, required: _r, runtime: _rt, visibility: _v, modelTier: _mt, roleProfile: _rp, ...identity } = spec;
+  const { specDigest: _d, required: _r, runtime: _rt, visibility: _v, modelTier: _mt, roleProfile: _rp, criticalPath: _cp, ...identity } = spec;
   return digestOf(identity);
 }
 
@@ -198,6 +203,7 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
   if (o.modelTier !== undefined && (!isString(o.modelTier) || !MODEL_TIERS.has(o.modelTier))) return { reason: `${where}.modelTier must be light|standard|heavy` };
   if (o.roleProfile !== undefined && !isNonEmptyString(o.roleProfile)) return { reason: `${where}.roleProfile must be a non-empty string` };
   if (o.coveredSpecDigests !== undefined && !isStringArray(o.coveredSpecDigests)) return { reason: `${where}.coveredSpecDigests must be a string[]` };
+  if (o.criticalPath !== undefined && typeof o.criticalPath !== "boolean") return { reason: `${where}.criticalPath must be a boolean` };
 
   const spec: TaskSpec = {
     nodeId: o.nodeId,
@@ -226,6 +232,7 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
     ...(o.modelTier !== undefined ? { modelTier: o.modelTier as ModelTier } : {}),
     ...(o.roleProfile !== undefined ? { roleProfile: o.roleProfile as string } : {}),
     ...(o.coveredSpecDigests !== undefined ? { coveredSpecDigests: [...(o.coveredSpecDigests as string[])] } : {}),
+    ...(o.criticalPath !== undefined ? { criticalPath: o.criticalPath as boolean } : {}),
     specDigest: "",
   };
   return { spec };
@@ -318,6 +325,11 @@ function frozenRefsMismatch(got: FrozenRefs | undefined, want: FrozenRefs): stri
  *  covering only a subset. (Structural dangling/ancestor/non-empty is validateR4Coverage's job.) */
 function validateManagedT3(specs: TaskSpec[], opts: ManagedT3Opts): string | null {
   const impl = specs.filter((s) => s.kind !== "design");
+  // A critical node with an unknown-risk path should have been needsClarification, never loadable (c790ff1d ③ /
+  // errata 0b966a11) — the loader re-verifies this with the persisted criticalPath, not by trusting the planner.
+  for (const s of impl) if (s.criticalPath === true) for (const p of s.sourceWriteScope ?? []) {
+    if (overlapsAny(p, opts.riskPolicy.undecidablePrefixes)) return `managed-t3: node ${s.nodeId} is criticalPath with unknown-risk path ${p} — should be needsClarification, not loadable`;
+  }
   const assess = evaluateR4(impl, opts.ownerDomainPolicy, opts.riskPolicy);
   if (!assess.designRequired) return null;
   const covered = new Set<string>();
@@ -395,6 +407,14 @@ export function loadPlan(raw: unknown, opts?: ManagedT3Opts): LoadResult {
   if (covReason) return { ok: false, reason: covReason };
   // Managed-T3: ref-match + policy-driven R4 enforcement (loader does not just trust the planner's coverage).
   if (opts?.mode === "managed-t3") {
+    // guard the opts shape (missing policy/refs -> clean reject, never a TypeError)
+    if (opts.ownerDomainPolicy == null || opts.riskPolicy == null || opts.expectedFrozenRefs == null || typeof opts.ownerDomainPolicy.version !== "string" || typeof opts.riskPolicy.version !== "string") {
+      return { ok: false, reason: "managed-t3 requires ownerDomainPolicy, riskPolicy, and expectedFrozenRefs (with versions)" };
+    }
+    // the policy snapshot used to re-evaluate R4 MUST be the version the plan was compiled under — otherwise a weak/other
+    // policy could wave a cross-domain no-gate plan through even with matching frozenRefs.
+    if (opts.ownerDomainPolicy.version !== opts.expectedFrozenRefs.ownerDomainPolicy) return { ok: false, reason: `managed-t3: ownerDomainPolicy version ${opts.ownerDomainPolicy.version} != plan ref ${opts.expectedFrozenRefs.ownerDomainPolicy}` };
+    if (opts.riskPolicy.version !== opts.expectedFrozenRefs.riskPolicy) return { ok: false, reason: `managed-t3: riskPolicy version ${opts.riskPolicy.version} != plan ref ${opts.expectedFrozenRefs.riskPolicy}` };
     const refMismatch = frozenRefsMismatch(plan.frozenRefs, opts.expectedFrozenRefs);
     if (refMismatch) return { ok: false, reason: refMismatch };
     const mReason = validateManagedT3(specs, opts);

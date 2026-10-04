@@ -25,7 +25,7 @@
  */
 
 import { loadPlan, computeSpecDigest, type TaskPlan, type TaskSpec, type TaskKind, type ModelTier, type OutputKind, type RequiredOutput, type AcceptanceCheck, type FrozenRefs } from "./task-plan.js";
-import { evaluateR4, pathRisk, domainsTouched, type OwnerDomainPolicy, type RiskPolicy } from "./task-r4.js";
+import { evaluateR4, overlapsAny, domainsTouched, type OwnerDomainPolicy, type RiskPolicy } from "./task-r4.js";
 
 export type { OwnerDomainPolicy, RiskPolicy } from "./task-r4.js";
 
@@ -155,12 +155,14 @@ function outputContractOf(t: Record<string, unknown>, at: string): { reason: str
 export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult {
   if (!isObj(draft) || !isNonEmptyStr(draft.jobId)) return R("draft.jobId must be a non-empty string");
   if (!Array.isArray(draft.tasks) || draft.tasks.length === 0) return R("draft.tasks must be a non-empty array");
+  if (draft.planRevision !== undefined && !(typeof draft.planRevision === "number" && Number.isInteger(draft.planRevision) && draft.planRevision >= 0)) return R("draft.planRevision must be a non-negative integer"); // null is not silently ?? 1'd
 
   const bp = fc.budgetPolicy;
   if (!(typeof bp.coefficientUsdPerPoint === "number" && Number.isFinite(bp.coefficientUsdPerPoint) && bp.coefficientUsdPerPoint > 0)) return R(`budget coefficient must be a finite positive number (policy ${bp.version})`);
   if (!(typeof bp.maxModelUsd === "number" && Number.isFinite(bp.maxModelUsd) && bp.maxModelUsd > 0)) return R(`budget maxModelUsd cap must be a finite positive number (policy ${bp.version})`);
 
-  const missingRoles: string[] = [];
+  const missingRoles: string[] = []; // hallucinated explicit roles -> always needsRole
+  const unresolvedInferredRoleNodes: string[] = []; // ambiguous/no-role inference -> needsRole ONLY if not design-gated
   const nodes: TaskSpec[] = [];
   const criticalNodeIds = new Set<string>();
   let complexitySum = 0;
@@ -203,26 +205,34 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
       if (!has(fc.roleCatalog.roles, t.roleProfile)) missingRoles.push(`${t.roleProfile} (hallucinated, node ${t.nodeId})`);
       else { resolvedRole = t.roleProfile; roleFloor = fc.roleCatalog.roles[t.roleProfile]!.floor ?? "light"; }
     } else {
-      // INFER: a role owns a path if the path is UNDER the role's fileDomain (longest wins, same rule as owner
-      // attribution). A unique owning role -> infer it. A broad scope that spans into role domains, or multiple owning
-      // roles -> ambiguous, leave absent (the design gate handles it). A single known owner domain with no role -> needsRole.
+      // INFER: a role owns a path if the path is UNDER its fileDomain; the LONGEST fileDomain wins. A tie at the longest
+      // length (3a), multiple distinct roles across paths, or a broad scope spanning into role subdomains (3b) = ambiguous
+      // -> unresolved (deterministic — never pick-first by key order). A unique owning role -> infer + floor.
       const roleIds = Object.keys(fc.roleCatalog.roles);
-      const roleForPath = (p: string): string | undefined => {
-        let best: { rid: string; len: number } | undefined;
+      const resolveOne = (p: string): { rid?: string; ambiguous: boolean } => {
+        let bestLen = -1;
+        const atBest = new Set<string>();
         for (const rid of roleIds) for (const fd of fc.roleCatalog.roles[rid]!.fileDomain ?? []) {
-          if ((p === fd || p.startsWith(fd)) && (best === undefined || fd.length > best.len)) best = { rid, len: fd.length };
+          if (p === fd || p.startsWith(fd)) {
+            if (fd.length > bestLen) { bestLen = fd.length; atBest.clear(); atBest.add(rid); }
+            else if (fd.length === bestLen) atBest.add(rid);
+          }
         }
-        return best?.rid;
+        if (atBest.size === 0) return { ambiguous: false };
+        if (atBest.size > 1) return { ambiguous: true }; // equal-length tie -> ambiguous, not pick-first
+        return { rid: [...atBest][0], ambiguous: false };
       };
       const spansIntoRole = (p: string): boolean => roleIds.some((rid) => (fc.roleCatalog.roles[rid]!.fileDomain ?? []).some((fd) => fd.startsWith(p) && fd !== p));
       const roleSet = new Set<string>();
-      let spanning = false;
-      for (const p of scope) { const rid = roleForPath(p); if (rid) roleSet.add(rid); if (spansIntoRole(p)) spanning = true; }
-      if (roleSet.size === 1 && !spanning) { resolvedRole = [...roleSet][0]!; roleFloor = fc.roleCatalog.roles[resolvedRole]!.floor ?? "light"; }
-      else if (roleSet.size === 0 && !spanning) {
+      let ambiguous = false;
+      for (const p of scope) { const r = resolveOne(p); if (r.ambiguous) ambiguous = true; else if (r.rid) roleSet.add(r.rid); if (spansIntoRole(p)) ambiguous = true; }
+      if (!ambiguous && roleSet.size === 1) { resolvedRole = [...roleSet][0]!; roleFloor = fc.roleCatalog.roles[resolvedRole]!.floor ?? "light"; }
+      else if (!ambiguous && roleSet.size === 0) {
         const known = new Set<string>();
         for (const p of scope) for (const d of domainsTouched(p, fc.ownerDomainPolicy)) known.add(d);
-        if (known.size === 1) missingRoles.push(`no role for domain "${[...known][0]}" (node ${t.nodeId})`); // single known domain, uninferable
+        if (known.size === 1) unresolvedInferredRoleNodes.push(t.nodeId); // single known owner domain, no role for it
+      } else {
+        unresolvedInferredRoleNodes.push(t.nodeId); // tie / multiple roles / spanning -> ambiguous
       }
     }
 
@@ -247,6 +257,7 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
       runtime: "ephemeral",
       modelTier,
       ...(resolvedRole !== undefined ? { roleProfile: resolvedRole } : {}),
+      ...(t.criticalPath === true ? { criticalPath: true } : {}),
       specDigest: "",
     });
 
@@ -277,17 +288,20 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
     const questions: ClarificationQuestion[] = [];
     for (const id of criticalUnknown) {
       const node = nodes.find((n) => n.nodeId === id);
-      for (const p of node?.sourceWriteScope ?? []) if (pathRisk(p, fc.riskPolicy) === "unknown") questions.push({ questionId: `q-risk-${id}-${questions.length}`, question: `Is writing "${p}" reversible, and who owns it?`, context: `node ${id}: path ${p} matched riskPolicy.undecidablePrefixes (risk ${fc.riskPolicy.version}) and the node is criticalPath` });
+      for (const p of node?.sourceWriteScope ?? []) if (overlapsAny(p, fc.riskPolicy.undecidablePrefixes)) questions.push({ questionId: `q-risk-${id}-${questions.length}`, question: `Is writing "${p}" reversible, and who owns it?`, context: `node ${id}: path ${p} matched riskPolicy.undecidablePrefixes (risk ${fc.riskPolicy.version}) and the node is criticalPath` });
     }
     return { outcome: "needsClarification", reason: "unknown risk on a requester-critical node — reversibility must be answered before planning", questions };
   }
-  if (missingRoles.length > 0) return { outcome: "needsRole", missingRoles: [...new Set(missingRoles)], reason: `unresolved role(s) (catalog ${fc.roleCatalog.version}): ${[...new Set(missingRoles)].join("; ")}` };
+  // Role blockers: hallucinated explicit roles ALWAYS block; an unresolved inferred role blocks only when no design gate
+  // will cover the node (if R4 gates it, the design review sorts the role).
+  const roleBlockers = [...missingRoles, ...(assess.designRequired ? [] : unresolvedInferredRoleNodes.map((id) => `no unique role for node ${id}`))];
+  if (roleBlockers.length > 0) return { outcome: "needsRole", missingRoles: [...new Set(roleBlockers)], reason: `unresolved role(s) (catalog ${fc.roleCatalog.version}): ${[...new Set(roleBlockers)].join("; ")}` };
 
   let allNodes = nodes;
   if (assess.designRequired) {
     if (nodes.some((n) => n.nodeId === DESIGN_GATE_ID)) return R(`cannot auto-prepend design gate: nodeId "${DESIGN_GATE_ID}" already used`);
     const impl = nodes.map((n) => ({ ...n, dependsOn: [...n.dependsOn, DESIGN_GATE_ID] }));
-    for (const n of impl) n.specDigest = computeSpecDigest(n);
+    try { for (const n of impl) n.specDigest = computeSpecDigest(n); } catch { return R("non-finite or unserializable value in a node (e.g. nested acceptance args)"); }
     const coveredSpecDigests = impl.map((n) => n.specDigest).sort(); // COVERAGE-FINAL: every impl node's final digest
     allNodes = [{
       nodeId: DESIGN_GATE_ID,
@@ -331,7 +345,10 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
     notImplemented: [R4_THRESHOLD_NOT_IMPLEMENTED], // R4 condition 3 phased; round-trips through loadPlan
     planDigest: "",
   };
-  const loaded = loadPlan(assembled);
-  if (!loaded.ok) return R(`assembled plan failed loadPlan: ${loaded.reason}`);
+  // Self-check via the SAME managed-t3 enforcement the consumer applies: translateDraft's output is guaranteed to pass
+  // the loader's R4 re-evaluation (a translateDraft bug that failed to insert a required gate surfaces here as rejected,
+  // not as a plan the dispatcher later rejects). loadPlan is the sole legality + digest + coverage authority.
+  const loaded = loadPlan(assembled, { mode: "managed-t3", ownerDomainPolicy: fc.ownerDomainPolicy, riskPolicy: fc.riskPolicy, expectedFrozenRefs: frozenRefs });
+  if (!loaded.ok) return R(`assembled plan failed managed loadPlan: ${loaded.reason}`);
   return { outcome: "loadable", plan: loaded.plan };
 }

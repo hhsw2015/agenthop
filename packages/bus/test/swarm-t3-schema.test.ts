@@ -86,6 +86,24 @@ describe("F-T3-2 identity classification: role annotations OUT of specDigest, co
     const base = fullSpec({ kind: "design", coveredSpecDigests: ["x"] });
     expect(computeSpecDigest(base)).not.toBe(computeSpecDigest({ ...base, coveredSpecDigests: ["x", "y"] }));
   });
+  test("criticalPath does NOT change specDigest (annotation, like modelTier/roleProfile)", () => {
+    expect(computeSpecDigest(fullSpec({ criticalPath: true }))).toBe(computeSpecDigest(fullSpec({ criticalPath: false })));
+    expect(computeSpecDigest(fullSpec({ criticalPath: true }))).toBe(computeSpecDigest(fullSpec()));
+  });
+});
+
+describe("managed-t3 critical∧unknown rejection (errata 0b966a11): loader re-verifies the clarify branch", () => {
+  const refs = { checkRegistry: "cr1", ownerDomainPolicy: "op1", riskPolicy: "rp1", roleCatalog: "rc1", budgetPolicy: "bp1", r4ThresholdPolicy: "tp1", sourceBaselineDigest: "base" };
+  test("a criticalPath node with an unknown-risk path is rejected (should have been needsClarification, not loadable)", () => {
+    const mD = computeSpecDigest(fullSpec({ nodeId: "M", dependsOn: ["design-gate"], sourceWriteScope: ["experimental/x.ts"], criticalPath: true }));
+    const p = plan([
+      raw({ nodeId: "design-gate", kind: "design", dependsOn: [], coveredSpecDigests: [mD] }),
+      raw({ nodeId: "M", dependsOn: ["design-gate"], sourceWriteScope: ["experimental/x.ts"], criticalPath: true }),
+    ], { frozenRefs: refs });
+    const opts = { mode: "managed-t3" as const, ownerDomainPolicy: { version: "op1", ownerByPrefix: [], frozenScopePrefixes: [] }, riskPolicy: { version: "rp1", irreversiblePrefixes: [], undecidablePrefixes: ["experimental/"] }, expectedFrozenRefs: refs };
+    const r = loadPlan(p, opts);
+    expect(r.ok === false && /criticalPath|needsClarification/.test(r.reason)).toBe(true);
+  });
 });
 
 describe("payloadRef carrier on query-wait (field only; bundle store/resume = T3b)", () => {

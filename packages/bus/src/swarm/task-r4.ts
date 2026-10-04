@@ -34,11 +34,9 @@ export function domainsTouched(path: string, policy: OwnerDomainPolicy): Set<str
   return out;
 }
 
-export function pathRisk(path: string, rp: RiskPolicy): "irreversible" | "unknown" | "reversible" {
-  if (overlapsAny(path, rp.irreversiblePrefixes)) return "irreversible"; // known-risk beats unknown (conservative)
-  if (overlapsAny(path, rp.undecidablePrefixes)) return "unknown";
-  return "reversible";
-}
+/** Is the path under (or equal to) ANY owner prefix? If not, its own ownership is unmapped — a broad scope spanning
+ *  unmapped area is unknown-owner even when it also touches a known NESTED subtree (reviewer seam #1). */
+export const pathHasOwner = (path: string, policy: OwnerDomainPolicy): boolean => policy.ownerByPrefix.some((e) => path === e.prefix || path.startsWith(e.prefix));
 
 export type R4NodeInput = { nodeId: string; sourceWriteScope?: string[] };
 export type R4Assessment = { designRequired: boolean; reasons: string[]; unknownRiskNodeIds: string[]; unknownOwnerPaths: string[] };
@@ -53,13 +51,15 @@ export function evaluateR4(nodes: R4NodeInput[], owner: OwnerDomainPolicy, risk:
   for (const n of nodes) {
     let nodeUnknownRisk = false;
     for (const p of n.sourceWriteScope ?? []) {
-      const ds = domainsTouched(p, owner);
-      if (ds.size === 0) unknownOwnerPaths.add(p);
-      else for (const d of ds) domains.add(d);
+      for (const d of domainsTouched(p, owner)) domains.add(d);
+      // #1: unknown ownership = the path itself is under NO owner prefix (a broad scope over unmapped area counts, even
+      // if it also touches a known nested subtree) — not just domainsTouched.size===0.
+      if (!pathHasOwner(p, owner)) unknownOwnerPaths.add(p);
       if (overlapsAny(p, owner.frozenScopePrefixes)) frozen = true;
-      const r = pathRisk(p, risk);
-      if (r === "irreversible") irreversible = true;
-      else if (r === "unknown") { unknownRisk = true; nodeUnknownRisk = true; }
+      // #2: irreversible and unknown are INDEPENDENT facts — a broad scope hitting both keeps both (no "known beats
+      // unknown" collapse): irreversible -> design (condition 4); unknown -> clarify-if-critical / design-if-not upstream.
+      if (overlapsAny(p, risk.irreversiblePrefixes)) irreversible = true;
+      if (overlapsAny(p, risk.undecidablePrefixes)) { unknownRisk = true; nodeUnknownRisk = true; }
     }
     if (nodeUnknownRisk) unknownRiskNodeIds.push(n.nodeId);
   }

@@ -169,6 +169,52 @@ describe("R4 decision table (two orthogonal axes + 3-state risk, c790ff1d)", () 
     const r = translateDraft(draft([task({ sourceWriteScope: ["packages/bus/src/swarm/task-plan.ts"] })]), fc());
     expect(r.outcome === "loadable" && designOf(r) === undefined).toBe(true);
   });
+  test("seam#1: a broad scope over partially-mapped area flags unknown ownership -> design", () => {
+    const partial = fc({
+      ownerDomainPolicy: { version: "p", ownerByPrefix: [{ prefix: "src/known/", domain: "core" }], frozenScopePrefixes: [] },
+      roleCatalog: { version: "r", roles: { core: { floor: "standard", fileDomain: ["src/known/"] } } },
+    });
+    const r = translateDraft(draft([task({ sourceWriteScope: ["src/"] })]), partial); // src/ touches src/known/ (core) AND unmapped area
+    expect(r.outcome === "loadable" && designOf(r) !== undefined).toBe(true);
+  });
+  test("seam#2: a broad scope hitting BOTH irreversible and undecidable keeps the unknown fact", () => {
+    const both = fc({
+      riskPolicy: { version: "b", irreversiblePrefixes: ["zone/irr/"], undecidablePrefixes: ["zone/unk/"] },
+      ownerDomainPolicy: { version: "o", ownerByPrefix: [{ prefix: "zone/", domain: "z" }], frozenScopePrefixes: [] },
+      roleCatalog: { version: "r", roles: { z: { floor: "standard", fileDomain: ["zone/"] } } },
+    });
+    expect(translateDraft(draft([task({ sourceWriteScope: ["zone/"], criticalPath: true })]), both).outcome).toBe("needsClarification"); // unknown not swallowed by irreversible
+    const noncrit = translateDraft(draft([task({ sourceWriteScope: ["zone/"] })]), both);
+    expect(noncrit.outcome === "loadable" && designOf(noncrit) !== undefined).toBe(true);
+  });
+});
+
+describe("88e6a44 re-verify seams (role determinism, non-finite, planRevision)", () => {
+  test("3a: an equal-length fileDomain tie is ambiguous -> needsRole (deterministic, not key-order pick-first)", () => {
+    const tie = fc({
+      roleCatalog: { version: "t", roles: { ra: { floor: "light", fileDomain: ["a/"] }, rb: { floor: "heavy", fileDomain: ["a/"] } } },
+      ownerDomainPolicy: { version: "o", ownerByPrefix: [{ prefix: "a/", domain: "d" }], frozenScopePrefixes: [] },
+    });
+    expect(translateDraft(draft([task({ sourceWriteScope: ["a/x.ts"] })]), tie).outcome).toBe("needsRole");
+  });
+  test("3b: a single owner domain spanning multiple role subdomains -> needsRole (not silent unconstrained)", () => {
+    const multi = fc({
+      ownerDomainPolicy: { version: "o", ownerByPrefix: [{ prefix: "d/", domain: "d" }], frozenScopePrefixes: [] },
+      roleCatalog: { version: "r", roles: { da: { floor: "standard", fileDomain: ["d/a/"] }, db: { floor: "standard", fileDomain: ["d/b/"] } } },
+    });
+    expect(translateDraft(draft([task({ sourceWriteScope: ["d/"] })]), multi).outcome).toBe("needsRole");
+  });
+  test("4a: a non-finite nested arg does not throw at the gate pre-hash — rejected", () => {
+    const reg = fc({ checkRegistry: { version: "cr", checks: { blob: { args: { data: { type: "object" } } }, testsPass: {} } } });
+    const r = translateDraft(draft([
+      task({ nodeId: "A", structuredChecks: [{ check: "blob", args: { data: { x: Infinity } } }], sourceWriteScope: ["packages/bus/src/swarm/task-plan.ts"] }),
+      task({ nodeId: "B", sourceWriteScope: ["scripts/swarm-dispatch.ts"] }),
+    ]), reg);
+    expect(r.outcome).toBe("rejected");
+  });
+  test("4b: planRevision:null is rejected, not silently defaulted to 1", () => {
+    expect(translateDraft({ jobId: "j", planRevision: null as unknown as number, tasks: [task()] }, fc()).outcome).toBe("rejected");
+  });
 });
 
 describe("loadPlan managed-t3 (loader ruling f06894b8): policy-driven R4 enforcement, catches structural bypasses", () => {
@@ -204,6 +250,14 @@ describe("loadPlan managed-t3 (loader ruling f06894b8): policy-driven R4 enforce
   });
   test("legacy mode (no opts) still loads the same plan (managed is opt-in)", () => {
     expect(loadPlan(built()).ok).toBe(true);
+  });
+  test("5a: a policy snapshot whose version != plan ref is rejected (no weak-policy bypass)", () => {
+    const weak = { ...opts, ownerDomainPolicy: { version: "WEAK", ownerByPrefix: [], frozenScopePrefixes: [] } };
+    expect(loadPlan(built(), weak).ok).toBe(false);
+  });
+  test("5b: missing ownerDomainPolicy in managed opts -> clean reject, not TypeError", () => {
+    const bad = { mode: "managed-t3" as const, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs } as unknown as Parameters<typeof loadPlan>[1];
+    expect(loadPlan(built(), bad).ok).toBe(false);
   });
 });
 
