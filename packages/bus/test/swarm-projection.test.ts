@@ -2,11 +2,22 @@ import { describe, expect, test } from "vitest";
 import { mkdtempSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { commit, entityKeyOf, initialLogState, type ChangeBody, type LogState } from "../src/swarm/control-log.js";
+import { writeFileSync } from "node:fs";
+import { commit, entityKeyOf, initialLogState, type ChangeBody, type LogState, type WaitRecord } from "../src/swarm/control-log.js";
 import { loadPlan, type TaskPlan } from "../src/swarm/task-plan.js";
 import type { TaskAttempt } from "../src/swarm/task-state.js";
 import type { AcceptedResult } from "../src/swarm/task-result.js";
 import { buildProjectionFiles, writeProjection } from "../src/swarm/projection.js";
+
+function planOf(jobId: string, nodeId: string, over: { maxWallClockSec?: number; maxTotalAttempts?: number } = {}): TaskPlan {
+  const r = loadPlan({
+    jobId, planRevision: 1,
+    nodes: [{ nodeId, kind: "work", goal: "g", dependsOn: [], outputContract: { requiredOutputs: [{ logicalName: "o", kind: "report" }] }, acceptance: [], artifactScope: ["out/"], estimatedRuntimeSec: 600, retryBudget: 2, required: true, runtime: "ephemeral" }],
+    jobBudget: { maxTotalAttempts: over.maxTotalAttempts ?? 10, maxWallClockSec: over.maxWallClockSec ?? 3600 },
+  });
+  if (!r.ok) throw new Error(r.reason);
+  return r.plan;
+}
 
 /** projection-schema v1 (docs/swarm/projection-schema.md): the read-only consumer view derived PURELY from the control-log
  *  via the authoritative deciders — jobStatus + complete come from the reducer, never self-computed (C-1 / viz-gap 1). */
@@ -78,5 +89,84 @@ describe("buildProjectionFiles", () => {
     expect(JSON.parse(readFileSync(path.join(dir, "jobs/job-x/plan.json"), "utf8")).jobId).toBe("job-x");
     expect(existsSync(path.join(dir, "jobs/job-x/attempts/build.json"))).toBe(true);
     expect(existsSync(path.join(dir, "jobs/job-x/results.json"))).toBe(true);
+  });
+});
+
+describe("projection review fixes", () => {
+  test("P1-1: a traversal nodeId is REJECTED fail-closed — the job emits nothing, no escaping relPath, nothing written outside root", () => {
+    const evil = planOf("safe-job", "../../../../control-log/42");
+    let s = initialLogState();
+    s = stamp(s, [planBody(evil)]);
+    s = stamp(s, [{ put: "attempt", attempt: attempt({ jobId: "safe-job", nodeId: "../../../../control-log/42", attemptId: "safe-job/x/a1", specDigest: evil.nodes[0]!.specDigest }) }]);
+    const files = buildProjectionFiles(s, { nowSec: 1000 });
+    expect(files.some((f) => f.relPath.includes("safe-job"))).toBe(false);          // whole job skipped
+    expect(files.every((f) => !f.relPath.includes("..") && !f.relPath.includes("control-log"))).toBe(true);
+    const base = mkdtempSync(path.join(tmpdir(), "p1esc-"));
+    writeFileSync(path.join(base, "sentinel"), "ORIGINAL");
+    writeProjection(path.join(base, "projection"), s, { nowSec: 1000 });
+    expect(readFileSync(path.join(base, "sentinel"), "utf8")).toBe("ORIGINAL");      // no escaping write
+    expect(existsSync(path.join(base, "control-log"))).toBe(false);                  // the attack target was never created
+  });
+
+  test("P1-2: job isolation — A does NOT borrow B's accepted (no false complete) nor B's attempt in its budget", () => {
+    const a = planOf("jobA", "build");
+    const b = planOf("jobB", "build"); // same nodeId + identical spec ⇒ same specDigest
+    let s = initialLogState();
+    s = stamp(s, [planBody(a)]);
+    s = stamp(s, [planBody(b)]);
+    s = stamp(s, [{ put: "attempt", attempt: attempt({ jobId: "jobB", nodeId: "build", attemptId: "jobB/build/a1", status: "SUCCEEDED", specDigest: b.nodes[0]!.specDigest }) }]);
+    s = stamp(s, [{ put: "accepted", accepted: acc({ acceptedResultId: "jobB/build/a1/r1", attemptId: "jobB/build/a1", nodeId: "build", jobId: "jobB" }) }]);
+    const files = buildProjectionFiles(s, { nowSec: 1000, jobStartSec: () => 400 });
+    expect(byPath(files, "jobs/jobA/plan.json").jobStatus).toBe("running");   // NOT succeeded off B's accepted
+    expect(byPath(files, "jobs/jobB/plan.json").jobStatus).toBe("succeeded");
+    expect(files.some((f) => f.relPath === "jobs/jobA/attempts/build.json")).toBe(false); // A has no attempt (B's not borrowed)
+    expect(byPath(files, "jobs/jobA/budget.json").used.totalAttempts).toBe(0);  // B's attempt not counted in A
+    expect(byPath(files, "jobs/jobB/budget.json").used.totalAttempts).toBe(1);
+  });
+
+  test("§8c: a wait entity ⇒ waits/<waitId>.json emitted as-is (full WaitRecord)", () => {
+    const w: WaitRecord = { waitId: "coord-x", kind: "wait", subject: { jobId: "j" }, state: "open", deadlineSec: 5000, owner: "claude:owner", timeoutPolicy: "bypass" };
+    let s = initialLogState();
+    s = stamp(s, [{ put: "wait", wait: w }]);
+    const files = buildProjectionFiles(s, { nowSec: 1000 });
+    expect(byPath(files, "waits/coord-x.json")).toEqual(w); // as-is, all fields
+  });
+
+  test("§8b: results.observed[] carries recent ResultObserved per attempt (commit/path trajectory)", () => {
+    const p = planOf("job-o", "build");
+    let s = initialLogState();
+    s = stamp(s, [planBody(p)]);
+    s = stamp(s, [{ put: "attempt", attempt: attempt({ jobId: "job-o", nodeId: "build", attemptId: "job-o/build/a1", specDigest: p.nodes[0]!.specDigest }) }]);
+    s = stamp(s, [{ put: "observed", observed: { observedId: "job-o/build/a1/g1/c1", attemptId: "job-o/build/a1", nodeId: "build", bindingId: "job-o/build/a1/b0", launchId: "rw-1", generation: 1, observedWorkCommit: "c1", resultPath: "out/results/job-o/build/a1/result.json", resultBlobOid: "b1", closureFiles: [] } }]);
+    const results = byPath(buildProjectionFiles(s, { nowSec: 1000 }), "jobs/job-o/results.json");
+    expect(results.observed).toHaveLength(1);
+    expect(results.observed[0]).toMatchObject({ attemptId: "job-o/build/a1", observedWorkCommit: "c1", generation: 1 });
+  });
+
+  test("P2-2: a rebuild to an older snapshot PRUNES a stale attempt file (no lingering SUCCEEDED)", () => {
+    const p = planOf("job-x", "build");
+    // newer snapshot: plan + a SUCCEEDED attempt ⇒ attempts/build.json written
+    let s3 = initialLogState();
+    s3 = stamp(s3, [planBody(p)]);
+    s3 = stamp(s3, [{ put: "attempt", attempt: attempt({ jobId: "job-x", nodeId: "build", attemptId: "job-x/build/a1", status: "SUCCEEDED", specDigest: p.nodes[0]!.specDigest }) }]);
+    const dir = mkdtempSync(path.join(tmpdir(), "p22-"));
+    writeProjection(dir, s3, { nowSec: 1000 });
+    expect(existsSync(path.join(dir, "jobs/job-x/attempts/build.json"))).toBe(true);
+    // rebuild to an older snapshot: plan only, no attempt ⇒ the stale attempt file must be pruned
+    let s1 = initialLogState();
+    s1 = stamp(s1, [planBody(p)]);
+    writeProjection(dir, s1, { nowSec: 1000 });
+    expect(existsSync(path.join(dir, "jobs/job-x/attempts/build.json"))).toBe(false); // pruned, not a lingering SUCCEEDED
+  });
+
+  test("P2-1 now-dependency: the same state recomputes a wall-clock-exhausted job as failed (per-tick refresh maintains it)", () => {
+    const p = planOf("job-x", "build", { maxWallClockSec: 100 });
+    let s = initialLogState();
+    s = stamp(s, [planBody(p)]);
+    s = stamp(s, [{ put: "attempt", attempt: attempt({ jobId: "job-x", nodeId: "build", attemptId: "job-x/build/a1", status: "RUNNING", specDigest: p.nodes[0]!.specDigest }) }]);
+    const early = byPath(buildProjectionFiles(s, { nowSec: 450, jobStartSec: () => 400 }), "jobs/job-x/plan.json"); // wall 50 < 100
+    const late = byPath(buildProjectionFiles(s, { nowSec: 550, jobStartSec: () => 400 }), "jobs/job-x/plan.json");  // wall 150 >= 100
+    expect(early.jobStatus).toBe("running");
+    expect(late.jobStatus).toBe("failed"); // now-dependent — only a per-tick refresh (not commit-only) keeps this current
   });
 });

@@ -547,6 +547,10 @@ async function main(): Promise<void> {
     passTick: async () => {
       await pass(records, ops);
       if (plan && taskOn && taskOps) { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
+      // P2-1 catch-up refresh: rewrite the projection every tick (not only on commit) so a failed projection write retries
+      // and now-dependent judgments (wall-clock jobStatus/budget) stay current WITHOUT needing a new business commit. Fail-soft.
+      try { writeProjection(PROJECTION_DIR, loadControlLog(CONTROL_LOG_DIR), { nowSec: nowSec(), jobStartSec }); }
+      catch (e) { log(`projection refresh failed: ${e instanceof Error ? e.message : e}`); }
     },
     // The liveness sweep (§0b R2) — scan durable waits + member liveness, auto-handle expired waits (ping/escalate/re-arm)
     // + dead owners (reassign) + stuck validators (move). The coordinator-replacement step; gated on SWARM_SWEEP.

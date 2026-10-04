@@ -1,36 +1,47 @@
 /**
- * Projection writer (projection-schema v1 — docs/swarm/projection-schema.md). The READ-ONLY consumer view of swarm state
- * for swarm-viz + fast dispatcher startup. PURE derivation from the control-log LogState via the AUTHORITATIVE deciders
- * (buildSched / jobStatus / currentAccepted), so a consumer never re-implements the reducer (C-1) and never self-computes a
- * cascaded judgment (complete / jobStatus) that would drift (viz-gap 1). CONTROL is authoritative; a lost/corrupt
- * projection is rebuilt by replay (§8). The IO half (atomic temp+rename per file, C-3) is writeProjection below.
+ * Projection writer (projection-schema v1 — docs/swarm/projection-schema.md, authoritative SHA 4fa06522 incl. §8b/§8c).
+ * The READ-ONLY consumer view of swarm state for swarm-viz + fast dispatcher startup. PURE derivation from the control-log
+ * LogState via the AUTHORITATIVE deciders (jobStatus / currentAccepted), so a consumer never re-implements the reducer (C-1)
+ * and never self-computes a cascaded judgment (complete / jobStatus) that would drift (viz-gap 1). CONTROL is authoritative;
+ * a lost/corrupt projection is rebuilt by replay (§8). The IO half (atomic temp+rename per file + prune, C-3) is below.
  *
- * Scope v1: the control-log-derived files — meta + jobs/<jobId>/{plan,attempts/<nodeId>,results,budget}. members.json is
- * the bus ROSTER (not control-log data), so it is written by the dispatcher from its peer roster, not here (the consumer
- * contract merges members.json with its own peers()). executor is always {kind:"box"} in v1 — the durable-member binding
- * variant (§3 [D]) is not yet in ExecutionBinding.
+ * SECURITY (review P1-1): jobId / nodeId / waitId become PATH SEGMENTS — a `../` id is an arbitrary-write escape from the
+ * read-only view. Every id is whitelist-validated; a job with ANY unsafe id emits NOTHING (fail-closed), and the writer
+ * refuses any path that resolves outside the projection root (belt-and-suspenders).
+ *
+ * DATA DOMAIN (review P1-2): each job's files are derived from its OWN attempts/accepted/rejected/observed, isolated by
+ * jobId BEFORE the deciders — the authoritative algorithm cannot fix a wrong-domain input (cross-job false complete/budget).
+ *
+ * Scope: meta + jobs/<jobId>/{plan,attempts/<nodeId>,results,budget} + waits/<waitId> (§8c) + results.observed[] (§8b).
+ * Deferred (entity fields not yet persisted, documented not faked): role (assignment text, viz-gap 4), §8b decidedBy /
+ * supersededBy / members.runDrift. members.json is an EMPTY placeholder — the durable roster is the bus peers() view the
+ * control-log does not hold; viz fills live members from its own peers() merge (§6). jobs/* require an actual PlanPut in
+ * CONTROL (not merely a SWARM_PLAN file).
  */
 
-import { mkdirSync, writeFileSync, renameSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import path from "node:path";
-import { liveEntities, type LogState } from "./control-log.js";
+import { liveEntities, type LogState, type WaitRecord, type ResultObserved } from "./control-log.js";
 import type { TaskPlan } from "./task-plan.js";
 import type { TaskAttempt, ExecutionBinding } from "./task-state.js";
 import type { AcceptedResult } from "./task-result.js";
-import { buildSched } from "./task-pass.js";
-import { jobStatus, currentAccepted, type JobUsage } from "./task-ready.js";
+import { jobStatus, currentAccepted, type SchedInput, type JobUsage } from "./task-ready.js";
 
 export const PROJECTION_SCHEMA_VERSION = 1;
 
 export type ProjectionFile = { relPath: string; json: unknown };
 export type ProjectOpts = { nowSec: number; jobStartSec?: (jobId: string) => number | undefined };
 
-const HISTORY_MAX = 8; // Open question 1: last 8 attempts + count.
+const HISTORY_MAX = 8;   // Open question 1: last 8 attempts + count.
+const OBSERVED_MAX = 8;  // §8b observed[]: recent N per attempt.
+
+/** A path segment is SAFE iff it is a non-empty run of [A-Za-z0-9._-] and not "." / ".." — no separators, no traversal. */
+const SAFE_SEG = /^[A-Za-z0-9._-]+$/;
+const isSafeSeg = (s: unknown): s is string => typeof s === "string" && s.length > 0 && s !== "." && s !== ".." && SAFE_SEG.test(s);
 
 const bindingState = (b: ExecutionBinding): "open" | "closing" | "closed" =>
   b.closedAtSeq !== undefined ? "closed" : b.closing !== undefined ? "closing" : "open";
 
-/** A short human line for a status (the consumer shows it directly; English only, viz translates — Open question 2). */
 function statusNote(a: TaskAttempt): string {
   if (a.note) return a.note;
   switch (a.status) {
@@ -49,7 +60,7 @@ function attemptView(a: TaskAttempt) {
     attemptId: a.attemptId,
     status: a.status,
     statusNote: statusNote(a),
-    role: null, // v1: the assignment's role text is not persisted in the control-log (viz-gap 4) — a follow-up when it is.
+    role: null, // deferred: the assignment role text is not persisted in the control-log (viz-gap 4) — nullable until it is.
     retriesUsed: a.retriesUsed,
     retryAt: a.retryAt ?? null,
     failureClass: a.failureClass ?? null,
@@ -68,31 +79,50 @@ function attemptView(a: TaskAttempt) {
 export function buildProjectionFiles(state: LogState, opts: ProjectOpts): ProjectionFile[] {
   const out: ProjectionFile[] = [];
   out.push({ relPath: "meta.json", json: { schemaVersion: PROJECTION_SCHEMA_VERSION, lastAppliedSeq: state.seq, rebuiltAt: new Date(opts.nowSec * 1000).toISOString() } });
-  // members.json — the durable roster is the bus peers() view, which the control-log does not hold; v1 emits an empty
-  // roster so the file always exists for the defensive consumer, and viz fills live members from its own peers() merge
-  // (schema §6 consumer promise). activeBindings would come from member-kind executionBindings (none in v1 — all box).
+  // members.json — empty placeholder (v1): the durable roster is the bus peers() view, not control-log data; viz merges it
+  // (schema §6). NOT written by the dispatcher from a roster in this batch; do not read this as "the roster is wired".
   out.push({ relPath: "members.json", json: { members: [] as unknown[] } });
 
   const plans: TaskPlan[] = [];
   const attempts: TaskAttempt[] = [];
   const accepted: AcceptedResult[] = [];
-  const rejected: Array<{ nodeId: string; attemptId: string; atSeq: number; [k: string]: unknown }> = [];
+  const rejected: Array<{ nodeId: string; attemptId: string; atSeq: number; reason?: unknown }> = [];
+  const observed: ResultObserved[] = [];
+  const waits: WaitRecord[] = [];
   for (const body of Object.values(liveEntities(state))) {
     if (body.put === "plan") plans.push(body.plan as unknown as TaskPlan);
     else if (body.put === "attempt") attempts.push(body.attempt);
     else if (body.put === "accepted") accepted.push(body.accepted);
     else if (body.put === "rejected") rejected.push(body.rejected as unknown as { nodeId: string; attemptId: string; atSeq: number });
+    else if (body.put === "observed") observed.push(body.observed);
+    else if (body.put === "wait") waits.push(body.wait);
+  }
+
+  // §8c — waits/<waitId>.json: the WaitRecord current state, AS-IS (all fields; optional A1 budget fields pass through).
+  for (const w of waits) {
+    if (!isSafeSeg(w.waitId)) continue; // unsafe id ⇒ no file (P1-1)
+    out.push({ relPath: `waits/${w.waitId}.json`, json: w });
   }
 
   for (const plan of plans) {
     const jobId = plan.jobId;
-    const sched = buildSched(plan, state);
+    // P1-1: reject the WHOLE job if its jobId or ANY nodeId is not a safe path segment — fail-closed, emit nothing for it.
+    if (!isSafeSeg(jobId) || !plan.nodes.every((n) => isSafeSeg(n.nodeId))) continue;
+
+    // P1-2: isolate this job's data BEFORE the deciders. attemptId convention is `${jobId}/${nodeId}/a${n}`, so the prefix
+    // isolates rejected/observed that lack a jobId field; accepted carries jobId directly.
+    const inJob = (attemptId: string): boolean => attemptId.startsWith(`${jobId}/`);
+    const jobAttempts = attempts.filter((a) => a.jobId === jobId);
+    const jobAccepted = accepted.filter((r) => r.jobId === jobId);
+    const jobRejected = rejected.filter((r) => inJob(r.attemptId));
+    const jobObserved = observed.filter((o) => inJob(o.attemptId));
+    const sched: SchedInput = { plan, attempts: jobAttempts, acceptedResults: jobAccepted };
+
     const jobStartSec = opts.jobStartSec?.(jobId);
     const wallClockSec = jobStartSec !== undefined ? Math.max(0, opts.nowSec - jobStartSec) : 0;
-    const usage: JobUsage = { totalAttempts: sched.attempts.length, wallClockSec };
+    const usage: JobUsage = { totalAttempts: jobAttempts.length, wallClockSec };
     const status = jobStatus({ ...sched, now: opts.nowSec, jobUsage: usage });
 
-    // plan.json — the DAG skeleton + the authoritative job status.
     out.push({
       relPath: `jobs/${jobId}/plan.json`,
       json: {
@@ -106,32 +136,34 @@ export function buildProjectionFiles(state: LogState, opts: ProjectOpts): Projec
       },
     });
 
-    // attempts/<nodeId>.json — current attempt + complete + history, per node declared in the plan.
     const byNode = new Map<string, TaskAttempt[]>();
-    for (const a of sched.attempts) { const arr = byNode.get(a.nodeId) ?? []; arr.push(a); byNode.set(a.nodeId, arr); }
+    for (const a of jobAttempts) { const arr = byNode.get(a.nodeId) ?? []; arr.push(a); byNode.set(a.nodeId, arr); }
     for (const node of plan.nodes) {
       const nodeAttempts = (byNode.get(node.nodeId) ?? []).slice().sort((x, y) => x.createdAtSeq - y.createdAtSeq);
-      if (nodeAttempts.length === 0) continue; // no attempt yet ⇒ no file (consumer renders pending from plan)
+      if (nodeAttempts.length === 0) continue;
       const current = nodeAttempts[nodeAttempts.length - 1]!;
-      const complete = currentAccepted(node.nodeId, sched) !== null; // AUTHORITATIVE (reducer), never self-computed
+      const complete = currentAccepted(node.nodeId, sched) !== null; // AUTHORITATIVE (reducer), over this job's data only
       const history = nodeAttempts.slice(0, -1).slice(-HISTORY_MAX).map((a) => ({ attemptId: a.attemptId, status: a.status, failureClass: a.failureClass ?? null }));
       out.push({ relPath: `jobs/${jobId}/attempts/${node.nodeId}.json`, json: { nodeId: node.nodeId, current: { ...attemptView(current), complete }, history } });
     }
 
-    // results.json — acceptance decisions for this job.
-    const jobAccepted = accepted.filter((r) => r.jobId === jobId);
-    const jobNodeIds = new Set(plan.nodes.map((n) => n.nodeId));
+    // §8b — observed[]: recent N ResultObserved per attempt (commit/path trajectory). decidedBy/supersededBy are deferred
+    // (not persisted on the accepted/rejected entities yet) — documented, not faked.
+    const observedByAttempt = new Map<string, ResultObserved[]>();
+    for (const o of jobObserved) { const arr = observedByAttempt.get(o.attemptId) ?? []; arr.push(o); observedByAttempt.set(o.attemptId, arr); }
+    const observedSummary = [...observedByAttempt.entries()].flatMap(([attemptId, os]) =>
+      os.slice(-OBSERVED_MAX).map((o) => ({ attemptId, observedWorkCommit: o.observedWorkCommit, resultPath: o.resultPath, generation: o.generation })));
     out.push({
       relPath: `jobs/${jobId}/results.json`,
       json: {
         accepted: jobAccepted.map((r) => ({ acceptedResultId: r.acceptedResultId, nodeId: r.nodeId, attemptId: r.attemptId, observedWorkCommit: r.observedWorkCommit, resultPath: r.resultPath, superseded: r.superseded ?? false, decidedAtSeq: r.decidedAtSeq })),
-        rejected: rejected.filter((r) => jobNodeIds.has(r.nodeId)).map((r) => ({ nodeId: r.nodeId, attemptId: r.attemptId, reason: (r as { reason?: unknown }).reason ?? (r as { failureClass?: unknown }).failureClass ?? "rejected", atSeq: r.atSeq })),
-        candidates: [] as unknown[], // v1: candidate index not separately tracked in the control-log; viz renders from attempts
+        rejected: jobRejected.map((r) => ({ nodeId: r.nodeId, attemptId: r.attemptId, reason: r.reason ?? (r as { failureClass?: unknown }).failureClass ?? "rejected", atSeq: r.atSeq })),
+        candidates: [] as unknown[],
+        observed: observedSummary,
         peerLate: 0,
       },
     });
 
-    // budget.json — cost visibility.
     out.push({
       relPath: `jobs/${jobId}/budget.json`,
       json: {
@@ -139,8 +171,7 @@ export function buildProjectionFiles(state: LogState, opts: ProjectOpts): Projec
         used: { totalAttempts: usage.totalAttempts, wallClockSec: usage.wallClockSec, modelUsd: null },
         perNode: plan.nodes.map((n) => {
           const na = byNode.get(n.nodeId) ?? [];
-          const retriesUsed = na.reduce((m, a) => Math.max(m, a.retriesUsed), 0);
-          return { nodeId: n.nodeId, attempts: na.length, retriesUsed, retryBudget: n.retryBudget };
+          return { nodeId: n.nodeId, attempts: na.length, retriesUsed: na.reduce((m, a) => Math.max(m, a.retriesUsed), 0), retryBudget: n.retryBudget };
         }),
       },
     });
@@ -148,14 +179,36 @@ export function buildProjectionFiles(state: LogState, opts: ProjectOpts): Projec
   return out;
 }
 
-/** Write every projection file atomically (temp+rename per file, C-3). meta.json is written LAST — its lastAppliedSeq is
- *  the consistency marker, so it only advances once all data files for this seq are on disk. v1 overwrites in place and
- *  does not prune files for a removed job/node (a follow-up); a stale file is harmless to the defensive consumer. */
+/** All .json files currently under `dir` (recursive), as dir-relative POSIX paths — for prune (P2-2). */
+function existingJsonFiles(dir: string, rel = ""): string[] {
+  let entries: string[];
+  try { entries = readdirSync(path.join(dir, rel)); } catch { return []; }
+  const out: string[] = [];
+  for (const name of entries) {
+    const r = rel ? `${rel}/${name}` : name;
+    let isDir = false;
+    try { isDir = statSync(path.join(dir, r)).isDirectory(); } catch { continue; }
+    if (isDir) out.push(...existingJsonFiles(dir, r));
+    else if (name.endsWith(".json")) out.push(r);
+  }
+  return out;
+}
+
+/** Write every projection file atomically (temp+rename, C-3), meta.json LAST (its lastAppliedSeq is the consistency
+ *  marker). PRUNES stale files absent from the new snapshot (P2-2 — a rebuild to an older/smaller snapshot must not leave a
+ *  stale SUCCEEDED attempt behind). REFUSES any path resolving outside the root (P1-1 belt-and-suspenders). */
 export function writeProjection(dir: string, state: LogState, opts: ProjectOpts): void {
   const files = buildProjectionFiles(state, opts);
+  const root = path.resolve(dir);
+  const want = new Set(files.map((f) => f.relPath));
+
+  // Prune first: remove managed .json files no longer in the current snapshot (meta.json is always in `want`).
+  for (const rel of existingJsonFiles(root)) if (!want.has(rel)) { try { unlinkSync(path.join(root, rel)); } catch { /* raced */ } }
+
   const ordered = [...files.filter((f) => f.relPath !== "meta.json"), ...files.filter((f) => f.relPath === "meta.json")];
   for (const f of ordered) {
-    const abs = path.join(dir, f.relPath);
+    const abs = path.resolve(root, f.relPath);
+    if (abs !== root && !abs.startsWith(root + path.sep)) continue; // refuse an escaping path (P1-1 defense; should never happen post-validation)
     mkdirSync(path.dirname(abs), { recursive: true });
     const tmp = `${abs}.tmp.${process.pid}`;
     writeFileSync(tmp, JSON.stringify(f.json, null, 2), { mode: 0o644 });
