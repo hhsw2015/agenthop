@@ -135,23 +135,25 @@ describe("R4 decision table (two orthogonal axes + 3-state risk, c790ff1d)", () 
     const narrow = translateDraft(draft([task({ sourceWriteScope: ["src/core/x.ts"] })]), wide);
     expect(narrow.outcome === "loadable" && designOf(narrow) === undefined).toBe(true); // single domain, no fan-out
   });
+  // these isolate the R4 OWNER/RISK behavior, so they give an explicit resolvable role (roleProfile:"doc") — an
+  // unresolved role would correctly short-circuit to needsRole (R4-P2-1) and mask the design outcome under test.
   test("R4-FROZEN: a frozen-contract write forces design regardless of (ignored) model risk", () => {
-    expect(designOf(translateDraft(draft([task({ sourceWriteScope: ["docs/swarm/brain-design.md"] })]), fc()) as never)).toBeDefined();
+    expect(designOf(translateDraft(draft([task({ sourceWriteScope: ["docs/swarm/brain-design.md"], roleProfile: "doc" })]), fc()) as never)).toBeDefined();
   });
   test("known-irreversible path -> DESIGN (条件4, 风险可判即便不可逆), NOT needsClarification", () => {
-    const r = translateDraft(draft([task({ sourceWriteScope: ["ops/prod/migrate.ts"] })]), fc());
+    const r = translateDraft(draft([task({ sourceWriteScope: ["ops/prod/migrate.ts"], roleProfile: "doc" })]), fc());
     expect(r.outcome === "loadable" && designOf(r) !== undefined).toBe(true);
   });
   test("unknown-risk + criticalPath -> needsClarification (ask the requester)", () => {
-    const r = translateDraft(draft([task({ sourceWriteScope: ["experimental/x.ts"], criticalPath: true })]), fc());
+    const r = translateDraft(draft([task({ sourceWriteScope: ["experimental/x.ts"], criticalPath: true, roleProfile: "doc" })]), fc());
     expect(r.outcome === "needsClarification" && r.questions.length > 0).toBe(true);
   });
   test("unknown-risk + non-critical -> conservative design gate (门吸收)", () => {
-    const r = translateDraft(draft([task({ sourceWriteScope: ["experimental/x.ts"] })]), fc());
+    const r = translateDraft(draft([task({ sourceWriteScope: ["experimental/x.ts"], roleProfile: "doc" })]), fc());
     expect(r.outcome === "loadable" && designOf(r) !== undefined).toBe(true);
   });
   test("unknown ownership (non-irreversible) -> conservative design (never silent bypass)", () => {
-    expect(designOf(translateDraft(draft([task({ sourceWriteScope: ["new/unmapped-module.ts"] })]), fc()) as never)).toBeDefined();
+    expect(designOf(translateDraft(draft([task({ sourceWriteScope: ["new/unmapped-module.ts"], roleProfile: "doc" })]), fc()) as never)).toBeDefined();
   });
   test("threshold is PHASED (notImplemented) — a high complexity sum alone does not trigger design", () => {
     const r = translateDraft(draft([task({ nodeId: "A", complexity: 10, sourceWriteScope: ["packages/bus/src/swarm/task-plan.ts"] })]), fc({ r4ThresholdPolicy: { version: "t", maxTotalComplexity: 1 } }));
@@ -223,6 +225,30 @@ describe("88e6a44 re-verify seams (role determinism, non-finite, planRevision)",
   });
   test("4b: planRevision:null is rejected, not silently defaulted to 1", () => {
     expect(translateDraft({ jobId: "j", planRevision: null as unknown as number, tasks: [task()] }, fc()).outcome).toBe("rejected");
+  });
+});
+
+describe("R4-P2-1 missing-role registration: non-empty scope + no matching role -> needsRole at ANY owner count", () => {
+  const nomatch = fc({ roleCatalog: { version: "nm", roles: { other: { floor: "heavy", fileDomain: ["totally/elsewhere/"] } } } });
+  test("NO-MATCH-ONE-OWNER -> needsRole", () => {
+    expect(translateDraft(draft([task({ sourceWriteScope: ["packages/bus/src/swarm/x.ts"] })]), nomatch).outcome).toBe("needsRole");
+  });
+  test("NO-MATCH-TWO-OWNERS -> needsRole (not loadable+design)", () => {
+    expect(translateDraft(draft([task({ sourceWriteScope: ["packages/bus/src/swarm/x.ts", "scripts/y.ts"] })]), nomatch).outcome).toBe("needsRole");
+  });
+  test("NO-MATCH-ZERO-OWNERS (unknown owner) -> needsRole (not loadable+design)", () => {
+    expect(translateDraft(draft([task({ sourceWriteScope: ["unmapped/a.ts"] })]), nomatch).outcome).toBe("needsRole");
+  });
+  test("empty scope + no role -> loadable (no role needed; existing policy unchanged)", () => {
+    expect(translateDraft(draft([task({ structuredChecks: [{ check: "testsPass" }] })]), nomatch).outcome).toBe("loadable");
+  });
+  test("CTRL-MATCHED-CROSS-DOMAIN: roles DO match -> resolved role + floor, design", () => {
+    const r = translateDraft(draft([
+      task({ nodeId: "A", sourceWriteScope: ["packages/bus/src/swarm/task-plan.ts"] }),
+      task({ nodeId: "B", sourceWriteScope: ["scripts/swarm-dispatch.ts"] }),
+    ]), fc());
+    expect(r.outcome).toBe("loadable");
+    if (r.outcome === "loadable") expect(r.plan.nodes.find((n) => n.nodeId === "A")!.roleProfile).toBe("pure-layer-impl");
   });
 });
 
@@ -310,7 +336,7 @@ describe("E — tier mapping (max of complexity / kind floor / role floor; 存�
   test("review kind floor = heavy at low complexity; design gate heavy", () => {
     const rev = translateDraft(draft([task({ kind: "review", complexity: 1 })]), fc());
     expect(rev.outcome === "loadable" && rev.plan.nodes[0]!.modelTier === "heavy").toBe(true);
-    const d = translateDraft(draft([task({ sourceWriteScope: ["docs/swarm/brain-design.md"] })]), fc());
+    const d = translateDraft(draft([task({ sourceWriteScope: ["docs/swarm/brain-design.md"], roleProfile: "doc" })]), fc());
     expect(d.outcome === "loadable" && designOf(d)!.modelTier === "heavy").toBe(true);
   });
   test("PLANNER-HEAVY: direction-setting planner operations are always heavy", () => {

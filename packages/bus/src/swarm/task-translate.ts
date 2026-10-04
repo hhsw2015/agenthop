@@ -25,7 +25,7 @@
  */
 
 import { loadPlan, computeSpecDigest, type TaskPlan, type TaskSpec, type TaskKind, type ModelTier, type OutputKind, type RequiredOutput, type AcceptanceCheck, type FrozenRefs } from "./task-plan.js";
-import { evaluateR4, overlapsAny, domainsTouched, type OwnerDomainPolicy, type RiskPolicy } from "./task-r4.js";
+import { evaluateR4, overlapsAny, type OwnerDomainPolicy, type RiskPolicy } from "./task-r4.js";
 
 export type { OwnerDomainPolicy, RiskPolicy } from "./task-r4.js";
 
@@ -227,13 +227,7 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
       let ambiguous = false;
       for (const p of scope) { const r = resolveOne(p); if (r.ambiguous) ambiguous = true; else if (r.rid) roleSet.add(r.rid); if (spansIntoRole(p)) ambiguous = true; }
       if (!ambiguous && roleSet.size === 1) { resolvedRole = [...roleSet][0]!; roleFloor = fc.roleCatalog.roles[resolvedRole]!.floor ?? "light"; }
-      else if (!ambiguous && roleSet.size === 0) {
-        const known = new Set<string>();
-        for (const p of scope) for (const d of domainsTouched(p, fc.ownerDomainPolicy)) known.add(d);
-        if (known.size === 1) unresolvedInferredRoleNodes.push(t.nodeId); // single known owner domain, no role for it
-      } else {
-        unresolvedInferredRoleNodes.push(t.nodeId); // tie / multiple roles / spanning -> ambiguous
-      }
+      else if (scope.length > 0) unresolvedInferredRoleNodes.push(t.nodeId); // R4-P2-1: ANY non-empty scope without a unique role -> needsRole (ambiguous tie/span, multiple roles, OR zero matches at any owner-domain count). owner count must not make a missing role vanish. Empty scope needs no role.
     }
 
     const effectiveComplexity = Math.max(t.complexity, (t.independentScore as number | undefined) ?? t.complexity); // SCORE-DISAGREES
