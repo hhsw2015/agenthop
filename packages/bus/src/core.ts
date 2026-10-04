@@ -9,7 +9,7 @@ import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn } from "./bus-identity.js";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox } from "./inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox } from "./inbox.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 
@@ -67,6 +67,9 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const inboxKey = (): string => self.stableId ?? self.id;
   const inboxKeys = (): string[] => (self.stableId && self.stableId !== self.id ? [self.stableId, self.id] : [self.id]);
   let flushing = false;
+  // Per-process retry set for poison files a claim could neither quarantine nor release (both failed on a transient FS
+  // fault). The flush timer re-attempts them via retryStuckPoison once the fault clears (review bb6dad5-P2-4-B).
+  const stuckPoison = new Set<string>();
   // Work-status is per SESSION IDENTITY, not per MCP-server process: one Codex daemon-backed server can
   // adopt several thread identities over its life (see learnStableId), and each must keep its own status
   // and its own monotonic seq — otherwise thread A's seq would gate thread B's reports.
@@ -98,11 +101,13 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // under the just-adopted stableId would otherwise never be reclaimed (claimInbox only sees `.json`), staying stuck
       // across the restart/adoption (Codex P2-8). Cheap + safe: only a dead pid's claim is released.
       recoverStaleClaims(home, inboxKeys());
+      // Re-attempt any poison stuck from a prior flush (quarantine+release both failed then); clears once the FS heals.
+      retryStuckPoison(home, stuckPoison);
       const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
       // claimInbox claims the WHOLE pending batch up front. On the first push failure (channel not ready) we
       // must release this one AND every still-unprocessed claim — otherwise they are orphaned as .claim-<pid>
       // files that no later flush reclaims (claimInbox only sees .json), stranding the message for good.
-      const claimed = claimInbox(home, inboxKeys(), String(process.pid)); // claimInbox validates + quarantines poison (F28) — msgs here are schema-valid
+      const claimed = claimInbox(home, inboxKeys(), String(process.pid), stuckPoison); // validates + quarantines poison (F28) — msgs here are schema-valid
       for (let i = 0; i < claimed.length; i++) {
         // F28 defense-in-depth: a push that THREW (not just returned false) must never escape flushInbox — this runs as
         // `void flushInbox()`, so an unhandled rejection would crash the whole bus server. Treat a throw as a delivery miss.
@@ -311,7 +316,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // timer never re-delivers the same message.
       const deadline = Date.now() + timeoutMs;
       const drain = (): BusMessage[] =>
-        claimInbox(home, inboxKeys(), String(process.pid)).map((c) => {
+        claimInbox(home, inboxKeys(), String(process.pid), stuckPoison).map((c) => {
           ackInbox(c.file);
           return { from: c.msg.from, fromLabel: c.msg.fromLabel, text: c.msg.text, via: c.msg.via };
         });

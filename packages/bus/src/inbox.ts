@@ -59,13 +59,22 @@ export function quarantineInbox(home: string, claimedFile: string, reason: strin
       try { linkSync(claimedFile, target); break; } // atomic NO-OVERWRITE (P2-3): EEXIST if the name exists -> retry a fresh one
       catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && attempt < 8) continue; throw e; }
     }
-    unlinkSync(claimedFile); // the link holds the bytes in quarantine/ now; remove the source
+    // The link now holds the bytes in quarantine/; remove the source. Best-effort: if the link already succeeded but this
+    // unlink fails (or the source raced away), the bytes ARE preserved in quarantine — do NOT fall into the catch below and
+    // misreport a move that actually happened.
+    try { unlinkSync(claimedFile); } catch { /* bytes already safe via the link */ }
   } catch (e) {
     // The move did NOT happen: either the file already vanished (a concurrent drainer took it — ENOENT) or the FS failed
-    // (mkdir/rename error). In BOTH cases do NOT write a "quarantined" dead-letter — that would be a false audit for a file
+    // (mkdir/link error). In BOTH cases do NOT write a "quarantined" dead-letter — that would be a false audit for a file
     // still in the delivery path (review 6da8b5c-P2-2). The file (if still present) stays .claim-<pid>, safely OUT of the
     // deliverable .json set; recoverStaleClaims + the next claim re-attempt the quarantine. Never throw (don't kill flush).
-    return (e as NodeJS.ErrnoException).code === "ENOENT" ? "vanished" : "failed"; // vanished=raced gone; failed=FS err ⇒ caller releases to retry (P2-2)
+    // ENOENT is AMBIGUOUS (review bb6dad5-P2-4-A): linkSync raises it both when the SOURCE is gone (truly "vanished") AND
+    // when the destination quarantine/ dir was removed between mkdir and link while the source .claim-<pid> is fully
+    // present. errno alone can't tell them apart — so only "vanished" when the source is REALLY gone; otherwise the move
+    // failed with the source still in hand and the caller MUST release it (reporting "vanished" would skip recovery and
+    // strand a live-pid claim, re-opening P2-4).
+    if ((e as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(claimedFile)) return "vanished";
+    return "failed"; // FS err (or ENOENT with source still present) ⇒ caller releases to retry (P2-2/P2-4-A)
   }
   // The file is REALLY quarantined now ⇒ record the dead-letter audit line. Best-effort: if the append fails the bytes are
   // still safely preserved in quarantine/ (the durable evidence), so a lost audit line never risks re-delivery or a crash.
@@ -99,8 +108,10 @@ export function writeInbox(home: string, key: string, msg: InboxMsg): void {
   renameSync(tmp, file);
 }
 
-/** Atomically claim every pending message under ANY of `keys` (oldest first). The claimer must ack or release each. */
-export function claimInbox(home: string, keys: string[], claimer: string): Claimed[] {
+/** Atomically claim every pending message under ANY of `keys` (oldest first). The claimer must ack or release each.
+ *  `stuck` (optional): a per-process set the caller keeps across flushes. A poison file this call can neither quarantine
+ *  NOR release (both failed on a transient FS fault) is recorded here so a later flush re-attempts it — see retryStuckPoison. */
+export function claimInbox(home: string, keys: string[], claimer: string, stuck?: Set<string>): Claimed[] {
   const out: Claimed[] = [];
   const seen = new Set<string>();
   for (const key of keys) {
@@ -121,7 +132,13 @@ export function claimInbox(home: string, keys: string[], claimer: string): Claim
       try { msg = validInboxMsg(JSON.parse(raw)); } catch { msg = null; }
       // poison ⇒ quarantine. A "failed" quarantine (FS error) RELEASES the claim so a later flush retries (recoverStaleClaims
       // won't free this still-LIVE pid) — the move stays a recoverable to-do, never a silently-stuck live-pid claim (P2-2).
-      if (msg === null) { if (quarantineInbox(home, claimed, "schema/parse", raw) === "failed") releaseInbox(claimed); continue; }
+      // If the release ALSO fails (same dir-level fault) the file is stuck as .claim-<our-live-pid> with no auto-retry path;
+      // record it in `stuck` so THIS process re-attempts quarantine on a later flush (review bb6dad5-P2-4-B). After the
+      // process exits the lingering .claim-<dead-pid> is reclaimable by stale recovery as the final backstop.
+      if (msg === null) {
+        if (quarantineInbox(home, claimed, "schema/parse", raw) === "failed" && !releaseInbox(claimed)) stuck?.add(claimed);
+        continue;
+      }
       out.push({ file: claimed, msg });
     }
   }
@@ -133,9 +150,25 @@ export function ackInbox(file: string): void {
   try { unlinkSync(file); } catch { /* already gone */ }
 }
 
-/** Could not deliver -> put it back for a later attempt (strip the .claim-<id> suffix). */
-export function releaseInbox(file: string): void {
-  try { renameSync(file, file.replace(/\.claim-[^.]+$/, "")); } catch { /* best-effort */ }
+/** Could not deliver -> put it back for a later attempt (strip the .claim-<id> suffix). Returns whether the rename
+ *  succeeded: a FALSE return is the caller's signal that the file is still stuck as .claim-<pid> and needs a retry
+ *  obligation recorded (review bb6dad5-P2-4-B) — the failure must not be swallowed silently. */
+export function releaseInbox(file: string): boolean {
+  try { renameSync(file, file.replace(/\.claim-[^.]+$/, "")); return true; } catch { return false; }
+}
+
+/** Re-attempt quarantine for poison files a prior claim could neither quarantine NOR release (both failed on a transient
+ *  FS fault, review bb6dad5-P2-4-B). The caller runs this each flush with its per-process stuck set: once the fault clears
+ *  the file leaves the set. A file that quarantined/vanished has discharged its obligation; one we can at least release
+ *  back to .json becomes reclaimable by the next claim; anything still faulting stays for the next tick (and after this
+ *  process exits, stale recovery reclaims the dead-pid claim). Pure damage-control: never throws. */
+export function retryStuckPoison(home: string, stuck: Set<string>): void {
+  for (const f of stuck) {
+    let raw: string | undefined;
+    try { raw = readFileSync(f, "utf8"); } catch { /* unreadable/gone -> quarantineInbox resolves the vanish below */ }
+    if (quarantineInbox(home, f, "schema/parse", raw) !== "failed") { stuck.delete(f); continue; } // quarantined or vanished
+    if (releaseInbox(f)) stuck.delete(f); // at least back to .json -> a later claim re-handles it; else keep for next tick
+  }
 }
 
 /**
