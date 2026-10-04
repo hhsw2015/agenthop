@@ -158,7 +158,16 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const learnStableId = (id: string | undefined, authoritative: boolean): void => {
     if (!id) return;
     if (self.stableId === id) {
-      if (authoritative) stableIdAuthoritative = true;
+      // A guess for THIS exact id is now confirmed authoritative: record the upgrade (P2-1) so whois gets a HARD claim —
+      // bus-identity correctly refuses to promote the earlier `possible` on its own. Flip once; a repeat authoritative
+      // call for an already-hard id records nothing (no new identity fact).
+      if (authoritative && !stableIdAuthoritative) {
+        stableIdAuthoritative = true;
+        recordLearn(home, self.id, undefined, id, "correction", true);
+        recordSelfObserve(home, self, true, "local");
+      } else if (authoritative) {
+        stableIdAuthoritative = true;
+      }
       return;
     }
     // A daemon guess never overrides an id we already have. Authoritative call metadata (or the env)
@@ -186,6 +195,10 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // authoritative id replacing an authoritative one) / correction (authoritative replacing a guess). authoritative flows
     // through as the confidence source; a correction's fold undoes the corrected old value. Append-only, fails soft.
     recordLearn(home, self.id, hadStableId ? oldKey : undefined, id, hadStableId ? (wasAuthoritative ? "thread-switch" : "correction") : "bootstrap", authoritative);
+    // P2-2: the native learn alone does not record the now-published HANDLE (self.title). Observe the full current identity
+    // (run + handle[derivedFrom native] + native) so whois(handle) resolves — a wait.owner stored as a handle can then get
+    // this entity's probeTargets instead of reading not-seen.
+    recordSelfObserve(home, self, authoritative, "local");
   };
 
   const relay: Relay | undefined = startRelay(self, (from, text) => handleInbound(from, text, "relay"), options);

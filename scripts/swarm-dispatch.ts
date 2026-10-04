@@ -463,6 +463,12 @@ function buildSweepOps(stateRef: { s: LogState }): SweepOps {
       // Route to the DESTINATION: reassign / move-validator notify the NEW owner / validator seat (action.target carries
       // it, so routing is reconstructable from the durable intent); bypass / escalation ping the current owner.
       const recipient = action.actionKind === "reassign" || action.actionKind === "move-validator" ? action.target : w.owner;
+      // P2-3: never route to an AMBIGUOUS identity via the legacy presence scanner — whois candidates means two sessions
+      // share the handle and we cannot tell which is the real owner. Withhold delivery (the wait stays supervised + re-fired)
+      // rather than ping the wrong one; routing resumes once the identity disambiguates. A single whois entity / not-seen
+      // falls through to the existing presence-based inbox resolution.
+      const idlog = readIdentityLog(HOME);
+      if (whois(buildProjection(idlog.events, idlog.corruption), recipient).kind === "candidates") { log(`sweep doAction ${w.waitId}: recipient ${recipient} ambiguous (whois candidates) — withholding delivery`); return false; }
       const sid = resolveSession(recipient, listSessions(HOME));
       if (!sid) { log(`sweep doAction ${w.waitId}: recipient ${recipient} unresolved — not delivered`); return false; }
       const text = action.actionKind === "bypass" ? `[sweep] progress on ${w.waitId}? (subject ${JSON.stringify(w.subject)}) — past deadline`
