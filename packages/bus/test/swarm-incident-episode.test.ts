@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import { mkdtempSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { reconcileIncident, readIncidents, writeIncidents, emptyRegistry, type IncidentRegistry } from "../src/swarm/incident-episode.js";
+import { reconcileIncident, reconcileRegistryWithControl, readIncidents, writeIncidents, emptyRegistry, type IncidentRegistry } from "../src/swarm/incident-episode.js";
 import { makeRepairWaitId, isRepairWaitId } from "../src/swarm/repair-wait-id.js";
 import type { LivenessVerdict } from "../src/swarm/task-liveness-inv1.js";
 
@@ -69,6 +69,40 @@ describe("reconcileIncident", () => {
     expect(makeRepairWaitId("job-x", 1)).toBe("repair-job-x-ep1");           // safe jobId = readable identity
     expect(isRepairWaitId("repair-job-x-ep1")).toBe(true);
     expect(isRepairWaitId("coord-x")).toBe(false);
+  });
+
+  test("19152aa-P1-3 floor: a new episode is bumped past any CONTROL-committed (even resolved) repair-wait id", () => {
+    const r = reconcileIncident(emptyRegistry(), stall(50), 1000, { ...cfg, controlEpisodeFloor: 5 });
+    expect(r.openRepairWait!.waitId).toBe(makeRepairWaitId("job-x", 6)); // 5 (floor) + 1 — never reuses a committed id
+    expect(r.registry.episodes[GK].episode).toBe(6);
+  });
+});
+
+describe("reconcileRegistryWithControl — durable-backstop reconciliation (19152aa-P1-3)", () => {
+  const rw = (ep: number, state: string) => ({ waitId: makeRepairWaitId("job-x", ep), state });
+
+  test("case A: a LIVE CONTROL repair-wait the registry lost is ADOPTED (open-write gap) ⇒ next STALL dedups, no duplicate", () => {
+    const sync = reconcileRegistryWithControl(emptyRegistry(), "job-x", [rw(1, "open")], 1000);
+    expect(sync.controlEpisodeFloor).toBe(1);
+    expect(sync.registry.episodes[GK]).toMatchObject({ episode: 1, open: true, repairWaitId: makeRepairWaitId("job-x", 1) });
+    const r = reconcileIncident(sync.registry, stall(60), 1100, { ...cfg, controlEpisodeFloor: sync.controlEpisodeFloor });
+    expect(r.openRepairWait).toBeUndefined();                               // dedup into the adopted live wait — no second wait
+    expect(r.registry.episodes[GK]).toMatchObject({ episode: 1, open: true, lastObservedSeq: 60 });
+  });
+
+  test("case B: registry OPEN but CONTROL wait RESOLVED (close-write gap) ⇒ sync closes it; a recurrence opens a FRESH episode", () => {
+    const reg1 = reconcileIncident(emptyRegistry(), stall(50), 1000, cfg).registry; // registry: ep1 open
+    const sync = reconcileRegistryWithControl(reg1, "job-x", [rw(1, "resolved")], 1200);
+    expect(sync.registry.episodes[GK]).toMatchObject({ episode: 1, open: false, closedAtSec: 1200 }); // synced closed
+    const recur = reconcileIncident(sync.registry, stall(90), 1300, { ...cfg, controlEpisodeFloor: sync.controlEpisodeFloor });
+    expect(recur.openRepairWait!.waitId).toBe(makeRepairWaitId("job-x", 2)); // a NEW armed repair-wait, not a dedup into stale-open ep1
+  });
+
+  test("no divergence ⇒ registry returned unchanged (identity), floor reflects CONTROL", () => {
+    const reg1 = reconcileIncident(emptyRegistry(), stall(50), 1000, cfg).registry;
+    const sync = reconcileRegistryWithControl(reg1, "job-x", [rw(1, "open")], 1200); // CONTROL live ep1 matches registry open ep1
+    expect(sync.registry).toBe(reg1);          // unchanged (same reference)
+    expect(sync.controlEpisodeFloor).toBe(1);
   });
 });
 

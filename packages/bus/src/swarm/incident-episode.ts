@@ -19,7 +19,7 @@ import { writeFileSync, renameSync, readFileSync, mkdirSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import type { LivenessVerdict } from "./task-liveness-inv1.js";
-import { makeRepairWaitId } from "./repair-wait-id.js";
+import { makeRepairWaitId, repairEpisodeOf } from "./repair-wait-id.js";
 
 /** One incident episode (the durable record). Keyed in the registry by groupKey; lastObservedSeq lives HERE (not on the
  *  WaitRecord, which the pure layer owns and cannot carry incident fields). */
@@ -53,7 +53,7 @@ export type IncidentReconcile = {
  *  recovery is matched on that groupKey; this stays correct if the kernel later adds categories keyed by the same subject. */
 export function reconcileIncident(
   reg: IncidentRegistry, verdict: LivenessVerdict, nowSec: number,
-  cfg: { repairWindowSec: number; owner: string; jobId: string },
+  cfg: { repairWindowSec: number; owner: string; jobId: string; controlEpisodeFloor?: number },
 ): IncidentReconcile {
   const episodes = { ...reg.episodes };
 
@@ -64,8 +64,10 @@ export function reconcileIncident(
       episodes[verdict.groupKey] = { ...existing, lastObservedSeq: verdict.lastObservedSeq, why: verdict.why };
       return { registry: { episodes } };
     }
-    // a new episode: first detection, OR a recurrence AFTER the prior episode was closed (episode = prev + 1).
-    const episode = (existing?.episode ?? 0) + 1;
+    // a new episode: first detection, OR a recurrence AFTER the prior episode was closed. The number is beyond BOTH the
+    // registry's last episode AND any episode already committed in CONTROL (controlEpisodeFloor) — so a registry whose counter
+    // was lost never reuses an id that an already-committed (even resolved) repair-wait still holds (review 19152aa-P1-3 ①).
+    const episode = Math.max(existing?.episode ?? 0, cfg.controlEpisodeFloor ?? 0) + 1;
     const incidentId = `${verdict.groupKey}:episode-${episode}`;
     const rwId = makeRepairWaitId(cfg.jobId, episode); // injective in jobId (review P2-3)
     episodes[verdict.groupKey] = {
@@ -91,6 +93,39 @@ export function reconcileIncident(
 
   // UNVERIFIABLE (no recovery evidence — leave any open episode open), or OK/STALL with nothing to change.
   return { registry: { episodes } };
+}
+
+/** Reconcile the registry against CONTROL (the durable backstop) BEFORE folding the verdict — CONTROL's committed repair-wait
+ *  facts win over a registry whose open/close write was lost (review 19152aa-P1-3). Both resolved-gap edges:
+ *   - A: CONTROL has a LIVE (non-resolved) repair-wait the registry doesn't record as its open episode ⇒ ADOPT it (the open
+ *     write was lost), so the next tick dedups into that live obligation rather than re-opening / resurrecting a resolved id.
+ *   - B: the registry records an open episode but CONTROL has NO live repair-wait for it (resolved/absent) ⇒ the close write
+ *     was lost; sync the episode CLOSED, so a fresh stall opens a NEW episode instead of dedup'ing into one with no live wait.
+ *  Returns controlEpisodeFloor (max episode among this job's CONTROL repair-waits, resolved or not) so a newly opened episode
+ *  never reuses an already-committed id. Pass ONLY this job's repair-waits. Pure; the caller supplies the CONTROL facts + persists. */
+export function reconcileRegistryWithControl(
+  reg: IncidentRegistry, jobId: string, controlRepairWaits: ReadonlyArray<{ waitId: string; state: string }>, nowSec: number,
+): { registry: IncidentRegistry; controlEpisodeFloor: number } {
+  const gk = `${jobId}:no-live-holder`;
+  const episodes = { ...reg.episodes };
+  const live = controlRepairWaits.find((w) => w.state !== "resolved");
+  let floor = 0;
+  for (const w of controlRepairWaits) { const n = repairEpisodeOf(w.waitId, jobId); if (n !== null && n > floor) floor = n; }
+  const ep = episodes[gk];
+  if (live !== undefined) {
+    const liveEp = repairEpisodeOf(live.waitId, jobId);
+    if (liveEp !== null && (ep === undefined || !ep.open || ep.repairWaitId !== live.waitId)) {
+      episodes[gk] = { // adopt the committed live repair-wait as the open episode (its registry open-write was lost) — case A
+        groupKey: gk, episode: liveEp, open: true, incidentId: `${gk}:episode-${liveEp}`,
+        why: ep?.why ?? "adopted from CONTROL live repair-wait", openedAtSec: ep?.openedAtSec ?? nowSec,
+        lastObservedSeq: ep?.lastObservedSeq ?? 0, repairWaitId: live.waitId,
+      };
+    }
+  } else if (ep !== undefined && ep.open) {
+    episodes[gk] = { ...ep, open: false, closedAtSec: nowSec }; // CONTROL has no live wait (close-write lost) ⇒ sync closed — case B
+  }
+  const changed = JSON.stringify(episodes) !== JSON.stringify(reg.episodes);
+  return { registry: changed ? { episodes } : reg, controlEpisodeFloor: floor };
 }
 
 /** Read the durable registry. A missing file ⇒ empty (first run). A corrupt/unreadable file THROWS — the caller is fail-soft

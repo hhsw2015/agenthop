@@ -38,7 +38,7 @@ export type ProjectionFile = { relPath: string; json: unknown };
  *  window — else a reused heartbeat's OK outlives the heartbeat (review 59e7328-P2). The dispatcher therefore passes the
  *  absolute livenessValidUntilSec (= earliest-expiring observation) + livenessSampledAtSec; livenessValidForSec is only a
  *  fallback window when no evidence-bounded value is supplied. */
-export type ProjectOpts = { nowSec: number; jobStartSec?: (jobId: string) => number | undefined; livenessVerdict?: unknown; livenessValidForSec?: number; livenessValidUntilSec?: number; livenessSampledAtSec?: number };
+export type ProjectOpts = { nowSec: number; jobStartSec?: (jobId: string) => number | undefined; livenessVerdict?: unknown; livenessValidForSec?: number; livenessValidUntilSec?: number; livenessSampledAtSec?: number; livenessCutSeq?: number };
 
 const HISTORY_MAX = 8;   // Open question 1: last 8 attempts + count.
 const OBSERVED_MAX = 8;  // §8b observed[]: recent N per attempt.
@@ -109,7 +109,10 @@ export function buildProjectionFiles(state: LogState, opts: ProjectOpts): Projec
   const livenessField = lv === undefined ? {} : {
     livenessVerdict: {
       ...(lv !== null && typeof lv === "object" ? (lv as Record<string, unknown>) : { verdict: lv }),
-      cutSeq: state.seq,
+      // cutSeq = the seq the verdict was EVALUATED over (§1c: a conclusion bound to its cut), which may be BEHIND the projection
+      // water level (meta.lastAppliedSeq): a post-verdict repair-wait commit advances the log but does not re-evaluate the
+      // verdict. Fall back to state.seq only when the caller doesn't supply the evaluation seq (review 19152aa-P2-1).
+      cutSeq: opts.livenessCutSeq ?? state.seq,
       // sample time + validity come from the EVIDENCE (the observations the verdict relied on) when the caller supplies them;
       // the publish-time + window is only a fallback, never an override — a verdict must not outlive its evidence (P2 / 59e7328).
       sampledAtSec: opts.livenessSampledAtSec ?? opts.nowSec,

@@ -10,3 +10,12 @@
 export const REPAIR_WAIT_PREFIX = "repair-";
 export const makeRepairWaitId = (jobId: string, episode: number): string => `${REPAIR_WAIT_PREFIX}${encodeURIComponent(jobId)}-ep${episode}`;
 export const isRepairWaitId = (waitId: string): boolean => waitId.startsWith(REPAIR_WAIT_PREFIX);
+
+/** The episode number encoded in `waitId` for `jobId`, or null if it is not this job's repair-wait. Lets the IO layer
+ *  reconcile the episode counter against CONTROL (the durable backstop) when the registry's own counter was lost (P1-3). */
+export function repairEpisodeOf(waitId: string, jobId: string): number | null {
+  const prefix = `${REPAIR_WAIT_PREFIX}${encodeURIComponent(jobId)}-ep`;
+  if (!waitId.startsWith(prefix)) return null;
+  const rest = waitId.slice(prefix.length);
+  return /^\d+$/.test(rest) ? Number(rest) : null;
+}

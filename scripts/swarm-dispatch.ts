@@ -44,7 +44,8 @@ import { writeProjection } from "../packages/bus/src/swarm/projection.js";
 import { beatStart, beatEnd } from "../packages/bus/src/swarm/heartbeat.js";
 import { buildControlCut, heartbeatObservations } from "../packages/bus/src/swarm/liveness-review.js";
 import { assertLiveness, type LivenessVerdict, type ControlCut, type ObservationFact } from "../packages/bus/src/swarm/task-liveness-inv1.js";
-import { reconcileIncident, readIncidents, writeIncidents, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
+import { reconcileIncident, reconcileRegistryWithControl, readIncidents, writeIncidents, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
+import { isRepairWaitId } from "../packages/bus/src/swarm/repair-wait-id.js";
 import { advanceWait } from "../packages/bus/src/swarm/task-wait.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
@@ -572,10 +573,10 @@ async function main(): Promise<void> {
     const b = Object.values(liveEntities(st)).find((x) => x.put === "wait" && (x as Extract<ChangeBody, { put: "wait" }>).wait.waitId === id);
     return b === undefined ? undefined : (b as Extract<ChangeBody, { put: "wait" }>).wait;
   };
-  const applyIncidentReconcile = (reg: IncidentRegistry, verdict: LivenessVerdict, cut: ControlCut, obs: ObservationFact[], openEp: number | undefined, jobId: string): LivenessVerdict => {
+  const applyIncidentReconcile = (reg: IncidentRegistry, verdict: LivenessVerdict, cut: ControlCut, obs: ObservationFact[], openEp: number | undefined, jobId: string, controlEpisodeFloor: number): LivenessVerdict => {
     try {
       const owner = REPAIR_OWNER_ROUTABLE ? REPAIR_OWNER : SELF; // P2-2: a routable repair owner when configured, else labeled best-effort
-      const rec = reconcileIncident(reg, verdict, nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner, jobId });
+      const rec = reconcileIncident(reg, verdict, nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner, jobId, controlEpisodeFloor });
       if (rec.openRepairWait === undefined && rec.resolveRepairWait === undefined) {
         if (JSON.stringify(rec.registry) !== JSON.stringify(reg)) writeIncidents(INCIDENTS_FILE, rec.registry); // dedup lastObservedSeq bump
         return verdict;
@@ -587,12 +588,15 @@ async function main(): Promise<void> {
         const spec = rec.openRepairWait;
         const existing = findWaitIn(fresh, spec.waitId);
         if (existing !== undefined && existing.state !== "resolved") {
-          // ADOPT (review P1-3): the repair-wait is ALREADY committed in CONTROL — a prior tick committed it but the registry
-          // write didn't land, or the sweep has since advanced it to action_pending. Re-putting would clobber its phase /
-          // deadline / pendingAction (erase committed progress). Treat as satisfied; just (re)persist the registry so the two
-          // stores reconverge on the EXISTING wait, never a reset one.
+          // ADOPT (review P1-3): the repair-wait is ALREADY live in CONTROL — a prior tick committed it but the registry write
+          // didn't land, or the sweep advanced it to action_pending. Re-putting would clobber its phase/deadline/pendingAction.
           committed = true;
-          log(`repair-wait ${spec.waitId} already in CONTROL (state=${existing.state}) — adopting, not re-opening (P1-3)`);
+          log(`repair-wait ${spec.waitId} already live in CONTROL (state=${existing.state}) — adopting, not re-opening (P1-3)`);
+        } else if (existing !== undefined) {
+          // existing is RESOLVED: re-putting would RESURRECT it + erase its resolution (review 19152aa-P1-3 A). The episode floor
+          // should have bumped past it — defer this tick; next tick reconcileRegistryWithControl's floor yields a fresh id.
+          log(`repair-wait ${spec.waitId} exists RESOLVED in CONTROL — NOT resurrecting; deferring (floor bumps next tick)`);
+          return verdict;
         } else {
           const w: WaitRecord = { waitId: spec.waitId, kind: "wait", subject: { jobId: spec.jobId }, state: "open", deadlineSec: spec.deadlineSec, owner: spec.owner, timeoutPolicy: "escalate" };
           committed = commitTask(fresh, [{ put: "wait", wait: w }]).result.ok;
@@ -630,6 +634,18 @@ async function main(): Promise<void> {
         // false-empty registry that would reset episode history (review P1-2); ENOENT returns an empty registry (legit first run).
         let reg: IncidentRegistry | null = null;
         try { reg = readIncidents(INCIDENTS_FILE); } catch (e) { log(`incidents read failed — SKIPPING incident reconcile this tick (no reset): ${e instanceof Error ? e.message : e}`); }
+        // Reconcile the registry against CONTROL (the durable backstop) BEFORE deciding: adopt a live committed repair-wait the
+        // registry lost, close an episode whose repair-wait already recovered in CONTROL, and get the episode floor so a new one
+        // never resurrects/collides with a committed id (review 19152aa-P1-3). Persist the correction (fail-soft).
+        let controlEpisodeFloor = 0;
+        if (reg !== null) {
+          const jobRepairWaits = Object.values(liveEntities(st))
+            .filter((b) => b.put === "wait" && isRepairWaitId((b as Extract<ChangeBody, { put: "wait" }>).wait.waitId) && (b as Extract<ChangeBody, { put: "wait" }>).wait.subject.jobId === plan.jobId)
+            .map((b) => { const w = (b as Extract<ChangeBody, { put: "wait" }>).wait; return { waitId: w.waitId, state: w.state }; });
+          const sync = reconcileRegistryWithControl(reg, plan.jobId, jobRepairWaits, nowSec());
+          controlEpisodeFloor = sync.controlEpisodeFloor;
+          if (sync.registry !== reg) { try { writeIncidents(INCIDENTS_FILE, sync.registry); } catch (e) { log(`incidents sync write failed: ${e instanceof Error ? e.message : e}`); } reg = sync.registry; }
+        }
         const ep = reg?.episodes[`${plan.jobId}:no-live-holder`];
         const openEp = ep?.open ? ep.episode : undefined;
         const cut = buildControlCut(plan.jobId, st, nowSec(), { jobStartSec: jobStartSec(plan.jobId), openIncidentEpisode: openEp });
@@ -642,7 +658,7 @@ async function main(): Promise<void> {
             const hb = JSON.parse(readFileSync(HEARTBEAT_FILE, "utf8"));
             const obs = heartbeatObservations(hb, LIVENESS_WINDOW_SEC);
             let verdict = assertLiveness({ controlCut: cut, observations: obs, modes: modesNow() }, nowSec());
-            if (reg !== null) verdict = applyIncidentReconcile(reg, verdict, cut, obs, openEp, plan.jobId); // STALL⇒episode+repair-wait; OK⇒close (skipped if registry unknown)
+            if (reg !== null) verdict = applyIncidentReconcile(reg, verdict, cut, obs, openEp, plan.jobId, controlEpisodeFloor); // STALL⇒episode+repair-wait; OK⇒close (skipped if registry unknown)
             livenessVerdict = verdict;
             // Evidence-bounded freshness (review 59e7328-P2): the verdict is valid only until its EARLIEST-expiring observation,
             // NOT publish-time + window — otherwise a reused heartbeat's OK outlives the heartbeat it relied on. No obs ⇒ now.
@@ -653,7 +669,9 @@ async function main(): Promise<void> {
       }
       // Publish over the CURRENT state: applyIncidentReconcile may have committed a repair-wait (advancing CONTROL), so reload —
       // writing the pre-commit `st` would regress meta + PRUNE the just-committed repair-wait's projection file (review P2-1).
-      writeProjection(PROJECTION_DIR, loadControlLog(CONTROL_LOG_DIR), { nowSec: nowSec(), jobStartSec, livenessVerdict, livenessSampledAtSec, livenessValidUntilSec });
+      // But the verdict was EVALUATED over `st` (seq before that commit), so stamp livenessCutSeq = st.seq — the verdict binds to
+      // its own cut, not the advanced water level (review 19152aa-P2-1). meta.lastAppliedSeq still reflects the reloaded state.
+      writeProjection(PROJECTION_DIR, loadControlLog(CONTROL_LOG_DIR), { nowSec: nowSec(), jobStartSec, livenessVerdict, livenessSampledAtSec, livenessValidUntilSec, livenessCutSeq: st.seq });
     } catch (e) { log(`projection refresh failed: ${e instanceof Error ? e.message : e}`); }
   };
 

@@ -218,6 +218,14 @@ describe("projection review fixes", () => {
     // as publish-time + a full window. Publish at t=1119 off a heartbeat valid only to 1120 ⇒ validUntil 1120, not 1239.
     const ev = byPath(buildProjectionFiles(s, { nowSec: 1119, livenessVerdict: { verdict: "OK" }, livenessValidUntilSec: 1120, livenessSampledAtSec: 1000 }), "meta.json");
     expect(ev.livenessVerdict).toMatchObject({ verdict: "OK", cutSeq: s.seq, sampledAtSec: 1000, validUntilSec: 1120 });
+    // 19152aa-P2-1: the verdict's cutSeq is the seq it was EVALUATED over (behind the water level after a post-verdict commit),
+    // NOT the projection's current state.seq. meta.lastAppliedSeq stays the water level; the two are separated.
+    let s2 = initialLogState(); s2 = stamp(s2, [planBody(plan1())]); s2 = stamp(s2, [{ put: "attempt", attempt: attempt({ specDigest: plan1().nodes[0]!.specDigest }) }]);
+    const behind = byPath(buildProjectionFiles(s2, { nowSec: 1000, livenessVerdict: { verdict: "STALL", lastObservedSeq: 1 }, livenessCutSeq: 1 }), "meta.json");
+    expect(behind.lastAppliedSeq).toBe(s2.seq);       // water level = current state (ahead)
+    expect(behind.lastAppliedSeq).toBeGreaterThan(1);
+    expect(behind.livenessVerdict.cutSeq).toBe(1);    // verdict bound to ITS own cut, not the advanced water level
+    expect(behind.livenessVerdict.lastObservedSeq).toBe(1);
     const without = byPath(buildProjectionFiles(s, { nowSec: 1000 }), "meta.json");
     expect("livenessVerdict" in without).toBe(false);
   });
