@@ -12,6 +12,7 @@ import { recordSelfObserve, recordLearn } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox } from "./inbox.js";
 import { fallbackForUnresolved, fallbackForMissedDelivery } from "./send-fallback.js";
 import { resolveSession, listSessions } from "./swarm/task-liveness.js";
+import { reportCheckIn } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 
@@ -295,6 +296,12 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   void flushInbox();
   const flushTimer = setInterval(() => void flushInbox(), 5000);
   flushTimer.unref?.();
+
+  // bus-reachability §4: announce this (re)started node to the coordinator's durable inbox so the coordinator learns of
+  // the session without relying on a prompt the LLM must remember to send. Gated on SWARM_COORDINATOR, never to self,
+  // fail-soft. A Claude node has its stableId at startup; a Codex node that learns its thread id later gets its durable
+  // re-announce through the reconnect/re-register path (Stage C), not here.
+  reportCheckIn(home, self, process.env.SWARM_COORDINATOR);
 
   return {
     self,
