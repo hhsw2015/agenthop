@@ -324,12 +324,13 @@ function frozenRefsMismatch(got: FrozenRefs | undefined, want: FrozenRefs): stri
  *  node's coverage. Catches the structural bypasses a/b/c miss — deleting all design nodes (still cross-domain) or
  *  covering only a subset. (Structural dangling/ancestor/non-empty is validateR4Coverage's job.) */
 function validateManagedT3(specs: TaskSpec[], opts: ManagedT3Opts): string | null {
-  const impl = specs.filter((s) => s.kind !== "design");
   // A critical node with an unknown-risk path should have been needsClarification, never loadable (c790ff1d ③ /
-  // errata 0b966a11) — the loader re-verifies this with the persisted criticalPath, not by trusting the planner.
-  for (const s of impl) if (s.criticalPath === true) for (const p of s.sourceWriteScope ?? []) {
+  // errata 0b966a11). This applies to EVERY node — INCLUDING a design gate itself (don't gate a design with a design,
+  // just reject the unclarified plan); so it runs over all specs, not the impl-only filter used for coverage.
+  for (const s of specs) if (s.criticalPath === true) for (const p of s.sourceWriteScope ?? []) {
     if (overlapsAny(p, opts.riskPolicy.undecidablePrefixes)) return `managed-t3: node ${s.nodeId} is criticalPath with unknown-risk path ${p} — should be needsClarification, not loadable`;
   }
+  const impl = specs.filter((s) => s.kind !== "design");
   const assess = evaluateR4(impl, opts.ownerDomainPolicy, opts.riskPolicy);
   if (!assess.designRequired) return null;
   const covered = new Set<string>();

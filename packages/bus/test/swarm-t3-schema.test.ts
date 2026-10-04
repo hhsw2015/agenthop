@@ -127,6 +127,16 @@ describe("managed-t3 critical∧unknown rejection (errata 0b966a11): loader re-v
     expect(falsey.ok && falsey.plan.nodes.find((n) => n.nodeId === "M")!.criticalPath === false).toBe(true); // loadable + field preserved
     expect(mk(true).ok).toBe(false); // flipping to true -> loader rejects (should be needsClarification)
   });
+  test("the critical∧unknown check covers a DESIGN node itself (not only impl nodes)", () => {
+    const mD = computeSpecDigest(fullSpec({ nodeId: "M", dependsOn: ["design-gate"] }));
+    const p = plan([
+      raw({ nodeId: "design-gate", kind: "design", dependsOn: [], coveredSpecDigests: [mD], criticalPath: true, sourceWriteScope: ["ops/unknown/x.ts"] }),
+      raw({ nodeId: "M", dependsOn: ["design-gate"] }),
+    ], { frozenRefs: refs });
+    const opts = { mode: "managed-t3" as const, ownerDomainPolicy: { version: "op1", ownerByPrefix: [], frozenScopePrefixes: [] }, riskPolicy: { version: "rp1", irreversiblePrefixes: [], undecidablePrefixes: ["ops/unknown/"] }, expectedFrozenRefs: refs };
+    const r = loadPlan(p, opts);
+    expect(r.ok === false && /design-gate|criticalPath/.test(r.reason)).toBe(true);
+  });
 });
 
 describe("payloadRef carrier on query-wait (field only; bundle store/resume = T3b)", () => {
