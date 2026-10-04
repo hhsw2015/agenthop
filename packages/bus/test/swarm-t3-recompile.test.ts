@@ -255,8 +255,24 @@ describe("reviewer counterexamples (bccf629 round)", () => {
     const withEvidence = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: f.ownerDomainPolicy, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs, resolvedRisk: r.resolvedRisk });
     expect(withEvidence.ok).toBe(true);
     // evidence whose specDigest does NOT match the node (② scope/identity tamper) is not honored => gate stands => rejected
-    const wrong = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: f.ownerDomainPolicy, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs, resolvedRisk: { A: { risk: "reversible", specDigest: "0".repeat(64) } } });
+    const wrong = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: f.ownerDomainPolicy, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs, resolvedRisk: { A: { risk: "reversible", specDigest: "0".repeat(64), answeredPaths: ["src/exp/a.ts"] } } });
     expect(wrong.ok).toBe(false);
+  });
+  test("R4-P1-1: stale evidence cannot clear a path the NEW policy added as unknown (answered-paths coverage)", () => {
+    const rpOld = fc({ riskPolicy: { version: "rp1", irreversiblePrefixes: [], undecidablePrefixes: ["src/exp/a.ts"] }, roleCatalog: { version: "rc1", roles: { impl: { floor: "standard", fileDomain: ["src/"] } } }, ownerDomainPolicy: { version: "op1", ownerByPrefix: [{ prefix: "src/", domain: "d" }], frozenScopePrefixes: [] } });
+    const d = draft([task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts", "src/exp/b.ts"], criticalPath: true })]);
+    // only a.ts is unknown under rpOld => only q-risk-A-0 asked => answer reversible => evidence answeredPaths=[a.ts]
+    const r = recompilePlan({ draft: d, fc: rpOld, answers: answersFor(d, rpOld, () => true), snapshotDigest: "s" });
+    expect(r.outcome).toBe("loadable");
+    if (r.outcome !== "loadable") return;
+    const refs = r.plan.frozenRefs!;
+    // NEW policy (same version string, aliased) now also marks b.ts unknown; reuse the OLD evidence
+    const rpNew = { version: "rp1", irreversiblePrefixes: [], undecidablePrefixes: ["src/exp/a.ts", "src/exp/b.ts"] };
+    const reloaded = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: rpOld.ownerDomainPolicy, riskPolicy: rpNew, expectedFrozenRefs: refs, resolvedRisk: r.resolvedRisk });
+    expect(reloaded.ok).toBe(false); // b.ts was never answered => not covered => A stays unknown => gate => rejected
+    // control: under the ORIGINAL policy the same evidence loads
+    const ok = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: rpOld.ownerDomainPolicy, riskPolicy: rpOld.riskPolicy, expectedFrozenRefs: refs, resolvedRisk: r.resolvedRisk });
+    expect(ok.ok).toBe(true);
   });
   test("R2-②: tampering a resolved node's scope changes its specDigest => evidence no longer matches => gate stands", () => {
     const f = riskFc();

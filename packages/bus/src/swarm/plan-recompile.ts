@@ -80,8 +80,10 @@ export function mintPlanOperationId(i: PlanOpInput): string {
   return digestOf({ ns: PLAN_OP_NAMESPACE, planningRequestId: i.planningRequestId, entityKey: i.entityKey, actionKind: i.actionKind, snapshotDigest: i.snapshotDigest, canonicalAnswerSetDigest: i.canonicalAnswerSetDigest });
 }
 
+/** The per-node resolution a projection yields: the risk plus the exact paths that were answered for that node. */
+export type NodeResolution = { risk: NodeRisk; answeredPaths: string[] };
 export type ProjectResult =
-  | { ok: true; resolvedRisk: Record<string, NodeRisk>; canonAnswers: CanonicalAnswer[] }
+  | { ok: true; resolvedRisk: Record<string, NodeResolution>; canonAnswers: CanonicalAnswer[] }
   | { ok: false; reason: string }
   | { incomplete: true; unanswered: string[] };
 
@@ -102,11 +104,14 @@ export function projectAnswers(draft: Draft, fc: FrozenContext, answers: Clarifi
   const unanswered = targets.filter((t) => !byId.has(t.questionId)).map((t) => t.questionId);
   if (unanswered.length > 0) return { incomplete: true, unanswered };
 
-  // Per-node aggregate (conservative): any irreversible answer for a node => the node is irreversible; else reversible.
-  const perNode = new Map<string, NodeRisk>();
+  // Per-node aggregate (conservative): any irreversible answer => irreversible; else reversible. Track the answered paths so
+  // the evidence can be checked against the loader's current unknown-path set.
+  const perNode = new Map<string, NodeResolution>();
   for (const t of targets) {
     const rev = byId.get(t.questionId)!.reversible;
-    perNode.set(t.nodeId, perNode.get(t.nodeId) === "irreversible" || !rev ? "irreversible" : "reversible");
+    const prev = perNode.get(t.nodeId);
+    const paths = prev ? (prev.answeredPaths.includes(t.path) ? prev.answeredPaths : [...prev.answeredPaths, t.path]) : [t.path];
+    perNode.set(t.nodeId, { risk: prev?.risk === "irreversible" || !rev ? "irreversible" : "reversible", answeredPaths: paths });
   }
   return { ok: true, resolvedRisk: Object.fromEntries(perNode), canonAnswers: canon };
 }
@@ -122,10 +127,11 @@ export type RecompileInput = {
   /** The control action kind this commit will carry (default "plan"). */
   actionKind?: string;
 };
-/** Trusted per-node risk EVIDENCE for the managed loader: bound to the node's TASK IDENTITY (specDigest), not just its
- *  nodeId — so a plan whose node scope/path was tampered (changing its specDigest) no longer matches and the override is
- *  not honored (reviewer ②: the gate stands). */
-export type RiskEvidence = Record<string, { risk: NodeRisk; specDigest: string }>;
+/** Trusted per-node risk EVIDENCE for the managed loader. Bound to BOTH (a) the node's TASK IDENTITY (specDigest) — so a
+ *  tampered scope no longer matches — AND (b) the exact ANSWERED paths — so the override is honored only when every path
+ *  that is unknown under the LOADER'S CURRENT policy was actually answered. A policy that adds a new unknown path to the
+ *  same node (specDigest unchanged) is therefore NOT cleared by stale evidence (reviewer ①). */
+export type RiskEvidence = Record<string, { risk: NodeRisk; specDigest: string; answeredPaths: string[] }>;
 
 export type RecompileResult =
   | { outcome: "loadable"; plan: TaskPlan; operationId: string; snapshotDigest: string; answerSetDigest: string; resolvedRisk: RiskEvidence; projectedDraft: Draft; projectedFc: FrozenContext }
@@ -160,9 +166,9 @@ export function recompilePlan(i: RecompileInput): RecompileResult {
     snapshotDigest: i.snapshotDigest,
     canonicalAnswerSetDigest: answerSetDigest,
   });
-  // Build spec-bound evidence from the PRODUCED plan (each resolved node's specDigest), so a consumer can managed-reload.
+  // Build evidence from the PRODUCED plan (each resolved node's specDigest) + the answered paths, so a consumer can managed-reload.
   const resolvedRisk: RiskEvidence = {};
-  for (const n of res.plan.nodes) if (n.resolvedRisk !== undefined) resolvedRisk[n.nodeId] = { risk: n.resolvedRisk, specDigest: n.specDigest };
+  for (const n of res.plan.nodes) if (n.resolvedRisk !== undefined) resolvedRisk[n.nodeId] = { risk: n.resolvedRisk, specDigest: n.specDigest, answeredPaths: proj.resolvedRisk[n.nodeId]?.answeredPaths ?? [] };
   return { outcome: "loadable", plan: res.plan, operationId, snapshotDigest: i.snapshotDigest, answerSetDigest, resolvedRisk, projectedDraft: i.draft, projectedFc: i.fc };
 }
 
@@ -174,13 +180,19 @@ export function clarificationResolution(reversible: boolean, sourceOperationId: 
   return { outcome: reversible ? CLARIFY_OUTCOME.reversible : CLARIFY_OUTCOME.irreversible, reason: `requester clarified: ${reversible ? "reversible" : "irreversible"}`, sourceOperationId };
 }
 
-/** The DURABLE per-question binding a query-wait must carry as its payloadRef: digest(bundle payloadRef, questionId). It
- *  binds the wait to ONE specific question of ONE snapshot, so a single closed wait cannot be re-pasted onto another
- *  question (reviewer ①) — only the bundle-level ref is not enough. The clarification handler opens each query-wait with
- *  this ref; resumeFromClosedWaits re-derives and checks it. */
-export const QUESTION_WAIT_NS = "swarm-clarify-wait/1";
+/** The DURABLE per-question binding a query-wait carries as its payloadRef: a COMPOSITE "<bundlePayloadRef>:<questionId>".
+ *  It binds the wait to ONE question of ONE snapshot (so a single close cannot be re-pasted onto another question — reviewer
+ *  round-4 ①) AND keeps the bundle payloadRef RECOVERABLE from the wait alone (so a restart can loadBundle it — reviewer
+ *  round-5 ②; the bundle-ref-only contract of design line 21 is preserved, just with a question suffix). The bundle ref is
+ *  64-hex (no ':'), so the FIRST ':' splits it from the questionId. */
 export function questionWaitRef(payloadRef: string, questionId: string): string {
-  return digestOf({ ns: QUESTION_WAIT_NS, payloadRef, questionId });
+  return `${payloadRef}:${questionId}`;
+}
+export function parseQuestionWaitRef(ref: string | undefined): { payloadRef: string; questionId: string } | null {
+  if (typeof ref !== "string") return null;
+  const idx = ref.indexOf(":");
+  if (idx <= 0 || idx === ref.length - 1) return null;
+  return { payloadRef: ref.slice(0, idx), questionId: ref.slice(idx + 1) };
 }
 
 const CLARIFY_OUTCOMES: ReadonlySet<string> = new Set([CLARIFY_OUTCOME.reversible, CLARIFY_OUTCOME.irreversible]);

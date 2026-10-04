@@ -13,7 +13,7 @@
  */
 
 import { loadBundle, loadFrozenContext, storeBundle, storeFrozenContext, prdDigestOf, frozenRefsOf, type ResumeBundle } from "./plan-bundle.js";
-import { recompilePlan, answersFromClosedWaits, questionWaitRef, type ClarificationAnswer, type RecompileResult } from "./plan-recompile.js";
+import { recompilePlan, answersFromClosedWaits, parseQuestionWaitRef, type ClarificationAnswer, type RecompileResult } from "./plan-recompile.js";
 import { digestOf } from "./digest.js";
 import type { Draft, FrozenContext } from "./task-translate.js";
 import type { WaitRecord } from "./control-log.js";
@@ -61,16 +61,25 @@ export function resumeClarification(i: ResumeInput, dirs: ResumeDirs = {}): Resu
  *  THIS payloadRef (reject a wait for a different snapshot) and carry a clarification close (answersFromClosedWaits); the
  *  winner is the close FACT (advanceWait first-close-wins), never a caller casSeq. */
 export type ClosedWaitEntry = { questionId: string; wait: WaitRecord };
-export function resumeFromClosedWaits(i: { payloadRef: string; closedWaits: ClosedWaitEntry[]; actionKind?: string }, dirs: ResumeDirs = {}): ResumeResult {
-  // Per-QUESTION binding (reviewer ①): each wait must carry the durable questionWaitRef(payloadRef, questionId) — so ONE
-  // closed wait cannot be re-pasted onto another question. The bundle-level payloadRef alone is not enough.
+/** Resume from CLOSED clarification waits. Each wait's payloadRef is the composite "<bundleRef>:<questionId>": this both
+ *  (a) binds the wait to ONE question (a close cannot be re-pasted onto another — the parsed questionId must match the
+ *  entry) and (b) makes the bundle ref RECOVERABLE from the wait alone, so a restart can resume with no separate ref.
+ *  payloadRef is optional (derived from the waits when omitted); when supplied it must agree with the derived one. */
+export function resumeFromClosedWaits(i: { payloadRef?: string; closedWaits: ClosedWaitEntry[]; actionKind?: string }, dirs: ResumeDirs = {}): ResumeResult {
+  if (i.closedWaits.length === 0) return { outcome: "rejected", reason: "no closed waits to resume from" };
   const seen = new Set<string>();
+  let bundleRef: string | undefined;
   for (const { questionId, wait } of i.closedWaits) {
     if (seen.has(questionId)) return { outcome: "rejected", reason: `duplicate closed-wait entry for ${questionId}` };
     seen.add(questionId);
-    if (wait.payloadRef !== questionWaitRef(i.payloadRef, questionId)) return { outcome: "rejected", reason: `wait for ${questionId} is not bound to this question of this snapshot (payloadRef mismatch) — re-pasted or cross-snapshot answer` };
+    const parsed = parseQuestionWaitRef(wait.payloadRef);
+    if (parsed === null || parsed.questionId !== questionId) return { outcome: "rejected", reason: `wait for ${questionId} is not bound to this question (payloadRef "${String(wait.payloadRef)}") — re-pasted or malformed` };
+    if (bundleRef === undefined) bundleRef = parsed.payloadRef;
+    else if (bundleRef !== parsed.payloadRef) return { outcome: "rejected", reason: "closed waits span different snapshots" };
   }
+  const payloadRef = i.payloadRef ?? bundleRef!;
+  if (bundleRef !== payloadRef) return { outcome: "rejected", reason: "supplied payloadRef does not match the waits' bound snapshot" };
   const derived = answersFromClosedWaits(i.closedWaits);
   if (!derived.ok) return { outcome: "rejected", reason: derived.reason };
-  return resumeClarification({ payloadRef: i.payloadRef, answers: derived.answers, ...(i.actionKind !== undefined ? { actionKind: i.actionKind } : {}) }, dirs);
+  return resumeClarification({ payloadRef, answers: derived.answers, ...(i.actionKind !== undefined ? { actionKind: i.actionKind } : {}) }, dirs);
 }

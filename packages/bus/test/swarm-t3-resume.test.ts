@@ -104,6 +104,13 @@ describe("storeResumeState + resumeClarification round-trip", () => {
     const r = resumeFromClosedWaits({ payloadRef, closedWaits: [{ questionId: qid, wait: closed.wait }] }, dirs);
     expect(r.outcome).toBe("rejected");
   });
+  test("R4-P2-1: restart recovers the bundle ref from the closed wait ALONE (no separately-passed payloadRef)", () => {
+    const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);
+    const qid = clarifyTargets(draft, fc())[0]!.questionId;
+    const wait = closedFor(payloadRef, qid, true); // wait.payloadRef = `${payloadRef}:${qid}` (bundle ref recoverable)
+    const r = resumeFromClosedWaits({ closedWaits: [{ questionId: qid, wait }] }, dirs); // NO payloadRef passed
+    expect(r.outcome).toBe("loadable");
+  });
   test("R3-P1-1: ONE real close cannot be re-pasted onto two questions (per-question binding)", () => {
     const two: Draft = { jobId: "jobR2", tasks: [
       task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts"] }),

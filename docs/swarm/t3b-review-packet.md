@@ -93,18 +93,29 @@ map derived from the closed clarification waits (bound to the payloadRef). A for
 | R3-P1-2 | trusted evidence bound to nodeId scalar only → stale evidence passes a new/added task path | evidence is `{risk, specDigest}`; the loader recomputes specDigest from the candidate content and honors only on a match (tamper → gate stands) | swarm-t3-recompile "R2-② scope tamper" + "① not trusted" |
 | R3-P2-1 | a legit timeout-default clarification close was always rejected | `answersFromClosedWaits` recovers `default-applied` when `defaultOnTimeout` was a clarification; isGranted stays false | swarm-t3-recompile "R2-③" + swarm-t3-resume "R3-P2-1" |
 
+## Round-5 disposition — reviewer 8dab1a8 re-review (1 P1 / 1 P2), all addressed
+
+| # | Finding | Fix | Pinned by |
+|---|---|---|---|
+| R4-P1-1 | evidence bound to specDigest only → a NEW policy that adds an unknown path (same task identity) is cleared by stale evidence | evidence carries `answeredPaths`; the loader honors `resolvedRisk` only when every path unknown under ITS policy was answered | swarm-t3-recompile "R4-P1-1" (stale evidence + new policy → rejected; original policy → loads) |
+| R4-P2-1 | `questionWaitRef` was a pure hash → bundle ref not recoverable from the wait (restart → ENOENT) | composite `"<bundleRef>:<questionId>"`; `resumeFromClosedWaits` parses the bundle ref from the wait (restart with no separate ref) | swarm-t3-resume "R4-P2-1" (restart from the wait alone) |
+
 ## Non-obvious decisions / seams to probe
 
 - **projectAnswers → per-node risk (round-3, design §3).** An answer resolves the ANSWERED node only (irreversible if any of
   its own answers is irreversible, else reversible), as a `resolvedRisk` on that node — NOT a global path-set edit. An
   unanswered node (even one sharing or overlapping the path) keeps its policy unknown-risk and its gate. `criticalPath` is
   never rewritten. A policy-known-irreversible path always still gates (the override governs only the unknown dimension).
-- **resolvedRisk trust (reviewer ①②, asymmetric forgery).** `reversible` can remove a gate, so the managed loader never
-  trusts the serialized field: it honors a node's `resolvedRisk` only when the caller's trusted evidence matches BOTH the
-  value AND the node's recomputed `specDigest` (task identity). A tampered scope (new/added path) changes specDigest →
-  evidence no longer matches → gate stands. Evidence comes from `resumeFromClosedWaits` (closed clarification facts).
-- **Wait→question binding (reviewer ①).** Each query-wait carries `questionWaitRef(payloadRef, questionId)` as its payloadRef,
-  so one closed wait cannot be re-pasted onto another question; `resumeFromClosedWaits` re-derives and checks it.
+- **resolvedRisk trust (asymmetric forgery).** `reversible` can remove a gate, so the managed loader never trusts the
+  serialized field. Evidence is `{risk, specDigest, answeredPaths}` and a node's `resolvedRisk` is honored only when the
+  evidence matches ALL of: the value, the node's recomputed `specDigest` (a tampered scope changes it), AND every path that
+  is unknown under THIS loader's policy is in `answeredPaths` (so a policy that ADDS an unknown path to the same node is not
+  cleared by stale evidence). Evidence comes from `resumeFromClosedWaits` (closed clarification facts). Policy-known
+  irreversible always still gates (the override governs only the unknown dimension).
+- **Wait→question binding + restart recovery.** Each query-wait carries the COMPOSITE `questionWaitRef(payloadRef, questionId)`
+  = `"<bundleRef>:<questionId>"` as its payloadRef: it binds the wait to ONE question (a close cannot be re-pasted onto
+  another — the parsed questionId must match) AND keeps the bundle ref RECOVERABLE from the wait alone, so a restart resumes
+  with no separately-held ref (`resumeFromClosedWaits` parses it, honoring design line 21's snapshot-recoverable contract).
 - **Timeout-default recovery (reviewer ③).** `answersFromClosedWaits` recovers an `outcome="default-applied"` close only when
   the pre-stored `defaultOnTimeout` was itself a clarification resolution; cancel/supersede/open are not answers. `isGranted`
   stays false throughout (a query close never grants execution).

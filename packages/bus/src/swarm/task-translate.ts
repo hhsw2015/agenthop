@@ -155,7 +155,7 @@ function outputContractOf(t: Record<string, unknown>, at: string): { reason: str
 /** opts.resolvedRisk: a TRUSTED per-node risk map (nodeId -> reversible|irreversible) supplied ONLY by the recompile after
  *  a requester clarification (design §3 "节点显式标记"). A raw draftPlan call omits it — the LLM draft cannot self-declare
  *  risk. It is stamped onto nodes AND passed as evidence to the self-check loadPlan so the gate decision stays consistent. */
-export type TranslateOpts = { resolvedRisk?: Record<string, NodeRisk> };
+export type TranslateOpts = { resolvedRisk?: Record<string, { risk: NodeRisk; answeredPaths: string[] }> };
 
 export function translateDraft(draft: Draft, fc: FrozenContext, opts: TranslateOpts = {}): TranslateResult {
   if (!isObj(draft) || !isNonEmptyStr(draft.jobId)) return R("draft.jobId must be a non-empty string");
@@ -261,7 +261,7 @@ export function translateDraft(draft: Draft, fc: FrozenContext, opts: TranslateO
       modelTier,
       ...(resolvedRole !== undefined ? { roleProfile: resolvedRole } : {}),
       ...(t.criticalPath === true ? { criticalPath: true } : {}),
-      ...(opts.resolvedRisk?.[t.nodeId] !== undefined ? { resolvedRisk: opts.resolvedRisk[t.nodeId] } : {}),
+      ...(opts.resolvedRisk?.[t.nodeId] !== undefined ? { resolvedRisk: opts.resolvedRisk[t.nodeId]!.risk } : {}),
       specDigest: "",
     });
 
@@ -355,8 +355,8 @@ export function translateDraft(draft: Draft, fc: FrozenContext, opts: TranslateO
   // not as a plan the dispatcher later rejects). loadPlan is the sole legality + digest + coverage authority.
   // Spec-bound evidence for the self-check: each stamped node's resolvedRisk + its computed specDigest (the same identity
   // loadPlan will compute), so the loader honors exactly the nodes we legitimately resolved — matching a consumer's reload.
-  const selfEvidence: Record<string, { risk: NodeRisk; specDigest: string }> = {};
-  if (opts.resolvedRisk !== undefined) for (const n of assembled.nodes) if (n.resolvedRisk !== undefined) selfEvidence[n.nodeId] = { risk: n.resolvedRisk, specDigest: computeSpecDigest(n) };
+  const selfEvidence: Record<string, { risk: NodeRisk; specDigest: string; answeredPaths: string[] }> = {};
+  if (opts.resolvedRisk !== undefined) for (const n of assembled.nodes) if (n.resolvedRisk !== undefined) selfEvidence[n.nodeId] = { risk: n.resolvedRisk, specDigest: computeSpecDigest(n), answeredPaths: opts.resolvedRisk[n.nodeId]?.answeredPaths ?? [] };
   const loaded = loadPlan(assembled, { mode: "managed-t3", ownerDomainPolicy: fc.ownerDomainPolicy, riskPolicy: fc.riskPolicy, expectedFrozenRefs: frozenRefs, ...(Object.keys(selfEvidence).length > 0 ? { resolvedRisk: selfEvidence } : {}) });
   if (!loaded.ok) return R(`assembled plan failed managed loadPlan: ${loaded.reason}`);
   return { outcome: "loadable", plan: loaded.plan };
