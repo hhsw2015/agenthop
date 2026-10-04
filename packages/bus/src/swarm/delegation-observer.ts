@@ -15,6 +15,7 @@ import { writeFileSync, renameSync, readFileSync, mkdirSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import type { DelegationRegistry, Candidate, CompletionRecord } from "./delegation-envelope.js";
+import type { IncidentSignal } from "./incident-episode.js";
 
 /** What the IO reader returns for a locator that currently holds an artifact: its content digest + the completion record the
  *  artifact self-declares (§2b). null = nothing there yet. The reader (fs + hash + parse) is the dispatcher's; injected for tests. */
@@ -84,6 +85,51 @@ export function detectWatchEvents(prev: WatchSnapshot, curr: WatchSnapshot): Wat
   }
   if (curr.progressMtimeMs !== prev.progressMtimeMs && prev.progressMtimeMs !== 0) events.push({ kind: "progress", mtimeMs: curr.progressMtimeMs });
   return events;
+}
+
+// --- dead-letter watch (F26, user: "a send failure nobody knows about = a defect") ---
+// The LEDGER WRITE side (a sender appends {ts,from,to,error,preview} on a failed send) is bus-identity v1.5's job; THIS is the
+// read/watch side: N dead-letters to the same `to` within a window ⇒ a ROUTING incident (via the generic incident-episode
+// core, category="routing"); the window clearing ⇒ recovered. Routing incident identity = groupKey `routing:<to>`.
+
+export type DeadLetter = { ts: number; from?: string; to: string; error?: string; preview?: string };
+const ROUTING_GK_PREFIX = "routing:";
+export const routingGroupKey = (to: string): string => `${ROUTING_GK_PREFIX}${to}`;
+export const routingToOf = (groupKey: string): string | null => groupKey.startsWith(ROUTING_GK_PREFIX) ? groupKey.slice(ROUTING_GK_PREFIX.length) : null;
+
+/** Parse a dead-letter ledger (JSONL — one record per line). Null-safe: blank / malformed / partial-last lines are skipped
+ *  (the append-only ledger may be mid-write), never a throw. Only records with a string `to` + numeric `ts` count. */
+export function parseDeadLetters(jsonl: string): DeadLetter[] {
+  const out: DeadLetter[] = [];
+  for (const line of jsonl.split("\n")) {
+    const t = line.trim();
+    if (t.length === 0) continue;
+    let rec: unknown;
+    try { rec = JSON.parse(t); } catch { continue; }
+    if (rec === null || typeof rec !== "object") continue;
+    const r = rec as { ts?: unknown; to?: unknown; from?: unknown; error?: unknown; preview?: unknown };
+    if (typeof r.to !== "string" || typeof r.ts !== "number") continue;
+    out.push({ ts: r.ts, to: r.to, ...(typeof r.from === "string" ? { from: r.from } : {}), ...(typeof r.error === "string" ? { error: r.error } : {}), ...(typeof r.preview === "string" ? { preview: r.preview } : {}) });
+  }
+  return out;
+}
+
+/** Count dead-letters per `to` within [windowStartMs, +∞) — a sliding window so an old burst that has aged out no longer counts. */
+export function countDeadLettersByTo(entries: readonly DeadLetter[], windowStartMs: number): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const e of entries) if (e.ts >= windowStartMs) m.set(e.to, (m.get(e.to) ?? 0) + 1);
+  return m;
+}
+
+/** Build the routing IncidentSignals this tick: a `to` at/above threshold in the window ⇒ active; an OPEN routing episode whose
+ *  `to` is now below threshold (window cleared) ⇒ recovered. subjectJobId is the synthetic routing domain (routing has no real
+ *  job). Pure; the caller folds each signal via reconcileIncidentCore + commits the repair-wait + notifies the coordinator. */
+export function routingSignals(counts: ReadonlyMap<string, number>, openRoutingTos: readonly string[], threshold: number, lastObservedSeq: number): IncidentSignal[] {
+  const sigs: IncidentSignal[] = [];
+  const active = new Set<string>();
+  for (const [to, n] of counts) if (n >= threshold) { active.add(to); sigs.push({ kind: "active", groupKey: routingGroupKey(to), category: "routing", why: `${n} dead-letters to ${to} within window`, lastObservedSeq, subjectJobId: "swarm-routing" }); }
+  for (const to of openRoutingTos) if (!active.has(to)) sigs.push({ kind: "recovered", groupKey: routingGroupKey(to), category: "routing", why: `dead-letters to ${to} cleared`, lastObservedSeq, subjectJobId: "swarm-routing" });
+  return sigs;
 }
 
 /** Read the durable snapshot. Missing ⇒ empty (first run); corrupt ⇒ THROWS (caller is fail-soft + skips — a transient read

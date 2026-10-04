@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   scanCompletionSlots, parseCompletionArtifact, parseBoardFile, detectWatchEvents,
   readWatchSnapshot, writeWatchSnapshot, emptyWatchSnapshot,
+  parseDeadLetters, countDeadLettersByTo, routingSignals, routingGroupKey, routingToOf,
   type ReadArtifact, type WatchSnapshot,
 } from "../src/swarm/delegation-observer.js";
 import { openDelegation, observeCandidate, emptyDelegationRegistry, type OpenSpec, type CompletionSlot, type DelegationRegistry } from "../src/swarm/delegation-envelope.js";
@@ -86,6 +87,47 @@ describe("detectWatchEvents", () => {
     const curr: WatchSnapshot = { boardFiles: ["x.json"], progressMtimeMs: 500 };
     expect(detectWatchEvents(emptyWatchSnapshot(), curr).some((e) => e.kind === "progress")).toBe(false); // mtime from 0 is initial, not a change
     expect(detectWatchEvents(curr, curr)).toEqual([]); // steady state ⇒ silent
+  });
+});
+
+describe("dead-letter watch (F26)", () => {
+  test("parseDeadLetters: JSONL, null-safe — blank/malformed/partial lines skipped, only {to:string, ts:number} kept", () => {
+    const jsonl = [
+      JSON.stringify({ ts: 100, from: "claude:A", to: "codex:B", error: "unresolved", preview: "hi" }),
+      "",                                   // blank
+      "{ not json",                         // malformed (partial last-line mid-write)
+      JSON.stringify({ ts: 200, to: "codex:B" }),
+      JSON.stringify({ to: "codex:B" }),    // no ts ⇒ skipped
+      JSON.stringify({ ts: 300 }),          // no to ⇒ skipped
+      "null",                               // JSON null ⇒ skipped
+    ].join("\n");
+    const out = parseDeadLetters(jsonl);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toEqual({ ts: 100, from: "claude:A", to: "codex:B", error: "unresolved", preview: "hi" });
+    expect(out[1]).toEqual({ ts: 200, to: "codex:B" });
+  });
+
+  test("countDeadLettersByTo: sliding window — aged-out entries don't count", () => {
+    const entries = [{ ts: 50, to: "X" }, { ts: 150, to: "X" }, { ts: 160, to: "X" }, { ts: 170, to: "Y" }];
+    const counts = countDeadLettersByTo(entries, 100); // window start 100 ⇒ the ts=50 X is excluded
+    expect(counts.get("X")).toBe(2);
+    expect(counts.get("Y")).toBe(1);
+  });
+
+  test("routingSignals: at/above threshold ⇒ active; an open routing `to` now below threshold ⇒ recovered", () => {
+    const counts = new Map([["codex:B", 3], ["codex:C", 1]]);
+    const sigs = routingSignals(counts, ["codex:D"], 3, 42); // D was open, now 0 in window ⇒ recovered; B≥3 ⇒ active; C<3 ⇒ nothing
+    expect(sigs).toContainEqual({ kind: "active", groupKey: routingGroupKey("codex:B"), category: "routing", why: "3 dead-letters to codex:B within window", lastObservedSeq: 42, subjectJobId: "swarm-routing" });
+    expect(sigs).toContainEqual({ kind: "recovered", groupKey: routingGroupKey("codex:D"), category: "routing", why: "dead-letters to codex:D cleared", lastObservedSeq: 42, subjectJobId: "swarm-routing" });
+    expect(sigs.some((s) => s.groupKey === routingGroupKey("codex:C"))).toBe(false); // below threshold, not open ⇒ no signal
+    expect(routingToOf(routingGroupKey("codex:B"))).toBe("codex:B");               // round-trips
+    expect(routingToOf("liveness:x")).toBeNull();
+  });
+
+  test("routingSignals: an open `to` STILL above threshold stays active (not recovered)", () => {
+    const sigs = routingSignals(new Map([["X", 5]]), ["X"], 3, 1);
+    expect(sigs).toHaveLength(1);
+    expect(sigs[0]!.kind).toBe("active");
   });
 });
 

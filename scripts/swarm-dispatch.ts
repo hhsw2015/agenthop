@@ -44,10 +44,10 @@ import { writeProjection } from "../packages/bus/src/swarm/projection.js";
 import { beatStart, beatEnd } from "../packages/bus/src/swarm/heartbeat.js";
 import { buildControlCut, heartbeatObservations } from "../packages/bus/src/swarm/liveness-review.js";
 import { assertLiveness, type LivenessVerdict, type ControlCut, type ObservationFact } from "../packages/bus/src/swarm/task-liveness-inv1.js";
-import { reconcileIncident, reconcileRegistryWithControl, readIncidents, writeIncidents, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
-import { isRepairWaitId } from "../packages/bus/src/swarm/repair-wait-id.js";
+import { reconcileIncident, reconcileIncidentCore, reconcileRegistryWithControl, readIncidents, writeIncidents, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
+import { isRepairWaitId, repairEpisodeOf } from "../packages/bus/src/swarm/repair-wait-id.js";
 import { observeCandidate, readDelegations, writeDelegations, type DelegationRegistry } from "../packages/bus/src/swarm/delegation-envelope.js";
-import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, type ReadArtifact, type WatchSnapshot } from "../packages/bus/src/swarm/delegation-observer.js";
+import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, parseDeadLetters, countDeadLettersByTo, routingSignals, routingToOf, type ReadArtifact, type WatchSnapshot } from "../packages/bus/src/swarm/delegation-observer.js";
 import { advanceWait } from "../packages/bus/src/swarm/task-wait.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
@@ -110,6 +110,11 @@ const CONSUMPTION_WINDOW_SEC = Number(process.env.SWARM_CONSUMPTION_WINDOW_SEC |
 // Local artifact root for RELATIVE completion-slot locators (review f0a999f-P2-4): WORK_REPO is a Git remote id (may be an
 // HTTPS URL) — NEVER a filesystem base. A relative locator with no ARTIFACT_ROOT is skipped (not joined under a URL).
 const ARTIFACT_ROOT = process.env.SWARM_ARTIFACT_ROOT || "";
+// Dead-letter watch (F26): N dead-letters to the same `to` within WINDOW ⇒ a routing incident. The ledger WRITE side is
+// bus-identity v1.5's (dormant until it exists); this is the read side.
+const DEAD_LETTERS_FILE = path.join(HOME, ".agenthop", "swarm", "dead-letters.jsonl");
+const DEAD_LETTER_WINDOW_MS = Number(process.env.SWARM_DEAD_LETTER_WINDOW_MS || "120000");
+const DEAD_LETTER_THRESHOLD = Number(process.env.SWARM_DEAD_LETTER_THRESHOLD || "3");
 const PLAN_FILE = process.env.SWARM_PLAN || "";
 const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
@@ -781,6 +786,50 @@ async function main(): Promise<void> {
     } catch (e) { log(`observer board watch failed: ${e instanceof Error ? e.message : e}`); }
   };
 
+  // Dead-letter watch (L2-struct 3b / F26): N dead-letters to the same `to` within a window ⇒ a ROUTING incident (via the
+  // generic incident core, category="routing"); the window clearing ⇒ recovered. The ledger is dormant until bus-identity v1.5
+  // writes it. Fail-soft; per-signal isolated. (The repair-wait commit mirrors the liveness applier — kept inline rather than
+  // refactoring the sealed liveness path.)
+  const runDeadLetterWatch = (): void => {
+    let jsonl: string;
+    try { jsonl = readFileSync(DEAD_LETTERS_FILE, "utf8"); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") log(`dead-letters read failed: ${e instanceof Error ? e.message : e}`); return; } // absent ⇒ dormant
+    let reg: IncidentRegistry;
+    try { reg = readIncidents(INCIDENTS_FILE); } catch (e) { log(`incidents read failed — skip dead-letter watch: ${e instanceof Error ? e.message : e}`); return; }
+    const counts = countDeadLettersByTo(parseDeadLetters(jsonl), Date.now() - DEAD_LETTER_WINDOW_MS);
+    const openRoutingTos: string[] = [];
+    for (const ep of Object.values(reg.episodes)) if (ep.category === "routing" && ep.open) { const to = routingToOf(ep.groupKey); if (to !== null) openRoutingTos.push(to); }
+    for (const sig of routingSignals(counts, openRoutingTos, DEAD_LETTER_THRESHOLD, loadControlLog(CONTROL_LOG_DIR).seq)) {
+      try {
+        const fresh = loadControlLog(CONTROL_LOG_DIR);
+        const groupCtlWaits = Object.values(liveEntities(fresh))
+          .filter((b) => b.put === "wait" && repairEpisodeOf((b as Extract<ChangeBody, { put: "wait" }>).wait.waitId, sig.groupKey) !== null)
+          .map((b) => { const w = (b as Extract<ChangeBody, { put: "wait" }>).wait; return { waitId: w.waitId, state: w.state }; });
+        const sync = reconcileRegistryWithControl(reg, sig.groupKey, "routing", groupCtlWaits, nowSec());
+        if (sync.registry !== reg) { writeIncidents(INCIDENTS_FILE, sync.registry); reg = sync.registry; }
+        const rec = reconcileIncidentCore(reg, sig, nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner: REPAIR_OWNER_ROUTABLE ? REPAIR_OWNER : SELF, controlEpisodeFloor: sync.controlEpisodeFloor });
+        if (rec.openRepairWait === undefined && rec.resolveRepairWait === undefined) { if (JSON.stringify(rec.registry) !== JSON.stringify(reg)) { writeIncidents(INCIDENTS_FILE, rec.registry); reg = rec.registry; } continue; }
+        let committed = false;
+        if (rec.openRepairWait) {
+          const spec = rec.openRepairWait;
+          const existing = findWaitIn(fresh, spec.waitId);
+          if (existing !== undefined && existing.state !== "resolved") committed = true;                 // adopt a live committed wait (P1-3)
+          else if (existing !== undefined) { log(`routing repair-wait ${spec.waitId} exists RESOLVED — not resurrecting; defer`); continue; }
+          else committed = commitTask(fresh, [{ put: "wait", wait: { waitId: spec.waitId, kind: "wait", subject: { jobId: spec.jobId }, state: "open", deadlineSec: spec.deadlineSec, owner: spec.owner, timeoutPolicy: "escalate" } }]).result.ok;
+          if (committed) notifyCoordinator(`routing incident ${spec.incidentId}: ${spec.why} — repair-wait ${spec.waitId} (owner=${spec.owner}${REPAIR_OWNER_ROUTABLE ? "" : ", NON-ROUTABLE default"})`);
+        } else if (rec.resolveRepairWait) {
+          const spec = rec.resolveRepairWait;
+          const w = findWaitIn(fresh, spec.waitId);
+          if (w === undefined || w.state === "resolved") committed = true;
+          else { const adv = advanceWait(w, { type: "close", resolution: { outcome: "recovered", reason: spec.reason, sourceOperationId: `routing-recover-${SELF}` } }); if (adv.ok) committed = commitTask(fresh, [{ put: "wait", wait: adv.wait }]).result.ok; }
+          if (committed) notifyCoordinator(`routing incident recovered — resolved repair-wait ${spec.waitId}`);
+        }
+        if (committed) { writeIncidents(INCIDENTS_FILE, rec.registry); reg = rec.registry; }
+        else log(`routing repair-wait action deferred (seq conflict) — retry next tick`);
+      } catch (e) { log(`routing signal ${sig.groupKey} failed (isolated): ${e instanceof Error ? e.message : e}`); }
+    }
+  };
+
   await runDispatchLoops({
     // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
     // dispatches). T1.5 RED LINE (fe0376cd): --task dispatch stays off (SWARM_TASK_EXEC) until the resume adapter +
@@ -803,6 +852,8 @@ async function main(): Promise<void> {
       refreshProjectionAndVerdict();
       // L2-struct observer (F22/F25): discover completion-slot artifacts + push board/PROGRESS durable changes to the coordinator.
       runObserver();
+      // L2-struct 3b (F26): dead-letter bursts ⇒ routing incidents. Dormant until the ledger exists.
+      runDeadLetterWatch();
     },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     passIntervalMs: 5000,
