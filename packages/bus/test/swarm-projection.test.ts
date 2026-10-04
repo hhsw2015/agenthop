@@ -207,10 +207,13 @@ describe("projection review fixes", () => {
     expect(JSON.parse(readFileSync(path.join(root, "members.json"), "utf8"))).toMatchObject({ members: [] }); // real file written
   });
 
-  test("L1b: meta.json carries livenessVerdict when provided, omits it otherwise (§1d)", () => {
+  test("L1b/P2-1: meta.json carries livenessVerdict WITH its freshness window when provided, omits it otherwise (§1c/§1d)", () => {
     let s = initialLogState(); s = stamp(s, [planBody(plan1())]);
-    const withV = byPath(buildProjectionFiles(s, { nowSec: 1000, livenessVerdict: { verdict: "STALL", why: "no holder" } }), "meta.json");
-    expect(withV.livenessVerdict).toMatchObject({ verdict: "STALL" });
+    const withV = byPath(buildProjectionFiles(s, { nowSec: 1000, livenessVerdict: { verdict: "STALL", why: "no holder" }, livenessValidForSec: 200 }), "meta.json");
+    // §1c: the verdict is published WITH cutSeq + sample time + validUntilSec so a consumer expires a stale OK (review P2-1).
+    expect(withV.livenessVerdict).toMatchObject({ verdict: "STALL", why: "no holder", cutSeq: s.seq, sampledAtSec: 1000, validUntilSec: 1200 });
+    const dflt = byPath(buildProjectionFiles(s, { nowSec: 1000, livenessVerdict: { verdict: "OK" } }), "meta.json");
+    expect(dflt.livenessVerdict.validUntilSec).toBe(1000 + 120); // default evidence window when the caller omits one
     const without = byPath(buildProjectionFiles(s, { nowSec: 1000 }), "meta.json");
     expect("livenessVerdict" in without).toBe(false);
   });
@@ -219,12 +222,26 @@ describe("projection review fixes", () => {
     const w: WaitRecord = { waitId: "w/r-123abc", kind: "wait", subject: { jobId: "j" }, state: "open", deadlineSec: 5000, owner: "claude:owner", timeoutPolicy: "escalate" };
     let s = initialLogState(); s = stamp(s, [{ put: "wait", wait: w }]);
     const wf = buildProjectionFiles(s, { nowSec: 1000 }).find((f) => f.relPath.startsWith("waits/"));
-    expect(wf?.relPath).toBe("waits/w%2fr-123abc.json"); // "/" → %2f, flat, collision-free
+    expect(wf?.relPath).toBe("waits/w%2Fr-123abc.json"); // "/" → %2F (standard UTF-8 percent-encoding), flat, collision-free
     expect(wf?.json).toEqual(w);                          // content as-is (real waitId preserved)
     let s2 = initialLogState(); s2 = stamp(s2, [{ put: "wait", wait: { ...w, waitId: "coord-x" } }]);
     expect(buildProjectionFiles(s2, { nowSec: 1000 }).some((f) => f.relPath === "waits/coord-x.json")).toBe(true); // safe id = identity (viz-compat)
     let s3 = initialLogState(); s3 = stamp(s3, [{ put: "wait", wait: { ...w, waitId: "../../etc" } }]);
     expect(buildProjectionFiles(s3, { nowSec: 1000 }).some((f) => f.relPath.startsWith("waits/"))).toBe(false); // real traversal rejected
+  });
+
+  test("re-review P2-2: encoding is collision-free (UTF-8) — 'w-€' and 'w- ac' map to DISTINCT files, neither overwritten", () => {
+    const mk = (id: string): WaitRecord => ({ waitId: id, kind: "wait", subject: { jobId: "j" }, state: "open", deadlineSec: 5000, owner: "o", timeoutPolicy: "bypass" });
+    let s = initialLogState();
+    s = stamp(s, [{ put: "wait", wait: mk("w-€") }]); // € = U+20AC (one UTF-16 unit 0x20ac)
+    s = stamp(s, [{ put: "wait", wait: mk("w- ac") }]);    // space (0x20) + literal "ac" — collided to %20ac under charCodeAt-hex
+    const waitFiles = buildProjectionFiles(s, { nowSec: 1000 }).filter((f) => f.relPath.startsWith("waits/"));
+    const paths = waitFiles.map((f) => f.relPath);
+    expect(new Set(paths).size).toBe(2); // two DISTINCT filenames — no collision, neither wait silently dropped
+    expect(paths).toContain(`waits/${encodeURIComponent("w-€")}.json`);
+    expect(paths).toContain(`waits/${encodeURIComponent("w- ac")}.json`);
+    for (const f of waitFiles) // the filename round-trips back to the real waitId (shared decode contract)
+      expect(decodeURIComponent(f.relPath.slice("waits/".length, -".json".length))).toBe((f.json as WaitRecord).waitId);
   });
 
   test("re-review P2a: a prune unlink failure (EACCES) throws — meta is NOT certified over stale state", () => {

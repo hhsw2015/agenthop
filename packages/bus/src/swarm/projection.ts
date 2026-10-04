@@ -32,26 +32,32 @@ export const PROJECTION_SCHEMA_VERSION = 1;
 
 export type ProjectionFile = { relPath: string; json: unknown };
 /** livenessVerdict (cluster-liveness §1d): the INV-1 verdict (OK|UNVERIFIABLE|STALL) the dispatcher computes per tick, surfaced
- *  in meta.json so viz renders a STALL red. Opaque here (the kernel owns its shape); absent until the first tick computes it. */
-export type ProjectOpts = { nowSec: number; jobStartSec?: (jobId: string) => number | undefined; livenessVerdict?: unknown };
+ *  in meta.json so viz renders a STALL red. Opaque here (the kernel owns its shape); absent until the first tick computes it.
+ *  livenessValidForSec is the evidence window: §1c requires meta to publish the cut seq + sample time + VALIDITY so a consumer
+ *  never treats an expired OK as current (review P2-1); the published verdict carries cutSeq/sampledAtSec/validUntilSec. */
+export type ProjectOpts = { nowSec: number; jobStartSec?: (jobId: string) => number | undefined; livenessVerdict?: unknown; livenessValidForSec?: number };
 
 const HISTORY_MAX = 8;   // Open question 1: last 8 attempts + count.
 const OBSERVED_MAX = 8;  // §8b observed[]: recent N per attempt.
+const LIVENESS_VALID_DEFAULT_SEC = 120;  // default evidence window if the caller does not pass one (P2-1).
 
 /** A path segment is SAFE iff it is a non-empty run of [A-Za-z0-9._-] and not "." / ".." — no separators, no traversal. */
 const SAFE_SEG = /^[A-Za-z0-9._-]+$/;
 const isSafeSeg = (s: unknown): s is string => typeof s === "string" && s.length > 0 && s !== "." && s !== ".." && SAFE_SEG.test(s);
 
-/** Safe projection FILENAME for a waitId (review P2b): a waitId MAY legitimately contain "/" (a sweep-generated
- *  base/r-hex), which the single-segment whitelist would silently drop. Reject only genuine traversal (a "." or ".."
- *  segment / absolute / null byte); otherwise PERCENT-ENCODE every non-[A-Za-z0-9._-] char — an injective (collision-free)
- *  map to one flat, separator-free name. A safe single-segment id is unchanged (identity), so the consumer still reads
- *  waits/<waitId>.json; for an encoded id the consumer percent-decodes the filename (minus ".json"). */
+/** Safe projection FILENAME for a waitId (review P2b/P2-2): a waitId MAY legitimately contain "/" (a sweep-generated
+ *  base/r-hex), which a single-segment whitelist would silently drop. Reject only genuine traversal (a "." or ".."
+ *  segment / absolute / null byte); otherwise encode to one flat, separator-free name with `encodeURIComponent` —
+ *  STANDARD UTF-8 percent-encoding, which is injective (collision-free) and reversible via `decodeURIComponent`, a shared
+ *  encode/decode contract with the consumer. A safe single-segment id is unchanged (identity: encodeURIComponent leaves
+ *  [A-Za-z0-9._-~!*'()] alone), so the consumer still reads waits/<waitId>.json. The previous charCodeAt-hex was NOT
+ *  collision-free — variable-length per UTF-16 code unit with no byte boundary, so "w-€" and "w- ac" both mapped to
+ *  "w-%20ac" and one silently overwrote the other (review P2-2). */
 function waitFilename(waitId: string): string | null {
   if (typeof waitId !== "string" || waitId.length === 0) return null;
   if (waitId.startsWith("/") || waitId.includes("\0")) return null;
   if (waitId.split("/").some((s) => s === "." || s === "..")) return null; // genuine traversal — reject (malicious)
-  return `${waitId.replace(/[^A-Za-z0-9._-]/g, (c) => `%${c.charCodeAt(0).toString(16).padStart(2, "0")}`)}.json`;
+  return `${encodeURIComponent(waitId)}.json`;
 }
 
 const bindingState = (b: ExecutionBinding): "open" | "closing" | "closed" =>
@@ -93,7 +99,19 @@ function attemptView(a: TaskAttempt) {
 /** Build every projection file for the current control-log state. Pure; the caller writes them atomically. */
 export function buildProjectionFiles(state: LogState, opts: ProjectOpts): ProjectionFile[] {
   const out: ProjectionFile[] = [];
-  out.push({ relPath: "meta.json", json: { schemaVersion: PROJECTION_SCHEMA_VERSION, lastAppliedSeq: state.seq, rebuiltAt: new Date(opts.nowSec * 1000).toISOString(), ...(opts.livenessVerdict !== undefined ? { livenessVerdict: opts.livenessVerdict } : {}) } });
+  // §1c freshness: the verdict is published WITH the cut seq it was computed over, the sample time, and a validUntilSec —
+  // so a consumer (viz) flips an expired OK to unknown instead of trusting a stale verdict left behind by a wedged refresh
+  // (review P2-1). The kernel's verdict object is spread in as-is; the freshness fields are siblings.
+  const lv = opts.livenessVerdict;
+  const livenessField = lv === undefined ? {} : {
+    livenessVerdict: {
+      ...(lv !== null && typeof lv === "object" ? (lv as Record<string, unknown>) : { verdict: lv }),
+      cutSeq: state.seq,
+      sampledAtSec: opts.nowSec,
+      validUntilSec: opts.nowSec + (opts.livenessValidForSec ?? LIVENESS_VALID_DEFAULT_SEC),
+    },
+  };
+  out.push({ relPath: "meta.json", json: { schemaVersion: PROJECTION_SCHEMA_VERSION, lastAppliedSeq: state.seq, rebuiltAt: new Date(opts.nowSec * 1000).toISOString(), ...livenessField } });
   // members.json — empty placeholder (v1): the durable roster is the bus peers() view, not control-log data; viz merges it
   // (schema §6). NOT written by the dispatcher from a roster in this batch; do not read this as "the roster is wired".
   out.push({ relPath: "members.json", json: { members: [] as unknown[] } });

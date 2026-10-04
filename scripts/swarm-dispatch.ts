@@ -546,6 +546,31 @@ async function main(): Promise<void> {
   // Write the projection once at startup so a consumer sees current state before this run's first commit (fail-soft).
   try { writeProjection(PROJECTION_DIR, taskStateRef.s, { nowSec: nowSec(), jobStartSec }); } catch (e) { log(`projection initial write failed: ${e instanceof Error ? e.message : e}`); }
   if (SWEEP_ENABLED) log(`liveness sweep ON${WAIT_SEED_FILE ? ` (seed=${WAIT_SEED_FILE})` : ""}`);
+
+  // Rewrite the projection (now-dependent wall-clock judgments) + recompute the INV-1 livenessVerdict (L1b) from the CURRENT
+  // control slice + heartbeat. The plan is resolved FROM the loaded state by buildControlCut (review P1-2: never the stale
+  // startup SWARM_PLAN) — a job with no authoritative PlanPut yields UNVERIFIABLE, not a judgment off a stale plan. The verdict
+  // is published with its evidence window (review P2-1). Fail-soft: a heartbeat gap omits the verdict this tick (filled next).
+  const refreshProjectionAndVerdict = (): void => {
+    try {
+      const st = loadControlLog(CONTROL_LOG_DIR);
+      let livenessVerdict: unknown;
+      if (plan) {
+        const cut = buildControlCut(plan.jobId, st, nowSec(), { jobStartSec: jobStartSec(plan.jobId) });
+        if (cut === null) {
+          livenessVerdict = { verdict: "UNVERIFIABLE", missing: ["current-plan"] }; // no PlanPut in CONTROL ⇒ don't guess (P1-2)
+        } else {
+          try {
+            const hb = JSON.parse(readFileSync(HEARTBEAT_FILE, "utf8"));
+            const obs = heartbeatObservations(hb, LIVENESS_WINDOW_SEC);
+            livenessVerdict = assertLiveness({ controlCut: cut, observations: obs, modes: { sweepOn: SWEEP_ENABLED, taskExecOn: taskOn, passInstance: SELF, sweepInstance: SELF } }, nowSec());
+          } catch { /* no heartbeat yet / parse error ⇒ omit the verdict this tick (viz shows unknown), filled next tick */ }
+        }
+      }
+      writeProjection(PROJECTION_DIR, st, { nowSec: nowSec(), jobStartSec, livenessVerdict, livenessValidForSec: LIVENESS_WINDOW_SEC });
+    } catch (e) { log(`projection refresh failed: ${e instanceof Error ? e.message : e}`); }
+  };
+
   await runDispatchLoops({
     // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
     // dispatches). T1.5 RED LINE (fe0376cd): --task dispatch stays off (SWARM_TASK_EXEC) until the resume adapter +
@@ -553,26 +578,20 @@ async function main(): Promise<void> {
     passTick: async () => {
       await pass(records, ops);
       if (plan && taskOn && taskOps) { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
-      // P2-1 catch-up refresh: rewrite the projection every tick (not only on commit) so a failed projection write retries
-      // and now-dependent judgments (wall-clock jobStatus/budget) stay current WITHOUT needing a new business commit. Also
-      // computes the INV-1 livenessVerdict (L1b) from the current cut + heartbeat and surfaces it in projection meta (§1d).
-      try {
-        const st = loadControlLog(CONTROL_LOG_DIR);
-        let livenessVerdict: unknown;
-        if (plan) {
-          try {
-            const hb = JSON.parse(readFileSync(HEARTBEAT_FILE, "utf8"));
-            const cut = buildControlCut(plan, st, nowSec(), { jobStartSec: jobStartSec(plan.jobId) });
-            const obs = heartbeatObservations(hb, LIVENESS_WINDOW_SEC);
-            livenessVerdict = assertLiveness({ controlCut: cut, observations: obs, modes: { sweepOn: SWEEP_ENABLED, taskExecOn: taskOn, passInstance: SELF, sweepInstance: SELF } }, nowSec());
-          } catch { /* no heartbeat yet / parse error ⇒ omit the verdict this tick (viz shows unknown), filled next tick */ }
-        }
-        writeProjection(PROJECTION_DIR, st, { nowSec: nowSec(), jobStartSec, livenessVerdict });
-      } catch (e) { log(`projection refresh failed: ${e instanceof Error ? e.message : e}`); }
+      // NOTE: the projection + verdict refresh is NOT here — it lives on the sweep loop (below), so a wedged pass/taskPass
+      // cannot freeze the on-disk verdict into a stale OK (review P2-1). Per-commit projection writes still happen via the
+      // commitTask apply hook; this loop only drives the business passes.
     },
     // The liveness sweep (§0b R2) — scan durable waits + member liveness, auto-handle expired waits (ping/escalate/re-arm)
     // + dead owners (reassign) + stuck validators (move). The coordinator-replacement step; gated on SWARM_SWEEP.
-    sweepTick: async () => { if (!SWEEP_ENABLED) return; sweepStateRef.s = loadControlLog(CONTROL_LOG_DIR); await sweepPass(sweepOps); },
+    sweepTick: async () => {
+      sweepStateRef.s = loadControlLog(CONTROL_LOG_DIR);
+      if (SWEEP_ENABLED) await sweepPass(sweepOps);
+      // Now-dependent projection + INV-1 verdict refresh on the INDEPENDENT sweep loop + its own ref (review P2-1): when the
+      // pass loop wedges, this keeps re-sampling observations and a stale pass heartbeat flips the verdict to UNVERIFIABLE.
+      // Runs even with sweep rules off — it is observability, not a sweep action; bounded, fail-soft inside the helper.
+      refreshProjectionAndVerdict();
+    },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     passIntervalMs: 5000,
     sweepIntervalMs: 5000,

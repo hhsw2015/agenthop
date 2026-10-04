@@ -13,17 +13,32 @@ import type { TaskPlan } from "./task-plan.js";
 import type { TaskAttempt } from "./task-state.js";
 import type { AcceptedResult } from "./task-result.js";
 import { buildSched } from "./task-pass.js";
-import { jobStatus, readyTasks, type JobUsage } from "./task-ready.js";
+import { jobStatus, readyTasks, currentAccepted, type JobUsage } from "./task-ready.js";
 import type { ControlCut, LivenessResponsibility, ObservationFact } from "./task-liveness-inv1.js";
 import type { Heartbeat } from "./heartbeat.js";
 
-/** Build the per-job ControlCut: jobTerminal + the §1 responsibility map, isolated to THIS job's entities. openIncidentEpisode
- *  is the IO layer's (passed in from persisted episode state), so a STALL verdict can carry a stable incidentId (C3). */
+/** An attempt is terminal (holds no current execution carrier) once SUCCEEDED/FAILED/ABANDONED. */
+const TERMINAL_ATTEMPT: ReadonlySet<TaskAttempt["status"]> = new Set(["SUCCEEDED", "FAILED", "ABANDONED"]);
+
+/** The authoritative current plan for a job = the live PlanPut in THIS LogState — never a stale startup/SWARM_PLAN copy
+ *  (review P1-2). A consistent §1c cut must read the plan from the same control slice as the attempts/intents it judges. */
+export function currentPlan(state: LogState, jobId: string): TaskPlan | undefined {
+  for (const body of Object.values(liveEntities(state))) {
+    if (body.put === "plan" && (body.plan as unknown as TaskPlan).jobId === jobId) return body.plan as unknown as TaskPlan;
+  }
+  return undefined;
+}
+
+/** Build the per-job ControlCut: jobTerminal + the §1 responsibility map, isolated to THIS job's entities. The plan is
+ *  resolved from `state` (NOT passed in) so the cut is a consistent control slice (review P1-2) — returns null when the job
+ *  has no authoritative PlanPut in this state, so the caller emits UNVERIFIABLE instead of judging off a stale plan.
+ *  openIncidentEpisode is the IO layer's (passed in from persisted episode state) for a stable STALL incidentId (C3). */
 export function buildControlCut(
-  plan: TaskPlan, state: LogState, nowSec: number,
+  jobId: string, state: LogState, nowSec: number,
   opts: { jobStartSec?: number; openIncidentEpisode?: number } = {},
-): ControlCut {
-  const jobId = plan.jobId;
+): ControlCut | null {
+  const plan = currentPlan(state, jobId);
+  if (plan === undefined) return null; // no authoritative plan in this cut ⇒ caller emits UNVERIFIABLE (don't guess, P1-2)
   // Per-job isolation (attemptId convention `${jobId}/${nodeId}/a${n}` isolates intents/runs that lack a jobId field).
   const inJob = (attemptId: string): boolean => attemptId.startsWith(`${jobId}/`);
   const jobAttempts: TaskAttempt[] = [];
@@ -44,14 +59,12 @@ export function buildControlCut(
   // W — RETRY_WAIT backoff (a supervised wait, counts in W — legitimate backoff is NOT a stall, §1/R1).
   for (const a of jobAttempts) if (a.status === "RETRY_WAIT" && (a.retryAt === undefined || a.retryAt > nowSec)) responsibilities.push({ kind: "RETRY_WAIT_BACKOFF", subjectId: a.attemptId });
 
-  // E (intents/binding) + W (validation runs + non-validation waits), from the live entities for this job.
+  // Live (non-abandoned) intents indexed by attempt + the W responsibilities (validation runs, non-validation gates), one pass.
+  const liveIntentByAttempt = new Map<string, { launchId: string; status: string }>();
   for (const body of Object.values(liveEntities(state))) {
     if (body.put === "intent") {
       const i = body.intent;
-      if (!inJob(i.attemptId) || i.status === "abandoned") continue; // abandoned = terminal, holds nothing
-      // confirmed = worker delivered + running (business exec, needs roster presence); pending = still allocating/recovering.
-      if (i.status === "confirmed") responsibilities.push({ kind: "BUSINESS_EXEC", subjectId: i.attemptId, executorInstance: i.launchId });
-      else responsibilities.push({ kind: "ALLOC_RECOVERING", subjectId: i.attemptId, executorInstance: i.launchId });
+      if (inJob(i.attemptId) && i.status !== "abandoned") liveIntentByAttempt.set(i.attemptId, { launchId: i.launchId, status: i.status });
     } else if (body.put === "validationRun") {
       const v = body.validationRun;
       if (inJob(v.attemptId) && v.state !== "closed") responsibilities.push({ kind: "VALIDATION", subjectId: v.validationRunId });
@@ -60,6 +73,22 @@ export function buildControlCut(
       // a validation-wait is covered by its VALIDATION run; here only the non-validation gates for THIS job.
       if (w.subject.jobId === jobId && w.state !== "resolved" && w.subject.validationRunId === undefined) responsibilities.push({ kind: "AWAITING_GATE", subjectId: w.waitId });
     }
+  }
+
+  // E — executing work, derived from the CURRENT non-terminal attempt + its OPEN execution binding (the §1 durable carriers:
+  // ALLOC_RECOVERING = DispatchIntent/binding(open); BUSINESS_EXEC = binding(open)+WORK). NOT raw historical intents (review
+  // P1-1): a done/terminal node's stale pending intent is not current work, and an open business binding with NO intent is
+  // still executing (the binding is the carrier). A missing carrier ⇒ no E responsibility; a confirmed intent or a bare open
+  // binding ⇒ BUSINESS_EXEC; a still-pending intent ⇒ ALLOC_RECOVERING. Roster/WORK absent ⇒ the kernel returns UNVERIFIABLE.
+  for (const a of jobAttempts) {
+    if (TERMINAL_ATTEMPT.has(a.status) || a.status === "RETRY_WAIT") continue;   // terminal holds no carrier; RETRY_WAIT is W
+    if (currentAccepted(a.nodeId, sched) !== null) continue;                     // node already accepted ⇒ not current work
+    const openBinding = a.executionBindings.find((b) => b.closedAtSeq === undefined);
+    const intent = liveIntentByAttempt.get(a.attemptId);
+    if (openBinding === undefined && intent === undefined) continue;             // no durable carrier ⇒ not an E responsibility
+    const executorInstance = intent?.launchId ?? openBinding?.launchId;
+    const kind = intent === undefined || intent.status === "confirmed" ? "BUSINESS_EXEC" : "ALLOC_RECOVERING";
+    responsibilities.push({ kind, subjectId: a.attemptId, ...(executorInstance !== undefined ? { executorInstance } : {}) });
   }
 
   return {
