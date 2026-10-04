@@ -20,6 +20,7 @@
  */
 
 import { mkdirSync, writeFileSync, renameSync, readdirSync, lstatSync, unlinkSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { liveEntities, type LogState, type WaitRecord, type ResultObserved } from "./control-log.js";
 import type { TaskPlan } from "./task-plan.js";
@@ -38,6 +39,18 @@ const OBSERVED_MAX = 8;  // §8b observed[]: recent N per attempt.
 /** A path segment is SAFE iff it is a non-empty run of [A-Za-z0-9._-] and not "." / ".." — no separators, no traversal. */
 const SAFE_SEG = /^[A-Za-z0-9._-]+$/;
 const isSafeSeg = (s: unknown): s is string => typeof s === "string" && s.length > 0 && s !== "." && s !== ".." && SAFE_SEG.test(s);
+
+/** Safe projection FILENAME for a waitId (review P2b): a waitId MAY legitimately contain "/" (a sweep-generated
+ *  base/r-hex), which the single-segment whitelist would silently drop. Reject only genuine traversal (a "." or ".."
+ *  segment / absolute / null byte); otherwise PERCENT-ENCODE every non-[A-Za-z0-9._-] char — an injective (collision-free)
+ *  map to one flat, separator-free name. A safe single-segment id is unchanged (identity), so the consumer still reads
+ *  waits/<waitId>.json; for an encoded id the consumer percent-decodes the filename (minus ".json"). */
+function waitFilename(waitId: string): string | null {
+  if (typeof waitId !== "string" || waitId.length === 0) return null;
+  if (waitId.startsWith("/") || waitId.includes("\0")) return null;
+  if (waitId.split("/").some((s) => s === "." || s === "..")) return null; // genuine traversal — reject (malicious)
+  return `${waitId.replace(/[^A-Za-z0-9._-]/g, (c) => `%${c.charCodeAt(0).toString(16).padStart(2, "0")}`)}.json`;
+}
 
 const bindingState = (b: ExecutionBinding): "open" | "closing" | "closed" =>
   b.closedAtSeq !== undefined ? "closed" : b.closing !== undefined ? "closing" : "open";
@@ -99,9 +112,11 @@ export function buildProjectionFiles(state: LogState, opts: ProjectOpts): Projec
   }
 
   // §8c — waits/<waitId>.json: the WaitRecord current state, AS-IS (all fields; optional A1 budget fields pass through).
+  // A "/" in the waitId is percent-encoded into a flat filename (review P2b — never dropped); only real traversal is rejected.
   for (const w of waits) {
-    if (!isSafeSeg(w.waitId)) continue; // unsafe id ⇒ no file (P1-1)
-    out.push({ relPath: `waits/${w.waitId}.json`, json: w });
+    const fn = waitFilename(w.waitId);
+    if (fn === null) continue; // traversal/absolute/null id ⇒ reject (malicious)
+    out.push({ relPath: `waits/${fn}`, json: w });
   }
 
   for (const plan of plans) {
@@ -236,8 +251,11 @@ export function writeProjection(dir: string, state: LogState, opts: ProjectOpts)
     if (abs !== root && !abs.startsWith(root + path.sep)) throw new Error(`projection: refusing out-of-root path ${f.relPath}`); // lexical guard
     if (!ancestorsSafe(root, abs)) throw new Error(`projection: refusing write through a symlinked ancestor of ${f.relPath}`); // P1: no symlink escape
     mkdirSync(path.dirname(abs), { recursive: true });
-    const tmp = `${abs}.tmp.${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(f.json, null, 2), { mode: 0o644 });
+    // Unique, unpredictable temp name + EXCLUSIVE create (wx / O_EXCL): an unguessable path can't be pre-planted, and
+    // O_EXCL refuses to follow/overwrite a symlink if one is there — so a derived write can never escape via the temp file
+    // (review P1 temp-file symlink). Only the temp WE created is renamed into place.
+    const tmp = `${abs}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
+    writeFileSync(tmp, JSON.stringify(f.json, null, 2), { mode: 0o644, flag: "wx" });
     renameSync(tmp, abs);
   }
 }

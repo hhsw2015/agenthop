@@ -195,6 +195,30 @@ describe("projection review fixes", () => {
     expect(existsSync(path.join(external, "plan.json"))).toBe(false);   // nothing escaped
   });
 
+  test("re-review P1 (temp symlink): an unpredictable temp name defeats a symlink pre-planted at the OLD predictable path", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "ptmp-"));
+    const root = path.join(base, "projection");
+    mkdirSync(root, { recursive: true });
+    const external = path.join(base, "external.json");
+    writeFileSync(external, JSON.stringify({ marker: "authority" }));
+    symlinkSync(external, path.join(root, `members.json.tmp.${process.pid}`)); // the OLD predictable temp path
+    writeProjection(root, initialLogState(), { nowSec: 1000 });
+    expect(JSON.parse(readFileSync(external, "utf8")).marker).toBe("authority");            // NOT overwritten (random temp used)
+    expect(JSON.parse(readFileSync(path.join(root, "members.json"), "utf8"))).toMatchObject({ members: [] }); // real file written
+  });
+
+  test("re-review P2b: a waitId containing '/' is projected under a percent-encoded flat filename (not dropped)", () => {
+    const w: WaitRecord = { waitId: "w/r-123abc", kind: "wait", subject: { jobId: "j" }, state: "open", deadlineSec: 5000, owner: "claude:owner", timeoutPolicy: "escalate" };
+    let s = initialLogState(); s = stamp(s, [{ put: "wait", wait: w }]);
+    const wf = buildProjectionFiles(s, { nowSec: 1000 }).find((f) => f.relPath.startsWith("waits/"));
+    expect(wf?.relPath).toBe("waits/w%2fr-123abc.json"); // "/" → %2f, flat, collision-free
+    expect(wf?.json).toEqual(w);                          // content as-is (real waitId preserved)
+    let s2 = initialLogState(); s2 = stamp(s2, [{ put: "wait", wait: { ...w, waitId: "coord-x" } }]);
+    expect(buildProjectionFiles(s2, { nowSec: 1000 }).some((f) => f.relPath === "waits/coord-x.json")).toBe(true); // safe id = identity (viz-compat)
+    let s3 = initialLogState(); s3 = stamp(s3, [{ put: "wait", wait: { ...w, waitId: "../../etc" } }]);
+    expect(buildProjectionFiles(s3, { nowSec: 1000 }).some((f) => f.relPath.startsWith("waits/"))).toBe(false); // real traversal rejected
+  });
+
   test("re-review P2a: a prune unlink failure (EACCES) throws — meta is NOT certified over stale state", () => {
     const p = planOf("job-x", "build");
     let s3 = initialLogState();
