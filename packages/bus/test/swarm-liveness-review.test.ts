@@ -60,6 +60,19 @@ describe("buildControlCut — §1 six-state responsibility map", () => {
     expect(kinds(buildControlCut("job-x", s, 1000)!).filter((k) => k === "VALIDATION" || k === "AWAITING_GATE")).toEqual(["AWAITING_GATE", "VALIDATION"]); // vw1 not a 3rd
   });
 
+  test("L1-tail P1-1: a repair-wait is EXCLUDED from responsibilities (it must not self-certify the stall it tracks)", () => {
+    const p = planOf("job-x", "build");
+    let s = initialLogState(); s = stamp(s, [{ put: "plan", plan: p } as unknown as ChangeBody]);
+    s = stamp(s, [{ put: "attempt", attempt: attempt({ status: "SUCCEEDED", specDigest: p.nodes[0]!.specDigest }) }]); // node has an attempt ⇒ not READY
+    s = stamp(s, [{ put: "accepted", accepted: { acceptedResultId: "job-x/build/a1/r1", attemptId: "job-x/build/a1", nodeId: "build", jobId: "job-x", planRevision: 1, observedWorkCommit: "c", resultPath: "p", resultBlobOid: "b", resultClosureDigest: "cd", inputBindingDigest: "d", validatorVersion: "v1", decision: "accepted", decidedAtSeq: 3 } }]);
+    s = stamp(s, [{ put: "wait", wait: { waitId: "repair-job-x-ep1", kind: "wait", subject: { jobId: "job-x" }, state: "open", deadlineSec: 5000, owner: "disp-1", timeoutPolicy: "escalate" } }]);
+    const cut = buildControlCut("job-x", s, 1000)!;
+    expect(cut.responsibilities.some((r) => r.subjectId === "repair-job-x-ep1")).toBe(false); // the repair-wait is NOT a holder
+    // a NORMAL gate wait IS still counted (the exclusion is specific to the repair- namespace).
+    let s2 = stamp(s, [{ put: "wait", wait: { waitId: "gate-x", kind: "wait", subject: { jobId: "job-x" }, state: "open", deadlineSec: 5000, owner: "o", timeoutPolicy: "escalate" } }]);
+    expect(buildControlCut("job-x", s2, 1000)!.responsibilities).toContainEqual({ kind: "AWAITING_GATE", subjectId: "gate-x" });
+  });
+
   test("per-job isolation: job A's cut excludes job B's attempts / intents / waits", () => {
     const a = planOf("jobA", "build"); const b = planOf("jobB", "build");
     let s = initialLogState();

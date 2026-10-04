@@ -19,6 +19,7 @@ import { writeFileSync, renameSync, readFileSync, mkdirSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import type { LivenessVerdict } from "./task-liveness-inv1.js";
+import { makeRepairWaitId } from "./repair-wait-id.js";
 
 /** One incident episode (the durable record). Keyed in the registry by groupKey; lastObservedSeq lives HERE (not on the
  *  WaitRecord, which the pure layer owns and cannot carry incident fields). */
@@ -46,10 +47,6 @@ export type IncidentReconcile = {
   resolveRepairWait?: { waitId: string; reason: string };      // a recovery closed an episode — resolve this repair-wait
 };
 
-/** A repair-wait id is a flat, path-safe, collision-free token (the projection filename encoder is lossless, but a dash form
- *  keeps the id readable and free of the groupKey's ':'). Non-[A-Za-z0-9._-] ⇒ '-'. */
-const safeToken = (s: string): string => s.replace(/[^A-Za-z0-9._-]/g, "-");
-
 /** Pure: fold THIS tick's verdict into the episode registry, emitting the repair-wait action (if any). IO (file + control-log
  *  commit) is the caller's; apply the action FIRST, then persist the returned registry, so the registry never claims an
  *  episode open before its repair-wait exists. The kernel ONLY emits groupKey `${jobId}:no-live-holder` (one category), so
@@ -70,14 +67,14 @@ export function reconcileIncident(
     // a new episode: first detection, OR a recurrence AFTER the prior episode was closed (episode = prev + 1).
     const episode = (existing?.episode ?? 0) + 1;
     const incidentId = `${verdict.groupKey}:episode-${episode}`;
-    const repairWaitId = `repair-${safeToken(cfg.jobId)}-ep${episode}`;
+    const rwId = makeRepairWaitId(cfg.jobId, episode); // injective in jobId (review P2-3)
     episodes[verdict.groupKey] = {
       groupKey: verdict.groupKey, episode, open: true, incidentId, why: verdict.why,
-      openedAtSec: nowSec, lastObservedSeq: verdict.lastObservedSeq, repairWaitId,
+      openedAtSec: nowSec, lastObservedSeq: verdict.lastObservedSeq, repairWaitId: rwId,
     };
     return {
       registry: { episodes },
-      openRepairWait: { waitId: repairWaitId, jobId: cfg.jobId, deadlineSec: nowSec + cfg.repairWindowSec, owner: cfg.owner, incidentId, why: verdict.why },
+      openRepairWait: { waitId: rwId, jobId: cfg.jobId, deadlineSec: nowSec + cfg.repairWindowSec, owner: cfg.owner, incidentId, why: verdict.why },
     };
   }
 

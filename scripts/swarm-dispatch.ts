@@ -44,7 +44,7 @@ import { writeProjection } from "../packages/bus/src/swarm/projection.js";
 import { beatStart, beatEnd } from "../packages/bus/src/swarm/heartbeat.js";
 import { buildControlCut, heartbeatObservations } from "../packages/bus/src/swarm/liveness-review.js";
 import { assertLiveness, type LivenessVerdict, type ControlCut, type ObservationFact } from "../packages/bus/src/swarm/task-liveness-inv1.js";
-import { reconcileIncident, readIncidents, writeIncidents, emptyRegistry, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
+import { reconcileIncident, readIncidents, writeIncidents, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
 import { advanceWait } from "../packages/bus/src/swarm/task-wait.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
@@ -89,6 +89,12 @@ const LIVENESS_WINDOW_SEC = Number(process.env.SWARM_LIVENESS_WINDOW_SEC || "120
 // control-log entity). REPAIR_WAIT_SEC = the repair-wait's deadline window (the sweep escalates an un-handled repair).
 const INCIDENTS_FILE = path.join(HOME, ".agenthop", "swarm", "incidents.json");
 const REPAIR_WAIT_SEC = Number(process.env.SWARM_REPAIR_WAIT_SEC || "600");
+// The repair-wait's responsible party (review P2-2): DISTINCT from SELF (the dispatcher's observation-instance id, `disp-<pid>`,
+// which is not a routable bus session). Set SWARM_REPAIR_OWNER to a routable bus handle so the sweep's escalation reaches a
+// repairer. Until it is set (or the deferred roster lands), the repair-wait is still RECORDED + supervised, but escalation
+// delivery is best-effort — we label that honestly rather than claim it routes.
+const REPAIR_OWNER = process.env.SWARM_REPAIR_OWNER || "";
+const REPAIR_OWNER_ROUTABLE = REPAIR_OWNER !== "";
 const PLAN_FILE = process.env.SWARM_PLAN || "";
 const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
@@ -562,9 +568,14 @@ async function main(): Promise<void> {
   // L1-tail STALL disposition: fold the verdict into the durable incident registry + open/resolve its repair-wait. Fail-soft
   // (never throws): a commit/write error logs + leaves the verdict as-is, retried next tick. Returns the verdict to publish —
   // on a freshly-opened episode it re-asserts with the new episode so the published verdict carries the stable incidentId (C3).
+  const findWaitIn = (st: LogState, id: string): WaitRecord | undefined => {
+    const b = Object.values(liveEntities(st)).find((x) => x.put === "wait" && (x as Extract<ChangeBody, { put: "wait" }>).wait.waitId === id);
+    return b === undefined ? undefined : (b as Extract<ChangeBody, { put: "wait" }>).wait;
+  };
   const applyIncidentReconcile = (reg: IncidentRegistry, verdict: LivenessVerdict, cut: ControlCut, obs: ObservationFact[], openEp: number | undefined, jobId: string): LivenessVerdict => {
     try {
-      const rec = reconcileIncident(reg, verdict, nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner: SELF, jobId });
+      const owner = REPAIR_OWNER_ROUTABLE ? REPAIR_OWNER : SELF; // P2-2: a routable repair owner when configured, else labeled best-effort
+      const rec = reconcileIncident(reg, verdict, nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner, jobId });
       if (rec.openRepairWait === undefined && rec.resolveRepairWait === undefined) {
         if (JSON.stringify(rec.registry) !== JSON.stringify(reg)) writeIncidents(INCIDENTS_FILE, rec.registry); // dedup lastObservedSeq bump
         return verdict;
@@ -574,15 +585,25 @@ async function main(): Promise<void> {
       let committed = false;
       if (rec.openRepairWait) {
         const spec = rec.openRepairWait;
-        const w: WaitRecord = { waitId: spec.waitId, kind: "wait", subject: { jobId: spec.jobId }, state: "open", deadlineSec: spec.deadlineSec, owner: spec.owner, timeoutPolicy: "escalate" };
-        committed = commitTask(fresh, [{ put: "wait", wait: w }]).result.ok;
-        if (committed) log(`liveness STALL ${spec.incidentId} — opened repair-wait ${w.waitId} (deadline +${REPAIR_WAIT_SEC}s)`);
+        const existing = findWaitIn(fresh, spec.waitId);
+        if (existing !== undefined && existing.state !== "resolved") {
+          // ADOPT (review P1-3): the repair-wait is ALREADY committed in CONTROL — a prior tick committed it but the registry
+          // write didn't land, or the sweep has since advanced it to action_pending. Re-putting would clobber its phase /
+          // deadline / pendingAction (erase committed progress). Treat as satisfied; just (re)persist the registry so the two
+          // stores reconverge on the EXISTING wait, never a reset one.
+          committed = true;
+          log(`repair-wait ${spec.waitId} already in CONTROL (state=${existing.state}) — adopting, not re-opening (P1-3)`);
+        } else {
+          const w: WaitRecord = { waitId: spec.waitId, kind: "wait", subject: { jobId: spec.jobId }, state: "open", deadlineSec: spec.deadlineSec, owner: spec.owner, timeoutPolicy: "escalate" };
+          committed = commitTask(fresh, [{ put: "wait", wait: w }]).result.ok;
+          if (committed) log(`liveness STALL ${spec.incidentId} — opened repair-wait ${w.waitId} (owner=${spec.owner}${REPAIR_OWNER_ROUTABLE ? "" : "; NON-ROUTABLE default — set SWARM_REPAIR_OWNER for escalation delivery (recorded + supervised, delivery best-effort)"}, deadline +${REPAIR_WAIT_SEC}s)`);
+        }
       } else if (rec.resolveRepairWait) {
         const spec = rec.resolveRepairWait;
-        const body = Object.values(liveEntities(fresh)).find((b) => b.put === "wait" && (b as Extract<ChangeBody, { put: "wait" }>).wait.waitId === spec.waitId) as Extract<ChangeBody, { put: "wait" }> | undefined;
-        if (body === undefined || body.wait.state === "resolved") committed = true; // already gone/resolved (idempotent)
+        const w = findWaitIn(fresh, spec.waitId);
+        if (w === undefined || w.state === "resolved") committed = true; // already gone/resolved (idempotent)
         else {
-          const adv = advanceWait(body.wait, { type: "close", resolution: { outcome: "recovered", reason: spec.reason, sourceOperationId: `liveness-recover-${SELF}` } });
+          const adv = advanceWait(w, { type: "close", resolution: { outcome: "recovered", reason: spec.reason, sourceOperationId: `liveness-recover-${SELF}` } });
           if (adv.ok) { committed = commitTask(fresh, [{ put: "wait", wait: adv.wait }]).result.ok; if (committed) log(`liveness recovered — resolved repair-wait ${spec.waitId}`); }
         }
       }
@@ -605,9 +626,12 @@ async function main(): Promise<void> {
       let livenessValidUntilSec: number | undefined;
       if (plan) {
         // L1-tail: feed the OPEN incident episode (if any) into the cut so a persisting STALL carries its stable incidentId (C3).
-        let reg = emptyRegistry();
-        try { reg = readIncidents(INCIDENTS_FILE); } catch (e) { log(`incidents read failed: ${e instanceof Error ? e.message : e}`); }
-        const openEp = reg.episodes[`${plan.jobId}:no-live-holder`]?.open ? reg.episodes[`${plan.jobId}:no-live-holder`]!.episode : undefined;
+        // A read FAILURE (non-ENOENT) leaves reg = null ⇒ we SKIP the incident reconcile this tick rather than run it on a
+        // false-empty registry that would reset episode history (review P1-2); ENOENT returns an empty registry (legit first run).
+        let reg: IncidentRegistry | null = null;
+        try { reg = readIncidents(INCIDENTS_FILE); } catch (e) { log(`incidents read failed — SKIPPING incident reconcile this tick (no reset): ${e instanceof Error ? e.message : e}`); }
+        const ep = reg?.episodes[`${plan.jobId}:no-live-holder`];
+        const openEp = ep?.open ? ep.episode : undefined;
         const cut = buildControlCut(plan.jobId, st, nowSec(), { jobStartSec: jobStartSec(plan.jobId), openIncidentEpisode: openEp });
         if (cut === null) {
           livenessVerdict = { verdict: "UNVERIFIABLE", missing: ["current-plan"] }; // no PlanPut in CONTROL ⇒ don't guess (P1-2)
@@ -618,7 +642,7 @@ async function main(): Promise<void> {
             const hb = JSON.parse(readFileSync(HEARTBEAT_FILE, "utf8"));
             const obs = heartbeatObservations(hb, LIVENESS_WINDOW_SEC);
             let verdict = assertLiveness({ controlCut: cut, observations: obs, modes: modesNow() }, nowSec());
-            verdict = applyIncidentReconcile(reg, verdict, cut, obs, openEp, plan.jobId); // L1-tail: STALL ⇒ episode + repair-wait; OK ⇒ close
+            if (reg !== null) verdict = applyIncidentReconcile(reg, verdict, cut, obs, openEp, plan.jobId); // STALL⇒episode+repair-wait; OK⇒close (skipped if registry unknown)
             livenessVerdict = verdict;
             // Evidence-bounded freshness (review 59e7328-P2): the verdict is valid only until its EARLIEST-expiring observation,
             // NOT publish-time + window — otherwise a reused heartbeat's OK outlives the heartbeat it relied on. No obs ⇒ now.
@@ -627,7 +651,9 @@ async function main(): Promise<void> {
           } catch { /* no heartbeat yet / parse error ⇒ omit the verdict this tick (viz shows unknown), filled next tick */ }
         }
       }
-      writeProjection(PROJECTION_DIR, st, { nowSec: nowSec(), jobStartSec, livenessVerdict, livenessSampledAtSec, livenessValidUntilSec });
+      // Publish over the CURRENT state: applyIncidentReconcile may have committed a repair-wait (advancing CONTROL), so reload —
+      // writing the pre-commit `st` would regress meta + PRUNE the just-committed repair-wait's projection file (review P2-1).
+      writeProjection(PROJECTION_DIR, loadControlLog(CONTROL_LOG_DIR), { nowSec: nowSec(), jobStartSec, livenessVerdict, livenessSampledAtSec, livenessValidUntilSec });
     } catch (e) { log(`projection refresh failed: ${e instanceof Error ? e.message : e}`); }
   };
 

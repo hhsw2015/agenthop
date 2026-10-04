@@ -3,6 +3,7 @@ import { mkdtempSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { reconcileIncident, readIncidents, writeIncidents, emptyRegistry, type IncidentRegistry } from "../src/swarm/incident-episode.js";
+import { makeRepairWaitId, isRepairWaitId } from "../src/swarm/repair-wait-id.js";
 import type { LivenessVerdict } from "../src/swarm/task-liveness-inv1.js";
 
 /** L1-tail (cluster-liveness §1): STALL ⇒ durable episode + repair-wait; same ongoing stall dedups (lastObservedSeq only);
@@ -58,6 +59,16 @@ describe("reconcileIncident", () => {
   test("OK / UNVERIFIABLE with no open episode ⇒ no-op (no spurious resolve)", () => {
     expect(reconcileIncident(emptyRegistry(), ok(), 1000, cfg)).toEqual({ registry: { episodes: {} } });
     expect(reconcileIncident(emptyRegistry(), unver(), 1000, cfg)).toEqual({ registry: { episodes: {} } });
+  });
+
+  test("P2-3: the repair-wait id is INJECTIVE in jobId — 'job:a' and 'job-a' do NOT collide to one wait", () => {
+    const a = reconcileIncident(emptyRegistry(), { verdict: "STALL", why: "x", groupKey: "job:a:no-live-holder", lastObservedSeq: 1 }, 1000, { repairWindowSec: 1800, owner: "o", jobId: "job:a" });
+    const b = reconcileIncident(emptyRegistry(), { verdict: "STALL", why: "x", groupKey: "job-a:no-live-holder", lastObservedSeq: 1 }, 1000, { repairWindowSec: 1800, owner: "o", jobId: "job-a" });
+    expect(a.openRepairWait!.waitId).not.toBe(b.openRepairWait!.waitId);     // distinct ids ⇒ no overwrite
+    expect(a.openRepairWait!.waitId).toBe(makeRepairWaitId("job:a", 1));     // encodeURIComponent-based
+    expect(makeRepairWaitId("job-x", 1)).toBe("repair-job-x-ep1");           // safe jobId = readable identity
+    expect(isRepairWaitId("repair-job-x-ep1")).toBe(true);
+    expect(isRepairWaitId("coord-x")).toBe(false);
   });
 });
 

@@ -15,6 +15,7 @@ import type { AcceptedResult } from "./task-result.js";
 import { buildSched } from "./task-pass.js";
 import { jobStatus, readyTasks, currentAccepted, type JobUsage } from "./task-ready.js";
 import type { ControlCut, LivenessResponsibility, ObservationFact } from "./task-liveness-inv1.js";
+import { isRepairWaitId } from "./repair-wait-id.js";
 import type { Heartbeat } from "./heartbeat.js";
 
 /** An attempt is terminal (holds no current execution carrier) once SUCCEEDED/FAILED/ABANDONED. */
@@ -75,8 +76,10 @@ export function buildControlCut(
       if (inJob(v.attemptId) && v.state !== "closed") responsibilities.push({ kind: "VALIDATION", subjectId: v.validationRunId });
     } else if (body.put === "wait") {
       const w = body.wait;
-      // a validation-wait is covered by its VALIDATION run; here only the non-validation gates for THIS job.
-      if (w.subject.jobId === jobId && w.state !== "resolved" && w.subject.validationRunId === undefined) responsibilities.push({ kind: "AWAITING_GATE", subjectId: w.waitId });
+      // a validation-wait is covered by its VALIDATION run; here only the non-validation gates for THIS job. A repair-wait is
+      // EXCLUDED (review P1-1): it is the incident's own repair obligation, not a business holder — counting it would let the
+      // repair-wait opened FOR a stall satisfy INV-1 and self-certify the stall's recovery. (Prefix marker ⇒ restart-safe.)
+      if (w.subject.jobId === jobId && w.state !== "resolved" && w.subject.validationRunId === undefined && !isRepairWaitId(w.waitId)) responsibilities.push({ kind: "AWAITING_GATE", subjectId: w.waitId });
     }
   }
 
