@@ -94,14 +94,21 @@ export function detectWatchEvents(prev: WatchSnapshot, curr: WatchSnapshot): Wat
 
 export type DeadLetter = { ts: number; from?: string; to: string; error?: string; preview?: string };
 const ROUTING_GK_PREFIX = "routing:";
-export const routingGroupKey = (to: string): string => `${ROUTING_GK_PREFIX}${to}`;
-export const routingToOf = (groupKey: string): string | null => groupKey.startsWith(ROUTING_GK_PREFIX) ? groupKey.slice(ROUTING_GK_PREFIX.length) : null;
+/** Route IDENTITY = the (from → to) PAIR (review bb2a2cb-P2-1: keying by `to` alone merges A→X and B→X). encodeURIComponent on
+ *  each leg keeps the composite unambiguous. A dead-letter missing `from` has no route-pair identity — it is diagnostic only
+ *  (never silently folded into a specific pair), so routeKeyOf returns null and it does not count toward any incident. */
+export const routeKeyOf = (dl: DeadLetter): string | null => dl.from === undefined ? null : `${encodeURIComponent(dl.from)}->${encodeURIComponent(dl.to)}`;
+export const routingGroupKey = (routeKey: string): string => `${ROUTING_GK_PREFIX}${routeKey}`;
+export const routeKeyOfGroup = (groupKey: string): string | null => groupKey.startsWith(ROUTING_GK_PREFIX) ? groupKey.slice(ROUTING_GK_PREFIX.length) : null;
 
 /** Parse a dead-letter ledger (JSONL — one record per line). Null-safe: blank / malformed / partial-last lines are skipped
- *  (the append-only ledger may be mid-write), never a throw. Only records with a string `to` + numeric `ts` count. */
-export function parseDeadLetters(jsonl: string): DeadLetter[] {
+ *  (the append-only ledger may be mid-write), never a throw. Only records with a string `to` + numeric `ts` count. `maxLines`
+ *  (optional) bounds the parse to the most-recent N lines — a verifiable read budget (review P2-3); the window is recent anyway. */
+export function parseDeadLetters(jsonl: string, maxLines?: number): DeadLetter[] {
+  let lines = jsonl.split("\n");
+  if (maxLines !== undefined && lines.length > maxLines) lines = lines.slice(lines.length - maxLines);
   const out: DeadLetter[] = [];
-  for (const line of jsonl.split("\n")) {
+  for (const line of lines) {
     const t = line.trim();
     if (t.length === 0) continue;
     let rec: unknown;
@@ -114,22 +121,20 @@ export function parseDeadLetters(jsonl: string): DeadLetter[] {
   return out;
 }
 
-/** Count dead-letters per `to` within [windowStartMs, +∞) — a sliding window so an old burst that has aged out no longer counts. */
-export function countDeadLettersByTo(entries: readonly DeadLetter[], windowStartMs: number): Map<string, number> {
+/** Count dead-letters per ROUTE PAIR within [windowStartMs, +∞) — a sliding window so an aged-out burst no longer counts.
+ *  From-less (identity-less) entries are excluded (diagnostic only, P2-1). */
+export function countDeadLettersByRoute(entries: readonly DeadLetter[], windowStartMs: number): Map<string, number> {
   const m = new Map<string, number>();
-  for (const e of entries) if (e.ts >= windowStartMs) m.set(e.to, (m.get(e.to) ?? 0) + 1);
+  for (const e of entries) { if (e.ts < windowStartMs) continue; const rk = routeKeyOf(e); if (rk === null) continue; m.set(rk, (m.get(rk) ?? 0) + 1); }
   return m;
 }
 
-/** Build the routing IncidentSignals this tick: a `to` at/above threshold in the window ⇒ active; an OPEN routing episode whose
- *  `to` is now below threshold (window cleared) ⇒ recovered. subjectJobId is the synthetic routing domain (routing has no real
- *  job). Pure; the caller folds each signal via reconcileIncidentCore + commits the repair-wait + notifies the coordinator. */
-export function routingSignals(counts: ReadonlyMap<string, number>, openRoutingTos: readonly string[], threshold: number, lastObservedSeq: number): IncidentSignal[] {
-  const sigs: IncidentSignal[] = [];
-  const active = new Set<string>();
-  for (const [to, n] of counts) if (n >= threshold) { active.add(to); sigs.push({ kind: "active", groupKey: routingGroupKey(to), category: "routing", why: `${n} dead-letters to ${to} within window`, lastObservedSeq, subjectJobId: "swarm-routing" }); }
-  for (const to of openRoutingTos) if (!active.has(to)) sigs.push({ kind: "recovered", groupKey: routingGroupKey(to), category: "routing", why: `dead-letters to ${to} cleared`, lastObservedSeq, subjectJobId: "swarm-routing" });
-  return sigs;
+/** The ACTIVE routing incident signal for a route at/above threshold. There is NO window-clear→recovered signal (review P1-1:
+ *  absence of dead-letters is "untested", not recovery — a real recovery needs POSITIVE evidence, a subsequent successful
+ *  delivery, which the ledger does not carry; routing recovery is therefore driven by the repair-wait being resolved, synced
+ *  by reconcileRegistryWithControl, DEFERRED to when a delivery-success signal exists). subjectJobId = synthetic routing domain. */
+export function routingActiveSignal(routeKey: string, count: number, lastObservedSeq: number): IncidentSignal {
+  return { kind: "active", groupKey: routingGroupKey(routeKey), category: "routing", why: `${count} dead-letters on route ${routeKey} within window`, lastObservedSeq, subjectJobId: "swarm-routing" };
 }
 
 /** Read the durable snapshot. Missing ⇒ empty (first run); corrupt ⇒ THROWS (caller is fail-soft + skips — a transient read

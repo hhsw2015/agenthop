@@ -21,3 +21,13 @@ export function repairEpisodeOf(waitId: string, key: string): number | null {
   const rest = waitId.slice(prefix.length);
   return /^\d+$/.test(rest) ? Number(rest) : null;
 }
+
+/** Decode the incident groupKey from a repair-wait id (inverse of makeRepairWaitId) — lets the IO layer ENUMERATE the incident
+ *  groups present in CONTROL (union with the registry + current observation) so an incident committed in CONTROL but lost from
+ *  the registry is still reconciled (review bb2a2cb-P1-2). The episode suffix is the FINAL `-ep<digits>`. */
+export function repairGroupKeyOf(waitId: string): string | null {
+  if (!waitId.startsWith(REPAIR_WAIT_PREFIX)) return null;
+  const m = waitId.slice(REPAIR_WAIT_PREFIX.length).match(/^(.*)-ep\d+$/);
+  if (m === null) return null;
+  try { return decodeURIComponent(m[1]!); } catch { return null; }
+}

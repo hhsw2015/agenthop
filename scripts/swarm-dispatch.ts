@@ -45,9 +45,9 @@ import { beatStart, beatEnd } from "../packages/bus/src/swarm/heartbeat.js";
 import { buildControlCut, heartbeatObservations } from "../packages/bus/src/swarm/liveness-review.js";
 import { assertLiveness, type LivenessVerdict, type ControlCut, type ObservationFact } from "../packages/bus/src/swarm/task-liveness-inv1.js";
 import { reconcileIncident, reconcileIncidentCore, reconcileRegistryWithControl, readIncidents, writeIncidents, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
-import { isRepairWaitId, repairEpisodeOf } from "../packages/bus/src/swarm/repair-wait-id.js";
+import { isRepairWaitId, repairEpisodeOf, repairGroupKeyOf } from "../packages/bus/src/swarm/repair-wait-id.js";
 import { observeCandidate, readDelegations, writeDelegations, type DelegationRegistry } from "../packages/bus/src/swarm/delegation-envelope.js";
-import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, parseDeadLetters, countDeadLettersByTo, routingSignals, routingToOf, type ReadArtifact, type WatchSnapshot } from "../packages/bus/src/swarm/delegation-observer.js";
+import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, parseDeadLetters, countDeadLettersByRoute, routingGroupKey, routeKeyOfGroup, routingActiveSignal, type ReadArtifact, type WatchSnapshot } from "../packages/bus/src/swarm/delegation-observer.js";
 import { advanceWait } from "../packages/bus/src/swarm/task-wait.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
@@ -115,6 +115,11 @@ const ARTIFACT_ROOT = process.env.SWARM_ARTIFACT_ROOT || "";
 const DEAD_LETTERS_FILE = path.join(HOME, ".agenthop", "swarm", "dead-letters.jsonl");
 const DEAD_LETTER_WINDOW_MS = Number(process.env.SWARM_DEAD_LETTER_WINDOW_MS || "120000");
 const DEAD_LETTER_THRESHOLD = Number(process.env.SWARM_DEAD_LETTER_THRESHOLD || "3");
+// Per-tick budgets so the dead-letter watch never occupies the supervision loop unbounded (review bb2a2cb-P2-3): parse at most
+// the most-recent N ledger lines (the window is recent anyway) + process at most M routing groups per tick (round-robin cursor;
+// the group UNION is re-derived each tick so a deferred group stays pending, never silently "recovered").
+const MAX_LEDGER_LINES = Number(process.env.SWARM_DEAD_LETTER_MAX_LINES || "5000");
+const MAX_ROUTING_GROUPS_PER_TICK = Number(process.env.SWARM_ROUTING_GROUPS_PER_TICK || "32");
 const PLAN_FILE = process.env.SWARM_PLAN || "";
 const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
@@ -786,47 +791,68 @@ async function main(): Promise<void> {
     } catch (e) { log(`observer board watch failed: ${e instanceof Error ? e.message : e}`); }
   };
 
-  // Dead-letter watch (L2-struct 3b / F26): N dead-letters to the same `to` within a window ⇒ a ROUTING incident (via the
-  // generic incident core, category="routing"); the window clearing ⇒ recovered. The ledger is dormant until bus-identity v1.5
-  // writes it. Fail-soft; per-signal isolated. (The repair-wait commit mirrors the liveness applier — kept inline rather than
-  // refactoring the sealed liveness path.)
+  // Dead-letter watch (L2-struct 3b / F26): N dead-letters on the same ROUTE PAIR within a window ⇒ a ROUTING incident (via the
+  // generic incident core, category="routing"). Recovery is NOT window-clear (review P1-1: absence of failures is "untested",
+  // not recovered) — a routing incident recovers only when its repair-wait is RESOLVED (by a delivery-success signal, deferred),
+  // synced closed by reconcileRegistryWithControl. The ledger is dormant until bus-identity v1.5 writes it. Fail-soft; per-group
+  // isolated. Bounded per tick (review P2-3). Repair-wait commit is inline (mirrors the liveness applier; sealed path untouched).
+  let deadLetterCursor = 0; // in-memory round-robin over the sorted group union; the union is re-derived each tick (restart-safe)
   const runDeadLetterWatch = (): void => {
     let jsonl: string;
     try { jsonl = readFileSync(DEAD_LETTERS_FILE, "utf8"); }
     catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") log(`dead-letters read failed: ${e instanceof Error ? e.message : e}`); return; } // absent ⇒ dormant
     let reg: IncidentRegistry;
     try { reg = readIncidents(INCIDENTS_FILE); } catch (e) { log(`incidents read failed — skip dead-letter watch: ${e instanceof Error ? e.message : e}`); return; }
-    const counts = countDeadLettersByTo(parseDeadLetters(jsonl), Date.now() - DEAD_LETTER_WINDOW_MS);
-    const openRoutingTos: string[] = [];
-    for (const ep of Object.values(reg.episodes)) if (ep.category === "routing" && ep.open) { const to = routingToOf(ep.groupKey); if (to !== null) openRoutingTos.push(to); }
-    for (const sig of routingSignals(counts, openRoutingTos, DEAD_LETTER_THRESHOLD, loadControlLog(CONTROL_LOG_DIR).seq)) {
+    const counts = countDeadLettersByRoute(parseDeadLetters(jsonl, MAX_LEDGER_LINES), Date.now() - DEAD_LETTER_WINDOW_MS);
+    // P1-2 UNION of routing groups: registry episodes + CONTROL routing repair-waits (decoded) + active ledger routes — so an
+    // incident committed in CONTROL but lost from the registry is still reconciled even when the ledger window no longer shows it.
+    const st0 = loadControlLog(CONTROL_LOG_DIR);
+    const groups = new Set<string>();
+    for (const ep of Object.values(reg.episodes)) if (ep.category === "routing") groups.add(ep.groupKey);
+    for (const b of Object.values(liveEntities(st0))) if (b.put === "wait") { const gk = repairGroupKeyOf((b as Extract<ChangeBody, { put: "wait" }>).wait.waitId); if (gk !== null && gk.startsWith("routing:")) groups.add(gk); }
+    for (const [rk, n] of counts) if (n >= DEAD_LETTER_THRESHOLD) groups.add(routingGroupKey(rk));
+    const all = [...groups].sort();
+    if (all.length === 0) return;
+    // P2-3 bounded slice via a round-robin cursor; unprocessed groups return in next tick's re-derived union (never "recovered").
+    const batchCount = Math.min(MAX_ROUTING_GROUPS_PER_TICK, all.length);
+    deadLetterCursor %= all.length;
+    const batch: string[] = [];
+    for (let i = 0; i < batchCount; i++) batch.push(all[(deadLetterCursor + i) % all.length]!);
+    deadLetterCursor = (deadLetterCursor + batchCount) % all.length;
+    for (const groupKey of batch) {
       try {
         const fresh = loadControlLog(CONTROL_LOG_DIR);
         const groupCtlWaits = Object.values(liveEntities(fresh))
-          .filter((b) => b.put === "wait" && repairEpisodeOf((b as Extract<ChangeBody, { put: "wait" }>).wait.waitId, sig.groupKey) !== null)
+          .filter((b) => b.put === "wait" && repairEpisodeOf((b as Extract<ChangeBody, { put: "wait" }>).wait.waitId, groupKey) !== null)
           .map((b) => { const w = (b as Extract<ChangeBody, { put: "wait" }>).wait; return { waitId: w.waitId, state: w.state }; });
-        const sync = reconcileRegistryWithControl(reg, sig.groupKey, "routing", groupCtlWaits, nowSec());
+        // the recovery closed loop: adopt a committed wait the registry lost / sync-close one whose repair-wait resolved.
+        const sync = reconcileRegistryWithControl(reg, groupKey, "routing", groupCtlWaits, nowSec());
         if (sync.registry !== reg) { writeIncidents(INCIDENTS_FILE, sync.registry); reg = sync.registry; }
-        const rec = reconcileIncidentCore(reg, sig, nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner: REPAIR_OWNER_ROUTABLE ? REPAIR_OWNER : SELF, controlEpisodeFloor: sync.controlEpisodeFloor });
-        if (rec.openRepairWait === undefined && rec.resolveRepairWait === undefined) { if (JSON.stringify(rec.registry) !== JSON.stringify(reg)) { writeIncidents(INCIDENTS_FILE, rec.registry); reg = rec.registry; } continue; }
-        let committed = false;
-        if (rec.openRepairWait) {
-          const spec = rec.openRepairWait;
-          const existing = findWaitIn(fresh, spec.waitId);
-          if (existing !== undefined && existing.state !== "resolved") committed = true;                 // adopt a live committed wait (P1-3)
-          else if (existing !== undefined) { log(`routing repair-wait ${spec.waitId} exists RESOLVED — not resurrecting; defer`); continue; }
-          else committed = commitTask(fresh, [{ put: "wait", wait: { waitId: spec.waitId, kind: "wait", subject: { jobId: spec.jobId }, state: "open", deadlineSec: spec.deadlineSec, owner: spec.owner, timeoutPolicy: "escalate" } }]).result.ok;
-          if (committed) notifyCoordinator(`routing incident ${spec.incidentId}: ${spec.why} — repair-wait ${spec.waitId} (owner=${spec.owner}${REPAIR_OWNER_ROUTABLE ? "" : ", NON-ROUTABLE default"})`);
-        } else if (rec.resolveRepairWait) {
-          const spec = rec.resolveRepairWait;
-          const w = findWaitIn(fresh, spec.waitId);
-          if (w === undefined || w.state === "resolved") committed = true;
-          else { const adv = advanceWait(w, { type: "close", resolution: { outcome: "recovered", reason: spec.reason, sourceOperationId: `routing-recover-${SELF}` } }); if (adv.ok) committed = commitTask(fresh, [{ put: "wait", wait: adv.wait }]).result.ok; }
-          if (committed) notifyCoordinator(`routing incident recovered — resolved repair-wait ${spec.waitId}`);
+        const route = routeKeyOfGroup(groupKey);
+        const n = route !== null ? (counts.get(route) ?? 0) : 0;
+        if (route !== null && n >= DEAD_LETTER_THRESHOLD) { // ACTIVE burst ⇒ open/dedup the incident
+          const rec = reconcileIncidentCore(reg, routingActiveSignal(route, n, fresh.seq), nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner: REPAIR_OWNER_ROUTABLE ? REPAIR_OWNER : SELF, controlEpisodeFloor: sync.controlEpisodeFloor });
+          if (rec.openRepairWait !== undefined) {
+            const spec = rec.openRepairWait;
+            const existing = findWaitIn(fresh, spec.waitId);
+            let committed = false;
+            if (existing !== undefined && existing.state !== "resolved") committed = true;               // adopt a live committed wait (P1-3)
+            else if (existing !== undefined) { log(`routing repair-wait ${spec.waitId} exists RESOLVED — not resurrecting; defer`); continue; }
+            else committed = commitTask(fresh, [{ put: "wait", wait: { waitId: spec.waitId, kind: "wait", subject: { jobId: spec.jobId }, state: "open", deadlineSec: spec.deadlineSec, owner: spec.owner, timeoutPolicy: "escalate" } }]).result.ok;
+            if (!committed) { log(`routing repair-wait ${spec.waitId} deferred (seq conflict) — retry next tick`); continue; }
+            writeIncidents(INCIDENTS_FILE, rec.registry); reg = rec.registry;
+          } else if (JSON.stringify(rec.registry) !== JSON.stringify(reg)) { writeIncidents(INCIDENTS_FILE, rec.registry); reg = rec.registry; } // dedup lastObservedSeq bump
         }
-        if (committed) { writeIncidents(INCIDENTS_FILE, rec.registry); reg = rec.registry; }
-        else log(`routing repair-wait action deferred (seq conflict) — retry next tick`);
-      } catch (e) { log(`routing signal ${sig.groupKey} failed (isolated): ${e instanceof Error ? e.message : e}`); }
+        // P2-2 at-least-once notify: an OPEN routing episode whose notification is not yet delivered ⇒ (re)notify. Set
+        // notifiedAtSec only on delivered/logged; a transient "failed" leaves it unset ⇒ retried next tick (never lost).
+        const ep = reg.episodes[groupKey];
+        if (ep !== undefined && ep.open && ep.category === "routing" && ep.notifiedAtSec === undefined) {
+          if (notifyCoordinator(`[${ep.repairWaitId}] routing incident ${ep.incidentId}: ${ep.why}`) !== "failed") {
+            reg = { episodes: { ...reg.episodes, [groupKey]: { ...ep, notifiedAtSec: nowSec() } } };
+            writeIncidents(INCIDENTS_FILE, reg);
+          } else log(`routing notify for ${ep.incidentId} failed (transient) — retry next tick`);
+        }
+      } catch (e) { log(`routing group ${groupKey} failed (isolated): ${e instanceof Error ? e.message : e}`); }
     }
   };
 

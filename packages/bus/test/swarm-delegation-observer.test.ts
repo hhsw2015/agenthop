@@ -5,7 +5,7 @@ import path from "node:path";
 import {
   scanCompletionSlots, parseCompletionArtifact, parseBoardFile, detectWatchEvents,
   readWatchSnapshot, writeWatchSnapshot, emptyWatchSnapshot,
-  parseDeadLetters, countDeadLettersByTo, routingSignals, routingGroupKey, routingToOf,
+  parseDeadLetters, countDeadLettersByRoute, routeKeyOf, routingGroupKey, routeKeyOfGroup, routingActiveSignal,
   type ReadArtifact, type WatchSnapshot,
 } from "../src/swarm/delegation-observer.js";
 import { openDelegation, observeCandidate, emptyDelegationRegistry, type OpenSpec, type CompletionSlot, type DelegationRegistry } from "../src/swarm/delegation-envelope.js";
@@ -91,43 +91,43 @@ describe("detectWatchEvents", () => {
 });
 
 describe("dead-letter watch (F26)", () => {
-  test("parseDeadLetters: JSONL, null-safe — blank/malformed/partial lines skipped, only {to:string, ts:number} kept", () => {
+  test("parseDeadLetters: JSONL null-safe — blank/malformed/partial/null skipped; maxLines bounds to the most-recent N", () => {
     const jsonl = [
       JSON.stringify({ ts: 100, from: "claude:A", to: "codex:B", error: "unresolved", preview: "hi" }),
-      "",                                   // blank
-      "{ not json",                         // malformed (partial last-line mid-write)
-      JSON.stringify({ ts: 200, to: "codex:B" }),
-      JSON.stringify({ to: "codex:B" }),    // no ts ⇒ skipped
-      JSON.stringify({ ts: 300 }),          // no to ⇒ skipped
-      "null",                               // JSON null ⇒ skipped
+      "", "{ not json", "null",                            // blank / malformed / JSON null ⇒ skipped
+      JSON.stringify({ ts: 200, to: "codex:B" }),          // from-less is kept here (routeKeyOf decides route identity)
+      JSON.stringify({ to: "codex:B" }),                   // no ts ⇒ skipped
     ].join("\n");
     const out = parseDeadLetters(jsonl);
-    expect(out).toHaveLength(2);
-    expect(out[0]).toEqual({ ts: 100, from: "claude:A", to: "codex:B", error: "unresolved", preview: "hi" });
-    expect(out[1]).toEqual({ ts: 200, to: "codex:B" });
+    expect(out).toEqual([{ ts: 100, from: "claude:A", to: "codex:B", error: "unresolved", preview: "hi" }, { ts: 200, to: "codex:B" }]);
+    // maxLines keeps only the last N raw lines (a verifiable read budget, P2-3)
+    const many = Array.from({ length: 10 }, (_, i) => JSON.stringify({ ts: i, from: "a", to: "b" })).join("\n");
+    expect(parseDeadLetters(many, 3)).toHaveLength(3);
   });
 
-  test("countDeadLettersByTo: sliding window — aged-out entries don't count", () => {
-    const entries = [{ ts: 50, to: "X" }, { ts: 150, to: "X" }, { ts: 160, to: "X" }, { ts: 170, to: "Y" }];
-    const counts = countDeadLettersByTo(entries, 100); // window start 100 ⇒ the ts=50 X is excluded
-    expect(counts.get("X")).toBe(2);
-    expect(counts.get("Y")).toBe(1);
+  test("P2-1 route-pair identity: routeKeyOf = (from→to); from-less ⇒ null (diagnostic, not a route)", () => {
+    expect(routeKeyOf({ ts: 1, from: "claude:A", to: "codex:X" })).toBe("claude%3AA->codex%3AX");
+    expect(routeKeyOf({ ts: 1, to: "codex:X" })).toBeNull();                  // no from ⇒ no route-pair identity
+    expect(routeKeyOfGroup(routingGroupKey("claude%3AA->codex%3AX"))).toBe("claude%3AA->codex%3AX"); // round-trips
+    expect(routeKeyOfGroup("liveness:x")).toBeNull();
   });
 
-  test("routingSignals: at/above threshold ⇒ active; an open routing `to` now below threshold ⇒ recovered", () => {
-    const counts = new Map([["codex:B", 3], ["codex:C", 1]]);
-    const sigs = routingSignals(counts, ["codex:D"], 3, 42); // D was open, now 0 in window ⇒ recovered; B≥3 ⇒ active; C<3 ⇒ nothing
-    expect(sigs).toContainEqual({ kind: "active", groupKey: routingGroupKey("codex:B"), category: "routing", why: "3 dead-letters to codex:B within window", lastObservedSeq: 42, subjectJobId: "swarm-routing" });
-    expect(sigs).toContainEqual({ kind: "recovered", groupKey: routingGroupKey("codex:D"), category: "routing", why: "dead-letters to codex:D cleared", lastObservedSeq: 42, subjectJobId: "swarm-routing" });
-    expect(sigs.some((s) => s.groupKey === routingGroupKey("codex:C"))).toBe(false); // below threshold, not open ⇒ no signal
-    expect(routingToOf(routingGroupKey("codex:B"))).toBe("codex:B");               // round-trips
-    expect(routingToOf("liveness:x")).toBeNull();
+  test("countDeadLettersByRoute: per ROUTE PAIR (A→X and B→X don't merge); sliding window; from-less excluded", () => {
+    const entries = [
+      { ts: 50, from: "A", to: "X" },   // aged out (window start 100)
+      { ts: 150, from: "A", to: "X" }, { ts: 160, from: "A", to: "X" },
+      { ts: 170, from: "B", to: "X" },  // SAME `to`, DIFFERENT route ⇒ separate count
+      { ts: 180, to: "X" },             // from-less ⇒ excluded
+    ];
+    const counts = countDeadLettersByRoute(entries, 100);
+    expect(counts.get(routeKeyOf({ ts: 0, from: "A", to: "X" })!)).toBe(2); // A→X: the ts=50 is aged out
+    expect(counts.get(routeKeyOf({ ts: 0, from: "B", to: "X" })!)).toBe(1); // B→X: separate, not merged with A→X
+    expect(counts.size).toBe(2);                                            // from-less did not create a phantom route
   });
 
-  test("routingSignals: an open `to` STILL above threshold stays active (not recovered)", () => {
-    const sigs = routingSignals(new Map([["X", 5]]), ["X"], 3, 1);
-    expect(sigs).toHaveLength(1);
-    expect(sigs[0]!.kind).toBe("active");
+  test("routingActiveSignal: builds an ACTIVE signal keyed by the route-pair groupKey (no recovered signal exists, P1-1)", () => {
+    const route = routeKeyOf({ ts: 0, from: "A", to: "X" })!;
+    expect(routingActiveSignal(route, 4, 42)).toEqual({ kind: "active", groupKey: routingGroupKey(route), category: "routing", why: `4 dead-letters on route ${route} within window`, lastObservedSeq: 42, subjectJobId: "swarm-routing" });
   });
 });
 

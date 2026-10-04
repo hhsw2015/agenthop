@@ -34,6 +34,7 @@ export type IncidentEpisode = {
   lastObservedSeq: number; // the control-cut seq this episode was last observed at (dedup updates this, not identity)
   repairWaitId: string;
   closedAtSec?: number;
+  notifiedAtSec?: number;  // set once a coordinator notification for this episode is DELIVERED — unset ⇒ retry (at-least-once, P2-2)
 };
 
 export type IncidentRegistry = { episodes: Record<string, IncidentEpisode> }; // keyed by groupKey
