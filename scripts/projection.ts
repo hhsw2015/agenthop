@@ -254,3 +254,240 @@ export function readProjection(home: string = homedir()): Projection {
     members: readMembers(dir),
   };
 }
+
+// ---------------------------------------------------------------------------------------------
+// Progress board (board-viz) — the three TRANSITIONAL durable sources the board spec names:
+//   ① control-log/   wait entities; we fold put-wait changes to current state and consume the wait's
+//                     `state` verbatim (judgment stays sunk — we never decide "expired" ourselves).
+//   ② board/         claimable/claimed items; STATUS IS THE FILENAME (x.json open, x.claimed.<id>.json,
+//                     x.done.<id>.json) — the claim protocol is an atomic rename, so the name is the truth.
+//   ③ PROGRESS.md    the human summary, passed through as text, never parsed for state.
+// Once projection-impl ships waits/<waitId>.json (schema §8c), readWaits switches source automatically
+// and the render side does not change — that is the promised zero-change migration for source ①.
+// ---------------------------------------------------------------------------------------------
+
+export type WaitState = "open" | "action_pending" | "resolved" | string; // tolerate future states (§8c: fields may appear)
+export type WaitRecord = {
+  waitId: string;
+  kind?: string;
+  subject?: { jobId?: string; attemptId?: string };
+  state: WaitState;
+  deadlineSec?: number;
+  owner?: string;
+  timeoutPolicy?: string;
+  escalatedAt?: number;
+  /** §8c: set ⇒ "automation stopped, waiting for a human" — a legal long-lived state, not a fault. */
+  automationExhausted?: boolean;
+  [k: string]: unknown;
+};
+
+export type BoardItemStatus = "open" | "claimed" | "done";
+export type BoardItem = {
+  itemId: string;
+  status: BoardItemStatus;
+  /** The sessionId from the filename, for claimed/done items. */
+  claimant: string | null;
+  file: string;
+  mtimeMs: number | null;
+  priority?: string;
+  spec?: string;
+  dependsOn: string[];
+  conflictsWith: string[];
+  fileDomain: string[];
+  fitProfile?: string;
+  postedBy?: string;
+  postedAtSec?: number;
+};
+
+/** INV-2b-c: an artifact that exists (done-file mtime = production instant) with consumption not yet
+ *  visible. waitId null = no wait references the item at all (consumer unknown, shown as such). A
+ *  RESOLVED related wait = consumption happened, so no gap row. */
+export type ArtifactGap = {
+  itemId: string;
+  doneAtMs: number;
+  waitId: string | null;
+  waitState: WaitState | null;
+};
+
+/** The stall theorem (全静默红态): everyone idle + nothing supervised + work unfinished = silence over
+ *  unfinished business. DERIVED from observable files/statuses (like isAllocExhausted); the UI labels it. */
+export type StallVerdict = {
+  stalled: boolean;
+  peersSeen: number;
+  allIdle: boolean;
+  unresolvedWaits: number;
+  openBoardItems: number;
+  incompleteJobs: number;
+  reason: string;
+};
+
+export type BoardView = {
+  items: BoardItem[];
+  waits: WaitRecord[];
+  waitsSource: "projection" | "control-log" | "none";
+  progress: { text: string; mtimeMs: number } | null;
+  gaps: ArtifactGap[];
+};
+
+function swarmRoot(home: string): string {
+  return path.join(home, ".agenthop", "swarm");
+}
+
+export type WaitLogEntry = { seq?: number; changes?: Array<Record<string, unknown>> };
+
+/** Fold control-log entries to the CURRENT state of each wait: apply put-wait changes in seq order,
+ *  last write wins per waitId. Non-wait changes and malformed records are skipped, never thrown. */
+export function foldWaitLog(entries: WaitLogEntry[]): WaitRecord[] {
+  const sorted = [...entries].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+  const byId = new Map<string, WaitRecord>();
+  for (const e of sorted) {
+    for (const c of e.changes ?? []) {
+      if (c.put !== "wait") continue;
+      const w = c.wait as WaitRecord | undefined;
+      if (!w || typeof w.waitId !== "string" || typeof w.state !== "string") continue;
+      byId.set(w.waitId, w);
+    }
+  }
+  return [...byId.values()];
+}
+
+/** Parse a board filename into (itemId, status, claimant). Unrecognized middle tokens stay part of the
+ *  id (conservative: a weird name is an open item with a long id, not a crash or a guessed claim). */
+export function parseBoardFileName(name: string): { itemId: string; status: BoardItemStatus; claimant: string | null } | null {
+  if (!name.endsWith(".json")) return null;
+  const stem = name.slice(0, -".json".length);
+  const parts = stem.split(".");
+  if (parts.length >= 2 && (parts[1] === "claimed" || parts[1] === "done")) {
+    return { itemId: parts[0]!, status: parts[1], claimant: parts.length > 2 ? parts.slice(2).join(".") : null };
+  }
+  return { itemId: stem, status: "open", claimant: null };
+}
+
+export function readBoard(home: string = homedir()): BoardItem[] {
+  const dir = path.join(swarmRoot(home), "board");
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((n) => n.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+  const out: BoardItem[] = [];
+  for (const name of names.sort()) {
+    const parsed = parseBoardFileName(name);
+    if (!parsed) continue;
+    const full = path.join(dir, name);
+    const body = readJson<Record<string, unknown>>(full) ?? {}; // unreadable body ⇒ filename still carries the state
+    let mtimeMs: number | null = null;
+    try {
+      mtimeMs = statSync(full).mtimeMs;
+    } catch {
+      // renamed between readdir and stat — the next snapshot sees the new name
+    }
+    out.push({
+      ...parsed,
+      file: name,
+      mtimeMs,
+      priority: typeof body.priority === "string" ? body.priority : undefined,
+      spec: typeof body.spec === "string" ? body.spec : undefined,
+      dependsOn: strs(body.dependsOn),
+      conflictsWith: strs(body.conflictsWith),
+      fileDomain: strs(body.fileDomain),
+      fitProfile: typeof body.fitProfile === "string" ? body.fitProfile : undefined,
+      postedBy: typeof body.postedBy === "string" ? body.postedBy : undefined,
+      postedAtSec: typeof body.postedAtSec === "number" ? body.postedAtSec : undefined,
+    });
+  }
+  return out;
+}
+
+/** Wait current-state. Source precedence: projection/waits/ WITH files (the §8c formal source) else the
+ *  control-log fold. "Dir exists but is empty" does NOT win — trusting an empty half-written directory
+ *  while the log clearly holds open waits would flip the stall banner red by mistake. */
+export function readWaits(home: string = homedir()): { waits: WaitRecord[]; source: BoardView["waitsSource"] } {
+  const projWaits = path.join(projectionDir(home), "waits");
+  try {
+    const files = readdirSync(projWaits).filter((n) => n.endsWith(".json"));
+    if (files.length) {
+      const waits = files
+        .map((n) => readJson<WaitRecord>(path.join(projWaits, n)))
+        .filter((w): w is WaitRecord => !!w && typeof w.waitId === "string" && typeof w.state === "string");
+      return { waits, source: "projection" };
+    }
+  } catch {
+    // no projection waits yet — the normal state until projection-impl ships §8c
+  }
+  const logDir = path.join(swarmRoot(home), "control-log");
+  let names: string[];
+  try {
+    names = readdirSync(logDir).filter((n) => n.endsWith(".json"));
+  } catch {
+    return { waits: [], source: "none" };
+  }
+  // ponytail: refold the whole log every snapshot (~hundreds of tiny files today); cache by mtime if it grows.
+  const entries = names.map((n) => readJson<WaitLogEntry>(path.join(logDir, n))).filter((e): e is WaitLogEntry => !!e);
+  return { waits: foldWaitLog(entries), source: "control-log" };
+}
+
+export function readProgressDoc(home: string = homedir()): { text: string; mtimeMs: number } | null {
+  const file = path.join(swarmRoot(home), "PROGRESS.md");
+  try {
+    return { text: readFileSync(file, "utf8").slice(0, 20_000), mtimeMs: statSync(file).mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+/** Done items whose consumption is not visible yet. Relation rule: a wait "consumes" an item when its
+ *  waitId contains the itemId (the coord-<itemId> convention) — stated here because it is a naming
+ *  convention, not a schema field; a done item no wait ever mentions is shown as "consumer unknown". */
+export function artifactGaps(items: BoardItem[], waits: WaitRecord[]): ArtifactGap[] {
+  const out: ArtifactGap[] = [];
+  for (const it of items) {
+    if (it.status !== "done" || it.mtimeMs == null) continue;
+    const related = waits.filter((w) => w.waitId.includes(it.itemId));
+    const unresolved = related.find((w) => w.state === "open" || w.state === "action_pending");
+    if (unresolved) {
+      out.push({ itemId: it.itemId, doneAtMs: it.mtimeMs, waitId: unresolved.waitId, waitState: unresolved.state });
+    } else if (related.length === 0) {
+      out.push({ itemId: it.itemId, doneAtMs: it.mtimeMs, waitId: null, waitState: null });
+    }
+    // a resolved related wait = consumed; no row
+  }
+  return out;
+}
+
+/** 停摆定理. All-idle requires ≥1 peer and EVERY status === "idle" — an unknown status means we cannot
+ *  see, and "cannot see" must not scream red. Incomplete = board item not done, or job not succeeded
+ *  (a failed job is unfinished business too; assumption recorded in the done-report). */
+export function stallVerdict(
+  peerStatuses: string[],
+  waits: WaitRecord[],
+  items: BoardItem[],
+  jobStatuses: string[],
+): StallVerdict {
+  const peersSeen = peerStatuses.length;
+  const allIdle = peersSeen > 0 && peerStatuses.every((s) => s === "idle");
+  const unresolvedWaits = waits.filter((w) => w.state === "open" || w.state === "action_pending").length;
+  const openBoardItems = items.filter((i) => i.status !== "done").length;
+  const incompleteJobs = jobStatuses.filter((s) => s !== "succeeded").length;
+  const stalled = allIdle && unresolvedWaits === 0 && (openBoardItems > 0 || incompleteJobs > 0);
+  return {
+    stalled,
+    peersSeen,
+    allIdle,
+    unresolvedWaits,
+    openBoardItems,
+    incompleteJobs,
+    reason: stalled
+      ? `all ${peersSeen} peer(s) idle, no unresolved wait, yet ${openBoardItems} board item(s) + ${incompleteJobs} job(s) unfinished`
+      : "",
+  };
+}
+
+/** The whole board view, assembled from the three transitional sources. Pure reads; never throws. */
+export function readBoardView(home: string = homedir()): BoardView {
+  const items = readBoard(home);
+  const { waits, source } = readWaits(home);
+  return { items, waits, waitsSource: source, progress: readProgressDoc(home), gaps: artifactGaps(items, waits) };
+}

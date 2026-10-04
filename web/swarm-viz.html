@@ -303,6 +303,30 @@
   .flowrow .arrow { color: var(--relay); }
   .flowrow .who { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+  /* ---------- progress board (board-viz) ---------- */
+  .brow { padding: 5px 0; font-size: 11.5px; border-bottom: 1px solid var(--line-soft); }
+  .brow:last-child { border-bottom: none; }
+  .brow .l1 { display: flex; align-items: center; gap: 7px; }
+  .brow .k { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .brow .v { color: var(--faint); font-size: 10px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .brow .l2 { color: var(--faint); font-size: 10px; margin-top: 2px; padding-left: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bchip { font-size: 9px; font-weight: 650; letter-spacing: .06em; padding: 1.5px 6px; border-radius: 5px; white-space: nowrap; }
+  .bchip.open { color: var(--idle); background: rgba(63,208,138,.12); }
+  .bchip.claimed { color: var(--working); background: rgba(90,169,255,.12); }
+  .bchip.done { color: var(--faint); background: rgba(255,255,255,.05); }
+  .bchip.wait-open { color: var(--working); background: rgba(90,169,255,.12); }
+  .bchip.wait-action_pending { color: var(--warn); background: rgba(255,180,84,.12); }
+  .bchip.wait-resolved { color: var(--faint); background: rgba(255,255,255,.05); }
+  .bdep { color: var(--warn); }
+  .gap-age { color: var(--warn); font-weight: 600; }
+  /* stall banner: the one state that must be impossible to miss */
+  .stallbar { display: none; position: absolute; left: 50%; transform: translateX(-50%); top: 14px; z-index: 6;
+    background: rgba(255,95,109,.14); border: 1px solid var(--blocked); color: var(--blocked);
+    border-radius: 11px; padding: 8px 16px; font-size: 12px; font-weight: 650; backdrop-filter: blur(14px);
+    max-width: min(640px, calc(100% - 48px)); }
+  .stallbar.on { display: block; animation: stallpulse 1.6s infinite; }
+  @keyframes stallpulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,95,109,.35) } 50% { box-shadow: 0 0 22px 2px rgba(255,95,109,.25) } }
+
   /* lineage timeline in the drawer */
   .tl { position: relative; padding-left: 16px; margin: 4px 0 8px; }
   .tl::before { content: ""; position: absolute; left: 4px; top: 4px; bottom: 4px; width: 1px; background: var(--line); }
@@ -385,6 +409,7 @@
     </defs>
     <g id="view"></g></svg>
     <div class="panels" id="panels"></div>
+<div class="stallbar" id="stallbar"></div>
     <div class="jobsmembers" id="jobsmembers"></div>
     <div class="ticker" id="ticker">
       <div class="ttitle"><span>Events</span><span class="tsub" id="tsub"></span>
@@ -716,6 +741,7 @@
       renderJobsView();
       renderDrawer();
       renderHeader();
+      renderStall(); // the stall banner must survive the early return — it shows in BOTH views
       return;
     }
     document.body.classList.remove("jobs-view");
@@ -1207,7 +1233,80 @@
       }</div>`);
     }
 
+    renderBoardPanels(parts);
     $("panels").innerHTML = parts.join("");
+    renderStall();
+  }
+
+  // ------------------------------------------------- progress board (board-viz)
+  /** BOARD — claimable/claimed/done items; status comes from the exporter (= the filename, the claim
+   *  protocol's atomic rename). dependsOn/conflictsWith render as text under each row — relations to
+   *  non-board things ("rev2 frozen") are prose, not edges, so a list is the honest form. */
+  function renderBoardPanels(parts) {
+    const b = state?.board;
+    if (!b) return;
+
+    const items = b.items ?? [];
+    if (items.length) {
+      const order = { open: 0, claimed: 1, done: 2 };
+      const rows = [...items].sort((x, y) => (order[x.status] ?? 9) - (order[y.status] ?? 9) || x.itemId.localeCompare(y.itemId));
+      parts.push(`<div class="panel"><h4>Board <span class="n">${items.filter((i) => i.status === "open").length} open</span></h4>${
+        rows.map((it) => {
+          const who = it.status === "claimed" ? ` → ${esc(it.claimant ?? "?")}` : it.status === "done" ? ` ✓ ${esc(it.claimant ?? "?")}` : "";
+          const deps = it.dependsOn.length ? `<span class="bdep" title="${esc(it.dependsOn.join("\n"))}">⧗${it.dependsOn.length} dep</span>` : "";
+          const conf = it.conflictsWith.length ? `<span class="bdep" title="${esc(it.conflictsWith.join("\n"))}">⚔${it.conflictsWith.length}</span>` : "";
+          const fit = it.fitProfile ? `<div class="l2" title="${esc(it.fitProfile)}">fit: ${esc(it.fitProfile)}</div>` : "";
+          return `<div class="brow" title="${esc(it.spec ?? "")}">
+            <div class="l1"><span class="bchip ${esc(it.status)}">${esc(it.status)}</span>
+            <span class="k">${esc(it.itemId)}${who}</span>${deps}${conf}</div>${fit}</div>`;
+        }).join("")
+      }</div>`);
+    }
+
+    // WAITS — current state per wait entity. State colour is CONSUMED (open/action_pending/resolved);
+    // deadline renders as a countdown but never changes the colour (judgment-sink: sweep decides expiry).
+    const waits = (b.waits ?? []).filter((w) => w.state !== "resolved");
+    const resolved = (b.waits ?? []).length - waits.length;
+    parts.push(`<div class="panel"><h4>Waits <span class="n">${waits.length} open · ${resolved} resolved</span></h4>${
+      waits.length
+        ? waits.map((w) => {
+            const cd = w.deadlineSec ? countdown(w.deadlineSec) : null;
+            const exhausted = w.automationExhausted ? `<span class="bchip wait-action_pending" title="automation stopped, waiting for a human — a legal state, not a fault">⏸ human</span>` : "";
+            return `<div class="brow"><div class="l1">
+              <span class="bchip wait-${esc(w.state)}">${esc(w.state)}</span>
+              <span class="k" title="${esc(w.subject?.jobId ?? "")}">${esc(w.waitId)}</span>${exhausted}
+              ${cd ? `<span class="v ${cd.cls}">${esc(cd.text)}</span>` : ""}</div>
+              <div class="l2">${esc(w.owner ?? "")}</div></div>`;
+          }).join("")
+        : `<div class="empty-note">No open waits.${b.waitsSource === "none" ? " (no wait source found)" : ""}</div>`
+    }<div class="empty-note" style="margin-top:6px">source: ${esc(b.waitsSource)}</div></div>`);
+
+    // ARTIFACT GAPS (INV-2b-c) — produced (done-file mtime) but consumption not visible. The age IS the
+    // handoff lag the invariant watches.
+    const gaps = b.gaps ?? [];
+    if (gaps.length) {
+      parts.push(`<div class="panel"><h4>Unconsumed artifacts <span class="n">${gaps.length}</span></h4>${
+        gaps.map((g) => `<div class="brow"><div class="l1">
+          <span class="k">${esc(g.itemId)}</span>
+          <span class="v gap-age" title="time since the artifact landed with no visible consumption">${esc(dur2(Date.now() - g.doneAtMs))}</span></div>
+          <div class="l2">${g.waitId ? `wait ${esc(g.waitId)}: ${esc(g.waitState)}` : "no wait references it — consumer unknown"}</div></div>`).join("")
+      }</div>`);
+    }
+
+    // PROGRESS.md — human summary, passthrough (transitional source ③; folds into the projection later).
+    if (b.progress) {
+      parts.push(`<div class="panel"><h4>PROGRESS.md <span class="n">${ago(b.progress.mtimeMs)}</span></h4>
+        <div class="empty-note" style="white-space:pre-wrap;max-height:180px;overflow-y:auto">${esc(b.progress.text)}</div></div>`);
+    }
+  }
+
+  /** 停摆定理 banner — shown in BOTH views (it is the one red state that must never hide). */
+  function renderStall() {
+    const bar = $("stallbar");
+    const st = state?.stall;
+    if (!st || !st.stalled) { bar.classList.remove("on"); bar.textContent = ""; return; }
+    bar.classList.add("on");
+    bar.textContent = "⚠ SWARM STALLED — " + st.reason;
   }
 
   // ---------------------------------------------------------------- drawer

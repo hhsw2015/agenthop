@@ -34,7 +34,7 @@ import { readMsgLogDays, msgLogEnabled, payloadLoggingEnabled, type MsgLogEntry 
 import { readTasks } from "../packages/bus/src/tasklog.js";
 import type { UnifiedPeer } from "../packages/bus/src/resolve.js";
 import { codexRolloutPath, readNodeActivity, transcriptPath, type NodeActivity } from "./node-activity.js";
-import { readProjection, type Projection } from "./projection.js";
+import { readBoardView, readProjection, stallVerdict, type BoardView, type Projection, type StallVerdict } from "./projection.js";
 
 // ---------------------------------------------------------------------------------------------
 // Types
@@ -201,6 +201,12 @@ export type Snapshot = {
   /** The swarm-brain projection: job DAGs, attempts, acceptance, members. present:false until the brain
    *  writes one (brain §4.3 step A). The task-logical view renders from this; never re-derives judgment. */
   projection: Projection;
+  /** The progress board (board-viz): board items (status = filename), wait current-state (projection
+   *  waits/ when present, else the control-log fold), PROGRESS.md passthrough, artifact gaps (INV-2b-c). */
+  board: BoardView;
+  /** 停摆定理: all peers idle + no unresolved wait + unfinished work = silence over unfinished business.
+   *  DERIVED here (like allocExhausted), from reported statuses and wait states — never from re-judging. */
+  stall: StallVerdict;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -475,6 +481,17 @@ export function buildSnapshot(
 
   const tasks = tasksFromSources(controls, readTasks(home) as unknown as TaskFile[]);
 
+  const projection = readProjection(home);
+  const board = readBoardView(home);
+  // Stall input = every peer's reported status (observer excluded above via `nodes`). The observer
+  // itself never counts as "someone is working".
+  const stall = stallVerdict(
+    nodes.map((n) => n.status ?? "unknown"),
+    board.waits,
+    board.items,
+    projection.jobs.map((j) => j.plan.jobStatus),
+  );
+
   return {
     generatedAt: Date.now(),
     observerId,
@@ -490,7 +507,9 @@ export function buildSnapshot(
     departures,
     tasks,
     events: msgLog,
-    projection: readProjection(home),
+    projection,
+    board,
+    stall,
     payloadLogged: msgLog.some((e) => typeof e.text === "string" && e.text.length > 0),
     msgLogEnabled: msgLogEnabled(),
   };
