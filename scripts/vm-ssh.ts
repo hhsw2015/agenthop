@@ -22,10 +22,14 @@
  */
 
 import { execFile, execFileSync, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { connect as netConnect, createServer, type Socket } from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
+import { Duplex } from "node:stream";
+import { connect as tlsConnect } from "node:tls";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileP = promisify(execFile);
@@ -114,6 +118,207 @@ async function provisionWithRetry(keyPath: string, knownHosts: string, bootstrap
 }
 function providerDestroy(): void {
   /* no-op: Railway auto-destroys the box ~1h after allocation (vm-ssh-brief). Local bookkeeping only. */
+}
+// ───────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────── BUNDLED ECH PROXY POOL (inlined) ───────────────────────
+// A SOCKS5 server tunneling TCP through Cloudflare-Worker WebSocket tunnels — the swarm's ECH proxy pool. Each worker
+// domain = one Cloudflare edge exit IP; round-robin spreads each `ssh railway.new` across fresh IPs to beat Railway's
+// per-source-IP gate (abundant IPs ⇒ a clean one is a retry away). Pool domains + edge IP are inlined so vm-ssh needs
+// NO external config file; the shared worker TOKEN is a secret and is NEVER committed — it comes from CF_PROXY_TOKEN or
+// ~/.vm-ssh/token (0600). Tunnel ported from packages/bus/src/swarm/cf-proxy.ts.
+const ECH_POOL_IP = "172.64.80.1";
+const ECH_POOL_DOMAINS = [
+  "ech-workers.pikapk-f47.workers.dev:443",
+  "ech.alias1.workers.dev:443", "ech.alias2.workers.dev:443", "ech.alias3.workers.dev:443", "ech.alias4.workers.dev:443",
+  "ech.alias5.workers.dev:443", "ech.alias6.workers.dev:443", "ech.alias7.workers.dev:443", "ech.alias8-9c7.workers.dev:443",
+  "ech.alias9.workers.dev:443", "ech.alias10.workers.dev:443", "ech.alias11.workers.dev:443", "ech.alias12.workers.dev:443",
+  "ech.alias13.workers.dev:443", "ech.alias14.workers.dev:443", "ech.alias15.workers.dev:443", "ech.alias16.workers.dev:443",
+  "ech.alias17.workers.dev:443", "ech.alias18.workers.dev:443", "ech.alias19.workers.dev:443", "ech.alias20.workers.dev:443",
+];
+const DEFAULT_PROXY_PORT = 10900;
+type EchWorker = { domain: string; ip: string; token: string };
+
+/** The shared ECH-worker token — the one secret, NEVER inlined/committed. CF_PROXY_TOKEN env, else ~/.vm-ssh/token (0600). */
+function echToken(): string | undefined {
+  const env = process.env.CF_PROXY_TOKEN?.trim();
+  if (env) return env;
+  try { const t = readFileSync(path.join(homedir(), ".vm-ssh", "token"), "utf8").trim(); if (t) return t; } catch { /* no file */ }
+  return undefined;
+}
+
+let workerIdx = 0;
+const parseHostPort = (addr: string): [string, string] => { const i = addr.lastIndexOf(":"); return [addr.slice(0, i), addr.slice(i + 1)]; };
+
+function wsFrame(opcode: number, payload: Buffer): Buffer { // masked (client→server)
+  const len = payload.length;
+  let header: Buffer;
+  if (len < 126) { header = Buffer.alloc(2); header[0] = opcode; header[1] = 0x80 | len; }
+  else if (len < 65536) { header = Buffer.alloc(4); header[0] = opcode; header[1] = 0x80 | 126; header.writeUInt16BE(len, 2); }
+  else { header = Buffer.alloc(10); header[0] = opcode; header[1] = 0x80 | 127; header.writeBigUInt64BE(BigInt(len), 2); }
+  const maskKey = randomBytes(4);
+  const masked = Buffer.alloc(len);
+  for (let i = 0; i < len; i++) masked[i] = payload[i]! ^ maskKey[i % 4]!;
+  return Buffer.concat([header, maskKey, masked]);
+}
+function parseWsFrame(buf: Buffer): { payload: Buffer; totalLen: number } | undefined {
+  if (buf.length < 2) return undefined;
+  const masked = !!(buf[1]! & 0x80);
+  let payloadLen = buf[1]! & 0x7f;
+  let offset = 2;
+  if (payloadLen === 126) { if (buf.length < 4) return undefined; payloadLen = buf.readUInt16BE(2); offset = 4; }
+  else if (payloadLen === 127) { if (buf.length < 10) return undefined; payloadLen = Number(buf.readBigUInt64BE(2)); offset = 10; }
+  if (masked) {
+    if (buf.length < offset + 4 + payloadLen) return undefined;
+    const maskKey = buf.subarray(offset, offset + 4); offset += 4;
+    const payload = Buffer.alloc(payloadLen);
+    for (let i = 0; i < payloadLen; i++) payload[i] = buf[offset + i]! ^ maskKey[i % 4]!;
+    return { payload, totalLen: offset + payloadLen };
+  }
+  if (buf.length < offset + payloadLen) return undefined;
+  return { payload: buf.subarray(offset, offset + payloadLen), totalLen: offset + payloadLen };
+}
+function wrapWsStream(sock: Socket, initial: Buffer): Duplex {
+  let readBuf = initial;
+  const duplex = new Duplex({
+    read() { /* pushed from sock 'data' */ },
+    write(chunk: Buffer, _enc, cb) { sock.write(wsFrame(0x82, chunk), cb); },
+    destroy(_err, cb) { sock.destroy(); cb(null); },
+  });
+  const pump = () => { while (readBuf.length > 0) { const f = parseWsFrame(readBuf); if (!f) break; duplex.push(f.payload); readBuf = readBuf.subarray(f.totalLen); } };
+  pump();
+  sock.on("data", (d) => { readBuf = Buffer.concat([readBuf, d]); pump(); });
+  sock.on("close", () => duplex.push(null));
+  sock.on("error", (e) => duplex.destroy(e));
+  return duplex;
+}
+function dialWorker(w: EchWorker, target: string): Promise<Duplex> {
+  return new Promise((resolve, reject) => {
+    const [host, port] = parseHostPort(w.domain);
+    const raw = netConnect(Number(port), w.ip || host, () => {
+      const sock = tlsConnect({ socket: raw, servername: host, minVersion: "TLSv1.3" }, () => {
+        const key = randomBytes(16).toString("base64");
+        sock.write([`GET / HTTP/1.1`, `Host: ${host}`, `Upgrade: websocket`, `Connection: Upgrade`, `Sec-WebSocket-Key: ${key}`, `Sec-WebSocket-Version: 13`, `Sec-WebSocket-Protocol: ${w.token}`, "", ""].join("\r\n"));
+        let headerBuf = "";
+        const onData = (chunk: Buffer) => {
+          headerBuf += chunk.toString();
+          const endIdx = headerBuf.indexOf("\r\n\r\n");
+          if (endIdx < 0) return;
+          sock.removeListener("data", onData);
+          if (!headerBuf.split("\r\n")[0]!.includes("101")) { sock.destroy(); reject(new Error(`WS upgrade failed: ${headerBuf.split("\r\n")[0]}`)); return; }
+          sock.write(wsFrame(0x81, Buffer.from(`CONNECT:${target}|`)));
+          let frameBuf = Buffer.from(headerBuf.slice(endIdx + 4));
+          const onFrame = (d: Buffer) => {
+            frameBuf = Buffer.concat([frameBuf, d]);
+            const parsed = parseWsFrame(frameBuf);
+            if (!parsed) return;
+            sock.removeListener("data", onFrame);
+            if (parsed.payload.toString() !== "CONNECTED") { sock.destroy(); reject(new Error(`CONNECT rejected: ${parsed.payload.toString()}`)); return; }
+            resolve(wrapWsStream(sock, frameBuf.subarray(parsed.totalLen)));
+          };
+          sock.on("data", onFrame);
+        };
+        sock.on("data", onData);
+      });
+      sock.on("error", reject);
+    });
+    raw.on("error", reject);
+    setTimeout(() => reject(new Error("dial timeout")), 20_000);
+  });
+}
+function handleSocks5(client: Socket, workers: EchWorker[]): void {
+  let state: "greeting" | "request" | "connected" = "greeting";
+  let buf = Buffer.alloc(0);
+  client.on("data", async (d) => {
+    buf = Buffer.concat([buf, d]);
+    if (state === "greeting") { if (buf.length < 2) return; client.write(Buffer.from([0x05, 0x00])); buf = Buffer.alloc(0); state = "request"; return; }
+    if (state === "request") {
+      if (buf.length < 7) return;
+      if (buf[0] !== 0x05 || buf[1] !== 0x01) { client.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])); client.destroy(); return; }
+      let host: string; let port: number; let consumed: number;
+      if (buf[3] === 0x01) { if (buf.length < 10) return; host = `${buf[4]}.${buf[5]}.${buf[6]}.${buf[7]}`; port = buf.readUInt16BE(8); consumed = 10; }
+      else if (buf[3] === 0x03) { const dlen = buf[4]!; if (buf.length < 5 + dlen + 2) return; host = buf.subarray(5, 5 + dlen).toString(); port = buf.readUInt16BE(5 + dlen); consumed = 7 + dlen; }
+      else { client.destroy(); return; }
+      const target = `${host}:${port}`;
+      buf = buf.subarray(consumed); state = "connected"; client.pause();
+      const w = workers[workerIdx++ % workers.length]!;
+      try {
+        const remote = await dialWorker(w, target);
+        client.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+        client.pipe(remote); remote.pipe(client);
+        if (buf.length) remote.write(buf);
+        client.resume();
+      } catch { client.write(Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])); client.destroy(); }
+    }
+  });
+  client.on("error", () => {});
+}
+function startSocksProxy(port: number, workers: EchWorker[]): Promise<{ port: number }> {
+  return new Promise((resolve) => {
+    const srv = createServer((client) => handleSocks5(client, workers));
+    srv.listen(port, "127.0.0.1", () => resolve({ port: (srv.address() as { port: number }).port }));
+  });
+}
+
+// --- proxy lifecycle: a detached background SOCKS server + a pidfile so down/status/auto-reuse work ---
+const proxyStatePath = (): string => path.join(homedir(), ".vm-ssh", "proxy.json");
+type ProxyState = { pid: number; port: number; startedSec: number };
+function readProxyState(): ProxyState | undefined { try { return JSON.parse(readFileSync(proxyStatePath(), "utf8")) as ProxyState; } catch { return undefined; } }
+function proxyAlive(s: ProxyState): boolean { try { process.kill(s.pid, 0); return true; } catch { return false; } }
+const portOpen = (port: number): Promise<boolean> => new Promise((res) => { const s = netConnect(port, "127.0.0.1"); s.on("connect", () => { s.destroy(); res(true); }); s.on("error", () => res(false)); setTimeout(() => { s.destroy(); res(false); }, 1500); });
+
+/** Ensure a usable egress proxy for `up`. Returns the SOCKS endpoint, or undefined to go direct. A caller-set
+ *  AGENTHOP_SSH_PROXY wins (we leave it). Else reuse a running bundled proxy, else auto-start one if a token exists. */
+async function ensureProxyForUp(): Promise<string | undefined> {
+  if (process.env.AGENTHOP_SSH_PROXY?.trim()) return undefined; // caller's proxy; proxyOpts already uses it
+  const st = readProxyState();
+  if (st && proxyAlive(st) && (await portOpen(st.port))) { process.env.AGENTHOP_SSH_PROXY = `127.0.0.1:${st.port}`; return `127.0.0.1:${st.port}`; }
+  if (!echToken()) return undefined; // no token -> can't start the ECH pool; go direct (railway may gate -> clear error)
+  process.stderr.write("vm-ssh up: no proxy running; auto-starting the bundled ECH proxy pool…\n");
+  const port = await startDetachedProxy(DEFAULT_PROXY_PORT);
+  process.env.AGENTHOP_SSH_PROXY = `127.0.0.1:${port}`;
+  return `127.0.0.1:${port}`;
+}
+
+/** Spawn this script's `__proxy-serve` as a DETACHED background process and record its pidfile. */
+async function startDetachedProxy(port: number): Promise<number> {
+  const self = fileURLToPath(import.meta.url);
+  const child = spawn("npx", ["tsx", self, "__proxy-serve", "--port", String(port)], { detached: true, stdio: "ignore", env: process.env });
+  child.unref();
+  for (let i = 0; i < 60; i++) { if (await portOpen(port)) { writeProxyStateFile({ pid: child.pid ?? -1, port, startedSec: Math.floor(Date.now() / 1000) }); return port; } await new Promise((r) => setTimeout(r, 500)); }
+  throw new Error(`vm-ssh: bundled proxy did not come up on :${port} within 30s`);
+}
+function writeProxyStateFile(s: ProxyState): void { mkdirSync(path.join(homedir(), ".vm-ssh"), { recursive: true }); writeFileSync(proxyStatePath(), `${JSON.stringify(s)}\n`, { mode: 0o600 }); }
+
+async function cmdProxyUp(args: Args): Promise<void> {
+  if (!echToken()) throw new Error("vm-ssh proxy up: no ECH token — set CF_PROXY_TOKEN or write ~/.vm-ssh/token (0600)");
+  const st = readProxyState();
+  if (st && proxyAlive(st) && (await portOpen(st.port))) { process.stdout.write(`${JSON.stringify({ port: st.port, pid: st.pid, reused: true })}\n`); return; }
+  const port = Number(args.val("--port") ?? DEFAULT_PROXY_PORT);
+  const actual = await startDetachedProxy(port);
+  process.stdout.write(`${JSON.stringify({ port: actual, addr: `127.0.0.1:${actual}`, workers: ECH_POOL_DOMAINS.length })}\n`);
+}
+function cmdProxyDown(): void {
+  const st = readProxyState();
+  if (!st) { process.stdout.write("(no bundled proxy recorded)\n"); return; }
+  try { process.kill(st.pid); } catch { /* already gone */ }
+  try { rmSync(proxyStatePath()); } catch { /* ok */ }
+  process.stdout.write(`${JSON.stringify({ stopped: st.pid, port: st.port })}\n`);
+}
+async function cmdProxyStatus(args: Args): Promise<void> {
+  const st = readProxyState();
+  const up = st ? proxyAlive(st) && (await portOpen(st.port)) : false;
+  const info = { running: up, ...(st ?? {}), workers: ECH_POOL_DOMAINS.length, tokenConfigured: Boolean(echToken()) };
+  if (args.has("--json")) { process.stdout.write(`${JSON.stringify(info)}\n`); return; }
+  process.stdout.write(up ? `ECH proxy up on 127.0.0.1:${st!.port} (pid ${st!.pid}, ${ECH_POOL_DOMAINS.length} workers)\n` : `ECH proxy down (token ${echToken() ? "configured" : "MISSING: set CF_PROXY_TOKEN or ~/.vm-ssh/token"})\n`);
+}
+/** Internal: run the bundled SOCKS server in the foreground (spawned detached by proxy up / auto-start). */
+async function serveProxy(args: Args): Promise<void> {
+  const token = echToken();
+  if (!token) { process.stderr.write("__proxy-serve: no ECH token (CF_PROXY_TOKEN or ~/.vm-ssh/token)\n"); process.exit(1); }
+  const port = Number(args.val("--port") ?? DEFAULT_PROXY_PORT);
+  await startSocksProxy(port, ECH_POOL_DOMAINS.map((domain) => ({ domain, ip: ECH_POOL_IP, token })));
+  await new Promise(() => { /* serve forever */ });
 }
 // ───────────────────────────────────────────────────────────────────────────────
 
@@ -240,6 +445,7 @@ async function cmdUp(args: Args): Promise<void> {
   const knownHosts = path.join(dir, "known_hosts");
   execFileSync("ssh-keygen", ["-t", "ed25519", "-f", keyPath, "-N", "", "-q"]);
 
+  await ensureProxyForUp(); // caller's AGENTHOP_SSH_PROXY wins; else reuse/auto-start the bundled ECH proxy pool
   const stdout = await provisionWithRetry(keyPath, knownHosts, buildBootstrap(mode, pubKey, initScript));
   const addr = parseCapturedAddr(stdout);
   if (!addr) throw new Error("vm-ssh up: no tailcat address captured from the box (serve may have failed; see /tmp/vmssh.serve.log on the box)");
@@ -296,7 +502,7 @@ class Args {
   afterDashDash(): string[] { const i = this.argv.indexOf("--"); return i >= 0 ? this.argv.slice(i + 1) : []; }
 }
 
-const USAGE = "usage: vm-ssh <up|ssh|ls|refresh> ...\n  up [--open] [--init <script>] [--key <pubkey-file>] [--name <alias>]\n  ssh [id] [-- <cmd...>]\n  ls [--json]\n  refresh <id>\n";
+const USAGE = "usage: vm-ssh <up|ssh|ls|refresh|proxy> ...\n  up [--open] [--init <script>] [--key <pubkey-file>] [--name <alias>]\n  ssh [id] [-- <cmd...>]\n  ls [--json]\n  refresh <id>\n  proxy <up|down|status> [--port <n>] [--json]   (bundled ECH pool; token: CF_PROXY_TOKEN or ~/.vm-ssh/token)\n";
 
 async function main(): Promise<void> {
   const [verb, ...rest] = process.argv.slice(2);
@@ -306,6 +512,15 @@ async function main(): Promise<void> {
     case "ssh": return cmdSsh(args);
     case "ls": return cmdLs(args);
     case "refresh": return cmdRefresh(args);
+    case "proxy": {
+      const sub = rest[0];
+      const subArgs = new Args(rest.slice(1));
+      if (sub === "up") return cmdProxyUp(subArgs);
+      if (sub === "status") return cmdProxyStatus(subArgs);
+      if (sub === "down") { cmdProxyDown(); return; }
+      process.stderr.write("usage: vm-ssh proxy <up|down|status> [--port <n>] [--json]\n"); process.exit(1); return;
+    }
+    case "__proxy-serve": return serveProxy(args); // internal: the detached SOCKS server
     case "--selftest": return selftest();
     default: process.stderr.write(USAGE); process.exit(verb ? 1 : 0);
   }
@@ -327,6 +542,9 @@ function selftest(): void {
   console.assert(new Args(["x", "--", "uptime", "-a"]).afterDashDash().join(" ") === "uptime -a", "afterDashDash splits remote cmd");
   console.assert(new Args(["myid", "--", "uptime"]).rest().join(",") === "myid", "rest() takes positional id before --");
   console.assert(new Args(["--name", "n1", "--open"]).rest().length === 0, "rest() skips flags + flag values");
+  console.assert(ECH_POOL_DOMAINS.length === 21, "ECH pool has its inlined workers");
+  const fr = parseWsFrame(wsFrame(0x82, Buffer.from("hello ws tunnel"))); // the bundled tunnel's framing round-trips
+  console.assert(fr?.payload.toString() === "hello ws tunnel", "ws frame masks + round-trips");
   providerDestroy();
   process.stdout.write("vm-ssh selftest: all assertions passed\n");
 }
