@@ -129,6 +129,19 @@ describe("reconcileRegistryWithControl — durable-backstop reconciliation (1915
     expect(recur.openRepairWait!.waitId).toBe(rwid(2)); // a NEW armed repair-wait, not a dedup into stale-open ep1
   });
 
+  test("6b766e3-P2-1: group-scoped — a SIBLING group's live/resolved wait (same list) doesn't hijack adopt or block close", () => {
+    const aLive = { waitId: makeRepairWaitId("routing:A", 1), state: "open" };       // a different group's wait, ordered FIRST
+    const bLive = { waitId: makeRepairWaitId("routing:B", 1), state: "open" };
+    // adopt: registry lost B, CONTROL has A-live (first) + B-live ⇒ must adopt B's wait, not be hijacked by A
+    const adopt = reconcileRegistryWithControl(emptyRegistry(), "routing:B", "routing", [aLive, bLive], 3000);
+    expect(adopt.registry.episodes["routing:B"]).toMatchObject({ episode: 1, open: true, repairWaitId: makeRepairWaitId("routing:B", 1) });
+    expect(adopt.controlEpisodeFloor).toBe(1); // floor from B's waits only
+    // close: registry has B open, CONTROL has A-live (first) + B-RESOLVED ⇒ must sync-close B (A-live must not block it)
+    const regBopen = reconcileIncidentCore(emptyRegistry(), { kind: "active", groupKey: "routing:B", category: "routing", why: "w", lastObservedSeq: 1, subjectJobId: "swarm-routing" }, 2900, { repairWindowSec: 300, owner: "o" }).registry;
+    const close = reconcileRegistryWithControl(regBopen, "routing:B", "routing", [aLive, { waitId: makeRepairWaitId("routing:B", 1), state: "resolved" }], 3100);
+    expect(close.registry.episodes["routing:B"]).toMatchObject({ open: false, closedAtSec: 3100 });
+  });
+
   test("no divergence ⇒ registry returned unchanged (identity), floor reflects CONTROL", () => {
     const reg1 = reconcileIncident(emptyRegistry(), stall(50), 1000, cfg).registry;
     const sync = reconcileRegistryWithControl(reg1, "job-x:no-live-holder", "liveness", [rw(1, "open")], 1200); // CONTROL live ep1 matches registry open ep1

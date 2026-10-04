@@ -121,9 +121,13 @@ export function reconcileRegistryWithControl(
   controlRepairWaits: ReadonlyArray<{ waitId: string; state: string }>, nowSec: number,
 ): { registry: IncidentRegistry; controlEpisodeFloor: number } {
   const episodes = { ...reg.episodes };
-  const live = controlRepairWaits.find((w) => w.state !== "resolved");
+  // GROUP-SCOPE first (review 6b766e3-P2-1): only repair-waits belonging to THIS groupKey count. A sibling incident's wait
+  // under the same job (passed in the same list) must not be taken as this group's live/floor — else a wrong-group live wait
+  // hijacks adopt (misses this group's live wait) or blocks sync-close (this group's wait is resolved but a sibling is live).
+  const groupWaits = controlRepairWaits.filter((w) => repairEpisodeOf(w.waitId, groupKey) !== null);
+  const live = groupWaits.find((w) => w.state !== "resolved");
   let floor = 0;
-  for (const w of controlRepairWaits) { const n = repairEpisodeOf(w.waitId, groupKey); if (n !== null && n > floor) floor = n; }
+  for (const w of groupWaits) { const n = repairEpisodeOf(w.waitId, groupKey); if (n !== null && n > floor) floor = n; }
   const ep = episodes[groupKey];
   if (live !== undefined) {
     const liveEp = repairEpisodeOf(live.waitId, groupKey);
