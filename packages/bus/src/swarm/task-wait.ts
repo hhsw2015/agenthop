@@ -56,6 +56,41 @@ export function openWait(i: NewWait): WaitRecord {
   };
 }
 
+export type NewQueryWait = {
+  waitId: string;
+  subject: WaitSubject;
+  deadlineSec: number;
+  owner: string;
+  /** The pre-stored default answer applied on timeout (R3-b). REQUIRED — a query must not bare-wait. */
+  defaultOnTimeout: WaitResolution;
+};
+
+/** R3-b: open a query-wait = an ordinary bypass wait carrying a durable default answer. On timeout the sweep applies the
+ *  default via applyDefaultOnTimeout (a close), not a new event. kind/timeoutPolicy are fixed here, and defaultOnTimeout
+ *  is required — so a query-wait ALWAYS carries its default (the type invariant "问询不裸等"); approvals, built by
+ *  openWait, cannot carry one (NewWait has no such field — "门控才裸等"). */
+export function openQueryWait(i: NewQueryWait): WaitRecord {
+  return {
+    waitId: i.waitId,
+    kind: "wait",
+    subject: i.subject,
+    state: "open",
+    deadlineSec: i.deadlineSec,
+    owner: i.owner,
+    timeoutPolicy: "bypass",
+    defaultOnTimeout: i.defaultOnTimeout,
+  };
+}
+
+/** Apply the pre-stored default on timeout: a CLOSE with the default resolution (outcome "default-applied") — the
+ *  question's subject completed, answer source = default (§0b/R3-b, consistent with "resolved only from close"). No IO
+ *  (notifying the asker is advisory), so it is a direct CAS close. Rejected if the wait carries no default (not a query
+ *  wait) — never fabricate a resolution. */
+export function applyDefaultOnTimeout(w: WaitRecord): WaitAdvance {
+  if (w.defaultOnTimeout === undefined) return { ok: false, error: "applyDefaultOnTimeout on a wait with no defaultOnTimeout (not a query wait)" };
+  return advanceWait(w, { type: "close", resolution: { outcome: "default-applied", reason: w.defaultOnTimeout.reason, sourceOperationId: w.defaultOnTimeout.sourceOperationId } });
+}
+
 export type WaitEvent =
   // timeout handling, phase "execute": CAS the recoverable action intent BEFORE the IO.
   | { type: "begin_action"; pendingAction: PendingAction }
