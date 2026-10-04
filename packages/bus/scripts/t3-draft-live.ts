@@ -17,7 +17,22 @@ const BASE = process.env.CPA_BASE_URL ?? "http://127.0.0.1:10808/v1";
 const MODEL = process.env.CPA_MODEL ?? "gpt-4o";
 const KEY = process.env.CPA_API_KEY ?? "";
 
+// Claude models speak the Anthropic /v1/messages API; everything else speaks OpenAI /v1/chat/completions.
+const isClaude = /(^|\/)claude/i.test(MODEL);
+
 const callModel: CallModel = async ({ system, user }) => {
+  if (isClaude) {
+    const res = await fetch(`${BASE}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", ...(KEY ? { authorization: `Bearer ${KEY}`, "x-api-key": KEY } : {}) },
+      body: JSON.stringify({ model: MODEL, max_tokens: 4096, temperature: 0, system, messages: [{ role: "user", content: user }] }),
+    });
+    if (!res.ok) throw new Error(`CPA ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const json = (await res.json()) as { content?: Array<{ type?: string; text?: string }> };
+    const text = (json.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
+    if (!text) throw new Error(`CPA returned no text content: ${JSON.stringify(json).slice(0, 300)}`);
+    return text;
+  }
   const res = await fetch(`${BASE}/chat/completions`, {
     method: "POST",
     headers: { "content-type": "application/json", ...(KEY ? { authorization: `Bearer ${KEY}` } : {}) },
@@ -47,7 +62,8 @@ typecheck passes.`;
 
 async function main(): Promise<void> {
   console.log(`[A1] CPA ${BASE} model=${MODEL}`);
-  const dr = await draftPlan({ prd: PRD, jobId: "live-job-1", allowedChecks: Object.keys(fc.checkRegistry.checks), rescore: true }, { callModel });
+  const rescore = process.env.A1_RESCORE !== "0"; // the second (complexity) model call; set A1_RESCORE=0 for a single call
+  const dr = await draftPlan({ prd: PRD, jobId: "live-job-1", allowedChecks: Object.keys(fc.checkRegistry.checks), rescore }, { callModel });
   if (!dr.ok) { console.error(`[A1] draftPlan REJECTED: ${dr.reason}`); process.exit(2); }
   console.log(`[A1] draftPlan ok: ${dr.draft.tasks.length} task(s), planningRequestId=${dr.planningRequestId.slice(0, 8)}…`);
 
