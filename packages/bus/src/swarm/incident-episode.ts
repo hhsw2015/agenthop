@@ -50,11 +50,12 @@ export type IncidentReconcile = {
 
 /** A category-tagged, kernel-agnostic incident signal — the generic input the episode lifecycle folds (liveness STALL/OK and
  *  routing dead-letter bursts both map to this). `active` = the incident condition holds now; `recovered` = it cleared; `none`
- *  = cannot tell (no-op). subjectKey keys the repair-wait id (injective, review P2-3); subjectJobId is the repair-wait's
- *  WaitSubject.jobId (a synthetic domain id is fine when the incident has no real job, e.g. "swarm-routing"). */
+ *  = cannot tell (no-op). The repair-wait id is derived from the FULL incident identity (groupKey), so distinct incidents never
+ *  share a repair-wait id (review 8ecf04d-P2-1 — a separate subjectKey could collide across groupKeys). subjectJobId is the
+ *  repair-wait's WaitSubject.jobId (a synthetic domain id is fine when the incident has no real job, e.g. "swarm-routing"). */
 export type IncidentSignal = {
   kind: "active" | "recovered" | "none";
-  groupKey: string; category: string; why: string; lastObservedSeq: number; subjectKey: string; subjectJobId: string;
+  groupKey: string; category: string; why: string; lastObservedSeq: number; subjectJobId: string;
 };
 
 /** Pure generic core: fold ONE incident signal into the episode registry, emitting the repair-wait action (if any). IO (file +
@@ -75,7 +76,7 @@ export function reconcileIncidentCore(
     }
     const episode = Math.max(existing?.episode ?? 0, cfg.controlEpisodeFloor ?? 0) + 1;
     const incidentId = `${sig.groupKey}:episode-${episode}`;
-    const rwId = makeRepairWaitId(sig.subjectKey, episode);
+    const rwId = makeRepairWaitId(sig.groupKey, episode); // id from the FULL incident identity ⇒ collision-free across incidents (P2-1)
     episodes[sig.groupKey] = {
       groupKey: sig.groupKey, category: sig.category, episode, open: true, incidentId, why: sig.why,
       openedAtSec: nowSec, lastObservedSeq: sig.lastObservedSeq, repairWaitId: rwId,
@@ -99,7 +100,7 @@ export function reconcileIncident(
   reg: IncidentRegistry, verdict: LivenessVerdict, nowSec: number,
   cfg: { repairWindowSec: number; owner: string; jobId: string; controlEpisodeFloor?: number },
 ): IncidentReconcile {
-  const base = { category: "liveness", subjectKey: cfg.jobId, subjectJobId: cfg.jobId };
+  const base = { category: "liveness", subjectJobId: cfg.jobId };
   if (verdict.verdict === "STALL")
     return reconcileIncidentCore(reg, { kind: "active", groupKey: verdict.groupKey, why: verdict.why, lastObservedSeq: verdict.lastObservedSeq, ...base }, nowSec, cfg);
   if (verdict.verdict === "OK")
@@ -116,16 +117,16 @@ export function reconcileIncident(
  *  Returns controlEpisodeFloor (max episode among this job's CONTROL repair-waits, resolved or not) so a newly opened episode
  *  never reuses an already-committed id. Pass ONLY this job's repair-waits. Pure; the caller supplies the CONTROL facts + persists. */
 export function reconcileRegistryWithControl(
-  reg: IncidentRegistry, groupKey: string, subjectKey: string, category: string,
+  reg: IncidentRegistry, groupKey: string, category: string,
   controlRepairWaits: ReadonlyArray<{ waitId: string; state: string }>, nowSec: number,
 ): { registry: IncidentRegistry; controlEpisodeFloor: number } {
   const episodes = { ...reg.episodes };
   const live = controlRepairWaits.find((w) => w.state !== "resolved");
   let floor = 0;
-  for (const w of controlRepairWaits) { const n = repairEpisodeOf(w.waitId, subjectKey); if (n !== null && n > floor) floor = n; }
+  for (const w of controlRepairWaits) { const n = repairEpisodeOf(w.waitId, groupKey); if (n !== null && n > floor) floor = n; }
   const ep = episodes[groupKey];
   if (live !== undefined) {
-    const liveEp = repairEpisodeOf(live.waitId, subjectKey);
+    const liveEp = repairEpisodeOf(live.waitId, groupKey);
     if (liveEp !== null && (ep === undefined || !ep.open || ep.repairWaitId !== live.waitId)) {
       episodes[groupKey] = { // adopt the committed live repair-wait as the open episode (its registry open-write was lost) — case A
         groupKey, category: ep?.category ?? category, episode: liveEp, open: true, incidentId: `${groupKey}:episode-${liveEp}`,
@@ -148,6 +149,9 @@ export function readIncidents(file: string): IncidentRegistry {
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return emptyRegistry(); throw e; }
   const parsed = JSON.parse(raw) as IncidentRegistry;
   if (parsed === null || typeof parsed !== "object" || typeof parsed.episodes !== "object" || parsed.episodes === null) throw new Error("incidents: malformed registry");
+  // Migrate a pre-3a registry: episodes written before `category` existed were all liveness — backfill it so the new
+  // read/dedup/backstop/write path never propagates a category-less record (review 8ecf04d-P2-2).
+  for (const ep of Object.values(parsed.episodes)) if (ep !== null && typeof ep === "object" && (ep as IncidentEpisode).category === undefined) (ep as IncidentEpisode).category = "liveness";
   return parsed;
 }
 
