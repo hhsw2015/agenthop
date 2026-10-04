@@ -63,6 +63,9 @@ export type NewQueryWait = {
   owner: string;
   /** The pre-stored default answer applied on timeout (R3-b). REQUIRED — a query must not bare-wait. */
   defaultOnTimeout: WaitResolution;
+  /** T3 needsClarification: content-addressed ref to the immutable resume bundle (original draft + PRD + frozenContext
+   *  version refs). Optional; the IO layer (T3b) stores/retrieves the bundle, this only pins the digest. */
+  payloadRef?: string;
 };
 
 /** R3-b: open a query-wait = an ordinary bypass wait carrying a durable default answer. On timeout the sweep applies the
@@ -79,6 +82,7 @@ export function openQueryWait(i: NewQueryWait): WaitRecord {
     owner: i.owner,
     timeoutPolicy: "bypass",
     defaultOnTimeout: i.defaultOnTimeout,
+    ...(i.payloadRef !== undefined ? { payloadRef: i.payloadRef } : {}),
   };
 }
 

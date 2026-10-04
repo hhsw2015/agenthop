@@ -18,8 +18,12 @@
 
 import { digestOf } from "./digest.js";
 
-export type TaskKind = "work" | "integration" | "synthesis" | "review" | "repair";
+// "design" (team-collab §0b R4): an adversarial-review GATE node a planner auto-prepends for a high-stakes change —
+// kind IS task identity (in specDigest), so it is a first-class kind, not a role annotation.
+export type TaskKind = "work" | "integration" | "synthesis" | "review" | "repair" | "design";
 export type OutputKind = "patch" | "files" | "report" | "notes";
+/** Model difficulty tier (model-tiering-notes §4): light|standard|heavy. A planner hint, NOT task identity. */
+export type ModelTier = "light" | "standard" | "heavy";
 
 export type RequiredOutput = {
   logicalName: string;
@@ -62,8 +66,18 @@ export type TaskSpec = {
   /** Member visibility — only meaningful for a durable member (a box is always headless), so only allowed when
    *  runtime=durable. Optional; absent otherwise. */
   visibility?: "visible" | "headless";
+  /** Model difficulty tier the planner assigned (T3). NOT part of specDigest — re-tiering a node did not change the
+   *  TASK (same rule as required/runtime/visibility; model-tiering-notes §4 "加字段不升版"). In planDigest. Optional. */
+  modelTier?: ModelTier;
+  /** Role/skill the executor must match (T3 planner, team-collab §2). NOT part of specDigest — re-staffing ≠ task
+   *  changed, so it must not V5-invalidate a running attempt (same class as the other role annotations). Optional. */
+  roleProfile?: string;
+  /** design-gate node (R4): the FINAL specDigests this node's adversarial review covers. IN specDigest — the coverage
+   *  mapping is part of the design task's IDENTITY (changing what it must cover changes the task; design D / P2-3).
+   *  Only meaningful on a kind=design node; absent elsewhere. */
+  coveredSpecDigests?: string[];
   /** canonical-JSON SHA-256 of the TASK IDENTITY fields — everything EXCEPT specDigest and the role annotations
-   *  required/runtime/visibility. Set by loadPlan. */
+   *  required/runtime/visibility/modelTier/roleProfile (coveredSpecDigests stays IN: it is identity). Set by loadPlan. */
   specDigest: string;
 };
 
@@ -84,17 +98,19 @@ export type TaskPlan = {
 
 export type LoadResult = { ok: true; plan: TaskPlan } | { ok: false; reason: string };
 
-const TASK_KINDS: ReadonlySet<string> = new Set(["work", "integration", "synthesis", "review", "repair"]);
+const TASK_KINDS: ReadonlySet<string> = new Set(["work", "integration", "synthesis", "review", "repair", "design"]);
 const OUTPUT_KINDS: ReadonlySet<string> = new Set(["patch", "files", "report", "notes"]);
+const MODEL_TIERS: ReadonlySet<string> = new Set(["light", "standard", "heavy"]);
 const RUNTIMES: ReadonlySet<string> = new Set(["ephemeral", "durable"]);
 const VISIBILITIES: ReadonlySet<string> = new Set(["visible", "headless"]);
 
 /** specDigest = canonical-JSON SHA-256 of the TASK IDENTITY fields. Omits specDigest (self-reference) AND the
  *  plan/dispatch role annotations required/runtime/visibility: specDigest answers "what must the worker do and what
  *  counts as acceptable", so V5 invalidates an attempt ONLY when the task itself changed — never when a node is
- *  retagged required/durable/visible (§4.2 V5; fe0376cd review #2). */
+ *  retagged required/durable/visible/retiered/restaffed (§4.2 V5; fe0376cd review #2; T3 F-T3-2). coveredSpecDigests
+ *  is NOT excluded — a design node's coverage set is part of its identity. */
 export function computeSpecDigest(spec: TaskSpec): string {
-  const { specDigest: _d, required: _r, runtime: _rt, visibility: _v, ...identity } = spec;
+  const { specDigest: _d, required: _r, runtime: _rt, visibility: _v, modelTier: _mt, roleProfile: _rp, ...identity } = spec;
   return digestOf(identity);
 }
 
@@ -154,6 +170,9 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
     if (!isString(o.visibility) || !VISIBILITIES.has(o.visibility)) return { reason: `${where}.visibility must be visible|headless` };
     if (runtime !== "durable") return { reason: `${where}.visibility only allowed when runtime=durable` };
   }
+  if (o.modelTier !== undefined && (!isString(o.modelTier) || !MODEL_TIERS.has(o.modelTier))) return { reason: `${where}.modelTier must be light|standard|heavy` };
+  if (o.roleProfile !== undefined && !isNonEmptyString(o.roleProfile)) return { reason: `${where}.roleProfile must be a non-empty string` };
+  if (o.coveredSpecDigests !== undefined && !isStringArray(o.coveredSpecDigests)) return { reason: `${where}.coveredSpecDigests must be a string[]` };
 
   const spec: TaskSpec = {
     nodeId: o.nodeId,
@@ -179,6 +198,9 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
     required,
     runtime,
     ...(o.visibility !== undefined ? { visibility: o.visibility as "visible" | "headless" } : {}),
+    ...(o.modelTier !== undefined ? { modelTier: o.modelTier as ModelTier } : {}),
+    ...(o.roleProfile !== undefined ? { roleProfile: o.roleProfile as string } : {}),
+    ...(o.coveredSpecDigests !== undefined ? { coveredSpecDigests: [...(o.coveredSpecDigests as string[])] } : {}),
     specDigest: "",
   };
   return { spec };
