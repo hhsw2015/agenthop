@@ -17,6 +17,7 @@
  */
 
 import { digestOf } from "./digest.js";
+import { evaluateR4, type OwnerDomainPolicy, type RiskPolicy } from "./task-r4.js";
 
 // "design" (team-collab §0b R4): an adversarial-review GATE node a planner auto-prepends for a high-stakes change —
 // kind IS task identity (in specDigest), so it is a first-class kind, not a role annotation.
@@ -87,14 +88,38 @@ export type JobBudget = {
   maxModelUsd?: number;
 };
 
+/** Version references for the frozenContext a planner compiled this plan under (T3 Q2a): digest/version strings, NOT
+ *  inlined content (inlining would pollute plan identity). Pinned so loader round-trip + replay see the exact versions;
+ *  the content is fetched from digest-addressed durable snapshots by the IO layer. Part of the plan, so in planDigest. */
+export type FrozenRefs = {
+  checkRegistry: string;
+  ownerDomainPolicy: string;
+  riskPolicy: string;
+  roleCatalog: string;
+  budgetPolicy: string;
+  r4ThresholdPolicy: string;
+  sourceBaselineDigest: string;
+  planningRequestId?: string;
+};
+
 export type TaskPlan = {
   jobId: string;
   planRevision: number;
   nodes: TaskSpec[];
   jobBudget: JobBudget;
+  /** Set by a planner (T3); absent on a hand-written plan. Round-trips through loadPlan unchanged. */
+  frozenRefs?: FrozenRefs;
+  /** Explicitly phased capabilities (T3 P2-7): e.g. ["r4-threshold"] when R4 condition 3 isn't implemented yet. An
+   *  honest marker (not a silent gap); round-trips through loadPlan, in planDigest. */
+  notImplemented?: string[];
   /** canonical-JSON SHA-256 of the plan (excluding planDigest). Set by loadPlan. */
   planDigest: string;
 };
+
+/** Optional managed-T3 loader mode (loader-interface ruling f06894b8): the loader re-runs the SHARED evaluateR4 against
+ *  a trusted policy snapshot and enforces that a required design gate exists covering every impl node — it does NOT just
+ *  trust the planner's own coverage. Also ref-matches the plan's frozenRefs against the snapshot. No IO/LLM. */
+export type ManagedT3Opts = { mode: "managed-t3"; ownerDomainPolicy: OwnerDomainPolicy; riskPolicy: RiskPolicy; expectedFrozenRefs: FrozenRefs };
 
 export type LoadResult = { ok: true; plan: TaskPlan } | { ok: false; reason: string };
 
@@ -226,8 +251,85 @@ function findCycle(nodes: TaskSpec[]): string | null {
   return found;
 }
 
-/** Turn untrusted JSON into a legal TaskPlan or reject it whole. Recomputes all digests authoritatively. */
-export function loadPlan(raw: unknown): LoadResult {
+function validateFrozenRefs(v: unknown): { reason: string } | { refs: FrozenRefs | undefined } {
+  if (v === undefined) return { refs: undefined };
+  if (typeof v !== "object" || v === null) return { reason: "frozenRefs must be an object" };
+  const o = v as Record<string, unknown>;
+  const req = ["checkRegistry", "ownerDomainPolicy", "riskPolicy", "roleCatalog", "budgetPolicy", "r4ThresholdPolicy", "sourceBaselineDigest"] as const;
+  for (const k of req) if (!isNonEmptyString(o[k])) return { reason: `frozenRefs.${k} must be a non-empty string` };
+  if (o.planningRequestId !== undefined && !isNonEmptyString(o.planningRequestId)) return { reason: "frozenRefs.planningRequestId must be a non-empty string" };
+  return {
+    refs: {
+      checkRegistry: o.checkRegistry as string, ownerDomainPolicy: o.ownerDomainPolicy as string, riskPolicy: o.riskPolicy as string,
+      roleCatalog: o.roleCatalog as string, budgetPolicy: o.budgetPolicy as string, r4ThresholdPolicy: o.r4ThresholdPolicy as string,
+      sourceBaselineDigest: o.sourceBaselineDigest as string,
+      ...(o.planningRequestId !== undefined ? { planningRequestId: o.planningRequestId as string } : {}),
+    },
+  };
+}
+
+/** R4 structural coverage validation (T3 P1-2; policy-free — the four-condition OR re-run needs frozenContext and so
+ *  stays in translateDraft). A kind=design gate must (a) cover at least one node, (b) cover only REAL node digests — no
+ *  stale/dangling coverage (catches "change M, keep old D coverage"), and (c) be a transitive ANCESTOR of every node it
+ *  covers (design-ancestor: the gate precedes the gated work). Runs after specDigests are set. Returns a reason or null. */
+function validateR4Coverage(specs: TaskSpec[]): string | null {
+  const byDigest = new Map<string, string>();
+  for (const s of specs) byDigest.set(s.specDigest, s.nodeId);
+  const deps = new Map(specs.map((s) => [s.nodeId, s.dependsOn] as const));
+  const ancestorCache = new Map<string, Set<string>>();
+  const ancestorsOf = (id: string): Set<string> => {
+    const cached = ancestorCache.get(id);
+    if (cached) return cached;
+    const out = new Set<string>();
+    const stack = [...(deps.get(id) ?? [])];
+    while (stack.length > 0) {
+      const d = stack.pop()!;
+      if (out.has(d)) continue;
+      out.add(d);
+      for (const dd of deps.get(d) ?? []) stack.push(dd);
+    }
+    ancestorCache.set(id, out);
+    return out;
+  };
+  for (const d of specs) {
+    if (d.kind !== "design") continue;
+    const cov = d.coveredSpecDigests;
+    if (cov === undefined || cov.length === 0) return `design node ${d.nodeId} must cover at least one node (empty coveredSpecDigests)`;
+    for (const cd of cov) {
+      const coveredId = byDigest.get(cd);
+      if (coveredId === undefined) return `design node ${d.nodeId} covers digest ${cd} matching no node (stale/dangling coverage)`;
+      if (coveredId === d.nodeId) return `design node ${d.nodeId} cannot cover itself`;
+      if (!ancestorsOf(coveredId).has(d.nodeId)) return `design node ${d.nodeId} is not an ancestor of covered node ${coveredId}`;
+    }
+  }
+  return null;
+}
+
+function frozenRefsMismatch(got: FrozenRefs | undefined, want: FrozenRefs): string | null {
+  if (got === undefined) return "managed-t3: plan has no frozenRefs";
+  const keys: (keyof FrozenRefs)[] = ["checkRegistry", "ownerDomainPolicy", "riskPolicy", "roleCatalog", "budgetPolicy", "r4ThresholdPolicy", "sourceBaselineDigest", "planningRequestId"];
+  for (const k of keys) if (got[k] !== want[k]) return `managed-t3: frozenRefs.${k} mismatch (plan ${String(got[k])} vs policy ${String(want[k])})`;
+  return null;
+}
+
+/** Managed-T3 R4 enforcement (loader ruling f06894b8): re-run the SHARED evaluateR4 on the impl nodes against the
+ *  trusted policy snapshot; if a design gate is required, EVERY impl node's final specDigest must appear in some design
+ *  node's coverage. Catches the structural bypasses a/b/c miss — deleting all design nodes (still cross-domain) or
+ *  covering only a subset. (Structural dangling/ancestor/non-empty is validateR4Coverage's job.) */
+function validateManagedT3(specs: TaskSpec[], opts: ManagedT3Opts): string | null {
+  const impl = specs.filter((s) => s.kind !== "design");
+  const assess = evaluateR4(impl, opts.ownerDomainPolicy, opts.riskPolicy);
+  if (!assess.designRequired) return null;
+  const covered = new Set<string>();
+  for (const s of specs) if (s.kind === "design" && s.coveredSpecDigests) for (const d of s.coveredSpecDigests) covered.add(d);
+  const uncovered = impl.filter((s) => !covered.has(s.specDigest));
+  if (uncovered.length > 0) return `managed-t3: R4 requires a design gate (${assess.reasons.join("; ")}) covering every impl node; uncovered: ${uncovered.map((s) => s.nodeId).join(",")}`;
+  return null;
+}
+
+/** Turn untrusted JSON into a legal TaskPlan or reject it whole. Recomputes all digests authoritatively. In managed-t3
+ *  mode the loader additionally ref-matches frozenRefs and re-enforces R4 from the trusted policy snapshot. */
+export function loadPlan(raw: unknown, opts?: ManagedT3Opts): LoadResult {
   if (typeof raw !== "object" || raw === null) return { ok: false, reason: "plan not an object" };
   const o = raw as Record<string, unknown>;
   if (!isNonEmptyString(o.jobId)) return { ok: false, reason: "jobId must be a non-empty string" };
@@ -239,6 +341,10 @@ export function loadPlan(raw: unknown): LoadResult {
   if (!isIntAtLeast(jb.maxTotalAttempts, 1)) return { ok: false, reason: "jobBudget.maxTotalAttempts must be an integer >= 1" };
   if (!isNumAtLeast(jb.maxWallClockSec, 1)) return { ok: false, reason: "jobBudget.maxWallClockSec must be >= 1" };
   if (jb.maxModelUsd !== undefined && !isNumAtLeast(jb.maxModelUsd, 0)) return { ok: false, reason: "jobBudget.maxModelUsd" };
+
+  const fr = validateFrozenRefs(o.frozenRefs);
+  if ("reason" in fr) return { ok: false, reason: fr.reason };
+  if (o.notImplemented !== undefined && !isStringArray(o.notImplemented)) return { ok: false, reason: "notImplemented must be a string[]" };
 
   const specs: TaskSpec[] = [];
   for (let i = 0; i < o.nodes.length; i++) {
@@ -271,6 +377,8 @@ export function loadPlan(raw: unknown): LoadResult {
       maxWallClockSec: jb.maxWallClockSec,
       ...(jb.maxModelUsd !== undefined ? { maxModelUsd: jb.maxModelUsd as number } : {}),
     },
+    ...(fr.refs !== undefined ? { frozenRefs: fr.refs } : {}),
+    ...(o.notImplemented !== undefined ? { notImplemented: [...(o.notImplemented as string[])] } : {}),
     planDigest: "",
   };
   // Digests canonicalize the whole spec (including arbitrary acceptance.args), so a non-finite number smuggled in via
@@ -281,6 +389,16 @@ export function loadPlan(raw: unknown): LoadResult {
     plan.planDigest = computePlanDigest(plan);
   } catch {
     return { ok: false, reason: "non-finite or unserializable value in plan" };
+  }
+  // R4 structural coverage (design-ancestor / coverage-match / non-empty) — runs on authoritative digests.
+  const covReason = validateR4Coverage(specs);
+  if (covReason) return { ok: false, reason: covReason };
+  // Managed-T3: ref-match + policy-driven R4 enforcement (loader does not just trust the planner's coverage).
+  if (opts?.mode === "managed-t3") {
+    const refMismatch = frozenRefsMismatch(plan.frozenRefs, opts.expectedFrozenRefs);
+    if (refMismatch) return { ok: false, reason: refMismatch };
+    const mReason = validateManagedT3(specs, opts);
+    if (mReason) return { ok: false, reason: mReason };
   }
   // Deep-clone so the returned plan shares NO mutable reference with the caller's input (acceptance.args etc.): a later
   // mutation of the input must not change the loaded plan or invalidate its digests (Codex re-review g).
