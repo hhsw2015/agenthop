@@ -23,7 +23,7 @@ import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSyn
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { type ControlRecord, PROVIDER_LIFETIME_SEC } from "../packages/bus/src/swarm/control.js";
 import { parseManifest } from "../packages/bus/src/swarm/manifest.js";
 import { type ObservedTip, tipToEvent } from "../packages/bus/src/swarm/acceptance.js";
@@ -47,7 +47,7 @@ import { assertLiveness, type LivenessVerdict, type ControlCut, type Observation
 import { reconcileIncident, reconcileRegistryWithControl, readIncidents, writeIncidents, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
 import { isRepairWaitId } from "../packages/bus/src/swarm/repair-wait-id.js";
 import { observeCandidate, readDelegations, writeDelegations, type DelegationRegistry } from "../packages/bus/src/swarm/delegation-envelope.js";
-import { scanCompletionSlots, detectWatchEvents, readWatchSnapshot, writeWatchSnapshot, type ReadArtifact, type WatchSnapshot } from "../packages/bus/src/swarm/delegation-observer.js";
+import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, type ReadArtifact, type WatchSnapshot } from "../packages/bus/src/swarm/delegation-observer.js";
 import { advanceWait } from "../packages/bus/src/swarm/task-wait.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
@@ -107,6 +107,9 @@ const BOARD_DIR = path.join(HOME, ".agenthop", "swarm", "board");
 const PROGRESS_FILE = path.join(HOME, ".agenthop", "swarm", "PROGRESS.md");
 const COORDINATOR = process.env.SWARM_COORDINATOR || "";
 const CONSUMPTION_WINDOW_SEC = Number(process.env.SWARM_CONSUMPTION_WINDOW_SEC || "600");
+// Local artifact root for RELATIVE completion-slot locators (review f0a999f-P2-4): WORK_REPO is a Git remote id (may be an
+// HTTPS URL) — NEVER a filesystem base. A relative locator with no ARTIFACT_ROOT is skipped (not joined under a URL).
+const ARTIFACT_ROOT = process.env.SWARM_ARTIFACT_ROOT || "";
 const PLAN_FILE = process.env.SWARM_PLAN || "";
 const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
@@ -686,66 +689,96 @@ async function main(): Promise<void> {
     } catch (e) { log(`projection refresh failed: ${e instanceof Error ? e.message : e}`); }
   };
 
-  // v1 lightweight completion-record reader (§2c; real version-resolution/integrity is a later acceptance): the artifact at the
-  // locator is a JSON completion record {requestId, payloadDigest, subject}; observedDigest = an INDEPENDENT sha256 of the file
-  // bytes (never an author self-report). Missing / non-JSON / incomplete ⇒ null (not a candidate).
+  // v1 lightweight completion-record reader (§2c; independent version-resolution + content integrity are a later acceptance):
+  // the artifact is a JSON completion record {requestId, payloadDigest, subject, workTarget}; observedDigest = the DECLARED
+  // workTarget (same domain as slot.targetDigest — review P1-1). Relative locators resolve under ARTIFACT_ROOT, NEVER WORK_REPO
+  // (a Git remote id — review P2-4); a relative locator with no root is skipped, not silently joined. Null-safe (never throws).
   const readArtifact: ReadArtifact = (locator) => {
-    const abs = path.isAbsolute(locator) ? locator : path.join(WORK_REPO || HOME, locator);
+    let abs: string;
+    if (path.isAbsolute(locator)) abs = locator;
+    else if (ARTIFACT_ROOT !== "") abs = path.join(ARTIFACT_ROOT, locator);
+    else { log(`observer: relative locator "${locator}" but SWARM_ARTIFACT_ROOT unset — skipping (WORK_REPO is not a filesystem base)`); return null; }
     let raw: string;
     try { raw = readFileSync(abs, "utf8"); } catch { return null; }
-    let rec: unknown;
-    try { rec = JSON.parse(raw); } catch { return null; }
-    const r = rec as { requestId?: unknown; payloadDigest?: unknown; subject?: { jobId?: unknown; revision?: unknown } };
-    if (typeof r.requestId !== "string" || typeof r.payloadDigest !== "string" || typeof r.subject?.jobId !== "string") return null;
-    return { observedDigest: createHash("sha256").update(raw).digest("hex"), record: { requestId: r.requestId, payloadDigest: r.payloadDigest, subject: { jobId: r.subject.jobId, ...(typeof r.subject.revision === "number" ? { revision: r.subject.revision } : {}) } } };
+    return parseCompletionArtifact(raw);
   };
-  const snapshotBoardProgress = (): WatchSnapshot => {
-    let boardFiles: string[] = [];
-    try { boardFiles = readdirSync(BOARD_DIR).filter((f) => f.endsWith(".json")).sort(); } catch { /* no board dir yet */ }
-    let progressMtimeMs = 0;
-    try { progressMtimeMs = statSync(PROGRESS_FILE).mtimeMs; } catch { /* no PROGRESS yet */ }
+  // Sample the watched surfaces. A real ENOENT is a legit empty (no board dir / no PROGRESS yet); ANY OTHER sampling error ⇒
+  // null, so the caller HOLDS the last good snapshot instead of certifying a false empty that re-fires every file next tick
+  // (review P2-3).
+  const snapshotBoardProgress = (): WatchSnapshot | null => {
+    let boardFiles: string[];
+    try { boardFiles = readdirSync(BOARD_DIR).filter((f) => f.endsWith(".json")).sort(); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") boardFiles = []; else { log(`observer: board readdir failed (${e instanceof Error ? e.message : e}) — holding snapshot`); return null; } }
+    let progressMtimeMs: number;
+    try { progressMtimeMs = statSync(PROGRESS_FILE).mtimeMs; }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") progressMtimeMs = 0; else { log(`observer: PROGRESS stat failed (${e instanceof Error ? e.message : e}) — holding snapshot`); return null; } }
     return { boardFiles, progressMtimeMs };
   };
-  const notifyCoordinator = (text: string): void => {
+  // "delivered" = written to the coordinator inbox; "logged" = unroutable (unset/unresolved) best-effort to the log (NOT a
+  // defect — a declared log-only mode); "failed" = routable but the inbox write errored (transient ⇒ the caller holds the
+  // snapshot + retries so the event is not lost — review P2-2).
+  const notifyCoordinator = (text: string): "delivered" | "logged" | "failed" => {
     if (COORDINATOR !== "") {
       const sid = resolveSession(COORDINATOR, listSessions(HOME));
-      if (sid) { try { writeInbox(HOME, sid, { from: SELF, fromLabel: "swarm-observer", text, via: "local", ts: Date.now() }); return; } catch (e) { log(`observer notify write failed: ${e instanceof Error ? e.message : e}`); } }
+      if (sid) {
+        try { writeInbox(HOME, sid, { from: SELF, fromLabel: "swarm-observer", text, via: "local", ts: Date.now() }); return "delivered"; }
+        catch (e) { log(`observer notify write failed (transient) — will retry: ${e instanceof Error ? e.message : e}`); return "failed"; }
+      }
     }
-    log(`[observer→coordinator] ${text}${COORDINATOR === "" ? " (SWARM_COORDINATOR unset — logged, not delivered)" : " (coordinator unresolved — logged)"}`);
+    log(`[observer→coordinator] ${text}${COORDINATOR === "" ? " (SWARM_COORDINATOR unset — logged)" : " (coordinator unresolved — logged)"}`);
+    return "logged";
   };
 
-  // The durable-state observer (L2-struct 2/n, §2b-c/§2c + F25): discover completion-slot artifacts → verify → close production +
-  // open consumption (so an artifact is found + the consumption obligation armed even if the producer never messaged); + watch
-  // the board/PROGRESS surfaces → push each durable change to the coordinator. Fail-soft throughout; runs on the sweep loop.
+  // The durable-state observer (L2-struct 2/n, §2b-c/§2c + F25). Two INDEPENDENT fail-soft halves (a failure in one must not
+  // block the other — review P2-1): completion-slot discovery + the board/PROGRESS watch. Runs on the sweep loop.
   const runObserver = (): void => {
-    try {
+    try { // --- completion-slot scan: discover → verify → close production + open consumption ---
       let dreg: DelegationRegistry | null = null;
       try { dreg = readDelegations(DELEGATIONS_FILE); } catch (e) { log(`delegations read failed — skip completion-slot scan: ${e instanceof Error ? e.message : e}`); }
       if (dreg !== null) {
         for (const cand of scanCompletionSlots(dreg, readArtifact)) {
-          const v = observeCandidate(dreg, cand, nowSec() + CONSUMPTION_WINDOW_SEC, nowSec());
-          if (!v.verified) { log(`observer: candidate for ${cand.record.requestId} rejected: ${v.reason}`); continue; }
-          const fresh = loadControlLog(CONTROL_LOG_DIR);
-          const changes: ChangeBody[] = [];
-          const prod = findWaitIn(fresh, v.closeProductionWait.waitId);
-          if (prod !== undefined && prod.state !== "resolved") { const adv = advanceWait(prod, { type: "close", resolution: v.closeProductionWait.resolution }); if (adv.ok) changes.push({ put: "wait", wait: adv.wait }); }
-          if (findWaitIn(fresh, v.openConsumptionWait.waitId) === undefined) changes.push({ put: "wait", wait: { waitId: v.openConsumptionWait.waitId, kind: "wait", subject: { jobId: v.openConsumptionWait.jobId }, state: "open", deadlineSec: v.openConsumptionWait.deadlineSec, owner: v.openConsumptionWait.owner, timeoutPolicy: "escalate" } });
-          if (changes.length === 0 || commitTask(fresh, changes).result.ok) { writeDelegations(DELEGATIONS_FILE, v.registry); dreg = v.registry; log(`observer: ${cand.record.requestId} produced→consumption (artifact ${cand.observedLocator})`); }
-          else log(`observer: ${cand.record.requestId} transition deferred (seq conflict) — retry next tick`);
+          try { // per-slot isolation: one bad candidate can't abort the scan (review P2-1)
+            const v = observeCandidate(dreg, cand, nowSec() + CONSUMPTION_WINDOW_SEC, nowSec());
+            if (!v.verified) { log(`observer: candidate ${cand.record.requestId} rejected: ${v.reason}`); continue; }
+            const fresh = loadControlLog(CONTROL_LOG_DIR);
+            const prod = findWaitIn(fresh, v.closeProductionWait.waitId);
+            // P1-2: only a CURRENTLY-VALID production receipt advances to consumption.
+            if (prod === undefined) { log(`observer: ${cand.record.requestId} production wait missing — not creating consumption`); continue; }
+            if (prod.state === "resolved") {
+              // already-produced replay (its consumption wait exists) ⇒ catch the registry up; cancelled/revoked/other ⇒ do NOT advance.
+              if (prod.resolution?.outcome === "produced" && findWaitIn(fresh, v.openConsumptionWait.waitId) !== undefined) { writeDelegations(DELEGATIONS_FILE, v.registry); dreg = v.registry; }
+              else log(`observer: ${cand.record.requestId} production wait resolved (${prod.resolution?.outcome ?? "?"}) without a consumption wait — not re-advancing (cancelled/revoked)`);
+              continue;
+            }
+            // open / action_pending (reminder in flight is still valid) ⇒ close production + open consumption.
+            const changes: ChangeBody[] = [];
+            const adv = advanceWait(prod, { type: "close", resolution: v.closeProductionWait.resolution });
+            if (adv.ok) changes.push({ put: "wait", wait: adv.wait });
+            if (findWaitIn(fresh, v.openConsumptionWait.waitId) === undefined) changes.push({ put: "wait", wait: { waitId: v.openConsumptionWait.waitId, kind: "wait", subject: { jobId: v.openConsumptionWait.jobId }, state: "open", deadlineSec: v.openConsumptionWait.deadlineSec, owner: v.openConsumptionWait.owner, timeoutPolicy: "escalate" } });
+            if (changes.length === 0 || commitTask(fresh, changes).result.ok) { writeDelegations(DELEGATIONS_FILE, v.registry); dreg = v.registry; log(`observer: ${cand.record.requestId} produced→consumption (artifact ${cand.observedLocator})`); }
+            else log(`observer: ${cand.record.requestId} transition deferred (seq conflict) — retry next tick`);
+          } catch (e) { log(`observer: slot ${cand.record.requestId} failed (isolated): ${e instanceof Error ? e.message : e}`); }
         }
       }
+    } catch (e) { log(`observer completion-slot scan failed: ${e instanceof Error ? e.message : e}`); }
+
+    try { // --- board/PROGRESS watch (independent half) ---
       let snap: WatchSnapshot | null = null;
       try { snap = readWatchSnapshot(OBSERVER_SNAPSHOT_FILE); } catch (e) { log(`watch snapshot read failed — skip watch: ${e instanceof Error ? e.message : e}`); }
       if (snap !== null) {
         const curr = snapshotBoardProgress();
+        if (curr === null) return; // a transient sampling error ⇒ hold the last snapshot, retry next tick (P2-3)
+        let anyFailed = false;
         for (const ev of detectWatchEvents(snap, curr)) {
-          notifyCoordinator(ev.kind === "board" ? `board: ${ev.item} → ${ev.state}${ev.who ? ` by ${ev.who}` : ""} (durable change — reconcile)` : `PROGRESS.md changed (mtime ${ev.mtimeMs})`);
+          const res = notifyCoordinator(ev.kind === "board" ? `board: ${ev.item} → ${ev.state}${ev.who ? ` by ${ev.who}` : ""} (durable change — reconcile)` : `PROGRESS.md changed (mtime ${ev.mtimeMs})`);
+          if (res === "failed") anyFailed = true;
         }
-        // advance the snapshot regardless (events were surfaced to inbox or log) so a persistently-unroutable coordinator does
-        // not re-fire every board file each tick; a transient write error just re-surfaces next tick (bounded).
+        // advance only if no event failed to deliver (unroutable log-only is fine); a transient delivery failure holds the
+        // snapshot so the event re-fires next tick instead of being lost (review P2-2).
+        if (anyFailed) { log("observer: a watch event failed delivery — snapshot held, retry next tick"); return; }
         try { writeWatchSnapshot(OBSERVER_SNAPSHOT_FILE, curr); } catch (e) { log(`watch snapshot write failed: ${e instanceof Error ? e.message : e}`); }
       }
-    } catch (e) { log(`observer failed: ${e instanceof Error ? e.message : e}`); }
+    } catch (e) { log(`observer board watch failed: ${e instanceof Error ? e.message : e}`); }
   };
 
   await runDispatchLoops({

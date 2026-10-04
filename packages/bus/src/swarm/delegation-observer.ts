@@ -34,6 +34,24 @@ export function scanCompletionSlots(reg: DelegationRegistry, read: ReadArtifact)
   return out;
 }
 
+/** Parse a completion-record artifact (v1 lightweight adapter, §2c). The record DECLARES its WORK TARGET (the commit/spec it
+ *  produced); observedDigest = that declared workTarget, in the SAME domain as the completion-slot's targetDigest — a file-content
+ *  hash is NOT the work target and never equals a commit SHA (review f0a999f-P1-1: comparing domains ⇒ a legit result never
+ *  verifies). NULL-SAFE: a null / non-object / field-incomplete record ⇒ null, never a throw (review f0a999f-P2-1: one bad
+ *  artifact must not abort the scan or the board watch). v1's target fact is the record's self-declared workTarget; INDEPENDENT
+ *  resolution (git rev-parse) + content integrity are the deferred real-adapter acceptance (documented, not faked). */
+export function parseCompletionArtifact(raw: string): ArtifactRead {
+  let rec: unknown;
+  try { rec = JSON.parse(raw); } catch { return null; }
+  if (rec === null || typeof rec !== "object") return null;
+  const r = rec as { requestId?: unknown; payloadDigest?: unknown; workTarget?: unknown; subject?: unknown };
+  if (typeof r.requestId !== "string" || typeof r.payloadDigest !== "string" || typeof r.workTarget !== "string") return null;
+  if (r.subject === null || typeof r.subject !== "object") return null;
+  const s = r.subject as { jobId?: unknown; revision?: unknown };
+  if (typeof s.jobId !== "string") return null;
+  return { observedDigest: r.workTarget, record: { requestId: r.requestId, payloadDigest: r.payloadDigest, subject: { jobId: s.jobId, ...(typeof s.revision === "number" ? { revision: s.revision } : {}) } } };
+}
+
 /** A board-file name parses to {item, state, who}. Convention: `<item>.<state>.<who>.json` (state ∈ claimed/done) or
  *  `<item>.json` (posted/unclaimed). Items are kebab-case (no dots); the LAST two dot-segments are state+who. */
 export function parseBoardFile(file: string): { item: string; state: string; who: string } | null {

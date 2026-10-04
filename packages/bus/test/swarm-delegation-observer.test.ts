@@ -3,7 +3,7 @@ import { mkdtempSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  scanCompletionSlots, parseBoardFile, detectWatchEvents,
+  scanCompletionSlots, parseCompletionArtifact, parseBoardFile, detectWatchEvents,
   readWatchSnapshot, writeWatchSnapshot, emptyWatchSnapshot,
   type ReadArtifact, type WatchSnapshot,
 } from "../src/swarm/delegation-observer.js";
@@ -37,6 +37,29 @@ describe("scanCompletionSlots", () => {
     const prod = observeCandidate(opened(), scanCompletionSlots(opened(), read)[0]!, 1200, 1100);
     if (!prod.verified) throw new Error("verify");
     expect(scanCompletionSlots(prod.registry, read)).toEqual([]); // consumption phase ⇒ not a production scan target
+  });
+});
+
+describe("parseCompletionArtifact", () => {
+  test("P1-1: observedDigest = the DECLARED workTarget (commit/spec domain), NOT a content hash", () => {
+    const raw = JSON.stringify({ requestId: "job-x/build/r1", payloadDigest: "pd-1", workTarget: "f0a999f0000000000000000000000000000000ab", subject: { jobId: "job-x", revision: 8 } });
+    expect(parseCompletionArtifact(raw)).toEqual({ observedDigest: "f0a999f0000000000000000000000000000000ab", record: { requestId: "job-x/build/r1", payloadDigest: "pd-1", subject: { jobId: "job-x", revision: 8 } } });
+  });
+
+  test("P2-1: null-safe — JSON null / non-object / invalid JSON / missing fields ⇒ null, never a throw", () => {
+    expect(parseCompletionArtifact("null")).toBeNull();            // JSON null (the crash the reviewer hit)
+    expect(parseCompletionArtifact("42")).toBeNull();              // non-object
+    expect(parseCompletionArtifact('"a string"')).toBeNull();
+    expect(parseCompletionArtifact("{ not json")).toBeNull();      // invalid JSON
+    expect(parseCompletionArtifact(JSON.stringify({ requestId: "r", payloadDigest: "p", subject: { jobId: "j" } }))).toBeNull(); // no workTarget
+    expect(parseCompletionArtifact(JSON.stringify({ requestId: "r", payloadDigest: "p", workTarget: "t" }))).toBeNull();          // no subject
+    expect(parseCompletionArtifact(JSON.stringify({ requestId: "r", payloadDigest: "p", workTarget: "t", subject: null }))).toBeNull();
+    expect(parseCompletionArtifact(JSON.stringify({ requestId: "r", payloadDigest: "p", workTarget: "t", subject: { revision: 1 } }))).toBeNull(); // no jobId
+  });
+
+  test("subject revision is optional (jobId-only subject is valid)", () => {
+    const raw = JSON.stringify({ requestId: "r", payloadDigest: "p", workTarget: "t", subject: { jobId: "j" } });
+    expect(parseCompletionArtifact(raw)).toEqual({ observedDigest: "t", record: { requestId: "r", payloadDigest: "p", subject: { jobId: "j" } } });
   });
 });
 
