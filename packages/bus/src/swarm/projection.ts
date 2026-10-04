@@ -68,6 +68,10 @@ function attemptView(a: TaskAttempt) {
 export function buildProjectionFiles(state: LogState, opts: ProjectOpts): ProjectionFile[] {
   const out: ProjectionFile[] = [];
   out.push({ relPath: "meta.json", json: { schemaVersion: PROJECTION_SCHEMA_VERSION, lastAppliedSeq: state.seq, rebuiltAt: new Date(opts.nowSec * 1000).toISOString() } });
+  // members.json — the durable roster is the bus peers() view, which the control-log does not hold; v1 emits an empty
+  // roster so the file always exists for the defensive consumer, and viz fills live members from its own peers() merge
+  // (schema §6 consumer promise). activeBindings would come from member-kind executionBindings (none in v1 — all box).
+  out.push({ relPath: "members.json", json: { members: [] as unknown[] } });
 
   const plans: TaskPlan[] = [];
   const attempts: TaskAttempt[] = [];

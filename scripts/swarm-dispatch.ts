@@ -40,6 +40,7 @@ import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.j
 import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
 import { validSeedWait } from "../packages/bus/src/swarm/wait-seed.js";
 import { runDispatchLoops } from "../packages/bus/src/swarm/dispatch-loops.js";
+import { writeProjection } from "../packages/bus/src/swarm/projection.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
@@ -73,6 +74,8 @@ const EXEC_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_EXEC ?? "");
 // the per-record mirror above stays the LIFECYCLE axis for now (its migration to commitControl is a separate step). The
 // task pass runs only with a plan AND SWARM_TASK_EXEC (it allocates real boxes + mints CPA tokens — opt-in like SWARM_EXEC).
 const CONTROL_LOG_DIR = path.join(HOME, ".agenthop", "swarm", "control-log");
+// Read-only consumer view (projection-schema v1); rewritten by the commitControl apply hook (projection write is fail-soft).
+const PROJECTION_DIR = path.join(HOME, ".agenthop", "swarm", "projection");
 const PLAN_FILE = process.env.SWARM_PLAN || "";
 const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
@@ -312,6 +315,13 @@ function commitTask(state: LogState, bodies: ChangeBody[]): { state: LogState; r
     return { ...b, operationId: `${key}#${rev + 1}`, expectedEntityRevision: rev };
   });
   const r = commitControl(CONTROL_LOG_DIR, state, changes);
+  // Projection apply hook (projection-schema §8): after a batch newly advances the log, rewrite the read-only view so viz +
+  // fast-startup see current state. Fail-soft — the projection is derived (rebuilt by replay), never the barrier; a write
+  // error must not break the commit.
+  if (r.result.ok && !r.result.replay) {
+    try { writeProjection(PROJECTION_DIR, r.state, { nowSec: nowSec(), jobStartSec }); }
+    catch (e) { log(`projection write failed: ${e instanceof Error ? e.message : e}`); }
+  }
   return { state: r.state, result: r.result };
 }
 
@@ -524,6 +534,8 @@ async function main(): Promise<void> {
   // overwrite a committed seq) + the actionId-matched confirm; a stale commit is rejected + retried next tick.
   const sweepStateRef = { s: loadControlLog(CONTROL_LOG_DIR) };
   const sweepOps = buildSweepOps(sweepStateRef);
+  // Write the projection once at startup so a consumer sees current state before this run's first commit (fail-soft).
+  try { writeProjection(PROJECTION_DIR, taskStateRef.s, { nowSec: nowSec(), jobStartSec }); } catch (e) { log(`projection initial write failed: ${e instanceof Error ? e.message : e}`); }
   if (SWEEP_ENABLED) log(`liveness sweep ON${WAIT_SEED_FILE ? ` (seed=${WAIT_SEED_FILE})` : ""}`);
   await runDispatchLoops({
     // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
