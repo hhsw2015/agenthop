@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
-import type { WaitRecord, PendingAction, WaitResolution } from "../src/swarm/control-log.js";
-import { openWait, advanceWait, isLive, isGranted, type NewWait } from "../src/swarm/task-wait.js";
+import { initialLogState, commit } from "../src/swarm/control-log.js";
+import type { WaitRecord, PendingAction, WaitResolution, Change } from "../src/swarm/control-log.js";
+import { openWait, openQueryWait, applyDefaultOnTimeout, advanceWait, isLive, isGranted, type NewWait } from "../src/swarm/task-wait.js";
 
 const subj = { jobId: "job", attemptId: "job/P/a1" };
 const res = (outcome: string): WaitResolution => ({ outcome, reason: "r", sourceOperationId: "op" });
@@ -110,5 +111,45 @@ describe("isLive / isGranted (admission is a matching grant, not 'no unresolved 
     const d = advanceWait(mkApproval(), { type: "decide", decision: "denied" });
     expect(d.ok && isGranted(d.wait, "pd1")).toBe(false); // denied != granted
     expect(isGranted(mkApproval(), "pd1")).toBe(false); // pending != granted
+  });
+});
+
+describe("R3-b query-wait (问询不裸等): a query carries a default, applied on timeout via close", () => {
+  const q = () => openQueryWait({ waitId: "q1", subject: { jobId: "job", attemptId: "job/P/a1" }, deadlineSec: 100, owner: "disp", defaultOnTimeout: { outcome: "proceed-c", reason: "no reply -> proceed with C", sourceOperationId: "op1" } });
+  test("built as a bypass wait carrying its default (not a bare wait)", () => {
+    const w = q();
+    expect(w.kind === "wait" && w.timeoutPolicy === "bypass" && w.defaultOnTimeout?.outcome === "proceed-c").toBe(true);
+  });
+  test("timeout applies the pre-stored default via close -> resolved(default-applied)", () => {
+    const applied = applyDefaultOnTimeout(q());
+    expect(applied.ok && applied.wait.state === "resolved" && applied.wait.resolution?.outcome === "default-applied").toBe(true);
+  });
+  test("early human answer wins; a later timeout default is rejected (two closes race, CAS arbitrates)", () => {
+    const answered = advanceWait(q(), { type: "close", resolution: { outcome: "answered", reason: "human chose A", sourceOperationId: "h1" } });
+    expect(answered.ok && answered.wait.state === "resolved" && answered.wait.resolution?.outcome === "answered").toBe(true);
+    const late = applyDefaultOnTimeout(answered.ok ? answered.wait : q()); // the timeout default arrives late
+    expect(late.ok).toBe(false); // close on an already-resolved wait is rejected — the human answer won
+  });
+  test("applyDefaultOnTimeout on a non-query wait (no default) is rejected — never fabricate a resolution", () => {
+    expect(applyDefaultOnTimeout(openWait({ waitId: "w1", kind: "wait", subject: { jobId: "job" }, deadlineSec: 100, owner: "disp", timeoutPolicy: "bypass" })).ok).toBe(false);
+  });
+  test("revision is monotonic after the default is applied (control-log)", () => {
+    const ch = (wait: WaitRecord, n: number): Change => ({ put: "wait", wait, operationId: `wait:${wait.waitId}#${n}`, expectedEntityRevision: n - 1 } as Change);
+    const w = q();
+    let s = commit(initialLogState(), 0, [ch(w, 1)]).state;
+    expect(s.revisions["wait:q1"]).toBe(1);
+    const applied = applyDefaultOnTimeout(w);
+    expect(applied.ok).toBe(true);
+    if (applied.ok) {
+      s = commit(s, 1, [ch(applied.wait, 2)]).state;
+      expect(s.revisions["wait:q1"]).toBe(2);
+      const body = s.entities["wait:q1"];
+      expect(body?.put === "wait" && body.wait.state === "resolved").toBe(true);
+    }
+  });
+  test("type invariant: an approval cannot carry a default (does not compile)", () => {
+    // @ts-expect-error — NewWait (openWait, used for approvals) has no defaultOnTimeout; a default is set ONLY via
+    // openQueryWait, which is always kind="wait". "问询不裸等 vs 门控才裸等" separated at the type layer.
+    openWait({ waitId: "a1", kind: "approval", subject: { jobId: "job" }, deadlineSec: 100, owner: "disp", timeoutPolicy: "escalate", defaultOnTimeout: { outcome: "x", reason: "y", sourceOperationId: "z" } });
   });
 });

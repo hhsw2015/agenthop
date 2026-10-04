@@ -85,4 +85,18 @@ describe("RPV anchor (b): ValidationRun + companion validation-wait", () => {
       expect(verdictEligible(moved.next)).toBe(true);
     }
   });
+
+  test("P2-1 race: normal completion committed FIRST => a later timeout move is a no-op (rejected on the resolved subject)", () => {
+    const { run, wait } = openValidationRunWithWait(openInput());
+    const vp = advanceValidationRun(run, { type: "verdict_observed" });
+    const closed = closeValidationWithWait(vp.ok ? vp.run : run, wait, { atSeq: 20, resolution });
+    expect("error" in closed).toBe(false);
+    if (!("error" in closed)) {
+      // subject already completed (run closed, wait resolved). A timeout-driven move must NOT act — it re-reads the
+      // current subject and finds it done, so moveValidatorWithWait is rejected (close on a resolved wait / move from a
+      // closed run). This is the "正常完成先提交则超时不再 IO" half of the P2-1 race (the move-first half is above).
+      const move = moveValidatorWithWait(closed.run, closed.wait, { newValidationRunId: "vrX", validatorLocation: "box:z", openedAtSeq: 40, atSeq: 40, newWaitId: "vwX", deadlineSec: 100, owner: "disp", timeoutPolicy: "escalate", resolution: { outcome: "reassigned", reason: "late", sourceOperationId: "op" } });
+      expect("error" in move).toBe(true);
+    }
+  });
 });

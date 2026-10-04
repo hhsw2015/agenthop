@@ -111,6 +111,10 @@ export type WaitRecord = {
   pendingAction?: PendingAction;
   resolution?: WaitResolution;
   escalatedAt?: number;
+  /** R3-b (问询不裸等): a query-wait (kind="wait", timeoutPolicy="bypass") carries a pre-stored default answer applied
+   *  on timeout via close(outcome "default-applied"). Durable so the sweep and recovery both see it. Set ONLY by
+   *  openQueryWait; an approval (real gate) must NOT carry one — it bare-waits. */
+  defaultOnTimeout?: WaitResolution;
   // --- approval branch (kind="approval"): resolved != granted (P1-2). ---
   actionRef?: string;
   paramsDigest?: string;
