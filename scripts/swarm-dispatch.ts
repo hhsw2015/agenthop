@@ -43,7 +43,9 @@ import { runDispatchLoops } from "../packages/bus/src/swarm/dispatch-loops.js";
 import { writeProjection } from "../packages/bus/src/swarm/projection.js";
 import { beatStart, beatEnd } from "../packages/bus/src/swarm/heartbeat.js";
 import { buildControlCut, heartbeatObservations } from "../packages/bus/src/swarm/liveness-review.js";
-import { assertLiveness } from "../packages/bus/src/swarm/task-liveness-inv1.js";
+import { assertLiveness, type LivenessVerdict, type ControlCut, type ObservationFact } from "../packages/bus/src/swarm/task-liveness-inv1.js";
+import { reconcileIncident, readIncidents, writeIncidents, emptyRegistry, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
+import { advanceWait } from "../packages/bus/src/swarm/task-wait.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
@@ -83,6 +85,10 @@ const PROJECTION_DIR = path.join(HOME, ".agenthop", "swarm", "projection");
 const HEARTBEAT_FILE = path.join(HOME, ".agenthop", "swarm", "heartbeat.json");
 // How long a heartbeat sample is treated as fresh (INV-1 observation window). A loop ticks ~every 5s; a gap beyond this ⇒ stale ⇒ UNVERIFIABLE.
 const LIVENESS_WINDOW_SEC = Number(process.env.SWARM_LIVENESS_WINDOW_SEC || "120");
+// Durable incident-episode registry (cluster-liveness L1-tail): STALL episodes + their repair-waits. IO-owned file (not a
+// control-log entity). REPAIR_WAIT_SEC = the repair-wait's deadline window (the sweep escalates an un-handled repair).
+const INCIDENTS_FILE = path.join(HOME, ".agenthop", "swarm", "incidents.json");
+const REPAIR_WAIT_SEC = Number(process.env.SWARM_REPAIR_WAIT_SEC || "600");
 const PLAN_FILE = process.env.SWARM_PLAN || "";
 const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
@@ -551,6 +557,46 @@ async function main(): Promise<void> {
   // control slice + heartbeat. The plan is resolved FROM the loaded state by buildControlCut (review P1-2: never the stale
   // startup SWARM_PLAN) — a job with no authoritative PlanPut yields UNVERIFIABLE, not a judgment off a stale plan. The verdict
   // is published with its evidence window (review P2-1). Fail-soft: a heartbeat gap omits the verdict this tick (filled next).
+  const modesNow = () => ({ sweepOn: SWEEP_ENABLED, taskExecOn: taskOn, passInstance: SELF, sweepInstance: SELF });
+
+  // L1-tail STALL disposition: fold the verdict into the durable incident registry + open/resolve its repair-wait. Fail-soft
+  // (never throws): a commit/write error logs + leaves the verdict as-is, retried next tick. Returns the verdict to publish —
+  // on a freshly-opened episode it re-asserts with the new episode so the published verdict carries the stable incidentId (C3).
+  const applyIncidentReconcile = (reg: IncidentRegistry, verdict: LivenessVerdict, cut: ControlCut, obs: ObservationFact[], openEp: number | undefined, jobId: string): LivenessVerdict => {
+    try {
+      const rec = reconcileIncident(reg, verdict, nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner: SELF, jobId });
+      if (rec.openRepairWait === undefined && rec.resolveRepairWait === undefined) {
+        if (JSON.stringify(rec.registry) !== JSON.stringify(reg)) writeIncidents(INCIDENTS_FILE, rec.registry); // dedup lastObservedSeq bump
+        return verdict;
+      }
+      // Apply the control-log action FIRST; persist the registry only if it committed, so the registry never leads CONTROL.
+      const fresh = loadControlLog(CONTROL_LOG_DIR);
+      let committed = false;
+      if (rec.openRepairWait) {
+        const spec = rec.openRepairWait;
+        const w: WaitRecord = { waitId: spec.waitId, kind: "wait", subject: { jobId: spec.jobId }, state: "open", deadlineSec: spec.deadlineSec, owner: spec.owner, timeoutPolicy: "escalate" };
+        committed = commitTask(fresh, [{ put: "wait", wait: w }]).result.ok;
+        if (committed) log(`liveness STALL ${spec.incidentId} — opened repair-wait ${w.waitId} (deadline +${REPAIR_WAIT_SEC}s)`);
+      } else if (rec.resolveRepairWait) {
+        const spec = rec.resolveRepairWait;
+        const body = Object.values(liveEntities(fresh)).find((b) => b.put === "wait" && (b as Extract<ChangeBody, { put: "wait" }>).wait.waitId === spec.waitId) as Extract<ChangeBody, { put: "wait" }> | undefined;
+        if (body === undefined || body.wait.state === "resolved") committed = true; // already gone/resolved (idempotent)
+        else {
+          const adv = advanceWait(body.wait, { type: "close", resolution: { outcome: "recovered", reason: spec.reason, sourceOperationId: `liveness-recover-${SELF}` } });
+          if (adv.ok) { committed = commitTask(fresh, [{ put: "wait", wait: adv.wait }]).result.ok; if (committed) log(`liveness recovered — resolved repair-wait ${spec.waitId}`); }
+        }
+      }
+      if (!committed) { log(`repair-wait action deferred (seq conflict/failed) — retry next tick`); return verdict; }
+      writeIncidents(INCIDENTS_FILE, rec.registry);
+      // first-stall tick: the episode was just assigned (openEp was undefined) — re-assert so the published verdict carries it.
+      if (rec.openRepairWait && openEp === undefined) {
+        const ep = rec.registry.episodes[`${jobId}:no-live-holder`]?.episode;
+        if (ep !== undefined) return assertLiveness({ controlCut: { ...cut, openIncidentEpisode: ep }, observations: obs, modes: modesNow() }, nowSec());
+      }
+      return verdict;
+    } catch (e) { log(`incident reconcile failed: ${e instanceof Error ? e.message : e}`); return verdict; }
+  };
+
   const refreshProjectionAndVerdict = (): void => {
     try {
       const st = loadControlLog(CONTROL_LOG_DIR);
@@ -558,7 +604,11 @@ async function main(): Promise<void> {
       let livenessSampledAtSec: number | undefined;
       let livenessValidUntilSec: number | undefined;
       if (plan) {
-        const cut = buildControlCut(plan.jobId, st, nowSec(), { jobStartSec: jobStartSec(plan.jobId) });
+        // L1-tail: feed the OPEN incident episode (if any) into the cut so a persisting STALL carries its stable incidentId (C3).
+        let reg = emptyRegistry();
+        try { reg = readIncidents(INCIDENTS_FILE); } catch (e) { log(`incidents read failed: ${e instanceof Error ? e.message : e}`); }
+        const openEp = reg.episodes[`${plan.jobId}:no-live-holder`]?.open ? reg.episodes[`${plan.jobId}:no-live-holder`]!.episode : undefined;
+        const cut = buildControlCut(plan.jobId, st, nowSec(), { jobStartSec: jobStartSec(plan.jobId), openIncidentEpisode: openEp });
         if (cut === null) {
           livenessVerdict = { verdict: "UNVERIFIABLE", missing: ["current-plan"] }; // no PlanPut in CONTROL ⇒ don't guess (P1-2)
           livenessSampledAtSec = nowSec();
@@ -567,7 +617,9 @@ async function main(): Promise<void> {
           try {
             const hb = JSON.parse(readFileSync(HEARTBEAT_FILE, "utf8"));
             const obs = heartbeatObservations(hb, LIVENESS_WINDOW_SEC);
-            livenessVerdict = assertLiveness({ controlCut: cut, observations: obs, modes: { sweepOn: SWEEP_ENABLED, taskExecOn: taskOn, passInstance: SELF, sweepInstance: SELF } }, nowSec());
+            let verdict = assertLiveness({ controlCut: cut, observations: obs, modes: modesNow() }, nowSec());
+            verdict = applyIncidentReconcile(reg, verdict, cut, obs, openEp, plan.jobId); // L1-tail: STALL ⇒ episode + repair-wait; OK ⇒ close
+            livenessVerdict = verdict;
             // Evidence-bounded freshness (review 59e7328-P2): the verdict is valid only until its EARLIEST-expiring observation,
             // NOT publish-time + window — otherwise a reused heartbeat's OK outlives the heartbeat it relied on. No obs ⇒ now.
             livenessSampledAtSec = obs.length > 0 ? Math.max(...obs.map((o) => o.sampledAtSec)) : nowSec();
