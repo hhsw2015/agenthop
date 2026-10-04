@@ -656,7 +656,7 @@ async function main(): Promise<void> {
           const jobRepairWaits = Object.values(liveEntities(st))
             .filter((b) => b.put === "wait" && isRepairWaitId((b as Extract<ChangeBody, { put: "wait" }>).wait.waitId) && (b as Extract<ChangeBody, { put: "wait" }>).wait.subject.jobId === plan.jobId)
             .map((b) => { const w = (b as Extract<ChangeBody, { put: "wait" }>).wait; return { waitId: w.waitId, state: w.state }; });
-          const sync = reconcileRegistryWithControl(reg, plan.jobId, jobRepairWaits, nowSec());
+          const sync = reconcileRegistryWithControl(reg, `${plan.jobId}:no-live-holder`, plan.jobId, "liveness", jobRepairWaits, nowSec());
           controlEpisodeFloor = sync.controlEpisodeFloor;
           if (sync.registry !== reg) { try { writeIncidents(INCIDENTS_FILE, sync.registry); } catch (e) { log(`incidents sync write failed: ${e instanceof Error ? e.message : e}`); } reg = sync.registry; }
         }

@@ -25,6 +25,7 @@ import { makeRepairWaitId, repairEpisodeOf } from "./repair-wait-id.js";
  *  WaitRecord, which the pure layer owns and cannot carry incident fields). */
 export type IncidentEpisode = {
   groupKey: string;
+  category: string;       // "liveness" | "routing" | … — the incident family (so a consumer can filter/route by kind)
   episode: number;        // 1-based; monotonic per groupKey (a recurrence after close is episode+1)
   open: boolean;          // true = unresolved; false = recovered/closed (a new recurrence may then open episode+1)
   incidentId: string;     // `${groupKey}:episode-${episode}` — the full C3 identity
@@ -47,52 +48,63 @@ export type IncidentReconcile = {
   resolveRepairWait?: { waitId: string; reason: string };      // a recovery closed an episode — resolve this repair-wait
 };
 
-/** Pure: fold THIS tick's verdict into the episode registry, emitting the repair-wait action (if any). IO (file + control-log
- *  commit) is the caller's; apply the action FIRST, then persist the returned registry, so the registry never claims an
- *  episode open before its repair-wait exists. The kernel ONLY emits groupKey `${jobId}:no-live-holder` (one category), so
- *  recovery is matched on that groupKey; this stays correct if the kernel later adds categories keyed by the same subject. */
+/** A category-tagged, kernel-agnostic incident signal — the generic input the episode lifecycle folds (liveness STALL/OK and
+ *  routing dead-letter bursts both map to this). `active` = the incident condition holds now; `recovered` = it cleared; `none`
+ *  = cannot tell (no-op). subjectKey keys the repair-wait id (injective, review P2-3); subjectJobId is the repair-wait's
+ *  WaitSubject.jobId (a synthetic domain id is fine when the incident has no real job, e.g. "swarm-routing"). */
+export type IncidentSignal = {
+  kind: "active" | "recovered" | "none";
+  groupKey: string; category: string; why: string; lastObservedSeq: number; subjectKey: string; subjectJobId: string;
+};
+
+/** Pure generic core: fold ONE incident signal into the episode registry, emitting the repair-wait action (if any). IO (file +
+ *  control-log commit) is the caller's; apply the action FIRST, then persist the returned registry, so the registry never claims
+ *  an episode open before its repair-wait exists. `active` with no open episode ⇒ a NEW episode (number beyond the registry's
+ *  last AND any CONTROL-committed one via controlEpisodeFloor, so a lost counter never reuses an id — review 19152aa-P1-3) +
+ *  its repair-wait; `active` with an open episode ⇒ DEDUP (advance only lastObservedSeq, C3); `recovered` ⇒ close + resolve. */
+export function reconcileIncidentCore(
+  reg: IncidentRegistry, sig: IncidentSignal, nowSec: number,
+  cfg: { repairWindowSec: number; owner: string; controlEpisodeFloor?: number },
+): IncidentReconcile {
+  const episodes = { ...reg.episodes };
+  if (sig.kind === "active") {
+    const existing = episodes[sig.groupKey];
+    if (existing !== undefined && existing.open) {
+      episodes[sig.groupKey] = { ...existing, lastObservedSeq: sig.lastObservedSeq, why: sig.why }; // dedup — same ongoing incident (C3)
+      return { registry: { episodes } };
+    }
+    const episode = Math.max(existing?.episode ?? 0, cfg.controlEpisodeFloor ?? 0) + 1;
+    const incidentId = `${sig.groupKey}:episode-${episode}`;
+    const rwId = makeRepairWaitId(sig.subjectKey, episode);
+    episodes[sig.groupKey] = {
+      groupKey: sig.groupKey, category: sig.category, episode, open: true, incidentId, why: sig.why,
+      openedAtSec: nowSec, lastObservedSeq: sig.lastObservedSeq, repairWaitId: rwId,
+    };
+    return { registry: { episodes }, openRepairWait: { waitId: rwId, jobId: sig.subjectJobId, deadlineSec: nowSec + cfg.repairWindowSec, owner: cfg.owner, incidentId, why: sig.why } };
+  }
+  if (sig.kind === "recovered") {
+    const existing = episodes[sig.groupKey];
+    if (existing !== undefined && existing.open) {
+      episodes[sig.groupKey] = { ...existing, open: false, closedAtSec: nowSec };
+      return { registry: { episodes }, resolveRepairWait: { waitId: existing.repairWaitId, reason: `recovered: ${sig.why} (episode ${existing.episode})` } };
+    }
+  }
+  return { registry: { episodes } }; // none / nothing-to-change
+}
+
+/** Liveness incident reconcile — maps the INV-1 verdict to a generic signal + folds it (category="liveness"). STALL ⇒ active;
+ *  OK ⇒ recovered (a verified-live holder; the kernel's groupKey is `${jobId}:no-live-holder`); UNVERIFIABLE ⇒ no-op (cannot
+ *  confirm, never "recovered"). The subject key/jobId is the job itself. Behavior is unchanged from before the generic extract. */
 export function reconcileIncident(
   reg: IncidentRegistry, verdict: LivenessVerdict, nowSec: number,
   cfg: { repairWindowSec: number; owner: string; jobId: string; controlEpisodeFloor?: number },
 ): IncidentReconcile {
-  const episodes = { ...reg.episodes };
-
-  if (verdict.verdict === "STALL") {
-    const existing = episodes[verdict.groupKey];
-    if (existing !== undefined && existing.open) {
-      // dedup: the SAME ongoing stall — advance only the observation version, never a new incident/wait/episode (C3).
-      episodes[verdict.groupKey] = { ...existing, lastObservedSeq: verdict.lastObservedSeq, why: verdict.why };
-      return { registry: { episodes } };
-    }
-    // a new episode: first detection, OR a recurrence AFTER the prior episode was closed. The number is beyond BOTH the
-    // registry's last episode AND any episode already committed in CONTROL (controlEpisodeFloor) — so a registry whose counter
-    // was lost never reuses an id that an already-committed (even resolved) repair-wait still holds (review 19152aa-P1-3 ①).
-    const episode = Math.max(existing?.episode ?? 0, cfg.controlEpisodeFloor ?? 0) + 1;
-    const incidentId = `${verdict.groupKey}:episode-${episode}`;
-    const rwId = makeRepairWaitId(cfg.jobId, episode); // injective in jobId (review P2-3)
-    episodes[verdict.groupKey] = {
-      groupKey: verdict.groupKey, episode, open: true, incidentId, why: verdict.why,
-      openedAtSec: nowSec, lastObservedSeq: verdict.lastObservedSeq, repairWaitId: rwId,
-    };
-    return {
-      registry: { episodes },
-      openRepairWait: { waitId: rwId, jobId: cfg.jobId, deadlineSec: nowSec + cfg.repairWindowSec, owner: cfg.owner, incidentId, why: verdict.why },
-    };
-  }
-
-  if (verdict.verdict === "OK") {
-    // recovery evidence (a verified-live holder, INV-1 satisfied) closes the open episode + resolves its repair-wait. Only
-    // an OK closes — UNVERIFIABLE is "cannot confirm", never "recovered". The kernel's groupKey for this job:
-    const gk = `${cfg.jobId}:no-live-holder`;
-    const existing = episodes[gk];
-    if (existing !== undefined && existing.open) {
-      episodes[gk] = { ...existing, open: false, closedAtSec: nowSec };
-      return { registry: { episodes }, resolveRepairWait: { waitId: existing.repairWaitId, reason: `recovered: live holder verified at seq-cut (episode ${existing.episode})` } };
-    }
-  }
-
-  // UNVERIFIABLE (no recovery evidence — leave any open episode open), or OK/STALL with nothing to change.
-  return { registry: { episodes } };
+  const base = { category: "liveness", subjectKey: cfg.jobId, subjectJobId: cfg.jobId };
+  if (verdict.verdict === "STALL")
+    return reconcileIncidentCore(reg, { kind: "active", groupKey: verdict.groupKey, why: verdict.why, lastObservedSeq: verdict.lastObservedSeq, ...base }, nowSec, cfg);
+  if (verdict.verdict === "OK")
+    return reconcileIncidentCore(reg, { kind: "recovered", groupKey: `${cfg.jobId}:no-live-holder`, why: "live holder verified at seq-cut", lastObservedSeq: 0, ...base }, nowSec, cfg);
+  return { registry: { episodes: { ...reg.episodes } } }; // UNVERIFIABLE — leave any open episode open
 }
 
 /** Reconcile the registry against CONTROL (the durable backstop) BEFORE folding the verdict — CONTROL's committed repair-wait
@@ -104,25 +116,25 @@ export function reconcileIncident(
  *  Returns controlEpisodeFloor (max episode among this job's CONTROL repair-waits, resolved or not) so a newly opened episode
  *  never reuses an already-committed id. Pass ONLY this job's repair-waits. Pure; the caller supplies the CONTROL facts + persists. */
 export function reconcileRegistryWithControl(
-  reg: IncidentRegistry, jobId: string, controlRepairWaits: ReadonlyArray<{ waitId: string; state: string }>, nowSec: number,
+  reg: IncidentRegistry, groupKey: string, subjectKey: string, category: string,
+  controlRepairWaits: ReadonlyArray<{ waitId: string; state: string }>, nowSec: number,
 ): { registry: IncidentRegistry; controlEpisodeFloor: number } {
-  const gk = `${jobId}:no-live-holder`;
   const episodes = { ...reg.episodes };
   const live = controlRepairWaits.find((w) => w.state !== "resolved");
   let floor = 0;
-  for (const w of controlRepairWaits) { const n = repairEpisodeOf(w.waitId, jobId); if (n !== null && n > floor) floor = n; }
-  const ep = episodes[gk];
+  for (const w of controlRepairWaits) { const n = repairEpisodeOf(w.waitId, subjectKey); if (n !== null && n > floor) floor = n; }
+  const ep = episodes[groupKey];
   if (live !== undefined) {
-    const liveEp = repairEpisodeOf(live.waitId, jobId);
+    const liveEp = repairEpisodeOf(live.waitId, subjectKey);
     if (liveEp !== null && (ep === undefined || !ep.open || ep.repairWaitId !== live.waitId)) {
-      episodes[gk] = { // adopt the committed live repair-wait as the open episode (its registry open-write was lost) — case A
-        groupKey: gk, episode: liveEp, open: true, incidentId: `${gk}:episode-${liveEp}`,
+      episodes[groupKey] = { // adopt the committed live repair-wait as the open episode (its registry open-write was lost) — case A
+        groupKey, category: ep?.category ?? category, episode: liveEp, open: true, incidentId: `${groupKey}:episode-${liveEp}`,
         why: ep?.why ?? "adopted from CONTROL live repair-wait", openedAtSec: ep?.openedAtSec ?? nowSec,
         lastObservedSeq: ep?.lastObservedSeq ?? 0, repairWaitId: live.waitId,
       };
     }
   } else if (ep !== undefined && ep.open) {
-    episodes[gk] = { ...ep, open: false, closedAtSec: nowSec }; // CONTROL has no live wait (close-write lost) ⇒ sync closed — case B
+    episodes[groupKey] = { ...ep, open: false, closedAtSec: nowSec }; // CONTROL has no live wait (close-write lost) ⇒ sync closed — case B
   }
   const changed = JSON.stringify(episodes) !== JSON.stringify(reg.episodes);
   return { registry: changed ? { episodes } : reg, controlEpisodeFloor: floor };
