@@ -122,8 +122,13 @@ export type RecompileInput = {
   /** The control action kind this commit will carry (default "plan"). */
   actionKind?: string;
 };
+/** Trusted per-node risk EVIDENCE for the managed loader: bound to the node's TASK IDENTITY (specDigest), not just its
+ *  nodeId — so a plan whose node scope/path was tampered (changing its specDigest) no longer matches and the override is
+ *  not honored (reviewer ②: the gate stands). */
+export type RiskEvidence = Record<string, { risk: NodeRisk; specDigest: string }>;
+
 export type RecompileResult =
-  | { outcome: "loadable"; plan: TaskPlan; operationId: string; snapshotDigest: string; answerSetDigest: string; resolvedRisk: Record<string, NodeRisk>; projectedDraft: Draft; projectedFc: FrozenContext }
+  | { outcome: "loadable"; plan: TaskPlan; operationId: string; snapshotDigest: string; answerSetDigest: string; resolvedRisk: RiskEvidence; projectedDraft: Draft; projectedFc: FrozenContext }
   | { outcome: "needsClarification"; questions: ClarificationQuestion[]; unanswered: string[] }
   | { outcome: "needsRole"; missingRoles: string[]; reason: string }
   | { outcome: "rejected"; reason: string };
@@ -155,7 +160,10 @@ export function recompilePlan(i: RecompileInput): RecompileResult {
     snapshotDigest: i.snapshotDigest,
     canonicalAnswerSetDigest: answerSetDigest,
   });
-  return { outcome: "loadable", plan: res.plan, operationId, snapshotDigest: i.snapshotDigest, answerSetDigest, resolvedRisk: proj.resolvedRisk, projectedDraft: i.draft, projectedFc: i.fc };
+  // Build spec-bound evidence from the PRODUCED plan (each resolved node's specDigest), so a consumer can managed-reload.
+  const resolvedRisk: RiskEvidence = {};
+  for (const n of res.plan.nodes) if (n.resolvedRisk !== undefined) resolvedRisk[n.nodeId] = { risk: n.resolvedRisk, specDigest: n.specDigest };
+  return { outcome: "loadable", plan: res.plan, operationId, snapshotDigest: i.snapshotDigest, answerSetDigest, resolvedRisk, projectedDraft: i.draft, projectedFc: i.fc };
 }
 
 /** The clarification answer rides on the query-wait's CLOSE resolution (no new WaitRecord field): the outcome string encodes
@@ -166,18 +174,33 @@ export function clarificationResolution(reversible: boolean, sourceOperationId: 
   return { outcome: reversible ? CLARIFY_OUTCOME.reversible : CLARIFY_OUTCOME.irreversible, reason: `requester clarified: ${reversible ? "reversible" : "irreversible"}`, sourceOperationId };
 }
 
-/** Derive the answer set from CLOSED query-waits — the trusted-winner source (reviewer P2-4/seam-3). Each entry's wait MUST
- *  be resolved (closed via advanceWait) and carry a clarification outcome; the winner is the close FACT, not a caller casSeq.
- *  Rejects a not-closed or non-clarification wait rather than guessing. */
+/** The DURABLE per-question binding a query-wait must carry as its payloadRef: digest(bundle payloadRef, questionId). It
+ *  binds the wait to ONE specific question of ONE snapshot, so a single closed wait cannot be re-pasted onto another
+ *  question (reviewer ①) — only the bundle-level ref is not enough. The clarification handler opens each query-wait with
+ *  this ref; resumeFromClosedWaits re-derives and checks it. */
+export const QUESTION_WAIT_NS = "swarm-clarify-wait/1";
+export function questionWaitRef(payloadRef: string, questionId: string): string {
+  return digestOf({ ns: QUESTION_WAIT_NS, payloadRef, questionId });
+}
+
+const CLARIFY_OUTCOMES: ReadonlySet<string> = new Set([CLARIFY_OUTCOME.reversible, CLARIFY_OUTCOME.irreversible]);
+const reversibleOf = (outcome: string): boolean => outcome === CLARIFY_OUTCOME.reversible;
+
+/** Derive the answer set from CLOSED query-waits — the trusted-winner source (reviewer P2-4/seam-3). The winner is the
+ *  close FACT (advanceWait enforces first-close-wins), never a caller casSeq. A wait resolved by its pre-stored default on
+ *  timeout (outcome "default-applied") is honored ONLY when that default was itself a clarification (reviewer ③ — recover
+ *  via the default). A cancel/supersede/other terminal reason is NOT an answer -> rejected (never guessed). */
 export function answersFromClosedWaits(entries: Array<{ questionId: string; wait: WaitRecord }>): { ok: true; answers: ClarificationAnswer[] } | { ok: false; reason: string } {
   const answers: ClarificationAnswer[] = [];
   for (const { questionId, wait } of entries) {
     if (typeof questionId !== "string" || questionId.length === 0) return { ok: false, reason: "a closed-wait entry needs a non-empty questionId" };
     if (wait.state !== "resolved") return { ok: false, reason: `wait for ${questionId} is not closed (state=${wait.state}) — only a closed-wait fact is a trusted answer` };
-    const outcome = wait.resolution?.outcome;
-    if (outcome === CLARIFY_OUTCOME.reversible) answers.push({ questionId, reversible: true });
-    else if (outcome === CLARIFY_OUTCOME.irreversible) answers.push({ questionId, reversible: false });
-    else return { ok: false, reason: `wait for ${questionId} is not a clarification close (outcome=${String(outcome)})` };
+    const outcome = wait.resolution?.outcome ?? "";
+    if (CLARIFY_OUTCOMES.has(outcome)) { answers.push({ questionId, reversible: reversibleOf(outcome) }); continue; }
+    // timeout default: recover ONLY if the pre-stored default was itself a clarification resolution.
+    const dflt = wait.defaultOnTimeout?.outcome;
+    if (outcome === "default-applied" && dflt !== undefined && CLARIFY_OUTCOMES.has(dflt)) { answers.push({ questionId, reversible: reversibleOf(dflt) }); continue; }
+    return { ok: false, reason: `wait for ${questionId} is not a clarification close (outcome=${String(wait.resolution?.outcome)}) — cancel/supersede/other is not an answer` };
   }
   return { ok: true, answers };
 }

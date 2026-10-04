@@ -6,8 +6,8 @@ import { storeResumeState, resumeClarification, resumeFromClosedWaits, type Resu
 import { storeFrozenContext, loadFrozenContext, storeBundle, loadBundle, frozenRefsOf } from "../src/swarm/plan-bundle.js";
 import { loadPlan } from "../src/swarm/task-plan.js";
 import { commit, initialLogState, type Change } from "../src/swarm/control-log.js";
-import { clarifyTargets, clarificationResolution, type ClarificationAnswer } from "../src/swarm/plan-recompile.js";
-import { openQueryWait, advanceWait } from "../src/swarm/task-wait.js";
+import { clarifyTargets, clarificationResolution, questionWaitRef, type ClarificationAnswer } from "../src/swarm/plan-recompile.js";
+import { openQueryWait, advanceWait, applyDefaultOnTimeout, isGranted } from "../src/swarm/task-wait.js";
 import { translateDraft, type Draft, type DraftTask, type FrozenContext } from "../src/swarm/task-translate.js";
 
 // T3b recompile ORCHESTRATION (design 1d0a1ffc §1 line 21; reviewer P2-4): the verified resume entry — payloadRef +
@@ -82,17 +82,20 @@ describe("storeResumeState + resumeClarification round-trip", () => {
     if (r.outcome === "rejected") expect(r.reason).toMatch(/drift|swap|match/i);
   });
 
-  test("resumeFromClosedWaits: a wait closed with a clarification resolution (bound to the payloadRef) resumes to loadable", () => {
+  const closedFor = (payloadRef: string, qid: string, reversible: boolean) => {
+    const w = openQueryWait({ waitId: `w-${qid}`, subject: { jobId: "jobR" }, deadlineSec: 100, owner: "coord", defaultOnTimeout: { outcome: "default-applied", reason: "r", sourceOperationId: "d" }, payloadRef: questionWaitRef(payloadRef, qid) });
+    const c = advanceWait(w, { type: "close", resolution: clarificationResolution(reversible, "op-win") });
+    if (!c.ok) throw new Error("close failed");
+    return c.wait;
+  };
+
+  test("resumeFromClosedWaits: a wait carrying the per-question binding resumes to loadable", () => {
     const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);
     const qid = clarifyTargets(draft, fc())[0]!.questionId;
-    const w = openQueryWait({ waitId: "w1", subject: { jobId: "jobR" }, deadlineSec: 100, owner: "coord", defaultOnTimeout: { outcome: "default-applied", reason: "r", sourceOperationId: "d" }, payloadRef });
-    const closed = advanceWait(w, { type: "close", resolution: clarificationResolution(true, "op-win") });
-    expect(closed.ok).toBe(true);
-    if (!closed.ok) return;
-    const r = resumeFromClosedWaits({ payloadRef, closedWaits: [{ questionId: qid, wait: closed.wait }] }, dirs);
+    const r = resumeFromClosedWaits({ payloadRef, closedWaits: [{ questionId: qid, wait: closedFor(payloadRef, qid, true) }] }, dirs);
     expect(r.outcome).toBe("loadable");
   });
-  test("resumeFromClosedWaits: a wait bound to a DIFFERENT payloadRef is rejected (no cross-snapshot answer)", () => {
+  test("resumeFromClosedWaits: a wait not bound to this question/snapshot is rejected", () => {
     const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);
     const qid = clarifyTargets(draft, fc())[0]!.questionId;
     const w = openQueryWait({ waitId: "w1", subject: { jobId: "jobR" }, deadlineSec: 100, owner: "coord", defaultOnTimeout: { outcome: "default-applied", reason: "r", sourceOperationId: "d" }, payloadRef: "a".repeat(64) });
@@ -100,6 +103,38 @@ describe("storeResumeState + resumeClarification round-trip", () => {
     if (!closed.ok) return;
     const r = resumeFromClosedWaits({ payloadRef, closedWaits: [{ questionId: qid, wait: closed.wait }] }, dirs);
     expect(r.outcome).toBe("rejected");
+  });
+  test("R3-P1-1: ONE real close cannot be re-pasted onto two questions (per-question binding)", () => {
+    const two: Draft = { jobId: "jobR2", tasks: [
+      task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts"] }),
+      task({ nodeId: "B", sourceWriteScope: ["src/exp/b.ts"] }),
+    ] };
+    const { payloadRef } = storeResumeState({ draft: two, prd, fc: fc() }, dirs);
+    const targets = clarifyTargets(two, fc());
+    const [qA, qB] = [targets[0]!.questionId, targets[1]!.questionId];
+    const aWait = closedFor(payloadRef, qA, true); // only A is actually closed
+    // re-paste the SAME A close under both qA and qB -> rejected (its payloadRef is bound to qA, not qB)
+    const relabel = resumeFromClosedWaits({ payloadRef, closedWaits: [{ questionId: qA, wait: aWait }, { questionId: qB, wait: aWait }] }, dirs);
+    expect(relabel.outcome).toBe("rejected");
+    // only its own question -> B still unanswered -> needsClarification (safe)
+    const onlyA = resumeFromClosedWaits({ payloadRef, closedWaits: [{ questionId: qA, wait: aWait }] }, dirs);
+    expect(onlyA.outcome).toBe("needsClarification");
+    // both questions with their OWN real closes -> loadable
+    const both = resumeFromClosedWaits({ payloadRef, closedWaits: [{ questionId: qA, wait: aWait }, { questionId: qB, wait: closedFor(payloadRef, qB, true) }] }, dirs);
+    expect(both.outcome).toBe("loadable");
+  });
+  test("R3-P2-1: a timeout default that was a clarification resumes (to a gated plan), isGranted stays false", () => {
+    const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);
+    const qid = clarifyTargets(draft, fc())[0]!.questionId;
+    const w = openQueryWait({ waitId: "wd", subject: { jobId: "jobR" }, deadlineSec: 100, owner: "coord", defaultOnTimeout: clarificationResolution(false, "def"), payloadRef: questionWaitRef(payloadRef, qid) });
+    const timedOut = applyDefaultOnTimeout(w);
+    expect(timedOut.ok).toBe(true);
+    if (!timedOut.ok) return;
+    expect(isGranted(timedOut.wait, "anything")).toBe(false); // a query close never grants execution
+    const r = resumeFromClosedWaits({ payloadRef, closedWaits: [{ questionId: qid, wait: timedOut.wait }] }, dirs);
+    expect(r.outcome).toBe("loadable");
+    if (r.outcome !== "loadable") return;
+    expect(r.plan.nodes.some((n) => n.kind === "design")).toBe(true); // irreversible default -> gated
   });
   test("accurate replay: the same resume committed twice is a replay no-op; a swapped-policy ref never reaches the same op", () => {
     const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);

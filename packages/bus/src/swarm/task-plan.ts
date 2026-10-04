@@ -135,11 +135,11 @@ export type ManagedT3Opts = {
   ownerDomainPolicy: OwnerDomainPolicy;
   riskPolicy: RiskPolicy;
   expectedFrozenRefs: FrozenRefs;
-  /** TRUSTED per-node risk evidence (nodeId -> NodeRisk), derived by the caller from closed clarification waits bound to
-   *  the plan's payloadRef. A node's serialized resolvedRisk is honored ONLY when it matches this map; otherwise it is
-   *  IGNORED (treated as policy), so a forged resolvedRisk cannot remove a design gate. Absent => all serialized
-   *  resolvedRisk ignored. */
-  resolvedRisk?: Record<string, NodeRisk>;
+  /** TRUSTED per-node risk evidence, derived by the caller from closed clarification waits bound to the plan's payloadRef.
+   *  Bound to the node's TASK IDENTITY (specDigest), not just nodeId: a serialized resolvedRisk is honored ONLY when BOTH
+   *  the risk value AND the node's specDigest match this evidence — so a plan whose node scope/path was tampered (changed
+   *  specDigest) is NOT honored and its design gate stands. Absent => all serialized resolvedRisk ignored. */
+  resolvedRisk?: Record<string, { risk: NodeRisk; specDigest: string }>;
 };
 
 export type LoadResult = { ok: true; plan: TaskPlan } | { ok: false; reason: string };
@@ -342,10 +342,13 @@ function frozenRefsMismatch(got: FrozenRefs | undefined, want: FrozenRefs): stri
  *  node's coverage. Catches the structural bypasses a/b/c miss — deleting all design nodes (still cross-domain) or
  *  covering only a subset. (Structural dangling/ancestor/non-empty is validateR4Coverage's job.) */
 function validateManagedT3(specs: TaskSpec[], opts: ManagedT3Opts): string | null {
-  // EFFECTIVE per-node risk: honor a serialized resolvedRisk ONLY when it matches the caller's TRUSTED evidence map;
-  // otherwise ignore it (a forged resolvedRisk must not remove a gate). Absent evidence => every serialized value ignored.
-  const effectiveRisk = (s: TaskSpec): NodeRisk | undefined =>
-    s.resolvedRisk !== undefined && opts.resolvedRisk?.[s.nodeId] === s.resolvedRisk ? s.resolvedRisk : undefined;
+  // EFFECTIVE per-node risk: honor a serialized resolvedRisk ONLY when the TRUSTED evidence matches BOTH its value AND the
+  // node's specDigest (task identity). A forged resolvedRisk, or a tampered scope that changed specDigest, is ignored (the
+  // gate stands). Absent evidence => every serialized value ignored.
+  const effectiveRisk = (s: TaskSpec): NodeRisk | undefined => {
+    const ev = opts.resolvedRisk?.[s.nodeId];
+    return s.resolvedRisk !== undefined && ev !== undefined && ev.risk === s.resolvedRisk && ev.specDigest === s.specDigest ? s.resolvedRisk : undefined;
+  };
 
   // A critical node with an unknown-risk path should have been needsClarification, never loadable (c790ff1d ③ /
   // errata 0b966a11) — UNLESS a trusted clarification resolved it (effective resolvedRisk present). This applies to EVERY

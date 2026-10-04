@@ -2,9 +2,13 @@
 
 **Scope:** T3 planner part B. Design `docs/swarm/t3-planner-design.md` (current sha `1d0a1ffc`; memory's `60c9ffa7` is a
 stale earlier freeze — the doc has no `§7`, the T3b content lives in §1/§2/§3/§4; coordinator's 5-point dispatch
-corroborated clause-by-clause). Baseline = `feat/swarm-brain` @ `ed2499d` (T3a signed off 0/0/0). **Builds on T3a without
-editing any T3a/bus source** — only new files. Branch `feat/swarm-brain`, commit `0cad201` (+ `scripts/t3-draft-live.ts`
-update for the Anthropic `/v1/messages` branch).
+corroborated clause-by-clause). Baseline = `feat/swarm-brain` @ `ed2499d` (T3a signed off 0/0/0). Branch `feat/swarm-brain`.
+
+**T3a surface (round 3+):** T3b began as new files only; from round 3 it ADDITIVELY extends the signed-off T3a shared layer
+(`evaluateR4`/`R4NodeInput`, `TaskSpec.resolvedRisk`, managed loader, `translateDraft` trusted opts) to implement design §3
+"节点显式标记" — see "T3a-surface change declaration" below. All extensions are optional/additive: absent `resolvedRisk`,
+behavior is byte-identical to T3a (all 93 T3a regression gates + the full suite stay green). The earlier "zero T3a edits"
+framing and the round-2 prefix-surgery projectAnswers description are superseded by the per-node-risk design documented here.
 
 ## What to review (round 2 — HEAD after the bccf629 fix round)
 
@@ -81,17 +85,31 @@ map derived from the closed clarification waits (bound to the payloadRef). A for
 | R2-P2-2 | resume trusted caller casSeq, not the real close winner | `answersFromClosedWaits` (winner = the resolved wait's close fact; advanceWait first-close-wins) + `resumeFromClosedWaits` (payloadRef-bound) | swarm-t3-recompile "R2-P2-2" + swarm-t3-resume (closed-wait resume + cross-snapshot reject) |
 | R2-P2-3 | F baseline missed the PRD's untagged test-dir obligation | coverage-audit `requiredScopePrefix` (untagged, scope-verified); baseline + A1 include the test-dir obligation | swarm-t3-acceptance "R2-P2-3" + regenerated a1-evidence.json |
 
+## Round-4 disposition — reviewer 3dabc23 re-review (2 P1 / 1 P2), all addressed
+
+| # | Finding | Fix | Pinned by |
+|---|---|---|---|
+| R3-P1-1 | one real close re-pasted onto multiple questions (payloadRef binding alone insufficient) | `questionWaitRef(payloadRef, questionId)` — each wait bound to its specific question of its snapshot; `resumeFromClosedWaits` re-derives + checks, rejects duplicates | swarm-t3-resume "R3-P1-1 ONE real close cannot be re-pasted" |
+| R3-P1-2 | trusted evidence bound to nodeId scalar only → stale evidence passes a new/added task path | evidence is `{risk, specDigest}`; the loader recomputes specDigest from the candidate content and honors only on a match (tamper → gate stands) | swarm-t3-recompile "R2-② scope tamper" + "① not trusted" |
+| R3-P2-1 | a legit timeout-default clarification close was always rejected | `answersFromClosedWaits` recovers `default-applied` when `defaultOnTimeout` was a clarification; isGranted stays false | swarm-t3-recompile "R2-③" + swarm-t3-resume "R3-P2-1" |
+
 ## Non-obvious decisions / seams to probe
 
-- **projectAnswers fold (round-2 rewrite).** The answer binds to its own node path: a touched undecidable prefix is replaced
-  by the still-**unanswered** node paths under it (siblings keep their unknown status → design gate), answered-irreversible
-  paths go to `irreversiblePrefixes`, and **`criticalPath` is never rewritten** (a reversibility answer is not a criticality
-  fact — per the reviewer's P2-1 ruling). Per-path aggregate is conservative (any irreversible wins). No deferral to a per-node
-  risk marker or the CPA ledger — the path-exact resolution makes the reversible case exact without them.
+- **projectAnswers → per-node risk (round-3, design §3).** An answer resolves the ANSWERED node only (irreversible if any of
+  its own answers is irreversible, else reversible), as a `resolvedRisk` on that node — NOT a global path-set edit. An
+  unanswered node (even one sharing or overlapping the path) keeps its policy unknown-risk and its gate. `criticalPath` is
+  never rewritten. A policy-known-irreversible path always still gates (the override governs only the unknown dimension).
+- **resolvedRisk trust (reviewer ①②, asymmetric forgery).** `reversible` can remove a gate, so the managed loader never
+  trusts the serialized field: it honors a node's `resolvedRisk` only when the caller's trusted evidence matches BOTH the
+  value AND the node's recomputed `specDigest` (task identity). A tampered scope (new/added path) changes specDigest →
+  evidence no longer matches → gate stands. Evidence comes from `resumeFromClosedWaits` (closed clarification facts).
+- **Wait→question binding (reviewer ①).** Each query-wait carries `questionWaitRef(payloadRef, questionId)` as its payloadRef,
+  so one closed wait cannot be re-pasted onto another question; `resumeFromClosedWaits` re-derives and checks it.
+- **Timeout-default recovery (reviewer ③).** `answersFromClosedWaits` recovers an `outcome="default-applied"` close only when
+  the pre-stored `defaultOnTimeout` was itself a clarification resolution; cancel/supersede/open are not answers. `isGranted`
+  stays false throughout (a query close never grants execution).
 - **clarifyTargets replicates translateDraft's question derivation** (not NL-parsed) and is **pinned** by a test asserting its
   questionIds equal translateDraft's emitted ones — a T3a format change breaks that test, not silently.
-- **Policy identity.** C' version is content-addressed over the resulting risk policy; the resume entry also checks the
-  resolved policy's `frozenRefs` against the bundle (drift/swap). loadFrozenContext/loadBundle both re-verify digests.
 - **A2 (real dispatch + V8 execution of required-review-pass + the real cost-based R4 threshold) is NOT in this batch** —
   `notImplemented:['r4-threshold']` stays; loadable ≠ A2. The resume orchestration produces a loadable plan + minted
   operationId only; it does not dispatch.

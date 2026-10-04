@@ -353,7 +353,11 @@ export function translateDraft(draft: Draft, fc: FrozenContext, opts: TranslateO
   // Self-check via the SAME managed-t3 enforcement the consumer applies: translateDraft's output is guaranteed to pass
   // the loader's R4 re-evaluation (a translateDraft bug that failed to insert a required gate surfaces here as rejected,
   // not as a plan the dispatcher later rejects). loadPlan is the sole legality + digest + coverage authority.
-  const loaded = loadPlan(assembled, { mode: "managed-t3", ownerDomainPolicy: fc.ownerDomainPolicy, riskPolicy: fc.riskPolicy, expectedFrozenRefs: frozenRefs, ...(opts.resolvedRisk !== undefined ? { resolvedRisk: opts.resolvedRisk } : {}) });
+  // Spec-bound evidence for the self-check: each stamped node's resolvedRisk + its computed specDigest (the same identity
+  // loadPlan will compute), so the loader honors exactly the nodes we legitimately resolved — matching a consumer's reload.
+  const selfEvidence: Record<string, { risk: NodeRisk; specDigest: string }> = {};
+  if (opts.resolvedRisk !== undefined) for (const n of assembled.nodes) if (n.resolvedRisk !== undefined) selfEvidence[n.nodeId] = { risk: n.resolvedRisk, specDigest: computeSpecDigest(n) };
+  const loaded = loadPlan(assembled, { mode: "managed-t3", ownerDomainPolicy: fc.ownerDomainPolicy, riskPolicy: fc.riskPolicy, expectedFrozenRefs: frozenRefs, ...(Object.keys(selfEvidence).length > 0 ? { resolvedRisk: selfEvidence } : {}) });
   if (!loaded.ok) return R(`assembled plan failed managed loadPlan: ${loaded.reason}`);
   return { outcome: "loadable", plan: loaded.plan };
 }

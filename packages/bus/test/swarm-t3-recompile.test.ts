@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import { translateDraft, type Draft, type DraftTask, type FrozenContext } from "../src/swarm/task-translate.js";
 import { loadPlan } from "../src/swarm/task-plan.js";
 import { clarifyTargets, canonicalAnswerSet, mintPlanOperationId, projectAnswers, recompilePlan, answersFromClosedWaits, clarificationResolution, type ClarificationAnswer } from "../src/swarm/plan-recompile.js";
-import { openQueryWait, advanceWait } from "../src/swarm/task-wait.js";
+import { openQueryWait, advanceWait, applyDefaultOnTimeout } from "../src/swarm/task-wait.js";
 
 // T3b recompile loop + deterministic operationId (design 1d0a1ffc §1; coordinator points 3+4).
 
@@ -170,6 +170,14 @@ describe("R2 re-review fixes (d6cf85d round)", () => {
     const cancelled = advanceWait(open, { type: "close", resolution: { outcome: "cancelled", reason: "x", sourceOperationId: "o" } });
     if (cancelled.ok) expect(answersFromClosedWaits([{ questionId: "q", wait: cancelled.wait }]).ok).toBe(false);
   });
+  test("R2-③: a timeout default that WAS a clarification is recovered via the default (outcome=default-applied)", () => {
+    const w = openQueryWait({ waitId: "w", subject: { jobId: "j" }, deadlineSec: 100, owner: "c", defaultOnTimeout: clarificationResolution(false, "op-default"), payloadRef: "p" });
+    const timedOut = applyDefaultOnTimeout(w); // outcome becomes "default-applied"; defaultOnTimeout stays clarified:irreversible
+    expect(timedOut.ok).toBe(true);
+    if (!timedOut.ok) return;
+    const got = answersFromClosedWaits([{ questionId: "q", wait: timedOut.wait }]);
+    expect(got.ok && got.answers[0]!.reversible).toBe(false); // recovered from the (conservative irreversible) default
+  });
 });
 
 describe("canonicalAnswerSet", () => {
@@ -243,12 +251,23 @@ describe("reviewer counterexamples (bccf629 round)", () => {
     // reload WITHOUT the trusted evidence map => resolvedRisk ignored => A is policy critical∧unknown => rejected
     const noEvidence = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: f.ownerDomainPolicy, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs });
     expect(noEvidence.ok).toBe(false);
-    // reload WITH the trusted evidence (matching) => honored => loadable
+    // reload WITH the trusted evidence (matching value + specDigest) => honored => loadable
     const withEvidence = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: f.ownerDomainPolicy, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs, resolvedRisk: r.resolvedRisk });
     expect(withEvidence.ok).toBe(true);
-    // a MISMATCHED evidence value (claims reversible where the plan says reversible but we pass irreversible) is not honored as reversible
-    const wrong = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: f.ownerDomainPolicy, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs, resolvedRisk: { A: "irreversible" } });
-    expect(wrong.ok).toBe(false); // evidence must MATCH the node's field to be honored
+    // evidence whose specDigest does NOT match the node (② scope/identity tamper) is not honored => gate stands => rejected
+    const wrong = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: f.ownerDomainPolicy, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs, resolvedRisk: { A: { risk: "reversible", specDigest: "0".repeat(64) } } });
+    expect(wrong.ok).toBe(false);
+  });
+  test("R2-②: tampering a resolved node's scope changes its specDigest => evidence no longer matches => gate stands", () => {
+    const f = riskFc();
+    const d = draft([task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts"], criticalPath: true })]);
+    const r = recompilePlan({ draft: d, fc: f, answers: answersFor(d, f, () => true), snapshotDigest: "s" });
+    if (r.outcome !== "loadable") throw new Error("setup");
+    const refs = r.plan.frozenRefs!;
+    // tamper: change A's write scope (new identity) while keeping the OLD evidence (bound to the original specDigest)
+    const tampered = { ...r.plan, nodes: r.plan.nodes.map((n) => (n.nodeId === "A" ? { ...n, sourceWriteScope: ["src/exp/EVIL.ts"], specDigest: "" } : n)) };
+    const loaded = loadPlan(tampered as typeof r.plan, { mode: "managed-t3", ownerDomainPolicy: f.ownerDomainPolicy, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs, resolvedRisk: r.resolvedRisk });
+    expect(loaded.ok).toBe(false); // the tampered node's recomputed specDigest != evidence => not honored => critical∧unknown => rejected
   });
   test("P1-3 at the recompile boundary: a conflicting answer set -> rejected", () => {
     const d = ab(), f = riskFc();

@@ -13,7 +13,7 @@
  */
 
 import { loadBundle, loadFrozenContext, storeBundle, storeFrozenContext, prdDigestOf, frozenRefsOf, type ResumeBundle } from "./plan-bundle.js";
-import { recompilePlan, answersFromClosedWaits, type ClarificationAnswer, type RecompileResult } from "./plan-recompile.js";
+import { recompilePlan, answersFromClosedWaits, questionWaitRef, type ClarificationAnswer, type RecompileResult } from "./plan-recompile.js";
 import { digestOf } from "./digest.js";
 import type { Draft, FrozenContext } from "./task-translate.js";
 import type { WaitRecord } from "./control-log.js";
@@ -62,8 +62,13 @@ export function resumeClarification(i: ResumeInput, dirs: ResumeDirs = {}): Resu
  *  winner is the close FACT (advanceWait first-close-wins), never a caller casSeq. */
 export type ClosedWaitEntry = { questionId: string; wait: WaitRecord };
 export function resumeFromClosedWaits(i: { payloadRef: string; closedWaits: ClosedWaitEntry[]; actionKind?: string }, dirs: ResumeDirs = {}): ResumeResult {
+  // Per-QUESTION binding (reviewer ①): each wait must carry the durable questionWaitRef(payloadRef, questionId) — so ONE
+  // closed wait cannot be re-pasted onto another question. The bundle-level payloadRef alone is not enough.
+  const seen = new Set<string>();
   for (const { questionId, wait } of i.closedWaits) {
-    if (wait.payloadRef !== i.payloadRef) return { outcome: "rejected", reason: `wait for ${questionId} is not bound to this payloadRef (got ${String(wait.payloadRef)}) — answer for a different snapshot/request` };
+    if (seen.has(questionId)) return { outcome: "rejected", reason: `duplicate closed-wait entry for ${questionId}` };
+    seen.add(questionId);
+    if (wait.payloadRef !== questionWaitRef(i.payloadRef, questionId)) return { outcome: "rejected", reason: `wait for ${questionId} is not bound to this question of this snapshot (payloadRef mismatch) — re-pasted or cross-snapshot answer` };
   }
   const derived = answersFromClosedWaits(i.closedWaits);
   if (!derived.ok) return { outcome: "rejected", reason: derived.reason };
