@@ -10,6 +10,8 @@ import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox } from "./inbox.js";
+import { fallbackForUnresolved, fallbackForMissedDelivery } from "./send-fallback.js";
+import { resolveSession, listSessions } from "./swarm/task-liveness.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 
@@ -25,7 +27,10 @@ export type BusMessage = { from: string; fromLabel: string; text: string; via: "
 export type BusCore = {
   self: SelfInfo;
   peers(): UnifiedPeer[];
-  send(to: string, text: string): Promise<{ ok: boolean; label?: string; error?: string }>;
+  /** `delivered` reports the channel actually used: "local"/"relay" = live push confirmed; "durable-fallback" = live
+   *  delivery was unavailable so the message was queued to the recipient's durable inbox (bus-reachability §1, same-machine).
+   *  `ok:true` with delivered:"durable-fallback" means stored-not-pushed; absent on a failure. */
+  send(to: string, text: string): Promise<{ ok: boolean; label?: string; error?: string; delivered?: "local" | "relay" | "durable-fallback" }>;
   recv(timeoutMs: number): Promise<BusMessage[]>;
   /** Record this Codex thread id (from x-codex-turn-metadata) so inbound can be pushed to it. */
   noteThread(id: string): void;
@@ -300,16 +305,31 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       void flushInbox(); // a Codex session just took a turn -> its rollout now exists -> flush anything pending to it
     },
     async send(to, text) {
+      // bus-reachability §1: when live delivery is unavailable, QUEUE to a same-machine recipient's durable inbox instead
+      // of dropping the send. The caller always makes ONE call; code (not the caller's judgment) picks fast vs durable and
+      // the return reports which (delivered:"durable-fallback"). Cross-machine (relay) targets have no local durable inbox,
+      // so a missed relay delivery is an honest failure, never a false "queued".
+      const toDurable = (sid: string): { ok: true; label?: string; delivered: "durable-fallback" } => {
+        writeInbox(home, sid, { from: self.stableId ?? self.id, fromLabel: self.title, ...(self.mode ? { fromMode: self.mode } : {}), text, via: "local", ts: Date.now() });
+        return { ok: true, label: labelFor(sid), delivered: "durable-fallback" };
+      };
       const peer = resolve(to);
-      if ("error" in peer) return { ok: false, error: peer.error };
-      // Log an "out" entry only on confirmed delivery. Gated so Buffer.byteLength + the call are skipped when
+      if ("error" in peer) {
+        // Not on the live roster. If a same-machine session owns this handle (a presence/<sid>.pid match), queue durably.
+        const plan = fallbackForUnresolved(resolveSession(to, listSessions(home)), peer.error);
+        return plan.kind === "durable" ? toDurable(plan.sid) : { ok: false, error: plan.reason };
+      }
+      // Log an "out" entry only on confirmed LIVE delivery. Gated so Buffer.byteLength + the call are skipped when
       // AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
       const logOut = (via: "local" | "relay"): void => {
         if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via, direction: "out", size: Buffer.byteLength(text), text });
       };
-      if (peer.via === "local") { const ok = local.send(peer.id, text); if (ok) logOut("local"); return { ok, label: labelFor(peer.id) }; }
-      if (relay && peer.pub) { const ok = await relay.send(peer.pub, text); if (ok) logOut("relay"); return { ok, label: labelFor(peer.id) }; }
-      return { ok: false, error: "That peer is on another machine but no team relay is configured here (set AGENTHOP_TEAM)." };
+      if (peer.via === "local") { const ok = local.send(peer.id, text); if (ok) { logOut("local"); return { ok, label: labelFor(peer.id), delivered: "local" }; } }
+      else if (relay && peer.pub) { const ok = await relay.send(peer.pub, text); if (ok) { logOut("relay"); return { ok, label: labelFor(peer.id), delivered: "relay" }; } }
+      else return { ok: false, error: "That peer is on another machine but no team relay is configured here (set AGENTHOP_TEAM)." };
+      // Resolved, but live delivery MISSED -> durable fallback (same-machine) or an honest failure (cross-machine relay).
+      const plan = fallbackForMissedDelivery(peer);
+      return plan.kind === "durable" ? toDurable(plan.sid) : { ok: false, error: plan.reason };
     },
     async recv(timeoutMs) {
       // Explicit pull: drain the DURABLE inbox (messages the push channel could not surface). Claim+ack so the retry

@@ -87,7 +87,9 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       noteCodex(core, extra);
       if (!text.trim()) return failure("Nothing to send.");
       const result = await core.send(to, text);
-      if (result.ok) return reply(`Sent to ${result.label}.`);
+      if (result.ok) return reply(result.delivered === "durable-fallback"
+        ? `Queued to ${result.label}'s durable inbox — it is not reachable live right now, so it will arrive when it next reconnects or calls agenthop_recv.`
+        : `Sent to ${result.label}.`);
       return failure(`${result.error ?? "Not sent."}\n${roster(core.peers(), core.self.id, core.status())}`);
     },
   );
@@ -109,7 +111,9 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       if (!summary.trim()) return failure("Nothing to hand off (empty summary).");
       const text = formatHandoff(core.self.title, { summary, next }, core.self.cwd);
       const result = await core.send(to, text);
-      if (result.ok) return reply(`Handed off to ${result.label}.`);
+      if (result.ok) return reply(result.delivered === "durable-fallback"
+        ? `Handed off to ${result.label} via its durable inbox — it is not reachable live right now, so it will arrive when it next reconnects or calls agenthop_recv.`
+        : `Handed off to ${result.label}.`);
       return failure(`${result.error ?? "Not sent."}\n${roster(core.peers(), core.self.id, core.status())}`);
     },
   );
