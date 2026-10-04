@@ -9,7 +9,7 @@
  * Concurrency: a drainer CLAIMS a message by atomically renaming its file, delivers, then ACKs (removes) on success or
  * RELEASES (renames back) on failure — so the retry timer and an explicit recv never deliver the same message twice.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 
@@ -44,21 +44,28 @@ export function validInboxMsg(raw: unknown): InboxMsg | null {
 /** Move a POISON inbox file out of the delivery path (into inbox/<sid>/quarantine/) so it can never be re-claimed and re-crash
  *  the server (F28 poison-pill perpetual motion), + append a dead-letter line to the F26 ledger for audit/routing-incident input.
  *  NEVER throws — quarantine is pure damage-control and must not itself take down the flush. */
-export function quarantineInbox(home: string, claimedFile: string, reason: string, raw?: string): void {
+export type QuarantineResult = "quarantined" | "vanished" | "failed";
+export function quarantineInbox(home: string, claimedFile: string, reason: string, raw?: string): QuarantineResult {
   const dir = path.dirname(claimedFile);
   const qdir = path.join(dir, "quarantine");
   const base = path.basename(claimedFile).replace(/\.claim-[^.]+$/, "");
   // UNIQUE, unguessable target: Date.now() alone collides for two poison files stripping to the same base in the same ms, and
   // rename() overwrites — destroying the first file's evidence (review 6da8b5c-P2-3). A random suffix makes each quarantine
   // name distinct, so no move clobbers another's bytes (no exists-then-rename TOCTOU either).
-  const target = path.join(qdir, `${base}.${Date.now()}.${randomBytes(6).toString("hex")}`);
-  try { mkdirSync(qdir, { recursive: true, mode: 0o700 }); renameSync(claimedFile, target); }
-  catch {
+  try {
+    mkdirSync(qdir, { recursive: true, mode: 0o700 });
+    for (let attempt = 0; ; attempt++) {
+      const target = path.join(qdir, `${base}.${Date.now()}.${randomBytes(8).toString("hex")}`);
+      try { linkSync(claimedFile, target); break; } // atomic NO-OVERWRITE (P2-3): EEXIST if the name exists -> retry a fresh one
+      catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && attempt < 8) continue; throw e; }
+    }
+    unlinkSync(claimedFile); // the link holds the bytes in quarantine/ now; remove the source
+  } catch (e) {
     // The move did NOT happen: either the file already vanished (a concurrent drainer took it — ENOENT) or the FS failed
     // (mkdir/rename error). In BOTH cases do NOT write a "quarantined" dead-letter — that would be a false audit for a file
     // still in the delivery path (review 6da8b5c-P2-2). The file (if still present) stays .claim-<pid>, safely OUT of the
     // deliverable .json set; recoverStaleClaims + the next claim re-attempt the quarantine. Never throw (don't kill flush).
-    return;
+    return (e as NodeJS.ErrnoException).code === "ENOENT" ? "vanished" : "failed"; // vanished=raced gone; failed=FS err ⇒ caller releases to retry (P2-2)
   }
   // The file is REALLY quarantined now ⇒ record the dead-letter audit line. Best-effort: if the append fails the bytes are
   // still safely preserved in quarantine/ (the durable evidence), so a lost audit line never risks re-delivery or a crash.
@@ -71,6 +78,7 @@ export function quarantineInbox(home: string, claimedFile: string, reason: strin
     mkdirSync(path.dirname(ledger), { recursive: true });
     appendFileSync(ledger, `${line}\n`, { mode: 0o644 });
   } catch { /* audit best-effort; the bytes are already quarantined */ }
+  return "quarantined";
 }
 
 function sanitize(key: string): string {
@@ -111,7 +119,9 @@ export function claimInbox(home: string, keys: string[], claimer: string): Claim
       // QUARANTINED out of the delivery path (never deref'd, never crashes the server, never re-claimed) — not returned.
       let msg: InboxMsg | null;
       try { msg = validInboxMsg(JSON.parse(raw)); } catch { msg = null; }
-      if (msg === null) { quarantineInbox(home, claimed, "schema/parse", raw); continue; }
+      // poison ⇒ quarantine. A "failed" quarantine (FS error) RELEASES the claim so a later flush retries (recoverStaleClaims
+      // won't free this still-LIVE pid) — the move stays a recoverable to-do, never a silently-stuck live-pid claim (P2-2).
+      if (msg === null) { if (quarantineInbox(home, claimed, "schema/parse", raw) === "failed") releaseInbox(claimed); continue; }
       out.push({ file: claimed, msg });
     }
   }

@@ -120,28 +120,37 @@ describe("F28 poison-pill defense", () => {
   test("P2-3: two same-base poison files get DISTINCT quarantine names — neither rename overwrites the other's evidence", () => {
     const d = inboxDirOf("s1"); mkdirSync(d, { recursive: true });
     for (const pid of ["101", "202"]) writeFileSync(path.join(d, `same.json.claim-${pid}`), JSON.stringify({ bad: pid }));
-    quarantineInbox(HOME, path.join(d, "same.json.claim-101"), "schema/parse", JSON.stringify({ from: "A", text: "x" }));
-    quarantineInbox(HOME, path.join(d, "same.json.claim-202"), "schema/parse", JSON.stringify({ from: "B", text: "y" }));
-    expect(readdirSync(path.join(d, "quarantine")).length).toBe(2);                 // both preserved (unique names)
+    expect(quarantineInbox(HOME, path.join(d, "same.json.claim-101"), "schema/parse", JSON.stringify({ from: "A", text: "x" }))).toBe("quarantined");
+    expect(quarantineInbox(HOME, path.join(d, "same.json.claim-202"), "schema/parse", JSON.stringify({ from: "B", text: "y" }))).toBe("quarantined");
+    expect(readdirSync(path.join(d, "quarantine")).length).toBe(2);                 // both preserved — atomic link never overwrote the other
     expect(readFileSync(ledger(), "utf8").trim().split("\n").length).toBe(2);        // one audit line each
   });
 
-  test("P2-2: quarantining a VANISHED source writes NO dead-letter (no false audit) and never throws", () => {
+  test("P2-2: quarantining a VANISHED source ⇒ 'vanished', writes NO dead-letter, never throws", () => {
     mkdirSync(inboxDirOf("s1"), { recursive: true });
-    quarantineInbox(HOME, path.join(inboxDirOf("s1"), "gone.json.claim-1"), "schema/parse"); // file does not exist
+    expect(quarantineInbox(HOME, path.join(inboxDirOf("s1"), "gone.json.claim-1"), "schema/parse")).toBe("vanished"); // file does not exist
     expect(existsSync(ledger())).toBe(false);                                        // no "quarantined" line for a file never moved
   });
 
-  test("P2-2: a rename FAILURE leaves the file in place and writes NO dead-letter (no false quarantine claim)", () => {
+  test("P2-2: a move FAILURE ⇒ 'failed', leaves the file in place, writes NO dead-letter (no false quarantine claim)", () => {
     const d = inboxDirOf("s1"); mkdirSync(d, { recursive: true });
     const f = path.join(d, "poison.json.claim-1");
     writeFileSync(f, JSON.stringify({ bad: 1 }));
-    chmodSync(d, 0o500); // read-only dir ⇒ the mkdir(quarantine)/rename out fails
-    let threw = false;
-    try { quarantineInbox(HOME, f, "schema/parse", JSON.stringify({ from: "A", text: "x" })); } catch { threw = true; } finally { chmodSync(d, 0o700); }
+    chmodSync(d, 0o500); // read-only dir ⇒ mkdir(quarantine)/link fails
+    let threw = false; let res: string | undefined;
+    try { res = quarantineInbox(HOME, f, "schema/parse", JSON.stringify({ from: "A", text: "x" })); } catch { threw = true; } finally { chmodSync(d, 0o700); }
     expect(threw).toBe(false);                 // never throws (a throw would kill the flush → crash the server)
-    if (!existsSync(f)) return;                // running as root ignores the mode — can't exercise the failure here
+    if (res !== "failed") return;              // running as root ignores the mode — can't exercise the failure here
     expect(existsSync(f)).toBe(true);          // bytes preserved in place for a later retry
     expect(existsSync(ledger())).toBe(false);  // and NO false "quarantined" audit line
+  });
+
+  test("P2-2: claimInbox RELEASES a poison whose quarantine FAILED — not a stuck live-pid claim (recoverable)", () => {
+    writeRaw("s1", "0000000000001000-dddddd.json", JSON.stringify({ text: "no-from", via: "local", ts: 1000 })); // poison (missing from)
+    writeFileSync(path.join(inboxDirOf("s1"), "quarantine"), "blocker"); // a FILE at quarantine/ ⇒ mkdir(quarantine) fails ⇒ quarantine "failed"
+    expect(claimInbox(HOME, ["s1"], "p").length).toBe(0); // claim succeeds, quarantine fails ⇒ released; no throw, no delivery
+    const names = readdirSync(inboxDirOf("s1"));
+    expect(names).toContain("0000000000001000-dddddd.json");         // RELEASED back to .json for a later retry
+    expect(names.some((n) => n.includes(".claim-"))).toBe(false);    // NOT left stuck as .claim-<live-pid>
   });
 });
