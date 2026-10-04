@@ -252,6 +252,40 @@ describe("R4-P2-1 missing-role registration: non-empty scope + no matching role 
   });
 });
 
+describe("R5-P2-1 partial-match: one matched path must not mask another unmatched path", () => {
+  const pfc = fc({
+    ownerDomainPolicy: { version: "o", ownerByPrefix: [{ prefix: "src/", domain: "core" }, { prefix: "scripts/", domain: "io" }], frozenScopePrefixes: [] },
+    riskPolicy: { version: "r", irreversiblePrefixes: [], undecidablePrefixes: [] },
+    roleCatalog: { version: "rc", roles: { partial: { floor: "light", fileDomain: ["src/covered/"] } } },
+  });
+  test("PARTIAL-MATCH-SAME-OWNER -> needsRole", () => {
+    expect(translateDraft(draft([task({ sourceWriteScope: ["src/covered/a.ts", "src/unmatched/b.ts"] })]), pfc).outcome).toBe("needsRole");
+  });
+  test("PARTIAL-MATCH-TWO-OWNERS -> needsRole", () => {
+    expect(translateDraft(draft([task({ sourceWriteScope: ["src/covered/a.ts", "scripts/b.ts"] })]), pfc).outcome).toBe("needsRole");
+  });
+  test("PARTIAL-MATCH-UNKNOWN-OWNER -> needsRole (a design gate can't fill the missing role)", () => {
+    expect(translateDraft(draft([task({ sourceWriteScope: ["src/covered/a.ts", "unmapped/b.ts"] })]), pfc).outcome).toBe("needsRole");
+  });
+  test("PARTIAL-MATCH-REVERSED -> needsRole (order-independent)", () => {
+    expect(translateDraft(draft([task({ sourceWriteScope: ["scripts/b.ts", "src/covered/a.ts"] })]), pfc).outcome).toBe("needsRole");
+  });
+  test("CTRL-UNMATCHED-PATH-ALONE -> needsRole", () => {
+    expect(translateDraft(draft([task({ sourceWriteScope: ["scripts/b.ts"] })]), pfc).outcome).toBe("needsRole");
+  });
+  test("CTRL-ALL-COVERED -> loadable with the inferred role", () => {
+    const r = translateDraft(draft([task({ sourceWriteScope: ["src/covered/a.ts", "src/covered/c.ts"] })]), pfc);
+    expect(r.outcome === "loadable" && r.plan.nodes[0]!.roleProfile === "partial").toBe(true);
+  });
+  test("CTRL-MULTIPLE-ROLES: paths match different roles -> needsRole", () => {
+    const two = fc({
+      ownerDomainPolicy: { version: "o", ownerByPrefix: [{ prefix: "a/", domain: "da" }, { prefix: "b/", domain: "db" }], frozenScopePrefixes: [] },
+      roleCatalog: { version: "rc", roles: { ra: { floor: "light", fileDomain: ["a/"] }, rb: { floor: "light", fileDomain: ["b/"] } } },
+    });
+    expect(translateDraft(draft([task({ sourceWriteScope: ["a/x.ts", "b/y.ts"] })]), two).outcome).toBe("needsRole");
+  });
+});
+
 describe("loadPlan managed-t3 (loader ruling f06894b8): policy-driven R4 enforcement, catches structural bypasses", () => {
   const f = fc();
   const refs: FrozenRefs = { checkRegistry: "cr1", ownerDomainPolicy: "op1", riskPolicy: "rp1", roleCatalog: "rc1", budgetPolicy: "bp1", r4ThresholdPolicy: "tp1", sourceBaselineDigest: "base-abc" };

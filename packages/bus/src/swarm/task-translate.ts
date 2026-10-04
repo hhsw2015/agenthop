@@ -205,11 +205,11 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
       if (!has(fc.roleCatalog.roles, t.roleProfile)) missingRoles.push(`${t.roleProfile} (hallucinated, node ${t.nodeId})`);
       else { resolvedRole = t.roleProfile; roleFloor = fc.roleCatalog.roles[t.roleProfile]!.floor ?? "light"; }
     } else {
-      // INFER: a role owns a path if the path is UNDER its fileDomain; the LONGEST fileDomain wins. A tie at the longest
-      // length (3a), multiple distinct roles across paths, or a broad scope spanning into role subdomains (3b) = ambiguous
-      // -> unresolved (deterministic — never pick-first by key order). A unique owning role -> infer + floor.
+      // INFER: a role owns a path if the path is UNDER its fileDomain; the LONGEST fileDomain wins. EVERY non-empty-scope
+      // path must uniquely match, and all to the SAME role (R5-P2-1: a matched path must not mask an unmatched one).
+      // Any unmatched/tie path, paths disagreeing on the role, or a broad span -> needsRole (deterministic, no pick-first).
       const roleIds = Object.keys(fc.roleCatalog.roles);
-      const resolveOne = (p: string): { rid?: string; ambiguous: boolean } => {
+      const roleForPath = (p: string): string | undefined => { // longest-fileDomain owning role; undefined if no match OR equal-length tie
         let bestLen = -1;
         const atBest = new Set<string>();
         for (const rid of roleIds) for (const fd of fc.roleCatalog.roles[rid]!.fileDomain ?? []) {
@@ -218,16 +218,20 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
             else if (fd.length === bestLen) atBest.add(rid);
           }
         }
-        if (atBest.size === 0) return { ambiguous: false };
-        if (atBest.size > 1) return { ambiguous: true }; // equal-length tie -> ambiguous, not pick-first
-        return { rid: [...atBest][0], ambiguous: false };
+        return atBest.size === 1 ? [...atBest][0] : undefined;
       };
       const spansIntoRole = (p: string): boolean => roleIds.some((rid) => (fc.roleCatalog.roles[rid]!.fileDomain ?? []).some((fd) => fd.startsWith(p) && fd !== p));
-      const roleSet = new Set<string>();
-      let ambiguous = false;
-      for (const p of scope) { const r = resolveOne(p); if (r.ambiguous) ambiguous = true; else if (r.rid) roleSet.add(r.rid); if (spansIntoRole(p)) ambiguous = true; }
-      if (!ambiguous && roleSet.size === 1) { resolvedRole = [...roleSet][0]!; roleFloor = fc.roleCatalog.roles[resolvedRole]!.floor ?? "light"; }
-      else if (scope.length > 0) unresolvedInferredRoleNodes.push(t.nodeId); // R4-P2-1: ANY non-empty scope without a unique role -> needsRole (ambiguous tie/span, multiple roles, OR zero matches at any owner-domain count). owner count must not make a missing role vanish. Empty scope needs no role.
+      let inferredRole: string | undefined;
+      let unresolved = false;
+      for (const p of scope) {
+        const rid = roleForPath(p);
+        if (rid === undefined) unresolved = true; // no match OR equal-length tie on this path
+        else if (inferredRole === undefined) inferredRole = rid;
+        else if (inferredRole !== rid) unresolved = true; // paths disagree on the role
+        if (spansIntoRole(p)) unresolved = true;
+      }
+      if (!unresolved && inferredRole !== undefined) { resolvedRole = inferredRole; roleFloor = fc.roleCatalog.roles[inferredRole]!.floor ?? "light"; }
+      else if (scope.length > 0) unresolvedInferredRoleNodes.push(t.nodeId); // non-empty scope without one unanimous role -> needsRole; empty scope needs no role
     }
 
     const effectiveComplexity = Math.max(t.complexity, (t.independentScore as number | undefined) ?? t.complexity); // SCORE-DISAGREES
