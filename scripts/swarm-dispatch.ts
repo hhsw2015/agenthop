@@ -464,8 +464,10 @@ function buildSweepOps(stateRef: { s: LogState }): SweepOps {
     pickReassignee: () => null,
     // v1: no validator-roster picker yet (needs bus-identity) ⇒ a stuck/dead RPV validator is left for escalation.
     pickValidator: () => null,
-    newWaitId: (base) => `${base}/r-${randomBytes(3).toString("hex")}`,
-    newValidationRunId: (base) => `${base}/g-${randomBytes(3).toString("hex")}`,
+    // Safe single-segment ids (no "/") so the projection's waits/<waitId>.json never drops a legit reassigned/moved wait
+    // (review P2b) — a "/" would be rejected by the path-safety whitelist. Dash separators keep them flat + collision-free.
+    newWaitId: (base) => `${base}-r-${randomBytes(3).toString("hex")}`,
+    newValidationRunId: (base) => `${base}-g-${randomBytes(3).toString("hex")}`,
     newActionId: () => `swp-${randomBytes(4).toString("hex")}`,
     freshDeadlineSec: () => nowSec() + 1800,
     // R5 channel: deliver the ping/escalation/reassign-notice to the owner's durable inbox (filesystem — part of bus

@@ -19,7 +19,7 @@
  * CONTROL (not merely a SWARM_PLAN file).
  */
 
-import { mkdirSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readdirSync, lstatSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { liveEntities, type LogState, type WaitRecord, type ResultObserved } from "./control-log.js";
 import type { TaskPlan } from "./task-plan.js";
@@ -179,36 +179,62 @@ export function buildProjectionFiles(state: LogState, opts: ProjectOpts): Projec
   return out;
 }
 
-/** All .json files currently under `dir` (recursive), as dir-relative POSIX paths — for prune (P2-2). */
+/** All .json files currently under `dir` (recursive), as dir-relative POSIX paths — for prune (P2-2). Uses lstat and does
+ *  NOT follow symlinks (review P1: a directory symlink must never let prune recurse/delete OUTSIDE the root). A vanished
+ *  entry/dir (ENOENT, raced) is skipped; any OTHER enumeration error PROPAGATES (review P2a — a readdir/lstat failure must
+ *  not be read as "no managed files" and let the writer certify a complete meta). */
 function existingJsonFiles(dir: string, rel = ""): string[] {
   let entries: string[];
-  try { entries = readdirSync(path.join(dir, rel)); } catch { return []; }
+  try { entries = readdirSync(path.join(dir, rel)); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
   const out: string[] = [];
   for (const name of entries) {
     const r = rel ? `${rel}/${name}` : name;
-    let isDir = false;
-    try { isDir = statSync(path.join(dir, r)).isDirectory(); } catch { continue; }
-    if (isDir) out.push(...existingJsonFiles(dir, r));
-    else if (name.endsWith(".json")) out.push(r);
+    let st;
+    try { st = lstatSync(path.join(dir, r)); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; throw e; }
+    if (st.isSymbolicLink()) continue;                 // never follow a link (P1)
+    if (st.isDirectory()) out.push(...existingJsonFiles(dir, r));
+    else if (st.isFile() && name.endsWith(".json")) out.push(r);
   }
   return out;
 }
 
+/** True iff every EXISTING ancestor of `abs` up to `root` is a real directory (not a symlink) — so a mkdir/write cannot
+ *  escape through a planted directory symlink (review P1). A not-yet-created ancestor (ENOENT) is fine (mkdir makes a real
+ *  dir); a symlink or any other lstat error is unsafe. */
+function ancestorsSafe(root: string, abs: string): boolean {
+  let cur = path.dirname(abs);
+  while (cur !== root && cur.startsWith(root + path.sep)) {
+    try { if (lstatSync(cur).isSymbolicLink()) return false; }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return false; } // ENOENT = will be mkdir'd (safe)
+    cur = path.dirname(cur);
+  }
+  return cur === root;
+}
+
 /** Write every projection file atomically (temp+rename, C-3), meta.json LAST (its lastAppliedSeq is the consistency
- *  marker). PRUNES stale files absent from the new snapshot (P2-2 — a rebuild to an older/smaller snapshot must not leave a
- *  stale SUCCEEDED attempt behind). REFUSES any path resolving outside the root (P1-1 belt-and-suspenders). */
+ *  marker — only advanced once the data files are on disk). PRUNES stale files absent from the new snapshot (P2-2). Any
+ *  real error (symlink ancestor, prune/write failure other than a benign ENOENT) THROWS before meta is written, so the
+ *  projection is left behind-but-retriable rather than certified complete over corrupt/escaped state (review P1/P2a); the
+ *  caller is fail-soft and the next tick retries. */
 export function writeProjection(dir: string, state: LogState, opts: ProjectOpts): void {
   const files = buildProjectionFiles(state, opts);
   const root = path.resolve(dir);
   const want = new Set(files.map((f) => f.relPath));
 
-  // Prune first: remove managed .json files no longer in the current snapshot (meta.json is always in `want`).
-  for (const rel of existingJsonFiles(root)) if (!want.has(rel)) { try { unlinkSync(path.join(root, rel)); } catch { /* raced */ } }
+  // Prune first (meta.json is always in `want`). ENOENT on unlink = already gone (OK); any other error propagates (P2a).
+  for (const rel of existingJsonFiles(root)) {
+    if (want.has(rel)) continue;
+    try { unlinkSync(path.join(root, rel)); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+  }
 
   const ordered = [...files.filter((f) => f.relPath !== "meta.json"), ...files.filter((f) => f.relPath === "meta.json")];
   for (const f of ordered) {
     const abs = path.resolve(root, f.relPath);
-    if (abs !== root && !abs.startsWith(root + path.sep)) continue; // refuse an escaping path (P1-1 defense; should never happen post-validation)
+    if (abs !== root && !abs.startsWith(root + path.sep)) throw new Error(`projection: refusing out-of-root path ${f.relPath}`); // lexical guard
+    if (!ancestorsSafe(root, abs)) throw new Error(`projection: refusing write through a symlinked ancestor of ${f.relPath}`); // P1: no symlink escape
     mkdirSync(path.dirname(abs), { recursive: true });
     const tmp = `${abs}.tmp.${process.pid}`;
     writeFileSync(tmp, JSON.stringify(f.json, null, 2), { mode: 0o644 });

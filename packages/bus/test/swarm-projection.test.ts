@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import { mkdtempSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, symlinkSync, chmodSync } from "node:fs";
 import { commit, entityKeyOf, initialLogState, type ChangeBody, type LogState, type WaitRecord } from "../src/swarm/control-log.js";
 import { loadPlan, type TaskPlan } from "../src/swarm/task-plan.js";
 import type { TaskAttempt } from "../src/swarm/task-state.js";
@@ -168,5 +168,47 @@ describe("projection review fixes", () => {
     const late = byPath(buildProjectionFiles(s, { nowSec: 550, jobStartSec: () => 400 }), "jobs/job-x/plan.json");  // wall 150 >= 100
     expect(early.jobStatus).toBe("running");
     expect(late.jobStatus).toBe("failed"); // now-dependent — only a per-tick refresh (not commit-only) keeps this current
+  });
+
+  test("re-review P1: prune does NOT follow a directory symlink out of root (no out-of-root delete)", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "psym-"));
+    const root = path.join(base, "projection");
+    const external = path.join(base, "external");
+    mkdirSync(external, { recursive: true });
+    writeFileSync(path.join(external, "42.json"), "AUTHORITATIVE");
+    mkdirSync(path.join(root, "jobs"), { recursive: true });
+    symlinkSync(external, path.join(root, "jobs", "external")); // planted directory symlink inside projection/jobs/
+    writeProjection(root, initialLogState(), { nowSec: 1000 });  // prune must NOT traverse the link
+    expect(readFileSync(path.join(external, "42.json"), "utf8")).toBe("AUTHORITATIVE"); // intact
+  });
+
+  test("re-review P1: writer REFUSES to write through a symlinked ancestor (throws, no out-of-root write)", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "pwsym-"));
+    const root = path.join(base, "projection");
+    const external = path.join(base, "external-job");
+    mkdirSync(external, { recursive: true });
+    mkdirSync(path.join(root, "jobs"), { recursive: true });
+    symlinkSync(external, path.join(root, "jobs", "safe-job")); // jobs/safe-job → outside the root
+    const p = planOf("safe-job", "build");
+    let s = initialLogState(); s = stamp(s, [planBody(p)]);
+    expect(() => writeProjection(root, s, { nowSec: 1000 })).toThrow(); // must refuse the symlinked ancestor
+    expect(existsSync(path.join(external, "plan.json"))).toBe(false);   // nothing escaped
+  });
+
+  test("re-review P2a: a prune unlink failure (EACCES) throws — meta is NOT certified over stale state", () => {
+    const p = planOf("job-x", "build");
+    let s3 = initialLogState();
+    s3 = stamp(s3, [planBody(p)]);
+    s3 = stamp(s3, [{ put: "attempt", attempt: attempt({ jobId: "job-x", nodeId: "build", attemptId: "job-x/build/a1", status: "SUCCEEDED", specDigest: p.nodes[0]!.specDigest }) }]);
+    const dir = mkdtempSync(path.join(tmpdir(), "peacc-"));
+    writeProjection(dir, s3, { nowSec: 1000 }); // attempts/build.json written; meta=s3.seq
+    const attemptsDir = path.join(dir, "jobs/job-x/attempts");
+    chmodSync(attemptsDir, 0o500); // read-only dir ⇒ unlink inside fails EACCES
+    let s1 = initialLogState(); s1 = stamp(s1, [planBody(p)]); // no attempt ⇒ prune would unlink build.json
+    let threw = false;
+    try { writeProjection(dir, s1, { nowSec: 1000 }); } catch { threw = true; } finally { chmodSync(attemptsDir, 0o700); }
+    if (!threw) return; // running as root ignores the mode — can't exercise EACCES here
+    expect(existsSync(path.join(attemptsDir, "build.json"))).toBe(true);                                // stale NOT removed
+    expect(JSON.parse(readFileSync(path.join(dir, "meta.json"), "utf8")).lastAppliedSeq).toBe(s3.seq);  // meta NOT advanced
   });
 });
