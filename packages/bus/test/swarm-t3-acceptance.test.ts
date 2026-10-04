@@ -1,10 +1,10 @@
 import { describe, expect, test } from "vitest";
-import { draftPlan, type CallModel } from "../src/swarm/plan-draft.js";
 import { translateDraft, type Draft, type DraftTask, type FrozenContext } from "../src/swarm/task-translate.js";
 import { loadPlan, type TaskPlan, type FrozenRefs } from "../src/swarm/task-plan.js";
+import { auditCoverage, reconcile, type ReqBaseline } from "../scripts/coverage-audit.js";
 
-// T3b acceptance B + F (design 1d0a1ffc §3), offline + deterministic. A1 (real-LLM live-fire) is the separate gated
-// script scripts/t3-draft-live.ts — its evidence rides with the review packet.
+// T3b acceptance B + F (design 1d0a1ffc §3), offline + deterministic. A1 (real-LLM live-fire) + the real F reconciliation
+// artifact are the separate gated script scripts/t3-draft-live.ts — its evidence rides with the review packet.
 
 function fc(over: Partial<FrozenContext> = {}): FrozenContext {
   return {
@@ -58,75 +58,52 @@ describe("acceptance B: R4 auto-triggers a design gate covering every impl node;
   });
 });
 
-// ---- Acceptance F: independent requirement-coverage audit. It reads ONLY the plan (there is no model "covers" field to
-// trust) and classifies each requirement; a silently dropped requirement must surface as uncovered. ----
+// ---- Acceptance F: independent requirement-coverage audit (shared helper scripts/coverage-audit.ts). It reads ONLY the
+// plan (no model "covers" field), requires STRUCTURED acceptance evidence for "implemented", and treats a marker in an
+// omission clause as NOT implemented. A dropped requirement (node removed, or obligation dropped while the marker stays)
+// surfaces as UNCOVERED. ----
 
-type Req = { id: string; marker: string; expect: "implemented" | "constrained-review" | "deferred" };
-type Disposition = "implemented" | "constrained-review" | "deferred" | "UNCOVERED";
-
-/** Independent audit: for each requirement, scan the plan's nodes for its marker and classify by WHERE it appears —
- *  not by any field the drafter claimed. A design/review node => constrained-review; a goal marked DEFER => deferred; a
- *  plain impl node => implemented; nowhere => UNCOVERED (a drop). Never consults a covers field (there is none). */
-function auditCoverage(plan: TaskPlan, reqs: Req[]): Record<string, Disposition> {
-  const out: Record<string, Disposition> = {};
-  for (const req of reqs) {
-    let deferred = false, review = false, impl = false;
-    for (const n of plan.nodes) {
-      const hay = [n.goal, JSON.stringify(n.acceptance)].join(" ");
-      if (!hay.includes(req.marker)) continue;
-      if (/\bDEFER\b/.test(n.goal)) deferred = true;
-      else if (n.kind === "design" || n.kind === "review") review = true;
-      else impl = true;
-    }
-    // precedence: an explicit deferral, else a review/design gate, else a plain impl node, else a drop
-    out[req.id] = deferred ? "deferred" : review ? "constrained-review" : impl ? "implemented" : "UNCOVERED";
-  }
-  return out;
-}
-
-describe("acceptance F: independent coverage audit (no model-covers trust; catches drops)", () => {
-  const reqs: Req[] = [
-    { id: "I1", marker: "[I1]", expect: "implemented" },
-    { id: "I2", marker: "[I2]", expect: "implemented" },
-    { id: "I3", marker: "[I3]", expect: "implemented" },
-    { id: "I4", marker: "[I4]", expect: "implemented" },
-    { id: "I5", marker: "[I5]", expect: "implemented" },
+describe("acceptance F: independent coverage audit (structured evidence, omission-aware, catches drops)", () => {
+  const reqs: ReqBaseline[] = [
+    { id: "I1", marker: "[I1]", requiredCheck: "testsPass", expect: "implemented" },
+    { id: "I2", marker: "[I2]", requiredCheck: "testsPass", expect: "implemented" },
+    { id: "I3", marker: "[I3]", requiredCheck: "testsPass", expect: "implemented" },
     { id: "I6", marker: "[I6]", expect: "constrained-review" },
     { id: "I7", marker: "[I7]", expect: "deferred" },
   ];
   const tasks: DraftTask[] = [
-    task({ nodeId: "t1", goal: "handle [I1]", sourceWriteScope: ["packages/bus/src/swarm/i1.ts"], roleProfile: "pure-layer-impl" }),
-    task({ nodeId: "t2", goal: "handle [I2]", sourceWriteScope: ["packages/bus/src/swarm/i2.ts"], roleProfile: "pure-layer-impl" }),
-    task({ nodeId: "t3", goal: "handle [I3]", sourceWriteScope: ["packages/bus/src/swarm/i3.ts"], roleProfile: "pure-layer-impl" }),
-    task({ nodeId: "t4", goal: "handle [I4]", sourceWriteScope: ["packages/bus/src/swarm/i4.ts"], roleProfile: "pure-layer-impl" }),
-    task({ nodeId: "t5", goal: "handle [I5]", sourceWriteScope: ["packages/bus/src/swarm/i5.ts"], roleProfile: "pure-layer-impl" }),
+    task({ nodeId: "t1", goal: "implement [I1] crash-safe storage", structuredChecks: [{ check: "testsPass" }], sourceWriteScope: ["packages/bus/src/swarm/i1.ts"], roleProfile: "pure-layer-impl" }),
+    task({ nodeId: "t2", goal: "implement [I2]", structuredChecks: [{ check: "testsPass" }], sourceWriteScope: ["packages/bus/src/swarm/i2.ts"], roleProfile: "pure-layer-impl" }),
+    task({ nodeId: "t3", goal: "implement [I3]", structuredChecks: [{ check: "testsPass" }], sourceWriteScope: ["packages/bus/src/swarm/i3.ts"], roleProfile: "pure-layer-impl" }),
     task({ nodeId: "t6", goal: "handle [I6] (needs expert judgement)", freeTextNotes: ["[I6] must be reviewed for correctness"], sourceWriteScope: ["packages/bus/src/swarm/i6.ts"], roleProfile: "pure-layer-impl" }),
-    task({ nodeId: "t7", goal: "DEFER [I7] to vNext (out of scope this milestone)", sourceWriteScope: ["packages/bus/src/swarm/i7.ts"], roleProfile: "pure-layer-impl" }),
+    task({ nodeId: "t7", goal: "DEFER [I7] to vNext (out of scope this milestone)", structuredChecks: [{ check: "testsPass" }], sourceWriteScope: ["packages/bus/src/swarm/i7.ts"], roleProfile: "pure-layer-impl" }),
   ];
 
-  test("every requirement is independently traceable and classified per the baseline", () => {
+  test("every requirement is independently classified per the hand-made baseline", () => {
     const r = translateDraft({ jobId: "jobF", tasks }, fc());
     expect(r.outcome).toBe("loadable");
     if (r.outcome !== "loadable") return;
-    const audit = auditCoverage(r.plan, reqs);
-    for (const req of reqs) expect(audit[req.id]).toBe(req.expect);
+    expect(reconcile(r.plan, reqs).pass).toBe(true);
   });
 
-  test("NEGATIVE: dropping a requirement's node makes the audit report it UNCOVERED (the audit is real)", () => {
+  test("NEGATIVE: a dropped node surfaces UNCOVERED", () => {
     const r = translateDraft({ jobId: "jobF2", tasks: tasks.filter((t) => t.nodeId !== "t3") }, fc());
     if (r.outcome !== "loadable") throw new Error("setup");
     expect(auditCoverage(r.plan, reqs)["I3"]).toBe("UNCOVERED");
   });
 
-  test("end-to-end through draftPlan (fake model) -> translateDraft -> audit", async () => {
-    const model: CallModel = async () => JSON.stringify({ jobId: "echo", tasks });
-    const dr = await draftPlan({ prd: "deliver I1..I7", jobId: "jobF3", allowedChecks: ["testsPass", "fileExists"] }, { callModel: model });
-    expect(dr.ok).toBe(true);
-    if (!dr.ok) return;
-    const r = translateDraft(dr.draft, fc({ planningRequestId: dr.planningRequestId }));
-    expect(r.outcome).toBe("loadable");
-    if (r.outcome !== "loadable") return;
-    const audit = auditCoverage(r.plan, reqs);
-    expect(Object.values(audit).every((d) => d !== "UNCOVERED")).toBe(true);
+  test("NEGATIVE: marker kept but obligation (required check) dropped => NOT implemented (UNCOVERED)", () => {
+    // t3 keeps [I3] in its goal but its only acceptance is an unrelated check — the obligation is gone.
+    const dropped = tasks.map((t) => (t.nodeId === "t3" ? { ...t, goal: "mention [I3] only", structuredChecks: [{ check: "fileExists", args: { path: "x" } }] } : t));
+    const r = translateDraft({ jobId: "jobF3", tasks: dropped }, fc());
+    if (r.outcome !== "loadable") throw new Error("setup");
+    expect(auditCoverage(r.plan, reqs)["I3"]).toBe("UNCOVERED");
+  });
+
+  test("NEGATIVE: a marker inside an explicit-omission clause is NOT counted implemented", () => {
+    const omit = tasks.map((t) => (t.nodeId === "t1" ? { ...t, goal: "Do NOT implement crash-safe storage [I1]; only print a greeting" } : t));
+    const r = translateDraft({ jobId: "jobF4", tasks: omit }, fc());
+    if (r.outcome !== "loadable") throw new Error("setup");
+    expect(auditCoverage(r.plan, reqs)["I1"]).not.toBe("implemented"); // the reviewer's MARKER-WITH-EXPLICIT-OMISSION
   });
 });

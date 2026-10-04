@@ -9,9 +9,13 @@
  * Offline/no-CPA: it prints a clear "CPA unreachable" line and exits non-zero, so it can't masquerade as a pass.
  */
 
+import { writeFileSync, mkdirSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { draftPlan, type CallModel } from "../src/swarm/plan-draft.js";
 import { translateDraft, type FrozenContext } from "../src/swarm/task-translate.js";
 import { loadPlan, type FrozenRefs } from "../src/swarm/task-plan.js";
+import { reconcile, type ReqBaseline } from "./coverage-audit.js";
 
 const BASE = process.env.CPA_BASE_URL ?? "http://127.0.0.1:10808/v1";
 const MODEL = process.env.CPA_MODEL ?? "gpt-4o";
@@ -55,10 +59,33 @@ const fc: FrozenContext = {
   sourceBaselineDigest: "live-base",
 };
 
-const PRD = `Add a pure helper module to the swarm brain that computes a stable "plan summary" string for a TaskPlan
-(node count, total complexity, whether a design gate is present). It must be deterministic and have unit tests.
-Put the module under packages/bus/src/swarm/ and its tests under packages/bus/test/. Acceptance: tests pass and
-typecheck passes.`;
+// A multi-requirement PRD so there is a real plan to reconcile. Each requirement is tagged [Ik]; the model is asked to
+// tag the task(s) that address each. The F audit is INDEPENDENT of any model "covers" claim (there is none) — it checks
+// structured acceptance evidence + omission, against the hand-made baseline below.
+const PRD = `Build a pure "plan metrics" module for the swarm brain. Requirements (tag each task's goal with the IDs it addresses):
+[I1] a function nodeCount(plan) returning the number of nodes — verified by tests.
+[I2] a function totalComplexity(plan) summing node complexity — verified by tests.
+[I3] a function hasDesignGate(plan) returning whether a design node exists — verified by tests.
+[I4] a function summary(plan) returning a stable one-line string — verified by tests.
+[I5] the module must typecheck.
+Put the module under packages/bus/src/swarm/ and tests under packages/bus/test/. Use the allowed checks for acceptance.
+Each task's requiredOutputs kind MUST be "files" or "report" (NOT "patch"). Keep tasks independent (no dependsOn) where possible.`;
+
+const F_BASELINE: ReqBaseline[] = [
+  { id: "I1", marker: "[I1]", requiredCheck: "testsPass", expect: "implemented" },
+  { id: "I2", marker: "[I2]", requiredCheck: "testsPass", expect: "implemented" },
+  { id: "I3", marker: "[I3]", requiredCheck: "testsPass", expect: "implemented" },
+  { id: "I4", marker: "[I4]", requiredCheck: "testsPass", expect: "implemented" },
+  { id: "I5", marker: "[I5]", requiredCheck: "typecheckPasses", expect: "implemented" },
+];
+
+function dump(name: string, data: unknown): void {
+  const dir = process.env.A1_EVIDENCE_DIR ?? path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "docs", "swarm", "t3b-a1-evidence");
+  mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, name);
+  writeFileSync(file, JSON.stringify(data, null, 2));
+  console.log(`[A1] wrote evidence ${file}`);
+}
 
 async function main(): Promise<void> {
   console.log(`[A1] CPA ${BASE} model=${MODEL}`);
@@ -69,17 +96,23 @@ async function main(): Promise<void> {
 
   const tr = translateDraft(dr.draft, { ...fc, planningRequestId: dr.planningRequestId });
   console.log(`[A1] translateDraft -> ${tr.outcome}`);
-  if (tr.outcome !== "loadable") { console.error(`[A1] not loadable: ${JSON.stringify(tr).slice(0, 400)}`); process.exit(3); }
+  if (tr.outcome !== "loadable") { dump("a1-not-loadable.json", { prd: PRD, draft: dr.draft, result: tr }); console.error(`[A1] not loadable: ${JSON.stringify(tr).slice(0, 400)}`); process.exit(3); }
 
   const gate = tr.plan.nodes.find((n) => n.kind === "design");
   console.log(`[A1] plan: ${tr.plan.nodes.length} node(s), designGate=${gate ? "yes" : "no"}, planDigest=${tr.plan.planDigest.slice(0, 16)}…`);
 
   // LOAD-ROUNDTRIP: the produced plan re-loads through the sole legality/digest authority (managed-t3), byte-stable.
-  const refs: FrozenRefs = tr.plan.frozenRefs;
+  const refs: FrozenRefs = tr.plan.frozenRefs!;
   const again = loadPlan(tr.plan, { mode: "managed-t3", ownerDomainPolicy: fc.ownerDomainPolicy, riskPolicy: fc.riskPolicy, expectedFrozenRefs: refs });
   if (!again.ok) { console.error(`[A1] LOAD-ROUNDTRIP FAILED: ${again.reason}`); process.exit(4); }
   if (again.plan.planDigest !== tr.plan.planDigest) { console.error(`[A1] planDigest drift on reload`); process.exit(5); }
-  console.log(`[A1] LOAD-ROUNDTRIP ok (planDigest stable). PASS.`);
+  console.log(`[A1] LOAD-ROUNDTRIP ok (planDigest stable).`);
+
+  // F reconciliation over the REAL produced plan (independent of any model covers claim).
+  const f = reconcile(tr.plan, F_BASELINE);
+  console.log(`[A1][F] audit=${JSON.stringify(f.audit)} pass=${f.pass} mismatches=${JSON.stringify(f.mismatches)}`);
+  dump("a1-evidence.json", { model: MODEL, prd: PRD, rawDraft: dr.draft, plan: tr.plan, fBaseline: F_BASELINE, fAudit: f });
+  console.log(`[A1] PASS (compile+roundtrip). F artifact saved${f.pass ? ", F reconciliation matched baseline" : " (see mismatches above)"}.`);
 }
 
 main().catch((e) => { console.error(`[A1] CPA unreachable / error: ${(e as Error).message}`); process.exit(1); });

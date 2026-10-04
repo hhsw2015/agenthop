@@ -6,18 +6,19 @@ corroborated clause-by-clause). Baseline = `feat/swarm-brain` @ `ed2499d` (T3a s
 editing any T3a/bus source** — only new files. Branch `feat/swarm-brain`, commit `0cad201` (+ `scripts/t3-draft-live.ts`
 update for the Anthropic `/v1/messages` branch).
 
-## What to review
+## What to review (round 2 — HEAD after the bccf629 fix round)
 
-| Module (new) | ~lines | Tests | Purpose |
-|---|---|---|---|
-| `src/swarm/plan-prompts.ts` | ~95 | swarm-t3-draft | 3 versioned prompt assets (task-master MIT = structural inspiration only, rewritten); `fillPrompt` (missing var throws), `writePromptAssets` |
-| `src/swarm/plan-draft.ts` | ~120 | swarm-t3-draft (13) | draftPlan: the ONE impure step. Injected `callModel`; strong-schema parse (one code fence tolerated, else reject); always-heavy tier; optional independent complexity re-score; surfaces request-round `planningRequestId` |
-| `src/swarm/plan-bundle.ts` | ~75 | swarm-t3-bundle (6) | content-addressed immutable resume snapshot; `payloadRef=digestOf(bundle)`; idempotent store; load re-verifies digest (tamper) |
-| `src/swarm/plan-recompile.ts` | ~150 | swarm-t3-recompile (14), swarm-t3-guards (5) | recompile loop + **sole** plan operationId minter |
-| `scripts/t3-draft-live.ts` | ~75 | A1 (manual) | real-LLM live-fire harness (CPA; OpenAI `/chat/completions` + Anthropic `/v1/messages`) |
-| test `swarm-t3-acceptance.ts` | — | B (3) + F (3) | R4 gate/coverage; independent requirement-coverage audit + drop-detection negative |
+| Module (new) | Tests | Purpose |
+|---|---|---|
+| `src/swarm/plan-prompts.ts` | swarm-t3-draft | 3 versioned prompt assets (task-master MIT = structural inspiration only, rewritten); `fillPrompt`, `writePromptAssets` |
+| `src/swarm/plan-draft.ts` | swarm-t3-draft (16) | draftPlan: the ONE impure step. Injected `callModel`; strong-schema parse; always-heavy tier; **null/non-object task → reject (no throw)**; **rescore must cover every task once (no omit/unknown/dup/non-numeric → no silent downgrade)**; surfaces request-round `planningRequestId` |
+| `src/swarm/plan-bundle.ts` | swarm-t3-bundle (10) | content-addressed resume snapshot + **policy-version store** (`storeFrozenContext`/`loadFrozenContext`, line 20); **atomic write (temp+rename)**; `frozenRefsOf`; load re-verifies digest |
+| `src/swarm/plan-recompile.ts` | swarm-t3-recompile (21), swarm-t3-guards (5) | recompile loop + **sole** operationId minter; conservative path-exact fold; CAS-conflict reject; content-addressed C' version |
+| `src/swarm/plan-resume.ts` | swarm-t3-resume (5) | **the verified recompile orchestration** (payloadRef → resolve+verify policy → recompile → persist C') |
+| `scripts/coverage-audit.ts` | swarm-t3-acceptance (F) | independent, omission-aware, structured-evidence coverage auditor |
+| `scripts/t3-draft-live.ts` | A1 (manual) | real-LLM live-fire + real F reconciliation + evidence dump (CPA; OpenAI + Anthropic `/v1/messages`) |
 
-**Totals:** 44 new tests; **414 swarm tests green**; `tsc --noEmit` clean.
+**Totals:** 64 new T3b tests; **434 swarm tests green**; `tsc --noEmit` clean.
 
 ## Coordinator's 5 points → where
 
@@ -29,25 +30,41 @@ update for the Anthropic `/v1/messages` branch).
 
 ## Acceptance evidence
 
-- **A1 (real-LLM live-fire)** via CPA `http://127.0.0.1:8318/v1`:
-  - `openai/gpt-4o` → draftPlan ok (1 task) → translateDraft **loadable** → 2-node plan → **LOAD-ROUNDTRIP ok, planDigest stable**. PASS.
-  - `claude-sonnet-4.5` via `/v1/messages`: the Anthropic branch is **verified** — draftPlan parsed a real Claude response
-    and advanced to the (optional) re-score step; the CPA upstream for claude was returning 429 `server_overload` at test
-    time, which the harness surfaced as a clean reject (never a crash). A full end-to-end claude pass is backend-availability
-    gated; the gpt-4o run is the complete A1 evidence. (set `A1_RESCORE=0` for a single-call run.)
-- **B** — cross-two-domain requirement ⇒ prepended design gate covering every impl node (`coveredSpecDigests == impl digests`); a tampered coverage ⇒ whole plan rejected on managed-t3 reload; a dependency cycle ⇒ rejected (not gated).
-- **F** — independent requirement-coverage audit over the PLAN (no model "covers" field exists to trust); I1–I7 classified {implemented / constrained-review / deferred}; **negative test**: dropping a requirement's node makes the audit report it UNCOVERED (the audit is real).
+- **A1 (real-LLM live-fire)** via CPA `http://127.0.0.1:8318/v1`, `openai/gpt-4o`: draftPlan ok (6 real tasks) → translateDraft
+  **loadable** → 7-node plan → **LOAD-ROUNDTRIP ok, planDigest stable** → **F reconciliation matched the hand-made baseline**
+  (I1–I5 all independently verified implemented). Committed artifact: `docs/swarm/t3b-a1-evidence/a1-evidence.json` (PRD + raw
+  model draft + produced plan + baseline + audit). The Anthropic `/v1/messages` branch is verified too (draftPlan parsed a real
+  claude-sonnet-4.5 response; CPA upstream was intermittently 429/403, surfaced as clean rejects — never a crash). A real
+  degraded-output rejection was also observed (a `patch` output lacking `baseSourceCommit` ⇒ rejected — acceptance C on live output).
+- **B** — cross-two-domain ⇒ prepended design gate covering every impl node; tampered coverage ⇒ rejected on managed reload; cycle ⇒ rejected.
+- **F** — independent, **omission-aware, structured-evidence** audit (`scripts/coverage-audit.ts`): "implemented" requires the
+  baseline's required acceptance check; a marker in a "do NOT implement [I1]" clause is NOT implemented; three negatives
+  (dropped node, dropped obligation with marker kept, explicit omission) all surface as not-implemented. Plus the real A1 reconciliation above.
+
+## Round-2 disposition — reviewer bccf629 (3 P1 / 5 P2), all addressed
+
+| # | Finding | Fix | Pinned by |
+|---|---|---|---|
+| P1-1 | same-path opposing answers last-write-wins → risk downgrade | conservative per-path AND (any irreversible wins), order-independent | swarm-t3-recompile "P1-1" (AB & BA both gate) + control |
+| P1-2 | C' version keyed only on answer digest → content aliasing / managed-reload bypass | C' version content-addressed over the resulting policy; resume adds a frozenRefs drift/swap guard | swarm-t3-recompile "P1-2"; swarm-t3-resume "drift/swap" |
+| P1-3 | invalid `reversible` (null/"false"/0) counted as answered; CAS tie order-picked | strict-boolean validation (else unanswered → needsClarification); CAS winner = top-casSeq group, a disagreement **rejects** | swarm-t3-recompile canonicalAnswerSet + "conflicting answer set → rejected" |
+| P2-1 | sibling fallback rewrote `criticalPath` (forged requester fact) | **never touch criticalPath**; path-exact resolution re-adds unanswered sibling paths so they keep the gate | swarm-t3-recompile "P2-1" (criticalPath preserved) |
+| P2-2 | rescore omit/empty/unknown/dup silent downgrade; null task throws | full-coverage check (reject omit/empty/unknown/dup/non-numeric); null/non-object task → readable reject | swarm-t3-draft "P2-2" (4 cases) |
+| P2-3 | half-written bundle falsely reports success | atomic write (temp + rename); a partial file is repaired by re-store, never a false unreadable ref | swarm-t3-bundle "P2-3" |
+| P2-4 | durable version resolution + verified resume entry not delivered | `plan-resume.ts` orchestration + `storeFrozenContext`/`loadFrozenContext`; resume reads only payloadRef+answers, verifies refs, persists C' | swarm-t3-resume (5: restart, C' reloadable, incomplete, drift, replay no-op) |
+| P2-5 | F trusted model markers (MARKER-WITH-EXPLICIT-OMISSION) | structured-evidence + omission-aware audit; real A1 reconciliation artifact | swarm-t3-acceptance F (3 negatives) + a1-evidence.json |
 
 ## Non-obvious decisions / seams to probe
 
-- **projectAnswers fold (the one judgement call the design delegated — "投影函数" mine to define).** Answers fold into a new
-  `C'` (risk policy): an undecidable prefix is dropped only once **every** node path overlapping it is answered (a sibling
-  path on an unanswered non-critical node keeps the prefix — no silent widening); answered-irreversible paths are added to
-  `irreversiblePrefixes` (⇒ design gate, safe). `D'` fallback: an answered node still overlapping a kept prefix has its
-  `criticalPath` cleared so it **gates** instead of re-asking. **ponytail / known ceiling:** under a sibling-conflict the
-  reversible answer is under-honored (gated, safe but not maximally efficient); the exact fix is a per-node explicit risk
-  marker (design §3 "节点显式标记"), deferred to the CPA-ledger batch. Flagging explicitly — push back if you want it exact now.
-- **clarifyTargets replicates translateDraft's question derivation** (not NL-parsed from question text) and is **pinned** by a
-  test asserting its questionIds equal translateDraft's emitted ones — a T3a format change breaks that test, not silently.
+- **projectAnswers fold (round-2 rewrite).** The answer binds to its own node path: a touched undecidable prefix is replaced
+  by the still-**unanswered** node paths under it (siblings keep their unknown status → design gate), answered-irreversible
+  paths go to `irreversiblePrefixes`, and **`criticalPath` is never rewritten** (a reversibility answer is not a criticality
+  fact — per the reviewer's P2-1 ruling). Per-path aggregate is conservative (any irreversible wins). No deferral to a per-node
+  risk marker or the CPA ledger — the path-exact resolution makes the reversible case exact without them.
+- **clarifyTargets replicates translateDraft's question derivation** (not NL-parsed) and is **pinned** by a test asserting its
+  questionIds equal translateDraft's emitted ones — a T3a format change breaks that test, not silently.
+- **Policy identity.** C' version is content-addressed over the resulting risk policy; the resume entry also checks the
+  resolved policy's `frozenRefs` against the bundle (drift/swap). loadFrozenContext/loadBundle both re-verify digests.
 - **A2 (real dispatch + V8 execution of required-review-pass + the real cost-based R4 threshold) is NOT in this batch** —
-  `notImplemented:['r4-threshold']` stays; loadable ≠ A2.
+  `notImplemented:['r4-threshold']` stays; loadable ≠ A2. The resume orchestration produces a loadable plan + minted
+  operationId only; it does not dispatch.

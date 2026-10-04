@@ -72,6 +72,9 @@ export async function draftPlan(input: DraftPlanInput, deps: DraftPlanDeps): Pro
   if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return { ok: false, reason: "draft must be a JSON object" };
   const tasks = (obj as Record<string, unknown>).tasks;
   if (!Array.isArray(tasks) || tasks.length === 0) return { ok: false, reason: "draft.tasks must be a non-empty array" };
+  // Top-level shape guard BEFORE touching task fields (rescore / summary): a null/non-object task becomes a readable reject,
+  // never a TypeError. Deep per-field validation still belongs to translateDraft.
+  for (let k = 0; k < tasks.length; k++) if (tasks[k] === null || typeof tasks[k] !== "object" || Array.isArray(tasks[k])) return { ok: false, reason: `draft.tasks[${k}] must be an object` };
 
   // jobId is the CALLER's identity, not the model's echo; planRevision from the caller. Deep validation is translateDraft's.
   const draft: Draft = { jobId: input.jobId, ...(input.planRevision !== undefined ? { planRevision: input.planRevision } : {}), tasks: tasks as DraftTask[] };
@@ -88,7 +91,9 @@ export async function draftPlan(input: DraftPlanInput, deps: DraftPlanDeps): Pro
  *  proceed with the possibly-biased self-scores. Merges independentScore onto matching nodeIds; translateDraft then takes
  *  max(self, independent) (SCORE-DISAGREES). */
 async function rescoreComplexity(draft: Draft, input: DraftPlanInput, deps: DraftPlanDeps, tier: ModelTier): Promise<{ ok: true; draft: Draft } | { ok: false; reason: string }> {
-  const { system, user } = fillPrompt(PROMPT_ASSETS["complexity"]!, { jobId: input.jobId, tasks: JSON.stringify(draft.tasks.map((t) => ({ nodeId: t.nodeId, goal: t.goal, complexity: t.complexity }))) });
+  // Null-safe summary (a malformed task must not throw; translateDraft is the deep validator afterwards).
+  const summary = draft.tasks.map((t) => ({ nodeId: (t as Record<string, unknown> | null)?.nodeId, goal: (t as Record<string, unknown> | null)?.goal, complexity: (t as Record<string, unknown> | null)?.complexity }));
+  const { system, user } = fillPrompt(PROMPT_ASSETS["complexity"]!, { jobId: input.jobId, tasks: JSON.stringify(summary) });
   let raw: string;
   try {
     raw = await deps.callModel({ system, user, tier });
@@ -98,14 +103,23 @@ async function rescoreComplexity(draft: Draft, input: DraftPlanInput, deps: Draf
   const parsed = parseStrict(raw);
   if (!parsed.ok) return { ok: false, reason: `complexity re-score: ${parsed.reason}` };
   if (!Array.isArray(parsed.value)) return { ok: false, reason: "complexity re-score must be a JSON array of {nodeId, independentScore}" };
+
+  // The scores we EXPECT: every task carrying a string nodeId. A rescore that omits, duplicates, or invents a nodeId is
+  // rejected — a silent partial would let an un-rescored task keep a (possibly biased) low self-score (SCORE-DISAGREES intent).
+  const expected = new Set<string>();
+  for (const t of draft.tasks) { const id = (t as Record<string, unknown> | null)?.nodeId; if (typeof id === "string" && id.length > 0) expected.add(id); }
   const byId = new Map<string, number>();
   for (const e of parsed.value as unknown[]) {
     if (typeof e !== "object" || e === null) return { ok: false, reason: "complexity re-score entry must be an object" };
     const nodeId = (e as Record<string, unknown>).nodeId;
     const score = (e as Record<string, unknown>).independentScore;
-    if (typeof nodeId !== "string" || typeof score !== "number") return { ok: false, reason: "complexity re-score entry needs {nodeId:string, independentScore:number}" };
+    if (typeof nodeId !== "string" || typeof score !== "number" || !Number.isFinite(score)) return { ok: false, reason: "complexity re-score entry needs {nodeId:string, independentScore:finite number}" };
+    if (!expected.has(nodeId)) return { ok: false, reason: `complexity re-score names unknown node "${nodeId}"` };
+    if (byId.has(nodeId)) return { ok: false, reason: `complexity re-score has a duplicate entry for "${nodeId}"` };
     byId.set(nodeId, score);
   }
-  const tasks = draft.tasks.map((t) => (byId.has(t.nodeId) ? { ...t, independentScore: byId.get(t.nodeId)! } : t));
+  if (byId.size !== expected.size) return { ok: false, reason: `complexity re-score must cover every task (${expected.size}); got ${byId.size} (no silent downgrade)` };
+
+  const tasks = draft.tasks.map((t) => { const id = (t as Record<string, unknown> | null)?.nodeId; return typeof id === "string" && byId.has(id) ? { ...(t as DraftTask), independentScore: byId.get(id)! } : t; });
   return { ok: true, draft: { ...draft, tasks } };
 }

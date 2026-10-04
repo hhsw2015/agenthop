@@ -41,17 +41,31 @@ export function clarifyTargets(draft: Draft, fc: FrozenContext): ClarifyTarget[]
   return out;
 }
 
-/** CAS-winning, questionId-sorted answer set — the canonical form the operationId digests over (design: "按 questionId
- *  排序、只含 CAS 获胜答复"). Duplicate answers for one questionId collapse to the highest casSeq (tie: last seen). */
-export function canonicalAnswerSet(answers: ClarificationAnswer[]): Array<{ questionId: string; reversible: boolean; owner?: string }> {
-  const win = new Map<string, ClarificationAnswer>();
+export type CanonicalAnswer = { questionId: string; reversible: boolean; owner?: string };
+export type AnswerSetResult = { ok: true; set: CanonicalAnswer[] } | { ok: false; reason: string };
+
+/** The canonical, CAS-winning answer set (design: "按 questionId 排序、只含 CAS 获胜答复"). A VALID answer needs a
+ *  non-empty questionId and a STRICT boolean reversible — anything else (undefined/null/"false"/0) is dropped (not an
+ *  answer at a trust boundary; its question stays unanswered). The CAS winner must be UNIQUE and PROVABLE: among the
+ *  answers at the HIGHEST casSeq for a questionId, a disagreement on reversible has no winner => REJECT (never let array
+ *  order decide). Order-independent. */
+export function canonicalAnswerSet(answers: ClarificationAnswer[]): AnswerSetResult {
+  const groups = new Map<string, ClarificationAnswer[]>();
   for (const a of answers) {
-    const prev = win.get(a.questionId);
-    if (prev === undefined || (a.casSeq ?? 0) >= (prev.casSeq ?? 0)) win.set(a.questionId, a);
+    if (a === null || typeof a !== "object" || typeof a.questionId !== "string" || a.questionId.length === 0 || typeof a.reversible !== "boolean") continue;
+    const g = groups.get(a.questionId);
+    if (g) g.push(a); else groups.set(a.questionId, [a]);
   }
-  return [...win.values()]
-    .sort((x, y) => (x.questionId < y.questionId ? -1 : x.questionId > y.questionId ? 1 : 0))
-    .map((a) => ({ questionId: a.questionId, reversible: a.reversible, ...(a.owner !== undefined ? { owner: a.owner } : {}) }));
+  const set: CanonicalAnswer[] = [];
+  for (const [qid, g] of groups) {
+    const maxCas = Math.max(...g.map((a) => a.casSeq ?? 0));
+    const top = g.filter((a) => (a.casSeq ?? 0) === maxCas);
+    if (new Set(top.map((a) => a.reversible)).size > 1) return { ok: false, reason: `conflicting answers for ${qid} at the same CAS seq ${maxCas} (no provable winner)` };
+    const owners = new Set(top.map((a) => a.owner));
+    set.push({ questionId: qid, reversible: top[0]!.reversible, ...(owners.size === 1 && top[0]!.owner !== undefined ? { owner: top[0]!.owner } : {}) });
+  }
+  set.sort((x, y) => (x.questionId < y.questionId ? -1 : x.questionId > y.questionId ? 1 : 0));
+  return { ok: true, set };
 }
 
 export const PLAN_OP_NAMESPACE = "swarm-plan-op/1";
@@ -64,45 +78,57 @@ export function mintPlanOperationId(i: PlanOpInput): string {
 }
 
 export type ProjectResult =
-  | { ok: true; draft: Draft; fc: FrozenContext }
+  | { ok: true; draft: Draft; fc: FrozenContext; canonAnswers: CanonicalAnswer[] }
   | { ok: false; reason: string }
   | { incomplete: true; unanswered: string[] };
 
-/** Fold answers into a new (D', C'). Never mutates the originals (content-addressed snapshot stays immutable):
- *   C'.undecidablePrefixes drops a prefix only once EVERY node path overlapping it has been answered (a sibling path on
- *     an unanswered, non-critical node keeps the prefix — no silent widening of its gate to reversible);
- *   C'.irreversiblePrefixes gains every answered-irreversible path (=> that node now hits the design gate, safe);
- *   D' clears criticalPath on an answered node whose path still overlaps a kept prefix (sibling conflict) so it GATES
- *     instead of re-asking — a safe fallback. ponytail: a per-node explicit risk marker (design §3 "节点显式标记") would
- *     make the reversible case exact even under sibling conflict; deferred to the CPA-ledger batch.
- *  Returns incomplete (=> caller keeps needsClarification, the safe default) when any emitted question is unanswered. */
+/** Fold answers into a new (D', C'). Never mutates the originals (content-addressed snapshot stays immutable) and NEVER
+ *  rewrites the requester's criticalPath declaration — an answer about reversibility is not a new criticality fact.
+ *  Resolution is PATH-EXACT: each answer binds to its own node path, so a sibling path on an unanswered node keeps its
+ *  unknown status.
+ *   - Per path, conservatively: reversible only if every answer touching it agrees (any irreversible wins => gate).
+ *   - C'.undecidablePrefixes: a prefix an answer TOUCHES is replaced by the still-UNANSWERED node paths under it
+ *     (siblings stay unknown => design gate); a prefix no answer touches is kept verbatim. So the answered path leaves
+ *     the unknown set exactly, without de-classifying siblings and without touching criticalPath.
+ *   - C'.irreversiblePrefixes gains every answered-irreversible path.
+ *   - C'.version is CONTENT-addressed over the RESULTING policy, so two different projected policies never share a version
+ *     (a managed reload cannot accept a swapped policy).
+ *  Returns {ok:false} on a conflicting (no-provable-winner) answer set; incomplete when any emitted question is unanswered
+ *  (=> caller keeps needsClarification, the safe default). */
 export function projectAnswers(draft: Draft, fc: FrozenContext, answers: ClarificationAnswer[]): ProjectResult {
   const targets = clarifyTargets(draft, fc);
   if (targets.length === 0) return { ok: false, reason: "no open clarification for this (draft, frozenContext)" };
-  const canon = canonicalAnswerSet(answers);
+  const canonR = canonicalAnswerSet(answers);
+  if (!canonR.ok) return { ok: false, reason: canonR.reason };
+  const canon = canonR.set;
   const byId = new Map(canon.map((a) => [a.questionId, a]));
   const unanswered = targets.filter((t) => !byId.has(t.questionId)).map((t) => t.questionId);
   if (unanswered.length > 0) return { incomplete: true, unanswered };
 
-  const answeredPaths = new Map<string, boolean>(); // path -> reversible
-  for (const t of targets) answeredPaths.set(t.path, byId.get(t.questionId)!.reversible);
+  // Conservative per-path aggregate: reversible only if every answer for that path agrees. Any irreversible wins (=> gate).
+  const reversibleByPath = new Map<string, boolean>();
+  for (const t of targets) reversibleByPath.set(t.path, (reversibleByPath.get(t.path) ?? true) && byId.get(t.questionId)!.reversible);
+  const answeredPathSet = new Set(reversibleByPath.keys());
   const allNodePaths = new Set<string>();
   for (const t of draft.tasks) for (const p of t.sourceWriteScope ?? []) allNodePaths.add(p);
 
   const risk = fc.riskPolicy;
-  const keptUndecidable = risk.undecidablePrefixes.filter((Q) => [...allNodePaths].some((p) => overlaps(p, Q) && !answeredPaths.has(p)));
-  const addIrreversible = [...answeredPaths.entries()].filter(([, rev]) => rev === false).map(([p]) => p);
+  // Path-exact undecidable resolution: replace a touched prefix with the UNANSWERED node paths still under it.
+  const newUndecidableSet = new Set<string>();
+  for (const Q of risk.undecidablePrefixes) {
+    if (![...answeredPathSet].some((p) => overlaps(p, Q))) { newUndecidableSet.add(Q); continue; } // untouched prefix kept verbatim
+    for (const p of allNodePaths) if (overlaps(p, Q) && !answeredPathSet.has(p)) newUndecidableSet.add(p); // siblings stay unknown
+  }
+  const addIrreversible = [...reversibleByPath.entries()].filter(([, rev]) => rev === false).map(([p]) => p);
   const newIrreversible = [...new Set([...risk.irreversiblePrefixes, ...addIrreversible])].sort();
-  const answerDigest = digestOf(canon);
+  const newUndecidable = [...newUndecidableSet].sort();
+  const contentDigest = digestOf({ base: risk.version, irreversiblePrefixes: newIrreversible, undecidablePrefixes: newUndecidable, answers: canon });
   const fcPrime: FrozenContext = {
     ...fc,
-    riskPolicy: { version: `${risk.version}+clar-${answerDigest.slice(0, 8)}`, irreversiblePrefixes: newIrreversible, undecidablePrefixes: keptUndecidable.slice().sort() },
+    riskPolicy: { version: `${risk.version}+clar-${contentDigest.slice(0, 16)}`, irreversiblePrefixes: newIrreversible, undecidablePrefixes: newUndecidable },
   };
-
-  const stillUnknownNodes = new Set<string>();
-  for (const t of targets) if (overlapsAny(t.path, keptUndecidable)) stillUnknownNodes.add(t.nodeId);
-  const draftPrime: Draft = stillUnknownNodes.size === 0 ? draft : { ...draft, tasks: draft.tasks.map((t) => (stillUnknownNodes.has(t.nodeId) ? { ...t, criticalPath: false } : t)) };
-  return { ok: true, draft: draftPrime, fc: fcPrime };
+  // D' = draft unchanged: criticalPath is the requester's declaration and is never forged away by a reversibility answer.
+  return { ok: true, draft, fc: fcPrime, canonAnswers: canon };
 }
 
 export type RecompileInput = {
@@ -117,7 +143,7 @@ export type RecompileInput = {
   actionKind?: string;
 };
 export type RecompileResult =
-  | { outcome: "loadable"; plan: TaskPlan; operationId: string; snapshotDigest: string; answerSetDigest: string }
+  | { outcome: "loadable"; plan: TaskPlan; operationId: string; snapshotDigest: string; answerSetDigest: string; projectedDraft: Draft; projectedFc: FrozenContext }
   | { outcome: "needsClarification"; questions: ClarificationQuestion[]; unanswered: string[] }
   | { outcome: "needsRole"; missingRoles: string[]; reason: string }
   | { outcome: "rejected"; reason: string };
@@ -138,7 +164,7 @@ export function recompilePlan(i: RecompileInput): RecompileResult {
   if (res.outcome === "needsRole") return { outcome: "needsRole", missingRoles: res.missingRoles, reason: res.reason };
   if (res.outcome === "rejected") return { outcome: "rejected", reason: res.reason };
 
-  const answerSetDigest = digestOf(canonicalAnswerSet(i.answers));
+  const answerSetDigest = digestOf(proj.canonAnswers); // the SAME validated/canonical set the projection used
   const operationId = mintPlanOperationId({
     planningRequestId: i.fc.planningRequestId,
     entityKey: i.draft.jobId,
@@ -146,5 +172,5 @@ export function recompilePlan(i: RecompileInput): RecompileResult {
     snapshotDigest: i.snapshotDigest,
     canonicalAnswerSetDigest: answerSetDigest,
   });
-  return { outcome: "loadable", plan: res.plan, operationId, snapshotDigest: i.snapshotDigest, answerSetDigest };
+  return { outcome: "loadable", plan: res.plan, operationId, snapshotDigest: i.snapshotDigest, answerSetDigest, projectedDraft: proj.draft, projectedFc: proj.fc };
 }

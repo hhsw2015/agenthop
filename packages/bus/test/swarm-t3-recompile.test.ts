@@ -124,12 +124,80 @@ describe("operationId minting is deterministic + request-scoped (op-conflict tra
 });
 
 describe("canonicalAnswerSet", () => {
-  test("sorts by questionId and keeps the highest-casSeq winner", () => {
-    const set = canonicalAnswerSet([
+  test("sorts by questionId and the HIGHEST casSeq wins (order-independent)", () => {
+    const r = canonicalAnswerSet([
       { questionId: "q-b", reversible: true },
       { questionId: "q-a", reversible: false, casSeq: 1 },
-      { questionId: "q-a", reversible: true, casSeq: 2 }, // later CAS wins
+      { questionId: "q-a", reversible: true, casSeq: 2 }, // higher CAS wins regardless of array position
     ]);
-    expect(set).toEqual([{ questionId: "q-a", reversible: true }, { questionId: "q-b", reversible: true }]);
+    expect(r.ok && r.set).toEqual([{ questionId: "q-a", reversible: true }, { questionId: "q-b", reversible: true }]);
+  });
+  test("a tie at the top casSeq with opposing answers is REJECTED (no order-picked winner) [P1-3]", () => {
+    const r = canonicalAnswerSet([{ questionId: "q", reversible: true, casSeq: 5 }, { questionId: "q", reversible: false, casSeq: 5 }]);
+    expect(r.ok).toBe(false);
+  });
+  test("invalid answers (missing/null/string/number reversible) are dropped, not treated as answered [P1-3]", () => {
+    const r = canonicalAnswerSet([
+      { questionId: "q1", reversible: "false" as unknown as boolean },
+      { questionId: "q2", reversible: 0 as unknown as boolean },
+      { questionId: "q3", reversible: undefined as unknown as boolean },
+      { questionId: "q4", reversible: true },
+    ]);
+    expect(r.ok && r.set.map((a) => a.questionId)).toEqual(["q4"]); // only the strict-boolean one survives
+  });
+});
+
+describe("reviewer counterexamples (bccf629 round)", () => {
+  function riskFc(over: Partial<FrozenContext> = {}): FrozenContext {
+    return fc({ riskPolicy: { version: "rp1", irreversiblePrefixes: [], undecidablePrefixes: ["src/exp/"] }, roleCatalog: { version: "rc1", roles: { impl: { floor: "standard", fileDomain: ["src/"] } } }, ownerDomainPolicy: { version: "op1", ownerByPrefix: [{ prefix: "src/", domain: "d" }], frozenScopePrefixes: [] }, ...over });
+  }
+  const ab = (): Draft => draft([
+    task({ nodeId: "A", sourceWriteScope: ["src/exp/shared.ts"], criticalPath: true }),
+    task({ nodeId: "B", sourceWriteScope: ["src/exp/shared.ts"], criticalPath: true }),
+  ]);
+  const answersFor = (d: Draft, f: FrozenContext, rev: (nodeId: string) => boolean): ClarificationAnswer[] =>
+    clarifyTargets(d, f).map((t) => ({ questionId: t.questionId, reversible: rev(t.nodeId) }));
+
+  test("P1-1: same-path, A=irreversible B=reversible -> GATE both orders (no order-dependent downgrade)", () => {
+    const d = ab(), f = riskFc();
+    const forward = recompilePlan({ draft: d, fc: f, answers: answersFor(d, f, (n) => n !== "A"), snapshotDigest: "s" });
+    const reverse = recompilePlan({ draft: d, fc: f, answers: [...answersFor(d, f, (n) => n !== "A")].reverse(), snapshotDigest: "s" });
+    expect(forward.outcome === "loadable" && forward.plan.nodes.some((n) => n.kind === "design")).toBe(true);
+    expect(reverse.outcome === "loadable" && reverse.plan.nodes.some((n) => n.kind === "design")).toBe(true);
+  });
+  test("P1-1 control: same-path both reversible -> loadable, no gate", () => {
+    const d = ab(), f = riskFc();
+    const r = recompilePlan({ draft: d, fc: f, answers: answersFor(d, f, () => true), snapshotDigest: "s" });
+    expect(r.outcome === "loadable" && !r.plan.nodes.some((n) => n.kind === "design")).toBe(true);
+  });
+  test("P2-1: an answered critical node keeps its criticalPath; an unanswered non-critical sibling keeps the gate", () => {
+    const d = draft([
+      task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts"], criticalPath: true }),
+      task({ nodeId: "B", sourceWriteScope: ["src/exp/b.ts"] }), // non-critical => not asked
+    ]);
+    const f = riskFc();
+    const r = recompilePlan({ draft: d, fc: f, answers: answersFor(d, f, () => true), snapshotDigest: "s" });
+    expect(r.outcome).toBe("loadable");
+    if (r.outcome !== "loadable") return;
+    const a = r.plan.nodes.find((n) => n.nodeId === "A");
+    expect(a?.criticalPath).toBe(true); // declaration preserved, NOT forged to false
+    expect(r.plan.nodes.some((n) => n.kind === "design")).toBe(true); // B keeps the gate
+    expect(r.projectedDraft.tasks.find((t) => t.nodeId === "A")?.criticalPath).toBe(true);
+  });
+  test("P1-2: two drafts, same answer, different paths -> DIFFERENT projected C' version (no content aliasing)", () => {
+    const f = riskFc();
+    const da = draft([task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts"], criticalPath: true })]);
+    const db = draft([task({ nodeId: "A", sourceWriteScope: ["src/exp/b.ts"], criticalPath: true })]);
+    const ra = recompilePlan({ draft: da, fc: f, answers: answersFor(da, f, () => false), snapshotDigest: "s" });
+    const rb = recompilePlan({ draft: db, fc: f, answers: answersFor(db, f, () => false), snapshotDigest: "s" });
+    expect(ra.outcome === "loadable" && rb.outcome === "loadable").toBe(true);
+    if (ra.outcome !== "loadable" || rb.outcome !== "loadable") return;
+    expect(ra.projectedFc.riskPolicy.version).not.toBe(rb.projectedFc.riskPolicy.version);
+  });
+  test("P1-3 at the recompile boundary: a conflicting answer set -> rejected", () => {
+    const d = ab(), f = riskFc();
+    const ts = clarifyTargets(d, f);
+    const answers: ClarificationAnswer[] = [{ questionId: ts[0]!.questionId, reversible: true, casSeq: 1 }, { questionId: ts[0]!.questionId, reversible: false, casSeq: 1 }, ...ts.slice(1).map((t) => ({ questionId: t.questionId, reversible: true }))];
+    expect(recompilePlan({ draft: d, fc: f, answers, snapshotDigest: "s" }).outcome).toBe("rejected");
   });
 });

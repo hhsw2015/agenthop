@@ -64,6 +64,34 @@ describe("draftPlan", () => {
     const r2 = await draftPlan({ prd: "x", jobId: "j", allowedChecks: ["testsPass"], rescore: true }, { callModel: badRescore });
     expect(r2.ok).toBe(false);
   });
+  test("P2-2: a null task is a readable reject, NOT a thrown TypeError (even with rescore)", async () => {
+    const r = await draftPlan({ prd: "x", jobId: "j", allowedChecks: ["testsPass"], rescore: true }, { callModel: fakeModel('{"jobId":"j","tasks":[null]}') });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/tasks\[0\]/);
+  });
+  test("P2-2: rescore must cover every task exactly once — empty / unknown-id / partial / duplicate all reject", async () => {
+    const twoTaskDraft = JSON.stringify({ jobId: "j", tasks: [
+      { nodeId: "A", kind: "work", goal: "a", dependsOn: [], structuredChecks: [{ check: "testsPass" }], freeTextNotes: [], complexity: 9, requiredOutputs: [{ logicalName: "o", kind: "report" }], artifactScope: ["out/"] },
+      { nodeId: "B", kind: "work", goal: "b", dependsOn: [], structuredChecks: [{ check: "testsPass" }], freeTextNotes: [], complexity: 2, requiredOutputs: [{ logicalName: "o", kind: "report" }], artifactScope: ["out/"] },
+    ] });
+    const run = (rescoreResp: string) => {
+      let c = 0;
+      const m: CallModel = async () => (c++ === 0 ? twoTaskDraft : rescoreResp);
+      return draftPlan({ prd: "x", jobId: "j", allowedChecks: ["testsPass"], rescore: true }, { callModel: m });
+    };
+    expect((await run("[]")).ok).toBe(false); // empty
+    expect((await run('[{"nodeId":"Z","independentScore":5}]')).ok).toBe(false); // unknown id
+    expect((await run('[{"nodeId":"A","independentScore":5}]')).ok).toBe(false); // partial (B missing)
+    expect((await run('[{"nodeId":"A","independentScore":9},{"nodeId":"A","independentScore":1}]')).ok).toBe(false); // duplicate
+    // full, correct coverage succeeds and keeps the high independent score
+    const okRun = await run('[{"nodeId":"A","independentScore":9},{"nodeId":"B","independentScore":2}]');
+    expect(okRun.ok && okRun.draft.tasks.find((t) => t.nodeId === "A")?.independentScore).toBe(9);
+  });
+  test("P2-2: a non-numeric independentScore rejects (no silent downgrade)", async () => {
+    let c = 0;
+    const m: CallModel = async () => (c++ === 0 ? goodDraftJson : '[{"nodeId":"A","independentScore":"9"}]');
+    expect((await draftPlan({ prd: "x", jobId: "j", allowedChecks: ["testsPass"], rescore: true }, { callModel: m })).ok).toBe(false);
+  });
   test("the produced draft actually feeds translateDraft (pipeline fit)", async () => {
     const r = await draftPlan({ prd: "x", jobId: "job1", allowedChecks: ["testsPass"] }, { callModel: fakeModel(goodDraftJson) });
     expect(r.ok).toBe(true);

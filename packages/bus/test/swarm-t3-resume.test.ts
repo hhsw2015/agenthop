@@ -1,0 +1,95 @@
+import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { storeResumeState, resumeClarification, type ResumeDirs } from "../src/swarm/plan-resume.js";
+import { storeFrozenContext, loadFrozenContext, storeBundle, loadBundle, frozenRefsOf } from "../src/swarm/plan-bundle.js";
+import { loadPlan } from "../src/swarm/task-plan.js";
+import { commit, initialLogState, type Change } from "../src/swarm/control-log.js";
+import { clarifyTargets, type ClarificationAnswer } from "../src/swarm/plan-recompile.js";
+import { translateDraft, type Draft, type DraftTask, type FrozenContext } from "../src/swarm/task-translate.js";
+
+// T3b recompile ORCHESTRATION (design 1d0a1ffc §1 line 21; reviewer P2-4): the verified resume entry — payloadRef +
+// answers -> resolve & verify original policy -> recompile -> persist C'.
+
+function fc(over: Partial<FrozenContext> = {}): FrozenContext {
+  return {
+    checkRegistry: { version: "cr1", checks: { testsPass: {} } },
+    ownerDomainPolicy: { version: "op1", ownerByPrefix: [{ prefix: "src/", domain: "d" }], frozenScopePrefixes: [] },
+    riskPolicy: { version: "rp1", irreversiblePrefixes: [], undecidablePrefixes: ["src/exp/"] },
+    roleCatalog: { version: "rc1", roles: { impl: { floor: "standard", fileDomain: ["src/"] } } },
+    budgetPolicy: { version: "bp1", coefficientUsdPerPoint: 0.5, maxModelUsd: 1000, maxTotalAttempts: 20, maxWallClockSec: 72000 },
+    r4ThresholdPolicy: { version: "tp1", maxTotalComplexity: 1000 },
+    sourceBaselineDigest: "base",
+    planningRequestId: "req-1",
+    ...over,
+  };
+}
+const task = (over: Partial<DraftTask>): DraftTask => ({ nodeId: "A", kind: "work", goal: "g", dependsOn: [], structuredChecks: [{ check: "testsPass" }], freeTextNotes: [], complexity: 5, requiredOutputs: [{ logicalName: "o", kind: "report" }], artifactScope: ["out/"], sourceWriteScope: ["src/exp/a.ts"], criticalPath: true, ...over });
+const draft: Draft = { jobId: "jobR", tasks: [task({})] };
+const prd = "resume me";
+
+let dirs: ResumeDirs;
+beforeEach(() => { dirs = { bundleDir: mkdtempSync(path.join(tmpdir(), "t3-b-")), policyDir: mkdtempSync(path.join(tmpdir(), "t3-p-")) }; });
+afterEach(() => { rmSync(dirs.bundleDir!, { recursive: true, force: true }); rmSync(dirs.policyDir!, { recursive: true, force: true }); });
+
+const answersFrom = (f: FrozenContext, rev: boolean): ClarificationAnswer[] => clarifyTargets(draft, f).map((t) => ({ questionId: t.questionId, reversible: rev }));
+
+describe("storeResumeState + resumeClarification round-trip", () => {
+  test("restart-from-payloadRef: only the ref + answers resume to a loadable plan with a minted operationId", () => {
+    const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);
+    // a fresh process would only have payloadRef + the answers; the stores are on disk.
+    const r = resumeClarification({ payloadRef, answers: answersFrom(fc(), true) }, dirs);
+    expect(r.outcome).toBe("loadable");
+    if (r.outcome !== "loadable") return;
+    expect(r.operationId).toMatch(/^[0-9a-f]{64}$/);
+    expect(r.projectedFcDigest).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("the persisted C' is retrievable and the resumed plan's riskPolicy version matches it", () => {
+    const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);
+    const r = resumeClarification({ payloadRef, answers: answersFrom(fc(), false) }, dirs); // irreversible => gate
+    if (r.outcome !== "loadable") throw new Error("setup");
+    const cPrime = loadFrozenContext(r.projectedFcDigest, dirs.policyDir);
+    const refs = r.plan.frozenRefs;
+    expect(refs).toBeDefined();
+    if (!refs) return;
+    expect(cPrime.riskPolicy.version).toBe(refs.riskPolicy); // the plan carries C''s version ref
+    // and C' managed-reloads the plan it produced
+    const again = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: cPrime.ownerDomainPolicy, riskPolicy: cPrime.riskPolicy, expectedFrozenRefs: refs });
+    expect(again.ok).toBe(true);
+  });
+
+  test("incomplete answers -> needsClarification (safe default), nothing persisted as loadable", () => {
+    const two: Draft = { jobId: "jobR2", tasks: [task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts"] }), task({ nodeId: "B", sourceWriteScope: ["src/exp/b.ts"] })] };
+    const { payloadRef } = storeResumeState({ draft: two, prd, fc: fc() }, dirs);
+    const first = clarifyTargets(two, fc())[0]!;
+    const r = resumeClarification({ payloadRef, answers: [{ questionId: first.questionId, reversible: true }] }, dirs);
+    expect(r.outcome).toBe("needsClarification");
+  });
+
+  test("policy drift/swap: a bundle pointing at a DIFFERENT policy whose refs mismatch is rejected (not a same-op)", () => {
+    const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);
+    // craft a tampered bundle: same payload shape but frozenContextDigest -> a different policy (version refs won't match)
+    const other = fc({ riskPolicy: { version: "rp-EVIL", irreversiblePrefixes: [], undecidablePrefixes: [] } });
+    const otherDigest = storeFrozenContext(other, dirs.policyDir);
+    const original = loadBundle(payloadRef, dirs.bundleDir);
+    const tampered = { ...original, frozenContextDigest: otherDigest };
+    const tamperedRef = storeBundle(tampered, dirs.bundleDir); // new payloadRef (content-addressed)
+    const r = resumeClarification({ payloadRef: tamperedRef, answers: answersFrom(fc(), true) }, dirs);
+    expect(r.outcome).toBe("rejected");
+    if (r.outcome === "rejected") expect(r.reason).toMatch(/drift|swap|match/i);
+  });
+
+  test("accurate replay: the same resume committed twice is a replay no-op; a swapped-policy ref never reaches the same op", () => {
+    const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);
+    const r1 = resumeClarification({ payloadRef, answers: answersFrom(fc(), true) }, dirs);
+    const r2 = resumeClarification({ payloadRef, answers: answersFrom(fc(), true) }, dirs);
+    if (r1.outcome !== "loadable" || r2.outcome !== "loadable") throw new Error("setup");
+    expect(r2.operationId).toBe(r1.operationId);
+    const ch = (op: string, plan: typeof r1.plan): Change => ({ put: "plan", plan, operationId: op, expectedEntityRevision: 0 });
+    const first = commit(initialLogState(), 0, [ch(r1.operationId, r1.plan)]);
+    const second = commit(first.state, first.result.ok ? first.result.newSeq : 0, [ch(r2.operationId, r2.plan)]);
+    expect(second.result.ok && second.result.replay).toBe(true);
+  });
+});
