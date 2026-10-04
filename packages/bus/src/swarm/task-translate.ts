@@ -25,7 +25,7 @@
  */
 
 import { loadPlan, computeSpecDigest, type TaskPlan, type TaskSpec, type TaskKind, type ModelTier, type OutputKind, type RequiredOutput, type AcceptanceCheck, type FrozenRefs } from "./task-plan.js";
-import { evaluateR4, overlapsAny, type OwnerDomainPolicy, type RiskPolicy } from "./task-r4.js";
+import { evaluateR4, overlapsAny, type OwnerDomainPolicy, type RiskPolicy, type NodeRisk } from "./task-r4.js";
 
 export type { OwnerDomainPolicy, RiskPolicy } from "./task-r4.js";
 
@@ -152,7 +152,12 @@ function outputContractOf(t: Record<string, unknown>, at: string): { reason: str
   return { outputContract: { requiredOutputs: outs, ...(t.baseSourceCommit !== undefined ? { baseSourceCommit: t.baseSourceCommit as string } : {}) } };
 }
 
-export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult {
+/** opts.resolvedRisk: a TRUSTED per-node risk map (nodeId -> reversible|irreversible) supplied ONLY by the recompile after
+ *  a requester clarification (design §3 "节点显式标记"). A raw draftPlan call omits it — the LLM draft cannot self-declare
+ *  risk. It is stamped onto nodes AND passed as evidence to the self-check loadPlan so the gate decision stays consistent. */
+export type TranslateOpts = { resolvedRisk?: Record<string, NodeRisk> };
+
+export function translateDraft(draft: Draft, fc: FrozenContext, opts: TranslateOpts = {}): TranslateResult {
   if (!isObj(draft) || !isNonEmptyStr(draft.jobId)) return R("draft.jobId must be a non-empty string");
   if (!Array.isArray(draft.tasks) || draft.tasks.length === 0) return R("draft.tasks must be a non-empty array");
   if (draft.planRevision !== undefined && !(typeof draft.planRevision === "number" && Number.isInteger(draft.planRevision) && draft.planRevision >= 0)) return R("draft.planRevision must be a non-negative integer"); // null is not silently ?? 1'd
@@ -256,6 +261,7 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
       modelTier,
       ...(resolvedRole !== undefined ? { roleProfile: resolvedRole } : {}),
       ...(t.criticalPath === true ? { criticalPath: true } : {}),
+      ...(opts.resolvedRisk?.[t.nodeId] !== undefined ? { resolvedRisk: opts.resolvedRisk[t.nodeId] } : {}),
       specDigest: "",
     });
 
@@ -347,7 +353,7 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
   // Self-check via the SAME managed-t3 enforcement the consumer applies: translateDraft's output is guaranteed to pass
   // the loader's R4 re-evaluation (a translateDraft bug that failed to insert a required gate surfaces here as rejected,
   // not as a plan the dispatcher later rejects). loadPlan is the sole legality + digest + coverage authority.
-  const loaded = loadPlan(assembled, { mode: "managed-t3", ownerDomainPolicy: fc.ownerDomainPolicy, riskPolicy: fc.riskPolicy, expectedFrozenRefs: frozenRefs });
+  const loaded = loadPlan(assembled, { mode: "managed-t3", ownerDomainPolicy: fc.ownerDomainPolicy, riskPolicy: fc.riskPolicy, expectedFrozenRefs: frozenRefs, ...(opts.resolvedRisk !== undefined ? { resolvedRisk: opts.resolvedRisk } : {}) });
   if (!loaded.ok) return R(`assembled plan failed managed loadPlan: ${loaded.reason}`);
   return { outcome: "loadable", plan: loaded.plan };
 }

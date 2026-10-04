@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import { translateDraft, type Draft, type DraftTask, type FrozenContext } from "../src/swarm/task-translate.js";
-import { clarifyTargets, canonicalAnswerSet, mintPlanOperationId, projectAnswers, recompilePlan, type ClarificationAnswer } from "../src/swarm/plan-recompile.js";
+import { loadPlan } from "../src/swarm/task-plan.js";
+import { clarifyTargets, canonicalAnswerSet, mintPlanOperationId, projectAnswers, recompilePlan, answersFromClosedWaits, clarificationResolution, type ClarificationAnswer } from "../src/swarm/plan-recompile.js";
+import { openQueryWait, advanceWait } from "../src/swarm/task-wait.js";
 
 // T3b recompile loop + deterministic operationId (design 1d0a1ffc §1; coordinator points 3+4).
 
@@ -123,6 +125,53 @@ describe("operationId minting is deterministic + request-scoped (op-conflict tra
   });
 });
 
+describe("R2 re-review fixes (d6cf85d round)", () => {
+  const riskFc = (): FrozenContext => fc({ riskPolicy: { version: "rp1", irreversiblePrefixes: [], undecidablePrefixes: ["src/exp/"] }, roleCatalog: { version: "rc1", roles: { impl: { floor: "standard", fileDomain: ["src/"] } } }, ownerDomainPolicy: { version: "op1", ownerByPrefix: [{ prefix: "src/", domain: "d" }], frozenScopePrefixes: [] } });
+  const ansFor = (d: Draft, f: FrozenContext, rev: (n: string) => boolean): ClarificationAnswer[] => clarifyTargets(d, f).map((t) => ({ questionId: t.questionId, reversible: rev(t.nodeId) }));
+
+  test("R2-P1-1 same-path: critical A answered reversible, non-critical B on the SAME path keeps its gate", () => {
+    const f = riskFc();
+    const d = draft([task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts"], criticalPath: true }), task({ nodeId: "B", sourceWriteScope: ["src/exp/a.ts"] })]);
+    const r = recompilePlan({ draft: d, fc: f, answers: ansFor(d, f, () => true), snapshotDigest: "s" });
+    expect(r.outcome).toBe("loadable");
+    if (r.outcome !== "loadable") return;
+    expect(r.plan.nodes.some((n) => n.kind === "design")).toBe(true); // B (unanswered, non-critical) still gated
+  });
+  test("R2-P1-1 parent/child: critical A=child answered reversible, non-critical B=parent -> loadable WITH gate, no re-ask loop", () => {
+    const f = riskFc();
+    const d = draft([task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts"], criticalPath: true }), task({ nodeId: "B", sourceWriteScope: ["src/exp/"] })]);
+    const r = recompilePlan({ draft: d, fc: f, answers: ansFor(d, f, () => true), snapshotDigest: "s" });
+    expect(r.outcome).toBe("loadable");
+    if (r.outcome !== "loadable") return;
+    expect(r.plan.nodes.some((n) => n.kind === "design")).toBe(true);
+    expect(r.plan.nodes.find((n) => n.nodeId === "A")?.criticalPath).toBe(true);
+  });
+  test("R2-P2-1: a non-numeric casSeq is dropped as invalid (no coercion, no throw)", () => {
+    const r = canonicalAnswerSet([{ questionId: "q", reversible: true, casSeq: "7" as unknown as number }]);
+    expect(r.ok && r.set.length).toBe(0);
+    const f = riskFc();
+    const d = draft([task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts"], criticalPath: true })]);
+    const qid = clarifyTargets(d, f)[0]!.questionId;
+    const rr = recompilePlan({ draft: d, fc: f, answers: [{ questionId: qid, reversible: true, casSeq: "bad" as unknown as number }], snapshotDigest: "s" });
+    expect(rr.outcome).toBe("needsClarification"); // dropped => unanswered => safe default, never a TypeError
+  });
+  test("R2-P2-2: answersFromClosedWaits takes the winner from the close FACT (first close wins), not casSeq", () => {
+    const base = openQueryWait({ waitId: "w", subject: { jobId: "j" }, deadlineSec: 100, owner: "c", defaultOnTimeout: { outcome: "default-applied", reason: "r", sourceOperationId: "d" }, payloadRef: "p" });
+    const c1 = advanceWait(base, { type: "close", resolution: clarificationResolution(false, "op1") }); // irreversible closes first
+    expect(c1.ok).toBe(true);
+    const c2 = c1.ok ? advanceWait(c1.wait, { type: "close", resolution: clarificationResolution(true, "op2") }) : { ok: false as const };
+    expect(c2.ok).toBe(false); // a later reversible close is rejected (already resolved)
+    const got = answersFromClosedWaits([{ questionId: "q-risk-A-0", wait: c1.ok ? c1.wait : base }]);
+    expect(got.ok && got.answers[0]!.reversible).toBe(false); // first/irreversible, not the later reversible
+  });
+  test("R2-P2-2: a not-closed or non-clarification wait is rejected (not guessed)", () => {
+    const open = openQueryWait({ waitId: "w", subject: { jobId: "j" }, deadlineSec: 100, owner: "c", defaultOnTimeout: { outcome: "default-applied", reason: "r", sourceOperationId: "o" }, payloadRef: "p" });
+    expect(answersFromClosedWaits([{ questionId: "q", wait: open }]).ok).toBe(false);
+    const cancelled = advanceWait(open, { type: "close", resolution: { outcome: "cancelled", reason: "x", sourceOperationId: "o" } });
+    if (cancelled.ok) expect(answersFromClosedWaits([{ questionId: "q", wait: cancelled.wait }]).ok).toBe(false);
+  });
+});
+
 describe("canonicalAnswerSet", () => {
   test("sorts by questionId and the HIGHEST casSeq wins (order-independent)", () => {
     const r = canonicalAnswerSet([
@@ -184,15 +233,22 @@ describe("reviewer counterexamples (bccf629 round)", () => {
     expect(r.plan.nodes.some((n) => n.kind === "design")).toBe(true); // B keeps the gate
     expect(r.projectedDraft.tasks.find((t) => t.nodeId === "A")?.criticalPath).toBe(true);
   });
-  test("P1-2: two drafts, same answer, different paths -> DIFFERENT projected C' version (no content aliasing)", () => {
+  test("R2-P1-1/①: a plan's serialized resolvedRisk is NOT trusted on managed reload without matching evidence (forged reversible can't remove the gate)", () => {
     const f = riskFc();
-    const da = draft([task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts"], criticalPath: true })]);
-    const db = draft([task({ nodeId: "A", sourceWriteScope: ["src/exp/b.ts"], criticalPath: true })]);
-    const ra = recompilePlan({ draft: da, fc: f, answers: answersFor(da, f, () => false), snapshotDigest: "s" });
-    const rb = recompilePlan({ draft: db, fc: f, answers: answersFor(db, f, () => false), snapshotDigest: "s" });
-    expect(ra.outcome === "loadable" && rb.outcome === "loadable").toBe(true);
-    if (ra.outcome !== "loadable" || rb.outcome !== "loadable") return;
-    expect(ra.projectedFc.riskPolicy.version).not.toBe(rb.projectedFc.riskPolicy.version);
+    const d = draft([task({ nodeId: "A", sourceWriteScope: ["src/exp/a.ts"], criticalPath: true })]);
+    const r = recompilePlan({ draft: d, fc: f, answers: answersFor(d, f, () => true), snapshotDigest: "s" });
+    expect(r.outcome).toBe("loadable");
+    if (r.outcome !== "loadable") return;
+    const refs = r.plan.frozenRefs!;
+    // reload WITHOUT the trusted evidence map => resolvedRisk ignored => A is policy critical∧unknown => rejected
+    const noEvidence = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: f.ownerDomainPolicy, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs });
+    expect(noEvidence.ok).toBe(false);
+    // reload WITH the trusted evidence (matching) => honored => loadable
+    const withEvidence = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: f.ownerDomainPolicy, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs, resolvedRisk: r.resolvedRisk });
+    expect(withEvidence.ok).toBe(true);
+    // a MISMATCHED evidence value (claims reversible where the plan says reversible but we pass irreversible) is not honored as reversible
+    const wrong = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: f.ownerDomainPolicy, riskPolicy: f.riskPolicy, expectedFrozenRefs: refs, resolvedRisk: { A: "irreversible" } });
+    expect(wrong.ok).toBe(false); // evidence must MATCH the node's field to be honored
   });
   test("P1-3 at the recompile boundary: a conflicting answer set -> rejected", () => {
     const d = ab(), f = riskFc();

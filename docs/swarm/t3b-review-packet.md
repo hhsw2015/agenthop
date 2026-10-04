@@ -41,6 +41,24 @@ update for the Anthropic `/v1/messages` branch).
   baseline's required acceptance check; a marker in a "do NOT implement [I1]" clause is NOT implemented; three negatives
   (dropped node, dropped obligation with marker kept, explicit omission) all surface as not-implemented. Plus the real A1 reconciliation above.
 
+## T3a-surface change declaration (round 3 — reviewer ④)
+
+R2-P1-1 required per-node risk resolution (design §3 "节点显式标记"), which T3a had stubbed (policy/path-only). This round
+**additively extends the frozen T3a surface** (coordinator notified via R3-b veto window):
+- `task-r4.ts` `evaluateR4` + `R4NodeInput`: optional per-node `resolvedRisk` governing ONLY the unknown dimension; a
+  policy-irreversible path ALWAYS still applies (the override cannot mask a known-irreversible write).
+- `task-plan.ts` `TaskSpec.resolvedRisk` (annotation class — **EXCLUDED from specDigest**, in planDigest, same family as
+  modelTier/roleProfile/criticalPath); `ManagedT3Opts.resolvedRisk` = TRUSTED evidence map; `validateManagedT3` honors a
+  node's serialized `resolvedRisk` ONLY when it matches the evidence (else ignored → the gate stands).
+- `task-translate.ts` `translateDraft(draft, fc, opts?)`: optional trusted `resolvedRisk` map (only the recompile passes it;
+  an LLM draft cannot self-declare), stamped on nodes and forwarded to the self-check loadPlan.
+All changes are **additive and optional**: absent `resolvedRisk`, behavior is byte-identical to T3a — the existing managed
+de-gate counterexample, digest, and replay controls are unchanged (442 swarm tests green, incl. all T3a tests).
+
+**Trust model (reviewer ①, asymmetric-forgery boundary):** `resolvedRisk:"reversible"` can REMOVE a design gate, so it is
+NEVER trusted from the serialized plan. The managed loader ignores it unless the caller supplies a matching trusted evidence
+map derived from the closed clarification waits (bound to the payloadRef). A forged field alone cannot delete a gate.
+
 ## Round-2 disposition — reviewer bccf629 (3 P1 / 5 P2), all addressed
 
 | # | Finding | Fix | Pinned by |
@@ -53,6 +71,15 @@ update for the Anthropic `/v1/messages` branch).
 | P2-3 | half-written bundle falsely reports success | atomic write (temp + rename); a partial file is repaired by re-store, never a false unreadable ref | swarm-t3-bundle "P2-3" |
 | P2-4 | durable version resolution + verified resume entry not delivered | `plan-resume.ts` orchestration + `storeFrozenContext`/`loadFrozenContext`; resume reads only payloadRef+answers, verifies refs, persists C' | swarm-t3-resume (5: restart, C' reloadable, incomplete, drift, replay no-op) |
 | P2-5 | F trusted model markers (MARKER-WITH-EXPLICIT-OMISSION) | structured-evidence + omission-aware audit; real A1 reconciliation artifact | swarm-t3-acceptance F (3 negatives) + a1-evidence.json |
+
+## Round-3 disposition — reviewer d6cf85d re-review (1 P1 / 3 P2), all addressed
+
+| # | Finding | Fix | Pinned by |
+|---|---|---|---|
+| R2-P1-1 | global path-set can't bind per-node answers (same/parent/child scope → downgrade or re-ask loop) | per-node `resolvedRisk` (design §3); projectAnswers aggregates per node; unanswered nodes keep policy risk + gate; criticalPath untouched | swarm-t3-recompile "R2-P1-1 same-path / parent-child" + "① not trusted without evidence" |
+| R2-P2-1 | non-numeric casSeq → Math.max NaN → TypeError | canonicalAnswerSet drops a non-finite casSeq as invalid (→ unanswered, safe) | swarm-t3-recompile "R2-P2-1" |
+| R2-P2-2 | resume trusted caller casSeq, not the real close winner | `answersFromClosedWaits` (winner = the resolved wait's close fact; advanceWait first-close-wins) + `resumeFromClosedWaits` (payloadRef-bound) | swarm-t3-recompile "R2-P2-2" + swarm-t3-resume (closed-wait resume + cross-snapshot reject) |
+| R2-P2-3 | F baseline missed the PRD's untagged test-dir obligation | coverage-audit `requiredScopePrefix` (untagged, scope-verified); baseline + A1 include the test-dir obligation | swarm-t3-acceptance "R2-P2-3" + regenerated a1-evidence.json |
 
 ## Non-obvious decisions / seams to probe
 

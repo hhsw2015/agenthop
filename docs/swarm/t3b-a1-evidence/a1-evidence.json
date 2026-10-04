@@ -1,6 +1,6 @@
 {
   "model": "openai/gpt-4o",
-  "prd": "Build a pure \"plan metrics\" module for the swarm brain. Requirements (tag each task's goal with the IDs it addresses):\n[I1] a function nodeCount(plan) returning the number of nodes — verified by tests.\n[I2] a function totalComplexity(plan) summing node complexity — verified by tests.\n[I3] a function hasDesignGate(plan) returning whether a design node exists — verified by tests.\n[I4] a function summary(plan) returning a stable one-line string — verified by tests.\n[I5] the module must typecheck.\nPut the module under packages/bus/src/swarm/ and tests under packages/bus/test/. Use the allowed checks for acceptance.\nEach task's requiredOutputs kind MUST be \"files\" or \"report\" (NOT \"patch\"). Keep tasks independent (no dependsOn) where possible.",
+  "prd": "Build a pure \"plan metrics\" module for the swarm brain. Requirements (tag each task's goal with the IDs it addresses):\n[I1] a function nodeCount(plan) returning the number of nodes — verified by tests.\n[I2] a function totalComplexity(plan) summing node complexity — verified by tests.\n[I3] a function hasDesignGate(plan) returning whether a design node exists — verified by tests.\n[I4] a function summary(plan) returning a stable one-line string — verified by tests.\n[I5] the module must typecheck.\nPut the module under packages/bus/src/swarm/ and the tests under packages/bus/test/. Use the allowed checks for acceptance.\nEach task's requiredOutputs kind MUST be \"files\" or \"report\" (NOT \"patch\"). Keep tasks independent (no dependsOn) where possible.\nInclude a dedicated task whose sourceWriteScope is [\"packages/bus/test/\"] that writes the unit tests (tag it [TESTS]).\nFor acceptance use only the checks \"testsPass\" and \"typecheckPasses\" (do NOT use fileExists).",
   "rawDraft": {
     "jobId": "live-job-1",
     "tasks": [
@@ -43,7 +43,7 @@
           }
         ],
         "freeTextNotes": [],
-        "complexity": 3,
+        "complexity": 4,
         "requiredOutputs": [
           {
             "logicalName": "totalComplexityFunction",
@@ -70,7 +70,7 @@
           }
         ],
         "freeTextNotes": [],
-        "complexity": 2,
+        "complexity": 3,
         "requiredOutputs": [
           {
             "logicalName": "hasDesignGateFunction",
@@ -97,7 +97,7 @@
           }
         ],
         "freeTextNotes": [],
-        "complexity": 3,
+        "complexity": 4,
         "requiredOutputs": [
           {
             "logicalName": "summaryFunction",
@@ -116,7 +116,12 @@
         "nodeId": "task-5",
         "kind": "integration",
         "goal": "Ensure the module typechecks [I5]",
-        "dependsOn": [],
+        "dependsOn": [
+          "task-1",
+          "task-2",
+          "task-3",
+          "task-4"
+        ],
         "structuredChecks": [
           {
             "check": "typecheckPasses",
@@ -141,30 +146,28 @@
       },
       {
         "nodeId": "task-6",
-        "kind": "review",
-        "goal": "Review the implementation of all functions for correctness and stability",
-        "dependsOn": [
-          "task-1",
-          "task-2",
-          "task-3",
-          "task-4"
+        "kind": "work",
+        "goal": "Write unit tests for all functions [TESTS]",
+        "dependsOn": [],
+        "structuredChecks": [
+          {
+            "check": "testsPass",
+            "args": {}
+          }
         ],
-        "structuredChecks": [],
-        "freeTextNotes": [
-          "Ensure all functions meet the requirements and are implemented correctly."
-        ],
-        "complexity": 4,
+        "freeTextNotes": [],
+        "complexity": 5,
         "requiredOutputs": [
           {
-            "logicalName": "reviewNotes",
-            "kind": "notes"
+            "logicalName": "unitTests",
+            "kind": "files"
           }
         ],
         "artifactScope": [
-          "packages/bus/src/swarm/"
+          "packages/bus/test/"
         ],
         "sourceWriteScope": [
-          "packages/bus/src/swarm/"
+          "packages/bus/test/"
         ],
         "criticalPath": false
       }
@@ -310,7 +313,12 @@
         "nodeId": "task-5",
         "kind": "integration",
         "goal": "Ensure the module typechecks [I5]",
-        "dependsOn": [],
+        "dependsOn": [
+          "task-1",
+          "task-2",
+          "task-3",
+          "task-4"
+        ],
         "outputContract": {
           "requiredOutputs": [
             {
@@ -337,75 +345,40 @@
         "runtime": "ephemeral",
         "modelTier": "standard",
         "roleProfile": "pure-layer-impl",
-        "specDigest": "ed08002095428818d64779fdae4395e18066951d94599e792167168bc7629f76"
+        "specDigest": "fa5d2fd5c32a49a719821652b2bd76f02cff79bf945f65b1c42076d6e4501852"
       },
       {
         "nodeId": "task-6",
-        "kind": "review",
-        "goal": "Review the implementation of all functions for correctness and stability",
-        "dependsOn": [
-          "task-1",
-          "task-2",
-          "task-3",
-          "task-4"
-        ],
+        "kind": "work",
+        "goal": "Write unit tests for all functions [TESTS]",
+        "dependsOn": [],
         "outputContract": {
           "requiredOutputs": [
             {
-              "logicalName": "reviewNotes",
-              "kind": "notes"
-            }
-          ]
-        },
-        "acceptance": [],
-        "artifactScope": [
-          "packages/bus/src/swarm/"
-        ],
-        "sourceWriteScope": [
-          "packages/bus/src/swarm/"
-        ],
-        "estimatedRuntimeSec": 600,
-        "retryBudget": 2,
-        "required": true,
-        "runtime": "ephemeral",
-        "modelTier": "heavy",
-        "roleProfile": "pure-layer-impl",
-        "specDigest": "2f3d18a036f0f2875ce8ba0dc753a7f7f7836691c6dc7f47b0a3b39c4b3c6686"
-      },
-      {
-        "nodeId": "task-6::review",
-        "kind": "review",
-        "goal": "Independent review of task-6 (prose obligations): Ensure all functions meet the requirements and are implemented correctly.",
-        "dependsOn": [
-          "task-6"
-        ],
-        "outputContract": {
-          "requiredOutputs": [
-            {
-              "logicalName": "review-verdict",
-              "kind": "notes"
+              "logicalName": "unitTests",
+              "kind": "files"
             }
           ]
         },
         "acceptance": [
           {
-            "check": "required-review-pass",
-            "args": {
-              "version": "1",
-              "boundTo": "task-6",
-              "notes": [
-                "Ensure all functions meet the requirements and are implemented correctly."
-              ]
-            }
+            "check": "testsPass",
+            "args": {}
           }
         ],
-        "artifactScope": [],
+        "artifactScope": [
+          "packages/bus/test/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/test/"
+        ],
         "estimatedRuntimeSec": 600,
         "retryBudget": 2,
         "required": true,
         "runtime": "ephemeral",
-        "modelTier": "heavy",
-        "specDigest": "db106bec1cca9a6f10b93f6371925e188f04a95284077e6a38d2f3936d198a1c"
+        "modelTier": "standard",
+        "roleProfile": "test-impl",
+        "specDigest": "3aaa520dc8dd36e39683d5a57f330a406be0537d678de7327103dda0c1d89f6c"
       }
     ],
     "jobBudget": {
@@ -421,12 +394,12 @@
       "budgetPolicy": "bp-live-1",
       "r4ThresholdPolicy": "tp-live-1",
       "sourceBaselineDigest": "live-base",
-      "planningRequestId": "2d7f5cdb-4f0e-4c32-8ae5-ada1b3e8b930"
+      "planningRequestId": "78981d20-5ea8-4051-a34d-f820f21f3e86"
     },
     "notImplemented": [
       "r4-threshold"
     ],
-    "planDigest": "0e07b361ddebf2a80f7e6993390e9c2771cb6f9bd10101de9ff74bdea6b4df9b"
+    "planDigest": "8f61136ddd08e103ce494e5e0b08881a499dd17c57d33c9e5a8345a62d1f4433"
   },
   "fBaseline": [
     {
@@ -458,6 +431,11 @@
       "marker": "[I5]",
       "requiredCheck": "typecheckPasses",
       "expect": "implemented"
+    },
+    {
+      "id": "TESTS-DIR",
+      "requiredScopePrefix": "packages/bus/test/",
+      "expect": "implemented"
     }
   ],
   "fAudit": {
@@ -467,7 +445,8 @@
       "I2": "implemented",
       "I3": "implemented",
       "I4": "implemented",
-      "I5": "implemented"
+      "I5": "implemented",
+      "TESTS-DIR": "implemented"
     },
     "mismatches": []
   }

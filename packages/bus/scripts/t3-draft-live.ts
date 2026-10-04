@@ -51,9 +51,9 @@ const callModel: CallModel = async ({ system, user }) => {
 
 const fc: FrozenContext = {
   checkRegistry: { version: "cr-live-1", checks: { testsPass: {}, typecheckPasses: {}, fileExists: { args: { path: { type: "string", required: true } } } } },
-  ownerDomainPolicy: { version: "op-live-1", ownerByPrefix: [{ prefix: "packages/bus/src/swarm/", domain: "pure" }, { prefix: "scripts/", domain: "io" }], frozenScopePrefixes: ["docs/swarm/"] },
+  ownerDomainPolicy: { version: "op-live-1", ownerByPrefix: [{ prefix: "packages/bus/src/swarm/", domain: "pure" }, { prefix: "packages/bus/test/", domain: "pure" }, { prefix: "scripts/", domain: "io" }], frozenScopePrefixes: ["docs/swarm/"] },
   riskPolicy: { version: "rp-live-1", irreversiblePrefixes: ["ops/prod/"], undecidablePrefixes: [] },
-  roleCatalog: { version: "rc-live-1", roles: { "pure-layer-impl": { floor: "standard", fileDomain: ["packages/bus/src/swarm/"] }, "io-impl": { floor: "standard", fileDomain: ["scripts/"] } } },
+  roleCatalog: { version: "rc-live-1", roles: { "pure-layer-impl": { floor: "standard", fileDomain: ["packages/bus/src/swarm/"] }, "test-impl": { floor: "standard", fileDomain: ["packages/bus/test/"] }, "io-impl": { floor: "standard", fileDomain: ["scripts/"] } } },
   budgetPolicy: { version: "bp-live-1", coefficientUsdPerPoint: 0.5, maxModelUsd: 1000, maxTotalAttempts: 20, maxWallClockSec: 72000 },
   r4ThresholdPolicy: { version: "tp-live-1", maxTotalComplexity: 1000 },
   sourceBaselineDigest: "live-base",
@@ -68,8 +68,10 @@ const PRD = `Build a pure "plan metrics" module for the swarm brain. Requirement
 [I3] a function hasDesignGate(plan) returning whether a design node exists — verified by tests.
 [I4] a function summary(plan) returning a stable one-line string — verified by tests.
 [I5] the module must typecheck.
-Put the module under packages/bus/src/swarm/ and tests under packages/bus/test/. Use the allowed checks for acceptance.
-Each task's requiredOutputs kind MUST be "files" or "report" (NOT "patch"). Keep tasks independent (no dependsOn) where possible.`;
+Put the module under packages/bus/src/swarm/ and the tests under packages/bus/test/. Use the allowed checks for acceptance.
+Each task's requiredOutputs kind MUST be "files" or "report" (NOT "patch"). Keep tasks independent (no dependsOn) where possible.
+Include a dedicated task whose sourceWriteScope is ["packages/bus/test/"] that writes the unit tests (tag it [TESTS]).
+For acceptance use only the checks "testsPass" and "typecheckPasses" (do NOT use fileExists).`;
 
 const F_BASELINE: ReqBaseline[] = [
   { id: "I1", marker: "[I1]", requiredCheck: "testsPass", expect: "implemented" },
@@ -77,6 +79,8 @@ const F_BASELINE: ReqBaseline[] = [
   { id: "I3", marker: "[I3]", requiredCheck: "testsPass", expect: "implemented" },
   { id: "I4", marker: "[I4]", requiredCheck: "testsPass", expect: "implemented" },
   { id: "I5", marker: "[I5]", requiredCheck: "typecheckPasses", expect: "implemented" },
+  // UNTAGGED obligation from the PRD prose ("tests under packages/bus/test/"): verified by write scope, not a tag.
+  { id: "TESTS-DIR", requiredScopePrefix: "packages/bus/test/", expect: "implemented" },
 ];
 
 function dump(name: string, data: unknown): void {

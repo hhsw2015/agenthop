@@ -13,9 +13,10 @@
  */
 
 import { loadBundle, loadFrozenContext, storeBundle, storeFrozenContext, prdDigestOf, frozenRefsOf, type ResumeBundle } from "./plan-bundle.js";
-import { recompilePlan, type ClarificationAnswer, type RecompileResult } from "./plan-recompile.js";
+import { recompilePlan, answersFromClosedWaits, type ClarificationAnswer, type RecompileResult } from "./plan-recompile.js";
 import { digestOf } from "./digest.js";
 import type { Draft, FrozenContext } from "./task-translate.js";
+import type { WaitRecord } from "./control-log.js";
 
 export type ResumeDirs = { bundleDir?: string; policyDir?: string };
 
@@ -52,6 +53,19 @@ export function resumeClarification(i: ResumeInput, dirs: ResumeDirs = {}): Resu
   const withId: FrozenContext = { ...fc, planningRequestId: bundle.planningRequestId };
   const res = recompilePlan({ draft: bundle.draft, fc: withId, answers: i.answers, snapshotDigest: i.payloadRef, ...(i.actionKind !== undefined ? { actionKind: i.actionKind } : {}) });
   if (res.outcome !== "loadable") return res;
-  const projectedFcDigest = storeFrozenContext(res.projectedFc, dirs.policyDir); // persist C' as a new durable version
+  const projectedFcDigest = storeFrozenContext(res.projectedFc, dirs.policyDir); // persist the resolved context (durable)
   return { ...res, projectedFcDigest };
+}
+
+/** Resume from the CLOSED clarification waits — the trusted-winner path (reviewer P2-4/R2-P2-2). Each wait must be bound to
+ *  THIS payloadRef (reject a wait for a different snapshot) and carry a clarification close (answersFromClosedWaits); the
+ *  winner is the close FACT (advanceWait first-close-wins), never a caller casSeq. */
+export type ClosedWaitEntry = { questionId: string; wait: WaitRecord };
+export function resumeFromClosedWaits(i: { payloadRef: string; closedWaits: ClosedWaitEntry[]; actionKind?: string }, dirs: ResumeDirs = {}): ResumeResult {
+  for (const { questionId, wait } of i.closedWaits) {
+    if (wait.payloadRef !== i.payloadRef) return { outcome: "rejected", reason: `wait for ${questionId} is not bound to this payloadRef (got ${String(wait.payloadRef)}) — answer for a different snapshot/request` };
+  }
+  const derived = answersFromClosedWaits(i.closedWaits);
+  if (!derived.ok) return { outcome: "rejected", reason: derived.reason };
+  return resumeClarification({ payloadRef: i.payloadRef, answers: derived.answers, ...(i.actionKind !== undefined ? { actionKind: i.actionKind } : {}) }, dirs);
 }

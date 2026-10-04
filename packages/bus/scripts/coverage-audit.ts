@@ -7,11 +7,20 @@
  * omission check + structured-acceptance evidence against a hand-made baseline (reviewer P2-5).
  */
 
-export type ReqBaseline = { id: string; marker: string; requiredCheck?: string; expect: "implemented" | "constrained-review" | "deferred" };
+/** A hand-made requirement. `marker` is optional: a requirement can be an UNTAGGED obligation verified purely by scope
+ *  (e.g. "tests must be written under packages/bus/test/" => requiredScopePrefix). `requiredCheck`/`requiredScopePrefix`
+ *  are the structured evidence needed for "implemented" (a marker alone is never enough). */
+export type ReqBaseline = { id: string; marker?: string; requiredCheck?: string; requiredScopePrefix?: string; expect: "implemented" | "constrained-review" | "deferred" };
 export type Disposition = "implemented" | "constrained-review" | "deferred" | "UNCOVERED";
 
-type PlanNodeLike = { kind?: string; goal?: string; acceptance?: Array<{ check?: string } | unknown> };
+type PlanNodeLike = { kind?: string; goal?: string; acceptance?: Array<{ check?: string } | unknown>; artifactScope?: unknown; sourceWriteScope?: unknown };
 type PlanLike = { nodes: PlanNodeLike[] };
+
+function nodeCoversScope(n: PlanNodeLike, prefix: string): boolean {
+  const scopes = [...(Array.isArray(n.artifactScope) ? n.artifactScope : []), ...(Array.isArray(n.sourceWriteScope) ? n.sourceWriteScope : [])];
+  return scopes.some((s) => typeof s === "string" && (s === prefix || s.startsWith(prefix)));
+}
+const isImplNode = (n: PlanNodeLike): boolean => n.kind !== "design" && n.kind !== "review";
 
 const OMISSION = /(do not|don'?t|does not|will not|won'?t|not implement|not implemented|skip|omit|omitted|without|out of scope|no longer|instead only|only print)/i;
 
@@ -27,6 +36,11 @@ function acceptanceHasCheck(n: PlanNodeLike, check: string): boolean {
 export function auditCoverage(plan: PlanLike, reqs: ReqBaseline[]): Record<string, Disposition> {
   const out: Record<string, Disposition> = {};
   for (const req of reqs) {
+    // Untagged scope obligation: implemented iff some impl node's write/artifact scope covers the required prefix.
+    if (req.marker === undefined) {
+      out[req.id] = req.requiredScopePrefix !== undefined && plan.nodes.some((n) => isImplNode(n) && nodeCoversScope(n, req.requiredScopePrefix!)) ? "implemented" : "UNCOVERED";
+      continue;
+    }
     let deferred = false, review = false, implemented = false;
     for (const n of plan.nodes) {
       const goal = String(n.goal ?? "");
@@ -35,9 +49,11 @@ export function auditCoverage(plan: PlanLike, reqs: ReqBaseline[]): Record<strin
       // An explicit omission/deferral clause for this marker is NOT implementation.
       if (/\bDEFER\b/.test(goal) || OMISSION.test(markerClause(goal, req.marker))) { deferred = true; continue; }
       if (n.kind === "design" || n.kind === "review") { review = true; continue; }
-      // A plain node mentioning the marker positively counts as implemented ONLY with the required structured evidence —
-      // keeping the marker but dropping the required check is NOT implementation.
-      if (req.requiredCheck === undefined || acceptanceHasCheck(n, req.requiredCheck)) implemented = true;
+      // Positive mention counts as implemented ONLY with ALL required structured evidence (check + scope, whichever set) —
+      // keeping the marker but dropping the obligation's check or write scope is NOT implementation.
+      const checkOk = req.requiredCheck === undefined || acceptanceHasCheck(n, req.requiredCheck);
+      const scopeOk = req.requiredScopePrefix === undefined || nodeCoversScope(n, req.requiredScopePrefix);
+      if (checkOk && scopeOk) implemented = true;
     }
     // Precedence: a review/design gate CONSTRAINS the requirement (even if also implemented); then genuine implementation;
     // then an explicit deferral; else a drop. An omission clause never reaches "implemented" (it set deferred and skipped).

@@ -17,8 +17,9 @@
 
 import { translateDraft, type Draft, type FrozenContext, type ClarificationQuestion } from "./task-translate.js";
 import type { TaskPlan } from "./task-plan.js";
-import { evaluateR4, overlaps, overlapsAny } from "./task-r4.js";
+import { evaluateR4, overlapsAny, type NodeRisk } from "./task-r4.js";
 import { digestOf } from "./digest.js";
+import type { WaitRecord, WaitResolution } from "./control-log.js";
 
 /** A requester's answer to one clarification question. STRUCTURED (no NL parsing, consistent with translateDraft):
  *  reversible resolves the unknown-risk the question asked about; owner is advisory this batch. casSeq is the optional
@@ -53,6 +54,8 @@ export function canonicalAnswerSet(answers: ClarificationAnswer[]): AnswerSetRes
   const groups = new Map<string, ClarificationAnswer[]>();
   for (const a of answers) {
     if (a === null || typeof a !== "object" || typeof a.questionId !== "string" || a.questionId.length === 0 || typeof a.reversible !== "boolean") continue;
+    // casSeq must be absent or a finite number — a string/NaN casSeq would poison Math.max and the top-group filter.
+    if (a.casSeq !== undefined && (typeof a.casSeq !== "number" || !Number.isFinite(a.casSeq))) continue;
     const g = groups.get(a.questionId);
     if (g) g.push(a); else groups.set(a.questionId, [a]);
   }
@@ -78,23 +81,17 @@ export function mintPlanOperationId(i: PlanOpInput): string {
 }
 
 export type ProjectResult =
-  | { ok: true; draft: Draft; fc: FrozenContext; canonAnswers: CanonicalAnswer[] }
+  | { ok: true; resolvedRisk: Record<string, NodeRisk>; canonAnswers: CanonicalAnswer[] }
   | { ok: false; reason: string }
   | { incomplete: true; unanswered: string[] };
 
-/** Fold answers into a new (D', C'). Never mutates the originals (content-addressed snapshot stays immutable) and NEVER
- *  rewrites the requester's criticalPath declaration — an answer about reversibility is not a new criticality fact.
- *  Resolution is PATH-EXACT: each answer binds to its own node path, so a sibling path on an unanswered node keeps its
- *  unknown status.
- *   - Per path, conservatively: reversible only if every answer touching it agrees (any irreversible wins => gate).
- *   - C'.undecidablePrefixes: a prefix an answer TOUCHES is replaced by the still-UNANSWERED node paths under it
- *     (siblings stay unknown => design gate); a prefix no answer touches is kept verbatim. So the answered path leaves
- *     the unknown set exactly, without de-classifying siblings and without touching criticalPath.
- *   - C'.irreversiblePrefixes gains every answered-irreversible path.
- *   - C'.version is CONTENT-addressed over the RESULTING policy, so two different projected policies never share a version
- *     (a managed reload cannot accept a swapped policy).
- *  Returns {ok:false} on a conflicting (no-provable-winner) answer set; incomplete when any emitted question is unanswered
- *  (=> caller keeps needsClarification, the safe default). */
+/** Fold answers into a per-NODE risk map (design §3 "节点显式标记") — nodeId+path bound, NOT a global path set. Never
+ *  mutates the originals and NEVER touches criticalPath (a reversibility answer is not a criticality fact). A node is
+ *  resolved only from ITS OWN answered paths: irreversible if ANY of its answers is irreversible, else reversible. Because
+ *  clarifyTargets asks every (critical node, undecidable path) and recompile requires all answered, a resolved node has ALL
+ *  its undecidable paths adjudicated — a partial answer never clears a node. An UNANSWERED (e.g. non-critical) node writing
+ *  the same or an overlapping path gets NO entry, so it keeps its policy unknown-risk (and thus its design gate).
+ *  Returns {ok:false} on a conflicting answer set; incomplete when any emitted question is unanswered (=> needsClarification). */
 export function projectAnswers(draft: Draft, fc: FrozenContext, answers: ClarificationAnswer[]): ProjectResult {
   const targets = clarifyTargets(draft, fc);
   if (targets.length === 0) return { ok: false, reason: "no open clarification for this (draft, frozenContext)" };
@@ -105,30 +102,13 @@ export function projectAnswers(draft: Draft, fc: FrozenContext, answers: Clarifi
   const unanswered = targets.filter((t) => !byId.has(t.questionId)).map((t) => t.questionId);
   if (unanswered.length > 0) return { incomplete: true, unanswered };
 
-  // Conservative per-path aggregate: reversible only if every answer for that path agrees. Any irreversible wins (=> gate).
-  const reversibleByPath = new Map<string, boolean>();
-  for (const t of targets) reversibleByPath.set(t.path, (reversibleByPath.get(t.path) ?? true) && byId.get(t.questionId)!.reversible);
-  const answeredPathSet = new Set(reversibleByPath.keys());
-  const allNodePaths = new Set<string>();
-  for (const t of draft.tasks) for (const p of t.sourceWriteScope ?? []) allNodePaths.add(p);
-
-  const risk = fc.riskPolicy;
-  // Path-exact undecidable resolution: replace a touched prefix with the UNANSWERED node paths still under it.
-  const newUndecidableSet = new Set<string>();
-  for (const Q of risk.undecidablePrefixes) {
-    if (![...answeredPathSet].some((p) => overlaps(p, Q))) { newUndecidableSet.add(Q); continue; } // untouched prefix kept verbatim
-    for (const p of allNodePaths) if (overlaps(p, Q) && !answeredPathSet.has(p)) newUndecidableSet.add(p); // siblings stay unknown
+  // Per-node aggregate (conservative): any irreversible answer for a node => the node is irreversible; else reversible.
+  const perNode = new Map<string, NodeRisk>();
+  for (const t of targets) {
+    const rev = byId.get(t.questionId)!.reversible;
+    perNode.set(t.nodeId, perNode.get(t.nodeId) === "irreversible" || !rev ? "irreversible" : "reversible");
   }
-  const addIrreversible = [...reversibleByPath.entries()].filter(([, rev]) => rev === false).map(([p]) => p);
-  const newIrreversible = [...new Set([...risk.irreversiblePrefixes, ...addIrreversible])].sort();
-  const newUndecidable = [...newUndecidableSet].sort();
-  const contentDigest = digestOf({ base: risk.version, irreversiblePrefixes: newIrreversible, undecidablePrefixes: newUndecidable, answers: canon });
-  const fcPrime: FrozenContext = {
-    ...fc,
-    riskPolicy: { version: `${risk.version}+clar-${contentDigest.slice(0, 16)}`, irreversiblePrefixes: newIrreversible, undecidablePrefixes: newUndecidable },
-  };
-  // D' = draft unchanged: criticalPath is the requester's declaration and is never forged away by a reversibility answer.
-  return { ok: true, draft, fc: fcPrime, canonAnswers: canon };
+  return { ok: true, resolvedRisk: Object.fromEntries(perNode), canonAnswers: canon };
 }
 
 export type RecompileInput = {
@@ -143,7 +123,7 @@ export type RecompileInput = {
   actionKind?: string;
 };
 export type RecompileResult =
-  | { outcome: "loadable"; plan: TaskPlan; operationId: string; snapshotDigest: string; answerSetDigest: string; projectedDraft: Draft; projectedFc: FrozenContext }
+  | { outcome: "loadable"; plan: TaskPlan; operationId: string; snapshotDigest: string; answerSetDigest: string; resolvedRisk: Record<string, NodeRisk>; projectedDraft: Draft; projectedFc: FrozenContext }
   | { outcome: "needsClarification"; questions: ClarificationQuestion[]; unanswered: string[] }
   | { outcome: "needsRole"; missingRoles: string[]; reason: string }
   | { outcome: "rejected"; reason: string };
@@ -159,8 +139,11 @@ export function recompilePlan(i: RecompileInput): RecompileResult {
   }
   if (!proj.ok) return { outcome: "rejected", reason: proj.reason };
 
-  const res = translateDraft(proj.draft, proj.fc);
-  if (res.outcome === "needsClarification") return { outcome: "needsClarification", questions: res.questions, unanswered: [] };
+  // Re-translate the ORIGINAL draft/fc with the trusted per-node resolvedRisk map (design §3): resolved critical nodes stop
+  // being unknown-risk; unanswered nodes keep policy risk (and their gate). criticalPath declarations are untouched.
+  const res = translateDraft(i.draft, i.fc, { resolvedRisk: proj.resolvedRisk });
+  // All questions were answered, so a re-translate that STILL needs clarification is a safety-net defect — reject, never loop.
+  if (res.outcome === "needsClarification") return { outcome: "rejected", reason: "projected plan unexpectedly still needs clarification after a complete, trusted answer set" };
   if (res.outcome === "needsRole") return { outcome: "needsRole", missingRoles: res.missingRoles, reason: res.reason };
   if (res.outcome === "rejected") return { outcome: "rejected", reason: res.reason };
 
@@ -172,5 +155,29 @@ export function recompilePlan(i: RecompileInput): RecompileResult {
     snapshotDigest: i.snapshotDigest,
     canonicalAnswerSetDigest: answerSetDigest,
   });
-  return { outcome: "loadable", plan: res.plan, operationId, snapshotDigest: i.snapshotDigest, answerSetDigest, projectedDraft: proj.draft, projectedFc: proj.fc };
+  return { outcome: "loadable", plan: res.plan, operationId, snapshotDigest: i.snapshotDigest, answerSetDigest, resolvedRisk: proj.resolvedRisk, projectedDraft: i.draft, projectedFc: i.fc };
+}
+
+/** The clarification answer rides on the query-wait's CLOSE resolution (no new WaitRecord field): the outcome string encodes
+ *  reversibility. advanceWait already enforces first-close-wins (a close on a resolved wait is rejected), so the resolved
+ *  wait carries the single trusted winner — never a transport-order or caller-casSeq pick. */
+export const CLARIFY_OUTCOME = { reversible: "clarified:reversible", irreversible: "clarified:irreversible" } as const;
+export function clarificationResolution(reversible: boolean, sourceOperationId: string): WaitResolution {
+  return { outcome: reversible ? CLARIFY_OUTCOME.reversible : CLARIFY_OUTCOME.irreversible, reason: `requester clarified: ${reversible ? "reversible" : "irreversible"}`, sourceOperationId };
+}
+
+/** Derive the answer set from CLOSED query-waits — the trusted-winner source (reviewer P2-4/seam-3). Each entry's wait MUST
+ *  be resolved (closed via advanceWait) and carry a clarification outcome; the winner is the close FACT, not a caller casSeq.
+ *  Rejects a not-closed or non-clarification wait rather than guessing. */
+export function answersFromClosedWaits(entries: Array<{ questionId: string; wait: WaitRecord }>): { ok: true; answers: ClarificationAnswer[] } | { ok: false; reason: string } {
+  const answers: ClarificationAnswer[] = [];
+  for (const { questionId, wait } of entries) {
+    if (typeof questionId !== "string" || questionId.length === 0) return { ok: false, reason: "a closed-wait entry needs a non-empty questionId" };
+    if (wait.state !== "resolved") return { ok: false, reason: `wait for ${questionId} is not closed (state=${wait.state}) — only a closed-wait fact is a trusted answer` };
+    const outcome = wait.resolution?.outcome;
+    if (outcome === CLARIFY_OUTCOME.reversible) answers.push({ questionId, reversible: true });
+    else if (outcome === CLARIFY_OUTCOME.irreversible) answers.push({ questionId, reversible: false });
+    else return { ok: false, reason: `wait for ${questionId} is not a clarification close (outcome=${String(outcome)})` };
+  }
+  return { ok: true, answers };
 }

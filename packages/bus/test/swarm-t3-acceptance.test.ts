@@ -106,4 +106,18 @@ describe("acceptance F: independent coverage audit (structured evidence, omissio
     if (r.outcome !== "loadable") throw new Error("setup");
     expect(auditCoverage(r.plan, reqs)["I1"]).not.toBe("implemented"); // the reviewer's MARKER-WITH-EXPLICIT-OMISSION
   });
+
+  test("R2-P2-3: an UNTAGGED scope obligation (tests under a dir) is UNCOVERED when no node writes there, implemented when one does", () => {
+    const scopeReq: ReqBaseline[] = [{ id: "TESTS-DIR", requiredScopePrefix: "packages/bus/test/", expect: "implemented" }];
+    const noTests = translateDraft({ jobId: "jobS1", tasks: [task({ nodeId: "src1", sourceWriteScope: ["packages/bus/src/swarm/x.ts"], roleProfile: "pure-layer-impl" })] }, fc());
+    if (noTests.outcome !== "loadable") throw new Error("setup");
+    expect(auditCoverage(noTests.plan, scopeReq)["TESTS-DIR"]).toBe("UNCOVERED"); // prose obligation silently dropped -> caught
+
+    const withTests = translateDraft({ jobId: "jobS2", tasks: [
+      task({ nodeId: "src1", sourceWriteScope: ["packages/bus/src/swarm/x.ts"], roleProfile: "pure-layer-impl" }),
+      task({ nodeId: "tests1", artifactScope: ["packages/bus/test/"], sourceWriteScope: ["packages/bus/test/"], roleProfile: "pure-layer-impl" }),
+    ] }, fc());
+    if (withTests.outcome !== "loadable") throw new Error("setup2");
+    expect(auditCoverage(withTests.plan, scopeReq)["TESTS-DIR"]).toBe("implemented");
+  });
 });

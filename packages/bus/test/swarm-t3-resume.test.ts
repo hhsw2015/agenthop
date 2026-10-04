@@ -2,11 +2,12 @@ import { describe, expect, test, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { storeResumeState, resumeClarification, type ResumeDirs } from "../src/swarm/plan-resume.js";
+import { storeResumeState, resumeClarification, resumeFromClosedWaits, type ResumeDirs } from "../src/swarm/plan-resume.js";
 import { storeFrozenContext, loadFrozenContext, storeBundle, loadBundle, frozenRefsOf } from "../src/swarm/plan-bundle.js";
 import { loadPlan } from "../src/swarm/task-plan.js";
 import { commit, initialLogState, type Change } from "../src/swarm/control-log.js";
-import { clarifyTargets, type ClarificationAnswer } from "../src/swarm/plan-recompile.js";
+import { clarifyTargets, clarificationResolution, type ClarificationAnswer } from "../src/swarm/plan-recompile.js";
+import { openQueryWait, advanceWait } from "../src/swarm/task-wait.js";
 import { translateDraft, type Draft, type DraftTask, type FrozenContext } from "../src/swarm/task-translate.js";
 
 // T3b recompile ORCHESTRATION (design 1d0a1ffc §1 line 21; reviewer P2-4): the verified resume entry — payloadRef +
@@ -54,9 +55,9 @@ describe("storeResumeState + resumeClarification round-trip", () => {
     const refs = r.plan.frozenRefs;
     expect(refs).toBeDefined();
     if (!refs) return;
-    expect(cPrime.riskPolicy.version).toBe(refs.riskPolicy); // the plan carries C''s version ref
-    // and C' managed-reloads the plan it produced
-    const again = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: cPrime.ownerDomainPolicy, riskPolicy: cPrime.riskPolicy, expectedFrozenRefs: refs });
+    expect(cPrime.riskPolicy.version).toBe(refs.riskPolicy); // the plan carries the resolved context's version ref
+    // the plan managed-reloads ONLY with the trusted resolvedRisk evidence the resume returned (serialized field alone is not trusted)
+    const again = loadPlan(r.plan, { mode: "managed-t3", ownerDomainPolicy: cPrime.ownerDomainPolicy, riskPolicy: cPrime.riskPolicy, expectedFrozenRefs: refs, resolvedRisk: r.resolvedRisk });
     expect(again.ok).toBe(true);
   });
 
@@ -81,6 +82,25 @@ describe("storeResumeState + resumeClarification round-trip", () => {
     if (r.outcome === "rejected") expect(r.reason).toMatch(/drift|swap|match/i);
   });
 
+  test("resumeFromClosedWaits: a wait closed with a clarification resolution (bound to the payloadRef) resumes to loadable", () => {
+    const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);
+    const qid = clarifyTargets(draft, fc())[0]!.questionId;
+    const w = openQueryWait({ waitId: "w1", subject: { jobId: "jobR" }, deadlineSec: 100, owner: "coord", defaultOnTimeout: { outcome: "default-applied", reason: "r", sourceOperationId: "d" }, payloadRef });
+    const closed = advanceWait(w, { type: "close", resolution: clarificationResolution(true, "op-win") });
+    expect(closed.ok).toBe(true);
+    if (!closed.ok) return;
+    const r = resumeFromClosedWaits({ payloadRef, closedWaits: [{ questionId: qid, wait: closed.wait }] }, dirs);
+    expect(r.outcome).toBe("loadable");
+  });
+  test("resumeFromClosedWaits: a wait bound to a DIFFERENT payloadRef is rejected (no cross-snapshot answer)", () => {
+    const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);
+    const qid = clarifyTargets(draft, fc())[0]!.questionId;
+    const w = openQueryWait({ waitId: "w1", subject: { jobId: "jobR" }, deadlineSec: 100, owner: "coord", defaultOnTimeout: { outcome: "default-applied", reason: "r", sourceOperationId: "d" }, payloadRef: "a".repeat(64) });
+    const closed = advanceWait(w, { type: "close", resolution: clarificationResolution(true, "op-win") });
+    if (!closed.ok) return;
+    const r = resumeFromClosedWaits({ payloadRef, closedWaits: [{ questionId: qid, wait: closed.wait }] }, dirs);
+    expect(r.outcome).toBe("rejected");
+  });
   test("accurate replay: the same resume committed twice is a replay no-op; a swapped-policy ref never reaches the same op", () => {
     const { payloadRef } = storeResumeState({ draft, prd, fc: fc() }, dirs);
     const r1 = resumeClarification({ payloadRef, answers: answersFrom(fc(), true) }, dirs);

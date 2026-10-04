@@ -17,7 +17,7 @@
  */
 
 import { digestOf } from "./digest.js";
-import { evaluateR4, overlapsAny, type OwnerDomainPolicy, type RiskPolicy } from "./task-r4.js";
+import { evaluateR4, overlapsAny, type OwnerDomainPolicy, type RiskPolicy, type NodeRisk } from "./task-r4.js";
 
 // "design" (team-collab §0b R4): an adversarial-review GATE node a planner auto-prepends for a high-stakes change —
 // kind IS task identity (in specDigest), so it is a first-class kind, not a role annotation.
@@ -82,8 +82,14 @@ export type TaskSpec = {
    *  modelTier/roleProfile), kept in planDigest. Persisted so the managed loader can re-verify the unknown∧critical ->
    *  needsClarification decision instead of trusting the planner. */
   criticalPath?: boolean;
+  /** Per-node risk adjudication from a requester clarification (T3b, design §3 "节点显式标记"). Annotation class —
+   *  EXCLUDED from specDigest (same family as modelTier/roleProfile/criticalPath), kept in planDigest. **NOT trusted from
+   *  the serialized plan by the managed loader** — because "reversible" can REMOVE a design gate (an asymmetric, dangerous
+   *  forge), the managed loader IGNORES this field unless the caller supplies matching trusted clarification evidence
+   *  (ManagedT3Opts.resolvedRisk, derived from closed waits bound to the payloadRef). Set only by the recompile. */
+  resolvedRisk?: NodeRisk;
   /** canonical-JSON SHA-256 of the TASK IDENTITY fields — everything EXCEPT specDigest and the role annotations
-   *  required/runtime/visibility/modelTier/roleProfile/criticalPath (coveredSpecDigests stays IN: it is identity). */
+   *  required/runtime/visibility/modelTier/roleProfile/criticalPath/resolvedRisk (coveredSpecDigests stays IN: identity). */
   specDigest: string;
 };
 
@@ -124,7 +130,17 @@ export type TaskPlan = {
 /** Optional managed-T3 loader mode (loader-interface ruling f06894b8): the loader re-runs the SHARED evaluateR4 against
  *  a trusted policy snapshot and enforces that a required design gate exists covering every impl node — it does NOT just
  *  trust the planner's own coverage. Also ref-matches the plan's frozenRefs against the snapshot. No IO/LLM. */
-export type ManagedT3Opts = { mode: "managed-t3"; ownerDomainPolicy: OwnerDomainPolicy; riskPolicy: RiskPolicy; expectedFrozenRefs: FrozenRefs };
+export type ManagedT3Opts = {
+  mode: "managed-t3";
+  ownerDomainPolicy: OwnerDomainPolicy;
+  riskPolicy: RiskPolicy;
+  expectedFrozenRefs: FrozenRefs;
+  /** TRUSTED per-node risk evidence (nodeId -> NodeRisk), derived by the caller from closed clarification waits bound to
+   *  the plan's payloadRef. A node's serialized resolvedRisk is honored ONLY when it matches this map; otherwise it is
+   *  IGNORED (treated as policy), so a forged resolvedRisk cannot remove a design gate. Absent => all serialized
+   *  resolvedRisk ignored. */
+  resolvedRisk?: Record<string, NodeRisk>;
+};
 
 export type LoadResult = { ok: true; plan: TaskPlan } | { ok: false; reason: string };
 
@@ -140,7 +156,7 @@ const VISIBILITIES: ReadonlySet<string> = new Set(["visible", "headless"]);
  *  retagged required/durable/visible/retiered/restaffed (§4.2 V5; fe0376cd review #2; T3 F-T3-2). coveredSpecDigests
  *  is NOT excluded — a design node's coverage set is part of its identity. */
 export function computeSpecDigest(spec: TaskSpec): string {
-  const { specDigest: _d, required: _r, runtime: _rt, visibility: _v, modelTier: _mt, roleProfile: _rp, criticalPath: _cp, ...identity } = spec;
+  const { specDigest: _d, required: _r, runtime: _rt, visibility: _v, modelTier: _mt, roleProfile: _rp, criticalPath: _cp, resolvedRisk: _rr, ...identity } = spec;
   return digestOf(identity);
 }
 
@@ -204,6 +220,7 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
   if (o.roleProfile !== undefined && !isNonEmptyString(o.roleProfile)) return { reason: `${where}.roleProfile must be a non-empty string` };
   if (o.coveredSpecDigests !== undefined && !isStringArray(o.coveredSpecDigests)) return { reason: `${where}.coveredSpecDigests must be a string[]` };
   if (o.criticalPath !== undefined && typeof o.criticalPath !== "boolean") return { reason: `${where}.criticalPath must be a boolean` };
+  if (o.resolvedRisk !== undefined && o.resolvedRisk !== "reversible" && o.resolvedRisk !== "irreversible") return { reason: `${where}.resolvedRisk must be "reversible" or "irreversible"` };
 
   const spec: TaskSpec = {
     nodeId: o.nodeId,
@@ -233,6 +250,7 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
     ...(o.roleProfile !== undefined ? { roleProfile: o.roleProfile as string } : {}),
     ...(o.coveredSpecDigests !== undefined ? { coveredSpecDigests: [...(o.coveredSpecDigests as string[])] } : {}),
     ...(o.criticalPath !== undefined ? { criticalPath: o.criticalPath as boolean } : {}),
+    ...(o.resolvedRisk !== undefined ? { resolvedRisk: o.resolvedRisk as NodeRisk } : {}),
     specDigest: "",
   };
   return { spec };
@@ -324,13 +342,18 @@ function frozenRefsMismatch(got: FrozenRefs | undefined, want: FrozenRefs): stri
  *  node's coverage. Catches the structural bypasses a/b/c miss — deleting all design nodes (still cross-domain) or
  *  covering only a subset. (Structural dangling/ancestor/non-empty is validateR4Coverage's job.) */
 function validateManagedT3(specs: TaskSpec[], opts: ManagedT3Opts): string | null {
+  // EFFECTIVE per-node risk: honor a serialized resolvedRisk ONLY when it matches the caller's TRUSTED evidence map;
+  // otherwise ignore it (a forged resolvedRisk must not remove a gate). Absent evidence => every serialized value ignored.
+  const effectiveRisk = (s: TaskSpec): NodeRisk | undefined =>
+    s.resolvedRisk !== undefined && opts.resolvedRisk?.[s.nodeId] === s.resolvedRisk ? s.resolvedRisk : undefined;
+
   // A critical node with an unknown-risk path should have been needsClarification, never loadable (c790ff1d ③ /
-  // errata 0b966a11). This applies to EVERY node — INCLUDING a design gate itself (don't gate a design with a design,
-  // just reject the unclarified plan); so it runs over all specs, not the impl-only filter used for coverage.
-  for (const s of specs) if (s.criticalPath === true) for (const p of s.sourceWriteScope ?? []) {
+  // errata 0b966a11) — UNLESS a trusted clarification resolved it (effective resolvedRisk present). This applies to EVERY
+  // node — INCLUDING a design gate itself; so it runs over all specs, not the impl-only filter used for coverage.
+  for (const s of specs) if (s.criticalPath === true && effectiveRisk(s) === undefined) for (const p of s.sourceWriteScope ?? []) {
     if (overlapsAny(p, opts.riskPolicy.undecidablePrefixes)) return `managed-t3: node ${s.nodeId} is criticalPath with unknown-risk path ${p} — should be needsClarification, not loadable`;
   }
-  const impl = specs.filter((s) => s.kind !== "design");
+  const impl = specs.filter((s) => s.kind !== "design").map((s) => ({ ...s, resolvedRisk: effectiveRisk(s) }));
   const assess = evaluateR4(impl, opts.ownerDomainPolicy, opts.riskPolicy);
   if (!assess.designRequired) return null;
   const covered = new Set<string>();

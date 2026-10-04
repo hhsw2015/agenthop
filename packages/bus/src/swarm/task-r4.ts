@@ -38,7 +38,12 @@ export function domainsTouched(path: string, policy: OwnerDomainPolicy): Set<str
  *  unmapped area is unknown-owner even when it also touches a known NESTED subtree (reviewer seam #1). */
 export const pathHasOwner = (path: string, policy: OwnerDomainPolicy): boolean => policy.ownerByPrefix.some((e) => path === e.prefix || path.startsWith(e.prefix));
 
-export type R4NodeInput = { nodeId: string; sourceWriteScope?: string[] };
+/** A node-level risk adjudication (design §3 "节点显式标记"): a trusted per-node override of the UNKNOWN dimension only —
+ *  set by the recompile after a requester clarification, never self-declared by a draft. "reversible" clears the node's
+ *  undecidable-risk; "irreversible" marks the node irreversible (=> design gate). Policy-irreversible paths ALWAYS apply
+ *  regardless (the override cannot mask a known-irreversible write). */
+export type NodeRisk = "reversible" | "irreversible";
+export type R4NodeInput = { nodeId: string; sourceWriteScope?: string[]; resolvedRisk?: NodeRisk };
 export type R4Assessment = { designRequired: boolean; reasons: string[]; unknownRiskNodeIds: string[]; unknownOwnerPaths: string[] };
 
 export function evaluateR4(nodes: R4NodeInput[], owner: OwnerDomainPolicy, risk: RiskPolicy): R4Assessment {
@@ -58,9 +63,13 @@ export function evaluateR4(nodes: R4NodeInput[], owner: OwnerDomainPolicy, risk:
       if (overlapsAny(p, owner.frozenScopePrefixes)) frozen = true;
       // #2: irreversible and unknown are INDEPENDENT facts — a broad scope hitting both keeps both (no "known beats
       // unknown" collapse): irreversible -> design (condition 4); unknown -> clarify-if-critical / design-if-not upstream.
+      // policy-irreversible ALWAYS applies, even for a node resolved "reversible" (the override cannot mask a known write).
       if (overlapsAny(p, risk.irreversiblePrefixes)) irreversible = true;
-      if (overlapsAny(p, risk.undecidablePrefixes)) { unknownRisk = true; nodeUnknownRisk = true; }
+      // the unknown (undecidable) dimension is overridable per node (design §3 "节点显式标记"): a resolvedRisk marker set by
+      // the recompile after a requester clarification suppresses the policy's unknown classification for THIS node.
+      if (n.resolvedRisk === undefined && overlapsAny(p, risk.undecidablePrefixes)) { unknownRisk = true; nodeUnknownRisk = true; }
     }
+    if (n.resolvedRisk === "irreversible") irreversible = true; // node explicitly adjudicated irreversible -> design gate
     if (nodeUnknownRisk) unknownRiskNodeIds.push(n.nodeId);
   }
   const reasons = [
