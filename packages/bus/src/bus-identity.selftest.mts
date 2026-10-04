@@ -573,4 +573,161 @@ const srcClaim = (value: string, form: Claim["form"], source: string, derivedFro
   } finally { rmSync(home, { recursive: true, force: true }); }
 }
 
+// =============================================================================================
+// immune-backlog #1 — ported once-red probes (reviewer scenario ids, fe0376cd task 2026-10-04).
+// Each case replicates an adversarial probe shape that was once RED in a review round and is now
+// permanently catchable here. Names carry the reviewer's scenario id + its round (R6/R7). The other
+// ~70 reviewer scenarios map to the cases above (see _ACK/migration list); these are the shapes not
+// already covered 1:1 by the round-by-round cases.
+// =============================================================================================
+{
+  const C = (value: string, form: Claim["form"], confidence: Claim["confidence"], extra: Partial<Claim> = {}): Claim => ({ value, form, confidence, provenance: "same-announce", ...extra });
+  const P = (ev: import("./bus-identity.js").IdentityEvent[]) => buildProjection(ev);
+  const AV = (p: ReturnType<typeof buildProjection>, v: string) => [...p.entities.values()].flatMap((e) => e.incarnations).flatMap((i) => i.claims).filter((c) => c.value === v && !c.superseded);
+  const UV = (p: ReturnType<typeof buildProjection>, v: string) => p.undecided.filter((c) => c.value === v);
+  const K = (p: ReturnType<typeof buildProjection>, v: string) => whois(p, v).kind;
+
+  // R6: an initial run-derived handle stays paired with the run through a later native bootstrap.
+  {
+    const base = [obs("run-parent-R", [C("run-parent-R", "run", "hard")], { ts: 1, eventId: "rp-root" }), obs("run-parent-R", [C("run-derived-H", "handle", "hard", { source: "rp-root", derivedFrom: { value: "run-parent-R", form: "run" } })], { ts: 2, eventId: "rp-copy" })];
+    const beforeId = eidOf(whois(P(base), "run-derived-H"));
+    const p = P([...base, learn("run-parent-R", undefined, "run-parent-A", "bootstrap", true, { ts: 3, eventId: "rp-boot" })]);
+    t("immune R6 explicit_run_parent_routes_and_survives_native_bootstrap", beforeId !== "" && K(p, "run-derived-H") === "entity" && eidOf(whois(p, "run-derived-H")) === beforeId && eidOf(whois(p, "run-derived-H")) === eidOf(whois(p, "run-parent-A")));
+  }
+  // R6: correcting native X retires only the native-derived possible handle; the run-derived hard handle survives.
+  {
+    const p = P([obs("form-X", [C("form-X", "run", "hard"), C("form-X", "native", "possible"), C("run-H", "handle", "hard", { derivedFrom: { value: "form-X", form: "run" } }), C("native-H", "handle", "possible", { derivedFrom: { value: "form-X", form: "native" } })], { ts: 1, eventId: "form-root" }), learn("form-X", "form-X", "form-Y", "correction", true, { ts: 2, eventId: "form-corr" })]);
+    t("immune R6 explicit_parent_form_protects_run_from_same_literal_guess", K(p, "run-H") === "entity" && K(p, "native-H") === "not-seen" && !p.possibleIndex.has("native-H"));
+  }
+  // R6: a legacy/invalid derivedFrom shape is schema-rejected as corruption; the explicit {value,form} is accepted.
+  {
+    const mkEv = (parent: unknown) => ({ v: 1, eventId: "fmt", ts: 1, type: "observe", incarnation: { key: "fmt-R", scope: "local", claims: [{ value: "fmt-R", form: "run", confidence: "hard", provenance: "same-announce" }, { value: "fmt-H", form: "handle", confidence: "hard", provenance: "same-announce", derivedFrom: parent }] } });
+    const bad = ["bare-string", { value: "fmt-R" }, { value: "fmt-R", form: "invalid" }].every((parent) => isValidEvent(mkEv(parent)) === false);
+    t("immune R6 explicit_parent_form_rejects_legacy_derivedFrom_shapes", bad && isValidEvent(mkEv({ value: "fmt-R", form: "run" })) === true);
+  }
+  // R6: a hard handle whose explicit parent form is run survives correction of a same-source same-literal native.
+  {
+    const p = P([obs("X", [C("X", "run", "hard"), C("X", "native", "possible"), C("run-H4", "handle", "hard", { derivedFrom: { value: "X", form: "run" } }), C("native-H4", "handle", "possible", { derivedFrom: { value: "X", form: "native" } })], { ts: 1, eventId: "rps-root" }), learn("X", "X", "true-B4", "correction", true, { ts: 2, eventId: "rps-corr" })]);
+    t("immune R6 explicit_run_parent_survives_same_source_native_correction", K(p, "X") === "entity" && K(p, "run-H4") === "entity" && K(p, "true-B4") === "entity" && AV(p, "native-H4").length === 0);
+  }
+  // R6: correcting one run's guess does not invalidate an independent other run's same-literal guess.
+  {
+    const p = P([obs("R-independent", [C("R-independent", "run", "hard"), C("independent-A", "native", "possible")], { ts: 1, eventId: "root-to-correct" }), obs("Q-independent", [C("Q-independent", "run", "hard"), C("independent-A", "native", "possible"), C("independent-H", "handle", "possible", { derivedFrom: { value: "independent-A", form: "native" } })], { ts: 2, eventId: "unrelated-root" }), learn("R-independent", "independent-A", "independent-B", "correction", true, { ts: 3, eventId: "correct-one-origin" })]);
+    const a = AV(p, "independent-A");
+    t("immune R6 independent_other_run_guess_does_not_inherit_source_invalidation", K(p, "independent-B") === "entity" && a.length === 1 && a[0]!.source === "unrelated-root" && p.possibleIndex.has("independent-H") && K(p, "independent-A") === "not-seen");
+  }
+  // R6: a possible derivative with no observed matching parent stays unresolved and auditable, not cross-bound.
+  {
+    const p = P([obs("Q-unknown", [C("Q-unknown", "run", "hard"), C("unknown-H", "handle", "possible", { derivedFrom: { value: "missing-A", form: "native" } })], { ts: 1, eventId: "unknown-root" }), obs("R-known", [C("R-known", "run", "hard"), C("missing-A", "native", "possible")], { ts: 2, eventId: "known-other-root" }), learn("R-known", "missing-A", "known-B", "correction", true, { ts: 3, eventId: "correct-known-other" })]);
+    t("immune R6 unknown_parent_stays_possible_without_inferred_cross_source_binding", K(p, "known-B") === "entity" && K(p, "unknown-H") === "not-seen" && UV(p, "unknown-H").length === 1 && !UV(p, "unknown-H")[0]!.superseded);
+  }
+  // R6/R7: a cross-run copy carrying only the derivative (parent elsewhere) follows the known corrected parent.
+  {
+    const p = P([obs("R-parent", [C("R-parent", "run", "hard"), C("parent-A", "native", "possible"), C("parent-H", "handle", "possible", { derivedFrom: { value: "parent-A", form: "native" } })], { ts: 1, eventId: "parent-root" }), obs("Q-parent", [C("Q-parent", "run", "hard"), C("parent-H", "handle", "possible", { source: "parent-root", derivedFrom: { value: "parent-A", form: "native" } })], { ts: 2, eventId: "handle-only-copy" }), learn("R-parent", "parent-A", "parent-B", "correction", true, { ts: 3, eventId: "correct-parent" })]);
+    t("immune R7 cross_run_derivative_only_copy_follows_known_corrected_parent", K(p, "parent-B") === "entity" && K(p, "Q-parent") === "entity" && !p.possibleIndex.has("parent-H") && AV(p, "parent-H").length === 0 && UV(p, "parent-H").every((c) => c.superseded === true));
+  }
+  // R6: every source retired locally by a correction retires its cross-run copies, regardless of observation order.
+  for (const roots of [["S1", "S2"], ["S2", "S1"]] as const) {
+    const p = P([
+      obs("R-multi", [C("R-multi", "run", "hard"), C("multi-A", "native", "possible")], { ts: 1, eventId: roots[0] }),
+      obs("R-multi", [C("R-multi", "run", "hard"), C("multi-A", "native", "possible")], { ts: 2, eventId: roots[1] }),
+      obs("Q1", [C("Q1", "run", "hard"), C("multi-A", "native", "possible", { source: "S1" }), C("H1", "handle", "possible", { source: "S1", derivedFrom: { value: "multi-A", form: "native" } })], { ts: 3, eventId: "copy-S1" }),
+      obs("Q2", [C("Q2", "run", "hard"), C("multi-A", "native", "possible", { source: "S2" }), C("H2", "handle", "possible", { source: "S2", derivedFrom: { value: "multi-A", form: "native" } })], { ts: 4, eventId: "copy-S2" }),
+      learn("R-multi", "multi-A", "multi-B", "correction", true, { ts: 5, eventId: "correct-multi" }),
+    ]);
+    t(`immune R6 all_locally_corrected_sources_retire_cross_run_copies (${roots.join("_")})`, K(p, "multi-B") === "entity" && ["multi-A", "H1", "H2"].every((v) => AV(p, v).length === 0 && !p.possibleIndex.has(v)));
+  }
+  // R6: a second locally-corrected source cannot reappear via a late explicit copy.
+  {
+    const p = P([
+      obs("R-late-multi", [C("R-late-multi", "run", "hard"), C("late-multi-A", "native", "possible")], { ts: 1, eventId: "late-S1" }),
+      obs("R-late-multi", [C("R-late-multi", "run", "hard"), C("late-multi-A", "native", "possible")], { ts: 2, eventId: "late-S2" }),
+      learn("R-late-multi", "late-multi-A", "late-multi-B", "correction", true, { ts: 4, eventId: "correct-late-multi" }),
+      obs("R-late-multi", [C("late-multi-A", "native", "possible", { source: "late-S2" }), C("late-multi-H", "handle", "possible", { source: "late-S2", derivedFrom: { value: "late-multi-A", form: "native" } })], { ts: 3, eventId: "late-copy-S2" }),
+    ]);
+    t("immune R6 second_locally_corrected_source_cannot_return_in_late_copy", K(p, "late-multi-B") === "entity" && ["late-multi-A", "late-multi-H"].every((v) => !p.possibleIndex.has(v) && AV(p, v).length === 0));
+  }
+  // R7: the global fixpoint retires an A->H->P chain even with P observed before H and both derivatives undecided.
+  {
+    const p = P([
+      obs("R-chain", [C("R-chain", "run", "hard"), C("chain-A", "native", "possible")], { ts: 1, eventId: "chain-root" }),
+      obs("Q-chain-P", [C("Q-chain-P", "run", "hard"), C("chain-P", "presence", "possible", { source: "chain-root", derivedFrom: { value: "chain-H", form: "handle" } })], { ts: 2, eventId: "chain-P-copy" }),
+      obs("Q-chain-H", [C("Q-chain-H", "run", "hard"), C("chain-H", "handle", "possible", { source: "chain-root", derivedFrom: { value: "chain-A", form: "native" } })], { ts: 3, eventId: "chain-H-copy" }),
+      learn("R-chain", "chain-A", "chain-B", "correction", true, { ts: 4, eventId: "chain-correction" }),
+    ]);
+    t("immune R7 global_fixpoint_retires_reverse_order_multihop_undecided_chain", K(p, "chain-B") === "entity" && ["chain-H", "chain-P"].every((v) => { const u = UV(p, v); return u.length === 1 && u[0]!.superseded === true && AV(p, v).length === 0 && K(p, v) === "not-seen"; }));
+  }
+  // R7: revoking source S1 retires its undecided copy; an independent S2 hard A/H of the same value/form survive.
+  {
+    const p = P([
+      obs("R-revoke-S1", [C("R-revoke-S1", "run", "hard"), C("shared-A", "native", "hard"), C("shared-H", "handle", "hard", { derivedFrom: { value: "shared-A", form: "native" } })], { ts: 1, eventId: "revoke-S1" }),
+      obs("R-revoke-S2", [C("R-revoke-S2", "run", "hard"), C("shared-A", "native", "hard"), C("shared-H", "handle", "hard", { derivedFrom: { value: "shared-A", form: "native" } })], { ts: 2, eventId: "revoke-S2" }),
+      obs("Q-revoke", [C("Q-revoke", "run", "hard"), C("shared-H", "handle", "hard", { source: "revoke-S1", derivedFrom: { value: "shared-A", form: "native" } })], { ts: 3, eventId: "revoke-copy" }),
+      revoke("revoke-S1", 4),
+    ]);
+    const u = UV(p, "shared-H");
+    t("immune R7 undecided_source_revoke_keeps_independent_hard_same_value_form", u.length === 1 && u[0]!.superseded === true && AV(p, "shared-H").every((c) => c.source === "revoke-S2") && AV(p, "shared-A").every((c) => c.source === "revoke-S2") && K(p, "shared-H") === "entity" && K(p, "shared-A") === "entity");
+  }
+  // R7: correcting S1's guess retires its undecided copy; an independent S2 hard A/H stay untouched.
+  {
+    const p = P([
+      obs("R-correct-S1", [C("R-correct-S1", "run", "hard"), C("other-A", "native", "possible"), C("other-H", "handle", "possible", { derivedFrom: { value: "other-A", form: "native" } })], { ts: 1, eventId: "correct-S1" }),
+      obs("R-correct-S2", [C("R-correct-S2", "run", "hard"), C("other-A", "native", "hard"), C("other-H", "handle", "hard", { derivedFrom: { value: "other-A", form: "native" } })], { ts: 2, eventId: "correct-S2" }),
+      obs("Q-correct", [C("Q-correct", "run", "hard"), C("other-H", "handle", "possible", { source: "correct-S1", derivedFrom: { value: "other-A", form: "native" } })], { ts: 3, eventId: "correct-copy" }),
+      learn("R-correct-S1", "other-A", "other-B", "correction", true, { ts: 4, eventId: "correct-S1-proof" }),
+    ]);
+    const u = UV(p, "other-H");
+    t("immune R7 undecided_correction_keeps_independent_hard_same_value_form", u.length === 1 && u[0]!.superseded === true && AV(p, "other-H").every((c) => c.source === "correct-S2") && K(p, "other-H") === "entity" && K(p, "other-A") === "entity" && K(p, "other-B") === "entity");
+  }
+  // R7: a derivative explicitly rooted in hard run X survives a correction of native X at the same source.
+  {
+    const p = P([
+      obs("X", [C("X", "run", "hard"), C("X", "native", "possible"), C("run-control-H", "handle", "hard", { derivedFrom: { value: "X", form: "run" } }), C("native-control-H", "handle", "possible", { derivedFrom: { value: "X", form: "native" } })], { ts: 1, eventId: "run-control-root" }),
+      obs("Q-run-control", [C("Q-run-control", "run", "hard"), C("run-control-H", "handle", "hard", { source: "run-control-root", derivedFrom: { value: "X", form: "run" } })], { ts: 2, eventId: "run-control-copy" }),
+      learn("X", "X", "run-control-B", "correction", true, { ts: 3, eventId: "run-control-correction" }),
+    ]);
+    const u = UV(p, "run-control-H");
+    t("immune R7 undecided_run_parent_is_not_invalidated_by_same_source_native", u.length === 1 && !u[0]!.superseded && AV(p, "run-control-H").length >= 1 && AV(p, "native-control-H").length === 0 && K(p, "run-control-H") === "entity" && K(p, "X") === "entity" && K(p, "run-control-B") === "entity");
+  }
+  // R7: a revoked correction does not act (guess stays possible, replacement vanishes); its copied authority derivative retires.
+  {
+    const p = P([
+      obs("R-undo", [C("R-undo", "run", "hard"), C("undo-A", "native", "possible")], { ts: 1, eventId: "undo-origin" }),
+      learn("R-undo", "undo-A", "undo-B", "correction", true, { ts: 2, eventId: "undo-authority" }),
+      obs("Q-undo", [C("Q-undo", "run", "hard"), C("undo-H", "handle", "hard", { source: "undo-authority", derivedFrom: { value: "undo-B", form: "native" } })], { ts: 3, eventId: "undo-authority-copy" }),
+      revoke("undo-authority", 4),
+    ]);
+    const a = AV(p, "undo-A"), u = UV(p, "undo-H");
+    t("immune R7 revoked_correction_retires_undecided_authority_derivative", a.length === 1 && a[0]!.confidence === "possible" && K(p, "undo-A") === "not-seen" && K(p, "undo-B") === "not-seen" && u.length === 1 && u[0]!.superseded === true && K(p, "undo-H") === "not-seen");
+  }
+  // R7: a hard run sharing the guessed native literal survives without keeping that native's H/P chain active.
+  {
+    const p = P([
+      obs("same-A", [C("same-A", "run", "hard")], { ts: 1, eventId: "run-root" }),
+      obs("same-A", [C("same-A", "native", "possible"), C("guess-H", "handle", "possible", { source: "guess-root", derivedFrom: { value: "same-A", form: "native" } }), C("guess-P", "presence", "possible", { source: "guess-root", derivedFrom: { value: "guess-H", form: "handle" } })], { ts: 2, eventId: "guess-root" }),
+      learn("same-A", "same-A", "truth-B", "correction", true, { ts: 3, eventId: "correct-guess" }),
+    ]);
+    t("immune R7 live_independent_run_literal_cannot_keep_corrected_native_derivatives", K(p, "same-A") === "entity" && K(p, "truth-B") === "entity" && !p.possibleIndex.has("guess-H") && AV(p, "guess-H").length === 0 && !p.possibleIndex.has("guess-P") && AV(p, "guess-P").length === 0);
+  }
+  // R7: an independent hard handle sharing a literal cannot keep a second-hop presence of a corrected guess alive.
+  {
+    const p = P([
+      obs("R-hop", [C("R-hop", "run", "hard"), C("shared-H", "handle", "hard")], { ts: 1, eventId: "independent-handle-root" }),
+      obs("R-hop", [C("guess-A", "native", "possible"), C("shared-H", "handle", "possible", { source: "guess-hop-root", derivedFrom: { value: "guess-A", form: "native" } }), C("derived-P", "presence", "possible", { source: "guess-hop-root", derivedFrom: { value: "shared-H", form: "handle" } })], { ts: 2, eventId: "guess-hop-root" }),
+      learn("R-hop", "guess-A", "truth-hop-B", "correction", true, { ts: 3, eventId: "correct-hop" }),
+    ]);
+    t("immune R7 live_independent_handle_literal_cannot_keep_second_hop_guess", !p.possibleIndex.has("guess-A") && K(p, "shared-H") === "entity" && !AV(p, "shared-H").some((c) => c.source === "guess-hop-root") && !p.possibleIndex.has("derived-P") && AV(p, "derived-P").length === 0 && K(p, "truth-hop-B") === "entity");
+  }
+  // R7: a direct source revoke kills every S1-rooted copy (full chain) while a live S2 same-literal native + handle survive.
+  {
+    const p = P([
+      obs("R-direct", [C("R-direct", "run", "hard"), C("direct-A", "native", "hard"), C("bad-H", "handle", "hard", { source: "direct-S1", derivedFrom: { value: "direct-A", form: "native" } }), C("bad-P", "presence", "hard", { source: "direct-S1", derivedFrom: { value: "bad-H", form: "handle" } })], { ts: 1, eventId: "direct-S1" }),
+      obs("R-direct", [C("R-direct", "run", "hard"), C("direct-A", "native", "hard"), C("good-H", "handle", "hard", { source: "direct-S2", derivedFrom: { value: "direct-A", form: "native" } })], { ts: 2, eventId: "direct-S2" }),
+      obs("R-direct", [C("R-direct", "run", "hard"), C("direct-A", "native", "hard", { source: "direct-S1" }), C("bad-H", "handle", "hard", { source: "direct-S1", derivedFrom: { value: "direct-A", form: "native" } }), C("bad-P", "presence", "hard", { source: "direct-S1", derivedFrom: { value: "bad-H", form: "handle" } })], { ts: 3, eventId: "direct-copy" }),
+      revoke("direct-S1", 4),
+    ]);
+    t("immune R7 explicit_revoke_preserves_independent_root_and_kills_bad_full_chain", K(p, "good-H") === "entity" && K(p, "direct-A") === "entity" && AV(p, "bad-H").length === 0 && AV(p, "bad-P").length === 0 && !p.possibleIndex.has("bad-H"));
+  }
+}
+
 console.log("all bus-identity selftests passed");
