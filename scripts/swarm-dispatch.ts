@@ -41,6 +41,7 @@ import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js"
 import { validSeedWait } from "../packages/bus/src/swarm/wait-seed.js";
 import { runDispatchLoops } from "../packages/bus/src/swarm/dispatch-loops.js";
 import { writeProjection } from "../packages/bus/src/swarm/projection.js";
+import { beatStart, beatEnd } from "../packages/bus/src/swarm/heartbeat.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
@@ -76,6 +77,8 @@ const EXEC_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_EXEC ?? "");
 const CONTROL_LOG_DIR = path.join(HOME, ".agenthop", "swarm", "control-log");
 // Read-only consumer view (projection-schema v1); rewritten by the commitControl apply hook (projection write is fail-soft).
 const PROJECTION_DIR = path.join(HOME, ".agenthop", "swarm", "projection");
+// Per-loop dispatcher heartbeat (cluster-liveness L1 subset); each loop records its own tick independently (fail-soft).
+const HEARTBEAT_FILE = path.join(HOME, ".agenthop", "swarm", "heartbeat.json");
 const PLAN_FILE = process.env.SWARM_PLAN || "";
 const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
@@ -553,6 +556,16 @@ async function main(): Promise<void> {
     sweepIntervalMs: 5000,
     shouldStop: () => false,
     onError: (where, e) => log(`${where} error: ${e instanceof Error ? e.message : e}`),
+    // Per-loop heartbeat (L1 subset): each loop records its own tick; a wedged loop stays in-flight while the other
+    // advances. Fail-soft — observability, never a barrier.
+    onTick: (loop, phase) => {
+      try {
+        const meta = { instance: SELF, pid: process.pid };
+        const mode = loop === "pass" ? (taskOn ? "task" : "lifecycle") : SWEEP_ENABLED ? "sweep" : "off";
+        if (phase === "start") beatStart(HEARTBEAT_FILE, meta, loop, loop === "pass" ? "pass+taskPass" : "sweep", nowSec(), mode);
+        else beatEnd(HEARTBEAT_FILE, meta, loop, nowSec(), mode);
+      } catch (e) { log(`heartbeat ${loop} ${phase} failed: ${e instanceof Error ? e.message : e}`); }
+    },
   });
 }
 

@@ -11,6 +11,8 @@
  * non-starvation property is offline-testable without real timers-in-production.
  */
 
+export type LoopName = "pass" | "sweep";
+
 export type LoopFns = {
   /** One lifecycle + task pass tick (may be slow — awaits provisioning IO). */
   passTick: () => Promise<void>;
@@ -22,12 +24,18 @@ export type LoopFns = {
   /** Loop-exit predicate (always false in production; a test flips it to stop). */
   shouldStop: () => boolean;
   onError: (where: string, e: unknown) => void;
+  /** Per-loop heartbeat beat — fired "start" BEFORE each tick and "end" AFTER it (even if the tick threw). A tick that
+   *  NEVER settles never fires "end", so its heartbeat stays in-flight while the OTHER loop's beats keep advancing
+   *  (per-loop liveness, L1). Optional + must not throw (the caller makes it fail-soft). */
+  onTick?: (loop: LoopName, phase: "start" | "end") => void;
 };
 
 export async function runDispatchLoops(fns: LoopFns): Promise<void> {
-  const loop = async (name: string, tick: () => Promise<void>, intervalMs: number): Promise<void> => {
+  const loop = async (name: LoopName, tick: () => Promise<void>, intervalMs: number): Promise<void> => {
     while (!fns.shouldStop()) {
+      fns.onTick?.(name, "start");
       try { await tick(); } catch (e) { fns.onError(name, e); }
+      fns.onTick?.(name, "end");
       if (fns.shouldStop()) break;
       await fns.sleep(intervalMs);
     }

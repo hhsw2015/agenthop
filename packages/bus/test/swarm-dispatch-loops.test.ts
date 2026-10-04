@@ -23,6 +23,26 @@ describe("runDispatchLoops", () => {
     expect(sweepsDuringPass).toBeGreaterThanOrEqual(2); // sweeps happened before the slow pass finished — not starved
   });
 
+  test("onTick fires start/end per loop; sweep beats faster than the slower pass loop (per-loop heartbeat)", async () => {
+    const beats: string[] = [];
+    let sweepCount = 0;
+    await runDispatchLoops({
+      passTick: async () => { await sleep(1); },
+      sweepTick: async () => { sweepCount += 1; },
+      sleep,
+      passIntervalMs: 5,   // pass re-checks shouldStop every ~5ms (so the loop exits promptly, no hang)
+      sweepIntervalMs: 1,  // sweep ticks faster
+      shouldStop: () => sweepCount >= 5,
+      onError: () => {},
+      onTick: (loop, phase) => beats.push(`${loop}:${phase}`),
+    });
+    const n = (b: string) => beats.filter((x) => x === b).length;
+    expect(n("sweep:start")).toBe(n("sweep:end"));                 // every started sweep tick also ended (none wedged)
+    expect(n("sweep:end")).toBeGreaterThanOrEqual(4);             // sweep advanced several ticks
+    expect(beats).toContain("pass:start");                        // pass beat too
+    expect(n("sweep:start")).toBeGreaterThan(n("pass:start"));    // the two loops beat at independent rates
+  });
+
   test("a throwing tick is reported and does not kill the loop (the other loop keeps running)", async () => {
     const errors: string[] = [];
     let sweepCount = 0;
