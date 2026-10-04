@@ -85,7 +85,17 @@ describe("F28 poison-pill defense", () => {
     expect(validInboxMsg({ from: 1, fromLabel: "b", text: "hi", via: "local", ts: 1 })).toBeNull();   // from mistyped
     expect(validInboxMsg(null)).toBeNull();
     expect(validInboxMsg("not an object")).toBeNull();
-    expect(validInboxMsg({ from: "a", fromLabel: "b", text: "hi", via: "local", ts: 1, taskRef: "x", title: "t" })).toMatchObject({ from: "a" }); // S11 extras OK
+    // S11 display fields present ⇒ PRESERVED (not dropped), + fromMode/actionId preserved; a mistyped extension ⇒ rejected
+    expect(validInboxMsg({ from: "a", fromLabel: "b", text: "hi", via: "local", ts: 1, fromMode: "bypass", actionId: "act-1", taskRef: "liveness-impl-L2", title: "re-review" }))
+      .toEqual({ from: "a", fromLabel: "b", text: "hi", via: "local", ts: 1, fromMode: "bypass", actionId: "act-1", taskRef: "liveness-impl-L2", title: "re-review" });
+    expect(validInboxMsg({ from: "a", fromLabel: "b", text: "hi", via: "local", ts: 1, taskRef: 7 })).toBeNull(); // mistyped extension
+  });
+
+  test("P2: a valid S11-carrying message round-trips through write→claim with taskRef/title intact", () => {
+    writeInbox(HOME, "s1", { from: "rw-x", fromLabel: "peer", text: "body", via: "local", ts: 1000, taskRef: "F28", title: "poison fix" });
+    const c = claimInbox(HOME, ["s1"], "p");
+    expect(c).toHaveLength(1);
+    expect(c[0].msg).toMatchObject({ text: "body", taskRef: "F28", title: "poison fix" }); // fields survive the validator rebuild
   });
 
   test("a poison file (missing field / unparseable) is QUARANTINED on claim — never returned, no throw, dead-letter logged", () => {

@@ -12,7 +12,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: "local" | "relay"; ts: number; actionId?: string };
+export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: "local" | "relay"; ts: number; actionId?: string; taskRef?: string; title?: string };
 export type Claimed = { file: string; msg: InboxMsg };
 
 /** Validate a parsed inbox record against the transport schema (F28 poison-pill defense). from/fromLabel/text are REQUIRED
@@ -27,7 +27,17 @@ export function validInboxMsg(raw: unknown): InboxMsg | null {
   if (typeof r.ts !== "number" || !Number.isFinite(r.ts)) return null;
   if (r.fromMode !== undefined && typeof r.fromMode !== "string") return null;
   if (r.actionId !== undefined && typeof r.actionId !== "string") return null;
-  return { from: r.from, fromLabel: r.fromLabel, text: r.text, via: r.via, ts: r.ts, ...(typeof r.fromMode === "string" ? { fromMode: r.fromMode } : {}), ...(typeof r.actionId === "string" ? { actionId: r.actionId } : {}) };
+  // S11 display fields (taskRef/title): optional, but when PRESENT must be preserved, not dropped (review 6da8b5c-P2 — the
+  // validator rebuild was silently losing them). A present-but-mistyped one is rejected like the other optionals.
+  if (r.taskRef !== undefined && typeof r.taskRef !== "string") return null;
+  if (r.title !== undefined && typeof r.title !== "string") return null;
+  return {
+    from: r.from, fromLabel: r.fromLabel, text: r.text, via: r.via, ts: r.ts,
+    ...(typeof r.fromMode === "string" ? { fromMode: r.fromMode } : {}),
+    ...(typeof r.actionId === "string" ? { actionId: r.actionId } : {}),
+    ...(typeof r.taskRef === "string" ? { taskRef: r.taskRef } : {}),
+    ...(typeof r.title === "string" ? { title: r.title } : {}),
+  };
 }
 
 /** Move a POISON inbox file out of the delivery path (into inbox/<sid>/quarantine/) so it can never be re-claimed and re-crash
