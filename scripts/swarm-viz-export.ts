@@ -34,7 +34,7 @@ import { readMsgLogDays, msgLogEnabled, payloadLoggingEnabled, type MsgLogEntry 
 import { readTasks } from "../packages/bus/src/tasklog.js";
 import type { UnifiedPeer } from "../packages/bus/src/resolve.js";
 import { codexRolloutPath, readNodeActivity, transcriptPath, type NodeActivity } from "./node-activity.js";
-import { readBoardView, readKanbanView, readProjection, stallVerdict, type BoardView, type KanbanView, type Projection, type StallVerdict } from "./projection.js";
+import { readBoardView, readKanbanView, readProjection, readTimelineView, stallVerdict, type BoardView, type KanbanView, type Projection, type StallVerdict, type TimelineView } from "./projection.js";
 
 // ---------------------------------------------------------------------------------------------
 // Types
@@ -207,6 +207,8 @@ export type Snapshot = {
   /** kanban-view (board-viz's second view): three columns (todo/in-progress/done) + member swimlanes,
    *  over the same four read-only sources. Columns/dep-gates/durations DERIVED in the reducer, not here. */
   kanban: KanbanView;
+  /** worklog-timeline (third view): a time-axis projection of the control-log (bars, project rollup, stall blanks). */
+  timeline: TimelineView;
   /** 停摆定理: all peers idle + no unresolved wait + unfinished work = silence over unfinished business.
    *  DERIVED here (like allocExhausted), from reported statuses and wait states — never from re-judging. */
   stall: StallVerdict;
@@ -487,6 +489,7 @@ export function buildSnapshot(
   const projection = readProjection(home);
   const board = readBoardView(home);
   const kanban = readKanbanView(home);
+  const timeline = readTimelineView(home);
   // Stall input = every peer's reported status (observer excluded above via `nodes`). The observer
   // itself never counts as "someone is working".
   const stall = stallVerdict(
@@ -514,6 +517,7 @@ export function buildSnapshot(
     projection,
     board,
     kanban,
+    timeline,
     stall,
     payloadLogged: msgLog.some((e) => typeof e.text === "string" && e.text.length > 0),
     msgLogEnabled: msgLogEnabled(),

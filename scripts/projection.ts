@@ -613,3 +613,139 @@ export function readKanbanView(home: string = homedir(), nowSec: number = Math.f
     swimlanes, heartbeat: hbView, generatedAtSec: nowSec,
   };
 }
+
+// =============================================================================================
+// worklog-timeline: the third viz view. worklog.jsonl is a time-axis PROJECTION of the control-log
+// (written by the machine at its existing transform points via packages/bus/src/swarm/worklog.ts).
+// Discipline C-2 still holds: this reader parses the FILE shape independently, it does not import bus.
+// Judgment-sink: the builder emits faithful per-change lines; HERE we collapse flaps into bars + roll
+// up "where did the time go" + flag stall blanks. (brain worklog-timeline, author 90b58f9c.)
+// =============================================================================================
+
+export interface WorklogEntry {
+  ts: number; event: string; taskId: string; who: string; project: string; title: string; outcome?: string;
+}
+/** One task's life as a single bar: first start -> last done, with the flap count kept as a liveness hint. */
+export interface TimelineBar {
+  taskId: string; project: string; who: string; title: string;
+  startSec: number; endSec: number | null; outcome: string | null;
+  durationSec: number | null; progressTicks: number; stale: boolean; // open > 24h: factorylog auto-close hint
+}
+export interface TimelineGap { startSec: number; endSec: number; durationSec: number; }
+export interface TimelineProjectTotal { project: string; totalSec: number; count: number; }
+export interface TimelineDay { date: string; startSec: number; bars: TimelineBar[]; }
+export interface TimelineView {
+  bars: TimelineBar[]; // every task, newest start first
+  days: TimelineDay[]; // grouped by LOCAL date, newest first (timeline / swimlane render)
+  byProject: TimelineProjectTotal[]; // closed-duration rollup = the pie, "where did the time go"
+  gaps: TimelineGap[]; // windows with nothing in progress, longer than the threshold (render red)
+  spanSec: { from: number; to: number } | null;
+  generatedAtSec: number;
+}
+
+const STALL_GAP_SEC = 15 * 60; // 15 min with nothing in progress = a blank worth flagging red
+const STALE_OPEN_SEC = 24 * 3600; // factorylog: an entry still open after 24h is treated as auto-closed
+
+/** unix seconds -> local YYYY-MM-DD (the log is for humans, so group by the machine's calendar day). */
+function localDate(sec: number): string {
+  const d = new Date(sec * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** Parse worklog.jsonl (file shape = the whole contract). Torn/malformed tail lines are skipped, the rest kept. */
+export function readWorklog(home: string = homedir()): WorklogEntry[] {
+  const f = path.join(home, ".agenthop", "swarm", "worklog.jsonl");
+  if (!existsSync(f)) return [];
+  const out: WorklogEntry[] = [];
+  for (const raw of readFileSync(f, "utf8").split("\n")) {
+    const s = raw.trim();
+    if (!s) continue;
+    try {
+      const o = JSON.parse(s) as Record<string, unknown>;
+      if (o && typeof o.ts === "number" && typeof o.event === "string" && typeof o.taskId === "string") {
+        out.push({
+          ts: o.ts, event: o.event, taskId: o.taskId,
+          who: typeof o.who === "string" ? o.who : "",
+          project: typeof o.project === "string" ? o.project : "",
+          title: typeof o.title === "string" ? o.title : o.taskId,
+          ...(o.outcome != null ? { outcome: String(o.outcome) } : {}),
+        });
+      }
+    } catch {
+      /* a half-written append tail: skip this line, keep the rest */
+    }
+  }
+  return out;
+}
+
+/** Collapse per-task flaps into bars, roll up project time, and find the stall blanks. Pure (selftestable). */
+export function foldTimeline(entries: WorklogEntry[], nowSec: number): TimelineView {
+  const byTask = new Map<string, WorklogEntry[]>();
+  for (const e of entries) (byTask.get(e.taskId) ?? byTask.set(e.taskId, []).get(e.taskId)!).push(e);
+
+  const bars: TimelineBar[] = [];
+  for (const [taskId, evs] of byTask) {
+    const sorted = [...evs].sort((a, b) => a.ts - b.ts);
+    const starts = sorted.filter((e) => e.event === "start");
+    const dones = sorted.filter((e) => e.event === "done");
+    const progress = sorted.filter((e) => e.event === "progress");
+    const first = starts[0] ?? sorted[0]!;
+    const last = dones.length ? dones[dones.length - 1]! : null;
+    const startSec = first.ts;
+    const endSec = last ? last.ts : null;
+    const stale = endSec == null && nowSec - startSec > STALE_OPEN_SEC;
+    bars.push({
+      taskId, project: first.project, who: first.who, title: first.title || taskId,
+      startSec, endSec, outcome: last?.outcome ?? null,
+      durationSec: endSec != null ? Math.max(0, endSec - startSec) : null,
+      progressTicks: progress.length, stale,
+    });
+  }
+  bars.sort((a, b) => b.startSec - a.startSec);
+
+  // project rollup: sum CLOSED durations (an open bar contributes no measurable time, only a count).
+  const proj = new Map<string, { totalSec: number; count: number }>();
+  for (const b of bars) {
+    const p = proj.get(b.project) ?? { totalSec: 0, count: 0 };
+    p.count++;
+    p.totalSec += b.durationSec ?? 0;
+    proj.set(b.project, p);
+  }
+  const byProject = [...proj.entries()]
+    .map(([project, v]) => ({ project, ...v }))
+    .sort((a, b) => b.totalSec - a.totalSec || b.count - a.count);
+
+  // gaps: merge every [start, end] interval (open bars extend to now); a hole wider than the threshold is a stall.
+  const iv = bars
+    .map((b) => [b.startSec, b.endSec ?? nowSec] as [number, number])
+    .filter(([s, e]) => e >= s)
+    .sort((a, b) => a[0] - b[0]);
+  const gaps: TimelineGap[] = [];
+  if (iv.length) {
+    let curEnd = iv[0]![1];
+    for (let i = 1; i < iv.length; i++) {
+      const [s, e] = iv[i]!;
+      if (s > curEnd) {
+        if (s - curEnd >= STALL_GAP_SEC) gaps.push({ startSec: curEnd, endSec: s, durationSec: s - curEnd });
+        curEnd = e;
+      } else if (e > curEnd) {
+        curEnd = e;
+      }
+    }
+  }
+
+  const dayMap = new Map<string, TimelineBar[]>();
+  for (const b of bars) (dayMap.get(localDate(b.startSec)) ?? dayMap.set(localDate(b.startSec), []).get(localDate(b.startSec))!).push(b);
+  const days: TimelineDay[] = [...dayMap.entries()]
+    .map(([date, bs]) => ({ date, startSec: Math.min(...bs.map((b) => b.startSec)), bars: bs }))
+    .sort((a, b) => b.startSec - a.startSec);
+
+  const allTs = entries.map((e) => e.ts);
+  const spanSec = allTs.length ? { from: Math.min(...allTs), to: Math.max(...allTs) } : null;
+  return { bars, days, byProject, gaps, spanSec, generatedAtSec: nowSec };
+}
+
+export function readTimelineView(home: string = homedir(), nowSec: number = Math.floor(Date.now() / 1000)): TimelineView {
+  return foldTimeline(readWorklog(home), nowSec);
+}

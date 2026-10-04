@@ -324,6 +324,39 @@
   .sdot { width:8px; height:8px; border-radius:50%; background:var(--faint); flex:none; }
   .sdot.working { background:var(--working); } .sdot.idle { background:var(--idle); }
 
+  /* ---------- worklog timeline (third view) ---------- */
+  .timeline-view { display:none; position:absolute; inset:0; overflow:auto; background:var(--bg); z-index:4; padding:16px 18px 44px; }
+  .timeline-view .khead { display:flex; align-items:baseline; gap:14px; margin-bottom:12px; flex-wrap:wrap; }
+  .timeline-view .khead h3 { margin:0; font-size:15px; }
+  .timeline-view .khead .v { color:var(--faint); font-size:11px; }
+  .tlmodes { display:flex; gap:6px; }
+  .tlmode { font-size:11px; padding:2px 9px; border-radius:6px; border:1px solid var(--line-soft); background:var(--panel); color:var(--faint); cursor:pointer; }
+  .tlmode.on { color:var(--ink); border-color:var(--working); }
+  .tlwrap { display:flex; gap:14px; align-items:flex-start; }
+  .tlmain { flex:1; min-width:0; }
+  .tlside { width:240px; flex:none; }
+  .tlpanel { background:var(--panel); border:1px solid var(--line-soft); border-radius:10px; padding:10px 12px; margin-bottom:10px; }
+  .tlpanel h4 { margin:0 0 8px; font-size:12px; display:flex; justify-content:space-between; }
+  .tlpanel .n { color:var(--faint); font-weight:400; }
+  .tlday { margin-bottom:14px; }
+  .tlday > .d { font-size:12px; font-weight:650; color:var(--ink-dim); margin:0 0 6px; }
+  .tlday > .d .v { color:var(--faint); font-weight:400; font-size:10px; }
+  .tllane { display:flex; align-items:center; gap:8px; margin-bottom:5px; }
+  .tllane .lbl { width:122px; flex:none; font-size:10.5px; color:var(--faint); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tllane .v { color:var(--faint); font-size:10px; font-variant-numeric:tabular-nums; }
+  .tltrack { position:relative; flex:1; height:18px; background:var(--panel); border:1px solid var(--line-soft); border-radius:5px; overflow:hidden; }
+  .tlbar { position:absolute; top:2px; height:12px; border-radius:3px; min-width:3px; cursor:default; }
+  .tlbar.open { background-image:repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(255,255,255,.3) 3px, rgba(255,255,255,.3) 6px); }
+  .tlbar.stale { outline:1px solid var(--warn); outline-offset:0; }
+  .tlgap { position:absolute; top:0; height:100%; background:rgba(255,95,109,.18); border-left:1px dashed var(--blocked); border-right:1px dashed var(--blocked); }
+  .tlhours { display:flex; justify-content:space-between; font-size:9px; color:var(--faint); margin:1px 0 0 130px; }
+  .tlrow { display:flex; align-items:center; gap:7px; font-size:11px; padding:3px 0; border-bottom:1px solid var(--line-soft); }
+  .tlrow:last-child { border-bottom:none; }
+  .tlrow .sw { width:9px; height:9px; border-radius:2px; flex:none; }
+  .tlrow .nm { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tlrow .tm { color:var(--faint); font-variant-numeric:tabular-nums; }
+  .tlgaprow .nm { color:var(--blocked); }
+
   /* ---------- progress board (board-viz) ---------- */
   .brow { padding: 5px 0; font-size: 11.5px; border-bottom: 1px solid var(--line-soft); }
   .brow:last-child { border-bottom: none; }
@@ -418,6 +451,7 @@
     <input class="search" id="search" placeholder="Search sessions, cwd, machine…" />
     <button class="viewbtn" id="viewtoggle" title="Topology (by machine) ⇄ Jobs (by task DAG)">jobs ▸</button>
     <button class="viewbtn" id="kanbanbtn" title="Kanban: board columns (todo/in-progress/done) + member swimlanes">kanban ▸</button>
+    <button class="viewbtn" id="timelinebtn" title="Timeline: worklog (per-day project lanes, where the time went, stall blanks)">timeline ▸</button>
     <button class="themebtn" id="theme" title="Toggle light / dark">◐</button>
   </header>
   <div id="stage">
@@ -433,6 +467,7 @@
     <div class="panels" id="panels"></div>
 <div class="stallbar" id="stallbar"></div>
     <div class="kanban-view" id="kanban"></div>
+    <div class="timeline-view" id="timeline"></div>
     <div class="jobsmembers" id="jobsmembers"></div>
     <div class="ticker" id="ticker">
       <div class="ttitle"><span>Events</span><span class="tsub" id="tsub"></span>
@@ -763,6 +798,8 @@
     // banner still shows (renderStall never hides). Hidden unless selected, so it never covers the stage.
     $("kanban").style.display = viewMode === "kanban" ? "block" : "none";
     if (viewMode === "kanban") { renderKanban(); renderHeader(); renderStall(); return; }
+    $("timeline").style.display = viewMode === "timeline" ? "block" : "none";
+    if (viewMode === "timeline") { renderTimeline(); renderHeader(); renderStall(); return; }
     if (viewMode === "jobs" && snap.projection && snap.projection.present) {
       document.body.classList.add("jobs-view");
       renderJobsView();
@@ -1296,6 +1333,83 @@
       <div class="klanes"><h4>Swimlanes — who's doing what</h4>${lanes || '<div class="empty-note">no active members</div>'}</div>`;
   }
 
+  // ---------- worklog timeline (third view): a time-axis projection of the control-log ----------
+  // Judgment already done in the reducer (foldTimeline): bars = one per task, project rollup, stall blanks.
+  // Here we only DRAW. "day" = every day as 24h project swimlanes; "week" = last 7 days as daily totals.
+  let tlMode = "day"; // "day" | "week"
+
+  function projColor(p) {
+    let h = 0; for (const c of (p || "")) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    return `hsl(${h % 360} 60% 58%)`;
+  }
+  function tlPie(parts, total) {
+    if (!parts.length || total <= 0) return "";
+    const R = 42, C = 48; let a = -Math.PI / 2; const segs = [];
+    for (const p of parts) {
+      if (p.totalSec <= 0) continue;
+      const frac = p.totalSec / total, a2 = a + frac * 2 * Math.PI;
+      const x1 = C + R * Math.cos(a), y1 = C + R * Math.sin(a), x2 = C + R * Math.cos(a2), y2 = C + R * Math.sin(a2);
+      segs.push(`<path d="M${C},${C} L${x1.toFixed(2)},${y1.toFixed(2)} A${R},${R} 0 ${frac > 0.5 ? 1 : 0} 1 ${x2.toFixed(2)},${y2.toFixed(2)} Z" fill="${projColor(p.project)}" />`);
+      a = a2;
+    }
+    return `<svg viewBox="0 0 96 96" width="96" height="96" style="display:block;margin:0 auto 8px">${segs.join("")}</svg>`;
+  }
+  function tlBarSeg(b, dayStart, dayEnd, now) {
+    const span = dayEnd - dayStart;
+    const s = Math.max(dayStart, b.startSec), e = Math.min(dayEnd, b.endSec == null ? now : b.endSec);
+    const left = ((s - dayStart) / span) * 100, w = Math.max(0.6, ((Math.max(e, s) - s) / span) * 100);
+    const cls = `tlbar${b.endSec == null ? " open" : ""}${b.stale ? " stale" : ""}`;
+    const title = `${b.title}\n${b.who}\n${b.endSec == null ? (b.stale ? "open >24h (stale)" : "open") : dur2((b.durationSec || 0) * 1000)}${b.outcome ? " · " + b.outcome : ""}${b.progressTicks ? " · " + b.progressTicks + " ticks" : ""}`;
+    return `<div class="${cls}" style="left:${left.toFixed(2)}%;width:${w.toFixed(2)}%;background:${projColor(b.project)}" title="${esc(title)}"></div>`;
+  }
+  function tlDayBlock(day, now) {
+    const dayStart = Math.floor(new Date(day.date + "T00:00:00").getTime() / 1000), dayEnd = dayStart + 86400;
+    const byP = new Map();
+    for (const b of day.bars) (byP.get(b.project) ?? byP.set(b.project, []).get(b.project)).push(b);
+    const lanes = [...byP.entries()].map(([proj, bars]) =>
+      `<div class="tllane"><span class="lbl" title="${esc(proj)}">${esc(proj || "(none)")}</span><div class="tltrack">${bars.map((b) => tlBarSeg(b, dayStart, dayEnd, now)).join("")}</div></div>`).join("");
+    const total = day.bars.reduce((t, b) => t + (b.durationSec || 0), 0);
+    return `<div class="tlday"><div class="d">${esc(day.date)} <span class="v">· ${day.bars.length} tasks · ${dur2(total * 1000)}</span></div>${lanes}
+      <div class="tlhours"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div></div>`;
+  }
+  function tlWeek(tl, now) {
+    const cutoff = now - 7 * 86400, days = tl.days.filter((d) => d.startSec >= cutoff);
+    if (!days.length) return '<div class="empty-note">no activity in the last 7 days</div>';
+    const dayTotal = (d) => d.bars.reduce((t, b) => t + (b.durationSec || 0), 0);
+    const max = Math.max(1, ...days.map(dayTotal));
+    return `<div class="tlpanel"><h4><span>Last 7 days</span><span class="n">daily active time</span></h4>` + days.map((d) => {
+      const byP = new Map();
+      for (const b of d.bars) byP.set(b.project, (byP.get(b.project) || 0) + (b.durationSec || 0));
+      let acc = 0;
+      const segs = [...byP.entries()].filter(([, v]) => v > 0).map(([proj, v]) => {
+        const left = (acc / max) * 100, w = (v / max) * 100; acc += v;
+        return `<div class="tlbar" style="left:${left.toFixed(2)}%;width:${w.toFixed(2)}%;background:${projColor(proj)}" title="${esc(proj)}: ${dur2(v * 1000)}"></div>`;
+      }).join("");
+      return `<div class="tllane"><span class="lbl">${esc(d.date)}</span><div class="tltrack">${segs}</div><span class="v">${dur2(dayTotal(d) * 1000)}</span></div>`;
+    }).join("") + `</div>`;
+  }
+  function renderTimeline() {
+    const tl = state?.timeline;
+    const host = $("timeline");
+    if (!tl || !tl.bars.length) { host.innerHTML = '<div class="empty-note" style="padding:20px">No worklog yet. Seed it once with: tsx scripts/worklog-backfill.ts</div>'; return; }
+    const now = tl.generatedAtSec || Math.floor(Date.now() / 1000);
+    const total = tl.byProject.reduce((t, p) => t + p.totalSec, 0);
+    const legend = tl.byProject.map((p) =>
+      `<div class="tlrow"><span class="sw" style="background:${projColor(p.project)}"></span><span class="nm" title="${esc(p.project)}">${esc(p.project || "(none)")}</span><span class="tm">${dur2(p.totalSec * 1000)} · ${p.count}</span></div>`).join("");
+    const gaps = tl.gaps.length
+      ? tl.gaps.slice().sort((a, b) => b.startSec - a.startSec).map((g) =>
+          `<div class="tlrow tlgaprow"><span class="nm">stall blank</span><span class="tm">${dur2(g.durationSec * 1000)} · ${clock(g.startSec * 1000)}</span></div>`).join("")
+      : '<div class="empty-note">no stall blanks</div>';
+    const side = `<div class="tlpanel"><h4><span>Where the time went</span><span class="n">${dur2(total * 1000)}</span></h4>${tlPie(tl.byProject, total)}${legend || '<div class="empty-note">no closed work yet</div>'}</div>
+      <div class="tlpanel"><h4><span>Stall blanks</span><span class="n">${tl.gaps.length}</span></h4>${gaps}</div>`;
+    const main = tlMode === "week" ? tlWeek(tl, now) : (tl.days.map((d) => tlDayBlock(d, now)).join("") || '<div class="empty-note">no days</div>');
+    const modes = `<div class="tlmodes"><span class="tlmode ${tlMode === "day" ? "on" : ""}" data-m="day">day</span><span class="tlmode ${tlMode === "week" ? "on" : ""}" data-m="week">week</span></div>`;
+    const span = tl.spanSec ? `<span class="v">${new Date(tl.spanSec.from * 1000).toLocaleDateString()} – ${new Date(tl.spanSec.to * 1000).toLocaleDateString()}</span>` : "";
+    host.innerHTML = `<div class="khead"><h3>Timeline</h3>${modes}<span class="v">${tl.bars.length} tasks</span>${span}</div>
+      <div class="tlwrap"><div class="tlmain">${main}</div><div class="tlside">${side}</div></div>`;
+    host.querySelectorAll(".tlmode").forEach((el) => { el.onclick = () => { tlMode = el.dataset.m; renderTimeline(); }; });
+  }
+
   function renderBoardPanels(parts) {
     const b = state?.board;
     if (!b) return;
@@ -1792,15 +1906,26 @@
       localStorage.setItem("swarm-viz-theme", next);
     };
   })();
+  function syncViewButtons() {
+    $("viewtoggle").textContent = viewMode === "jobs" ? "◂ topology" : "jobs ▸";
+    $("kanbanbtn").textContent = viewMode === "kanban" ? "◂ topology" : "kanban ▸";
+    $("timelinebtn").textContent = viewMode === "timeline" ? "◂ topology" : "timeline ▸";
+  }
   $("kanbanbtn").onclick = () => {
     viewMode = viewMode === "kanban" ? "topology" : "kanban";
-    $("kanbanbtn").textContent = viewMode === "kanban" ? "◂ topology" : "kanban ▸";
+    syncViewButtons();
+    sel = null; jobSel = null;
+    render();
+  };
+  $("timelinebtn").onclick = () => {
+    viewMode = viewMode === "timeline" ? "topology" : "timeline";
+    syncViewButtons();
     sel = null; jobSel = null;
     render();
   };
   $("viewtoggle").onclick = () => {
     viewMode = viewMode === "jobs" ? "topology" : "jobs";
-    $("viewtoggle").textContent = viewMode === "jobs" ? "◂ topology" : "jobs ▸";
+    syncViewButtons();
     didFit = false; // re-fit for the new axis
     jobSel = null; sel = null;
     render();

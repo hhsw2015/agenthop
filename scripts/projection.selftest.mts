@@ -5,9 +5,11 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  artifactGaps, assignLayers, foldWaitLog, parseBoardFileName, planEdges, readBoardView, readKanbanView,
-  readProjection, readStatuses, stallVerdict, type BoardItem, type TaskNode, type TaskPlan, type WaitRecord,
+  artifactGaps, assignLayers, foldTimeline, foldWaitLog, parseBoardFileName, planEdges, readBoardView, readKanbanView,
+  readProjection, readStatuses, readTimelineView, readWorklog, stallVerdict,
+  type BoardItem, type TaskNode, type TaskPlan, type WaitRecord, type WorklogEntry,
 } from "./projection.js";
+import { worklogLinesFromBatch, type ControlChangeLike } from "../packages/bus/src/swarm/worklog.js";
 
 const t = (name: string, cond: boolean) => {
   if (!cond) throw new Error("FAILED: " + name);
@@ -237,5 +239,107 @@ t("no projection dir -> present:false, empty", (() => { const p = readProjection
   const k = readKanbanView("/tmp/definitely-no-such-home-xyz", 1);
   t("kanban: absent sources -> empty columns, no swimlanes, no heartbeat", k.columns.todo.length === 0 && k.columns.inProgress.length === 0 && k.columns.done.length === 0 && k.swimlanes.length === 0 && k.heartbeat === null);
 }
+
+// =============================================================================================
+// worklog-timeline: the third view. foldTimeline collapses per-task flaps into bars + rolls up time + gaps.
+// =============================================================================================
+{
+  const we = (over: Partial<WorklogEntry> = {}): WorklogEntry =>
+    ({ ts: 1000, event: "start", taskId: "coord-x", who: "claude:A", project: "job-1", title: "coord-x", ...over });
+  // one task: start -> 3 progress flaps -> done. Collapses to ONE bar with a duration and a tick count.
+  const v = foldTimeline([
+    we({ ts: 100, event: "start" }),
+    we({ ts: 150, event: "progress" }), we({ ts: 200, event: "progress" }), we({ ts: 250, event: "progress" }),
+    we({ ts: 300, event: "done", outcome: "resolved" }),
+  ], 1000);
+  t("flaps collapse to one bar", v.bars.length === 1);
+  t("bar spans first start to last done", v.bars[0]!.startSec === 100 && v.bars[0]!.endSec === 300);
+  t("duration is end - start", v.bars[0]!.durationSec === 200);
+  t("progress ticks counted (liveness hint)", v.bars[0]!.progressTicks === 3);
+  t("outcome carried from done", v.bars[0]!.outcome === "resolved" && v.bars[0]!.stale === false);
+}
+{
+  const we = (over: Partial<WorklogEntry> = {}): WorklogEntry =>
+    ({ ts: 1000, event: "start", taskId: "t", who: "w", project: "p", title: "t", ...over });
+  // an open task (no done): endSec null, no duration; open > 24h -> stale (factorylog auto-close hint).
+  const now = 100000;
+  const vOpen = foldTimeline([we({ ts: now - 100, taskId: "fresh" })], now);
+  t("open task has null end + null duration", vOpen.bars[0]!.endSec === null && vOpen.bars[0]!.durationSec === null);
+  t("open < 24h is not stale", vOpen.bars[0]!.stale === false);
+  const vStale = foldTimeline([we({ ts: now - 25 * 3600, taskId: "old" })], now);
+  t("open > 24h is stale", vStale.bars[0]!.stale === true);
+}
+{
+  const mk = (taskId: string, project: string, s: number, e: number | null): WorklogEntry[] =>
+    e == null ? [{ ts: s, event: "start", taskId, who: "w", project, title: taskId }]
+      : [{ ts: s, event: "start", taskId, who: "w", project, title: taskId },
+         { ts: e, event: "done", taskId, who: "w", project, title: taskId, outcome: "ok" }];
+  // byProject rollup: closed durations summed per project; open contributes a count, no time.
+  const v = foldTimeline([
+    ...mk("a", "alpha", 0, 100), ...mk("b", "alpha", 100, 300), ...mk("c", "beta", 0, 50), ...mk("d", "beta", 0, null),
+  ], 10000);
+  const alpha = v.byProject.find((p) => p.project === "alpha")!;
+  t("project time = sum of closed durations", alpha.totalSec === 300 && alpha.count === 2);
+  t("open bar counts but adds no time", v.byProject.find((p) => p.project === "beta")!.count === 2 && v.byProject.find((p) => p.project === "beta")!.totalSec === 50);
+  t("byProject sorted by time desc", v.byProject[0]!.project === "alpha");
+}
+{
+  const mk = (taskId: string, s: number, e: number): WorklogEntry[] =>
+    [{ ts: s, event: "start", taskId, who: "w", project: "p", title: taskId },
+     { ts: e, event: "done", taskId, who: "w", project: "p", title: taskId, outcome: "ok" }];
+  // gaps: a > 15min window with nothing in progress is a stall blank; overlapping work leaves no gap.
+  const v = foldTimeline([...mk("a", 0, 100), ...mk("b", 100 + 20 * 60, 100 + 20 * 60 + 100)], 100000);
+  t("a blank wider than 15min is a gap", v.gaps.length === 1 && v.gaps[0]!.durationSec === 20 * 60);
+  const vOverlap = foldTimeline([...mk("a", 0, 1000), ...mk("b", 500, 1500)], 100000);
+  t("overlapping work leaves no gap", vOverlap.gaps.length === 0);
+  const vTight = foldTimeline([...mk("a", 0, 100), ...mk("b", 200, 300)], 100000);
+  t("a sub-15min blank is not flagged", vTight.gaps.length === 0);
+}
+{
+  // days: bars grouped by LOCAL calendar day of their start, newest day first.
+  const day = 86400;
+  const base = 1_700_000_000; // a fixed epoch; exact dates are local but grouping/ordering is what we assert
+  const v = foldTimeline([
+    { ts: base, event: "start", taskId: "d1", who: "w", project: "p", title: "d1" },
+    { ts: base + day, event: "start", taskId: "d2", who: "w", project: "p", title: "d2" },
+    { ts: base + day + 3600, event: "start", taskId: "d2b", who: "w", project: "p", title: "d2b" },
+  ], base + 2 * day);
+  t("days grouped by local date", v.days.length === 2);
+  t("newest day first", v.days[0]!.startSec > v.days[1]!.startSec);
+  t("span covers first to last ts", v.spanSec?.from === base && v.spanSec?.to === base + day + 3600);
+}
+{
+  // empty worklog -> empty view, never throws.
+  const v = foldTimeline([], 1);
+  t("empty timeline is empty, not an error", v.bars.length === 0 && v.days.length === 0 && v.byProject.length === 0 && v.gaps.length === 0 && v.spanSec === null);
+}
+
+// --- round trip + CROSS-MODULE contract: the bus builder's lines are exactly what the reader parses ---
+{
+  const home = mkdtempSync(path.join(tmpdir(), "ah-worklog-"));
+  try {
+    const swarm = path.join(home, ".agenthop", "swarm");
+    mkdirSync(swarm, { recursive: true });
+    // produce lines the SAME way the live dispatcher hook will (shared builder), then write them as the machine would.
+    const changes: ControlChangeLike[] = [
+      { put: "wait", wait: { waitId: "coord-r", state: "open", owner: "claude:R", subject: { jobId: "job-z" } } },
+    ];
+    const line1 = worklogLinesFromBatch(changes, 500);
+    const line2 = worklogLinesFromBatch([{ put: "wait", wait: { waitId: "coord-r", state: "resolved", owner: "claude:R", subject: { jobId: "job-z" }, resolution: { outcome: "bypass" } } }], 800);
+    writeFileSync(path.join(swarm, "worklog.jsonl"), line1.join("") + line2.join("") + "{ torn tail not json\n");
+    const entries = readWorklog(home);
+    t("reader parses builder lines, skips the torn tail", entries.length === 2);
+    t("reader + builder agree on the shape (project from subject.jobId)", entries[0]!.project === "job-z" && entries[0]!.event === "start");
+    const view = readTimelineView(home, 1000);
+    t("round trip to a bar: open then resolved = one closed bar", view.bars.length === 1 && view.bars[0]!.durationSec === 300 && view.bars[0]!.outcome === "bypass");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+{
+  const v = readTimelineView("/tmp/definitely-no-such-home-xyz", 1);
+  t("absent worklog -> empty timeline view", v.bars.length === 0 && v.spanSec === null);
+}
+
 
 console.log("all projection selftests passed");
