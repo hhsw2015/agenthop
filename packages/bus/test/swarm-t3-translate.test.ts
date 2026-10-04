@@ -79,6 +79,10 @@ describe("G — acceptance matrix (registry authority, prototype-safe, obligatio
     expect(translateDraft(draft([task({ structuredChecks: [{ check: "constructor" }] })]), fc()).outcome).toBe("rejected");
     expect(translateDraft(draft([task({ structuredChecks: [{ check: "toString" }] })]), fc()).outcome).toBe("rejected");
   });
+  test("ARGS-INHERITED-REQUIRED: a required arg named like a prototype key isn't satisfied by inheritance", () => {
+    const proto = fc({ checkRegistry: { version: "cr", checks: { needsCtor: { args: { ["constructor"]: { type: "string" as const, required: true } } } } } });
+    expect(translateDraft(draft([task({ structuredChecks: [{ check: "needsCtor", args: {} }] })]), proto).outcome).toBe("rejected");
+  });
   test("args schema: wrong-typed / null / undeclared args are rejected (not just presence)", () => {
     expect(translateDraft(draft([task({ structuredChecks: [{ check: "fileExists", args: { path: null } }] })]), fc()).outcome).toBe("rejected");
     expect(translateDraft(draft([task({ structuredChecks: [{ check: "fileExists", args: { path: 5 } }] })]), fc()).outcome).toBe("rejected");
