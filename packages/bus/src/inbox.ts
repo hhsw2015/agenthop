@@ -9,11 +9,48 @@
  * Concurrency: a drainer CLAIMS a message by atomically renaming its file, delivers, then ACKs (removes) on success or
  * RELEASES (renames back) on failure — so the retry timer and an explicit recv never deliver the same message twice.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: "local" | "relay"; ts: number; actionId?: string };
 export type Claimed = { file: string; msg: InboxMsg };
+
+/** Validate a parsed inbox record against the transport schema (F28 poison-pill defense). from/fromLabel/text are REQUIRED
+ *  strings, via ∈ {local,relay}, ts a finite number — a missing/mistyped one is exactly what reached xml()'s `.replace(undefined)`
+ *  and crashed the whole bus server. fromMode/actionId (and any future display fields like taskRef/title) are optional and
+ *  tolerated. Returns the typed msg, or null ⇒ the caller QUARANTINES it (never delivers, never derefs an undefined). */
+export function validInboxMsg(raw: unknown): InboxMsg | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.from !== "string" || typeof r.fromLabel !== "string" || typeof r.text !== "string") return null;
+  if (r.via !== "local" && r.via !== "relay") return null;
+  if (typeof r.ts !== "number" || !Number.isFinite(r.ts)) return null;
+  if (r.fromMode !== undefined && typeof r.fromMode !== "string") return null;
+  if (r.actionId !== undefined && typeof r.actionId !== "string") return null;
+  return { from: r.from, fromLabel: r.fromLabel, text: r.text, via: r.via, ts: r.ts, ...(typeof r.fromMode === "string" ? { fromMode: r.fromMode } : {}), ...(typeof r.actionId === "string" ? { actionId: r.actionId } : {}) };
+}
+
+/** Move a POISON inbox file out of the delivery path (into inbox/<sid>/quarantine/) so it can never be re-claimed and re-crash
+ *  the server (F28 poison-pill perpetual motion), + append a dead-letter line to the F26 ledger for audit/routing-incident input.
+ *  NEVER throws — quarantine is pure damage-control and must not itself take down the flush. */
+export function quarantineInbox(home: string, claimedFile: string, reason: string, raw?: string): void {
+  try {
+    const dir = path.dirname(claimedFile);
+    const qdir = path.join(dir, "quarantine");
+    mkdirSync(qdir, { recursive: true, mode: 0o700 });
+    const base = path.basename(claimedFile).replace(/\.claim-[^.]+$/, "");
+    try { renameSync(claimedFile, path.join(qdir, `${base}.${Date.now()}`)); } catch { /* best-effort — may already be gone */ }
+  } catch { /* never throw */ }
+  try {
+    let from: string | undefined; let preview: string | undefined;
+    if (raw !== undefined) { try { const r = JSON.parse(raw) as Record<string, unknown>; if (typeof r.from === "string") from = r.from; if (typeof r.text === "string") preview = r.text.slice(0, 120); } catch { /* unparseable ⇒ no fields */ } }
+    const to = path.basename(path.dirname(claimedFile)); // the recipient sid = the inbox dir name
+    const line = JSON.stringify({ ts: Date.now(), ...(from !== undefined ? { from } : {}), to, error: `quarantined: ${reason}`, ...(preview !== undefined ? { preview } : {}) });
+    const ledger = path.join(home, ".agenthop", "swarm", "dead-letters.jsonl");
+    mkdirSync(path.dirname(ledger), { recursive: true });
+    appendFileSync(ledger, `${line}\n`, { mode: 0o644 });
+  } catch { /* never throw */ }
+}
 
 function sanitize(key: string): string {
   return key.replace(/[^A-Za-z0-9._-]/g, "_") || "unknown";
@@ -46,12 +83,15 @@ export function claimInbox(home: string, keys: string[], claimer: string): Claim
     for (const n of names) {
       const src = path.join(dir, n);
       const claimed = `${src}.claim-${claimer}`;
-      try {
-        renameSync(src, claimed); // atomic: if a concurrent drainer already took it, this throws -> skip
-        out.push({ file: claimed, msg: JSON.parse(readFileSync(claimed, "utf8")) as InboxMsg });
-      } catch {
-        // claimed/removed by someone else, or malformed — skip (a malformed claimed file is cleaned below on ack)
-      }
+      try { renameSync(src, claimed); } catch { continue; } // atomic: a concurrent drainer already took it / it vanished -> skip
+      let raw: string;
+      try { raw = readFileSync(claimed, "utf8"); } catch { continue; } // vanished right after the claim -> skip
+      // F28: validate the transport schema on read; a poison file (unparseable OR missing/mistyped required fields) is
+      // QUARANTINED out of the delivery path (never deref'd, never crashes the server, never re-claimed) — not returned.
+      let msg: InboxMsg | null;
+      try { msg = validInboxMsg(JSON.parse(raw)); } catch { msg = null; }
+      if (msg === null) { quarantineInbox(home, claimed, "schema/parse", raw); continue; }
+      out.push({ file: claimed, msg });
     }
   }
   return out;

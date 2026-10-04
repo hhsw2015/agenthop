@@ -102,9 +102,13 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // claimInbox claims the WHOLE pending batch up front. On the first push failure (channel not ready) we
       // must release this one AND every still-unprocessed claim — otherwise they are orphaned as .claim-<pid>
       // files that no later flush reclaims (claimInbox only sees .json), stranding the message for good.
-      const claimed = claimInbox(home, inboxKeys(), String(process.pid));
+      const claimed = claimInbox(home, inboxKeys(), String(process.pid)); // claimInbox validates + quarantines poison (F28) — msgs here are schema-valid
       for (let i = 0; i < claimed.length; i++) {
-        const ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread, codexHome: codexDaemon?.codexHome(), fromMode: claimed[i].msg.fromMode, to: self.title });
+        // F28 defense-in-depth: a push that THREW (not just returned false) must never escape flushInbox — this runs as
+        // `void flushInbox()`, so an unhandled rejection would crash the whole bus server. Treat a throw as a delivery miss.
+        let ok = false;
+        try { ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread, codexHome: codexDaemon?.codexHome(), fromMode: claimed[i].msg.fromMode, to: self.title }); }
+        catch (e) { dbg(`flushInbox push threw (treating as miss): ${e instanceof Error ? e.message : e}`); ok = false; }
         if (ok) { ackInbox(claimed[i].file); continue; }
         for (let j = i; j < claimed.length; j++) releaseInbox(claimed[j].file);
         break;

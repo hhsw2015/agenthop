@@ -127,10 +127,12 @@ function pushClaude(
   });
 }
 
-function xml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// F28 deep fallback: coerce via String(x ?? "") so a non-string / undefined value (from an untyped peer JSON that slipped a
+// validation seam) can NEVER reach `.replace` on undefined and throw — a thrown escape here crashed the whole bus server.
+function xml(text: unknown): string {
+  return String(text ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function attr(text: string): string {
+function attr(text: unknown): string {
   return xml(text).replace(/"/g, "&quot;");
 }
