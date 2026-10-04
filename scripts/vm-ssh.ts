@@ -47,8 +47,11 @@ const TAILCAT_INSTALL = [
   'command -v tailcat >/dev/null 2>&1 || export PATH="$HOME/.local/bin:$PATH"',
 ].join("\n");
 
-/** Optional SOCKS5 egress for the provisioning ssh. Railway rate-limits anonymous `railway.new` PER SOURCE IP; a proxy
- *  gives a fresh IP (and lets a signed-up account route as it likes). AGENTHOP_SSH_PROXY = "host:port" or "socks5://…". */
+/** Optional SOCKS5 egress for the provisioning ssh. Railway rate-limits anonymous `railway.new` PER SOURCE IP, so a
+ *  proxy that rotates egress IPs raises the allocation success rate. The swarm points this at its ECH proxy POOL
+ *  (packages/bus/src/swarm/cf-proxy.ts: a SOCKS5 server round-robining many Cloudflare-Worker edge IPs — abundant IPs
+ *  ⇒ each retry a fresh one); any SOCKS5 works (a personal local proxy too, though a single IP won't benefit from
+ *  retries). AGENTHOP_SSH_PROXY = "host:port" or "socks5://host:port". */
 function proxyOpts(env: NodeJS.ProcessEnv = process.env): string[] {
   const raw = env.AGENTHOP_SSH_PROXY?.trim();
   if (!raw) return [];
@@ -64,26 +67,49 @@ const isolatedKeyOpts = (keyPath: string, knownHosts: string): string[] => [
   ...proxyOpts(),
 ];
 
-/** provision/reach: run a script on the box named by `keyPath` (new key ⇒ new box; existing key ⇒ same box). Surfaces
- *  Railway's anonymous-limit refusal as an actionable error (sign up, or route through AGENTHOP_SSH_PROXY). */
+/** Railway's PRE-PROVISION IP-gate refusal ("Anonymous visitors are limited") — the box was NOT created, so retrying
+ *  via a fresh egress IP is safe (no orphan box). Carries the signup URL for the no-proxy case. */
+class RailwayRefused extends Error {
+  constructor(public readonly signupUrl: string) {
+    super(`Railway refused anonymous provisioning (per-source-IP limit). Sign up: ${signupUrl}  — or route an IP-rotating SOCKS proxy via AGENTHOP_SSH_PROXY (the swarm's ECH proxy pool), then retry.`);
+    this.name = "RailwayRefused";
+  }
+}
+
+/** provision/reach: run a script on the box named by `keyPath` (new key ⇒ new box; existing key ⇒ same box). A
+ *  pre-provision IP-gate refusal becomes a retryable RailwayRefused (see provisionWithRetry). */
 async function railwayRun(keyPath: string, knownHosts: string, remoteScript: string, timeoutMs = 180_000): Promise<string> {
-  const refused = (out: string): string | undefined => {
+  const refusal = (out: string): RailwayRefused | undefined => {
     if (!out.includes('"status":"refused"')) return undefined;
     let url = "https://railway.com";
     try { url = (JSON.parse(out.match(/\{[\s\S]*\}/)?.[0] ?? "{}") as { human_signup_url?: string }).human_signup_url ?? url; } catch { /* keep default */ }
-    return `Railway refused anonymous provisioning (per-source-IP limit). Sign up: ${url}  — or set AGENTHOP_SSH_PROXY=host:port (SOCKS5) for a fresh egress IP, then retry.`;
+    return new RailwayRefused(url);
   };
   try {
     const { stdout } = await execFileP("ssh", [...isolatedKeyOpts(keyPath, knownHosts), "railway.new", remoteScript], { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
-    const s = stdout.toString();
-    const r = refused(s);
-    if (r) throw new Error(r);
-    return s;
+    const r = refusal(stdout.toString());
+    if (r) throw r;
+    return stdout.toString();
   } catch (e) {
-    const out = `${(e as { stdout?: string }).stdout ?? ""}${(e as { stderr?: string }).stderr ?? ""}`;
-    const r = refused(out);
-    if (r) throw new Error(r);
+    if (e instanceof RailwayRefused) throw e;
+    const r = refusal(`${(e as { stdout?: string }).stdout ?? ""}${(e as { stderr?: string }).stderr ?? ""}`);
+    if (r) throw r;
     throw e;
+  }
+}
+
+/** Allocate, retrying the IP-gate refusal ONLY when an egress proxy is set: the ECH proxy pool round-robins a fresh
+ *  Cloudflare edge IP per connection, so each retry sees a new source IP and the abundant pool makes success likely.
+ *  With no proxy every retry reuses the one blocked IP — pointless — so fail fast with the signup hint. */
+async function provisionWithRetry(keyPath: string, knownHosts: string, bootstrap: string): Promise<string> {
+  const maxTries = process.env.AGENTHOP_SSH_PROXY?.trim() ? 8 : 1;
+  for (let i = 1; ; i++) {
+    try { return await railwayRun(keyPath, knownHosts, bootstrap); }
+    catch (e) {
+      if (!(e instanceof RailwayRefused) || i >= maxTries) throw e;
+      process.stderr.write(`vm-ssh up: egress IP gated (attempt ${i}/${maxTries}); retrying through the proxy pool for a fresh IP…\n`);
+      await new Promise((r) => setTimeout(r, 800));
+    }
   }
 }
 function providerDestroy(): void {
@@ -214,7 +240,7 @@ async function cmdUp(args: Args): Promise<void> {
   const knownHosts = path.join(dir, "known_hosts");
   execFileSync("ssh-keygen", ["-t", "ed25519", "-f", keyPath, "-N", "", "-q"]);
 
-  const stdout = await railwayRun(keyPath, knownHosts, buildBootstrap(mode, pubKey, initScript));
+  const stdout = await provisionWithRetry(keyPath, knownHosts, buildBootstrap(mode, pubKey, initScript));
   const addr = parseCapturedAddr(stdout);
   if (!addr) throw new Error("vm-ssh up: no tailcat address captured from the box (serve may have failed; see /tmp/vmssh.serve.log on the box)");
 
