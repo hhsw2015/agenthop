@@ -88,6 +88,20 @@ describe("buildControlCut — §1 six-state responsibility map", () => {
     expect(cut.responsibilities).toContainEqual({ kind: "BUSINESS_EXEC", subjectId: "job-x/build/a1", executorInstance: "rw9" });
   });
 
+  test("59e7328-P1: a superseded prior binding's stale intent does NOT govern the successor OPEN binding (stays BUSINESS_EXEC/successor)", () => {
+    const p = planOf("job-x", "build");
+    let s = initialLogState(); s = stamp(s, [{ put: "plan", plan: p } as unknown as ChangeBody]);
+    // one RUNNING attempt: prior binding b0 CLOSED (its pending intent lingers), successor binding b1 OPEN (continuationOf b0), no intent for b1.
+    s = stamp(s, [{ put: "attempt", attempt: attempt({ status: "RUNNING", specDigest: p.nodes[0]!.specDigest, executionBindings: [
+      { bindingId: "job-x/build/a1/b0", assignmentId: "rw-old@build", launchId: "rw-old", publishGeneration: 1, openedAtSeq: 1, closedAtSeq: 4 },
+      { bindingId: "job-x/build/a1/b1", assignmentId: "rw-successor@build", launchId: "rw-successor", publishGeneration: 2, openedAtSeq: 5, continuationOf: "job-x/build/a1/b0" },
+    ] }) }]);
+    s = stamp(s, [intentBody({ status: "pending", bindingId: "job-x/build/a1/b0", launchId: "rw-old" })]); // stale intent for the CLOSED prior binding
+    const cut = buildControlCut("job-x", s, 1000)!;
+    expect(cut.responsibilities).toContainEqual({ kind: "BUSINESS_EXEC", subjectId: "job-x/build/a1", executorInstance: "rw-successor" }); // open successor is the carrier
+    expect(cut.responsibilities.some((r) => r.kind === "ALLOC_RECOVERING")).toBe(false); // the b0 intent must NOT leak onto b1
+  });
+
   test("P1-2: no authoritative PlanPut for the job in this state ⇒ null (caller emits UNVERIFIABLE, never judges off a stale startup plan)", () => {
     const s = stamp(initialLogState(), [{ put: "plan", plan: planOf("other-job", "build") } as unknown as ChangeBody]);
     expect(buildControlCut("job-x", s, 1000)).toBeNull();          // job-x has no plan in this cut

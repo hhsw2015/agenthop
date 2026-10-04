@@ -555,19 +555,27 @@ async function main(): Promise<void> {
     try {
       const st = loadControlLog(CONTROL_LOG_DIR);
       let livenessVerdict: unknown;
+      let livenessSampledAtSec: number | undefined;
+      let livenessValidUntilSec: number | undefined;
       if (plan) {
         const cut = buildControlCut(plan.jobId, st, nowSec(), { jobStartSec: jobStartSec(plan.jobId) });
         if (cut === null) {
           livenessVerdict = { verdict: "UNVERIFIABLE", missing: ["current-plan"] }; // no PlanPut in CONTROL ⇒ don't guess (P1-2)
+          livenessSampledAtSec = nowSec();
+          livenessValidUntilSec = nowSec(); // no evidence ⇒ immediately re-check (not valid into the future)
         } else {
           try {
             const hb = JSON.parse(readFileSync(HEARTBEAT_FILE, "utf8"));
             const obs = heartbeatObservations(hb, LIVENESS_WINDOW_SEC);
             livenessVerdict = assertLiveness({ controlCut: cut, observations: obs, modes: { sweepOn: SWEEP_ENABLED, taskExecOn: taskOn, passInstance: SELF, sweepInstance: SELF } }, nowSec());
+            // Evidence-bounded freshness (review 59e7328-P2): the verdict is valid only until its EARLIEST-expiring observation,
+            // NOT publish-time + window — otherwise a reused heartbeat's OK outlives the heartbeat it relied on. No obs ⇒ now.
+            livenessSampledAtSec = obs.length > 0 ? Math.max(...obs.map((o) => o.sampledAtSec)) : nowSec();
+            livenessValidUntilSec = obs.length > 0 ? Math.min(...obs.map((o) => o.validUntilSec)) : nowSec();
           } catch { /* no heartbeat yet / parse error ⇒ omit the verdict this tick (viz shows unknown), filled next tick */ }
         }
       }
-      writeProjection(PROJECTION_DIR, st, { nowSec: nowSec(), jobStartSec, livenessVerdict, livenessValidForSec: LIVENESS_WINDOW_SEC });
+      writeProjection(PROJECTION_DIR, st, { nowSec: nowSec(), jobStartSec, livenessVerdict, livenessSampledAtSec, livenessValidUntilSec });
     } catch (e) { log(`projection refresh failed: ${e instanceof Error ? e.message : e}`); }
   };
 

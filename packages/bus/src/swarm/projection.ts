@@ -33,9 +33,12 @@ export const PROJECTION_SCHEMA_VERSION = 1;
 export type ProjectionFile = { relPath: string; json: unknown };
 /** livenessVerdict (cluster-liveness §1d): the INV-1 verdict (OK|UNVERIFIABLE|STALL) the dispatcher computes per tick, surfaced
  *  in meta.json so viz renders a STALL red. Opaque here (the kernel owns its shape); absent until the first tick computes it.
- *  livenessValidForSec is the evidence window: §1c requires meta to publish the cut seq + sample time + VALIDITY so a consumer
- *  never treats an expired OK as current (review P2-1); the published verdict carries cutSeq/sampledAtSec/validUntilSec. */
-export type ProjectOpts = { nowSec: number; jobStartSec?: (jobId: string) => number | undefined; livenessVerdict?: unknown; livenessValidForSec?: number };
+ *  §1c requires meta to publish the cut seq + sample time + VALIDITY so a consumer never treats an expired OK as current
+ *  (review P2-1). The validity MUST be bounded by the EVIDENCE the verdict relied on, not re-derived from publish time + a full
+ *  window — else a reused heartbeat's OK outlives the heartbeat (review 59e7328-P2). The dispatcher therefore passes the
+ *  absolute livenessValidUntilSec (= earliest-expiring observation) + livenessSampledAtSec; livenessValidForSec is only a
+ *  fallback window when no evidence-bounded value is supplied. */
+export type ProjectOpts = { nowSec: number; jobStartSec?: (jobId: string) => number | undefined; livenessVerdict?: unknown; livenessValidForSec?: number; livenessValidUntilSec?: number; livenessSampledAtSec?: number };
 
 const HISTORY_MAX = 8;   // Open question 1: last 8 attempts + count.
 const OBSERVED_MAX = 8;  // §8b observed[]: recent N per attempt.
@@ -107,8 +110,10 @@ export function buildProjectionFiles(state: LogState, opts: ProjectOpts): Projec
     livenessVerdict: {
       ...(lv !== null && typeof lv === "object" ? (lv as Record<string, unknown>) : { verdict: lv }),
       cutSeq: state.seq,
-      sampledAtSec: opts.nowSec,
-      validUntilSec: opts.nowSec + (opts.livenessValidForSec ?? LIVENESS_VALID_DEFAULT_SEC),
+      // sample time + validity come from the EVIDENCE (the observations the verdict relied on) when the caller supplies them;
+      // the publish-time + window is only a fallback, never an override — a verdict must not outlive its evidence (P2 / 59e7328).
+      sampledAtSec: opts.livenessSampledAtSec ?? opts.nowSec,
+      validUntilSec: opts.livenessValidUntilSec ?? (opts.nowSec + (opts.livenessValidForSec ?? LIVENESS_VALID_DEFAULT_SEC)),
     },
   };
   out.push({ relPath: "meta.json", json: { schemaVersion: PROJECTION_SCHEMA_VERSION, lastAppliedSeq: state.seq, rebuiltAt: new Date(opts.nowSec * 1000).toISOString(), ...livenessField } });

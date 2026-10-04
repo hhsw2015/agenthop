@@ -214,6 +214,10 @@ describe("projection review fixes", () => {
     expect(withV.livenessVerdict).toMatchObject({ verdict: "STALL", why: "no holder", cutSeq: s.seq, sampledAtSec: 1000, validUntilSec: 1200 });
     const dflt = byPath(buildProjectionFiles(s, { nowSec: 1000, livenessVerdict: { verdict: "OK" } }), "meta.json");
     expect(dflt.livenessVerdict.validUntilSec).toBe(1000 + 120); // default evidence window when the caller omits one
+    // 59e7328-P2: an EVIDENCE-bounded validUntil (from the observation the verdict relied on) is used verbatim — NOT re-derived
+    // as publish-time + a full window. Publish at t=1119 off a heartbeat valid only to 1120 ⇒ validUntil 1120, not 1239.
+    const ev = byPath(buildProjectionFiles(s, { nowSec: 1119, livenessVerdict: { verdict: "OK" }, livenessValidUntilSec: 1120, livenessSampledAtSec: 1000 }), "meta.json");
+    expect(ev.livenessVerdict).toMatchObject({ verdict: "OK", cutSeq: s.seq, sampledAtSec: 1000, validUntilSec: 1120 });
     const without = byPath(buildProjectionFiles(s, { nowSec: 1000 }), "meta.json");
     expect("livenessVerdict" in without).toBe(false);
   });

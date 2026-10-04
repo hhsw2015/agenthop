@@ -59,12 +59,17 @@ export function buildControlCut(
   // W — RETRY_WAIT backoff (a supervised wait, counts in W — legitimate backoff is NOT a stall, §1/R1).
   for (const a of jobAttempts) if (a.status === "RETRY_WAIT" && (a.retryAt === undefined || a.retryAt > nowSec)) responsibilities.push({ kind: "RETRY_WAIT_BACKOFF", subjectId: a.attemptId });
 
-  // Live (non-abandoned) intents indexed by attempt + the W responsibilities (validation runs, non-validation gates), one pass.
-  const liveIntentByAttempt = new Map<string, { launchId: string; status: string }>();
+  // Live (non-abandoned) intents GROUPED by attempt, each keeping its bindingId — a DispatchIntent governs a SPECIFIC binding,
+  // not the whole attempt (review 59e7328-P1) — + the W responsibilities (validation runs, non-validation gates), one pass.
+  const liveIntents = new Map<string, Array<{ bindingId: string; launchId: string; status: string }>>();
   for (const body of Object.values(liveEntities(state))) {
     if (body.put === "intent") {
       const i = body.intent;
-      if (inJob(i.attemptId) && i.status !== "abandoned") liveIntentByAttempt.set(i.attemptId, { launchId: i.launchId, status: i.status });
+      if (inJob(i.attemptId) && i.status !== "abandoned") {
+        const arr = liveIntents.get(i.attemptId) ?? [];
+        arr.push({ bindingId: i.bindingId, launchId: i.launchId, status: i.status });
+        liveIntents.set(i.attemptId, arr);
+      }
     } else if (body.put === "validationRun") {
       const v = body.validationRun;
       if (inJob(v.attemptId) && v.state !== "closed") responsibilities.push({ kind: "VALIDATION", subjectId: v.validationRunId });
@@ -78,16 +83,21 @@ export function buildControlCut(
   // E — executing work, derived from the CURRENT non-terminal attempt + its OPEN execution binding (the §1 durable carriers:
   // ALLOC_RECOVERING = DispatchIntent/binding(open); BUSINESS_EXEC = binding(open)+WORK). NOT raw historical intents (review
   // P1-1): a done/terminal node's stale pending intent is not current work, and an open business binding with NO intent is
-  // still executing (the binding is the carrier). A missing carrier ⇒ no E responsibility; a confirmed intent or a bare open
-  // binding ⇒ BUSINESS_EXEC; a still-pending intent ⇒ ALLOC_RECOVERING. Roster/WORK absent ⇒ the kernel returns UNVERIFIABLE.
+  // still executing (the binding is the carrier). The GOVERNING intent for an open binding is the one targeting THAT binding
+  // (matched by bindingId) — a superseded prior binding's stale intent must not leak onto a successor open binding (review
+  // 59e7328-P1); with no open binding, the attempt's live allocation intent governs. A confirmed governing intent or a bare
+  // open binding ⇒ BUSINESS_EXEC; a still-pending intent ⇒ ALLOC_RECOVERING. Roster/WORK absent ⇒ the kernel is UNVERIFIABLE.
   for (const a of jobAttempts) {
     if (TERMINAL_ATTEMPT.has(a.status) || a.status === "RETRY_WAIT") continue;   // terminal holds no carrier; RETRY_WAIT is W
     if (currentAccepted(a.nodeId, sched) !== null) continue;                     // node already accepted ⇒ not current work
     const openBinding = a.executionBindings.find((b) => b.closedAtSeq === undefined);
-    const intent = liveIntentByAttempt.get(a.attemptId);
-    if (openBinding === undefined && intent === undefined) continue;             // no durable carrier ⇒ not an E responsibility
-    const executorInstance = intent?.launchId ?? openBinding?.launchId;
-    const kind = intent === undefined || intent.status === "confirmed" ? "BUSINESS_EXEC" : "ALLOC_RECOVERING";
+    const intents = liveIntents.get(a.attemptId) ?? [];
+    const governing = openBinding !== undefined
+      ? intents.find((i) => i.bindingId === openBinding.bindingId)               // ONLY the intent for the open binding (P1)
+      : (intents.find((i) => i.status !== "confirmed") ?? intents[0]);          // no binding yet ⇒ the live allocation intent
+    if (openBinding === undefined && governing === undefined) continue;          // no durable carrier ⇒ not an E responsibility
+    const executorInstance = governing?.launchId ?? openBinding?.launchId;
+    const kind = governing === undefined || governing.status === "confirmed" ? "BUSINESS_EXEC" : "ALLOC_RECOVERING";
     responsibilities.push({ kind, subjectId: a.attemptId, ...(executorInstance !== undefined ? { executorInstance } : {}) });
   }
 
