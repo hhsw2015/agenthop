@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, validInboxMsg } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, validInboxMsg, quarantineInbox } from "../src/inbox.js";
 
 let HOME: string;
 beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-inbox-")); });
@@ -115,5 +115,33 @@ describe("F28 poison-pill defense", () => {
     const c = claimInbox(HOME, ["s1"], "p");             // claims → validates → quarantines; no throw, no delivery
     expect(c.length).toBe(0);
     expect(readdirSync(path.join(inboxDirOf("s1"), "quarantine")).length).toBe(1);
+  });
+
+  test("P2-3: two same-base poison files get DISTINCT quarantine names — neither rename overwrites the other's evidence", () => {
+    const d = inboxDirOf("s1"); mkdirSync(d, { recursive: true });
+    for (const pid of ["101", "202"]) writeFileSync(path.join(d, `same.json.claim-${pid}`), JSON.stringify({ bad: pid }));
+    quarantineInbox(HOME, path.join(d, "same.json.claim-101"), "schema/parse", JSON.stringify({ from: "A", text: "x" }));
+    quarantineInbox(HOME, path.join(d, "same.json.claim-202"), "schema/parse", JSON.stringify({ from: "B", text: "y" }));
+    expect(readdirSync(path.join(d, "quarantine")).length).toBe(2);                 // both preserved (unique names)
+    expect(readFileSync(ledger(), "utf8").trim().split("\n").length).toBe(2);        // one audit line each
+  });
+
+  test("P2-2: quarantining a VANISHED source writes NO dead-letter (no false audit) and never throws", () => {
+    mkdirSync(inboxDirOf("s1"), { recursive: true });
+    quarantineInbox(HOME, path.join(inboxDirOf("s1"), "gone.json.claim-1"), "schema/parse"); // file does not exist
+    expect(existsSync(ledger())).toBe(false);                                        // no "quarantined" line for a file never moved
+  });
+
+  test("P2-2: a rename FAILURE leaves the file in place and writes NO dead-letter (no false quarantine claim)", () => {
+    const d = inboxDirOf("s1"); mkdirSync(d, { recursive: true });
+    const f = path.join(d, "poison.json.claim-1");
+    writeFileSync(f, JSON.stringify({ bad: 1 }));
+    chmodSync(d, 0o500); // read-only dir ⇒ the mkdir(quarantine)/rename out fails
+    let threw = false;
+    try { quarantineInbox(HOME, f, "schema/parse", JSON.stringify({ from: "A", text: "x" })); } catch { threw = true; } finally { chmodSync(d, 0o700); }
+    expect(threw).toBe(false);                 // never throws (a throw would kill the flush → crash the server)
+    if (!existsSync(f)) return;                // running as root ignores the mode — can't exercise the failure here
+    expect(existsSync(f)).toBe(true);          // bytes preserved in place for a later retry
+    expect(existsSync(ledger())).toBe(false);  // and NO false "quarantined" audit line
   });
 });

@@ -10,6 +10,7 @@
  * RELEASES (renames back) on failure — so the retry timer and an explicit recv never deliver the same message twice.
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 
 export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: "local" | "relay"; ts: number; actionId?: string; taskRef?: string; title?: string };
@@ -44,22 +45,32 @@ export function validInboxMsg(raw: unknown): InboxMsg | null {
  *  the server (F28 poison-pill perpetual motion), + append a dead-letter line to the F26 ledger for audit/routing-incident input.
  *  NEVER throws — quarantine is pure damage-control and must not itself take down the flush. */
 export function quarantineInbox(home: string, claimedFile: string, reason: string, raw?: string): void {
-  try {
-    const dir = path.dirname(claimedFile);
-    const qdir = path.join(dir, "quarantine");
-    mkdirSync(qdir, { recursive: true, mode: 0o700 });
-    const base = path.basename(claimedFile).replace(/\.claim-[^.]+$/, "");
-    try { renameSync(claimedFile, path.join(qdir, `${base}.${Date.now()}`)); } catch { /* best-effort — may already be gone */ }
-  } catch { /* never throw */ }
+  const dir = path.dirname(claimedFile);
+  const qdir = path.join(dir, "quarantine");
+  const base = path.basename(claimedFile).replace(/\.claim-[^.]+$/, "");
+  // UNIQUE, unguessable target: Date.now() alone collides for two poison files stripping to the same base in the same ms, and
+  // rename() overwrites — destroying the first file's evidence (review 6da8b5c-P2-3). A random suffix makes each quarantine
+  // name distinct, so no move clobbers another's bytes (no exists-then-rename TOCTOU either).
+  const target = path.join(qdir, `${base}.${Date.now()}.${randomBytes(6).toString("hex")}`);
+  try { mkdirSync(qdir, { recursive: true, mode: 0o700 }); renameSync(claimedFile, target); }
+  catch {
+    // The move did NOT happen: either the file already vanished (a concurrent drainer took it — ENOENT) or the FS failed
+    // (mkdir/rename error). In BOTH cases do NOT write a "quarantined" dead-letter — that would be a false audit for a file
+    // still in the delivery path (review 6da8b5c-P2-2). The file (if still present) stays .claim-<pid>, safely OUT of the
+    // deliverable .json set; recoverStaleClaims + the next claim re-attempt the quarantine. Never throw (don't kill flush).
+    return;
+  }
+  // The file is REALLY quarantined now ⇒ record the dead-letter audit line. Best-effort: if the append fails the bytes are
+  // still safely preserved in quarantine/ (the durable evidence), so a lost audit line never risks re-delivery or a crash.
   try {
     let from: string | undefined; let preview: string | undefined;
     if (raw !== undefined) { try { const r = JSON.parse(raw) as Record<string, unknown>; if (typeof r.from === "string") from = r.from; if (typeof r.text === "string") preview = r.text.slice(0, 120); } catch { /* unparseable ⇒ no fields */ } }
-    const to = path.basename(path.dirname(claimedFile)); // the recipient sid = the inbox dir name
+    const to = path.basename(dir); // the recipient sid = the inbox dir name
     const line = JSON.stringify({ ts: Date.now(), ...(from !== undefined ? { from } : {}), to, error: `quarantined: ${reason}`, ...(preview !== undefined ? { preview } : {}) });
     const ledger = path.join(home, ".agenthop", "swarm", "dead-letters.jsonl");
     mkdirSync(path.dirname(ledger), { recursive: true });
     appendFileSync(ledger, `${line}\n`, { mode: 0o644 });
-  } catch { /* never throw */ }
+  } catch { /* audit best-effort; the bytes are already quarantined */ }
 }
 
 function sanitize(key: string): string {
