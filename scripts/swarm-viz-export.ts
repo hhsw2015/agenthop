@@ -34,7 +34,7 @@ import { readMsgLogDays, msgLogEnabled, payloadLoggingEnabled, type MsgLogEntry 
 import { readTasks } from "../packages/bus/src/tasklog.js";
 import type { UnifiedPeer } from "../packages/bus/src/resolve.js";
 import { codexRolloutPath, readNodeActivity, transcriptPath, type NodeActivity } from "./node-activity.js";
-import { readBoardView, readProjection, stallVerdict, type BoardView, type Projection, type StallVerdict } from "./projection.js";
+import { readBoardView, readKanbanView, readProjection, stallVerdict, type BoardView, type KanbanView, type Projection, type StallVerdict } from "./projection.js";
 
 // ---------------------------------------------------------------------------------------------
 // Types
@@ -204,6 +204,9 @@ export type Snapshot = {
   /** The progress board (board-viz): board items (status = filename), wait current-state (projection
    *  waits/ when present, else the control-log fold), PROGRESS.md passthrough, artifact gaps (INV-2b-c). */
   board: BoardView;
+  /** kanban-view (board-viz's second view): three columns (todo/in-progress/done) + member swimlanes,
+   *  over the same four read-only sources. Columns/dep-gates/durations DERIVED in the reducer, not here. */
+  kanban: KanbanView;
   /** 停摆定理: all peers idle + no unresolved wait + unfinished work = silence over unfinished business.
    *  DERIVED here (like allocExhausted), from reported statuses and wait states — never from re-judging. */
   stall: StallVerdict;
@@ -483,6 +486,7 @@ export function buildSnapshot(
 
   const projection = readProjection(home);
   const board = readBoardView(home);
+  const kanban = readKanbanView(home);
   // Stall input = every peer's reported status (observer excluded above via `nodes`). The observer
   // itself never counts as "someone is working".
   const stall = stallVerdict(
@@ -509,6 +513,7 @@ export function buildSnapshot(
     events: msgLog,
     projection,
     board,
+    kanban,
     stall,
     payloadLogged: msgLog.some((e) => typeof e.text === "string" && e.text.length > 0),
     msgLogEnabled: msgLogEnabled(),

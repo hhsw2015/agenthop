@@ -491,3 +491,125 @@ export function readBoardView(home: string = homedir()): BoardView {
   const { waits, source } = readWaits(home);
   return { items, waits, waitsSource: source, progress: readProgressDoc(home), gaps: artifactGaps(items, waits) };
 }
+
+// --------------------------------------------------------------------------------------------------
+// kanban-view (board-viz's second view): three columns + member swimlanes, over the SAME four read-only
+// sources (board filenames / waits / status dir / heartbeat). Judgment-sink: columns, dep-gates, swimlane
+// grouping and durations are all DERIVED here from observable files — the renderer only draws.
+// --------------------------------------------------------------------------------------------------
+
+/** status dir = <home>/.agenthop/status, files `<sessionId>.json.<seq>` (highest seq = current, same
+ *  lock-free register as statusfile.ts). Returns the current {state,seq} per sessionId. Defensive. */
+export function readStatuses(home: string = homedir()): Map<string, { state: string; seq: number }> {
+  const dir = path.join(home, ".agenthop", "status");
+  const cur = new Map<string, { state: string; seq: number }>();
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return cur; }
+  for (const name of names) {
+    const m = /^(.+)\.json\.(\d+)$/.exec(name);
+    if (!m) continue;
+    const sessionId = m[1]!, seq = Number(m[2]);
+    const prev = cur.get(sessionId);
+    if (prev && prev.seq >= seq) continue;
+    const body = readJson<{ state?: unknown }>(path.join(dir, name));
+    const state = body && typeof body.state === "string" ? body.state : "unknown";
+    cur.set(sessionId, { state, seq });
+  }
+  return cur;
+}
+
+export type Heartbeat = { instance?: string; pass?: { lastTickSec?: number; inFlight?: unknown; mode?: string }; sweep?: { lastTickSec?: number; inFlight?: unknown; mode?: string } };
+/** dispatcher heartbeat (L1): <home>/.agenthop/swarm/heartbeat.json. null if absent. */
+export function readHeartbeat(home: string = homedir()): Heartbeat | null {
+  return readJson<Heartbeat>(path.join(swarmRoot(home), "heartbeat.json")) ?? null;
+}
+
+export type KanbanCard = {
+  id: string;
+  kind: "item" | "wait";
+  owner: string | null;
+  startSec: number | null;      // claim/post instant (item) or escalation instant (wait)
+  deadlineSec: number | null;
+  deps: string[];
+  blocked: boolean;             // open item with an unmet dependency, or a wait awaiting a human
+  status: string;               // board status or wait state
+  note?: string;                // human-readable reason (dep-gate / automation-exhausted)
+};
+export type KanbanSwimlane = {
+  member: string;               // claimant id (as on the board filename)
+  state: string;                // live status (working/idle/…) or "unknown"
+  sinceSec: number | null;      // working-since = oldest in-flight card's startSec (not a verified-output claim)
+  cards: KanbanCard[];
+};
+export type KanbanView = {
+  columns: { todo: KanbanCard[]; inProgress: KanbanCard[]; done: KanbanCard[] };
+  swimlanes: KanbanSwimlane[];
+  heartbeat: { passAgeSec: number | null; sweepAgeSec: number | null; inFlight: boolean } | null;
+  generatedAtSec: number;
+};
+
+/** Compose the kanban view. Pure given the four sources; `nowSec` injectable for tests. */
+export function readKanbanView(home: string = homedir(), nowSec: number = Math.floor(Date.now() / 1000)): KanbanView {
+  const items = readBoard(home);
+  const { waits } = readWaits(home);
+  const statuses = readStatuses(home);
+  const hb = readHeartbeat(home);
+  const doneIds = new Set(items.filter((i) => i.status === "done").map((i) => i.itemId));
+
+  // resolve a board claimant (short id on the filename) to a live status, matching by sessionId prefix.
+  const statusOf = (who: string | null): { state: string; seq: number } | undefined => {
+    if (!who) return undefined;
+    if (statuses.has(who)) return statuses.get(who);
+    for (const [sid, st] of statuses) if (sid.startsWith(who)) return st;
+    return undefined;
+  };
+
+  const itemCard = (it: BoardItem): KanbanCard => {
+    const unmet = it.status === "open" ? it.dependsOn.filter((d) => !doneIds.has(d)) : [];
+    return {
+      id: it.itemId, kind: "item", owner: it.claimant ?? it.postedBy ?? null,
+      startSec: it.status === "open" ? (it.postedAtSec ?? null) : it.mtimeMs != null ? Math.floor(it.mtimeMs / 1000) : null,
+      deadlineSec: null, deps: it.dependsOn, blocked: unmet.length > 0, status: it.status,
+      ...(unmet.length ? { note: `waiting on ${unmet.join(", ")}` } : {}),
+    };
+  };
+  const waitCard = (w: WaitRecord): KanbanCard => ({
+    id: w.waitId, kind: "wait", owner: w.owner ?? null,
+    startSec: typeof w.escalatedAt === "number" ? w.escalatedAt : null,
+    deadlineSec: typeof w.deadlineSec === "number" ? w.deadlineSec : null, deps: [],
+    blocked: !!w.automationExhausted, status: w.state,
+    ...(w.automationExhausted ? { note: "automation stopped — awaiting a human (a legal state)" } : {}),
+  });
+
+  const openItems = items.filter((i) => i.status === "open").map(itemCard);
+  const claimedItems = items.filter((i) => i.status === "claimed").map(itemCard);
+  const doneItems = items.filter((i) => i.status === "done").map(itemCard).sort((a, b) => (b.startSec ?? 0) - (a.startSec ?? 0));
+  const openWaits = waits.filter((w) => w.state === "open" || w.state === "action_pending").map(waitCard);
+  const resolvedWaits = waits.filter((w) => w.state === "resolved").map(waitCard);
+
+  // swimlanes: in-flight ITEMS grouped by owner, plus members reporting "working" with no board item.
+  const byOwner = new Map<string, KanbanCard[]>();
+  for (const c of claimedItems) { const k = c.owner ?? "?"; (byOwner.get(k) ?? byOwner.set(k, []).get(k)!).push(c); }
+  for (const [sid, st] of statuses) {
+    if (st.state !== "working") continue;
+    const short = sid.split("-")[0]!;
+    const already = [...byOwner.keys()].some((k) => k === sid || k === short || sid.startsWith(k));
+    if (!already) byOwner.set(short, []); // working but holding no board item — still "who's active"
+  }
+  const swimlanes: KanbanSwimlane[] = [...byOwner.entries()].map(([member, cards]) => {
+    const st = statusOf(member);
+    const starts = cards.map((c) => c.startSec).filter((s): s is number => s != null);
+    return { member, state: st?.state ?? "unknown", sinceSec: starts.length ? Math.min(...starts) : st ? Math.floor(st.seq / 1000) : null, cards };
+  }).sort((a, b) => b.cards.length - a.cards.length || a.member.localeCompare(b.member));
+
+  const hbView = hb ? {
+    passAgeSec: hb.pass?.lastTickSec != null ? nowSec - hb.pass.lastTickSec : null,
+    sweepAgeSec: hb.sweep?.lastTickSec != null ? nowSec - hb.sweep.lastTickSec : null,
+    inFlight: hb.pass?.inFlight != null || hb.sweep?.inFlight != null,
+  } : null;
+
+  return {
+    columns: { todo: openItems, inProgress: [...claimedItems, ...openWaits], done: [...doneItems, ...resolvedWaits] },
+    swimlanes, heartbeat: hbView, generatedAtSec: nowSec,
+  };
+}

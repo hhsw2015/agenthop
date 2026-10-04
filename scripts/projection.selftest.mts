@@ -5,8 +5,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  artifactGaps, assignLayers, foldWaitLog, parseBoardFileName, planEdges, readBoardView, readProjection,
-  stallVerdict, type BoardItem, type TaskNode, type TaskPlan, type WaitRecord,
+  artifactGaps, assignLayers, foldWaitLog, parseBoardFileName, planEdges, readBoardView, readKanbanView,
+  readProjection, readStatuses, stallVerdict, type BoardItem, type TaskNode, type TaskPlan, type WaitRecord,
 } from "./projection.js";
 
 const t = (name: string, cond: boolean) => {
@@ -189,6 +189,53 @@ t("no projection dir -> present:false, empty", (() => { const p = readProjection
 {
   const v = readBoardView("/tmp/definitely-no-such-home-xyz");
   t("absent swarm dir -> empty board view", v.items.length === 0 && v.waits.length === 0 && v.waitsSource === "none" && v.progress === null && v.gaps.length === 0);
+}
+
+// --- kanban-view: three columns + member swimlanes over board/waits/status/heartbeat ---
+{
+  const home = mkdtempSync(path.join(tmpdir(), "ah-kanban-"));
+  try {
+    const swarm = path.join(home, ".agenthop", "swarm");
+    const status = path.join(home, ".agenthop", "status");
+    mkdirSync(path.join(swarm, "board"), { recursive: true });
+    mkdirSync(path.join(swarm, "control-log"), { recursive: true });
+    mkdirSync(status, { recursive: true });
+    const now = 1_000_000;
+    // board: one ready open, one dep-gated open, one claimed (by 90b58f9c), one done.
+    writeFileSync(path.join(swarm, "board", "task-ready.json"), JSON.stringify({ itemId: "task-ready", dependsOn: [], postedAtSec: now - 100 }));
+    writeFileSync(path.join(swarm, "board", "task-blocked.json"), JSON.stringify({ itemId: "task-blocked", dependsOn: ["task-missing"], postedAtSec: now - 90 }));
+    writeFileSync(path.join(swarm, "board", "task-wip.claimed.90b58f9c.json"), JSON.stringify({ itemId: "task-wip" }));
+    writeFileSync(path.join(swarm, "board", "task-shipped.done.90b58f9c.json"), JSON.stringify({ itemId: "task-shipped" }));
+    // waits: one open (supervises in-progress).
+    writeFileSync(path.join(swarm, "control-log", "1.json"), JSON.stringify({ seq: 1, changes: [{ put: "wait", wait: { waitId: "w-review", state: "open", owner: "claude:X", deadlineSec: now + 60 } }] }));
+    // status: 90b58f9c working (has the claimed item), 20cab0a5 working (no item), f32a0507 idle.
+    writeFileSync(path.join(status, "90b58f9c-5bac-4318-a996-2373c179d674.json." + (now * 1000 + 1)), JSON.stringify({ state: "working", seq: now * 1000 + 1 }));
+    writeFileSync(path.join(status, "20cab0a5-b30e-4723-8399-7bc5cf78f6f7.json." + (now * 1000 + 2)), JSON.stringify({ state: "working", seq: now * 1000 + 2 }));
+    writeFileSync(path.join(status, "f32a0507-27bd-47d2-adea-9f30b87612ae.json." + (now * 1000 + 3)), JSON.stringify({ state: "idle", seq: now * 1000 + 3 }));
+    // heartbeat (L1).
+    writeFileSync(path.join(swarm, "heartbeat.json"), JSON.stringify({ instance: "disp-1", pass: { lastTickSec: now - 5, inFlight: null, mode: "lifecycle" }, sweep: { lastTickSec: now - 7, inFlight: null, mode: "sweep" } }));
+
+    // highest-seq status wins (register semantics)
+    const st = readStatuses(home);
+    t("kanban status: current state per session by highest seq", st.get("90b58f9c-5bac-4318-a996-2373c179d674")?.state === "working" && st.size === 3);
+
+    const k = readKanbanView(home, now);
+    t("kanban todo column = open items", k.columns.todo.length === 2 && k.columns.todo.every((c) => c.kind === "item" && c.status === "open"));
+    t("kanban dep-gate: unmet dependency marks blocked with a reason", (() => { const b = k.columns.todo.find((c) => c.id === "task-blocked"); return !!b && b.blocked === true && (b.note ?? "").includes("task-missing"); })());
+    t("kanban ready item is not blocked", k.columns.todo.find((c) => c.id === "task-ready")?.blocked === false);
+    t("kanban in-progress = claimed items + open waits", k.columns.inProgress.some((c) => c.id === "task-wip" && c.kind === "item") && k.columns.inProgress.some((c) => c.id === "w-review" && c.kind === "wait"));
+    t("kanban done = done items (+ resolved waits)", k.columns.done.some((c) => c.id === "task-shipped"));
+    t("kanban swimlane: the claimant with an in-flight card, live state resolved by prefix", (() => { const l = k.swimlanes.find((s) => s.member === "90b58f9c"); return !!l && l.state === "working" && l.cards.length === 1 && l.cards[0]!.id === "task-wip"; })());
+    t("kanban swimlane: a working member with no board item still shows (who's active)", (() => { const l = k.swimlanes.find((s) => s.member === "20cab0a5"); return !!l && l.state === "working" && l.cards.length === 0; })());
+    t("kanban swimlane: an idle member with no item is omitted (focus on who's doing what)", !k.swimlanes.some((s) => s.member.startsWith("f32a0507")));
+    t("kanban heartbeat: pass/sweep ages derived from lastTick", k.heartbeat?.passAgeSec === 5 && k.heartbeat?.sweepAgeSec === 7);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+{
+  const k = readKanbanView("/tmp/definitely-no-such-home-xyz", 1);
+  t("kanban: absent sources -> empty columns, no swimlanes, no heartbeat", k.columns.todo.length === 0 && k.columns.inProgress.length === 0 && k.columns.done.length === 0 && k.swimlanes.length === 0 && k.heartbeat === null);
 }
 
 console.log("all projection selftests passed");

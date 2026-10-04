@@ -303,6 +303,27 @@
   .flowrow .arrow { color: var(--relay); }
   .flowrow .who { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+  /* ---------- kanban (board-viz second view: columns + swimlanes) ---------- */
+  .kanban-view { display:none; position:absolute; inset:0; overflow:auto; background:var(--bg); z-index:4; padding:16px 18px 44px; }
+  .kanban-view .khead { display:flex; align-items:baseline; gap:14px; margin-bottom:12px; }
+  .kanban-view .khead h3 { margin:0; font-size:15px; }
+  .kcols { display:flex; gap:14px; align-items:flex-start; }
+  .kcol { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line-soft); border-radius:10px; padding:10px 12px; }
+  .kcol h4 { margin:0 0 8px; font-size:12px; display:flex; justify-content:space-between; }
+  .kcol.todo { border-top:3px solid var(--idle); } .kcol.wip { border-top:3px solid var(--working); } .kcol.done { border-top:3px solid var(--relay); }
+  .kcard { padding:6px 0; border-bottom:1px solid var(--line-soft); }
+  .kcard:last-child { border-bottom:none; }
+  .kcard.blk { opacity:.7; }
+  .kcard .l1 { display:flex; align-items:center; gap:7px; }
+  .kcard .k { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink); }
+  .kcard .l2 { color:var(--faint); font-size:10px; margin-top:2px; padding-left:2px; }
+  .klanes { margin-top:16px; }
+  .klanes h4 { font-size:12px; margin:0 0 8px; }
+  .swimlane { background:var(--panel); border:1px solid var(--line-soft); border-radius:8px; padding:8px 12px; margin-bottom:8px; }
+  .swho { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+  .sdot { width:8px; height:8px; border-radius:50%; background:var(--faint); flex:none; }
+  .sdot.working { background:var(--working); } .sdot.idle { background:var(--idle); }
+
   /* ---------- progress board (board-viz) ---------- */
   .brow { padding: 5px 0; font-size: 11.5px; border-bottom: 1px solid var(--line-soft); }
   .brow:last-child { border-bottom: none; }
@@ -396,6 +417,7 @@
     <div class="filters" id="filters"></div>
     <input class="search" id="search" placeholder="Search sessions, cwd, machine…" />
     <button class="viewbtn" id="viewtoggle" title="Topology (by machine) ⇄ Jobs (by task DAG)">jobs ▸</button>
+    <button class="viewbtn" id="kanbanbtn" title="Kanban: board columns (todo/in-progress/done) + member swimlanes">kanban ▸</button>
     <button class="themebtn" id="theme" title="Toggle light / dark">◐</button>
   </header>
   <div id="stage">
@@ -410,6 +432,7 @@
     <g id="view"></g></svg>
     <div class="panels" id="panels"></div>
 <div class="stallbar" id="stallbar"></div>
+    <div class="kanban-view" id="kanban"></div>
     <div class="jobsmembers" id="jobsmembers"></div>
     <div class="ticker" id="ticker">
       <div class="ttitle"><span>Events</span><span class="tsub" id="tsub"></span>
@@ -736,6 +759,10 @@
     if (!snap) return;
     // Task-logical (DAG) view is a different ORGANIZING AXIS of the same stage: topology = by machine,
     // jobs = by dependency. It renders only when the brain projection is present.
+    // Kanban is a distinct overlay view (board columns + member swimlanes), not the SVG stage. The stall
+    // banner still shows (renderStall never hides). Hidden unless selected, so it never covers the stage.
+    $("kanban").style.display = viewMode === "kanban" ? "block" : "none";
+    if (viewMode === "kanban") { renderKanban(); renderHeader(); renderStall(); return; }
     if (viewMode === "jobs" && snap.projection && snap.projection.present) {
       document.body.classList.add("jobs-view");
       renderJobsView();
@@ -1242,6 +1269,33 @@
   /** BOARD — claimable/claimed/done items; status comes from the exporter (= the filename, the claim
    *  protocol's atomic rename). dependsOn/conflictsWith render as text under each row — relations to
    *  non-board things ("rev2 frozen") are prose, not edges, so a list is the honest form. */
+  /** Kanban view (board-viz's second view): three columns + member swimlanes. Reads state.kanban, which is
+   *  DERIVED in the reducer (columns/dep-gates/durations) — this only draws. Read-only, defensive. */
+  function renderKanban() {
+    const k = state?.kanban;
+    const host = $("kanban");
+    if (!k) { host.innerHTML = '<div class="empty-note" style="padding:20px">No kanban data yet.</div>'; return; }
+    const card = (c) => {
+      const chipCls = c.kind === "wait" ? `wait-${esc(c.status)}` : esc(c.status);
+      const when = c.startSec ? `<span class="v" title="start / claim time">${ago(c.startSec * 1000)}</span>` : "";
+      const dl = c.deadlineSec ? (() => { const cd = countdown(c.deadlineSec); return `<span class="v ${cd.cls}">${esc(cd.text)}</span>`; })() : "";
+      const deps = c.deps && c.deps.length ? `<span class="bdep" title="${esc(c.deps.join("\n"))}">⧗${c.deps.length}</span>` : "";
+      const blocked = c.blocked ? `<span class="bchip wait-action_pending" title="${esc(c.note || "blocked")}">⏳ blocked</span>` : "";
+      const note = c.note && !c.blocked ? `<div class="l2">${esc(c.note)}</div>` : "";
+      return `<div class="kcard ${c.blocked ? "blk" : ""}"><div class="l1">
+        <span class="bchip ${chipCls}">${esc(c.status)}</span>
+        <span class="k">${esc(c.id)}</span>${blocked}${deps}${when}${dl}</div>${c.owner ? `<div class="l2">${esc(c.owner)}</div>` : ""}${note}</div>`;
+    };
+    const col = (title, cards, cls) => `<div class="kcol ${cls}"><h4><span>${title}</span><span class="n">${cards.length}</span></h4>${cards.map(card).join("") || '<div class="empty-note">—</div>'}</div>`;
+    const lanes = (k.swimlanes || []).map((l) => `<div class="swimlane"><div class="swho"><span class="sdot ${esc(l.state)}"></span><b>${esc(l.member)}</b> <span class="v">${esc(l.state)}</span>${l.sinceSec ? ` <span class="v">· since ${ago(l.sinceSec * 1000)}</span>` : ""}</div>${(l.cards || []).map(card).join("") || '<div class="empty-note">working — no board item claimed</div>'}</div>`).join("");
+    const hb = k.heartbeat
+      ? `<span class="v" title="dispatcher heartbeat age">dispatch: pass ${k.heartbeat.passAgeSec == null ? "?" : k.heartbeat.passAgeSec + "s"} · sweep ${k.heartbeat.sweepAgeSec == null ? "?" : k.heartbeat.sweepAgeSec + "s"}${k.heartbeat.inFlight ? " · in-flight" : ""}</span>`
+      : '<span class="v">dispatch: no heartbeat</span>';
+    host.innerHTML = `<div class="khead"><h3>Kanban</h3>${hb}</div>
+      <div class="kcols">${col("待办 / Todo", k.columns.todo, "todo")}${col("进行中 / In progress", k.columns.inProgress, "wip")}${col("已完成 / Done", k.columns.done, "done")}</div>
+      <div class="klanes"><h4>Swimlanes — who's doing what</h4>${lanes || '<div class="empty-note">no active members</div>'}</div>`;
+  }
+
   function renderBoardPanels(parts) {
     const b = state?.board;
     if (!b) return;
@@ -1738,6 +1792,12 @@
       localStorage.setItem("swarm-viz-theme", next);
     };
   })();
+  $("kanbanbtn").onclick = () => {
+    viewMode = viewMode === "kanban" ? "topology" : "kanban";
+    $("kanbanbtn").textContent = viewMode === "kanban" ? "◂ topology" : "kanban ▸";
+    sel = null; jobSel = null;
+    render();
+  };
   $("viewtoggle").onclick = () => {
     viewMode = viewMode === "jobs" ? "topology" : "jobs";
     $("viewtoggle").textContent = viewMode === "jobs" ? "◂ topology" : "jobs ▸";
