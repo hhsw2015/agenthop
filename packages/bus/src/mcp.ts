@@ -87,9 +87,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       noteCodex(core, extra);
       if (!text.trim()) return failure("Nothing to send.");
       const result = await core.send(to, text);
-      if (result.ok) return reply(result.delivered === "durable-fallback"
-        ? `Queued to ${result.label}'s durable inbox — it is not reachable live right now, so it will arrive when it next reconnects or calls agenthop_recv.`
-        : `Sent to ${result.label}.`);
+      if (result.ok) return reply(sendOutcome(result.delivered, result.label));
       return failure(`${result.error ?? "Not sent."}\n${roster(core.peers(), core.self.id, core.status())}`);
     },
   );
@@ -111,9 +109,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       if (!summary.trim()) return failure("Nothing to hand off (empty summary).");
       const text = formatHandoff(core.self.title, { summary, next }, core.self.cwd);
       const result = await core.send(to, text);
-      if (result.ok) return reply(result.delivered === "durable-fallback"
-        ? `Handed off to ${result.label} via its durable inbox — it is not reachable live right now, so it will arrive when it next reconnects or calls agenthop_recv.`
-        : `Handed off to ${result.label}.`);
+      if (result.ok) return reply(sendOutcome(result.delivered, result.label, "Handed off"));
       return failure(`${result.error ?? "Not sent."}\n${roster(core.peers(), core.self.id, core.status())}`);
     },
   );
@@ -288,6 +284,13 @@ function roster(peers: UnifiedPeer[], selfId: string, status: string): string {
     return `  ${p.title}${where}${mine}  ${state}  ${p.cwd}  (run ${run})`;
   });
   return `${status}\n${rows.length ? rows.join("\n") : "  (no sessions)"}`;
+}
+
+/** Honest one-line outcome for a send/handoff, naming the channel the message actually took (bus-reachability §1/F31). */
+function sendOutcome(delivered: "local" | "relay" | "native-direct" | "durable-fallback" | undefined, label: string | undefined, verb = "Sent"): string {
+  if (delivered === "native-direct") return `${verb} to ${label} via its live UI (native-direct — its agenthop node was unreachable, so this went straight to the Claude session).`;
+  if (delivered === "durable-fallback") return `${verb === "Sent" ? "Queued" : "Handed off"} to ${label}'s durable inbox — not reachable live right now, so it will arrive when it next reconnects or calls agenthop_recv.`;
+  return `${verb} to ${label}.`;
 }
 
 function reply(text: string) {
