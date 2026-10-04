@@ -61,13 +61,25 @@ describe("G — rejection matrix (reject vs conservative exit; original 18-fixtu
     const r = translateDraft(draft([task({ structuredChecks: ["Reviewer judges nothing omitted" as unknown as { check: string }] })]), fc());
     expect(r.outcome === "rejected" && /structuredCheck|prose/.test(r.reason)).toBe(true);
   });
-  test("AC-OBLIGATION-DROP: fileExists + prose keeps BOTH — the prose becomes a required review gate, not dropped", () => {
-    const r = translateDraft(draft([task({ structuredChecks: [{ check: "fileExists", args: { path: "out/r.md" } }], freeTextNotes: ["an independent reviewer confirms I1-I7"] })]), fc());
+  test("AC-OBLIGATION-DROP: fileExists + prose keeps BOTH — work node keeps fileExists, prose becomes a required review node (not dropped)", () => {
+    const r = translateDraft(draft([task({ nodeId: "M", structuredChecks: [{ check: "fileExists", args: { path: "out/r.md" } }], freeTextNotes: ["an independent reviewer confirms I1-I7"] })]), fc());
     expect(r.outcome).toBe("loadable");
     if (r.outcome !== "loadable") return;
-    const checks = r.plan.nodes[0]!.acceptance.map((a) => a.check);
-    expect(checks).toContain("fileExists");
-    expect(checks).toContain(REQUIRED_REVIEW_CHECK);
+    const work = r.plan.nodes.find((n) => n.nodeId === "M")!;
+    expect(work.acceptance.map((a) => a.check)).toEqual(["fileExists"]); // structured obligation stays on the work node
+    const review = r.plan.nodes.find((n) => n.nodeId === "M::review")!;
+    expect(review.kind).toBe("review");
+    expect(review.required).toBe(true);
+    expect(review.dependsOn).toContain("M");
+    expect(review.acceptance[0]!.check).toBe(REQUIRED_REVIEW_CHECK); // candidate-version-bound review gate (V8/A2)
+    expect(review.modelTier).toBe("heavy");
+  });
+  test("prose-only task: work node acceptance empty, obligation carried entirely by the required review node", () => {
+    const r = translateDraft(draft([task({ nodeId: "M", structuredChecks: [], freeTextNotes: ["reviewer confirms correctness"] })]), fc());
+    expect(r.outcome).toBe("loadable");
+    if (r.outcome !== "loadable") return;
+    expect(r.plan.nodes.find((n) => n.nodeId === "M")!.acceptance).toEqual([]);
+    expect(r.plan.nodes.find((n) => n.nodeId === "M::review")).toBeDefined();
   });
   test("AC-REGISTRY-DOWNGRADE: a registry missing a once-valid check rejects and names it", () => {
     const downgraded = fc({ checkRegistry: { version: "cr0", checks: { fileExists: { requiredArgs: ["path"] } } } }); // testsPass removed

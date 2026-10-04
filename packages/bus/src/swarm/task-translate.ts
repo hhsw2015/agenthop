@@ -11,9 +11,10 @@
  *  - checkRegistry authority (P1-1 / AC-UNKNOWN, AC-REGISTRY-DOWNGRADE): a structuredCheck is accepted only if its name
  *    is in the versioned registry and its required args are present — unknown check / malformed args ⇒ reject, never
  *    silently drop or downgrade. A non-{check} element (prose smuggled into structured) ⇒ reject (AC-PROSE).
- *  - obligation never evaporates (P1-1 / AC-OBLIGATION-DROP): a non-empty freeTextNotes becomes a REQUIRED
- *    `required-review-pass` acceptance check (V8 binds it to the candidate version at A2 time, Q1). It is appended, not
- *    substituted — a node with fileExists + prose keeps BOTH. Empty structuredChecks AND empty notes ⇒ reject (C).
+ *  - obligation never evaporates (P1-1 / AC-OBLIGATION-DROP): a non-empty freeTextNotes spawns a SEPARATE required
+ *    review node (kind=review) whose acceptance is the candidate-version-bound `required-review-pass` gate (V8 at A2
+ *    time, Q1; design §26). The work node keeps its structured checks; the prose obligation becomes its own reviewer
+ *    task, never dropped and never folded as prose. Empty structuredChecks AND empty notes ⇒ reject (C).
  *  - R4 from TRUSTED inputs only (P1-2 / R4-OWNER-SPOOF, R4-FROZEN, R4-UNKNOWN): the four-condition gate reads the
  *    frozenContext owner/frozen/irreversible policy, NEVER the model's own covers/risk labels. ≥2 trusted domains, a
  *    frozen-scope write, or an irreversible path ⇒ auto-prepend one design gate (coveredSpecDigests = the covered impl
@@ -168,7 +169,9 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
     if (!isIntInRange(t.complexity, 1, 10)) return R(`${at}: complexity must be an integer 1-10`); // BUDGET-INVALID (out-of-range)
     if (t.independentScore !== undefined && !isIntInRange(t.independentScore, 1, 10)) return R(`${at}: independentScore must be an integer 1-10`);
 
-    // acceptance: structured via registry, prose -> required review gate; both empty -> reject (C)
+    // acceptance split (F-T3-3): structured checks go on the work node (registry-validated); a non-empty freeTextNotes
+    // spawns a SEPARATE required review node (design §26 "freeTextNotes→review 节点") — never silently dropped, never
+    // folded as prose. Both empty ⇒ reject (C).
     if (t.structuredChecks.length === 0 && t.freeTextNotes.length === 0) return R(`${at}: empty acceptance (no structuredChecks and no freeTextNotes)`);
     const acceptance: AcceptanceCheck[] = [];
     for (let j = 0; j < t.structuredChecks.length; j++) {
@@ -176,10 +179,7 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
       if ("reason" in r) return R(r.reason);
       acceptance.push(r.check);
     }
-    if (t.freeTextNotes.length > 0) {
-      if (!t.freeTextNotes.every(isNonEmptyStr)) return R(`${at}: freeTextNotes entries must be non-empty strings`);
-      acceptance.push({ check: REQUIRED_REVIEW_CHECK, args: { notes: [...t.freeTextNotes] } }); // AC-OBLIGATION-DROP: appended, never substituting structured checks
-    }
+    if (t.freeTextNotes.length > 0 && !t.freeTextNotes.every(isNonEmptyStr)) return R(`${at}: freeTextNotes entries must be non-empty strings`);
 
     // role: present-but-unknown -> needsRole (ROLE-UNKNOWN); absent -> no role constraint
     let roleFloor: ModelTier = "light";
@@ -202,7 +202,7 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
         requiredOutputs: t.requiredOutputs.map((o) => ({ logicalName: o.logicalName, kind: o.kind, ...(o.pathHint !== undefined ? { pathHint: o.pathHint } : {}) })),
         ...(t.baseSourceCommit !== undefined ? { baseSourceCommit: t.baseSourceCommit } : {}),
       },
-      acceptance,
+      acceptance, // structured checks only (may be empty if the node's obligations are all prose → its review node)
       artifactScope: [...t.artifactScope],
       ...(t.sourceWriteScope !== undefined ? { sourceWriteScope: [...t.sourceWriteScope] } : {}),
       estimatedRuntimeSec: t.estimatedRuntimeSec ?? 600,
@@ -213,6 +213,27 @@ export function translateDraft(draft: Draft, fc: FrozenContext): TranslateResult
       ...(t.roleProfile !== undefined ? { roleProfile: t.roleProfile } : {}),
       specDigest: "",
     });
+
+    if (t.freeTextNotes.length > 0) {
+      // a required review node (kind=review, heavy) gates the prose obligation: its acceptance is the candidate-version-
+      // bound review-pass gate (V8 at A2 time, Q1). Reviewing scales with the work, so it adds to the budget estimate.
+      complexitySum += effectiveComplexity;
+      nodes.push({
+        nodeId: `${t.nodeId}::review`,
+        kind: "review",
+        goal: `Independent review of ${t.nodeId} (prose obligations): ${t.freeTextNotes.join("; ")}`,
+        dependsOn: [t.nodeId],
+        outputContract: { requiredOutputs: [{ logicalName: "review-verdict", kind: "notes" }] },
+        acceptance: [{ check: REQUIRED_REVIEW_CHECK, args: { boundTo: t.nodeId, notes: [...t.freeTextNotes] } }],
+        artifactScope: [],
+        estimatedRuntimeSec: 600,
+        retryBudget: 2,
+        required: true,
+        runtime: "ephemeral",
+        modelTier: "heavy", // review kind floor
+        specDigest: "",
+      });
+    }
   }
 
   // needsRole wins over R4/assembly: an unresolved role is not a dispatchable plan (never silently default-dispatch).
