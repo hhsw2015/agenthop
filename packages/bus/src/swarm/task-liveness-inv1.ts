@@ -8,13 +8,15 @@
  *
  * Semantics the reviewer's countermodels attack (each pinned by a test):
  *  ① legitimate backoff (a RETRY_WAIT whose retryAt isn't due) is a SUPERVISED wait — it counts in W, never STALL.
- *  ② a missing/stale observation ⇒ UNVERIFIABLE listing what's missing — never guess (no evidence ≠ dead ≠ alive;
- *     "a roster-absent RUNNING" is UNVERIFIABLE, not STALL and not healthy).
+ *  ② a missing/stale/FUTURE observation ⇒ UNVERIFIABLE listing what's missing — never guess (no evidence ≠ dead ≠
+ *     alive; a roster-absent RUNNING is UNVERIFIABLE). Observations match by responsibility IDENTITY+instance (C1): a
+ *     shared loop (pass/sweep) is scoped to the declared current instance, business WORK/roster to the executor — a
+ *     missing anchor stays UNVERIFIABLE, never wildcards another record. A valid window is sampledAtSec<=nowSec<=validUntil (C2).
  *  ③ the SAME controlCut with DIFFERENT observations can yield a different verdict — health is an input, not a table
  *     lookup over the cut alone.
- *  ④ incidentKey is STABLE: (affected subject + gap category), independent of seq, so re-detecting the same ongoing
- *     stall yields the same key (dedup no-op — writing the incident must not change next-dedup). lastObservedSeq updates
- *     separately, it is NOT part of the key.
+ *  ④ the STALL output separates a stable groupKey (affected subject + gap category — seq- AND episode-independent, so
+ *     re-detecting the same ongoing stall yields the same fingerprint, a dedup no-op) from the full incidentId
+ *     (groupKey + episode), built only when the IO layer supplies the episode it owns (C3). lastObservedSeq updates apart.
  *  ⑤ coverage ≠ progress: OK only proves responsibility HAS a live holder; business progress is each loop's own
  *     evidence, reported separately — the OK verdict carries a `coverage` breakdown, never a progress claim.
  */
@@ -30,17 +32,23 @@ export type ObservationSource = "pass-heartbeat" | "sweep-heartbeat" | "roster" 
  *  window — fresh iff nowSec <= validUntilSec. `instance` scopes roster/per-executor facts. */
 export type ObservationFact = { source: ObservationSource; instance?: string; sampledAtSec: number; validUntilSec: number };
 
-/** Admission declaration: a closed loop is not a promise, so a mode-off witness is a VERIFIED absence, not UNVERIFIABLE. */
-export type Modes = { sweepOn: boolean; taskExecOn: boolean };
+/** Admission declaration: a closed loop is not a promise, so a mode-off witness is a VERIFIED absence, not UNVERIFIABLE.
+ *  passInstance/sweepInstance name the CURRENT dispatcher/sweep loop instance (C1): a shared-loop heartbeat witnesses
+ *  only if it is from THAT instance — an arbitrary same-source record (a stale/other dispatcher's heartbeat) cannot
+ *  stand in. Undefined while the mode is on ⇒ the current instance is undeclared ⇒ UNVERIFIABLE (never wildcard). */
+export type Modes = { sweepOn: boolean; taskExecOn: boolean; passInstance?: string; sweepInstance?: string };
 
-export type ControlCut = { jobId: string; seq: number; jobTerminal: boolean; responsibilities: LivenessResponsibility[] };
+/** openIncidentEpisode (C3): the episode the IO layer is currently tracking for this group, if any. The pure function
+ *  outputs a stable groupKey (fingerprint); only when an episode is supplied does it also build the full incidentId.
+ *  Episode assignment/persistence (bump on recurrence after close) is the IO layer's job, not this function's. */
+export type ControlCut = { jobId: string; seq: number; jobTerminal: boolean; responsibilities: LivenessResponsibility[]; openIncidentEpisode?: number };
 export type ReviewCut = { controlCut: ControlCut; observations: ObservationFact[]; modes: Modes };
 
 export type Coverage = { e: string[]; w: string[]; r: string[] };
 export type LivenessVerdict =
   | { verdict: "OK"; coverage: Coverage }
   | { verdict: "UNVERIFIABLE"; missing: string[] }
-  | { verdict: "STALL"; why: string; incidentKey: string; lastObservedSeq: number };
+  | { verdict: "STALL"; why: string; groupKey: string; incidentId?: string; lastObservedSeq: number };
 
 // The §1 responsibility coverage table: each non-terminal state -> which loop witnesses it (mode + heartbeat), which
 // non-emptiness set it joins, and whether it additionally needs a roster presence (executor actually there).
@@ -59,8 +67,10 @@ export function assertLiveness(cut: ReviewCut, nowSec: number): LivenessVerdict 
   // INV-1 only binds a non-terminal job; a finished job needs no holder.
   if (controlCut.jobTerminal) return { verdict: "OK", coverage: { e: [], w: [], r: [] } };
 
-  const has = (src: ObservationSource, inst: string | undefined, requireFresh: boolean): boolean =>
-    observations.some((o) => o.source === src && (inst === undefined || o.instance === inst) && (!requireFresh || nowSec <= o.validUntilSec));
+  // C2: a valid observation window is sampledAtSec <= nowSec <= validUntilSec — a FUTURE sample proves nothing and an
+  // expired one is stale; both are not-yet/not-anymore evidence, treated as unverifiable, never as health or death.
+  const match = (src: ObservationSource, inst: string): ObservationFact | undefined =>
+    observations.find((o) => o.source === src && o.instance === inst && o.sampledAtSec <= nowSec && nowSec <= o.validUntilSec);
 
   const coverage: Coverage = { e: [], w: [], r: [] };
   const missing: string[] = [];
@@ -70,12 +80,14 @@ export function assertLiveness(cut: ReviewCut, nowSec: number): LivenessVerdict 
     const t = TABLE[r.kind];
     // Mode off = a VERIFIED dead holder (we KNOW the loop isn't running) — not a witness, not unverifiable.
     if (!modes[t.mode]) continue;
-    // The loop's heartbeat must be present AND fresh, else we cannot confirm it is alive -> UNVERIFIABLE.
-    if (!has(t.obs, undefined, false)) { missing.push(`${t.obs} (for ${r.kind} ${r.subjectId})`); continue; }
-    if (!has(t.obs, undefined, true)) { missing.push(`stale ${t.obs} (for ${r.kind} ${r.subjectId})`); continue; }
+    // C1: the witness observation must match the responsibility's identity+instance — never wildcard a missing anchor.
+    // A shared loop (pass/sweep) is scoped to the declared current instance; business WORK/roster to the executor.
+    const inst = t.obs === "pass-heartbeat" ? modes.passInstance : t.obs === "sweep-heartbeat" ? modes.sweepInstance : r.executorInstance;
+    if (inst === undefined) { missing.push(`${t.obs} instance not declared (for ${r.kind} ${r.subjectId})`); continue; }
+    if (!match(t.obs, inst)) { missing.push(`${t.obs}@${inst} missing/stale/future (for ${r.kind} ${r.subjectId})`); continue; }
     if (t.needsRoster) {
-      if (!has("roster", r.executorInstance, false)) { missing.push(`roster@${r.executorInstance ?? "?"} (for ${r.subjectId})`); continue; }
-      if (!has("roster", r.executorInstance, true)) { missing.push(`stale roster@${r.executorInstance ?? "?"} (for ${r.subjectId})`); continue; }
+      if (r.executorInstance === undefined) { missing.push(`roster instance not set (for ${r.subjectId})`); continue; }
+      if (!match("roster", r.executorInstance)) { missing.push(`roster@${r.executorInstance} missing/stale/future (for ${r.subjectId})`); continue; }
     }
     coverage[SET_KEY[t.set]].push(r.subjectId);
     anyVerified = true;
@@ -86,8 +98,18 @@ export function assertLiveness(cut: ReviewCut, nowSec: number): LivenessVerdict 
   // No verified holder, but something we cannot confirm -> don't convict; ask for the missing evidence.
   if (missing.length > 0) return { verdict: "UNVERIFIABLE", missing };
   // No verified holder and nothing unverifiable (no responsibilities, or all holders verified-dead) -> STALL.
+  // C3: groupKey is the stable dedup fingerprint (subject + category), seq- AND episode-independent. The full incident
+  // identity is groupKey + episode; episode is the IO layer's to assign/persist, so we only build incidentId when it is
+  // supplied — otherwise we emit the fingerprint alone and never fold seq/now into it.
   const why = controlCut.responsibilities.length === 0
     ? "non-terminal job with no E/W/R responsibility at all"
     : "every responsibility holder is down (its loop mode is off)";
-  return { verdict: "STALL", why, incidentKey: `${controlCut.jobId}:no-live-holder`, lastObservedSeq: controlCut.seq };
+  const groupKey = `${controlCut.jobId}:no-live-holder`;
+  return {
+    verdict: "STALL",
+    why,
+    groupKey,
+    ...(controlCut.openIncidentEpisode !== undefined ? { incidentId: `${groupKey}:episode-${controlCut.openIncidentEpisode}` } : {}),
+    lastObservedSeq: controlCut.seq,
+  };
 }
