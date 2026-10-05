@@ -134,6 +134,22 @@ v1 **不投影** DM 与团队板:DM 是可丢的 advisory(R0),板有自己的 go
 - schemaVersion 起 1;加字段不升版,改语义/删字段升版并保留一个过渡版本期。
 - 投影丢失/损坏不是故障:dispatcher 重放 control-log 全量重建(brain §4.3 步骤 A 的既定能力)。
 
+## 8b. v1 增补(2026-10-03,实弹笔记五缺口定稿;「加字段不升版」)
+
+- **review 两种形态的建模指引(S1)**:节点式 review = 消费冻结输入的终审,进 DAG;流水式 review(边做边审)= **验收活动**,不建节点,每轮结论落 results.json 的 accepted/rejected。把流水 review 建成 DAG 节点会与递归 currentAccepted 冲突(它依赖未完成节点,恒 complete:false)——那是模型故意不让,不是缺陷。
+- **decidedBy(S4)**:accepted/rejected 条目加 `decidedBy: string`(memberId 或 validator 标识);同 attempt 的多轮验收结论靠 decidedBy+时序+supersede 链区分「曾绿已修」与「反复横跳」。
+- **issuedBy(S8)**:supersede 置位时投影在被 supersede 的 accepted 上暴露 `supersededBy: { issuedBy, atSeq }`——打回边 = issuedBy→target,viz 画虚线。
+- **runDrift(S5/F1)**:members.json 条目加 `runDrift: { count, lastChangeAtSec }`——memberId 稳定不变,漂移次数作可靠性信号可见。
+- **observed[] 节选(S2)**:results.json 加 `observed: ResultObserved 摘要[]`(每 attempt 最近 N 条,含 commit/path),attempt 内多 commit 推进的轨迹由此可见——零件 CONTROL 本就有,此前投影漏暴露。
+
+viz 渲染侧若再报缺口,作后续增补,不阻塞本批。
+
+## 8c. v1 增补二(2026-10-03,wait 实体投影;「加字段不升版」)
+
+- 目录新增 `waits/<waitId>.json` = control-log `{put:"wait"}` 实体当前态**原样**(WaitRecord 全字段;若 §0b A1 增补冻结,预算/耗尽字段随之出现——消费者按可选字段处理)。
+- 渲染注解:approval 的 `decision:"pending"` 与 wait 的 `state:"open"` 是两根轴,分开画(resolved≠granted 是冻结语义);`automationExhausted` 置位 ⇒ 画「自动催办已停、等人」,这是合法长期状态不是故障;判定下沉原则同 §3——过期与否由 sweep 判,投影只给 deadlineSec,viz 可以画倒计时但不得自判「已超时」改状态色。
+- sweep 的处置动作本身不投影(它们是 CONTROL 转换,结果已反映在 wait 状态里);审计走日志。
+
 ## 9. 与 tasklog(P0 运输记录)的分层——防止再长出两套任务模型
 
 swarm-viz 仓库里已有 `packages/bus/src/tasklog.ts` [F]:file-per-task、temp+rename、读者永不阻塞写者——**正是本文 C-3 的纪律,先例有效**。但它是 **P0 TASK 的运输记录**(「一单工作递给了谁、对方回了什么状态」,总线层),不是业务任务轴(attempt/验收/依赖,brain 层)。分层立场:
