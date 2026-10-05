@@ -62,6 +62,14 @@ function busHeader(from: string, to?: string): string {
   return to ? `[bus] ${from} → ${to}\n` : `[bus] ${from}\n`;
 }
 
+/** Bounded wait (ms) for a `codex queue` spawn to settle. Overridable via AGENTHOP_PUSH_TIMEOUT_MS (also lets a test drive a
+ *  short timeout). Read at call time so an override takes effect per call. B7: without a bound a child that never exits would
+ *  hang flushInbox forever (flushing stays true ⇒ every later flush returns busy ⇒ the inbox wedges). */
+function pushTimeoutMs(): number {
+  const n = Number(process.env.AGENTHOP_PUSH_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 8000;
+}
+
 /** codex queue delivers as if the user typed it (no sender field), so we prefix an email-style From→To header. */
 function pushCodex(thread: string, from: string, text: string, codexHome?: string, to?: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -71,15 +79,22 @@ function pushCodex(thread: string, from: string, text: string, codexHome?: strin
     const child = spawn(codexBin(), ["queue", "--thread", thread, "--message", `${busHeader(from, to)}${text}`], { stdio: ["ignore", "pipe", "pipe"], env });
     let out = "";
     let err = "";
+    let settled = false;
+    const finish = (ok: boolean): void => { if (settled) return; settled = true; clearTimeout(timer); resolve(ok); };
+    // B7 (review d8dd4b1): bound the spawn. A `codex queue` child that connects but never exits must not hang the caller
+    // (pushToHost → flushInbox's `await`) forever — recoverStaleClaims only frees DEAD pids, not a wedged live flush. On
+    // timeout, KILL the child and report a miss, so flushInbox releases the claim and retries the message next tick.
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } dbg(`pushCodex thread=${thread} timed out after ${pushTimeoutMs()}ms — killed, treating as miss`); finish(false); }, pushTimeoutMs());
+    timer.unref?.();
     child.stdout?.on("data", (d) => (out += d));
     child.stderr?.on("data", (d) => (err += d));
     child.on("error", (e) => {
       dbg(`pushCodex spawn error thread=${thread}: ${e.message}`);
-      resolve(false);
+      finish(false);
     });
     child.on("exit", (code) => {
       dbg(`pushCodex thread=${thread} exit=${code} out=${out.trim().slice(0, 200)} err=${err.trim().slice(0, 200)}`);
-      resolve(code === 0);
+      finish(code === 0);
     });
   });
 }
@@ -127,10 +142,12 @@ function pushClaude(
   });
 }
 
-function xml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// F28 deep fallback: coerce via String(x ?? "") so a non-string / undefined value (from an untyped peer JSON that slipped a
+// validation seam) can NEVER reach `.replace` on undefined and throw — a thrown escape here crashed the whole bus server.
+function xml(text: unknown): string {
+  return String(text ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function attr(text: string): string {
+function attr(text: unknown): string {
   return xml(text).replace(/"/g, "&quot;");
 }

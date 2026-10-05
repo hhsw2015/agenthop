@@ -4,11 +4,15 @@ import { startLocalBus, type LocalBus } from "./broker.js";
 import { startRelay, type Relay } from "./relay.js";
 import { pushToHost } from "./push.js";
 import { startCodexDaemon, type CodexDaemon } from "./codex.js";
-import { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
+import { dedupLocalPeers, resolvePeer, type UnifiedPeer, type ResolveError } from "./resolve.js";
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox } from "./inbox.js";
+import { recordSelfObserve, recordLearn } from "./bus-identity.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
+import { fallbackForUnresolved, fallbackForMissedDelivery } from "./send-fallback.js";
+import { resolveSession, listSessions } from "./swarm/task-liveness.js";
+import { reportCheckIn } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 
@@ -24,7 +28,13 @@ export type BusMessage = { from: string; fromLabel: string; text: string; via: "
 export type BusCore = {
   self: SelfInfo;
   peers(): UnifiedPeer[];
-  send(to: string, text: string): Promise<{ ok: boolean; label?: string; error?: string }>;
+  /** `delivered` reports the channel used (bus-reachability §1 / B2+B3 option b): "durable" = written to the recipient's durable
+   *  inbox, the ONLY same-machine delivery guarantee (surfaced near-live by the recipient's fs-watch/flush, and restart-safe);
+   *  "relay" = a live best-effort cross-machine send (no shared durable inbox). There is no "local"/"native-direct" live push:
+   *  a byte-write/FIN is not a confirmed receipt (B3) and native-direct's cached socket could misroute (B2). "bus" = a live
+   *  best-effort broker push to a node that does NOT consume the durable inbox (an OpenCode plugin node, C1) — not a durable
+   *  guarantee. Absent on failure. */
+  send(to: string, text: string): Promise<{ ok: boolean; label?: string; error?: string; delivered?: "durable" | "relay" | "bus" }>;
   recv(timeoutMs: number): Promise<BusMessage[]>;
   /** Record this Codex thread id (from x-codex-turn-metadata) so inbound can be pushed to it. */
   noteThread(id: string): void;
@@ -66,6 +76,26 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const inboxKey = (): string => self.stableId ?? self.id;
   const inboxKeys = (): string[] => (self.stableId && self.stableId !== self.id ? [self.stableId, self.id] : [self.id]);
   let flushing = false;
+  // Per-process retry set for poison files a claim could neither quarantine nor release (both failed on a transient FS
+  // fault). The flush timer re-attempts them via retryStuckPoison once the fault clears (review bb6dad5-P2-4-B).
+  const stuckPoison = new Set<string>();
+  // B7 (review 01b773d): HEALTHY claims whose release failed (transient rename error) after a push miss. recoverStaleClaims only
+  // frees DEAD-pid claims, so our own live-pid claim would otherwise stay `.claim-<pid>` forever. flushInbox retries releasing
+  // these at the top of each pass; on success the file is back to `.json` and the normal claim path re-delivers it.
+  const stuckRelease = new Set<string>();
+  // C2 (review 01b773d): watch-triggered flushes back off until this time after a no-progress flush, so our OWN claim/release
+  // renames (which also fire the inbox fs-watch) cannot self-excite a tight flush loop while the push channel is down. The 5s
+  // flush timer stays the retry floor during the backoff; a flush that DELIVERS clears it so near-live resumes.
+  let watchCooldownUntil = 0;
+  const WATCH_COOLDOWN_MS = 5000; // one flush-timer interval: during a channel outage the watch stays quiet, the timer retries
+  // B5 (review 01b773d): a startup check-in that missed (coordinator not resolvable yet, or the write failed) leaves a RETRY
+  // obligation. retryCheckIn re-attempts it on the flush timer and on a broker (re)connect until it is sent; a permanent "skip"
+  // (not in a swarm / we are the coordinator) clears it. Identity-change re-checks-in directly (learnStableId) and resets this.
+  let checkInPending = false;
+  const retryCheckIn = (): void => {
+    if (!checkInPending) return;
+    if (reportCheckIn(home, self, process.env.SWARM_COORDINATOR) !== "retry") checkInPending = false; // sent or permanently-skipped ⇒ obligation discharged
+  };
   // Work-status is per SESSION IDENTITY, not per MCP-server process: one Codex daemon-backed server can
   // adopt several thread identities over its life (see learnStableId), and each must keep its own status
   // and its own monotonic seq — otherwise thread A's seq would gate thread B's reports.
@@ -97,17 +127,32 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // under the just-adopted stableId would otherwise never be reclaimed (claimInbox only sees `.json`), staying stuck
       // across the restart/adoption (Codex P2-8). Cheap + safe: only a dead pid's claim is released.
       recoverStaleClaims(home, inboxKeys());
+      // Re-attempt any poison stuck from a prior flush (quarantine+release both failed then); clears once the FS heals.
+      retryStuckPoison(home, stuckPoison);
+      // B7: re-attempt releasing HEALTHY claims whose release failed earlier; on success the file is back to `.json` and the
+      // claim below re-delivers it. recoverStaleClaims can't help (this is our own LIVE pid).
+      for (const f of [...stuckRelease]) if (releaseInbox(f)) stuckRelease.delete(f);
       const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
       // claimInbox claims the WHOLE pending batch up front. On the first push failure (channel not ready) we
       // must release this one AND every still-unprocessed claim — otherwise they are orphaned as .claim-<pid>
       // files that no later flush reclaims (claimInbox only sees .json), stranding the message for good.
-      const claimed = claimInbox(home, inboxKeys(), String(process.pid));
+      const claimed = claimInbox(home, inboxKeys(), String(process.pid), stuckPoison); // validates + quarantines poison (F28) — msgs here are schema-valid
+      let delivered = 0;
       for (let i = 0; i < claimed.length; i++) {
-        const ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread, codexHome: codexDaemon?.codexHome(), fromMode: claimed[i].msg.fromMode, to: self.title });
-        if (ok) { ackInbox(claimed[i].file); continue; }
-        for (let j = i; j < claimed.length; j++) releaseInbox(claimed[j].file);
+        // F28 defense-in-depth: a push that THREW (not just returned false) must never escape flushInbox — this runs as
+        // `void flushInbox()`, so an unhandled rejection would crash the whole bus server. Treat a throw as a delivery miss.
+        let ok = false;
+        try { ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread, codexHome: codexDaemon?.codexHome(), fromMode: claimed[i].msg.fromMode, to: self.title }); }
+        catch (e) { dbg(`flushInbox push threw (treating as miss): ${e instanceof Error ? e.message : e}`); ok = false; }
+        if (ok) { ackInbox(claimed[i].file); delivered++; continue; }
+        // B7: a failed release for a HEALTHY message must not silently strand it — track it for retry (not stuckPoison; it is not
+        // a bad message, and recoverStaleClaims won't free a live-pid claim).
+        for (let j = i; j < claimed.length; j++) if (!releaseInbox(claimed[j].file)) stuckRelease.add(claimed[j].file);
         break;
       }
+      // C2: if we processed claims but delivered NONE (channel not ready), back off watch-triggered re-flushes so our own
+      // claim/release renames don't self-excite a tight loop; the 5s timer keeps retrying. A delivery clears the backoff.
+      if (claimed.length > 0) watchCooldownUntil = delivered === 0 ? Date.now() + WATCH_COOLDOWN_MS : 0;
     } finally {
       flushing = false;
     }
@@ -148,7 +193,18 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     });
   };
 
-  const local: LocalBus = startLocalBus(self, options.home, (m) => handleInbound(m.from, m.payload, "local", { label: m.fromLabel, mode: m.fromMode }));
+  // B9 (review d8dd4b1): persist a durable RECOVERY FACT when the local broker (re)connects after a drop. Pre-fix, the in-memory
+  // roster re-registered (elect -> broker/client) but NO durable surface recorded that this connection recovered — recordSelfObserve
+  // ran only at startup/identity-change. Re-run it on each RE-registration: a fresh alias-log observe (new eventId + ts = the
+  // recovery moment, busPid = this incarnation) that a pre-decision whois can read and date for staleness. The FIRST registration
+  // is already covered by the startup observe below, so skip it. Reuses an existing face — no new persistent surface, no broadcast.
+  let busRegistered = false;
+  const onBusRegistered = (): void => {
+    if (!busRegistered) { busRegistered = true; return; } // initial connect — startup recordSelfObserve covers it
+    recordSelfObserve(home, self, stableIdAuthoritative, "local");
+    retryCheckIn(); // B5: a (re)connect is a good moment to retry a missed startup check-in (coordinator may now be reachable)
+  };
+  const local: LocalBus = startLocalBus(self, options.home, (m) => handleInbound(m.from, m.payload, "local", { label: m.fromLabel, mode: m.fromMode }), onBusRegistered);
 
   // Codex has no native session id in its env, so we adopt the thread id as our stableId the first
   // time we learn it (from an MCP call's metadata or the daemon). This also refreshes the readable
@@ -157,7 +213,16 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const learnStableId = (id: string | undefined, authoritative: boolean): void => {
     if (!id) return;
     if (self.stableId === id) {
-      if (authoritative) stableIdAuthoritative = true;
+      // A guess for THIS exact id is now confirmed authoritative: record the upgrade (P2-1) so whois gets a HARD claim —
+      // bus-identity correctly refuses to promote the earlier `possible` on its own. Flip once; a repeat authoritative
+      // call for an already-hard id records nothing (no new identity fact).
+      if (authoritative && !stableIdAuthoritative) {
+        stableIdAuthoritative = true;
+        recordLearn(home, self.id, undefined, id, "correction", true);
+        recordSelfObserve(home, self, true, "local");
+      } else if (authoritative) {
+        stableIdAuthoritative = true;
+      }
       return;
     }
     // A daemon guess never overrides an id we already have. Authoritative call metadata (or the env)
@@ -166,6 +231,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     if (!authoritative && self.stableId) return;
     const hadStableId = self.stableId !== undefined;
     const oldKey = self.stableId ?? self.id;
+    const wasAuthoritative = stableIdAuthoritative; // capture BEFORE the reassign below — distinguishes thread-switch vs correction
     self.stableId = id;
     self.title = sessionTitle(self.tool, self.cwd, id ?? self.id); // never bare tool:dir (would shadow a sibling)
     stableIdAuthoritative = authoritative;
@@ -180,9 +246,25 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     self.statusAt = e?.at;
     local.updateSelf(self);
     relay?.updateSelf(self);
+    // Record the identity learn to the durable alias-log (bus-identity): bootstrap (first adoption) / thread-switch (an
+    // authoritative id replacing an authoritative one) / correction (authoritative replacing a guess). authoritative flows
+    // through as the confidence source; a correction's fold undoes the corrected old value. Append-only, fails soft.
+    recordLearn(home, self.id, hadStableId ? oldKey : undefined, id, hadStableId ? (wasAuthoritative ? "thread-switch" : "correction") : "bootstrap", authoritative);
+    // P2-2: the native learn alone does not record the now-published HANDLE (self.title). Observe the full current identity
+    // (run + handle[derivedFrom native] + native) so whois(handle) resolves — a wait.owner stored as a handle can then get
+    // this entity's probeTargets instead of reading not-seen.
+    recordSelfObserve(home, self, authoritative, "local");
+    // B5 (review d8dd4b1): the startup check-in used the per-run id because a Codex node's stableId was not yet known. Now that
+    // the durable identity is learned (bootstrap / thread-switch / correction), re-report to the coordinator with the STABLE sid
+    // so the session is durably addressable — the earlier provisional per-run line is superseded (idempotent at the coordinator
+    // by sid). Gated on SWARM_COORDINATOR, never to self, fail-soft (reportCheckIn). Retain a retry obligation on a transient miss (B5).
+    checkInPending = reportCheckIn(home, self, process.env.SWARM_COORDINATOR) === "retry";
   };
 
   const relay: Relay | undefined = startRelay(self, (from, text) => handleInbound(from, text, "relay"), options);
+  // Record one self-observe to the alias-log at startup (run/handle/native[hard|possible by authority]/busPid/hostPid) so
+  // whois can resolve this session + probe its liveness. Append-only, fails soft; only on identity change thereafter (learn).
+  recordSelfObserve(home, self, stableIdAuthoritative, "local");
 
   const unified = (): UnifiedPeer[] => {
     // Collapse this machine's duplicate nodes for ONE session (startup presence daemon + lazily-spawned MCP node share
@@ -214,7 +296,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     return p?.via === "local" ? p.mode : undefined;
   };
 
-  const resolve = (to: string): UnifiedPeer | { error: string } => resolvePeer(unified(), self.id, to);
+  const resolve = (to: string): UnifiedPeer | ResolveError => resolvePeer(unified(), self.id, to);
 
   // Set this session's own status, keyed per identity (see statusByIdentity). Shared by the MCP tool
   // and the file watcher below.
@@ -257,8 +339,28 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // identity's keys (Codex P2-8), so this covers both the initial run-id and any later-adopted stableId. Unref'd — the
   // broker socket keeps the process alive; this timer must not by itself.
   void flushInbox();
-  const flushTimer = setInterval(() => void flushInbox(), 5000);
+  const flushTimer = setInterval(() => { void flushInbox(); retryCheckIn(); }, 5000); // B5: the timer also retries a missed check-in
   flushTimer.unref?.();
+
+  // Recipient fs-watch (B2/B3 option b): a sender now writes same-machine messages straight to our durable inbox, so watch our
+  // inbox dir(s) and flush the MOMENT one lands — near-live surfacing instead of waiting out the 5s timer, which stays the floor.
+  // Debounced so a burst of writes coalesces into one flush. Watches the CURRENT inbox keys at startup; a Codex node that adopts
+  // its stableId later still surfaces via the timer until then (durable is the guarantee, the watch is only the accelerator).
+  // S18 seam ("message is a pointer, file is authoritative"): a pre-seal flush would hook in here, before flushInbox.
+  let watchDebounce: ReturnType<typeof setTimeout> | undefined;
+  const onInboxChange = (): void => {
+    if (Date.now() < watchCooldownUntil) return; // C2: backing off after a no-progress flush — ignore self-induced churn; the timer retries
+    if (watchDebounce) return; // coalesce a burst of arrivals into a single flush
+    watchDebounce = setTimeout(() => { watchDebounce = undefined; void flushInbox(); }, 50);
+    watchDebounce.unref?.();
+  };
+  const stopInboxWatch = watchInbox(home, inboxKeys(), onInboxChange);
+
+  // bus-reachability §4: announce this (re)started node to the coordinator's durable inbox so the coordinator learns of
+  // the session without relying on a prompt the LLM must remember to send. Gated on SWARM_COORDINATOR, never to self,
+  // fail-soft. A Claude node has its stableId at startup; a Codex node that learns its thread id later gets its durable
+  // re-announce through the reconnect/re-register path (Stage C), not here.
+  if (reportCheckIn(home, self, process.env.SWARM_COORDINATOR) === "retry") checkInPending = true; // B5: coordinator not reachable yet / write failed ⇒ retry on the timer + reconnect
 
   return {
     self,
@@ -269,15 +371,49 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       void flushInbox(); // a Codex session just took a turn -> its rollout now exists -> flush anything pending to it
     },
     async send(to, text) {
-      const peer = resolve(to);
-      if ("error" in peer) return { ok: false, error: peer.error };
-      // Log an "out" entry only on confirmed delivery. Gated so Buffer.byteLength + the call are skipped when
-      // AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
-      const logOut = (via: "local" | "relay"): void => {
-        if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via, direction: "out", size: Buffer.byteLength(text), text });
+      // bus-reachability §1 / B2+B3 (option b): SAME-MACHINE delivery is DURABLE-ALWAYS. The recipient's durable inbox is the
+      // ONLY delivery guarantee — a live broker/native push is never a confirmed receipt (B3), and native-direct is RETIRED (its
+      // cached cc-socks path could be rebound to another process ⇒ misroute, B2). A same-machine target (a resolved LOCAL peer,
+      // or an offline session that owns the handle via presence/<sid>.pid) ⇒ write its durable inbox; the recipient's fs-watch +
+      // flush surfaces it near-live and it survives a restart. CROSS-MACHINE (relay) has no shared durable inbox ⇒ a live
+      // best-effort relay send, reported honestly. `delivered` is thus "durable" (guaranteed-queued) or "relay" (live).
+      const toDurable = (sid: string): { ok: true; label?: string; delivered: "durable" } => {
+        writeInbox(home, sid, { from: self.stableId ?? self.id, fromLabel: self.title, ...(self.mode ? { fromMode: self.mode } : {}), text, via: "local", ts: Date.now() });
+        return { ok: true, label: labelFor(sid), delivered: "durable" };
       };
-      if (peer.via === "local") { const ok = local.send(peer.id, text); if (ok) logOut("local"); return { ok, label: labelFor(peer.id) }; }
-      if (relay && peer.pub) { const ok = await relay.send(peer.pub, text); if (ok) logOut("relay"); return { ok, label: labelFor(peer.id) }; }
+      const peer = resolve(to);
+      if ("error" in peer) {
+        // B1 (review d8dd4b1): an AMBIGUOUS (or empty) target must NEVER fall back — resolveSession runs a weaker handle match
+        // that could pick ONE of several live matches and misroute a private message. Only a genuine no-match may route to a
+        // same-machine durable inbox (a session that owns the handle via presence/<sid>.pid).
+        if (peer.kind !== "none") return { ok: false, error: peer.error };
+        const plan = fallbackForUnresolved(resolveSession(to, listSessions(home)), peer.error);
+        return plan.kind === "durable" ? toDurable(plan.sid) : { ok: false, error: plan.reason };
+      }
+      // Resolved. SAME-MACHINE (local) ⇒ durable-always (fallbackForMissedDelivery computes the recipient's durable sid).
+      const plan = fallbackForMissedDelivery(peer);
+      if (plan.kind === "durable") {
+        // C1 (review 01b773d): an OpenCode node receives over the broker + its own in-memory queue; it does NOT consume the
+        // durable inbox, so a durable write to it is never read. For such a node, deliver over the LIVE BUS (the accelerator it
+        // does consume) and report the capability limit honestly — delivered:"bus" is best-effort, NOT the durable guarantee. Every
+        // other local node (BusCore: claude/codex) consumes the durable inbox and gets durable-always. (Not native-direct — no
+        // cached socket, no misroute; just the broker the peer is already on.)
+        if (peer.tool === "opencode") {
+          const ok = local.send(peer.id, text);
+          if (ok) { if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via: "local", direction: "out", size: Buffer.byteLength(text), text }); return { ok: true, label: labelFor(peer.id), delivered: "bus" }; }
+          return { ok: false, error: `"${peer.title}" (OpenCode) is not reachable on the live bus right now, and OpenCode nodes do not consume the durable inbox — try again when it is active.` };
+        }
+        return toDurable(plan.sid);
+      }
+      // CROSS-MACHINE (relay): a live best-effort send; no local durable fallback (no shared filesystem).
+      if (relay && peer.pub) {
+        const ok = await relay.send(peer.pub, text);
+        if (ok) {
+          if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via: "relay", direction: "out", size: Buffer.byteLength(text), text });
+          return { ok: true, label: labelFor(peer.id), delivered: "relay" };
+        }
+        return { ok: false, error: `Relay delivery to "${peer.title}" failed; it is on another machine.` };
+      }
       return { ok: false, error: "That peer is on another machine but no team relay is configured here (set AGENTHOP_TEAM)." };
     },
     async recv(timeoutMs) {
@@ -285,7 +421,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // timer never re-delivers the same message.
       const deadline = Date.now() + timeoutMs;
       const drain = (): BusMessage[] =>
-        claimInbox(home, inboxKeys(), String(process.pid)).map((c) => {
+        claimInbox(home, inboxKeys(), String(process.pid), stuckPoison).map((c) => {
           ackInbox(c.file);
           return { from: c.msg.from, fromLabel: c.msg.fromLabel, text: c.msg.text, via: c.msg.via };
         });
@@ -333,6 +469,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     },
     async close() {
       clearInterval(flushTimer);
+      stopInboxWatch();
       stopStatusWatch();
       codexDaemon?.close();
       await local.close();

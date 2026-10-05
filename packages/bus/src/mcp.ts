@@ -87,7 +87,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       noteCodex(core, extra);
       if (!text.trim()) return failure("Nothing to send.");
       const result = await core.send(to, text);
-      if (result.ok) return reply(`Sent to ${result.label}.`);
+      if (result.ok) return reply(sendOutcome(result.delivered, result.label));
       return failure(`${result.error ?? "Not sent."}\n${roster(core.peers(), core.self.id, core.status())}`);
     },
   );
@@ -109,7 +109,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       if (!summary.trim()) return failure("Nothing to hand off (empty summary).");
       const text = formatHandoff(core.self.title, { summary, next }, core.self.cwd);
       const result = await core.send(to, text);
-      if (result.ok) return reply(`Handed off to ${result.label}.`);
+      if (result.ok) return reply(sendOutcome(result.delivered, result.label, "Handed off"));
       return failure(`${result.error ?? "Not sent."}\n${roster(core.peers(), core.self.id, core.status())}`);
     },
   );
@@ -284,6 +284,13 @@ function roster(peers: UnifiedPeer[], selfId: string, status: string): string {
     return `  ${p.title}${where}${mine}  ${state}  ${p.cwd}  (run ${run})`;
   });
   return `${status}\n${rows.length ? rows.join("\n") : "  (no sessions)"}`;
+}
+
+/** Honest one-line outcome for a send/handoff, naming the channel the message actually took (bus-reachability §1/F31). */
+function sendOutcome(delivered: "durable" | "relay" | "bus" | undefined, label: string | undefined, verb = "Sent"): string {
+  if (delivered === "durable") return `${verb === "Sent" ? "Queued" : "Handed off"} to ${label}'s durable inbox — it surfaces the moment ${label} next flushes (near-live on the same machine) and survives a restart.`;
+  if (delivered === "bus") return `${verb} to ${label} over the live bus (best-effort — ${label} is an OpenCode node, which does not keep a durable inbox, so this is not a restart-safe guarantee).`;
+  return `${verb} to ${label}.`;
 }
 
 function reply(text: string) {

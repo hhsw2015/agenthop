@@ -56,7 +56,7 @@ export function bridgeSocketPath(home: string = path.join(homedir(), ".agenthop"
   return process.env.AGENTHOP_BRIDGE_SOCK ?? path.join(home, "bridge.sock");
 }
 
-export function startLocalBus(self: SelfInfo, home?: string, onInbound?: (msg: Inbound) => void): LocalBus {
+export function startLocalBus(self: SelfInfo, home?: string, onInbound?: (msg: Inbound) => void, onRegistered?: () => void): LocalBus {
   const sock = socketPath(home);
   let role: Role = "connecting";
   let roster: SelfInfo[] = [self];
@@ -170,6 +170,7 @@ export function startLocalBus(self: SelfInfo, home?: string, onInbound?: (msg: I
       server = srv;
       role = "broker";
       roster = rosterFromClients();
+      onRegistered?.(); // this node (re)joined the bus as the broker — a reconnect recovery event (B9)
     });
   };
 
@@ -191,6 +192,7 @@ export function startLocalBus(self: SelfInfo, home?: string, onInbound?: (msg: I
       client = socket;
       role = "client";
       socket.write(`${JSON.stringify({ t: "hello", self } satisfies Wire)}\n`);
+      onRegistered?.(); // this node (re)joined the bus as a client (hello sent) — a reconnect recovery event (B9)
     });
     readLines(socket, (msg) => {
       if (msg.t === "peers") roster = msg.peers;

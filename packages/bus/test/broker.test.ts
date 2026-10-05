@@ -152,3 +152,22 @@ test("a client takes over when the broker exits", async () => {
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("B9: onRegistered fires on each (re)registration — a failover/reconnect is observable for the recovery-fact hook", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "bus-"));
+  const a = startLocalBus(mk("aaaaaaaa-1"), home);
+  await until(() => a.role() === "broker");
+  let bRegistrations = 0;
+  const b = startLocalBus(mk("bbbbbbbb-2"), home, undefined, () => { bRegistrations++; });
+  try {
+    expect(await until(() => b.role() === "client")).toBe(true);
+    expect(await until(() => bRegistrations >= 1)).toBe(true); // initial client registration fired the hook
+    const afterInitial = bRegistrations;
+    await a.close(); // broker gone -> b re-elects (reconnect/recovery)
+    expect(await until(() => b.role() === "broker", 4000)).toBe(true);
+    expect(await until(() => bRegistrations > afterInitial)).toBe(true); // the re-registration fired the hook again (the recovery fact hangs off this)
+  } finally {
+    await b.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
