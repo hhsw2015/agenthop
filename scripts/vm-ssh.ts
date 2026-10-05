@@ -260,6 +260,13 @@ export function normalizeOs(os: string): string { if (!Object.hasOwn(OS_MAP, os)
 const sshUserForOs = (os: string): string => (os.startsWith("windows") ? "runneradmin" : "runner");
 /** v2 discipline: a PUBLIC repo forbids --open (Actions logs are world-readable; in open mode the address is the sole key). */
 export function openRefusedOnPublic(mode: Mode, visibility: string): boolean { return mode === "open" && visibility.toUpperCase() === "PUBLIC"; }
+/** On a missing address, may a READ (ssh) prune the record? Only a railway box that was once ready (its address since lost
+ *  ⇒ platform-destroyed). NEVER a gha record (recoverable via run id / nonce, or an in-flight create) and NEVER an
+ *  in-flight reservation of either backend — a read must not drop a still-recoverable handle or free a name in use. */
+export function prunableOnNoAddr(m: Meta): boolean {
+  if (backendOf(m) === "gha") return false;
+  return !(m.phase === "reserved" || m.phase === "requesting");
+}
 
 // --- gh CLI wrappers ---
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -322,12 +329,16 @@ async function ghaCaptureAddr(repo: string, runId: string): Promise<CaptureResul
     for (let i = 0; i < 50; i++) {
       const status = (await ghCapture(["run", "view", runId, "-R", repo, "--json", "status", "-q", ".status"]).catch(() => "")).trim();
       if (status === "completed") return { kind: "ended" }; // terminal run: the box is gone; any artifact is stale
-      const dir = path.join(base, String(i));
-      try {
-        await gh(["run", "download", runId, "-R", repo, "-n", "vmssh-addr", "-D", dir]);
-        const addr = parseAddress(readFileSync(path.join(dir, "vmssh-addr.txt"), "utf8"));
-        if (addr) return { kind: "addr", addr }; // run still live (status != completed) + address published
-      } catch { /* artifact not uploaded yet — retry */ }
+      // UNKNOWN != live: a failed/empty status query must not let a (possibly stale) artifact be reported ready. Only a
+      // CONFIRMED non-terminal status proceeds to download; an empty/errored status just retries (→ timeout if it persists).
+      if (status !== "") {
+        const dir = path.join(base, String(i));
+        try {
+          await gh(["run", "download", runId, "-R", repo, "-n", "vmssh-addr", "-D", dir]);
+          const addr = parseAddress(readFileSync(path.join(dir, "vmssh-addr.txt"), "utf8"));
+          if (addr) return { kind: "addr", addr };
+        } catch { /* artifact not uploaded yet — retry */ }
+      }
       await sleep(3000);
     }
     return { kind: "timeout" };
@@ -360,17 +371,18 @@ async function cmdUpGha(id: string, mode: Mode, initScript: string | undefined, 
   if (mode === "keyed") await ghaPreflightKeys(githubUser);
   const runTag = `vmssh-${randomBytes(6).toString("hex")}`;
   const base: Meta = { id, mode, backend: "gha", createdSec: Math.floor(Date.now() / 1000), addrFile: addrPath(id), repo: repo.nameWithOwner, os, githubUser, ttlMin, sshUser: sshUserForOs(os) };
+  // Persist repo + nonce BEFORE the request: if the dispatch request reaches GitHub (a run is created) but the reply is
+  // lost (gh exits non-zero), the handle must already be on disk — an unknown dispatch result is NOT "not dispatched".
+  writeMeta({ ...base, runTag, phase: "requesting" });
   await ghaDispatch(repo.nameWithOwner, { os, ttlMin, auth: mode === "open" ? "none" : "keys", githubUser, userScript: initScript ?? "", runTag });
-  // Dispatch succeeded ⇒ a run EXISTS. Persist the nonce now so a lock timeout (run not yet listed) still leaves a
-  // recoverable handle — refresh/down re-lock by run_tag. (Before dispatch there is nothing to recover, so nothing kept.)
-  writeMeta({ ...base, runTag });
   const runId = await ghaLockRunId(repo.nameWithOwner, runTag);
   // Persist the run id too: a capture timeout must NOT orphan a billable, running box — down/refresh/ls can manage it.
-  writeMeta({ ...base, runTag, runId });
+  writeMeta({ ...base, runTag, runId, phase: "running" });
   const cap = await ghaCaptureAddr(repo.nameWithOwner, runId);
   if (cap.kind === "ended") { prune(id); throw new Error(`vm-ssh up --backend gha: run ${runId} completed before an address was captured (ttl too short, or the box failed early) — the box is gone. Inspect: gh run view ${runId} -R ${repo.nameWithOwner}`); }
   if (cap.kind === "timeout") throw new Error(`vm-ssh up --backend gha: dispatched run ${runId} but no address captured within ~150s. The box is RECORDED (id "${id}") and may still be coming up — retry: vm-ssh refresh ${id}; or stop it: vm-ssh down ${id}.`);
   writeAddr(id, cap.addr);
+  writeMeta({ ...base, runTag, runId, phase: "ready" });
   process.stdout.write(`${JSON.stringify({ id, addrFile: addrPath(id), mode, backend: "gha", runId, os, ttlMin })}\n`);
 }
 
@@ -411,17 +423,20 @@ async function cmdDown(args: Args): Promise<void> {
   const m = readMeta(id)!;
   if (backendOf(m) !== "gha") { process.stdout.write(`vm-ssh down: "${id}" is a ${backendOf(m)} box — no down verb (the platform auto-destroys ~1h; vm-ssh-brief). Bookkeeping is pruned on ls/ssh.\n`); return; }
   const addr = readAddr(id);
-  let stopped = "sentinel";
+  let stopped: string;
   try {
     if (!addr) throw new Error("no address on file");
     const target = m.sshUser ? `${m.sshUser}@${addr}` : addr;
     await execFileP("tailcat", ["ssh", target, "touch", "/tmp/ghostish.stop"], { timeout: 30_000 }); // trips the hold loop
+    stopped = "sentinel";
   } catch {
     const runId = await ensureGhaRunId(m); // recorded id, or re-locked by the stored nonce (lock-timeout recovery)
     if (m.repo && runId) { await gh(["run", "cancel", runId, "-R", m.repo]); stopped = "cancel"; } // hard stop
-    else { prune(id); throw new Error(`vm-ssh down: "${id}" has no reachable address and no run to cancel — pruned bookkeeping only`); }
+    // Could not reach the box AND could not resolve a run to cancel: the run may be dispatched-but-not-yet-visible, or a
+    // reply-lost dispatch. Do NOT prune a recoverable handle — report honestly so the user retries (or removes it by hand).
+    else throw new Error(`vm-ssh down: "${id}" — no reachable address and its run is not yet visible (tag ${m.runTag ?? "none"}). Retry shortly; if it never appears the dispatch may have failed — remove ${metaPath(id)} to drop it.`);
   }
-  prune(id);
+  prune(id); // only after a CONFIRMED stop (sentinel tripped or run cancelled)
   process.stdout.write(`${JSON.stringify({ id, stopped })}\n`);
 }
 // ───────────────────────────────────────────────────────────────────────────────
@@ -632,6 +647,10 @@ type Meta = {
   id: string; mode: Mode; backend?: Backend; createdSec: number; addrFile: string;
   keyPath?: string; knownHosts?: string; // railway-only (per-box provisioning ssh key)
   repo?: string; runId?: string; runTag?: string; os?: string; githubUser?: string; ttlMin?: number; sshUser?: string; // gha-only
+  /** Lifecycle phase (distinguishes an in-flight create from a dead box so reads/cleanup never drop a recoverable handle):
+   *  reserved = name claimed, nothing requested yet; requesting = dispatch request sent (repo+nonce durable, run may exist
+   *  even if the reply was lost); running = run id locked; ready = address captured. Absent = legacy (treat as ready). */
+  phase?: "reserved" | "requesting" | "running" | "ready";
 };
 /** A box's backend; absent on pre-v2 records = railway (back-compat). */
 const backendOf = (m: Meta): Backend => m.backend ?? "railway";
@@ -670,7 +689,7 @@ function writeMeta(m: Meta): void {
  *  same-name `up`s cannot both proceed and overwrite each other's run handle (reviewer P2-1). Upgraded later via writeMeta. */
 function reserveMeta(m: Meta): void {
   mkdirSync(addrDir(), { recursive: true });
-  try { writeFileSync(metaPath(m.id), `${JSON.stringify(m)}\n`, { mode: 0o600, flag: "wx" }); }
+  try { writeFileSync(metaPath(m.id), `${JSON.stringify({ ...m, phase: "reserved" })}\n`, { mode: 0o600, flag: "wx" }); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`name "${m.id}" already in use (or an in-flight up is claiming it)`); throw e; }
 }
 function readMeta(id: string): Meta | undefined {
@@ -788,7 +807,7 @@ async function cmdUpInner(id: string, mode: Mode, backend: Backend, initScript: 
   if (!addr) throw new Error("vm-ssh up: no tailcat address captured from the box (serve may have failed; see /tmp/vmssh.serve.log on the box)");
 
   writeAddr(id, addr);
-  writeMeta({ id, mode, backend: "railway", createdSec: Math.floor(Date.now() / 1000), keyPath, knownHosts, addrFile: addrPath(id) });
+  writeMeta({ id, mode, backend: "railway", createdSec: Math.floor(Date.now() / 1000), keyPath, knownHosts, addrFile: addrPath(id), phase: "ready" });
   process.stdout.write(`${JSON.stringify({ id, addrFile: addrPath(id), mode, backend: "railway" })}\n`); // address itself stays in the 0600 file
 }
 
@@ -798,9 +817,11 @@ async function cmdSsh(args: Args): Promise<void> {
   const m = readMeta(id);
   const addr = readAddr(id);
   if (!addr) {
-    // a gha box with a run id but no address yet is recoverable (capture timed out, box may be alive) — do NOT prune it.
-    if (m && backendOf(m) === "gha" && m.runId) throw new Error(`no address for "${id}" yet — run ${m.runId} may still be coming up; try: vm-ssh refresh ${id} (or vm-ssh down ${id} to stop it)`);
-    prune(id); throw new Error(`no address for "${id}" (box gone or not captured) — try: vm-ssh refresh ${id}`);
+    if (m && !prunableOnNoAddr(m)) { // recoverable gha handle (run id/nonce) or an in-flight create — never drop it
+      if (backendOf(m) === "gha" && (m.runId || m.runTag)) throw new Error(`no address for "${id}" yet — run ${m.runId ?? `tag ${m.runTag}`} may still be coming up; try: vm-ssh refresh ${id} (or vm-ssh down ${id} to stop it)`);
+      throw new Error(`"${id}" is being created by an in-flight up — try again shortly`);
+    }
+    prune(id); throw new Error(`no address for "${id}" (box gone or not captured) — try: vm-ssh refresh ${id}`); // railway once-ready -> destroyed
   }
   const remoteCmd = args.afterDashDash();
   // gha boxes serve as the runner's unix user (recorded sshUser); railway boxes take tailcat's default user.
@@ -920,6 +941,12 @@ function selftest(): void {
   console.assert(openRefusedOnPublic("open", "PUBLIC") && !openRefusedOnPublic("open", "PRIVATE") && !openRefusedOnPublic("keyed", "PUBLIC"), "public repo forbids --open only (keyed ok, private ok)");
   console.assert(backendOf({ id: "x", mode: "keyed", createdSec: 0, addrFile: "" }) === "railway", "backendOf defaults a pre-v2 record to railway");
   console.assert(ttlSec({ id: "x", mode: "keyed", backend: "gha", ttlMin: 120, createdSec: 0, addrFile: "" }) === 7200, "gha ttlSec honors ttlMin");
+  {
+    const mk = (p: Partial<Meta>): Meta => ({ id: "x", mode: "keyed", createdSec: 0, addrFile: "", ...p });
+    console.assert(prunableOnNoAddr(mk({ backend: "railway", phase: "ready" })) === true && prunableOnNoAddr(mk({ backend: "railway" })) === true, "ssh may prune a once-ready / legacy railway box (address lost = destroyed)");
+    console.assert(prunableOnNoAddr(mk({ backend: "railway", phase: "reserved" })) === false, "ssh must NOT prune a railway in-flight reservation");
+    console.assert(prunableOnNoAddr(mk({ backend: "gha", phase: "running", runId: "1" })) === false && prunableOnNoAddr(mk({ backend: "gha", phase: "requesting", runTag: "t" })) === false, "ssh must NEVER prune a gha record (recoverable handle or in-flight)");
+  }
   console.assert(WORKFLOW_YAML.includes("workflow_dispatch") && WORKFLOW_YAML.includes("--ssh-authorized-keys=${GITHUB_USER}@github") && WORKFLOW_YAML.includes("VMSSH_ADDR=") && WORKFLOW_YAML.includes("/tmp/ghostish.stop") && WORKFLOW_YAML.includes("contents: read") && WORKFLOW_YAML.includes("run-name:") && WORKFLOW_YAML.includes("run_tag") && WORKFLOW_YAML.includes("secrets.VMSSH_SECRET"), "workflow yaml: dispatch inputs + keyed key-fetch + addr marker + sentinel + least-privilege + run_tag nonce + secret channel");
   console.assert(runTitleFor("vmssh-abc") === "vm-ssh-box vmssh-abc" && runTitleFor("vmssh-abc") !== "vm-ssh-box vmssh-abc-other", "run title is matched EXACTLY (a <tag>-other title must not satisfy the lock)");
   process.stdout.write("vm-ssh selftest: all assertions passed\n");
