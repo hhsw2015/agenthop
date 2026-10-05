@@ -138,4 +138,18 @@ describe("dead-letter watch snapshot IO", () => {
     writeFileSync(f, JSON.stringify({ offset: "nope" }));
     expect(() => readDeadLetterWatch(f)).toThrow();
   });
+
+  test("D2: a legacy numeric pending migrates to timestamps reconstructed from the retained window (never fabricated, never crashes)", () => {
+    const f = path.join(HOME, "dlw.json");
+    // legacy on-disk shape: pending is a COUNT (pre-R5-C Record<string,number>); the window holds the route's actual failures.
+    const legacy = { sig: "1", offset: 10, carry: "", truncating: false,
+      window: [{ ts: 100, route: "a->x" }, { ts: 200, route: "a->x" }, { ts: 300, route: "a->x" }, { ts: 500, route: "b->y" }],
+      handled: {}, recovered: {}, pending: { "a->x": 3, "c->z": 2 }, owed: {} };
+    writeFileSync(f, JSON.stringify(legacy));
+    const w = readDeadLetterWatch(f);
+    expect(w.pending["a->x"]).toEqual([100, 200, 300]); // reconstructed from the retained window evidence, not fabricated
+    expect(w.pending["c->z"]).toBeUndefined();          // a count with NO retained evidence ⇒ omitted (cannot fabricate), never a crash
+    // and the migrated value is the new array shape, so the recovery-boundary filter (ts.filter) no longer throws
+    expect(() => w.pending["a->x"]!.filter((t) => t > 150)).not.toThrow();
+  });
 });

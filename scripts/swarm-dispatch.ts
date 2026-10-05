@@ -933,8 +933,17 @@ async function main(): Promise<void> {
             // burst was pre-recovery ⇒ discharge, no reopen. Absent a recovery boundary the full candidate stands: a discovered
             // obligation does not age out just because its samples left the sliding window (the R5-C regression this replaces).
             const boundary = watch.recovered[route];
-            const live = boundary === undefined ? watch.pending[route] : watch.pending[route].filter((ts) => ts > boundary);
-            if (live.length < DEAD_LETTER_THRESHOLD) { delete watch.pending[route]; continue; }
+            let live = boundary === undefined ? watch.pending[route] : watch.pending[route].filter((ts) => ts > boundary);
+            if (live.length < DEAD_LETTER_THRESHOLD) {
+              // D1 (review 01b773d): the old candidate is invalidated by the recovery boundary. Population SKIPPED this route (it
+              // still had the now-stale pending), so a NEW post-recovery burst sits only in the window and would be lost once the
+              // window ages. In the SAME slice, re-derive the current window's fresh (post-recovery) failures and re-record them as
+              // the candidate if they reach threshold — consolidated into aging-exempt pending now, not deferred to a window that
+              // may be gone next tick. REPLACE (not merge) with the freshly-derived set ⇒ no double-count of the same failure.
+              const freshNow = freshTimestampsByRoute(watch.window, windowStartMs, watch.handled, watch.recovered).get(route) ?? [];
+              if (freshNow.length < DEAD_LETTER_THRESHOLD) { delete watch.pending[route]; continue; }
+              live = freshNow;
+            }
             watch.pending[route] = live;
             const rec = reconcileIncidentCore(reg, routingActiveSignal(route, live.length, fresh.seq), nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner: REPAIR_OWNER_ROUTABLE ? REPAIR_OWNER : SELF, controlEpisodeFloor: sync.controlEpisodeFloor });
             let settled = false;

@@ -269,10 +269,23 @@ export function readDeadLetterWatch(file: string): DeadLetterWatch {
   const p = JSON.parse(raw) as DeadLetterWatch;
   if (p === null || typeof p !== "object" || typeof p.offset !== "number" || typeof p.carry !== "string" || !Array.isArray(p.window)
       || typeof p.handled !== "object" || typeof p.pending !== "object") throw new Error("dead-letter watch: malformed");
+  // D2 (review 01b773d): migrate a LEGACY pending. Pre-R5-C the field was Record<string,number> (a count); a bare count has no
+  // timestamps, and we must NOT fabricate them. RECONSTRUCT from retained evidence — the watch's own window events for that route —
+  // when present; otherwise omit the bare count (its evidence is gone, the tss-based consumer cannot act on a count, and population
+  // re-derives any still-in-window burst anyway). Explicitly version-recognized via Array.isArray — never a silent assumption that
+  // the old shape cannot occur. (The dead-letter watch is dormant until the ledger exists, so no numeric-pending file is written in
+  // production; this is defense-in-depth for a mixed-version read, not a live data migration.)
+  const window = (Array.isArray(p.window) ? p.window : []) as WindowEvent[];
+  const pending: Record<string, number[]> = {};
+  for (const [route, v] of Object.entries((p.pending ?? {}) as Record<string, unknown>)) {
+    if (Array.isArray(v)) { const tss = v.filter((t): t is number => typeof t === "number" && Number.isFinite(t)); if (tss.length > 0) pending[route] = tss; continue; }
+    const rebuilt = window.filter((e) => e.route === route).map((e) => e.ts).sort((a, b) => a - b); // legacy count ⇒ rebuild tss from retained window evidence
+    if (rebuilt.length > 0) pending[route] = rebuilt;
+  }
   return {
     sig: typeof p.sig === "string" ? p.sig : "", offset: p.offset, carry: p.carry,
-    truncating: p.truncating === true, window: p.window,
-    handled: p.handled ?? {}, recovered: p.recovered ?? {}, pending: p.pending ?? {}, owed: p.owed ?? {},
+    truncating: p.truncating === true, window,
+    handled: p.handled ?? {}, recovered: p.recovered ?? {}, pending, owed: p.owed ?? {},
   };
 }
 
