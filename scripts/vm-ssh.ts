@@ -32,9 +32,9 @@
 
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { connect as netConnect, createServer, type Socket } from "node:net";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { Duplex } from "node:stream";
 import { connect as tlsConnect } from "node:tls";
@@ -160,9 +160,9 @@ export const WORKFLOW_YAML = [
   "        default: keys",
   "        options: [keys, none]",
   "      github_user:",
-  "        description: whose github.com/<user>.keys the box trusts (keyed mode)",
+  "        description: whose github.com/<user>.keys the box trusts (keyed mode; empty = the dispatcher)",
   "        type: string",
-  "        default: ${{ github.actor }}",
+  '        default: ""',
   "      user_script:",
   "        description: optional shell run before serve",
   "        type: string",
@@ -173,28 +173,53 @@ export const WORKFLOW_YAML = [
   "  box:",
   "    runs-on: ${{ inputs.os }}",
   "    steps:",
-  "      - name: serve + hold",
+  // Step 1 completes fast so `gh run view --log` can serve its address line while Step 2 blocks. The serve is fully
+  // detached (setsid + nohup + </dev/null) so it survives into Step 2 on the same runner (killed only at job end).
+  "      - name: start box",
   "        shell: bash",
   "        env:",
   "          AUTH: ${{ inputs.auth }}",
-  "          GITHUB_USER: ${{ inputs.github_user }}",
+  "          GITHUB_USER: ${{ inputs.github_user || github.actor }}",
   "          USER_SCRIPT: ${{ inputs.user_script }}",
-  "          TTL_MINUTES: ${{ inputs.ttl_minutes }}",
+  `          TCVER: ${TAILCAT_VERSION}`,
   "        run: |",
   "          set -uo pipefail",
-  "          go install github.com/tailscale/tailcat/cmd/tailcat@latest",
-  '          export PATH="$HOME/go/bin:$PATH"',
+  // Linux (v2's verified OS): the prebuilt binary (seconds) so the box is ready inside the 90s target. macOS/windows
+  // (unverified in v2) fall back to the portable `go install` (compiles; slower).
+  '          if [ "$RUNNER_OS" = Linux ]; then',
+  '            _a=$(uname -m); case "$_a" in x86_64) _a=amd64;; aarch64|arm64) _a=arm64;; esac;',
+  '            curl -fsSL "https://github.com/tailscale/tailcat/releases/download/v${TCVER}/tailcat_${TCVER}_linux_${_a}.tar.gz" -o /tmp/tc.tgz;',
+  '            tar xzf /tmp/tc.tgz -C /tmp tailcat && sudo install -m 0755 /tmp/tailcat /usr/local/bin/tailcat;',
+  "          else",
+  '            go install github.com/tailscale/tailcat/cmd/tailcat@latest && export PATH="$HOME/go/bin:$PATH";',
+  "          fi",
   '          if [ -n "${USER_SCRIPT:-}" ]; then bash -lc "$USER_SCRIPT" || true; fi',
   '          if [ "$AUTH" = none ]; then SVC=no-auth-ssh; AUTHFLAG=""; else SVC=ssh; AUTHFLAG="--ssh-authorized-keys=${GITHUB_USER}@github"; fi',
   "          rm -f /tmp/tc.addr",
-  '          TAILCAT_ADDR_FILE=/tmp/tc.addr nohup tailcat serve --key=new $AUTHFLAG "$SVC" >/tmp/tc.out 2>/tmp/tc.err &',
+  '          TAILCAT_ADDR_FILE=/tmp/tc.addr setsid nohup tailcat serve --key=new $AUTHFLAG "$SVC" >/tmp/tc.out 2>/tmp/tc.err </dev/null &',
   "          echo $! > /tmp/tc.pid",
   "          for i in $(seq 1 90); do [ -s /tmp/tc.addr ] && break; sleep 1; done",
   '          ADDR="$(cat /tmp/tc.addr 2>/dev/null || true)"',
   '          if [ -z "$ADDR" ]; then ADDR="$(grep -oE "tc[A-Za-z0-9_-]{100,220}" /tmp/tc.err /tmp/tc.out 2>/dev/null | head -1 || true)"; fi',
   '          if [ -z "$ADDR" ]; then echo "tailcat did not report an address"; cat /tmp/tc.err || true; exit 1; fi',
   '          echo "VMSSH_ADDR=$ADDR"',
+  '          printf %s "$ADDR" > "$GITHUB_WORKSPACE/vmssh-addr.txt"',
   '          echo "vm-ssh box ready: tailcat ssh ${GITHUB_USER}@$ADDR" >> "$GITHUB_STEP_SUMMARY"',
+  // The run's logs are NOT fetchable while it is in progress (gh --log / jobs-API both refuse mid-run), so the address is
+  // handed off as an artifact uploaded by this fast step — downloadable while the hold step still blocks.
+  "      - name: publish address",
+  "        uses: actions/upload-artifact@v4",
+  "        with:",
+  "          name: vmssh-addr",
+  "          path: ${{ github.workspace }}/vmssh-addr.txt",
+  "          retention-days: 1",
+  "          if-no-files-found: error",
+  "      - name: hold",
+  "        shell: bash",
+  "        env:",
+  "          TTL_MINUTES: ${{ inputs.ttl_minutes }}",
+  "        run: |",
+  "          set -uo pipefail",
   '          TTL="${TTL_MINUTES:-360}"',
   "          for i in $(seq 1 $((TTL*6))); do",
   "            if [ -f /tmp/ghostish.stop ]; then echo stop sentinel seen; break; fi",
@@ -243,17 +268,26 @@ async function ghaLockRunId(repo: string, sinceIso: string): Promise<string> {
   throw new Error("vm-ssh up --backend gha: the dispatched run did not appear in `gh run list` within 30s");
 }
 
-/** ~90s: poll the in-progress run log for the address line the serve step echoed. CONFIRM-on-real-run (IMPLEMENTATION §5):
- *  `gh run view --log` returns COMPLETED steps of an in-progress run; our serve+hold is a single blocking step, so if a
- *  real run shows the line won't stream mid-step, the Phase-2 fallback is a short artifact uploaded right after the echo. */
+/** Address handoff via ARTIFACT (Phase-2 verified): a run's logs are NOT fetchable while it is in progress — both
+ *  `gh run view --log` ("still in progress") and the jobs-API log (404 until the job ends) refuse mid-run. So the fast
+ *  start step uploads the address as the "vmssh-addr" artifact, downloadable while the hold step still blocks. ~150s total
+ *  absorbs queue + install (the box itself is ready inside the 90s target once its step runs). */
 async function ghaCaptureAddr(repo: string, runId: string): Promise<string | undefined> {
-  for (let i = 0; i < 30; i++) {
-    const log = await ghCapture(["run", "view", runId, "-R", repo, "--log"]).catch(() => "");
-    const addr = parseLogAddr(log);
-    if (addr) return addr;
-    await sleep(3000);
+  const base = mkdtempSync(path.join(tmpdir(), "vmssh-"));
+  try {
+    for (let i = 0; i < 50; i++) {
+      const dir = path.join(base, String(i));
+      try {
+        await gh(["run", "download", runId, "-R", repo, "-n", "vmssh-addr", "-D", dir]);
+        const addr = parseAddress(readFileSync(path.join(dir, "vmssh-addr.txt"), "utf8"));
+        if (addr) return addr;
+      } catch { /* artifact not uploaded yet (or the run failed) — retry */ }
+      await sleep(3000);
+    }
+    return undefined;
+  } finally {
+    rmSync(base, { recursive: true, force: true });
   }
-  return undefined;
 }
 
 /** Non-fatal pre-flight: warn if the ssh-agent holds no key published at github.com/<user>.keys — otherwise keyed connect
