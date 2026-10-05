@@ -97,7 +97,13 @@ export type WaitSubject = {
 };
 
 export type PendingAction = { actionId: string; actionKind: string; target: string; expectedSubjectVersion: number };
-export type WaitResolution = { outcome: string; reason: string; sourceOperationId: string };
+/** occurredAtSec (dead-letter R5-B): the wall-clock second at which the fact this resolution proves ACTUALLY occurred
+ *  (the recovery/close moment), supplied by the committing IO — NOT the later moment the sweep observes the close. The
+ *  pure layer only stores it. Optional + absent = current behavior (same additive precedent as payloadRef): a bare close
+ *  carries no boundary, and an incident-boundary consumer (failureReopensIncident) then fails toward reopening rather
+ *  than silently swallowing a post-recovery failure. It is the ONLY datum that separates a pre-recovery burst from a
+ *  post-recovery one when both are observed at the same later tick. */
+export type WaitResolution = { outcome: string; reason: string; sourceOperationId: string; occurredAtSec?: number };
 
 export type WaitRecord = {
   waitId: string;
