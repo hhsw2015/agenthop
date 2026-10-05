@@ -216,6 +216,11 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // (run + handle[derivedFrom native] + native) so whois(handle) resolves — a wait.owner stored as a handle can then get
     // this entity's probeTargets instead of reading not-seen.
     recordSelfObserve(home, self, authoritative, "local");
+    // B5 (review d8dd4b1): the startup check-in used the per-run id because a Codex node's stableId was not yet known. Now that
+    // the durable identity is learned (bootstrap / thread-switch / correction), re-report to the coordinator with the STABLE sid
+    // so the session is durably addressable — the earlier provisional per-run line is superseded (idempotent at the coordinator
+    // by sid). Gated on SWARM_COORDINATOR, never to self, fail-soft (reportCheckIn).
+    reportCheckIn(home, self, process.env.SWARM_COORDINATOR);
   };
 
   const relay: Relay | undefined = startRelay(self, (from, text) => handleInbound(from, text, "relay"), options);

@@ -304,7 +304,7 @@ export function startDirectory(options: DirectoryOptions): Directory {
         // bus-reachability §2: on a WS recover, RE-REGISTER presence IMMEDIATELY instead of waiting for the next 60s beat
         // ("reconnect success => re-announce"). Reset the read cursor too — the room log may have restarted under a new
         // keeper while we were disconnected, so re-read it from the start.
-        onReconnected: () => { after = 0; void announce(); },
+        onReconnected: () => { after = 0; epoch++; void announce(); }, // epoch++ with the reset (as every other cursor reset does, 361/377/393) so a pre-reset pull's late response is discarded, not allowed to roll `after` back (review d8dd4b1-B6)
         // The directory room lives for the whole session and only holds small presence blobs. The
         // default 2,000-message / 8 MiB lifetime quota would silently reject announcements after a
         // while (20 sessions announcing once a minute ~= 100 min), so lift it like upstream inbox.
