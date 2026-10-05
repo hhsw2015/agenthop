@@ -45,6 +45,12 @@ export function fileIsAlive(sessionId: string, io: LivenessIO): Liveness {
  *  guessed (F16: two different handles can share a short-id prefix; guessing misroutes the inbox). bus-identity's alias
  *  table replaces this. null ⇒ the caller treats the owner as unresolvable (suspected), not dead. */
 export function resolveSession(ownerHandle: string, sessionIds: string[]): string | null {
+  // B4 (review d8dd4b1): a FULL session id passed as the handle must match exactly FIRST. Otherwise the tail logic below
+  // takes only the segment after its last "-" (a UUID's final group) and never finds the complete id — so a send addressed
+  // by a full sid to an OFFLINE session (presence/<sid>.pid) failed to resolve. A handle (tool:dir-<short>) is never a
+  // sessionId, so this exact check only helps the full-sid case and never shadows the handle/prefix logic.
+  const whole = ownerHandle.trim();
+  if (whole && sessionIds.includes(whole)) return whole;
   const tail = ownerHandle.slice(ownerHandle.lastIndexOf("-") + 1).trim();
   if (!tail) return null;
   const exact = sessionIds.find((id) => id === tail);

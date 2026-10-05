@@ -4,7 +4,7 @@ import { startLocalBus, type LocalBus } from "./broker.js";
 import { startRelay, type Relay } from "./relay.js";
 import { pushToHost, pushClaudeDirect } from "./push.js";
 import { startCodexDaemon, type CodexDaemon } from "./codex.js";
-import { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
+import { dedupLocalPeers, resolvePeer, type UnifiedPeer, type ResolveError } from "./resolve.js";
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
@@ -258,7 +258,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     return p?.via === "local" ? p.mode : undefined;
   };
 
-  const resolve = (to: string): UnifiedPeer | { error: string } => resolvePeer(unified(), self.id, to);
+  const resolve = (to: string): UnifiedPeer | ResolveError => resolvePeer(unified(), self.id, to);
 
   // Set this session's own status, keyed per identity (see statusByIdentity). Shared by the MCP tool
   // and the file watcher below.
@@ -343,6 +343,10 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       };
       const peer = resolve(to);
       if ("error" in peer) {
+        // B1 (review d8dd4b1): an AMBIGUOUS (or empty) target must NEVER fall back — resolveSession runs a weaker handle
+        // match that could pick ONE of the several live matches and misroute a private message. Only a genuine no-match may
+        // fall back to a same-machine durable inbox. resolvePeer already classifies the error; honor its kind here.
+        if (peer.kind !== "none") return { ok: false, error: peer.error };
         // Not on the live roster (offline, or our broker view is empty). If a same-machine session owns this handle
         // (presence/<sid>.pid), try native-direct, then the durable inbox.
         const plan = fallbackForUnresolved(resolveSession(to, listSessions(home)), peer.error);

@@ -54,6 +54,13 @@ describe("resolveSession — unique match only; ambiguity rejected (F16/P2-3)", 
   test("empty tail ⇒ null", () => {
     expect(resolveSession("nodash", [])).toBe(null); // "nodash" has no '-', tail is the whole string; no match ⇒ null
   });
+  test("B4: a FULL session id passed as the handle matches exactly (not reduced to its last '-' segment)", () => {
+    const full = "20cab0a5-b30e-4723-8399-7bc5cf78f6f7"; // a complete UUID sid, e.g. the presence/<sid>.pid of an offline session
+    // Only the whole-match path can resolve this: the tail is "7bc5cf78f6f7" (absent from the roster), and `full` is not a
+    // prefix of itself-minus-tail, so pre-B4 this returned null (the regression) — now it resolves to the full id.
+    expect(resolveSession(full, [full])).toBe(full);
+    expect(resolveSession(full, [full, "4fd84f9f-aaaa"])).toBe(full); // still exact even alongside other sessions
+  });
 });
 
 describe("makeFileLiveness — real fs/proc binding (status deliberately not read)", () => {
