@@ -12,18 +12,24 @@ import { writeInbox } from "./inbox.js";
 import { resolveSession, listSessions } from "./swarm/task-liveness.js";
 import type { SelfInfo } from "./label.js";
 
-export function reportCheckIn(home: string, self: SelfInfo, coordinatorHandle: string | undefined): boolean {
+/** The outcome of a check-in attempt, so the caller knows whether to RETAIN a retry obligation (review 01b773d-B5):
+ *  "sent" = delivered to the coordinator inbox; "retry" = a TRANSIENT miss (coordinator not resolvable YET, or the write
+ *  failed) — retain and retry when it becomes reachable / on a later tick; "skip" = PERMANENT no-op (not in a swarm, or we
+ *  ARE the coordinator) — never retry. */
+export type CheckInResult = "sent" | "retry" | "skip";
+
+export function reportCheckIn(home: string, self: SelfInfo, coordinatorHandle: string | undefined): CheckInResult {
   try {
-    if (!coordinatorHandle || !coordinatorHandle.trim()) return false; // not in a swarm context
+    if (!coordinatorHandle || !coordinatorHandle.trim()) return "skip"; // not in a swarm context — permanent
     const coordSid = resolveSession(coordinatorHandle, listSessions(home));
-    if (!coordSid) return false;           // coordinator not resolvable on this machine yet -> skip (not an error)
+    if (!coordSid) return "retry";          // coordinator not resolvable on this machine YET -> retain + retry when it appears (B5)
     const mySid = self.stableId ?? self.id;
-    if (coordSid === mySid) return false;  // we ARE the coordinator -> don't check in to ourselves
+    if (coordSid === mySid) return "skip";  // we ARE the coordinator -> don't check in to ourselves — permanent
     const line = JSON.stringify({ sid: mySid, handle: self.title, pid: self.pid, startedAt: self.startedAt });
     writeInbox(home, coordSid, {
       from: mySid, fromLabel: self.title, ...(self.mode ? { fromMode: self.mode } : {}),
       text: `[checkin] ${line}`, via: "local", ts: Date.now(),
     });
-    return true;
-  } catch { return false; } // best-effort; a check-in must never throw on startup
+    return "sent";
+  } catch { return "retry"; } // transient (e.g. the write failed) -> retain the obligation (B5); never throw on startup
 }

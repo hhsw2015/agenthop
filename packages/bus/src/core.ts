@@ -86,6 +86,14 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // flush timer stays the retry floor during the backoff; a flush that DELIVERS clears it so near-live resumes.
   let watchCooldownUntil = 0;
   const WATCH_COOLDOWN_MS = 5000; // one flush-timer interval: during a channel outage the watch stays quiet, the timer retries
+  // B5 (review 01b773d): a startup check-in that missed (coordinator not resolvable yet, or the write failed) leaves a RETRY
+  // obligation. retryCheckIn re-attempts it on the flush timer and on a broker (re)connect until it is sent; a permanent "skip"
+  // (not in a swarm / we are the coordinator) clears it. Identity-change re-checks-in directly (learnStableId) and resets this.
+  let checkInPending = false;
+  const retryCheckIn = (): void => {
+    if (!checkInPending) return;
+    if (reportCheckIn(home, self, process.env.SWARM_COORDINATOR) !== "retry") checkInPending = false; // sent or permanently-skipped ⇒ obligation discharged
+  };
   // Work-status is per SESSION IDENTITY, not per MCP-server process: one Codex daemon-backed server can
   // adopt several thread identities over its life (see learnStableId), and each must keep its own status
   // and its own monotonic seq — otherwise thread A's seq would gate thread B's reports.
@@ -192,6 +200,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const onBusRegistered = (): void => {
     if (!busRegistered) { busRegistered = true; return; } // initial connect — startup recordSelfObserve covers it
     recordSelfObserve(home, self, stableIdAuthoritative, "local");
+    retryCheckIn(); // B5: a (re)connect is a good moment to retry a missed startup check-in (coordinator may now be reachable)
   };
   const local: LocalBus = startLocalBus(self, options.home, (m) => handleInbound(m.from, m.payload, "local", { label: m.fromLabel, mode: m.fromMode }), onBusRegistered);
 
@@ -246,8 +255,8 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // B5 (review d8dd4b1): the startup check-in used the per-run id because a Codex node's stableId was not yet known. Now that
     // the durable identity is learned (bootstrap / thread-switch / correction), re-report to the coordinator with the STABLE sid
     // so the session is durably addressable — the earlier provisional per-run line is superseded (idempotent at the coordinator
-    // by sid). Gated on SWARM_COORDINATOR, never to self, fail-soft (reportCheckIn).
-    reportCheckIn(home, self, process.env.SWARM_COORDINATOR);
+    // by sid). Gated on SWARM_COORDINATOR, never to self, fail-soft (reportCheckIn). Retain a retry obligation on a transient miss (B5).
+    checkInPending = reportCheckIn(home, self, process.env.SWARM_COORDINATOR) === "retry";
   };
 
   const relay: Relay | undefined = startRelay(self, (from, text) => handleInbound(from, text, "relay"), options);
@@ -328,7 +337,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // identity's keys (Codex P2-8), so this covers both the initial run-id and any later-adopted stableId. Unref'd — the
   // broker socket keeps the process alive; this timer must not by itself.
   void flushInbox();
-  const flushTimer = setInterval(() => void flushInbox(), 5000);
+  const flushTimer = setInterval(() => { void flushInbox(); retryCheckIn(); }, 5000); // B5: the timer also retries a missed check-in
   flushTimer.unref?.();
 
   // Recipient fs-watch (B2/B3 option b): a sender now writes same-machine messages straight to our durable inbox, so watch our
@@ -349,7 +358,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // the session without relying on a prompt the LLM must remember to send. Gated on SWARM_COORDINATOR, never to self,
   // fail-soft. A Claude node has its stableId at startup; a Codex node that learns its thread id later gets its durable
   // re-announce through the reconnect/re-register path (Stage C), not here.
-  reportCheckIn(home, self, process.env.SWARM_COORDINATOR);
+  if (reportCheckIn(home, self, process.env.SWARM_COORDINATOR) === "retry") checkInPending = true; // B5: coordinator not reachable yet / write failed ⇒ retry on the timer + reconnect
 
   return {
     self,
