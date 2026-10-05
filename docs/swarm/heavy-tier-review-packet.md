@@ -57,9 +57,18 @@ acceptance C holding on live output.)
 UNBENCHMARKED-VARIANT, same-tier non-recommended self-select +why (kept), SERVED older/family/mini/different-family reject +
 exact/dated positives, RAISED-FLOOR default/explicit. A1 re-run: chosen=served=claude-opus-5-5 (exact) @ xhigh → loadable → F pass.
 
-## Seams to probe (current)
+## Round-3 disposition — reviewer f57162d (0 P1 / 1 P2), addressed in `cf0e74f`
 
-- Identity is **exact** (alias table + a 6-8 digit date-suffix strip). A served id with a NON-date trailing token not in the
-  alias list is rejected (fail-closed) — safe, but a legitimately new spelling needs an alias-table (ruling) update.
+| # | Finding | Fix |
+|---|---|---|
+| P2-1 | a dated catalog id is recognized by identity/benchmark but not selectable from a catalog that has ONLY it (conservative mis-reject) | `availableCatalogId`: prefer a bare alias, else a catalog id whose 6-8 digit date suffix strips to an alias — returns the ACTUAL dated id to call; default + explicit paths both covered. A non-date variant (…-mini) stays unavailable; downgrade/floor/why/served rejections unchanged (no substring resurrected). Tests: DATED-CATALOG default/explicit/bare-preferred/non-date-variant. |
+
+renew pure layer (`441566c`): **signed off 0/0/0** by the reviewer (the sweep/IO wiring remains 20cab0a5's).
+
+## Seams to probe (current, HEAD `cf0e74f`)
+
+- Identity is **exact** (alias table + a 6-8 digit date-suffix strip), symmetric across select/served/benchmark: a dated
+  catalog id is selectable (returns the real dated id); a NON-date trailing token not in the alias list is rejected
+  (fail-closed) — a legitimately new spelling needs an alias-table (ruling) update.
 - CPA Claude reasoning uses `thinking.type=adaptive` + `output_config.effort`; non-Claude uses `reasoning_effort`.
 - `renew`/`isRenewable` are the pure half; the sweep-side wiring (hasFreshSubjectEvidence ⇒ commit renew) is 20cab0a5's.
