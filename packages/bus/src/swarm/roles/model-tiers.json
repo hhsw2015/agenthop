@@ -1,0 +1,57 @@
+{
+  "version": "mtr-2026-10-05",
+  "source": "docs/swarm/model-tier-rulings.md (user ruling 2026-10-05) + CLIProxyAPIPlus/docs/flagship-coverage.md (AA Intel benchmark snapshot, 2026-10-05)",
+  "benchmark": "AA Intel = Artificial Analysis Intelligence index; higher is stronger. 'same-or-stronger' = aaIntel >= the role's floorAaIntel.",
+  "note": "Recommended = baseline, NOT a closed whitelist. A caller may self-select any CPA-catalog model that is same-or-stronger (aaIntel >= floor) and leave a {chosen, why, benchmark} selection record. Updates are a user ruling, not a code change.",
+  "reasoningEfforts": ["low", "medium", "high", "xhigh", "max"],
+  "reasoningEffortNote": "CPA reasoning_effort levels (CLIProxyAPIPlus/docs/agent-configs.md). Claude/GPT accept all five. Per-role default below (user 2026-10-05: xhigh for better planning/review quality).",
+  "roles": {
+    "planning": {
+      "semantics": "PLANNER-HEAVY resolution target (draftPlan / expand / plan-revision); reasoning strength first.",
+      "floorAaIntel": 53,
+      "reasoningEffort": "xhigh",
+      "recommended": [
+        { "name": "opus 5.5", "match": "claude-opus-5-5", "aaIntel": 58 },
+        { "name": "fable 5.1", "match": "claude-fable-5-1", "aaIntel": 53 },
+        { "name": "gpt 6 astra", "match": "gpt-6-astra", "aaIntel": 53 }
+      ]
+    },
+    "coding": {
+      "semantics": "work/repair execution; cost/perf band, layered by task tier.",
+      "floorAaIntel": 51,
+      "reasoningEffort": "high",
+      "recommended": [
+        { "name": "opus 5.5", "match": "claude-opus-5-5", "aaIntel": 58 },
+        { "name": "sonnet 5.5", "match": "claude-sonnet-5-5", "aaIntel": 56 },
+        { "name": "opus 5", "match": "claude-opus-5", "aaIntel": 51 },
+        { "name": "gpt 6.1 sol", "match": "gpt-6-1-sol", "aaIntel": 52 }
+      ]
+    },
+    "review": {
+      "semantics": "adversarial review / acceptance; prefer a different family from the implementer (cross-family audit).",
+      "floorAaIntel": 53,
+      "reasoningEffort": "xhigh",
+      "recommended": [
+        { "name": "gpt 6 astra", "match": "gpt-6-astra", "aaIntel": 53 },
+        { "name": "opus 5.5", "match": "claude-opus-5-5", "aaIntel": 58 }
+      ]
+    }
+  },
+  "benchmarkScores": [
+    { "name": "claude opus 5.5", "aaIntel": 58 },
+    { "name": "claude sonnet 5.5", "aaIntel": 56 },
+    { "name": "claude fable 5.1", "aaIntel": 53 },
+    { "name": "gpt-6 astra", "aaIntel": 53 },
+    { "name": "gpt-6.1 sol", "aaIntel": 52 },
+    { "name": "claude opus 5", "aaIntel": 51 },
+    { "name": "claude fable 5", "aaIntel": 50 },
+    { "name": "gpt-6 sol", "aaIntel": 48 },
+    { "name": "gpt-5.6 sol", "aaIntel": 47 },
+    { "name": "grok 4.7", "aaIntel": 46 },
+    { "name": "qwen3.8 max", "aaIntel": 45 },
+    { "name": "glm-5.3", "aaIntel": 45 },
+    { "name": "grok 4.6", "aaIntel": 44 },
+    { "name": "kimi k3", "aaIntel": 44 },
+    { "name": "gpt-5.6 terra", "aaIntel": 42 }
+  ]
+}
