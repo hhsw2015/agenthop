@@ -910,16 +910,21 @@ async function main(): Promise<void> {
             .filter((b) => b.put === "wait" && repairEpisodeOf((b as Extract<ChangeBody, { put: "wait" }>).wait.waitId, groupKey) !== null)
             .map((b) => { const w = (b as Extract<ChangeBody, { put: "wait" }>).wait; return { waitId: w.waitId, state: w.state }; });
           // recovery closed loop: adopt a committed wait the registry lost / sync-close one whose repair-wait resolved.
-          const wasOpen = reg.episodes[groupKey]?.open === true; // R5: snapshot open-state to detect a recovery (open -> closed)
+          const preEp = reg.episodes[groupKey];             // snapshot BEFORE sync (R5: detect an open -> closed recovery + its repair-wait)
+          const wasOpen = preEp?.open === true;
           const sync = reconcileRegistryWithControl(reg, groupKey, "routing", groupCtlWaits, nowSec());
           if (sync.registry !== reg) { writeIncidents(INCIDENTS_FILE, sync.registry); reg = sync.registry; }
           const route = routeKeyOfGroup(groupKey);
-          // R5: a reconcile that RECOVERED the episode (was open, now closed/gone) records a recovery boundary, so a failure at/
-          // under it never fakes a relapse. NOTE (R5-B, pending f32a0507 design): this boundary is the OBSERVATION time (nowMs),
-          // not the true recovery OCCURRENCE time — a bare CONTROL close carries no timestamp, so a failure that occurred after
-          // the real recovery but before we observed the close is still wrongly excluded. Carrying the occurrence time on the
-          // recovery evidence is the open design question; until then this is the conservative v1 approximation.
-          if (route !== null && wasOpen && reg.episodes[groupKey]?.open !== true) watch.recovered[route] = Math.max(watch.recovered[route] ?? 0, nowMs);
+          // R5-B: a reconcile that RECOVERED the episode (open -> closed) sets the recovery boundary from the resolved repair-
+          // wait's resolution.occurredAtSec — the TRUE recovery OCCURRENCE (written by whoever committed the close, f32a0507's
+          // 459af09), NOT the observation time. A failure at/under it is pre-recovery and never reopens; a strictly-newer one is
+          // post-recovery evidence (this mirrors task-wait.failureReopensIncident, the agreed truth source, in the window's ms
+          // unit). A bare/legacy close with no finite occurredAtSec sets NO boundary ⇒ post-recovery failures reopen
+          // (fail-toward-noticing; never swallow a real failure on a missing/NaN occurrence). occurredAtSec is seconds ⇒ *1000.
+          if (route !== null && wasOpen && reg.episodes[groupKey]?.open !== true) {
+            const occ = (preEp !== undefined ? findWaitIn(fresh, preEp.repairWaitId) : undefined)?.resolution?.occurredAtSec;
+            if (occ !== undefined && Number.isFinite(occ)) watch.recovered[route] = Math.max(watch.recovered[route] ?? 0, occ * 1000);
+          }
           if (route !== null && watch.pending[route] !== undefined) { // a DURABLE candidate awaiting commit
             // R5-A (ordering): the candidate count was computed BEFORE this tick's recovery boundary was known. Re-evaluate
             // freshness against the now-updated recovered so a PRE-recovery burst ingested in the same tick the recovery was

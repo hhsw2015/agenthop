@@ -221,8 +221,11 @@ export function pruneDeadLetterWindow(window: readonly WindowEvent[], windowStar
 
 /** Count in-window failures per route STRICTLY NEWER than the route's floor = max(handled watermark, recovery boundary). R5:
  *  a failure already covered by an opened incident (handled), OR at/under a recorded recovery (recovered), never reopens — so
- *  neither the same already-counted burst nor a late-ingested pre-recovery failure can fake a relapse; recurrence needs a
- *  failure strictly after the recovery boundary. */
+ *  neither the same already-counted burst nor a PRE-recovery failure can fake a relapse; recurrence needs a failure strictly
+ *  after the recovery boundary. The recovered boundary is the TRUE recovery OCCURRENCE (the resolved repair-wait's
+ *  resolution.occurredAtSec, set by the committing IO; the caller stores it here in ms), NOT the observation time — this strict
+ *  `> boundary` test mirrors task-wait.failureReopensIncident (the agreed truth source) in ms. A recovery with no finite
+ *  occurrence sets no boundary (recovered unset ⇒ 0 floor) ⇒ its post-recovery failures reopen (fail-toward-noticing). */
 export function countFreshByRoute(window: readonly WindowEvent[], windowStartMs: number, handled: Record<string, number>, recovered: Record<string, number>): Map<string, number> {
   const m = new Map<string, number>();
   for (const e of window) {
