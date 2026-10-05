@@ -79,6 +79,26 @@ describe("resolvePlannerModel — fail-closed + the reviewer's counterexamples",
   });
 });
 
+describe("dated-catalog availability (symmetric with served date tolerance)", () => {
+  const dated = ["claude-opus-5-5-20261001"]; // catalog serves ONLY a dated snapshot of opus 5.5
+  test("DATED-CATALOG-DEFAULT: a dated-only catalog is usable -> resolves to the actual dated id", () => {
+    const r = resolvePlannerModel({ catalog: dated });
+    expect(r.ok && r.model).toBe("claude-opus-5-5-20261001");
+    expect(r.ok && r.selection.chosen).toBe("opus 5.5");
+  });
+  test("DATED-CATALOG-EXPLICIT: choosing the dated catalog id resolves it as opus 5.5", () => {
+    const r = resolvePlannerModel({ catalog: dated, chosen: "claude-opus-5-5-20261001" });
+    expect(r.ok && r.model).toBe("claude-opus-5-5-20261001");
+  });
+  test("bare alias is still preferred when both bare and dated are present", () => {
+    const r = resolvePlannerModel({ catalog: ["claude-opus-5-5-20261001", "claude-opus-5-5"] });
+    expect(r.ok && r.model).toBe("claude-opus-5-5");
+  });
+  test("a non-date variant (opus-5-5-mini) is still NOT available-as-opus-5.5", () => {
+    expect(resolvePlannerModel({ catalog: ["claude-opus-5-5-mini"] }).ok).toBe(false);
+  });
+});
+
 describe("P2-1: recommended branch checks the current floor (no self-contradictory success)", () => {
   test("RAISED-FLOOR-DEFAULT: floor 60, recommended all < 60 -> fail-closed", () => {
     const r = resolvePlannerModel({ catalog: CATALOG, table: withFloor("planning", 60) });

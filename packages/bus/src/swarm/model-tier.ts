@@ -77,8 +77,16 @@ export function aaIntelOf(ref: string, table: ModelTierTable): number | undefine
  *  a known model, or none of its aliases are in the catalog. */
 export function resolveToCatalogId(ref: string, catalog: string[], table: ModelTierTable = loadModelTierTable()): string | null {
   const entry = modelEntryOf(ref, table);
-  if (!entry) return null;
-  return entry.aliases.find((a) => catalog.includes(a)) ?? null;
+  return entry ? availableCatalogId(entry, catalog) : null;
+}
+
+/** The ACTUAL catalog id to call for a model: a bare alias exactly present (preferred, rolling id), else a catalog id whose
+ *  date-suffix-stripped form is an alias (so a catalog that serves ONLY a dated snapshot is still usable — symmetric with
+ *  servedMatchesChosen's date tolerance). null if the model is not in the catalog in any form. */
+function availableCatalogId(entry: ModelEntry, catalog: string[]): string | null {
+  const bare = entry.aliases.find((a) => catalog.includes(a));
+  if (bare !== undefined) return bare;
+  return catalog.find((cid) => entry.aliases.includes(stripDateSuffix(cid))) ?? null;
 }
 
 export type ResolveOpts = { catalog: string[]; chosen?: string; why?: string; table?: ModelTierTable };
@@ -90,7 +98,7 @@ export function resolveRoleModel(role: Role, opts: ResolveOpts): ResolveResult {
   if (!spec) return { ok: false, reason: `unknown role "${role}"` };
   const idx = indexOf(table);
   const eff = spec.reasoningEffort !== undefined ? { reasoningEffort: spec.reasoningEffort } : {};
-  const availableAlias = (entry: ModelEntry): string | null => entry.aliases.find((a) => opts.catalog.includes(a)) ?? null;
+  const availableAlias = (entry: ModelEntry): string | null => availableCatalogId(entry, opts.catalog);
 
   if (opts.chosen !== undefined && opts.chosen.length > 0) {
     const entry = modelEntryOf(opts.chosen, table, idx);
