@@ -67,14 +67,21 @@ export function dedupLocalPeers(peers: UnifiedPeer[]): UnifiedPeer[] {
  * duplicate AGENTHOP_TITLE) is reported as ambiguous, never silently resolved to the first. An empty
  * target is rejected (otherwise every prefix check matches it).
  */
-export function resolvePeer(peers: UnifiedPeer[], selfId: string, to: string): UnifiedPeer | { error: string } {
+/** Why a recipient did not resolve. The caller MUST distinguish these: "none" (no such session) may fall back to a
+ *  same-machine durable inbox, but "ambiguous" must NEVER fall back — picking one of several matches would misroute a private
+ *  message (review d8dd4b1-B1). "empty" is a malformed request. */
+export type ResolveErrorKind = "empty" | "ambiguous" | "none";
+export type ResolveError = { error: string; kind: ResolveErrorKind };
+
+export function resolvePeer(peers: UnifiedPeer[], selfId: string, to: string): UnifiedPeer | ResolveError {
   const wanted = to.trim();
-  if (!wanted) return { error: "No target given (empty recipient)." };
+  if (!wanted) return { error: "No target given (empty recipient).", kind: "empty" };
   const others = peers.filter((p) => p.id !== selfId);
   // An ambiguous match lists the ALWAYS-unique per-run id (the short roster handle can't disambiguate,
   // and even two runs sharing one stableId would repeat it). The session id is shown too for durable
   // addressing when present. Both are accepted by this resolver.
-  const ambiguous = (hits: UnifiedPeer[]): { error: string } => ({
+  const ambiguous = (hits: UnifiedPeer[]): ResolveError => ({
+    kind: "ambiguous",
     error: `"${to}" matches ${hits.length} sessions: ${hits
       .map((p) => `${p.title}${p.machine ? `@${p.machine}` : ""} (run ${p.id}${p.stableId ? `, session ${p.stableId}` : ""})`)
       .join("; ")}. Address one by its run id or session id.`,
@@ -92,5 +99,5 @@ export function resolvePeer(peers: UnifiedPeer[], selfId: string, to: string): U
   );
   if (byPrefix.length === 1) return byPrefix[0]!;
   if (byPrefix.length > 1) return ambiguous(byPrefix);
-  return { error: `No session matches "${to}".` };
+  return { error: `No session matches "${to}".`, kind: "none" };
 }
