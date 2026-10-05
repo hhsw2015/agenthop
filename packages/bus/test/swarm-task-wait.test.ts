@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { initialLogState, commit } from "../src/swarm/control-log.js";
 import type { WaitRecord, PendingAction, WaitResolution, Change } from "../src/swarm/control-log.js";
-import { openWait, openQueryWait, applyDefaultOnTimeout, advanceWait, isLive, isGranted, isRenewable, type NewWait } from "../src/swarm/task-wait.js";
+import { openWait, openQueryWait, applyDefaultOnTimeout, advanceWait, isLive, isGranted, isRenewable, failureReopensIncident, type NewWait } from "../src/swarm/task-wait.js";
 
 const subj = { jobId: "job", attemptId: "job/P/a1" };
 const res = (outcome: string): WaitResolution => ({ outcome, reason: "r", sourceOperationId: "op" });
@@ -186,5 +186,46 @@ describe("renew (§2c-b evidence renewal)", () => {
     expect(pending.ok).toBe(true);
     if (pending.ok) expect(advanceWait(pending.wait, { type: "renew", newDeadlineSec: 500 }).ok).toBe(false); // action_pending
     expect(advanceWait(renewable(), { type: "renew" } as never).ok).toBe(false); // missing newDeadlineSec
+  });
+});
+
+// dead-letter R5-B (routing-recovery boundary; coordinator-routed with 20cab0a5): occurredAtSec is the ONLY datum that
+// separates a pre-recovery burst from a post-recovery one when both are observed at the same later tick.
+describe("occurredAtSec + failureReopensIncident (R5-B incident boundary)", () => {
+  const t0 = 1_000_000;
+
+  test("occurredAtSec flows through a plain close verbatim (pure layer only stores it)", () => {
+    const r = advanceWait(mkWait({ timeoutPolicy: "escalate" }), { type: "close", resolution: { outcome: "recovered", reason: "routing healthy", sourceOperationId: "op", occurredAtSec: t0 + 2000 } });
+    expect(r.ok && r.wait.resolution?.occurredAtSec).toBe(t0 + 2000);
+  });
+
+  test("applyDefaultOnTimeout stamps the injected nowSec as occurredAtSec; absent nowSec leaves it off (current behavior)", () => {
+    const q = () => openQueryWait({ waitId: "q", subject: { jobId: "job" }, deadlineSec: 100, owner: "d", defaultOnTimeout: res("default-applied") });
+    const stamped = applyDefaultOnTimeout(q(), t0 + 5);
+    expect(stamped.ok && stamped.wait.resolution?.occurredAtSec).toBe(t0 + 5);
+    const bare = applyDefaultOnTimeout(q());
+    expect(bare.ok && bare.wait.resolution?.occurredAtSec).toBeUndefined();
+  });
+
+  // The two counterexamples (codex acd6c23): same observation tick, failure ts both < observation; only the recovery
+  // occurrence separates them.
+  test("A: failure (t0+1000) BEFORE recovery (t0+2000) -> stale, does NOT reopen", () => {
+    const recovery: WaitResolution = { outcome: "recovered", reason: "r", sourceOperationId: "op", occurredAtSec: t0 + 2000 };
+    expect(failureReopensIncident(t0 + 1000, recovery)).toBe(false);
+  });
+  test("B: failure (t0+2000) AFTER recovery (t0+1000) -> fresh, DOES reopen", () => {
+    const recovery: WaitResolution = { outcome: "recovered", reason: "r", sourceOperationId: "op", occurredAtSec: t0 + 1000 };
+    expect(failureReopensIncident(t0 + 2000, recovery)).toBe(true);
+  });
+
+  test("failure exactly AT the recovery moment is stale (strict >) — the same-tick triggering burst does not re-flap", () => {
+    expect(failureReopensIncident(t0 + 1000, { outcome: "recovered", reason: "r", sourceOperationId: "op", occurredAtSec: t0 + 1000 })).toBe(false);
+  });
+
+  test("no / non-finite boundary -> fail toward noticing (reopen), never a NaN-swallow", () => {
+    expect(failureReopensIncident(t0, res("recovered"))).toBe(true); // bare close, no occurredAtSec
+    expect(failureReopensIncident(t0, { outcome: "r", reason: "r", sourceOperationId: "op", occurredAtSec: Number.NaN })).toBe(true);
+    expect(failureReopensIncident(t0, { outcome: "r", reason: "r", sourceOperationId: "op", occurredAtSec: Number.POSITIVE_INFINITY })).toBe(true);
+    expect(failureReopensIncident(Number.NaN, { outcome: "r", reason: "r", sourceOperationId: "op", occurredAtSec: t0 })).toBe(true);
   });
 });

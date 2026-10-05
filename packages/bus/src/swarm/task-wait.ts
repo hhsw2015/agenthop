@@ -90,9 +90,11 @@ export function openQueryWait(i: NewQueryWait): WaitRecord {
  *  question's subject completed, answer source = default (§0b/R3-b, consistent with "resolved only from close"). No IO
  *  (notifying the asker is advisory), so it is a direct CAS close. Rejected if the wait carries no default (not a query
  *  wait) — never fabricate a resolution. */
-export function applyDefaultOnTimeout(w: WaitRecord): WaitAdvance {
+export function applyDefaultOnTimeout(w: WaitRecord, nowSec?: number): WaitAdvance {
   if (w.defaultOnTimeout === undefined) return { ok: false, error: "applyDefaultOnTimeout on a wait with no defaultOnTimeout (not a query wait)" };
-  return advanceWait(w, { type: "close", resolution: { outcome: "default-applied", reason: w.defaultOnTimeout.reason, sourceOperationId: w.defaultOnTimeout.sourceOperationId } });
+  // occurredAtSec (R5-B) = the timeout instant, injected by the sweep IO (pure layer never reads a clock). Absent nowSec
+  // leaves it off = current behavior.
+  return advanceWait(w, { type: "close", resolution: { outcome: "default-applied", reason: w.defaultOnTimeout.reason, sourceOperationId: w.defaultOnTimeout.sourceOperationId, ...(nowSec !== undefined ? { occurredAtSec: nowSec } : {}) } });
 }
 
 export type WaitEvent =
@@ -165,6 +167,22 @@ export function advanceWait(w: WaitRecord, event: WaitEvent): WaitAdvance {
  *  any non-escalate timeoutPolicy is a SEMANTIC deadline and is NOT renewable. */
 export function isRenewable(w: WaitRecord): boolean {
   return w.kind === "wait" && w.defaultOnTimeout === undefined && w.subject.validationRunId === undefined && w.timeoutPolicy === "escalate";
+}
+
+/** Incident-boundary semantics (dead-letter R5-B; single source of truth, the sweep side reuses this exact predicate).
+ *  Given a failure/dead-letter observation stamped at failureTsSec and a routing-repair wait's recovery resolution, does
+ *  this failure REOPEN the incident? It does iff it occurred strictly AFTER the recovery (failureTsSec > occurrence): a
+ *  failure at or before the recovery moment is STALE — already subsumed by the repair that resolution closed — even when
+ *  the sweep only observes both at a later, common tick (the two counterexamples that no observation-derived boundary can
+ *  separate). Strict `>` so the stale burst that TRIGGERED an instant (same-tick) repair does not immediately re-flap.
+ *  Fail toward NOTICING: a missing or non-finite occurrence (a bare/legacy close, or garbage) establishes no suppression
+ *  boundary, so reopen — never let a NaN comparison (NaN > x === false) silently swallow a real post-recovery failure.
+ *  ponytail: second granularity; a genuine same-second post-recovery failure needs finer clock resolution, not a flipped
+ *  comparison (which would guarantee flaps on every instant repair). */
+export function failureReopensIncident(failureTsSec: number, recovery: WaitResolution): boolean {
+  const boundary = recovery.occurredAtSec;
+  if (boundary === undefined || !Number.isFinite(boundary) || !Number.isFinite(failureTsSec)) return true;
+  return failureTsSec > boundary;
 }
 
 /** Is this wait still something the sweep must supervise? (open or action_pending). */
