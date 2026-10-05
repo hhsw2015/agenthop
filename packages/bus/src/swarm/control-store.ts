@@ -37,15 +37,20 @@ function maxSeqOnDisk(dir: string): number {
   catch { return 0; }
 }
 
-/** Rebuild LogState from the on-disk log. A missing dir = the initial (seq 0) state. */
-export function loadControlLog(dir: string): LogState {
-  if (!existsSync(dir)) return initialLogState();
-  const batches: CommittedBatch[] = readdirSync(dir)
+/** The on-disk log as its ordered CommittedBatch list (seq-ascending). A missing dir = no batches. Exposed for consumers that
+ *  need per-batch SEQs (not just the folded projection) — e.g. §2c-b evidence renewal deriving a subject's progress seq. */
+export function readControlBatches(dir: string): CommittedBatch[] {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
     .filter((f) => /^\d+\.json$/.test(f)) // ignore `<seq>.json.tmp.<pid>` partials from a crashed write
     .map((f) => ({ f, seq: Number(f.slice(0, -".json".length)) }))
     .sort((a, b) => a.seq - b.seq)
     .map(({ f }) => JSON.parse(readFileSync(path.join(dir, f), "utf8")) as CommittedBatch);
-  return replayLog(batches);
+}
+
+/** Rebuild LogState from the on-disk log. A missing dir = the initial (seq 0) state. */
+export function loadControlLog(dir: string): LogState {
+  return replayLog(readControlBatches(dir));
 }
 
 /**
