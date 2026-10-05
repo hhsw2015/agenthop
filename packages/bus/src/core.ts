@@ -165,7 +165,17 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     });
   };
 
-  const local: LocalBus = startLocalBus(self, options.home, (m) => handleInbound(m.from, m.payload, "local", { label: m.fromLabel, mode: m.fromMode }));
+  // B9 (review d8dd4b1): persist a durable RECOVERY FACT when the local broker (re)connects after a drop. Pre-fix, the in-memory
+  // roster re-registered (elect -> broker/client) but NO durable surface recorded that this connection recovered — recordSelfObserve
+  // ran only at startup/identity-change. Re-run it on each RE-registration: a fresh alias-log observe (new eventId + ts = the
+  // recovery moment, busPid = this incarnation) that a pre-decision whois can read and date for staleness. The FIRST registration
+  // is already covered by the startup observe below, so skip it. Reuses an existing face — no new persistent surface, no broadcast.
+  let busRegistered = false;
+  const onBusRegistered = (): void => {
+    if (!busRegistered) { busRegistered = true; return; } // initial connect — startup recordSelfObserve covers it
+    recordSelfObserve(home, self, stableIdAuthoritative, "local");
+  };
+  const local: LocalBus = startLocalBus(self, options.home, (m) => handleInbound(m.from, m.payload, "local", { label: m.fromLabel, mode: m.fromMode }), onBusRegistered);
 
   // Codex has no native session id in its env, so we adopt the thread id as our stableId the first
   // time we learn it (from an MCP call's metadata or the daemon). This also refreshes the readable
