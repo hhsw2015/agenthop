@@ -29,5 +29,8 @@
   "scripts": {
     "test": "pnpm -r --if-present --workspace-concurrency=1 test",
     "typecheck": "pnpm -r --if-present typecheck"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.15"
   }
 }
