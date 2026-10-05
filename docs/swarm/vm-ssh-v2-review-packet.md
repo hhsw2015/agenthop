@@ -76,10 +76,20 @@ ignored by the server anyway).
   `contents: read`). All pass. `tsc --noEmit` clean.
 - Real run (ubuntu): init → up → ssh → down full chain green (box-test on hhsw2015/vm-ssh-home).
 
+## Round-2 disposition — reviewer 01a0ff49 (4 findings, all fixed in `9897e05`, re-validated on a real run)
+| # | Finding | Fix |
+|---|---|---|
+| 1 | run-id ownership: a timestamp filter picks a newer foreign run, and a same-second no-fraction `…00Z` sorts after `…00.500Z` (lexical `>=`) — ownership unprovable | the CLI sets a random `run_tag` input echoed into `run-name`; `ghaLockRunId` locks the run whose `displayTitle` carries that nonce (exact, collision-free). Timestamp filter dropped. |
+| 2 | capture timeout orphans a dispatched (billable, running) box — no cancel, no metadata, handle lost | meta is persisted right after the run-id lock (before capture); the timeout error points at `refresh`/`down`; `cmdSsh` no longer prunes a gha box that has a run id but no address yet |
+| 3 | `user_script` (a caller credential, per the known-gap path) passed via gh argv + echoed in the local error on dispatch failure | inputs go to gh over **STDIN** (`--json`), never argv; the failure surfaces only gh's own stderr. Documented: a secret in `--init` still lands in the run's recorded inputs → real secrets via `gh secret set`, not `--init` |
+| 4 | `normalizeOs('constructor')` hits `Object.prototype` → returns a truthy Function, passes validation, crashes a later `os.startsWith` after the gh call | `Object.hasOwn(OS_MAP, os)` guard — a prototype key is rejected up front (selftest pins it) |
+
+Also removed the now-dead `parseLogAddr` (capture uses the artifact, not logs). The real re-run confirmed the nonce lock
+(`displayTitle` = `vm-ssh-box vmssh-<nonce>`) and stdin dispatch end to end.
+
 ## Seams to probe
-- `ghaLockRunId` uses an ISO-lexical `createdAt >= sinceIso` filter to avoid grabbing an older run (a pre-existing `push`
-  run was present during testing — correctly skipped).
+- `ghaLockRunId` identifies the run by the `run_tag` nonce in `displayTitle` — not a timestamp (ownership is exact).
 - The tailcat address never touches stdout/argv: captured from the artifact file (0600 addr file), and the connect passes
-  it only to tailcat's argv (its documented interface).
+  it only to tailcat's argv (its documented interface). Workflow inputs travel over gh's stdin, not argv.
 - `init` is the only persistent external write; it prints the full workflow before committing via the gh contents API.
 - Not merged to main (user/coordinator gate).
