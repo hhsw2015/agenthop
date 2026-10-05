@@ -352,7 +352,7 @@ describe("sweep — expired QUERY wait applies its default + closes (ab1bf81-E2)
     const stateRef = { s: mkState([q]) };
     const order: string[] = [];
     await sweepPass(mkOps(stateRef, order));
-    expect(order).toEqual(["commit:wait:action_pending", "doAction:apply-default", "commit:wait:resolved"]); // apply-default (not bypass); CLOSE (not re-arm)
+    expect(order).toEqual(["commit:wait:resolved"]); // PHASE 0 closes the expired query DIRECTLY (CAS close with default) — no begin/fire/confirm, no bypass
     const all = allWaits(stateRef.s);
     expect(all).toHaveLength(1);
     expect(all[0]!.state).toBe("resolved");                      // closed, not re-armed to open
@@ -370,7 +370,7 @@ describe("sweep — query default is INDEPENDENT of the owner-liveness / disposi
     const stateRef = { s: mkState([q()]) }; // deadline 1000 < nowSec 2000 ⇒ expired
     const order: string[] = [];
     await sweepPass(mkOps(stateRef, order, { isAlive: () => "dead", pickReassignee: () => null })); // dead + no picker used to STRAND it
-    expect(order).toEqual(["commit:wait:action_pending", "doAction:apply-default", "commit:wait:resolved"]); // default, NOT reassign/stuck
+    expect(order).toEqual(["commit:wait:resolved"]); // PHASE 0 default close even with dead owner + NO picker — no reassign, no IO, no stuck
     const all = allWaits(stateRef.s);
     expect(all).toHaveLength(1);                                  // no reassign ⇒ no second wait
     expect(all[0]!.state).toBe("resolved");
@@ -396,11 +396,24 @@ describe("sweep — query default is INDEPENDENT of the owner-liveness / disposi
     const stateRef = { s: mkState([begun.wait]) }; // a query left in action_pending with a bypass by a pre-fix version / crash
     const order: string[] = [];
     await sweepPass(mkOps(stateRef, order));
-    expect(order).toEqual(["doAction:bypass", "commit:wait:resolved"]); // fired the stale bypass, but CONFIRMED as a default close
+    expect(order).toEqual(["commit:wait:resolved"]); // PHASE 0 closes the expired pending-bypass query DIRECTLY — the stale bypass IO never fires
     const all = allWaits(stateRef.s);
     expect(all).toHaveLength(1);
     expect(all[0]!.state).toBe("resolved");
     expect(all[0]!.resolution?.outcome).toBe("default-applied");  // default applied, NOT re-armed to open
     expect(all[0]!.deadlineSec).toBe(1000);                       // not bumped to 9999
+  });
+
+  test("E2 (01b773d): an expired query in action_pending applies its default even when IO delivery keeps FAILING", async () => {
+    const begun = advanceWait(q(), { type: "begin_action", pendingAction: { actionId: "stale", actionKind: "bypass", target: "job", expectedSubjectVersion: 0 } });
+    if (!begun.ok) throw new Error(begun.error);
+    const stateRef = { s: mkState([begun.wait]) }; // expired query stuck in pending-bypass (deadline 1000 < nowSec 2000)
+    const order: string[] = [];
+    // delivery FAILS every time — the residual was that the default hung behind delivery success and never applied.
+    await sweepPass(mkOps(stateRef, order, { doAction: async (_w, a) => { order.push(`doAction:${a.actionKind}`); return false; } }));
+    expect(order).toEqual(["commit:wait:resolved"]); // PHASE 0 closes with the default BEFORE phase 2 — doAction never fires; delivery is not a barrier
+    const all = allWaits(stateRef.s);
+    expect(all[0]!.state).toBe("resolved");
+    expect(all[0]!.resolution?.outcome).toBe("default-applied"); // default answered despite the failing IO
   });
 });

@@ -93,12 +93,8 @@ function withTimeout(thunk: () => Promise<boolean>, ms: number): Promise<boolean
 /** PURE-ish decision for an OPEN wait: the PendingAction it needs now, or null (no action / deferred). Mirrors the §0b
  *  rules; target carries the IO destination so the confirm is reconstructable. May log a deferral reason. */
 function decideAction(w: WaitRecord, runs: Map<string, ValidationRun>, live: Liveness, ops: SweepOps): PendingAction | null {
-  // E2-A (review 4c617fa): an EXPIRED query wait (kind=wait + defaultOnTimeout) applies its pre-stored default FIRST — before
-  // the validation/owner-dead branches. Its deadline IS the decision moment; the default needs neither the owner alive nor a
-  // reassignee, so a dead owner (no picker) or a validator check must NOT return ahead of it and strand the query past its
-  // default moment (the default's consumer must never wait on owner health). A non-expired query falls through (no action yet).
-  if (w.kind === "wait" && w.defaultOnTimeout !== undefined && ops.nowSec() >= w.deadlineSec)
-    return { actionId: ops.newActionId(), actionKind: "apply-default", target: subjectTarget(w), expectedSubjectVersion: 0 };
+  // NOTE: an EXPIRED query wait (kind=wait + defaultOnTimeout) is handled by PHASE 0 in sweepPass (a direct CAS close with its
+  // default, covering BOTH open and action_pending), so it never reaches decideAction's IO branches (review 01b773d-E2).
   // RPV validation-wait: a DEAD or ALIVE-but-expired validator ⇒ moveValidator. A single "suspected" never convicts.
   if (w.subject.validationRunId !== undefined) {
     if (live === "suspected") return null;
@@ -206,7 +202,23 @@ export async function sweepPass(ops: SweepOps): Promise<void> {
     return true;
   };
 
+  // PHASE 0 — expired-query default (review 01b773d-E2): a query wait (kind=wait + defaultOnTimeout) past its deadline applies
+  // its pre-stored default via a DIRECT CAS close, in EITHER open OR action_pending state, with NO IO. The default needs no
+  // delivery (notifying the asker is advisory), so a failed bypass/reassign IO or an unresolvable/dead owner must NEVER block it
+  // — that stranded the query past its semantic deadline with no answer. This preempts the begin/fire/confirm phases for a query,
+  // and clears any stale pendingAction via the close. Skips a resolved (a real answer/terminal state won) or FROZEN wait; a late
+  // re-run is a no-op (close-on-resolved is rejected). Non-query waits are untouched here — they keep the 3-phase path below.
+  for (const w of indexEntities(state).waits) {
+    if (w.state === "resolved" || w.kind !== "wait" || w.defaultOnTimeout === undefined) continue; // only a LIVE query wait
+    if (ops.nowSec() < w.deadlineSec) continue;                                                     // not yet the decision moment
+    if (state.frozen.includes(`wait:${w.waitId}`)) { ops.log(`sweep ${w.waitId}: expired query FROZEN — skipping default`); continue; }
+    const applied = applyDefaultOnTimeout(w, ops.nowSec());
+    if (!applied.ok) { ops.log(`sweep ${w.waitId}: expired-query default rejected: ${applied.error}`); continue; }
+    commitOk([{ put: "wait", wait: applied.wait }], `${w.waitId} expired-query default`);
+  }
+
   // PHASE 1 — begin: CAS-commit a recoverable intent for each OPEN wait that needs an action (no IO here).
+  state = ops.loadState(); // pick up PHASE 0's closes so a defaulted query is no longer seen as open/pending
   for (const w of indexEntities(state).waits) {
     if (w.state !== "open") continue; // action_pending residue is handled in phase 2 (recovery); resolved is done
     const action = decideAction(w, indexEntities(state).runs, ops.isAlive(w.owner), ops);
