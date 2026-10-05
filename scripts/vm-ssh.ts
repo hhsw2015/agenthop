@@ -32,7 +32,7 @@
 
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { connect as netConnect, createServer, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -702,32 +702,46 @@ function writeMeta(m: Meta): void {
 /** Atomically CLAIM a name before any side effect (dispatch/provision): exclusive create (flag "wx") so two concurrent
  *  same-name `up`s cannot both proceed and overwrite each other's run handle (reviewer P2-1). Upgraded later via writeMeta. */
 function reserveMeta(m: Meta): void {
-  mkdirSync(addrDir(), { recursive: true });
-  try { writeFileSync(metaPath(m.id), `${JSON.stringify({ ...m, phase: "reserved" })}\n`, { mode: 0o600, flag: "wx" }); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`name "${m.id}" already in use (or an in-flight up is claiming it)`); throw e; }
+  // Inside the SAME per-id lock as every guarded write/prune: an old generation's cleanup (holding the lock) can't delete
+  // a new reservation, and this wx-create can't race one. wx still gives the "name already in use" semantics.
+  withIdLock(m.id, () => {
+    try { writeFileSync(metaPath(m.id), `${JSON.stringify({ ...m, phase: "reserved" })}\n`, { mode: 0o600, flag: "wx" }); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`name "${m.id}" already in use (or an in-flight up is claiming it)`); throw e; }
+  });
 }
 type OwnedMeta = Meta & { reqId: string };
 /** Does an on-disk record still belong to this up's generation? (pure; the guard below reads the record and applies it.) */
 export function recordIsOwned(cur: Meta | undefined, reqId: string): boolean { return cur !== undefined && cur.reqId === reqId; }
 
 const sleepSync = (ms: number): void => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(1, ms)); } catch { const u = Date.now() + ms; while (Date.now() < u) { /* spin */ } } };
-/** A cross-PROCESS mutex for a box id: the generation check and the meta/address write-or-delete must be ONE critical
- *  section, so a second CLI cannot slip a takeover (down + reuse) between our read and our write. NETWORK AWAITS STAY
- *  OUTSIDE this. O_EXCL lock file; a crashed holder's lock (older than 10s) is reclaimed. */
+/** Is a pid a LIVE process? kill(pid,0) throws ESRCH only when it is gone; EPERM (exists, not ours) still means alive.
+ *  (The F33 claimInbox criterion — time-old is NOT death, only a dead pid is.) */
+export function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}
+/** A cross-PROCESS mutex for a box id: the generation check and the meta/address write-or-delete (and reservation) must be
+ *  ONE critical section, so a second CLI cannot slip a takeover (down + reuse) between our read and our write. NETWORK
+ *  AWAITS STAY OUTSIDE. O_EXCL lock file holding "<pid>.<nonce>": a stale lock is reclaimed ONLY when its holder pid is
+ *  provably DEAD (age alone never steals a live holder); the finally releases ONLY our own lock token (so a reclaimer or a
+ *  successor's lock is never deleted by us). A live holder we can't reclaim → bounded wait then error (never two sections). */
 function withIdLock<T>(id: string, fn: () => T): T {
   mkdirSync(addrDir(), { recursive: true });
   const lock = path.join(addrDir(), `${id}.lock`);
+  const token = `${process.pid}.${randomBytes(6).toString("hex")}`;
   const deadline = Date.now() + 5000;
   for (;;) {
-    try { const fd = openSync(lock, "wx", 0o600); writeSync(fd, `${process.pid} ${Date.now()}`); closeSync(fd); break; }
+    try { const fd = openSync(lock, "wx", 0o600); writeSync(fd, token); closeSync(fd); break; }
     catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      try { if (Date.now() - statSync(lock).mtimeMs > 10_000) { rmSync(lock, { force: true }); continue; } } catch { continue; }
-      if (Date.now() > deadline) throw new Error(`vm-ssh: timed out acquiring the lock for "${id}" (another operation holds it)`);
+      let holderPid = 0;
+      try { holderPid = Number(readFileSync(lock, "utf8").split(".")[0]); } catch { continue; } // vanished between open and read -> retry
+      if (!pidAlive(holderPid)) { try { rmSync(lock, { force: true }); } catch { /* raced */ } continue; } // dead holder -> reclaim
+      if (Date.now() > deadline) throw new Error(`vm-ssh: timed out acquiring the lock for "${id}" (held by live pid ${holderPid})`);
       sleepSync(25);
     }
   }
-  try { return fn(); } finally { try { rmSync(lock, { force: true }); } catch { /* ok */ } }
+  try { return fn(); } finally { try { if (readFileSync(lock, "utf8") === token) rmSync(lock, { force: true }); } catch { /* gone or no longer ours */ } }
 }
 
 /** Write meta ONLY if the current record is still THIS generation's — atomic read-check-write across processes, so a late
@@ -1009,6 +1023,7 @@ function selftest(): void {
     console.assert(recordIsOwned(undefined, "a") === false && recordIsOwned(mk({ reqId: "a" }), "a") === true && recordIsOwned(mk({ reqId: "b" }), "a") === false, "recordIsOwned: a late write/prune matches only its own generation (reused name is not owned)");
     console.assert(timePrunable(mk({ backend: "railway" })) === true && timePrunable(mk({ backend: "gha" })) === false, "timePrunable: railway by platform TTL; gha NEVER by local time (dispatch time is not a destroy proof)");
   }
+  console.assert(pidAlive(process.pid) === true && pidAlive(2 ** 30) === false && pidAlive(0) === false && pidAlive(-1) === false, "pidAlive: self is alive; an absent/invalid pid is not (lock reclaim needs a DEAD holder, not just an old one)");
   console.assert(WORKFLOW_YAML.includes("workflow_dispatch") && WORKFLOW_YAML.includes("--ssh-authorized-keys=${GITHUB_USER}@github") && WORKFLOW_YAML.includes("VMSSH_ADDR=") && WORKFLOW_YAML.includes("/tmp/ghostish.stop") && WORKFLOW_YAML.includes("contents: read") && WORKFLOW_YAML.includes("run-name:") && WORKFLOW_YAML.includes("run_tag") && WORKFLOW_YAML.includes("secrets.VMSSH_SECRET"), "workflow yaml: dispatch inputs + keyed key-fetch + addr marker + sentinel + least-privilege + run_tag nonce + secret channel");
   console.assert(runTitleFor("vmssh-abc") === "vm-ssh-box vmssh-abc" && runTitleFor("vmssh-abc") !== "vm-ssh-box vmssh-abc-other", "run title is matched EXACTLY (a <tag>-other title must not satisfy the lock)");
   process.stdout.write("vm-ssh selftest: all assertions passed\n");
