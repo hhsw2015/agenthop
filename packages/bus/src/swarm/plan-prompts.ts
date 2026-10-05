@@ -27,7 +27,7 @@ export type PromptAsset = {
 
 const PLAN_DRAFT: PromptAsset = {
   id: "plan-draft",
-  version: "1",
+  version: "2",
   description: "PRD/one-line goal -> a structured plan draft (translateDraft's input schema).",
   system:
     "You are a planning drafter for an agent swarm. Turn the requirement into a STRICT JSON draft and nothing else — no prose, no markdown fences. " +
@@ -38,6 +38,19 @@ const PLAN_DRAFT: PromptAsset = {
   userTemplate:
     "Requirement (jobId={{jobId}}):\n{{prd}}\n\n" +
     "Allowed structuredCheck names (anything else is rejected): {{allowedChecks}}\n\n" +
+    // S15: define every field so the model never guesses a term (each guess is a rework risk).
+    "Field meanings (fill exactly these, do not rename):\n" +
+    "- nodeId: a short unique id for the task within this plan.\n" +
+    "- kind: the task type; use \"work\" unless it is clearly integration/synthesis/review/repair.\n" +
+    "- goal: one sentence stating what the task must achieve.\n" +
+    "- dependsOn: nodeIds that must finish before this task (empty if none).\n" +
+    "- structuredChecks: machine-checkable acceptance, each {check, args}; check must be an allowed name above.\n" +
+    "- freeTextNotes: acceptance that needs human/expert judgement (spawns a required review task).\n" +
+    "- complexity: integer 1-10, your honest difficulty estimate.\n" +
+    "- requiredOutputs: the artifacts the task produces; kind is patch|files|report|notes.\n" +
+    "- artifactScope: output path prefixes the task's deliverables land under.\n" +
+    "- sourceWriteScope: existing source path prefixes the task will MODIFY (drives ownership/risk checks).\n" +
+    "- criticalPath: true ONLY if a wrong result here would block or mislead the whole job; else false.\n\n" +
     'Output exactly this JSON shape:\n' +
     '{"jobId":"{{jobId}}","tasks":[{"nodeId":"string","kind":"work|integration|synthesis|review|repair",' +
     '"goal":"string","dependsOn":["nodeId"],"structuredChecks":[{"check":"name","args":{}}],"freeTextNotes":["string"],' +

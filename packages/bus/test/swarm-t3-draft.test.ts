@@ -113,7 +113,7 @@ describe("draftPlan", () => {
 describe("prompt assets", () => {
   test("three versioned assets exist", () => {
     expect(Object.keys(PROMPT_ASSETS).sort()).toEqual(["complexity", "expand-node", "plan-draft"]);
-    for (const a of Object.values(PROMPT_ASSETS)) expect(a.version).toBe("1");
+    for (const a of Object.values(PROMPT_ASSETS)) expect(a.version.length).toBeGreaterThan(0); // versioned (plan-draft bumped to 2 for the S15 field glossary)
   });
   test("fillPrompt substitutes vars and throws on a missing one", () => {
     const { user } = fillPrompt(PROMPT_ASSETS["plan-draft"]!, { jobId: "j", prd: "p", allowedChecks: "testsPass" });
