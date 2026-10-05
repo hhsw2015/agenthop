@@ -97,7 +97,15 @@ const ROUTING_GK_PREFIX = "routing:";
 /** Route IDENTITY = the (from → to) PAIR (review bb2a2cb-P2-1: keying by `to` alone merges A→X and B→X). encodeURIComponent on
  *  each leg keeps the composite unambiguous. A dead-letter missing `from` has no route-pair identity — it is diagnostic only
  *  (never silently folded into a specific pair), so routeKeyOf returns null and it does not count toward any incident. */
-export const routeKeyOf = (dl: DeadLetter): string | null => dl.from === undefined ? null : `${encodeURIComponent(dl.from)}->${encodeURIComponent(dl.to)}`;
+export const routeKeyOf = (dl: DeadLetter): string | null => {
+  if (dl.from === undefined) return null;
+  // encodeURIComponent THROWS a URIError on a malformed string (e.g. a lone UTF-16 surrogate like "\ud800" that JSON.parse
+  // accepts). A throw here used to escape the per-record loop AFTER the byte cursor had advanced, permanently skipping the
+  // HEALTHY records later in the same chunk (review 4aafeca-R1). A from/to we cannot encode has no usable route identity —
+  // treat it as diagnostic-only (null, like a from-less entry), never a throw.
+  try { return `${encodeURIComponent(dl.from)}->${encodeURIComponent(dl.to)}`; }
+  catch { return null; }
+};
 export const routingGroupKey = (routeKey: string): string => `${ROUTING_GK_PREFIX}${routeKey}`;
 export const routeKeyOfGroup = (groupKey: string): string | null => groupKey.startsWith(ROUTING_GK_PREFIX) ? groupKey.slice(ROUTING_GK_PREFIX.length) : null;
 
@@ -150,29 +158,45 @@ export type DeadLetterWatch = {
   /** Bytes read past the last COMPLETE record — the incomplete trailing line as BASE64 bytes (not a string: a multi-byte UTF-8
    *  char split across the read boundary must not be decoded until its continuation arrives), carried to the next tick (R1/R3). */
   carry: string;
+  /** True while SKIPPING a pathological over-long (> maxCarry) line that has no newline: drop its bytes until the next newline
+   *  rather than growing carry unboundedly each tick (R3), then resume on the records AFTER it — never a re-tail, never a drop
+   *  of the healthy suffix. */
+  truncating: boolean;
   /** In-window failure events (route-pair), accumulated from the incremental read and pruned each tick (R1 keeps in-window). */
   window: WindowEvent[];
   /** route -> the max failure ts already COVERED by an opened incident (R5 watermark): a failure at/under this never reopens. */
   handled: Record<string, number>;
+  /** route -> the recovery-boundary ts recorded when an incident was recovered/closed (R5): a failure at/under it is
+   *  pre-recovery and never reopens, EVEN IF ingested AFTER the recovery was observed — so a late-ingested pre-recovery burst
+   *  cannot fake a relapse; only a failure strictly newer than this boundary is post-recovery evidence. */
+  recovered: Record<string, number>;
   /** route -> failure count at detection, awaiting a durable CONTROL commit (R1 durable candidate; removed only after commit). */
   pending: Record<string, number>;
-  /** incidentId -> notify obligation, kept until delivered INDEPENDENT of whether the episode is still open (R4). */
-  notify: Record<string, { text: string; sent: boolean }>;
 };
 
 export function emptyDeadLetterWatch(): DeadLetterWatch {
-  return { sig: "", offset: 0, carry: "", window: [], handled: {}, pending: {}, notify: {} };
+  return { sig: "", offset: 0, carry: "", truncating: false, window: [], handled: {}, recovered: {}, pending: {} };
 }
 
-/** Fold a freshly-read byte chunk into (events, carryB64): prepend the prior carry BYTES, decode only up to the last newline
- *  BYTE (a complete-line boundary is always a valid UTF-8 boundary) and parse those via the null-safe parser, and return the
- *  trailing incomplete bytes as the new base64 carry. A record split across two reads — even mid-UTF-8-char — is never
- *  half-parsed, mis-decoded, or lost (R1/R3 record boundary). */
-export function ingestLedgerChunk(carryB64: string, chunk: Buffer): { events: DeadLetter[]; carry: string } {
-  const combined = carryB64 ? Buffer.concat([Buffer.from(carryB64, "base64"), chunk]) : chunk;
+/** Fold a freshly-read byte chunk into (events, carryB64, truncating): prepend the prior carry BYTES, decode only up to the
+ *  last newline BYTE (a complete-line boundary is always a valid UTF-8 boundary) and parse those via the null-safe parser, and
+ *  return the trailing incomplete bytes as the new base64 carry. A record split across two reads — even mid-UTF-8-char — is
+ *  never half-parsed, mis-decoded, or lost (R1/R3 record boundary). CARRY IS BOUNDED (R3): a no-newline residual exceeding
+ *  maxCarryBytes is a pathological over-long line ⇒ enter `truncating` (drop its bytes until the next newline) instead of
+ *  growing carry each tick; the records after its terminating newline resume normally, never tail-cut (which would re-open R1). */
+export function ingestLedgerChunk(carryB64: string, chunk: Buffer, maxCarryBytes: number, truncating: boolean): { events: DeadLetter[]; carry: string; truncating: boolean } {
+  let combined = carryB64 ? Buffer.concat([Buffer.from(carryB64, "base64"), chunk]) : chunk;
+  if (truncating) {
+    const end = combined.indexOf(0x0a); // skipping an over-long line: wait for its terminating newline
+    if (end < 0) return { events: [], carry: "", truncating: true }; // not ended yet — drop this chunk's bytes, keep skipping
+    combined = combined.subarray(end + 1); // resume on the suffix after the over-long line
+  }
   const nl = combined.lastIndexOf(0x0a); // last '\n' byte
-  if (nl < 0) return { events: [], carry: combined.toString("base64") };     // no complete line yet — keep accumulating
-  return { events: parseDeadLetters(combined.toString("utf8", 0, nl)), carry: combined.subarray(nl + 1).toString("base64") };
+  if (nl < 0) {
+    if (combined.length > maxCarryBytes) return { events: [], carry: "", truncating: true }; // over-long incomplete line ⇒ start skipping (R3)
+    return { events: [], carry: combined.toString("base64"), truncating: false };            // no complete line yet — keep accumulating
+  }
+  return { events: parseDeadLetters(combined.toString("utf8", 0, nl)), carry: combined.subarray(nl + 1).toString("base64"), truncating: false };
 }
 
 /** Drop window events older than the window start (sliding window; R1 retains in-window, prunes aged-out). */
@@ -180,13 +204,15 @@ export function pruneDeadLetterWindow(window: readonly WindowEvent[], windowStar
   return window.filter((e) => e.ts >= windowStartMs);
 }
 
-/** Count in-window failures per route that are STRICTLY NEWER than the route's handled-through watermark (R5: a failure already
- *  covered by an opened incident never reopens a new episode; recurrence needs post-recovery negative evidence). */
-export function countFreshByRoute(window: readonly WindowEvent[], windowStartMs: number, handled: Record<string, number>): Map<string, number> {
+/** Count in-window failures per route STRICTLY NEWER than the route's floor = max(handled watermark, recovery boundary). R5:
+ *  a failure already covered by an opened incident (handled), OR at/under a recorded recovery (recovered), never reopens — so
+ *  neither the same already-counted burst nor a late-ingested pre-recovery failure can fake a relapse; recurrence needs a
+ *  failure strictly after the recovery boundary. */
+export function countFreshByRoute(window: readonly WindowEvent[], windowStartMs: number, handled: Record<string, number>, recovered: Record<string, number>): Map<string, number> {
   const m = new Map<string, number>();
   for (const e of window) {
     if (e.ts < windowStartMs) continue;
-    if (e.ts <= (handled[e.route] ?? 0)) continue;     // already handled by a prior/open incident (R5)
+    if (e.ts <= Math.max(handled[e.route] ?? 0, recovered[e.route] ?? 0)) continue; // handled OR pre-recovery ⇒ not fresh (R5)
     m.set(e.route, (m.get(e.route) ?? 0) + 1);
   }
   return m;
@@ -207,8 +233,12 @@ export function readDeadLetterWatch(file: string): DeadLetterWatch {
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return emptyDeadLetterWatch(); throw e; }
   const p = JSON.parse(raw) as DeadLetterWatch;
   if (p === null || typeof p !== "object" || typeof p.offset !== "number" || typeof p.carry !== "string" || !Array.isArray(p.window)
-      || typeof p.handled !== "object" || typeof p.pending !== "object" || typeof p.notify !== "object") throw new Error("dead-letter watch: malformed");
-  return { sig: typeof p.sig === "string" ? p.sig : "", offset: p.offset, carry: p.carry, window: p.window, handled: p.handled ?? {}, pending: p.pending ?? {}, notify: p.notify ?? {} };
+      || typeof p.handled !== "object" || typeof p.pending !== "object") throw new Error("dead-letter watch: malformed");
+  return {
+    sig: typeof p.sig === "string" ? p.sig : "", offset: p.offset, carry: p.carry,
+    truncating: p.truncating === true, window: p.window,
+    handled: p.handled ?? {}, recovered: p.recovered ?? {}, pending: p.pending ?? {},
+  };
 }
 
 /** Write the watch state atomically (unique temp + exclusive create + rename). Persist AFTER the batch's commits + notifies, so
