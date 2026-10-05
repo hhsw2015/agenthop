@@ -77,6 +77,15 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // Per-process retry set for poison files a claim could neither quarantine nor release (both failed on a transient FS
   // fault). The flush timer re-attempts them via retryStuckPoison once the fault clears (review bb6dad5-P2-4-B).
   const stuckPoison = new Set<string>();
+  // B7 (review 01b773d): HEALTHY claims whose release failed (transient rename error) after a push miss. recoverStaleClaims only
+  // frees DEAD-pid claims, so our own live-pid claim would otherwise stay `.claim-<pid>` forever. flushInbox retries releasing
+  // these at the top of each pass; on success the file is back to `.json` and the normal claim path re-delivers it.
+  const stuckRelease = new Set<string>();
+  // C2 (review 01b773d): watch-triggered flushes back off until this time after a no-progress flush, so our OWN claim/release
+  // renames (which also fire the inbox fs-watch) cannot self-excite a tight flush loop while the push channel is down. The 5s
+  // flush timer stays the retry floor during the backoff; a flush that DELIVERS clears it so near-live resumes.
+  let watchCooldownUntil = 0;
+  const WATCH_COOLDOWN_MS = 5000; // one flush-timer interval: during a channel outage the watch stays quiet, the timer retries
   // Work-status is per SESSION IDENTITY, not per MCP-server process: one Codex daemon-backed server can
   // adopt several thread identities over its life (see learnStableId), and each must keep its own status
   // and its own monotonic seq — otherwise thread A's seq would gate thread B's reports.
@@ -110,21 +119,30 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       recoverStaleClaims(home, inboxKeys());
       // Re-attempt any poison stuck from a prior flush (quarantine+release both failed then); clears once the FS heals.
       retryStuckPoison(home, stuckPoison);
+      // B7: re-attempt releasing HEALTHY claims whose release failed earlier; on success the file is back to `.json` and the
+      // claim below re-delivers it. recoverStaleClaims can't help (this is our own LIVE pid).
+      for (const f of [...stuckRelease]) if (releaseInbox(f)) stuckRelease.delete(f);
       const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
       // claimInbox claims the WHOLE pending batch up front. On the first push failure (channel not ready) we
       // must release this one AND every still-unprocessed claim — otherwise they are orphaned as .claim-<pid>
       // files that no later flush reclaims (claimInbox only sees .json), stranding the message for good.
       const claimed = claimInbox(home, inboxKeys(), String(process.pid), stuckPoison); // validates + quarantines poison (F28) — msgs here are schema-valid
+      let delivered = 0;
       for (let i = 0; i < claimed.length; i++) {
         // F28 defense-in-depth: a push that THREW (not just returned false) must never escape flushInbox — this runs as
         // `void flushInbox()`, so an unhandled rejection would crash the whole bus server. Treat a throw as a delivery miss.
         let ok = false;
         try { ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread, codexHome: codexDaemon?.codexHome(), fromMode: claimed[i].msg.fromMode, to: self.title }); }
         catch (e) { dbg(`flushInbox push threw (treating as miss): ${e instanceof Error ? e.message : e}`); ok = false; }
-        if (ok) { ackInbox(claimed[i].file); continue; }
-        for (let j = i; j < claimed.length; j++) releaseInbox(claimed[j].file);
+        if (ok) { ackInbox(claimed[i].file); delivered++; continue; }
+        // B7: a failed release for a HEALTHY message must not silently strand it — track it for retry (not stuckPoison; it is not
+        // a bad message, and recoverStaleClaims won't free a live-pid claim).
+        for (let j = i; j < claimed.length; j++) if (!releaseInbox(claimed[j].file)) stuckRelease.add(claimed[j].file);
         break;
       }
+      // C2: if we processed claims but delivered NONE (channel not ready), back off watch-triggered re-flushes so our own
+      // claim/release renames don't self-excite a tight loop; the 5s timer keeps retrying. A delivery clears the backoff.
+      if (claimed.length > 0) watchCooldownUntil = delivered === 0 ? Date.now() + WATCH_COOLDOWN_MS : 0;
     } finally {
       flushing = false;
     }
@@ -320,6 +338,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // S18 seam ("message is a pointer, file is authoritative"): a pre-seal flush would hook in here, before flushInbox.
   let watchDebounce: ReturnType<typeof setTimeout> | undefined;
   const onInboxChange = (): void => {
+    if (Date.now() < watchCooldownUntil) return; // C2: backing off after a no-progress flush — ignore self-induced churn; the timer retries
     if (watchDebounce) return; // coalesce a burst of arrivals into a single flush
     watchDebounce = setTimeout(() => { watchDebounce = undefined; void flushInbox(); }, 50);
     watchDebounce.unref?.();
