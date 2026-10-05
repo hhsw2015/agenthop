@@ -149,6 +149,13 @@ Live/unknown/ambiguous holder → bounded wait then error (never two critical se
 named file. No general lock lib (this file's namespace, per the coordinator). Real run on `~/Dev` confirmed up/ssh/down
 with no `.lockd` leak; `pidAlive` pinned in selftest; strict/NodeNext tsc exit 0 (TS 5.9.3).
 
+## Round-9 disposition — reviewer 01a0ff49 (af3ba29: 0 P1 / 1 P2), fixed in `fbd3af3`
+| Finding | Fix |
+|---|---|
+| af3ba29-P2-1 (directory ABA): the reclaim `rmdir`'d unconditionally — a late reclaimer whose `rmSync` of the dead identity returned ENOENT (a peer already reclaimed + `mkdir`'d a fresh, identity-not-yet-published successor dir) deleted that successor's empty dir, re-opening the mutex | only the reclaimer that ACTUALLY removed the dead identity file may `rmdir` the container; an ENOENT means not-entitled → leave the dir, the loop re-reads (empty = UNKNOWN = wait). The published-identity case already failed `rmdir` on a non-empty dir; this closes the unpublished-successor window too. |
+
+selftest + strict/NodeNext tsc exit 0; real run (`fbd3af3`) up/ssh/down with no `.lockd` leak.
+
 ## Seams to probe
 - `ghaLockRunId` identifies the run by the `run_tag` nonce in `displayTitle` — not a timestamp (ownership is exact).
 - The tailcat address never touches stdout/argv: captured from the artifact file (0600 addr file), and the connect passes
