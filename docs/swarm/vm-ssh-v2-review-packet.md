@@ -137,6 +137,18 @@ Real re-run (`cd18e13`) confirmed up/ssh/down under the lock with no lock-file l
 
 `pidAlive` pinned in selftest; real re-run (`95bf0d5`) confirmed up/ssh/down with no lock-file leak.
 
+## Round-8 disposition — reviewer 01a0ff49 (95bf0d5: 0 P1 / 2 P2) + coordinator #9 structural fix, in `af3ba29`
+Both residuals were "check and action not bound to the same lock instance". Fixed structurally by putting the owner
+identity in the lock-entry NAME (a lock **directory** `<id>.lockd` whose single entry is `<pid>.<nonce>`):
+| Finding | Fix |
+|---|---|
+| 95bf0d5-P2-1: `openSync(wx)` exposed an empty lock before `writeSync(token)` → a reader parsed `''`→pid 0→reclaimed a live owner's uninitialized lock | acquire is one atomic `mkdir`; identity is published as `dir/<pid>.<nonce>`. A competitor seeing the dir with **no entry yet** reads it as UNKNOWN and waits — an empty/unpublished state is never "dead". |
+| 95bf0d5-P2-2: a reclaimer that read a dead token then `rmSync(lock)` by path deleted a successor's live lock | reclaim unlinks ONLY the dead holder's **specifically-named** file, then `rmdir`s the empty dir (harmless failure if a successor repopulated it). A successor's differently-named file can never be deleted. |
+
+Live/unknown/ambiguous holder → bounded wait then error (never two critical sections); `finally` removes only our own
+named file. No general lock lib (this file's namespace, per the coordinator). Real run on `~/Dev` confirmed up/ssh/down
+with no `.lockd` leak; `pidAlive` pinned in selftest; strict/NodeNext tsc exit 0 (TS 5.9.3).
+
 ## Seams to probe
 - `ghaLockRunId` identifies the run by the `run_tag` nonce in `displayTitle` — not a timestamp (ownership is exact).
 - The tailcat address never touches stdout/argv: captured from the artifact file (0600 addr file), and the connect passes
