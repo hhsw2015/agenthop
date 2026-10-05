@@ -31,7 +31,7 @@
  */
 
 import { liveEntities, type WaitRecord, type PendingAction, type LogState, type ChangeBody, type CommitResult, type ValidationRun } from "./control-log.js";
-import { advanceWait, openWait } from "./task-wait.js";
+import { advanceWait, openWait, applyDefaultOnTimeout } from "./task-wait.js";
 import { moveValidatorAction, moveValidatorWithWait } from "./task-rpv.js";
 
 export type Liveness = "alive" | "suspected" | "dead";
@@ -116,6 +116,10 @@ function decideAction(w: WaitRecord, runs: Map<string, ValidationRun>, live: Liv
   // for every owner; a truly-dead owner misjudged suspected gets harmless repeated re-arm/ping (at-least-once) until birth
   // collection + a picker enable a real reassign. (An approval ALWAYS escalates, never bypass.)
   if (ops.nowSec() >= w.deadlineSec) { // live is alive|suspected here (dead returned above) — expiry fires for any not-dead owner
+    // A QUERY wait (R3-b: kind=wait + defaultOnTimeout): its deadline IS the decision moment — apply the pre-stored default and
+    // CLOSE, never a bypass ping + re-arm. Treating it as an ordinary bypass kept re-asking forever and starved the consumer
+    // that waits on the default answer (review ab1bf81-P1#2). Must come before the bypass/escalation split.
+    if (w.kind === "wait" && w.defaultOnTimeout !== undefined) return { actionId: ops.newActionId(), actionKind: "apply-default", target: subjectTarget(w), expectedSubjectVersion: 0 };
     const isApproval = w.kind === "approval" && (w.decision ?? "pending") === "pending";
     const kind = isApproval || w.timeoutPolicy !== "bypass" ? "escalation" : "bypass";
     return { actionId: ops.newActionId(), actionKind: kind, target: subjectTarget(w), expectedSubjectVersion: 0 };
@@ -132,6 +136,14 @@ function confirmChanges(w: WaitRecord, action: PendingAction, runs: Map<string, 
       const done = advanceWait(w, { type: "action_done", newDeadlineSec: ops.freshDeadlineSec(), nowSec: ops.nowSec() });
       if (!done.ok) { ops.log(`sweep ${w.waitId}: action_done rejected: ${done.error}`); return null; }
       return [{ put: "wait", wait: done.wait }];
+    }
+    case "apply-default": {
+      // Query-wait deadline reached (R3-b): apply the pre-stored default answer and CLOSE (resolved, outcome=default-applied) —
+      // NOT a re-arm, so the consumer waiting on the default stops being starved (review ab1bf81-P1#2). applyDefaultOnTimeout
+      // rejects a non-query wait, which decideAction already excludes; close-on-resolved is a no-op, so a late re-fire is safe.
+      const applied = applyDefaultOnTimeout(w);
+      if (!applied.ok) { ops.log(`sweep ${w.waitId}: applyDefaultOnTimeout rejected: ${applied.error}`); return null; }
+      return [{ put: "wait", wait: applied.wait }];
     }
     case "reassign": {
       const closed = advanceWait(w, { type: "close", resolution: { outcome: "owner-dead", reason: `owner ${w.owner} unreachable → ${action.target}`, sourceOperationId: action.actionId } });

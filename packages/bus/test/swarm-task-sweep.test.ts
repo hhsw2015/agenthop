@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { commit, entityKeyOf, initialLogState, liveEntities, type ChangeBody, type LogState, type WaitRecord, type ValidationRun } from "../src/swarm/control-log.js";
-import { openWait, isLive } from "../src/swarm/task-wait.js";
+import { openWait, openQueryWait, isLive } from "../src/swarm/task-wait.js";
 import { openValidationRun } from "../src/swarm/task-validation.js";
 import { sweepPass, type SweepOps } from "../src/swarm/task-sweep.js";
 
@@ -343,5 +343,20 @@ describe("sweep P1-1 — a REJECTED commit blocks IO and never logs success (com
     expect(logs.some((m) => m.includes("resolved"))).toBe(false);       // never claimed success on a failed confirm
     expect(logs.some((m) => m.includes("commit rejected"))).toBe(true);
     expect(liveWaits(stateRef.s)[0]!.state).toBe("action_pending");     // held recoverable, not falsely resolved
+  });
+});
+
+describe("sweep — expired QUERY wait applies its default + closes (ab1bf81-E2), not a bypass re-arm", () => {
+  test("decideAction → apply-default → applyDefaultOnTimeout close (resolved, default-applied); no bypass ping, no re-arm", async () => {
+    const q = openQueryWait({ waitId: "q1", subject: { jobId: "job" }, deadlineSec: 1000, owner: "claude:owner", defaultOnTimeout: { outcome: "clarified", reason: "default-applied-reason", sourceOperationId: "op-q" } });
+    const stateRef = { s: mkState([q]) };
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order));
+    expect(order).toEqual(["commit:wait:action_pending", "doAction:apply-default", "commit:wait:resolved"]); // apply-default (not bypass); CLOSE (not re-arm)
+    const all = allWaits(stateRef.s);
+    expect(all).toHaveLength(1);
+    expect(all[0]!.state).toBe("resolved");                      // closed, not re-armed to open
+    expect(all[0]!.resolution?.outcome).toBe("default-applied"); // the pre-stored default was applied
+    expect(all[0]!.deadlineSec).toBe(1000);                      // NOT bumped to freshDeadlineSec — no re-arm
   });
 });

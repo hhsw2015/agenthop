@@ -9,7 +9,7 @@ const plan = (jobId: string) => ch({ put: "plan", plan: { jobId } });
 const attempt = (jobId: string, attemptId: string) => ch({ put: "attempt", attempt: { jobId, attemptId } });
 const observed = (attemptId: string) => ch({ put: "observed", observed: { attemptId } });
 const intent = (attemptId: string) => ch({ put: "intent", intent: { attemptId } });
-const accepted = (jobId: string) => ch({ put: "accepted", accepted: { jobId } });
+const accepted = (jobId: string, attemptId?: string) => ch({ put: "accepted", accepted: { jobId, ...(attemptId ? { attemptId } : {}) } });
 const waitAt = (waitId: string, state: string, jobId = "J") => ch({ put: "wait", wait: { waitId, state, subject: { jobId } } });
 
 describe("subjectProgressSeq (§2c-b subject progress evidence)", () => {
@@ -21,7 +21,7 @@ describe("subjectProgressSeq (§2c-b subject progress evidence)", () => {
       batch(4, intent("a1")),
       batch(5, accepted("J")),
     ];
-    expect(subjectProgressSeq(batches, "J")).toBe(5);
+    expect(subjectProgressSeq(batches, { jobId: "J" })).toBe(5);
   });
 
   test("another job's changes, and observed/intent on a non-J attempt, do not count", () => {
@@ -32,8 +32,8 @@ describe("subjectProgressSeq (§2c-b subject progress evidence)", () => {
       batch(4, intent("b1")),
       batch(5, plan("OTHER")),
     ];
-    expect(subjectProgressSeq(batches, "J")).toBe(1);
-    expect(subjectProgressSeq(batches, "NONE")).toBe(0);
+    expect(subjectProgressSeq(batches, { jobId: "J" })).toBe(1);
+    expect(subjectProgressSeq(batches, { jobId: "NONE" })).toBe(0);
   });
 
   test("WAIT changes NEVER count as subject progress (no renew→progress→renew loop)", () => {
@@ -42,7 +42,20 @@ describe("subjectProgressSeq (§2c-b subject progress evidence)", () => {
       batch(9, waitAt("W", "open", "J")),          // the subject's own wait, armed — must NOT advance progress
       batch(10, waitAt("W", "action_pending", "J")),
     ];
-    expect(subjectProgressSeq(batches, "J")).toBe(1); // still 1, not 9/10
+    expect(subjectProgressSeq(batches, { jobId: "J" })).toBe(1); // still 1, not 9/10
+  });
+
+  test("attempt-anchored subject counts ONLY that attempt's progress, not a sibling attempt of the same job (ab1bf81-P1#1)", () => {
+    const batches = [
+      batch(1, attempt("J", "a1")),
+      batch(2, attempt("J", "a2")),         // sibling attempt of the SAME job
+      batch(3, observed("a2")),             // a2 progresses @3
+      batch(4, accepted("J", "a1")),        // a1 progresses @4
+    ];
+    expect(subjectProgressSeq(batches, { jobId: "J", attemptId: "a1" })).toBe(4); // only a1 (@1 attempt, @4 accepted)
+    expect(subjectProgressSeq(batches, { jobId: "J", attemptId: "a2" })).toBe(3); // only a2 (@2 attempt, @3 observed)
+    expect(subjectProgressSeq(batches, { jobId: "J" })).toBe(4);                   // job-level counts any attempt
+    expect(subjectProgressSeq([batch(5, plan("J"))], { jobId: "J", attemptId: "a1" })).toBe(0); // a plan change is job-level, not a1's own progress
   });
 });
 
@@ -62,6 +75,8 @@ describe("waitArmSeq (last arm = a 'put wait' leaving state 'open')", () => {
 describe("renewalCount (§2c-b acceptance ③: finite renewals, derived from the log)", () => {
   const renewCh = (waitId: string, progressSeq: number): Change =>
     ({ put: "wait", wait: { waitId, state: "open" }, operationId: renewOperationId(waitId, progressSeq), expectedEntityRevision: 0 } as unknown as Change);
+  const waitPut = (waitId: string, operationId: string): Change =>
+    ({ put: "wait", wait: { waitId, state: "open" }, operationId, expectedEntityRevision: 0 } as unknown as Change);
 
   test("renewOperationId is distinguishable and idempotent by progress seq", () => {
     expect(renewOperationId("W", 5)).toBe("wait:W#renew@5");
@@ -79,15 +94,25 @@ describe("renewalCount (§2c-b acceptance ③: finite renewals, derived from the
     expect(renewalCount(batches, "W")).toBe(2);
     expect(renewalCount(batches, "OTHER")).toBe(0);
   });
+
+  test("E3: a DIFFERENT wait whose id starts with '<W>#renew@' does not burn W's quota (operationId prefix is not enough)", () => {
+    const sib = "W#renew@unrelated-0"; // a weird-but-valid other waitId; its CREATE opId "wait:W#renew@unrelated-0#1" starts with "wait:W#renew@"
+    const batches = [
+      batch(1, waitPut(sib, `wait:${sib}#1`)), // the sibling's own create — must NOT count toward W
+      batch(2, renewCh("W", 5)),               // W's actual renewal #1
+    ];
+    expect(renewalCount(batches, "W")).toBe(1);   // only W's own renew (not the sibling create)
+    expect(renewalCount(batches, sib)).toBe(0);   // the sibling's create is not a renewal either
+  });
 });
 
 describe("hasFreshSubjectEvidence (the sweep's renew-vs-escalate test)", () => {
   test("progress AFTER the last arm ⇒ fresh (renew); progress at/before ⇒ none (escalate); repeat after renew ⇒ no-op", () => {
     // armed @2, then the subject commits @5 ⇒ fresh evidence
-    expect(hasFreshSubjectEvidence([batch(2, waitAt("W", "open")), batch(5, accepted("J"))], "J", "W")).toBe(true);
+    expect(hasFreshSubjectEvidence([batch(2, waitAt("W", "open")), batch(5, accepted("J"))], { jobId: "J" }, "W")).toBe(true);
     // subject progress @1, wait armed later @4 ⇒ nothing new since the arm
-    expect(hasFreshSubjectEvidence([batch(1, accepted("J")), batch(4, waitAt("W", "open"))], "J", "W")).toBe(false);
+    expect(hasFreshSubjectEvidence([batch(1, accepted("J")), batch(4, waitAt("W", "open"))], { jobId: "J" }, "W")).toBe(false);
     // after a renew the arm advances PAST the triggering progress ⇒ the same evidence does not renew again
-    expect(hasFreshSubjectEvidence([batch(2, waitAt("W", "open")), batch(5, accepted("J")), batch(6, waitAt("W", "open"))], "J", "W")).toBe(false);
+    expect(hasFreshSubjectEvidence([batch(2, waitAt("W", "open")), batch(5, accepted("J")), batch(6, waitAt("W", "open"))], { jobId: "J" }, "W")).toBe(false);
   });
 });

@@ -115,24 +115,31 @@ const ARTIFACT_ROOT = process.env.SWARM_ARTIFACT_ROOT || "";
 // bus-identity v1.5's (dormant until it exists); this is the read side.
 const DEAD_LETTERS_FILE = path.join(HOME, ".agenthop", "swarm", "dead-letters.jsonl");
 const DEAD_LETTER_WATCH_FILE = path.join(HOME, ".agenthop", "swarm", "dead-letter-watch.json"); // durable cursor/window/pending/notify (R1-R5)
-const DEAD_LETTER_WINDOW_MS = Number(process.env.SWARM_DEAD_LETTER_WINDOW_MS || "120000");
-const DEAD_LETTER_THRESHOLD = Number(process.env.SWARM_DEAD_LETTER_THRESHOLD || "3");
+// Parse an env numeric budget/cap to a FINITE integer >= min, else the default. A bare Number() yields NaN on a bad value, and
+// a NaN bound SILENTLY disables itself — e.g. `renewalCount >= NaN` is always false, so the free-renewal cap vanishes and a wait
+// renews forever (review ab1bf81-E4). An invalid config must fall back to the safe default, never to "no bound".
+const envInt = (raw: string | undefined, fallback: number, min = 1): number => {
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= min ? n : fallback;
+};
+const DEAD_LETTER_WINDOW_MS = envInt(process.env.SWARM_DEAD_LETTER_WINDOW_MS, 120000);
+const DEAD_LETTER_THRESHOLD = envInt(process.env.SWARM_DEAD_LETTER_THRESHOLD, 3);
 // Per-tick budgets so the dead-letter watch never occupies the supervision loop unbounded (review bb2a2cb-P2-3 / d1bcd94-R3):
 // read at most N BYTES of the ledger per tick from a persistent byte cursor (NOT a full-file slurp — the IO/decode/split cost
 // is what must be bounded, not just the JSON.parse count) + process at most M routing groups per tick (round-robin cursor).
-const MAX_READ_BYTES = Number(process.env.SWARM_DEAD_LETTER_MAX_BYTES || String(256 * 1024));
-const MAX_ROUTING_GROUPS_PER_TICK = Number(process.env.SWARM_ROUTING_GROUPS_PER_TICK || "32");
+const MAX_READ_BYTES = envInt(process.env.SWARM_DEAD_LETTER_MAX_BYTES, 256 * 1024);
+const MAX_ROUTING_GROUPS_PER_TICK = envInt(process.env.SWARM_ROUTING_GROUPS_PER_TICK, 32);
 // R3: an over-long ledger line (no newline) past this many bytes is pathological ⇒ skip it instead of growing carry each tick;
 // and notify at most this many owed incidents per tick (round-robin) so a backlog can't become an unbounded notify storm.
-const MAX_CARRY_BYTES = Number(process.env.SWARM_DEAD_LETTER_MAX_CARRY_BYTES || String(64 * 1024));
-const MAX_NOTIFY_PER_TICK = Number(process.env.SWARM_ROUTING_NOTIFY_PER_TICK || "32");
+const MAX_CARRY_BYTES = envInt(process.env.SWARM_DEAD_LETTER_MAX_CARRY_BYTES, 64 * 1024);
+const MAX_NOTIFY_PER_TICK = envInt(process.env.SWARM_ROUTING_NOTIFY_PER_TICK, 32);
 // S11/4-n: suppress an IDENTICAL coordinator notice (same taskRef+text) re-sent within this window, so a repeating observer
 // event does not spam the coordinator inbox. A transient send FAILURE is never recorded, so a genuine retry is not suppressed.
-const NOTIFY_DEDUP_MS = Number(process.env.SWARM_NOTIFY_DEDUP_MS || "60000");
+const NOTIFY_DEDUP_MS = envInt(process.env.SWARM_NOTIFY_DEDUP_MS, 60000, 0);
 // §2c-b evidence renewal: a renewed liveness wait's fresh probe window (a coarse magnitude, NOT an ETA — §2c), and the finite
 // number of FREE renewals a non-A1-approved wait gets before the sweep escalates instead of renewing ("不许无限 re-arm", acc ③).
-const RENEW_WINDOW_SEC = Number(process.env.SWARM_RENEW_WINDOW_SEC || "1800");
-const MAX_FREE_RENEWALS = Number(process.env.SWARM_MAX_FREE_RENEWALS || "20");
+const RENEW_WINDOW_SEC = envInt(process.env.SWARM_RENEW_WINDOW_SEC, 1800);
+const MAX_FREE_RENEWALS = envInt(process.env.SWARM_MAX_FREE_RENEWALS, 20, 0); // 0 = a valid strict "no free renewals" policy
 const PLAN_FILE = process.env.SWARM_PLAN || "";
 const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
@@ -535,6 +542,9 @@ function buildSweepOps(stateRef: { s: LogState }): SweepOps {
     // Bound a single action's IO per tick (P1-3): a slower delivery is left action_pending + re-fired next tick.
     actionTimeoutMs: Number(process.env.SWARM_ACTION_TIMEOUT_MS || "5000"),
     doAction: async (w, action) => {
+      // apply-default (query-wait deadline, ab1bf81-P1#2) has NO recipient to ping — the pre-stored default IS the answer; there
+      // is nothing to deliver, so report "delivered" and let the confirm phase apply it (applyDefaultOnTimeout → close).
+      if (action.actionKind === "apply-default") return true;
       // Route to the DESTINATION: reassign / move-validator notify the NEW owner / validator seat (action.target carries
       // it, so routing is reconstructable from the durable intent); bypass / escalation ping the current owner.
       const recipient = action.actionKind === "reassign" || action.actionKind === "move-validator" ? action.target : w.owner;
@@ -971,10 +981,13 @@ async function main(): Promise<void> {
       const w = (b as Extract<ChangeBody, { put: "wait" }>).wait;
       if (w.state !== "open" || !isRenewable(w) || w.deadlineSec > now) continue;    // only an EXPIRED open renewable wait (the probe moment)
       if (renewalCount(batches, w.waitId) >= MAX_FREE_RENEWALS) continue;            // §2c-b ③: finite free renewals ⇒ let the sweep escalate
-      if (!hasFreshSubjectEvidence(batches, w.subject.jobId, w.waitId)) continue;    // no subject progress since the arm ⇒ let the sweep escalate
+      // §2c-b evidence is anchored to the wait's FULL subject: if it supervises one attempt, only THAT attempt's progress
+      // renews it — a sibling attempt of the same job must not (review ab1bf81-P1#1).
+      const progressSubject = { jobId: w.subject.jobId, attemptId: w.subject.attemptId };
+      if (!hasFreshSubjectEvidence(batches, progressSubject, w.waitId)) continue;    // no subject progress since the arm ⇒ let the sweep escalate
       const adv = advanceWait(w, { type: "renew", newDeadlineSec: now + RENEW_WINDOW_SEC, nowSec: now });
       if (!adv.ok) { log(`renew ${w.waitId} rejected by reducer: ${adv.error}`); continue; } // the reducer guard is the authority
-      const progressSeq = subjectProgressSeq(batches, w.subject.jobId);              // idempotent id by the triggering progress (countable, §2c-b ③)
+      const progressSeq = subjectProgressSeq(batches, progressSubject);             // idempotent id by the triggering progress (countable, §2c-b ③)
       const rev = st.revisions[`wait:${w.waitId}`] ?? 0;
       try {
         const res = commitChanges(st, [{ put: "wait", wait: adv.wait, operationId: renewOperationId(w.waitId, progressSeq), expectedEntityRevision: rev }]);
