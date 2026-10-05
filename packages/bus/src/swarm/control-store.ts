@@ -12,12 +12,13 @@
  * power loss (Codex review P2-6: the fsyncs are what make the claimed barrier real). Cross-machine CONTROL = step B / T3.
  */
 
-import { mkdirSync, readdirSync, readFileSync, existsSync, openSync, writeSync, fsyncSync, closeSync, linkSync, unlinkSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, existsSync, openSync, writeSync, fsyncSync, closeSync, linkSync, unlinkSync, appendFileSync } from "node:fs";
 import path from "node:path";
 import {
   commit, replayLog, initialLogState,
   type Change, type CommitResult, type CommittedBatch, type LogState,
 } from "./control-log.js";
+import { worklogLinesFromBatch, WORKLOG_FILE } from "./worklog.js";
 
 /** Atomic + durable publish of a NEW file; throws EEXIST if it already exists — a disk-level CAS so a stale in-memory
  *  writer can NEVER overwrite an already-committed <seq>.json (R2). temp → fsync → hard-link into place → dir fsync. Any
@@ -66,6 +67,14 @@ export function commitControl(dir: string, state: LogState, changes: Change[]): 
       }
       throw e; // a real durable-write failure (R4) — propagate; never report ok on a non-durable barrier
     }
+    // worklog-timeline hook (brain worklog-timeline; pure builder owner 90b58f9c): the control batch is durable now, so
+    // mirror it into the work TIMELINE (a projection of the log, NOT a second ledger). ONE hook covers both the dispatcher
+    // and the sweep (every wait transition goes through commitControl). BEST-EFFORT: an append failure must NEVER fail an
+    // already-durable control commit; any gap is rebuilt by scripts/worklog-backfill.ts from the authoritative control-log.
+    try {
+      const lines = worklogLinesFromBatch(changes, Math.floor(Date.now() / 1000));
+      if (lines.length) appendFileSync(path.join(path.dirname(dir), WORKLOG_FILE), lines.join(""));
+    } catch { /* worklog is derived + rebuildable; never break the authoritative commit for it */ }
   }
   return r;
 }
