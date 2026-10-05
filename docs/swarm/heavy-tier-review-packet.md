@@ -45,10 +45,21 @@ acceptance C holding on live output.)
   rejects a semantic-deadline wait / non-open / missing deadline.
 - 468 swarm tests green; `tsc --noEmit` clean; 93 T3a regression gates unaffected (additive only).
 
-## Seams to probe
+## Round-2 disposition — reviewer c6b5968 (2 P1 / 1 P2), all addressed in `f57162d`
 
-- `servedMatchesChosen` is a normalized includes-match (tolerates version suffixes). A same-family different-version that is
-  WEAKER (e.g. a hypothetical "opus-5.5-lite") would pass the name match — the AA Intel floor is the strength guard at
-  resolve time, not at served-verify time (served-verify only catches a different-model downgrade). Flagging explicitly.
-- CPA Claude reasoning uses `thinking.type=adaptive` + `output_config.effort` (CPA quirk); non-Claude uses `reasoning_effort`.
+| # | Finding | Fix |
+|---|---|---|
+| P1-1 | catalog/benchmark substring match: weak/unavailable/unbenchmarked model passes as a recommendation | EXACT identity via the `models` alias table (`modelEntryOf`); no-chosen picks strongest recommended that is available AND >= floor, else fail-closed; the live harness exits non-zero before any HTTP |
+| P1-2 | `servedMatchesChosen` substring: older version / bare family / mini-variant accepted (runtime downgrade) | served true iff served and chosen resolve to the SAME canonical model (dated suffix tolerated); older/family/mini/different-family rejected |
+| P2-1 | recommended branch skipped the floor | both recommended and explicit branches enforce `aaIntel >= floor` (a raised floor rejects a now-sub-floor recommended; no false "58 >= 60") |
+
+**Thresholds pinned** (swarm-model-tier, 16): DEFAULT-WEAK-ONLY, DEFAULT-SKIP-WEAK-FOR-REAL-BASELINE, EXPLICIT-WEAK-AS-BASELINE,
+UNBENCHMARKED-VARIANT, same-tier non-recommended self-select +why (kept), SERVED older/family/mini/different-family reject +
+exact/dated positives, RAISED-FLOOR default/explicit. A1 re-run: chosen=served=claude-opus-5-5 (exact) @ xhigh → loadable → F pass.
+
+## Seams to probe (current)
+
+- Identity is **exact** (alias table + a 6-8 digit date-suffix strip). A served id with a NON-date trailing token not in the
+  alias list is rejected (fail-closed) — safe, but a legitimately new spelling needs an alias-table (ruling) update.
+- CPA Claude reasoning uses `thinking.type=adaptive` + `output_config.effort`; non-Claude uses `reasoning_effort`.
 - `renew`/`isRenewable` are the pure half; the sweep-side wiring (hasFreshSubjectEvidence ⇒ commit renew) is 20cab0a5's.
