@@ -102,6 +102,15 @@ Also removed the now-dead `parseLogAddr` (capture uses the artifact, not logs). 
 
 Real re-run (`9209997`) confirmed the exact-title lock + status-gated capture + `ssh`(`runner`) + sentinel `down`.
 
+## Round-4 disposition — reviewer 01a0ff49 (9209997: 0 P1 / 2 P2), fixed in `cba55ed`
+| Finding | Fix |
+|---|---|
+| R3-P2-1: a failed/empty run-status query (`.catch(()=>"")`) was treated as non-terminal → `up`/`refresh` could serve a stale artifact | `ghaCaptureAddr` serves the artifact ONLY on a CONFIRMED non-terminal status; an empty/errored status (unknown) retries, and times out as *not ready* if it never resolves. `completed` → `ended`. Unknown ≠ live. |
+| R3-P2-2: the in-flight / nonce record was dropped by reads, cleanup, or a lost dispatch reply | a lifecycle `phase` (reserved→requesting→running→ready); repo+`run_tag` persisted **before** the dispatch request (a reply-lost dispatch keeps a recoverable handle; unknown result ≠ not-dispatched); `prunableOnNoAddr` — `ssh` never prunes a gha record or any in-flight reservation, only a once-ready railway box; `down` prunes ONLY after a confirmed stop (sentinel/cancel), else keeps the handle and reports honestly. |
+
+Real re-run (`cba55ed`) confirmed the status-gated capture + `phase=ready` happy path (up/ssh/down). `prunableOnNoAddr`
+matrix pinned in selftest.
+
 ## Seams to probe
 - `ghaLockRunId` identifies the run by the `run_tag` nonce in `displayTitle` — not a timestamp (ownership is exact).
 - The tailcat address never touches stdout/argv: captured from the artifact file (0600 addr file), and the connect passes
