@@ -115,6 +115,12 @@ export type WaitRecord = {
    *  on timeout via close(outcome "default-applied"). Durable so the sweep and recovery both see it. Set ONLY by
    *  openQueryWait; an approval (real gate) must NOT carry one — it bare-waits. */
   defaultOnTimeout?: WaitResolution;
+  /** T3 needsClarification carrier (payloadRef): a content-addressed digest ref to the immutable bundle
+   *  {original draft + PRD version + frozenContext version refs} a planner must re-read to resume compilation after
+   *  the query resolves. Explicit record over path convention (supervision chain — the resume reference travels IN the
+   *  durable record, not by an implicit "derive it from waitId"). Bundle storage/retrieval is the IO layer's (T3b);
+   *  this field only pins the ref. Optional. */
+  payloadRef?: string;
   // --- approval branch (kind="approval"): resolved != granted (P1-2). ---
   actionRef?: string;
   paramsDigest?: string;

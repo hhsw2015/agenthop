@@ -1,0 +1,458 @@
+{
+  "model": "claude-opus-5.5",
+  "selection": {
+    "chosen": "opus 5.5",
+    "model": "claude-opus-5.5",
+    "why": "recommended baseline (strongest available in catalog)",
+    "benchmark": "AA Intel 58 >= floor 53 (mtr-2026-10-05)",
+    "reasoningEffort": "xhigh"
+  },
+  "prd": "Build a pure \"plan metrics\" module for the swarm brain. Requirements (tag each task's goal with the IDs it addresses):\n[I1] a function nodeCount(plan) returning the number of nodes — verified by tests.\n[I2] a function totalComplexity(plan) summing node complexity — verified by tests.\n[I3] a function hasDesignGate(plan) returning whether a design node exists — verified by tests.\n[I4] a function summary(plan) returning a stable one-line string — verified by tests.\n[I5] the module must typecheck.\nPut the module under packages/bus/src/swarm/ and the tests under packages/bus/test/.\nProduce ONE separate task per requirement I1..I5, and put that requirement's exact marker (e.g. [I1]) in that task's goal text.\nEach of those five tasks must list \"testsPass\" in its structuredChecks (I5 also \"typecheckPasses\"); requiredOutputs kind MUST be\n\"files\" or \"report\" (NOT \"patch\"); keep tasks independent (no dependsOn) where possible.\nAlso include ONE dedicated task whose sourceWriteScope is [\"packages/bus/test/\"] that writes the unit tests (tag it [TESTS]);\nthis task must ALSO list \"testsPass\" in its structuredChecks (every task needs at least one structuredCheck).\nUse ONLY the checks \"testsPass\" and \"typecheckPasses\" (do NOT use fileExists).",
+  "rawDraft": {
+    "jobId": "live-job-1",
+    "tasks": [
+      {
+        "nodeId": "tests",
+        "kind": "work",
+        "goal": "[TESTS] Write unit tests for all metrics functions (nodeCount, totalComplexity, hasDesignGate, summary)",
+        "dependsOn": [],
+        "structuredChecks": [
+          {
+            "check": "testsPass",
+            "args": {}
+          }
+        ],
+        "freeTextNotes": [],
+        "complexity": 3,
+        "requiredOutputs": [
+          {
+            "logicalName": "test-suite",
+            "kind": "files"
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/test/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/test/"
+        ],
+        "criticalPath": false
+      },
+      {
+        "nodeId": "i1",
+        "kind": "work",
+        "goal": "[I1] Implement nodeCount(plan) function returning the number of nodes",
+        "dependsOn": [],
+        "structuredChecks": [
+          {
+            "check": "testsPass",
+            "args": {}
+          }
+        ],
+        "freeTextNotes": [],
+        "complexity": 2,
+        "requiredOutputs": [
+          {
+            "logicalName": "nodeCount-implementation",
+            "kind": "files"
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "criticalPath": false
+      },
+      {
+        "nodeId": "i2",
+        "kind": "work",
+        "goal": "[I2] Implement totalComplexity(plan) function summing node complexity",
+        "dependsOn": [],
+        "structuredChecks": [
+          {
+            "check": "testsPass",
+            "args": {}
+          }
+        ],
+        "freeTextNotes": [],
+        "complexity": 2,
+        "requiredOutputs": [
+          {
+            "logicalName": "totalComplexity-implementation",
+            "kind": "files"
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "criticalPath": false
+      },
+      {
+        "nodeId": "i3",
+        "kind": "work",
+        "goal": "[I3] Implement hasDesignGate(plan) function returning whether a design node exists",
+        "dependsOn": [],
+        "structuredChecks": [
+          {
+            "check": "testsPass",
+            "args": {}
+          }
+        ],
+        "freeTextNotes": [],
+        "complexity": 2,
+        "requiredOutputs": [
+          {
+            "logicalName": "hasDesignGate-implementation",
+            "kind": "files"
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "criticalPath": false
+      },
+      {
+        "nodeId": "i4",
+        "kind": "work",
+        "goal": "[I4] Implement summary(plan) function returning a stable one-line string",
+        "dependsOn": [],
+        "structuredChecks": [
+          {
+            "check": "testsPass",
+            "args": {}
+          }
+        ],
+        "freeTextNotes": [],
+        "complexity": 3,
+        "requiredOutputs": [
+          {
+            "logicalName": "summary-implementation",
+            "kind": "files"
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "criticalPath": false
+      },
+      {
+        "nodeId": "i5",
+        "kind": "work",
+        "goal": "[I5] Ensure the module typechecks correctly",
+        "dependsOn": [],
+        "structuredChecks": [
+          {
+            "check": "testsPass",
+            "args": {}
+          },
+          {
+            "check": "typecheckPasses",
+            "args": {}
+          }
+        ],
+        "freeTextNotes": [],
+        "complexity": 2,
+        "requiredOutputs": [
+          {
+            "logicalName": "typecheck-validation",
+            "kind": "report"
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "criticalPath": false
+      }
+    ]
+  },
+  "plan": {
+    "jobId": "live-job-1",
+    "planRevision": 1,
+    "nodes": [
+      {
+        "nodeId": "tests",
+        "kind": "work",
+        "goal": "[TESTS] Write unit tests for all metrics functions (nodeCount, totalComplexity, hasDesignGate, summary)",
+        "dependsOn": [],
+        "outputContract": {
+          "requiredOutputs": [
+            {
+              "logicalName": "test-suite",
+              "kind": "files"
+            }
+          ]
+        },
+        "acceptance": [
+          {
+            "check": "testsPass",
+            "args": {}
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/test/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/test/"
+        ],
+        "estimatedRuntimeSec": 600,
+        "retryBudget": 2,
+        "required": true,
+        "runtime": "ephemeral",
+        "modelTier": "standard",
+        "roleProfile": "test-impl",
+        "specDigest": "3c1769564a78a5324ad9a7f8b4133c3d7942416608825fdc9f2b05811be2f0d5"
+      },
+      {
+        "nodeId": "i1",
+        "kind": "work",
+        "goal": "[I1] Implement nodeCount(plan) function returning the number of nodes",
+        "dependsOn": [],
+        "outputContract": {
+          "requiredOutputs": [
+            {
+              "logicalName": "nodeCount-implementation",
+              "kind": "files"
+            }
+          ]
+        },
+        "acceptance": [
+          {
+            "check": "testsPass",
+            "args": {}
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "estimatedRuntimeSec": 600,
+        "retryBudget": 2,
+        "required": true,
+        "runtime": "ephemeral",
+        "modelTier": "standard",
+        "roleProfile": "pure-layer-impl",
+        "specDigest": "cdd7f13ccc1dc489c04ff22b70b39e0d7ad5232d972632ef1241e561ce7b03e2"
+      },
+      {
+        "nodeId": "i2",
+        "kind": "work",
+        "goal": "[I2] Implement totalComplexity(plan) function summing node complexity",
+        "dependsOn": [],
+        "outputContract": {
+          "requiredOutputs": [
+            {
+              "logicalName": "totalComplexity-implementation",
+              "kind": "files"
+            }
+          ]
+        },
+        "acceptance": [
+          {
+            "check": "testsPass",
+            "args": {}
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "estimatedRuntimeSec": 600,
+        "retryBudget": 2,
+        "required": true,
+        "runtime": "ephemeral",
+        "modelTier": "standard",
+        "roleProfile": "pure-layer-impl",
+        "specDigest": "a8ad6317c43b21c07a937f27897ccc49ce8451c4ad1fc8b69de1ee17d461e4c9"
+      },
+      {
+        "nodeId": "i3",
+        "kind": "work",
+        "goal": "[I3] Implement hasDesignGate(plan) function returning whether a design node exists",
+        "dependsOn": [],
+        "outputContract": {
+          "requiredOutputs": [
+            {
+              "logicalName": "hasDesignGate-implementation",
+              "kind": "files"
+            }
+          ]
+        },
+        "acceptance": [
+          {
+            "check": "testsPass",
+            "args": {}
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "estimatedRuntimeSec": 600,
+        "retryBudget": 2,
+        "required": true,
+        "runtime": "ephemeral",
+        "modelTier": "standard",
+        "roleProfile": "pure-layer-impl",
+        "specDigest": "a6122ccff6d2d3c8442e33f3030ded68aa5799e6f78fad4971edd0bb46f442ec"
+      },
+      {
+        "nodeId": "i4",
+        "kind": "work",
+        "goal": "[I4] Implement summary(plan) function returning a stable one-line string",
+        "dependsOn": [],
+        "outputContract": {
+          "requiredOutputs": [
+            {
+              "logicalName": "summary-implementation",
+              "kind": "files"
+            }
+          ]
+        },
+        "acceptance": [
+          {
+            "check": "testsPass",
+            "args": {}
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "estimatedRuntimeSec": 600,
+        "retryBudget": 2,
+        "required": true,
+        "runtime": "ephemeral",
+        "modelTier": "standard",
+        "roleProfile": "pure-layer-impl",
+        "specDigest": "2340ea2cdb68186c10945be354c08f3f6f798b1d2963bc689a924ab5ca3d933e"
+      },
+      {
+        "nodeId": "i5",
+        "kind": "work",
+        "goal": "[I5] Ensure the module typechecks correctly",
+        "dependsOn": [],
+        "outputContract": {
+          "requiredOutputs": [
+            {
+              "logicalName": "typecheck-validation",
+              "kind": "report"
+            }
+          ]
+        },
+        "acceptance": [
+          {
+            "check": "testsPass",
+            "args": {}
+          },
+          {
+            "check": "typecheckPasses",
+            "args": {}
+          }
+        ],
+        "artifactScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "sourceWriteScope": [
+          "packages/bus/src/swarm/"
+        ],
+        "estimatedRuntimeSec": 600,
+        "retryBudget": 2,
+        "required": true,
+        "runtime": "ephemeral",
+        "modelTier": "standard",
+        "roleProfile": "pure-layer-impl",
+        "specDigest": "f1357b02b13b0d8a744a70ca3639721c632479f6d1dc2c39c49d76818071cb0a"
+      }
+    ],
+    "jobBudget": {
+      "maxTotalAttempts": 20,
+      "maxWallClockSec": 72000,
+      "maxModelUsd": 7
+    },
+    "frozenRefs": {
+      "checkRegistry": "cr-live-1",
+      "ownerDomainPolicy": "op-live-1",
+      "riskPolicy": "rp-live-1",
+      "roleCatalog": "rc-live-1",
+      "budgetPolicy": "bp-live-1",
+      "r4ThresholdPolicy": "tp-live-1",
+      "sourceBaselineDigest": "live-base",
+      "planningRequestId": "765507fb-895d-4cfe-8015-031678866329"
+    },
+    "notImplemented": [
+      "r4-threshold"
+    ],
+    "planDigest": "8bf0702755a43d019e4edf2e240ee1861ee3d4214da08ee4f04ae3a2b05ab440"
+  },
+  "fBaseline": [
+    {
+      "id": "I1",
+      "marker": "[I1]",
+      "requiredCheck": "testsPass",
+      "expect": "implemented"
+    },
+    {
+      "id": "I2",
+      "marker": "[I2]",
+      "requiredCheck": "testsPass",
+      "expect": "implemented"
+    },
+    {
+      "id": "I3",
+      "marker": "[I3]",
+      "requiredCheck": "testsPass",
+      "expect": "implemented"
+    },
+    {
+      "id": "I4",
+      "marker": "[I4]",
+      "requiredCheck": "testsPass",
+      "expect": "implemented"
+    },
+    {
+      "id": "I5",
+      "marker": "[I5]",
+      "requiredCheck": "typecheckPasses",
+      "expect": "implemented"
+    },
+    {
+      "id": "TESTS-DIR",
+      "requiredScopePrefix": "packages/bus/test/",
+      "expect": "implemented"
+    }
+  ],
+  "fAudit": {
+    "pass": true,
+    "audit": {
+      "I1": "implemented",
+      "I2": "implemented",
+      "I3": "implemented",
+      "I4": "implemented",
+      "I5": "implemented",
+      "TESTS-DIR": "implemented"
+    },
+    "mismatches": []
+  }
+}
