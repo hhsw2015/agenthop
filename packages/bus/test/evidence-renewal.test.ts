@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { subjectProgressSeq, waitArmSeq, hasFreshSubjectEvidence } from "../src/swarm/evidence-renewal.js";
+import { subjectProgressSeq, waitArmSeq, hasFreshSubjectEvidence, renewOperationId, renewalCount } from "../src/swarm/evidence-renewal.js";
 import type { Change, CommittedBatch } from "../src/swarm/control-log.js";
 
 // Minimal change fixtures: the derivations read only a few fields per change type, so build those and cast.
@@ -56,6 +56,28 @@ describe("waitArmSeq (last arm = a 'put wait' leaving state 'open')", () => {
     ];
     expect(waitArmSeq(batches, "W")).toBe(3);
     expect(waitArmSeq(batches, "OTHER")).toBe(0);
+  });
+});
+
+describe("renewalCount (§2c-b acceptance ③: finite renewals, derived from the log)", () => {
+  const renewCh = (waitId: string, progressSeq: number): Change =>
+    ({ put: "wait", wait: { waitId, state: "open" }, operationId: renewOperationId(waitId, progressSeq), expectedEntityRevision: 0 } as unknown as Change);
+
+  test("renewOperationId is distinguishable and idempotent by progress seq", () => {
+    expect(renewOperationId("W", 5)).toBe("wait:W#renew@5");
+    expect(renewOperationId("W", 5)).toBe(renewOperationId("W", 5)); // same inputs ⇒ same id ⇒ replay no-op
+  });
+
+  test("counts DISTINCT renew ids; a re-attempt (same id) and a create/action_done open (non-renew id) do not add", () => {
+    const batches = [
+      batch(1, waitAt("W", "open")),      // create — operationId "op", NOT a renewal
+      batch(2, renewCh("W", 5)),          // renewal #1
+      batch(3, waitAt("W", "action_pending")),
+      batch(4, renewCh("W", 8)),          // renewal #2
+      batch(5, renewCh("W", 5)),          // a re-attempt of #1 (same id) — replay, not a new renewal
+    ];
+    expect(renewalCount(batches, "W")).toBe(2);
+    expect(renewalCount(batches, "OTHER")).toBe(0);
   });
 });
 

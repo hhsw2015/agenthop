@@ -52,3 +52,22 @@ export function waitArmSeq(batches: readonly CommittedBatch[], waitId: string): 
 export function hasFreshSubjectEvidence(batches: readonly CommittedBatch[], jobId: string, waitId: string): boolean {
   return subjectProgressSeq(batches, jobId) > waitArmSeq(batches, waitId);
 }
+
+/** The operationId the sweep stamps on an evidence renewal: distinguishable (carries the record, §2c-b acceptance ③) and
+ *  idempotent by the triggering progress seq — the SAME progress yields the SAME id, so a re-attempted renew is a control-log
+ *  replay no-op, and each distinct renewal is one countable id. (A later renew needs strictly newer progress — see waitArmSeq
+ *  — so its seq, hence its id, differs.) */
+export function renewOperationId(waitId: string, progressSeq: number): string {
+  return `wait:${waitId}#renew@${progressSeq}`;
+}
+
+/** How many evidence RENEWALS this wait has had, derived from the authoritative log (no separate counter to drift — F13): the
+ *  count of distinct renew-stamped operationIds for it. The sweep caps a NON-A1-approved wait at a finite number of free
+ *  renewals (§2c-b: "不许无限 re-arm"); past the cap it escalates instead of renewing. Create / action_done re-arms are NOT
+ *  renewals (they carry their own ids), so they never consume the free-renewal budget. */
+export function renewalCount(batches: readonly CommittedBatch[], waitId: string): number {
+  const prefix = `wait:${waitId}#renew@`;
+  const seen = new Set<string>();
+  for (const batch of batches) for (const c of batch.changes) if (c.operationId.startsWith(prefix)) seen.add(c.operationId);
+  return seen.size;
+}
