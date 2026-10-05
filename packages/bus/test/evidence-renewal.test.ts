@@ -9,6 +9,8 @@ const plan = (jobId: string) => ch({ put: "plan", plan: { jobId } });
 const attempt = (jobId: string, attemptId: string) => ch({ put: "attempt", attempt: { jobId, attemptId } });
 const observed = (attemptId: string) => ch({ put: "observed", observed: { attemptId } });
 const intent = (attemptId: string) => ch({ put: "intent", intent: { attemptId } });
+const observedB = (attemptId: string, bindingId: string) => ch({ put: "observed", observed: { attemptId, bindingId } });
+const intentB = (attemptId: string, bindingId: string) => ch({ put: "intent", intent: { attemptId, bindingId } });
 const accepted = (jobId: string, attemptId?: string) => ch({ put: "accepted", accepted: { jobId, ...(attemptId ? { attemptId } : {}) } });
 const waitAt = (waitId: string, state: string, jobId = "J") => ch({ put: "wait", wait: { waitId, state, subject: { jobId } } });
 
@@ -56,6 +58,30 @@ describe("subjectProgressSeq (§2c-b subject progress evidence)", () => {
     expect(subjectProgressSeq(batches, { jobId: "J", attemptId: "a2" })).toBe(3); // only a2 (@2 attempt, @3 observed)
     expect(subjectProgressSeq(batches, { jobId: "J" })).toBe(4);                   // job-level counts any attempt
     expect(subjectProgressSeq([batch(5, plan("J"))], { jobId: "J", attemptId: "a1" })).toBe(0); // a plan change is job-level, not a1's own progress
+  });
+});
+
+describe("subjectProgressSeq binding-anchored (bindingId = the MOST specific anchor; review 4c617fa-E1)", () => {
+  test("bindingId set ⇒ ONLY that binding's observed/intent count; a sibling binding of the same attempt does NOT", () => {
+    const batches = [
+      batch(1, attempt("J", "a1")),
+      batch(2, observedB("a1", "b0")),   // sibling binding b0 progresses @2
+      batch(3, observedB("a1", "b1")),   // b1 progresses @3
+      batch(4, intentB("a1", "b0")),     // b0 again @4
+    ];
+    expect(subjectProgressSeq(batches, { jobId: "J", attemptId: "a1", bindingId: "b1" })).toBe(3); // only b1 (@3) — b0's @2/@4 excluded
+    expect(subjectProgressSeq(batches, { jobId: "J", attemptId: "a1", bindingId: "b0" })).toBe(4); // only b0 (@2, @4)
+    expect(subjectProgressSeq(batches, { jobId: "J", attemptId: "a1" })).toBe(4);                  // attempt-level counts any of its bindings' observed/intent
+  });
+
+  test("bindingId WITHOUT attemptId still anchors to the binding — it must NOT degrade to job scope", () => {
+    const batches = [
+      batch(1, plan("J")),                 // job-level @1
+      batch(2, attempt("J", "aX")),        // job-level @2
+      batch(5, observedB("aOther", "b0")), // b0's own progress @5 (on some attempt aOther)
+    ];
+    expect(subjectProgressSeq(batches, { jobId: "J", bindingId: "b0" })).toBe(5);    // only b0 — NOT the job's plan/attempt
+    expect(subjectProgressSeq(batches, { jobId: "J", bindingId: "bNone" })).toBe(0); // a binding with no progress ⇒ 0, never job-level
   });
 });
 

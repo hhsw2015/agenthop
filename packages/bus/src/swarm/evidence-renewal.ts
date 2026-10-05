@@ -7,24 +7,34 @@
  */
 import type { CommittedBatch } from "./control-log.js";
 
-/** What a wait's renewal is anchored to. A wait that supervises ONE attempt (attemptId set — e.g. a BUSINESS_EXEC wait)
- *  must renew ONLY on THAT attempt's progress; a job-level wait (no attemptId) renews on any of the job's progress. */
-export type ProgressSubject = { jobId: string; attemptId?: string };
+/** What a wait's renewal is anchored to — the MOST SPECIFIC field present wins (review 4c617fa-E1). A wait that supervises one
+ *  BINDING (bindingId set) renews ONLY on THAT binding's progress; one that supervises an ATTEMPT (attemptId, no bindingId)
+ *  renews only on that attempt's; a job-level wait (neither) renews on any of the job's progress. A bindingId may be present
+ *  WITHOUT attemptId (WaitSubject allows it) — it must still anchor to the binding, not degrade to job scope. */
+export type ProgressSubject = { jobId: string; attemptId?: string; bindingId?: string };
 
-/** The max control-log seq at which the SUBJECT made PROGRESS. ATTEMPT-ANCHORED (attemptId set): ONLY that attempt's own
+/** The max control-log seq at which the SUBJECT made PROGRESS. BINDING-ANCHORED (bindingId set, MOST specific): ONLY that
+ *  binding's own observed/intent count — a sibling binding of the SAME attempt can NOT renew it, and a bindingId-only subject
+ *  must NOT degrade to job scope (review 4c617fa-E1). ATTEMPT-ANCHORED (attemptId, no bindingId): ONLY that attempt's own
  *  progress counts — its attempt/observed/intent/accepted — so a sibling attempt of the SAME job can NOT renew a wait anchored
- *  to a different attempt (review ab1bf81-P1#1). JOB-LEVEL (no attemptId): a plan/attempt/accepted for the job, or an
+ *  to a different attempt (review ab1bf81-P1#1). JOB-LEVEL (neither): a plan/attempt/accepted for the job, or an
  *  observed/intent on one of the job's attempts. WAIT changes are EXCLUDED entirely (incl renew/action_done/close) so a wait's
  *  own churn never counts as its subject's progress — that would loop renew→"progress"→renew (confirmed with f32a0507). Forward
  *  scan: an attempt is committed before its observed/intent, so the job's attempt set fills in time. 0 ⇒ no progress in the log. */
 export function subjectProgressSeq(batches: readonly CommittedBatch[], subject: ProgressSubject): number {
-  const { jobId, attemptId } = subject;
+  const { jobId, attemptId, bindingId } = subject;
   const jobAttempts = new Set<string>();
   let max = 0;
   for (const batch of batches) {
     let hit = false;
     for (const c of batch.changes) {
-      if (attemptId !== undefined) {
+      if (bindingId !== undefined) {
+        switch (c.put) { // binding-anchored (MOST specific): ONLY this binding's own progress — observed/intent carry bindingId.
+          case "observed": if (c.observed.bindingId === bindingId) hit = true; break; // a sibling binding (b0) of the SAME attempt does NOT renew a wait anchored to b1 (review 4c617fa-E1)
+          case "intent": if (c.intent.bindingId === bindingId) hit = true; break;
+          // attempt/accepted/plan are above a binding — not this binding's own progress; a bindingId-only subject must NOT fall to job scope
+        }
+      } else if (attemptId !== undefined) {
         switch (c.put) { // attempt-anchored: ONLY this attempt's own progress (not plan/job-level, not a sibling attempt)
           case "attempt": if (c.attempt.attemptId === attemptId) hit = true; break;
           case "observed": if (c.observed.attemptId === attemptId) hit = true; break;

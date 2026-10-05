@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { commit, entityKeyOf, initialLogState, liveEntities, type ChangeBody, type LogState, type WaitRecord, type ValidationRun } from "../src/swarm/control-log.js";
-import { openWait, openQueryWait, isLive } from "../src/swarm/task-wait.js";
+import { openWait, openQueryWait, isLive, advanceWait } from "../src/swarm/task-wait.js";
 import { openValidationRun } from "../src/swarm/task-validation.js";
 import { sweepPass, type SweepOps } from "../src/swarm/task-sweep.js";
 
@@ -358,5 +358,49 @@ describe("sweep — expired QUERY wait applies its default + closes (ab1bf81-E2)
     expect(all[0]!.state).toBe("resolved");                      // closed, not re-armed to open
     expect(all[0]!.resolution?.outcome).toBe("default-applied"); // the pre-stored default was applied
     expect(all[0]!.deadlineSec).toBe(1000);                      // NOT bumped to freshDeadlineSec — no re-arm
+  });
+});
+
+describe("sweep — query default is INDEPENDENT of the owner-liveness / disposition chain (review 4c617fa-E2)", () => {
+  const q = (over: { deadlineSec?: number; owner?: string } = {}) =>
+    openQueryWait({ waitId: "q1", subject: { jobId: "job" }, deadlineSec: over.deadlineSec ?? 1000, owner: over.owner ?? "claude:owner",
+      defaultOnTimeout: { outcome: "clarified", reason: "default-reason", sourceOperationId: "op-q" }, payloadRef: "bundle-1" });
+
+  test("E2-A: an EXPIRED query applies its default even with a DEAD owner and NO reassignee (default precedes owner-liveness)", async () => {
+    const stateRef = { s: mkState([q()]) }; // deadline 1000 < nowSec 2000 ⇒ expired
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { isAlive: () => "dead", pickReassignee: () => null })); // dead + no picker used to STRAND it
+    expect(order).toEqual(["commit:wait:action_pending", "doAction:apply-default", "commit:wait:resolved"]); // default, NOT reassign/stuck
+    const all = allWaits(stateRef.s);
+    expect(all).toHaveLength(1);                                  // no reassign ⇒ no second wait
+    expect(all[0]!.state).toBe("resolved");
+    expect(all[0]!.resolution?.outcome).toBe("default-applied");
+    expect(all[0]!.resolution?.occurredAtSec).toBe(2000);        // R5-B: the close carries its true occurrence (the timeout instant)
+  });
+
+  test("E2-B: reassigning a NOT-yet-expired query preserves its default, payloadRef, and ORIGINAL deadline", async () => {
+    const stateRef = { s: mkState([q({ deadlineSec: 3000, owner: "claude:dead" })]) }; // 3000 > nowSec 2000 ⇒ not expired; owner dead ⇒ reassign
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order, { isAlive: () => "dead", pickReassignee: () => "claude:successor" }));
+    expect(order).toEqual(["commit:wait:action_pending", "doAction:reassign", "commit:wait:resolved,wait:open"]);
+    const fresh = allWaits(stateRef.s).find((w) => w.state === "open")!;
+    expect(fresh.owner).toBe("claude:successor");                 // only the decider changed
+    expect(fresh.defaultOnTimeout?.outcome).toBe("clarified");    // the question's default survived the reassign
+    expect(fresh.payloadRef).toBe("bundle-1");                    // the resume payload survived
+    expect(fresh.deadlineSec).toBe(3000);                         // ORIGINAL semantic deadline, NOT freshDeadlineSec (9999)
+  });
+
+  test("E2-C: a STALE pending-bypass on a query applies the default on confirm, never a re-arm", async () => {
+    const begun = advanceWait(q(), { type: "begin_action", pendingAction: { actionId: "stale", actionKind: "bypass", target: "job", expectedSubjectVersion: 0 } });
+    if (!begun.ok) throw new Error(begun.error);
+    const stateRef = { s: mkState([begun.wait]) }; // a query left in action_pending with a bypass by a pre-fix version / crash
+    const order: string[] = [];
+    await sweepPass(mkOps(stateRef, order));
+    expect(order).toEqual(["doAction:bypass", "commit:wait:resolved"]); // fired the stale bypass, but CONFIRMED as a default close
+    const all = allWaits(stateRef.s);
+    expect(all).toHaveLength(1);
+    expect(all[0]!.state).toBe("resolved");
+    expect(all[0]!.resolution?.outcome).toBe("default-applied");  // default applied, NOT re-armed to open
+    expect(all[0]!.deadlineSec).toBe(1000);                       // not bumped to 9999
   });
 });

@@ -1006,9 +1006,10 @@ async function main(): Promise<void> {
       const w = (b as Extract<ChangeBody, { put: "wait" }>).wait;
       if (w.state !== "open" || !isRenewable(w) || w.deadlineSec > now) continue;    // only an EXPIRED open renewable wait (the probe moment)
       if (renewalCount(batches, w.waitId) >= MAX_FREE_RENEWALS) continue;            // §2c-b ③: finite free renewals ⇒ let the sweep escalate
-      // §2c-b evidence is anchored to the wait's FULL subject: if it supervises one attempt, only THAT attempt's progress
-      // renews it — a sibling attempt of the same job must not (review ab1bf81-P1#1).
-      const progressSubject = { jobId: w.subject.jobId, attemptId: w.subject.attemptId };
+      // §2c-b evidence is anchored to the wait's FULL subject, most-specific field first: a binding-anchored wait renews only
+      // on THAT binding's progress (a sibling binding of the same attempt must not, and a bindingId-only subject must not
+      // degrade to job scope — review 4c617fa-E1); an attempt-anchored one only on that attempt's (review ab1bf81-P1#1).
+      const progressSubject = { jobId: w.subject.jobId, attemptId: w.subject.attemptId, bindingId: w.subject.bindingId };
       if (!hasFreshSubjectEvidence(batches, progressSubject, w.waitId)) continue;    // no subject progress since the arm ⇒ let the sweep escalate
       const adv = advanceWait(w, { type: "renew", newDeadlineSec: now + RENEW_WINDOW_SEC, nowSec: now });
       if (!adv.ok) { log(`renew ${w.waitId} rejected by reducer: ${adv.error}`); continue; } // the reducer guard is the authority

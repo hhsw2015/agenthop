@@ -31,7 +31,7 @@
  */
 
 import { liveEntities, type WaitRecord, type PendingAction, type LogState, type ChangeBody, type CommitResult, type ValidationRun } from "./control-log.js";
-import { advanceWait, openWait, applyDefaultOnTimeout } from "./task-wait.js";
+import { advanceWait, openWait, openQueryWait, applyDefaultOnTimeout } from "./task-wait.js";
 import { moveValidatorAction, moveValidatorWithWait } from "./task-rpv.js";
 
 export type Liveness = "alive" | "suspected" | "dead";
@@ -93,6 +93,12 @@ function withTimeout(thunk: () => Promise<boolean>, ms: number): Promise<boolean
 /** PURE-ish decision for an OPEN wait: the PendingAction it needs now, or null (no action / deferred). Mirrors the §0b
  *  rules; target carries the IO destination so the confirm is reconstructable. May log a deferral reason. */
 function decideAction(w: WaitRecord, runs: Map<string, ValidationRun>, live: Liveness, ops: SweepOps): PendingAction | null {
+  // E2-A (review 4c617fa): an EXPIRED query wait (kind=wait + defaultOnTimeout) applies its pre-stored default FIRST — before
+  // the validation/owner-dead branches. Its deadline IS the decision moment; the default needs neither the owner alive nor a
+  // reassignee, so a dead owner (no picker) or a validator check must NOT return ahead of it and strand the query past its
+  // default moment (the default's consumer must never wait on owner health). A non-expired query falls through (no action yet).
+  if (w.kind === "wait" && w.defaultOnTimeout !== undefined && ops.nowSec() >= w.deadlineSec)
+    return { actionId: ops.newActionId(), actionKind: "apply-default", target: subjectTarget(w), expectedSubjectVersion: 0 };
   // RPV validation-wait: a DEAD or ALIVE-but-expired validator ⇒ moveValidator. A single "suspected" never convicts.
   if (w.subject.validationRunId !== undefined) {
     if (live === "suspected") return null;
@@ -116,10 +122,7 @@ function decideAction(w: WaitRecord, runs: Map<string, ValidationRun>, live: Liv
   // for every owner; a truly-dead owner misjudged suspected gets harmless repeated re-arm/ping (at-least-once) until birth
   // collection + a picker enable a real reassign. (An approval ALWAYS escalates, never bypass.)
   if (ops.nowSec() >= w.deadlineSec) { // live is alive|suspected here (dead returned above) — expiry fires for any not-dead owner
-    // A QUERY wait (R3-b: kind=wait + defaultOnTimeout): its deadline IS the decision moment — apply the pre-stored default and
-    // CLOSE, never a bypass ping + re-arm. Treating it as an ordinary bypass kept re-asking forever and starved the consumer
-    // that waits on the default answer (review ab1bf81-P1#2). Must come before the bypass/escalation split.
-    if (w.kind === "wait" && w.defaultOnTimeout !== undefined) return { actionId: ops.newActionId(), actionKind: "apply-default", target: subjectTarget(w), expectedSubjectVersion: 0 };
+    // A query wait was already handled at the TOP (E2-A), so here it is an approval (escalate) or an ordinary bypass wait.
     const isApproval = w.kind === "approval" && (w.decision ?? "pending") === "pending";
     const kind = isApproval || w.timeoutPolicy !== "bypass" ? "escalation" : "bypass";
     return { actionId: ops.newActionId(), actionKind: kind, target: subjectTarget(w), expectedSubjectVersion: 0 };
@@ -132,6 +135,14 @@ function confirmChanges(w: WaitRecord, action: PendingAction, runs: Map<string, 
   switch (action.actionKind) {
     case "bypass":
     case "escalation": {
+      // E2-C (review 4c617fa): a QUERY wait may be left in a STALE pending-bypass by a pre-fix version or a crash/upgrade.
+      // Its deadline decision is ALWAYS "apply the default + CLOSE", never a re-arm (which re-asks forever and starves the
+      // default's consumer). Recognize the query here and apply its default regardless of the stale actionKind.
+      if (w.kind === "wait" && w.defaultOnTimeout !== undefined) {
+        const applied = applyDefaultOnTimeout(w, ops.nowSec());
+        if (!applied.ok) { ops.log(`sweep ${w.waitId}: applyDefaultOnTimeout (stale ${action.actionKind}) rejected: ${applied.error}`); return null; }
+        return [{ put: "wait", wait: applied.wait }];
+      }
       // Re-arm (erratum 94284fc2): the ping/notice ended only THAT action; re-open with a fresh deadline + escalatedAt.
       const done = advanceWait(w, { type: "action_done", newDeadlineSec: ops.freshDeadlineSec(), nowSec: ops.nowSec() });
       if (!done.ok) { ops.log(`sweep ${w.waitId}: action_done rejected: ${done.error}`); return null; }
@@ -141,20 +152,30 @@ function confirmChanges(w: WaitRecord, action: PendingAction, runs: Map<string, 
       // Query-wait deadline reached (R3-b): apply the pre-stored default answer and CLOSE (resolved, outcome=default-applied) —
       // NOT a re-arm, so the consumer waiting on the default stops being starved (review ab1bf81-P1#2). applyDefaultOnTimeout
       // rejects a non-query wait, which decideAction already excludes; close-on-resolved is a no-op, so a late re-fire is safe.
-      const applied = applyDefaultOnTimeout(w);
+      // nowSec stamps resolution.occurredAtSec = the timeout instant (R5-B occurrence), so this close carries its true boundary.
+      const applied = applyDefaultOnTimeout(w, ops.nowSec());
       if (!applied.ok) { ops.log(`sweep ${w.waitId}: applyDefaultOnTimeout rejected: ${applied.error}`); return null; }
       return [{ put: "wait", wait: applied.wait }];
     }
     case "reassign": {
       const closed = advanceWait(w, { type: "close", resolution: { outcome: "owner-dead", reason: `owner ${w.owner} unreachable → ${action.target}`, sourceOperationId: action.actionId } });
       if (!closed.ok) { ops.log(`sweep ${w.waitId}: close(owner-dead) rejected: ${closed.error}`); return null; }
-      // Carry the approval context (what needs deciding) to the successor — the new owner inherits the SAME request; only
-      // the decider changed. Dropping actionRef/paramsDigest/authority/reason would silently strip an approval (report
-      // conditional note). decision resets to pending via openWait (a fresh decider), which is correct.
-      const approvalCtx = w.kind === "approval"
-        ? { actionRef: w.actionRef, paramsDigest: w.paramsDigest, approvalAuthority: w.approvalAuthority, approvalReason: w.approvalReason }
-        : {};
-      const fresh = openWait({ waitId: ops.newWaitId(w.waitId), kind: w.kind, subject: w.subject, deadlineSec: ops.freshDeadlineSec(), owner: action.target, timeoutPolicy: w.timeoutPolicy, ...approvalCtx });
+      // E2-B (review 4c617fa): a QUERY wait (defaultOnTimeout) reassigned before its deadline — only the DECIDER changed, so the
+      // new owner inherits the SAME unanswered question: its default, payloadRef, AND original semantic deadline must all survive.
+      // openWait+freshDeadlineSec would drop the default/payload and reset the deadline to a fresh window — re-opening the
+      // "default lost / deadline reset on reassign" gap. Rebuild it as a query wait keyed to the SAME deadline instead.
+      let fresh: WaitRecord;
+      if (w.kind === "wait" && w.defaultOnTimeout !== undefined) {
+        fresh = openQueryWait({ waitId: ops.newWaitId(w.waitId), subject: w.subject, deadlineSec: w.deadlineSec, owner: action.target, defaultOnTimeout: w.defaultOnTimeout, ...(w.payloadRef !== undefined ? { payloadRef: w.payloadRef } : {}) });
+      } else {
+        // Carry the approval context (what needs deciding) to the successor — the new owner inherits the SAME request; only
+        // the decider changed. Dropping actionRef/paramsDigest/authority/reason would silently strip an approval (report
+        // conditional note). decision resets to pending via openWait (a fresh decider), which is correct.
+        const approvalCtx = w.kind === "approval"
+          ? { actionRef: w.actionRef, paramsDigest: w.paramsDigest, approvalAuthority: w.approvalAuthority, approvalReason: w.approvalReason }
+          : {};
+        fresh = openWait({ waitId: ops.newWaitId(w.waitId), kind: w.kind, subject: w.subject, deadlineSec: ops.freshDeadlineSec(), owner: action.target, timeoutPolicy: w.timeoutPolicy, ...approvalCtx });
+      }
       return [{ put: "wait", wait: closed.wait }, { put: "wait", wait: fresh }];
     }
     case "move-validator": {
