@@ -1,0 +1,44 @@
+{
+  "version": "mtr-2026-10-05b",
+  "source": "docs/swarm/model-tier-rulings.md (user ruling 2026-10-05) + CLIProxyAPIPlus/docs/flagship-coverage.md (AA Intel benchmark snapshot, 2026-10-05)",
+  "benchmark": "AA Intel = Artificial Analysis Intelligence index; higher is stronger. 'same-or-stronger' = aaIntel >= the role's floorAaIntel.",
+  "note": "EXPLICIT ALIAS TABLE (one term, one meaning, machine form): each model lists its EXACT catalog id spellings. Identity is by EXACT equality against an alias (a trailing -<date> suffix is tolerated), NEVER a substring — so claude-opus-5 can never pass as claude-opus-5-5, nor sonnet-5.5-mini inherit sonnet-5.5. Recommended = baseline, not a closed whitelist: a self-selected catalog model that is a benchmarked, same-or-stronger model (aaIntel >= floor) + a {chosen, why, benchmark} record is accepted. Updating this is a user ruling, not a code change.",
+  "reasoningEfforts": ["low", "medium", "high", "xhigh", "max"],
+  "models": [
+    { "id": "opus 5.5", "aliases": ["claude-opus-5-5", "claude-opus-5.5", "mirage/claude-opus-5-5"], "aaIntel": 58 },
+    { "id": "sonnet 5.5", "aliases": ["claude-sonnet-5-5", "claude-sonnet-5.5"], "aaIntel": 56 },
+    { "id": "fable 5.1", "aliases": ["claude-fable-5-1", "claude-fable-5.1", "mirage/claude-fable-5-1"], "aaIntel": 53 },
+    { "id": "gpt 6 astra", "aliases": ["gpt-6-astra"], "aaIntel": 53 },
+    { "id": "gpt 6.1 sol", "aliases": ["gpt-6-1-sol", "gpt-6.1-sol"], "aaIntel": 52 },
+    { "id": "opus 5", "aliases": ["claude-opus-5", "claude-opus-5.0", "mirage/claude-opus-5"], "aaIntel": 51 },
+    { "id": "fable 5", "aliases": ["claude-fable-5", "claude-fable-5.0"], "aaIntel": 50 },
+    { "id": "gpt 6 sol", "aliases": ["gpt-6-sol"], "aaIntel": 48 },
+    { "id": "gpt 5.6 sol", "aliases": ["gpt-5-6-sol", "gpt-5.6-sol"], "aaIntel": 47 },
+    { "id": "grok 4.7", "aliases": ["grok-4-7", "grok-4.7"], "aaIntel": 46 },
+    { "id": "qwen3.8 max", "aliases": ["qwen3.8-max", "qwen3-8-max"], "aaIntel": 45 },
+    { "id": "glm 5.3", "aliases": ["glm-5.3", "glm-5-3"], "aaIntel": 45 },
+    { "id": "grok 4.6", "aliases": ["grok-4-6", "grok-4.6"], "aaIntel": 44 },
+    { "id": "kimi k3", "aliases": ["kimi-k3", "moonshot.kimi-k3"], "aaIntel": 44 },
+    { "id": "gpt 5.6 terra", "aliases": ["gpt-5-6-terra", "gpt-5.6-terra"], "aaIntel": 42 }
+  ],
+  "roles": {
+    "planning": {
+      "semantics": "PLANNER-HEAVY resolution target (draftPlan / expand / plan-revision); reasoning strength first.",
+      "floorAaIntel": 53,
+      "reasoningEffort": "xhigh",
+      "recommended": ["opus 5.5", "fable 5.1", "gpt 6 astra"]
+    },
+    "coding": {
+      "semantics": "work/repair execution; cost/perf band, layered by task tier.",
+      "floorAaIntel": 51,
+      "reasoningEffort": "high",
+      "recommended": ["opus 5.5", "sonnet 5.5", "opus 5", "gpt 6.1 sol"]
+    },
+    "review": {
+      "semantics": "adversarial review / acceptance; prefer a different family from the implementer (cross-family audit).",
+      "floorAaIntel": 53,
+      "reasoningEffort": "xhigh",
+      "recommended": ["gpt 6 astra", "opus 5.5"]
+    }
+  }
+}
