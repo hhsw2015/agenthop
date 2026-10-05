@@ -131,9 +131,16 @@ function providerDestroy(): void {
 // ───────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────── PROVIDER SEAM (GitHub Actions) ───────────────────────────
-// v2 (vm-ssh-brief §v2): a GHA runner runs `tailcat serve ssh`; the address is handed off through the job log. Keyed via
-// the user's published github.com/<user>.keys (zero secret transfer). 6h runner ceiling. The access layer (ssh/ls) is
+// v2 (vm-ssh-brief §v2): a GHA runner runs `tailcat serve ssh`; the address is handed off as an uploaded ARTIFACT (a
+// run's logs are NOT fetchable mid-run — verified: gh --log and the jobs-API log both refuse until the job ends). Keyed
+// via the user's published github.com/<user>.keys (zero secret transfer). 6h runner ceiling. The access layer (ssh/ls) is
 // byte-identical to Railway — only provisioning differs. Backend is caller-chosen, NEVER auto-selected.
+//
+// KNOWN GAP (ruling #R2, coordinator 2026-10-05 — a tailcat capability edge, not an impl gap): tailcat's in-process SSH
+// server does NOT implement SSH agent forwarding (a client's auth-agent request is ignored; the remote SSH_AUTH_SOCK
+// stays unset). So a box cannot clone a private repo via the laptop's forwarded agent. Per this primitive's cut line
+// (cloning / bootstrap is the CALLER's job), a box that must clone injects a short-lived credential via `up --init`
+// (e.g. a narrowly-scoped token), never a long-lived key baked into the box.
 
 export type Backend = "railway" | "gha";
 const WORKFLOW_FILE = "vm-ssh-box.yml";
