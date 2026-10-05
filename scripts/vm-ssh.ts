@@ -32,7 +32,7 @@
 
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { connect as netConnect, createServer, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -720,28 +720,41 @@ export function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
 }
-/** A cross-PROCESS mutex for a box id: the generation check and the meta/address write-or-delete (and reservation) must be
- *  ONE critical section, so a second CLI cannot slip a takeover (down + reuse) between our read and our write. NETWORK
- *  AWAITS STAY OUTSIDE. O_EXCL lock file holding "<pid>.<nonce>": a stale lock is reclaimed ONLY when its holder pid is
- *  provably DEAD (age alone never steals a live holder); the finally releases ONLY our own lock token (so a reclaimer or a
- *  successor's lock is never deleted by us). A live holder we can't reclaim → bounded wait then error (never two sections). */
+/** A cross-PROCESS mutex for a box id — structurally free of the stale-reclaim races, because the owner identity IS the
+ *  NAME of the single file inside the lock DIRECTORY (coordinator #9 structural fix). The mutex is one atomic `mkdirSync`;
+ *  the identity is then published as `<dir>/<pid>.<nonce>`. A competitor that sees the dir with NO identity file yet (an
+ *  in-flight acquisition) treats it as UNKNOWN and waits — an unpublished/empty state is never read as "dead". Reclaim of a
+ *  dead holder unlinks ONLY that holder's SPECIFICALLY-NAMED file, so it can never delete a successor's (differently-named)
+ *  lock; the empty dir is then rmdir'd (which fails harmlessly if a successor already populated it). A live or
+ *  unknown/ambiguous holder is never reclaimed → bounded wait then error (never two critical sections). NETWORK AWAITS STAY
+ *  OUTSIDE. The finally removes ONLY our own named file. */
 function withIdLock<T>(id: string, fn: () => T): T {
   mkdirSync(addrDir(), { recursive: true });
-  const lock = path.join(addrDir(), `${id}.lock`);
+  const dir = path.join(addrDir(), `${id}.lockd`);
   const token = `${process.pid}.${randomBytes(6).toString("hex")}`;
+  const mine = path.join(dir, token);
   const deadline = Date.now() + 5000;
   for (;;) {
-    try { const fd = openSync(lock, "wx", 0o600); writeSync(fd, token); closeSync(fd); break; }
+    try { mkdirSync(dir); writeFileSync(mine, "", { mode: 0o600 }); break; } // won the mutex (atomic mkdir); publish identity
     catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      let holderPid = 0;
-      try { holderPid = Number(readFileSync(lock, "utf8").split(".")[0]); } catch { continue; } // vanished between open and read -> retry
-      if (!pidAlive(holderPid)) { try { rmSync(lock, { force: true }); } catch { /* raced */ } continue; } // dead holder -> reclaim
-      if (Date.now() > deadline) throw new Error(`vm-ssh: timed out acquiring the lock for "${id}" (held by live pid ${holderPid})`);
+      let entries: string[];
+      try { entries = readdirSync(dir); } catch { continue; } // dir vanished mid-check -> retry the mkdir
+      if (entries.length === 1) {
+        const holder = entries[0]!;
+        const holderPid = Number(holder.split(".")[0]);
+        if (Number.isInteger(holderPid) && holderPid > 0 && !pidAlive(holderPid)) { // dead holder -> reclaim by EXACT name
+          try { rmSync(path.join(dir, holder)); } catch { /* already gone */ }
+          try { rmdirSync(dir); } catch { /* a successor populated it, or it is gone -> the loop re-mkdirs */ }
+          continue;
+        }
+      }
+      // in-flight (0 entries), a live holder, or ambiguous (!=1 / unparseable) -> UNKNOWN: wait, NEVER reclaim.
+      if (Date.now() > deadline) throw new Error(`vm-ssh: timed out acquiring the lock for "${id}"`);
       sleepSync(25);
     }
   }
-  try { return fn(); } finally { try { if (readFileSync(lock, "utf8") === token) rmSync(lock, { force: true }); } catch { /* gone or no longer ours */ } }
+  try { return fn(); } finally { try { rmSync(mine, { force: true }); } catch { /* ok */ } try { rmdirSync(dir); } catch { /* a successor is in, or gone */ } }
 }
 
 /** Write meta ONLY if the current record is still THIS generation's — atomic read-check-write across processes, so a late
