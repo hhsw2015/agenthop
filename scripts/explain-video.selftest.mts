@@ -2,7 +2,8 @@
 // voice mapping). No manim/ffmpeg/network — those are IO shells exercised by the real acceptance runs.
 //   packages/bus/node_modules/.bin/tsx scripts/explain-video.selftest.mts
 import {
-  amVoiceEnv, parseScenes, planAlignment, renderWithRetry, selectTier,
+  amVoiceEnv, lengthUnits, parseScenes, planAlignment, renderWithRetry, selectTier,
+  splitSentences, steLint, steSimplify,
   type CpaConfig, type RenderOutcome,
 } from "./explain-video.js";
 
@@ -110,6 +111,35 @@ const t = (name: string, cond: boolean) => {
   const e = amVoiceEnv("eleven", cpa);
   t("eleven -> am local via CPA with eleven model", e.flag === "local" && e.env.AM_TTS_MODEL === "eleven_flash_v2_5" && e.env.AM_TTS_VOICE === "ev");
   t("no api key -> AM_TTS_API_KEY omitted", amVoiceEnv("doubao", { ...cpa, apiKey: "" }).env.AM_TTS_API_KEY === undefined);
+}
+
+// --- controlled-language (ASD-STE100-inspired) narration pass ---
+{
+  // sentence splitting on Latin + CJK terminators
+  t("splits latin sentences", splitSentences("One idea. Two ideas! Three?").length === 3);
+  t("splits cjk sentences", splitSentences("第一句。第二句！第三句？").length === 3);
+  // length units: words for latin, non-space chars for cjk
+  t("latin length = word count", lengthUnits("one two three") === 3);
+  t("cjk length = char count", lengthUnits("第一轮提交") === 5);
+}
+{
+  // lint flags overlong + passive
+  const longLatin = "this one sentence just keeps going and going with far too many separate ideas crammed in so that nobody listening can follow the thread at all really";
+  t("flags an overlong latin sentence", steLint(longLatin).some((w) => w.kind === "too-long"));
+  t("flags passive voice", steLint("the file was created by the job.").some((w) => w.kind === "passive"));
+  t("short active sentence is clean", steLint("The job writes the file.").length === 0);
+  const longCjk = "第一轮提交之后我们发现了很多很多的问题并且这些问题牵涉到好几个不同的模块所以需要分好几轮来逐一修复直到全部归零为止";
+  t("flags an overlong cjk sentence", steLint(longCjk).some((w) => w.kind === "too-long"));
+}
+{
+  // deterministic simplify: break an overlong sentence at clause punctuation into shorter sentences
+  const out = steSimplify("第一轮，提交 bccf629，剩 8 条待修，其中三个是 P1，五个是 P2，都要逐一关闭才能收敛");
+  t("overlong cjk split into multiple sentences", splitSentences(out).length >= 3);
+  t("numbers preserved verbatim through split", out.includes("bccf629") && out.includes("8") && out.includes("P1"));
+  // a short sentence is left alone (idempotent-ish)
+  t("short sentence unchanged in meaning", steSimplify("The job writes the file.").includes("The job writes the file"));
+  // nothing to split on -> left as-is (no clause punctuation)
+  t("no clause punctuation -> unchanged", steSimplify("aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt uuuu").split(".").length <= 2);
 }
 
 console.log("all explain-video selftests passed");

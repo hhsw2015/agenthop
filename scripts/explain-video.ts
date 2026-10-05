@@ -129,6 +129,59 @@ export function planAlignment(scenes: { videoSec: number; audioSec: number }[]):
   return { scenes: out, totalSec: total };
 }
 
+// ---- controlled-language narration (ASD-STE100-inspired) ----------------------------------------
+// Karpathy's writing tip: ask for ASD-STE100 Simplified Technical English (or "80% of it") for clean, readable
+// output. For SPOKEN narration the useful subset is: one idea per sentence, short sentences, active voice,
+// present tense, plain words. The pure core LINTS and can deterministically SPLIT overlong sentences; the
+// optional LLM pass (steRewrite) does the full rewrite when CPA is reachable.
+
+export interface SteLimits { wordMax: number; cjkCharMax: number }
+export const STE_DEFAULT: SteLimits = { wordMax: 20, cjkCharMax: 30 };
+
+const SENT_TERM = /[.。!！?？;；]$/;
+const isCjk = (s: string): boolean => /[一-鿿]/.test(s);
+
+/** Split text into sentences at terminal punctuation (keeps the terminator with its sentence). */
+export function splitSentences(text: string): string[] {
+  return text.split(/(?<=[.。!！?？;；])\s*/).map((s) => s.trim()).filter(Boolean);
+}
+
+/** Length in STE units: words for Latin text, non-space characters for CJK. */
+export function lengthUnits(s: string): number {
+  return isCjk(s) ? [...s].filter((c) => !/\s/.test(c) && !SENT_TERM.test(c)).length : s.split(/\s+/).filter(Boolean).length;
+}
+
+export interface SteWarning { sentence: string; units: number; limit: number; kind: "too-long" | "passive" }
+
+/** Flag sentences that break the controlled-language limits (too long, or passive voice). Pure. */
+export function steLint(text: string, limits: SteLimits = STE_DEFAULT): SteWarning[] {
+  const out: SteWarning[] = [];
+  for (const s of splitSentences(text)) {
+    const limit = isCjk(s) ? limits.cjkCharMax : limits.wordMax;
+    const units = lengthUnits(s);
+    if (units > limit) out.push({ sentence: s, units, limit, kind: "too-long" });
+    if (/\b(?:was|were|is|are|be|been|being)\s+\w+ed\b/i.test(s)) out.push({ sentence: s, units, limit, kind: "passive" });
+  }
+  return out;
+}
+
+const addTerm = (s: string, cjk: boolean): string => (SENT_TERM.test(s) ? s : s + (cjk ? "。" : "."));
+
+/** Deterministic "toward STE" with no LLM: break each overlong sentence at clause punctuation into shorter
+ *  sentences. Technical nouns and numbers are untouched (we only split, never reword). Pure. */
+export function steSimplify(text: string, limits: SteLimits = STE_DEFAULT): string {
+  const pieces: string[] = [];
+  for (const s of splitSentences(text)) {
+    const cjk = isCjk(s);
+    const limit = cjk ? limits.cjkCharMax : limits.wordMax;
+    if (lengthUnits(s) <= limit) { pieces.push(addTerm(s, cjk)); continue; }
+    const clauses = s.replace(SENT_TERM, "").split(/[,，、;；]/).map((p) => p.trim()).filter(Boolean);
+    if (clauses.length < 2) { pieces.push(addTerm(s, cjk)); continue; } // nothing to split on; leave it
+    for (const c of clauses) pieces.push(addTerm(c, cjk));
+  }
+  return pieces.join(" ");
+}
+
 /** Map the contract's --voice to the am-video skill's TTS settings (light tier delegates TTS to am). */
 export function amVoiceEnv(voice: Voice, cpa: CpaConfig): { flag: string; env: Record<string, string> } {
   if (voice === "say") return { flag: "system", env: {} };
@@ -277,20 +330,30 @@ export function nodeBin(): string {
   return "node";
 }
 
-/** Light tier: hand the whole script to the installed `am video` skill with --mp4. Returns the mp4 path. */
-export async function runAmVideo(scriptFile: string, voice: Voice, outMp4: string, cpa: CpaConfig): Promise<string> {
+export type OutFormat = "mp4" | "html" | "both";
+export interface AmResult { mp4?: string; html?: string }
+
+/** Light tier: hand the whole script to the installed `am video` skill. The interactive HTML player page is
+ *  always produced; --mp4 additionally exports a video (needs a browser + Node>=22). `format` picks what to keep:
+ *  html (skip the export, no browser needed), mp4, or both. Returns the kept artifact path(s). */
+export async function runAmVideo(scriptFile: string, voice: Voice, out: string, cpa: CpaConfig, format: OutFormat = "mp4"): Promise<AmResult> {
   const am = path.join(process.env.HOME ?? "", ".claude", "skills", "answer-me-with-html", "scripts", "am.mjs");
   if (!existsSync(am)) throw new Error(`am video skill not found at ${am}`);
   const { flag, env } = amVoiceEnv(voice, cpa);
-  const chrome = chromeBin(); // prefer the installed EGO browser; don't download one
-  if (chrome) env.AM_CHROME = chrome;
-  const { stdout, stderr } = await pexec(nodeBin(), [am, "video", scriptFile, "--no-open", "--mp4", "--voice", flag],
-    { env: { ...process.env, ...env }, maxBuffer: 1 << 24 });
-  const out = stdout + "\n" + stderr;
-  const mp4 = /(\/\S+\.mp4)/.exec(out)?.[1];
-  if (!mp4 || !existsSync(mp4)) throw new Error(`am video did not report an mp4 path. Output:\n${out.slice(-800)}`);
-  if (path.resolve(mp4) !== path.resolve(outMp4)) { mkdirSync(path.dirname(outMp4), { recursive: true }); await pexec("cp", [mp4, outMp4]); }
-  return outMp4;
+  const wantMp4 = format !== "html";
+  if (wantMp4) { const chrome = chromeBin(); if (chrome) env.AM_CHROME = chrome; } // prefer an installed browser; never download
+  const args = [am, "video", scriptFile, "--no-open", "--voice", flag, ...(wantMp4 ? ["--mp4"] : [])];
+  const { stdout, stderr } = await pexec(nodeBin(), args, { env: { ...process.env, ...env }, maxBuffer: 1 << 24 });
+  const text = stdout + "\n" + stderr;
+  const srcHtml = /(\/\S+\.html)/.exec(text)?.[1];
+  const srcMp4 = wantMp4 ? /(\/\S+\.mp4)/.exec(text)?.[1] : undefined;
+  if (wantMp4 && (!srcMp4 || !existsSync(srcMp4))) throw new Error(`am video did not report an mp4 path. Output:\n${text.slice(-800)}`);
+  if (!wantMp4 && (!srcHtml || !existsSync(srcHtml))) throw new Error(`am video did not report an html path. Output:\n${text.slice(-800)}`);
+  const result: AmResult = {};
+  const copyTo = async (src: string, dstExt: string) => { const dst = out.replace(/\.\w+$/, dstExt); if (path.resolve(src) !== path.resolve(dst)) { mkdirSync(path.dirname(dst), { recursive: true }); await pexec("cp", [src, dst]); } return dst; };
+  if (srcMp4 && (format === "mp4" || format === "both")) result.mp4 = await copyTo(srcMp4, ".mp4");
+  if (srcHtml && (format === "html" || format === "both")) result.html = await copyTo(srcHtml, ".html");
+  return result;
 }
 
 // =================================================================================================
@@ -316,7 +379,8 @@ async function heavy(script: string, outMp4: string, voice: Voice, cpa: CpaConfi
       });
       if (!r.ok || !r.video) {
         console.error(`[heavy] scene ${i} failed after ${r.rounds} rounds; downgrading the whole job to light (am video).`);
-        return runAmVideo(writeTmp(work, "downgrade.md", script), voice, outMp4, cpa);
+        const dg = await runAmVideo(writeTmp(work, "downgrade.md", script), voice, outMp4, cpa, "mp4");
+        return dg.mp4 ?? outMp4;
       }
       const narration = sc.narration.join(" ");
       let audio: string | null = null, holdSec = 0;
@@ -366,24 +430,81 @@ async function fixManimViaCpa(code: string, error: string, cpa: CpaConfig): Prom
   return fixed.replace(/^```(?:python)?\s*\n?/, "").replace(/\n?```\s*$/, "");
 }
 
+/** Rewrite narration lines toward ASD-STE100. With CPA + llm:true, a model does the full rewrite; otherwise the
+ *  deterministic steSimplify (split overlong sentences) runs. Best-effort — any failure falls back to steSimplify. */
+export async function steRewrite(lines: string[], cpa: CpaConfig, opts: { llm: boolean; strictness: number }): Promise<string[]> {
+  if (!lines.length) return lines;
+  if (!opts.llm || !cpa.apiKey) return lines.map((l) => steSimplify(l));
+  try {
+    const model = process.env.CPA_STE_MODEL ?? "claude-haiku-4.5";
+    const pct = Math.round(opts.strictness * 100);
+    const sys = `Rewrite each input line toward ASD-STE100 Simplified Technical English at ${pct}% strictness: one idea per sentence, active voice, present tense, short sentences (<=20 words, or <=30 characters for Chinese), plain approved vocabulary. Keep technical nouns, identifiers and NUMBERS exactly. Keep each line in its original language. Return EXACTLY ${lines.length} lines, one rewritten line per input line, in order, no numbering, no commentary.`;
+    const res = await fetch(`${cpa.baseUrl.replace(/\/+$/, "")}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${cpa.apiKey}` },
+      body: JSON.stringify({ model, messages: [{ role: "system", content: sys }, { role: "user", content: lines.join("\n") }] }),
+    });
+    if (!res.ok) throw new Error(`CPA ste ${res.status}`);
+    const j = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+    const got = (j.choices?.[0]?.message?.content ?? "").split("\n").map((l) => l.replace(/^\s*\d+[.)]\s*/, "").trim()).filter(Boolean);
+    if (got.length !== lines.length) throw new Error(`ste: expected ${lines.length} lines, got ${got.length}`);
+    return got;
+  } catch (e) {
+    console.error(`[ste] LLM rewrite unavailable (${(e as Error).message}); using deterministic split.`);
+    return lines.map((l) => steSimplify(l));
+  }
+}
+
+/** Rewrite the `>` narration lines of a script in place (toward STE), leaving everything else untouched. */
+export async function applySte(script: string, cpa: CpaConfig, opts: { llm: boolean; strictness: number }): Promise<string> {
+  const lines = script.replace(/\r\n?/g, "\n").split("\n");
+  const idx: number[] = [];
+  const texts: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^>\s?(.*)$/.exec(lines[i]!);
+    if (m && m[1]!.trim()) { idx.push(i); texts.push(m[1]!.trim()); }
+  }
+  if (!texts.length) return script;
+  const rewritten = await steRewrite(texts, cpa, opts);
+  idx.forEach((lineNo, k) => { lines[lineNo] = `> ${rewritten[k]}`; });
+  return lines.join("\n");
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const pos = argv.filter((a) => !a.startsWith("--"));
   const opt = (n: string, d?: string) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1]! : d; };
   const scriptFile = pos[0];
-  if (!scriptFile) { console.error("usage: explain-video.ts <script.md> [--voice doubao|eleven|say|off] [--out <file.mp4>] [--tier auto|light|heavy] [--keep]"); process.exit(2); }
+  if (!scriptFile) { console.error("usage: explain-video.ts <script.md> [--voice doubao|eleven|say|off] [--out <file>] [--tier auto|light|heavy] [--format mp4|html|both] [--ste[=0.8]] [--ste-llm] [--keep]"); process.exit(2); }
   if (!existsSync(scriptFile)) { console.error(`no such script: ${scriptFile}`); process.exit(2); }
-  const script = readFileSync(scriptFile, "utf8");
+  let script = readFileSync(scriptFile, "utf8");
   const voice = (opt("--voice", "doubao") as Voice);
   const tierOpt = opt("--tier", "auto")!;
   const tier: Tier = tierOpt === "auto" ? selectTier(script) : (tierOpt as Tier);
+  const format = (opt("--format", "mp4") as OutFormat);
   const out = path.resolve(opt("--out", path.join(process.cwd(), `${path.basename(scriptFile).replace(/\.\w+$/, "")}.mp4`))!);
   const cpa = cpaFromEnv();
   const keep = argv.includes("--keep");
 
-  console.error(`[explain-video] tier=${tier} voice=${voice} -> ${out}`);
-  const mp4 = tier === "light" ? await runAmVideo(scriptFile, voice, out, cpa) : await heavy(script, out, voice, cpa, keep);
-  console.log(mp4);
+  // Controlled-language narration pass (ASD-STE100-inspired). --ste[=strictness] on; --ste-llm uses a CPA model,
+  // otherwise a deterministic split. Lint always surfaces what is still over the limit.
+  let lightScriptFile = scriptFile;
+  const steArg = argv.find((a) => a === "--ste" || a.startsWith("--ste="));
+  if (steArg) {
+    const strictness = steArg.includes("=") ? Math.max(0, Math.min(1, Number(steArg.split("=")[1]))) : 0.8;
+    script = await applySte(script, cpa, { llm: argv.includes("--ste-llm"), strictness });
+    const left = steLint(script.split("\n").filter((l) => l.startsWith(">")).join(" "));
+    console.error(`[ste] narration rewritten (strictness ${strictness}${argv.includes("--ste-llm") ? ", llm" : ", deterministic"}); ${left.length} sentence(s) still over limit`);
+    if (tier === "light") { lightScriptFile = out.replace(/\.\w+$/, ".ste.md"); writeFileSync(lightScriptFile, script); } // am reads a file
+  }
+
+  console.error(`[explain-video] tier=${tier} voice=${voice} format=${format} -> ${out}`);
+  if (tier === "heavy" && format !== "mp4") console.error(`[explain-video] note: heavy (manim) tier produces mp4 only; --format ${format} -> mp4.`);
+
+  const result: AmResult = tier === "light"
+    ? await runAmVideo(lightScriptFile, voice, out, cpa, format)
+    : { mp4: await heavy(script, out, voice, cpa, keep) };
+  for (const p of [result.mp4, result.html].filter(Boolean)) console.log(p);
 }
 
 // Guard so the pure core can be imported by the selftest without running (msglog P1 lesson).
