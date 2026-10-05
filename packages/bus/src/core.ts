@@ -9,7 +9,7 @@ import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn } from "./bus-identity.js";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox } from "./inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
 import { fallbackForUnresolved, fallbackForMissedDelivery } from "./send-fallback.js";
 import { resolveSession, listSessions } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
@@ -303,6 +303,19 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const flushTimer = setInterval(() => void flushInbox(), 5000);
   flushTimer.unref?.();
 
+  // Recipient fs-watch (B2/B3 option b): a sender now writes same-machine messages straight to our durable inbox, so watch our
+  // inbox dir(s) and flush the MOMENT one lands — near-live surfacing instead of waiting out the 5s timer, which stays the floor.
+  // Debounced so a burst of writes coalesces into one flush. Watches the CURRENT inbox keys at startup; a Codex node that adopts
+  // its stableId later still surfaces via the timer until then (durable is the guarantee, the watch is only the accelerator).
+  // S18 seam ("message is a pointer, file is authoritative"): a pre-seal flush would hook in here, before flushInbox.
+  let watchDebounce: ReturnType<typeof setTimeout> | undefined;
+  const onInboxChange = (): void => {
+    if (watchDebounce) return; // coalesce a burst of arrivals into a single flush
+    watchDebounce = setTimeout(() => { watchDebounce = undefined; void flushInbox(); }, 50);
+    watchDebounce.unref?.();
+  };
+  const stopInboxWatch = watchInbox(home, inboxKeys(), onInboxChange);
+
   // bus-reachability §4: announce this (re)started node to the coordinator's durable inbox so the coordinator learns of
   // the session without relying on a prompt the LLM must remember to send. Gated on SWARM_COORDINATOR, never to self,
   // fail-soft. A Claude node has its stableId at startup; a Codex node that learns its thread id later gets its durable
@@ -404,6 +417,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     },
     async close() {
       clearInterval(flushTimer);
+      stopInboxWatch();
       stopStatusWatch();
       codexDaemon?.close();
       await local.close();

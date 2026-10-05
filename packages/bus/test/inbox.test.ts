@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, validInboxMsg, quarantineInbox } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, quarantineInbox } from "../src/inbox.js";
 
 let HOME: string;
 beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-inbox-")); });
@@ -68,6 +68,17 @@ describe("durable inbox", () => {
     claimInbox(HOME, ["s1"], String(process.pid)); // claimed by us (alive)
     recoverStaleClaims(HOME, ["s1"]); // must NOT steal it
     expect(claimInbox(HOME, ["s1"], "p2").length).toBe(0);
+  });
+
+  test("watchInbox fires onChange when a message lands in a watched inbox dir (near-live surfacing, B2/B3)", async () => {
+    let fired = 0;
+    const stop = watchInbox(HOME, ["s1"], () => { fired++; });
+    try {
+      await new Promise((r) => setTimeout(r, 40));            // let the watcher attach to the (mkdir'd) dir
+      writeInbox(HOME, "s1", msg("ping", 1000));
+      for (let i = 0; i < 50 && fired === 0; i++) await new Promise((r) => setTimeout(r, 20)); // fs.watch is async/platform-timed
+      expect(fired).toBeGreaterThan(0);                       // the write triggered the watch (the accelerator path)
+    } finally { stop(); }
   });
 
   test("B8/F32: writeInbox REJECTS an invalid record at the write boundary — never publishes a file the receiver can only quarantine", () => {

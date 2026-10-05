@@ -9,7 +9,7 @@
  * Concurrency: a drainer CLAIMS a message by atomically renaming its file, delivers, then ACKs (removes) on success or
  * RELEASES (renames back) on failure — so the retry timer and an explicit recv never deliver the same message twice.
  */
-import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 
@@ -97,6 +97,26 @@ function sanitize(key: string): string {
 }
 function inboxDir(home: string, key: string): string {
   return path.join(home, ".agenthop", "inbox", sanitize(key));
+}
+
+/** Watch this session's inbox dir(s) so a durably-written message surfaces NEAR-LIVE (B2/B3 option b): a sender writes to our
+ *  inbox, our watch fires, the caller flushes — instead of waiting for the periodic flush timer. Best-effort accelerator ONLY:
+ *  the timer remains the delivery floor, so a missed or platform-unsupported watch event just delays surfacing, never drops (the
+ *  durable copy is the guarantee). mkdir each dir first so the watch has a target; { persistent: false } so a watcher never by
+ *  itself keeps the process alive. Returns a stop fn that closes every watcher. */
+export function watchInbox(home: string, keys: string[], onChange: () => void): () => void {
+  const watchers: FSWatcher[] = [];
+  const seen = new Set<string>();
+  for (const key of keys) {
+    const dir = inboxDir(home, key);
+    if (seen.has(dir)) continue; // the stableId + per-run id can map to the same sanitized dir
+    seen.add(dir);
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      watchers.push(watch(dir, { persistent: false }, () => onChange()));
+    } catch { /* best-effort: the periodic flush is the floor */ }
+  }
+  return () => { for (const w of watchers) { try { w.close(); } catch { /* already closed */ } } };
 }
 
 /** Append a message to the durable inbox for `key` (atomic temp+rename, 0600). VALIDATES at the WRITE boundary (F32/B8):
