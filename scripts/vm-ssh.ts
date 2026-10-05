@@ -140,7 +140,10 @@ function providerDestroy(): void {
 // server does NOT implement SSH agent forwarding (a client's auth-agent request is ignored; the remote SSH_AUTH_SOCK
 // stays unset). So a box cannot clone a private repo via the laptop's forwarded agent. Per this primitive's cut line
 // (cloning / bootstrap is the CALLER's job), a box that must clone injects a short-lived credential via `up --init`
-// (e.g. a narrowly-scoped token), never a long-lived key baked into the box.
+// (e.g. a narrowly-scoped token), never a long-lived key baked into the box. NOTE: the --init script is sent to gh over
+// STDIN (not argv — no `ps`/error leak), but it becomes a workflow_dispatch INPUT recorded in the run and readable by
+// anyone with repo read. For a REAL secret use GitHub Actions secrets (`gh secret set`) referenced in the workflow, not
+// --init; keep --init for a short-lived, low-blast-radius token.
 
 export type Backend = "railway" | "gha";
 const WORKFLOW_FILE = "vm-ssh-box.yml";
@@ -149,9 +152,16 @@ const WORKFLOW_FILE = "vm-ssh-box.yml";
  *  as single-quoted lines so GitHub `${{ }}` and bash `${}`/`$()` are all literal (no JS template interpolation). */
 export const WORKFLOW_YAML = [
   "name: vm-ssh-box",
+  // run-name carries vm-ssh's correlation nonce so the CLI can identify THIS dispatch by displayTitle — a dispatch
+  // returns no run id, and a timestamp filter cannot prove ownership (a newer foreign run, or a same-second older one).
+  "run-name: vm-ssh-box ${{ inputs.run_tag }}",
   "on:",
   "  workflow_dispatch:",
   "    inputs:",
+  "      run_tag:",
+  "        description: correlation nonce set by vm-ssh to identify this dispatch (do not set by hand)",
+  "        type: string",
+  '        default: ""',
   "      os:",
   "        description: runner OS",
   "        type: choice",
@@ -236,13 +246,10 @@ export const WORKFLOW_YAML = [
 ].join("\n") + "\n";
 
 // --- pure helpers (selftest covers these; no network) ---
-/** Extract VMSSH_ADDR=tc... from anywhere in a gh-run log (lines are timestamp/step-prefixed, so match substring). */
-export function parseLogAddr(log: string): string | undefined {
-  const m = log.match(/VMSSH_ADDR=(tc[A-Za-z0-9_-]{100,220})/);
-  return m ? m[1] : undefined;
-}
 const OS_MAP: Record<string, string> = { ubuntu: "ubuntu-latest", macos: "macos-latest", windows: "windows-latest", "ubuntu-latest": "ubuntu-latest", "macos-latest": "macos-latest", "windows-latest": "windows-latest" };
-export function normalizeOs(os: string): string { const n = OS_MAP[os]; if (!n) throw new Error(`--os must be ubuntu|macos|windows (got "${os}")`); return n; }
+// Object.hasOwn so a prototype key ("constructor", "__proto__", "toString") can't resolve to a truthy Function and slip
+// past validation (then crash a later os.startsWith) — reject anything not an own key.
+export function normalizeOs(os: string): string { if (!Object.hasOwn(OS_MAP, os)) throw new Error(`--os must be ubuntu|macos|windows (got "${os}")`); return OS_MAP[os]!; }
 /** GH-hosted runner's unix user (CONFIRM on a real run; ubuntu/macos = runner, windows = runneradmin). */
 const sshUserForOs = (os: string): string => (os.startsWith("windows") ? "runneradmin" : "runner");
 /** v2 discipline: a PUBLIC repo forbids --open (Actions logs are world-readable; in open mode the address is the sole key). */
@@ -252,27 +259,45 @@ export function openRefusedOnPublic(mode: Mode, visibility: string): boolean { r
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 async function gh(a: string[]): Promise<void> { await execFileP("gh", a, { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 }); }
 async function ghCapture(a: string[]): Promise<string> { return (await execFileP("gh", a, { timeout: 120_000, maxBuffer: 64 * 1024 * 1024 })).stdout.toString(); }
+/** Run gh feeding `stdin` on its standard input — for data that must NOT appear in argv (ps) or in an error message: the
+ *  only thing surfaced on failure is gh's OWN stderr (field-name validation, never the input values). Used for workflow
+ *  inputs (a user_script may carry a caller's short-lived credential). */
+function ghStdin(a: string[], stdin: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("gh", a, { stdio: ["pipe", "ignore", "pipe"] });
+    let err = "";
+    child.stderr.on("data", (d: Buffer) => { err += d.toString(); });
+    child.on("error", reject);
+    child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`gh ${a.slice(0, 2).join(" ")} failed (${code}): ${err.trim().slice(0, 500)}`))));
+    child.stdin.write(stdin);
+    child.stdin.end();
+  });
+}
 async function ghaResolveUser(): Promise<string> { return (await execFileP("gh", ["api", "user", "-q", ".login"], { timeout: 30_000 })).stdout.toString().trim(); }
 async function ghaResolveRepo(override?: string): Promise<{ nameWithOwner: string; visibility: string }> {
   const a = ["repo", "view", ...(override ? [override] : []), "--json", "nameWithOwner,visibility"];
   return JSON.parse(await ghCapture(a)) as { nameWithOwner: string; visibility: string };
 }
 
-type GhaInputs = { os: string; ttlMin: number; auth: "keys" | "none"; githubUser: string; userScript: string };
+type GhaInputs = { os: string; ttlMin: number; auth: "keys" | "none"; githubUser: string; userScript: string; runTag: string };
 async function ghaDispatch(repo: string, i: GhaInputs): Promise<void> {
-  await gh(["workflow", "run", WORKFLOW_FILE, "-R", repo, "-f", `os=${i.os}`, "-f", `ttl_minutes=${i.ttlMin}`, "-f", `auth=${i.auth}`, "-f", `github_user=${i.githubUser}`, "-f", `user_script=${i.userScript}`]);
+  // All inputs via STDIN (not argv): user_script may carry a caller credential (known-gap path). run_tag lets us identify
+  // the run by displayTitle (a dispatch returns no id).
+  const inputs = { run_tag: i.runTag, os: i.os, ttl_minutes: String(i.ttlMin), auth: i.auth, github_user: i.githubUser, user_script: i.userScript };
+  await ghStdin(["workflow", "run", WORKFLOW_FILE, "-R", repo, "--json"], JSON.stringify(inputs));
 }
 
-/** Lock the run WE just dispatched: `workflow run` returns no id, so pick the newest run created at/after our pre-dispatch
- *  timestamp (guards against grabbing an older run — vm-ssh-brief/IMPLEMENTATION §5). */
-async function ghaLockRunId(repo: string, sinceIso: string): Promise<string> {
+/** Lock the run WE just dispatched by its correlation NONCE (run_tag → run-name → displayTitle). A dispatch returns no id,
+ *  and a timestamp filter cannot prove ownership (reviewer: a newer foreign run is picked; a same-second older run passes a
+ *  lexical `>=` because a no-fraction "…00Z" sorts after "…00.500Z"). The nonce is exact and collision-free. */
+async function ghaLockRunId(repo: string, runTag: string): Promise<string> {
   for (let i = 0; i < 20; i++) {
-    const runs = JSON.parse(await ghCapture(["run", "list", "-R", repo, "--workflow", WORKFLOW_FILE, "-L", "20", "--json", "databaseId,createdAt,status"])) as { databaseId: number; createdAt: string; status: string }[];
-    const fresh = runs.filter((r) => r.createdAt >= sinceIso).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    if (fresh.length > 0) return String(fresh[0]!.databaseId);
+    const runs = JSON.parse(await ghCapture(["run", "list", "-R", repo, "--workflow", WORKFLOW_FILE, "-L", "30", "--json", "databaseId,displayTitle"])) as { databaseId: number; displayTitle: string }[];
+    const mine = runs.find((r) => r.displayTitle.includes(runTag));
+    if (mine) return String(mine.databaseId);
     await sleep(1500);
   }
-  throw new Error("vm-ssh up --backend gha: the dispatched run did not appear in `gh run list` within 30s");
+  throw new Error(`vm-ssh up --backend gha: the dispatched run (tag ${runTag}) did not appear in \`gh run list\` within 30s`);
 }
 
 /** Address handoff via ARTIFACT (Phase-2 verified): a run's logs are NOT fetchable while it is in progress — both
@@ -319,13 +344,15 @@ async function cmdUpGha(id: string, mode: Mode, initScript: string | undefined, 
   if (openRefusedOnPublic(mode, repo.visibility)) throw new Error(`vm-ssh up --backend gha --open REFUSED: ${repo.nameWithOwner} is ${repo.visibility} — Actions logs are world-readable and in --open mode the tailcat address IS the sole credential. Drop --open (keyed), or use a private repo.`);
   const githubUser = args.val("--user") ?? (await ghaResolveUser());
   if (mode === "keyed") await ghaPreflightKeys(githubUser);
-  const sinceIso = new Date().toISOString();
-  await ghaDispatch(repo.nameWithOwner, { os, ttlMin, auth: mode === "open" ? "none" : "keys", githubUser, userScript: initScript ?? "" });
-  const runId = await ghaLockRunId(repo.nameWithOwner, sinceIso);
-  const addr = await ghaCaptureAddr(repo.nameWithOwner, runId);
-  if (!addr) throw new Error(`vm-ssh up --backend gha: no address captured within ~90s (run ${runId}). Inspect: gh run view ${runId} -R ${repo.nameWithOwner} --log`);
-  writeAddr(id, addr);
+  const runTag = `vmssh-${randomBytes(6).toString("hex")}`;
+  await ghaDispatch(repo.nameWithOwner, { os, ttlMin, auth: mode === "open" ? "none" : "keys", githubUser, userScript: initScript ?? "", runTag });
+  const runId = await ghaLockRunId(repo.nameWithOwner, runTag);
+  // Persist the handle NOW (before capture): a dispatched run is billable and running — a capture timeout must NOT orphan
+  // it. With meta recorded, `vm-ssh down`/`refresh`/`ls` can manage it even if the address never arrives.
   writeMeta({ id, mode, backend: "gha", createdSec: Math.floor(Date.now() / 1000), addrFile: addrPath(id), repo: repo.nameWithOwner, runId, os, githubUser, ttlMin, sshUser: sshUserForOs(os) });
+  const addr = await ghaCaptureAddr(repo.nameWithOwner, runId);
+  if (!addr) throw new Error(`vm-ssh up --backend gha: dispatched run ${runId} but no address captured within ~150s. The box is RECORDED (id "${id}") and may still be coming up — retry: vm-ssh refresh ${id}; or stop it: vm-ssh down ${id}.`);
+  writeAddr(id, addr);
   process.stdout.write(`${JSON.stringify({ id, addrFile: addrPath(id), mode, backend: "gha", runId, os, ttlMin })}\n`);
 }
 
@@ -718,12 +745,16 @@ async function cmdUp(args: Args): Promise<void> {
 async function cmdSsh(args: Args): Promise<void> {
   const rest = args.rest(); // [id?] before a `--`
   const id = resolveId(rest[0]);
+  const m = readMeta(id);
   const addr = readAddr(id);
-  if (!addr) { prune(id); throw new Error(`no address for "${id}" (box gone or not captured) — try: vm-ssh refresh ${id}`); }
+  if (!addr) {
+    // a gha box with a run id but no address yet is recoverable (capture timed out, box may be alive) — do NOT prune it.
+    if (m && backendOf(m) === "gha" && m.runId) throw new Error(`no address for "${id}" yet — run ${m.runId} may still be coming up; try: vm-ssh refresh ${id} (or vm-ssh down ${id} to stop it)`);
+    prune(id); throw new Error(`no address for "${id}" (box gone or not captured) — try: vm-ssh refresh ${id}`);
+  }
   const remoteCmd = args.afterDashDash();
   // gha boxes serve as the runner's unix user (recorded sshUser); railway boxes take tailcat's default user.
-  const sshUser = readMeta(id)?.sshUser;
-  const target = sshUser ? `${sshUser}@${addr}` : addr;
+  const target = m?.sshUser ? `${m.sshUser}@${addr}` : addr;
   // spawn (not execFile) with inherited stdio: an interactive shell / streamed remote-command output must pass through,
   // and the address goes only to tailcat's argv (its documented interface), never to our stdout/log.
   const child = spawn("tailcat", ["ssh", target, ...remoteCmd], { stdio: "inherit" });
@@ -829,15 +860,14 @@ function selftest(): void {
   console.assert(fr?.payload.toString() === "hello ws tunnel", "ws frame masks + round-trips");
   providerDestroy();
   // --- v2 gha backend (pure helpers; no network) ---
-  console.assert(parseLogAddr(`2026-10-05T00:00:00.0Z\tbox\tVMSSH_ADDR=${A} more log`) === A, "parseLogAddr extracts the address from a gh-log line");
-  console.assert(parseLogAddr("2026\tbox\tno address here") === undefined, "parseLogAddr returns undefined when absent");
   console.assert(normalizeOs("ubuntu") === "ubuntu-latest" && normalizeOs("macos-latest") === "macos-latest", "normalizeOs maps short + full forms");
   let osThrew = false; try { normalizeOs("plan9"); } catch { osThrew = true; } console.assert(osThrew, "normalizeOs rejects an unknown os");
+  let protoThrew = false; try { normalizeOs("constructor"); } catch { protoThrew = true; } console.assert(protoThrew, "normalizeOs rejects a prototype key (constructor/__proto__/toString), never returns a Function");
   console.assert(sshUserForOs("ubuntu-latest") === "runner" && sshUserForOs("windows-latest") === "runneradmin", "sshUserForOs picks the runner unix user");
   console.assert(openRefusedOnPublic("open", "PUBLIC") && !openRefusedOnPublic("open", "PRIVATE") && !openRefusedOnPublic("keyed", "PUBLIC"), "public repo forbids --open only (keyed ok, private ok)");
   console.assert(backendOf({ id: "x", mode: "keyed", createdSec: 0, addrFile: "" }) === "railway", "backendOf defaults a pre-v2 record to railway");
   console.assert(ttlSec({ id: "x", mode: "keyed", backend: "gha", ttlMin: 120, createdSec: 0, addrFile: "" }) === 7200, "gha ttlSec honors ttlMin");
-  console.assert(WORKFLOW_YAML.includes("workflow_dispatch") && WORKFLOW_YAML.includes("--ssh-authorized-keys=${GITHUB_USER}@github") && WORKFLOW_YAML.includes("VMSSH_ADDR=") && WORKFLOW_YAML.includes("/tmp/ghostish.stop") && WORKFLOW_YAML.includes("contents: read"), "workflow yaml: dispatch inputs + keyed key-fetch + addr marker + sentinel + least-privilege");
+  console.assert(WORKFLOW_YAML.includes("workflow_dispatch") && WORKFLOW_YAML.includes("--ssh-authorized-keys=${GITHUB_USER}@github") && WORKFLOW_YAML.includes("VMSSH_ADDR=") && WORKFLOW_YAML.includes("/tmp/ghostish.stop") && WORKFLOW_YAML.includes("contents: read") && WORKFLOW_YAML.includes("run-name:") && WORKFLOW_YAML.includes("run_tag"), "workflow yaml: dispatch inputs + keyed key-fetch + addr marker + sentinel + least-privilege + run_tag nonce");
   process.stdout.write("vm-ssh selftest: all assertions passed\n");
 }
 
