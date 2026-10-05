@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { draftPlan, type CallModel } from "../src/swarm/plan-draft.js";
 import { translateDraft, type FrozenContext } from "../src/swarm/task-translate.js";
 import { loadPlan, type FrozenRefs } from "../src/swarm/task-plan.js";
-import { resolvePlannerModel, type ModelSelection } from "../src/swarm/model-tier.js";
+import { resolvePlannerModel, servedMatchesChosen, type ModelSelection } from "../src/swarm/model-tier.js";
 import { reconcile, type ReqBaseline } from "./coverage-audit.js";
 
 /** The CPA API base is NOT hardcoded (it may move to a cloud URL): env CPA_BASE_URL first, then ~/.agenthop/cpa.json's
@@ -49,7 +49,7 @@ function reasoningBody(model: string, effort?: string): Record<string, unknown> 
   if (/(^|\/)claude/i.test(model)) return { thinking: { type: "adaptive" }, output_config: { effort } }; // Claude adaptive path (no temperature)
   return { temperature: 0, reasoning_effort: effort };
 }
-function makeCallModel(model: string, reasoningEffort?: string): CallModel {
+function makeCallModel(model: string, reasoningEffort?: string, onServed?: (served: string) => void): CallModel {
   return async ({ system, user }) => {
     const res = await fetch(`${BASE}/chat/completions`, {
       method: "POST",
@@ -57,7 +57,11 @@ function makeCallModel(model: string, reasoningEffort?: string): CallModel {
       body: JSON.stringify({ model, ...reasoningBody(model, reasoningEffort), messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
     });
     if (!res.ok) throw new Error(`CPA ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const json = (await res.json()) as { model?: string; choices?: Array<{ message?: { content?: string } }> };
+    // Runtime fail-closed: the backend must answer with the model we chose (a flagged model can silently downgrade).
+    const served = json.model;
+    if (typeof served !== "string" || !servedMatchesChosen(model, served)) throw new Error(`served model "${String(served)}" != chosen "${model}" — silent downgrade, fail-closed`);
+    onServed?.(served);
     const content = json.choices?.[0]?.message?.content;
     if (typeof content !== "string") throw new Error(`CPA returned no message content: ${JSON.stringify(json).slice(0, 300)}`);
     return content;
@@ -116,11 +120,13 @@ async function main(): Promise<void> {
   if (!sel.ok) { console.error(`[A1] planner-model resolution FAILED (fail-closed): ${sel.reason}`); process.exit(6); }
   const selection: ModelSelection = sel.selection;
   console.log(`[A1] CPA ${BASE} | planner model=${sel.model} | reasoning_effort=${selection.reasoningEffort ?? "(default)"} | selection=${JSON.stringify(selection)}`);
-  const callModel = makeCallModel(sel.model, selection.reasoningEffort);
+  let servedModel: string | undefined;
+  const callModel = makeCallModel(sel.model, selection.reasoningEffort, (s) => { servedModel = s; });
   const rescore = process.env.A1_RESCORE !== "0"; // the second (complexity) model call; set A1_RESCORE=0 for a single call
   const dr = await draftPlan({ prd: PRD, jobId: "live-job-1", allowedChecks: Object.keys(fc.checkRegistry.checks), rescore }, { callModel });
   if (!dr.ok) { console.error(`[A1] draftPlan REJECTED: ${dr.reason}`); process.exit(2); }
-  console.log(`[A1] draftPlan ok: ${dr.draft.tasks.length} task(s), planningRequestId=${dr.planningRequestId.slice(0, 8)}…`);
+  selection.served = servedModel; // runtime fail-closed verified in callModel; record the served model (quadruple)
+  console.log(`[A1] draftPlan ok: ${dr.draft.tasks.length} task(s), served=${servedModel} (chosen=${sel.model}), planningRequestId=${dr.planningRequestId.slice(0, 8)}…`);
 
   const tr = translateDraft(dr.draft, { ...fc, planningRequestId: dr.planningRequestId });
   console.log(`[A1] translateDraft -> ${tr.outcome}`);

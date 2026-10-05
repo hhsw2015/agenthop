@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { loadModelTierTable, normalizeModelName, resolveToCatalogId, aaIntelOf, resolveRoleModel, resolvePlannerModel } from "../src/swarm/model-tier.js";
+import { loadModelTierTable, normalizeModelName, resolveToCatalogId, aaIntelOf, resolveRoleModel, resolvePlannerModel, servedMatchesChosen } from "../src/swarm/model-tier.js";
 
 // heavy-tier-binding (coordinator dispatch 2026-10-05): fail-closed resolution of a role tier to a catalog model, with a
 // data-driven same-or-stronger (AA Intel) check and a {chosen, why, benchmark} selection record.
@@ -82,6 +82,18 @@ describe("self-selection (same-or-stronger + triple)", () => {
     const r = resolvePlannerModel({ catalog: CATALOG, chosen: "mystery-model-9000", why: "trust me" });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toMatch(/no AA Intel benchmark/);
+  });
+});
+
+describe("servedMatchesChosen (runtime fail-closed: claimed == served)", () => {
+  test("exact + version-suffix served match the chosen", () => {
+    expect(servedMatchesChosen("claude-opus-5.5", "claude-opus-5.5")).toBe(true);
+    expect(servedMatchesChosen("claude-opus-5.5", "claude-opus-5-5-20261001")).toBe(true);
+  });
+  test("a different (downgraded) served model is rejected", () => {
+    expect(servedMatchesChosen("claude-opus-5-5", "claude-opus-4-5")).toBe(false); // flagged silent downgrade
+    expect(servedMatchesChosen("claude-opus-5-5", "gpt-6-astra")).toBe(false);
+    expect(servedMatchesChosen("claude-opus-5-5", "")).toBe(false);
   });
 });
 

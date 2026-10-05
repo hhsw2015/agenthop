@@ -5,7 +5,8 @@
     "model": "claude-opus-5.5",
     "why": "recommended baseline (strongest available in catalog)",
     "benchmark": "AA Intel 58 >= floor 53 (mtr-2026-10-05)",
-    "reasoningEffort": "xhigh"
+    "reasoningEffort": "xhigh",
+    "served": "claude-opus-5-5"
   },
   "prd": "Build a pure \"plan metrics\" module for the swarm brain. Requirements (tag each task's goal with the IDs it addresses):\n[I1] a function nodeCount(plan) returning the number of nodes — verified by tests.\n[I2] a function totalComplexity(plan) summing node complexity — verified by tests.\n[I3] a function hasDesignGate(plan) returning whether a design node exists — verified by tests.\n[I4] a function summary(plan) returning a stable one-line string — verified by tests.\n[I5] the module must typecheck.\nPut the module under packages/bus/src/swarm/ and the tests under packages/bus/test/.\nProduce ONE separate task per requirement I1..I5, and put that requirement's exact marker (e.g. [I1]) in that task's goal text.\nEach of those five tasks must list \"testsPass\" in its structuredChecks (I5 also \"typecheckPasses\"); requiredOutputs kind MUST be\n\"files\" or \"report\" (NOT \"patch\"); keep tasks independent (no dependsOn) where possible.\nAlso include ONE dedicated task whose sourceWriteScope is [\"packages/bus/test/\"] that writes the unit tests (tag it [TESTS]);\nthis task must ALSO list \"testsPass\" in its structuredChecks (every task needs at least one structuredCheck).\nUse ONLY the checks \"testsPass\" and \"typecheckPasses\" (do NOT use fileExists).",
   "rawDraft": {
@@ -399,12 +400,12 @@
       "budgetPolicy": "bp-live-1",
       "r4ThresholdPolicy": "tp-live-1",
       "sourceBaselineDigest": "live-base",
-      "planningRequestId": "765507fb-895d-4cfe-8015-031678866329"
+      "planningRequestId": "919f32ad-56df-4751-934c-4e562c74cc9c"
     },
     "notImplemented": [
       "r4-threshold"
     ],
-    "planDigest": "8bf0702755a43d019e4edf2e240ee1861ee3d4214da08ee4f04ae3a2b05ab440"
+    "planDigest": "92ef21df7fb9ae7a830c5188e7253e6ce3c6bfac386f9e42359bd54632f9709d"
   },
   "fBaseline": [
     {

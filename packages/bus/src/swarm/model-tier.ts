@@ -25,9 +25,19 @@ export type ModelTierTable = {
   benchmarkScores: Array<{ name: string; aaIntel: number }>;
 };
 
-/** The {chosen, why, benchmark} record the ruling requires in the worklog for every model choice, plus the role's
- *  reasoning_effort (CPA level; user 2026-10-05: xhigh for planning quality). */
-export type ModelSelection = { chosen: string; model: string; why: string; benchmark: string; reasoningEffort?: ReasoningEffort };
+/** The worklog record for every model choice: {chosen, why, benchmark} + reasoning_effort, and (filled at call time) the
+ *  `served` model the backend actually answered with (runtime fail-closed; coordinator 2026-10-05: a flagged model can
+ *  silently downgrade, so claimed must equal served). */
+export type ModelSelection = { chosen: string; model: string; why: string; benchmark: string; reasoningEffort?: ReasoningEffort; served?: string };
+
+/** Runtime fail-closed check: does the model the backend actually SERVED match the one we chose? Tolerates a version
+ *  suffix (served "claude-opus-5.5-20261001" for chosen "claude-opus-5.5") but rejects a different model (a flagged
+ *  silent downgrade, e.g. opus-4.5 served for opus-5.5) — "claimed != served" (same principle as cpa:fingerprint). */
+export function servedMatchesChosen(chosen: string, served: string): boolean {
+  const c = normalizeModelName(chosen), s = normalizeModelName(served);
+  if (c.length === 0 || s.length === 0) return false;
+  return s.includes(c) || c.includes(s);
+}
 export type ResolveResult = { ok: true; model: string; selection: ModelSelection } | { ok: false; reason: string };
 
 export function defaultTablePath(): string {
