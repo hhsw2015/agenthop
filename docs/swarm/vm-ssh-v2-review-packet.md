@@ -111,6 +111,15 @@ Real re-run (`9209997`) confirmed the exact-title lock + status-gated capture + 
 Real re-run (`cba55ed`) confirmed the status-gated capture + `phase=ready` happy path (up/ssh/down). `prunableOnNoAddr`
 matrix pinned in selftest.
 
+## Round-5 disposition — reviewer 01a0ff49 (cba55ed: 0 P1 / 2 P2), fixed in `f293120`
+| Finding | Fix |
+|---|---|
+| R4-P2-1: a late-resuming old `up` writes/prunes by alias → clobbers/deletes a reused name's new record (and the new run leaks) | each up stamps a per-generation `reqId` at reservation; every late write/prune (cmdUpGha requesting/running/ready, railway ready, up catch, down, `ensureGhaRunId` cache) is generation-guarded (`writeMetaIfOwner`/`pruneIfOwner`/`recordIsOwned`, re-checked after each await). A resumed old up whose name was reused aborts without touching the new record + best-effort cancels its own run. |
+| R4-P2-2: `resolveId`/`ls` time-prune by `createdSec+ttl`, bypassing `phase` → a queued/requesting gha record is deleted before the runner's hold even starts | `timePrunable`: only railway is time-pruned (its ~1h platform destroy is the model); a gha record is NEVER time-pruned — released only on confirmed-terminal status (refresh/down). `remainingSec` stays a display estimate. |
+
+New pure predicates `recordIsOwned` / `timePrunable` pinned in selftest; real re-run (`f293120`) confirmed up/ls/ssh/down
+with the guards in place.
+
 ## Seams to probe
 - `ghaLockRunId` identifies the run by the `run_tag` nonce in `displayTitle` — not a timestamp (ownership is exact).
 - The tailcat address never touches stdout/argv: captured from the artifact file (0600 addr file), and the connect passes
