@@ -137,6 +137,89 @@ export function routingActiveSignal(routeKey: string, count: number, lastObserve
   return { kind: "active", groupKey: routingGroupKey(routeKey), category: "routing", why: `${count} dead-letters on route ${routeKey} within window`, lastObservedSeq, subjectJobId: "swarm-routing" };
 }
 
+// --- dead-letter watch DURABLE STATE (review d1bcd94 R1-R5): the watch must never re-read the whole ledger (R3), never drop
+// an in-window burst or an observed-but-deferred candidate (R1), distinguish pre- vs post-recovery failures (R5), and keep an
+// undelivered notice alive past episode close (R4). All of that needs state persisted between ticks, below. ---
+
+export type WindowEvent = { ts: number; route: string };
+export type DeadLetterWatch = {
+  /** Ledger file-identity fingerprint for rotation/truncation detection (R3): a changed sig OR size < offset ⇒ re-read from 0. */
+  sig: string;
+  /** Byte cursor: the next unread position in the ledger (R3 incremental read; never a full-file slurp). */
+  offset: number;
+  /** Bytes read past the last COMPLETE record — the incomplete trailing line as BASE64 bytes (not a string: a multi-byte UTF-8
+   *  char split across the read boundary must not be decoded until its continuation arrives), carried to the next tick (R1/R3). */
+  carry: string;
+  /** In-window failure events (route-pair), accumulated from the incremental read and pruned each tick (R1 keeps in-window). */
+  window: WindowEvent[];
+  /** route -> the max failure ts already COVERED by an opened incident (R5 watermark): a failure at/under this never reopens. */
+  handled: Record<string, number>;
+  /** route -> failure count at detection, awaiting a durable CONTROL commit (R1 durable candidate; removed only after commit). */
+  pending: Record<string, number>;
+  /** incidentId -> notify obligation, kept until delivered INDEPENDENT of whether the episode is still open (R4). */
+  notify: Record<string, { text: string; sent: boolean }>;
+};
+
+export function emptyDeadLetterWatch(): DeadLetterWatch {
+  return { sig: "", offset: 0, carry: "", window: [], handled: {}, pending: {}, notify: {} };
+}
+
+/** Fold a freshly-read byte chunk into (events, carryB64): prepend the prior carry BYTES, decode only up to the last newline
+ *  BYTE (a complete-line boundary is always a valid UTF-8 boundary) and parse those via the null-safe parser, and return the
+ *  trailing incomplete bytes as the new base64 carry. A record split across two reads — even mid-UTF-8-char — is never
+ *  half-parsed, mis-decoded, or lost (R1/R3 record boundary). */
+export function ingestLedgerChunk(carryB64: string, chunk: Buffer): { events: DeadLetter[]; carry: string } {
+  const combined = carryB64 ? Buffer.concat([Buffer.from(carryB64, "base64"), chunk]) : chunk;
+  const nl = combined.lastIndexOf(0x0a); // last '\n' byte
+  if (nl < 0) return { events: [], carry: combined.toString("base64") };     // no complete line yet — keep accumulating
+  return { events: parseDeadLetters(combined.toString("utf8", 0, nl)), carry: combined.subarray(nl + 1).toString("base64") };
+}
+
+/** Drop window events older than the window start (sliding window; R1 retains in-window, prunes aged-out). */
+export function pruneDeadLetterWindow(window: readonly WindowEvent[], windowStartMs: number): WindowEvent[] {
+  return window.filter((e) => e.ts >= windowStartMs);
+}
+
+/** Count in-window failures per route that are STRICTLY NEWER than the route's handled-through watermark (R5: a failure already
+ *  covered by an opened incident never reopens a new episode; recurrence needs post-recovery negative evidence). */
+export function countFreshByRoute(window: readonly WindowEvent[], windowStartMs: number, handled: Record<string, number>): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const e of window) {
+    if (e.ts < windowStartMs) continue;
+    if (e.ts <= (handled[e.route] ?? 0)) continue;     // already handled by a prior/open incident (R5)
+    m.set(e.route, (m.get(e.route) ?? 0) + 1);
+  }
+  return m;
+}
+
+/** The max in-window ts for a route (the new handled-through watermark once an incident is committed for it, R5). */
+export function maxTsForRoute(window: readonly WindowEvent[], route: string): number {
+  let mx = 0;
+  for (const e of window) if (e.route === route && e.ts > mx) mx = e.ts;
+  return mx;
+}
+
+/** Read the durable dead-letter watch state. Missing ⇒ empty (first run); corrupt ⇒ THROWS (caller is fail-soft + skips, so a
+ *  transient read error never resets the cursor/window/pending to empty and loses durable obligations — R1). */
+export function readDeadLetterWatch(file: string): DeadLetterWatch {
+  let raw: string;
+  try { raw = readFileSync(file, "utf8"); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return emptyDeadLetterWatch(); throw e; }
+  const p = JSON.parse(raw) as DeadLetterWatch;
+  if (p === null || typeof p !== "object" || typeof p.offset !== "number" || typeof p.carry !== "string" || !Array.isArray(p.window)
+      || typeof p.handled !== "object" || typeof p.pending !== "object" || typeof p.notify !== "object") throw new Error("dead-letter watch: malformed");
+  return { sig: typeof p.sig === "string" ? p.sig : "", offset: p.offset, carry: p.carry, window: p.window, handled: p.handled ?? {}, pending: p.pending ?? {}, notify: p.notify ?? {} };
+}
+
+/** Write the watch state atomically (unique temp + exclusive create + rename). Persist AFTER the batch's commits + notifies, so
+ *  a crash before the write re-reads the same cursor/pending next run rather than skipping durable work (R1). */
+export function writeDeadLetterWatch(file: string, w: DeadLetterWatch): void {
+  mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
+  writeFileSync(tmp, JSON.stringify(w), { mode: 0o644, flag: "wx" });
+  renameSync(tmp, file);
+}
+
 /** Read the durable snapshot. Missing ⇒ empty (first run); corrupt ⇒ THROWS (caller is fail-soft + skips — a transient read
  *  error must not reset the snapshot to empty and re-fire every board file as "new"). */
 export function readWatchSnapshot(file: string): WatchSnapshot {
