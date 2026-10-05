@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  ingestLedgerChunk, pruneDeadLetterWindow, countFreshByRoute, maxTsForRoute, routeKeyOf,
+  ingestLedgerChunk, pruneDeadLetterWindow, countFreshByRoute, freshTimestampsByRoute, maxTsForRoute, routeKeyOf,
   readDeadLetterWatch, writeDeadLetterWatch, emptyDeadLetterWatch, type WindowEvent, type DeadLetterWatch,
 } from "../src/swarm/delegation-observer.js";
 
@@ -108,6 +108,14 @@ describe("window prune + fresh count (R5 handled-through + recovery boundary)", 
     expect(maxTsForRoute(win, "a->x")).toBe(3000);
     expect(maxTsForRoute(win, "none")).toBe(0);
   });
+
+  test("freshTimestampsByRoute returns the fresh tss per route (sorted), same floor rule as countFreshByRoute (R5-C)", () => {
+    expect(freshTimestampsByRoute(win, 0, {}, {}).get("a->x")).toEqual([1000, 2000, 3000]); // all fresh
+    expect(freshTimestampsByRoute(win, 0, { "a->x": 2000 }, {}).get("a->x")).toEqual([3000]); // handled watermark excludes <=2000
+    expect(freshTimestampsByRoute(win, 0, {}, { "a->x": 3000 }).get("a->x")).toBeUndefined(); // recovery boundary excludes the whole burst
+    expect(freshTimestampsByRoute(win, 0, { "a->x": 1000 }, { "a->x": 2500 }).get("a->x")).toEqual([3000]); // floor = max(1000,2500)
+    expect(freshTimestampsByRoute(win, 0, {}, {}).get("b->y")).toEqual([2500]);
+  });
 });
 
 describe("dead-letter watch snapshot IO", () => {
@@ -118,7 +126,7 @@ describe("dead-letter watch snapshot IO", () => {
   test("missing ⇒ empty; write ⇒ read round-trips cursor/carry/truncating/window/handled/recovered/pending", () => {
     const f = path.join(HOME, "dlw.json");
     expect(readDeadLetterWatch(f)).toEqual(emptyDeadLetterWatch());
-    const w: DeadLetterWatch = { sig: "42", offset: 2048, carry: b64('{"ts":9'), truncating: false, window: [{ ts: 9000, route: "a->x" }], handled: { "a->x": 8000 }, recovered: { "a->x": 7000 }, pending: { "b->y": 3 }, owed: { "routing:a->x:episode-1": { why: "3 dead-letters", open: false, repairWaitId: "rw", notifiedAtSec: 7100 } } };
+    const w: DeadLetterWatch = { sig: "42", offset: 2048, carry: b64('{"ts":9'), truncating: false, window: [{ ts: 9000, route: "a->x" }], handled: { "a->x": 8000 }, recovered: { "a->x": 7000 }, pending: { "b->y": [8800, 9100, 9400] }, owed: { "routing:a->x:episode-1": { why: "3 dead-letters", open: false, repairWaitId: "rw", notifiedAtSec: 7100 } } };
     writeDeadLetterWatch(f, w);
     expect(readDeadLetterWatch(f)).toEqual(w);
   });

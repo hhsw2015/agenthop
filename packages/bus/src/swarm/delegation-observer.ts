@@ -173,8 +173,11 @@ export type DeadLetterWatch = {
    *  pre-recovery and never reopens, EVEN IF ingested AFTER the recovery was observed — so a late-ingested pre-recovery burst
    *  cannot fake a relapse; only a failure strictly newer than this boundary is post-recovery evidence. */
   recovered: Record<string, number>;
-  /** route -> failure count at detection, awaiting a durable CONTROL commit (R1 durable candidate; removed only after commit). */
-  pending: Record<string, number>;
+  /** route -> the FAILURE TIMESTAMPS of a candidate that reached threshold, awaiting a durable CONTROL commit. Stored as the
+   *  timestamps (not just a count) so the candidate is SELF-CONTAINED (review 7e9a08b-R5-C): it is a discovered obligation that
+   *  survives window aging — it is pruned ONLY when a recovery boundary filters its post-recovery members below threshold, never
+   *  because its samples left the sliding detection window. Removed on commit. */
+  pending: Record<string, number[]>;
   /** incidentId -> the owed/delivered coordinator notice (R4). reg.episodes is keyed by groupKey and keeps only the LATEST
    *  generation, so a recurrence (episode+1) overwrites a previous episode still owing a notice; keying the obligation by the
    *  full incidentId HERE (durable) preserves every generation's notice until delivered. A delivered entry is pruned once its
@@ -241,6 +244,20 @@ export function maxTsForRoute(window: readonly WindowEvent[], route: string): nu
   let mx = 0;
   for (const e of window) if (e.route === route && e.ts > mx) mx = e.ts;
   return mx;
+}
+
+/** The in-window FRESH failure timestamps per route — those strictly newer than the route's floor = max(handled, recovered),
+ *  same freshness rule as countFreshByRoute but returning the timestamps so the caller can store a SELF-CONTAINED durable
+ *  candidate (review 7e9a08b-R5-C). Sorted ascending per route. */
+export function freshTimestampsByRoute(window: readonly WindowEvent[], windowStartMs: number, handled: Record<string, number>, recovered: Record<string, number>): Map<string, number[]> {
+  const m = new Map<string, number[]>();
+  for (const e of window) {
+    if (e.ts < windowStartMs) continue;
+    if (e.ts <= Math.max(handled[e.route] ?? 0, recovered[e.route] ?? 0)) continue; // handled OR pre-recovery ⇒ not fresh (R5)
+    (m.get(e.route) ?? m.set(e.route, []).get(e.route)!).push(e.ts);
+  }
+  for (const tss of m.values()) tss.sort((a, b) => a - b);
+  return m;
 }
 
 /** Read the durable dead-letter watch state. Missing ⇒ empty (first run); corrupt ⇒ THROWS (caller is fail-soft + skips, so a

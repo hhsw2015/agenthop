@@ -47,7 +47,7 @@ import { assertLiveness, type LivenessVerdict, type ControlCut, type Observation
 import { reconcileIncident, reconcileIncidentCore, reconcileRegistryWithControl, readIncidents, writeIncidents, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
 import { isRepairWaitId, repairEpisodeOf, repairGroupKeyOf } from "../packages/bus/src/swarm/repair-wait-id.js";
 import { observeCandidate, readDelegations, writeDelegations, type DelegationRegistry } from "../packages/bus/src/swarm/delegation-envelope.js";
-import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, ingestLedgerChunk, pruneDeadLetterWindow, countFreshByRoute, maxTsForRoute, readDeadLetterWatch, writeDeadLetterWatch, routeKeyOf, routingGroupKey, routeKeyOfGroup, routingActiveSignal, type ReadArtifact, type WatchSnapshot, type DeadLetterWatch } from "../packages/bus/src/swarm/delegation-observer.js";
+import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, ingestLedgerChunk, pruneDeadLetterWindow, freshTimestampsByRoute, readDeadLetterWatch, writeDeadLetterWatch, routeKeyOf, routingGroupKey, routeKeyOfGroup, routingActiveSignal, type ReadArtifact, type WatchSnapshot, type DeadLetterWatch } from "../packages/bus/src/swarm/delegation-observer.js";
 import { advanceWait, isRenewable } from "../packages/bus/src/swarm/task-wait.js";
 import { subjectProgressSeq, hasFreshSubjectEvidence, renewOperationId, renewalCount } from "../packages/bus/src/swarm/evidence-renewal.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
@@ -883,11 +883,13 @@ async function main(): Promise<void> {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") log(`dead-letters read failed: ${e instanceof Error ? e.message : e}`);
     }
 
-    // Prune the window; fold watermark-fresh bursts into the DURABLE pending set (R1-B: a threshold candidate persists until it
-    // is committed, surviving a window change; R5: countFreshByRoute excludes failures already covered by an opened incident so
-    // the same pre-recovery burst can never reopen a new episode).
+    // Prune the detection window, then record a DURABLE candidate the FIRST time a route reaches threshold — storing its FRESH
+    // failure TIMESTAMPS, not a count (review 7e9a08b-R5-C). A candidate is a discovered obligation: once recorded it is
+    // self-contained and survives the sliding window aging out its samples; it is filtered/committed/discharged in the group loop
+    // below, and invalidated ONLY by a recovery boundary (never by window aging). A route already pending is left untouched here.
     watch.window = pruneDeadLetterWindow(watch.window, windowStartMs);
-    for (const [route, n] of countFreshByRoute(watch.window, windowStartMs, watch.handled, watch.recovered)) if (n >= DEAD_LETTER_THRESHOLD) watch.pending[route] = n;
+    for (const [route, tss] of freshTimestampsByRoute(watch.window, windowStartMs, watch.handled, watch.recovered))
+      if (watch.pending[route] === undefined && tss.length >= DEAD_LETTER_THRESHOLD) watch.pending[route] = tss;
 
     // UNION of KNOWN obligations (registry routing episodes + CONTROL routing repair-waits — ledger-independent, R2) + the
     // durable pending candidates: a committed-but-registry-lost incident still reconciles even with the ledger window gone.
@@ -906,33 +908,35 @@ async function main(): Promise<void> {
         const groupKey = all[(deadLetterCursor + i) % all.length]!;
         try {
           const fresh = loadControlLog(CONTROL_LOG_DIR);
-          const groupCtlWaits = Object.values(liveEntities(fresh))
+          const groupWaits = Object.values(liveEntities(fresh))
             .filter((b) => b.put === "wait" && repairEpisodeOf((b as Extract<ChangeBody, { put: "wait" }>).wait.waitId, groupKey) !== null)
-            .map((b) => { const w = (b as Extract<ChangeBody, { put: "wait" }>).wait; return { waitId: w.waitId, state: w.state }; });
+            .map((b) => (b as Extract<ChangeBody, { put: "wait" }>).wait);
+          const groupCtlWaits = groupWaits.map((w) => ({ waitId: w.waitId, state: w.state }));
           // recovery closed loop: adopt a committed wait the registry lost / sync-close one whose repair-wait resolved.
-          const preEp = reg.episodes[groupKey];             // snapshot BEFORE sync (R5: detect an open -> closed recovery + its repair-wait)
-          const wasOpen = preEp?.open === true;
           const sync = reconcileRegistryWithControl(reg, groupKey, "routing", groupCtlWaits, nowSec());
           if (sync.registry !== reg) { writeIncidents(INCIDENTS_FILE, sync.registry); reg = sync.registry; }
           const route = routeKeyOfGroup(groupKey);
-          // R5-B: a reconcile that RECOVERED the episode (open -> closed) sets the recovery boundary from the resolved repair-
-          // wait's resolution.occurredAtSec — the TRUE recovery OCCURRENCE (written by whoever committed the close, f32a0507's
-          // 459af09), NOT the observation time. A failure at/under it is pre-recovery and never reopens; a strictly-newer one is
-          // post-recovery evidence (this mirrors task-wait.failureReopensIncident, the agreed truth source, in the window's ms
-          // unit). A bare/legacy close with no finite occurredAtSec sets NO boundary ⇒ post-recovery failures reopen
-          // (fail-toward-noticing; never swallow a real failure on a missing/NaN occurrence). occurredAtSec is seconds ⇒ *1000.
-          if (route !== null && wasOpen && reg.episodes[groupKey]?.open !== true) {
-            const occ = (preEp !== undefined ? findWaitIn(fresh, preEp.repairWaitId) : undefined)?.resolution?.occurredAtSec;
-            if (occ !== undefined && Number.isFinite(occ)) watch.recovered[route] = Math.max(watch.recovered[route] ?? 0, occ * 1000);
+          // R5-D (review 7e9a08b): derive the recovery boundary from CONTROL's DURABLE occurredAtSec on the group's RESOLVED
+          // repair-wait(s), EVERY tick — not only when THIS tick witnessed open->closed. A watch write-loss + restart leaves the
+          // episode already closed, but the occurrence remains a committed CONTROL fact that must still bound late pre-recovery
+          // failures. The boundary is the TRUE occurrence (f32a0507's 459af09), *1000 to the window's ms unit, mirroring
+          // task-wait.failureReopensIncident. A bare/legacy close with no finite occurredAtSec sets NO boundary ⇒ post-recovery
+          // failures reopen (fail-toward-noticing; a missing/NaN occurrence never swallows a real failure).
+          if (route !== null) {
+            let occMs = 0;
+            for (const w of groupWaits) { const o = w.state === "resolved" ? w.resolution?.occurredAtSec : undefined; if (o !== undefined && Number.isFinite(o)) occMs = Math.max(occMs, o * 1000); }
+            if (occMs > 0) watch.recovered[route] = Math.max(watch.recovered[route] ?? 0, occMs);
           }
           if (route !== null && watch.pending[route] !== undefined) { // a DURABLE candidate awaiting commit
-            // R5-A (ordering): the candidate count was computed BEFORE this tick's recovery boundary was known. Re-evaluate
-            // freshness against the now-updated recovered so a PRE-recovery burst ingested in the same tick the recovery was
-            // observed cannot open a new episode from a stale count. Below threshold ⇒ discharge the candidate, no reopen.
-            const freshNow = countFreshByRoute(watch.window, windowStartMs, watch.handled, watch.recovered).get(route) ?? 0;
-            if (freshNow < DEAD_LETTER_THRESHOLD) { delete watch.pending[route]; continue; }
-            watch.pending[route] = freshNow;
-            const rec = reconcileIncidentCore(reg, routingActiveSignal(route, freshNow, fresh.seq), nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner: REPAIR_OWNER_ROUTABLE ? REPAIR_OWNER : SELF, controlEpisodeFloor: sync.controlEpisodeFloor });
+            // R5-A/R5-C (review 7e9a08b): filter the candidate by the RECOVERY BOUNDARY only — never by window aging. Pre-recovery
+            // timestamps (<= the boundary just rebuilt above) drop; if the remaining post-recovery failures fall below threshold the
+            // burst was pre-recovery ⇒ discharge, no reopen. Absent a recovery boundary the full candidate stands: a discovered
+            // obligation does not age out just because its samples left the sliding window (the R5-C regression this replaces).
+            const boundary = watch.recovered[route];
+            const live = boundary === undefined ? watch.pending[route] : watch.pending[route].filter((ts) => ts > boundary);
+            if (live.length < DEAD_LETTER_THRESHOLD) { delete watch.pending[route]; continue; }
+            watch.pending[route] = live;
+            const rec = reconcileIncidentCore(reg, routingActiveSignal(route, live.length, fresh.seq), nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner: REPAIR_OWNER_ROUTABLE ? REPAIR_OWNER : SELF, controlEpisodeFloor: sync.controlEpisodeFloor });
             let settled = false;
             if (rec.openRepairWait !== undefined) { // NEW episode ⇒ commit/adopt the repair-wait (the notify obligation is derived below from the committed episode — R4)
               const spec = rec.openRepairWait;
@@ -944,8 +948,8 @@ async function main(): Promise<void> {
               writeIncidents(INCIDENTS_FILE, rec.registry); reg = rec.registry;
             } else { if (JSON.stringify(rec.registry) !== JSON.stringify(reg)) { writeIncidents(INCIDENTS_FILE, rec.registry); reg = rec.registry; } settled = true; } // already open ⇒ dedup bump
             if (settled) {
-              watch.handled[route] = Math.max(watch.handled[route] ?? 0, maxTsForRoute(watch.window, route)); // R5 watermark: cover the burst so it can't reopen
-              delete watch.pending[route]; // durable candidate discharged (re-set next tick only if a FRESH burst recurs)
+              watch.handled[route] = Math.max(watch.handled[route] ?? 0, ...live); // R5 watermark: cover the committed candidate's own failures so they can't reopen
+              delete watch.pending[route]; // durable candidate discharged (re-recorded next tick only if a FRESH burst recurs)
             }
           }
         } catch (e) { log(`routing group ${groupKey} failed (isolated): ${e instanceof Error ? e.message : e}`); }
@@ -953,18 +957,27 @@ async function main(): Promise<void> {
       deadLetterCursor = (deadLetterCursor + batchCount) % all.length;
     }
 
-    // R4 notify obligation keyed by FULL incidentId in the DURABLE WATCH — not by groupKey in the registry. reg.episodes keeps
-    // only the latest generation per groupKey, so a recurrence (episode+1) OVERWRITES a previous episode that still owed a notice;
-    // deriving owed straight from reg.episodes therefore loses the old generation's obligation. Instead, MIRROR every routing
-    // episode's obligation into watch.owed[incidentId] (distinct generations are distinct keys ⇒ never overwritten), refreshing
-    // open/why while still owed. This still reconstructs from the registry (the adopt/dedup/sync-close paths keep working, so a
-    // lost registry write is recovered from CONTROL and re-mirrored), and the delivered marker lives in the watch so a confirmed
-    // notice is never re-sent across a restart. Round-robin budget: at most MAX_NOTIFY_PER_TICK per tick (R3).
-    for (const ep of Object.values(reg.episodes)) {
-      if (ep.category !== "routing") continue;
-      const cur = watch.owed[ep.incidentId];
-      if (cur === undefined) watch.owed[ep.incidentId] = { why: ep.why, open: ep.open, repairWaitId: ep.repairWaitId, ...(ep.notifiedAtSec !== undefined ? { notifiedAtSec: ep.notifiedAtSec } : {}) };
-      else if (cur.notifiedAtSec === undefined) watch.owed[ep.incidentId] = { ...cur, why: ep.why, open: ep.open, repairWaitId: ep.repairWaitId }; // refresh text/state while still owed
+    // R4 (review 7e9a08b): reconstruct the owed set from the GENERATION-PRESERVING authoritative store — CONTROL repair-waits —
+    // not the latest-generation registry. reg.episodes keeps only ONE generation per groupKey, so a watch write-loss followed by a
+    // recurrence (which overwrites the old episode) would lose the prior generation's unfulfilled notice. Every routing repair-wait
+    // in CONTROL maps to an incidentId and owes a notice UNLESS watch.owed records it DELIVERED (notifiedAtSec); the registry
+    // supplies why/open for whichever generation is current, else it is reconstructed from the wait. A lost watch then only
+    // re-notifies (at-least-once) — no generation's obligation is ever lost, because CONTROL retains them all. Reload AFTER the
+    // group loop so a just-opened repair-wait is included. ponytail: watch.owed keeps one tiny delivered-marker per lifetime
+    // routing episode (rare); TTL-tombstone them only if that set ever grows enough to matter.
+    for (const b of Object.values(liveEntities(loadControlLog(CONTROL_LOG_DIR)))) {
+      if (b.put !== "wait") continue;
+      const w = (b as Extract<ChangeBody, { put: "wait" }>).wait;
+      const gk = repairGroupKeyOf(w.waitId);
+      if (gk === null || !gk.startsWith("routing:")) continue;
+      const epNum = repairEpisodeOf(w.waitId, gk);
+      if (epNum === null) continue;
+      const incidentId = `${gk}:episode-${epNum}`;
+      const cur = watch.owed[incidentId];
+      if (cur?.notifiedAtSec !== undefined) continue; // already delivered — never re-mirror or re-send
+      const regEp = reg.episodes[gk];
+      const current = regEp?.incidentId === incidentId;
+      watch.owed[incidentId] = { why: current ? regEp!.why : (cur?.why ?? `routing incident ${incidentId}`), open: current ? regEp!.open : (w.state !== "resolved"), repairWaitId: w.waitId };
     }
     const owed = Object.entries(watch.owed).filter(([, n]) => n.notifiedAtSec === undefined);
     if (owed.length > 0) {
@@ -979,10 +992,8 @@ async function main(): Promise<void> {
       }
       deadLetterNotifyCursor = (deadLetterNotifyCursor + notifyCount) % owed.length;
     }
-    // Prune a DELIVERED notice whose incidentId is no longer the current generation for its group — a superseded, already-sent
-    // obligation is safe to forget, bounding watch.owed's growth. An un-delivered or still-current entry is kept.
-    const currentIncidentIds = new Set(Object.values(reg.episodes).filter((e) => e.category === "routing").map((e) => e.incidentId));
-    for (const incidentId of Object.keys(watch.owed)) if (watch.owed[incidentId]!.notifiedAtSec !== undefined && !currentIncidentIds.has(incidentId)) delete watch.owed[incidentId];
+    // (No prune: a DELIVERED marker must persist as long as its repair-wait exists in CONTROL, else the R4 reconstruct above would
+    //  re-derive that generation as owed and re-notify it. Growth is one small marker per lifetime routing episode — see ceiling note.)
 
     // Persist the watch LAST (after commits + notifies): a crash before this re-reads the same cursor/window/pending next run,
     // never skipping durable work (R1). Stay fully dormant (write no file) only when there is genuinely nothing to track (R2).
