@@ -744,8 +744,12 @@ function withIdLock<T>(id: string, fn: () => T): T {
         const holder = entries[0]!;
         const holderPid = Number(holder.split(".")[0]);
         if (Number.isInteger(holderPid) && holderPid > 0 && !pidAlive(holderPid)) { // dead holder -> reclaim by EXACT name
-          try { rmSync(path.join(dir, holder)); } catch { /* already gone */ }
-          try { rmdirSync(dir); } catch { /* a successor populated it, or it is gone -> the loop re-mkdirs */ }
+          let removed = false;
+          try { rmSync(path.join(dir, holder)); removed = true; } catch { /* ENOENT: another reclaimer already took the dead identity */ }
+          // Only the reclaimer that ACTUALLY removed the dead identity may rmdir the container. An ENOENT means a peer
+          // already reclaimed and may have mkdir'd a fresh (still-empty, identity-not-yet-published) successor dir — rmdir'ing
+          // that would re-open the mutex (the directory ABA). Not entitled -> leave it; the loop re-reads (empty=UNKNOWN wait).
+          if (removed) { try { rmdirSync(dir); } catch { /* a successor already populated it, or it is gone */ } }
           continue;
         }
       }
