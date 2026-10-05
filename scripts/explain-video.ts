@@ -247,6 +247,21 @@ async function concatScenes(parts: string[], out: string): Promise<void> {
   await pexec("ffmpeg", ["-y", ...inputs, "-filter_complex", filter, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", out], { maxBuffer: 1 << 24 });
 }
 
+/** am's --mp4 export spawns a Chromium headless. Prefer the EGO browser already installed (ego-lite, a Chromium)
+ *  over downloading anything; fall through to AM_CHROME/CHROME_PATH or a system Chrome. Returns a path to set as
+ *  AM_CHROME, or "" to let am search. */
+export function chromeBin(): string {
+  if (process.env.AM_CHROME || process.env.CHROME_PATH) return ""; // caller already chose; let am use it
+  const candidates = [
+    "/Applications/ego lite.app/Contents/MacOS/ego lite", // ego-browser (ego-lite) — the installed Chromium, preferred
+    "/Applications/Arc.app/Contents/MacOS/Arc", // Arc — also Chromium, another installed browser
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+  ];
+  return candidates.find((p) => existsSync(p)) ?? "";
+}
+
 /** am's --mp4 export needs Node >=22 (built-in WebSocket). Pick one: AM_NODE, else the newest nvm node >=22, else
  *  the current node (am will report if it is too old). */
 export function nodeBin(): string {
@@ -267,6 +282,8 @@ export async function runAmVideo(scriptFile: string, voice: Voice, outMp4: strin
   const am = path.join(process.env.HOME ?? "", ".claude", "skills", "answer-me-with-html", "scripts", "am.mjs");
   if (!existsSync(am)) throw new Error(`am video skill not found at ${am}`);
   const { flag, env } = amVoiceEnv(voice, cpa);
+  const chrome = chromeBin(); // prefer the installed EGO browser; don't download one
+  if (chrome) env.AM_CHROME = chrome;
   const { stdout, stderr } = await pexec(nodeBin(), [am, "video", scriptFile, "--no-open", "--mp4", "--voice", flag],
     { env: { ...process.env, ...env }, maxBuffer: 1 << 24 });
   const out = stdout + "\n" + stderr;
