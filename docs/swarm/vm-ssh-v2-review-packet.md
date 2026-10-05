@@ -129,6 +129,14 @@ with the guards in place.
 
 Real re-run (`cd18e13`) confirmed up/ssh/down under the lock with no lock-file leak.
 
+## Round-7 disposition — reviewer 01a0ff49 (cd18e13: 0 P1 / 2 P2), fixed in `95bf0d5`
+| Finding | Fix |
+|---|---|
+| R6-P2-1: `withIdLock` reclaims by `mtime>10s` — steals a still-LIVE holder's lock (age ≠ death) | the lock holds `<pid>.<nonce>`; a held lock is reclaimed ONLY when the holder pid is provably DEAD (`pidAlive` = `kill(pid,0)`: ESRCH dead, EPERM alive). A live holder we can't reclaim → bounded wait then error (never two critical sections). The finally releases ONLY our own lock token. (Applies the F33 bus `claimInbox` wx + `kill -0` liveness criterion.) |
+| R6-P2-2: `reserveMeta` bypasses `withIdLock` — an old cleanup holding the lock can delete a new reservation | `reserveMeta` now runs inside `withIdLock`; the `wx`-create can't race the lock, and an old generation's cleanup can't delete a new reservation. |
+
+`pidAlive` pinned in selftest; real re-run (`95bf0d5`) confirmed up/ssh/down with no lock-file leak.
+
 ## Seams to probe
 - `ghaLockRunId` identifies the run by the `run_tag` nonce in `displayTitle` — not a timestamp (ownership is exact).
 - The tailcat address never touches stdout/argv: captured from the artifact file (0600 addr file), and the connect passes
