@@ -1,10 +1,10 @@
 {
-  "model": "claude-opus-5.5",
+  "model": "claude-opus-5-5",
   "selection": {
     "chosen": "opus 5.5",
-    "model": "claude-opus-5.5",
+    "model": "claude-opus-5-5",
     "why": "recommended baseline (strongest available in catalog)",
-    "benchmark": "AA Intel 58 >= floor 53 (mtr-2026-10-05)",
+    "benchmark": "AA Intel 58 >= floor 53 (mtr-2026-10-05b)",
     "reasoningEffort": "xhigh",
     "served": "claude-opus-5-5"
   },
@@ -15,7 +15,7 @@
       {
         "nodeId": "tests",
         "kind": "work",
-        "goal": "[TESTS] Write unit tests for all metrics functions (nodeCount, totalComplexity, hasDesignGate, summary)",
+        "goal": "[TESTS] Write unit tests for all plan metrics functions (nodeCount, totalComplexity, hasDesignGate, summary)",
         "dependsOn": [],
         "structuredChecks": [
           {
@@ -23,11 +23,13 @@
             "args": {}
           }
         ],
-        "freeTextNotes": [],
-        "complexity": 3,
+        "freeTextNotes": [
+          "Tests must cover edge cases: empty plans, single-node plans, plans with and without design gates, complexity sum overflow prevention"
+        ],
+        "complexity": 4,
         "requiredOutputs": [
           {
-            "logicalName": "test-suite",
+            "logicalName": "plan-metrics-tests",
             "kind": "files"
           }
         ],
@@ -37,7 +39,7 @@
         "sourceWriteScope": [
           "packages/bus/test/"
         ],
-        "criticalPath": false
+        "criticalPath": true
       },
       {
         "nodeId": "i1",
@@ -54,7 +56,7 @@
         "complexity": 2,
         "requiredOutputs": [
           {
-            "logicalName": "nodeCount-implementation",
+            "logicalName": "nodeCount-function",
             "kind": "files"
           }
         ],
@@ -81,7 +83,7 @@
         "complexity": 2,
         "requiredOutputs": [
           {
-            "logicalName": "totalComplexity-implementation",
+            "logicalName": "totalComplexity-function",
             "kind": "files"
           }
         ],
@@ -105,10 +107,10 @@
           }
         ],
         "freeTextNotes": [],
-        "complexity": 2,
+        "complexity": 3,
         "requiredOutputs": [
           {
-            "logicalName": "hasDesignGate-implementation",
+            "logicalName": "hasDesignGate-function",
             "kind": "files"
           }
         ],
@@ -131,11 +133,13 @@
             "args": {}
           }
         ],
-        "freeTextNotes": [],
+        "freeTextNotes": [
+          "Summary format must be deterministic and readable, suitable for logging and display"
+        ],
         "complexity": 3,
         "requiredOutputs": [
           {
-            "logicalName": "summary-implementation",
+            "logicalName": "summary-function",
             "kind": "files"
           }
         ],
@@ -150,7 +154,7 @@
       {
         "nodeId": "i5",
         "kind": "work",
-        "goal": "[I5] Ensure the module typechecks correctly",
+        "goal": "[I5] Ensure the plan metrics module typechecks successfully",
         "dependsOn": [],
         "structuredChecks": [
           {
@@ -176,7 +180,7 @@
         "sourceWriteScope": [
           "packages/bus/src/swarm/"
         ],
-        "criticalPath": false
+        "criticalPath": true
       }
     ]
   },
@@ -187,12 +191,12 @@
       {
         "nodeId": "tests",
         "kind": "work",
-        "goal": "[TESTS] Write unit tests for all metrics functions (nodeCount, totalComplexity, hasDesignGate, summary)",
+        "goal": "[TESTS] Write unit tests for all plan metrics functions (nodeCount, totalComplexity, hasDesignGate, summary)",
         "dependsOn": [],
         "outputContract": {
           "requiredOutputs": [
             {
-              "logicalName": "test-suite",
+              "logicalName": "plan-metrics-tests",
               "kind": "files"
             }
           ]
@@ -215,7 +219,43 @@
         "runtime": "ephemeral",
         "modelTier": "standard",
         "roleProfile": "test-impl",
-        "specDigest": "3c1769564a78a5324ad9a7f8b4133c3d7942416608825fdc9f2b05811be2f0d5"
+        "criticalPath": true,
+        "specDigest": "9fe1be7a37a917ac6ac91c1522b4a71e3172a151589ffd9b37afb0203c61ae61"
+      },
+      {
+        "nodeId": "tests::review",
+        "kind": "review",
+        "goal": "Independent review of tests (prose obligations): Tests must cover edge cases: empty plans, single-node plans, plans with and without design gates, complexity sum overflow prevention",
+        "dependsOn": [
+          "tests"
+        ],
+        "outputContract": {
+          "requiredOutputs": [
+            {
+              "logicalName": "review-verdict",
+              "kind": "notes"
+            }
+          ]
+        },
+        "acceptance": [
+          {
+            "check": "required-review-pass",
+            "args": {
+              "version": "1",
+              "boundTo": "tests",
+              "notes": [
+                "Tests must cover edge cases: empty plans, single-node plans, plans with and without design gates, complexity sum overflow prevention"
+              ]
+            }
+          }
+        ],
+        "artifactScope": [],
+        "estimatedRuntimeSec": 600,
+        "retryBudget": 2,
+        "required": true,
+        "runtime": "ephemeral",
+        "modelTier": "heavy",
+        "specDigest": "0af454755fbae057da482ff1828a3a8c4db1e1b76961222fdfd6cdfb7288a0a0"
       },
       {
         "nodeId": "i1",
@@ -225,7 +265,7 @@
         "outputContract": {
           "requiredOutputs": [
             {
-              "logicalName": "nodeCount-implementation",
+              "logicalName": "nodeCount-function",
               "kind": "files"
             }
           ]
@@ -248,7 +288,7 @@
         "runtime": "ephemeral",
         "modelTier": "standard",
         "roleProfile": "pure-layer-impl",
-        "specDigest": "cdd7f13ccc1dc489c04ff22b70b39e0d7ad5232d972632ef1241e561ce7b03e2"
+        "specDigest": "792791cf0db2f1ac2543582a557643b1afd405e77b5ad9b768eb3728a281060d"
       },
       {
         "nodeId": "i2",
@@ -258,7 +298,7 @@
         "outputContract": {
           "requiredOutputs": [
             {
-              "logicalName": "totalComplexity-implementation",
+              "logicalName": "totalComplexity-function",
               "kind": "files"
             }
           ]
@@ -281,7 +321,7 @@
         "runtime": "ephemeral",
         "modelTier": "standard",
         "roleProfile": "pure-layer-impl",
-        "specDigest": "a8ad6317c43b21c07a937f27897ccc49ce8451c4ad1fc8b69de1ee17d461e4c9"
+        "specDigest": "85108e5a1a662f07d365137b4f0a4eee2218f33ce63dfd861412c04dc21ea401"
       },
       {
         "nodeId": "i3",
@@ -291,7 +331,7 @@
         "outputContract": {
           "requiredOutputs": [
             {
-              "logicalName": "hasDesignGate-implementation",
+              "logicalName": "hasDesignGate-function",
               "kind": "files"
             }
           ]
@@ -314,7 +354,7 @@
         "runtime": "ephemeral",
         "modelTier": "standard",
         "roleProfile": "pure-layer-impl",
-        "specDigest": "a6122ccff6d2d3c8442e33f3030ded68aa5799e6f78fad4971edd0bb46f442ec"
+        "specDigest": "b353ccf906fe14f07c8e1dd995cd853eb13604cacdec1aeab5b9cffbb6fd3d6a"
       },
       {
         "nodeId": "i4",
@@ -324,7 +364,7 @@
         "outputContract": {
           "requiredOutputs": [
             {
-              "logicalName": "summary-implementation",
+              "logicalName": "summary-function",
               "kind": "files"
             }
           ]
@@ -347,12 +387,47 @@
         "runtime": "ephemeral",
         "modelTier": "standard",
         "roleProfile": "pure-layer-impl",
-        "specDigest": "2340ea2cdb68186c10945be354c08f3f6f798b1d2963bc689a924ab5ca3d933e"
+        "specDigest": "3334fa97db7f27a12878b36871abf218bf4e42091515a9c997ea4c19c3293752"
+      },
+      {
+        "nodeId": "i4::review",
+        "kind": "review",
+        "goal": "Independent review of i4 (prose obligations): Summary format must be deterministic and readable, suitable for logging and display",
+        "dependsOn": [
+          "i4"
+        ],
+        "outputContract": {
+          "requiredOutputs": [
+            {
+              "logicalName": "review-verdict",
+              "kind": "notes"
+            }
+          ]
+        },
+        "acceptance": [
+          {
+            "check": "required-review-pass",
+            "args": {
+              "version": "1",
+              "boundTo": "i4",
+              "notes": [
+                "Summary format must be deterministic and readable, suitable for logging and display"
+              ]
+            }
+          }
+        ],
+        "artifactScope": [],
+        "estimatedRuntimeSec": 600,
+        "retryBudget": 2,
+        "required": true,
+        "runtime": "ephemeral",
+        "modelTier": "heavy",
+        "specDigest": "aa78774215b460943767c3c259976be8cd61d8c88d7282757957f0f1a7e57f15"
       },
       {
         "nodeId": "i5",
         "kind": "work",
-        "goal": "[I5] Ensure the module typechecks correctly",
+        "goal": "[I5] Ensure the plan metrics module typechecks successfully",
         "dependsOn": [],
         "outputContract": {
           "requiredOutputs": [
@@ -384,13 +459,14 @@
         "runtime": "ephemeral",
         "modelTier": "standard",
         "roleProfile": "pure-layer-impl",
-        "specDigest": "f1357b02b13b0d8a744a70ca3639721c632479f6d1dc2c39c49d76818071cb0a"
+        "criticalPath": true,
+        "specDigest": "80198e9ba495452a2d8801c98ac7a5f0ceca2881063089a86168c65ff62ca123"
       }
     ],
     "jobBudget": {
       "maxTotalAttempts": 20,
       "maxWallClockSec": 72000,
-      "maxModelUsd": 7
+      "maxModelUsd": 11.5
     },
     "frozenRefs": {
       "checkRegistry": "cr-live-1",
@@ -400,12 +476,12 @@
       "budgetPolicy": "bp-live-1",
       "r4ThresholdPolicy": "tp-live-1",
       "sourceBaselineDigest": "live-base",
-      "planningRequestId": "919f32ad-56df-4751-934c-4e562c74cc9c"
+      "planningRequestId": "ad8d86e3-c032-4a50-a7c9-e3632086e25a"
     },
     "notImplemented": [
       "r4-threshold"
     ],
-    "planDigest": "92ef21df7fb9ae7a830c5188e7253e6ce3c6bfac386f9e42359bd54632f9709d"
+    "planDigest": "f382e07bbe254732744d4b1d32823ea04b1e34fc0f92e9822d7e0bc9353569ae"
   },
   "fBaseline": [
     {

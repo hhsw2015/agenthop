@@ -1,11 +1,16 @@
 /**
- * Model-tier binding (heavy-tier-binding single scope; coordinator dispatch 2026-10-05 off the user's model-tier ruling).
- * Resolves a ROLE's heavy tier to a concrete CPA-catalog model, FAIL-CLOSED: if no recommended (or same-or-stronger
- * self-selected) model is actually in the catalog, it refuses rather than silently dropping to a weak default.
+ * Model-tier binding (heavy-tier-binding; coordinator dispatch 2026-10-05 off the user's model-tier ruling). Resolves a
+ * ROLE's heavy tier to a concrete CPA-catalog model, FAIL-CLOSED: no recommended (or same-or-stronger self-selected) model
+ * in the catalog => refuse, never a weak default.
  *
- * The recommendation table is DATA (roles/model-tiers.json), not hardcoded — updating it is a user ruling. "Recommended"
- * is a baseline, not a closed whitelist: a caller may self-select any catalog model that is same-or-stronger by the AA Intel
- * benchmark (aaIntel >= the role's floor) and MUST leave a {chosen, why, benchmark} selection record (the worklog triple).
+ * Identity is EXACT (reviewer heavy-tier-c6b5968 root cause): an explicit alias table maps each model to its exact catalog
+ * id spellings; matching is equality against an alias (a trailing -<date> suffix tolerated), NEVER a substring — so
+ * claude-opus-5 (AA 51) can never pass as opus 5.5 (AA 58), served "claude-opus-5"/bare "claude" never passes as the chosen
+ * model (the silent downgrade this batch kills), and "sonnet-5.5-mini" never inherits sonnet 5.5's score.
+ *
+ * Recommended = baseline, not a closed whitelist: a self-selected model must be a BENCHMARKED, same-or-stronger model
+ * (aaIntel >= the role floor) and carry a {chosen, why, benchmark} record. The table (roles/model-tiers.json) is data; a
+ * change is a user ruling, not a code edit.
  */
 
 import { readFileSync } from "node:fs";
@@ -14,31 +19,19 @@ import { fileURLToPath } from "node:url";
 
 export type Role = "planning" | "coding" | "review";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max";
-export type RecommendedModel = { name: string; match: string; aaIntel: number };
-export type RoleSpec = { semantics: string; floorAaIntel: number; reasoningEffort?: ReasoningEffort; recommended: RecommendedModel[] };
+export type ModelEntry = { id: string; aliases: string[]; aaIntel: number };
+export type RoleSpec = { semantics: string; floorAaIntel: number; reasoningEffort?: ReasoningEffort; recommended: string[] };
 export type ModelTierTable = {
   version: string;
   source: string;
   benchmark: string;
   reasoningEfforts?: ReasoningEffort[];
+  models: ModelEntry[];
   roles: Record<Role, RoleSpec>;
-  benchmarkScores: Array<{ name: string; aaIntel: number }>;
 };
 
-/** The worklog record for every model choice: {chosen, why, benchmark} + reasoning_effort, and (filled at call time) the
- *  `served` model the backend actually answered with (runtime fail-closed; coordinator 2026-10-05: a flagged model can
- *  silently downgrade, so claimed must equal served). */
+/** The worklog record for every model choice, plus the role reasoning_effort and (filled at call time) the SERVED model. */
 export type ModelSelection = { chosen: string; model: string; why: string; benchmark: string; reasoningEffort?: ReasoningEffort; served?: string };
-
-/** Runtime fail-closed check: does the model the backend actually SERVED match the one we chose? Tolerates a version
- *  suffix (served "claude-opus-5.5-20261001" for chosen "claude-opus-5.5") but rejects a different model (a flagged
- *  silent downgrade, e.g. opus-4.5 served for opus-5.5) — "claimed != served" (same principle as cpa:fingerprint). */
-export function servedMatchesChosen(chosen: string, served: string): boolean {
-  const c = normalizeModelName(chosen), s = normalizeModelName(served);
-  if (c.length === 0 || s.length === 0) return false;
-  return s.includes(c) || c.includes(s);
-}
-export type ResolveResult = { ok: true; model: string; selection: ModelSelection } | { ok: false; reason: string };
 
 export function defaultTablePath(): string {
   return path.join(path.dirname(fileURLToPath(import.meta.url)), "roles", "model-tiers.json");
@@ -47,73 +40,91 @@ export function loadModelTierTable(file = defaultTablePath()): ModelTierTable {
   return JSON.parse(readFileSync(file, "utf8")) as ModelTierTable;
 }
 
-/** Lowercase, alphanumeric-only — so "opus 5.5", "claude-opus-5-5", "claude opus 5.5" all compare equal-ish. */
+/** Lowercase, alphanumeric-only. Kept as a display/debug utility — NOT used for identity (identity is exact alias match). */
 export const normalizeModelName = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, "");
 
-/** Find the catalog id that best matches a display name / hint: an exact normalized match wins; otherwise the SHORTEST
- *  catalog id whose normalized form contains (or is contained by) the normalized name. null if nothing matches. */
-export function resolveToCatalogId(nameOrHint: string, catalog: string[]): string | null {
-  const want = normalizeModelName(nameOrHint);
-  if (want.length === 0) return null;
-  let best: { id: string; norm: string } | null = null;
-  for (const id of catalog) {
-    const norm = normalizeModelName(id);
-    if (norm === want) return id; // exact normalized match wins outright
-    if (norm.includes(want) || want.includes(norm)) {
-      if (best === null || norm.length < best.norm.length) best = { id, norm };
-    }
-  }
-  return best ? best.id : null;
+/** Strip a trailing date/version-stamp suffix (e.g. "...-20261001") so a dated served id maps to its base alias. Only a
+ *  6-8 digit trailing group is stripped — a short id like "claude-opus-5-5" (trailing "-5") is left intact. */
+export function stripDateSuffix(id: string): string {
+  return id.replace(/[-_.]\d{6,8}$/, "");
 }
 
-/** AA Intel score for a model (by display name or catalog id), from the benchmark snapshot. undefined if not benchmarked. */
-export function aaIntelOf(nameOrId: string, table: ModelTierTable): number | undefined {
-  const want = normalizeModelName(nameOrId);
-  let best: { score: number; norm: string } | undefined;
-  for (const e of table.benchmarkScores) {
-    const norm = normalizeModelName(e.name);
-    if (norm === want) return e.aaIntel;
-    if (norm.includes(want) || want.includes(norm)) {
-      if (best === undefined || norm.length < best.norm.length) best = { score: e.aaIntel, norm };
-    }
+type Index = { byId: Map<string, ModelEntry>; aliasToId: Map<string, string> };
+function indexOf(table: ModelTierTable): Index {
+  const byId = new Map<string, ModelEntry>();
+  const aliasToId = new Map<string, string>();
+  for (const m of table.models) {
+    byId.set(m.id, m);
+    for (const a of m.aliases) aliasToId.set(a, m.id);
   }
-  return best?.score;
+  return { byId, aliasToId };
+}
+
+/** The ModelEntry a reference denotes: a canonical id ("opus 5.5"), an exact catalog alias ("claude-opus-5-5"), or a dated
+ *  alias ("claude-opus-5-5-20261001"). undefined if the reference is not a known (benchmarked) model. EXACT only. */
+export function modelEntryOf(ref: string, table: ModelTierTable, idx: Index = indexOf(table)): ModelEntry | undefined {
+  if (idx.byId.has(ref)) return idx.byId.get(ref);
+  const canon = idx.aliasToId.get(ref) ?? idx.aliasToId.get(stripDateSuffix(ref));
+  return canon ? idx.byId.get(canon) : undefined;
+}
+
+/** AA Intel for a model (by canonical id or exact catalog alias); undefined if not a benchmarked model. */
+export function aaIntelOf(ref: string, table: ModelTierTable): number | undefined {
+  return modelEntryOf(ref, table)?.aaIntel;
+}
+
+/** The catalog id to use for a model reference: its first alias that is EXACTLY in the catalog. null if the reference is not
+ *  a known model, or none of its aliases are in the catalog. */
+export function resolveToCatalogId(ref: string, catalog: string[], table: ModelTierTable = loadModelTierTable()): string | null {
+  const entry = modelEntryOf(ref, table);
+  if (!entry) return null;
+  return entry.aliases.find((a) => catalog.includes(a)) ?? null;
 }
 
 export type ResolveOpts = { catalog: string[]; chosen?: string; why?: string; table?: ModelTierTable };
+export type ResolveResult = { ok: true; model: string; selection: ModelSelection } | { ok: false; reason: string };
 
-/** Resolve a role's model against the live CPA catalog, FAIL-CLOSED. No `chosen` => the strongest available recommended
- *  baseline (by AA Intel). A `chosen` must be in the catalog AND same-or-stronger than the role floor; a non-baseline
- *  self-select also requires a `why` (the worklog triple). Returns the resolved catalog id + the selection record. */
 export function resolveRoleModel(role: Role, opts: ResolveOpts): ResolveResult {
   const table = opts.table ?? loadModelTierTable();
   const spec = table.roles[role];
   if (!spec) return { ok: false, reason: `unknown role "${role}"` };
+  const idx = indexOf(table);
+  const eff = spec.reasoningEffort !== undefined ? { reasoningEffort: spec.reasoningEffort } : {};
+  const availableAlias = (entry: ModelEntry): string | null => entry.aliases.find((a) => opts.catalog.includes(a)) ?? null;
 
   if (opts.chosen !== undefined && opts.chosen.length > 0) {
-    const id = resolveToCatalogId(opts.chosen, opts.catalog);
-    if (id === null) return { ok: false, reason: `chosen model "${opts.chosen}" is not in the CPA catalog — fail-closed` };
-    const eff = spec.reasoningEffort !== undefined ? { reasoningEffort: spec.reasoningEffort } : {};
-    const asBaseline = spec.recommended.find((r) => resolveToCatalogId(r.match, opts.catalog) === id);
-    if (asBaseline) return { ok: true, model: id, selection: { chosen: opts.chosen, model: id, why: opts.why ?? "recommended baseline (explicit)", benchmark: `recommended ${role}; AA Intel ${asBaseline.aaIntel} >= floor ${spec.floorAaIntel} (${table.version})`, ...eff } };
-    // self-select: must be verifiably same-or-stronger, and carry a reason.
-    const score = aaIntelOf(opts.chosen, table) ?? aaIntelOf(id, table);
-    if (score === undefined) return { ok: false, reason: `cannot verify "${opts.chosen}" is same-or-stronger: no AA Intel benchmark for it — add it via a user ruling before self-selecting` };
-    if (score < spec.floorAaIntel) return { ok: false, reason: `"${opts.chosen}" AA Intel ${score} < ${role} floor ${spec.floorAaIntel} (weaker than recommended) — fail-closed` };
-    if (opts.why === undefined || opts.why.length === 0) return { ok: false, reason: `self-selected model "${opts.chosen}" requires a selection reason (why) for the worklog triple` };
-    return { ok: true, model: id, selection: { chosen: opts.chosen, model: id, why: opts.why, benchmark: `self-select ${role}; AA Intel ${score} >= floor ${spec.floorAaIntel} (${table.version})`, ...eff } };
+    const entry = modelEntryOf(opts.chosen, table, idx);
+    if (!entry) return { ok: false, reason: `"${opts.chosen}" is not a benchmarked model (exact alias match) — add it to the model-tier table (a user ruling) before selecting it` };
+    const id = availableAlias(entry);
+    if (id === null) return { ok: false, reason: `chosen model "${opts.chosen}" (${entry.id}) has no alias in the CPA catalog — fail-closed` };
+    if (entry.aaIntel < spec.floorAaIntel) return { ok: false, reason: `"${entry.id}" AA Intel ${entry.aaIntel} < ${role} floor ${spec.floorAaIntel} (weaker than recommended) — fail-closed` };
+    const isRecommended = spec.recommended.includes(entry.id);
+    if (!isRecommended && (opts.why === undefined || opts.why.length === 0)) return { ok: false, reason: `self-selected model "${entry.id}" requires a selection reason (why) for the worklog triple` };
+    return { ok: true, model: id, selection: { chosen: opts.chosen, model: id, why: opts.why ?? "recommended baseline (explicit)", benchmark: `${isRecommended ? "recommended" : "self-select"} ${role}; AA Intel ${entry.aaIntel} >= floor ${spec.floorAaIntel} (${table.version})`, ...eff } };
   }
 
-  // No chosen: the strongest available recommended baseline (reasoning strength first).
-  const ranked = [...spec.recommended].sort((a, b) => b.aaIntel - a.aaIntel);
-  for (const r of ranked) {
-    const id = resolveToCatalogId(r.match, opts.catalog);
-    if (id !== null) return { ok: true, model: id, selection: { chosen: r.name, model: id, why: "recommended baseline (strongest available in catalog)", benchmark: `AA Intel ${r.aaIntel} >= floor ${spec.floorAaIntel} (${table.version})`, ...(spec.reasoningEffort !== undefined ? { reasoningEffort: spec.reasoningEffort } : {}) } };
+  // No chosen: the strongest recommended that is AT/ABOVE the current floor AND available (reasoning strength first).
+  const qualified = spec.recommended
+    .map((rid) => idx.byId.get(rid))
+    .filter((e): e is ModelEntry => e !== undefined && e.aaIntel >= spec.floorAaIntel)
+    .sort((a, b) => b.aaIntel - a.aaIntel);
+  for (const e of qualified) {
+    const id = availableAlias(e);
+    if (id !== null) return { ok: true, model: id, selection: { chosen: e.id, model: id, why: "recommended baseline (strongest available in catalog)", benchmark: `AA Intel ${e.aaIntel} >= floor ${spec.floorAaIntel} (${table.version})`, ...eff } };
   }
-  return { ok: false, reason: `fail-closed: none of the ${role} recommended models are in the CPA catalog (${spec.recommended.map((r) => r.name).join(", ")})` };
+  return { ok: false, reason: `fail-closed: no ${role} recommended model at/above floor ${spec.floorAaIntel} is in the CPA catalog (${spec.recommended.join(", ")})` };
 }
 
-/** Convenience for the PLANNER heavy binding (draftPlan/expand). */
 export function resolvePlannerModel(opts: ResolveOpts): ResolveResult {
   return resolveRoleModel("planning", opts);
+}
+
+/** Runtime fail-closed: did the backend serve the SAME model we chose? True iff both resolve to the SAME benchmarked model
+ *  by EXACT alias identity (a trailing -<date> suffix tolerated). A different model (a flagged silent downgrade like
+ *  opus-5 for opus-5-5, or a bare "claude") resolves to a different/unknown canonical => false. */
+export function servedMatchesChosen(chosen: string, served: string, table: ModelTierTable = loadModelTierTable()): boolean {
+  const idx = indexOf(table);
+  const cc = modelEntryOf(chosen, table, idx)?.id;
+  const sc = modelEntryOf(served, table, idx)?.id;
+  return cc !== undefined && cc === sc;
 }
