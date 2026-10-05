@@ -150,6 +150,9 @@ export function routingActiveSignal(routeKey: string, count: number, lastObserve
 // undelivered notice alive past episode close (R4). All of that needs state persisted between ticks, below. ---
 
 export type WindowEvent = { ts: number; route: string };
+/** An unfulfilled (or recently-delivered) coordinator notice for ONE incident, keyed by its FULL incidentId in the watch (R4).
+ *  notifiedAtSec unset ⇒ still owed (retry, at-least-once); set ⇒ delivered (durable, so a confirmed notice is never re-sent). */
+export type OwedNotice = { why: string; open: boolean; repairWaitId: string; notifiedAtSec?: number };
 export type DeadLetterWatch = {
   /** Ledger file-identity fingerprint for rotation/truncation detection (R3): a changed sig OR size < offset ⇒ re-read from 0. */
   sig: string;
@@ -172,10 +175,16 @@ export type DeadLetterWatch = {
   recovered: Record<string, number>;
   /** route -> failure count at detection, awaiting a durable CONTROL commit (R1 durable candidate; removed only after commit). */
   pending: Record<string, number>;
+  /** incidentId -> the owed/delivered coordinator notice (R4). reg.episodes is keyed by groupKey and keeps only the LATEST
+   *  generation, so a recurrence (episode+1) overwrites a previous episode still owing a notice; keying the obligation by the
+   *  full incidentId HERE (durable) preserves every generation's notice until delivered. A delivered entry is pruned once its
+   *  episode is superseded, bounding growth. The delivered marker living here (not only on the overwritten episode) means a
+   *  lost registry write only DELAYS a notice, and a confirmed one is never re-sent across a restart. */
+  owed: Record<string, OwedNotice>;
 };
 
 export function emptyDeadLetterWatch(): DeadLetterWatch {
-  return { sig: "", offset: 0, carry: "", truncating: false, window: [], handled: {}, recovered: {}, pending: {} };
+  return { sig: "", offset: 0, carry: "", truncating: false, window: [], handled: {}, recovered: {}, pending: {}, owed: {} };
 }
 
 /** Fold a freshly-read byte chunk into (events, carryB64, truncating): prepend the prior carry BYTES, decode only up to the
@@ -196,7 +205,13 @@ export function ingestLedgerChunk(carryB64: string, chunk: Buffer, maxCarryBytes
     if (combined.length > maxCarryBytes) return { events: [], carry: "", truncating: true }; // over-long incomplete line ⇒ start skipping (R3)
     return { events: [], carry: combined.toString("base64"), truncating: false };            // no complete line yet — keep accumulating
   }
-  return { events: parseDeadLetters(combined.toString("utf8", 0, nl)), carry: combined.subarray(nl + 1).toString("base64"), truncating: false };
+  // Parse the complete prefix lines, then cap the TRAILING incomplete fragment too (R3-b): the bytes after the last newline are
+  // an incomplete line like the no-newline case, so an over-cap fragment must ALSO enter skipping instead of being carried —
+  // the cap was previously only checked on the no-newline branch, letting a long trailing residue persist past the limit.
+  const events = parseDeadLetters(combined.toString("utf8", 0, nl));
+  const rest = combined.subarray(nl + 1);
+  if (rest.length > maxCarryBytes) return { events, carry: "", truncating: true }; // over-long trailing fragment ⇒ skip until its newline; the parsed records are kept
+  return { events, carry: rest.toString("base64"), truncating: false };
 }
 
 /** Drop window events older than the window start (sliding window; R1 retains in-window, prunes aged-out). */
@@ -237,7 +252,7 @@ export function readDeadLetterWatch(file: string): DeadLetterWatch {
   return {
     sig: typeof p.sig === "string" ? p.sig : "", offset: p.offset, carry: p.carry,
     truncating: p.truncating === true, window: p.window,
-    handled: p.handled ?? {}, recovered: p.recovered ?? {}, pending: p.pending ?? {},
+    handled: p.handled ?? {}, recovered: p.recovered ?? {}, pending: p.pending ?? {}, owed: p.owed ?? {},
   };
 }
 

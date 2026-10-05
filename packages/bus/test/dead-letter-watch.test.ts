@@ -58,6 +58,24 @@ describe("dead-letter incremental ingest (R1/R3 record boundary, byte/UTF-8 safe
     expect(resume.events.map((e) => e.ts)).toEqual([1000, 2000]); // the records after the dropped line are NOT lost (not R1 tail-cut)
     expect(resume.truncating).toBe(false);
   });
+
+  test("R3-b: a complete line followed by an over-cap trailing fragment parses the line and SKIPS the fragment (cap on every return path)", () => {
+    const r = ing("", buf(line(1000, "a", "x") + "y".repeat(100)), 16, false); // one complete record + 100-byte no-newline tail, cap 16
+    expect(r.events.map((e) => e.ts)).toEqual([1000]); // the complete record is kept
+    expect(r.carry).toBe("");                          // the over-cap trailing fragment is NOT carried (was previously retained unbounded)
+    expect(r.truncating).toBe(true);                   // enter skipping, exactly like the no-newline over-long case
+    // the skip ends at the fragment's terminating newline; records after it resume normally
+    const resume = ing(r.carry, buf(`tail-of-fragment\n${line(2000, "b", "y")}`), 16, r.truncating);
+    expect(resume.events.map((e) => e.ts)).toEqual([2000]);
+    expect(resume.truncating).toBe(false);
+  });
+
+  test("R3-b: a complete line + a WITHIN-cap trailing fragment still carries the fragment (cap not over-eager)", () => {
+    const r = ing("", buf(line(1000, "a", "x") + '{"ts":2'), 16, false); // 7-byte tail, under cap
+    expect(r.events.map((e) => e.ts)).toEqual([1000]);
+    expect(unb64(r.carry)).toBe('{"ts":2');
+    expect(r.truncating).toBe(false);
+  });
 });
 
 describe("routeKeyOf is null-safe on a malformed from/to (R1 — never throws past the cursor)", () => {
@@ -100,7 +118,7 @@ describe("dead-letter watch snapshot IO", () => {
   test("missing ⇒ empty; write ⇒ read round-trips cursor/carry/truncating/window/handled/recovered/pending", () => {
     const f = path.join(HOME, "dlw.json");
     expect(readDeadLetterWatch(f)).toEqual(emptyDeadLetterWatch());
-    const w: DeadLetterWatch = { sig: "42", offset: 2048, carry: b64('{"ts":9'), truncating: false, window: [{ ts: 9000, route: "a->x" }], handled: { "a->x": 8000 }, recovered: { "a->x": 7000 }, pending: { "b->y": 3 } };
+    const w: DeadLetterWatch = { sig: "42", offset: 2048, carry: b64('{"ts":9'), truncating: false, window: [{ ts: 9000, route: "a->x" }], handled: { "a->x": 8000 }, recovered: { "a->x": 7000 }, pending: { "b->y": 3 }, owed: { "routing:a->x:episode-1": { why: "3 dead-letters", open: false, repairWaitId: "rw", notifiedAtSec: 7100 } } };
     writeDeadLetterWatch(f, w);
     expect(readDeadLetterWatch(f)).toEqual(w);
   });

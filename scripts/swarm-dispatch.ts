@@ -838,7 +838,8 @@ async function main(): Promise<void> {
   let deadLetterNotifyCursor = 0; // in-memory round-robin over owed notifications (R3 per-tick notify budget)
   const isEmptyWatch = (w: DeadLetterWatch): boolean =>
     w.offset === 0 && w.sig === "" && w.carry === "" && !w.truncating && w.window.length === 0
-    && Object.keys(w.handled).length === 0 && Object.keys(w.recovered).length === 0 && Object.keys(w.pending).length === 0;
+    && Object.keys(w.handled).length === 0 && Object.keys(w.recovered).length === 0 && Object.keys(w.pending).length === 0
+    && Object.keys(w.owed).length === 0;
   const runDeadLetterWatch = (): void => {
     // Load the durable watch + registry FIRST — both independent of the ledger (R2: the backstop over already-known CONTROL/
     // registry obligations must run even when the ledger is missing/unreadable). Corrupt ⇒ skip, never reset durable state (R1).
@@ -859,7 +860,7 @@ async function main(): Promise<void> {
       try {
         const stt = fstatSync(fd);
         const sig = String(stt.ino);
-        if ((watch.sig !== "" && watch.sig !== sig) || stt.size < watch.offset) { watch.offset = 0; watch.carry = ""; } // rotated/truncated
+        if ((watch.sig !== "" && watch.sig !== sig) || stt.size < watch.offset) { watch.offset = 0; watch.carry = ""; watch.truncating = false; } // rotated/truncated — a new input stream, so drop the prior stream's skip-state too, else the new file's first record is eaten as an old over-long line's tail (R3-a)
         watch.sig = sig;
         const toRead = Math.min(MAX_READ_BYTES, Math.max(0, stt.size - watch.offset));
         if (toRead > 0) {
@@ -913,12 +914,20 @@ async function main(): Promise<void> {
           const sync = reconcileRegistryWithControl(reg, groupKey, "routing", groupCtlWaits, nowSec());
           if (sync.registry !== reg) { writeIncidents(INCIDENTS_FILE, sync.registry); reg = sync.registry; }
           const route = routeKeyOfGroup(groupKey);
-          // R5: a reconcile that RECOVERED the episode (was open, now closed/gone) records a recovery boundary, so neither the
-          // ingested burst NOR a late-ingested PRE-recovery failure (ts under this) can fake a relapse — only a strictly-newer
-          // failure is post-recovery evidence.
+          // R5: a reconcile that RECOVERED the episode (was open, now closed/gone) records a recovery boundary, so a failure at/
+          // under it never fakes a relapse. NOTE (R5-B, pending f32a0507 design): this boundary is the OBSERVATION time (nowMs),
+          // not the true recovery OCCURRENCE time — a bare CONTROL close carries no timestamp, so a failure that occurred after
+          // the real recovery but before we observed the close is still wrongly excluded. Carrying the occurrence time on the
+          // recovery evidence is the open design question; until then this is the conservative v1 approximation.
           if (route !== null && wasOpen && reg.episodes[groupKey]?.open !== true) watch.recovered[route] = Math.max(watch.recovered[route] ?? 0, nowMs);
-          if (route !== null && watch.pending[route] !== undefined) { // a DURABLE candidate at/above threshold awaiting commit
-            const rec = reconcileIncidentCore(reg, routingActiveSignal(route, watch.pending[route], fresh.seq), nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner: REPAIR_OWNER_ROUTABLE ? REPAIR_OWNER : SELF, controlEpisodeFloor: sync.controlEpisodeFloor });
+          if (route !== null && watch.pending[route] !== undefined) { // a DURABLE candidate awaiting commit
+            // R5-A (ordering): the candidate count was computed BEFORE this tick's recovery boundary was known. Re-evaluate
+            // freshness against the now-updated recovered so a PRE-recovery burst ingested in the same tick the recovery was
+            // observed cannot open a new episode from a stale count. Below threshold ⇒ discharge the candidate, no reopen.
+            const freshNow = countFreshByRoute(watch.window, windowStartMs, watch.handled, watch.recovered).get(route) ?? 0;
+            if (freshNow < DEAD_LETTER_THRESHOLD) { delete watch.pending[route]; continue; }
+            watch.pending[route] = freshNow;
+            const rec = reconcileIncidentCore(reg, routingActiveSignal(route, freshNow, fresh.seq), nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner: REPAIR_OWNER_ROUTABLE ? REPAIR_OWNER : SELF, controlEpisodeFloor: sync.controlEpisodeFloor });
             let settled = false;
             if (rec.openRepairWait !== undefined) { // NEW episode ⇒ commit/adopt the repair-wait (the notify obligation is derived below from the committed episode — R4)
               const spec = rec.openRepairWait;
@@ -939,25 +948,36 @@ async function main(): Promise<void> {
       deadLetterCursor = (deadLetterCursor + batchCount) % all.length;
     }
 
-    // R4 notify obligation DERIVED from the committed registry (not a volatile per-branch map): EVERY routing episode — OPEN OR
-    // CLOSED — whose notifiedAtSec is unset still owes the coordinator a notice. This covers the adopt, dedup, and closed-episode
-    // paths the old per-create branch missed, and it survives a restart because the delivered marker (notifiedAtSec) lives in the
-    // committed incidents.json, not the watch — so a lost watch/registry write only DELAYS a notice, never drops it, and a
-    // confirmed one is never re-sent. R3 budget: at most MAX_NOTIFY_PER_TICK per tick (round-robin); a backlog drains over ticks.
-    const owed = Object.entries(reg.episodes).filter(([, ep]) => ep.category === "routing" && ep.notifiedAtSec === undefined);
+    // R4 notify obligation keyed by FULL incidentId in the DURABLE WATCH — not by groupKey in the registry. reg.episodes keeps
+    // only the latest generation per groupKey, so a recurrence (episode+1) OVERWRITES a previous episode that still owed a notice;
+    // deriving owed straight from reg.episodes therefore loses the old generation's obligation. Instead, MIRROR every routing
+    // episode's obligation into watch.owed[incidentId] (distinct generations are distinct keys ⇒ never overwritten), refreshing
+    // open/why while still owed. This still reconstructs from the registry (the adopt/dedup/sync-close paths keep working, so a
+    // lost registry write is recovered from CONTROL and re-mirrored), and the delivered marker lives in the watch so a confirmed
+    // notice is never re-sent across a restart. Round-robin budget: at most MAX_NOTIFY_PER_TICK per tick (R3).
+    for (const ep of Object.values(reg.episodes)) {
+      if (ep.category !== "routing") continue;
+      const cur = watch.owed[ep.incidentId];
+      if (cur === undefined) watch.owed[ep.incidentId] = { why: ep.why, open: ep.open, repairWaitId: ep.repairWaitId, ...(ep.notifiedAtSec !== undefined ? { notifiedAtSec: ep.notifiedAtSec } : {}) };
+      else if (cur.notifiedAtSec === undefined) watch.owed[ep.incidentId] = { ...cur, why: ep.why, open: ep.open, repairWaitId: ep.repairWaitId }; // refresh text/state while still owed
+    }
+    const owed = Object.entries(watch.owed).filter(([, n]) => n.notifiedAtSec === undefined);
     if (owed.length > 0) {
       const notifyCount = Math.min(MAX_NOTIFY_PER_TICK, owed.length);
       deadLetterNotifyCursor %= owed.length;
       for (let i = 0; i < notifyCount; i++) {
-        const [gk, ep] = owed[(deadLetterNotifyCursor + i) % owed.length]!;
-        const text = `routing incident ${ep.incidentId}: ${ep.why}${ep.open ? "" : " (recovered)"}`;
-        if (notifyCoordinator(text, { taskRef: ep.repairWaitId ?? ep.incidentId, title: "routing incident" }) !== "failed") {
-          reg = { episodes: { ...reg.episodes, [gk]: { ...ep, notifiedAtSec: nowSec() } } };
-          writeIncidents(INCIDENTS_FILE, reg); // durable delivered marker ⇒ no re-send of a confirmed notice across restarts
-        } else log(`routing notify for ${ep.incidentId} failed (transient) — retry next tick`);
+        const [incidentId, n] = owed[(deadLetterNotifyCursor + i) % owed.length]!;
+        const text = `routing incident ${incidentId}: ${n.why}${n.open ? "" : " (recovered)"}`;
+        if (notifyCoordinator(text, { taskRef: n.repairWaitId || incidentId, title: "routing incident" }) !== "failed")
+          watch.owed[incidentId] = { ...n, notifiedAtSec: nowSec() }; // durable delivered marker (persisted with the watch below)
+        else log(`routing notify for ${incidentId} failed (transient) — retry next tick`);
       }
       deadLetterNotifyCursor = (deadLetterNotifyCursor + notifyCount) % owed.length;
     }
+    // Prune a DELIVERED notice whose incidentId is no longer the current generation for its group — a superseded, already-sent
+    // obligation is safe to forget, bounding watch.owed's growth. An un-delivered or still-current entry is kept.
+    const currentIncidentIds = new Set(Object.values(reg.episodes).filter((e) => e.category === "routing").map((e) => e.incidentId));
+    for (const incidentId of Object.keys(watch.owed)) if (watch.owed[incidentId]!.notifiedAtSec !== undefined && !currentIncidentIds.has(incidentId)) delete watch.owed[incidentId];
 
     // Persist the watch LAST (after commits + notifies): a crash before this re-reads the same cursor/window/pending next run,
     // never skipping durable work (R1). Stay fully dormant (write no file) only when there is genuinely nothing to track (R2).
