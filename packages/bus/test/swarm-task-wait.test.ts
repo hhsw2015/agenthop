@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { initialLogState, commit } from "../src/swarm/control-log.js";
 import type { WaitRecord, PendingAction, WaitResolution, Change } from "../src/swarm/control-log.js";
-import { openWait, openQueryWait, applyDefaultOnTimeout, advanceWait, isLive, isGranted, type NewWait } from "../src/swarm/task-wait.js";
+import { openWait, openQueryWait, applyDefaultOnTimeout, advanceWait, isLive, isGranted, isRenewable, type NewWait } from "../src/swarm/task-wait.js";
 
 const subj = { jobId: "job", attemptId: "job/P/a1" };
 const res = (outcome: string): WaitResolution => ({ outcome, reason: "r", sourceOperationId: "op" });
@@ -151,5 +151,40 @@ describe("R3-b query-wait (问询不裸等): a query carries a default, applied 
     // @ts-expect-error — NewWait (openWait, used for approvals) has no defaultOnTimeout; a default is set ONLY via
     // openQueryWait, which is always kind="wait". "问询不裸等 vs 门控才裸等" separated at the type layer.
     openWait({ waitId: "a1", kind: "approval", subject: { jobId: "job" }, deadlineSec: 100, owner: "disp", timeoutPolicy: "escalate", defaultOnTimeout: { outcome: "x", reason: "y", sourceOperationId: "z" } });
+  });
+});
+
+// §2c-b evidence renewal (coordinator-routed boundary with 20cab0a5): the pure `renew` event + isRenewable predicate.
+describe("renew (§2c-b evidence renewal)", () => {
+  const renewable = (p: Partial<NewWait> = {}): WaitRecord => openWait({ waitId: "sup1", kind: "wait", subject: { jobId: "job" }, deadlineSec: 100, owner: "disp", timeoutPolicy: "escalate", ...p });
+
+  test("isRenewable: only an escalate liveness wait (no defaultOnTimeout / validationRunId / approval / bypass)", () => {
+    expect(isRenewable(renewable())).toBe(true);
+    expect(isRenewable(mkWait({ timeoutPolicy: "bypass" }))).toBe(false); // bypass = semantic
+    expect(isRenewable(mkApproval())).toBe(false); // approval
+    expect(isRenewable(openQueryWait({ waitId: "q", subject: { jobId: "job" }, deadlineSec: 100, owner: "d", defaultOnTimeout: res("default-applied") }))).toBe(false); // query-wait
+    expect(isRenewable(renewable({ subject: { jobId: "job", validationRunId: "v1" } }))).toBe(false); // validation
+  });
+
+  test("renew on a renewable OPEN wait re-arms (open + fresh deadline + escalatedAt), never resolves", () => {
+    const r = advanceWait(renewable(), { type: "renew", newDeadlineSec: 500, nowSec: 42 });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.wait.state).toBe("open");
+    expect(r.wait.deadlineSec).toBe(500);
+    expect(r.wait.escalatedAt).toBe(42);
+    expect(isLive(r.wait)).toBe(true);
+  });
+
+  test("renew is rejected on a semantic-deadline wait", () => {
+    expect(advanceWait(mkWait({ timeoutPolicy: "bypass" }), { type: "renew", newDeadlineSec: 500 }).ok).toBe(false);
+    expect(advanceWait(mkApproval(), { type: "renew", newDeadlineSec: 500 }).ok).toBe(false);
+  });
+
+  test("renew is rejected from a non-open state and without a new deadline", () => {
+    const pending = advanceWait(renewable(), { type: "begin_action", pendingAction: notice });
+    expect(pending.ok).toBe(true);
+    if (pending.ok) expect(advanceWait(pending.wait, { type: "renew", newDeadlineSec: 500 }).ok).toBe(false); // action_pending
+    expect(advanceWait(renewable(), { type: "renew" } as never).ok).toBe(false); // missing newDeadlineSec
   });
 });

@@ -104,7 +104,10 @@ export type WaitEvent =
   // the real approval decision arrived (approval only). A terminal decision ENDS the wait.
   | { type: "decide"; decision: Exclude<ApprovalDecision, "pending">; grantRef?: string; resolution?: WaitResolution }
   // the subject completed/cancelled/was replaced normally -> close the wait (P2-1; committed same-batch as the subject).
-  | { type: "close"; resolution: WaitResolution };
+  | { type: "close"; resolution: WaitResolution }
+  // §2c-b evidence renewal: fresh liveness evidence arrived WHILE open -> push the deadline out. Same re-armed shape as
+  // action_done, NEVER resolves. ONLY for a renewable (liveness/reminder) wait — a semantic-deadline wait rejects it.
+  | { type: "renew"; newDeadlineSec: number; nowSec?: number };
 
 export type WaitAdvance = { ok: true; wait: WaitRecord } | { ok: false; error: string };
 
@@ -143,7 +146,25 @@ export function advanceWait(w: WaitRecord, event: WaitEvent): WaitAdvance {
     case "close":
       if (w.state === "resolved") return bad("close on a resolved wait");
       return ok({ state: "resolved", pendingAction: undefined, resolution: event.resolution });
+
+    case "renew": {
+      // Renewal is a liveness re-arm from OPEN (evidence arrived before any timeout action). Same shape as action_done's
+      // re-arm (open + fresh deadline + escalatedAt, pendingAction cleared) and NEVER resolves. Only a renewable wait
+      // qualifies — a semantic-deadline wait (query/validation/approval/bypass) must keep its real deadline.
+      if (!isRenewable(w)) return bad("renew on a semantic-deadline wait (not a renewable liveness/reminder wait)");
+      if (w.state !== "open") return bad(`renew from ${w.state} (only an open wait renews; action_pending must action_done first)`);
+      if (event.newDeadlineSec === undefined) return bad("renew requires newDeadlineSec (renewal never resolves)");
+      return ok({ state: "open", deadlineSec: event.newDeadlineSec, escalatedAt: event.nowSec, pendingAction: undefined });
+    }
   }
+}
+
+/** §2c-b classification (single source of truth; the sweep side reuses this exact predicate). A wait is RENEWABLE
+ *  (liveness/reminder — fresh health evidence may push its deadline) iff it is an escalate-policy supervision wait with no
+ *  semantic-deadline marker: a query-wait (defaultOnTimeout), a validation-wait (subject.validationRunId), an approval, or
+ *  any non-escalate timeoutPolicy is a SEMANTIC deadline and is NOT renewable. */
+export function isRenewable(w: WaitRecord): boolean {
+  return w.kind === "wait" && w.defaultOnTimeout === undefined && w.subject.validationRunId === undefined && w.timeoutPolicy === "escalate";
 }
 
 /** Is this wait still something the sweep must supervise? (open or action_pending). */
