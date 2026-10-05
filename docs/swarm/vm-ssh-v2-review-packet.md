@@ -27,7 +27,8 @@ workflow/logs/quota decouple from business repos; user approved repo-create + Ac
 | Caller-chosen, NEVER auto-selected (coordinator division: railway=short/unbounded, gha=long/6h/single-acct-capped) | no auto-select anywhere; `ls` annotates the gha single-account Actions-quota semantics (no tracking) |
 | Embedded box workflow (single-file) | `WORKFLOW_YAML` + `WORKFLOW_FILE` |
 | `init [repo]` idempotent, print-before-write | `cmdInit` (gh contents API; identical-content = no-op) |
-| `up --backend gha` → dispatch → run-id lock → capture | `cmdUpGha` → `ghaDispatch`/`ghaLockRunId` (pre-dispatch timestamp)/`ghaCaptureAddr` (artifact) |
+| `up --backend gha` → dispatch → run-id lock → capture | `cmdUpGha` → `ghaDispatch`/`ghaLockRunId` (exact `run_tag` nonce in displayTitle)/`ghaCaptureAddr` (artifact, status-gated) |
+| credential channel (ruling #R3) | `gh secret set VMSSH_SECRET` → workflow masked env `$VMSSH_SECRET` to `--init`; `--init` is non-sensitive only (never a plaintext input) |
 | keyed via `<user>@github` published keys (zero secret); public-repo `--open` refused | workflow `--ssh-authorized-keys`; `openRefusedOnPublic`; `ghaPreflightKeys` (non-fatal warn) |
 | `down` (gha sentinel / cancel; railway no-op) | `cmdDown` |
 | `ssh`/`ls`/`refresh` backend-aware | `cmdSsh` (gha `sshUser`), `cmdLs` (backend column + quota note), `cmdRefresh` (gha re-download) |
@@ -64,16 +65,21 @@ tailcat's **in-process SSH server does not implement SSH agent forwarding**. Ver
 `auth-agent-req@openssh.com`, but the remote `SSH_AUTH_SOCK` stays unset (both plain `tailcat ssh` and a self-built
 `ProxyCommand=tailcat <addr> 22` + `ForwardAgent=yes` yield `SOCK=none`). `tailcat serve --help` exposes no agent/forward
 surface. This is an **upstream tailcat capability edge, not an implementation gap**. Consequence: a box cannot clone a
-private repo via the laptop's forwarded agent. Per the primitive's cut line, a box that must clone injects a
-**short-lived, narrowly-scoped credential via `up --init`** (never a long-lived key baked into the box). The connect path
-stays `tailcat ssh` (reliable); the ProxyCommand route was rejected (transient ping timeouts, and its `ForwardAgent` is
-ignored by the server anyway).
+private repo via the laptop's forwarded agent. Per the primitive's cut line, cloning/bootstrap is the caller's job. The
+connect path stays `tailcat ssh` (reliable); the ProxyCommand route was rejected (transient ping timeouts, and its
+`ForwardAgent` is ignored by the server anyway).
+
+**Credential path (ruling #R3, supersedes the earlier `--init`-token note):** `--init` is a NON-SENSITIVE bootstrap
+script only. A credential uses the supported secret channel — `gh secret set VMSSH_SECRET -R <home-repo>` → the workflow
+exposes the masked env `$VMSSH_SECRET` to `--init`, never a plaintext workflow input/argv/log. "Short-lived" does not
+substitute for confidential transport, and a private home repo is not permanently private.
 
 ## Tests
-- In-file selftest (`vm-ssh --selftest`, pure, no network): v1 assertions + v2 — `parseLogAddr`, `normalizeOs`
-  (map + reject), `sshUserForOs`, `openRefusedOnPublic` (public forbids `--open` only), `backendOf` default,
-  `ttlSec` (gha honors ttlMin), `WORKFLOW_YAML` shape (dispatch inputs + keyed key-fetch + addr marker + sentinel +
-  `contents: read`). All pass. `tsc --noEmit` clean.
+- In-file selftest (`vm-ssh --selftest`, pure, no network): v1 assertions + v2 — `normalizeOs` (map + reject + a
+  prototype key like `constructor`), `sshUserForOs`, `openRefusedOnPublic` (public forbids `--open` only), `backendOf`
+  default, `ttlSec` (gha honors ttlMin), `runTitleFor` exact-match (a `<tag>-other` title must not satisfy the lock),
+  `WORKFLOW_YAML` shape (dispatch inputs + keyed key-fetch + addr marker + sentinel + `contents: read` + `run_tag` nonce +
+  `secrets.VMSSH_SECRET` channel). All pass. `tsc --noEmit` clean.
 - Real run (ubuntu): init → up → ssh → down full chain green (box-test on hhsw2015/vm-ssh-home).
 
 ## Round-2 disposition — reviewer 01a0ff49 (4 findings, all fixed in `9897e05`, re-validated on a real run)
@@ -86,6 +92,15 @@ ignored by the server anyway).
 
 Also removed the now-dead `parseLogAddr` (capture uses the artifact, not logs). The real re-run confirmed the nonce lock
 (`displayTitle` = `vm-ssh-box vmssh-<nonce>`) and stdin dispatch end to end.
+
+## Round-3 disposition — reviewer 01a0ff49 (9897e05: 3 REMAIN) + coordinator ruling #R3, fixed in `9209997`
+| Finding | Fix |
+|---|---|
+| P1-1 residual: `displayTitle.includes(tag)` is substring (a `vm-ssh-box <tag>-other` title wins over the exact one); and a **completed** run's retained artifact is still reported ready | `ghaLockRunId` now matches the FULL run-name EXACTLY (`displayTitle === "vm-ssh-box <tag>"`). `ghaCaptureAddr` reads run **status first** each poll; a `completed` run returns `ended` (stale artifact, box gone) — `up`/`refresh` prune + report distinctly, never ready. |
+| P2-1 residual: registration only moved to post-lock; the dispatch/list window still double-proceeds on a same `--name`, and a lock timeout leaves no durable handle | name is reserved **atomically before any side effect** (`reserveMeta`, exclusive `wx`). On dispatch success the `run_tag` nonce is persisted immediately; a lock timeout keeps a recoverable handle (`ensureGhaRunId` re-locks by nonce for `refresh`/`down`); `cmdUp` frees the name only when neither runId nor nonce survived. |
+| P1-2 residual (ruling #R3): the credential still rode a plain workflow input/step env | **ruling #R3**: `--init` is non-sensitive only; the supported credential channel is `gh secret set VMSSH_SECRET` → masked `$VMSSH_SECRET` env (never a plaintext input/argv/log). Removed the `--init`-token recommendation from code + this packet + the brief; the stdin transport (local argv/error) stays closed. |
+
+Real re-run (`9209997`) confirmed the exact-title lock + status-gated capture + `ssh`(`runner`) + sentinel `down`.
 
 ## Seams to probe
 - `ghaLockRunId` identifies the run by the `run_tag` nonce in `displayTitle` — not a timestamp (ownership is exact).
