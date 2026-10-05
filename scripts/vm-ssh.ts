@@ -360,7 +360,7 @@ async function ghaPreflightKeys(githubUser: string): Promise<void> {
   } catch { /* best-effort */ }
 }
 
-async function cmdUpGha(id: string, mode: Mode, initScript: string | undefined, args: Args): Promise<void> {
+async function cmdUpGha(id: string, mode: Mode, initScript: string | undefined, args: Args, reqId: string): Promise<void> {
   // pure input validation first — fail fast before any network round-trip.
   const os = normalizeOs(args.val("--os") ?? "ubuntu");
   const ttlMin = Number(args.val("--ttl") ?? "360");
@@ -370,19 +370,27 @@ async function cmdUpGha(id: string, mode: Mode, initScript: string | undefined, 
   const githubUser = args.val("--user") ?? (await ghaResolveUser());
   if (mode === "keyed") await ghaPreflightKeys(githubUser);
   const runTag = `vmssh-${randomBytes(6).toString("hex")}`;
-  const base: Meta = { id, mode, backend: "gha", createdSec: Math.floor(Date.now() / 1000), addrFile: addrPath(id), repo: repo.nameWithOwner, os, githubUser, ttlMin, sshUser: sshUserForOs(os) };
+  const base: Meta = { id, mode, backend: "gha", createdSec: Math.floor(Date.now() / 1000), addrFile: addrPath(id), repo: repo.nameWithOwner, os, githubUser, ttlMin, sshUser: sshUserForOs(os), reqId };
+  // If the name was taken over by a newer up (ours was cancelled + reused) while we were awaiting, STOP without touching the
+  // new record; best-effort cancel our own run so it doesn't leak. Every late write/prune is generation-guarded.
+  const reused = async (runId?: string): Promise<never> => {
+    if (runId) await gh(["run", "cancel", runId, "-R", repo.nameWithOwner]).catch(() => {}); // our own run only; idempotent
+    throw new Error(`vm-ssh up --backend gha: name "${id}" was reused by another up while this one was in flight — aborting without disturbing the new instance`);
+  };
   // Persist repo + nonce BEFORE the request: if the dispatch request reaches GitHub (a run is created) but the reply is
   // lost (gh exits non-zero), the handle must already be on disk — an unknown dispatch result is NOT "not dispatched".
-  writeMeta({ ...base, runTag, phase: "requesting" });
+  if (!writeMetaIfOwner({ ...base, runTag, phase: "requesting" })) return reused();
   await ghaDispatch(repo.nameWithOwner, { os, ttlMin, auth: mode === "open" ? "none" : "keys", githubUser, userScript: initScript ?? "", runTag });
   const runId = await ghaLockRunId(repo.nameWithOwner, runTag);
   // Persist the run id too: a capture timeout must NOT orphan a billable, running box — down/refresh/ls can manage it.
-  writeMeta({ ...base, runTag, runId, phase: "running" });
+  if (!writeMetaIfOwner({ ...base, runTag, runId, phase: "running" })) return reused(runId);
   const cap = await ghaCaptureAddr(repo.nameWithOwner, runId);
-  if (cap.kind === "ended") { prune(id); throw new Error(`vm-ssh up --backend gha: run ${runId} completed before an address was captured (ttl too short, or the box failed early) — the box is gone. Inspect: gh run view ${runId} -R ${repo.nameWithOwner}`); }
+  if (cap.kind === "ended") { pruneIfOwner(id, reqId); throw new Error(`vm-ssh up --backend gha: run ${runId} completed before an address was captured (ttl too short, or the box failed early) — the box is gone. Inspect: gh run view ${runId} -R ${repo.nameWithOwner}`); }
   if (cap.kind === "timeout") throw new Error(`vm-ssh up --backend gha: dispatched run ${runId} but no address captured within ~150s. The box is RECORDED (id "${id}") and may still be coming up — retry: vm-ssh refresh ${id}; or stop it: vm-ssh down ${id}.`);
+  // re-check ownership AFTER the capture await, right before writing the address + ready record.
+  if (!recordIsOwned(readMeta(id), reqId)) return reused(runId);
   writeAddr(id, cap.addr);
-  writeMeta({ ...base, runTag, runId, phase: "ready" });
+  writeMetaIfOwner({ ...base, runTag, runId, phase: "ready" });
   process.stdout.write(`${JSON.stringify({ id, addrFile: addrPath(id), mode, backend: "gha", runId, os, ttlMin })}\n`);
 }
 
@@ -391,7 +399,12 @@ async function cmdUpGha(id: string, mode: Mode, initScript: string | undefined, 
 async function ensureGhaRunId(m: Meta): Promise<string | undefined> {
   if (m.runId) return m.runId;
   if (m.repo && m.runTag) {
-    try { const runId = await ghaLockRunId(m.repo, m.runTag); writeMeta({ ...m, runId }); return runId; } catch { return undefined; }
+    try {
+      const runId = await ghaLockRunId(m.repo, m.runTag);
+      const cur = readMeta(m.id); // cache the id back ONLY if the record is still the same generation we were resolving
+      if (cur !== undefined && cur.reqId === m.reqId) writeMeta({ ...cur, runId });
+      return runId;
+    } catch { return undefined; }
   }
   return undefined;
 }
@@ -436,7 +449,7 @@ async function cmdDown(args: Args): Promise<void> {
     // reply-lost dispatch. Do NOT prune a recoverable handle — report honestly so the user retries (or removes it by hand).
     else throw new Error(`vm-ssh down: "${id}" — no reachable address and its run is not yet visible (tag ${m.runTag ?? "none"}). Retry shortly; if it never appears the dispatch may have failed — remove ${metaPath(id)} to drop it.`);
   }
-  prune(id); // only after a CONFIRMED stop (sentinel tripped or run cancelled)
+  pruneIfOwner(id, m.reqId); // only after a CONFIRMED stop, and only if the record is still the one we acted on
   process.stdout.write(`${JSON.stringify({ id, stopped })}\n`);
 }
 // ───────────────────────────────────────────────────────────────────────────────
@@ -645,6 +658,9 @@ async function serveProxy(args: Args): Promise<void> {
 type Mode = "keyed" | "open";
 type Meta = {
   id: string; mode: Mode; backend?: Backend; createdSec: number; addrFile: string;
+  /** Per-up generation id (set at name reservation). A late write/prune from an OLD up checks this still matches before
+   *  mutating, so it can't clobber or delete a record a reused name now belongs to. */
+  reqId?: string;
   keyPath?: string; knownHosts?: string; // railway-only (per-box provisioning ssh key)
   repo?: string; runId?: string; runTag?: string; os?: string; githubUser?: string; ttlMin?: number; sshUser?: string; // gha-only
   /** Lifecycle phase (distinguishes an in-flight create from a dead box so reads/cleanup never drop a recoverable handle):
@@ -692,6 +708,20 @@ function reserveMeta(m: Meta): void {
   try { writeFileSync(metaPath(m.id), `${JSON.stringify({ ...m, phase: "reserved" })}\n`, { mode: 0o600, flag: "wx" }); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`name "${m.id}" already in use (or an in-flight up is claiming it)`); throw e; }
 }
+/** Does an on-disk record still belong to this up's generation? (pure; the guard below reads the record and applies it.) */
+export function recordIsOwned(cur: Meta | undefined, reqId: string): boolean { return cur !== undefined && cur.reqId === reqId; }
+/** Write meta ONLY if the current record is still THIS generation's — a late write from an old up must not clobber a
+ *  record a reused name now owns. Returns false (write skipped) when the name has been taken over. */
+function writeMetaIfOwner(m: Meta & { reqId: string }): boolean {
+  if (!recordIsOwned(readMeta(m.id), m.reqId)) return false;
+  writeMeta(m); return true;
+}
+/** Prune ONLY if the current record is this generation's (or already gone). Never deletes a newer generation's record. */
+function pruneIfOwner(id: string, reqId: string | undefined): boolean {
+  const cur = readMeta(id);
+  if (cur !== undefined && cur.reqId !== reqId) return false;
+  prune(id); return true;
+}
 function readMeta(id: string): Meta | undefined {
   try { return JSON.parse(readFileSync(metaPath(id), "utf8")) as Meta; } catch { return undefined; }
 }
@@ -701,11 +731,16 @@ function allIds(): string[] {
 /** A box's lifetime cap in seconds: railway = ~1h platform fact; gha = its recorded ttlMin (≤6h runner ceiling). */
 function ttlSec(m: Meta): number { return backendOf(m) === "gha" ? (m.ttlMin ?? 360) * 60 : TTL_SEC; }
 function remainingSec(m: Meta, now = Date.now()): number { return m.createdSec + ttlSec(m) - Math.floor(now / 1000); }
+/** May a record be pruned purely by elapsed LOCAL time? Only railway (its ~1h platform destroy is a fact we don't verify).
+ *  A gha record is NEVER time-pruned: dispatch time is not a destroy proof (the runner's hold timer only starts after
+ *  queue + startup), so a queued/requesting/running record must be released only on confirmed-terminal status (refresh/down
+ *  via ghaCaptureAddr's `ended`), never on createdSec+ttl. remainingSec stays a display estimate for gha. */
+export function timePrunable(m: Meta): boolean { return backendOf(m) !== "gha"; }
 function prune(id: string): void { for (const p of [addrPath(id), metaPath(id)]) try { rmSync(p); } catch { /* ok */ } try { rmSync(keyBoxDir(id), { recursive: true, force: true }); } catch { /* ok */ } }
 
 /** Resolve a (possibly partial) id to exactly one live box; never silently pick one. Prunes expired boxes first. */
 function resolveId(partial: string | undefined): string {
-  for (const id of allIds()) if (remainingSec(readMeta(id)!) <= 0) prune(id); // dangling by platform TTL
+  for (const id of allIds()) { const m = readMeta(id)!; if (timePrunable(m) && remainingSec(m) <= 0) prune(id); } // railway dangling by platform TTL; gha only on confirmed-terminal
   const live = allIds();
   if (live.length === 0) throw new Error("no live vm-ssh boxes");
   if (partial === undefined) {
@@ -777,22 +812,22 @@ async function cmdUp(args: Args): Promise<void> {
   const id = args.val("--name") ?? genId();
   const initFile = args.val("--init");
   const initScript = initFile ? readFileSync(initFile, "utf8") : undefined;
-  // Reserve the name atomically BEFORE any side effect; on failure, free it UNLESS a manageable gha handle (runId) was
-  // recorded (a capture timeout keeps the box for down/refresh).
-  reserveMeta({ id, mode, backend, createdSec: Math.floor(Date.now() / 1000), addrFile: addrPath(id) });
+  // Reserve the name atomically BEFORE any side effect; reqId stamps THIS generation so a late write/prune can't clobber a
+  // reused name. On failure, free it UNLESS a manageable gha handle (runId/nonce) survived AND it is still ours.
+  const reqId = randomUUID();
+  reserveMeta({ id, mode, backend, createdSec: Math.floor(Date.now() / 1000), addrFile: addrPath(id), reqId });
   try {
-    await cmdUpInner(id, mode, backend, initScript, args);
+    await cmdUpInner(id, mode, backend, initScript, args, reqId);
   } catch (e) {
-    // free the name UNLESS a manageable gha handle survived: a run id, or the nonce (dispatch succeeded, lock timed out —
-    // refresh/down re-lock by it). A reservation with neither (pre-dispatch failure) is pruned.
     const m = readMeta(id);
-    if (!(m && backendOf(m) === "gha" && (m.runId || m.runTag))) prune(id);
+    const recoverableMine = m !== undefined && m.reqId === reqId && backendOf(m) === "gha" && (m.runId !== undefined || m.runTag !== undefined);
+    if (!recoverableMine) pruneIfOwner(id, reqId); // only ever free OUR own reservation, never a reused name's record
     throw e;
   }
 }
 
-async function cmdUpInner(id: string, mode: Mode, backend: Backend, initScript: string | undefined, args: Args): Promise<void> {
-  if (backend === "gha") return cmdUpGha(id, mode, initScript, args);
+async function cmdUpInner(id: string, mode: Mode, backend: Backend, initScript: string | undefined, args: Args, reqId: string): Promise<void> {
+  if (backend === "gha") return cmdUpGha(id, mode, initScript, args, reqId);
 
   const pubKey = mode === "keyed" ? resolvePubKey(args.val("--key")) : undefined;
   const dir = keyBoxDir(id);
@@ -806,8 +841,8 @@ async function cmdUpInner(id: string, mode: Mode, backend: Backend, initScript: 
   const addr = parseCapturedAddr(stdout);
   if (!addr) throw new Error("vm-ssh up: no tailcat address captured from the box (serve may have failed; see /tmp/vmssh.serve.log on the box)");
 
+  if (!writeMetaIfOwner({ id, mode, backend: "railway", createdSec: Math.floor(Date.now() / 1000), keyPath, knownHosts, addrFile: addrPath(id), phase: "ready", reqId })) throw new Error(`vm-ssh up: name "${id}" was reused by another up while this one was in flight`);
   writeAddr(id, addr);
-  writeMeta({ id, mode, backend: "railway", createdSec: Math.floor(Date.now() / 1000), keyPath, knownHosts, addrFile: addrPath(id), phase: "ready" });
   process.stdout.write(`${JSON.stringify({ id, addrFile: addrPath(id), mode, backend: "railway" })}\n`); // address itself stays in the 0600 file
 }
 
@@ -833,7 +868,7 @@ async function cmdSsh(args: Args): Promise<void> {
 }
 
 function cmdLs(args: Args): void {
-  for (const id of allIds()) if (remainingSec(readMeta(id)!) <= 0) prune(id);
+  for (const id of allIds()) { const m = readMeta(id)!; if (timePrunable(m) && remainingSec(m) <= 0) prune(id); }
   const rows = allIds().map((id) => { const m = readMeta(id)!; return { id, mode: m.mode, backend: backendOf(m), ...(m.os ? { os: m.os } : {}), createdSec: m.createdSec, remainingSec: Math.max(0, remainingSec(m)), addrFile: m.addrFile }; });
   if (args.has("--json")) { process.stdout.write(`${JSON.stringify(rows)}\n`); return; }
   if (rows.length === 0) { process.stdout.write("(no live boxes)\n"); return; }
@@ -946,6 +981,8 @@ function selftest(): void {
     console.assert(prunableOnNoAddr(mk({ backend: "railway", phase: "ready" })) === true && prunableOnNoAddr(mk({ backend: "railway" })) === true, "ssh may prune a once-ready / legacy railway box (address lost = destroyed)");
     console.assert(prunableOnNoAddr(mk({ backend: "railway", phase: "reserved" })) === false, "ssh must NOT prune a railway in-flight reservation");
     console.assert(prunableOnNoAddr(mk({ backend: "gha", phase: "running", runId: "1" })) === false && prunableOnNoAddr(mk({ backend: "gha", phase: "requesting", runTag: "t" })) === false, "ssh must NEVER prune a gha record (recoverable handle or in-flight)");
+    console.assert(recordIsOwned(undefined, "a") === false && recordIsOwned(mk({ reqId: "a" }), "a") === true && recordIsOwned(mk({ reqId: "b" }), "a") === false, "recordIsOwned: a late write/prune matches only its own generation (reused name is not owned)");
+    console.assert(timePrunable(mk({ backend: "railway" })) === true && timePrunable(mk({ backend: "gha" })) === false, "timePrunable: railway by platform TTL; gha NEVER by local time (dispatch time is not a destroy proof)");
   }
   console.assert(WORKFLOW_YAML.includes("workflow_dispatch") && WORKFLOW_YAML.includes("--ssh-authorized-keys=${GITHUB_USER}@github") && WORKFLOW_YAML.includes("VMSSH_ADDR=") && WORKFLOW_YAML.includes("/tmp/ghostish.stop") && WORKFLOW_YAML.includes("contents: read") && WORKFLOW_YAML.includes("run-name:") && WORKFLOW_YAML.includes("run_tag") && WORKFLOW_YAML.includes("secrets.VMSSH_SECRET"), "workflow yaml: dispatch inputs + keyed key-fetch + addr marker + sentinel + least-privilege + run_tag nonce + secret channel");
   console.assert(runTitleFor("vmssh-abc") === "vm-ssh-box vmssh-abc" && runTitleFor("vmssh-abc") !== "vm-ssh-box vmssh-abc-other", "run title is matched EXACTLY (a <tag>-other title must not satisfy the lock)");
