@@ -287,9 +287,8 @@ function roster(peers: UnifiedPeer[], selfId: string, status: string): string {
 }
 
 /** Honest one-line outcome for a send/handoff, naming the channel the message actually took (bus-reachability §1/F31). */
-function sendOutcome(delivered: "local" | "relay" | "native-direct" | "durable-fallback" | undefined, label: string | undefined, verb = "Sent"): string {
-  if (delivered === "native-direct") return `${verb} to ${label} via its live UI (native-direct — its agenthop node was unreachable, so this went straight to the Claude session).`;
-  if (delivered === "durable-fallback") return `${verb === "Sent" ? "Queued" : "Handed off"} to ${label}'s durable inbox — not reachable live right now, so it will arrive when it next reconnects or calls agenthop_recv.`;
+function sendOutcome(delivered: "durable" | "relay" | undefined, label: string | undefined, verb = "Sent"): string {
+  if (delivered === "durable") return `${verb === "Sent" ? "Queued" : "Handed off"} to ${label}'s durable inbox — it surfaces the moment ${label} next flushes (near-live on the same machine) and survives a restart.`;
   return `${verb} to ${label}.`;
 }
 

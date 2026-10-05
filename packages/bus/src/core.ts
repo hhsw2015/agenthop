@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { selfInfo, sessionTitle, type AgentStatus, type SelfInfo } from "./label.js";
 import { startLocalBus, type LocalBus } from "./broker.js";
 import { startRelay, type Relay } from "./relay.js";
-import { pushToHost, pushClaudeDirect } from "./push.js";
+import { pushToHost } from "./push.js";
 import { startCodexDaemon, type CodexDaemon } from "./codex.js";
 import { dedupLocalPeers, resolvePeer, type UnifiedPeer, type ResolveError } from "./resolve.js";
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
@@ -13,7 +13,6 @@ import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoiso
 import { fallbackForUnresolved, fallbackForMissedDelivery } from "./send-fallback.js";
 import { resolveSession, listSessions } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
-import { writeCcSocket, readCcSocket } from "./cc-socket.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 
@@ -29,11 +28,11 @@ export type BusMessage = { from: string; fromLabel: string; text: string; via: "
 export type BusCore = {
   self: SelfInfo;
   peers(): UnifiedPeer[];
-  /** `delivered` reports the channel actually used (bus-reachability §1/F31 three-layer tree): "local"/"relay" = live bus
-   *  push confirmed; "native-direct" = pushed straight into a same-machine Claude session's live UI (its agenthop node was
-   *  unreachable); "durable-fallback" = queued to the recipient's durable inbox (read on its next flush/recv). ok:true with
-   *  a non-live `delivered` means it did not go over the live bus; absent on a failure. */
-  send(to: string, text: string): Promise<{ ok: boolean; label?: string; error?: string; delivered?: "local" | "relay" | "native-direct" | "durable-fallback" }>;
+  /** `delivered` reports the channel used (bus-reachability §1 / B2+B3 option b): "durable" = written to the recipient's durable
+   *  inbox, the ONLY same-machine delivery guarantee (surfaced near-live by the recipient's fs-watch/flush, and restart-safe);
+   *  "relay" = a live best-effort cross-machine send (no shared durable inbox). There is no "local"/"native-direct" live push:
+   *  a byte-write/FIN is not a confirmed receipt (B3) and native-direct's cached socket could misroute (B2). Absent on failure. */
+  send(to: string, text: string): Promise<{ ok: boolean; label?: string; error?: string; delivered?: "durable" | "relay" }>;
   recv(timeoutMs: number): Promise<BusMessage[]>;
   /** Record this Codex thread id (from x-codex-turn-metadata) so inbound can be pushed to it. */
   noteThread(id: string): void;
@@ -310,11 +309,6 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // re-announce through the reconnect/re-register path (Stage C), not here.
   reportCheckIn(home, self, process.env.SWARM_COORDINATOR);
 
-  // bus-reachability §1/F31: record this Claude node's live-UI socket under its sid so a sender can native-direct to it even
-  // with an empty broker roster (tonight's "0 peers" outbound) or after this agenthop node dies — the Claude host and its
-  // cc-socks socket outlive the node. Claude only (Codex has no cc-socks); a machine-local /tmp path, never sent to the relay.
-  if (process.env.CLAUDE_CODE_MESSAGING_SOCKET && self.stableId) writeCcSocket(home, self.stableId, process.env.CLAUDE_CODE_MESSAGING_SOCKET);
-
   return {
     self,
     peers: unified,
@@ -324,47 +318,38 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       void flushInbox(); // a Codex session just took a turn -> its rollout now exists -> flush anything pending to it
     },
     async send(to, text) {
-      // bus-reachability §1/F31 THREE-LAYER fallback tree, each layer automatic, one caller call, return reports the channel
-      // actually used: bus (live local/relay push) -> native-direct (straight into a same-machine Claude session's live UI
-      // via its cc-socks socket — reaches it even with an empty roster or a dead agenthop node) -> durable inbox (the
-      // load-bearing guarantee; the peer reads it on its next flush/recv). Native-direct is an ACCELERATOR, so a message
-      // takes exactly ONE path (first success wins) — no double delivery. Cross-machine relay has no local durable inbox.
-      const toDurable = (sid: string): { ok: true; label?: string; delivered: "durable-fallback" } => {
+      // bus-reachability §1 / B2+B3 (option b): SAME-MACHINE delivery is DURABLE-ALWAYS. The recipient's durable inbox is the
+      // ONLY delivery guarantee — a live broker/native push is never a confirmed receipt (B3), and native-direct is RETIRED (its
+      // cached cc-socks path could be rebound to another process ⇒ misroute, B2). A same-machine target (a resolved LOCAL peer,
+      // or an offline session that owns the handle via presence/<sid>.pid) ⇒ write its durable inbox; the recipient's fs-watch +
+      // flush surfaces it near-live and it survives a restart. CROSS-MACHINE (relay) has no shared durable inbox ⇒ a live
+      // best-effort relay send, reported honestly. `delivered` is thus "durable" (guaranteed-queued) or "relay" (live).
+      const toDurable = (sid: string): { ok: true; label?: string; delivered: "durable" } => {
         writeInbox(home, sid, { from: self.stableId ?? self.id, fromLabel: self.title, ...(self.mode ? { fromMode: self.mode } : {}), text, via: "local", ts: Date.now() });
-        return { ok: true, label: labelFor(sid), delivered: "durable-fallback" };
-      };
-      // Native-direct: push into the target's live Claude UI if it has a recorded cc-socks socket (⇒ a same-machine Claude
-      // session). null ⇒ not applicable (non-Claude / no record) or the push missed ⇒ caller falls to the durable inbox.
-      const tryNative = async (sid: string): Promise<{ ok: true; label?: string; delivered: "native-direct" } | null> => {
-        const sock = readCcSocket(home, sid);
-        if (!sock) return null;
-        const ok = await pushClaudeDirect(sock, self.title, text, { fromMode: self.mode, to: labelFor(sid) });
-        return ok ? { ok: true, label: labelFor(sid), delivered: "native-direct" } : null;
+        return { ok: true, label: labelFor(sid), delivered: "durable" };
       };
       const peer = resolve(to);
       if ("error" in peer) {
-        // B1 (review d8dd4b1): an AMBIGUOUS (or empty) target must NEVER fall back — resolveSession runs a weaker handle
-        // match that could pick ONE of the several live matches and misroute a private message. Only a genuine no-match may
-        // fall back to a same-machine durable inbox. resolvePeer already classifies the error; honor its kind here.
+        // B1 (review d8dd4b1): an AMBIGUOUS (or empty) target must NEVER fall back — resolveSession runs a weaker handle match
+        // that could pick ONE of several live matches and misroute a private message. Only a genuine no-match may route to a
+        // same-machine durable inbox (a session that owns the handle via presence/<sid>.pid).
         if (peer.kind !== "none") return { ok: false, error: peer.error };
-        // Not on the live roster (offline, or our broker view is empty). If a same-machine session owns this handle
-        // (presence/<sid>.pid), try native-direct, then the durable inbox.
         const plan = fallbackForUnresolved(resolveSession(to, listSessions(home)), peer.error);
-        if (plan.kind !== "durable") return { ok: false, error: plan.reason };
-        return (await tryNative(plan.sid)) ?? toDurable(plan.sid);
+        return plan.kind === "durable" ? toDurable(plan.sid) : { ok: false, error: plan.reason };
       }
-      // Log an "out" entry only on confirmed LIVE delivery. Gated so Buffer.byteLength + the call are skipped when
-      // AGENTHOP_MSGLOG is off (the default); writeMsgLog is also internally a no-op + never throws.
-      const logOut = (via: "local" | "relay"): void => {
-        if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via, direction: "out", size: Buffer.byteLength(text), text });
-      };
-      if (peer.via === "local") { const ok = local.send(peer.id, text); if (ok) { logOut("local"); return { ok, label: labelFor(peer.id), delivered: "local" }; } }
-      else if (relay && peer.pub) { const ok = await relay.send(peer.pub, text); if (ok) { logOut("relay"); return { ok, label: labelFor(peer.id), delivered: "relay" }; } }
-      else return { ok: false, error: "That peer is on another machine but no team relay is configured here (set AGENTHOP_TEAM)." };
-      // Resolved but live delivery MISSED -> native-direct (same-machine Claude), then durable inbox; relay ⇒ honest failure.
+      // Resolved. SAME-MACHINE (local) ⇒ durable-always (fallbackForMissedDelivery computes the recipient's durable sid).
       const plan = fallbackForMissedDelivery(peer);
-      if (plan.kind !== "durable") return { ok: false, error: plan.reason };
-      return (await tryNative(plan.sid)) ?? toDurable(plan.sid);
+      if (plan.kind === "durable") return toDurable(plan.sid);
+      // CROSS-MACHINE (relay): a live best-effort send; no local durable fallback (no shared filesystem).
+      if (relay && peer.pub) {
+        const ok = await relay.send(peer.pub, text);
+        if (ok) {
+          if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via: "relay", direction: "out", size: Buffer.byteLength(text), text });
+          return { ok: true, label: labelFor(peer.id), delivered: "relay" };
+        }
+        return { ok: false, error: `Relay delivery to "${peer.title}" failed; it is on another machine.` };
+      }
+      return { ok: false, error: "That peer is on another machine but no team relay is configured here (set AGENTHOP_TEAM)." };
     },
     async recv(timeoutMs) {
       // Explicit pull: drain the DURABLE inbox (messages the push channel could not surface). Claim+ack so the retry

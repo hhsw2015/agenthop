@@ -99,17 +99,6 @@ function pushCodex(thread: string, from: string, text: string, codexHome?: strin
   });
 }
 
-/**
- * NATIVE-DIRECT send (bus-reachability §1 / F31): push a bus message straight into ANOTHER same-machine Claude session's
- * live UI by connecting to ITS cc-socks socket — the accelerator layer between the bus and the durable inbox, and the only
- * path that reaches a session whose agenthop node has died but whose Claude host is still alive. The token is EMPTY on
- * purpose: the cc-socks socket is owner-only (srw-------), so same-user filesystem permission is the real gate and the
- * server does not enforce the auth token (verified empirically). Best-effort: false ⇒ the caller falls to the durable inbox.
- */
-export function pushClaudeDirect(socketPath: string, from: string, text: string, opts: { fromMode?: string; to?: string } = {}): Promise<boolean> {
-  return pushClaude(socketPath, "", from, text, opts);
-}
-
 function pushClaude(
   sockPath: string,
   token: string | undefined,
