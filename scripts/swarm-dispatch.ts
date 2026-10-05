@@ -47,7 +47,7 @@ import { assertLiveness, type LivenessVerdict, type ControlCut, type Observation
 import { reconcileIncident, reconcileIncidentCore, reconcileRegistryWithControl, readIncidents, writeIncidents, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
 import { isRepairWaitId, repairEpisodeOf, repairGroupKeyOf } from "../packages/bus/src/swarm/repair-wait-id.js";
 import { observeCandidate, readDelegations, writeDelegations, type DelegationRegistry } from "../packages/bus/src/swarm/delegation-envelope.js";
-import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, ingestLedgerChunk, pruneDeadLetterWindow, freshTimestampsByRoute, readDeadLetterWatch, writeDeadLetterWatch, routeKeyOf, routingGroupKey, routeKeyOfGroup, routingActiveSignal, type ReadArtifact, type WatchSnapshot, type DeadLetterWatch } from "../packages/bus/src/swarm/delegation-observer.js";
+import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, ingestLedgerChunk, pruneDeadLetterWindow, consolidatePending, readDeadLetterWatch, writeDeadLetterWatch, routeKeyOf, routingGroupKey, routeKeyOfGroup, routingActiveSignal, type ReadArtifact, type WatchSnapshot, type DeadLetterWatch } from "../packages/bus/src/swarm/delegation-observer.js";
 import { advanceWait, isRenewable } from "../packages/bus/src/swarm/task-wait.js";
 import { subjectProgressSeq, hasFreshSubjectEvidence, renewOperationId, renewalCount } from "../packages/bus/src/swarm/evidence-renewal.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
@@ -883,13 +883,16 @@ async function main(): Promise<void> {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") log(`dead-letters read failed: ${e instanceof Error ? e.message : e}`);
     }
 
-    // Prune the detection window, then record a DURABLE candidate the FIRST time a route reaches threshold — storing its FRESH
-    // failure TIMESTAMPS, not a count (review 7e9a08b-R5-C). A candidate is a discovered obligation: once recorded it is
-    // self-contained and survives the sliding window aging out its samples; it is filtered/committed/discharged in the group loop
-    // below, and invalidated ONLY by a recovery boundary (never by window aging). A route already pending is left untouched here.
+    // Prune the detection window, then CONSOLIDATE at INGESTION — for EVERY route, not just those without pending, and not
+    // deferred to the budget-limited group loop (review 2548808-D1). When a route's FRESH (post-handled/recovery) in-window
+    // failures reach threshold, record them as the durable pending candidate, REPLACING with the current window SNAPSHOT (never
+    // accumulating) ⇒ a route already pending gets its NEW burst folded in here, and the same failure is never double-counted.
+    // A threshold-reaching set is a discovered obligation: it is STICKY — when the window later ages below threshold before the
+    // group loop reaches the route, population does NOT shrink or drop it (review 7e9a08b-R5-C survival); only the group loop
+    // removes it (on commit, or when the recovery boundary leaves it sub-threshold). So a new burst becomes aging-exempt the
+    // moment it is observed, independent of when its group's turn comes under MAX_ROUTING_GROUPS_PER_TICK.
     watch.window = pruneDeadLetterWindow(watch.window, windowStartMs);
-    for (const [route, tss] of freshTimestampsByRoute(watch.window, windowStartMs, watch.handled, watch.recovered))
-      if (watch.pending[route] === undefined && tss.length >= DEAD_LETTER_THRESHOLD) watch.pending[route] = tss;
+    watch.pending = consolidatePending(watch.pending, watch.window, windowStartMs, watch.handled, watch.recovered, DEAD_LETTER_THRESHOLD);
 
     // UNION of KNOWN obligations (registry routing episodes + CONTROL routing repair-waits — ledger-independent, R2) + the
     // durable pending candidates: a committed-but-registry-lost incident still reconciles even with the ledger window gone.
@@ -933,17 +936,8 @@ async function main(): Promise<void> {
             // burst was pre-recovery ⇒ discharge, no reopen. Absent a recovery boundary the full candidate stands: a discovered
             // obligation does not age out just because its samples left the sliding window (the R5-C regression this replaces).
             const boundary = watch.recovered[route];
-            let live = boundary === undefined ? watch.pending[route] : watch.pending[route].filter((ts) => ts > boundary);
-            if (live.length < DEAD_LETTER_THRESHOLD) {
-              // D1 (review 01b773d): the old candidate is invalidated by the recovery boundary. Population SKIPPED this route (it
-              // still had the now-stale pending), so a NEW post-recovery burst sits only in the window and would be lost once the
-              // window ages. In the SAME slice, re-derive the current window's fresh (post-recovery) failures and re-record them as
-              // the candidate if they reach threshold — consolidated into aging-exempt pending now, not deferred to a window that
-              // may be gone next tick. REPLACE (not merge) with the freshly-derived set ⇒ no double-count of the same failure.
-              const freshNow = freshTimestampsByRoute(watch.window, windowStartMs, watch.handled, watch.recovered).get(route) ?? [];
-              if (freshNow.length < DEAD_LETTER_THRESHOLD) { delete watch.pending[route]; continue; }
-              live = freshNow;
-            }
+            const live = boundary === undefined ? watch.pending[route] : watch.pending[route].filter((ts) => ts > boundary);
+            if (live.length < DEAD_LETTER_THRESHOLD) { delete watch.pending[route]; continue; } // pre-recovery/handled ⇒ discharge; population re-consolidates any fresh post-recovery burst from the window
             watch.pending[route] = live;
             const rec = reconcileIncidentCore(reg, routingActiveSignal(route, live.length, fresh.seq), nowSec(), { repairWindowSec: REPAIR_WAIT_SEC, owner: REPAIR_OWNER_ROUTABLE ? REPAIR_OWNER : SELF, controlEpisodeFloor: sync.controlEpisodeFloor });
             let settled = false;

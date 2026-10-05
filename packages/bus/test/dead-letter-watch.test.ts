@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  ingestLedgerChunk, pruneDeadLetterWindow, countFreshByRoute, freshTimestampsByRoute, maxTsForRoute, routeKeyOf,
+  ingestLedgerChunk, pruneDeadLetterWindow, countFreshByRoute, freshTimestampsByRoute, consolidatePending, maxTsForRoute, routeKeyOf,
   readDeadLetterWatch, writeDeadLetterWatch, emptyDeadLetterWatch, type WindowEvent, type DeadLetterWatch,
 } from "../src/swarm/delegation-observer.js";
 
@@ -107,6 +107,24 @@ describe("window prune + fresh count (R5 handled-through + recovery boundary)", 
   test("maxTsForRoute gives the watermark to set once an incident is committed", () => {
     expect(maxTsForRoute(win, "a->x")).toBe(3000);
     expect(maxTsForRoute(win, "none")).toBe(0);
+  });
+
+  test("D1 consolidatePending: folds a NEW burst into an existing stale pending (for every route), snapshot-replace, sticky, no double-count", () => {
+    const window: WindowEvent[] = [
+      { ts: 1001000, route: "a->x" }, { ts: 1001000, route: "a->x" }, { ts: 1001000, route: "a->x" }, // old (pre-recovery) burst
+      { ts: 1003000, route: "a->x" }, { ts: 1003000, route: "a->x" }, { ts: 1003000, route: "a->x" }, // new (post-recovery) burst
+    ];
+    const handled = { "a->x": 1000000 };
+    // a->x already has STALE pending (recorded earlier); consolidate folds in the full current window snapshot (both bursts) —
+    // even though the budget-limited group loop may not reach a->x this tick. REPLACE, not accumulate.
+    const next = consolidatePending({ "a->x": [1001000, 1001000, 1001000] }, window, 1000000, handled, {}, 3);
+    expect(next["a->x"]).toEqual([1001000, 1001000, 1001000, 1003000, 1003000, 1003000]);
+    // idempotent: re-running on the same window does NOT double the snapshot
+    expect(consolidatePending(next, window, 1000000, handled, {}, 3)["a->x"]).toEqual([1001000, 1001000, 1001000, 1003000, 1003000, 1003000]);
+    // sticky: a route whose fresh is now below threshold (empty window) KEEPS its previously-recorded pending (survives aging)
+    expect(consolidatePending({ "b->y": [5, 5, 5] }, [], 0, {}, {}, 3)["b->y"]).toEqual([5, 5, 5]);
+    // a sub-threshold fresh set is NOT recorded (no pending created for a lone failure)
+    expect(consolidatePending({}, [{ ts: 9, route: "c->z" }], 0, {}, {}, 3)["c->z"]).toBeUndefined();
   });
 
   test("freshTimestampsByRoute returns the fresh tss per route (sorted), same floor rule as countFreshByRoute (R5-C)", () => {

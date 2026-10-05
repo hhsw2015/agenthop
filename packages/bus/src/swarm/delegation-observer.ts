@@ -260,6 +260,20 @@ export function freshTimestampsByRoute(window: readonly WindowEvent[], windowSta
   return m;
 }
 
+/** Fold the window's FRESH failures into the durable pending candidates at INGESTION (review 2548808-D1): for EVERY route whose
+ *  fresh (post-handled/recovery) in-window failures reach `threshold`, record them — REPLACING with the current window SNAPSHOT,
+ *  never accumulating, so the SAME failure is never double-counted AND a route that already has (stale) pending gets its NEW
+ *  burst folded in here rather than only when the budget-limited group loop reaches it. A threshold-reaching set is a discovered
+ *  obligation and is STICKY: a route whose fresh is now BELOW threshold keeps its previously-recorded pending (it survives the
+ *  sliding window aging out its samples — R5-C). Pure (returns the next map), so the budget-independent consolidation is
+ *  unit-tested; the caller commits incidents from `pending` under its per-tick group budget separately. */
+export function consolidatePending(pending: Record<string, number[]>, window: readonly WindowEvent[], windowStartMs: number, handled: Record<string, number>, recovered: Record<string, number>, threshold: number): Record<string, number[]> {
+  const next = { ...pending };
+  for (const [route, tss] of freshTimestampsByRoute(window, windowStartMs, handled, recovered))
+    if (tss.length >= threshold) next[route] = tss; // record/refresh with the current snapshot; sub-threshold routes keep their existing pending (sticky)
+  return next;
+}
+
 /** Read the durable dead-letter watch state. Missing ⇒ empty (first run); corrupt ⇒ THROWS (caller is fail-soft + skips, so a
  *  transient read error never resets the cursor/window/pending to empty and loses durable obligations — R1). */
 export function readDeadLetterWatch(file: string): DeadLetterWatch {
