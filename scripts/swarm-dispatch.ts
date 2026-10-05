@@ -28,8 +28,8 @@ import { type ControlRecord, PROVIDER_LIFETIME_SEC } from "../packages/bus/src/s
 import { parseManifest } from "../packages/bus/src/swarm/manifest.js";
 import { type ObservedTip, tipToEvent } from "../packages/bus/src/swarm/acceptance.js";
 import { type HandoffOps, handoffStep } from "../packages/bus/src/swarm/dispatch-step.js";
-import { loadControlLog, commitControl } from "../packages/bus/src/swarm/control-store.js";
-import { entityKeyOf, type ChangeBody, type CommitResult, type LogState } from "../packages/bus/src/swarm/control-log.js";
+import { loadControlLog, commitControl, readControlBatches } from "../packages/bus/src/swarm/control-store.js";
+import { entityKeyOf, type Change, type ChangeBody, type CommitResult, type LogState } from "../packages/bus/src/swarm/control-log.js";
 import { loadPlan, type TaskPlan, type TaskSpec } from "../packages/bus/src/swarm/task-plan.js";
 import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/task-state.js";
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
@@ -48,7 +48,8 @@ import { reconcileIncident, reconcileIncidentCore, reconcileRegistryWithControl,
 import { isRepairWaitId, repairEpisodeOf, repairGroupKeyOf } from "../packages/bus/src/swarm/repair-wait-id.js";
 import { observeCandidate, readDelegations, writeDelegations, type DelegationRegistry } from "../packages/bus/src/swarm/delegation-envelope.js";
 import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, ingestLedgerChunk, pruneDeadLetterWindow, countFreshByRoute, maxTsForRoute, readDeadLetterWatch, writeDeadLetterWatch, routeKeyOf, routingGroupKey, routeKeyOfGroup, routingActiveSignal, type ReadArtifact, type WatchSnapshot, type DeadLetterWatch } from "../packages/bus/src/swarm/delegation-observer.js";
-import { advanceWait } from "../packages/bus/src/swarm/task-wait.js";
+import { advanceWait, isRenewable } from "../packages/bus/src/swarm/task-wait.js";
+import { subjectProgressSeq, hasFreshSubjectEvidence, renewOperationId, renewalCount } from "../packages/bus/src/swarm/evidence-renewal.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
@@ -124,6 +125,10 @@ const MAX_ROUTING_GROUPS_PER_TICK = Number(process.env.SWARM_ROUTING_GROUPS_PER_
 // S11/4-n: suppress an IDENTICAL coordinator notice (same taskRef+text) re-sent within this window, so a repeating observer
 // event does not spam the coordinator inbox. A transient send FAILURE is never recorded, so a genuine retry is not suppressed.
 const NOTIFY_DEDUP_MS = Number(process.env.SWARM_NOTIFY_DEDUP_MS || "60000");
+// §2c-b evidence renewal: a renewed liveness wait's fresh probe window (a coarse magnitude, NOT an ETA — §2c), and the finite
+// number of FREE renewals a non-A1-approved wait gets before the sweep escalates instead of renewing ("不许无限 re-arm", acc ③).
+const RENEW_WINDOW_SEC = Number(process.env.SWARM_RENEW_WINDOW_SEC || "1800");
+const MAX_FREE_RENEWALS = Number(process.env.SWARM_MAX_FREE_RENEWALS || "20");
 const PLAN_FILE = process.env.SWARM_PLAN || "";
 const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
@@ -356,12 +361,10 @@ function buildOps(): HandoffOps {
 // --- business-task IO (the real TaskOps wired to git / mint / scp / swarm-launch / swarm-task + the control-log) ---
 
 /** Stamp operationId (= entityKey#targetRev, deterministic + replay-idempotent) + expectedEntityRevision, persist. */
-function commitTask(state: LogState, bodies: ChangeBody[]): { state: LogState; result: CommitResult } {
-  const changes = bodies.map((b) => {
-    const key = entityKeyOf(b);
-    const rev = state.revisions[key] ?? 0;
-    return { ...b, operationId: `${key}#${rev + 1}`, expectedEntityRevision: rev };
-  });
+// Commit pre-built Changes (caller supplies operationId + expectedEntityRevision) + the projection apply hook. Used directly
+// when the operationId must be a specific value (e.g. the §2c-b renew id for countability); commitTask wraps it for the common
+// case where the id is the default `${key}#${rev+1}`.
+function commitChanges(state: LogState, changes: Change[]): { state: LogState; result: CommitResult } {
   const r = commitControl(CONTROL_LOG_DIR, state, changes);
   // Projection apply hook (projection-schema §8): after a batch newly advances the log, rewrite the read-only view so viz +
   // fast-startup see current state. Fail-soft — the projection is derived (rebuilt by replay), never the barrier; a write
@@ -371,6 +374,14 @@ function commitTask(state: LogState, bodies: ChangeBody[]): { state: LogState; r
     catch (e) { log(`projection write failed: ${e instanceof Error ? e.message : e}`); }
   }
   return { state: r.state, result: r.result };
+}
+
+function commitTask(state: LogState, bodies: ChangeBody[]): { state: LogState; result: CommitResult } {
+  return commitChanges(state, bodies.map((b) => {
+    const key = entityKeyOf(b);
+    const rev = state.revisions[key] ?? 0;
+    return { ...b, operationId: `${key}#${rev + 1}`, expectedEntityRevision: rev };
+  }));
 }
 
 function loadPlanFile(): TaskPlan | null {
@@ -917,6 +928,36 @@ async function main(): Promise<void> {
     if (!(wasEmpty && isEmptyWatch(watch))) { try { writeDeadLetterWatch(DEAD_LETTER_WATCH_FILE, watch); } catch (e) { log(`dead-letter watch write failed: ${e instanceof Error ? e.message : e}`); } }
   };
 
+  // §2c-b evidence renewal (two-clocks). BEFORE the sweep escalates an EXPIRED liveness wait, renew it IF the subject made
+  // progress since it was armed — the owner is alive, so push the PROBE deadline out instead of convicting. Only renewable
+  // (liveness/reminder) waits qualify (isRenewable — f32a0507's single predicate; also guarded inside advanceWait so a
+  // misclassification here can't illegally renew a semantic-deadline wait). Evidence is derived LIVE from the control-log (no
+  // cached counter to drift — F13). Finite FREE renewals (MAX_FREE_RENEWALS) so a forever-progressing job can't re-arm without
+  // bound (§2c-b acceptance ③: "不许无限 re-arm"); past the cap, or with no fresh evidence, the wait stays expired and the
+  // sweep escalates it as before. Fail-soft + per-wait isolated. Runs just before sweepPass so a renewed wait is no longer
+  // expired by the time the sweep evaluates it.
+  const renewLivenessWaits = (): void => {
+    const now = nowSec();
+    let st = loadControlLog(CONTROL_LOG_DIR);
+    const batches = readControlBatches(CONTROL_LOG_DIR);
+    for (const b of Object.values(liveEntities(st))) {
+      if (b.put !== "wait") continue;
+      const w = (b as Extract<ChangeBody, { put: "wait" }>).wait;
+      if (w.state !== "open" || !isRenewable(w) || w.deadlineSec > now) continue;    // only an EXPIRED open renewable wait (the probe moment)
+      if (renewalCount(batches, w.waitId) >= MAX_FREE_RENEWALS) continue;            // §2c-b ③: finite free renewals ⇒ let the sweep escalate
+      if (!hasFreshSubjectEvidence(batches, w.subject.jobId, w.waitId)) continue;    // no subject progress since the arm ⇒ let the sweep escalate
+      const adv = advanceWait(w, { type: "renew", newDeadlineSec: now + RENEW_WINDOW_SEC, nowSec: now });
+      if (!adv.ok) { log(`renew ${w.waitId} rejected by reducer: ${adv.error}`); continue; } // the reducer guard is the authority
+      const progressSeq = subjectProgressSeq(batches, w.subject.jobId);              // idempotent id by the triggering progress (countable, §2c-b ③)
+      const rev = st.revisions[`wait:${w.waitId}`] ?? 0;
+      try {
+        const res = commitChanges(st, [{ put: "wait", wait: adv.wait, operationId: renewOperationId(w.waitId, progressSeq), expectedEntityRevision: rev }]);
+        if (res.result.ok) { st = res.state; log(`renewed liveness wait ${w.waitId} (subject ${w.subject.jobId} progressed @${progressSeq}) +${RENEW_WINDOW_SEC}s`); }
+        else log(`renew ${w.waitId} deferred (${JSON.stringify(res.result)}) — retry next tick`);
+      } catch (e) { log(`renew ${w.waitId} failed (isolated): ${e instanceof Error ? e.message : e}`); }
+    }
+  };
+
   await runDispatchLoops({
     // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
     // dispatches). T1.5 RED LINE (fe0376cd): --task dispatch stays off (SWARM_TASK_EXEC) until the resume adapter +
@@ -932,7 +973,13 @@ async function main(): Promise<void> {
     // + dead owners (reassign) + stuck validators (move). The coordinator-replacement step; gated on SWARM_SWEEP.
     sweepTick: async () => {
       sweepStateRef.s = loadControlLog(CONTROL_LOG_DIR);
-      if (SWEEP_ENABLED) await sweepPass(sweepOps);
+      if (SWEEP_ENABLED) {
+        // §2c-b: renew eligible EXPIRED liveness waits (subject progressed since the arm) BEFORE escalating, then reload so
+        // sweepPass sees the fresh deadlines and does not escalate a just-renewed wait.
+        renewLivenessWaits();
+        sweepStateRef.s = loadControlLog(CONTROL_LOG_DIR);
+        await sweepPass(sweepOps);
+      }
       // Now-dependent projection + INV-1 verdict refresh on the INDEPENDENT sweep loop + its own ref (review P2-1): when the
       // pass loop wedges, this keeps re-sampling observations and a stale pass heartbeat flips the verdict to UNVERIFIABLE.
       // Runs even with sweep rules off — it is observability, not a sweep action; bounded, fail-soft inside the helper.
