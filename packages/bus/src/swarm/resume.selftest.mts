@@ -2,7 +2,7 @@
 // that module has no top-level side effects (msglog P1 lesson).
 //   packages/bus/node_modules/.bin/tsx packages/bus/src/swarm/resume.selftest.mts
 import {
-  ROSTER_FILE, assembleRoster, memberKey, parseSnapshot, planResume,
+  ROSTER_FILE, SCHEMA_VERSION, assembleRoster, memberKey, parseSnapshot, planResume, resumeCmdFor, resumeCommandForMember,
   type PeerLike, type RosterSnapshot,
 } from "./resume.js";
 
@@ -31,7 +31,7 @@ const peer = (over: Partial<PeerLike> = {}): PeerLike => ({ id: "run-1", stableI
   t("excludes self (observer)", !snap.members.some((m) => m.title === "observer"));
   t("member label prefers the durable stableId", snap.members.find((m) => m.title === "one")?.member === "a");
   t("role is best-effort null (no structured source yet)", snap.members.every((m) => m.role === null));
-  t("version + capturedAt stamped", snap.version === 1 && snap.capturedAtSec === 1000);
+  t("version + capturedAt stamped (schema v2)", snap.version === 2 && snap.capturedAtSec === 1000);
   t("members sorted by handle", snap.members[0]!.title === "one");
 }
 {
@@ -103,6 +103,53 @@ const peer = (over: Partial<PeerLike> = {}): PeerLike => ({ id: "run-1", stableI
 {
   t("empty peers -> empty roster", assembleRoster([], 1).members.length === 0);
   t("undefined-ish safe", assembleRoster([{}], 1).members.length === 0);
+}
+
+// --- F36: resumeCmd (full launch command, not a bare relaunch) ---
+{
+  // resumeCmdFor: with live claude argv -> preserve recognized flags + --resume <sid>, source "argv"
+  const r1 = resumeCmdFor("claude", "sid-1", ["/path/node", "cli.js", "--dangerously-skip-permissions", "--model", "claude-opus-5-5[1m]", "--effort", "xhigh", "--other"]);
+  t("claude argv -> source argv", r1.source === "argv");
+  t("claude argv preserves flags + injects --resume", r1.cmd === "claude --dangerously-skip-permissions --model claude-opus-5-5[1m] --effort xhigh --resume sid-1");
+  t("argv[0] (node wrapper) is ignored, command name is the tool", r1.cmd.startsWith("claude "));
+  // --model=X form also captured
+  t("claude --model=form captured", resumeCmdFor("claude", "s", ["claude", "--model=opus", "--dangerously-skip-permissions"]).cmd.includes("--model=opus"));
+  // bare claude (no recognized flags) -> canon template is SAFER than reproducing bareness (the F36 bug)
+  const bare = resumeCmdFor("claude", "sid-2", ["claude"]);
+  t("bare claude argv -> canon template (not bare)", bare.source === "template" && bare.cmd.includes("--dangerously-skip-permissions") && bare.cmd.endsWith("--resume sid-2"));
+  // codex
+  t("codex argv -> codex resume <sid>", resumeCmdFor("codex", "cx-1", ["codex"]).cmd === "codex resume cx-1");
+  // no argv -> template, source template
+  const tmpl = resumeCmdFor("claude", "sid-3");
+  t("no argv -> source template", tmpl.source === "template" && tmpl.cmd === "claude --dangerously-skip-permissions --model 'claude-opus-5-5[1m]' --effort xhigh --resume sid-3");
+  t("codex no argv -> template codex resume", resumeCmdFor("codex", "cx-2").cmd === "codex resume cx-2");
+  t("unknown tool -> best-effort --resume", resumeCmdFor("opencode", "o-1").cmd === "opencode --resume o-1");
+}
+{
+  // assembleRoster attaches resumeCmd: argv path vs template path, and writes schema v2
+  const peers: PeerLike[] = [
+    { stableId: "a", tool: "claude", cwd: "/w/one", title: "one", pid: 1, argv: ["claude", "--dangerously-skip-permissions", "--model", "m", "--effort", "xhigh"] } as PeerLike,
+    { stableId: "b", tool: "codex", cwd: "/w/two", title: "two" }, // no argv -> template
+  ];
+  const snap = assembleRoster(peers, 1000);
+  t("snapshot is schema v2", snap.version === SCHEMA_VERSION && SCHEMA_VERSION === 2);
+  const one = snap.members.find((m) => m.title === "one")!;
+  t("member with argv -> resumeCmd from argv + --resume <sid>", one.resumeCmdSource === "argv" && one.resumeCmd === "claude --dangerously-skip-permissions --model m --effort xhigh --resume a");
+  const two = snap.members.find((m) => m.title === "two")!;
+  t("member without argv -> canon template codex", two.resumeCmdSource === "template" && two.resumeCmd === "codex resume b");
+}
+{
+  // v1 old snapshot (no resumeCmd) stays readable; resumeCommandForMember recomputes canon
+  const v1 = JSON.stringify({ version: 1, capturedAtSec: 5, members: [{ member: "old-sid", tool: "claude", cwd: "/x", role: null, title: "Old" }] });
+  const s = parseSnapshot(v1)!;
+  t("v1 snapshot still parses", s.version === 1 && s.members.length === 1);
+  t("v1 member has no resumeCmd field", s.members[0]!.resumeCmd === undefined);
+  t("resumeCommandForMember recomputes canon for a v1 member", resumeCommandForMember(s.members[0]!) === "claude --dangerously-skip-permissions --model 'claude-opus-5-5[1m]' --effort xhigh --resume old-sid");
+  // v2 snapshot round-trips resumeCmd + source
+  const v2 = JSON.stringify({ version: 2, capturedAtSec: 9, members: [{ member: "x", tool: "codex", cwd: "/y", role: null, resumeCmd: "codex resume x", resumeCmdSource: "argv" }] });
+  const s2 = parseSnapshot(v2)!;
+  t("v2 snapshot preserves version + resumeCmd + source", s2.version === 2 && s2.members[0]!.resumeCmd === "codex resume x" && s2.members[0]!.resumeCmdSource === "argv");
+  t("resumeCommandForMember uses the captured resumeCmd when present", resumeCommandForMember(s2.members[0]!) === "codex resume x");
 }
 
 console.log("all resume selftests passed");

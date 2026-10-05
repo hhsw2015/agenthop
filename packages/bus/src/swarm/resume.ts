@@ -22,10 +22,19 @@ export interface RosterMember {
   cwd: string; // the working directory the window opened in
   role: string | null; // best-effort; null when unknown
   title?: string; // short handle (e.g. "Work-20cab0a5"), for display
+  // F36: the FULL resume command, not a bare `claude --resume`. A bare relaunch loses permission mode / model /
+  // effort and starts a wrong session (user caught this by hand). Captured from the live process args when
+  // available, else the user's canon template. `resumeCmdSource` says which, honestly.
+  resumeCmd?: string;
+  resumeCmdSource?: ResumeCmdSource;
 }
 
+export type ResumeCmdSource = "argv" | "template";
+
+export const SCHEMA_VERSION = 2; // v1 had no resumeCmd; v2 adds it. Old v1 snapshots still read (resumeCmd recomputed).
+
 export interface RosterSnapshot {
-  version: 1;
+  version: 1 | 2;
   capturedAtSec: number;
   members: RosterMember[];
 }
@@ -39,9 +48,56 @@ export interface PeerLike {
   cwd?: string;
   title?: string;
   status?: string;
+  argv?: string[]; // the live process args (ps -o args= -p <pid>), split by the IO shell; used to capture resumeCmd
 }
 
 export const ROSTER_FILE = "roster-snapshot.json";
+
+// The user's canon resume forms (F36, user-dictated 2026-10-05). A bare relaunch is the bug; these are correct.
+function canonResumeCmd(tool: string, sid: string): string {
+  const t = tool.trim().toLowerCase();
+  if (t === "claude") return `claude --dangerously-skip-permissions --model 'claude-opus-5-5[1m]' --effort xhigh --resume ${sid}`;
+  if (t === "codex") return `codex resume ${sid}`;
+  return `${tool} --resume ${sid}`; // unknown tool: best-effort shape
+}
+
+// Preserve a live claude session's resumable flags (permission mode / model / effort) from its process args, so
+// a session launched with non-canon flags resumes AS IT WAS. Only recognized flags are kept — argv[0] (often a
+// node wrapper path) is ignored; the command name comes from `tool`.
+function claudeFlagsFromArgv(argv: readonly string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === "--dangerously-skip-permissions" || a === "--fast") out.push(a);
+    else if (a === "--model" || a === "--effort") { if (argv[i + 1]) { out.push(a, argv[i + 1]!); i++; } }
+    else if (a.startsWith("--model=") || a.startsWith("--effort=")) out.push(a);
+  }
+  return out;
+}
+
+/**
+ * Build the FULL resume command for a session. With live process args (from ps), reconstruct the command
+ * preserving the session's real flags + `--resume <sid>` (source "argv"); otherwise the user's canon template
+ * (source "template"). Pure. The sid is the durable session id to resume.
+ */
+export function resumeCmdFor(tool: string, sid: string, argv?: readonly string[]): { cmd: string; source: ResumeCmdSource } {
+  const t = (tool ?? "").trim().toLowerCase();
+  if (argv && argv.length) {
+    if (t === "claude") {
+      const flags = claudeFlagsFromArgv(argv);
+      if (flags.length) return { cmd: `claude ${flags.join(" ")} --resume ${sid}`, source: "argv" };
+      // a bare `claude` launch (no recognized flags) -> canon is SAFER than reproducing bareness (the F36 bug)
+    } else if (t === "codex") {
+      return { cmd: `codex resume ${sid}`, source: "argv" };
+    }
+  }
+  return { cmd: canonResumeCmd(tool, sid), source: "template" };
+}
+
+/** The resume command to actually run for a member: the captured one, else recompute canon (old v1 snapshots). */
+export function resumeCommandForMember(m: RosterMember): string {
+  return m.resumeCmd ?? canonResumeCmd(m.tool, m.member);
+}
 
 /** Normalize a directory for identity comparison: trim trailing slashes (but keep root "/"). */
 function normCwd(cwd: string): string {
@@ -79,10 +135,12 @@ export function assembleRoster(
     const identity = p.stableId ?? p.title ?? p.id ?? `${memberKey(tool, cwd)}#${members.length}`;
     if (seen.has(identity)) continue; // the same member listed twice, not two windows
     seen.add(identity);
-    members.push({ member: identity, tool, cwd, role: null, ...(p.title ? { title: p.title } : {}) });
+    const sid = p.stableId ?? p.id ?? identity; // the id to resume (durable session id, not the display title)
+    const { cmd, source } = resumeCmdFor(tool, sid, p.argv);
+    members.push({ member: identity, tool, cwd, role: null, ...(p.title ? { title: p.title } : {}), resumeCmd: cmd, resumeCmdSource: source });
   }
   members.sort((a, b) => (a.title ?? a.member).localeCompare(b.title ?? b.member));
-  return { version: 1, capturedAtSec: Math.floor(nowSec), members };
+  return { version: SCHEMA_VERSION, capturedAtSec: Math.floor(nowSec), members };
 }
 
 /** Tolerant parse of a snapshot file. Returns null on anything malformed (a resume should degrade, not throw). */
@@ -107,10 +165,13 @@ export function parseSnapshot(text: string): RosterSnapshot | null {
       cwd: mm.cwd,
       role: typeof mm.role === "string" ? mm.role : null,
       ...(typeof mm.title === "string" ? { title: mm.title } : {}),
+      // v2 field; a v1 snapshot lacks it -> left undefined, launch recomputes canon (resumeCommandForMember).
+      ...(typeof mm.resumeCmd === "string" ? { resumeCmd: mm.resumeCmd } : {}),
+      ...(mm.resumeCmdSource === "argv" || mm.resumeCmdSource === "template" ? { resumeCmdSource: mm.resumeCmdSource } : {}),
     });
   }
   return {
-    version: 1,
+    version: r.version === 2 ? 2 : 1, // preserve the on-disk version; unknown/missing -> treat as v1
     capturedAtSec: typeof r.capturedAtSec === "number" ? r.capturedAtSec : 0,
     members,
   };
