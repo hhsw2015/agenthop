@@ -32,7 +32,7 @@
 
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { connect as netConnect, createServer, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -370,7 +370,7 @@ async function cmdUpGha(id: string, mode: Mode, initScript: string | undefined, 
   const githubUser = args.val("--user") ?? (await ghaResolveUser());
   if (mode === "keyed") await ghaPreflightKeys(githubUser);
   const runTag = `vmssh-${randomBytes(6).toString("hex")}`;
-  const base: Meta = { id, mode, backend: "gha", createdSec: Math.floor(Date.now() / 1000), addrFile: addrPath(id), repo: repo.nameWithOwner, os, githubUser, ttlMin, sshUser: sshUserForOs(os), reqId };
+  const base: OwnedMeta = { id, mode, backend: "gha", createdSec: Math.floor(Date.now() / 1000), addrFile: addrPath(id), repo: repo.nameWithOwner, os, githubUser, ttlMin, sshUser: sshUserForOs(os), reqId };
   // If the name was taken over by a newer up (ours was cancelled + reused) while we were awaiting, STOP without touching the
   // new record; best-effort cancel our own run so it doesn't leak. Every late write/prune is generation-guarded.
   const reused = async (runId?: string): Promise<never> => {
@@ -387,10 +387,8 @@ async function cmdUpGha(id: string, mode: Mode, initScript: string | undefined, 
   const cap = await ghaCaptureAddr(repo.nameWithOwner, runId);
   if (cap.kind === "ended") { pruneIfOwner(id, reqId); throw new Error(`vm-ssh up --backend gha: run ${runId} completed before an address was captured (ttl too short, or the box failed early) — the box is gone. Inspect: gh run view ${runId} -R ${repo.nameWithOwner}`); }
   if (cap.kind === "timeout") throw new Error(`vm-ssh up --backend gha: dispatched run ${runId} but no address captured within ~150s. The box is RECORDED (id "${id}") and may still be coming up — retry: vm-ssh refresh ${id}; or stop it: vm-ssh down ${id}.`);
-  // re-check ownership AFTER the capture await, right before writing the address + ready record.
-  if (!recordIsOwned(readMeta(id), reqId)) return reused(runId);
-  writeAddr(id, cap.addr);
-  writeMetaIfOwner({ ...base, runTag, runId, phase: "ready" });
+  // commit the address + ready record atomically; if the name was taken over during capture, abort without touching it.
+  if (!commitReadyIfOwner({ ...base, runTag, runId, phase: "ready" }, cap.addr)) return reused(runId);
   process.stdout.write(`${JSON.stringify({ id, addrFile: addrPath(id), mode, backend: "gha", runId, os, ttlMin })}\n`);
 }
 
@@ -401,8 +399,8 @@ async function ensureGhaRunId(m: Meta): Promise<string | undefined> {
   if (m.repo && m.runTag) {
     try {
       const runId = await ghaLockRunId(m.repo, m.runTag);
-      const cur = readMeta(m.id); // cache the id back ONLY if the record is still the same generation we were resolving
-      if (cur !== undefined && cur.reqId === m.reqId) writeMeta({ ...cur, runId });
+      // cache the id back ONLY if the record is still the same generation we were resolving (atomic read-check-write).
+      withIdLock(m.id, () => { const cur = readMeta(m.id); if (cur !== undefined && cur.reqId === m.reqId) writeMeta({ ...cur, runId }); });
       return runId;
     } catch { return undefined; }
   }
@@ -708,19 +706,47 @@ function reserveMeta(m: Meta): void {
   try { writeFileSync(metaPath(m.id), `${JSON.stringify({ ...m, phase: "reserved" })}\n`, { mode: 0o600, flag: "wx" }); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`name "${m.id}" already in use (or an in-flight up is claiming it)`); throw e; }
 }
+type OwnedMeta = Meta & { reqId: string };
 /** Does an on-disk record still belong to this up's generation? (pure; the guard below reads the record and applies it.) */
 export function recordIsOwned(cur: Meta | undefined, reqId: string): boolean { return cur !== undefined && cur.reqId === reqId; }
-/** Write meta ONLY if the current record is still THIS generation's — a late write from an old up must not clobber a
- *  record a reused name now owns. Returns false (write skipped) when the name has been taken over. */
-function writeMetaIfOwner(m: Meta & { reqId: string }): boolean {
-  if (!recordIsOwned(readMeta(m.id), m.reqId)) return false;
-  writeMeta(m); return true;
+
+const sleepSync = (ms: number): void => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(1, ms)); } catch { const u = Date.now() + ms; while (Date.now() < u) { /* spin */ } } };
+/** A cross-PROCESS mutex for a box id: the generation check and the meta/address write-or-delete must be ONE critical
+ *  section, so a second CLI cannot slip a takeover (down + reuse) between our read and our write. NETWORK AWAITS STAY
+ *  OUTSIDE this. O_EXCL lock file; a crashed holder's lock (older than 10s) is reclaimed. */
+function withIdLock<T>(id: string, fn: () => T): T {
+  mkdirSync(addrDir(), { recursive: true });
+  const lock = path.join(addrDir(), `${id}.lock`);
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try { const fd = openSync(lock, "wx", 0o600); writeSync(fd, `${process.pid} ${Date.now()}`); closeSync(fd); break; }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      try { if (Date.now() - statSync(lock).mtimeMs > 10_000) { rmSync(lock, { force: true }); continue; } } catch { continue; }
+      if (Date.now() > deadline) throw new Error(`vm-ssh: timed out acquiring the lock for "${id}" (another operation holds it)`);
+      sleepSync(25);
+    }
+  }
+  try { return fn(); } finally { try { rmSync(lock, { force: true }); } catch { /* ok */ } }
 }
-/** Prune ONLY if the current record is this generation's (or already gone). Never deletes a newer generation's record. */
+
+/** Write meta ONLY if the current record is still THIS generation's — atomic read-check-write across processes, so a late
+ *  write from an old up cannot clobber a record a reused name now owns. Returns false (skipped) when the name was taken over. */
+function writeMetaIfOwner(m: OwnedMeta): boolean {
+  return withIdLock(m.id, () => { if (!recordIsOwned(readMeta(m.id), m.reqId)) return false; writeMeta(m); return true; });
+}
+/** Commit the captured ADDRESS + its meta atomically under one lock — a takeover must not slip between the addr and meta
+ *  writes, nor have our stale address overwrite the new instance's. */
+function commitReadyIfOwner(m: OwnedMeta, addr: string): boolean {
+  return withIdLock(m.id, () => { if (!recordIsOwned(readMeta(m.id), m.reqId)) return false; writeAddr(m.id, addr); writeMeta(m); return true; });
+}
+/** Write just the address if still ours (refresh). */
+function commitAddrIfOwner(id: string, reqId: string | undefined, addr: string): boolean {
+  return withIdLock(id, () => { const cur = readMeta(id); if (cur === undefined || cur.reqId !== reqId) return false; writeAddr(id, addr); return true; });
+}
+/** Prune ONLY if the current record is this generation's (or already gone), atomically. Never deletes a newer generation. */
 function pruneIfOwner(id: string, reqId: string | undefined): boolean {
-  const cur = readMeta(id);
-  if (cur !== undefined && cur.reqId !== reqId) return false;
-  prune(id); return true;
+  return withIdLock(id, () => { const cur = readMeta(id); if (cur !== undefined && cur.reqId !== reqId) return false; prune(id); return true; });
 }
 function readMeta(id: string): Meta | undefined {
   try { return JSON.parse(readFileSync(metaPath(id), "utf8")) as Meta; } catch { return undefined; }
@@ -841,8 +867,7 @@ async function cmdUpInner(id: string, mode: Mode, backend: Backend, initScript: 
   const addr = parseCapturedAddr(stdout);
   if (!addr) throw new Error("vm-ssh up: no tailcat address captured from the box (serve may have failed; see /tmp/vmssh.serve.log on the box)");
 
-  if (!writeMetaIfOwner({ id, mode, backend: "railway", createdSec: Math.floor(Date.now() / 1000), keyPath, knownHosts, addrFile: addrPath(id), phase: "ready", reqId })) throw new Error(`vm-ssh up: name "${id}" was reused by another up while this one was in flight`);
-  writeAddr(id, addr);
+  if (!commitReadyIfOwner({ id, mode, backend: "railway", createdSec: Math.floor(Date.now() / 1000), keyPath, knownHosts, addrFile: addrPath(id), phase: "ready", reqId }, addr)) throw new Error(`vm-ssh up: name "${id}" was reused by another up while this one was in flight`);
   process.stdout.write(`${JSON.stringify({ id, addrFile: addrPath(id), mode, backend: "railway" })}\n`); // address itself stays in the 0600 file
 }
 
@@ -879,19 +904,19 @@ function cmdLs(args: Args): void {
 async function cmdRefresh(args: Args): Promise<void> {
   const id = resolveId(args.rest()[0]);
   const m = readMeta(id)!;
-  let addr: string | undefined;
+  const reused = (): never => { throw new Error(`vm-ssh refresh: "${id}" was reused by another up while this refresh was in flight — not overwriting the new instance`); };
   if (backendOf(m) === "gha") {
     const cap = await ghaRefresh(m); // re-download the address artifact (only if the run is still live)
-    if (cap.kind === "ended") { prune(id); throw new Error(`vm-ssh refresh: run ${m.runId} for "${id}" has completed — the box is gone (pruned).`); }
+    if (cap.kind === "ended") { pruneIfOwner(id, m.reqId); throw new Error(`vm-ssh refresh: run ${m.runId} for "${id}" has completed — the box is gone (pruned).`); }
     if (cap.kind === "timeout") throw new Error(`vm-ssh refresh: no address for "${id}" yet — run ${m.runId} may still be coming up; retry shortly (or vm-ssh down ${id}).`);
-    addr = cap.addr;
+    if (!commitAddrIfOwner(id, m.reqId, cap.addr)) reused(); // generation-guarded: never write a stale address over a reused name
   } else {
     // railway: same key ⇒ same box: re-read the address the box's serve wrote (survives a serve restart that changed it).
     const stdout = await railwayRun(m.keyPath!, m.knownHosts!, "printf 'VMSSH_ADDR=%s\\n' \"$(cat /tmp/vmssh.addr 2>/dev/null)\"");
-    addr = parseCapturedAddr(stdout);
+    const addr = parseCapturedAddr(stdout);
     if (!addr) { throw new Error(`vm-ssh refresh: box "${id}" returned no address (it may be destroyed; run vm-ssh ls)`); }
+    if (!commitAddrIfOwner(id, m.reqId, addr)) reused();
   }
-  writeAddr(id, addr);
   process.stdout.write(`${JSON.stringify({ id, addrFile: addrPath(id), mode: m.mode, backend: backendOf(m), refreshed: true })}\n`);
 }
 
