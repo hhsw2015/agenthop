@@ -121,6 +121,9 @@ const DEAD_LETTER_THRESHOLD = Number(process.env.SWARM_DEAD_LETTER_THRESHOLD || 
 // is what must be bounded, not just the JSON.parse count) + process at most M routing groups per tick (round-robin cursor).
 const MAX_READ_BYTES = Number(process.env.SWARM_DEAD_LETTER_MAX_BYTES || String(256 * 1024));
 const MAX_ROUTING_GROUPS_PER_TICK = Number(process.env.SWARM_ROUTING_GROUPS_PER_TICK || "32");
+// S11/4-n: suppress an IDENTICAL coordinator notice (same taskRef+text) re-sent within this window, so a repeating observer
+// event does not spam the coordinator inbox. A transient send FAILURE is never recorded, so a genuine retry is not suppressed.
+const NOTIFY_DEDUP_MS = Number(process.env.SWARM_NOTIFY_DEDUP_MS || "60000");
 const PLAN_FILE = process.env.SWARM_PLAN || "";
 const TASK_EXEC = /^(1|true|yes|on)$/i.test(process.env.SWARM_TASK_EXEC ?? "");
 const CPA_BASE_URL = process.env.SWARM_CPA_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
@@ -534,7 +537,7 @@ function buildSweepOps(stateRef: { s: LogState }): SweepOps {
         : action.actionKind === "move-validator" ? `[sweep] VALIDATE: ${w.waitId} (run ${w.subject.validationRunId ?? "?"}) — you are the new validator seat`
         : `[sweep] ${w.waitId}: ${action.actionKind}`;
       // R6: at-least-once delivery — carry actionId so a re-fired duplicate is self-evident to the receiver (no transport dedup).
-      try { writeInbox(HOME, sid, { from: SELF, fromLabel: "swarm-sweep", text: `${text} [actionId:${action.actionId}]`, via: "local", ts: Date.now(), actionId: action.actionId }); return true; }
+      try { writeInbox(HOME, sid, { from: SELF, fromLabel: "swarm-sweep", taskRef: w.waitId, title: `sweep:${action.actionKind}`, text: `${text} [actionId:${action.actionId}]`, via: "local", ts: Date.now(), actionId: action.actionId }); return true; }
       catch (e) { log(`sweep doAction ${w.waitId}: inbox write failed: ${e instanceof Error ? e.message : e}`); return false; }
     },
     log,
@@ -728,16 +731,22 @@ async function main(): Promise<void> {
   // "delivered" = written to the coordinator inbox; "logged" = unroutable (unset/unresolved) best-effort to the log (NOT a
   // defect — a declared log-only mode); "failed" = routable but the inbox write errored (transient ⇒ the caller holds the
   // snapshot + retries so the event is not lost — review P2-2).
-  const notifyCoordinator = (text: string): "delivered" | "logged" | "failed" => {
+  const notifySent = new Map<string, number>(); // dedup: (taskRef\0text) -> last-sent ms; suppress an identical re-send within NOTIFY_DEDUP_MS
+  const notifyCoordinator = (text: string, opts: { taskRef?: string; title?: string } = {}): "delivered" | "logged" | "failed" | "deduped" => {
+    const now = Date.now();
+    for (const [k, t] of notifySent) if (now - t >= NOTIFY_DEDUP_MS) notifySent.delete(k); // prune expired (bounds the map)
+    const key = `${opts.taskRef ?? ""}\u0000${text}`;
+    if ((notifySent.get(key) ?? -Infinity) > now - NOTIFY_DEDUP_MS) return "deduped"; // identical notice just sent — skip the duplicate (not a failure: the original went out)
+    const s11 = { ...(opts.taskRef ? { taskRef: opts.taskRef } : {}), ...(opts.title ? { title: opts.title } : {}) }; // S11 structured header (validInboxMsg preserves these)
     if (COORDINATOR !== "") {
       const sid = resolveSession(COORDINATOR, listSessions(HOME));
       if (sid) {
-        try { writeInbox(HOME, sid, { from: SELF, fromLabel: "swarm-observer", text, via: "local", ts: Date.now() }); return "delivered"; }
-        catch (e) { log(`observer notify write failed (transient) — will retry: ${e instanceof Error ? e.message : e}`); return "failed"; }
+        try { writeInbox(HOME, sid, { from: SELF, fromLabel: "swarm-observer", ...s11, text, via: "local", ts: now }); notifySent.set(key, now); return "delivered"; }
+        catch (e) { log(`observer notify write failed (transient) — will retry: ${e instanceof Error ? e.message : e}`); return "failed"; } // not recorded ⇒ retry not suppressed
       }
     }
     log(`[observer→coordinator] ${text}${COORDINATOR === "" ? " (SWARM_COORDINATOR unset — logged)" : " (coordinator unresolved — logged)"}`);
-    return "logged";
+    notifySent.set(key, now); return "logged";
   };
 
   // The durable-state observer (L2-struct 2/n, §2b-c/§2c + F25). Two INDEPENDENT fail-soft halves (a failure in one must not
@@ -781,7 +790,10 @@ async function main(): Promise<void> {
         if (curr === null) return; // a transient sampling error ⇒ hold the last snapshot, retry next tick (P2-3)
         let anyFailed = false;
         for (const ev of detectWatchEvents(snap, curr)) {
-          const res = notifyCoordinator(ev.kind === "board" ? `board: ${ev.item} → ${ev.state}${ev.who ? ` by ${ev.who}` : ""} (durable change — reconcile)` : `PROGRESS.md changed (mtime ${ev.mtimeMs})`);
+          const res = notifyCoordinator(
+            ev.kind === "board" ? `board: ${ev.item} → ${ev.state}${ev.who ? ` by ${ev.who}` : ""} (durable change — reconcile)` : `PROGRESS.md changed (mtime ${ev.mtimeMs})`,
+            ev.kind === "board" ? { taskRef: ev.item, title: "board change" } : { taskRef: "PROGRESS", title: "progress change" },
+          );
           if (res === "failed") anyFailed = true;
         }
         // advance only if no event failed to deliver (unroutable log-only is fine); a transient delivery failure holds the
@@ -895,7 +907,7 @@ async function main(): Promise<void> {
     // survives a close (a repair could resolve the wait before the first retry). Delivered ⇒ drop to bound the map.
     for (const [incidentId, note] of Object.entries(watch.notify)) {
       if (note.sent) continue;
-      if (notifyCoordinator(note.text) !== "failed") watch.notify[incidentId] = { ...note, sent: true };
+      if (notifyCoordinator(note.text, { taskRef: incidentId, title: "routing incident" }) !== "failed") watch.notify[incidentId] = { ...note, sent: true };
       else log(`routing notify for ${incidentId} failed (transient) — retry next tick`);
     }
     for (const [incidentId, note] of Object.entries(watch.notify)) if (note.sent) delete watch.notify[incidentId];
