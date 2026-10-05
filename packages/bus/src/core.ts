@@ -31,8 +31,10 @@ export type BusCore = {
   /** `delivered` reports the channel used (bus-reachability §1 / B2+B3 option b): "durable" = written to the recipient's durable
    *  inbox, the ONLY same-machine delivery guarantee (surfaced near-live by the recipient's fs-watch/flush, and restart-safe);
    *  "relay" = a live best-effort cross-machine send (no shared durable inbox). There is no "local"/"native-direct" live push:
-   *  a byte-write/FIN is not a confirmed receipt (B3) and native-direct's cached socket could misroute (B2). Absent on failure. */
-  send(to: string, text: string): Promise<{ ok: boolean; label?: string; error?: string; delivered?: "durable" | "relay" }>;
+   *  a byte-write/FIN is not a confirmed receipt (B3) and native-direct's cached socket could misroute (B2). "bus" = a live
+   *  best-effort broker push to a node that does NOT consume the durable inbox (an OpenCode plugin node, C1) — not a durable
+   *  guarantee. Absent on failure. */
+  send(to: string, text: string): Promise<{ ok: boolean; label?: string; error?: string; delivered?: "durable" | "relay" | "bus" }>;
   recv(timeoutMs: number): Promise<BusMessage[]>;
   /** Record this Codex thread id (from x-codex-turn-metadata) so inbound can be pushed to it. */
   noteThread(id: string): void;
@@ -390,7 +392,19 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       }
       // Resolved. SAME-MACHINE (local) ⇒ durable-always (fallbackForMissedDelivery computes the recipient's durable sid).
       const plan = fallbackForMissedDelivery(peer);
-      if (plan.kind === "durable") return toDurable(plan.sid);
+      if (plan.kind === "durable") {
+        // C1 (review 01b773d): an OpenCode node receives over the broker + its own in-memory queue; it does NOT consume the
+        // durable inbox, so a durable write to it is never read. For such a node, deliver over the LIVE BUS (the accelerator it
+        // does consume) and report the capability limit honestly — delivered:"bus" is best-effort, NOT the durable guarantee. Every
+        // other local node (BusCore: claude/codex) consumes the durable inbox and gets durable-always. (Not native-direct — no
+        // cached socket, no misroute; just the broker the peer is already on.)
+        if (peer.tool === "opencode") {
+          const ok = local.send(peer.id, text);
+          if (ok) { if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via: "local", direction: "out", size: Buffer.byteLength(text), text }); return { ok: true, label: labelFor(peer.id), delivered: "bus" }; }
+          return { ok: false, error: `"${peer.title}" (OpenCode) is not reachable on the live bus right now, and OpenCode nodes do not consume the durable inbox — try again when it is active.` };
+        }
+        return toDurable(plan.sid);
+      }
       // CROSS-MACHINE (relay): a live best-effort send; no local durable fallback (no shared filesystem).
       if (relay && peer.pub) {
         const ok = await relay.send(peer.pub, text);
