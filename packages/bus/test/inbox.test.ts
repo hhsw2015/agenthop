@@ -69,6 +69,18 @@ describe("durable inbox", () => {
     recoverStaleClaims(HOME, ["s1"]); // must NOT steal it
     expect(claimInbox(HOME, ["s1"], "p2").length).toBe(0);
   });
+
+  test("B8/F32: writeInbox REJECTS an invalid record at the write boundary — never publishes a file the receiver can only quarantine", () => {
+    // The three reviewer cases (bus-reachability B8): a bad ts must be rejected by the writer, not published and then
+    // quarantined by the receiver (and ts=null previously CRASHED on `.toString()` instead of a clean rejection).
+    for (const bad of [{ ...msg("x", 0), ts: "bad-clock" }, { ...msg("x", 0), ts: NaN }, { ...msg("x", 0), ts: null }, { ...msg("x", 0), via: "carrier-pigeon" }, { ...msg("x", 1000), from: 42 }]) {
+      expect(() => writeInbox(HOME, "s1", bad as never)).toThrow();
+    }
+    expect(claimInbox(HOME, ["s1"], "p").length).toBe(0); // nothing was published
+    writeInbox(HOME, "s1", msg("good", 1000));            // a valid one still writes + normalizes
+    const c = claimInbox(HOME, ["s1"], "p");
+    expect(c.map((x) => x.msg.text)).toEqual(["good"]);
+  });
 });
 
 describe("F28 poison-pill defense", () => {

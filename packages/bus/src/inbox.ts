@@ -99,14 +99,22 @@ function inboxDir(home: string, key: string): string {
   return path.join(home, ".agenthop", "inbox", sanitize(key));
 }
 
-/** Append a message to the durable inbox for `key` (atomic temp+rename, 0600). */
+/** Append a message to the durable inbox for `key` (atomic temp+rename, 0600). VALIDATES at the WRITE boundary (F32/B8):
+ *  the producer's record must pass validInboxMsg BEFORE it is published — the same schema the receiver enforces after claim.
+ *  Without this a malformed write (e.g. ts="bad-clock" or NaN) publishes a .json the receiver can only QUARANTINE, and ts=null
+ *  used to crash here on `.toString()` instead of a clean rejection. The receiver-side validator is crash/poison defense (F28),
+ *  not a substitute for refusing an invalid write at the source. Throwing is the fail-fast rejection; every caller passes a
+ *  well-formed envelope, so this never fires on the live paths — it guards a future/untrusted producer. The NORMALIZED record
+ *  (known fields only) is what gets persisted, so no junk field is ever written. */
 export function writeInbox(home: string, key: string, msg: InboxMsg): void {
+  const valid = validInboxMsg(msg);
+  if (valid === null) throw new Error("writeInbox: refusing to publish an invalid inbox message (from/fromLabel/text must be strings, via ∈ {local,relay}, ts a finite number)");
   const dir = inboxDir(home, key);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const base = `${msg.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
+  const base = `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
   const file = path.join(dir, base);
   const tmp = `${file}.tmp`;
-  writeFileSync(tmp, JSON.stringify(msg), { mode: 0o600 });
+  writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
   renameSync(tmp, file);
 }
 
