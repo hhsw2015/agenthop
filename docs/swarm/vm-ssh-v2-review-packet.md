@@ -120,6 +120,15 @@ matrix pinned in selftest.
 New pure predicates `recordIsOwned` / `timePrunable` pinned in selftest; real re-run (`f293120`) confirmed up/ls/ssh/down
 with the guards in place.
 
+## Round-6 disposition — reviewer 01a0ff49 (f293120: 0 P1 / 3 P2), fixed in `cd18e13`
+| Finding | Fix |
+|---|---|
+| R5-P2: `writeMetaIfOwner`'s read-check-write is not atomic across CLIs — a stale read passes the check, then blindly writes/clobbers | `withIdLock` — an O_EXCL per-id lock file (stale-steal after 10s) wraps the WHOLE read-check-write (and addr write) so a second CLI can't slip a down+reuse between the read and the write. Network awaits stay outside. All guards (`writeMetaIfOwner`/`pruneIfOwner`/`commitReadyIfOwner`/`commitAddrIfOwner`/`ensureGhaRunId` cache) go through it; the up ready path commits address+meta in one locked section. |
+| R5-P2: `cmdRefresh` missing the generation guard — a refresh resuming after down+reuse writes a stale address onto / prunes the new record | refresh generation-guards its `ended` prune (`pruneIfOwner`) and its address write (`commitAddrIfOwner`); on takeover it aborts without touching the new record. |
+| R5-P2 (tsc TS2345): `base: Meta` widened `reqId` to optional, breaking the `Meta & {reqId:string}` guard calls | `base` typed `OwnedMeta` (required `reqId`); strict/NodeNext typecheck stays on and passes. |
+
+Real re-run (`cd18e13`) confirmed up/ssh/down under the lock with no lock-file leak.
+
 ## Seams to probe
 - `ghaLockRunId` identifies the run by the `run_tag` nonce in `displayTitle` — not a timestamp (ownership is exact).
 - The tailcat address never touches stdout/argv: captured from the artifact file (0600 addr file), and the connect passes
