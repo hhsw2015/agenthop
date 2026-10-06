@@ -52,7 +52,12 @@ export function herdrAgentName(label: string, taken: ReadonlySet<string> = new S
  *  {kind:"codex", args:["resume","X"]}. Pure. (A richer shell-aware split is overkill — our commands are flag
  *  lists with no embedded quotes after shell parsing.) */
 export function splitCommand(cmd: string): { kind: string; args: string[] } {
-  const toks = (cmd ?? "").trim().split(/\s+/).filter(Boolean);
+  // Strip matched surrounding shell quotes per token: the canon resume cmd quotes the model
+  // ('claude-opus-5-5[1m]') for the SHELL (Ghostty runs a string), but herdr `agent start -- <args>` goes through
+  // execFile with no shell, so a literal quote would corrupt the arg. Our tokens have no internal spaces, so a
+  // per-token whitespace split + quote-strip is correct here (a full shell tokenizer is overkill).
+  const unquote = (s: string) => (/^'.*'$/.test(s) || /^".*"$/.test(s) ? s.slice(1, -1) : s);
+  const toks = (cmd ?? "").trim().split(/\s+/).filter(Boolean).map(unquote);
   return { kind: toks[0] ?? "", args: toks.slice(1) };
 }
 

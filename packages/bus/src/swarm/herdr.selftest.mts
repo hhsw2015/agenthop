@@ -33,6 +33,9 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   const c = splitCommand("codex resume SID");
   t("codex kind + resume subcommand as args", c.kind === "codex" && c.args.join(" ") === "resume SID");
   t("empty -> empty kind", splitCommand("").kind === "");
+  // the canon resume cmd quotes the model for the shell; herdr (execFile, no shell) must get it UNquoted
+  const q = splitCommand("claude --dangerously-skip-permissions --model 'claude-opus-5-5[1m]' --effort xhigh --resume SID");
+  t("surrounding shell quotes stripped for execFile", q.args.includes("claude-opus-5-5[1m]") && !q.args.some((a) => a.includes("'")));
 }
 
 // --- argv builders ---
