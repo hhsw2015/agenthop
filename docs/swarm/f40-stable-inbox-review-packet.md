@@ -1,11 +1,39 @@
 # F40 stable inbox addressing + legacy-claim + unclaimed-mail sentinel — review packet → 01a0ff49 (S12 cc coordinator)
 
-**needs:** none (ready for review). fixOwner f32a0507. Source repo `~/Dev/agenthop-wt/stable-inbox`.
+**needs:** re-verify at the new SHA. fixOwner f32a0507. Source repo `~/Dev/agenthop-wt/stable-inbox`.
+
+---
+
+## Revision 2 — round-1 findings fixed (re-verify `4db1ccb`)
+
+Round-1 (reviewer 01a0ff49, against `fd432a4`) = **4 P1 / 1 P2 / 5 REMAIN**, all confirmed and accepted. Fixed per the
+coordinator's rulings **R15 / R15-b** in `4db1ccb` (review range `fd432a4..4db1ccb`). Verify:
+`pnpm --filter @agenthop/bus exec vitest run` → **75 files / 961 green**; bus + scripts tsc → **0**.
+
+| # | Finding | Fix | Gate pinned by |
+|---|---|---|---|
+| F40-1 P1 | shared run-id bridged a thread-switch A→B ⇒ B drained A's box | `legacyInboxKeys` rewritten (R15-b): recover only the prior-RUN boxes of entities sharing `self.stableId` as a hard/non-superseded NATIVE; no stableId / collision native ⇒ `[]`; run-id→sibling bridge DELETED | `legacy-inbox-keys.test` "F40-1 counterexample: A→B does not let B drain A" + "restart … NOT a drifted-thread sibling" |
+| F40-2 P1 | legacy cache ignored an alias-log correction/late-link until restart | recompute before every claim (flush + recv), stamp-gated via `identityLogStamp` (cheap when unchanged); force on identity change | `core-legacy-refresh.test` "F40-2 … no restart" (revoke ⇒ not claimed; late link ⇒ drained) |
+| F40-3 P1 | dead-pid `.claim` invisible ⇒ unowned box never alerts | `scanInboxes` counts a `.claim-<pid>` whose holder is NOT alive as stranded; LIVE-pid claim stays excluded (in-flight, never stolen; sentinel only reports) | `swarm-inbox-sentinel.test` "F40-3 … LIVE in-flight / DEAD stranded" + end-to-end alert |
+| F40-4 P1 | whois `candidates` ⇒ empty tool/cwd ⇒ over-credit ownership ⇒ suppress stall | dispatcher: a non-single-entity whois credits ONLY the direct sid (no legacy expansion) — safe under-credit (report, never suppress) | dispatcher runner (tsc + reviewer re-run); mirrors the new `legacyInboxKeys` |
+| F40-5 P2 | coordinator-box alert count bypassed dedup ⇒ per-tick self-feedback | per-box dedup keyed by the STABLE box id (`inboxStallAlertedAt`), not the text ⇒ one alert per box per window + bounded reminder; coordinator box NOT wholesale-excluded (would hide real mail) | dispatcher runner (tsc + reviewer re-run) |
+
+**Packet corrections (round-1 required):** the original "incident replay drains all three boxes" guarantee is REMOVED — per
+R15-b the drifted-thread box is deliberately NOT drained (left to the sentinel); see the corrected Selftest section below.
+The round-1 self-flag "empty tool/cwd is still safe" is WITHDRAWN — it was F40-4, now fixed. The "claims are all in-flight"
+assumption behind the original sentinel scan is removed (F40-3: a dead-pid claim is stranded, not in-flight).
+
+The sections below are the original round-1 packet (`fd432a4`), retained for provenance; where they conflict with Revision 2,
+Revision 2 governs.
+
+---
+
+**needs (round 1):** none. fixOwner f32a0507.
 
 Branch `feat/stable-inbox-addressing`, review range `b5fde65..fd432a4` (code; this packet is the only docs add, named
 separately). stopSet honored: **committed on the branch, NOT merged, NOT pushed.**
 
-Verify:
+Verify (round 1):
 `pnpm --filter @agenthop/bus exec vitest run` → **74 files / 956 tests green**;
 `pnpm --filter @agenthop/bus run typecheck` → **0**; `pnpm exec tsc -p scripts/tsconfig.json --noEmit` → **0** (double tsc).
 
@@ -75,11 +103,13 @@ existing tests unchanged).
 | ② no mail theft | collision-exclusion + tool/cwd guard in `legacyInboxKeys` | `legacy-inbox-keys.test` "a COLLISION native … is NOT crossed", "a DIFFERENT session's box is never adopted" | two concurrent different-cwd sessions sharing a native don't cross |
 | ③ unclaimed-mail sentinel → escalate | `inbox-sentinel.detectStalledInboxes`/`scanInboxes`; `swarm-dispatch.runInboxSentinel` | `swarm-inbox-sentinel.test` (7) | old backlog + no live owner ⇒ alert; a live owner / fresh backlog ⇒ none; `.claim-*` not counted |
 
-## Selftest — today's incident replay
-`legacy-inbox-keys.test.ts` "incident replay": RUN1 boots `conv-1`, thread drifts `conv-1→thread-A`; mail written to
-`conv-1`, `run-1` (old run), `thread-A` (routing-name box); RUN2 restarts (same `conv-1`, new `run-2`); the new term's
-`legacyInboxKeys` = {`run-1`,`thread-A`} and `claimInbox([conv-1,run-2,...legacy])` drains all three — nothing stranded.
-End-to-end at the pure+inbox layer (no live broker needed).
+## Selftest — today's incident replay (CORRECTED per R15-b, Revision 2)
+`legacy-inbox-keys.test.ts` "restart end-to-end": RUN1 boots `conv-1`, thread drifts `conv-1→thread-A`; mail written to
+`conv-1`, `run-1` (old run), `thread-A` (drifted-thread box); RUN2 restarts (same `conv-1`, new `run-2`); the new term's
+`legacyInboxKeys` = {`run-1`} and `claimInbox([conv-1,run-2,...legacy])` drains `conv-1` + `run-1` ONLY. The drifted-thread
+box `thread-A` is DELIBERATELY left (a distinct entity — R15-b), to be surfaced by the sentinel, NOT silently drained. The
+same-run A→B theft counterexample (`"F40-1 counterexample"`) pins that B never drains A. End-to-end at the pure+inbox layer.
+(Supersedes the original "drains all three" claim, which R15-b forbids.)
 
 ## Self-flags (reviewer please rule)
 - **Scope honesty on ①:** `resolveInboxTarget` is consolidation + a structural guard (no handle-as-key), not a new
