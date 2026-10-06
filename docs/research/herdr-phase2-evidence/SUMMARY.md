@@ -10,16 +10,23 @@ herdr 0.9.3, binary `~/.local/bin/herdr`. Probe kind: codex (GPT-6-Astra). Raw J
 
 ## Captured receipts (raw files)
 
+Two runs. Run 1 (01–08) captured the shapes but did NOT archive the completion read for the stalled working
+prompt (a gap the reviewer caught). Run 2 (09–11) re-captured the decisive `--wait` case with a complete,
+timestamped archive. Both runs are isolated+torn-down.
+
 | # | file | what it proves |
 |---|------|----------------|
 | 01 | `01-agent-started.json` | `agent start` success shape |
 | 02 | `02-agent-get.json` | `agent get` success shape (pane binding field) |
-| 03 | `03-prompt-wait-success.json` | `agent prompt --wait` on a real working task |
-| 04 | `04-prompt-stalled.json` | `agent prompt --wait` stalled (first trivial prompt) |
-| 05 | `05-read-recent-unwrapped.txt` | real `agent read recent-unwrapped` noise sample |
+| 03 | `03-prompt-wait-success.json` | run-1 `agent prompt --wait` (multiplication) → stalled; run-1 completion read was NOT archived (the gap; fixed by 09–11) |
+| 04 | `04-prompt-stalled.json` | run-1 `agent prompt --wait` (trivial "OK") → stalled BECAUSE codex was still on the startup hook page (see 05): not-ready, NOT a detection miss |
+| 05 | `05-read-recent-unwrapped.txt` | run-1 read AT the first stall: codex on the startup hook-trust page (explains 04). A real noise sample. **Does NOT contain 391 / "Worked for 7s".** |
 | 06 | `06-submit-agent-prompted.json` | `agent prompt` (no --wait) success shape |
 | 07 | `07-agent-name-taken.json` | duplicate `agent start` error code |
 | 08 | `08-prompt-not-found.json` | `agent prompt` to a nonexistent agent |
+| 09 | `09-input-ready-read.txt` + `09b-status-before.json` | run-2: codex AT its input prompt, status `idle` + `interactive_ready:true`, BEFORE the prompt |
+| 10 | `10-prompt-wait.json` + `10-sequence-timing.txt` | run-2 `agent prompt --wait` on the input-ready agent → `agent_prompt_stalled` at ~5.4s (T0→T1) |
+| 11 | `11-read-after-completion.txt` | run-2 read right after: codex DID complete — "17 × 23 = … = 391 … Worked for 7s" |
 
 ## Findings vs the five ticket items
 
@@ -29,18 +36,22 @@ Success is `result.type==="agent_prompted"` with `result.agent` an AgentInfo car
 `name` we targeted. This exactly matches `classifySubmit`'s positive path (type + agent + pane_id + name===target).
 `name` is **populated** (="probeagent"), not null.
 
-**① `agent prompt --wait` settle — NO RELIABLE SIGNAL (03, 04).**
-`--wait` returned `{"error":{"code":"agent_prompt_stalled","message":"agent prompt produced no observed working or
-blocked state within 5000 ms; current status is idle"}}` — on BOTH a trivial prompt AND a real working task. The
-pane read (05) proves the second prompt **was submitted and codex completed it** ("17 × 23 = 391 ... Worked for 7s"),
-yet `--wait` still declared stalled: herdr's 5000ms working-state detector never observed codex's 7s of work. So in
-herdr 0.9.3 `--wait` does **not** yield a trustworthy settle receipt for codex. **WAIT_SETTLE_TYPES stays empty is
-now empirically justified, not merely conservative.** settle remains `unknown`.
+**① `agent prompt --wait` settle — NO RELIABLE SIGNAL (09 → 10 → 11, timestamped).**
+Two stalls were seen, with DIFFERENT causes — run 1 did not separate them, so run 2 re-captured the decisive case:
+ - run-1 trivial "OK" prompt stalled because codex was still on its startup hook-trust page (read 05) — the agent
+   was not ready, NOT a detection miss.
+ - run-2 is decisive: codex was confirmed AT its input prompt, `idle` + `interactive_ready:true` (09 / 09b); the
+   working prompt was sent; `agent prompt --wait` returned `agent_prompt_stalled` at ~5.4s (10 + timing T0→T1); the
+   immediate read (11) shows codex DID receive and complete it — "17 × 23 = … = 391 … Worked for 7s". herdr's 5000ms
+   working-state detector missed a genuinely working+completed codex turn.
+So in herdr 0.9.3 `--wait` does **not** yield a trustworthy settle receipt for codex: it reports stalled on a real,
+input-ready, submitted, completed prompt. **WAIT_SETTLE_TYPES empty is empirically justified, not merely
+conservative;** settle stays `unknown`.
 
-**② post-submit timeout / stalled — CONFIRMED (03, 04).**
-`agent_prompt_stalled` occurred even though the prompt was submitted and the work completed. This is the reviewer's
-R3-P2-1 exactly: a `--wait`/prompt error can post-date a real submission. Mapping it to `no` would be wrong;
-`unknown` (never replay) is correct.
+**② post-submit timeout / stalled — CONFIRMED (09 → 10 → 11).**
+In run 2, `agent_prompt_stalled` was returned for a prompt submitted to a confirmed input-ready agent that then
+completed the work (391). This is the reviewer's R3-P2-1 exactly: a `--wait`/prompt error can post-date a real
+submission AND completion. Mapping it to `no` would be wrong; `unknown` (never replay) is correct.
 
 **③ `agent_name_taken` — CONFIRMED (07).**
 Starting a second agent with an existing name: `{"error":{"code":"agent_name_taken","message":"agent name
@@ -55,18 +66,19 @@ schema-legal null-name case was NOT observed in practice — the positive target
 correct and is NOT relaxed. `02` `agent get` → `result.type==="agent_info"`, `result.agent.pane_id` present
 (validates `agentPaneId`/`paneBound`, R2-P2-5).
 
-**⑤ `agent read recent-unwrapped` noise — SAMPLE CAPTURED (05).**
-Real chrome seen: codex startup hook-review/trust screen, `Worked for Ns`, `› Ask Codex to do anything`, the
-`GPT-… · Context … · …` status line, `← for agents · ? for shortcuts`. Confirms the `stripTui` drop-list targets are
-realistic. (Also a real finding: a freshly-started codex probe BLOCKS on a hook-trust prompt while herdr reports it
-`idle` — a herdr state-detection gap relevant to the future sentinel, not to this module.)
+**⑤ `agent read recent-unwrapped` noise — SAMPLES CAPTURED (05, 11).**
+Real chrome across the reads: codex startup hook-review/trust screen + `› Ask Codex to do anything` + the
+`GPT-… · Context … · …` status line + `← for agents · ? for shortcuts` (05); `Worked for Ns` (11). Confirms the
+`stripTui` drop-list targets are realistic. (Also a real finding: a freshly-started codex probe can BLOCK on a
+hook-trust prompt while herdr reports it `idle` — a herdr state-detection gap relevant to the future sentinel, not
+to this module.)
 
 ## Code narrowing applied (evidence-driven)
 
 1. **herdrPrompt** now confirms submission from the plain `agent prompt` receipt (reliably `agent_prompted`, 06) and
-   does **not** use `--wait` for confirmation: `--wait` stalls even on success (03/04), which would turn a real
-   success into `unknown`. `settled` stays `false` (no reliable settle signal in 0.9.3). This converts real
-   successes from `unknown` → `yes` while never fabricating a settle.
+   does **not** use `--wait` for confirmation: `--wait` stalls even on an input-ready, submitted, completed prompt
+   (09 → 10 → 11), which would turn a real success into `unknown`. `settled` stays `false` (no reliable settle signal
+   in 0.9.3). This converts real successes from `unknown` → `yes` while never fabricating a settle.
 2. **WAIT_SETTLE_TYPES** stays empty — now with the empirical reason (no reliable `--wait` settle receipt exists in
    0.9.3). `settledFrom` / `buildAgentPromptWait` are kept as the dormant re-enable seam for a future herdr that
    emits a trustworthy settle/working signal.
@@ -76,5 +88,8 @@ realistic. (Also a real finding: a freshly-started codex probe BLOCKS on a hook-
 
 ## Boundary
 
-One isolated real codex agent, minimal prompts, torn down. No live swarm session was prompted, read, or closed.
-Not merged, not pushed. Re-review of archive↔narrowing consistency pending (01a0ff49).
+Two isolated real-machine runs (run 1: shapes 01–08; run 2: the decisive input-ready→stalled→completed sequence
+09–11, added after the reviewer caught that run 1 never archived the completion read). Each run: dedicated config +
+session + one short-lived codex probe in its own Ghostty window, driven only over the isolated socket, fully torn
+down. No live swarm session was prompted, read, or closed. Not merged, not pushed. Re-review of archive↔narrowing
+consistency pending (01a0ff49).
