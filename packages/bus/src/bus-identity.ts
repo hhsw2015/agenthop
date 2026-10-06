@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, truncateSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -277,6 +277,14 @@ export function readIdentityLog(home: string): LogReadResult {
     return { events: [], uncommittedTail: null, corruption: [], status: "error", errorCode: code };
   }
   return readLog(raw);
+}
+
+/** A cheap change stamp for the alias-log (`<mtimeMs>:<size>`), so a consumer that folds the log on a timer (core's legacy-key
+ *  recompute, F40-2) can SKIP the fold when the file is unchanged. "" ⇒ missing/unreadable (a stable "nothing yet"). A stamp
+ *  change means the log grew/was rewritten; equal stamps mean no new events to fold. */
+export function identityLogStamp(home: string): string {
+  try { const s = statSync(logPath(home)); return `${s.mtimeMs}:${s.size}`; }
+  catch { return ""; }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -701,6 +709,44 @@ export function whois(proj: Projection, id: string): WhoisResult {
 export function probeTargets(ent: IdentityEntity): { hostPid?: number; busPid?: number; scope: Scope; birth?: Birth } {
   const inc = ent.incarnations[ent.incarnations.length - 1];
   return { hostPid: inc?.hostPid, busPid: inc?.busPid, scope: inc?.scope ?? "local", birth: inc?.birth };
+}
+
+/**
+ * F40 (ruling R15/R15-b) — the PRIOR-run inbox keys that belong to the SAME LOGICAL SESSION as `self`, so a RESTART (same
+ * conversation, new run) drains mail stranded in an old per-run box. Folded into core's inboxKeys().
+ *
+ * The ONLY accepted proof of "same session across runs" is a shared DURABLE NATIVE (the conversation id: Claude's
+ * CLAUDE_CODE_SESSION_ID, Codex's AGENTHOP_SESSION). A shared per-run id, tool, or cwd is NOT proof (R15: no same-session
+ * evidence ⇒ no inheritance). So:
+ *  - No `self.stableId` (no durable native) ⇒ return [] — nothing to anchor the proof on.
+ *  - A native in `proj.collisions` (two concurrent, differently-situated sessions share it) ⇒ return [] — ambiguous, never cross.
+ *  - Otherwise: for each entity that holds `self.stableId` as a HARD, non-superseded NATIVE (a prior incarnation of THIS
+ *    conversation) and matches self's tool/cwd, recover its per-run id (`run`) boxes ONLY.
+ *
+ * Deliberately does NOT follow a shared per-run id to a thread-switch SIBLING's native (the deleted "run-id bridge", F40-1):
+ * a thread-switch A→B yields two DISTINCT entities, and B must never drain A's box. The presence/MCP identity-divergence form
+ * of the original F40 incident has no shared durable native linking the two, so it is left UNBRIDGED here, by design — the
+ * unclaimed-mail sentinel escalates it for manual routing (R15-b). Returns the EXTRA keys only (self's own id/stableId are
+ * already claimed by inboxKeys()).
+ */
+export function legacyInboxKeys(proj: Projection, self: SelfLike): string[] {
+  const native = self.stableId;
+  if (!native) return [];                 // no durable native ⇒ no same-session proof ⇒ inherit nothing (R15)
+  if (proj.collisions.has(native)) return []; // ambiguous conversation id ⇒ never cross it
+  const anchors = new Set<string>([self.id, native]);
+  const out = new Set<string>();
+  const holdsNative = (ent: IdentityEntity): boolean =>
+    ent.incarnations.some((inc) => inc.claims.some((c) => !c.superseded && c.confidence === "hard" && c.form === "native" && c.value === native));
+  for (const ent of proj.entities.values()) {
+    if (self.tool && ent.tool && ent.tool !== self.tool) continue; // a different tool is not this session
+    if (self.cwd && ent.cwd && ent.cwd !== self.cwd) continue;     // a different working dir is not this session
+    if (!holdsNative(ent)) continue;                               // not a prior incarnation of THIS conversation
+    for (const inc of ent.incarnations) for (const c of inc.claims) {
+      if (c.superseded || c.confidence !== "hard" || c.form !== "run") continue; // only per-run id boxes; never a sibling native
+      if (!anchors.has(c.value)) out.add(c.value);
+    }
+  }
+  return [...out];
 }
 
 // ---------------------------------------------------------------------------------------------

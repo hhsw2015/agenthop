@@ -119,6 +119,11 @@ export function quarantineInbox(home: string, claimedFile: string, reason: strin
 function sanitize(key: string): string {
   return key.replace(/[^A-Za-z0-9._-]/g, "_") || "unknown";
 }
+/** The on-disk inbox DIR NAME for a key (the sanitized form). Exposed so a consumer scanning inbox dirs (e.g. the F40
+ *  unclaimed-mail sentinel) can map a session's raw keys to the dir names it would compare against — the same mapping writes use. */
+export function inboxDirName(key: string): string {
+  return sanitize(key);
+}
 function inboxDir(home: string, key: string): string {
   return path.join(home, ".agenthop", "inbox", sanitize(key));
 }

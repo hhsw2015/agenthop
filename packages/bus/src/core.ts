@@ -8,9 +8,9 @@ import { dedupLocalPeers, resolvePeer, type UnifiedPeer, type ResolveError } fro
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
-import { recordSelfObserve, recordLearn } from "./bus-identity.js";
+import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
-import { fallbackForUnresolved, fallbackForMissedDelivery } from "./send-fallback.js";
+import { resolveInboxTarget } from "./send-fallback.js";
 import { resolveSession, listSessions } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
 
@@ -74,7 +74,44 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // and retried, instead of sitting in a volatile array only agenthop_recv drains. Keys: the stable identity (survives
   // an MCP-subprocess restart) plus the per-run id (used before stableId was learned).
   const inboxKey = (): string => self.stableId ?? self.id;
-  const inboxKeys = (): string[] => (self.stableId && self.stableId !== self.id ? [self.stableId, self.id] : [self.id]);
+  // F40 legacy-claim: besides the current identity's two keys, DRAIN boxes keyed by a PRIOR identity of this same logical
+  // session (old per-run id / a drifted Codex thread id), discovered from the durable alias-log so a restart/thread-drift
+  // doesn't strand earlier mail in a box the new inboxKey() never looks at. Recomputed at startup + on each identity change;
+  // fail-soft (the current-identity keys always work on their own — legacy is a recovery safety net, never a dependency).
+  let legacyKeys: string[] = [];
+  // F40-2: recompute BEFORE each claim (flush/recv), not only on identity change — an alias-log correction/revoke (or a new
+  // same-native link) appended by ANY party must take effect without this session restarting or changing its own identity.
+  // Stamp-gated so the fold is skipped when the log is unchanged (the common idle case); `force` bypasses it when self's own
+  // identity just changed (the native the keys depend on moved).
+  // `legacyStamp` is the stamp of the last SUCCESSFUL fold. "\u0000" (initial) / STAMP_RETRY (after a failed read) are
+  // sentinels that never equal a real stamp, so the next refresh always re-reads — even if the file's mtime/size is unchanged
+  // (a transient EACCES leaves the bytes identical, F40-2-B). A real stamp is committed ONLY after a successful read.
+  const STAMP_RETRY = "\u0000retry";
+  let legacyStamp = "\u0000";
+  const refreshLegacyKeys = (force = false): void => {
+    try {
+      const stamp = identityLogStamp(home);
+      if (!force && stamp === legacyStamp) return; // unchanged since the last SUCCESSFUL fold ⇒ reuse cached keys (cheap path)
+      const lg = readIdentityLog(home);
+      if (lg.status === "error") {
+        // F40-2-B: a READ failure (e.g. a transient EACCES) is NOT an empty log. Folding it to empty-and-committing the stamp
+        // stranded mail once perms were restored (the bytes, hence the stamp, were unchanged → the gate skipped the re-read).
+        // CONSERVATIVE authorization while blind: grant NO legacy claim — the log may ALREADY carry a revoke, so the stale set
+        // must not keep authorizing claims (a revoked box must not be drained during the outage). The current id/stableId keys
+        // still work. Force a re-read next time (RETRY sentinel) so a recovery with an UNCHANGED stamp still re-folds.
+        legacyKeys = [];
+        legacyStamp = STAMP_RETRY;
+        return;
+      }
+      legacyStamp = stamp; // commit the stamp ONLY on a successful read
+      legacyKeys = legacyInboxKeys(buildProjection(lg.events, lg.corruption), self);
+    } catch { legacyKeys = []; legacyStamp = STAMP_RETRY; /* same conservative stance on any throw: no legacy claim, retry next time */ }
+  };
+  const inboxKeys = (): string[] => {
+    const out = self.stableId && self.stableId !== self.id ? [self.stableId, self.id] : [self.id];
+    for (const k of legacyKeys) if (!out.includes(k)) out.push(k); // legacyInboxKeys already excludes the current keys; dedup defensively
+    return out;
+  };
   let flushing = false;
   // Per-process retry set for poison files a claim could neither quarantine nor release (both failed on a transient FS
   // fault). The flush timer re-attempts them via retryStuckPoison once the fault clears (review bb6dad5-P2-4-B).
@@ -122,6 +159,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     if (flushing) return;
     flushing = true;
     try {
+      refreshLegacyKeys(); // F40-2: pick up an alias-log revoke/new-link before this claim (stamp-gated — cheap when unchanged)
       // Recover claims a dead/previous run left behind, for the CURRENT identity's keys. Crucial after a LATE identity
       // adoption (Codex learns its native id only after its first turn): a message orphaned as `.json.claim-<oldpid>`
       // under the just-adopted stableId would otherwise never be reclaimed (claimInbox only sees `.json`), staying stuck
@@ -259,12 +297,14 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // so the session is durably addressable — the earlier provisional per-run line is superseded (idempotent at the coordinator
     // by sid). Gated on SWARM_COORDINATOR, never to self, fail-soft (reportCheckIn). Retain a retry obligation on a transient miss (B5).
     checkInPending = reportCheckIn(home, self, process.env.SWARM_COORDINATOR) === "retry";
+    refreshLegacyKeys(true); // F40: self's native just changed ⇒ force a recompute (the keys depend on self.stableId, not only the log)
   };
 
   const relay: Relay | undefined = startRelay(self, (from, text) => handleInbound(from, text, "relay"), options);
   // Record one self-observe to the alias-log at startup (run/handle/native[hard|possible by authority]/busPid/hostPid) so
   // whois can resolve this session + probe its liveness. Append-only, fails soft; only on identity change thereafter (learn).
   recordSelfObserve(home, self, stableIdAuthoritative, "local");
+  refreshLegacyKeys(true); // F40: discover prior-identity inbox boxes of this logical session NOW (before watchInbox/flush below)
 
   const unified = (): UnifiedPeer[] => {
     // Collapse this machine's duplicate nodes for ONE session (startup presence daemon + lazily-spawned MCP node share
@@ -381,31 +421,27 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
         writeInbox(home, sid, { from: self.stableId ?? self.id, fromLabel: self.title, ...(self.mode ? { fromMode: self.mode } : {}), text, via: "local", ts: Date.now() });
         return { ok: true, label: labelFor(sid), delivered: "durable" };
       };
-      const peer = resolve(to);
-      if ("error" in peer) {
-        // B1 (review d8dd4b1): an AMBIGUOUS (or empty) target must NEVER fall back — resolveSession runs a weaker handle match
-        // that could pick ONE of several live matches and misroute a private message. Only a genuine no-match may route to a
-        // same-machine durable inbox (a session that owns the handle via presence/<sid>.pid).
-        if (peer.kind !== "none") return { ok: false, error: peer.error };
-        const plan = fallbackForUnresolved(resolveSession(to, listSessions(home)), peer.error);
-        return plan.kind === "durable" ? toDurable(plan.sid) : { ok: false, error: plan.reason };
-      }
-      // Resolved. SAME-MACHINE (local) ⇒ durable-always (fallbackForMissedDelivery computes the recipient's durable sid).
-      const plan = fallbackForMissedDelivery(peer);
-      if (plan.kind === "durable") {
+      // F40: ONE write-side addressing entry decides durable / relay / none and computes the durable inbox KEY. The key is
+      // always the recipient's STABLE identity (stableId ?? per-run id, or an offline session's presence-owned native sid) —
+      // never the routing name, which can drift on restart and strand mail in a box no live node drains (the F40 incident).
+      const target = resolveInboxTarget(to, resolve(to), resolveSession(to, listSessions(home)));
+      if (target.kind === "none") return { ok: false, error: target.reason };
+      if (target.kind === "durable") {
         // C1 (review 01b773d): an OpenCode node receives over the broker + its own in-memory queue; it does NOT consume the
         // durable inbox, so a durable write to it is never read. For such a node, deliver over the LIVE BUS (the accelerator it
         // does consume) and report the capability limit honestly — delivered:"bus" is best-effort, NOT the durable guarantee. Every
         // other local node (BusCore: claude/codex) consumes the durable inbox and gets durable-always. (Not native-direct — no
         // cached socket, no misroute; just the broker the peer is already on.)
-        if (peer.tool === "opencode") {
-          const ok = local.send(peer.id, text);
-          if (ok) { if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from: self.id, to: peer.id, via: "local", direction: "out", size: Buffer.byteLength(text), text }); return { ok: true, label: labelFor(peer.id), delivered: "bus" }; }
-          return { ok: false, error: `"${peer.title}" (OpenCode) is not reachable on the live bus right now, and OpenCode nodes do not consume the durable inbox — try again when it is active.` };
+        if (target.peer?.tool === "opencode") {
+          const oc = target.peer;
+          const ok = local.send(oc.id, text);
+          if (ok) { if (msgLogEnabled()) writeMsgLog(home, { ts: Date.now(), from: self.id, to: oc.id, via: "local", direction: "out", size: Buffer.byteLength(text), text }); return { ok: true, label: labelFor(oc.id), delivered: "bus" }; }
+          return { ok: false, error: `"${oc.title}" (OpenCode) is not reachable on the live bus right now, and OpenCode nodes do not consume the durable inbox — try again when it is active.` };
         }
-        return toDurable(plan.sid);
+        return toDurable(target.sid);
       }
       // CROSS-MACHINE (relay): a live best-effort send; no local durable fallback (no shared filesystem).
+      const peer = target.peer;
       if (relay && peer.pub) {
         const ok = await relay.send(peer.pub, text);
         if (ok) {
@@ -420,11 +456,16 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // Explicit pull: drain the DURABLE inbox (messages the push channel could not surface). Claim+ack so the retry
       // timer never re-delivers the same message.
       const deadline = Date.now() + timeoutMs;
-      const drain = (): BusMessage[] =>
-        claimInbox(home, inboxKeys(), String(process.pid), stuckPoison).map((c) => {
+      // F40-2-A: recompute legacy keys before EVERY claim — at entry AND on each 120ms poll — not just at recv entry. An
+      // alias-log revoke/late-link appended DURING the wait must take effect on the very next drain: a revoked box must not be
+      // claimed, a newly-linked same-native box must be picked up. Stamp-gated ⇒ cheap when the log is unchanged.
+      const drain = (): BusMessage[] => {
+        refreshLegacyKeys();
+        return claimInbox(home, inboxKeys(), String(process.pid), stuckPoison).map((c) => {
           ackInbox(c.file);
           return { from: c.msg.from, fromLabel: c.msg.fromLabel, text: c.msg.text, via: c.msg.via };
         });
+      };
       let batch = drain();
       while (batch.length === 0 && Date.now() < deadline) {
         await delay(120);
