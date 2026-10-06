@@ -1,0 +1,3 @@
+idle->working flow observed when driving the argv0=claude real claude pane (t1 idle, t2-t8 working).
+agent explain: rule live_prompt_box, evidence "❯". Root cause: process basename 2.1.283.pristine != claude.
+Fix: exec -a claude in claude-with-override.
