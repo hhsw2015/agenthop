@@ -35,8 +35,7 @@ import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/ta
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
 import { taskPass, buildSched, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
 import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
-import { boardAdmitEnabled, planBoardWrites, postedFileName, buildGrantBodies, grantWaitId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName } from "../packages/bus/src/swarm/task-board.js";
-import { prepareDispatch, type DispatchParams } from "../packages/bus/src/swarm/task-dispatch.js";
+import { boardAdmitEnabled, planBoardWrites, postedFileName, planClaimAdmission, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
@@ -823,36 +822,24 @@ async function main(): Promise<void> {
     const claims = files.map((f) => parseBoardItemName(f)).filter((p): p is { itemId: string; state: "claimed"; who: string } => p !== null && p.state === "claimed");
     for (const claim of claims) {
       const claimFile = path.join(BOARD_DIR, claimedFileName(claim.itemId, claim.who));
+      const grantedFile = path.join(BOARD_DIR, grantedFileName(claim.itemId, claim.who));
       try {
         const state = loadControlLog(CONTROL_LOG_DIR);
-        const sched = buildSched(plan, state);
-        const usage = { totalAttempts: sched.attempts.length, wallClockSec: Math.max(0, nowSec() - jobStartSec(plan.jobId)) };
-        const rt = readyTasks({ ...sched, now: nowSec(), jobUsage: usage }).find((r) => r.nodeId === claim.itemId);
-        if (rt === undefined) {
-          // Not admittable now. Was it ALREADY granted by admission (commit ok, granted-rename lost)? That node has an attempt
-          // carrying our board-exec supervision wait — reconcile the board to granted rather than reject a real grant.
-          const granted = sched.attempts.find((a) => a.nodeId === claim.itemId && findWaitIn(state, grantWaitId(a.attemptId)) !== undefined);
-          if (granted !== undefined) { try { renameSync(claimFile, path.join(BOARD_DIR, grantedFileName(claim.itemId, claim.who))); log(`board admission: ${claim.itemId} already granted — reconciled board state`); } catch { /* retry next tick */ } continue; }
-          rejectClaim(claim, "node no longer admittable (already dispatched / completed / deps or budget changed)");
-          continue;
-        }
-        const spec = plan.nodes.find((n) => n.nodeId === claim.itemId);
-        if (spec === undefined) { rejectClaim(claim, "node not in current plan"); continue; }
-        const launchId = `rw-${randomBytes(4).toString("hex")}`;
-        const params: DispatchParams = {
-          remainingLifeSec: VM_LIFETIME_SEC, checkpointBudgetSec: CHECKPOINT_BUDGET_SEC, handoffMarginSec: HANDOFF_LEAD_SEC,
-          tokenMarginSec: TOKEN_MARGIN_SEC, budgetSec: BUDGET_SEC, nowSec: nowSec(), atSeq: state.seq + 1,
-        };
-        const prep = prepareDispatch(plan, rt, sched.attempts, launchId, `${launchId}@${claim.itemId}`, params);
-        if (!prep.ok) { rejectClaim(claim, prep.reason); continue; }
-        const bodies = buildGrantBodies(prep, { waitId: grantWaitId(prep.attempt.attemptId), jobId: plan.jobId, owner: claim.who, deadlineSec: nowSec() + spec.estimatedRuntimeSec + HANDOFF_LEAD_SEC });
-        const r = commitTask(state, bodies);
-        if (!r.result.ok) { log(`board admission ${claim.itemId}: grant commit rejected (${r.result.reason}) — claim left for re-review next tick`); continue; } // orphan: claim stays, re-reviewed (no 2nd ledger)
+        const verdict = planClaimAdmission(plan, state, claim, {
+          nowSec: nowSec(), jobStartSec: jobStartSec(plan.jobId), launchId: `rw-${randomBytes(4).toString("hex")}`,
+          remainingLifeSec: VM_LIFETIME_SEC, checkpointBudgetSec: CHECKPOINT_BUDGET_SEC, handoffMarginSec: HANDOFF_LEAD_SEC, tokenMarginSec: TOKEN_MARGIN_SEC, budgetSec: BUDGET_SEC,
+        });
+        if (verdict.verdict === "reconcile") { try { renameSync(claimFile, grantedFile); log(`board admission: ${claim.itemId} already granted — reconciled board state`); } catch { /* retry next tick */ } continue; }
+        if (verdict.verdict === "reject") { rejectClaim(claim, verdict.reason); continue; }
+        // GRANT: commit intent+attempt(+retired)+supervision wait (NO startTask — boundary #3). A failed commit leaves the
+        // claim in place to be re-reviewed next tick (board is an app-queue + projection, never a 2nd ledger).
+        const r = commitTask(state, verdict.bodies);
+        if (!r.result.ok) { log(`board admission ${claim.itemId}: grant commit rejected (${r.result.reason}) — claim left for re-review next tick`); continue; }
         // Receipt — NO execution side-effect (boundary #3): admission is recorded; A2 (real dispatch/V8) is not wired.
-        try { writeInbox(HOME, claim.who, { from: SELF, fromLabel: "swarm-admission", text: `[admission] granted ${claim.itemId} → attempt ${prep.attempt.attemptId} (binding ${prep.binding.bindingId}); supervision wait ${grantWaitId(prep.attempt.attemptId)} open. DO NOT begin execution — A2 (real dispatch/V8) is not wired yet.`, via: "local", ts: Date.now() }); }
+        try { writeInbox(HOME, claim.who, { from: SELF, fromLabel: "swarm-admission", text: `[admission] granted ${claim.itemId} → attempt ${verdict.attemptId} (binding ${verdict.bindingId}); supervision wait ${verdict.waitId} open. DO NOT begin execution — A2 (real dispatch/V8) is not wired yet.`, via: "local", ts: Date.now() }); }
         catch (e) { log(`board admission ${claim.itemId}: receipt write failed (grant already committed): ${e instanceof Error ? e.message : e}`); }
-        try { renameSync(claimFile, path.join(BOARD_DIR, grantedFileName(claim.itemId, claim.who))); } catch (e) { log(`board admission ${claim.itemId}: granted-rename failed (grant committed; reconciled next tick): ${e instanceof Error ? e.message : e}`); }
-        log(`board admission: granted ${claim.itemId} to ${claim.who} (attempt ${prep.attempt.attemptId})`);
+        try { renameSync(claimFile, grantedFile); } catch (e) { log(`board admission ${claim.itemId}: granted-rename failed (grant committed; reconciled next tick): ${e instanceof Error ? e.message : e}`); }
+        log(`board admission: granted ${claim.itemId} to ${claim.who} (attempt ${verdict.attemptId})`);
       } catch (e) { log(`board claim ${claim.itemId} failed (isolated): ${e instanceof Error ? e.message : e}`); }
     }
   };

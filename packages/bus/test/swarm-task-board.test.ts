@@ -1,10 +1,10 @@
 import { describe, expect, test } from "vitest";
 import {
-  boardItemsToPost, planBoardWrites, buildGrantBodies, grantWaitId, postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName,
-  parseBoardItemName, isValidItemId, boardAdmitEnabled, type BoardItem,
+  boardItemsToPost, planBoardWrites, buildGrantBodies, grantWaitId, planClaimAdmission, postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName,
+  parseBoardItemName, isValidItemId, boardAdmitEnabled, type BoardItem, type AdmissionParams,
 } from "../src/swarm/task-board.js";
-import type { ChangeBody, WaitRecord } from "../src/swarm/control-log.js";
-import type { TaskPlan } from "../src/swarm/task-plan.js";
+import { commit, entityKeyOf, initialLogState, type ChangeBody, type LogState, type WaitRecord } from "../src/swarm/control-log.js";
+import { loadPlan, type TaskPlan } from "../src/swarm/task-plan.js";
 import type { ReadyTask } from "../src/swarm/task-ready.js";
 
 // Minimal cast fixtures — boardItemsToPost reads only a few fields per node.
@@ -98,6 +98,61 @@ describe("task-board buildGrantBodies (§2d-b grant, option B: intent+attempt(+r
     expect(wait.deadlineSec).toBe(5000);
     expect(wait.owner).toBe("w1");
     expect(grantWaitId("at1")).toBe("board-exec:at1"); // stable per attempt ⇒ re-grant replay is idempotent at the wait entity
+  });
+});
+
+describe("task-board planClaimAdmission (§2d-b admit: re-admit a claim on the CURRENT CONTROL, real engine)", () => {
+  // A real one-node plan + the real control-log engine (mirrors swarm-task-pass.test): drive the admission DECISION end to end.
+  const plan1 = (): TaskPlan => {
+    const res = loadPlan({
+      jobId: "job", planRevision: 1,
+      nodes: [{ nodeId: "build", kind: "work", goal: "g", dependsOn: [], outputContract: { requiredOutputs: [{ logicalName: "o", kind: "report" }] }, acceptance: [], artifactScope: ["out/"], estimatedRuntimeSec: 600, retryBudget: 2, required: true, runtime: "ephemeral" }],
+      jobBudget: { maxTotalAttempts: 10, maxWallClockSec: 36000 },
+    });
+    if (!res.ok) throw new Error(res.reason);
+    return res.plan;
+  };
+  // The real shell's commit stamping: operationId = entityKey#targetRev, expectedEntityRevision = current rev.
+  const stampCommit = (state: LogState, bodies: ChangeBody[]): LogState => {
+    const changes = bodies.map((b) => { const key = entityKeyOf(b); const rev = state.revisions[key] ?? 0; return { ...b, operationId: `${key}#${rev + 1}`, expectedEntityRevision: rev }; });
+    const r = commit(state, state.seq, changes);
+    if (!r.result.ok) throw new Error(`commit rejected: ${r.result.reason}`);
+    return r.state;
+  };
+  const params = (over: Partial<AdmissionParams> = {}): AdmissionParams => ({
+    nowSec: 1000, jobStartSec: 1000, launchId: "rw-t1",
+    remainingLifeSec: 3000, checkpointBudgetSec: 300, handoffMarginSec: 180, tokenMarginSec: 600, budgetSec: 3480, ...over,
+  });
+
+  test("a ready claim GRANTS: intent + attempt + supervision wait (NO startTask), wait owned by the claimant, escalate policy", () => {
+    const v = planClaimAdmission(plan1(), initialLogState(), { itemId: "build", who: "w1" }, params());
+    expect(v.verdict).toBe("grant");
+    if (v.verdict !== "grant") throw new Error("not a grant");
+    expect(v.bodies.map((b) => b.put)).toEqual(["intent", "attempt", "wait"]); // no retired (fresh lineage), no execution body
+    expect(v.waitId).toBe(grantWaitId(v.attemptId));
+    const wait = (v.bodies.find((b) => b.put === "wait") as { wait: WaitRecord }).wait;
+    expect(wait.owner).toBe("w1");
+    expect(wait.timeoutPolicy).toBe("escalate");
+    expect(wait.subject.attemptId).toBe(v.attemptId);
+  });
+
+  test("a node not in the current plan REJECTS", () => {
+    expect(planClaimAdmission(plan1(), initialLogState(), { itemId: "ghost", who: "w1" }, params())).toEqual({ verdict: "reject", reason: "node not in current plan" });
+  });
+
+  test("after a grant commits: the SAME member's re-claim RECONCILES (idempotent lost-rename); a DIFFERENT member's claim REJECTS (single-active race lost)", () => {
+    let s = initialLogState();
+    const g = planClaimAdmission(plan1(), s, { itemId: "build", who: "w1" }, params());
+    if (g.verdict !== "grant") throw new Error("expected grant");
+    s = stampCommit(s, g.bodies); // the attempt is now RUNNING ⇒ node single-active, no longer ready
+
+    const again = planClaimAdmission(plan1(), s, { itemId: "build", who: "w1" }, params({ launchId: "rw-t2" }));
+    expect(again).toEqual({ verdict: "reconcile", attemptId: g.attemptId });
+
+    const other = planClaimAdmission(plan1(), s, { itemId: "build", who: "w2" }, params({ launchId: "rw-t3" }));
+    expect(other.verdict).toBe("reject");
+    if (other.verdict !== "reject") throw new Error("expected reject");
+    expect(other.reason).toMatch(/already granted to w1/);
   });
 });
 

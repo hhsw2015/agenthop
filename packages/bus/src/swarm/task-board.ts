@@ -13,10 +13,12 @@
  * comes ONLY from dispatcher admission on the current CONTROL, re-checked at claim time, not from holding a board file.
  */
 import type { TaskPlan } from "./task-plan.js";
-import type { ReadyTask } from "./task-ready.js";
+import { readyTasks, type ReadyTask } from "./task-ready.js";
 import type { TaskAttempt, ExecutionBinding } from "./task-state.js";
-import type { ChangeBody, DispatchIntent } from "./control-log.js";
+import { liveEntities, type ChangeBody, type DispatchIntent, type LogState, type WaitRecord } from "./control-log.js";
 import { openWait } from "./task-wait.js";
+import { buildSched } from "./task-pass.js";
+import { prepareDispatch, type DispatchParams } from "./task-dispatch.js";
 
 /** The lifecycle states a board item's FILE NAME encodes. `posted` = `<itemId>.json` (unclaimed); the rest are
  *  `<itemId>.<state>.<who>.json`. `claimed` is a RESERVATION application (not authority); `granted`/`rejected` are the
@@ -115,6 +117,60 @@ export function buildGrantBodies(
 
 /** The supervision-wait id for an admitted attempt (stable per attempt ⇒ a re-grant replay is idempotent at the wait entity). */
 export function grantWaitId(attemptId: string): string { return `board-exec:${attemptId}`; }
+
+/** Inputs an admission decision needs beyond the plan+CONTROL+claim: the clock, the job's start (for wall-clock budget), a
+ *  fresh launch id, and the dispatch margins (same bundle taskPass passes to prepareDispatch). All provided by the shell. */
+export type AdmissionParams = {
+  nowSec: number; jobStartSec: number; launchId: string;
+  remainingLifeSec: number; checkpointBudgetSec: number; handoffMarginSec: number; tokenMarginSec: number; budgetSec: number;
+};
+
+/** The §2d-b admission VERDICT for one claim (pure). grant ⇒ commit these bodies then mark the board item granted + receipt;
+ *  reject ⇒ mark rejected with the reason; reconcile ⇒ the node was ALREADY granted (its attempt carries our board-exec wait)
+ *  but the board rename was lost — just fix the board to granted, do NOT re-grant. The shell does the IO; this decides. */
+export type ClaimAdmission =
+  | { verdict: "grant"; bodies: ChangeBody[]; attemptId: string; bindingId: string; waitId: string }
+  | { verdict: "reject"; reason: string }
+  | { verdict: "reconcile"; attemptId: string };
+
+function findWait(state: LogState, waitId: string): WaitRecord | undefined {
+  for (const b of Object.values(liveEntities(state))) if (b.put === "wait" && b.wait.waitId === waitId) return b.wait;
+  return undefined;
+}
+
+/** The §2d-b admission DECISION (pure): re-run admission for a claimed board item on the CURRENT CONTROL. A claim is a
+ *  reservation application, not authority — so this re-resolves the node at the current plan revision, confirms it is still
+ *  READY (deps accepted, no active attempt, within budget), then prepareDispatch (§3.1 node single-active, token fit). It
+ *  returns a grant (intent+attempt(+retired)+supervision wait via buildGrantBodies — NO startTask, boundary #3), a reject
+ *  (not admittable / not in plan / prepare refused, with reason), or a reconcile (the node was already granted and only the
+ *  board file is behind). Pure ⇒ the full branching is unit-tested against the real control engine; the shell commits+renames. */
+export function planClaimAdmission(plan: TaskPlan, state: LogState, claim: { itemId: string; who: string }, params: AdmissionParams): ClaimAdmission {
+  const spec = plan.nodes.find((n) => n.nodeId === claim.itemId);
+  if (spec === undefined) return { verdict: "reject", reason: "node not in current plan" }; // the plan dropped/renamed it since posting
+  const sched = buildSched(plan, state);
+  const usage = { totalAttempts: sched.attempts.length, wallClockSec: Math.max(0, params.nowSec - params.jobStartSec) };
+  const rt = readyTasks({ ...sched, now: params.nowSec, jobUsage: usage }).find((r) => r.nodeId === claim.itemId);
+  if (rt === undefined) {
+    // In the plan but not admittable now. If the node ALREADY carries one of our board-exec supervision waits, a grant
+    // committed: the SAME member's claim is an idempotent lost-rename ⇒ reconcile; a DIFFERENT member lost the race ⇒ reject.
+    for (const a of sched.attempts) {
+      if (a.nodeId !== claim.itemId) continue;
+      const w = findWait(state, grantWaitId(a.attemptId));
+      if (w === undefined) continue;
+      return w.owner === claim.who ? { verdict: "reconcile", attemptId: a.attemptId } : { verdict: "reject", reason: `already granted to ${w.owner}` };
+    }
+    return { verdict: "reject", reason: "node no longer admittable (already dispatched / completed / deps or budget changed)" };
+  }
+  const dp: DispatchParams = {
+    remainingLifeSec: params.remainingLifeSec, checkpointBudgetSec: params.checkpointBudgetSec, handoffMarginSec: params.handoffMarginSec,
+    tokenMarginSec: params.tokenMarginSec, budgetSec: params.budgetSec, nowSec: params.nowSec, atSeq: state.seq + 1,
+  };
+  const prep = prepareDispatch(plan, rt, sched.attempts, params.launchId, `${params.launchId}@${claim.itemId}`, dp);
+  if (!prep.ok) return { verdict: "reject", reason: prep.reason };
+  const waitId = grantWaitId(prep.attempt.attemptId);
+  const bodies = buildGrantBodies(prep, { waitId, jobId: plan.jobId, owner: claim.who, deadlineSec: params.nowSec + spec.estimatedRuntimeSec + params.handoffMarginSec });
+  return { verdict: "grant", bodies, attemptId: prep.attempt.attemptId, bindingId: prep.binding.bindingId, waitId };
+}
 
 // --- the ONE canonical board file-name convention (so producer, consumer, observer + projection all agree, incl. the new
 //     granted/rejected states) ---

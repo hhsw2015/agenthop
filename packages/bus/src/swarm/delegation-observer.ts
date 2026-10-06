@@ -54,7 +54,9 @@ export function parseCompletionArtifact(raw: string): ArtifactRead {
 }
 
 /** A board-file name parses to {item, state, who}. Convention: `<item>.<state>.<who>.json` (state ∈ claimed/done) or
- *  `<item>.json` (posted/unclaimed). Items are kebab-case (no dots); the LAST two dot-segments are state+who. */
+ *  `<item>.json` (posted/unclaimed). state ∈ {claimed,granted,rejected,done} (admission 5/n added granted/rejected; this
+ *  parser is generic over the token, so new states flow through unchanged). Items are kebab-case (no dots); the LAST two
+ *  dot-segments are state+who. */
 export function parseBoardFile(file: string): { item: string; state: string; who: string } | null {
   if (!file.endsWith(".json")) return null;
   const name = file.slice(0, -".json".length);
