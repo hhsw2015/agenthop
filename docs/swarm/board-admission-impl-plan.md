@@ -29,6 +29,8 @@ satisfied by EITHER a CONTROL wait OR intent+binding. Three readings of the gran
 LEAN: (B) for the dormant v1 — satisfies "intent+binding + a supervision wait + receipt" without wiring the whole
 unbuilt §2b envelope-open side (that is its own batch). Awaiting coordinator ruling before implementing Inc 3's grant.
 
+## REVIEW CLEARED @facfaf2 — 0 REMAIN (5 rounds: 3fda743→fcb8834→b32b25e→08f9d54→facfaf2). BA1-BA8 closed; BA9 deferred #R14 (hard pre-flip blocker). Merge = coordinator.
+
 ## ROUND 2 — v2 fixes @fcb8834 (codex 3fda743 review: 6P1+3P2)
 - BA1 plan-from-CONTROL (currentPlan), BA2 claim-body validation (parseClaimApplication + digest/approval checks),
   BA3 per-job sched isolation, BA4 job-namespaced board keys (`<jobId>__<nodeId>`, on-disk v2, coord-approved),

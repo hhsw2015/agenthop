@@ -218,3 +218,17 @@ board tests; 967/967 suite; projection selftest green.
 ## Still out of scope (recorded)
 A2 execution + gate flip; §2b envelope-open; §2d-c ping; **BA9 posted-supervision (#R14, pre-flip blocker)**. Hex filenames
 remain a non-blocking cosmetic (body carries readable jobId/nodeId; viz follow-up).
+
+---
+
+# FINAL — review CLEARED (codex seat 01a0ead5, 2026-10-06)
+
+**0 REMAIN at `facfaf2`** (docs `2d4b0f9`, base `main=b5fde65`, branch `feat/board-admission`).
+BA1-BA8 all closed across 5 review rounds (3fda743 → fcb8834 → b32b25e → 08f9d54 → facfaf2). BA9 (posted-item
+supervision) explicitly DEFERRED under coordinator ruling **#R14** — a HARD precondition before `SWARM_BOARD_ADMIT` is ever
+flipped on, alongside §2b envelope-open and §2d-c R8-idle ping. **0 REMAIN does NOT lift the BA9/#R14 pre-flip blocker.**
+Gates: bus/dispatch/projection tsc 0; 967/967 vitest; projection selftest (86 checks); no source-hash drift.
+Scope held throughout: gate default-off, grant-commit only in the gate-open branch, receipt triggers no execution (A2
+separate). No merge/push/deploy performed — merge is the coordinator's per existing gates.
+Reviewer report: `/Users/wowdd1/Work/review-reports/board-admission-codex-rereview-facfaf2.md`
+(SHA-256 bf8add2682f906e9bc18ea9955272bc22a5969c411426f945a64dc9796ec9aff).
