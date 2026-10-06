@@ -29,7 +29,7 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
 {
   const a = splitCommand("claude --dangerously-skip-permissions --model 'opus' --resume SID");
   t("claude kind", a.kind === "claude");
-  t("claude args after kind", a.args.join(" ") === "--dangerously-skip-permissions --model 'opus' --resume SID");
+  t("claude args after kind (quotes stripped for execFile)", a.args.join(" ") === "--dangerously-skip-permissions --model opus --resume SID");
   const c = splitCommand("codex resume SID");
   t("codex kind + resume subcommand as args", c.kind === "codex" && c.args.join(" ") === "resume SID");
   t("empty -> empty kind", splitCommand("").kind === "");
