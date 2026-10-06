@@ -89,12 +89,18 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
 
 // --- R2-P2-3/4 + R13-B: submit 3-state with a NARROW reject whitelist; settle needs a VERIFIED --wait type ---
 {
-  t("agent_prompted -> submitted yes", classifySubmit({ result: { type: "agent_prompted" } }, false).submitted === "yes");
-  t("agent_not_found (whitelisted) -> submitted no", classifySubmit({ error: { code: "agent_not_found" } }, true).submitted === "no");
-  t("timeout -> submitted unknown (can post-date submission, R3/R13)", classifySubmit({ error: { code: "timeout" } }, true).submitted === "unknown");
-  t("agent_prompt_stalled -> submitted unknown (can post-date submission, R3/R13)", classifySubmit({ error: { code: "agent_prompt_stalled" } }, true).submitted === "unknown");
-  t("exec failed, no code -> submitted unknown (never replay)", classifySubmit(null, true).submitted === "unknown");
-  t("wrong type -> submitted unknown", classifySubmit({ result: { type: "agent_other" } }, false).submitted === "unknown");
+  // R13 static-schema lock: agent_prompted requires {type, agent(AgentInfo with pane_id)}; name is nullable but a
+  // PRESENT name must be our target (evidence .../installed-api-schema.json).
+  t("valid agent_prompted bound to target -> yes", classifySubmit({ result: { type: "agent_prompted", agent: { name: "r", pane_id: "w1:p2" } } }, "r", false).submitted === "yes");
+  t("agent_prompted with null name (schema-legal) + pane_id -> yes", classifySubmit({ result: { type: "agent_prompted", agent: { name: null, pane_id: "w1:p2" } } }, "r", false).submitted === "yes");
+  t("agent_prompted MISSING agent object -> unknown (invalid shape)", classifySubmit({ result: { type: "agent_prompted" } }, "r", false).submitted === "unknown");
+  t("agent_prompted agent without pane_id -> unknown (invalid shape)", classifySubmit({ result: { type: "agent_prompted", agent: { name: "r" } } }, "r", false).submitted === "unknown");
+  t("agent_prompted for a DIFFERENT agent -> unknown (not bound to our target)", classifySubmit({ result: { type: "agent_prompted", agent: { name: "other", pane_id: "w1:p2" } } }, "r", false).submitted === "unknown");
+  t("agent_not_found (whitelisted) -> submitted no", classifySubmit({ error: { code: "agent_not_found" } }, "r", true).submitted === "no");
+  t("timeout -> submitted unknown (can post-date submission, R3/R13)", classifySubmit({ error: { code: "timeout" } }, "r", true).submitted === "unknown");
+  t("agent_prompt_stalled -> submitted unknown (can post-date submission, R3/R13)", classifySubmit({ error: { code: "agent_prompt_stalled" } }, "r", true).submitted === "unknown");
+  t("exec failed, no code -> submitted unknown (never replay)", classifySubmit(null, "r", true).submitted === "unknown");
+  t("wrong type -> submitted unknown", classifySubmit({ result: { type: "agent_other" } }, "r", false).submitted === "unknown");
   t("SUBMIT_REJECTED is narrow (only provably-not-submitted codes)", SUBMIT_REJECTED.has("agent_not_found") && !SUBMIT_REJECTED.has("timeout") && !SUBMIT_REJECTED.has("agent_prompt_stalled"));
   // settle: a bare agent_status is NOT proof (agent get returns it too); it needs a VERIFIED --wait receipt type.
   t("prod WAIT_SETTLE_TYPES empty -> settle unknown until live-verified (R13-B)", WAIT_SETTLE_TYPES.size === 0);

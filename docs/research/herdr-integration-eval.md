@@ -127,6 +127,8 @@ user 裁定:语音 broker 转写用户话音→`herdr agent prompt <协调者> <
 
 **R13 两段走**:本批=诚实降级关门(上三条 + eval 纠正)。批后由协调者另派**隔离真机验证单**:herdr 内起隔离 server + 探针 agent(绝不碰现役),实跑全部回执形态、存档原始 JSON,据此填 `WAIT_SETTLE_TYPES`、收窄 `SUBMIT_REJECTED`、锁定 `agentPaneId` 字段名——能力到那单才算「验证过」。
 
+**第四轮静态契约残留(rev5,b6bf97d3→新 SHA)**:审查人从**已装二进制内嵌 JSON schema 静态提取**(无需真机,证据 `~/Work/review-reports/herdr-b6bf97d3-review-2026-10-06-evidence/installed-api-schema.json` + `schema-extraction.json` 的二进制 hash/位置):`agent_prompted` variant `required=[type, agent]`,`AgentInfo` 必有 string `pane_id`、`name` 可空。原 `classifySubmit` 只看 `result.type===agent_prompted`,缺 agent 的 body、或 `agent.name`=别的目标,`herdrPrompt('coordinator',...)` 都会误判 submitted=yes。**R3-P2-4 修复**:`classifySubmit` 现按此静态契约校验——必须有 agent 对象 + string pane_id(缺形→unknown),且回执若带 name 必须等于本次 prompt 的目标(不同名→unknown,证明回执属他人);name 为空(schema 合法)+ pane_id 合格才算绑定成功。这条**按 R13 静态锁契约**,属已验证(非推断);settle 侧仍 unknown 不动,不填 `WAIT_SETTLE_TYPES`、不启真机(phase-2 独立)。
+
 验证:herdr selftest 全绿(新增白名单拒绝/timeout-unknown/裸状态非证据/已验证type正例),resume selftest 全绿,bus tsc=0,scripts tsc=0。
 
 (研究口径:只读+能力验证,不迁移现役会话(user 亲手),不并 main/不 push;送审即停。基线:spawn.ts/resume.ts 现函数 + S19/S24/F36。)

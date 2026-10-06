@@ -173,10 +173,24 @@ export type SubmitState = "yes" | "no" | "unknown";
 // they are `unknown` (may have landed -> never replay). agent_not_found is a live-confirmed literal; the set stays
 // deliberately narrow until the R13 phase-2 real-machine pass archives the full `agent prompt` error taxonomy.
 export const SUBMIT_REJECTED = new Set(["agent_not_found"]);
-/** Classify an `agent prompt` result. agent_prompted receipt -> yes; a whitelisted "not submitted" code -> no;
- *  everything else (timeout/stalled/unknown code, exec failure, empty, wrong type) -> unknown (NEVER replay). Pure. */
-export function classifySubmit(json: unknown, exitFailed: boolean): { submitted: SubmitState; reason: string } {
-  if ((json as any)?.result?.type === "agent_prompted") return { submitted: "yes", reason: "agent_prompted receipt" };
+/** Classify an `agent prompt` result against the STATIC installed-binary schema (R13 static contract lock; evidence
+ *  herdr-b6bf97d3 .../installed-api-schema.json): the `agent_prompted` variant requires {type, agent}, and the
+ *  agent (AgentInfo) requires a string `pane_id`; `name` is nullable/optional. So a valid "yes" needs the type AND
+ *  a real agent object with pane_id AND — when the receipt names an agent — that name must be the one we prompted
+ *  (a different name proves the receipt is for someone else). A whitelisted code -> no; everything else -> unknown
+ *  (NEVER replay). Pure. */
+export function classifySubmit(json: unknown, expectedName: string, exitFailed: boolean): { submitted: SubmitState; reason: string } {
+  const r = (json as any)?.result;
+  if (r?.type === "agent_prompted") {
+    const agent = r.agent;
+    if (!agent || typeof agent !== "object" || typeof agent.pane_id !== "string" || !agent.pane_id) {
+      return { submitted: "unknown", reason: "agent_prompted missing the required agent/pane_id (invalid shape) — not a proven submit" };
+    }
+    if (typeof agent.name === "string" && agent.name && agent.name !== expectedName) {
+      return { submitted: "unknown", reason: `agent_prompted names a different agent (${agent.name} != ${expectedName}) — receipt not bound to our target` };
+    }
+    return { submitted: "yes", reason: "agent_prompted receipt bound to target" };
+  }
   const code = (json as any)?.error?.code;
   if (typeof code === "string" && SUBMIT_REJECTED.has(code)) return { submitted: "no", reason: `rejected: ${code} (target agent absent — nothing submitted)` };
   if (typeof code === "string" && code) return { submitted: "unknown", reason: `error ${code} can post-date submission (e.g. timeout/stalled) — not replayed` };
@@ -333,7 +347,7 @@ export async function herdrPaneClose(paneId: string): Promise<{ ok: boolean; not
 export async function herdrPrompt(name: string, text: string, opts: { wait?: boolean; waitTimeoutMs?: number } = {}): Promise<{ submitted: SubmitState; settled: boolean; status?: string; note: string }> {
   if (!opts.wait) {
     const r = await herdrRun(buildAgentSubmit(name, text), 15000);
-    const c = classifySubmit(r.json, r.exitFailed);
+    const c = classifySubmit(r.json, name, r.exitFailed);
     return { submitted: c.submitted, settled: false, note: c.reason };
   }
   const timeout = opts.waitTimeoutMs ?? 120000; // explicit, generous default — not a hidden 10s
@@ -341,7 +355,7 @@ export async function herdrPrompt(name: string, text: string, opts: { wait?: boo
   // R13-B: judge submission ONLY by a recognized receipt type (classifySubmit), never by the mere presence of an
   // agent_status — `agent get` returns that field too, so it is not proof the prompt landed. Settle likewise needs a
   // verified --wait type (currently none -> unknown). Never replay on anything short of a provable rejection.
-  const c = classifySubmit(r.json, r.exitFailed);
+  const c = classifySubmit(r.json, name, r.exitFailed);
   const s = settledFrom(r.json);
   if (c.submitted !== "yes") return { submitted: c.submitted, settled: false, status: s.status, note: c.reason };
   return { submitted: "yes", settled: s.settled, status: s.status, note: s.settled ? `settled:${s.status}` : "submitted; settle shape unverified (unknown until R13 phase-2) — not replayed" };
