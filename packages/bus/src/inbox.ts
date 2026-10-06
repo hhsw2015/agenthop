@@ -13,18 +13,21 @@ import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSyn
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 
-export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: "local" | "relay"; ts: number; actionId?: string; taskRef?: string; title?: string };
+export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: string; ts: number; actionId?: string; taskRef?: string; title?: string };
 export type Claimed = { file: string; msg: InboxMsg };
 
 /** Validate a parsed inbox record against the transport schema (F28 poison-pill defense). from/fromLabel/text are REQUIRED
- *  strings, via ∈ {local,relay}, ts a finite number — a missing/mistyped one is exactly what reached xml()'s `.replace(undefined)`
- *  and crashed the whole bus server. fromMode/actionId (and any future display fields like taskRef/title) are optional and
- *  tolerated. Returns the typed msg, or null ⇒ the caller QUARANTINES it (never delivers, never derefs an undefined). */
+ *  strings, via any NON-EMPTY string, ts a finite number — a missing/mistyped one is exactly what reached xml()'s
+ *  `.replace(undefined)` and crashed the whole bus server. F38: `via` is a free-form provenance LABEL ("local"/"relay"
+ *  carry transport semantics; an unknown label like "durable-inbox" is kept and displayed as-is, never a reason to
+ *  quarantine) — the validator and the S11 docs were two sources of truth and a documented "durable-inbox" write got
+ *  wrongly isolated; one schema now, tolerant of the label. fromMode/actionId (and display fields taskRef/title) are
+ *  optional and tolerated. Returns the typed msg, or null ⇒ the caller QUARANTINES it (never delivers, never derefs undefined). */
 export function validInboxMsg(raw: unknown): InboxMsg | null {
   if (raw === null || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
   if (typeof r.from !== "string" || typeof r.fromLabel !== "string" || typeof r.text !== "string") return null;
-  if (r.via !== "local" && r.via !== "relay") return null;
+  if (typeof r.via !== "string" || r.via.length === 0) return null; // F38: any non-empty label; missing/empty still rejected
   if (typeof r.ts !== "number" || !Number.isFinite(r.ts)) return null;
   if (r.fromMode !== undefined && typeof r.fromMode !== "string") return null;
   if (r.actionId !== undefined && typeof r.actionId !== "string") return null;
@@ -39,6 +42,27 @@ export function validInboxMsg(raw: unknown): InboxMsg | null {
     ...(typeof r.taskRef === "string" ? { taskRef: r.taskRef } : {}),
     ...(typeof r.title === "string" ? { title: r.title } : {}),
   };
+}
+
+/** Canonical constructor for an inbox envelope (F38): the ONE validated way scripts/members build a durable message, so a
+ *  hand-written S11 record can never drift from validInboxMsg again (the root cause this fix closes). Fills ts (now) and a
+ *  via label ("durable-inbox") when omitted, keeps only known fields, and re-validates — throwing on anything the receiver
+ *  would quarantine. S11 docs point here instead of hand-writing JSON. */
+export function composeInboxMsg(i: {
+  from: string; fromLabel: string; text: string; via?: string; ts?: number; fromMode?: string; actionId?: string; taskRef?: string; title?: string;
+}): InboxMsg {
+  const msg: InboxMsg = {
+    from: i.from, fromLabel: i.fromLabel, text: i.text,
+    via: i.via ?? "durable-inbox",
+    ts: i.ts ?? Date.now(),
+    ...(i.fromMode !== undefined ? { fromMode: i.fromMode } : {}),
+    ...(i.actionId !== undefined ? { actionId: i.actionId } : {}),
+    ...(i.taskRef !== undefined ? { taskRef: i.taskRef } : {}),
+    ...(i.title !== undefined ? { title: i.title } : {}),
+  };
+  const valid = validInboxMsg(msg);
+  if (valid === null) throw new Error("composeInboxMsg: produced an invalid inbox message (from/fromLabel/text must be strings, via a non-empty string, ts finite)");
+  return valid;
 }
 
 /** Move a POISON inbox file out of the delivery path (into inbox/<sid>/quarantine/) so it can never be re-claimed and re-crash
@@ -128,7 +152,7 @@ export function watchInbox(home: string, keys: string[], onChange: () => void): 
  *  (known fields only) is what gets persisted, so no junk field is ever written. */
 export function writeInbox(home: string, key: string, msg: InboxMsg): void {
   const valid = validInboxMsg(msg);
-  if (valid === null) throw new Error("writeInbox: refusing to publish an invalid inbox message (from/fromLabel/text must be strings, via ∈ {local,relay}, ts a finite number)");
+  if (valid === null) throw new Error("writeInbox: refusing to publish an invalid inbox message (from/fromLabel/text must be strings, via a non-empty string, ts a finite number)");
   const dir = inboxDir(home, key);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const base = `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
