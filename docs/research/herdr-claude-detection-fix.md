@@ -45,10 +45,16 @@ only the process's presented name — nothing about tweakcc, claude-hud, model s
 live swarm):**
 - Without the fix: real claude → `agent_session` registered but `agent_status: unknown`, absent from `agent list`
   (reproduces ③).
-- With `exec -a claude` running the real claude: `agent list` → `('claude','idle',<pane>)`; `agent explain` →
-  `rule: live_prompt_box, evidence "❯"`; driving the pane → status flows **idle → working** in real time.
+- With `exec -a claude` running the real claude: `agent list` → claude is **listed**; `agent explain` →
+  `rule: live_prompt_box, evidence "❯"`. The final archived list record carries `state_change_seq=6, revision=4,
+  completion_seq=6, agent_status=done` — raw proof the state **changed multiple times** through the driven task and
+  the run completed. (The explicit per-tick idle→working snapshots were read from live output but NOT archived; a
+  `blocked` state was not induced — see the evidence-boundary note. Those gaps are covered by the natural
+  rolling-restart acceptance, below.)
 - Cross-check: a dummy `exec -a claude sleep 600` is also identified+listed (`default_known_agent_idle_fallback`),
-  isolating argv0 as the sole lever. Raw captures in `docs/research/herdr-claude-state-evidence/`.
+  isolating argv0 as the sole lever.
+- Raw captures + an explicit raw-vs-observed-vs-not-captured inventory: `docs/research/herdr-claude-state-evidence/`
+  (`FINAL-state-flow-note.txt`).
 
 ## Status: user-applied (2026-10-06 eve)
 
@@ -84,10 +90,14 @@ code change; if a concrete `agent start` repro appears, it points upstream. Docu
 
 ## ② first-char drop on keystroke injection (claude → laude)
 
-Not reproduced in this investigation: `pane send-keys` (trust navigation Up/Enter) and `pane send-text` (driving a
-prompt into claude) both landed intact. It is an intermittent herdr keystroke-timing issue (first key sent before the
-PTY/app is ready). Our integration does not rely on raw keystrokes for the live paths: `herdrPrompt` uses
+**Not reproduced** in this investigation: `pane send-keys` (trust navigation Up/Enter) and `pane send-text` (driving a
+prompt into claude) both landed intact across every attempt. **The cause is therefore not established** — a
+first-keystroke/PTY-readiness race is only a *hypothesis*, not something this investigation demonstrated; it could
+equally be a one-off from the original field session. No raw capture of the drop exists.
+
+Impact on our integration is low regardless: the live paths do not use raw keystrokes — `herdrPrompt` uses
 `agent prompt` (atomic submit), and `herdrSendKeys` is only the (currently escalate-only, not auto-invoked) sentinel
-re-injection. **Mitigation if/when needed (our side, additive):** before `send-keys`, probe pane readiness (read the
-pane for the prompt marker) and/or prefix a throwaway key, or prefer `agent prompt` / `pane run` over raw keystrokes.
-Documented as a known item + workaround; no code change required for the current integration surface.
+re-injection. **If it is ever reproduced**, candidate mitigations (all untested hypotheses, to be validated against a
+real repro before adopting): probe pane readiness before `send-keys`, prefix a throwaway key, or prefer
+`agent prompt` / `pane run` over raw keystrokes. Recorded as a known item; **no code change made** (declining to add
+speculative code for an unreproduced bug with an unconfirmed cause).
