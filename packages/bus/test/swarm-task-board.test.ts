@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
-  boardItemsToPost, postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName,
+  boardItemsToPost, planBoardWrites, postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName,
   parseBoardItemName, isValidItemId, boardAdmitEnabled, type BoardItem,
 } from "../src/swarm/task-board.js";
 import type { TaskPlan } from "../src/swarm/task-plan.js";
@@ -35,6 +35,23 @@ describe("task-board boardItemsToPost (§2d-a curate: ready nodes → board item
 
   test("a ready node absent from the plan is skipped (guard)", () => {
     expect(boardItemsToPost([ready("ghost")], plan([node("a")]), { postedBy: "c", nowSec: 1 })).toEqual([]);
+  });
+});
+
+describe("task-board planBoardWrites (§2d-a producer decision: post new ready, reap stale unclaimed)", () => {
+  const p = plan([node("a"), node("b"), node("c")]);
+  test("posts ready items not already on the board; an already-present item (any state) is skipped (idempotent)", () => {
+    expect(planBoardWrites([ready("a"), ready("b")], p, ["b.json"], { postedBy: "c", nowSec: 1 }).post.map((i) => i.itemId)).toEqual(["a"]);
+    expect(planBoardWrites([ready("a")], p, ["a.claimed.w.json"], { postedBy: "c", nowSec: 1 }).post).toEqual([]); // claimed ⇒ not re-posted
+    expect(planBoardWrites([ready("a")], p, ["a.granted.w.json"], { postedBy: "c", nowSec: 1 }).post).toEqual([]); // granted ⇒ not re-posted
+  });
+  test("reaps a stale UNCLAIMED posted item whose node is no longer ready; never reaps a claimed/granted item", () => {
+    const { post, reap } = planBoardWrites([ready("a")], p, ["a.json", "b.json", "c.claimed.w.json"], { postedBy: "c", nowSec: 1 });
+    expect(post).toEqual([]);         // a already posted
+    expect(reap).toEqual(["b.json"]); // b posted but not ready ⇒ reap; c is claimed ⇒ kept
+  });
+  test("an invalid (dotted) itemId is filtered out of post", () => {
+    expect(planBoardWrites([ready("a.b")], plan([node("a.b")]), [], { postedBy: "c", nowSec: 1 }).post).toEqual([]);
   });
 });
 

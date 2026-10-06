@@ -33,7 +33,9 @@ import { entityKeyOf, type Change, type ChangeBody, type CommitResult, type LogS
 import { loadPlan, type TaskPlan, type TaskSpec } from "../packages/bus/src/swarm/task-plan.js";
 import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/task-state.js";
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
-import { taskPass, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
+import { taskPass, buildSched, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
+import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
+import { boardAdmitEnabled, planBoardWrites, postedFileName } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
@@ -774,6 +776,26 @@ async function main(): Promise<void> {
     notifySent.set(key, now); return "logged";
   };
 
+  // §2d-a board producer (board admission 5/n, the PULL path): post the current READY nodes as claimable board items so an
+  // idle member can apply, and reap stale UNCLAIMED posts whose node is no longer ready. DORMANT-AHEAD-OF-USE: runs ONLY when
+  // SWARM_BOARD_ADMIT is on (coordinator boundary #1/#2 — gate off ⇒ fully dry, writes nothing). Board files are the
+  // application-queue projection, NEVER a second ledger — no CONTROL commit here (the admission commit is the consumer's).
+  // The pure decision (which to post/reap) is planBoardWrites; this shell only does the atomic write + unlink. Fail-soft.
+  const runBoardProducer = (): void => {
+    if (!plan || !boardAdmitEnabled()) return;
+    try {
+      const state = loadControlLog(CONTROL_LOG_DIR);
+      const sched = buildSched(plan, state);
+      const usage = { totalAttempts: sched.attempts.length, wallClockSec: Math.max(0, nowSec() - jobStartSec(plan.jobId)) };
+      const ready = readyTasks({ ...sched, now: nowSec(), jobUsage: usage });
+      mkdirSync(BOARD_DIR, { recursive: true });
+      const { post, reap } = planBoardWrites(ready, plan, readdirSync(BOARD_DIR), { postedBy: SELF, nowSec: nowSec() });
+      for (const item of post) atomicWrite(path.join(BOARD_DIR, postedFileName(item.itemId)), JSON.stringify(item));
+      for (const f of reap) { try { unlinkSync(path.join(BOARD_DIR, f)); } catch { /* raced away — fine */ } }
+      if (post.length || reap.length) log(`board producer: posted ${post.length}, reaped ${reap.length} stale`);
+    } catch (e) { log(`board producer failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   // The durable-state observer (L2-struct 2/n, §2b-c/§2c + F25). Two INDEPENDENT fail-soft halves (a failure in one must not
   // block the other — review P2-1): completion-slot discovery + the board/PROGRESS watch. Runs on the sweep loop.
   const runObserver = (): void => {
@@ -1044,6 +1066,10 @@ async function main(): Promise<void> {
     passTick: async () => {
       await pass(records, ops);
       if (plan && taskOn && taskOps) { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
+      // §2d-a board admission producer (PULL path) — self-gated on SWARM_BOARD_ADMIT (default off ⇒ no-op); independent of
+      // SWARM_TASK_EXEC push. Posts ready nodes as claimable board items; the §2d-b admission consumer (next increment)
+      // consumes claims. Dormant-ahead-of-use.
+      runBoardProducer();
       // NOTE: the projection + verdict refresh is NOT here — it lives on the sweep loop (below), so a wedged pass/taskPass
       // cannot freeze the on-disk verdict into a stale OK (review P2-1). Per-commit projection writes still happen via the
       // commitTask apply hook; this loop only drives the business passes.

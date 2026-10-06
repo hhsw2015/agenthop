@@ -66,6 +66,27 @@ export function boardItemsToPost(ready: readonly ReadyTask[], plan: TaskPlan, op
   return out;
 }
 
+/** The §2d-a producer DECISION (pure): given the current READY set and the board dir's existing file names, decide which
+ *  items to POST (ready, valid id, not already on the board in ANY state — idempotent) and which stale UNCLAIMED `posted`
+ *  files to REAP (a `posted` item whose node is no longer ready — it was push-dispatched, completed, or its deps changed).
+ *  A claimed/granted/rejected/done file is an in-flight application and is NEVER reaped here (that is the consumer's/
+ *  supervision's concern). The caller performs the thin IO (atomic-write `post`, unlink `reap`). Pure ⇒ unit-tested. */
+export function planBoardWrites(ready: readonly ReadyTask[], plan: TaskPlan, existingFiles: readonly string[], opts: { postedBy: string; nowSec: number }): { post: BoardItem[]; reap: string[] } {
+  const readyIds = new Set(ready.map((r) => r.nodeId));
+  const onBoard = new Set<string>();
+  const postedFiles = new Map<string, string>(); // itemId -> its posted (unclaimed) file name
+  for (const f of existingFiles) {
+    const p = parseBoardItemName(f);
+    if (p === null) continue;
+    onBoard.add(p.itemId);
+    if (p.state === "posted") postedFiles.set(p.itemId, f);
+  }
+  const post = boardItemsToPost(ready, plan, opts).filter((i) => isValidItemId(i.itemId) && !onBoard.has(i.itemId));
+  const reap: string[] = [];
+  for (const [itemId, file] of postedFiles) if (!readyIds.has(itemId)) reap.push(file);
+  return { post, reap };
+}
+
 // --- the ONE canonical board file-name convention (so producer, consumer, observer + projection all agree, incl. the new
 //     granted/rejected states) ---
 
