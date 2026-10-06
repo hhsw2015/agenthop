@@ -105,9 +105,9 @@ export function buildAgentStart(name: string, kind: string, paneId: string, args
     ...(args.length ? ["--", ...args] : [])];
 }
 export function buildAgentSubmit(name: string, text: string): string[] { return ["agent", "prompt", name, text]; }
-/** Native `agent prompt --wait` builder. DORMANT: herdrPrompt no longer uses it — R13 phase-2 showed 0.9.3's --wait
- *  returns agent_prompt_stalled even on a submitted+completed prompt (see WAIT_SETTLE_TYPES). Kept as the re-enable
- *  seam for a future herdr whose --wait is reliable. */
+/** Native `agent prompt --wait` builder. DORMANT: herdrPrompt no longer uses it — in the R13 phase-2 run a codex
+ *  probe's --wait returned agent_prompt_stalled on a prompt it still completed (see WAIT_SETTLE_TYPES), so we don't
+ *  rely on it; its reliability for other kinds/conditions is unverified. Kept as the re-enable seam. */
 export function buildAgentPromptWait(name: string, text: string, timeoutMs: number): string[] {
   return ["agent", "prompt", name, text, "--wait", "--timeout", String(timeoutMs)];
 }
@@ -173,9 +173,9 @@ export function classifyStart(json: unknown, expectedName: string, exitFailed: b
 export type SubmitState = "yes" | "no" | "unknown";
 // `no` is a WHITELIST of codes that PROVE the prompt was never submitted (the target agent is absent, so nothing
 // could land). timeout / agent_prompt_stalled — and any other code — can post-date a real submission, so they are
-// `unknown` (may have landed -> never replay). R13 phase-2 real-machine evidence confirms both ends: `agent prompt`
-// to a missing agent -> agent_not_found (08, provably not submitted); `agent prompt --wait` -> agent_prompt_stalled
-// even when the prompt WAS submitted and completed (03/04, must stay unknown). The set stays narrow.
+// `unknown` (may have landed -> never replay). R13 phase-2 evidence confirms both ends: `agent prompt` to a missing
+// agent -> agent_not_found (08, provably not submitted); `agent prompt --wait` -> agent_prompt_stalled on a prompt
+// that was submitted and still completed (09->10->11, so it must stay unknown, never no). The set stays narrow.
 export const SUBMIT_REJECTED = new Set(["agent_not_found"]);
 /** Classify an `agent prompt` result against the STATIC installed-binary schema (R13 static contract lock; evidence
  *  herdr-b6bf97d3 .../installed-api-schema.json): the `agent_prompted` variant requires {type, agent}, and the
@@ -208,15 +208,18 @@ export function classifySubmit(json: unknown, expectedName: string, exitFailed: 
 }
 // Settle can be asserted ONLY from a VERIFIED native `--wait` receipt type + a resolved status. A bare agent_status
 // (idle/working/...) is NOT proof — `agent get` returns the same field, so a stale snapshot would be mistaken for a
-// settle. R13 phase-2 real-machine result (docs/research/herdr-phase2-evidence): herdr 0.9.3 `--wait` returns
-// `agent_prompt_stalled` even on a submitted+completed prompt, so NO trustworthy settle receipt type exists ->
-// WAIT_SETTLE_TYPES stays EMPTY (empirically, not merely conservatively) and every settle stays unknown. This set,
-// settledFrom, and buildAgentPromptWait are the DORMANT re-enable seam: fill the set once a future herdr emits a
-// reliable settle/working signal, behind a fresh review. Not currently used by herdrPrompt.
+// settle. R13 phase-2 run (docs/research/herdr-phase2-evidence, 09->10->11 + timing): one codex probe, confirmed
+// input-ready, was given a prompt it ultimately completed (391, "Worked for 7s"), yet `--wait` returned
+// `agent_prompt_stalled` at ~5.4s reporting idle. That proves the stalled receipt is NOT "not submitted" and that the
+// prompt completed; it does NOT prove the whole working period went undetected, nor that NO trustworthy settle signal
+// exists across herdr 0.9.3 (one probe/kind/condition; other kinds/paths unverified). We obtained no verifiable
+// `--wait` settle receipt in this run, so WAIT_SETTLE_TYPES stays EMPTY and settle stays unknown — a conservative
+// default, NOT a proof of absence. This set, settledFrom, and buildAgentPromptWait are the DORMANT re-enable seam:
+// fill the set once a settle signal is actually verified, behind a fresh review. Not currently used by herdrPrompt.
 export const WAIT_SETTLE_TYPES = new Set<string>();
 /** Settle only on a verified --wait receipt TYPE + a resolved status (idle/done/blocked; never `working`). status
  *  is extracted best-effort for the human-readable note only — it is never, by itself, proof of settle. Pure.
- *  (Dormant: no verified settle type exists in herdr 0.9.3 — see WAIT_SETTLE_TYPES.) */
+ *  (Dormant: this run obtained no verifiable --wait settle type; integration does not rely on it — see WAIT_SETTLE_TYPES.) */
 export function settledFrom(json: unknown, settleTypes: ReadonlySet<string> = WAIT_SETTLE_TYPES): { settled: boolean; status: string } {
   const type = (json as any)?.result?.type;
   const st = (json as any)?.result?.agent?.agent_status ?? (json as any)?.result?.agent_status;
@@ -356,16 +359,17 @@ export async function herdrPaneClose(paneId: string): Promise<{ ok: boolean; not
  * Phase-2 real-machine evidence (docs/research/herdr-phase2-evidence) drives the design:
  *  - Submission is confirmed ONLY by the plain `agent prompt` receipt — it reliably returns `agent_prompted` bound
  *    to the target (evidence 06).
- *  - We deliberately do NOT use `agent prompt --wait`: in herdr 0.9.3 it returns `agent_prompt_stalled` even when the
- *    prompt WAS submitted and the agent completed the work (evidence 03/04: a 7s codex turn went undetected), so it
- *    would turn a real success into unknown. `--wait` is unusable as a confirmation signal here.
- *  - There is NO reliable settle/working signal in 0.9.3 (WAIT_SETTLE_TYPES is empty), so `settled` stays false; a
- *    caller that needs settle must poll its own signal until a future herdr exposes a trustworthy one.
+ *  - We deliberately do NOT use `agent prompt --wait`: in the phase-2 run it returned `agent_prompt_stalled` on a
+ *    prompt the codex probe still completed (evidence 09->10->11), which would turn a real success into unknown. So we
+ *    don't rely on `--wait` for confirmation; its reliability for other kinds/conditions is unverified.
+ *  - This run obtained no verifiable settle/working signal (WAIT_SETTLE_TYPES empty), so `settled` stays false — a
+ *    conservative default, NOT a proof that no such signal exists. A caller needing settle must poll its own signal
+ *    until a reliable one is verified.
  */
 export async function herdrPrompt(name: string, text: string, opts: { wait?: boolean; waitTimeoutMs?: number } = {}): Promise<{ submitted: SubmitState; settled: boolean; status?: string; note: string }> {
   const r = await herdrRun(buildAgentSubmit(name, text), 15000);
   const c = classifySubmit(r.json, name, r.exitFailed);
-  const settleNote = opts.wait ? " (settle not observable in herdr 0.9.3: --wait stalls even on a successful, completed prompt)" : "";
+  const settleNote = opts.wait ? " (no verifiable --wait settle obtained in the phase-2 run; integration does not use --wait — settle unknown)" : "";
   return { submitted: c.submitted, settled: false, note: c.reason + settleNote };
 }
 
