@@ -89,13 +89,17 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
 
 // --- R2-P2-3/4 + R13-B: submit 3-state with a NARROW reject whitelist; settle needs a VERIFIED --wait type ---
 {
-  // R13 static-schema lock: agent_prompted requires {type, agent(AgentInfo with pane_id)}; name is nullable but a
-  // PRESENT name must be our target (evidence .../installed-api-schema.json).
-  t("valid agent_prompted bound to target -> yes", classifySubmit({ result: { type: "agent_prompted", agent: { name: "r", pane_id: "w1:p2" } } }, "r", false).submitted === "yes");
-  t("agent_prompted with null name (schema-legal) + pane_id -> yes", classifySubmit({ result: { type: "agent_prompted", agent: { name: null, pane_id: "w1:p2" } } }, "r", false).submitted === "yes");
+  // R4-P2-2 POSITIVE target binding: yes ONLY when the receipt names the exact prompted target; everything short of
+  // that (missing shape, wrong/null/absent/empty/non-string name) is insufficient proof -> unknown.
+  t("valid agent_prompted bound to the exact target -> yes", classifySubmit({ result: { type: "agent_prompted", agent: { name: "r", pane_id: "w1:p2" } } }, "r", false).submitted === "yes");
+  t("agent_prompted for a DIFFERENT agent -> unknown", classifySubmit({ result: { type: "agent_prompted", agent: { name: "other", pane_id: "w1:p2" } } }, "r", false).submitted === "unknown");
+  t("agent_prompted NULL name -> unknown (not provably our target)", classifySubmit({ result: { type: "agent_prompted", agent: { name: null, pane_id: "w1:p2" } } }, "r", false).submitted === "unknown");
+  t("agent_prompted OMITTED name -> unknown", classifySubmit({ result: { type: "agent_prompted", agent: { pane_id: "w1:p2" } } }, "r", false).submitted === "unknown");
+  t("agent_prompted EMPTY-STRING name -> unknown", classifySubmit({ result: { type: "agent_prompted", agent: { name: "", pane_id: "w1:p2" } } }, "r", false).submitted === "unknown");
+  t("agent_prompted NON-STRING name (9) -> unknown (can't bypass via typeof)", classifySubmit({ result: { type: "agent_prompted", agent: { name: 9, pane_id: "w1:p2" } } }, "r", false).submitted === "unknown");
   t("agent_prompted MISSING agent object -> unknown (invalid shape)", classifySubmit({ result: { type: "agent_prompted" } }, "r", false).submitted === "unknown");
   t("agent_prompted agent without pane_id -> unknown (invalid shape)", classifySubmit({ result: { type: "agent_prompted", agent: { name: "r" } } }, "r", false).submitted === "unknown");
-  t("agent_prompted for a DIFFERENT agent -> unknown (not bound to our target)", classifySubmit({ result: { type: "agent_prompted", agent: { name: "other", pane_id: "w1:p2" } } }, "r", false).submitted === "unknown");
+  t("empty expectedName never yields yes (guard)", classifySubmit({ result: { type: "agent_prompted", agent: { name: "", pane_id: "w1:p2" } } }, "", false).submitted === "unknown");
   t("agent_not_found (whitelisted) -> submitted no", classifySubmit({ error: { code: "agent_not_found" } }, "r", true).submitted === "no");
   t("timeout -> submitted unknown (can post-date submission, R3/R13)", classifySubmit({ error: { code: "timeout" } }, "r", true).submitted === "unknown");
   t("agent_prompt_stalled -> submitted unknown (can post-date submission, R3/R13)", classifySubmit({ error: { code: "agent_prompt_stalled" } }, "r", true).submitted === "unknown");

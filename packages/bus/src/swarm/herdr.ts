@@ -186,10 +186,14 @@ export function classifySubmit(json: unknown, expectedName: string, exitFailed: 
     if (!agent || typeof agent !== "object" || typeof agent.pane_id !== "string" || !agent.pane_id) {
       return { submitted: "unknown", reason: "agent_prompted missing the required agent/pane_id (invalid shape) — not a proven submit" };
     }
-    if (typeof agent.name === "string" && agent.name && agent.name !== expectedName) {
-      return { submitted: "unknown", reason: `agent_prompted names a different agent (${agent.name} != ${expectedName}) — receipt not bound to our target` };
+    // POSITIVE target binding (R4-P2-2): the bar is "prove this receipt is for the agent we prompted", NOT "no
+    // conflicting name was seen". So submitted=yes ONLY when the receipt names the exact target; null / absent /
+    // empty / non-string names are all insufficient proof -> unknown (R13: never fabricate; never downgrade to no;
+    // never replay). Narrowing the schema-legal null-name case waits for the phase-2 real-receipt archive.
+    if (typeof expectedName === "string" && expectedName.length > 0 && agent.name === expectedName) {
+      return { submitted: "yes", reason: "agent_prompted bound to the requested target" };
     }
-    return { submitted: "yes", reason: "agent_prompted receipt bound to target" };
+    return { submitted: "unknown", reason: `agent_prompted not provably bound to ${JSON.stringify(expectedName)} (receipt name=${JSON.stringify(agent.name)}) — insufficient proof` };
   }
   const code = (json as any)?.error?.code;
   if (typeof code === "string" && SUBMIT_REJECTED.has(code)) return { submitted: "no", reason: `rejected: ${code} (target agent absent — nothing submitted)` };
