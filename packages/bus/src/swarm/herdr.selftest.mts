@@ -1,91 +1,109 @@
-// Selftest for the pure herdr backend core. Kept OUT of herdr.ts (msglog P1 lesson); IO wrappers are exercised
-// by live runs, not here.  npx tsx packages/bus/src/swarm/herdr.selftest.mts
+// Selftest for the pure herdr backend core (rev2, first-review fixes). IO wrappers exercised by live runs.
+//   npx tsx packages/bus/src/swarm/herdr.selftest.mts
 import {
-  WHITELIST_V1, buildAgentPrompt, buildAgentRead, buildAgentStart, buildAgentWait, buildApprovalDoc, buildPaneSplit,
-  buildSendKeys, herdrAgentName, herdrSpawnable, sentinelDecision, splitCommand, stripTui,
+  HARD_NOT_STARTED, WHITELIST_V1, buildAgentRead, buildAgentStart, buildAgentSubmit, buildAgentWait,
+  buildApprovalDoc, buildPaneClose, buildPaneSplit, buildSendKeys, classifyStart, currentPromptRegion,
+  hasExplicitBinary, herdrAgentName, herdrSpawnable, paneIdFromSplit, sentinelDecision, shellTokenize,
+  splitCommand, startedName, stripTui,
 } from "./herdr.js";
+import { validInboxMsg } from "../inbox.js";
 
 const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED: " + name); console.log("ok  " + name); };
 
-// --- detection gate: spawn/resume backend needs HERDR_ENV=1 AND a pane id ---
+// --- detection gates ---
 {
   t("spawnable needs HERDR_ENV=1 + HERDR_PANE_ID", herdrSpawnable({ HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" } as any) === true);
-  t("no HERDR_ENV -> not spawnable", herdrSpawnable({ HERDR_PANE_ID: "w1:p1" } as any) === false);
-  t("HERDR_ENV but no pane id -> not spawnable", herdrSpawnable({ HERDR_ENV: "1" } as any) === false);
-  t("empty env -> not spawnable", herdrSpawnable({} as any) === false);
+  t("no pane id -> not spawnable", herdrSpawnable({ HERDR_ENV: "1" } as any) === false);
+  // H-P2-3: explicit binary override -> herdr must step aside
+  t("AGENTHOP_SPAWN_BIN_CODEX -> explicit binary", hasExplicitBinary("codex", { AGENTHOP_SPAWN_BIN_CODEX: "/x/codex" } as any) === true);
+  t("ALLOW_CMD -> explicit binary", hasExplicitBinary("claude", { AGENTHOP_SPAWN_ALLOW_CMD: "1" } as any) === true);
+  t("no override -> not explicit", hasExplicitBinary("claude", {} as any) === false);
 }
 
-// --- agent name sanitation: [a-z][a-z0-9_-]{0,31}, unique ---
+// --- name sanitation ---
 {
-  t("uppercase + spaces -> slug", herdrAgentName("Work-20cab0a5 Viz") === "work-20cab0a5-viz");
-  t("leading non-alpha stripped", herdrAgentName("90b58f9c") === "b58f9c" || /^[a-z]/.test(herdrAgentName("90b58f9c")));
+  t("slug + unique suffix", herdrAgentName("Work Viz", new Set(["work-viz"])) === "work-viz-1");
   t("empty -> agent", herdrAgentName("") === "agent");
-  t("<=32 chars", herdrAgentName("x".repeat(99).replace(/x/g, "a")).length <= 32);
-  t("uniqueness suffix", herdrAgentName("rev", new Set(["rev"])) === "rev-1");
-  t("uniqueness skips taken", herdrAgentName("rev", new Set(["rev", "rev-1"])) === "rev-2");
 }
 
-// --- splitCommand: full command -> {kind, args} for `agent start -- <args>` ---
+// --- H-P2-4: quote-aware tokenizer preserves spaced args ---
 {
-  const a = splitCommand("claude --dangerously-skip-permissions --model 'opus' --resume SID");
-  t("claude kind", a.kind === "claude");
-  t("claude args after kind (quotes stripped for execFile)", a.args.join(" ") === "--dangerously-skip-permissions --model opus --resume SID");
-  const c = splitCommand("codex resume SID");
-  t("codex kind + resume subcommand as args", c.kind === "codex" && c.args.join(" ") === "resume SID");
-  t("empty -> empty kind", splitCommand("").kind === "");
-  // the canon resume cmd quotes the model for the shell; herdr (execFile, no shell) must get it UNquoted
-  const q = splitCommand("claude --dangerously-skip-permissions --model 'claude-opus-5-5[1m]' --effort xhigh --resume SID");
-  t("surrounding shell quotes stripped for execFile", q.args.includes("claude-opus-5-5[1m]") && !q.args.some((a) => a.includes("'")));
+  t("quoted spaced arg stays one token", shellTokenize(`codex --config "model_reasoning_effort = 'xhigh'" resume s`).length === 5);
+  t("quoted value content preserved (spaces kept, quotes stripped)", shellTokenize(`a --c "x = 'y'"`)[2] === "x = 'y'");
+  const canon = splitCommand("claude --dangerously-skip-permissions --model 'claude-opus-5-5[1m]' --resume SID");
+  t("canon: model unquoted, balanced", canon.kind === "claude" && canon.args.includes("claude-opus-5-5[1m]") && canon.balanced);
+  const spaced = splitCommand(`codex --config "model_reasoning_effort = 'xhigh'" resume sid`);
+  t("spaced config stays ONE arg (H-P2-4)", spaced.args[0] === "--config" && spaced.args[1] === "model_reasoning_effort = 'xhigh'" && spaced.args[2] === "resume");
+  t("unbalanced quotes flagged (caller refuses herdr)", splitCommand(`codex --config "oops`).balanced === false);
+  t("balanced canon flagged balanced", splitCommand("codex resume sid").balanced === true);
 }
 
 // --- argv builders ---
 {
-  t("pane split preserves cwd + no-focus", buildPaneSplit("/w/x").join(" ") === "pane split --current --direction right --cwd /w/x --no-focus");
-  t("agent start with args after --", buildAgentStart("rev", "claude", "w1:p2", ["--resume", "S"]).join(" ") === "agent start rev --kind claude --pane w1:p2 -- --resume S");
-  t("agent start no args -> no trailing --", buildAgentStart("rev", "codex", "w1:p2").join(" ") === "agent start rev --kind codex --pane w1:p2");
-  t("agent start timeout", buildAgentStart("r", "claude", "p", [], 30000).includes("--timeout"));
-  t("prompt --wait --until (multi) --timeout", buildAgentPrompt("rev", "hi", { wait: true, until: ["blocked", "idle"], timeoutMs: 60000 }).join(" ") === "agent prompt rev hi --wait --until blocked --until idle --timeout 60000");
-  t("prompt bare", buildAgentPrompt("rev", "hi").join(" ") === "agent prompt rev hi");
-  t("wait builder", buildAgentWait("rev", ["blocked"], 5000).join(" ") === "agent wait rev --until blocked --timeout 5000");
-  t("read builder default recent-unwrapped", buildAgentRead("rev").join(" ") === "agent read rev --source recent-unwrapped");
-  t("send-keys builder", buildSendKeys("rev", ["Enter"]).join(" ") === "agent send-keys rev Enter");
+  t("pane split", buildPaneSplit("/w").join(" ") === "pane split --current --direction right --cwd /w --no-focus");
+  t("agent start args after --", buildAgentStart("r", "claude", "w1:p2", ["--resume", "S"]).join(" ") === "agent start r --kind claude --pane w1:p2 -- --resume S");
+  t("agent submit (no --wait; submit/wait separated)", buildAgentSubmit("r", "hi").join(" ") === "agent prompt r hi");
+  t("agent wait explicit timeout", buildAgentWait("r", ["idle", "done"], 120000).join(" ") === "agent wait r --until idle --until done --timeout 120000");
+  t("agent read default source", buildAgentRead("r").join(" ") === "agent read r --source recent-unwrapped");
+  t("send-keys", buildSendKeys("r", ["Enter"]).join(" ") === "agent send-keys r Enter");
+  t("pane close", buildPaneClose("w1:p2").join(" ") === "pane close w1:p2");
 }
 
-// --- stripTui: drop the chrome, keep content (verified-live noise shapes) ---
+// --- H-P2-6: receipt validation (no fabricated success) ---
 {
-  const raw = ["The answer is 42.", "", "  Worked for 5s • 2:02 PM", "› Ask Codex to do anything", "  GPT-6-Astra xhigh · Context 99% left · 828K window", "  ← for agents · ? for shortcuts", "  ⚠ 2 warnings · f2 to view"].join("\n");
-  const clean = stripTui(raw);
-  t("keeps real content", clean.includes("The answer is 42."));
-  t("drops 'Worked for'", !/Worked for/.test(clean));
-  t("drops input box", !/Ask Codex/.test(clean));
-  t("drops status line", !/Context 99% left/.test(clean));
-  t("drops shortcuts + warnings", !/for shortcuts/.test(clean) && !/warning/.test(clean));
+  t("pane id from split", paneIdFromSplit({ result: { pane: { pane_id: "w1:p3" } } }) === "w1:p3");
+  t("no pane id -> null", paneIdFromSplit({ result: {} }) === null);
+  t("valid agent_started for name", startedName({ result: { type: "agent_started", agent: { name: "rev" } } }, "rev") === "rev");
+  t("wrong name -> null", startedName({ result: { type: "agent_started", agent: { name: "other" } } }, "rev") === null);
+  t("wrong type -> null", startedName({ result: { type: "agent_released" } }, "rev") === null);
+  t("empty -> null", startedName(null, "rev") === null);
 }
 
-// --- sentinel classifier: whitelist auto-clear vs escalate (the HARD boundary) ---
+// --- H-P2-2: start classification (started / not-started / unconfirmed) ---
 {
-  const dir = sentinelDecision("Do you trust the files in this folder?\n> Yes  No");
-  t("dir-trust -> auto-clear with Enter", dir.action === "auto-clear" && dir.ruleId === "dir-trust" && dir.keys?.join("") === "Enter");
-  const hook = sentinelDecision("Allow this hook to run? trust hooks");
-  t("hook-trust -> auto-clear", hook.action === "auto-clear" && hook.ruleId === "hook-trust");
-  const danger = sentinelDecision("Run `rm -rf /` ? This will delete everything. [y/N]");
-  t("non-whitelist (dangerous) -> escalate, never auto-answer", danger.action === "escalate" && !danger.keys);
-  const generic = sentinelDecision("The model wants to push to main. Approve? [y/n]");
-  t("generic approval -> escalate", generic.action === "escalate");
-  t("whitelist v1 is narrow (2 rules)", WHITELIST_V1.length === 2);
+  t("valid receipt -> started", classifyStart({ result: { type: "agent_started", agent: { name: "r" } } }, "r", false).state === "started");
+  t("name_in_use -> not-started (clean + fallback)", classifyStart({ error: { code: "name_in_use" } }, "r", true).state === "not-started");
+  t("unknown_kind -> not-started", classifyStart({ error: { code: "unknown_kind" } }, "r", true).state === "not-started");
+  t("agent_not_ready -> unconfirmed (keep, no re-launch)", classifyStart({ error: { code: "agent_not_ready" } }, "r", true).state === "unconfirmed");
+  t("empty output -> unconfirmed", classifyStart(null, "r", false).state === "unconfirmed");
+  t("wrong receipt type -> unconfirmed", classifyStart({ result: { type: "agent_released" } }, "r", false).state === "unconfirmed");
+  t("unrecognized error code -> unconfirmed (never prove not-started)", classifyStart({ error: { code: "weird_new_code" } }, "r", true).state === "unconfirmed");
+  t("HARD_NOT_STARTED is a narrow set", HARD_NOT_STARTED.has("name_in_use") && !HARD_NOT_STARTED.has("agent_not_ready"));
 }
 
-// --- buildApprovalDoc: reuse S19 7-field format, taskRef=approval, options+consequences ---
+// --- H-P1-1: current-prompt region + full-form whitelist; the four counterexamples MUST escalate ---
+{
+  // positives: the real mechanical prompts auto-clear
+  t("real dir-trust -> auto-clear", sentinelDecision("Do you trust the files in this folder?\n> 1. Yes, proceed\n  2. No").action === "auto-clear");
+  t("real hook-trust -> auto-clear", sentinelDecision("Trust the hooks in this directory to run?\n> Yes / No").action === "auto-clear");
+  // the four review counterexamples
+  t("CE1 deployment-not-mechanical -> escalate", sentinelDecision("Do you trust this deployment to delete the production database? [y/N]").action === "escalate");
+  t("CE2 webhook substring -> escalate", sentinelDecision("Allow this webhook to transfer $5000? [y/N]").action === "escalate");
+  const stale = ["Do you trust the files in this folder?", "> Yes (answered)", ...Array(14).fill("build log line"), "Push to main and deploy to prod? [y/N]"].join("\n");
+  t("CE3 stale trust in history, current=push -> escalate", sentinelDecision(stale).action === "escalate");
+  const quoted = ["tool output: the agent said \"trust this directory\" earlier", "Delete all backups now? [y/N]"].join("\n");
+  t("CE4 quoted trust in tool output, current=delete -> escalate", sentinelDecision(quoted).action === "escalate");
+  // region is the tail only
+  t("currentPromptRegion takes the tail", !currentPromptRegion(stale).includes("trust the files"));
+}
+
+// --- H-P2-1: approval envelope is a VALID InboxMsg (via local), roundtrips through the real validator ---
 {
   const { file, body } = buildApprovalDoc({
-    from: "90b58f9c-5bac", fromLabel: "90b58f9c", coordinatorId: "fe0376cd", nowSec: 1000,
+    from: "90b58f9c-5bac", fromLabel: "90b58f9c", nowSec: 1000,
     member: "Work-1", screenSummary: "push to main?", options: [{ label: "approve", consequence: "merges" }, { label: "deny", consequence: "stays open" }], recommend: "deny",
   });
-  t("approval taskRef", body.taskRef === "approval");
-  t("7 fields present", ["from", "fromLabel", "via", "ts", "taskRef", "title", "text"].every((k) => k in body));
-  t("options + consequences in text", String(body.text).includes("approve → merges") && String(body.text).includes("deny → stays open"));
-  t("recommendation present but labeled advisory", String(body.text).includes("建议") && String(body.text).includes("裁决出自你"));
+  t("via is local (not durable-inbox)", body.via === "local");
+  t("passes the REAL validInboxMsg (H-P2-1 roundtrip)", validInboxMsg(body) !== null);
+  t("validator preserves taskRef + title", (() => { const v = validInboxMsg(body)!; return v.taskRef === "approval" && !!v.title; })());
+  t("options + consequences + advisory recommend in text", body.text.includes("approve → merges") && body.text.includes("deny → stays open") && body.text.includes("裁决出自你"));
   t("filename shape", file === "1000-approval-Work-1-from-90b58f9c.json");
+}
+
+// --- stripTui keeps content, drops chrome ---
+{
+  const clean = stripTui(["The answer is 42.", "  Worked for 5s • 2:02 PM", "› Ask Codex to do anything"].join("\n"));
+  t("keeps content, drops chrome", clean.includes("42.") && !/Worked for|Ask Codex/.test(clean));
 }
 
 console.log("all herdr selftests passed");

@@ -2,7 +2,7 @@
 
 对象:**herdr 0.9.3**(~/.local/bin/herdr,Rust,server+CLI,unix socket 协议 /Users/wowdd1/.config/herdr/herdr.sock;源 https://github.com/herdrdev/herdr)。
 注意:user shell 有指向不存在 `herdr-cmux` 的旧 alias——一切验证用**绝对路径**;代码用 `HERDR_BIN` 环境变量指绝对路径。
-目标:把拉起/恢复从「osascript 盲打 Ghostty」升级为 herdr 后端(JSON 回执 + 生命周期状态),并把 S24「禁弹框」从纪律变机制(blocked 检测)。**双后端并存,Ghostty 不删。**
+目标:把拉起/恢复从「osascript 盲打 Ghostty」升级为 herdr 后端(JSON 回执 + 生命周期状态),并为 S24「禁弹框」提供机制部件(blocked 检测;**整链接线属 d7f6c917 后续单,本批只交部件,S24 整链未上线**)。**双后端并存,Ghostty 不删。**
 
 ## 一、herdr 是什么(与我们相关的面)
 
@@ -20,7 +20,7 @@ terminal workspace manager:把终端组织成 workspace/tab/pane,识别 pane 内
 | `spawnAgent({tool,cwd,visible})` | `buildAppleScript`→osascript 开 Ghostty 窗跑命令 | `pane split --current --cwd <cwd> --no-focus`(得 pane_id)→ `agent start <name> --kind <tool> --pane <id> -- <flags>` | herdr 不开窗,在现有 pane 分裂;返回 JSON 回执 |
 | `resumeCommandForMember(m)`(F36 完整命令) | buildAppleScript 原样跑 resumeCmd | `splitCommand(resumeCmd)`→{kind,args}→ `agent start --kind <kind> -- <args>` | claude 的 flags / codex 的 `resume <sid>` 作 native args |
 | (无)成员存活 | presence pid/status | `agent list`→`agent_status`;`agent wait --until <state>` | idle/working/blocked/done/unknown |
-| (无)卡点检测 | 无——弹框静默卡死 | **`agent wait --until blocked`** 或轮询 `agent list` | S24 从纪律变机制 |
+| (无)卡点检测 | 无——弹框静默卡死 | **`agent wait --until blocked`** 或轮询 `agent list` | S24 机制部件(整链未上线,接线归 d7f6c917) |
 | (无)读屏 | 无 | `agent read --source recent-unwrapped`(带 TUI 噪音,`stripTui` 剥壳) | 供网页镜像/审批摘要 |
 | (无)注入 | 无 | `agent prompt <name> <text> [--wait] [--until S]`;`agent send-keys <name> <key>` | 语音直通 + 审批回注 |
 
@@ -76,5 +76,20 @@ user 裁定:语音 broker 转写用户话音→`herdr agent prompt <协调者> <
 - `spawnAgent`(spawn.ts):探测 `herdrSpawnable && herdrServerReachable` → `herdrLaunch`,否则原 Ghostty 路径(**Ghostty 本体未删**)。
 - `scripts/swarm-resume.ts`:launch 循环同款双后端分支(herdr 用 `splitCommand(resumeCmd)`,否则 buildAppleScript)。
 - 验证:bus tsc=0,scripts tsc=0,herdr+resume selftest 全绿;三-/四-节能力均**临时 server 实测**过(已清理,server 不留)。
+
+## 九、首轮对抗复验修复(rev2,16bf8c8→新 SHA)
+
+01a0ff49 首轮判决 1 P1/7 P2(8 REMAIN),协调者裁定#R11:注册表退化须修(裁 A),哨兵接线批准延期(d7f6c917),via 先用 local。本轮一次性修全八项:
+
+- **H-P1-1(P1)白名单误代答**:`sentinelDecision` 改为只在**当前提示区**(`currentPromptRegion`=stripTui 后末尾 12 行)匹配**完整机制形制**;`dir-trust`=「do you trust the files in this folder/directory/workspace」整句,`hook-trust`=trust/allow+`\bhooks?\b`(词界排除 webhook)+ in this/for this/run/execute。四反例(deployment/webhook/历史陈旧/工具输出引用)全 escalate,真实正例保留。认不准即呈批。
+- **H-P2-1 审批信封**:`buildApprovalDoc` 产出合法 `InboxMsg`(`via:"local"`),selftest 过真实 `validInboxMsg` 往返;F38 的 composeInboxMsg 落地后再换。
+- **H-P2-2 启动异常/回退/句柄**:`herdrRun` 捕获非零退出不再抛穿;`herdrLaunch` 返回分型 `started/not-started/unconfirmed`——未启动硬失败(name/kind/pane)清理本次空 pane 后回落 Ghostty;agent_not_ready/超时/空/畸形=unconfirmed 保留 pane/name **绝不重拉**;spawn+resume 同消费。名字按 live agent 去重防碰撞。
+- **H-P2-3 binary override**:`hasExplicitBinary` 门——设了 AGENTHOP_SPAWN_BIN_* 或 ALLOW_CMD 时 herdr 让位 Ghostty(herdr --kind 只跑 canonical exe)。
+- **H-P2-4 带空格参数**:`shellTokenize` 引号感知,spaced config 保一个参数;不平衡引号→`balanced:false`→resume 回落 Ghostty 保边界。
+- **H-P2-5 wait 语义**:`herdrPrompt` 拆**提交**(agent_prompted 回执=submitted)与**等待**(独立 bounded,默认 120s 显式);超时返 `{submitted:true,settled:false}` 不盲重放;无提交回执→submitted:false。
+- **H-P2-6 成功回执**:`startedName` 校验 type==agent_started + name 匹配;空/畸形/错型/错 name→unconfirmed,不虚构成功。
+- **H-P2-7 注册表/despawn(裁 A)**:herdr 启动经 `recordSpawn`(backend=herdr+pane(windowId)+name(surfaceId)+每次启动 launchId)入册,`readRegistry` 带出;`despawnAgent` 见 backend=herdr 走 `herdrPaneClose(pane)` 清理或诚实报 herdr 管辖,绝不按可复用名字猜 owner。
+
+验证:herdr+resume selftest 全绿(含四反例、inbox 往返、启动分型、spaced 参数),bus tsc=0,scripts tsc=0。接线(live dispatcher 巡检)仍留 d7f6c917。
 
 (研究口径:只读+能力验证,不迁移现役会话(user 亲手),不并 main/不 push;送审即停。基线:spawn.ts/resume.ts 现函数 + S19/S24/F36。)

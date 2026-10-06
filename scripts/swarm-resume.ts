@@ -24,7 +24,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { startBusCore } from "../packages/bus/src/core.js";
 import { buildAppleScript } from "../packages/bus/src/spawn.js";
-import { herdrAgentName, herdrLaunch, herdrServerReachable, herdrSpawnable, splitCommand } from "../packages/bus/src/swarm/herdr.js";
+import { herdrAgentName, herdrAgentStates, herdrLaunch, herdrServerReachable, herdrSpawnable, splitCommand } from "../packages/bus/src/swarm/herdr.js";
 import { ROSTER_FILE, assembleRoster, parseSnapshot, planResume, resumeCommandForMember, type PeerLike } from "../packages/bus/src/swarm/resume.js";
 
 const pexec = promisify(execFile);
@@ -96,16 +96,20 @@ async function main(): Promise<void> {
     // herdr backend (S14): inside a herdr pane + server reachable -> relaunch as herdr panes; else Ghostty.
     const useHerdr = herdrSpawnable(process.env) && (await herdrServerReachable());
     console.log(`backend: ${useHerdr ? "herdr" : "Ghostty (osascript)"}`);
-    let ok = 0, fail = 0;
+    const taken = useHerdr ? new Set((await herdrAgentStates()).map((a) => a.name)) : new Set<string>();
+    let ok = 0, fail = 0, unconfirmed = 0;
     for (const m of plan.launch) {
       const cmd = resumeCommandForMember(m); // F36: full resume command, never a bare relaunch
       try {
-        if (useHerdr) {
-          const { kind, args } = splitCommand(cmd);
-          const r = await herdrLaunch({ name: herdrAgentName(m.title ?? m.member), kind, cwd: m.cwd, args });
-          if (!r.ok) throw new Error(r.note);
-          ok++; console.log(`  launched[herdr]  ${m.title ?? m.member}  pane ${r.paneId}  (${cmd})`);
-          continue;
+        const sc = splitCommand(cmd);
+        // herdr only when it's on AND the command tokenizes cleanly (H-P2-4: unbalanced quotes -> Ghostty keeps
+        // arg boundaries); a hard not-started also falls back; an unconfirmed launch is kept, never re-launched.
+        if (useHerdr && sc.balanced) {
+          const name = herdrAgentName(m.title ?? m.member, taken); taken.add(name);
+          const r = await herdrLaunch({ name, kind: sc.kind, cwd: m.cwd, args: sc.args });
+          if (r.state === "started") { ok++; console.log(`  launched[herdr]  ${m.title ?? m.member}  pane ${r.paneId}  (${cmd})`); continue; }
+          if (r.state === "unconfirmed") { unconfirmed++; console.log(`  unconfirmed[herdr]  ${m.title ?? m.member}  ${r.note} — kept, NOT re-launched`); continue; }
+          console.error(`  herdr not-started (${r.note}); falling back to Ghostty for ${m.title ?? m.member}`);
         }
         await launchWindow(cmd, m.cwd);
         ok++;
@@ -115,7 +119,7 @@ async function main(): Promise<void> {
         console.error(`  FAILED    ${m.title ?? m.member}  ${m.cwd}  (${(e as Error).message})`);
       }
     }
-    console.log(`done: ${ok} launched, ${fail} failed, ${plan.skip.length} already live. Each session self-reports; the sweep takes over.`);
+    console.log(`done: ${ok} launched, ${unconfirmed} unconfirmed(kept), ${fail} failed, ${plan.skip.length} already live. Each session self-reports; the sweep takes over.`);
     if (fail) process.exitCode = 1;
   } finally {
     await core.close();
