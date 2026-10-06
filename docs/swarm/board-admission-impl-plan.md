@@ -29,6 +29,15 @@ satisfied by EITHER a CONTROL wait OR intent+binding. Three readings of the gran
 LEAN: (B) for the dormant v1 — satisfies "intent+binding + a supervision wait + receipt" without wiring the whole
 unbuilt §2b envelope-open side (that is its own batch). Awaiting coordinator ruling before implementing Inc 3's grant.
 
+## ROUND 2 — v2 fixes @fcb8834 (codex 3fda743 review: 6P1+3P2)
+- BA1 plan-from-CONTROL (currentPlan), BA2 claim-body validation (parseClaimApplication + digest/approval checks),
+  BA3 per-job sched isolation, BA4 job-namespaced board keys (`<jobId>__<nodeId>`, on-disk v2, coord-approved),
+  BA5 receipt-first at-least-once + reconcile re-deliver, BA6 capacity gate (CAP − physicalSlotsOccupied),
+  BA7 current-live-attempt owner, BA8 terminal-no-block + stale-refresh. ALL FIXED.
+- BA9 posted-supervision DEFERRED under coordinator ruling #R14 = HARD precondition before flipping SWARM_BOARD_ADMIT
+  (tracked with envelope-open + §2d-c ping). See [[swarm-sweep-batch-assignment]] / todo pool.
+- Gates: bus tsc 0, dispatch tsc 0, projection tsc 0, 962/962 vitest. Packet addendum "v2 (round 2)" sent for narrow re-verify.
+
 ## DONE — ALL INCREMENTS COMPLETE (HEAD 3fda743, review packet sent)
 - Increment 4 @3fda743 (+@a793744): §2d-b admission FINISH. `planClaimAdmission` (PURE decider in task-board.ts:
   plan+CONTROL+claim → grant|reject|reconcile; same-member lost-rename reconciles, different-member single-active-race

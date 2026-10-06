@@ -73,3 +73,48 @@ packages/bus/src/swarm/delegation-observer.ts  ±4     (doc comment)
 
 ## doneLine / stopSet
 Design + impl + test green + self-review DONE → this packet. STOP: no merge, no push, no deploy. Awaiting verdict.
+
+---
+
+# v2 (round 2) — fixes for codex review of 3fda743 (6P1 + 3P2)
+
+**Code frozen at** `fcb8834` (base `main=b5fde65`, branch `feat/board-admission`). Prior round `3fda743`.
+**Verdict addressed:** BA1-BA8 FIXED; BA9 DEFERRED under coordinator ruling **#R14**.
+Gates: bus tsc 0, dispatch tsc 0, projection tsc 0, **962/962** vitest green.
+
+## Board key v2 (BA4) — ON-DISK CONVENTION CHANGE, since 3fda743
+Board item id is now JOB-NAMESPACED: `itemId = <jobId>__<nodeId>` (was bare `<nodeId>`). Two jobs' same nodeId no longer
+collide on the one shared board dir, and a producer can tell its own posts from another job's. `__` is dot/slash/whitespace-
+free (survives isValidItemId + the `.`-separated file-name convention). All three board parsers already tolerate it; dormant
+⇒ no live files to migrate. (Coordinator-approved: "改约窗口就是现在".)
+
+## Per-finding
+- **BA1** (plan not from CONTROL): `planClaimAdmission` and `runBoardProducer` resolve the plan via `currentPlan(state, jobId)`
+  (the liveness-review canonical). Missing PlanPut ⇒ DEFER (consumer) / fall back to startup only pre-PlanPut (producer).
+- **BA2** (claim body unvalidated): new `parseClaimApplication` narrows the untrusted body; the decider validates
+  jobId/nodeId/specDigest/inputBindingDigest against the current plan (drift ⇒ reject) and rejects any `requiresApproval`
+  claim (no node-level approval source exists in TaskSpec; board admission does not auto-satisfy an approval gate in v1 —
+  future follow-up if the plan model adds one). The consumer rejects an unreadable/malformed body.
+- **BA3** (global sched input): attempts/accepted/usage are filtered to the claim's OWN job (`a.jobId === jobId`) before
+  readyTasks/prepareDispatch, so a grant can never retire or budget-charge another job.
+- **BA4** (cross-job reap + nodeId collision): job-namespaced keys + `planBoardWrites` scoped to `<jobId>__` prefix; another
+  job's entries are never posted-over or reaped.
+- **BA5** (receipt loss): `deliverGrantAndMark` writes the receipt FIRST and marks the item `granted` only on success; a
+  failed receipt keeps the claim; reconcile re-delivers then marks. At-least-once (benign duplicate possible).
+- **BA6** (no capacity check): the consumer computes `freeSlots = CAP - physicalSlotsOccupied(state)` (global VM pool, shared
+  with the push path) and the decider DEFERS a grant when it is 0; recomputed per claim from the reloaded state.
+- **BA7** (historical owner): reconcile-vs-reject follows the CURRENT-generation LIVE (non-terminal) attempt's supervision-wait
+  owner, not the first historical grant.
+- **BA8** (terminal/stale blocks repost): a terminal `rejected` file no longer blocks a READY node (re-post + clear it); a
+  stale-revision `posted` file (digest drifted) is reaped + re-posted fresh.
+- **BA9** (posted-but-unclaimed supervision): DEFERRED — coordinator ruling **#R14**. Same seam-class as envelope-open and
+  §2d-c ping; it couples the producer into CONTROL-commit lifecycle. **Hard precondition before SWARM_BOARD_ADMIT is ever
+  flipped on.** Tracked in the todo pool as "§2d-a posted supervision (claim deadline + sweep escalate)".
+
+## New / changed tests (real control engine)
+`parseClaimApplication` (valid/malformed/approval); planClaimAdmission: BA1 defer, BA2 spec-drift + input-drift + approval
+reject, BA6 capacity defer, BA7 two-generation owner, BA3 cross-job non-interference; planBoardWrites: BA8a terminal-no-block,
+BA8b stale-refresh, BA4 other-job-untouched. 22 board tests; 962/962 suite.
+
+## Still out of scope (recorded)
+A2 execution + gate flip; §2b envelope-open; §2d-c ping; **BA9 posted-supervision (R14, pre-flip blocker)**.
