@@ -49,11 +49,12 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
 {
   t("pane split", buildPaneSplit("/w").join(" ") === "pane split --current --direction right --cwd /w --no-focus");
   t("agent start args after --", buildAgentStart("r", "claude", "w1:p2", ["--resume", "S"]).join(" ") === "agent start r --kind claude --pane w1:p2 -- --resume S");
-  // ①(herdr-args-fix) regression guard: a full resume command flows splitCommand -> buildAgentStart as SEPARATE
-  // argv elements (herdrRun hands this array straight to execFile), so each flag reaches herdr as its own argv. The
-  // field "whole flag string as one arg" cannot originate on our side; any join would be upstream `agent start --`
-  // forwarding.
-  t("① full resume tokenizes to separate argv (no whole-string join)", (() => {
+  // ①(herdr-args-fix) regression guard: a STANDARD generated resume command flows splitCommand -> buildAgentStart as
+  // SEPARATE argv elements (herdrRun hands this array straight to execFile), so each flag reaches herdr as its own
+  // argv. This verifies our boundary handling for this input; it does NOT localize the field whole-string issue (a
+  // quoted input like `claude "--model opus --resume SID"` would itself yield a single tail arg here) nor uniquely
+  // attribute it upstream.
+  t("① standard resume command tokenizes to separate argv (boundary preserved)", (() => {
     const sc = splitCommand("claude --dangerously-skip-permissions --model 'claude-opus-5-5[1m]' --resume SID");
     const argv = buildAgentStart("m", sc.kind, "w1:p2", sc.args);
     const after = argv.slice(argv.indexOf("--") + 1);

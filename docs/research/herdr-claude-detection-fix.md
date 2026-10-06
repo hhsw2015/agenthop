@@ -46,15 +46,21 @@ live swarm):**
 - Without the fix: real claude → `agent_session` registered but `agent_status: unknown`, absent from `agent list`
   (reproduces ③).
 - With `exec -a claude` running the real claude: `agent list` → claude is **listed**; `agent explain` →
-  `rule: live_prompt_box, evidence "❯"`. The final archived list record carries `state_change_seq=6, revision=4,
-  completion_seq=6, agent_status=done` — raw proof the state **changed multiple times** through the driven task and
-  the run completed. (The explicit per-tick idle→working snapshots were read from live output but NOT archived; a
-  `blocked` state was not induced — see the evidence-boundary note. Those gaps are covered by the natural
-  rolling-restart acceptance, below.)
+  `rule: live_prompt_box, evidence "❯"`. One archived end-state snapshot (`FINAL-agent-list…`) shows
+  `agent_status=done` with `state_change_seq=6 / completion_seq=6 / revision=4` — accurate reading: *that snapshot's*
+  end-state is `done` and the agent is listed. The counters are present but their exact semantics/scope are not locked
+  here, and there is **no** archived start point or per-tick record, so this snapshot does **not** by itself
+  reconstruct a specific task's state history. The per-tick idle→working sequence was a live-terminal **observation**
+  (not archived); a `blocked` state was **not** induced.
 - Cross-check: a dummy `exec -a claude sleep 600` is also identified+listed (`default_known_agent_idle_fallback`),
-  isolating argv0 as the sole lever.
-- Raw captures + an explicit raw-vs-observed-vs-not-captured inventory: `docs/research/herdr-claude-state-evidence/`
-  (`FINAL-state-flow-note.txt`).
+  isolating argv0 as the sole identity lever.
+- **Production acceptance (read-only, real member) — `docs/research/herdr-claude-state-evidence/LIVE-acceptance/`:**
+  the first member to restart via the fixed launcher (the coordinator session) is listed live as `claude` (pre-fix
+  always absent), classified from its OSC title (`rule: osc_title_working, evidence "◐ …"`), bound to a process whose
+  `ps` shows **argv0=claude**; `agent get` read live shows `state_change_seq` climbing (18→33) and status working→idle
+  = **real state flow in production**. This is ③'s coordinator-named scope-B acceptance for identify→list→flow.
+  `wait --until` and a `blocked` observation remain **unverified**.
+- Raw-vs-observed-vs-not-captured inventory: `docs/research/herdr-claude-state-evidence/FINAL-state-flow-note.txt`.
 
 ## Status: user-applied (2026-10-06 eve)
 
@@ -64,29 +70,41 @@ then **applied it themselves**, slightly better than the original proposal:
   (so it no longer picks `2.1.283.pristine`), AND
 - every `exec` line uses `exec -a claude "$REAL_CLAUDE" …` (lines 116/122/142/148/151).
 
-**③ status: root-caused + user-fixed; awaiting natural rolling-restart verification.** The change takes effect on
-newly-started sessions; the four live claude members were started before it (their processes still show the version
-name) and will be recognized by herdr as they naturally restart — the live sessions are deliberately not disturbed.
-**Acceptance evidence:** the next real member launched via the new launcher appears in herdr `agent list` with flowing
-state (occurs naturally; no isolated repro needed — already proven end-to-end in isolation above).
+**③ status: root-caused + user-fixed; production acceptance for identify→list→state-flow OBSERVED live (read-only),
+coordinator-named (scope-B).** The change takes effect on newly-started sessions; members started before it still show
+the version name and are recognized by herdr as they naturally restart — live sessions are deliberately not disturbed.
+The coordinator (the first member to restart) is the named acceptance: see `LIVE-acceptance/` above. **Still
+unverified:** `wait --until` for claude, and a `blocked` observation (the claude.toml blocker rules read the same
+screen regions that already classify idle/working here, so blocked is *expected* to work once identified — that is an
+inference, not captured). Per coordinator scope-B, the end-to-end follow-up remains owned by 90b58f9c until those are
+confirmed; this ticket does not claim full ③ closure.
 
 If the launcher fix were ever reverted, the fallbacks are upstream herdr changes (add `("herdr:claude","claude")` to
 `full_lifecycle_hook_authority` + extend the claude integration hook to report state; or teach `identify_agent` to
 recognize the versioned claude binary) — both require rebuilding/PRing herdr.
 
-The bus-presence bridge is **not** needed: herdr's observation surface (agent list / wait / blocked / unified panel)
-works in full once the process is identified — which is the capability the user wanted to reuse.
+The bus-presence bridge is **not** needed for the verified capability: once the process is identified, herdr lists the
+agent and its idle/working state flows (shown live). `wait --until` and the blocked path are not yet verified, so no
+claim is made about the full panel.
 
 ## ① `agent start -- <args>` whole-string-as-one-arg — our side is correct
 
 `buildAgentStart` returns an argv **array** (`["agent","start",name,"--kind",k,"--pane",p,"--",...args]`) and
 `herdrRun` passes it to `execFile(HERDR_BIN, args)` — each element is a separate argv entry, so word-by-word passing
-is already guaranteed on our side (no shell interpolation). `swarm-resume` tokenizes the full command via the
-escape-aware `splitCommand` before handing `args` to `herdrLaunch`, and refuses herdr (falls back to Ghostty) on an
-unbalanced command. So the only way claude receives `"--flag1 --flag2"` as one token is if herdr's own
-`agent start … -- <args>` forwarding re-joins them (upstream) — our argv is clean. The migrated members are
-user-launched (not via `agent start`), so this path is not exercised in production today. **Action:** no agenthop
-code change; if a concrete `agent start` repro appears, it points upstream. Documented as a known item.
+is preserved on our side (no shell interpolation). `swarm-resume` tokenizes the full command via the escape-aware
+`splitCommand` before handing `args` to `herdrLaunch`, and refuses herdr (falls back to Ghostty) on an unbalanced
+command. A regression guard (selftest) + a real `execFile` capture confirm that a standard generated command yields
+separate tail argv.
+
+**Scope of that claim (narrowed per review):** this verifies our argv **boundary handling** for standard generated
+commands and the tested inputs — it does **not** localize the field "whole string as one arg", and it is **not**
+uniquely attributable to upstream. Counterexample: a quoted input `claude "--model opus --resume SID"` goes through
+`splitCommand` (balanced) and real `execFile` as a **single** tail arg here, with no upstream join — correct
+quote-boundary preservation, but it shows the whole-string can originate in the **input** too. So the input boundary
+also needs checking. **Action:** no agenthop code change (boundary handling is correct); the field case is *not
+localized* — pinning it needs the field's original command/input plus the per-hop argv (what entered herdr vs what was
+delivered to claude). The migrated members are user-launched (not via `agent start`), so this path is not exercised in
+production today. Documented as a known, un-localized item.
 
 ## ② first-char drop on keystroke injection (claude → laude)
 

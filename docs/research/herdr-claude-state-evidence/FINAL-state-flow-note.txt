@@ -1,31 +1,36 @@
-OBSERVATION NOTE — NOT raw evidence. (Relabeled per reviewer evidence-boundary check.)
+EVIDENCE INVENTORY — raw / observed / not-captured, each item mapped to its actual file content.
+(Isolated-probe round. The production acceptance evidence is in ./LIVE-acceptance/ — see bottom.)
 
-The per-tick "t1 idle, t2-t8 working" line below was read from live terminal output while driving the
-argv0=claude real claude pane; the individual agent_list snapshots of that transition were NOT archived.
-Treat it as an observation, not a raw receipt:
-  "idle->working observed when driving the argv0=claude real claude pane (t1 idle, t2-t8 working)."
+RAW (archived here), stating only what each file literally contains:
+- claude-pane-get.json ............ PRE-FIX real custom-TUI claude: agent_status=unknown, agent_session registered.
+- explain-claude-notfound.json .... PRE-FIX: `agent explain w1:p5` -> {"error":"agent_not_found"} (not promoted).
+- explain-codex-BYNAME-error.json . A FAILURE receipt: {"error":"agent_not_found","message":"agent target cxprobe
+                                    not found"} — this was `agent explain cxprobe` (explain targets by PANE id, not
+                                    name), so it errored. It is NOT codex-detection evidence. Codex detection is
+                                    instead shown by codex-pane-get.json / the agent-list snapshots (codex listed) and
+                                    by herdr source (identify_agent matches "codex"; codex.toml osc_title rules).
+- codex-pane-get.json ............. codex pane info (codex was detected/listed).
+- FINAL-agent-list-argv0-claude-listed.json .. POST-FIX (argv0=claude real claude): this ONE snapshot shows claude
+                                    LISTED, agent_status=done, with fields state_change_seq=6 / completion_seq=6 /
+                                    revision=4, title "✳ Reply with HELLO". Accurate reading: *this snapshot's*
+                                    end-state is `done` and the agent is listed. The counters are present in the
+                                    snapshot; their exact semantics/scope are not locked in this package, and there is
+                                    NO archived start point or per-tick record, so this snapshot does NOT by itself
+                                    reconstruct a specific task's state history.
+- FINAL-explain-claude-argv0.txt .. POST-FIX: `agent explain` -> rule live_prompt_box, evidence "❯" (classification
+                                    works on the custom TUI once identified).
 
-WHAT IS RAW (archived in this dir), and what each proves:
-- claude-pane-get.json .......... PRE-FIX real custom-TUI claude: agent_status=unknown, agent_session registered
-                                  (reproduces broken state).
-- explain-claude-notfound.json .. PRE-FIX: `agent explain` -> agent_not_found (herdr never promoted it).
-- explain-codex-detected.json ... detection mechanism: codex matched rule osc_title / process "codex".
-- FINAL-agent-list-argv0-claude-listed.json .. POST-FIX (argv0=claude real claude): claude is LISTED, and the
-                                  record shows state_change_seq=6, revision=4, completion_seq=6, agent_status=done,
-                                  title "✳ Reply with HELLO" — RAW proof that (a) identity/listing works and
-                                  (b) state CHANGED multiple times through the driven task (ended `done`).
-- FINAL-explain-claude-argv0.txt . POST-FIX: `agent explain` -> rule live_prompt_box, evidence "❯" (classification
-                                  works on the custom TUI once identified).
+OBSERVED (live terminal, NOT archived as raw): the per-tick "idle -> working" sequence while driving the isolated
+argv0=claude claude. Treat as an observation only.
 
-NOT CAPTURED (gaps, stated honestly):
-- The explicit per-tick idle->working->done snapshot sequence (only the end-state `done` + the seq counters are raw).
-- A `blocked` observation for claude was never induced/captured. The claude.toml blocker rules
-  (generic_permission_prompt / live_blocked_form / bash_permission_prompt) read the same screen regions that already
-  classify idle/working here, so blocked is expected to work once identified, but that is INFERENCE, not captured.
+NOT CAPTURED (isolated round): explicit per-tick idle->working snapshots; any `blocked` state; an archived argv0 `ps`.
+Note on "listed => argv0=claude": listing proves herdr classified the pane as Claude; it does NOT by itself record the
+exact argv0 (herdr also accepts "claude-code"). The argv0 mechanism is supported separately by: (a) the macOS
+KERN_PROCARGS2/basename probe (isolated), (b) the launcher static fix, (c) the live `ps` in ./LIVE-acceptance/ showing
+argv0=claude. Three different layers, each labeled.
 
-ACCEPTANCE (per coordinator ruling): the official acceptance for ③ is the next real member launched via the fixed
-launcher appearing in herdr `agent list` with flowing state — occurring naturally on rolling restart, no isolated
-repro required. The isolated captures above are supporting root-cause evidence, not the acceptance gate.
-
-Root cause (raw/source-backed): process basename `2.1.283.pristine` != `claude` -> herdr identify_agent None.
-Fix (user-applied): find_real_binary greps pure-version binary + `exec -a claude` -> argv0=claude.
+PRODUCTION ACCEPTANCE (./LIVE-acceptance/, read-only, real member): the first member to restart via the fixed launcher
+(the coordinator session) is listed live as claude, classified from its OSC title (rule osc_title_working,
+evidence "◐ …"), bound to a process with argv0=claude; `agent get` read live shows state_change_seq climbing
+(18 -> 33) and status working -> idle = real state flow in production. This is ③'s coordinator-named scope-B
+acceptance (identify -> list -> flow). `wait --until` and a `blocked` observation remain unverified.
