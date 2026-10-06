@@ -14,56 +14,71 @@ const self = (p: Partial<SelfLike> & { id: string }): SelfLike => ({ stableId: u
 const proj = () => { const l = readIdentityLog(HOME); return buildProjection(l.events, l.corruption); };
 const msg = (text: string, ts: number) => ({ from: "x", fromLabel: "peer", text, via: "local" as const, ts });
 
-describe("F40 legacyInboxKeys — drain a prior identity's inbox after a restart / thread drift", () => {
-  test("incident replay: routing-name box + old run-id box are drained by the new term (same conversation, new run)", () => {
-    // RUN 1: a Codex session boots as conv-1, then its active thread DRIFTS conv-1 → thread-A (the a058b168 case).
-    const run1 = self({ id: "run-1", stableId: "conv-1", pid: 100 });
-    recordSelfObserve(HOME, run1, true);
+// F40 ruling R15/R15-b: ONLY a shared durable native (conversation id) proves "same session across runs"; a shared per-run id
+// is NOT proof. legacyInboxKeys recovers only the PRIOR-RUN boxes of entities sharing self.stableId as a hard native.
+describe("F40 legacyInboxKeys (R15-b) — restart drains prior-run boxes; thread-switch siblings do NOT cross", () => {
+  test("restart (same stableId, new run) recovers the OLD per-run box — but NOT a drifted-thread sibling box", () => {
+    // RUN 1 boots as conv-1, then its active thread drifts conv-1 → thread-A (two DISTINCT entities, both on run-1).
+    recordSelfObserve(HOME, self({ id: "run-1", stableId: "conv-1", pid: 100 }), true);
     recordLearn(HOME, "run-1", "conv-1", "thread-A", "thread-switch", true);
+    // RUN 2 restarts the SAME conversation (stableId conv-1, new per-run id run-2).
+    recordSelfObserve(HOME, self({ id: "run-2", stableId: "conv-1", pid: 200 }), true);
 
-    // Mail arrives addressed three ways while run 1 is up: to the stable conv id, to the OLD per-run id, and to the DRIFTED
-    // thread id (what a stale routing name "codex:w-thread-A" resolved to). All three land in durable boxes.
+    const legacy = legacyInboxKeys(proj(), self({ id: "run-2", stableId: "conv-1", pid: 200 }));
+    expect(legacy).toEqual(["run-1"]);          // the prior run's box — recovered
+    expect(legacy).not.toContain("thread-A");   // a drifted-thread SIBLING is a distinct entity → left to the sentinel (R15-b)
+    expect(legacy).not.toContain("conv-1");     // current native — already in inboxKeys()
+    expect(legacy).not.toContain("run-2");
+  });
+
+  test("F40-1 counterexample: a same-run thread-switch A→B does NOT let B drain A's private box", () => {
+    recordSelfObserve(HOME, self({ id: "run-1", stableId: "thread-A", pid: 100 }), true);
+    recordLearn(HOME, "run-1", "thread-A", "thread-B", "thread-switch", true); // same run, A → B (distinct entities)
+    writeInbox(HOME, "thread-A", msg("A-only-private", 1000));
+
+    const me = self({ id: "run-1", stableId: "thread-B", pid: 100 }); // now on thread-B
+    expect(legacyInboxKeys(proj(), me)).not.toContain("thread-A");    // the deleted run-id bridge: B must not inherit A
+    // End-to-end: B's inboxKeys drain NOTHING of A's; A's private mail stays put.
+    const keys = ["thread-B", "run-1", ...legacyInboxKeys(proj(), me)];
+    expect(claimInbox(HOME, keys, "p").map((c) => c.msg.text)).not.toContain("A-only-private");
+    expect(claimInbox(HOME, ["thread-A"], "p2").map((c) => c.msg.text)).toEqual(["A-only-private"]); // still waiting for A
+  });
+
+  test("restart end-to-end: the old per-run box is drained, the drifted-thread box is NOT (sentinel territory)", () => {
+    recordSelfObserve(HOME, self({ id: "run-1", stableId: "conv-1", pid: 100 }), true);
+    recordLearn(HOME, "run-1", "conv-1", "thread-A", "thread-switch", true);
     writeInbox(HOME, "conv-1", msg("to-stable", 1000));
     writeInbox(HOME, "run-1", msg("to-old-run", 1100));
     writeInbox(HOME, "thread-A", msg("to-drifted-thread", 1200));
+    recordSelfObserve(HOME, self({ id: "run-2", stableId: "conv-1", pid: 200 }), true);
 
-    // RUN 2: the conversation RESTARTS — SAME stableId conv-1, a NEW per-run id run-2.
-    const run2 = self({ id: "run-2", stableId: "conv-1", pid: 200 });
-    recordSelfObserve(HOME, run2, true);
-
-    // The new term discovers its prior-identity boxes from the alias-log: the old run id AND the drifted thread.
-    const legacy = legacyInboxKeys(proj(), run2);
-    expect(new Set(legacy)).toEqual(new Set(["run-1", "thread-A"]));
-    expect(legacy).not.toContain("conv-1"); // current identity — already in inboxKeys()
-    expect(legacy).not.toContain("run-2");
-
-    // End-to-end: inboxKeys() = [stableId, runId, ...legacy] drains EVERY box — nothing stranded.
-    const keys = ["conv-1", "run-2", ...legacy];
-    const drained = claimInbox(HOME, keys, "p").map((c) => c.msg.text).sort();
-    expect(drained).toEqual(["to-drifted-thread", "to-old-run", "to-stable"]);
+    const me = self({ id: "run-2", stableId: "conv-1", pid: 200 });
+    const keys = ["conv-1", "run-2", ...legacyInboxKeys(proj(), me)];
+    expect(claimInbox(HOME, keys, "p").map((c) => c.msg.text).sort()).toEqual(["to-old-run", "to-stable"]);
+    expect(claimInbox(HOME, ["thread-A"], "p2").map((c) => c.msg.text)).toEqual(["to-drifted-thread"]); // left for the sentinel
   });
 
-  test("a DIFFERENT session's box is never adopted (no shared key ⇒ not my lineage)", () => {
+  test("no stableId ⇒ no inheritance (a shared run id alone is NOT same-session proof, R15)", () => {
     recordSelfObserve(HOME, self({ id: "run-1", stableId: "conv-1", pid: 100 }), true);
-    recordSelfObserve(HOME, self({ id: "other-run", stableId: "other-conv", cwd: "/elsewhere", pid: 300 }), true);
-    const legacy = legacyInboxKeys(proj(), self({ id: "run-1", stableId: "conv-1", pid: 100 }));
-    expect(legacy).not.toContain("other-conv");
-    expect(legacy).not.toContain("other-run");
+    expect(legacyInboxKeys(proj(), self({ id: "run-1", stableId: undefined, pid: 100 }))).toEqual([]);
   });
 
-  test("a COLLISION native (two concurrent, different-cwd sessions share it) is NOT crossed — never steal mail", () => {
-    // Two live sessions claim the SAME native "shared" from different cwds + pids, overlapping in time ⇒ projection flags a
-    // collision. Draining across it could steal the other session's mail, so legacyInboxKeys must refuse to adopt it.
+  test("a COLLISION native (two concurrent, different-cwd sessions share it) ⇒ inherit nothing (never steal mail)", () => {
     recordSelfObserve(HOME, self({ id: "run-a", stableId: "shared", cwd: "/a", pid: 100 }), true);
     recordSelfObserve(HOME, self({ id: "run-b", stableId: "shared", cwd: "/b", pid: 200 }), true);
     const p = proj();
-    expect(p.collisions.has("shared")).toBe(true); // precondition: it IS flagged ambiguous
-    // From run-a's view, "shared" is its own stableId (anchor) but the OTHER session's run-b must not be pulled in through it.
-    const legacy = legacyInboxKeys(p, self({ id: "run-a", stableId: "shared", cwd: "/a", pid: 100 }));
-    expect(legacy).not.toContain("run-b");
+    expect(p.collisions.has("shared")).toBe(true); // precondition: flagged ambiguous
+    expect(legacyInboxKeys(p, self({ id: "run-a", stableId: "shared", cwd: "/a", pid: 100 }))).toEqual([]);
   });
 
-  test("no prior identities ⇒ no legacy keys (a fresh session)", () => {
+  test("a DIFFERENT session's box is never adopted (no shared native)", () => {
+    recordSelfObserve(HOME, self({ id: "run-1", stableId: "conv-1", pid: 100 }), true);
+    recordSelfObserve(HOME, self({ id: "other-run", stableId: "other-conv", cwd: "/elsewhere", pid: 300 }), true);
+    const legacy = legacyInboxKeys(proj(), self({ id: "run-1", stableId: "conv-1", pid: 100 }));
+    expect(legacy).toEqual([]);
+  });
+
+  test("no prior identities ⇒ no legacy keys", () => {
     const only = self({ id: "run-1", stableId: "conv-1", pid: 100 });
     recordSelfObserve(HOME, only, true);
     expect(legacyInboxKeys(proj(), only)).toEqual([]);

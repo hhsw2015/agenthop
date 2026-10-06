@@ -41,11 +41,21 @@ describe("F40 scanInboxes — fail-soft fs scan", () => {
     expect(s).toMatchObject({ key: "box1", unclaimedCount: 2, oldestUnclaimedAtMs: 1000 });
   });
 
-  test("in-flight .claim-<pid> files are NOT counted (a live drainer holds them)", () => {
-    writeInbox(HOME, "box1", { from: "x", fromLabel: "p", text: "a", via: "local", ts: 1000 });
-    writeInbox(HOME, "box1", { from: "x", fromLabel: "p", text: "b", via: "local", ts: 2000 });
-    claimInbox(HOME, ["box1"], "999999"); // renames both .json -> .claim-999999
-    expect(scanInboxes(HOME).find((s) => s.key === "box1")).toBeUndefined(); // no deliverable .json left to report
+  test("F40-3: a LIVE-pid claim is in-flight (not counted); a DEAD-pid orphan claim is stranded (counted)", () => {
+    writeInbox(HOME, "live", { from: "x", fromLabel: "p", text: "a", via: "local", ts: 1000 });
+    claimInbox(HOME, ["live"], "111"); // .json -> .json.claim-111
+    writeInbox(HOME, "dead", { from: "x", fromLabel: "p", text: "b", via: "local", ts: 2000 });
+    claimInbox(HOME, ["dead"], "222"); // .json -> .json.claim-222
+    const stats = scanInboxes(HOME, (pid) => pid === 111); // 111 alive, 222 dead (injected)
+    expect(stats.find((s) => s.key === "live")).toBeUndefined();                              // live claim ⇒ in flight ⇒ skipped
+    expect(stats.find((s) => s.key === "dead")).toMatchObject({ key: "dead", unclaimedCount: 1, oldestUnclaimedAtMs: 2000 }); // dead orphan ⇒ stranded
+  });
+
+  test("F40-3: a dead-pid orphan ALERTS when past threshold with no owner (end-to-end with detectStalledInboxes)", () => {
+    writeInbox(HOME, "orphan", { from: "x", fromLabel: "p", text: "stuck", via: "local", ts: (NOW - 700) * 1000 });
+    claimInbox(HOME, ["orphan"], "222");
+    const stats = scanInboxes(HOME, () => false); // holder dead
+    expect(detectStalledInboxes(stats, () => false, 600, NOW)).toEqual([{ key: "orphan", unclaimedCount: 1, staleSec: 700 }]);
   });
 
   test("a missing inbox root ⇒ [] (never throws)", () => {

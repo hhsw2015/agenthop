@@ -1041,11 +1041,13 @@ async function main(): Promise<void> {
     }
   };
 
-  // F40 unclaimed-mail sentinel (silent-stall detection). Scan durable inbox dirs; a box with unread mail past INBOX_STALL_SEC
-  // AND no live session draining it (owner offline/dead — write-side stable addressing + drain-side legacy-claim cannot help a
-  // box nobody owns) is escalated to the coordinator. The ownership set MIRRORS core's inboxKeys(): each live presence session's
-  // own key + its legacy (prior-identity) keys, so a box a live session WILL drain is never a false alarm. Fail-soft + isolated;
-  // notifyCoordinator dedups an identical alert within NOTIFY_DEDUP_MS (a stall persisting past the window re-alerts, as intended).
+  // F40 unclaimed-mail sentinel (silent-stall detection). Scan durable inbox dirs (incl. dead-pid orphan claims, F40-3); a box
+  // with stranded mail past INBOX_STALL_SEC AND no live session draining it is escalated to the coordinator. The ownership set
+  // MIRRORS core's inboxKeys(): each live presence session's own key + its legacy prior-run keys. Fail-soft + isolated.
+  // Per-box dedup (inboxStallAlertedAt) keyed by the STABLE box id — NOT the message text — so a self-induced backlog count
+  // does NOT bypass dedup (F40-5): at most one alert per box per SWARM_NOTIFY_DEDUP_MS, then a bounded reminder. The coordinator
+  // box is NOT excluded (that would hide real business mail stranded in it); it just gets the same bounded treatment.
+  const inboxStallAlertedAt = new Map<string, number>(); // boxKey -> last-alerted ms
   const runInboxSentinel = (): void => {
     try {
       const stats = scanInboxes(HOME);
@@ -1058,19 +1060,23 @@ async function main(): Promise<void> {
         const pid = io.readPid(sid);
         if (pid === null || io.procAlive(pid) !== "alive") continue; // only a LIVE presence session owns (drains) a box
         owned.add(inboxDirName(sid));
-        // Mirror core's inboxKeys() EXACTLY: a live session also drains its prior-identity boxes. Use the session's real
-        // tool/cwd (from whois) so the ownership criterion matches the real drain set and can't falsely suppress a stall.
+        // Mirror core's inboxKeys() legacy set, using the session's REAL tool/cwd. F40-4: only a whois SINGLE entity gives a
+        // trustworthy tool/cwd; for candidates/pid/not-seen we must NOT fall back to empty (wildcard) metadata — that would
+        // over-credit ownership and SUPPRESS a real stall core would actually refuse to drain. When unprovable, credit ONLY
+        // the direct sid (under-credit ⇒ a safe false alert the coordinator checks, never a silently-suppressed stall).
         const w = whois(proj, sid);
-        const ent = w.kind === "entity" ? w.entity : undefined;
-        for (const k of legacyInboxKeys(proj, { id: sid, stableId: sid, title: "", tool: ent?.tool ?? "", cwd: ent?.cwd ?? "", pid: 0 })) owned.add(inboxDirName(k));
+        if (w.kind !== "entity") continue; // ambiguous/unknown identity ⇒ no legacy expansion (direct sid already credited)
+        for (const k of legacyInboxKeys(proj, { id: sid, stableId: sid, title: "", tool: w.entity.tool ?? "", cwd: w.entity.cwd ?? "", pid: 0 })) owned.add(inboxDirName(k));
       }
-      // Stable text (no growing age) so notifyCoordinator's dedup suppresses per-tick spam; a persistent stall re-surfaces
-      // once the dedup window (SWARM_NOTIFY_DEDUP_MS) elapses, and a growing backlog (new count) re-alerts immediately.
+      const now = Date.now();
+      for (const [k, t] of inboxStallAlertedAt) if (now - t >= NOTIFY_DEDUP_MS) inboxStallAlertedAt.delete(k); // bound the map
       const thMin = Math.floor(INBOX_STALL_SEC / 60);
       for (const a of detectStalledInboxes(stats, (key) => owned.has(key), INBOX_STALL_SEC, nowSec())) {
+        if ((inboxStallAlertedAt.get(a.key) ?? -Infinity) > now - NOTIFY_DEDUP_MS) continue; // already alerted this box this window
+        inboxStallAlertedAt.set(a.key, now);
         notifyCoordinator(
           `[inbox-sentinel] STALL: inbox ${a.key} has ${a.unclaimedCount} unclaimed message(s) older than ${thMin}min and NO live session is draining it`,
-          { taskRef: `inbox:${a.key}`, title: "inbox stall" },
+          { taskRef: `inbox-stall:${a.key}`, title: "inbox stall" },
         );
       }
     } catch (e) { log(`inbox sentinel failed (isolated): ${e instanceof Error ? e.message : e}`); }

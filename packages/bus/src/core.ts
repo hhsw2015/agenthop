@@ -8,7 +8,7 @@ import { dedupLocalPeers, resolvePeer, type UnifiedPeer, type ResolveError } fro
 import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
-import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys } from "./bus-identity.js";
+import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
 import { resolveInboxTarget } from "./send-fallback.js";
 import { resolveSession, listSessions } from "./swarm/task-liveness.js";
@@ -79,9 +79,19 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // doesn't strand earlier mail in a box the new inboxKey() never looks at. Recomputed at startup + on each identity change;
   // fail-soft (the current-identity keys always work on their own — legacy is a recovery safety net, never a dependency).
   let legacyKeys: string[] = [];
-  const refreshLegacyKeys = (): void => {
-    try { const lg = readIdentityLog(home); legacyKeys = legacyInboxKeys(buildProjection(lg.events, lg.corruption), self); }
-    catch { /* best-effort: never block the bus on an alias-log read/fold */ }
+  // F40-2: recompute BEFORE each claim (flush/recv), not only on identity change — an alias-log correction/revoke (or a new
+  // same-native link) appended by ANY party must take effect without this session restarting or changing its own identity.
+  // Stamp-gated so the fold is skipped when the log is unchanged (the common idle case); `force` bypasses it when self's own
+  // identity just changed (the native the keys depend on moved).
+  let legacyStamp = "\u0000"; // sentinel ≠ a real stamp ("" means missing) so the first refresh always folds
+  const refreshLegacyKeys = (force = false): void => {
+    try {
+      const stamp = identityLogStamp(home);
+      if (!force && stamp === legacyStamp) return; // alias-log unchanged since the last fold ⇒ reuse cached keys (cheap path)
+      legacyStamp = stamp;
+      const lg = readIdentityLog(home);
+      legacyKeys = legacyInboxKeys(buildProjection(lg.events, lg.corruption), self);
+    } catch { /* best-effort: never block the bus on an alias-log read/fold */ }
   };
   const inboxKeys = (): string[] => {
     const out = self.stableId && self.stableId !== self.id ? [self.stableId, self.id] : [self.id];
@@ -135,6 +145,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     if (flushing) return;
     flushing = true;
     try {
+      refreshLegacyKeys(); // F40-2: pick up an alias-log revoke/new-link before this claim (stamp-gated — cheap when unchanged)
       // Recover claims a dead/previous run left behind, for the CURRENT identity's keys. Crucial after a LATE identity
       // adoption (Codex learns its native id only after its first turn): a message orphaned as `.json.claim-<oldpid>`
       // under the just-adopted stableId would otherwise never be reclaimed (claimInbox only sees `.json`), staying stuck
@@ -272,14 +283,14 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // so the session is durably addressable — the earlier provisional per-run line is superseded (idempotent at the coordinator
     // by sid). Gated on SWARM_COORDINATOR, never to self, fail-soft (reportCheckIn). Retain a retry obligation on a transient miss (B5).
     checkInPending = reportCheckIn(home, self, process.env.SWARM_COORDINATOR) === "retry";
-    refreshLegacyKeys(); // F40: a newly-adopted native may reveal more prior-identity boxes to drain (e.g. a Codex thread switch)
+    refreshLegacyKeys(true); // F40: self's native just changed ⇒ force a recompute (the keys depend on self.stableId, not only the log)
   };
 
   const relay: Relay | undefined = startRelay(self, (from, text) => handleInbound(from, text, "relay"), options);
   // Record one self-observe to the alias-log at startup (run/handle/native[hard|possible by authority]/busPid/hostPid) so
   // whois can resolve this session + probe its liveness. Append-only, fails soft; only on identity change thereafter (learn).
   recordSelfObserve(home, self, stableIdAuthoritative, "local");
-  refreshLegacyKeys(); // F40: discover prior-identity inbox boxes of this logical session NOW (before watchInbox/flush below)
+  refreshLegacyKeys(true); // F40: discover prior-identity inbox boxes of this logical session NOW (before watchInbox/flush below)
 
   const unified = (): UnifiedPeer[] => {
     // Collapse this machine's duplicate nodes for ONE session (startup presence daemon + lazily-spawned MCP node share
@@ -430,6 +441,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     async recv(timeoutMs) {
       // Explicit pull: drain the DURABLE inbox (messages the push channel could not surface). Claim+ack so the retry
       // timer never re-delivers the same message.
+      refreshLegacyKeys(); // F40-2: use CURRENT alias-log evidence for this drain (a revoked legacy link must not be claimed)
       const deadline = Date.now() + timeoutMs;
       const drain = (): BusMessage[] =>
         claimInbox(home, inboxKeys(), String(process.pid), stuckPoison).map((c) => {
