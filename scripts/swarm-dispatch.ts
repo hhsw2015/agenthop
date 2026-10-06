@@ -35,7 +35,7 @@ import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/ta
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
 import { taskPass, buildSched, physicalSlotsOccupied, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
 import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
-import { boardAdmitEnabled, planBoardWrites, postedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
+import { boardAdmitEnabled, planBoardWrites, postedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
@@ -462,7 +462,11 @@ async function startTaskIO(a: { assignment: Assignment; launchId: string }): Pro
 // NOT reset it (fe0376cd T1 review A / T2 review #1). Write-once per jobId; later reads return the original epoch.
 function jobStartSec(jobId: string): number {
   const dir = path.join(HOME, ".agenthop", "swarm", "jobs");
-  const file = path.join(dir, `${jobId}.started`);
+  // Path-boundary safety (BA2a defense-in-depth): a jobId can arrive from an untrusted board-claim body. Never concatenate a
+  // raw jobId containing a path separator into a filename — encode it to a single safe segment. Plain identifiers are left
+  // as-is (backward-compatible with existing <jobId>.started files; board claims are already identifier-validated upstream).
+  const safe = /[/\\]/.test(jobId) ? encodeURIComponent(jobId) : jobId;
+  const file = path.join(dir, `${safe}.started`);
   try { const v = Number(readFileSync(file, "utf8").trim()); if (Number.isFinite(v) && v > 0) return v; } catch { /* first run */ }
   const now = nowSec();
   mkdirSync(dir, { recursive: true });
@@ -802,8 +806,11 @@ async function main(): Promise<void> {
         return { file: f, body };
       });
       const { post, reap } = planBoardWrites(ready, cur, existing, { postedBy: SELF, nowSec: nowSec() });
-      for (const item of post) atomicWrite(path.join(BOARD_DIR, postedFileName(item.itemId)), JSON.stringify(item));
+      // Reap BEFORE post (BA8a): a stale-revision refresh overwrites the posted file in place via atomicWrite, so post must run
+      // AFTER any unlink — never write the fresh item and then delete it. (planBoardWrites keeps the two sets path-disjoint,
+      // but ordering reap-first is the robust guarantee.)
       for (const f of reap) { try { unlinkSync(path.join(BOARD_DIR, f)); } catch { /* raced away — fine */ } }
+      for (const item of post) atomicWrite(path.join(BOARD_DIR, postedFileName(item.itemId)), JSON.stringify(item));
       if (post.length || reap.length) log(`board producer: posted ${post.length}, reaped ${reap.length} stale`);
     } catch (e) { log(`board producer failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
@@ -853,6 +860,9 @@ async function main(): Promise<void> {
         let app: ClaimApplication | null = null;
         try { app = parseClaimApplication(JSON.parse(readFileSync(claimFile, "utf8")), claim.who); } catch { app = null; }
         if (app === null) { rejectClaim(claim, "unreadable or malformed claim body"); continue; }
+        // BA2b: bind the file NAME to the body identity — a claim whose filename says one (job,node) but whose body is another's
+        // valid entry must not be admitted under the filename's key. (Also keeps the granted/receipt rename on the right item.)
+        if (claim.itemId !== boardItemId(app.jobId, app.nodeId)) { rejectClaim(claim, `claim filename does not match body identity (${claim.itemId} vs ${boardItemId(app.jobId, app.nodeId)})`); continue; }
         // BA6: free GLOBAL physical capacity, recomputed from the just-loaded state (a same-tick prior grant is already durable).
         const freeSlots = Math.max(0, CAP - physicalSlotsOccupied(state, nowSec()));
         const verdict = planClaimAdmission(state, app, {

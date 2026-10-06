@@ -18,9 +18,12 @@
  * job's attempts; (BA2) the claim FILE BODY is untrusted — its jobId/nodeId/specDigest/inputBindingDigest are validated
  * against the current plan and a requiresApproval flag is honored; (BA6) capacity (free physical slots) gates a grant;
  * (BA7) the current-generation LIVE attempt's owner — not the first historical grant — decides reconcile-vs-reject. Board
- * keys are JOB-NAMESPACED (`<jobId>__<nodeId>`, v2 since 3fda743) so two jobs' same nodeId never collide on the shared board
- * and a producer only reaps its own job's posts (BA4). BA9 (posted-but-unclaimed supervision) is DEFERRED under coordinator
- * ruling #R14 — a hard precondition before SWARM_BOARD_ADMIT is ever flipped on (tracked with envelope-open + §2d-c ping).
+ * keys are JOB-NAMESPACED + INJECTIVELY encoded (`<len>-<jobId>-<nodeId>`, v3) so two different (job,node) pairs never collide
+ * on the shared board, and a producer judges ownership from the item BODY + a filename↔body binding — never a string prefix
+ * (BA4). The claim body's jobId/nodeId are validated as path-safe identifiers before any path is built from them (BA2), and a
+ * reconcile must match the committed grant's INPUT identity, not just its owner (BA2c). BA9 (posted-but-unclaimed supervision)
+ * is DEFERRED under coordinator ruling #R14 — a hard precondition before SWARM_BOARD_ADMIT is ever flipped on (tracked with
+ * envelope-open + §2d-c ping).
  */
 import type { TaskPlan } from "./task-plan.js";
 import { readyTasks, type ReadyTask } from "./task-ready.js";
@@ -34,11 +37,14 @@ import { currentPlan } from "./liveness-review.js";
 /** An attempt holds no current execution once terminal — BA7 uses this to pick the CURRENT-generation attempt for a node. */
 const TERMINAL_ATTEMPT: ReadonlySet<TaskAttempt["status"]> = new Set(["SUCCEEDED", "FAILED", "ABANDONED"]);
 
-/** The board identity for a plan node, JOB-NAMESPACED (v2): `<jobId>__<nodeId>`. Two jobs' same nodeId must not collide on
- *  the ONE shared board dir, and a producer must be able to tell its own posts from another job's (BA4). `__` is dot/slash/
- *  whitespace-free so it survives isValidItemId + the `.`-separated file-name convention. The nodeId/jobId also live in the
- *  item body, so the consumer never has to split this back apart. */
-export function boardItemId(jobId: string, nodeId: string): string { return `${jobId}__${nodeId}`; }
+/** The board identity for a plan node, JOB-NAMESPACED and INJECTIVELY encoded (v3): `<len(jobId)>-<jobId>-<nodeId>`. The
+ *  length prefix makes the (jobId,nodeId) → key mapping injective even though both may contain the separator characters — so
+ *  two DIFFERENT (job,node) pairs can never collide on the ONE shared board dir (BA4: `A/B__C` vs `A__B/C` both mapped to
+ *  `A__B__C` under the v2 `__` form). Ownership is judged from the item BODY (jobId) plus a filename↔body binding, never a
+ *  string prefix. Still dot/slash/whitespace-free (jobId/nodeId are validated identifiers) so it survives isValidItemId + the
+ *  `.`-separated file-name convention. The nodeId/jobId also live in the body, so the key is only ever ENCODED + COMPARED,
+ *  never decoded. */
+export function boardItemId(jobId: string, nodeId: string): string { return `${jobId.length}-${jobId}-${nodeId}`; }
 
 /** The lifecycle states a board item's FILE NAME encodes. `posted` = `<itemId>.json` (unclaimed); the rest are
  *  `<itemId>.<state>.<who>.json`. `claimed` is a RESERVATION application (not authority); `granted`/`rejected` are the
@@ -105,16 +111,20 @@ export type ExistingBoardFile = { file: string; body: BoardItem | null };
  *    - a posted file whose node is no longer ready ⇒ reap (push-dispatched / completed / deps changed).
  *  The caller performs the thin IO (atomic-write `post`, unlink `reap`). Pure ⇒ unit-tested. */
 export function planBoardWrites(ready: readonly ReadyTask[], plan: TaskPlan, existing: readonly ExistingBoardFile[], opts: { postedBy: string; nowSec: number }): { post: BoardItem[]; reap: string[] } {
-  const jobPrefix = `${plan.jobId}__`;
   const readyIds = new Set(ready.map((r) => boardItemId(plan.jobId, r.nodeId)));
   const posted = new Map<string, ExistingBoardFile>();  // itemId -> posted (unclaimed) file, MY job only
-  const active = new Set<string>();                      // itemIds claimed/granted (in-flight) — skip, never reap
-  const rejected = new Map<string, string>();           // itemId -> terminal rejected file name — does NOT block re-post (BA8a)
+  const claimed = new Set<string>();                    // itemIds with a PENDING application in-flight — don't double-post
+  const granted = new Map<string, string>();            // itemId -> granted file name (admitted; stale IFF the node is READY)
+  const rejected = new Map<string, string>();           // itemId -> terminal rejected file name — does NOT block re-post
   for (const e of existing) {
     const p = parseBoardItemName(e.file);
-    if (p === null || !p.itemId.startsWith(jobPrefix)) continue; // other job / unparseable ⇒ leave it ENTIRELY alone (BA4)
+    if (p === null) continue;
+    // BA4: ownership by the item BODY (jobId) + a filename↔body binding — NOT a string prefix (the key is not prefix-injective).
+    // A file whose body is unreadable, names another job, or whose name does not match its own body identity is left ALONE.
+    if (e.body === null || e.body.jobId !== plan.jobId || p.itemId !== boardItemId(e.body.jobId, e.body.nodeId)) continue;
     if (p.state === "posted") posted.set(p.itemId, e);
-    else if (p.state === "claimed" || p.state === "granted") active.add(p.itemId);
+    else if (p.state === "claimed") claimed.add(p.itemId);
+    else if (p.state === "granted") granted.set(p.itemId, e.file);
     else if (p.state === "rejected") rejected.set(p.itemId, e.file);
     // done ⇒ terminal; a done node is not READY, so it never reaches the post loop anyway
   }
@@ -123,14 +133,13 @@ export function planBoardWrites(ready: readonly ReadyTask[], plan: TaskPlan, exi
   for (const item of boardItemsToPost(ready, plan, opts)) {
     if (!isValidItemId(item.itemId)) continue;
     const pf = posted.get(item.itemId);
-    if (pf !== undefined) {
-      if (pf.body !== null && pf.body.specDigest === item.specDigest && pf.body.inputBindingDigest === item.inputBindingDigest) continue; // fresh ⇒ idempotent
-      reap.push(pf.file); post.push(item); // BA8b: stale revision ⇒ replace content
-      continue;
-    }
-    if (active.has(item.itemId)) continue;            // claimed/granted in-flight
-    const rej = rejected.get(item.itemId);
-    if (rej !== undefined) reap.push(rej);            // BA8a: clear the stale rejection as we re-post
+    if (pf !== undefined && pf.body !== null && pf.body.specDigest === item.specDigest && pf.body.inputBindingDigest === item.inputBindingDigest) continue; // fresh posted ⇒ idempotent
+    if (claimed.has(item.itemId)) continue; // a pending application is in-flight ⇒ don't double-post (admission will resolve it)
+    // Post — a NEW item, or OVERWRITE a stale-revision posted file IN PLACE (same path ⇒ atomicWrite overwrites, no reap, BA8a).
+    // A granted/rejected file for a node that is READY is STALE: ready ⟹ no live attempt ⟹ the grant was revoked / the
+    // rejection is moot ⟹ clear it so the fresh READY identity can be posted (BA8b / BA8a).
+    const g = granted.get(item.itemId); if (g !== undefined) reap.push(g);
+    const rj = rejected.get(item.itemId); if (rj !== undefined) reap.push(rj);
     post.push(item);
   }
   const slated = new Set(reap);
@@ -178,12 +187,14 @@ export type AdmissionParams = {
 export type ClaimApplication = { who: string; jobId: string; nodeId: string; specDigest: string; inputBindingDigest: string; requiresApproval?: boolean };
 
 /** Validate + narrow an untrusted claim-file body into a ClaimApplication (BA2: the body is attacker-controllable — a member
- *  may write any file into the shared board dir). null ⇒ unreadable/malformed ⇒ the shell rejects the claim. */
+ *  may write any file into the shared board dir). jobId/nodeId MUST be path-safe identifiers (no `.`/`/`/whitespace) — the
+ *  shell builds filesystem paths from the jobId (the job clock), so an unvalidated `../../x` would traverse (BA2a). null ⇒
+ *  unreadable / malformed / unsafe ⇒ the shell rejects the claim before any path is built from it. */
 export function parseClaimApplication(body: unknown, who: string): ClaimApplication | null {
   if (typeof body !== "object" || body === null) return null;
   const b = body as Record<string, unknown>;
   if (typeof b.jobId !== "string" || typeof b.nodeId !== "string" || typeof b.specDigest !== "string" || typeof b.inputBindingDigest !== "string") return null;
-  if (!b.jobId || !b.nodeId) return null;
+  if (!isValidItemId(b.jobId) || !isValidItemId(b.nodeId)) return null; // path-safe + convention-safe identifiers (BA2a)
   return { who, jobId: b.jobId, nodeId: b.nodeId, specDigest: b.specDigest, inputBindingDigest: b.inputBindingDigest, ...(b.requiresApproval === true ? { requiresApproval: true } : {}) };
 }
 
@@ -234,7 +245,13 @@ export function planClaimAdmission(state: LogState, claim: ClaimApplication, par
     const live = attempts.find((a) => a.nodeId === claim.nodeId && !TERMINAL_ATTEMPT.has(a.status));
     if (live !== undefined) {
       const w = findWait(state, grantWaitId(live.attemptId));
-      if (w !== undefined) return w.owner === claim.who ? { verdict: "reconcile", attemptId: live.attemptId } : { verdict: "reject", reason: `already granted to ${w.owner}` };
+      if (w !== undefined) {
+        if (w.owner !== claim.who) return { verdict: "reject", reason: `already granted to ${w.owner}` };
+        // BA2c: a reconcile is a recovery of THIS member's OWN prior grant — it must match the committed grant's input identity,
+        // not just the owner. A same-owner claim carrying a different inputBindingDigest is a different (stale) application.
+        if (live.inputBindingDigest !== claim.inputBindingDigest) return { verdict: "reject", reason: `input drifted vs committed grant (claim ${claim.inputBindingDigest} vs attempt ${live.inputBindingDigest})` };
+        return { verdict: "reconcile", attemptId: live.attemptId };
+      }
     }
     return { verdict: "reject", reason: "node no longer admittable (already dispatched / completed / deps or budget changed)" };
   }
