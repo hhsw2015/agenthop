@@ -35,14 +35,17 @@ describe("task-board boardItemsToPost + boardItemId (§2d-a curate: ready nodes 
     expect(items[1]!.fitProfile).toBeUndefined(); // no roleProfile ⇒ omitted
     expect(items[1]!.priority).toBeUndefined();   // no TaskSpec source ⇒ absent
   });
-  test("BA4: the key is INJECTIVE and FILESYSTEM-SAFE (distinct under case-fold + Unicode normalization)", () => {
-    expect(boardItemId("A", "B__C")).not.toBe(boardItemId("A__B", "C")); // v2 `__` form collided; v3 len-prefix fixed strings
-    expect(isValidItemId(boardItemId("J", "build-a"))).toBe(true);       // hex + `-` ⇒ no ./ /whitespace
-    // v4: keys must stay distinct after the folding a real case-insensitive / Unicode-normalizing filesystem applies.
+  test("BA4: the key is INJECTIVE, FILESYSTEM-SAFE, and BOUNDED (v5 SHA-256)", () => {
+    expect(boardItemId("A", "B__C")).not.toBe(boardItemId("A__B", "C")); // length-prefixed preimage => no collision
+    expect(isValidItemId(boardItemId("J", "build-a"))).toBe(true);       // 64-hex => no ./ /whitespace
     const fold = (s: string) => s.normalize("NFC").toLowerCase();
-    expect(fold(boardItemId("A", "build"))).not.toBe(fold(boardItemId("a", "build")));         // case-insensitive FS (jobs A vs a)
-    expect(fold(boardItemId("J", "\u00e9"))).not.toBe(fold(boardItemId("J", "e\u0301"))); // NFC é vs NFD e+combining (same job)
-    expect(/^[0-9a-f]+-[0-9a-f]+$/.test(boardItemId("A", "build"))).toBe(true);                 // single-case pure-ASCII hex
+    expect(fold(boardItemId("A", "build"))).not.toBe(fold(boardItemId("a", "build")));   // case-insensitive FS (jobs A vs a)
+    expect(fold(boardItemId("J", "\u00e9"))).not.toBe(fold(boardItemId("J", "e\u0301"))); // NFC é vs NFD e+combining
+    expect(/^[0-9a-f]{64}$/.test(boardItemId("A", "build"))).toBe(true);                  // single-case ASCII hex, constant 64
+    // BA4/P2b: the key is BOUNDED - a long identity no longer grows the on-disk name into ENAMETOOLONG territory.
+    expect(boardItemId("x".repeat(500), "y".repeat(500)).length).toBe(64);
+    const claimed = claimedFileName(boardItemId("u".repeat(36), "n".repeat(67)), "w".repeat(36));
+    expect(Buffer.byteLength(claimed, "utf8")).toBeLessThanOrEqual(255); // the v4 hex key overflowed here (257 bytes)
   });
   test("a ready node absent from the plan is skipped (guard)", () => {
     expect(boardItemsToPost([ready("ghost")], plan([node("a")]), { postedBy: "c", nowSec: 1 })).toEqual([]);
@@ -139,6 +142,13 @@ describe("task-board parseClaimApplication (BA2: the claim body is an untrusted 
     expect(parseClaimApplication({ jobId: "J", nodeId: "a/b", specDigest: "s", inputBindingDigest: "i" }, "w1")).toBeNull();
     expect(parseClaimApplication({ jobId: "", nodeId: "a", specDigest: "s", inputBindingDigest: "i" }, "w1")).toBeNull();
     expect(parseClaimApplication({ jobId: "a b", nodeId: "a", specDigest: "s", inputBindingDigest: "i" }, "w1")).toBeNull();
+  });
+  test("BA4/P2a: an ill-formed UTF-16 identifier (lone surrogate) is rejected so it cannot alias an accepted identity", () => {
+    // A lone surrogate U+D800 encodes to the same UTF-8 bytes (U+FFFD) as the accepted replacement char — rejecting it at the
+    // boundary prevents two distinct accepted identities from keying onto the same board file.
+    expect(parseClaimApplication({ jobId: "\uD800", nodeId: "build", specDigest: "s", inputBindingDigest: "i" }, "w1")).toBeNull();
+    expect(parseClaimApplication({ jobId: "J", nodeId: "a\uDC00b", specDigest: "s", inputBindingDigest: "i" }, "w1")).toBeNull();
+    expect(parseClaimApplication({ jobId: "\uFFFD", nodeId: "build", specDigest: "s", inputBindingDigest: "i" }, "w1")).not.toBeNull(); // the real replacement char is well-formed ⇒ allowed
   });
 });
 

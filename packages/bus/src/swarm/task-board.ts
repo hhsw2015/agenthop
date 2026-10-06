@@ -18,9 +18,12 @@
  * job's attempts; (BA2) the claim FILE BODY is untrusted — its jobId/nodeId/specDigest/inputBindingDigest are validated
  * against the current plan and a requiresApproval flag is honored; (BA6) capacity (free physical slots) gates a grant;
  * (BA7) the current-generation LIVE attempt's owner — not the first historical grant — decides reconcile-vs-reject. Board
- * keys are JOB-NAMESPACED + hex-encoded (`<hex(jobId)>-<hex(nodeId)>`, v4) so two different (job,node) pairs never collide on
- * the shared board even under a case-insensitive / Unicode-normalizing filesystem, and a producer judges ownership from the
- * item BODY + a filename↔body binding — never a string prefix
+ * keys are JOB-NAMESPACED + hashed to a BOUNDED, filesystem-safe form (SHA-256 hex of a length-prefixed `jobId`/`nodeId`,
+ * v5) so two different (job,node) pairs never collide on the shared board even under a case-insensitive / Unicode-normalizing
+ * filesystem, AND the on-disk file name stays a constant 64 hex chars regardless of identifier length — so a long identity can
+ * never produce a state file name that overflows NAME_MAX and becomes unclaimable (BA4/P2b). Identity components are rejected
+ * at the board boundary unless they are well-formed UTF-8 (a lone surrogate would be lossily folded by the encoder, BA4/P2a).
+ * A producer judges ownership from the item BODY + a filename↔body binding — never a string prefix
  * (BA4). The claim body's jobId/nodeId are validated as path-safe identifiers before any path is built from them (BA2), and a
  * reconcile must match the committed grant's INPUT identity, not just its owner (BA2c). BA9 (posted-but-unclaimed supervision)
  * is DEFERRED under coordinator ruling #R14 — a hard precondition before SWARM_BOARD_ADMIT is ever flipped on (tracked with
@@ -34,20 +37,33 @@ import { openWait } from "./task-wait.js";
 import { buildSched } from "./task-pass.js";
 import { prepareDispatch, type DispatchParams } from "./task-dispatch.js";
 import { currentPlan } from "./liveness-review.js";
+import { createHash } from "node:crypto";
 
 /** An attempt holds no current execution once terminal — BA7 uses this to pick the CURRENT-generation attempt for a node. */
 const TERMINAL_ATTEMPT: ReadonlySet<TaskAttempt["status"]> = new Set(["SUCCEEDED", "FAILED", "ABANDONED"]);
 
-/** The board identity for a plan node, JOB-NAMESPACED and encoded so it is injective ON THE REAL FILESYSTEM (v4): the UTF-8
- *  bytes of jobId and nodeId are hex-encoded and joined with `-`. A merely string-injective key (the v3 length-prefix form)
- *  was NOT enough — a case-insensitive or Unicode-normalizing filesystem (e.g. default macOS APFS) folds distinct string keys
- *  onto ONE file (BA4: jobs `A` vs `a`, or NFC `é` vs NFD `é`, would overwrite each other). Lowercase hex is single-case,
- *  pure-ASCII and normalization-stable, so two keys are equal as strings IFF they map to the same on-disk file; `-` is an
- *  unambiguous separator (hex has no `-`) so the whole encoding stays injective. Ownership is judged from the item BODY
- *  (jobId) plus a filename↔body binding, never a string prefix. The key is only ever ENCODED + COMPARED, never decoded;
- *  jobId/nodeId also live in the body. */
-const hexId = (s: string): string => Buffer.from(s, "utf8").toString("hex");
-export function boardItemId(jobId: string, nodeId: string): string { return `${hexId(jobId)}-${hexId(nodeId)}`; }
+/** The board identity for a plan node (v5): the SHA-256 hex of a length-prefixed `<len(jobId)>-<jobId>-<nodeId>` preimage.
+ *  Properties that matter for the shared on-disk board:
+ *   - BOUNDED: always 64 lowercase hex chars, independent of identifier length — so `<key>.<state>.<who>.json` can never
+ *     overflow NAME_MAX and publish an item a normal member cannot atomically claim (BA4/P2b). A plain hex-of-identity (v4)
+ *     grew with the identity and did exactly that.
+ *   - FILESYSTEM-INJECTIVE: lowercase hex is single-case, pure-ASCII and Unicode-normalization-stable, so two keys are equal
+ *     as strings IFF they name the same on-disk file even on a case-insensitive / normalizing filesystem (BA4 P1). The
+ *     length-prefixed preimage is injective over the (well-formed) identity domain, and SHA-256 preserves that (collision
+ *     negligible). Callers MUST pass well-formed components (see isValidIdComponent) so the UTF-8 encoding is not lossy (P2a).
+ *  Ownership is judged from the item BODY + a filename↔body binding, never a string prefix. The key is only ENCODED + COMPARED,
+ *  never decoded; jobId/nodeId also live in the body. */
+export function boardItemId(jobId: string, nodeId: string): string {
+  return createHash("sha256").update(`${jobId.length}-${jobId}-${nodeId}`).digest("hex");
+}
+
+/** A board identity component (jobId / nodeId) is admissible onto the board only if it is a convention- + path-safe identifier
+ *  (no `.`/`/`/whitespace — see isValidItemId) AND well-formed UTF-8. The key encoder hashes the UTF-8 bytes, and Node's UTF-8
+ *  encoder folds a lone UTF-16 surrogate to U+FFFD — so an ill-formed id would silently collide with a DIFFERENT accepted id
+ *  (BA4/P2a). We reject it at the board boundary rather than key a corrupted identity. */
+function isValidIdComponent(s: string): boolean {
+  return isValidItemId(s) && Buffer.from(s, "utf8").toString("utf8") === s;
+}
 
 /** The lifecycle states a board item's FILE NAME encodes. `posted` = `<itemId>.json` (unclaimed); the rest are
  *  `<itemId>.<state>.<who>.json`. `claimed` is a RESERVATION application (not authority); `granted`/`rejected` are the
@@ -82,11 +98,13 @@ export type BoardItem = {
  *  WHICH items the current ready set wants on the board. A ready node absent from the plan is skipped (cannot happen for a
  *  readyTasks output, but guarded). */
 export function boardItemsToPost(ready: readonly ReadyTask[], plan: TaskPlan, opts: { postedBy: string; nowSec: number }): BoardItem[] {
+  if (!isValidIdComponent(plan.jobId)) return []; // a job whose id can't be safely/uniquely keyed is never put on the board (BA4/P2a)
   const specByNode = new Map(plan.nodes.map((n) => [n.nodeId, n]));
   const out: BoardItem[] = [];
   for (const r of ready) {
     const spec = specByNode.get(r.nodeId);
     if (spec === undefined) continue; // not in the plan — never happens for a readyTasks output, guarded anyway
+    if (!isValidIdComponent(spec.nodeId)) continue; // node id can't be safely/uniquely keyed (ill-formed / convention-breaking)
     const fileDomain = [...new Set([...(spec.artifactScope ?? []), ...(spec.sourceWriteScope ?? [])])];
     out.push({
       itemId: boardItemId(plan.jobId, spec.nodeId), jobId: plan.jobId, nodeId: spec.nodeId, planRevision: plan.planRevision,
@@ -197,7 +215,7 @@ export function parseClaimApplication(body: unknown, who: string): ClaimApplicat
   if (typeof body !== "object" || body === null) return null;
   const b = body as Record<string, unknown>;
   if (typeof b.jobId !== "string" || typeof b.nodeId !== "string" || typeof b.specDigest !== "string" || typeof b.inputBindingDigest !== "string") return null;
-  if (!isValidItemId(b.jobId) || !isValidItemId(b.nodeId)) return null; // path-safe + convention-safe identifiers (BA2a)
+  if (!isValidIdComponent(b.jobId) || !isValidIdComponent(b.nodeId)) return null; // path-safe + convention-safe + well-formed UTF-8 (BA2a / BA4/P2a)
   return { who, jobId: b.jobId, nodeId: b.nodeId, specDigest: b.specDigest, inputBindingDigest: b.inputBindingDigest, ...(b.requiresApproval === true ? { requiresApproval: true } : {}) };
 }
 
