@@ -35,10 +35,14 @@ describe("task-board boardItemsToPost + boardItemId (§2d-a curate: ready nodes 
     expect(items[1]!.fitProfile).toBeUndefined(); // no roleProfile ⇒ omitted
     expect(items[1]!.priority).toBeUndefined();   // no TaskSpec source ⇒ absent
   });
-  test("BA4: the key is INJECTIVE — two different (job,node) pairs never collide (the v2 `__` form did)", () => {
-    expect(boardItemId("A", "B__C")).not.toBe(boardItemId("A__B", "C")); // v2: both were "A__B__C"
-    expect(boardItemId("J", "a")).toBe("1-J-a");
-    expect(isValidItemId(boardItemId("J", "build-a"))).toBe(true);
+  test("BA4: the key is INJECTIVE and FILESYSTEM-SAFE (distinct under case-fold + Unicode normalization)", () => {
+    expect(boardItemId("A", "B__C")).not.toBe(boardItemId("A__B", "C")); // v2 `__` form collided; v3 len-prefix fixed strings
+    expect(isValidItemId(boardItemId("J", "build-a"))).toBe(true);       // hex + `-` ⇒ no ./ /whitespace
+    // v4: keys must stay distinct after the folding a real case-insensitive / Unicode-normalizing filesystem applies.
+    const fold = (s: string) => s.normalize("NFC").toLowerCase();
+    expect(fold(boardItemId("A", "build"))).not.toBe(fold(boardItemId("a", "build")));         // case-insensitive FS (jobs A vs a)
+    expect(fold(boardItemId("J", "\u00e9"))).not.toBe(fold(boardItemId("J", "e\u0301"))); // NFC é vs NFD e+combining (same job)
+    expect(/^[0-9a-f]+-[0-9a-f]+$/.test(boardItemId("A", "build"))).toBe(true);                 // single-case pure-ASCII hex
   });
   test("a ready node absent from the plan is skipped (guard)", () => {
     expect(boardItemsToPost([ready("ghost")], plan([node("a")]), { postedBy: "c", nowSec: 1 })).toEqual([]);

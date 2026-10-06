@@ -18,8 +18,9 @@
  * job's attempts; (BA2) the claim FILE BODY is untrusted — its jobId/nodeId/specDigest/inputBindingDigest are validated
  * against the current plan and a requiresApproval flag is honored; (BA6) capacity (free physical slots) gates a grant;
  * (BA7) the current-generation LIVE attempt's owner — not the first historical grant — decides reconcile-vs-reject. Board
- * keys are JOB-NAMESPACED + INJECTIVELY encoded (`<len>-<jobId>-<nodeId>`, v3) so two different (job,node) pairs never collide
- * on the shared board, and a producer judges ownership from the item BODY + a filename↔body binding — never a string prefix
+ * keys are JOB-NAMESPACED + hex-encoded (`<hex(jobId)>-<hex(nodeId)>`, v4) so two different (job,node) pairs never collide on
+ * the shared board even under a case-insensitive / Unicode-normalizing filesystem, and a producer judges ownership from the
+ * item BODY + a filename↔body binding — never a string prefix
  * (BA4). The claim body's jobId/nodeId are validated as path-safe identifiers before any path is built from them (BA2), and a
  * reconcile must match the committed grant's INPUT identity, not just its owner (BA2c). BA9 (posted-but-unclaimed supervision)
  * is DEFERRED under coordinator ruling #R14 — a hard precondition before SWARM_BOARD_ADMIT is ever flipped on (tracked with
@@ -37,14 +38,16 @@ import { currentPlan } from "./liveness-review.js";
 /** An attempt holds no current execution once terminal — BA7 uses this to pick the CURRENT-generation attempt for a node. */
 const TERMINAL_ATTEMPT: ReadonlySet<TaskAttempt["status"]> = new Set(["SUCCEEDED", "FAILED", "ABANDONED"]);
 
-/** The board identity for a plan node, JOB-NAMESPACED and INJECTIVELY encoded (v3): `<len(jobId)>-<jobId>-<nodeId>`. The
- *  length prefix makes the (jobId,nodeId) → key mapping injective even though both may contain the separator characters — so
- *  two DIFFERENT (job,node) pairs can never collide on the ONE shared board dir (BA4: `A/B__C` vs `A__B/C` both mapped to
- *  `A__B__C` under the v2 `__` form). Ownership is judged from the item BODY (jobId) plus a filename↔body binding, never a
- *  string prefix. Still dot/slash/whitespace-free (jobId/nodeId are validated identifiers) so it survives isValidItemId + the
- *  `.`-separated file-name convention. The nodeId/jobId also live in the body, so the key is only ever ENCODED + COMPARED,
- *  never decoded. */
-export function boardItemId(jobId: string, nodeId: string): string { return `${jobId.length}-${jobId}-${nodeId}`; }
+/** The board identity for a plan node, JOB-NAMESPACED and encoded so it is injective ON THE REAL FILESYSTEM (v4): the UTF-8
+ *  bytes of jobId and nodeId are hex-encoded and joined with `-`. A merely string-injective key (the v3 length-prefix form)
+ *  was NOT enough — a case-insensitive or Unicode-normalizing filesystem (e.g. default macOS APFS) folds distinct string keys
+ *  onto ONE file (BA4: jobs `A` vs `a`, or NFC `é` vs NFD `é`, would overwrite each other). Lowercase hex is single-case,
+ *  pure-ASCII and normalization-stable, so two keys are equal as strings IFF they map to the same on-disk file; `-` is an
+ *  unambiguous separator (hex has no `-`) so the whole encoding stays injective. Ownership is judged from the item BODY
+ *  (jobId) plus a filename↔body binding, never a string prefix. The key is only ever ENCODED + COMPARED, never decoded;
+ *  jobId/nodeId also live in the body. */
+const hexId = (s: string): string => Buffer.from(s, "utf8").toString("hex");
+export function boardItemId(jobId: string, nodeId: string): string { return `${hexId(jobId)}-${hexId(nodeId)}`; }
 
 /** The lifecycle states a board item's FILE NAME encodes. `posted` = `<itemId>.json` (unclaimed); the rest are
  *  `<itemId>.<state>.<who>.json`. `claimed` is a RESERVATION application (not authority); `granted`/`rejected` are the
