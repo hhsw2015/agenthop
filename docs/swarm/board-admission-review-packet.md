@@ -184,3 +184,37 @@ vs NFD é) and are single-case ASCII hex. 26 board tests; 966/966 suite; project
 
 ## Still out of scope (recorded)
 A2 execution + gate flip; §2b envelope-open; §2d-c ping; **BA9 posted-supervision (#R14, pre-flip blocker)**.
+
+---
+
+# v5 (round 5) — fix for codex re-review of 08f9d54 (0P1 + 1P2: BA4 encoding boundary)
+
+**Code frozen at** `facfaf2` (base `main=b5fde65`, branch `feat/board-admission`). Prior: `3fda743`→`fcb8834`→`b32b25e`→`08f9d54`.
+**Verdict addressed:** BA4 encoding input-domain / filename-length (P2, 2 sub-cases) FIXED. BA4 P1 + BA1/2/3/5/6/7/8 stay
+CLOSED; BA9 deferred (#R14). Gates: bus tsc 0, dispatch tsc 0, projection tsc 0, **967/967** vitest + projection selftest.
+
+## Board key v5 (BA4/P2) — ON-DISK CONVENTION CHANGE, since 08f9d54
+`boardItemId` is now the SHA-256 hex of a length-prefixed `<len(jobId)>-<jobId>-<nodeId>` preimage — a CONSTANT 64 lowercase
+hex chars. Replaces the v4 variable-length `hex(jobId)-hex(nodeId)`.
+
+- **BA4/P2b (filename length / ENAMETOOLONG)**: the v4 hex key grew with the identity, so a 36-char UUID job + 67-char node +
+  UUID claimant produced a 257-byte `<key>.claimed.<who>.json` that failed atomic rename (NAME_MAX 255) — an item the
+  producer published but no normal member could claim. The bounded 64-char key keeps the full state file name well under
+  NAME_MAX for any identity length + a normal member id (test: 36-char job + 67-char node + 36-char who ⇒ ≤255).
+- **BA4/P2a (ill-formed UTF-16)**: identity components must be well-formed UTF-8 (`isValidIdComponent` = isValidItemId AND a
+  UTF-8 round-trip). A lone surrogate (U+D800) folds to U+FFFD under the encoder and would alias a distinct accepted identity;
+  it is now rejected at BOTH board entries — `parseClaimApplication` (consumer) and `boardItemsToPost` (producer skips the
+  node, or the whole job if its id is ill-formed). The genuine replacement char U+FFFD is well-formed ⇒ still allowed.
+
+The v4 filesystem-injectivity (BA4 P1: `A` vs `a`, NFC vs NFD) is preserved — the length-prefixed preimage is injective over
+well-formed ids, SHA-256 keeps it collision-free, lowercase hex stays single-case ASCII. Ownership + filename↔body checks are
+unchanged (recompute `boardItemId`).
+
+## New / changed tests
+boardItemId: 64-hex bounded key (long identity ⇒ still 64; claimed filename for UUID-job/67-node/UUID-who ≤255 bytes) +
+NFC/NFD + case-fold distinctness. parseClaimApplication: lone-surrogate jobId/nodeId rejected, genuine U+FFFD allowed. 27
+board tests; 967/967 suite; projection selftest green.
+
+## Still out of scope (recorded)
+A2 execution + gate flip; §2b envelope-open; §2d-c ping; **BA9 posted-supervision (#R14, pre-flip blocker)**. Hex filenames
+remain a non-blocking cosmetic (body carries readable jobId/nodeId; viz follow-up).
