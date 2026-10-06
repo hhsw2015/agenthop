@@ -33,9 +33,9 @@ import { entityKeyOf, type Change, type ChangeBody, type CommitResult, type LogS
 import { loadPlan, type TaskPlan, type TaskSpec } from "../packages/bus/src/swarm/task-plan.js";
 import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/task-state.js";
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
-import { taskPass, buildSched, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
+import { taskPass, buildSched, physicalSlotsOccupied, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
 import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
-import { boardAdmitEnabled, planBoardWrites, postedFileName, planClaimAdmission, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName } from "../packages/bus/src/swarm/task-board.js";
+import { boardAdmitEnabled, planBoardWrites, postedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
@@ -44,7 +44,7 @@ import { validSeedWait } from "../packages/bus/src/swarm/wait-seed.js";
 import { runDispatchLoops } from "../packages/bus/src/swarm/dispatch-loops.js";
 import { writeProjection } from "../packages/bus/src/swarm/projection.js";
 import { beatStart, beatEnd } from "../packages/bus/src/swarm/heartbeat.js";
-import { buildControlCut, heartbeatObservations } from "../packages/bus/src/swarm/liveness-review.js";
+import { buildControlCut, heartbeatObservations, currentPlan } from "../packages/bus/src/swarm/liveness-review.js";
 import { assertLiveness, type LivenessVerdict, type ControlCut, type ObservationFact } from "../packages/bus/src/swarm/task-liveness-inv1.js";
 import { reconcileIncident, reconcileIncidentCore, reconcileRegistryWithControl, readIncidents, writeIncidents, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
 import { isRepairWaitId, repairEpisodeOf, repairGroupKeyOf } from "../packages/bus/src/swarm/repair-wait-id.js";
@@ -785,11 +785,23 @@ async function main(): Promise<void> {
     if (!plan || !boardAdmitEnabled()) return;
     try {
       const state = loadControlLog(CONTROL_LOG_DIR);
-      const sched = buildSched(plan, state);
-      const usage = { totalAttempts: sched.attempts.length, wallClockSec: Math.max(0, nowSec() - jobStartSec(plan.jobId)) };
-      const ready = readyTasks({ ...sched, now: nowSec(), jobUsage: usage });
+      // BA1: post from the job's AUTHORITATIVE plan in the current CONTROL (fall back to the startup copy only before the
+      // PlanPut lands). BA3: isolate the ready computation to THIS job's attempts/accepted.
+      const cur = currentPlan(state, plan.jobId) ?? plan;
+      const all = buildSched(cur, state);
+      const attempts = all.attempts.filter((a) => a.jobId === cur.jobId);
+      const acceptedResults = all.acceptedResults.filter((r) => r.jobId === cur.jobId);
+      const usage = { totalAttempts: attempts.length, wallClockSec: Math.max(0, nowSec() - jobStartSec(cur.jobId)) };
+      const ready = readyTasks({ plan: cur, attempts, acceptedResults, now: nowSec(), jobUsage: usage });
       mkdirSync(BOARD_DIR, { recursive: true });
-      const { post, reap } = planBoardWrites(ready, plan, readdirSync(BOARD_DIR), { postedBy: SELF, nowSec: nowSec() });
+      // Read each existing board file's body so the producer can refresh a stale-revision post (BA8b) and tell its own job's
+      // entries from another job's (BA4). Unreadable ⇒ body null.
+      const existing: ExistingBoardFile[] = readdirSync(BOARD_DIR).map((f) => {
+        let body: ExistingBoardFile["body"] = null;
+        try { body = JSON.parse(readFileSync(path.join(BOARD_DIR, f), "utf8")); } catch { /* unreadable ⇒ null */ }
+        return { file: f, body };
+      });
+      const { post, reap } = planBoardWrites(ready, cur, existing, { postedBy: SELF, nowSec: nowSec() });
       for (const item of post) atomicWrite(path.join(BOARD_DIR, postedFileName(item.itemId)), JSON.stringify(item));
       for (const f of reap) { try { unlinkSync(path.join(BOARD_DIR, f)); } catch { /* raced away — fine */ } }
       if (post.length || reap.length) log(`board producer: posted ${post.length}, reaped ${reap.length} stale`);
@@ -806,15 +818,28 @@ async function main(): Promise<void> {
     log(`board admission: rejected ${claim.itemId} (${claim.who}): ${reason}`);
   };
 
-  // §2d-b admission CONSUMER (board admission 5/n): a claim (`<item>.claimed.<who>.json`) is a RESERVATION APPLICATION, not
-  // authority. Each tick, re-run admission on the CURRENT CONTROL via prepareDispatch (spec/inputs at the current revision,
-  // deps accepted, §3.1 node single-active, token/budget) → GRANT (commit intent+attempt(+retired)+a BUSINESS_EXEC supervision
-  // wait via buildGrantBodies, write a receipt, mark the item granted) or REJECT (mark + reason). DORMANT: runs only under
-  // SWARM_BOARD_ADMIT (boundary #1/#2 — gate off ⇒ no claims processed, no CONTROL commit). NO startTask — a grant admits, it
-  // does not execute (boundary #3; A2 wires execution). The board is an application queue + projection, never a 2nd ledger:
-  // a grant whose commit fails/crashes leaves the claim in place to be RE-REVIEWED next tick; a claim whose node was already
-  // granted (commit ok but the rename was lost) is reconciled to granted, not re-granted; a claim whose node is no longer
-  // admittable is rejected. Fail-soft, per-claim isolated.
+  // §2d-b GRANT delivery (BA5 — receipt-first, at-least-once): the CONTROL grant is already durable. Deliver the receipt to
+  // the applicant, and mark the board item `granted` ONLY once the receipt is written. If the receipt write fails, LEAVE the
+  // claim as claimed — next tick's reconcile re-enters here and retries, so the receipt obligation is never silently dropped.
+  // A benign duplicate receipt is acceptable; a lost one is not. NO execution side-effect (boundary #3 — A2 wires startTask).
+  const deliverGrantAndMark = (claim: { itemId: string; who: string }, grant: { attemptId: string; waitId: string; bindingId?: string }): void => {
+    const claimFile = path.join(BOARD_DIR, claimedFileName(claim.itemId, claim.who));
+    const grantedFile = path.join(BOARD_DIR, grantedFileName(claim.itemId, claim.who));
+    const bindingNote = grant.bindingId ? ` (binding ${grant.bindingId})` : "";
+    try { writeInbox(HOME, claim.who, { from: SELF, fromLabel: "swarm-admission", text: `[admission] granted ${claim.itemId} → attempt ${grant.attemptId}${bindingNote}; supervision wait ${grant.waitId} open. DO NOT begin execution — A2 (real dispatch/V8) is not wired yet.`, via: "local", ts: Date.now() }); }
+    catch (e) { log(`board admission ${claim.itemId}: receipt write failed (grant committed) — claim kept, retry next tick: ${e instanceof Error ? e.message : e}`); return; } // BA5: do NOT mark granted until the receipt is delivered
+    try { renameSync(claimFile, grantedFile); } catch (e) { log(`board admission ${claim.itemId}: granted-rename failed (receipt delivered; reconciled next tick): ${e instanceof Error ? e.message : e}`); }
+    log(`board admission: granted ${claim.itemId} to ${claim.who} (attempt ${grant.attemptId})`);
+  };
+
+  // §2d-b admission CONSUMER (board admission 5/n, v2 — codex 3fda743 review): a claim (`<item>.claimed.<who>.json`) is a
+  // RESERVATION APPLICATION, not authority. Each tick, re-run admission on the CURRENT CONTROL: resolve the job's authoritative
+  // plan (BA1), validate the untrusted claim BODY against it (BA2), isolate the scheduler input to the claim's job (BA3), gate
+  // on free capacity (BA6) → GRANT (commit intent+attempt(+retired)+supervision wait, receipt-first then mark granted) /
+  // REJECT (terminal, mark + reason) / RECONCILE (already granted to this member — re-deliver receipt + fix board) / DEFER
+  // (transient: no plan yet / capacity full — leave the claim). DORMANT under SWARM_BOARD_ADMIT (boundary #1/#2). NO startTask
+  // (boundary #3). The board is an app-queue + projection, never a 2nd ledger: a grant whose commit fails leaves the claim for
+  // re-review. Fail-soft, per-claim isolated.
   const runBoardConsumer = (): void => {
     if (!plan || !boardAdmitEnabled()) return;
     let files: string[];
@@ -822,24 +847,25 @@ async function main(): Promise<void> {
     const claims = files.map((f) => parseBoardItemName(f)).filter((p): p is { itemId: string; state: "claimed"; who: string } => p !== null && p.state === "claimed");
     for (const claim of claims) {
       const claimFile = path.join(BOARD_DIR, claimedFileName(claim.itemId, claim.who));
-      const grantedFile = path.join(BOARD_DIR, grantedFileName(claim.itemId, claim.who));
       try {
         const state = loadControlLog(CONTROL_LOG_DIR);
-        const verdict = planClaimAdmission(plan, state, claim, {
-          nowSec: nowSec(), jobStartSec: jobStartSec(plan.jobId), launchId: `rw-${randomBytes(4).toString("hex")}`,
+        // BA2: the claim FILE BODY is untrusted (any member can write into the shared board dir). Validate it before admitting.
+        let app: ClaimApplication | null = null;
+        try { app = parseClaimApplication(JSON.parse(readFileSync(claimFile, "utf8")), claim.who); } catch { app = null; }
+        if (app === null) { rejectClaim(claim, "unreadable or malformed claim body"); continue; }
+        // BA6: free GLOBAL physical capacity, recomputed from the just-loaded state (a same-tick prior grant is already durable).
+        const freeSlots = Math.max(0, CAP - physicalSlotsOccupied(state, nowSec()));
+        const verdict = planClaimAdmission(state, app, {
+          nowSec: nowSec(), jobStartSec: jobStartSec(app.jobId), launchId: `rw-${randomBytes(4).toString("hex")}`, freeSlots,
           remainingLifeSec: VM_LIFETIME_SEC, checkpointBudgetSec: CHECKPOINT_BUDGET_SEC, handoffMarginSec: HANDOFF_LEAD_SEC, tokenMarginSec: TOKEN_MARGIN_SEC, budgetSec: BUDGET_SEC,
         });
-        if (verdict.verdict === "reconcile") { try { renameSync(claimFile, grantedFile); log(`board admission: ${claim.itemId} already granted — reconciled board state`); } catch { /* retry next tick */ } continue; }
+        if (verdict.verdict === "defer") { log(`board admission: ${claim.itemId} deferred — ${verdict.reason}`); continue; } // transient ⇒ leave claim, re-review next tick
         if (verdict.verdict === "reject") { rejectClaim(claim, verdict.reason); continue; }
-        // GRANT: commit intent+attempt(+retired)+supervision wait (NO startTask — boundary #3). A failed commit leaves the
-        // claim in place to be re-reviewed next tick (board is an app-queue + projection, never a 2nd ledger).
+        if (verdict.verdict === "reconcile") { deliverGrantAndMark(claim, { attemptId: verdict.attemptId, waitId: grantWaitId(verdict.attemptId) }); continue; } // BA5: re-deliver receipt then mark
+        // GRANT: commit intent+attempt(+retired)+supervision wait (NO startTask). A failed commit leaves the claim for re-review.
         const r = commitTask(state, verdict.bodies);
         if (!r.result.ok) { log(`board admission ${claim.itemId}: grant commit rejected (${r.result.reason}) — claim left for re-review next tick`); continue; }
-        // Receipt — NO execution side-effect (boundary #3): admission is recorded; A2 (real dispatch/V8) is not wired.
-        try { writeInbox(HOME, claim.who, { from: SELF, fromLabel: "swarm-admission", text: `[admission] granted ${claim.itemId} → attempt ${verdict.attemptId} (binding ${verdict.bindingId}); supervision wait ${verdict.waitId} open. DO NOT begin execution — A2 (real dispatch/V8) is not wired yet.`, via: "local", ts: Date.now() }); }
-        catch (e) { log(`board admission ${claim.itemId}: receipt write failed (grant already committed): ${e instanceof Error ? e.message : e}`); }
-        try { renameSync(claimFile, grantedFile); } catch (e) { log(`board admission ${claim.itemId}: granted-rename failed (grant committed; reconciled next tick): ${e instanceof Error ? e.message : e}`); }
-        log(`board admission: granted ${claim.itemId} to ${claim.who} (attempt ${verdict.attemptId})`);
+        deliverGrantAndMark(claim, { attemptId: verdict.attemptId, waitId: verdict.waitId, bindingId: verdict.bindingId });
       } catch (e) { log(`board claim ${claim.itemId} failed (isolated): ${e instanceof Error ? e.message : e}`); }
     }
   };
