@@ -23,7 +23,11 @@ plus a canonical writer so hand-JSON can never drift again.
 
 ## Semantics
 - `via` is a free-form provenance LABEL. `local`/`relay` still carry transport meaning (set by the bus/relay layers,
-  compared with `===`); an unknown label (`durable-inbox`, …) is kept and shown as-is, never a quarantine reason.
+  compared with `===`); an unknown label (`durable-inbox`, …) is PRESERVED VERBATIM in the delivered record
+  (`InboxMsg` + `BusMessage` from `core.recv`), never a quarantine reason. SCOPE (precision, re F38 review): this is
+  field-level pass-through, NOT a new UI rendering of `via` — the existing display paths (`mcp.ts` `agenthop_recv`
+  output, the host push adapter) do not surface `via` today and did not for `local`/`relay` either; F38 adds none.
+  Making an unknown label user-visible would be a separate, explicitly-agreed change (see the scope note below).
 - Empty / missing / non-string `via` is STILL rejected (poison) — the F28 crash-defense is intact.
 - `composeInboxMsg` is the one validated constructor; manual JSON routes through it, closing the doc↔validator gap.
 
