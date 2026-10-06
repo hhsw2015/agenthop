@@ -176,12 +176,16 @@ export function classifySubmit(json: unknown, exitFailed: boolean): { submitted:
   if (typeof code === "string" && code) return { submitted: "no", reason: `explicit error ${code}` };
   return { submitted: "unknown", reason: exitFailed ? "exec failed, no error code (may have landed) — not replayed" : "no receipt (empty/wrong type)" };
 }
-/** Did a native `agent prompt --wait` actually settle? Require a real terminal state, not an empty/stale read.
- *  (The native --wait carries herdr's activity guard; this validates the receipt shape on top.) Pure. */
-export function settledFrom(json: unknown): { settled: boolean; status: string } {
+/** Did a native `agent prompt --wait` actually settle? `working` is NOT a settle — it means the agent is still
+ *  running (or the receipt is only an initial snapshot), so ONLY idle/done/blocked count as a resolved wait. A
+ *  known state (incl. working) still proves the prompt was SUBMITTED, exposed via `known`. Empty/stale/bogus ->
+ *  neither. Pure. NB: the receipt field is INFERRED — herdr 0.9.3's `--wait` could not be exercised live from
+ *  outside a pane (the HERDR_ENV gate blocks `pane split --current`), so this is defensive, not sample-verified. */
+export function settledFrom(json: unknown): { settled: boolean; status: string; known: boolean } {
   const st = (json as any)?.result?.agent?.agent_status ?? (json as any)?.result?.agent_status;
-  const ok = typeof st === "string" && (["idle", "done", "blocked", "working"] as string[]).includes(st);
-  return { settled: ok, status: ok ? st : "unknown" };
+  const known = typeof st === "string" && (["idle", "working", "blocked", "done"] as string[]).includes(st);
+  const settled = known && st !== "working";
+  return { settled, status: known ? st : "unknown", known };
 }
 
 // ---- stall sentinel: a blocked agent is a human decision -> escalate (R2-P1-1, coordinator ruling R12) ----
@@ -327,9 +331,11 @@ export async function herdrPrompt(name: string, text: string, opts: { wait?: boo
   const r = await herdrRun(buildAgentPromptWait(name, text, timeout), timeout + 5000);
   const c = classifySubmit(r.json, r.exitFailed);
   const s = settledFrom(r.json);
-  const submitted: SubmitState = c.submitted === "yes" || s.settled ? "yes" : c.submitted; // a valid settle proves submission even if the --wait receipt type differs
+  // a KNOWN live state (idle/working/blocked/done) proves the prompt landed even if the --wait receipt type differs;
+  // but only a RESOLVED state (never `working`) counts as settled.
+  const submitted: SubmitState = c.submitted === "yes" || s.known ? "yes" : c.submitted;
   if (submitted !== "yes") return { submitted, settled: false, note: c.reason };
-  return { submitted: "yes", settled: s.settled, status: s.status, note: s.settled ? `settled:${s.status}` : "submitted; not settled within timeout (not replayed)" };
+  return { submitted: "yes", settled: s.settled, status: s.status, note: s.settled ? `settled:${s.status}` : `submitted; ${s.status === "working" ? "still working" : "not settled"} within timeout (not replayed)` };
 }
 
 export async function herdrReadClean(name: string, lines = 40): Promise<string> {

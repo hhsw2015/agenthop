@@ -93,10 +93,12 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   t("explicit error -> submitted no", classifySubmit({ error: { code: "agent_not_found" } }, true).submitted === "no");
   t("exec failed, no code -> submitted unknown (may have landed, never replay)", classifySubmit(null, true).submitted === "unknown");
   t("wrong type -> submitted unknown", classifySubmit({ result: { type: "agent_other" } }, false).submitted === "unknown");
-  t("settle: real status (agent.agent_status) -> settled", settledFrom({ result: { agent: { agent_status: "idle" } } }).settled === true);
-  t("settle: flat agent_status -> settled", settledFrom({ result: { agent_status: "blocked" } }).settled === true);
-  t("settle: empty -> NOT settled (stale read is not settle)", settledFrom({}).settled === false);
-  t("settle: bogus status -> NOT settled", settledFrom({ result: { agent: { agent_status: "spinning" } } }).settled === false);
+  t("settle: idle -> settled", settledFrom({ result: { agent: { agent_status: "idle" } } }).settled === true);
+  t("settle: done -> settled", settledFrom({ result: { agent: { agent_status: "done" } } }).settled === true);
+  t("settle: blocked (flat) -> settled", settledFrom({ result: { agent_status: "blocked" } }).settled === true);
+  t("settle: working is KNOWN but NOT settled (still running / initial snapshot — reviewer R3)", (() => { const s = settledFrom({ result: { agent: { agent_status: "working" } } }); return s.settled === false && s.known === true; })());
+  t("settle: empty -> neither settled nor known", (() => { const s = settledFrom({}); return s.settled === false && s.known === false; })());
+  t("settle: bogus status -> neither", (() => { const s = settledFrom({ result: { agent: { agent_status: "spinning" } } }); return s.settled === false && s.known === false; })());
 }
 
 // --- R2-P1-1: the sentinel ALWAYS escalates (auto-clear disabled; whitelist empty) ---
