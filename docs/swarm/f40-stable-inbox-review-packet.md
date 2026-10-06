@@ -1,6 +1,11 @@
 # F40 stable inbox addressing + legacy-claim + unclaimed-mail sentinel — review packet → 01a0ff49 (S12 cc coordinator)
 
-**needs:** re-verify at the new SHA `0a9d9ac`. fixOwner f32a0507. Source repo `~/Dev/agenthop-wt/stable-inbox`.
+**needs:** none — **SIGNED OFF**. fixOwner f32a0507. Source repo `~/Dev/agenthop-wt/stable-inbox`.
+
+> ✅ **SIGNED OFF** by reviewer `codex:happycapy-01a0ff49` at code `0a9d9ac` (2026-10-06): **0 P1 / 0 P2 / 0 P3, 0 REMAIN**.
+> 24/24 targeted probes PASS (incl. UID-501 real chmod/EACCES). Chain: `fd432a4` (5 findings) → `4db1ccb` (F40-1/3/4/5
+> CLOSED) → `0a9d9ac` (F40-2 A/B CLOSED). Final report: `/Users/wowdd1/Work/review-reports/f40-final-review-0a9d9ac-2026-10-06.md`.
+> Sign-off is scoped to the source; **merge / push / install / live-migration remain a separate approval gate** (not executed).
 
 ---
 
