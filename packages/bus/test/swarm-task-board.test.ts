@@ -1,8 +1,9 @@
 import { describe, expect, test } from "vitest";
 import {
-  boardItemsToPost, planBoardWrites, postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName,
+  boardItemsToPost, planBoardWrites, buildGrantBodies, grantWaitId, postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName,
   parseBoardItemName, isValidItemId, boardAdmitEnabled, type BoardItem,
 } from "../src/swarm/task-board.js";
+import type { ChangeBody, WaitRecord } from "../src/swarm/control-log.js";
 import type { TaskPlan } from "../src/swarm/task-plan.js";
 import type { ReadyTask } from "../src/swarm/task-ready.js";
 
@@ -76,6 +77,27 @@ describe("task-board file-name convention + parser (one canonical form, incl. gr
     expect(isValidItemId("a/b")).toBe(false);
     expect(isValidItemId("a b")).toBe(false);
     expect(isValidItemId("")).toBe(false);
+  });
+});
+
+describe("task-board buildGrantBodies (§2d-b grant, option B: intent+attempt(+retired)+supervision wait, NO startTask)", () => {
+  const prep = {
+    intent: { intentId: "i1" } as unknown as import("../src/swarm/control-log.js").DispatchIntent,
+    attempt: { attemptId: "at1", nodeId: "a" } as unknown as import("../src/swarm/task-state.js").TaskAttempt,
+    retired: [{ attemptId: "old1" } as unknown as import("../src/swarm/task-state.js").TaskAttempt],
+    binding: { bindingId: "b1" } as unknown as import("../src/swarm/task-state.js").ExecutionBinding,
+  };
+  test("produces intent + new attempt + retired attempts + a BUSINESS_EXEC supervision wait; no execution body", () => {
+    const bodies = buildGrantBodies(prep, { waitId: grantWaitId("at1"), jobId: "J", owner: "w1", deadlineSec: 5000 });
+    expect(bodies.map((b: ChangeBody) => b.put)).toEqual(["intent", "attempt", "attempt", "wait"]); // retired folded in; no startTask body
+    const wait = (bodies.find((b) => b.put === "wait") as { wait: WaitRecord }).wait;
+    expect(wait.subject).toEqual({ jobId: "J", attemptId: "at1", bindingId: "b1" }); // anchored to the admitted attempt+binding
+    expect(wait.kind).toBe("wait");
+    expect(wait.timeoutPolicy).toBe("escalate"); // sweep supervises the admitted work
+    expect(wait.state).toBe("open");
+    expect(wait.deadlineSec).toBe(5000);
+    expect(wait.owner).toBe("w1");
+    expect(grantWaitId("at1")).toBe("board-exec:at1"); // stable per attempt ⇒ re-grant replay is idempotent at the wait entity
   });
 });
 

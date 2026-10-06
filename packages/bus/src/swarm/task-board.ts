@@ -14,6 +14,9 @@
  */
 import type { TaskPlan } from "./task-plan.js";
 import type { ReadyTask } from "./task-ready.js";
+import type { TaskAttempt, ExecutionBinding } from "./task-state.js";
+import type { ChangeBody, DispatchIntent } from "./control-log.js";
+import { openWait } from "./task-wait.js";
 
 /** The lifecycle states a board item's FILE NAME encodes. `posted` = `<itemId>.json` (unclaimed); the rest are
  *  `<itemId>.<state>.<who>.json`. `claimed` is a RESERVATION application (not authority); `granted`/`rejected` are the
@@ -86,6 +89,32 @@ export function planBoardWrites(ready: readonly ReadyTask[], plan: TaskPlan, exi
   for (const [itemId, file] of postedFiles) if (!readyIds.has(itemId)) reap.push(file);
   return { post, reap };
 }
+
+/** Assemble the §2d-b GRANT commit bodies (option B, coordinator ruling 2026-10-06): the dispatch intent + the new attempt
+ *  (+ any retired attempts) from prepareDispatch — which IS the 派发即登记 receipt per §2b-b — PLUS a BUSINESS_EXEC-style
+ *  SUPERVISION wait (the "信封 wait"), subject-anchored to the admitted attempt+binding, timeoutPolicy=escalate so the sweep
+ *  watches the admitted work. There is NO execution body: startTask/V8 is A2 (boundary #3 — a grant admits, it does not run).
+ *  The full §2b delegation envelope (openDelegation) is a SEPARATE batch (its open side is unwired today). Pure ⇒ the exact
+ *  grant shape is unit-tested; the dispatcher commits these atomically inside the gate-open branch (boundary #2). */
+export function buildGrantBodies(
+  prep: { intent: DispatchIntent; attempt: TaskAttempt; retired: TaskAttempt[]; binding: ExecutionBinding },
+  sup: { waitId: string; jobId: string; owner: string; deadlineSec: number },
+): ChangeBody[] {
+  const wait = openWait({
+    waitId: sup.waitId, kind: "wait",
+    subject: { jobId: sup.jobId, attemptId: prep.attempt.attemptId, bindingId: prep.binding.bindingId },
+    deadlineSec: sup.deadlineSec, owner: sup.owner, timeoutPolicy: "escalate",
+  });
+  return [
+    { put: "intent", intent: prep.intent },
+    { put: "attempt", attempt: prep.attempt },
+    ...prep.retired.map((a) => ({ put: "attempt", attempt: a }) as ChangeBody),
+    { put: "wait", wait },
+  ];
+}
+
+/** The supervision-wait id for an admitted attempt (stable per attempt ⇒ a re-grant replay is idempotent at the wait entity). */
+export function grantWaitId(attemptId: string): string { return `board-exec:${attemptId}`; }
 
 // --- the ONE canonical board file-name convention (so producer, consumer, observer + projection all agree, incl. the new
 //     granted/rejected states) ---

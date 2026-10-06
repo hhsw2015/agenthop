@@ -35,7 +35,8 @@ import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/ta
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
 import { taskPass, buildSched, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
 import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
-import { boardAdmitEnabled, planBoardWrites, postedFileName } from "../packages/bus/src/swarm/task-board.js";
+import { boardAdmitEnabled, planBoardWrites, postedFileName, buildGrantBodies, grantWaitId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName } from "../packages/bus/src/swarm/task-board.js";
+import { prepareDispatch, type DispatchParams } from "../packages/bus/src/swarm/task-dispatch.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
@@ -796,6 +797,66 @@ async function main(): Promise<void> {
     } catch (e) { log(`board producer failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
+  // §2d-b admission REJECT: mark a claim rejected (reason into the board file) + tell the applicant. Best-effort.
+  const rejectClaim = (claim: { itemId: string; who: string }, reason: string): void => {
+    const from = path.join(BOARD_DIR, claimedFileName(claim.itemId, claim.who));
+    const to = path.join(BOARD_DIR, rejectedFileName(claim.itemId, claim.who));
+    try { const item = JSON.parse(readFileSync(from, "utf8")); atomicWrite(to, JSON.stringify({ ...item, rejectedReason: reason, rejectedAtSec: nowSec() })); unlinkSync(from); }
+    catch { try { renameSync(from, to); } catch { /* raced away */ } }
+    try { writeInbox(HOME, claim.who, { from: SELF, fromLabel: "swarm-admission", text: `[admission] rejected ${claim.itemId}: ${reason}`, via: "local", ts: Date.now() }); } catch { /* best-effort */ }
+    log(`board admission: rejected ${claim.itemId} (${claim.who}): ${reason}`);
+  };
+
+  // §2d-b admission CONSUMER (board admission 5/n): a claim (`<item>.claimed.<who>.json`) is a RESERVATION APPLICATION, not
+  // authority. Each tick, re-run admission on the CURRENT CONTROL via prepareDispatch (spec/inputs at the current revision,
+  // deps accepted, §3.1 node single-active, token/budget) → GRANT (commit intent+attempt(+retired)+a BUSINESS_EXEC supervision
+  // wait via buildGrantBodies, write a receipt, mark the item granted) or REJECT (mark + reason). DORMANT: runs only under
+  // SWARM_BOARD_ADMIT (boundary #1/#2 — gate off ⇒ no claims processed, no CONTROL commit). NO startTask — a grant admits, it
+  // does not execute (boundary #3; A2 wires execution). The board is an application queue + projection, never a 2nd ledger:
+  // a grant whose commit fails/crashes leaves the claim in place to be RE-REVIEWED next tick; a claim whose node was already
+  // granted (commit ok but the rename was lost) is reconciled to granted, not re-granted; a claim whose node is no longer
+  // admittable is rejected. Fail-soft, per-claim isolated.
+  const runBoardConsumer = (): void => {
+    if (!plan || !boardAdmitEnabled()) return;
+    let files: string[];
+    try { files = readdirSync(BOARD_DIR); } catch { return; } // no board dir yet ⇒ nothing to admit
+    const claims = files.map((f) => parseBoardItemName(f)).filter((p): p is { itemId: string; state: "claimed"; who: string } => p !== null && p.state === "claimed");
+    for (const claim of claims) {
+      const claimFile = path.join(BOARD_DIR, claimedFileName(claim.itemId, claim.who));
+      try {
+        const state = loadControlLog(CONTROL_LOG_DIR);
+        const sched = buildSched(plan, state);
+        const usage = { totalAttempts: sched.attempts.length, wallClockSec: Math.max(0, nowSec() - jobStartSec(plan.jobId)) };
+        const rt = readyTasks({ ...sched, now: nowSec(), jobUsage: usage }).find((r) => r.nodeId === claim.itemId);
+        if (rt === undefined) {
+          // Not admittable now. Was it ALREADY granted by admission (commit ok, granted-rename lost)? That node has an attempt
+          // carrying our board-exec supervision wait — reconcile the board to granted rather than reject a real grant.
+          const granted = sched.attempts.find((a) => a.nodeId === claim.itemId && findWaitIn(state, grantWaitId(a.attemptId)) !== undefined);
+          if (granted !== undefined) { try { renameSync(claimFile, path.join(BOARD_DIR, grantedFileName(claim.itemId, claim.who))); log(`board admission: ${claim.itemId} already granted — reconciled board state`); } catch { /* retry next tick */ } continue; }
+          rejectClaim(claim, "node no longer admittable (already dispatched / completed / deps or budget changed)");
+          continue;
+        }
+        const spec = plan.nodes.find((n) => n.nodeId === claim.itemId);
+        if (spec === undefined) { rejectClaim(claim, "node not in current plan"); continue; }
+        const launchId = `rw-${randomBytes(4).toString("hex")}`;
+        const params: DispatchParams = {
+          remainingLifeSec: VM_LIFETIME_SEC, checkpointBudgetSec: CHECKPOINT_BUDGET_SEC, handoffMarginSec: HANDOFF_LEAD_SEC,
+          tokenMarginSec: TOKEN_MARGIN_SEC, budgetSec: BUDGET_SEC, nowSec: nowSec(), atSeq: state.seq + 1,
+        };
+        const prep = prepareDispatch(plan, rt, sched.attempts, launchId, `${launchId}@${claim.itemId}`, params);
+        if (!prep.ok) { rejectClaim(claim, prep.reason); continue; }
+        const bodies = buildGrantBodies(prep, { waitId: grantWaitId(prep.attempt.attemptId), jobId: plan.jobId, owner: claim.who, deadlineSec: nowSec() + spec.estimatedRuntimeSec + HANDOFF_LEAD_SEC });
+        const r = commitTask(state, bodies);
+        if (!r.result.ok) { log(`board admission ${claim.itemId}: grant commit rejected (${r.result.reason}) — claim left for re-review next tick`); continue; } // orphan: claim stays, re-reviewed (no 2nd ledger)
+        // Receipt — NO execution side-effect (boundary #3): admission is recorded; A2 (real dispatch/V8) is not wired.
+        try { writeInbox(HOME, claim.who, { from: SELF, fromLabel: "swarm-admission", text: `[admission] granted ${claim.itemId} → attempt ${prep.attempt.attemptId} (binding ${prep.binding.bindingId}); supervision wait ${grantWaitId(prep.attempt.attemptId)} open. DO NOT begin execution — A2 (real dispatch/V8) is not wired yet.`, via: "local", ts: Date.now() }); }
+        catch (e) { log(`board admission ${claim.itemId}: receipt write failed (grant already committed): ${e instanceof Error ? e.message : e}`); }
+        try { renameSync(claimFile, path.join(BOARD_DIR, grantedFileName(claim.itemId, claim.who))); } catch (e) { log(`board admission ${claim.itemId}: granted-rename failed (grant committed; reconciled next tick): ${e instanceof Error ? e.message : e}`); }
+        log(`board admission: granted ${claim.itemId} to ${claim.who} (attempt ${prep.attempt.attemptId})`);
+      } catch (e) { log(`board claim ${claim.itemId} failed (isolated): ${e instanceof Error ? e.message : e}`); }
+    }
+  };
+
   // The durable-state observer (L2-struct 2/n, §2b-c/§2c + F25). Two INDEPENDENT fail-soft halves (a failure in one must not
   // block the other — review P2-1): completion-slot discovery + the board/PROGRESS watch. Runs on the sweep loop.
   const runObserver = (): void => {
@@ -1066,10 +1127,11 @@ async function main(): Promise<void> {
     passTick: async () => {
       await pass(records, ops);
       if (plan && taskOn && taskOps) { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
-      // §2d-a board admission producer (PULL path) — self-gated on SWARM_BOARD_ADMIT (default off ⇒ no-op); independent of
-      // SWARM_TASK_EXEC push. Posts ready nodes as claimable board items; the §2d-b admission consumer (next increment)
-      // consumes claims. Dormant-ahead-of-use.
+      // §2d board admission (PULL path) — both self-gated on SWARM_BOARD_ADMIT (default off ⇒ no-op), independent of
+      // SWARM_TASK_EXEC push. Producer posts ready nodes as claimable items; consumer admits claims (prepareDispatch on current
+      // CONTROL → grant intent+binding+supervision wait+receipt / reject), NO execution (A2). Dormant-ahead-of-use.
       runBoardProducer();
+      runBoardConsumer();
       // NOTE: the projection + verdict refresh is NOT here — it lives on the sweep loop (below), so a wedged pass/taskPass
       // cannot freeze the on-disk verdict into a stale OK (review P2-1). Per-commit projection writes still happen via the
       // commitTask apply hook; this loop only drives the business passes.
