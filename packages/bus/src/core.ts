@@ -83,15 +83,29 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // same-native link) appended by ANY party must take effect without this session restarting or changing its own identity.
   // Stamp-gated so the fold is skipped when the log is unchanged (the common idle case); `force` bypasses it when self's own
   // identity just changed (the native the keys depend on moved).
-  let legacyStamp = "\u0000"; // sentinel ≠ a real stamp ("" means missing) so the first refresh always folds
+  // `legacyStamp` is the stamp of the last SUCCESSFUL fold. "\u0000" (initial) / STAMP_RETRY (after a failed read) are
+  // sentinels that never equal a real stamp, so the next refresh always re-reads — even if the file's mtime/size is unchanged
+  // (a transient EACCES leaves the bytes identical, F40-2-B). A real stamp is committed ONLY after a successful read.
+  const STAMP_RETRY = "\u0000retry";
+  let legacyStamp = "\u0000";
   const refreshLegacyKeys = (force = false): void => {
     try {
       const stamp = identityLogStamp(home);
-      if (!force && stamp === legacyStamp) return; // alias-log unchanged since the last fold ⇒ reuse cached keys (cheap path)
-      legacyStamp = stamp;
+      if (!force && stamp === legacyStamp) return; // unchanged since the last SUCCESSFUL fold ⇒ reuse cached keys (cheap path)
       const lg = readIdentityLog(home);
+      if (lg.status === "error") {
+        // F40-2-B: a READ failure (e.g. a transient EACCES) is NOT an empty log. Folding it to empty-and-committing the stamp
+        // stranded mail once perms were restored (the bytes, hence the stamp, were unchanged → the gate skipped the re-read).
+        // CONSERVATIVE authorization while blind: grant NO legacy claim — the log may ALREADY carry a revoke, so the stale set
+        // must not keep authorizing claims (a revoked box must not be drained during the outage). The current id/stableId keys
+        // still work. Force a re-read next time (RETRY sentinel) so a recovery with an UNCHANGED stamp still re-folds.
+        legacyKeys = [];
+        legacyStamp = STAMP_RETRY;
+        return;
+      }
+      legacyStamp = stamp; // commit the stamp ONLY on a successful read
       legacyKeys = legacyInboxKeys(buildProjection(lg.events, lg.corruption), self);
-    } catch { /* best-effort: never block the bus on an alias-log read/fold */ }
+    } catch { legacyKeys = []; legacyStamp = STAMP_RETRY; /* same conservative stance on any throw: no legacy claim, retry next time */ }
   };
   const inboxKeys = (): string[] => {
     const out = self.stableId && self.stableId !== self.id ? [self.stableId, self.id] : [self.id];
@@ -441,13 +455,17 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     async recv(timeoutMs) {
       // Explicit pull: drain the DURABLE inbox (messages the push channel could not surface). Claim+ack so the retry
       // timer never re-delivers the same message.
-      refreshLegacyKeys(); // F40-2: use CURRENT alias-log evidence for this drain (a revoked legacy link must not be claimed)
       const deadline = Date.now() + timeoutMs;
-      const drain = (): BusMessage[] =>
-        claimInbox(home, inboxKeys(), String(process.pid), stuckPoison).map((c) => {
+      // F40-2-A: recompute legacy keys before EVERY claim — at entry AND on each 120ms poll — not just at recv entry. An
+      // alias-log revoke/late-link appended DURING the wait must take effect on the very next drain: a revoked box must not be
+      // claimed, a newly-linked same-native box must be picked up. Stamp-gated ⇒ cheap when the log is unchanged.
+      const drain = (): BusMessage[] => {
+        refreshLegacyKeys();
+        return claimInbox(home, inboxKeys(), String(process.pid), stuckPoison).map((c) => {
           ackInbox(c.file);
           return { from: c.msg.from, fromLabel: c.msg.fromLabel, text: c.msg.text, via: c.msg.via };
         });
+      };
       let batch = drain();
       while (batch.length === 0 && Date.now() < deadline) {
         await delay(120);
