@@ -703,6 +703,50 @@ export function probeTargets(ent: IdentityEntity): { hostPid?: number; busPid?: 
   return { hostPid: inc?.hostPid, busPid: inc?.busPid, scope: inc?.scope ?? "local", birth: inc?.birth };
 }
 
+/**
+ * F40 — the durable inbox keys that belong to the SAME LOGICAL SESSION as `self`, derived from the alias-log projection, so a
+ * restarted or thread-drifted incarnation DRAINS mail addressed to a PRIOR identity: a box keyed by an old per-run id, or by a
+ * Codex thread id the active thread later drifted away from. Without this, a "same conversation, new run / new thread" restart
+ * leaves earlier mail in a box its new inboxKey() never looks at — the F40 silent stall. Folded into core's inboxKeys().
+ *
+ * CONSERVATIVE by construction (a wrong key here would DRAIN ANOTHER session's mail): the lineage is the transitive closure,
+ * from self's own per-run id + stableId, over entities that share a HARD, non-superseded run/native value — the very evidence
+ * the projection uses to relate incarnations. An entity in a different tool/cwd is excluded (not this session), and a native in
+ * `proj.collisions` (two concurrent, differently-situated sessions share it — ambiguous ownership) is NEVER crossed: an entity
+ * is adopted only when it shares a NON-collision key, and a collision value is never itself added as a drain key. Returns the
+ * EXTRA keys only (self's current id/stableId are already claimed by inboxKeys()), deduped.
+ */
+export function legacyInboxKeys(proj: Projection, self: SelfLike): string[] {
+  const anchors = new Set<string>([self.id, ...(self.stableId ? [self.stableId] : [])]);
+  const keys = new Set<string>(anchors);
+  // The id FORMS an inbox is keyed by: stableId = a native claim, the per-run id = a run claim. Hard + non-superseded only.
+  const keyVals = (ent: IdentityEntity): string[] => {
+    const out: string[] = [];
+    for (const inc of ent.incarnations) for (const c of inc.claims) {
+      if (c.superseded || c.confidence !== "hard") continue;
+      if (c.form === "run" || c.form === "native") out.push(c.value);
+    }
+    return out;
+  };
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const ent of proj.entities.values()) {
+      if (self.tool && ent.tool && ent.tool !== self.tool) continue; // a different tool is not this session
+      if (self.cwd && ent.cwd && ent.cwd !== self.cwd) continue;     // a different working dir is not this session
+      const vals = keyVals(ent);
+      // Join the lineage ONLY on a shared NON-collision key — matching solely on an ambiguous (collision) native could
+      // adopt a different session's incarnation, so it is not enough to claim this entity as mine.
+      if (!vals.some((v) => keys.has(v) && !proj.collisions.has(v))) continue;
+      for (const v of vals) {
+        if (proj.collisions.has(v)) continue;                        // never add an ambiguous native as a drain key
+        if (!keys.has(v)) { keys.add(v); changed = true; }
+      }
+    }
+  }
+  return [...keys].filter((k) => !anchors.has(k));
+}
+
 // ---------------------------------------------------------------------------------------------
 // liveness kernel (design §5) — three-state + evidence policy. Pure given probe facts.
 // ---------------------------------------------------------------------------------------------

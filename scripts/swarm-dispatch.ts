@@ -50,10 +50,11 @@ import { observeCandidate, readDelegations, writeDelegations, type DelegationReg
 import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, ingestLedgerChunk, pruneDeadLetterWindow, consolidatePending, readDeadLetterWatch, writeDeadLetterWatch, routeKeyOf, routingGroupKey, routeKeyOfGroup, routingActiveSignal, type ReadArtifact, type WatchSnapshot, type DeadLetterWatch } from "../packages/bus/src/swarm/delegation-observer.js";
 import { advanceWait, isRenewable } from "../packages/bus/src/swarm/task-wait.js";
 import { subjectProgressSeq, hasFreshSubjectEvidence, renewOperationId, renewalCount } from "../packages/bus/src/swarm/evidence-renewal.js";
-import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
-import { whois, buildProjection, readIdentityLog, probeTargets, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
+import { resolveSession, listSessions, makeFileLiveness } from "../packages/bus/src/swarm/task-liveness.js";
+import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
-import { writeInbox } from "../packages/bus/src/inbox.js";
+import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
+import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
 const MIRROR_DIR = path.join(HOME, ".agenthop", "swarm", "control");
@@ -78,6 +79,9 @@ const SWARM_TEAM = process.env.SWARM_TEAM || "";
 // lifecycle record (drain/expire/milestone/checkpoint) to the mirror, but allocates no VM until SWARM_EXEC=1.
 // Only explicit enabling values count — `!!"0"`/`!!"false"` are truthy, so SWARM_EXEC=0 must NOT enable (Codex P1).
 const EXEC_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_EXEC ?? "");
+// F40 unclaimed-mail sentinel: a durable inbox with unread mail older than this AND no live session draining it ⇒ escalate to
+// the coordinator (silent-stall detection). 10min default — long enough that an ordinary flush cadence never trips it.
+const INBOX_STALL_SEC = Number(process.env.SWARM_INBOX_STALL_SEC || "600");
 
 // --- business-task layer (brain §4.5). The control-log is authoritative for the task axis (intents/attempts/accepted);
 // the per-record mirror above stays the LIFECYCLE axis for now (its migration to commitControl is a separate step). The
@@ -1037,6 +1041,41 @@ async function main(): Promise<void> {
     }
   };
 
+  // F40 unclaimed-mail sentinel (silent-stall detection). Scan durable inbox dirs; a box with unread mail past INBOX_STALL_SEC
+  // AND no live session draining it (owner offline/dead — write-side stable addressing + drain-side legacy-claim cannot help a
+  // box nobody owns) is escalated to the coordinator. The ownership set MIRRORS core's inboxKeys(): each live presence session's
+  // own key + its legacy (prior-identity) keys, so a box a live session WILL drain is never a false alarm. Fail-soft + isolated;
+  // notifyCoordinator dedups an identical alert within NOTIFY_DEDUP_MS (a stall persisting past the window re-alerts, as intended).
+  const runInboxSentinel = (): void => {
+    try {
+      const stats = scanInboxes(HOME);
+      if (stats.length === 0) return;
+      const idlog = readIdentityLog(HOME);
+      const proj = buildProjection(idlog.events, idlog.corruption);
+      const io = makeFileLiveness(HOME);
+      const owned = new Set<string>();
+      for (const sid of listSessions(HOME)) {
+        const pid = io.readPid(sid);
+        if (pid === null || io.procAlive(pid) !== "alive") continue; // only a LIVE presence session owns (drains) a box
+        owned.add(inboxDirName(sid));
+        // Mirror core's inboxKeys() EXACTLY: a live session also drains its prior-identity boxes. Use the session's real
+        // tool/cwd (from whois) so the ownership criterion matches the real drain set and can't falsely suppress a stall.
+        const w = whois(proj, sid);
+        const ent = w.kind === "entity" ? w.entity : undefined;
+        for (const k of legacyInboxKeys(proj, { id: sid, stableId: sid, title: "", tool: ent?.tool ?? "", cwd: ent?.cwd ?? "", pid: 0 })) owned.add(inboxDirName(k));
+      }
+      // Stable text (no growing age) so notifyCoordinator's dedup suppresses per-tick spam; a persistent stall re-surfaces
+      // once the dedup window (SWARM_NOTIFY_DEDUP_MS) elapses, and a growing backlog (new count) re-alerts immediately.
+      const thMin = Math.floor(INBOX_STALL_SEC / 60);
+      for (const a of detectStalledInboxes(stats, (key) => owned.has(key), INBOX_STALL_SEC, nowSec())) {
+        notifyCoordinator(
+          `[inbox-sentinel] STALL: inbox ${a.key} has ${a.unclaimedCount} unclaimed message(s) older than ${thMin}min and NO live session is draining it`,
+          { taskRef: `inbox:${a.key}`, title: "inbox stall" },
+        );
+      }
+    } catch (e) { log(`inbox sentinel failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   await runDispatchLoops({
     // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
     // dispatches). T1.5 RED LINE (fe0376cd): --task dispatch stays off (SWARM_TASK_EXEC) until the resume adapter +
@@ -1067,6 +1106,8 @@ async function main(): Promise<void> {
       runObserver();
       // L2-struct 3b (F26): dead-letter bursts ⇒ routing incidents. Dormant until the ledger exists.
       runDeadLetterWatch();
+      // F40: unclaimed-mail sentinel — a box with stale unread mail and no live drainer ⇒ escalate (silent-stall backstop).
+      runInboxSentinel();
     },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     passIntervalMs: 5000,
