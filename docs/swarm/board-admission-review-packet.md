@@ -118,3 +118,43 @@ BA8b stale-refresh, BA4 other-job-untouched. 22 board tests; 962/962 suite.
 
 ## Still out of scope (recorded)
 A2 execution + gate flip; §2b envelope-open; §2d-c ping; **BA9 posted-supervision (R14, pre-flip blocker)**.
+
+---
+
+# v3 (round 3) — fixes for codex re-review of fcb8834 (2P1 + 1P2 residual)
+
+**Code frozen at** `b32b25e` (base `main=b5fde65`, branch `feat/board-admission`). Prior rounds `3fda743` → `fcb8834`.
+**Verdict addressed:** BA2, BA4, BA8 residual sub-cases FIXED. BA1/BA3/BA5/BA6/BA7 remain CLOSED; BA9 deferred (#R14).
+Gates: bus tsc 0, dispatch tsc 0, projection tsc 0, **966/966** vitest + projection selftest green.
+
+## Board key v3 (BA4) — ON-DISK CONVENTION CHANGE, since fcb8834
+`boardItemId` is now LENGTH-PREFIXED and injective: `<len(jobId)>-<jobId>-<nodeId>` (was v2 `<jobId>__<nodeId>`). The v2
+`__` form was not prefix-injective — `A/B__C` and `A__B/C` both mapped to `A__B__C`. The length prefix makes the mapping
+injective over the allowed id domain, so two different (job,node) pairs never collide on the shared board. Ownership is judged
+from the item BODY jobId + a filename↔body binding, never a string prefix. Still dormant ⇒ no live files to migrate.
+
+## Per-finding (residual)
+- **BA2a** (path traversal via untrusted jobId): `parseClaimApplication` now rejects a jobId/nodeId that is not a path-safe
+  identifier (reuses isValidItemId: no `.`/`/`/whitespace), so `../../victim` is dropped before the consumer builds any path
+  from it. `jobStartSec` additionally encodes a separator-bearing jobId to a single safe segment (defense-in-depth;
+  backward-compatible for plain identifiers).
+- **BA2b** (filename not bound to body): the consumer rejects a claim whose file name itemId ≠ `boardItemId(body.jobId,
+  body.nodeId)` — an "A-named file, B-body" claim can no longer be granted/renamed under A's key.
+- **BA2c** (reconcile skips input check): a same-owner reconcile now also requires the claim's inputBindingDigest to match the
+  LIVE attempt's inputBindingDigest; a different input is rejected (not replayed as a recovery).
+- **BA4** (key not injective + prefix ownership): injective length-prefixed key + ownership-by-body + filename↔body binding in
+  `planBoardWrites`; a sibling job (`A__B`) is neither collided-with nor reaped by job `A`.
+- **BA8a** (refresh writes-then-deletes): a stale-revision posted file is OVERWRITTEN in place (post only, no same-path reap);
+  the producer also reaps-before-posts (robust ordering).
+- **BA8b** (revoked grant blocks forever): a granted/rejected file for a node that is READY again is stale (ready ⟹ no live
+  attempt ⟹ the grant was revoked) ⇒ it is reaped and the fresh READY identity re-posted, while a truly-live grant (node not
+  ready) is untouched.
+
+## New / changed tests
+`parseClaimApplication` BA2a path-safety; boardItemId injectivity (BA4); planBoardWrites BA8a overwrite-no-reap, BA8b
+granted-stale-reap, BA4 body-ownership + sibling-job, name↔body mismatch left-alone; planClaimAdmission BA2c reconcile input
+identity. 26 board tests; 966/966 suite. (BA2b filename↔body binding + BA8a reap-before-post ordering are in the shell
+runBoardConsumer/runBoardProducer — AST-checkable.)
+
+## Still out of scope (recorded)
+A2 execution + gate flip; §2b envelope-open; §2d-c ping; **BA9 posted-supervision (#R14, pre-flip blocker)**.
