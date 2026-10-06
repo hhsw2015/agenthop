@@ -158,3 +158,29 @@ runBoardConsumer/runBoardProducer — AST-checkable.)
 
 ## Still out of scope (recorded)
 A2 execution + gate flip; §2b envelope-open; §2d-c ping; **BA9 posted-supervision (#R14, pre-flip blocker)**.
+
+---
+
+# v4 (round 4) — fix for codex re-review of b32b25e (1P1 residual: BA4 fs-alias)
+
+**Code frozen at** `08f9d54` (base `main=b5fde65`, branch `feat/board-admission`). Prior: `3fda743`→`fcb8834`→`b32b25e`.
+**Verdict addressed:** BA4 native-filesystem aliasing FIXED. BA1/BA2/BA3/BA5/BA6/BA7/BA8 remain CLOSED; BA9 deferred (#R14).
+Gates: bus tsc 0, dispatch tsc 0, projection tsc 0, **966/966** vitest + projection selftest green.
+
+## Board key v4 (BA4) — ON-DISK CONVENTION CHANGE, since b32b25e
+`boardItemId` is now `<hex(utf8(jobId))>-<hex(utf8(nodeId))>`. The v3 length-prefix key was string-injective but embedded
+raw jobId/nodeId, so a case-insensitive / Unicode-normalizing filesystem (default macOS APFS) folded distinct string keys
+onto one file — jobs `A` vs `a`, or NFC `é` vs NFD `é`, overwrote each other (reviewer reproduced on this machine:
+`st_dev` 16777242). Lowercase hex is single-case, pure-ASCII and normalization-stable, so **string-equality ⟺ on-disk
+equality**; `-` stays unambiguous (hex has no `-`) so the encoding is injective. Ownership + filename↔body checks are
+unchanged — they recompute `boardItemId`, now filesystem-accurate. Still dormant ⇒ no live files to migrate.
+
+Note (cosmetic, non-blocking): board FILE names are now hex; the item body still carries readable jobId/nodeId, and the
+projection/kanban views read the body. A follow-up could show `body.nodeId` instead of the hex itemId in the viz.
+
+## New / changed test
+`boardItemId` injectivity + FILESYSTEM-SAFETY: keys stay distinct after NFC-normalize + lowercase folding (jobs A/a; NFC é
+vs NFD é) and are single-case ASCII hex. 26 board tests; 966/966 suite; projection selftest (86 checks) green.
+
+## Still out of scope (recorded)
+A2 execution + gate flip; §2b envelope-open; §2d-c ping; **BA9 posted-supervision (#R14, pre-flip blocker)**.
