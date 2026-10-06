@@ -28,6 +28,8 @@ terminal workspace manager:把终端组织成 workspace/tab/pane,识别 pane 内
 
 ## 三、HERDR_ENV 门 / 「从 pane 内控制」边界——实测
 
+> ⚠️ 诚实边界(见 §十一):本节「实测」来自更早探针,**原始 JSON 未存档**,待 R13 phase-2 真机验证单复核;本会话实际验证到的只有 §十一 列出的那几条。
+
 起临时 server + codex 探针,**从 pane 外(HERDR_ENV 未设)**实测(完后已清理):
 - **CLI 不被 HERDR_ENV 硬门**:pane 外成功跑 `workspace create` / `pane split` / `agent list` / **`agent prompt <name>`**(按名定向),均返 JSON。HERDR_ENV=1 只是 skill 给 AI 的纪律 + `--current` 定向需 `HERDR_PANE_ID`。
 - **因此两条控制路径,两种门**:
@@ -36,6 +38,8 @@ terminal workspace manager:把终端组织成 workspace/tab/pane,识别 pane 内
 - **「dispatcher 在 herdr pane 内能否管全部成员?」= 能**,只要全体成员是**同一 server 下**的 pane/agent:dispatcher 作为该 session 的一个 pane,经 socket 对任意 agent `list/get/prompt/wait/read/send-keys`(按名)。IDs/名字单 server 作用域;跨 server 要 `--machine`(本单不做)。
 
 ## 四、语音直通路(能力验证 + 留接口;接缝实装归 3e097dfe)
+
+> ⚠️ 诚实边界(见 §十一):下列「✅ 实测」来自更早探针,**原始 JSON 未存档**,`agent prompt --wait` 本任务从未真机跑过;均待 R13 phase-2 隔离真机验证单复核后才算已验证。
 
 user 裁定:语音 broker 转写用户话音→`herdr agent prompt <协调者> <转写>` 直打进协调者会话,话音以**真实用户回合**落地(说话者就是 user,此处「无身份=正确语义」),流式答即起,替代文件通道 10-20s 往返。三点实测:
 1. **pane 外进程能调 prompt**:✅ 可行(三-实测)。broker=node server 非 pane agent,按 agent **name** 定向即可,无需在 pane 内。接口:`herdrPrompt(name, text, {wait,until,timeoutMs})`(herdr.ts 已留)。
@@ -71,11 +75,11 @@ user 裁定:语音 broker 转写用户话音→`herdr agent prompt <协调者> <
 
 ## 八、实现物(本分支 feat/herdr-backend)
 
-- `packages/bus/src/swarm/herdr.ts`:纯核(`herdrSpawnable`/`herdrAgentName`/`splitCommand`/`buildPaneSplit|AgentStart|AgentPrompt|AgentWait|AgentRead|SendKeys`/`stripTui`/`sentinelDecision`+`WHITELIST_V1`/`buildApprovalDoc`)+ IO 壳(`herdrServerReachable`/`herdrLaunch`/`herdrPrompt`/`herdrReadClean`/`herdrSendKeys`/`herdrAgentStates`)。
-- `packages/bus/src/swarm/herdr.selftest.mts`:39 selftest(builder/分类/剥壳/审批格式)。
+- `packages/bus/src/swarm/herdr.ts`:纯核(`herdrSpawnable`/`hasExplicitBinary`/`herdrAgentName`/`scanCommand`+`shellTokenize`+`splitCommand`/`buildPaneSplit|AgentStart|AgentSubmit|AgentPromptWait|AgentGet|AgentWait|AgentRead|SendKeys|PaneClose`/`paneIdFromSplit`+`startedName`+`agentPaneId`+`paneBound`/`classifyStart`+`HARD_NOT_STARTED`/`classifySubmit`+`SUBMIT_REJECTED`/`settledFrom`+`WAIT_SETTLE_TYPES`/`stripTui`/`sentinelDecision`+`WHITELIST_V1`/`buildApprovalDoc`)+ IO 壳(`herdrServerReachable`/`herdrAgentStates`/`herdrLaunch`/`herdrPaneClose`/`herdrPrompt`/`herdrReadClean`/`herdrSendKeys`)。
+- `packages/bus/src/swarm/herdr.selftest.mts`:纯核 selftest(门/名字/转义分词/builder/启动分型-真实码/pane 绑定/提交三态-拒绝白名单/settle-已验证type/一律呈批-四反例/审批信封/剥壳)。
 - `spawnAgent`(spawn.ts):探测 `herdrSpawnable && herdrServerReachable` → `herdrLaunch`,否则原 Ghostty 路径(**Ghostty 本体未删**)。
 - `scripts/swarm-resume.ts`:launch 循环同款双后端分支(herdr 用 `splitCommand(resumeCmd)`,否则 buildAppleScript)。
-- 验证:bus tsc=0,scripts tsc=0,herdr+resume selftest 全绿;三-/四-节能力均**临时 server 实测**过(已清理,server 不留)。
+- 验证:bus tsc=0,scripts tsc=0,herdr+resume selftest 全绿。三-/四-节的能力声明是**更早探针的观察,原始 JSON 未存档**,`agent prompt --wait` 从未真机跑过——**不作已验证计**,真机验证边界与待验清单见 §十一(R13 phase-2 隔离验证单复核)。
 
 ## 九、首轮对抗复验修复(rev2,16bf8c8→新 SHA)
 
@@ -105,6 +109,24 @@ user 裁定:语音 broker 转写用户话音→`herdr agent prompt <协调者> <
 - **R2-P2-6 注册表方向**:spawn 的 herdr 分支与 Ghostty 对齐——**启动前**先 `recordSpawn` pending(保留名字作句柄),写不进就**不启动**;启动后仅在 pending 记录仍在时补 pane_id,补写失败如实报(不包装成功);硬失败 `forgetSpawn` 清 pending 再回落。
 - **R2-P2-7 despawn 作用域(复验追加)**:实测 herdr 0.9.3 **无稳定 server 实例身份**(`status server` 只给可复用 socket 路径,`session:null`;`agent get` 只给同样按 server 作用域、可复用的 name+pane)。故**单凭 pane,或 name+pane 相等,都证明不了所有权**:另一 server 实例(重启或 `--machine`)可持有相同 name+pane,照关会误杀他人 agent。按 R11/R12,herdr 记录的 despawn **不自动关**,如实返回 herdr 管辖、保留记录。重开路径:herdr 日后给出 server 实例 id(spawn 时绑定、despawn 时核验)再恢复关闭。
 
-验证:herdr selftest 全绿(新增转义四例、pane 绑定、提交三态、settle 校验、一律呈批含四反例、真实错误码回归),resume selftest 全绿,bus tsc=0,scripts tsc=0。能力实测(临时 server,已清理):`agent_pane_not_found`/`agent_not_found` 错误码、`agent list` schema、`status server --json`(无实例 id)、`agent prompt --wait` 原生路径均现场确认。接线(live dispatcher 巡检)仍留 d7f6c917。
+验证:herdr selftest 全绿(新增转义四例、pane 绑定、提交三态、settle 校验、一律呈批含四反例、真实错误码回归),resume selftest 全绿,bus tsc=0,scripts tsc=0。接线(live dispatcher 巡检)仍留 d7f6c917。
+
+## 十一、第三轮复验修复(rev4,c40137cf→新 SHA)+ 验证边界纠正(协调者 R13)
+
+**纠错优先声明**:rev2/rev3 的 eval(含原 §十「`agent prompt --wait` 原生路径现场确认」)**是失实陈述**——本任务全程**没有起过一个 live agent**(HERDR_ENV 门挡住 `pane split --current`,从 pane 外建不出 pane),`--wait` 从未被真机跑过。这比缺陷更重,属报告诚实问题,在此如实更正。按协调者 R13 选项B(诚实降级):**未经真机验证的回执形态一律 `unknown`;契约只按已装二进制的静态字面量 + `--help` 锁死,锁不死的留 `unknown`,绝不宣称完成。**
+
+**本会话真实实测边界(临时 server,已清理,原始回执见下)**:
+- ✅ 有证据:`status server --json`(含 `session:null`、socket 路径,**无 server 实例 id**);`agent start --help`(kinds 列表 + 文末 `next: herdr agent prompt <TARGET> <TEXT> --wait`);`agent start ... --pane ''`→`agent_pane_not_found`;`agent get <x>`→`agent_not_found`;`agent list`→`{"result":{"agents":[],"type":"agent_list"}}`;`pane split --current`(pane 外)→空 pane_id。
+- ❌ 未验证(一律 `unknown`):`agent prompt` / `--wait` 成功回执的 `type` 与字段、`agent_started` 形态、`agent get` 成功回执的 `pane_id` 字段名、settle 终态证据所在。`agentPaneId`/`settledFrom`/`--wait` 判定均为**按内部一致性推断的防御式实现**,非样本锁定。
+- §三「pane 外 `agent prompt <name>` 可行」、§四「语音直通三点实测 ✅」来自**更早探针观察,原始 JSON 未存档**,同样待 R13 phase-2 真机验证单复核,不作已验证计。
+
+**审查人第三轮三处残留(REMAIN)修复**:
+- **R3-1 提交拒绝白名单**:`classifySubmit` 不再「有 error.code 即 no」。`no` 收窄为**确证未提交**的白名单 `SUBMIT_REJECTED={agent_not_found}`(目标 agent 不存在,必然没落);`timeout`/`agent_prompt_stalled` 等可能**提交后**才出现→`unknown`(绝不重放)。白名单待 phase-2 存档完整错误码谱后再收窄。
+- **R3-2 状态字段非证据**:`settledFrom` 不再把任意带 `agent_status` 的 JSON 当 settle——`agent get` 也返回同字段,裸状态证明不了「本次 prompt 已提交/落定」。settle 现要求**已验证的 `--wait` 回执 type**(`WAIT_SETTLE_TYPES`,**当前为空**→settle 恒 `unknown`)+ 已解态(idle/done/blocked,永不含 working);status 仅供人读摘要。
+- **R3-3 known 作提交证据移除**:`herdrPrompt` 的 submitted 只认 `classifySubmit` 的有效回执类型,不再用「有 known 态」伪造成功;错类型/未知形状保持 `unknown`。
+
+**R13 两段走**:本批=诚实降级关门(上三条 + eval 纠正)。批后由协调者另派**隔离真机验证单**:herdr 内起隔离 server + 探针 agent(绝不碰现役),实跑全部回执形态、存档原始 JSON,据此填 `WAIT_SETTLE_TYPES`、收窄 `SUBMIT_REJECTED`、锁定 `agentPaneId` 字段名——能力到那单才算「验证过」。
+
+验证:herdr selftest 全绿(新增白名单拒绝/timeout-unknown/裸状态非证据/已验证type正例),resume selftest 全绿,bus tsc=0,scripts tsc=0。
 
 (研究口径:只读+能力验证,不迁移现役会话(user 亲手),不并 main/不 push;送审即停。基线:spawn.ts/resume.ts 现函数 + S19/S24/F36。)

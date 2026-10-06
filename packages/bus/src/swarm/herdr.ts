@@ -166,26 +166,35 @@ export function classifyStart(json: unknown, expectedName: string, exitFailed: b
   return { state: "unconfirmed", reason: exitFailed ? `unrecognized failure (${code ?? "no code"})` : "no valid receipt (empty/wrong type)" };
 }
 
-// ---- R2-P2-3/4: submit + settle classification for herdrPrompt (3-state; never fabricate, never replay) ----
+// ---- R2-P2-3/4 + R13-B: submit + settle classification for herdrPrompt (3-state; never fabricate, never replay) ----
 export type SubmitState = "yes" | "no" | "unknown";
-/** receipt agent_prompted -> yes; explicit error code -> no; else (exec timeout / lost / wrong type) -> unknown
- *  (MAY have landed -> caller must NOT replay). Pure. */
+// R13-B: `no` is a WHITELIST of codes that PROVE the prompt was never submitted (the target agent is absent, so
+// nothing could land). timeout / agent_prompt_stalled — and any other code — can post-date a real submission, so
+// they are `unknown` (may have landed -> never replay). agent_not_found is a live-confirmed literal; the set stays
+// deliberately narrow until the R13 phase-2 real-machine pass archives the full `agent prompt` error taxonomy.
+export const SUBMIT_REJECTED = new Set(["agent_not_found"]);
+/** Classify an `agent prompt` result. agent_prompted receipt -> yes; a whitelisted "not submitted" code -> no;
+ *  everything else (timeout/stalled/unknown code, exec failure, empty, wrong type) -> unknown (NEVER replay). Pure. */
 export function classifySubmit(json: unknown, exitFailed: boolean): { submitted: SubmitState; reason: string } {
   if ((json as any)?.result?.type === "agent_prompted") return { submitted: "yes", reason: "agent_prompted receipt" };
   const code = (json as any)?.error?.code;
-  if (typeof code === "string" && code) return { submitted: "no", reason: `explicit error ${code}` };
-  return { submitted: "unknown", reason: exitFailed ? "exec failed, no error code (may have landed) — not replayed" : "no receipt (empty/wrong type)" };
+  if (typeof code === "string" && SUBMIT_REJECTED.has(code)) return { submitted: "no", reason: `rejected: ${code} (target agent absent — nothing submitted)` };
+  if (typeof code === "string" && code) return { submitted: "unknown", reason: `error ${code} can post-date submission (e.g. timeout/stalled) — not replayed` };
+  return { submitted: "unknown", reason: exitFailed ? "exec failed, no code (may have landed) — not replayed" : "no receipt (empty/wrong type)" };
 }
-/** Did a native `agent prompt --wait` actually settle? `working` is NOT a settle — it means the agent is still
- *  running (or the receipt is only an initial snapshot), so ONLY idle/done/blocked count as a resolved wait. A
- *  known state (incl. working) still proves the prompt was SUBMITTED, exposed via `known`. Empty/stale/bogus ->
- *  neither. Pure. NB: the receipt field is INFERRED — herdr 0.9.3's `--wait` could not be exercised live from
- *  outside a pane (the HERDR_ENV gate blocks `pane split --current`), so this is defensive, not sample-verified. */
-export function settledFrom(json: unknown): { settled: boolean; status: string; known: boolean } {
+// R13-B: a settle can be asserted ONLY from a VERIFIED native `--wait` receipt type together with a resolved
+// status. A bare agent_status (idle/working/...) is NOT proof — `agent get` returns the same field, so a stale
+// snapshot would be mistaken for a settle (reviewer). WAIT_SETTLE_TYPES is EMPTY until the R13 phase-2 real-machine
+// pass archives the actual `--wait` receipt type(s); until then every settle stays unknown (settled:false).
+export const WAIT_SETTLE_TYPES = new Set<string>();
+/** Settle only on a verified --wait receipt TYPE + a resolved status (idle/done/blocked; never `working`). status
+ *  is extracted best-effort for the human-readable note only — it is never, by itself, proof of settle. Pure. */
+export function settledFrom(json: unknown, settleTypes: ReadonlySet<string> = WAIT_SETTLE_TYPES): { settled: boolean; status: string } {
+  const type = (json as any)?.result?.type;
   const st = (json as any)?.result?.agent?.agent_status ?? (json as any)?.result?.agent_status;
-  const known = typeof st === "string" && (["idle", "working", "blocked", "done"] as string[]).includes(st);
-  const settled = known && st !== "working";
-  return { settled, status: known ? st : "unknown", known };
+  const status = typeof st === "string" && st ? st : "unknown";
+  const settled = typeof type === "string" && settleTypes.has(type) && (["idle", "done", "blocked"] as string[]).includes(status);
+  return { settled, status };
 }
 
 // ---- stall sentinel: a blocked agent is a human decision -> escalate (R2-P1-1, coordinator ruling R12) ----
@@ -329,13 +338,13 @@ export async function herdrPrompt(name: string, text: string, opts: { wait?: boo
   }
   const timeout = opts.waitTimeoutMs ?? 120000; // explicit, generous default — not a hidden 10s
   const r = await herdrRun(buildAgentPromptWait(name, text, timeout), timeout + 5000);
+  // R13-B: judge submission ONLY by a recognized receipt type (classifySubmit), never by the mere presence of an
+  // agent_status — `agent get` returns that field too, so it is not proof the prompt landed. Settle likewise needs a
+  // verified --wait type (currently none -> unknown). Never replay on anything short of a provable rejection.
   const c = classifySubmit(r.json, r.exitFailed);
   const s = settledFrom(r.json);
-  // a KNOWN live state (idle/working/blocked/done) proves the prompt landed even if the --wait receipt type differs;
-  // but only a RESOLVED state (never `working`) counts as settled.
-  const submitted: SubmitState = c.submitted === "yes" || s.known ? "yes" : c.submitted;
-  if (submitted !== "yes") return { submitted, settled: false, note: c.reason };
-  return { submitted: "yes", settled: s.settled, status: s.status, note: s.settled ? `settled:${s.status}` : `submitted; ${s.status === "working" ? "still working" : "not settled"} within timeout (not replayed)` };
+  if (c.submitted !== "yes") return { submitted: c.submitted, settled: false, status: s.status, note: c.reason };
+  return { submitted: "yes", settled: s.settled, status: s.status, note: s.settled ? `settled:${s.status}` : "submitted; settle shape unverified (unknown until R13 phase-2) — not replayed" };
 }
 
 export async function herdrReadClean(name: string, lines = 40): Promise<string> {
