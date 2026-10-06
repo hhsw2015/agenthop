@@ -55,11 +55,13 @@ live swarm):**
 - Cross-check: a dummy `exec -a claude sleep 600` is also identified+listed (`default_known_agent_idle_fallback`),
   isolating argv0 as the sole identity lever.
 - **Production acceptance (read-only, real member) — `docs/research/herdr-claude-state-evidence/LIVE-acceptance/`:**
-  the first member to restart via the fixed launcher (the coordinator session) is listed live as `claude` (pre-fix
-  always absent), classified from its OSC title (`rule: osc_title_working, evidence "◐ …"`), bound to a process whose
-  `ps` shows **argv0=claude**; `agent get` read live shows `state_change_seq` climbing (18→33) and status working→idle
-  = **real state flow in production**. This is ③'s coordinator-named scope-B acceptance for identify→list→flow.
-  `wait --until` and a `blocked` observation remain **unverified**.
+  the first member to restart via the fixed launcher (the coordinator session, `fe0376cd`) is listed live as `claude`
+  (pre-fix always absent), classified from its OSC title (`rule: osc_title_working, evidence "◐ …"`). Two raw
+  `agent list` snapshots of the SAME target (session `fe0376cd-…`, pane `w1:p1`) — `01`: working, `state_change_seq=18`;
+  `05`: idle, `state_change_seq=33` — show **real working→idle state flow in production** (independent of any single
+  counter and of the external coordinator file). A live `ps` (`03`) shows a process with `argv0=claude` (one support
+  layer, not alone the pane binding). This is ③'s coordinator-named scope-B acceptance for identify→list→flow.
+  `wait --until` and a `blocked` observation remain **unverified** (handed to the ③ follow-up).
 - Raw-vs-observed-vs-not-captured inventory: `docs/research/herdr-claude-state-evidence/FINAL-state-flow-note.txt`.
 
 ## Status: user-applied (2026-10-06 eve)
