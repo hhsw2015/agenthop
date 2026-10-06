@@ -127,6 +127,19 @@ user 裁定:语音 broker 转写用户话音→`herdr agent prompt <协调者> <
 
 **R13 两段走**:本批=诚实降级关门(上三条 + eval 纠正)。批后由协调者另派**隔离真机验证单**:herdr 内起隔离 server + 探针 agent(绝不碰现役),实跑全部回执形态、存档原始 JSON,据此填 `WAIT_SETTLE_TYPES`、收窄 `SUBMIT_REJECTED`、锁定 `agentPaneId` 字段名——能力到那单才算「验证过」。
 
+## 十二、R13 phase-2 隔离真机验证(已执行,原始回执存档 `docs/research/herdr-phase2-evidence/`)
+
+user 批准的一次性隔离真机跑: 专用 `XDG_CONFIG_HOME=/tmp/herdr-p2-cfg` + 专用 session `ahp2probe` + 真 codex 探针 `probeagent`,经 AppleScript 开独立 Ghostty 窗起 herdr TUI,全程只经隔离 socket 驱动,**绝不触现役 7 会话**;跑完即拆(session stop+delete、关探针窗、删临时 config、无残留进程)。八份原始 JSON 见 evidence 目录,摘要见其 `SUMMARY.md`。关键实证:
+
+- **① 提交成功形态(06)**:`agent prompt`(不带 --wait)真机回执 `type=agent_prompted` + `agent`(AgentInfo,`name="probeagent"` 已填、string `pane_id`)。正合 `classifySubmit` 正向绑定;**name 实测已填,非 null**。
+- **① --wait 落定(03/04)**:`agent prompt --wait` 对真 codex **即便提交成功且已完成也返回 `agent_prompt_stalled`**(读屏 05 证明 codex 真答出「17×23=391, Worked for 7s」,herdr 5000ms 窗口没捕捉到 working)。故 0.9.3 **无可信 --wait 落定回执**→`WAIT_SETTLE_TYPES` 保持空属**实证结论(非保守默认)**,settle 恒 unknown。
+- **② 提交后 stalled(03/04)**:`agent_prompt_stalled` 可在提交并完成之后出现→判 `no` 必错,`unknown` 正确(审查人 R3-P2-1 实证坐实)。
+- **③ 错误码(07/08)**:`agent_name_taken`(重名起)、`agent_not_found`(prompt 不存在 agent)真机确认→`HARD_NOT_STARTED`、`SUBMIT_REJECTED={agent_not_found}` 坐实。
+- **④ agent_started null-name(01)**:按名起的真机回执 `name` 已填(非 null);`agent get`(02)`type=agent_info`、`agent.pane_id` 在位(坐实 `agentPaneId`/`paneBound`)。**null-name 未出现→正向绑定不放宽、保持严格。**
+- **⑤ read 噪音(05)**:真实 chrome(codex 启动 hook-trust 屏、`Worked for Ns`、`› Ask Codex`、状态行)坐实 `stripTui` 丢弃项。
+
+**据此收窄代码**:`herdrPrompt` 改为**只凭不带 --wait 的 `agent prompt` 回执**确认提交(可信 `agent_prompted`),**不再用 --wait**(它会把真成功误成 unknown);`settled` 恒 false 并注明 0.9.3 无可信落定信号;`WAIT_SETTLE_TYPES`/`settledFrom`/`buildAgentPromptWait` 留作**休眠再启接缝**(未来 herdr 出可信 working/settle 信号时按新审填回)。`classifySubmit`/`HARD_NOT_STARTED`/`SUBMIT_REJECTED`/`agentPaneId` 均经真机回执坐实,逻辑不变、注释引证据。null-name 不放宽。送 01a0ff49 复验「存档↔收窄一致性」。
+
 **第四/五轮提交确认边界(rev5→rev6,b6bf97d3→新 SHA)**:审查人从**已装二进制内嵌 JSON schema 静态提取**(无需真机,证据 `~/Work/review-reports/.../installed-api-schema.json` + `schema-extraction.json` 的二进制 hash/位置):`agent_prompted` variant `required=[type, agent]`,`AgentInfo` 必有 string `pane_id`、`name` 可空。
 
 - **R4-P2-1(rev5)**:原 `classifySubmit` 只看 `result.type===agent_prompted`,缺 agent 的 body、或 `agent.name`=别的目标,`herdrPrompt('coordinator',...)` 都误判 yes。先按静态契约加:必须有 agent 对象 + string pane_id(缺形→unknown)。

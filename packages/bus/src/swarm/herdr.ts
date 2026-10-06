@@ -105,7 +105,9 @@ export function buildAgentStart(name: string, kind: string, paneId: string, args
     ...(args.length ? ["--", ...args] : [])];
 }
 export function buildAgentSubmit(name: string, text: string): string[] { return ["agent", "prompt", name, text]; }
-/** R2-P2-4: native `agent prompt --wait` (carries herdr's own activity guard) — submit + bounded settle in one. */
+/** Native `agent prompt --wait` builder. DORMANT: herdrPrompt no longer uses it — R13 phase-2 showed 0.9.3's --wait
+ *  returns agent_prompt_stalled even on a submitted+completed prompt (see WAIT_SETTLE_TYPES). Kept as the re-enable
+ *  seam for a future herdr whose --wait is reliable. */
 export function buildAgentPromptWait(name: string, text: string, timeoutMs: number): string[] {
   return ["agent", "prompt", name, text, "--wait", "--timeout", String(timeoutMs)];
 }
@@ -150,8 +152,9 @@ export type StartState = "started" | "not-started" | "unconfirmed";
 // Hard error codes that prove the agent NEVER launched (safe to clean the empty pane + fall back). Anything else
 // (agent_not_ready, timeouts, empty/garbled output) is UNCONFIRMED: it may already be a live agent, so we keep
 // the pane/name and never re-launch (H-P2-2).
-// Real codes from the installed herdr 0.9.3 binary (R2-P2-1 — static literal evidence: `agent_name_taken`,
-// `agent_pane_not_found/busy/unavailable` exist; `name_in_use` does NOT). An unknown code stays unconfirmed.
+// Real codes from the installed herdr 0.9.3 binary (static literal evidence; `name_in_use` does NOT exist). R13
+// phase-2 real-machine runs additionally confirmed `agent_name_taken` (07: duplicate start) and
+// `agent_pane_not_found` (empty-pane start) live. An unknown code stays unconfirmed.
 export const HARD_NOT_STARTED = new Set(["agent_name_taken", "agent_pane_not_found", "agent_pane_busy", "agent_pane_unavailable"]);
 
 /** Classify an `agent start` result into started / not-started / unconfirmed. Pure (the IO shell feeds it the
@@ -168,17 +171,20 @@ export function classifyStart(json: unknown, expectedName: string, exitFailed: b
 
 // ---- R2-P2-3/4 + R13-B: submit + settle classification for herdrPrompt (3-state; never fabricate, never replay) ----
 export type SubmitState = "yes" | "no" | "unknown";
-// R13-B: `no` is a WHITELIST of codes that PROVE the prompt was never submitted (the target agent is absent, so
-// nothing could land). timeout / agent_prompt_stalled — and any other code — can post-date a real submission, so
-// they are `unknown` (may have landed -> never replay). agent_not_found is a live-confirmed literal; the set stays
-// deliberately narrow until the R13 phase-2 real-machine pass archives the full `agent prompt` error taxonomy.
+// `no` is a WHITELIST of codes that PROVE the prompt was never submitted (the target agent is absent, so nothing
+// could land). timeout / agent_prompt_stalled — and any other code — can post-date a real submission, so they are
+// `unknown` (may have landed -> never replay). R13 phase-2 real-machine evidence confirms both ends: `agent prompt`
+// to a missing agent -> agent_not_found (08, provably not submitted); `agent prompt --wait` -> agent_prompt_stalled
+// even when the prompt WAS submitted and completed (03/04, must stay unknown). The set stays narrow.
 export const SUBMIT_REJECTED = new Set(["agent_not_found"]);
 /** Classify an `agent prompt` result against the STATIC installed-binary schema (R13 static contract lock; evidence
  *  herdr-b6bf97d3 .../installed-api-schema.json): the `agent_prompted` variant requires {type, agent}, and the
  *  agent (AgentInfo) requires a string `pane_id`; `name` is nullable/optional. So a valid "yes" needs the type AND
  *  a real agent object with pane_id AND — when the receipt names an agent — that name must be the one we prompted
  *  (a different name proves the receipt is for someone else). A whitelisted code -> no; everything else -> unknown
- *  (NEVER replay). Pure. */
+ *  (NEVER replay). R13 phase-2 real receipt (evidence 06) confirms the success shape: type=agent_prompted,
+ *  agent.name populated (="probeagent") + string pane_id — so real successes DO bind by name (null-name not
+ *  observed), and the positive match stays strict. Pure. */
 export function classifySubmit(json: unknown, expectedName: string, exitFailed: boolean): { submitted: SubmitState; reason: string } {
   const r = (json as any)?.result;
   if (r?.type === "agent_prompted") {
@@ -200,13 +206,17 @@ export function classifySubmit(json: unknown, expectedName: string, exitFailed: 
   if (typeof code === "string" && code) return { submitted: "unknown", reason: `error ${code} can post-date submission (e.g. timeout/stalled) — not replayed` };
   return { submitted: "unknown", reason: exitFailed ? "exec failed, no code (may have landed) — not replayed" : "no receipt (empty/wrong type)" };
 }
-// R13-B: a settle can be asserted ONLY from a VERIFIED native `--wait` receipt type together with a resolved
-// status. A bare agent_status (idle/working/...) is NOT proof — `agent get` returns the same field, so a stale
-// snapshot would be mistaken for a settle (reviewer). WAIT_SETTLE_TYPES is EMPTY until the R13 phase-2 real-machine
-// pass archives the actual `--wait` receipt type(s); until then every settle stays unknown (settled:false).
+// Settle can be asserted ONLY from a VERIFIED native `--wait` receipt type + a resolved status. A bare agent_status
+// (idle/working/...) is NOT proof — `agent get` returns the same field, so a stale snapshot would be mistaken for a
+// settle. R13 phase-2 real-machine result (docs/research/herdr-phase2-evidence): herdr 0.9.3 `--wait` returns
+// `agent_prompt_stalled` even on a submitted+completed prompt, so NO trustworthy settle receipt type exists ->
+// WAIT_SETTLE_TYPES stays EMPTY (empirically, not merely conservatively) and every settle stays unknown. This set,
+// settledFrom, and buildAgentPromptWait are the DORMANT re-enable seam: fill the set once a future herdr emits a
+// reliable settle/working signal, behind a fresh review. Not currently used by herdrPrompt.
 export const WAIT_SETTLE_TYPES = new Set<string>();
 /** Settle only on a verified --wait receipt TYPE + a resolved status (idle/done/blocked; never `working`). status
- *  is extracted best-effort for the human-readable note only — it is never, by itself, proof of settle. Pure. */
+ *  is extracted best-effort for the human-readable note only — it is never, by itself, proof of settle. Pure.
+ *  (Dormant: no verified settle type exists in herdr 0.9.3 — see WAIT_SETTLE_TYPES.) */
 export function settledFrom(json: unknown, settleTypes: ReadonlySet<string> = WAIT_SETTLE_TYPES): { settled: boolean; status: string } {
   const type = (json as any)?.result?.type;
   const st = (json as any)?.result?.agent?.agent_status ?? (json as any)?.result?.agent_status;
@@ -341,28 +351,22 @@ export async function herdrPaneClose(paneId: string): Promise<{ ok: boolean; not
 }
 
 /**
- * Voice/ops prompt (H-P2-5/6, R2-P2-3/4). `submitted` is a THREE-state fact, never a boolean that hides doubt:
- *  - "yes": an agent_prompted receipt (or, with --wait, a real settle receipt) proves it landed.
- *  - "no": an explicit error code proves it did not.
- *  - "unknown": exec timeout / lost output / wrong type — it MAY have landed, so we never replay it.
- * With {wait:true} we use herdr's native `agent prompt --wait` (R2-P2-4: that path carries herdr's own activity
- * guard) and still validate the settle receipt — an empty/stale read is NOT "settled".
+ * Voice/ops prompt. `submitted` is a THREE-state fact (yes/no/unknown), never a boolean that hides doubt.
+ *
+ * Phase-2 real-machine evidence (docs/research/herdr-phase2-evidence) drives the design:
+ *  - Submission is confirmed ONLY by the plain `agent prompt` receipt — it reliably returns `agent_prompted` bound
+ *    to the target (evidence 06).
+ *  - We deliberately do NOT use `agent prompt --wait`: in herdr 0.9.3 it returns `agent_prompt_stalled` even when the
+ *    prompt WAS submitted and the agent completed the work (evidence 03/04: a 7s codex turn went undetected), so it
+ *    would turn a real success into unknown. `--wait` is unusable as a confirmation signal here.
+ *  - There is NO reliable settle/working signal in 0.9.3 (WAIT_SETTLE_TYPES is empty), so `settled` stays false; a
+ *    caller that needs settle must poll its own signal until a future herdr exposes a trustworthy one.
  */
 export async function herdrPrompt(name: string, text: string, opts: { wait?: boolean; waitTimeoutMs?: number } = {}): Promise<{ submitted: SubmitState; settled: boolean; status?: string; note: string }> {
-  if (!opts.wait) {
-    const r = await herdrRun(buildAgentSubmit(name, text), 15000);
-    const c = classifySubmit(r.json, name, r.exitFailed);
-    return { submitted: c.submitted, settled: false, note: c.reason };
-  }
-  const timeout = opts.waitTimeoutMs ?? 120000; // explicit, generous default — not a hidden 10s
-  const r = await herdrRun(buildAgentPromptWait(name, text, timeout), timeout + 5000);
-  // R13-B: judge submission ONLY by a recognized receipt type (classifySubmit), never by the mere presence of an
-  // agent_status — `agent get` returns that field too, so it is not proof the prompt landed. Settle likewise needs a
-  // verified --wait type (currently none -> unknown). Never replay on anything short of a provable rejection.
+  const r = await herdrRun(buildAgentSubmit(name, text), 15000);
   const c = classifySubmit(r.json, name, r.exitFailed);
-  const s = settledFrom(r.json);
-  if (c.submitted !== "yes") return { submitted: c.submitted, settled: false, status: s.status, note: c.reason };
-  return { submitted: "yes", settled: s.settled, status: s.status, note: s.settled ? `settled:${s.status}` : "submitted; settle shape unverified (unknown until R13 phase-2) — not replayed" };
+  const settleNote = opts.wait ? " (settle not observable in herdr 0.9.3: --wait stalls even on a successful, completed prompt)" : "";
+  return { submitted: c.submitted, settled: false, note: c.reason + settleNote };
 }
 
 export async function herdrReadClean(name: string, lines = 40): Promise<string> {
