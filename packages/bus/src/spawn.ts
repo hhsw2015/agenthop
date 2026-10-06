@@ -4,6 +4,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, 
 import { homedir, platform } from "node:os";
 import path from "node:path";
 import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
+import { hasExplicitBinary, herdrAgentName, herdrAgentStates, herdrLaunch, herdrServerReachable, herdrSpawnable } from "./swarm/herdr.js";
 
 /**
  * Launch a chosen agent CLI as a dispatched sub-agent, in one of two modes the CALLING AGENT chooses
@@ -310,6 +311,9 @@ export type SpawnRecord = {
   outputFile?: string;
   exitCode?: number | null;
   exitedAt?: number;
+  /** S14: which launcher created this. "herdr" records carry a real pane id (windowId) + agent name (surfaceId)
+   *  so agenthop_spawned/despawn can find them; absence/"ghostty" = the osascript window path. */
+  backend?: "ghostty" | "herdr";
 };
 
 // TWO writers, TWO files, never a shared read-modify-write: the DISPATCHER owns the main record
@@ -320,6 +324,7 @@ export type SpawnRecord = {
 // surface, and gets no AGENTHOP_LAUNCH_ID — see HEADLESS_SCRUB_ENV).
 type MainRecord = {
   windowId: string | null;
+  surfaceId?: string | null; // S14: herdr records carry the agent name here (no child-claim for a herdr pane)
   launchId: string;
   tool: string;
   cwd: string;
@@ -331,6 +336,9 @@ type MainRecord = {
   outputFile?: string;
   exitCode?: number | null;
   exitedAt?: number;
+  /** S14: which launcher created this. "herdr" records carry a real pane id (windowId) + agent name (surfaceId)
+   *  so agenthop_spawned/despawn can find them; absence/"ghostty" = the osascript window path. */
+  backend?: "ghostty" | "herdr";
 };
 type ClaimRecord = { launchId: string; surfaceId: string; claimed: true };
 
@@ -402,8 +410,8 @@ export function readRegistry(home: string = homedir()): SpawnRecord[] {
         tool: m.tool,
         cwd: m.cwd,
         ts: m.ts,
-        surfaceId: claim?.surfaceId ?? null,
-        claimed: claim?.claimed ?? false,
+        surfaceId: claim?.surfaceId ?? m.surfaceId ?? null, // herdr records carry name in the main file (no claim)
+        claimed: claim?.claimed ?? (m.backend === "herdr" ? true : false),
         mode: m.mode ?? "visible", // records from before headless existed are all visible launches
         pid: m.pid,
         spawnerPid: m.spawnerPid,
@@ -411,6 +419,7 @@ export function readRegistry(home: string = homedir()): SpawnRecord[] {
         outputFile: m.outputFile,
         exitCode: m.exitCode,
         exitedAt: m.exitedAt,
+        ...(m.backend !== undefined ? { backend: m.backend } : {}),
       });
     } catch {
       // skip a malformed / partially-written record
@@ -428,6 +437,8 @@ export function recordSpawn(rec: SpawnRecord, home: string = homedir()): boolean
     tool: rec.tool,
     cwd: rec.cwd,
     ts: rec.ts,
+    ...(rec.surfaceId != null && rec.backend === "herdr" ? { surfaceId: rec.surfaceId } : {}),
+    ...(rec.backend !== undefined ? { backend: rec.backend } : {}),
     ...(rec.mode !== undefined ? { mode: rec.mode } : {}),
     ...(rec.pid !== undefined ? { pid: rec.pid } : {}),
     ...(rec.spawnerPid !== undefined ? { spawnerPid: rec.spawnerPid } : {}),
@@ -632,6 +643,37 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
   if (input.visible === false) return spawnHeadlessAgent(input, env);
   const cli = resolveCli(input.tool, env);
   if ("error" in cli) return { ok: false, arranged: false, note: cli.error };
+  // herdr backend (S14): when the dispatcher runs INSIDE a herdr pane and the server is reachable, launch the
+  // agent as a herdr pane (JSON receipt + lifecycle states) instead of blind-typing Ghostty. Any miss falls
+  // through to the Ghostty path below — the two backends coexist, Ghostty is not removed.
+  // herdr backend only when it can faithfully express the launch: inside a pane, server up, AND no explicit
+  // binary override (H-P2-3 — herdr --kind runs the canonical executable; a custom bin must go to Ghostty).
+  if (herdrSpawnable(env) && !hasExplicitBinary(input.tool, env) && (await herdrServerReachable())) {
+    const hcwd = input.cwd ?? homedir();
+    const taken = new Set((await herdrAgentStates()).map((a) => a.name)); // uniquify to avoid a hard name collision
+    const name = herdrAgentName(input.workspace ?? input.tool, taken);
+    const hlid = launchId(input.tool);
+    // R2-P2-6 (mirror Ghostty): record the launch REQUEST before any side effect, reserving the name as the handle.
+    // If we cannot even record it, do NOT launch — a live agent we failed to track could never be despawned.
+    if (!recordSpawn({ windowId: null, surfaceId: name, launchId: hlid, tool: input.tool, cwd: hcwd, ts: Date.now(), mode: "visible", backend: "herdr" })) {
+      return { ok: false, arranged: false, launchId: hlid, note: `Could not write a herdr launch record under ~/.agenthop/spawned; not launching (an untracked agent could never be despawned).` };
+    }
+    const r = await herdrLaunch({ name, kind: input.tool, cwd: hcwd, args: cli.argv.slice(1) });
+    if (r.state === "started" || r.state === "unconfirmed") {
+      // Fill in the real pane id, but only if the pending record still exists (a despawn in flight must not be
+      // resurrected). A failed update is reported honestly — an unconfirmed handle is never dressed up as success.
+      let recordOk = true;
+      if (r.paneId && readRegistry().some((rec) => rec.launchId === hlid)) {
+        recordOk = recordSpawn({ windowId: r.paneId, surfaceId: r.name ?? name, launchId: hlid, tool: input.tool, cwd: hcwd, ts: Date.now(), mode: "visible", backend: "herdr" });
+      }
+      const warn = !r.paneId ? " (no pane id returned; agenthop_despawn may not find it)" : !recordOk ? " (warning: could not persist the pane id; agenthop_despawn may not find it)" : "";
+      return { ok: r.state === "started", mode: "visible", arranged: false, launchId: hlid, surfaceId: r.name ?? name, windowId: r.paneId ?? undefined, note: `herdr(${r.state}): ${r.note}${warn}` };
+    }
+    // not-started: herdrLaunch proved it never came up and cleaned the empty pane it split, so the pending record
+    // points at nothing — forget it (no ghost) before falling back to Ghostty, which records its own launch.
+    forgetSpawn(hlid);
+    console.error(`[spawn] herdr not-started (${r.note}); falling back to Ghostty.`);
+  }
   if (platform() !== "darwin") return { ok: false, arranged: false, note: "agenthop_spawn (visible) currently supports macOS + Ghostty only. Try visible:false for a headless background run." };
   if (!ghosttyPresent()) return { ok: false, arranged: false, note: "Ghostty.app not found; a visible agenthop_spawn needs Ghostty. Try visible:false for a headless background run." };
   const dir = validateCwd(input.cwd);
@@ -934,6 +976,16 @@ export async function despawnAgent(handle: string, opts: DespawnOptions = {}): P
   }
   const rec = target.rec;
   if (rec.mode === "headless") return despawnHeadless(rec, home);
+  // R2-P2-7: herdr 0.9.3 exposes NO stable server-INSTANCE identity — `status server` gives only the reusable
+  // socket path, and `agent get` gives name + pane_id, both scoped per-server and reusable. So neither the recorded
+  // pane id nor a name+pane re-match can PROVE the live agent is the one THIS launch created: a different server
+  // instance (after a restart, or a --machine target) can hold an identical name+pane, and closing on that evidence
+  // would kill someone else's agent. Per coordinator ruling R11/R12, agenthop does NOT auto-close here — it reports
+  // herdr's jurisdiction honestly and keeps the record. Re-enable path: close once herdr exposes a server-instance
+  // id we can bind at spawn and verify at despawn (name+pane equality alone is never ownership).
+  if (rec.backend === "herdr") {
+    return { ok: false, note: `herdr manages this agent's lifecycle (agent ${rec.surfaceId ?? "?"}, pane ${rec.windowId ?? "?"}, launchId ${rec.launchId}). agenthop can't prove the live agent is the one this launch created — herdr exposes no stable server-instance id, and a name+pane match can be a different server's agent — so it won't close it. Close it via herdr directly; the record is kept.` };
+  }
   if (platform() !== "darwin") return { ok: false, note: "agenthop_despawn of a visible window currently supports macOS + Ghostty only." };
   if (!rec.claimed || !rec.surfaceId) {
     // The agent has not self-confirmed which surface it runs in (still starting up, or killed before it

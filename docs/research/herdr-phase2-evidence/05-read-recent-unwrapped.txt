@@ -1,0 +1,35 @@
+any changes and find
+issues
+
+
+  Hooks
+  Lifecycle hooks
+  from config and
+  enabled plugins.
+
+  ⚠ 1 hook needs
+  review before it
+  can run.
+
+  Issues
+  ⚠ clamping
+  SessionEnd hook
+  timeout to 3s in
+  /Users/wowdd1/.c
+  odex/hooks.json
+
+  Event
+     Active/Instal
+  led
+
+  PreToolUse
+  PermissionRequest
+  PostToolUse
+  PreCompact
+  PostCompact
+› SessionStart
+  SessionEnd
+  UserPromptSubmit
+↓
+
+  t trust all · ente

@@ -1,0 +1,1 @@
+{"error":{"code":"agent_name_taken","message":"agent name probeagent is already used; candidates: terminal_id=term_65d27d9c9b4162 pane_id=w1:p2 workspace_id=w1 tab_id=w1:t1 cwd=/private/tmp status=Idle"},"id":"cli:agent:start"}
