@@ -4,7 +4,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, 
 import { homedir, platform } from "node:os";
 import path from "node:path";
 import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
-import { hasExplicitBinary, herdrAgentName, herdrAgentStates, herdrLaunch, herdrPaneClose, herdrServerReachable, herdrSpawnable } from "./swarm/herdr.js";
+import { hasExplicitBinary, herdrAgentName, herdrAgentStates, herdrLaunch, herdrServerReachable, herdrSpawnable } from "./swarm/herdr.js";
 
 /**
  * Launch a chosen agent CLI as a dispatched sub-agent, in one of two modes the CALLING AGENT chooses
@@ -653,13 +653,25 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
     const taken = new Set((await herdrAgentStates()).map((a) => a.name)); // uniquify to avoid a hard name collision
     const name = herdrAgentName(input.workspace ?? input.tool, taken);
     const hlid = launchId(input.tool);
+    // R2-P2-6 (mirror Ghostty): record the launch REQUEST before any side effect, reserving the name as the handle.
+    // If we cannot even record it, do NOT launch — a live agent we failed to track could never be despawned.
+    if (!recordSpawn({ windowId: null, surfaceId: name, launchId: hlid, tool: input.tool, cwd: hcwd, ts: Date.now(), mode: "visible", backend: "herdr" })) {
+      return { ok: false, arranged: false, launchId: hlid, note: `Could not write a herdr launch record under ~/.agenthop/spawned; not launching (an untracked agent could never be despawned).` };
+    }
     const r = await herdrLaunch({ name, kind: input.tool, cwd: hcwd, args: cli.argv.slice(1) });
     if (r.state === "started" || r.state === "unconfirmed") {
-      // H-P2-7: register with the real handle so agenthop_spawned/despawn can find it. Unconfirmed is recorded
-      // too (a pane may be live) and does NOT fall through — never double-spawn.
-      recordSpawn({ windowId: r.paneId ?? null, surfaceId: r.name ?? name, launchId: hlid, tool: input.tool, cwd: hcwd, ts: Date.now(), mode: "visible", backend: "herdr" });
-      return { ok: r.state === "started", mode: "visible", arranged: false, launchId: hlid, surfaceId: r.name ?? name, windowId: r.paneId ?? undefined, note: `herdr(${r.state}): ${r.note}` };
+      // Fill in the real pane id, but only if the pending record still exists (a despawn in flight must not be
+      // resurrected). A failed update is reported honestly — an unconfirmed handle is never dressed up as success.
+      let recordOk = true;
+      if (r.paneId && readRegistry().some((rec) => rec.launchId === hlid)) {
+        recordOk = recordSpawn({ windowId: r.paneId, surfaceId: r.name ?? name, launchId: hlid, tool: input.tool, cwd: hcwd, ts: Date.now(), mode: "visible", backend: "herdr" });
+      }
+      const warn = !r.paneId ? " (no pane id returned; agenthop_despawn may not find it)" : !recordOk ? " (warning: could not persist the pane id; agenthop_despawn may not find it)" : "";
+      return { ok: r.state === "started", mode: "visible", arranged: false, launchId: hlid, surfaceId: r.name ?? name, windowId: r.paneId ?? undefined, note: `herdr(${r.state}): ${r.note}${warn}` };
     }
+    // not-started: herdrLaunch proved it never came up and cleaned the empty pane it split, so the pending record
+    // points at nothing — forget it (no ghost) before falling back to Ghostty, which records its own launch.
+    forgetSpawn(hlid);
     console.error(`[spawn] herdr not-started (${r.note}); falling back to Ghostty.`);
   }
   if (platform() !== "darwin") return { ok: false, arranged: false, note: "agenthop_spawn (visible) currently supports macOS + Ghostty only. Try visible:false for a headless background run." };
@@ -964,13 +976,15 @@ export async function despawnAgent(handle: string, opts: DespawnOptions = {}): P
   }
   const rec = target.rec;
   if (rec.mode === "headless") return despawnHeadless(rec, home);
-  // H-P2-7: a herdr-backed launch is closed via herdr (its pane), not osascript. We located the record by its
-  // per-launch id; close the real pane handle, else report herdr's jurisdiction honestly (never guess by name).
+  // R2-P2-7: herdr 0.9.3 exposes NO stable server-INSTANCE identity — `status server` gives only the reusable
+  // socket path, and `agent get` gives name + pane_id, both scoped per-server and reusable. So neither the recorded
+  // pane id nor a name+pane re-match can PROVE the live agent is the one THIS launch created: a different server
+  // instance (after a restart, or a --machine target) can hold an identical name+pane, and closing on that evidence
+  // would kill someone else's agent. Per coordinator ruling R11/R12, agenthop does NOT auto-close here — it reports
+  // herdr's jurisdiction honestly and keeps the record. Re-enable path: close once herdr exposes a server-instance
+  // id we can bind at spawn and verify at despawn (name+pane equality alone is never ownership).
   if (rec.backend === "herdr") {
-    if (!rec.windowId) return { ok: false, note: `herdr launch ${rec.launchId} (agent ${rec.surfaceId ?? "?"}) has no recorded pane id; close it via herdr. Record kept.` };
-    const hr = await herdrPaneClose(rec.windowId);
-    if (hr.ok) { forgetSpawn(rec.launchId, home); return { ok: true, note: `Closed herdr pane ${rec.windowId} (agent ${rec.surfaceId ?? "?"}, launchId ${rec.launchId}).` }; }
-    return { ok: false, note: `Could not close herdr pane ${rec.windowId} (${hr.note}); herdr manages its lifecycle — close via herdr. Record kept.` };
+    return { ok: false, note: `herdr manages this agent's lifecycle (agent ${rec.surfaceId ?? "?"}, pane ${rec.windowId ?? "?"}, launchId ${rec.launchId}). agenthop can't prove the live agent is the one this launch created — herdr exposes no stable server-instance id, and a name+pane match can be a different server's agent — so it won't close it. Close it via herdr directly; the record is kept.` };
   }
   if (platform() !== "darwin") return { ok: false, note: "agenthop_despawn of a visible window currently supports macOS + Ghostty only." };
   if (!rec.claimed || !rec.surfaceId) {

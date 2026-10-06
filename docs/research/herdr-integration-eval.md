@@ -92,4 +92,19 @@ user 裁定:语音 broker 转写用户话音→`herdr agent prompt <协调者> <
 
 验证:herdr+resume selftest 全绿(含四反例、inbox 往返、启动分型、spaced 参数),bus tsc=0,scripts tsc=0。接线(live dispatcher 巡检)仍留 d7f6c917。
 
+## 十、二轮对抗复验修复(rev3,d0d886a→新 SHA)
+
+复验 01a0ff49(报告 `~/Work/review-reports/herdr-rereview-d0d886a-2026-10-06.md`):H-P2-1/H-P2-3 已核销,余八项。协调者 R12 授权「白名单整个降级为一律呈批」。本轮一次性修全,并落实复验追加的 R2-P2-7 作用域纠偏:
+
+- **R2-P1-1(P1)哨兵一律呈批**:`WHITELIST_V1=[]`,`sentinelDecision` **恒 escalate 且不带 keys**。理由:herdr 0.9.3 只给**自由文本读屏**,无「当前待答提示」结构化信号——任何文本启发式都分不清活提示与 scrollback/工具输出里的信任句(四反例正是钻这个空子)。读屏只用于**人看的摘要**,绝不用于判定。重开路径:herdr 日后吐出结构化当前提示字段后,在**那个字段**上恢复匹配(永不在读屏上),须过新一轮审。
+- **R2-P2-1 真实错误码**:`HARD_NOT_STARTED` 改为安装版二进制里**实有**的 `agent_name_taken`/`agent_pane_not_found`(实测确认)/`agent_pane_busy`/`agent_pane_unavailable`;猜测的 `name_in_use` 等移除,未知码→unconfirmed(回归用例钉住)。resume 启动硬失败已回落 Ghostty(原已具备)。
+- **R2-P2-2 转义解析**:`shellTokenize`/`splitCommand` 重写为逐字符扫描(`scanCommand`):单引号字面,双引号内 `\"`/`\\` 转义,引号外 `\` 转义下一字符;`balanced` 是**解析状态**(收尾在引号外、无悬空转义)非字符计数。转义引号不再误触发引号开合(indexOf 版的洞)。不平衡/悬空转义→回落 Ghostty。
+- **R2-P2-3 提交三态**:`herdrPrompt.submitted` 改 `yes`/`no`/`unknown`——有 `agent_prompted` 回执=yes,显式错误码=no,exec 超时/丢输出/错型=unknown(**可能已落,绝不重放**)。
+- **R2-P2-4 原生活动门**:等待走 herdr 原生 `agent prompt --wait --timeout`(带 herdr 自己的活动门),再 `settledFrom` 校验回执里有真实终态(idle/done/blocked/working);空/陈旧读≠settled。
+- **R2-P2-5 pane 绑定**:`herdrLaunch` 在 `agent_started` 之后再 `agent get <name>` 取 `pane_id`,必须等于本次 split 的 pane(`paneBound`)才算 started;不等/取不到→unconfirmed 保留句柄不重拉(防同名 agent 挂到别的 pane)。
+- **R2-P2-6 注册表方向**:spawn 的 herdr 分支与 Ghostty 对齐——**启动前**先 `recordSpawn` pending(保留名字作句柄),写不进就**不启动**;启动后仅在 pending 记录仍在时补 pane_id,补写失败如实报(不包装成功);硬失败 `forgetSpawn` 清 pending 再回落。
+- **R2-P2-7 despawn 作用域(复验追加)**:实测 herdr 0.9.3 **无稳定 server 实例身份**(`status server` 只给可复用 socket 路径,`session:null`;`agent get` 只给同样按 server 作用域、可复用的 name+pane)。故**单凭 pane,或 name+pane 相等,都证明不了所有权**:另一 server 实例(重启或 `--machine`)可持有相同 name+pane,照关会误杀他人 agent。按 R11/R12,herdr 记录的 despawn **不自动关**,如实返回 herdr 管辖、保留记录。重开路径:herdr 日后给出 server 实例 id(spawn 时绑定、despawn 时核验)再恢复关闭。
+
+验证:herdr selftest 全绿(新增转义四例、pane 绑定、提交三态、settle 校验、一律呈批含四反例、真实错误码回归),resume selftest 全绿,bus tsc=0,scripts tsc=0。能力实测(临时 server,已清理):`agent_pane_not_found`/`agent_not_found` 错误码、`agent list` schema、`status server --json`(无实例 id)、`agent prompt --wait` 原生路径均现场确认。接线(live dispatcher 巡检)仍留 d7f6c917。
+
 (研究口径:只读+能力验证,不迁移现役会话(user 亲手),不并 main/不 push;送审即停。基线:spawn.ts/resume.ts 现函数 + S19/S24/F36。)

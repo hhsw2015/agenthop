@@ -51,34 +51,48 @@ export function herdrAgentName(label: string, taken: ReadonlySet<string> = new S
 /** H-P2-4: a quote-aware tokenizer so a legal spaced arg stays ONE arg. Handles '...' and "..." segments
  *  (strip the quotes, keep internal spaces); concatenates adjacent quoted/bare runs. No shell escapes needed for
  *  our commands. Pure. e.g. `codex --config "a = 'b'" resume s` -> ["codex","--config","a = 'b'","resume","s"]. */
-export function shellTokenize(cmd: string): string[] {
+/** A proper char-by-char shell-ish scan (R2-P2-2): single quotes are literal; double quotes honor \\ and \"
+ *  escapes; a backslash outside quotes escapes the next char. `balanced` is the PARSE state (ended outside any
+ *  quote, no dangling escape) — not a character count. Pure. */
+export function scanCommand(cmd: string): { tokens: string[]; balanced: boolean } {
+  const s = cmd ?? "";
   const out: string[] = [];
   let cur = ""; let has = false; let i = 0;
-  const s = cmd ?? "";
+  let mode: "none" | "single" | "double" = "none";
   while (i < s.length) {
     const ch = s[i]!;
-    if (ch === " " || ch === "\t" || ch === "\n") { if (has) { out.push(cur); cur = ""; has = false; } i++; continue; }
-    if (ch === "'" || ch === '"') {
-      const close = s.indexOf(ch, i + 1);
-      if (close === -1) { cur += s.slice(i + 1); has = true; i = s.length; } // unbalanced: take the rest
-      else { cur += s.slice(i + 1, close); has = true; i = close + 1; }
-      continue;
+    if (mode === "none") {
+      if (ch === " " || ch === "\t" || ch === "\n") { if (has) { out.push(cur); cur = ""; has = false; } i++; continue; }
+      if (ch === "'") { mode = "single"; has = true; i++; continue; }
+      if (ch === '"') { mode = "double"; has = true; i++; continue; }
+      if (ch === "\\") { if (i + 1 < s.length) { cur += s[i + 1]; has = true; i += 2; continue; } return finish(out, cur, has, false); }
+      cur += ch; has = true; i++; continue;
     }
-    cur += ch; has = true; i++;
+    if (mode === "single") {
+      if (ch === "'") { mode = "none"; i++; continue; }
+      cur += ch; i++; continue;
+    }
+    // double
+    if (ch === "\\" && i + 1 < s.length && (s[i + 1] === '"' || s[i + 1] === "\\")) { cur += s[i + 1]; i += 2; continue; }
+    if (ch === '"') { mode = "none"; i++; continue; }
+    cur += ch; i++; continue;
   }
+  return finish(out, cur, has, mode === "none");
+}
+function finish(out: string[], cur: string, has: boolean, balanced: boolean): { tokens: string[]; balanced: boolean } {
   if (has) out.push(cur);
-  return out;
+  return { tokens: out, balanced };
 }
 
-/** Split a full launch/resume command into { kind, args } for `agent start <name> --kind <kind> -- <args>`.
- *  Quote-aware (H-P2-4). Returns hasUnbalanced when the command had an unterminated quote (caller should refuse
- *  herdr and use the original backend rather than launch a corrupted arg list). Pure. */
+/** Tokens only (back-compat helper). */
+export function shellTokenize(cmd: string): string[] { return scanCommand(cmd).tokens; }
+
+/** Split a full launch/resume command into { kind, args, balanced }. Escape/quote-aware (R2-P2-2). When not
+ *  balanced (unterminated quote / dangling escape) the caller must refuse herdr and use the original backend
+ *  rather than launch a corrupted arg list. Pure. */
 export function splitCommand(cmd: string): { kind: string; args: string[]; balanced: boolean } {
-  const raw = cmd ?? "";
-  const dq = (raw.match(/"/g) ?? []).length, sq = (raw.match(/'/g) ?? []).length;
-  const balanced = dq % 2 === 0 && sq % 2 === 0;
-  const toks = shellTokenize(raw);
-  return { kind: toks[0] ?? "", args: toks.slice(1), balanced };
+  const { tokens, balanced } = scanCommand(cmd);
+  return { kind: tokens[0] ?? "", args: tokens.slice(1), balanced };
 }
 
 // ---- argv builders (pure) ----
@@ -91,6 +105,11 @@ export function buildAgentStart(name: string, kind: string, paneId: string, args
     ...(args.length ? ["--", ...args] : [])];
 }
 export function buildAgentSubmit(name: string, text: string): string[] { return ["agent", "prompt", name, text]; }
+/** R2-P2-4: native `agent prompt --wait` (carries herdr's own activity guard) — submit + bounded settle in one. */
+export function buildAgentPromptWait(name: string, text: string, timeoutMs: number): string[] {
+  return ["agent", "prompt", name, text, "--wait", "--timeout", String(timeoutMs)];
+}
+export function buildAgentGet(name: string): string[] { return ["agent", "get", name]; }
 export function buildAgentWait(name: string, until: readonly AgentState[], timeoutMs: number): string[] {
   return ["agent", "wait", name, ...until.flatMap((s) => ["--until", s]), "--timeout", String(timeoutMs)];
 }
@@ -114,12 +133,26 @@ export function startedName(json: unknown, expectedName: string): string | null 
   const n = r.agent?.name;
   return typeof n === "string" && n === expectedName ? n : null;
 }
+/** R2-P2-5: the pane a live agent is bound to, from an `agent get` (or `agent started`) result. herdr is
+ *  internally consistent — the split receipt uses result.pane.pane_id and `agent get` returns the agent with a
+ *  pane_id. Defensive across the likely shapes; null when absent. Pure. */
+export function agentPaneId(json: unknown): string | null {
+  const r = (json as any)?.result;
+  const p = r?.agent?.pane_id ?? r?.pane_id ?? r?.pane?.pane_id ?? r?.agent?.pane?.pane_id;
+  return typeof p === "string" && p ? p : null;
+}
+/** The live agent is bound to the exact pane we launched into (no same-name reattach on another pane). Pure. */
+export function paneBound(getJson: unknown, expectedPane: string): boolean {
+  return !!expectedPane && agentPaneId(getJson) === expectedPane;
+}
 
 export type StartState = "started" | "not-started" | "unconfirmed";
 // Hard error codes that prove the agent NEVER launched (safe to clean the empty pane + fall back). Anything else
 // (agent_not_ready, timeouts, empty/garbled output) is UNCONFIRMED: it may already be a live agent, so we keep
 // the pane/name and never re-launch (H-P2-2).
-export const HARD_NOT_STARTED = new Set(["name_in_use", "name_taken", "duplicate_name", "unknown_kind", "invalid_kind", "pane_not_found", "pane_unavailable", "pane_busy", "no_such_pane"]);
+// Real codes from the installed herdr 0.9.3 binary (R2-P2-1 — static literal evidence: `agent_name_taken`,
+// `agent_pane_not_found/busy/unavailable` exist; `name_in_use` does NOT). An unknown code stays unconfirmed.
+export const HARD_NOT_STARTED = new Set(["agent_name_taken", "agent_pane_not_found", "agent_pane_busy", "agent_pane_unavailable"]);
 
 /** Classify an `agent start` result into started / not-started / unconfirmed. Pure (the IO shell feeds it the
  *  parsed JSON, or null for a timeout/no-output). */
@@ -133,41 +166,43 @@ export function classifyStart(json: unknown, expectedName: string, exitFailed: b
   return { state: "unconfirmed", reason: exitFailed ? `unrecognized failure (${code ?? "no code"})` : "no valid receipt (empty/wrong type)" };
 }
 
-// ---- stall sentinel: classify a blocked agent's CURRENT prompt into auto-clear vs escalate ----
-
-/** H-P1-1: the active prompt is at the BOTTOM of the screen. Take the tail (after chrome-strip) so a trust
- *  question sitting in SCROLLBACK history or quoted in tool output cannot be mistaken for the current prompt. */
-export function currentPromptRegion(screen: string, tailLines = 12): string {
-  const lines = stripTui(screen).split("\n").filter((l) => l.trim() !== "");
-  return lines.slice(-tailLines).join("\n");
+// ---- R2-P2-3/4: submit + settle classification for herdrPrompt (3-state; never fabricate, never replay) ----
+export type SubmitState = "yes" | "no" | "unknown";
+/** receipt agent_prompted -> yes; explicit error code -> no; else (exec timeout / lost / wrong type) -> unknown
+ *  (MAY have landed -> caller must NOT replay). Pure. */
+export function classifySubmit(json: unknown, exitFailed: boolean): { submitted: SubmitState; reason: string } {
+  if ((json as any)?.result?.type === "agent_prompted") return { submitted: "yes", reason: "agent_prompted receipt" };
+  const code = (json as any)?.error?.code;
+  if (typeof code === "string" && code) return { submitted: "no", reason: `explicit error ${code}` };
+  return { submitted: "unknown", reason: exitFailed ? "exec failed, no error code (may have landed) — not replayed" : "no receipt (empty/wrong type)" };
+}
+/** Did a native `agent prompt --wait` actually settle? Require a real terminal state, not an empty/stale read.
+ *  (The native --wait carries herdr's activity guard; this validates the receipt shape on top.) Pure. */
+export function settledFrom(json: unknown): { settled: boolean; status: string } {
+  const st = (json as any)?.result?.agent?.agent_status ?? (json as any)?.result?.agent_status;
+  const ok = typeof st === "string" && (["idle", "done", "blocked", "working"] as string[]).includes(st);
+  return { settled: ok, status: ok ? st : "unknown" };
 }
 
-export interface BlockedRule {
-  id: string;
-  /** Matches the FULL mechanical form of this prompt in the current region — not a loose keyword. */
-  match: RegExp;
-  keys: string[];
-  why: string;
-}
+// ---- stall sentinel: a blocked agent is a human decision -> escalate (R2-P1-1, coordinator ruling R12) ----
 
-/** Whitelist v1 — DELIBERATELY NARROW, dogfood-only, and matched ONLY against the current prompt region with the
- *  FULL canonical phrasing (H-P1-1). `\bhooks?\b` word-boundary excludes "webhook". Near-misses ("trust this
- *  deployment", "allow this webhook", stale/quoted trust) do NOT match and therefore escalate. */
-export const WHITELIST_V1: BlockedRule[] = [
-  { id: "dir-trust", match: /do you trust the files in this (folder|directory|workspace)\b/i, keys: ["Enter"], why: "directory-trust prompt (S24 silent item): the dir is ours" },
-  { id: "hook-trust", match: /\b(trust|allow)\b[^\n]{0,40}\bhooks?\b[^\n]{0,20}\b(in this|for this|run|execute)\b/i, keys: ["Enter"], why: "hook-trust prompt (S24 silent item): our own hooks" },
-];
+export interface BlockedRule { id: string; match: RegExp; keys: string[]; why: string }
+
+/** Whitelist v1 is EMPTY by coordinator ruling R12 (R2-P1-1). herdr 0.9.3 exposes NO structured "current pending
+ *  prompt" — only a free-text screen scrape — so no text heuristic can reliably separate the live prompt from a
+ *  trust question sitting in scrollback or quoted inside tool output (the four review counterexamples gamed exactly
+ *  that). Rather than risk auto-answering the wrong box, every blocked agent escalates to the user (S24). Re-enable
+ *  path: when herdr emits the current prompt as a structured field, matching can be restored on THAT field (never
+ *  on the scrape), behind a fresh review. */
+export const WHITELIST_V1: BlockedRule[] = [];
 
 export interface SentinelDecision { action: "auto-clear" | "escalate"; ruleId?: string; keys?: string[]; reason: string }
 
-/** Decide on a blocked agent's screen. Matches the whitelist ONLY within the current prompt region, requiring the
- *  full mechanical form. Can't confirm the prompt identity -> escalate (never synthesize an answer). Pure. */
-export function sentinelDecision(screen: string, whitelist: readonly BlockedRule[] = WHITELIST_V1): SentinelDecision {
-  const region = currentPromptRegion(screen);
-  for (const r of whitelist) {
-    if (r.match.test(region)) return { action: "auto-clear", ruleId: r.id, keys: r.keys, reason: r.why };
-  }
-  return { action: "escalate", reason: "not a whitelisted mechanical prompt in the current region — a human decision; escalate via S19" };
+/** v1 ALWAYS escalates (auto-clear disabled, R2-P1-1): a blocked agent is routed to the coordinator inbox as an
+ *  S19 approval (buildApprovalDoc), never an auto-synthesized keypress. The screen is read only for the human's
+ *  summary, never to decide. Pure. */
+export function sentinelDecision(_screen: string, _whitelist: readonly BlockedRule[] = WHITELIST_V1): SentinelDecision {
+  return { action: "escalate", reason: "auto-clear disabled in v1 (herdr gives no structured current-prompt signal); every blocked agent escalates to the user via S19" };
 }
 
 /** H-P2-1: build the S19 approval request as a VALID InboxMsg (via:"local" — the schema accepts local/relay, not
@@ -258,7 +293,14 @@ export async function herdrLaunch(opts: { name: string; kind: string; cwd: strin
     return { state: "not-started", paneId, note: `${cls.reason}; cleaned pane ${paneId}` };
   }
   if (cls.state === "unconfirmed") return { state: "unconfirmed", paneId, name: opts.name, note: `${cls.reason}; pane ${paneId} kept (no re-launch)` };
-  return { state: "started", paneId, name: opts.name, note: "agent_started" };
+  // R2-P2-5: a valid agent_started receipt is not enough — prove the live agent is bound to the pane we just split
+  // (herdr could attach a same-name agent on another pane). agent get -> pane_id must equal paneId; else keep the
+  // handle but report unconfirmed (never re-launch, never fabricate success).
+  const get = await herdrRun(buildAgentGet(opts.name), 8000);
+  if (!paneBound(get.json, paneId)) {
+    return { state: "unconfirmed", paneId, name: opts.name, note: `agent_started but pane bind unconfirmed (get pane=${agentPaneId(get.json) ?? "none"} != ${paneId}); kept, NOT re-launched` };
+  }
+  return { state: "started", paneId, name: opts.name, note: "agent_started + pane-bound" };
 }
 
 /** Close a herdr pane by id (despawn of a herdr-backed launch). */
@@ -268,19 +310,26 @@ export async function herdrPaneClose(paneId: string): Promise<{ ok: boolean; not
 }
 
 /**
- * Voice/ops prompt (H-P2-5/6): SUBMIT (confirmed by the agent_prompted receipt), then OPTIONALLY wait for a
- * state in a SEPARATE bounded call. `submitted` is true only with a real submit receipt — an exec timeout alone
- * never implies submission (no blind replay). On wait timeout: {submitted:true, settled:false}.
+ * Voice/ops prompt (H-P2-5/6, R2-P2-3/4). `submitted` is a THREE-state fact, never a boolean that hides doubt:
+ *  - "yes": an agent_prompted receipt (or, with --wait, a real settle receipt) proves it landed.
+ *  - "no": an explicit error code proves it did not.
+ *  - "unknown": exec timeout / lost output / wrong type — it MAY have landed, so we never replay it.
+ * With {wait:true} we use herdr's native `agent prompt --wait` (R2-P2-4: that path carries herdr's own activity
+ * guard) and still validate the settle receipt — an empty/stale read is NOT "settled".
  */
-export async function herdrPrompt(name: string, text: string, opts: { wait?: boolean; until?: readonly AgentState[]; waitTimeoutMs?: number } = {}): Promise<{ submitted: boolean; settled: boolean; note: string }> {
-  const sub = await herdrRun(buildAgentSubmit(name, text), 15000);
-  const submitted = sub.json?.result?.type === "agent_prompted";
-  if (!submitted) return { submitted: false, settled: false, note: `submit unconfirmed: ${sub.json?.error?.code ?? sub.raw.slice(0, 120)}` };
-  if (!opts.wait) return { submitted: true, settled: false, note: "agent_prompted" };
+export async function herdrPrompt(name: string, text: string, opts: { wait?: boolean; waitTimeoutMs?: number } = {}): Promise<{ submitted: SubmitState; settled: boolean; status?: string; note: string }> {
+  if (!opts.wait) {
+    const r = await herdrRun(buildAgentSubmit(name, text), 15000);
+    const c = classifySubmit(r.json, r.exitFailed);
+    return { submitted: c.submitted, settled: false, note: c.reason };
+  }
   const timeout = opts.waitTimeoutMs ?? 120000; // explicit, generous default — not a hidden 10s
-  const w = await herdrRun(buildAgentWait(name, opts.until ?? ["idle", "done", "blocked"], timeout), timeout + 5000);
-  if (w.exitFailed) return { submitted: true, settled: false, note: "submitted; wait timed out/failed (not replayed)" };
-  return { submitted: true, settled: true, note: w.json?.result?.agent?.agent_status ?? "settled" };
+  const r = await herdrRun(buildAgentPromptWait(name, text, timeout), timeout + 5000);
+  const c = classifySubmit(r.json, r.exitFailed);
+  const s = settledFrom(r.json);
+  const submitted: SubmitState = c.submitted === "yes" || s.settled ? "yes" : c.submitted; // a valid settle proves submission even if the --wait receipt type differs
+  if (submitted !== "yes") return { submitted, settled: false, note: c.reason };
+  return { submitted: "yes", settled: s.settled, status: s.status, note: s.settled ? `settled:${s.status}` : "submitted; not settled within timeout (not replayed)" };
 }
 
 export async function herdrReadClean(name: string, lines = 40): Promise<string> {
