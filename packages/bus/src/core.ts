@@ -23,7 +23,7 @@ export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
  * is on; a session on this machine wins if it somehow appears on both.
  */
 
-export type BusMessage = { from: string; fromLabel: string; text: string; via: "local" | "relay" };
+export type BusMessage = { from: string; fromLabel: string; text: string; via: string }; // via is a free-form provenance label (F38): "local"/"relay" carry semantics, an inbox label like "durable-inbox" passes through
 
 export type BusCore = {
   self: SelfInfo;

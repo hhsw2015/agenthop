@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, quarantineInbox } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox } from "../src/inbox.js";
 
 let HOME: string;
 beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-inbox-")); });
@@ -84,7 +84,8 @@ describe("durable inbox", () => {
   test("B8/F32: writeInbox REJECTS an invalid record at the write boundary — never publishes a file the receiver can only quarantine", () => {
     // The three reviewer cases (bus-reachability B8): a bad ts must be rejected by the writer, not published and then
     // quarantined by the receiver (and ts=null previously CRASHED on `.toString()` instead of a clean rejection).
-    for (const bad of [{ ...msg("x", 0), ts: "bad-clock" }, { ...msg("x", 0), ts: NaN }, { ...msg("x", 0), ts: null }, { ...msg("x", 0), via: "carrier-pigeon" }, { ...msg("x", 1000), from: 42 }]) {
+    // F38: an unknown non-empty via ("carrier-pigeon") is now VALID (a label, not poison); an EMPTY via is still rejected.
+    for (const bad of [{ ...msg("x", 0), ts: "bad-clock" }, { ...msg("x", 0), ts: NaN }, { ...msg("x", 0), ts: null }, { ...msg("x", 0), via: "" }, { ...msg("x", 1000), from: 42 }]) {
       expect(() => writeInbox(HOME, "s1", bad as never)).toThrow();
     }
     expect(claimInbox(HOME, ["s1"], "p").length).toBe(0); // nothing was published
@@ -104,7 +105,12 @@ describe("F28 poison-pill defense", () => {
     expect(validInboxMsg({ fromLabel: "b", text: "hi", via: "local", ts: 1 })).toBeNull();      // no from (the exact crash input)
     expect(validInboxMsg({ from: "a", fromLabel: "b", via: "local", ts: 1 })).toBeNull();        // no text
     expect(validInboxMsg({ from: "a", fromLabel: "b", text: "hi", via: "local" })).toBeNull();   // no ts
-    expect(validInboxMsg({ from: "a", fromLabel: "b", text: "hi", via: "bogus", ts: 1 })).toBeNull(); // bad via
+    // F38: `via` is a free-form provenance LABEL — a non-empty unknown label ("durable-inbox") PASSES (kept + shown as-is);
+    // an EMPTY, missing, or mistyped via is still rejected as poison.
+    expect(validInboxMsg({ from: "a", fromLabel: "b", text: "hi", via: "durable-inbox", ts: 1 })).toMatchObject({ via: "durable-inbox" });
+    expect(validInboxMsg({ from: "a", fromLabel: "b", text: "hi", via: "", ts: 1 })).toBeNull();     // empty via
+    expect(validInboxMsg({ from: "a", fromLabel: "b", text: "hi", ts: 1 })).toBeNull();               // missing via
+    expect(validInboxMsg({ from: "a", fromLabel: "b", text: "hi", via: 7, ts: 1 })).toBeNull();       // via mistyped (not a string)
     expect(validInboxMsg({ from: 1, fromLabel: "b", text: "hi", via: "local", ts: 1 })).toBeNull();   // from mistyped
     expect(validInboxMsg(null)).toBeNull();
     expect(validInboxMsg("not an object")).toBeNull();
@@ -119,6 +125,20 @@ describe("F28 poison-pill defense", () => {
     const c = claimInbox(HOME, ["s1"], "p");
     expect(c).toHaveLength(1);
     expect(c[0].msg).toMatchObject({ text: "body", taskRef: "F28", title: "poison fix" }); // fields survive the validator rebuild
+  });
+
+  test("F38: composeInboxMsg yields a validator-passing durable-inbox envelope that round-trips write→claim (the drift that was quarantined)", () => {
+    const m = composeInboxMsg({ from: "f32a0507", fromLabel: "claude:agenthop-f32a0507", text: "packet ready", taskRef: "F38", title: "root fix" });
+    expect(m.via).toBe("durable-inbox"); // default label
+    expect(Number.isFinite(m.ts)).toBe(true);
+    expect(validInboxMsg(m)).not.toBeNull(); // produces a passing record by construction
+    // end-to-end: a composed durable-inbox envelope now writes + claims cleanly (before F38 it would have been quarantined)
+    writeInbox(HOME, "s-f38", composeInboxMsg({ from: "a", fromLabel: "b", text: "hi", via: "durable-inbox", ts: 2000, taskRef: "F38" }));
+    const c = claimInbox(HOME, ["s-f38"], "p");
+    expect(c).toHaveLength(1);
+    expect(c[0].msg).toMatchObject({ via: "durable-inbox", taskRef: "F38" });
+    // composeInboxMsg refuses to emit an invalid record (empty via)
+    expect(() => composeInboxMsg({ from: "a", fromLabel: "b", text: "hi", via: "" })).toThrow();
   });
 
   test("a poison file (missing field / unparseable) is QUARANTINED on claim — never returned, no throw, dead-letter logged", () => {

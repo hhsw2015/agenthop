@@ -312,3 +312,10 @@ codex resume。
 修复:①roster-snapshot 即刻补 resumeCmd 字段(逐成员全参数);②swarm-resume 的 schema/
 assembleRoster 补捕获启动参数(归 viz 轨,复活用 resumeCmd 不再拼装);③教训=需求原文里的
 每个名词都是 schema 字段,漏一个=复活时错一环。
+
+### F38(2026-10-06)inbox schema 漂移根修:via 标签被验证器误隔离
+- **事故**:90b58f9c 按 S11 文档手写耐久件 `via:"durable-inbox"`,但 `packages/bus/src/inbox.ts` 的 `validInboxMsg` 只认 `via∈{local,relay}`→5 件(含送审件)被 F28 守卫隔离到 quarantine/。
+- **根因**:文档与验证器**两套真相**——S11 文档允许的 via 标签,验证器不认。手搓 JSON 的毒丸产地(F28 教训)再现,这次是『合法文档形态被代码拒』。
+- **根修(机制优先)**:①读侧 `validInboxMsg` 容忍 `via`=任意**非空 string**(local/relay 保留传输语义;未知标签如 durable-inbox 照收、display 原样;空/缺/非串仍拒)。`InboxMsg.via` 与 `BusMessage.via` 由 `"local"|"relay"` 放宽为 `string`(二者只做 `=== "relay"/"local"` 比较,无穷举)。②写侧新增 **`composeInboxMsg`**(inbox.ts):脚本/成员构造 S11 信封的唯一校验入口——填 ts(now)与 via 默认("durable-inbox"),只保留已知字段,产出必过 `validInboxMsg`,否则抛。**手搓 JSON 一律改走它**,根除漂移。③selftest 钉死:durable-inbox 标签可过 + 空/缺 via 仍拒 + composeInboxMsg 产出 write→claim 往返(正是先前被隔离的形态)。
+- **协调者手工投递模板更新**:不再手写 JSON——用 `composeInboxMsg({from,fromLabel,text,taskRef?,title?,via?})`;via 省略即 "durable-inbox"。七字段仍为 from/fromLabel/text/ts/via/taskRef/title,但由助手产出而非手拼。
+- **教训**:schema 的真相只能有一处(验证器);文档给的任何形态要么被验证器接受,要么由一个产出必过验证器的助手承载——**文档描述形态,代码定义形态,二者之间必须有机器桥(composeInboxMsg),不能靠人对齐**。
