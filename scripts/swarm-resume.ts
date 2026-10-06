@@ -24,6 +24,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { startBusCore } from "../packages/bus/src/core.js";
 import { buildAppleScript } from "../packages/bus/src/spawn.js";
+import { herdrAgentName, herdrLaunch, herdrServerReachable, herdrSpawnable, splitCommand } from "../packages/bus/src/swarm/herdr.js";
 import { ROSTER_FILE, assembleRoster, parseSnapshot, planResume, resumeCommandForMember, type PeerLike } from "../packages/bus/src/swarm/resume.js";
 
 const pexec = promisify(execFile);
@@ -92,10 +93,20 @@ async function main(): Promise<void> {
       return;
     }
 
+    // herdr backend (S14): inside a herdr pane + server reachable -> relaunch as herdr panes; else Ghostty.
+    const useHerdr = herdrSpawnable(process.env) && (await herdrServerReachable());
+    console.log(`backend: ${useHerdr ? "herdr" : "Ghostty (osascript)"}`);
     let ok = 0, fail = 0;
     for (const m of plan.launch) {
       const cmd = resumeCommandForMember(m); // F36: full resume command, never a bare relaunch
       try {
+        if (useHerdr) {
+          const { kind, args } = splitCommand(cmd);
+          const r = await herdrLaunch({ name: herdrAgentName(m.title ?? m.member), kind, cwd: m.cwd, args });
+          if (!r.ok) throw new Error(r.note);
+          ok++; console.log(`  launched[herdr]  ${m.title ?? m.member}  pane ${r.paneId}  (${cmd})`);
+          continue;
+        }
         await launchWindow(cmd, m.cwd);
         ok++;
         console.log(`  launched  ${m.title ?? m.member}  ${m.cwd}  (${cmd})`);

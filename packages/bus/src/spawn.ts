@@ -4,6 +4,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, 
 import { homedir, platform } from "node:os";
 import path from "node:path";
 import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
+import { herdrAgentName, herdrLaunch, herdrServerReachable, herdrSpawnable } from "./swarm/herdr.js";
 
 /**
  * Launch a chosen agent CLI as a dispatched sub-agent, in one of two modes the CALLING AGENT chooses
@@ -632,6 +633,15 @@ export async function spawnAgent(input: SpawnInput, env: NodeJS.ProcessEnv = pro
   if (input.visible === false) return spawnHeadlessAgent(input, env);
   const cli = resolveCli(input.tool, env);
   if ("error" in cli) return { ok: false, arranged: false, note: cli.error };
+  // herdr backend (S14): when the dispatcher runs INSIDE a herdr pane and the server is reachable, launch the
+  // agent as a herdr pane (JSON receipt + lifecycle states) instead of blind-typing Ghostty. Any miss falls
+  // through to the Ghostty path below — the two backends coexist, Ghostty is not removed.
+  if (herdrSpawnable(env) && (await herdrServerReachable())) {
+    const name = herdrAgentName(input.workspace ?? input.tool);
+    const r = await herdrLaunch({ name, kind: input.tool, cwd: input.cwd ?? homedir(), args: cli.argv.slice(1) });
+    if (r.ok) return { ok: true, mode: "visible", arranged: false, launchId: r.name, note: `herdr: ${r.note} (pane ${r.paneId}, agent ${r.name})` };
+    console.error(`[spawn] herdr backend miss (${r.note}); falling back to Ghostty.`);
+  }
   if (platform() !== "darwin") return { ok: false, arranged: false, note: "agenthop_spawn (visible) currently supports macOS + Ghostty only. Try visible:false for a headless background run." };
   if (!ghosttyPresent()) return { ok: false, arranged: false, note: "Ghostty.app not found; a visible agenthop_spawn needs Ghostty. Try visible:false for a headless background run." };
   const dir = validateCwd(input.cwd);
