@@ -582,7 +582,9 @@ export function readKanbanView(home: string = homedir(), nowSec: number = Math.f
   });
 
   const openItems = items.filter((i) => i.status === "open").map(itemCard);
-  const claimedItems = items.filter((i) => i.status === "claimed").map(itemCard);
+  // claimed = reservation applied; granted = admission committed (in-flight admitted work). Both are in-progress swimlane work;
+  // rejected is a dead claim (re-posted/reaped next tick) ⇒ not a column. (admission 5/n; dormant until SWARM_BOARD_ADMIT.)
+  const claimedItems = items.filter((i) => i.status === "claimed" || i.status === "granted").map(itemCard);
   const doneItems = items.filter((i) => i.status === "done").map(itemCard).sort((a, b) => (b.startSec ?? 0) - (a.startSec ?? 0));
   const openWaits = waits.filter((w) => w.state === "open" || w.state === "action_pending").map(waitCard);
   const resolvedWaits = waits.filter((w) => w.state === "resolved").map(waitCard);
