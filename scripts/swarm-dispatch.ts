@@ -33,7 +33,9 @@ import { entityKeyOf, type Change, type ChangeBody, type CommitResult, type LogS
 import { loadPlan, type TaskPlan, type TaskSpec } from "../packages/bus/src/swarm/task-plan.js";
 import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/task-state.js";
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
-import { taskPass, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
+import { taskPass, buildSched, physicalSlotsOccupied, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
+import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
+import { boardAdmitEnabled, planBoardWrites, postedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
@@ -42,7 +44,7 @@ import { validSeedWait } from "../packages/bus/src/swarm/wait-seed.js";
 import { runDispatchLoops } from "../packages/bus/src/swarm/dispatch-loops.js";
 import { writeProjection } from "../packages/bus/src/swarm/projection.js";
 import { beatStart, beatEnd } from "../packages/bus/src/swarm/heartbeat.js";
-import { buildControlCut, heartbeatObservations } from "../packages/bus/src/swarm/liveness-review.js";
+import { buildControlCut, heartbeatObservations, currentPlan } from "../packages/bus/src/swarm/liveness-review.js";
 import { assertLiveness, type LivenessVerdict, type ControlCut, type ObservationFact } from "../packages/bus/src/swarm/task-liveness-inv1.js";
 import { reconcileIncident, reconcileIncidentCore, reconcileRegistryWithControl, readIncidents, writeIncidents, type IncidentRegistry } from "../packages/bus/src/swarm/incident-episode.js";
 import { isRepairWaitId, repairEpisodeOf, repairGroupKeyOf } from "../packages/bus/src/swarm/repair-wait-id.js";
@@ -464,7 +466,11 @@ async function startTaskIO(a: { assignment: Assignment; launchId: string }): Pro
 // NOT reset it (fe0376cd T1 review A / T2 review #1). Write-once per jobId; later reads return the original epoch.
 function jobStartSec(jobId: string): number {
   const dir = path.join(HOME, ".agenthop", "swarm", "jobs");
-  const file = path.join(dir, `${jobId}.started`);
+  // Path-boundary safety (BA2a defense-in-depth): a jobId can arrive from an untrusted board-claim body. Never concatenate a
+  // raw jobId containing a path separator into a filename — encode it to a single safe segment. Plain identifiers are left
+  // as-is (backward-compatible with existing <jobId>.started files; board claims are already identifier-validated upstream).
+  const safe = /[/\\]/.test(jobId) ? encodeURIComponent(jobId) : jobId;
+  const file = path.join(dir, `${safe}.started`);
   try { const v = Number(readFileSync(file, "utf8").trim()); if (Number.isFinite(v) && v > 0) return v; } catch { /* first run */ }
   const now = nowSec();
   mkdirSync(dir, { recursive: true });
@@ -778,6 +784,106 @@ async function main(): Promise<void> {
     notifySent.set(key, now); return "logged";
   };
 
+  // §2d-a board producer (board admission 5/n, the PULL path): post the current READY nodes as claimable board items so an
+  // idle member can apply, and reap stale UNCLAIMED posts whose node is no longer ready. DORMANT-AHEAD-OF-USE: runs ONLY when
+  // SWARM_BOARD_ADMIT is on (coordinator boundary #1/#2 — gate off ⇒ fully dry, writes nothing). Board files are the
+  // application-queue projection, NEVER a second ledger — no CONTROL commit here (the admission commit is the consumer's).
+  // The pure decision (which to post/reap) is planBoardWrites; this shell only does the atomic write + unlink. Fail-soft.
+  const runBoardProducer = (): void => {
+    if (!plan || !boardAdmitEnabled()) return;
+    try {
+      const state = loadControlLog(CONTROL_LOG_DIR);
+      // BA1: post from the job's AUTHORITATIVE plan in the current CONTROL (fall back to the startup copy only before the
+      // PlanPut lands). BA3: isolate the ready computation to THIS job's attempts/accepted.
+      const cur = currentPlan(state, plan.jobId) ?? plan;
+      const all = buildSched(cur, state);
+      const attempts = all.attempts.filter((a) => a.jobId === cur.jobId);
+      const acceptedResults = all.acceptedResults.filter((r) => r.jobId === cur.jobId);
+      const usage = { totalAttempts: attempts.length, wallClockSec: Math.max(0, nowSec() - jobStartSec(cur.jobId)) };
+      const ready = readyTasks({ plan: cur, attempts, acceptedResults, now: nowSec(), jobUsage: usage });
+      mkdirSync(BOARD_DIR, { recursive: true });
+      // Read each existing board file's body so the producer can refresh a stale-revision post (BA8b) and tell its own job's
+      // entries from another job's (BA4). Unreadable ⇒ body null.
+      const existing: ExistingBoardFile[] = readdirSync(BOARD_DIR).map((f) => {
+        let body: ExistingBoardFile["body"] = null;
+        try { body = JSON.parse(readFileSync(path.join(BOARD_DIR, f), "utf8")); } catch { /* unreadable ⇒ null */ }
+        return { file: f, body };
+      });
+      const { post, reap } = planBoardWrites(ready, cur, existing, { postedBy: SELF, nowSec: nowSec() });
+      // Reap BEFORE post (BA8a): a stale-revision refresh overwrites the posted file in place via atomicWrite, so post must run
+      // AFTER any unlink — never write the fresh item and then delete it. (planBoardWrites keeps the two sets path-disjoint,
+      // but ordering reap-first is the robust guarantee.)
+      for (const f of reap) { try { unlinkSync(path.join(BOARD_DIR, f)); } catch { /* raced away — fine */ } }
+      for (const item of post) atomicWrite(path.join(BOARD_DIR, postedFileName(item.itemId)), JSON.stringify(item));
+      if (post.length || reap.length) log(`board producer: posted ${post.length}, reaped ${reap.length} stale`);
+    } catch (e) { log(`board producer failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
+  // §2d-b admission REJECT: mark a claim rejected (reason into the board file) + tell the applicant. Best-effort.
+  const rejectClaim = (claim: { itemId: string; who: string }, reason: string): void => {
+    const from = path.join(BOARD_DIR, claimedFileName(claim.itemId, claim.who));
+    const to = path.join(BOARD_DIR, rejectedFileName(claim.itemId, claim.who));
+    try { const item = JSON.parse(readFileSync(from, "utf8")); atomicWrite(to, JSON.stringify({ ...item, rejectedReason: reason, rejectedAtSec: nowSec() })); unlinkSync(from); }
+    catch { try { renameSync(from, to); } catch { /* raced away */ } }
+    try { writeInbox(HOME, claim.who, { from: SELF, fromLabel: "swarm-admission", text: `[admission] rejected ${claim.itemId}: ${reason}`, via: "local", ts: Date.now() }); } catch { /* best-effort */ }
+    log(`board admission: rejected ${claim.itemId} (${claim.who}): ${reason}`);
+  };
+
+  // §2d-b GRANT delivery (BA5 — receipt-first, at-least-once): the CONTROL grant is already durable. Deliver the receipt to
+  // the applicant, and mark the board item `granted` ONLY once the receipt is written. If the receipt write fails, LEAVE the
+  // claim as claimed — next tick's reconcile re-enters here and retries, so the receipt obligation is never silently dropped.
+  // A benign duplicate receipt is acceptable; a lost one is not. NO execution side-effect (boundary #3 — A2 wires startTask).
+  const deliverGrantAndMark = (claim: { itemId: string; who: string }, grant: { attemptId: string; waitId: string; bindingId?: string }): void => {
+    const claimFile = path.join(BOARD_DIR, claimedFileName(claim.itemId, claim.who));
+    const grantedFile = path.join(BOARD_DIR, grantedFileName(claim.itemId, claim.who));
+    const bindingNote = grant.bindingId ? ` (binding ${grant.bindingId})` : "";
+    try { writeInbox(HOME, claim.who, { from: SELF, fromLabel: "swarm-admission", text: `[admission] granted ${claim.itemId} → attempt ${grant.attemptId}${bindingNote}; supervision wait ${grant.waitId} open. DO NOT begin execution — A2 (real dispatch/V8) is not wired yet.`, via: "local", ts: Date.now() }); }
+    catch (e) { log(`board admission ${claim.itemId}: receipt write failed (grant committed) — claim kept, retry next tick: ${e instanceof Error ? e.message : e}`); return; } // BA5: do NOT mark granted until the receipt is delivered
+    try { renameSync(claimFile, grantedFile); } catch (e) { log(`board admission ${claim.itemId}: granted-rename failed (receipt delivered; reconciled next tick): ${e instanceof Error ? e.message : e}`); }
+    log(`board admission: granted ${claim.itemId} to ${claim.who} (attempt ${grant.attemptId})`);
+  };
+
+  // §2d-b admission CONSUMER (board admission 5/n, v2 — codex 3fda743 review): a claim (`<item>.claimed.<who>.json`) is a
+  // RESERVATION APPLICATION, not authority. Each tick, re-run admission on the CURRENT CONTROL: resolve the job's authoritative
+  // plan (BA1), validate the untrusted claim BODY against it (BA2), isolate the scheduler input to the claim's job (BA3), gate
+  // on free capacity (BA6) → GRANT (commit intent+attempt(+retired)+supervision wait, receipt-first then mark granted) /
+  // REJECT (terminal, mark + reason) / RECONCILE (already granted to this member — re-deliver receipt + fix board) / DEFER
+  // (transient: no plan yet / capacity full — leave the claim). DORMANT under SWARM_BOARD_ADMIT (boundary #1/#2). NO startTask
+  // (boundary #3). The board is an app-queue + projection, never a 2nd ledger: a grant whose commit fails leaves the claim for
+  // re-review. Fail-soft, per-claim isolated.
+  const runBoardConsumer = (): void => {
+    if (!plan || !boardAdmitEnabled()) return;
+    let files: string[];
+    try { files = readdirSync(BOARD_DIR); } catch { return; } // no board dir yet ⇒ nothing to admit
+    const claims = files.map((f) => parseBoardItemName(f)).filter((p): p is { itemId: string; state: "claimed"; who: string } => p !== null && p.state === "claimed");
+    for (const claim of claims) {
+      const claimFile = path.join(BOARD_DIR, claimedFileName(claim.itemId, claim.who));
+      try {
+        const state = loadControlLog(CONTROL_LOG_DIR);
+        // BA2: the claim FILE BODY is untrusted (any member can write into the shared board dir). Validate it before admitting.
+        let app: ClaimApplication | null = null;
+        try { app = parseClaimApplication(JSON.parse(readFileSync(claimFile, "utf8")), claim.who); } catch { app = null; }
+        if (app === null) { rejectClaim(claim, "unreadable or malformed claim body"); continue; }
+        // BA2b: bind the file NAME to the body identity — a claim whose filename says one (job,node) but whose body is another's
+        // valid entry must not be admitted under the filename's key. (Also keeps the granted/receipt rename on the right item.)
+        if (claim.itemId !== boardItemId(app.jobId, app.nodeId)) { rejectClaim(claim, `claim filename does not match body identity (${claim.itemId} vs ${boardItemId(app.jobId, app.nodeId)})`); continue; }
+        // BA6: free GLOBAL physical capacity, recomputed from the just-loaded state (a same-tick prior grant is already durable).
+        const freeSlots = Math.max(0, CAP - physicalSlotsOccupied(state, nowSec()));
+        const verdict = planClaimAdmission(state, app, {
+          nowSec: nowSec(), jobStartSec: jobStartSec(app.jobId), launchId: `rw-${randomBytes(4).toString("hex")}`, freeSlots,
+          remainingLifeSec: VM_LIFETIME_SEC, checkpointBudgetSec: CHECKPOINT_BUDGET_SEC, handoffMarginSec: HANDOFF_LEAD_SEC, tokenMarginSec: TOKEN_MARGIN_SEC, budgetSec: BUDGET_SEC,
+        });
+        if (verdict.verdict === "defer") { log(`board admission: ${claim.itemId} deferred — ${verdict.reason}`); continue; } // transient ⇒ leave claim, re-review next tick
+        if (verdict.verdict === "reject") { rejectClaim(claim, verdict.reason); continue; }
+        if (verdict.verdict === "reconcile") { deliverGrantAndMark(claim, { attemptId: verdict.attemptId, waitId: grantWaitId(verdict.attemptId) }); continue; } // BA5: re-deliver receipt then mark
+        // GRANT: commit intent+attempt(+retired)+supervision wait (NO startTask). A failed commit leaves the claim for re-review.
+        const r = commitTask(state, verdict.bodies);
+        if (!r.result.ok) { log(`board admission ${claim.itemId}: grant commit rejected (${r.result.reason}) — claim left for re-review next tick`); continue; }
+        deliverGrantAndMark(claim, { attemptId: verdict.attemptId, waitId: verdict.waitId, bindingId: verdict.bindingId });
+      } catch (e) { log(`board claim ${claim.itemId} failed (isolated): ${e instanceof Error ? e.message : e}`); }
+    }
+  };
+
   // The durable-state observer (L2-struct 2/n, §2b-c/§2c + F25). Two INDEPENDENT fail-soft halves (a failure in one must not
   // block the other — review P2-1): completion-slot discovery + the board/PROGRESS watch. Runs on the sweep loop.
   const runObserver = (): void => {
@@ -1089,6 +1195,11 @@ async function main(): Promise<void> {
     passTick: async () => {
       await pass(records, ops);
       if (plan && taskOn && taskOps) { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
+      // §2d board admission (PULL path) — both self-gated on SWARM_BOARD_ADMIT (default off ⇒ no-op), independent of
+      // SWARM_TASK_EXEC push. Producer posts ready nodes as claimable items; consumer admits claims (prepareDispatch on current
+      // CONTROL → grant intent+binding+supervision wait+receipt / reject), NO execution (A2). Dormant-ahead-of-use.
+      runBoardProducer();
+      runBoardConsumer();
       // NOTE: the projection + verdict refresh is NOT here — it lives on the sweep loop (below), so a wedged pass/taskPass
       // cannot freeze the on-disk verdict into a stale OK (review P2-1). Per-commit projection writes still happen via the
       // commitTask apply hook; this loop only drives the business passes.
