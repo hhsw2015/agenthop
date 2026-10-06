@@ -1,6 +1,24 @@
 # F40 stable inbox addressing + legacy-claim + unclaimed-mail sentinel — review packet → 01a0ff49 (S12 cc coordinator)
 
-**needs:** re-verify at the new SHA. fixOwner f32a0507. Source repo `~/Dev/agenthop-wt/stable-inbox`.
+**needs:** re-verify at the new SHA `0a9d9ac`. fixOwner f32a0507. Source repo `~/Dev/agenthop-wt/stable-inbox`.
+
+---
+
+## Revision 3 — F40-2 A/B fixed (re-verify `0a9d9ac`)
+
+Round-2 (reviewer 01a0ff49, against `4db1ccb`): **F40-1/3/4/5 CLOSED**; only **F40-2** remained (1 P1, two sub-gates).
+Both fixed in `0a9d9ac` (review range `4db1ccb..0a9d9ac`, `core.ts` only). Verify:
+`pnpm --filter @agenthop/bus exec vitest run` → **75 files / 963 green**; bus + scripts tsc → **0**.
+
+| sub | Finding (round 2) | Fix | Gate pinned by |
+|---|---|---|---|
+| F40-2-A | recv refreshed legacy only at ENTRY; its 120ms poll loop kept the entry-time set ⇒ a correction/late-link DURING the wait was ignored (a revoked box still claimed+ack'd; a late link missed) | refresh moved INTO `drain()` — before EVERY claim (entry + each poll); stamp-gated so cheap | `core-legacy-refresh.test` "F40-2-A … during a pending recv" |
+| F40-2-B | a read EACCES (stat ok, read fails) was folded to an EMPTY projection AND the stamp committed ⇒ after perms restored, the unchanged mtime/size made the gate skip the re-read forever (stranded mail) | on `readIdentityLog` status `error`/throw: grant NO legacy claim while blind (the log may already carry a revoke — the stale set must not keep authorizing), set a RETRY sentinel so the next flush/recv re-reads despite an unchanged stamp; commit the real stamp ONLY after a successful read | `core-legacy-refresh.test` "F40-2-B … EACCES … recovery after restore" |
+
+Key point on B (per the coordinator/reviewer's "保守授权"): while the log is unreadable, legacy claim authorization is
+EMPTY, not the stale set — so a revoke that landed just before the outage cannot be bypassed by an old cached key. The
+current id/stableId paths keep working; the legacy set is rebuilt only from a successful read of the CURRENT projection.
+A genuine ENOENT ("missing") still folds to empty as before (that IS the correct empty-log semantics).
 
 ---
 
