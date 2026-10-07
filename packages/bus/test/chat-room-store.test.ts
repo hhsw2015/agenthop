@@ -168,3 +168,29 @@ describe("chat-room store — review round-1 fixes (CR-P1-1..P2-2)", () => {
     expect(appendPost(HOME, "r", draft("a", "two"), 12).seq).toBe(2); // after restore, resumes at 2 (no reuse)
   });
 });
+
+describe("chat-room store — review round-2 fixes", () => {
+  test("CR-P2-1: putMeta persists the NORMALIZED meta (owner in roster, deduped) to the FILE", () => {
+    openRoom(HOME, { roomId: "r", topic: "t", owner: "owner", roster: ["a"], nowSec: 1 });
+    putMeta(HOME, { roomId: "r", topic: "t", owner: "owner", roster: ["b", "b"], state: "open", createdAtSec: 1 }); // dupes, owner missing from roster
+    const raw = JSON.parse(readFileSync(path.join(HOME, ".agenthop", "rooms", "r", "meta.json"), "utf8"));
+    expect(raw.roster.sort()).toEqual(["b", "owner"]); // the persisted BYTES satisfy the invariant, not just the read projection
+  });
+
+  test("CR-R2-P2-1: a failed throttled-receipt write leaves the slot open; a later denial re-sends (both return throttled)", () => {
+    const rl = new RoomRateLimiter({ limit: 1, windowMs: 60_000 });
+    openRoom(HOME, { roomId: "r", topic: "t", owner: "own", roster: ["alice"], nowSec: 1 });
+    expect("post" in postToRoom(HOME, "r", draft("alice", "m1"), 0, rl)).toBe(true); // admitted (seq 1)
+    const inbox = path.join(HOME, ".agenthop", "inbox");
+    mkdirSync(inbox, { recursive: true });
+    writeFileSync(path.join(inbox, "alice"), "a FILE at inbox/alice blocks the receipt write");
+    const r2 = postToRoom(HOME, "r", draft("alice", "m2"), 10, rl); // over limit; receipt write fails
+    expect(r2.throttled).toBe(true); // still throttled, not thrown, not silent
+    rmSync(path.join(inbox, "alice")); // fault cleared
+    const r3 = postToRoom(HOME, "r", draft("alice", "m3"), 20, rl); // over limit; receipt now delivers (slot was not consumed)
+    expect(r3.throttled).toBe(true);
+    const receipts = claimInbox(HOME, ["alice"], "p");
+    expect(receipts).toHaveLength(1); // exactly one receipt, delivered by the retry
+    expect(receipts[0].msg.via).toBe("room-throttled");
+  });
+});

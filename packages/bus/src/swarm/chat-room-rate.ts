@@ -1,7 +1,7 @@
 /**
  * Per-sender room rate limit (S14 chat-entry throttle). A high-frequency chat flood would hammer the roster's durable inboxes
- * (and, via a room, the coordinator), so a post into a room is throttled per (room, sender) — mirroring tunnel's PostCounter
- * (fixed window, reject over-send). Normal conversation, INCLUDING the human, is never the target: 30 posts/min/sender is
+ * (and, via a room, the coordinator), so a post into a room is throttled per (room, sender) with a SLIDING window (per-hit
+ * timestamps pruned to the last `windowMs`), rejecting over-send. Normal conversation, INCLUDING the human, is never the target: 30 posts/min/sender is
  * generous; the cap only bites a storm. A rejected post is NOT silently dropped — postToRoom returns a throttled result and
  * writes ONE throttled receipt to the sender (the "undelivered, never silent" rule).
  *
@@ -23,12 +23,16 @@ export class RoomRateLimiter {
   constructor(opts: RateOpts = {}) {
     this.limit = opts.limit ?? 30;          // posts per window per (room, sender) — tunable
     this.windowMs = opts.windowMs ?? 60_000; // 1 minute
+    // CR-R2-P2-2: reject an invalid config LOUDLY — never return a NaN retryAfterMs, never silently disable the cap.
+    if (!Number.isInteger(this.limit) || this.limit < 1) throw new Error(`RoomRateLimiter: limit must be a positive integer (got ${String(opts.limit)})`);
+    if (!Number.isFinite(this.windowMs) || this.windowMs <= 0) throw new Error(`RoomRateLimiter: windowMs must be a positive finite number (got ${String(opts.windowMs)})`);
   }
 
   /**
    * Record an attempt at `nowMs`. ok ⇒ admitted (counted). !ok ⇒ over the window limit: `retryAfterMs` = until the oldest hit
-   * ages out; `notify` ⇒ this is the FIRST denial in the current window, so the caller writes ONE throttled receipt (never one
-   * per rejected post — a storm must not turn into a receipt storm, same as tunnel's single "throttled" line).
+   * in the sliding window ages out; `notify` ⇒ a throttled receipt is DUE (not yet sent this window). The slot is NOT consumed
+   * here (CR-R2-P2-1) — the caller calls markNotified() only AFTER it actually delivers the receipt, so a failed write can be
+   * retried on a later denial and a storm still yields at most one receipt per window.
    */
   admit(key: string, nowMs: number): RateDecision {
     const cutoff = nowMs - this.windowMs;
@@ -41,8 +45,11 @@ export class RoomRateLimiter {
     this.hits.set(key, recent); // persist the pruned window even on denial (bounds memory)
     const retryAfterMs = Math.max(0, recent[0]! + this.windowMs - nowMs);
     const last = this.notifiedAt.get(key);
-    const notify = last === undefined || last <= cutoff; // once per window
-    if (notify) this.notifiedAt.set(key, nowMs);
+    const notify = last === undefined || last <= cutoff; // a receipt is due if none delivered within the current window
     return { ok: false, retryAfterMs, notify };
   }
+
+  /** Record a throttled receipt as DELIVERED for this window (CR-R2-P2-1). Called by the caller ONLY after a successful write,
+   *  so a failed receipt never consumes the once-per-window slot. */
+  markNotified(key: string, nowMs: number): void { this.notifiedAt.set(key, nowMs); }
 }

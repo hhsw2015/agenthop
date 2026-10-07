@@ -49,12 +49,15 @@ export function readMeta(home: string, roomId: string): RoomMeta | null {
 /** Atomically persist meta (temp + rename, 0600). Validates at the write boundary (CR-P2-1): never persist a meta the read
  *  side would reject (e.g. empty topic ⇒ readMeta null). */
 function writeMeta(home: string, meta: RoomMeta): void {
-  if (!validRoomMeta(meta)) throw new Error("writeMeta: refusing to persist invalid room meta (roomId/topic/owner must be non-empty)");
-  const dir = roomDir(home, meta.roomId);
+  // CR-P2-1: persist the NORMALIZED result (owner forced into the roster, deduped), not the caller's raw object — else the
+  // file could violate the frozen invariant (dupes / missing owner) while reads masked it via validRoomMeta's normalization.
+  const valid = validRoomMeta(meta);
+  if (!valid) throw new Error("writeMeta: refusing to persist invalid room meta (roomId/topic/owner must be non-empty)");
+  const dir = roomDir(home, valid.roomId);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const file = metaPath(home, meta.roomId);
+  const file = metaPath(home, valid.roomId);
   const tmp = `${file}.tmp-${randomBytes(4).toString("hex")}`;
-  writeFileSync(tmp, JSON.stringify(meta), { mode: 0o600 });
+  writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
   renameSync(tmp, file);
 }
 
@@ -154,16 +157,22 @@ export function postToRoom(home: string, roomId: string, draft: RoomPostDraft, n
   if (!meta) throw new Error(`postToRoom: no such room ${roomId}`);
   if (meta.state !== "open") throw new Error(`postToRoom: room ${roomId} is closed`);
   if (limiter) {
-    const d = limiter.admit(rateKey(roomId, draft.from), nowSec * 1000); // the limiter window is in ms
+    const key = rateKey(roomId, draft.from);
+    const d = limiter.admit(key, nowSec * 1000); // the limiter window is in ms
     if (!d.ok) {
       if (d.notify) { // one throttled receipt per window, to the sender's own inbox — not silent, not a receipt storm
+        // CR-R2-P2-1: consume the once-per-window slot ONLY after the receipt is actually written. A failed write leaves the
+        // slot open (a later denial re-sends) yet STILL returns throttled (never a silent drop, never a throw to the caller).
+        let delivered = false;
         try {
           writeInbox(home, draft.from, composeInboxMsg({
             from: draft.from, fromLabel: draft.fromLabel,
             text: `throttled: room ${roomId} rate limit exceeded; retry in ~${Math.ceil(d.retryAfterMs / 1000)}s`,
             via: "room-throttled", ts: nowSec * 1000, taskRef: `room:${roomId}`, title: meta.topic.slice(0, 48),
           }));
-        } catch { /* best-effort receipt; the throttled RESULT is still returned to the caller */ }
+          delivered = true;
+        } catch { /* receipt write failed — leave the slot open; the throttled RESULT is still returned */ }
+        if (delivered) limiter.markNotified(key, nowSec * 1000);
       }
       return { throttled: true, retryAfterMs: d.retryAfterMs };
     }

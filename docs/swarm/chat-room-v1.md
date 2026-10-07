@@ -77,8 +77,9 @@ So an offline member surfaces the post through its normal flush; the canonical o
 
 ## Rate limit (S14 chat-entry throttle)
 
-Per-`(room, sender)` fixed-window cap, protecting the roster's inboxes + the coordinator from a chat flood (mirrors tunnel's
-PostCounter). Default **30 posts / 60s / sender / room**, tunable via `new RoomRateLimiter({limit, windowMs})`. The limit caps
+Per-`(room, sender)` SLIDING-window cap (per-hit timestamps pruned to the last `windowMs`), protecting the roster's inboxes +
+the coordinator from a chat flood. Default **30 posts / 60s / sender / room**, tunable via `new RoomRateLimiter({limit, windowMs})`
+(an invalid limit/windowMs is rejected at construction — never a NaN wait, never a silently-disabled cap). The limit caps
 a STORM; normal conversation — including the human (highest priority, not exempt) — never reaches it. Applies to sender traffic
 through `postToRoom`; the owner's own `appendPost` is unlimited. Over-limit behavior (chosen of the two options): **explicit
 reject**, NOT queue-delay — the post is not appended or fanned, `{throttled, retryAfterMs}` is returned, and ONE throttled
