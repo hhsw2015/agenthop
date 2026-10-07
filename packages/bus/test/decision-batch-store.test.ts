@@ -142,4 +142,51 @@ describe("decision-batch store (IO)", () => {
     expect(c).toHaveLength(1);
     expect(c[0].msg).toMatchObject({ via: "decision-batch", taskRef: "decision-batch:b1" });
   });
+
+  test("DB-P1-1 (round-2): a planted/foreign batch.json (batchId≠dir) is not consumed as this batch and does not seal the dir", () => {
+    openBatch(HOME, { batchId: "A", owner: "coord", items: [item("1")], nowSec: 1 });
+    // overwrite A/batch.json with a FOREIGN batch (batchId "B") — planted/misbound metadata in dir A
+    writeFileSync(path.join(dbDir("A"), "batch.json"), JSON.stringify({ batchId: "B", owner: "x", createdAtSec: 1, items: [{ id: "1", kind: "pr", summary: "s", suggestedAction: "merge" }] }));
+    writeFileSync(path.join(dbDir("A"), "decisions.json"), JSON.stringify({ batchId: "B", decidedAtSec: 2, decisions: [{ id: "1", verdict: "approve" }] }));
+    expect(() => consumeDecisions(HOME, "A")).toThrow(/no such batch/);          // dir-bound readBatch ⇒ foreign batch.json reads as absent
+    expect(existsSync(path.join(dbDir("A"), "consumed.json"))).toBe(false);       // NOT sealed
+    // restore the correct batch.json ⇒ the real decision still works (no starvation)
+    writeFileSync(path.join(dbDir("A"), "batch.json"), JSON.stringify({ batchId: "A", owner: "coord", createdAtSec: 1, items: [{ id: "1", kind: "pr", summary: "s", suggestedAction: "merge" }] }));
+    writeDecisions(HOME, { batchId: "A", decidedAtSec: 3, decisions: [{ id: "1", verdict: "reject" }] });
+    const got = consumeDecisions(HOME, "A");
+    expect(got.consumed).toBe(true);
+    expect(got.resolved.map((r) => [r.item.id, r.verdict])).toEqual([["1", "reject"]]);
+  });
+
+  test("DB-P1-3 (round-2): the terminal marker is the batch barrier — a claim in hand cannot re-release an already-closed batch", () => {
+    openBatch(HOME, { batchId: "b1", owner: "c", items: [item("1")], nowSec: 1 });
+    // batch already closed (consumed.json present) but a claim file is still sitting in the dir (a paused/raced consumer)
+    writeFileSync(path.join(dbDir("b1"), "consumed.json"), JSON.stringify({ batchId: "b1", decidedAtSec: 2, consumedAtMs: 1 }));
+    writeFileSync(path.join(dbDir("b1"), "decisions-consumed-100-aaaa.json"), JSON.stringify({ batchId: "b1", decidedAtSec: 2, decisions: [{ id: "1", verdict: "approve" }] }));
+    const got = consumeDecisions(HOME, "b1");
+    expect(got.consumed).toBe(false);   // the terminal marker wins — the held claim is NOT executed (no double)
+    expect(got.resolved).toEqual([]);
+  });
+
+  test("DB-R2-P1-1: a read fault after claiming leaves a RECOVERABLE claim — retry completes the SAME consume, no resubmit", () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root bypasses chmod
+    openBatch(HOME, { batchId: "b1", owner: "c", items: [item("1")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 2, decisions: [{ id: "1", verdict: "approve", reason: "ok" }] });
+    const dpath = path.join(dbDir("b1"), "decisions.json");
+    const mode = statSync(dpath).mode & 0o777;
+    chmodSync(dpath, 0o000); // consume CLAIMS it (rename needs only dir write), then faults READING the claimed file
+    let blind = false; try { readFileSync(dpath); } catch { blind = true; }
+    try {
+      if (!blind) return; // environment can still read (root-ish)
+      expect(() => consumeDecisions(HOME, "b1")).toThrow();                     // read fault surfaces; the claim persists as decisions-consumed-* (NOT "undecided")
+      expect(existsSync(path.join(dbDir("b1"), "consumed.json"))).toBe(false);  // not closed on a fault
+    } finally {
+      // restore perms on the claimed file (named decisions-consumed-*, exactly the reviewer's probe restore pattern)
+      for (const f of readdirSync(dbDir("b1"))) if (f === "decisions.json" || f.startsWith("decisions-consumed-")) chmodSync(path.join(dbDir("b1"), f), mode);
+    }
+    // recover permissions ⇒ retry RESUMES the claim and completes the SAME verdict with no user resubmit
+    const got = consumeDecisions(HOME, "b1");
+    expect(got.consumed).toBe(true);
+    expect(got.resolved.map((r) => [r.item.id, r.verdict])).toEqual([["1", "approve"]]);
+  });
 });

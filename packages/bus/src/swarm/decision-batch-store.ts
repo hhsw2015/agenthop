@@ -7,7 +7,7 @@
  * Hardened with the chat-room review lessons: safe batchId (reject, never sanitize), validate at the write boundary, ENOENT
  * (absent) distinguished from a real read error (EACCES → throw, never treated as empty), corrupt-but-readable → null.
  */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, existsSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, existsSync, statSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { writeInbox, composeInboxMsg } from "../inbox.js";
@@ -25,15 +25,20 @@ function batchesDir(home: string): string { return path.join(home, ".agenthop", 
 function batchDir(home: string, batchId: string): string { assertSafeBatchId(batchId); return path.join(batchesDir(home), batchId); }
 function batchPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "batch.json"); }
 function decisionsPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "decisions.json"); }
-/** Durable per-batch markers (existence = the fact): `consumed.json` once the verdicts are claimed (DB-P1-3), `notified.json`
- *  once the compression ping landed (DB-P1-4). Kept inside the batch dir so they travel/clean up with it. */
+/** Durable per-batch files (existence = the fact). `consumed.json`: the TERMINAL marker — written with an EXCLUSIVE create so
+ *  it is the atomic batch-level single-winner (DB-P1-3), not a per-file rename. `notified.json`: the compression ping landed
+ *  (DB-P1-4/R2-P2-1), kept in lock-step with the send (marker⟺sent). `decisions-consumed-<ms>-<rand>.json`: a CLAIM — a consume
+ *  moves decisions.json here (claim-before-read, DB-P1-2) and, if it faults before the terminal marker, this file is a
+ *  RECOVERABLE claim a retry finishes (DB-R2-P1-1), not stranded verdicts. `decisions-rejected-*`: a misbound/corrupt claim set
+ *  aside. All inside the batch dir. */
 function consumedMarkerPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "consumed.json"); }
 function notifiedMarkerPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.json"); }
 
-/** Does a marker file exist? ENOENT ⇒ false (absent); any other error (EACCES/…) THROWS — a read failure is NEVER treated as
- *  "absent" (the same discipline readJsonOrNull uses), so a permission glitch can't be mistaken for "not yet consumed/notified"
- *  and re-release verdicts or re-notify. existsSync is deliberately NOT used here (it folds every error into false). */
-function markerExists(file: string): boolean {
+/** Does a path exist? ENOENT ⇒ false (absent); any other error (EACCES/…) THROWS — a read failure is NEVER treated as
+ *  "absent" (the same discipline readJsonOrNull uses), so a permission glitch can't be mistaken for "not yet consumed/notified/
+ *  claimed" and re-release verdicts, re-notify, or re-claim. existsSync is deliberately NOT used here (it folds every error
+ *  into false). */
+function existsStrict(file: string): boolean {
   try { statSync(file); return true; }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return false; throw e; }
 }
@@ -57,7 +62,11 @@ function writeJsonAtomic(file: string, data: unknown): void {
 }
 
 export function readBatch(home: string, batchId: string): DecisionBatch | null {
-  return readJsonOrNull(batchPath(home, batchId), validDecisionBatch);
+  const batch = readJsonOrNull(batchPath(home, batchId), validDecisionBatch);
+  // DB-P1-1: the batch.json's own batchId MUST equal the directory it sits in. A planted/foreign batch.json (batchId ≠ dir)
+  // is NOT this batch — treat it as absent, so consume never resolves a foreign batch's items as this batch's nor seals the dir.
+  if (batch && batch.batchId !== batchId) return null;
+  return batch;
 }
 
 export function readDecisions(home: string, batchId: string): DecisionsDoc | null {
@@ -82,7 +91,7 @@ export function writeDecisions(home: string, doc: DecisionsDoc): void {
   // DB-P1-3 (write boundary): a batch consumed once is DONE — refuse to persist fresh decisions into it. Remaining/deferred
   // items are re-asked by the coordinator under a NEW batchId (per the contract), so re-submitting here can only be a
   // double-decision attempt. Combined with the consume-side marker check, re-submission can never re-release a verdict.
-  if (markerExists(consumedMarkerPath(home, valid.batchId))) throw new Error(`writeDecisions: batch ${valid.batchId} already consumed — remaining items are re-batched under a new batchId`);
+  if (existsStrict(consumedMarkerPath(home, valid.batchId))) throw new Error(`writeDecisions: batch ${valid.batchId} already consumed — remaining items are re-batched under a new batchId`);
   writeJsonAtomic(decisionsPath(home, valid.batchId), valid);
 }
 
@@ -103,49 +112,91 @@ export function openBatch(home: string, i: { batchId?: string; owner: string; it
   return batch;
 }
 
-/** Write ONE durable-inbox compression ping for a batch, exactly once (DB-P1-4). The `notified.json` marker is written only
- *  AFTER writeInbox succeeds (markNotified-after-success, the chat-room lesson) — so a notify failure leaves NO marker and the
- *  next openBatch(same id) re-sends. A present marker ⇒ already delivered ⇒ skip (no duplicate ping). The failure is NOT
- *  swallowed: writeInbox throwing propagates out of openBatch so the coordinator knows the user was not pinged. */
+/** Write ONE durable-inbox compression ping for a batch, exactly once (DB-P1-4 / DB-R2-P2-1). INVARIANT: `notified.json`
+ *  exists ⟺ the ping was sent. We RECORD FIRST (write the marker), then SEND; if the send fails we ROLL BACK the marker and
+ *  rethrow. So the state is never ambiguous: a present marker always means sent (⇒ a retry never re-sends → no duplicate
+ *  reminder), an absent marker always means not-sent (⇒ a retry sends once). The failure is never swallowed — a send fault
+ *  propagates out of openBatch so the coordinator knows the user was not pinged, and the rolled-back marker makes the retry
+ *  re-send exactly one. (Recording first and rolling back on failure is what distinguishes not-sent from sent-but-unrecorded
+ *  without a blind resend: the marker and the send move together.) */
 function notifyOnce(home: string, batchId: string, owner: string, itemCount: number, notifyTo: string, nowSec: number): void {
-  if (markerExists(notifiedMarkerPath(home, batchId))) return; // already notified on an earlier (successful) open
-  writeInbox(home, notifyTo, composeInboxMsg({
-    from: owner, fromLabel: "coordinator",
-    text: `${itemCount} decision(s) pending — clear batch ${batchId} (approve/reject/defer)`,
-    via: "decision-batch", ts: nowSec * 1000, taskRef: `decision-batch:${batchId}`, title: "decisions pending",
-  })); // may throw (FS fault) — intentionally NOT caught: failure must be visible and retriable (marker stays unwritten)
-  writeJsonAtomic(notifiedMarkerPath(home, batchId), { to: notifyTo, notifiedAtSec: nowSec });
+  const marker = notifiedMarkerPath(home, batchId);
+  if (existsStrict(marker)) return; // marker present ⇒ already sent on an earlier open ⇒ never re-send
+  writeJsonAtomic(marker, { to: notifyTo, notifiedAtSec: nowSec }); // record intent FIRST (fails ⇒ throws, nothing sent, retriable)
+  try {
+    writeInbox(home, notifyTo, composeInboxMsg({
+      from: owner, fromLabel: "coordinator",
+      text: `${itemCount} decision(s) pending — clear batch ${batchId} (approve/reject/defer)`,
+      via: "decision-batch", ts: nowSec * 1000, taskRef: `decision-batch:${batchId}`, title: "decisions pending",
+    }));
+  } catch (e) {
+    try { unlinkSync(marker); } catch { /* best-effort rollback; see ceiling note */ } // send failed ⇒ undo the record so the retry re-sends
+    throw e; // visible, retriable; marker⟺sent invariant preserved
+  }
+  // ponytail: residual window is a crash BETWEEN a failed writeInbox and the rollback unlink (marker set, not sent). chmod/EACCES
+  // faults (what we test) never hit it; a true process kill there would skip one retry — acceptable vs a duplicate reminder.
 }
 
 export type ConsumeResult = { resolved: ResolvedDecision[]; undecided: DecisionItem[]; unknownIds: string[]; consumed: boolean };
 
 /**
- * Consume the user's decisions for a batch EXACTLY ONCE: read batch + decisions, match them, then atomically move
- * decisions.json aside so a second call cannot re-return (and the coordinator cannot execute the same verdicts twice) — the
- * same atomic-rename claim the inbox uses. `consumed:false` + all-undecided means the user has not decided yet (or another
- * consumer already won the race). The coordinator executes `resolved` (approve/reject), and re-batches `undecided` + deferred.
+ * Consume the user's decisions for a batch EXACTLY ONCE across concurrent consumers, sequential re-submits, AND a fault +
+ * retry. Shape: (1) a batch consumed once is TERMINAL (consumed.json); (2) a claim moves decisions.json → a STABLE in-progress
+ * file (decisions.claiming.json) and reads THAT — so a mid-consume fault leaves a recoverable claim a retry finishes, never a
+ * stranded throwaway; (3) the batch's single winner is whoever EXCLUSIVE-creates consumed.json (a file rename alone is not a
+ * batch-level commit). `consumed:false` + all-undecided means: not decided yet, OR a racer already closed the batch. The
+ * coordinator executes `resolved` (approve/reject) and re-batches `undecided` + deferred under a NEW batchId.
  */
+/** The CLAIM files for a batch: `decisions-consumed-<ms>-<rand>.json` (a claimed decisions set — in-flight, or the archive of a
+ *  finished consume). ENOENT ⇒ none; any other readdir error THROWS (an unreadable dir is not "no claims"). */
+function listClaims(home: string, batchId: string): string[] {
+  const d = batchDir(home, batchId);
+  try { return readdirSync(d).filter((n) => /^decisions-consumed-.*\.json$/.test(n)); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
+}
+/** The newest claim file (by the embedded ms, tiebroken by name), or null. Used to RESUME an unfinalized claim on retry. */
+function latestClaim(home: string, batchId: string): string | null {
+  const names = listClaims(home, batchId);
+  if (names.length === 0) return null;
+  names.sort((a, b) => (Number(b.match(/decisions-consumed-(\d+)/)?.[1] ?? 0) - Number(a.match(/decisions-consumed-(\d+)/)?.[1] ?? 0)) || (a < b ? 1 : -1));
+  return path.join(batchDir(home, batchId), names[0]);
+}
+
 export function consumeDecisions(home: string, batchId: string): ConsumeResult {
-  const batch = readBatch(home, batchId);
+  const batch = readBatch(home, batchId); // DB-P1-1: dir-bound — a planted/foreign batch.json reads as null ⇒ "no such batch"
   if (!batch) throw new Error(`consumeDecisions: no such batch ${batchId}`);
   const none: ConsumeResult = { resolved: [], undecided: batch.items, unknownIds: [], consumed: false };
-  // DB-P1-3: a batch consumed once is DONE — a decisions.json re-written afterwards (same batchId) never re-releases verdicts.
-  // The remaining/deferred items were re-asked by the coordinator under a NEW batchId. This marker is the durable barrier.
-  if (markerExists(consumedMarkerPath(home, batchId))) return none;
-  // DB-P1-2: CLAIM the file FIRST (atomic rename = single cross-process winner), THEN read EXACTLY the bytes we claimed — so a
-  // producer swapping decisions.json between our check and our read lands on a NEW file, never on the verdicts we return. The
-  // old order (read → resolve → rename) could return an approve while the rename actually claimed a swapped-in reject.
-  const claimed = decisionsPath(home, batchId).replace(/decisions\.json$/, `decisions-consumed-${Date.now()}-${randomBytes(3).toString("hex")}.json`);
-  try { renameSync(decisionsPath(home, batchId), claimed); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return none; throw e; } // nothing to claim (no decisions yet / a concurrent consumer won)
-  const doc = readJsonOrNull(claimed, validDecisionsDoc); // read the claimed file, not a pre-claim cache (DB-P1-2)
-  // DB-P1-1: the claimed doc MUST be bound to THIS batch. A misbound (foreign batchId) or corrupt claim yields NO actionable
-  // verdict and is NOT marked consumed — a foreign drop is archived aside but cannot strand the user's real decisions.
-  if (!doc || doc.batchId !== batchId) return { ...none, unknownIds: doc ? doc.decisions.map((d) => d.id) : [] };
+  const consumedMarker = consumedMarkerPath(home, batchId);
+  // DB-P1-3: a batch consumed once is TERMINAL — a decisions.json re-written afterwards never re-releases verdicts (remaining
+  // items were re-asked under a NEW batchId). The EXCLUSIVE-created marker below is the atomic batch-level barrier.
+  if (existsStrict(consumedMarker)) return none;
+  // Prefer a FRESH decisions.json: claim it atomically (rename → decisions-consumed-<ts>) BEFORE reading (DB-P1-2 — a producer
+  // swapping decisions.json after the claim lands on a new file, never on the verdicts we return), and let it SUPERSEDE any
+  // stale unfinalized claim (DB-R2-P1-1 — a newer decision is never overwritten by a failed older claim).
+  let claimFile: string | null = null;
+  if (existsStrict(decisionsPath(home, batchId))) {
+    const target = path.join(batchDir(home, batchId), `decisions-consumed-${Date.now()}-${randomBytes(4).toString("hex")}.json`);
+    try { renameSync(decisionsPath(home, batchId), target); claimFile = target; }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; } // a racer took decisions.json first ⇒ fall through to resume its claim
+  }
+  // No fresh decision ⇒ RESUME the latest unfinalized claim (a prior consume faulted after claiming but before the terminal
+  // marker). This is the recovery path: a fault leaves a recoverable claim, not "undecided"; a retry finishes it with no resubmit.
+  if (!claimFile) claimFile = latestClaim(home, batchId);
+  if (!claimFile) return none; // nothing to consume (no decisions yet / a racer already claimed+closed)
+  const doc = readJsonOrNull(claimFile, validDecisionsDoc); // read EXACTLY the claimed bytes; EACCES → throws, the claim persists → recoverable retry (DB-R2-P1-1)
+  // DB-P1-1: the claimed doc MUST be bound to this batch. A misbound (foreign batchId) or corrupt claim yields NO actionable
+  // verdict and is NOT marked consumed — it is set aside (decisions-rejected-*) so it can't starve the real decisions nor be re-resumed.
+  if (!doc || doc.batchId !== batchId) {
+    try { renameSync(claimFile, claimFile.replace(/decisions-consumed-/, "decisions-rejected-")); } catch { /* raced away */ }
+    return { ...none, unknownIds: doc ? doc.decisions.map((d) => d.id) : [] };
+  }
   const res = resolveBatch(batch, doc);
-  // DB-P1-3: record the consume durably BEFORE returning, so a subsequent re-written decisions.json (or a racing consumer that
-  // reaches here after a mid-flight rewrite) cannot re-release this batch's verdicts.
-  writeJsonAtomic(consumedMarkerPath(home, batchId), { batchId, decidedAtSec: doc.decidedAtSec, consumedAtMs: Date.now() });
+  // DB-P1-3 / DB-R2-P1-1: the TERMINAL marker is an EXCLUSIVE create — the atomic batch-level single winner. A plain file rename
+  // is NOT a batch commit (concurrent/raced consumers can hold claims on the same bytes); only the one that CREATES consumed.json
+  // closes the batch. A loser (EEXIST) returns not-consumed and executes nothing (no double). EACCES throws with the claim intact
+  // ⇒ a retry completes the SAME consume (no user resubmit).
+  try { writeFileSync(consumedMarker, JSON.stringify({ batchId, decidedAtSec: doc.decidedAtSec, consumedAtMs: Date.now() }), { mode: 0o600, flag: "wx" }); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") return none; throw e; } // another consumer already closed this batch
   return { ...res, consumed: true };
 }
 
