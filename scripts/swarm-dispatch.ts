@@ -57,6 +57,9 @@ import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys,
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
+import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrAgentState, herdrAgentPaneId, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
+import { superviseMember, decideLiveSentinel, type WatchOps, type SentinelEvent, type MemberObs } from "../packages/bus/src/swarm/live-sentinel.js";
+import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
 const MIRROR_DIR = path.join(HOME, ".agenthop", "swarm", "control");
@@ -155,6 +158,13 @@ const TOKEN_MARGIN_SEC = Number(process.env.SWARM_TOKEN_MARGIN_SEC || "300");
 // inboxes). SWARM_WAIT_SEED = a JSON file of {put:"wait"} entries to seed the control-log (the migrated coordinator waits).
 const SWEEP_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_SWEEP ?? "");
 const WAIT_SEED_FILE = process.env.SWARM_WAIT_SEED || "";
+// S14 live sentinel: watch herdr-identified members (plus bus-presence fallback) for blocked / idle-timeout / working-fake-death
+// and escalate to the coordinator (blocked ⇒ S19 approval via sentinelDecision+buildApprovalDoc). Gated on SWARM_SENTINEL
+// (default OFF, dormant-ahead-of-use) AND herdr being reachable (it reads terminal screens). FAKEDEATH = status working but zero
+// new terminal output for this long; IDLE = idle with no check-in for this long.
+const SENTINEL_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_SENTINEL ?? "");
+const SENTINEL_FAKEDEATH_SEC = envInt(process.env.SWARM_SENTINEL_FAKEDEATH_SEC, 900);
+const SENTINEL_IDLE_SEC = envInt(process.env.SWARM_SENTINEL_IDLE_SEC, 1800);
 
 function log(m: string): void { console.error(`[dispatch ${SELF}] ${m}`); }
 function nowSec(): number { return Math.floor(Date.now() / 1000); }
@@ -1188,6 +1198,85 @@ async function main(): Promise<void> {
     } catch (e) { log(`inbox sentinel failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
+  // S14 live sentinel (v2 — herdr-primitive-driven, user "用到极致"): per herdr-IDENTIFIED member run an event-driven watcher
+  // (superviseMember) on herdr's BLOCKING primitives — `agent wait --until` (①), `pane wait-output` (②), `agent explain` (④)
+  // — INSTEAD of tick-polling. A bus-presence-only member (herdr can't wait on it) falls back to a per-tick self-reported-
+  // status check (blocked / idle), no screen ("识别到才监控,未识别回落总线 presence"). Decisions trust only the VERIFIED
+  // agent-list state / status file, never an unparsed herdr wait receipt. Gated on SWARM_SENTINEL + herdr reachability.
+  // Escalation: blocked ⇒ S19 approval (buildApprovalDoc with explain + screen); fake-death / idle-timeout ⇒ a coordinator
+  // notice. Per member+kind dedup (NOTIFY_DEDUP_MS). Fail-soft. NOTE: the herdr-name↔bus-sid mapping is the still-open
+  // "identification" work (1/7 lit) — until it lands, a member that is BOTH herdr-identified AND self-reports idle could
+  // double-notify (benign: one notice per id, no wrong action); blocked does not double (a stuck member cannot self-report).
+  const ALL_AGENT_STATES: AgentState[] = ["idle", "working", "blocked", "done", "unknown"];
+  const sentinelWatchers = new Map<string, AbortController>(); // herdr member -> its running watcher's abort handle
+  const sentinelAlertedAt = new Map<string, number>();         // `${member}\0${kind}` -> last-alerted ms (dedup)
+  const sentinelCfg = { fakeDeathSec: SENTINEL_FAKEDEATH_SEC, idleTimeoutSec: SENTINEL_IDLE_SEC, reArmSec: SENTINEL_IDLE_SEC, doneWakeSec: SENTINEL_IDLE_SEC };
+  const sentinelEscalate = async (ev: SentinelEvent): Promise<void> => {
+    const nowMs = Date.now();
+    for (const [k, t] of sentinelAlertedAt) if (nowMs - t >= NOTIFY_DEDUP_MS) sentinelAlertedAt.delete(k); // bound the map
+    const dk = `${ev.member}\u0000${ev.kind}`;
+    if ((sentinelAlertedAt.get(dk) ?? -Infinity) > nowMs - NOTIFY_DEDUP_MS) return; // already surfaced this member+kind this window
+    sentinelAlertedAt.set(dk, nowMs);
+    if (ev.kind === "blocked") {
+      const screen = await herdrReadClean(ev.member).catch(() => ""); // "" for a presence-only member (no herdr pane)
+      if (sentinelDecision(screen).action !== "escalate") return;     // R12: always escalate; a future auto-clear would branch here
+      const summary = [ev.explain ? `定性:${ev.explain}` : "", screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
+      const doc = buildApprovalDoc({
+        from: SELF, fromLabel: "swarm-sentinel", nowSec: nowSec(), member: ev.member, screenSummary: summary,
+        options: [{ label: "读屏后裁决", consequence: "批准→prompt --wait 回注放行;拒绝→中止/另派" }],
+      });
+      notifyCoordinator(doc.body.text, { taskRef: `approval:${ev.member}`, title: doc.body.title });
+    } else {
+      const detail = ev.kind === "fake-death" ? `status working but no terminal output for >= ${ev.silentSec}s` : `idle with no check-in for >= ${ev.idleSec}s`;
+      notifyCoordinator(`[live-sentinel] ${ev.kind}: 成员 ${ev.member} — ${detail}`, { taskRef: `sentinel:${ev.kind}:${ev.member}`, title: `member ${ev.kind}` });
+    }
+  };
+  const startWatcher = (name: string): void => {
+    const ac = new AbortController();
+    sentinelWatchers.set(name, ac);
+    const signal = ac.signal;
+    let paneId: string | null = null;
+    const ops: WatchOps = {
+      state: () => herdrAgentState(name, signal),
+      waitLeave: (from, timeoutSec) => herdrWait(name, ALL_AGENT_STATES.filter((s) => s !== from), timeoutSec * 1000, signal),
+      waitOutput: async (timeoutSec) => {
+        if (paneId === null) paneId = await herdrAgentPaneId(name, signal).catch(() => null);
+        if (paneId === null) return "error"; // no pane ⇒ cannot watch output (never a false fake-death)
+        return herdrWaitOutput(paneId, { regex: "[^\\s]", timeoutMs: timeoutSec * 1000 }, signal);
+      },
+      explain: () => herdrExplain(name, signal).catch(() => ""),
+      emit: (ev) => { void sentinelEscalate(ev); },
+      stopped: () => signal.aborted || !SENTINEL_ENABLED,
+    };
+    void superviseMember(name, ops, sentinelCfg)
+      .catch((e) => log(`live sentinel watcher ${name} ended: ${e instanceof Error ? e.message : e}`))
+      .finally(() => { if (sentinelWatchers.get(name) === ac) sentinelWatchers.delete(name); });
+  };
+  const runLiveSentinel = async (): Promise<void> => {
+    const abortAll = (): void => { for (const ac of sentinelWatchers.values()) ac.abort(); sentinelWatchers.clear(); };
+    if (!SENTINEL_ENABLED) { abortAll(); return; }
+    try {
+      if (!(await herdrServerReachable())) { abortAll(); return; } // herdr workbench absent ⇒ stop watchers (avoid error-spin), restart on recovery
+      const identified = new Set((await herdrAgentStates()).map((s) => s.name));
+      for (const name of identified) if (!sentinelWatchers.has(name)) startWatcher(name);                 // new identified member ⇒ watch it
+      for (const [name, ac] of sentinelWatchers) if (!identified.has(name)) { ac.abort(); sentinelWatchers.delete(name); } // gone ⇒ stop its watcher
+      // Fallback: bus-presence-only members (not herdr-identified) ⇒ per-tick self-reported-status check (no screen).
+      const now = nowSec();
+      const obs: MemberObs[] = [];
+      for (const sid of listSessions(HOME)) {
+        if (identified.has(sid)) continue; // best-effort exclusion (exact name match) — see the herdr-name↔sid mapping note above
+        const st = readStatusFile(HOME, sid);
+        if (!st) continue;
+        obs.push({ member: sid, reportedStatus: st.state, ...(st.state === "idle" && Number.isFinite(st.seq) ? { idleSec: Math.max(0, now - Math.floor(st.seq / 1000)) } : {}) });
+      }
+      for (const a of decideLiveSentinel(obs, { idleTimeoutSec: SENTINEL_IDLE_SEC })) {
+        void sentinelEscalate(a.kind === "blocked"
+          ? { kind: "blocked", member: a.member, explain: "(presence-only member; no herdr screen/explain)" }
+          : { kind: "idle-timeout", member: a.member, idleSec: SENTINEL_IDLE_SEC });
+      }
+    } catch (e) { log(`live sentinel failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   await runDispatchLoops({
     // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
     // dispatches). T1.5 RED LINE (fe0376cd): --task dispatch stays off (SWARM_TASK_EXEC) until the resume adapter +
@@ -1225,6 +1314,9 @@ async function main(): Promise<void> {
       runDeadLetterWatch();
       // F40: unclaimed-mail sentinel — a box with stale unread mail and no live drainer ⇒ escalate (silent-stall backstop).
       runInboxSentinel();
+      // S14: live member sentinel — herdr-identified blocked/fake-death/idle-timeout ⇒ escalate (blocked ⇒ S19 approval). Gated
+      // on SWARM_SENTINEL + herdr reachability; dormant otherwise.
+      await runLiveSentinel();
     },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     passIntervalMs: 5000,
