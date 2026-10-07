@@ -237,11 +237,12 @@ export function settledFrom(json: unknown, settleTypes: ReadonlySet<string> = WA
   return { settled, status };
 }
 
-/** S14 LS3 (pure): classify an `agent wait` outcome. reached = the re-read state is a target. timeout = a POSITIVE timeout
- *  marker (error code timeout/wait_timeout, result.timed_out, a result.type matching /timeout/, or a timeout word on a failed
- *  exit) — NEVER inferred from near-deadline elapsed, since a success can land just before the deadline. error = a failure with
- *  no timeout marker (the wait did not run). A success exit whose state moved off target with NO timeout marker is `reached`
- *  (it hit a target then fell back; uncertain, but NOT a continuous-idle timeout — the caller preserves that uncertainty). */
+/** S14 LS3 (pure): classify an `agent wait` outcome. reached = the re-read state is a target. timeout = a POSITIVE STRUCTURED
+ *  marker ONLY (error code timeout/wait_timeout, result.timed_out, or a result.type matching /timeout/) — NEVER a raw-text
+ *  substring (a "socket timed out" failure or a member named "timeout-worker" is not a member-wait timeout) and NEVER inferred
+ *  from near-deadline elapsed (a success can land just before the deadline). error = any failed exit with no structured timeout
+ *  marker (the wait did not run; a recognized non-timeout code takes priority). A success exit whose state moved off target with
+ *  NO timeout marker is `reached` (it hit a target then fell back; uncertain, but NOT a continuous-idle timeout). */
 export function classifyWaitOutcome(json: unknown, _raw: string, exitFailed: boolean, state: AgentState, until: readonly AgentState[]): "reached" | "timeout" | "error" {
   if (until.includes(state)) return "reached";
   const code = (json as any)?.error?.code;
