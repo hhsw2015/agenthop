@@ -1,23 +1,20 @@
-# chat-room 后端 审查包 round-2 → 01a0ff49（S26 抄协调者）
+# chat-room 后端 审查包 round-3 → 01a0ff49
 
-分支 `feat/chat-room`，范围 `c3439cd..1c951f6`（代码）+ 本包。round-1 五项(3 P1/2 P2)全修 + S14 限流，整件一次交齐(S27)。stopSet：已提交分支，未并未推。fixOwner f32a0507。源 `~/Dev/agenthop-wt/chat-room`。验证：`pnpm --filter @agenthop/bus exec vitest run` → 79 files/1016 green;`tsc -p tsconfig.json --noEmit` → 0；审查人原 17 探针对本修 **17/17 PASS**（重指向 src 复跑）。
+分支 `feat/chat-room`，范围 `c3439cd..74e9732`（代码）+ 本包。round-2 判决=0 P1/3 P2+1 nit，本轮全修。stopSet：已提交分支，未并未推。fixOwner f32a0507。源 `~/Dev/agenthop-wt/chat-room`。验证：`vitest run` → 79 files/1020 green;`tsc -p tsconfig.json --noEmit` → 0；审查人原 17 探针 + 新增 8 边界探针对本修 **25/25 PASS**（重指向 src 复跑）。
 
-## round-1 五项 → 修法 → 测试
+## round-2 三项 + nit → 修法 → 测试
 | 条 | 修法 | 测试 |
 |---|---|---|
-| CR-P1-1 房间 ID 逃逸/别名 | 拒绝不安全 ID(`^[A-Za-z0-9_-]{1,64}$`)，不再有损 sanitize；无 `.` 则无 `..`，无改写则无 `a/b`↔`a_b` | store「unsafe roomId REJECTED」;probe DOTDOT/ALIAS |
-| CR-P1-2 未终止尾行吞新帖 | appendPost 追加前若文件不以 LF 结尾先补一个 LF；残行/完整缺 LF 行都不吞下一帖，seq 不复用 | store「unterminated tail…(complete + fragment)」;probe TORN/COMPLETE-WITHOUT-NEWLINE |
-| CR-P1-3 读失败当空 | readLogRaw/readMeta 区分 ENOENT（缺失）与真读错（EACCES→抛）；不可读时拒追加（seq 不回退）/拒盖 meta | store「EACCES…refuse」（非 root）;probe UNREADABLE-LOG/META |
-| CR-P2-1 写入收读端会拒的数据 | 写边界校验：appendPost 过 validRoomPost、writeMeta 过 validRoomMeta，再写日志/meta/扇出 | store「invalid input REJECTED;empty text legal」;probe INVALID-DRAFT/TIMESTAMP/META |
-| CR-P2-2 ts 把秒当毫秒 | 时钟参数=秒(nowSec);post.ts 转 `nowSec*1000`(ms)；显式 draft.ts(ms)保留；扇出副本 ts==post.ts | pure「stampPost」;store「default ts converts…」;probe DEFAULT/EXPLICIT-TIMESTAMP |
+| CR-P2-1 规范化未落盘 | writeMeta 落 `validRoomMeta` 的**规范化结果**（owner 入名单、去重），文件本身满足冻结不变量，非仅读投影 | store「putMeta persists NORMALIZED meta」;probe META-NORMALIZATION |
+| CR-R2-P2-1 回执写失败仍消耗去重位 | admit 不再置 notifiedAt;postToRoom **仅在回执写成功后** markNotified；写失败留位（后续拒绝补发）且仍返回 throttled（不抛不静默） | rate「without markNotified notify 仍 DUE」;store「failed receipt… re-sends」;probe RECEIPT-FAILURE |
+| CR-R2-P2-2 非法配置 NaN/绕过 | 构造器校验 limit（正整数）、windowMs（正有限），否则抛；无 NaN retry、不静默关限流 | rate「invalid config rejected」;probe INVALID-LIMITER-OPTIONS |
+| nit CR-N1 窗口描述不符 | 统一文档+注释为**滑动窗口**（逐帖按 `t>now-windowMs` 剪枝）;rate 模块/契约/packet 一致 | probe OBSERVE-ROLLING-NOT-FIXED-WINDOW。**此项新 SHA 74e9732 核销，changed-line 哈希=该提交**，不另开轮 |
 
-## S14 限流（新增，随本单一起审）
-- `chat-room-rate.ts` `RoomRateLimiter`:per-(room,sender) 固定窗口，默认 30/60s，可调。仿 tunnel PostCounter。
-- 入口=postToRoom（可选 limiter）；超限=**明确拒绝**（非排队延发）：不入日志/不扇出，返回 `{throttled,retryAfterMs}`，并向发送者箱写**每窗一条** throttled 回执（，去重，绝不静默丢）。owner 自身 appendPost 不限。
-- user 不豁免但 30/min 对真人绰绰（限风暴非正常对话）。测试：rate「limit/slide/notify-once/key 隔离」+ store「over-limit REJECTED+一条去重回执」。
+## round-1 四项（已 CLOSED，保持）
+CR-P1-1 roomId 安全拒绝 · P1-2 尾行补 LF 不吞帖 · P1-3 ENOENT≠读错（EACCES 抛拒写）· P2-2 ts=nowSec*1000。原 17 探针仍 17/17。
 
-## 自标（沿用 round-1，仍请裁）
-- 单 owner 不变量(v1);appendPost O(n) 重读取 maxSeq（会议室短寿，不缓存以保崩溃重读）；扇出 best-effort 返 fannedOut；中段损坏行亦跳过；dispatcher 接线留缝；限流窗口 in-memory（重启重置，非洪水）。
+## 自标（沿用，仍请裁）
+单 owner 不变量(v1);appendPost O(n) 重读（不缓存保崩溃重读）；扇出 best-effort 返 fannedOut；中段损坏行跳过；dispatcher 接线留缝；限流窗口 in-memory（重启重置）。
 
 ## DEFERRED（非 v1）
-回合/公平栅栏（限流≠回合公平） · 房内审批 · 附件做房间对象 · reply 树 · 跨进程并发写 · 排队延发式限流。
+回合/公平栅栏 · 房内审批 · 附件做房间对象 · reply 树 · 跨进程并发写 · 排队延发式限流。
