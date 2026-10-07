@@ -118,11 +118,12 @@ export function buildAgentWait(name: string, until: readonly AgentState[], timeo
 export function buildAgentRead(name: string, source = "recent-unwrapped", lines?: number): string[] {
   return ["agent", "read", name, "--source", source, ...(lines ? ["--lines", String(lines)] : [])];
 }
-/** S14: wait for a pane to emit output matching a pattern (or until timeout). Used as the fake-death trigger — a WORKING
- *  member whose pane prints nothing before the timeout is surfaced. One of `regex`/`match` (regex wins); neither ⇒ any output. */
+/** S14: block until a pane emits output (or timeout). The pane id is POSITIONAL (herdr 0.9.3 has no `--pane` option — LS1).
+ *  Used only as a bounded inter-sample BLOCK; new-output truth comes from a content-hash diff, not this match (LS2). One of
+ *  `regex`/`match` (regex wins); neither ⇒ any output. */
 export function buildPaneWaitOutput(paneId: string, opts: { regex?: string; match?: string; timeoutMs: number }): string[] {
   const pat = opts.regex !== undefined ? ["--regex", opts.regex] : opts.match !== undefined ? ["--match", opts.match] : [];
-  return ["pane", "wait-output", "--pane", paneId, ...pat, "--timeout", String(opts.timeoutMs)];
+  return ["pane", "wait-output", paneId, ...pat, "--timeout", String(opts.timeoutMs)];
 }
 /** S14: characterize a blocked agent (safety-stop / approval box / crash). Free-text, attached to the S19 approval. */
 export function buildAgentExplain(name: string): string[] { return ["agent", "explain", name]; }
@@ -405,12 +406,19 @@ export async function herdrAgentPaneId(name: string, signal?: AbortSignal): Prom
   return agentPaneId(json);
 }
 
-/** S14 primitive ① — BLOCK until the agent reaches one of `until` (or timeout), then return its CURRENT verified state
- *  (from agent list). We trust the state read, NOT the wait receipt (herdr 0.9.3 wait receipts are unverified — same
- *  discipline as WAIT_SETTLE_TYPES). The caller compares the returned state to decide reached-vs-timed-out. */
-export async function herdrWait(name: string, until: readonly AgentState[], timeoutMs: number, signal?: AbortSignal): Promise<AgentState> {
-  await herdrRun(buildAgentWait(name, until, timeoutMs), timeoutMs + 5000, signal); // block (receipt ignored)
-  return herdrAgentState(name, signal);                                            // decide on the verified state
+/** S14 primitive ① — BLOCK until the agent reaches one of `until` (or timeout), then report the CURRENT verified state (from
+ *  agent list) AND the wait OUTCOME (LS3): `reached` = the member transitioned into `until`; `timeout` = the wait ran to its
+ *  deadline with no transition (exit ok, or a timeout error code); `error` = the wait FAILED fast (e.g. permission_denied) and
+ *  so did NOT actually wait — the caller must NOT treat the unchanged state as a real timeout. We trust the state read, not the
+ *  wait receipt body (same discipline as WAIT_SETTLE_TYPES); only exit-success + error-code are used to split timeout vs error. */
+export async function herdrWait(name: string, until: readonly AgentState[], timeoutMs: number, signal?: AbortSignal): Promise<{ state: AgentState; outcome: "reached" | "timeout" | "error" }> {
+  const r = await herdrRun(buildAgentWait(name, until, timeoutMs), timeoutMs + 5000, signal);
+  const state = await herdrAgentState(name, signal);
+  if (until.includes(state)) return { state, outcome: "reached" };
+  if (!r.exitFailed) return { state, outcome: "timeout" }; // waited to the deadline, no transition
+  const code = (r.json as any)?.error?.code;
+  if (code === "timeout" || code === "wait_timeout" || /timed? ?out/i.test(r.raw)) return { state, outcome: "timeout" };
+  return { state, outcome: "error" }; // failed fast (did not wait) ⇒ an unchanged state is NOT a real timeout
 }
 
 /** S14 primitive ② — BLOCK until the pane emits output (or timeout). "output" = the command returned before its timeout;

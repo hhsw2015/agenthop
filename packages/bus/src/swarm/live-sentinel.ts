@@ -24,50 +24,71 @@ export type SentinelEvent =
   | { kind: "fake-death"; member: string; silentSec: number }
   | { kind: "idle-timeout"; member: string; idleSec: number };
 
-export type WatchCfg = { fakeDeathSec: number; idleTimeoutSec: number; reArmSec: number; doneWakeSec: number };
+export type WaitOutcome = { state: AgentState; outcome: "reached" | "timeout" | "error" };
+export type WatchCfg = { fakeDeathSec: number; idleTimeoutSec: number; reArmSec: number; doneWakeSec: number; sampleSec: number; backoffSec: number };
 
-/** Per-member IO, injected so the state machine is testable. All waits BLOCK (herdr-side) and return the member's CURRENT
- *  verified state; `waitOutput` returns only the coarse output/timeout/error classification. `stopped` is the abort check. */
+/** Per-member IO, injected so the state machine is testable with no herdr and no real clock. Decisions use only VERIFIED
+ *  signals: `state` (agent list), `contentHash` (a hash of the current pane content — the new-output evidence, LS2), and the
+ *  `waitLeave` OUTCOME (reached/timeout/error, LS3). `paneId` is re-resolved each cycle so a rebind is followed (LS2b).
+ *  `waitOutput` is only a bounded inter-sample BLOCK (its match is NOT trusted as progress). */
 export interface WatchOps {
   state(): Promise<AgentState>;
-  waitLeave(from: AgentState, timeoutSec: number): Promise<AgentState>;      // block until state != from (or timeout) ⇒ current state
-  waitOutput(timeoutSec: number): Promise<"output" | "timeout" | "error">;  // block until pane output (or timeout)
+  paneId(): Promise<string | null>;                                            // fresh each cycle (LS2b)
+  contentHash(pane: string): Promise<string>;                                  // hash of current pane content (LS2 new-output evidence)
+  waitOutput(pane: string, timeoutSec: number): Promise<"output" | "timeout" | "error">; // bounded block only
+  waitLeave(from: AgentState, timeoutSec: number): Promise<WaitOutcome>;       // block until state != from; reports the outcome (LS3)
   explain(): Promise<string>;
   emit(ev: SentinelEvent): void;
+  now(): number;                                                               // epoch sec (silent-duration)
+  sleep(sec: number): Promise<void>;                                           // bounded backoff
   stopped(): boolean;
 }
 
 /** The per-member watch loop (herdr-identified members). One blocking wait per step; branches on the VERIFIED state:
- *   blocked  → explain + emit, then block until it leaves blocked (bounded re-arm) so a single block escalates once.
- *   working  → wait for output; a timeout with the member STILL working ⇒ fake-death emit (output / state-change ⇒ re-loop,
- *              which also catches a new block once its prompt renders).
- *   idle     → wait to leave idle; still idle after the timeout ⇒ idle-timeout emit.
- *   done/unknown → block until it becomes active again, then re-loop.
+ *   blocked → explain + emit once, then block until it leaves blocked (bounded re-arm; a wait error backs off, LS3).
+ *   working → sample the pane CONTENT HASH on a fresh pane (LS2/LS2b): a change resets the silence clock; no change for
+ *             fakeDeathSec of REAL elapsed time ⇒ fake-death. Between samples, block on pane wait-output (positional, LS1)
+ *             for sampleSec; a wait ERROR backs off instead of spinning (LS1 bounded retry). The content hash — not the
+ *             wait-output match — is the progress truth, so a stale-buffer match cannot keep a hung member alive.
+ *   idle → block until it leaves idle; only a REAL timeout still-idle emits idle-timeout; a wait error backs off (LS3).
+ *   done/unknown → block until active again (error ⇒ backoff).
  *  Runs until ops.stopped(). Pure over the injected ops. */
 export async function superviseMember(name: string, ops: WatchOps, cfg: WatchCfg): Promise<void> {
+  let lastHash: string | null = null;
+  let silentSince = ops.now();
+  const resetSilence = (): void => { lastHash = null; silentSince = ops.now(); };
   while (!ops.stopped()) {
     const st = await ops.state();
     if (ops.stopped()) break;
     if (st === "blocked") {
       const explain = await ops.explain();
       ops.emit({ kind: "blocked", member: name, explain });
-      await ops.waitLeave("blocked", cfg.reArmSec); // escalate once; re-arm only after it unblocks (bounded)
+      const r = await ops.waitLeave("blocked", cfg.reArmSec); // escalate once; re-arm only after it unblocks
+      if (r.outcome === "error") await ops.sleep(cfg.backoffSec);
+      resetSilence();
       continue;
     }
     if (st === "working") {
-      const r = await ops.waitOutput(cfg.fakeDeathSec);
-      if (r === "timeout") {
-        if (ops.stopped()) break;
-        if ((await ops.state()) === "working") ops.emit({ kind: "fake-death", member: name, silentSec: cfg.fakeDeathSec });
-      }
-      continue; // output / error / state-change ⇒ re-classify next loop
-    }
-    if (st === "idle") {
-      const after = await ops.waitLeave("idle", cfg.idleTimeoutSec);
-      if (after === "idle") ops.emit({ kind: "idle-timeout", member: name, idleSec: cfg.idleTimeoutSec });
+      const pane = await ops.paneId(); // LS2b: a rebind is followed (never a stale cached pane)
+      if (pane === null) { const r = await ops.waitLeave("working", cfg.sampleSec); if (r.outcome === "error") await ops.sleep(cfg.backoffSec); continue; }
+      const h = await ops.contentHash(pane); // LS2: NEW-output evidence, not a stale-buffer match
+      const t = ops.now();
+      if (h !== lastHash) { lastHash = h; silentSince = t; } // new output ⇒ reset the silence clock
+      else if (t - silentSince >= cfg.fakeDeathSec) { ops.emit({ kind: "fake-death", member: name, silentSec: t - silentSince }); silentSince = t; }
+      const r = await ops.waitOutput(pane, cfg.sampleSec); // bounded inter-sample block (positional pane, LS1)
+      if (r === "error") await ops.sleep(cfg.backoffSec);  // LS1: bounded retry, never a tight spin
       continue;
     }
-    await ops.waitLeave(st, cfg.doneWakeSec); // done / unknown ⇒ block until active again
+    if (st === "idle") {
+      const r = await ops.waitLeave("idle", cfg.idleTimeoutSec);
+      if (r.outcome === "timeout" && r.state === "idle") ops.emit({ kind: "idle-timeout", member: name, idleSec: cfg.idleTimeoutSec }); // LS3: ONLY a real timeout
+      else if (r.outcome === "error") await ops.sleep(cfg.backoffSec);
+      resetSilence();
+      continue;
+    }
+    const r = await ops.waitLeave(st, cfg.doneWakeSec); // done / unknown ⇒ block until active again
+    if (r.outcome === "error") await ops.sleep(cfg.backoffSec);
+    resetSilence();
   }
 }
 
