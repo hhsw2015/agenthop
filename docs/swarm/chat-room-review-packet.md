@@ -1,5 +1,9 @@
 # chat-room 后端 审查包 round-3 → 01a0ff49
 
+> ✅ **已签收** 审查人 `codex:happycapy-01a0ff49` @ 代码 `74e9732`（2026-10-07）：**0 P1、0 P2、0 P3,0 nit**。25/25 探针（17+8）。
+> 链：689ee16 v1 → 1c951f6（round-1 五项 + 限流）→ **74e9732**（round-2 三 P2 + nit CLOSED）。签收范围=纯核 + 文件 IO + 限流
+> 部件 + 冻结契约；**merge/push/install/端到端上线仍属独立批准门**（未并未推未部署）。
+
 分支 `feat/chat-room`，范围 `c3439cd..74e9732`（代码）+ 本包。round-2 判决=0 P1/3 P2+1 nit，本轮全修。stopSet：已提交分支，未并未推。fixOwner f32a0507。源 `~/Dev/agenthop-wt/chat-room`。验证：`vitest run` → 79 files/1020 green;`tsc -p tsconfig.json --noEmit` → 0；审查人原 17 探针 + 新增 8 边界探针对本修 **25/25 PASS**（重指向 src 复跑）。
 
 ## round-2 三项 + nit → 修法 → 测试
