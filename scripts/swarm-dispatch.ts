@@ -57,7 +57,7 @@ import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys,
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
-import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrAgentState, herdrAgentPaneId, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
+import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { superviseMember, decideLiveSentinel, type WatchOps, type SentinelEvent, type MemberObs } from "../packages/bus/src/swarm/live-sentinel.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
@@ -1213,13 +1213,25 @@ async function main(): Promise<void> {
   const REAL_AGENT_STATES: AgentState[] = ["idle", "working", "blocked", "done"]; // waitable states (no "unknown")
   const sentinelWatchers = new Map<string, AbortController>(); // herdr member -> its running watcher's abort handle
   const sentinelAlertedAt = new Map<string, number>();         // `${member}\0${kind}` -> last-alerted ms (dedup)
+  const sentinelPending = new Map<string, { text: string; taskRef: string; title: string }>(); // LS4: failed deliveries ⇒ retried each tick
   const sentinelCfg = { fakeDeathSec: SENTINEL_FAKEDEATH_SEC, idleTimeoutSec: SENTINEL_IDLE_SEC, reArmSec: SENTINEL_IDLE_SEC, doneWakeSec: SENTINEL_IDLE_SEC, sampleSec: SENTINEL_SAMPLE_SEC, backoffSec: SENTINEL_SAMPLE_SEC };
+  // LS4: deliver with a durable pending-retry. A FAILED notifyCoordinator does NOT consume the dedup slot AND the rendered
+  // message is parked in sentinelPending, which runLiveSentinel drains every tick — so recovery is automatic and does NOT
+  // depend on the watcher re-emitting (it is inside an 1800s state-wait). Success records dedup + clears pending.
+  const sentinelDeliver = (dk: string, msg: { text: string; taskRef: string; title: string }): void => {
+    const result = notifyCoordinator(msg.text, { taskRef: msg.taskRef, title: msg.title });
+    if (result === "failed") { sentinelPending.set(dk, msg); return; } // keep the obligation for the next tick
+    sentinelAlertedAt.set(dk, Date.now());
+    sentinelPending.delete(dk);
+  };
+  const sentinelRetryPending = (): void => { for (const [dk, msg] of sentinelPending) sentinelDeliver(dk, msg); }; // LS4: auto-retry each tick
   const sentinelEscalate = async (ev: SentinelEvent): Promise<void> => {
     const nowMs = Date.now();
     for (const [k, t] of sentinelAlertedAt) if (nowMs - t >= NOTIFY_DEDUP_MS) sentinelAlertedAt.delete(k); // bound the map
     const dk = `${ev.member}\u0000${ev.kind}`;
     if ((sentinelAlertedAt.get(dk) ?? -Infinity) > nowMs - NOTIFY_DEDUP_MS) return; // already surfaced this member+kind this window
-    let result: "delivered" | "logged" | "failed" | "deduped";
+    if (sentinelPending.has(dk)) return; // already queued for retry (LS4) — don't rebuild/double-send
+    let msg: { text: string; taskRef: string; title: string };
     if (ev.kind === "blocked") {
       const screen = await herdrReadClean(ev.member).catch(() => ""); // "" for a presence-only member (no herdr pane)
       if (sentinelDecision(screen).action !== "escalate") return;     // R12: always escalate; a future auto-clear would branch here
@@ -1228,12 +1240,12 @@ async function main(): Promise<void> {
         from: SELF, fromLabel: "swarm-sentinel", nowSec: nowSec(), member: ev.member, screenSummary: summary,
         options: [{ label: "读屏后裁决", consequence: "批准/拒绝由授权方按实际界面回注(blocked 态不可用 prompt,须按 UI 选择 send-keys 等);或中止/另派" }], // N1: prompt is rejected for a blocked agent
       });
-      result = notifyCoordinator(doc.body.text, { taskRef: `approval:${ev.member}`, title: doc.body.title });
+      msg = { text: doc.body.text, taskRef: `approval:${ev.member}`, title: doc.body.title };
     } else {
       const detail = ev.kind === "fake-death" ? `status working but no terminal output for >= ${ev.silentSec}s` : `idle with no check-in for >= ${ev.idleSec}s`;
-      result = notifyCoordinator(`[live-sentinel] ${ev.kind}: 成员 ${ev.member} — ${detail}`, { taskRef: `sentinel:${ev.kind}:${ev.member}`, title: `member ${ev.kind}` });
+      msg = { text: `[live-sentinel] ${ev.kind}: 成员 ${ev.member} — ${detail}`, taskRef: `sentinel:${ev.kind}:${ev.member}`, title: `member ${ev.kind}` };
     }
-    if (result !== "failed") sentinelAlertedAt.set(dk, nowMs); // LS4: record dedup ONLY after delivery; a failed send keeps the obligation ⇒ next tick retries
+    sentinelDeliver(dk, msg);
   };
   const startWatcher = (name: string): void => {
     const ac = new AbortController();
@@ -1242,7 +1254,7 @@ async function main(): Promise<void> {
     const ops: WatchOps = {
       state: () => herdrAgentState(name, signal),
       paneId: () => herdrAgentPaneId(name, signal).catch(() => null),                       // fresh each cycle (LS2b)
-      contentHash: async (_pane) => createHash("sha256").update(await herdrReadClean(name).catch(() => "")).digest("hex"), // LS2 new-output evidence
+      contentHash: async (_pane) => { const c = await herdrReadContent(name, 40, signal).catch(() => null); return c === null ? null : createHash("sha256").update(c).digest("hex"); }, // LS2: null on read failure (not evidence)
       waitOutput: (pane, timeoutSec) => herdrWaitOutput(pane, { regex: "[^\\s]", timeoutMs: timeoutSec * 1000 }, signal),  // bounded block (positional, LS1)
       waitLeave: (from, timeoutSec) => herdrWait(name, REAL_AGENT_STATES.filter((s) => s !== from), timeoutSec * 1000, signal), // LS3 outcome
       explain: () => herdrExplain(name, signal).catch(() => ""),
@@ -1257,9 +1269,10 @@ async function main(): Promise<void> {
   };
   const runLiveSentinel = async (): Promise<void> => {
     const abortAll = (): void => { for (const ac of sentinelWatchers.values()) ac.abort(); sentinelWatchers.clear(); };
-    if (!SENTINEL_ENABLED) { abortAll(); return; }
+    if (!SENTINEL_ENABLED) { abortAll(); sentinelPending.clear(); return; }
     try {
       if (!(await herdrServerReachable())) { abortAll(); return; } // herdr workbench absent ⇒ stop watchers (avoid error-spin), restart on recovery
+      sentinelRetryPending(); // LS4: re-attempt any previously-failed escalation deliveries (recovery independent of the watcher)
       const identified = new Set((await herdrAgentStates()).map((s) => s.name));
       for (const name of identified) if (!sentinelWatchers.has(name)) startWatcher(name);                 // new identified member ⇒ watch it
       for (const [name, ac] of sentinelWatchers) if (!identified.has(name)) { ac.abort(); sentinelWatchers.delete(name); } // gone ⇒ stop its watcher

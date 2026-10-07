@@ -34,7 +34,7 @@ export type WatchCfg = { fakeDeathSec: number; idleTimeoutSec: number; reArmSec:
 export interface WatchOps {
   state(): Promise<AgentState>;
   paneId(): Promise<string | null>;                                            // fresh each cycle (LS2b)
-  contentHash(pane: string): Promise<string>;                                  // hash of current pane content (LS2 new-output evidence)
+  contentHash(pane: string): Promise<string | null>;                           // hash of current pane content; null = read FAILED (not evidence, LS2)
   waitOutput(pane: string, timeoutSec: number): Promise<"output" | "timeout" | "error">; // bounded block only
   waitLeave(from: AgentState, timeoutSec: number): Promise<WaitOutcome>;       // block until state != from; reports the outcome (LS3)
   explain(): Promise<string>;
@@ -72,11 +72,15 @@ export async function superviseMember(name: string, ops: WatchOps, cfg: WatchCfg
       const pane = await ops.paneId(); // LS2b: a rebind is followed (never a stale cached pane)
       if (pane === null) { const r = await ops.waitLeave("working", cfg.sampleSec); if (r.outcome === "error") await ops.sleep(cfg.backoffSec); continue; }
       const h = await ops.contentHash(pane); // LS2: NEW-output evidence, not a stale-buffer match
+      if (h === null) { await ops.sleep(cfg.sampleSec); continue; } // LS2: a FAILED read is not progress evidence — floor + retry, no silence move, no emit
       const t = ops.now();
       if (h !== lastHash) { lastHash = h; silentSince = t; } // new output ⇒ reset the silence clock
-      else if (t - silentSince >= cfg.fakeDeathSec) { ops.emit({ kind: "fake-death", member: name, silentSec: t - silentSince }); silentSince = t; }
+      else if (t - silentSince >= cfg.fakeDeathSec) {
+        if (ops.stopped()) break;
+        if ((await ops.state()) === "working") { ops.emit({ kind: "fake-death", member: name, silentSec: t - silentSince }); silentSince = t; } // LS2: re-check state (may have left working / been cancelled during sampling)
+      }
       const r = await ops.waitOutput(pane, cfg.sampleSec); // bounded inter-sample block (positional pane, LS1)
-      if (r === "error") await ops.sleep(cfg.backoffSec);  // LS1: bounded retry, never a tight spin
+      if (r !== "timeout") await ops.sleep(cfg.backoffSec); // LS2: sample-rate floor — a stale instant match / error must not drive rapid resampling (LS1 backoff kept)
       continue;
     }
     if (st === "idle") {

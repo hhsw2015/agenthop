@@ -387,6 +387,13 @@ export async function herdrReadClean(name: string, lines = 40): Promise<string> 
   return stripTui(raw);
 }
 
+/** Like herdrReadClean but reports a FAILED read as null (LS2): a read error must NOT become fake-death "progress evidence"
+ *  (hashing the error text as content). null ⇒ the caller skips the silence update this cycle; "" is a real empty screen. */
+export async function herdrReadContent(name: string, lines = 40, signal?: AbortSignal): Promise<string | null> {
+  const { raw, exitFailed } = await herdrRun(buildAgentRead(name, "recent-unwrapped", lines), 15000, signal);
+  return exitFailed ? null : stripTui(raw);
+}
+
 export async function herdrSendKeys(name: string, keys: readonly string[]): Promise<{ ok: boolean; note: string }> {
   const r = await herdrRun(buildSendKeys(name, [...keys]));
   return { ok: !r.exitFailed && !r.json?.error, note: r.exitFailed ? "send-keys failed" : "sent" };
@@ -412,13 +419,19 @@ export async function herdrAgentPaneId(name: string, signal?: AbortSignal): Prom
  *  so did NOT actually wait — the caller must NOT treat the unchanged state as a real timeout. We trust the state read, not the
  *  wait receipt body (same discipline as WAIT_SETTLE_TYPES); only exit-success + error-code are used to split timeout vs error. */
 export async function herdrWait(name: string, until: readonly AgentState[], timeoutMs: number, signal?: AbortSignal): Promise<{ state: AgentState; outcome: "reached" | "timeout" | "error" }> {
+  const startMs = Date.now();
   const r = await herdrRun(buildAgentWait(name, until, timeoutMs), timeoutMs + 5000, signal);
+  const elapsedMs = Date.now() - startMs;
   const state = await herdrAgentState(name, signal);
   if (until.includes(state)) return { state, outcome: "reached" };
-  if (!r.exitFailed) return { state, outcome: "timeout" }; // waited to the deadline, no transition
+  if (!r.exitFailed) {
+    // Exit ok but the re-read state is not a target: a real deadline TIMEOUT only if the wait actually ran ~to its deadline.
+    // A FAST successful exit means it REACHED a target and then fell back before the re-read (LS3) — not a timeout.
+    return { state, outcome: elapsedMs >= timeoutMs * 0.9 ? "timeout" : "reached" };
+  }
   const code = (r.json as any)?.error?.code;
-  if (code === "timeout" || code === "wait_timeout" || /timed? ?out/i.test(r.raw)) return { state, outcome: "timeout" };
-  return { state, outcome: "error" }; // failed fast (did not wait) ⇒ an unchanged state is NOT a real timeout
+  if ((code === "timeout" || code === "wait_timeout" || /timed? ?out/i.test(r.raw)) && elapsedMs >= timeoutMs * 0.9) return { state, outcome: "timeout" };
+  return { state, outcome: "error" }; // failed (did not wait to the deadline) ⇒ an unchanged state is NOT a real timeout
 }
 
 /** S14 primitive ② — BLOCK until the pane emits output (or timeout). "output" = the command returned before its timeout;

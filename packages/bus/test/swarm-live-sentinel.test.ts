@@ -11,7 +11,7 @@ const END = "script-end";
 type Script = {
   states: AgentState[];
   paneId?: (string | null)[];
-  contentHash?: string[];
+  contentHash?: Array<string | null>;
   waitOutput?: Array<"output" | "timeout" | "error">;
   waitLeave?: WaitOutcome[];
   explain?: string;
@@ -49,14 +49,22 @@ describe("live-sentinel superviseMember v3 (herdr primitives; content-diff fake-
       .toEqual([{ kind: "blocked", member: "m", explain: "safety stop" }]);
   });
 
-  test("LS2: working with UNCHANGED content for >= fakeDeathSec ⇒ fake-death (content-diff, not a stale match)", async () => {
-    const events = await run({ states: ["working", "working"], contentHash: ["h1", "h1"], waitOutput: ["output", "output"], nowSeq: [0, 0, 900] });
+  test("LS2: working with UNCHANGED content for >= fakeDeathSec ⇒ fake-death (3rd state is the pre-emit re-check)", async () => {
+    const events = await run({ states: ["working", "working", "working"], contentHash: ["h1", "h1"], nowSeq: [0, 0, 900] });
     expect(events).toEqual([{ kind: "fake-death", member: "m", silentSec: 900 }]);
   });
 
   test("LS2: working with CHANGED content ⇒ no fake-death (new output resets the clock)", async () => {
-    const events = await run({ states: ["working", "working"], contentHash: ["h1", "h2"], waitOutput: ["output", "output"], nowSeq: [0, 0, 900] });
+    const events = await run({ states: ["working", "working"], contentHash: ["h1", "h2"], nowSeq: [0, 0, 900] });
     expect(events).toEqual([]);
+  });
+
+  test("LS2: a FAILED content read (null) is NOT progress ⇒ no fake-death even past the window", async () => {
+    expect(await run({ states: ["working", "working"], contentHash: [null, null], nowSeq: [0, 900, 900] })).toEqual([]);
+  });
+
+  test("LS2: silence elapsed but the pre-emit re-check finds the member already left working ⇒ no fake-death", async () => {
+    expect(await run({ states: ["working", "working", "idle"], contentHash: ["h1", "h1"], nowSeq: [0, 0, 900] })).toEqual([]);
   });
 
   test("LS1: a wait-output error backs off and never emits fake-death on its own", async () => {
