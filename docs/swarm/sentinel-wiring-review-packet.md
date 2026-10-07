@@ -56,3 +56,7 @@ A2 execution; flipping SWARM_SENTINEL; the decision inject-back trigger; BA9 and
 - LS2 (P2): the fake-death emit re-checks both state==working and stopped() AFTER the state read, so an abort during that read no longer emits.
 - LS4/R23-A (P1): sentinelRetryPending runs before the herdr-reachability gate, so a parked escalation retries every sweep tick even while the observation source is down; a new observation still needs herdr.
 - Tests: classifyWaitOutcome selftest (8 cases incl. the success-fallback) + an abort-during-re-check case; 14 superviseMember/fallback cases. Gates: bus tsc 0, dispatch tsc 0, herdr selftest, 1005/1005 vitest.
+
+## Round 5 — fix for the 6f2941d review (code 665df18, base c3439cd)
+- LS3 (P2): classifyWaitOutcome now derives a timeout ONLY from a structured marker (error code timeout or wait_timeout, result.timed_out, a result.type matching timeout); the raw-text substring heuristic is removed, so a member named timeout-worker under permission_denied, or a socket timed out connection failure, is an error, never a member-wait timeout. Any failed exit without a structured marker is error; a recognized non-timeout code takes priority.
+- Selftest: the former raw-text case now expects error, plus two counterexamples (non-timeout code with timeout in the text; socket timed out failed exit). Gates: bus tsc 0, dispatch tsc 0, herdr selftest, 1005/1005 vitest.
