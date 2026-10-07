@@ -1,0 +1,14 @@
+import { agentCapacity, parseNproc, parseFreeTotalGB, capacityFromProbe } from "./remote-capacity.js";
+const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
+t("8c/32GB -> 7", agentCapacity({ cores: 8, memGB: 32 }) === 7);
+t("2c/2GB -> 1", agentCapacity({ cores: 2, memGB: 2 }) === 1);
+t("1c/8GB -> 1 (leave a core, never 0)", agentCapacity({ cores: 1, memGB: 8 }) === 1);
+t("4c/8GB -> 2", agentCapacity({ cores: 4, memGB: 8 }) === 2);
+t("2c/16GB -> 1 (Railway small)", agentCapacity({ cores: 2, memGB: 16 }) === 1);
+t("non-finite -> 1", agentCapacity({ cores: NaN as unknown as number, memGB: NaN as unknown as number }) === 1);
+t("nproc parse", parseNproc("4\n") === 4 && parseNproc("garbage") === null);
+t("free -b bytes -> 8GB", Math.round(parseFreeTotalGB("              total\nMem:   8589934592 1 1\n")!) === 8);
+t("free -m MiB -> 4GB (explicit unit)", Math.round(parseFreeTotalGB("total\nMem:   4096 100\n", "m")!) === 4);
+t("capacityFromProbe nproc+free -b", capacityFromProbe("8\n", "total\nMem: 34359738368 1 1\n") === 7);
+t("capacityFromProbe unparseable -> null", capacityFromProbe("x", "y") === null);
+console.log("all remote-capacity selftests passed");
