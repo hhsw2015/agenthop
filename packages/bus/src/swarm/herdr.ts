@@ -242,15 +242,16 @@ export function settledFrom(json: unknown, settleTypes: ReadonlySet<string> = WA
  *  exit) — NEVER inferred from near-deadline elapsed, since a success can land just before the deadline. error = a failure with
  *  no timeout marker (the wait did not run). A success exit whose state moved off target with NO timeout marker is `reached`
  *  (it hit a target then fell back; uncertain, but NOT a continuous-idle timeout — the caller preserves that uncertainty). */
-export function classifyWaitOutcome(json: unknown, raw: string, exitFailed: boolean, state: AgentState, until: readonly AgentState[]): "reached" | "timeout" | "error" {
+export function classifyWaitOutcome(json: unknown, _raw: string, exitFailed: boolean, state: AgentState, until: readonly AgentState[]): "reached" | "timeout" | "error" {
   if (until.includes(state)) return "reached";
   const code = (json as any)?.error?.code;
   const res = (json as any)?.result;
-  const timedOut = code === "timeout" || code === "wait_timeout" || res?.timed_out === true
-    || (typeof res?.type === "string" && /timeout/i.test(res.type)) || (exitFailed && /timed? ?out/i.test(raw));
-  if (timedOut) return "timeout";
-  if (exitFailed) return "error";
-  return "reached";
+  // A timeout must come from a STRUCTURED marker, NEVER a raw-text substring (LS3): "socket timed out" is a connection
+  // failure, and an error whose text merely names a member like "timeout-worker" is not the member's wait expiring. A
+  // recognized non-timeout error code (e.g. permission_denied) therefore takes priority ⇒ error.
+  if (code === "timeout" || code === "wait_timeout" || res?.timed_out === true || (typeof res?.type === "string" && /timeout/i.test(res.type))) return "timeout";
+  if (exitFailed) return "error"; // any failed exit without a structured timeout marker ⇒ error (not a confirmed timeout)
+  return "reached"; // success exit, state off target, no timeout marker ⇒ reached then fell back (uncertain, not timeout)
 }
 
 // ---- stall sentinel: a blocked agent is a human decision -> escalate (R2-P1-1, coordinator ruling R12) ----

@@ -157,10 +157,13 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   t("timeout: error code wait_timeout", classifyWaitOutcome({ error: { code: "wait_timeout" } }, "", true, "idle", until) === "timeout");
   t("timeout: result.timed_out flag", classifyWaitOutcome({ result: { timed_out: true } }, "", false, "idle", until) === "timeout");
   t("timeout: result.type ~ timeout", classifyWaitOutcome({ result: { type: "wait_timeout" } }, "", false, "idle", until) === "timeout");
-  t("timeout: timeout word on a failed exit", classifyWaitOutcome(null, "wait timed out", true, "idle", until) === "timeout");
   // LS3 core: a SUCCESS exit whose state fell off target, with NO timeout marker, is reached — NOT a (false) timeout.
   t("LS3 success-fallback (no marker) -> reached, NOT timeout", classifyWaitOutcome({ result: { type: "ok" } }, "", false, "idle", until) === "reached");
   t("error: failed exit, non-timeout code", classifyWaitOutcome({ error: { code: "permission_denied" } }, "", true, "idle", until) === "error");
+  // LS3 round-4: a raw-text timeout substring must NOT override a recognized error code / failed exit (member named
+  // "timeout-worker", or "socket timed out" on a connection failure) — both are error, never a member-wait timeout.
+  t("LS3 non-timeout code + 'timeout' in text -> error", classifyWaitOutcome({ error: { code: "permission_denied" } }, "member timeout-worker denied", true, "idle", until) === "error");
+  t("LS3 'socket timed out' failed exit (no code) -> error", classifyWaitOutcome(null, "socket timed out", true, "idle", until) === "error");
 }
 
 console.log("all herdr selftests passed");
