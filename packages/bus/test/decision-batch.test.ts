@@ -48,4 +48,13 @@ describe("decision-batch pure core", () => {
     const r = resolveBatch(b, doc([{ id: "a", verdict: "approve" }, { id: "b", verdict: "defer" }]));
     expect(actionable(r.resolved).map((x) => x.item.id)).toEqual(["a"]);
   });
+
+  test("DB-P1-1: resolveBatch rejects a doc bound to another batch (a same-id item never borrows a foreign verdict)", () => {
+    const b = batch([item("a"), item("b")]); // batchId "b1"
+    const foreign: DecisionsDoc = { batchId: "OTHER", decidedAtSec: 9, decisions: [{ id: "a", verdict: "approve" }, { id: "b", verdict: "reject" }] };
+    const r = resolveBatch(b, foreign);
+    expect(r.resolved).toEqual([]);                     // nothing resolved against the wrong batch
+    expect(r.undecided.map((x) => x.id)).toEqual(["a", "b"]); // all items stay undecided
+    expect(r.unknownIds).toEqual(["a", "b"]);            // the foreign ids are reported, acted on by nothing
+  });
 });

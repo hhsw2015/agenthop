@@ -105,6 +105,10 @@ export type ResolvedDecision = { item: DecisionItem; verdict: Verdict; reason?: 
  * foreign decision can never trigger an action it was not matched to.
  */
 export function resolveBatch(batch: DecisionBatch, doc: DecisionsDoc): { resolved: ResolvedDecision[]; undecided: DecisionItem[]; unknownIds: string[] } {
+  // DB-P1-1: the decisions MUST be for THIS batch. A doc carrying a different batchId never resolves against it — otherwise
+  // a verdict for batch B's item "1" would borrow batch A's item "1" (same id, different batch) and execute the wrong action.
+  // A mismatched doc produces NO resolved/undecided-removal; its ids are reported as unknown (acted on by nothing).
+  if (doc.batchId !== batch.batchId) return { resolved: [], undecided: batch.items, unknownIds: doc.decisions.map((d) => d.id) };
   const byId = new Map(batch.items.map((it) => [it.id, it]));
   const decidedIds = new Set<string>();
   const resolved: ResolvedDecision[] = [];
