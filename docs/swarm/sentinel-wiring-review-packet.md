@@ -44,3 +44,9 @@ A2 execution; flipping SWARM_SENTINEL; the decision inject-back trigger; BA9 and
 - LS4 (P1): sentinelEscalate records the dedup slot only after a non-failed delivery; a failed send keeps the obligation and the next tick retries.
 - N1 (nit): approval text no longer claims prompt --wait injects into a blocked agent; the authorized party chooses the inject per the real UI. Changed line: scripts/swarm-dispatch.ts:1229, sha256 568703a90049df6d5f4fd351f271f5d947e76706409ca0a0ce9c90540488b34e.
 - Tests updated: 11 superviseMember + fallback cases cover LS1 backoff, LS2 content-diff both ways, LS3 wait-error-not-timeout. Gates: bus tsc 0, dispatch tsc 0, herdr selftest, 1002/1002 vitest.
+
+## Round 3 — fixes for the a77b1fd review (code 9f7a345, base c3439cd)
+- LS4 (P1): a failed escalation is parked in sentinelPending and sentinelRetryPending re-attempts it every sweep tick, so recovery is automatic and independent of the watcher re-emitting; success records dedup and clears pending; a dk already pending is not rebuilt.
+- LS2 (P2): herdrReadContent returns null on a failed read so an error is never hashed as progress; a null read floors and retries without moving the silence clock or emitting; the fake-death emit re-checks state is still working after the window; a non-timeout wait-output return floors the sample rate.
+- LS3 (P2): herdrWait measures elapsed and only calls a deadline-length run a timeout; a fast successful exit that is no longer at the target reached a target then fell back, not a timeout, so a 75 ms reach-then-idle no longer reports 1800 s.
+- Tests: 13 superviseMember and fallback cases, adding null-read, pre-emit state re-check, and the content-diff paths. Gates: bus tsc 0, dispatch tsc 0, herdr selftest, 1004/1004 vitest.
