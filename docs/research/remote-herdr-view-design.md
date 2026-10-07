@@ -41,17 +41,32 @@ echoed to logs) and referenced from ssh-config via `$(cat …)`, not duplicated.
 removed with the machine. (Full source audit of herdr's machine transport pending; CLI/behavior consistent with
 ssh-only.)
 
-## ② Lifecycle alignment — DESIGN (to build)
+## ② Lifecycle alignment — DONE (code + selftest; `packages/bus/src/swarm/remote-recycle.ts` + `.selftest.mts`)
 
-When the VM recycles (Railway self-destructs ~1h; `vm-ssh down` is a no-op for railway), the local machine becomes
-unreachable. Cleaner (workspace granularity, not per-tab):
-- signal: `herdr machine status` = unreachable AND `vm-ssh ls` no longer lists the VM (recycled, not a transient net
-  blip) → treat as recycled.
-- action: `herdr machine remove <id>` (verified live — removes the saved machine) + close the machine's workspace
-  (`workspace close --group`, per the herdr skill's constraint). "Recycle = disappears."
-- guard: unreachable-but-still-in-`vm-ssh ls` = transient → keep (maybe `machine disable`), do not remove.
-Build as a pure predicate (recycled? from {machineReachable, vmListed}) + selftest, + an IO sweep reusing herdr.ts
-helpers + vm-ssh ls. `machine remove` is proven; the detection predicate is the new code.
+When the VM recycles (Railway self-destructs ~1h; `vm-ssh down` is a no-op for railway), the saved herdr machine becomes
+a dangling entry. Cleaner at workspace granularity (not per-tab), built as a pure verdict + a thin IO sweep.
+
+**Pure verdict (`recycleVerdict`) — two evidence faces, fail-closed (CORE iron law 4: 单信号不定罪; 两证据面):**
+- `machineReachable` (from `herdr machine status`) AND `vmListed` (label in `vm-ssh ls`) — recycled = BOTH say gone.
+- reachable=true ⇒ `live` (never remove). unreachable + still listed ⇒ `transient` (net blip, keep). unreachable +
+  absent ⇒ `recycled`. ANY missing/ambiguous face ⇒ `unknown` ⇒ keep. `shouldRemove` triggers ONLY on `recycled`.
+- 33/33 selftests (full 3×3 truth table incl. the `unreachable`⊃`reachable` substring trap) + tsc 0.
+
+**IO sweep (`sweepRecycled`) — exercised by live runs, three independent safety layers:**
+- ephemeral-gated: acts only on machines whose label ∈ `ephemeralLabels` (the vm-ssh VMs this flow provisioned) — a
+  permanent SSH box is never touched. This set is the seam to ③ (boot-template records the vm-ssh↔machine linkage).
+- fail-closed: `vm-ssh ls` unavailable ⇒ vmListed=null ⇒ every verdict `unknown` ⇒ nothing removed.
+- dry-run default (`act` defaults false): the sweep only REPORTS unless explicitly enabled.
+- recycled + act ⇒ `herdr machine remove <id>` then `herdr workspace close <workspace_id>`.
+
+**CLI-shape corrections (verified against live herdr 0.9.3 help, read-only):**
+- `herdr workspace close <workspace_id>` is POSITIONAL — there is no `--group` flag (earlier design note was wrong).
+  The workspace is mapped by `workspace list` JSON `label` == machine label (one machine = one workspace by label).
+- `herdr machine remove <PROFILE_ID>` (the id hash), `machine list` plain-text rows `<id>\t<label>\t<host>\t<group>\t<enabled>`,
+  `vm-ssh ls --json` = `[{id,...}]`.
+- Honest gap: the exact `machine status` wording for a LIVE reachable machine was not captured offline (no VM
+  provisioned — no-spend). `parseReachable` keyword set is best-effort; fail-closed makes a wrong guess safe (keeps,
+  never wrongly removes). Confirm/trim on the next live run.
 
 ## ③ Boot template (to add to vm-ssh docs)
 
@@ -61,8 +76,10 @@ One-shot remote bootstrap: `curl -fsSL https://herdr.dev/install.sh | sh` (herdr
 
 ## Remaining to doneLine + stopSet
 
-- [x] ① link-up proven live. [x] ③ capacity (code+live).
-- [ ] ② cleaner (predicate+selftest+IO sweep). [ ] ③ boot-template script + capacity-into-workspace-metadata.
+- [x] ① link-up proven live. [x] ③ capacity (code+live). [x] ② cleaner (verdict+33 selftests+IO sweep, tsc 0).
+- [ ] ③ boot-template script + capacity-into-workspace-metadata (also emits the ephemeral-machine linkage ② consumes).
 - [ ] ④ finish source audit note. [ ] workspace-per-machine wiring in the add/cleaner flow.
+- Live-acceptance rider for ②: one real recycle (provision → let Railway self-destruct → sweep) to confirm the
+  `parseReachable` wording + end-to-end remove+close. Rides a future authorized VM (no-spend now).
 - Spend: one Railway VM used (authorized R19, user-channel); auto-expires ~1h; test machine removed, ssh-config
   restored. Reuse-first honored (none was live). Send-review (f39ddc91) when doneLine met.
