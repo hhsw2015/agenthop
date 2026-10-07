@@ -20,28 +20,31 @@ latency-adding approval hop. The coordinator is a compression layer, not a gatek
 Frozen so `3e097dfe` (console render) can consume the files directly. Code: `packages/bus/src/swarm/decision-batch.ts` (pure)
 + `decision-batch-store.ts` (IO).
 
-> **round-2 (review @b242d34 → @390a61b → @85089a7):** verdicts bound to batch+dir — INCLUDING `batch.json` itself (a planted
-> foreign batch.json reads as "no such batch"); consume CLAIMS before reading; the terminal `consumed.json` is an EXCLUSIVE
-> create (the atomic batch winner) and a faulted claim is RESUMABLE (a fresh decision supersedes a stale claim); `notified.json`
-> is recorded BEFORE the send and rolled back on failure (marker⟺sent, no duplicate ping); `openBatch` propagates a notify
-> failure; `writeDecisions` refuses a consumed batch. The console/coordinator surface is unchanged except these throw cases and
-> the backend-internal marker/claim files below.
+> **rounds 2-3 (review @b242d34 → @390a61b → @85089a7 → @e06d98a):** verdicts bound to batch+dir — INCLUDING `batch.json`
+> itself (a planted foreign batch.json reads as "no such batch"); consume CLAIMS before reading, under ONE STABLE claim name so
+> a newer claim overwrites an older (latest decision wins, no wall-clock ordering); the terminal `consumed.json` is committed via
+> temp+link so it appears ONLY complete (a half-written marker never seals) AND is the atomic single winner; a faulted claim is
+> RESUMABLE; the notify uses an exclusive lock + a separate sent-proof (at most one ping under concurrency/faults; an intent
+> marker is never "sent"); `openBatch` propagates a notify failure; `writeDecisions` refuses a consumed batch. The
+> console/coordinator surface is unchanged except these throw cases and the backend-internal files below.
 
 ## Files (under `$HOME/.agenthop/console/decision-batches/<batchId>/`)
 
 - `batch.json` — the coordinator-written batch (schema below). Atomic (temp+rename). Its `batchId` MUST equal the directory
   name; a `batch.json` whose `batchId` ≠ its dir reads as absent (never resolved, never sealed).
 - `decisions.json` — the USER-written verdicts (console/CLI writes it). Atomic.
-- `decisions-consumed-<ts>-<rand>.json` — a CLAIM: consume renames decisions.json here (claim-before-read) and reads THAT. If
-  consume faults before the terminal marker, this file is a RECOVERABLE claim a retry resumes; after success it is the archive.
-- `decisions-rejected-<ts>-<rand>.json` — a misbound/corrupt claim set aside (never resolved, never resumed).
-- `consumed.json` — the TERMINAL marker, EXCLUSIVE-created: the single consumer that creates it closes the batch (others get
-  EEXIST and execute nothing). While present, `writeDecisions` and `consumeDecisions` refuse this batch (remaining items were
-  re-asked under a NEW batchId).
-- `notified.json` — recorded BEFORE the compression ping and rolled back if the send fails (so it exists ⟺ the ping was sent);
-  while present, a repeat `openBatch` does not re-ping.
+- `decisions-consumed-claim.json` — the CLAIM (ONE stable name): consume renames decisions.json here (claim-before-read) and
+  reads THAT. A newer claim atomically OVERWRITES an older one (latest decision wins, no wall-clock ordering). If consume faults
+  before the terminal marker, this file is a RECOVERABLE claim a retry resumes.
+- `decisions-rejected-claim.json` — a misbound/corrupt claim set aside (never resolved, never resumed).
+- `consumed.json` — the TERMINAL marker, committed via temp+link: appears ONLY with complete content (a half-written marker
+  never seals) and is the single-winner (a second creator gets EEXIST, executes nothing). While present, `writeDecisions` and
+  `consumeDecisions` refuse this batch (remaining items were re-asked under a NEW batchId).
+- `notified.sent` — the ONLY proof-of-sent (written AFTER the ping). While present, a repeat `openBatch` does not re-ping.
+- `notified.lock` — an exclusive link-lock serializing concurrent notifiers; `notified.json` — a pre-send intent record (NOT
+  proof of sent). A lock held with no `notified.sent` ⇒ `openBatch` returns UNCERTAIN (throws) rather than re-ping or silently skip.
 
-A decisions doc OR a batch.json whose `batchId` ≠ its directory is IGNORED (a misbound/foreign drop). Markers/claim files are
+A decisions doc OR a batch.json whose `batchId` ≠ its directory is IGNORED (a misbound/foreign drop). Marker/claim/lock files are
 backend-internal; the console writes only `decisions.json`.
 
 `batchId` is an opaque locator: `^[A-Za-z0-9_-]{1,64}$`, REJECTED otherwise (never sanitized). Generated form `batch-<16 hex>`.
@@ -78,20 +81,30 @@ Duplicate item ids ⇒ the whole batch is rejected at the write boundary (a verd
 
 ## Consume-once (and consumed-forever), fault-recoverable
 
-`consumeDecisions` CLAIMS `decisions.json` by atomic rename BEFORE reading it, then reads the CLAIMED file — so a producer that
-swaps `decisions.json` after the claim lands on a different file, never on the returned verdicts (no read-then-claim stale
-window). The batch's single winner is whoever EXCLUSIVE-creates `consumed.json` (NOT merely whoever renamed a file): a loser
-gets `consumed:false` and executes nothing, so two consumers that both hold a claim still produce at most one actionable result.
-A "no decisions yet" call gets `consumed:false` + all `undecided`.
+`consumeDecisions` CLAIMS `decisions.json` by renaming it to the STABLE `decisions-consumed-claim.json` BEFORE reading, then
+reads the CLAIMED file — so a producer that swaps `decisions.json` after the claim lands on a different write, never on the
+returned verdicts (no read-then-claim stale window). The stable claim name means a newer claim atomically OVERWRITES an older
+one, so the latest decision always wins WITHOUT any wall-clock or random ordering (same-ms and backward-clock both resolve to the
+later submission). The batch's single winner is whoever creates `consumed.json` (NOT merely whoever renamed a file): a loser gets
+`consumed:false` and executes nothing, so two consumers that both hold a claim still produce at most one actionable result. A "no
+decisions yet" call gets `consumed:false` + all `undecided`.
 
-Fault recovery: if a consume faults AFTER claiming but BEFORE the terminal marker (a read EACCES, a marker-write EACCES), the
-claim file persists and a retry RESUMES it — one consume completes with no user resubmit, and the result is never "undecided".
-A FRESH `decisions.json` supersedes a stale claim (a newer decision is never overwritten by a failed older one).
+Fault recovery: `consumed.json` is committed via temp+link, so it appears ONLY with complete content — a write interrupted
+mid-way (EFBIG, a crash) never leaves a half-written marker that falsely seals the batch. If a consume faults AFTER claiming but
+BEFORE the terminal marker (a read EACCES, a commit EACCES/EFBIG), the claim file persists and a retry RESUMES it — one consume
+completes with no user resubmit, and the result is never "undecided". A FRESH `decisions.json` supersedes a stale claim (a newer
+decision is never overwritten by a failed older one).
 
 After `consumed.json` exists, a re-written `decisions.json` is refused by `writeDecisions` and ignored by `consumeDecisions`
 (`consumed:false`) — a verdict is never actionable twice. A misbound/corrupt claim (its `batchId` ≠ dir, or unparseable) yields
-no actionable verdict, is set aside as `decisions-rejected-*`, and does NOT mark the batch consumed (a foreign/garbled drop can
-neither strand nor starve the user's real decisions).
+no actionable verdict, is set aside as `decisions-rejected-claim.json`, and does NOT mark the batch consumed (a foreign/garbled
+drop can neither strand nor starve the user's real decisions).
+
+Notify exactly-once: `notifyOnce` sends at most one ping across concurrency and faults. `notified.sent` (written after the send)
+is the only proof-of-sent; a pre-send `notified.json` intent marker is NEVER treated as sent. An exclusive `notified.lock`
+serializes concurrent notifiers; a loser re-checks `notified.sent` and otherwise returns UNCERTAIN (throws) rather than
+re-sending. A send failure releases the lock so a retry re-sends exactly one; if that release also fails, a retry returns
+UNCERTAIN — never a silent zero-ping success, never a duplicate.
 
 ## resolve semantics (pure, `resolveBatch`)
 
