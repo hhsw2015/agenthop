@@ -62,7 +62,7 @@ A2 execution; flipping SWARM_SENTINEL; the decision inject-back trigger; BA9 and
 - Selftest: the former raw-text case now expects error, plus two counterexamples (non-timeout code with timeout in the text; socket timed out failed exit). Gates: bus tsc 0, dispatch tsc 0, herdr selftest, 1005/1005 vitest.
 
 ## FINAL — review CLEARED (codex 01a0ead5, round 5): 0 REMAIN + N2 nit closed
-Behavior acceptance PASSED at 665df18: LS1/LS2/LS3/LS4 + N1 all CLOSED across 5 rounds.
-N2 (nit, S27③ line-hash closure): the classifyWaitOutcome doc-comment described a removed raw-text timeout path; rewritten to state timeout comes only from a structured marker. Comment-only, code 2df0b86; changed comment-block sha256 ac3d7637956758ef6a953214d5cd26268a1a8f04eef9471956f9db6f36e90370.
-Gates at 2df0b86: bus tsc 0, dispatch tsc 0, herdr selftest, 1005/1005 vitest, packet stcn100 lint-only deterministic-clean. No merge/push/deploy — merge is the coordinator's per existing gates.
-Out of scope / packet-exempt (recorded): herdr-name↔sid identification mapping; real-member receipt shapes; the ③ inject-back trigger; A2; flipping SWARM_SENTINEL.
+- Behavior acceptance PASSED at 665df18: LS1/LS2/LS3/LS4 + N1 all CLOSED across 5 rounds.
+- N2 (nit, S27③ line-hash closure): the classifyWaitOutcome doc-comment described a removed raw-text timeout path; rewritten to state timeout comes only from a structured marker. Comment-only, code 2df0b86; comment block (herdr.ts:240-245 incl. trailing LF) sha256 436a1cfd12859a0a2fa3363ec6e22fc852004d1c24c96468d55a2edac8ae039a (canonical per reviewer; my earlier ac3d7637 was a different line range).
+- Gates at 2df0b86: bus tsc 0, dispatch tsc 0, herdr selftest, 1005/1005 vitest, packet stcn100 lint-only deterministic-clean. No merge/push/deploy — merge is the coordinator's per existing gates.
+- Out of scope / packet-exempt (recorded): herdr-name↔sid identification mapping; real-member receipt shapes; the inject-back trigger; A2; flipping SWARM_SENTINEL.
