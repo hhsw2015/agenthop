@@ -16,6 +16,7 @@ type Script = {
   waitLeave?: WaitOutcome[];
   explain?: string;
   nowSeq?: number[];
+  stopAfterStates?: number; // stopped() flips true once state() has been called this many times (models an abort mid-cycle)
 };
 function makeOps(s: Script): { ops: WatchOps; events: SentinelEvent[] } {
   const events: SentinelEvent[] = [];
@@ -33,7 +34,7 @@ function makeOps(s: Script): { ops: WatchOps; events: SentinelEvent[] } {
       emit: (ev) => events.push(ev),
       now: () => (s.nowSeq ? s.nowSeq[Math.min(ni++, s.nowSeq.length - 1)]! : ni++),
       sleep: async () => { /* immediate */ },
-      stopped: () => false,
+      stopped: () => s.stopAfterStates !== undefined && si >= s.stopAfterStates,
     },
   };
 }
@@ -65,6 +66,11 @@ describe("live-sentinel superviseMember v3 (herdr primitives; content-diff fake-
 
   test("LS2: silence elapsed but the pre-emit re-check finds the member already left working ⇒ no fake-death", async () => {
     expect(await run({ states: ["working", "working", "idle"], contentHash: ["h1", "h1"], nowSeq: [0, 0, 900] })).toEqual([]);
+  });
+
+  test("LS2: ABORT during the pre-emit state re-check (state reads working) ⇒ no fake-death", async () => {
+    // stopped() flips true only after the 3rd state() call (the re-check) returns working — the guard AFTER the read catches it.
+    expect(await run({ states: ["working", "working", "working"], contentHash: ["h1", "h1"], nowSeq: [0, 0, 900], stopAfterStates: 3 })).toEqual([]);
   });
 
   test("LS1: a wait-output error backs off and never emits fake-death on its own", async () => {

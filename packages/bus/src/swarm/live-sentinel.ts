@@ -77,7 +77,8 @@ export async function superviseMember(name: string, ops: WatchOps, cfg: WatchCfg
       if (h !== lastHash) { lastHash = h; silentSince = t; } // new output ⇒ reset the silence clock
       else if (t - silentSince >= cfg.fakeDeathSec) {
         if (ops.stopped()) break;
-        if ((await ops.state()) === "working") { ops.emit({ kind: "fake-death", member: name, silentSec: t - silentSince }); silentSince = t; } // LS2: re-check state (may have left working / been cancelled during sampling)
+        const s2 = await ops.state();
+        if (!ops.stopped() && s2 === "working") { ops.emit({ kind: "fake-death", member: name, silentSec: t - silentSince }); silentSince = t; } // LS2: re-check state AND stopped() AFTER the read (cancel during it)
       }
       const r = await ops.waitOutput(pane, cfg.sampleSec); // bounded inter-sample block (positional pane, LS1)
       if (r !== "timeout") await ops.sleep(cfg.backoffSec); // LS2: sample-rate floor — a stale instant match / error must not drive rapid resampling (LS1 backoff kept)

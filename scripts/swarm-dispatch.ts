@@ -1271,8 +1271,8 @@ async function main(): Promise<void> {
     const abortAll = (): void => { for (const ac of sentinelWatchers.values()) ac.abort(); sentinelWatchers.clear(); };
     if (!SENTINEL_ENABLED) { abortAll(); sentinelPending.clear(); return; }
     try {
+      sentinelRetryPending(); // LS4/R23-A: retry parked deliveries EVERY tick, BEFORE the herdr gate — recovery must not depend on observation-source reachability
       if (!(await herdrServerReachable())) { abortAll(); return; } // herdr workbench absent ⇒ stop watchers (avoid error-spin), restart on recovery
-      sentinelRetryPending(); // LS4: re-attempt any previously-failed escalation deliveries (recovery independent of the watcher)
       const identified = new Set((await herdrAgentStates()).map((s) => s.name));
       for (const name of identified) if (!sentinelWatchers.has(name)) startWatcher(name);                 // new identified member ⇒ watch it
       for (const [name, ac] of sentinelWatchers) if (!identified.has(name)) { ac.abort(); sentinelWatchers.delete(name); } // gone ⇒ stop its watcher

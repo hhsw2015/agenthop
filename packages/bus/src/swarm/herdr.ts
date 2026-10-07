@@ -237,6 +237,22 @@ export function settledFrom(json: unknown, settleTypes: ReadonlySet<string> = WA
   return { settled, status };
 }
 
+/** S14 LS3 (pure): classify an `agent wait` outcome. reached = the re-read state is a target. timeout = a POSITIVE timeout
+ *  marker (error code timeout/wait_timeout, result.timed_out, a result.type matching /timeout/, or a timeout word on a failed
+ *  exit) — NEVER inferred from near-deadline elapsed, since a success can land just before the deadline. error = a failure with
+ *  no timeout marker (the wait did not run). A success exit whose state moved off target with NO timeout marker is `reached`
+ *  (it hit a target then fell back; uncertain, but NOT a continuous-idle timeout — the caller preserves that uncertainty). */
+export function classifyWaitOutcome(json: unknown, raw: string, exitFailed: boolean, state: AgentState, until: readonly AgentState[]): "reached" | "timeout" | "error" {
+  if (until.includes(state)) return "reached";
+  const code = (json as any)?.error?.code;
+  const res = (json as any)?.result;
+  const timedOut = code === "timeout" || code === "wait_timeout" || res?.timed_out === true
+    || (typeof res?.type === "string" && /timeout/i.test(res.type)) || (exitFailed && /timed? ?out/i.test(raw));
+  if (timedOut) return "timeout";
+  if (exitFailed) return "error";
+  return "reached";
+}
+
 // ---- stall sentinel: a blocked agent is a human decision -> escalate (R2-P1-1, coordinator ruling R12) ----
 
 export interface BlockedRule { id: string; match: RegExp; keys: string[]; why: string }
@@ -419,19 +435,9 @@ export async function herdrAgentPaneId(name: string, signal?: AbortSignal): Prom
  *  so did NOT actually wait — the caller must NOT treat the unchanged state as a real timeout. We trust the state read, not the
  *  wait receipt body (same discipline as WAIT_SETTLE_TYPES); only exit-success + error-code are used to split timeout vs error. */
 export async function herdrWait(name: string, until: readonly AgentState[], timeoutMs: number, signal?: AbortSignal): Promise<{ state: AgentState; outcome: "reached" | "timeout" | "error" }> {
-  const startMs = Date.now();
-  const r = await herdrRun(buildAgentWait(name, until, timeoutMs), timeoutMs + 5000, signal);
-  const elapsedMs = Date.now() - startMs;
+  const r = await herdrRun(buildAgentWait(name, until, timeoutMs), timeoutMs + 5000, signal); // block (receipt body only read for a timeout marker)
   const state = await herdrAgentState(name, signal);
-  if (until.includes(state)) return { state, outcome: "reached" };
-  if (!r.exitFailed) {
-    // Exit ok but the re-read state is not a target: a real deadline TIMEOUT only if the wait actually ran ~to its deadline.
-    // A FAST successful exit means it REACHED a target and then fell back before the re-read (LS3) — not a timeout.
-    return { state, outcome: elapsedMs >= timeoutMs * 0.9 ? "timeout" : "reached" };
-  }
-  const code = (r.json as any)?.error?.code;
-  if ((code === "timeout" || code === "wait_timeout" || /timed? ?out/i.test(r.raw)) && elapsedMs >= timeoutMs * 0.9) return { state, outcome: "timeout" };
-  return { state, outcome: "error" }; // failed (did not wait to the deadline) ⇒ an unchanged state is NOT a real timeout
+  return { state, outcome: classifyWaitOutcome(r.json, r.raw, r.exitFailed, state, until) };
 }
 
 /** S14 primitive ② — BLOCK until the pane emits output (or timeout). "output" = the command returned before its timeout;

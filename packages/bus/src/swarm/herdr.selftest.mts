@@ -3,7 +3,7 @@
 import {
   HARD_NOT_STARTED, SUBMIT_REJECTED, WAIT_SETTLE_TYPES, WHITELIST_V1, agentPaneId, buildAgentGet,
   buildAgentPromptWait, buildAgentRead, buildAgentStart, buildAgentSubmit, buildAgentWait, buildApprovalDoc,
-  buildPaneClose, buildPaneSplit, buildSendKeys, classifyStart, classifySubmit, hasExplicitBinary,
+  buildPaneClose, buildPaneSplit, buildSendKeys, classifyStart, classifySubmit, classifyWaitOutcome, hasExplicitBinary,
   herdrAgentName, herdrSpawnable, paneBound, paneIdFromSplit, scanCommand, sentinelDecision, settledFrom,
   shellTokenize, splitCommand, startedName, stripTui,
 } from "./herdr.js";
@@ -147,6 +147,20 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
 {
   const clean = stripTui(["The answer is 42.", "  Worked for 5s • 2:02 PM", "› Ask Codex to do anything"].join("\n"));
   t("keeps content, drops chrome", clean.includes("42.") && !/Worked for|Ask Codex/.test(clean));
+}
+
+// --- S14 LS3: classifyWaitOutcome — timeout ONLY on a positive marker, never near-deadline elapsed ---
+{
+  const until = ["working", "blocked", "done"] as const;
+  t("reached: re-read state is a target", classifyWaitOutcome(null, "", false, "working", until) === "reached");
+  t("timeout: error code timeout", classifyWaitOutcome({ error: { code: "timeout" } }, "", true, "idle", until) === "timeout");
+  t("timeout: error code wait_timeout", classifyWaitOutcome({ error: { code: "wait_timeout" } }, "", true, "idle", until) === "timeout");
+  t("timeout: result.timed_out flag", classifyWaitOutcome({ result: { timed_out: true } }, "", false, "idle", until) === "timeout");
+  t("timeout: result.type ~ timeout", classifyWaitOutcome({ result: { type: "wait_timeout" } }, "", false, "idle", until) === "timeout");
+  t("timeout: timeout word on a failed exit", classifyWaitOutcome(null, "wait timed out", true, "idle", until) === "timeout");
+  // LS3 core: a SUCCESS exit whose state fell off target, with NO timeout marker, is reached — NOT a (false) timeout.
+  t("LS3 success-fallback (no marker) -> reached, NOT timeout", classifyWaitOutcome({ result: { type: "ok" } }, "", false, "idle", until) === "reached");
+  t("error: failed exit, non-timeout code", classifyWaitOutcome({ error: { code: "permission_denied" } }, "", true, "idle", until) === "error");
 }
 
 console.log("all herdr selftests passed");
