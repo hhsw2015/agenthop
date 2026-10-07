@@ -189,4 +189,41 @@ describe("decision-batch store (IO)", () => {
     expect(got.consumed).toBe(true);
     expect(got.resolved.map((r) => [r.item.id, r.verdict])).toEqual([["1", "approve"]]);
   });
+
+  test("DB-R3-P1-1: a newer failed claim supersedes an older one (stable claim name, no wall-clock ordering)", () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root bypasses chmod
+    openBatch(HOME, { batchId: "b1", owner: "c", items: [item("same")], nowSec: 1 });
+    const dpath = path.join(dbDir("b1"), "decisions.json");
+    const failClaim = (verdict: "approve" | "reject", ts: number) => {
+      writeDecisions(HOME, { batchId: "b1", decidedAtSec: ts, decisions: [{ id: "same", verdict }] });
+      const mode = statSync(dpath).mode & 0o777;
+      chmodSync(dpath, 0o000); // consume CLAIMS it (rename), then faults reading — leaving a recoverable claim
+      try { consumeDecisions(HOME, "b1"); } catch { /* read fault expected */ }
+      for (const f of readdirSync(dbDir("b1"))) if (f === "decisions.json" || f.startsWith("decisions-consumed-")) chmodSync(path.join(dbDir("b1"), f), mode);
+    };
+    let blind = false; writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
+    chmodSync(dpath, 0o000); try { readFileSync(dpath); } catch { blind = true; } chmodSync(dpath, 0o600);
+    if (!blind) return; // environment can still read (root-ish)
+    failClaim("approve", 20); // older claim
+    failClaim("reject", 21);  // newer claim OVERWRITES the stale approve claim (stable name)
+    const got = consumeDecisions(HOME, "b1"); // retry: the later (reject) wins, never the revived older approve
+    expect(got.consumed).toBe(true);
+    expect(got.resolved.map((r) => r.verdict)).toEqual(["reject"]);
+  });
+
+  test("DB-R2-P2-1: a lingering notify lock without a sent-proof yields UNCERTAIN, never a silent skip or blind re-send", () => {
+    openBatch(HOME, { batchId: "b1", owner: "coord", items: [item("1")], nowSec: 1 });
+    // a prior notify that locked but faulted before recording the send (no notified.sent)
+    writeFileSync(path.join(dbDir("b1"), "notified.lock"), JSON.stringify({ to: "user-sid", at: 1 }));
+    expect(() => openBatch(HOME, { batchId: "b1", owner: "coord", items: [item("1")], nowSec: 2, notifyTo: "user-sid" })).toThrow(/unsent/);
+    expect(claimInbox(HOME, ["user-sid"], "probe")).toHaveLength(0); // NOT re-sent (can't prove the prior ping didn't land)
+  });
+
+  test("DB-R2-P1-1 (resid): a successful consume commits a COMPLETE consumed.json (atomic link-commit, no leftover temp)", () => {
+    openBatch(HOME, { batchId: "b1", owner: "c", items: [item("1")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 2, decisions: [{ id: "1", verdict: "approve" }] });
+    consumeDecisions(HOME, "b1");
+    expect(JSON.parse(readFileSync(path.join(dbDir("b1"), "consumed.json"), "utf8"))).toMatchObject({ batchId: "b1", decidedAtSec: 2 }); // complete/parseable
+    expect(readdirSync(dbDir("b1")).some((n) => n.includes(".tmp-"))).toBe(false); // temp cleaned up
+  });
 });
