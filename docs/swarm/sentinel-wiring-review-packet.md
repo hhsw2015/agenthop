@@ -50,3 +50,9 @@ A2 execution; flipping SWARM_SENTINEL; the decision inject-back trigger; BA9 and
 - LS2 (P2): herdrReadContent returns null on a failed read so an error is never hashed as progress; a null read floors and retries without moving the silence clock or emitting; the fake-death emit re-checks state is still working after the window; a non-timeout wait-output return floors the sample rate.
 - LS3 (P2): herdrWait measures elapsed and only calls a deadline-length run a timeout; a fast successful exit that is no longer at the target reached a target then fell back, not a timeout, so a 75 ms reach-then-idle no longer reports 1800 s.
 - Tests: 13 superviseMember and fallback cases, adding null-read, pre-emit state re-check, and the content-diff paths. Gates: bus tsc 0, dispatch tsc 0, herdr selftest, 1004/1004 vitest.
+
+## Round 4 — fixes for the 9f7a345 review (code 6f2941d, base c3439cd)
+- LS3 (P2): a new pure classifyWaitOutcome decides the wait result; a timeout needs a positive marker (error code timeout or wait_timeout, result.timed_out, a result.type matching timeout, or a timeout word on a failed exit) and is never inferred from near-deadline elapsed, so a success that lands at 1919 ms and falls back to idle is reached, not a false timeout. herdrWait delegates to it and is now selftested.
+- LS2 (P2): the fake-death emit re-checks both state==working and stopped() AFTER the state read, so an abort during that read no longer emits.
+- LS4/R23-A (P1): sentinelRetryPending runs before the herdr-reachability gate, so a parked escalation retries every sweep tick even while the observation source is down; a new observation still needs herdr.
+- Tests: classifyWaitOutcome selftest (8 cases incl. the success-fallback) + an abort-during-re-check case; 14 superviseMember/fallback cases. Gates: bus tsc 0, dispatch tsc 0, herdr selftest, 1005/1005 vitest.
