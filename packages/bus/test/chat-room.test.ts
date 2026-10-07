@@ -27,8 +27,8 @@ describe("chat-room pure core", () => {
   test("seq: maxSeq + stampPost give gap-free monotonic seq from the authoritative last", () => {
     expect(maxSeq([])).toBe(0);
     expect(maxSeq([{ seq: 3, from: "x", fromLabel: "l", text: "", ts: 1 }, { seq: 7, from: "x", fromLabel: "l", text: "", ts: 1 }])).toBe(7);
-    expect(stampPost({ from: "a", fromLabel: "A", text: "hi" }, 7, 200)).toEqual({ seq: 8, from: "a", fromLabel: "A", text: "hi", ts: 200 });
-    expect(stampPost({ from: "a", fromLabel: "A", text: "hi", ts: 5 }, 0, 200).ts).toBe(5); // explicit ts kept
+    expect(stampPost({ from: "a", fromLabel: "A", text: "hi" }, 7, 200)).toEqual({ seq: 8, from: "a", fromLabel: "A", text: "hi", ts: 200_000 }); // nowSec 200 → ms
+    expect(stampPost({ from: "a", fromLabel: "A", text: "hi", ts: 5 }, 0, 200).ts).toBe(5); // explicit ms ts kept
   });
 
   test("postsSince returns seq-ordered posts strictly after the cursor; 0 = whole log", () => {

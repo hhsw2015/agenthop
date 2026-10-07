@@ -95,10 +95,12 @@ export function maxSeq(posts: RoomPost[]): number {
   return m;
 }
 
-/** Stamp a draft with the next monotonic seq after `lastSeq`. Pure: the caller (store, under a single-writer lock) supplies
- *  the authoritative lastSeq and the clock. */
+/** Stamp a draft with the next monotonic seq after `lastSeq`. Pure: the caller (store) supplies the authoritative lastSeq
+ *  and the clock. `nowSec` is epoch SECONDS (the swarm's clock unit, same as meta.createdAtSec); the post `ts` is epoch
+ *  MILLISECONDS (matching the inbox envelope + the frozen contract), so the default CONVERTS `nowSec * 1000`. An explicit
+ *  `draft.ts` is already ms and is kept verbatim. */
 export function stampPost(draft: RoomPostDraft, lastSeq: number, nowSec: number): RoomPost {
-  return { seq: lastSeq + 1, from: draft.from, fromLabel: draft.fromLabel, text: draft.text, ts: draft.ts ?? nowSec };
+  return { seq: lastSeq + 1, from: draft.from, fromLabel: draft.fromLabel, text: draft.text, ts: draft.ts ?? nowSec * 1000 };
 }
 
 /** The incremental read the console tail uses: posts with seq STRICTLY greater than `sinceSeq`, in seq order. `sinceSeq=0`
