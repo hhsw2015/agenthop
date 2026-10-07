@@ -36,3 +36,11 @@ A2 execution; flipping SWARM_SENTINEL; the decision inject-back trigger; BA9 and
 
 ## Reproduce
 `cd packages/bus && npx vitest run test/swarm-live-sentinel.test.ts`, then `npx tsx src/swarm/herdr.selftest.mts`, plus tsc per the gates. No merge, push, or deploy performed.
+
+## Round 2 — fixes for the 8b534f3 review (code a77b1fd, base c3439cd)
+- LS1 (P1): buildPaneWaitOutput uses a positional pane argument; a wait-output error backs off (bounded) instead of spinning.
+- LS2 (P1): fake-death rests on a content-hash diff (new-output evidence) with the pane re-resolved each cycle; pane wait-output is only a bounded block, its match is not trusted as progress.
+- LS3 (P2): herdrWait returns an outcome (reached, timeout, error); idle-timeout fires only on a real timeout still-idle, and a wait error backs off.
+- LS4 (P1): sentinelEscalate records the dedup slot only after a non-failed delivery; a failed send keeps the obligation and the next tick retries.
+- N1 (nit): approval text no longer claims prompt --wait injects into a blocked agent; the authorized party chooses the inject per the real UI. Changed line: scripts/swarm-dispatch.ts:1229, sha256 568703a90049df6d5f4fd351f271f5d947e76706409ca0a0ce9c90540488b34e.
+- Tests updated: 11 superviseMember + fallback cases cover LS1 backoff, LS2 content-diff both ways, LS3 wait-error-not-timeout. Gates: bus tsc 0, dispatch tsc 0, herdr selftest, 1002/1002 vitest.
