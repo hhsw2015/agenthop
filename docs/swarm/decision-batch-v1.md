@@ -60,6 +60,14 @@ Frozen so `3e097dfe` (console render) can consume the files directly. Code: `pac
 > LIVE FOREIGN pid exists (faulted ⇒ dead/own intent ⇒ reclaim and continue the original verdict; live ⇒ alive intent ⇒ contend),
 > so a faulted empty dir recovers while a live one is never stolen. DB-N2 (nit): if the orphan `.sent` proof write faults AFTER a
 > good send, a retry re-delivers — orphan signalling is AT-LEAST-ONCE; the coordinator dedups by the stable update id (digest).
+>
+> **round-11 (R25, @71ba9b6):** the empty-lock-dir reclaim is now BOUND to observed occupancy so it can never delete a live or
+> arriving holder. (A) Listing the hold-intents must SUCCEED — a read fault (EACCES) PROPAGATES and the reclaim contends; a read
+> that cannot see the intents may never be folded to "no holder" and authorize a reclaim. (B) A reclaim no longer trusts a single
+> stale snapshot: after observing no live-foreign hold-intent it re-creates a FRESH lock dir it owns, then RE-VERIFIES; if a live
+> successor arrived during the reclaim (its hold-intent now live), it YIELDS the fresh empty dir to that successor instead of
+> keeping a dir a live holder is using. A normal release/re-acquire interleaving therefore never lets a stale check delete the new
+> occupant, and a genuinely faulted empty dir still recovers the original verdict.
 
 ## Orphan recovery (R25) — formal boundary
 
@@ -100,12 +108,15 @@ responsible for idempotent re-batching keyed on the stable update id (the conten
 - `consume.lockd/` — the per-batch exclusive consume lock (a DIRECTORY, atomic mkdir), holder identity = the single file inside
   named `<pid>.<nonce>` (vm-ssh `withIdLock` pattern). Reclaim removes ONLY a dead holder's exact-named file (never a successor's);
   release removes ONLY our own named file and never throws. A PUBLISHED holder (one identity file) is reclaimed iff dead/own. An
-  EMPTY lock dir is the brief mkdir→publish window: reclaimable iff NO `consume.lockd.hold.*` of a LIVE FOREIGN pid exists (see
-  below) — so a faulted empty dir recovers while a LIVE in-flight one is never stolen (`contended`).
+  EMPTY lock dir (the brief mkdir→publish window, faulted debris, or a holder mid-release) is reclaimed only when BOUND to the
+  occupancy observed: the reclaim contends if it cannot read the hold-intents (EACCES never means "no holder"), contends if any
+  `consume.lockd.hold.*` of a LIVE FOREIGN pid is present, and after re-creating a fresh dir RE-VERIFIES and YIELDS it to a live
+  successor that arrived meanwhile — so a faulted empty dir recovers while a live/arriving holder is never stolen.
 - `consume.lockd.hold.<pid>.<nonce>` — a HOLD-INTENT credential written in the batch dir BEFORE the mkdir and removed after
   release. Because it is written while the batch dir is still writable, it SURVIVES a compensation that can no longer touch the
   lock dir (parent/lock dir turned unwritable mid-cleanup, or a publish that faulted before any identity could be written) and
-  names the faulter's pid — the recognizable credential that makes an empty lock dir recoverable without stealing a live acquirer.
+  names the faulter's pid — the live/dead signal that tells a reclaim whether an empty lock dir is a live holder (contend) or
+  faulted debris (recover), and that a live successor uses to claim a yielded dir.
 - `orphan-<digest>.sent` — per-update proof-of-sent, written only AFTER the orphan re-batch signal is delivered. Dedups re-emits of
   the same content digest across retries; its absence after a faulted send is what lets a retry re-send exactly one.
 

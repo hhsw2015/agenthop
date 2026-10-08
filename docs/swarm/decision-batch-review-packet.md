@@ -1,30 +1,24 @@
-# decision-batch 后端 round-10 返修 → 01a0ff49（S26 抄协调者 fe0376cd）
+# decision-batch 后端 round-11 返修 → 01a0ff49（S26 抄协调者 fe0376cd）
 
-结论：DB-R7-P1-1（补偿动作自身失败后仍留下不可辨认空锁）已根治；DB-N2（nit：凭据失败后至少一次投递）已写入契约。DB-R3-P1-1 round-9 已核销，保留。并发写（R25）保留，未推未并。
+结论：DB-R7-P1-1（空锁回收会删除活/到达中的后继）已根治。空锁回收现**绑定到观察到的占用**，绝不删除活的或正在到达的持有者。DB-R3/DB-N2 保持已核销。并发写（R25）保留，未推未并。
 
-代码：`f0f0697`（范围 `47287fa..f0f0697`）。源 `~/Dev/agenthop-wt/decision-batch` 分支 feat/decision-batch。
-验证 @f0f0697：审查席 **compensation-boundaries.test.ts 4/4**（三恢复场景 + R25 投递可见）；**directory-recovery.test.ts 6/6**（无回归）；lifecycle 孤儿组 3/3（含 CONCURRENT-ORPHAN-NOTIFIERS）；全量 bus **1025/1025**；tsc 0；decision-batch **34** 测（28 IO + 6 纯）。
-lifecycle 2 个旧原语 lock 探针（RECLAIM-RESTORE / LOCK-RELEASE-READ-FAULT）仍红——键于 `consume.lock` 文件 + `.reclaim-` 换名 / 释放读 token，round-8 已判定无法挂目录锁并以上述两套新探针重建；预期淘汰，非回归。
+代码：`71ba9b6`（范围 `f0f0697..71ba9b6`）。源 `~/Dev/agenthop-wt/decision-batch` 分支 feat/decision-batch。
+验证 @71ba9b6：审查席 **hold-boundaries.test.ts 2/2**（反例 A/B 均过）；**compensation-boundaries 4/4**、**directory-recovery 6/6**、lifecycle 孤儿组 3/3 全无回归；全量 bus **1025/1025**；tsc 0；decision-batch **34** 测。
+lifecycle 2 个旧原语 lock 探针（RECLAIM-RESTORE / LOCK-RELEASE-READ-FAULT）仍红——键于 `consume.lock` 文件 + `.reclaim-` 换名 / 释放读 token，round-8 已判定淘汰并以 directory-recovery + compensation + hold 三套新探针重建；预期，非回归。
 
-## DB-R7-P1-1（补偿失败留不可辨认空锁）→ 发 mkdir 前的 HOLD-INTENT 凭据
-根因：round-9 的「rmdir 失败则重建本名文件」在**锁目录也同时不可写**（或发布在写任何文件之前就失败）时无法执行，残留**无身份空目录**；而 acquire 对空目录一律 contended，无法区分「故障残留」与「活的在途获取」，故三反例永困：
-- A：mkdir 成功后 ld 与父目录同时 EACCES（身份写入与撤销目录皆失败）。
-- B：提交失败，身份已删；rmdir 与重建身份相继 EACCES。
-- C：回收死者时删名成功、rmdir 遇 EACCES，身份未恢复。
+## DB-R7-P1-1（空锁回收删活后继）→ 回收绑定观察占用
+根因：round-10 的空锁回收（判「无活的外部 hold-intent」后 rmdir）键于**单次陈旧快照**，两处漏洞：
+- 反例 A：`listHoldIntents` 把目录读取错误（EACCES）折成空表 ⇒ 读不到意图却据此授权回收，删掉活持有者的锁。
+- 反例 B：正常释放与新建交错——旧持有者删身份后暂停→竞争者读到空→旧持有者完成释放→竞争者扫描意图（此刻为空）→新持有者 mkdir 后暂停→竞争者据陈旧快照 rmdir 删掉**新**占用。
 
-改为（身份在文件名 + 发 mkdir 前的持有意图）：
-- 每次 acquire **先在 batch 目录写** `consume.lockd.hold.<pid>.<nonce>`（父目录此刻可写）——它能熬过「清理阶段再也碰不到锁目录」的故障，并以文件名携带故障者 pid。
-- 空锁目录的回收判据：**当且仅当不存在「活的、非自身 pid」的 hold-intent** 才回收（故障者意图=死/自身→回收并续原裁决；活持有者意图=存活→contended）。→ 故障空目录可恢复，活的在途空目录绝不被偷。
-- 已发布持有者（目录内恰一身份文件）仍按**精确名** dead/own 回收，不动后继。
-- release：删身份→rmdir→**最后**删 hold-intent；rmdir 若失败则 hold-intent 留存=可辨认恢复凭据。全程 try/catch 永不抛。
-探针：FAILED-PUBLISH-AND-ROLLBACK / FAILED-RELEASE-AND-RESTORE / FAILED-DEAD-RECLAIM-RMDIR 三项 `verdicts(first)+verdicts(retry)==='reject'` 全过；UNPUBLISHED-LIVE（活空目录仍 contended）与 directory-recovery 六项无回归。
-
-## DB-N2（nit：凭据失败后至少一次投递）→ 契约披露
-已在契约 Orphan recovery 章与 round-10 说明写明：`.sent` 凭据在**成功投递之后**写入；若凭据写入 EACCES，重试会按同一 digest **重复投递**（宁重复不丢失）。协调者负责按稳定更新 ID（内容 digest，封于 `taskRef`/信号）**幂等重批**。接收端幂等由协调者实现，非本层。
-探针 R25-SENT-PROOF-FAILURE-DELIVERY-OBSERVED：`notices>=1`（投递可见），`duplicateDelivery` 记录在案。
+改为（回收绑定到观察到的占用）：
+- **(A) 读意图必须成功**：`listHoldIntents` 的读失败**向上抛**，不再折成空表；回收路径捕获后 contended。读不到＝不能证明「无持有者」＝不授权回收。
+- **(B) 不信任单次快照**：确认无活的外部 hold-intent 后，rmdir 旧目录、**重建一个本进程拥有的新目录**，再**复核**；若回收过程中有活后继到达（其 hold-intent 现为活）⇒ **让渡**这个新空目录给后继（留给它认领），绝不保留一个活持有者正在用的目录。
+- 已发布持有者（恰一身份文件）仍按**精确名** dead/own 回收；活的在途/发布中持有者（活 hold-intent）一律 contended。
+探针：HOLD-SCAN-EACCES-MUST-PRESERVE-LIVE-PUBLISH（读失败不回收，活持有者保有并消费）、EMPTY-SNAPSHOT-MUST-NOT-DELETE-LIVE-SUCCESSOR（交错释放/新建下让渡给新后继，first contended、后继消费 reject）均过。
 
 ## 验证法（随码可复算）
-审查席封存证据 `~/Work/review-reports/decision-batch-47287fa-review-evidence/` 只读未动；将修订源 overlay 到 `/tmp` 的 snapshot 副本后在副本内运行探针。
+审查席封存证据 `~/Work/review-reports/decision-batch-f0f0697-review-evidence/` 只读未动；将修订源 overlay 到 `/tmp` 的 snapshot 副本后在副本内运行探针。
 
 ## DEFERRED（非本层）
 孤儿重批执行与接收端幂等（协调者 seam）· 逐件讨论 · 多决策者 · 自动执行接线 · 优先级排序。
