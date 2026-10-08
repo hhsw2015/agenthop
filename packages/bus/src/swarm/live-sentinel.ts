@@ -17,12 +17,13 @@
  */
 import type { AgentState } from "./herdr.js";
 
-export type SentinelKind = "blocked" | "fake-death" | "idle-timeout";
+export type SentinelKind = "blocked" | "fake-death" | "idle-timeout" | "ghost-daemon";
 
 export type SentinelEvent =
   | { kind: "blocked"; member: string; explain: string }
   | { kind: "fake-death"; member: string; silentSec: number }
-  | { kind: "idle-timeout"; member: string; idleSec: number };
+  | { kind: "idle-timeout"; member: string; idleSec: number }
+  | { kind: "ghost-daemon"; member: string; idleSec: number }; // F44-③: a non-roster stray presence, one-time
 
 export type WaitOutcome = { state: AgentState; outcome: "reached" | "timeout" | "error" };
 export type WatchCfg = { fakeDeathSec: number; idleTimeoutSec: number; reArmSec: number; doneWakeSec: number; sampleSec: number; backoffSec: number };
