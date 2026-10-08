@@ -1,11 +1,19 @@
-# Review packet — BA9 board-post supervision (§2d-a, an R14 pre-flight)
+# Review packet — BA9 board-post supervision (§2d-a, an R14 pre-flight), ROUND 2
 
-- **Branch** `feat/board-post-supervision`  **HEAD** `52533f3`  **Base** `main` (`5da42b5`)
+- **Branch** `feat/board-post-supervision`  **HEAD** `68e41e0`  **Base** `main` (`5da42b5`)  (round-1 `52533f3`)
 - **Reviewer** codex `01a0ead5` (cross-family, independent)  **Author** bus-pen `d7f6c917`
 - **Design** `docs/swarm/board-post-supervision-design.md` @`93023c6` (coordinator-approved, zero change)
 
 ## What this is
 A posted-but-unclaimed board item that is STILL ready is never reaped by `planBoardWrites` (reap only fires when the node stops being ready), so without supervision it can sit forever — a silent stall that must be closed before `SWARM_BOARD_ADMIT` can flip (R14). BA9 adds the escalation: REPOST (bounded) -> REPORT (coordinator incident, deduped) -> RECLAIM (dead-letter). DORMANT behind `SWARM_BOARD_ADMIT`.
+
+## Round 2 — round-1 REMAIN resolved (BP1-BP6)
+- BP1 a REPORT is RECORDED first (persisted `reportedAtSec`), and RECLAIM's grace runs from THAT time — never straight-to-reclaim on a late scan, never a report-write-failure bypass. The report action carries the stamped item; the driver re-posts it + writes one S19 incident.
+- BP2 supervision runs on a FRESH board snapshot read AFTER `planBoardWrites`, so it never disposes a just-published new version from a stale pre-write snapshot.
+- BP3 repost/report acquire the same posted file by ATOMIC RENAME (skip if a member claimed it first); reclaim is a single atomic rename to the terminal `reclaimed` file — never posted+claimed/reclaimed coexisting, never a half-migration on an unlink failure.
+- BP4 `planBoardSupervision` uses the VERIFIED DERIVED itemId (the filename identity) for every output path — a crafted body `itemId` (`../foreign`) can no longer steer the report/reclaim path.
+- BP5 the projection (`parseBoardFileName` + `BoardItemStatus`) recognizes `reclaimed` as terminal, so `readBoard` no longer counts a reclaimed item as open.
+- BP6 `parsePolicyNum` validates finiteness + non-negativity (+ integer for the repost count), preserves an explicit `0`, and rejects `Infinity` (the cap can never be disabled).
 
 ## Design decisions
 - Pure `superviseBoardPost(item, now, policy)` returns one action; `planBoardSupervision(existing, readyItemIds, now, policy, reportedIds)` reduces the board dir to `{reposts, reports, reclaims}`. The dispatcher does only the thin IO.
@@ -26,7 +34,7 @@ A posted-but-unclaimed board item that is STILL ready is never reaped by `planBo
 | `packages/bus/test/swarm-task-board.test.ts` | +45 | 7 | the ladder, the reducer, boundaries, and the reclaim-is-terminal (no re-post loop) |
 
 ## Gates
-- bus tsc 0; scripts tsc 0; bus vitest 1075/1075 (+7 BA9).
+- bus tsc 0; scripts tsc 0; board test 37 (+10 BA9); bus vitest 1078/1078.
 
 ## Counterexamples the tests lock
 - within deadline -> ok; past deadline under cap -> REPOST (fresh postedAtSec + repostCount+1); at cap in grace -> REPORT; past cap+grace -> RECLAIM.
