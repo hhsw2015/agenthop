@@ -1,6 +1,6 @@
 # T5-5 review-seat-autoscale — review packet (S14, owner 90b58f9c)
 
-Branch `feat/review-seat-autoscale`, review range `c3439cd..cfa15fc` (merge-base with main = c3439cd). Verify: `npx tsx packages/bus/src/swarm/review-seat-autoscale.selftest.mts` → 35 cases green; `cd packages/bus && npx tsc --noEmit` → 0.
+Branch `feat/review-seat-autoscale`, review range `c3439cd..cfa15fc` (merge-base with main = c3439cd). Verify: `npx tsx packages/bus/src/swarm/review-seat-autoscale.selftest.mts` → 39 cases green; `cd packages/bus && npx tsc --noEmit` → 0.
 
 **Scope proof** (`git diff --name-status c3439cd..cfa15fc`): PURELY ADDITIVE — `review-seat-autoscale.{ts,selftest.mts}` + the design doc. Modifies NO existing file; touches NO dispatcher/launcher/control path. No new dependency. Design was coordinator-approved with two amendments (both implemented, see below).
 
@@ -10,7 +10,7 @@ Scales the adversarial-review seat pool to queue depth (DHH baseline audit #5: r
 
 | Module | lines | selftest | Purpose |
 |---|---|---|---|
-| `review-seat-autoscale.ts` | 220 | 35 | pure: queue-depth, scale decision (hysteresis+sustain+dwell+floor), seat selection ①, first-ticket band ②, birth cert, ledger parser; IO: dormant-gated ledger |
+| `review-seat-autoscale.ts` | 223 | 39 | pure: queue-depth, scale decision (hysteresis+sustain+dwell+floor), seat selection ①, first-ticket band ②, birth cert, ledger parser; IO: dormant-gated ledger |
 
 ## Invariant → where pinned (the review walk)
 

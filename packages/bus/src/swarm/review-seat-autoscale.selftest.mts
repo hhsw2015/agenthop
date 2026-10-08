@@ -35,8 +35,10 @@ t("fresh seat blocks P1", canRouteToSeat({ priority: 1 }, { completedReviews: 0 
 t("fresh seat allows P2", canRouteToSeat({ priority: 2 }, { completedReviews: 0 }) === true);
 t("fresh seat allows P3", canRouteToSeat({ priority: 3 }, { completedReviews: 0 }) === true);
 t("fresh seat allows small P0", canRouteToSeat({ priority: 0, small: true }, { completedReviews: 0 }) === true);
-t("fresh seat allows absent-priority", canRouteToSeat({}, { completedReviews: 0 }) === true);
+t("fresh seat REJECTS absent-priority (fail-closed, reviewer Q2)", canRouteToSeat({}, { completedReviews: 0 }) === false);
+t("fresh seat REJECTS absent-priority non-small", canRouteToSeat({ small: false }, { completedReviews: 0 }) === false);
 t("experienced seat takes P0", canRouteToSeat({ priority: 0 }, { completedReviews: 1 }) === true);
+t("experienced seat takes absent-priority", canRouteToSeat({}, { completedReviews: 1 }) === true);
 
 // --- selectSeatToReclaim: amendment ① idle + in-flight=0, never floor, never mid-review ---
 t("reclaim picks idle+empty non-floor", selectSeatToReclaim([seat("f1", { floor: true }), seat("f2", { floor: true }), seat("x", { spawnedSec: 10 })]) === "x");
@@ -59,6 +61,9 @@ t("hold in band (4 open, 2 seats, not > 4 and not < kDown band)", scaleDecision(
 const down = scaleDecision({ totalOpen: 1, perSeat: {} }, threeSeats, CFG, 999, 60);
 t("scale-down drains to eligible seat", down.action === "scale-down" && (down as any).seat === "s3");
 t("hold at floor (2 seats never scale down)", scaleDecision({ totalOpen: 0, perSeat: {} }, twoSeats, CFG, 999, 999).action === "hold");
+// Q1: below floor (a standing seat crashed) -> hold; autoscaler does NOT top up, the roster does (F22)
+t("below floor -> hold even with deep queue (roster restores, reviewer Q1)", scaleDecision({ totalOpen: 99, perSeat: {} }, [seat("s1", { floor: true })], CFG, 999, 999).action === "hold");
+t("below floor reason names the roster", (scaleDecision({ totalOpen: 99, perSeat: {} }, [], CFG, 999, 999) as any).reason.includes("below floor"));
 t("down but no eligible seat -> hold+wait", scaleDecision({ totalOpen: 1, perSeat: {} }, [...twoSeats, seat("s3", { inFlight: 1 })], CFG, 999, 999).action === "hold");
 t("down not sustained -> hold", scaleDecision({ totalOpen: 1, perSeat: {} }, threeSeats, CFG, 999, 30).action === "hold");
 // hysteresis gap: with kUp=2,kDown=1 and 3 seats, open=3 is neither up(>6) nor down(<2) -> hold (no churn)

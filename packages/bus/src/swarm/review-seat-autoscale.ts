@@ -85,8 +85,9 @@ export function queueDepth(openRecords: readonly ReviewRecord[]): QueueSignal {
 export function canRouteToSeat(ticket: { priority?: number; small?: boolean }, seat: { completedReviews: number }): boolean {
   if (seat.completedReviews > 0) return true; // calibrated — full rotation
   if (ticket.small === true) return true; // small first ticket is allowed
-  const p = ticket.priority ?? Number.POSITIVE_INFINITY; // absent priority = lowest urgency = allowed
-  return p >= 2; // P2/P3 only for a fresh seat; P0/P1 blocked
+  // Fresh seat: route ONLY on EXPLICIT low priority (P2/P3). Absent/unknown priority cannot be confirmed low-stakes, so
+  // it is REJECTED (fail-closed) — the band is a safety gate, and an uncalibrated seat must not take an unknown ticket.
+  return typeof ticket.priority === "number" && ticket.priority >= 2;
 }
 
 /**
@@ -113,6 +114,10 @@ export function scaleDecision(
   sustainedSec: number,
 ): ScaleAction {
   const n = seats.filter((s) => s.live).length;
+  // The autoscaler flexes ONLY above the floor. Below floor (a standing seat crashed) is NOT its job to top up — the
+  // roster / swarm-resume / sweep own standing-member liveness (one owner, F22). Hold and let them restore the baseline
+  // first; this also avoids a double-spawn race with resume on restart.
+  if (n < cfg.floor) return { action: "hold", reason: "below floor — roster restores baseline, autoscaler flexes only above" };
   if (sinceLastActionSec < cfg.minDwellSec) return { action: "hold", reason: "min-dwell not elapsed" };
 
   const wantUp = signal.totalOpen > n * cfg.kUp;
