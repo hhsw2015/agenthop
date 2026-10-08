@@ -7,6 +7,12 @@ const s = makeSub("sub1", "me", "peer", T0);
 t("makeSub: 12h expiry default", s.expireSec === T0 + IDLE_SUB_TTL_SEC && s.fired === false);
 t("makeSub: missing field throws", (() => { try { makeSub("", "me", "p", T0); return false; } catch { return true; } })());
 
+// IS-P2-1: a positive fractional TTL must NOT floor to 0 (which would expire the sub at creation)
+t("makeSub: positive TTL<1 clamps to >=1, not expired at creation", (() => { const x = makeSub("f", "me", "p", T0, 0.5); return x.expireSec === T0 + 1 && !isExpired(x, T0) && shouldFire(x, { idle: true, exited: false }, T0) === true; })());
+// IS-P2-1: a non-finite creation clock is REJECTED (else a NaN expiry never trips isExpired -> fires forever, never prunes)
+t("makeSub: NaN creation clock throws", (() => { try { makeSub("b", "me", "p", NaN); return false; } catch { return true; } })());
+t("makeSub: Infinity creation clock throws", (() => { try { makeSub("b", "me", "p", Infinity); return false; } catch { return true; } })());
+
 // one-shot fire: idle OR exit, not fired, not expired
 t("fire on idle", shouldFire(s, { idle: true, exited: false }, T0 + 10) === true);
 t("fire on exit", shouldFire(s, { idle: false, exited: true }, T0 + 10) === true);

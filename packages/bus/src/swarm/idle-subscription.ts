@@ -27,11 +27,15 @@ export interface IdleSub {
   fired: boolean; // one-shot: set once the notice is delivered
 }
 
-/** Create a subscription. `ttlSec` clamps to a positive finite value; default 12h. Pure. */
+/** Create a subscription. A non-finite creation clock is REJECTED (a NaN `createdSec` would make an expiry that never
+ *  trips `isExpired`, so the sub would fire forever and never prune — IS-P2-1). A positive `ttlSec` never floors to 0
+ *  (which would expire the sub at creation); it clamps to at least 1 second. A non-positive/non-finite ttl ⇒ the 12h
+ *  default. Pure. */
 export function makeSub(id: string, subscriber: string, target: string, nowSec: number, ttlSec: number = IDLE_SUB_TTL_SEC): IdleSub {
   if (!id || !subscriber || !target) throw new Error("makeSub: id/subscriber/target required");
+  if (!Number.isFinite(nowSec)) throw new Error("makeSub: nowSec must be a finite clock (a bad creation clock would make a fireable, never-expiring subscription)");
   const now = Math.floor(nowSec);
-  const ttl = Number.isFinite(ttlSec) && ttlSec > 0 ? Math.floor(ttlSec) : IDLE_SUB_TTL_SEC;
+  const ttl = Number.isFinite(ttlSec) && ttlSec > 0 ? Math.max(1, Math.floor(ttlSec)) : IDLE_SUB_TTL_SEC; // a positive TTL never floors to 0
   return { id, subscriber, target, createdSec: now, expireSec: now + ttl, fired: false };
 }
 
