@@ -42,6 +42,15 @@ Frozen so `3e097dfe` (console render) can consume the files directly. Code: `pac
 > double-send. The consume lock is ported to the vm-ssh named-identity DIRECTORY lock (`consume.lockd/<pid>.<nonce>`): reclaim
 > removes only a dead holder's exact-named file (never a successor's), release removes only our own named file and never throws
 > (a cleanup fault can't mask a committed result).
+>
+> **round-9 (R25, @47287fa):** two recovery gaps closed. (1) The orphan signal now DELIVERS FIRST and records its proof
+> (`orphan-<digest>.sent`) only AFTER the inbox write succeeds — a failed delivery leaves no proof and PROPAGATES, so a retry
+> re-sends exactly one (the old pre-send `orphan-<digest>.signaled` claim wrongly made a send-and-rollback fault look done).
+> Concurrent double-send is prevented by running every emit (including the terminal-path one) UNDER the consume lock, not by a
+> marker; the per-update `.sent` proof dedups across retries. (2) A faulted lock release/publish now leaves a RECOGNIZABLE
+> pid-bearing credential, never an identity-less empty dir: release RESTORES its own named file if the final rmdir faults, and a
+> failed identity-publish drops the empty dir it just made — so a faulted holder is reclaimed by own/dead pid on retry, while a
+> LIVE in-flight (genuinely empty) dir still stays `contended`.
 
 ## Orphan recovery (R25) — formal boundary
 
@@ -52,10 +61,13 @@ current `decisions.json` is valid, bound to this batch, and **digests to a value
 (stored in `consumed.json`), it is an **orphan** (a distinct, un-fulfilled update). The backend emits EXACTLY ONE durable inbox
 signal to the batch **owner** (the coordinator): `via:"decision-batch"`, `taskRef:"decision-batch:<id>"`, title
 `"orphan decision — re-batch"`. This signal is part of THIS slice and reaches the owner's inbox (not deferred to a seam). The owner
-RE-BATCHES the orphan under a NEW batchId (that execution is the coordinator's seam). Dedup is **PER-UPDATE**: each distinct update
-claims its own `orphan-<digest>.signaled` marker via an exclusive create — so concurrent emitters never double-send, and a later
-DIFFERENT update is never blocked by an earlier signal (the dedup is never per-batch). A decision whose digest EQUALS the consumed
-verdict's is already fulfilled ⇒ no signal.
+RE-BATCHES the orphan under a NEW batchId (that execution is the coordinator's seam). Delivery is **deliver-first, prove-after**:
+the emit writes the inbox message, then records `orphan-<digest>.sent` as the proof-of-sent ONLY on success — a delivery that
+FAULTS leaves no proof and PROPAGATES, so a retry re-sends exactly one (a pre-send claim must never make a failed send look done).
+Concurrent double-send is prevented by running every emit UNDER the consume lock (the terminal path takes it too), NOT by a marker;
+the per-update `.sent` proof then dedups across retries, so a later DIFFERENT update (new digest) is never blocked by an earlier
+one, and the consumed verdict never re-signals. A decision whose digest EQUALS the consumed verdict's is already fulfilled ⇒ no
+signal.
 
 ## Files (under `$HOME/.agenthop/console/decision-batches/<batchId>/`)
 
@@ -76,8 +88,12 @@ verdict's is already fulfilled ⇒ no signal.
   proof of sent). A lock held with no `notified.sent` ⇒ `openBatch` returns UNCERTAIN (throws) rather than re-ping or silently skip.
 - `consume.lockd/` — the per-batch exclusive consume lock (a DIRECTORY, atomic mkdir), holder identity = the single file inside
   named `<pid>.<nonce>` (vm-ssh `withIdLock` pattern). Reclaim removes ONLY a dead holder's exact-named file (never a successor's);
-  release removes ONLY our own named file and never throws. A live/in-flight/ambiguous holder ⇒ an explicit `contended` receipt.
-- `orphan-<digest>.signaled` — per-update marker: records the one-time orphan re-batch signal for a decision of that content digest.
+  release removes ONLY our own named file and never throws. If release cannot drop the now-empty dir (parent unwritable), it
+  RESTORES its own named file so the leftover carries a recognizable pid — reclaimed by own/dead pid on a later consume; a failed
+  identity-publish likewise drops the empty dir it made. A genuinely EMPTY (identity-less) dir is a LIVE in-flight acquisition and
+  is never reclaimed ⇒ an explicit `contended` receipt (so a faulted holder recovers, a live one is never stolen).
+- `orphan-<digest>.sent` — per-update proof-of-sent, written only AFTER the orphan re-batch signal is delivered. Dedups re-emits of
+  the same content digest across retries; its absence after a faulted send is what lets a retry re-send exactly one.
 
 A decisions doc OR a batch.json whose `batchId` ≠ its directory is IGNORED (a misbound/foreign drop). Marker/claim/lock files are
 backend-internal; the console writes only `decisions.json`.

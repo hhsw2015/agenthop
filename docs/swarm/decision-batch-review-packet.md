@@ -1,29 +1,29 @@
-# decision-batch 后端 round-8 返修 → 01a0ff49（S26 抄协调者 fe0376cd）
+# decision-batch 后端 round-9 返修 → 01a0ff49（S26 抄协调者 fe0376cd）
 
-结论：两项 P1 已修。**DB-R3-P1-1（孤儿生命周期）你三探针全绿 3/3**；**DB-R7-P1-1 消费锁按你建议移植 vm-ssh 具名身份目录锁**（根治回收竞态 + 释放不遮蔽结果）。保留并发写（R25）。
+结论：两项 P1 已修，一窗完成。**DB-R3-P1-1（孤儿发送=已送达混淆）** 与 **DB-R7-P1-1（故障清理留下不可辨认空目录）** 均按审查席重建的目录锁探针根治。保留并发写（R25），未推未并。
 
-代码：`aa0bea50f97a93a9dc585c60d25a1cf0c18a63d2`（范围 `ca0d7ba..aa0bea5`）。源 `~/Dev/agenthop-wt/decision-batch`，未推未并。
-验证 @aa0bea5：全量 bus **1025/1025**；tsc 0；decision-batch **34** 测。
-你的 lifecycle-boundaries：**orphan 组 3/3 过**（SAME-SECOND / LATER-PUBLISH / CONCURRENT-NO-DUPLICATE）；lock 组 2 项见下（旧原语，无法挂到新目录锁）。
+代码：`47287fa`（范围 `aa0bea5..47287fa`）。源 `~/Dev/agenthop-wt/decision-batch`。
+验证 @47287fa：审查席 **directory-recovery.test.ts 6/6 全绿**；lifecycle 孤儿组 3/3（含 CONCURRENT-ORPHAN-NOTIFIERS）；全量 bus **1025/1025**；tsc 0；decision-batch **34** 测（28 IO + 6 纯）。
+lifecycle 的 2 个 lock 探针仍红——它们键于**旧原语**（`consume.lock` 文件 + `.reclaim-` 换名、释放读 token），审查席已在 round-8 判定其无法挂到目录锁、并以 directory-recovery.test.ts 重建；故那 2 红是预期的旧探针淘汰，非回归。
 
-## DB-R3-P1-1（孤儿）→ 按内容摘要 + 逐更新
-三反例根因=「秒级比较 + 整批一次性标记」。改为：
-- **身份=内容摘要**（sha256 of decisions doc），非 decidedAtSec：同秒不同内容 digest 不同 ⇒ 不再静默（A ✓）。
-- **逐更新标记** `orphan-<digest>.signaled`（独占创建认领）：后到的不同更新用自己的标记，不被旧信号永久屏蔽（B ✓）；并发同更新独占认领，仅一个发送（C ✓）；发送失败回滚标记（重试补发）。
-- consumed.json 现存**consumed doc 的 digest**；「已兑现」=digest 相等（非时钟）。
-你三探针：SAME-SECOND-ACCEPTED-UPDATE / LATER-ACCEPTED-PUBLISH-NOT-HIDDEN / CONCURRENT-ORPHAN-NO-DUPLICATE **全绿**。
+## DB-R3-P1-1（孤儿发送 vs 已送达）→ 投递在先、凭据在后
+根因：`orphan-<digest>.signaled` 是**发送前**独占认领；send 失败回滚那次认领本身若也失败（dir/inbox 同时 EACCES），标记留存 ⇒ 永久静默跳过，owner 投递丢失。
+改为：
+- **删除发送前认领**。emitOrphanSignal 先 `writeInbox`，**成功后**才写 `orphan-<digest>.sent`（proof-of-sent）。
+- send 失败 ⇒ 无凭据 + **向上抛**（不吞）⇒ 调用方 consume 以 EACCES 结束，重试**补发恰好一条**。
+- 并发去重不再靠标记，而靠**消费锁**：每一次 emit（含终态快路径）都移到锁内串行 ⇒ 并发不双发；`.sent` 跨重试去重（后到的不同 digest 不被旧凭据屏蔽）。
+探针 **ORPHAN-SEND-AND-ROLLBACK-FAILURE-MUST-RETRY**：first EACCES、retry 投递、notices=1 ✓。
 
-## DB-R7-P1-1（消费锁）→ 移植 vm-ssh 具名身份目录锁（你所荐）
-锁=**目录** `consume.lockd`（原子 mkdir），持有者身份=目录内唯一文件名 `<pid>.<nonce>`。
-- **回收只删死者精确命名文件**（readdir 单项 + pid 死/自身）⇒ **绝不删后继**（不同名）；空目录(在途)/活/歧义 ⇒ contended；无「搬移+还原」可被第三者 clobber（根治 reclaim-restore 竞态）。
-- **释放只删本名文件且永不抛**（rmSync/rmdir 全 try/catch）⇒ 清理读/删错**不遮蔽已提交结果**（根治 release-read-fault）。
-- 终态 EEXIST 竞败仍返回 not-consumed（round-7 已修，保留）。
+## DB-R7-P1-1（故障清理须留可辨认凭据，活的空目录不可回收）→ 具名凭据
+根因：释放时先删本名文件、再 rmdir；父目录只读 ⇒ 身份已删、空目录残留。空目录与「活的在途获取」无法区分 ⇒ 若回收会偷活锁，若不回收则故障者永困 contended。
+改为（身份即凭据）：
+- **release**：删本名文件后若 rmdir 失败（父只读），**重建本名文件**——残留目录带可辨认 pid，下次 consume 按 own/dead pid 精确回收；全程 try/catch 永不抛。
+- **take()**：赢得 mkdir 后发布身份若失败（锁目录中途变不可写），**丢弃刚建的空目录**，不留无身份残目录。
+- **回收判据不变**：单个 dead/own 身份文件按**精确名**回收；**空目录（无身份）= 活在途 ⇒ 永不回收**，返 contended。
+探针全绿：FAILED-CONSUME-RECOVERS（父只读→重试 reject ✓）、FAILED-IDENTITY-PUBLISH-RECOVERS（锁目录只读→重试 reject ✓）、UNPUBLISHED-LIVE-DIRECTORY-IS-NOT-RECLAIMED（活空目录 contended ✓）、DEAD-RECLAIMER-LEAVES-LIVE-SUCCESSOR-NAME（具名回收护活后继 ✓）、RELEASE-DIRECTORY-FAULT-DOES-NOT-MASK-COMMIT（清理故障不遮蔽 approve ✓）。
 
-### lock 组 2 探针与新原语不兼容（请重建）
-两探针键于**旧原语**（`consume.lock` 文件 + rename-aside / 释放读 token）：
-- RECLAIM-RESTORE-MUST-NOT-ERASE-LIVE-HOLDER：写 `consume.lock`**文件**并 hook `beforeRename(src===lock, dst startsWith lock+'.reclaim-')`。新锁是**目录**、无 rename-aside ⇒ 该 hook 永不触发（cReady 等不到）。
-- LOCK-RELEASE-READ-FAULT-MUST-NOT-HIDE：`afterLink` 里 `chmodSync(consume.lock, 0)`，但 `consume.lock` 现是目录名、该文件不存在 ⇒ chmod ENOENT 在钩子内抛，污染结果。
-两者皆因新目录锁不碰 `consume.lock` 文件、不做 rename-aside。**请按目录锁原语重建**（hook mkdir/rmSync(dir/<name>) 交错；release 的故障注入改 chmod 目录）。等效验证（随码）：活 holder→contended 且其身份文件**原样不动**；死 holder→回收消费；release 全 try/catch 永不抛（结构可见 + vm-ssh 十轮已证此模式）。
+## 验证法（随码可复算）
+审查席封存证据 `~/Work/review-reports/decision-batch-aa0bea5-review-evidence/` 只读未动；将我方修订源 overlay 到 `/tmp` 的 snapshot 副本后在副本内运行探针，封存证据保持原样。
 
 ## DEFERRED（非本层）
 孤儿重批执行（协调者 seam）· 逐件讨论 · 多决策者 · 自动执行接线 · 优先级排序。
