@@ -54,6 +54,17 @@ t("VMC-P1-1b: JSON running:false -> down", readyVerdict('{"running":false}', fal
 t("VMC-P1-1b: text 'running=false' -> NOT ready", readyVerdict("running=false", false) !== "ready");
 t("VMC-P1-1b: JSON reachable:true -> ready (control)", readyVerdict('{"reachable":true}', false) === "ready");
 t("VMC-P1-1b: 'server is ready' -> ready (control)", readyVerdict("server is ready", false) === "ready");
+// VMC-P1-1 round-3: valid JSON judged structurally only (no text fall-through); conflict/non-bool -> unknown; progress text -> unknown
+t("VMC-P1-1c-A: {ready:null} -> NOT ready", readyVerdict('{"ready":null}', false) !== "ready");
+t("VMC-P1-1c-A: {ready:'pending'} -> NOT ready", readyVerdict('{"ready":"pending"}', false) !== "ready");
+t("VMC-P1-1c-A: {running:0} -> NOT ready", readyVerdict('{"running":0}', false) !== "ready");
+t("VMC-P1-1c-B: {ready:true,online:false} conflict -> unknown", readyVerdict('{"ready":true,"online":false}', false) === "unknown");
+t("VMC-P1-1c-B: [{ready:true},{ready:false}] conflict -> unknown", readyVerdict('[{"ready":true},{"ready":false}]', false) === "unknown");
+t("VMC-P1-1c-C: 'waiting for server to become ready' -> NOT ready", readyVerdict("waiting for server to become ready", false) !== "ready");
+t("VMC-P1-1c-C: 'checking whether host is reachable' -> NOT ready", readyVerdict("checking whether host is reachable", false) !== "ready");
+t("VMC-P1-1c-C: 'ready check pending' -> NOT ready", readyVerdict("ready check pending", false) !== "ready");
+t("VMC-P1-1c: {ready:true} -> ready (control)", readyVerdict('{"ready":true}', false) === "ready");
+t("VMC-P1-1c: {online:false} -> down (control)", readyVerdict('{"online":false}', false) === "down");
 
 // --- backoff: bounded, last value repeats ---
 t("backoff attempt1 = first", nextBackoffSec(1) === READY_BACKOFF_SEC[0]);

@@ -66,42 +66,51 @@ export type ReadyVerdict = "ready" | "down" | "unknown";
  * Ready-probe verdict from an ssh/probe invocation = (raw output, exit-failed). A non-zero exit is a LOCAL/transport
  * failure (not the remote asserting down) ⇒ `unknown` (retry, never "down"); explicit reachable text ⇒ `ready`;
  * explicit connection-refused/down ⇒ `down`; anything else ⇒ `unknown`. Fail-closed: never "ready" on doubt. Pure. */
-/** A structured readiness flag from a parsed probe JSON (`{ready|reachable|running|online: bool}`, top-level or one
- *  level deep). null when absent/non-boolean. Pure. */
-function readyFlag(s: string): boolean | null {
-  let v: unknown;
-  try {
-    v = JSON.parse(s);
-  } catch {
-    return null;
-  }
+/**
+ * Verdict from a value that PARSED as JSON — judged structurally and ONLY structurally (the caller must NOT text-scan
+ * a valid-JSON input). Scans known boolean flags (`ready|reachable|running|online`) across the top level and array
+ * elements: all-true → ready, all-false → down, a mix → unknown (conflict). A known key with a NON-boolean value
+ * (null/"pending"/0) ⇒ unknown (unrecognized shape); no known flag key ⇒ unknown. Pure (VMC-P1-1). */
+function jsonReadyVerdict(v: unknown): ReadyVerdict {
   const objs = Array.isArray(v) ? v : [v];
+  let sawTrue = false;
+  let sawFalse = false;
   for (const o of objs) {
     if (!o || typeof o !== "object") continue;
     for (const k of ["ready", "reachable", "running", "online"] as const) {
+      if (!(k in (o as Record<string, unknown>))) continue;
       const f = (o as Record<string, unknown>)[k];
-      if (typeof f === "boolean") return f;
+      if (f === true) sawTrue = true;
+      else if (f === false) sawFalse = true;
+      else return "unknown"; // known key, non-boolean value ⇒ cannot confirm
     }
   }
-  return null;
+  if (sawTrue && sawFalse) return "unknown"; // conflict
+  if (sawTrue) return "ready";
+  if (sawFalse) return "down";
+  return "unknown"; // no recognized flag ⇒ unknown shape (never fall through to text)
 }
 
 /**
- * Ready verdict (VMC-P1-1, hardened): a structured JSON flag wins (`ready:false`/`running:false` → down); otherwise a
- * GENERIC negation/falsity guard (`not`, `n't`, `no`, `false`, `disabled`) blocks `ready` — an enumerated down-list
- * can't cover every negation ("not online", "not connected", "running=false"). `ready` requires an explicit success
- * expression AND no negation; explicit failure → down; everything unconfirmable → unknown. Pure. */
+ * Ready verdict (VMC-P1-1, hardened). Order: exit-fail → unknown; a VALID-JSON input is decided structurally and STOPS
+ * (unknown shape / conflict → unknown, never text-scanned); plain text → explicit failure → down; progress/question or
+ * any negation/falsity → unknown; `ready` ONLY on a COMPLETE success format (not a bare keyword inside progress text
+ * like "waiting for server to become ready"). Pure. */
 export function readyVerdict(raw: string, exitFailed: boolean): ReadyVerdict {
   if (exitFailed) return "unknown"; // transport/local failure — retry, don't conclude
-  const s = (raw ?? "").toLowerCase().trim();
+  const s = (raw ?? "").trim();
   if (!s) return "unknown";
-  const flag = readyFlag(s);
-  if (flag !== null) return flag ? "ready" : "down"; // structured truth beats text
-  const failure = /\bunreachable\b|not reachable|unable to reach|cannot reach|not running|not ready|connection refused|\btimed out\b|no route to host|host is down|\boffline\b|\bfailed\b/.test(s);
-  const negated = /\bnot\b|n['’]t|\bno\b|\bfalse\b|=\s*false|:\s*false|\bdisabled\b/.test(s); // generic: any negation/falsity
-  if (failure) return "down";
-  if (negated) return "unknown"; // negated/false but no explicit failure phrase → unconfirmable, never ready
-  const affirm = /server is ready|status:\s*running|\breachable\b|\bready\b|\brunning\b|\bonline\b|\bconnected\b/.test(s);
+  try {
+    return jsonReadyVerdict(JSON.parse(s)); // parsed as JSON ⇒ structural only, no text fall-through
+  } catch {
+    /* not JSON — fall to text */
+  }
+  const low = s.toLowerCase();
+  if (/\bunreachable\b|not reachable|unable to reach|cannot reach|not running|not ready|connection refused|\btimed out\b|no route to host|host is down|\boffline\b|\bfailed\b/.test(low)) return "down";
+  // progress / question / any negation or falsity ⇒ unconfirmable, never ready
+  if (/\bwaiting\b|\bchecking\b|\bpending\b|\bwhether\b|to become|\btrying\b|\bconnecting\b|will be|\bnot\b|n['’]t|\bno\b|\bfalse\b|\bdisabled\b/.test(low)) return "unknown";
+  // COMPLETE success formats only (an affirmative STATE, not a bare keyword)
+  const affirm = /server is ready|status:\s*running|is ready\b|is running\b|is reachable\b|is online\b|is up\b|connection established|herdr[^.]*\brunning\b/.test(low);
   return affirm ? "ready" : "unknown";
 }
 
