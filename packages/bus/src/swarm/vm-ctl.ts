@@ -67,19 +67,26 @@ export type ReadyVerdict = "ready" | "down" | "unknown";
  * failure (not the remote asserting down) ⇒ `unknown` (retry, never "down"); explicit reachable text ⇒ `ready`;
  * explicit connection-refused/down ⇒ `down`; anything else ⇒ `unknown`. Fail-closed: never "ready" on doubt. Pure. */
 export function readyVerdict(raw: string, exitFailed: boolean): ReadyVerdict {
-  const s = (raw ?? "").toLowerCase().trim();
   if (exitFailed) return "unknown"; // transport/local failure — retry, don't conclude
+  const s = (raw ?? "").toLowerCase().trim();
   if (!s) return "unknown";
-  if (/\bready\b|reachable|online|\bok\b|herdr .*running|status:\s*running/.test(s)) return "ready";
-  if (/connection refused|no route to host|\btimed out\b|host is down|\bunreachable\b/.test(s)) return "down";
+  // DOWN evidence (incl. NEGATIONS) is computed alongside UP, and a conflict yields unknown — only clear, conflict-free
+  // success is `ready` (VMC-P1-1). `\breachable\b` won't match inside "unreachable" (no word boundary).
+  const down = /\bunreachable\b|not reachable|unable to reach|cannot reach|not ready|not running|connection refused|\btimed out\b|no route to host|host is down|\boffline\b/.test(s);
+  const up = /\breachable\b|server is ready|\bready\b|\bonline\b|\brunning\b|\bconnected\b/.test(s);
+  if (down && up) return "unknown"; // conflicting/negated text — never ready
+  if (down) return "down";
+  if (up) return "ready";
   return "unknown";
 }
 
 /** Bounded exponential-ish backoff for the ready gate (borrowed from Railway's BACKOFF_SECS). Last value repeats. Pure. */
 export const READY_BACKOFF_SEC: readonly number[] = [1, 2, 4, 8, 15];
 export function nextBackoffSec(attempt: number, schedule: readonly number[] = READY_BACKOFF_SEC): number {
-  if (!Number.isFinite(attempt) || attempt < 1) return schedule[0];
-  return schedule[Math.min(Math.floor(attempt) - 1, schedule.length - 1)];
+  // Reject an illegal table (empty, or any non-finite/negative entry) → safe default; a delay must be finite & ≥0 (VMC-P2-2).
+  const safe = Array.isArray(schedule) && schedule.length > 0 && schedule.every((n) => Number.isFinite(n) && n >= 0) ? schedule : READY_BACKOFF_SEC;
+  const a = Number.isFinite(attempt) && attempt >= 1 ? Math.floor(attempt) : 1;
+  return safe[Math.min(a - 1, safe.length - 1)];
 }
 
 export type CredFamily = "codex" | "claude";
@@ -98,20 +105,23 @@ export interface CredSeed {
  * never an argv (Railway `CODEX_SEED`). Claude: mint a one-time setup token rather than copying raw credentials.
  * Pure (builds the command + the stdin discipline; the IO caller pipes the secret to stdin). */
 export function buildCredSeed(family: CredFamily): CredSeed {
+  // 0600 BEFORE the first sensitive byte (VMC-P1-2): `rm -f` drops any stale/0644/0400 file, then under `umask 077`
+  // the redirect creates a FRESH 0600 file — the credential's first byte lands already-protected (no chmod-after window).
+  // `&&`-chained: a failed mkdir/rm/write exits non-zero, so exit 0 means complete delivery (no chmod masquerade).
   if (family === "codex") {
     return {
       family,
       viaStdin: true,
-      remoteCmd: "umask 077; mkdir -p ~/.codex; cat > ~/.codex/auth.json; chmod 600 ~/.codex/auth.json",
-      note: "cred on stdin → 0600 file, never argv",
+      remoteCmd: "mkdir -p ~/.codex && umask 077 && rm -f ~/.codex/auth.json && cat > ~/.codex/auth.json",
+      note: "cred on stdin → fresh 0600 file (born protected), never argv; && so a failed write is non-zero",
     };
   }
   if (family === "claude") {
     return {
       family,
       viaStdin: true,
-      remoteCmd: "umask 077; mkdir -p ~/.claude; cat > ~/.claude/.credentials.json; chmod 600 ~/.claude/.credentials.json",
-      note: "prefer a minted one-time setup token over raw creds; still stdin → 0600",
+      remoteCmd: "mkdir -p ~/.claude && umask 077 && rm -f ~/.claude/.credentials.json && cat > ~/.claude/.credentials.json",
+      note: "prefer a minted one-time setup token over raw creds; still stdin → fresh 0600 file, && for write-failure",
     };
   }
   throw new Error(`buildCredSeed: unknown family ${family}`);
@@ -202,10 +212,16 @@ export function buildCodePlan(family: CredFamily, source: { verb: "up" | "adopt"
 
 /** Idempotent boot plan (hard-condition: re-runnable from any point). Converges with remote-bootstrap's
  *  buildBootstrapScript (deduped at merge); kept self-contained here since that lives on an unmerged branch. Pure. */
+/** POSIX single-quote a string so the shell treats it as ONE literal argument (no `$(...)`, `&`, globbing). Pure. */
+export function shQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 export function buildBootPlan(opts: { herdrInstallUrl?: string } = {}): string[] {
   const url = opts.herdrInstallUrl ?? "https://herdr.dev/install.sh";
   return [
-    `tmp=$(mktemp); curl -fsSL ${url} -o "$tmp" || exit 1; sh "$tmp"`, // install herdr (download-then-run, RH6)
+    // VMC-P2-1: the URL is single-quoted so query `&`/`$(...)`/metachars can't rewrite the command or run before download.
+    `tmp=$(mktemp); curl -fsSL ${shQuote(url)} -o "$tmp" || exit 1; sh "$tmp"`, // install herdr (download-then-run, RH6)
     "nproc; free -b", // capacity probe → stdout
     "# ensure every agent launcher uses `exec -a claude <real-binary>` (herdr argv0 identify)",
     "# reconcile hooks/config idempotently (safe to re-run)",

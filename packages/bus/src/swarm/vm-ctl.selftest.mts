@@ -11,6 +11,7 @@ import {
   forkPlan,
   buildCodePlan,
   buildBootPlan,
+  shQuote,
   READY_BACKOFF_SEC,
   type Verb,
 } from "./vm-ctl.js";
@@ -39,22 +40,45 @@ t("ready: explicit refused (exit ok) -> down", readyVerdict("connection refused"
 t("ready: timed out -> down", readyVerdict("ssh: connect timed out", false) === "down");
 t("ready: noise -> unknown", readyVerdict("some banner text", false) === "unknown");
 t("ready: empty -> unknown", readyVerdict("", false) === "unknown");
+// VMC-P1-1: negation / conflict text must NEVER be ready
+t("VMC-P1-1: 'unreachable' -> down (not ready)", readyVerdict("unreachable", false) === "down");
+t("VMC-P1-1: 'not ready' -> NOT ready", readyVerdict("not ready", false) !== "ready");
+t("VMC-P1-1: 'herdr server not running' -> NOT ready", readyVerdict("herdr server not running", false) !== "ready");
+t("VMC-P1-1: 'OK: connection refused' -> NOT ready", readyVerdict("OK: connection refused", false) !== "ready");
+t("VMC-P1-1: conflict (reachable + refused) -> unknown", readyVerdict("reachable but connection refused", false) === "unknown");
 
 // --- backoff: bounded, last value repeats ---
 t("backoff attempt1 = first", nextBackoffSec(1) === READY_BACKOFF_SEC[0]);
 t("backoff clamps to last", nextBackoffSec(99) === READY_BACKOFF_SEC[READY_BACKOFF_SEC.length - 1]);
 t("backoff attempt<1 -> first", nextBackoffSec(0) === READY_BACKOFF_SEC[0]);
+// VMC-P2-2: illegal custom table -> safe default; result always finite & >=0
+t("VMC-P2-2: empty table -> finite default", Number.isFinite(nextBackoffSec(1, [])) && nextBackoffSec(1, []) >= 0);
+t("VMC-P2-2: NaN/Infinity table -> default", nextBackoffSec(1, [NaN, Infinity]) === READY_BACKOFF_SEC[0]);
+t("VMC-P2-2: negative table -> default", nextBackoffSec(2, [-5, -1]) === READY_BACKOFF_SEC[1]);
+t("VMC-P2-2: valid custom table honored", nextBackoffSec(1, [3, 6]) === 3);
 
 // --- credential hard-gate: stdin→0600 always; argv = refuse ---
 const codex = buildCredSeed("codex");
 t("codex seed via stdin (never argv)", codex.viaStdin === true && codex.remoteCmd.includes("cat > ~/.codex/auth.json"));
-t("codex seed sets 0600", codex.remoteCmd.includes("chmod 600") && codex.remoteCmd.includes("umask 077"));
+t("codex seed born 0600 (umask 077 + rm -f, no chmod-after)", codex.remoteCmd.includes("umask 077") && codex.remoteCmd.includes("rm -f") && !codex.remoteCmd.includes("chmod"));
 const claude = buildCredSeed("claude");
 t("claude seed stdin + setup-token note", claude.viaStdin === true && /setup token/i.test(claude.note));
 t("cred gate: stdin+not-argv -> ok", credDeliveryOk({ viaStdin: true, inArgv: false }) === true);
 t("cred gate: argv -> REFUSE (fail-closed)", credDeliveryOk({ viaStdin: true, inArgv: true }) === false);
 t("cred gate: not-stdin -> REFUSE", credDeliveryOk({ viaStdin: false, inArgv: false }) === false);
 t("unknown family throws", (() => { try { buildCredSeed("grok" as any); return false; } catch { return true; } })());
+// VMC-P1-2: 0600 BEFORE first byte (umask+rm before cat), &&-chained, no chmod-after masquerade
+t("VMC-P1-2: codex 0600 before write (umask 077 && rm -f before cat)", /umask 077 && rm -f .* && cat > ~\/\.codex\/auth\.json$/.test(codex.remoteCmd));
+t("VMC-P1-2: codex &&-chained, no post-cat chmod", codex.remoteCmd.includes("&&") && !/cat >.*chmod/.test(codex.remoteCmd));
+t("VMC-P1-2: claude same discipline", /umask 077 && rm -f .* && cat > ~\/\.claude\/\.credentials\.json$/.test(claude.remoteCmd));
+
+// VMC-P2-1: install URL is single-quoted (one literal arg; no shell rewrite / pre-download substitution)
+t("VMC-P2-1: shQuote wraps + escapes", shQuote("a'b") === "'a'\\''b'");
+t("VMC-P2-1: boot plan single-quotes the url", buildBootPlan().some((l) => l.includes("curl -fsSL 'https://herdr.dev/install.sh'")));
+t("VMC-P2-1: malicious url stays quoted (no bare &/$())", (() => {
+  const l = buildBootPlan({ herdrInstallUrl: "http://x/i.sh?a=1&b=2" }).find((x) => x.includes("curl"))!;
+  return l.includes("'http://x/i.sh?a=1&b=2'") && !l.includes("i.sh?a=1&b=2 ");
+})());
 
 // --- forward: ssh -L args ---
 t("forward builds -L", JSON.stringify(buildForwardArgs("root@h", 8080)) === JSON.stringify(["-N", "-L", "8080:localhost:8080", "root@h"]));
