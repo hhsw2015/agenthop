@@ -49,6 +49,19 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
 {
   t("pane split", buildPaneSplit("/w").join(" ") === "pane split --current --direction right --cwd /w --no-focus");
   t("agent start args after --", buildAgentStart("r", "claude", "w1:p2", ["--resume", "S"]).join(" ") === "agent start r --kind claude --pane w1:p2 -- --resume S");
+  // ①(herdr-args-fix) regression guard: a STANDARD generated resume command flows splitCommand -> buildAgentStart as
+  // SEPARATE argv elements (herdrRun hands this array straight to execFile), so each flag reaches herdr as its own
+  // argv. This verifies our boundary handling for this input; it does NOT localize the field whole-string issue (a
+  // quoted input like `claude "--model opus --resume SID"` would itself yield a single tail arg here) nor uniquely
+  // attribute it upstream.
+  t("① standard resume command tokenizes to separate argv (boundary preserved)", (() => {
+    const sc = splitCommand("claude --dangerously-skip-permissions --model 'claude-opus-5-5[1m]' --resume SID");
+    const argv = buildAgentStart("m", sc.kind, "w1:p2", sc.args);
+    const after = argv.slice(argv.indexOf("--") + 1);
+    return after.length === 5 && after[0] === "--dangerously-skip-permissions" && after[1] === "--model"
+      && after[2] === "claude-opus-5-5[1m]" && after[3] === "--resume" && after[4] === "SID"
+      && !after.some((a) => a.includes(" "));
+  })());
   t("agent submit (no --wait)", buildAgentSubmit("r", "hi").join(" ") === "agent prompt r hi");
   t("agent prompt --wait (native activity gate, R2-P2-4)", buildAgentPromptWait("r", "hi", 120000).join(" ") === "agent prompt r hi --wait --timeout 120000");
   t("agent get (pane-bind lookup, R2-P2-5)", buildAgentGet("r").join(" ") === "agent get r");
