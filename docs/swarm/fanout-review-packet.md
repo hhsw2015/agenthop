@@ -1,11 +1,22 @@
-# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 2
+# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 3
 
-- **Branch** `feat/fanout-native`  **HEAD** `c55f9e5`  **Base** `c3439cd`  (round-1 reviewed at `ff16594`)
+- **Branch** `feat/fanout-native`  **HEAD** `64bfb17`  **Base** `c3439cd`  (round-1 `ff16594`, round-2 `c55f9e5`)
 - **Reviewer** codex `01a0ead5` (cross-family, independent)  **Author** bus-pen `d7f6c917`
-- **Contract pointers (N1)**: design `docs/swarm/fanout-native-design.md` @`fc799d9` + pre-study `docs/swarm/fanout-prestudy.md` @`cd42840`, both on branch `feat/fanout-native-design`.
+- **Contract pointers**: design `docs/swarm/fanout-native-design.md` @`fc799d9` + pre-study `docs/swarm/fanout-prestudy.md` @`cd42840`, both on branch `feat/fanout-native-design`.
 
 ## What this is
-Phase-1 of fan-out nativization: the SOVEREIGN self-built backend a long-lived member wields as a stateless sub-tool. A pure governance core (`fanout.ts`) + a visible-chain pure layer (`fanout-herdr.ts`) + a thin IO driver (`swarm-fanout.ts`) that composes the AS-IS spawn stack, single-flight, and the herdr CLI. DORMANT behind `SWARM_FANOUT`. Round-1 was 8P1 + 1P2; all resolved below.
+Phase-1 of fan-out nativization: the SOVEREIGN self-built backend a long-lived member wields as a stateless sub-tool. A pure governance core (`fanout.ts`) + a visible-chain pure layer (`fanout-herdr.ts`) + a thin IO driver (`swarm-fanout.ts`) that composes the AS-IS spawn stack, single-flight, and the herdr CLI. DORMANT behind `SWARM_FANOUT`. Headless is the DEFAULT; the temp-workspace visible chain is an explicit opt-in (`visible:true`). Round-1 and round-2 were each 8P1 + 1P2 (N1 closed in round-2); round-3 resolves every threshold below.
+
+## Round 3 — round-2 REMAIN resolved (FN1-FN9, precise thresholds)
+- FN1 the reservation is PRE-CHECKED to fit (`spent + reserve <= cap`) before each launch (no overshoot); cumulative spend (tokens + USD) is persisted in the ledger and resumed, counting ALL attempts; every unit row is registered UPFRONT so an un-launched unit still reaches `aborted`.
+- FN2 `readLedgerState` distinguishes MISSING (fresh) from CORRUPT/unreadable (throws — never re-spawns on unknown prior state; a directory at the path is corrupt); a prior still-LIVE `running` or a `delivery_uncertain` row is carried, not re-run; the register write is checked BEFORE any spawn (fail -> no launch).
+- FN3 `nextReceipt` makes an ACCEPTED generation FINAL (never downgraded, even on a later not-all-terminal pass); interim ledger writes preserve the prior receipt (never clobber accepted with false).
+- FN4 headless is the DEFAULT; `visible:true` is required for the temp-workspace chain; zone close moved to `finally` (exception-safe, canReapZone-guarded); a failed close writes a durable `cleanup-pending.json` todo.
+- FN5 `unit.key` is validated as a safe slug (the traversal can no longer move to the key).
+- FN6 `parseDepth` rejects a present-but-invalid depth (NaN/negative/non-integer), never coerces to 0; the visible `unitCommand` carries `FANOUT_DEPTH` to the child, so both backends depth-cap.
+- FN7 all ticket/ROI numbers must be FINITE (`Infinity`/`NaN` rejected).
+- FN8 `classifyExit` is done ONLY on an explicit 0 exit WITH output; a launch failure is failed immediately (no timeout wait); an exception is failed; a visible unit with no `rc` evidence is timeout, never a fake done.
+- FN9 after the bounded lease wait, a unit with NO lease is NOT launched (remaining units stay registered and reach `aborted`).
 
 ## Round 2 — round-1 REMAIN resolved (FN1-FN9 + FN4-B, N1)
 - FN1 budget breaker now meters a conservative per-launch reservation (ceiling from the budget ticket); on overrun it stops launching and `markAborted` gives every un-launched/running unit a terminal `aborted` state (honest aggregate).
@@ -27,15 +38,15 @@ Phase-1 of fan-out nativization: the SOVEREIGN self-built backend a long-lived m
 ## Files + tests
 | Module | ~lines | Tests | Purpose |
 | --- | --- | --- | --- |
-| `packages/bus/src/swarm/fanout.ts` | ~320 | 90 | pure governance (schema/width/tier/display/reduce/receipt/budget/sweep/zone/depth/classify/evidence/resume/abort) |
-| `packages/bus/src/swarm/fanout-herdr.ts` | ~75 | 22 | pure visible-chain builders/parsers + the unit command (tier-model + F41 atomic + rc sidecar) |
-| `packages/bus/src/swarm/fanout.selftest.mts` | ~230 | 90 | one named counterexample per pit + per round-1 finding |
-| `packages/bus/src/swarm/fanout-herdr.selftest.mts` | ~55 | 22 | builders/parsers + the char-swallow defense |
-| `scripts/swarm-fanout.ts` | ~230 | live | driver: single-flight, resume, width-evidence, depth, pool + shared lease, both backends, breaker, classify, persist-then-receipt, F42 cleanup |
+| `packages/bus/src/swarm/fanout.ts` | ~345 | 105 | pure governance (schema/width/tier/display/reduce/receipt/budget/sweep/zone/depth/classify/evidence/resume/abort/finiteness) |
+| `packages/bus/src/swarm/fanout-herdr.ts` | ~80 | 23 | pure visible-chain builders/parsers + the unit command (tier-model + depth + F41 atomic + rc sidecar) |
+| `packages/bus/src/swarm/fanout.selftest.mts` | ~270 | 105 | one named counterexample per pit + per round-1/2 finding |
+| `packages/bus/src/swarm/fanout-herdr.selftest.mts` | ~60 | 23 | builders/parsers + the char-swallow + child-depth defenses |
+| `scripts/swarm-fanout.ts` | ~255 | live | driver: single-flight + resume (corrupt-vs-missing), width-evidence, strict depth, upfront-register, reservation pre-check + durable spend, shared lease (no-lease-no-launch), both backends, classify, persist-then-receipt, finally cleanup |
 
 ## Gates
-- bus tsc 0; scripts tsc 0; fanout selftest 90/90; fanout-herdr selftest 22/22; bus vitest 991/991 (unchanged — additive files).
+- bus tsc 0; scripts tsc 0; fanout selftest 105/105; fanout-herdr selftest 23/23; bus vitest 991/991 (unchanged — additive files).
 
-## Open self-flags (reviewer please rule)
-- FN1 metering is a conservative per-launch RESERVATION (`FANOUT_UNIT_TOKEN_EST`), not a parse of real post-hoc token usage — the breaker is bounded-above-correct (never overshoots), but a real-usage parse is a phase-2 refinement. Reviewer: confirm reservation is acceptable for phase-1.
-- FN9 shared lease uses a file-per-unit dir under a global single-flight lock with stale (dead-pid) reaping; acceptable for same-machine phase-1 (cross-machine is out of scope).
+## Self-flags (per the round-2 ruling)
+- FN1 metering is a conservative per-launch RESERVATION (`FANOUT_UNIT_TOKEN_EST` + `FANOUT_UNIT_USD_EST`) — the reviewer accepted a conservative reserve for phase-1; it is now enforceable (pre-checked to fit, no overshoot) and durably cumulative across attempts. A real post-hoc token parse is a phase-2 refinement.
+- FN9 shared lease is same-machine (file-per-unit under a global single-flight lock, stale-reaped) — the reviewer accepted the single-machine scope; cross-machine is out of scope.
