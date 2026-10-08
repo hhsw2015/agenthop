@@ -34,7 +34,11 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   t("a REGEX literal is NOT an import (AR3 round-2)", extractImports(`const re = /import "node:fs"/;`).length === 0);
   t("divide then regex does not fabricate an import (AR3 round-2)", extractImports(`const a = b / c; const d = /x/;`).length === 0);
   t("import x = require(...) captured", extractImports(`import x = require("./eq.js");`)[0] === "./eq.js");
-  t("template dynamic import (unresolvable) omitted", extractImports("await import(`./${v}.js`);").length === 0);
+  t("INTERPOLATED template dynamic import (unresolvable) omitted", extractImports("await import(`./${v}.js`);").length === 0);
+  t("no-substitution template in dynamic import IS captured (AR3 round-3)", extractImports("await import(`./dep.js`);")[0] === "./dep.js");
+  t("no-substitution template in require IS captured (AR3 round-3)", extractImports("const x = require(`./dep.js`);")[0] === "./dep.js");
+  t("import TYPE node is captured (AR3 round-3)", extractImports(`type T = import("./dep.js").T;`)[0] === "./dep.js");
+  t("import type with a no-substitution template is captured (AR3 round-3)", extractImports("type T = import(`./dep.js`).T;")[0] === "./dep.js");
 }
 
 // --- AR4: IO taint matched on the builtin ROOT (submodules + /promises covered) ---

@@ -47,11 +47,13 @@ export function ioRootOf(spec: string): string {
   return spec.replace(/^node:/, "").split("/")[0] ?? "";
 }
 
-// Import extraction via a real TypeScript PARSE + AST walk (round-2 AR3: the preprocessor still mis-read a
-// regex literal like `/import "x"/` as an import). The parser distinguishes code from string/regex/template/
-// comment, so it captures ONLY genuine module edges: static import, export-from, `import x = require()`,
-// require(), and a literal dynamic import("..."). A non-literal dynamic import (template/variable) has no
-// knowable target and is omitted.
+// Import extraction via a real TypeScript PARSE + AST walk (AR3: a regex literal like `/import "x"/` must not
+// be read as an import). The parser distinguishes code from string/regex/template/comment, so it captures ONLY
+// genuine module edges: static import, export-from, `import x = require()`, require(), a literal dynamic
+// import("..."), and a type-position `import("...").T` (ImportTypeNode). A module STRING here is either a plain
+// string literal OR a no-substitution template `` `...` `` (both are static, round-3 AR3) — matched by
+// ts.isStringLiteralLike. A template WITH interpolation has no knowable target and is omitted; no expression
+// is ever executed.
 export function extractImports(content: string): string[] {
   const sf = ts.createSourceFile("f.ts", content, ts.ScriptTarget.Latest, /*setParentNodes*/ false, ts.ScriptKind.TS);
   const out: string[] = [];
@@ -60,13 +62,15 @@ export function extractImports(content: string): string[] {
       out.push(node.moduleSpecifier.text);
     } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
       out.push(node.moduleSpecifier.text);
-    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference) && ts.isStringLiteral(node.moduleReference.expression)) {
+    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference) && ts.isStringLiteralLike(node.moduleReference.expression)) {
       out.push(node.moduleReference.expression.text);
+    } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument) && ts.isStringLiteralLike(node.argument.literal)) {
+      out.push(node.argument.literal.text);
     } else if (ts.isCallExpression(node)) {
       const isRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
       const arg0 = node.arguments[0];
-      if ((isRequire || isDynamicImport) && arg0 && ts.isStringLiteral(arg0)) out.push(arg0.text);
+      if ((isRequire || isDynamicImport) && arg0 && ts.isStringLiteralLike(arg0)) out.push(arg0.text);
     }
     ts.forEachChild(node, visit);
   };
