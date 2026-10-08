@@ -390,6 +390,21 @@ export function parseBoardItemName(file: string): { itemId: string; state: Board
   return null; // unknown / malformed shape — never silently mis-attributed
 }
 
+// BP3: adoption decision for an orphaned repost `.tmp` (a crash between a repost's rename-acquire and its rewrite/restore).
+// Restore it to `posted` ONLY when the item is genuinely MISSING — if ANY live board state exists for its itemId (posted
+// already back, or claimed/granted/rejected/done/reclaimed), the item has MOVED ON, so the tmp is stale and must be
+// DROPPED, never revived (reviving a claimed item would make claimed+posted coexist).
+export function repostTmpAction(itemId: string, liveItemIds: ReadonlySet<string>): "restore" | "drop" {
+  return liveItemIds.has(itemId) ? "drop" : "restore";
+}
+
+// BP3: a node whose itemId still has an UNRESTORED repost tmp keeps its escalation obligation (repostCount + deadline) in
+// that tmp. Re-posting it as a fresh first item would reset the count + deadline and bypass the cap — so suppress a fresh
+// post for it (a later tick's adoption retries the restore). A restore that SUCCEEDED is not pending -> never suppressed.
+export function suppressPendingReposts<T extends { itemId: string }>(post: readonly T[], pendingTmpItemIds: ReadonlySet<string>): T[] {
+  return post.filter((p) => !pendingTmpItemIds.has(p.itemId));
+}
+
 /** Reject a nodeId that would break the file-name convention (dots collide with the state/who separators). Pure guard the
  *  producer uses before posting; a plan node id is normally a plain identifier, so this only catches a malformed plan. */
 export function isValidItemId(itemId: string): boolean {

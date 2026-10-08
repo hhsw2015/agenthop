@@ -3,6 +3,7 @@ import {
   boardItemsToPost, planBoardWrites, buildGrantBodies, grantWaitId, planClaimAdmission, parseClaimApplication, boardItemId,
   postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName, reclaimedFileName,
   parseBoardItemName, isValidItemId, boardAdmitEnabled, superviseBoardPost, planBoardSupervision, parsePolicyNum,
+  repostTmpAction, suppressPendingReposts,
   type BoardItem, type AdmissionParams, type ExistingBoardFile, type ClaimApplication, type BoardSupervisionPolicy,
 } from "../src/swarm/task-board.js";
 import { commit, entityKeyOf, initialLogState, type ChangeBody, type LogState, type WaitRecord } from "../src/swarm/control-log.js";
@@ -354,5 +355,23 @@ describe("task-board BA9 reclaim is terminal: planBoardWrites never auto-re-post
     const { post, reap } = planBoardWrites([ready("a")], p, [reclaimed], { postedBy: "coord", nowSec: 2000 });
     expect(post).toEqual([]);
     expect(reap).toEqual([]);
+  });
+});
+
+describe("task-board BP3 repost-tmp recovery (crash between acquire + rewrite/restore must not revive a moved item or reset escalation)", () => {
+  test("genuinely-missing item -> restore (no live state for its itemId)", () => {
+    expect(repostTmpAction("item-a", new Set())).toBe("restore");
+  });
+  test("counterexample A: a claimed/moved item -> DROP the stale tmp (never revive -> claimed+posted coexisting)", () => {
+    expect(repostTmpAction("item-a", new Set(["item-a"]))).toBe("drop"); // any live state (posted back / claimed / terminal)
+    expect(repostTmpAction("item-b", new Set(["item-a"]))).toBe("restore"); // a different item's state does not block
+  });
+  test("counterexample B: a node with an UNRESTORED tmp is suppressed from a fresh first post (obligation retained)", () => {
+    const post = [{ itemId: "item-a" }, { itemId: "item-b" }];
+    expect(suppressPendingReposts(post, new Set(["item-a"]))).toEqual([{ itemId: "item-b" }]);
+  });
+  test("a successfully-restored (not pending) item is NOT suppressed", () => {
+    const post = [{ itemId: "item-a" }, { itemId: "item-b" }];
+    expect(suppressPendingReposts(post, new Set())).toEqual(post); // empty pending set -> nothing suppressed
   });
 });

@@ -35,7 +35,7 @@ import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/ta
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
 import { taskPass, buildSched, physicalSlotsOccupied, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
 import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
-import { boardAdmitEnabled, planBoardWrites, planBoardSupervision, parsePolicyNum, postedFileName, reclaimedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
+import { boardAdmitEnabled, planBoardWrites, planBoardSupervision, parsePolicyNum, postedFileName, reclaimedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, repostTmpAction, suppressPendingReposts, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
@@ -816,20 +816,26 @@ async function main(): Promise<void> {
       const ready = readyTasks({ plan: cur, attempts, acceptedResults, now: nowSec(), jobUsage: usage });
       mkdirSync(BOARD_DIR, { recursive: true });
       // BP3: adopt an orphaned `.repost.<pid>.tmp` left when a crash hit BETWEEN the repost's rename-acquire
-      // (posted -> tmp) and its rewrite/restore. Without this the posted file is missing, so the next
-      // planBoardWrites re-posts a FRESH item (repostCount + deadline reset -> escalation silently bypassed).
-      // Restore it to its posted name so the item's progress survives the restart. Only adopt a tmp whose writer
-      // is gone and whose posted slot is free (never steal a live producer's in-flight tmp, never clobber a racer).
-      for (const f of readdirSync(BOARD_DIR)) {
-        const m = /^(.+\.json)\.repost\.(\d+)\.tmp$/.exec(f);
+      // (posted -> tmp) and its rewrite/restore, so the item's escalation progress (repostCount + deadline) survives a
+      // restart. Restore ONLY a genuinely-missing item: if ANY live state exists for its itemId (posted already back, or
+      // claimed/granted/terminal) the item MOVED ON -> the tmp is stale, drop it (never revive a claimed/moved item ->
+      // claimed+posted coexisting). A restore that itself FAILS keeps the itemId a PENDING obligation (below), so a fresh
+      // first post is suppressed (never reset the count by re-creating the item). Only touch a tmp whose writer is gone.
+      const boardFiles = readdirSync(BOARD_DIR);
+      const liveItemIds = new Set<string>();
+      for (const bf of boardFiles) { const p = parseBoardItemName(bf); if (p) liveItemIds.add(p.itemId); }
+      const pendingTmpItemIds = new Set<string>();
+      for (const f of boardFiles) {
+        const m = /^(.+)\.json\.repost\.(\d+)\.tmp$/.exec(f);
         if (!m) continue;
-        const tmp = path.join(BOARD_DIR, f);
-        const posted = path.join(BOARD_DIR, m[1]!);
+        const itemId = m[1]!;
         const writerPid = Number(m[2]);
         let writerAlive = false; try { process.kill(writerPid, 0); writerAlive = true; } catch { /* dead */ }
         if (writerAlive && writerPid !== process.pid) continue; // another producer is mid-repost — leave its tmp alone
-        if (existsSync(posted)) { try { unlinkSync(tmp); } catch { /* fine */ } continue; } // original is back -> drop the stale tmp
-        try { renameSync(tmp, posted); } catch { /* a racer restored it first */ }
+        const tmp = path.join(BOARD_DIR, f);
+        if (repostTmpAction(itemId, liveItemIds) === "drop") { try { unlinkSync(tmp); } catch { /* fine */ } continue; } // moved on / already back -> stale
+        try { renameSync(tmp, path.join(BOARD_DIR, postedFileName(itemId))); liveItemIds.add(itemId); } // recovered -> now live
+        catch { pendingTmpItemIds.add(itemId); } // restore FAILED -> obligation still pending; suppress a fresh first post
       }
       // Read each existing board file's body so the producer can refresh a stale-revision post (BA8b) and tell its own job's
       // entries from another job's (BA4). Unreadable ⇒ body null.
@@ -842,9 +848,12 @@ async function main(): Promise<void> {
       // Reap BEFORE post (BA8a): a stale-revision refresh overwrites the posted file in place via atomicWrite, so post must run
       // AFTER any unlink — never write the fresh item and then delete it. (planBoardWrites keeps the two sets path-disjoint,
       // but ordering reap-first is the robust guarantee.)
+      // BP3: suppress a fresh first post for any node whose itemId still has an UNRESTORED repost tmp — its escalation
+      // obligation lives in that tmp; re-posting fresh would reset repostCount + deadline and bypass the cap.
+      const toPost = suppressPendingReposts(post, pendingTmpItemIds);
       for (const f of reap) { try { unlinkSync(path.join(BOARD_DIR, f)); } catch { /* raced away — fine */ } }
-      for (const item of post) atomicWrite(path.join(BOARD_DIR, postedFileName(item.itemId)), JSON.stringify(item));
-      if (post.length || reap.length) log(`board producer: posted ${post.length}, reaped ${reap.length} stale`);
+      for (const item of toPost) atomicWrite(path.join(BOARD_DIR, postedFileName(item.itemId)), JSON.stringify(item));
+      if (toPost.length || reap.length) log(`board producer: posted ${toPost.length}, reaped ${reap.length} stale`);
 
       // BA9: supervise STILL-READY posted-but-unclaimed items past their claim deadline — REPOST (bounded) ->
       // REPORT (S19-form incident, deduped by a `.report.json` marker) -> RECLAIM (rename to the terminal
