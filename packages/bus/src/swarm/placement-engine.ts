@@ -46,7 +46,7 @@ export function binPack(units: number, machines: readonly MachineCap[]): PackRes
   const assignments: Record<string, number> = Object.create(null);
   let placed = 0;
   let remaining = Number.isFinite(units) ? Math.max(0, Math.floor(units)) : 0;
-  for (const m of machines) {
+  for (const m of dedupeById(machines)) { // PE3: a repeated id must not double-count then overwrite its assignment
     if (remaining <= 0) break;
     const free = Number.isFinite(m.freeCapacity) ? Math.max(0, Math.floor(m.freeCapacity)) : 0;
     const take = Math.min(remaining, free);
@@ -67,7 +67,10 @@ export interface Demand {
 
 /** Desired machine count = max(ceil(board work / per-machine capacity), fanout machines). Pure. */
 export function desiredCount(d: Demand, perMachineCapacity: number): number {
-  const byBoard = perMachineCapacity > 0 ? Math.ceil(Math.max(0, d.boardUnits) / perMachineCapacity) : 0;
+  // Guard non-finite/invalid inputs so a direct caller never gets Infinity/NaN (reconcile is the explicit-hold gate).
+  const cap = Number.isFinite(perMachineCapacity) && perMachineCapacity > 0 ? perMachineCapacity : 0;
+  const board = Number.isFinite(d.boardUnits) && d.boardUnits > 0 ? d.boardUnits : 0;
+  const byBoard = cap > 0 ? Math.ceil(board / cap) : 0;
   const byFanout = Number.isFinite(d.fanoutMachines) ? Math.max(0, Math.floor(d.fanoutMachines)) : 0;
   return Math.max(byBoard, byFanout);
 }
@@ -101,8 +104,23 @@ export interface ReconcileConfig {
 export type Action =
   | { kind: "reclaim"; id: string; reason: "non-live" | "surplus" }
   | { kind: "rebuild"; id: string; reason: "expiring" }
-  | { kind: "spawn"; n: number }
+  | { kind: "spawn"; n: number; urgent?: boolean } // urgent = restore necessary capacity below floor (bypasses dwell)
   | { kind: "hold"; reason: string };
+
+const finiteNonNeg = (n: number): boolean => Number.isFinite(n) && n >= 0;
+
+/** Dedupe machines by id (first occurrence wins) — duplicate records must not double-count capacity, overwrite
+ *  assignments, or fabricate surplus (PE3). Pure. */
+export function dedupeById<T extends { id: string }>(xs: readonly T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const x of xs) {
+    if (seen.has(x.id)) continue;
+    seen.add(x.id);
+    out.push(x);
+  }
+  return out;
+}
 
 /**
  * Level-triggered reconcile: actual (machines) → desired. HEAL is ungated/urgent (a dead VM is reclaimed so a spawn
@@ -110,21 +128,43 @@ export type Action =
  * (spawn the shortfall; reclaim a surplus machine only when it is ready+idle-long+in-flight=0+non-floor). Idempotent:
  * the same (desired, actual) yields the same actions, safe to replay. Pure. */
 export function reconcile(d: Demand, machines: readonly MachineView[], cfg: ReconcileConfig, sinceLastActionSec: number): Action[] {
+  // PE4: validate every input; an illegal/abnormal value yields an EXPLICIT hold, never a fabricated 0/Infinity action.
+  if (!(Number.isFinite(cfg.perMachineCapacity) && cfg.perMachineCapacity > 0)) return [{ kind: "hold", reason: "invalid perMachineCapacity" }];
+  if (!(Number.isInteger(cfg.floor) && cfg.floor >= 0)) return [{ kind: "hold", reason: "invalid floor" }];
+  for (const [k, v] of [["reclaimIdleSec", cfg.reclaimIdleSec], ["expiringSec", cfg.expiringSec], ["minDwellSec", cfg.minDwellSec]] as const) {
+    if (!finiteNonNeg(v)) return [{ kind: "hold", reason: `invalid ${k}` }];
+  }
+  if (!finiteNonNeg(d.boardUnits) || !finiteNonNeg(d.fanoutMachines)) return [{ kind: "hold", reason: "invalid demand" }];
+  if (!finiteNonNeg(sinceLastActionSec)) return [{ kind: "hold", reason: "invalid clock" }];
+
+  const uniq = dedupeById(machines); // PE3: duplicates must not double-count or fabricate surplus
   const want = Math.max(desiredCount(d, cfg.perMachineCapacity), cfg.floor);
-  const healthy = machines.filter((m) => m.live);
-  const actions: Action[] = [];
-
-  // HEAL (ungated): dead → reclaim (shortfall spawn replaces); expiring live → snapshot+rebuild (preserve state).
-  for (const m of machines) if (!m.live) actions.push({ kind: "reclaim", id: m.id, reason: "non-live" });
-  for (const m of healthy) if (m.remainingSec != null && m.remainingSec <= cfg.expiringSec) actions.push({ kind: "rebuild", id: m.id, reason: "expiring" });
-
-  // SCALE (dwell-gated + hysteresis) on the healthy set.
+  const live = uniq.filter((m) => m.live);
   const dwellOk = sinceLastActionSec >= cfg.minDwellSec;
-  if (dwellOk && healthy.length < want) {
-    actions.push({ kind: "spawn", n: want - healthy.length });
-  } else if (dwellOk && healthy.length > want) {
-    const cand = healthy.filter((m) => m.ready && m.inFlight === 0 && m.idleSec >= cfg.reclaimIdleSec && !m.floor);
-    if (cand.length > 0) actions.push({ kind: "reclaim", id: cand.reduce((a, b) => (b.idleSec > a.idleSec ? b : a)).id, reason: "surplus" });
+  const actions: Action[] = [];
+  const handled = new Set<string>(); // PE1: each machine gets exactly ONE action (heal and scale never collide)
+
+  // dead → reclaim (always; not capacity). The shortfall spawn below replaces necessary ones.
+  for (const m of uniq) if (!m.live) { actions.push({ kind: "reclaim", id: m.id, reason: "non-live" }); handled.add(m.id); }
+
+  // surplus: reclaim one live machine beyond `want` (idle+empty+ready+non-floor), dwell-gated + hysteretic. A machine
+  // reclaimed here is marked handled, so the expiring-rebuild below never also fires on it (PE1).
+  if (dwellOk && live.length > want) {
+    const cand = live.filter((m) => !handled.has(m.id) && m.ready && m.inFlight === 0 && m.idleSec >= cfg.reclaimIdleSec && !m.floor);
+    if (cand.length > 0) {
+      const pick = cand.reduce((a, b) => (b.idleSec > a.idleSec ? b : a));
+      actions.push({ kind: "reclaim", id: pick.id, reason: "surplus" });
+      handled.add(pick.id);
+    }
+  }
+
+  // expiring KEPT live → snapshot+rebuild (a surplus-reclaimed one is already handled, so it is not rebuilt).
+  for (const m of live) if (!handled.has(m.id) && m.remainingSec != null && m.remainingSec <= cfg.expiringSec) { actions.push({ kind: "rebuild", id: m.id, reason: "expiring" }); handled.add(m.id); }
+
+  // spawn shortfall. Below FLOOR = URGENT necessary-capacity recovery (ungated — PE2); growth above floor is dwell-gated.
+  if (live.length < want) {
+    if (dwellOk) actions.push({ kind: "spawn", n: want - live.length });
+    else if (live.length < cfg.floor) actions.push({ kind: "spawn", n: cfg.floor - live.length, urgent: true });
   }
 
   if (actions.length === 0) actions.push({ kind: "hold", reason: dwellOk ? "at desired" : "min-dwell" });

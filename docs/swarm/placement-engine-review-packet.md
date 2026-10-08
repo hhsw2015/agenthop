@@ -1,6 +1,6 @@
 # placement-engine phase-2a — review packet (S14, owner 90b58f9c)
 
-Branch `feat/placement-engine`, review range `c3439cd..HEAD` (merge-base with main = c3439cd). Verify: `npx tsx packages/bus/src/swarm/placement-engine.selftest.mts` → 27 cases green; `cd packages/bus && npx tsc --noEmit` → 0.
+Branch `feat/placement-engine`, review range `c3439cd..HEAD` (merge-base with main = c3439cd). Verify: `npx tsx packages/bus/src/swarm/placement-engine.selftest.mts` → 39 cases green; `cd packages/bus && npx tsc --noEmit` → 0.
 
 **Scope proof** (`git diff --name-status c3439cd..HEAD`): PURELY ADDITIVE — `placement-engine.{ts,selftest.mts}` + design doc + this packet. Modifies NO existing file; changes NO runtime (`SWARM_PLACEMENT` default OFF). No new dependency. Design coordinator-approved, no changes (`docs/swarm/placement-engine-design.md`).
 
@@ -10,7 +10,7 @@ The UPPER layer of vm-ctl's two-layer architecture (phase-2a, single-backend sco
 
 | Module | lines | selftest | Purpose |
 |---|---|---|---|
-| `placement-engine.ts` | ~130 | 27 | pure: `classifyHealth`/`disposition` (liveness≠readiness), `binPack` (no oversubscribe), `desiredCount` (two consumers), `forkHealthGate` (Betabrand), `reconcile` (level-triggered heal + dwell-gated scale); IO: `placementEnabled` (dormant) |
+| `placement-engine.ts` | ~165 | 39 | pure: `classifyHealth`/`disposition` (liveness≠readiness), `binPack` (no oversubscribe), `desiredCount` (two consumers), `forkHealthGate` (Betabrand), `reconcile` (level-triggered heal + dwell-gated scale); IO: `placementEnabled` (dormant) |
 
 ## Invariant → where pinned (the review walk)
 

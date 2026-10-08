@@ -5,6 +5,7 @@ import {
   desiredCount,
   forkHealthGate,
   reconcile,
+  dedupeById,
   type MachineView,
   type ReconcileConfig,
 } from "./placement-engine.js";
@@ -65,5 +66,32 @@ t("at desired -> hold", reconcile({ boardUnits: 2, fanoutMachines: 0 }, [mv("a")
 // idempotent: same inputs -> same actions
 const inM = [mv("a"), mv("dead", { live: false })];
 t("idempotent (same in -> same out)", JSON.stringify(reconcile({ boardUnits: 2, fanoutMachines: 0 }, inM, CFG, 999)) === JSON.stringify(reconcile({ boardUnits: 2, fanoutMachines: 0 }, inM, CFG, 999)));
+
+// --- PE1: a machine must get ONE consistent action (never both rebuild AND reclaim) ---
+{
+  const acts = reconcile({ boardUnits: 2, fanoutMachines: 0 }, [mv("f", { floor: true }), mv("e", { remainingSec: 60, idleSec: 999 })], CFG, 999);
+  const eActs = acts.filter((a) => "id" in a && (a as any).id === "e");
+  t("PE1: expiring+surplus machine gets exactly ONE action", eActs.length === 1);
+  t("PE1: that action is reclaim (surplus wins over rebuild), not both", eActs[0].kind === "reclaim");
+}
+
+// --- PE2: a dead NECESSARY machine (below floor) is respawned URGENTLY even inside dwell ---
+{
+  const acts = reconcile({ boardUnits: 0, fanoutMachines: 0 }, [mv("x", { live: false })], CFG, 0); // floor=1, 0 live, in dwell
+  t("PE2: dead reclaimed", acts.some((a) => a.kind === "reclaim" && a.reason === "non-live"));
+  t("PE2: urgent spawn restores floor despite dwell", acts.some((a) => a.kind === "spawn" && (a as any).urgent === true && a.n === 1));
+}
+
+// --- PE3: duplicate ids don't double-count / overwrite / fabricate surplus ---
+t("PE3: binpack dedupes id (placed == assignment sum)", (() => { const p = binPack(5, [{ id: "a", freeCapacity: 2 }, { id: "a", freeCapacity: 2 }]); return p.placed === 2 && p.assignments["a"] === 2; })());
+t("PE3: dedupeById keeps first", dedupeById([{ id: "a", v: 1 }, { id: "a", v: 2 }]).length === 1);
+t("PE3: duplicate machine not reclaimed as surplus", reconcile({ boardUnits: 2, fanoutMachines: 0 }, [mv("a"), mv("a")], CFG, 999).every((a) => a.kind !== "reclaim"));
+
+// --- PE4: abnormal numbers -> explicit hold (never a fabricated action or false at-desired) ---
+t("PE4: infinite demand -> hold (no spawn Infinity)", (() => { const a = reconcile({ boardUnits: Infinity, fanoutMachines: 0 }, [mv("a")], CFG, 999); return a.some((x) => x.kind === "hold") && a.every((x) => x.kind !== "spawn"); })());
+t("PE4: NaN demand -> hold (not 'at desired')", reconcile({ boardUnits: NaN, fanoutMachines: 0 }, [mv("a")], CFG, 999).every((x) => x.kind === "hold" && x.reason === "invalid demand"));
+t("PE4: floor=1.5 -> hold (non-integer count)", reconcile({ boardUnits: 2, fanoutMachines: 0 }, [mv("a")], { ...CFG, floor: 1.5 }, 999).every((x) => x.kind === "hold"));
+t("PE4: perMachineCapacity 0 -> hold", reconcile({ boardUnits: 2, fanoutMachines: 0 }, [mv("a")], { ...CFG, perMachineCapacity: 0 }, 999).every((x) => x.kind === "hold"));
+t("PE4: desiredCount never returns Infinity", Number.isFinite(desiredCount({ boardUnits: Infinity, fanoutMachines: 0 }, 2)) && desiredCount({ boardUnits: Infinity, fanoutMachines: 0 }, 2) === 0);
 
 console.log("all placement-engine selftests passed");
