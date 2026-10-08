@@ -2,7 +2,7 @@
 //   npx tsx packages/bus/src/swarm/fanout.selftest.mts
 // Each pre-study pit (docs/swarm/fanout-prestudy.md §2) is a NAMED counterexample below.
 import {
-  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, degradeDisplay,
+  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, degradeDisplay, resumeVerdict,
   effectiveTier, elapsedTimedOut, isSafeRunKey, isTerminal, markAborted, newLedgerRow, nextReceipt, parseDepth,
   planResume, progress, reconcileOrphans, reduceUnits, reservationFits, reserveValid, validateFanoutRequest,
   validBudgetTicket, validRoiEstimate, widthClass, widthGate, zoneName, type FanoutUnit, type LedgerRow, type UnitResult,
@@ -178,6 +178,17 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("unknown exit + output -> FAILED (no success without an explicit 0 exit, FN8)", classifyExit({ spawnOk: true, outputPresent: true }) === "failed");
   t("null exit + output -> failed (FN8)", classifyExit({ spawnOk: true, exitCode: null, outputPresent: true }) === "failed");
   t("unknown exit + no output -> failed", classifyExit({ spawnOk: true, outputPresent: false }) === "failed");
+}
+
+// --- FN2: resumeVerdict for a prior RUNNING row — never blind re-run (double-spend) ---
+{
+  t("alive pid -> carry (alive)", resumeVerdict({ alive: true, exitCode: null, outputPresent: false }) === "alive");
+  t("alive wins even over a recorded exit", resumeVerdict({ alive: true, exitCode: 0, outputPresent: true }) === "alive");
+  t("exit 0 + output -> reuse (done)", resumeVerdict({ alive: false, exitCode: 0, outputPresent: true }) === "done");
+  t("exit 0 + NO output -> failed-terminal (retry, not a silent reuse)", resumeVerdict({ alive: false, exitCode: 0, outputPresent: false }) === "failed-terminal");
+  t("non-zero exit -> failed-terminal (confirmed ended, safe retry)", resumeVerdict({ alive: false, exitCode: 7, outputPresent: true }) === "failed-terminal");
+  t("no pid, undefined exit -> uncertain (quarantine, NEVER re-run)", resumeVerdict({ alive: false, exitCode: undefined, outputPresent: false }) === "uncertain");
+  t("no pid, null exit -> uncertain (crash-left: may have launched)", resumeVerdict({ alive: false, exitCode: null, outputPresent: true }) === "uncertain");
 }
 
 // --- FN7: width evidence must be real + bound to the run (not a bare flag) ---

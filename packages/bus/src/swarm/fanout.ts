@@ -313,6 +313,18 @@ export function classifyExit(opts: { spawnOk: boolean; exitCode?: number | null;
   return opts.outputPresent ? "done" : "failed";
 }
 
+// FN2: a prior RUNNING row is UNKNOWN after a crash — it may never have launched, be still live, have finished, or
+// launched-but-unconfirmed. This is the ONLY safe mapping from gathered evidence; blind re-run double-spends.
+//   alive            -> carry (still in flight)
+//   done             -> reuse (explicit 0 exit WITH output — it actually completed)
+//   failed-terminal  -> safe retry (confirmed ended non-zero / no output)
+//   uncertain        -> quarantine, NEVER re-run (pid gone, no terminal record: it may have launched)
+export function resumeVerdict(ev: { alive: boolean; exitCode?: number | null; outputPresent: boolean }): "alive" | "done" | "failed-terminal" | "uncertain" {
+  if (ev.alive) return "alive";
+  if (ev.exitCode === undefined || ev.exitCode === null) return "uncertain";
+  return ev.exitCode === 0 && ev.outputPresent ? "done" : "failed-terminal";
+}
+
 // FN7: the width ROI tier needs a REAL estimate bound to this run (env may carry a pointer to it, never be the
 // evidence). A valid estimate names the runKey and gives positive speedup- and cost-ratios.
 // A positive FINITE number — FN7: Infinity/NaN must never pass an amount/quota/ratio check.

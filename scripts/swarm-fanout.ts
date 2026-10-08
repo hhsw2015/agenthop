@@ -20,7 +20,7 @@ import {
 import {
   admitDepth, canReapZone, chooseDisplayMode, classifyExit, degradeDisplay, effectiveTier,
   elapsedTimedOut, markAborted, newLedgerRow, nextReceipt, parseDepth, planResume, reconcileOrphans, reduceUnits,
-  reservationFits, reserveValid, validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthGate, zoneName,
+  reservationFits, reserveValid, resumeVerdict, validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthGate, zoneName,
   type AggregateReceipt, type DisplayMode, type FanoutBudget, type FanoutRequest, type FanoutUnit, type FanoutTier,
   type LedgerRow, type Spent, type UnitResult,
 } from "../packages/bus/src/swarm/fanout.js";
@@ -37,7 +37,7 @@ const ledgerPath = (home: string, runKey: string): string => path.join(runDir(ho
 const aggregatePath = (home: string, runKey: string): string => path.join(runDir(home, runKey), "aggregate.json");
 const cleanupPendingPath = (home: string, zoneId: string): string => path.join(fanoutDir(home), "cleanup-pending", `${zoneId}.json`); // FN4: per-ZONE (never overwrites across leaked zones)
 const lockPath = (home: string, runKey: string): string => path.join(runDir(home, runKey), "run.lock");
-const outFile = (home: string, runKey: string, key: string): string => path.join(runDir(home, runKey), `${key}.out`);
+const outFile = (home: string, runKey: string, key: string, attempt: string): string => path.join(runDir(home, runKey), `${key}.${attempt}.out`);
 const leasesDir = (home: string): string => path.join(fanoutDir(home), "leases");
 
 function writeJsonAtomic(file: string, obj: unknown): boolean {
@@ -52,6 +52,8 @@ function writeJsonAtomic(file: string, obj: unknown): boolean {
   }
 }
 type LedgerState = { runKey: string; rows: LedgerRow[]; receipt?: AggregateReceipt; spent?: Spent };
+const LEDGER_STATUSES: ReadonlySet<string> = new Set<string>(["running", "done", "failed", "timeout", "delivery_uncertain", "aborted"]);
+const finiteNonNeg = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0;
 // FN2: distinguish MISSING (fresh run, null) from CORRUPT/unreadable (throw — prior state is unknown, never
 // treat it as "no prior run" and re-spawn everything). A directory at the path is EISDIR -> corrupt -> throw.
 function readLedgerState(home: string, runKey: string): LedgerState | null {
@@ -74,6 +76,21 @@ function readLedgerState(home: string, runKey: string): LedgerState | null {
   if (typeof o !== "object" || o === null || Array.isArray(o) || o.runKey !== runKey || !Array.isArray(o.rows)) {
     throw new Error(`fanout ledger malformed or foreign (${p}); refusing to start`);
   }
+  // FN2: validate EACH inner row's shape/status AND the cumulative spend. A crafted row (illegal status, non-number
+  // pid) or a negative/NaN spent must REFUSE the launch — never flow into resume/reservation math as trustworthy.
+  for (const r of o.rows as unknown[]) {
+    const rr = r as Partial<LedgerRow> | null;
+    if (typeof rr !== "object" || rr === null || typeof rr.key !== "string" || typeof rr.status !== "string" || !LEDGER_STATUSES.has(rr.status)) {
+      throw new Error(`fanout ledger has a malformed row (${p}); refusing to start`);
+    }
+    if (rr.pid !== undefined && typeof rr.pid !== "number") throw new Error(`fanout ledger row pid corrupt (${p}); refusing to start`);
+  }
+  if (o.spent !== undefined) {
+    const s = o.spent as Partial<Spent> | null;
+    if (typeof s !== "object" || s === null || (s.tokens !== undefined && !finiteNonNeg(s.tokens)) || (s.usd !== undefined && !finiteNonNeg(s.usd))) {
+      throw new Error(`fanout ledger spent corrupt (${p}); refusing to start`);
+    }
+  }
   return o as LedgerState;
 }
 const writeLedger = (home: string, runKey: string, rows: readonly LedgerRow[], receipt: AggregateReceipt | undefined, spent: Spent): boolean =>
@@ -83,6 +100,21 @@ const pidAlive = (pid: number): boolean => { try { process.kill(pid, 0); return 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const readFileOrNull = (p: string): string | null => { try { return readFileSync(p, "utf8"); } catch { return null; } };
 const readJsonOrNull = (p: string): unknown => { const s = readFileOrNull(p); if (s === null) return null; try { return JSON.parse(s); } catch { return null; } };
+const outputPresentAt = (p: string | undefined): boolean => { if (!p) return false; try { return existsSync(p) && statSync(p).size > 0; } catch { return false; } };
+
+// FN2: reconcile a prior RUNNING row against REAL terminal evidence before a resume decides anything. A crash can
+// leave a row "running" whether it never launched, is still live, already finished, or launched-but-unconfirmed —
+// blind re-run double-spends. Verdict from: live pid (alive) | headless registry exit or visible rc sidecar
+// (done on 0+output, else failed-terminal/retry) | no terminal record at all (uncertain -> quarantine, never re-run).
+function reconcileRunning(home: string, pr: LedgerRow): "alive" | "done" | "failed-terminal" | "uncertain" {
+  const alive = pr.pid !== undefined && pidAlive(pr.pid);
+  let exit: number | null | undefined = alive ? undefined : readRegistry(home).find((r) => r.launchId === pr.id || (pr.pid !== undefined && r.pid === pr.pid))?.exitCode;
+  if (!alive && (exit === undefined || exit === null) && pr.outputPtr) {
+    const rc = readFileOrNull(rcFile(pr.outputPtr));
+    if (rc !== null && /^\d+$/.test(rc.trim())) exit = Number(rc.trim());
+  }
+  return resumeVerdict({ alive, exitCode: exit, outputPresent: outputPresentAt(pr.outputPtr) }); // FN2: pure, tested mapping
+}
 
 // ---- herdr CLI (direct exec; herdr is NOT forked, spawn.ts is NOT touched) ----
 const herdrBin = (env: NodeJS.ProcessEnv): string => env.HERDR_BIN || path.join(homedir(), ".local", "bin", "herdr");
@@ -167,9 +199,16 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
     const toRun: FanoutUnit[] = [];
     for (const u of resumeToRun) {
       const pr = priorByKey.get(u.key);
-      if (pr?.status === "delivery_uncertain") { carry.push(pr); continue; } // quarantined — never auto-re-run
-      if (pr?.status === "running" && pr.pid !== undefined && pidAlive(pr.pid)) { carry.push(pr); continue; } // still live
-      toRun.push(u);
+      if (!pr) { toRun.push(u); continue; } // no prior attempt -> fresh launch
+      if (pr.status === "delivery_uncertain") { carry.push(pr); continue; } // already quarantined — never auto-re-run
+      if (pr.status === "running") {
+        const v = reconcileRunning(home, pr); // FN2: confirm from real evidence; never blind re-run a prior running row
+        if (v === "alive") { carry.push(pr); continue; } // still in flight
+        if (v === "done") { carry.push({ ...pr, status: "done", endedAt: pr.endedAt ?? Date.now() }); continue; } // actually completed -> reuse
+        if (v === "uncertain") { carry.push({ ...pr, status: "delivery_uncertain", endedAt: Date.now() }); continue; } // launched-but-unconfirmed -> quarantine
+        toRun.push(u); continue; // confirmed terminal non-zero -> safe retry
+      }
+      toRun.push(u); // terminal non-done (failed/timeout/aborted) -> retry
     }
 
     // FN7: width gate on real evidence bound to this run; a valid ticket is the budget ceiling (FN1).
@@ -203,7 +242,9 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
     const runnable: Launched[] = [];
     for (const u of toRun) {
       const row = newLedgerRow(u, u.key, "self-built", mode, zone);
-      row.outputPtr = outFile(home, req.runKey, u.key);
+      // FN8: a UNIQUE per-launch evidence path. An old attempt's rc/output can never share this path, so success is
+      // bound to THIS launch by construction — no fragile stale-file delete (whose failure could pass off old evidence).
+      row.outputPtr = outFile(home, req.runKey, u.key, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
       rows.push(row);
       runnable.push({ row, lease: null });
     }
@@ -229,7 +270,6 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
         spent.tokens += reserve.tokens; spent.usd += reserve.usd; // FN1: reserve BEFORE spawn
         if (!writeLedger(home, req.runKey, rows, priorReceipt, spent)) { releaseLease(lease); l.lease = null; bi = runnable.length; break; } // durable spend; fail -> no launch
         l.row.startedAt = Date.now();
-        try { rmSync(l.row.outputPtr!, { force: true }); rmSync(rcFile(l.row.outputPtr!), { force: true }); } catch { /* FN8: clear stale evidence so an old rc/output can't impersonate THIS launch */ }
         const model = tierModel(effectiveTier(unitOfRow(req, l.row)), env);
         if (mode === "headless") {
           const r = await spawnAgent({ tool: "claude", task: promptOfRow(req, l.row), visible: false, ...(cwdOfRow(req, l.row) ? { cwd: cwdOfRow(req, l.row)! } : {}) }, { ...env, ANTHROPIC_MODEL: model, FANOUT_DEPTH: String(depth + 1) });
@@ -248,7 +288,7 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
           } else { l.row.spawnOk = false; l.row.status = "failed"; l.row.endedAt = Date.now(); }
         }
         launchedAll.push(l);
-        settles.push(settleUnit(env, home, req.runKey, l, timeoutMs));
+        settles.push(settleUnit(env, home, l, timeoutMs));
       }
       await Promise.all(settles);
       writeLedger(home, req.runKey, rows, priorReceipt, spent);
@@ -272,8 +312,10 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
     return { rows: finalRows, receipt };
   } finally {
     for (const l of launchedAll) {
-      releaseLease(l.lease);
-      if (l.row.displayMode === "headless" && l.row.pid !== undefined) await despawnAgent(l.row.id).catch(() => {});
+      // FN9: confirm the child is gone before releasing its slot. A failed/unconfirmed despawn keeps the lease bound to
+      // the child pid (acquireLease reaps it when the child dies) rather than freeing capacity while the child still runs.
+      if (l.row.displayMode === "headless" && l.row.pid !== undefined && pidAlive(l.row.pid)) await despawnAgent(l.row.id).catch(() => {});
+      if (l.row.pid === undefined || !pidAlive(l.row.pid)) { releaseLease(l.lease); l.lease = null; }
     }
     // FN4: reap ONLY the zone we opened, in finally (exception-safe); a failed close leaves a durable cleanup todo.
     if (zone && zoneId && canReapZone(zone, new Set([req.runKey]))) {
@@ -292,10 +334,10 @@ const promptOfRow = (req: FanoutRequest, row: LedgerRow): string => unitOfRow(re
 const cwdOfRow = (req: FanoutRequest, row: LedgerRow): string | undefined => unitOfRow(req, row).cwd;
 
 // Settle one launched unit: classify from REAL exit evidence (FN8), despawn/close on timeout, release its lease.
-async function settleUnit(env: NodeJS.ProcessEnv, home: string, runKey: string, l: Launched, timeoutMs: number): Promise<void> {
+async function settleUnit(env: NodeJS.ProcessEnv, home: string, l: Launched, timeoutMs: number): Promise<void> {
   const row = l.row;
   if (row.status !== "running") { releaseLease(l.lease); l.lease = null; return; }
-  const out = row.outputPtr ?? outFile(home, runKey, row.key);
+  const out = row.outputPtr!; // always set at registration (FN8 unique per-launch path)
   const outputPresent = (): boolean => { try { return existsSync(out) && statSync(out).size > 0; } catch { return false; } };
   try {
     if (row.displayMode === "headless") {
@@ -319,8 +361,9 @@ async function settleUnit(env: NodeJS.ProcessEnv, home: string, runKey: string, 
     row.status = "failed"; // FN8: an exception is never a success
   } finally {
     row.endedAt = Date.now();
-    releaseLease(l.lease);
-    l.lease = null;
+    // FN9: free capacity ONLY when the child is confirmed gone. A timeout despawn that did not kill it leaves the
+    // child alive — keep the lease bound to its pid (acquireLease reaps the slot when the child actually dies).
+    if (row.pid === undefined || !pidAlive(row.pid)) { releaseLease(l.lease); l.lease = null; }
   }
 }
 
