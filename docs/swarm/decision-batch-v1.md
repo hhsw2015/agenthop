@@ -51,6 +51,15 @@ Frozen so `3e097dfe` (console render) can consume the files directly. Code: `pac
 > pid-bearing credential, never an identity-less empty dir: release RESTORES its own named file if the final rmdir faults, and a
 > failed identity-publish drops the empty dir it just made — so a faulted holder is reclaimed by own/dead pid on retry, while a
 > LIVE in-flight (genuinely empty) dir still stays `contended`.
+>
+> **round-10 (R25, @f0f0697):** DB-R7 hardened against a COMPENSATION that itself faults. round-9's "restore our named file on a
+> failed rmdir" cannot run when the lock dir ALSO turns unwritable mid-cleanup (or when the publish failed before any file could
+> be written), leaving an identity-less empty dir that `acquire` could never tell from a live in-flight one. Fixed with a pre-mkdir
+> HOLD-INTENT credential `consume.lockd.hold.<pid>.<nonce>`, written in the batch dir while it is still writable: it survives a
+> cleanup that can no longer touch the lock dir and names the faulter's pid. An empty lock dir is reclaimed iff NO hold-intent of a
+> LIVE FOREIGN pid exists (faulted ⇒ dead/own intent ⇒ reclaim and continue the original verdict; live ⇒ alive intent ⇒ contend),
+> so a faulted empty dir recovers while a live one is never stolen. DB-N2 (nit): if the orphan `.sent` proof write faults AFTER a
+> good send, a retry re-delivers — orphan signalling is AT-LEAST-ONCE; the coordinator dedups by the stable update id (digest).
 
 ## Orphan recovery (R25) — formal boundary
 
@@ -67,7 +76,9 @@ FAULTS leaves no proof and PROPAGATES, so a retry re-sends exactly one (a pre-se
 Concurrent double-send is prevented by running every emit UNDER the consume lock (the terminal path takes it too), NOT by a marker;
 the per-update `.sent` proof then dedups across retries, so a later DIFFERENT update (new digest) is never blocked by an earlier
 one, and the consumed verdict never re-signals. A decision whose digest EQUALS the consumed verdict's is already fulfilled ⇒ no
-signal.
+signal. Delivery is AT-LEAST-ONCE (DB-N2): if the `.sent` proof write FAULTS after a good send, a retry re-delivers the same
+digest — a duplicate re-batch signal, never a lost one (a lost signal is unrecoverable; a duplicate is not). The coordinator is
+responsible for idempotent re-batching keyed on the stable update id (the content digest in `taskRef`/the signal).
 
 ## Files (under `$HOME/.agenthop/console/decision-batches/<batchId>/`)
 
@@ -88,10 +99,13 @@ signal.
   proof of sent). A lock held with no `notified.sent` ⇒ `openBatch` returns UNCERTAIN (throws) rather than re-ping or silently skip.
 - `consume.lockd/` — the per-batch exclusive consume lock (a DIRECTORY, atomic mkdir), holder identity = the single file inside
   named `<pid>.<nonce>` (vm-ssh `withIdLock` pattern). Reclaim removes ONLY a dead holder's exact-named file (never a successor's);
-  release removes ONLY our own named file and never throws. If release cannot drop the now-empty dir (parent unwritable), it
-  RESTORES its own named file so the leftover carries a recognizable pid — reclaimed by own/dead pid on a later consume; a failed
-  identity-publish likewise drops the empty dir it made. A genuinely EMPTY (identity-less) dir is a LIVE in-flight acquisition and
-  is never reclaimed ⇒ an explicit `contended` receipt (so a faulted holder recovers, a live one is never stolen).
+  release removes ONLY our own named file and never throws. A PUBLISHED holder (one identity file) is reclaimed iff dead/own. An
+  EMPTY lock dir is the brief mkdir→publish window: reclaimable iff NO `consume.lockd.hold.*` of a LIVE FOREIGN pid exists (see
+  below) — so a faulted empty dir recovers while a LIVE in-flight one is never stolen (`contended`).
+- `consume.lockd.hold.<pid>.<nonce>` — a HOLD-INTENT credential written in the batch dir BEFORE the mkdir and removed after
+  release. Because it is written while the batch dir is still writable, it SURVIVES a compensation that can no longer touch the
+  lock dir (parent/lock dir turned unwritable mid-cleanup, or a publish that faulted before any identity could be written) and
+  names the faulter's pid — the recognizable credential that makes an empty lock dir recoverable without stealing a live acquirer.
 - `orphan-<digest>.sent` — per-update proof-of-sent, written only AFTER the orphan re-batch signal is delivered. Dedups re-emits of
   the same content digest across retries; its absence after a faulted send is what lets a retry re-send exactly one.
 
