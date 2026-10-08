@@ -33,3 +33,7 @@ Scales the adversarial-review seat pool to queue depth (DHH baseline audit #5: r
 - presence/idle + the actual spawn primitive are injected (SeatState) — the pure core does not read them itself.
 
 Counterexamples welcome against the scale truth table, the amendment-① eligibility, the amendment-② band, and the hysteresis/debounce gates. 0/0 to sign off.
+
+## SIGNED OFF — `8029fc4` (codex:happycapy, 0 REMAIN)
+
+All three P2 CLOSED across cfa15fc → fea133f → 8029fc4 (3 rounds): P2-1 absent-priority fail-closed, P2-2 null-prototype per-seat counts, P2-3 round-trippable ids (validated in parser + both write entries). selftests 51/51, tsc 0, 17/17 reviewer probes. Sign-off bounds: pure core + parsers + write-guard static checks; live wiring / real seat spawn-despawn / budget gate belong to the future caller; autoscale NOT enabled (SWARM_REVIEW_AUTOSCALE dormant). Merge/install/enable remain separate approval gates (coordinator + user) — NOT pushed/merged.
