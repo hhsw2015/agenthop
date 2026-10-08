@@ -81,6 +81,21 @@ t("idempotent (same in -> same out)", JSON.stringify(reconcile({ boardUnits: 2, 
   t("PE2: dead reclaimed", acts.some((a) => a.kind === "reclaim" && a.reason === "non-live"));
   t("PE2: urgent spawn restores floor despite dwell", acts.some((a) => a.kind === "spawn" && (a as any).urgent === true && a.n === 1));
 }
+// --- PE2 (round-3): dead capacity ABOVE floor is urgently replaced; NEW growth stays dwell-gated ---
+{
+  // floor=1, want=2 (ceil(4/2)), one alive + one dead, in dwell: urgently replace the dead one (n=1), not just to floor.
+  const a1 = reconcile({ boardUnits: 4, fanoutMachines: 0 }, [mv("a"), mv("dead", { live: false })], CFG, 0);
+  t("PE2b: dead-above-floor urgently replaced in dwell (n=1)", a1.some((x) => x.kind === "spawn" && (x as any).urgent === true && x.n === 1));
+  // two dead, want=3, floor=1, in dwell: urgently recover the 2 that died; the 3rd (new growth) waits for dwell.
+  const a2 = reconcile({ boardUnits: 6, fanoutMachines: 0 }, [mv("d1", { live: false }), mv("d2", { live: false })], CFG, 0);
+  t("PE2b: both dead urgently recovered, growth withheld (n=2)", a2.some((x) => x.kind === "spawn" && (x as any).urgent === true && x.n === 2));
+  // pure growth, NO deaths, in dwell: nothing urgent — the scale waits for dwell (regression guard).
+  const a3 = reconcile({ boardUnits: 6, fanoutMachines: 0 }, [mv("a"), mv("b")], CFG, 0); // want=3, 2 live, 0 dead
+  t("PE2b: pure growth (no deaths) stays dwell-gated", a3.every((x) => x.kind !== "spawn"));
+  // demand dropped below the dead count: only `want` replaced, surplus dead NOT replaced.
+  const a4 = reconcile({ boardUnits: 2, fanoutMachines: 0 }, [mv("d1", { live: false }), mv("d2", { live: false })], { ...CFG, floor: 0 }, 0); // want=1
+  t("PE2b: demand-drop replaces only want, surplus dead unreplaced (n=1)", a4.some((x) => x.kind === "spawn" && x.n === 1) && !a4.some((x) => x.kind === "spawn" && x.n > 1));
+}
 
 // --- PE3: duplicate ids don't double-count / overwrite / fabricate surplus ---
 t("PE3: binpack dedupes id (placed == assignment sum)", (() => { const p = binPack(5, [{ id: "a", freeCapacity: 2 }, { id: "a", freeCapacity: 2 }]); return p.placed === 2 && p.assignments["a"] === 2; })());
@@ -92,6 +107,18 @@ t("PE4: infinite demand -> hold (no spawn Infinity)", (() => { const a = reconci
 t("PE4: NaN demand -> hold (not 'at desired')", reconcile({ boardUnits: NaN, fanoutMachines: 0 }, [mv("a")], CFG, 999).every((x) => x.kind === "hold" && x.reason === "invalid demand"));
 t("PE4: floor=1.5 -> hold (non-integer count)", reconcile({ boardUnits: 2, fanoutMachines: 0 }, [mv("a")], { ...CFG, floor: 1.5 }, 999).every((x) => x.kind === "hold"));
 t("PE4: perMachineCapacity 0 -> hold", reconcile({ boardUnits: 2, fanoutMachines: 0 }, [mv("a")], { ...CFG, perMachineCapacity: 0 }, 999).every((x) => x.kind === "hold"));
-t("PE4: desiredCount never returns Infinity", Number.isFinite(desiredCount({ boardUnits: Infinity, fanoutMachines: 0 }, 2)) && desiredCount({ boardUnits: Infinity, fanoutMachines: 0 }, 2) === 0);
+// desiredCount never fabricates: invalid or overflowing demand -> NaN (never 0, never Infinity).
+t("PE4: desiredCount NaN on infinite board", Number.isNaN(desiredCount({ boardUnits: Infinity, fanoutMachines: 0 }, 2)));
+t("PE4: desiredCount NaN on finite-input overflow (1e308/1e-308)", Number.isNaN(desiredCount({ boardUnits: 1e308, fanoutMachines: 0 }, 1e-308)));
+t("PE4: desiredCount NaN on non-integer fanout (no silent 1.5->1)", Number.isNaN(desiredCount({ boardUnits: 0, fanoutMachines: 1.5 }, 2)));
+// --- PE4 (round-3): finite inputs can still overflow; non-integer fanout must not fabricate 'at desired' ---
+{
+  // board 1e308 / cap 1e-308 overflows the ratio; the old code produced spawn Infinity, now an explicit hold.
+  const over = reconcile({ boardUnits: 1e308, fanoutMachines: 0 }, [mv("a")], { ...CFG, perMachineCapacity: 1e-308 }, 999);
+  t("PE4b: finite-input overflow -> hold, no spawn Infinity", over.some((x) => x.kind === "hold") && over.every((x) => x.kind !== "spawn"));
+  // fanout 1.5 must not be floored to 1 and then reported 'at desired' with one live machine.
+  const frac = reconcile({ boardUnits: 0, fanoutMachines: 1.5 }, [mv("a")], CFG, 999);
+  t("PE4b: non-integer fanout -> hold 'invalid demand' (not floored, not at-desired)", frac.every((x) => x.kind === "hold" && x.reason === "invalid demand"));
+}
 
 console.log("all placement-engine selftests passed");

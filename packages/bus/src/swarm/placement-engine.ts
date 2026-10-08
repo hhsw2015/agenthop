@@ -67,12 +67,14 @@ export interface Demand {
 
 /** Desired machine count = max(ceil(board work / per-machine capacity), fanout machines). Pure. */
 export function desiredCount(d: Demand, perMachineCapacity: number): number {
-  // Guard non-finite/invalid inputs so a direct caller never gets Infinity/NaN (reconcile is the explicit-hold gate).
-  const cap = Number.isFinite(perMachineCapacity) && perMachineCapacity > 0 ? perMachineCapacity : 0;
-  const board = Number.isFinite(d.boardUnits) && d.boardUnits > 0 ? d.boardUnits : 0;
-  const byBoard = cap > 0 ? Math.ceil(board / cap) : 0;
-  const byFanout = Number.isFinite(d.fanoutMachines) ? Math.max(0, Math.floor(d.fanoutMachines)) : 0;
-  return Math.max(byBoard, byFanout);
+  // Counts of machines are integers; a demand that is illegal or overflows a safe integer yields NaN (a clear "not a
+  // valid count"), NEVER a fabricated 0 or an Infinity — the consumer (reconcile) turns NaN into an explicit hold. (PE4)
+  const cap = Number.isFinite(perMachineCapacity) && perMachineCapacity > 0 ? perMachineCapacity : NaN;
+  const board = Number.isFinite(d.boardUnits) && d.boardUnits >= 0 ? d.boardUnits : NaN;
+  const fanout = Number.isInteger(d.fanoutMachines) && d.fanoutMachines >= 0 ? d.fanoutMachines : NaN; // machine count is whole (no silent 1.5→1 floor)
+  if (Number.isNaN(cap) || Number.isNaN(board) || Number.isNaN(fanout)) return NaN;
+  const want = Math.max(Math.ceil(board / cap), fanout);
+  return Number.isSafeInteger(want) ? want : NaN; // e.g. board 1e308 / cap 1e-308 overflows the ratio -> NaN, not Infinity
 }
 
 /**
@@ -134,11 +136,13 @@ export function reconcile(d: Demand, machines: readonly MachineView[], cfg: Reco
   for (const [k, v] of [["reclaimIdleSec", cfg.reclaimIdleSec], ["expiringSec", cfg.expiringSec], ["minDwellSec", cfg.minDwellSec]] as const) {
     if (!finiteNonNeg(v)) return [{ kind: "hold", reason: `invalid ${k}` }];
   }
-  if (!finiteNonNeg(d.boardUnits) || !finiteNonNeg(d.fanoutMachines)) return [{ kind: "hold", reason: "invalid demand" }];
+  if (!finiteNonNeg(d.boardUnits)) return [{ kind: "hold", reason: "invalid demand" }];
+  if (!(Number.isInteger(d.fanoutMachines) && d.fanoutMachines >= 0)) return [{ kind: "hold", reason: "invalid demand" }]; // PE4: a machine count must be a whole number (1.5 is not floored into a fabricated demand)
   if (!finiteNonNeg(sinceLastActionSec)) return [{ kind: "hold", reason: "invalid clock" }];
 
   const uniq = dedupeById(machines); // PE3: duplicates must not double-count or fabricate surplus
   const want = Math.max(desiredCount(d, cfg.perMachineCapacity), cfg.floor);
+  if (!Number.isSafeInteger(want)) return [{ kind: "hold", reason: "demand overflow" }]; // PE4: finite inputs (board/cap) can still overflow a safe integer
   const live = uniq.filter((m) => m.live);
   const dwellOk = sinceLastActionSec >= cfg.minDwellSec;
   const actions: Action[] = [];
@@ -161,10 +165,19 @@ export function reconcile(d: Demand, machines: readonly MachineView[], cfg: Reco
   // expiring KEPT live → snapshot+rebuild (a surplus-reclaimed one is already handled, so it is not rebuilt).
   for (const m of live) if (!handled.has(m.id) && m.remainingSec != null && m.remainingSec <= cfg.expiringSec) { actions.push({ kind: "rebuild", id: m.id, reason: "expiring" }); handled.add(m.id); }
 
-  // spawn shortfall. Below FLOOR = URGENT necessary-capacity recovery (ungated — PE2); growth above floor is dwell-gated.
+  // spawn shortfall. Growth (dwell-gated) spawns the full shortfall; inside the dwell window only NECESSARY capacity is
+  // restored URGENTLY — the floor PLUS capacity lost to death (machines that existed and died), capped at `want`. NEW
+  // demand above the already-committed fleet stays dwell-gated. established = total records this tick (live + dead) =
+  // the fleet that was committed before deaths; want-beyond-established is growth, want-within is dead-replacement. (PE2)
   if (live.length < want) {
-    if (dwellOk) actions.push({ kind: "spawn", n: want - live.length });
-    else if (live.length < cfg.floor) actions.push({ kind: "spawn", n: cfg.floor - live.length, urgent: true });
+    if (dwellOk) {
+      actions.push({ kind: "spawn", n: want - live.length });
+    } else {
+      const established = uniq.length; // live + dead records = capacity that was already committed before this tick
+      const urgentTarget = Math.max(cfg.floor, Math.min(want, established));
+      const urgentN = urgentTarget - live.length;
+      if (urgentN > 0) actions.push({ kind: "spawn", n: urgentN, urgent: true });
+    }
   }
 
   if (actions.length === 0) actions.push({ kind: "hold", reason: dwellOk ? "at desired" : "min-dwell" });
