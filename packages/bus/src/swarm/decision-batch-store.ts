@@ -70,13 +70,36 @@ function existsStrict(file: string): boolean {
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return false; throw e; }
 }
 
-/** The inode of `file`, or null if absent (ENOENT). Any other error (EACCES/…) THROWS. Used to BIND a consume to the exact
- *  claim INSTANCE it read: a concurrent consumer that overwrites decisions.json → the stable claim path replaces the inode, and
- *  the old reader must neither commit its stale verdict nor archive the newer instance (DB-R3-P1-1). */
-function claimIno(file: string): number | null {
-  try { return statSync(file).ino; }
-  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
+/** The per-batch EXCLUSIVE consume lock (R24). The ENTIRE critical section — claim-replacement, recovery, read, and the terminal
+ *  commit — runs while this lock is held, so no concurrent consume or write can replace the claim mid-flight. That makes the
+ *  terminal marker FINAL (never a create-then-retract, which could EACCES-fail and seal a stale verdict) and makes recovery
+ *  non-overwriting of a successor — the two R24 failure modes ("过时裁决不提交" / "有效裁决可恢复") collapse because there is no
+ *  concurrent replacement to race. A would-be consumer/writer that cannot take the lock gets an explicit receipt (contended /
+ *  "busy"); its decision stays in decisions.json, recoverable on the next consume once the lock frees. */
+function consumeLockPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "consume.lock"); }
+
+/** True if the lock may be RECLAIMED: its recorded holder pid is a DEAD process (ESRCH — a crashed consumer), or it is OUR OWN
+ *  pid (a prior hold in this process whose release failed, e.g. unlink hit a transient read-only dir — a consume is never
+ *  re-entrant within one process, so our own leftover lock is ours to retake). An unreadable/odd lock, or another LIVE pid
+ *  (EPERM/alive), is NOT reclaimable. */
+function lockReclaimable(lock: string): boolean {
+  const h = readJsonOrNull(lock, (raw) => (raw !== null && typeof raw === "object" && typeof (raw as Record<string, unknown>).pid === "number" ? (raw as { pid: number }) : null));
+  if (!h) return false;
+  if (h.pid === process.pid) return true; // our own leftover (a release that faulted) — reclaim it
+  try { process.kill(h.pid, 0); return false; } // another live holder
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ESRCH"; } // dead ⇒ reclaimable; EPERM alive
 }
+
+/** Acquire the exclusive per-batch consume lock. Returns true if held by us. If a DEAD holder left it behind (crash mid-consume),
+ *  steal it once. A live holder ⇒ false (caller returns a contended/busy receipt). Throws only on a real FS write fault. */
+function acquireConsumeLock(home: string, batchId: string): boolean {
+  const lock = consumeLockPath(home, batchId);
+  const content = JSON.stringify({ pid: process.pid, atMs: Date.now() });
+  if (createExclusiveAtomic(lock, content) === "created") return true;
+  if (lockReclaimable(lock)) { try { unlinkSync(lock); } catch { /* raced */ } return createExclusiveAtomic(lock, content) === "created"; }
+  return false;
+}
+function releaseConsumeLock(home: string, batchId: string): void { try { unlinkSync(consumeLockPath(home, batchId)); } catch { /* already gone */ } }
 
 export function newBatchId(): string { return `batch-${randomBytes(8).toString("hex")}`; }
 
@@ -123,9 +146,9 @@ function writeBatch(home: string, batch: DecisionBatch): void {
 export function writeDecisions(home: string, doc: DecisionsDoc): void {
   const valid = validDecisionsDoc(doc);
   if (!valid) throw new Error("writeDecisions: refusing to persist an invalid decisions doc");
-  // DB-P1-3 (write boundary): a batch consumed once is DONE — refuse to persist fresh decisions into it. Remaining/deferred
-  // items are re-asked by the coordinator under a NEW batchId (per the contract), so re-submitting here can only be a
-  // double-decision attempt. Combined with the consume-side marker check, re-submission can never re-release a verdict.
+  // DB-P1-3 (write boundary): a batch consumed once is DONE — refuse to persist fresh decisions into it. A concurrent write
+  // DURING a consume is intentionally ALLOWED (not locked): the newer decision must be able to win (R24: valid verdict
+  // recoverable / latest wins), and the consume RE-CLAIMS the latest decisions.json right before it commits.
   if (existsStrict(consumedMarkerPath(home, valid.batchId))) throw new Error(`writeDecisions: batch ${valid.batchId} already consumed — remaining items are re-batched under a new batchId`);
   writeJsonAtomic(decisionsPath(home, valid.batchId), valid);
 }
@@ -187,7 +210,7 @@ function notifyOnce(home: string, batchId: string, owner: string, itemCount: num
   writeJsonAtomic(sent, { to: notifyTo, notifiedAtSec: nowSec });
 }
 
-export type ConsumeResult = { resolved: ResolvedDecision[]; undecided: DecisionItem[]; unknownIds: string[]; consumed: boolean };
+export type ConsumeResult = { resolved: ResolvedDecision[]; undecided: DecisionItem[]; unknownIds: string[]; consumed: boolean; contended?: boolean };
 
 /**
  * Consume the user's decisions for a batch EXACTLY ONCE across concurrent consumers, sequential re-submits, AND a fault +
@@ -203,51 +226,46 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
   if (!batch) throw new Error(`consumeDecisions: no such batch ${batchId}`);
   const none: ConsumeResult = { resolved: [], undecided: batch.items, unknownIds: [], consumed: false };
   const consumedMarker = consumedMarkerPath(home, batchId);
-  const claim = claimPath(home, batchId);
-  const rejected = rejectedClaimPath(home, batchId);
-  // DB-P1-3: a batch consumed once is TERMINAL — consumed.json only ever appears COMPLETE (createExclusiveAtomic), so its mere
-  // presence is a true "done"; a half-written marker can never seal the batch (DB-R2-P1-1).
-  if (existsStrict(consumedMarker)) return none;
-  // Acquire a claim, in order of preference:
-  //  (1) a FRESH decisions.json — claim it (rename → the STABLE claim name) so the LATEST decision wins (DB-R3-P1-1);
-  //  (2) the stable claim — RESUME a prior consume that faulted before the terminal marker;
-  //  (3) a VALID doc stranded in decisions-rejected-claim.json — RECOVER it. A mis-archive under contention (or a restore that
-  //      faulted, DB-R2-P1-1 / DB-R3-P1-1) can leave a real decision in the rejected slot; a genuinely-foreign doc (batchId≠dir)
-  //      is left there. Recovering a bound doc keeps a valid verdict from being stranded after an archive fault.
-  let haveClaim = false;
-  if (existsStrict(decisionsPath(home, batchId))) {
-    try { renameSync(decisionsPath(home, batchId), claim); haveClaim = true; }
-    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; } // a racer took decisions.json first ⇒ fall through
-  }
-  if (!haveClaim && existsStrict(claim)) haveClaim = true;
-  if (!haveClaim && existsStrict(rejected)) {
-    const r = readJsonOrNull(rejected, validDecisionsDoc);
-    if (r && r.batchId === batchId) { try { renameSync(rejected, claim); haveClaim = true; } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; } }
-  }
-  if (!haveClaim) return none; // nothing to consume (no decisions yet / a racer already claimed+closed)
-  // DB-R3-P1-1 instance binding: capture the inode of the claim we are about to READ. A concurrent consumer that overwrites
-  // decisions.json → claim replaces this inode; we must then neither commit our stale read nor archive the newer instance.
-  const readIno = claimIno(claim);
-  if (readIno === null) return none; // the claim vanished (a racer took and closed it)
-  const doc = readJsonOrNull(claim, validDecisionsDoc); // reads exactly these bytes; a concurrent replace lands on a NEW inode
-  // DB-P1-1: the claimed doc MUST be bound to this batch. A misbound/corrupt claim yields NO actionable verdict and is set aside
-  // (decisions-rejected-claim.json). If the archive actually moved a DIFFERENT (newer) inode — a concurrent claim slipped into the
-  // path during the rename — restore it so the newer decision is recovered on retry (via source (3) above).
-  if (!doc || doc.batchId !== batchId) {
-    try {
-      renameSync(claim, rejected);
-      if (claimIno(rejected) !== readIno) { try { renameSync(rejected, claim); } catch { /* a racer re-took it */ } }
-    } catch { /* claim raced away */ }
-    return { ...none, unknownIds: doc ? doc.decisions.map((d) => d.id) : [] };
-  }
-  const res = resolveBatch(batch, doc);
-  // DB-R3-P1-1 (atomic bind, not a stat race): the terminal commit must act on the SAME instance we read. A bare stat-then-link
-  // is a TOCTOU (the claim can be replaced between the check and the link). Instead COMMIT, then VERIFY the claim is still our
-  // instance; if a newer decision replaced it (so we would have sealed a superseded verdict), UNDO the just-created marker and
-  // abort — the newer claim is consumed on a retry. "exists" ⇒ another consumer already committed ⇒ execute nothing.
-  if (createExclusiveAtomic(consumedMarker, JSON.stringify({ batchId, decidedAtSec: doc.decidedAtSec, consumedAtMs: Date.now() })) === "exists") return none;
-  if (claimIno(claim) !== readIno) { try { unlinkSync(consumedMarker); } catch { /* already gone */ } return none; }
-  return { ...res, consumed: true };
+  if (existsStrict(consumedMarker)) return none; // terminal (fast path, no lock needed — consumed.json is final)
+  // R24: take the per-batch EXCLUSIVE lock for the WHOLE critical section. While held, no concurrent consume or write can
+  // replace the claim — so the read we commit is the claim we hold (no stale commit), the terminal marker is created ONCE and
+  // is FINAL (no create-then-retract that could EACCES-seal a stale verdict), and recovery never overwrites a successor
+  // (there is no concurrent successor). A consumer that cannot take the lock returns an explicit `contended` receipt.
+  if (!acquireConsumeLock(home, batchId)) return { ...none, contended: true };
+  try {
+    if (existsStrict(consumedMarker)) return none; // re-check under the lock
+    const claim = claimPath(home, batchId);
+    const dpath = decisionsPath(home, batchId);
+    // Claim the LATEST decision, under the lock: a FRESH decisions.json first (it supersedes any stale claim — we hold the lock);
+    // else RESUME a prior in-progress claim; else RECOVER a VALID doc stranded in the rejected slot (foreign — batchId≠dir —
+    // left there). writeDecisions is NOT locked, so a newer decision can be written concurrently — we handle that below.
+    if (existsStrict(dpath)) {
+      renameSync(dpath, claim);
+    } else if (!existsStrict(claim)) {
+      const rejected = rejectedClaimPath(home, batchId);
+      if (existsStrict(rejected)) {
+        const r = readJsonOrNull(rejected, validDecisionsDoc);
+        if (r && r.batchId === batchId) renameSync(rejected, claim); // recover a valid stranded decision
+      }
+    }
+    // R24 (newer wins): a writer may have landed a FRESHER decisions.json while we acquired/recovered. Claim it now so the
+    // LATEST user decision supersedes an older claim/recovery — a valid newer verdict is never lost to an older one.
+    if (existsStrict(dpath)) renameSync(dpath, claim);
+    if (!existsStrict(claim)) return none; // nothing to consume (no decisions yet)
+    const doc = readJsonOrNull(claim, validDecisionsDoc);
+    // DB-P1-1: the claimed doc MUST be bound to this batch; a misbound/corrupt claim yields NO actionable verdict and is set
+    // aside. Under the lock this archive always moves OUR instance (no concurrent replace ⇒ no mis-archive, no restore dance).
+    if (!doc || doc.batchId !== batchId) {
+      try { renameSync(claim, rejectedClaimPath(home, batchId)); } catch { /* raced away */ }
+      return { ...none, unknownIds: doc ? doc.decisions.map((d) => d.id) : [] };
+    }
+    const res = resolveBatch(batch, doc);
+    // FINAL terminal commit (temp+link, complete-or-nothing). Under the lock the claim cannot have changed since the read, so
+    // this is never stale and never needs retraction. EFBIG/EACCES on the write THROWS with the claim intact ⇒ finally releases
+    // the lock, a retry re-acquires it and resumes the SAME claim (no user resubmit, no partial seal).
+    createExclusiveAtomic(consumedMarker, JSON.stringify({ batchId, decidedAtSec: doc.decidedAtSec, consumedAtMs: Date.now() }));
+    return { ...res, consumed: true };
+  } finally { releaseConsumeLock(home, batchId); }
 }
 
 /** List batchIds that have a batch.json (console index). Best-effort; unreadable ⇒ []. */
