@@ -18,7 +18,7 @@
 // env: AGENTHOP_TEAM, AGENTHOP_RELAY, SWARM_WORK_REPO (git URL / path), SWARM_CAP (3), SWARM_BUDGET_SEC (3480),
 //      SWARM_HANDOFF_LEAD_SEC (180), SWARM_LAUNCH (scripts/swarm-launch.sh), AH_HOME, SWARM_SELF.
 
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync, statSync, unlinkSync, openSync, readSync, fstatSync, closeSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -58,7 +58,8 @@ import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control
 import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
 import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
-import { superviseMember, decideLiveSentinel, type WatchOps, type SentinelEvent, type MemberObs } from "../packages/bus/src/swarm/live-sentinel.js";
+import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
+import { AlertDedup, alertKey, classifyMemberHealth, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
@@ -616,6 +617,13 @@ async function main(): Promise<void> {
   mkdirSync(path.dirname(DISPATCHER_LOCK), { recursive: true });
   const releaseLock = acquireSingleFlight(DISPATCHER_LOCK);
   if (!releaseLock) { log("dispatcher: another active dispatcher holds the single-flight lock — refusing to start a second"); return; }
+  // F44-⑤: defense-in-depth OVER the single-flight lock — refuse to start if another dispatcher LOOP process tree is already
+  // running (the lock can be free while a lingering `npx tsx scripts/swarm-dispatch.ts` wrapper still lives). Excludes our own
+  // process tree. Fail-soft: if the process table can't be read, we rely on the lock alone (never block a legit start on a ps error).
+  try {
+    const procs = parsePsOutput(execSync("ps -axo pid=,ppid=,command=", { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 }));
+    if (isDispatcherAlreadyRunning(procs, process.pid)) { log("dispatcher: another dispatcher process tree is already running (npx/tsx wrapper past the lock) — refusing to start a second"); releaseLock(); return; }
+  } catch (e) { log(`dispatcher: process-tree self-check skipped (ps unavailable: ${e instanceof Error ? e.message : e}) — relying on the single-flight lock`); }
   process.on("exit", () => releaseLock());
   for (const sig of ["SIGTERM", "SIGINT"] as const) process.on(sig, () => { releaseLock(); process.exit(0); });
 
@@ -938,6 +946,10 @@ async function main(): Promise<void> {
         if (curr === null) return; // a transient sampling error ⇒ hold the last snapshot, retry next tick (P2-3)
         let anyFailed = false;
         for (const ev of detectWatchEvents(snap, curr)) {
+          // F44-⑥: board changes always notify; the PROGRESS-mtime ping is self-noise (the coordinator is now PROGRESS's main
+          // writer, so its own edits echo back) — OFF by default, opt-in via SWARM_WATCH_PROGRESS. A skipped event still lets the
+          // snapshot advance (it is intentionally consumed, not a delivery failure).
+          if (!shouldEmitWatchNotice(ev.kind, process.env.SWARM_WATCH_PROGRESS)) continue;
           const res = notifyCoordinator(
             ev.kind === "board" ? `board: ${ev.item} → ${ev.state}${ev.who ? ` by ${ev.who}` : ""} (durable change — reconcile)` : `PROGRESS.md changed (mtime ${ev.mtimeMs})`,
             ev.kind === "board" ? { taskRef: ev.item, title: "board change" } : { taskRef: "PROGRESS", title: "progress change" },
@@ -1166,7 +1178,7 @@ async function main(): Promise<void> {
   // Per-box dedup (inboxStallAlertedAt) keyed by the STABLE box id — NOT the message text — so a self-induced backlog count
   // does NOT bypass dedup (F40-5): at most one alert per box per SWARM_NOTIFY_DEDUP_MS, then a bounded reminder. The coordinator
   // box is NOT excluded (that would hide real business mail stranded in it); it just gets the same bounded treatment.
-  const inboxStallAlertedAt = new Map<string, number>(); // boxKey -> last-alerted ms
+  const inboxDedup = new AlertDedup(NOTIFY_DEDUP_MS); // F44-①: per-box event-identity dedup + cooldown (stable box id, NOT message text)
   const runInboxSentinel = (): void => {
     try {
       const stats = scanInboxes(HOME);
@@ -1187,12 +1199,11 @@ async function main(): Promise<void> {
         if (w.kind !== "entity") continue; // ambiguous/unknown identity ⇒ no legacy expansion (direct sid already credited)
         for (const k of legacyInboxKeys(proj, { id: sid, stableId: sid, title: "", tool: w.entity.tool ?? "", cwd: w.entity.cwd ?? "", pid: 0 })) owned.add(inboxDirName(k));
       }
-      const now = Date.now();
-      for (const [k, t] of inboxStallAlertedAt) if (now - t >= NOTIFY_DEDUP_MS) inboxStallAlertedAt.delete(k); // bound the map
       const thMin = Math.floor(INBOX_STALL_SEC / 60);
       for (const a of detectStalledInboxes(stats, (key) => owned.has(key), INBOX_STALL_SEC, nowSec())) {
-        if ((inboxStallAlertedAt.get(a.key) ?? -Infinity) > now - NOTIFY_DEDUP_MS) continue; // already alerted this box this window
-        inboxStallAlertedAt.set(a.key, now);
+        const dk = alertKey(a.key, "inbox-stall");
+        if (!inboxDedup.shouldFire(dk)) continue; // already alerted this box this window
+        inboxDedup.record(dk);
         notifyCoordinator(
           `[inbox-sentinel] STALL: inbox ${a.key} has ${a.unclaimedCount} unclaimed message(s) older than ${thMin}min and NO live session is draining it`,
           { taskRef: `inbox-stall:${a.key}`, title: "inbox stall" },
@@ -1212,7 +1223,7 @@ async function main(): Promise<void> {
   // double-notify (benign: one notice per id, no wrong action); blocked does not double (a stuck member cannot self-report).
   const REAL_AGENT_STATES: AgentState[] = ["idle", "working", "blocked", "done"]; // waitable states (no "unknown")
   const sentinelWatchers = new Map<string, AbortController>(); // herdr member -> its running watcher's abort handle
-  const sentinelAlertedAt = new Map<string, number>();         // `${member}\0${kind}` -> last-alerted ms (dedup)
+  const sentinelDedup = new AlertDedup(NOTIFY_DEDUP_MS); // F44-①: per member+kind event-identity dedup + cooldown (incl. ghost-daemon one-time)
   const sentinelPending = new Map<string, { text: string; taskRef: string; title: string }>(); // LS4: failed deliveries ⇒ retried each tick
   const sentinelCfg = { fakeDeathSec: SENTINEL_FAKEDEATH_SEC, idleTimeoutSec: SENTINEL_IDLE_SEC, reArmSec: SENTINEL_IDLE_SEC, doneWakeSec: SENTINEL_IDLE_SEC, sampleSec: SENTINEL_SAMPLE_SEC, backoffSec: SENTINEL_SAMPLE_SEC };
   // LS4: deliver with a durable pending-retry. A FAILED notifyCoordinator does NOT consume the dedup slot AND the rendered
@@ -1221,15 +1232,13 @@ async function main(): Promise<void> {
   const sentinelDeliver = (dk: string, msg: { text: string; taskRef: string; title: string }): void => {
     const result = notifyCoordinator(msg.text, { taskRef: msg.taskRef, title: msg.title });
     if (result === "failed") { sentinelPending.set(dk, msg); return; } // keep the obligation for the next tick
-    sentinelAlertedAt.set(dk, Date.now());
+    sentinelDedup.record(dk);
     sentinelPending.delete(dk);
   };
   const sentinelRetryPending = (): void => { for (const [dk, msg] of sentinelPending) sentinelDeliver(dk, msg); }; // LS4: auto-retry each tick
   const sentinelEscalate = async (ev: SentinelEvent): Promise<void> => {
-    const nowMs = Date.now();
-    for (const [k, t] of sentinelAlertedAt) if (nowMs - t >= NOTIFY_DEDUP_MS) sentinelAlertedAt.delete(k); // bound the map
-    const dk = `${ev.member}\u0000${ev.kind}`;
-    if ((sentinelAlertedAt.get(dk) ?? -Infinity) > nowMs - NOTIFY_DEDUP_MS) return; // already surfaced this member+kind this window
+    const dk = alertKey(ev.member, ev.kind);
+    if (!sentinelDedup.shouldFire(dk)) return; // already surfaced this member+kind this window (F44-①)
     if (sentinelPending.has(dk)) return; // already queued for retry (LS4) — don't rebuild/double-send
     let msg: { text: string; taskRef: string; title: string };
     if (ev.kind === "blocked") {
@@ -1241,6 +1250,9 @@ async function main(): Promise<void> {
         options: [{ label: "读屏后裁决", consequence: "批准/拒绝由授权方按实际界面回注(blocked 态不可用 prompt,须按 UI 选择 send-keys 等);或中止/另派" }], // N1: prompt is rejected for a blocked agent
       });
       msg = { text: doc.body.text, taskRef: `approval:${ev.member}`, title: doc.body.title };
+    } else if (ev.kind === "ghost-daemon") {
+      // F44-③: a non-roster stray presence sitting idle — likely a leftover/ghost daemon, not a registered member. One-time (deduped by member+kind).
+      msg = { text: `[live-sentinel] ghost-daemon: 游离 presence ${ev.member} idle >= ${ev.idleSec}s 且不在册(非 roster 成员)— 疑似残留守护进程,一次性告警`, taskRef: `sentinel:ghost-daemon:${ev.member}`, title: "ghost daemon" };
     } else {
       const detail = ev.kind === "fake-death" ? `status working but no terminal output for >= ${ev.silentSec}s` : `idle with no check-in for >= ${ev.idleSec}s`;
       msg = { text: `[live-sentinel] ${ev.kind}: 成员 ${ev.member} — ${detail}`, taskRef: `sentinel:${ev.kind}:${ev.member}`, title: `member ${ev.kind}` };
@@ -1277,18 +1289,28 @@ async function main(): Promise<void> {
       for (const name of identified) if (!sentinelWatchers.has(name)) startWatcher(name);                 // new identified member ⇒ watch it
       for (const [name, ac] of sentinelWatchers) if (!identified.has(name)) { ac.abort(); sentinelWatchers.delete(name); } // gone ⇒ stop its watcher
       // Fallback: bus-presence-only members (not herdr-identified) ⇒ per-tick self-reported-status check (no screen).
+      // F44-③④: roster + in-flight aware. A member is "on the roster" if the swarm resolves its identity OR it owns live work;
+      // a stray presence that is neither, sitting idle, is a ghost daemon (③, one-time). A roster member idle with NO in-flight
+      // work is HEALTHY (④, no alert); only an in-flight owner gone idle is a disconnect candidate. `blocked` is a real
+      // self-report and still escalates regardless of roster.
       const now = nowSec();
-      const obs: MemberObs[] = [];
+      const idlog2 = readIdentityLog(HOME);
+      const proj2 = buildProjection(idlog2.events, idlog2.corruption);
+      const activeOwners = new Set<string>();
+      for (const b of Object.values(liveEntities(loadControlLog(CONTROL_LOG_DIR)))) {
+        if (b.put === "wait") { const o = (b as Extract<ChangeBody, { put: "wait" }>).wait.owner; if (o) activeOwners.add(o); }
+      }
       for (const sid of listSessions(HOME)) {
         if (identified.has(sid)) continue; // best-effort exclusion (exact name match) — see the herdr-name↔sid mapping note above
         const st = readStatusFile(HOME, sid);
         if (!st) continue;
-        obs.push({ member: sid, reportedStatus: st.state, ...(st.state === "idle" && Number.isFinite(st.seq) ? { idleSec: Math.max(0, now - Math.floor(st.seq / 1000)) } : {}) });
-      }
-      for (const a of decideLiveSentinel(obs, { idleTimeoutSec: SENTINEL_IDLE_SEC })) {
-        void sentinelEscalate(a.kind === "blocked"
-          ? { kind: "blocked", member: a.member, explain: "(presence-only member; no herdr screen/explain)" }
-          : { kind: "idle-timeout", member: a.member, idleSec: SENTINEL_IDLE_SEC });
+        if (st.state === "blocked") { void sentinelEscalate({ kind: "blocked", member: sid, explain: "(presence-only member; no herdr screen/explain)" }); continue; }
+        if (st.state !== "idle" || !Number.isFinite(st.seq)) continue;
+        const idleSec = Math.max(0, now - Math.floor(st.seq / 1000));
+        const onRoster = activeOwners.has(sid) || whois(proj2, sid).kind === "entity";
+        const health = classifyMemberHealth({ onRoster, hasInFlight: activeOwners.has(sid), idleSec, presenceSeen: true }, { idleTimeoutSec: SENTINEL_IDLE_SEC });
+        if (health === "disconnect-candidate") void sentinelEscalate({ kind: "idle-timeout", member: sid, idleSec });
+        else if (health === "ghost-daemon") void sentinelEscalate({ kind: "ghost-daemon", member: sid, idleSec });
       }
     } catch (e) { log(`live sentinel failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };

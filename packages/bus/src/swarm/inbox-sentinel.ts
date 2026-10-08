@@ -10,6 +10,7 @@
  */
 import { readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import { isValidInboxKey } from "./sentinel-denoise.js";
 
 /** Is `pid` a LIVE process (kill(pid,0): ok / EPERM ⇒ alive; ESRCH / any other errno ⇒ not alive). An "alive" claim is IN
  *  FLIGHT (a live drainer holds it) and must not be counted or stolen; a NOT-alive one (dead ESRCH, or an unverifiable errno)
@@ -59,7 +60,9 @@ export function detectStalledInboxes(stats: InboxStat[], isOwnedByLive: (key: st
 export function scanInboxes(home: string, pidAlive: (pid: number) => boolean = defaultPidAlive): InboxStat[] {
   const root = path.join(home, ".agenthop", "inbox");
   let dirs: string[];
-  try { dirs = readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name); }
+  // F44-②: only scan LEGIT box dirs (a swarm stableId). A non-conforming dir (_archive, quarantine, a dotfile, the sanitize
+  // fallback, stray garbage) is bookkeeping/debris, never a real stranded mailbox — scanning it would raise a false stall.
+  try { dirs = readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory() && isValidInboxKey(d.name)).map((d) => d.name); }
   catch { return []; }
   const out: InboxStat[] = [];
   for (const key of dirs) {
