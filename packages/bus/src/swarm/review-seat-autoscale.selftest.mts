@@ -6,6 +6,7 @@ import {
   scaleDecision,
   buildReviewSeatBirthCert,
   parseReviewFileName,
+  isValidReviewId,
   type ReviewRecord,
   type SeatState,
   type ScaleConfig,
@@ -28,6 +29,10 @@ t("live filter drops dead seat", filterLiveRecords([rec("a", "dead", "alice")], 
 const q = queueDepth([rec("a", "s1", "x"), rec("b", "s1", "x"), rec("c", "s2", "x")]);
 t("queueDepth total", q.totalOpen === 3);
 t("queueDepth per-seat", q.perSeat["s1"] === 2 && q.perSeat["s2"] === 1);
+// T55-P2-2: seat names that collide with Object.prototype keys must count as plain keys (null-proto map)
+const qp = queueDepth([rec("a", "toString", "x"), rec("b", "constructor", "x"), rec("c", "__proto__", "x"), rec("d", "toString", "x")]);
+t("T55-P2-2: prototype-key seats count numerically", qp.perSeat["toString"] === 2 && qp.perSeat["constructor"] === 1 && qp.perSeat["__proto__"] === 1);
+t("T55-P2-2: Σ per-seat === totalOpen", Object.values(qp.perSeat).reduce((a, b) => a + b, 0) === qp.totalOpen && qp.totalOpen === 4);
 
 // --- canRouteToSeat: amendment ② slow-start band ---
 t("fresh seat blocks P0", canRouteToSeat({ priority: 0 }, { completedReviews: 0 }) === false);
@@ -80,5 +85,17 @@ t("parse done", parseReviewFileName("t5-5.happycapy.done.json")?.done === true);
 t("parse done seat/ticket", JSON.stringify(parseReviewFileName("t5-5.happycapy.done.json")) === JSON.stringify({ ticket: "t5-5", seat: "happycapy", done: true }));
 t("parse non-json -> null", parseReviewFileName("notes.txt") === null);
 t("parse missing seat -> null", parseReviewFileName("ticketonly.json") === null);
+
+// T55-P2-3: filename encoding round-trips for conforming ids; non-conforming ids rejected (not misparsed)
+t("isValidReviewId: kebab ok", isValidReviewId("remote-herdr-view") && isValidReviewId("t5_5"));
+t("isValidReviewId: dot rejected", !isValidReviewId("a.b"));
+t("isValidReviewId: 'done' reserved", !isValidReviewId("done"));
+t("isValidReviewId: empty rejected", !isValidReviewId(""));
+for (const [tk, st2] of [["remote-herdr-view", "codex-work"], ["t5-5", "happycapy"]] as const) {
+  t(`T55-P2-3 round-trip open ${tk}.${st2}`, JSON.stringify(parseReviewFileName(`${tk}.${st2}.json`)) === JSON.stringify({ ticket: tk, seat: st2, done: false }));
+  t(`T55-P2-3 round-trip done ${tk}.${st2}`, JSON.stringify(parseReviewFileName(`${tk}.${st2}.done.json`)) === JSON.stringify({ ticket: tk, seat: st2, done: true }));
+}
+t("T55-P2-3: seat 'done' open file not misread as done-marker", parseReviewFileName("x.done.json") === null);
+t("T55-P2-3: dotted ticket rejected (no mis-split)", parseReviewFileName("a.b.c.json") === null);
 
 console.log("all review-seat-autoscale selftests passed");

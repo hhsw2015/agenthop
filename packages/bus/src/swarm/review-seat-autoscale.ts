@@ -69,9 +69,11 @@ export function filterLiveRecords(records: readonly ReviewRecord[], liveAuthors:
   return records.filter((r) => !r.done && liveAuthors.has(r.author) && liveSeats.has(r.seat));
 }
 
-/** queue-depth = count of open records, total and per-seat. Expects already-live-filtered records. Pure. */
+/** queue-depth = count of open records, total and per-seat. Expects already-live-filtered records. Uses a
+ *  NULL-prototype map so a seat named `toString`/`constructor`/`__proto__` counts as a plain own key and never reads an
+ *  inherited property (T55-P2-2); Σ per-seat === totalOpen for any seat names. Pure. */
 export function queueDepth(openRecords: readonly ReviewRecord[]): QueueSignal {
-  const perSeat: Record<SeatId, number> = {};
+  const perSeat: Record<SeatId, number> = Object.create(null);
   for (const r of openRecords) perSeat[r.seat] = (perSeat[r.seat] ?? 0) + 1;
   return { totalOpen: openRecords.length, perSeat };
 }
@@ -155,8 +157,16 @@ export function buildReviewSeatBirthCert(n: number, cwd: string): SeatBirthCert 
   };
 }
 
+/** A review ticket/seat id must be a dot-free token and not the reserved word `done`, so the `<ticket>.<seat>[.done].json`
+ *  filename round-trips unambiguously (T55-P2-3): a dot would mis-split, and a seat literally named `done` would collide
+ *  with the done-marker. The writer rejects non-conforming ids; the parser rejects non-conforming filenames. Pure. */
+const REVIEW_ID = /^[A-Za-z0-9_-]+$/;
+export function isValidReviewId(s: string): boolean {
+  return typeof s === "string" && REVIEW_ID.test(s) && s !== "done";
+}
+
 /** Parse a review-queue filename `<ticket>.<seat>.json` / `<ticket>.<seat>.done.json`. seat = last token before
- *  (optional) `.done`; ticket = the rest. null when not a review file. Pure. */
+ *  (optional) `.done`; ticket = the rest. null when not a review file OR either id is non-conforming (T55-P2-3). Pure. */
 export function parseReviewFileName(name: string): { ticket: string; seat: string; done: boolean } | null {
   if (!name.endsWith(".json")) return null;
   let stem = name.slice(0, -".json".length);
@@ -167,7 +177,10 @@ export function parseReviewFileName(name: string): { ticket: string; seat: strin
   }
   const dot = stem.lastIndexOf(".");
   if (dot <= 0 || dot === stem.length - 1) return null; // need both a ticket and a seat
-  return { ticket: stem.slice(0, dot), seat: stem.slice(dot + 1), done };
+  const ticket = stem.slice(0, dot);
+  const seat = stem.slice(dot + 1);
+  if (!isValidReviewId(ticket) || !isValidReviewId(seat)) return null; // non-round-trippable id ⇒ reject
+  return { ticket, seat, done };
 }
 
 // ============================================================================================================
@@ -210,8 +223,11 @@ export async function readReviewLedger(dir: string = reviewQueueDir()): Promise<
   return out;
 }
 
-/** Author writes a review request (open record). Atomic temp+rename. */
+/** Author writes a review request (open record). Rejects non-conforming ids BEFORE writing (T55-P2-3). Atomic temp+rename. */
 export async function markReviewOpen(rec: Omit<ReviewRecord, "done">, dir: string = reviewQueueDir()): Promise<void> {
+  if (!isValidReviewId(rec.ticket) || !isValidReviewId(rec.seat)) {
+    throw new Error(`invalid review id (ticket/seat must match ${REVIEW_ID} and not be 'done'): ${rec.ticket}.${rec.seat}`);
+  }
   await mkdir(dir, { recursive: true });
   const file = join(dir, `${rec.ticket}.${rec.seat}.json`);
   const tmp = `${file}.${process.pid}.tmp`;
@@ -219,7 +235,8 @@ export async function markReviewOpen(rec: Omit<ReviewRecord, "done">, dir: strin
   await rename(tmp, file);
 }
 
-/** Reviewer's terminal verdict: atomic rename open → `.done`. */
+/** Reviewer's terminal verdict: atomic rename open → `.done`. Rejects non-conforming ids (T55-P2-3). */
 export async function markReviewDone(ticket: string, seat: SeatId, dir: string = reviewQueueDir()): Promise<void> {
+  if (!isValidReviewId(ticket) || !isValidReviewId(seat)) throw new Error(`invalid review id: ${ticket}.${seat}`);
   await rename(join(dir, `${ticket}.${seat}.json`), join(dir, `${ticket}.${seat}.done.json`));
 }
