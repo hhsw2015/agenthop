@@ -2,7 +2,7 @@
 //   npx tsx packages/bus/src/swarm/fanout.selftest.mts
 // Each pre-study pit (docs/swarm/fanout-prestudy.md §2) is a NAMED counterexample below.
 import {
-  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, degradeDisplay, resumeVerdict, validSpent,
+  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, degradeDisplay, resumeVerdict, validSpent, leaseOccupied,
   effectiveTier, elapsedTimedOut, isSafeRunKey, isTerminal, markAborted, newLedgerRow, nextReceipt, parseDepth,
   planResume, progress, reconcileOrphans, reduceUnits, reservationFits, reserveValid, validateFanoutRequest,
   validBudgetTicket, validRoiEstimate, widthClass, widthGate, zoneName, type FanoutUnit, type LedgerRow, type UnitResult,
@@ -202,6 +202,19 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("NaN usd -> invalid", validSpent({ tokens: 0, usd: NaN }) === false);
   t("Infinity -> invalid", validSpent({ tokens: Infinity, usd: 0 }) === false);
   t("null -> invalid", validSpent(null) === false);
+}
+
+// --- FN9: lease slot frees only on a confirmed terminal, NEVER merely on driver death ---
+{
+  const P = (o: Partial<{ childAlive: boolean; driverAlive: boolean; zonePending: boolean }>) => ({ childAlive: false, driverAlive: false, zonePending: false, ...o });
+  t("null lease -> not occupied", leaseOccupied(null, P({})) === false);
+  t("headless: child alive -> occupied (survives dead driver)", leaseOccupied({ childPid: 10, pid: 1 }, P({ childAlive: true, driverAlive: false })) === true);
+  t("headless: child dead -> free (even if driver alive)", leaseOccupied({ childPid: 10, pid: 1 }, P({ childAlive: false, driverAlive: true })) === false);
+  t("visible: driver alive -> occupied", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: true })) === true);
+  t("visible: driver DEAD but zone still pending -> occupied (survives driver exit, the FN9 fix)", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: false, zonePending: true })) === true);
+  t("visible: driver dead AND zone gone -> free (close fact)", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: false, zonePending: false })) === false);
+  t("unbound (no child/zone): held while driver lives", leaseOccupied({ pid: 1 }, P({ driverAlive: true })) === true);
+  t("unbound: driver dead -> free", leaseOccupied({ pid: 1 }, P({ driverAlive: false })) === false);
 }
 
 // --- FN7: width evidence must be real + bound to the run (not a bare flag) ---

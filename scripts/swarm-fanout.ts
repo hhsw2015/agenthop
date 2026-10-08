@@ -20,7 +20,7 @@ import {
 import {
   admitDepth, canReapZone, chooseDisplayMode, classifyExit, degradeDisplay, effectiveTier,
   elapsedTimedOut, markAborted, newLedgerRow, nextReceipt, parseDepth, planResume, reconcileOrphans, reduceUnits,
-  reservationFits, reserveValid, resumeVerdict, validSpent, validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthGate, zoneName,
+  leaseOccupied, reservationFits, reserveValid, resumeVerdict, validSpent, validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthGate, zoneName,
   type AggregateReceipt, type DisplayMode, type FanoutBudget, type FanoutRequest, type FanoutUnit, type FanoutTier,
   type LedgerRow, type Spent, type UnitResult,
 } from "../packages/bus/src/swarm/fanout.js";
@@ -99,6 +99,12 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 const readFileOrNull = (p: string): string | null => { try { return readFileSync(p, "utf8"); } catch { return null; } };
 const readJsonOrNull = (p: string): unknown => { const s = readFileOrNull(p); if (s === null) return null; try { return JSON.parse(s); } catch { return null; } };
 const outputPresentAt = (p: string | undefined): boolean => { if (!p) return false; try { return existsSync(p) && statSync(p).size > 0; } catch { return false; } };
+// FN2: the registry exit code for a SPECIFIC launch, matched by launchId ONLY — a pid is recyclable, so another launch
+// that reused this pid (and happens to sort first in an unordered readRegistry) must NEVER confirm this one. No launchId
+// -> no registry evidence. Used by EVERY settle entry (live settle + resume reconcile) so terminal state is always bound
+// to the same launch, not just on the resume path.
+const exitForLaunch = (home: string, launchId: string | undefined): number | null | undefined =>
+  launchId === undefined ? undefined : readRegistry(home).find((r) => r.launchId === launchId)?.exitCode;
 
 // FN2: reconcile a prior RUNNING row against REAL terminal evidence before a resume decides anything. A crash can
 // leave a row "running" whether it never launched, is still live, already finished, or launched-but-unconfirmed —
@@ -106,10 +112,9 @@ const outputPresentAt = (p: string | undefined): boolean => { if (!p) return fal
 // (done on 0+output, else failed-terminal/retry) | no terminal record at all (uncertain -> quarantine, never re-run).
 function reconcileRunning(home: string, pr: LedgerRow): "alive" | "done" | "failed-terminal" | "uncertain" {
   const alive = pr.pid !== undefined && pidAlive(pr.pid);
-  // FN2: bind terminal evidence to the SAME launch by launchId ONLY — a pid is recyclable, so another launch that
-  // reused this pid and exited 0 must NOT be read as this row's result. No launchId (or none matches) -> no registry
-  // evidence; fall to the launch-bound rc sidecar (its path is unique per launch, FN8), else uncertain.
-  let exit: number | null | undefined = !alive && pr.id !== undefined ? readRegistry(home).find((r) => r.launchId === pr.id)?.exitCode : undefined;
+  // FN2: terminal evidence is bound to the SAME launch (exitForLaunch = launchId match only). No launchId/none matches
+  // -> no registry evidence; fall to the launch-bound rc sidecar (its path is unique per launch, FN8), else uncertain.
+  let exit: number | null | undefined = alive ? undefined : exitForLaunch(home, pr.id);
   if (!alive && (exit === undefined || exit === null) && pr.outputPtr) {
     const rc = readFileOrNull(rcFile(pr.outputPtr));
     if (rc !== null && /^\d+$/.test(rc.trim())) exit = Number(rc.trim());
@@ -138,11 +143,16 @@ function acquireLease(home: string, cap: number, label: string): string | null {
   try {
     for (const f of readdirSync(dir)) {
       if (!f.endsWith(".lease")) continue;
-      const rec = readJsonOrNull(path.join(dir, f)) as { pid?: number; childPid?: number } | null;
-      // FN9: a lease binds the ACTUAL execution. Once a child pid is recorded, the slot is held while the CHILD
-      // lives (even if the driver died); before a child is bound, it is held while the driver lives.
-      const alive = rec ? (rec.childPid !== undefined ? pidAlive(rec.childPid) : typeof rec.pid === "number" && pidAlive(rec.pid)) : false;
-      if (!alive) rmSync(path.join(dir, f), { force: true });
+      const rec = readJsonOrNull(path.join(dir, f)) as { pid?: number; childPid?: number; zoneId?: string } | null;
+      // FN9: a lease binds the ACTUAL execution — a slot frees ONLY on a confirmed terminal, never merely on driver death
+      // (leaseOccupied, pure). A close-FAILED visible zone keeps its slot across the driver's exit while its cleanup-pending
+      // todo exists; freed only once the zone is confirmed gone.
+      const occupied = leaseOccupied(rec, {
+        childAlive: rec?.childPid !== undefined && pidAlive(rec.childPid),
+        driverAlive: typeof rec?.pid === "number" && pidAlive(rec.pid),
+        zonePending: rec?.zoneId !== undefined && existsSync(cleanupPendingPath(home, rec.zoneId)),
+      });
+      if (!occupied) rmSync(path.join(dir, f), { force: true });
     }
     if (readdirSync(dir).filter((f) => f.endsWith(".lease")).length >= cap) return null;
     const file = path.join(dir, `${process.pid}-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.lease`);
@@ -157,6 +167,13 @@ function bindLeaseChild(file: string | null, childPid: number): void {
   if (!file) return;
   const rec = readJsonOrNull(file) as Record<string, unknown> | null;
   if (rec) writeJsonAtomic(file, { ...rec, childPid });
+}
+// FN9: bind a VISIBLE lease to its ZONE, so its capacity obligation survives the driver's exit — acquireLease holds the
+// slot while the zone's cleanup-pending todo exists (a close-failed zone), freeing it only once the zone is confirmed gone.
+function bindLeaseZone(file: string | null, zoneId: string): void {
+  if (!file) return;
+  const rec = readJsonOrNull(file) as Record<string, unknown> | null;
+  if (rec) writeJsonAtomic(file, { ...rec, zoneId });
 }
 
 // ---- width evidence (FN7): env carries a POINTER to the evidence file, never the evidence itself ----
@@ -268,6 +285,7 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
         for (let a = 0; a < 30 && !(lease = acquireLease(home, globalCap, l.row.key)); a++) await sleep(1000);
         if (!lease) { bi = runnable.length; break; } // no admission -> stop launching (remaining stay running -> aborted)
         l.lease = lease;
+        if (mode !== "headless" && zoneId !== undefined) bindLeaseZone(lease, zoneId); // FN9: visible slot survives driver exit, tied to the zone's lifetime
         spent.tokens += reserve.tokens; spent.usd += reserve.usd; // FN1: reserve BEFORE spawn
         if (!writeLedger(home, req.runKey, rows, priorReceipt, spent)) { releaseLease(lease); l.lease = null; bi = runnable.length; break; } // durable spend; fail -> no launch
         l.row.startedAt = Date.now();
@@ -352,10 +370,11 @@ async function settleUnit(env: NodeJS.ProcessEnv, home: string, l: Launched, tim
     if (row.displayMode === "headless") {
       const started = row.startedAt ?? Date.now();
       for (;;) {
-        const rec = readRegistry(home).find((r) => r.launchId === row.id || (row.pid !== undefined && r.pid === row.pid));
-        const exited = rec?.exitCode !== undefined && rec?.exitCode !== null;
-        const dead = row.pid !== undefined && !pidAlive(row.pid);
-        if (exited || dead) { row.status = classifyExit({ spawnOk: row.spawnOk ?? true, exitCode: rec?.exitCode ?? null, outputPresent: outputPresent() }); break; }
+        // FN2: exit evidence bound to THIS launch by launchId ONLY (never a recycled-pid match from an unordered registry).
+        const ec = exitForLaunch(home, row.id);
+        const exited = ec !== undefined && ec !== null;
+        const dead = row.pid !== undefined && !pidAlive(row.pid); // liveness only; a dead pid with no THIS-launch exit -> classifyExit(null) = failed (never a false done)
+        if (exited || dead) { row.status = classifyExit({ spawnOk: row.spawnOk ?? true, exitCode: ec ?? null, outputPresent: outputPresent() }); break; }
         if (elapsedTimedOut(started, Date.now(), timeoutMs)) { await despawnAgent(row.id).catch(() => {}); row.status = "timeout"; break; }
         await sleep(2000);
       }

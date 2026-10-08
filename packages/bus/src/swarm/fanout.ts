@@ -336,6 +336,17 @@ export function validSpent(s: unknown): boolean {
   return ok(o.tokens) && ok(o.usd);
 }
 
+// FN9: is a lease's slot still OCCUPIED (must not be reaped)? A slot frees only on a confirmed terminal, never merely on
+// driver death. headless -> while the CHILD lives (survives the driver). visible (a zoneId bound) -> while the driver
+// lives OR the zone is still open (a cleanup-pending todo exists for it), so a close-FAILED visible slot survives the
+// driver's exit and is freed only once the zone is confirmed gone. Neither bound yet -> while the driver lives.
+export function leaseOccupied(rec: { pid?: number; childPid?: number; zoneId?: string } | null, probe: { childAlive: boolean; driverAlive: boolean; zonePending: boolean }): boolean {
+  if (rec === null) return false;
+  if (rec.childPid !== undefined) return probe.childAlive;
+  if (rec.zoneId !== undefined) return probe.driverAlive || probe.zonePending;
+  return probe.driverAlive;
+}
+
 // FN7: the width ROI tier needs a REAL estimate bound to this run (env may carry a pointer to it, never be the
 // evidence). A valid estimate names the runKey and gives positive speedup- and cost-ratios.
 // A positive FINITE number — FN7: Infinity/NaN must never pass an amount/quota/ratio check.
