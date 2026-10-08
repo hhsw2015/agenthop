@@ -44,7 +44,7 @@ When the VM recycles (Railway self-destructs ~1h; `vm-ssh down` is a no-op for r
 - 32/32 selftests (full 3×3 truth table incl. the `unreachable`⊃`reachable` substring trap) + tsc 0.
 
 **IO sweep (`sweepRecycled`) — exercised by live runs, three independent safety layers:**
-- ephemeral-gated: acts only on machines whose label ∈ `ephemeralLabels` (the vm-ssh VMs this flow provisioned) — a permanent SSH box is never touched. This set is the seam to ③ (boot-template records the vm-ssh↔machine linkage).
+- ephemeral-gated: acts only on machines whose label is a key of the `ephemeral` linkage map (the vm-ssh VMs this flow provisioned) — a permanent SSH box is never touched. VM presence is matched by the registered `vmId`, NOT the label (they can differ — RH3). Seam to ③ (the linkage ledger).
 - fail-closed: `vm-ssh ls` unavailable ⇒ vmListed=null ⇒ every verdict `unknown` ⇒ nothing removed.
 - dry-run default (`act` defaults false): the sweep only REPORTS unless explicitly enabled.
 - recycled + act ⇒ `herdr machine remove <id>` then `herdr workspace close <workspace_id>`.
@@ -59,7 +59,7 @@ When the VM recycles (Railway self-destructs ~1h; `vm-ssh down` is a no-op for r
 One-shot remote bootstrap, built as pure builders + an ephemeral-linkage ledger (16/16 selftests, tsc 0):
 - `buildBootstrapScript()` → the `vm-ssh up --init` payload: `curl -fsSL https://herdr.dev/install.sh | sh` (herdr must match the local version or `machine add` refuses) + the `CAPACITY_PROBE_CMD` to stdout + a documented requirement that remote agent launchers `exec -a claude <real-binary>` (herdr-args-fix F③: herdr identifies by argv0 basename).
 - `buildCapacityMetadataArgs(workspaceId, capacity)` → `herdr workspace report-metadata --source remote-herdr-view --token capacity=<n> <workspaceId>` (CLI shape verified vs live 0.9.3). Local flow: probe → `capacityFromProbe` (remote-capacity.ts) → this → metadata.
-- **Ephemeral linkage ledger** (`~/.agenthop/swarm/remote-herdr/ephemeral.json`, atomic write): records machine label ↔ vm-ssh id on provision. `linkageLabels(readLinkage())` IS the `ephemeralLabels` the ② sweep acts within — this closes the ②↔③ seam (without it ② stays inert, by design: a recycled VM is indistinguishable from a down permanent box).
+- **Ephemeral linkage ledger** (`~/.agenthop/swarm/remote-herdr/ephemeral.json`, atomic write): records machine label ↔ vm-ssh id on provision. `parseLinkage` validates EACH entry (an invalid body grants no cleanup authority — RH4). `readLinkage()` IS the `ephemeral` map the ② sweep acts within — this closes the ②↔③ seam (without it ② stays inert, by design: a recycled VM is indistinguishable from a down permanent box).
 - Live acceptance (real `vm-ssh up --init` → `machine add` → metadata write) rides a future authorized VM; no-spend now.
 
 ## Workspace-per-machine wiring (the ②↔③ seam, one line)
@@ -67,8 +67,8 @@ One-shot remote bootstrap, built as pure builders + an ephemeral-linkage ledger 
 The recycle sweep consumes the linkage ledger directly — no new entrypoint needed:
 ```ts
 import { sweepRecycled } from "./remote-recycle.js";
-import { readLinkage, linkageLabels } from "./remote-bootstrap.js";
-await sweepRecycled({ ephemeralLabels: linkageLabels(await readLinkage()), act: /* dormant default false */ });
+import { readLinkage } from "./remote-bootstrap.js";
+await sweepRecycled({ ephemeral: await readLinkage(), act: /* dormant default false */ });
 ```
 One machine = one workspace (named by the machine label); ③ provisions + links, ② sweeps recycled links + closes the workspace by label. Enabling `act` is the single flip (dormant-ahead-of-use, like SWARM_BOARD_ADMIT).
 

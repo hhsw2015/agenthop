@@ -77,8 +77,12 @@ export function parseMachineList(raw: string): SavedMachine[] {
   return out;
 }
 
-/** Parse `vm-ssh ls --json` (array of `{id,...}`) into the set of live VM ids/labels. Unparseable/non-array ⇒ null
- *  (signals "vm-ssh ls unavailable" to the caller, which must then keep every machine). Pure. */
+/**
+ * Parse `vm-ssh ls --json` (array of `{id,...}`) into the set of live VM ids. The set is used as POSITIVE
+ * "the VM is gone" evidence (absence ⇒ recycled), so a PARTIAL set is dangerous: a dropped row would read as a missing
+ * VM and recycle a live machine (RH2). Therefore ANY malformed element (not an object, or without a non-empty string
+ * `id`) ⇒ null ("list unconfirmed — keep every machine"). A legitimate empty array ⇒ empty set (trusted: no VMs). Pure.
+ */
 export function parseVmSshIds(json: string): Set<string> | null {
   let v: unknown;
   try {
@@ -89,35 +93,63 @@ export function parseVmSshIds(json: string): Set<string> | null {
   if (!Array.isArray(v)) return null;
   const ids = new Set<string>();
   for (const r of v) {
-    const id = (r as { id?: unknown })?.id;
-    if (typeof id === "string" && id) ids.add(id);
+    if (!r || typeof r !== "object") return null; // can't confirm the list's shape ⇒ don't trust it
+    const id = (r as { id?: unknown }).id;
+    if (typeof id !== "string" || !id) return null; // a row without an identity ⇒ set is not complete
+    ids.add(id);
   }
   return ids;
 }
 
-/**
- * Reachability from `herdr machine status <id>` output, as a TRI-STATE (true/false/null). null ⇒ inconclusive ⇒ the
- * verdict keeps the machine. Keyword scan on the raw text (works whether or not --json wraps it); the down-patterns are
- * checked BEFORE the up-patterns because "reachable" is a substring of "unreachable". A `unknown machine` reply means
- * the machine is not even saved (already removed) → null, caller skips it.
- *
- * NOTE (honesty): the exact reachable wording of a LIVE saved machine was not captured offline (no VM provisioned —
- * no-spend). These patterns are a best-effort set; the fail-closed design makes a wrong guess safe (it keeps, never
- * wrongly removes). Confirm/trim the wording on the next live run. Pure.
- */
-export function parseReachable(raw: string): boolean | null {
-  const s = (raw ?? "").toLowerCase();
-  if (!s.trim()) return null;
-  if (s.includes("unknown machine")) return null; // not saved → not our concern
-  if (/unreachable|unable to reach|cannot reach|not reachable|timed out|timeout|refused|no route|offline|failed|error/.test(s)) {
-    return false;
+/** Pull a boolean reachability flag out of a parsed `machine status --json` value (top-level or array[0]). A top-level
+ *  `reachable`/`online` boolean wins; null when absent/non-boolean. Pure. */
+function reachableFlag(v: unknown): boolean | null {
+  const o = Array.isArray(v) ? v[0] : v;
+  if (!o || typeof o !== "object") return null;
+  for (const k of ["reachable", "online"] as const) {
+    const f = (o as Record<string, unknown>)[k];
+    if (typeof f === "boolean") return f;
   }
-  if (/reachable|server is ready|\bready\b|connected|online|\bok\b|healthy|\bup\b/.test(s)) return true;
   return null;
 }
 
-/** Find the workspace_id whose label matches a machine label, from `herdr workspace list` JSON
- *  (`{result:{workspaces:[{workspace_id,label,...}]}}`). null when absent/unparseable. Pure. */
+/**
+ * Reachability from `herdr machine status <id>` output, as a TRI-STATE (true/false/null). false is returned ONLY on
+ * EXPLICIT target-unreachable evidence; execution failures, contradictory text, and anything unrecognized return null
+ * (RH1). This matters because false + VM-absent ⇒ recycled ⇒ removal: a local read error ("permission denied") or a
+ * reachable JSON that merely contains the token `last_error:null` must NOT read as unreachable.
+ *
+ * Order: (1) a structured boolean `reachable` flag wins; (2) `unknown machine` ⇒ null (not saved); (3) EXPLICIT
+ * unreachable phrases ⇒ false, EXPLICIT reachable phrases ⇒ true; (4) both present (contradictory) ⇒ null; (5) neither
+ * ⇒ null. The phrase sets are specific (connection-level), never the bare words `error`/`failed`.
+ *
+ * NOTE (honesty): the exact live wording was not captured offline (no VM, no-spend). Fail-closed (null ⇒ keep) makes a
+ * miss safe. Confirm/trim on the next live run. Pure.
+ */
+export function parseReachable(raw: string): boolean | null {
+  const s = (raw ?? "").trim();
+  if (!s) return null;
+  try {
+    const flag = reachableFlag(JSON.parse(s));
+    if (flag !== null) return flag;
+  } catch {
+    /* not json — fall through to text */
+  }
+  const low = s.toLowerCase();
+  if (low.includes("unknown machine")) return null; // not saved → not our concern
+  const down = /\bunreachable\b|unable to reach|cannot reach|not reachable|connection refused|\btimed out\b|no route to host|host is down|\boffline\b/.test(low);
+  const up = /\breachable\b|server is ready|\bready\b|\bconnected\b|\bonline\b/.test(low);
+  if (down && up) return null; // contradictory → inconclusive
+  if (down) return false;
+  if (up) return true;
+  return null; // execution failure / unrecognized → keep
+}
+
+/**
+ * Find the workspace_id whose label matches a machine label, from `herdr workspace list` JSON
+ * (`{result:{workspaces:[{workspace_id,label,...}]}}`). Returns a workspace id ONLY on a UNIQUE match; an invalid
+ * collection (missing / not an array, e.g. `workspaces:{}`), zero matches, or an AMBIGUOUS >1 match ⇒ null, so we never
+ * close the wrong (or a business) workspace (RH5). Pure. */
 export function workspaceIdForLabel(workspaceListJson: string, label: string): string | null {
   let v: any;
   try {
@@ -125,9 +157,10 @@ export function workspaceIdForLabel(workspaceListJson: string, label: string): s
   } catch {
     return null;
   }
-  const ws: any[] = v?.result?.workspaces ?? [];
-  const hit = ws.find((w) => w?.label === label && typeof w?.workspace_id === "string");
-  return hit ? hit.workspace_id : null;
+  const ws = v?.result?.workspaces;
+  if (!Array.isArray(ws)) return null; // {} / missing ⇒ no close (never throws)
+  const hits = ws.filter((w) => w && w.label === label && typeof w.workspace_id === "string");
+  return hits.length === 1 ? hits[0].workspace_id : null; // unique only; 0 or >1 ⇒ null
 }
 
 // ============================================================================================================
@@ -164,23 +197,26 @@ export interface SweepOutcome {
  * Sweep saved herdr machines for recycled remote VMs and (optionally) clean them up.
  *
  * Safety layers, independent:
- *  - ephemeral-gated: only machines whose label is in `ephemeralLabels` (the vm-ssh VMs THIS flow provisioned) are
- *    even considered — a permanent SSH box is never touched. (The ephemeral set is the seam to ③ boot-template, which
- *    will record the vm-ssh↔machine linkage in workspace metadata; until then the caller supplies it.)
+ *  - ephemeral-gated: only machines whose label is a key of `ephemeral` (the vm-ssh VMs THIS flow provisioned, each
+ *    carrying its registered vmId) are even considered — a permanent SSH box is never touched. This map is the seam to
+ *    ③ boot-template's linkage ledger (pass `readLinkage()` directly).
+ *  - identity-correct: vm presence is checked by the registered `vmId`, NOT the herdr machine label — the two can
+ *    differ, and matching the label would recycle a live machine whose VM is still listed under its real id (RH3).
  *  - two-evidence verdict: recycleVerdict needs unreachable AND absent-from-`vm-ssh ls`.
- *  - fail-closed: if `vm-ssh ls` is unavailable, vmListed=null ⇒ every verdict is unknown ⇒ nothing removed.
+ *  - fail-closed: if `vm-ssh ls` is unavailable/unconfirmed, vmIds=null ⇒ every verdict unknown ⇒ nothing removed.
  *  - dry-run default: `act` defaults to false — the sweep only REPORTS unless explicitly enabled.
  *
  * On a recycled machine with act=true: `herdr machine remove <id>` then `herdr workspace close <workspace_id>` (the
- * workspace whose label == the machine label). Removal is best-effort; a failed close still reports acted with a note.
+ * UNIQUE workspace whose label == the machine label). Removal is best-effort; a failed close still reports acted.
  */
 export async function sweepRecycled(opts: {
-  ephemeralLabels: ReadonlySet<string>;
+  ephemeral: Readonly<Record<string, { vmId: string }>>;
   act?: boolean;
 }): Promise<SweepOutcome[]> {
   const act = opts.act === true;
+  const owns = (label: string) => Object.prototype.hasOwnProperty.call(opts.ephemeral, label);
   const ml = await run(HERDR_BIN, ["machine", "list"]);
-  const machines = parseMachineList(ml.raw).filter((m) => opts.ephemeralLabels.has(m.label));
+  const machines = parseMachineList(ml.raw).filter((m) => owns(m.label));
   if (machines.length === 0) return [];
 
   const ls = await run(VM_SSH_BIN, ["ls", "--json"], 15000);
@@ -190,7 +226,7 @@ export async function sweepRecycled(opts: {
   for (const m of machines) {
     const st = await run(HERDR_BIN, ["machine", "status", m.id, "--json"], 10000);
     const machineReachable = parseReachable(st.raw);
-    const vmListed = vmIds === null ? null : vmIds.has(m.label);
+    const vmListed = vmIds === null ? null : vmIds.has(opts.ephemeral[m.label].vmId); // match by registered vmId (RH3)
     const verdict = recycleVerdict({ machineReachable, vmListed });
 
     if (!shouldRemove(verdict) || !act) {

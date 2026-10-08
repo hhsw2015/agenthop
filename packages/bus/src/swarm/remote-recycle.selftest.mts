@@ -61,4 +61,24 @@ t("workspace: match label -> id", workspaceIdForLabel(wl, "vm-railway-rhv1") ===
 t("workspace: no match -> null", workspaceIdForLabel(wl, "nope") === null);
 t("workspace: garbage -> null", workspaceIdForLabel("x", "a") === null);
 
+// --- RH1 regression: parseReachable only EXPLICIT unreachable -> false; else null (never on error/failed substrings) ---
+t("RH1: 'permission denied' (local read fail) -> null, NOT false", parseReachable("error: permission denied reading config") === null);
+t("RH1: generic 'failure' -> null", parseReachable("local config read failure") === null);
+t("RH1: reachable JSON with last_error:null -> true (not false)", parseReachable('{"reachable":true,"last_error":null}') === true);
+t("RH1: structured reachable:false -> false", parseReachable('{"reachable":false}') === false);
+t("RH1: contradictory (unreachable + reachable) -> null", parseReachable("was unreachable, now reachable") === null);
+t("RH1: bare 'error' token does NOT force false", parseReachable("status report: no error") === null);
+
+// --- RH2 regression: a partial/malformed vm-ssh list -> null (never a partial 'absent' set) ---
+t("RH2: [null,{}] -> null (not empty set)", parseVmSshIds("[null,{}]") === null);
+t("RH2: valid+missing-id rows -> null (not partial set)", parseVmSshIds('[{"id":"a"},{"backend":"x"}]') === null);
+t("RH2: all-valid -> trusted set", (() => { const s = parseVmSshIds('[{"id":"a"},{"id":"b"}]'); return !!s && s.size === 2 && s.has("a"); })());
+t("RH2: legit empty [] -> empty set (trusted)", (() => { const s = parseVmSshIds("[]"); return !!s && s.size === 0; })());
+
+// --- RH5 regression: invalid collection / ambiguous match -> null (no close, no throw) ---
+t("RH5: workspaces:{} -> null (no throw)", workspaceIdForLabel(JSON.stringify({ result: { workspaces: {} } }), "a") === null);
+t("RH5: two same-label -> null (ambiguous)", workspaceIdForLabel(JSON.stringify({ result: { workspaces: [
+  { workspace_id: "w3", label: "dup" }, { workspace_id: "w4", label: "dup" } ] } }), "dup") === null);
+t("RH5: unique match still returns", workspaceIdForLabel(JSON.stringify({ result: { workspaces: [ { workspace_id: "w3", label: "dup" } ] } }), "dup") === "w3");
+
 console.log("all remote-recycle selftests passed");

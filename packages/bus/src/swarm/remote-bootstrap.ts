@@ -32,7 +32,10 @@ export function buildBootstrapScript(opts: { herdrInstallUrl?: string } = {}): s
     "set -eu",
     "# remote-herdr-view ③ boot template — runs on the fresh VM via `vm-ssh up --init`.",
     "# 1. herdr (must match the local version, else local `machine add` refuses).",
-    `curl -fsSL ${url} | sh`,
+    "#    Download THEN run (never pipe curl into a shell): in a pipe the shell sees the installer's exit, not curl's,",
+    "#    so a failed/empty download is swallowed and the box comes up herdr-less but exit 0 (RH6). `set -e`+`&&` stop it.",
+    'herdr_installer="$(mktemp)"',
+    `curl -fsSL ${url} -o "$herdr_installer" && sh "$herdr_installer"`,
     "# 2. capacity probe → stdout; the local add-flow reads it and computes agentCapacity (remote-capacity.ts).",
     CAPACITY_PROBE_CMD,
     "# 3. NOTE: every agent launcher on this box MUST `exec -a claude <real-binary>` so herdr identifies the agent by",
@@ -55,15 +58,32 @@ export interface LinkageEntry {
 }
 export type Linkage = Record<string, LinkageEntry>; // keyed by herdr machine label
 
-/** Parse the linkage file; anything that is not a JSON object ⇒ empty (a fresh/corrupt ledger means "nothing linked",
- *  which keeps ② inert rather than guessing). Pure. */
+/** A value is a valid LinkageEntry only with a non-empty string vmId + string backend + finite createdSec. Pure. */
+export function isLinkageEntry(v: unknown): v is LinkageEntry {
+  if (!v || typeof v !== "object") return false;
+  const e = v as Record<string, unknown>;
+  return typeof e.vmId === "string" && e.vmId.length > 0 && typeof e.backend === "string" && typeof e.createdSec === "number" && Number.isFinite(e.createdSec);
+}
+
+/**
+ * Parse the linkage ledger. The ledger's keys become `ephemeralLabels` — the set of machines the recycle sweep (②) is
+ * ALLOWED to remove — so a key with an invalid body must NOT grant that authority: e.g. `{"permanent-main":null}` must
+ * not make `permanent-main` sweepable (RH4). Each entry is validated; invalid entries are DROPPED (a valid entry
+ * alongside them is still usable). Non-object root / parse error ⇒ empty (nothing linked). Pure.
+ */
 export function parseLinkage(json: string): Linkage {
+  let v: unknown;
   try {
-    const v = JSON.parse(json);
-    return v && typeof v === "object" && !Array.isArray(v) ? (v as Linkage) : {};
+    v = JSON.parse(json);
   } catch {
     return {};
   }
+  if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+  const out: Linkage = {};
+  for (const [label, entry] of Object.entries(v as Record<string, unknown>)) {
+    if (isLinkageEntry(entry)) out[label] = entry; // invalid entry ⇒ no cleanup authority
+  }
+  return out;
 }
 
 /** Add/replace a label's linkage, returning a NEW record (coding-style: never mutate). Pure. */
