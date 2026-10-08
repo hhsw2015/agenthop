@@ -390,10 +390,22 @@ export function parseBoardItemName(file: string): { itemId: string; state: Board
   return null; // unknown / malformed shape — never silently mis-attributed
 }
 
+// BP3/BA4: a board file's identity is VERIFIED only when its filename itemId matches the itemId its BODY hashes to
+// (`boardItemId(jobId, nodeId)`). A forged/mismatched file (the filename claims one itemId, the body is another job's
+// entry) is NOT verified — it must never count as a "live state" that could evict a legit repost tmp (the consumer will
+// reject it on BA2b, so trusting its filename would drop a real obligation and re-post a fresh count-less item).
+export function boardFileIdentityVerified(itemId: string, body: unknown): boolean {
+  if (typeof body !== "object" || body === null) return false;
+  const b = body as { jobId?: unknown; nodeId?: unknown };
+  if (typeof b.jobId !== "string" || typeof b.nodeId !== "string") return false;
+  return boardItemId(b.jobId, b.nodeId) === itemId;
+}
+
 // BP3: adoption decision for an orphaned repost `.tmp` (a crash between a repost's rename-acquire and its rewrite/restore).
-// Restore it to `posted` ONLY when the item is genuinely MISSING — if ANY live board state exists for its itemId (posted
-// already back, or claimed/granted/rejected/done/reclaimed), the item has MOVED ON, so the tmp is stale and must be
-// DROPPED, never revived (reviving a claimed item would make claimed+posted coexist).
+// Restore it to `posted` ONLY when the item is genuinely MISSING — if any BODY-VERIFIED live state exists for its itemId
+// (posted already back, or claimed/granted/rejected/done/reclaimed), the item has MOVED ON, so the tmp is stale and must
+// be DROPPED, never revived (reviving a claimed item would make claimed+posted coexist). `liveItemIds` MUST contain only
+// body-verified itemIds (a forged claim's filename must not evict a real tmp — BP3 round-4 counterexample A).
 export function repostTmpAction(itemId: string, liveItemIds: ReadonlySet<string>): "restore" | "drop" {
   return liveItemIds.has(itemId) ? "drop" : "restore";
 }

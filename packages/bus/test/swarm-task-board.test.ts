@@ -3,7 +3,7 @@ import {
   boardItemsToPost, planBoardWrites, buildGrantBodies, grantWaitId, planClaimAdmission, parseClaimApplication, boardItemId,
   postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName, reclaimedFileName,
   parseBoardItemName, isValidItemId, boardAdmitEnabled, superviseBoardPost, planBoardSupervision, parsePolicyNum,
-  repostTmpAction, suppressPendingReposts,
+  repostTmpAction, suppressPendingReposts, boardFileIdentityVerified,
   type BoardItem, type AdmissionParams, type ExistingBoardFile, type ClaimApplication, type BoardSupervisionPolicy,
 } from "../src/swarm/task-board.js";
 import { commit, entityKeyOf, initialLogState, type ChangeBody, type LogState, type WaitRecord } from "../src/swarm/control-log.js";
@@ -373,5 +373,27 @@ describe("task-board BP3 repost-tmp recovery (crash between acquire + rewrite/re
   test("a successfully-restored (not pending) item is NOT suppressed", () => {
     const post = [{ itemId: "item-a" }, { itemId: "item-b" }];
     expect(suppressPendingReposts(post, new Set())).toEqual(post); // empty pending set -> nothing suppressed
+  });
+});
+
+describe("task-board BP3 round-5 (body-verified eviction + obligation retained under a live/recycled writer pid)", () => {
+  const itemId = boardItemId("J", "a");
+  test("a body whose identity matches the filename itemId is VERIFIED", () => {
+    expect(boardFileIdentityVerified(itemId, { jobId: "J", nodeId: "a" })).toBe(true);
+  });
+  test("counterexample A: a claim whose BODY is another job's entry is NOT verified (cannot evict a legit tmp)", () => {
+    expect(boardFileIdentityVerified(itemId, { jobId: "OTHER", nodeId: "a" })).toBe(false); // body→different itemId
+    expect(boardFileIdentityVerified(itemId, { nodeId: "a" })).toBe(false); // missing jobId
+    expect(boardFileIdentityVerified(itemId, null)).toBe(false);
+    // so liveItemIds (built from VERIFIED bodies only) would NOT contain itemId -> the tmp is restored, not dropped:
+    expect(repostTmpAction(itemId, new Set())).toBe("restore");
+  });
+  test("a verified live state DOES evict (drop) the stale tmp", () => {
+    const live = new Set(boardFileIdentityVerified(itemId, { jobId: "J", nodeId: "a" }) ? [itemId] : []);
+    expect(repostTmpAction(itemId, live)).toBe("drop");
+  });
+  test("counterexample B: an unrestored tmp (live/recycled writer) still suppresses the fresh first post", () => {
+    const post = [{ itemId }, { itemId: boardItemId("J", "b") }];
+    expect(suppressPendingReposts(post, new Set([itemId]))).toEqual([{ itemId: boardItemId("J", "b") }]);
   });
 });

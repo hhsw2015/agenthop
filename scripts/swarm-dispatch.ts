@@ -35,7 +35,7 @@ import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/ta
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
 import { taskPass, buildSched, physicalSlotsOccupied, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
 import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
-import { boardAdmitEnabled, planBoardWrites, planBoardSupervision, parsePolicyNum, postedFileName, reclaimedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, repostTmpAction, suppressPendingReposts, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
+import { boardAdmitEnabled, planBoardWrites, planBoardSupervision, parsePolicyNum, postedFileName, reclaimedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, repostTmpAction, suppressPendingReposts, boardFileIdentityVerified, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
@@ -822,8 +822,17 @@ async function main(): Promise<void> {
       // claimed+posted coexisting). A restore that itself FAILS keeps the itemId a PENDING obligation (below), so a fresh
       // first post is suppressed (never reset the count by re-creating the item). Only touch a tmp whose writer is gone.
       const boardFiles = readdirSync(BOARD_DIR);
+      // BP3 counterexample A: liveItemIds counts ONLY body-VERIFIED states — a forged/mismatched file (filename itemId ≠
+      // body identity) must NOT evict a legit tmp (the consumer rejects it on BA2b, so trusting its filename would drop a
+      // real obligation and re-post a fresh count-less item). Verify each candidate state's body against its filename.
       const liveItemIds = new Set<string>();
-      for (const bf of boardFiles) { const p = parseBoardItemName(bf); if (p) liveItemIds.add(p.itemId); }
+      for (const bf of boardFiles) {
+        const p = parseBoardItemName(bf);
+        if (!p) continue;
+        let body: unknown = null;
+        try { body = JSON.parse(readFileSync(path.join(BOARD_DIR, bf), "utf8")); } catch { /* unreadable ⇒ unverified */ }
+        if (boardFileIdentityVerified(p.itemId, body)) liveItemIds.add(p.itemId);
+      }
       const pendingTmpItemIds = new Set<string>();
       for (const f of boardFiles) {
         const m = /^(.+)\.json\.repost\.(\d+)\.tmp$/.exec(f);
@@ -831,9 +840,12 @@ async function main(): Promise<void> {
         const itemId = m[1]!;
         const writerPid = Number(m[2]);
         let writerAlive = false; try { process.kill(writerPid, 0); writerAlive = true; } catch { /* dead */ }
-        if (writerAlive && writerPid !== process.pid) continue; // another producer is mid-repost — leave its tmp alone
+        // BP3 counterexample B: an UNRESTORED legit tmp ALWAYS suppresses a fresh first post — a live/recycled/ambiguous
+        // writer pid is NO exception; its escalation obligation still lives in the tmp. Leave the tmp (don't steal a
+        // possibly-live producer's in-flight work), but retain the obligation so planBoardWrites can't re-post it fresh.
+        if (writerAlive && writerPid !== process.pid) { pendingTmpItemIds.add(itemId); continue; }
         const tmp = path.join(BOARD_DIR, f);
-        if (repostTmpAction(itemId, liveItemIds) === "drop") { try { unlinkSync(tmp); } catch { /* fine */ } continue; } // moved on / already back -> stale
+        if (repostTmpAction(itemId, liveItemIds) === "drop") { try { unlinkSync(tmp); } catch { /* fine */ } continue; } // body-verified moved-on -> stale
         try { renameSync(tmp, path.join(BOARD_DIR, postedFileName(itemId))); liveItemIds.add(itemId); } // recovered -> now live
         catch { pendingTmpItemIds.add(itemId); } // restore FAILED -> obligation still pending; suppress a fresh first post
       }
