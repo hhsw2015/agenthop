@@ -7,19 +7,21 @@ Closes F40 drift (self-reported ID) + R16 relay laundering at the code layer. Pu
 Compact HS256 JWT, `base64url(header).base64url(payload).base64url(hmac)`, header `{"alg":"HS256","typ":"JWT"}`.
 
 - **Identity credential** (`mintIdToken`): `{ iss:"id", sub:<mintedId>, iat, exp? }`. Proves the holder is the coordinator-minted `mintedId`. Issued in the spawn/birth-cert envelope; `exp` optional (omit = seat-lifetime, bounded by secret rotation).
-- **Capability credential** (`mintCapToken`): `{ iss:"cap", sub:<mintedId>, act:<CapAct>, iat, exp, nonce? }`. Authorizes `sub` to perform `act` until `exp`. `exp = iat + min(ttlSec, MAX_CAP_TTL_SEC)`, `MAX_CAP_TTL_SEC = 3600`.
+- **Capability credential** (`mintCapToken`): `{ iss:"cap", sub:<mintedId>, act:<CapAct>, iat, exp, nonce? }`. Authorizes `sub` to perform `act` until `exp`. `exp = iat + min(floor(ttlSec), MAX_CAP_TTL_SEC)`, `MAX_CAP_TTL_SEC = 3600`. A non-positive or non-finite `ttlSec` is REJECTED at mint (no lower clamp that would fabricate authorization time — SC3).
 - `CapAct` (frozen enum): `vm-spawn | three-gate-proxy | board-admit | seat-spawn`.
 - `mintedId` = `mintSeatId()` = a UUID minted by the coordinator/dispatcher — NEVER a CLI-reported thread ID.
 
 ## Verify algorithm (frozen — the one gate every execution point calls)
 
 `verifyToken(token, { secret, iss, now?, sub?, act? })` → `{ok:true,claims} | {ok:false,reason}`. Checks IN ORDER:
+0. verify secret non-empty (empty ⇒ `no verify secret` — SC2) AND `now` finite (non-finite ⇒ `bad clock` — SC3); neither ever authorizes.
 1. token present + 3 dot-parts (missing/empty ⇒ `no token` — this IS the R16 anti-laundering: a relayed `user approved` carries no token).
 2. header `alg === "HS256"` (blocks `alg:none` and algorithm-downgrade).
 3. HMAC-SHA256 signature over `header.payload`, compared constant-time (`timingSafeEqual`).
 4. `iss` matches the expected (`id` vs `cap` never cross).
 5. not expired (`now < exp` when `exp` present).
-6. optional `sub` match; optional `act` match (cap only — a `vm-spawn` cap does NOT authorize `three-gate-proxy`).
+6. payload SHAPE (SC1, after the signature, never throwing): must be a non-null object; `sub` is a mandatory non-empty string; any `exp` must be a finite number; a `cap` MUST carry a finite `exp` AND a known `act`.
+7. not expired (`now < exp`); optional `sub` match; optional `act` match (cap only — a `vm-spawn` cap does NOT authorize `three-gate-proxy`).
 
 ## Secret handling (frozen)
 

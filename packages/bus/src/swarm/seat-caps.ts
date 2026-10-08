@@ -55,7 +55,10 @@ export function mintIdToken(input: { mintedId: string; secret: string; now?: num
   if (!input.secret) throw new Error("mintIdToken: secret required");
   const now = Math.floor(input.now ?? Date.now() / 1000);
   const payload: Record<string, unknown> = { iss: "id", sub: input.mintedId, iat: now };
-  if (input.ttlSec !== undefined) payload.exp = now + Math.max(1, Math.floor(input.ttlSec));
+  if (input.ttlSec !== undefined) {
+    if (!Number.isFinite(input.ttlSec) || input.ttlSec <= 0) throw new Error("mintIdToken: ttlSec must be a positive finite number");
+    payload.exp = now + Math.floor(input.ttlSec);
+  }
   return signHs256(payload, input.secret);
 }
 
@@ -65,7 +68,11 @@ export function mintCapToken(input: { mintedId: string; act: CapAct; secret: str
   if (!CAP_ACTS.includes(input.act)) throw new Error(`mintCapToken: unknown act ${input.act}`);
   if (!input.secret) throw new Error("mintCapToken: secret required");
   const now = Math.floor(input.now ?? Date.now() / 1000);
-  const ttl = Math.min(Math.max(1, Math.floor(input.ttlSec ?? MAX_CAP_TTL_SEC)), MAX_CAP_TTL_SEC);
+  const reqTtl = input.ttlSec ?? MAX_CAP_TTL_SEC;
+  // SC3: a non-positive / non-finite TTL must NOT be clamped UP to a 1s grant — reject it (frozen formula is
+  // exp = iat + min(ttlSec, MAX), no lower clamp that fabricates authorization time).
+  if (!Number.isFinite(reqTtl) || reqTtl <= 0) throw new Error("mintCapToken: ttlSec must be a positive finite number");
+  const ttl = Math.min(Math.floor(reqTtl), MAX_CAP_TTL_SEC);
   const payload: Record<string, unknown> = { iss: "cap", sub: input.mintedId, act: input.act, iat: now, exp: now + ttl };
   if (input.nonce) payload.nonce = input.nonce;
   return signHs256(payload, input.secret);
@@ -80,6 +87,9 @@ export type VerifyResult = { ok: true; claims: Record<string, unknown> } | { ok:
  * fails at step 1 — that IS the anti-laundering property. Pure (secret + now injected).
  */
 export function verifyToken(token: string, opts: { secret: string; iss: "id" | "cap"; now?: number; sub?: string; act?: CapAct }): VerifyResult {
+  if (!opts.secret) return { ok: false, reason: "no verify secret" }; // SC2: an empty verify secret never authorizes
+  const now = Math.floor(opts.now ?? Date.now() / 1000);
+  if (!Number.isFinite(now)) return { ok: false, reason: "bad clock" }; // SC3: a non-finite clock never authorizes
   if (typeof token !== "string" || !token) return { ok: false, reason: "no token" };
   const parts = token.split(".");
   if (parts.length !== 3) return { ok: false, reason: "malformed" };
@@ -95,14 +105,24 @@ export function verifyToken(token: string, opts: { secret: string; iss: "id" | "
   const got = Buffer.from(sig);
   const want = Buffer.from(expected);
   if (got.length !== want.length || !timingSafeEqual(got, want)) return { ok: false, reason: "bad signature" };
-  let claims: Record<string, unknown>;
+  let parsed: unknown;
   try {
-    claims = JSON.parse(Buffer.from(p, "base64url").toString("utf8"));
+    parsed = JSON.parse(Buffer.from(p, "base64url").toString("utf8"));
   } catch {
     return { ok: false, reason: "bad payload" };
   }
+  // SC1: validate the frozen payload SHAPE after the signature — a valid signature over a malformed claim set must not
+  // authorize, and must never throw. null/array/primitive are not a claim set.
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { ok: false, reason: "payload not an object" };
+  const claims = parsed as Record<string, unknown>;
   if (claims.iss !== opts.iss) return { ok: false, reason: `iss mismatch (want ${opts.iss})` };
-  const now = Math.floor(opts.now ?? Date.now() / 1000);
+  if (typeof claims.sub !== "string" || !claims.sub) return { ok: false, reason: "missing sub" }; // identity binding is mandatory
+  if (claims.exp !== undefined && (typeof claims.exp !== "number" || !Number.isFinite(claims.exp))) return { ok: false, reason: "bad exp" };
+  if (opts.iss === "cap") {
+    // frozen cap shape: a finite exp and a known act are MANDATORY (an exp-less or act-less cap must not authorize)
+    if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp)) return { ok: false, reason: "cap missing exp" };
+    if (typeof claims.act !== "string" || !CAP_ACTS.includes(claims.act as CapAct)) return { ok: false, reason: "cap bad act" };
+  }
   if (claims.exp !== undefined && now >= (claims.exp as number)) return { ok: false, reason: "expired" };
   if (opts.sub !== undefined && claims.sub !== opts.sub) return { ok: false, reason: "sub mismatch" };
   if (opts.iss === "cap" && opts.act !== undefined && claims.act !== opts.act) return { ok: false, reason: "act mismatch" };

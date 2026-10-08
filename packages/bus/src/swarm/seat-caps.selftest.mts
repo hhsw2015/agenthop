@@ -8,9 +8,18 @@ import {
   MAX_CAP_TTL_SEC,
 } from "./seat-caps.js";
 
+import { createHmac } from "node:crypto";
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 const SECRET = "dispatcher-secret-xyz";
 const T0 = 1_000_000;
+// Local signer: craft a VALID signature over an arbitrary (possibly malformed) payload, to test post-signature shape checks.
+const b64u = (b: Buffer) => b.toString("base64url");
+const sign = (payload: unknown, secret = SECRET): string => {
+  const h = b64u(Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })));
+  const p = b64u(Buffer.from(JSON.stringify(payload)));
+  return `${h}.${p}.${b64u(createHmac("sha256", secret).update(`${h}.${p}`).digest())}`;
+};
+const rej = (r: ReturnType<typeof verifyToken>) => r.ok === false;
 
 // --- mintSeatId: a UUID, injectable, independent of any CLI id ---
 t("mintSeatId uses injected rand", mintSeatId(() => "fixed-uuid") === "fixed-uuid");
@@ -57,5 +66,28 @@ const mc = mintedClaim("seat-1");
 t("mintedClaim is a hard claim from the mint event", mc.form === "minted" && mc.confidence === "hard" && mc.provenance === "mint" && mc.value === "seat-1");
 
 t("CAP_ACTS covers the four action classes", CAP_ACTS.length === 4 && CAP_ACTS.includes("three-gate-proxy"));
+
+// --- SC1: validly-SIGNED but MALFORMED payload must fail (frozen shape), never throw ---
+t("SC1: cap missing exp -> reject", rej(verifyToken(sign({ iss: "cap", sub: "s", act: "vm-spawn", iat: T0 }), { secret: SECRET, iss: "cap", now: T0 })));
+t("SC1: cap exp as string -> reject", rej(verifyToken(sign({ iss: "cap", sub: "s", act: "vm-spawn", exp: "9999999999" }), { secret: SECRET, iss: "cap", now: T0 })));
+t("SC1: cap exp non-finite -> reject", rej(verifyToken(sign({ iss: "cap", sub: "s", act: "vm-spawn", exp: null }), { secret: SECRET, iss: "cap", now: T0 })));
+t("SC1: cap missing act -> reject", rej(verifyToken(sign({ iss: "cap", sub: "s", exp: T0 + 10 }), { secret: SECRET, iss: "cap", now: T0 })));
+t("SC1: cap unknown act -> reject", rej(verifyToken(sign({ iss: "cap", sub: "s", act: "rm-rf", exp: T0 + 10 }), { secret: SECRET, iss: "cap", now: T0 })));
+t("SC1: missing sub -> reject", rej(verifyToken(sign({ iss: "id", iat: T0 }), { secret: SECRET, iss: "id", now: T0 })));
+t("SC1: null payload -> reject WITHOUT throwing", rej(verifyToken(sign(null), { secret: SECRET, iss: "id", now: T0 })));
+t("SC1: array payload -> reject", rej(verifyToken(sign([1, 2, 3]), { secret: SECRET, iss: "id", now: T0 })));
+t("SC1: id with valid shape still OK (control)", verifyToken(sign({ iss: "id", sub: "s", iat: T0 }), { secret: SECRET, iss: "id", now: T0 }).ok === true);
+
+// --- SC2: an empty verify secret must never authorize (even a cap self-signed with "") ---
+t("SC2: verify with empty secret -> reject", rej(verifyToken(cap, { secret: "", iss: "cap", act: "vm-spawn", now: T0 })));
+t("SC2: empty-secret self-signed cap under empty-secret verify -> reject", rej(verifyToken(sign({ iss: "cap", sub: "s", act: "vm-spawn", exp: T0 + 10 }, ""), { secret: "", iss: "cap", now: T0 })));
+
+// --- SC3: non-finite clock / non-positive TTL must not widen the window ---
+t("SC3: now NaN -> reject (expired cap can't pass)", rej(verifyToken(cap, { secret: SECRET, iss: "cap", act: "vm-spawn", now: NaN })));
+t("SC3: now -Infinity -> reject", rej(verifyToken(cap, { secret: SECRET, iss: "cap", act: "vm-spawn", now: -Infinity })));
+t("SC3: mintCapToken ttl 0 throws (no 1s grant)", (() => { try { mintCapToken({ mintedId: "s", act: "vm-spawn", secret: SECRET, ttlSec: 0 }); return false; } catch { return true; } })());
+t("SC3: mintCapToken ttl -10 throws", (() => { try { mintCapToken({ mintedId: "s", act: "vm-spawn", secret: SECRET, ttlSec: -10 }); return false; } catch { return true; } })());
+t("SC3: mintCapToken ttl NaN throws", (() => { try { mintCapToken({ mintedId: "s", act: "vm-spawn", secret: SECRET, ttlSec: NaN }); return false; } catch { return true; } })());
+t("SC3: mintIdToken ttl 0 throws", (() => { try { mintIdToken({ mintedId: "s", secret: SECRET, ttlSec: 0 }); return false; } catch { return true; } })());
 
 console.log("all seat-caps selftests passed");
