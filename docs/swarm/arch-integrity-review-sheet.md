@@ -1,16 +1,18 @@
 # Architecture-integrity review sheet — feat/arch-integrity-review
 
-- **Branch** `feat/arch-integrity-review`  **HEAD** `8a3acce`  **Base** `c3439cd`
+- **Branch** `feat/arch-integrity-review`  **HEAD** `bb06060`  **Base** `c3439cd`
 - **Reviewer** codex 01a0ead5 (cross-family, independent)  **Author/tooling** bus-pen d7f6c917
 - **Spec** `docs/swarm/arch-integrity-review-design.md` (R22) + 32-eval C11
 
 ## What this is
-A CROSS-CUTTING review of the batch as a whole, not per-PR correctness. The tooling below collected the inputs; the reviewer fills each axis verdict. A CONFIRMED finding is REMAIN and BLOCKS the batch merge; a drift finding opens a convergence follow-up. The tool flags candidates only — it never pronounces a verdict.
+A CROSS-CUTTING review of the batch as a whole, not per-PR correctness. The tooling below collected the inputs from the git objects at HEAD (not the working tree); the reviewer fills each axis verdict. A CONFIRMED finding is REMAIN and BLOCKS the batch merge; a drift finding opens a convergence follow-up. The tool flags candidates only — it never pronounces a verdict.
 
 ## Diff set
-1 commit(s), 3 changed file(s), `c3439cd..8a3acce`.
+3 commit(s), 6 changed file(s), `c3439cd..bb06060`.
 
 ```
+bb06060 fix(swarm): arch-review round-2 — AR1-AR5 (read git objects, lexical imports, IO roots, real-file resolution)
+e80c046 docs(swarm): arch-integrity review sheet (dogfood template) + review packet
 8a3acce feat(swarm): architecture-integrity review tooling (P1③/R22, S14 T5-3)
 ```
 
@@ -28,6 +30,7 @@ A CROSS-CUTTING review of the batch as a whole, not per-PR correctness. The tool
 ## Import map (who-imports-whom, batch files only)
 | from | zone | to | zone |
 | --- | --- | --- | --- |
+| `packages/bus/src/swarm/arch-review.integration.selftest.mts` | test | `packages/bus/src/swarm/arch-review.ts` | bus |
 | `packages/bus/src/swarm/arch-review.selftest.mts` | test | `packages/bus/src/swarm/arch-review.ts` | bus |
 | `scripts/swarm-arch-review.ts` | script | `packages/bus/src/swarm/arch-review.ts` | bus |
 
@@ -37,7 +40,7 @@ _(none auto-detected; the reviewer still judges the axes below)_
 ## C11 — done bound to SHA evidence
 | node | ok | reason |
 | --- | --- | --- |
-| arch-review-tooling | yes | bound to 8a3acce |
+| arch-review-tooling | yes | bound to bb06060 |
 
 ## Axis verdicts (reviewer fills; REMAIN blocks the batch)
 ### Module boundary drift
