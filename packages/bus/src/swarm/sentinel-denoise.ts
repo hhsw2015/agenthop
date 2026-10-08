@@ -78,10 +78,46 @@ export function parsePsOutput(raw: string): ProcInfo[] {
 }
 
 /** True if `cmd` is the dispatcher LOOP (not a one-shot --sweep-once / --observe-once invocation, which are short-lived). */
+/** JS runtimes that can actually EXECUTE the dispatcher script (argv0, by basename). Anything else holding the path as an
+ *  argument — an editor, `git`, `rg`, `cat` — is a mere file reference, never a running loop. */
+const JS_RUNTIMES = new Set(["node", "nodejs", "tsx", "ts-node", "bun", "deno", "npx", "pnpm"]);
+/** Flags that make the script path DATA, not an entry: `node -e '... swarm-dispatch.ts ...'` runs the eval string, not the file. */
+const EVAL_FLAGS = new Set(["-e", "--eval", "-p", "--print", "-c"]);
+const isScriptEntry = (tok: string): boolean => !tok.startsWith("-") && (tok === "swarm-dispatch.ts" || tok.endsWith("/swarm-dispatch.ts"));
+
+/** True ONLY when `cmd` is a real, long-running execution of the dispatcher — a JS-runtime argv0, a bare `swarm-dispatch.ts`
+ *  entry token (NOT inside an eval flag), and NOT a one-shot invocation. F44-P1-1: a mere mention of the path (an editor, a
+ *  grep, a `node -e` whose eval string names the file) is NOT a running loop and must never block a legitimate startup. The
+ *  one-shot check mirrors main()'s EXACT parse: `--sweep-once` / `--observe-once` disable the loop ONLY as argv[0] (the FIRST
+ *  token after the script entry), so a NON-first `--sweep-once` still runs the loop. */
 export function isDispatcherLoopCommand(cmd: string): boolean {
-  if (!/swarm-dispatch\.ts/.test(cmd)) return false;
-  if (/--(sweep-once|observe-once)\b/.test(cmd)) return false;
+  const tokens = cmd.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  const argv0 = tokens[0]!;
+  const base = argv0.slice(argv0.lastIndexOf("/") + 1);
+  if (!JS_RUNTIMES.has(base)) return false;               // not a JS runtime ⇒ a file reference, not an execution
+  if (tokens.some((t) => EVAL_FLAGS.has(t))) return false; // eval-style ⇒ the path is data, not a script entry
+  const entryIdx = tokens.findIndex((t, i) => i > 0 && isScriptEntry(t));
+  if (entryIdx < 0) return false;                          // the dispatcher is not the thing being run
+  const firstArg = tokens[entryIdx + 1];                   // argv[0] from main()'s perspective (process.argv.slice(2)[0])
+  if (firstArg === "--sweep-once" || firstArg === "--observe-once") return false; // one-shot ⇒ not the loop
   return true;
+}
+
+/** Pure one-time-per-episode gate for ghost-daemon alerts: fire ONCE while a member is a ghost, re-fire only after it has
+ *  LEFT the ghost state and later returns. NOT a cooldown (which would re-remind every window). Unit-tested here; the live
+ *  sentinel inlines the same three operations because its review harness injects a fixed dep set without this class. */
+export class GhostOnce {
+  private readonly fired = new Set<string>();
+  /** Forget any already-fired member that is no longer a ghost this tick, so a later re-ghost of the same member re-fires. */
+  reconcile(currentGhosts: Iterable<string>): void {
+    const cur = currentGhosts instanceof Set ? currentGhosts : new Set(currentGhosts);
+    for (const m of [...this.fired]) if (!cur.has(m)) this.fired.delete(m);
+  }
+  /** True if this ghost member has not yet been alerted this episode (caller may fire). */
+  shouldFire(member: string): boolean { return !this.fired.has(member); }
+  /** Record a delivered ghost alert so it is not repeated until the member leaves and re-enters the ghost state. */
+  record(member: string): void { this.fired.add(member); }
 }
 
 /** The pid set of THIS process's own tree (self + ancestor chain via ppid), so our own `npx`/`tsx`/`node` wrapper layers are

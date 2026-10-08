@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  AlertDedup, alertKey, isValidInboxKey, classifyMemberHealth,
+  AlertDedup, alertKey, isValidInboxKey, classifyMemberHealth, GhostOnce,
   parsePsOutput, selfTree, isDispatcherLoopCommand, isDispatcherAlreadyRunning, shouldEmitWatchNotice,
   type ProcInfo,
 } from "../src/swarm/sentinel-denoise.js";
@@ -48,15 +48,17 @@ describe("F44 sentinel-denoise — ① AlertDedup", () => {
     expect(() => new AlertDedup(NaN)).toThrow(/cooldownMs/);
   });
 
-  test("REPLAY multi-generation: same member across dispatcher generations does NOT double-alert within the window", () => {
+  test("same-instance cooldown: an identical event within the window does NOT re-alert", () => {
+    // Scope note (F44-N1): AlertDedup is in-memory, per dispatcher instance — this is a SAME-INSTANCE cooldown, NOT a
+    // cross-restart durable claim. A dispatcher restart constructs a fresh AlertDedup (empty state); the ⑤ process-tree
+    // check is what prevents a second concurrent dispatcher, not this map.
     let now = 0;
     const d = new AlertDedup(100_000, () => now);
     const k = alertKey("coord", "idle-timeout");
-    // generation 1 alerts
     expect(d.shouldFire(k)).toBe(true); d.record(k);
-    // generation 2 (a restart) observing the SAME condition shortly after must NOT re-alert (shared durable window)
-    now += 500; expect(d.shouldFire(k)).toBe(false);
-    now += 5000; expect(d.shouldFire(k)).toBe(false);
+    now += 500; expect(d.shouldFire(k)).toBe(false);  // same instance, still inside the window
+    now += 5000; expect(d.shouldFire(k)).toBe(false); // still inside 100s
+    now += 100_000; expect(d.shouldFire(k)).toBe(true); // window elapsed ⇒ fireable again
   });
 });
 
@@ -116,6 +118,17 @@ describe("F44 sentinel-denoise — ⑤ single-instance process-tree check", () =
     expect(isDispatcherLoopCommand("node tsx scripts/swarm-dispatch.ts --sweep-once")).toBe(false);
     expect(isDispatcherLoopCommand("node tsx scripts/swarm-dispatch.ts --observe-once r b l g")).toBe(false);
     expect(isDispatcherLoopCommand("node scripts/other.ts")).toBe(false);
+    // F44-P1-1: a mere file reference is NOT a running loop — only a JS runtime actually executes it.
+    expect(isDispatcherLoopCommand("nvim scripts/swarm-dispatch.ts")).toBe(false);
+    expect(isDispatcherLoopCommand("git diff -- scripts/swarm-dispatch.ts")).toBe(false);
+    expect(isDispatcherLoopCommand("rg swarm-dispatch.ts scripts")).toBe(false);
+    expect(isDispatcherLoopCommand("cat scripts/swarm-dispatch.ts")).toBe(false);
+    // F44-P1-1: eval-style — the path is DATA inside the eval string, not a script entry.
+    expect(isDispatcherLoopCommand("node -e setInterval(()=>0,1) scripts/swarm-dispatch.ts")).toBe(false);
+    expect(isDispatcherLoopCommand("node --eval require('./scripts/swarm-dispatch.ts')")).toBe(false);
+    // F44-P1-1: the one-shot exclusion mirrors main()'s EXACT argv[0] parse — a NON-first --sweep-once still runs the loop.
+    expect(isDispatcherLoopCommand("node /x/tsx scripts/swarm-dispatch.ts --unused --sweep-once")).toBe(true);
+    expect(isDispatcherLoopCommand("node /x/tsx scripts/swarm-dispatch.ts --observe-once")).toBe(false);
   });
   test("selfTree walks self + ancestors via ppid", () => {
     const procs = ps([{ pid: 500, ppid: 400, command: "node .../tsx swarm-dispatch.ts" }, { pid: 400, ppid: 300, command: "npx tsx scripts/swarm-dispatch.ts" }, { pid: 300, ppid: 1, command: "sh" }]);
@@ -155,5 +168,35 @@ describe("F44 sentinel-denoise — ⑥ shouldEmitWatchNotice", () => {
     expect(shouldEmitWatchNotice("progress", "0")).toBe(false);
     expect(shouldEmitWatchNotice("progress", "no")).toBe(false);
     for (const on of ["1", "true", "yes", "on", "YES", "On"]) expect(shouldEmitWatchNotice("progress", on)).toBe(true);
+  });
+});
+
+describe("F44 sentinel-denoise — P2-3 GhostOnce (one-time-per-episode gate)", () => {
+  test("fires once while a member stays a ghost, even past a cooldown window", () => {
+    const g = new GhostOnce();
+    let fires = 0;
+    for (let tick = 0; tick < 4; tick++) {
+      g.reconcile(["m1"]);              // m1 still a ghost every tick
+      if (g.shouldFire("m1")) { fires++; g.record("m1"); }
+    }
+    expect(fires).toBe(1);             // NOT re-reminded each tick (contrast AlertDedup cooldown)
+  });
+
+  test("re-fires after a member LEAVES the ghost state and returns", () => {
+    const g = new GhostOnce();
+    g.reconcile(["m1"]); expect(g.shouldFire("m1")).toBe(true); g.record("m1");
+    g.reconcile(["m1"]); expect(g.shouldFire("m1")).toBe(false); // still a ghost ⇒ silent
+    g.reconcile([]);                                              // m1 recovered (no longer a ghost) ⇒ forgotten
+    g.reconcile(["m1"]); expect(g.shouldFire("m1")).toBe(true);  // re-ghost ⇒ fires again
+  });
+
+  test("tracks members independently; an undelivered ghost (not recorded) retries next tick", () => {
+    const g = new GhostOnce();
+    g.reconcile(["m1", "m2"]);
+    expect(g.shouldFire("m1")).toBe(true); g.record("m1"); // m1 delivered
+    expect(g.shouldFire("m2")).toBe(true);                 // m2 send failed ⇒ NOT recorded
+    g.reconcile(["m1", "m2"]);
+    expect(g.shouldFire("m1")).toBe(false);                // m1 already alerted
+    expect(g.shouldFire("m2")).toBe(true);                 // m2 retries
   });
 });

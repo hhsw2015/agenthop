@@ -1203,11 +1203,13 @@ async function main(): Promise<void> {
       for (const a of detectStalledInboxes(stats, (key) => owned.has(key), INBOX_STALL_SEC, nowSec())) {
         const dk = alertKey(a.key, "inbox-stall");
         if (!inboxDedup.shouldFire(dk)) continue; // already alerted this box this window
-        inboxDedup.record(dk);
-        notifyCoordinator(
+        // F44-P2-1: notify FIRST, consume the cooldown slot ONLY on a non-failed delivery (mirror live-sentinel's
+        // record-on-success). A FAILED write must NOT start the cooldown, else an undelivered stall is silenced until it lapses.
+        const res = notifyCoordinator(
           `[inbox-sentinel] STALL: inbox ${a.key} has ${a.unclaimedCount} unclaimed message(s) older than ${thMin}min and NO live session is draining it`,
           { taskRef: `inbox-stall:${a.key}`, title: "inbox stall" },
         );
+        if (res !== "failed") inboxDedup.record(dk);
       }
     } catch (e) { log(`inbox sentinel failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
@@ -1223,7 +1225,12 @@ async function main(): Promise<void> {
   // double-notify (benign: one notice per id, no wrong action); blocked does not double (a stuck member cannot self-report).
   const REAL_AGENT_STATES: AgentState[] = ["idle", "working", "blocked", "done"]; // waitable states (no "unknown")
   const sentinelWatchers = new Map<string, AbortController>(); // herdr member -> its running watcher's abort handle
-  const sentinelDedup = new AlertDedup(NOTIFY_DEDUP_MS); // F44-①: per member+kind event-identity dedup + cooldown (incl. ghost-daemon one-time)
+  const sentinelDedup = new AlertDedup(NOTIFY_DEDUP_MS); // F44-①: per member+kind event-identity dedup + cooldown (fake-death / idle-timeout / blocked)
+  // F44-P2-3: ghost-daemon is ONE-TIME per episode, NOT a cooldown re-fire. ghostFired holds members already alerted; it is
+  // reconciled each tick against the current ghost set (a member no longer a ghost is forgotten, so a later re-ghost re-fires).
+  // This is the inline mirror of the pure `GhostOnce` helper in sentinel-denoise.ts (the live-sentinel test harness injects a
+  // FIXED dep set with no GhostOnce, so the dispatcher cannot import it — the helper is unit-tested there, the logic lives here).
+  const ghostFired = new Set<string>();
   const sentinelPending = new Map<string, { text: string; taskRef: string; title: string }>(); // LS4: failed deliveries ⇒ retried each tick
   const sentinelCfg = { fakeDeathSec: SENTINEL_FAKEDEATH_SEC, idleTimeoutSec: SENTINEL_IDLE_SEC, reArmSec: SENTINEL_IDLE_SEC, doneWakeSec: SENTINEL_IDLE_SEC, sampleSec: SENTINEL_SAMPLE_SEC, backoffSec: SENTINEL_SAMPLE_SEC };
   // LS4: deliver with a durable pending-retry. A FAILED notifyCoordinator does NOT consume the dedup slot AND the rendered
@@ -1250,10 +1257,9 @@ async function main(): Promise<void> {
         options: [{ label: "读屏后裁决", consequence: "批准/拒绝由授权方按实际界面回注(blocked 态不可用 prompt,须按 UI 选择 send-keys 等);或中止/另派" }], // N1: prompt is rejected for a blocked agent
       });
       msg = { text: doc.body.text, taskRef: `approval:${ev.member}`, title: doc.body.title };
-    } else if (ev.kind === "ghost-daemon") {
-      // F44-③: a non-roster stray presence sitting idle — likely a leftover/ghost daemon, not a registered member. One-time (deduped by member+kind).
-      msg = { text: `[live-sentinel] ghost-daemon: 游离 presence ${ev.member} idle >= ${ev.idleSec}s 且不在册(非 roster 成员)— 疑似残留守护进程,一次性告警`, taskRef: `sentinel:ghost-daemon:${ev.member}`, title: "ghost daemon" };
     } else {
+      // F44-P2-3: ghost-daemon is NOT routed here — it has a one-time gate (ghostFired), not this cooldown dedup. This branch is
+      // fake-death / idle-timeout only (both carry idleSec/silentSec); the type still admits ghost-daemon but it is never emitted.
       const detail = ev.kind === "fake-death" ? `status working but no terminal output for >= ${ev.silentSec}s` : `idle with no check-in for >= ${ev.idleSec}s`;
       msg = { text: `[live-sentinel] ${ev.kind}: 成员 ${ev.member} — ${detail}`, taskRef: `sentinel:${ev.kind}:${ev.member}`, title: `member ${ev.kind}` };
     }
@@ -1294,13 +1300,22 @@ async function main(): Promise<void> {
       // work is HEALTHY (④, no alert); only an in-flight owner gone idle is a disconnect candidate. `blocked` is a real
       // self-report and still escalates regardless of roster.
       const now = nowSec();
+      const sids = listSessions(HOME);
       const idlog2 = readIdentityLog(HOME);
       const proj2 = buildProjection(idlog2.events, idlog2.corruption);
+      // F44-P2-2: in-flight = owns a NON-TERMINAL wait whose owner resolves to a UNIQUE session. (A) a "resolved" wait is done
+      // (not in-flight; liveEntities already drops tombstones but keeps resolved waits). (B) the wait owner is a handle/short-id,
+      // resolved to a canonical sid via resolveSession; an unassigned/ambiguous owner is credited to NO member (never guess, F16).
       const activeOwners = new Set<string>();
       for (const b of Object.values(liveEntities(loadControlLog(CONTROL_LOG_DIR)))) {
-        if (b.put === "wait") { const o = (b as Extract<ChangeBody, { put: "wait" }>).wait.owner; if (o) activeOwners.add(o); }
+        if (b.put !== "wait") continue;
+        const w = (b as Extract<ChangeBody, { put: "wait" }>).wait;
+        if (w.state === "resolved") continue; // terminal WaitState ⇒ not in-flight
+        const owner = resolveSession(w.owner ?? "", sids); // handle/short-id ⇒ unique sid, else null (unassigned/ambiguous)
+        if (owner) activeOwners.add(owner);
       }
-      for (const sid of listSessions(HOME)) {
+      const currentGhosts: { sid: string; idleSec: number }[] = [];
+      for (const sid of sids) {
         if (identified.has(sid)) continue; // best-effort exclusion (exact name match) — see the herdr-name↔sid mapping note above
         const st = readStatusFile(HOME, sid);
         if (!st) continue;
@@ -1310,7 +1325,20 @@ async function main(): Promise<void> {
         const onRoster = activeOwners.has(sid) || whois(proj2, sid).kind === "entity";
         const health = classifyMemberHealth({ onRoster, hasInFlight: activeOwners.has(sid), idleSec, presenceSeen: true }, { idleTimeoutSec: SENTINEL_IDLE_SEC });
         if (health === "disconnect-candidate") void sentinelEscalate({ kind: "idle-timeout", member: sid, idleSec });
-        else if (health === "ghost-daemon") void sentinelEscalate({ kind: "ghost-daemon", member: sid, idleSec });
+        else if (health === "ghost-daemon") currentGhosts.push({ sid, idleSec });
+      }
+      // F44-P2-3: fire each ghost ONCE per episode. Reconcile first — forget any member no longer observed as a ghost — so a
+      // member that recovers and later re-ghosts fires again. The slot is taken only on a non-failed delivery, so an undelivered
+      // ghost alert retries next tick (the member is still a ghost). This bypasses sentinelDedup (which would re-remind on cooldown).
+      const ghostSet = new Set(currentGhosts.map((g) => g.sid));
+      for (const m of [...ghostFired]) if (!ghostSet.has(m)) ghostFired.delete(m);
+      for (const g of currentGhosts) {
+        if (ghostFired.has(g.sid)) continue; // already alerted this episode
+        const res = notifyCoordinator(
+          `[live-sentinel] ghost-daemon: 游离 presence ${g.sid} idle >= ${g.idleSec}s 且不在册(非 roster 成员)— 疑似残留守护进程,一次性告警`,
+          { taskRef: `sentinel:ghost-daemon:${g.sid}`, title: "ghost daemon" },
+        );
+        if (res !== "failed") ghostFired.add(g.sid);
       }
     } catch (e) { log(`live sentinel failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
