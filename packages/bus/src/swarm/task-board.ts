@@ -91,6 +91,7 @@ export type BoardItem = {
   postedBy: string;           // the curator identity that posted it
   postedAtSec: number;
   repostCount?: number;       // BA9: times this still-ready item was re-posted after an unclaimed deadline (default 0)
+  reportedAtSec?: number;     // BA9 (BP1): when the REPORT incident was durably recorded — RECLAIM's grace runs from HERE
 };
 
 /** The §2d-a "上板/curate" DECISION (pure): map each READY plan-node to the board item that represents it. The board is
@@ -184,30 +185,45 @@ export type BoardSupervisionPolicy = { claimTtlSec: number; maxReposts: number; 
 export type BoardPostAction =
   | { kind: "ok" }
   | { kind: "repost"; item: BoardItem }
-  | { kind: "report"; itemId: string }
+  | { kind: "report"; item: BoardItem } // carries the item stamped with reportedAtSec (the caller persists it) (BP1)
   | { kind: "reclaim"; itemId: string };
 
 export function superviseBoardPost(item: BoardItem, nowSec: number, policy: BoardSupervisionPolicy): BoardPostAction {
   const age = nowSec - item.postedAtSec;
   if (age < policy.claimTtlSec) return { kind: "ok" }; // within the claim deadline
   const reposts = item.repostCount ?? 0;
-  if (reposts < policy.maxReposts) return { kind: "repost", item: { ...item, postedAtSec: nowSec, repostCount: reposts + 1 } };
-  if (age < policy.claimTtlSec + policy.reportGraceSec) return { kind: "report", itemId: item.itemId }; // cap reached — raise, then grace
-  return { kind: "reclaim", itemId: item.itemId }; // reported + grace elapsed, still unclaimed
+  if (reposts < policy.maxReposts) return { kind: "repost", item: { ...item, postedAtSec: nowSec, repostCount: reposts + 1, reportedAtSec: undefined } };
+  // At the repost cap: a REPORT must be RECORDED first, and RECLAIM's grace runs from that recorded time — never
+  // straight to reclaim on a late scan, never a report-write-failure bypass (BP1).
+  if (item.reportedAtSec === undefined) return { kind: "report", item: { ...item, reportedAtSec: nowSec } };
+  if (nowSec >= item.reportedAtSec + policy.reportGraceSec) return { kind: "reclaim", itemId: item.itemId };
+  return { kind: "ok" }; // reported, still within grace
 }
 
-export type BoardSupervision = { reposts: BoardItem[]; reports: string[]; reclaims: { file: string; itemId: string }[] };
+// BA9 (BP6): parse a policy value strictly — finite and non-negative; a count must be a non-negative INTEGER; an
+// explicit 0 is PRESERVED (not replaced by the default); a non-finite / negative / NaN value falls to the default
+// (so e.g. maxReposts=Infinity can never disable the cap).
+export function parsePolicyNum(raw: string | undefined, def: number, opts: { integer?: boolean } = {}): number {
+  if (raw === undefined || raw === "") return def;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return def;
+  if (opts.integer && !Number.isInteger(n)) return def;
+  return n;
+}
+
+export type BoardSupervision = { reposts: BoardItem[]; reports: BoardItem[]; reclaims: { file: string; itemId: string }[] };
 
 // The §2d-a supervision DECISION (pure): over the board dir's files, classify each STILL-READY posted-unclaimed
-// item through the escalation ladder. `reportedItemIds` = itemIds that already have an incident (dedup). The
-// caller does the IO: atomic-write each repost (same `<itemId>.json` path, in place), render an S19 incident for
-// each report, reap each reclaim file + dead-letter its node.
+// item through the escalation ladder. Dedup is intrinsic — a report only fires on the tick that first stamps
+// `reportedAtSec` (subsequent ticks within grace are `ok`). The caller does the IO: atomically migrate each
+// repost/report (same `<itemId>.json`) and each reclaim (-> the terminal `reclaimed` file), and render one S19
+// incident per report. BP4: every returned itemId is the VERIFIED DERIVED id (the filename identity), never the
+// untrusted body `itemId`, so no output path can be steered by a crafted body.
 export function planBoardSupervision(
   existing: readonly ExistingBoardFile[],
   readyItemIds: ReadonlySet<string>,
   nowSec: number,
   policy: BoardSupervisionPolicy,
-  reportedItemIds: ReadonlySet<string> = new Set(),
 ): BoardSupervision {
   const out: BoardSupervision = { reposts: [], reports: [], reclaims: [] };
   for (const e of existing) {
@@ -216,9 +232,9 @@ export function planBoardSupervision(
     if (p.itemId !== boardItemId(e.body.jobId, e.body.nodeId)) continue; // name<->body binding (BA4)
     if (!readyItemIds.has(p.itemId)) continue; // not still ready ⇒ planBoardWrites reaps it; BA9 leaves it alone
     const action = superviseBoardPost(e.body, nowSec, policy);
-    if (action.kind === "repost") out.reposts.push(action.item);
-    else if (action.kind === "report") { if (!reportedItemIds.has(action.itemId)) out.reports.push(action.itemId); }
-    else if (action.kind === "reclaim") out.reclaims.push({ file: e.file, itemId: action.itemId });
+    if (action.kind === "repost") out.reposts.push({ ...action.item, itemId: p.itemId }); // BP4: derived id
+    else if (action.kind === "report") out.reports.push({ ...action.item, itemId: p.itemId });
+    else if (action.kind === "reclaim") out.reclaims.push({ file: e.file, itemId: p.itemId });
   }
   return out;
 }

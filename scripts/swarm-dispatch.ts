@@ -35,7 +35,7 @@ import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/ta
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
 import { taskPass, buildSched, physicalSlotsOccupied, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
 import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
-import { boardAdmitEnabled, planBoardWrites, planBoardSupervision, postedFileName, reclaimedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
+import { boardAdmitEnabled, planBoardWrites, planBoardSupervision, parsePolicyNum, postedFileName, reclaimedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
@@ -834,27 +834,45 @@ async function main(): Promise<void> {
       // REPORT (S19-form incident, deduped by a `.report.json` marker) -> RECLAIM (rename to the terminal
       // `reclaimed` dead-letter, which planBoardWrites then never auto-re-posts). Still inside the board gate.
       const supPolicy = {
-        claimTtlSec: Number(process.env.SWARM_BOARD_CLAIM_TTL_SEC ?? 300) || 300,
-        maxReposts: Number(process.env.SWARM_BOARD_MAX_REPOSTS ?? 2) || 2,
-        reportGraceSec: Number(process.env.SWARM_BOARD_REPORT_GRACE_SEC ?? 300) || 300,
+        claimTtlSec: parsePolicyNum(process.env.SWARM_BOARD_CLAIM_TTL_SEC, 300),
+        maxReposts: parsePolicyNum(process.env.SWARM_BOARD_MAX_REPOSTS, 2, { integer: true }), // BP6: finite non-neg int, preserve 0
+        reportGraceSec: parsePolicyNum(process.env.SWARM_BOARD_REPORT_GRACE_SEC, 300),
       };
       const readyItemIds = new Set(ready.map((r) => boardItemId(cur.jobId, r.nodeId)));
-      const reportedIds = new Set(existing.filter((e) => e.file.endsWith(".report.json")).map((e) => e.file.slice(0, -".report.json".length)));
-      const sup = planBoardSupervision(existing, readyItemIds, nowSec(), supPolicy, reportedIds);
-      for (const it of sup.reposts) atomicWrite(path.join(BOARD_DIR, postedFileName(it.itemId)), JSON.stringify(it)); // re-post in place, fresh deadline
-      for (const itemId of sup.reports) {
+      // BP2: supervise a FRESH snapshot taken AFTER the post/reap writes — never the pre-write `existing`.
+      const fresh: ExistingBoardFile[] = readdirSync(BOARD_DIR).map((f) => {
+        let body: ExistingBoardFile["body"] = null;
+        try { body = JSON.parse(readFileSync(path.join(BOARD_DIR, f), "utf8")); } catch { /* unreadable ⇒ null */ }
+        return { file: f, body };
+      });
+      const sup = planBoardSupervision(fresh, readyItemIds, nowSec(), supPolicy);
+      // BP3: repost/report migrate the SAME posted file atomically — acquire it by rename (skip if a member
+      // claimed it first), rewrite, release. Losing the source never publishes a new state.
+      const atomicRepost = (itemId: string, body: unknown): boolean => {
+        const posted = path.join(BOARD_DIR, postedFileName(itemId));
+        const tmp = `${posted}.repost.${process.pid}.tmp`;
+        try { renameSync(posted, tmp); } catch { return false; } // gone/claimed ⇒ never revive
+        atomicWrite(posted, JSON.stringify(body));
+        try { unlinkSync(tmp); } catch { /* fine */ }
+        return true;
+      };
+      for (const it of sup.reposts) atomicRepost(it.itemId, it);
+      for (const it of sup.reports) {
+        if (!atomicRepost(it.itemId, it)) continue; // BP1: persist reportedAtSec on the still-unclaimed file; skip if claimed
         const doc = buildApprovalDoc({
-          from: SELF, fromLabel: "swarm-board", nowSec: nowSec(), member: itemId,
-          screenSummary: `board item ${itemId} unclaimed after ${supPolicy.maxReposts} reposts — no capable member claimed it`,
+          from: SELF, fromLabel: "swarm-board", nowSec: nowSec(), member: it.itemId,
+          screenSummary: `board item ${it.itemId} unclaimed after ${supPolicy.maxReposts} reposts — no capable member claimed it`,
           options: [{ label: "reassign / raise capacity", consequence: "a capable member claims the item" }, { label: "let it reclaim", consequence: "the node returns to the dead-letter lane after the grace" }],
         });
-        atomicWrite(path.join(BOARD_DIR, `${itemId}.report.json`), JSON.stringify(doc.body)); // dedup marker + S19 incident the coordinator surfaces
+        atomicWrite(path.join(BOARD_DIR, `${it.itemId}.report.json`), JSON.stringify(doc.body)); // one S19 incident the coordinator surfaces
       }
       for (const rc of sup.reclaims) {
+        const from = path.join(BOARD_DIR, rc.file);
+        const to = path.join(BOARD_DIR, reclaimedFileName(rc.itemId, SELF));
         let body: unknown = { itemId: rc.itemId };
-        try { body = JSON.parse(readFileSync(path.join(BOARD_DIR, rc.file), "utf8")); } catch { /* unreadable ⇒ minimal */ }
-        atomicWrite(path.join(BOARD_DIR, reclaimedFileName(rc.itemId, SELF)), JSON.stringify({ ...(body as object), reclaimedBy: SELF, reclaimedAtSec: nowSec(), deadLetter: true, note: "unclaimed past the repost cap + grace; dead-lettered (coordinator must re-enqueue)" }));
-        try { unlinkSync(path.join(BOARD_DIR, rc.file)); } catch { /* raced away */ }
+        try { body = JSON.parse(readFileSync(from, "utf8")); } catch { /* minimal */ }
+        try { renameSync(from, to); } catch { continue; } // BP3: ATOMIC state migration; skip if claimed/gone (never posted+reclaimed, never half-done)
+        atomicWrite(to, JSON.stringify({ ...(body as object), reclaimedBy: SELF, reclaimedAtSec: nowSec(), deadLetter: true, note: "unclaimed past the repost cap + grace; dead-lettered (coordinator must re-enqueue)" }));
       }
       if (sup.reposts.length || sup.reports.length || sup.reclaims.length) log(`board supervision: reposted ${sup.reposts.length}, reported ${sup.reports.length}, reclaimed ${sup.reclaims.length}`);
     } catch (e) { log(`board producer failed (isolated): ${e instanceof Error ? e.message : e}`); }
