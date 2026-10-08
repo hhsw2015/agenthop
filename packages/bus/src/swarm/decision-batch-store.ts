@@ -123,32 +123,29 @@ function acquireConsumeLock(home: string, batchId: string): string | null {
     const hpid = Number(holder.split(".")[0]);
     if (Number.isInteger(hpid) && hpid > 0 && (hpid === process.pid || !pidAlive(hpid))) {
       let removed = false; try { rmSync(path.join(dir, holder)); removed = true; } catch { /* a peer reclaimed it first */ }
-      if (removed) { try { rmdirSync(dir); } catch { strandedLockDirs.add(dir); } } // emptied it but could not drop it ⇒ ours to recover (retry adopts)
+      if (removed) { try { rmdirSync(dir); strandedLockDirs.delete(dir); } catch { strandedLockDirs.add(dir); } } // dropped it ⇒ any stale own record is void (DB-R7 B); could not drop ⇒ ours to recover (retry adopts)
       try { if (take()) return token; } catch (e) { throw e; }
     }
     dropIntent(); return null; // live published holder, or reclaim lost ⇒ contended
   }
   if (entries.length === 0) {
-    // EMPTY lock dir. We ADOPT it (publish our identity INTO it — NO rmdir, so there is no remove→recreate gap a live holder could
-    // fall into) ONLY with proof it is recoverable, bound to occupancy we can actually establish — otherwise we CONTEND:
+    // EMPTY lock dir. We recover it ONLY to continue OUR OWN unfinished occupancy, by ADOPTION (publish our identity straight INTO
+    // it — NO rmdir, so no remove→recreate gap a live holder could fall into). Any other empty dir ⇒ CONTEND:
     //  (A) reading the hold-intents MUST succeed — a read fault cannot prove recoverability ⇒ contend (never fold to empty);
     //  (B) a LIVE FOREIGN hold-intent ⇒ a holder is mid-publish/arriving ⇒ contend (never steal — DB-R7 occupancy protection);
-    //  (C) OUR OWN unfinished occupancy (this process stranded THIS dir) ⇒ adopt (a stale same-pid intent on disk never qualifies);
-    //  (D) else an EXTERNAL DEAD holder's stranded dir (a dead hold-intent present, no live one) ⇒ CLAIM that intent, then adopt.
+    //  (C) OUR OWN unfinished occupancy (this process stranded THIS dir, tracked in-process) ⇒ adopt.
+    // An EXTERNAL empty dir — including a DEAD holder's stranded one — is NEVER adopted here: a stale on-disk credential cannot
+    // prove the CURRENT dir is unoccupied (DB-R7 A/B — a dead intent may outlive the dir it named), and a crashed external holder's
+    // recovery is handled out of band (R26). So external empty dirs are simply contended.
     const bdir = batchDir(home, batchId);
     let others: { name: string; pid: number }[];
     try { others = listHoldIntents(home, batchId).filter((i) => i.name !== path.basename(intent)); } catch { dropIntent(); return null; }
     if (others.some((i) => i.pid !== process.pid && pidAlive(i.pid))) { dropIntent(); return null; } // (B) live foreign ⇒ contend
-    const adopt = (): string | null => {
-      try { writeFileSync(mine, "", { mode: 0o600 }); } catch { dropIntent(); return null; } // dir not writable / vanished ⇒ contend; a later retry re-adopts or wins fresh
-      strandedLockDirs.delete(dir);
-      for (const i of others) { if (i.pid === process.pid || !pidAlive(i.pid)) { try { unlinkSync(path.join(bdir, i.name)); } catch { /* best-effort cleanup of stale/dead credentials */ } } }
-      return token;
-    };
-    if (strandedLockDirs.has(dir)) return adopt(); // (C) our own stranded dir
-    const dead = others.find((i) => Number.isInteger(i.pid) && i.pid > 0 && !pidAlive(i.pid));
-    if (dead) { try { unlinkSync(path.join(bdir, dead.name)); } catch { dropIntent(); return null; } return adopt(); } // (D) claim the dead credential (single-winner), then adopt
-    dropIntent(); return null; // no provable recoverable occupancy (live gap / stale own / bare empty) ⇒ contend
+    if (!strandedLockDirs.has(dir)) { dropIntent(); return null; } // (C-neg) not our own unfinished occupancy ⇒ contend
+    try { writeFileSync(mine, "", { mode: 0o600 }); } catch { dropIntent(); return null; } // (C) adopt; dir not writable/vanished ⇒ contend (a later retry re-adopts or wins fresh)
+    strandedLockDirs.delete(dir);
+    for (const i of others) { if (i.pid === process.pid) { try { unlinkSync(path.join(bdir, i.name)); } catch { /* best-effort cleanup of our OWN stale intents (a dead foreign intent is left for R26) */ } } }
+    return token;
   }
   dropIntent(); return null; // >1 identity (ambiguous) ⇒ contended
 }
