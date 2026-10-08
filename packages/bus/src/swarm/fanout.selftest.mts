@@ -2,10 +2,10 @@
 //   npx tsx packages/bus/src/swarm/fanout.selftest.mts
 // Each pre-study pit (docs/swarm/fanout-prestudy.md §2) is a NAMED counterexample below.
 import {
-  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, effectiveTier, isSafeRunKey,
-  isTerminal, markAborted, newLedgerRow, nextReceipt, planResume, progress, reconcileOrphans, reduceUnits,
-  validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthClass, widthGate, zoneName,
-  type FanoutUnit, type LedgerRow, type UnitResult,
+  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, degradeDisplay,
+  effectiveTier, elapsedTimedOut, isSafeRunKey, isTerminal, markAborted, newLedgerRow, nextReceipt, planResume,
+  progress, reconcileOrphans, reduceUnits, validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthClass,
+  widthGate, zoneName, type FanoutUnit, type LedgerRow, type UnitResult,
 } from "./fanout.js";
 
 const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED: " + name); console.log("ok  " + name); };
@@ -61,6 +61,11 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("over pane budget (17) -> headless", chooseDisplayMode(17, true) === "headless");
   t("exactly 16 -> temp-workspace", chooseDisplayMode(16, true) === "temp-workspace");
   t("zoneName prefixes fanout-", zoneName("abc") === "fanout-abc");
+  t("zone-open fail degrades temp-workspace to headless (FN4-B)", degradeDisplay("temp-workspace", false) === "headless");
+  t("zone opened keeps temp-workspace", degradeDisplay("temp-workspace", true) === "temp-workspace");
+  t("headless stays headless under degrade", degradeDisplay("headless", false) === "headless");
+  t("unit past its timeout is timed out (FN4-B hang)", elapsedTimedOut(0, 1000, 500) === true);
+  t("unit within its timeout is not", elapsedTimedOut(0, 400, 500) === false);
 }
 
 // --- reduce + holes + quarantine (pit 2.1) ---

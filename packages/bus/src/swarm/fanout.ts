@@ -141,6 +141,17 @@ export function zoneName(runKey: string): string {
   return `fanout-${runKey}`;
 }
 
+// FN4-B degradation: a requested temp-workspace falls back to headless if the zone could not be opened —
+// governance (guardrail/ledger/aggregate) is identical, only the display changes.
+export function degradeDisplay(requested: DisplayMode, zoneOpened: boolean): DisplayMode {
+  return requested === "temp-workspace" && !zoneOpened ? "headless" : requested;
+}
+
+// FN4-B hang detection: a unit that has run past its timeout is timed out.
+export function elapsedTimedOut(startedAt: number, now: number, timeoutMs: number): boolean {
+  return now - startedAt > timeoutMs;
+}
+
 // ---------- ledger ----------
 export type UnitStatus = "running" | "done" | "failed" | "timeout" | "delivery_uncertain" | "aborted";
 export type Backend = "self-built" | "native";
@@ -152,6 +163,7 @@ export type LedgerRow = {
   zone?: string;
   pane?: string;
   pid?: number;
+  spawnOk?: boolean;
   tier: FanoutTier;
   status: UnitStatus;
   startedAt?: number;

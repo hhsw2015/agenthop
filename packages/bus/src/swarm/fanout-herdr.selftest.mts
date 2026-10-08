@@ -36,6 +36,7 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   t("command sets the tier-model on the command line", cmd.includes(`--model ${shquote("claude-haiku-5-5")}`));
   t("command passes the prompt via -p, shell-quoted", cmd.includes(`-p ${shquote("scan the repo")}`));
   t("command redirects all output to the harvest file", cmd.includes(`> ${shquote("/t/out.log")} 2>&1`));
+  t("command captures the real exit code to the rc sidecar (FN8 for visible)", cmd.includes(`echo $? > ${shquote("/t/out.log.rc")}`));
   t("command echoes the completion marker last", cmd.trim().endsWith(`echo ${shquote("FANOUT_DONE_k1")}`));
   t("default extra args skip permissions", cmd.includes("--dangerously-skip-permissions"));
   // F41 char-swallow defense: a prompt with quotes/semicolons stays ONE safe command (shquote escapes it),

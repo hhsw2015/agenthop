@@ -62,5 +62,12 @@ export function doneMarker(key: string): string {
 // is shell-quoted (F41: a single atomic command, never char-by-char keystrokes).
 export function unitCommand(opts: { bin: string; model: string; prompt: string; outputFile: string; key: string; extraArgs?: readonly string[] }): string {
   const extra = (opts.extraArgs ?? ["--dangerously-skip-permissions"]).join(" ");
-  return `${opts.bin} --model ${shquote(opts.model)} ${extra} -p ${shquote(opts.prompt)} > ${shquote(opts.outputFile)} 2>&1; echo ${shquote(doneMarker(opts.key))}`;
+  // Capture the REAL exit code to a sidecar `<outputFile>.rc` so the visible path has true exit evidence
+  // (round-1 FN8), then echo the completion marker last for `pane wait-output`.
+  return `${opts.bin} --model ${shquote(opts.model)} ${extra} -p ${shquote(opts.prompt)} > ${shquote(opts.outputFile)} 2>&1; echo $? > ${shquote(opts.outputFile + ".rc")}; echo ${shquote(doneMarker(opts.key))}`;
+}
+
+// The sidecar path where a visible unit's exit code lands.
+export function rcFile(outputFile: string): string {
+  return outputFile + ".rc";
 }
