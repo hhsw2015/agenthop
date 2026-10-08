@@ -18,10 +18,10 @@ Compact HS256 JWT, `base64url(header).base64url(payload).base64url(hmac)`, heade
 1. token present + 3 dot-parts (missing/empty ⇒ `no token` — this IS the R16 anti-laundering: a relayed `user approved` carries no token).
 2. header `alg === "HS256"` (blocks `alg:none` and algorithm-downgrade).
 3. HMAC-SHA256 signature over `header.payload`, compared constant-time (`timingSafeEqual`).
-4. `iss` matches the expected (`id` vs `cap` never cross).
-5. not expired (`now < exp` when `exp` present).
-6. payload SHAPE (SC1, after the signature, never throwing): must be a non-null object; `sub` is a mandatory non-empty string; any `exp` must be a finite number; a `cap` MUST carry a finite `exp` AND a known `act`.
-7. not expired (`now < exp`); optional `sub` match; optional `act` match (cap only — a `vm-spawn` cap does NOT authorize `three-gate-proxy`).
+4. payload parses to a non-null object (SC1, after the signature, never throwing; null/array/primitive ⇒ reject).
+5. `iss` matches the expected (`id` vs `cap` never cross); `sub` is a mandatory non-empty string.
+6. SHAPE (SC1): any `exp` must be a finite number; a `cap` MUST carry a finite `exp` AND a known `act`.
+7. not expired (`now < exp` when `exp` present); optional `sub` match; optional `act` match (cap only — a `vm-spawn` cap does NOT authorize `three-gate-proxy`).
 
 ## Secret handling (frozen)
 
