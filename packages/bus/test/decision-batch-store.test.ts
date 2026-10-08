@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, chmodSync, statSync, readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, chmodSync, statSync, readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, renameSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { openBatch, readBatch, writeDecisions, readDecisions, consumeDecisions, listBatches } from "../src/swarm/decision-batch-store.js";
@@ -215,7 +215,7 @@ describe("decision-batch store (IO)", () => {
     openBatch(HOME, { batchId: "b1", owner: "coord", items: [item("1")], nowSec: 1 });
     // a prior notify that locked but faulted before recording the send (no notified.sent)
     writeFileSync(path.join(dbDir("b1"), "notified.lock"), JSON.stringify({ to: "user-sid", at: 1 }));
-    expect(() => openBatch(HOME, { batchId: "b1", owner: "coord", items: [item("1")], nowSec: 2, notifyTo: "user-sid" })).toThrow(/unsent/);
+    expect(() => openBatch(HOME, { batchId: "b1", owner: "coord", items: [item("1")], nowSec: 2, notifyTo: "user-sid" })).toThrow(/unconfirmed/);
     expect(claimInbox(HOME, ["user-sid"], "probe")).toHaveLength(0); // NOT re-sent (can't prove the prior ping didn't land)
   });
 
@@ -225,5 +225,22 @@ describe("decision-batch store (IO)", () => {
     consumeDecisions(HOME, "b1");
     expect(JSON.parse(readFileSync(path.join(dbDir("b1"), "consumed.json"), "utf8"))).toMatchObject({ batchId: "b1", decidedAtSec: 2 }); // complete/parseable
     expect(readdirSync(dbDir("b1")).some((n) => n.includes(".tmp-"))).toBe(false); // temp cleaned up
+  });
+
+  test("DB-R3-P1-1 (instance): an old reader whose claim was replaced does NOT commit its stale verdict (inode binding)", () => {
+    openBatch(HOME, { batchId: "b1", owner: "c", items: [item("same")], nowSec: 1 });
+    // old consumer's claim sits as approve; simulate a concurrent replacement AFTER it read by swapping the claim inode
+    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
+    const claim = path.join(dbDir("b1"), "decisions-consumed-claim.json");
+    renameSync(path.join(dbDir("b1"), "decisions.json"), claim); // the old claim (approve)
+    const readIno = statSync(claim).ino;
+    // a newer consumer replaces the claim instance (reject) — different inode at the same path
+    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 21, decisions: [{ id: "same", verdict: "reject" }] });
+    renameSync(path.join(dbDir("b1"), "decisions.json"), claim); // overwrite ⇒ new inode
+    expect(statSync(claim).ino).not.toBe(readIno); // precondition: the instance changed
+    // a consume now reads the CURRENT claim (reject) and commits it; the stale approve instance is gone
+    const got = consumeDecisions(HOME, "b1");
+    expect(got.consumed).toBe(true);
+    expect(got.resolved.map((r) => r.verdict)).toEqual(["reject"]); // the live instance wins, never the replaced approve
   });
 });

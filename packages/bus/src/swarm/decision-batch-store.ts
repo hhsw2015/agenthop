@@ -70,6 +70,14 @@ function existsStrict(file: string): boolean {
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return false; throw e; }
 }
 
+/** The inode of `file`, or null if absent (ENOENT). Any other error (EACCES/…) THROWS. Used to BIND a consume to the exact
+ *  claim INSTANCE it read: a concurrent consumer that overwrites decisions.json → the stable claim path replaces the inode, and
+ *  the old reader must neither commit its stale verdict nor archive the newer instance (DB-R3-P1-1). */
+function claimIno(file: string): number | null {
+  try { return statSync(file).ino; }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
+}
+
 export function newBatchId(): string { return `batch-${randomBytes(8).toString("hex")}`; }
 
 /** Read a file, distinguishing ENOENT (absent ⇒ `null` for the caller) from any other error (EACCES/… ⇒ throw — a read
@@ -153,7 +161,9 @@ function notifyOnce(home: string, batchId: string, owner: string, itemCount: num
   const lock = notifyLockPath(home, batchId);
   if (createExclusiveAtomic(lock, JSON.stringify({ to: notifyTo, at: nowSec })) === "exists") {
     if (existsStrict(sent)) return; // the lock holder completed the send
-    throw new Error(`notifyOnce: batch ${batchId} notification is locked but unsent (another notifier in-flight or faulted) — not re-sending to avoid a duplicate ping`);
+    // DB-N1: the holder may have sent the ping and only failed to record the proof — so this is DELIVERY-UNCONFIRMED, not
+    // definitively "unsent". Surface it as uncertain (never a silent skip, never a blind re-send that could duplicate).
+    throw new Error(`notifyOnce: batch ${batchId} notification delivery is unconfirmed (a prior notifier is in-flight or faulted after possibly sending) — not re-sending to avoid a duplicate ping`);
   }
   // We hold the exclusive lock. Record the pre-send intent (its rename is the tests' injection point), then send, then prove it.
   try { writeJsonAtomic(notifiedMarkerPath(home, batchId), { to: notifyTo, notifiedAtSec: nowSec }); }
@@ -194,35 +204,42 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
   const none: ConsumeResult = { resolved: [], undecided: batch.items, unknownIds: [], consumed: false };
   const consumedMarker = consumedMarkerPath(home, batchId);
   const claim = claimPath(home, batchId);
-  // DB-P1-3: a batch consumed once is TERMINAL — a decisions.json re-written afterwards never re-releases verdicts (remaining
-  // items were re-asked under a NEW batchId). consumed.json only ever appears COMPLETE (createExclusiveAtomic), so its mere
-  // presence is a true "done" — a half-written marker can never seal the batch (DB-R2-P1-1).
+  // DB-P1-3: a batch consumed once is TERMINAL — consumed.json only ever appears COMPLETE (createExclusiveAtomic), so its mere
+  // presence is a true "done"; a half-written marker can never seal the batch (DB-R2-P1-1).
   if (existsStrict(consumedMarker)) return none;
-  // Prefer a FRESH decisions.json: claim it (rename → the STABLE claim name) BEFORE reading (DB-P1-2 — a producer swapping
-  // decisions.json after the claim lands on a new file, never on the verdicts we return). The stable name means a newer claim
-  // atomically OVERWRITES an older one, so the LATEST decision wins with NO wall-clock/random ordering (DB-R3-P1-1), and a stale
-  // failed claim is superseded, never revived (DB-R2-P1-1).
-  let claimFile: string | null = null;
+  // Prefer a FRESH decisions.json: claim it (rename → the STABLE claim name) BEFORE reading (DB-P1-2). The stable name means a
+  // newer claim atomically OVERWRITES an older one, so the LATEST decision wins with no wall-clock/random ordering (DB-R3-P1-1).
+  let haveClaim = false;
   if (existsStrict(decisionsPath(home, batchId))) {
-    try { renameSync(decisionsPath(home, batchId), claim); claimFile = claim; }
+    try { renameSync(decisionsPath(home, batchId), claim); haveClaim = true; }
     catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; } // a racer took decisions.json first ⇒ fall through to resume its claim
   }
-  // No fresh decision ⇒ RESUME the stable claim (a prior consume faulted after claiming but before the terminal marker). This is
-  // the recovery path: a fault leaves a recoverable claim, not "undecided"; a retry finishes it with no resubmit.
-  if (!claimFile && existsStrict(claim)) claimFile = claim;
-  if (!claimFile) return none; // nothing to consume (no decisions yet / a racer already claimed+closed)
-  const doc = readJsonOrNull(claimFile, validDecisionsDoc); // read EXACTLY the claimed bytes; EACCES → throws, the claim persists → recoverable retry (DB-R2-P1-1)
-  // DB-P1-1: the claimed doc MUST be bound to this batch. A misbound (foreign batchId) or corrupt claim yields NO actionable
-  // verdict and is NOT marked consumed — it is set aside (decisions-rejected-claim.json) so it can't starve the real decisions nor be re-resumed.
+  // No fresh decision ⇒ RESUME the stable claim (a prior consume faulted after claiming but before the terminal marker).
+  if (!haveClaim && existsStrict(claim)) haveClaim = true;
+  if (!haveClaim) return none; // nothing to consume (no decisions yet / a racer already claimed+closed)
+  // DB-R3-P1-1 instance binding: capture the inode of the claim we are about to READ. A concurrent consumer that overwrites
+  // decisions.json → claim replaces this inode; we must then neither commit our stale read nor archive the newer instance.
+  const readIno = claimIno(claim);
+  if (readIno === null) return none; // the claim vanished (a racer took and closed it)
+  const doc = readJsonOrNull(claim, validDecisionsDoc); // reads exactly these bytes; a concurrent replace lands on a NEW inode
+  // DB-P1-1: the claimed doc MUST be bound to this batch. A misbound/corrupt claim yields NO actionable verdict and is set aside
+  // (decisions-rejected-claim.json). Bind to OUR instance: if the archive rename actually moved a DIFFERENT (newer) inode — a
+  // concurrent claim slipped into the path during the rename — restore it so the newer decision is consumed on retry (DB-R3-P1-1).
   if (!doc || doc.batchId !== batchId) {
-    try { renameSync(claim, rejectedClaimPath(home, batchId)); } catch { /* raced away */ }
+    const rejected = rejectedClaimPath(home, batchId);
+    try {
+      renameSync(claim, rejected);
+      if (claimIno(rejected) !== readIno) { try { renameSync(rejected, claim); } catch { /* a racer re-took it */ } }
+    } catch { /* claim raced away */ }
     return { ...none, unknownIds: doc ? doc.decisions.map((d) => d.id) : [] };
   }
   const res = resolveBatch(batch, doc);
-  // DB-P1-3 / DB-R2-P1-1: commit the TERMINAL marker via temp+link — the atomic batch-level single winner that appears ONLY with
-  // complete content. A plain rename/claim is NOT a batch commit (concurrent/raced consumers can hold the same claim); only the
-  // one that CREATES consumed.json closes the batch. "exists" ⇒ another consumer won ⇒ execute nothing (no double). A write/link
-  // fault (EFBIG/EACCES) THROWS with the claim intact ⇒ a retry completes the SAME consume (no user resubmit, no partial seal).
+  // DB-R3-P1-1: commit ONLY if the claim is still OUR instance (not replaced by a newer decision between our read and commit).
+  // Otherwise abort — the newer claim is consumed on a retry; we never commit a superseded verdict.
+  if (claimIno(claim) !== readIno) return none;
+  // DB-P1-3 / DB-R2-P1-1: commit the TERMINAL marker via temp+link — appears ONLY complete, and the single creator wins
+  // ("exists" ⇒ another consumer already closed the batch ⇒ execute nothing). A write/link fault (EFBIG/EACCES) THROWS with the
+  // claim intact ⇒ a retry completes the SAME consume (no user resubmit, no partial seal).
   if (createExclusiveAtomic(consumedMarker, JSON.stringify({ batchId, decidedAtSec: doc.decidedAtSec, consumedAtMs: Date.now() })) === "exists") return none;
   return { ...res, consumed: true };
 }

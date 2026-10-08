@@ -68,14 +68,16 @@ Duplicate item ids ⇒ the whole batch is rejected at the write boundary (a verd
 ## Flow
 
 1. Coordinator `openBatch(home, {owner, items, nowSec, notifyTo?})` → writes `batch.json`; if `notifyTo` (a stableId) is set,
-   writes EXACTLY ONE durable-inbox ping (`via:"decision-batch"`, `taskRef:"decision-batch:<id>"`, text "N decision(s)
-   pending") and records `notified.json`. The ping is NOT best-effort: if the inbox write fails, `openBatch` THROWS (no
-   `notified.json` written) so the caller knows the user was not pinged; an idempotent retry (same batchId) re-sends it. A
-   repeat open after a successful ping does not re-ping.
+   sends EXACTLY ONE durable-inbox ping (`via:"decision-batch"`, `taskRef:"decision-batch:<id>"`, text "N decision(s) pending").
+   The ping is NOT best-effort and is at-most-once under concurrency/faults: a pre-send intent (`notified.json`) is recorded,
+   the ping is sent, then `notified.sent` (the only proof-of-sent) is written; an exclusive `notified.lock` serializes
+   notifiers. If the inbox write fails, `openBatch` THROWS and a retry re-sends exactly one; if the send landed but the proof
+   could not be recorded (or a concurrent notifier is mid-flight), `openBatch` THROWS DELIVERY-UNCONFIRMED rather than
+   re-pinging. A repeat open after a recorded send does not re-ping.
 2. Console/CLI renders the one-screen list; the user decides each item; the console writes `decisions.json` via `writeDecisions`.
-3. Coordinator `consumeDecisions(home, batchId)` → CLAIMS `decisions.json` first (rename → `decisions-consumed-<ts>`), reads
-   exactly the claimed bytes, matches them, then EXCLUSIVE-creates `consumed.json`. Returns `{ resolved, undecided, unknownIds,
-   consumed }`.
+3. Coordinator `consumeDecisions(home, batchId)` → CLAIMS `decisions.json` first (rename → the stable `decisions-consumed-claim.json`),
+   captures that claim's inode, reads exactly the claimed bytes, matches them, then commits `consumed.json` (temp+link) ONLY if
+   the claim is still that same instance. Returns `{ resolved, undecided, unknownIds, consumed }`.
 4. Coordinator executes `resolved` where `verdict≠defer` (`actionable(resolved)`), and re-batches `undecided` + deferred under a
    NEW batchId. The old batch is now `consumed.json`-marked and never re-decided.
 
