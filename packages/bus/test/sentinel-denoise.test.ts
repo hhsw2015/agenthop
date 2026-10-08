@@ -144,6 +144,19 @@ describe("F44 sentinel-denoise — ⑤ single-instance process-tree check", () =
     expect(isDispatcherLoopCommand("node /x/node_modules/tsx/dist/cli.mjs scripts/swarm-dispatch.ts")).toBe(true);
     expect(isDispatcherLoopCommand("node --require /x/tsx/preflight.cjs --import file:///x/tsx/loader.mjs scripts/swarm-dispatch.ts")).toBe(true);
     expect(isDispatcherLoopCommand("pnpm exec tsx scripts/swarm-dispatch.ts")).toBe(true);
+    // F44-P1-1 (round-3) — an UNKNOWN value-taking option must NOT let its value masquerade as the entry: the real entry is a
+    // later tool, so do not refuse-to-start on it.
+    expect(isDispatcherLoopCommand("node --redirect-warnings /x/scripts/swarm-dispatch.ts /x/warnings-tool.mjs")).toBe(false);
+    expect(isDispatcherLoopCommand("node --diagnostic-dir /x/swarm-dispatch.ts /x/tool.mjs")).toBe(false);
+    // F44-P1-1 (round-3) — a mere `tsx/` DIRECTORY member is an ordinary tool, not a runtime cli; swarm-dispatch.ts is its arg.
+    expect(isDispatcherLoopCommand("node /x/node_modules/fixture-tsx/tsx/analyzer.mjs scripts/swarm-dispatch.ts")).toBe(false);
+    // F44-P1-1 (round-3) — but a KNOWN loader value that itself LOOKS like a dispatch entry is still consumed by --import; the
+    // REAL entry is the next positional ⇒ STILL the loop.
+    expect(isDispatcherLoopCommand("node --import /tmp/swarm-dispatch.ts /real/scripts/swarm-dispatch.ts")).toBe(true);
+    // F44-P1-1 (round-3) — an EXPLICIT ts-node cli entrypoint (dist/bin.js) resolves to its next positional ⇒ the loop.
+    expect(isDispatcherLoopCommand("node /x/node_modules/ts-node/dist/bin.js scripts/swarm-dispatch.ts")).toBe(true);
+    // F44-P1-1 (round-3) — npx `-y` plus `-p <pkg>` value flags are unwrapped before the tsx runtime ⇒ the loop.
+    expect(isDispatcherLoopCommand("npx -y -p tsx tsx scripts/swarm-dispatch.ts")).toBe(true);
   });
   test("selfTree walks self + ancestors via ppid", () => {
     const procs = ps([{ pid: 500, ppid: 400, command: "node .../tsx swarm-dispatch.ts" }, { pid: 400, ppid: 300, command: "npx tsx scripts/swarm-dispatch.ts" }, { pid: 300, ppid: 1, command: "sh" }]);

@@ -90,8 +90,10 @@ const EVAL_OPT_RE = /^(-e|--eval|-p|--print|-c)(=|$)/;
 const baseName = (t: string): string => t.slice(t.lastIndexOf("/") + 1);
 const isDispatchEntry = (t: string): boolean => !t.startsWith("-") && (t === "swarm-dispatch.ts" || t.endsWith("/swarm-dispatch.ts"));
 /** A nested JS-runtime cli passed as the parent runtime's first positional (`node /x/tsx <script>`, `node .../tsx/dist/cli.mjs
- *  <script>`): the REAL entry is the token AFTER it. */
-const isNestedRuntimeCli = (t: string): boolean => !t.startsWith("-") && !isDispatchEntry(t) && (["tsx", "ts-node"].includes(baseName(t)) || /(^|\/)(tsx|ts-node)\//.test(t));
+ *  <script>`): the REAL entry is the token AFTER it. Recognized ONLY as the bare `tsx`/`ts-node` basename or an EXPLICIT cli
+ *  entrypoint (`.../tsx/dist/cli.*`, `.../ts-node/dist/bin.*`) — NOT any file that merely sits under a `tsx/` directory
+ *  (F44-P1-1: `.../tsx/analyzer.mjs` is an ordinary tool, not a runner). */
+const isNestedRuntimeCli = (t: string): boolean => !t.startsWith("-") && !isDispatchEntry(t) && (["tsx", "ts-node"].includes(baseName(t)) || /\/(tsx|ts-node)\/dist\/(cli|bin)\.[cm]?js$/.test(t));
 
 /**
  * F44-P1-1 — true ONLY when `cmd` is a real, long-running execution whose ENTRY is the dispatcher script. It PARSES the command
@@ -122,8 +124,12 @@ export function isDispatcherLoopCommand(cmd: string): boolean {
   const skipOpts = (): boolean => {
     while (i < toks.length && toks[i]!.startsWith("-")) {
       const t = toks[i]!;
-      if (EVAL_OPT_RE.test(t)) return false;
-      if (!t.includes("=") && VALUE_OPTS.has(t)) i += 2; else i += 1;
+      if (EVAL_OPT_RE.test(t)) return false;        // eval in any form ⇒ runs the eval STRING, not a script entry
+      if (t.includes("=")) { i += 1; continue; }     // self-contained flag (value attached) ⇒ consumes only itself
+      if (VALUE_OPTS.has(t)) { i += 2; continue; }   // KNOWN value-taking option ⇒ skip it + its value
+      return false;                                  // UNKNOWN space-form option: cannot tell if its value is the next token,
+                                                     // so never guess that token is the entry (F44-P1-1: an unknown option must
+                                                     // not ground a refusal) ⇒ not a confident dispatcher loop
     }
     return true;
   };
