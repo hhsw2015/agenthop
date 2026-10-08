@@ -1,0 +1,114 @@
+/**
+ * Dual-bandwidth gauge pure core (T5-2, DHH-eval borrow — grounds in docs/research/dhh-16thread-eval.md). DHH's deep insight:
+ * the bottleneck is HUMAN JUDGMENT bandwidth, not agent throughput — "the faster the agents run, the fewer threads I can run"
+ * (38:21). When the rate at which agents PRODUCE items needing a human verdict outruns the rate at which the user CONSUMES
+ * (clears) those verdicts, the backlog grows unbounded and the user drowns. Today that imbalance is invisible. This gauge makes
+ * it a reading: two bandwidths (produce / consume), their ratio, the backlog and its drain time, and a zone the coordinator
+ * acts on (compress harder / throttle thread-opening).
+ *
+ * DESIGN LAW (DHH 18:51): the gauge MEASURES so the coordinator can COMPRESS or THROTTLE; it is a sensor, never an approval or
+ * latency hop. RED means "open fewer threads" (R18 two-tier: concurrency bounded by B_cons), NOT "add an approval gate".
+ *
+ * Pure: no fs, no clock beyond the injected `nowSec`, so the window math + zone thresholds are unit-tested without disk. The IO
+ * half (scan decision-batch / chat-room / inbox durable files → event timestamps) lives in dual-bandwidth-store.ts. This core
+ * takes two already-classified timestamp streams and the current backlog, and never reads a source.
+ *
+ * Coordinator rulings folded (2026-10-08): (1) two numbers per bandwidth — a rolling-window RATE (real-time imbalance) + a
+ * session-cumulative COUNT (daily-report base); (2) thresholds 0.8/1.2 are tunable constants to start; (3) B_cons counts ONLY
+ * real decisions (approve/reject/defer + 呈批 verdicts), NEVER chat-room sign-offs (communication is not a decision — folding it
+ * in would inflate the apparent consume rate) — that classification is the IO layer's job, this core just takes the streams.
+ */
+
+/** The coordinator-facing zone. GREEN = carry on; AMBER = compress harder (bigger batches, defer low-priority, merge 呈批);
+ *  RED = throttle thread-opening (never an approval hop). */
+export type BwZone = "green" | "amber" | "red";
+
+/** Tunable thresholds + window (coordinator ruling (2): constants to start, recalibrate after a week). */
+export type DualBandwidthConfig = {
+  windowSec?: number;          // rolling window for the main rate (default 3600 = 1h)
+  amberRatio?: number;         // ratio above this (and ≤ redRatio) ⇒ at least AMBER (default 0.8)
+  redRatio?: number;           // ratio above this ⇒ RED (default 1.2)
+  backlogSoftCap?: number;     // backlog at/above this ⇒ at least AMBER (default 20)
+  backlogHardCap?: number;     // backlog above this ⇒ RED (default 50)
+  tDrainHorizonHours?: number; // drain time above this ⇒ RED (default 8)
+};
+
+/** One gauge reading. Rates are PER HOUR. `ratio` / `tDrainHours` are null when undefined (no consumption in the window): a
+ *  non-serializable Infinity is never emitted — the zone carries the severity instead. */
+export type DualBandwidthReading = {
+  bProd1h: number;            // produce rate over the window, per hour
+  bCons1h: number;            // consume (real-decision) rate over the window, per hour
+  bProdTotal: number;         // cumulative produce events this session
+  bConsTotal: number;         // cumulative consume events this session
+  ratio: number | null;       // bProd1h / bCons1h; null when bCons1h === 0 (undefined)
+  backlog: number;            // D — current undecided count
+  dBacklogDtPerHour: number;  // net backlog growth rate = bProd1h - bCons1h (dD/dt)
+  tDrainHours: number | null; // backlog / bCons1h; 0 when backlog === 0; null when bCons1h === 0 and backlog > 0 (never drains)
+  zone: BwZone;
+};
+
+export type DualBandwidthInput = {
+  nowSec: number;
+  produceAtSec: readonly number[]; // timestamps (sec) of items that needed a human verdict (decision-batch opens + 呈批/签收/并库/立项)
+  consumeAtSec: readonly number[]; // timestamps (sec) of REAL decisions cleared (consume verdicts + 呈批 verdicts) — NO chat sign-offs
+  backlog: number;                 // D — current undecided count (from the IO layer)
+  config?: DualBandwidthConfig;
+};
+
+const DEFAULTS = { windowSec: 3600, amberRatio: 0.8, redRatio: 1.2, backlogSoftCap: 20, backlogHardCap: 50, tDrainHorizonHours: 8 };
+
+function resolveConfig(c: DualBandwidthConfig = {}): Required<DualBandwidthConfig> {
+  const cfg = { ...DEFAULTS, ...c };
+  // Reject an invalid config LOUDLY — never silently disable a threshold or emit a NaN reading (mirrors RoomRateLimiter).
+  if (!Number.isFinite(cfg.windowSec) || cfg.windowSec <= 0) throw new Error(`dual-bandwidth: windowSec must be a positive finite number (got ${String(c.windowSec)})`);
+  if (!Number.isFinite(cfg.amberRatio) || cfg.amberRatio <= 0) throw new Error(`dual-bandwidth: amberRatio must be a positive finite number (got ${String(c.amberRatio)})`);
+  if (!Number.isFinite(cfg.redRatio) || cfg.redRatio <= 0) throw new Error(`dual-bandwidth: redRatio must be a positive finite number (got ${String(c.redRatio)})`);
+  if (cfg.redRatio <= cfg.amberRatio) throw new Error(`dual-bandwidth: redRatio (${cfg.redRatio}) must exceed amberRatio (${cfg.amberRatio})`);
+  if (!Number.isInteger(cfg.backlogSoftCap) || cfg.backlogSoftCap < 0) throw new Error(`dual-bandwidth: backlogSoftCap must be a non-negative integer (got ${String(c.backlogSoftCap)})`);
+  if (!Number.isInteger(cfg.backlogHardCap) || cfg.backlogHardCap < 0) throw new Error(`dual-bandwidth: backlogHardCap must be a non-negative integer (got ${String(c.backlogHardCap)})`);
+  if (cfg.backlogHardCap < cfg.backlogSoftCap) throw new Error(`dual-bandwidth: backlogHardCap (${cfg.backlogHardCap}) must be ≥ backlogSoftCap (${cfg.backlogSoftCap})`);
+  if (!Number.isFinite(cfg.tDrainHorizonHours) || cfg.tDrainHorizonHours <= 0) throw new Error(`dual-bandwidth: tDrainHorizonHours must be a positive finite number (got ${String(c.tDrainHorizonHours)})`);
+  return cfg;
+}
+
+/** Count timestamps inside the rolling window (now-windowSec, now]; a far-future stamp (clock skew) still counts as recent. */
+function rateInWindow(atSec: readonly number[], nowSec: number, windowSec: number): number {
+  const cutoff = nowSec - windowSec;
+  let n = 0;
+  for (const t of atSec) if (Number.isFinite(t) && t > cutoff) n += 1;
+  return n / (windowSec / 3600); // normalize the count to a PER-HOUR rate regardless of window length
+}
+
+/**
+ * Compute the dual-bandwidth reading from two timestamp streams + the current backlog. Deterministic in `nowSec`. The IO layer
+ * classifies events into the two streams (and excludes chat sign-offs from `consumeAtSec`, ruling (3)); this core only aggregates.
+ */
+export function computeDualBandwidth(input: DualBandwidthInput): DualBandwidthReading {
+  const cfg = resolveConfig(input.config);
+  if (!Number.isFinite(input.nowSec)) throw new Error(`dual-bandwidth: nowSec must be a finite number (got ${String(input.nowSec)})`);
+  if (!Number.isInteger(input.backlog) || input.backlog < 0) throw new Error(`dual-bandwidth: backlog must be a non-negative integer (got ${String(input.backlog)})`);
+
+  const bProd1h = rateInWindow(input.produceAtSec, input.nowSec, cfg.windowSec);
+  const bCons1h = rateInWindow(input.consumeAtSec, input.nowSec, cfg.windowSec);
+  const bProdTotal = input.produceAtSec.filter((t) => Number.isFinite(t)).length;
+  const bConsTotal = input.consumeAtSec.filter((t) => Number.isFinite(t)).length;
+  const consuming = bCons1h > 0;
+  const backlog = input.backlog;
+
+  const ratio = consuming ? bProd1h / bCons1h : null;
+  const dBacklogDtPerHour = bProd1h - bCons1h;
+  const tDrainHours = backlog === 0 ? 0 : consuming ? backlog / bCons1h : null; // null ⇒ never drains (no consumption)
+
+  // Zone, precedence RED > AMBER > GREEN.
+  //  RED  : ratio > redRatio (or producing with ZERO consumption = max imbalance) · backlog over hard cap · drain over horizon
+  //         (a null drain = "never drains" while backlog > 0 exceeds any horizon).
+  //  AMBER: ratio > amberRatio · backlog rising (dD/dt > 0) · backlog at/over soft cap.
+  const ratioRed = consuming ? ratio! > cfg.redRatio : bProd1h > 0;
+  const drainRed = tDrainHours === null ? backlog > 0 : tDrainHours > cfg.tDrainHorizonHours;
+  let zone: BwZone;
+  if (ratioRed || backlog > cfg.backlogHardCap || drainRed) zone = "red";
+  else if ((consuming && ratio! > cfg.amberRatio) || dBacklogDtPerHour > 0 || backlog >= cfg.backlogSoftCap) zone = "amber";
+  else zone = "green";
+
+  return { bProd1h, bCons1h, bProdTotal, bConsTotal, ratio, backlog, dBacklogDtPerHour, tDrainHours, zone };
+}
