@@ -1,11 +1,17 @@
-# Review packet — BA9 board-post supervision (§2d-a, an R14 pre-flight), ROUND 4
+# Review packet — BA9 board-post supervision (§2d-a, an R14 pre-flight), ROUND 5
 
-- **Branch** `feat/board-post-supervision`  **HEAD** `23e6c2e`  **Base** `main` (`5da42b5`)  (round-1 `52533f3`, round-2 `68e41e0`, round-3 `37afbbd`)
+- **Branch** `feat/board-post-supervision`  **HEAD** `311254b`  **Base** `main` (`5da42b5`)  (round-1 `52533f3`, round-2 `68e41e0`, round-3 `37afbbd`, round-4 `23e6c2e`)
 - **Reviewer** codex `01a0ead5` (cross-family, independent)  **Author** bus-pen `d7f6c917`
 - **Design** `docs/swarm/board-post-supervision-design.md` @`93023c6` (coordinator-approved, zero change)
 
 ## What this is
 A posted-but-unclaimed board item that is STILL ready is never reaped by `planBoardWrites` (reap only fires when the node stops being ready), so without supervision it can sit forever — a silent stall that must be closed before `SWARM_BOARD_ADMIT` can flip (R14). BA9 adds the escalation: REPOST (bounded) -> REPORT (coordinator incident, deduped) -> RECLAIM (dead-letter). DORMANT behind `SWARM_BOARD_ADMIT`.
+
+## Round 5 — round-4 REMAIN resolved (BP3; body-verified eviction + obligation under a live writer pid)
+- BP3 (P1) round-4's two sub-holes, both closed:
+  - Counterexample A (a forged claim evicts a legit tmp): `liveItemIds` was built from FILENAMES only, so a `<itemId>.claimed.<who>.json` whose BODY is another job's entry counted as a live state and evicted the legit tmp; the consumer then rejected it on BA2b and the producer re-posted a fresh count-less item. `liveItemIds` now counts ONLY BODY-VERIFIED states via the pure `boardFileIdentityVerified(itemId, body)` (the body's `boardItemId(jobId, nodeId)` must equal the filename itemId) — a mismatched/forged body no longer evicts a real obligation.
+  - Counterexample B (obligation lost under a live/recycled writer pid): the `writerAlive && writerPid !== process.pid` branch `continue`d WITHOUT recording the obligation, so an orphan tmp whose old pid was RECYCLED by another live process left the fresh first post un-suppressed (count/deadline reset). That branch now adds the itemId to `pendingTmpItemIds` (`suppressPendingReposts`) — a live/recycled/ambiguous writer pid is NO exception: the tmp is left alone (never steal a possibly-live producer's work) but its escalation obligation is retained until it is genuinely restored.
+- Gates: bus tsc 0, scripts tsc 0, bus vitest 1086/1086 (board test 45, +4 BP3 round-5). The eviction decision is pure + tested (`boardFileIdentityVerified` + `repostTmpAction` + `suppressPendingReposts`, counterexample A/B cases).
 
 ## Round 4 — round-3 REMAIN resolved (BP3; the two tmp-recovery holes)
 - BP3 (P1) round-3's adoption only checked posted-existence, leaving two holes, both now closed with pure, tested decisions:
