@@ -87,7 +87,14 @@ function acquireConsumeLock(home: string, batchId: string): string | null {
   const dir = consumeLockDir(home, batchId);
   const token = `${process.pid}.${randomBytes(6).toString("hex")}`;
   const mine = path.join(dir, token);
-  const take = (): boolean => { try { mkdirSync(dir); writeFileSync(mine, "", { mode: 0o600 }); return true; } catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; return false; } };
+  const take = (): boolean => {
+    try { mkdirSync(dir); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; return false; } // held by someone
+    // Won the atomic mkdir; now publish our identity. If THAT faults (DB-R7: lock dir made unwritable mid-acquire), drop the
+    // empty dir we just made so we never strand an identity-less dir — an empty dir is indistinguishable from a LIVE in-flight
+    // acquisition and would stay contended forever. If the rmdir also faults (parent unwritable), a retry's reclaim handles it.
+    try { writeFileSync(mine, "", { mode: 0o600 }); return true; }
+    catch (e) { try { rmdirSync(dir); } catch { /* parent unwritable ⇒ leftover empty dir, reclaimed on a later acquire */ } throw e; }
+  };
   if (take()) return token; // won the atomic mkdir; identity published
   // Held. Reclaim ONLY a single, confirmed dead-or-own holder, by its EXACT name (never a successor's differently-named file).
   let entries: string[]; try { entries = readdirSync(dir); } catch { return null; } // dir vanished mid-check ⇒ contended (caller retries)
@@ -109,37 +116,43 @@ function acquireConsumeLock(home: string, batchId: string): string | null {
  *  read/unlink fault must not mask the consume's committed result (DB-R7). */
 function releaseConsumeLock(home: string, batchId: string, token: string): void {
   const dir = consumeLockDir(home, batchId);
-  try { rmSync(path.join(dir, token), { force: true }); } catch { /* best-effort */ }
-  try { rmdirSync(dir); } catch { /* a successor is in, or it is gone */ }
+  const mine = path.join(dir, token);
+  try { rmSync(mine, { force: true }); } catch { return; } // can't remove our identity (lock dir unwritable) ⇒ it STAYS as a recognizable (pid-bearing) recovery credential; done
+  // Our identity is gone; drop the now-empty dir. If THAT faults (parent unwritable), RESTORE our identity so the leftover dir
+  // carries a recognizable pid — a retry reclaims it by own/dead pid (DB-R7). We must never leave an identity-LESS dir on a
+  // recoverable fault: an empty dir is indistinguishable from a LIVE in-flight acquisition and would stay contended.
+  try { rmdirSync(dir); } catch { try { writeFileSync(mine, "", { mode: 0o600 }); } catch { /* can't restore either ⇒ degraded empty dir */ } }
 }
 
 /** DB-R3-P1-1 / R25 orphan-recovery contract. An ORPHAN is a decision in decisions.json that is valid, bound to this batch, and
  *  NOT the verdict that was consumed — a subsequent user decision the batch never fulfilled. Identity is by CONTENT DIGEST (never a
  *  second-granularity clock, which cannot order same-second re-decisions): if the current decisions.json digests to the SAME value
- *  as the consumed verdict it is already fulfilled (no signal); otherwise it is a distinct update. Each distinct update signals the
- *  owner EXACTLY ONCE via a PER-DIGEST marker claimed with an exclusive create — so concurrent emitters never double-send (C), and
- *  a LATER different update is never blocked by an earlier one (B): the dedup is per-update, NEVER per-batch. The signal is a
- *  durable inbox message to the batch OWNER (the coordinator), guaranteed to reach them; the owner re-batches under a new batchId. */
+ *  as the consumed verdict it is already fulfilled (no signal); otherwise it is a distinct update. The signal is a durable inbox
+ *  message to the batch OWNER (the coordinator), guaranteed to reach them; the owner re-batches under a new batchId.
+ *  DB-R3-P1-1: distinguish a send CLAIM from a delivered FACT. We deliver FIRST and record the `orphan-<digest>.sent` PROOF only
+ *  AFTER the inbox write succeeds — so a delivery that FAULTS leaves NO proof and PROPAGATES, and a retry re-sends exactly one
+ *  (a pre-send claim must never make a failed delivery look done). Concurrent double-send is prevented by the CONSUME LOCK (every
+ *  emit runs under it — the terminal path takes it too), not by a marker; the per-update `.sent` proof then dedups across retries
+ *  so a LATER different update (new digest) is never blocked by an earlier one (B), and the consumed verdict never re-signals. */
 function digestDoc(doc: DecisionsDoc): string {
   return createHash("sha256").update(JSON.stringify({ batchId: doc.batchId, decidedAtSec: doc.decidedAtSec, decisions: doc.decisions })).digest("hex");
 }
-function orphanMarkerPath(home: string, batchId: string, digest: string): string { return path.join(batchDir(home, batchId), `orphan-${digest}.signaled`); }
+function orphanSentPath(home: string, batchId: string, digest: string): string { return path.join(batchDir(home, batchId), `orphan-${digest}.sent`); }
 function emitOrphanSignal(home: string, batchId: string, owner: string): void {
   const orphan = readJsonOrNull(decisionsPath(home, batchId), validDecisionsDoc);
   if (!orphan || orphan.batchId !== batchId) return; // no valid pending decision
   const digest = digestDoc(orphan);
   const consumed = readJsonOrNull(consumedMarkerPath(home, batchId), (raw) => (raw !== null && typeof raw === "object" && typeof (raw as Record<string, unknown>).digest === "string" ? (raw as { digest: string }) : null));
   if (consumed && consumed.digest === digest) return; // this IS the consumed verdict (already fulfilled) ⇒ not an orphan
-  // per-update, once-only CLAIM (exclusive create). "exists" ⇒ this exact update already signaled — idempotent, incl. concurrently.
-  const mark = orphanMarkerPath(home, batchId, digest);
-  if (createExclusiveAtomic(mark, JSON.stringify({ digest, at: Date.now() })) === "exists") return;
-  try {
-    writeInbox(home, owner, composeInboxMsg({
-      from: owner, fromLabel: "decision-batch",
-      text: `orphan decision in batch ${batchId} (digest ${digest.slice(0, 12)}) arrived but was not consumed — re-batch it under a new batchId`,
-      via: "decision-batch", taskRef: `decision-batch:${batchId}`, title: "orphan decision — re-batch",
-    }));
-  } catch (e) { try { unlinkSync(mark); } catch { /* best-effort */ } throw e; } // send failed ⇒ release the claim so a retry re-sends
+  const sent = orphanSentPath(home, batchId, digest);
+  if (existsStrict(sent)) return; // PROOF-OF-SENT present ⇒ this exact update already reached the owner ⇒ never re-send
+  // Deliver first; a fault here PROPAGATES with no proof recorded ⇒ a retry re-sends exactly one (DB-R3-P1-1).
+  writeInbox(home, owner, composeInboxMsg({
+    from: owner, fromLabel: "decision-batch",
+    text: `orphan decision in batch ${batchId} (digest ${digest.slice(0, 12)}) arrived but was not consumed — re-batch it under a new batchId`,
+    via: "decision-batch", taskRef: `decision-batch:${batchId}`, title: "orphan decision — re-batch",
+  }));
+  try { createExclusiveAtomic(sent, JSON.stringify({ digest, at: Date.now() })); } catch { /* proof write faulted AFTER a good send ⇒ a retry may re-send one (a duplicate re-batch is recoverable; a lost signal is not) */ }
 }
 
 export function newBatchId(): string { return `batch-${randomBytes(8).toString("hex")}`; }
@@ -267,13 +280,14 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
   if (!batch) throw new Error(`consumeDecisions: no such batch ${batchId}`);
   const none: ConsumeResult = { resolved: [], undecided: batch.items, unknownIds: [], consumed: false };
   const consumedMarker = consumedMarkerPath(home, batchId);
-  if (existsStrict(consumedMarker)) { emitOrphanSignal(home, batchId, batch.owner); return none; } // terminal — but surface any orphan (R25)
-  // R24/R25: take the per-batch EXCLUSIVE consume lock for the whole critical section (serializes consumers; the terminal marker
-  // is created once and FINAL). A consumer that cannot take it returns an explicit `contended` receipt.
+  // R24/R25: take the per-batch EXCLUSIVE consume lock for the WHOLE critical section (serializes consumers; the terminal marker
+  // is created once and FINAL). The terminal orphan signal runs under the lock too, so concurrent emitters never double-send
+  // (DB-R3-P1-1 — the dedup is the lock + the post-send `.sent` proof, not a pre-send claim). A consumer that cannot take the
+  // lock returns an explicit `contended` receipt (a concurrent holder is already emitting/committing).
   const token = acquireConsumeLock(home, batchId);
   if (token === null) return { ...none, contended: true };
   try {
-    if (existsStrict(consumedMarker)) { emitOrphanSignal(home, batchId, batch.owner); return none; } // re-check under the lock
+    if (existsStrict(consumedMarker)) { emitOrphanSignal(home, batchId, batch.owner); return none; } // terminal — surface any orphan (R25), under the lock
     const claim = claimPath(home, batchId);
     const dpath = decisionsPath(home, batchId);
     // Claim the LATEST decision: a FRESH decisions.json first; else RESUME a prior in-progress claim; else RECOVER a VALID doc
