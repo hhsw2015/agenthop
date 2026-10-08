@@ -20,7 +20,7 @@ import {
 import {
   admitDepth, canReapZone, chooseDisplayMode, classifyExit, degradeDisplay, effectiveTier,
   elapsedTimedOut, markAborted, newLedgerRow, nextReceipt, parseDepth, planResume, reconcileOrphans, reduceUnits,
-  reservationFits, reserveValid, resumeVerdict, validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthGate, zoneName,
+  reservationFits, reserveValid, resumeVerdict, validSpent, validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthGate, zoneName,
   type AggregateReceipt, type DisplayMode, type FanoutBudget, type FanoutRequest, type FanoutUnit, type FanoutTier,
   type LedgerRow, type Spent, type UnitResult,
 } from "../packages/bus/src/swarm/fanout.js";
@@ -53,7 +53,6 @@ function writeJsonAtomic(file: string, obj: unknown): boolean {
 }
 type LedgerState = { runKey: string; rows: LedgerRow[]; receipt?: AggregateReceipt; spent?: Spent };
 const LEDGER_STATUSES: ReadonlySet<string> = new Set<string>(["running", "done", "failed", "timeout", "delivery_uncertain", "aborted"]);
-const finiteNonNeg = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0;
 // FN2: distinguish MISSING (fresh run, null) from CORRUPT/unreadable (throw — prior state is unknown, never
 // treat it as "no prior run" and re-spawn everything). A directory at the path is EISDIR -> corrupt -> throw.
 function readLedgerState(home: string, runKey: string): LedgerState | null {
@@ -85,11 +84,10 @@ function readLedgerState(home: string, runKey: string): LedgerState | null {
     }
     if (rr.pid !== undefined && typeof rr.pid !== "number") throw new Error(`fanout ledger row pid corrupt (${p}); refusing to start`);
   }
-  if (o.spent !== undefined) {
-    const s = o.spent as Partial<Spent> | null;
-    if (typeof s !== "object" || s === null || (s.tokens !== undefined && !finiteNonNeg(s.tokens)) || (s.usd !== undefined && !finiteNonNeg(s.usd))) {
-      throw new Error(`fanout ledger spent corrupt (${p}); refusing to start`);
-    }
+  // FN2: a PRESENT spent must satisfy the numeric structure (both tokens+usd finite non-neg) — an array, `{}`, or a
+  // partial object is corrupt and REFUSES the launch; it is never silently read as zero.
+  if (o.spent !== undefined && !validSpent(o.spent)) {
+    throw new Error(`fanout ledger spent corrupt (${p}); refusing to start`);
   }
   return o as LedgerState;
 }
@@ -108,7 +106,10 @@ const outputPresentAt = (p: string | undefined): boolean => { if (!p) return fal
 // (done on 0+output, else failed-terminal/retry) | no terminal record at all (uncertain -> quarantine, never re-run).
 function reconcileRunning(home: string, pr: LedgerRow): "alive" | "done" | "failed-terminal" | "uncertain" {
   const alive = pr.pid !== undefined && pidAlive(pr.pid);
-  let exit: number | null | undefined = alive ? undefined : readRegistry(home).find((r) => r.launchId === pr.id || (pr.pid !== undefined && r.pid === pr.pid))?.exitCode;
+  // FN2: bind terminal evidence to the SAME launch by launchId ONLY — a pid is recyclable, so another launch that
+  // reused this pid and exited 0 must NOT be read as this row's result. No launchId (or none matches) -> no registry
+  // evidence; fall to the launch-bound rc sidecar (its path is unique per launch, FN8), else uncertain.
+  let exit: number | null | undefined = !alive && pr.id !== undefined ? readRegistry(home).find((r) => r.launchId === pr.id)?.exitCode : undefined;
   if (!alive && (exit === undefined || exit === null) && pr.outputPtr) {
     const rc = readFileOrNull(rcFile(pr.outputPtr));
     if (rc !== null && /^\d+$/.test(rc.trim())) exit = Number(rc.trim());
@@ -312,19 +313,27 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
     return { rows: finalRows, receipt };
   } finally {
     for (const l of launchedAll) {
-      // FN9: confirm the child is gone before releasing its slot. A failed/unconfirmed despawn keeps the lease bound to
-      // the child pid (acquireLease reaps it when the child dies) rather than freeing capacity while the child still runs.
-      if (l.row.displayMode === "headless" && l.row.pid !== undefined && pidAlive(l.row.pid)) await despawnAgent(l.row.id).catch(() => {});
+      // FN9 HEADLESS: confirm the child is gone before releasing its slot. A failed/unconfirmed despawn keeps the lease
+      // bound to the child pid (acquireLease reaps it when the child dies) rather than freeing capacity while it runs.
+      if (l.row.displayMode !== "headless") continue; // VISIBLE leases are released ONLY after a confirmed zone close (below)
+      if (l.row.pid !== undefined && pidAlive(l.row.pid)) await despawnAgent(l.row.id).catch(() => {});
       if (l.row.pid === undefined || !pidAlive(l.row.pid)) { releaseLease(l.lease); l.lease = null; }
     }
     // FN4: reap ONLY the zone we opened, in finally (exception-safe); a failed close leaves a durable cleanup todo.
+    let zoneClosed = !(zone && zoneId); // nothing opened ⇒ nothing to close
     if (zone && zoneId && canReapZone(zone, new Set([req.runKey]))) {
       const { exitFailed } = await herdrExec(env, buildWorkspaceClose(zoneId)).catch(() => ({ exitFailed: true, json: null }));
+      zoneClosed = !exitFailed;
       if (exitFailed) {
         const wrote = writeJsonAtomic(cleanupPendingPath(home, zoneId), { zone, zoneId, runKey: req.runKey, note: "workspace close failed; a later sweep must reap it", ts: Date.now() });
         if (!wrote) console.error(`swarm-fanout: LEAKED zone ${zoneId} (${zone}) — close failed AND the cleanup todo could not be recorded; manual reap required`); // FN4: explicit hand-back, never silent
       }
     }
+    // FN9 VISIBLE: a pane has no pid, so "no pid" must NOT mean "released". Free a still-held visible slot ONLY once its
+    // pane is gone — i.e. the zone close CONFIRMED (settleUnit already released any unit whose rc proved it exited). A
+    // failed close RETAINS the lease (capacity obligation); it is driver-pid-bound, so acquireLease reaps it when this
+    // driver exits — never freeing the slot while an unclosed pane may still be running.
+    if (zoneClosed) for (const l of launchedAll) { if (l.row.displayMode !== "headless") { releaseLease(l.lease); l.lease = null; } }
     releaseRun();
   }
 }
@@ -361,9 +370,12 @@ async function settleUnit(env: NodeJS.ProcessEnv, home: string, l: Launched, tim
     row.status = "failed"; // FN8: an exception is never a success
   } finally {
     row.endedAt = Date.now();
-    // FN9: free capacity ONLY when the child is confirmed gone. A timeout despawn that did not kill it leaves the
-    // child alive — keep the lease bound to its pid (acquireLease reaps the slot when the child actually dies).
-    if (row.pid === undefined || !pidAlive(row.pid)) { releaseLease(l.lease); l.lease = null; }
+    // FN9: free capacity ONLY on a CONFIRMED terminal. Headless: the child pid is gone (a timeout despawn that did
+    // not kill it leaves the child alive — keep the lease bound to its pid for acquireLease's stale-reap). Visible
+    // (no pid): the command wrote its rc sidecar, i.e. it actually EXITED — a missing pid is NOT "ended", and a
+    // still-running/lingering pane holds the slot until the run's outer finally confirms the zone close.
+    const terminal = row.displayMode === "headless" ? (row.pid === undefined || !pidAlive(row.pid)) : readFileOrNull(rcFile(out)) !== null;
+    if (terminal) { releaseLease(l.lease); l.lease = null; }
   }
 }
 

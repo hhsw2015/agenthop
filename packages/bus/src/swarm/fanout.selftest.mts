@@ -2,7 +2,7 @@
 //   npx tsx packages/bus/src/swarm/fanout.selftest.mts
 // Each pre-study pit (docs/swarm/fanout-prestudy.md §2) is a NAMED counterexample below.
 import {
-  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, degradeDisplay, resumeVerdict,
+  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, degradeDisplay, resumeVerdict, validSpent,
   effectiveTier, elapsedTimedOut, isSafeRunKey, isTerminal, markAborted, newLedgerRow, nextReceipt, parseDepth,
   planResume, progress, reconcileOrphans, reduceUnits, reservationFits, reserveValid, validateFanoutRequest,
   validBudgetTicket, validRoiEstimate, widthClass, widthGate, zoneName, type FanoutUnit, type LedgerRow, type UnitResult,
@@ -189,6 +189,19 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("non-zero exit -> failed-terminal (confirmed ended, safe retry)", resumeVerdict({ alive: false, exitCode: 7, outputPresent: true }) === "failed-terminal");
   t("no pid, undefined exit -> uncertain (quarantine, NEVER re-run)", resumeVerdict({ alive: false, exitCode: undefined, outputPresent: false }) === "uncertain");
   t("no pid, null exit -> uncertain (crash-left: may have launched)", resumeVerdict({ alive: false, exitCode: null, outputPresent: true }) === "uncertain");
+}
+
+// --- FN2: a PRESENT cumulative spend must satisfy the numeric structure (never silently zeroed) ---
+{
+  t("both finite non-neg -> valid", validSpent({ tokens: 1000, usd: 0.5 }) === true);
+  t("zeros -> valid (a real fresh-but-tracked spend)", validSpent({ tokens: 0, usd: 0 }) === true);
+  t("array -> invalid (refuse, never zero)", validSpent([]) === false);
+  t("empty object -> invalid (missing both fields, not a zero)", validSpent({}) === false);
+  t("partial object (usd missing) -> invalid", validSpent({ tokens: 10 }) === false);
+  t("negative tokens -> invalid", validSpent({ tokens: -1, usd: 0 }) === false);
+  t("NaN usd -> invalid", validSpent({ tokens: 0, usd: NaN }) === false);
+  t("Infinity -> invalid", validSpent({ tokens: Infinity, usd: 0 }) === false);
+  t("null -> invalid", validSpent(null) === false);
 }
 
 // --- FN7: width evidence must be real + bound to the run (not a bare flag) ---

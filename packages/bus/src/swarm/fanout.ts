@@ -325,6 +325,17 @@ export function resumeVerdict(ev: { alive: boolean; exitCode?: number | null; ou
   return ev.exitCode === 0 && ev.outputPresent ? "done" : "failed-terminal";
 }
 
+// FN2: a PROVIDED cumulative spend must be a plain object with BOTH tokens and usd as finite, non-negative numbers.
+// An array, an empty/partial object (missing a field), or a non-finite/negative value is CORRUPT — it must refuse the
+// launch, never be read through `?? 0` as a silent zero (which corrupts the reservation math). A spend that is absent
+// entirely (never tracked) is a separate case the caller defaults to 0; this validates only a present value.
+export function validSpent(s: unknown): boolean {
+  if (typeof s !== "object" || s === null || Array.isArray(s)) return false;
+  const o = s as Record<string, unknown>;
+  const ok = (n: unknown): boolean => typeof n === "number" && Number.isFinite(n) && n >= 0;
+  return ok(o.tokens) && ok(o.usd);
+}
+
 // FN7: the width ROI tier needs a REAL estimate bound to this run (env may carry a pointer to it, never be the
 // evidence). A valid estimate names the runKey and gives positive speedup- and cost-ratios.
 // A positive FINITE number — FN7: Infinity/NaN must never pass an amount/quota/ratio check.
