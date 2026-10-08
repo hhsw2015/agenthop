@@ -118,6 +118,15 @@ export function buildAgentWait(name: string, until: readonly AgentState[], timeo
 export function buildAgentRead(name: string, source = "recent-unwrapped", lines?: number): string[] {
   return ["agent", "read", name, "--source", source, ...(lines ? ["--lines", String(lines)] : [])];
 }
+/** S14: block until a pane emits output (or timeout). The pane id is POSITIONAL (herdr 0.9.3 has no `--pane` option — LS1).
+ *  Used only as a bounded inter-sample BLOCK; new-output truth comes from a content-hash diff, not this match (LS2). One of
+ *  `regex`/`match` (regex wins); neither ⇒ any output. */
+export function buildPaneWaitOutput(paneId: string, opts: { regex?: string; match?: string; timeoutMs: number }): string[] {
+  const pat = opts.regex !== undefined ? ["--regex", opts.regex] : opts.match !== undefined ? ["--match", opts.match] : [];
+  return ["pane", "wait-output", paneId, ...pat, "--timeout", String(opts.timeoutMs)];
+}
+/** S14: characterize a blocked agent (safety-stop / approval box / crash). Free-text, attached to the S19 approval. */
+export function buildAgentExplain(name: string): string[] { return ["agent", "explain", name]; }
 export function buildSendKeys(name: string, keys: readonly string[]): string[] {
   return ["agent", "send-keys", name, ...keys];
 }
@@ -228,6 +237,24 @@ export function settledFrom(json: unknown, settleTypes: ReadonlySet<string> = WA
   return { settled, status };
 }
 
+/** S14 LS3 (pure): classify an `agent wait` outcome. reached = the re-read state is a target. timeout = a POSITIVE STRUCTURED
+ *  marker ONLY (error code timeout/wait_timeout, result.timed_out, or a result.type matching /timeout/) — NEVER a raw-text
+ *  substring (a "socket timed out" failure or a member named "timeout-worker" is not a member-wait timeout) and NEVER inferred
+ *  from near-deadline elapsed (a success can land just before the deadline). error = any failed exit with no structured timeout
+ *  marker (the wait did not run; a recognized non-timeout code takes priority). A success exit whose state moved off target with
+ *  NO timeout marker is `reached` (it hit a target then fell back; uncertain, but NOT a continuous-idle timeout). */
+export function classifyWaitOutcome(json: unknown, _raw: string, exitFailed: boolean, state: AgentState, until: readonly AgentState[]): "reached" | "timeout" | "error" {
+  if (until.includes(state)) return "reached";
+  const code = (json as any)?.error?.code;
+  const res = (json as any)?.result;
+  // A timeout must come from a STRUCTURED marker, NEVER a raw-text substring (LS3): "socket timed out" is a connection
+  // failure, and an error whose text merely names a member like "timeout-worker" is not the member's wait expiring. A
+  // recognized non-timeout error code (e.g. permission_denied) therefore takes priority ⇒ error.
+  if (code === "timeout" || code === "wait_timeout" || res?.timed_out === true || (typeof res?.type === "string" && /timeout/i.test(res.type))) return "timeout";
+  if (exitFailed) return "error"; // any failed exit without a structured timeout marker ⇒ error (not a confirmed timeout)
+  return "reached"; // success exit, state off target, no timeout marker ⇒ reached then fell back (uncertain, not timeout)
+}
+
 // ---- stall sentinel: a blocked agent is a human decision -> escalate (R2-P1-1, coordinator ruling R12) ----
 
 export interface BlockedRule { id: string; match: RegExp; keys: string[]; why: string }
@@ -293,9 +320,9 @@ const px = promisify(execFile);
 
 /** Run herdr; NEVER throw on a normal CLI failure (exit1 + stderr JSON) — return it structured so callers can
  *  classify instead of a reject escaping past the fallback (H-P2-2). */
-async function herdrRun(args: string[], timeoutMs = 45000): Promise<{ raw: string; json: any | null; exitFailed: boolean }> {
+async function herdrRun(args: string[], timeoutMs = 45000, signal?: AbortSignal): Promise<{ raw: string; json: any | null; exitFailed: boolean }> {
   try {
-    const { stdout } = await px(HERDR_BIN, args, { timeout: timeoutMs, maxBuffer: 1 << 22 });
+    const { stdout } = await px(HERDR_BIN, args, { timeout: timeoutMs, maxBuffer: 1 << 22, ...(signal ? { signal } : {}) });
     let json: any = null; try { json = JSON.parse(stdout); } catch { /* read cmds are plain text */ }
     return { raw: stdout, json, exitFailed: false };
   } catch (e) {
@@ -378,7 +405,66 @@ export async function herdrReadClean(name: string, lines = 40): Promise<string> 
   return stripTui(raw);
 }
 
+/** Like herdrReadClean but reports a FAILED read as null (LS2): a read error must NOT become fake-death "progress evidence"
+ *  (hashing the error text as content). null ⇒ the caller skips the silence update this cycle; "" is a real empty screen. */
+export async function herdrReadContent(name: string, lines = 40, signal?: AbortSignal): Promise<string | null> {
+  const { raw, exitFailed } = await herdrRun(buildAgentRead(name, "recent-unwrapped", lines), 15000, signal);
+  return exitFailed ? null : stripTui(raw);
+}
+
 export async function herdrSendKeys(name: string, keys: readonly string[]): Promise<{ ok: boolean; note: string }> {
   const r = await herdrRun(buildSendKeys(name, [...keys]));
   return { ok: !r.exitFailed && !r.json?.error, note: r.exitFailed ? "send-keys failed" : "sent" };
+}
+
+/** Current VERIFIED state of one agent (from `agent list`, the same source herdrAgentStates trusts). "unknown" if absent. */
+export async function herdrAgentState(name: string, signal?: AbortSignal): Promise<AgentState> {
+  const { json } = await herdrRun(["agent", "list"], 10000, signal);
+  const agents: any[] = json?.result?.agents ?? [];
+  const a = agents.find((x) => x?.name === name);
+  return (a?.agent_status ?? "unknown") as AgentState;
+}
+
+/** Resolve an agent name to its bound pane id (for pane-level commands). null if unresolved. */
+export async function herdrAgentPaneId(name: string, signal?: AbortSignal): Promise<string | null> {
+  const { json } = await herdrRun(buildAgentGet(name), 10000, signal);
+  return agentPaneId(json);
+}
+
+/** S14 primitive ① — BLOCK until the agent reaches one of `until` (or timeout), then report the CURRENT verified state (from
+ *  agent list) AND the wait OUTCOME (LS3): `reached` = the member transitioned into `until`; `timeout` = the wait ran to its
+ *  deadline with no transition (exit ok, or a timeout error code); `error` = the wait FAILED fast (e.g. permission_denied) and
+ *  so did NOT actually wait — the caller must NOT treat the unchanged state as a real timeout. We trust the state read, not the
+ *  wait receipt body (same discipline as WAIT_SETTLE_TYPES); only exit-success + error-code are used to split timeout vs error. */
+export async function herdrWait(name: string, until: readonly AgentState[], timeoutMs: number, signal?: AbortSignal): Promise<{ state: AgentState; outcome: "reached" | "timeout" | "error" }> {
+  const r = await herdrRun(buildAgentWait(name, until, timeoutMs), timeoutMs + 5000, signal); // block (receipt body only read for a timeout marker)
+  const state = await herdrAgentState(name, signal);
+  return { state, outcome: classifyWaitOutcome(r.json, r.raw, r.exitFailed, state, until) };
+}
+
+/** S14 primitive ② — BLOCK until the pane emits output (or timeout). "output" = the command returned before its timeout;
+ *  "timeout" = no matching output within timeoutMs (the fake-death trigger); "error" = an inconclusive failure (treated as
+ *  non-fake-death by the caller, never a false alert). We classify only timeout-vs-not, never parse an output receipt. */
+export async function herdrWaitOutput(paneId: string, opts: { regex?: string; match?: string; timeoutMs: number }, signal?: AbortSignal): Promise<"output" | "timeout" | "error"> {
+  const r = await herdrRun(buildPaneWaitOutput(paneId, opts), opts.timeoutMs + 5000, signal);
+  if (!r.exitFailed) return "output";
+  const code = (r.json as any)?.error?.code;
+  if (code === "timeout" || code === "wait_timeout" || /tim␣?out/i.test(r.raw) || /timed? ?out/i.test(r.raw)) return "timeout";
+  return "error"; // unknown failure ⇒ inconclusive (do NOT convict fake-death)
+}
+
+/** S14 primitive ④ — characterize a blocked agent; returns the cleaned free-text for the human S19 summary ("" on failure). */
+export async function herdrExplain(name: string, signal?: AbortSignal): Promise<string> {
+  const r = await herdrRun(buildAgentExplain(name), 15000, signal);
+  if (r.exitFailed) return "";
+  const txt = typeof (r.json as any)?.result?.explanation === "string" ? (r.json as any).result.explanation : r.raw;
+  return stripTui(txt).slice(0, 2000);
+}
+
+/** S14 primitive ③ — inject a decision back with a receipt (replaces blind send-keys for the approval close-loop). Reuses
+ *  the verified classifySubmit (3-state; never fabricate, never replay). */
+export async function herdrPromptWait(name: string, text: string, timeoutMs: number, signal?: AbortSignal): Promise<{ submitted: SubmitState; note: string }> {
+  const r = await herdrRun(buildAgentPromptWait(name, text, timeoutMs), timeoutMs + 5000, signal);
+  const c = classifySubmit(r.json, name, r.exitFailed);
+  return { submitted: c.submitted, note: c.reason };
 }
