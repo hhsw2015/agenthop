@@ -36,7 +36,9 @@ Frozen so `3e097dfe` (console render) can consume the files directly. Code: `pac
 - `decisions-consumed-claim.json` — the CLAIM (ONE stable name): consume renames decisions.json here (claim-before-read) and
   reads THAT. A newer claim atomically OVERWRITES an older one (latest decision wins, no wall-clock ordering). If consume faults
   before the terminal marker, this file is a RECOVERABLE claim a retry resumes.
-- `decisions-rejected-claim.json` — a misbound/corrupt claim set aside (never resolved, never resumed).
+- `decisions-rejected-claim.json` — a claim set aside: a genuinely-foreign doc (batchId ≠ dir) stays here forever (never
+  resolved, never resumed); but a VALID (bound) doc stranded here by a mis-archive or a faulted archive-restore is RECOVERED as
+  the claim on the next consume (resume-fallback) — a valid decision is never lost to the rejected slot.
 - `consumed.json` — the TERMINAL marker, committed via temp+link: appears ONLY with complete content (a half-written marker
   never seals) and is the single-winner (a second creator gets EEXIST, executes nothing). While present, `writeDecisions` and
   `consumeDecisions` refuse this batch (remaining items were re-asked under a NEW batchId).
