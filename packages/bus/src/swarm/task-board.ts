@@ -69,7 +69,7 @@ function isValidIdComponent(s: string): boolean {
  *  `<itemId>.<state>.<who>.json`. `claimed` is a RESERVATION application (not authority); `granted`/`rejected` are the
  *  dispatcher's admission verdict; `done` is the member's completion. granted/rejected are NEW states the two legacy
  *  readers do not classify yet — align them on this set when wiring. */
-export type BoardItemState = "posted" | "claimed" | "granted" | "rejected" | "done";
+export type BoardItemState = "posted" | "claimed" | "granted" | "rejected" | "done" | "reclaimed";
 
 /** The content of a posted board file (`~/.agenthop/swarm/board/<itemId>.json`). Carries §2d-a's "spec 摘要/适配域/优先级"
  *  plus the identity an admission needs to re-check on the CURRENT CONTROL: a board file is a stale snapshot, so admission
@@ -90,6 +90,7 @@ export type BoardItem = {
   priority?: number;          // §2d-a "优先级" — no TaskSpec source; a curator/planner may supply it, else absent
   postedBy: string;           // the curator identity that posted it
   postedAtSec: number;
+  repostCount?: number;       // BA9: times this still-ready item was re-posted after an unclaimed deadline (default 0)
 };
 
 /** The §2d-a "上板/curate" DECISION (pure): map each READY plan-node to the board item that represents it. The board is
@@ -137,6 +138,7 @@ export function planBoardWrites(ready: readonly ReadyTask[], plan: TaskPlan, exi
   const claimed = new Set<string>();                    // itemIds with a PENDING application in-flight — don't double-post
   const granted = new Map<string, string>();            // itemId -> granted file name (admitted; stale IFF the node is READY)
   const rejected = new Map<string, string>();           // itemId -> terminal rejected file name — does NOT block re-post
+  const reclaimedDead = new Set<string>();              // BA9: itemId dead-lettered by supervision — BLOCKS auto-re-post
   for (const e of existing) {
     const p = parseBoardItemName(e.file);
     if (p === null) continue;
@@ -147,12 +149,15 @@ export function planBoardWrites(ready: readonly ReadyTask[], plan: TaskPlan, exi
     else if (p.state === "claimed") claimed.add(p.itemId);
     else if (p.state === "granted") granted.set(p.itemId, e.file);
     else if (p.state === "rejected") rejected.set(p.itemId, e.file);
+    else if (p.state === "reclaimed") reclaimedDead.add(p.itemId); // BA9: dead-lettered ⇒ never auto-re-post (needs coordinator action)
     // done ⇒ terminal; a done node is not READY, so it never reaches the post loop anyway
   }
   const post: BoardItem[] = [];
   const reap: string[] = [];
   for (const item of boardItemsToPost(ready, plan, opts)) {
     if (!isValidItemId(item.itemId)) continue;
+    if (reclaimedDead.has(item.itemId)) continue; // BA9: a reclaimed (dead-lettered) node is not auto-re-posted
+
     const pf = posted.get(item.itemId);
     if (pf !== undefined && pf.body !== null && pf.body.specDigest === item.specDigest && pf.body.inputBindingDigest === item.inputBindingDigest) continue; // fresh posted ⇒ idempotent
     if (claimed.has(item.itemId)) continue; // a pending application is in-flight ⇒ don't double-post (admission will resolve it)
@@ -166,6 +171,56 @@ export function planBoardWrites(ready: readonly ReadyTask[], plan: TaskPlan, exi
   const slated = new Set(reap);
   for (const [itemId, e] of posted) if (!readyIds.has(itemId) && !slated.has(e.file)) reap.push(e.file); // stale unclaimed, node no longer ready
   return { post, reap };
+}
+
+// ---------- BA9: board-post supervision (§2d-a; an R14 pre-flight) ----------
+// A posted item that is STILL ready but unclaimed past its deadline must ESCALATE, not stall silently
+// (planBoardWrites only reaps items whose node STOPPED being ready). Ladder: REPOST (bounded — a transient
+// "no free capable worker" gets another window) -> REPORT (at the cap, a coordinator needs-attention incident,
+// deduped per itemId) -> RECLAIM (after a grace, withdraw + dead-letter so the plan is never silently blocked).
+// Pure decision; the dispatcher does the thin IO (atomic re-post / S19 incident / reap). Dormant behind the
+// board gate. Acts ONLY on a `posted` still-ready unclaimed file — never a claimed/granted/rejected/done one.
+export type BoardSupervisionPolicy = { claimTtlSec: number; maxReposts: number; reportGraceSec: number };
+export type BoardPostAction =
+  | { kind: "ok" }
+  | { kind: "repost"; item: BoardItem }
+  | { kind: "report"; itemId: string }
+  | { kind: "reclaim"; itemId: string };
+
+export function superviseBoardPost(item: BoardItem, nowSec: number, policy: BoardSupervisionPolicy): BoardPostAction {
+  const age = nowSec - item.postedAtSec;
+  if (age < policy.claimTtlSec) return { kind: "ok" }; // within the claim deadline
+  const reposts = item.repostCount ?? 0;
+  if (reposts < policy.maxReposts) return { kind: "repost", item: { ...item, postedAtSec: nowSec, repostCount: reposts + 1 } };
+  if (age < policy.claimTtlSec + policy.reportGraceSec) return { kind: "report", itemId: item.itemId }; // cap reached — raise, then grace
+  return { kind: "reclaim", itemId: item.itemId }; // reported + grace elapsed, still unclaimed
+}
+
+export type BoardSupervision = { reposts: BoardItem[]; reports: string[]; reclaims: { file: string; itemId: string }[] };
+
+// The §2d-a supervision DECISION (pure): over the board dir's files, classify each STILL-READY posted-unclaimed
+// item through the escalation ladder. `reportedItemIds` = itemIds that already have an incident (dedup). The
+// caller does the IO: atomic-write each repost (same `<itemId>.json` path, in place), render an S19 incident for
+// each report, reap each reclaim file + dead-letter its node.
+export function planBoardSupervision(
+  existing: readonly ExistingBoardFile[],
+  readyItemIds: ReadonlySet<string>,
+  nowSec: number,
+  policy: BoardSupervisionPolicy,
+  reportedItemIds: ReadonlySet<string> = new Set(),
+): BoardSupervision {
+  const out: BoardSupervision = { reposts: [], reports: [], reclaims: [] };
+  for (const e of existing) {
+    const p = parseBoardItemName(e.file);
+    if (p === null || p.state !== "posted" || e.body === null) continue; // only a posted-unclaimed file with a body
+    if (p.itemId !== boardItemId(e.body.jobId, e.body.nodeId)) continue; // name<->body binding (BA4)
+    if (!readyItemIds.has(p.itemId)) continue; // not still ready ⇒ planBoardWrites reaps it; BA9 leaves it alone
+    const action = superviseBoardPost(e.body, nowSec, policy);
+    if (action.kind === "repost") out.reposts.push(action.item);
+    else if (action.kind === "report") { if (!reportedItemIds.has(action.itemId)) out.reports.push(action.itemId); }
+    else if (action.kind === "reclaim") out.reclaims.push({ file: e.file, itemId: action.itemId });
+  }
+  return out;
 }
 
 /** Assemble the §2d-b GRANT commit bodies (option B, coordinator ruling 2026-10-06): the dispatch intent + the new attempt
@@ -293,7 +348,8 @@ export function planClaimAdmission(state: LogState, claim: ClaimApplication, par
 // --- the ONE canonical board file-name convention (so producer, consumer, observer + projection all agree, incl. the new
 //     granted/rejected states) ---
 
-const CLAIMABLE_STATES = new Set<BoardItemState>(["claimed", "granted", "rejected", "done"]);
+// Three-segment lifecycle states (`<itemId>.<state>.<who>.json`); `reclaimed` is BA9's terminal dead-letter marker.
+const CLAIMABLE_STATES = new Set<BoardItemState>(["claimed", "granted", "rejected", "done", "reclaimed"]);
 
 /** The posted (unclaimed) file name for an item: `<itemId>.json`. itemId (= nodeId) must be dot-free (plan node ids are
  *  identifiers) so the parser's last-two-segments rule is unambiguous — asserted by the caller via sanitizeItemId. */
@@ -301,6 +357,7 @@ export function postedFileName(itemId: string): string { return `${itemId}.json`
 export function claimedFileName(itemId: string, who: string): string { return `${itemId}.claimed.${who}.json`; }
 export function grantedFileName(itemId: string, who: string): string { return `${itemId}.granted.${who}.json`; }
 export function rejectedFileName(itemId: string, who: string): string { return `${itemId}.rejected.${who}.json`; }
+export function reclaimedFileName(itemId: string, who: string): string { return `${itemId}.reclaimed.${who}.json`; } // BA9 terminal dead-letter
 export function doneFileName(itemId: string, who: string): string { return `${itemId}.done.${who}.json`; }
 
 /** Parse a board file name into {itemId, state, who}. Convention: `<itemId>.json` (posted) or `<itemId>.<state>.<who>.json`

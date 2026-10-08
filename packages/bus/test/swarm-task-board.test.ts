@@ -1,8 +1,9 @@
 import { describe, expect, test } from "vitest";
 import {
   boardItemsToPost, planBoardWrites, buildGrantBodies, grantWaitId, planClaimAdmission, parseClaimApplication, boardItemId,
-  postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName,
-  parseBoardItemName, isValidItemId, boardAdmitEnabled, type BoardItem, type AdmissionParams, type ExistingBoardFile, type ClaimApplication,
+  postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName, reclaimedFileName,
+  parseBoardItemName, isValidItemId, boardAdmitEnabled, superviseBoardPost, planBoardSupervision,
+  type BoardItem, type AdmissionParams, type ExistingBoardFile, type ClaimApplication, type BoardSupervisionPolicy,
 } from "../src/swarm/task-board.js";
 import { commit, entityKeyOf, initialLogState, type ChangeBody, type LogState, type WaitRecord } from "../src/swarm/control-log.js";
 import { loadPlan, type TaskPlan } from "../src/swarm/task-plan.js";
@@ -285,5 +286,70 @@ describe("task-board dormancy gate (coordinator boundary #1: default OFF)", () =
     expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: "0" })).toBe(false);
     expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: "off" })).toBe(false);
     for (const v of ["1", "true", "yes", "on", "ON", "True"]) expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: v })).toBe(true);
+  });
+});
+
+describe("task-board BA9 superviseBoardPost + planBoardSupervision (§2d-a: unclaimed-post escalation, R14 pre-flight)", () => {
+  const POLICY: BoardSupervisionPolicy = { claimTtlSec: 100, maxReposts: 2, reportGraceSec: 50 };
+  const mkPosted = (nodeId: string, postedAtSec: number, repostCount?: number): ExistingBoardFile => {
+    const body = { ...boardItemsToPost([ready(nodeId)], plan([node(nodeId)]), { postedBy: "coord", nowSec: postedAtSec })[0]!, ...(repostCount !== undefined ? { repostCount } : {}) };
+    return { file: postedFileName(boardItemId("J", nodeId)), body };
+  };
+
+  test("within the claim deadline ⇒ ok (no action)", () => {
+    const item = mkPosted("a", 1000).body!;
+    expect(superviseBoardPost(item, 1050, POLICY)).toEqual({ kind: "ok" }); // age 50 < 100
+  });
+  test("past deadline, under the repost cap ⇒ REPOST with fresh postedAtSec + repostCount+1", () => {
+    const item = mkPosted("a", 1000).body!;
+    const act = superviseBoardPost(item, 1200, POLICY); // age 200 >= 100, reposts 0 < 2
+    expect(act.kind).toBe("repost");
+    if (act.kind === "repost") { expect(act.item.postedAtSec).toBe(1200); expect(act.item.repostCount).toBe(1); }
+    const act2 = superviseBoardPost(mkPosted("a", 1000, 1).body!, 1200, POLICY);
+    expect(act2.kind === "repost" && act2.item.repostCount === 2).toBe(true);
+  });
+  test("at the repost cap, past deadline, within grace ⇒ REPORT", () => {
+    const item = mkPosted("a", 1000, 2).body!; // cap reached
+    expect(superviseBoardPost(item, 1120, POLICY)).toEqual({ kind: "report", itemId: boardItemId("J", "a") }); // age 120 in [100,150)
+  });
+  test("at the cap, past deadline + grace ⇒ RECLAIM", () => {
+    const item = mkPosted("a", 1000, 2).body!;
+    expect(superviseBoardPost(item, 1151, POLICY)).toEqual({ kind: "reclaim", itemId: boardItemId("J", "a") }); // age 151 >= 150
+  });
+
+  test("planBoardSupervision: a still-ready overdue post is reposted; a different one reclaimed; dedup on report", () => {
+    const ready0 = mkPosted("a", 1000, 0);       // overdue, under cap ⇒ repost
+    const capReport = mkPosted("b", 1000, 2);    // cap + report window ⇒ report
+    const capReclaim = mkPosted("c", 1000, 2);   // cap + past grace ⇒ reclaim
+    const readyIds = new Set([boardItemId("J", "a"), boardItemId("J", "b"), boardItemId("J", "c")]);
+    const now = 1120; // a: age120 repost; b: report; now for c use a later tick below
+    const r = planBoardSupervision([ready0, capReport], readyIds, now, POLICY);
+    expect(r.reposts.map((i) => i.nodeId)).toEqual(["a"]);
+    expect(r.reports).toEqual([boardItemId("J", "b")]);
+    // dedup: an already-reported item is not re-reported
+    const r2 = planBoardSupervision([capReport], readyIds, now, POLICY, new Set([boardItemId("J", "b")]));
+    expect(r2.reports).toEqual([]);
+    // reclaim carries the file name for the caller to reap
+    const r3 = planBoardSupervision([capReclaim], readyIds, 1151, POLICY);
+    expect(r3.reclaims).toEqual([{ file: postedFileName(boardItemId("J", "c")), itemId: boardItemId("J", "c") }]);
+  });
+  test("planBoardSupervision acts ONLY on still-ready posted files — not no-longer-ready, not claimed/granted", () => {
+    const overdue = mkPosted("a", 1000, 0);
+    // not in readyIds ⇒ planBoardWrites reaps it, BA9 leaves it alone
+    expect(planBoardSupervision([overdue], new Set(), 1200, POLICY)).toEqual({ reposts: [], reports: [], reclaims: [] });
+    // a claimed file (same item) is never touched by supervision
+    const claimed: ExistingBoardFile = { file: claimedFileName(boardItemId("J", "a"), "w1"), body: overdue.body };
+    const readyIds = new Set([boardItemId("J", "a")]);
+    expect(planBoardSupervision([claimed], readyIds, 1200, POLICY)).toEqual({ reposts: [], reports: [], reclaims: [] });
+  });
+});
+
+describe("task-board BA9 reclaim is terminal: planBoardWrites never auto-re-posts a dead-lettered node", () => {
+  test("a `reclaimed` file blocks re-post even when the node is READY (no reclaim->repost loop)", () => {
+    const p = plan([node("a")]);
+    const reclaimed: ExistingBoardFile = { file: reclaimedFileName(boardItemId("J", "a"), "coord"), body: boardItemsToPost([ready("a")], p, { postedBy: "coord", nowSec: 1000 })[0]! };
+    const { post, reap } = planBoardWrites([ready("a")], p, [reclaimed], { postedBy: "coord", nowSec: 2000 });
+    expect(post).toEqual([]); // dead-lettered ⇒ not re-posted
+    expect(reap).toEqual([]); // the terminal reclaimed file is left for the coordinator, not reaped
   });
 });
