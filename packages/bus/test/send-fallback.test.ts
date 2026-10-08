@@ -41,6 +41,20 @@ describe("F40 resolveInboxTarget — the single write-side addressing entry", ()
     expect(resolveInboxTarget("remote:box", p, null)).toEqual({ kind: "relay", peer: p });
   });
 
+  test("F45 ③: a SAME-MACHINE relay peer (its own sid owns a local presence pid) ⇒ durable, keyed by that exact sid", () => {
+    // cross-broker but same machine: relayLocalSid is the peer's own stableId (a local presence match), so durable-always
+    // holds across brokers — the fix for a dispatch that resolved as relay and landed in no inbox.
+    const p = peer({ via: "relay", stableId: "sid-same", id: "run-r", title: "claude:agenthop-sameXX", pub: "pk" });
+    const t = resolveInboxTarget("claude:agenthop-sameXX", p, null, "sid-same");
+    expect(t).toMatchObject({ kind: "durable", sid: "sid-same", label: "claude:agenthop-sameXX" });
+    if (t.kind === "durable") expect(t.peer).toBe(p);
+  });
+
+  test("F45 ③: a truly CROSS-MACHINE relay peer (no local presence match) stays relay", () => {
+    const p = peer({ via: "relay", stableId: "sid-remote", title: "remote:box", pub: "pk" });
+    expect(resolveInboxTarget("remote:box", p, null, null)).toEqual({ kind: "relay", peer: p });
+  });
+
   test("UNRESOLVED no-match + an offline presence sid ⇒ durable to THAT sid (label = the address); no sid ⇒ none", () => {
     expect(resolveInboxTarget("who", err("none", "no match"), "off-sid")).toMatchObject({ kind: "durable", sid: "off-sid", label: "who" });
     expect(resolveInboxTarget("who", err("none", "no match"), null)).toEqual({ kind: "none", reason: "no match" });

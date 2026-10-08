@@ -47,7 +47,7 @@ export type InboxTarget =
   | { kind: "relay"; peer: UnifiedPeer }                                 // cross-machine ⇒ the caller does a live relay send
   | { kind: "none"; reason: string };                                    // undeliverable ⇒ { ok:false, error:reason }
 
-export function resolveInboxTarget(to: string, resolved: UnifiedPeer | ResolveError, offlineSid: string | null): InboxTarget {
+export function resolveInboxTarget(to: string, resolved: UnifiedPeer | ResolveError, offlineSid: string | null, relayLocalSid: string | null = null): InboxTarget {
   if ("error" in resolved) {
     // B1: an AMBIGUOUS (or empty) target must NEVER fall back — a weaker handle match could pick one of several live matches
     // and misroute a private message. Only a genuine no-match may route to a same-machine durable inbox owned offline.
@@ -55,8 +55,16 @@ export function resolveInboxTarget(to: string, resolved: UnifiedPeer | ResolveEr
     const plan = fallbackForUnresolved(offlineSid, resolved.error);
     return plan.kind === "durable" ? { kind: "durable", sid: plan.sid, label: to } : { kind: "none", reason: plan.reason };
   }
-  // CROSS-MACHINE (relay): a live best-effort send; no local durable inbox.
-  if (resolved.via === "relay") return { kind: "relay", peer: resolved };
+  // RELAY-resolved. F45 ③: a relay peer is "cross-broker", which is NOT the same as "cross-machine". When the peer's OWN
+  // durable id owns a local presence pid (passed in as `relayLocalSid` — computed from the peer's stableId, so a short-id
+  // collision cannot misroute), it shares our filesystem and HAS a local durable inbox. Route durable, keyed by that exact
+  // sid — restoring "same-machine ⇒ durable-always" ACROSS brokers. Before this, a same-machine peer on a different broker
+  // resolved as relay ⇒ a live-only send ⇒ no durable copy ⇒ a dispatch stranded in no inbox (the F45 incident). A truly
+  // CROSS-MACHINE relay peer (relayLocalSid null) has no local inbox ⇒ a live best-effort relay send.
+  if (resolved.via === "relay") {
+    if (relayLocalSid) return { kind: "durable", sid: relayLocalSid, label: resolved.title, peer: resolved };
+    return { kind: "relay", peer: resolved };
+  }
   // SAME-MACHINE (local): durable-always, keyed by the DURABLE identity (never the handle — that is `label`).
   const plan = fallbackForMissedDelivery(resolved);
   return plan.kind === "durable" ? { kind: "durable", sid: plan.sid, label: resolved.title, peer: resolved } : { kind: "none", reason: plan.reason };

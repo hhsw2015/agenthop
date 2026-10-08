@@ -424,7 +424,14 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // F40: ONE write-side addressing entry decides durable / relay / none and computes the durable inbox KEY. The key is
       // always the recipient's STABLE identity (stableId ?? per-run id, or an offline session's presence-owned native sid) —
       // never the routing name, which can drift on restart and strand mail in a box no live node drains (the F40 incident).
-      const target = resolveInboxTarget(to, resolve(to), resolveSession(to, listSessions(home)));
+      const resolvedPeer = resolve(to);
+      const sessionList = listSessions(home);
+      // F45 ③: a relay-resolved peer is cross-BROKER, not necessarily cross-MACHINE. If its OWN durable id owns a local
+      // presence pid (a full-sid exact match, so a short-id collision can't misroute), it shares our filesystem and has a
+      // local durable inbox — route durable there, not a live-only relay send. (Before this, a same-machine peer on a
+      // different broker got a live send with no durable copy, so a dispatch could land in no inbox — the F45 incident.)
+      const relayLocalSid = !("error" in resolvedPeer) && resolvedPeer.via === "relay" && resolvedPeer.stableId && resolveSession(resolvedPeer.stableId, sessionList) === resolvedPeer.stableId ? resolvedPeer.stableId : null;
+      const target = resolveInboxTarget(to, resolvedPeer, resolveSession(to, sessionList), relayLocalSid);
       if (target.kind === "none") return { ok: false, error: target.reason };
       if (target.kind === "durable") {
         // C1 (review 01b773d): an OpenCode node receives over the broker + its own in-memory queue; it does NOT consume the
