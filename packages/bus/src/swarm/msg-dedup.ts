@@ -20,15 +20,18 @@
 export const DEDUP_WINDOW_SEC = 60; // a repeat of the same line inside this window is a duplicate
 export const RING_QUEUE_CAP = 50; // queue at/over this ⇒ stop the ring (matches the official ≤50 self-stop)
 
-/** FNV-1a over `sender\0text` → stable 8-hex fingerprint. Same (sender,text) ⇒ same fp. Pure, dependency-free. */
+/**
+ * Length-prefixed CANONICAL encoding of the (sender,text) pair — the dedup key. `${sender.length}:${sender}${text}`.
+ *
+ * MD-P2-1: it must be impossible for two DISTINCT pairs to share a key — a shared key means a different message is
+ * silently dropped as a "duplicate" (data loss, the project's one red line). A 32-bit hash collides (two printable
+ * texts → one 8-hex value), and a plain `sender + "\0" + text` delimiter is ambiguous when sender/text contain NUL.
+ * The length prefix removes both: the reader recovers sender = the `<len>` chars after the first ':', the rest is text,
+ * so the pair is uniquely encoded regardless of NUL or digits in the content. Equality of this key therefore means the
+ * pairs are TRULY identical. Pure, dependency-free. */
 export function msgFingerprint(sender: string, text: string): string {
-  let h = 0x811c9dc5;
-  const s = (sender ?? "") + "\u0000" + (text ?? "");
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(16).padStart(8, "0");
+  const s = sender ?? "";
+  return `${s.length}:${s}${text ?? ""}`;
 }
 
 /** fingerprint → last-seen epoch seconds. Immutable; treat as read-only. */
@@ -42,11 +45,13 @@ export function pruneSeen(seen: SeenMap, nowSec: number, windowSec: number = DED
   return out;
 }
 
-/** Has this fingerprint been seen inside the window? Bad clock ⇒ false (never drop on an unusable clock). Pure. */
+/** Has this key been seen inside the window? Bad clock ⇒ false (never drop on an unusable clock). MD-P2-2: a stamp in the
+ *  FUTURE (ts > now, e.g. after a clock rewind) is NOT duplicate evidence — require a non-negative, within-window delta,
+ *  else a stale future stamp would keep authorizing silent drops. Pure. */
 export function isDuplicate(seen: SeenMap, fp: string, nowSec: number, windowSec: number = DEDUP_WINDOW_SEC): boolean {
   if (!Number.isFinite(nowSec)) return false; // fail-safe: unsure ⇒ not a duplicate ⇒ deliver
   const ts = seen[fp];
-  return ts !== undefined && Number.isFinite(ts) && nowSec - ts < windowSec;
+  return ts !== undefined && Number.isFinite(ts) && ts <= nowSec && nowSec - ts < windowSec; // ts<=now: a future stamp never proves a duplicate
 }
 
 /** Record a fingerprint as just-seen, pruning expired entries. Returns a NEW map; input untouched. Bad clock ⇒ prune only. Pure. */
