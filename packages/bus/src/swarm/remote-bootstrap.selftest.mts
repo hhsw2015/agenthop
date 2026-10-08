@@ -57,8 +57,10 @@ t("RH4: isLinkageEntry rejects empty vmId", !isLinkageEntry({ vmId: "", backend:
 t("RH4: isLinkageEntry rejects non-finite createdSec", !isLinkageEntry({ vmId: "a", backend: "x", createdSec: NaN }));
 t("RH4: isLinkageEntry accepts a full entry", isLinkageEntry(e1));
 
-// --- RH6 regression: download failure must fail the script (no `curl | sh`) ---
+// --- RH6 regression: download failure must fail the script (no `curl | sh`, no fragile `curl && sh`) ---
 t("RH6: no `curl | sh` pipe", !script.includes("| sh"));
-t("RH6: downloads to a temp file then runs", script.includes('-o "$herdr_installer"') && script.includes('&& sh "$herdr_installer"'));
+t("RH6 round-2: no fragile `&& sh` (set -e exempts && LHS)", !script.includes("&& sh"));
+t("RH6 round-2: explicit `|| exit` on download failure", /curl -fsSL \S+ -o "\$herdr_installer" \|\| exit 1/.test(script));
+t("RH6 round-2: sh runs as a separate command", script.includes('\nsh "$herdr_installer"'));
 
 console.log("all remote-bootstrap selftests passed");

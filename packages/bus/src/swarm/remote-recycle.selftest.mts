@@ -4,6 +4,7 @@ import {
   parseMachineList,
   parseVmSshIds,
   parseReachable,
+  reachabilityFromStatus,
   workspaceIdForLabel,
 } from "./remote-recycle.js";
 
@@ -69,6 +70,13 @@ t("RH1: structured reachable:false -> false", parseReachable('{"reachable":false
 t("RH1: contradictory (unreachable + reachable) -> null", parseReachable("was unreachable, now reachable") === null);
 t("RH1: bare 'error' token does NOT force false", parseReachable("status report: no error") === null);
 
+// --- RH1 round-2: a LOCAL command failure (exit!=0) is NOT remote-unreachable evidence -> null ---
+t("RH1b: exit-failed + 'connection refused' -> null (local socket, not remote)", reachabilityFromStatus("error: connection refused (herdr socket)", true) === null);
+t("RH1b: exit-failed + 'timed out' -> null (local IPC)", reachabilityFromStatus("local IPC timed out", true) === null);
+t("RH1b: exit-ok + structured reachable:false -> false", reachabilityFromStatus('{"reachable":false}', false) === false);
+t("RH1b: exit-ok + explicit unreachable text -> false", reachabilityFromStatus("machine is unreachable", false) === false);
+t("RH1b: exit-ok + reachable -> true", reachabilityFromStatus('{"reachable":true}', false) === true);
+
 // --- RH2 regression: a partial/malformed vm-ssh list -> null (never a partial 'absent' set) ---
 t("RH2: [null,{}] -> null (not empty set)", parseVmSshIds("[null,{}]") === null);
 t("RH2: valid+missing-id rows -> null (not partial set)", parseVmSshIds('[{"id":"a"},{"backend":"x"}]') === null);
@@ -80,5 +88,10 @@ t("RH5: workspaces:{} -> null (no throw)", workspaceIdForLabel(JSON.stringify({ 
 t("RH5: two same-label -> null (ambiguous)", workspaceIdForLabel(JSON.stringify({ result: { workspaces: [
   { workspace_id: "w3", label: "dup" }, { workspace_id: "w4", label: "dup" } ] } }), "dup") === null);
 t("RH5: unique match still returns", workspaceIdForLabel(JSON.stringify({ result: { workspaces: [ { workspace_id: "w3", label: "dup" } ] } }), "dup") === "w3");
+// RH5 round-2: a same-label record missing its id makes the label AMBIGUOUS -> null (don't close the complete one)
+t("RH5b: complete + same-label-missing-id -> null (ambiguous)", workspaceIdForLabel(JSON.stringify({ result: { workspaces: [
+  { workspace_id: "w-local-business", label: "dup" }, { label: "dup" } ] } }), "dup") === null);
+t("RH5b: unique complete still returns (control)", workspaceIdForLabel(JSON.stringify({ result: { workspaces: [
+  { workspace_id: "w3", label: "dup" }, { workspace_id: "w4", label: "other" } ] } }), "dup") === "w3");
 
 console.log("all remote-recycle selftests passed");

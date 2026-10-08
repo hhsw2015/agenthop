@@ -146,6 +146,16 @@ export function parseReachable(raw: string): boolean | null {
 }
 
 /**
+ * Remote reachability from a `herdr machine status` INVOCATION = (raw output, process exit-failed). A non-zero exit
+ * means the STATUS COMMAND ITSELF failed — e.g. the LOCAL herdr socket refused the connection or the local IPC timed
+ * out. That is a LOCAL fault, NOT evidence the REMOTE machine is gone, so it returns null (keep). Only a SUCCESSFUL
+ * invocation's output is classified by parseReachable (RH1). Pure. */
+export function reachabilityFromStatus(raw: string, exitFailed: boolean): boolean | null {
+  if (exitFailed) return null; // local command failure — says nothing about the remote
+  return parseReachable(raw);
+}
+
+/**
  * Find the workspace_id whose label matches a machine label, from `herdr workspace list` JSON
  * (`{result:{workspaces:[{workspace_id,label,...}]}}`). Returns a workspace id ONLY on a UNIQUE match; an invalid
  * collection (missing / not an array, e.g. `workspaces:{}`), zero matches, or an AMBIGUOUS >1 match ⇒ null, so we never
@@ -159,8 +169,12 @@ export function workspaceIdForLabel(workspaceListJson: string, label: string): s
   }
   const ws = v?.result?.workspaces;
   if (!Array.isArray(ws)) return null; // {} / missing ⇒ no close (never throws)
-  const hits = ws.filter((w) => w && w.label === label && typeof w.workspace_id === "string");
-  return hits.length === 1 ? hits[0].workspace_id : null; // unique only; 0 or >1 ⇒ null
+  // Count by LABEL first (RH5): a same-label record that merely lacks a workspace_id still makes the label AMBIGUOUS —
+  // filtering it out before counting would fabricate a false "unique" match and close the wrong workspace.
+  const byLabel = ws.filter((w) => w && w.label === label);
+  if (byLabel.length !== 1) return null; // zero, or ambiguous (incl. an incomplete same-label record)
+  const only = byLabel[0];
+  return typeof only.workspace_id === "string" && only.workspace_id ? only.workspace_id : null; // unique but invalid id ⇒ null
 }
 
 // ============================================================================================================
@@ -225,7 +239,7 @@ export async function sweepRecycled(opts: {
   const outcomes: SweepOutcome[] = [];
   for (const m of machines) {
     const st = await run(HERDR_BIN, ["machine", "status", m.id, "--json"], 10000);
-    const machineReachable = parseReachable(st.raw);
+    const machineReachable = reachabilityFromStatus(st.raw, st.exitFailed); // exit-failed = local fault ⇒ null (RH1)
     const vmListed = vmIds === null ? null : vmIds.has(opts.ephemeral[m.label].vmId); // match by registered vmId (RH3)
     const verdict = recycleVerdict({ machineReachable, vmListed });
 
