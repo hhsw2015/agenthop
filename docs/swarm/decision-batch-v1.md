@@ -78,6 +78,15 @@ Frozen so `3e097dfe` (console render) can consume the files directly. Code: `pac
 > hold-intent, no live one) is CLAIMED (unlink that intent, single-winner) then adopted. Everything else (a live gap, a bare empty
 > dir, a stale own intent alone) contends. No other process ever touches a foreign empty dir, so a dir we stranded is ours alone to
 > recover; a crashed holder's own-process-restart or any peer recovers it via the dead-intent path.
+>
+> **round-13 (R25, @4d02ca0):** two mis-adoption paths closed. (A) The round-12 "claim a DEAD hold-intent, then adopt" branch is
+> REMOVED: a stale dead credential can outlive the dir it named (a prior holder removed its dir but its cleanup unlink faulted),
+> so claiming it never proves the CURRENT empty dir is unoccupied — it could adopt a fresh successor's dir. An EXTERNAL empty dir
+> (including a dead holder's) is now simply CONTENDED; crashed-external recovery is out of band (R26). (B) The in-process
+> stranded-dir record is now invalidated on EVERY successful rmdir of the dir, not only on a successful re-acquire: a published
+> reclaim could rmdir the dir yet lose the re-mkdir to another process, and the lingering record would then wrongly authorize
+> adopting the new occupant's dir. Own-recovery by adoption therefore fires ONLY for a dir this process still has genuinely
+> stranded.
 
 ## Orphan recovery (R25) — formal boundary
 
@@ -119,14 +128,15 @@ responsible for idempotent re-batching keyed on the stable update id (the conten
   named `<pid>.<nonce>` (vm-ssh `withIdLock` pattern). Reclaim removes ONLY a dead holder's exact-named file (never a successor's);
   release removes ONLY our own named file and never throws. A PUBLISHED holder (one identity file) is reclaimed iff dead/own. An
   EMPTY lock dir is never DELETED to recover it (a remove→recreate gap could strand a live successor); it is recovered by ADOPTION
-  (publishing our identity straight into it) ONLY with occupancy-bound proof: contend if the hold-intents cannot be read (EACCES
-  never means "no holder"); contend on any LIVE FOREIGN `consume.lockd.hold.*`; adopt if it is OUR OWN unfinished occupancy (an
-  in-process fact, not a same-pid intent on disk); else claim+adopt an EXTERNAL DEAD holder's dir (a dead hold-intent, no live one).
+  (publishing our identity straight into it) ONLY for OUR OWN unfinished occupancy: contend if the hold-intents cannot be read
+  (EACCES never means "no holder"); contend on any LIVE FOREIGN `consume.lockd.hold.*`; adopt ONLY if this dir is in our in-process
+  stranded set. An EXTERNAL empty dir — including a DEAD holder's — is CONTENDED, never adopted (a stale on-disk credential cannot
+  prove the current dir unoccupied); a crashed external holder's recovery is out of band (R26). The stranded record is invalidated
+  on every successful rmdir of the dir, so it can never authorize adopting a later occupant's dir.
 - `consume.lockd.hold.<pid>.<nonce>` — a HOLD-INTENT written in the batch dir BEFORE the mkdir and removed after release. While
-  LIVE it tells a concurrent acquirer we hold the empty mkdir→publish window (⇒ contend, never steal); if its owner DIES mid-window
-  it is the DEAD credential a peer (or the owner's own restart) recovers the stranded dir by (claim it, then adopt). OWN
-  same-process recovery does NOT trust this on-disk intent (a prior completed call may leave a stale one) — it uses the in-process
-  stranded-dir set, so a stale own intent never authorizes adopting a dir a new successor now holds.
+  LIVE it tells a concurrent acquirer we hold the empty mkdir→publish window (⇒ contend, never steal). OWN same-process recovery
+  does NOT use this on-disk intent (a prior completed call may leave a stale one, and a dead intent may outlive the dir it named)
+  — it uses the in-process stranded-dir set, so a stale/dead intent never authorizes adopting a dir a new successor now holds.
 - `orphan-<digest>.sent` — per-update proof-of-sent, written only AFTER the orphan re-batch signal is delivered. Dedups re-emits of
   the same content digest across retries; its absence after a faulted send is what lets a retry re-send exactly one.
 
