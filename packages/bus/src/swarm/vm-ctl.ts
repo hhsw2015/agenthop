@@ -66,25 +66,52 @@ export type ReadyVerdict = "ready" | "down" | "unknown";
  * Ready-probe verdict from an ssh/probe invocation = (raw output, exit-failed). A non-zero exit is a LOCAL/transport
  * failure (not the remote asserting down) ⇒ `unknown` (retry, never "down"); explicit reachable text ⇒ `ready`;
  * explicit connection-refused/down ⇒ `down`; anything else ⇒ `unknown`. Fail-closed: never "ready" on doubt. Pure. */
+/** A structured readiness flag from a parsed probe JSON (`{ready|reachable|running|online: bool}`, top-level or one
+ *  level deep). null when absent/non-boolean. Pure. */
+function readyFlag(s: string): boolean | null {
+  let v: unknown;
+  try {
+    v = JSON.parse(s);
+  } catch {
+    return null;
+  }
+  const objs = Array.isArray(v) ? v : [v];
+  for (const o of objs) {
+    if (!o || typeof o !== "object") continue;
+    for (const k of ["ready", "reachable", "running", "online"] as const) {
+      const f = (o as Record<string, unknown>)[k];
+      if (typeof f === "boolean") return f;
+    }
+  }
+  return null;
+}
+
+/**
+ * Ready verdict (VMC-P1-1, hardened): a structured JSON flag wins (`ready:false`/`running:false` → down); otherwise a
+ * GENERIC negation/falsity guard (`not`, `n't`, `no`, `false`, `disabled`) blocks `ready` — an enumerated down-list
+ * can't cover every negation ("not online", "not connected", "running=false"). `ready` requires an explicit success
+ * expression AND no negation; explicit failure → down; everything unconfirmable → unknown. Pure. */
 export function readyVerdict(raw: string, exitFailed: boolean): ReadyVerdict {
   if (exitFailed) return "unknown"; // transport/local failure — retry, don't conclude
   const s = (raw ?? "").toLowerCase().trim();
   if (!s) return "unknown";
-  // DOWN evidence (incl. NEGATIONS) is computed alongside UP, and a conflict yields unknown — only clear, conflict-free
-  // success is `ready` (VMC-P1-1). `\breachable\b` won't match inside "unreachable" (no word boundary).
-  const down = /\bunreachable\b|not reachable|unable to reach|cannot reach|not ready|not running|connection refused|\btimed out\b|no route to host|host is down|\boffline\b/.test(s);
-  const up = /\breachable\b|server is ready|\bready\b|\bonline\b|\brunning\b|\bconnected\b/.test(s);
-  if (down && up) return "unknown"; // conflicting/negated text — never ready
-  if (down) return "down";
-  if (up) return "ready";
-  return "unknown";
+  const flag = readyFlag(s);
+  if (flag !== null) return flag ? "ready" : "down"; // structured truth beats text
+  const failure = /\bunreachable\b|not reachable|unable to reach|cannot reach|not running|not ready|connection refused|\btimed out\b|no route to host|host is down|\boffline\b|\bfailed\b/.test(s);
+  const negated = /\bnot\b|n['’]t|\bno\b|\bfalse\b|=\s*false|:\s*false|\bdisabled\b/.test(s); // generic: any negation/falsity
+  if (failure) return "down";
+  if (negated) return "unknown"; // negated/false but no explicit failure phrase → unconfirmable, never ready
+  const affirm = /server is ready|status:\s*running|\breachable\b|\bready\b|\brunning\b|\bonline\b|\bconnected\b/.test(s);
+  return affirm ? "ready" : "unknown";
 }
 
 /** Bounded exponential-ish backoff for the ready gate (borrowed from Railway's BACKOFF_SECS). Last value repeats. Pure. */
 export const READY_BACKOFF_SEC: readonly number[] = [1, 2, 4, 8, 15];
 export function nextBackoffSec(attempt: number, schedule: readonly number[] = READY_BACKOFF_SEC): number {
-  // Reject an illegal table (empty, or any non-finite/negative entry) → safe default; a delay must be finite & ≥0 (VMC-P2-2).
-  const safe = Array.isArray(schedule) && schedule.length > 0 && schedule.every((n) => Number.isFinite(n) && n >= 0) ? schedule : READY_BACKOFF_SEC;
+  // Reject an illegal table → safe default; a delay must be finite & ≥0 (VMC-P2-2). `Array.from` materializes sparse
+  // HOLES as `undefined` so `every` can't skip them (a plain `.every` skips holes and lets `new Array(n)` through).
+  const dense = Array.isArray(schedule) ? Array.from(schedule as ArrayLike<number>) : [];
+  const safe = dense.length > 0 && dense.every((n) => Number.isFinite(n) && n >= 0) ? dense : READY_BACKOFF_SEC;
   const a = Number.isFinite(attempt) && attempt >= 1 ? Math.floor(attempt) : 1;
   return safe[Math.min(a - 1, safe.length - 1)];
 }

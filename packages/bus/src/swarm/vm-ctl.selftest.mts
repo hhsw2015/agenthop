@@ -45,7 +45,15 @@ t("VMC-P1-1: 'unreachable' -> down (not ready)", readyVerdict("unreachable", fal
 t("VMC-P1-1: 'not ready' -> NOT ready", readyVerdict("not ready", false) !== "ready");
 t("VMC-P1-1: 'herdr server not running' -> NOT ready", readyVerdict("herdr server not running", false) !== "ready");
 t("VMC-P1-1: 'OK: connection refused' -> NOT ready", readyVerdict("OK: connection refused", false) !== "ready");
-t("VMC-P1-1: conflict (reachable + refused) -> unknown", readyVerdict("reachable but connection refused", false) === "unknown");
+t("VMC-P1-1: conflict (reachable + refused) -> NOT ready", readyVerdict("reachable but connection refused", false) !== "ready");
+// VMC-P1-1 round-2: generic negation/falsity (not just enumerated down-words) + structured flag
+t("VMC-P1-1b: 'not online' -> NOT ready", readyVerdict("not online", false) !== "ready");
+t("VMC-P1-1b: 'not connected' -> NOT ready", readyVerdict("not connected", false) !== "ready");
+t("VMC-P1-1b: JSON ready:false -> down", readyVerdict('{"ready":false}', false) === "down");
+t("VMC-P1-1b: JSON running:false -> down", readyVerdict('{"running":false}', false) === "down");
+t("VMC-P1-1b: text 'running=false' -> NOT ready", readyVerdict("running=false", false) !== "ready");
+t("VMC-P1-1b: JSON reachable:true -> ready (control)", readyVerdict('{"reachable":true}', false) === "ready");
+t("VMC-P1-1b: 'server is ready' -> ready (control)", readyVerdict("server is ready", false) === "ready");
 
 // --- backoff: bounded, last value repeats ---
 t("backoff attempt1 = first", nextBackoffSec(1) === READY_BACKOFF_SEC[0]);
@@ -56,6 +64,10 @@ t("VMC-P2-2: empty table -> finite default", Number.isFinite(nextBackoffSec(1, [
 t("VMC-P2-2: NaN/Infinity table -> default", nextBackoffSec(1, [NaN, Infinity]) === READY_BACKOFF_SEC[0]);
 t("VMC-P2-2: negative table -> default", nextBackoffSec(2, [-5, -1]) === READY_BACKOFF_SEC[1]);
 t("VMC-P2-2: valid custom table honored", nextBackoffSec(1, [3, 6]) === 3);
+// VMC-P2-2 round-2: sparse-array holes must NOT pass (every skips holes)
+t("VMC-P2-2b: new Array(1) -> finite default", Number.isFinite(nextBackoffSec(1, new Array(1))) && nextBackoffSec(1, new Array(1)) === READY_BACKOFF_SEC[0]);
+t("VMC-P2-2b: new Array(3) -> finite default", Number.isFinite(nextBackoffSec(2, new Array(3))) && nextBackoffSec(2, new Array(3)) === READY_BACKOFF_SEC[1]);
+t("VMC-P2-2b: deleted-middle sparse -> default", (() => { const a = [1, 2, 3]; delete (a as any)[1]; const r = nextBackoffSec(2, a); return Number.isFinite(r) && r === READY_BACKOFF_SEC[1]; })());
 
 // --- credential hard-gate: stdin→0600 always; argv = refuse ---
 const codex = buildCredSeed("codex");
