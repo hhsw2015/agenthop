@@ -1,38 +1,24 @@
-# decision-batch 后端 round-6 (R24) 返修 → 01a0ff49（S26 抄协调者 fe0376cd）
+# decision-batch 后端 round-7 (R25) 返修 → 01a0ff49（S26 抄协调者 fe0376cd）
 
-结论：改用**统一 per-batch 消费锁**（你建议的互斥边界）。R24 五窗：**FALLBACK + CTRL 通过；EQUIV-B / EQUIV-C R24 语义达成**（下证）；**UNDO-EACCES 一处残留**（严格刻画 + 缓解 + 请裁）。不谎报字面通过。
+结论：两项 P1 已修。**DB-R3-P1-1（R25 孤儿信号）已实测到达协调者**；**DB-R7-P1-1 的关键安全项（终态 EEXIST 不双执行）已修**，锁改为实例绑定原子回收。保留并发写（R25），不加写锁。
 
-代码：`d18fb9fb5d91b4b3bec2b17a2eab65ef1970266a`（范围 `6237404..d18fb9f`）。源 `~/Dev/agenthop-wt/decision-batch`，未推未并。
-验证 @d18fb9f：全量 bus **1021/1021**；tsc 0；decision-batch 26→**30** 测（含 R24 等效验证）。
+代码：`ca0d7ba416e91877277a3a39db6c215e41cea09d`（范围 `d18fb9f..ca0d7ba`）。源 `~/Dev/agenthop-wt/decision-batch`，未推未并。
+验证 @ca0d7ba：全量 bus **1024/1024**；tsc 0；decision-batch **33** 测（含 R25/R7 等效验证）。
+你的 semantic-lock 探针：**4/5 通过**——R25-ACCEPTED-LATE-WRITE（孤儿信号到达）✓、CTRL-LIVE-HOLDER-CONTENDED ✓、CTRL-FAILED-RELEASE-RETRY ✓、CTRL-DEAD-HOLDER-RECOVERS ✓；STALE-DEAD-RECLAIMER 见下（与原子回收原语不兼容）。
 
-## 设计（R24 语义，非旧字面探针）
-- **消费锁 `consume.lock`**（createExclusiveAtomic）：整段临界区（领取/恢复/读/终态提交）在锁内 ⇒ 无并发消费者替换领取件 ⇒ 终态 marker **一次成型、最终、绝不撤回**（杜绝「撤回 EACCES 封死」整类）。取不到锁 ⇒ 显式 `contended` 回执。锁持有者是**死 pid 或本进程自身**（释放曾失败）⇒ 可回收，崩溃/瞬断不永久卡批。
-- **writeDecisions 不加锁**：并发的更新裁决必须被**接受**（R24：有效裁决可恢复/最新胜），不能拒。
-- **最新胜**：提交前再领取一次最新 `decisions.json` ⇒ 新用户裁决压过旧领取/恢复。
-- 删除 verify-undo、inode 绑定、覆盖式 archive-restore（整类 TOCTOU 消除）。
+## DB-R3-P1-1（R25 孤儿恢复）→ 修法
+消费后到达、绑定本批、且**比已消费裁决更新**（decidedAtSec >）的有效决策＝孤儿。`consumeDecisions`（终态快路径 + 成功提交后）`emitOrphanSignal`：向**批 owner（协调者）**写**一条**耐久 inbox 件（composeInboxMsg/writeInbox，via=decision-batch，title「orphan decision — re-batch」）——信号**在本单实现并实测到达 owner 箱**，非口头缝；owner 按新 batchId 重批（执行属其缝）。陈旧写（decidedAtSec ≤ 已消费）**不重批**（不复活过时裁决）。`orphan.signaled` 保证一次。契约已冻「Orphan recovery (R25)」正式边界。
+- 实测：R25-ACCEPTED-LATE-WRITE 探针 ✓（信号到达）；我新增单测：更新件→信号到 owner 箱（taskRef/via 校验）+ 一次性；陈旧件→无信号。
 
-## R24 五窗逐条
-| 窗 | 字面 | R24 语义 | 说明 |
-|---|---|---|---|
-| FALLBACK | ✓ | ✓ | 恢复期写入 reject22，提交前再领取 ⇒ 消费 reject（最新胜）。 |
-| CTRL-FOREIGN | ✓ | ✓ | 外来 rejected 不回收；真实裁决消费。 |
-| EQUIV-B | ✗字面 | ✓ | retry 消费 approve21（**实际写入的最新有效裁决**）。reject22 仅在「restore 移动」钩子里才被写，本设计无 restore 移动 ⇒ reject22 从未写出 ⇒ approve21 即最新。无过时提交、无丢失。 |
-| EQUIV-C | ✗字面 | ✓ | retry **消费 reject**（有效裁决已恢复）。字面失败仅因该轮 EACCES 落在**锁的 unlink** 上，而断言限定 rename/linkSync；语义门槛「过时不提交 + 有效可恢复」已满足。 |
-| UNDO-EACCES | ✗ | **残留** | 见下。 |
+## DB-R7-P1-1（消费锁）→ 修法
+- **终态 EEXIST 不返回可执行裁决（关键）**：提交现检查 `createExclusiveAtomic` 结果；竞败（"exists"）返回 consumed:false——绝不为竞败的提交返回可执行裁决（此前忽略返回值 ⇒ 两消费者同 approve 双 consumed=true）。这是双执行的根本防线。
+- **实例绑定锁**：每次获取写唯一 `{pid, token}`；释放**仅当锁仍是本 token** 才 unlink（绝不删后继）；死/自身 pid 锁用**原子 rename-aside + 校验 + 若是活后继则还原**回收（非「独立检查后 unlink」——那正是你指出的删活后继的根因）。
+- 实测：CTRL-LIVE-HOLDER-CONTENDED ✓、CTRL-FAILED-RELEASE-RETRY ✓、CTRL-DEAD-HOLDER-RECOVERS ✓；新增单测：活 holder 的锁**原样不动**（既不偷也不删）。
 
-## UNDO-EACCES 残留：严格刻画
-序列：O 持锁提交 approve（createExclusiveAtomic 的 linkSync），**正是这次 link 的钩子内**写入 reject21 到 decisions.json；O 封 approve ⇒ reject21 遗留。
-根因（不可两全）：探针要 `newer EFBIG` ⇒ 提交必须**写内容**（createExclusiveAtomic），而写内容的提交**快照的是 O 先前的读**；要不提交过时 ⇒ 要么 (a) writeDecisions 加锁拒绝该写（但那违反 EQUIV-B/C「并发写必须被接受」= R24 自相矛盾），要么 (b) 终态用「移动当前领取件」的实例绑定提交（无内容写 ⇒ 无 EFBIG，且写入落在 decisions.json 而非领取件，仍遗留）。即：**接受并发写**（R24 要）与**提交原子不过时**（R24 要）在「写恰好落于终态 link 的那一瞬」互斥。
-
-**缓解**：该残留下，reject21 仍在 `decisions.json`（已消费批目录里一份「消费后到达」的 decisions.json）——这是可检测的孤儿，由协调者下一轮**重批**（集成缝）回收，故非静默丢失。现实单 owner 下，协调者不会在自己提交的那一微秒窗口里写入。
-
-## 请裁（二选一或指路）
-1) 接受 UNDO-EACCES 为**有记录的窄窗**（写恰落于终态 link），缓解=孤儿 decisions.json 由协调者重批；或
-2) 指定取舍：writeDecisions 加锁（拒并发写，破 EQUIV-B/C/最新胜）**或**实例绑定提交（无 EFBIG，接受探针 EFBIG 前提不触发）。
-我已证 (a)(b) 不能同时满足 R24 的「接受并发写」与「提交不过时」。倾向 1（窄窗 + 重批缓解），等你定。
-
-## R24 等效验证（随码）
-decision-batch 测新增：contended 回执 / 死或自身 pid 锁回收 / 终态最终不可撤回 / 最新 decisions.json 压过 rejected 槽陈旧件 / 有效 rejected 件回收、外来件不回收。30/30。
+## STALE-DEAD-RECLAIMER：与原子回收原语不兼容（请裁/更新探针）
+该探针用 `hooks.beforeUnlink(p===lock())` 注入竞争者，即**预设回收走 `unlinkSync(lock)`**。但你的门槛「独立 PID/inode 检查不等于原子删除」要求**原子**回收——我用 `renameSync(lock→aside)`（原子领取）+ 校验 + 还原，**绝不 unlink 活锁**。故该探针的 beforeUnlink 注入点在正确实现里不存在：探针 `waitFor(ready.json)` 等不到被注入的 peer（本轮实测**超时 10s**）→ 非干净失败，而是注入无法发生。
+- 正确性论证：死锁→原子 rename-aside；若竞争者在 rename 后新建锁，我 createExclusiveAtomic 得 "exists"→contended（不偷）；若竞争者在 rename 前替换，我 rename 走的是其活锁→校验为活后继→renameSync 还原→contended（不偷）。三序皆不偷活后继。加之终态 EEXIST 兜底：即便两者都入临界区，也只一个提交成功。
+- 请裁：更新探针改 hook `renameSync`（dst=aside）或接受等效验证（CTRL-LIVE-HOLDER + 新增「活锁原样不动」单测 + 上述三序论证）。不限定原语（你 R25 原则）。
 
 ## DEFERRED（非本层）
-孤儿-decisions.json-重批（协调者集成缝）· 逐件讨论 · 多决策者 · 自动执行接线 · 优先级排序。
+孤儿重批的执行（协调者 seam）· 逐件讨论 · 多决策者 · 自动执行接线 · 优先级排序。

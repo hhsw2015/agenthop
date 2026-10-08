@@ -32,8 +32,23 @@ Frozen so `3e097dfe` (console render) can consume the files directly. Code: `pac
 > per-batch exclusive lock `consume.lock`, so the terminal marker is created once and FINAL (no retract), and the claim can't be
 > replaced mid-consume. A consumer that cannot take the lock returns `{ consumed:false, contended:true }` (explicit receipt); a
 > lock left by a dead/own pid is reclaimable. `writeDecisions` stays UNLOCKED (a concurrent newer decision is accepted), and the
-> consume re-claims the LATEST `decisions.json` right before commit so the newer decision wins. (Residual under adjudication: a
-> write landing exactly during the terminal link — see the review packet.)
+> consume re-claims the LATEST `decisions.json` right before commit so the newer decision wins.
+>
+> **round-7 (R25, @ca0d7ba):** ORPHAN RECOVERY is now a formal contract (below). The consume lock is INSTANCE-BOUND (`{pid, token}`:
+> release unlinks only our token; a dead/own-pid lock is reclaimed by an atomic rename-aside + verify, never a check-then-unlink
+> that could delete a live successor). The terminal commit now checks `createExclusiveAtomic` — a lost race (`"exists"`) returns
+> `consumed:false` (never an executable verdict for a lost commit).
+
+## Orphan recovery (R25) — formal boundary
+
+A decision can be ACCEPTED (written to `decisions.json`) but never consumed into this batch, because the batch became terminal
+first (a write that landed during the winning consumer's commit, or after it). When such a decision is **valid, bound to this
+batch, and NEWER than the verdict that was consumed** (`decidedAtSec >` the consumed verdict's), it is an **orphan**. The backend
+emits EXACTLY ONE durable inbox signal to the batch **owner** (the coordinator): `via:"decision-batch"`,
+`taskRef:"decision-batch:<id>"`, title `"orphan decision — re-batch"`. This signal is part of THIS slice and is guaranteed to
+reach the owner's inbox (not deferred to a seam). The owner RE-BATCHES the orphan under a NEW batchId (that execution is the
+coordinator's integration seam). A STALE/older write (`decidedAtSec ≤` the consumed verdict's) is NOT an orphan and is never
+re-batched — a superseded verdict is never revived. `orphan.signaled` records the one-time emission.
 
 ## Files (under `$HOME/.agenthop/console/decision-batches/<batchId>/`)
 
@@ -52,6 +67,9 @@ Frozen so `3e097dfe` (console render) can consume the files directly. Code: `pac
 - `notified.sent` — the ONLY proof-of-sent (written AFTER the ping). While present, a repeat `openBatch` does not re-ping.
 - `notified.lock` — an exclusive link-lock serializing concurrent notifiers; `notified.json` — a pre-send intent record (NOT
   proof of sent). A lock held with no `notified.sent` ⇒ `openBatch` returns UNCERTAIN (throws) rather than re-ping or silently skip.
+- `consume.lock` — the per-batch exclusive consume lock (`{pid, token}`): serializes consumers so the terminal marker is final and
+  the claim can't be replaced mid-consume. Release unlinks ONLY our token; a dead/own-pid lock is reclaimed atomically.
+- `orphan.signaled` — records that the one-time orphan re-batch signal (see Orphan recovery) was emitted to the owner.
 
 A decisions doc OR a batch.json whose `batchId` ≠ its directory is IGNORED (a misbound/foreign drop). Marker/claim/lock files are
 backend-internal; the console writes only `decisions.json`.
