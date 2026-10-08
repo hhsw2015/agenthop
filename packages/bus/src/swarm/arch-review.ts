@@ -12,13 +12,17 @@
 // import map is built from the diff'd files alone, so an edge to a file outside the batch is simply absent,
 // never a pass. Correctness is the reviewer's; this is collection + rendering only.
 //
-// PURE CORE + THIN IO (the herdr.ts idiom): classification/extraction/rendering is pure and selftested; the
-// git/fs/crypto wrappers at the bottom are exercised by live runs. Keeping the split is itself the boundary
-// invariant this very tool checks for — the pure half below imports no node builtin.
+// RESULTS ARE A FUNCTION OF THE SHA, NOT THE WORKING TREE (round-1 AR1): every file's content is read from
+// the git object at `head` via `git show <head>:<path>`, so a dirty tree or a different checkout cannot change
+// the pack. A path absent at `head` is UNAVAILABLE, not an empty file (AR1/AR2).
+//
+// PURE CORE + THIN IO (the herdr.ts idiom): classification/extraction/rendering is pure and selftested (import
+// extraction delegates to the TypeScript preprocessor, which is lexically correct); the git/crypto wrappers at
+// the bottom are exercised by the integration selftest and live runs.
 
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import * as ts from "typescript";
 
 // ===================== PURE CORE (selftested) =====================
 
@@ -26,53 +30,70 @@ import { createHash } from "node:crypto";
 export type Zone = "script" | "test" | "doc" | "bus" | "other";
 
 export function zoneOf(filePath: string): Zone {
-  if (/\.(test|selftest)\.[cm]?[jt]s$/.test(filePath)) return "test";
+  if (/\.(test|selftest)\.[cm]?[jt]sx?$/.test(filePath)) return "test";
   if (filePath.startsWith("scripts/")) return "script";
   if (filePath.endsWith(".md") || filePath.startsWith("docs/")) return "doc";
   if (filePath.startsWith("packages/bus/src/")) return "bus";
   return "other";
 }
 
-// node builtins whose DIRECT import makes a module IO-tainted (side-effecting), for the pure->IO boundary axis.
-const IO_BUILTINS = new Set([
-  "fs", "fs/promises", "child_process", "net", "http", "https", "dgram", "tls", "readline", "dns", "cluster",
+// node builtins whose DIRECT import makes a module IO-tainted, matched on the builtin ROOT so a submodule like
+// `fs/promises`, `dns/promises`, `readline/promises`, `http2` is covered without enumerating each (AR4).
+const IO_BUILTIN_ROOTS = new Set([
+  "fs", "child_process", "net", "http", "http2", "https", "dgram", "tls", "dns", "readline", "cluster", "inspector", "repl",
 ]);
 
-// Strip comments so a commented-out `import` line is never mistaken for a real edge (the `://` guard keeps URLs).
-export function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+export function ioRootOf(spec: string): string {
+  return spec.replace(/^node:/, "").split("/")[0] ?? "";
 }
 
-// Extract module specifiers from static imports/exports, bare imports, and require()/dynamic import().
+// Lexically-correct import extraction via the TypeScript preprocessor: it ignores strings, comments, regex and
+// template literals, and captures static import/export-from, bare imports, require(), and a resolvable literal
+// dynamic import("..."). A non-literal dynamic import (template/variable) has no knowable target and is omitted
+// (AR3). This is a real scanner, not a regex over raw text.
 export function extractImports(content: string): string[] {
-  const src = stripComments(content);
-  const out: string[] = [];
-  const re =
-    /(?:import|export)\s[^;]*?from\s*["']([^"']+)["']|import\s*["']([^"']+)["']|(?:require|import)\s*\(\s*["']([^"']+)["']\s*\)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(src)) !== null) {
-    const spec = m[1] ?? m[2] ?? m[3];
-    if (spec) out.push(spec);
-  }
-  return out;
+  return ts.preProcessFile(content, /*readImportFiles*/ true, /*detectJavaScriptImports*/ true).importedFiles.map((f) => f.fileName);
 }
 
 export function isIoTainted(content: string): boolean {
-  return extractImports(content).some((s) => IO_BUILTINS.has(s.replace(/^node:/, "")));
+  return extractImports(content).some((s) => IO_BUILTIN_ROOTS.has(ioRootOf(s)));
 }
 
-// Resolve a RELATIVE specifier to a repo-relative path (ESM `.js` specifier maps back to `.ts` source).
-// Bare/external specifiers return null — they are not internal edges.
-export function resolveSpecifier(fromPath: string, spec: string): string | null {
+// Normalize a RELATIVE specifier to a repo-relative path, keeping its own extension. Bare/external -> null.
+export function normalizeSpecifier(fromPath: string, spec: string): string | null {
   if (!spec.startsWith(".")) return null;
-  const dir = fromPath.split("/").slice(0, -1);
-  const stack = [...dir];
+  const stack = fromPath.split("/").slice(0, -1);
   for (const part of spec.split("/")) {
     if (part === "" || part === ".") continue;
     if (part === "..") stack.pop();
     else stack.push(part);
   }
-  return stack.join("/").replace(/\.js$/, ".ts").replace(/\.mjs$/, ".mts");
+  return stack.join("/");
+}
+
+// Candidate SOURCE paths for a normalized import path: the literal path, compiled->source extension swaps
+// (.js->.ts/.tsx, .mjs->.mts, .cjs->.cts), and bare/extensionless + index resolution. The swaps are ADDED,
+// never forced — a real `.mjs` in the batch resolves to itself (AR5). Most specific first.
+const SRC_EXTS = [".ts", ".mts", ".cts", ".tsx", ".js", ".mjs", ".cjs"];
+export function candidatePaths(normalized: string): string[] {
+  const out: string[] = [normalized];
+  if (/\.js$/.test(normalized)) out.push(normalized.replace(/\.js$/, ".ts"), normalized.replace(/\.js$/, ".tsx"));
+  if (/\.mjs$/.test(normalized)) out.push(normalized.replace(/\.mjs$/, ".mts"));
+  if (/\.cjs$/.test(normalized)) out.push(normalized.replace(/\.cjs$/, ".cts"));
+  const noext = normalized.replace(/\.[cm]?[jt]sx?$/, "");
+  for (const e of SRC_EXTS) {
+    out.push(noext + e);
+    out.push(`${noext}/index${e}`);
+  }
+  return [...new Set(out)];
+}
+
+// Resolve a specifier to the REAL file present in the batch set; null if it resolves outside the set.
+export function resolveInSet(fromPath: string, spec: string, paths: ReadonlySet<string>): string | null {
+  const norm = normalizeSpecifier(fromPath, spec);
+  if (norm === null) return null;
+  for (const c of candidatePaths(norm)) if (paths.has(c)) return c;
+  return null;
 }
 
 export type FileInfo = { path: string; zone: Zone; ioTainted: boolean; imports: string[] };
@@ -86,10 +107,11 @@ export type Edge = { from: string; to: string; fromZone: Zone; toZone: Zone };
 // Edges are kept ONLY when both endpoints are in the collected file set — an edge out of the batch is absent.
 export function buildImportEdges(files: FileInfo[]): Edge[] {
   const byPath = new Map(files.map((f) => [f.path, f]));
+  const paths = new Set(files.map((f) => f.path));
   const edges: Edge[] = [];
   for (const f of files) {
     for (const spec of f.imports) {
-      const to = resolveSpecifier(f.path, spec);
+      const to = resolveInSet(f.path, spec, paths);
       if (!to) continue;
       const tf = byPath.get(to);
       if (!tf) continue;
@@ -169,13 +191,14 @@ export type ContractCategory = "spec-doc" | "shared-type" | "invariant-doc" | "o
 export function contractCategory(filePath: string): ContractCategory {
   if (/(^|\/)(CLAUDE\.md$|memory\/)/.test(filePath)) return "invariant-doc";
   if (filePath.endsWith(".md")) return "spec-doc";
-  if (/\.(ts|mts)$/.test(filePath)) return "shared-type";
+  if (/\.(ts|mts|cts)$/.test(filePath)) return "shared-type";
   return "other";
 }
 
-export type ManifestRow = { path: string; sha256: string; category: ContractCategory };
+// sha256 === null means the path was UNAVAILABLE at head (missing / unreadable), NOT an empty file (AR2).
+export type ManifestRow = { path: string; sha256: string | null; category: ContractCategory };
 
-export function contractSurfaceManifest(entries: { path: string; sha256: string }[]): ManifestRow[] {
+export function contractSurfaceManifest(entries: { path: string; sha256: string | null }[]): ManifestRow[] {
   return entries.map((e) => ({ path: e.path, sha256: e.sha256, category: contractCategory(e.path) }));
 }
 
@@ -221,8 +244,9 @@ export function renderReviewSheet(input: ReviewSheetInput): string {
   out.push("## What this is");
   out.push(
     "A CROSS-CUTTING review of the batch as a whole, not per-PR correctness. The tooling below collected the " +
-      "inputs; the reviewer fills each axis verdict. A CONFIRMED finding is REMAIN and BLOCKS the batch merge; a " +
-      "drift finding opens a convergence follow-up. The tool flags candidates only — it never pronounces a verdict.",
+      "inputs from the git objects at HEAD (not the working tree); the reviewer fills each axis verdict. A " +
+      "CONFIRMED finding is REMAIN and BLOCKS the batch merge; a drift finding opens a convergence follow-up. The " +
+      "tool flags candidates only — it never pronounces a verdict.",
   );
   out.push("");
   out.push("## Diff set");
@@ -238,7 +262,11 @@ export function renderReviewSheet(input: ReviewSheetInput): string {
   out.push(
     table(
       ["path", "category", "sha256"],
-      input.manifest.map((r) => [`\`${r.path}\``, r.category, `\`${r.sha256.slice(0, 16)}…\``]),
+      input.manifest.map((r) => [
+        `\`${r.path}\``,
+        r.category,
+        r.sha256 === null ? "**(unavailable)**" : `\`${r.sha256.slice(0, 16)}…\``,
+      ]),
     ),
   );
   out.push("");
@@ -273,29 +301,41 @@ export function renderReviewSheet(input: ReviewSheetInput): string {
   return out.join("\n");
 }
 
-// ===================== THIN IO (exercised by live runs, not the selftest) =====================
+// ===================== THIN IO (exercised by the integration selftest + live runs) =====================
 
 export function sha256(s: string): string {
   return createHash("sha256").update(s).digest("hex");
 }
 
 function git(repo: string, args: string[]): string {
-  return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+}
+
+// Read a path's content at a FIXED commit (git object) — null if the path is absent/unreadable at that rev.
+// Reading the OBJECT, never the working tree, is what makes the pack a function of the SHA (AR1).
+export function gitShow(repo: string, rev: string, rel: string): string | null {
+  try {
+    // stderr ignored: an absent path at rev is the expected "unavailable" signal (caught below), not noise.
+    return execFileSync("git", ["-C", repo, "show", `${rev}:${rel}`], {
+      encoding: "utf8",
+      maxBuffer: 256 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    return null;
+  }
 }
 
 export function gitBatchDiff(repo: string, base: string, head: string): { commits: string[]; changedFiles: string[] } {
-  const commits = git(repo, ["log", "--format=%h %s", `${base}..${head}`]).trim().split("\n").filter(Boolean);
-  const changedFiles = git(repo, ["diff", "--name-only", `${base}...${head}`]).trim().split("\n").filter(Boolean);
+  const commits = git(repo, ["log", "--format=%h %s", `${base}..${head}`]).split("\n").filter(Boolean);
+  // -z + core.quotepath=false: a machine-readable NUL-separated list, so non-ASCII paths are neither escaped
+  // nor split mid-name (AR5).
+  const raw = git(repo, ["-c", "core.quotepath=false", "diff", "--name-only", "-z", `${base}...${head}`]);
+  const changedFiles = raw.split("\0").filter(Boolean);
   return { commits, changedFiles };
 }
 
-function readSafe(repo: string, rel: string): string {
-  try {
-    return readFileSync(`${repo}/${rel}`, "utf8");
-  } catch {
-    return "";
-  }
-}
+const SRC_FILE_RE = /\.[cm]?[jt]sx?$/; // .ts .tsx .mts .cts .js .jsx .mjs .cjs — collect compiled sources too (AR5)
 
 export const DEFAULT_CONTRACT_SURFACE: readonly string[] = [
   "docs/swarm/cluster-liveness-design.md",
@@ -316,6 +356,7 @@ export type ArchReviewPack = {
   doneFlags: DoneFlag[];
   commits: string[];
   changedFiles: string[];
+  unavailableContracts: string[];
 };
 
 export function collectArchReviewPack(opts: {
@@ -331,18 +372,21 @@ export function collectArchReviewPack(opts: {
   const { repo, base, head } = opts;
   const { commits, changedFiles } = gitBatchDiff(repo, base, head);
   const srcFiles = changedFiles.filter(
-    (p) => /\.(ts|mts)$/.test(p) && (p.startsWith("packages/bus/src/") || p.startsWith("scripts/")),
+    (p) => SRC_FILE_RE.test(p) && (p.startsWith("packages/bus/src/") || p.startsWith("scripts/")),
   );
   const infos = srcFiles
-    .map((p) => ({ p, content: readSafe(repo, p) }))
-    .filter((x) => x.content !== "")
+    .map((p) => ({ p, content: gitShow(repo, head, p) }))
+    .filter((x): x is { p: string; content: string } => x.content !== null)
     .map((x) => fileInfo(x.p, x.content));
   const edges = buildImportEdges(infos);
   const flags = flagBoundaries(infos, edges);
   const contractPaths = opts.contractPaths ?? DEFAULT_CONTRACT_SURFACE;
-  const manifest = contractSurfaceManifest(
-    contractPaths.map((p) => ({ path: p, sha256: sha256(readSafe(repo, p)) })),
-  );
+  const contractEntries = contractPaths.map((p) => {
+    const content = gitShow(repo, head, p);
+    return { path: p, sha256: content === null ? null : sha256(content) };
+  });
+  const manifest = contractSurfaceManifest(contractEntries);
+  const unavailableContracts = manifest.filter((r) => r.sha256 === null).map((r) => r.path);
   const doneFlags = checkDoneEvidence(opts.doneClaims ?? []);
   const sheet = renderReviewSheet({
     branch: opts.branch,
@@ -357,5 +401,5 @@ export function collectArchReviewPack(opts: {
     flags,
     doneFlags,
   });
-  return { sheet, infos, edges, flags, manifest, doneFlags, commits, changedFiles };
+  return { sheet, infos, edges, flags, manifest, doneFlags, commits, changedFiles, unavailableContracts };
 }

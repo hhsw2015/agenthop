@@ -1,8 +1,9 @@
-// Selftest for the pure arch-review core. IO wrappers (git/fs/crypto) are exercised by live runs.
+// Selftest for the pure arch-review core. IO (git/crypto) is locked by arch-review.integration.selftest.mts.
 //   npx tsx packages/bus/src/swarm/arch-review.selftest.mts
 import {
-  ARCH_AXES, buildImportEdges, checkDoneEvidence, contractCategory, contractSurfaceManifest, extractImports,
-  fileInfo, findCycles, flagBoundaries, isIoTainted, renderReviewSheet, resolveSpecifier, stripComments, zoneOf,
+  ARCH_AXES, buildImportEdges, candidatePaths, checkDoneEvidence, contractCategory, contractSurfaceManifest,
+  extractImports, fileInfo, findCycles, flagBoundaries, ioRootOf, isIoTainted, normalizeSpecifier,
+  renderReviewSheet, resolveInSet, zoneOf,
 } from "./arch-review.js";
 
 const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED: " + name); console.log("ok  " + name); };
@@ -17,34 +18,51 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   t("other -> other", zoneOf("package.json") === "other");
 }
 
-// --- comment stripping + import extraction (the edge the import map is built from) ---
+// --- AR3: lexically-correct import extraction (TypeScript preprocessor, not a regex) ---
 {
-  t("static import extracted", extractImports(`import { a } from "./x.js";`)[0] === "./x.js");
+  t("named import extracted", extractImports(`import { a } from "./x.js";`)[0] === "./x.js");
   t("export-from extracted", extractImports(`export { a } from "../y.js";`)[0] === "../y.js");
   t("bare import extracted", extractImports(`import "./side.js";`)[0] === "./side.js");
+  t("bare import WITHOUT semicolon extracted (AR3)", extractImports(`import "./side.js"\nconst a=1`)[0] === "./side.js");
   t("require extracted", extractImports(`const x = require("node:fs");`)[0] === "node:fs");
-  t("dynamic import extracted", extractImports(`await import("./lazy.js");`)[0] === "./lazy.js");
-  t("multi-line import specifier captured", extractImports(`import {\n a,\n b\n} from "./multi.js";`)[0] === "./multi.js");
-  t("commented-out import ignored", extractImports(`// import x from "./ghost.js";\nimport y from "./real.js";`).join(",") === "./real.js");
-  t("block-commented import ignored", extractImports(`/* import x from "./ghost.js"; */ import y from "./real.js";`).join(",") === "./real.js");
-  t("URL in a line comment is not eaten as code", stripComments(`const u = "http://x"; // note http://y`).includes("http://x"));
+  t("dynamic import WITH options extracted (AR3)", extractImports(`await import("./lazy.js", { with: { type: "json" } });`)[0] === "./lazy.js");
+  t("multiline named import captured", extractImports(`import {\n a,\n b\n} from "./multi.js";`)[0] === "./multi.js");
+  t("commented-out import ignored (AR3)", extractImports(`// import x from "./ghost.js";\nimport y from "./real.js";`).join(",") === "./real.js");
+  t("block-commented import ignored (AR3)", extractImports(`/* import x from "./ghost.js"; */ import y from "./real.js";`).join(",") === "./real.js");
+  t("import TEXT inside a string literal is NOT a dep (AR3)", extractImports('const s = "import x from \\"./ghost.js\\"";').length === 0);
+  t("preimport() is NOT matched as an import (AR3)", extractImports(`preimport();\nimport z from "./z.js";`).join(",") === "./z.js");
 }
 
-// --- IO taint (direct node-builtin import) ---
+// --- AR4: IO taint matched on the builtin ROOT (submodules + /promises covered) ---
 {
+  t("ioRootOf strips node: and submodule", ioRootOf("node:dns/promises") === "dns");
+  t("ioRootOf of a relative path is '.'", ioRootOf("./x.js") === ".");
   t("imports node:fs -> tainted", isIoTainted(`import { readFileSync } from "node:fs";`) === true);
   t("imports child_process -> tainted", isIoTainted(`import { execFileSync } from "child_process";`) === true);
-  t("pure module -> not tainted", isIoTainted(`import { foo } from "./pure.js";`) === false);
-  t("node:path alone is not IO-taint (not a side-effecting builtin)", isIoTainted(`import path from "node:path";`) === false);
+  t("node:dns/promises -> tainted (AR4)", isIoTainted(`import dns from "node:dns/promises";`) === true);
+  t("node:readline/promises -> tainted (AR4)", isIoTainted(`import { createInterface } from "node:readline/promises";`) === true);
+  t("node:http2 -> tainted (AR4)", isIoTainted(`import http2 from "node:http2";`) === true);
+  t("fs/promises -> tainted", isIoTainted(`import { readFile } from "fs/promises";`) === true);
+  t("node:path alone is not IO-taint", isIoTainted(`import path from "node:path";`) === false);
+  t("pure relative import -> not tainted", isIoTainted(`import { foo } from "./pure.js";`) === false);
 }
 
-// --- specifier resolution (ESM .js specifier -> .ts source; bare -> null) ---
+// --- AR5: resolve against the REAL batch files (compiled-suffix swaps added, never forced) ---
 {
-  t("sibling .js -> .ts", resolveSpecifier("packages/bus/src/swarm/a.ts", "./b.js") === "packages/bus/src/swarm/b.ts");
-  t("parent dir resolves", resolveSpecifier("packages/bus/src/swarm/a.ts", "../inbox.js") === "packages/bus/src/inbox.ts");
-  t(".mjs -> .mts", resolveSpecifier("scripts/a.ts", "./b.mjs") === "scripts/b.mts");
-  t("bare specifier -> null (external, not an internal edge)", resolveSpecifier("scripts/a.ts", "node:fs") === null);
-  t("package specifier -> null", resolveSpecifier("scripts/a.ts", "@opencode-ai/plugin") === null);
+  const set = new Set([
+    "packages/bus/src/swarm/b.ts",
+    "packages/bus/src/inbox.ts",
+    "scripts/hook.mjs",
+  ]);
+  t("normalize parent specifier", normalizeSpecifier("packages/bus/src/swarm/a.ts", "../inbox.js") === "packages/bus/src/inbox.js");
+  t("normalize bare -> null", normalizeSpecifier("x/a.ts", "node:fs") === null);
+  t("candidatePaths adds .js->.ts and an index candidate", candidatePaths("a/b.js").includes("a/b.ts") && candidatePaths("a/b.js").includes("a/b/index.ts"));
+  t("candidatePaths keeps the literal first", candidatePaths("a/b.mjs")[0] === "a/b.mjs");
+  t("sibling .js resolves to the .ts in the set", resolveInSet("packages/bus/src/swarm/a.ts", "./b.js", set) === "packages/bus/src/swarm/b.ts");
+  t("parent .js resolves", resolveInSet("packages/bus/src/swarm/a.ts", "../inbox.js", set) === "packages/bus/src/inbox.ts");
+  t("a real .mjs resolves to itself, NOT forced to .mts (AR5)", resolveInSet("scripts/a.ts", "./hook.mjs", set) === "scripts/hook.mjs");
+  t("bare specifier -> null", resolveInSet("scripts/a.ts", "node:fs", set) === null);
+  t("target outside the set -> null (never fabricated)", resolveInSet("packages/bus/src/swarm/a.ts", "./missing.js", set) === null);
 }
 
 // --- import edges: only kept when both ends are in the set ---
@@ -64,21 +82,27 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
     fileInfo("packages/bus/src/swarm/pure.ts", `import { w } from "./io.js";`),
     fileInfo("packages/bus/src/swarm/io.ts", `import { readFileSync } from "node:fs"; export const w = 1;`),
   ];
-  const flags = flagBoundaries(pureImportsIo, buildImportEdges(pureImportsIo));
-  t("pure module importing an IO module is flagged", flags.some((f) => f.kind === "pure-imports-io"));
+  t("pure module importing an IO module is flagged", flagBoundaries(pureImportsIo, buildImportEdges(pureImportsIo)).some((f) => f.kind === "pure-imports-io"));
 
-  const busImportsScript = [
-    fileInfo("packages/bus/src/swarm/c.ts", `import { s } from "../../../../scripts/tool.js";`),
-    fileInfo("scripts/tool.ts", `export const s = 1;`),
+  // AR5: a bus module importing a real .mjs SCRIPT is collected, resolved, and flagged
+  const busImportsMjsScript = [
+    fileInfo("packages/bus/src/swarm/c.ts", `import "../../../../scripts/hook.mjs";`),
+    fileInfo("scripts/hook.mjs", `export const s = 1;`),
   ];
-  const f2 = flagBoundaries(busImportsScript, buildImportEdges(busImportsScript));
-  t("bus importing a script (wrong direction) is flagged", f2.some((f) => f.kind === "bus-imports-script"));
+  t("bus importing a .mjs script (wrong direction) is flagged (AR5)", flagBoundaries(busImportsMjsScript, buildImportEdges(busImportsMjsScript)).some((f) => f.kind === "bus-imports-script"));
 
   const clean = [
     fileInfo("packages/bus/src/swarm/p1.ts", `import { p2 } from "./p2.js";`),
     fileInfo("packages/bus/src/swarm/p2.ts", `export const p2 = 1;`),
   ];
   t("a clean pure->pure edge raises no flag", flagBoundaries(clean, buildImportEdges(clean)).length === 0);
+
+  // allowed directions must NOT flag
+  const allowed = [
+    fileInfo("scripts/driver.ts", `import { c } from "../packages/bus/src/swarm/core.js";`),
+    fileInfo("packages/bus/src/swarm/core.ts", `export const c = 1;`),
+  ];
+  t("script->bus raises no flag (allowed)", !flagBoundaries(allowed, buildImportEdges(allowed)).some((f) => f.kind === "bus-imports-script"));
 }
 
 // --- cycle detection ---
@@ -113,14 +137,15 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   t("valid long SHA ok", flags[4]!.ok === true);
 }
 
-// --- contract surface manifest ---
+// --- contract surface manifest (AR2: null = unavailable, distinct from an empty-file hash) ---
 {
   t("CLAUDE.md -> invariant-doc", contractCategory("CLAUDE.md") === "invariant-doc");
   t("memory path -> invariant-doc", contractCategory("docs/memory/x.md") === "invariant-doc");
   t("spec md -> spec-doc", contractCategory("docs/swarm/projection-schema.md") === "spec-doc");
   t("ts -> shared-type", contractCategory("packages/bus/src/inbox.ts") === "shared-type");
-  const m = contractSurfaceManifest([{ path: "CLAUDE.md", sha256: "abc" }, { path: "packages/bus/src/inbox.ts", sha256: "def" }]);
-  t("manifest categorizes + passes the hash through", m[0]!.category === "invariant-doc" && m[1]!.sha256 === "def");
+  const m = contractSurfaceManifest([{ path: "CLAUDE.md", sha256: "abc" }, { path: "docs/gone.md", sha256: null }]);
+  t("present file keeps its hash", m[0]!.category === "invariant-doc" && m[0]!.sha256 === "abc");
+  t("unavailable file keeps null (not an empty hash)", m[1]!.sha256 === null && m[1]!.category === "spec-doc");
 }
 
 // --- review sheet rendering (deterministic; all axes + sections present) ---
@@ -128,7 +153,10 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   const sheet = renderReviewSheet({
     branch: "feat/x", base: "c3439cd", head: "deadbee", reviewer: "codex 01a0ead5", author: "bus-pen d7f6c917",
     commits: ["deadbee feat: a"], changedFiles: ["packages/bus/src/swarm/a.ts"],
-    manifest: [{ path: "CLAUDE.md", sha256: "abcdef0123456789aa", category: "invariant-doc" }],
+    manifest: [
+      { path: "CLAUDE.md", sha256: "abcdef0123456789aa", category: "invariant-doc" },
+      { path: "docs/gone.md", sha256: null, category: "spec-doc" },
+    ],
     edges: [{ from: "packages/bus/src/swarm/a.ts", to: "packages/bus/src/swarm/b.ts", fromZone: "bus", toZone: "bus" }],
     flags: [{ kind: "pure-imports-io", detail: "a imports b" }],
     doneFlags: [{ node: "n1", ok: false, reason: "done claim carries no SHA" }],
@@ -138,14 +166,19 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   t("C11 axis present", sheet.includes("32-eval C11"));
   t("REMAIN blocking section present", sheet.includes("## REMAIN (open, blocking)"));
   t("a failing done flag is shown in bold NO", sheet.includes("**NO**"));
-  t("deterministic (same input -> same output)", sheet === renderReviewSheet({
+  t("an unavailable contract renders (unavailable), not a hash (AR2)", sheet.includes("**(unavailable)**"));
+  const again = renderReviewSheet({
     branch: "feat/x", base: "c3439cd", head: "deadbee", reviewer: "codex 01a0ead5", author: "bus-pen d7f6c917",
     commits: ["deadbee feat: a"], changedFiles: ["packages/bus/src/swarm/a.ts"],
-    manifest: [{ path: "CLAUDE.md", sha256: "abcdef0123456789aa", category: "invariant-doc" }],
+    manifest: [
+      { path: "CLAUDE.md", sha256: "abcdef0123456789aa", category: "invariant-doc" },
+      { path: "docs/gone.md", sha256: null, category: "spec-doc" },
+    ],
     edges: [{ from: "packages/bus/src/swarm/a.ts", to: "packages/bus/src/swarm/b.ts", fromZone: "bus", toZone: "bus" }],
     flags: [{ kind: "pure-imports-io", detail: "a imports b" }],
     doneFlags: [{ node: "n1", ok: false, reason: "done claim carries no SHA" }],
-  }));
+  });
+  t("deterministic (same input -> same output)", sheet === again);
 }
 
 console.log("all arch-review selftests passed");
