@@ -52,10 +52,11 @@ Code: `packages/bus/src/swarm/grill-gate.ts` (pure, no IO, no clock). Review pac
 ## Seam / DORMANT-AHEAD-OF-USE
 
 `grillGateEnabled(env)` = `/^(1|true|yes|on)$/i.test(SWARM_GRILL_GATE)`, default **OFF** — same discipline as
-`SWARM_BOARD_ADMIT` / review-seat-autoscale / seat-identity-caps. The live T3 orchestrator that would call
-`grillGateEnabled()` → interactive `nextQuestion` loop → `resolveDecisions` → `foldDecisionsIntoPrd(prd, …)` → `draftPlan`
-does not exist yet (`draftPlan` has no in-repo caller; the orchestrator is the still-dormant live-fire A1). The exported gate
-+ fold ARE the seam, ready to attach when the flag is flipped. Nothing here is wired into a running path.
+`SWARM_BOARD_ADMIT` / review-seat-autoscale / seat-identity-caps. grill-gate has **no runtime caller**: the live T3
+orchestrator that would call `grillGateEnabled()` → interactive `nextQuestion` loop → `resolveDecisions` →
+`foldDecisionsIntoPrd(prd, …)` → `draftPlan` is not wired. (The manual A1 live-fire script `packages/bus/scripts/t3-draft-live.ts`
+calls `draftPlan` DIRECTLY, not through this gate.) The exported gate + fold ARE the seam, ready to attach when the flag is
+flipped. Nothing here is wired into a running path.
 
 ## NON-GOALS (not this slice)
 

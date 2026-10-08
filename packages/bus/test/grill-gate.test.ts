@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   loadGrillTree, nextQuestion, isGrillComplete, resolveDecisions, grillGateEnabled, foldDecisionsIntoPrd,
-  type GrillQuestion, type GrillTree,
+  type GrillQuestion, type GrillTree, type GrillAnswers,
 } from "../src/swarm/grill-gate.js";
 
 // A 4-node design tree: q1 forks placement; q2 (vm branch) picks a backend; q3 (local branch) is free-form; q4 is a
@@ -117,6 +117,59 @@ describe("grill-gate — ③ resolveDecisions (R3-b: user answers + defaults, de
     expect(resolveDecisions(t, { ghost: "x" }).ok).toBe(false);
     expect(resolveDecisions(t, { q1: "cloud" }).ok).toBe(false);                 // q1 domain is vm|local
     expect(resolveDecisions(t, { q1: "local", q2: "bogus" }).ok).toBe(false);    // q2 bogus invalid though q2 is dead here
+  });
+});
+
+describe("grill-gate — GG-P2-1 answers are OWN-key only (no prototype / accessor masquerade)", () => {
+  const t = load({ questions: [
+    { id: "constructor", prompt: "c?", choices: [{ value: "a" }, { value: "b" }], recommended: "a" },
+    { id: "kid", prompt: "k?", parent: "constructor", whenAnswers: ["a"], recommended: "x" },
+  ] });
+  test("an id colliding with an inherited property is UNANSWERED on an empty map (asked, defaulted, child kept live)", () => {
+    expect(nextQuestion(t, {})!.id).toBe("constructor"); // not skipped by Object.prototype.constructor
+    const d = (resolveDecisions(t, {}) as { ok: true; resolved: { decisions: any[] } }).resolved.decisions;
+    expect(d.map((x) => [x.id, x.answer, x.source])).toEqual([["constructor", "a", "default"], ["kid", "x", "default"]]); // default "a" unlocks kid
+  });
+  test("toString / __proto__ / hasOwnProperty / valueOf collisions are likewise unanswered on an empty map", () => {
+    for (const id of ["toString", "__proto__", "hasOwnProperty", "valueOf"]) {
+      const tt = load({ questions: [{ id, prompt: "p", recommended: "def" }] });
+      expect(nextQuestion(tt, {})!.id).toBe(id);
+      expect((resolveDecisions(tt, {}) as { ok: true; resolved: { decisions: any[] } }).resolved.decisions).toEqual([{ id, prompt: "p", answer: "def", source: "default" }]);
+    }
+  });
+  test("an EXPLICIT own answer is honored — incl. a JSON own __proto__ key read as data, not the prototype", () => {
+    const tp = load({ questions: [{ id: "__proto__", prompt: "p", choices: [{ value: "a" }, { value: "b" }], recommended: "a" }] });
+    const ans = JSON.parse('{"__proto__":"b"}'); // JSON.parse makes an OWN data property "__proto__"="b" (no pollution)
+    const d = (resolveDecisions(tp, ans) as { ok: true; resolved: { decisions: any[] } }).resolved.decisions;
+    expect(d).toEqual([{ id: "__proto__", prompt: "p", answer: "b", source: "user" }]);
+  });
+  test("an explicit own constructor answer that does NOT unlock the child prunes it (own value wins)", () => {
+    const d = (resolveDecisions(t, JSON.parse('{"constructor":"b"}')) as { ok: true; resolved: { decisions: any[] } }).resolved.decisions;
+    expect(d.map((x) => [x.id, x.source])).toEqual([["constructor", "user"]]); // "b" ≠ "a" ⇒ kid pruned, not defaulted
+  });
+  test("a prototype-less answers map (Object.create(null)) works", () => {
+    const a = Object.create(null) as GrillAnswers; a["constructor"] = "a";
+    const d = (resolveDecisions(t, a) as { ok: true; resolved: { decisions: any[] } }).resolved.decisions;
+    expect(d.map((x) => [x.id, x.source])).toEqual([["constructor", "user"], ["kid", "default"]]);
+  });
+});
+
+describe("grill-gate — GG-P2-2 arbitrarily deep legal trees resolve (no recursion overflow, no depth cap)", () => {
+  const N = 20000;
+  const deep = { questions: [{ id: "n0", prompt: "p0", choices: [{ value: "yes" }, { value: "no" }], recommended: "yes" } as GrillQuestion] };
+  for (let i = 1; i < N; i++) deep.questions.push({ id: `n${i}`, prompt: `p${i}`, parent: `n${i - 1}`, whenAnswers: ["yes"], choices: [{ value: "yes" }, { value: "no" }], recommended: "yes" });
+  test("loads, resolves all-defaults through the whole chain, and a fully-answered nextQuestion completes — no throw", () => {
+    const r = loadGrillTree(deep);
+    expect(r.ok).toBe(true);
+    const t = (r as { ok: true; tree: GrillTree }).tree;
+    const res = resolveDecisions(t, {});
+    expect(res.ok).toBe(true);
+    const d = (res as { ok: true; resolved: { decisions: any[] } }).resolved.decisions;
+    expect(d.length).toBe(N); // every level live: each recommended "yes" unlocks the next
+    expect(d[N - 1]).toMatchObject({ id: `n${N - 1}`, answer: "yes", source: "default" });
+    const answers: GrillAnswers = {};
+    for (let i = 0; i < N; i++) answers[`n${i}`] = "yes";
+    expect(nextQuestion(t, answers)).toBeNull();
   });
 });
 

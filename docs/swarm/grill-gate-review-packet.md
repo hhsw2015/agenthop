@@ -26,8 +26,15 @@ Files: `packages/bus/src/swarm/grill-gate.ts` · `packages/bus/test/grill-gate.t
 5. **Dormant gate** — `grillGateEnabled` default OFF; only `1|true|yes|on` (case-insensitive) ⇒ ON. No live path reads it.
 6. **Determinism** — `resolveDecisions` output order = tree order; `foldDecisionsIntoPrd` is deterministic and leaves the PRD
    untouched on empty decisions.
+7. **(round-1 GG-P2-1) OWN-key answers only** — every answer read goes through `Object.getOwnPropertyDescriptor` and takes the
+   value only when it is an own STRING data property; the prototype chain and accessors are never consulted. A question id of
+   `constructor`/`__proto__`/`toString`/`hasOwnProperty` is unanswered on an empty map (asked, defaulted, children kept live);
+   an explicit own answer (incl. a JSON own `__proto__`) is honored; `Object.create(null)` answers work.
+8. **(round-1 GG-P2-2) arbitrary depth resolves** — liveness/ordering/resolution are iterative, O(n), no recursion and NO
+   depth cap: a 20k-deep legal chain loads, resolves all-defaults through every level, and a fully-answered `nextQuestion`
+   returns null — no RangeError.
 
 ## Verification already run
 
-bus tsc 0 · `grill-gate.test.ts` 17/17 · full bus 83 files / 1085 tests pass (base 5da42b5 + 17). Not pushed, not merged
-(merge/wiring gate = coordinator + user).
+bus tsc 0 · `grill-gate.test.ts` 23/23 · reviewer probe `grill-boundaries.test.ts` 8/8 (round-1 was 5/8) · full bus 83 files /
+1091 tests pass (base 5da42b5 + 23). Not pushed, not merged (merge/wiring gate = coordinator + user).
