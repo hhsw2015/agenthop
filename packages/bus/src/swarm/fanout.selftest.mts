@@ -2,7 +2,7 @@
 //   npx tsx packages/bus/src/swarm/fanout.selftest.mts
 // Each pre-study pit (docs/swarm/fanout-prestudy.md §2) is a NAMED counterexample below.
 import {
-  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classToTier, effectiveTier, newLedgerRow,
+  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classToTier, effectiveTier, isSafeRunKey, newLedgerRow,
   nextReceipt, progress, reconcileOrphans, reduceUnits, validateFanoutRequest, widthClass, widthGate, zoneName,
   type FanoutUnit, type LedgerRow, type UnitResult,
 } from "./fanout.js";
@@ -23,6 +23,9 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("missing reduce rejected", validateFanoutRequest({ ...okReq(), reduce: 1 }).ok === false);
   t("negative budget rejected", validateFanoutRequest({ ...okReq(), budget: { maxTokens: -1 } }).ok === false);
   t("DUPLICATE unit key rejected (pit 2.2)", validateFanoutRequest({ ...okReq(), units: [unit("dup"), unit("dup")] }).ok === false);
+  t("runKey path-traversal rejected (FN5)", validateFanoutRequest({ ...okReq(), runKey: "../outside" }).ok === false);
+  t("isSafeRunKey: plain slug ok", isSafeRunKey("r1") && isSafeRunKey("a.b-c_d"));
+  t("isSafeRunKey: traversal/separator/empty/leading-dot rejected (FN5)", !isSafeRunKey("../x") && !isSafeRunKey("a/b") && !isSafeRunKey("..") && !isSafeRunKey("") && !isSafeRunKey(".hidden"));
   t("bad taskClass rejected", validateFanoutRequest({ ...okReq(), units: [unit("u", "nope" as unknown as FanoutUnit["taskClass"])] }).ok === false);
   t("unit missing prompt rejected", validateFanoutRequest({ runKey: "r", units: [{ key: "u", taskClass: "scan" }], mode: "fresh", reduce: "c", budget: {} }).ok === false);
 }

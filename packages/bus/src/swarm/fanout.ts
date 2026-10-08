@@ -43,6 +43,12 @@ const TIERS = new Set<string>(["cheap", "mid", "top"]);
 const isStr = (v: unknown): v is string => typeof v === "string" && v.length > 0;
 const isNonNeg = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
 
+// A runKey becomes a filename segment (the ledger path), so it MUST be a safe slug — no separators, no
+// traversal (round-1 FN5). Enforced at validation so a crafted runKey can never escape the fanout dir.
+export function isSafeRunKey(s: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(s) && !s.includes("..");
+}
+
 export type ValidationResult = { ok: true; req: FanoutRequest } | { ok: false; reason: string };
 
 // Validate an untrusted `fanout` request. Keys are content-addressed and MUST be unique (a duplicate key is a
@@ -51,6 +57,7 @@ export function validateFanoutRequest(raw: unknown): ValidationResult {
   if (typeof raw !== "object" || raw === null) return { ok: false, reason: "request is not an object" };
   const r = raw as Record<string, unknown>;
   if (!isStr(r.runKey)) return { ok: false, reason: "runKey missing or empty" };
+  if (!isSafeRunKey(r.runKey)) return { ok: false, reason: "runKey must be a safe slug (alphanumeric . _ - ; no separators or traversal)" };
   if (!Array.isArray(r.units) || r.units.length === 0) return { ok: false, reason: "units must be a non-empty array" };
   if (r.mode !== "fresh" && r.mode !== "keep_alive") return { ok: false, reason: "mode must be fresh|keep_alive" };
   if (!isStr(r.reduce)) return { ok: false, reason: "reduce rule missing" };
