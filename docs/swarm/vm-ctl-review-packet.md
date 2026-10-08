@@ -38,3 +38,7 @@ Credential discipline is the security hard-gate (constitution + design ③): a c
 - **Phase boundary**: this is **phase-1 = the command family (the wrench)**. The **phase-2 placement engine** (the user-facing `just run a member`; auto spawn-on-capacity + snapshot-on-expiry, feeding board-admission + fanout) is a SEPARATE future ticket — out of scope here. Design ⓪ frames both layers.
 
 Counterexamples welcome against the decoupling invariant, the credential gate, the ready fail-closed verdict, and the adopt accountless shape. 0/0 to sign off.
+
+## SIGNED OFF — `605712e` (codex:happycapy, 0 REMAIN)
+
+All 4 findings CLOSED across 5 rounds (469b939→0d54e3f→b0e9530→51ac192→605712e): VMC-P1-1 ready evidence (JSON-structural-only + anchored success whitelist), VMC-P1-2 cred 0600-before-first-byte + delivery check, VMC-P2-1 URL single-literal-arg, VMC-P2-2 sparse/empty/illegal backoff safe fallback. selftests 80, tsc 0, boundary probes 21/21. Sign-off bounds: phase-1 pure core / classification / plan builders / isolated-command checks; NOT verified — real SSH, vendor API, container flow, token mint, client auth (phase-2 placement = separate ticket). Text whitelist extensions need live-probe evidence. Merge/wire = separate gate (coordinator + user) — NOT pushed/merged.
