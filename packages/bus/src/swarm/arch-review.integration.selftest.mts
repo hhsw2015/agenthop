@@ -57,6 +57,17 @@ try {
   });
   t("AR2: a real empty file hashes normally (not unavailable)", pack2.manifest[0]!.sha256 === sha256(""));
 
+  // AR2 round-2: a DIRECTORY (git tree object) at the contract path is unavailable, not a hashed tree listing
+  mkdirSync(join(repo, "docs/adir"), { recursive: true });
+  writeFileSync(join(repo, "docs/adir/inner.md"), "inner\n");
+  g(repo, ["add", "-A"]); g(repo, ["commit", "-qm", "add dir"]);
+  const head3 = g(repo, ["rev-parse", "HEAD"]).trim();
+  const pack3 = collectArchReviewPack({
+    repo, base: head2, head: head3, branch: "b", reviewer: "r", author: "a",
+    contractPaths: ["docs/adir"],
+  });
+  t("AR2: a directory object is unavailable, NOT a hashed tree listing (round-2)", pack3.manifest[0]!.sha256 === null && pack3.unavailableContracts.includes("docs/adir"));
+
   console.log("all arch-review integration selftests passed");
 } finally {
   rmSync(repo, { recursive: true, force: true });

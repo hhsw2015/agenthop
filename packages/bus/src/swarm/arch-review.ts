@@ -47,12 +47,31 @@ export function ioRootOf(spec: string): string {
   return spec.replace(/^node:/, "").split("/")[0] ?? "";
 }
 
-// Lexically-correct import extraction via the TypeScript preprocessor: it ignores strings, comments, regex and
-// template literals, and captures static import/export-from, bare imports, require(), and a resolvable literal
-// dynamic import("..."). A non-literal dynamic import (template/variable) has no knowable target and is omitted
-// (AR3). This is a real scanner, not a regex over raw text.
+// Import extraction via a real TypeScript PARSE + AST walk (round-2 AR3: the preprocessor still mis-read a
+// regex literal like `/import "x"/` as an import). The parser distinguishes code from string/regex/template/
+// comment, so it captures ONLY genuine module edges: static import, export-from, `import x = require()`,
+// require(), and a literal dynamic import("..."). A non-literal dynamic import (template/variable) has no
+// knowable target and is omitted.
 export function extractImports(content: string): string[] {
-  return ts.preProcessFile(content, /*readImportFiles*/ true, /*detectJavaScriptImports*/ true).importedFiles.map((f) => f.fileName);
+  const sf = ts.createSourceFile("f.ts", content, ts.ScriptTarget.Latest, /*setParentNodes*/ false, ts.ScriptKind.TS);
+  const out: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      out.push(node.moduleSpecifier.text);
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+      out.push(node.moduleSpecifier.text);
+    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference) && ts.isStringLiteral(node.moduleReference.expression)) {
+      out.push(node.moduleReference.expression.text);
+    } else if (ts.isCallExpression(node)) {
+      const isRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
+      const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
+      const arg0 = node.arguments[0];
+      if ((isRequire || isDynamicImport) && arg0 && ts.isStringLiteral(arg0)) out.push(arg0.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return out;
 }
 
 export function isIoTainted(content: string): boolean {
@@ -60,30 +79,47 @@ export function isIoTainted(content: string): boolean {
 }
 
 // Normalize a RELATIVE specifier to a repo-relative path, keeping its own extension. Bare/external -> null.
+// A `..` that would climb ABOVE the repo root returns null — an out-of-repo path must not fold back inside (AR5).
 export function normalizeSpecifier(fromPath: string, spec: string): string | null {
   if (!spec.startsWith(".")) return null;
   const stack = fromPath.split("/").slice(0, -1);
   for (const part of spec.split("/")) {
     if (part === "" || part === ".") continue;
-    if (part === "..") stack.pop();
-    else stack.push(part);
+    if (part === "..") {
+      if (stack.length === 0) return null;
+      stack.pop();
+    } else stack.push(part);
   }
   return stack.join("/");
 }
 
-// Candidate SOURCE paths for a normalized import path: the literal path, compiled->source extension swaps
-// (.js->.ts/.tsx, .mjs->.mts, .cjs->.cts), and bare/extensionless + index resolution. The swaps are ADDED,
-// never forced — a real `.mjs` in the batch resolves to itself (AR5). Most specific first.
-const SRC_EXTS = [".ts", ".mts", ".cts", ".tsx", ".js", ".mjs", ".cjs"];
+// Candidate SOURCE paths for a normalized import path.
+// - An EXPLICIT extension maps ONLY to compatible sources (.js->.ts/.tsx, .mjs->.mts, .cjs->.cts, .tsx->.tsx,
+//   a source ext to itself) — never to an incompatible ext, and never an index candidate (AR5: an out-of-batch
+//   `dep.mjs` must not mis-match an in-batch `dep.ts` or `dep/index.mts`).
+// - An EXTENSIONLESS specifier tries the source exts and `/index.*`.
+const EXT_MAP: Record<string, string[]> = {
+  ".js": [".js", ".ts", ".tsx"],
+  ".jsx": [".jsx", ".tsx"],
+  ".mjs": [".mjs", ".mts"],
+  ".cjs": [".cjs", ".cts"],
+  ".ts": [".ts"],
+  ".tsx": [".tsx"],
+  ".mts": [".mts"],
+  ".cts": [".cts"],
+};
+const EXTLESS_EXTS = [".ts", ".mts", ".cts", ".tsx", ".js", ".mjs", ".cjs"];
 export function candidatePaths(normalized: string): string[] {
-  const out: string[] = [normalized];
-  if (/\.js$/.test(normalized)) out.push(normalized.replace(/\.js$/, ".ts"), normalized.replace(/\.js$/, ".tsx"));
-  if (/\.mjs$/.test(normalized)) out.push(normalized.replace(/\.mjs$/, ".mts"));
-  if (/\.cjs$/.test(normalized)) out.push(normalized.replace(/\.cjs$/, ".cts"));
-  const noext = normalized.replace(/\.[cm]?[jt]sx?$/, "");
-  for (const e of SRC_EXTS) {
-    out.push(noext + e);
-    out.push(`${noext}/index${e}`);
+  const m = normalized.match(/\.[cm]?[jt]sx?$/);
+  if (m) {
+    const ext = m[0];
+    const stem = normalized.slice(0, normalized.length - ext.length);
+    return [...new Set((EXT_MAP[ext] ?? [ext]).map((e) => stem + e))];
+  }
+  const out: string[] = [];
+  for (const e of EXTLESS_EXTS) {
+    out.push(normalized + e);
+    out.push(`${normalized}/index${e}`);
   }
   return [...new Set(out)];
 }
@@ -315,8 +351,15 @@ function git(repo: string, args: string[]): string {
 // Reading the OBJECT, never the working tree, is what makes the pack a function of the SHA (AR1).
 export function gitShow(repo: string, rev: string, rel: string): string | null {
   try {
-    // stderr ignored: an absent path at rev is the expected "unavailable" signal (caught below), not noise.
-    return execFileSync("git", ["-C", repo, "show", `${rev}:${rel}`], {
+    // AR2: confirm the object is a BLOB (file content). A tree (directory) or any non-blob is UNAVAILABLE, not
+    // content — `cat-file -p`/`show` on a tree prints a listing that must never be hashed as a file. stderr is
+    // ignored: an absent path is the expected "unavailable" signal (caught below), not noise.
+    const type = execFileSync("git", ["-C", repo, "cat-file", "-t", `${rev}:${rel}`], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (type !== "blob") return null;
+    return execFileSync("git", ["-C", repo, "cat-file", "-p", `${rev}:${rel}`], {
       encoding: "utf8",
       maxBuffer: 256 * 1024 * 1024,
       stdio: ["ignore", "pipe", "ignore"],

@@ -31,6 +31,10 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   t("block-commented import ignored (AR3)", extractImports(`/* import x from "./ghost.js"; */ import y from "./real.js";`).join(",") === "./real.js");
   t("import TEXT inside a string literal is NOT a dep (AR3)", extractImports('const s = "import x from \\"./ghost.js\\"";').length === 0);
   t("preimport() is NOT matched as an import (AR3)", extractImports(`preimport();\nimport z from "./z.js";`).join(",") === "./z.js");
+  t("a REGEX literal is NOT an import (AR3 round-2)", extractImports(`const re = /import "node:fs"/;`).length === 0);
+  t("divide then regex does not fabricate an import (AR3 round-2)", extractImports(`const a = b / c; const d = /x/;`).length === 0);
+  t("import x = require(...) captured", extractImports(`import x = require("./eq.js");`)[0] === "./eq.js");
+  t("template dynamic import (unresolvable) omitted", extractImports("await import(`./${v}.js`);").length === 0);
 }
 
 // --- AR4: IO taint matched on the builtin ROOT (submodules + /promises covered) ---
@@ -56,13 +60,19 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   ]);
   t("normalize parent specifier", normalizeSpecifier("packages/bus/src/swarm/a.ts", "../inbox.js") === "packages/bus/src/inbox.js");
   t("normalize bare -> null", normalizeSpecifier("x/a.ts", "node:fs") === null);
-  t("candidatePaths adds .js->.ts and an index candidate", candidatePaths("a/b.js").includes("a/b.ts") && candidatePaths("a/b.js").includes("a/b/index.ts"));
-  t("candidatePaths keeps the literal first", candidatePaths("a/b.mjs")[0] === "a/b.mjs");
+  t("explicit .js maps to compatible sources (.js/.ts/.tsx), NO index (AR5)", (() => { const c = candidatePaths("a/b.js"); return c.includes("a/b.ts") && c.includes("a/b.js") && c.includes("a/b.tsx") && !c.some((x) => x.includes("index")); })());
+  t("explicit .mjs maps ONLY to .mjs/.mts (AR5 round-2)", JSON.stringify(candidatePaths("a/b.mjs")) === JSON.stringify(["a/b.mjs", "a/b.mts"]));
+  t("extensionless path gets source exts + an index candidate", candidatePaths("a/b").includes("a/b.ts") && candidatePaths("a/b").includes("a/b/index.ts"));
   t("sibling .js resolves to the .ts in the set", resolveInSet("packages/bus/src/swarm/a.ts", "./b.js", set) === "packages/bus/src/swarm/b.ts");
   t("parent .js resolves", resolveInSet("packages/bus/src/swarm/a.ts", "../inbox.js", set) === "packages/bus/src/inbox.ts");
   t("a real .mjs resolves to itself, NOT forced to .mts (AR5)", resolveInSet("scripts/a.ts", "./hook.mjs", set) === "scripts/hook.mjs");
   t("bare specifier -> null", resolveInSet("scripts/a.ts", "node:fs", set) === null);
   t("target outside the set -> null (never fabricated)", resolveInSet("packages/bus/src/swarm/a.ts", "./missing.js", set) === null);
+  // AR5 round-2: an out-of-batch .mjs must NOT mis-match an in-batch .ts or dep/index.mts
+  t("out-of-batch .mjs does NOT mis-map to an in-batch .ts/index (AR5 round-2)", resolveInSet("packages/bus/src/swarm/a.ts", "./dep.mjs", new Set(["packages/bus/src/swarm/dep.ts", "packages/bus/src/swarm/dep/index.mts"])) === null);
+  // AR5 round-2: `..` above the repo root returns null, never folded back inside
+  t("'..' above repo root -> null (no fold-back) (AR5 round-2)", normalizeSpecifier("a/b.ts", "../../../x.js") === null);
+  t("exactly-to-root traversal still resolves", normalizeSpecifier("packages/bus/src/swarm/a.ts", "../../../../scripts/x.js") === "scripts/x.js");
 }
 
 // --- import edges: only kept when both ends are in the set ---
