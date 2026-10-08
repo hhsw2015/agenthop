@@ -204,18 +204,26 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
   const none: ConsumeResult = { resolved: [], undecided: batch.items, unknownIds: [], consumed: false };
   const consumedMarker = consumedMarkerPath(home, batchId);
   const claim = claimPath(home, batchId);
+  const rejected = rejectedClaimPath(home, batchId);
   // DB-P1-3: a batch consumed once is TERMINAL — consumed.json only ever appears COMPLETE (createExclusiveAtomic), so its mere
   // presence is a true "done"; a half-written marker can never seal the batch (DB-R2-P1-1).
   if (existsStrict(consumedMarker)) return none;
-  // Prefer a FRESH decisions.json: claim it (rename → the STABLE claim name) BEFORE reading (DB-P1-2). The stable name means a
-  // newer claim atomically OVERWRITES an older one, so the LATEST decision wins with no wall-clock/random ordering (DB-R3-P1-1).
+  // Acquire a claim, in order of preference:
+  //  (1) a FRESH decisions.json — claim it (rename → the STABLE claim name) so the LATEST decision wins (DB-R3-P1-1);
+  //  (2) the stable claim — RESUME a prior consume that faulted before the terminal marker;
+  //  (3) a VALID doc stranded in decisions-rejected-claim.json — RECOVER it. A mis-archive under contention (or a restore that
+  //      faulted, DB-R2-P1-1 / DB-R3-P1-1) can leave a real decision in the rejected slot; a genuinely-foreign doc (batchId≠dir)
+  //      is left there. Recovering a bound doc keeps a valid verdict from being stranded after an archive fault.
   let haveClaim = false;
   if (existsStrict(decisionsPath(home, batchId))) {
     try { renameSync(decisionsPath(home, batchId), claim); haveClaim = true; }
-    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; } // a racer took decisions.json first ⇒ fall through to resume its claim
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; } // a racer took decisions.json first ⇒ fall through
   }
-  // No fresh decision ⇒ RESUME the stable claim (a prior consume faulted after claiming but before the terminal marker).
   if (!haveClaim && existsStrict(claim)) haveClaim = true;
+  if (!haveClaim && existsStrict(rejected)) {
+    const r = readJsonOrNull(rejected, validDecisionsDoc);
+    if (r && r.batchId === batchId) { try { renameSync(rejected, claim); haveClaim = true; } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; } }
+  }
   if (!haveClaim) return none; // nothing to consume (no decisions yet / a racer already claimed+closed)
   // DB-R3-P1-1 instance binding: capture the inode of the claim we are about to READ. A concurrent consumer that overwrites
   // decisions.json → claim replaces this inode; we must then neither commit our stale read nor archive the newer instance.
@@ -223,10 +231,9 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
   if (readIno === null) return none; // the claim vanished (a racer took and closed it)
   const doc = readJsonOrNull(claim, validDecisionsDoc); // reads exactly these bytes; a concurrent replace lands on a NEW inode
   // DB-P1-1: the claimed doc MUST be bound to this batch. A misbound/corrupt claim yields NO actionable verdict and is set aside
-  // (decisions-rejected-claim.json). Bind to OUR instance: if the archive rename actually moved a DIFFERENT (newer) inode — a
-  // concurrent claim slipped into the path during the rename — restore it so the newer decision is consumed on retry (DB-R3-P1-1).
+  // (decisions-rejected-claim.json). If the archive actually moved a DIFFERENT (newer) inode — a concurrent claim slipped into the
+  // path during the rename — restore it so the newer decision is recovered on retry (via source (3) above).
   if (!doc || doc.batchId !== batchId) {
-    const rejected = rejectedClaimPath(home, batchId);
     try {
       renameSync(claim, rejected);
       if (claimIno(rejected) !== readIno) { try { renameSync(rejected, claim); } catch { /* a racer re-took it */ } }
@@ -234,13 +241,12 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
     return { ...none, unknownIds: doc ? doc.decisions.map((d) => d.id) : [] };
   }
   const res = resolveBatch(batch, doc);
-  // DB-R3-P1-1: commit ONLY if the claim is still OUR instance (not replaced by a newer decision between our read and commit).
-  // Otherwise abort — the newer claim is consumed on a retry; we never commit a superseded verdict.
-  if (claimIno(claim) !== readIno) return none;
-  // DB-P1-3 / DB-R2-P1-1: commit the TERMINAL marker via temp+link — appears ONLY complete, and the single creator wins
-  // ("exists" ⇒ another consumer already closed the batch ⇒ execute nothing). A write/link fault (EFBIG/EACCES) THROWS with the
-  // claim intact ⇒ a retry completes the SAME consume (no user resubmit, no partial seal).
+  // DB-R3-P1-1 (atomic bind, not a stat race): the terminal commit must act on the SAME instance we read. A bare stat-then-link
+  // is a TOCTOU (the claim can be replaced between the check and the link). Instead COMMIT, then VERIFY the claim is still our
+  // instance; if a newer decision replaced it (so we would have sealed a superseded verdict), UNDO the just-created marker and
+  // abort — the newer claim is consumed on a retry. "exists" ⇒ another consumer already committed ⇒ execute nothing.
   if (createExclusiveAtomic(consumedMarker, JSON.stringify({ batchId, decidedAtSec: doc.decidedAtSec, consumedAtMs: Date.now() })) === "exists") return none;
+  if (claimIno(claim) !== readIno) { try { unlinkSync(consumedMarker); } catch { /* already gone */ } return none; }
   return { ...res, consumed: true };
 }
 

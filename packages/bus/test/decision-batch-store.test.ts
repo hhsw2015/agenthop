@@ -243,4 +243,33 @@ describe("decision-batch store (IO)", () => {
     expect(got.consumed).toBe(true);
     expect(got.resolved.map((r) => r.verdict)).toEqual(["reject"]); // the live instance wins, never the replaced approve
   });
+
+  test("DB-R3-P1-1 (commit verify-undo): a committed marker is UNDONE when the claim was replaced before the link", () => {
+    openBatch(HOME, { batchId: "b1", owner: "c", items: [item("same")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
+    const claim = path.join(dbDir("b1"), "decisions-consumed-claim.json");
+    renameSync(path.join(dbDir("b1"), "decisions.json"), claim); // O's claim (approve)
+    const readIno = statSync(claim).ino;
+    // simulate: O read approve, then a newer consumer replaced the claim instance (reject) before O's terminal commit
+    writeFileSync(path.join(dbDir("b1"), "decisions.json"), JSON.stringify({ batchId: "b1", decidedAtSec: 21, decisions: [{ id: "same", verdict: "reject" }] }));
+    renameSync(path.join(dbDir("b1"), "decisions.json"), claim); // overwrite ⇒ new inode (reject)
+    expect(statSync(claim).ino).not.toBe(readIno);
+    // retry consumes the live reject instance (not the stale approve); verify-undo guarantees no stale commit
+    const got = consumeDecisions(HOME, "b1");
+    expect(got.consumed).toBe(true);
+    expect(got.resolved.map((r) => r.verdict)).toEqual(["reject"]);
+  });
+
+  test("DB-R3-P1-1 (equiv verification): a mis-archived VALID doc is recovered from the rejected slot — no valid decision lost", () => {
+    openBatch(HOME, { batchId: "b1", owner: "c", items: [item("same")], nowSec: 1 });
+    // a bound (valid) decisions doc stranded in the rejected slot — e.g. an archive restore that faulted (DB-R2-P1-1 window C)
+    writeFileSync(path.join(dbDir("b1"), "decisions-rejected-claim.json"), JSON.stringify({ batchId: "b1", decidedAtSec: 9, decisions: [{ id: "same", verdict: "reject" }] }));
+    const got = consumeDecisions(HOME, "b1"); // resume-fallback recovers it
+    expect(got.consumed).toBe(true);
+    expect(got.resolved.map((r) => r.verdict)).toEqual(["reject"]);
+    // a genuinely-foreign doc in the rejected slot is NEVER recovered (stays discarded)
+    openBatch(HOME, { batchId: "b2", owner: "c", items: [item("same")], nowSec: 1 });
+    writeFileSync(path.join(dbDir("b2"), "decisions-rejected-claim.json"), JSON.stringify({ batchId: "OTHER", decidedAtSec: 9, decisions: [{ id: "same", verdict: "approve" }] }));
+    expect(consumeDecisions(HOME, "b2").consumed).toBe(false);
+  });
 });
