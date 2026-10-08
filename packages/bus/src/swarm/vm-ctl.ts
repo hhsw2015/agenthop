@@ -105,14 +105,29 @@ export function readyVerdict(raw: string, exitFailed: boolean): ReadyVerdict {
   } catch {
     /* not JSON — fall to text */
   }
-  const low = s.toLowerCase();
+  const low = s.toLowerCase().trim();
   if (/\bunreachable\b|not reachable|unable to reach|cannot reach|not running|not ready|connection refused|\btimed out\b|no route to host|host is down|\boffline\b|\bfailed\b/.test(low)) return "down";
-  // progress / question / any negation or falsity ⇒ unconfirmable, never ready
-  if (/\bwaiting\b|\bchecking\b|\bpending\b|\bwhether\b|to become|\btrying\b|\bconnecting\b|will be|\bnot\b|n['’]t|\bno\b|\bfalse\b|\bdisabled\b/.test(low)) return "unknown";
-  // COMPLETE success formats only (an affirmative STATE, not a bare keyword)
-  const affirm = /server is ready|status:\s*running|is ready\b|is running\b|is reachable\b|is online\b|is up\b|connection established|herdr[^.]*\brunning\b/.test(low);
-  return affirm ? "ready" : "unknown";
+  // `ready` ONLY on an EXACT, fully-anchored complete-success format — no arbitrary surrounding text, no question/
+  // conditional/speculation (VMC-P1-1). A substring/`[^.]*` match let "server is ready?", "if the server is ready,
+  // continue", "herdr may be running" through; whole-string anchoring rejects them. Bare "reachable" stays a positive.
+  return READY_FORMATS.some((re) => re.test(low)) ? "ready" : "unknown";
 }
+
+/** The ENUMERATED, fully-anchored set of complete success formats a probe may emit. Extend from a live run (the exact
+ *  herdr wording is an acceptance rider), never loosen to a substring match. */
+const READY_FORMATS: readonly RegExp[] = [
+  /^reachable$/,
+  /^ready$/,
+  /^online$/,
+  /^connected$/,
+  /^up$/,
+  /^ok$/,
+  /^running$/,
+  /^server is ready$/,
+  /^status:\s*running$/,
+  /^connection established$/,
+  /^herdr( server)?( is)? running$/,
+];
 
 /** Bounded exponential-ish backoff for the ready gate (borrowed from Railway's BACKOFF_SECS). Last value repeats. Pure. */
 export const READY_BACKOFF_SEC: readonly number[] = [1, 2, 4, 8, 15];

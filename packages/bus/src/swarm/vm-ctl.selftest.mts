@@ -65,6 +65,13 @@ t("VMC-P1-1c-C: 'checking whether host is reachable' -> NOT ready", readyVerdict
 t("VMC-P1-1c-C: 'ready check pending' -> NOT ready", readyVerdict("ready check pending", false) !== "ready");
 t("VMC-P1-1c: {ready:true} -> ready (control)", readyVerdict('{"ready":true}', false) === "ready");
 t("VMC-P1-1c: {online:false} -> down (control)", readyVerdict('{"online":false}', false) === "down");
+// VMC-P1-1 round-4: success text must FULLY match an enumerated format — no question/conditional/speculation/context
+t("VMC-P1-1d: 'server is ready?' -> NOT ready", readyVerdict("server is ready?", false) !== "ready");
+t("VMC-P1-1d: 'herdr server running?' -> NOT ready", readyVerdict("herdr server running?", false) !== "ready");
+t("VMC-P1-1d: 'if the server is ready, continue' -> NOT ready", readyVerdict("if the server is ready, continue", false) !== "ready");
+t("VMC-P1-1d: 'herdr may be running' -> NOT ready", readyVerdict("herdr may be running", false) !== "ready");
+t("VMC-P1-1d: bare 'reachable' complete status -> ready (regression)", readyVerdict("reachable", false) === "ready");
+t("VMC-P1-1d: 'herdr server running' (no punct) -> ready (control)", readyVerdict("herdr server running", false) === "ready");
 
 // --- backoff: bounded, last value repeats ---
 t("backoff attempt1 = first", nextBackoffSec(1) === READY_BACKOFF_SEC[0]);

@@ -1,6 +1,6 @@
 # vm-ctl — review packet (S14, owner 90b58f9c)
 
-Branch `feat/vm-ctl`, review range `c3439cd..HEAD` (merge-base with main = c3439cd). Verify: `npx tsx packages/bus/src/swarm/vm-ctl.selftest.mts` → 74 cases green; `cd packages/bus && npx tsc --noEmit` → 0.
+Branch `feat/vm-ctl`, review range `c3439cd..HEAD` (merge-base with main = c3439cd). Verify: `npx tsx packages/bus/src/swarm/vm-ctl.selftest.mts` → 80 cases green; `cd packages/bus && npx tsc --noEmit` → 0.
 
 **Scope proof** (`git diff --name-status c3439cd..HEAD`): PURELY ADDITIVE — `vm-ctl.{ts,selftest.mts}` + design doc + this packet. Modifies NO existing file; changes NO runtime (`SWARM_VM_CTL` default OFF). No new dependency. Design coordinator-approved + user positioning ruling (`docs/swarm/vm-ctl-design.md`).
 
@@ -10,7 +10,7 @@ Elevates vm-ssh into a backend-agnostic machine-management command family. **Con
 
 | Module | lines | selftest | Purpose |
 |---|---|---|---|
-| `vm-ctl.ts` | 268 | 74 | pure: Machine shape, `verbNeedsBackend` (decoupling invariant), `adoptMachine`, `readyVerdict`, `nextBackoffSec`, `buildCredSeed`+`credDeliveryOk` (hard gate), `buildForwardArgs`, snapshot genealogy (`snapshotRef`/`restorePlan`/`forkPlan`, checkpoint/template/fork), `buildCodePlan` (code facade), `buildBootPlan`; IO: `vmCtlEnabled` (dormant) |
+| `vm-ctl.ts` | 284 | 80 | pure: Machine shape, `verbNeedsBackend` (decoupling invariant), `adoptMachine`, `readyVerdict`, `nextBackoffSec`, `buildCredSeed`+`credDeliveryOk` (hard gate), `buildForwardArgs`, snapshot genealogy (`snapshotRef`/`restorePlan`/`forkPlan`, checkpoint/template/fork), `buildCodePlan` (code facade), `buildBootPlan`; IO: `vmCtlEnabled` (dormant) |
 
 ## Invariant → where pinned (the review walk)
 
