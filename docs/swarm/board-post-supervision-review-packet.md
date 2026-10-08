@@ -1,11 +1,17 @@
-# Review packet — BA9 board-post supervision (§2d-a, an R14 pre-flight), ROUND 3
+# Review packet — BA9 board-post supervision (§2d-a, an R14 pre-flight), ROUND 4
 
-- **Branch** `feat/board-post-supervision`  **HEAD** `37afbbd`  **Base** `main` (`5da42b5`)  (round-1 `52533f3`, round-2 `68e41e0`)
+- **Branch** `feat/board-post-supervision`  **HEAD** `23e6c2e`  **Base** `main` (`5da42b5`)  (round-1 `52533f3`, round-2 `68e41e0`, round-3 `37afbbd`)
 - **Reviewer** codex `01a0ead5` (cross-family, independent)  **Author** bus-pen `d7f6c917`
 - **Design** `docs/swarm/board-post-supervision-design.md` @`93023c6` (coordinator-approved, zero change)
 
 ## What this is
 A posted-but-unclaimed board item that is STILL ready is never reaped by `planBoardWrites` (reap only fires when the node stops being ready), so without supervision it can sit forever — a silent stall that must be closed before `SWARM_BOARD_ADMIT` can flip (R14). BA9 adds the escalation: REPOST (bounded) -> REPORT (coordinator incident, deduped) -> RECLAIM (dead-letter). DORMANT behind `SWARM_BOARD_ADMIT`.
+
+## Round 4 — round-3 REMAIN resolved (BP3; the two tmp-recovery holes)
+- BP3 (P1) round-3's adoption only checked posted-existence, leaving two holes, both now closed with pure, tested decisions:
+  - Counterexample A (revive a moved item): a repost whose `tmp`-unlink failed left a stale tmp; after a member claimed the new posted, the next tick revived the tmp -> `claimed`+`posted` coexisting. Adoption now builds `liveItemIds` from ALL current board files (`parseBoardItemName`) and asks the pure `repostTmpAction(itemId, liveItemIds)`: ANY live state (posted back, claimed, granted, rejected, done, reclaimed) means the item MOVED ON -> `drop` the stale tmp, never revive. Restore only a genuinely-missing item.
+  - Counterexample B (reset escalation on a persistent failure): when the rewrite, the restore, AND the adoption rename all fail, round-3 still re-posted a FRESH first item (repostCount + deadline reset, cap bypassed). A failed restore now records the itemId as a PENDING obligation; the producer runs the pure `suppressPendingReposts(post, pendingTmpItemIds)` so a fresh first post for it is suppressed — a later tick's adoption retries the restore, the count is never reset by re-creating the item.
+- Gates: bus tsc 0, scripts tsc 0, bus vitest 1082/1082 (board test 41, +4 BP3 recovery). The two new decisions are pure (`repostTmpAction`, `suppressPendingReposts`) with counterexample-A/B tests.
 
 ## Round 3 — round-2 REMAIN resolved (BP1/BP3; the report-durability + repost-atomicity seams)
 - BP1 (P1) the `reportedAtSec` stamp is what starts the reclaim grace, so it must mean "a report was durably saved". The driver now writes the S19 incident (`<itemId>.report.json`) FIRST; ONLY a confirmed save then stamps the posted file (`atomicRepost` of the stamped item). A failed save leaves `reportedAtSec` unset, so the next tick re-emits the report (the obligation is retained) — never stamp-then-grace-then-reclaim with no report file. The incident content is fixed per item, so a re-write before the stamp lands is idempotent.
