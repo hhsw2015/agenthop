@@ -27,6 +27,13 @@ Frozen so `3e097dfe` (console render) can consume the files directly. Code: `pac
 > RESUMABLE; the notify uses an exclusive lock + a separate sent-proof (at most one ping under concurrency/faults; an intent
 > marker is never "sent"); `openBatch` propagates a notify failure; `writeDecisions` refuses a consumed batch. The
 > console/coordinator surface is unchanged except these throw cases and the backend-internal files below.
+>
+> **round-6 (R24, @d18fb9f):** `consumeDecisions` now runs its WHOLE critical section (claim / recover / read / commit) under a
+> per-batch exclusive lock `consume.lock`, so the terminal marker is created once and FINAL (no retract), and the claim can't be
+> replaced mid-consume. A consumer that cannot take the lock returns `{ consumed:false, contended:true }` (explicit receipt); a
+> lock left by a dead/own pid is reclaimable. `writeDecisions` stays UNLOCKED (a concurrent newer decision is accepted), and the
+> consume re-claims the LATEST `decisions.json` right before commit so the newer decision wins. (Residual under adjudication: a
+> write landing exactly during the terminal link — see the review packet.)
 
 ## Files (under `$HOME/.agenthop/console/decision-batches/<batchId>/`)
 

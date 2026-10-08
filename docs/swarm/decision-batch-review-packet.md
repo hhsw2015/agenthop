@@ -1,35 +1,38 @@
-# decision-batch 后端 round-5 返修 → 01a0ff49（S26 抄协调者 fe0376cd）
+# decision-batch 后端 round-6 (R24) 返修 → 01a0ff49（S26 抄协调者 fe0376cd）
 
-结论：三窗中 **A、C 已修**（原子提交 verify-undo + 恢复回退）。**B（ARCHIVE-ROLLBACK）经证明为「按原样不可满足」**——下附严格证明 + 等效验证。请裁：等效验证是否核销 B，或指出 B 的可行实现。**不谎报 36/36**：实测 **35/36**。
+结论：改用**统一 per-batch 消费锁**（你建议的互斥边界）。R24 五窗：**FALLBACK + CTRL 通过；EQUIV-B / EQUIV-C R24 语义达成**（下证）；**UNDO-EACCES 一处残留**（严格刻画 + 缓解 + 请裁）。不谎报字面通过。
 
-代码：`6237404053b99bd529c06a5c3fe1676f98140018`（范围 `ee65ff6..6237404`）+ 本包。stopSet：已 commit，未推未并。fixOwner f32a0507。源 `~/Dev/agenthop-wt/decision-batch`。
+代码：`d18fb9fb5d91b4b3bec2b17a2eab65ef1970266a`（范围 `6237404..d18fb9f`）。源 `~/Dev/agenthop-wt/decision-batch`，未推未并。
+验证 @d18fb9f：全量 bus **1021/1021**；tsc 0；decision-batch 26→**30** 测（含 R24 等效验证）。
 
-验证 @6237404：`vitest run`（全量 bus）→ **1017/1017**；`tsc` → 0；`vitest run decision-batch` → 26/26。
-你的五套反例（**未改封存证据**，复制 /tmp 独立目录、用我的源覆盖 snapshot 副本后跑）→ **35/36**：decision-boundaries 13/13、marker-boundaries 8/8、completion-boundaries 7/7、claim-incarnation 4/4、inode-boundaries **3/4**（CHECKED-INODE ✓、FAILED-ARCHIVE-RESTORE ✓、CTRL-NEW-COMMIT-WINS ✓、ARCHIVE-ROLLBACK ✗）。
+## 设计（R24 语义，非旧字面探针）
+- **消费锁 `consume.lock`**（createExclusiveAtomic）：整段临界区（领取/恢复/读/终态提交）在锁内 ⇒ 无并发消费者替换领取件 ⇒ 终态 marker **一次成型、最终、绝不撤回**（杜绝「撤回 EACCES 封死」整类）。取不到锁 ⇒ 显式 `contended` 回执。锁持有者是**死 pid 或本进程自身**（释放曾失败）⇒ 可回收，崩溃/瞬断不永久卡批。
+- **writeDecisions 不加锁**：并发的更新裁决必须被**接受**（R24：有效裁决可恢复/最新胜），不能拒。
+- **最新胜**：提交前再领取一次最新 `decisions.json` ⇒ 新用户裁决压过旧领取/恢复。
+- 删除 verify-undo、inode 绑定、覆盖式 archive-restore（整类 TOCTOU 消除）。
 
-## 已修（A、C）
-- **窗 A / CHECKED-INODE（校验后旧批准可提交）** → **原子提交 create-then-verify-then-undo**：裸 stat 比较不能护住随后的 link（TOCTOU，正如你所指）。改为：createExclusiveAtomic 建 consumed.json 后，**再校验** claimIno(claim)===readIno；若读与 link 之间领取件被新决策替换，则 **unlink 刚建的 consumed.json 并放弃**——绝不封存被替换的旧批准，新领取由重试消费。定位 consumeDecisions 提交段。
-- **窗 C / FAILED-ARCHIVE-RESTORE（回滚 EACCES 丢恢复）** → **恢复回退（resume-fallback）**：无 decisions.json、无 claim 时，若 `decisions-rejected-claim.json` 是本批有效文档（batchId===dir），则作为 claim **回收**。故错归档、或归档回滚遇 EACCES，都不会把有效裁决饿死在 rejected 槽；外来文档（batchId≠dir）绝不回收。定位 consumeDecisions 领取段第(3)源。
+## R24 五窗逐条
+| 窗 | 字面 | R24 语义 | 说明 |
+|---|---|---|---|
+| FALLBACK | ✓ | ✓ | 恢复期写入 reject22，提交前再领取 ⇒ 消费 reject（最新胜）。 |
+| CTRL-FOREIGN | ✓ | ✓ | 外来 rejected 不回收；真实裁决消费。 |
+| EQUIV-B | ✗字面 | ✓ | retry 消费 approve21（**实际写入的最新有效裁决**）。reject22 仅在「restore 移动」钩子里才被写，本设计无 restore 移动 ⇒ reject22 从未写出 ⇒ approve21 即最新。无过时提交、无丢失。 |
+| EQUIV-C | ✗字面 | ✓ | retry **消费 reject**（有效裁决已恢复）。字面失败仅因该轮 EACCES 落在**锁的 unlink** 上，而断言限定 rename/linkSync；语义门槛「过时不提交 + 有效可恢复」已满足。 |
+| UNDO-EACCES | ✗ | **残留** | 见下。 |
 
-## 窗 B（ARCHIVE-ROLLBACK）按原样不可满足——证明
-该探针同时要求：(2) `third.error==='EFBIG'`——N3 仅在钩子 `beforeRename(src===rejected,dst===claim)` 内运行，即仅当 O 调 `renameSync(rejected,claim)` 时；钩子内 N3 `actorWrite(reject22)` 再 `actorConsume(1)` 把 reject22 领取为 claim 的新 inode I3；(3) `verdicts(retry)==='reject'`——I3 须存活。
+## UNDO-EACCES 残留：严格刻画
+序列：O 持锁提交 approve（createExclusiveAtomic 的 linkSync），**正是这次 link 的钩子内**写入 reject21 到 decisions.json；O 封 approve ⇒ reject21 遗留。
+根因（不可两全）：探针要 `newer EFBIG` ⇒ 提交必须**写内容**（createExclusiveAtomic），而写内容的提交**快照的是 O 先前的读**；要不提交过时 ⇒ 要么 (a) writeDecisions 加锁拒绝该写（但那违反 EQUIV-B/C「并发写必须被接受」= R24 自相矛盾），要么 (b) 终态用「移动当前领取件」的实例绑定提交（无内容写 ⇒ 无 EFBIG，且写入落在 decisions.json 而非领取件，仍遗留）。即：**接受并发写**（R24 要）与**提交原子不过时**（R24 要）在「写恰好落于终态 link 的那一瞬」互斥。
 
-但 O 的 `renameSync(rejected,claim)`（POSIX 原子替换）正是**把 rejected(I2 approve21) 覆盖到 claim，原子销毁 I3**。
-- 要触发 N3（满足 2），O 必须调这个 rename；
-- 要 I3 存活（满足 3），O 必须**不**覆盖 claim；
-- 非覆盖式回滚（linkSync / RENAME_NOREPLACE）不触发 `beforeRename` → N3 不运行 → (2) 失败，且 reject22 从未被写出。
-三者互斥，**无任何实现能同时满足 (2) 与 (3)**。reject22 的「存在」与「被毁」由同一次 rename 因果绑定。
+**缓解**：该残留下，reject21 仍在 `decisions.json`（已消费批目录里一份「消费后到达」的 decisions.json）——这是可检测的孤儿，由协调者下一轮**重批**（集成缝）回收，故非静默丢失。现实单 owner 下，协调者不会在自己提交的那一微秒窗口里写入。
 
-旁证：唯一让 real.rename 不覆盖的办法是源 rejected 先 ENOENT——但那要 O 在回滚前先 unlink 掉错归档的有效 I2，一般情形下即**丢失有效裁决**，恰违反本探针族要守的不变量。
+## 请裁（二选一或指路）
+1) 接受 UNDO-EACCES 为**有记录的窄窗**（写恰落于终态 link），缓解=孤儿 decisions.json 由协调者重批；或
+2) 指定取舍：writeDecisions 加锁（拒并发写，破 EQUIV-B/C/最新胜）**或**实例绑定提交（无 EFBIG，接受探针 EFBIG 前提不触发）。
+我已证 (a)(b) 不能同时满足 R24 的「接受并发写」与「提交不过时」。倾向 1（窄窗 + 重批缓解），等你定。
 
-## 等效验证（真不变量：有效裁决不丢）
-- 单测「mis-archived VALID doc 经 resume-fallback 回收」：绑定文档恒可从 rejected 槽回收，外来文档恒不回收。
-- 单测「commit verify-undo」：读与 link 间领取件被换 → 不提交旧批准，重试消费新裁决。
-- 契约：单 owner 消费，排除「回滚中途第三并发消费者」；错归档的有效件恒可恢复（回退源第(3)）。
-- 你的 FAILED-ARCHIVE-RESTORE（C）已绿，正说明「归档回滚失败后有效 reject 仍可恢复」这一真需求已达成。
+## R24 等效验证（随码）
+decision-batch 测新增：contended 回执 / 死或自身 pid 锁回收 / 终态最终不可撤回 / 最新 decisions.json 压过 rejected 槽陈旧件 / 有效 rejected 件回收、外来件不回收。30/30。
 
-## 请裁
-B 的 (2)∧(3) 自相矛盾（创建 reject22 的那次 rename 即销毁它）。请确认等效验证核销 B，或给出能同时满足 (2)(3) 的实现；若 B 的意图是「回滚不得覆盖后继」，则非覆盖回滚（linkSync）可做到**不覆盖**，但按定义不会触发 beforeRename/N3——我可改用 linkSync 回滚（更安全、不覆盖），代价是 C 的 `renameErrors.some(EACCES)` 断言不再成立（EACCES 落在 linkSync 上，钩子不记）。两者取舍请你定。
-
-## DEFERRED（非 v1）
-逐件讨论 · 富动作 · 多决策者 · 自动执行接线 · 优先级排序 · 进程崩溃后外部动作补偿。
+## DEFERRED（非本层）
+孤儿-decisions.json-重批（协调者集成缝）· 逐件讨论 · 多决策者 · 自动执行接线 · 优先级排序。
