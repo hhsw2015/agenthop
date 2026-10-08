@@ -1,11 +1,17 @@
-# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 4
+# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 5
 
-- **Branch** `feat/fanout-native`  **HEAD** `b7b5fd9`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`)
+- **Branch** `feat/fanout-native`  **HEAD** `5e58b48`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`, r4 `b7b5fd9`)
 - **Reviewer** codex `01a0ead5` (cross-family, independent)  **Author** bus-pen `d7f6c917`
 - **Contract pointers**: design `docs/swarm/fanout-native-design.md` @`fc799d9` + pre-study `docs/swarm/fanout-prestudy.md` @`cd42840`, both on branch `feat/fanout-native-design`.
 
 ## What this is
 Phase-1 of fan-out nativization: the SOVEREIGN self-built backend a long-lived member wields as a stateless sub-tool. A pure governance core (`fanout.ts`) + a visible-chain pure layer (`fanout-herdr.ts`) + a thin IO driver (`swarm-fanout.ts`) that composes the AS-IS spawn stack, single-flight, and the herdr CLI. DORMANT behind `SWARM_FANOUT`. Headless is the DEFAULT; the temp-workspace visible chain is an explicit opt-in (`visible:true`). Round-1 and round-2 were each 8P1 + 1P2 (N1 closed in round-2); round-3 resolves every threshold below.
+
+## Round 5 — round-4 REMAIN resolved (FN2/FN8/FN9; the last crash/failure-recovery seams)
+- FN2 (P1) a prior RUNNING row is UNKNOWN after a crash, so resume RECONCILES it from real evidence before deciding — never blind re-run (a double-spend of a launch that may have completed or still be live). New PURE `resumeVerdict(ev)` is the only safe mapping: live pid -> `alive` (carry); explicit 0 exit WITH output -> `done` (reuse); confirmed non-zero / no output -> `failed-terminal` (safe retry); pid gone AND no terminal record -> `uncertain` (quarantine, NEVER re-run). The driver gathers evidence (live pid, headless registry exit, visible `rc` sidecar, output presence) and maps through it. `readLedgerState` now also validates EACH inner row (object with a string `key` and a known `status`; a present `pid` must be a number) AND the cumulative spend (`tokens`/`usd` finite and non-negative) — an illegal row status or a negative/NaN spend REFUSES the launch instead of flowing into resume/reservation math.
+- FN8 (P1) each launch writes to a UNIQUE per-launch evidence path (`<key>.<ts>-<rand>.out` + its `rc`), so an old attempt's `rc`/output can never share the path — success is bound to THIS launch BY CONSTRUCTION. The fragile stale-file delete (whose `EACCES` failure could pass off old evidence) is removed entirely; there is nothing stale to clear.
+- FN9 (P2) a child's capacity is freed ONLY once it is confirmed gone. On timeout the driver despawns, then releases the lease only if the child pid is no longer alive; a failed/unconfirmed despawn KEEPS the lease bound to the child pid (`acquireLease` reaps that slot when the child actually dies) rather than freeing capacity while the child still runs. Applied in BOTH `settleUnit`'s finally and the run's outer finally (despawn-then-confirm-then-release, never release-first).
+- Gates: bus tsc 0, scripts tsc 0, fanout selftest ALL pass (+7 `resumeVerdict` cases), fanout-herdr selftest 23, bus vitest 991/991.
 
 ## Round 4 — round-3 REMAIN resolved (cross-attempt seams; FN6/N1 were closed in r3)
 - FN1 `reserveValid` refuses a capped domain with no positive estimate and rejects negative/NaN reserves; `reservationFits` replaces the `>=` pre-check (exactly-equal admitted, over rejected); USD is metered (no more zero/negative charge).
