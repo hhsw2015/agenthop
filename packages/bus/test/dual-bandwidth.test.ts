@@ -134,4 +134,15 @@ describe("dual-bandwidth pure core", () => {
     expect(Number.isFinite(r.bProd1h)).toBe(true);
     expect(Number.isFinite(r.ratio!)).toBe(true);
   });
+
+  test("T52-P2-5 B: overflow-prone config/counts are rejected, never emitted as a null-masquerade", () => {
+    // reviewer B1: windowSec=MAX_VALUE + backlog + 1 consume used to give tDrain=Infinity -> JSON null (reads as "no consumption").
+    expect(() => run({ consumeAtSec: [NOW - 10], backlog: 10000, config: { windowSec: Number.MAX_VALUE } })).toThrow(/windowSec/);
+    // reviewer B2: a valid 2h window but backlog=MAX_VALUE overflowed the drain division.
+    expect(() => run({ consumeAtSec: [NOW - 10], backlog: Number.MAX_VALUE, config: { windowSec: 7200 } })).toThrow(/backlog/);
+    // within bounds, a consuming reading keeps a FINITE drain (never null while consuming).
+    const r = run({ consumeAtSec: inLastHour(1), backlog: 1000, config: { windowSec: 7200 } });
+    expect(r.tDrainHours).not.toBeNull();
+    expect(Number.isFinite(r.tDrainHours!)).toBe(true);
+  });
 });

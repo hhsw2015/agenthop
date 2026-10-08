@@ -62,7 +62,7 @@ function resolveConfig(c: DualBandwidthConfig = {}): Required<DualBandwidthConfi
   const cfg = { ...DEFAULTS, ...c };
   // Reject an invalid config LOUDLY — never silently disable a threshold or emit a NaN/Infinity reading (mirrors RoomRateLimiter).
   // windowSec must be ≥ 1: a sub-second window underflows `windowSec/3600` toward 0 and makes the per-hour rate Infinity/NaN (T52-P2-5).
-  if (!Number.isFinite(cfg.windowSec) || cfg.windowSec < 1) throw new Error(`dual-bandwidth: windowSec must be a finite number ≥ 1 (got ${String(c.windowSec)})`);
+  if (!Number.isFinite(cfg.windowSec) || cfg.windowSec < 1 || cfg.windowSec > Number.MAX_SAFE_INTEGER) throw new Error(`dual-bandwidth: windowSec must be a finite number in [1, ${Number.MAX_SAFE_INTEGER}] (got ${String(c.windowSec)})`);
   if (!Number.isFinite(cfg.amberRatio) || cfg.amberRatio <= 0) throw new Error(`dual-bandwidth: amberRatio must be a positive finite number (got ${String(c.amberRatio)})`);
   if (!Number.isFinite(cfg.redRatio) || cfg.redRatio <= 0) throw new Error(`dual-bandwidth: redRatio must be a positive finite number (got ${String(c.redRatio)})`);
   if (cfg.redRatio <= cfg.amberRatio) throw new Error(`dual-bandwidth: redRatio (${cfg.redRatio}) must exceed amberRatio (${cfg.amberRatio})`);
@@ -100,7 +100,9 @@ function countTotal(atSec: readonly number[], upperSec: number): number {
 export function computeDualBandwidth(input: DualBandwidthInput): DualBandwidthReading {
   const cfg = resolveConfig(input.config);
   if (!Number.isFinite(input.nowSec)) throw new Error(`dual-bandwidth: nowSec must be a finite number (got ${String(input.nowSec)})`);
-  if (!Number.isInteger(input.backlog) || input.backlog < 0) throw new Error(`dual-bandwidth: backlog must be a non-negative integer (got ${String(input.backlog)})`);
+  // Number.isSafeInteger (not just isInteger): Number.MAX_VALUE IS an integer but overflows backlog/bCons arithmetic into
+  // Infinity (which JSON would turn into a null that reads as "no consumption"). A safe-integer bound keeps every derived value finite (T52-P2-5).
+  if (!Number.isSafeInteger(input.backlog) || input.backlog < 0) throw new Error(`dual-bandwidth: backlog must be a safe non-negative integer (got ${String(input.backlog)})`);
 
   const upperSec = input.nowSec + cfg.skewToleranceSec; // future-skew bound shared by the rate and the cumulative count
   const bProd1h = rateInWindow(input.produceAtSec, input.nowSec, cfg.windowSec, upperSec);
@@ -124,6 +126,14 @@ export function computeDualBandwidth(input: DualBandwidthInput): DualBandwidthRe
   if (ratioRed || backlog > cfg.backlogHardCap || drainRed) zone = "red";
   else if ((consuming && ratio! > cfg.amberRatio) || dBacklogDtPerHour > 0 || backlog >= cfg.backlogSoftCap) zone = "amber";
   else zone = "green";
+
+  // Final guard (T52-P2-5 B): a derived value must never be non-finite. With consumption present, an arithmetic overflow must
+  // THROW loudly — never be emitted as an Infinity that JSON silently turns into the "no consumption" null. (null is ONLY the
+  // legitimate undefined — bCons1h === 0 — handled above; here `consuming` guarantees these are real divisions.)
+  const nonFinite =
+    !Number.isFinite(bProd1h) || !Number.isFinite(bCons1h) || !Number.isFinite(dBacklogDtPerHour) ||
+    (consuming && !Number.isFinite(ratio as number)) || (consuming && backlog > 0 && !Number.isFinite(tDrainHours as number));
+  if (nonFinite) throw new Error(`dual-bandwidth: a derived value overflowed to non-finite (windowSec/backlog/counts out of range) — refusing to emit a null-masquerade`);
 
   return { bProd1h, bCons1h, bProdTotal, bConsTotal, ratio, backlog, dBacklogDtPerHour, tDrainHours, zone };
 }

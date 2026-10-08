@@ -177,5 +177,10 @@ export function readBandwidthProjection(home: string): BandwidthProjection | nul
   if (!num(r.generatedAtSec) || !pair(r.prod) || !pair(r.cons)) return null;
   if (!nullable(r.ratio) || !num(r.backlog) || !num(r.backlogGrowthPerHour) || !nullable(r.drainHours)) return null;
   if (!num(r.windowSec) || (r.zone !== "green" && r.zone !== "amber" && r.zone !== "red")) return null;
+  // thresholds is REQUIRED and must carry all five finite numeric fields (T52-P2-5 A) — not merely be present.
+  const th = r.thresholds;
+  if (th === null || typeof th !== "object") return null;
+  const t = th as Record<string, unknown>;
+  if (!num(t.amberRatio) || !num(t.redRatio) || !num(t.backlogSoftCap) || !num(t.backlogHardCap) || !num(t.tDrainHorizonHours)) return null;
   return raw as BandwidthProjection;
 }

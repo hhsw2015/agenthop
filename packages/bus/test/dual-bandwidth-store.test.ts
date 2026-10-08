@@ -176,12 +176,28 @@ describe("dual-bandwidth IO store", () => {
     const h = mkHome();
     const gaugeDir = path.join(h, ".agenthop", "console", "bandwidth-gauge");
     mkdirSync(gaugeDir, { recursive: true });
-    const full = { schema: "bandwidth-gauge/v1", generatedAtSec: 1, prod: { ratePerHour: 1, sessionTotal: 1 }, cons: { ratePerHour: 1, sessionTotal: 1 }, ratio: null, backlog: 0, backlogGrowthPerHour: 0, drainHours: null, zone: "green", windowSec: 3600 };
+    const thresholds = { amberRatio: 0.8, redRatio: 1.2, backlogSoftCap: 20, backlogHardCap: 50, tDrainHorizonHours: 8 };
+    const full = { schema: "bandwidth-gauge/v1", generatedAtSec: 1, prod: { ratePerHour: 1, sessionTotal: 1 }, cons: { ratePerHour: 1, sessionTotal: 1 }, ratio: null, backlog: 0, backlogGrowthPerHour: 0, drainHours: null, zone: "green", windowSec: 3600, thresholds };
     const w = (o: unknown) => writeFileSync(path.join(gaugeDir, "gauge.json"), JSON.stringify(o));
     w(full); expect(readBandwidthProjection(h)).not.toBeNull(); // the valid baseline
     w({ ...full, cons: undefined }); expect(readBandwidthProjection(h)).toBeNull(); // missing required pair
     w({ ...full, zone: "purple" }); expect(readBandwidthProjection(h)).toBeNull(); // bad zone
     w({ ...full, prod: { ratePerHour: null, sessionTotal: 1 } }); expect(readBandwidthProjection(h)).toBeNull(); // non-finite rate (a serialized NaN)
     w({ ...full, backlog: "x" }); expect(readBandwidthProjection(h)).toBeNull(); // wrong type
+  });
+
+  test("T52-P2-5 A: thresholds is required and all five fields must be finite numbers", () => {
+    const h = mkHome();
+    const gaugeDir = path.join(h, ".agenthop", "console", "bandwidth-gauge");
+    mkdirSync(gaugeDir, { recursive: true });
+    const thresholds = { amberRatio: 0.8, redRatio: 1.2, backlogSoftCap: 20, backlogHardCap: 50, tDrainHorizonHours: 8 };
+    const full = { schema: "bandwidth-gauge/v1", generatedAtSec: 1, prod: { ratePerHour: 1, sessionTotal: 1 }, cons: { ratePerHour: 1, sessionTotal: 1 }, ratio: null, backlog: 0, backlogGrowthPerHour: 0, drainHours: null, zone: "green", windowSec: 3600, thresholds };
+    const w = (o: unknown) => writeFileSync(path.join(gaugeDir, "gauge.json"), JSON.stringify(o));
+    w({ ...full, thresholds: undefined }); expect(readBandwidthProjection(h)).toBeNull(); // missing entirely
+    w({ ...full, thresholds: null }); expect(readBandwidthProjection(h)).toBeNull();
+    w({ ...full, thresholds: {} }); expect(readBandwidthProjection(h)).toBeNull(); // empty object
+    w({ ...full, thresholds: "x" }); expect(readBandwidthProjection(h)).toBeNull(); // wrong type
+    w({ ...full, thresholds: { ...thresholds, tDrainHorizonHours: undefined } }); expect(readBandwidthProjection(h)).toBeNull(); // one field missing
+    w({ ...full, thresholds: { ...thresholds, redRatio: "1.2" } }); expect(readBandwidthProjection(h)).toBeNull(); // numeric string, not a number
   });
 });

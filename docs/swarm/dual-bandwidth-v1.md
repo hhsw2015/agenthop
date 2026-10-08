@@ -43,8 +43,10 @@ Code: `packages/bus/src/swarm/dual-bandwidth.ts` (pure core) + `dual-bandwidth-s
   - Defaults: window 3600s, amber 0.8, red 1.2, soft cap 20, hard cap 50, drain horizon 8h, future-skew tolerance 300s.
 - **Window bounds (T52-P2-4):** the rolling window is `(now - windowSec, now + skewToleranceSec]`. An event dated past
   `now + skewToleranceSec` (a clock bug / bogus data — e.g. a verdict a year out) is IGNORED, in both the window rate AND the
-  session total, so it can never lower the current backlog's alert level. `windowSec` must be ≥ 1 (a sub-second window underflows
-  the per-hour rate to Infinity/NaN and is rejected); `skewToleranceSec` ≥ 0.
+  session total, so it can never lower the current backlog's alert level. `windowSec` must be in `[1, MAX_SAFE_INTEGER]` (a
+  sub-second window underflows the per-hour rate; a MAX_VALUE window overflows the drain division — both rejected); `backlog` must
+  be a SAFE non-negative integer; `skewToleranceSec` ≥ 0. A derived value that still overflows to non-finite THROWS (T52-P2-5 B) —
+  a consume-present overflow is never emitted as the Infinity-to-null that reads as "no consumption".
 
 ## Projection (frozen read contract) — `$HOME/.agenthop/console/bandwidth-gauge/gauge.json`
 
@@ -76,7 +78,8 @@ severity in those cases.
 - IO `writeBandwidthProjection(home, nowSec, config?) → reading` (computes + atomically writes the projection).
 - IO `readBandwidthProjection(home) → projection|null` (console/tests). Validates STRUCTURE + NUMERICS, not just the schema string
   (T52-P2-5): required prod/cons pairs with finite rate+total, finite generatedAtSec/backlog/backlogGrowthPerHour/windowSec, a known
-  zone, and ratio/drainHours that are null or finite (never a serialized NaN); anything absent / wrong-schema / invalid ⇒ null.
+  zone, ratio/drainHours that are null or finite (never a serialized NaN), AND a required `thresholds` object carrying all five finite
+  numeric fields (amberRatio, redRatio, backlogSoftCap, backlogHardCap, tDrainHorizonHours); anything absent / wrong-schema / invalid ⇒ null.
 
 ## Source boundary (v0)
 
