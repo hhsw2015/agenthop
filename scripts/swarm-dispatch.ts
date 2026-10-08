@@ -815,6 +815,22 @@ async function main(): Promise<void> {
       const usage = { totalAttempts: attempts.length, wallClockSec: Math.max(0, nowSec() - jobStartSec(cur.jobId)) };
       const ready = readyTasks({ plan: cur, attempts, acceptedResults, now: nowSec(), jobUsage: usage });
       mkdirSync(BOARD_DIR, { recursive: true });
+      // BP3: adopt an orphaned `.repost.<pid>.tmp` left when a crash hit BETWEEN the repost's rename-acquire
+      // (posted -> tmp) and its rewrite/restore. Without this the posted file is missing, so the next
+      // planBoardWrites re-posts a FRESH item (repostCount + deadline reset -> escalation silently bypassed).
+      // Restore it to its posted name so the item's progress survives the restart. Only adopt a tmp whose writer
+      // is gone and whose posted slot is free (never steal a live producer's in-flight tmp, never clobber a racer).
+      for (const f of readdirSync(BOARD_DIR)) {
+        const m = /^(.+\.json)\.repost\.(\d+)\.tmp$/.exec(f);
+        if (!m) continue;
+        const tmp = path.join(BOARD_DIR, f);
+        const posted = path.join(BOARD_DIR, m[1]!);
+        const writerPid = Number(m[2]);
+        let writerAlive = false; try { process.kill(writerPid, 0); writerAlive = true; } catch { /* dead */ }
+        if (writerAlive && writerPid !== process.pid) continue; // another producer is mid-repost — leave its tmp alone
+        if (existsSync(posted)) { try { unlinkSync(tmp); } catch { /* fine */ } continue; } // original is back -> drop the stale tmp
+        try { renameSync(tmp, posted); } catch { /* a racer restored it first */ }
+      }
       // Read each existing board file's body so the producer can refresh a stale-revision post (BA8b) and tell its own job's
       // entries from another job's (BA4). Unreadable ⇒ body null.
       const existing: ExistingBoardFile[] = readdirSync(BOARD_DIR).map((f) => {
@@ -852,19 +868,35 @@ async function main(): Promise<void> {
         const posted = path.join(BOARD_DIR, postedFileName(itemId));
         const tmp = `${posted}.repost.${process.pid}.tmp`;
         try { renameSync(posted, tmp); } catch { return false; } // gone/claimed ⇒ never revive
-        atomicWrite(posted, JSON.stringify(body));
+        try {
+          atomicWrite(posted, JSON.stringify(body));
+        } catch {
+          // BP3: the rewrite failed — RESTORE the acquired original (with its repostCount/postedAtSec) so the
+          // item's escalation progress is never lost. A failure that leaves only the tmp would make the next
+          // planBoardWrites re-post a fresh first item (count/deadline reset, cap bypassed). If restore also fails,
+          // the tmp survives for the next tick's adoption sweep to recover.
+          try { renameSync(tmp, posted); } catch { /* adoption sweep will recover the tmp */ }
+          return false;
+        }
         try { unlinkSync(tmp); } catch { /* fine */ }
         return true;
       };
       for (const it of sup.reposts) atomicRepost(it.itemId, it);
       for (const it of sup.reports) {
-        if (!atomicRepost(it.itemId, it)) continue; // BP1: persist reportedAtSec on the still-unclaimed file; skip if claimed
+        // BP1: the reportedAtSec stamp is what starts the reclaim grace, so it must mean "a report was durably
+        // saved". Write the S19 incident FIRST; ONLY a confirmed save then stamps the posted file. A failed save
+        // leaves reportedAtSec unset, so the next tick re-emits the report (the obligation is retained) — never
+        // stamp-then-grace-then-reclaim with no report file. The incident content is fixed per item, so a re-write
+        // before the stamp lands is idempotent.
         const doc = buildApprovalDoc({
           from: SELF, fromLabel: "swarm-board", nowSec: nowSec(), member: it.itemId,
           screenSummary: `board item ${it.itemId} unclaimed after ${supPolicy.maxReposts} reposts — no capable member claimed it`,
           options: [{ label: "reassign / raise capacity", consequence: "a capable member claims the item" }, { label: "let it reclaim", consequence: "the node returns to the dead-letter lane after the grace" }],
         });
-        atomicWrite(path.join(BOARD_DIR, `${it.itemId}.report.json`), JSON.stringify(doc.body)); // one S19 incident the coordinator surfaces
+        let saved = false;
+        try { atomicWrite(path.join(BOARD_DIR, `${it.itemId}.report.json`), JSON.stringify(doc.body)); saved = true; } catch { /* not durable — retry next tick, do NOT stamp */ }
+        if (!saved) continue;
+        atomicRepost(it.itemId, it); // persist reportedAtSec on the still-unclaimed file (grace starts here); claimed/gone ⇒ harmless skip
       }
       for (const rc of sup.reclaims) {
         const from = path.join(BOARD_DIR, rc.file);
