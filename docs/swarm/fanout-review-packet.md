@@ -1,11 +1,21 @@
-# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 3
+# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 4
 
-- **Branch** `feat/fanout-native`  **HEAD** `64bfb17`  **Base** `c3439cd`  (round-1 `ff16594`, round-2 `c55f9e5`)
+- **Branch** `feat/fanout-native`  **HEAD** `b7b5fd9`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`)
 - **Reviewer** codex `01a0ead5` (cross-family, independent)  **Author** bus-pen `d7f6c917`
 - **Contract pointers**: design `docs/swarm/fanout-native-design.md` @`fc799d9` + pre-study `docs/swarm/fanout-prestudy.md` @`cd42840`, both on branch `feat/fanout-native-design`.
 
 ## What this is
 Phase-1 of fan-out nativization: the SOVEREIGN self-built backend a long-lived member wields as a stateless sub-tool. A pure governance core (`fanout.ts`) + a visible-chain pure layer (`fanout-herdr.ts`) + a thin IO driver (`swarm-fanout.ts`) that composes the AS-IS spawn stack, single-flight, and the herdr CLI. DORMANT behind `SWARM_FANOUT`. Headless is the DEFAULT; the temp-workspace visible chain is an explicit opt-in (`visible:true`). Round-1 and round-2 were each 8P1 + 1P2 (N1 closed in round-2); round-3 resolves every threshold below.
+
+## Round 4 — round-3 REMAIN resolved (cross-attempt seams; FN6/N1 were closed in r3)
+- FN1 `reserveValid` refuses a capped domain with no positive estimate and rejects negative/NaN reserves; `reservationFits` replaces the `>=` pre-check (exactly-equal admitted, over rejected); USD is metered (no more zero/negative charge).
+- FN2 `readLedgerState` validates SHAPE + IDENTITY (`null`/`{}`/array/foreign `runKey` -> throw, never a fresh run); `markAborted` aborts ONLY a never-launched (no-pid) row, so an in-flight live-pid carry is left running (not re-run); a headless spawn that returns ok-but-no-pid is `delivery_uncertain` (quarantined, never re-run).
+- FN3 an already-ACCEPTED run short-circuits at entry (its results + receipt are immutable — no same-generation overwrite).
+- FN4 the cleanup todo is per-ZONE (`cleanup-pending/<zoneId>.json`, never overwrites another leaked zone); a todo-write failure logs an explicit hand-back (never silent).
+- FN5 duplicate unit keys are rejected case-INSENSITIVELY (a case-folding volume maps `item`/`ITEM` to one file).
+- FN7 `validBudgetTicket` validates EVERY provided cap (a non-finite `maxTokens` is not excused by a valid `maxUsd`).
+- FN8 a unit's stale `output`/`rc` are cleared at launch, so an old `rc=0` cannot impersonate this attempt.
+- FN9 the lease binds the detached CHILD pid; a slot is held until the child's terminal state, even if the driver died.
 
 ## Round 3 — round-2 REMAIN resolved (FN1-FN9, precise thresholds)
 - FN1 the reservation is PRE-CHECKED to fit (`spent + reserve <= cap`) before each launch (no overshoot); cumulative spend (tokens + USD) is persisted in the ledger and resumed, counting ALL attempts; every unit row is registered UPFRONT so an un-launched unit still reaches `aborted`.
@@ -38,14 +48,14 @@ Phase-1 of fan-out nativization: the SOVEREIGN self-built backend a long-lived m
 ## Files + tests
 | Module | ~lines | Tests | Purpose |
 | --- | --- | --- | --- |
-| `packages/bus/src/swarm/fanout.ts` | ~345 | 105 | pure governance (schema/width/tier/display/reduce/receipt/budget/sweep/zone/depth/classify/evidence/resume/abort/finiteness) |
+| `packages/bus/src/swarm/fanout.ts` | ~375 | 117 | pure governance (schema/width/tier/display/reduce/receipt/budget/sweep/zone/depth/classify/evidence/resume/abort/finiteness) |
 | `packages/bus/src/swarm/fanout-herdr.ts` | ~80 | 23 | pure visible-chain builders/parsers + the unit command (tier-model + depth + F41 atomic + rc sidecar) |
-| `packages/bus/src/swarm/fanout.selftest.mts` | ~270 | 105 | one named counterexample per pit + per round-1/2 finding |
+| `packages/bus/src/swarm/fanout.selftest.mts` | ~300 | 117 | one named counterexample per pit + per round-1/2 finding |
 | `packages/bus/src/swarm/fanout-herdr.selftest.mts` | ~60 | 23 | builders/parsers + the char-swallow + child-depth defenses |
 | `scripts/swarm-fanout.ts` | ~255 | live | driver: single-flight + resume (corrupt-vs-missing), width-evidence, strict depth, upfront-register, reservation pre-check + durable spend, shared lease (no-lease-no-launch), both backends, classify, persist-then-receipt, finally cleanup |
 
 ## Gates
-- bus tsc 0; scripts tsc 0; fanout selftest 105/105; fanout-herdr selftest 23/23; bus vitest 991/991 (unchanged — additive files).
+- bus tsc 0; scripts tsc 0; fanout selftest 117/117; fanout-herdr selftest 23/23; bus vitest 991/991 (unchanged — additive files).
 
 ## Self-flags (per the round-2 ruling)
 - FN1 metering is a conservative per-launch RESERVATION (`FANOUT_UNIT_TOKEN_EST` + `FANOUT_UNIT_USD_EST`) — the reviewer accepted a conservative reserve for phase-1; it is now enforceable (pre-checked to fit, no overshoot) and durably cumulative across attempts. A real post-hoc token parse is a phase-2 refinement.
