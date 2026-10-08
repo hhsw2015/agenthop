@@ -68,6 +68,16 @@ Frozen so `3e097dfe` (console render) can consume the files directly. Code: `pac
 > successor arrived during the reclaim (its hold-intent now live), it YIELDS the fresh empty dir to that successor instead of
 > keeping a dir a live holder is using. A normal release/re-acquire interleaving therefore never lets a stale check delete the new
 > occupant, and a genuinely faulted empty dir still recovers the original verdict.
+>
+> **round-12 (R25, @de469d0):** the empty-lock-dir recovery no longer DELETES the dir at all — the remove→recreate gap (even guarded)
+> could strand a live successor that resumed inside it. Recovery is now by ADOPTION (publish our identity straight INTO the empty
+> dir; no rmdir), gated on provable, occupancy-bound evidence: (A) a hold-intent read fault contends; (B) any LIVE FOREIGN
+> hold-intent contends (never steal an arriving holder); (C) OUR OWN unfinished occupancy — tracked by an in-PROCESS set of dirs
+> THIS process created-but-could-not-publish/drop, NOT a same-pid intent on disk (a prior COMPLETED call whose cleanup merely
+> faulted leaves a STALE own intent that is not current occupancy) — adopts; (D) else an EXTERNAL DEAD holder's stranded dir (a dead
+> hold-intent, no live one) is CLAIMED (unlink that intent, single-winner) then adopted. Everything else (a live gap, a bare empty
+> dir, a stale own intent alone) contends. No other process ever touches a foreign empty dir, so a dir we stranded is ours alone to
+> recover; a crashed holder's own-process-restart or any peer recovers it via the dead-intent path.
 
 ## Orphan recovery (R25) — formal boundary
 
@@ -108,15 +118,15 @@ responsible for idempotent re-batching keyed on the stable update id (the conten
 - `consume.lockd/` — the per-batch exclusive consume lock (a DIRECTORY, atomic mkdir), holder identity = the single file inside
   named `<pid>.<nonce>` (vm-ssh `withIdLock` pattern). Reclaim removes ONLY a dead holder's exact-named file (never a successor's);
   release removes ONLY our own named file and never throws. A PUBLISHED holder (one identity file) is reclaimed iff dead/own. An
-  EMPTY lock dir (the brief mkdir→publish window, faulted debris, or a holder mid-release) is reclaimed only when BOUND to the
-  occupancy observed: the reclaim contends if it cannot read the hold-intents (EACCES never means "no holder"), contends if any
-  `consume.lockd.hold.*` of a LIVE FOREIGN pid is present, and after re-creating a fresh dir RE-VERIFIES and YIELDS it to a live
-  successor that arrived meanwhile — so a faulted empty dir recovers while a live/arriving holder is never stolen.
-- `consume.lockd.hold.<pid>.<nonce>` — a HOLD-INTENT credential written in the batch dir BEFORE the mkdir and removed after
-  release. Because it is written while the batch dir is still writable, it SURVIVES a compensation that can no longer touch the
-  lock dir (parent/lock dir turned unwritable mid-cleanup, or a publish that faulted before any identity could be written) and
-  names the faulter's pid — the live/dead signal that tells a reclaim whether an empty lock dir is a live holder (contend) or
-  faulted debris (recover), and that a live successor uses to claim a yielded dir.
+  EMPTY lock dir is never DELETED to recover it (a remove→recreate gap could strand a live successor); it is recovered by ADOPTION
+  (publishing our identity straight into it) ONLY with occupancy-bound proof: contend if the hold-intents cannot be read (EACCES
+  never means "no holder"); contend on any LIVE FOREIGN `consume.lockd.hold.*`; adopt if it is OUR OWN unfinished occupancy (an
+  in-process fact, not a same-pid intent on disk); else claim+adopt an EXTERNAL DEAD holder's dir (a dead hold-intent, no live one).
+- `consume.lockd.hold.<pid>.<nonce>` — a HOLD-INTENT written in the batch dir BEFORE the mkdir and removed after release. While
+  LIVE it tells a concurrent acquirer we hold the empty mkdir→publish window (⇒ contend, never steal); if its owner DIES mid-window
+  it is the DEAD credential a peer (or the owner's own restart) recovers the stranded dir by (claim it, then adopt). OWN
+  same-process recovery does NOT trust this on-disk intent (a prior completed call may leave a stale one) — it uses the in-process
+  stranded-dir set, so a stale own intent never authorizes adopting a dir a new successor now holds.
 - `orphan-<digest>.sent` — per-update proof-of-sent, written only AFTER the orphan re-batch signal is delivered. Dedups re-emits of
   the same content digest across retries; its absence after a faulted send is what lets a retry re-send exactly one.
 
