@@ -87,30 +87,35 @@ function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
 }
-/** Hold-intents in the batch dir (the empty-window recovery credentials), with the owning pid parsed from each name. A READ
- *  FAILURE (EACCES/…) PROPAGATES — inability to read the intents must NEVER be folded to "no intents" (DB-R7 A): it cannot
- *  authorize reclaiming an empty lock dir that a live holder may own. */
+/** Hold-intents in the batch dir, with the owning pid parsed from each name. A READ FAILURE (EACCES/…) PROPAGATES — inability to
+ *  read the intents must NEVER be folded to "no intents" (DB-R7 A): it cannot authorize touching an empty lock dir a holder owns. */
 function listHoldIntents(home: string, batchId: string): { name: string; pid: number }[] {
   return readdirSync(batchDir(home, batchId)).filter((n) => n.startsWith(HOLD_INTENT_PREFIX)).map((n) => ({ name: n, pid: Number(n.slice(HOLD_INTENT_PREFIX.length).split(".")[0]) }));
 }
+/** Lock DIRECTORIES THIS PROCESS created but could not publish into or drop on release — its OWN unfinished occupancy. Own-recovery
+ *  is bound to THIS in-process fact, NOT to a same-pid hold-intent on disk: a prior COMPLETED call whose cleanup merely faulted
+ *  leaves a stale own intent that is NOT current occupancy (DB-R7). No other process ever touches a foreign empty lock dir, so a dir
+ *  we stranded stays ours alone to recover. */
+const strandedLockDirs = new Set<string>();
 /** Acquire the per-batch consume lock. Returns our identity token (`<pid>.<nonce>`) if held by us, else null (contended). */
 function acquireConsumeLock(home: string, batchId: string): string | null {
   const dir = consumeLockDir(home, batchId);
   const token = `${process.pid}.${randomBytes(6).toString("hex")}`;
   const mine = path.join(dir, token);
   const intent = holdIntentPath(home, batchId, token);
-  // Stage our hold-intent FIRST, while the parent is writable — the credential that keeps the brief empty mkdir→publish window
-  // (and any faulted cleanup that can no longer touch the lock dir) recoverable WITHOUT stealing a live acquirer.
+  // Stage our hold-intent FIRST, while the parent is writable: it tells a concurrent acquirer we hold the empty mkdir→publish
+  // window (⇒ they contend, never steal), and if we DIE mid-window it is the DEAD credential another process recovers us by.
   try { writeFileSync(intent, "", { flag: "wx", mode: 0o600 }); } catch { return null; } // cannot even stage ⇒ contended (rare)
   const dropIntent = () => { try { unlinkSync(intent); } catch { /* best-effort */ } };
-  // Win the atomic mkdir, then publish our identity INSIDE the lock. A publish fault leaves an empty lock dir — our hold-intent
-  // (above) remains as the recovery credential, so we RETHROW without dropping it.
+  // Win the atomic mkdir, then publish our identity INSIDE the lock. If the publish faults, the empty dir we just made is OUR OWN
+  // unfinished occupancy ⇒ record it so a same-process retry recovers it (never leave an identity-less dir to a stale-intent guess).
   const take = (): boolean => {
     try { mkdirSync(dir); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; return false; } // held by someone
-    writeFileSync(mine, "", { mode: 0o600 }); return true;
+    try { writeFileSync(mine, "", { mode: 0o600 }); } catch (e) { strandedLockDirs.add(dir); throw e; }
+    strandedLockDirs.delete(dir); return true;
   };
-  if (take()) return token; // won; identity published; intent stays as our working credential until release
-  // Lock dir exists. Reclaim ONLY when the holder is provably gone.
+  if (take()) return token; // won; identity published
+  // Lock dir exists.
   let entries: string[]; try { entries = readdirSync(dir); } catch { dropIntent(); return null; } // vanished mid-check ⇒ contended
   if (entries.length === 1) {
     // A PUBLISHED holder. Reclaim by its EXACT name iff dead/own (never a successor's differently-named file).
@@ -118,39 +123,42 @@ function acquireConsumeLock(home: string, batchId: string): string | null {
     const hpid = Number(holder.split(".")[0]);
     if (Number.isInteger(hpid) && hpid > 0 && (hpid === process.pid || !pidAlive(hpid))) {
       let removed = false; try { rmSync(path.join(dir, holder)); removed = true; } catch { /* a peer reclaimed it first */ }
-      if (removed) { try { rmdirSync(dir); } catch { /* a successor populated/removed it */ } }
-      if (take()) return token; // a peer winning the fresh mkdir ⇒ fall through to contend
+      if (removed) { try { rmdirSync(dir); } catch { strandedLockDirs.add(dir); } } // emptied it but could not drop it ⇒ ours to recover (retry adopts)
+      try { if (take()) return token; } catch (e) { throw e; }
     }
     dropIntent(); return null; // live published holder, or reclaim lost ⇒ contended
   }
   if (entries.length === 0) {
-    // EMPTY lock dir: the brief mkdir→publish window, or faulted debris, or a holder mid-release. Reclaim is bound to the
-    // occupancy we actually observe, and NEVER steals a live/arriving holder (DB-R7 A & B):
+    // EMPTY lock dir. We ADOPT it (publish our identity INTO it — NO rmdir, so there is no remove→recreate gap a live holder could
+    // fall into) ONLY with proof it is recoverable, bound to occupancy we can actually establish — otherwise we CONTEND:
+    //  (A) reading the hold-intents MUST succeed — a read fault cannot prove recoverability ⇒ contend (never fold to empty);
+    //  (B) a LIVE FOREIGN hold-intent ⇒ a holder is mid-publish/arriving ⇒ contend (never steal — DB-R7 occupancy protection);
+    //  (C) OUR OWN unfinished occupancy (this process stranded THIS dir) ⇒ adopt (a stale same-pid intent on disk never qualifies);
+    //  (D) else an EXTERNAL DEAD holder's stranded dir (a dead hold-intent present, no live one) ⇒ CLAIM that intent, then adopt.
     const bdir = batchDir(home, batchId);
-    const liveForeign = (list: { name: string; pid: number }[]) =>
-      list.some((i) => i.name !== path.basename(intent) && i.pid !== process.pid && pidAlive(i.pid));
-    // (A) reading the hold-intents MUST succeed; a read fault cannot prove "no live holder" ⇒ contend (never fold to empty).
-    let before: { name: string; pid: number }[]; try { before = listHoldIntents(home, batchId); } catch { dropIntent(); return null; }
-    if (liveForeign(before)) { dropIntent(); return null; } // a holder is actively here ⇒ never disturb it
-    // No live foreign holder observed ⇒ tentatively reclaim: drop the stale dir and re-create a FRESH one we own.
-    try { rmdirSync(dir); } catch { /* already gone / a co-reclaimer; the mkdir below arbitrates */ }
-    try { mkdirSync(dir); } catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") { dropIntent(); return null; } throw e; } // someone else took it ⇒ contend
-    // (B) RE-VERIFY against the occupancy NOW: if a live successor arrived DURING our reclaim (its hold-intent now live), YIELD
-    // the fresh empty dir to it (leave it for the successor to adopt) rather than keeping a dir a live holder is using.
-    let after: { name: string; pid: number }[]; try { after = listHoldIntents(home, batchId); } catch { dropIntent(); return null; }
-    if (liveForeign(after)) { dropIntent(); return null; } // yield to the live successor
-    for (const i of after) { if (i.name !== path.basename(intent)) { try { unlinkSync(path.join(bdir, i.name)); } catch { /* best-effort */ } } }
-    writeFileSync(mine, "", { mode: 0o600 }); return token; // publish our identity into the fresh dir (a fault here leaves our intent as credential)
+    let others: { name: string; pid: number }[];
+    try { others = listHoldIntents(home, batchId).filter((i) => i.name !== path.basename(intent)); } catch { dropIntent(); return null; }
+    if (others.some((i) => i.pid !== process.pid && pidAlive(i.pid))) { dropIntent(); return null; } // (B) live foreign ⇒ contend
+    const adopt = (): string | null => {
+      try { writeFileSync(mine, "", { mode: 0o600 }); } catch { dropIntent(); return null; } // dir not writable / vanished ⇒ contend; a later retry re-adopts or wins fresh
+      strandedLockDirs.delete(dir);
+      for (const i of others) { if (i.pid === process.pid || !pidAlive(i.pid)) { try { unlinkSync(path.join(bdir, i.name)); } catch { /* best-effort cleanup of stale/dead credentials */ } } }
+      return token;
+    };
+    if (strandedLockDirs.has(dir)) return adopt(); // (C) our own stranded dir
+    const dead = others.find((i) => Number.isInteger(i.pid) && i.pid > 0 && !pidAlive(i.pid));
+    if (dead) { try { unlinkSync(path.join(bdir, dead.name)); } catch { dropIntent(); return null; } return adopt(); } // (D) claim the dead credential (single-winner), then adopt
+    dropIntent(); return null; // no provable recoverable occupancy (live gap / stale own / bare empty) ⇒ contend
   }
   dropIntent(); return null; // >1 identity (ambiguous) ⇒ contended
 }
-/** Release: remove our identity file, drop the (now-empty) lock dir, then remove our hold-intent LAST. NEVER throws — a cleanup
- *  fault can't mask a committed result, and if the rmdir faults the hold-intent REMAINS as a recognizable recovery credential. */
+/** Release: remove our identity file, drop the (now-empty) lock dir, then remove our hold-intent. NEVER throws. If the rmdir
+ *  faults, the empty dir is OUR OWN unfinished occupancy ⇒ record it so a same-process retry recovers it (adopts it). */
 function releaseConsumeLock(home: string, batchId: string, token: string): void {
   const dir = consumeLockDir(home, batchId);
   try { rmSync(path.join(dir, token), { force: true }); } catch { /* best-effort */ }
-  try { rmdirSync(dir); } catch { /* a successor is in, or parent unwritable ⇒ the hold-intent below stays as the credential */ }
-  try { unlinkSync(holdIntentPath(home, batchId, token)); } catch { /* best-effort; a faulted removal leaves a recoverable credential */ }
+  try { rmdirSync(dir); strandedLockDirs.delete(dir); } catch { strandedLockDirs.add(dir); } // could not drop the empty dir ⇒ ours to recover
+  try { unlinkSync(holdIntentPath(home, batchId, token)); } catch { /* best-effort */ }
 }
 
 /** DB-R3-P1-1 / R25 orphan-recovery contract. An ORPHAN is a decision in decisions.json that is valid, bound to this batch, and
