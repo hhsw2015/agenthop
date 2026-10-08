@@ -2,8 +2,9 @@
 //   npx tsx packages/bus/src/swarm/fanout.selftest.mts
 // Each pre-study pit (docs/swarm/fanout-prestudy.md §2) is a NAMED counterexample below.
 import {
-  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classToTier, effectiveTier, isSafeRunKey, newLedgerRow,
-  nextReceipt, progress, reconcileOrphans, reduceUnits, validateFanoutRequest, widthClass, widthGate, zoneName,
+  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, effectiveTier, isSafeRunKey,
+  isTerminal, markAborted, newLedgerRow, nextReceipt, planResume, progress, reconcileOrphans, reduceUnits,
+  validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthClass, widthGate, zoneName,
   type FanoutUnit, type LedgerRow, type UnitResult,
 } from "./fanout.js";
 
@@ -148,6 +149,55 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
 {
   const row = newLedgerRow(unit("u", "judge"), "id-1", "self-built", "temp-workspace", "fanout-r1");
   t("new row starts running, tier from class, zone set", row.status === "running" && row.tier === "mid" && row.zone === "fanout-r1");
+}
+
+// --- FN8: classify terminal status from real exit evidence ---
+{
+  t("failed spawn -> failed", classifyExit({ spawnOk: false, outputPresent: true }) === "failed");
+  t("non-zero exit (42) -> failed (FN8)", classifyExit({ spawnOk: true, exitCode: 42, outputPresent: true }) === "failed");
+  t("clean exit + output -> done", classifyExit({ spawnOk: true, exitCode: 0, outputPresent: true }) === "done");
+  t("clean exit + NO output -> failed (empty yield not a silent success)", classifyExit({ spawnOk: true, exitCode: 0, outputPresent: false }) === "failed");
+  t("unknown exit + output -> done", classifyExit({ spawnOk: true, outputPresent: true }) === "done");
+  t("unknown exit + no output -> failed", classifyExit({ spawnOk: true, outputPresent: false }) === "failed");
+}
+
+// --- FN7: width evidence must be real + bound to the run (not a bare flag) ---
+{
+  t("valid ROI estimate bound to runKey", validRoiEstimate({ runKey: "r1", speedupRatio: 3, costRatio: 1.2 }, "r1") === true);
+  t("ROI estimate for a different run rejected", validRoiEstimate({ runKey: "rX", speedupRatio: 3, costRatio: 1.2 }, "r1") === false);
+  t("ROI estimate missing a ratio rejected", validRoiEstimate({ runKey: "r1", speedupRatio: 3 }, "r1") === false);
+  t("ROI estimate null rejected", validRoiEstimate(null, "r1") === false);
+  t("valid budget ticket bound to runKey", validBudgetTicket({ runKey: "r1", maxTokens: 1000, issuedAt: 1 }, "r1") === true);
+  t("budget ticket for a different run rejected", validBudgetTicket({ runKey: "rX", maxTokens: 1000, issuedAt: 1 }, "r1") === false);
+  t("budget ticket with no ceiling rejected", validBudgetTicket({ runKey: "r1", issuedAt: 1 }, "r1") === false);
+  t("budget ticket null rejected", validBudgetTicket(null, "r1") === false);
+}
+
+// --- FN2: resume reuses prior DONE rows by key, never re-runs them ---
+{
+  const prior: LedgerRow[] = [
+    { id: "1", key: "a", backend: "self-built", displayMode: "headless", tier: "cheap", status: "done", outputPtr: "/o/a" },
+    { id: "2", key: "b", backend: "self-built", displayMode: "headless", tier: "cheap", status: "failed" },
+  ];
+  const { reuse, toRun } = planResume(prior, [unit("a"), unit("b"), unit("c")]);
+  t("a prior DONE unit is reused, not re-run (FN2)", reuse.length === 1 && reuse[0]!.key === "a");
+  t("a prior FAILED unit + a new unit are to-run", toRun.map((u) => u.key).sort().join(",") === "b,c");
+}
+
+// --- FN1: budget-abort marks un-launched/running units terminal (aborted), never vanishing ---
+{
+  const rows: LedgerRow[] = [
+    { id: "1", key: "a", backend: "self-built", displayMode: "headless", tier: "cheap", status: "done" },
+    { id: "2", key: "b", backend: "self-built", displayMode: "headless", tier: "cheap", status: "running" },
+  ];
+  const aborted = markAborted(rows);
+  t("running -> aborted on breaker (FN1)", aborted[1]!.status === "aborted");
+  t("done -> unchanged", aborted[0]!.status === "done");
+  t("aborted is terminal", isTerminal("aborted") === true);
+  t("markAborted is immutable", rows[1]!.status === "running");
+  const red = reduceUnits([{ key: "b", status: "aborted" }]);
+  t("aborted reduces to an error item (honest aggregate)", (red.items[0]?.error ?? "").length > 0 && red.allTerminal === true);
+  t("aborted counts as failed in progress", progress(aborted).failed === 1);
 }
 
 console.log("all fanout selftests passed");

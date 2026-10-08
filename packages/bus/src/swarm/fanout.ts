@@ -142,7 +142,7 @@ export function zoneName(runKey: string): string {
 }
 
 // ---------- ledger ----------
-export type UnitStatus = "running" | "done" | "failed" | "timeout" | "delivery_uncertain";
+export type UnitStatus = "running" | "done" | "failed" | "timeout" | "delivery_uncertain" | "aborted";
 export type Backend = "self-built" | "native";
 export type LedgerRow = {
   id: string;
@@ -172,7 +172,7 @@ export function newLedgerRow(u: FanoutUnit, id: string, backend: Backend, displa
   };
 }
 
-export const TERMINAL: ReadonlySet<UnitStatus> = new Set<UnitStatus>(["done", "failed", "timeout", "delivery_uncertain"]);
+export const TERMINAL: ReadonlySet<UnitStatus> = new Set<UnitStatus>(["done", "failed", "timeout", "delivery_uncertain", "aborted"]);
 export function isTerminal(s: UnitStatus): boolean {
   return TERMINAL.has(s);
 }
@@ -182,7 +182,7 @@ export type Progress = { done: number; failed: number; running: number; total: n
 export function progress(rows: readonly LedgerRow[]): Progress {
   const total = rows.length;
   const done = rows.filter((r) => r.status === "done").length;
-  const failed = rows.filter((r) => r.status === "failed" || r.status === "timeout" || r.status === "delivery_uncertain").length;
+  const failed = rows.filter((r) => r.status === "failed" || r.status === "timeout" || r.status === "delivery_uncertain" || r.status === "aborted").length;
   const running = rows.filter((r) => r.status === "running").length;
   return { done, failed, running, total, line: `${done} done / ${total} total` };
 }
@@ -255,4 +255,52 @@ export function reconcileOrphans(rows: readonly LedgerRow[], livePids: ReadonlyS
 export function canReapZone(zone: string, ourRunKeys: ReadonlySet<string>): boolean {
   if (!zone.startsWith("fanout-")) return false;
   return ourRunKeys.has(zone.slice("fanout-".length));
+}
+
+// ---------- terminal classification + evidence + resume (round-1 FN8/FN7/FN2/FN1) ----------
+
+// FN8: classify a unit's terminal status from its REAL exit evidence, never from pid-gone alone. A failed
+// spawn or a non-zero exit is failed; a clean (or unknown) exit is done ONLY with output evidence — an empty
+// yield is not silently a success.
+export function classifyExit(opts: { spawnOk: boolean; exitCode?: number | null; outputPresent: boolean }): "done" | "failed" {
+  if (!opts.spawnOk) return "failed";
+  if (opts.exitCode !== undefined && opts.exitCode !== null && opts.exitCode !== 0) return "failed";
+  return opts.outputPresent ? "done" : "failed";
+}
+
+// FN7: the width ROI tier needs a REAL estimate bound to this run (env may carry a pointer to it, never be the
+// evidence). A valid estimate names the runKey and gives positive speedup- and cost-ratios.
+export type RoiEstimate = { runKey: string; speedupRatio: number; costRatio: number };
+export function validRoiEstimate(obj: unknown, runKey: string): boolean {
+  const o = obj as Partial<RoiEstimate> | null;
+  return !!o && o.runKey === runKey && typeof o.speedupRatio === "number" && o.speedupRatio > 0 && typeof o.costRatio === "number" && o.costRatio > 0;
+}
+
+// FN7: the over-32 tier needs a valid budget ticket bound to this run (a real ceiling, not a bare flag).
+export type BudgetTicket = { runKey: string; maxTokens?: number; maxUsd?: number; issuedAt: number };
+export function validBudgetTicket(obj: unknown, runKey: string): boolean {
+  const o = obj as Partial<BudgetTicket> | null;
+  if (!o || o.runKey !== runKey || typeof o.issuedAt !== "number") return false;
+  return (typeof o.maxTokens === "number" && o.maxTokens > 0) || (typeof o.maxUsd === "number" && o.maxUsd > 0);
+}
+
+// FN2: resume — reuse the prior ledger's DONE rows by content-addressed key; everything else is to-run. A
+// completed unit is never re-run (no double-spend on a same-runKey replay).
+export function planResume(prior: readonly LedgerRow[], units: readonly FanoutUnit[]): { reuse: LedgerRow[]; toRun: FanoutUnit[] } {
+  const doneByKey = new Map(prior.filter((r) => r.status === "done").map((r) => [r.key, r] as const));
+  const reuse: LedgerRow[] = [];
+  const toRun: FanoutUnit[] = [];
+  for (const u of units) {
+    const d = doneByKey.get(u.key);
+    if (d) reuse.push(d);
+    else toRun.push(u);
+  }
+  return { reuse, toRun };
+}
+
+// FN1: on the budget breaker, a still-running (or never-launched) row reaches a TERMINAL `aborted` state — it
+// must not vanish, so the aggregate stays honest and the receipt is not falsely accepted over missing units.
+// Immutable.
+export function markAborted(rows: readonly LedgerRow[]): LedgerRow[] {
+  return rows.map((r) => (r.status === "running" ? { ...r, status: "aborted" as UnitStatus } : r));
 }
