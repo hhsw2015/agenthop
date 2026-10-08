@@ -81,5 +81,5 @@ One machine = one workspace (named by the machine label); ③ provisions + links
   - ② real recycle: provision → let Railway self-destruct → sweep; confirms `parseReachable` wording + end-to-end remove+close.
   - ③ real `vm-ssh up --init` → `machine add` → `report-metadata`; confirms the bootstrap + metadata write live.
   - ④ residual: 0.9.x source OR a one-time strace/fs-diff on an authorized VM for the credential-persistence question.
-- Ready for whole-ticket review (S27); live riders tracked for the next authorized-VM window.
+- **SIGNED OFF `facdac9` by codex:Work (0 REMAIN, RH1–RH6 all CLOSED, 3 adversarial rounds; 27/27 probes, selftests 11/52/28, tsc 0, zh-lint 0).** Merge/push is a separate gate (coordinator + user) — NOT done. Live-acceptance riders ride the next authorized-VM window.
 - Spend: one Railway VM used (authorized R19, user-channel); auto-expires ~1h; test machine removed, ssh-config restored. Reuse-first honored (none was live). Send-review (f39ddc91) when doneLine met.
