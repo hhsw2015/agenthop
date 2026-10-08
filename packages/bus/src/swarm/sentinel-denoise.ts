@@ -77,29 +77,62 @@ export function parsePsOutput(raw: string): ProcInfo[] {
   return out;
 }
 
-/** True if `cmd` is the dispatcher LOOP (not a one-shot --sweep-once / --observe-once invocation, which are short-lived). */
-/** JS runtimes that can actually EXECUTE the dispatcher script (argv0, by basename). Anything else holding the path as an
- *  argument — an editor, `git`, `rg`, `cat` — is a mere file reference, never a running loop. */
-const JS_RUNTIMES = new Set(["node", "nodejs", "tsx", "ts-node", "bun", "deno", "npx", "pnpm"]);
-/** Flags that make the script path DATA, not an entry: `node -e '... swarm-dispatch.ts ...'` runs the eval string, not the file. */
-const EVAL_FLAGS = new Set(["-e", "--eval", "-p", "--print", "-c"]);
-const isScriptEntry = (tok: string): boolean => !tok.startsWith("-") && (tok === "swarm-dispatch.ts" || tok.endsWith("/swarm-dispatch.ts"));
+/** JS runtimes that actually EXECUTE a script (by basename). npx/pnpm are WRAPPERS that exec one of these. Anything else — an
+ *  editor, git, rg, cat, or a Node-based TOOL (prettier/eslint) whose OWN entry is a different script — is not the loop, even
+ *  when a swarm-dispatch.ts token appears as one of its arguments. */
+const JS_RUNTIMES = new Set(["node", "nodejs", "tsx", "ts-node", "bun", "deno"]);
+/** Node options that CONSUME the next token as their value (so it is never mistaken for the script entry). Equals forms
+ *  (`--import=x`) are self-contained and handled separately. */
+const VALUE_OPTS = new Set(["--require", "-r", "--import", "--loader", "--experimental-loader", "--conditions", "-C"]);
+/** An eval option in ANY form (`-e` `--eval` `-p` `--print` `-c` + their `=value` forms): the runtime runs the eval STRING, not
+ *  a script — a swarm-dispatch.ts token after it is data, never an entry. */
+const EVAL_OPT_RE = /^(-e|--eval|-p|--print|-c)(=|$)/;
+const baseName = (t: string): string => t.slice(t.lastIndexOf("/") + 1);
+const isDispatchEntry = (t: string): boolean => !t.startsWith("-") && (t === "swarm-dispatch.ts" || t.endsWith("/swarm-dispatch.ts"));
+/** A nested JS-runtime cli passed as the parent runtime's first positional (`node /x/tsx <script>`, `node .../tsx/dist/cli.mjs
+ *  <script>`): the REAL entry is the token AFTER it. */
+const isNestedRuntimeCli = (t: string): boolean => !t.startsWith("-") && !isDispatchEntry(t) && (["tsx", "ts-node"].includes(baseName(t)) || /(^|\/)(tsx|ts-node)\//.test(t));
 
-/** True ONLY when `cmd` is a real, long-running execution of the dispatcher — a JS-runtime argv0, a bare `swarm-dispatch.ts`
- *  entry token (NOT inside an eval flag), and NOT a one-shot invocation. F44-P1-1: a mere mention of the path (an editor, a
- *  grep, a `node -e` whose eval string names the file) is NOT a running loop and must never block a legitimate startup. The
- *  one-shot check mirrors main()'s EXACT parse: `--sweep-once` / `--observe-once` disable the loop ONLY as argv[0] (the FIRST
- *  token after the script entry), so a NON-first `--sweep-once` still runs the loop. */
+/**
+ * F44-P1-1 — true ONLY when `cmd` is a real, long-running execution whose ENTRY is the dispatcher script. It PARSES the command
+ * like a runtime CLI instead of string-searching: unwrap npx/pnpm wrappers; require a JS-runtime program (a Node TOOL whose own
+ * entry is some other script, with swarm-dispatch.ts a mere business ARGUMENT, is NOT the loop); walk the runtime's options to
+ * the first positional (an eval option in ANY form incl. `--eval=` BEFORE the entry ⇒ it runs the eval, not a script; a
+ * value-taking option consumes its value); resolve a nested tsx/ts-node cli to the next positional; the entry itself MUST be
+ * swarm-dispatch.ts. One-shot is then judged ONLY by the first token AFTER the entry (main's argv[0]), so an `-e`/`--eval`/
+ * `--sweep-once` appearing LATER is the dispatcher's own application argument, not an interpreter flag.
+ */
 export function isDispatcherLoopCommand(cmd: string): boolean {
-  const tokens = cmd.trim().split(/\s+/).filter(Boolean);
-  if (tokens.length === 0) return false;
-  const argv0 = tokens[0]!;
-  const base = argv0.slice(argv0.lastIndexOf("/") + 1);
-  if (!JS_RUNTIMES.has(base)) return false;               // not a JS runtime ⇒ a file reference, not an execution
-  if (tokens.some((t) => EVAL_FLAGS.has(t))) return false; // eval-style ⇒ the path is data, not a script entry
-  const entryIdx = tokens.findIndex((t, i) => i > 0 && isScriptEntry(t));
-  if (entryIdx < 0) return false;                          // the dispatcher is not the thing being run
-  const firstArg = tokens[entryIdx + 1];                   // argv[0] from main()'s perspective (process.argv.slice(2)[0])
+  const toks = cmd.trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  if (i >= toks.length) return false;
+  // Unwrap wrappers: `npx [flags (-p/--package take a value)] <prog> …` ; `pnpm [exec|dlx] [flags] <prog> …`.
+  if (baseName(toks[i]!) === "npx") {
+    i += 1;
+    while (i < toks.length && toks[i]!.startsWith("-")) { const f = toks[i]!; i += 1; if ((f === "-p" || f === "--package") && i < toks.length && !toks[i]!.startsWith("-")) i += 1; }
+  } else if (baseName(toks[i]!) === "pnpm") {
+    i += 1;
+    if (i < toks.length && (toks[i] === "exec" || toks[i] === "dlx")) i += 1;
+    while (i < toks.length && toks[i]!.startsWith("-")) i += 1;
+  }
+  // The program must be a JS runtime — otherwise it is a tool/editor/other program whose entry is NOT the dispatcher.
+  if (i >= toks.length || !JS_RUNTIMES.has(baseName(toks[i]!))) return false;
+  i += 1;
+  // Walk runtime options to the first positional (the entry). Returns false if an eval option is seen (not a script run).
+  const skipOpts = (): boolean => {
+    while (i < toks.length && toks[i]!.startsWith("-")) {
+      const t = toks[i]!;
+      if (EVAL_OPT_RE.test(t)) return false;
+      if (!t.includes("=") && VALUE_OPTS.has(t)) i += 2; else i += 1;
+    }
+    return true;
+  };
+  if (!skipOpts()) return false;
+  if (i >= toks.length) return false; // bare runtime, no entry
+  // Resolve a nested tsx/ts-node cli (`node /x/tsx <script>`): the dispatcher entry is its first positional.
+  if (isNestedRuntimeCli(toks[i]!)) { i += 1; if (!skipOpts()) return false; if (i >= toks.length) return false; }
+  if (!isDispatchEntry(toks[i]!)) return false; // the thing actually being run is some OTHER script/tool
+  const firstArg = toks[i + 1]; // main()'s process.argv.slice(2)[0]
   if (firstArg === "--sweep-once" || firstArg === "--observe-once") return false; // one-shot ⇒ not the loop
   return true;
 }

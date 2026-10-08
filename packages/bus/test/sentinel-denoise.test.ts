@@ -129,6 +129,21 @@ describe("F44 sentinel-denoise — ⑤ single-instance process-tree check", () =
     // F44-P1-1: the one-shot exclusion mirrors main()'s EXACT argv[0] parse — a NON-first --sweep-once still runs the loop.
     expect(isDispatcherLoopCommand("node /x/tsx scripts/swarm-dispatch.ts --unused --sweep-once")).toBe(true);
     expect(isDispatcherLoopCommand("node /x/tsx scripts/swarm-dispatch.ts --observe-once")).toBe(false);
+    // F44-P1-1 (round-2): a JS TOOL whose OWN entry is another script, with swarm-dispatch.ts a mere business ARG ⇒ NOT the loop.
+    expect(isDispatcherLoopCommand("node tools/analyze.mjs scripts/swarm-dispatch.ts")).toBe(false);
+    expect(isDispatcherLoopCommand("node /x/node_modules/prettier/bin/prettier.cjs --check scripts/swarm-dispatch.ts")).toBe(false);
+    expect(isDispatcherLoopCommand("npx prettier --check scripts/swarm-dispatch.ts")).toBe(false);
+    expect(isDispatcherLoopCommand("pnpm exec prettier scripts/swarm-dispatch.ts")).toBe(false);
+    // F44-P1-1 (round-2): the `--eval=` EQUALS form is eval-before-entry ⇒ NOT the loop.
+    expect(isDispatcherLoopCommand("node --eval=process.stdout.write('x');setInterval(()=>0,1) scripts/swarm-dispatch.ts")).toBe(false);
+    // F44-P1-1 (round-2): an -e/--eval/-p AFTER the entry is the dispatcher's own application arg ⇒ STILL the loop.
+    expect(isDispatcherLoopCommand("node scripts/swarm-dispatch.ts -e")).toBe(true);
+    expect(isDispatcherLoopCommand("node /x/tsx scripts/swarm-dispatch.ts --eval")).toBe(true);
+    expect(isDispatcherLoopCommand("tsx scripts/swarm-dispatch.ts --unused -p")).toBe(true);
+    // F44-P1-1 (round-2): real wrappers / nested tsx cli / value-taking node options remain DETECTED.
+    expect(isDispatcherLoopCommand("node /x/node_modules/tsx/dist/cli.mjs scripts/swarm-dispatch.ts")).toBe(true);
+    expect(isDispatcherLoopCommand("node --require /x/tsx/preflight.cjs --import file:///x/tsx/loader.mjs scripts/swarm-dispatch.ts")).toBe(true);
+    expect(isDispatcherLoopCommand("pnpm exec tsx scripts/swarm-dispatch.ts")).toBe(true);
   });
   test("selfTree walks self + ancestors via ppid", () => {
     const procs = ps([{ pid: 500, ppid: 400, command: "node .../tsx swarm-dispatch.ts" }, { pid: 400, ppid: 300, command: "npx tsx scripts/swarm-dispatch.ts" }, { pid: 300, ppid: 1, command: "sh" }]);
