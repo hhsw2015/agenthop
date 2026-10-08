@@ -73,8 +73,8 @@ export function validateFanoutRequest(raw: unknown): ValidationResult {
     const uo = u as Record<string, unknown>;
     if (!isStr(uo.key)) return { ok: false, reason: "a unit key is missing or empty" };
     if (!isSafeRunKey(uo.key)) return { ok: false, reason: `unit key must be a safe slug (no separators/traversal): ${uo.key}` };
-    if (seen.has(uo.key)) return { ok: false, reason: `duplicate unit key: ${uo.key}` };
-    seen.add(uo.key);
+    if (seen.has(uo.key.toLowerCase())) return { ok: false, reason: `duplicate unit key (case-insensitive; the output volume may fold case): ${uo.key}` }; // FN5
+    seen.add(uo.key.toLowerCase());
     if (!isStr(uo.prompt)) return { ok: false, reason: `unit ${uo.key}: prompt missing` };
     if (!TASK_CLASSES.has(uo.taskClass as string)) return { ok: false, reason: `unit ${uo.key}: bad taskClass` };
     if (uo.tier !== undefined && !TIERS.has(uo.tier as string)) return { ok: false, reason: `unit ${uo.key}: bad tier` };
@@ -251,6 +251,24 @@ export function budgetExceeded(spent: Spent, cap: FanoutBudget): boolean {
   return false;
 }
 
+// FN1: a per-launch reservation (tokens + USD). The reserve must be finite and non-negative, and EVERY capped
+// domain must carry a POSITIVE estimate — a capped domain with no estimate could never be honored, so bypassing
+// it (reserve 0) is refused up front.
+export type Reserve = { tokens: number; usd: number };
+const finiteNonNeg = (v: number): boolean => Number.isFinite(v) && v >= 0;
+export function reserveValid(reserve: Reserve, cap: FanoutBudget): { ok: true } | { ok: false; reason: string } {
+  if (!finiteNonNeg(reserve.tokens) || !finiteNonNeg(reserve.usd)) return { ok: false, reason: "reserve must be finite and non-negative" };
+  if (cap.maxTokens !== undefined && !(reserve.tokens > 0)) return { ok: false, reason: "maxTokens is capped but no positive token estimate was given" };
+  if (cap.maxUsd !== undefined && !(reserve.usd > 0)) return { ok: false, reason: "maxUsd is capped but no positive USD estimate was given" };
+  return { ok: true };
+}
+// FN1: admit a launch iff, for EVERY capped domain, spent + reserve does not EXCEED the cap (exactly-equal is allowed).
+export function reservationFits(spent: Reserve, reserve: Reserve, cap: FanoutBudget): boolean {
+  if (cap.maxTokens !== undefined && spent.tokens + reserve.tokens > cap.maxTokens) return false;
+  if (cap.maxUsd !== undefined && spent.usd + reserve.usd > cap.maxUsd) return false;
+  return true;
+}
+
 // ---------- lifecycle reconciliation (orphan sweep, zone ownership, depth cap) ----------
 export const DEFAULT_MAX_DEPTH = 2; // a fan-out unit may not itself fan out beyond this depth (recursion-bomb guard)
 
@@ -311,6 +329,10 @@ export type BudgetTicket = { runKey: string; maxTokens?: number; maxUsd?: number
 export function validBudgetTicket(obj: unknown, runKey: string): boolean {
   const o = obj as Partial<BudgetTicket> | null;
   if (!o || o.runKey !== runKey || typeof o.issuedAt !== "number" || !Number.isFinite(o.issuedAt)) return false;
+  // FN7: EVERY provided cap must be valid (a present-but-non-finite maxTokens can't be excused by a valid maxUsd),
+  // then at least one valid cap must exist.
+  if (o.maxTokens !== undefined && !posFinite(o.maxTokens)) return false;
+  if (o.maxUsd !== undefined && !posFinite(o.maxUsd)) return false;
   return posFinite(o.maxTokens) || posFinite(o.maxUsd);
 }
 
@@ -332,5 +354,8 @@ export function planResume(prior: readonly LedgerRow[], units: readonly FanoutUn
 // must not vanish, so the aggregate stays honest and the receipt is not falsely accepted over missing units.
 // Immutable.
 export function markAborted(rows: readonly LedgerRow[]): LedgerRow[] {
-  return rows.map((r) => (r.status === "running" ? { ...r, status: "aborted" as UnitStatus } : r));
+  // FN2: abort ONLY a never-launched row (running with NO pid). A running row WITH a pid is in-flight (a carried
+  // still-live unit or one this run launched) — orphan-sweep turns a dead pid into timeout; a live one stays
+  // running, never aborted (which would wrongly re-run a live task next replay).
+  return rows.map((r) => (r.status === "running" && r.pid === undefined ? { ...r, status: "aborted" as UnitStatus } : r));
 }

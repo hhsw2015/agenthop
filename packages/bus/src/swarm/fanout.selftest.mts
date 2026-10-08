@@ -4,8 +4,8 @@
 import {
   admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, degradeDisplay,
   effectiveTier, elapsedTimedOut, isSafeRunKey, isTerminal, markAborted, newLedgerRow, nextReceipt, parseDepth,
-  planResume, progress, reconcileOrphans, reduceUnits, validateFanoutRequest, validBudgetTicket, validRoiEstimate,
-  widthClass, widthGate, zoneName, type FanoutUnit, type LedgerRow, type UnitResult,
+  planResume, progress, reconcileOrphans, reduceUnits, reservationFits, reserveValid, validateFanoutRequest,
+  validBudgetTicket, validRoiEstimate, widthClass, widthGate, zoneName, type FanoutUnit, type LedgerRow, type UnitResult,
 } from "./fanout.js";
 
 const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED: " + name); console.log("ok  " + name); };
@@ -28,6 +28,7 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("isSafeRunKey: plain slug ok", isSafeRunKey("r1") && isSafeRunKey("a.b-c_d"));
   t("isSafeRunKey: traversal/separator/empty/leading-dot rejected (FN5)", !isSafeRunKey("../x") && !isSafeRunKey("a/b") && !isSafeRunKey("..") && !isSafeRunKey("") && !isSafeRunKey(".hidden"));
   t("unit KEY path-traversal rejected (FN5 round-3)", validateFanoutRequest({ ...okReq(), units: [unit("../foreign")] }).ok === false);
+  t("case-insensitive duplicate unit keys rejected (FN5 round-4)", validateFanoutRequest({ ...okReq(), units: [unit("item"), unit("ITEM")] }).ok === false);
   t("visible:true accepted (FN4 opt-in)", validateFanoutRequest({ ...okReq(), visible: true }).ok === true);
   t("visible non-boolean rejected (FN4)", validateFanoutRequest({ ...okReq(), visible: "yes" }).ok === false);
   t("bad taskClass rejected", validateFanoutRequest({ ...okReq(), units: [unit("u", "nope" as unknown as FanoutUnit["taskClass"])] }).ok === false);
@@ -192,6 +193,20 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("Infinity maxTokens rejected (FN7)", validBudgetTicket({ runKey: "r1", maxTokens: Infinity, issuedAt: 1 }, "r1") === false);
   t("NaN maxUsd rejected (FN7)", validBudgetTicket({ runKey: "r1", maxUsd: NaN, issuedAt: 1 }, "r1") === false);
   t("Infinity ROI ratio rejected (FN7)", validRoiEstimate({ runKey: "r1", speedupRatio: Infinity, costRatio: 1 }, "r1") === false);
+  t("mixed ticket: a non-finite maxTokens is rejected even with a valid maxUsd (FN7 round-4)", validBudgetTicket({ runKey: "r1", maxTokens: Infinity, maxUsd: 1, issuedAt: 1 }, "r1") === false);
+}
+
+// --- FN1 round-4: reservation validity (estimate required for a capped domain) + fit (equal allowed) ---
+{
+  t("reserveValid: finite non-neg, no caps -> ok", reserveValid({ tokens: 5, usd: 0 }, {}).ok === true);
+  t("reserveValid: negative reserve rejected (FN1)", reserveValid({ tokens: -1, usd: 0 }, {}).ok === false);
+  t("reserveValid: NaN reserve rejected", reserveValid({ tokens: NaN, usd: 0 }, {}).ok === false);
+  t("reserveValid: capped USD but no estimate -> refuse (FN1)", reserveValid({ tokens: 5, usd: 0 }, { maxUsd: 1 }).ok === false);
+  t("reserveValid: capped USD WITH estimate -> ok", reserveValid({ tokens: 5, usd: 0.01 }, { maxUsd: 1 }).ok === true);
+  t("reserveValid: capped tokens but no estimate -> refuse", reserveValid({ tokens: 0, usd: 0 }, { maxTokens: 8 }).ok === false);
+  t("reservationFits: exactly-equal is allowed (FN1)", reservationFits({ tokens: 0, usd: 0 }, { tokens: 8, usd: 0 }, { maxTokens: 8 }) === true);
+  t("reservationFits: over the token cap rejected", reservationFits({ tokens: 4, usd: 0 }, { tokens: 8, usd: 0 }, { maxTokens: 8 }) === false);
+  t("reservationFits: over the USD cap rejected", reservationFits({ tokens: 0, usd: 1 }, { tokens: 0, usd: 0.5 }, { maxUsd: 1 }) === false);
 }
 
 // --- FN2: resume reuses prior DONE rows by key, never re-runs them ---
@@ -216,6 +231,7 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("done -> unchanged", aborted[0]!.status === "done");
   t("aborted is terminal", isTerminal("aborted") === true);
   t("markAborted is immutable", rows[1]!.status === "running");
+  t("a LIVE-pid running row is NOT aborted (FN2 round-4)", markAborted([{ id: "x", key: "x", backend: "self-built", displayMode: "headless", tier: "cheap", status: "running", pid: 12345 }])[0]!.status === "running");
   const red = reduceUnits([{ key: "b", status: "aborted" }]);
   t("aborted reduces to an error item (honest aggregate)", (red.items[0]?.error ?? "").length > 0 && red.allTerminal === true);
   t("aborted counts as failed in progress", progress(aborted).failed === 1);

@@ -18,11 +18,11 @@ import {
   buildWorkspaceRename, doneMarker, paneIdFromSplit, rcFile, unitCommand, workspaceFromCreate,
 } from "../packages/bus/src/swarm/fanout-herdr.js";
 import {
-  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, degradeDisplay, effectiveTier,
+  admitDepth, canReapZone, chooseDisplayMode, classifyExit, degradeDisplay, effectiveTier,
   elapsedTimedOut, markAborted, newLedgerRow, nextReceipt, parseDepth, planResume, reconcileOrphans, reduceUnits,
-  validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthGate, zoneName, type AggregateReceipt,
-  type DisplayMode, type FanoutBudget, type FanoutRequest, type FanoutUnit, type FanoutTier, type LedgerRow,
-  type Spent, type UnitResult,
+  reservationFits, reserveValid, validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthGate, zoneName,
+  type AggregateReceipt, type DisplayMode, type FanoutBudget, type FanoutRequest, type FanoutUnit, type FanoutTier,
+  type LedgerRow, type Spent, type UnitResult,
 } from "../packages/bus/src/swarm/fanout.js";
 
 export const fanoutEnabled = (env: NodeJS.ProcessEnv = process.env): boolean => /^(1|true|yes|on)$/i.test(env.SWARM_FANOUT ?? "");
@@ -35,7 +35,7 @@ const fanoutDir = (home: string): string => path.join(home, ".agenthop", "swarm"
 const runDir = (home: string, runKey: string): string => path.join(fanoutDir(home), runKey);
 const ledgerPath = (home: string, runKey: string): string => path.join(runDir(home, runKey), "ledger.json");
 const aggregatePath = (home: string, runKey: string): string => path.join(runDir(home, runKey), "aggregate.json");
-const cleanupPendingPath = (home: string, runKey: string): string => path.join(runDir(home, runKey), "cleanup-pending.json");
+const cleanupPendingPath = (home: string, zoneId: string): string => path.join(fanoutDir(home), "cleanup-pending", `${zoneId}.json`); // FN4: per-ZONE (never overwrites across leaked zones)
 const lockPath = (home: string, runKey: string): string => path.join(runDir(home, runKey), "run.lock");
 const outFile = (home: string, runKey: string, key: string): string => path.join(runDir(home, runKey), `${key}.out`);
 const leasesDir = (home: string): string => path.join(fanoutDir(home), "leases");
@@ -63,11 +63,18 @@ function readLedgerState(home: string, runKey: string): LedgerState | null {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw new Error(`fanout ledger unreadable (${p}): ${(e as Error).message}`);
   }
+  let parsed: unknown;
   try {
-    return JSON.parse(raw) as LedgerState;
+    parsed = JSON.parse(raw);
   } catch {
     throw new Error(`fanout ledger corrupt (${p}); refusing to start (prior state unknown)`);
   }
+  // FN2: validate SHAPE + IDENTITY — null/{}/an array/a foreign runKey is corrupt, never a fresh run.
+  const o = parsed as Partial<LedgerState> | null;
+  if (typeof o !== "object" || o === null || Array.isArray(o) || o.runKey !== runKey || !Array.isArray(o.rows)) {
+    throw new Error(`fanout ledger malformed or foreign (${p}); refusing to start`);
+  }
+  return o as LedgerState;
 }
 const writeLedger = (home: string, runKey: string, rows: readonly LedgerRow[], receipt: AggregateReceipt | undefined, spent: Spent): boolean =>
   writeJsonAtomic(ledgerPath(home, runKey), { runKey, rows, receipt, spent, updatedAt: Date.now() });
@@ -98,8 +105,11 @@ function acquireLease(home: string, cap: number, label: string): string | null {
   try {
     for (const f of readdirSync(dir)) {
       if (!f.endsWith(".lease")) continue;
-      const rec = readJsonOrNull(path.join(dir, f)) as { pid?: number } | null;
-      if (!rec || typeof rec.pid !== "number" || !pidAlive(rec.pid)) rmSync(path.join(dir, f), { force: true });
+      const rec = readJsonOrNull(path.join(dir, f)) as { pid?: number; childPid?: number } | null;
+      // FN9: a lease binds the ACTUAL execution. Once a child pid is recorded, the slot is held while the CHILD
+      // lives (even if the driver died); before a child is bound, it is held while the driver lives.
+      const alive = rec ? (rec.childPid !== undefined ? pidAlive(rec.childPid) : typeof rec.pid === "number" && pidAlive(rec.pid)) : false;
+      if (!alive) rmSync(path.join(dir, f), { force: true });
     }
     if (readdirSync(dir).filter((f) => f.endsWith(".lease")).length >= cap) return null;
     const file = path.join(dir, `${process.pid}-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.lease`);
@@ -109,6 +119,12 @@ function acquireLease(home: string, cap: number, label: string): string | null {
   }
 }
 const releaseLease = (file: string | null): void => { if (file) rmSync(file, { force: true }); };
+// FN9: bind the lease to the detached child's pid, so capacity is not released until the child's terminal state.
+function bindLeaseChild(file: string | null, childPid: number): void {
+  if (!file) return;
+  const rec = readJsonOrNull(file) as Record<string, unknown> | null;
+  if (rec) writeJsonAtomic(file, { ...rec, childPid });
+}
 
 // ---- width evidence (FN7): env carries a POINTER to the evidence file, never the evidence itself ----
 function widthEvidence(env: NodeJS.ProcessEnv, runKey: string): { hasRoiEstimate: boolean; hasBudgetTicket: boolean; ticket: FanoutBudget | null } {
@@ -141,6 +157,7 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
   try {
     // FN2: resume — corrupt ledger throws; reuse prior DONE by key; carry a still-live or quarantined prior row.
     const prior = readLedgerState(home, req.runKey);
+    if (prior?.receipt?.accepted) return { rows: prior.rows ?? [], receipt: prior.receipt }; // FN3: an accepted run is immutable — never modify its results or receipt
     const priorRows = prior?.rows ?? [];
     const priorReceipt = prior?.receipt;
     const spent = { tokens: prior?.spent?.tokens ?? 0, usd: prior?.spent?.usd ?? 0 }; // FN1: durable cumulative spend (concrete numbers)
@@ -160,6 +177,10 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
     const gate = widthGate(req.units.length, { hasRoiEstimate: ev.hasRoiEstimate, hasBudgetTicket: ev.hasBudgetTicket });
     if (!gate.admit) throw new Error(`fanout width gate refused (${req.units.length} units): ${gate.reason}`);
     const cap: FanoutBudget = ev.ticket ?? req.budget;
+    // FN1: validate the per-launch reservation up front — a capped domain with no positive estimate is refused.
+    const reserve = { tokens: numEnv(env, "FANOUT_UNIT_TOKEN_EST", 50000, 0), usd: Number(env.FANOUT_UNIT_USD_EST ?? 0) || 0 };
+    const rv = reserveValid(reserve, cap);
+    if (!rv.ok) throw new Error(`fanout reservation invalid: ${rv.reason}`);
 
     // FN4: headless default; the temp-workspace visible chain is an explicit opt-in.
     const requested: DisplayMode = chooseDisplayMode(req.units.length, await herdrServerReachable(), req.visible === true);
@@ -191,8 +212,6 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
     const perRunCap = numEnv(env, "FANOUT_CONCURRENCY", 5, 1);
     const globalCap = numEnv(env, "FANOUT_GLOBAL_CONCURRENCY", 16, 1);
     const timeoutMs = numEnv(env, "FANOUT_UNIT_TIMEOUT_MS", 900000, 1000);
-    const tokenReserve = numEnv(env, "FANOUT_UNIT_TOKEN_EST", 50000, 0); // FN1 conservative token reservation
-    const usdReserve = Number(env.FANOUT_UNIT_USD_EST ?? 0) || 0; // FN1 conservative USD reservation
 
     let bi = 0;
     while (bi < runnable.length) {
@@ -200,24 +219,26 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
       bi += perRunCap;
       const settles: Array<Promise<void>> = [];
       for (const l of batch) {
-        // FN1: the reservation must FIT before launch (pre-check spent + reserve, no overshoot).
-        if (budgetExceeded({ tokens: spent.tokens + tokenReserve, usd: spent.usd + usdReserve }, cap)) { bi = runnable.length; break; }
+        // FN1: the reservation must FIT before launch (pre-check spent + reserve; exactly-equal allowed, over rejected).
+        if (!reservationFits(spent, reserve, cap)) { bi = runnable.length; break; }
         // FN9: acquire a cross-run lease; NEVER launch without one.
         let lease: string | null = null;
         for (let a = 0; a < 30 && !(lease = acquireLease(home, globalCap, l.row.key)); a++) await sleep(1000);
         if (!lease) { bi = runnable.length; break; } // no admission -> stop launching (remaining stay running -> aborted)
         l.lease = lease;
-        spent.tokens += tokenReserve; spent.usd += usdReserve; // FN1: reserve BEFORE spawn
+        spent.tokens += reserve.tokens; spent.usd += reserve.usd; // FN1: reserve BEFORE spawn
         if (!writeLedger(home, req.runKey, rows, priorReceipt, spent)) { releaseLease(lease); l.lease = null; bi = runnable.length; break; } // durable spend; fail -> no launch
         l.row.startedAt = Date.now();
+        try { rmSync(l.row.outputPtr!, { force: true }); rmSync(rcFile(l.row.outputPtr!), { force: true }); } catch { /* FN8: clear stale evidence so an old rc/output can't impersonate THIS launch */ }
         const model = tierModel(effectiveTier(unitOfRow(req, l.row)), env);
         if (mode === "headless") {
           const r = await spawnAgent({ tool: "claude", task: promptOfRow(req, l.row), visible: false, ...(cwdOfRow(req, l.row) ? { cwd: cwdOfRow(req, l.row)! } : {}) }, { ...env, ANTHROPIC_MODEL: model, FANOUT_DEPTH: String(depth + 1) });
           l.row.spawnOk = r.ok;
           if (r.launchId !== undefined) l.row.id = r.launchId;
-          if (r.pid !== undefined) l.row.pid = r.pid;
+          if (r.pid !== undefined) { l.row.pid = r.pid; bindLeaseChild(lease, r.pid); } // FN9: the lease now binds the child's life
           if (r.outputFile !== undefined) l.row.outputPtr = r.outputFile;
           if (!r.ok) { l.row.status = "failed"; l.row.endedAt = Date.now(); } // FN8: launch failure keeps its reason immediately
+          else if (r.pid === undefined) { l.row.status = "delivery_uncertain"; l.row.endedAt = Date.now(); } // FN2: launched but no handle -> quarantine, never re-run
         } else {
           const split = paneIdFromSplit((await herdrExec(env, buildPaneSplitIn(lastPane ?? "", cwdOfRow(req, l.row) ?? process.cwd()))).json);
           if (split) {
@@ -257,7 +278,10 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
     // FN4: reap ONLY the zone we opened, in finally (exception-safe); a failed close leaves a durable cleanup todo.
     if (zone && zoneId && canReapZone(zone, new Set([req.runKey]))) {
       const { exitFailed } = await herdrExec(env, buildWorkspaceClose(zoneId)).catch(() => ({ exitFailed: true, json: null }));
-      if (exitFailed) writeJsonAtomic(cleanupPendingPath(home, req.runKey), { zone, zoneId, note: "workspace close failed; a later sweep must reap it", ts: Date.now() });
+      if (exitFailed) {
+        const wrote = writeJsonAtomic(cleanupPendingPath(home, zoneId), { zone, zoneId, runKey: req.runKey, note: "workspace close failed; a later sweep must reap it", ts: Date.now() });
+        if (!wrote) console.error(`swarm-fanout: LEAKED zone ${zoneId} (${zone}) — close failed AND the cleanup todo could not be recorded; manual reap required`); // FN4: explicit hand-back, never silent
+      }
     }
     releaseRun();
   }
