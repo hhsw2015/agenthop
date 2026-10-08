@@ -109,4 +109,29 @@ describe("dual-bandwidth pure core", () => {
     expect(() => computeDualBandwidth({ nowSec: NOW, produceAtSec: [], consumeAtSec: [], backlog: -1 })).toThrow(/backlog/);
     expect(() => computeDualBandwidth({ nowSec: NaN, produceAtSec: [], consumeAtSec: [], backlog: 0 })).toThrow(/nowSec/);
   });
+
+  test("T52-P2-4: far-future timestamps (beyond skew) are ignored, never inflating the window or total", () => {
+    const yearOut = Array.from({ length: 10 }, () => NOW + 365 * 24 * 3600);
+    const r = run({ produceAtSec: inLastHour(1), consumeAtSec: yearOut, backlog: 1 });
+    expect(r.bCons1h).toBe(0); // the 10 future "consumes" do not count
+    expect(r.bConsTotal).toBe(0); // nor in the cumulative base
+    expect(r.zone).toBe("red"); // producing + backlog with genuinely zero consumption ⇒ not downgraded to green
+  });
+
+  test("T52-P2-4: minor clock skew within tolerance still counts", () => {
+    const r = run({ consumeAtSec: [NOW + 100] }); // 100s ahead ≤ default 300s skew
+    expect(r.bCons1h).toBe(1);
+    const strict = run({ consumeAtSec: [NOW + 100], config: { skewToleranceSec: 10 } }); // now past a 10s tolerance
+    expect(strict.bCons1h).toBe(0);
+  });
+
+  test("T52-P2-5: a sub-1 windowSec (rate underflow) and a negative skew are rejected", () => {
+    expect(() => run({ config: { windowSec: 5e-324 } })).toThrow(/windowSec/);
+    expect(() => run({ config: { windowSec: 0.5 } })).toThrow(/windowSec/);
+    expect(() => run({ config: { skewToleranceSec: -1 } })).toThrow(/skewToleranceSec/);
+    // and a valid large window still yields finite numbers
+    const r = run({ produceAtSec: inLastHour(3600), consumeAtSec: inLastHour(1), config: { windowSec: 3600 } });
+    expect(Number.isFinite(r.bProd1h)).toBe(true);
+    expect(Number.isFinite(r.ratio!)).toBe(true);
+  });
 });

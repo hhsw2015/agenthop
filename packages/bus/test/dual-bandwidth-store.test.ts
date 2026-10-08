@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, chmodSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { openBatch, writeDecisions, consumeDecisions } from "../src/swarm/decision-batch-store.js";
@@ -127,5 +127,61 @@ describe("dual-bandwidth IO store", () => {
     mkdirSync(gaugeDir, { recursive: true });
     writeFileSync(path.join(gaugeDir, "gauge.json"), JSON.stringify({ schema: "other" }));
     expect(readBandwidthProjection(h)).toBeNull();
+  });
+
+  test("T52-P2-1: a batches-dir access fault propagates (never a false-green all-zero)", () => {
+    if (process.getuid && process.getuid() === 0) return; // chmod EACCES injection is a no-op for root
+    const h = mkHome();
+    openBatch(h, { owner: "coord", items: items(1), nowSec: nowSec() });
+    const bdir = batchesDir(h);
+    chmodSync(bdir, 0o000);
+    try { expect(() => collectBandwidthEvents(h)).toThrow(); } // must NOT swallow EACCES and return all-zero
+    finally { chmodSync(bdir, 0o755); }
+  });
+
+  test("T52-P2-2: consume counts ONLY decisions matching this batch; unknown ids excluded", () => {
+    const h = mkHome();
+    const t = nowSec();
+    openBatch(h, { batchId: "b1", owner: "coord", items: items(1), nowSec: t });
+    writeDecisions(h, { batchId: "b1", decidedAtSec: t, decisions: [
+      { id: "it0", verdict: "approve" }, { id: "ghost1", verdict: "approve" }, { id: "ghost2", verdict: "reject" }, { id: "ghost3", verdict: "defer" },
+    ] });
+    consumeDecisions(h, "b1");
+    expect(collectBandwidthEvents(h).consumeAtSec.length).toBe(1); // only it0 matched; the 3 ghosts are not B_cons
+  });
+
+  test("T52-P2-2: a wrong-batch consumed.json does not prove this batch consumed", () => {
+    const h = mkHome();
+    const t = nowSec();
+    openBatch(h, { batchId: "b1", owner: "coord", items: items(2), nowSec: t });
+    writeFileSync(path.join(batchesDir(h), "b1", "consumed.json"), JSON.stringify({ batchId: "OTHER", decidedAtSec: t, consumedAtMs: Date.now(), digest: "x" }));
+    const ev = collectBandwidthEvents(h);
+    expect(ev.consumeAtSec.length).toBe(0); // foreign receipt ignored
+    expect(ev.backlog).toBe(2); // treated as NOT consumed ⇒ its items are backlog
+  });
+
+  test("T52-P2-3: a claimed-but-uncommitted verdict is not re-counted as backlog", () => {
+    const h = mkHome();
+    const t = nowSec();
+    openBatch(h, { batchId: "b1", owner: "coord", items: items(3), nowSec: t });
+    writeDecisions(h, { batchId: "b1", decidedAtSec: t, decisions: [{ id: "it0", verdict: "approve" }] }); // 1 decided ⇒ backlog 2
+    // simulate consumeDecisions that CLAIMED decisions.json then faulted before committing consumed.json:
+    renameSync(path.join(batchesDir(h), "b1", "decisions.json"), path.join(batchesDir(h), "b1", "decisions-consumed-claim.json"));
+    const ev = collectBandwidthEvents(h);
+    expect(ev.consumeAtSec.length).toBe(0); // no consumed.json ⇒ not consumed
+    expect(ev.backlog).toBe(2); // it1, it2 undecided; the claimed it0 is recognized (was wrongly 3 before the fix)
+  });
+
+  test("T52-P2-5: reader rejects same-schema objects that are structurally or numerically invalid", () => {
+    const h = mkHome();
+    const gaugeDir = path.join(h, ".agenthop", "console", "bandwidth-gauge");
+    mkdirSync(gaugeDir, { recursive: true });
+    const full = { schema: "bandwidth-gauge/v1", generatedAtSec: 1, prod: { ratePerHour: 1, sessionTotal: 1 }, cons: { ratePerHour: 1, sessionTotal: 1 }, ratio: null, backlog: 0, backlogGrowthPerHour: 0, drainHours: null, zone: "green", windowSec: 3600 };
+    const w = (o: unknown) => writeFileSync(path.join(gaugeDir, "gauge.json"), JSON.stringify(o));
+    w(full); expect(readBandwidthProjection(h)).not.toBeNull(); // the valid baseline
+    w({ ...full, cons: undefined }); expect(readBandwidthProjection(h)).toBeNull(); // missing required pair
+    w({ ...full, zone: "purple" }); expect(readBandwidthProjection(h)).toBeNull(); // bad zone
+    w({ ...full, prod: { ratePerHour: null, sessionTotal: 1 } }); expect(readBandwidthProjection(h)).toBeNull(); // non-finite rate (a serialized NaN)
+    w({ ...full, backlog: "x" }); expect(readBandwidthProjection(h)).toBeNull(); // wrong type
   });
 });

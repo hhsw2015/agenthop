@@ -19,16 +19,18 @@
  * ENOENT = absent (skip); any other read error (EACCES/…) PROPAGATES — a read fault is never silently treated as "no events".
  */
 
-import { mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, statSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
-import { listBatches, readBatch, readDecisions } from "./decision-batch-store.js";
+import { readBatch, readDecisions } from "./decision-batch-store.js";
 import { resolveBatch, validDecisionsDoc, type DecisionsDoc } from "./decision-batch.js";
 import { computeDualBandwidth, type DualBandwidthReading, type DualBandwidthConfig } from "./dual-bandwidth.js";
 
 function batchesDir(home: string): string { return path.join(home, ".agenthop", "console", "decision-batches"); }
+function batchJsonPath(home: string, id: string): string { return path.join(batchesDir(home), id, "batch.json"); }
 function consumedPath(home: string, id: string): string { return path.join(batchesDir(home), id, "consumed.json"); }
 function claimPath(home: string, id: string): string { return path.join(batchesDir(home), id, "decisions-consumed-claim.json"); }
+function rejectedClaimPath(home: string, id: string): string { return path.join(batchesDir(home), id, "decisions-rejected-claim.json"); }
 function gaugeDir(home: string): string { return path.join(home, ".agenthop", "console", "bandwidth-gauge"); }
 function gaugePath(home: string): string { return path.join(gaugeDir(home), "gauge.json"); }
 
@@ -43,25 +45,64 @@ function readJsonOrNull(file: string): unknown {
 
 export type BandwidthEvents = { produceAtSec: number[]; consumeAtSec: number[]; backlog: number };
 
-/** Scan the decision-batch directory into the pure core's inputs. Read-only; a per-batch corrupt/absent file is skipped, not fatal. */
+/** STRICT enumeration of batch ids (T52-P2-1): unlike the lenient listBatches, an access fault (EACCES) on the batches dir or a
+ *  sub-dir's batch.json PROPAGATES — it is never folded to "no batches", which would overwrite a RED projection with a false
+ *  GREEN. ENOENT (no batches dir yet, or a dir with no batch.json) is a genuine absence and is skipped. */
+function listBatchIdsStrict(home: string): string[] {
+  let entries;
+  try { entries = readdirSync(batchesDir(home), { withFileTypes: true }); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
+  const ids: string[] = [];
+  for (const d of entries) {
+    if (!d.isDirectory()) continue;
+    try { statSync(batchJsonPath(home, d.name)); ids.push(d.name); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; throw e; } // a sub-dir access fault must NOT silently vanish
+  }
+  return ids;
+}
+
+/** A terminal `consumed.json` only proves THIS batch consumed when it is BOUND to it (batchId === id) and carries a finite
+ *  consumedAtMs (T52-P2-2: a wrong-batch receipt proves nothing). */
+function boundConsumedAtMs(raw: unknown, id: string): number | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (r.batchId !== id) return null;
+  return typeof r.consumedAtMs === "number" && Number.isFinite(r.consumedAtMs) ? r.consumedAtMs : null;
+}
+
+/** A DecisionsDoc at `file` that is valid AND bound to this batch (batchId === id), else null. */
+function readBoundDoc(file: string, id: string): DecisionsDoc | null {
+  const doc = validDecisionsDoc(readJsonOrNull(file));
+  return doc && doc.batchId === id ? doc : null;
+}
+
+/** Scan the decision-batch directory into the pure core's inputs. READ-ONLY (never the mutating consumeDecisions); a per-batch
+ *  corrupt/foreign file is skipped, but an ACCESS fault propagates (via listBatchIdsStrict / readBatch / readJsonOrNull). */
 export function collectBandwidthEvents(home: string): BandwidthEvents {
   const produceAtSec: number[] = [];
   const consumeAtSec: number[] = [];
   let backlog = 0;
-  for (const id of listBatches(home)) {
-    const batch = readBatch(home, id); // dir-bound; a foreign/garbled batch.json reads as null
+  for (const id of listBatchIdsStrict(home)) {
+    const batch = readBatch(home, id); // dir-bound; a foreign/garbled batch.json reads as null (throws on an access fault)
     if (!batch) continue;
     for (let i = 0; i < batch.items.length; i += 1) produceAtSec.push(batch.createdAtSec); // one produce event per pending item, at open time
-    const consumed = readJsonOrNull(consumedPath(home, id)) as { consumedAtMs?: unknown } | null;
-    if (consumed && typeof consumed.consumedAtMs === "number" && Number.isFinite(consumed.consumedAtMs)) {
-      // CONSUMED: each decision in the claim doc is a consume event at the consume time.
-      const claim = validDecisionsDoc(readJsonOrNull(claimPath(home, id)));
-      const n = claim && claim.batchId === id ? claim.decisions.length : 0;
-      const atSec = consumed.consumedAtMs / 1000; // consumedAtMs is epoch MS; the pure core is in seconds
-      for (let i = 0; i < n; i += 1) consumeAtSec.push(atSec);
+    const consumedAtMs = boundConsumedAtMs(readJsonOrNull(consumedPath(home, id)), id);
+    if (consumedAtMs !== null) {
+      // CONSUMED (bound terminal): count ONLY decisions that MATCH this batch's items (T52-P2-2) — resolved excludes unknownIds and
+      // a wrong-batch claim; approve/reject/defer all count (ruling (3), defer is a real decision). One consume event per match.
+      const claim = readBoundDoc(claimPath(home, id), id);
+      const matched = claim ? resolveBatch(batch, claim).resolved.length : 0;
+      const atSec = consumedAtMs / 1000; // consumedAtMs is epoch MS; the pure core is in seconds
+      for (let i = 0; i < matched; i += 1) consumeAtSec.push(atSec);
     } else {
-      // NOT consumed: its undecided items are current backlog (read-only; never calls the mutating consumeDecisions).
-      const doc: DecisionsDoc = readDecisions(home, id) ?? { batchId: id, decidedAtSec: 0, decisions: [] };
+      // NOT consumed: backlog = undecided under the FRESHEST valid verdicts (T52-P2-3) — decisions.json wins, else an in-flight
+      // consumed-claim (a consume that claimed but faulted before committing), else a recoverable rejected-claim. Read-only; the
+      // priority of a fresh decisions.json is preserved, and a claimed-but-uncommitted verdict is NOT re-counted as backlog.
+      const doc: DecisionsDoc =
+        readDecisions(home, id) ??
+        readBoundDoc(claimPath(home, id), id) ??
+        readBoundDoc(rejectedClaimPath(home, id), id) ??
+        { batchId: id, decidedAtSec: 0, decisions: [] };
       backlog += resolveBatch(batch, doc).undecided.length;
     }
   }
@@ -122,10 +163,19 @@ export function writeBandwidthProjection(home: string, nowSec: number, config?: 
   return reading;
 }
 
-/** Read the current projection (console/tests). ENOENT ⇒ null; other read errors propagate; a corrupt file ⇒ null. */
+/** Read the current projection (console/tests). ENOENT ⇒ null; other read errors propagate; a corrupt / structurally-or-numerically
+ *  INVALID file ⇒ null (T52-P2-5: the schema string alone is not enough — required fields must exist and be finite; ratio/drainHours
+ *  may be null but never NaN/Infinity; zone must be a known value). */
 export function readBandwidthProjection(home: string): BandwidthProjection | null {
   const raw = readJsonOrNull(gaugePath(home));
   if (raw === null || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
-  return r.schema === "bandwidth-gauge/v1" ? (raw as BandwidthProjection) : null;
+  if (r.schema !== "bandwidth-gauge/v1") return null;
+  const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+  const pair = (v: unknown): boolean => v !== null && typeof v === "object" && num((v as Record<string, unknown>).ratePerHour) && num((v as Record<string, unknown>).sessionTotal);
+  const nullable = (v: unknown): boolean => v === null || num(v);
+  if (!num(r.generatedAtSec) || !pair(r.prod) || !pair(r.cons)) return null;
+  if (!nullable(r.ratio) || !num(r.backlog) || !num(r.backlogGrowthPerHour) || !nullable(r.drainHours)) return null;
+  if (!num(r.windowSec) || (r.zone !== "green" && r.zone !== "amber" && r.zone !== "red")) return null;
+  return raw as BandwidthProjection;
 }

@@ -40,7 +40,11 @@ Code: `packages/bus/src/swarm/dual-bandwidth.ts` (pure core) + `dual-bandwidth-s
     low-priority, merge 呈批).
   - **RED**: ratio > 1.2 (or producing with ZERO consumption) or backlog > hard cap or drainHours > horizon (a never-drains backlog
     exceeds any horizon) → coordinator THROTTLES thread-opening (R18). Throttle = open fewer threads, NOT an approval hop.
-  - Defaults: window 3600s, amber 0.8, red 1.2, soft cap 20, hard cap 50, drain horizon 8h.
+  - Defaults: window 3600s, amber 0.8, red 1.2, soft cap 20, hard cap 50, drain horizon 8h, future-skew tolerance 300s.
+- **Window bounds (T52-P2-4):** the rolling window is `(now - windowSec, now + skewToleranceSec]`. An event dated past
+  `now + skewToleranceSec` (a clock bug / bogus data — e.g. a verdict a year out) is IGNORED, in both the window rate AND the
+  session total, so it can never lower the current backlog's alert level. `windowSec` must be ≥ 1 (a sub-second window underflows
+  the per-hour rate to Infinity/NaN and is rejected); `skewToleranceSec` ≥ 0.
 
 ## Projection (frozen read contract) — `$HOME/.agenthop/console/bandwidth-gauge/gauge.json`
 
@@ -70,7 +74,9 @@ severity in those cases.
   absent, other read errors THROW; a corrupt/foreign per-batch file is skipped, never fatal).
 - IO `computeGauge(home, nowSec, config?) → reading`.
 - IO `writeBandwidthProjection(home, nowSec, config?) → reading` (computes + atomically writes the projection).
-- IO `readBandwidthProjection(home) → projection|null` (console/tests; wrong-schema or absent ⇒ null).
+- IO `readBandwidthProjection(home) → projection|null` (console/tests). Validates STRUCTURE + NUMERICS, not just the schema string
+  (T52-P2-5): required prod/cons pairs with finite rate+total, finite generatedAtSec/backlog/backlogGrowthPerHour/windowSec, a known
+  zone, and ratio/drainHours that are null or finite (never a serialized NaN); anything absent / wrong-schema / invalid ⇒ null.
 
 ## Source boundary (v0)
 

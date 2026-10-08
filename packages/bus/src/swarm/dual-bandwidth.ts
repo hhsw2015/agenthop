@@ -31,6 +31,7 @@ export type DualBandwidthConfig = {
   backlogSoftCap?: number;     // backlog at/above this ⇒ at least AMBER (default 20)
   backlogHardCap?: number;     // backlog above this ⇒ RED (default 50)
   tDrainHorizonHours?: number; // drain time above this ⇒ RED (default 8)
+  skewToleranceSec?: number;   // max future clock skew tolerated; an event past now+this is IGNORED (default 300 = 5min, T52-P2-4)
 };
 
 /** One gauge reading. Rates are PER HOUR. `ratio` / `tDrainHours` are null when undefined (no consumption in the window): a
@@ -55,12 +56,13 @@ export type DualBandwidthInput = {
   config?: DualBandwidthConfig;
 };
 
-const DEFAULTS = { windowSec: 3600, amberRatio: 0.8, redRatio: 1.2, backlogSoftCap: 20, backlogHardCap: 50, tDrainHorizonHours: 8 };
+const DEFAULTS = { windowSec: 3600, amberRatio: 0.8, redRatio: 1.2, backlogSoftCap: 20, backlogHardCap: 50, tDrainHorizonHours: 8, skewToleranceSec: 300 };
 
 function resolveConfig(c: DualBandwidthConfig = {}): Required<DualBandwidthConfig> {
   const cfg = { ...DEFAULTS, ...c };
-  // Reject an invalid config LOUDLY — never silently disable a threshold or emit a NaN reading (mirrors RoomRateLimiter).
-  if (!Number.isFinite(cfg.windowSec) || cfg.windowSec <= 0) throw new Error(`dual-bandwidth: windowSec must be a positive finite number (got ${String(c.windowSec)})`);
+  // Reject an invalid config LOUDLY — never silently disable a threshold or emit a NaN/Infinity reading (mirrors RoomRateLimiter).
+  // windowSec must be ≥ 1: a sub-second window underflows `windowSec/3600` toward 0 and makes the per-hour rate Infinity/NaN (T52-P2-5).
+  if (!Number.isFinite(cfg.windowSec) || cfg.windowSec < 1) throw new Error(`dual-bandwidth: windowSec must be a finite number ≥ 1 (got ${String(c.windowSec)})`);
   if (!Number.isFinite(cfg.amberRatio) || cfg.amberRatio <= 0) throw new Error(`dual-bandwidth: amberRatio must be a positive finite number (got ${String(c.amberRatio)})`);
   if (!Number.isFinite(cfg.redRatio) || cfg.redRatio <= 0) throw new Error(`dual-bandwidth: redRatio must be a positive finite number (got ${String(c.redRatio)})`);
   if (cfg.redRatio <= cfg.amberRatio) throw new Error(`dual-bandwidth: redRatio (${cfg.redRatio}) must exceed amberRatio (${cfg.amberRatio})`);
@@ -68,15 +70,27 @@ function resolveConfig(c: DualBandwidthConfig = {}): Required<DualBandwidthConfi
   if (!Number.isInteger(cfg.backlogHardCap) || cfg.backlogHardCap < 0) throw new Error(`dual-bandwidth: backlogHardCap must be a non-negative integer (got ${String(c.backlogHardCap)})`);
   if (cfg.backlogHardCap < cfg.backlogSoftCap) throw new Error(`dual-bandwidth: backlogHardCap (${cfg.backlogHardCap}) must be ≥ backlogSoftCap (${cfg.backlogSoftCap})`);
   if (!Number.isFinite(cfg.tDrainHorizonHours) || cfg.tDrainHorizonHours <= 0) throw new Error(`dual-bandwidth: tDrainHorizonHours must be a positive finite number (got ${String(c.tDrainHorizonHours)})`);
+  if (!Number.isFinite(cfg.skewToleranceSec) || cfg.skewToleranceSec < 0) throw new Error(`dual-bandwidth: skewToleranceSec must be a non-negative finite number (got ${String(c.skewToleranceSec)})`);
   return cfg;
 }
 
-/** Count timestamps inside the rolling window (now-windowSec, now]; a far-future stamp (clock skew) still counts as recent. */
-function rateInWindow(atSec: readonly number[], nowSec: number, windowSec: number): number {
+/** An event timestamp is COUNTABLE if finite and not past `now + skewTolerance`: a far-future stamp (clock bug / bogus data) is
+ *  ignored, never counted (T52-P2-4 — a verdict dated a year out must not inflate the current reading). */
+function countable(t: number, upperSec: number): boolean { return Number.isFinite(t) && t <= upperSec; }
+
+/** Count countable timestamps inside the rolling window (now-windowSec, now+skew], normalized to a PER-HOUR rate. */
+function rateInWindow(atSec: readonly number[], nowSec: number, windowSec: number, upperSec: number): number {
   const cutoff = nowSec - windowSec;
   let n = 0;
-  for (const t of atSec) if (Number.isFinite(t) && t > cutoff) n += 1;
+  for (const t of atSec) if (countable(t, upperSec) && t > cutoff) n += 1;
   return n / (windowSec / 3600); // normalize the count to a PER-HOUR rate regardless of window length
+}
+
+/** Count all countable timestamps (session cumulative) — same future-skew bound as the window rate. */
+function countTotal(atSec: readonly number[], upperSec: number): number {
+  let n = 0;
+  for (const t of atSec) if (countable(t, upperSec)) n += 1;
+  return n;
 }
 
 /**
@@ -88,10 +102,11 @@ export function computeDualBandwidth(input: DualBandwidthInput): DualBandwidthRe
   if (!Number.isFinite(input.nowSec)) throw new Error(`dual-bandwidth: nowSec must be a finite number (got ${String(input.nowSec)})`);
   if (!Number.isInteger(input.backlog) || input.backlog < 0) throw new Error(`dual-bandwidth: backlog must be a non-negative integer (got ${String(input.backlog)})`);
 
-  const bProd1h = rateInWindow(input.produceAtSec, input.nowSec, cfg.windowSec);
-  const bCons1h = rateInWindow(input.consumeAtSec, input.nowSec, cfg.windowSec);
-  const bProdTotal = input.produceAtSec.filter((t) => Number.isFinite(t)).length;
-  const bConsTotal = input.consumeAtSec.filter((t) => Number.isFinite(t)).length;
+  const upperSec = input.nowSec + cfg.skewToleranceSec; // future-skew bound shared by the rate and the cumulative count
+  const bProd1h = rateInWindow(input.produceAtSec, input.nowSec, cfg.windowSec, upperSec);
+  const bCons1h = rateInWindow(input.consumeAtSec, input.nowSec, cfg.windowSec, upperSec);
+  const bProdTotal = countTotal(input.produceAtSec, upperSec);
+  const bConsTotal = countTotal(input.consumeAtSec, upperSec);
   const consuming = bCons1h > 0;
   const backlog = input.backlog;
 
