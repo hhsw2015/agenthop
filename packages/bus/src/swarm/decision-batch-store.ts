@@ -87,10 +87,11 @@ function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
 }
-/** Hold-intents in the batch dir (the empty-window recovery credentials), with the owning pid parsed from each name. */
+/** Hold-intents in the batch dir (the empty-window recovery credentials), with the owning pid parsed from each name. A READ
+ *  FAILURE (EACCES/…) PROPAGATES — inability to read the intents must NEVER be folded to "no intents" (DB-R7 A): it cannot
+ *  authorize reclaiming an empty lock dir that a live holder may own. */
 function listHoldIntents(home: string, batchId: string): { name: string; pid: number }[] {
-  let names: string[]; try { names = readdirSync(batchDir(home, batchId)); } catch { return []; }
-  return names.filter((n) => n.startsWith(HOLD_INTENT_PREFIX)).map((n) => ({ name: n, pid: Number(n.slice(HOLD_INTENT_PREFIX.length).split(".")[0]) }));
+  return readdirSync(batchDir(home, batchId)).filter((n) => n.startsWith(HOLD_INTENT_PREFIX)).map((n) => ({ name: n, pid: Number(n.slice(HOLD_INTENT_PREFIX.length).split(".")[0]) }));
 }
 /** Acquire the per-batch consume lock. Returns our identity token (`<pid>.<nonce>`) if held by us, else null (contended). */
 function acquireConsumeLock(home: string, batchId: string): string | null {
@@ -123,15 +124,23 @@ function acquireConsumeLock(home: string, batchId: string): string | null {
     dropIntent(); return null; // live published holder, or reclaim lost ⇒ contended
   }
   if (entries.length === 0) {
-    // EMPTY lock dir: a LIVE acquirer mid-publish, or FAULTED debris. A LIVE FOREIGN hold-intent means someone is mid-publish ⇒
-    // never steal. Otherwise (all intents dead/own) the empty dir is faulted ⇒ reclaim it and continue the original verdict.
+    // EMPTY lock dir: the brief mkdir→publish window, or faulted debris, or a holder mid-release. Reclaim is bound to the
+    // occupancy we actually observe, and NEVER steals a live/arriving holder (DB-R7 A & B):
     const bdir = batchDir(home, batchId);
-    const others = listHoldIntents(home, batchId).filter((i) => i.name !== path.basename(intent));
-    if (others.some((i) => i.pid !== process.pid && pidAlive(i.pid))) { dropIntent(); return null; } // live in-flight ⇒ contended
-    for (const i of others) { try { unlinkSync(path.join(bdir, i.name)); } catch { /* best-effort: clear faulted debris credentials */ } }
-    try { rmdirSync(dir); } catch { /* a concurrent reclaimer/holder got it */ }
-    if (take()) return token;
-    dropIntent(); return null; // lost a concurrent reclaim ⇒ contended
+    const liveForeign = (list: { name: string; pid: number }[]) =>
+      list.some((i) => i.name !== path.basename(intent) && i.pid !== process.pid && pidAlive(i.pid));
+    // (A) reading the hold-intents MUST succeed; a read fault cannot prove "no live holder" ⇒ contend (never fold to empty).
+    let before: { name: string; pid: number }[]; try { before = listHoldIntents(home, batchId); } catch { dropIntent(); return null; }
+    if (liveForeign(before)) { dropIntent(); return null; } // a holder is actively here ⇒ never disturb it
+    // No live foreign holder observed ⇒ tentatively reclaim: drop the stale dir and re-create a FRESH one we own.
+    try { rmdirSync(dir); } catch { /* already gone / a co-reclaimer; the mkdir below arbitrates */ }
+    try { mkdirSync(dir); } catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") { dropIntent(); return null; } throw e; } // someone else took it ⇒ contend
+    // (B) RE-VERIFY against the occupancy NOW: if a live successor arrived DURING our reclaim (its hold-intent now live), YIELD
+    // the fresh empty dir to it (leave it for the successor to adopt) rather than keeping a dir a live holder is using.
+    let after: { name: string; pid: number }[]; try { after = listHoldIntents(home, batchId); } catch { dropIntent(); return null; }
+    if (liveForeign(after)) { dropIntent(); return null; } // yield to the live successor
+    for (const i of after) { if (i.name !== path.basename(intent)) { try { unlinkSync(path.join(bdir, i.name)); } catch { /* best-effort */ } } }
+    writeFileSync(mine, "", { mode: 0o600 }); return token; // publish our identity into the fresh dir (a fault here leaves our intent as credential)
   }
   dropIntent(); return null; // >1 identity (ambiguous) ⇒ contended
 }
