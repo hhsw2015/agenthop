@@ -55,7 +55,10 @@ export interface SummaryRequest {
 /** Build the one-line activity-summary request from a member's recent output (truncated). Pure (prompt builder; the
  *  model call is the IO caller's job, gated by shouldResummarize). */
 export function buildSummaryRequest(recentOutput: string, maxChars: number = 2000): SummaryRequest {
-  const clipped = (recentOutput ?? "").slice(-Math.max(0, Math.floor(maxChars)));
+  // VT-P2-1: `slice(-0)` is `slice(0)` = the WHOLE string, so a zero/fractional cap silently bypassed the size limit.
+  // Normalize: a cap of 0 (or <1) ⇒ empty output; a positive cap keeps only the last `cap` chars.
+  const cap = Math.max(0, Math.floor(maxChars));
+  const clipped = cap === 0 ? "" : (recentOutput ?? "").slice(-cap);
   return {
     system: "Summarize this agent's current activity in ONE short line (<=12 words). State what it is doing now; no preamble.",
     user: clipped,

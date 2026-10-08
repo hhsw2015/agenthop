@@ -30,5 +30,10 @@ t("summary: light tier (cheap)", req.tier === "light");
 t("summary: clips recent output to maxChars (last N)", req.user.length === 2000);
 t("summary: one-line instruction", /one short line/i.test(req.system) && /<=12 words/.test(req.system));
 t("summary: empty output safe", buildSummaryRequest("").user === "");
+// VT-P2-1: a zero/fractional cap must produce EMPTY output, not bypass the limit via slice(-0)
+t("summary: maxChars=0 -> empty (not full via slice(-0))", buildSummaryRequest("x".repeat(20000), 0).user === "");
+t("summary: maxChars=0.5 -> empty (fractional floors to 0)", buildSummaryRequest("x".repeat(20000), 0.5).user === "");
+t("summary: negative maxChars -> empty", buildSummaryRequest("x".repeat(20000), -5).user === "");
+t("summary: positive cap still keeps the last N", buildSummaryRequest("abcdef", 3).user === "def");
 
 console.log("all viz-triage selftests passed");
