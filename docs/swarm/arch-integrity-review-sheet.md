@@ -1,6 +1,6 @@
 # Architecture-integrity review sheet — feat/arch-integrity-review
 
-- **Branch** `feat/arch-integrity-review`  **HEAD** `HEAD`  **Base** `5da42b5`
+- **Branch** `feat/arch-integrity-review`  **HEAD** `HEAD`  **Base** `3732f4b`
 - **Reviewer** codex 01a0ead5 (cross-family, independent)  **Author/tooling** bus-pen
 - **Spec** `docs/swarm/arch-integrity-review-design.md` (R22) + 32-eval C11
 
@@ -8,32 +8,32 @@
 A CROSS-CUTTING review of the batch as a whole, not per-PR correctness. The tooling below collected the inputs from the git objects at HEAD (not the working tree); the reviewer fills each axis verdict. A CONFIRMED finding is REMAIN and BLOCKS the batch merge; a drift finding opens a convergence follow-up. The tool flags candidates only — it never pronounces a verdict.
 
 ## Diff set
-23 commit(s), 32 changed file(s), `5da42b5..HEAD`.
+23 commit(s), 20 changed file(s), `3732f4b..HEAD`.
 
 ```
-8f961a5 Merge branch 'feat/sentinel-denoise' (batch-4, adversarially signed 0 REMAIN)
-b54b79e Merge branch 'feat/herdr-args-fix' (batch-4, adversarially signed 0 REMAIN)
-e7040d8 Merge branch 'feat/dual-bandwidth' (batch-4, adversarially signed 0 REMAIN)
-aeb1792 Merge branch 'feat/vm-ctl' (batch-4, adversarially signed 0 REMAIN)
-0e2eb47 fix(sentinel): F44-P1-1 round-3 — two false-refuse parser paths in isDispatcherLoopCommand
-553d273 fix(sentinel): F44-P1-1 round-3 — parse the dispatcher entry as a runtime CLI, not a string search
-0de55f8 fix(sentinel): address F44 review bounce (1 P1 + 3 P2 + 1 nit)
-728b438 fix(swarm): F44 sentinel denoise — 6 fixes (dedup, legit-box scan, roster/in-flight split, ghost daemon, startup self-check, PROGRESS watch opt-in)
-52a5feb docs(vm-ctl): record phase-1 sign-off (605712e, 0 REMAIN, codex:happycapy, 5 rounds)
-605712e fix(vm-ctl): VMC-P1-1 round-5 — ready text requires an exact anchored success format
-51ac192 fix(vm-ctl): VMC-P1-1 round-4 — valid JSON judged structurally only, no text fall-through
-b0e9530 fix(vm-ctl): VMC-P1-1 + P2-2 round-3 (generic negation guard + structured flag; sparse-table rejection)
-0d54e3f fix(vm-ctl): VMC-P1-1..P2-2 round-2 (ready negation, cred 0600-before-write, url quoting, backoff validation)
-469b939 feat(vm-ctl): phase-1 backend-agnostic machine-management command family (pure core)
-41ef927 fix(swarm): T5-2 round-3 — close T52-P2-5 (required thresholds in reader; overflow-safe derived values)
-fc44e94 fix(swarm): T5-2 round-2 — close 5 P2 (collect read-faults, consume binding, in-flight backlog, future skew, projection guards)
-694caf8 feat(swarm): T5-2 dual-bandwidth gauge — pure core + IO + frozen projection contract
-0d11607 docs(herdr): ③ follow-up rollout roster ledger (read-only tracking)
-e10d84d docs(herdr): close HARGS-P2-3 residual — drop unsupported explain-by-name attribution + fix LIVE labels
-6d52b21 docs(herdr): close HARGS-P2-1 + P2-3 — narrow ① attribution, fix artifact citations, add live acceptance
-56df578 docs(herdr): evidence-boundary correction (reviewer) — raw vs observed vs not-captured
-baf0159 fix(herdr): ① argv regression guard + ③ status update (user-applied launcher fix)
-be02cc7 docs(herdr): ③ root cause + confirmed fix (process identification via argv0) + ①② assessment
+5558a85 Merge branch 'feat/absorb-resume-compact' (batch-5, adversarially signed 0 REMAIN)
+3c7a3d8 Merge branch 'feat/absorb-msg-dedup' (batch-5, adversarially signed 0 REMAIN)
+065a845 Merge branch 'feat/absorb-schedule-jitter' (batch-5, adversarially signed 0 REMAIN)
+19e9cb9 Merge branch 'feat/absorb-perm-inbound-gate' (batch-5, adversarially signed 0 REMAIN)
+d9f71d4 Merge branch 'feat/absorb-viz-triage' (batch-5, adversarially signed 0 REMAIN)
+414a090 Merge branch 'feat/absorb-idle-subscription' (batch-5, adversarially signed 0 REMAIN)
+7c6f6cd Merge branch 'feat/grill-gate' (batch-5, adversarially signed 0 REMAIN)
+6c64118 Merge branch 'feat/placement-engine' (batch-5, adversarially signed 0 REMAIN)
+0475868 docs(swarm): resume-compact RC-N1 — doc distinguishes bad measurement (refuse) from bad threshold (fallback)
+5cce333 fix(swarm): msg-dedup MD-P2-1/MD-P2-2 — unambiguous collision-free key; future stamp is not duplicate evidence (round-2)
+4753077 fix(swarm): viz-triage VT-P2-1 — a zero/fractional summary cap no longer bypasses the limit via slice(-0) (round-2)
+1116a1e fix(swarm): idle-subscription IS-P2-1 — positive TTL never floors to 0; reject a bad creation clock (round-2)
+db34af0 fix(swarm): grill-gate round-1 — GG-P2-1 own-key answers, GG-P2-2 iterative depth, GG-N1 wording
+90cdda2 fix(placement-engine): PE2+PE4 round-3 (dead-capacity urgent replacement, overflow + non-integer-count fail-closed)
+17a6929 feat(swarm): resume-compact — gate compacting a member's history on resume (absorb #6, dormant)
+a63247a feat(swarm): msg-dedup — ring dedup + queue-cap self-stop (absorb #5, dormant)
+c22a934 feat(swarm): schedule-jitter — deterministic per-id fire-time offset (absorb #4, dormant)
+c32f8a4 feat(swarm): grill-gate (烤问门) — pure pre-dispatch decision tree + dormant T3 seam
+3fd6e15 feat(absorb): perm-inbound-gate — permission-mode-aware inbound gating (docs-sweep #3)
+5c78c67 feat(absorb): viz-triage — needs-input-first ordering + cheap per-member summary (docs-sweep #2)
+ab843db feat(absorb): idle-subscription — one-shot notify-when-peer-idle (docs-sweep #1)
+62b1f20 fix(placement-engine): PE1-PE4 round-2 (one-action-per-machine, urgent respawn, dedup, input validation)
+a1f6c83 feat(placement-engine): phase-2a K8s-controller reconcile (pure core)
 ```
 
 ## Contract surface (hashed — compare against the prior verdict to see drift)
@@ -50,12 +50,13 @@ be02cc7 docs(herdr): ③ root cause + confirmed fix (process identification via 
 ## Import map (who-imports-whom, batch files only)
 | from | zone | to | zone |
 | --- | --- | --- | --- |
-| `packages/bus/src/swarm/dual-bandwidth-store.ts` | bus | `packages/bus/src/swarm/dual-bandwidth.ts` | bus |
-| `packages/bus/src/swarm/inbox-sentinel.ts` | bus | `packages/bus/src/swarm/sentinel-denoise.ts` | bus |
-| `packages/bus/src/swarm/vm-ctl.selftest.mts` | test | `packages/bus/src/swarm/vm-ctl.ts` | bus |
-| `scripts/swarm-dispatch.ts` | script | `packages/bus/src/swarm/inbox-sentinel.ts` | bus |
-| `scripts/swarm-dispatch.ts` | script | `packages/bus/src/swarm/live-sentinel.ts` | bus |
-| `scripts/swarm-dispatch.ts` | script | `packages/bus/src/swarm/sentinel-denoise.ts` | bus |
+| `packages/bus/src/swarm/idle-subscription.selftest.mts` | test | `packages/bus/src/swarm/idle-subscription.ts` | bus |
+| `packages/bus/src/swarm/msg-dedup.selftest.mts` | test | `packages/bus/src/swarm/msg-dedup.ts` | bus |
+| `packages/bus/src/swarm/perm-inbound-gate.selftest.mts` | test | `packages/bus/src/swarm/perm-inbound-gate.ts` | bus |
+| `packages/bus/src/swarm/placement-engine.selftest.mts` | test | `packages/bus/src/swarm/placement-engine.ts` | bus |
+| `packages/bus/src/swarm/resume-compact.selftest.mts` | test | `packages/bus/src/swarm/resume-compact.ts` | bus |
+| `packages/bus/src/swarm/schedule-jitter.selftest.mts` | test | `packages/bus/src/swarm/schedule-jitter.ts` | bus |
+| `packages/bus/src/swarm/viz-triage.selftest.mts` | test | `packages/bus/src/swarm/viz-triage.ts` | bus |
 
 ### Candidate boundary flags (reviewer confirms — evidence, not findings)
 _(none auto-detected; the reviewer still judges the axes below)_
