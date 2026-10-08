@@ -274,16 +274,17 @@ describe("decision-batch store (IO)", () => {
   });
 
   // ---- R24: unified per-batch lock (no stale commit + valid recoverable, by excluding concurrent replacement) ----
-  const lockPath = (id: string) => path.join(dbDir(id), "consume.lock");
+  const lockDir = (id: string) => path.join(dbDir(id), "consume.lockd");
+  const holdLock = (id: string, pid: number, nonce = "n") => { mkdirSync(lockDir(id), { recursive: true }); writeFileSync(path.join(lockDir(id), `${pid}.${nonce}`), ""); };
 
   test("R24: a consume whose batch lock is held by a LIVE holder returns an explicit contended receipt (decision stays recoverable)", () => {
     openBatch(HOME, { batchId: "b1", owner: "c", items: [item("same")], nowSec: 1 });
     writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
-    writeFileSync(lockPath("b1"), JSON.stringify({ pid: 1, token: "live-holder" })); // a DIFFERENT live holder (init, pid 1 — not us)
+    holdLock("b1", 1); // a DIFFERENT live holder (init, pid 1 — not us)
     const contended = consumeDecisions(HOME, "b1");
     expect(contended).toMatchObject({ consumed: false, contended: true }); // explicit receipt, NOT a silent/stale consume
     expect(contended.resolved).toEqual([]);
-    rmSync(lockPath("b1")); // holder releases
+    rmSync(lockDir("b1"), { recursive: true }); // holder releases
     const got = consumeDecisions(HOME, "b1"); // the decision was never lost — now it consumes
     expect(got.consumed).toBe(true);
     expect(got.resolved.map((r) => r.verdict)).toEqual(["approve"]);
@@ -306,7 +307,7 @@ describe("decision-batch store (IO)", () => {
     writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
     // find a pid that is definitely dead
     let deadPid = 2147480000; for (let p = 2147480000; p < 2147480050; p++) { try { process.kill(p, 0); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ESRCH") { deadPid = p; break; } } }
-    writeFileSync(lockPath("b1"), JSON.stringify({ pid: deadPid, token: "dead-holder" }));
+    holdLock("b1", deadPid); // a dead holder left its identity file
     const got = consumeDecisions(HOME, "b1"); // steals the stale lock
     expect(got.consumed).toBe(true);
     expect(got.resolved.map((r) => r.verdict)).toEqual(["approve"]);
@@ -328,23 +329,32 @@ describe("decision-batch store (IO)", () => {
     expect(claimInbox(HOME, ["coord-sid"], "probe2").some((c) => c.msg.title === "orphan decision — re-batch")).toBe(false);
   });
 
-  test("R25 orphan: a STALE (older-or-equal) decision after consume is NOT re-batched (no signal — never revives a superseded verdict)", () => {
+  test("R25 orphan: a decision IDENTICAL to the consumed verdict is NOT re-signaled (already fulfilled — content digest match, not a clock)", () => {
     openBatch(HOME, { batchId: "b1", owner: "coord-sid", items: [item("same")], nowSec: 1 });
-    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "reject" }] });
-    consumeDecisions(HOME, "b1"); // consumed.decidedAtSec=20
-    writeFileSync(path.join(dbDir("b1"), "decisions.json"), JSON.stringify({ batchId: "b1", decidedAtSec: 19, decisions: [{ id: "same", verdict: "approve" }] })); // OLDER
+    const d = { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "reject" as const }] };
+    writeDecisions(HOME, d);
+    consumeDecisions(HOME, "b1"); // consumed.json records the content digest of d
+    writeFileSync(path.join(dbDir("b1"), "decisions.json"), JSON.stringify(d)); // re-write the SAME decision (same content)
     consumeDecisions(HOME, "b1");
-    expect(claimInbox(HOME, ["coord-sid"], "probe").some((c) => c.msg.title === "orphan decision — re-batch")).toBe(false);
+    expect(claimInbox(HOME, ["coord-sid"], "probe").some((c) => c.msg.title === "orphan decision — re-batch")).toBe(false); // identical ⇒ already fulfilled ⇒ no signal
+  });
+
+  test("R25 orphan: a SAME-SECOND different decision after consume IS signaled (digest, not decidedAtSec, decides identity)", () => {
+    openBatch(HOME, { batchId: "b1", owner: "coord-sid", items: [item("same")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
+    consumeDecisions(HOME, "b1");
+    writeFileSync(path.join(dbDir("b1"), "decisions.json"), JSON.stringify({ batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "reject" }] })); // SAME second, different content
+    consumeDecisions(HOME, "b1");
+    expect(claimInbox(HOME, ["coord-sid"], "probe").some((c) => c.msg.title === "orphan decision — re-batch")).toBe(true); // different content at the same second ⇒ orphan (A)
   });
 
   test("DB-R7: a consume NEVER steals or deletes a LIVE holder's lock (instance-bound; the race can't double-execute)", () => {
     openBatch(HOME, { batchId: "b1", owner: "c", items: [item("same")], nowSec: 1 });
     writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
-    const live = JSON.stringify({ pid: 1, token: "peer-live" }); // a LIVE foreign holder (init, pid 1)
-    writeFileSync(lockPath("b1"), live);
+    holdLock("b1", 1, "peer-live"); // a LIVE foreign holder (init, pid 1)
     const r = consumeDecisions(HOME, "b1");
-    expect(r).toMatchObject({ consumed: false, contended: true }); // contended — not stolen
-    expect(readFileSync(lockPath("b1"), "utf8")).toBe(live);       // the live holder's lock is UNTOUCHED (never deleted)
+    expect(r).toMatchObject({ consumed: false, contended: true });   // contended — not stolen
+    expect(existsSync(path.join(lockDir("b1"), "1.peer-live"))).toBe(true); // the live holder's identity file is UNTOUCHED
   });
 
   test("R24: the terminal commit is FINAL (no retraction) — once consumed, a late write is refused and re-consume is terminal", () => {

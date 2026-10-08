@@ -7,8 +7,8 @@
  * Hardened with the chat-room review lessons: safe batchId (reject, never sanitize), validate at the write boundary, ENOENT
  * (absent) distinguished from a real read error (EACCES → throw, never treated as empty), corrupt-but-readable → null.
  */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, existsSync, statSync, unlinkSync, linkSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, existsSync, statSync, unlinkSync, linkSync, rmSync, rmdirSync } from "node:fs";
+import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
 import { writeInbox, composeInboxMsg } from "../inbox.js";
 import {
@@ -70,83 +70,76 @@ function existsStrict(file: string): boolean {
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return false; throw e; }
 }
 
-/** The per-batch EXCLUSIVE consume lock (R24). The ENTIRE critical section — claim-replacement, recovery, read, and the terminal
- *  commit — runs while this lock is held, so no concurrent consume or write can replace the claim mid-flight. That makes the
- *  terminal marker FINAL (never a create-then-retract, which could EACCES-fail and seal a stale verdict) and makes recovery
- *  non-overwriting of a successor — the two R24 failure modes ("过时裁决不提交" / "有效裁决可恢复") collapse because there is no
- *  concurrent replacement to race. A would-be consumer/writer that cannot take the lock gets an explicit receipt (contended /
- *  "busy"); its decision stays in decisions.json, recoverable on the next consume once the lock frees. */
-function consumeLockPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "consume.lock"); }
-
-type LockHolder = { pid: number; token?: string };
-/** Parse a lock file's {pid, token?}. pid is required; token identifies OUR instance for a bound release (a lock without a token
- *  — a foreign/old-format one — can be reclaimed if its pid is dead, but our token-bound release never deletes it). Odd ⇒ null. */
-function readLockHolder(lock: string): LockHolder | null {
-  return readJsonOrNull(lock, (raw) => {
-    if (raw === null || typeof raw !== "object") return null;
-    const r = raw as Record<string, unknown>;
-    if (typeof r.pid !== "number") return null;
-    return { pid: r.pid, ...(typeof r.token === "string" ? { token: r.token } : {}) };
-  });
+/** The per-batch EXCLUSIVE consume lock — a lock DIRECTORY (atomic mkdir) whose HOLDER IDENTITY is the NAME of the single file
+ *  inside it (`<pid>.<nonce>`), ported from the proven vm-ssh `withIdLock` (scripts/vm-ssh.ts). Putting the identity in the
+ *  FILENAME makes reclaim structurally race-free (DB-R7): a dead holder is reclaimed by removing its EXACT-named file, so it can
+ *  NEVER delete a successor's (differently-named) file, and there is no "move-aside + restore" a third acquirer could clobber.
+ *  Release removes ONLY our own named file and NEVER throws (a cleanup fault can't mask a committed result). An empty dir (an
+ *  in-flight acquisition) or a LIVE/ambiguous holder is never reclaimed ⇒ an explicit `contended` receipt. */
+function consumeLockDir(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "consume.lockd"); }
+/** True while pid is a running process (EPERM = exists, not ours = alive). Only a definite ESRCH is "dead". */
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
 }
-/** A holder is RECLAIMABLE if its pid is DEAD (ESRCH — a crashed consumer) or is OUR OWN pid (a leftover from a release that
- *  faulted; a consume is not re-entrant within one process). Another LIVE pid (EPERM/alive) is NOT reclaimable. */
-function lockHolderReclaimable(h: LockHolder): boolean {
-  if (h.pid === process.pid) return true;
-  try { process.kill(h.pid, 0); return false; } // live
-  catch (e) { return (e as NodeJS.ErrnoException).code === "ESRCH"; } // dead ⇒ reclaimable
-}
-
-/** Acquire the exclusive per-batch consume lock, bound to a UNIQUE token. Returns the token if held by us, else null (contended).
- *  DB-R7: reclaim is INSTANCE-BOUND. We never unlink the lock path blindly (that could delete a live successor a racer just
- *  created between our staleness check and the unlink). Instead we atomically RENAME the stale lock aside to a token-unique name
- *  (only one reclaimer wins the rename; a loser gets ENOENT ⇒ contended), VERIFY the moved file is actually reclaimable, and —
- *  if we moved a LIVE successor by mistake — RESTORE it rather than steal. Only then do we create our own lock. */
+/** Acquire the per-batch consume lock. Returns our identity token (`<pid>.<nonce>`) if held by us, else null (contended). */
 function acquireConsumeLock(home: string, batchId: string): string | null {
-  const lock = consumeLockPath(home, batchId);
-  const token = randomBytes(8).toString("hex");
-  const content = JSON.stringify({ pid: process.pid, token });
-  if (createExclusiveAtomic(lock, content) === "created") return token;
-  const holder = readLockHolder(lock);
-  if (!holder || !lockHolderReclaimable(holder)) return null; // a live/odd holder ⇒ contended
-  const aside = `${lock}.reclaim-${token}`;
-  try { renameSync(lock, aside); } catch { return null; } // another reclaimer moved it first (ENOENT) ⇒ contended
-  const moved = readLockHolder(aside);
-  if (moved && moved.pid !== process.pid && !lockHolderReclaimable(moved)) {
-    try { renameSync(aside, lock); } catch { /* best-effort restore */ } // we grabbed a LIVE successor — put it back, don't steal
-    return null;
+  const dir = consumeLockDir(home, batchId);
+  const token = `${process.pid}.${randomBytes(6).toString("hex")}`;
+  const mine = path.join(dir, token);
+  const take = (): boolean => { try { mkdirSync(dir); writeFileSync(mine, "", { mode: 0o600 }); return true; } catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; return false; } };
+  if (take()) return token; // won the atomic mkdir; identity published
+  // Held. Reclaim ONLY a single, confirmed dead-or-own holder, by its EXACT name (never a successor's differently-named file).
+  let entries: string[]; try { entries = readdirSync(dir); } catch { return null; } // dir vanished mid-check ⇒ contended (caller retries)
+  if (entries.length === 1) {
+    const holder = entries[0]!;
+    const holderPid = Number(holder.split(".")[0]);
+    if (Number.isInteger(holderPid) && holderPid > 0 && (holderPid === process.pid || !pidAlive(holderPid))) {
+      let removed = false;
+      try { rmSync(path.join(dir, holder)); removed = true; } catch { /* a peer reclaimed this exact identity first */ }
+      // Only the reclaimer that actually removed the dead identity may rmdir — an ENOENT means a peer may have a fresh (empty)
+      // successor dir, and rmdir'ing that would re-open the mutex (directory ABA). Not entitled ⇒ leave it.
+      if (removed) { try { rmdirSync(dir); } catch { /* a successor already populated/removed it */ } }
+      if (take()) return token; // one retry; a peer winning the fresh mkdir ⇒ contended
+    }
   }
-  try { unlinkSync(aside); } catch { /* already gone */ } // discard the stale lock we legitimately reclaimed
-  return createExclusiveAtomic(lock, content) === "created" ? token : null;
+  return null; // live / in-flight(empty) / ambiguous holder ⇒ contended
 }
-/** Release the lock ONLY if it still carries OUR token (DB-R7: never delete a successor's lock). A consume holds the lock while
- *  its pid is alive, so no one reclaims it mid-section; if a release faulted earlier and a successor took over, our token no
- *  longer matches and we leave theirs intact. */
+/** Release: remove ONLY our own named identity file, then best-effort rmdir the (now-empty) lock dir. NEVER throws — a cleanup
+ *  read/unlink fault must not mask the consume's committed result (DB-R7). */
 function releaseConsumeLock(home: string, batchId: string, token: string): void {
-  const lock = consumeLockPath(home, batchId);
-  const holder = readLockHolder(lock);
-  if (holder && holder.token === token) { try { unlinkSync(lock); } catch { /* already gone */ } }
+  const dir = consumeLockDir(home, batchId);
+  try { rmSync(path.join(dir, token), { force: true }); } catch { /* best-effort */ }
+  try { rmdirSync(dir); } catch { /* a successor is in, or it is gone */ }
 }
 
-/** DB-R3-P1-1 / R25 orphan-recovery contract. An ORPHAN is a decision that was ACCEPTED (written to decisions.json) but could not
- *  be consumed because the batch is already terminal (e.g. a write that landed during the winning consumer's terminal commit, or
- *  after it), AND is NEWER than the verdict that WAS consumed — i.e. a genuine un-fulfilled, not-superseded user decision. When
- *  detected, emit EXACTLY ONE durable inbox signal to the batch OWNER (the coordinator) so recovery truly reaches it; the owner
- *  re-batches it under a NEW batchId (its integration seam). A STALE/older write (decidedAtSec ≤ the consumed verdict's) is NOT an
- *  orphan and is never re-batched (R25). The `orphan.signaled` marker makes the signal once-only. */
-function orphanSignalPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "orphan.signaled"); }
+/** DB-R3-P1-1 / R25 orphan-recovery contract. An ORPHAN is a decision in decisions.json that is valid, bound to this batch, and
+ *  NOT the verdict that was consumed — a subsequent user decision the batch never fulfilled. Identity is by CONTENT DIGEST (never a
+ *  second-granularity clock, which cannot order same-second re-decisions): if the current decisions.json digests to the SAME value
+ *  as the consumed verdict it is already fulfilled (no signal); otherwise it is a distinct update. Each distinct update signals the
+ *  owner EXACTLY ONCE via a PER-DIGEST marker claimed with an exclusive create — so concurrent emitters never double-send (C), and
+ *  a LATER different update is never blocked by an earlier one (B): the dedup is per-update, NEVER per-batch. The signal is a
+ *  durable inbox message to the batch OWNER (the coordinator), guaranteed to reach them; the owner re-batches under a new batchId. */
+function digestDoc(doc: DecisionsDoc): string {
+  return createHash("sha256").update(JSON.stringify({ batchId: doc.batchId, decidedAtSec: doc.decidedAtSec, decisions: doc.decisions })).digest("hex");
+}
+function orphanMarkerPath(home: string, batchId: string, digest: string): string { return path.join(batchDir(home, batchId), `orphan-${digest}.signaled`); }
 function emitOrphanSignal(home: string, batchId: string, owner: string): void {
-  if (existsStrict(orphanSignalPath(home, batchId))) return; // already signaled
   const orphan = readJsonOrNull(decisionsPath(home, batchId), validDecisionsDoc);
-  if (!orphan || orphan.batchId !== batchId) return; // no valid pending decision in decisions.json
-  const consumed = readJsonOrNull(consumedMarkerPath(home, batchId), (raw) => (raw !== null && typeof raw === "object" && typeof (raw as Record<string, unknown>).decidedAtSec === "number" ? (raw as { decidedAtSec: number }) : null));
-  if (consumed && orphan.decidedAtSec <= consumed.decidedAtSec) return; // older/stale than what we consumed ⇒ NOT re-batched (R25)
-  writeInbox(home, owner, composeInboxMsg({
-    from: owner, fromLabel: "decision-batch",
-    text: `orphan decision in batch ${batchId} (decidedAtSec ${orphan.decidedAtSec}) arrived after the batch was consumed — re-batch it under a new batchId`,
-    via: "decision-batch", taskRef: `decision-batch:${batchId}`, title: "orphan decision — re-batch",
-  }));
-  writeJsonAtomic(orphanSignalPath(home, batchId), { batchId, decidedAtSec: orphan.decidedAtSec, signaledAtMs: Date.now() });
+  if (!orphan || orphan.batchId !== batchId) return; // no valid pending decision
+  const digest = digestDoc(orphan);
+  const consumed = readJsonOrNull(consumedMarkerPath(home, batchId), (raw) => (raw !== null && typeof raw === "object" && typeof (raw as Record<string, unknown>).digest === "string" ? (raw as { digest: string }) : null));
+  if (consumed && consumed.digest === digest) return; // this IS the consumed verdict (already fulfilled) ⇒ not an orphan
+  // per-update, once-only CLAIM (exclusive create). "exists" ⇒ this exact update already signaled — idempotent, incl. concurrently.
+  const mark = orphanMarkerPath(home, batchId, digest);
+  if (createExclusiveAtomic(mark, JSON.stringify({ digest, at: Date.now() })) === "exists") return;
+  try {
+    writeInbox(home, owner, composeInboxMsg({
+      from: owner, fromLabel: "decision-batch",
+      text: `orphan decision in batch ${batchId} (digest ${digest.slice(0, 12)}) arrived but was not consumed — re-batch it under a new batchId`,
+      via: "decision-batch", taskRef: `decision-batch:${batchId}`, title: "orphan decision — re-batch",
+    }));
+  } catch (e) { try { unlinkSync(mark); } catch { /* best-effort */ } throw e; } // send failed ⇒ release the claim so a retry re-sends
 }
 
 export function newBatchId(): string { return `batch-${randomBytes(8).toString("hex")}`; }
@@ -307,7 +300,7 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
     // FINAL terminal commit (temp+link). DB-R7: if a concurrent consumer already created consumed.json ("exists"), we LOST the
     // race — return NOT consumed (never return an executable verdict for a lost commit; no double-execute). EFBIG/EACCES THROWS
     // with the claim intact ⇒ finally releases the lock, a retry resumes the SAME claim.
-    if (createExclusiveAtomic(consumedMarker, JSON.stringify({ batchId, decidedAtSec: doc.decidedAtSec, consumedAtMs: Date.now() })) === "exists") return none;
+    if (createExclusiveAtomic(consumedMarker, JSON.stringify({ batchId, decidedAtSec: doc.decidedAtSec, consumedAtMs: Date.now(), digest: digestDoc(doc) })) === "exists") return none;
     emitOrphanSignal(home, batchId, batch.owner); // a decision that landed during this consume (now terminal) is an orphan — signal it (R25)
     return { ...res, consumed: true };
   } finally { releaseConsumeLock(home, batchId, token); }
