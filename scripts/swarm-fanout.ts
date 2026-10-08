@@ -1,14 +1,10 @@
 #!/usr/bin/env tsx
 // swarm-fanout — phase-1 SELF-BUILT fan-out backend (the sovereign default), DORMANT behind SWARM_FANOUT.
 //
-// Composes the AS-IS spawn stack + single-flight + the herdr CLI (direct exec, herdr NOT forked, spawn.ts NOT
-// touched) with the pure governance core (fanout.ts) and the visible-chain builders (fanout-herdr.ts). A member
-// posts a `fanout` request; this driver resumes any prior run (FN2), validates width evidence (FN7), enforces a
-// depth cap (FN6) and a budget breaker over metered usage (FN1), runs the units through a per-run pool + a
-// cross-run shared lease (FN9) at the chosen display mode (a temporary herdr workspace of VISIBLE panes — FN4-B
-// — or headless on degradation), classifies each unit from its REAL exit evidence (FN8), persists the aggregate
-// BEFORE advancing an exactly-once receipt (FN3), and reaps only the zone it opened (F42). A single-flight lock
-// serializes same-run replays and a try/finally keeps cleanup responsibility (FN2).
+// Composes the AS-IS spawn stack + single-flight + the herdr CLI (direct exec; herdr NOT forked, spawn.ts NOT
+// touched) with the pure governance core (fanout.ts) and the visible-chain builders (fanout-herdr.ts). Headless
+// is the DEFAULT; the temp-workspace VISIBLE chain is an explicit opt-in (request `visible:true`). All IO
+// decisions (budget, resume, depth, exit classification, display) come from the tested pure layer.
 // Design: docs/swarm/fanout-native-design.md; pits: docs/swarm/fanout-prestudy.md.
 import { mkdirSync, writeFileSync, readFileSync, existsSync, statSync, renameSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
@@ -23,9 +19,10 @@ import {
 } from "../packages/bus/src/swarm/fanout-herdr.js";
 import {
   admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, degradeDisplay, effectiveTier,
-  elapsedTimedOut, markAborted, newLedgerRow, nextReceipt, planResume, reconcileOrphans, reduceUnits,
+  elapsedTimedOut, markAborted, newLedgerRow, nextReceipt, parseDepth, planResume, reconcileOrphans, reduceUnits,
   validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthGate, zoneName, type AggregateReceipt,
-  type FanoutBudget, type FanoutRequest, type FanoutTier, type FanoutUnit, type LedgerRow, type UnitResult,
+  type DisplayMode, type FanoutBudget, type FanoutRequest, type FanoutUnit, type FanoutTier, type LedgerRow,
+  type Spent, type UnitResult,
 } from "../packages/bus/src/swarm/fanout.js";
 
 export const fanoutEnabled = (env: NodeJS.ProcessEnv = process.env): boolean => /^(1|true|yes|on)$/i.test(env.SWARM_FANOUT ?? "");
@@ -38,6 +35,7 @@ const fanoutDir = (home: string): string => path.join(home, ".agenthop", "swarm"
 const runDir = (home: string, runKey: string): string => path.join(fanoutDir(home), runKey);
 const ledgerPath = (home: string, runKey: string): string => path.join(runDir(home, runKey), "ledger.json");
 const aggregatePath = (home: string, runKey: string): string => path.join(runDir(home, runKey), "aggregate.json");
+const cleanupPendingPath = (home: string, runKey: string): string => path.join(runDir(home, runKey), "cleanup-pending.json");
 const lockPath = (home: string, runKey: string): string => path.join(runDir(home, runKey), "run.lock");
 const outFile = (home: string, runKey: string, key: string): string => path.join(runDir(home, runKey), `${key}.out`);
 const leasesDir = (home: string): string => path.join(fanoutDir(home), "leases");
@@ -53,11 +51,31 @@ function writeJsonAtomic(file: string, obj: unknown): boolean {
     return false;
   }
 }
-function readJson(file: string): unknown {
-  try { return JSON.parse(readFileSync(file, "utf8")); } catch { return null; }
+type LedgerState = { runKey: string; rows: LedgerRow[]; receipt?: AggregateReceipt; spent?: Spent };
+// FN2: distinguish MISSING (fresh run, null) from CORRUPT/unreadable (throw — prior state is unknown, never
+// treat it as "no prior run" and re-spawn everything). A directory at the path is EISDIR -> corrupt -> throw.
+function readLedgerState(home: string, runKey: string): LedgerState | null {
+  const p = ledgerPath(home, runKey);
+  let raw: string;
+  try {
+    raw = readFileSync(p, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error(`fanout ledger unreadable (${p}): ${(e as Error).message}`);
+  }
+  try {
+    return JSON.parse(raw) as LedgerState;
+  } catch {
+    throw new Error(`fanout ledger corrupt (${p}); refusing to start (prior state unknown)`);
+  }
 }
+const writeLedger = (home: string, runKey: string, rows: readonly LedgerRow[], receipt: AggregateReceipt | undefined, spent: Spent): boolean =>
+  writeJsonAtomic(ledgerPath(home, runKey), { runKey, rows, receipt, spent, updatedAt: Date.now() });
+
 const pidAlive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+const readFileOrNull = (p: string): string | null => { try { return readFileSync(p, "utf8"); } catch { return null; } };
+const readJsonOrNull = (p: string): unknown => { const s = readFileOrNull(p); if (s === null) return null; try { return JSON.parse(s); } catch { return null; } };
 
 // ---- herdr CLI (direct exec; herdr is NOT forked, spawn.ts is NOT touched) ----
 const herdrBin = (env: NodeJS.ProcessEnv): string => env.HERDR_BIN || path.join(homedir(), ".local", "bin", "herdr");
@@ -80,11 +98,10 @@ function acquireLease(home: string, cap: number, label: string): string | null {
   try {
     for (const f of readdirSync(dir)) {
       if (!f.endsWith(".lease")) continue;
-      const rec = readJson(path.join(dir, f)) as { pid?: number } | null;
+      const rec = readJsonOrNull(path.join(dir, f)) as { pid?: number } | null;
       if (!rec || typeof rec.pid !== "number" || !pidAlive(rec.pid)) rmSync(path.join(dir, f), { force: true });
     }
-    const live = readdirSync(dir).filter((f) => f.endsWith(".lease")).length;
-    if (live >= cap) return null;
+    if (readdirSync(dir).filter((f) => f.endsWith(".lease")).length >= cap) return null;
     const file = path.join(dir, `${process.pid}-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.lease`);
     return writeJsonAtomic(file, { pid: process.pid, label, ts: Date.now() }) ? file : null;
   } finally {
@@ -95,8 +112,8 @@ const releaseLease = (file: string | null): void => { if (file) rmSync(file, { f
 
 // ---- width evidence (FN7): env carries a POINTER to the evidence file, never the evidence itself ----
 function widthEvidence(env: NodeJS.ProcessEnv, runKey: string): { hasRoiEstimate: boolean; hasBudgetTicket: boolean; ticket: FanoutBudget | null } {
-  const roi = env.FANOUT_ROI_FILE ? readJson(env.FANOUT_ROI_FILE) : null;
-  const ticketRaw = env.FANOUT_TICKET_FILE ? readJson(env.FANOUT_TICKET_FILE) : null;
+  const roi = env.FANOUT_ROI_FILE ? readJsonOrNull(env.FANOUT_ROI_FILE) : null;
+  const ticketRaw = env.FANOUT_TICKET_FILE ? readJsonOrNull(env.FANOUT_TICKET_FILE) : null;
   const hasBudgetTicket = validBudgetTicket(ticketRaw, runKey);
   const t = ticketRaw as { maxTokens?: number; maxUsd?: number } | null;
   return {
@@ -106,44 +123,49 @@ function widthEvidence(env: NodeJS.ProcessEnv, runKey: string): { hasRoiEstimate
   };
 }
 
-type Launched = { unit: FanoutUnit; row: LedgerRow; lease: string | null };
+type Launched = { row: LedgerRow; lease: string | null };
 
 export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = process.env, home: string = homedir()): Promise<{ rows: LedgerRow[]; receipt: AggregateReceipt }> {
-  // FN6: depth cap — a unit may not fan out past the cap; children carry FANOUT_DEPTH+1.
-  const depth = Math.max(0, Number(env.FANOUT_DEPTH ?? 0) || 0);
+  // FN6: strict depth — reject a present-but-invalid value; absent = root (0).
+  const depth = parseDepth(env.FANOUT_DEPTH);
+  if (depth === null) throw new Error(`invalid FANOUT_DEPTH=${JSON.stringify(env.FANOUT_DEPTH)} (must be a non-negative integer)`);
   if (!admitDepth(depth)) throw new Error(`fanout depth cap reached (${depth}); not spawning a deeper generation`);
 
-  // FN2: single-flight per runKey — serialize same-run replays; the release runs in finally.
   mkdirSync(runDir(home, req.runKey), { recursive: true });
-  const releaseRun = acquireSingleFlight(lockPath(home, req.runKey));
+  const releaseRun = acquireSingleFlight(lockPath(home, req.runKey)); // FN2: serialize same-run replays
   if (!releaseRun) throw new Error(`fanout run ${req.runKey} is already in flight (single-flight lock held)`);
 
   const launchedAll: Launched[] = [];
+  let zoneId: string | undefined;
+  let zone: string | undefined;
   try {
-    // FN2: resume — reuse prior DONE rows by key; only the rest are to-run.
-    const prior = (readJson(ledgerPath(home, req.runKey)) as { rows?: LedgerRow[]; receipt?: AggregateReceipt } | null) ?? null;
+    // FN2: resume — corrupt ledger throws; reuse prior DONE by key; carry a still-live or quarantined prior row.
+    const prior = readLedgerState(home, req.runKey);
     const priorRows = prior?.rows ?? [];
     const priorReceipt = prior?.receipt;
-    const { reuse, toRun } = planResume(priorRows, req.units);
+    const spent = { tokens: prior?.spent?.tokens ?? 0, usd: prior?.spent?.usd ?? 0 }; // FN1: durable cumulative spend (concrete numbers)
+    const priorByKey = new Map(priorRows.map((r) => [r.key, r] as const));
+    const { reuse, toRun: resumeToRun } = planResume(priorRows, req.units);
+    const carry: LedgerRow[] = [];
+    const toRun: FanoutUnit[] = [];
+    for (const u of resumeToRun) {
+      const pr = priorByKey.get(u.key);
+      if (pr?.status === "delivery_uncertain") { carry.push(pr); continue; } // quarantined — never auto-re-run
+      if (pr?.status === "running" && pr.pid !== undefined && pidAlive(pr.pid)) { carry.push(pr); continue; } // still live
+      toRun.push(u);
+    }
 
-    // FN7: width gate on REAL evidence bound to this run; the ticket (if valid) is the budget ceiling (FN1).
+    // FN7: width gate on real evidence bound to this run; a valid ticket is the budget ceiling (FN1).
     const ev = widthEvidence(env, req.runKey);
     const gate = widthGate(req.units.length, { hasRoiEstimate: ev.hasRoiEstimate, hasBudgetTicket: ev.hasBudgetTicket });
     if (!gate.admit) throw new Error(`fanout width gate refused (${req.units.length} units): ${gate.reason}`);
     const cap: FanoutBudget = ev.ticket ?? req.budget;
 
-    const display = chooseDisplayMode(req.units.length, await herdrServerReachable());
-    const perRunCap = numEnv(env, "FANOUT_CONCURRENCY", 5, 1);
-    const globalCap = numEnv(env, "FANOUT_GLOBAL_CONCURRENCY", 16, 1);
-    const timeoutMs = numEnv(env, "FANOUT_UNIT_TIMEOUT_MS", 900000, 1000);
-    const tokenReserve = numEnv(env, "FANOUT_UNIT_TOKEN_EST", 50000, 0); // FN1: conservative reservation per launch
-
-    // FN4-B: open the temp zone; on any failure, degrade to headless (governance unchanged).
-    let zone: string | undefined;
-    let zoneId: string | undefined;
+    // FN4: headless default; the temp-workspace visible chain is an explicit opt-in.
+    const requested: DisplayMode = chooseDisplayMode(req.units.length, await herdrServerReachable(), req.visible === true);
     let lastPane: string | undefined;
     let zoneOpened = false;
-    if (display === "temp-workspace") {
+    if (requested === "temp-workspace") {
       const created = workspaceFromCreate((await herdrExec(env, buildWorkspaceCreate())).json);
       if (created) {
         zone = zoneName(req.runKey);
@@ -153,52 +175,65 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
         await herdrExec(env, buildWorkspaceRename(created.workspaceId, zone)).catch(() => undefined);
       }
     }
-    const mode = degradeDisplay(display, zoneOpened); // FN4-B: zone-open fail -> headless
+    const mode = degradeDisplay(requested, zoneOpened); // FN4 degradation
 
-    const rows: LedgerRow[] = [...reuse];
-    const spent = { tokens: reuse.length * tokenReserve };
-    const settleOf: Array<Promise<void>> = [];
+    // FN1/FN2: register a row for EVERY to-run unit BEFORE any spawn; a failed register must NOT launch.
+    const rows: LedgerRow[] = [...reuse, ...carry];
+    const runnable: Launched[] = [];
+    for (const u of toRun) {
+      const row = newLedgerRow(u, u.key, "self-built", mode, zone);
+      row.outputPtr = outFile(home, req.runKey, u.key);
+      rows.push(row);
+      runnable.push({ row, lease: null });
+    }
+    if (!writeLedger(home, req.runKey, rows, priorReceipt, spent)) throw new Error("fanout: could not durably register the run ledger; not launching");
 
-    for (let i = 0; i < toRun.length; i += perRunCap) {
-      if (budgetExceeded(spent, cap)) break; // FN1 breaker
-      const batch = toRun.slice(i, i + perRunCap);
-      const launched: Launched[] = [];
-      for (const unit of batch) {
-        if (budgetExceeded(spent, cap)) break;
-        // FN9: acquire a cross-run lease (bounded wait); skip to the breaker/next tick if the global cap is full.
+    const perRunCap = numEnv(env, "FANOUT_CONCURRENCY", 5, 1);
+    const globalCap = numEnv(env, "FANOUT_GLOBAL_CONCURRENCY", 16, 1);
+    const timeoutMs = numEnv(env, "FANOUT_UNIT_TIMEOUT_MS", 900000, 1000);
+    const tokenReserve = numEnv(env, "FANOUT_UNIT_TOKEN_EST", 50000, 0); // FN1 conservative token reservation
+    const usdReserve = Number(env.FANOUT_UNIT_USD_EST ?? 0) || 0; // FN1 conservative USD reservation
+
+    let bi = 0;
+    while (bi < runnable.length) {
+      const batch = runnable.slice(bi, bi + perRunCap);
+      bi += perRunCap;
+      const settles: Array<Promise<void>> = [];
+      for (const l of batch) {
+        // FN1: the reservation must FIT before launch (pre-check spent + reserve, no overshoot).
+        if (budgetExceeded({ tokens: spent.tokens + tokenReserve, usd: spent.usd + usdReserve }, cap)) { bi = runnable.length; break; }
+        // FN9: acquire a cross-run lease; NEVER launch without one.
         let lease: string | null = null;
-        for (let a = 0; a < 30 && !(lease = acquireLease(home, globalCap, unit.key)); a++) await sleep(1000);
-        const model = tierModel(effectiveTier(unit), env);
-        const out = outFile(home, req.runKey, unit.key);
-        const row = newLedgerRow(unit, unit.key, "self-built", mode, zone);
-        row.startedAt = Date.now();
-        row.outputPtr = out;
-        rows.push(row);
-        writeJsonAtomic(ledgerPath(home, req.runKey), { runKey: req.runKey, rows, receipt: { generation: priorReceipt?.generation ?? 0, delivered: false, accepted: false } }); // FN2: durable-register BEFORE spawn
+        for (let a = 0; a < 30 && !(lease = acquireLease(home, globalCap, l.row.key)); a++) await sleep(1000);
+        if (!lease) { bi = runnable.length; break; } // no admission -> stop launching (remaining stay running -> aborted)
+        l.lease = lease;
+        spent.tokens += tokenReserve; spent.usd += usdReserve; // FN1: reserve BEFORE spawn
+        if (!writeLedger(home, req.runKey, rows, priorReceipt, spent)) { releaseLease(lease); l.lease = null; bi = runnable.length; break; } // durable spend; fail -> no launch
+        l.row.startedAt = Date.now();
+        const model = tierModel(effectiveTier(unitOfRow(req, l.row)), env);
         if (mode === "headless") {
-          const childEnv = { ...env, ANTHROPIC_MODEL: model, FANOUT_DEPTH: String(depth + 1) }; // FN6
-          const r = await spawnAgent({ tool: "claude", task: unit.prompt, visible: false, ...(unit.cwd ? { cwd: unit.cwd } : {}) }, childEnv);
-          row.spawnOk = r.ok;
-          if (r.launchId !== undefined) row.id = r.launchId; // the despawn handle (keep row.key as the stable content key)
-          if (r.pid !== undefined) row.pid = r.pid;
-          if (r.outputFile !== undefined) row.outputPtr = r.outputFile;
+          const r = await spawnAgent({ tool: "claude", task: promptOfRow(req, l.row), visible: false, ...(cwdOfRow(req, l.row) ? { cwd: cwdOfRow(req, l.row)! } : {}) }, { ...env, ANTHROPIC_MODEL: model, FANOUT_DEPTH: String(depth + 1) });
+          l.row.spawnOk = r.ok;
+          if (r.launchId !== undefined) l.row.id = r.launchId;
+          if (r.pid !== undefined) l.row.pid = r.pid;
+          if (r.outputFile !== undefined) l.row.outputPtr = r.outputFile;
+          if (!r.ok) { l.row.status = "failed"; l.row.endedAt = Date.now(); } // FN8: launch failure keeps its reason immediately
         } else {
-          const split = paneIdFromSplit((await herdrExec(env, buildPaneSplitIn(lastPane ?? "", unit.cwd ?? process.cwd()))).json);
-          if (split) { row.pane = split; lastPane = split; row.spawnOk = true; const cmd = unitCommand({ bin: "claude", model, prompt: unit.prompt, outputFile: out, key: unit.key }); await herdrExec(env, buildPaneRun(split, cmd)); }
-          else { row.spawnOk = false; row.status = "failed"; row.endedAt = Date.now(); }
+          const split = paneIdFromSplit((await herdrExec(env, buildPaneSplitIn(lastPane ?? "", cwdOfRow(req, l.row) ?? process.cwd()))).json);
+          if (split) {
+            l.row.pane = split; lastPane = split; l.row.spawnOk = true;
+            const cmd = unitCommand({ bin: "claude", model, prompt: promptOfRow(req, l.row), outputFile: l.row.outputPtr!, key: l.row.key, childDepth: depth + 1 });
+            await herdrExec(env, buildPaneRun(split, cmd));
+          } else { l.row.spawnOk = false; l.row.status = "failed"; l.row.endedAt = Date.now(); }
         }
-        spent.tokens += tokenReserve; // FN1: reserve on launch
-        launched.push({ unit, row, lease });
-        launchedAll.push({ unit, row, lease });
+        launchedAll.push(l);
+        settles.push(settleUnit(env, home, req.runKey, l, timeoutMs));
       }
-      // settle this batch (await completion), then write the ledger
-      for (const l of launched) settleOf.push(settleUnit(env, home, req.runKey, l, timeoutMs));
-      await Promise.all(settleOf.splice(0));
-      writeJsonAtomic(ledgerPath(home, req.runKey), { runKey: req.runKey, rows, receipt: { generation: priorReceipt?.generation ?? 0, delivered: false, accepted: false } });
+      await Promise.all(settles);
+      writeLedger(home, req.runKey, rows, priorReceipt, spent);
     }
 
-    // FN1: any still-running (never-launched past the breaker) row reaches a terminal `aborted` state.
-    // orphan sweep first (a running row with a dead pid -> timeout), then abort any still-running remainder.
+    // orphan sweep, then abort any still-running remainder (never-launched past the breaker/lease).
     const livePids = new Set(readRegistry(home).map((r) => r.pid).filter((p): p is number => typeof p === "number" && pidAlive(p)));
     const finalRows = markAborted(reconcileOrphans(rows, livePids));
 
@@ -209,30 +244,35 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
       ...(r.status !== "done" && r.status !== "running" ? { error: r.status } : {}),
     }));
     const red = reduceUnits(results);
-    // FN3: persist the aggregate FIRST; only then advance the receipt, and only to accepted if the persist held.
+    // FN3: persist the aggregate FIRST; advance the receipt from the PRIOR one (nextReceipt never downgrades accepted).
     const persistOk = writeJsonAtomic(aggregatePath(home, req.runKey), { runKey: req.runKey, items: red.items, allTerminal: red.allTerminal });
     const receipt = nextReceipt(priorReceipt, red.allTerminal, persistOk);
-    writeJsonAtomic(ledgerPath(home, req.runKey), { runKey: req.runKey, rows: finalRows, receipt });
-
-    // F42: reap ONLY the zone we opened.
-    if (zone && zoneId && canReapZone(zone, new Set([req.runKey]))) await herdrExec(env, buildWorkspaceClose(zoneId)).catch(() => undefined);
+    writeLedger(home, req.runKey, finalRows, receipt, spent);
     return { rows: finalRows, receipt };
   } finally {
-    // cleanup responsibility (FN2): release leases + despawn any headless child we launched, even on a throw.
     for (const l of launchedAll) {
       releaseLease(l.lease);
-      if (l.row.backend === "self-built" && l.row.displayMode === "headless" && l.row.pid !== undefined) await despawnAgent(l.row.id).catch(() => {});
+      if (l.row.displayMode === "headless" && l.row.pid !== undefined) await despawnAgent(l.row.id).catch(() => {});
+    }
+    // FN4: reap ONLY the zone we opened, in finally (exception-safe); a failed close leaves a durable cleanup todo.
+    if (zone && zoneId && canReapZone(zone, new Set([req.runKey]))) {
+      const { exitFailed } = await herdrExec(env, buildWorkspaceClose(zoneId)).catch(() => ({ exitFailed: true, json: null }));
+      if (exitFailed) writeJsonAtomic(cleanupPendingPath(home, req.runKey), { zone, zoneId, note: "workspace close failed; a later sweep must reap it", ts: Date.now() });
     }
     releaseRun();
   }
 }
 
+const unitOfRow = (req: FanoutRequest, row: LedgerRow): FanoutUnit => req.units.find((u) => u.key === row.key)!;
+const promptOfRow = (req: FanoutRequest, row: LedgerRow): string => unitOfRow(req, row).prompt;
+const cwdOfRow = (req: FanoutRequest, row: LedgerRow): string | undefined => unitOfRow(req, row).cwd;
+
 // Settle one launched unit: classify from REAL exit evidence (FN8), despawn/close on timeout, release its lease.
 async function settleUnit(env: NodeJS.ProcessEnv, home: string, runKey: string, l: Launched, timeoutMs: number): Promise<void> {
-  const { row } = l;
-  if (row.status !== "running") { releaseLease(l.lease); return; }
+  const row = l.row;
+  if (row.status !== "running") { releaseLease(l.lease); l.lease = null; return; }
   const out = row.outputPtr ?? outFile(home, runKey, row.key);
-  const outputPresent = (): boolean => existsSync(out) && (() => { try { return statSync(out).size > 0; } catch { return false; } })();
+  const outputPresent = (): boolean => { try { return existsSync(out) && statSync(out).size > 0; } catch { return false; } };
   try {
     if (row.displayMode === "headless") {
       const started = row.startedAt ?? Date.now();
@@ -245,16 +285,18 @@ async function settleUnit(env: NodeJS.ProcessEnv, home: string, runKey: string, 
         await sleep(2000);
       }
     } else {
-      await herdrExec(env, buildPaneWaitOutput(row.pane ?? "", doneMarker(row.key), timeoutMs));
-      const rc = readFileSync(rcFile(out), "utf8").trim();
-      const exitCode = /^\d+$/.test(rc) ? Number(rc) : null;
-      row.status = exitCode === null && !outputPresent() ? "timeout" : classifyExit({ spawnOk: row.spawnOk ?? true, exitCode, outputPresent: outputPresent() });
+      const wait = await herdrExec(env, buildPaneWaitOutput(row.pane ?? "", doneMarker(row.key), timeoutMs));
+      const rcRaw = readFileOrNull(rcFile(out));
+      const exitCode = rcRaw !== null && /^\d+$/.test(rcRaw.trim()) ? Number(rcRaw.trim()) : null;
+      // FN8: no rc evidence (and no completion) -> timeout; otherwise classify on the real exit code (null -> failed).
+      row.status = exitCode === null && wait.exitFailed ? "timeout" : classifyExit({ spawnOk: row.spawnOk ?? true, exitCode, outputPresent: outputPresent() });
     }
   } catch {
-    row.status = outputPresent() ? "done" : "failed";
+    row.status = "failed"; // FN8: an exception is never a success
   } finally {
     row.endedAt = Date.now();
     releaseLease(l.lease);
+    l.lease = null;
   }
 }
 
@@ -263,7 +305,7 @@ async function main(): Promise<void> {
   if (!fanoutEnabled()) { console.error("swarm-fanout: SWARM_FANOUT is off (dormant). Set SWARM_FANOUT=1 to run."); process.exit(0); }
   const i = process.argv.indexOf("--request");
   if (i < 0 || i + 1 >= process.argv.length) { console.error("usage: swarm-fanout --request <request.json>"); process.exit(2); }
-  const v = validateFanoutRequest(readJson(process.argv[i + 1]!));
+  const v = validateFanoutRequest(readJsonOrNull(process.argv[i + 1]!));
   if (!v.ok) { console.error(`swarm-fanout: invalid request: ${v.reason}`); process.exit(2); }
   const { rows, receipt } = await runFanout(v.req);
   const done = rows.filter((r) => r.status === "done").length;

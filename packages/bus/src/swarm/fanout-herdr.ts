@@ -60,11 +60,12 @@ export function doneMarker(key: string): string {
 // Build the one command `pane run` types into the pane: run the tool non-interactively with the tier-model on
 // the command line, redirect all output to the unit's harvest file, then echo the completion marker. The prompt
 // is shell-quoted (F41: a single atomic command, never char-by-char keystrokes).
-export function unitCommand(opts: { bin: string; model: string; prompt: string; outputFile: string; key: string; extraArgs?: readonly string[] }): string {
+export function unitCommand(opts: { bin: string; model: string; prompt: string; outputFile: string; key: string; childDepth: number; extraArgs?: readonly string[] }): string {
   const extra = (opts.extraArgs ?? ["--dangerously-skip-permissions"]).join(" ");
-  // Capture the REAL exit code to a sidecar `<outputFile>.rc` so the visible path has true exit evidence
-  // (round-1 FN8), then echo the completion marker last for `pane wait-output`.
-  return `${opts.bin} --model ${shquote(opts.model)} ${extra} -p ${shquote(opts.prompt)} > ${shquote(opts.outputFile)} 2>&1; echo $? > ${shquote(opts.outputFile + ".rc")}; echo ${shquote(doneMarker(opts.key))}`;
+  // FANOUT_DEPTH is carried to the child so a visible unit that fans out again is still depth-capped (FN6).
+  // Capture the REAL exit code to a sidecar `<outputFile>.rc` so the visible path has true exit evidence (FN8),
+  // then echo the completion marker last for `pane wait-output`.
+  return `FANOUT_DEPTH=${opts.childDepth} ${opts.bin} --model ${shquote(opts.model)} ${extra} -p ${shquote(opts.prompt)} > ${shquote(opts.outputFile)} 2>&1; echo $? > ${shquote(opts.outputFile + ".rc")}; echo ${shquote(doneMarker(opts.key))}`;
 }
 
 // The sidecar path where a visible unit's exit code lands.

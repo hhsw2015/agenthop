@@ -3,9 +3,9 @@
 // Each pre-study pit (docs/swarm/fanout-prestudy.md §2) is a NAMED counterexample below.
 import {
   admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, degradeDisplay,
-  effectiveTier, elapsedTimedOut, isSafeRunKey, isTerminal, markAborted, newLedgerRow, nextReceipt, planResume,
-  progress, reconcileOrphans, reduceUnits, validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthClass,
-  widthGate, zoneName, type FanoutUnit, type LedgerRow, type UnitResult,
+  effectiveTier, elapsedTimedOut, isSafeRunKey, isTerminal, markAborted, newLedgerRow, nextReceipt, parseDepth,
+  planResume, progress, reconcileOrphans, reduceUnits, validateFanoutRequest, validBudgetTicket, validRoiEstimate,
+  widthClass, widthGate, zoneName, type FanoutUnit, type LedgerRow, type UnitResult,
 } from "./fanout.js";
 
 const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED: " + name); console.log("ok  " + name); };
@@ -27,6 +27,9 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("runKey path-traversal rejected (FN5)", validateFanoutRequest({ ...okReq(), runKey: "../outside" }).ok === false);
   t("isSafeRunKey: plain slug ok", isSafeRunKey("r1") && isSafeRunKey("a.b-c_d"));
   t("isSafeRunKey: traversal/separator/empty/leading-dot rejected (FN5)", !isSafeRunKey("../x") && !isSafeRunKey("a/b") && !isSafeRunKey("..") && !isSafeRunKey("") && !isSafeRunKey(".hidden"));
+  t("unit KEY path-traversal rejected (FN5 round-3)", validateFanoutRequest({ ...okReq(), units: [unit("../foreign")] }).ok === false);
+  t("visible:true accepted (FN4 opt-in)", validateFanoutRequest({ ...okReq(), visible: true }).ok === true);
+  t("visible non-boolean rejected (FN4)", validateFanoutRequest({ ...okReq(), visible: "yes" }).ok === false);
   t("bad taskClass rejected", validateFanoutRequest({ ...okReq(), units: [unit("u", "nope" as unknown as FanoutUnit["taskClass"])] }).ok === false);
   t("unit missing prompt rejected", validateFanoutRequest({ runKey: "r", units: [{ key: "u", taskClass: "scan" }], mode: "fresh", reduce: "c", budget: {} }).ok === false);
 }
@@ -56,10 +59,11 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
 
 // --- display mode (temp-workspace default; headless degradation) ---
 {
-  t("reachable + small -> temp-workspace", chooseDisplayMode(8, true) === "temp-workspace");
-  t("herdr unreachable -> headless", chooseDisplayMode(4, false) === "headless");
-  t("over pane budget (17) -> headless", chooseDisplayMode(17, true) === "headless");
-  t("exactly 16 -> temp-workspace", chooseDisplayMode(16, true) === "temp-workspace");
+  t("visible opt-in + reachable + small -> temp-workspace", chooseDisplayMode(8, true, true) === "temp-workspace");
+  t("NO opt-in -> headless even when reachable (FN4 default)", chooseDisplayMode(8, true, false) === "headless");
+  t("opt-in but herdr unreachable -> headless", chooseDisplayMode(4, false, true) === "headless");
+  t("opt-in but over pane budget (17) -> headless", chooseDisplayMode(17, true, true) === "headless");
+  t("opt-in + exactly 16 -> temp-workspace", chooseDisplayMode(16, true, true) === "temp-workspace");
   t("zoneName prefixes fanout-", zoneName("abc") === "fanout-abc");
   t("zone-open fail degrades temp-workspace to headless (FN4-B)", degradeDisplay("temp-workspace", false) === "headless");
   t("zone opened keeps temp-workspace", degradeDisplay("temp-workspace", true) === "temp-workspace");
@@ -96,6 +100,9 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   const unacked = { generation: 1, delivered: true, accepted: false };
   const rearm = nextReceipt(unacked, true, true);
   t("unacked prior delivery RE-ARMS to a new generation", rearm.generation === 2 && rearm.delivered && rearm.accepted);
+  const accepted = { generation: 1, delivered: true, accepted: true };
+  t("an ACCEPTED receipt is FINAL even if a later pass is not-all-terminal (FN3)", nextReceipt(accepted, false, false) === accepted);
+  t("an accepted receipt is not re-delivered when still all-terminal", nextReceipt(accepted, true, true) === accepted);
 }
 
 // --- progress line ---
@@ -123,6 +130,11 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("under depth cap admits", admitDepth(0) === true && admitDepth(1) === true);
   t("at depth cap refuses (stops agent-spawns-agent)", admitDepth(2) === false);
   t("custom cap honored", admitDepth(3, 5) === true && admitDepth(5, 5) === false);
+  t("parseDepth absent/empty -> 0 root (FN6)", parseDepth(undefined) === 0 && parseDepth("") === 0);
+  t("parseDepth valid integer", parseDepth("2") === 2);
+  t("parseDepth NaN -> null (rejected, not coerced, FN6)", parseDepth("x") === null);
+  t("parseDepth negative -> null", parseDepth("-1") === null);
+  t("parseDepth non-integer -> null", parseDepth("1.5") === null);
 }
 
 // --- orphan sweep (pit 2.4: orphan process) ---
@@ -162,7 +174,8 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("non-zero exit (42) -> failed (FN8)", classifyExit({ spawnOk: true, exitCode: 42, outputPresent: true }) === "failed");
   t("clean exit + output -> done", classifyExit({ spawnOk: true, exitCode: 0, outputPresent: true }) === "done");
   t("clean exit + NO output -> failed (empty yield not a silent success)", classifyExit({ spawnOk: true, exitCode: 0, outputPresent: false }) === "failed");
-  t("unknown exit + output -> done", classifyExit({ spawnOk: true, outputPresent: true }) === "done");
+  t("unknown exit + output -> FAILED (no success without an explicit 0 exit, FN8)", classifyExit({ spawnOk: true, outputPresent: true }) === "failed");
+  t("null exit + output -> failed (FN8)", classifyExit({ spawnOk: true, exitCode: null, outputPresent: true }) === "failed");
   t("unknown exit + no output -> failed", classifyExit({ spawnOk: true, outputPresent: false }) === "failed");
 }
 
@@ -176,6 +189,9 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("budget ticket for a different run rejected", validBudgetTicket({ runKey: "rX", maxTokens: 1000, issuedAt: 1 }, "r1") === false);
   t("budget ticket with no ceiling rejected", validBudgetTicket({ runKey: "r1", issuedAt: 1 }, "r1") === false);
   t("budget ticket null rejected", validBudgetTicket(null, "r1") === false);
+  t("Infinity maxTokens rejected (FN7)", validBudgetTicket({ runKey: "r1", maxTokens: Infinity, issuedAt: 1 }, "r1") === false);
+  t("NaN maxUsd rejected (FN7)", validBudgetTicket({ runKey: "r1", maxUsd: NaN, issuedAt: 1 }, "r1") === false);
+  t("Infinity ROI ratio rejected (FN7)", validRoiEstimate({ runKey: "r1", speedupRatio: Infinity, costRatio: 1 }, "r1") === false);
 }
 
 // --- FN2: resume reuses prior DONE rows by key, never re-runs them ---

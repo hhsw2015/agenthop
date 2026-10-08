@@ -36,6 +36,7 @@ export type FanoutRequest = {
   mode: FanoutMode;
   reduce: string;
   budget: FanoutBudget;
+  visible?: boolean; // FN4: visible (temp-workspace) is an EXPLICIT opt-in; default/absent = headless
 };
 
 const TASK_CLASSES = new Set<string>(["scan", "extract", "format", "judge", "synthesize", "aggregate", "adjudicate"]);
@@ -61,6 +62,7 @@ export function validateFanoutRequest(raw: unknown): ValidationResult {
   if (!Array.isArray(r.units) || r.units.length === 0) return { ok: false, reason: "units must be a non-empty array" };
   if (r.mode !== "fresh" && r.mode !== "keep_alive") return { ok: false, reason: "mode must be fresh|keep_alive" };
   if (!isStr(r.reduce)) return { ok: false, reason: "reduce rule missing" };
+  if (r.visible !== undefined && typeof r.visible !== "boolean") return { ok: false, reason: "visible must be a boolean" };
   const budget = (r.budget ?? {}) as Record<string, unknown>;
   if (budget.maxTokens !== undefined && !isNonNeg(budget.maxTokens)) return { ok: false, reason: "budget.maxTokens must be >= 0" };
   if (budget.maxUsd !== undefined && !isNonNeg(budget.maxUsd)) return { ok: false, reason: "budget.maxUsd must be >= 0" };
@@ -70,6 +72,7 @@ export function validateFanoutRequest(raw: unknown): ValidationResult {
     if (typeof u !== "object" || u === null) return { ok: false, reason: "a unit is not an object" };
     const uo = u as Record<string, unknown>;
     if (!isStr(uo.key)) return { ok: false, reason: "a unit key is missing or empty" };
+    if (!isSafeRunKey(uo.key)) return { ok: false, reason: `unit key must be a safe slug (no separators/traversal): ${uo.key}` };
     if (seen.has(uo.key)) return { ok: false, reason: `duplicate unit key: ${uo.key}` };
     seen.add(uo.key);
     if (!isStr(uo.prompt)) return { ok: false, reason: `unit ${uo.key}: prompt missing` };
@@ -88,7 +91,7 @@ export function validateFanoutRequest(raw: unknown): ValidationResult {
     ...(budget.maxTokens !== undefined ? { maxTokens: budget.maxTokens as number } : {}),
     ...(budget.maxUsd !== undefined ? { maxUsd: budget.maxUsd as number } : {}),
   };
-  return { ok: true, req: { runKey: r.runKey, units, mode: r.mode, reduce: r.reduce, budget: budgetClean } };
+  return { ok: true, req: { runKey: r.runKey, units, mode: r.mode, reduce: r.reduce, budget: budgetClean, ...(r.visible !== undefined ? { visible: r.visible as boolean } : {}) } };
 }
 
 // An explicit tier overrides the class default; otherwise the class decides.
@@ -131,7 +134,8 @@ export type DisplayMode = "temp-workspace" | "headless";
 // The self-built pool shows units as VISIBLE panes in a temporary herdr workspace by default; it degrades to
 // headless when herdr is unreachable or the batch exceeds the per-zone pane budget. Governance is identical
 // either way — degradation changes display, never the guardrail/ledger/aggregate.
-export function chooseDisplayMode(n: number, herdrReachable: boolean): DisplayMode {
+export function chooseDisplayMode(n: number, herdrReachable: boolean, visibleOptIn: boolean): DisplayMode {
+  if (!visibleOptIn) return "headless"; // FN4: headless is the DEFAULT; visible is an explicit opt-in
   if (!herdrReachable) return "headless";
   if (n > PANE_BUDGET) return "headless";
   return "temp-workspace";
@@ -228,9 +232,11 @@ export function reduceUnits(results: readonly UnitResult[]): Reduced {
 export type AggregateReceipt = { generation: number; delivered: boolean; accepted: boolean };
 export function nextReceipt(prev: AggregateReceipt | undefined, allTerminal: boolean, ackOk: boolean): AggregateReceipt {
   const gen = prev?.generation ?? 0;
+  // An ACCEPTED generation is FINAL — never downgraded, even if a later pass is not-all-terminal (FN3): a retry
+  // of a failed item in an already-accepted run must not revoke the accepted fact.
+  if (prev?.delivered && prev.accepted) return prev;
   if (!allTerminal) return { generation: gen, delivered: false, accepted: false };
-  if (prev?.delivered && prev.accepted) return prev; // idempotent: already delivered and acked
-  // first delivery, or re-arm after a prior unacked delivery
+  // first delivery, or re-arm after a prior UNACKED delivery
   return { generation: gen + 1, delivered: true, accepted: ackOk };
 }
 
@@ -251,6 +257,14 @@ export const DEFAULT_MAX_DEPTH = 2; // a fan-out unit may not itself fan out bey
 // A unit may spawn its own sub-units only while under the depth cap — stops agent-spawns-agent runaway.
 export function admitDepth(currentDepth: number, maxDepth: number = DEFAULT_MAX_DEPTH): boolean {
   return currentDepth < maxDepth;
+}
+
+// FN6: parse a carried depth strictly. Absent/empty = a root request (0); a PRESENT-but-invalid value (NaN,
+// negative, non-integer) is REJECTED (null), never silently coerced to 0 (which would bypass the cap).
+export function parseDepth(raw: string | undefined): number | null {
+  if (raw === undefined || raw === "") return 0;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
 // Orphan sweep: a unit still marked running whose OS pid is no longer live is orphaned → mark it timeout (the
@@ -276,24 +290,28 @@ export function canReapZone(zone: string, ourRunKeys: ReadonlySet<string>): bool
 // yield is not silently a success.
 export function classifyExit(opts: { spawnOk: boolean; exitCode?: number | null; outputPresent: boolean }): "done" | "failed" {
   if (!opts.spawnOk) return "failed";
-  if (opts.exitCode !== undefined && opts.exitCode !== null && opts.exitCode !== 0) return "failed";
+  // done ONLY on an EXPLICIT zero exit WITH output — an unknown/null/non-zero exit is never a success (FN8).
+  if (opts.exitCode !== 0) return "failed";
   return opts.outputPresent ? "done" : "failed";
 }
 
 // FN7: the width ROI tier needs a REAL estimate bound to this run (env may carry a pointer to it, never be the
 // evidence). A valid estimate names the runKey and gives positive speedup- and cost-ratios.
+// A positive FINITE number — FN7: Infinity/NaN must never pass an amount/quota/ratio check.
+const posFinite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v > 0;
+
 export type RoiEstimate = { runKey: string; speedupRatio: number; costRatio: number };
 export function validRoiEstimate(obj: unknown, runKey: string): boolean {
   const o = obj as Partial<RoiEstimate> | null;
-  return !!o && o.runKey === runKey && typeof o.speedupRatio === "number" && o.speedupRatio > 0 && typeof o.costRatio === "number" && o.costRatio > 0;
+  return !!o && o.runKey === runKey && posFinite(o.speedupRatio) && posFinite(o.costRatio);
 }
 
-// FN7: the over-32 tier needs a valid budget ticket bound to this run (a real ceiling, not a bare flag).
+// FN7: the over-32 tier needs a valid budget ticket bound to this run (a real FINITE ceiling, not a bare flag).
 export type BudgetTicket = { runKey: string; maxTokens?: number; maxUsd?: number; issuedAt: number };
 export function validBudgetTicket(obj: unknown, runKey: string): boolean {
   const o = obj as Partial<BudgetTicket> | null;
-  if (!o || o.runKey !== runKey || typeof o.issuedAt !== "number") return false;
-  return (typeof o.maxTokens === "number" && o.maxTokens > 0) || (typeof o.maxUsd === "number" && o.maxUsd > 0);
+  if (!o || o.runKey !== runKey || typeof o.issuedAt !== "number" || !Number.isFinite(o.issuedAt)) return false;
+  return posFinite(o.maxTokens) || posFinite(o.maxUsd);
 }
 
 // FN2: resume — reuse the prior ledger's DONE rows by content-addressed key; everything else is to-run. A

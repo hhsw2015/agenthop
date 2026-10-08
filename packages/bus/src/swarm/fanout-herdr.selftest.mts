@@ -32,7 +32,8 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
 // --- unit command (tier-model explicit; F41 single atomic command) ---
 {
   t("doneMarker format", doneMarker("k1") === "FANOUT_DONE_k1");
-  const cmd = unitCommand({ bin: "claude", model: "claude-haiku-5-5", prompt: "scan the repo", outputFile: "/t/out.log", key: "k1" });
+  const cmd = unitCommand({ bin: "claude", model: "claude-haiku-5-5", prompt: "scan the repo", outputFile: "/t/out.log", key: "k1", childDepth: 1 });
+  t("command carries FANOUT_DEPTH to the child (FN6 visible depth)", cmd.startsWith("FANOUT_DEPTH=1 "));
   t("command sets the tier-model on the command line", cmd.includes(`--model ${shquote("claude-haiku-5-5")}`));
   t("command passes the prompt via -p, shell-quoted", cmd.includes(`-p ${shquote("scan the repo")}`));
   t("command redirects all output to the harvest file", cmd.includes(`> ${shquote("/t/out.log")} 2>&1`));
@@ -41,11 +42,11 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   t("default extra args skip permissions", cmd.includes("--dangerously-skip-permissions"));
   // F41 char-swallow defense: a prompt with quotes/semicolons stays ONE safe command (shquote escapes it),
   // run atomically by `pane run` — not typed character-by-character via send-text.
-  const tricky = unitCommand({ bin: "claude", model: "m", prompt: `a'; rm -rf /; echo '`, outputFile: "/t/o", key: "k2" });
+  const tricky = unitCommand({ bin: "claude", model: "m", prompt: `a'; rm -rf /; echo '`, outputFile: "/t/o", key: "k2", childDepth: 1 });
   t("a prompt with quotes/semicolons is shell-quoted, not injected", tricky.includes(`-p ${shquote(`a'; rm -rf /; echo '`)}`));
   t("the tricky command is a single line (no raw newline)", !tricky.includes("\n"));
   // override extra args (e.g. a different tool/flags)
-  const custom = unitCommand({ bin: "codex", model: "m", prompt: "p", outputFile: "/o", key: "k", extraArgs: ["exec", "--yolo"] });
+  const custom = unitCommand({ bin: "codex", model: "m", prompt: "p", outputFile: "/o", key: "k", childDepth: 2, extraArgs: ["exec", "--yolo"] });
   t("extraArgs override is honored", custom.includes(`codex --model ${shquote("m")} exec --yolo -p`));
 }
 
