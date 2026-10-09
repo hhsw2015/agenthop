@@ -63,17 +63,17 @@ export function relaySameMachineSid(peer: UnifiedPeer, isLocalInstance: (sid: st
   return isLocalInstance(peer.stableId) ? peer.stableId : null;
 }
 
-/** F45-P1-2 (round-5): a live presence pid is the REAL writer of `presence/<sid>.pid` only if the process was already
- *  running when that file was written — i.e. its start time is at/under the file's mtime. The presence daemon writes the
- *  file with its own pid at startup (presence.ts), so for the genuine owner `procStart <= fileMtime`. A STALE file whose pid
- *  was RECYCLED to an unrelated later process fails this: the recycled process started AFTER the old file ⇒ `procStart >
- *  fileMtime` ⇒ rejected. This is unforgeable from argv/env text (the round-4 hole): it reads neither — only the OS start
- *  time and the file mtime. (A deliberately FORGED fresh presence file pointing at an existing process requires write access
- *  to ~/.agenthop/presence — below the trust boundary: anyone with it can write the inbox directly.) Non-finite inputs ⇒
- *  false (unknown ⇒ keep relay, never a false durable). `toleranceSec` absorbs mtime/clock granularity. Pure. */
-export function pidFileFresh(procStartSec: number, fileMtimeSec: number, toleranceSec = 2): boolean {
-  if (!Number.isFinite(procStartSec) || !Number.isFinite(fileMtimeSec)) return false;
-  return procStartSec <= fileMtimeSec + toleranceSec;
+/** F45-P1-2 (round-6): a live presence pid belongs to session `sid`'s CURRENT instance only if that instance is ACTIVELY
+ *  maintaining `presence/<sid>.pid` — i.e. the file's mtime is FRESH (the daemon heartbeats it every PRESENCE_HEARTBEAT_SEC;
+ *  see presence.ts). A pid RECYCLED to an unrelated process does NOT heartbeat the stale file, so its mtime goes cold ⇒
+ *  rejected ⇒ keep relay. This binds to an ACTIVE local association rather than a start-time comparison, whose 1-second
+ *  `ps` granularity let a same-second recycle (procStart within the tolerance of fileMtime) masquerade as the writer — the
+ *  round-5 hole. `maxAgeSec` spans a few missed heartbeats so a merely-busy daemon is never misjudged. Non-finite inputs ⇒
+ *  false (unknown ⇒ keep relay, never a false durable). Pure. */
+export function pidFileFresh(fileMtimeSec: number, nowSec: number, maxAgeSec: number): boolean {
+  if (!Number.isFinite(fileMtimeSec) || !Number.isFinite(nowSec) || !Number.isFinite(maxAgeSec)) return false;
+  const age = nowSec - fileMtimeSec;
+  return age >= 0 ? age <= maxAgeSec : -age <= maxAgeSec; // fresh within the window (a small future skew is tolerated symmetrically)
 }
 
 export function resolveInboxTarget(to: string, resolved: UnifiedPeer | ResolveError, offlineSid: string | null, relayLocalSid: string | null = null): InboxTarget {

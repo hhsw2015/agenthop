@@ -1,6 +1,7 @@
 import net from "node:net";
-import { rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync, utimesSync } from "node:fs";
 import { startBusCore, type BusCoreOptions } from "./core.js";
+import { PRESENCE_HEARTBEAT_SEC } from "./swarm/task-liveness.js";
 import { dbg } from "./debug.js";
 
 /**
@@ -43,8 +44,14 @@ export function runPresence(opts: BusCoreOptions = {}): void {
   const core = startBusCore(opts);
   dbg(`presence up: ${core.self.title} (tool=${core.self.tool} stable=${core.self.stableId ?? "-"})`);
   // Keep the process alive. The daemon is detached (its own session, no controlling terminal, stdio ignored), so a
-  // ref'd timer is what holds the event loop open — a non-compiled bun/node script stays up on that alone.
-  const keepAlive = setInterval(() => {}, 60000);
+  // ref'd timer is what holds the event loop open — a non-compiled bun/node script stays up on that alone. This timer
+  // ALSO HEARTBEATS the pid file's mtime (F45-P1-2): a live same-machine peer proves THIS instance is current by the file
+  // being fresh; a stale mtime means the daemon is gone and the pid may be recycled, so the send path keeps relay rather
+  // than a false local durable redirect. Keyed on the file's freshness (an active association), not on process start time
+  // (whose 1s granularity let a same-second recycle masquerade as the original writer).
+  const keepAlive = setInterval(() => {
+    if (pidFile) { try { const t = new Date(); utimesSync(pidFile, t, t); } catch { /* best effort — the pid file may be gone on shutdown */ } }
+  }, PRESENCE_HEARTBEAT_SEC * 1000);
 
   let closing = false;
   const timers: Array<ReturnType<typeof setInterval>> = [keepAlive];

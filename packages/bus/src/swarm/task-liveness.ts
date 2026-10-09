@@ -61,8 +61,14 @@ export function resolveSession(ownerHandle: string, sessionIds: string[]): strin
 
 // --- real-fs binding (the TEMP v1; bus-identity replaces it). Thin; the testable decisions are above. -------------
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import path from "node:path";
+
+/** F45-P1-2: the presence daemon refreshes its pid file's mtime this often (presence.ts), so a live same-machine instance
+ *  keeps the file FRESH; a pid file older than PRESENCE_FRESH_MAX_SEC means the daemon is gone (and the pid may be recycled
+ *  to an unrelated process) — the send path then keeps relay instead of a false local durable redirect. The window is a few
+ *  missed heartbeats so a merely-busy daemon is never misjudged. */
+export const PRESENCE_HEARTBEAT_SEC = 30;
+export const PRESENCE_FRESH_MAX_SEC = 95;
 
 /** Native sessionIds that have a presence pid file under <home>/.agenthop/presence/<id>.pid (for resolveSession). */
 export function listSessions(home: string): string[] {
@@ -90,22 +96,9 @@ export function makeFileLiveness(home: string): LivenessIO {
   };
 }
 
-/** F45-P1-2: the START TIME (epoch seconds) of a live pid, via `ps -o lstart=`, or null if unavailable. Used to prove a
- *  presence pid is the REAL writer of its pid file (procStart <= fileMtime) and not a later recycle — reads only the OS
- *  start time, never argv/env text (unforgeable). Rare path (same-machine relay peer only), so a synchronous `ps` is fine. */
-export function readProcStartSec(pid: number): number | null {
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 4000 }).trim();
-    if (!out) return null;
-    const ms = Date.parse(out);
-    return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
-  } catch { return null; }
-}
-
-/** F45-P1-2: the mtime (epoch seconds) of `presence/<sid>.pid`, or null if missing/unreadable. The presence daemon writes
- *  this file once at startup, so its mtime is the daemon's write time — compared against readProcStartSec to reject a stale
- *  file whose pid was recycled. */
+/** F45-P1-2: the mtime (epoch seconds) of `presence/<sid>.pid`, or null if missing/unreadable. The presence daemon keeps
+ *  this fresh (heartbeat every PRESENCE_HEARTBEAT_SEC); a mtime older than PRESENCE_FRESH_MAX_SEC ⇒ the daemon is gone, so
+ *  the live pid in the file (if any) is a recycle, not the current instance. */
 export function pidFileMtimeSec(home: string, sessionId: string): number | null {
   try { return Math.floor(statSync(path.join(home, ".agenthop", "presence", `${sessionId}.pid`)).mtimeMs / 1000); }
   catch { return null; }

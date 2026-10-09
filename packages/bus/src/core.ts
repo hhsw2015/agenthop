@@ -11,7 +11,7 @@ import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
 import { resolveInboxTarget, relaySameMachineSid, pidFileFresh } from "./send-fallback.js";
-import { resolveSession, listSessions, fileIsAlive, makeFileLiveness, readProcStartSec, pidFileMtimeSec } from "./swarm/task-liveness.js";
+import { resolveSession, listSessions, fileIsAlive, makeFileLiveness, pidFileMtimeSec, PRESENCE_FRESH_MAX_SEC } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -428,16 +428,15 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       const sessionList = listSessions(home);
       const liveness = makeFileLiveness(home);
       // F45 ③ (P1-2 hardened): a relay-resolved peer is cross-BROKER, not necessarily cross-MACHINE. Route durable to it ONLY
-      // if its OWN full sid owns a presence pid that is (a) alive AND (b) the REAL writer of presence/<sid>.pid — proven by
-      // the process start time being at/under the file's mtime (the daemon writes the file at startup; a recycled pid starts
-      // AFTER the stale file ⇒ rejected). Reads only OS start time + file mtime, never argv/env text (unforgeable). Unproven
-      // ⇒ keep relay (never silently redirect a remote peer to a local inbox nobody drains).
+      // if its OWN full sid owns a presence pid that is (a) alive AND (b) part of a CURRENT instance — proven by the pid
+      // file being FRESH (the live daemon heartbeats presence/<sid>.pid; a pid recycled to an unrelated process does not,
+      // so a stale mtime ⇒ reject). An active local association, not a start-time compare (whose 1s granularity let a
+      // same-second recycle pass). Unproven ⇒ keep relay (never silently redirect a remote peer to a local inbox nobody drains).
+      const nowSec = Date.now() / 1000;
       const isLocalInstance = (sid: string): boolean => {
         if (fileIsAlive(sid, liveness) !== "alive") return false;      // (a) a live pid in presence/<sid>.pid
-        const pid = liveness.readPid(sid);
-        if (pid == null) return false;
-        const procStart = readProcStartSec(pid), mtime = pidFileMtimeSec(home, sid);
-        return procStart != null && mtime != null && pidFileFresh(procStart, mtime); // (b) that live pid WROTE the file (not a recycle)
+        const mtime = pidFileMtimeSec(home, sid);
+        return mtime != null && pidFileFresh(mtime, nowSec, PRESENCE_FRESH_MAX_SEC); // (b) the daemon is actively heartbeating it (current, not a recycle)
       };
       const relayLocalSid = !("error" in resolvedPeer) ? relaySameMachineSid(resolvedPeer, isLocalInstance) : null;
       const target = resolveInboxTarget(to, resolvedPeer, resolveSession(to, sessionList), relayLocalSid);

@@ -37,7 +37,7 @@ user 重启协调者后，新壳拿到全新 native sid，未继承稳定 sid（
 
 **现场证据**（本单实时复现）：我的 `~/.agenthop/inbox/90b58f9c-…/` 顶层空，吸收批与 F45 两次派单都不在；派单仅经总线桥到达。唯一的隔离件是 10-05 的旧 reboot-rollcall（与本缺口无关）。
 
-**修复**（round-5 收紧，F45-P1-2：活 pid≠当前实例归属）：`relaySameMachineSid(peer, isLocalInstance)` 的 `isLocalInstance` 证明**活 pid 就是 `presence/<sid>.pid` 的真实写入者**——纯 `pidFileFresh(procStart, fileMtime)`：进程启动时刻 ≤ 文件 mtime（守护进程启动即写该文件、被回收的新 pid 启动晚于陈旧文件 ⇒ `procStart > mtime` ⇒ 拒）。只读 OS 启动时刻（`readProcStartSec` 经 `ps -o lstart=`）+ 文件 mtime（`pidFileMtimeSec`）、**不读 argv/env 文本**（round-4 洞：ps 文本混 argv+env、继承变量可伪冒、均弃）。core `isLocalInstance`=signal-0 活 AND pidFileFresh。无法证明=保留 relay。伪造新鲜 presence 文件需写 `~/.agenthop/presence` 写权=信任边界下（有此权可直接写箱）。
+**修复**（round-6 收口，F45-P1-2：时间容差把同秒复用的 PID 误授权为原写入者）：弃启动时刻比较，改**文件新鲜度=活动本地关联**。presence 守护进程每 `PRESENCE_HEARTBEAT_SEC`（30s）心跳刷新 `presence/<sid>.pid` 的 mtime（presence.ts keepAlive）；`pidFileFresh(fileMtime, now, maxAge=95s)` 判 mtime 是否新鲜。被回收到无关进程的 pid **不**心跳那陈旧文件 ⇒ mtime 变冷 ⇒ 拒 ⇒ 保留 relay。core `isLocalInstance`=signal-0 活 AND pidFileFresh。窗口=数个心跳容忍繁忙守护；只读文件 mtime 不读 argv/env/启动时刻、无 1s 粒度洞。**scope 注：本轮扩及 presence.ts 守护进程（+心跳一行、安全：仅 touch 自有 pid 文件、无其他读者依赖其 mtime 作启动时刻）——这是「等价本地关联」所需的守护侧配合。** 真跨机（无本地新鲜 presence）仍 relay。
 
 这是修 bug（非 dormant 新机制）：改在本分支、未合并故 main 不受影响，经合并门后应**默认生效**。
 
