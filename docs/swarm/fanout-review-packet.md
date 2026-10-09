@@ -1,6 +1,12 @@
-# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 9
+# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 10
 
-- **Branch** `feat/fanout-native`  **HEAD** `8401017`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`, r4 `b7b5fd9`, r5 `5e58b48`, r6 `9c15c20`, r7 `6a2380b`, r8 `0111607`)
+- **Branch** `feat/fanout-native`  **HEAD** `9dde6ef`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`, r4 `b7b5fd9`, r5 `5e58b48`, r6 `9c15c20`, r7 `6a2380b`, r8 `0111607`, r9 `8401017`)
+
+## Round 10 — round-9 REMAIN resolved (FN9; the headless rollback branch)
+- FN9 (P2) round-9's headless rollback despawned the child, IGNORED the result, then deleted the lease unconditionally — a despawn that kept failing (child alive) freed the slot → over-admission. Now the childPid write is RETRIED (a transient glitch clears, keeping the launch tracked and proceeding normally); only if it persistently fails does the undo run, and it despawns + VERIFIES the pid is dead (bounded loop) before releasing. A child that survives despawn HOLDS the lease (never deleted under a live execution) and hands back loudly — capacity is never freed while the child runs. (Visible bind-save-fail stays stopped pre-launch from r9.)
+- Gates: bus tsc 0, scripts tsc 0, fanout selftest 142, fanout-herdr selftest 23, bus vitest 991/991.
+
+## Round 9 — round-8 REMAIN resolved (FN9; a failed lease-identity write stops the launch)
 
 ## Round 9 — round-8 REMAIN resolved (FN9; a failed lease-identity write stops the launch)
 - FN9 (P2) `bindLeaseZone`/`bindLeaseChild` ignored `writeJsonAtomic`'s result, so a lease-identity write failure left a BARE driver-pid lease while the task still launched — another run then reaped that slot on driver death (child/pane still running) → over-admission. Both now RETURN the write result and the launch is GATED on it: visible — `bindLeaseZone` runs BEFORE the pane-run, a failed write releases the lease, fails the unit, and skips the launch (nothing spawned); headless — `bindLeaseChild` runs post-spawn (the pid is only known then), a failed write UNDOES the launch (despawn the child, fail the unit, release the lease) so no executed slot ever outlives its durable binding.
