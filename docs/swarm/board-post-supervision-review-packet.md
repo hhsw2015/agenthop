@@ -1,6 +1,12 @@
-# Review packet — BA9 board-post supervision (§2d-a, an R14 pre-flight), ROUND 5
+# Review packet — BA9 board-post supervision (§2d-a, an R14 pre-flight), ROUND 6
 
-- **Branch** `feat/board-post-supervision`  **HEAD** `311254b`  **Base** `main` (`5da42b5`)  (round-1 `52533f3`, round-2 `68e41e0`, round-3 `37afbbd`, round-4 `23e6c2e`)
+- **Branch** `feat/board-post-supervision`  **HEAD** `6c9f3ab`  **Base** `main` (`5da42b5`)  (round-1 `52533f3`, round-2 `68e41e0`, round-3 `37afbbd`, round-4 `23e6c2e`, round-5 `311254b`)
+
+## Round 6 — round-5 REMAIN resolved (BP3; the identity-encoding edge)
+- BP3 (P2) `boardFileIdentityVerified` validated only the string TYPE, then hashed to `boardItemId`. `boardItemId`'s UTF-8 encoding folds a lone surrogate (U+D800) to the SAME bytes as a real U+FFFD, so an ill-formed forged body hashed to a legit item's key → counted as a live state → evicted its repost tmp, while the consumer (`parseClaimApplication`) rejected that same body (fresh post, count lost). It now runs the SAME `isValidIdComponent` check the consumer entry uses BEFORE hashing (well-formed UTF-8 round-trip + path/convention-safe): a lone surrogate is not verified (never evicts), a genuine U+FFFD stays legit.
+- Gates: bus tsc 0, scripts tsc 0, bus vitest 1087/1087 (board test 46, +1 BP3 round-6 — asserts the lone-surrogate↔U+FFFD collision is defended).
+
+## Round 5 — round-4 REMAIN resolved (BP3; body-verified eviction + obligation under a live writer pid)
 - **Reviewer** codex `01a0ead5` (cross-family, independent)  **Author** bus-pen `d7f6c917`
 - **Design** `docs/swarm/board-post-supervision-design.md` @`93023c6` (coordinator-approved, zero change)
 
