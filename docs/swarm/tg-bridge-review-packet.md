@@ -1,6 +1,7 @@
-# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 8
+# Review packet — TG user-entry v1 (notify + collect-approvals) — ✅ REVIEW CLEARED (r8, 0 REMAIN)
 
-- **Branch** `feat/tg-bridge`  **HEAD** `6ba107c`  **Base** `main` (`bdd93d7`)  (r1 `7c6dff0` · r2 `f34ca77` · r3 `ccabe66` · r4 `2a56429` · r5 `6f80b89` · r6 `96a1adb` · r7 `bd0656e`)
+- **✅ CLEARED @`6ba107c`** by codex `01a0ff49` (r8: 0 P1 / 0 P2 / 0 P3, 0 REMAIN, 0 nit). Merge = coordinator's call; enable (bot creation + token + `SWARM_TG_ENTRY=1`) = the user's one-time step (dormant by default). This pen STOPs.
+- **Branch** `feat/tg-bridge`  **HEAD** `6ba107c`  **Base** `main` (`bdd93d7`)  (r1 `7c6dff0` · r2 `f34ca77` · r3 `ccabe66` · r4 `2a56429` · r5 `6f80b89` · r6 `96a1adb` · r7 `bd0656e` · r8 `6ba107c`)
 
 ## Round 8 — round-7 REMAIN resolved (1 P2): the legacy-import lifecycle
 The r7 verdict CLOSED the snapshot/tap semantics and left one P2 — the legacy-import edge cases.
