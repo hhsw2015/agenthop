@@ -11,8 +11,9 @@
  */
 
 /** One item awaiting a verdict. `summary` is ONE line (the whole point); `suggestedAction` is the coordinator's recommended
- *  default; `evidenceRef` is a POINTER (path / url / handle), never inlined content (S18). `kind` groups it for the UI. */
-export type DecisionItem = { id: string; kind: string; summary: string; suggestedAction: string; evidenceRef?: string };
+ *  default; `evidenceRef` is a POINTER (path / url / handle), never inlined content (S18). `kind` groups it for the UI.
+ *  `hardGate` marks a spend/publish/irreversible item — a verdict on it may NEVER be remembered "always" (R16). */
+export type DecisionItem = { id: string; kind: string; summary: string; suggestedAction: string; evidenceRef?: string; hardGate?: boolean };
 
 /** A batch of items the owner (coordinator) asks the user to clear in one pass. */
 export type DecisionBatch = { batchId: string; owner: string; createdAtSec: number; items: DecisionItem[] };
@@ -21,8 +22,21 @@ export type DecisionBatch = { batchId: string; owner: string; createdAtSec: numb
 export type Verdict = "approve" | "reject" | "defer";
 export const VERDICTS: readonly Verdict[] = ["approve", "reject", "defer"];
 
-/** One decision the user made; `reason` is an optional one-line note. */
-export type Decision = { id: string; verdict: Verdict; reason?: string };
+/** The REMEMBERED scope of an approve verdict (borrowed from nanoMuse): just this once, this conversation, or always.
+ *  Shared by EVERY entry (console / TG / future PWA) so a decision means the same thing regardless of where it was made. */
+export type ApprovalScope = "once" | "this-chat" | "always";
+export const APPROVAL_SCOPES: readonly ApprovalScope[] = ["once", "this-chat", "always"];
+
+/** The scopes an entry may OFFER for an item. A HARD-gate item (spend / publish / irreversible) offers ONLY `once` — an
+ *  irreversible action is never blanket-remembered (R16: no standing auto-consent to the three gates). Pure; every entry
+ *  renders the SAME allowed set, so console and TG can never diverge on what "always" is permitted for. */
+export function allowedScopes(item: DecisionItem): ApprovalScope[] {
+  return item.hardGate ? ["once"] : ["once", "this-chat", "always"];
+}
+
+/** One decision the user made; `reason` is an optional one-line note. `scope` is the remembered scope of an approve verdict
+ *  (absent => "once"); it is dropped for reject/defer, and never honored as "always" on a hard-gate item (validated). */
+export type Decision = { id: string; verdict: Verdict; reason?: string; scope?: ApprovalScope };
 
 /** The user's decisions for a batch (written back by the console/CLI). */
 export type DecisionsDoc = { batchId: string; decidedAtSec: number; decisions: Decision[] };
@@ -37,9 +51,11 @@ export function validDecisionItem(raw: unknown): DecisionItem | null {
   const r = raw as Record<string, unknown>;
   if (!isNonEmptyStr(r.id) || !isNonEmptyStr(r.kind) || !isNonEmptyStr(r.summary) || !isNonEmptyStr(r.suggestedAction)) return null;
   if (r.evidenceRef !== undefined && !isStr(r.evidenceRef)) return null;
+  if (r.hardGate !== undefined && typeof r.hardGate !== "boolean") return null;
   return {
     id: r.id, kind: r.kind, summary: r.summary, suggestedAction: r.suggestedAction,
     ...(isStr(r.evidenceRef) ? { evidenceRef: r.evidenceRef } : {}),
+    ...(r.hardGate === true ? { hardGate: true } : {}),
   };
 }
 
@@ -69,7 +85,11 @@ export function validDecision(raw: unknown): Decision | null {
   if (!isNonEmptyStr(r.id)) return null;
   if (r.verdict !== "approve" && r.verdict !== "reject" && r.verdict !== "defer") return null;
   if (r.reason !== undefined && !isStr(r.reason)) return null;
-  return { id: r.id, verdict: r.verdict, ...(isStr(r.reason) ? { reason: r.reason } : {}) };
+  if (r.scope !== undefined && !APPROVAL_SCOPES.includes(r.scope as ApprovalScope)) return null;
+  // scope is meaningful ONLY on an approve verdict; dropped for reject/defer. (The hard-gate "never always" rule is enforced
+  // where the buttons are offered — allowedScopes — and re-checkable here by the consumer against the item's hardGate.)
+  const scope = r.verdict === "approve" && APPROVAL_SCOPES.includes(r.scope as ApprovalScope) ? (r.scope as ApprovalScope) : undefined;
+  return { id: r.id, verdict: r.verdict, ...(isStr(r.reason) ? { reason: r.reason } : {}), ...(scope ? { scope } : {}) };
 }
 
 /** Validate a parsed decisions doc: batchId non-empty, decidedAtSec finite, decisions an array of valid decisions (a torn /

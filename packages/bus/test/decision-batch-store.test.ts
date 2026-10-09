@@ -365,3 +365,32 @@ describe("decision-batch store (IO)", () => {
     expect(consumeDecisions(HOME, "b1").consumed).toBe(false); // terminal, final
   });
 });
+
+// TG entry (user-entry layer): two entries (console + TG) over the SINGLE decision ledger. The consume-once seal means
+// whoever decides FIRST wins and the other entry's later verdict is a NO-OP — no double-execute, no fork. (Coordinator-
+// mandated counterexample for the tg-entry charter.)
+describe("two entries, one ledger: consume-once makes the second entry a no-op (no fork)", () => {
+  test("console approves first -> a later TG reject is a no-op (write refused, never executed)", () => {
+    openBatch(HOME, { batchId: "e1", owner: "coord", items: [item("1")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "e1", decidedAtSec: 2, decisions: [{ id: "1", verdict: "approve" }] }); // console
+    const first = consumeDecisions(HOME, "e1");
+    expect(first.consumed).toBe(true);
+    expect(first.resolved.map((r) => r.verdict)).toEqual(["approve"]);
+    // TG, later: the batch is sealed, so the conflicting write is REFUSED (the strongest no-fork — it never reaches the ledger).
+    expect(() => writeDecisions(HOME, { batchId: "e1", decidedAtSec: 3, decisions: [{ id: "1", verdict: "reject" }] })).toThrow(/already consumed/);
+    const second = consumeDecisions(HOME, "e1");
+    expect(second.consumed).toBe(false);     // terminal; nothing new to execute
+    expect(second.resolved).toEqual([]);      // the TG reject NEVER executes
+  });
+  test("bidirectional: TG approves first -> a later console reject is a no-op (write refused)", () => {
+    openBatch(HOME, { batchId: "e2", owner: "coord", items: [item("1")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "e2", decidedAtSec: 2, decisions: [{ id: "1", verdict: "approve", scope: "once" }] }); // TG (carries a scope)
+    const first = consumeDecisions(HOME, "e2");
+    expect(first.consumed).toBe(true);
+    expect(first.resolved.map((r) => r.verdict)).toEqual(["approve"]);
+    expect(() => writeDecisions(HOME, { batchId: "e2", decidedAtSec: 3, decisions: [{ id: "1", verdict: "reject" }] })).toThrow(/already consumed/); // console, later
+    const second = consumeDecisions(HOME, "e2");
+    expect(second.consumed).toBe(false);
+    expect(second.resolved).toEqual([]);
+  });
+});
