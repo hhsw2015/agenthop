@@ -855,11 +855,19 @@ async function main(): Promise<void> {
   // the applicant, and mark the board item `granted` ONLY once the receipt is written. If the receipt write fails, LEAVE the
   // claim as claimed — next tick's reconcile re-enters here and retries, so the receipt obligation is never silently dropped.
   // A benign duplicate receipt is acceptable; a lost one is not. NO execution side-effect (boundary #3 — A2 wires startTask).
-  const deliverGrantAndMark = (claim: { itemId: string; who: string }, grant: { attemptId: string; waitId: string; bindingId?: string; envelope?: boolean }): void => {
+  // §2b OPEN result: "none" = no envelope needed (node has no required output) ⇒ mark granted normally; "deferred" = OPEN
+  // could not complete ⇒ EO1 the caller keeps the claim (retry next reconcile), NEVER mark granted; "opened" = registered +
+  // wait committed, carries the frozen identity the receipt needs (EO3).
+  type EnvelopeOpen = { status: "none" } | { status: "deferred" } | { status: "opened"; requestId: string; payloadDigest: string; revision?: number };
+  const deliverGrantAndMark = (claim: { itemId: string; who: string }, grant: { attemptId: string; waitId: string; bindingId?: string; envelope?: EnvelopeOpen }): void => {
     const claimFile = path.join(BOARD_DIR, claimedFileName(claim.itemId, claim.who));
     const grantedFile = path.join(BOARD_DIR, grantedFileName(claim.itemId, claim.who));
     const bindingNote = grant.bindingId ? ` (binding ${grant.bindingId})` : "";
-    const envelopeNote = grant.envelope ? `; delegation envelope open (requestId ${grant.attemptId})` : ""; // §2b OPEN: the requestId IS the attempt
+    // EO3: the receipt carries the envelope's requestId + payloadDigest + subject revision + a RESOLVABLE payload source
+    // (the delegations registry, keyed by requestId, holds the inline frozen payload) — enough to locate the frozen payload
+    // and run receiptMatches. No execution asked (A2).
+    const e = grant.envelope?.status === "opened" ? grant.envelope : undefined;
+    const envelopeNote = e ? `; delegation envelope OPEN — requestId ${e.requestId}, payloadDigest ${e.payloadDigest}, subject revision ${e.revision ?? "?"}, payload source: delegations registry [${e.requestId}] @ ${DELEGATIONS_FILE}` : "";
     try { writeInbox(HOME, claim.who, { from: SELF, fromLabel: "swarm-admission", text: `[admission] granted ${claim.itemId} → attempt ${grant.attemptId}${bindingNote}; supervision wait ${grant.waitId} open${envelopeNote}. DO NOT begin execution — A2 (real dispatch/V8) is not wired yet.`, via: "local", ts: Date.now() }); }
     catch (e) { log(`board admission ${claim.itemId}: receipt write failed (grant committed) — claim kept, retry next tick: ${e instanceof Error ? e.message : e}`); return; } // BA5: do NOT mark granted until the receipt is delivered
     try { renameSync(claimFile, grantedFile); } catch (e) { log(`board admission ${claim.itemId}: granted-rename failed (receipt delivered; reconciled next tick): ${e instanceof Error ? e.message : e}`); }
@@ -872,24 +880,28 @@ async function main(): Promise<void> {
   // sees a persisted envelope with no wait). Idempotent on the attemptId (= requestId): a re-grant/reconcile replay re-opens
   // nothing (no new wait). Best-effort + isolated: a skip/defer just means the next reconcile retries (receipt still delivered;
   // START stays A2 — this opens + supervises, never executes). Returns whether the envelope is active (for the receipt note).
-  const openGrantEnvelope = (st: LogState, app: ClaimApplication, attemptId: string): boolean => {
+  const openGrantEnvelope = (st: LogState, app: ClaimApplication, attemptId: string): EnvelopeOpen => {
     try {
       const p = currentPlan(st, app.jobId);
-      if (p === undefined) return false; // no authoritative plan ⇒ nothing to open (defensive; the grant already resolved one)
+      if (p === undefined) return { status: "deferred" }; // no authoritative plan now ⇒ retry next reconcile
       const spec = planGrantEnvelope({ jobId: app.jobId, nodeId: app.nodeId, attemptId, specDigest: app.specDigest, inputBindingDigest: app.inputBindingDigest }, p, nowSec(), app.who, SELF);
-      if (spec === null) return false; // node has no required output ⇒ nothing to observe ⇒ no envelope
+      if (spec === null) return { status: "none" }; // node has no required output ⇒ nothing to observe ⇒ no envelope (mark granted normally)
       let reg: DelegationRegistry;
-      try { reg = readDelegations(DELEGATIONS_FILE); } catch (e) { log(`board envelope ${app.jobId}/${app.nodeId}: delegations unreadable — skip open (retry next reconcile): ${e instanceof Error ? e.message : e}`); return false; } // corrupt ⇒ never overwrite
+      try { reg = readDelegations(DELEGATIONS_FILE); } catch (e) { log(`board envelope ${app.jobId}/${app.nodeId}: delegations unreadable — retry next reconcile: ${e instanceof Error ? e.message : e}`); return { status: "deferred" }; } // corrupt ⇒ never overwrite
       const open = openDelegation(reg, spec, nowSec());
-      if (!open.ok) { log(`board envelope ${app.jobId}/${app.nodeId}: open rejected (${open.reason})`); return false; }
-      if (open.openProductionWait !== undefined) { // a fresh open (not an idempotent replay) ⇒ commit its production-wait FIRST
+      if (!open.ok) { log(`board envelope ${app.jobId}/${app.nodeId}: open rejected (${open.reason}) — retry next reconcile`); return { status: "deferred" }; }
+      // EO2: adopt an already-committed wait by CONTROL's facts. openDelegation emits openProductionWait on a FRESH registry
+      // entry — but the registry may have been LOST after a prior wait-commit, so commit ONLY when the wait is ABSENT from
+      // CONTROL. An existing wait (open OR resolved/frozen) is preserved as-is — never re-committed (which would reopen a
+      // resolved wait or reset its deadline, erasing the close reason).
+      if (open.openProductionWait !== undefined && findWaitIn(st, open.openProductionWait.waitId) === undefined) {
         const w = open.openProductionWait;
         const committed = commitTask(st, [{ put: "wait", wait: { waitId: w.waitId, kind: "wait", subject: { jobId: w.jobId }, state: "open", deadlineSec: w.deadlineSec, owner: w.owner, timeoutPolicy: "escalate" } }]).result.ok;
-        if (!committed) { log(`board envelope ${app.jobId}/${app.nodeId}: production-wait commit deferred — retry next reconcile`); return false; } // never persist the registry without its wait
+        if (!committed) { log(`board envelope ${app.jobId}/${app.nodeId}: production-wait commit deferred — retry next reconcile`); return { status: "deferred" }; } // never persist the registry without its wait
       }
       writeDelegations(DELEGATIONS_FILE, open.registry);
-      return true;
-    } catch (e) { log(`board envelope open failed (isolated): ${e instanceof Error ? e.message : e}`); return false; }
+      return { status: "opened", requestId: spec.requestId, payloadDigest: spec.payloadDigest, ...(spec.subject.revision !== undefined ? { revision: spec.subject.revision } : {}) };
+    } catch (e) { log(`board envelope open failed (isolated) — retry next reconcile: ${e instanceof Error ? e.message : e}`); return { status: "deferred" }; }
   };
 
   // §2d-b admission CONSUMER (board admission 5/n, v2 — codex 3fda743 review): a claim (`<item>.claimed.<who>.json`) is a
@@ -924,11 +936,18 @@ async function main(): Promise<void> {
         });
         if (verdict.verdict === "defer") { log(`board admission: ${claim.itemId} deferred — ${verdict.reason}`); continue; } // transient ⇒ leave claim, re-review next tick
         if (verdict.verdict === "reject") { rejectClaim(claim, verdict.reason); continue; }
-        if (verdict.verdict === "reconcile") { const env = openGrantEnvelope(state, app, verdict.attemptId); deliverGrantAndMark(claim, { attemptId: verdict.attemptId, waitId: grantWaitId(verdict.attemptId), envelope: env }); continue; } // BA5: re-deliver receipt (+ retry the envelope open, idempotent) then mark
+        if (verdict.verdict === "reconcile") {
+          const env = openGrantEnvelope(state, app, verdict.attemptId); // retry the envelope open (idempotent) on reconcile
+          if (env.status === "deferred") { log(`board admission ${claim.itemId}: envelope OPEN still deferred — claim kept for retry`); continue; } // EO1: never mark granted without the envelope
+          deliverGrantAndMark(claim, { attemptId: verdict.attemptId, waitId: grantWaitId(verdict.attemptId), envelope: env }); continue; // BA5: re-deliver receipt then mark
+        }
         // GRANT: commit intent+attempt(+retired)+supervision wait (NO startTask). A failed commit leaves the claim for re-review.
         const r = commitTask(state, verdict.bodies);
         if (!r.result.ok) { log(`board admission ${claim.itemId}: grant commit rejected (${r.result.reason}) — claim left for re-review next tick`); continue; }
         const env = openGrantEnvelope(r.state, app, verdict.attemptId); // §2b OPEN the production envelope on the post-grant state
+        // EO1: a DEFERRED open must NOT mark granted — keep the claim so the next tick's reconcile retries OPEN (the grant
+        // attempt is already durable; the receipt + granted-rename wait until the envelope is open). Never granted-without-envelope.
+        if (env.status === "deferred") { log(`board admission ${claim.itemId}: envelope OPEN deferred — claim kept for retry (grant committed, receipt pending)`); continue; }
         deliverGrantAndMark(claim, { attemptId: verdict.attemptId, waitId: verdict.waitId, bindingId: verdict.bindingId, envelope: env });
       } catch (e) { log(`board claim ${claim.itemId} failed (isolated): ${e instanceof Error ? e.message : e}`); }
     }
