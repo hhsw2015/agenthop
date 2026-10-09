@@ -60,7 +60,7 @@ import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inb
 import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
 import { AlertDedup, alertKey, classifyMemberHealth, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
-import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
+import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
@@ -816,7 +816,10 @@ async function main(): Promise<void> {
       }
     }
     log(`[observer→coordinator] ${text}${COORDINATOR === "" ? " (SWARM_COORDINATOR unset — logged)" : " (coordinator unresolved — logged)"}`);
-    notifySent.set(key, now); return "logged";
+    // Do NOT record dedup on the log-only path (AS-P2-3): nothing was delivered to the inbox, so an identical notice that
+    // CAN be delivered once the coordinator becomes resolvable must not be suppressed as a "deduped" success. notifySent is
+    // recorded ONLY on a real delivery (above), so a later recovery re-delivers instead of silently dropping the advice.
+    return "logged";
   };
 
   // §2d-a board producer (board admission 5/n, the PULL path): post the current READY nodes as claimable board items so an
@@ -1365,23 +1368,41 @@ async function main(): Promise<void> {
   let autoscaleWant: "up" | "down" | "none" = "none";
   let autoscaleWantSinceSec = nowSec();
   let lastAutoscaleSuggestSec = 0;
+  let autoscaleReadInFlight = false;
   const runReviewAutoscaleSuggest = (): void => {
     if (!autoscaleEnabled()) return; // SWARM_REVIEW_AUTOSCALE default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT)
+    if (autoscaleReadInFlight) return; // single-flight (AS-P2-4): never overlap reads, so a slow older read cannot resolve late and clobber a newer snapshot
+    autoscaleReadInFlight = true;
     void (async () => {
-      const records = await readReviewLedger(reviewQueueDir(HOME));
-      if (records.length === 0) { autoscaleWant = "none"; autoscaleWantSinceSec = nowSec(); return; } // empty ledger ⇒ nothing to advise
-      const sessions = listSessions(HOME);
-      const liveOf = (id: string): boolean => resolveSession(id, sessions) !== null; // phantom-depth guard: a dead author/seat does not count
-      const liveAuthors = new Set(records.map((r) => r.author).filter((a) => a !== "" && liveOf(a)));
-      const liveSeats = new Set(records.map((r) => r.seat).filter((s) => liveOf(s)));
-      const seats = buildSeatStatesFromLedger(records, liveSeats, SCALE_CFG, nowSec());
-      // Track the raw want's continuity across ticks (reset on flip), feeding the planner's sustain gate.
-      const want = instantaneousWant(queueDepth(filterLiveRecords(records, liveAuthors, liveSeats)), seats, SCALE_CFG);
-      if (want !== autoscaleWant) { autoscaleWant = want; autoscaleWantSinceSec = nowSec(); }
-      const sustainedSec = nowSec() - autoscaleWantSinceSec;
-      const sinceLastActionSec = nowSec() - lastAutoscaleSuggestSec; // no seats move; min-dwell just throttles re-suggesting
-      const sug = planAutoscaleSuggestion({ records, liveAuthors, liveSeats, seats, cfg: SCALE_CFG, sinceLastActionSec, sustainedSec });
-      if (sug && notifyCoordinator(sug.text, { taskRef: "autoscale-suggest", title: "autoscale" }) !== "failed") lastAutoscaleSuggestSec = nowSec();
+      try {
+        const records = await readReviewLedger(reviewQueueDir(HOME));
+        if (records.length === 0) { autoscaleWant = "none"; autoscaleWantSinceSec = nowSec(); return; } // empty ledger ⇒ nothing to advise
+        // Phantom-depth guard (AS-P2-1): resolve each author/seat to its canonical native sid AND confirm the process is
+        // actually ALIVE (a pid file alone is not life — kill(0): ESRCH ⇒ dead). Aliases of one seat collapse to the one
+        // canonical id (AS-P2-2), so capacity is never inflated by an alias; all ticket work is kept.
+        const sessions = listSessions(HOME);
+        const io = makeFileLiveness(HOME);
+        const resolveLive = (id: string): string | null => {
+          const sid = resolveSession(id, sessions);
+          if (sid === null) return null;
+          const pid = io.readPid(sid);
+          return pid !== null && io.procAlive(pid) === "alive" ? sid : null;
+        };
+        const canon = canonicalizeLiveRecords(records, resolveLive);
+        const seats = buildSeatStatesFromLedger(canon.records, canon.liveSeats, SCALE_CFG, nowSec());
+        // Track the raw want's continuity across ticks (reset on flip), feeding the planner's sustain gate.
+        const want = instantaneousWant(queueDepth(filterLiveRecords(canon.records, canon.liveAuthors, canon.liveSeats)), seats, SCALE_CFG);
+        if (want !== autoscaleWant) { autoscaleWant = want; autoscaleWantSinceSec = nowSec(); }
+        const sustainedSec = nowSec() - autoscaleWantSinceSec;
+        const sinceLastActionSec = nowSec() - lastAutoscaleSuggestSec; // no seats move; min-dwell just throttles re-suggesting
+        const sug = planAutoscaleSuggestion({ records: canon.records, liveAuthors: canon.liveAuthors, liveSeats: canon.liveSeats, seats, cfg: SCALE_CFG, sinceLastActionSec, sustainedSec });
+        // Only a REAL delivery consumes the cooldown slot (AS-P2-3): a logged (coordinator unresolved) or deduped result is
+        // NOT a successful report, so lastAutoscaleSuggestSec does not advance and the still-standing advice re-delivers once
+        // the coordinator becomes reachable.
+        if (sug && notifyCoordinator(sug.text, { taskRef: "autoscale-suggest", title: "autoscale" }) === "delivered") lastAutoscaleSuggestSec = nowSec();
+      } finally {
+        autoscaleReadInFlight = false;
+      }
     })().catch((e) => log(`review-autoscale suggest failed (isolated): ${e instanceof Error ? e.message : e}`));
   };
 

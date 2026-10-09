@@ -264,6 +264,39 @@ export function buildSeatStatesFromLedger(
   }));
 }
 
+/**
+ * Canonicalize review records against presence for suggestion mode (AS-P2-1 + AS-P2-2). `resolveLive(id)` must resolve an
+ * identity to its CANONICAL native session id AND confirm the process is actually alive (a pid file alone is not life — a
+ * stale file pointing at a dead pid resolves but is NOT live), returning null for a dead/unresolvable id. Each record keeps
+ * ALL its work (a 5-ticket queue stays 5 tickets), but two ALIASES of one seat (e.g. a full sid and its short prefix) both
+ * map to the one canonical id, so capacity is never inflated by an alias; a dead/unresolvable seat or author keeps its RAW id
+ * (absent from liveSeats/liveAuthors ⇒ excluded downstream, never counted). Returns the canonicalized records + the canonical
+ * live id sets. Pure; `resolveLive` is injected (the IO — presence + kill(0) — lives in the caller). resolveLive is memoized
+ * per distinct id.
+ */
+export function canonicalizeLiveRecords(
+  records: readonly ReviewRecord[],
+  resolveLive: (id: string) => string | null,
+): { records: ReviewRecord[]; liveAuthors: Set<string>; liveSeats: Set<SeatId> } {
+  const liveAuthors = new Set<string>();
+  const liveSeats = new Set<SeatId>();
+  const memo = new Map<string, string | null>();
+  const canon = (id: string): string | null => {
+    if (memo.has(id)) return memo.get(id)!;
+    const c = resolveLive(id);
+    memo.set(id, c);
+    return c;
+  };
+  const out = records.map((r) => {
+    const cSeat = canon(r.seat);
+    const cAuthor = r.author !== "" ? canon(r.author) : null;
+    if (cSeat !== null) liveSeats.add(cSeat);
+    if (cAuthor !== null) liveAuthors.add(cAuthor);
+    return { ...r, seat: cSeat ?? r.seat, author: cAuthor ?? r.author };
+  });
+  return { records: out, liveAuthors, liveSeats };
+}
+
 // ============================================================================================================
 // IO shell — ledger + wiring (exercised by live/integration runs, NOT the selftest)
 // ============================================================================================================

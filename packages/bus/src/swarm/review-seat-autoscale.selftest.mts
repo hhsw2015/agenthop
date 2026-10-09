@@ -7,6 +7,7 @@ import {
   planAutoscaleSuggestion,
   instantaneousWant,
   buildSeatStatesFromLedger,
+  canonicalizeLiveRecords,
   buildReviewSeatBirthCert,
   parseReviewFileName,
   isValidReviewId,
@@ -118,6 +119,27 @@ t("buildSeatStates: idle = inFlight===0 (ledger proxy)", bS1.idle === false && b
 t("buildSeatStates: a ledger seat NOT in presence is not live", buildSeatStatesFromLedger([rec("a", "dead", "x")], new Set<string>(), CFG, 1000)[0]!.live === false);
 t("buildSeatStates: floor marks the cfg.floor most-senior LIVE seats", (() => { const r = buildSeatStatesFromLedger([{ ...rec("a", "old", "x"), sentSec: 5 }, { ...rec("b", "new", "x"), sentSec: 50 }, { ...rec("c", "newest", "x"), sentSec: 99 }], new Set(["old", "new", "newest"]), CFG, 1000); return r.find((s) => s.seat === "old")!.floor && r.find((s) => s.seat === "new")!.floor && !r.find((s) => s.seat === "newest")!.floor; })());
 t("buildSeatStates: prototype-key seat names are plain keys (Map-based)", (() => { const r = buildSeatStatesFromLedger([rec("a", "toString", "x"), rec("b", "__proto__", "x")], new Set(["toString", "__proto__"]), CFG, 1000); return r.length === 2 && r.every((s) => s.inFlight === 1); })());
+
+// --- canonicalizeLiveRecords: AS-P2-1 liveness + AS-P2-2 alias collapse ---
+{
+  // resolveLive: S1full/S1short → S1full (canonical); S2 → S2; "dead"/"ghost" → null (dead or unresolvable)
+  const rl = (id: string): string | null => (id === "S1full" || id === "S1short" ? "S1full" : id === "S2" ? "S2" : id === "AUTH" ? "AUTH" : null);
+  const recs = [rec("t0", "S1full", "AUTH"), rec("t1", "S1short", "AUTH"), rec("t2", "S1full", "AUTH"), rec("t3", "S2", "AUTH"), rec("t4", "S2", "AUTH")];
+  const c = canonicalizeLiveRecords(recs, rl);
+  t("canonicalize: aliases collapse to ONE canonical seat (2 live seats, not 3)", c.liveSeats.size === 2 && c.liveSeats.has("S1full") && c.liveSeats.has("S2"));
+  t("canonicalize: ALL work kept (5 records, no ticket dropped)", c.records.length === 5);
+  t("canonicalize: alias record's seat rewritten to canonical", c.records[1]!.seat === "S1full");
+  t("canonicalize: 3 records now attributed to the canonical seat", c.records.filter((r) => r.seat === "S1full").length === 3);
+  // a dead seat is excluded from liveSeats but its record is kept (raw seat), so it is filtered downstream not silently dropped
+  const d = canonicalizeLiveRecords([rec("x", "dead", "AUTH"), rec("y", "S2", "AUTH")], rl);
+  t("canonicalize: a DEAD seat is excluded from liveSeats (pid-file-alone is not life)", !d.liveSeats.has("dead") && d.liveSeats.has("S2") && d.records.length === 2);
+  // empty author never enters liveAuthors (no identity to confirm live)
+  const e = canonicalizeLiveRecords([rec("z", "S2", "")], rl);
+  t("canonicalize: empty author is not counted (unverifiable)", e.liveAuthors.size === 0 && e.liveSeats.has("S2"));
+  // a dead author excludes its records downstream (liveAuthors empty)
+  const f = canonicalizeLiveRecords([rec("w", "S2", "ghost")], rl);
+  t("canonicalize: a dead author is excluded from liveAuthors", f.liveAuthors.size === 0);
+}
 
 // --- planAutoscaleSuggestion: suggestion mode (compose filter→depth→scaleDecision→render; NEVER acts) ---
 const upRecs = [rec("t1", "s1", "alice"), rec("t2", "s1", "alice"), rec("t3", "s2", "alice"), rec("t4", "s2", "alice"), rec("t5", "s1", "alice")]; // 5 live open

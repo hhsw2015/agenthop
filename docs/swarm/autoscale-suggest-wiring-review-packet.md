@@ -31,8 +31,22 @@ Files (`git diff --stat 3732f4b..HEAD`):
 7. **Producer CLI** — wraps the signed `markReviewOpen`/`markReviewDone`; validates ids (dotted/`done` rejected, exit 1);
    `AH_HOME` honored; a standalone script so F44 `isDispatcherLoopCommand` needs no change.
 
+## Round-1 fixes (0P1/4P2/0P3 @aaea0db → this SHA)
+
+- **AS-P2-1** (pid-file ≠ alive): `canonicalizeLiveRecords` + `resolveLive` now confirm the process is ALIVE via
+  `makeFileLiveness` `kill(0)` (ESRCH ⇒ dead), not just that a presence file exists. A dead author/seat never enters
+  liveAuthors/liveSeats.
+- **AS-P2-2** (alias double-count): records are canonicalized to the resolved native sid; two aliases of one seat collapse to
+  one, all ticket work kept (no alias record dropped).
+- **AS-P2-3** (log-only consumes the slot): the cooldown advances ONLY on a real `"delivered"`; and `notifyCoordinator` no
+  longer records dedup on its log-only path, so a still-standing suggestion re-delivers once the coordinator is reachable.
+- **AS-P2-4** (stale read clobbers newer): `autoscaleReadInFlight` single-flight — reads never overlap (the extractor gains
+  this one var name).
+- **AS-N1** (nit): `review-ledger.ts` + contract now document that `author` is optional syntax but REQUIRED to count, with a
+  full example.
+
 ## Verification already run
 
-review-seat-autoscale selftest 68/68 · bus tsc 0 · scripts tsc 0 · producer CLI smoke (open → `<t>.<s>.json`, done → rename to
-`.done.json`, dotted id → exit 1) · full bus 85 files / 1124 tests pass. Not pushed, not merged (merge/enable gate =
-coordinator + user).
+review-seat-autoscale selftest 75/75 · bus tsc 0 · scripts tsc 0 · reviewer probe `autoscale-boundaries.test.ts` 11/11 (was
+7/11; harness consumer-extraction list adapted to add `autoscaleReadInFlight`, per the blessed refactor) · producer CLI smoke ·
+full bus 85 files / 1124 tests pass. Not pushed, not merged (merge/enable gate = coordinator + user).

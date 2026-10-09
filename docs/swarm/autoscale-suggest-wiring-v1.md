@@ -16,17 +16,22 @@ is R16, the user's). Master switch `SWARM_REVIEW_AUTOSCALE` stays **default OFF*
 
 ## Consumer — the suggestion step (`scripts/swarm-dispatch.ts`, sweep tick)
 
-Each sweep tick, when `autoscaleEnabled()`:
+Each sweep tick, when `autoscaleEnabled()` and no read is already in flight (single-flight, AS-P2-4):
 1. `readReviewLedger(reviewQueueDir(HOME))` — the durable review-queue records.
-2. Presence (phantom-depth guard): a record's author/seat counts only if `resolveSession(id, listSessions(HOME))` resolves live.
-3. `buildSeatStatesFromLedger(records, liveSeats, SCALE_CFG, now)` → `filterLiveRecords` → `queueDepth` → `instantaneousWant`
+2. Phantom-depth guard (AS-P2-1 + AS-P2-2) via `canonicalizeLiveRecords`: `resolveLive(id)` resolves an identity to its
+   CANONICAL native sid AND confirms the process is actually ALIVE — `makeFileLiveness` `kill(0)`, ESRCH ⇒ dead (a pid file
+   alone is not life). Aliases of one seat collapse to one canonical id (capacity never inflated by an alias); all ticket work
+   is kept.
+3. `buildSeatStatesFromLedger(canon.records, canon.liveSeats, …)` → `filterLiveRecords` → `queueDepth` → `instantaneousWant`
    (tracked across ticks for the sustain window) → `planAutoscaleSuggestion`.
-4. A non-null suggestion is delivered via the existing `notifyCoordinator(text, { taskRef: "autoscale-suggest", title:
-   "autoscale" })` — an **S11** durable-inbox message (`{via, taskRef, title, text}`, team-collab-design §133).
+4. A non-null suggestion is delivered via `notifyCoordinator(text, { taskRef: "autoscale-suggest", title: "autoscale" })` —
+   an **S11** durable-inbox message (`{via, taskRef, title, text}`, team-collab-design §133).
 
-Cross-tick state: the raw want's continuity (→ `sustainedSec`, debounces a transient spike) and the last-suggestion time (→
-`sinceLastActionSec`, so `scaleDecision`'s min-dwell throttles how often a suggestion re-fires; no seats move, so min-dwell
-only paces advice). Fully fail-soft: the ledger scan + inbox write are isolated and never break the sweep.
+Cross-tick state: `autoscaleReadInFlight` (single-flight), the raw want's continuity (→ `sustainedSec`, debounces a transient
+spike), and the last-DELIVERED time (→ `sinceLastActionSec`). The cooldown advances **only on a real `"delivered"`** (AS-P2-3):
+a log-only (coordinator unresolved) or deduped result is not a successful report, so a still-standing suggestion re-delivers
+once the coordinator is reachable — and `notifyCoordinator` no longer records dedup on its log-only path, so the recovery
+delivery is not suppressed. Fully fail-soft: the ledger scan + inbox write are isolated and never break the sweep.
 
 `SCALE_CFG` is TUNABLE via env (defaults): `SWARM_REVIEW_KUP`=2, `SWARM_REVIEW_KDOWN`=1 (kUp>kDown ⇒ hysteresis),
 `SWARM_REVIEW_FLOOR`=2, `SWARM_REVIEW_SUSTAIN_SEC`=60, `SWARM_REVIEW_MIN_DWELL_SEC`=300.
@@ -41,6 +46,11 @@ The ledger had **no producer** (the signed `markReviewOpen`/`markReviewDone` had
 
 It wraps the SIGNED ledger primitives (which validate ids + write atomically); a bad id fails loud (exit 1). A standalone CLI
 (not a `swarm-dispatch.ts` one-shot mode) so F44's `isDispatcherLoopCommand` one-shot set needs no change.
+
+**`author` is optional syntax but REQUIRED to count** (AS-N1): the consumer counts an open record only when BOTH its seat AND
+its author resolve to a live session. An empty/unresolvable author ⇒ the record is written (audit) but excluded from the
+queue-depth signal. Pass the submitting session's native sid. Full counting example:
+`review-ledger.ts open feat-autoscale <reviewer-sid> <author-sid> <sha>` then `review-ledger.ts done feat-autoscale <reviewer-sid>`.
 
 ## New pure helpers (`review-seat-autoscale.ts`, selftested)
 
