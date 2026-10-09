@@ -1,6 +1,17 @@
-# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 3
+# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 4
 
-- **Branch** `feat/tg-bridge`  **HEAD** `ccabe66`  **Base** `main` (`bdd93d7`)  (round-1 `7c6dff0`, round-2 `f34ca77`)
+- **Branch** `feat/tg-bridge`  **HEAD** `2a56429`  **Base** `main` (`bdd93d7`)  (r1 `7c6dff0`, r2 `f34ca77`, r3 `ccabe66`)
+
+## Round 4 — round-3 REMAIN resolved (2 P1 + 1 P2, one window)
+The r3 verdict was **2 P1 + 1 P2 (3 REMAIN)**: the fold ordered by the 1-second `decidedAtSec` so a same-second console write-after-tap lost; the tap filename hashed the item id and aliased distinct UTF-8-coinciding ids; the read contract was incomplete (readDecisions ignored the claim, consume deleted taps leaving only a digest, so the existing bandwidth reader miscounted). All three fixed; the r2 items stay CLOSED; P2-5 stays deferred to v1.1.
+
+- **TG-R3-P1-1 (P1) — fold by WRITE order, not the second.** `foldDecisionDocs` now takes an explicit per-source `order` token and orders by it; the store supplies each source file's mtime in ns (`readDocEntry`). The latest-WRITTEN decision per id wins, from EITHER entry — no fixed entry preference. A console reject written after a tap approve in the same second wins; a tap written after a console snapshot wins; a newer second always wins. A true mtime tie breaks deterministically by `decidedAtSec`. Regression tests both directions + the reverse/next-second controls.
+- **TG-P1-2 (P1, was still-REMAIN) — lossless tap key.** The tap file is keyed by the item's INDEX in the batch (`taps/<idx>.json`), not a hash of the id. Distinct ids whose UTF-8 encodings coincide (unpaired surrogate U+D800 vs U+FFFD) now get distinct files and both survive to consume (regression test asserts `resolved.length === 2`). The index is unique per item and always path-safe.
+- **TG-R3-P2-1 (P2) — canonical consumed record + complete read.** `readDecisions` folds `decisions.json` + a recoverable claim + every tap (so a reader never misses a claimed-but-not-sealed decision — backlog no longer miscounts). `consumeDecisions` PERSISTS the full merged doc to the claim (`decisions-consumed-claim.json`, the canonical consumed record) BEFORE the terminal seal, then removes the taps — so the existing bandwidth collector (`collectBandwidthEvents` → `readBoundDoc(claim)` for a consumed batch; `readDecisions` for backlog) sees the complete set. Regression tests for tap-only + mixed (claim has all 2, `consumeAtSec.length === 2`) and recoverable-claim+tap (`readDecisions` has both, `backlog === 0`). A tap read failure still PROPAGATES (an unreadable taps dir throws rather than sealing).
+- Gates: bus tsc 0, scripts tsc 0, tg-entry selftest pass, **decision-batch 46** (+7 round-4 counterexamples), dual-bandwidth 16, full bus no new failures (one pre-existing flaky cross-machine relay timing test passes in isolation).
+- **Reviewer** codex `01a0ff49` (happycapy)  **Author** bus-pen `d7f6c917`
+
+## Round 3 (resolved) — round-2 REMAIN resolved (2P1 + 2P2, one window)
 
 ## Round 3 — round-2 REMAIN resolved (2P1 + 2P2, one window)
 The r2 verdict was **2P1 + 2P2 (4 REMAIN)**: a single-item tap still dropped a sibling (recoverable claim / concurrent snapshot); a 40-bit short hash could approve the wrong batch; a ref-lookup read failure still advanced the offset; console's `writeDecisions` skipped `enforceScope`. All four are fixed; P1-3 / P2-2 / P2-4 stay CLOSED; P2-5 stays deferred to v1.1 (coordinator-accepted, not counted).
