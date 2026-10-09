@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { fallbackForUnresolved, fallbackForMissedDelivery, resolveInboxTarget } from "../src/send-fallback.js";
+import { fallbackForUnresolved, fallbackForMissedDelivery, resolveInboxTarget, relaySameMachineSid } from "../src/send-fallback.js";
 import type { UnifiedPeer, ResolveError } from "../src/resolve.js";
 
 const peer = (p: Partial<UnifiedPeer>): UnifiedPeer => ({ id: "run-1", tool: "claude", cwd: "/x", title: "t", via: "local", ...p });
@@ -53,6 +53,30 @@ describe("F40 resolveInboxTarget — the single write-side addressing entry", ()
   test("F45 ③: a truly CROSS-MACHINE relay peer (no local presence match) stays relay", () => {
     const p = peer({ via: "relay", stableId: "sid-remote", title: "remote:box", pub: "pk" });
     expect(resolveInboxTarget("remote:box", p, null, null)).toEqual({ kind: "relay", peer: p });
+  });
+});
+
+describe("F45-P1-2 relaySameMachineSid — a filename is not proof; the pid must be LIVE", () => {
+  const relayPeer = (sid?: string) => peer({ via: "relay", stableId: sid, title: "claude:agenthop-x", pub: "pk" });
+  const alive = () => "alive" as const;
+
+  test("live presence pid for the peer's OWN sid ⇒ same-machine (route durable)", () => {
+    expect(relaySameMachineSid(relayPeer("sid-1"), ["sid-1"], alive)).toBe("sid-1");
+  });
+  test("DEAD pid ⇒ null (keep relay; don't redirect a remote peer to a local box)", () => {
+    expect(relaySameMachineSid(relayPeer("sid-1"), ["sid-1"], () => "dead")).toBeNull();
+  });
+  test("CORRUPT/unreadable presence (suspected) ⇒ null", () => {
+    expect(relaySameMachineSid(relayPeer("sid-1"), ["sid-1"], () => "suspected")).toBeNull();
+  });
+  test("no presence file for the exact sid ⇒ null (a short-id filename is not it)", () => {
+    expect(relaySameMachineSid(relayPeer("sid-1"), ["sid-2"], alive)).toBeNull();
+  });
+  test("a LOCAL peer is not this helper's concern ⇒ null", () => {
+    expect(relaySameMachineSid(peer({ via: "local", stableId: "sid-1" }), ["sid-1"], alive)).toBeNull();
+  });
+  test("relay peer with no stableId ⇒ null", () => {
+    expect(relaySameMachineSid(relayPeer(undefined), ["sid-1"], alive)).toBeNull();
   });
 
   test("UNRESOLVED no-match + an offline presence sid ⇒ durable to THAT sid (label = the address); no sid ⇒ none", () => {

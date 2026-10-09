@@ -18,9 +18,11 @@
 
 export type ReportSurface = "inbox" | "s19" | "herdr-pane" | "log";
 
-/** `isReport` is TRUE iff the notice reached a surface that actually informs the coordinator. It is FALSE only for "log"
- *  — a log line is not a report (the F45 ② ruling). The caller treats isReport=false as a delivery FAILURE to retry, not
- *  a success. */
+/** `isReport` says whether the CHOSEN surface COUNTS as a reporting surface (one that can inform the coordinator) — it is
+ *  FALSE only for "log" (a log line is not a report, the F45 ② ruling). F45-N1: this is a ROUTING decision made from
+ *  availability inputs; it does NOT mean the notice was delivered. Actual delivery success is confirmed separately by the
+ *  IO caller's receipt. The caller treats isReport=false as "no reporting surface was chosen" (escalate/alarm), never as a
+ *  confirmed send. */
 export interface ReportPlan {
   surface: ReportSurface;
   isReport: boolean;
@@ -32,18 +34,19 @@ export interface ReportPlan {
 export type ReportSeverity = "info" | "stall" | "critical";
 
 /**
- * Decide where a coordinator notice goes.
- *  - coordinator RESOLVED ⇒ "inbox" (the durable-inbox path; a real report).
- *  - UNRESOLVED + info ⇒ "log" (not a report, but info does not escalate).
- *  - UNRESOLVED + stall/critical ⇒ escalate: "s19" (structured incident, preferred) ▸ "herdr-pane" (send-text) ▸ "log"
- *    (DEGRADED, isReport=false — the notice is deaf, surfaced so the caller can retry/alarm).
+ * CHOOSE where a coordinator notice should go (a routing plan — not a delivery; the IO caller performs the send and
+ * confirms it):
+ *  - coordinator RESOLVED ⇒ "inbox" (the durable-inbox path; a reporting surface).
+ *  - UNRESOLVED + info ⇒ "log" (not a reporting surface, but info does not escalate).
+ *  - UNRESOLVED + stall/critical ⇒ choose a reporting surface: "s19" (structured incident, preferred) ▸ "herdr-pane"
+ *    (send-text) ▸ "log" (DEGRADED, isReport=false — no reporting surface available, surfaced so the caller can alarm).
  * Pure. */
 export function coordinatorReportPlan(opts: { coordinatorResolved: boolean; s19Available: boolean; herdrPaneAvailable: boolean; severity: ReportSeverity }): ReportPlan {
-  if (opts.coordinatorResolved) return { surface: "inbox", isReport: true, reason: "coordinator resolved — durable inbox" };
-  if (opts.severity === "info") return { surface: "log", isReport: false, reason: "coordinator unresolved; info notice does not escalate — logged (not a report)" };
-  if (opts.s19Available) return { surface: "s19", isReport: true, reason: "coordinator unresolved — escalated to a structured S19 incident event" };
-  if (opts.herdrPaneAvailable) return { surface: "herdr-pane", isReport: true, reason: "coordinator unresolved, no S19 surface — send-text to the coordinator's herdr pane" };
-  return { surface: "log", isReport: false, reason: "coordinator unresolved and no S19/pane surface — DEGRADED to log; notice is DEAF (not a report)" };
+  if (opts.coordinatorResolved) return { surface: "inbox", isReport: true, reason: "coordinator resolved — route to durable inbox" };
+  if (opts.severity === "info") return { surface: "log", isReport: false, reason: "coordinator unresolved; info notice does not escalate — route to log (not a reporting surface)" };
+  if (opts.s19Available) return { surface: "s19", isReport: true, reason: "coordinator unresolved — route to a structured S19 incident event (preferred)" };
+  if (opts.herdrPaneAvailable) return { surface: "herdr-pane", isReport: true, reason: "coordinator unresolved, no S19 surface — route to send-text on the coordinator's herdr pane" };
+  return { surface: "log", isReport: false, reason: "coordinator unresolved and no S19/pane surface — DEGRADED to log; no reporting surface available (not a report)" };
 }
 
 // ============================================================================================================

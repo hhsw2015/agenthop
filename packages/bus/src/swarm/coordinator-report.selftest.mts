@@ -15,7 +15,7 @@ t("unresolved critical + s19 -> s19", plan({ severity: "critical", s19Available:
 t("unresolved stall + no s19 + herdr -> herdr-pane, isReport", (() => { const p = plan({ herdrPaneAvailable: true }); return p.surface === "herdr-pane" && p.isReport; })());
 t("s19 preferred over herdr when both", plan({ s19Available: true, herdrPaneAvailable: true }).surface === "s19");
 t("unresolved stall + neither -> log, NOT a report", (() => { const p = plan(); return p.surface === "log" && p.isReport === false; })());
-t("degraded-log reason flags DEAF", /DEAF/.test(plan().reason));
+t("degraded-log reason flags no reporting surface", /DEGRADED|no reporting surface/.test(plan().reason));
 
 // --- unresolved + info: does not escalate ---
 t("unresolved info -> log, NOT a report (no escalation)", (() => { const p = plan({ severity: "info" }); return p.surface === "log" && p.isReport === false; })());

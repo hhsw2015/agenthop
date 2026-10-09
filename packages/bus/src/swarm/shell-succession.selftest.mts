@@ -11,10 +11,15 @@ t("continuity: machine mismatch -> false", provesContinuity(att({ machine: "m2" 
 t("continuity: cwd mismatch -> false", provesContinuity(att({ cwd: "/other" }), inc()) === false);
 t("continuity: tool mismatch -> false", provesContinuity(att({ tool: "codex" }), inc()) === false);
 t("continuity: resumeCmd disagree -> false", provesContinuity(att({ resumeCmd: "x" }), inc()) === false);
-t("continuity: no recorded resumeCmd (v1 roster) -> machine+cwd+tool only", provesContinuity(att({ resumeCmd: "anything" }), inc({ recordedResumeCmd: null })) === true);
+// F45-P1-1: environment sameness is NOT identity — without a credential binding to THIS stableSid, no continuity.
+t("continuity: v1 roster (no resumeCmd/pane, sid differs) -> FALSE (env != identity)", provesContinuity(att({ resumeCmd: "anything", newNativeSid: "new-sid" }), inc({ recordedResumeCmd: null })) === false);
+t("continuity: resumeCmd matches but does NOT name the sid (generic template) -> false", provesContinuity(att({ resumeCmd: "claude", newNativeSid: "new-sid" }), inc({ recordedResumeCmd: "claude", recordedHerdrPane: null })) === false);
+t("continuity: sidBinds (shell already carries stable sid) -> true even without resumeCmd", provesContinuity(att({ resumeCmd: "x", newNativeSid: "fe0376cd" }), inc({ recordedResumeCmd: null })) === true);
+t("continuity: paneBinds alone (no resumeCmd) -> true", provesContinuity(att({ resumeCmd: "claude", herdrPane: "p1", newNativeSid: "new-sid" }), inc({ recordedResumeCmd: null, recordedHerdrPane: "p1" })) === true);
+t("continuity: two different stableSids, empty fields -> both fresh (no binding)", provesContinuity(att({ resumeCmd: "x", newNativeSid: "n" }), inc({ stableSid: "A", recordedResumeCmd: null })) === false && provesContinuity(att({ resumeCmd: "x", newNativeSid: "n" }), inc({ stableSid: "B", recordedResumeCmd: null })) === false);
 t("continuity: herdr pane disagree (both known) -> false", provesContinuity(att({ herdrPane: "p1" }), inc({ recordedHerdrPane: "p2" })) === false);
 t("continuity: herdr pane match -> true", provesContinuity(att({ herdrPane: "p1" }), inc({ recordedHerdrPane: "p1" })) === true);
-t("continuity: pane known one side only -> not required", provesContinuity(att({ herdrPane: "p1" }), inc({ recordedHerdrPane: null })) === true);
+t("continuity: pane known one side only -> not required (resumeCmd still binds)", provesContinuity(att({ herdrPane: "p1" }), inc({ recordedHerdrPane: null })) === true);
 
 // --- successionVerdict: fail-closed ---
 const vAdopt = successionVerdict(att(), inc({ incumbentLiveness: "dead" }));
@@ -24,7 +29,12 @@ t("absent incumbent + continuity -> adopt", successionVerdict(att(), inc({ incum
 
 t("LIVE other incumbent -> reject (never steal a live slot)", successionVerdict(att({ newPid: 200 }), inc({ incumbentLiveness: "alive", incumbentPid: 100 })).action === "reject");
 t("reject carries no rebind", successionVerdict(att(), inc({ incumbentLiveness: "alive", incumbentPid: 100 })).rebind === undefined);
-t("LIVE incumbent that IS us (same pid) -> adopt idempotent", successionVerdict(att({ newPid: 100 }), inc({ incumbentLiveness: "alive", incumbentPid: 100 })).action === "adopt");
+t("LIVE incumbent that IS us (same pid + proven) -> adopt idempotent", successionVerdict(att({ newPid: 100 }), inc({ incumbentLiveness: "alive", incumbentPid: 100 })).action === "adopt");
+// F45-P1-1: same pid must NOT exempt the continuity check
+t("same-pid + ALIVE + env conflict -> reject (pid alone is not identity)", successionVerdict(att({ newPid: 100, cwd: "/other" }), inc({ incumbentLiveness: "alive", incumbentPid: 100 })).action === "reject");
+t("same-pid + DEAD + env conflict -> fresh (not adopt)", successionVerdict(att({ newPid: 100, machine: "m2" }), inc({ incumbentLiveness: "dead", incumbentPid: 100 })).action === "fresh");
+t("dead + env matches but NO binding credential -> fresh", successionVerdict(att({ resumeCmd: "claude", newNativeSid: "new-sid" }), inc({ recordedResumeCmd: null, incumbentLiveness: "dead" })).action === "fresh");
+t("dead + sidBinds -> adopt", successionVerdict(att({ resumeCmd: "x", newNativeSid: "fe0376cd" }), inc({ recordedResumeCmd: null, incumbentLiveness: "dead" })).action === "adopt");
 
 t("dead incumbent but continuity FAILS -> fresh (never hijack)", successionVerdict(att({ cwd: "/elsewhere" }), inc({ incumbentLiveness: "dead" })).action === "fresh");
 t("fresh carries no rebind", successionVerdict(att({ machine: "m2" }), inc({ incumbentLiveness: "absent" })).rebind === undefined);

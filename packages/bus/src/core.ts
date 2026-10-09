@@ -10,8 +10,8 @@ import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
-import { resolveInboxTarget } from "./send-fallback.js";
-import { resolveSession, listSessions } from "./swarm/task-liveness.js";
+import { resolveInboxTarget, relaySameMachineSid } from "./send-fallback.js";
+import { resolveSession, listSessions, fileIsAlive, makeFileLiveness } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -426,11 +426,11 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // never the routing name, which can drift on restart and strand mail in a box no live node drains (the F40 incident).
       const resolvedPeer = resolve(to);
       const sessionList = listSessions(home);
-      // F45 ③: a relay-resolved peer is cross-BROKER, not necessarily cross-MACHINE. If its OWN durable id owns a local
-      // presence pid (a full-sid exact match, so a short-id collision can't misroute), it shares our filesystem and has a
-      // local durable inbox — route durable there, not a live-only relay send. (Before this, a same-machine peer on a
-      // different broker got a live send with no durable copy, so a dispatch could land in no inbox — the F45 incident.)
-      const relayLocalSid = !("error" in resolvedPeer) && resolvedPeer.via === "relay" && resolvedPeer.stableId && resolveSession(resolvedPeer.stableId, sessionList) === resolvedPeer.stableId ? resolvedPeer.stableId : null;
+      // F45 ③ (P1-2 hardened): a relay-resolved peer is cross-BROKER, not necessarily cross-MACHINE. Route durable to it
+      // ONLY if its OWN full sid owns a LIVE presence pid on this host — proof it shares our filesystem. A mere filename, or
+      // a dead/corrupt presence file (e.g. a remote peer that once ran here), is NOT proof and must keep the relay path, so
+      // a remote peer is never silently redirected to a local inbox nobody drains. liveness is fileIsAlive (signal-0).
+      const relayLocalSid = !("error" in resolvedPeer) ? relaySameMachineSid(resolvedPeer, sessionList, (sid) => fileIsAlive(sid, makeFileLiveness(home))) : null;
       const target = resolveInboxTarget(to, resolvedPeer, resolveSession(to, sessionList), relayLocalSid);
       if (target.kind === "none") return { ok: false, error: target.reason };
       if (target.kind === "durable") {

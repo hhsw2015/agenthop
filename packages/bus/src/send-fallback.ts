@@ -47,6 +47,22 @@ export type InboxTarget =
   | { kind: "relay"; peer: UnifiedPeer }                                 // cross-machine ⇒ the caller does a live relay send
   | { kind: "none"; reason: string };                                    // undeliverable ⇒ { ok:false, error:reason }
 
+/**
+ * F45-P1-2: decide whether a RELAY-resolved peer is actually SAME-MACHINE, returning the sid to deliver durably to, or
+ * null. The proof is NOT a mere filename: the peer's OWN full stableId must own a presence pid (exact match, so a short-id
+ * collision cannot misroute) AND that pid must be LIVE on this host (`liveness(sid) === "alive"`). A dead or corrupt
+ * presence file — e.g. left behind by a session that once ran here, or an isolation fixture for a remote peer — is NOT
+ * proof of a shared filesystem and must NOT redirect a remote peer to a local inbox (which no live local node would drain,
+ * while the real remote peer gets nothing and the send falsely reports "durable"). Insufficient proof ⇒ null ⇒ the caller
+ * keeps the relay path. `liveness` is injected (fileIsAlive) so this stays pure and unit-testable. Pure. */
+export function relaySameMachineSid(peer: UnifiedPeer, sessionIds: readonly string[], liveness: (sid: string) => "alive" | "suspected" | "dead"): string | null {
+  if (peer.via !== "relay" || !peer.stableId) return null;
+  const sid = peer.stableId;
+  if (!sessionIds.includes(sid)) return null;   // no presence file for this EXACT sid (a filename for a short-id prefix is not it)
+  if (liveness(sid) !== "alive") return null;    // dead / corrupt / suspected pid ⇒ not proof of a live same-machine session
+  return sid;
+}
+
 export function resolveInboxTarget(to: string, resolved: UnifiedPeer | ResolveError, offlineSid: string | null, relayLocalSid: string | null = null): InboxTarget {
   if ("error" in resolved) {
     // B1: an AMBIGUOUS (or empty) target must NEVER fall back — a weaker handle match could pick one of several live matches
