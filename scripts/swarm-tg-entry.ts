@@ -1,19 +1,21 @@
 #!/usr/bin/env tsx
 // swarm-tg-entry — the Telegram USER-ENTRY driver (thin IO). A user-entry peer to the console: it READS the core's frozen
-// projections (decision batches here in v1) + pushes them to a bot, and PARSES the user's tap back into the SINGLE decision
-// ledger (decision-batch DecisionsDoc). ZERO business logic — render/parse/scope/digest all come from the pure core
-// (tg-entry.ts / decision-batch.ts / morning-digest.ts). DORMANT behind SWARM_TG_ENTRY. v1: notify + collect-approvals ONLY,
-// NEVER executes a command (a verdict is only WRITTEN to the ledger; the coordinator's R17 chain re-injects).
+// projections (decision batches in v1) + pushes them to a bot, and PARSES the user's tap into the SINGLE decision ledger via
+// the atomic merge recordDecision. ZERO business logic — render/parse/scope/merge/digest all live in the pure core. DORMANT
+// behind SWARM_TG_ENTRY. v1: notify + collect-approvals ONLY, NEVER executes a command (a verdict is only WRITTEN; the
+// coordinator's R17 chain re-injects).
 //
-// Credential discipline (§creds, same gate as vm-ctl): the bot token travels on STDIN into a 0600 file, NEVER argv/env.
+// Credential discipline (§creds, vm-ctl gate): the bot token travels on STDIN into a 0600 file, NEVER argv/env.
 //   seed:   printf %s '<token>' | tsx scripts/swarm-tg-entry.ts --seed-token
 //   run:    SWARM_TG_ENTRY=1 tsx scripts/swarm-tg-entry.ts
-import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import https from "node:https";
+import { createHash } from "node:crypto";
 import { renderProjection, parseUpdate, type RenderSpec, type TgUpdate } from "../packages/bus/src/swarm/tg-entry.js";
-import { listBatches, readBatch, writeDecisions } from "../packages/bus/src/swarm/decision-batch-store.js";
+import { listBatches, readBatch, recordDecision } from "../packages/bus/src/swarm/decision-batch-store.js";
+import type { Verdict, ApprovalScope } from "../packages/bus/src/swarm/decision-batch.js";
 
 const HOME = homedir();
 const tgDir = (): string => path.join(HOME, ".agenthop", "tg");
@@ -24,13 +26,11 @@ const notifiedFile = (): string => path.join(tgDir(), "notified-batches.json");
 
 const enabled = (env = process.env): boolean => /^(1|true|yes|on)$/i.test(env.SWARM_TG_ENTRY ?? "");
 
-/** Read the 0600 token file; throws a clear error if absent (the user seeds it with --seed-token). */
 function readToken(): string {
   const f = tokenFile();
   if (!existsSync(f)) throw new Error(`no bot token at ${f} — seed it: printf %s '<token>' | ${process.argv[1]} --seed-token`);
   return readFileSync(f, "utf8").trim();
 }
-/** The allowlist of numeric chat_ids (the user, usually one). Absent/corrupt -> empty (every inbound then ignored). */
 function readAllow(): Set<number> {
   try { const a = JSON.parse(readFileSync(allowFile(), "utf8")); return new Set((Array.isArray(a) ? a : a?.chatIds ?? []).filter((n: unknown): n is number => typeof n === "number")); }
   catch { return new Set(); }
@@ -38,9 +38,25 @@ function readAllow(): Set<number> {
 const readOffset = (): number => { try { return Number(readFileSync(offsetFile(), "utf8").trim()) || 0; } catch { return 0; } };
 const writeOffset = (n: number): void => { try { writeFileSync(offsetFile(), String(n), { mode: 0o600 }); } catch { /* best-effort; a replayed update is deduped by consume-once */ } };
 const readNotified = (): Set<string> => { try { return new Set(JSON.parse(readFileSync(notifiedFile(), "utf8"))); } catch { return new Set(); } };
-const writeNotified = (s: Set<string>): void => { try { writeFileSync(notifiedFile(), JSON.stringify([...s]), { mode: 0o600 }); } catch { /* best-effort; a double-notify is benign (consume-once dedups the verdict) */ } };
+const writeNotified = (s: Set<string>): void => { try { writeFileSync(notifiedFile(), JSON.stringify([...s]), { mode: 0o600 }); } catch { /* best-effort */ } };
 
-/** One Telegram Bot API call over https. Resolves the parsed JSON `result`, or rejects. */
+// TG-P2-3: a compact ref that round-trips ANY legal batchId/itemId inside Telegram's 64-byte callback_data. The ref is
+// `<batchHash10>.<itemIndex>` — the driver (which holds the batch) resolves it back; no arbitrary id is ever embedded.
+const batchRef = (batchId: string): string => createHash("sha256").update(batchId).digest("hex").slice(0, 10);
+const encodeRef = (batchId: string, idx: number): string => `${batchRef(batchId)}.${idx}`;
+function resolveRef(ref: string): { batchId: string; itemId: string } | null {
+  const dot = ref.lastIndexOf(".");
+  if (dot < 0) return null;
+  const bh = ref.slice(0, dot), idx = Number(ref.slice(dot + 1));
+  if (!bh || !Number.isInteger(idx) || idx < 0) return null;
+  for (const batchId of listBatches(HOME)) {
+    if (batchRef(batchId) !== bh) continue;
+    const item = readBatch(HOME, batchId)?.items[idx];
+    if (item) return { batchId, itemId: item.id };
+  }
+  return null;
+}
+
 function tg(token: string, method: string, body: unknown): Promise<any> {
   const data = Buffer.from(JSON.stringify(body));
   return new Promise((resolve, reject) => {
@@ -48,50 +64,61 @@ function tg(token: string, method: string, body: unknown): Promise<any> {
       { host: "api.telegram.org", path: `/bot${token}/${method}`, method: "POST", headers: { "content-type": "application/json", "content-length": data.length }, timeout: 65000 },
       (res) => { let buf = ""; res.on("data", (c) => (buf += c)); res.on("end", () => { try { const j = JSON.parse(buf); j.ok ? resolve(j.result) : reject(new Error(j.description || "tg error")); } catch (e) { reject(e); } }); },
     );
-    req.on("error", reject);
-    req.on("timeout", () => req.destroy(new Error("tg timeout")));
+    req.on("error", reject); req.on("timeout", () => req.destroy(new Error("tg timeout")));
     req.write(data); req.end();
   });
 }
 
-/** Send a RenderSpec. v1: message + inline keyboard fully; a photo/card falls back to its caption (no rasterizer yet); a
- *  document attachment is sent when the ref is a readable local file, else its pointer rides in the text. */
+/** Send a RenderSpec (throws on API failure so the caller can keep a retry obligation). v1: message + inline keyboard; a
+ *  photo/card falls back to its caption (no rasterizer yet); a document rides as a pointer in text. */
 async function send(token: string, chatId: number, spec: RenderSpec): Promise<void> {
   const reply_markup = spec.keyboard ? { inline_keyboard: spec.keyboard.map((row) => row.map((b) => ({ text: b.label, callback_data: b.data }))) } : undefined;
-  if (spec.attachment?.kind === "document" && existsSync(spec.attachment.ref) && statSync(spec.attachment.ref).isFile()) {
-    // ponytail: document upload is multipart; v1 sends the text + the pointer, full sendDocument multipart is a follow-up.
-    await tg(token, "sendMessage", { chat_id: chatId, text: `${spec.text}\n(doc: ${spec.attachment.ref})`, ...(reply_markup ? { reply_markup } : {}) });
-    return;
-  }
-  const msg = await tg(token, "sendMessage", { chat_id: chatId, text: spec.text, ...(reply_markup ? { reply_markup } : {}) });
-  if (spec.primitive === "pin" && msg?.message_id) await tg(token, "pinChatMessage", { chat_id: chatId, message_id: msg.message_id }).catch(() => {}); // RED alert
+  const text = spec.attachment?.kind === "document" ? `${spec.text}\n(doc: ${spec.attachment.ref})` : spec.text;
+  const msg = await tg(token, "sendMessage", { chat_id: chatId, text, ...(reply_markup ? { reply_markup } : {}) });
+  if (spec.primitive === "pin" && msg?.message_id) await tg(token, "pinChatMessage", { chat_id: chatId, message_id: msg.message_id }).catch(() => {});
 }
 
-/** OUTBOUND: push any decision batch not yet notified to each allowlisted chat (one message per item, with its scope keyboard). */
+/** OUTBOUND: push each not-yet-notified decision batch. TG-P2-2: a batch is marked notified ONLY after FULL successful
+ *  delivery to every allowlisted recipient; a zero-recipient run or any send failure leaves it un-notified to retry. */
 async function notifyNewBatches(token: string, allow: Set<number>): Promise<void> {
+  if (allow.size === 0) return; // no recipient => no delivery => never a completion proof
   const notified = readNotified();
   for (const batchId of listBatches(HOME)) {
     if (notified.has(batchId)) continue;
     const batch = readBatch(HOME, batchId);
     if (!batch) continue;
-    for (const chatId of allow) for (const item of batch.items) await send(token, chatId, renderProjection({ kind: "decision", batchId, item })).catch((e) => console.error(`tg send failed: ${e instanceof Error ? e.message : e}`));
-    notified.add(batchId); writeNotified(notified);
+    let allOk = true;
+    for (const chatId of allow) for (let i = 0; i < batch.items.length; i++) {
+      try { await send(token, chatId, renderProjection({ kind: "decision", item: batch.items[i]!, ref: encodeRef(batchId, i) })); }
+      catch (e) { allOk = false; console.error(`swarm-tg-entry: notify send failed (will retry): ${e instanceof Error ? e.message : e}`); }
+    }
+    if (allOk) { notified.add(batchId); writeNotified(notified); } // only a fully-delivered batch is done
   }
 }
 
-/** INBOUND: long-poll getUpdates; a tap -> parseUpdate -> write the SINGLE ledger (never execute). */
+/** INBOUND: long-poll getUpdates; a tap -> parseUpdate -> resolve ref -> recordDecision (merge). TG-P2-1: the offset is
+ *  committed ONLY after a TERMINAL outcome (recorded / consumed / unknown-item / ignored / expired-ref); a transient IO error
+ *  or a contended lock STOPS this poll WITHOUT advancing, so the same update is retried — never a silent "already decided". */
 async function pollOnce(token: string, allow: Set<number>): Promise<void> {
   const updates = await tg(token, "getUpdates", { offset: readOffset(), timeout: 50, allowed_updates: ["callback_query", "message"] });
   for (const u of updates ?? []) {
-    writeOffset(u.update_id + 1);
     const cq = u.callback_query;
-    const upd: TgUpdate = cq
-      ? { chatId: cq.message?.chat?.id, callbackData: cq.data }
-      : { chatId: u.message?.chat?.id, text: u.message?.text };
-    const r = parseUpdate(upd, allow, Math.floor(Date.now() / 1000));
-    if (r.kind === "ignore") { if (cq) await tg(token, "answerCallbackQuery", { callback_query_id: cq.id }).catch(() => {}); continue; }
-    try { writeDecisions(HOME, r.doc); if (cq) await tg(token, "answerCallbackQuery", { callback_query_id: cq.id, text: "recorded" }).catch(() => {}); }
-    catch (e) { if (cq) await tg(token, "answerCallbackQuery", { callback_query_id: cq.id, text: "already decided" }).catch(() => {}); console.error(`tg verdict not written (likely already consumed): ${e instanceof Error ? e.message : e}`); }
+    const chatId: unknown = cq ? cq.message?.chat?.id : u.message?.chat?.id;
+    const ack = async (text?: string): Promise<void> => { if (cq) await tg(token, "answerCallbackQuery", { callback_query_id: cq.id, ...(text ? { text } : {}) }).catch(() => {}); };
+    // first-contact: surface an un-allowlisted chat_id so the user can add it (design detail); terminal -> advance.
+    if (typeof chatId === "number" && !allow.has(chatId)) { console.error(`swarm-tg-entry: message from un-allowlisted chat_id ${chatId} — add it to ${allowFile()} to enable`); writeOffset(u.update_id + 1); await ack(); continue; }
+    const upd: TgUpdate = cq ? { chatId, callbackData: cq.data } : { chatId, text: u.message?.text };
+    const r = parseUpdate(upd, allow);
+    if (r.kind === "ignore") { writeOffset(u.update_id + 1); await ack(); continue; }
+    const resolved = resolveRef(r.ref);
+    if (!resolved) { writeOffset(u.update_id + 1); await ack("expired"); continue; } // the batch is gone -> terminal
+    const decision = { id: resolved.itemId, verdict: r.verdict as Verdict, ...(r.scope ? { scope: r.scope as ApprovalScope } : {}) };
+    let outcome: "recorded" | "consumed" | "unknown-item" | "contended";
+    try { outcome = recordDecision(HOME, resolved.batchId, decision, Math.floor(Date.now() / 1000)); }
+    catch (e) { console.error(`swarm-tg-entry: recordDecision transient error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return; } // transient IO -> retry this update next poll
+    if (outcome === "contended") return; // a concurrent holder — retry this update next poll (do NOT advance)
+    writeOffset(u.update_id + 1); // terminal
+    await ack(outcome === "recorded" ? "recorded" : outcome === "consumed" ? "already decided" : "unknown");
   }
 }
 
@@ -100,7 +127,11 @@ async function main(): Promise<void> {
     const tok = readFileSync(0, "utf8").trim(); // stdin, NEVER argv
     if (!tok) { console.error("no token on stdin"); process.exit(2); }
     mkdirSync(tgDir(), { recursive: true });
-    writeFileSync(tokenFile(), tok, { mode: 0o600 });
+    // TG-P1-3: 0600 from the FIRST byte — write a 0600 temp and atomic-rename over the target (replaces a pre-existing 0644;
+    // a post-hoc chmod would leave a window at the old mode).
+    const tmp = path.join(tgDir(), `.bot.token.tmp-${process.pid}`);
+    writeFileSync(tmp, tok, { mode: 0o600 });
+    renameSync(tmp, tokenFile());
     console.error(`wrote ${tokenFile()} (0600). Next: put your numeric chat_id in ${allowFile()} and SWARM_TG_ENTRY=1 to run.`);
     return;
   }

@@ -12,8 +12,8 @@ import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
 import { writeInbox, composeInboxMsg } from "../inbox.js";
 import {
-  type DecisionBatch, type DecisionsDoc, type DecisionItem, type ResolvedDecision,
-  validDecisionBatch, validDecisionsDoc, buildBatch, resolveBatch,
+  type DecisionBatch, type DecisionsDoc, type DecisionItem, type ResolvedDecision, type Decision,
+  validDecisionBatch, validDecisionsDoc, buildBatch, resolveBatch, enforceScope, upsertDecision,
 } from "./decision-batch.js";
 
 const SAFE_BATCH_ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -239,6 +239,26 @@ export function writeDecisions(home: string, doc: DecisionsDoc): void {
   // recoverable / latest wins), and the consume RE-CLAIMS the latest decisions.json right before it commits.
   if (existsStrict(consumedMarkerPath(home, valid.batchId))) throw new Error(`writeDecisions: batch ${valid.batchId} already consumed — remaining items are re-batched under a new batchId`);
   writeJsonAtomic(decisionsPath(home, valid.batchId), valid);
+}
+
+/** TG-P1-2: record ONE item's decision, MERGING with the batch's other decisions (never a snapshot-overwrite that wipes a
+ *  sibling another entry recorded). Atomic under the per-batch lock: refuse if already consumed (sealed -> a no-op, no fork),
+ *  enforce the scope against the REAL item (TG-P1-1), upsert by id, write. "contended" => a concurrent holder has the lock,
+ *  the caller must retry (do NOT treat as decided). "unknown-item" => the id is not in this batch. */
+export function recordDecision(home: string, batchId: string, decision: Decision, nowSec: number): "recorded" | "consumed" | "unknown-item" | "contended" {
+  const batch = readBatch(home, batchId);
+  if (!batch) throw new Error(`recordDecision: no such batch ${batchId}`);
+  const item = batch.items.find((it) => it.id === decision.id);
+  if (!item) return "unknown-item";
+  const token = acquireConsumeLock(home, batchId);
+  if (token === null) return "contended";
+  try {
+    if (existsStrict(consumedMarkerPath(home, batchId))) return "consumed"; // sealed — no fork, the tap is a no-op
+    const existing = readJsonOrNull(decisionsPath(home, batchId), validDecisionsDoc);
+    const merged = upsertDecision(existing, batchId, enforceScope(item, decision), nowSec); // preserve siblings + clamp scope
+    writeJsonAtomic(decisionsPath(home, batchId), merged);
+    return "recorded";
+  } finally { releaseConsumeLock(home, batchId, token); }
 }
 
 /**

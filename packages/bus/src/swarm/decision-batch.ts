@@ -114,7 +114,26 @@ export function buildBatch(i: { batchId: string; owner: string; items: DecisionI
   return { batchId: i.batchId, owner: i.owner, createdAtSec: i.nowSec, items: i.items };
 }
 
-export type ResolvedDecision = { item: DecisionItem; verdict: Verdict; reason?: string };
+export type ResolvedDecision = { item: DecisionItem; verdict: Verdict; reason?: string; scope?: ApprovalScope };
+
+/** TG-P1-1: ENFORCE the scope against the REAL item (not the UI buttons). scope is meaningful only on `approve`; a scope not
+ *  in `allowedScopes(item)` is clamped to `once` (the safe floor) — so a hard-gate item can NEVER record a `this-chat`/`always`
+ *  grant even if a client (TG or console) writes one. Pure; applied at BOTH write (recordDecision) and resolve, so the UI is
+ *  never the permission boundary. */
+export function enforceScope(item: DecisionItem, d: Decision): Decision {
+  if (d.verdict !== "approve") { const { scope: _drop, ...rest } = d; return rest; }
+  const scope: ApprovalScope = allowedScopes(item).includes(d.scope ?? "once") ? (d.scope ?? "once") : "once";
+  return { ...d, scope };
+}
+
+/** TG-P1-2: merge ONE decision into the batch's decisions doc, PRESERVING every other item's decision (writeDecisions is a
+ *  full-snapshot replace, so a single-item update must merge, not overwrite). Upsert by id (a re-tap of the same item updates
+ *  it); a doc for a different batchId is treated as absent (never cross-contaminate). Pure; the store does the atomic read-
+ *  merge-write under a lock so concurrent taps cannot lose a sibling. */
+export function upsertDecision(existing: DecisionsDoc | null, batchId: string, decision: Decision, nowSec: number): DecisionsDoc {
+  const kept = existing && existing.batchId === batchId ? existing.decisions.filter((d) => d.id !== decision.id) : [];
+  return { batchId, decidedAtSec: nowSec, decisions: [...kept, decision] };
+}
 
 /**
  * Match the user's decisions onto the batch. Returns:
@@ -138,7 +157,8 @@ export function resolveBatch(batch: DecisionBatch, doc: DecisionsDoc): { resolve
     if (!item) { unknownIds.push(d.id); continue; }
     if (decidedIds.has(d.id)) continue; // a duplicate decision for the same id — first wins, rest ignored
     decidedIds.add(d.id);
-    resolved.push({ item, verdict: d.verdict, ...(d.reason !== undefined ? { reason: d.reason } : {}) });
+    const e = enforceScope(item, d); // TG-P1-1: clamp an out-of-policy scope against the REAL item before it is acted on
+    resolved.push({ item, verdict: e.verdict, ...(e.reason !== undefined ? { reason: e.reason } : {}), ...(e.scope !== undefined ? { scope: e.scope } : {}) });
   }
   const undecided = batch.items.filter((it) => !decidedIds.has(it.id));
   return { resolved, undecided, unknownIds };

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync, chmodSync, statSync, readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, renameSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { openBatch, readBatch, writeDecisions, readDecisions, consumeDecisions, listBatches } from "../src/swarm/decision-batch-store.js";
+import { openBatch, readBatch, writeDecisions, readDecisions, consumeDecisions, listBatches, recordDecision } from "../src/swarm/decision-batch-store.js";
 import { type DecisionItem } from "../src/swarm/decision-batch.js";
 import { claimInbox } from "../src/inbox.js";
 
@@ -392,5 +392,33 @@ describe("two entries, one ledger: consume-once makes the second entry a no-op (
     const second = consumeDecisions(HOME, "e2");
     expect(second.consumed).toBe(false);
     expect(second.resolved).toEqual([]);
+  });
+});
+
+// TG-P1-2 / TG-P1-1 at the store: recordDecision MERGES one item (never overwrites siblings) + clamps a hard-gate scope.
+describe("recordDecision (atomic single-item merge for an entry tap)", () => {
+  test("TG-P1-2: a second item's tap preserves the first (no snapshot overwrite)", () => {
+    openBatch(HOME, { batchId: "m1", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
+    expect(recordDecision(HOME, "m1", { id: "a", verdict: "approve" }, 2)).toBe("recorded");
+    expect(recordDecision(HOME, "m1", { id: "b", verdict: "reject" }, 3)).toBe("recorded");
+    const doc = readDecisions(HOME, "m1")!;
+    expect(doc.decisions.map((d) => d.id).sort()).toEqual(["a", "b"]); // BOTH survive
+    expect(doc.decisions.find((d) => d.id === "a")!.verdict).toBe("approve");
+  });
+  test("TG-P1-1: a hard-gate item's 'always' is clamped to once on write", () => {
+    openBatch(HOME, { batchId: "m2", owner: "coord", items: [{ id: "x", kind: "spend", summary: "pay", suggestedAction: "approve", hardGate: true }], nowSec: 1 });
+    expect(recordDecision(HOME, "m2", { id: "x", verdict: "approve", scope: "always" }, 2)).toBe("recorded");
+    expect(readDecisions(HOME, "m2")!.decisions[0]!.scope).toBe("once"); // never records the expanded grant
+  });
+  test("a tap on a sealed batch is a no-op (consumed), not a fork", () => {
+    openBatch(HOME, { batchId: "m3", owner: "coord", items: [item("a")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "m3", decidedAtSec: 2, decisions: [{ id: "a", verdict: "approve" }] });
+    expect(consumeDecisions(HOME, "m3").consumed).toBe(true);
+    expect(recordDecision(HOME, "m3", { id: "a", verdict: "reject" }, 3)).toBe("consumed"); // sealed -> no write
+  });
+  test("an unknown item id -> unknown-item (never written)", () => {
+    openBatch(HOME, { batchId: "m4", owner: "coord", items: [item("a")], nowSec: 1 });
+    expect(recordDecision(HOME, "m4", { id: "ghost", verdict: "approve" }, 2)).toBe("unknown-item");
+    expect(readDecisions(HOME, "m4")).toBeNull();
   });
 });
