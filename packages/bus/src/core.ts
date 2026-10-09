@@ -10,8 +10,8 @@ import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
-import { resolveInboxTarget } from "./send-fallback.js";
-import { resolveSession, listSessions } from "./swarm/task-liveness.js";
+import { resolveInboxTarget, isValidSessionId } from "./send-fallback.js";
+import { resolveSession, listSessions, probeSessionAlive } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -442,7 +442,26 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // F40: ONE write-side addressing entry decides durable / relay / none and computes the durable inbox KEY. The key is
       // always the recipient's STABLE identity (stableId ?? per-run id, or an offline session's presence-owned native sid) —
       // never the routing name, which can drift on restart and strand mail in a box no live node drains (the F40 incident).
-      const target = resolveInboxTarget(to, resolve(to), resolveSession(to, listSessions(home)));
+      const resolvedPeer = resolve(to);
+      const sessionList = listSessions(home);
+      // F45-R1 (coordinator ruling B): a relay-resolved peer is cross-BROKER, not necessarily cross-MACHINE. It is same-machine
+      // (⇒ route durable to its local inbox) IFF its per-session LIVENESS SOCKET answers: the presence daemon listens on
+      // presence/<sid>.sock, and the kernel drops that listener the instant the daemon dies, so a successful connect proves the
+      // CURRENT instance is alive — window-free (no last-write/mtime freshness, so no pid-recycle window). A stale sock from a
+      // dead daemon ⇒ ECONNREFUSED; a recycled pid never listens on it ⇒ connect fails ⇒ keep relay (no false durable). The
+      // sock filename IS the sid, so the probe is naturally bound to the exact identity.
+      // F45-R7 (rounds 7-9): is this relay-resolved peer actually SAME-MACHINE? probeSessionAlive hashes the sid to a bounded,
+      // collision-free socket-name prefix (a crafted "../bridge" can't traverse; two long sids can't truncate-collide) and
+      // connect-probes the peer's per-instance liveness socket(s). A connect proves the current instance is alive — window-free.
+      // isValidSessionId still gates the DURABLE INBOX KEY below (the raw sid is the inbox dir name): an unsafe sid never becomes
+      // a durable target even though its hashed socket path is always safe.
+      let relayLocalSid: string | null = null;
+      if (!("error" in resolvedPeer) && resolvedPeer.via === "relay" && resolvedPeer.stableId
+          && isValidSessionId(resolvedPeer.stableId)
+          && (await probeSessionAlive(home, resolvedPeer.stableId))) {
+        relayLocalSid = resolvedPeer.stableId;
+      }
+      const target = resolveInboxTarget(to, resolvedPeer, resolveSession(to, sessionList), relayLocalSid);
       if (target.kind === "none") return { ok: false, error: target.reason };
       if (target.kind === "durable") {
         // C1 (review 01b773d): an OpenCode node receives over the broker + its own in-memory queue; it does NOT consume the

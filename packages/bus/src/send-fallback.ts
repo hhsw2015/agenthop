@@ -10,6 +10,19 @@
  */
 import type { UnifiedPeer, ResolveError } from "./resolve.js";
 
+/**
+ * F45-R7-P1-2: a session id becomes a FILESYSTEM KEY — the durable inbox dir `~/.agenthop/inbox/<sid>/` and the liveness
+ * sock `~/.agenthop/presence/<sid>.sock`. A peer's stableId arrives as an unvalidated JSON field, so a crafted value like
+ * `../bridge` would make the sock probe connect to an UNRELATED listener (e.g. the bus bridge's own socket) and the inbox
+ * write land OUTSIDE the namespace — a false "durable" that strands the message in a box no node drains. We REJECT anything
+ * that is not a single safe path segment (no lossy sanitization): one-to-one sid→endpoint, no escape. Real native sids are
+ * UUIDs and per-run ids are plain tokens; both match `[A-Za-z0-9_-]+`. `..`, `.`, `/`, `\`, NUL, empty all fail.
+ */
+const SAFE_SESSION_ID = /^[A-Za-z0-9_-]+$/;
+export function isValidSessionId(sid: string): boolean {
+  return typeof sid === "string" && sid.length > 0 && sid.length <= 128 && SAFE_SESSION_ID.test(sid);
+}
+
 export type FallbackPlan =
   | { kind: "durable"; sid: string }    // write the message to ~/.agenthop/inbox/<sid>/ and report delivered:"durable"
   | { kind: "none"; reason: string };   // genuinely undeliverable from here -> report { ok:false, error:reason }
@@ -47,17 +60,33 @@ export type InboxTarget =
   | { kind: "relay"; peer: UnifiedPeer }                                 // cross-machine ⇒ the caller does a live relay send
   | { kind: "none"; reason: string };                                    // undeliverable ⇒ { ok:false, error:reason }
 
-export function resolveInboxTarget(to: string, resolved: UnifiedPeer | ResolveError, offlineSid: string | null): InboxTarget {
+export function resolveInboxTarget(to: string, resolved: UnifiedPeer | ResolveError, offlineSid: string | null, relayLocalSid: string | null = null): InboxTarget {
+  // F45-R7-P1-2: a durable inbox key is a filesystem path segment, so refuse to EMIT one that is not a safe session id — a
+  // crafted stableId must never escape the inbox namespace. Fail closed (never write to an unsafe path).
+  const durableIfSafe = (sid: string, label: string, peer?: UnifiedPeer): InboxTarget =>
+    isValidSessionId(sid)
+      ? { kind: "durable", sid, label, ...(peer ? { peer } : {}) }
+      : { kind: "none", reason: `Recipient identity "${sid}" is not a valid session id; refusing to route to an unsafe inbox path.` };
   if ("error" in resolved) {
     // B1: an AMBIGUOUS (or empty) target must NEVER fall back — a weaker handle match could pick one of several live matches
     // and misroute a private message. Only a genuine no-match may route to a same-machine durable inbox owned offline.
     if (resolved.kind !== "none") return { kind: "none", reason: resolved.error };
     const plan = fallbackForUnresolved(offlineSid, resolved.error);
-    return plan.kind === "durable" ? { kind: "durable", sid: plan.sid, label: to } : { kind: "none", reason: plan.reason };
+    return plan.kind === "durable" ? durableIfSafe(plan.sid, to) : { kind: "none", reason: plan.reason };
   }
-  // CROSS-MACHINE (relay): a live best-effort send; no local durable inbox.
-  if (resolved.via === "relay") return { kind: "relay", peer: resolved };
+  // RELAY-resolved. F45 ③: a relay peer is "cross-broker", which is NOT the same as "cross-machine". When the peer's OWN
+  // durable id owns a local presence pid (passed in as `relayLocalSid` — computed from the peer's stableId, so a short-id
+  // collision cannot misroute), it shares our filesystem and HAS a local durable inbox. Route durable, keyed by that exact
+  // sid — restoring "same-machine ⇒ durable-always" ACROSS brokers. Before this, a same-machine peer on a different broker
+  // resolved as relay ⇒ a live-only send ⇒ no durable copy ⇒ a dispatch stranded in no inbox (the F45 incident). A truly
+  // CROSS-MACHINE relay peer (relayLocalSid null) has no local inbox ⇒ a live best-effort relay send.
+  if (resolved.via === "relay") {
+    // An unsafe relayLocalSid falls back to RELAY (a live send still reaches a remote peer), not to none — only a VALID
+    // same-machine sid routes durable.
+    if (relayLocalSid && isValidSessionId(relayLocalSid)) return { kind: "durable", sid: relayLocalSid, label: resolved.title, peer: resolved };
+    return { kind: "relay", peer: resolved };
+  }
   // SAME-MACHINE (local): durable-always, keyed by the DURABLE identity (never the handle — that is `label`).
   const plan = fallbackForMissedDelivery(resolved);
-  return plan.kind === "durable" ? { kind: "durable", sid: plan.sid, label: resolved.title, peer: resolved } : { kind: "none", reason: plan.reason };
+  return plan.kind === "durable" ? durableIfSafe(plan.sid, resolved.title, resolved) : { kind: "none", reason: plan.reason };
 }
