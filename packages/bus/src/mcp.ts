@@ -56,6 +56,11 @@ Incoming messages arrive on their own: on agents with a native inbox (e.g. Claud
 export function registerBusTools(server: McpServer, options: BusMcpOptions = {}): () => void {
   const core: BusCore = startBusCore(options);
 
+  // Note: SWARM_SUCCESSION adoption is NOT wired here. Adoption can only COMPLETE at the presence daemon — the single instance
+  // that owns a liveness socket (coordinator SU3 pivot: one completion point avoids the double-write surface F45 closed). The
+  // MCP node has no liveness socket, so an adoption here could not make resolveSession(adopted) work. Credential source is still
+  // the agent's argv, read at the presence daemon via ps/_proc on the host pid.
+
   // If THIS session was launched by agenthop_spawn, self-register the Ghostty surface it runs in so
   // despawn has an authoritative (agent-claimed) target. Bounded retry; a no-op unless spawned.
   startClaimRetry();

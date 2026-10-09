@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { startBusCore, type BusCore, type BusCoreOptions } from "./core.js";
 import { PRESENCE_HEARTBEAT_SEC, openLivenessSocket } from "./swarm/task-liveness.js";
+import { successionEnabled, runSuccessionAtStartup } from "./swarm/shell-succession.js";
 import { dbg } from "./debug.js";
 
 /**
@@ -68,14 +69,14 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
     binding = true;
     void openLivenessSocket(home, bindFor).then(
       (res) => {
-        binding = false;
-        if (!res) return;                               // path too long (relay-only) or a transient bind failure — retry next tick
+        if (gen === bindGen) binding = false;           // SU3: only the CURRENT attempt releases the shared in-flight marker — a
+        if (!res) return;                               // superseded bind must NOT clear `binding` out from under its superseder
         // Keep ONLY if this is still the latest attempt and we are not shutting down; otherwise it is stale/duplicate — close it
         // (unlinks its own path) so no superseded or orphaned listener survives (B7-1-R1).
         if (closing || gen !== bindGen) { try { res.server.close(); } catch { /* best effort */ } return; }
         sockServer = res.server;
       },
-      () => { binding = false; },                       // openLivenessSocket resolves null on failure; guard a reject regardless
+      () => { if (gen === bindGen) binding = false; },  // same: a stale reject never clears the current attempt's marker
     );
   };
   // B7-1: the stable identity was (re)assigned after startup (no pre-set SID + no pid file). Re-bind with NO poll window — close
@@ -90,9 +91,62 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
     if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
     openSock();
   };
+  // SU3: bind the liveness socket to `want` and RETURN whether the listener is actually ready for THIS identity. Used on a proven
+  // succession adoption (overrides a seeded fixedSid — the one place that happens). Unlike syncSidFor there is NO same-sid early
+  // return: core.adoptStableId fires onIdentityChange→syncSidFor which may already have started an in-flight bind for `want`, so
+  // this bumps the generation to SUPERSEDE it and binds freshly, then awaits — so "done" means the socket for `want` is up, not
+  // merely "sockSid already equals want". Returns false on a failed bind / supersession / shutdown (NOT ready) so the caller can
+  // treat the adoption as incomplete and roll back its pid claim.
+  const ensureSockBoundTo = async (want: string): Promise<boolean> => {
+    if (!want || closing) return false;
+    const prev = sockSid;                             // the identity to fall back to if this bind does not complete (SU3)
+    sockSid = want;
+    const gen = ++bindGen;                            // supersede any in-flight bind (incl. syncSidFor's from onIdentityChange)
+    binding = true;                                   // SU3: HOLD the in-flight marker across our own await, so a keepAlive openSock
+                                                      // cannot bind `want` behind us and publish the un-adopted target as if it were
+                                                      // established. WE are the sole binder for this generation until it resolves.
+    if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
+    const res = await openLivenessSocket(home, want);
+    if (gen === bindGen) binding = false;             // our bind resolved and we are still current — release the marker
+    if (res && !closing && gen === bindGen) { sockServer = res.server; return true; } // bound + current ⇒ ready
+    if (res) { try { res.server.close(); } catch { /* best effort */ } }              // superseded / shutting down ⇒ discard
+    // SU3: the bind did NOT complete for `want`. Because `binding` was held across the await, no benign heartbeat could have bumped
+    // the generation, so `gen === bindGen` here is a GENUINE failure (not a real adopt) and the revert MUST run: restore sockSid to
+    // the previous identity and re-open ITS socket, so a failed adoption never leaves the un-adopted target as the published
+    // identity and the keepAlive heartbeat serves our own sid. A newer generation can only be ANOTHER ensureSockBoundTo (a real
+    // adopt) — leave it alone.
+    if (gen === bindGen && sockSid === want) { sockSid = prev; bindGen++; openSock(); }
+    return false;                                     // NOT ready
+  };
   const core = startBusCore({ ...opts, onIdentityChange: (self) => syncSidFor(self.stableId ?? self.id) });
   if (!fixedSid) sockSid = core.self.stableId ?? core.self.id; // initial sid from the core (the per-run id until a late adopt)
   dbg(`presence up: ${core.self.title} (tool=${core.self.tool} stable=${core.self.stableId ?? "-"})`);
+
+  // F45 ① (SWARM_SUCCESSION): a restarted shell proving it continues a stable identity may re-take that identity's presence
+  // slot + durable-inbox scan instead of coming up a stranger. DORMANT by default (flag off ⇒ skipped entirely). On "adopt"
+  // the pid slot is taken over inside runSuccessionAtStartup; core.adoptStableId then drains that sid's inbox ("扫箱") and
+  // rebinds the liveness socket (via onIdentityChange) so resolveSession(stableSid) finds this instance. Fail-soft.
+  if (successionEnabled()) {
+    // SOLE completion point (coordinator SU3 pivot): adoption completes ONLY here — the presence daemon is the single instance
+    // that owns a liveness socket, so one completion point avoids the double-write surface F45 closed. The credential (resume
+    // target) is the AGENT's own argv, read via ps / /proc on the host pid the hook recorded (AGENTHOP_HOST_PID = the codex/
+    // claude process), never this daemon's `node presence.mjs`. Async because the incumbent check probes the live socket (SU1).
+    void (async () => {
+      try {
+        // The publish runs UNDER SU2's single-winner adopt lock: adopt the identity (drain its inbox) then bind its liveness
+        // socket (SU3), RETURNING whether the listener is actually ready — runSuccessionAtStartup rolls back the pid claim if not.
+        // The lock is released only after this resolves, covering the pre-publish interval.
+        await runSuccessionAtStartup(
+          home, core.self.tool, core.self.stableId ?? core.self.id, Number(process.env.AGENTHOP_HOST_PID) || undefined,
+          // SU3: bind the target's liveness socket FIRST; only adopt the core identity (+ drain inbox) once the socket is confirmed
+          // ready. On a bind failure core identity is left untouched and sockSid is reverted — nothing to roll back in core, and the
+          // heartbeat keeps serving our own sid. (syncSidFor from adoptStableId is a same-sid no-op: the socket is already bound.)
+          async (sid) => { if (closing) return false; const bound = await ensureSockBoundTo(sid); if (!bound) return false; core.adoptStableId(sid); return true; },
+          dbg,
+        );
+      } catch (e) { dbg(`succession startup failed (ignored): ${e instanceof Error ? e.message : e}`); }
+    })();
+  }
 
   // Keep the process alive (a ref'd timer holds the detached loop open — a non-compiled bun/node script stays up on that alone).
   // Heartbeat the pid file's mtime (sentinel aux only — NOT ownership, which is the liveness socket), re-sync the sid defensively

@@ -38,6 +38,11 @@ export type BusCore = {
   recv(timeoutMs: number): Promise<BusMessage[]>;
   /** Record this Codex thread id (from x-codex-turn-metadata) so inbound can be pushed to it. */
   noteThread(id: string): void;
+  /** F45 ① (shell-succession): AUTHORITATIVELY adopt a stable sid as this node's identity — the SAME path a Codex thread
+   *  adoption takes (learnStableId authoritative). On adoption the node's inboxKeys() start including `sid` (so its durable
+   *  inbox is drained — "扫箱"), the liveness socket re-binds via onIdentityChange, and resolveSession(sid) finds this node.
+   *  Used by presence's succession consumption point after successionVerdict returns "adopt"; dormant (SWARM_SUCCESSION off). */
+  adoptStableId(sid: string): void;
   status(): string;
   /** Set this session's own work state (working|idle|blocked|unknown); it rides the roster to peers.
    *  A monotonic `seq` (explicit or auto-incremented) drops a stale/duplicate report. */
@@ -436,6 +441,10 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       ownCodexThread = id;
       learnStableId(id, true); // call metadata is authoritative for both identity and delivery
       void flushInbox(); // a Codex session just took a turn -> its rollout now exists -> flush anything pending to it
+    },
+    adoptStableId(sid) {
+      learnStableId(sid, true); // F45 ①: authoritative adoption — same machinery as a Codex thread adopt (inboxKeys + socket rebind + resolve)
+      void flushInbox();        // drain anything already pending to the adopted identity's inbox immediately ("扫箱")
     },
     async send(to, text) {
       // bus-reachability §1 / B2+B3 (option b): SAME-MACHINE delivery is DURABLE-ALWAYS. The recipient's durable inbox is the
