@@ -8,7 +8,7 @@
  * set in the swarm context — so tests and ordinary sessions never write); never checks in to self; skips silently when the
  * coordinator has no resolvable same-machine presence file yet (it is found on a later node's startup / the next run).
  */
-import { writeInbox } from "./inbox.js";
+import { writeInbox, buildPoisonS19, type InboxMsg } from "./inbox.js";
 import { resolveSession, listSessions } from "./swarm/task-liveness.js";
 import type { SelfInfo } from "./label.js";
 
@@ -32,4 +32,21 @@ export function reportCheckIn(home: string, self: SelfInfo, coordinatorHandle: s
     });
     return "sent";
   } catch { return "retry"; } // transient (e.g. the write failed) -> retain the obligation (B5); never throw on startup
+}
+
+/** FC-2 — notify the coordinator that a poison message was quarantined (content preview + failure trace + strike count),
+ *  reusing the same coordinator-handle resolution as the check-in. Best-effort + fail-soft: the quarantine itself + the F26
+ *  dead-letter ledger line are the DURABLE record, so a missing/unresolvable coordinator never loses the incident — this is
+ *  the ACTIVE push on top. "sent" = written to the coordinator inbox; "skip" = no coordinator / not resolvable / is self /
+ *  write failed. NEVER throws. */
+export function notifyCoordinatorPoison(home: string, self: SelfInfo, coordinatorHandle: string | undefined, poison: InboxMsg, strikes: number, trace: string): "sent" | "skip" {
+  try {
+    if (!coordinatorHandle || !coordinatorHandle.trim()) return "skip";
+    const coordSid = resolveSession(coordinatorHandle, listSessions(home));
+    if (!coordSid) return "skip"; // not resolvable here — the dead-letter ledger remains the durable fallback
+    const mySid = self.stableId ?? self.id;
+    if (coordSid === mySid) return "skip"; // never to self
+    writeInbox(home, coordSid, buildPoisonS19(mySid, self.title, poison, strikes, trace));
+    return "sent";
+  } catch { return "skip"; } // fail-soft: the quarantine + ledger already captured it
 }

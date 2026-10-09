@@ -9,10 +9,10 @@ import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes } from "./inbox.js";
 import { resolveInboxTarget, isValidSessionId } from "./send-fallback.js";
 import { resolveSession, listSessions, probeSessionAlive } from "./swarm/task-liveness.js";
-import { reportCheckIn } from "./checkin.js";
+import { reportCheckIn, notifyCoordinatorPoison } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 
@@ -184,11 +184,26 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       let delivered = 0;
       for (let i = 0; i < claimed.length; i++) {
         // F28 defense-in-depth: a push that THREW (not just returned false) must never escape flushInbox — this runs as
-        // `void flushInbox()`, so an unhandled rejection would crash the whole bus server. Treat a throw as a delivery miss.
+        // `void flushInbox()`, so an unhandled rejection would crash the whole bus server. Treat a throw as a delivery miss,
+        // but REMEMBER it threw (FC-2: a throw is a poison strike; a return-false is channel-not-ready and never strikes).
         let ok = false;
+        let threw: string | null = null;
         try { ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread, codexHome: codexDaemon?.codexHome(), fromMode: claimed[i].msg.fromMode, to: self.title }); }
-        catch (e) { dbg(`flushInbox push threw (treating as miss): ${e instanceof Error ? e.message : e}`); ok = false; }
-        if (ok) { ackInbox(claimed[i].file); delivered++; continue; }
+        catch (e) { threw = e instanceof Error ? e.message : String(e); dbg(`flushInbox push threw (treating as miss): ${threw}`); ok = false; }
+        if (ok) { if (poisonDlqEnabled()) clearPoisonStrikes(claimed[i].file); ackInbox(claimed[i].file); delivered++; continue; }
+        // FC-2 poison dead-letter: a push that THREW (the host erring on THIS message's content) is a poison strike — a push
+        // that returned false is channel-not-ready and does NOT strike (no false-quarantine during an outage). After the
+        // threshold the message is quarantined (bytes preserved + the coordinator told) and we CONTINUE the batch so the
+        // head-of-line poison stops blocking the rest. Dormant unless SWARM_POISON_DLQ; quarantine is recoverable, never a drop.
+        if (threw !== null && poisonDlqEnabled()) {
+          const strikes = recordPoisonStrike(claimed[i].file);
+          if (shouldQuarantinePoison(strikes, poisonDlqThreshold()) &&
+              quarantineInbox(home, claimed[i].file, `poison: delivery threw ${strikes}x: ${threw}`, JSON.stringify(claimed[i].msg)) !== "failed") {
+            clearPoisonStrikes(claimed[i].file);
+            notifyCoordinatorPoison(home, self, process.env.SWARM_COORDINATOR, claimed[i].msg, strikes, threw); // best-effort, fail-soft
+            continue; // poison removed ⇒ try the rest of the batch
+          }
+        }
         // B7: a failed release for a HEALTHY message must not silently strand it — track it for retry (not stuckPoison; it is not
         // a bad message, and recoverStaleClaims won't free a live-pid claim).
         for (let j = i; j < claimed.length; j++) if (!releaseInbox(claimed[j].file)) stuckRelease.add(claimed[j].file);

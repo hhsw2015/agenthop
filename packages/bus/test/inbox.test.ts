@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19 } from "../src/inbox.js";
 
 let HOME: string;
 beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-inbox-")); });
@@ -195,5 +195,65 @@ describe("F28 poison-pill defense", () => {
     const names = readdirSync(inboxDirOf("s1"));
     expect(names).toContain("0000000000001000-dddddd.json");         // RELEASED back to .json for a later retry
     expect(names.some((n) => n.includes(".claim-"))).toBe(false);    // NOT left stuck as .claim-<live-pid>
+  });
+});
+
+describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
+  const dirOf = (key: string) => path.join(HOME, ".agenthop", "inbox", key);
+
+  test("poisonDlqEnabled default OFF; truthy words ON", () => {
+    expect(poisonDlqEnabled({})).toBe(false);
+    expect(poisonDlqEnabled({ SWARM_POISON_DLQ: "0" })).toBe(false);
+    for (const on of ["1", "true", "yes", "on", "YES"]) expect(poisonDlqEnabled({ SWARM_POISON_DLQ: on })).toBe(true);
+  });
+
+  test("poisonDlqThreshold default 3; valid int >= 1 honored; junk/0/negative ⇒ 3", () => {
+    expect(poisonDlqThreshold({})).toBe(3);
+    expect(poisonDlqThreshold({ SWARM_POISON_DLQ_THRESHOLD: "5" })).toBe(5);
+    expect(poisonDlqThreshold({ SWARM_POISON_DLQ_THRESHOLD: "1" })).toBe(1);
+    for (const bad of ["0", "-2", "2.5", "abc", ""]) expect(poisonDlqThreshold({ SWARM_POISON_DLQ_THRESHOLD: bad })).toBe(3);
+  });
+
+  test("shouldQuarantinePoison: fires at/above threshold, never below; guards NaN strikes + bad threshold", () => {
+    expect(shouldQuarantinePoison(3, 3)).toBe(true);
+    expect(shouldQuarantinePoison(4, 3)).toBe(true);
+    expect(shouldQuarantinePoison(2, 3)).toBe(false);
+    expect(shouldQuarantinePoison(NaN, 3)).toBe(false);  // no count ⇒ never
+    expect(shouldQuarantinePoison(5, 0)).toBe(false);    // threshold < 1 ⇒ never (guards misconfig)
+  });
+
+  test("recordPoisonStrike increments and the sidecar is keyed by the STABLE base (survives claim→release→reclaim)", () => {
+    const base = path.join(dirOf("s1"), "0000000000001000-aaaaaa.json");
+    mkdirSync(dirOf("s1"), { recursive: true });
+    expect(recordPoisonStrike(`${base}.claim-123`)).toBe(1); // claimed form
+    expect(recordPoisonStrike(base)).toBe(2);                // released form ⇒ SAME sidecar
+    expect(recordPoisonStrike(`${base}.claim-456`)).toBe(3); // reclaimed by a new pid ⇒ still the same count
+    clearPoisonStrikes(base);
+    expect(recordPoisonStrike(base)).toBe(1);                // cleared ⇒ starts over
+  });
+
+  test("the strike sidecar is NOT a .json ⇒ claimInbox never lists it as a deliverable message", () => {
+    writeInbox(HOME, "s1", msg("hello", 1000));
+    const jsonName = readdirSync(dirOf("s1")).find((n) => n.endsWith(".json"))!;
+    recordPoisonStrike(path.join(dirOf("s1"), jsonName)); // drop a .poison sidecar next to the message
+    const claimed = claimInbox(HOME, ["s1"], "p");
+    expect(claimed.length).toBe(1);                         // ONLY the message, not the sidecar
+    expect(claimed[0].msg.text).toBe("hello");
+    expect(existsSync(path.join(dirOf("s1"), `${jsonName}.poison`))).toBe(true); // sidecar untouched by the claim
+  });
+
+  test("buildPoisonS19 carries strikes + trace + source + a bounded preview", () => {
+    const poison = { from: "x", fromLabel: "alice", text: "A".repeat(500), via: "durable-inbox", ts: 42 };
+    const s19 = buildPoisonS19("my-sid", "me", poison, 3, "TypeError: boom");
+    expect(s19.taskRef).toBe("poison-dlq");
+    expect(s19.title).toBe("poison quarantine");
+    expect(s19.from).toBe("my-sid");
+    expect(s19.fromLabel).toBe("me");
+    expect(s19.text).toContain("3");                 // strike count
+    expect(s19.text).toContain("TypeError: boom");   // failure trace
+    expect(s19.text).toContain("alice");             // source label
+    expect(s19.text).toContain("durable-inbox");     // source via
+    expect(s19.text).toContain("…");                 // preview truncated (500 > 240)
+    expect(validInboxMsg(s19)).not.toBeNull();       // a well-formed inbox message
   });
 });

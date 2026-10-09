@@ -270,3 +270,60 @@ function alive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
 }
+
+// ============================================================================================================
+// FC-2 — poison dead-letter quarantine (SWARM_POISON_DLQ, default OFF). Under at-least-once delivery, a message whose
+// delivery reliably THROWS (the host erring on THIS content) head-of-line-blocks the queue, re-claimed + retried forever.
+// After a strike threshold it is moved to quarantine/ (bytes preserved, never deleted) and the coordinator is told. A push
+// that merely RETURNS FALSE is channel-not-ready (transient) and NEVER strikes — so a channel outage cannot false-quarantine
+// a healthy message. The strike count lives in a sidecar keyed by the message's STABLE base, invisible to claimInbox.
+// ============================================================================================================
+
+/** FC-2 dormant gate: OFF ⇒ the drainer's failure path is byte-for-byte v0 (release + retry, no strike counting). */
+export function poisonDlqEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(1|true|yes|on)$/i.test(env.SWARM_POISON_DLQ ?? "");
+}
+
+/** FC-2 strike threshold (default 3; SWARM_POISON_DLQ_THRESHOLD). A non-integer or < 1 value falls back to 3 (a 0/negative
+ *  threshold would quarantine on the first strike, or never — both wrong). */
+export function poisonDlqThreshold(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number(env.SWARM_POISON_DLQ_THRESHOLD);
+  return Number.isInteger(n) && n >= 1 ? n : 3;
+}
+
+/** FC-2 quarantine decision: a message has struck out once its delivery-CRASH count reaches the threshold. Pure. (Strikes
+ *  count only pushes that THREW — never a push that returned false, which is channel-not-ready and must not consume a strike.) */
+export function shouldQuarantinePoison(strikes: number, threshold: number): boolean {
+  return Number.isFinite(strikes) && threshold >= 1 && strikes >= threshold;
+}
+
+/** FC-2 — the strike sidecar for a (claimed or released) message file, keyed by the STABLE base (`<base>.json`) so the count
+ *  survives the claim→release→reclaim cycle. Not a `.json` file ⇒ claimInbox never lists it as a deliverable message. */
+function poisonSidecar(file: string): string {
+  return `${file.replace(/\.claim-[^.]+$/, "")}.poison`;
+}
+
+/** FC-2 — record one delivery-CRASH strike and return the new total. Best-effort read (missing/garbled ⇒ 0 so far) + atomic
+ *  write (tmp + rename). NEVER throws — a sidecar fault must not break the flush; on a write fault it still returns the
+ *  incremented count so the caller progresses (worst case the on-disk count lags, delaying — never dropping — quarantine). */
+export function recordPoisonStrike(file: string): number {
+  const sc = poisonSidecar(file);
+  let prev = 0;
+  try { const n = Number.parseInt(readFileSync(sc, "utf8"), 10); if (Number.isInteger(n) && n > 0) prev = n; } catch { /* none yet / unreadable ⇒ 0 */ }
+  const next = prev + 1;
+  try { const tmp = `${sc}.tmp-${randomBytes(4).toString("hex")}`; writeFileSync(tmp, String(next), { mode: 0o600 }); renameSync(tmp, sc); } catch { /* best-effort: count lags, never crashes */ }
+  return next;
+}
+
+/** FC-2 — clear the strike sidecar (on a successful ack, or after a quarantine move). Best-effort; never throws. */
+export function clearPoisonStrikes(file: string): void {
+  try { unlinkSync(poisonSidecar(file)); } catch { /* already gone */ }
+}
+
+/** FC-2 — build the S19 dead-letter notification for the coordinator when a poison message is quarantined: content preview +
+ *  failure trace + strike count, as an InboxMsg. Pure (no IO); the caller writes it to the coordinator's durable box. */
+export function buildPoisonS19(mySid: string, myLabel: string, poison: InboxMsg, strikes: number, trace: string): InboxMsg {
+  const preview = poison.text.length > 240 ? `${poison.text.slice(0, 240)}…` : poison.text;
+  const text = `[poison-dlq] 毒件已隔离(投递崩溃 ${strikes} 次,已达阈值)。来源 ${poison.fromLabel} via ${poison.via};失败轨迹: ${trace};内容预览: ${preview}`;
+  return { from: mySid, fromLabel: myLabel, text, via: "local", ts: Date.now(), taskRef: "poison-dlq", title: "poison quarantine" };
+}
