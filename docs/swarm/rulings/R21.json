@@ -1,0 +1,14 @@
+{
+  "id": "R21",
+  "series": "R",
+  "title": "通讯分层:原生优先,总线跨族,协调者不中转",
+  "status": "active",
+  "by": "user",
+  "statement": "user 拍板:Claude↔Claude 用内置原生通道(零中继);Claude↔Codex 等跨族才走 agenthop 总线;一律不经协调者转发(多一级传递伤效率)。三层定序:①同族同机=原生直发(cc 原生 messaging;codex↔codex 用 codex queue 直投);②跨族/跨机=agenthop 总线;③协调者不做消息中转站。",
+  "relates": [
+    "R21-b"
+  ],
+  "sources": [
+    "PROGRESS.md:452 (2026-10-07)"
+  ]
+}

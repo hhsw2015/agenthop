@@ -1,0 +1,10 @@
+{
+  "id": "S24",
+  "series": "S",
+  "title": "herdr 整合:spawn/resume 双后端",
+  "status": "active",
+  "statement": "herdr 整合派单:spawn/resume 双后端(HERDR_ENV/server 可达走 herdr,否则回落 Ghost);卡点哨兵+审批回注。",
+  "sources": [
+    "PROGRESS.md:270"
+  ]
+}

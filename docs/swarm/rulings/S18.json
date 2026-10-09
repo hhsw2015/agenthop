@@ -1,0 +1,13 @@
+{
+  "id": "S18",
+  "series": "S",
+  "title": "file=authority, message=pointer",
+  "status": "active",
+  "statement": "文件=权威,消息=指针:判决/交付的权威载体是落档文件,消息只承载指针与摘要。S26 抄送精简即以此为据。",
+  "relates": [
+    "S26"
+  ],
+  "sources": [
+    "PROGRESS.md:394"
+  ]
+}

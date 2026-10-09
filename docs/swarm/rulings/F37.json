@@ -1,0 +1,10 @@
+{
+  "id": "F37",
+  "series": "F",
+  "title": "重启后会话档案 cwd 漂移",
+  "status": "active",
+  "statement": "重启后全员复线:happycapy codex 卡点=Share 盘已删除,会话档案 session_meta 记旧 cwd;补丁 rollout jsonl 的 cwd/workspace_roots 至新家 ~/Dev。",
+  "sources": [
+    "PROGRESS.md:264"
+  ]
+}

@@ -1,0 +1,393 @@
+{
+  "version": 1,
+  "generatedAtSec": 1791521590,
+  "count": 63,
+  "bySeriesCount": {
+    "R": 26,
+    "S": 17,
+    "F": 20
+  },
+  "entries": [
+    {
+      "id": "R1",
+      "series": "R",
+      "title": "裁定版本号机制首战生效",
+      "status": "active"
+    },
+    {
+      "id": "R2",
+      "series": "R",
+      "title": "vm-ssh v2 known-gap 入代码+packet",
+      "status": "active"
+    },
+    {
+      "id": "R3",
+      "series": "R",
+      "title": "凭证收窄:--init 非敏感+secret 引用",
+      "status": "active"
+    },
+    {
+      "id": "R7",
+      "series": "R",
+      "title": "换源②③边界:导管 Dot 无大脑",
+      "status": "superseded",
+      "supersededBy": "R10"
+    },
+    {
+      "id": "R8",
+      "series": "R",
+      "title": "语音直通路(user 方向)",
+      "status": "active"
+    },
+    {
+      "id": "R9",
+      "series": "R",
+      "title": "语音前台(对话官)开工,修订 R7 语音半边",
+      "status": "superseded",
+      "supersededBy": "R10"
+    },
+    {
+      "id": "R10",
+      "series": "R",
+      "title": "终定:文字+语音统一走对话官",
+      "status": "active"
+    },
+    {
+      "id": "R11",
+      "series": "R",
+      "title": "纠在途交叉:范围答复带裁定号",
+      "status": "active"
+    },
+    {
+      "id": "R12",
+      "series": "R",
+      "title": "哨兵 escalate-only 降级",
+      "status": "active"
+    },
+    {
+      "id": "R13",
+      "series": "R",
+      "title": "原生回执验证两段走:失实重于缺陷",
+      "status": "active"
+    },
+    {
+      "id": "R14",
+      "series": "R",
+      "title": "BA9 上板监督准延期+硬条件",
+      "status": "active"
+    },
+    {
+      "id": "R15",
+      "series": "R",
+      "title": "F40 自动恢复身份边界:裁 A",
+      "status": "active"
+    },
+    {
+      "id": "R15-b",
+      "series": "R",
+      "title": "legacyInboxKeys 收紧口径核准",
+      "status": "active"
+    },
+    {
+      "id": "R16",
+      "series": "R",
+      "title": "user 授权链宪法条款",
+      "status": "active"
+    },
+    {
+      "id": "R16-b",
+      "series": "R",
+      "title": "修订:R16 收窄为实际可执行面",
+      "status": "active"
+    },
+    {
+      "id": "R17",
+      "series": "R",
+      "title": "协调者代行=以 user 名义实施,非冒充",
+      "status": "active"
+    },
+    {
+      "id": "R18",
+      "series": "R",
+      "title": "分层调度宪章:二级协调者",
+      "status": "active"
+    },
+    {
+      "id": "R19",
+      "series": "R",
+      "title": "临时 VM 费用定性:零费用",
+      "status": "active"
+    },
+    {
+      "id": "R20",
+      "series": "R",
+      "title": "对话官升档:轻推理日常事务官",
+      "status": "active"
+    },
+    {
+      "id": "R21",
+      "series": "R",
+      "title": "通讯分层:原生优先,总线跨族,协调者不中转",
+      "status": "active"
+    },
+    {
+      "id": "R21-b",
+      "series": "R",
+      "title": "通信模型=公司拓扑,非全连通网",
+      "status": "active"
+    },
+    {
+      "id": "R22",
+      "series": "R",
+      "title": "DHH 经验定为设计基准",
+      "status": "active"
+    },
+    {
+      "id": "R23",
+      "series": "R",
+      "title": "LS4 双故障边界:裁 A",
+      "status": "active"
+    },
+    {
+      "id": "R24",
+      "series": "R",
+      "title": "决策批窗 B:探针不可实现时门槛回到语义",
+      "status": "active"
+    },
+    {
+      "id": "R25",
+      "series": "R",
+      "title": "决策批终窗:接受窄窗+孤儿重批",
+      "status": "active"
+    },
+    {
+      "id": "R26",
+      "series": "R",
+      "title": "DB-R7 探针互斥:裁保守解",
+      "status": "active"
+    },
+    {
+      "id": "S11",
+      "series": "S",
+      "title": "coord-liveness L2 结构化委托",
+      "status": "active"
+    },
+    {
+      "id": "S12",
+      "series": "S",
+      "title": "抄送纪律(后经 S26 收紧)",
+      "status": "superseded",
+      "supersededBy": "S26"
+    },
+    {
+      "id": "S14",
+      "series": "S",
+      "title": "派单全字段契约",
+      "status": "active"
+    },
+    {
+      "id": "S15",
+      "series": "S",
+      "title": "heavy-tier prompt 契约 + 中文纪律",
+      "status": "active"
+    },
+    {
+      "id": "S16",
+      "series": "S",
+      "title": "交付产物落档 + 内联",
+      "status": "active"
+    },
+    {
+      "id": "S18",
+      "series": "S",
+      "title": "file=authority, message=pointer",
+      "status": "active"
+    },
+    {
+      "id": "S19",
+      "series": "S",
+      "title": "审批件经协调者(单线宪法下)",
+      "status": "active"
+    },
+    {
+      "id": "S21",
+      "series": "S",
+      "title": "单线宪法",
+      "status": "active"
+    },
+    {
+      "id": "S22",
+      "series": "S",
+      "title": "控制台 HITL 呈批五格式契约",
+      "status": "active"
+    },
+    {
+      "id": "S23",
+      "series": "S",
+      "title": "花费请示门(临时 VM 除外)",
+      "status": "active"
+    },
+    {
+      "id": "S24",
+      "series": "S",
+      "title": "herdr 整合:spawn/resume 双后端",
+      "status": "active"
+    },
+    {
+      "id": "S26",
+      "series": "S",
+      "title": "抄送精简纪律",
+      "status": "active"
+    },
+    {
+      "id": "S27",
+      "series": "S",
+      "title": "消息减肥 + 审查批量",
+      "status": "active"
+    },
+    {
+      "id": "S28",
+      "series": "S",
+      "title": "产出精简:定长先行",
+      "status": "active"
+    },
+    {
+      "id": "S28-b",
+      "series": "S",
+      "title": "补强:ste100 + i-have-adhd 全员强制",
+      "status": "active"
+    },
+    {
+      "id": "S29",
+      "series": "S",
+      "title": "单轮对话效率:一单两信",
+      "status": "active"
+    },
+    {
+      "id": "S30",
+      "series": "S",
+      "title": "派单模板补强:user 已裁事项注明原话",
+      "status": "active"
+    },
+    {
+      "id": "F21",
+      "series": "F",
+      "title": "完成槽 observer 根治消息全丢",
+      "status": "active"
+    },
+    {
+      "id": "F24",
+      "series": "F",
+      "title": "bus-reachability 通信根治四机制",
+      "status": "active"
+    },
+    {
+      "id": "F25",
+      "series": "F",
+      "title": "空等无人催",
+      "status": "active"
+    },
+    {
+      "id": "F28",
+      "series": "F",
+      "title": "inbox 定向补查(IO/rename/审计)",
+      "status": "active"
+    },
+    {
+      "id": "F30",
+      "series": "F",
+      "title": "bus-reachability 从根本解决",
+      "status": "active"
+    },
+    {
+      "id": "F31",
+      "series": "F",
+      "title": "native-direct 设计+安全问题待裁",
+      "status": "active"
+    },
+    {
+      "id": "F32",
+      "series": "F",
+      "title": "活 pid 推送永不 settle 整批卡死",
+      "status": "active"
+    },
+    {
+      "id": "F33",
+      "series": "F",
+      "title": "pr-to-video 无账号边界实测",
+      "status": "active"
+    },
+    {
+      "id": "F36",
+      "series": "F",
+      "title": "出生证补完整 resumeCmd(非裸 --resume)",
+      "status": "active"
+    },
+    {
+      "id": "F37",
+      "series": "F",
+      "title": "重启后会话档案 cwd 漂移",
+      "status": "active"
+    },
+    {
+      "id": "F38",
+      "series": "F",
+      "title": "inbox via 容忍:读侧宽写侧唯一校验",
+      "status": "active"
+    },
+    {
+      "id": "F39",
+      "series": "F",
+      "title": "协调者巡检缺位",
+      "status": "active"
+    },
+    {
+      "id": "F40",
+      "series": "F",
+      "title": "codex 线程漂移致死箱投递",
+      "status": "active"
+    },
+    {
+      "id": "F41",
+      "series": "F",
+      "title": "成员侧安全拦截造成不可见卡死",
+      "status": "active"
+    },
+    {
+      "id": "F42",
+      "series": "F",
+      "title": "herdr 自动恢复丢启动参数",
+      "status": "active"
+    },
+    {
+      "id": "F43",
+      "series": "F",
+      "title": "user 跑成员终端敲 go 违反自动化原则",
+      "status": "active"
+    },
+    {
+      "id": "F44",
+      "series": "F",
+      "title": "哨兵降噪:同卡点多封无去重等",
+      "status": "active"
+    },
+    {
+      "id": "F45",
+      "series": "F",
+      "title": "为什么你没收到消息(换壳继任+I3)",
+      "status": "active"
+    },
+    {
+      "id": "F46",
+      "series": "F",
+      "title": "送审投错箱(run-id 而非线程 id)",
+      "status": "active"
+    },
+    {
+      "id": "F47",
+      "series": "F",
+      "title": "codex CLI 升级后总线身份失联",
+      "status": "active"
+    }
+  ]
+}

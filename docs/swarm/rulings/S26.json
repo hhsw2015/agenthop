@@ -1,0 +1,21 @@
+{
+  "id": "S26",
+  "series": "S",
+  "title": "抄送精简纪律",
+  "status": "active",
+  "by": "user",
+  "supersedes": [
+    "S12"
+  ],
+  "statement": "user 点出:判决/交付全文只直投一方(修复方/任务归属方);抄送协调者一律摘要件(≤15 行:固定 SHA/计数/CLOSED 清单/REMAIN 清单/门槛类型/报告路径+SHA256/下一步归谁)。依据=S18「file=authority, message=pointer」。",
+  "relates": [
+    "S12",
+    "S18",
+    "S27",
+    "S28",
+    "S29"
+  ],
+  "sources": [
+    "PROGRESS.md:394"
+  ]
+}

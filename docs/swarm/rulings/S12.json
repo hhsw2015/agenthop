@@ -1,0 +1,11 @@
+{
+  "id": "S12",
+  "series": "S",
+  "title": "抄送纪律(后经 S26 收紧)",
+  "status": "superseded",
+  "supersededBy": "S26",
+  "statement": "判决/交付的抄送纪律初版,后由 S26 修订收紧为「全文只直投一方,抄送协调者一律 ≤15 行摘要件」。",
+  "sources": [
+    "PROGRESS.md:394"
+  ]
+}

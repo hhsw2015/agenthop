@@ -1,0 +1,10 @@
+{
+  "id": "S22",
+  "series": "S",
+  "title": "控制台 HITL 呈批五格式契约",
+  "status": "active",
+  "statement": "协调者控制台 v1:HITL 呈批回执五格式契约 + F 集群视图 + chat 单线导管(端到端实测)+ 剥云(禁用=零网络可达)+ UI 单线。",
+  "sources": [
+    "PROGRESS.md:239"
+  ]
+}

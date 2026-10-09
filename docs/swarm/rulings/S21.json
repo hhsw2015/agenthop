@@ -1,0 +1,10 @@
+{
+  "id": "S21",
+  "series": "S",
+  "title": "单线宪法",
+  "status": "active",
+  "statement": "单线宪法:一切聊天/控制台单线导管,user 唯一可信入口经协调者;console-refs-eval 四对象对表确认 OpenDots 最正对口。",
+  "sources": [
+    "PROGRESS.md:20"
+  ]
+}

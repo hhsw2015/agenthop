@@ -1,0 +1,10 @@
+{
+  "id": "F38",
+  "series": "F",
+  "title": "inbox via 容忍:读侧宽写侧唯一校验",
+  "status": "active",
+  "statement": "F38 修复:读侧 via 容忍任意非空标签(空/缺/非串仍拒)+写侧 composeInboxMsg 唯一校验入口(产出必过验证器)+selftest 钉死被隔离形态往返+docs 模板改指助手。",
+  "sources": [
+    "PROGRESS.md:285"
+  ]
+}

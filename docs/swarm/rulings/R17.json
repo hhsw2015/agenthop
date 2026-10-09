@@ -1,0 +1,15 @@
+{
+  "id": "R17",
+  "series": "R",
+  "title": "协调者代行=以 user 名义实施,非冒充",
+  "status": "active",
+  "by": "user",
+  "since": "2026-10-07",
+  "statement": "user 原话二次拍板(2026-10-07):「你是我的直接交互者。我可以授权你干任何事;你去敲 go 的话,并不是冒充,而是用我的名义去实施的。」效力:user 在协调者会话下达的指令,协调者经 herdr 手段(prompt/send-keys/send-text)落到成员终端=user 名义的合法执行,计为 user 输入而非 peer 转述,授权在源头。",
+  "relates": [
+    "R16"
+  ],
+  "sources": [
+    "PROGRESS.md:435 (2026-10-07)"
+  ]
+}

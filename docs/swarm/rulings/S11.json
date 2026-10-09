@@ -1,0 +1,14 @@
+{
+  "id": "S11",
+  "series": "S",
+  "title": "coord-liveness L2 结构化委托",
+  "status": "active",
+  "statement": "L2-struct=受管委托信封(requestId 轮次身份+payloadDigest+subject+完成槽+owner)+双端监管(生产 wait/消费 wait 原子 close+open)+完成槽独立 observer(目录扫描核对目标摘要,消息全丢仍被发现消费),全不依赖名册。",
+  "relates": [
+    "F21"
+  ],
+  "sources": [
+    "PROGRESS.md:36",
+    "PROGRESS.md:67"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "id": "S23",
+  "series": "S",
+  "title": "花费请示门(临时 VM 除外)",
+  "status": "active",
+  "statement": "花费请示门纪律;经 R19 修正:Railway/GHA 类短命 VM=零费用项不设请示门。成本宪法句(user):「大量 agent 消耗大量 token;不是每个场景都需要顶级模型,成本是非常大的考虑。」fan-out 须带成本模型+分层用模。",
+  "relates": [
+    "R19"
+  ],
+  "sources": [
+    "PROGRESS.md:441",
+    "PROGRESS.md:538"
+  ]
+}

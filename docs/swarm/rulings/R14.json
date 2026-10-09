@@ -1,0 +1,11 @@
+{
+  "id": "R14",
+  "series": "R",
+  "title": "BA9 上板监督准延期+硬条件",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "SWARM_BOARD_ADMIT 翻开前必须补齐(启用门硬条件)。BA4 盘上键改 jobId__nodeId 命名空间:准(dormant 期=零迁移税窗口)。BA1-BA8 修法认可。",
+  "sources": [
+    "PROGRESS.md:355"
+  ]
+}

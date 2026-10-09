@@ -1,0 +1,15 @@
+{
+  "id": "R9",
+  "series": "R",
+  "title": "语音前台(对话官)开工,修订 R7 语音半边",
+  "status": "superseded",
+  "by": "user",
+  "supersededBy": "R10",
+  "statement": "语音前台(对话官)拍板开工,参考 OpenClicky 两层架构:realtime 前台=有限大脑+记忆。自答域(寒暄/澄清/状态摘要/转述)亚秒起声;上交域(派活/变更/裁定/三门)投协调者+即时 ack+异步回播;前台永不派活/审批/裁定。",
+  "relates": [
+    "R7"
+  ],
+  "sources": [
+    "PROGRESS.md:281"
+  ]
+}

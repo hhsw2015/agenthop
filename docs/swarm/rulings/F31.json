@@ -1,0 +1,10 @@
+{
+  "id": "F31",
+  "series": "F",
+  "title": "native-direct 设计+安全问题待裁",
+  "status": "active",
+  "statement": "native-direct(Stage A 三层树中层):有设计+安全问题,未擅自实现,请协调者/user 裁。",
+  "sources": [
+    "PROGRESS.md:95"
+  ]
+}

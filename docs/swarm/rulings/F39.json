@@ -1,0 +1,13 @@
+{
+  "id": "F39",
+  "series": "F",
+  "title": "协调者巡检缺位",
+  "status": "active",
+  "statement": "user 点破「就 herdr 在做」:点名实证多线 idle/未动审查,三线停摆而我只在等汇报,F25「空等无人催」换方向重演(上次成员等我,这次我等成员)。即改:三线逐一催办。",
+  "relates": [
+    "F25"
+  ],
+  "sources": [
+    "PROGRESS.md:313"
+  ]
+}

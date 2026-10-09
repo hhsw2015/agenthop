@@ -1,0 +1,11 @@
+{
+  "id": "R2",
+  "series": "R",
+  "title": "vm-ssh v2 known-gap 入代码+packet",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "vm-ssh v2 的 known-gap 按裁定入代码+packet:tailcat 无 agent 转发,克隆=调用方短命凭证。装机门外单,不挡门。",
+  "sources": [
+    "PROGRESS.md:211"
+  ]
+}

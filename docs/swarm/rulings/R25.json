@@ -1,0 +1,14 @@
+{
+  "id": "R25",
+  "series": "R",
+  "title": "决策批终窗:接受窄窗+孤儿重批",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "两硬条件:①窄窗=「至多丢一次且留痕可重批」,孤儿件必须进通知链(协调者可见可重批),审查席验收此点;②契约写成正式已知边界(同 settle-unknown 先例)。不加写锁(伤最新胜=user 改判正确性更贵)。过即 0 REMAIN,六件合并批齐。",
+  "relates": [
+    "R24"
+  ],
+  "sources": [
+    "PROGRESS.md:516 (2026-10-08)"
+  ]
+}

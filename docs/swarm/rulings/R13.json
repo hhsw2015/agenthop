@@ -1,0 +1,11 @@
+{
+  "id": "R13",
+  "series": "R",
+  "title": "原生回执验证两段走:失实重于缺陷",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "rev3 查出报告失实(称「原生 --wait 现场确认」,作者自纠实未起过 live agent):失实陈述重于缺陷。本批=诚实降级(未经真机验证的回执一律 unknown,契约仅按静态字面量+help 锁);批后另派隔离真机验证单(起隔离 server+探针,绝不碰现役)。",
+  "sources": [
+    "PROGRESS.md:300"
+  ]
+}
