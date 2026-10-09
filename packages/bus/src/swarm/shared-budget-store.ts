@@ -65,18 +65,25 @@ const isAlive = (pid: number) => !holderIsDead(pid);
 
 function sleepMs(ms: number): void { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 
-// Self-stranded state this process must recover (SB1/R3): a credential file we could not remove, and an empty dir we could not drop.
+// Self-stranded state this process must recover (SB1): a credential file we could not remove, and/or an empty dir we could not
+// drop. After ANY publish fault the on-disk residue is uncertain (our credential may or may not exist, the dir may be empty), so
+// we register BOTH and let the retry's reclaim (entries===1 + our cred) / adopt (entries===0 + our dir) pick the true path. Only
+// our OWN (dir, token) are ever registered — an external unknown lock is never made recoverable (boundary preserved).
 const strandedCreds = new Set<string>(); // `${dir}\0${token}`
 const strandedEmpty = new Set<string>(); // dir
+const credKey = (dir: string, token: string) => `${dir}\0${token}`;
+function markStranded(dir: string, token: string): void { strandedCreds.add(credKey(dir, token)); strandedEmpty.add(dir); }
+function clearStranded(dir: string, token: string): void { strandedCreds.delete(credKey(dir, token)); strandedEmpty.delete(dir); }
 
 // --- holder-identity lock (SB1/SB5) -------------------------------------------
+/** Publish our identity, then verify we are the SOLE holder (loses a race safely). On ANY failure where our credential may be left
+ *  on disk, register it for in-process recovery (SB1/R4) — never return a bare false that drops a real residue. */
 function publishSole(dir: string, mine: string, token: string): boolean {
-  // Publish our identity, then verify we are the SOLE holder (loses a race safely).
-  try { writeFileSync(mine, '', { mode: 0o600 }); } catch { return false; }
+  try { writeFileSync(mine, '', { mode: 0o600 }); } catch { markStranded(dir, token); return false; } // may have partially created it
   let after: string[];
-  try { after = readdirSync(dir); } catch { try { rmSync(mine); } catch { /* */ } return false; }
+  try { after = readdirSync(dir); } catch { markStranded(dir, token); return false; } // our file exists but we can't verify
   if (after.length === 1 && after[0] === token) return true;
-  try { rmSync(mine); } catch { /* best-effort back-off */ }
+  try { rmSync(mine); } catch { markStranded(dir, token); } // couldn't drop our losing credential => recover it later
   return false;
 }
 function acquireLock(home: string, name: string): string {
@@ -94,10 +101,10 @@ function acquireLock(home: string, name: string): string {
       try { entries = readdirSync(dir); } catch { sleepMs(15); continue; }
       if (entries.length === 1) {
         const holder = entries[0]!;
-        if (strandedCreds.has(`${dir}\0${holder}`)) {
-          // OUR OWN leftover credential (a prior release fault) => reclaim it, then adopt the dir.
-          try { rmSync(path.join(dir, holder)); strandedCreds.delete(`${dir}\0${holder}`); } catch { sleepMs(15); continue; }
-          if (publishSole(dir, mine, token)) { strandedEmpty.delete(dir); return token; }
+        if (strandedCreds.has(credKey(dir, holder))) {
+          // OUR OWN leftover credential (a prior publish/release fault) => reclaim it, then adopt the dir.
+          try { rmSync(path.join(dir, holder)); strandedCreds.delete(credKey(dir, holder)); } catch { sleepMs(15); continue; }
+          if (publishSole(dir, mine, token)) { clearStranded(dir, token); return token; }
           sleepMs(15); continue;
         }
         if (holderIsDead(Number(holder.split('.')[0]))) {
@@ -108,7 +115,7 @@ function acquireLock(home: string, name: string): string {
       }
       if (entries.length === 0) {
         if (strandedEmpty.has(dir)) { // OUR OWN stranded empty dir => adopt
-          if (publishSole(dir, mine, token)) { strandedEmpty.delete(dir); return token; }
+          if (publishSole(dir, mine, token)) { clearStranded(dir, token); return token; }
           sleepMs(15); continue;
         }
         sleepMs(15); continue; // external empty => contend
@@ -116,9 +123,9 @@ function acquireLock(home: string, name: string): string {
       sleepMs(15); continue; // ambiguous (>1) => contend
     }
     // Won a fresh mkdir.
-    strandedEmpty.delete(dir);
     try { writeFileSync(mine, '', { mode: 0o600 }); }
-    catch (e) { strandedEmpty.add(dir); throw e; }
+    catch (e) { markStranded(dir, token); throw e; } // SB1/R4: our credential may exist => register both paths
+    clearStranded(dir, token);
     return token;
   }
   throw new Error(`shared-budget: could not acquire lock for pool ${name} within ${tries} tries`);
@@ -127,9 +134,10 @@ function releaseLock(home: string, name: string, token: string): void {
   const dir = lockDir(home, name);
   const mine = path.join(dir, token);
   try { if (existsSync(mine)) rmSync(mine); }
-  catch { strandedCreds.add(`${dir}\0${token}`); return; } // our credential lingers => reclaim on retry (SB1/R3)
+  catch { strandedCreds.add(credKey(dir, token)); return; } // credential residue => reclaim on retry (SB1)
+  strandedCreds.delete(credKey(dir, token));
   try { rmdirSync(dir); strandedEmpty.delete(dir); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') strandedEmpty.add(dir); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') strandedEmpty.delete(dir); else strandedEmpty.add(dir); } // empty-dir residue
 }
 function withLock<T>(home: string, name: string, fn: () => T): T {
   const token = acquireLock(home, name);
