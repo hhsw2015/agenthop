@@ -2,7 +2,7 @@
 //   npx tsx packages/bus/src/swarm/fanout.selftest.mts
 // Each pre-study pit (docs/swarm/fanout-prestudy.md §2) is a NAMED counterexample below.
 import {
-  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, degradeDisplay, resumeVerdict, validSpent, leaseOccupied,
+  admitDepth, budgetExceeded, canReapZone, chooseDisplayMode, classifyExit, classToTier, degradeDisplay, resumeVerdict, validSpent, leaseOccupied, rowReleasable,
   effectiveTier, elapsedTimedOut, isSafeRunKey, isTerminal, markAborted, newLedgerRow, nextReceipt, parseDepth,
   planResume, progress, reconcileOrphans, reduceUnits, reservationFits, reserveValid, validateFanoutRequest,
   validBudgetTicket, validRoiEstimate, widthClass, widthGate, zoneName, type FanoutUnit, type LedgerRow, type UnitResult,
@@ -216,6 +216,16 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("visible: rc absence is NOT 'closed' (a missing/unwritable todo cannot free the slot)", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: false, rcPresent: false })) === true);
   t("unbound (no child/zone): held while driver lives", leaseOccupied({ pid: 1 }, P({ driverAlive: true })) === true);
   t("unbound: driver dead -> free", leaseOccupied({ pid: 1 }, P({ driverAlive: false })) === false);
+}
+
+// --- FN9: rowReleasable — the ONE settle/cleanup release rule; a HELD (failed-but-running) row is NEVER reaped ---
+{
+  const Q = (o: Partial<{ childGone: boolean; hasPane: boolean; rcPresent: boolean }>) => ({ childGone: false, hasPane: false, rcPresent: false, ...o });
+  t("headless: child gone -> releasable", rowReleasable("headless", Q({ childGone: true })) === true);
+  t("headless HOLD: child ALIVE (failed status) -> NOT releasable (the r10 bug)", rowReleasable("headless", Q({ childGone: false })) === false);
+  t("visible: never opened a pane -> releasable (nothing launched)", rowReleasable("temp-workspace", Q({ hasPane: false })) === true);
+  t("visible: pane open, no rc yet -> NOT releasable (still running)", rowReleasable("temp-workspace", Q({ hasPane: true, rcPresent: false })) === false);
+  t("visible: pane open + rc present -> releasable (command exited)", rowReleasable("temp-workspace", Q({ hasPane: true, rcPresent: true })) === true);
 }
 
 // --- FN7: width evidence must be real + bound to the run (not a bare flag) ---

@@ -20,7 +20,7 @@ import {
 import {
   admitDepth, canReapZone, chooseDisplayMode, classifyExit, degradeDisplay, effectiveTier,
   elapsedTimedOut, markAborted, newLedgerRow, nextReceipt, parseDepth, planResume, reconcileOrphans, reduceUnits,
-  leaseOccupied, reservationFits, reserveValid, resumeVerdict, validSpent, validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthGate, zoneName,
+  leaseOccupied, reservationFits, reserveValid, resumeVerdict, rowReleasable, validSpent, validateFanoutRequest, validBudgetTicket, validRoiEstimate, widthGate, zoneName,
   type AggregateReceipt, type DisplayMode, type FanoutBudget, type FanoutRequest, type FanoutUnit, type FanoutTier,
   type LedgerRow, type Spent, type UnitResult,
 } from "../packages/bus/src/swarm/fanout.js";
@@ -162,6 +162,22 @@ function acquireLease(home: string, cap: number, label: string): string | null {
   }
 }
 const releaseLease = (file: string | null): void => { if (file) rmSync(file, { force: true }); };
+// FN9: the ONE release rule, shared by EVERY settle/cleanup entry (settleUnit early-return + finally, the run's outer
+// finally, the bind-fail HOLD). Free a slot ONLY on CONFIRMED terminal evidence — a `failed` ledger status NEVER proves
+// the process ended. headless: no child pid, or the pid is gone. visible: no pane was ever opened (never launched), or
+// THIS launch's rc sidecar exists (the command exited). Otherwise the slot is HELD (the lease stays, surviving driver
+// exit) — a still-running execution's capacity is never freed by bookkeeping. (A confirmed zone CLOSE is a separate
+// terminal signal handled where the close happens.)
+function releaseIfTerminal(l: Launched): void {
+  if (!l.lease) return;
+  const row = l.row;
+  const releasable = rowReleasable(row.displayMode, {
+    childGone: row.pid === undefined || !pidAlive(row.pid),
+    hasPane: row.pane !== undefined,
+    rcPresent: row.outputPtr !== undefined && readFileOrNull(rcFile(row.outputPtr)) !== null,
+  });
+  if (releasable) { releaseLease(l.lease); l.lease = null; }
+}
 // FN9: bind the lease to the detached child's pid, so capacity is not released until the child's terminal state. Returns
 // whether the identity write was DURABLE — a failed write must be visible to the caller so it can undo the launch (a bare
 // lease would be reaped on driver death while the child still runs).
@@ -311,11 +327,10 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
             let bound = bindLeaseChild(lease, r.pid);
             for (let a = 0; a < 5 && !bound; a++) { await sleep(200); bound = bindLeaseChild(lease, r.pid); }
             if (!bound) {
-              let dead = !pidAlive(r.pid);
-              for (let a = 0; a < 5 && !dead; a++) { await despawnAgent(l.row.id).catch(() => {}); await sleep(200); dead = !pidAlive(r.pid); }
+              for (let a = 0; a < 5 && pidAlive(r.pid); a++) { await despawnAgent(l.row.id).catch(() => {}); await sleep(200); }
               l.row.status = "failed"; l.row.endedAt = Date.now();
-              if (dead) { releaseLease(lease); l.lease = null; } // child confirmed gone -> safe to free the slot
-              else console.error(`swarm-fanout: LEAKED slot — child pid ${r.pid} (launch ${l.row.id}) survived despawn AND its lease identity could not be persisted; lease HELD (never deleted under a live child), manual reap required`);
+              releaseIfTerminal(l); // FN9: releases iff the child is confirmed gone; a survivor HOLDS the lease (never deleted under a live child) — settleUnit + outer finally use the SAME rule, so none of them later delete this HELD lease
+              if (l.lease) console.error(`swarm-fanout: LEAKED slot — child pid ${r.pid} (launch ${l.row.id}) survived despawn AND its lease identity could not be persisted; lease HELD, manual reap required`);
             }
           }
           if (r.outputFile !== undefined) l.row.outputPtr = r.outputFile;
@@ -358,7 +373,7 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
       // bound to the child pid (acquireLease reaps it when the child dies) rather than freeing capacity while it runs.
       if (l.row.displayMode !== "headless") continue; // VISIBLE leases are released ONLY after a confirmed zone close (below)
       if (l.row.pid !== undefined && pidAlive(l.row.pid)) await despawnAgent(l.row.id).catch(() => {});
-      if (l.row.pid === undefined || !pidAlive(l.row.pid)) { releaseLease(l.lease); l.lease = null; }
+      releaseIfTerminal(l); // FN9: release iff the child is confirmed gone (same rule as settleUnit); a survivor HOLDS its slot
     }
     // FN4: reap ONLY the zone we opened, in finally (exception-safe); a failed close leaves a durable cleanup todo.
     let zoneClosed = !(zone && zoneId); // nothing opened ⇒ nothing to close
@@ -386,7 +401,9 @@ const cwdOfRow = (req: FanoutRequest, row: LedgerRow): string | undefined => uni
 // Settle one launched unit: classify from REAL exit evidence (FN8), despawn/close on timeout, release its lease.
 async function settleUnit(env: NodeJS.ProcessEnv, home: string, l: Launched, timeoutMs: number): Promise<void> {
   const row = l.row;
-  if (row.status !== "running") { releaseLease(l.lease); l.lease = null; return; }
+  // FN9: a non-running row is NOT automatically a reapable terminal — a HOLD (bind-fail, child still alive) is `failed` yet
+  // its slot is still owed. Share the ONE confirmed-terminal rule; a live HELD execution keeps its lease.
+  if (row.status !== "running") { releaseIfTerminal(l); return; }
   const out = row.outputPtr!; // always set at registration (FN8 unique per-launch path)
   const outputPresent = (): boolean => { try { return existsSync(out) && statSync(out).size > 0; } catch { return false; } };
   try {
@@ -412,12 +429,7 @@ async function settleUnit(env: NodeJS.ProcessEnv, home: string, l: Launched, tim
     row.status = "failed"; // FN8: an exception is never a success
   } finally {
     row.endedAt = Date.now();
-    // FN9: free capacity ONLY on a CONFIRMED terminal. Headless: the child pid is gone (a timeout despawn that did
-    // not kill it leaves the child alive — keep the lease bound to its pid for acquireLease's stale-reap). Visible
-    // (no pid): the command wrote its rc sidecar, i.e. it actually EXITED — a missing pid is NOT "ended", and a
-    // still-running/lingering pane holds the slot until the run's outer finally confirms the zone close.
-    const terminal = row.displayMode === "headless" ? (row.pid === undefined || !pidAlive(row.pid)) : readFileOrNull(rcFile(out)) !== null;
-    if (terminal) { releaseLease(l.lease); l.lease = null; }
+    releaseIfTerminal(l); // FN9: the ONE confirmed-terminal rule (headless pid-gone / visible rc-present); a still-running execution HOLDS its slot
   }
 }
 

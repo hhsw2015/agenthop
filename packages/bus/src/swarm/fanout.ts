@@ -350,6 +350,15 @@ export function leaseOccupied(rec: { pid?: number; childPid?: number; zoneId?: s
   return probe.driverAlive;
 }
 
+// FN9: is a settled row's slot RELEASABLE (confirmed terminal)? The ONE rule every settle/cleanup entry shares (settleUnit
+// early-return + finally, the run's outer finally, the bind-fail HOLD) so a HELD row — `failed` on the ledger but its
+// child STILL running — is never reaped by bookkeeping. headless: the child is gone. visible: it never opened a pane
+// (never launched) OR THIS launch's rc sidecar exists (the command exited). A confirmed zone CLOSE is a separate terminal
+// signal, applied where the close happens.
+export function rowReleasable(displayMode: string, probe: { childGone: boolean; hasPane: boolean; rcPresent: boolean }): boolean {
+  return displayMode === "headless" ? probe.childGone : !probe.hasPane || probe.rcPresent;
+}
+
 // FN7: the width ROI tier needs a REAL estimate bound to this run (env may carry a pointer to it, never be the
 // evidence). A valid estimate names the runKey and gives positive speedup- and cost-ratios.
 // A positive FINITE number — FN7: Infinity/NaN must never pass an amount/quota/ratio check.
