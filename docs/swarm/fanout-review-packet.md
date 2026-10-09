@@ -1,6 +1,12 @@
-# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 8
+# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 9
 
-- **Branch** `feat/fanout-native`  **HEAD** `0111607`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`, r4 `b7b5fd9`, r5 `5e58b48`, r6 `9c15c20`, r7 `6a2380b`)
+- **Branch** `feat/fanout-native`  **HEAD** `8401017`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`, r4 `b7b5fd9`, r5 `5e58b48`, r6 `9c15c20`, r7 `6a2380b`, r8 `0111607`)
+
+## Round 9 — round-8 REMAIN resolved (FN9; a failed lease-identity write stops the launch)
+- FN9 (P2) `bindLeaseZone`/`bindLeaseChild` ignored `writeJsonAtomic`'s result, so a lease-identity write failure left a BARE driver-pid lease while the task still launched — another run then reaped that slot on driver death (child/pane still running) → over-admission. Both now RETURN the write result and the launch is GATED on it: visible — `bindLeaseZone` runs BEFORE the pane-run, a failed write releases the lease, fails the unit, and skips the launch (nothing spawned); headless — `bindLeaseChild` runs post-spawn (the pid is only known then), a failed write UNDOES the launch (despawn the child, fail the unit, release the lease) so no executed slot ever outlives its durable binding.
+- Gates: bus tsc 0, scripts tsc 0, fanout selftest 142, fanout-herdr selftest 23, bus vitest 991/991.
+
+## Round 8 — round-7 REMAIN resolved (FN9; positive terminal evidence, not todo-absence)
 
 ## Round 8 — round-7 REMAIN resolved (FN9; positive terminal evidence, not todo-absence)
 - FN9 (P2) round-7 treated a MISSING cleanup-pending todo as "zone closed", so when the todo WRITE itself failed (unwritable dir) a close-failed visible slot was still reaped on driver death — over-admission with no terminal evidence. A missing / write-failed / not-yet-written todo is UNKNOWN, never proof the zone ended. `leaseOccupied` now frees a visible slot ONLY on POSITIVE evidence: THIS launch's rc sidecar exists (the command actually exited). Driver death and todo state are irrelevant to the decision. The lease records its rc path (`bindLeaseZone(zoneId, rcPath)`); an explicit CLOSE fact still frees it out-of-band (settleUnit on rc / the outer finally on a confirmed close / a future zone-reaper removes the lease), so `acquireLease` auto-reaps only on the rc fact. A stuck command with no rc holds its slot until an explicit reap — never freed by bookkeeping that may have failed. `leaseOccupied` is pure + tested (the visible cases now assert driver-death-with-no-rc stays occupied).
