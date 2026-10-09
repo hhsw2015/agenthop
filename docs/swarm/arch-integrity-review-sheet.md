@@ -1,6 +1,6 @@
 # Architecture-integrity review sheet — feat/arch-integrity-review
 
-- **Branch** `feat/arch-integrity-review`  **HEAD** `HEAD`  **Base** `ece25c2`
+- **Branch** `feat/arch-integrity-review`  **HEAD** `HEAD`  **Base** `c46ac1a`
 - **Reviewer** codex 01a0ead5 (cross-family, independent)  **Author/tooling** bus-pen
 - **Spec** `docs/swarm/arch-integrity-review-design.md` (R22) + 32-eval C11
 
@@ -8,36 +8,59 @@
 A CROSS-CUTTING review of the batch as a whole, not per-PR correctness. The tooling below collected the inputs from the git objects at HEAD (not the working tree); the reviewer fills each axis verdict. A CONFIRMED finding is REMAIN and BLOCKS the batch merge; a drift finding opens a convergence follow-up. The tool flags candidates only — it never pronounces a verdict.
 
 ## Diff set
-27 commit(s), 84 changed file(s), `ece25c2..HEAD`.
+50 commit(s), 33 changed file(s), `c46ac1a..HEAD`.
 
 ```
-d286fc3 Merge branch 'feat/f45-succession' (batch-7, adversarially signed 0 REMAIN)
-fbbf1b8 Merge branch 'feat/ruling-backfill' (batch-7, adversarially signed 0 REMAIN)
-2721024 Merge branch 'feat/f44-blocked-path' (batch-7, adversarially signed 0 REMAIN)
-57be796 Merge branch 'feat/f47-codex-bus' (batch-7, adversarially signed 0 REMAIN)
-916aa91 fix(swarm): F45 round-10 — per-connection error handler on the liveness socket (R9-P2-1)
-e17ac6e fix(swarm): F45 round-9 — add socket identity back-verification (coordinator hint ①)
-7c8546a fix(swarm): F45 round-9 — hash-prefixed per-instance liveness socket (R7-P1-2 + P2-1)
-8d46250 docs(swarm): ruling-backfill nits RB-N1/RB-N2 + self-spot-check
-b62c6b1 docs(swarm): backfill ruling-ledger (63 rulings R/S/F) from PROGRESS.md
-d508b08 fix(swarm): F45 round-8 — safe SID path (P1-2) + listener lifecycle (R7-P2-1)
-f9b716e fix(swarm): F45 round-7 — per-session liveness socket (P1-2, coordinator ruling B)
-eedac7b fix(swarm): F44 round-3 — 8B clear once-mark only on DEFINITE working/idle
-ec1b8a7 docs(swarm): F47-A review packet round-3 (F47-1 inbound entry + N1 nit)
-7ee5ae0 fix(bus): F47-A round-3 — strict ownThread at the INBOUND identity entry too (F47-1)
-03865a9 fix(swarm): F44 round-2 — 8A in-flight escalation claim, 8B confirmed-left reconcile, 9 snapshot handle→sid resolve
-923b64a docs(swarm): F47-A review packet round-2 (F47-1/F47-2 resolved)
-a93b890 fix(bus): F47-A round-2 — strict unique-cwd identity adoption + clear idTimer on close (F47-1/F47-2)
-98cc32e fix(swarm): F45 round-6 — pid-file heartbeat freshness closes the P1-2 recycle window
-bc72250 feat(swarm): F44-⑦⑧⑨ blocked-alert path fixes (pane-mapped screen read, roster-gated blocked, snapshot roster source)
-8994fca fix(swarm): F45 round-5 — exact-codex resume parser (P1-1) + pid-file-writer proof (P1-2)
-120ab9c docs(swarm): F47-A review packet (daemon-adopt stableId, round 1)
-25f9883 fix(bus): F47-A — codex node adopts its roster stableId from the daemon at startup (restore bus identity)
-c165e20 fix(swarm): F45 round-4 — tool/position-aware resume-target parser (P1-1) + env-based presence correlation (P1-2)
-6c863a4 fix(swarm): F45 round-3 — structured resume-target credential (P1-1) + instance-ownership proof (P1-2)
-6e53c29 docs(swarm): F47 codex bus-presence design (restart invariant + root cause + layered fix)
-bf55fea fix(swarm): F45 round-2 — continuity requires an identity-binding credential; same-machine relay requires a LIVE pid (P1-1, P1-2, N1)
-eed1755 feat(swarm): F45 succession protocol + coordinator-report escalation + I3 dispatch-stranding fix
+44927e5 Merge branch 'feat/flag-wiring' (batch-8, adversarially signed 0 REMAIN)
+f324a33 Merge branch 'feat/gauge-sampling' (batch-8, adversarially signed 0 REMAIN)
+aec2dcb Merge branch 'feat/console-canvas' (batch-8, adversarially signed 0 REMAIN)
+ba97b53 Merge branch 'feat/f44-content-filter' (batch-8, adversarially signed 0 REMAIN)
+1e72911 Merge branch 'feat/tg-bridge' (batch-8, adversarially signed 0 REMAIN)
+0b6138f Merge branch 'feat/spend-breaker' (batch-8, adversarially signed 0 REMAIN)
+7e9c0ae Merge branch 'feat/shared-budget' (batch-8, adversarially signed 0 REMAIN)
+d575342 fix(swarm): flag-wiring review r5 — close SU1 at the candidate-probe layer (last REMAIN)
+a2f0110 fix(swarm): flag-wiring review r4 — close SU1/SU3/SP3 (SU2 signed); tri-state probe, gen-guarded binding, exact /proc argv
+6918003 fix(swarm): FC-4 r2 — selftest reads card by taskRef not timestamp (SBK-R2-P2-1) + fallback comment (SBK-R2-N1)
+c5c60be fix(swarm): FC-4 review fixes — S19 token-dimension card (SBK-P2-1) + soft-cap comments (SBK-N1)
+17dea79 feat(swarm): FC-4 spend circuit-breaker (dormant) — per-task-ticket spend cap on shared-budget
+078f661 fix(swarm): flag-wiring review r3 — SU1/SU2/SU3/SP3 via the verified holder-lock + gate/boundary fixes
+49901da fix(swarm): flag-wiring review r2 — SU1/SU2/SU3/SP3 (the 4 REMAIN)
+cabbe60 feat(swarm): T5-2 gauge timed sampling wiring (dormant)
+9ea7b2c docs(tg-entry): user bring-up guide for the Telegram bridge (v1)
+15a5414 fix(swarm): flag-wiring review r1 part 2/2 — SU2 single-winner occupancy + CE1-4 notify
+2cacfbb fix(swarm-viz): console-canvas v1 review fixes — 5 P2 (happycapy c259f5f)
+8769476 feat(swarm-viz): console canvas view v1 — unified system-derived task graph
+d203f9b docs(tg-entry): mark review CLEARED (r8, 0 REMAIN)
+c2b93bf fix(swarm): F44-⑩ r2 — content-filter hint annotates, never replaces approval
+8e51cd3 docs(tg-entry): review packet round-8 (legacy-import lifecycle closed)
+6ba107c fix(tg-entry): r8 — legacy import is unconditional (no false orphan post-seal; rejected-claim imported)
+5badac4 feat(swarm): F44-⑩ content-filter blocked classification
+a1eb25e docs(tg-entry): review packet round-7 (publish-type slots + legacy import)
+bd0656e fix(tg-entry): r7 — slots carry publish TYPE (snapshot replaces / tap merges) + legacy baseline import
+8898b36 docs(tg-entry): review packet round-6 (slot ledger; ctime withdrawn)
+96a1adb fix(tg-entry): r6 — append-only immutable slot ledger for a durable, version-bound publish order
+bf54003 fix(swarm): flag-wiring review r1 part 1/2 — SP1/SP2/SP3 + SU1 + SU3 + single-completion pivot
+ddb8cda fix(swarm): DA2-R6b — reclaim external holder only on definite ESRCH (SB1 boundary)
+0cc6ca7 docs(tg-entry): review packet round-5 (2 REMAIN resolved; ctime vs in-content-seq rationale)
+6f80b89 fix(tg-entry): r5 — order by PUBLISH ctime (not temp mtime), same-version binding, propagate order-read errors
+1aedd1b fix(swarm): DA2-R6 — extract decision-batch lock to shared holder-lock; SB1 release-path fixed
+d180dd3 feat(swarm): SWARM_SUCCESSION (a) — credential from the AGENT's own argv via ps on the host pid
+2a0a707 feat(swarm): wire the two "signed but not powered" flags (SWARM_SUCCESSION + SWARM_COORD_ESCALATE)
+2206e02 docs(tg-entry): review packet round-4 (3 REMAIN resolved)
+2a56429 fix(tg-entry): r4 — write-order fold, lossless tap key, canonical consumed record
+93eb946 docs(tg-entry): review packet round-3 (4 REMAIN resolved)
+ccabe66 fix(tg-entry): r3 — per-item taps (no lost sibling), unique callback ref, read-fail retains retry, write-boundary scope
+439068f fix(swarm): DA2-R4 — SB1 publish-failure credential registration
+74511bc fix(swarm): DA2-R3 rework — SB3 (settled-flag model) + SB1 + N2
+4a4eb9c docs(swarm): TG user-entry review packet round-2 (TG-P1-1..P2-4 resolved; P2-5 phasing asked)
+f34ca77 fix(swarm): TG user-entry round-2 — scope enforcement, atomic merge, compact callback, safe parse, honest offset/notify (TG-P1-1..P2-4)
+a380707 fix(swarm): DA2-R2 rework — SB3 remains-P1 + SB1/SB2/SB4 P2 (shared-budget)
+46d9817 docs(swarm): TG user-entry v1 review packet (round 1)
+7c6dff0 feat(swarm): TG user-entry v1 — pure render/parse + scope ladder & digest in CORE + thin driver
+d25b56f fix(swarm): DA2-R1 rework — SB1-SB5 + N1 (shared-budget)
+dc76d57 docs(swarm): TG entry design — add multimodal delivery surface (entry-side rendering)
+6dc0fac docs(swarm): TG entry design — user-entry layer (peer to console), read-projection + write-receipt
+3b6d828 feat(swarm): shared-budget pool (DA2) — named ceiling, many consumers
 ```
 
 ## Contract surface (hashed — compare against the prior verdict to see drift)
@@ -54,21 +77,46 @@ eed1755 feat(swarm): F45 succession protocol + coordinator-report escalation + I
 ## Import map (who-imports-whom, batch files only)
 | from | zone | to | zone |
 | --- | --- | --- | --- |
-| `packages/bus/src/core.ts` | bus | `packages/bus/src/codex.ts` | bus |
-| `packages/bus/src/core.ts` | bus | `packages/bus/src/send-fallback.ts` | bus |
 | `packages/bus/src/core.ts` | bus | `packages/bus/src/swarm/task-liveness.ts` | bus |
+| `packages/bus/src/mcp.ts` | bus | `packages/bus/src/core.ts` | bus |
 | `packages/bus/src/presence.ts` | bus | `packages/bus/src/core.ts` | bus |
 | `packages/bus/src/presence.ts` | bus | `packages/bus/src/swarm/task-liveness.ts` | bus |
-| `packages/bus/src/swarm/coordinator-report.selftest.mts` | test | `packages/bus/src/swarm/coordinator-report.ts` | bus |
-| `packages/bus/src/swarm/herdr.selftest.mts` | test | `packages/bus/src/swarm/herdr.ts` | bus |
+| `packages/bus/src/presence.ts` | bus | `packages/bus/src/swarm/shell-succession.ts` | bus |
+| `packages/bus/src/swarm/decision-batch-store.ts` | bus | `packages/bus/src/swarm/holder-lock.ts` | bus |
+| `packages/bus/src/swarm/decision-batch-store.ts` | bus | `packages/bus/src/swarm/decision-batch.ts` | bus |
+| `packages/bus/src/swarm/dual-bandwidth-store.ts` | bus | `packages/bus/src/swarm/decision-batch-store.ts` | bus |
+| `packages/bus/src/swarm/dual-bandwidth-store.ts` | bus | `packages/bus/src/swarm/decision-batch.ts` | bus |
+| `packages/bus/src/swarm/shared-budget-store.ts` | bus | `packages/bus/src/swarm/holder-lock.ts` | bus |
+| `packages/bus/src/swarm/shared-budget-store.ts` | bus | `packages/bus/src/swarm/shared-budget.ts` | bus |
+| `packages/bus/src/swarm/shared-budget.selftest.mts` | test | `packages/bus/src/swarm/shared-budget.ts` | bus |
+| `packages/bus/src/swarm/shared-budget.selftest.mts` | test | `packages/bus/src/swarm/shared-budget-store.ts` | bus |
 | `packages/bus/src/swarm/shell-succession.selftest.mts` | test | `packages/bus/src/swarm/shell-succession.ts` | bus |
+| `packages/bus/src/swarm/shell-succession.selftest.mts` | test | `packages/bus/src/swarm/holder-lock.ts` | bus |
+| `packages/bus/src/swarm/shell-succession.selftest.mts` | test | `packages/bus/src/swarm/task-liveness.ts` | bus |
+| `packages/bus/src/swarm/shell-succession.ts` | bus | `packages/bus/src/swarm/task-liveness.ts` | bus |
+| `packages/bus/src/swarm/shell-succession.ts` | bus | `packages/bus/src/swarm/holder-lock.ts` | bus |
+| `packages/bus/src/swarm/spend-breaker-store.ts` | bus | `packages/bus/src/swarm/shared-budget-store.ts` | bus |
+| `packages/bus/src/swarm/spend-breaker-store.ts` | bus | `packages/bus/src/swarm/spend-breaker.ts` | bus |
+| `packages/bus/src/swarm/spend-breaker-store.ts` | bus | `packages/bus/src/swarm/shared-budget.ts` | bus |
+| `packages/bus/src/swarm/spend-breaker.selftest.mts` | test | `packages/bus/src/swarm/spend-breaker.ts` | bus |
+| `packages/bus/src/swarm/spend-breaker.selftest.mts` | test | `packages/bus/src/swarm/spend-breaker-store.ts` | bus |
+| `packages/bus/src/swarm/spend-breaker.selftest.mts` | test | `packages/bus/src/swarm/shared-budget.ts` | bus |
+| `packages/bus/src/swarm/spend-breaker.ts` | bus | `packages/bus/src/swarm/shared-budget.ts` | bus |
+| `packages/bus/src/swarm/tg-entry.selftest.mts` | test | `packages/bus/src/swarm/tg-entry.ts` | bus |
+| `packages/bus/src/swarm/tg-entry.selftest.mts` | test | `packages/bus/src/swarm/decision-batch.ts` | bus |
+| `packages/bus/src/swarm/tg-entry.selftest.mts` | test | `packages/bus/src/swarm/morning-digest.ts` | bus |
+| `packages/bus/src/swarm/tg-entry.ts` | bus | `packages/bus/src/swarm/decision-batch.ts` | bus |
 | `scripts/swarm-dispatch.ts` | script | `packages/bus/src/swarm/task-liveness.ts` | bus |
-| `scripts/swarm-dispatch.ts` | script | `packages/bus/src/swarm/herdr.ts` | bus |
 | `scripts/swarm-dispatch.ts` | script | `packages/bus/src/swarm/sentinel-denoise.ts` | bus |
+| `scripts/swarm-dispatch.ts` | script | `packages/bus/src/swarm/dual-bandwidth-store.ts` | bus |
+| `scripts/swarm-tg-entry.ts` | script | `packages/bus/src/swarm/tg-entry.ts` | bus |
+| `scripts/swarm-tg-entry.ts` | script | `packages/bus/src/swarm/decision-batch-store.ts` | bus |
+| `scripts/swarm-tg-entry.ts` | script | `packages/bus/src/swarm/decision-batch.ts` | bus |
+| `scripts/swarm-viz-export.ts` | script | `packages/bus/src/core.ts` | bus |
 
 ### Candidate boundary flags (reviewer confirms — evidence, not findings)
-- **pure-imports-io** — packages/bus/src/core.ts (pure) imports packages/bus/src/codex.ts (IO-tainted)
 - **pure-imports-io** — packages/bus/src/core.ts (pure) imports packages/bus/src/swarm/task-liveness.ts (IO-tainted)
+- **pure-imports-io** — packages/bus/src/swarm/spend-breaker-store.ts (pure) imports packages/bus/src/swarm/shared-budget-store.ts (IO-tainted)
 
 ## C11 — done bound to SHA evidence
 _(no done claims supplied; reviewer lists the batch's done declarations and confirms each binds a SHA)_
