@@ -101,9 +101,10 @@ t("no projection dir -> present:false, empty", (() => { const p = readProjection
   t("plain name -> open", (() => { const p = parseBoardFileName("board-viz.json"); return p?.itemId === "board-viz" && p.status === "open" && p.claimant === null; })());
   t("claimed name carries the claimant", (() => { const p = parseBoardFileName("x.claimed.viz-member-2.json"); return p?.itemId === "x" && p.status === "claimed" && p.claimant === "viz-member-2"; })());
   t("done name carries the finisher", (() => { const p = parseBoardFileName("y.done.90b58f9c.json"); return p?.status === "done" && p.claimant === "90b58f9c"; })());
-  t("a claimant with dots survives", parseBoardFileName("z.claimed.a.b.c.json")?.claimant === "a.b.c");
+  t("a dotted claimant is NOT a task (who is dot-free; unify with canonical parseBoardItemName)", parseBoardFileName("z.claimed.a.b.c.json") === null);
   t("non-json is ignored", parseBoardFileName("notes.md") === null);
-  t("unknown middle token stays in the id (conservative: open, not a guessed claim)", (() => { const p = parseBoardFileName("item.weird.json"); return p?.itemId === "item.weird" && p.status === "open"; })());
+  t("B6-1: a .report.json evidence file is NOT a task (never a fake open TODO)", parseBoardFileName("item.report.json") === null);
+  t("B6-1: an unrecognized shape returns null (matches canonical), not a fake open item", parseBoardFileName("item.weird.json") === null);
 }
 
 // --- wait fold: last write (by seq) wins; non-wait and malformed changes are skipped ---

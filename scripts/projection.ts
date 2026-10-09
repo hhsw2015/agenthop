@@ -351,16 +351,20 @@ export function foldWaitLog(entries: WaitLogEntry[]): WaitRecord[] {
   return [...byId.values()];
 }
 
-/** Parse a board filename into (itemId, status, claimant). Unrecognized middle tokens stay part of the
- *  id (conservative: a weird name is an open item with a long id, not a crash or a guessed claim). */
+/** Parse a board filename into (itemId, status, claimant). Mirrors the canonical task-board.parseBoardItemName discipline:
+ *  a recognized shape only — `<itemId>.json` (open/posted) or `<itemId>.<status>.<who>.json` where status is a real lifecycle
+ *  state. Any OTHER shape returns null (NOT a task), so an evidence file like `<itemId>.report.json` is never surfaced as a
+ *  fake open TODO (B6-1): the canonical parser already excludes it, and the two classifications must agree. itemId/who are
+ *  dot-free by construction (postedFileName requires it; `who` is a hex id), so a multi-dot name is never a real board item. */
 export function parseBoardFileName(name: string): { itemId: string; status: BoardItemStatus; claimant: string | null } | null {
   if (!name.endsWith(".json")) return null;
   const stem = name.slice(0, -".json".length);
   const parts = stem.split(".");
-  if (parts.length >= 2 && (parts[1] === "claimed" || parts[1] === "granted" || parts[1] === "rejected" || parts[1] === "done" || parts[1] === "reclaimed")) {
-    return { itemId: parts[0]!, status: parts[1], claimant: parts.length > 2 ? parts.slice(2).join(".") : null };
+  if (parts.length === 1 && parts[0]) return { itemId: parts[0], status: "open", claimant: null };
+  if (parts.length === 3 && parts[0] && parts[2] && (parts[1] === "claimed" || parts[1] === "granted" || parts[1] === "rejected" || parts[1] === "done" || parts[1] === "reclaimed")) {
+    return { itemId: parts[0], status: parts[1], claimant: parts[2] };
   }
-  return { itemId: stem, status: "open", claimant: null };
+  return null; // unrecognized shape (incl. `<itemId>.report.json` evidence) — never a fake open item (B6-1)
 }
 
 export function readBoard(home: string = homedir()): BoardItem[] {

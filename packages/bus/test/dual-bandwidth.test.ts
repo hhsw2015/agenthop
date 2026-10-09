@@ -146,3 +146,25 @@ describe("dual-bandwidth pure core", () => {
     expect(Number.isFinite(r.tDrainHours!)).toBe(true);
   });
 });
+
+describe("B6-2 backlogGrowthPerHour uses the item-unit produce stream, not submission-unit B_prod", () => {
+  test("submit-tag fold counterexample: 5 submits -> 1 item approved (D 0->1->0) ⇒ growth 0, NOT bProd-bCons=4", () => {
+    // produceAtSec is submission-unit (B_prod=N, 5 folded submits); consume + backlogProduce are item-unit (the 1 decision item).
+    const r = run({ produceAtSec: inLastHour(5), consumeAtSec: inLastHour(1), backlogProduceAtSec: inLastHour(1), backlog: 0 });
+    expect(r.bProd1h).toBe(5);              // B_prod=N preserved (the ruled contract)
+    expect(r.ratio).toBe(5);               // the display ratio still reflects submission throughput
+    expect(r.dBacklogDtPerHour).toBe(0);   // item-consistent: 1 produced item - 1 consumed = 0 (B6-2 fix; was 5-1=4)
+    expect(r.backlog).toBe(0);
+  });
+
+  test("absent backlogProduceAtSec ⇒ defaults to produceAtSec (identical to pre-fix when B_prod is item-unit)", () => {
+    const r = run({ produceAtSec: inLastHour(10), consumeAtSec: inLastHour(4), backlog: 6 });
+    expect(r.dBacklogDtPerHour).toBe(6); // 10 - 4, unchanged back-compat (submit-tag OFF: produce is already item-unit)
+  });
+
+  test("item-unit produce exceeding consume still reports real growth (the derivative is not forced to 0)", () => {
+    const r = run({ produceAtSec: inLastHour(9), consumeAtSec: inLastHour(2), backlogProduceAtSec: inLastHour(5), backlog: 3 });
+    expect(r.bProd1h).toBe(9);             // submission-unit display
+    expect(r.dBacklogDtPerHour).toBe(3);  // item-unit: 5 produced - 2 consumed = 3 (real growth, correctly signed)
+  });
+});

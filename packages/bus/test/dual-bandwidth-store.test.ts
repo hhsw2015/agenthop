@@ -21,7 +21,7 @@ const batchesDir = (h: string) => path.join(h, ".agenthop", "console", "decision
 describe("dual-bandwidth IO store", () => {
   test("empty home ⇒ zero events, zero backlog, green", () => {
     const h = mkHome();
-    expect(collectBandwidthEvents(h)).toEqual({ produceAtSec: [], consumeAtSec: [], backlog: 0 });
+    expect(collectBandwidthEvents(h)).toEqual({ produceAtSec: [], consumeAtSec: [], backlog: 0, backlogProduceAtSec: [] });
     expect(computeGauge(h, nowSec()).zone).toBe("green");
   });
 
@@ -101,7 +101,7 @@ describe("dual-bandwidth IO store", () => {
     const dir = path.join(batchesDir(h), "realdir");
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, "batch.json"), JSON.stringify({ batchId: "OTHER", owner: "coord", createdAtSec: nowSec(), items: items(2) }));
-    expect(collectBandwidthEvents(h)).toEqual({ produceAtSec: [], consumeAtSec: [], backlog: 0 });
+    expect(collectBandwidthEvents(h)).toEqual({ produceAtSec: [], consumeAtSec: [], backlog: 0, backlogProduceAtSec: [] });
   });
 
   test("projection write is atomic, frozen-schema, and round-trips", () => {
@@ -283,5 +283,25 @@ describe("dual-bandwidth IO store — submit-tag secondary source (SWARM_SUBMIT_
     chmodSync(box, 0o000);
     try { withTag(true, () => { expect(() => collectBandwidthEvents(h)).toThrow(); }); }
     finally { chmodSync(box, 0o755); }
+  });
+
+  test("B6-2: 5 submits folded into 1 approved item ⇒ backlogGrowth 0 (item-unit), B_prod=5 (submission-unit)", () => {
+    const h = mkHome(); const t = nowSec();
+    openRoom(h, { roomId: "r1", topic: "x", owner: "coord", nowSec: t });
+    const digests: string[] = [];
+    for (let i = 0; i < 5; i += 1) { const text = `ship ${i}`; appendPost(h, "r1", { from: "alice", fromLabel: "alice", text, intent: "submit" }, t); digests.push(submitDigest("alice", text)); }
+    openBatch(h, { batchId: "b1", owner: "coord", items: [{ id: "A", kind: "pr", summary: "folded", suggestedAction: "merge", foldedFrom: digests }], nowSec: t });
+    writeDecisions(h, { batchId: "b1", decidedAtSec: t, decisions: [{ id: "A", verdict: "approve" }] });
+    expect(consumeDecisions(h, "b1").consumed).toBe(true);
+    withTag(true, () => {
+      const ev = collectBandwidthEvents(h);
+      expect(ev.backlogProduceAtSec.length).toBe(1); // ONE decision item (item-unit, the dD/dt base)
+      expect(ev.produceAtSec.length).toBe(5);        // 5 logical submissions (B_prod=N, submission-unit)
+      expect(ev.consumeAtSec.length).toBe(1);        // the 1 item consumed
+      expect(ev.backlog).toBe(0);                    // D 0->1->0: nothing undecided
+      const g = computeGauge(h, nowSec());
+      expect(g.dBacklogDtPerHour).toBe(0);           // B6-2 fix: item-consistent (was bProd-bCons = 5-1 = 4)
+      expect(g.bProd1h).toBe(5);                     // B_prod=N preserved (the ruled contract)
+    });
   });
 });
