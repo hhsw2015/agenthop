@@ -33,6 +33,13 @@ const DIGEST_RE = /^[0-9a-f]{64}$/;              // bare sha256 hex (the stored 
 const PINNED_REF_RE = /^sha256:[0-9a-f]{64}$/;   // an immutable ref form `sha256:<hex>`
 const isNonEmptyStr = (v: unknown): v is string => typeof v === "string" && v.length > 0;
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+/** Read an OWN DATA property's value (BDP-P2-3): never the prototype chain, never invoking an accessor (a getter field reads as
+ *  undefined ⇒ absent). Each field is captured ONCE and used for validation, de-dup AND output, so a getter cannot return a
+ *  valid value during the check and a different one at copy time. */
+function ownVal(o: object, k: string): unknown {
+  const d = Object.getOwnPropertyDescriptor(o, k);
+  return d && "value" in d ? d.value : undefined;
+}
 
 /** Content address of an artifact's bytes/text. A reproducible boot pins THIS, not the URL it came from. */
 export function computeArtifactDigest(content: string): string {
@@ -60,19 +67,22 @@ export function digestOfRef(ref: string): string | null {
  *  kind, a `digest` that is not a bare sha256 hex (so a `latest`/tag can never pose as a pin), or a non-string sourceRef. */
 export function validateBootManifest(input: unknown): Res<BootManifest> {
   if (!isObj(input)) return { ok: false, reason: "manifest must be an object" };
-  if (input.schema !== "boot-digest-pin/v1") return { ok: false, reason: "manifest.schema must be \"boot-digest-pin/v1\"" };
-  if (!Array.isArray(input.artifacts)) return { ok: false, reason: "manifest.artifacts must be an array" };
+  if (ownVal(input, "schema") !== "boot-digest-pin/v1") return { ok: false, reason: "manifest.schema must be \"boot-digest-pin/v1\"" };
+  const artifactsRaw = ownVal(input, "artifacts");
+  if (!Array.isArray(artifactsRaw)) return { ok: false, reason: "manifest.artifacts must be an array" };
   const ids = new Set<string>();
   const artifacts: BootArtifact[] = [];
-  for (const [i, raw] of input.artifacts.entries()) {
+  for (let i = 0; i < artifactsRaw.length; i += 1) { // index walk (BDP-P2-2): never input.artifacts.entries()/iterator
+    const raw = artifactsRaw[i];
     if (!isObj(raw)) return { ok: false, reason: `artifact[${i}] must be an object` };
-    if (!isNonEmptyStr(raw.id)) return { ok: false, reason: `artifact[${i}].id must be a non-empty string` };
-    if (ids.has(raw.id)) return { ok: false, reason: `duplicate artifact id "${raw.id}"` };
-    ids.add(raw.id);
-    if (typeof raw.kind !== "string" || !KINDS.has(raw.kind)) return { ok: false, reason: `artifact "${raw.id}".kind unknown` };
-    if (typeof raw.digest !== "string" || !DIGEST_RE.test(raw.digest)) return { ok: false, reason: `artifact "${raw.id}".digest must be a bare sha256 hex (a tag/latest is not a pin)` };
-    if (raw.sourceRef !== undefined && typeof raw.sourceRef !== "string") return { ok: false, reason: `artifact "${raw.id}".sourceRef must be a string` };
-    artifacts.push({ id: raw.id, kind: raw.kind as BootArtifactKind, digest: raw.digest, ...(typeof raw.sourceRef === "string" ? { sourceRef: raw.sourceRef } : {}) });
+    const id = ownVal(raw, "id"), kind = ownVal(raw, "kind"), digest = ownVal(raw, "digest"), sourceRef = ownVal(raw, "sourceRef"); // capture once
+    if (!isNonEmptyStr(id)) return { ok: false, reason: `artifact[${i}].id must be a non-empty string` };
+    if (ids.has(id)) return { ok: false, reason: `duplicate artifact id "${id}"` };
+    ids.add(id);
+    if (typeof kind !== "string" || !KINDS.has(kind)) return { ok: false, reason: `artifact "${id}".kind unknown` };
+    if (typeof digest !== "string" || !DIGEST_RE.test(digest)) return { ok: false, reason: `artifact "${id}".digest must be a bare sha256 hex (a tag/latest is not a pin)` };
+    if (sourceRef !== undefined && typeof sourceRef !== "string") return { ok: false, reason: `artifact "${id}".sourceRef must be a string` };
+    artifacts.push({ id, kind: kind as BootArtifactKind, digest, ...(typeof sourceRef === "string" ? { sourceRef } : {}) }); // output the captured values
   }
   return { ok: true, value: { schema: "boot-digest-pin/v1", artifacts } };
 }
@@ -80,14 +90,20 @@ export function validateBootManifest(input: unknown): Res<BootManifest> {
 /** Build a pinned manifest from the actual artifact CONTENTS (computes each digest). Whole-reject on a duplicate id or an
  *  unknown kind — the authoring boundary, so a manifest is pinned by construction. */
 export function buildBootManifest(items: readonly { id: string; kind: BootArtifactKind; content: string; sourceRef?: string }[]): Res<BootManifest> {
+  if (!Array.isArray(items)) return { ok: false, reason: "items must be an array" };
   const ids = new Set<string>();
   const artifacts: BootArtifact[] = [];
-  for (const it of items) {
-    if (!isNonEmptyStr(it.id)) return { ok: false, reason: "artifact id must be a non-empty string" };
-    if (ids.has(it.id)) return { ok: false, reason: `duplicate artifact id "${it.id}"` };
-    ids.add(it.id);
-    if (!KINDS.has(it.kind)) return { ok: false, reason: `artifact "${it.id}" has an unknown kind "${it.kind}"` };
-    artifacts.push({ id: it.id, kind: it.kind, digest: computeArtifactDigest(it.content), ...(it.sourceRef !== undefined ? { sourceRef: it.sourceRef } : {}) });
+  for (let i = 0; i < items.length; i += 1) { // index walk (BDP-P2-2): never the input's iterator, which could hide a dup/bad item
+    const it = items[i];
+    if (!isObj(it)) return { ok: false, reason: `item[${i}] must be an object` };
+    const id = ownVal(it, "id"), kind = ownVal(it, "kind"), content = ownVal(it, "content"), sourceRef = ownVal(it, "sourceRef"); // capture once
+    if (!isNonEmptyStr(id)) return { ok: false, reason: `item[${i}].id must be a non-empty string` };
+    if (ids.has(id)) return { ok: false, reason: `duplicate artifact id "${id}"` };
+    ids.add(id);
+    if (typeof kind !== "string" || !KINDS.has(kind)) return { ok: false, reason: `artifact "${id}" has an unknown kind` };
+    if (typeof content !== "string") return { ok: false, reason: `artifact "${id}".content must be a string` };
+    if (sourceRef !== undefined && typeof sourceRef !== "string") return { ok: false, reason: `artifact "${id}".sourceRef must be a string (a built manifest must pass validateBootManifest — BDP-P2-1)` };
+    artifacts.push({ id, kind: kind as BootArtifactKind, digest: computeArtifactDigest(content), ...(typeof sourceRef === "string" ? { sourceRef } : {}) });
   }
   return { ok: true, value: { schema: "boot-digest-pin/v1", artifacts } };
 }

@@ -88,6 +88,35 @@ describe("boot-digest-pin — sameBootPin (reproducibility equality)", () => {
   });
 });
 
+describe("boot-digest-pin — RP-family round-1 fixes (builder/validator parity, input-method trust, getter TOCTOU)", () => {
+  test("BDP-P2-1: build rejects a non-string sourceRef; a successfully-built manifest always re-validates", () => {
+    for (const bad of [7, null, {}, false]) {
+      expect(buildBootManifest([{ id: "a", kind: "role-profile", content: "x", sourceRef: bad as unknown as string }]).ok).toBe(false);
+    }
+    expect(validateBootManifest(okv(buildBootManifest([{ id: "a", kind: "role-profile", content: "x", sourceRef: "ok" }]))).ok).toBe(true);
+  });
+  test("BDP-P2-2: validate walks slots by index — a hijacked entries() cannot hide a bad item", () => {
+    const d = computeArtifactDigest("x");
+    const artifacts: unknown[] = [{ id: "a", kind: "role-profile", digest: d }, { id: "b", kind: "role-profile", digest: "latest" }];
+    (artifacts as { entries: unknown }).entries = function* () { yield [0, artifacts[0]]; }; // would hide the bad item
+    expect(validateBootManifest({ schema: "boot-digest-pin/v1", artifacts }).ok).toBe(false); // the latest digest is still caught
+  });
+  test("BDP-P2-2: build walks slots by index — a hijacked iterator cannot hide a duplicate id", () => {
+    const items: unknown[] = [{ id: "a", kind: "role-profile", content: "x" }, { id: "a", kind: "role-profile", content: "y" }];
+    (items as { [Symbol.iterator]: unknown })[Symbol.iterator] = function* () { yield items[0]; }; // would hide the dup
+    expect(buildBootManifest(items as never).ok).toBe(false); // the duplicate id is still caught
+  });
+  test("BDP-P2-3: fields captured once — a digest getter (valid-then-latest) and an inherited field both reject", () => {
+    const d = computeArtifactDigest("x");
+    let n = 0;
+    const art: Record<string, unknown> = { id: "a", kind: "role-profile" };
+    Object.defineProperty(art, "digest", { enumerable: true, get() { return n++ < 2 ? d : "latest"; } });
+    expect(validateBootManifest({ schema: "boot-digest-pin/v1", artifacts: [art] }).ok).toBe(false); // getter field ⇒ absent ⇒ reject
+    const inherited = Object.create({ id: "a", kind: "role-profile", digest: d });
+    expect(validateBootManifest({ schema: "boot-digest-pin/v1", artifacts: [inherited] }).ok).toBe(false); // inherited ⇒ own-read absent ⇒ reject
+  });
+});
+
 describe("boot-digest-pin — bootDigestPinEnabled (dormant, default OFF)", () => {
   test("default OFF; truthy words ON", () => {
     expect(bootDigestPinEnabled({})).toBe(false);

@@ -49,7 +49,16 @@ same member. This module ships pure + selftested + dormant; no spawn/boot path c
 5. Dormant + non-invasive — `SWARM_BOOT_DIGEST_PIN` default OFF; the module is an independent file, imports nothing from and
    edits nothing in the signed vm-ctl/placement/remote-bootstrap files.
 
+## Round-1 fixes (0P1/3P2/0P3 @61d93a8 → this SHA) — same family as roleProfile v2 / ruling-ledger, same recipe
+
+- **BDP-P2-1** (builder/validator parity): `buildBootManifest` now validates the optional `sourceRef` (undefined or string) and
+  `content`/`kind` before building, so a successfully-built manifest always passes `validateBootManifest` (no silently-dropped bad field).
+- **BDP-P2-2** (input-method trust): both `validateBootManifest` and `buildBootManifest` walk the array BY INDEX (never
+  `.entries()` / the input's `Symbol.iterator`), so a hijacked iterator cannot hide a bad item or a duplicate id.
+- **BDP-P2-3** (getter TOCTOU): every field is read via `ownVal` (own data only, no prototype, no accessor) and captured ONCE for
+  validation, de-dup AND output — a `digest` getter returning valid-then-`latest`, or an inherited field, now rejects.
+
 ## Verification
 
-boot-digest-pin.test.ts 8/8 · bus tsc 0 · full bus 87 files / 1155 pass. Not pushed, not merged (merge/enable gate =
-coordinator + user).
+boot-digest-pin.test.ts 12/12 (4 new round-1 regressions) · reviewer probe `pin-boundaries.test.ts` 10/10 (was 5/10) · bus tsc 0
+· full bus 87 files / 1159 pass. Not pushed, not merged (merge/enable gate = coordinator + user).
