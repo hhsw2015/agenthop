@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  AlertDedup, alertKey, isValidInboxKey, classifyMemberHealth, GhostOnce, isOnRoster, classifyBlockedEscalation,
+  AlertDedup, alertKey, isValidInboxKey, classifyMemberHealth, GhostOnce, isOnRoster, classifyBlockedEscalation, resolveSnapshotMembers,
   parsePsOutput, selfTree, isDispatcherLoopCommand, isDispatcherAlreadyRunning, shouldEmitWatchNotice,
   type ProcInfo,
 } from "../src/swarm/sentinel-denoise.js";
@@ -125,6 +125,31 @@ describe("F44-⑧ classifyBlockedEscalation — roster-gate the blocked alert", 
   });
   test("non-roster (e.g. user's private session) blocked ⇒ escalate-once (not repeated coordinator noise)", () => {
     expect(classifyBlockedEscalation(false)).toBe("escalate-once");
+  });
+});
+
+describe("F44-9 resolveSnapshotMembers — map snapshot handles to current SIDs (not raw member strings)", () => {
+  // the 3e097dfe incident: assembleRoster emitted member="Work-3e097dfe"; presence has the full sid.
+  const sids = ["3e097dfe-81b3-4cca-b678-80dd3480a203", "90b58f9c-5bac-4318-a996-2373c179d674"];
+  const resolve = (h: string) => { // mirrors resolveSession(h, sids)
+    if (sids.includes(h)) return h;
+    const tail = h.slice(h.lastIndexOf("-") + 1);
+    const hit = sids.filter((s) => s.startsWith(tail));
+    return hit.length === 1 ? hit[0] : null;
+  };
+  test("a short handle resolves to its full SID (ghost false-positive fixed)", () => {
+    const set = resolveSnapshotMembers([{ member: "Work-3e097dfe" }], resolve);
+    expect(set.has("3e097dfe-81b3-4cca-b678-80dd3480a203")).toBe(true);
+  });
+  test("a full SID resolves to itself", () => {
+    expect(resolveSnapshotMembers([{ member: "90b58f9c-5bac-4318-a996-2373c179d674" }], resolve).has("90b58f9c-5bac-4318-a996-2373c179d674")).toBe(true);
+  });
+  test("an ambiguous/unknown handle is dropped (never guessed)", () => {
+    expect(resolveSnapshotMembers([{ member: "Work-nope" }], resolve).size).toBe(0);
+  });
+  test("non-array / malformed members ⇒ empty", () => {
+    expect(resolveSnapshotMembers(null as any, resolve).size).toBe(0);
+    expect(resolveSnapshotMembers([{ notmember: "x" }, 42], resolve).size).toBe(0);
   });
 });
 

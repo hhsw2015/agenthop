@@ -74,6 +74,25 @@ export function isOnRoster(sid: string, src: { activeOwners: ReadonlySet<string>
   return src.activeOwners.has(sid) || src.identityEntity || src.snapshotMembers.has(sid);
 }
 
+/** F44-9: a roster-snapshot member may be a full presence SID or a short HANDLE (assembleRoster falls back to e.g.
+ *  `Work-3e097dfe` when the stableId is absent). The ghost check compares against full presence SIDs, so each snapshot
+ *  member must be RESOLVED to its current SID first (via the unique-identity rule — `resolve` = resolveSession bound to the
+ *  live presence sids). An ambiguous/unknown handle resolves to null and is dropped (never guessed), so it simply does not
+ *  grant roster membership. A full SID resolves to itself. Returns the set of resolved SIDs. Pure (resolve injected). */
+export function resolveSnapshotMembers(members: readonly unknown[], resolve: (handle: string) => string | null): Set<string> {
+  const out = new Set<string>();
+  if (!Array.isArray(members)) return out;
+  for (const m of members) {
+    const handle = m && typeof m === "object" && typeof (m as { member?: unknown }).member === "string"
+      ? (m as { member: string }).member
+      : typeof m === "string" ? m : null;
+    if (!handle) continue;
+    const sid = resolve(handle);
+    if (sid) out.add(sid);
+  }
+  return out;
+}
+
 export type BlockedRoute = "escalate" | "escalate-once";
 
 /**
