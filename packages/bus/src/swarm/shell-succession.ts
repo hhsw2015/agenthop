@@ -26,7 +26,9 @@ export interface Attestation {
   machine: string;        // host / machine id (same-machine is a precondition: presence + inbox are a LOCAL fs)
   cwd: string;            // working directory the shell came up in
   tool: string;           // agent family (claude / codex / …)
-  resumeCmd: string;      // the command this shell was (re)launched with — matched against the roster's recorded resumeCmd
+  resumeCmd: string;      // the launch command — INFORMATIONAL ONLY (logging); NOT used for binding (free text, F45-P1-1)
+  resumeTargetSid?: string; // F45-P1-1: the EXACT sid the IO parsed from the real `--resume`/`resume` argv token (a verified
+                            //           structured credential). Binding uses THIS, never a substring of resumeCmd.
   herdrPane?: string | null; // the herdr pane it inherited, when known
   newPid: number;         // this process's pid (what the presence slot would be rebound to)
   newNativeSid: string;   // this process's OWN native session id (usually != stableSid after a restart)
@@ -71,17 +73,31 @@ export interface SuccessionResult {
  * Empty fields prove nothing, and "same machine/cwd/tool" alone never proves identity, so without (2) ⇒ not a continuation.
  * Pure. */
 export function provesContinuity(att: Attestation, inc: IncumbentBinding): boolean {
-  if (att.machine !== inc.recordedMachine) return false;
-  if (att.cwd !== inc.recordedCwd) return false;
-  if (att.tool !== inc.recordedTool) return false;
-  // any credential present on BOTH sides must agree (conflict disqualifies)
-  if (inc.recordedResumeCmd != null && inc.recordedResumeCmd !== "" && att.resumeCmd !== inc.recordedResumeCmd) return false;
+  // (1) F45-P1-1: the environment must be KNOWN (non-empty) AND equal. Empty fields prove nothing — two empty strings are
+  //     not "the same environment". (A recorded field must also be non-empty, which follows from equality to a non-empty att.)
+  if (!att.machine || !att.cwd || !att.tool) return false;
+  if (att.machine !== inc.recordedMachine || att.cwd !== inc.recordedCwd || att.tool !== inc.recordedTool) return false;
+  // (2) a PRESENT credential naming a DIFFERENT identity disqualifies: a shell launched to resume A cannot be the
+  //     continuation of B, and an inherited pane recorded for another session cannot be ours.
+  if (att.resumeTargetSid != null && att.resumeTargetSid !== inc.stableSid) return false;
   if (att.herdrPane != null && att.herdrPane !== "" && inc.recordedHerdrPane != null && inc.recordedHerdrPane !== "" && att.herdrPane !== inc.recordedHerdrPane) return false;
-  // at least one credential must BIND to THIS stableSid (env sameness is not identity)
-  const resumeBinds = inc.recordedResumeCmd != null && inc.recordedResumeCmd !== "" && att.resumeCmd === inc.recordedResumeCmd && att.resumeCmd.includes(inc.stableSid);
+  // (3) at least ONE credential must BIND to THIS stableSid from a VERIFIED STRUCTURED source (never free text, F45-P1-1):
+  //     the exact resume-target sid, an inherited herdr pane recorded for this session, or the shell already holding the sid.
+  const resumeBinds = att.resumeTargetSid != null && att.resumeTargetSid === inc.stableSid;
   const paneBinds = att.herdrPane != null && att.herdrPane !== "" && inc.recordedHerdrPane != null && inc.recordedHerdrPane !== "" && att.herdrPane === inc.recordedHerdrPane;
   const sidBinds = att.newNativeSid === inc.stableSid;
   return resumeBinds || paneBinds || sidBinds;
+}
+
+/** F45-P1-1: extract the EXACT resume-target sid from a real argv array (the OS-tokenized command — no quoting ambiguity):
+ *  the token after `--resume` (claude) or the `resume` subcommand (codex). The FIRST such token wins; a sid appearing
+ *  elsewhere (a quoted arg, body text) is NOT a resume target. null when absent. This is the verified structured credential
+ *  the IO feeds into `Attestation.resumeTargetSid`. Pure. */
+export function parseResumeTargetFromArgv(argv: readonly string[]): string | null {
+  for (let i = 0; i < argv.length - 1; i++) {
+    if (argv[i] === "--resume" || argv[i] === "resume") return argv[i + 1] || null;
+  }
+  return null;
 }
 
 /**

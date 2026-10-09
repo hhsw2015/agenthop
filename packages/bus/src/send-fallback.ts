@@ -55,12 +55,21 @@ export type InboxTarget =
  * proof of a shared filesystem and must NOT redirect a remote peer to a local inbox (which no live local node would drain,
  * while the real remote peer gets nothing and the send falsely reports "durable"). Insufficient proof ⇒ null ⇒ the caller
  * keeps the relay path. `liveness` is injected (fileIsAlive) so this stays pure and unit-testable. Pure. */
-export function relaySameMachineSid(peer: UnifiedPeer, sessionIds: readonly string[], liveness: (sid: string) => "alive" | "suspected" | "dead"): string | null {
+export function relaySameMachineSid(peer: UnifiedPeer, isLocalInstance: (sid: string) => boolean): string | null {
   if (peer.via !== "relay" || !peer.stableId) return null;
-  const sid = peer.stableId;
-  if (!sessionIds.includes(sid)) return null;   // no presence file for this EXACT sid (a filename for a short-id prefix is not it)
-  if (liveness(sid) !== "alive") return null;    // dead / corrupt / suspected pid ⇒ not proof of a live same-machine session
-  return sid;
+  // F45-P1-2: a live presence pid (signal-0) is NOT enough — a stale presence file may name a pid RECYCLED to an unrelated
+  // live process, which would silently redirect a remote peer to a local inbox nobody drains. `isLocalInstance` must PROVE
+  // the peer's current instance owns the local pid (see argvBoundToSid); unproven ⇒ null ⇒ the caller keeps the relay path.
+  return isLocalInstance(peer.stableId) ? peer.stableId : null;
+}
+
+/** F45-P1-2: a live pid belongs to session `sid`'s CURRENT instance only if the process's argv carries the sid as a token
+ *  — a resumed session's `--resume <sid>` / `resume <sid>`. A bare alive pid does not prove ownership (pid reuse), so this
+ *  is the correlation the IO must add on top of signal-0. null/empty argv ⇒ false (unverifiable ⇒ keep relay, never a false
+ *  durable). Pure. */
+export function argvBoundToSid(argv: string | null | undefined, sid: string): boolean {
+  if (!argv || !sid) return false;
+  return argv.split(/\s+/).includes(sid);
 }
 
 export function resolveInboxTarget(to: string, resolved: UnifiedPeer | ResolveError, offlineSid: string | null, relayLocalSid: string | null = null): InboxTarget {

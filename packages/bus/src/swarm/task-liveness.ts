@@ -61,6 +61,7 @@ export function resolveSession(ownerHandle: string, sessionIds: string[]): strin
 
 // --- real-fs binding (the TEMP v1; bus-identity replaces it). Thin; the testable decisions are above. -------------
 import { readFileSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 
 /** Native sessionIds that have a presence pid file under <home>/.agenthop/presence/<id>.pid (for resolveSession). */
@@ -87,4 +88,13 @@ export function makeFileLiveness(home: string): LivenessIO {
       }
     },
   };
+}
+
+/** F45-P1-2: the argv (command line) of a live pid, via `ps`, or null if unavailable. Used to CORRELATE a presence pid to
+ *  a session's current instance (its argv carries the sid) — a bare signal-0 "alive" can be a recycled, unrelated pid.
+ *  Rare path (only a same-machine relay peer), so a synchronous `ps` is acceptable; any failure ⇒ null (keep relay). */
+export function readPidArgv(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try { return execFileSync("ps", ["-p", String(pid), "-o", "args="], { encoding: "utf8", timeout: 4000 }).trim() || null; }
+  catch { return null; }
 }

@@ -10,8 +10,8 @@ import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
-import { resolveInboxTarget, relaySameMachineSid } from "./send-fallback.js";
-import { resolveSession, listSessions, fileIsAlive, makeFileLiveness } from "./swarm/task-liveness.js";
+import { resolveInboxTarget, relaySameMachineSid, argvBoundToSid } from "./send-fallback.js";
+import { resolveSession, listSessions, fileIsAlive, makeFileLiveness, readPidArgv } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -426,11 +426,17 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // never the routing name, which can drift on restart and strand mail in a box no live node drains (the F40 incident).
       const resolvedPeer = resolve(to);
       const sessionList = listSessions(home);
-      // F45 ③ (P1-2 hardened): a relay-resolved peer is cross-BROKER, not necessarily cross-MACHINE. Route durable to it
-      // ONLY if its OWN full sid owns a LIVE presence pid on this host — proof it shares our filesystem. A mere filename, or
-      // a dead/corrupt presence file (e.g. a remote peer that once ran here), is NOT proof and must keep the relay path, so
-      // a remote peer is never silently redirected to a local inbox nobody drains. liveness is fileIsAlive (signal-0).
-      const relayLocalSid = !("error" in resolvedPeer) ? relaySameMachineSid(resolvedPeer, sessionList, (sid) => fileIsAlive(sid, makeFileLiveness(home))) : null;
+      const liveness = makeFileLiveness(home);
+      // F45 ③ (P1-2 hardened): a relay-resolved peer is cross-BROKER, not necessarily cross-MACHINE. Route durable to it ONLY
+      // if its OWN full sid owns a presence pid that is (a) alive AND (b) a process whose argv carries the sid — proof it is
+      // THIS peer's current local instance, not a recycled/unrelated pid behind a stale presence file. Unproven ⇒ keep relay
+      // (never silently redirect a remote peer to a local inbox nobody drains).
+      const isLocalInstance = (sid: string): boolean => {
+        if (fileIsAlive(sid, liveness) !== "alive") return false;     // (a) a live pid in presence/<sid>.pid
+        const pid = liveness.readPid(sid);
+        return pid != null && argvBoundToSid(readPidArgv(pid), sid);   // (b) that pid's process is bound to THIS sid (not pid-reuse)
+      };
+      const relayLocalSid = !("error" in resolvedPeer) ? relaySameMachineSid(resolvedPeer, isLocalInstance) : null;
       const target = resolveInboxTarget(to, resolvedPeer, resolveSession(to, sessionList), relayLocalSid);
       if (target.kind === "none") return { ok: false, error: target.reason };
       if (target.kind === "durable") {
