@@ -299,31 +299,54 @@ export function shouldQuarantinePoison(strikes: number, threshold: number): bool
 
 /** FC-2 — the strike sidecar for a (claimed or released) message file, keyed by the STABLE base (`<base>.json`) so the count
  *  survives the claim→release→reclaim cycle. Not a `.json` file ⇒ claimInbox never lists it as a deliverable message. */
-function poisonSidecar(file: string): string {
-  return `${file.replace(/\.claim-[^.]+$/, "")}.poison`;
+function stableBase(file: string): string { return file.replace(/\.claim-[^.]+$/, ""); }
+function poisonSidecar(file: string): string { return `${stableBase(file)}.poison`; }
+
+/** FC-2 (PD-P2-4) — parse a sidecar's ENTIRE content as a non-negative safe integer. A prefix like "2-not-a-counter" or any
+ *  trailing junk is REJECTED (null) — a corrupt/unconfirmable count must never authorize an early quarantine. */
+function parsePoisonCount(raw: string): number | null {
+  const t = raw.trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
 }
 
-/** FC-2 — record one delivery-CRASH strike and return the new total. Best-effort read (missing/garbled ⇒ 0 so far) + atomic
- *  write (tmp + rename). NEVER throws — a sidecar fault must not break the flush; on a write fault it still returns the
- *  incremented count so the caller progresses (worst case the on-disk count lags, delaying — never dropping — quarantine). */
-export function recordPoisonStrike(file: string): number {
-  const sc = poisonSidecar(file);
-  let prev = 0;
-  try { const n = Number.parseInt(readFileSync(sc, "utf8"), 10); if (Number.isInteger(n) && n > 0) prev = n; } catch { /* none yet / unreadable ⇒ 0 */ }
-  const next = prev + 1;
-  try { const tmp = `${sc}.tmp-${randomBytes(4).toString("hex")}`; writeFileSync(tmp, String(next), { mode: 0o600 }); renameSync(tmp, sc); } catch { /* best-effort: count lags, never crashes */ }
+/** FC-2 — record one delivery-CRASH strike and return the new total. `mem` is the drainer's per-process count map (keyed by the
+ *  stable base) and is AUTHORITATIVE, so the count advances even when the sidecar write fails (PD-P2-3 — otherwise a persistent
+ *  write fault would re-read 0 every call and never reach the threshold, re-opening the head-of-line block). The sidecar is the
+ *  cross-restart persistence; a corrupt sidecar is ignored (PD-P2-4), never trusted over `mem`. next = max(disk, mem) + 1.
+ *  Best-effort write (tmp + rename); NEVER throws. */
+export function recordPoisonStrike(file: string, mem: Map<string, number>): number {
+  const key = stableBase(file);
+  const sc = `${key}.poison`;
+  let disk = 0;
+  try { const p = parsePoisonCount(readFileSync(sc, "utf8")); if (p !== null) disk = p; } catch { /* none/unreadable/corrupt ⇒ 0 */ }
+  const next = Math.max(disk, mem.get(key) ?? 0) + 1;
+  mem.set(key, next);
+  try { const tmp = `${sc}.tmp-${randomBytes(4).toString("hex")}`; writeFileSync(tmp, String(next), { mode: 0o600 }); renameSync(tmp, sc); } catch { /* best-effort: mem already advanced, so quarantine is never blocked by a write fault */ }
   return next;
 }
 
-/** FC-2 — clear the strike sidecar (on a successful ack, or after a quarantine move). Best-effort; never throws. */
-export function clearPoisonStrikes(file: string): void {
+/** FC-2 — clear the strike count (on a successful ack, or after a quarantine move): drop the in-memory entry AND the sidecar.
+ *  Best-effort; never throws. */
+export function clearPoisonStrikes(file: string, mem: Map<string, number>): void {
+  mem.delete(stableBase(file));
   try { unlinkSync(poisonSidecar(file)); } catch { /* already gone */ }
 }
 
+/** FC-2 (PD-P2-1) — strip transport-UNSAFE control chars (NUL + other C0/DEL, keeping \t \n \r) so the NOTICE itself can never
+ *  become a poison message. A legal envelope may carry U+0000, which a real Codex push rejects (ERR_INVALID_ARG_VALUE); copying
+ *  it verbatim into the alert would make the ALERT a poison that blocks the coordinator's inbox. The original bytes stay intact
+ *  in quarantine/; only this human-facing notice is sanitized. */
+function sanitizeForTransport(s: string): string {
+  return s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "�");
+}
+
 /** FC-2 — build the S19 dead-letter notification for the coordinator when a poison message is quarantined: content preview +
- *  failure trace + strike count, as an InboxMsg. Pure (no IO); the caller writes it to the coordinator's durable box. */
+ *  failure trace + strike count, as an InboxMsg, all TRANSPORT-SANITIZED (PD-P2-1). Pure (no IO); the caller writes it. */
 export function buildPoisonS19(mySid: string, myLabel: string, poison: InboxMsg, strikes: number, trace: string): InboxMsg {
-  const preview = poison.text.length > 240 ? `${poison.text.slice(0, 240)}…` : poison.text;
-  const text = `[poison-dlq] 毒件已隔离(投递崩溃 ${strikes} 次,已达阈值)。来源 ${poison.fromLabel} via ${poison.via};失败轨迹: ${trace};内容预览: ${preview}`;
+  const clipped = poison.text.length > 240 ? `${poison.text.slice(0, 240)}…` : poison.text;
+  const preview = sanitizeForTransport(clipped);
+  const text = `[poison-dlq] 毒件已隔离(投递崩溃 ${strikes} 次,已达阈值)。来源 ${sanitizeForTransport(poison.fromLabel)} via ${sanitizeForTransport(poison.via)};失败轨迹: ${sanitizeForTransport(trace)};内容预览: ${preview}`;
   return { from: mySid, fromLabel: myLabel, text, via: "local", ts: Date.now(), taskRef: "poison-dlq", title: "poison quarantine" };
 }

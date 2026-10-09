@@ -35,18 +35,19 @@ export function reportCheckIn(home: string, self: SelfInfo, coordinatorHandle: s
 }
 
 /** FC-2 — notify the coordinator that a poison message was quarantined (content preview + failure trace + strike count),
- *  reusing the same coordinator-handle resolution as the check-in. Best-effort + fail-soft: the quarantine itself + the F26
- *  dead-letter ledger line are the DURABLE record, so a missing/unresolvable coordinator never loses the incident — this is
- *  the ACTIVE push on top. "sent" = written to the coordinator inbox; "skip" = no coordinator / not resolvable / is self /
- *  write failed. NEVER throws. */
-export function notifyCoordinatorPoison(home: string, self: SelfInfo, coordinatorHandle: string | undefined, poison: InboxMsg, strikes: number, trace: string): "sent" | "skip" {
+ *  reusing the same coordinator-handle resolution as the check-in. THREE-STATE so the caller can RETAIN a retry obligation
+ *  (PD-P2-2 — one quarantine is below the F26 dead-letter burst threshold, so a silently-dropped notice hides the incident):
+ *  "sent" = written to the coordinator inbox; "retry" = TRANSIENT (coordinator not resolvable yet, or the write failed) ⇒
+ *  retain + retry on the flush timer; "skip" = PERMANENT (no coordinator configured, or we ARE the coordinator). The
+ *  quarantine + the F26 ledger remain the durable record; this is the ACTIVE push on top. NEVER throws. */
+export function notifyCoordinatorPoison(home: string, self: SelfInfo, coordinatorHandle: string | undefined, poison: InboxMsg, strikes: number, trace: string): "sent" | "retry" | "skip" {
   try {
-    if (!coordinatorHandle || !coordinatorHandle.trim()) return "skip";
+    if (!coordinatorHandle || !coordinatorHandle.trim()) return "skip"; // no coordinator ⇒ permanent (ledger is the record)
     const coordSid = resolveSession(coordinatorHandle, listSessions(home));
-    if (!coordSid) return "skip"; // not resolvable here — the dead-letter ledger remains the durable fallback
+    if (!coordSid) return "retry"; // not resolvable on this machine YET ⇒ retain + retry (PD-P2-2)
     const mySid = self.stableId ?? self.id;
-    if (coordSid === mySid) return "skip"; // never to self
+    if (coordSid === mySid) return "skip"; // never to self ⇒ permanent
     writeInbox(home, coordSid, buildPoisonS19(mySid, self.title, poison, strikes, trace));
     return "sent";
-  } catch { return "skip"; } // fail-soft: the quarantine + ledger already captured it
+  } catch { return "retry"; } // write failed ⇒ retain + retry (PD-P2-2); fail-soft, never throw
 }

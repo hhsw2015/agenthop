@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSyn
 import os from "node:os";
 import path from "node:path";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19 } from "../src/inbox.js";
+import { notifyCoordinatorPoison } from "../src/checkin.js";
+import type { SelfInfo } from "../src/label.js";
 
 let HOME: string;
 beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-inbox-")); });
@@ -222,20 +224,21 @@ describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
     expect(shouldQuarantinePoison(5, 0)).toBe(false);    // threshold < 1 ⇒ never (guards misconfig)
   });
 
-  test("recordPoisonStrike increments and the sidecar is keyed by the STABLE base (survives claim→release→reclaim)", () => {
+  test("recordPoisonStrike increments and the count is keyed by the STABLE base (survives claim→release→reclaim)", () => {
     const base = path.join(dirOf("s1"), "0000000000001000-aaaaaa.json");
     mkdirSync(dirOf("s1"), { recursive: true });
-    expect(recordPoisonStrike(`${base}.claim-123`)).toBe(1); // claimed form
-    expect(recordPoisonStrike(base)).toBe(2);                // released form ⇒ SAME sidecar
-    expect(recordPoisonStrike(`${base}.claim-456`)).toBe(3); // reclaimed by a new pid ⇒ still the same count
-    clearPoisonStrikes(base);
-    expect(recordPoisonStrike(base)).toBe(1);                // cleared ⇒ starts over
+    const mem = new Map<string, number>();
+    expect(recordPoisonStrike(`${base}.claim-123`, mem)).toBe(1); // claimed form
+    expect(recordPoisonStrike(base, mem)).toBe(2);                // released form ⇒ SAME key
+    expect(recordPoisonStrike(`${base}.claim-456`, mem)).toBe(3); // reclaimed by a new pid ⇒ still the same count
+    clearPoisonStrikes(base, mem);
+    expect(recordPoisonStrike(base, mem)).toBe(1);                // cleared (sidecar + mem) ⇒ starts over
   });
 
   test("the strike sidecar is NOT a .json ⇒ claimInbox never lists it as a deliverable message", () => {
     writeInbox(HOME, "s1", msg("hello", 1000));
     const jsonName = readdirSync(dirOf("s1")).find((n) => n.endsWith(".json"))!;
-    recordPoisonStrike(path.join(dirOf("s1"), jsonName)); // drop a .poison sidecar next to the message
+    recordPoisonStrike(path.join(dirOf("s1"), jsonName), new Map()); // drop a .poison sidecar next to the message
     const claimed = claimInbox(HOME, ["s1"], "p");
     expect(claimed.length).toBe(1);                         // ONLY the message, not the sidecar
     expect(claimed[0].msg.text).toBe("hello");
@@ -255,5 +258,40 @@ describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
     expect(s19.text).toContain("durable-inbox");     // source via
     expect(s19.text).toContain("…");                 // preview truncated (500 > 240)
     expect(validInboxMsg(s19)).not.toBeNull();       // a well-formed inbox message
+  });
+
+  test("PD-P2-1: buildPoisonS19 strips transport-unsafe control chars so the NOTICE is not itself poison", () => {
+    const poison = { from: "x", fromLabel: "al\u0000ice", text: "payload\u0000with NUL", via: "dur\u0000able", ts: 42 };
+    const s19 = buildPoisonS19("my-sid", "me", poison, 3, "Error\u0000trace");
+    expect(s19.text).not.toContain("\u0000");        // no NUL anywhere ⇒ a real push won't ERR_INVALID_ARG_VALUE on the alert
+    expect(s19.text).toContain("�");            // replaced with the visible marker
+    expect(s19.text).toContain("payload");           // the safe content survives
+    expect(validInboxMsg(s19)).not.toBeNull();
+  });
+
+  test("PD-P2-2: notifyCoordinatorPoison is 3-state — skip (no coordinator) vs retry (unresolvable) so the obligation is retained", () => {
+    const self = { id: "me", stableId: "me", title: "me" } as SelfInfo;
+    const poison = { from: "x", fromLabel: "alice", text: "boom", via: "local", ts: 1 };
+    expect(notifyCoordinatorPoison(HOME, self, undefined, poison, 3, "t")).toBe("skip");   // no coordinator ⇒ permanent
+    expect(notifyCoordinatorPoison(HOME, self, "", poison, 3, "t")).toBe("skip");          // blank handle ⇒ permanent
+    expect(notifyCoordinatorPoison(HOME, self, "coord-ghost", poison, 3, "t")).toBe("retry"); // not resolvable here ⇒ retain + retry
+  });
+
+  test("PD-P2-3: the in-memory map drives the count to threshold even when the sidecar write keeps failing", () => {
+    const mem = new Map<string, number>();
+    const base = path.join(HOME, "no-such-dir", "x.json"); // parent missing ⇒ sidecar read AND write both fail
+    expect(recordPoisonStrike(base, mem)).toBe(1);
+    expect(recordPoisonStrike(base, mem)).toBe(2);
+    expect(recordPoisonStrike(base, mem)).toBe(3);          // reaches threshold despite zero successful persistence
+    expect(existsSync(`${base}.poison`)).toBe(false);       // nothing was ever written
+  });
+
+  test("PD-P2-4: a corrupt sidecar (prefix-parse bait) is ignored, never authorizing an early quarantine", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    const base = path.join(dirOf("s1"), "0000000000002000-bbbbbb.json");
+    writeFileSync(`${base}.poison`, "2-not-a-counter"); // parseInt would read 2 ⇒ next 3 ⇒ premature quarantine
+    expect(recordPoisonStrike(base, new Map())).toBe(1);  // whole-string parse rejects it ⇒ treated as 0 ⇒ starts at 1
+    writeFileSync(`${base}.poison`, "2");                 // a VALID complete integer IS honored
+    expect(recordPoisonStrike(base, new Map())).toBe(3);  // max(2, 0) + 1
   });
 });
