@@ -1,6 +1,11 @@
-# Review packet — F47-A codex bus-identity restore (daemon-adopt), ROUND 1
+# Review packet — F47-A codex bus-identity restore (daemon-adopt), ROUND 2
 
-- **Branch** `feat/f47-codex-bus`  **HEAD** `25f9883`  **Base** `main` (`bdd93d7`)
+- **Branch** `feat/f47-codex-bus`  **HEAD** `a93b890`  **Base** `main` (`bdd93d7`)  (round-1 `25f9883`)
+
+## Round 2 — round-1 REMAIN resolved (F47-1 / F47-2)
+- F47-1 (P1) identity adoption used the daemon's LENIENT `activeThread`, whose sole-loaded fallback returns the only loaded thread even when its cwd clearly belongs to another session — a node in `/projects/own` would adopt a thread in `/projects/other` and then recv that session's inbox. Fixed with a new STRICT `ownThreadByCwd` (codex.ts) + `daemon.ownThread`: a loaded thread whose cwd UNIQUELY equals ours, with NO sole-loaded fallback. Delivery keeps the lenient `activeThread`; IDENTITY must prove ownership. No unique cwd match -> stay unconfirmed. `adoptCodexIdentity` now calls `ownThread`, not `activeThread`.
+- F47-2 (P2) `close()` cleared only `flushTimer`; the fast-adopt `idTimer` kept firing, so a torn-down instance kept adopting + logging identity. The `idTimer` is now tracked and cleared in `close()`, and `adoptCodexIdentity` is guarded by a `closed` flag so a closed instance never adopts or records. The normal startup poll, 20-try cap, and 5s backstop are unchanged.
+- Gates: bus tsc 0; `codex-pick` 13 (+5 `ownThreadByCwd`, incl. the F47-1 counterexample: sole-loaded-but-cwd-mismatch -> undefined) + `resolve` + `bus-identity` pass (27). Full suite net -1 vs baseline (adds no failures; the env-baseline failures are this machine's live-codex-daemon tests — the reviewer's isolated env is 1147/1147).
 - **Reviewer** codex `01a0ead5` (cross-family)  **Author** bus-pen `d7f6c917`
 - **Design** `docs/swarm/f47-codex-bus-design.md` @`6e53c29` (coordinator-APPROVED for A; B is a user gate)
 
