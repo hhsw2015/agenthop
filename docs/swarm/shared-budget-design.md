@@ -18,7 +18,7 @@ docker-agent `budgets` 共享池:几个 agent 引用同一名字 → 从同一�
 - **池 = 名字 + 天花板 + 已花(committed draws)+ 在途(reservations)**。同名=同池;异名=独立池。`PoolCeiling = { maxUsd?, maxTokens? }`,至少一维,到任一维即耗尽(裁③ fail-closed)。
 - **准入 = reserve(派新前,锁内写)**:消费者派新单元前 `reserve(reserveKey, 估额=该单票面额, pid)`。判据 `committed + inflight >= ceiling ⇒ 拒`(裁 A)。放行则把该估额计入在途。**这是本件的 overshoot 上界凭证**:只要 spent+inflight<ceiling 才放行,唯一溢出就是「压过线的那一张票」⇒ 上界 = ceiling + 单票最大面额,**与消费者数量无关**(修 SB3:旧版准入只读 spent,10 个消费者可并发全放行=无界)。
 - **记账 = commit(实花后,锁内写)**:单元完成后 `commit(drawKey, reserveKey, 实际花费)` ——移除该 reservation(在途减)、记入实花(committed 增)。实花可小于估额。幂等 by `drawKey`。
-- **在途回收(settle 非 refund,修 SB3/R2)**:crash/超时的 reservation 由 `settleExpiredReservations` **结算为「推定已花」draw(按估额入账),绝不删除退款**(删除会把 vanished 单元可能已花的额度退回,重开无界超支)。pid-liveness 为主 + TTL 3600s 兜 pid 复用。真单元若仍活,日后 `commit` 以实际额**对冲**掉该推定估额;若真死,则估额作为保守上限长留。`commit` 只结算**本消费者自己**的 reservation,且对已提交的 drawKey 为纯 no-op——重放或跨消费者提交都不会抹掉他人 reservation。
+- **在途回收(settle 非 refund,修 SB3/R2+R3)**:crash/超时的 reservation 由 `settleExpiredReservations` **标记 `settled`(估额仍计入在途责任),绝不删除、绝不退款、绝不转成 draw**(删除会退回 vanished 单元可能已花的额度=重开无界超支;转成 draw 会让内部键混入真实 drawKey 去重空间)。每条 reservation **单次活性采样**判定(避免两次采样让责任落空),已 settled 的不再重判(幂等)。pid-liveness 为主 + TTL 3600s 兜 pid 复用。真单元若仍活,日后 `commit` 以实际额**对冲**(移除该 reservation + 记真实 draw);若真死,则估额作为保守上限长留。`commit` 只移除**本消费者自己**的 reservation(open 或 settled 皆可,consumer 绑定),且对已提交的 drawKey 为纯 no-op——重放或跨消费者提交都不会抹掉他人责任。
 - **幂等**:reserve by `reserveKey`、commit by `drawKey`,内容寻址(照搬 fanout runKey)——重连/重试不双记。
 - **耗尽 ≠ 关闭**:耗尽是拒新派的瞬时态;协调者可加额复活(裁⑤)。
 
@@ -47,7 +47,7 @@ docker-agent `budgets` 共享池:几个 agent 引用同一名字 → 从同一�
 (前端 3e097dfe:额度条 + 在途段 + per-消费者细目 + open/exhausted 色,防御式渲染。= 后续 OpenDots console 切片,非本 agenthop 单。)
 
 ## 架构(沿用 dual-bandwidth 范式)
-- **纯核 `shared-budget.ts`** + selftest:`reserve/commit/applyDraw/pruneStaleReservations/isExhausted/raiseCeiling/project`,loud 校验,无 fs/clock(时间戳/liveness 注入)。
+- **纯核 `shared-budget.ts`** + selftest:`reserve/commit/applyDraw/settleExpiredReservations/isExhausted/raiseCeiling/project`,loud 校验,无 fs/clock(时间戳/liveness 注入)。
 - **IO `shared-budget-store.ts`**:持有者身份锁 + CAS 读改写 + fail-closed 读 + 投影原子写。
 - **dormant**:独立文件,**不接线 fanout**(feat/fanout-native 仍在审)。接点①fanout:派 run 前 `reservePool`、单元完成 `commitDraw`;②bandwidth-gauge/R18:读 `remaining/state/inflight` 作成本面节流读数。实际接线 = fanout 并库后另单。
 

@@ -1,17 +1,18 @@
 /**
  * Shared-budget pool pure core (DA2, docker-agent borrow #2 — grounds in docs/research/docker-agent-eval.md axis-cost + Q⑤,
- * design docs/swarm/shared-budget-design.md). A NAMED pool = one ceiling, many consumers: N concurrent consumers that reference
- * the same pool name draw from the SAME ceiling, so a fan-out to N sub-tasks cannot spend N times the limit (docker-agent's
- * `budgets` shared-pot semantics). The soft shared layer above fan-out's per-run ticket caps.
+ * design docs/swarm/shared-budget-design.md). A NAMED pool = one ceiling, many consumers: N consumers referencing the same pool
+ * name draw from the SAME ceiling, so a fan-out to N sub-tasks cannot spend N times the limit. The soft shared layer above
+ * fan-out's per-run ticket caps.
  *
- * Coordinator rulings (DA2 APPROVED) + DA2-R1/R2 review fixes:
- *  (3/A, SB3) Overshoot is BOUNDED and the bound is PROVABLE AT ADMIT: admission (`reserve`) counts committed spend PLUS reserved
- *      in-flight, refusing once `spent + inflight >= ceiling`, so the only overshoot is the single reservation that tips the pool —
- *      bound = ceiling + one max ticket, independent of consumer count. Unsettled liability is NEVER refunded: a reservation whose
- *      owner is gone is SETTLED to a presumed-spent draw at its estimate (`settleExpiredReservations`), never deleted (deleting
- *      would refund headroom the vanished unit may already have spent, reopening unbounded overshoot — SB3/R2). `commit` settles
- *      only the committing consumer's OWN reservation and is a pure no-op on an already-committed drawKey, so a replay or a
- *      cross-consumer commit can never erase another reservation (SB3/R2).
+ * Coordinator rulings (DA2 APPROVED) + review fixes through DA2-R3:
+ *  (3/A, SB3) Overshoot is bounded and provable AT ADMIT: `reserve` counts committed spend + in-flight reservations and refuses at
+ *      `spent + inflight >= ceiling`, so the only overshoot is the single reservation that tips the pool (bound = ceiling + one max
+ *      ticket, independent of consumer count). Unsettled liability is NEVER refunded: a reservation whose owner is gone is MARKED
+ *      `settled` (its estimate stays counted as in-flight liability), never deleted and never converted into a draw — so it can't
+ *      refund headroom and its internal key can't collide with a real drawKey (SB3/R3). A reservation is settled ONCE (idempotent),
+ *      in a single liveness sample (SB3/R3: no double-sample can drop it). `commit` removes ONLY the committing consumer's own
+ *      reservation (open or settled) and is a no-op on an already-committed drawKey, so a replay / cross-consumer commit can never
+ *      erase another consumer's liability (SB3/R3). A live unit reconciles its estimate to the actual on commit.
  *  (3) Exhaustion = maxUsd OR maxTokens, whichever hits first (fail-closed).
  *  (5) Raising the ceiling is a money-gate (coordinator only) — enforced by the caller.
  *
@@ -20,7 +21,8 @@
 
 export type PoolCeiling = { maxUsd: number | null; maxTokens: number | null };
 
-/** An admitted-but-not-yet-accounted unit (its ticket estimate held against the pool). Idempotent by `reserveKey`. */
+/** An admitted unit's held liability (its ticket estimate). Idempotent by `reserveKey`. `settled` = its owner is gone and the
+ *  estimate now stands as a conservative charge (still counted in-flight) until the real unit reconciles it via `commit`. */
 export type Reservation = {
   reserveKey: string;
   consumer: string;
@@ -28,10 +30,10 @@ export type Reservation = {
   estTokens: number;
   pid: number;
   atSec: number;
+  settled?: boolean;
 };
 
-/** One accounted spend. Idempotent by `drawKey`. `presumed` marks an estimate booked for a vanished reservation (SB3): it holds
- *  the liability until the real unit commits (which reconciles it to the actual) or stands as a conservative charge forever. */
+/** One accounted (real) spend. Idempotent by `drawKey`. draws[] holds ONLY real commits — never a synthetic/presumed record. */
 export type PoolDraw = {
   drawKey: string;
   consumer: string;
@@ -39,7 +41,6 @@ export type PoolDraw = {
   tokens: number;
   atSec: number;
   reserveKey?: string;
-  presumed?: boolean;
 };
 
 export type PoolState = {
@@ -59,12 +60,13 @@ export type BudgetPoolProjection = {
   poolName: string;
   generatedAtSec: number;
   ceiling: PoolCeiling;
-  spent: PoolSpent;
-  inflight: PoolSpent;
+  spent: PoolSpent;        // committed (real) spend
+  inflight: PoolSpent;     // reserved liability (open + settled estimates)
   remaining: { usd: number | null; tokens: number | null };
   state: 'open' | 'exhausted';
   drawCount: number;
   reservationCount: number;
+  settledCount: number;    // reservations whose owner vanished; estimate held as a conservative charge
   consumers: { id: string; usd: number; tokens: number }[];
 };
 
@@ -94,6 +96,7 @@ export function spentOf(state: PoolState): PoolSpent {
   return { usd, tokens };
 }
 
+/** In-flight liability = every reservation's estimate (open AND settled — a settled one still holds its charge until reconciled). */
 export function inflightOf(state: PoolState): PoolSpent {
   let usd = 0, tokens = 0;
   for (const r of state.reservations) { usd += r.estUsd; tokens += r.estTokens; }
@@ -129,13 +132,13 @@ function validateReservation(r: Reservation): void {
   if (!Number.isFinite(r.atSec)) throw new Error(`shared-budget: reservation.atSec must be a finite number (got ${String(r.atSec)})`);
 }
 
-/** Admit + reserve atomically (store calls this under the lock). Refuses once spent+inflight >= ceiling. Idempotent by reserveKey. */
+/** Admit + reserve atomically (store calls under the lock). Refuses once spent+inflight >= ceiling. Idempotent by reserveKey. */
 export function reserve(state: PoolState, r: Reservation): { ok: boolean; exhausted?: true; state: PoolState } {
   validateReservation(r);
   if (state.reservations.some((x) => x.reserveKey === r.reserveKey)) return { ok: true, state }; // already reserved
-  if (state.draws.some((d) => d.reserveKey === r.reserveKey)) return { ok: true, state }; // already committed/settled under this key
+  if (state.draws.some((d) => d.reserveKey === r.reserveKey)) return { ok: true, state }; // already committed under this key
   if (isExhausted(state)) return { ok: false, exhausted: true, state };
-  return { ok: true, state: { ...state, reservations: [...state.reservations, r] } };
+  return { ok: true, state: { ...state, reservations: [...state.reservations, { ...r, settled: false }] } };
 }
 
 function validateDraw(d: PoolDraw): void {
@@ -144,25 +147,18 @@ function validateDraw(d: PoolDraw): void {
   if (!Number.isFinite(d.usd) || d.usd < 0) throw new Error(`shared-budget: draw.usd must be a non-negative finite number (got ${String(d.usd)})`);
   if (!Number.isInteger(d.tokens) || d.tokens < 0) throw new Error(`shared-budget: draw.tokens must be a non-negative integer (got ${String(d.tokens)})`);
   if (!Number.isFinite(d.atSec)) throw new Error(`shared-budget: draw.atSec must be a finite number (got ${String(d.atSec)})`);
-  // SB2: the optional association fields must be write-valid, or the ledger becomes unreadable by the same-version reader.
   if (d.reserveKey !== undefined && (typeof d.reserveKey !== 'string' || d.reserveKey.length === 0)) throw new Error('shared-budget: draw.reserveKey, when present, must be a non-empty string');
-  if (d.presumed !== undefined && typeof d.presumed !== 'boolean') throw new Error('shared-budget: draw.presumed, when present, must be a boolean');
 }
 
-/** Commit an actual spend. Settles ONLY the committing consumer's own matching reservation (ownership binding) and reconciles a
- *  prior presumed-spent estimate for the same reserveKey (replaces the estimate with the actual). A pure no-op when the (real)
- *  drawKey is already committed — a replay or cross-consumer commit therefore never erases another reservation (SB3/R2). */
+/** Commit an actual spend. Removes ONLY the committing consumer's own reservation (open or settled) and books the real draw. A pure
+ *  no-op on an already-committed drawKey, so a replay / cross-consumer commit never erases another consumer's reservation (SB3/R3). */
 export function commit(state: PoolState, draw: PoolDraw): PoolState {
   validateDraw(draw);
-  if (state.draws.some((d) => d.drawKey === draw.drawKey && !d.presumed)) return state; // already committed (real) => no-op, strips nothing
-  let reservations = state.reservations;
-  let draws = state.draws;
-  if (draw.reserveKey !== undefined) {
-    reservations = reservations.filter((r) => !(r.reserveKey === draw.reserveKey && r.consumer === draw.consumer)); // settle only our own
-    draws = draws.filter((d) => !(d.presumed && d.reserveKey === draw.reserveKey)); // reconcile a presumed estimate with the actual
-  }
-  if (draws.some((d) => d.drawKey === draw.drawKey)) return { ...state, reservations, draws }; // settled, but the draw already exists
-  return { ...state, reservations, draws: [...draws, draw] };
+  if (state.draws.some((d) => d.drawKey === draw.drawKey)) return state; // real drawKey already present => no-op, strips nothing
+  const reservations = draw.reserveKey === undefined
+    ? state.reservations
+    : state.reservations.filter((r) => !(r.reserveKey === draw.reserveKey && r.consumer === draw.consumer)); // own only (consumer-bound)
+  return { ...state, reservations, draws: [...state.draws, draw] };
 }
 
 /** Direct accounting with no prior reservation (reconciliation import). Idempotent by drawKey. */
@@ -170,34 +166,24 @@ export function applyDraw(state: PoolState, draw: PoolDraw): PoolState {
   return commit(state, draw);
 }
 
-/** Settle reservations whose owner is gone: dead pid (liveness) OR older than ttlSec (backstop). A gone reservation is NOT
- *  refunded — it is CONVERTED to a presumed-spent draw at its estimate, so committed+inflight never drops without evidence of
- *  settlement and the overshoot bound holds (SB3/R2). The real unit, if still alive, reconciles it later via `commit`. Pure:
- *  caller injects `isAlive` + `nowSec`. */
+/** Mark reservations whose owner is gone as `settled` — a SINGLE liveness sample per reservation (SB3/R3: no double-sample can
+ *  drop one), and NEVER deleted or refunded (its estimate stays counted in-flight). Already-settled reservations are left as-is
+ *  (idempotent). The real unit, if alive, reconciles its estimate via `commit`. Pure: caller injects `isAlive` + `nowSec`. */
 export function settleExpiredReservations(
   state: PoolState,
   isAlive: (pid: number) => boolean,
   nowSec: number,
   ttlSec: number,
 ): PoolState {
-  const isStale = (r: Reservation) => !isAlive(r.pid) || (Number.isFinite(nowSec) && nowSec - r.atSec > ttlSec);
-  const stale = state.reservations.filter(isStale);
-  if (stale.length === 0) return state;
-  const live = state.reservations.filter((r) => !isStale(r));
-  const alreadyPresumed = new Set(state.draws.filter((d) => d.presumed && d.reserveKey !== undefined).map((d) => d.reserveKey));
-  const committedKeys = new Set(state.draws.map((d) => d.reserveKey).filter((k): k is string => k !== undefined));
-  const presumed: PoolDraw[] = stale
-    .filter((r) => !alreadyPresumed.has(r.reserveKey) && !committedKeys.has(r.reserveKey)) // don't double-book or override a real commit
-    .map((r) => ({
-      drawKey: `presumed:${r.reserveKey}`,
-      consumer: r.consumer,
-      usd: r.estUsd,
-      tokens: r.estTokens,
-      atSec: Number.isFinite(nowSec) ? nowSec : r.atSec,
-      reserveKey: r.reserveKey,
-      presumed: true,
-    }));
-  return { ...state, reservations: live, draws: [...state.draws, ...presumed] };
+  let changed = false;
+  const reservations = state.reservations.map((r) => {
+    if (r.settled) return r; // settle once
+    const gone = !isAlive(r.pid) || (Number.isFinite(nowSec) && nowSec - r.atSec > ttlSec); // ONE sample
+    if (!gone) return r;
+    changed = true;
+    return { ...r, settled: true };
+  });
+  return changed ? { ...state, reservations } : state;
 }
 
 export function raiseCeiling(state: PoolState, next: PoolCeiling): PoolState {
@@ -232,6 +218,7 @@ export function project(state: PoolState, nowSec: number): BudgetPoolProjection 
     state: isExhausted(state) ? 'exhausted' : 'open',
     drawCount: state.draws.length,
     reservationCount: state.reservations.length,
+    settledCount: state.reservations.filter((r) => r.settled).length,
     consumers: [...byConsumer.entries()].map(([id, v]) => ({ id, usd: v.usd, tokens: v.tokens })).sort((a, b) => b.usd - a.usd),
   };
 }
