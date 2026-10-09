@@ -140,25 +140,60 @@ export async function probeSessionAlive(home: string, sessionId: string, timeout
 }
 
 export type SessionLiveness = "alive" | "no-socket" | "unknown";
+export type CandidateLiveness = "alive" | "dead" | "unknown";
 
-/** SU1 (F45 flag-wiring r4): the TRI-STATE occupancy observation — one enumeration, probed in place. ONE readdir of the presence
- *  dir, and EVERY candidate it lists for this sid is connect-probed within that SAME enumeration. "alive" = a socket back-verified
- *  the sid; "no-socket" = the dir was enumerated successfully and none of its listed candidates is a live owner; "unknown" = the
- *  dir could not be enumerated (EACCES/etc). Keeping the list and the probes in ONE pass is the fix: a listener that appears is
- *  either in the list (⇒ probed ⇒ "alive") or genuinely not there — it can never be LISTED-but-UNPROBED and then called absent by
- *  stitching a failed probe's empty view onto a later readable-but-unprobed enumeration. `probeSessionAlive`'s boolean folds both
+/** SU1 (flag-wiring r5): probe ONE candidate liveness socket for `sid`, preserving the connect/response uncertainty that the
+ *  boolean probeSocketSid discards. "alive" = we CONNECTED and the socket emitted EXACTLY this sid (a confirmed live owner).
+ *  "dead" = the connect was refused / the path vanished (a leftover file with no listener ⇒ ECONNREFUSED/ENOENT), OR the socket
+ *  emitted a DIFFERENT non-empty sid (a confirmed OTHER owner — not a live owner of THIS sid). "unknown" = we reached a live
+ *  acceptor but could NOT read a confirming sid in time — a RESPONSE timeout, or a connected-then-closed-empty — which is exactly
+ *  how our own instance looks when its event loop is momentarily blocked (the kernel completes the AF_UNIX connect before the
+ *  accept callback runs, so a wedged owner answers the connect but not the sid write within the probe window). Only a "dead"
+ *  candidate may be treated as absence; an "unknown" one forbids adoption (the slot may be a live-but-slow current instance).
+ *  A connect ERROR is "dead" ONLY for a DEFINITIVE refusal — ECONNREFUSED (nothing accepting at this path) or ENOENT (the path
+ *  vanished); ANY OTHER connect error (EACCES, ECONNRESET, ETIMEDOUT, …) is ambiguous ⇒ "unknown" (a listener may exist; a probe
+ *  failure is not a proof of absence). A response TIMEOUT is likewise "unknown", never "dead". */
+export function probeCandidateLiveness(sockPath: string, sid: string, timeoutMs: number = PRESENCE_PROBE_MS): Promise<CandidateLiveness> {
+  return new Promise((resolve) => {
+    let done = false; let buf = "";
+    const sock = net.connect(sockPath);
+    const finish = (v: CandidateLiveness): void => { if (done) return; done = true; try { sock.destroy(); } catch { /* noop */ } resolve(v); };
+    const timer = setTimeout(() => finish("unknown"), timeoutMs); // connected-but-silent (slow owner) OR never-answered ⇒ cannot confirm
+    timer.unref?.();
+    sock.setEncoding("utf8");
+    // exact sid ⇒ alive; a DIFFERENT non-empty sid ⇒ a confirmed other owner (dead for THIS sid); empty ⇒ connected but unconfirmed
+    const verdict = (): CandidateLiveness => (buf === sid ? "alive" : buf ? "dead" : "unknown");
+    sock.on("data", (d) => { buf += d; if (buf.length > 4096) { clearTimeout(timer); finish(buf.slice(0, 4096) === sid ? "alive" : "dead"); } }); // cap a rogue stream
+    sock.once("end", () => { clearTimeout(timer); finish(verdict()); });
+    // DEFINITIVE refusal (ECONNREFUSED) / vanished path (ENOENT) ⇒ no live listener here ⇒ "dead". Any OTHER connect error is
+    // ambiguous ⇒ "unknown" (never let a non-definitive probe failure count as a confirmed absence).
+    sock.once("error", (e) => { clearTimeout(timer); const code = (e as NodeJS.ErrnoException).code; finish(code === "ECONNREFUSED" || code === "ENOENT" ? "dead" : "unknown"); });
+  });
+}
+
+/** SU1 (flag-wiring r4/r5): the TRI-STATE occupancy observation — one enumeration, probed in place, with the per-candidate
+ *  uncertainty PRESERVED. ONE readdir of the presence dir, and EVERY candidate it lists for this sid is probed in that SAME pass
+ *  via probeCandidateLiveness. "alive" = a candidate back-verified the sid. "unknown" = the dir could not be enumerated (EACCES),
+ *  OR a listed candidate could not be confirmed dead (a connected-but-unresponsive socket — a live-but-slow owner). "no-socket" =
+ *  the dir enumerated AND every listed candidate was confirmed DEAD (leftover/other-owner) — only then is absence proven. Two
+ *  layers of uncertainty are kept distinct from absence: the enumeration (r4: no stitching a failed probe's empty view onto a
+ *  later readable readdir) AND the candidate response (r5: a response timeout is NOT absence). `probeSessionAlive` folds both
  *  "no-socket" and "unknown" to false (correct for keep-relay routing); an ADOPTION decision must instead distinguish them. */
 export async function probeSessionLiveness(home: string, sessionId: string, timeoutMs: number = PRESENCE_PROBE_MS): Promise<SessionLiveness> {
   const prefix = sidSockPrefix(sessionId);
   let files: string[];
   try { files = readdirSync(presenceDir(home)); } catch { return "unknown"; } // enumeration failure ⇒ uncertain, NOT a confirmed absence
+  let sawUnknown = false;
   for (const f of files) {
     if (!f.startsWith(`${prefix}.`) || !f.endsWith(".sock")) continue;
     const p = path.join(presenceDir(home), f);
     if (!sockPathFits(p)) continue; // a truncatable path could answer for a different sid — never trust it
-    if (await probeSocketSid(p, timeoutMs) === sessionId) return "alive"; // connect + the socket proves it owns THIS sid
+    const r = await probeCandidateLiveness(p, sessionId, timeoutMs);
+    if (r === "alive") return "alive";   // a confirmed live owner — done
+    if (r === "unknown") sawUnknown = true; // a candidate we could not confirm dead ⇒ absence is no longer provable
+    // r === "dead" ⇒ a leftover / other owner — ignore (does not block adoption; this is the orphan-reclaim path)
   }
-  return "no-socket"; // enumerated successfully; no listed candidate is a live owner of this sid
+  return sawUnknown ? "unknown" : "no-socket"; // any unconfirmable candidate ⇒ unknown; else every candidate was dead ⇒ confirmed absent
 }
 
 /** F45-R7-P2-1: open THIS instance's liveness socket on a UNIQUE per-instance path (bounded hash prefix + random nonce). No

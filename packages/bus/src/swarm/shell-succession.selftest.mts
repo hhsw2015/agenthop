@@ -1,9 +1,11 @@
 import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, argvFromCmdline, presencePidRelPath, planSuccession, adoptLockSite, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
 import { acquireHolderLock, releaseHolderLock } from "./holder-lock.js";
+import { probeCandidateLiveness, probeSessionLiveness, sidSockPrefix } from "./task-liveness.js";
 import type { RosterMember } from "./resume.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import net from "node:net";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
@@ -122,5 +124,39 @@ const sA = acquireHolderLock(adoptLockSite(lockHome, "sidA"));
 const sB = acquireHolderLock(adoptLockSite(lockHome, "sidB"));
 t("SU2 lock: distinct sids are independent locks (both win)", typeof sA === "string" && typeof sB === "string");
 rmSync(lockHome, { recursive: true, force: true });
+
+// --- SU1 (round-5) candidate-probe uncertainty: probeCandidateLiveness must distinguish a CONFIRMED live owner, a CONFIRMED
+//     dead/other candidate, and an UNCONFIRMABLE one (a connected-but-unresponsive socket = a live-but-slow owner). A response
+//     TIMEOUT must NOT read as absence (the r5 false-adopt: a current instance with a momentarily blocked event loop answers the
+//     connect but not the sid write within the probe window, and was being consumed as adoptable). Real unix sockets. ---
+// A SHORT home (/tmp, not the deep mkdtemp tmpdir) so the prefix(32)+nonce socket path fits the macOS AF_UNIX ~104-byte limit.
+const sockHome = mkdtempSync("/tmp/f45s-");
+const servers: net.Server[] = [];
+const mkServer = (p: string, onConn: (s: net.Socket) => void): Promise<string> => new Promise((res) => {
+  const srv = net.createServer(onConn); servers.push(srv); srv.listen(p, () => res(p));
+});
+const aliveP = await mkServer(path.join(sockHome, "alive.sock"), (s) => s.end("sidX"));           // emits EXACTLY our sid, then closes
+const otherP = await mkServer(path.join(sockHome, "other.sock"), (s) => s.end("a-different-sid")); // a different owner answers
+const slowP  = await mkServer(path.join(sockHome, "slow.sock"), () => { /* accept, then NEVER write/close within the window */ });
+t("probeCandidate: emits exact sid -> alive", (await probeCandidateLiveness(aliveP, "sidX", 300)) === "alive");
+t("probeCandidate: emits a DIFFERENT sid -> dead (a confirmed other owner, not ours)", (await probeCandidateLiveness(otherP, "sidX", 300)) === "dead");
+t("probeCandidate: no listener at path -> dead (ECONNREFUSED/ENOENT leftover)", (await probeCandidateLiveness(path.join(sockHome, "nope.sock"), "sidX", 300)) === "dead");
+t("probeCandidate: connected but response times out -> UNKNOWN (live-but-slow owner, never 'dead')", (await probeCandidateLiveness(slowP, "sidX", 150)) === "unknown");
+
+// probeSessionLiveness aggregation (real sockets at the CORRECT hashed prefix in a presence dir):
+const SID = "fe0376cd-f1df-4d46-a15d-b333acba7ee9";
+const presDir = path.join(sockHome, ".agenthop", "presence");
+mkdirSync(presDir, { recursive: true });
+const pref = sidSockPrefix(SID);
+t("probeSessionLiveness: enumerable dir, no candidate -> no-socket (confirmed absent)", (await probeSessionLiveness(sockHome, SID, 200)) === "no-socket");
+const aliveSock = await mkServer(path.join(presDir, `${pref}.a.sock`), (s) => s.end(SID)); void aliveSock;
+t("probeSessionLiveness: a live candidate at the hashed prefix -> alive", (await probeSessionLiveness(sockHome, SID, 300)) === "alive");
+// SU1 crux at the AGGREGATION layer: a SLOW (connected-but-silent) candidate and NO live one ⇒ "unknown" (absence unprovable ⇒
+// the adoption path must NOT treat this as adoptable). Replace the dir with only a slow candidate.
+rmSync(path.join(presDir, `${pref}.a.sock`), { force: true });
+const slowSock = await mkServer(path.join(presDir, `${pref}.s.sock`), () => { /* silent */ }); void slowSock;
+t("probeSessionLiveness: only a connected-but-silent candidate -> unknown (NOT no-socket; forbids adoption)", (await probeSessionLiveness(sockHome, SID, 150)) === "unknown");
+for (const s of servers) { try { s.close(); } catch { /* noop */ } }
+rmSync(sockHome, { recursive: true, force: true });
 
 console.log("all shell-succession selftests passed");
