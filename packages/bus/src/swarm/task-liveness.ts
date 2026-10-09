@@ -60,7 +60,7 @@ export function resolveSession(ownerHandle: string, sessionIds: string[]): strin
 }
 
 // --- real-fs binding (the TEMP v1; bus-identity replaces it). Thin; the testable decisions are above. -------------
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, mkdirSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import net from "node:net";
 import path from "node:path";
@@ -163,6 +163,9 @@ export async function openLivenessSocket(home: string, sessionId: string, _timeo
   const nonce = randomBytes(4).toString("hex");
   const sockPath = instanceSockPath(home, sessionId, nonce);
   if (!sockPathFits(sockPath)) return null; // can't express this endpoint without truncation ⇒ relay-only
+  // B7-1: ensure the presence dir exists before binding. A presence daemon with no pid file (the B7-1 scenario) has nothing else
+  // that creates it, so without this listen() fails ENOENT ⇒ no liveness socket ⇒ the listener can never prove the identity alive.
+  try { mkdirSync(presenceDir(home), { recursive: true }); } catch { /* a concurrent create / EEXIST is fine; a real failure surfaces at listen() */ }
   try {
     const server = await new Promise<net.Server>((resolve, reject) => {
       // On accept, EMIT the owning sid then close (coordinator r9 hint ①: lets a prober back-verify this socket owns the sid —

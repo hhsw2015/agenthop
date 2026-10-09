@@ -48,7 +48,13 @@ export type BusCore = {
   close(): Promise<void>;
 };
 
-export type BusCoreOptions = { home?: string; relay?: string; pass?: string };
+export type BusCoreOptions = {
+  home?: string; relay?: string; pass?: string;
+  /** B7-1: called AFTER this session's stable identity is (re)assigned (Codex adopts its thread id late, by cwd-match). The
+   *  presence daemon uses it to RE-BIND its liveness socket from hash(run-id) to hash(stableId) with no poll window, so a
+   *  sender probing the stable id proves THIS instance alive and routes its send to the stable id's durable inbox. */
+  onIdentityChange?: (self: SelfInfo) => void;
+};
 
 /**
  * Which Codex thread to deliver an inbound message into. Locked to this session's learned identity so
@@ -300,6 +306,9 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // by sid). Gated on SWARM_COORDINATOR, never to self, fail-soft (reportCheckIn). Retain a retry obligation on a transient miss (B5).
     checkInPending = reportCheckIn(home, self, process.env.SWARM_COORDINATOR) === "retry";
     refreshLegacyKeys(true); // F40: self's native just changed ⇒ force a recompute (the keys depend on self.stableId, not only the log)
+    // B7-1: the published identity just (re)assigned — notify the owner (presence) so a LISTENER bound to the old id (run-id)
+    // re-binds to the new stable id. Fired only on an actual reassignment (the same-id/guess-only early returns above skip it).
+    options.onIdentityChange?.(self);
   };
 
   const relay: Relay | undefined = startRelay(self, (from, text) => handleInbound(from, text, "relay"), options);
