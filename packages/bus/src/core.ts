@@ -11,7 +11,7 @@ import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
 import { resolveInboxTarget, isValidSessionId } from "./send-fallback.js";
-import { resolveSession, listSessions, presenceSockPath, probeLivenessSock } from "./swarm/task-liveness.js";
+import { resolveSession, listSessions, probeSessionAlive } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -432,13 +432,15 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // CURRENT instance is alive — window-free (no last-write/mtime freshness, so no pid-recycle window). A stale sock from a
       // dead daemon ⇒ ECONNREFUSED; a recycled pid never listens on it ⇒ connect fails ⇒ keep relay (no false durable). The
       // sock filename IS the sid, so the probe is naturally bound to the exact identity.
-      // F45-R7-P1-2: the stableId becomes a filesystem path (presence/<sid>.sock). It is an unvalidated peer field, so a
-      // crafted value like "../bridge" would point the probe at an UNRELATED listener and yield a false local durable. Only
-      // probe for a sid that is a safe single path segment; anything else stays relay (never probe another endpoint).
+      // F45-R7 (rounds 7-9): is this relay-resolved peer actually SAME-MACHINE? probeSessionAlive hashes the sid to a bounded,
+      // collision-free socket-name prefix (a crafted "../bridge" can't traverse; two long sids can't truncate-collide) and
+      // connect-probes the peer's per-instance liveness socket(s). A connect proves the current instance is alive — window-free.
+      // isValidSessionId still gates the DURABLE INBOX KEY below (the raw sid is the inbox dir name): an unsafe sid never becomes
+      // a durable target even though its hashed socket path is always safe.
       let relayLocalSid: string | null = null;
       if (!("error" in resolvedPeer) && resolvedPeer.via === "relay" && resolvedPeer.stableId
           && isValidSessionId(resolvedPeer.stableId)
-          && (await probeLivenessSock(presenceSockPath(home, resolvedPeer.stableId)))) {
+          && (await probeSessionAlive(home, resolvedPeer.stableId))) {
         relayLocalSid = resolvedPeer.stableId;
       }
       const target = resolveInboxTarget(to, resolvedPeer, resolveSession(to, sessionList), relayLocalSid);

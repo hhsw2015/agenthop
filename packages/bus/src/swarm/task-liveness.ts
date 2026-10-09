@@ -60,7 +60,8 @@ export function resolveSession(ownerHandle: string, sessionIds: string[]): strin
 }
 
 // --- real-fs binding (the TEMP v1; bus-identity replaces it). Thin; the testable decisions are above. -------------
-import { readFileSync, readdirSync, statSync, rmSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import net from "node:net";
 import path from "node:path";
 
@@ -70,16 +71,34 @@ export const PRESENCE_HEARTBEAT_SEC = 30;
 /** connect timeout for the per-session liveness socket probe — short so a dead/unreachable sock never hangs a send. */
 export const PRESENCE_PROBE_MS = 200;
 
-/** The per-session liveness socket the presence daemon listens on (presence/<sid>.sock). The filename IS the sid (natural
- *  binding). Pure. */
-export function presenceSockPath(home: string, sessionId: string): string {
-  return path.join(home, ".agenthop", "presence", `${sessionId}.sock`);
+/** Max bytes for a unix-domain socket PATH. The OS sun_path array is 104 (macOS) / 108 (Linux) INCLUDING the NUL terminator; a
+ *  longer path is SILENTLY TRUNCATED by the kernel (not an error on macOS), which would make two distinct paths collide on one
+ *  endpoint. We use the smaller platform bound and reject anything that would not fit — never let truncation form a false
+ *  identity match (F45-R7-P1-2). */
+export const MAX_SOCK_PATH_BYTES = 103; // 104 (macOS sun_path) - 1 for the NUL terminator
+
+/** True iff `sockPath` fits in sun_path without truncation (so the kernel endpoint is EXACTLY this path, not a prefix). */
+export function sockPathFits(sockPath: string): boolean { return Buffer.byteLength(sockPath) <= MAX_SOCK_PATH_BYTES; }
+
+/** F45-R7-P1-2: a BOUNDED, STABLE, collision-free mapping sid -> socket-name prefix. sha256 truncated to 32 hex (128 bits): a
+ *  crafted sid (`../bridge`) can no longer traverse (the name is hex), and two distinct LONG sids can no longer truncate to the
+ *  same path (the prefix is fixed 32 chars). A targeted collision needs ~2^64 work (128-bit second-preimage) = infeasible. */
+export function sidSockPrefix(sessionId: string): string { return createHash("sha256").update(sessionId, "utf8").digest("hex").slice(0, 32); }
+
+/** The directory holding per-session liveness sockets. */
+function presenceDir(home: string): string { return path.join(home, ".agenthop", "presence"); }
+
+/** A per-INSTANCE liveness socket path: `presence/<sidPrefix>.<nonce>.sock`. The nonce makes each daemon instance own a UNIQUE
+ *  path, so close() (which unlinks its OWN path) can never delete another instance's endpoint (F45-R7-P2-1), and there is no
+ *  shared path to reclaim. */
+export function instanceSockPath(home: string, sessionId: string, nonce: string): string {
+  return path.join(presenceDir(home), `${sidSockPrefix(sessionId)}.${nonce}.sock`);
 }
 
-/** F45-R1 (coordinator ruling B): probe a per-session liveness socket. A live instance LISTENS; death drops the listener,
- *  so a successful connect proves the CURRENT instance is alive — window-free (unlike any last-write/mtime freshness scheme).
- *  A stale sock file from a dead daemon connects to nothing ⇒ ECONNREFUSED ⇒ false; a missing file ⇒ ENOENT ⇒ false; a hang
- *  ⇒ timeout ⇒ false. Resolves true ONLY on an accepted connection. */
+/** F45-R1 (ruling B): probe a liveness socket (true ONLY on an accepted connection). A live instance LISTENS; death drops the
+ *  listener, so a successful connect proves the CURRENT instance is alive — window-free. Stale/missing/hang/EACCES ⇒ false. A
+ *  failed probe is NEVER used to authorize a delete anywhere (F45-R7-P2-1), so a transient false is harmless (worst case: a
+ *  one-off relay fallback instead of durable). */
 export function probeLivenessSock(sockPath: string, timeoutMs: number = PRESENCE_PROBE_MS): Promise<boolean> {
   return new Promise((resolve) => {
     let done = false;
@@ -92,29 +111,47 @@ export function probeLivenessSock(sockPath: string, timeoutMs: number = PRESENCE
   });
 }
 
-/**
- * F45-R7-P2-1: claim the per-session liveness socket WITHOUT ever unlinking a LIVE listener. A unix bind fails EADDRINUSE
- * whether the path holds a live listener OR a dead daemon's stale file — so we cannot tell them apart by bind alone, and
- * unconditionally unlinking-before-bind (the r7 bug) silences a still-serving instance of the same sid. Instead:
- *   1. try to listen. Free path ⇒ we own it.
- *   2. EADDRINUSE ⇒ probe. A LIVE incumbent ⇒ return null (DEFER — never steal a live peer's endpoint; the caller retries
- *      later and takes over once the incumbent frees it). Only a DEAD stale file is unlinked and reclaimed.
- * Any other listen error ⇒ null (stay without a local socket; the send path falls back to relay, never a false durable).
- * On shutdown the owner just calls server.close(), which unlinks its OWN path — so two instances never collide on one file.
- */
-export async function claimLivenessSocket(sockPath: string, probeMs: number = PRESENCE_PROBE_MS): Promise<net.Server | null> {
-  const listen = (): Promise<net.Server> => new Promise((resolve, reject) => {
-    const srv = net.createServer((c) => c.destroy());
-    srv.once("error", reject);
-    srv.listen(sockPath, () => { srv.removeListener("error", reject); srv.on("error", () => { /* never crash on a socket error */ }); srv.unref?.(); resolve(srv); });
-  });
-  try { return await listen(); }
-  catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "EADDRINUSE") return null;
-    if (await probeLivenessSock(sockPath, probeMs)) return null; // a LIVE listener owns this sid — defer, do not unlink it
-    try { rmSync(sockPath, { force: true }); } catch { /* best effort: a dead daemon's stale file */ }
-    try { return await listen(); } catch { return null; }
+/** F45-R7 (ruling B, rounds 7-9): is the SAME-MACHINE current instance of `sessionId` alive? The socket name is a bounded hash
+ *  of the sid (no traversal, no truncation collision) + a per-instance nonce, so we LIST the presence dir for this sid's prefix
+ *  and probe each candidate — ANY accepted connection ⇒ alive. A candidate whose path would not fit sun_path is skipped (never
+ *  trust a truncatable path that could answer for a different sid). A readdir fault ⇒ false (keep relay). Pure connect: no
+ *  pid/mtime/start-time proof; stops at the first live match. */
+export async function probeSessionAlive(home: string, sessionId: string, timeoutMs: number = PRESENCE_PROBE_MS): Promise<boolean> {
+  const prefix = sidSockPrefix(sessionId);
+  let files: string[];
+  try { files = readdirSync(presenceDir(home)); } catch { return false; }
+  for (const f of files) {
+    if (!f.startsWith(`${prefix}.`) || !f.endsWith(".sock")) continue;
+    const p = path.join(presenceDir(home), f);
+    if (!sockPathFits(p)) continue; // a truncatable path could answer for a different sid — never trust it
+    if (await probeLivenessSock(p, timeoutMs)) return true;
   }
+  return false;
+}
+
+/** F45-R7-P2-1: open THIS instance's liveness socket on a UNIQUE per-instance path (bounded hash prefix + random nonce). No
+ *  shared path ⇒ no EADDRINUSE contention, no reclaim, and close() unlinks only OUR OWN path (never another instance's) — so an
+ *  exiting instance can never delete a live instance's endpoint. Returns the server + its path, or null when the path would not
+ *  fit sun_path (then the session is relay-only — never a truncated or colliding socket).
+ *
+ *  Deliberately NO orphan reclaim: a crashed prior instance leaves a stale socket file, but deleting it would require a probe,
+ *  and a probe failure (a transient ECONNREFUSED from a backlog-full LIVE sibling, a timeout, an EACCES) must NEVER authorize a
+ *  delete (F45-R7-P2-1) — there is no delete here at all. Orphans are harmless: probeSessionAlive connects to each candidate and
+ *  a dead orphan simply fails the connect (skipped), so a leftover never reads as alive and is never removed by a false signal.
+ *  ponytail: orphans from a session that repeatedly CRASHES accumulate slowly under its hash prefix; an age-based reaper can
+ *  bound them later if it ever matters, but it must not be a probe-authorized unlink. */
+export async function openLivenessSocket(home: string, sessionId: string, _timeoutMs: number = PRESENCE_PROBE_MS): Promise<{ server: net.Server; path: string } | null> {
+  const nonce = randomBytes(4).toString("hex");
+  const sockPath = instanceSockPath(home, sessionId, nonce);
+  if (!sockPathFits(sockPath)) return null; // can't express this endpoint without truncation ⇒ relay-only
+  try {
+    const server = await new Promise<net.Server>((resolve, reject) => {
+      const srv = net.createServer((c) => c.destroy());
+      srv.once("error", reject);
+      srv.listen(sockPath, () => { srv.removeListener("error", reject); srv.on("error", () => { /* never crash on a socket error */ }); srv.unref?.(); resolve(srv); });
+    });
+    return { server, path: sockPath };
+  } catch { return null; } // a fresh random path should not be in use; any bind failure ⇒ relay-only, not a reclaim
 }
 
 /** Native sessionIds that have a presence pid file under <home>/.agenthop/presence/<id>.pid (for resolveSession). */

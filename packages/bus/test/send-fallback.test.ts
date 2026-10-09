@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "vitest";
 import net from "node:net";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fallbackForUnresolved, fallbackForMissedDelivery, resolveInboxTarget, isValidSessionId } from "../src/send-fallback.js";
-import { probeLivenessSock, claimLivenessSocket } from "../src/swarm/task-liveness.js";
+import { probeLivenessSock, probeSessionAlive, openLivenessSocket, sidSockPrefix, sockPathFits, instanceSockPath, MAX_SOCK_PATH_BYTES } from "../src/swarm/task-liveness.js";
 import type { UnifiedPeer, ResolveError } from "../src/resolve.js";
 
 const peer = (p: Partial<UnifiedPeer>): UnifiedPeer => ({ id: "run-1", tool: "claude", cwd: "/x", title: "t", via: "local", ...p });
@@ -118,39 +118,73 @@ describe("F45-R1 probeLivenessSock — a live LISTENER proves the current instan
   });
 });
 
-describe("F45-R7-P2-1 claimLivenessSocket — never unlink a LIVE listener (ruling: safe handover, no cross-delete)", () => {
+describe("F45-R7-P1-2 sid→socket is a bounded, collision-free mapping (no traversal, no truncation collision)", () => {
+  test("sidSockPrefix: 32 hex, stable per sid, distinct across sids — a traversal sid becomes pure hex (can't escape)", () => {
+    expect(sidSockPrefix("x")).toMatch(/^[0-9a-f]{32}$/);
+    expect(sidSockPrefix("x")).toBe(sidSockPrefix("x"));            // stable
+    expect(sidSockPrefix("a")).not.toBe(sidSockPrefix("b"));        // distinct
+    expect(sidSockPrefix("../bridge")).toMatch(/^[0-9a-f]{32}$/);   // no "/" or "." survives into the socket name
+    const a = "x".repeat(127) + "a", b = "x".repeat(127) + "b";     // the r8 truncation counterexample
+    expect(sidSockPrefix(a)).not.toBe(sidSockPrefix(b));            // two long sids ⇒ distinct prefixes ⇒ distinct sockets
+  });
+  test("sockPathFits: rejects a path over the sun_path bound (would silently truncate)", () => {
+    expect(sockPathFits("/tmp/ah/s.sock")).toBe(true);
+    expect(sockPathFits("/" + "x".repeat(MAX_SOCK_PATH_BYTES) + ".sock")).toBe(false);
+  });
+});
+
+describe("F45-R7 openLivenessSocket + probeSessionAlive — per-instance ownership, no cross-delete, no truncation collision", () => {
   const dirs: string[] = [];
   const servers: net.Server[] = [];
-  const mk = () => { const d = mkdtempSync(path.join(tmpdir(), "f45-claim-")); dirs.push(d); return d; };
+  // Short /tmp home: the socket path (home + .agenthop/presence/<32hex>.<nonce>.sock) must fit sun_path (~103), and macOS
+  // tmpdir() (/var/folders/.../T/) is already too long on its own — the same bound the fix enforces.
+  const mkHome = () => { const d = mkdtempSync(path.join("/tmp", "f45l-")); mkdirSync(path.join(d, ".agenthop", "presence"), { recursive: true }); dirs.push(d); return d; };
   afterEach(() => {
     for (const s of servers.splice(0)) { try { s.close(); } catch { /* noop */ } }
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   });
 
-  test("a FREE path ⇒ binds and listens (a probe then connects)", async () => {
-    const sock = path.join(mk(), "s.sock");
-    const srv = await claimLivenessSocket(sock, 300);
-    expect(srv).not.toBeNull();
-    if (srv) servers.push(srv);
-    expect(await probeLivenessSock(sock, 500)).toBe(true);
+  test("open ⇒ probeSessionAlive true; no socket ⇒ false (keep relay)", async () => {
+    const home = mkHome();
+    expect(await probeSessionAlive(home, "sid-A", 400)).toBe(false);
+    const res = await openLivenessSocket(home, "sid-A", 400);
+    expect(res).not.toBeNull();
+    if (res) servers.push(res.server);
+    expect(await probeSessionAlive(home, "sid-A", 400)).toBe(true);
   });
 
-  test("a DEAD stale FILE (no listener) ⇒ reclaimed: unlink + bind (probe then connects)", async () => {
-    const sock = path.join(mk(), "s.sock");
-    writeFileSync(sock, "leftover"); // a regular file left by a crashed daemon — not a live listener
-    const srv = await claimLivenessSocket(sock, 300);
-    expect(srv).not.toBeNull();
-    if (srv) servers.push(srv);
-    expect(await probeLivenessSock(sock, 500)).toBe(true);
+  test("P1-2: two DISTINCT 127-char sids do NOT collide — only the one that opened is alive (no kernel truncation match)", async () => {
+    const home = mkHome();
+    const a = "x".repeat(127) + "a", b = "x".repeat(127) + "b";
+    const res = await openLivenessSocket(home, a, 400);
+    expect(res).not.toBeNull();
+    if (res) { servers.push(res.server); expect(sockPathFits(res.path)).toBe(true); } // bounded hash name fits sun_path
+    expect(await probeSessionAlive(home, a, 400)).toBe(true);
+    expect(await probeSessionAlive(home, b, 400)).toBe(false); // distinct hash ⇒ no shared endpoint ⇒ no false durable
   });
 
-  test("a LIVE incumbent ⇒ DEFER (null) and the incumbent stays alive — its endpoint is NOT stolen", async () => {
-    const sock = path.join(mk(), "s.sock");
-    const incumbent = net.createServer((c) => c.destroy()); incumbent.on("error", () => {});
-    await new Promise<void>((r) => incumbent.listen(sock, r));
-    servers.push(incumbent);
-    const srv = await claimLivenessSocket(sock, 500);
-    expect(srv).toBeNull();                               // we deferred — did not take over a live listener
-    expect(await probeLivenessSock(sock, 500)).toBe(true); // the incumbent is still serving (not unlinked)
+  test("P2-1: two instances of the SAME sid own DISTINCT paths; closing one leaves the other alive (no cross-delete)", async () => {
+    const home = mkHome();
+    const r1 = await openLivenessSocket(home, "sid-S", 400);
+    const r2 = await openLivenessSocket(home, "sid-S", 400);
+    expect(r1).not.toBeNull(); expect(r2).not.toBeNull();
+    if (!r1 || !r2) return;
+    servers.push(r1.server, r2.server);
+    expect(r1.path).not.toBe(r2.path);                    // unique per-instance nonce paths
+    r1.server.close();                                     // the old instance exits — unlinks ONLY its own path
+    await new Promise((r) => setTimeout(r, 50));
+    expect(await probeSessionAlive(home, "sid-S", 400)).toBe(true); // r2 still serving (its path was not deleted)
+  });
+
+  test("P2-1: a DEAD orphan (stale file, no listener) is TOLERATED, not deleted — the live socket still answers", async () => {
+    const home = mkHome();
+    const deadPath = instanceSockPath(home, "sid-O", "deadbeef");
+    writeFileSync(deadPath, "leftover");                   // a crashed instance's leftover under the same sid prefix
+    const res = await openLivenessSocket(home, "sid-O", 400);
+    expect(res).not.toBeNull();
+    if (res) servers.push(res.server);
+    expect(await probeSessionAlive(home, "sid-O", 400)).toBe(true); // the live socket answers; the dead orphan is skipped
+    // NO probe-authorized delete (F45-R7-P2-1): the orphan is left on disk, never removed by a probe signal.
+    expect(() => rmSync(deadPath)).not.toThrow();          // still present ⇒ not swept
   });
 });

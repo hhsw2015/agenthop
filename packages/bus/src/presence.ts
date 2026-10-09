@@ -1,7 +1,9 @@
 import net from "node:net";
 import { rmSync, writeFileSync, utimesSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 import { startBusCore, type BusCoreOptions } from "./core.js";
-import { PRESENCE_HEARTBEAT_SEC, claimLivenessSocket } from "./swarm/task-liveness.js";
+import { PRESENCE_HEARTBEAT_SEC, openLivenessSocket } from "./swarm/task-liveness.js";
 import { dbg } from "./debug.js";
 
 /**
@@ -49,34 +51,36 @@ export function runPresence(opts: BusCoreOptions = {}): void {
   // being fresh; a stale mtime means the daemon is gone and the pid may be recycled, so the send path keeps relay rather
   // than a false local durable redirect. Keyed on the file's freshness (an active association), not on process start time
   // (whose 1s granularity let a same-second recycle masquerade as the original writer).
-  // F45-R1 (coordinator ruling B): a per-session LIVENESS SOCKET at presence/<sid>.sock. A live instance LISTENS; when it
-  // dies the kernel drops the listener, so a receiver's connect-probe is a WINDOW-FREE "is the current instance alive?" check
-  // (ownership — the mtime heartbeat below is only a sentinel-classification aid). The sock filename IS the sid (natural
-  // binding). F45-R7-P2-1: claimLivenessSocket NEVER unlinks a LIVE listener — if an incumbent of this sid is still serving
-  // (succession handoff overlap), we DEFER and retry on the next heartbeat tick, taking over only once it frees the path; a
-  // dead daemon's stale file is reclaimed. On shutdown we only server.close() (which unlinks OUR OWN path), so two instances
-  // never collide on one file and no instance ever deletes another's live endpoint.
-  const sockPath = pidFile ? pidFile.replace(/\.pid$/, ".sock") : null;
+  // F45-R1 (coordinator ruling B): a per-session LIVENESS SOCKET. A live instance LISTENS; when it dies the kernel drops the
+  // listener, so a receiver's connect-probe is a WINDOW-FREE "is the current instance alive?" check (ownership — the mtime
+  // heartbeat below is only a sentinel-classification aid). F45-R7 (rounds 7-9): the socket lives at
+  // `presence/<hash(sid)>.<nonce>.sock` — a BOUNDED hash of the sid (so a crafted/long sid can neither traverse nor truncate-
+  // collide, P1) plus a per-INSTANCE nonce (so each daemon owns a UNIQUE path; close() unlinks only its own, never another
+  // instance's — no shared path, no reclaim race, P2). We key by the pid-file's identity so the socket, the pid file, and the
+  // sender's probe all agree on the sid. openLivenessSocket binds a fresh unique path (no contention) and sweeps only
+  // definitely-dead orphans of this sid.
+  const home = opts.home ?? homedir();
+  const sockSid = pidFile ? path.basename(pidFile).replace(/\.pid$/, "") : (core.self.stableId ?? core.self.id);
   let sockServer: net.Server | null = null;
   let closing = false;
-  const claimSock = (): void => {
-    if (!sockPath || sockServer || closing) return;
-    void claimLivenessSocket(sockPath).then((srv) => {
-      if (!srv) return;                               // deferred (a live incumbent) or failed — retry on the next keepAlive tick
-      if (closing) { try { srv.close(); } catch { /* best effort */ } return; }
-      sockServer = srv;
+  const openSock = (): void => {
+    if (sockServer || closing) return;
+    void openLivenessSocket(home, sockSid).then((res) => {
+      if (!res) return;                                 // path too long (relay-only) or a transient bind failure — retry next tick
+      if (closing) { try { res.server.close(); } catch { /* best effort */ } return; }
+      sockServer = res.server;
     });
   };
 
   // Keep the process alive. The daemon is detached (its own session, no controlling terminal, stdio ignored), so a
   // ref'd timer is what holds the event loop open — a non-compiled bun/node script stays up on that alone. This timer
-  // ALSO HEARTBEATS the pid file's mtime (sentinel aux only — NOT ownership, which is the liveness socket) and (re)claims
-  // the liveness socket when we don't hold it (first start, or after a deferred incumbent dies and frees the path).
+  // ALSO HEARTBEATS the pid file's mtime (sentinel aux only — NOT ownership, which is the liveness socket) and (re)opens
+  // the liveness socket when we don't hold it (first start, or after a transient bind failure).
   const keepAlive = setInterval(() => {
     if (pidFile) { try { const t = new Date(); utimesSync(pidFile, t, t); } catch { /* best effort — the pid file may be gone on shutdown */ } }
-    claimSock();
+    openSock();
   }, PRESENCE_HEARTBEAT_SEC * 1000);
-  claimSock(); // claim immediately at startup; the keepAlive tick is only the retry/takeover path
+  openSock(); // open immediately at startup; the keepAlive tick is only the retry path
 
   const timers: Array<ReturnType<typeof setInterval>> = [keepAlive];
   const shutdown = (code = 0): void => {
