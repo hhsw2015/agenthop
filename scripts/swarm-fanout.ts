@@ -302,10 +302,22 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
           const r = await spawnAgent({ tool: "claude", task: promptOfRow(req, l.row), visible: false, ...(cwdOfRow(req, l.row) ? { cwd: cwdOfRow(req, l.row)! } : {}) }, { ...env, ANTHROPIC_MODEL: model, FANOUT_DEPTH: String(depth + 1) });
           l.row.spawnOk = r.ok;
           if (r.launchId !== undefined) l.row.id = r.launchId;
-          // FN9: bind the child's life to the lease. If the identity write FAILS the child is untracked (a bare lease is reaped
-          // on driver death while the child runs) -> UNDO the launch: despawn the child + fail the unit, so no executed slot
-          // outlives its binding. (Headless must undo post-spawn; visible is stopped pre-launch above.)
-          if (r.pid !== undefined) { l.row.pid = r.pid; if (!bindLeaseChild(lease, r.pid)) { await despawnAgent(l.row.id).catch(() => {}); l.row.status = "failed"; l.row.endedAt = Date.now(); releaseLease(lease); l.lease = null; } }
+          // FN9: record the child's identity so its slot survives the driver's exit (leaseOccupied: childAlive). The write can
+          // glitch — RETRY it; a tracked launch then proceeds normally. If it persistently cannot be persisted, UNDO the launch:
+          // release capacity ONLY after the child is CONFIRMED gone (despawn + verify the pid). A despawn that leaves the child
+          // alive must NOT delete the lease (that would free a slot with a live execution) — hold it + hand back loudly.
+          if (r.pid !== undefined) {
+            l.row.pid = r.pid;
+            let bound = bindLeaseChild(lease, r.pid);
+            for (let a = 0; a < 5 && !bound; a++) { await sleep(200); bound = bindLeaseChild(lease, r.pid); }
+            if (!bound) {
+              let dead = !pidAlive(r.pid);
+              for (let a = 0; a < 5 && !dead; a++) { await despawnAgent(l.row.id).catch(() => {}); await sleep(200); dead = !pidAlive(r.pid); }
+              l.row.status = "failed"; l.row.endedAt = Date.now();
+              if (dead) { releaseLease(lease); l.lease = null; } // child confirmed gone -> safe to free the slot
+              else console.error(`swarm-fanout: LEAKED slot — child pid ${r.pid} (launch ${l.row.id}) survived despawn AND its lease identity could not be persisted; lease HELD (never deleted under a live child), manual reap required`);
+            }
+          }
           if (r.outputFile !== undefined) l.row.outputPtr = r.outputFile;
           if (!r.ok) { l.row.status = "failed"; l.row.endedAt = Date.now(); } // FN8: launch failure keeps its reason immediately
           else if (r.pid === undefined) { l.row.status = "delivery_uncertain"; l.row.endedAt = Date.now(); } // FN2: launched but no handle -> quarantine, never re-run
