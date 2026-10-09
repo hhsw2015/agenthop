@@ -11,8 +11,9 @@
  */
 
 /** One item awaiting a verdict. `summary` is ONE line (the whole point); `suggestedAction` is the coordinator's recommended
- *  default; `evidenceRef` is a POINTER (path / url / handle), never inlined content (S18). `kind` groups it for the UI. */
-export type DecisionItem = { id: string; kind: string; summary: string; suggestedAction: string; evidenceRef?: string; foldedFrom?: string[] };
+ *  default; `evidenceRef` is a POINTER (path / url / handle), never inlined content (S18). `kind` groups it for the UI.
+ *  `hardGate` marks a spend/publish/irreversible item — a verdict on it may NEVER be remembered "always" (R16). */
+export type DecisionItem = { id: string; kind: string; summary: string; suggestedAction: string; evidenceRef?: string; foldedFrom?: string[]; hardGate?: boolean };
 
 /** A batch of items the owner (coordinator) asks the user to clear in one pass. */
 export type DecisionBatch = { batchId: string; owner: string; createdAtSec: number; items: DecisionItem[] };
@@ -21,8 +22,21 @@ export type DecisionBatch = { batchId: string; owner: string; createdAtSec: numb
 export type Verdict = "approve" | "reject" | "defer";
 export const VERDICTS: readonly Verdict[] = ["approve", "reject", "defer"];
 
-/** One decision the user made; `reason` is an optional one-line note. */
-export type Decision = { id: string; verdict: Verdict; reason?: string };
+/** The REMEMBERED scope of an approve verdict (borrowed from nanoMuse): just this once, this conversation, or always.
+ *  Shared by EVERY entry (console / TG / future PWA) so a decision means the same thing regardless of where it was made. */
+export type ApprovalScope = "once" | "this-chat" | "always";
+export const APPROVAL_SCOPES: readonly ApprovalScope[] = ["once", "this-chat", "always"];
+
+/** The scopes an entry may OFFER for an item. A HARD-gate item (spend / publish / irreversible) offers ONLY `once` — an
+ *  irreversible action is never blanket-remembered (R16: no standing auto-consent to the three gates). Pure; every entry
+ *  renders the SAME allowed set, so console and TG can never diverge on what "always" is permitted for. */
+export function allowedScopes(item: DecisionItem): ApprovalScope[] {
+  return item.hardGate ? ["once"] : ["once", "this-chat", "always"];
+}
+
+/** One decision the user made; `reason` is an optional one-line note. `scope` is the remembered scope of an approve verdict
+ *  (absent => "once"); it is dropped for reject/defer, and never honored as "always" on a hard-gate item (validated). */
+export type Decision = { id: string; verdict: Verdict; reason?: string; scope?: ApprovalScope };
 
 /** The user's decisions for a batch (written back by the console/CLI). */
 export type DecisionsDoc = { batchId: string; decidedAtSec: number; decisions: Decision[] };
@@ -52,10 +66,12 @@ export function validDecisionItem(raw: unknown): DecisionItem | null {
     }
     foldedFrom = ff;
   }
+  if (r.hardGate !== undefined && typeof r.hardGate !== "boolean") return null;
   return {
     id: r.id, kind: r.kind, summary: r.summary, suggestedAction: r.suggestedAction,
     ...(isStr(r.evidenceRef) ? { evidenceRef: r.evidenceRef } : {}),
     ...(foldedFrom !== undefined ? { foldedFrom } : {}),
+    ...(r.hardGate === true ? { hardGate: true } : {}),
   };
 }
 
@@ -85,7 +101,11 @@ export function validDecision(raw: unknown): Decision | null {
   if (!isNonEmptyStr(r.id)) return null;
   if (r.verdict !== "approve" && r.verdict !== "reject" && r.verdict !== "defer") return null;
   if (r.reason !== undefined && !isStr(r.reason)) return null;
-  return { id: r.id, verdict: r.verdict, ...(isStr(r.reason) ? { reason: r.reason } : {}) };
+  if (r.scope !== undefined && !APPROVAL_SCOPES.includes(r.scope as ApprovalScope)) return null;
+  // scope is meaningful ONLY on an approve verdict; dropped for reject/defer. (The hard-gate "never always" rule is enforced
+  // where the buttons are offered — allowedScopes — and re-checkable here by the consumer against the item's hardGate.)
+  const scope = r.verdict === "approve" && APPROVAL_SCOPES.includes(r.scope as ApprovalScope) ? (r.scope as ApprovalScope) : undefined;
+  return { id: r.id, verdict: r.verdict, ...(isStr(r.reason) ? { reason: r.reason } : {}), ...(scope ? { scope } : {}) };
 }
 
 /** Validate a parsed decisions doc: batchId non-empty, decidedAtSec finite, decisions an array of valid decisions (a torn /
@@ -110,7 +130,55 @@ export function buildBatch(i: { batchId: string; owner: string; items: DecisionI
   return { batchId: i.batchId, owner: i.owner, createdAtSec: i.nowSec, items: i.items };
 }
 
-export type ResolvedDecision = { item: DecisionItem; verdict: Verdict; reason?: string };
+export type ResolvedDecision = { item: DecisionItem; verdict: Verdict; reason?: string; scope?: ApprovalScope };
+
+/** TG-P1-1: ENFORCE the scope against the REAL item (not the UI buttons). scope is meaningful only on `approve`; a scope not
+ *  in `allowedScopes(item)` is clamped to `once` (the safe floor) — so a hard-gate item can NEVER record a `this-chat`/`always`
+ *  grant even if a client (TG or console) writes one. Pure; applied at BOTH write (recordDecision) and resolve, so the UI is
+ *  never the permission boundary. */
+export function enforceScope(item: DecisionItem, d: Decision): Decision {
+  if (d.verdict !== "approve") { const { scope: _drop, ...rest } = d; return rest; }
+  const scope: ApprovalScope = allowedScopes(item).includes(d.scope ?? "once") ? (d.scope ?? "once") : "once";
+  return { ...d, scope };
+}
+
+/** TG-P1-2: merge ONE decision into the batch's decisions doc, PRESERVING every other item's decision (writeDecisions is a
+ *  full-snapshot replace, so a single-item update must merge, not overwrite). Upsert by id (a re-tap of the same item updates
+ *  it); a doc for a different batchId is treated as absent (never cross-contaminate). Pure; the store does the atomic read-
+ *  merge-write under a lock so concurrent taps cannot lose a sibling. */
+export function upsertDecision(existing: DecisionsDoc | null, batchId: string, decision: Decision, nowSec: number): DecisionsDoc {
+  const kept = existing && existing.batchId === batchId ? existing.decisions.filter((d) => d.id !== decision.id) : [];
+  return { batchId, decidedAtSec: nowSec, decisions: [...kept, decision] };
+}
+
+/** TG-P1-2 (round 3): FOLD many decision docs for one batch into one effective ledger, UNION by id, LATEST-per-id wins. The
+ *  store writes one file per entry tap (plus the console's full-snapshot decisions.json and a recoverable claim), so no single
+ *  writer ever read-merge-overwrites a shared file and loses a sibling. Callers pass docs in [snapshot, ...taps] order; a
+ *  decision from a doc with an EQUAL-OR-GREATER decidedAtSec supersedes an earlier one (so a tap wins an equal-second tie over
+ *  the console snapshot — a targeted single-item action is the more recent intent). Only docs bound to `batchId` count; returns
+ *  null when there is nothing to fold (no snapshot, no taps). Pure. */
+/** A publish's TYPE in the slot ledger: a console full-snapshot (the complete decision set — REPLACES prior state) vs a
+ *  single-item entry tap (an incremental update — MERGES, preserving untouched items). TG-R6-P1-1. */
+export type SlotKind = "snapshot" | "tap";
+
+export function foldDecisionDocs(entries: { doc: DecisionsDoc; order: bigint; kind: SlotKind }[], batchId: string): DecisionsDoc | null {
+  const bound = entries.filter((e) => e.doc.batchId === batchId);
+  if (bound.length === 0) return null;
+  // Fold by PUBLISH ORDER (the immutable slot number) PRESERVING publish SEMANTICS (TG-R6-P1-1): a "snapshot" (a console full
+  // clear) REPLACES all prior decisions — a later snapshot that omits an item un-decides it (baseline parity), an empty snapshot
+  // clears everything; a "tap" (a single-item entry) MERGES, preserving untouched items. So the effective state is the LATEST
+  // snapshot's items plus every tap published after it. Order ties (same slot — impossible for real slots) break by decidedAtSec.
+  const sorted = [...bound].sort((a, b) =>
+    a.order < b.order ? -1 : a.order > b.order ? 1 : a.doc.decidedAtSec - b.doc.decidedAtSec);
+  const latest = new Map<string, Decision>();
+  let maxTs = 0;
+  for (const { doc, kind } of sorted) {
+    maxTs = Math.max(maxTs, doc.decidedAtSec);
+    if (kind === "snapshot") latest.clear(); // a full snapshot replaces all prior decisions (new snapshot supersedes old)
+    for (const d of doc.decisions) latest.set(d.id, d); // snapshot sets its items; tap upserts its one item
+  }
+  return { batchId, decidedAtSec: maxTs, decisions: [...latest.values()] };
+}
 
 /**
  * Match the user's decisions onto the batch. Returns:
@@ -134,7 +202,8 @@ export function resolveBatch(batch: DecisionBatch, doc: DecisionsDoc): { resolve
     if (!item) { unknownIds.push(d.id); continue; }
     if (decidedIds.has(d.id)) continue; // a duplicate decision for the same id — first wins, rest ignored
     decidedIds.add(d.id);
-    resolved.push({ item, verdict: d.verdict, ...(d.reason !== undefined ? { reason: d.reason } : {}) });
+    const e = enforceScope(item, d); // TG-P1-1: clamp an out-of-policy scope against the REAL item before it is acted on
+    resolved.push({ item, verdict: e.verdict, ...(e.reason !== undefined ? { reason: e.reason } : {}), ...(e.scope !== undefined ? { scope: e.scope } : {}) });
   }
   const undecided = batch.items.filter((it) => !decidedIds.has(it.id));
   return { resolved, undecided, unknownIds };
