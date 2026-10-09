@@ -104,6 +104,43 @@ export function classifyBlockedEscalation(onRoster: boolean): BlockedRoute {
   return onRoster ? "escalate" : "escalate-once";
 }
 
+/**
+ * F44-⑩ — platform content-filter anchors. When a member/reviewer's agent hits a PLATFORM content-moderation block, the
+ * screen shows a fixed vendor string (e.g. codex: "This content can't be shown … Daybreak"); the agent is stuck but it is
+ * NOT a user-approval decision — the fix is to reword the prompt and retry. Anchors are matched against the (ANSI-stripped)
+ * screen after lowercasing + folding typographic apostrophes/quotes to ASCII. CONSERVATIVE by design (same discipline as
+ * isValidInboxKey): a FALSE POSITIVE would downgrade a genuine blocked-decision to a "just retry" notice and MASK a real
+ * approval, so only CONFIRMED vendor strings go here. Extensible — add a vendor's string when a real screen is captured
+ * (never guess: an unconfirmed anchor risks masking a real block). Each anchor is pre-normalized (lowercase + ASCII apostrophe). */
+export const CONTENT_FILTER_ANCHORS: readonly string[] = [
+  "content can't be shown", // codex platform content filter ("This content can't be shown … Daybreak"), observed 2026-10-09
+];
+
+/** Normalize a screen for anchor matching: lowercase + fold typographic apostrophes/quotes to ASCII (a herdr-read screen may
+ *  carry either form), so an anchor need only be written once in ASCII lowercase. Pure. */
+function normalizeScreenText(s: string): string {
+  return s.replace(/[‘’ʼ]/g, "'").replace(/[“”]/g, '"').toLowerCase();
+}
+
+/** F44-⑩ — does the screen show a KNOWN platform content-filter block? Own-anchor substring match on the normalized screen;
+ *  a non-string or empty screen is never a filter (no evidence ⇒ false). Pure, no IO. */
+export function screenIndicatesContentFilter(screen: unknown): boolean {
+  if (typeof screen !== "string" || screen.length === 0) return false;
+  const norm = normalizeScreenText(screen);
+  for (let i = 0; i < CONTENT_FILTER_ANCHORS.length; i += 1) if (norm.includes(CONTENT_FILTER_ANCHORS[i]!)) return true;
+  return false;
+}
+
+export type BlockedScreenKind = "content-filter" | "generic";
+
+/**
+ * F44-⑩ — sub-classify an escalate-worthy blocked SCREEN. "content-filter" ⇒ a platform moderation block: report a
+ * reword-and-retry SUGGESTION to the coordinator, NOT an S19 user-approval (no human decision is owed; the member just needs
+ * its prompt reworded). "generic" ⇒ the existing path (an approval the authorized party must adjudicate). Pure. */
+export function classifyBlockedScreen(screen: unknown): BlockedScreenKind {
+  return screenIndicatesContentFilter(screen) ? "content-filter" : "generic";
+}
+
 export type ProcInfo = { pid: number; ppid: number; command: string };
 
 /** Parse `ps -axo pid=,ppid=,command=` output into {pid, ppid, command}. Pure; malformed lines are skipped. */
