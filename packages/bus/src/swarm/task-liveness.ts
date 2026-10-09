@@ -90,11 +90,13 @@ export function makeFileLiveness(home: string): LivenessIO {
   };
 }
 
-/** F45-P1-2: the argv (command line) of a live pid, via `ps`, or null if unavailable. Used to CORRELATE a presence pid to
- *  a session's current instance (its argv carries the sid) — a bare signal-0 "alive" can be a recycled, unrelated pid.
- *  Rare path (only a same-machine relay peer), so a synchronous `ps` is acceptable; any failure ⇒ null (keep relay). */
-export function readPidArgv(pid: number): string | null {
+/** F45-P1-2: the ENVIRONMENT of a live pid (whitespace-joined KEY=VALUE), via `ps eww`, or null if unavailable. Used to
+ *  CORRELATE a presence pid to a session's current instance by the identity the launcher passes in the env
+ *  (AGENTHOP_PID_FILE / CLAUDE_CODE_SESSION_ID) — a bare signal-0 "alive" can be a recycled, unrelated pid, and the
+ *  daemon's ARGV carries no sid. Rare path (only a same-machine relay peer), so a synchronous `ps` is acceptable; any
+ *  failure ⇒ null (keep relay). `ps eww` prints the command followed by the environment for OUR own processes. */
+export function readPidEnv(pid: number): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  try { return execFileSync("ps", ["-p", String(pid), "-o", "args="], { encoding: "utf8", timeout: 4000 }).trim() || null; }
+  try { return execFileSync("ps", ["eww", "-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 4000 }).trim() || null; }
   catch { return null; }
 }

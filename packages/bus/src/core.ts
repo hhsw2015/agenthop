@@ -10,8 +10,8 @@ import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
-import { resolveInboxTarget, relaySameMachineSid, argvBoundToSid } from "./send-fallback.js";
-import { resolveSession, listSessions, fileIsAlive, makeFileLiveness, readPidArgv } from "./swarm/task-liveness.js";
+import { resolveInboxTarget, relaySameMachineSid, presenceEnvOwnsSid } from "./send-fallback.js";
+import { resolveSession, listSessions, fileIsAlive, makeFileLiveness, readPidEnv } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -428,13 +428,14 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       const sessionList = listSessions(home);
       const liveness = makeFileLiveness(home);
       // F45 ③ (P1-2 hardened): a relay-resolved peer is cross-BROKER, not necessarily cross-MACHINE. Route durable to it ONLY
-      // if its OWN full sid owns a presence pid that is (a) alive AND (b) a process whose argv carries the sid — proof it is
-      // THIS peer's current local instance, not a recycled/unrelated pid behind a stale presence file. Unproven ⇒ keep relay
-      // (never silently redirect a remote peer to a local inbox nobody drains).
+      // if its OWN full sid owns a presence pid that is (a) alive AND (b) a process whose ENVIRONMENT carries the launcher's
+      // identity for THIS sid (AGENTHOP_PID_FILE=.../<sid>.pid or CLAUDE_CODE_SESSION_ID=<sid>) — proof it is this peer's
+      // current local presence daemon, not a recycled/unrelated pid behind a stale file (the daemon's argv has no sid; a
+      // plain-argument sid on an unrelated process is not identity). Unproven ⇒ keep relay (never a false durable).
       const isLocalInstance = (sid: string): boolean => {
-        if (fileIsAlive(sid, liveness) !== "alive") return false;     // (a) a live pid in presence/<sid>.pid
+        if (fileIsAlive(sid, liveness) !== "alive") return false;      // (a) a live pid in presence/<sid>.pid
         const pid = liveness.readPid(sid);
-        return pid != null && argvBoundToSid(readPidArgv(pid), sid);   // (b) that pid's process is bound to THIS sid (not pid-reuse)
+        return pid != null && presenceEnvOwnsSid(readPidEnv(pid), sid); // (b) that pid's ENV proves it owns THIS sid (not pid-reuse)
       };
       const relayLocalSid = !("error" in resolvedPeer) ? relaySameMachineSid(resolvedPeer, isLocalInstance) : null;
       const target = resolveInboxTarget(to, resolvedPeer, resolveSession(to, sessionList), relayLocalSid);

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { fallbackForUnresolved, fallbackForMissedDelivery, resolveInboxTarget, relaySameMachineSid, argvBoundToSid } from "../src/send-fallback.js";
+import { fallbackForUnresolved, fallbackForMissedDelivery, resolveInboxTarget, relaySameMachineSid, presenceEnvOwnsSid } from "../src/send-fallback.js";
 import type { UnifiedPeer, ResolveError } from "../src/resolve.js";
 
 const peer = (p: Partial<UnifiedPeer>): UnifiedPeer => ({ id: "run-1", tool: "claude", cwd: "/x", title: "t", via: "local", ...p });
@@ -72,20 +72,23 @@ describe("F45-P1-2 relaySameMachineSid — a live pid is not proof; the instance
     expect(relaySameMachineSid(relayPeer(undefined), () => true)).toBeNull();
   });
 
-  // argvBoundToSid: the correlation the IO adds on top of signal-0 (a recycled pid's argv won't carry the sid).
-  test("argv carrying the sid as a token ⇒ bound (resumed session)", () => {
-    expect(argvBoundToSid("codex resume 01a0ff49-7a50", "01a0ff49-7a50")).toBe(true);
-    expect(argvBoundToSid("claude --resume fe0376cd", "fe0376cd")).toBe(true);
+  // presenceEnvOwnsSid: the correlation the IO adds on top of signal-0 — the daemon's ENV, not argv (F45-P1-2 round-4).
+  test("env with AGENTHOP_PID_FILE=.../<sid>.pid ⇒ owns the sid (the real presence daemon)", () => {
+    expect(presenceEnvOwnsSid("node /h/.agenthop/presence.mjs AGENTHOP_PID_FILE=/h/.agenthop/presence/fe0376cd.pid AGENTHOP_HOST_PID=42", "fe0376cd")).toBe(true);
   });
-  test("argv WITHOUT the sid ⇒ not bound (recycled/unrelated pid)", () => {
-    expect(argvBoundToSid("node /some/unrelated/worker.js", "fe0376cd")).toBe(false);
+  test("env with CLAUDE_CODE_SESSION_ID=<sid> ⇒ owns the sid", () => {
+    expect(presenceEnvOwnsSid("node presence.mjs CLAUDE_CODE_SESSION_ID=fe0376cd", "fe0376cd")).toBe(true);
   });
-  test("sid only as a SUBSTRING (not a whole token) ⇒ not bound", () => {
-    expect(argvBoundToSid("claude --resume fe0376cdEXTRA", "fe0376cd")).toBe(false);
+  test("unrelated process carrying the sid as a plain ARG ⇒ NOT owned (argv is not identity)", () => {
+    expect(presenceEnvOwnsSid("node worker.js --diagnostic-for fe0376cd", "fe0376cd")).toBe(false);
+    expect(presenceEnvOwnsSid("node fe0376cd-tool.js", "fe0376cd")).toBe(false);
   });
-  test("null/empty argv ⇒ not bound (unverifiable ⇒ keep relay)", () => {
-    expect(argvBoundToSid(null, "fe0376cd")).toBe(false);
-    expect(argvBoundToSid("", "fe0376cd")).toBe(false);
+  test("AGENTHOP_PID_FILE for a DIFFERENT sid ⇒ not owned", () => {
+    expect(presenceEnvOwnsSid("node presence.mjs AGENTHOP_PID_FILE=/h/.agenthop/presence/OTHER.pid", "fe0376cd")).toBe(false);
+  });
+  test("null/empty env ⇒ not owned (unverifiable ⇒ keep relay)", () => {
+    expect(presenceEnvOwnsSid(null, "fe0376cd")).toBe(false);
+    expect(presenceEnvOwnsSid("", "fe0376cd")).toBe(false);
   });
 
   test("UNRESOLVED no-match + an offline presence sid ⇒ durable to THAT sid (label = the address); no sid ⇒ none", () => {

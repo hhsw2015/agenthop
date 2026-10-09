@@ -89,13 +89,34 @@ export function provesContinuity(att: Attestation, inc: IncumbentBinding): boole
   return resumeBinds || paneBinds || sidBinds;
 }
 
-/** F45-P1-1: extract the EXACT resume-target sid from a real argv array (the OS-tokenized command — no quoting ambiguity):
- *  the token after `--resume` (claude) or the `resume` subcommand (codex). The FIRST such token wins; a sid appearing
- *  elsewhere (a quoted arg, body text) is NOT a resume target. null when absent. This is the verified structured credential
- *  the IO feeds into `Attestation.resumeTargetSid`. Pure. */
+/** claude long-options that CONSUME the following token as their value — so that value (even one that looks like `--resume`
+ *  or `resume`) is never mistaken for the resume flag/target (F45-P1-1 round-4: "skip value-taking options"). `--resume`
+ *  itself is handled explicitly before this set is consulted. Version-dependent; `--resume=<sid>` inline is always safe. */
+const CLAUDE_VALUE_FLAGS = new Set([
+  "--model", "--fallback-model", "--append-system-prompt", "--system-prompt", "--permission-mode", "--permission-prompt-tool",
+  "--allowedTools", "--disallowedTools", "--add-dir", "--mcp-config", "--settings", "--setting-sources", "--session-id",
+  "--agents", "--input-format", "--output-format",
+]);
+
+/** F45-P1-1 (round-4): extract the EXACT resume-target sid from a real argv array, TOOL- and POSITION-aware.
+ *  - codex: the `resume` SUBCOMMAND must be EXACTLY argv[1] (`codex resume <sid>`) ⇒ target argv[2]. A later bare "resume"
+ *    (an option value) is not the subcommand.
+ *  - claude: a POSITION-CORRECT `--resume <sid>` / `--resume=<sid>` found by a left-to-right scan that STOPS at `--` (end of
+ *    options) and SKIPS each value-option's value — so `--append-system-prompt resume <sid>`, `-- --resume <sid>`, and a
+ *    value that merely looks like `--resume` are NOT taken as targets.
+ *  Anything unprovable ⇒ null ⇒ no resume binding (continuity then needs sidBinds / an inherited pane). Pure. */
 export function parseResumeTargetFromArgv(argv: readonly string[]): string | null {
-  for (let i = 0; i < argv.length - 1; i++) {
-    if (argv[i] === "--resume" || argv[i] === "resume") return argv[i + 1] || null;
+  if (argv.length < 2) return null;
+  const tool = (argv[0].split("/").pop() || argv[0]).toLowerCase();
+  if (tool.includes("codex")) {
+    return argv[1] === "resume" && argv.length >= 3 && argv[2] && !argv[2].startsWith("-") ? argv[2] : null;
+  }
+  for (let i = 1; i < argv.length; i++) {
+    const tok = argv[i];
+    if (tok === "--") break;                                                     // end of options — nothing after is a flag
+    if (tok === "--resume") { const v = argv[i + 1]; return v && !v.startsWith("-") ? v : null; }
+    if (tok.startsWith("--resume=")) { const v = tok.slice("--resume=".length); return v || null; }
+    if (CLAUDE_VALUE_FLAGS.has(tok)) i++;                                        // skip this option's VALUE (not a flag/positional)
   }
   return null;
 }

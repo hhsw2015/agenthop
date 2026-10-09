@@ -29,12 +29,19 @@ t("paneBinds (inherited pane recorded for this sid) -> true", provesContinuity(a
 t("pane disagree (both known) -> false", provesContinuity(att({ resumeTargetSid: undefined, herdrPane: "p1", newNativeSid: "new-sid" }), inc({ recordedHerdrPane: "p2" })) === false);
 t("pane known one side only -> not a conflict (resume target still binds)", provesContinuity(att({ herdrPane: "p1" }), inc({ recordedHerdrPane: null })) === true);
 
-// --- parseResumeTargetFromArgv: structured extraction from a real argv array ---
+// --- parseResumeTargetFromArgv: tool- and position-aware structured extraction (round-4) ---
 t("argv: claude --resume <sid>", parseResumeTargetFromArgv(["claude", "--resume", "fe0376cd"]) === "fe0376cd");
-t("argv: codex resume <sid>", parseResumeTargetFromArgv(["codex", "resume", "01a0ff49"]) === "01a0ff49");
+t("argv: claude --resume=<sid> inline", parseResumeTargetFromArgv(["claude", "--resume=fe0376cd"]) === "fe0376cd");
+t("argv: claude --resume after a value-option", parseResumeTargetFromArgv(["claude", "--model", "x", "--resume", "fe0376cd"]) === "fe0376cd");
+t("argv: codex resume <sid> (subcommand at argv[1])", parseResumeTargetFromArgv(["codex", "resume", "01a0ff49"]) === "01a0ff49");
 t("argv: no resume -> null", parseResumeTargetFromArgv(["claude", "--flag", "x"]) === null);
-t("argv: FIRST resume wins", parseResumeTargetFromArgv(["claude", "--resume", "A", "--resume", "B"]) === "A");
-t("argv: a sid inside another arg's value is NOT a target", parseResumeTargetFromArgv(["claude", "--resume", "A", "--append", "note --resume B"]) === "A");
+// P1-1 round-3 counterexamples
+t("argv: option VALUE 'resume' is NOT a target", parseResumeTargetFromArgv(["claude", "--append-system-prompt", "resume", "fe0376cd"]) === null);
+t("argv: '--resume' AFTER -- is positional, not a flag", parseResumeTargetFromArgv(["claude", "--", "--resume", "fe0376cd"]) === null);
+t("argv: a value that looks like --resume is skipped (value-option)", parseResumeTargetFromArgv(["claude", "--append-system-prompt", "--resume", "fe0376cd"]) === null);
+t("argv: codex with a flag before resume -> null (not position-exact)", parseResumeTargetFromArgv(["codex", "--flag", "resume", "sid"]) === null);
+t("argv: codex resume with a dash target -> null", parseResumeTargetFromArgv(["codex", "resume", "--x"]) === null);
+t("argv: FIRST --resume wins", parseResumeTargetFromArgv(["claude", "--resume", "A", "--resume", "B"]) === "A");
 t("argv: trailing --resume with no value -> null", parseResumeTargetFromArgv(["claude", "--resume"]) === null);
 
 // --- successionVerdict: fail-closed ---

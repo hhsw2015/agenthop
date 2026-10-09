@@ -63,13 +63,19 @@ export function relaySameMachineSid(peer: UnifiedPeer, isLocalInstance: (sid: st
   return isLocalInstance(peer.stableId) ? peer.stableId : null;
 }
 
-/** F45-P1-2: a live pid belongs to session `sid`'s CURRENT instance only if the process's argv carries the sid as a token
- *  — a resumed session's `--resume <sid>` / `resume <sid>`. A bare alive pid does not prove ownership (pid reuse), so this
- *  is the correlation the IO must add on top of signal-0. null/empty argv ⇒ false (unverifiable ⇒ keep relay, never a false
- *  durable). Pure. */
-export function argvBoundToSid(argv: string | null | undefined, sid: string): boolean {
-  if (!argv || !sid) return false;
-  return argv.split(/\s+/).includes(sid);
+/** F45-P1-2 (round-4): a live presence pid belongs to session `sid`'s CURRENT instance only if THAT PROCESS'S ENVIRONMENT
+ *  carries the identity the launcher passes — NOT its argv (an unrelated process can carry the sid as a plain argument; the
+ *  real presence DAEMON's argv is just `node presence.mjs` and has no sid). The daemon (agents.ts presenceStartCommand /
+ *  presence.ts) is launched with `AGENTHOP_PID_FILE=.../<sid>.pid` and inherits `CLAUDE_CODE_SESSION_ID=<sid>`. So ownership
+ *  is proven iff the env has `AGENTHOP_PID_FILE=<…>/<sid>.pid` OR `CLAUDE_CODE_SESSION_ID=<sid>`. A recycled/unrelated pid
+ *  has neither ⇒ false ⇒ keep relay (never a false durable); the real daemon has them ⇒ its same-machine inbox is used.
+ *  `envText` is a whitespace-joined `KEY=VALUE` dump (e.g. `ps eww`); null/empty ⇒ false. Pure. */
+export function presenceEnvOwnsSid(envText: string | null | undefined, sid: string): boolean {
+  if (!envText || !sid) return false;
+  const toks = envText.split(/\s+/);
+  if (toks.includes(`CLAUDE_CODE_SESSION_ID=${sid}`)) return true;
+  for (const t of toks) if (t.startsWith("AGENTHOP_PID_FILE=") && t.endsWith(`/${sid}.pid`)) return true;
+  return false;
 }
 
 export function resolveInboxTarget(to: string, resolved: UnifiedPeer | ResolveError, offlineSid: string | null, relayLocalSid: string | null = null): InboxTarget {
