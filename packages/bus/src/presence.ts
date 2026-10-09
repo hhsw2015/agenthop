@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { startBusCore, type BusCore, type BusCoreOptions } from "./core.js";
 import { PRESENCE_HEARTBEAT_SEC, openLivenessSocket } from "./swarm/task-liveness.js";
+import { successionEnabled, runSuccessionAtStartup } from "./swarm/shell-succession.js";
 import { dbg } from "./debug.js";
 
 /**
@@ -93,6 +94,17 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
   const core = startBusCore({ ...opts, onIdentityChange: (self) => syncSidFor(self.stableId ?? self.id) });
   if (!fixedSid) sockSid = core.self.stableId ?? core.self.id; // initial sid from the core (the per-run id until a late adopt)
   dbg(`presence up: ${core.self.title} (tool=${core.self.tool} stable=${core.self.stableId ?? "-"})`);
+
+  // F45 ① (SWARM_SUCCESSION): a restarted shell proving it continues a stable identity may re-take that identity's presence
+  // slot + durable-inbox scan instead of coming up a stranger. DORMANT by default (flag off ⇒ skipped entirely). On "adopt"
+  // the pid slot is taken over inside runSuccessionAtStartup; core.adoptStableId then drains that sid's inbox ("扫箱") and
+  // rebinds the liveness socket (via onIdentityChange) so resolveSession(stableSid) finds this instance. Fail-soft.
+  if (successionEnabled()) {
+    try {
+      const adopted = runSuccessionAtStartup(home, core.self.tool, core.self.stableId ?? core.self.id, dbg);
+      if (adopted) core.adoptStableId(adopted);
+    } catch (e) { dbg(`succession startup failed (ignored): ${e instanceof Error ? e.message : e}`); }
+  }
 
   // Keep the process alive (a ref'd timer holds the detached loop open — a non-compiled bun/node script stays up on that alone).
   // Heartbeat the pid file's mtime (sentinel aux only — NOT ownership, which is the liveness socket), re-sync the sid defensively

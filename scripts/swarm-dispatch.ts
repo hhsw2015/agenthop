@@ -58,7 +58,9 @@ import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys,
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
-import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
+import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrSendKeys, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
+import { coordinatorReportPlan, coordEscalateEnabled, type ReportSeverity } from "../packages/bus/src/swarm/coordinator-report.js";
+import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
@@ -803,7 +805,7 @@ async function main(): Promise<void> {
   // defect — a declared log-only mode); "failed" = routable but the inbox write errored (transient ⇒ the caller holds the
   // snapshot + retries so the event is not lost — review P2-2).
   const notifySent = new Map<string, number>(); // dedup: (taskRef\0text) -> last-sent ms; suppress an identical re-send within NOTIFY_DEDUP_MS
-  const notifyCoordinator = (text: string, opts: { taskRef?: string; title?: string } = {}): "delivered" | "logged" | "failed" | "deduped" => {
+  const notifyCoordinator = (text: string, opts: { taskRef?: string; title?: string; severity?: ReportSeverity } = {}): "delivered" | "logged" | "failed" | "deduped" => {
     const now = Date.now();
     for (const [k, t] of notifySent) if (now - t >= NOTIFY_DEDUP_MS) notifySent.delete(k); // prune expired (bounds the map)
     const key = `${opts.taskRef ?? ""}\u0000${text}`;
@@ -815,6 +817,31 @@ async function main(): Promise<void> {
         try { writeInbox(HOME, sid, { from: SELF, fromLabel: "swarm-observer", ...s11, text, via: "local", ts: now }); notifySent.set(key, now); return "delivered"; }
         catch (e) { log(`observer notify write failed (transient) — will retry: ${e instanceof Error ? e.message : e}`); return "failed"; } // not recorded ⇒ retry not suppressed
       }
+    }
+    // F45 ② (SWARM_COORD_ESCALATE): the coordinator is UNRESOLVED (unset, or no live presence binding — the DEAF-coordinator
+    // incident). A log is NOT a report. When the flag is ON, route the notice by coordinatorReportPlan to a REAL surface instead
+    // of only logging. DORMANT by default (flag off ⇒ the plain log below, unchanged behavior). notifyCoordinator is sync, so the
+    // async herdr-pane probe/send run fire-and-forget (best-effort — coordinatorReportPlan's isReport is a ROUTING decision, not a
+    // delivery receipt). An S19 incident is a DURABLE write to the coordinator's STABLE inbox (survives the presence gap); a real
+    // escalation records dedup (so repeated identical notices don't spam), a degraded/failed one does NOT (so recovery re-delivers).
+    if (coordEscalateEnabled()) {
+      const coordSid = COORDINATOR;
+      const s19Available = coordSid !== "" && isValidSessionId(coordSid); // can key a durable S19 incident to the stable inbox
+      void (async () => {
+        const paneId = coordSid !== "" ? await herdrPaneIdForSession(coordSid).catch(() => null) : null;
+        const plan = coordinatorReportPlan({ coordinatorResolved: false, s19Available, herdrPaneAvailable: paneId !== null, severity: opts.severity ?? "stall" });
+        if (plan.surface === "s19") {
+          try { writeInbox(HOME, coordSid, { from: SELF, fromLabel: "swarm-observer", ...s11, text: `[S19 incident] ${text}`, via: "local", ts: Date.now() }); notifySent.set(key, Date.now()); log(`[observer→coordinator] escalated to S19 durable incident (coordinator unresolved): ${text}`); }
+          catch (e) { log(`[observer→coordinator] S19 escalation write FAILED — UNHEARD: ${e instanceof Error ? e.message : e}`); } // no dedup ⇒ retried
+        } else if (plan.surface === "herdr-pane" && paneId) {
+          const r = await herdrSendKeys(paneId, [text]).catch(() => ({ ok: false, note: "send threw" }));
+          if (r.ok) { notifySent.set(key, Date.now()); log(`[observer→coordinator] escalated to herdr pane ${paneId}: ${text}`); }
+          else log(`[observer→coordinator] herdr-pane escalation FAILED (${r.note}) — UNHEARD: ${text}`); // no dedup ⇒ retried
+        } else {
+          log(`[observer→coordinator] UNHEARD — no reporting surface available (coordinator unresolved): ${text}`); // plan=log, isReport=false
+        }
+      })();
+      return "logged"; // sync contract unchanged; the real escalation is best-effort in flight
     }
     log(`[observer→coordinator] ${text}${COORDINATOR === "" ? " (SWARM_COORDINATOR unset — logged)" : " (coordinator unresolved — logged)"}`);
     // Do NOT record dedup on the log-only path (AS-P2-3): nothing was delivered to the inbox, so an identical notice that

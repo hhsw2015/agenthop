@@ -1,4 +1,5 @@
-import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, presencePidRelPath, type Attestation, type IncumbentBinding } from "./shell-succession.js";
+import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, presencePidRelPath, planSuccession, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
+import type { RosterMember } from "./resume.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
@@ -58,5 +59,21 @@ t("adopt with no recorded mintedId -> mintedId null (not invented)", successionV
 
 // --- path helper ---
 t("presence pid rel path", presencePidRelPath("fe0376cd") === "presence/fe0376cd.pid");
+
+// --- planSuccession: roster-snapshot candidate selection + verdict (F45 ① consumption-point core) ---
+const mem = (o: Partial<RosterMember> = {}): RosterMember => ({ member: "fe0376cd", tool: "claude", cwd: "/w", role: null, resumeCmd: "claude --resume fe0376cd", ...o });
+const deadInc: (s: string) => IncumbentLiveness = () => ({ pid: 100, liveness: "dead" });
+const aliveInc: (s: string) => IncumbentLiveness = () => ({ pid: 100, liveness: "alive" });
+t("plan: no roster members -> fresh", planSuccession(att(), [], deadInc).action === "fresh");
+t("plan: candidate == own native sid is EXCLUDED (nothing to adopt) -> fresh", planSuccession(att({ newNativeSid: "fe0376cd" }), [mem({ member: "fe0376cd" })], deadInc).action === "fresh");
+t("plan: tool mismatch -> no candidate -> fresh", planSuccession(att({ tool: "codex" }), [mem({ tool: "claude" })], deadInc).action === "fresh");
+t("plan: cwd mismatch -> no candidate -> fresh", planSuccession(att({ cwd: "/other" }), [mem({ cwd: "/w" })], deadInc).action === "fresh");
+t("plan: match + resume-target credential + dead incumbent -> ADOPT (machinery works with a credential)", (() => {
+  const r = planSuccession(att({ resumeTargetSid: "fe0376cd", newNativeSid: "new-sid" }), [mem({ member: "fe0376cd" })], deadInc);
+  return r.action === "adopt" && r.rebind?.stableSid === "fe0376cd" && r.rebind?.pid === 200 && r.rebind?.mintedId === null; // snapshot carries no mintedId
+})());
+t("plan: match but LIVE incumbent -> reject (never steal a live slot)", planSuccession(att({ resumeTargetSid: "fe0376cd", newNativeSid: "new-sid" }), [mem({ member: "fe0376cd" })], aliveInc).action === "reject");
+t("plan: match but NO binding credential (presence caveat) -> fresh", planSuccession(att({ resumeTargetSid: undefined, herdrPane: undefined, newNativeSid: "new-sid" }), [mem({ member: "fe0376cd" })], deadInc).action === "fresh");
+t("plan: cwd compared normalized (trailing slash)", planSuccession(att({ cwd: "/w/", resumeTargetSid: "fe0376cd", newNativeSid: "new-sid" }), [mem({ cwd: "/w" })], deadInc).action === "adopt");
 
 console.log("all shell-succession selftests passed");
