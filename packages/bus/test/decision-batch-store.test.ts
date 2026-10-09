@@ -614,3 +614,51 @@ describe("TG r7: snapshot-replace / tap-merge semantics + legacy import", () => 
     expect(got.resolved.map((r) => [r.item.id, r.verdict]).sort()).toEqual([["a", "approve"], ["b", "reject"]]); // legacy a + new b
   });
 });
+
+// TG round-8 (codex r7 verdict): close the legacy-import lifecycle — a consumed import must NOT fire a false orphan post-seal
+// (the import stays stable across the seal), and a baseline rejected-claim must be imported too.
+describe("TG r8: legacy import lifecycle (stable across seal; rejected-claim import)", () => {
+  const dd = (id: string) => path.join(HOME, ".agenthop", "console", "decision-batches", id);
+
+  test("TG-R6-P2-1 A: an imported legacy snapshot + a new tap consumes both, and a terminal re-consume fires NO false orphan", () => {
+    openBatch(HOME, { batchId: "fa", owner: "coord-sid", items: [item("a"), item("b")], nowSec: 1 });
+    writeFileSync(path.join(dd("fa"), "decisions.json"), JSON.stringify({ batchId: "fa", decidedAtSec: 5, decisions: [{ id: "a", verdict: "approve" }] })); // baseline legacy
+    expect(recordDecision(HOME, "fa", { id: "b", verdict: "reject" }, 10)).toBe("recorded"); // new tap (slot 0)
+    expect(consumeDecisions(HOME, "fa").resolved.map((r) => r.item.id).sort()).toEqual(["a", "b"]); // both consumed
+    const again = consumeDecisions(HOME, "fa"); // terminal re-consume — nothing new was published
+    expect(again.consumed).toBe(false);
+    expect(claimInbox(HOME, ["coord-sid"], "p").some((c) => c.msg.title === "orphan decision — re-batch")).toBe(false); // NO false orphan
+  });
+
+  test("TG-R6-P2-1 A: with the owner inbox UNWRITABLE, a legacy-import consume does NOT throw (no spurious orphan write)", () => {
+    openBatch(HOME, { batchId: "fw", owner: "coord-sid", items: [item("a"), item("b")], nowSec: 1 });
+    writeFileSync(path.join(dd("fw"), "decisions.json"), JSON.stringify({ batchId: "fw", decidedAtSec: 5, decisions: [{ id: "a", verdict: "approve" }] }));
+    expect(recordDecision(HOME, "fw", { id: "b", verdict: "reject" }, 10)).toBe("recorded");
+    mkdirSync(path.join(HOME, ".agenthop"), { recursive: true });
+    writeFileSync(path.join(HOME, ".agenthop", "inbox"), "x"); // block any inbox write (a spurious orphan would throw ENOTDIR)
+    const got = consumeDecisions(HOME, "fw"); // must NOT throw — the post-seal read equals the consumed digest, so no orphan
+    expect(got.consumed).toBe(true);
+    expect(got.resolved.map((r) => r.item.id).sort()).toEqual(["a", "b"]);
+  });
+
+  test("TG-R6-P2-1 A (claim variant): a legacy recoverable claim + a new tap — no false orphan post-seal", () => {
+    openBatch(HOME, { batchId: "fc", owner: "coord-sid", items: [item("a"), item("b")], nowSec: 1 });
+    writeFileSync(path.join(dd("fc"), "decisions-consumed-claim.json"), JSON.stringify({ batchId: "fc", decidedAtSec: 5, decisions: [{ id: "a", verdict: "approve" }] })); // baseline recoverable claim
+    expect(recordDecision(HOME, "fc", { id: "b", verdict: "reject" }, 10)).toBe("recorded");
+    expect(consumeDecisions(HOME, "fc").resolved.map((r) => r.item.id).sort()).toEqual(["a", "b"]);
+    consumeDecisions(HOME, "fc");
+    expect(claimInbox(HOME, ["coord-sid"], "p").some((c) => c.msg.title === "orphan decision — re-batch")).toBe(false);
+  });
+
+  test("TG-R6-P2-1 B: a legacy baseline rejected-claim (valid, bound) is IMPORTED and consumed; a foreign one is not", () => {
+    openBatch(HOME, { batchId: "rb", owner: "coord", items: [item("a")], nowSec: 1 });
+    writeFileSync(path.join(dd("rb"), "decisions-rejected-claim.json"), JSON.stringify({ batchId: "rb", decidedAtSec: 5, decisions: [{ id: "a", verdict: "approve" }] }));
+    expect(readDecisions(HOME, "rb")!.decisions.map((x) => x.id)).toEqual(["a"]);
+    const got = consumeDecisions(HOME, "rb");
+    expect(got.consumed).toBe(true);
+    expect(got.resolved.map((r) => [r.item.id, r.verdict])).toEqual([["a", "approve"]]);
+    openBatch(HOME, { batchId: "rb2", owner: "coord", items: [item("a")], nowSec: 1 });
+    writeFileSync(path.join(dd("rb2"), "decisions-rejected-claim.json"), JSON.stringify({ batchId: "OTHER", decidedAtSec: 5, decisions: [{ id: "a", verdict: "approve" }] }));
+    expect(consumeDecisions(HOME, "rb2").consumed).toBe(false); // a foreign (batchId != dir) rejected-claim is never imported
+  });
+});

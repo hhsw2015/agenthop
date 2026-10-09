@@ -39,6 +39,8 @@ function decisionsPath(home: string, batchId: string): string { return path.join
  *    intent — is the only "definitely sent" signal. */
 function consumedMarkerPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "consumed.json"); }
 function claimPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "decisions-consumed-claim.json"); }
+// TG-R6-P2-1: the BASELINE's mis-archived-but-recoverable claim slot (never written by this version) — imported for compat.
+function rejectedClaimPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "decisions-rejected-claim.json"); }
 function notifiedMarkerPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.json"); }
 function notifyLockPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.lock"); }
 function notifiedSentPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.sent"); }
@@ -231,19 +233,22 @@ export function readDecisions(home: string, batchId: string): DecisionsDoc | nul
   return foldDecisionDocs(readLedgerEntries(home, batchId), batchId);
 }
 
-/** The full fold input: legacy baseline data (imported for compat, TG-R6-P2-1) THEN the slot ledger. A read error PROPAGATES. */
+/** The full fold input: legacy baseline data (imported for compat, TG-R6-P2-1) folded in BEFORE every slot, THEN the slot ledger.
+ *  A read error PROPAGATES. The legacy files are console FULL SNAPSHOTS in baseline PRECEDENCE: the mis-archived rejected-claim
+ *  (oldest, order -3), the recoverable consumed-claim (-2), then decisions.json (freshest, -1, supersedes the others). These are
+ *  imported UNCONDITIONALLY (not gated on sealed) so the fold is IDENTICAL before and after a consume seals — otherwise a sealed
+ *  batch would drop the import and the post-seal read would differ from the consumed digest, firing a FALSE orphan (R6-P2-1 A).
+ *  `decisions.json` and the rejected-claim are never written by this version (always baseline). The consumed-claim is EITHER a
+ *  baseline recoverable claim OR this version's consumed PROJECTION; importing it as a snapshot is correct for BOTH — the slots
+ *  re-apply on top (idempotent for a projection, since a projection IS the slots' fold), so it never double-counts or mis-orders. */
 function readLedgerEntries(home: string, batchId: string): { doc: DecisionsDoc; order: bigint; kind: SlotKind }[] {
   const entries: { doc: DecisionsDoc; order: bigint; kind: SlotKind }[] = [];
-  // TG-R6-P2-1: import a batch created by the BASELINE (bdd93d7) API before the slot ledger existed, so its already-accepted,
-  // not-yet-consumed decisions are NOT silently dropped. Imported ONLY while the batch is not sealed (a sealed batch's claim is a
-  // consumed projection, not pending input). Both legacy files are console FULL SNAPSHOTS, ordered BEFORE every slot (they predate
-  // the switch): the recoverable claim (older) then decisions.json (a fresh snapshot supersedes the claim — baseline precedence).
-  if (!existsStrict(consumedMarkerPath(home, batchId))) {
-    const legacyClaim = readJsonOrNull(claimPath(home, batchId), validDecisionsDoc);
-    if (legacyClaim && legacyClaim.batchId === batchId) entries.push({ doc: legacyClaim, order: -2n, kind: "snapshot" });
-    const legacySnap = readJsonOrNull(decisionsPath(home, batchId), validDecisionsDoc);
-    if (legacySnap && legacySnap.batchId === batchId) entries.push({ doc: legacySnap, order: -1n, kind: "snapshot" });
-  }
+  const rej = readJsonOrNull(rejectedClaimPath(home, batchId), validDecisionsDoc);
+  if (rej && rej.batchId === batchId) entries.push({ doc: rej, order: -3n, kind: "snapshot" });
+  const claim = readJsonOrNull(claimPath(home, batchId), validDecisionsDoc);
+  if (claim && claim.batchId === batchId) entries.push({ doc: claim, order: -2n, kind: "snapshot" });
+  const snap = readJsonOrNull(decisionsPath(home, batchId), validDecisionsDoc);
+  if (snap && snap.batchId === batchId) entries.push({ doc: snap, order: -1n, kind: "snapshot" });
   entries.push(...readSlots(home, batchId));
   return entries;
 }
