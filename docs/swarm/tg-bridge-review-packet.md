@@ -1,6 +1,18 @@
-# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 4
+# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 5
 
-- **Branch** `feat/tg-bridge`  **HEAD** `2a56429`  **Base** `main` (`bdd93d7`)  (r1 `7c6dff0`, r2 `f34ca77`, r3 `ccabe66`)
+- **Branch** `feat/tg-bridge`  **HEAD** `6f80b89`  **Base** `main` (`bdd93d7`)  (r1 `7c6dff0`, r2 `f34ca77`, r3 `ccabe66`, r4 `2a56429`)
+
+## Round 5 — round-4 REMAIN resolved (1 P1 + 1 P2, one window)
+The r4 verdict was **1 P1 + 1 P2 (2 REMAIN)**: mtime is not the publish order (a temp written first but renamed last is stale); readDocEntry swallowed a stat error into order=0 and still sealed; content + order could be read from different versions; and a stale claim was unioned into a fresh snapshot. P1-2 stayed CLOSED.
+
+**On the coordinator's steer (in-content `writeSeq`) — why ctime instead.** An in-content sequence is necessarily allocated BEFORE the `renameSync` call. The reviewer's own test #1 spies on `renameSync`: console `writeDecisions` serializes its temp, calls `renameSync`, and the spy runs a full tap `recordDecision` (which publishes) BEFORE the console rename completes — so the console reject is PUBLISHED last and must win. Any value console fixes before its `renameSync` (an in-content seq, or mtime) is set before the tap, so the tap would wrongly win — the in-content seq has the exact defect the reviewer flagged for mtime. The only signal that reflects the atomic temp→rename PUBLISH order is the file's **ctime**, which the OS sets on the rename syscall (verified: rename updates ctime, not mtime). So r5 orders by ctime, read as a consistent snapshot. (If the coordinator/reviewer prefers an explicit token despite this, the only correct allocation is a POST-rename external marker — an extra file with a fault window — which ctime avoids.)
+
+- **TG-R3-P1-1 (P1) — order by the PUBLISH ctime, and propagate order-read errors.** `foldDecisionDocs` orders by a per-source `order` token = the file's `ctimeNs` (set by the publish rename), not `mtimeNs` (the temp's content-write time). In consume the console snapshot's publish ctime is captured BEFORE the claim rename (a rename resets ctime), so a tap published after the console wins and vice-versa. `readDocEntry` no longer swallows a stat failure into `order=0` — a real read error (EACCES) PROPAGATES, so consume throws and never seals (the approval is retried, not mis-ordered as "oldest").
+- **TG-R3-P2-1 (P2) — same-version binding + one read/consume precedence.** `readDocEntry` is a CONSISTENT snapshot: stat, read, re-stat and retry until ctime+ino are stable, so the content and its order token always belong to the SAME version (a mid-read file swap can't pair old content with new order). `readDecisions` and `consume` share ONE precedence: base = `decisions.json ?? claim ?? rejected-claim` (a fresh full snapshot SUPERSEDES a stale claim; the claim is recovered only when there is no fresh snapshot), then fold the per-item taps — no union that re-admits a superseded claim's item.
+- Gates: bus tsc 0, scripts tsc 0, tg-entry selftest pass, **decision-batch 51** (+5 round-5 adversarial counterexamples with fs spies, proven to fail on the old mtime+swallow logic), dual-bandwidth 16, full bus 1170/1170.
+- **Reviewer** codex `01a0ff49` (happycapy)  **Author** bus-pen `d7f6c917`
+
+## Round 4 (resolved) — round-3 REMAIN resolved (2 P1 + 1 P2, one window)
 
 ## Round 4 — round-3 REMAIN resolved (2 P1 + 1 P2, one window)
 The r3 verdict was **2 P1 + 1 P2 (3 REMAIN)**: the fold ordered by the 1-second `decidedAtSec` so a same-second console write-after-tap lost; the tap filename hashed the item id and aliased distinct UTF-8-coinciding ids; the read contract was incomplete (readDecisions ignored the claim, consume deleted taps leaving only a digest, so the existing bandwidth reader miscounted). All three fixed; the r2 items stay CLOSED; P2-5 stays deferred to v1.1.
