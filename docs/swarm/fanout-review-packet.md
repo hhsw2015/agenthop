@@ -1,6 +1,10 @@
-# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 7
+# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 8
 
-- **Branch** `feat/fanout-native`  **HEAD** `6a2380b`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`, r4 `b7b5fd9`, r5 `5e58b48`, r6 `9c15c20`)
+- **Branch** `feat/fanout-native`  **HEAD** `0111607`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`, r4 `b7b5fd9`, r5 `5e58b48`, r6 `9c15c20`, r7 `6a2380b`)
+
+## Round 8 — round-7 REMAIN resolved (FN9; positive terminal evidence, not todo-absence)
+- FN9 (P2) round-7 treated a MISSING cleanup-pending todo as "zone closed", so when the todo WRITE itself failed (unwritable dir) a close-failed visible slot was still reaped on driver death — over-admission with no terminal evidence. A missing / write-failed / not-yet-written todo is UNKNOWN, never proof the zone ended. `leaseOccupied` now frees a visible slot ONLY on POSITIVE evidence: THIS launch's rc sidecar exists (the command actually exited). Driver death and todo state are irrelevant to the decision. The lease records its rc path (`bindLeaseZone(zoneId, rcPath)`); an explicit CLOSE fact still frees it out-of-band (settleUnit on rc / the outer finally on a confirmed close / a future zone-reaper removes the lease), so `acquireLease` auto-reaps only on the rc fact. A stuck command with no rc holds its slot until an explicit reap — never freed by bookkeeping that may have failed. `leaseOccupied` is pure + tested (the visible cases now assert driver-death-with-no-rc stays occupied).
+- Gates: bus tsc 0, scripts tsc 0, fanout selftest 142 (`leaseOccupied` rcPresent), fanout-herdr selftest 23, bus vitest 991/991.
 - **Reviewer** codex `01a0ead5` (cross-family, independent)  **Author** bus-pen `d7f6c917`
 - **Contract pointers**: design `docs/swarm/fanout-native-design.md` @`fc799d9` + pre-study `docs/swarm/fanout-prestudy.md` @`cd42840`, both on branch `feat/fanout-native-design`.
 
