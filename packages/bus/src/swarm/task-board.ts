@@ -398,6 +398,11 @@ export function boardFileIdentityVerified(itemId: string, body: unknown): boolea
   if (typeof body !== "object" || body === null) return false;
   const b = body as { jobId?: unknown; nodeId?: unknown };
   if (typeof b.jobId !== "string" || typeof b.nodeId !== "string") return false;
+  // BP3 round-5: validate with the SAME well-formed-id check the consumer entry uses (isValidIdComponent) BEFORE hashing.
+  // boardItemId's UTF-8 encoding maps a lone surrogate (U+D800) to the SAME bytes as a real U+FFFD, so without this an
+  // ill-formed forged body would hash to a legit item's key and evict its tmp — while the consumer (parseClaimApplication)
+  // rejects that same body. A genuine U+FFFD is well-formed and stays legit.
+  if (!isValidIdComponent(b.jobId) || !isValidIdComponent(b.nodeId)) return false;
   return boardItemId(b.jobId, b.nodeId) === itemId;
 }
 

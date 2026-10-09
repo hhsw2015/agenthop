@@ -397,3 +397,12 @@ describe("task-board BP3 round-5 (body-verified eviction + obligation retained u
     expect(suppressPendingReposts(post, new Set([itemId]))).toEqual([{ itemId: boardItemId("J", "b") }]);
   });
 });
+
+describe("task-board BP3 round-6 (identity encoding: a lone surrogate cannot impersonate a real U+FFFD to evict a tmp)", () => {
+  test("a genuine U+FFFD body is VERIFIED; a lone-surrogate body that hashes to the same key is REJECTED before it can evict", () => {
+    const key = boardItemId("�", "a"); // a real replacement char — well-formed
+    expect(boardItemId("\uD800", "a")).toBe(key); // the collision the fix defends against: a lone surrogate folds to U+FFFD bytes
+    expect(boardFileIdentityVerified(key, { jobId: "�", nodeId: "a" })).toBe(true); // real U+FFFD stays legit
+    expect(boardFileIdentityVerified(key, { jobId: "\uD800", nodeId: "a" })).toBe(false); // ill-formed -> not verified -> never evicts the legit tmp
+  });
+});
