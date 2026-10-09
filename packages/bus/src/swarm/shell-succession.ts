@@ -142,6 +142,7 @@ export function successionEnabled(env: NodeJS.ProcessEnv = process.env): boolean
 }
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { ROSTER_FILE, type RosterMember } from "./resume.js";
@@ -201,19 +202,35 @@ export function incumbentLivenessOf(home: string): (stableSid: string) => Incumb
   };
 }
 
+/** Read a process's argv via `ps -o args= -p <pid>` — the AGENT's OWN launch command, read straight from the OS (the truest
+ *  credential source; not a relayable file, coordinator ruling a). A bus process's own `process.argv` is `node presence.mjs` /
+ *  `agenthop mcp`, never the resume command, so the resume target must come from the HOST (agent) process. Split on whitespace
+ *  (resume sids/paths rarely contain spaces; mirrors resume.ts's capture). Empty on any fault. */
+export function readHostArgv(hostPid: number | undefined): string[] {
+  if (!hostPid || !Number.isInteger(hostPid) || hostPid <= 1) return [];
+  try {
+    const r = spawnSync("ps", ["-o", "args=", "-p", String(hostPid)], { encoding: "utf8", timeout: 2000 });
+    if (r.status !== 0 || !r.stdout) return [];
+    return r.stdout.trim().split(/\s+/).filter(Boolean);
+  } catch { return []; }
+}
+
 /**
- * Presence-startup consumption point (dormant: SWARM_SUCCESSION off). Gather this shell's attestation, plan succession
- * against the roster snapshot, and on "adopt" TAKE OVER the stable sid's presence slot (write presence/<sid>.pid) — then
- * return the adopted sid so the caller does `core.adoptStableId(sid)` (drains its inbox + rebinds the liveness socket +
- * makes resolveSession find it). Returns null on fresh/reject or any IO fault (fail-closed — never hijack on error).
+ * Bus-core-init / presence-startup consumption point (dormant: SWARM_SUCCESSION off). Gather this shell's attestation — the
+ * binding credential (resume target) comes from the AGENT's OWN argv via ps on `hostPid` (coordinator ruling a: argv is the
+ * truest source; not a relayable file / not the roster snapshot) — plan succession against the roster snapshot, and on "adopt"
+ * TAKE OVER the stable sid's presence slot (write presence/<sid>.pid), returning the adopted sid so the caller does
+ * `core.adoptStableId(sid)` (drains its inbox + rebinds the liveness socket + makes resolveSession find it). Returns null on
+ * fresh/reject or any IO fault (fail-closed — never hijack on error).
  */
-export function runSuccessionAtStartup(home: string, selfTool: string, selfNativeSid: string, log: (m: string) => void = () => {}): string | null {
+export function runSuccessionAtStartup(home: string, selfTool: string, selfNativeSid: string, hostPid: number | undefined, log: (m: string) => void = () => {}): string | null {
+  const hostArgv = readHostArgv(hostPid); // the AGENT's real launch argv (e.g. `codex resume <sid>`) — the credential source
   const att: Attestation = {
     machine: os.hostname(),
     cwd: process.cwd(),
     tool: selfTool,
-    resumeCmd: process.argv.join(" "),
-    resumeTargetSid: parseResumeTargetFromArgv(process.argv) ?? undefined, // a detached presence daemon rarely carries this (caveat above)
+    resumeCmd: hostArgv.join(" ") || process.argv.join(" "),
+    resumeTargetSid: parseResumeTargetFromArgv(hostArgv) ?? undefined, // from the HOST (agent) argv, not this bus process's own
     herdrPane: process.env.AGENTHOP_HERDR_PANE || null,
     newPid: process.pid,
     newNativeSid: selfNativeSid,

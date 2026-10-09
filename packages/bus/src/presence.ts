@@ -101,7 +101,10 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
   // rebinds the liveness socket (via onIdentityChange) so resolveSession(stableSid) finds this instance. Fail-soft.
   if (successionEnabled()) {
     try {
-      const adopted = runSuccessionAtStartup(home, core.self.tool, core.self.stableId ?? core.self.id, dbg);
+      // SECOND consumption point (coordinator ruling a): the primary gather is at the AGENT's bus-core-init (mcp.ts); this
+      // fail-closed path covers the presence daemon too. The credential (resume target) is read from the AGENT's argv via the
+      // host pid the hook recorded (AGENTHOP_HOST_PID = the codex/claude process), never this daemon's own `node presence.mjs`.
+      const adopted = runSuccessionAtStartup(home, core.self.tool, core.self.stableId ?? core.self.id, Number(process.env.AGENTHOP_HOST_PID) || undefined, dbg);
       if (adopted) core.adoptStableId(adopted);
     } catch (e) { dbg(`succession startup failed (ignored): ${e instanceof Error ? e.message : e}`); }
   }

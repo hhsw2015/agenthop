@@ -7,6 +7,9 @@ import { formatHandoff } from "./handoff.js";
 import { despawnAgent, readRegistry, spawnAgent, startClaimRetry } from "./spawn.js";
 import { omniwmctl, splitArgs } from "./wm.js";
 import { version } from "./version.js";
+import { successionEnabled, runSuccessionAtStartup } from "./swarm/shell-succession.js";
+import { dbg } from "./debug.js";
+import { homedir } from "node:os";
 
 /**
  * The bus tools — agenthop_peers / send / recv — that make every session discoverable and reachable
@@ -55,6 +58,18 @@ Incoming messages arrive on their own: on agents with a native inbox (e.g. Claud
 /** Put the bus tools on an existing server. Returns a cleanup to run when the server closes. */
 export function registerBusTools(server: McpServer, options: BusMcpOptions = {}): () => void {
   const core: BusCore = startBusCore(options);
+
+  // F45 ① PRIMARY consumption point (coordinator ruling a): the AGENT's bus-core-init. The binding credential (resume target)
+  // is read from the AGENT's OWN argv — ps on the host pid (AGENTHOP_HOST_PID the hook recorded, else this MCP server's parent
+  // = the agent process) — the truest source (not a relayable file / not the roster snapshot). On "adopt" the stable sid's
+  // presence slot is taken over and core.adoptStableId drains its inbox + rebinds the liveness socket + makes resolveSession
+  // find it. DORMANT (SWARM_SUCCESSION off). Fail-soft; dbg goes to stderr/debug ONLY (stdout here is the MCP JSON-RPC stream).
+  if (successionEnabled()) {
+    try {
+      const adopted = runSuccessionAtStartup(options.home ?? homedir(), core.self.tool, core.self.stableId ?? core.self.id, Number(process.env.AGENTHOP_HOST_PID) || process.ppid, dbg);
+      if (adopted) core.adoptStableId(adopted);
+    } catch (e) { dbg(`mcp succession failed (ignored): ${e instanceof Error ? e.message : e}`); }
+  }
 
   // If THIS session was launched by agenthop_spawn, self-register the Ghostty surface it runs in so
   // despawn has an authoritative (agent-claimed) target. Bounded retry; a no-op unless spawned.
