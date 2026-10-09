@@ -1355,7 +1355,7 @@ async function main(): Promise<void> {
           else if (!blockedOnceFired.has(sid)) { blockedOnceFired.add(sid); void sentinelEscalate({ kind: "blocked", member: sid, explain: "(non-roster presence; surfaced once)" }); }
           continue;
         }
-        sawNonBlocked.add(sid); // F44-8B: a readable state that is NOT blocked = CONFIRMED left blocked (a missing/unreadable sample does NOT count)
+        if (st.state === "working" || st.state === "idle") sawNonBlocked.add(sid); // F44-8B: ONLY a DEFINITE working/idle proves left blocked; "unknown" (= not reported) / missing / unreadable keep the once-mark
         if (st.state !== "idle" || !Number.isFinite(st.seq)) continue;
         const idleSec = Math.max(0, now - Math.floor(st.seq / 1000));
         const health = classifyMemberHealth({ onRoster, hasInFlight: activeOwners.has(sid), idleSec, presenceSeen: true }, { idleTimeoutSec: SENTINEL_IDLE_SEC });
