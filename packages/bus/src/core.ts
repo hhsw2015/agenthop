@@ -203,10 +203,12 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // run changed / it has >1 node) — the bug that showed a bare run-id prefix + "default". Relay has no carry yet → it
   // falls back to resolving by the roster (labelFor/modeFor).
   const handleInbound = (from: string, text: string, via: "local" | "relay", carried?: { label?: string; mode?: string }): void => {
-    // Delivery is locked to this session's learned identity (codexDeliveryThread), so it never diverges from the
-    // published stableId. Learn from the SAME value: authoritative from call metadata, a guess from the daemon.
+    // DELIVERY may use the lenient fallback (deliver into the sole session around); IDENTITY learning must NOT (F47-1/F47-R1:
+    // every non-authoritative identity entry requires a UNIQUE cwd match). So: delivery target = codexDeliveryThread (lenient
+    // activeThread ok); identity learn = authoritative ownCodexThread, else the STRICT ownThread (a lenient sole-loaded guess
+    // never provides an ownership claim — adopting another cwd's thread here let an inbound message steal its identity).
     const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
-    learnStableId(codexThread, ownCodexThread !== undefined);
+    learnStableId(ownCodexThread ?? codexDaemon?.ownThread(self.cwd), ownCodexThread !== undefined);
     const label = carried?.label ?? labelFor(from); // the sender's stamped address, else resolve via roster
     const fromMode = carried?.mode ?? modeFor(from); // the sender's stamped mode, else resolve via roster
     // Bind the delivery identity's inbox key + arrival time NOW, before the async push. If the push fails, the fallback
