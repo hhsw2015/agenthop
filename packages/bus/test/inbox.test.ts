@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19 } from "../src/inbox.js";
-import { notifyCoordinatorPoison } from "../src/checkin.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
+import { deliverToCoordinator } from "../src/checkin.js";
 import type { SelfInfo } from "../src/label.js";
 
 let HOME: string;
@@ -269,12 +269,39 @@ describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
     expect(validInboxMsg(s19)).not.toBeNull();
   });
 
-  test("PD-P2-2: notifyCoordinatorPoison is 3-state — skip (no coordinator) vs retry (unresolvable) so the obligation is retained", () => {
+  test("PD-P2-2: deliverToCoordinator is 3-state — skip (no coordinator) vs retry (unresolvable) so the obligation is retained", () => {
     const self = { id: "me", stableId: "me", title: "me" } as SelfInfo;
-    const poison = { from: "x", fromLabel: "alice", text: "boom", via: "local", ts: 1 };
-    expect(notifyCoordinatorPoison(HOME, self, undefined, poison, 3, "t")).toBe("skip");   // no coordinator ⇒ permanent
-    expect(notifyCoordinatorPoison(HOME, self, "", poison, 3, "t")).toBe("skip");          // blank handle ⇒ permanent
-    expect(notifyCoordinatorPoison(HOME, self, "coord-ghost", poison, 3, "t")).toBe("retry"); // not resolvable here ⇒ retain + retry
+    const m = buildPoisonS19("me", "me", { from: "x", fromLabel: "alice", text: "boom", via: "local", ts: 1 }, 3, "t");
+    expect(deliverToCoordinator(HOME, self, undefined, m)).toBe("skip");    // no coordinator ⇒ permanent
+    expect(deliverToCoordinator(HOME, self, "", m)).toBe("skip");           // blank handle ⇒ permanent
+    expect(deliverToCoordinator(HOME, self, "coord-ghost", m)).toBe("retry"); // not resolvable here ⇒ retain + retry
+  });
+
+  test("PD-P2-2: an undelivered notice is DURABLE — survives on disk and a later drain delivers it (restart + cap safe)", () => {
+    const dir = path.join(HOME, ".agenthop", "swarm", "poison-notices");
+    enqueuePoisonNotice(HOME, buildPoisonS19("me", "me", { from: "x", fromLabel: "a", text: "boom", via: "local", ts: 1000 }, 3, "trace"));
+    expect(readdirSync(dir).filter((n) => n.endsWith(".json")).length).toBe(1); // persisted (process 1 could not reach coordinator)
+    // a FRESH drain (process 2, no in-memory state): coordinator still unreachable ⇒ KEEP the obligation
+    drainPoisonNotices(HOME, () => "retry");
+    expect(readdirSync(dir).filter((n) => n.endsWith(".json")).length).toBe(1); // retained across the "restart"
+    // coordinator now reachable ⇒ delivered ⇒ cleared ONLY after the confirmed send
+    const sent: InboxMsg[] = [];
+    drainPoisonNotices(HOME, (m) => { sent.push(m); return "sent"; });
+    expect(sent.length).toBe(1);
+    expect(sent[0]!.text).toContain("boom");
+    expect(readdirSync(dir).filter((n) => n.endsWith(".json")).length).toBe(0);
+  });
+
+  test("PD-P2-2: drain discharges on skip (no target), drops a corrupt notice, and has no in-memory cap", () => {
+    const dir = path.join(HOME, ".agenthop", "swarm", "poison-notices");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "0000000000000001-aaaa.json"), "not valid json{"); // corrupt ⇒ dropped (never wedges the queue)
+    for (let i = 0; i < 300; i++) enqueuePoisonNotice(HOME, buildPoisonS19("me", "me", { from: "x", fromLabel: "a", text: `m${i}`, via: "local", ts: 2000 + i }, 3, "t")); // > any in-memory cap
+    expect(readdirSync(dir).filter((n) => n.endsWith(".json")).length).toBe(301); // all persisted, no cap drop
+    let delivered = 0;
+    for (let pass = 0; pass < 6; pass++) drainPoisonNotices(HOME, () => { delivered++; return "sent"; }); // bounded per tick (64) ⇒ several passes
+    expect(delivered).toBe(300);                 // all 300 valid notices delivered, none lost to a cap
+    expect(readdirSync(dir).filter((n) => n.endsWith(".json")).length).toBe(0); // corrupt + all delivered ⇒ empty
   });
 
   test("PD-P2-3: the in-memory map drives the count to threshold even when the sidecar write keeps failing", () => {

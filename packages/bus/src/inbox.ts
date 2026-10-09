@@ -350,3 +350,46 @@ export function buildPoisonS19(mySid: string, myLabel: string, poison: InboxMsg,
   const text = `[poison-dlq] 毒件已隔离(投递崩溃 ${strikes} 次,已达阈值)。来源 ${sanitizeForTransport(poison.fromLabel)} via ${sanitizeForTransport(poison.via)};失败轨迹: ${sanitizeForTransport(trace)};内容预览: ${preview}`;
   return { from: mySid, fromLabel: myLabel, text, via: "local", ts: Date.now(), taskRef: "poison-dlq", title: "poison quarantine" };
 }
+
+/** FC-2 (PD-P2-2) — the DURABLE poison-notice queue dir. A single quarantine is below the F26 dead-letter burst threshold, so
+ *  the coordinator notice cannot live only in a bounded in-process array (a restart or an overflow would silently discharge the
+ *  obligation). Each undeliverable notice is a file here; a later flush (any process) re-scans and delivers it, deleting only
+ *  after a CONFIRMED send. Under `.agenthop/swarm/` (NOT an inbox key) so claimInbox/inboxKeys never touch it. */
+function poisonNoticeDir(home: string): string { return path.join(home, ".agenthop", "swarm", "poison-notices"); }
+
+/** FC-2 (PD-P2-2) — persist an undelivered poison notice so the obligation survives process restart + memory limits. The
+ *  already-built, already-sanitized S19 is stored verbatim (atomic tmp+rename). Best-effort: a write fault falls back to the
+ *  F26 dead-letter ledger (the durable audit), never throws. */
+export function enqueuePoisonNotice(home: string, notice: InboxMsg): void {
+  try {
+    const dir = poisonNoticeDir(home);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const base = `${notice.ts.toString().padStart(16, "0")}-${randomBytes(4).toString("hex")}.json`;
+    const file = path.join(dir, base);
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, JSON.stringify(notice), { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch { /* best-effort: the F26 dead-letter ledger remains the durable audit backstop */ }
+}
+
+/** FC-2 (PD-P2-2) — the deterministic re-scan entry: deliver persisted poison notices (oldest first, bounded per tick). `deliver`
+ *  returns "sent" (delivered ⇒ delete), "skip" (no target / is self ⇒ discharge), or "retry" (coordinator not reachable yet ⇒
+ *  KEEP for a later flush). A corrupt notice file is dropped (the quarantine bytes + ledger remain the record) so it can never
+ *  wedge the queue. Pure damage-control: never throws. Any process that flushes drains it, so a restart recovers the obligation. */
+export function drainPoisonNotices(home: string, deliver: (msg: InboxMsg) => "sent" | "retry" | "skip", cap = 64): void {
+  const dir = poisonNoticeDir(home);
+  let names: string[];
+  try { names = readdirSync(dir).filter((n) => n.endsWith(".json")).sort(); } catch { return; } // no dir ⇒ nothing pending
+  let processed = 0;
+  for (const n of names) {
+    if (processed >= cap) break; // bound the per-tick batch; the rest drain next flush
+    const f = path.join(dir, n);
+    let msg: InboxMsg | null;
+    try { msg = validInboxMsg(JSON.parse(readFileSync(f, "utf8"))); } catch { msg = null; }
+    if (msg === null) { try { unlinkSync(f); } catch { /* already gone */ } continue; } // corrupt ⇒ drop (ledger is the backstop)
+    processed += 1;
+    let r: "sent" | "retry" | "skip";
+    try { r = deliver(msg); } catch { r = "retry"; } // a throwing deliver ⇒ keep + retry
+    if (r !== "retry") { try { unlinkSync(f); } catch { /* already gone */ } } // sent or permanently-skipped ⇒ discharged
+  }
+}

@@ -8,7 +8,7 @@
  * set in the swarm context — so tests and ordinary sessions never write); never checks in to self; skips silently when the
  * coordinator has no resolvable same-machine presence file yet (it is found on a later node's startup / the next run).
  */
-import { writeInbox, buildPoisonS19, type InboxMsg } from "./inbox.js";
+import { writeInbox, type InboxMsg } from "./inbox.js";
 import { resolveSession, listSessions } from "./swarm/task-liveness.js";
 import type { SelfInfo } from "./label.js";
 
@@ -34,20 +34,19 @@ export function reportCheckIn(home: string, self: SelfInfo, coordinatorHandle: s
   } catch { return "retry"; } // transient (e.g. the write failed) -> retain the obligation (B5); never throw on startup
 }
 
-/** FC-2 — notify the coordinator that a poison message was quarantined (content preview + failure trace + strike count),
- *  reusing the same coordinator-handle resolution as the check-in. THREE-STATE so the caller can RETAIN a retry obligation
- *  (PD-P2-2 — one quarantine is below the F26 dead-letter burst threshold, so a silently-dropped notice hides the incident):
- *  "sent" = written to the coordinator inbox; "retry" = TRANSIENT (coordinator not resolvable yet, or the write failed) ⇒
- *  retain + retry on the flush timer; "skip" = PERMANENT (no coordinator configured, or we ARE the coordinator). The
- *  quarantine + the F26 ledger remain the durable record; this is the ACTIVE push on top. NEVER throws. */
-export function notifyCoordinatorPoison(home: string, self: SelfInfo, coordinatorHandle: string | undefined, poison: InboxMsg, strikes: number, trace: string): "sent" | "retry" | "skip" {
+/** FC-2 (PD-P2-2) — deliver an already-built notice to the coordinator, reusing the same coordinator-handle resolution as the
+ *  check-in. THREE-STATE so the caller can RETAIN a retry obligation: "sent" = written to the coordinator inbox; "retry" =
+ *  TRANSIENT (coordinator not resolvable yet, or the write failed) ⇒ keep the durable notice + retry on a later flush; "skip" =
+ *  PERMANENT (no coordinator configured, or we ARE the coordinator) ⇒ discharge. NEVER throws. The durable poison-notice queue
+ *  (inbox.ts enqueue/drain) + the F26 ledger are the durable record; this is the delivery step. */
+export function deliverToCoordinator(home: string, self: SelfInfo, coordinatorHandle: string | undefined, msg: InboxMsg): "sent" | "retry" | "skip" {
   try {
-    if (!coordinatorHandle || !coordinatorHandle.trim()) return "skip"; // no coordinator ⇒ permanent (ledger is the record)
+    if (!coordinatorHandle || !coordinatorHandle.trim()) return "skip"; // no coordinator ⇒ permanent
     const coordSid = resolveSession(coordinatorHandle, listSessions(home));
-    if (!coordSid) return "retry"; // not resolvable on this machine YET ⇒ retain + retry (PD-P2-2)
+    if (!coordSid) return "retry"; // not resolvable on this machine YET ⇒ retain + retry
     const mySid = self.stableId ?? self.id;
     if (coordSid === mySid) return "skip"; // never to self ⇒ permanent
-    writeInbox(home, coordSid, buildPoisonS19(mySid, self.title, poison, strikes, trace));
+    writeInbox(home, coordSid, msg);
     return "sent";
-  } catch { return "retry"; } // write failed ⇒ retain + retry (PD-P2-2); fail-soft, never throw
+  } catch { return "retry"; } // write failed ⇒ retain + retry; fail-soft, never throw
 }

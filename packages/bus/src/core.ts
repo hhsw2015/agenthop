@@ -9,10 +9,10 @@ import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, type InboxMsg } from "./inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices } from "./inbox.js";
 import { resolveInboxTarget, isValidSessionId } from "./send-fallback.js";
 import { resolveSession, listSessions, probeSessionAlive } from "./swarm/task-liveness.js";
-import { reportCheckIn, notifyCoordinatorPoison } from "./checkin.js";
+import { reportCheckIn, deliverToCoordinator } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 
@@ -127,18 +127,12 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // these at the top of each pass; on success the file is back to `.json` and the normal claim path re-delivers it.
   const stuckRelease = new Set<string>();
   // FC-2: per-process poison strike counts, AUTHORITATIVE over the sidecar (PD-P2-3: a persistent sidecar-write fault must not
-  // re-read 0 forever and never reach the threshold) + coordinator notices that could not be delivered yet, RETAINED and retried
-  // (PD-P2-2: one quarantine is below the F26 burst threshold, so a dropped notice would hide the incident). The quarantine
-  // bytes + the F26 ledger are the durable record; these are the active push on top.
+  // re-read 0 forever and never reach the threshold). Coordinator notices are DURABLE on disk (inbox.ts enqueue/drain, PD-P2-2):
+  // a restart or an overflow must not discharge the obligation, so there is no in-memory queue — drainPoisonNotices re-scans the
+  // durable dir each flush and clears a notice only after a confirmed send.
   const poisonStrikes = new Map<string, number>();
-  const pendingPoisonNotices: { msg: InboxMsg; strikes: number; trace: string }[] = [];
-  const POISON_NOTICE_CAP = 256; // bound memory during a long coordinator outage (the ledger retains the record regardless)
   const retryPoisonNotices = (): void => {
-    for (let k = 0; k < pendingPoisonNotices.length; ) {
-      const p = pendingPoisonNotices[k]!;
-      if (notifyCoordinatorPoison(home, self, process.env.SWARM_COORDINATOR, p.msg, p.strikes, p.trace) === "retry") k++; // still pending
-      else pendingPoisonNotices.splice(k, 1); // sent or permanently-skipped ⇒ obligation discharged
-    }
+    drainPoisonNotices(home, (m) => deliverToCoordinator(home, self, process.env.SWARM_COORDINATOR, m));
   };
   // C2 (review 01b773d): watch-triggered flushes back off until this time after a no-progress flush, so our OWN claim/release
   // renames (which also fire the inbox fs-watch) cannot self-excite a tight flush loop while the push channel is down. The 5s
@@ -216,11 +210,10 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
           if (shouldQuarantinePoison(strikes, poisonDlqThreshold()) &&
               quarantineInbox(home, claimed[i].file, `poison: delivery threw ${strikes}x: ${threw}`, JSON.stringify(claimed[i].msg)) !== "failed") {
             clearPoisonStrikes(claimed[i].file, poisonStrikes);
-            // PD-P2-2: retain the notice if the coordinator can't receive it yet (a single quarantine won't trip the F26 burst).
-            if (notifyCoordinatorPoison(home, self, process.env.SWARM_COORDINATOR, claimed[i].msg, strikes, threw) === "retry") {
-              pendingPoisonNotices.push({ msg: claimed[i].msg, strikes, trace: threw });
-              if (pendingPoisonNotices.length > POISON_NOTICE_CAP) pendingPoisonNotices.shift(); // bound memory; ledger retains it
-            }
+            // PD-P2-2: build the notice, try to deliver NOW; if the coordinator is not reachable yet, PERSIST it to the durable
+            // queue so the obligation survives a restart + has no memory cap (drainPoisonNotices retries it, clears on send).
+            const notice = buildPoisonS19(self.stableId ?? self.id, self.title, claimed[i].msg, strikes, threw);
+            if (deliverToCoordinator(home, self, process.env.SWARM_COORDINATOR, notice) === "retry") enqueuePoisonNotice(home, notice);
             continue; // poison removed ⇒ try the rest of the batch
           }
         }
