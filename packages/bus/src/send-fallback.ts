@@ -63,19 +63,17 @@ export function relaySameMachineSid(peer: UnifiedPeer, isLocalInstance: (sid: st
   return isLocalInstance(peer.stableId) ? peer.stableId : null;
 }
 
-/** F45-P1-2 (round-4): a live presence pid belongs to session `sid`'s CURRENT instance only if THAT PROCESS'S ENVIRONMENT
- *  carries the identity the launcher passes — NOT its argv (an unrelated process can carry the sid as a plain argument; the
- *  real presence DAEMON's argv is just `node presence.mjs` and has no sid). The daemon (agents.ts presenceStartCommand /
- *  presence.ts) is launched with `AGENTHOP_PID_FILE=.../<sid>.pid` and inherits `CLAUDE_CODE_SESSION_ID=<sid>`. So ownership
- *  is proven iff the env has `AGENTHOP_PID_FILE=<…>/<sid>.pid` OR `CLAUDE_CODE_SESSION_ID=<sid>`. A recycled/unrelated pid
- *  has neither ⇒ false ⇒ keep relay (never a false durable); the real daemon has them ⇒ its same-machine inbox is used.
- *  `envText` is a whitespace-joined `KEY=VALUE` dump (e.g. `ps eww`); null/empty ⇒ false. Pure. */
-export function presenceEnvOwnsSid(envText: string | null | undefined, sid: string): boolean {
-  if (!envText || !sid) return false;
-  const toks = envText.split(/\s+/);
-  if (toks.includes(`CLAUDE_CODE_SESSION_ID=${sid}`)) return true;
-  for (const t of toks) if (t.startsWith("AGENTHOP_PID_FILE=") && t.endsWith(`/${sid}.pid`)) return true;
-  return false;
+/** F45-P1-2 (round-5): a live presence pid is the REAL writer of `presence/<sid>.pid` only if the process was already
+ *  running when that file was written — i.e. its start time is at/under the file's mtime. The presence daemon writes the
+ *  file with its own pid at startup (presence.ts), so for the genuine owner `procStart <= fileMtime`. A STALE file whose pid
+ *  was RECYCLED to an unrelated later process fails this: the recycled process started AFTER the old file ⇒ `procStart >
+ *  fileMtime` ⇒ rejected. This is unforgeable from argv/env text (the round-4 hole): it reads neither — only the OS start
+ *  time and the file mtime. (A deliberately FORGED fresh presence file pointing at an existing process requires write access
+ *  to ~/.agenthop/presence — below the trust boundary: anyone with it can write the inbox directly.) Non-finite inputs ⇒
+ *  false (unknown ⇒ keep relay, never a false durable). `toleranceSec` absorbs mtime/clock granularity. Pure. */
+export function pidFileFresh(procStartSec: number, fileMtimeSec: number, toleranceSec = 2): boolean {
+  if (!Number.isFinite(procStartSec) || !Number.isFinite(fileMtimeSec)) return false;
+  return procStartSec <= fileMtimeSec + toleranceSec;
 }
 
 export function resolveInboxTarget(to: string, resolved: UnifiedPeer | ResolveError, offlineSid: string | null, relayLocalSid: string | null = null): InboxTarget {

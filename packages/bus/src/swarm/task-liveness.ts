@@ -60,7 +60,7 @@ export function resolveSession(ownerHandle: string, sessionIds: string[]): strin
 }
 
 // --- real-fs binding (the TEMP v1; bus-identity replaces it). Thin; the testable decisions are above. -------------
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 
@@ -90,13 +90,23 @@ export function makeFileLiveness(home: string): LivenessIO {
   };
 }
 
-/** F45-P1-2: the ENVIRONMENT of a live pid (whitespace-joined KEY=VALUE), via `ps eww`, or null if unavailable. Used to
- *  CORRELATE a presence pid to a session's current instance by the identity the launcher passes in the env
- *  (AGENTHOP_PID_FILE / CLAUDE_CODE_SESSION_ID) — a bare signal-0 "alive" can be a recycled, unrelated pid, and the
- *  daemon's ARGV carries no sid. Rare path (only a same-machine relay peer), so a synchronous `ps` is acceptable; any
- *  failure ⇒ null (keep relay). `ps eww` prints the command followed by the environment for OUR own processes. */
-export function readPidEnv(pid: number): string | null {
+/** F45-P1-2: the START TIME (epoch seconds) of a live pid, via `ps -o lstart=`, or null if unavailable. Used to prove a
+ *  presence pid is the REAL writer of its pid file (procStart <= fileMtime) and not a later recycle — reads only the OS
+ *  start time, never argv/env text (unforgeable). Rare path (same-machine relay peer only), so a synchronous `ps` is fine. */
+export function readProcStartSec(pid: number): number | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  try { return execFileSync("ps", ["eww", "-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 4000 }).trim() || null; }
+  try {
+    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 4000 }).trim();
+    if (!out) return null;
+    const ms = Date.parse(out);
+    return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+  } catch { return null; }
+}
+
+/** F45-P1-2: the mtime (epoch seconds) of `presence/<sid>.pid`, or null if missing/unreadable. The presence daemon writes
+ *  this file once at startup, so its mtime is the daemon's write time — compared against readProcStartSec to reject a stale
+ *  file whose pid was recycled. */
+export function pidFileMtimeSec(home: string, sessionId: string): number | null {
+  try { return Math.floor(statSync(path.join(home, ".agenthop", "presence", `${sessionId}.pid`)).mtimeMs / 1000); }
   catch { return null; }
 }

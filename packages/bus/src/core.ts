@@ -10,8 +10,8 @@ import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
-import { resolveInboxTarget, relaySameMachineSid, presenceEnvOwnsSid } from "./send-fallback.js";
-import { resolveSession, listSessions, fileIsAlive, makeFileLiveness, readPidEnv } from "./swarm/task-liveness.js";
+import { resolveInboxTarget, relaySameMachineSid, pidFileFresh } from "./send-fallback.js";
+import { resolveSession, listSessions, fileIsAlive, makeFileLiveness, readProcStartSec, pidFileMtimeSec } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -428,14 +428,16 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       const sessionList = listSessions(home);
       const liveness = makeFileLiveness(home);
       // F45 ③ (P1-2 hardened): a relay-resolved peer is cross-BROKER, not necessarily cross-MACHINE. Route durable to it ONLY
-      // if its OWN full sid owns a presence pid that is (a) alive AND (b) a process whose ENVIRONMENT carries the launcher's
-      // identity for THIS sid (AGENTHOP_PID_FILE=.../<sid>.pid or CLAUDE_CODE_SESSION_ID=<sid>) — proof it is this peer's
-      // current local presence daemon, not a recycled/unrelated pid behind a stale file (the daemon's argv has no sid; a
-      // plain-argument sid on an unrelated process is not identity). Unproven ⇒ keep relay (never a false durable).
+      // if its OWN full sid owns a presence pid that is (a) alive AND (b) the REAL writer of presence/<sid>.pid — proven by
+      // the process start time being at/under the file's mtime (the daemon writes the file at startup; a recycled pid starts
+      // AFTER the stale file ⇒ rejected). Reads only OS start time + file mtime, never argv/env text (unforgeable). Unproven
+      // ⇒ keep relay (never silently redirect a remote peer to a local inbox nobody drains).
       const isLocalInstance = (sid: string): boolean => {
         if (fileIsAlive(sid, liveness) !== "alive") return false;      // (a) a live pid in presence/<sid>.pid
         const pid = liveness.readPid(sid);
-        return pid != null && presenceEnvOwnsSid(readPidEnv(pid), sid); // (b) that pid's ENV proves it owns THIS sid (not pid-reuse)
+        if (pid == null) return false;
+        const procStart = readProcStartSec(pid), mtime = pidFileMtimeSec(home, sid);
+        return procStart != null && mtime != null && pidFileFresh(procStart, mtime); // (b) that live pid WROTE the file (not a recycle)
       };
       const relayLocalSid = !("error" in resolvedPeer) ? relaySameMachineSid(resolvedPeer, isLocalInstance) : null;
       const target = resolveInboxTarget(to, resolvedPeer, resolveSession(to, sessionList), relayLocalSid);
