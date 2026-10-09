@@ -1,6 +1,17 @@
-# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 5
+# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 6
 
-- **Branch** `feat/tg-bridge`  **HEAD** `6f80b89`  **Base** `main` (`bdd93d7`)  (r1 `7c6dff0`, r2 `f34ca77`, r3 `ccabe66`, r4 `2a56429`)
+- **Branch** `feat/tg-bridge`  **HEAD** `96a1adb`  **Base** `main` (`bdd93d7`)  (r1 `7c6dff0`, r2 `f34ca77`, r3 `ccabe66`, r4 `2a56429`, r5 `6f80b89`)
+
+## Round 6 — round-5 REMAIN resolved (1 P1 + 1 P2): the append-only slot ledger
+The r5 verdict (confirmed by the reviewer's platform supplement + the coordinator) was that **ctime is not a usable publish-order signal** — on APFS a plain `chmod` advances ctime with identical content, POSIX leaves rename's effect on ctime implementation-defined, a stat-after-read skews content vs order, and a claim move / retry loses a stack-local order. **ctime is withdrawn.** r6 adopts the reviewer's blessed design: an append-only immutable slot ledger.
+
+- **Durable, version-bound publish order (TG-R3-P1-1).** Every publish — a console full-snapshot (`writeDecisions`) and a single-item entry tap (`recordDecision`) — EXCLUSIVE-creates the next monotonic slot `seq/<n>.json` (reusing the temp+link `O_CREAT|O_EXCL` primitive, `createExclusiveAtomic`); on `EEXIST` it probes `n+1`. The slot that is exclusively created IS the acceptance point — the publish order is fixed atomically, and the record is IMMUTABLE (never renamed, rewritten, or chmod-reordered), so the order is durable and bound to that exact decision version. `foldDecisionDocs` orders by the slot number. The ctime-killer is now a passing regression test (a `chmod` on the older slot does not reorder).
+- **One order for all readers (TG-R3-P2-1).** `readDecisions` and `consume` FOLD the SAME slots by slot number — no per-consumer stack-local ordering, no ctime/mtime stat, no `decisions.json`-vs-claim precedence to diverge on. A slot read error PROPAGATES (never a silent drop / fabricated order); consume reads the slots, folds, projects the merged result to `decisions-consumed-claim.json` (for the existing bandwidth reader), then EXCLUSIVE-seals `consumed.json`. Immutable slots make a mid-consume fault trivially recoverable (retry re-folds identically); the lock + the exclusive seal keep consume-once; a slot landing after the read is an orphan (R25).
+- This removes the mutable `decisions.json` + per-item taps + claim-rename / rejected-slot / ctime machinery entirely. The claim is now only a projection, never the authority.
+- Gates: bus tsc 0, scripts tsc 0, tg-entry selftest pass, **decision-batch 46** (the DB-R2/R3 claim-mechanism, ctime, and taps tests rewritten to the slot model — same invariants: read-fault recoverability, newest-wins, foreign-slot dropped, orphan signal, consume-once; a new "TG r6" block asserts the ctime-killer + read/consume order agreement + seal-failure recovery), dual-bandwidth 16, full bus **1165/1165**.
+- **Reviewer** codex `01a0ff49` (happycapy)  **Author** bus-pen `d7f6c917`
+
+## Round 5 (superseded — ctime withdrawn) — round-4 REMAIN resolved (1 P1 + 1 P2, one window)
 
 ## Round 5 — round-4 REMAIN resolved (1 P1 + 1 P2, one window)
 The r4 verdict was **1 P1 + 1 P2 (2 REMAIN)**: mtime is not the publish order (a temp written first but renamed last is stale); readDocEntry swallowed a stat error into order=0 and still sealed; content + order could be read from different versions; and a stale claim was unioned into a fresh snapshot. P1-2 stayed CLOSED.
