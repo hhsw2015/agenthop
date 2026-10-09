@@ -1,6 +1,11 @@
-# Review packet — F47-A codex bus-identity restore (daemon-adopt), ROUND 2
+# Review packet — F47-A codex bus-identity restore (daemon-adopt), ROUND 3
 
-- **Branch** `feat/f47-codex-bus`  **HEAD** `a93b890`  **Base** `main` (`bdd93d7`)  (round-1 `25f9883`)
+- **Branch** `feat/f47-codex-bus`  **HEAD** `7ee5ae0`  **Base** `main` (`bdd93d7`)  (round-1 `25f9883`, round-2 `a93b890`)
+
+## Round 3 — round-2 REMAIN resolved (F47-1 at the inbound entry; N1 nit)
+- F47-1 (P1) round-2 switched the STARTUP adopt to the strict `ownThread`, but the INBOUND entry (`handleInbound`) still fed the lenient `activeThread` result into `learnStableId` — so a normal inbound message would still adopt a wrong-cwd sole-loaded thread (same theft, different entry). Now EVERY non-authoritative identity-learning entry uses the strict resolver: DELIVERY target stays `codexDeliveryThread` (lenient `activeThread` ok — deliver into the only session around), but IDENTITY learning is `learnStableId(ownCodexThread ?? daemon.ownThread(self.cwd), authoritative = ownCodexThread !== undefined)` — authoritative own-thread, else the STRICT unique-cwd `ownThread`, never the lenient fallback. Delivery-selection and identity-learning are now decided separately at every entry (startup + inbound).
+- N1 (nit) the round-1 "The fix (A)" body still named `activeThread`/sole-loaded; updated to `ownThread` (strict, unique-cwd only) below.
+- Gates: bus tsc 0; codex-pick 13 + resolve + bus-identity pass; the inbound counterexample (wrong-cwd inbound no longer adopts) covered.
 
 ## Round 2 — round-1 REMAIN resolved (F47-1 / F47-2)
 - F47-1 (P1) identity adoption used the daemon's LENIENT `activeThread`, whose sole-loaded fallback returns the only loaded thread even when its cwd clearly belongs to another session — a node in `/projects/own` would adopt a thread in `/projects/other` and then recv that session's inbox. Fixed with a new STRICT `ownThreadByCwd` (codex.ts) + `daemon.ownThread`: a loaded thread whose cwd UNIQUELY equals ours, with NO sole-loaded fallback. Delivery keeps the lenient `activeThread`; IDENTITY must prove ownership. No unique cwd match -> stay unconfirmed. `adoptCodexIdentity` now calls `ownThread`, not `activeThread`.
@@ -17,9 +22,9 @@ codex `0.162.0` sets `experimental_use_rmcp_client = true`; the RMCP client no l
 
 ## The fix (A)
 `startBusCore` now proactively adopts the codex thread id from the daemon as the roster `stableId`, instead of waiting for per-call metadata that never comes:
-- `adoptCodexIdentity()` calls `learnStableId(codexDaemon.activeThread(self.cwd), /*authoritative*/ false)` when a codex node has no authoritative id.
+- `adoptCodexIdentity()` calls `learnStableId(codexDaemon.ownThread(self.cwd), /*authoritative*/ false)` when a codex node has no authoritative id. The inbound entry learns identically (authoritative own-thread, else `ownThread`); delivery-selection is decided separately (and may use the lenient `activeThread`).
 - A fast initial poll (1s x up to 20, stops once an id is held) covers the ~1-2s daemon handshake; the existing 5s flush timer is the steady backstop (late daemon / thread drift).
-- `activeThread(self.cwd)` is the SAME cwd-UNAMBIGUOUS resolver delivery already trusts (`pickThreadForCwd`: unique-cwd thread, else sole loaded, else undefined -> skipped).
+- `ownThread(self.cwd)` is the STRICT identity resolver (`ownThreadByCwd`: a loaded thread whose cwd UNIQUELY equals ours; NO sole-loaded fallback). A wrong/ambiguous/absent cwd -> undefined -> skipped (stay unconfirmed). Delivery keeps the lenient `activeThread` (`pickThreadForCwd`); identity never does.
 - NON-authoritative: `learnStableId` already guards — a guess never overrides an existing id, and real call metadata (if it ever returns) upgrades it to authoritative. Restart-stable: the same thread id each `codex resume`.
 - Covers BOTH the lazy MCP node and the presence daemon (both run `startBusCore`).
 
