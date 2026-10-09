@@ -203,10 +203,12 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // run changed / it has >1 node) — the bug that showed a bare run-id prefix + "default". Relay has no carry yet → it
   // falls back to resolving by the roster (labelFor/modeFor).
   const handleInbound = (from: string, text: string, via: "local" | "relay", carried?: { label?: string; mode?: string }): void => {
-    // Delivery is locked to this session's learned identity (codexDeliveryThread), so it never diverges from the
-    // published stableId. Learn from the SAME value: authoritative from call metadata, a guess from the daemon.
+    // DELIVERY may use the lenient fallback (deliver into the sole session around); IDENTITY learning must NOT (F47-1/F47-R1:
+    // every non-authoritative identity entry requires a UNIQUE cwd match). So: delivery target = codexDeliveryThread (lenient
+    // activeThread ok); identity learn = authoritative ownCodexThread, else the STRICT ownThread (a lenient sole-loaded guess
+    // never provides an ownership claim — adopting another cwd's thread here let an inbound message steal its identity).
     const codexThread = codexDeliveryThread(self.tool, ownCodexThread, self.stableId, codexDaemon?.activeThread(self.cwd));
-    learnStableId(codexThread, ownCodexThread !== undefined);
+    learnStableId(ownCodexThread ?? codexDaemon?.ownThread(self.cwd), ownCodexThread !== undefined);
     const label = carried?.label ?? labelFor(from); // the sender's stamped address, else resolve via roster
     const fromMode = carried?.mode ?? modeFor(from); // the sender's stamped mode, else resolve via roster
     // Bind the delivery identity's inbox key + arrival time NOW, before the async push. If the push fails, the fallback
@@ -379,7 +381,23 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // identity's keys (Codex P2-8), so this covers both the initial run-id and any later-adopted stableId. Unref'd — the
   // broker socket keeps the process alive; this timer must not by itself.
   void flushInbox();
-  const flushTimer = setInterval(() => { void flushInbox(); retryCheckIn(); }, 5000); // B5: the timer also retries a missed check-in
+  // F47: proactively adopt the Codex thread id from the daemon as our roster stableId. Under Codex 0.162 (rmcp client) an
+  // MCP call no longer carries x-codex-turn-metadata, so the node never learns its thread id from a call and — if it also
+  // never receives an inbound (handleInbound's adopt) — stays an un-addressable "unknown" in the roster, restart and all.
+  // F47-1: adopt ONLY via the STRICT ownThread (a loaded thread whose cwd UNIQUELY equals ours) — NOT the lenient
+  // delivery fallback `activeThread`, which would adopt the sole loaded thread even when its cwd clearly belongs to another
+  // session (stealing its identity). A NON-authoritative guess (real call metadata still upgrades it); no unique cwd match
+  // -> stay unconfirmed. F47-2: skip once `closed` so a torn-down instance never adopts or records identity.
+  let closedForAdopt = false;
+  const adoptCodexIdentity = (): void => { if (closedForAdopt || !codexDaemon || stableIdAuthoritative) return; learnStableId(codexDaemon.ownThread(self.cwd), false); };
+  // Fast initial adoption: the daemon handshake + thread list take ~1-2s, so poll briefly until we hold an id (then stop).
+  let codexIdTimer: ReturnType<typeof setInterval> | undefined;
+  if (codexDaemon) {
+    let tries = 0;
+    codexIdTimer = setInterval(() => { adoptCodexIdentity(); if (self.stableId !== undefined || ++tries >= 20) { if (codexIdTimer) clearInterval(codexIdTimer); codexIdTimer = undefined; } }, 1000);
+    codexIdTimer.unref?.();
+  }
+  const flushTimer = setInterval(() => { void flushInbox(); retryCheckIn(); adoptCodexIdentity(); }, 5000); // B5: the timer also retries a missed check-in; the steady backstop for a late daemon / thread drift
   flushTimer.unref?.();
 
   // Recipient fs-watch (B2/B3 option b): a sender now writes same-machine messages straight to our durable inbox, so watch our
@@ -509,6 +527,8 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       return `local broker: ${local.role()}; ${team_}; ${unified().filter((p) => p.id !== self.id).length} other session(s)`;
     },
     async close() {
+      closedForAdopt = true; // F47-2: a closed instance must never adopt or record identity again
+      if (codexIdTimer) { clearInterval(codexIdTimer); codexIdTimer = undefined; } // F47-2: clear the fast-adopt timer (flushTimer is cleared below)
       clearInterval(flushTimer);
       stopInboxWatch();
       stopStatusWatch();
