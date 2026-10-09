@@ -65,6 +65,45 @@ export function classifyMemberHealth(m: MemberHealthInput, cfg: { idleTimeoutSec
   return m.hasInFlight ? "disconnect-candidate" : "ok"; // ④ roster member: only an in-flight owner gone idle is a disconnect
 }
 
+/**
+ * F44-⑨ — "on the roster" is the UNION of ALL roster sources, not just the identity log + in-flight owners. The
+ * roster-snapshot (resume.ts ROSTER_FILE) is an equally authoritative member list: a session captured there (e.g. the
+ * swarm-viz front end 3e097dfe) is a real member even with no in-flight wait and no identity-log entity yet. Omitting the
+ * snapshot mislabels a registered member as a ghost daemon (the reported incident). Pure set-union. */
+export function isOnRoster(sid: string, src: { activeOwners: ReadonlySet<string>; identityEntity: boolean; snapshotMembers: ReadonlySet<string> }): boolean {
+  return src.activeOwners.has(sid) || src.identityEntity || src.snapshotMembers.has(sid);
+}
+
+/** F44-9: a roster-snapshot member may be a full presence SID or a short HANDLE (assembleRoster falls back to e.g.
+ *  `Work-3e097dfe` when the stableId is absent). The ghost check compares against full presence SIDs, so each snapshot
+ *  member must be RESOLVED to its current SID first (via the unique-identity rule — `resolve` = resolveSession bound to the
+ *  live presence sids). An ambiguous/unknown handle resolves to null and is dropped (never guessed), so it simply does not
+ *  grant roster membership. A full SID resolves to itself. Returns the set of resolved SIDs. Pure (resolve injected). */
+export function resolveSnapshotMembers(members: readonly unknown[], resolve: (handle: string) => string | null): Set<string> {
+  const out = new Set<string>();
+  if (!Array.isArray(members)) return out;
+  for (const m of members) {
+    const handle = m && typeof m === "object" && typeof (m as { member?: unknown }).member === "string"
+      ? (m as { member: string }).member
+      : typeof m === "string" ? m : null;
+    if (!handle) continue;
+    const sid = resolve(handle);
+    if (sid) out.add(sid);
+  }
+  return out;
+}
+
+export type BlockedRoute = "escalate" | "escalate-once";
+
+/**
+ * F44-⑧ — a `blocked` self-report from a presence-only session escalates to the coordinator as swarm work ONLY for a
+ * ROSTER member. A non-roster presence (e.g. the user's PRIVATE session) is not swarm work and must not keep surfacing to
+ * the coordinator — it is routed "escalate-once" (surfaced at most once per blocked episode, since it MIGHT be a member
+ * whose identity has not resolved yet, then suppressed). The caller gates "escalate-once" with a one-time set. Pure. */
+export function classifyBlockedEscalation(onRoster: boolean): BlockedRoute {
+  return onRoster ? "escalate" : "escalate-once";
+}
+
 export type ProcInfo = { pid: number; ppid: number; command: string };
 
 /** Parse `ps -axo pid=,ppid=,command=` output into {pid, ppid, command}. Pure; malformed lines are skipped. */

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  AlertDedup, alertKey, isValidInboxKey, classifyMemberHealth, GhostOnce,
+  AlertDedup, alertKey, isValidInboxKey, classifyMemberHealth, GhostOnce, isOnRoster, classifyBlockedEscalation, resolveSnapshotMembers,
   parsePsOutput, selfTree, isDispatcherLoopCommand, isDispatcherAlreadyRunning, shouldEmitWatchNotice,
   type ProcInfo,
 } from "../src/swarm/sentinel-denoise.js";
@@ -100,6 +100,56 @@ describe("F44 sentinel-denoise — ③④ classifyMemberHealth", () => {
   test("no presence ⇒ ok; NaN idle ⇒ ok (never convicts on an undefined duration)", () => {
     expect(classifyMemberHealth({ onRoster: false, hasInFlight: false, idleSec: 9999, presenceSeen: false }, cfg)).toBe("ok");
     expect(classifyMemberHealth({ onRoster: false, hasInFlight: false, idleSec: NaN, presenceSeen: true }, cfg)).toBe("ok");
+  });
+});
+
+describe("F44-⑨ isOnRoster — union of ALL roster sources (identity log + in-flight owners + roster-snapshot)", () => {
+  const S = (...xs: string[]) => new Set(xs);
+  test("in roster-snapshot only ⇒ on roster (the 3e097dfe incident: registered member, no in-flight, no identity entity)", () => {
+    expect(isOnRoster("3e097dfe", { activeOwners: S(), identityEntity: false, snapshotMembers: S("3e097dfe") })).toBe(true);
+  });
+  test("an in-flight owner ⇒ on roster", () => {
+    expect(isOnRoster("x", { activeOwners: S("x"), identityEntity: false, snapshotMembers: S() })).toBe(true);
+  });
+  test("an identity-log entity ⇒ on roster", () => {
+    expect(isOnRoster("x", { activeOwners: S(), identityEntity: true, snapshotMembers: S() })).toBe(true);
+  });
+  test("in NO source ⇒ not on roster (a genuine stray ⇒ still a ghost)", () => {
+    expect(isOnRoster("stray", { activeOwners: S("other"), identityEntity: false, snapshotMembers: S("member") })).toBe(false);
+  });
+});
+
+describe("F44-⑧ classifyBlockedEscalation — roster-gate the blocked alert", () => {
+  test("roster member blocked ⇒ escalate (swarm work)", () => {
+    expect(classifyBlockedEscalation(true)).toBe("escalate");
+  });
+  test("non-roster (e.g. user's private session) blocked ⇒ escalate-once (not repeated coordinator noise)", () => {
+    expect(classifyBlockedEscalation(false)).toBe("escalate-once");
+  });
+});
+
+describe("F44-9 resolveSnapshotMembers — map snapshot handles to current SIDs (not raw member strings)", () => {
+  // the 3e097dfe incident: assembleRoster emitted member="Work-3e097dfe"; presence has the full sid.
+  const sids = ["3e097dfe-81b3-4cca-b678-80dd3480a203", "90b58f9c-5bac-4318-a996-2373c179d674"];
+  const resolve = (h: string) => { // mirrors resolveSession(h, sids)
+    if (sids.includes(h)) return h;
+    const tail = h.slice(h.lastIndexOf("-") + 1);
+    const hit = sids.filter((s) => s.startsWith(tail));
+    return hit.length === 1 ? hit[0] : null;
+  };
+  test("a short handle resolves to its full SID (ghost false-positive fixed)", () => {
+    const set = resolveSnapshotMembers([{ member: "Work-3e097dfe" }], resolve);
+    expect(set.has("3e097dfe-81b3-4cca-b678-80dd3480a203")).toBe(true);
+  });
+  test("a full SID resolves to itself", () => {
+    expect(resolveSnapshotMembers([{ member: "90b58f9c-5bac-4318-a996-2373c179d674" }], resolve).has("90b58f9c-5bac-4318-a996-2373c179d674")).toBe(true);
+  });
+  test("an ambiguous/unknown handle is dropped (never guessed)", () => {
+    expect(resolveSnapshotMembers([{ member: "Work-nope" }], resolve).size).toBe(0);
+  });
+  test("non-array / malformed members ⇒ empty", () => {
+    expect(resolveSnapshotMembers(null as any, resolve).size).toBe(0);
+    expect(resolveSnapshotMembers([{ notmember: "x" }, 42], resolve).size).toBe(0);
   });
 });
 

@@ -4,7 +4,7 @@ import {
   HARD_NOT_STARTED, SUBMIT_REJECTED, WAIT_SETTLE_TYPES, WHITELIST_V1, agentPaneId, buildAgentGet,
   buildAgentPromptWait, buildAgentRead, buildAgentStart, buildAgentSubmit, buildAgentWait, buildApprovalDoc,
   buildPaneClose, buildPaneSplit, buildSendKeys, classifyStart, classifySubmit, classifyWaitOutcome, hasExplicitBinary,
-  herdrAgentName, herdrSpawnable, paneBound, paneIdFromSplit, scanCommand, sentinelDecision, settledFrom,
+  herdrAgentName, herdrSpawnable, paneBound, paneIdForSession, paneIdFromSplit, scanCommand, sentinelDecision, settledFrom,
   shellTokenize, splitCommand, startedName, stripTui,
 } from "./herdr.js";
 import { validInboxMsg } from "../inbox.js";
@@ -177,6 +177,22 @@ const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED:
   // "timeout-worker", or "socket timed out" on a connection failure) — both are error, never a member-wait timeout.
   t("LS3 non-timeout code + 'timeout' in text -> error", classifyWaitOutcome({ error: { code: "permission_denied" } }, "member timeout-worker denied", true, "idle", until) === "error");
   t("LS3 'socket timed out' failed exit (no code) -> error", classifyWaitOutcome(null, "socket timed out", true, "idle", until) === "error");
+}
+
+// --- F44-⑦: paneIdForSession (sid -> pane_id via agent_session.value; a nameless claude agent is read by pane) ---
+{
+  const agentList = { result: { type: "agent_list", agents: [
+    { agent: "claude", agent_session: { kind: "id", value: "fe0376cd-sid" }, agent_status: "blocked", pane_id: "w1:p1" }, // nameless claude
+    { agent: "codex", name: "mea01a0ead5", agent_session: { kind: "id", value: "codex-sid" }, agent_status: "idle", pane_id: "w1:p6" },
+  ] } };
+  t("F44-7: nameless claude mapped by agent_session.value -> pane_id", paneIdForSession(agentList, "fe0376cd-sid") === "w1:p1");
+  t("F44-7: codex session -> its pane_id", paneIdForSession(agentList, "codex-sid") === "w1:p6");
+  t("F44-7: unknown sid -> null", paneIdForSession(agentList, "nope") === null);
+  t("F44-7: empty sid -> null", paneIdForSession(agentList, "") === null);
+  const paneList = { result: { type: "pane_info", panes: [{ agent_session: { value: "s1" }, pane_id: "w1:p3" }, { pane_id: "w1:p4" }] } };
+  t("F44-7: pane list shape supported", paneIdForSession(paneList, "s1") === "w1:p3");
+  t("F44-7: an unbound pane (no agent_session) is not matched", paneIdForSession(paneList, "") === null);
+  t("F44-7: garbage json -> null", paneIdForSession(null, "x") === null && paneIdForSession({ result: {} }, "x") === null);
 }
 
 console.log("all herdr selftests passed");
