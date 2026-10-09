@@ -41,7 +41,20 @@ Resolver is pure + UNWIRED (the live spawn/launcher still reads v1; wiring it is
 flag; the committed golden shows the pattern for pure-layer-impl (io-impl / adversarial-review follow identically; adversarial-review
 then gains `flavors: {strict, lenient}`). NOT in scope: budget-pool fragment (立项②), force_handoff (立项④), any RoleCatalog/t3 change.
 
+## Round-1 fixes (0P1/3P2/0P3 @0edbcc4 → this SHA) — same family as the ruling-ledger r2 counterexamples, same recipe
+
+- **RP-P2-1** (object patch bypassed recursion): `mergeRolePatch` now ALWAYS recurses into an object patch value, treating a
+  missing/non-object target as `{}`, so nested null-delete / `key+`/`key-` sigils / forbidden-key / double-touch checks apply at
+  every depth. `{}` + `{branch:{drop:null,"items+":["a"]}}` ⇒ `{branch:{items:["a"]}}`; a nested `__proto__` rejects.
+- **RP-P2-2** (inherited reads + getter TOCTOU): every field is read with `ownVal` (`Object.getOwnPropertyDescriptor(...).value`
+  — own data only, never the prototype, never invoking an accessor) and CAPTURED ONCE for both validation and output. An
+  all-inherited role rejects; a getter field is absent ⇒ reject; an inherited `modelTier.floor` does not satisfy a v2 role.
+- **RP-P2-3** (input methods on arrays): `strArrayCopy` validates + copies by index (no `.every`/spread), rejecting a sparse hole
+  or a hijacked `every`; `mergeRolePatch` remove builds a `Set` and filters by index (never `val.includes`/`cur.filter`), so a
+  hijacked `includes` can't delete a whole array.
+
 ## Verification already run
 
-role-profile.test.ts 17/17 (incl. the real-role golden) · bus tsc 0 · scripts tsc 0 · full bus 87 files / 1164 tests pass. Not
-pushed, not merged (merge/enable gate = coordinator + user).
+role-profile.test.ts 25/25 (incl. the real-role golden + 8 new RP-P2 regressions) · reviewer probe `profile-boundaries.test.ts`
+11/11 (was 3/11) · bus tsc 0 · scripts tsc 0 · full bus 87 files / 1172 tests pass. Not pushed, not merged (merge/enable gate =
+coordinator + user).

@@ -147,6 +147,51 @@ describe("role-profile — GOLDEN real-role migration byte-identity (钉迁移)"
   });
 });
 
+describe("role-profile — RP-P2-1 object patch always recurses (absent/non-object target ⇒ {})", () => {
+  test("recurses into an object patch on a missing target, applying null-delete + sigil inside", () => {
+    expect(okv(mergeRolePatch({}, { branch: { drop: null, "items+": ["a"] } }))).toEqual({ branch: { items: ["a"] } });
+  });
+  test("a non-object target is treated as {} and merged, not overwritten verbatim", () => {
+    expect(okv(mergeRolePatch({ b: "scalar" }, { b: { k: 1 } }))).toEqual({ b: { k: 1 } });
+  });
+  test("a nested forbidden key is caught inside the recursion", () => {
+    expect(mergeRolePatch({}, { branch: JSON.parse('{"__proto__":{"x":1}}') }).ok).toBe(false);
+    expect(({} as Record<string, unknown>).x).toBeUndefined(); // no global pollution
+  });
+});
+
+describe("role-profile — RP-P2-2 own-property + capture-once (no inherited reads, no getter TOCTOU)", () => {
+  test("a role whose fields are all INHERITED is rejected (own-only reads)", () => {
+    const proto = { roleId: "r", title: "t", summary: "s", skills: ["a"], modelTier: { floor: "light" }, expectedParallelism: 1, fileDomain: ["x"], promptTemplate: "P", claimDiscipline: "c", boundaries: ["b"] };
+    expect(loadRoleProfile(Object.create(proto)).ok).toBe(false);
+  });
+  test("a getter field is treated as absent (never invoked), so a TOCTOU cannot slip a number through", () => {
+    let n = 0;
+    const v2: Record<string, unknown> = { schemaNote: "roleProfile/v2", roleId: "r", title: "t", summary: "s", modelTier: { floor: "standard" }, expectedParallelism: 1, fileDomain: ["x"], claimDiscipline: "c" };
+    Object.defineProperty(v2, "promptHead", { enumerable: true, configurable: true, get() { return n++ === 0 ? "head" : 42; } });
+    expect(loadRoleProfile(v2).ok).toBe(false); // ownVal reads descriptor.value (none for an accessor) ⇒ promptHead absent ⇒ reject
+  });
+  test("an inherited modelTier.floor does not satisfy a v2 role", () => {
+    const mt = Object.create({ floor: "heavy" }); // floor is inherited
+    const v2 = { schemaNote: "roleProfile/v2", roleId: "r", title: "t", summary: "s", modelTier: mt, expectedParallelism: 1, fileDomain: ["x"], claimDiscipline: "c", promptHead: "h" };
+    expect(loadRoleProfile(v2).ok).toBe(false);
+  });
+});
+
+describe("role-profile — RP-P2-3 arrays validated/copied/removed by index (no input methods)", () => {
+  test("a sparse array is rejected; a hijacked every cannot smuggle a non-string", () => {
+    const sparse = { roleId: "r", title: "t", summary: "s", skills: new Array(1), modelTier: { floor: "light" as const }, expectedParallelism: 1, fileDomain: ["x"], promptTemplate: "P", claimDiscipline: "c", boundaries: ["b"] };
+    expect(loadRoleProfile(sparse).ok).toBe(false);
+    const skills = ["ok", 2] as unknown[]; (skills as { every: unknown }).every = () => true;
+    expect(loadRoleProfile({ roleId: "r", title: "t", summary: "s", skills, modelTier: { floor: "light" }, expectedParallelism: 1, fileDomain: ["x"], promptTemplate: "P", claimDiscipline: "c", boundaries: ["b"] }).ok).toBe(false);
+  });
+  test("remove matches ACTUAL elements (Set membership), never a hijacked includes/filter", () => {
+    const evil = ["zzz"] as string[]; (evil as { includes: unknown }).includes = () => true; // would delete everything if called
+    expect(okv(mergeRolePatch({ boundaries: ["a", "b"] }, { "boundaries-": evil }))).toEqual({ boundaries: ["a", "b"] }); // "zzz" absent ⇒ nothing removed
+    expect(okv(mergeRolePatch({ boundaries: ["a", "b", "c"] }, { "boundaries-": ["b"] }))).toEqual({ boundaries: ["a", "c"] });
+  });
+});
+
 describe("role-profile — roleProfileV2Enabled (dormant, default OFF)", () => {
   test("default OFF; truthy words ON", () => {
     expect(roleProfileV2Enabled({})).toBe(false);
