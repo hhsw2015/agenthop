@@ -891,12 +891,16 @@ async function main(): Promise<void> {
       const open = openDelegation(reg, spec, nowSec());
       if (!open.ok) { log(`board envelope ${app.jobId}/${app.nodeId}: open rejected (${open.reason}) — retry next reconcile`); return { status: "deferred" }; }
       // EO2: recover the envelope by the production wait's ACTUAL lifecycle in CONTROL (its id comes from the registered
-      // envelope, not a re-derived formula). A wait already RESOLVED/frozen (production produced / cancelled / revoked) must
-      // NEVER be re-declared as an active OPEN, nor have a production-phase envelope persisted over it — that would make the
-      // two durable faces contradict. The grant stands; no OPEN receipt. The original deadline + close reason are untouched.
+      // envelope, not a re-derived formula). Never re-declare an active OPEN over a wait that is no longer live, nor persist a
+      // production-phase envelope that contradicts CONTROL.
       const waitId = open.envelope.productionWaitId;
+      // A FREEZE (op-conflict) lives in LogState.frozen, NOT wait.state — a frozen wait can still read state "open". A frozen
+      // production is BLOCKED, not concluded: retain the recovery obligation (keep the claim, no OPEN receipt, nothing
+      // persisted over the conflict) and re-evaluate once the freeze is lifted ⇒ deferred, not settled.
+      if (st.frozen.includes(`wait:${waitId}`)) { log(`board envelope ${app.jobId}/${app.nodeId}: production wait ${waitId} is frozen (op-conflict) — retaining the claim, not declaring OPEN`); return { status: "deferred" }; }
       const existingWait = findWaitIn(st, waitId);
       const waitLive = existingWait !== undefined && (existingWait.state === "open" || existingWait.state === "action_pending");
+      // A RESOLVED/concluded production (produced / cancelled / revoked) is terminal — the grant stands, no OPEN receipt, nothing persisted over it.
       if (existingWait !== undefined && !waitLive) { log(`board envelope ${app.jobId}/${app.nodeId}: production wait ${waitId} is ${existingWait.state} — not re-declaring OPEN`); return { status: "settled" }; }
       // Commit the production-wait ONLY when it is ABSENT (the registry may have been lost after a prior wait-commit); a LIVE
       // existing wait is adopted as-is — never re-committed (which would reset its deadline).
