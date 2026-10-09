@@ -1,6 +1,12 @@
-# Review packet — envelope-open side (§2b OPEN, an R14 pre-flight, dual to BA9), ROUND 1
+# Review packet — envelope-open side (§2b OPEN, an R14 pre-flight, dual to BA9), ROUND 2
 
-- **Branch** `feat/envelope-open`  **HEAD** `a39d129`  **Base** `main` (`3732f4b`)
+- **Branch** `feat/envelope-open`  **HEAD** `db43600`  **Base** `main` (`3732f4b`)  (round-1 `a39d129`)
+
+## Round 2 — round-1 REMAIN resolved (EO1/EO2/EO3)
+- EO1 (P1) a failed OPEN no longer marks granted. `openGrantEnvelope` returns a tri-state (`none` | `deferred` | `opened`); on `deferred` the consumer KEEPS the claim (the grant attempt is already durable; the receipt + granted-rename wait) so the next tick's reconcile RETRIES OPEN — never granted-without-envelope. `none` (node has no required output) marks granted normally. The retry is the existing reconcile path (a still-`claimed` item whose live attempt carries our board-exec wait + same owner), so a transient failure (seq conflict / unreadable registry) self-heals in a tick or two; a persistent failure stalls the claim honestly rather than marking a granted item that has no envelope.
+- EO2 (P1) the production-wait is committed ONLY when it is ABSENT from CONTROL (`findWaitIn`), not merely when the registry looks fresh. The prior code keyed "first OPEN" off the registry alone, so a registry LOST after a committed wait would, on retry, re-emit + re-commit the wait (reopening a resolved wait / resetting its deadline, erasing the close reason). Now an existing wait (open OR resolved/frozen) is adopted as-is; the registry is then persisted to catch up. A conflict is never treated as a new OPEN.
+- EO3 (P2) the grant receipt now carries the envelope's requestId + payloadDigest + subject revision + a RESOLVABLE payload SOURCE (the delegations registry, keyed by requestId, holds the inline frozen payload) — enough to locate the frozen payload and run `receiptMatches`, per the design's RECEIPT clause. No execution asked (A2).
+- Gates: bus tsc 0, scripts tsc 0, bus vitest 1132/1132 (board-envelope test 8 — pure `planGrantEnvelope` unchanged; EO1/EO2/EO3 are driver-IO).
 - **Reviewer** codex `01a0ead5` (cross-family, independent)  **Author** bus-pen `d7f6c917`
 - **Design** `docs/swarm/envelope-open-design.md` @`41c48e4` (coordinator-dispatched to implement during the re-review wait)
 
