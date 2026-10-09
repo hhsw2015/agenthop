@@ -13,31 +13,31 @@
  */
 
 import { CAPACITY_PROBE_CMD } from "./remote-capacity.js";
+import { buildHerdrInstallStep, HERDR_INSTALL_URL } from "./vm-ctl.js"; // D4-1: single construction point lives in vm-ctl's boot family
+export { HERDR_INSTALL_URL }; // keep the public name stable for importers of this module
 
 // ============================================================================================================
 // Pure layer — builders + linkage algebra (selftested in remote-bootstrap.selftest.mts)
 // ============================================================================================================
 
 export const BOOTSTRAP_SOURCE = "remote-herdr-view";
-export const HERDR_INSTALL_URL = "https://herdr.dev/install.sh";
 
 /**
  * The one-shot remote bootstrap, passed as `vm-ssh up --init <this>`. Installs herdr (must match the LOCAL version or
- * `machine add` refuses) and prints the capacity probe to stdout (the local flow feeds it to capacityFromProbe). Pure.
- */
+ * `machine add` refuses) and prints the capacity probe to stdout (the local flow feeds it to capacityFromProbe). The
+ * herdr-install lines come from vm-ctl's `buildHerdrInstallStep` (D4-1: one construction point for the boot template —
+ * RH6 download-then-run + VMC-P2-1 shQuote'd URL); this function adds the shebang, `set -eu`, comments, the shared probe,
+ * and the exec-a note. Pure. */
 export function buildBootstrapScript(opts: { herdrInstallUrl?: string } = {}): string {
   const url = opts.herdrInstallUrl ?? HERDR_INSTALL_URL;
   return [
     "#!/bin/sh",
     "set -eu",
     "# remote-herdr-view ③ boot template — runs on the fresh VM via `vm-ssh up --init`.",
-    "# 1. herdr (must match the local version, else local `machine add` refuses).",
-    "#    Download THEN run as SEPARATE commands with an explicit `|| exit` (RH6): never pipe curl into a shell (hides",
-    "#    curl's exit), and never join them with `&&` either — under `set -e` a failed LHS of an and-list is EXEMPT, so a",
-    "#    failed download would be swallowed and nproc/free still run, exiting 0. `|| exit 1` stops the script non-zero.",
-    'herdr_installer="$(mktemp)"',
-    `curl -fsSL ${url} -o "$herdr_installer" || exit 1`,
-    'sh "$herdr_installer"',
+    "# 1. herdr (must match the local version, else local `machine add` refuses). The install step is vm-ctl's",
+    "#    buildHerdrInstallStep (D4-1 single source): download THEN run as SEPARATE commands with an explicit `|| exit`",
+    "#    (RH6 — never pipe curl into a shell, never join with `&&` which `set -e` exempts); URL shQuote'd (VMC-P2-1).",
+    ...buildHerdrInstallStep(url),
     "# 2. capacity probe → stdout; the local add-flow reads it and computes agentCapacity (remote-capacity.ts).",
     CAPACITY_PROBE_CMD,
     "# 3. NOTE: every agent launcher on this box MUST `exec -a claude <real-binary>` so herdr identifies the agent by",

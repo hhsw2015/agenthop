@@ -11,6 +11,8 @@ import {
   forkPlan,
   buildCodePlan,
   buildBootPlan,
+  buildHerdrInstallStep,
+  HERDR_INSTALL_URL,
   shQuote,
   READY_BACKOFF_SEC,
   type Verb,
@@ -137,7 +139,14 @@ t("code plan via adopt (accountless source)", buildCodePlan("codex", { verb: "ad
 
 // --- boot plan: download-then-run (never curl|sh), re-runnable ---
 const boot = buildBootPlan();
-t("boot plan downloads then runs (RH6)", boot[0].includes("-o") && boot[0].includes("|| exit 1") && !boot[0].includes("| sh"));
+const bootCurl = boot.find((l) => l.includes("curl"))!;
+t("boot plan downloads then runs (RH6)", bootCurl.includes("-o") && bootCurl.includes("|| exit 1") && !boot.some((l) => l.includes("| sh")));
 t("boot plan documents exec -a claude", boot.some((l) => l.includes("exec -a claude")));
+
+// --- D4-1: buildHerdrInstallStep is the single construction point both callers compose from ---
+const step = buildHerdrInstallStep();
+t("D4-1: install step is download-then-run, shQuote'd url, || exit 1 (RH6+VMC-P2-1)", step.length === 3 && step[1].includes(`curl -fsSL '${HERDR_INSTALL_URL}' -o "$herdr_installer" || exit 1`) && step[2] === 'sh "$herdr_installer"' && !step.some((l) => l.includes("| sh")));
+t("D4-1: custom url stays shQuote'd (metachars inert)", buildHerdrInstallStep("http://x/i.sh?a=1&b=2")[1].includes("'http://x/i.sh?a=1&b=2'"));
+t("D4-1: boot plan composes the shared step verbatim", step.every((l) => boot.includes(l)));
 
 console.log("all vm-ctl selftests passed");

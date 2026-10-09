@@ -9,16 +9,20 @@ import {
   HERDR_INSTALL_URL,
 } from "./remote-bootstrap.js";
 import { CAPACITY_PROBE_CMD } from "./remote-capacity.js";
+import { buildHerdrInstallStep } from "./vm-ctl.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
 // --- buildBootstrapScript: has the install, the (shared) probe cmd, and the exec -a claude requirement ---
 const script = buildBootstrapScript();
 t("bootstrap: shebang + set -eu", script.startsWith("#!/bin/sh\nset -eu"));
-t("bootstrap: installs herdr from the canonical url", script.includes(`curl -fsSL ${HERDR_INSTALL_URL} -o`));
+t("bootstrap: installs herdr from the canonical url (shQuote'd, VMC-P2-1)", script.includes(`curl -fsSL '${HERDR_INSTALL_URL}' -o`));
 t("bootstrap: reuses CAPACITY_PROBE_CMD (DRY)", script.includes(CAPACITY_PROBE_CMD));
 t("bootstrap: documents exec -a claude argv0 requirement", script.includes("exec -a claude"));
-t("bootstrap: custom install url honored", buildBootstrapScript({ herdrInstallUrl: "https://x/i.sh" }).includes("curl -fsSL https://x/i.sh -o"));
+t("bootstrap: custom install url honored (shQuote'd)", buildBootstrapScript({ herdrInstallUrl: "https://x/i.sh" }).includes("curl -fsSL 'https://x/i.sh' -o"));
+// D4-1: the herdr-install lines are vm-ctl's single construction point, embedded verbatim (no second copy here).
+t("D4-1: bootstrap embeds vm-ctl's buildHerdrInstallStep verbatim", buildHerdrInstallStep().every((l) => script.includes(l)));
+t("D4-1: custom url flows through the shared step", buildHerdrInstallStep("https://x/i.sh").every((l) => buildBootstrapScript({ herdrInstallUrl: "https://x/i.sh" }).includes(l)));
 
 // --- buildCapacityMetadataArgs: exact CLI shape ---
 t("capacity meta args exact", JSON.stringify(buildCapacityMetadataArgs("w3", 2)) ===

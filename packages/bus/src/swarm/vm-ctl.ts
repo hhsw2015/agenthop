@@ -17,6 +17,8 @@
  * runs. Credential discipline (§creds) is a hard gate: a credential travels on stdin into a 0600 file, NEVER argv.
  */
 
+import { CAPACITY_PROBE_CMD } from "./remote-capacity.js"; // D4-1: single-source the capacity probe command (its parsers live here)
+
 // ============================================================================================================
 // Pure core (selftested in vm-ctl.selftest.mts)
 // ============================================================================================================
@@ -261,19 +263,34 @@ export function buildCodePlan(family: CredFamily, source: { verb: "up" | "adopt"
   ];
 }
 
-/** Idempotent boot plan (hard-condition: re-runnable from any point). Converges with remote-bootstrap's
- *  buildBootstrapScript (deduped at merge); kept self-contained here since that lives on an unmerged branch. Pure. */
 /** POSIX single-quote a string so the shell treats it as ONE literal argument (no `$(...)`, `&`, globbing). Pure. */
 export function shQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-export function buildBootPlan(opts: { herdrInstallUrl?: string } = {}): string[] {
-  const url = opts.herdrInstallUrl ?? "https://herdr.dev/install.sh";
+/** The canonical herdr install URL (one source; remote-herdr-view's bootstrap re-exports this). */
+export const HERDR_INSTALL_URL = "https://herdr.dev/install.sh";
+
+/**
+ * D4-1: the ONE construction point for the herdr-install step of a boot template — both vm-ctl's boot plan and
+ * remote-herdr-view's bootstrap script compose from this (the batch-4 DRIFT was two divergent copies). Download THEN run
+ * as SEPARATE commands with an explicit `|| exit 1` (RH6): never `curl | sh` (hides curl's exit), never `&&` (under
+ * `set -e` a failed and-list LHS is exempt, so a failed download would be swallowed). The URL is shQuote'd (VMC-P2-1) so
+ * a query `&`/`$(...)`/metachar can't rewrite the command or run before the download. Returns the ordered lines. Pure. */
+export function buildHerdrInstallStep(url: string = HERDR_INSTALL_URL): string[] {
   return [
-    // VMC-P2-1: the URL is single-quoted so query `&`/`$(...)`/metachars can't rewrite the command or run before download.
-    `tmp=$(mktemp); curl -fsSL ${shQuote(url)} -o "$tmp" || exit 1; sh "$tmp"`, // install herdr (download-then-run, RH6)
-    "nproc; free -b", // capacity probe → stdout
+    `herdr_installer="$(mktemp)"`,
+    `curl -fsSL ${shQuote(url)} -o "$herdr_installer" || exit 1`,
+    `sh "$herdr_installer"`,
+  ];
+}
+
+/** Idempotent boot plan (hard-condition: re-runnable from any point). Composes the shared herdr-install step + the shared
+ *  capacity probe (D4-1 single source), so it can never drift from remote-herdr-view's bootstrap script again. Pure. */
+export function buildBootPlan(opts: { herdrInstallUrl?: string } = {}): string[] {
+  return [
+    ...buildHerdrInstallStep(opts.herdrInstallUrl ?? HERDR_INSTALL_URL), // install herdr (the single construction point)
+    CAPACITY_PROBE_CMD, // capacity probe → stdout (shared with remote-capacity's parsers)
     "# ensure every agent launcher uses `exec -a claude <real-binary>` (herdr argv0 identify)",
     "# reconcile hooks/config idempotently (safe to re-run)",
   ];
