@@ -1,14 +1,16 @@
 /**
  * FC-4 spend circuit-breaker IO (dormant filing). CONSUMES the DA2 shared-budget-store API only — it never
  * touches shared-budget's files or behavior. One budget pool per task ticket (budgetRef = `task-<ticketId>`):
- * a ticket registers its budget, each spawn reserves its estimate, real spend is booked via commit, and a
- * reserve that would exceed the cap trips the breaker. In-flight reservations are never force-killed on a
- * trip (pool semantics); only NEW spawns are refused until the coordinator rules (S19).
+ * a ticket registers its budget, each spawn reserves its estimate, real spend is booked via commit. It is a
+ * SOFT cap (shared-budget SB3): a reserve made once committed + in-flight is already at/over the ceiling is
+ * refused — the reserve that first crosses is admitted, the one after it trips. In-flight reservations are
+ * never force-killed on a trip, and a settled (owner-timed-out) reserve KEEPS its liability (never refunded);
+ * only NEW spawns are refused until the coordinator rules (S19).
  */
 import { createPool, readPool, reservePool, commitDraw } from "./shared-budget-store.js";
 import { writeInbox, composeInboxMsg } from "../inbox.js";
 import { breakerEnabled, budgetRefFor, verdictFromAdmission, type SpendVerdict } from "./spend-breaker.js";
-import { spentOf, type PoolCeiling, type PoolDraw, type PoolState, type Reservation } from "./shared-budget.js";
+import { spentOf, inflightOf, remainingOf, type PoolCeiling, type PoolDraw, type PoolState, type Reservation } from "./shared-budget.js";
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -63,15 +65,39 @@ export function presentTripToCoordinator(
   ticketId: string,
   v: Extract<SpendVerdict, { allowed: false }>,
 ): void {
+  // SBK-P2-1: the card must NAME the dimension(s) that tripped and show per-axis balances WITH UNITS,
+  // distinguishing committed spend from in-flight liability — and must NOT present an unbounded (null-ceiling)
+  // axis as "the balance". Derive from the pool ledger; fall back to the verdict's remaining only if the pool
+  // is unreadable (then without the committed/in-flight split, which only the ledger carries).
   const st = taskBudget(home, ticketId);
-  const spent = st ? spentOf(st) : { usd: 0, tokens: 0 };
-  const rem = v.remaining.usd === null ? "∞" : `$${v.remaining.usd}`;
+  const lines: string[] = [];
+  const tripped: string[] = [];
+  if (st) {
+    const spent = spentOf(st), inflight = inflightOf(st), rem = remainingOf(st), ceil = st.ceiling;
+    if (ceil.maxUsd !== null) {
+      const r = rem.usd ?? 0;
+      lines.push(`USD $${spent.usd.toFixed(2)} committed + $${inflight.usd.toFixed(2)} in-flight of $${ceil.maxUsd} cap (remaining $${r.toFixed(2)})`);
+      if (r <= 0) tripped.push("USD");
+    }
+    if (ceil.maxTokens !== null) {
+      const r = rem.tokens ?? 0;
+      lines.push(`tokens ${spent.tokens} committed + ${inflight.tokens} in-flight of ${ceil.maxTokens} cap (remaining ${r})`);
+      if (r <= 0) tripped.push("tokens");
+    }
+  } else {
+    // pool unreadable — least-bad fallback from the verdict (no committed/in-flight split), still unit-tagged
+    // and still skipping any unbounded axis.
+    if (v.remaining.usd !== null) { lines.push(`USD remaining $${v.remaining.usd.toFixed(2)}`); if (v.remaining.usd <= 0) tripped.push("USD"); }
+    if (v.remaining.tokens !== null) { lines.push(`tokens remaining ${v.remaining.tokens}`); if (v.remaining.tokens <= 0) tripped.push("tokens"); }
+  }
+  const dims = tripped.length ? tripped.join(" + ") : "budget";
+  const detail = lines.length ? " — " + lines.join("; ") : "";
   writeInbox(home, coordinatorId, composeInboxMsg({
     from: coordinatorId,
     fromLabel: "spend-breaker",
-    text: `task ${ticketId} hit its spend cap — further spawning refused (spent $${spent.usd.toFixed(2)} / ${spent.tokens} tok; remaining ${rem}). Raise the cap or halt the ticket; in-flight work keeps running.`,
+    text: `task ${ticketId} hit its ${dims} cap — further spawning refused${detail}. Raise the cap or halt the ticket; in-flight work keeps running.`,
     via: "spend-breaker",
     taskRef: `spend-breaker:${ticketId}`,
-    title: "spend cap tripped — decide",
+    title: `spend cap tripped (${dims}) — decide`,
   }));
 }

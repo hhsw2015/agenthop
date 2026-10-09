@@ -1,9 +1,11 @@
 /**
  * FC-4 spend circuit-breaker (pure core). A per-task-ticket spend cap layered on the DA2 shared-budget pool
  * primitives: each ticket gets a budget pool (ceiling = the ticket's spend cap); every would-be spawn first
- * RESERVEs its estimate, and when committed + in-flight would exceed the cap the breaker TRIPS — refuse to
- * spawn more sub-units, present the trip to the coordinator (S19), and leave in-flight work ALONE (pool
- * semantics: a reservation is never force-killed; it reconciles via commit or expires). This is the
+ * RESERVEs its estimate. It is a SOFT cap (shared-budget SB3): a reserve is admitted while committed +
+ * in-flight is still under the ceiling, so the reserve that FIRST crosses the line is let through and the NEXT
+ * one trips — the breaker then refuses further spawns, presents the trip to the coordinator (S19), and leaves
+ * in-flight work ALONE (a reservation is never force-killed; it reconciles via commit, or on owner-timeout is
+ * marked SETTLED with its estimate RETAINED as a conservative charge — SB3: never refunded). This is the
  * spend-AMOUNT dimension, distinct from the existing spawn-COUNT cap a runaway ticket would otherwise slip.
  *
  * DORMANT: gated behind SWARM_SPEND_BREAKER (default OFF). OFF ⇒ every request is allowed and NO pool is
