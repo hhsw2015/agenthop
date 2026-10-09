@@ -858,7 +858,7 @@ async function main(): Promise<void> {
   // §2b OPEN result: "none" = no envelope needed (node has no required output) ⇒ mark granted normally; "deferred" = OPEN
   // could not complete ⇒ EO1 the caller keeps the claim (retry next reconcile), NEVER mark granted; "opened" = registered +
   // wait committed, carries the frozen identity the receipt needs (EO3).
-  type EnvelopeOpen = { status: "none" } | { status: "deferred" } | { status: "opened"; requestId: string; payloadDigest: string; revision?: number };
+  type EnvelopeOpen = { status: "none" } | { status: "deferred" } | { status: "settled" } | { status: "opened"; requestId: string; payloadDigest: string; revision?: number };
   const deliverGrantAndMark = (claim: { itemId: string; who: string }, grant: { attemptId: string; waitId: string; bindingId?: string; envelope?: EnvelopeOpen }): void => {
     const claimFile = path.join(BOARD_DIR, claimedFileName(claim.itemId, claim.who));
     const grantedFile = path.join(BOARD_DIR, grantedFileName(claim.itemId, claim.who));
@@ -890,17 +890,26 @@ async function main(): Promise<void> {
       try { reg = readDelegations(DELEGATIONS_FILE); } catch (e) { log(`board envelope ${app.jobId}/${app.nodeId}: delegations unreadable — retry next reconcile: ${e instanceof Error ? e.message : e}`); return { status: "deferred" }; } // corrupt ⇒ never overwrite
       const open = openDelegation(reg, spec, nowSec());
       if (!open.ok) { log(`board envelope ${app.jobId}/${app.nodeId}: open rejected (${open.reason}) — retry next reconcile`); return { status: "deferred" }; }
-      // EO2: adopt an already-committed wait by CONTROL's facts. openDelegation emits openProductionWait on a FRESH registry
-      // entry — but the registry may have been LOST after a prior wait-commit, so commit ONLY when the wait is ABSENT from
-      // CONTROL. An existing wait (open OR resolved/frozen) is preserved as-is — never re-committed (which would reopen a
-      // resolved wait or reset its deadline, erasing the close reason).
-      if (open.openProductionWait !== undefined && findWaitIn(st, open.openProductionWait.waitId) === undefined) {
+      // EO2: recover the envelope by the production wait's ACTUAL lifecycle in CONTROL (its id comes from the registered
+      // envelope, not a re-derived formula). A wait already RESOLVED/frozen (production produced / cancelled / revoked) must
+      // NEVER be re-declared as an active OPEN, nor have a production-phase envelope persisted over it — that would make the
+      // two durable faces contradict. The grant stands; no OPEN receipt. The original deadline + close reason are untouched.
+      const waitId = open.envelope.productionWaitId;
+      const existingWait = findWaitIn(st, waitId);
+      const waitLive = existingWait !== undefined && (existingWait.state === "open" || existingWait.state === "action_pending");
+      if (existingWait !== undefined && !waitLive) { log(`board envelope ${app.jobId}/${app.nodeId}: production wait ${waitId} is ${existingWait.state} — not re-declaring OPEN`); return { status: "settled" }; }
+      // Commit the production-wait ONLY when it is ABSENT (the registry may have been lost after a prior wait-commit); a LIVE
+      // existing wait is adopted as-is — never re-committed (which would reset its deadline).
+      if (existingWait === undefined && open.openProductionWait !== undefined) {
         const w = open.openProductionWait;
         const committed = commitTask(st, [{ put: "wait", wait: { waitId: w.waitId, kind: "wait", subject: { jobId: w.jobId }, state: "open", deadlineSec: w.deadlineSec, owner: w.owner, timeoutPolicy: "escalate" } }]).result.ok;
         if (!committed) { log(`board envelope ${app.jobId}/${app.nodeId}: production-wait commit deferred — retry next reconcile`); return { status: "deferred" }; } // never persist the registry without its wait
       }
       writeDelegations(DELEGATIONS_FILE, open.registry);
-      return { status: "opened", requestId: spec.requestId, payloadDigest: spec.payloadDigest, ...(spec.subject.revision !== undefined ? { revision: spec.subject.revision } : {}) };
+      // EO3: the receipt binds to the REGISTERED envelope openDelegation returned (its original requestId/payloadDigest/
+      // revision), NOT the current candidate spec — a plan-revision bump between a lost first receipt and the retry must not
+      // ship a receipt whose revision diverges from the persisted identity (receiptMatches would then fail).
+      return { status: "opened", requestId: open.envelope.requestId, payloadDigest: open.envelope.payloadDigest, ...(open.envelope.subject.revision !== undefined ? { revision: open.envelope.subject.revision } : {}) };
     } catch (e) { log(`board envelope open failed (isolated) — retry next reconcile: ${e instanceof Error ? e.message : e}`); return { status: "deferred" }; }
   };
 
