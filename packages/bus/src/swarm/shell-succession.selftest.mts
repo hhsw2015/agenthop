@@ -2,6 +2,7 @@ import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, presenc
 import type { RosterMember } from "./resume.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
@@ -93,6 +94,10 @@ releaseAdoptLock(lockHome, "sidL");
 t("SU2 lock: release then re-acquire wins", acquireAdoptLock(lockHome, "sidL", process.pid) === true);
 writeFileSync(path.join(lockHome, ".agenthop", "presence", "sidG.adopt.lock"), "garbage"); // unreadable (non-numeric) holder
 t("SU2 lock: a lock with an unreadable holder is NOT stolen (fail-closed)", acquireAdoptLock(lockHome, "sidG", process.pid) === false);
+// SU2 rename-based reclaim: a DEFINITELY-dead holder (a reaped child's freed pid) is reclaimed; a live holder (above) is not.
+const reaped = spawnSync(process.execPath, ["-e", ""]); const deadPid = reaped.pid ?? 0; // spawnSync blocks until exit+reap ⇒ pid is dead
+writeFileSync(path.join(lockHome, ".agenthop", "presence", "sidR.adopt.lock"), String(deadPid));
+t("SU2 lock: a dead holder's stale lock is reclaimed (rename-atomic)", deadPid > 0 && acquireAdoptLock(lockHome, "sidR", process.pid) === true);
 rmSync(lockHome, { recursive: true, force: true });
 
 console.log("all shell-succession selftests passed");

@@ -91,20 +91,23 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
     if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
     openSock();
   };
-  // SU3: like syncSidFor but OVERRIDES a fixedSid AND resolves only once the new socket is actually bound — used ONLY on a proven
-  // succession adoption to move the liveness socket to the adopted sid (a seeded presence's fixedSid would otherwise pin the
-  // socket to the wrong identity, so resolveSession(adopted) would find nothing and fall to relay). AWAITABLE so SU2's adopt lock
-  // can be held until the listener is published. The one place a fixedSid is overridden.
-  const forceSockSidToAsync = async (want: string): Promise<void> => {
-    if (!want || want === sockSid) return;
+  // SU3: bind the liveness socket to `want` and RETURN whether the listener is actually ready for THIS identity. Used on a proven
+  // succession adoption (overrides a seeded fixedSid — the one place that happens). Unlike syncSidFor there is NO same-sid early
+  // return: core.adoptStableId fires onIdentityChange→syncSidFor which may already have started an in-flight bind for `want`, so
+  // this bumps the generation to SUPERSEDE it and binds freshly, then awaits — so "done" means the socket for `want` is up, not
+  // merely "sockSid already equals want". Returns false on a failed bind / supersession / shutdown (NOT ready) so the caller can
+  // treat the adoption as incomplete and roll back its pid claim.
+  const ensureSockBoundTo = async (want: string): Promise<boolean> => {
+    if (!want || closing) return false;
     sockSid = want;
-    const gen = ++bindGen;
+    const gen = ++bindGen;                            // supersede any in-flight bind (incl. syncSidFor's from onIdentityChange)
     binding = false;
     if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
     const res = await openLivenessSocket(home, want);
-    if (!res) return;                                 // path too long / bind failed ⇒ relay-only (retry on the keepAlive tick)
-    if (closing || gen !== bindGen) { try { res.server.close(); } catch { /* best effort */ } return; } // superseded/shutting down
+    if (!res) return false;                           // path too long / bind failed ⇒ NOT ready
+    if (closing || gen !== bindGen) { try { res.server.close(); } catch { /* best effort */ } return false; } // superseded/shutting down ⇒ NOT ready
     sockServer = res.server;
+    return true;                                      // the listener for `want` is bound + current
   };
   const core = startBusCore({ ...opts, onIdentityChange: (self) => syncSidFor(self.stableId ?? self.id) });
   if (!fixedSid) sockSid = core.self.stableId ?? core.self.id; // initial sid from the core (the per-run id until a late adopt)
@@ -122,10 +125,11 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
     void (async () => {
       try {
         // The publish runs UNDER SU2's single-winner adopt lock: adopt the identity (drain its inbox) then bind its liveness
-        // socket (SU3) — the lock is released only after this resolves, covering the pre-publish interval.
+        // socket (SU3), RETURNING whether the listener is actually ready — runSuccessionAtStartup rolls back the pid claim if not.
+        // The lock is released only after this resolves, covering the pre-publish interval.
         await runSuccessionAtStartup(
           home, core.self.tool, core.self.stableId ?? core.self.id, Number(process.env.AGENTHOP_HOST_PID) || undefined,
-          async (sid) => { if (closing) return; core.adoptStableId(sid); await forceSockSidToAsync(sid); },
+          async (sid) => { if (closing) return false; core.adoptStableId(sid); return await ensureSockBoundTo(sid); },
           dbg,
         );
       } catch (e) { dbg(`succession startup failed (ignored): ${e instanceof Error ? e.message : e}`); }

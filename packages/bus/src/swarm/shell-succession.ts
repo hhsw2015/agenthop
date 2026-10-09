@@ -141,7 +141,7 @@ export function successionEnabled(env: NodeJS.ProcessEnv = process.env): boolean
   return /^(1|true|yes|on)$/i.test(env.SWARM_SUCCESSION ?? "");
 }
 
-import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -222,10 +222,16 @@ function readPidDetailed(home: string, sid: string): { kind: "missing" | "unread
  *  DEAD pid ⇒ dead (adoptable); a readable LIVE pid with no socket ⇒ conservatively "alive" (don't steal a maybe-live slot). */
 export function incumbentLivenessOf(home: string): (stableSid: string) => Promise<IncumbentLiveness> {
   const io = makeFileLiveness(home);
+  const presenceDir = path.join(home, ".agenthop", "presence");
   return async (sid) => {
     if (await probeSessionAlive(home, sid)) return { pid: readPidDetailed(home, sid).pid, liveness: "alive" };
+    // SU1: probeSessionAlive returned false — but that conflates "confirmed NO live socket" with "could not ENUMERATE the
+    // presence dir" (readdir EACCES folds to an empty list in the boolean probe). Occupancy may NOT be authorized on an
+    // uncertain observation: if the dir is unenumerable, the incumbent might still be live (its known socket could answer), so
+    // treat it as UNKNOWN ⇒ "alive" (do not adopt). Only a SUCCESSFULLY enumerated dir with no live socket is a real absence.
+    try { readdirSync(presenceDir); } catch { return { pid: null, liveness: "alive" }; } // SU1: enumeration failure ⇒ unknown ⇒ not adoptable
     const d = readPidDetailed(home, sid);
-    if (d.kind === "missing") return { pid: null, liveness: "absent" };
+    if (d.kind === "missing") return { pid: null, liveness: "absent" }; // enumerable dir + no live socket + no pid ⇒ confirmed absent
     if (d.kind === "unreadable" || d.pid === null) return { pid: d.pid, liveness: "alive" }; // SU1: unreadable/unparseable ⇒ do not authorize
     return { pid: d.pid, liveness: io.procAlive(d.pid) === "dead" ? "dead" : "alive" };
   };
@@ -237,21 +243,25 @@ export function incumbentLivenessOf(home: string): (stableSid: string) => Promis
  *  (resume sids/paths rarely contain spaces; mirrors resume.ts's capture). Empty on any fault. */
 export function readHostArgv(hostPid: number | undefined): string[] {
   if (!hostPid || !Number.isInteger(hostPid) || hostPid <= 1) return [];
-  // SP3: prefer /proc/<pid>/cmdline — argv is NUL-separated with EXACT boundaries, so a program path containing spaces
-  // (e.g. `Tool Install/codex`) survives and argv[0] basename is correct. Linux only.
+  // Linux: /proc/<pid>/cmdline — NUL-separated argv, EXACT boundaries (a path with spaces survives; argv[0] basename correct).
   try {
     const raw = readFileSync(`/proc/${hostPid}/cmdline`, "utf8");
     const argv = raw.split("\0").filter(Boolean);
     if (argv.length) return argv;
   } catch { /* no /proc (macOS) — fall through to ps */ }
-  // ps fallback (no /proc): `ps -o args=` is a display string that LOSES arg boundaries, so a space in the path mis-splits
-  // and parseResumeTargetFromArgv returns null ⇒ FRESH (fail-closed: a miss, never a mis-adopt). We do NOT quote-reconstruct
-  // a boundary-lost string (SP3 threshold).
-  try {
-    const r = spawnSync("ps", ["-o", "args=", "-p", String(hostPid)], { encoding: "utf8", timeout: 2000 });
-    if (r.status === 0 && r.stdout) return r.stdout.trim().split(/\s+/).filter(Boolean);
-  } catch { /* noop */ }
-  return [];
+  // macOS/BSD (no /proc): `ps -o args=` joins argv with spaces (boundaries lost). SP3: recover argv[0]'s EXACT extent from
+  // `ps -o comm=` — the executable PATH as the WHOLE output line (a boundary-preserved source for argv[0]) — then split only the
+  // space-free argument tail. A program path WITH SPACES (e.g. `Tool Install/codex`) is no longer mis-split. A truncated or
+  // mismatching comm falls back to the plain split (fail-closed: parseResumeTargetFromArgv rejects a bad argv[0] ⇒ fresh).
+  const ps = (fmt: string): string => { try { const r = spawnSync("ps", ["-o", fmt, "-p", String(hostPid)], { encoding: "utf8", timeout: 2000 }); return r.status === 0 && r.stdout ? r.stdout.trim() : ""; } catch { return ""; } };
+  const args = ps("args=");
+  if (!args) return [];
+  const comm = ps("comm=");
+  if (comm && args.startsWith(comm)) {
+    const tail = args.slice(comm.length).trim(); // the args AFTER the exe path — for `codex resume <sid>` these are space-free
+    return tail ? [comm, ...tail.split(/\s+/).filter(Boolean)] : [comm];
+  }
+  return args.split(/\s+/).filter(Boolean); // no usable comm boundary ⇒ plain split (correct when the exe path has no spaces)
 }
 
 function adoptLockPath(home: string, sid: string): string { return path.join(home, ".agenthop", "presence", `${sid}.adopt.lock`); }
@@ -268,14 +278,21 @@ function procIsDead(pid: number): boolean {
  *  with concurrent reclaimers at most one re-create wins. */
 export function acquireAdoptLock(home: string, sid: string, selfPid: number): boolean {
   const p = adoptLockPath(home, sid);
-  try { writeFileSync(p, String(selfPid), { flag: "wx" }); return true; }
+  try { writeFileSync(p, String(selfPid), { flag: "wx" }); return true; } // O_EXCL: the live-contention serializer
   catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "EEXIST") return false; // any other error ⇒ fail-closed (do not adopt)
     let holder: number | null = null;
     try { const n = Number(readFileSync(p, "utf8").trim()); holder = Number.isInteger(n) && n > 0 ? n : null; } catch { holder = null; }
     if (holder === null || !procIsDead(holder)) return false;         // unreadable, or a LIVE holder ⇒ loser (never steal a live adopt)
-    try { unlinkSync(p); } catch { return false; }                    // reclaim a provably-dead holder's lock, once
-    try { writeFileSync(p, String(selfPid), { flag: "wx" }); return true; } catch { return false; }
+    // SU2: reclaim a provably-dead holder's lock ATOMICALLY. `unlink`-then-create has a TOCTOU gap — a later-comer could have
+    // replaced the lock between our read and our unlink, and we'd delete THEIR live lock (double adoption). Instead MOVE the stale
+    // lock via rename: only ONE process can rename a given file (the rest get ENOENT), so the rename is the single-winner reclaim
+    // serializer; after winning the move, the O_EXCL create at `p` is the final serializer (a concurrent create-winner makes us a
+    // clean loser). We never unlink a path by its (possibly stale) holder read value.
+    const staged = `${p}.stale.${selfPid}.${process.hrtime.bigint().toString(36)}`;
+    try { renameSync(p, staged); } catch { return false; } // ENOENT ⇒ another reclaimer already moved it ⇒ loser (never steal theirs)
+    try { unlinkSync(staged); } catch { /* best effort — the moved stale lock is ours to discard */ }
+    try { writeFileSync(p, String(selfPid), { flag: "wx" }); return true; } catch { return false; } // EEXIST ⇒ a concurrent create won ⇒ loser
   }
 }
 export function releaseAdoptLock(home: string, sid: string): void { try { unlinkSync(adoptLockPath(home, sid)); } catch { /* best effort */ } }
@@ -288,7 +305,12 @@ export function releaseAdoptLock(home: string, sid: string): void { try { unlink
  * `core.adoptStableId(sid)` (drains its inbox + rebinds the liveness socket + makes resolveSession find it). Returns null on
  * fresh/reject or any IO fault (fail-closed — never hijack on error).
  */
-export async function runSuccessionAtStartup(home: string, selfTool: string, selfNativeSid: string, hostPid: number | undefined, publish: (adoptedSid: string) => Promise<void> | void, log: (m: string) => void = () => {}): Promise<string | null> {
+/** Read presence/<...>.pid at `pidPath` and report whether it still holds exactly `pid` (so a rollback only removes OUR claim). */
+function pidFileIs(pidPath: string, pid: number): boolean {
+  try { return Number(readFileSync(pidPath, "utf8").trim()) === pid; } catch { return false; }
+}
+
+export async function runSuccessionAtStartup(home: string, selfTool: string, selfNativeSid: string, hostPid: number | undefined, publish: (adoptedSid: string) => Promise<boolean> | boolean, log: (m: string) => void = () => {}): Promise<string | null> {
   const hostArgv = readHostArgv(hostPid); // the AGENT's real launch argv (e.g. `codex resume <sid>`) — the credential source
   const att: Attestation = {
     machine: os.hostname(),
@@ -310,13 +332,24 @@ export async function runSuccessionAtStartup(home: string, selfTool: string, sel
   // winner. The lock is held until `publish` resolves (the winner's liveness socket is actually bound — covering the pre-publish
   // interval), then released.
   if (!acquireAdoptLock(home, sid, att.newPid)) { log(`succession: another shell is adopting ${sid} — coming up fresh`); return null; }
+  const pidPath = path.join(home, ".agenthop", presencePidRelPath(sid));
   try {
     // Re-check UNDER the lock: a winner may have published a live socket between the plan and the lock acquire.
     if (await probeSessionAlive(home, sid)) { log(`succession: ${sid} became live under the lock — not adopting`); return null; }
-    writeFileSync(path.join(home, ".agenthop", presencePidRelPath(sid)), String(att.newPid));
-    await publish(sid); // core.adoptStableId + bind the liveness socket — the listener is published WHILE we hold the lock
+    writeFileSync(pidPath, String(att.newPid)); // claim the slot (under the lock)
+    const ready = await publish(sid); // core.adoptStableId + bind the liveness socket; TRUE iff the listener for sid is actually ready (SU3)
+    if (!ready) {
+      // SU3: the publish did NOT complete (bind failed / superseded / stop). Do not report adopted, and ROLL BACK this write's
+      // occupancy — remove our pid claim (only if it is still ours), so we never leave a pid pointing at us without a serving
+      // listener. The incumbent was verified dead/absent under the lock, so no live owner is lost.
+      try { if (pidFileIs(pidPath, att.newPid)) unlinkSync(pidPath); } catch { /* best effort */ }
+      log(`succession: publish did not complete for ${sid} — not adopting (rolled back the pid claim)`);
+      return null;
+    }
     log(`succession: ADOPTED stable sid ${sid} — ${result.reason}`);
     return sid;
-  } catch (e) { log(`succession: adopt commit failed (coming up fresh): ${e instanceof Error ? e.message : e}`); return null; }
-  finally { releaseAdoptLock(home, sid); }
+  } catch (e) {
+    try { if (pidFileIs(pidPath, att.newPid)) unlinkSync(pidPath); } catch { /* best effort */ }
+    log(`succession: adopt commit failed (coming up fresh): ${e instanceof Error ? e.message : e}`); return null;
+  } finally { releaseAdoptLock(home, sid); }
 }
