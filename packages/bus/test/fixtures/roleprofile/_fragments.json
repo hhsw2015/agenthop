@@ -1,0 +1,31 @@
+{
+  "schemaNote": "roleProfile-fragments/v2",
+  "instructionBlocks": {
+    "impl-block-1": "[消息纪律 S11] 一切蜂群消息带任务锚:json={via,taskRef,title(≤15字标签),text(纯正文,不复述title/taskRef)};bus 裸消息=[taskRef] title 头行+正文。报备/完成/核询一律耐久收件箱优先,总线只是加速。",
+    "impl-block-2": "F30 报到铁律: 本会话每次启动/复活(含 resume、人工重启)后的第一动作=向协调者收件箱投报到行 {roleId, sid, busHandle};不报到=全网不可达是你自己的停摆。",
+    "impl-block-3": "S14 产物报告形制(I/O 裁定 2026-10-05): 任何完成/阶段报告,第一行=「需要谁做什么」(无需则写 none);必含「未验证面」一节列出你没验证的东西与原因(none 也要写)。深度/用心不写咒语,由派单的 tier 字段承载;报告给 user 的版本短句单义,机器消费的字段齐全。",
+    "impl-block-4": "S15 受控写作(2026-10-05): 一切消息与报告同守——一句一事;主动语态;一词一义(同物同名不换叫法);行话/编号首次出现带一句白话解释;读者(人或模型)无需猜测。歧义即返工。",
+    "impl-block-5": "F33(2026-10-05): 缺依赖先盘点本机已有(which/查已装应用),再考虑下载安装;装=最后手段且报备。「没有」必须被证明,不能被默认(F31/F33 同根)。",
+    "impl-block-6": "S18 交错纪律(2026-10-05): 封长稿(报告/判决/处置)提交前最后一步=重新冲洗自己的收件箱,有未读先消化再封;状态类结论(计级/范围/裁定)以耐久状态文件为权威,消息只是指针,见高版本序号弃低。",
+    "impl-block-7": "S23 花钱线(2026-10-05): CPA 池内模型调用(含实时模型调试/benchmark)+已授权的 Actions 分钟=正常开发,不属三门花钱,不弹框不等批。算花钱的只有:新付费账号/key/订阅、单次预估>$5 的批量消耗、长驻云资源。拿不准按量级:调试级=做,批量级=问。",
+    "impl-block-8": "S24 禁弹框等待(2026-10-05,绝对禁令): **禁用 AskUserQuestion 及一切交互式选择框——零使用,无例外**。user 只与协调者交互,弹给你屏幕的框没有观众=必然卡点。需要选择/审批:①按既有裁定(S23 花钱线等)能自决则自决留痕;②不能自决=写审批请求(taskRef=approval,选项+各自后果+你的建议)投协调者箱,继续其余工作或转合法空闲;③决定回执到箱后恢复。"
+  },
+  "skillGroups": {
+    "pure-layer-skills": [
+      "pure-reducer",
+      "append-log",
+      "invariant-design",
+      "selftest-tdd",
+      "schema-validation",
+      "no-top-level-side-effects"
+    ]
+  },
+  "boundaryGroups": {
+    "pure-layer-boundaries": [
+      "不碰他人单编辑者文件(core.ts/directory.ts/sweep 等 = IO 轨 owner 的);接线以 diff 交付",
+      "不在模块留顶层副作用(selftest 进 .selftest.mts)",
+      "不自授权改冻结协议/权限/配置;范围变更报协调者或 user 门",
+      "验收不自放宽(V1–V8 + 对抗审查照走)"
+    ]
+  }
+}
