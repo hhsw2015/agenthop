@@ -1,6 +1,12 @@
-# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 10
+# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 11
 
-- **Branch** `feat/fanout-native`  **HEAD** `9dde6ef`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`, r4 `b7b5fd9`, r5 `5e58b48`, r6 `9c15c20`, r7 `6a2380b`, r8 `0111607`, r9 `8401017`)
+- **Branch** `feat/fanout-native`  **HEAD** `e9c2bbf`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`, r4 `b7b5fd9`, r5 `5e58b48`, r6 `9c15c20`, r7 `6a2380b`, r8 `0111607`, r9 `8401017`, r10 `9dde6ef`)
+
+## Round 11 — round-10 REMAIN resolved (FN9; isolate HELD from every lease-delete path)
+- FN9 (P2) round-10 held the lease in the bind-fail branch, but `settleUnit`'s early-return (`status !== "running"` -> unconditional `releaseLease`, line 389) then DELETED it — a `failed` ledger status is not a terminal, so the still-alive child's slot was freed on the next run. Every settle/cleanup entry now shares ONE rule — the pure, tested `rowReleasable(displayMode, probe)`: release ONLY on confirmed terminal (headless the child is gone; visible it never opened a pane OR its rc sidecar exists), else HOLD. Applied at `settleUnit`'s early-return AND finally, the run's outer finally, and the bind-fail HOLD. A confirmed zone CLOSE stays a separate terminal signal applied at the close site. A HELD (failed-but-running) row is never reaped by bookkeeping — isolated from the delete path at every entry.
+- Gates: bus tsc 0, scripts tsc 0, fanout selftest 147 (+5 `rowReleasable`), fanout-herdr selftest 23, bus vitest 991/991.
+
+## Round 10 — round-9 REMAIN resolved (FN9; the headless rollback branch)
 
 ## Round 10 — round-9 REMAIN resolved (FN9; the headless rollback branch)
 - FN9 (P2) round-9's headless rollback despawned the child, IGNORED the result, then deleted the lease unconditionally — a despawn that kept failing (child alive) freed the slot → over-admission. Now the childPid write is RETRIED (a transient glitch clears, keeping the launch tracked and proceeding normally); only if it persistently fails does the undo run, and it despawns + VERIFIES the pid is dead (bounded loop) before releasing. A child that survives despawn HOLDS the lease (never deleted under a live execution) and hands back loudly — capacity is never freed while the child runs. (Visible bind-save-fail stays stopped pre-launch from r9.)
