@@ -53,8 +53,16 @@ then gains `flavors: {strict, lenient}`). NOT in scope: budget-pool fragment (�
   or a hijacked `every`; `mergeRolePatch` remove builds a `Set` and filters by index (never `val.includes`/`cur.filter`), so a
   hijacked `includes` can't delete a whole array.
 
+## Round-2 residuals (RP-P2-1 CLOSED; 2 residual P2 @8856d88 → this SHA)
+
+- **RP-P2-2 residual** (accessor patch key): an accessor/getter patch key had no `value`, which `ownVal` turned into `undefined`
+  and then wrote — silently clearing a field (a flavor declaring only a `boundaries` getter cleared boundaries with the getter
+  never invoked). `mergeRolePatch` now reads the patch key's descriptor and REJECTS any key that is not an own DATA property.
+- **RP-P2-3 residual** (remove double-read): the remove loop read `cur[i]` twice (membership test, then output), so a getter
+  element returning keep-then-remove wrote the removed value back. Each element is now captured ONCE and used for both.
+
 ## Verification already run
 
-role-profile.test.ts 25/25 (incl. the real-role golden + 8 new RP-P2 regressions) · reviewer probe `profile-boundaries.test.ts`
-11/11 (was 3/11) · bus tsc 0 · scripts tsc 0 · full bus 87 files / 1172 tests pass. Not pushed, not merged (merge/enable gate =
-coordinator + user).
+role-profile.test.ts 28/28 (real-role golden + RP-P2 round-1 + round-2 regressions) · reviewer probes
+`profile-boundaries.test.ts` 11/11 + `patch-capture.test.ts` 4/4 (15/15, was 13/15) · bus tsc 0 · scripts tsc 0 · full bus 87
+files / 1175 tests pass. Not pushed, not merged (merge/enable gate = coordinator + user).

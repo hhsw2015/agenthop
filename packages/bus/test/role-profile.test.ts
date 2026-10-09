@@ -192,6 +192,33 @@ describe("role-profile — RP-P2-3 arrays validated/copied/removed by index (no 
   });
 });
 
+describe("role-profile — round-2 residual fixes (accessor patch key / remove capture-once)", () => {
+  test("RP-P2-2 residual: an accessor patch key is REJECTED (never silently clears a field; getter not invoked)", () => {
+    const patch: Record<string, unknown> = {};
+    let calls = 0;
+    Object.defineProperty(patch, "boundaries", { enumerable: true, get() { calls += 1; return []; } });
+    expect(mergeRolePatch({ boundaries: ["require approval"] }, patch).ok).toBe(false);
+    expect(calls).toBe(0);
+  });
+  test("RP-P2-2 residual: a flavor with an accessor patch key fails applyFlavor (not an empty-boundaries success)", () => {
+    const loaded = okv(loadRoleProfile({ ...V2_ROLE, boundaries: ["require approval"] }));
+    if (loaded.kind !== "v2") throw new Error("not v2");
+    const flavorPatch: Record<string, unknown> = {};
+    Object.defineProperty(flavorPatch, "boundaries", { enumerable: true, get() { return []; } });
+    const withEvil: RoleProfileV2 = { ...loaded.role, flavors: { evil: flavorPatch } };
+    expect(applyFlavor(withEvil, "evil").ok).toBe(false);
+  });
+  test("RP-P2-3 residual: remove captures each element once — a getter element cannot resurrect a removed value", () => {
+    const cur: string[] = [];
+    let reads = 0;
+    Object.defineProperty(cur, 0, { enumerable: true, configurable: true, get() { return reads++ === 0 ? "keep" : "remove"; } });
+    cur.length = 1;
+    const r = okv(mergeRolePatch({ boundaries: cur }, { "boundaries-": ["remove"] }));
+    expect(r.boundaries).toEqual(["keep"]); // canonical read = "keep" ⇒ kept; the removed value is never written back
+    expect(reads).toBe(1);
+  });
+});
+
 describe("role-profile — roleProfileV2Enabled (dormant, default OFF)", () => {
   test("default OFF; truthy words ON", () => {
     expect(roleProfileV2Enabled({})).toBe(false);

@@ -233,7 +233,11 @@ export function mergeRolePatch(base: Record<string, unknown>, patch: Record<stri
     if (field.length === 0 || FORBIDDEN.has(field)) return { ok: false, reason: `patch key "${key}" targets a forbidden/empty field` };
     if (touched.has(field)) return { ok: false, reason: `patch touches field "${field}" more than once (ambiguous)` };
     touched.add(field);
-    const val = ownVal(patch, key);
+    // RP-P2-2 (round-2): the patch key MUST be an own DATA property. An accessor/getter patch key has no `value`, which ownVal
+    // would turn into `undefined` and then silently write — clearing an existing field. Reject it outright.
+    const pd = Object.getOwnPropertyDescriptor(patch, key);
+    if (!pd || !("value" in pd)) return { ok: false, reason: `patch key "${key}" must be a data property (an accessor/getter patch is rejected)` };
+    const val = pd.value;
     if (op === "append") {
       if (!Array.isArray(val)) return { ok: false, reason: `patch "${key}" value must be an array` };
       const cur = Object.prototype.hasOwnProperty.call(result, field) ? result[field] : undefined;
@@ -246,7 +250,7 @@ export function mergeRolePatch(base: Record<string, unknown>, patch: Record<stri
       const removeSet = new Set<unknown>();
       for (let i = 0; i < val.length; i += 1) removeSet.add(val[i]); // membership by index, never val.includes
       const out: unknown[] = [];
-      for (let i = 0; i < cur.length; i += 1) if (!removeSet.has(cur[i])) out.push(cur[i]); // never cur.filter
+      for (let i = 0; i < cur.length; i += 1) { const e = cur[i]; if (!removeSet.has(e)) out.push(e); } // RP-P2-3 (round-2): capture ONCE — membership test + output use the same value (a getter element can't write back a removed value)
       result[field] = out;
     } else {
       if (val === null) { delete result[field]; continue; }
