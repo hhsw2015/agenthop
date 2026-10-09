@@ -98,6 +98,12 @@ try {
     t('SB1/R3: invalid-credential lock NOT stolen (contends then throws, bounded)', threw(() => reservePool(fresh, 'lk', res({ reserveKey: 'no', estUsd: 1 }))));
     process.env.SHARED_BUDGET_LOCK_TRIES = 'Infinity'; // SB1/R3: must fall back to a finite default, not loop forever
     t('SB1/R3: env=Infinity is bounded (reserve still terminates by throwing)', threw(() => reservePool(fresh, 'lk', res({ reserveKey: 'no2', estUsd: 1 }))));
+    // SB1/R6 (reclaim boundary): an out-of-range pid credential passes Number.isInteger/>0, but process.kill throws a NON-ESRCH
+    // error (ERR_OUT_OF_RANGE / ERR_INVALID_ARG_TYPE) — NOT proof of death ⇒ the external credential is NOT stolen (contends, then
+    // throws, bounded). Only a definite ESRCH authorizes reclaiming an external holder.
+    rmSync(lock, { recursive: true, force: true }); mkdirSync(lock, { recursive: true }); writeFileSync(join(lock, '999999999999999999999.bad'), '');
+    process.env.SHARED_BUDGET_LOCK_TRIES = '3';
+    t('SB1/R6: out-of-range pid credential NOT stolen (non-ESRCH probe error is not death)', threw(() => reservePool(fresh, 'lk', res({ reserveKey: 'nor', estUsd: 1 }))));
     // SB1/R6 (release-path residue): OUR OWN leftover credential (a faulted release left it; the in-process stranded set is empty
     // — e.g. existsSync(mine) returned false under a real EACCES) is reclaimed by pid-in-filename on the next acquire, NOT taken
     // for a live external holder (our pid IS alive) and contended to timeout. Before R6 this threw within the retry budget; the

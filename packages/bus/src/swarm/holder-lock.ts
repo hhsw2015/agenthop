@@ -30,10 +30,20 @@ export interface LockSite {
   readonly intentPrefix: string;
 }
 
-/** True while pid is a running process (EPERM = exists, not ours = alive). Only a definite ESRCH (or an invalid pid) is "dead". */
+/** MIGHT the process be alive? A successful probe or EPERM (exists, not ours) is alive. Used only to detect a LIVE foreign
+ *  hold-intent in the empty-dir branch (where returning false just falls through to the own-stranded gate, which contends for any
+ *  non-own dir) — it NEVER authorizes removing an external credential. An invalid pid is "not alive" here. */
 function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}
+/** DEFINITELY dead? Reclaiming an EXTERNAL published credential is authorized ONLY by a definite ESRCH (SB1 / DA2-R6). An
+ *  invalid/out-of-range pid (process.kill throws ERR_OUT_OF_RANGE / ERR_INVALID_ARG_TYPE), EPERM (alive), or ANY other/unknown
+ *  probe error is NOT proof of death ⇒ contend, never steal. A non-EPERM exception must not be read as "dead": that over-broad
+ *  read would delete a live holder's credential whose pid merely probes to an unknown error (the unknown-external-holder boundary). */
+function pidDefinitelyDead(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return false; } catch (e) { return (e as NodeJS.ErrnoException).code === "ESRCH"; }
 }
 
 function holdIntentPath(site: LockSite, token: string): string { return path.join(site.intentDir, `${site.intentPrefix}${token}`); }
@@ -73,10 +83,11 @@ export function acquireHolderLock(site: LockSite): string | null {
   // Lock dir exists.
   let entries: string[]; try { entries = readdirSync(dir); } catch { dropIntent(); return null; } // vanished mid-check ⇒ contended
   if (entries.length === 1) {
-    // A PUBLISHED holder. Reclaim by its EXACT name iff dead/own (never a successor's differently-named file).
+    // A PUBLISHED holder. Reclaim by its EXACT name iff it is OUR OWN residue (same pid — a faulted release of ours) or the holder
+    // is DEFINITELY dead (ESRCH only). An invalid/out-of-range pid, EPERM, or any unknown probe error is NOT reclaimable (SB1).
     const holder = entries[0]!;
     const hpid = Number(holder.split(".")[0]);
-    if (Number.isInteger(hpid) && hpid > 0 && (hpid === process.pid || !pidAlive(hpid))) {
+    if (Number.isInteger(hpid) && hpid > 0 && (hpid === process.pid || pidDefinitelyDead(hpid))) {
       let removed = false; try { rmSync(path.join(dir, holder)); removed = true; } catch { /* a peer reclaimed it first */ }
       if (removed) { try { rmdirSync(dir); strandedLockDirs.delete(dir); } catch { strandedLockDirs.add(dir); } } // dropped it ⇒ any stale own record is void (DB-R7 B); could not drop ⇒ ours to recover (retry adopts)
       try { if (take()) return token; } catch (e) { throw e; }
