@@ -1,20 +1,18 @@
 /**
- * Shared-budget pool IO (DA2 + DA2-R1 review fixes). Single-file optimistic CAS: the pool's ledger (committed draws + in-flight
- * reservations) lives in one JSON file, mutated only under a per-pool HOLDER-IDENTITY lock so concurrent consumers never lose an
- * update. Review fixes folded:
- *   SB1 — the lock is broken only when its published holder's pid is DEAD (pid-liveness), never by age alone, so a paused live
- *         holder can't have its confirmed draw clobbered; an unknown/empty external lock stays contended.
- *   SB2 — a corrupt or wrong-identity ledger is NEVER treated as absent (which would re-grant a full ceiling): ENOENT = absent,
- *         anything else (unparseable / invalid / body poolName != requested) THROWS; ceiling + draws are value-validated; the body
- *         name is bound to the requested name, defeating a case-insensitive-filesystem alias (Shared vs shared).
- *   SB3 — admission is a RESERVE (write under the lock) that counts committed spend + in-flight reservations, bounding overshoot to
- *         one ticket regardless of consumer count (coordinator ruling A). Crashed units are reclaimed (pid-liveness + TTL).
- *   SB4 — every mutation re-writes the projection (even an idempotent replay), so a prior projection-write fault is repaired; the
- *         lock-contention handler no longer swallows an EEXIST thrown by the critical section.
- *   SB5 — the pool name is validated BEFORE any filesystem path is touched, so an invalid name can never create/reclaim/delete a
- *         lock outside the budgets dir.
+ * Shared-budget pool IO (DA2 + DA2-R1/R2 review fixes). Single-file optimistic CAS: the pool ledger (committed draws + in-flight
+ * reservations) lives in one JSON file, mutated only under a per-pool HOLDER-IDENTITY lock. Review fixes folded:
+ *   SB1 — the lock is broken ONLY when its holder's pid is definitively dead (ESRCH); an invalid credential or any inconclusive
+ *         probe (EPERM / RangeError / unknown) never authorizes a break; an unknown external empty lock stays contended; a lock
+ *         this process stranded on a release fault is tracked in-process and adopted on retry (recovery survives the fault).
+ *   SB2 — write-side validation covers the optional reserveKey/presumed fields, so a mutation can never persist a ledger the
+ *         same-version reader would reject.
+ *   SB3 — admission is a RESERVE that counts committed + in-flight (bound = ceiling + one ticket); a gone reservation is SETTLED to
+ *         a presumed-spent estimate, never refunded; commit settles only its own reservation and is a no-op on a committed drawKey.
+ *   SB4 — EVERY successful mutation (create / reserve / commit / raise), including an idempotent replay, re-writes the projection,
+ *         so a prior projection-write fault is repaired on replay.
+ *   SB5 — the pool name is validated before any filesystem path is touched.
  *
- * dormant: standalone, NOT wired into fan-out (feat/fanout-native still in review); interface seams are documented in the design.
+ * dormant: standalone, NOT wired into fan-out (feat/fanout-native still in review); interface seams documented in the design.
  */
 import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, rmdirSync, rmSync, existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -32,13 +30,13 @@ import {
   reserve as pureReserve,
   commit as pureCommit,
   raiseCeiling as pureRaiseCeiling,
-  pruneStaleReservations,
+  settleExpiredReservations,
   remainingOf,
   project,
 } from './shared-budget.js';
 
-const RESERVATION_TTL_SEC = 3600; // backstop reclaim if a reservation's pid was reused (liveness is primary)
-const LOCK_TRIES = 200;           // ~200 * 15ms = 3s max wait before giving up
+const RESERVATION_TTL_SEC = 3600; // backstop settlement if a reservation's pid was reused (liveness is primary)
+const LOCK_TRIES = Number(process.env.SHARED_BUDGET_LOCK_TRIES ?? 200); // ~200 * 15ms = 3s max wait (lowered in tests)
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 const budgetsDir = (home: string) => path.join(home, '.agenthop', 'budgets');
@@ -51,58 +49,76 @@ function poolFile(home: string, name: string): string { return path.join(budgets
 function lockDir(home: string, name: string): string { return path.join(budgetsDir(home), `${name}.lock`); }
 function projectionFile(home: string, name: string): string { return path.join(projectionsDir(home), `${name}.json`); }
 
-function pidAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
+/** Definitively dead? ONLY a validated pid that probes to ESRCH ("no such process") authorizes a break (SB1). An out-of-range /
+ *  non-integer credential, EPERM (alive, other user), or any other/unknown error => NOT dead => the caller contends, never steals. */
+function holderIsDead(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return false; }
+  catch (e) { return (e as NodeJS.ErrnoException).code === 'ESRCH'; }
 }
-function sleepMs(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); // synchronous sleep, no dependency
-}
+const isAlive = (pid: number) => !holderIsDead(pid);
+
+function sleepMs(ms: number): void { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+
+// Locks THIS process created but could not drop on release — its OWN unfinished occupancy, adoptable on retry (SB1 recovery).
+const strandedLocks = new Set<string>();
 
 // --- holder-identity lock (SB1/SB5) -------------------------------------------
 function acquireLock(home: string, name: string): string {
   assertName(name); // SB5: validate BEFORE any path is built or touched
   const dir = lockDir(home, name);
   const token = `${process.pid}.${randomBytes(6).toString('hex')}`;
+  const mine = path.join(dir, token);
   mkdirSync(budgetsDir(home), { recursive: true, mode: 0o700 });
   for (let i = 0; i < LOCK_TRIES; i++) {
-    let made = false;
-    try { mkdirSync(dir); made = true; }
+    try { mkdirSync(dir); }
     catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-      // Held. Break ONLY if the published holder's pid is dead (SB1 — never by age alone). Anything else contends.
       let entries: string[];
       try { entries = readdirSync(dir); } catch { sleepMs(15); continue; } // vanished mid-check => retry
       if (entries.length === 1) {
         const hpid = Number(entries[0]!.split('.')[0]);
-        if (Number.isInteger(hpid) && hpid > 0 && !pidAlive(hpid)) {
-          try { rmSync(path.join(dir, entries[0]!)); rmdirSync(dir); } catch { /* a peer reclaimed it first */ }
-          continue; // retry fresh
+        if (holderIsDead(hpid)) {
+          // Clear the dead holder AND drop the dir, then retry a fresh mkdir (atomic winner). Partial failure => contend.
+          try { rmSync(path.join(dir, entries[0]!)); rmdirSync(dir); } catch { sleepMs(15); }
+          continue;
         }
+        sleepMs(15); continue; // live / inconclusive holder => contend, never steal
       }
-      // live published holder, empty (mid-acquire / external stranded), or ambiguous (>1): contend, never steal.
-      sleepMs(15);
-      continue;
+      if (entries.length === 0) {
+        if (strandedLocks.has(dir)) {
+          // OUR OWN unfinished occupancy => adopt by publishing identity straight in (no remove/recreate gap), then verify sole.
+          try { writeFileSync(mine, '', { mode: 0o600 }); } catch { sleepMs(15); continue; }
+          let after: string[];
+          try { after = readdirSync(dir); } catch { sleepMs(15); continue; }
+          if (after.length === 1 && after[0] === token) { strandedLocks.delete(dir); return token; }
+          try { rmSync(mine); } catch { /* best-effort back-off */ }
+          sleepMs(15); continue;
+        }
+        sleepMs(15); continue; // EXTERNAL empty lock => contend, never adopt (SB1)
+      }
+      sleepMs(15); continue; // ambiguous (>1) => contend
     }
-    if (made) {
-      try { writeFileSync(path.join(dir, token), '', { mode: 0o600 }); } // publish identity inside the lock
-      catch (e) { try { rmdirSync(dir); } catch { /* best-effort */ } throw e; }
-      return token;
-    }
+    // Won a fresh mkdir: publish identity inside.
+    strandedLocks.delete(dir);
+    try { writeFileSync(mine, '', { mode: 0o600 }); }
+    catch (e) { strandedLocks.add(dir); throw e; } // empty dir is ours => recoverable on retry
+    return token;
   }
   throw new Error(`shared-budget: could not acquire lock for pool ${name} within ${LOCK_TRIES} tries`);
 }
 function releaseLock(home: string, name: string, token: string): void {
   const dir = lockDir(home, name);
-  // Only tear down if the lock is still OURS (a stale-break could have reassigned it). Never remove a successor's lock.
-  try {
-    if (existsSync(path.join(dir, token)) && readdirSync(dir).length === 1) {
-      rmSync(path.join(dir, token));
-      rmdirSync(dir);
-    }
-  } catch { /* best-effort */ }
+  let mineGone = false;
+  try { if (existsSync(path.join(dir, token))) { rmSync(path.join(dir, token)); } mineGone = true; }
+  catch { /* best-effort */ }
+  // Drop the (now-empty) dir only if it is ours to drop; a failure strands it for in-process recovery (SB1).
+  if (mineGone) {
+    try { rmdirSync(dir); strandedLocks.delete(dir); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') strandedLocks.add(dir); }
+  }
 }
-/** Run fn under the per-pool lock. fn's own errors PROPAGATE (SB4: they are not caught by the lock-contention handler, which lives
- *  entirely inside acquireLock). */
+/** Run fn under the per-pool lock. fn's own errors PROPAGATE (SB4: not caught by the lock-contention handler in acquireLock). */
 function withLock<T>(home: string, name: string, fn: () => T): T {
   const token = acquireLock(home, name);
   try { return fn(); } finally { releaseLock(home, name, token); }
@@ -115,7 +131,8 @@ function validDrawShape(d: unknown): d is PoolDraw {
     && typeof o.usd === 'number' && Number.isFinite(o.usd) && o.usd >= 0
     && typeof o.tokens === 'number' && Number.isInteger(o.tokens) && o.tokens >= 0
     && typeof o.atSec === 'number' && Number.isFinite(o.atSec)
-    && (o.reserveKey === undefined || typeof o.reserveKey === 'string');
+    && (o.reserveKey === undefined || (typeof o.reserveKey === 'string' && (o.reserveKey as string).length > 0))
+    && (o.presumed === undefined || typeof o.presumed === 'boolean');
 }
 function validResShape(r: unknown): r is Reservation {
   const o = r as Record<string, unknown>;
@@ -125,13 +142,12 @@ function validResShape(r: unknown): r is Reservation {
     && typeof o.pid === 'number' && Number.isInteger(o.pid) && o.pid > 0
     && typeof o.atSec === 'number' && Number.isFinite(o.atSec);
 }
-/** Parse a ledger, binding its body name to `expectedName`. Returns null only for a structurally invalid body. */
 function parsePoolState(raw: unknown, expectedName: string): PoolState | null {
   if (!raw || typeof raw !== 'object') return null;
   const o = raw as Record<string, unknown>;
-  if (o.poolName !== expectedName || !isValidPoolName(o.poolName)) return null; // SB2: body must match requested (defeats fs alias)
+  if (o.poolName !== expectedName || !isValidPoolName(o.poolName)) return null; // SB2: body binds to requested name (defeats fs alias)
   let ceiling: PoolCeiling;
-  try { ceiling = resolveCeiling(o.ceiling as PoolCeiling); } catch { return null; } // SB2: reject double-null/negative/non-finite
+  try { ceiling = resolveCeiling(o.ceiling as PoolCeiling); } catch { return null; }
   if (!Array.isArray(o.draws)) return null;
   const reservationsRaw = o.reservations === undefined ? [] : o.reservations;
   if (!Array.isArray(reservationsRaw)) return null;
@@ -141,8 +157,8 @@ function parsePoolState(raw: unknown, expectedName: string): PoolState | null {
   for (const r of reservationsRaw) { if (!validResShape(r)) return null; reservations.push(r); }
   return { poolName: o.poolName, ceiling, draws, reservations };
 }
-/** Read a pool, FAIL-CLOSED: ENOENT = absent (null); a real read error / unparseable / invalid body all THROW — a corrupt ledger
- *  is NEVER silently treated as absent (which would re-grant a full ceiling, SB2). */
+/** FAIL-CLOSED read: ENOENT = absent (null); unparseable / invalid / name-mismatched all THROW — a corrupt ledger is NEVER
+ *  treated as absent (which would re-grant a full ceiling, SB2). */
 function readPoolStrict(home: string, name: string): PoolState | null {
   assertName(name);
   let raw: string;
@@ -168,50 +184,48 @@ function writeLedgerAndProjection(home: string, name: string, state: PoolState):
 
 // --- public API ---------------------------------------------------------------
 
-/** Read a pool's state, or null if absent. Fail-closed on corruption (throws). */
 export function readPool(home: string, name: string): PoolState | null {
   return readPoolStrict(home, name);
 }
 
-/** Create a pool (idempotent: an existing pool is returned unchanged, never clobbered — and a corrupt ledger THROWS rather than
- *  being recreated at full ceiling, SB2). Coordinator action. */
+/** Create a pool (idempotent). A corrupt ledger THROWS rather than being recreated at full ceiling (SB2). ALWAYS (re)writes the
+ *  projection, so a replay after a projection-write fault repairs it (SB4). Coordinator action. */
 export function createPool(home: string, name: string, ceiling: PoolCeiling): PoolState {
   return withLock(home, name, () => {
     const existing = readPoolStrict(home, name);
-    if (existing) return existing;
-    const state = emptyPool(name, ceiling);
-    writeLedgerAndProjection(home, name, state);
+    const state = existing ?? emptyPool(name, ceiling);
+    writeLedgerAndProjection(home, name, state); // SB4: write even for an existing pool (converge projection)
     return state;
   });
 }
 
-/** Admit + reserve atomically before dispatching a NEW unit (SB3 gate). Returns null when the pool is absent (caller fail-closes:
- *  an unknown pool grants no budget). Reclaims crashed units' reservations first. */
+/** Admit + reserve atomically before dispatching a NEW unit (SB3 gate). null when the pool is absent (caller fail-closes). Settles
+ *  vanished units first (never refunds). ALWAYS writes the projection (SB4: an idempotent replay still converges it). */
 export function reservePool(home: string, name: string, res: Reservation): PoolAdmission | null {
   return withLock(home, name, () => {
     const read = readPoolStrict(home, name);
     if (!read) return null;
-    const pruned = pruneStaleReservations(read, pidAlive, nowSec(), RESERVATION_TTL_SEC);
-    const r = pureReserve(pruned, res);
-    if (r.state !== read) writeLedgerAndProjection(home, name, r.state); // persist prune and/or the new reservation
+    const settled = settleExpiredReservations(read, isAlive, nowSec(), RESERVATION_TTL_SEC);
+    const r = pureReserve(settled, res);
+    writeLedgerAndProjection(home, name, r.state); // SB4: always (covers settle, the new reservation, and a pure replay)
     return r.ok ? { ok: true, remaining: remainingOf(r.state) } : { ok: false, exhausted: true, remaining: remainingOf(r.state) };
   });
 }
 
-/** Commit an actual spend (settles its reservation). Idempotent by drawKey. ALWAYS re-writes the projection so an idempotent
- *  replay converges a previously-failed projection write to the committed ledger (SB4). Throws if the pool is absent. */
+/** Commit an actual spend (settles its own reservation). Idempotent by drawKey. ALWAYS re-writes the projection (SB4). Throws if
+ *  the pool is absent. */
 export function commitDraw(home: string, name: string, draw: PoolDraw): PoolState {
   return withLock(home, name, () => {
     const read = readPoolStrict(home, name);
     if (!read) throw new Error(`shared-budget: pool ${name} does not exist (create it first)`);
-    const pruned = pruneStaleReservations(read, pidAlive, nowSec(), RESERVATION_TTL_SEC);
-    const next = pureCommit(pruned, draw);
-    writeLedgerAndProjection(home, name, next); // always: repairs a stale projection even when the draw is an idempotent no-op
+    const settled = settleExpiredReservations(read, isAlive, nowSec(), RESERVATION_TTL_SEC);
+    const next = pureCommit(settled, draw);
+    writeLedgerAndProjection(home, name, next);
     return next;
   });
 }
 
-/** Raise a pool's ceiling (coordinator-only — ruling 5; the money-gate is the CALLER's, enforced at dispatch, not here). */
+/** Raise a pool's ceiling (coordinator-only — ruling 5; the money-gate is the CALLER's). */
 export function raisePoolCeiling(home: string, name: string, next: PoolCeiling): PoolState {
   return withLock(home, name, () => {
     const read = readPoolStrict(home, name);
@@ -222,8 +236,8 @@ export function raisePoolCeiling(home: string, name: string, next: PoolCeiling):
   });
 }
 
-/** List every pool's projection (console). Missing dir => empty. A corrupt pool is SKIPPED from the display list (it is never
- *  granted budget — the gate paths still throw on it), so one bad ledger can't break the whole view. */
+/** List every pool's projection (console). Missing dir => empty. A corrupt pool is SKIPPED from the display list (never granted;
+ *  the gate paths still throw on it). */
 export function listPoolProjections(home: string): BudgetPoolProjection[] {
   let names: string[];
   try { names = readdirSync(budgetsDir(home)); }
@@ -234,7 +248,7 @@ export function listPoolProjections(home: string): BudgetPoolProjection[] {
     const name = f.slice(0, -'.json'.length);
     if (!isValidPoolName(name)) continue;
     let state: PoolState | null;
-    try { state = readPoolStrict(home, name); } catch { continue; } // corrupt: skip from display (never granted)
+    try { state = readPoolStrict(home, name); } catch { continue; }
     if (state) out.push(project(state, nowSec()));
   }
   return out;

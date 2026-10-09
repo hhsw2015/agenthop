@@ -18,7 +18,7 @@ docker-agent `budgets` 共享池:几个 agent 引用同一名字 → 从同一�
 - **池 = 名字 + 天花板 + 已花(committed draws)+ 在途(reservations)**。同名=同池;异名=独立池。`PoolCeiling = { maxUsd?, maxTokens? }`,至少一维,到任一维即耗尽(裁③ fail-closed)。
 - **准入 = reserve(派新前,锁内写)**:消费者派新单元前 `reserve(reserveKey, 估额=该单票面额, pid)`。判据 `committed + inflight >= ceiling ⇒ 拒`(裁 A)。放行则把该估额计入在途。**这是本件的 overshoot 上界凭证**:只要 spent+inflight<ceiling 才放行,唯一溢出就是「压过线的那一张票」⇒ 上界 = ceiling + 单票最大面额,**与消费者数量无关**(修 SB3:旧版准入只读 spent,10 个消费者可并发全放行=无界)。
 - **记账 = commit(实花后,锁内写)**:单元完成后 `commit(drawKey, reserveKey, 实际花费)` ——移除该 reservation(在途减)、记入实花(committed 增)。实花可小于估额。幂等 by `drawKey`。
-- **在途回收**:crash 的消费者留下的 reservation 由 `pruneStaleReservations` 清除(pid-liveness 为主 + TTL 3600s 兜 pid 复用),否则会把池假性撑满。
+- **在途回收(settle 非 refund,修 SB3/R2)**:crash/超时的 reservation 由 `settleExpiredReservations` **结算为「推定已花」draw(按估额入账),绝不删除退款**(删除会把 vanished 单元可能已花的额度退回,重开无界超支)。pid-liveness 为主 + TTL 3600s 兜 pid 复用。真单元若仍活,日后 `commit` 以实际额**对冲**掉该推定估额;若真死,则估额作为保守上限长留。`commit` 只结算**本消费者自己**的 reservation,且对已提交的 drawKey 为纯 no-op——重放或跨消费者提交都不会抹掉他人 reservation。
 - **幂等**:reserve by `reserveKey`、commit by `drawKey`,内容寻址(照搬 fanout runKey)——重连/重试不双记。
 - **耗尽 ≠ 关闭**:耗尽是拒新派的瞬时态;协调者可加额复活(裁⑤)。
 
