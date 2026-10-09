@@ -13,7 +13,8 @@
  *
  * dormant: standalone, NOT wired into fan-out (feat/fanout-native still in review); interface seams documented in the design.
  */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, rmdirSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync } from 'node:fs';
+import { acquireHolderLock, releaseHolderLock, type LockSite } from './holder-lock.js';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import {
@@ -65,79 +66,30 @@ const isAlive = (pid: number) => !holderIsDead(pid);
 
 function sleepMs(ms: number): void { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 
-// Self-stranded state this process must recover (SB1): a credential file we could not remove, and/or an empty dir we could not
-// drop. After ANY publish fault the on-disk residue is uncertain (our credential may or may not exist, the dir may be empty), so
-// we register BOTH and let the retry's reclaim (entries===1 + our cred) / adopt (entries===0 + our dir) pick the true path. Only
-// our OWN (dir, token) are ever registered — an external unknown lock is never made recoverable (boundary preserved).
-const strandedCreds = new Set<string>(); // `${dir}\0${token}`
-const strandedEmpty = new Set<string>(); // dir
-const credKey = (dir: string, token: string) => `${dir}\0${token}`;
-function markStranded(dir: string, token: string): void { strandedCreds.add(credKey(dir, token)); strandedEmpty.add(dir); }
-function clearStranded(dir: string, token: string): void { strandedCreds.delete(credKey(dir, token)); strandedEmpty.delete(dir); }
-
-// --- holder-identity lock (SB1/SB5) -------------------------------------------
-/** Publish our identity, then verify we are the SOLE holder (loses a race safely). On ANY failure where our credential may be left
- *  on disk, register it for in-process recovery (SB1/R4) — never return a bare false that drops a real residue. */
-function publishSole(dir: string, mine: string, token: string): boolean {
-  try { writeFileSync(mine, '', { mode: 0o600 }); } catch { markStranded(dir, token); return false; } // may have partially created it
-  let after: string[];
-  try { after = readdirSync(dir); } catch { markStranded(dir, token); return false; } // our file exists but we can't verify
-  if (after.length === 1 && after[0] === token) return true;
-  try { rmSync(mine); } catch { markStranded(dir, token); } // couldn't drop our losing credential => recover it later
-  return false;
+// --- holder-identity lock (SB1/SB5/DA2-R6) -----------------------------------
+// The per-pool mutation lock is the shared holder-identity lock (./holder-lock.ts — the proven DB-R7 lock). The lock DIR is
+// `<pool>.lock` under the budgets dir; its hold-intents live beside it under the `<pool>.lock.hold.` prefix (skipped by the
+// `.json`-only pool listing). acquireHolderLock reclaims a dead holder OR our OWN stranded credential by pid-in-filename, so a
+// release that faulted under EACCES (SB1) — leaving our live-pid credential behind — is reclaimed on retry instead of being
+// mistaken for a live external holder and contended to timeout. The bounded retry budget stays here (shared-budget contends and
+// waits; the shared primitive is single-attempt, returning null on contention).
+function budgetLockSite(home: string, name: string): LockSite {
+  return { lockDir: lockDir(home, name), intentDir: budgetsDir(home), intentPrefix: `${name}.lock.hold.` };
 }
 function acquireLock(home: string, name: string): string {
   assertName(name); // SB5: before any path op
-  const dir = lockDir(home, name);
-  const token = `${process.pid}.${randomBytes(6).toString('hex')}`;
-  const mine = path.join(dir, token);
-  mkdirSync(budgetsDir(home), { recursive: true, mode: 0o700 });
+  mkdirSync(budgetsDir(home), { recursive: true, mode: 0o700 }); // the intent dir must exist before staging a hold-intent
+  const site = budgetLockSite(home, name);
   const tries = lockTries();
   for (let i = 0; i < tries; i++) {
-    try { mkdirSync(dir); }
-    catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-      let entries: string[];
-      try { entries = readdirSync(dir); } catch { sleepMs(15); continue; }
-      if (entries.length === 1) {
-        const holder = entries[0]!;
-        if (strandedCreds.has(credKey(dir, holder))) {
-          // OUR OWN leftover credential (a prior publish/release fault) => reclaim it, then adopt the dir.
-          try { rmSync(path.join(dir, holder)); strandedCreds.delete(credKey(dir, holder)); } catch { sleepMs(15); continue; }
-          if (publishSole(dir, mine, token)) { clearStranded(dir, token); return token; }
-          sleepMs(15); continue;
-        }
-        if (holderIsDead(Number(holder.split('.')[0]))) {
-          try { rmSync(path.join(dir, holder)); rmdirSync(dir); } catch { sleepMs(15); }
-          continue;
-        }
-        sleepMs(15); continue; // live / inconclusive foreign holder => contend
-      }
-      if (entries.length === 0) {
-        if (strandedEmpty.has(dir)) { // OUR OWN stranded empty dir => adopt
-          if (publishSole(dir, mine, token)) { clearStranded(dir, token); return token; }
-          sleepMs(15); continue;
-        }
-        sleepMs(15); continue; // external empty => contend
-      }
-      sleepMs(15); continue; // ambiguous (>1) => contend
-    }
-    // Won a fresh mkdir.
-    try { writeFileSync(mine, '', { mode: 0o600 }); }
-    catch (e) { markStranded(dir, token); throw e; } // SB1/R4: our credential may exist => register both paths
-    clearStranded(dir, token);
-    return token;
+    const token = acquireHolderLock(site);
+    if (token !== null) return token;
+    sleepMs(15); // contended (a live/inconclusive foreign holder) => wait, bounded by lockTries() (SB1/R3)
   }
   throw new Error(`shared-budget: could not acquire lock for pool ${name} within ${tries} tries`);
 }
 function releaseLock(home: string, name: string, token: string): void {
-  const dir = lockDir(home, name);
-  const mine = path.join(dir, token);
-  try { if (existsSync(mine)) rmSync(mine); }
-  catch { strandedCreds.add(credKey(dir, token)); return; } // credential residue => reclaim on retry (SB1)
-  strandedCreds.delete(credKey(dir, token));
-  try { rmdirSync(dir); strandedEmpty.delete(dir); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') strandedEmpty.delete(dir); else strandedEmpty.add(dir); } // empty-dir residue
+  releaseHolderLock(budgetLockSite(home, name), token);
 }
 function withLock<T>(home: string, name: string, fn: () => T): T {
   const token = acquireLock(home, name);

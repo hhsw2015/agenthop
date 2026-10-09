@@ -98,6 +98,15 @@ try {
     t('SB1/R3: invalid-credential lock NOT stolen (contends then throws, bounded)', threw(() => reservePool(fresh, 'lk', res({ reserveKey: 'no', estUsd: 1 }))));
     process.env.SHARED_BUDGET_LOCK_TRIES = 'Infinity'; // SB1/R3: must fall back to a finite default, not loop forever
     t('SB1/R3: env=Infinity is bounded (reserve still terminates by throwing)', threw(() => reservePool(fresh, 'lk', res({ reserveKey: 'no2', estUsd: 1 }))));
+    // SB1/R6 (release-path residue): OUR OWN leftover credential (a faulted release left it; the in-process stranded set is empty
+    // — e.g. existsSync(mine) returned false under a real EACCES) is reclaimed by pid-in-filename on the next acquire, NOT taken
+    // for a live external holder (our pid IS alive) and contended to timeout. Before R6 this threw within the retry budget; the
+    // shared holder-lock reclaims it because hpid === process.pid.
+    createPool(fresh, 'resid', { maxUsd: 100, maxTokens: null });
+    const rlock = join(fresh, '.agenthop', 'budgets', 'resid.lock');
+    mkdirSync(rlock, { recursive: true }); writeFileSync(join(rlock, `${process.pid}.stale`), '');
+    process.env.SHARED_BUDGET_LOCK_TRIES = '3'; // old behavior would contend→throw within 3 tries; the fix reclaims on the first
+    t('SB1/R6: own stranded credential reclaimed by pid, not contended to timeout', reservePool(fresh, 'resid', res({ reserveKey: 'ok', estUsd: 1 }))!.ok === true);
     delete process.env.SHARED_BUDGET_LOCK_TRIES;
   } finally { rmSync(fresh, { recursive: true, force: true }); }
 
