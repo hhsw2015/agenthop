@@ -166,8 +166,10 @@ export async function openLivenessSocket(home: string, sessionId: string, _timeo
   try {
     const server = await new Promise<net.Server>((resolve, reject) => {
       // On accept, EMIT the owning sid then close (coordinator r9 hint ①: lets a prober back-verify this socket owns the sid —
-      // the hashed filename alone is just a key). A write error never crashes the daemon.
-      const srv = net.createServer((c) => { try { c.end(sessionId); } catch { try { c.destroy(); } catch { /* noop */ } } });
+      // the hashed filename alone is just a key). F45-R9-P2-1: the CONNECTION's own async stream errors (a client that
+      // disconnects before the reply ⇒ EPIPE/ECONNRESET on the write) are NOT delivered to the server's error listener, so
+      // register a per-connection error handler FIRST — a single broken connection must end only itself, never the daemon.
+      const srv = net.createServer((c) => { c.on("error", () => { /* broken client conn — end this conn only, never the daemon */ }); try { c.end(sessionId); } catch { try { c.destroy(); } catch { /* noop */ } } });
       srv.once("error", reject);
       srv.listen(sockPath, () => { srv.removeListener("error", reject); srv.on("error", () => { /* never crash on a socket error */ }); srv.unref?.(); resolve(srv); });
     });

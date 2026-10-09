@@ -196,4 +196,22 @@ describe("F45-R7 openLivenessSocket + probeSessionAlive — per-instance ownersh
     // NO probe-authorized delete (F45-R7-P2-1): the orphan is left on disk, never removed by a probe signal.
     expect(() => rmSync(deadPath)).not.toThrow();          // still present ⇒ not swept
   });
+
+  test("R9-P2-1: a per-connection stream error (EPIPE on the identity write) ends only that conn, never the daemon", async () => {
+    const home = mkHome();
+    const res = await openLivenessSocket(home, "sid-X", 400);
+    expect(res).not.toBeNull();
+    if (!res) return;
+    servers.push(res.server);
+    // Deterministically reproduce the async write error the reviewer hit: on the next accepted connection, emit an 'error' on
+    // the server-side socket WITHOUT adding our own handler. The production accept handler must have registered c.on("error")
+    // first (it runs before this listener) — else EventEmitter re-throws an unhandled 'error' and crashes the worker (the bug).
+    const errorDelivered = new Promise<void>((resolve) => {
+      res.server.once("connection", (c) => { setImmediate(() => { c.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })); resolve(); }); });
+    });
+    await new Promise<void>((resolve) => { const c = net.connect(res.path, () => resolve()); c.on("error", () => { /* client side fine */ }); });
+    await errorDelivered;
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await probeSessionAlive(home, "sid-X", 400)).toBe(true); // the daemon survived and still answers a normal probe
+  });
 });

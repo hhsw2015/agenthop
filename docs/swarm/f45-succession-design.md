@@ -49,10 +49,14 @@ user 重启协调者后，新壳拿到全新 native sid，未继承稳定 sid（
 - **F45-R7-P1-2（P1，合法长 SID 内核路径碰撞）：** 128 字符守卫不限制最终 socket 路径字节数；两个 127 字符仅尾字母不同的 SID 均过校验，但 macOS sun_path（104 字节）把超长路径**静默截断**成同一前缀，send(B) 连上 A 的 socket 回 durable=假归属。修（协调者裁 B 之「有界稳定映射」）：socket 名 = `<sha256(sid) 前 32 hex>.<nonce>.sock`——哈希使 `../bridge` 无法穿越、两个长 SID 得不同前缀不再截断成同一端点（定向碰撞需 2^64 = 不可行）；另加 `sockPathFits`（≤103 字节）在开 socket 与探测两侧**拒绝放不下的路径**（退 relay，绝不探测会截断的路径）。原始 SID 仍经 isValidSessionId 守**耐久箱目录键**（箱名是生 SID，无 sun_path 限制但要防穿越）。**身份回验（协调者 r9 提示①）**：socket 被连上时**吐出自己的全 SID** 再关；`probeSessionAlive` 连上后读该 SID，仅当 == 被探 SID 才算活——哈希文件名只是键，emit 的全 SID 是回验，哪怕（不可行的）128 位碰撞或同前缀残留也无法替它不拥有的 SID 应答。
 - **F45-R7-P2-1（P2，旧实例退出删新实例路径）：** 共享路径下 Node v20 `server.close()` 按路径 unlink，旧实例退出删掉新实例的文件；且失败探测（活 incumbent 的瞬时 ECONNREFUSED / timeout / EACCES）不得授权删除。修：**每实例 nonce 路径**——`openLivenessSocket` 每次绑定全新随机 nonce 路径（无 EADDRINUSE 争用、无回收、close() 只 unlink 自己的路径，绝不碰他人端点）；收端 `probeSessionAlive` 按哈希前缀 readdir + 逐一 connect 探测，任一连上即活。**全程无任何探测授权的删除**（陈旧孤儿留在盘上，探测不通即跳过，绝不被某个失败探测删掉）——彻底消除跨实例删除与瞬时误删。孤儿（崩溃残留）无害且实践中有界（仅崩溃产生），留一条 age-based reaper 的后路但绝不做探测删除。
 
+**round-10 收口（审查席 happycapy r9 判：R7 两项全 CLOSED，仅剩 1 P2）：**
+
+- **F45-R9-P2-1（P2，身份回应异步写错终止守护进程）：** r9 新加的「accept 即吐 SID」回调 `c.end(sessionId)` 未给连接 `c` 挂 error 监听；客户端在回应前断连则写 SID 触发 EPIPE/ECONNRESET，这是连接自身的**异步**流错误——外层 try/catch 只接同步异常、Server 的 error 监听不收连接流错误，于是未处理 error 让 presence 以退出码 1 终止，后续活性探测全失败。修（协调者裁：socket.on error 吞 EPIPE）：accept 回调**先给每条连接挂 `c.on("error", …)`** 再写——单条断连/写失败只结束该连接，绝不终止守护进程；正常身份探测照常成功。
+
 这是修 bug（非 dormant 新机制）：改在本分支、未合并故 main 不受影响，经合并门后应**默认生效**。
 
 ## 门与边界
 
-- 纯核自测：shell-succession 38、coordinator-report 12 = 作者 50/50；send-fallback 25/25（r8 isValidSessionId + 不安全耐久键；r9 sidSockPrefix/sockPathFits 边界 + openLivenessSocket/probeSessionAlive 真 socket：开→活 / 无 socket→relay / 两个 127 字符长 SID 不碰撞 / 同前缀但吐错 SID 的 socket 被回验拒绝 / 同 SID 两实例独占路径关一个另一个仍活 / 死孤儿被容忍不删）。bus 全量 tsc 净（exit 0）；liveness+core 邻接 48/48；全量 bus 1268/1268。
+- 纯核自测：shell-succession 38、coordinator-report 12 = 作者 50/50；send-fallback 26/26（r8 isValidSessionId + 不安全耐久键；r9 sidSockPrefix/sockPathFits 边界 + openLivenessSocket/probeSessionAlive 真 socket：开→活 / 无 socket→relay / 两个 127 字符长 SID 不碰撞 / 同前缀但吐错 SID 的 socket 被回验拒绝 / 同 SID 两实例独占路径关一个另一个仍活 / 死孤儿被容忍不删 / 连接异步 error 只结束该连接不杀守护）。bus 全量 tsc 净（exit 0）；liveness+core 邻接 48/48；全量 bus 1269/1269。
 - 留白：①的采证 IO（读 roster-snapshot + presence 存活 + herdr pane）与重写 pid、②的 S19/herdr 面接线、live 重跑 bus 全量，均按既定范围 dormant/未接，候合并门。
 - ③的修改触及 live 代码（send-fallback.ts、core.ts），已随邻接测试验证不破坏既有 send 路径。
