@@ -24,7 +24,10 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { readBatch, readDecisions } from "./decision-batch-store.js";
 import { resolveBatch, validDecisionsDoc, type DecisionsDoc } from "./decision-batch.js";
-import { computeDualBandwidth, type DualBandwidthReading, type DualBandwidthConfig } from "./dual-bandwidth.js";
+import { computeDualBandwidth, mergeProduceEvents, submitDigest, type DualBandwidthReading, type DualBandwidthConfig } from "./dual-bandwidth.js";
+import { listRooms, readPosts } from "./chat-room-store.js";
+import { digestOf } from "./digest.js";
+import { validInboxMsg } from "../inbox.js";
 
 function batchesDir(home: string): string { return path.join(home, ".agenthop", "console", "decision-batches"); }
 function batchJsonPath(home: string, id: string): string { return path.join(batchesDir(home), id, "batch.json"); }
@@ -76,16 +79,64 @@ function readBoundDoc(file: string, id: string): DecisionsDoc | null {
   return doc && doc.batchId === id ? doc : null;
 }
 
+function inboxRoot(home: string): string { return path.join(home, ".agenthop", "inbox"); }
+
+/** submit-tag dormant gate (SWARM_SUBMIT_TAG, default OFF, dormant-ahead-of-use like SWARM_BOARD_ADMIT). OFF ⇒
+ *  collectBandwidthEvents keeps the v0 decision-batch-only behavior byte-for-byte; ON ⇒ the tagged-submit secondary source +
+ *  foldedFrom de-dup activate. */
+export function submitTagEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(1|true|yes|on)$/i.test(env.SWARM_SUBMIT_TAG ?? "");
+}
+
+/** Scan the swarm's durable append-logs for tagged `submit` posts/messages → de-dup-keyed produce events (submitDigest, atSec).
+ *  Chat-room logs are append-only (a reliable early signal); inbox messages are ephemeral (a best-effort early signal — once a
+ *  submit is folded into a batch the item's foldedFrom carries the durable count, so nothing is lost after a claim). READ-ONLY.
+ *  A corrupt line/file is skipped; an inbox dir ACCESS fault PROPAGATES (same design law as the decision-batch scan — a read
+ *  fault is never a silent "no events" that could under-count produce into a false green). `ts` is epoch-ms (÷1000 → seconds). */
+function scanSubmits(home: string): { digest: string; atSec: number }[] {
+  const out: { digest: string; atSec: number }[] = [];
+  for (const roomId of listRooms(home)) {
+    for (const post of readPosts(home, roomId)) {
+      if (post.intent === "submit") out.push({ digest: submitDigest(post.from, post.text), atSec: Math.floor(post.ts / 1000) });
+    }
+  }
+  let boxes;
+  try { boxes = readdirSync(inboxRoot(home), { withFileTypes: true }); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return out; throw e; }
+  for (const box of boxes) {
+    if (!box.isDirectory()) continue;
+    const dir = path.join(inboxRoot(home), box.name);
+    let files: string[];
+    try { files = readdirSync(dir); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; throw e; } // a box that vanished mid-scan
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue; // final envelopes only; skip .tmp/.claim-* + the quarantine/ sub-dir
+      const msg = validInboxMsg(readJsonOrNull(path.join(dir, f)));
+      if (msg && msg.intent === "submit") out.push({ digest: submitDigest(msg.from, msg.text), atSec: Math.floor(msg.ts / 1000) });
+    }
+  }
+  return out;
+}
+
 /** Scan the decision-batch directory into the pure core's inputs. READ-ONLY (never the mutating consumeDecisions); a per-batch
- *  corrupt/foreign file is skipped, but an ACCESS fault propagates (via listBatchIdsStrict / readBatch / readJsonOrNull). */
+ *  corrupt/foreign file is skipped, but an ACCESS fault propagates (via listBatchIdsStrict / readBatch / readJsonOrNull). When
+ *  SWARM_SUBMIT_TAG is on, B_prod additionally folds in tagged chat-room/inbox submits, de-duped against the decision-batch
+ *  items they are compressed into (foldedFrom), each logical submission counted once (B_prod=N). */
 export function collectBandwidthEvents(home: string): BandwidthEvents {
   const produceAtSec: number[] = [];
   const consumeAtSec: number[] = [];
   let backlog = 0;
+  const submitTag = submitTagEnabled();
+  const batchItemsForMerge: { digest: string; createdAtSec: number; foldedFrom: readonly string[] }[] = [];
   for (const id of listBatchIdsStrict(home)) {
     const batch = readBatch(home, id); // dir-bound; a foreign/garbled batch.json reads as null (throws on an access fault)
     if (!batch) continue;
-    for (let i = 0; i < batch.items.length; i += 1) produceAtSec.push(batch.createdAtSec); // one produce event per pending item, at open time
+    if (submitTag) {
+      // defer produce to the merge (de-dup): a per-item stable digest (never collides with a submitDigest — different key shape).
+      for (const it of batch.items) batchItemsForMerge.push({ digest: digestOf({ batchId: id, itemId: it.id }), createdAtSec: batch.createdAtSec, foldedFrom: it.foldedFrom ?? [] });
+    } else {
+      for (let i = 0; i < batch.items.length; i += 1) produceAtSec.push(batch.createdAtSec); // v0: one produce event per pending item, at open time
+    }
     const consumedAtMs = boundConsumedAtMs(readJsonOrNull(consumedPath(home, id)), id);
     if (consumedAtMs !== null) {
       // CONSUMED (bound terminal): count ONLY decisions that MATCH this batch's items (T52-P2-2) — resolved excludes unknownIds and
@@ -105,6 +156,12 @@ export function collectBandwidthEvents(home: string): BandwidthEvents {
         { batchId: id, decidedAtSec: 0, decisions: [] };
       backlog += resolveBatch(batch, doc).undecided.length;
     }
+  }
+  if (submitTag) {
+    // merge tagged submits with the batch items (de-dup by digest, B_prod=N): a folded submit and the item it was folded into
+    // count once; a native item counts as its own digest; an un-folded submit counts at its post time (the early signal).
+    const merged = mergeProduceEvents({ batchItems: batchItemsForMerge, submits: scanSubmits(home) });
+    for (const atSec of merged) produceAtSec.push(atSec);
   }
   return { produceAtSec, consumeAtSec, backlog };
 }

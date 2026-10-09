@@ -21,6 +21,8 @@
 
 /** The coordinator-facing zone. GREEN = carry on; AMBER = compress harder (bigger batches, defer low-priority, merge 呈批);
  *  RED = throttle thread-opening (never an approval hop). */
+import { digestOf } from "./digest.js";
+
 export type BwZone = "green" | "amber" | "red";
 
 /** Tunable thresholds + window (coordinator ruling (2): constants to start, recalibrate after a week). */
@@ -136,4 +138,45 @@ export function computeDualBandwidth(input: DualBandwidthInput): DualBandwidthRe
   if (nonFinite) throw new Error(`dual-bandwidth: a derived value overflowed to non-finite (windowSec/backlog/counts out of range) — refusing to emit a null-masquerade`);
 
   return { bProd1h, bCons1h, bProdTotal, bConsTotal, ratio, backlog, dBacklogDtPerHour, tDrainHours, zone };
+}
+
+// ============================================================================================================
+// submit-tag (T5-2 secondary-source seam) — produce-event merge with de-dup. Pure.
+// ============================================================================================================
+
+/** The stable content digest of a tagged `submit` — the de-dup key shared by the raw submit scan AND the `foldedFrom` stamp a
+ *  decision-batch item carries when it compresses that submit. Content-addressed (NOT time-keyed) so a submit observed at post
+ *  time and the later batch item it is folded into resolve to the SAME key. Two byte-identical submissions by the same author
+ *  collide to one (a benign de-dup of a resend). The fold path MUST stamp foldedFrom with this exact function. */
+export function submitDigest(from: string, text: string): string {
+  return digestOf({ from, text });
+}
+
+export type ProduceMergeInput = {
+  /** One per decision-batch item: a stable per-item digest, the batch's createdAtSec, and the submit digests it folded (empty = a
+   *  native item not derived from a tagged submit). */
+  batchItems: readonly { digest: string; createdAtSec: number; foldedFrom: readonly string[] }[];
+  /** One per observed tagged `submit`: its content digest (submitDigest) and the second it was posted. */
+  submits: readonly { digest: string; atSec: number }[];
+};
+
+/**
+ * Merge decision-batch produce + tagged submits into B_prod events, each LOGICAL submission counted ONCE by digest at its
+ * EARLIEST timestamp (coordinator R3-b: B_prod = N — N logical items are N units of demand; compression is a CONSUME-side
+ * efficiency, it must NOT shrink the demand count). A batch item that folded submit(s) contributes those submit digests (at the
+ * item's createdAtSec as a floor), so a folded submit is counted once whether or not it was also observed raw; a native item (no
+ * fold) contributes its own digest. Returns the produce timestamps (seconds). Pure.
+ */
+export function mergeProduceEvents(inp: ProduceMergeInput): number[] {
+  const earliest = new Map<string, number>();
+  const add = (digest: string, atSec: number): void => {
+    const e = earliest.get(digest);
+    if (e === undefined || atSec < e) earliest.set(digest, atSec);
+  };
+  for (const s of inp.submits) add(s.digest, s.atSec);
+  for (const it of inp.batchItems) {
+    if (it.foldedFrom.length > 0) for (const d of it.foldedFrom) add(d, it.createdAtSec);
+    else add(it.digest, it.createdAtSec);
+  }
+  return [...earliest.values()];
 }

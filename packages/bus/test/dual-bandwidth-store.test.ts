@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { openBatch, writeDecisions, consumeDecisions } from "../src/swarm/decision-batch-store.js";
 import { type DecisionItem } from "../src/swarm/decision-batch.js";
-import { collectBandwidthEvents, computeGauge, writeBandwidthProjection, readBandwidthProjection } from "../src/swarm/dual-bandwidth-store.js";
+import { collectBandwidthEvents, computeGauge, writeBandwidthProjection, readBandwidthProjection, submitTagEnabled } from "../src/swarm/dual-bandwidth-store.js";
+import { openRoom, appendPost } from "../src/swarm/chat-room-store.js";
+import { writeInbox, composeInboxMsg } from "../src/inbox.js";
+import { submitDigest } from "../src/swarm/dual-bandwidth.js";
 
 const homes: string[] = [];
 const mkHome = (): string => { const h = mkdtempSync(path.join(tmpdir(), "dbw-")); homes.push(h); return h; };
@@ -199,5 +202,64 @@ describe("dual-bandwidth IO store", () => {
     w({ ...full, thresholds: "x" }); expect(readBandwidthProjection(h)).toBeNull(); // wrong type
     w({ ...full, thresholds: { ...thresholds, tDrainHorizonHours: undefined } }); expect(readBandwidthProjection(h)).toBeNull(); // one field missing
     w({ ...full, thresholds: { ...thresholds, redRatio: "1.2" } }); expect(readBandwidthProjection(h)).toBeNull(); // numeric string, not a number
+  });
+});
+
+describe("dual-bandwidth IO store — submit-tag secondary source (SWARM_SUBMIT_TAG)", () => {
+  const withTag = (on: boolean, fn: () => void): void => {
+    const prev = process.env.SWARM_SUBMIT_TAG;
+    process.env.SWARM_SUBMIT_TAG = on ? "1" : "";
+    try { fn(); } finally { if (prev === undefined) delete process.env.SWARM_SUBMIT_TAG; else process.env.SWARM_SUBMIT_TAG = prev; }
+  };
+
+  test("default OFF: tagged submits are IGNORED (v0 decision-batch-only behavior unchanged)", () => {
+    const h = mkHome(); const t = nowSec();
+    openRoom(h, { roomId: "r1", topic: "x", owner: "coord", nowSec: t });
+    appendPost(h, "r1", { from: "alice", fromLabel: "alice", text: "呈批 ship", intent: "submit" }, t);
+    openBatch(h, { batchId: "b1", owner: "coord", items: items(2), nowSec: t });
+    expect(submitTagEnabled({})).toBe(false);
+    withTag(false, () => { expect(collectBandwidthEvents(h).produceAtSec.length).toBe(2); }); // only the 2 batch items
+  });
+
+  test("ON: a chat-room `submit` post is a produce event; report/fyi/untagged are ignored", () => {
+    const h = mkHome(); const t = nowSec();
+    openRoom(h, { roomId: "r1", topic: "x", owner: "coord", nowSec: t });
+    appendPost(h, "r1", { from: "a", fromLabel: "a", text: "呈批 1", intent: "submit" }, t);
+    appendPost(h, "r1", { from: "a", fromLabel: "a", text: "fyi note", intent: "fyi" }, t);
+    appendPost(h, "r1", { from: "a", fromLabel: "a", text: "status", intent: "report" }, t);
+    appendPost(h, "r1", { from: "a", fromLabel: "a", text: "chatter" }, t); // untagged
+    withTag(true, () => { expect(collectBandwidthEvents(h).produceAtSec.length).toBe(1); });
+  });
+
+  test("ON: an inbox `submit` message is counted; fyi ignored", () => {
+    const h = mkHome(); const t = nowSec();
+    const box = "01a0ff49-7a50-7393-9737-2402e68e4649";
+    writeInbox(h, box, composeInboxMsg({ from: "a", fromLabel: "a", text: "呈批 via inbox", ts: t * 1000, intent: "submit" }));
+    writeInbox(h, box, composeInboxMsg({ from: "a", fromLabel: "a", text: "just fyi", ts: t * 1000, intent: "fyi" }));
+    withTag(true, () => { expect(collectBandwidthEvents(h).produceAtSec.length).toBe(1); });
+  });
+
+  test("ON: a submit folded into a batch item counts ONCE (de-dup); a native item still counts", () => {
+    const h = mkHome(); const t = nowSec();
+    openRoom(h, { roomId: "r1", topic: "x", owner: "coord", nowSec: t });
+    appendPost(h, "r1", { from: "alice", fromLabel: "alice", text: "ship it", intent: "submit" }, t);
+    const d = submitDigest("alice", "ship it");
+    openBatch(h, { batchId: "b1", owner: "coord", items: [
+      { id: "A", kind: "pr", summary: "folded", suggestedAction: "merge", foldedFrom: [d] },
+      { id: "B", kind: "pr", summary: "native", suggestedAction: "merge" },
+    ], nowSec: t });
+    // submit(alice/"ship it") === item A's fold ⇒ once; item B native ⇒ once ⇒ 2 total (NOT 3 — no double-count)
+    withTag(true, () => { expect(collectBandwidthEvents(h).produceAtSec.length).toBe(2); });
+  });
+
+  test("ON: an inbox access fault during the submit scan propagates (never a silent under-count)", () => {
+    if (process.getuid && process.getuid() === 0) return;
+    const h = mkHome();
+    const box = path.join(h, ".agenthop", "inbox", "01a0ff49-7a50-7393-9737-2402e68e4649");
+    mkdirSync(box, { recursive: true });
+    writeFileSync(path.join(box, "x.json"), "{}");
+    chmodSync(box, 0o000);
+    try { withTag(true, () => { expect(() => collectBandwidthEvents(h)).toThrow(); }); }
+    finally { chmodSync(box, 0o755); }
   });
 });

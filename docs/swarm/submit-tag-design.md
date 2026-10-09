@@ -39,12 +39,19 @@ merged with the existing decision-batch produce through the digest de-dup above.
 like the existing decision-batch scan). Gated behind a dormant flag `SWARM_SUBMIT_TAG` (default OFF, dormant-ahead-of-use like
 SWARM_BOARD_ADMIT) so wiring lands dark; the gauge's current decision-batch-only behavior is unchanged when off.
 
-## OPEN QUESTION for the coordinator (needs a ruling before implement)
+## RESOLVED (coordinator ruling 2026-10-09) — B_prod = N
 
-When N submits are compressed into ONE decision-batch item, is B_prod **N** (each logical submission produced — recommended,
-gives the truest/earliest produce signal; compression's benefit then shows as CONSUME efficiency) or **1** (compression also
-collapses produce)? The de-dup above assumes **N** (count each submit once; the fold adds nothing). If you want **1**, the fold
-instead SUPERSEDES the submits' produce — a one-line variant. Flagging per R3-b; recommended default = N.
+APPROVED all three points; the N-vs-1 question is ruled **B_prod = N** (the recommended case): B_prod's semantics = demand
+arrival rate, N logical items are N units of demand; compression is a CONSUME-side efficiency whose benefit must surface as a
+higher B_cons + shorter T_drain, NOT as a smaller demand count — recording 1 would false-green the gauge during a high-fold
+window, hiding exactly the moment it should warn (Little's-law input distortion). `mergeProduceEvents` implements N.
+
+## IMPLEMENTED (feat/submit-tag)
+
+`intent?` on `inbox.ts` InboxMsg + `swarm/chat-room.ts` RoomPost/Draft (shared `SubmitIntent` in a new pure core
+`submit-intent.ts`); `foldedFrom?: string[]` on the decision item; pure `mergeProduceEvents` + `submitDigest` in
+`dual-bandwidth.ts`; `submitTagEnabled` + a chat-room/inbox submit scan + foldedFrom de-dup in `dual-bandwidth-store.ts`
+(dormant, OFF ⇒ v0 behavior byte-for-byte). Tests: `submit-tag.test.ts` (12) + 5 store-integration cases.
 
 ## Scope / non-goals
 
