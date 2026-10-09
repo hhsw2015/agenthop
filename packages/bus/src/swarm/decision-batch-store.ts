@@ -224,25 +224,42 @@ export function readBatch(home: string, batchId: string): DecisionBatch | null {
 }
 
 export function readDecisions(home: string, batchId: string): DecisionsDoc | null {
-  // TG-R3-P2-1: the EFFECTIVE ledger folds THREE sources so a reader always sees the complete valid decisions: the console's
-  // full-snapshot decisions.json, a RECOVERABLE claim (a consume moved decisions.json here then faulted — a reader must still
-  // see it, else backlog miscounts), and every per-item tap. Folded by actual WRITE order (readDocEntry's mtime token,
-  // TG-R3-P1-1). A misbound doc (batchId ≠ dir) is dropped inside foldDecisionDocs. null when there is nothing to read.
-  const entries = [readDocEntry(decisionsPath(home, batchId)), readDocEntry(claimPath(home, batchId)), ...readTaps(home, batchId)];
-  return foldDecisionDocs(entries.filter((e): e is { doc: DecisionsDoc; order: bigint } => e !== null), batchId);
+  // TG-R3-P2-1: the BASE is the console's authoritative snapshot, with the SAME precedence consume uses — a FRESH decisions.json
+  // SUPERSEDES a stale claim (only recover the claim when there is no fresh snapshot, then a stranded rejected-claim), so read and
+  // consume mean ONE thing. Then FOLD the per-item taps onto the base by PUBLISH order (TG-R3-P1-1). null when there is nothing.
+  const base = readDocEntry(decisionsPath(home, batchId), batchId)
+            ?? readDocEntry(claimPath(home, batchId), batchId)
+            ?? readDocEntry(rejectedClaimPath(home, batchId), batchId);
+  return foldDecisionDocs([...(base ? [base] : []), ...readTaps(home, batchId)], batchId);
 }
 
-/** Read a DecisionsDoc at `file` with its WRITE-ORDER token (mtime in ns — finer than the 1-second decidedAtSec, TG-R3-P1-1).
- *  A real read error PROPAGATES (never silently dropped — a lost source is a lost/miscounted verdict); ENOENT or corrupt ⇒ null. */
-function readDocEntry(file: string): { doc: DecisionsDoc; order: bigint } | null {
-  const doc = readJsonOrNull(file, validDecisionsDoc);
-  if (!doc) return null;
-  let order = 0n;
-  try { order = statSync(file, { bigint: true }).mtimeNs; } catch { /* vanished right after the read ⇒ treat as oldest */ }
-  return { doc, order };
+/** Read a DecisionsDoc at `file` with its PUBLISH-ORDER token — the ctime (set by the atomic temp->rename PUBLISH). mtime is the
+ *  TEMP's content-write time and does NOT reflect publish order (a content written first but renamed last, TG-R3-P1-1), so it is
+ *  never used for ordering. CONSISTENT SNAPSHOT (TG-R3-P2-1): stat, read, re-stat and retry until ctime+ino are stable across the
+ *  read, so the content and its order token always belong to the SAME version. A real read error (EACCES) PROPAGATES — it is NEVER
+ *  fabricated into order=0 (which would release a stale verdict as if it were oldest). ENOENT ⇒ null; corrupt ⇒ null; a doc not
+ *  bound to `batchId` (when given) ⇒ null (misbound/foreign). */
+function readDocEntry(file: string, batchId?: string): { doc: DecisionsDoc; order: bigint } | null {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    let st1: import("node:fs").BigIntStats;
+    try { st1 = statSync(file, { bigint: true }); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; } // EACCES etc PROPAGATE (never order=0)
+    let raw: string;
+    try { raw = readFileSync(file, "utf8"); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
+    let st2: import("node:fs").BigIntStats;
+    try { st2 = statSync(file, { bigint: true }); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
+    if (st1.ctimeNs !== st2.ctimeNs || st1.ino !== st2.ino) continue; // changed under the read ⇒ retry for a consistent snapshot
+    let doc: DecisionsDoc | null;
+    try { doc = validDecisionsDoc(JSON.parse(raw)); } catch { doc = null; }
+    if (!doc || (batchId !== undefined && doc.batchId !== batchId)) return null;
+    return { doc, order: st2.ctimeNs };
+  }
+  throw new Error(`readDocEntry: ${file} kept changing under read (no consistent snapshot)`); // a read error ⇒ retry, never a seal
 }
 
-/** Read every per-item TAP for a batch (with its write-order token). A dir/file read error PROPAGATES (never folded to [] — a
+/** Read every per-item TAP for a batch (with its publish-order token). A dir/file read error PROPAGATES (never folded to [] — a
  *  lost tap is a lost approval, TG-P2-1); a missing dir ⇒ none; a corrupt/misbound tap file ⇒ skipped. */
 function readTaps(home: string, batchId: string): { doc: DecisionsDoc; order: bigint }[] {
   let names: string[];
@@ -251,8 +268,8 @@ function readTaps(home: string, batchId: string): { doc: DecisionsDoc; order: bi
   const out: { doc: DecisionsDoc; order: bigint }[] = [];
   for (const n of names) {
     if (!n.endsWith(".json")) continue;
-    const e = readDocEntry(path.join(tapsDir(home, batchId), n)); // throws on a real read error ⇒ kept, not dropped
-    if (e && e.doc.batchId === batchId) out.push(e);
+    const e = readDocEntry(path.join(tapsDir(home, batchId), n), batchId); // throws on a real read error ⇒ kept, not dropped
+    if (e) out.push(e);
   }
   return out;
 }
@@ -395,27 +412,32 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
     const dpath = decisionsPath(home, batchId);
     // Claim the LATEST decision: a FRESH decisions.json first; else RESUME a prior in-progress claim; else RECOVER a VALID doc
     // stranded in the rejected slot (foreign — batchId≠dir — left there). writeDecisions is NOT locked (R25: concurrent writes
-    // are accepted, not refused), so a newer decision may land concurrently — we re-claim it below so the latest wins.
+    // are accepted, not refused), so a newer decision may land concurrently — we re-claim it below so the latest wins. TG-R3-P1-1:
+    // CAPTURE each fresh snapshot's PUBLISH ctime BEFORE the rename (a rename resets ctime, so the claim's own ctime would be the
+    // consume time, not the console's publish). A stat read error PROPAGATES (never a fabricated order).
+    let baseOrder: bigint | null = null;
+    const claimFresh = (): void => { baseOrder = statSync(dpath, { bigint: true }).ctimeNs; renameSync(dpath, claim); };
     if (existsStrict(dpath)) {
-      renameSync(dpath, claim);
+      claimFresh();
     } else if (!existsStrict(claim)) {
       const rejected = rejectedClaimPath(home, batchId);
       if (existsStrict(rejected)) {
-        const r = readJsonOrNull(rejected, validDecisionsDoc);
-        if (r && r.batchId === batchId) renameSync(rejected, claim); // recover a valid stranded decision
+        const r = readDocEntry(rejected); // no filter: recover only a doc bound to THIS batch, carrying its own publish ctime
+        if (r && r.doc.batchId === batchId) { baseOrder = r.order; renameSync(rejected, claim); }
       }
     }
-    if (existsStrict(dpath)) renameSync(dpath, claim); // R25 (newer wins): a write that landed during acquire/recover supersedes
-    // TG-P1-2/R3-P2-1: read every per-item entry tap under the lock (serialized vs recordDecision), each with its write-order
-    // token. The EFFECTIVE ledger folds the console snapshot (the claim) with the taps BY WRITE ORDER — a read failure PROPAGATES
+    if (existsStrict(dpath)) claimFresh(); // R25 (newer wins): a write that landed during acquire/recover supersedes
+    // TG-P1-2/R3-P2-1: read every per-item entry tap under the lock (serialized vs recordDecision), each with its publish-order
+    // token. The EFFECTIVE ledger folds the console snapshot (the claim) with the taps BY PUBLISH ORDER — a read failure PROPAGATES
     // (never silently drops a tap => a lost approval).
     const taps = readTaps(home, batchId);
     let base: { doc: DecisionsDoc; order: bigint } | null = null;
     if (existsStrict(claim)) {
-      const entry = readDocEntry(claim);
+      const entry = readDocEntry(claim); // no filter: get the doc even if misbound (to set aside + report its ids)
       // DB-P1-1: the claimed doc MUST be bound to this batch; a misbound/corrupt claim yields NO verdict — set it aside (the taps,
-      // if any, still resolve for THIS batch).
-      if (entry && entry.doc.batchId === batchId) base = entry;
+      // if any, still resolve for THIS batch). The base's order is the console PUBLISH ctime captured before the rename (or the
+      // claim's own ctime for a resumed claim with no fresh snapshot this pass).
+      if (entry && entry.doc.batchId === batchId) base = { doc: entry.doc, order: baseOrder ?? entry.order };
       else {
         try { renameSync(claim, rejectedClaimPath(home, batchId)); } catch { /* raced away */ }
         if (taps.length === 0) return { ...none, unknownIds: entry ? entry.doc.decisions.map((d) => d.id) : [] };

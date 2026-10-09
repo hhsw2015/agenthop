@@ -1,5 +1,7 @@
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { mkdtempSync, rmSync, chmodSync, statSync, readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, renameSync } from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { openBatch, readBatch, writeDecisions, readDecisions, consumeDecisions, listBatches, listBatchesStrict, recordDecision } from "../src/swarm/decision-batch-store.js";
@@ -542,5 +544,99 @@ describe("TG r4: write-order fold, lossless tap key, canonical consumed record",
     } finally { chmodSync(taps, mode); }
     const got = consumeDecisions(HOME, "ut");
     expect(got.consumed).toBe(true); expect(got.resolved.length).toBe(1); // recovers once readable
+  });
+});
+
+// TG round-5 counterexamples (codex r4 verdict): ORDER must be PUBLISH order (the atomic temp->rename), not temp-content mtime;
+// content + order must bind to one version; an order-read error must propagate (no fabricated order=0); a fresh full snapshot
+// supersedes a stale claim. Ordering now uses the file's ctime (set by the rename = the publish), read as a consistent snapshot.
+describe("TG r5: publish-order (ctime, not temp mtime), same-version binding, read-error propagation", () => {
+  const d = (id: string) => path.join(HOME, ".agenthop", "console", "decision-batches", id);
+
+  test("TG-R4-P1-1: a console reject whose RENAME completes AFTER a tap approve wins (publish order, not temp-content time)", () => {
+    openBatch(HOME, { batchId: "ap", owner: "coord", items: [item("a")], nowSec: 1 });
+    const snap = path.join(d("ap"), "decisions.json");
+    const orig = fs.renameSync; let entered = false;
+    // console serializes its temp FIRST; the tap publishes DURING the console rename (before it completes); console publishes LAST.
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation(((src: unknown, dst: unknown) => {
+      if (String(dst) === snap && !entered) { entered = true; expect(recordDecision(HOME, "ap", { id: "a", verdict: "approve" }, 1000)).toBe("recorded"); }
+      return (orig as (s: unknown, dd: unknown) => void)(src, dst);
+    }) as typeof fs.renameSync);
+    syncBuiltinESMExports();
+    try { writeDecisions(HOME, { batchId: "ap", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "reject" }] }); }
+    finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(entered).toBe(true);
+    expect(readDecisions(HOME, "ap")!.decisions[0]!.verdict).toBe("reject");          // the later-PUBLISHED console reject
+    expect(consumeDecisions(HOME, "ap").resolved[0]!.verdict).toBe("reject");
+  });
+
+  test("TG-R4-P1-1: an order-metadata (stat) read error PROPAGATES — no seal, no stale approval", () => {
+    openBatch(HOME, { batchId: "se", owner: "coord", items: [item("a")], nowSec: 1 });
+    expect(recordDecision(HOME, "se", { id: "a", verdict: "approve" }, 1000)).toBe("recorded");
+    writeDecisions(HOME, { batchId: "se", decidedAtSec: 1001, decisions: [{ id: "a", verdict: "reject" }] });
+    const claim = path.join(d("se"), "decisions-consumed-claim.json");
+    const orig = fs.statSync; let injected = false;
+    const spy = vi.spyOn(fs, "statSync").mockImplementation(((f: unknown, ...a: unknown[]) => {
+      if (String(f) === claim && (a[0] as { bigint?: boolean } | undefined)?.bigint && !injected) { injected = true; throw Object.assign(new Error("metadata unavailable"), { code: "EACCES" }); }
+      return (orig as (ff: unknown, ...aa: unknown[]) => unknown)(f, ...a);
+    }) as typeof fs.statSync);
+    syncBuiltinESMExports();
+    let threw = false;
+    try { consumeDecisions(HOME, "se"); } catch { threw = true; } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(injected).toBe(true);
+    expect(threw).toBe(true);
+    expect(existsSync(path.join(d("se"), "consumed.json"))).toBe(false);              // never sealed on an order-read error
+  });
+
+  test("TG-R4-P2-1: content and order metadata belong to the SAME version (a mid-read swap is not skewed)", () => {
+    openBatch(HOME, { batchId: "sv", owner: "coord", items: [item("a")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "sv", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] });
+    expect(recordDecision(HOME, "sv", { id: "a", verdict: "reject" }, 1001)).toBe("recorded");
+    const snap = path.join(d("sv"), "decisions.json");
+    const orig = fs.readFileSync; let replaced = false;
+    const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((f: unknown, ...a: unknown[]) => {
+      const v = (orig as (ff: unknown, ...aa: unknown[]) => unknown)(f, ...a);
+      if (String(f) === snap && !replaced) { replaced = true; writeDecisions(HOME, { batchId: "sv", decidedAtSec: 1002, decisions: [{ id: "a", verdict: "reject" }] }); }
+      return v;
+    }) as typeof fs.readFileSync);
+    syncBuiltinESMExports();
+    let read: ReturnType<typeof readDecisions>;
+    try { read = readDecisions(HOME, "sv"); } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(replaced).toBe(true);
+    expect(read!.decisions[0]!.verdict).toBe("reject");                               // not a v1-content paired with v2-order
+  });
+
+  test("TG-R4-P2-1: a fresh full snapshot SUPERSEDES a stale recoverable claim (not a union)", () => {
+    openBatch(HOME, { batchId: "fs", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "fs", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] });
+    const cur = path.join(d("fs"), "decisions.json"), claim = path.join(d("fs"), "decisions-consumed-claim.json");
+    chmodSync(cur, 0o000); // a consume that claims (rename -> claim) then faults reading it
+    try { expect(() => consumeDecisions(HOME, "fs")).toThrow(); } finally { for (const p of [cur, claim]) if (existsSync(p)) chmodSync(p, 0o600); }
+    writeDecisions(HOME, { batchId: "fs", decidedAtSec: 1001, decisions: [{ id: "b", verdict: "reject" }] }); // fresh full snapshot
+    const read = readDecisions(HOME, "fs")!;
+    expect(read.decisions.length).toBe(1); expect(read.decisions[0]!.id).toBe("b");   // the stale claim's a is NOT unioned in
+    expect(collectBandwidthEvents(HOME).backlog).toBe(1);
+    expect(consumeDecisions(HOME, "fs").resolved.length).toBe(1);
+  });
+
+  test("TG-R4-P2-1 control: the canonical claim survives a seal failure; a later tap + retry still consumes all", () => {
+    openBatch(HOME, { batchId: "cf", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "cf", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] });
+    expect(recordDecision(HOME, "cf", { id: "b", verdict: "approve" }, 1001)).toBe("recorded");
+    const marker = path.join(d("cf"), "consumed.json");
+    const orig = fs.linkSync; let injected = false;
+    const spy = vi.spyOn(fs, "linkSync").mockImplementation(((s: unknown, dst: unknown) => {
+      if (String(dst) === marker && !injected) { injected = true; throw Object.assign(new Error("seal unavailable"), { code: "EACCES" }); }
+      return (orig as (ss: unknown, dd: unknown) => void)(s, dst);
+    }) as typeof fs.linkSync);
+    syncBuiltinESMExports();
+    try { expect(() => consumeDecisions(HOME, "cf")).toThrow(); } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(injected).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+    expect(readDecisions(HOME, "cf")!.decisions.length).toBe(2);                      // the merged claim survived the seal failure
+    expect(recordDecision(HOME, "cf", { id: "a", verdict: "reject" }, 1002)).toBe("recorded");
+    const got = consumeDecisions(HOME, "cf");
+    expect(got.resolved.find((r) => r.item.id === "a")!.verdict).toBe("reject");      // the later tap wins on retry
+    expect(collectBandwidthEvents(HOME).consumeAtSec.length).toBe(2);
   });
 });
