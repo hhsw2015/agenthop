@@ -336,14 +336,17 @@ export function validSpent(s: unknown): boolean {
   return ok(o.tokens) && ok(o.usd);
 }
 
-// FN9: is a lease's slot still OCCUPIED (must not be reaped)? A slot frees only on a confirmed terminal, never merely on
-// driver death. headless -> while the CHILD lives (survives the driver). visible (a zoneId bound) -> while the driver
-// lives OR the zone is still open (a cleanup-pending todo exists for it), so a close-FAILED visible slot survives the
-// driver's exit and is freed only once the zone is confirmed gone. Neither bound yet -> while the driver lives.
-export function leaseOccupied(rec: { pid?: number; childPid?: number; zoneId?: string } | null, probe: { childAlive: boolean; driverAlive: boolean; zonePending: boolean }): boolean {
+// FN9: is a lease's slot still OCCUPIED (must not be reaped)? A slot frees only on POSITIVE terminal evidence of THIS
+// execution — never on driver death, and never on the ABSENCE of a cleanup todo (a missing / write-failed / not-yet-written
+// todo is UNKNOWN, not proof the zone closed). headless -> while the CHILD lives (the child's death IS the terminal fact).
+// visible (a zoneId bound) -> until THIS launch's rc sidecar exists (the command actually exited); driver death / todo
+// state are irrelevant. An explicit CLOSE fact frees it out-of-band by removing the lease (settleUnit / the run's outer
+// finally on a confirmed close / a future zone-reaper), so acquireLease only ever auto-reaps on the rc fact. Neither bound
+// yet -> while the driver lives.
+export function leaseOccupied(rec: { pid?: number; childPid?: number; zoneId?: string } | null, probe: { childAlive: boolean; driverAlive: boolean; rcPresent: boolean }): boolean {
   if (rec === null) return false;
   if (rec.childPid !== undefined) return probe.childAlive;
-  if (rec.zoneId !== undefined) return probe.driverAlive || probe.zonePending;
+  if (rec.zoneId !== undefined) return !probe.rcPresent; // visible: held until THIS execution's rc; driver death / todo absence NEVER release it
   return probe.driverAlive;
 }
 

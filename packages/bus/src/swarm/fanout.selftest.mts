@@ -206,13 +206,14 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
 
 // --- FN9: lease slot frees only on a confirmed terminal, NEVER merely on driver death ---
 {
-  const P = (o: Partial<{ childAlive: boolean; driverAlive: boolean; zonePending: boolean }>) => ({ childAlive: false, driverAlive: false, zonePending: false, ...o });
+  const P = (o: Partial<{ childAlive: boolean; driverAlive: boolean; rcPresent: boolean }>) => ({ childAlive: false, driverAlive: false, rcPresent: false, ...o });
   t("null lease -> not occupied", leaseOccupied(null, P({})) === false);
   t("headless: child alive -> occupied (survives dead driver)", leaseOccupied({ childPid: 10, pid: 1 }, P({ childAlive: true, driverAlive: false })) === true);
   t("headless: child dead -> free (even if driver alive)", leaseOccupied({ childPid: 10, pid: 1 }, P({ childAlive: false, driverAlive: true })) === false);
-  t("visible: driver alive -> occupied", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: true })) === true);
-  t("visible: driver DEAD but zone still pending -> occupied (survives driver exit, the FN9 fix)", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: false, zonePending: true })) === true);
-  t("visible: driver dead AND zone gone -> free (close fact)", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: false, zonePending: false })) === false);
+  t("visible: no rc yet -> occupied EVEN with a dead driver (the FN9 fix: driver death never releases)", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: false, rcPresent: false })) === true);
+  t("visible: no rc + driver ALIVE -> occupied", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: true, rcPresent: false })) === true);
+  t("visible: THIS execution's rc present -> free (positive terminal evidence)", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: false, rcPresent: true })) === false);
+  t("visible: rc absence is NOT 'closed' (a missing/unwritable todo cannot free the slot)", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: false, rcPresent: false })) === true);
   t("unbound (no child/zone): held while driver lives", leaseOccupied({ pid: 1 }, P({ driverAlive: true })) === true);
   t("unbound: driver dead -> free", leaseOccupied({ pid: 1 }, P({ driverAlive: false })) === false);
 }

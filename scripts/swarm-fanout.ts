@@ -143,14 +143,14 @@ function acquireLease(home: string, cap: number, label: string): string | null {
   try {
     for (const f of readdirSync(dir)) {
       if (!f.endsWith(".lease")) continue;
-      const rec = readJsonOrNull(path.join(dir, f)) as { pid?: number; childPid?: number; zoneId?: string } | null;
-      // FN9: a lease binds the ACTUAL execution — a slot frees ONLY on a confirmed terminal, never merely on driver death
-      // (leaseOccupied, pure). A close-FAILED visible zone keeps its slot across the driver's exit while its cleanup-pending
-      // todo exists; freed only once the zone is confirmed gone.
+      const rec = readJsonOrNull(path.join(dir, f)) as { pid?: number; childPid?: number; zoneId?: string; rcPath?: string } | null;
+      // FN9: a lease binds the ACTUAL execution — a slot frees ONLY on POSITIVE terminal evidence (leaseOccupied, pure),
+      // never on driver death nor on the ABSENCE of a cleanup todo. headless -> the child's death; visible -> THIS launch's
+      // rc sidecar exists (the command exited). An explicit close removes the lease out-of-band.
       const occupied = leaseOccupied(rec, {
         childAlive: rec?.childPid !== undefined && pidAlive(rec.childPid),
         driverAlive: typeof rec?.pid === "number" && pidAlive(rec.pid),
-        zonePending: rec?.zoneId !== undefined && existsSync(cleanupPendingPath(home, rec.zoneId)),
+        rcPresent: typeof rec?.rcPath === "string" && existsSync(rec.rcPath),
       });
       if (!occupied) rmSync(path.join(dir, f), { force: true });
     }
@@ -168,12 +168,13 @@ function bindLeaseChild(file: string | null, childPid: number): void {
   const rec = readJsonOrNull(file) as Record<string, unknown> | null;
   if (rec) writeJsonAtomic(file, { ...rec, childPid });
 }
-// FN9: bind a VISIBLE lease to its ZONE, so its capacity obligation survives the driver's exit — acquireLease holds the
-// slot while the zone's cleanup-pending todo exists (a close-failed zone), freeing it only once the zone is confirmed gone.
-function bindLeaseZone(file: string | null, zoneId: string): void {
+// FN9: bind a VISIBLE lease to its ZONE + THIS launch's rc sidecar path, so its capacity obligation survives the driver's
+// exit — acquireLease holds the slot until the rc proves the command EXITED (positive terminal evidence), never on driver
+// death or on a missing/unwritable cleanup todo. An explicit close removes the lease out-of-band.
+function bindLeaseZone(file: string | null, zoneId: string, rcPath: string): void {
   if (!file) return;
   const rec = readJsonOrNull(file) as Record<string, unknown> | null;
-  if (rec) writeJsonAtomic(file, { ...rec, zoneId });
+  if (rec) writeJsonAtomic(file, { ...rec, zoneId, rcPath });
 }
 
 // ---- width evidence (FN7): env carries a POINTER to the evidence file, never the evidence itself ----
@@ -285,7 +286,7 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
         for (let a = 0; a < 30 && !(lease = acquireLease(home, globalCap, l.row.key)); a++) await sleep(1000);
         if (!lease) { bi = runnable.length; break; } // no admission -> stop launching (remaining stay running -> aborted)
         l.lease = lease;
-        if (mode !== "headless" && zoneId !== undefined) bindLeaseZone(lease, zoneId); // FN9: visible slot survives driver exit, tied to the zone's lifetime
+        if (mode !== "headless" && zoneId !== undefined) bindLeaseZone(lease, zoneId, rcFile(l.row.outputPtr!)); // FN9: visible slot held until THIS launch's rc (survives driver exit)
         spent.tokens += reserve.tokens; spent.usd += reserve.usd; // FN1: reserve BEFORE spawn
         if (!writeLedger(home, req.runKey, rows, priorReceipt, spent)) { releaseLease(lease); l.lease = null; bi = runnable.length; break; } // durable spend; fail -> no launch
         l.row.startedAt = Date.now();
