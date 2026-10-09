@@ -1,6 +1,12 @@
-# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 11
+# Review packet — fanout-native phase-1 (sovereign self-built backend), ROUND 12
 
-- **Branch** `feat/fanout-native`  **HEAD** `e9c2bbf`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`, r4 `b7b5fd9`, r5 `5e58b48`, r6 `9c15c20`, r7 `6a2380b`, r8 `0111607`, r9 `8401017`, r10 `9dde6ef`)
+- **Branch** `feat/fanout-native`  **HEAD** `11d7f17`  **Base** `c3439cd`  (r1 `ff16594`, r2 `c55f9e5`, r3 `64bfb17`, r4 `b7b5fd9`, r5 `5e58b48`, r6 `9c15c20`, r7 `6a2380b`, r8 `0111607`, r9 `8401017`, r10 `9dde6ef`, r11 `e9c2bbf`)
+
+## Round 12 — round-11 REMAIN resolved (FN9; durable started-HOLD across driver exit)
+- FN9 (P2) round-11 isolated HOLD from the in-process delete path, but across DRIVER EXIT a bind-persistently-failed lease held only `{pid,label,ts}` (no childPid/zoneId), so `acquireLease` in another driver fell to `driverAlive` and reaped it while the child was still alive — over-admission. The durable lease must distinguish an un-executed RESERVATION from a started-but-unconfirmed HOLD. New `markLeaseLaunched` writes `launched: true` BEFORE spawn (while the lease is still writable); if that durable commit fails the unit does NOT spawn (no recordable obligation -> release + fail). If the post-spawn childPid bind then fails, the `launched` flag is already on disk, so `leaseOccupied` HOLDS the slot across driver death (started HOLD, no terminal handle) rather than reaping it as a bare reservation. A bound childPid still wins (precise child-liveness check — the happy path); a spawn failure clears the lease via `rowReleasable` (row.pid undefined -> releasable). `leaseOccupied`'s three-way distinction (childPid / zoneId / launched / reservation) is pure + tested.
+- Gates: bus tsc 0, scripts tsc 0, fanout selftest 150 (+3 launched), fanout-herdr selftest 23, bus vitest 991/991.
+
+## Round 11 — round-10 REMAIN resolved (FN9; isolate HELD from every lease-delete path)
 
 ## Round 11 — round-10 REMAIN resolved (FN9; isolate HELD from every lease-delete path)
 - FN9 (P2) round-10 held the lease in the bind-fail branch, but `settleUnit`'s early-return (`status !== "running"` -> unconditional `releaseLease`, line 389) then DELETED it — a `failed` ledger status is not a terminal, so the still-alive child's slot was freed on the next run. Every settle/cleanup entry now shares ONE rule — the pure, tested `rowReleasable(displayMode, probe)`: release ONLY on confirmed terminal (headless the child is gone; visible it never opened a pane OR its rc sidecar exists), else HOLD. Applied at `settleUnit`'s early-return AND finally, the run's outer finally, and the bind-fail HOLD. A confirmed zone CLOSE stays a separate terminal signal applied at the close site. A HELD (failed-but-running) row is never reaped by bookkeeping — isolated from the delete path at every entry.
