@@ -88,6 +88,22 @@ export function submitTagEnabled(env: NodeJS.ProcessEnv = process.env): boolean 
   return /^(1|true|yes|on)$/i.test(env.SWARM_SUBMIT_TAG ?? "");
 }
 
+/** T5-2 DEFERRED seam — gauge timed-sampling dormant gate (SWARM_GAUGE_SAMPLING, default OFF, dormant-ahead-of-use like
+ *  SWARM_BOARD_ADMIT). OFF ⇒ the dispatcher never auto-writes gauge.json (unchanged v0: the gauge refreshes only on a manual run). */
+export function gaugeSamplingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(1|true|yes|on)$/i.test(env.SWARM_GAUGE_SAMPLING ?? "");
+}
+
+/** T5-2 seam — pure throttle for the dispatcher's gauge sampler: the sweep ticks faster than the sample interval, so each tick
+ *  is gated through this. True iff at least `intervalSec` has elapsed since `lastSampleSec`. Fail-soft on misconfig: a non-finite
+ *  `nowSec` never samples (no clock ⇒ no write); a non-finite or non-positive `intervalSec` degrades to "sample every call"
+ *  (never silently wedge to "never" — that would re-introduce the stale-gauge bug this seam fixes). Pure, no IO. */
+export function shouldSampleGauge(nowSec: number, lastSampleSec: number, intervalSec: number): boolean {
+  if (!Number.isFinite(nowSec)) return false;
+  if (!Number.isFinite(intervalSec) || intervalSec <= 0) return true;
+  return nowSec - lastSampleSec >= intervalSec;
+}
+
 /** Scan the swarm's durable append-logs for tagged `submit` posts/messages → de-dup-keyed produce events (submitDigest, atSec).
  *  Chat-room logs are append-only (a reliable early signal); inbox messages are ephemeral (a best-effort early signal — once a
  *  submit is folded into a batch the item's foldedFrom carries the durable count, so nothing is lost after a claim). READ-ONLY.

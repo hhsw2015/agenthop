@@ -62,6 +62,7 @@ import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadConten
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
+import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
@@ -171,6 +172,7 @@ const SENTINEL_IDLE_SEC = envInt(process.env.SWARM_SENTINEL_IDLE_SEC, 1800);
 // Inter-sample block / backoff for a working member's fake-death content sampling (LS1/LS2): bounds the loop so a quirky
 // wait-output can never tight-spin, and sets how often the pane content hash is re-sampled within the fake-death window.
 const SENTINEL_SAMPLE_SEC = envInt(process.env.SWARM_SENTINEL_SAMPLE_SEC, 60);
+const GAUGE_SAMPLE_SEC = envInt(process.env.SWARM_GAUGE_SAMPLE_SEC, 60); // T5-2 seam: gauge sampling interval (sweep ticks faster, every 5s)
 
 // T5-5 review-seat autoscale — SUGGESTION MODE ONLY (user ruling 2026-10-08: the flag is half-flipped). When
 // SWARM_REVIEW_AUTOSCALE is on, the sweep reads the durable review-queue ledger, runs the pure planner, and ADVISES the
@@ -1605,6 +1607,21 @@ async function main(): Promise<void> {
     })().catch((e) => log(`review-autoscale suggest failed (isolated): ${e instanceof Error ? e.message : e}`));
   };
 
+  // T5-2 DEFERRED seam: gauge timed sampling. The dual-bandwidth pure core + store shipped (batch-4) but had NO trigger, so
+  // gauge.json only refreshed on a manual run and the (installed) console gauge read a stale projection. Each sweep, if
+  // SWARM_GAUGE_SAMPLING is on and the sample interval has elapsed (sweep ticks every 5s, far faster than the 60s default),
+  // re-derive + atomically write the projection. The interval advances whether or not the write succeeds, so a persistent
+  // write fault logs once per interval, not every tick. Fully fail-soft: a sampling failure NEVER breaks the sweep.
+  let lastGaugeSampleSec = 0;
+  const runGaugeSampling = (): void => {
+    if (!gaugeSamplingEnabled()) return; // SWARM_GAUGE_SAMPLING default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT)
+    const now = nowSec();
+    if (!shouldSampleGauge(now, lastGaugeSampleSec, GAUGE_SAMPLE_SEC)) return; // throttle to the sample interval
+    lastGaugeSampleSec = now; // advance BEFORE the write ⇒ one attempt per interval even if it throws (no tight retry loop)
+    try { writeBandwidthProjection(HOME, now); }
+    catch (e) { log(`gauge sampling failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   await runDispatchLoops({
     // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
     // dispatches). T1.5 RED LINE (fe0376cd): --task dispatch stays off (SWARM_TASK_EXEC) until the resume adapter +
@@ -1648,6 +1665,9 @@ async function main(): Promise<void> {
       // T5-5: review-seat autoscale SUGGESTION (never acts) — read the review-queue ledger, advise the coordinator on seat
       // scaling. Gated on SWARM_REVIEW_AUTOSCALE (default OFF); fully fail-soft.
       runReviewAutoscaleSuggest();
+      // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
+      // (default OFF), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
+      runGaugeSampling();
     },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     passIntervalMs: 5000,
