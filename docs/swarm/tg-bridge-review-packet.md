@@ -1,6 +1,16 @@
-# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 6
+# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 7
 
-- **Branch** `feat/tg-bridge`  **HEAD** `96a1adb`  **Base** `main` (`bdd93d7`)  (r1 `7c6dff0`, r2 `f34ca77`, r3 `ccabe66`, r4 `2a56429`, r5 `6f80b89`)
+- **Branch** `feat/tg-bridge`  **HEAD** `bd0656e`  **Base** `main` (`bdd93d7`)  (r1 `7c6dff0`, r2 `f34ca77`, r3 `ccabe66`, r4 `2a56429`, r5 `6f80b89`, r6 `96a1adb`)
+
+## Round 7 — round-6 REMAIN resolved (1 P1 + 1 P2): slots carry publish TYPE + legacy import
+The r6 verdict accepted the slot publish-order direction (the ctime drift / read divergence are CLOSED) and found two protocol-semantics gaps.
+
+- **TG-R6-P1-1 (P1) — a slot records its publish KIND; the fold preserves publish semantics.** A slot used to store only a `DecisionsDoc`, so the fold treated a console full snapshot as an incremental merge: a later full snapshot that omits an item wrongly kept the item, and `snapshot(a)→snapshot(b)` was indistinguishable from `snapshot(a)→tap(b)`. Now each slot stores a `kind`: `writeDecisions` publishes a **snapshot** (the console's complete view) and `foldDecisionDocs` CLEARS prior state before applying it (a later snapshot replaces an earlier one; an empty snapshot clears everything → zero consumed, not a stale approve — baseline parity); `recordDecision` publishes a **tap** (a single-item entry) that MERGES, preserving untouched items. The effective state = the latest snapshot + every tap published after it.
+- **TG-R6-P2-1 (P2) — legacy baseline data is imported, not silently dropped.** A batch created by the baseline (`bdd93d7`) API — a pending `decisions.json` or a recoverable `decisions-consumed-claim.json` — used to read as null (accepted-but-unconsumed verdicts silently lost at the format switch). `readDecisions`/`consume` now IMPORT legacy data via `readLedgerEntries`: while a batch is unsealed, the legacy claim (older) and `decisions.json` (newer, supersedes it) fold in as console snapshots BEFORE every slot, so existing in-flight batches are consumed, not lost.
+- Gates: bus tsc 0, scripts tsc 0, tg-entry selftest pass, **decision-batch 53** (counterexample B updated to the replace semantics; a new "TG r7" block: snapshot→snapshot replace, snapshot→tap merge, empty-snapshot clears, snapshot-vs-tap divergence, and legacy decisions.json / recoverable-claim / legacy+new-tap import — all proven to fail on the old union/no-import logic), dual-bandwidth 16, full bus **1172/1172**.
+- **Reviewer** codex `01a0ff49` (happycapy)  **Author** bus-pen `d7f6c917`
+
+## Round 6 (resolved) — the append-only slot ledger
 
 ## Round 6 — round-5 REMAIN resolved (1 P1 + 1 P2): the append-only slot ledger
 The r5 verdict (confirmed by the reviewer's platform supplement + the coordinator) was that **ctime is not a usable publish-order signal** — on APFS a plain `chmod` advances ctime with identical content, POSIX leaves rename's effect on ctime implementation-defined, a stat-after-read skews content vs order, and a claim move / retry loses a stack-local order. **ctime is withdrawn.** r6 adopts the reviewer's blessed design: an append-only immutable slot ledger.
