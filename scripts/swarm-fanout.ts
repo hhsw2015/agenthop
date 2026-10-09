@@ -162,19 +162,21 @@ function acquireLease(home: string, cap: number, label: string): string | null {
   }
 }
 const releaseLease = (file: string | null): void => { if (file) rmSync(file, { force: true }); };
-// FN9: bind the lease to the detached child's pid, so capacity is not released until the child's terminal state.
-function bindLeaseChild(file: string | null, childPid: number): void {
-  if (!file) return;
+// FN9: bind the lease to the detached child's pid, so capacity is not released until the child's terminal state. Returns
+// whether the identity write was DURABLE — a failed write must be visible to the caller so it can undo the launch (a bare
+// lease would be reaped on driver death while the child still runs).
+function bindLeaseChild(file: string | null, childPid: number): boolean {
+  if (!file) return false;
   const rec = readJsonOrNull(file) as Record<string, unknown> | null;
-  if (rec) writeJsonAtomic(file, { ...rec, childPid });
+  return rec !== null && writeJsonAtomic(file, { ...rec, childPid });
 }
 // FN9: bind a VISIBLE lease to its ZONE + THIS launch's rc sidecar path, so its capacity obligation survives the driver's
 // exit — acquireLease holds the slot until the rc proves the command EXITED (positive terminal evidence), never on driver
 // death or on a missing/unwritable cleanup todo. An explicit close removes the lease out-of-band.
-function bindLeaseZone(file: string | null, zoneId: string, rcPath: string): void {
-  if (!file) return;
+function bindLeaseZone(file: string | null, zoneId: string, rcPath: string): boolean {
+  if (!file) return false;
   const rec = readJsonOrNull(file) as Record<string, unknown> | null;
-  if (rec) writeJsonAtomic(file, { ...rec, zoneId, rcPath });
+  return rec !== null && writeJsonAtomic(file, { ...rec, zoneId, rcPath }); // FN9: a failed identity write must STOP the launch (caller checks)
 }
 
 // ---- width evidence (FN7): env carries a POINTER to the evidence file, never the evidence itself ----
@@ -286,7 +288,12 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
         for (let a = 0; a < 30 && !(lease = acquireLease(home, globalCap, l.row.key)); a++) await sleep(1000);
         if (!lease) { bi = runnable.length; break; } // no admission -> stop launching (remaining stay running -> aborted)
         l.lease = lease;
-        if (mode !== "headless" && zoneId !== undefined) bindLeaseZone(lease, zoneId, rcFile(l.row.outputPtr!)); // FN9: visible slot held until THIS launch's rc (survives driver exit)
+        // FN9: for a VISIBLE unit, persist the lease identity (zoneId + THIS launch's rcPath) BEFORE anything is launched. A
+        // failed identity write would leave a bare driver-pid lease that another run reaps on driver death while the pane runs
+        // -> binding failure STOPS the launch (nothing spawned yet; the slot is released and the unit fails).
+        if (mode !== "headless" && zoneId !== undefined && !bindLeaseZone(lease, zoneId, rcFile(l.row.outputPtr!))) {
+          releaseLease(lease); l.lease = null; l.row.status = "failed"; l.row.endedAt = Date.now(); launchedAll.push(l); continue; // identity not durable -> do not launch
+        }
         spent.tokens += reserve.tokens; spent.usd += reserve.usd; // FN1: reserve BEFORE spawn
         if (!writeLedger(home, req.runKey, rows, priorReceipt, spent)) { releaseLease(lease); l.lease = null; bi = runnable.length; break; } // durable spend; fail -> no launch
         l.row.startedAt = Date.now();
@@ -295,7 +302,10 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
           const r = await spawnAgent({ tool: "claude", task: promptOfRow(req, l.row), visible: false, ...(cwdOfRow(req, l.row) ? { cwd: cwdOfRow(req, l.row)! } : {}) }, { ...env, ANTHROPIC_MODEL: model, FANOUT_DEPTH: String(depth + 1) });
           l.row.spawnOk = r.ok;
           if (r.launchId !== undefined) l.row.id = r.launchId;
-          if (r.pid !== undefined) { l.row.pid = r.pid; bindLeaseChild(lease, r.pid); } // FN9: the lease now binds the child's life
+          // FN9: bind the child's life to the lease. If the identity write FAILS the child is untracked (a bare lease is reaped
+          // on driver death while the child runs) -> UNDO the launch: despawn the child + fail the unit, so no executed slot
+          // outlives its binding. (Headless must undo post-spawn; visible is stopped pre-launch above.)
+          if (r.pid !== undefined) { l.row.pid = r.pid; if (!bindLeaseChild(lease, r.pid)) { await despawnAgent(l.row.id).catch(() => {}); l.row.status = "failed"; l.row.endedAt = Date.now(); releaseLease(lease); l.lease = null; } }
           if (r.outputFile !== undefined) l.row.outputPtr = r.outputFile;
           if (!r.ok) { l.row.status = "failed"; l.row.endedAt = Date.now(); } // FN8: launch failure keeps its reason immediately
           else if (r.pid === undefined) { l.row.status = "delivery_uncertain"; l.row.endedAt = Date.now(); } // FN2: launched but no handle -> quarantine, never re-run
