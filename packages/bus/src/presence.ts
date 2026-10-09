@@ -69,14 +69,14 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
     binding = true;
     void openLivenessSocket(home, bindFor).then(
       (res) => {
-        binding = false;
-        if (!res) return;                               // path too long (relay-only) or a transient bind failure — retry next tick
+        if (gen === bindGen) binding = false;           // SU3: only the CURRENT attempt releases the shared in-flight marker — a
+        if (!res) return;                               // superseded bind must NOT clear `binding` out from under its superseder
         // Keep ONLY if this is still the latest attempt and we are not shutting down; otherwise it is stale/duplicate — close it
         // (unlinks its own path) so no superseded or orphaned listener survives (B7-1-R1).
         if (closing || gen !== bindGen) { try { res.server.close(); } catch { /* best effort */ } return; }
         sockServer = res.server;
       },
-      () => { binding = false; },                       // openLivenessSocket resolves null on failure; guard a reject regardless
+      () => { if (gen === bindGen) binding = false; },  // same: a stale reject never clears the current attempt's marker
     );
   };
   // B7-1: the stable identity was (re)assigned after startup (no pre-set SID + no pid file). Re-bind with NO poll window — close
@@ -102,15 +102,20 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
     const prev = sockSid;                             // the identity to fall back to if this bind does not complete (SU3)
     sockSid = want;
     const gen = ++bindGen;                            // supersede any in-flight bind (incl. syncSidFor's from onIdentityChange)
-    binding = false;
+    binding = true;                                   // SU3: HOLD the in-flight marker across our own await, so a keepAlive openSock
+                                                      // cannot bind `want` behind us and publish the un-adopted target as if it were
+                                                      // established. WE are the sole binder for this generation until it resolves.
     if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
     const res = await openLivenessSocket(home, want);
+    if (gen === bindGen) binding = false;             // our bind resolved and we are still current — release the marker
     if (res && !closing && gen === bindGen) { sockServer = res.server; return true; } // bound + current ⇒ ready
     if (res) { try { res.server.close(); } catch { /* best effort */ } }              // superseded / shutting down ⇒ discard
-    // SU3: the bind did NOT complete for `want`. If we are still the latest attempt, REVERT sockSid to the previous identity and
-    // re-open ITS socket — so a failed/cancelled adoption never leaves the un-adopted target as the published identity, and the
-    // keepAlive heartbeat serves our own sid, not the target. (A newer generation = a real adopt; leave it alone.)
-    if (gen === bindGen && sockSid === want) { sockSid = prev; bindGen++; binding = false; openSock(); }
+    // SU3: the bind did NOT complete for `want`. Because `binding` was held across the await, no benign heartbeat could have bumped
+    // the generation, so `gen === bindGen` here is a GENUINE failure (not a real adopt) and the revert MUST run: restore sockSid to
+    // the previous identity and re-open ITS socket, so a failed adoption never leaves the un-adopted target as the published
+    // identity and the keepAlive heartbeat serves our own sid. A newer generation can only be ANOTHER ensureSockBoundTo (a real
+    // adopt) — leave it alone.
+    if (gen === bindGen && sockSid === want) { sockSid = prev; bindGen++; openSock(); }
     return false;                                     // NOT ready
   };
   const core = startBusCore({ ...opts, onIdentityChange: (self) => syncSidFor(self.stableId ?? self.id) });

@@ -136,16 +136,29 @@ export function probeSocketSid(sockPath: string, timeoutMs: number = PRESENCE_PR
  *  does not own this sid is rejected). A candidate whose path would not fit sun_path is skipped (never trust a truncatable path).
  *  A readdir fault ⇒ false (keep relay). No pid/mtime/start-time proof; stops at the first verified live match. */
 export async function probeSessionAlive(home: string, sessionId: string, timeoutMs: number = PRESENCE_PROBE_MS): Promise<boolean> {
+  return (await probeSessionLiveness(home, sessionId, timeoutMs)) === "alive"; // boolean routing contract (keep-relay on anything but a proven live socket)
+}
+
+export type SessionLiveness = "alive" | "no-socket" | "unknown";
+
+/** SU1 (F45 flag-wiring r4): the TRI-STATE occupancy observation — one enumeration, probed in place. ONE readdir of the presence
+ *  dir, and EVERY candidate it lists for this sid is connect-probed within that SAME enumeration. "alive" = a socket back-verified
+ *  the sid; "no-socket" = the dir was enumerated successfully and none of its listed candidates is a live owner; "unknown" = the
+ *  dir could not be enumerated (EACCES/etc). Keeping the list and the probes in ONE pass is the fix: a listener that appears is
+ *  either in the list (⇒ probed ⇒ "alive") or genuinely not there — it can never be LISTED-but-UNPROBED and then called absent by
+ *  stitching a failed probe's empty view onto a later readable-but-unprobed enumeration. `probeSessionAlive`'s boolean folds both
+ *  "no-socket" and "unknown" to false (correct for keep-relay routing); an ADOPTION decision must instead distinguish them. */
+export async function probeSessionLiveness(home: string, sessionId: string, timeoutMs: number = PRESENCE_PROBE_MS): Promise<SessionLiveness> {
   const prefix = sidSockPrefix(sessionId);
   let files: string[];
-  try { files = readdirSync(presenceDir(home)); } catch { return false; }
+  try { files = readdirSync(presenceDir(home)); } catch { return "unknown"; } // enumeration failure ⇒ uncertain, NOT a confirmed absence
   for (const f of files) {
     if (!f.startsWith(`${prefix}.`) || !f.endsWith(".sock")) continue;
     const p = path.join(presenceDir(home), f);
     if (!sockPathFits(p)) continue; // a truncatable path could answer for a different sid — never trust it
-    if (await probeSocketSid(p, timeoutMs) === sessionId) return true; // connect + the socket proves it owns THIS sid
+    if (await probeSocketSid(p, timeoutMs) === sessionId) return "alive"; // connect + the socket proves it owns THIS sid
   }
-  return false;
+  return "no-socket"; // enumerated successfully; no listed candidate is a live owner of this sid
 }
 
 /** F45-R7-P2-1: open THIS instance's liveness socket on a UNIQUE per-instance path (bounded hash prefix + random nonce). No

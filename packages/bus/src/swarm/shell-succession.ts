@@ -141,11 +141,11 @@ export function successionEnabled(env: NodeJS.ProcessEnv = process.env): boolean
   return /^(1|true|yes|on)$/i.test(env.SWARM_SUCCESSION ?? "");
 }
 
-import { readFileSync, writeFileSync, unlinkSync, readdirSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ROSTER_FILE, type RosterMember } from "./resume.js";
-import { makeFileLiveness, probeSessionAlive } from "./task-liveness.js";
+import { makeFileLiveness, probeSessionLiveness } from "./task-liveness.js";
 import { acquireHolderLock, releaseHolderLock, type LockSite } from "./holder-lock.js";
 
 export interface IncumbentLiveness { pid: number | null; liveness: "alive" | "dead" | "absent"; }
@@ -222,15 +222,16 @@ function readPidDetailed(home: string, sid: string): { kind: "missing" | "unread
  *  DEAD pid ⇒ dead (adoptable); a readable LIVE pid with no socket ⇒ conservatively "alive" (don't steal a maybe-live slot). */
 export function incumbentLivenessOf(home: string): (stableSid: string) => Promise<IncumbentLiveness> {
   const io = makeFileLiveness(home);
-  const presenceDir = path.join(home, ".agenthop", "presence");
   return async (sid) => {
-    if (await probeSessionAlive(home, sid)) return { pid: readPidDetailed(home, sid).pid, liveness: "alive" };
-    // SU1: probeSessionAlive returned false — but that conflates "confirmed NO live socket" with "could not ENUMERATE the
-    // presence dir" (readdir EACCES folds to an empty list in the boolean probe). Occupancy may NOT be authorized on an
-    // uncertain observation: if the dir is unenumerable, the incumbent might still be live (its known socket could answer), so
-    // treat it as UNKNOWN ⇒ "alive" (do not adopt). Only a SUCCESSFULLY enumerated dir with no live socket is a real absence.
-    try { readdirSync(presenceDir); } catch { return { pid: null, liveness: "alive" }; } // SU1: enumeration failure ⇒ unknown ⇒ not adoptable
-    const d = readPidDetailed(home, sid);
+    // SU1 (r4): ONE tri-state enumerate-and-probe — the dir is listed once and every candidate it lists is probed in that SAME
+    // pass, so there is no stitching of a failed probe's empty view onto a separate, later readdir whose listed sockets were never
+    // probed (the r3 residue: a listener appearing between a real EACCES and a permission-recovered enumeration was listed but not
+    // probed, then consumed as absent). "unknown" (dir unenumerable) ⇒ the incumbent might still be live ⇒ "alive" (never adopt on
+    // an uncertain observation). Only a successfully enumerated-AND-probed dir with no live socket proceeds to the PID check.
+    const probe = await probeSessionLiveness(home, sid);
+    if (probe === "alive") return { pid: readPidDetailed(home, sid).pid, liveness: "alive" };
+    if (probe === "unknown") return { pid: null, liveness: "alive" }; // SU1: enumeration uncertain ⇒ not adoptable
+    const d = readPidDetailed(home, sid); // probe === "no-socket": enumerated + probed, no live owner of this sid
     if (d.kind === "missing") return { pid: null, liveness: "absent" }; // enumerable dir + no live socket + no pid ⇒ confirmed absent
     if (d.kind === "unreadable" || d.pid === null) return { pid: d.pid, liveness: "alive" }; // SU1: unreadable/unparseable ⇒ do not authorize
     return { pid: d.pid, liveness: io.procAlive(d.pid) === "dead" ? "dead" : "alive" };
@@ -241,13 +242,24 @@ export function incumbentLivenessOf(home: string): (stableSid: string) => Promis
  *  credential source; not a relayable file, coordinator ruling a). A bus process's own `process.argv` is `node presence.mjs` /
  *  `agenthop mcp`, never the resume command, so the resume target must come from the HOST (agent) process. Split on whitespace
  *  (resume sids/paths rarely contain spaces; mirrors resume.ts's capture). Empty on any fault. */
+/** SP3 (r4): parse a Linux /proc/<pid>/cmdline buffer into the EXACT argv. Args are NUL-separated AND each is NUL-terminated, so
+ *  the buffer ends with a trailing terminator and a zero-length arg is legal at ANY position. Remove ONLY that single trailing
+ *  terminator — never interior or trailing empty REAL args. `.filter(Boolean)` (the r3 residue) dropped every empty, shifting the
+ *  remaining args left, which could move a non-target into the resume-target slot and FABRICATE a credential (false adopt). Empty
+ *  buffer (zombie/kernel thread) ⇒ []. Pure, so the boundary contract is unit-tested without /proc. */
+export function argvFromCmdline(raw: string): string[] {
+  if (raw === "") return [];
+  const parts = raw.split("\0");
+  if (parts[parts.length - 1] === "") parts.pop(); // drop ONLY the final NUL terminator's empty; keep every real (incl. empty) arg
+  return parts;
+}
+
 export function readHostArgv(hostPid: number | undefined): string[] {
   if (!hostPid || !Number.isInteger(hostPid) || hostPid <= 1) return [];
   // SP3: the ONLY source that preserves argument boundaries is /proc/<pid>/cmdline (NUL-separated argv — a program path AND any
   // argument with spaces survive exactly). Linux only.
   try {
-    const raw = readFileSync(`/proc/${hostPid}/cmdline`, "utf8");
-    const argv = raw.split("\0").filter(Boolean);
+    const argv = argvFromCmdline(readFileSync(`/proc/${hostPid}/cmdline`, "utf8"));
     if (argv.length) return argv;
   } catch { /* no /proc */ }
   // macOS/BSD have NO boundary-preserving per-pid argv source accessible without a native syscall (KERN_PROCARGS2). A `ps -o args=`

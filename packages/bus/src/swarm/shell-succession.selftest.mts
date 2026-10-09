@@ -1,4 +1,4 @@
-import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, presencePidRelPath, planSuccession, adoptLockSite, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
+import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, argvFromCmdline, presencePidRelPath, planSuccession, adoptLockSite, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
 import { acquireHolderLock, releaseHolderLock } from "./holder-lock.js";
 import type { RosterMember } from "./resume.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
@@ -45,6 +45,23 @@ t("argv: claude --resume SID -> null (claude keeps its sid; sidBinds, not argv)"
 t("argv: codex with a flag before resume -> null (not position-exact)", parseResumeTargetFromArgv(["codex", "--flag", "resume", "sid"]) === null);
 t("argv: codex resume with a dash target -> null", parseResumeTargetFromArgv(["codex", "resume", "--x"]) === null);
 t("argv: codex alone -> null", parseResumeTargetFromArgv(["codex", "resume"]) === null);
+
+// --- SP3 (round-4): /proc/<pid>/cmdline parse keeps EXACT argv boundaries. Args are NUL-separated AND NUL-terminated; only the
+//     single trailing terminator is dropped, NEVER interior/trailing empty real args (a `.filter(Boolean)` would shift positions
+//     and could FABRICATE a resume target out of a non-target arg). The parse result MUST equal the raw-array parse result. ---
+const sp3 = (parts: string[]) => parts.join("\0") + "\0"; // kernel form: each arg NUL-terminated ⇒ trailing terminator
+t("cmdline: normal codex resume -> exact argv", JSON.stringify(argvFromCmdline(sp3(["codex", "resume", "01a0ff49"]))) === JSON.stringify(["codex", "resume", "01a0ff49"]));
+t("cmdline: empty buffer -> [] (zombie/kernel thread)", argvFromCmdline("").length === 0);
+t("cmdline: no trailing NUL -> kept as-is", JSON.stringify(argvFromCmdline("codex\0resume")) === JSON.stringify(["codex", "resume"]));
+// the false-adopt counterexamples: filter(Boolean) would shift and yield a target; the correct parse yields NONE (same as raw array)
+t("cmdline: EMPTY FIRST arg preserved -> parse null (argv0 '' != codex), NOT shifted to adopt",
+  (() => { const a = argvFromCmdline(sp3(["", "codex", "resume", "sid"])); return JSON.stringify(a) === JSON.stringify(["", "codex", "resume", "sid"]) && parseResumeTargetFromArgv(a) === null; })());
+t("cmdline: EMPTY TARGET arg preserved -> parse null (argv2 ''), NOT shifted to adopt the next arg",
+  (() => { const a = argvFromCmdline(sp3(["codex", "resume", "", "x"])); return JSON.stringify(a) === JSON.stringify(["codex", "resume", "", "x"]) && parseResumeTargetFromArgv(a) === null; })());
+t("cmdline: argv ending in a real empty arg -> that empty is KEPT (only the terminator dropped)",
+  JSON.stringify(argvFromCmdline(sp3(["codex", "resume", ""]))) === JSON.stringify(["codex", "resume", ""]));
+t("cmdline: interior arg WITH SPACES survives exactly (no boundary loss)",
+  JSON.stringify(argvFromCmdline(sp3(["/my dir/codex", "resume", "sid"]))) === JSON.stringify(["/my dir/codex", "resume", "sid"]));
 
 // --- successionVerdict: fail-closed ---
 const vAdopt = successionVerdict(att(), inc({ incumbentLiveness: "dead" }));
