@@ -393,14 +393,15 @@ describe("TG-P1-2 (round 3): a tap never drops a sibling (recoverable claim / co
 
   // (counterexample A — "a tap preserves a decision stranded in a recoverable claim" — is retired: the slot ledger has no claim
   //  to strand; both the console publish and the tap are independent immutable slots, so neither can lose the other, as below.)
-  test("counterexample B: a tap and a concurrent console full-snapshot write BOTH survive (no overwrite)", () => {
+  test("counterexample B (R6 semantics): a console full snapshot AFTER a tap REPLACES it (the snapshot is the complete console view)", () => {
     openBatch(HOME, { batchId: "cb", owner: "coord", items: [item("a"), item("c")], nowSec: 1 });
-    expect(recordDecision(HOME, "cb", { id: "a", verdict: "approve" }, 2)).toBe("recorded"); // TG tap (own file)
-    writeDecisions(HOME, { batchId: "cb", decidedAtSec: 5, decisions: [{ id: "c", verdict: "approve" }] }); // console full snapshot
+    expect(recordDecision(HOME, "cb", { id: "a", verdict: "approve" }, 2)).toBe("recorded"); // TG tap (slot 0)
+    writeDecisions(HOME, { batchId: "cb", decidedAtSec: 5, decisions: [{ id: "c", verdict: "approve" }] }); // console full snapshot (slot 1) — omits a
     const doc = readDecisions(HOME, "cb")!;
-    expect(doc.decisions.map((d) => d.id).sort()).toEqual(["a", "c"]); // the snapshot did not clobber the tap, nor vice versa
+    expect(doc.decisions.map((d) => d.id)).toEqual(["c"]); // the later full snapshot REPLACES the earlier tap (baseline parity, TG-R6-P1-1)
     const r = consumeDecisions(HOME, "cb");
-    expect(r.resolved.map((x) => x.item.id).sort()).toEqual(["a", "c"]);
+    expect(r.resolved.map((x) => x.item.id)).toEqual(["c"]);
+    // (the complementary snapshot->tap MERGE case is covered by "TG-R3-P2-1: a console slot + a tap slot BOTH appear")
   });
 
   test("TG-P1-1: writeDecisions (console path) clamps a hard-gate 'always' to once at the WRITE boundary", () => {
@@ -542,5 +543,74 @@ describe("TG r6: slot-ledger durable publish order", () => {
     const got = consumeDecisions(HOME, "cf");
     expect(got.resolved.find((r) => r.item.id === "a")!.verdict).toBe("reject"); // the later slot wins on retry
     expect(collectBandwidthEvents(HOME).consumeAtSec.length).toBe(2);
+  });
+});
+
+// TG round-7 (codex r6 verdict): slots must preserve PUBLISH SEMANTICS (a console full snapshot REPLACES; a single-item tap
+// MERGES) — not a blind historical union — AND import legacy baseline (bdd93d7) pending/recoverable data instead of silently
+// dropping it.
+describe("TG r7: snapshot-replace / tap-merge semantics + legacy import", () => {
+  const dd = (id: string) => path.join(HOME, ".agenthop", "console", "decision-batches", id);
+
+  test("TG-R6-P1-1: snapshot -> snapshot REPLACES (a later full snapshot that omits an item un-decides it)", () => {
+    openBatch(HOME, { batchId: "ss", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "ss", decidedAtSec: 10, decisions: [{ id: "a", verdict: "approve" }] });            // snapshot 1
+    writeDecisions(HOME, { batchId: "ss", decidedAtSec: 11, decisions: [{ id: "b", verdict: "reject" }] });             // snapshot 2 — omits a
+    const got = consumeDecisions(HOME, "ss");
+    expect(got.resolved.map((r) => [r.item.id, r.verdict])).toEqual([["b", "reject"]]); // only b (a is un-decided by the replace)
+  });
+
+  test("TG-R6-P1-1: snapshot -> tap MERGES (the tap preserves the snapshot's untouched items)", () => {
+    openBatch(HOME, { batchId: "st", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "st", decidedAtSec: 10, decisions: [{ id: "a", verdict: "approve" }] }); // snapshot
+    expect(recordDecision(HOME, "st", { id: "b", verdict: "reject" }, 11)).toBe("recorded");                 // tap
+    const got = consumeDecisions(HOME, "st");
+    expect(got.resolved.map((r) => [r.item.id, r.verdict]).sort()).toEqual([["a", "approve"], ["b", "reject"]]); // BOTH
+  });
+
+  test("TG-R6-P1-1: an EMPTY full snapshot clears prior decisions (zero consumed, not a stale approve)", () => {
+    openBatch(HOME, { batchId: "es", owner: "coord", items: [item("a")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "es", decidedAtSec: 10, decisions: [{ id: "a", verdict: "approve" }] });
+    writeDecisions(HOME, { batchId: "es", decidedAtSec: 11, decisions: [] }); // the console cleared the batch with no decisions
+    expect(readDecisions(HOME, "es")!.decisions).toEqual([]);
+    expect(consumeDecisions(HOME, "es").resolved).toEqual([]); // zero — the old approve is NOT consumed
+  });
+
+  test("TG-R6-P1-1: snapshot(a)->snapshot(b) and snapshot(a)->tap(b) DIVERGE (publish type is recorded, not inferred)", () => {
+    openBatch(HOME, { batchId: "d1", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "d1", decidedAtSec: 10, decisions: [{ id: "a", verdict: "approve" }] });
+    writeDecisions(HOME, { batchId: "d1", decidedAtSec: 11, decisions: [{ id: "b", verdict: "approve" }] });
+    expect(consumeDecisions(HOME, "d1").resolved.map((r) => r.item.id)).toEqual(["b"]);        // snapshot->snapshot: replace
+
+    openBatch(HOME, { batchId: "d2", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "d2", decidedAtSec: 10, decisions: [{ id: "a", verdict: "approve" }] });
+    expect(recordDecision(HOME, "d2", { id: "b", verdict: "approve" }, 11)).toBe("recorded");
+    expect(consumeDecisions(HOME, "d2").resolved.map((r) => r.item.id).sort()).toEqual(["a", "b"]); // snapshot->tap: merge
+  });
+
+  test("TG-R6-P2-1: a legacy baseline decisions.json (no slots) is IMPORTED, not silently dropped", () => {
+    openBatch(HOME, { batchId: "lg", owner: "coord", items: [item("a")], nowSec: 1 });
+    // a pending batch created by the baseline (bdd93d7) API: a raw decisions.json, no seq/ ledger, no consumed.json
+    writeFileSync(path.join(dd("lg"), "decisions.json"), JSON.stringify({ batchId: "lg", decidedAtSec: 5, decisions: [{ id: "a", verdict: "approve" }] }));
+    expect(readDecisions(HOME, "lg")!.decisions.map((d) => d.id)).toEqual(["a"]); // read sees the legacy decision
+    const got = consumeDecisions(HOME, "lg");
+    expect(got.consumed).toBe(true);
+    expect(got.resolved.map((r) => [r.item.id, r.verdict])).toEqual([["a", "approve"]]); // and it consumes it (no silent loss)
+  });
+
+  test("TG-R6-P2-1: a legacy baseline recoverable claim (no consumed.json, no slots) is IMPORTED", () => {
+    openBatch(HOME, { batchId: "lc", owner: "coord", items: [item("a")], nowSec: 1 });
+    // a baseline consume that claimed decisions.json then faulted before sealing left a recoverable claim
+    writeFileSync(path.join(dd("lc"), "decisions-consumed-claim.json"), JSON.stringify({ batchId: "lc", decidedAtSec: 5, decisions: [{ id: "a", verdict: "reject" }] }));
+    expect(readDecisions(HOME, "lc")!.decisions.map((d) => d.id)).toEqual(["a"]);
+    expect(consumeDecisions(HOME, "lc").resolved.map((r) => r.verdict)).toEqual(["reject"]); // recovered, not lost
+  });
+
+  test("TG-R6-P2-1: a legacy decisions.json then a NEW tap — the legacy snapshot is the base, the tap merges on top", () => {
+    openBatch(HOME, { batchId: "lm", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
+    writeFileSync(path.join(dd("lm"), "decisions.json"), JSON.stringify({ batchId: "lm", decidedAtSec: 5, decisions: [{ id: "a", verdict: "approve" }] })); // legacy base
+    expect(recordDecision(HOME, "lm", { id: "b", verdict: "reject" }, 10)).toBe("recorded"); // new slot 0 (tap)
+    const got = consumeDecisions(HOME, "lm");
+    expect(got.resolved.map((r) => [r.item.id, r.verdict]).sort()).toEqual([["a", "approve"], ["b", "reject"]]); // legacy a + new b
   });
 });

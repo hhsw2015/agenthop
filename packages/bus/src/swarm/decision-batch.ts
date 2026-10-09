@@ -141,20 +141,25 @@ export function upsertDecision(existing: DecisionsDoc | null, batchId: string, d
  *  decision from a doc with an EQUAL-OR-GREATER decidedAtSec supersedes an earlier one (so a tap wins an equal-second tie over
  *  the console snapshot — a targeted single-item action is the more recent intent). Only docs bound to `batchId` count; returns
  *  null when there is nothing to fold (no snapshot, no taps). Pure. */
-export function foldDecisionDocs(entries: { doc: DecisionsDoc; order: bigint }[], batchId: string): DecisionsDoc | null {
+/** A publish's TYPE in the slot ledger: a console full-snapshot (the complete decision set — REPLACES prior state) vs a
+ *  single-item entry tap (an incremental update — MERGES, preserving untouched items). TG-R6-P1-1. */
+export type SlotKind = "snapshot" | "tap";
+
+export function foldDecisionDocs(entries: { doc: DecisionsDoc; order: bigint; kind: SlotKind }[], batchId: string): DecisionsDoc | null {
   const bound = entries.filter((e) => e.doc.batchId === batchId);
   if (bound.length === 0) return null;
-  // TG-R3-P1-1: order by the ACTUAL WRITE order (an `order` token — the source file's mtime in ns), NOT the 1-second
-  // `decidedAtSec`. A later-WRITTEN decision for an id supersedes an earlier one even within the same second (a console reject
-  // written after a tap approve wins; a tap written after a snapshot wins) — the entries never fix-prefer one writer. A true
-  // mtime tie breaks deterministically by decidedAtSec (and, equal, input order) — only a genuinely simultaneous write.
+  // Fold by PUBLISH ORDER (the immutable slot number) PRESERVING publish SEMANTICS (TG-R6-P1-1): a "snapshot" (a console full
+  // clear) REPLACES all prior decisions — a later snapshot that omits an item un-decides it (baseline parity), an empty snapshot
+  // clears everything; a "tap" (a single-item entry) MERGES, preserving untouched items. So the effective state is the LATEST
+  // snapshot's items plus every tap published after it. Order ties (same slot — impossible for real slots) break by decidedAtSec.
   const sorted = [...bound].sort((a, b) =>
     a.order < b.order ? -1 : a.order > b.order ? 1 : a.doc.decidedAtSec - b.doc.decidedAtSec);
   const latest = new Map<string, Decision>();
   let maxTs = 0;
-  for (const { doc } of sorted) { // ascending ⇒ a later entry overwrites ⇒ the latest-WRITTEN decision per id wins
+  for (const { doc, kind } of sorted) {
     maxTs = Math.max(maxTs, doc.decidedAtSec);
-    for (const d of doc.decisions) latest.set(d.id, d);
+    if (kind === "snapshot") latest.clear(); // a full snapshot replaces all prior decisions (new snapshot supersedes old)
+    for (const d of doc.decisions) latest.set(d.id, d); // snapshot sets its items; tap upserts its one item
   }
   return { batchId, decidedAtSec: maxTs, decisions: [...latest.values()] };
 }

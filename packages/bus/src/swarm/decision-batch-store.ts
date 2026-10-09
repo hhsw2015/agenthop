@@ -12,7 +12,7 @@ import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
 import { writeInbox, composeInboxMsg } from "../inbox.js";
 import {
-  type DecisionBatch, type DecisionsDoc, type DecisionItem, type ResolvedDecision, type Decision,
+  type DecisionBatch, type DecisionsDoc, type DecisionItem, type ResolvedDecision, type Decision, type SlotKind,
   validDecisionBatch, validDecisionsDoc, buildBatch, resolveBatch, enforceScope, foldDecisionDocs,
 } from "./decision-batch.js";
 
@@ -24,6 +24,9 @@ function assertSafeBatchId(id: string): void {
 function batchesDir(home: string): string { return path.join(home, ".agenthop", "console", "decision-batches"); }
 function batchDir(home: string, batchId: string): string { assertSafeBatchId(batchId); return path.join(batchesDir(home), batchId); }
 function batchPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "batch.json"); }
+// TG-R6-P2-1: the BASELINE (bdd93d7) pending-decisions file, read ONLY for backward-compat import of a batch created before the
+// slot ledger existed (never written by this version).
+function decisionsPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "decisions.json"); }
 /** Durable per-batch files (existence = the fact), all inside the batch dir.
  *  - `consumed.json`: the TERMINAL marker. Committed via temp+link (`createExclusiveAtomic`) so it appears ONLY with COMPLETE
  *    content (a half-written marker never seals the batch, DB-R2-P1-1) and is the atomic batch-level single winner (DB-P1-3).
@@ -222,27 +225,58 @@ export function readBatch(home: string, batchId: string): DecisionBatch | null {
 }
 
 export function readDecisions(home: string, batchId: string): DecisionsDoc | null {
-  // The EFFECTIVE ledger = every published slot FOLDED by slot number (the durable publish order), latest-per-id wins. read and
-  // consume fold the SAME slots, so they are naturally consistent (TG-R3-P2-1); the order is the immutable slot index, not a
-  // drift-prone filesystem timestamp (TG-R3-P1-1). null when no slot is published yet.
-  return foldDecisionDocs(readSlots(home, batchId), batchId);
+  // The EFFECTIVE ledger = legacy baseline data (imported for compat) THEN every published slot, FOLDED by order PRESERVING publish
+  // semantics (snapshot replaces / tap merges, TG-R6-P1-1). read and consume fold the SAME entries, so they are naturally consistent
+  // (TG-R3-P2-1); the order is the immutable slot index, not a drift-prone filesystem timestamp. null when there is nothing.
+  return foldDecisionDocs(readLedgerEntries(home, batchId), batchId);
 }
 
-/** Read every published SLOT for a batch as {doc, order=slot#}. A dir/file read error PROPAGATES (never folded to [] — a lost slot
- *  is a lost/miscounted verdict); a missing dir ⇒ none; a corrupt/misbound slot ⇒ skipped. The slot is IMMUTABLE, so one read is a
- *  consistent snapshot (no stat/ctime race): the order is the filename's integer, bound to the record written at slot creation. */
-function readSlots(home: string, batchId: string): { doc: DecisionsDoc; order: bigint }[] {
+/** The full fold input: legacy baseline data (imported for compat, TG-R6-P2-1) THEN the slot ledger. A read error PROPAGATES. */
+function readLedgerEntries(home: string, batchId: string): { doc: DecisionsDoc; order: bigint; kind: SlotKind }[] {
+  const entries: { doc: DecisionsDoc; order: bigint; kind: SlotKind }[] = [];
+  // TG-R6-P2-1: import a batch created by the BASELINE (bdd93d7) API before the slot ledger existed, so its already-accepted,
+  // not-yet-consumed decisions are NOT silently dropped. Imported ONLY while the batch is not sealed (a sealed batch's claim is a
+  // consumed projection, not pending input). Both legacy files are console FULL SNAPSHOTS, ordered BEFORE every slot (they predate
+  // the switch): the recoverable claim (older) then decisions.json (a fresh snapshot supersedes the claim — baseline precedence).
+  if (!existsStrict(consumedMarkerPath(home, batchId))) {
+    const legacyClaim = readJsonOrNull(claimPath(home, batchId), validDecisionsDoc);
+    if (legacyClaim && legacyClaim.batchId === batchId) entries.push({ doc: legacyClaim, order: -2n, kind: "snapshot" });
+    const legacySnap = readJsonOrNull(decisionsPath(home, batchId), validDecisionsDoc);
+    if (legacySnap && legacySnap.batchId === batchId) entries.push({ doc: legacySnap, order: -1n, kind: "snapshot" });
+  }
+  entries.push(...readSlots(home, batchId));
+  return entries;
+}
+
+/** Read every published SLOT for a batch as {doc, order=slot#, kind}. A dir/file read error PROPAGATES (never folded to [] — a lost
+ *  slot is a lost/miscounted verdict); a missing dir ⇒ none; a corrupt/misbound slot ⇒ skipped. The slot is IMMUTABLE, so one read
+ *  is a consistent snapshot (no stat/ctime race): the order is the filename's integer, bound to the record written at slot creation. */
+function readSlots(home: string, batchId: string): { doc: DecisionsDoc; order: bigint; kind: SlotKind }[] {
   let names: string[];
   try { names = readdirSync(slotsDir(home, batchId)); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
-  const out: { doc: DecisionsDoc; order: bigint }[] = [];
+  const out: { doc: DecisionsDoc; order: bigint; kind: SlotKind }[] = [];
   for (const name of names) {
     const m = /^(\d+)\.json$/.exec(name); // only canonical slot files (skip temps / anything else)
     if (!m) continue;
-    const doc = readJsonOrNull(path.join(slotsDir(home, batchId), name), validDecisionsDoc); // throws on a real read error ⇒ kept, not dropped
-    if (doc && doc.batchId === batchId) out.push({ doc, order: BigInt(m[1]!) });
+    const slot = readSlotFile(path.join(slotsDir(home, batchId), name)); // throws on a real read error ⇒ kept, not dropped
+    if (slot && slot.doc.batchId === batchId) out.push({ doc: slot.doc, order: BigInt(m[1]!), kind: slot.kind });
   }
   return out;
+}
+
+/** Read one immutable slot file: its DecisionsDoc + its publish KIND. ENOENT/corrupt ⇒ null; a real read error (EACCES) PROPAGATES.
+ *  A record missing `kind` (never written by this version) defaults to "snapshot" — the safe full-replace. */
+function readSlotFile(file: string): { doc: DecisionsDoc; kind: SlotKind } | null {
+  let raw: string;
+  try { raw = readFileSync(file, "utf8"); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return null; } // readable-but-corrupt ⇒ null
+  const doc = validDecisionsDoc(parsed);
+  if (!doc) return null;
+  const kind: SlotKind = (parsed as { kind?: unknown }).kind === "tap" ? "tap" : "snapshot";
+  return { doc, kind };
 }
 
 /** The highest published slot number + 1 (the probe start for the next publish). ENOENT ⇒ 0; a read error PROPAGATES (a publisher
@@ -256,15 +290,15 @@ function nextSlotStart(home: string, batchId: string): number {
   return max + 1;
 }
 
-/** Publish ONE decision record by COMPETING for the next free monotonic slot: probe n = highest+1, EXCLUSIVE-create seq/<n>.json;
- *  on EEXIST (a concurrent publisher won n) probe n+1 and retry. The slot that is exclusively created IS the acceptance point — the
- *  publish order is fixed atomically and the record is immutable, so no later op (rename/chmod/retry) can drift it. Returns the slot
- *  number. The caller refuses a sealed batch first; a slot that still lands after a seal is surfaced as an orphan by consume (R25). */
-function publishSlot(home: string, batchId: string, record: DecisionsDoc): number {
+/** Publish ONE decision record (with its KIND) by COMPETING for the next free monotonic slot: probe n = highest+1, EXCLUSIVE-create
+ *  seq/<n>.json; on EEXIST (a concurrent publisher won n) probe n+1 and retry. The slot that is exclusively created IS the acceptance
+ *  point — the publish order is fixed atomically and the record is immutable, so no later op can drift it. TG-R6-P1-1: `kind`
+ *  (snapshot|tap) is stored IN the record so the fold preserves publish semantics (replace vs merge). Returns the slot number. */
+function publishSlot(home: string, batchId: string, record: DecisionsDoc, kind: SlotKind): number {
   mkdirSync(slotsDir(home, batchId), { recursive: true, mode: 0o700 });
   let n = nextSlotStart(home, batchId);
   for (;;) {
-    if (createExclusiveAtomic(slotPath(home, batchId, n), JSON.stringify(record)) === "created") return n;
+    if (createExclusiveAtomic(slotPath(home, batchId, n), JSON.stringify({ ...record, kind })) === "created") return n;
     n += 1; // the slot was taken by a concurrent publisher ⇒ a LATER publisher gets a HIGHER slot ⇒ publish order preserved
   }
 }
@@ -291,7 +325,7 @@ export function writeDecisions(home: string, doc: DecisionsDoc): void {
   const enforced: DecisionsDoc = batch
     ? { ...valid, decisions: valid.decisions.map((d) => { const it = batch.items.find((i) => i.id === d.id); return it ? enforceScope(it, d) : d; }) }
     : valid;
-  publishSlot(home, valid.batchId, enforced); // append-only slot ⇒ durable publish order, never overwrites a sibling
+  publishSlot(home, valid.batchId, enforced, "snapshot"); // a console full clear ⇒ a SNAPSHOT slot (replaces prior state, TG-R6-P1-1)
 }
 
 /** Record ONE item's decision as its OWN immutable slot (an entry tap). Each tap COMPETES for the next slot, so the publish order
@@ -309,7 +343,7 @@ export function recordDecision(home: string, batchId: string, decision: Decision
   if (token === null) return "contended";
   try {
     if (existsStrict(consumedMarkerPath(home, batchId))) return "consumed"; // sealed — no fork, the tap is a no-op
-    publishSlot(home, batchId, { batchId, decidedAtSec: nowSec, decisions: [enforceScope(batch.items[idx]!, decision)] });
+    publishSlot(home, batchId, { batchId, decidedAtSec: nowSec, decisions: [enforceScope(batch.items[idx]!, decision)] }, "tap"); // a single-item entry ⇒ a TAP slot (merges, preserves siblings)
     return "recorded";
   } finally { releaseConsumeLock(home, batchId, token); }
 }
@@ -400,9 +434,9 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
     // this read is surfaced as an orphan below. A slot read failure PROPAGATES (never a silent drop ⇒ a lost approval). The slots
     // are IMMUTABLE, so their order is the same for every reader and every retry — no claim move / permission change / stack-local
     // ordering can drift it.
-    const slots = readSlots(home, batchId);
-    if (slots.length === 0) return none; // nothing to consume yet
-    const doc = foldDecisionDocs(slots, batchId) ?? { batchId, decidedAtSec: 0, decisions: [] };
+    const entries = readLedgerEntries(home, batchId); // slot ledger + any legacy baseline import (TG-R6-P2-1), by publish order
+    if (entries.length === 0) return none; // nothing to consume yet
+    const doc = foldDecisionDocs(entries, batchId) ?? { batchId, decidedAtSec: 0, decisions: [] };
     const res = resolveBatch(batch, doc);
     // The CANONICAL consumed record — a PROJECTION of the folded ledger for the existing read side (the bandwidth collector's
     // readBoundDoc(claim), any post-consume canonical read). The slots remain the authority and keep their order; the claim never
