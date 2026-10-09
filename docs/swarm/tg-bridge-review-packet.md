@@ -1,6 +1,16 @@
-# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 7
+# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 8
 
-- **Branch** `feat/tg-bridge`  **HEAD** `bd0656e`  **Base** `main` (`bdd93d7`)  (r1 `7c6dff0`, r2 `f34ca77`, r3 `ccabe66`, r4 `2a56429`, r5 `6f80b89`, r6 `96a1adb`)
+- **Branch** `feat/tg-bridge`  **HEAD** `6ba107c`  **Base** `main` (`bdd93d7`)  (r1 `7c6dff0` · r2 `f34ca77` · r3 `ccabe66` · r4 `2a56429` · r5 `6f80b89` · r6 `96a1adb` · r7 `bd0656e`)
+
+## Round 8 — round-7 REMAIN resolved (1 P2): the legacy-import lifecycle
+The r7 verdict CLOSED the snapshot/tap semantics and left one P2 — the legacy-import edge cases.
+
+- **TG-R6-P2-1 A (false orphan).** `readLedgerEntries` imported legacy baseline data ONLY while the batch was unsealed. So after a consume sealed an imported legacy decision + a new tap, the post-seal `readDecisions` dropped the legacy half — differing from the consumed digest — and `emitOrphanSignal` fired a spurious re-batch signal (and, with an unwritable owner inbox, made a normal consume throw EACCES after sealing). Fix: import the legacy files UNCONDITIONALLY (no sealed gate), so the fold is identical before and after the seal. `decisions.json` + the rejected-claim are never written by this version (always baseline); the consumed-claim is either a baseline recoverable claim or this version's consumed projection — importing it as an order(-2) snapshot is correct for both, because the slots re-apply on top (a projection IS the slots' fold → idempotent, never mis-ordered), so the post-seal read equals the consumed digest and no false orphan is raised.
+- **TG-R6-P2-1 B (rejected-claim).** A baseline `decisions-rejected-claim.json` holding a valid, bound doc is now imported too (oldest snapshot, order -3), matching the baseline's recovery of a mis-archived verdict; a foreign one (batchId ≠ dir) is never imported.
+- Gates: bus tsc 0, scripts tsc 0, tg-entry selftest pass, **decision-batch 57** (a new "TG r8" block: a consumed legacy-import + tap fires no false orphan on re-consume; an unwritable owner inbox does not make a legacy-import consume throw; the claim variant; rejected-claim import valid+foreign — all four proven to fail on the old sealed-gated / no-rejected-import logic), dual-bandwidth 16, full bus **1176/1176**.
+- **Reviewer** codex `01a0ff49` (happycapy)  **Author** bus-pen `d7f6c917`
+
+## Round 7 (resolved) — slots carry publish TYPE + legacy import
 
 ## Round 7 — round-6 REMAIN resolved (1 P1 + 1 P2): slots carry publish TYPE + legacy import
 The r6 verdict accepted the slot publish-order direction (the ctime drift / read divergence are CLOSED) and found two protocol-semantics gaps.
