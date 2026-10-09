@@ -1,7 +1,7 @@
 import net from "node:net";
 import { rmSync, writeFileSync, utimesSync } from "node:fs";
 import { startBusCore, type BusCoreOptions } from "./core.js";
-import { PRESENCE_HEARTBEAT_SEC } from "./swarm/task-liveness.js";
+import { PRESENCE_HEARTBEAT_SEC, claimLivenessSocket } from "./swarm/task-liveness.js";
 import { dbg } from "./debug.js";
 
 /**
@@ -49,36 +49,45 @@ export function runPresence(opts: BusCoreOptions = {}): void {
   // being fresh; a stale mtime means the daemon is gone and the pid may be recycled, so the send path keeps relay rather
   // than a false local durable redirect. Keyed on the file's freshness (an active association), not on process start time
   // (whose 1s granularity let a same-second recycle masquerade as the original writer).
-  const keepAlive = setInterval(() => {
-    if (pidFile) { try { const t = new Date(); utimesSync(pidFile, t, t); } catch { /* best effort — the pid file may be gone on shutdown */ } }
-  }, PRESENCE_HEARTBEAT_SEC * 1000);
-
   // F45-R1 (coordinator ruling B): a per-session LIVENESS SOCKET at presence/<sid>.sock. A live instance LISTENS; when it
   // dies the kernel drops the listener, so a receiver's connect-probe is a WINDOW-FREE "is the current instance alive?" check
-  // (ownership — the mtime heartbeat above is only a sentinel-classification aid). The sock filename IS the sid (natural
-  // binding). A stale sock file from a dead daemon connects to nothing ⇒ ECONNREFUSED ⇒ naturally rejected; we only unlink a
-  // leftover file BEFORE binding (standard unix). Accept-and-close: the mere existence of a listener is the signal.
+  // (ownership — the mtime heartbeat below is only a sentinel-classification aid). The sock filename IS the sid (natural
+  // binding). F45-R7-P2-1: claimLivenessSocket NEVER unlinks a LIVE listener — if an incumbent of this sid is still serving
+  // (succession handoff overlap), we DEFER and retry on the next heartbeat tick, taking over only once it frees the path; a
+  // dead daemon's stale file is reclaimed. On shutdown we only server.close() (which unlinks OUR OWN path), so two instances
+  // never collide on one file and no instance ever deletes another's live endpoint.
   const sockPath = pidFile ? pidFile.replace(/\.pid$/, ".sock") : null;
   let sockServer: net.Server | null = null;
-  if (sockPath) {
-    try { rmSync(sockPath, { force: true }); } catch { /* no stale sock */ }
-    try {
-      sockServer = net.createServer((c) => c.destroy());
-      sockServer.on("error", () => { /* never crash the daemon on a socket error */ });
-      sockServer.listen(sockPath);
-      sockServer.unref?.(); // don't keep the loop alive on the socket alone (keepAlive does that)
-    } catch { sockServer = null; }
-  }
-
   let closing = false;
+  const claimSock = (): void => {
+    if (!sockPath || sockServer || closing) return;
+    void claimLivenessSocket(sockPath).then((srv) => {
+      if (!srv) return;                               // deferred (a live incumbent) or failed — retry on the next keepAlive tick
+      if (closing) { try { srv.close(); } catch { /* best effort */ } return; }
+      sockServer = srv;
+    });
+  };
+
+  // Keep the process alive. The daemon is detached (its own session, no controlling terminal, stdio ignored), so a
+  // ref'd timer is what holds the event loop open — a non-compiled bun/node script stays up on that alone. This timer
+  // ALSO HEARTBEATS the pid file's mtime (sentinel aux only — NOT ownership, which is the liveness socket) and (re)claims
+  // the liveness socket when we don't hold it (first start, or after a deferred incumbent dies and frees the path).
+  const keepAlive = setInterval(() => {
+    if (pidFile) { try { const t = new Date(); utimesSync(pidFile, t, t); } catch { /* best effort — the pid file may be gone on shutdown */ } }
+    claimSock();
+  }, PRESENCE_HEARTBEAT_SEC * 1000);
+  claimSock(); // claim immediately at startup; the keepAlive tick is only the retry/takeover path
+
   const timers: Array<ReturnType<typeof setInterval>> = [keepAlive];
   const shutdown = (code = 0): void => {
     if (closing) return;
     closing = true;
     for (const tmr of timers) clearInterval(tmr);
-    // Close the liveness socket + remove its file (a clean exit; a crash leaves the file, but connect then gets ECONNREFUSED).
+    // Close the liveness socket we OWN. server.close() unlinks our own socket file — we only ever hold a path we bound (a
+    // live incumbent is deferred, never replaced), so this cannot delete another instance's endpoint (F45-R7-P2-1). No
+    // unconditional rmSync: a deferring instance (sockServer null) must not touch the live incumbent's file; a crashed
+    // daemon's leftover file is reclaimed by the next start's probe-then-unlink.
     if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } }
-    if (sockPath) { try { rmSync(sockPath, { force: true }); } catch { /* best effort */ } }
     // Remove our own pid file (the entry wrote it, the SessionEnd hook also removes it — harmless to do both).
     const pidFile = process.env.AGENTHOP_PID_FILE;
     if (pidFile) {

@@ -10,7 +10,7 @@ import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
-import { resolveInboxTarget } from "./send-fallback.js";
+import { resolveInboxTarget, isValidSessionId } from "./send-fallback.js";
 import { resolveSession, listSessions, presenceSockPath, probeLivenessSock } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
 
@@ -432,8 +432,12 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // CURRENT instance is alive — window-free (no last-write/mtime freshness, so no pid-recycle window). A stale sock from a
       // dead daemon ⇒ ECONNREFUSED; a recycled pid never listens on it ⇒ connect fails ⇒ keep relay (no false durable). The
       // sock filename IS the sid, so the probe is naturally bound to the exact identity.
+      // F45-R7-P1-2: the stableId becomes a filesystem path (presence/<sid>.sock). It is an unvalidated peer field, so a
+      // crafted value like "../bridge" would point the probe at an UNRELATED listener and yield a false local durable. Only
+      // probe for a sid that is a safe single path segment; anything else stays relay (never probe another endpoint).
       let relayLocalSid: string | null = null;
       if (!("error" in resolvedPeer) && resolvedPeer.via === "relay" && resolvedPeer.stableId
+          && isValidSessionId(resolvedPeer.stableId)
           && (await probeLivenessSock(presenceSockPath(home, resolvedPeer.stableId)))) {
         relayLocalSid = resolvedPeer.stableId;
       }

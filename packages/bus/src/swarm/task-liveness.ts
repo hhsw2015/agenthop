@@ -60,7 +60,7 @@ export function resolveSession(ownerHandle: string, sessionIds: string[]): strin
 }
 
 // --- real-fs binding (the TEMP v1; bus-identity replaces it). Thin; the testable decisions are above. -------------
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, rmSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 
@@ -90,6 +90,31 @@ export function probeLivenessSock(sockPath: string, timeoutMs: number = PRESENCE
     sock.once("connect", () => { clearTimeout(timer); finish(true); });
     sock.once("error", () => { clearTimeout(timer); finish(false); });
   });
+}
+
+/**
+ * F45-R7-P2-1: claim the per-session liveness socket WITHOUT ever unlinking a LIVE listener. A unix bind fails EADDRINUSE
+ * whether the path holds a live listener OR a dead daemon's stale file — so we cannot tell them apart by bind alone, and
+ * unconditionally unlinking-before-bind (the r7 bug) silences a still-serving instance of the same sid. Instead:
+ *   1. try to listen. Free path ⇒ we own it.
+ *   2. EADDRINUSE ⇒ probe. A LIVE incumbent ⇒ return null (DEFER — never steal a live peer's endpoint; the caller retries
+ *      later and takes over once the incumbent frees it). Only a DEAD stale file is unlinked and reclaimed.
+ * Any other listen error ⇒ null (stay without a local socket; the send path falls back to relay, never a false durable).
+ * On shutdown the owner just calls server.close(), which unlinks its OWN path — so two instances never collide on one file.
+ */
+export async function claimLivenessSocket(sockPath: string, probeMs: number = PRESENCE_PROBE_MS): Promise<net.Server | null> {
+  const listen = (): Promise<net.Server> => new Promise((resolve, reject) => {
+    const srv = net.createServer((c) => c.destroy());
+    srv.once("error", reject);
+    srv.listen(sockPath, () => { srv.removeListener("error", reject); srv.on("error", () => { /* never crash on a socket error */ }); srv.unref?.(); resolve(srv); });
+  });
+  try { return await listen(); }
+  catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EADDRINUSE") return null;
+    if (await probeLivenessSock(sockPath, probeMs)) return null; // a LIVE listener owns this sid — defer, do not unlink it
+    try { rmSync(sockPath, { force: true }); } catch { /* best effort: a dead daemon's stale file */ }
+    try { return await listen(); } catch { return null; }
+  }
 }
 
 /** Native sessionIds that have a presence pid file under <home>/.agenthop/presence/<id>.pid (for resolveSession). */

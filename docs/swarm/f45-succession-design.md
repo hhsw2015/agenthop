@@ -39,10 +39,15 @@ user 重启协调者后，新壳拿到全新 native sid，未继承稳定 sid（
 
 **修复**（round-7 定案，F45-R1 协调者裁 B：每会话活性 socket）：归属只认 socket，不认时间。presence 守护进程在 `presence/<sid>.sock` 监听（bind 前 unlink 旧文件；accept 即关，监听器存在本身即活证）；收端 `probeLivenessSock` connect 探测，200 ms 超时。连上=当前实例活（内核在守护死时即丢监听器，故无窗——不同于任何 last-write/mtime 新鲜度方案）；陈旧 sock（守护死残留）connect 得 ECONNREFUSED、缺文件得 ENOENT、挂起得 timeout，皆 false⇒保留 relay。sock 文件名即 sid=天然绑定。core 的 relayLocalSid=await probeLivenessSock（presenceSockPath（sid））。r6 的 mtime 心跳保留作哨兵 liveness 辅证（分类用），归属不认。**scope：send 路径 + presence 守护进程（+socket 监听/清理、保留心跳）。** 真跨机（无本地活 socket）仍 relay。
 
+**round-8 修两残留（审查席 happycapy r7 判回 1 P1 + 1 P2）：**
+
+- **F45-R7-P1-2（P1，SID 路径未绑定到准确 sid）：** `stableId` 是未校验的 peer 字段。`../bridge` 会让探测路径逃出 `presence/` 命名空间、连上无关监听器（如 bus bridge 的 socket）=假耐久，消息进无人消费的箱。修：纯 `isValidSessionId`（单段安全路径，`^[A-Za-z0-9_-]+$`、非空、≤128）。核 `relayLocalSid` 计算仅对合法 sid 探测，非法=保留 relay、绝不探测别的端点。`resolveInboxTarget` 对每个耐久键校验：非法的 relayLocalSid 退回 relay，非法的本地/离线 sid=fail-closed none。不做有损清洗（拒绝，不改写）。
+- **F45-R7-P2-1（P2，旧实例退出删掉新实例的监听路径）：** 旧的 bind 前无条件 unlink 会抢走同 sid 活监听器的路径；且 Node v20 `server.close()` 本身按路径 unlink socket 文件，旧实例退出删掉新实例的文件=新实例虽活但后续探测得 ENOENT⇒全退 relay。修：`claimLivenessSocket` 绝不 unlink 活监听器——先 listen，`EADDRINUSE` 则探测，活 incumbent 则**让渡**（返回 null，下一心跳 tick 重试，待其释放再接管），仅死守护的陈旧文件才 unlink 重建。关停只 `server.close()`（只 unlink 自己 bind 的路径），不再无条件 rmSync（让渡中的实例绝不碰 incumbent 的文件）。整条监听生命周期都不删他人端点。
+
 这是修 bug（非 dormant 新机制）：改在本分支、未合并故 main 不受影响，经合并门后应**默认生效**。
 
 ## 门与边界
 
-- 纯核自测：shell-succession 20、coordinator-report 12；send-fallback 新增 2 例（同机 relay ⇒ 耐久 / 跨机 relay ⇒ relay），既有 8 例不变 = 10/10。bus 全量 tsc 净；send-path 邻接 28/28（legacy-inbox-keys/inbox/core-legacy-refresh）。
+- 纯核自测：shell-succession 38、coordinator-report 12 = 作者 50/50；send-fallback 21/21（r7 的 socket 探测 3 例 + r8 新增 isValidSessionId 2 例、不安全耐久键 3 例、claimLivenessSocket 真 socket 3 例：free 绑定 / 死文件重建 / 活 incumbent 让渡不抢）。bus 全量 tsc 净（exit 0）；liveness+core 邻接 48/48。
 - 留白：①的采证 IO（读 roster-snapshot + presence 存活 + herdr pane）与重写 pid、②的 S19/herdr 面接线、live 重跑 bus 全量，均按既定范围 dormant/未接，候合并门。
 - ③的修改触及 live 代码（send-fallback.ts、core.ts），已随邻接测试验证不破坏既有 send 路径。
