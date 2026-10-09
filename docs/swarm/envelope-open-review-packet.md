@@ -1,6 +1,11 @@
-# Review packet — envelope-open side (§2b OPEN, an R14 pre-flight, dual to BA9), ROUND 2
+# Review packet — envelope-open side (§2b OPEN, an R14 pre-flight, dual to BA9), ROUND 3
 
-- **Branch** `feat/envelope-open`  **HEAD** `db43600`  **Base** `main` (`3732f4b`)  (round-1 `a39d129`)
+- **Branch** `feat/envelope-open`  **HEAD** `df83be7`  **Base** `main` (`3732f4b`)  (round-1 `a39d129`, round-2 `db43600`)
+
+## Round 3 — round-2 REMAIN resolved (EO2/EO3; the two consistency edges)
+- EO2 (P2) a production wait already RESOLVED/frozen in CONTROL (produced / cancelled / revoked) was still re-declared as an active OPEN — the registry persisted a production-phase envelope and the receipt announced OPEN, contradicting CONTROL's two durable faces. `openGrantEnvelope` now reads the wait by the REGISTERED envelope's `productionWaitId` (not a re-derived formula) and recovers by its ACTUAL lifecycle: a non-live wait (not `open`/`action_pending`) returns `settled` (the grant stands, NO OPEN receipt, nothing persisted over it); the production-wait is committed ONLY when ABSENT; a live existing wait is adopted as-is (its deadline + close reason untouched, never re-committed).
+- EO3 (P2) the receipt bound to the CURRENT candidate spec's revision, so a plan-revision bump between a lost first receipt and the retry shipped a receipt whose revision diverged from the persisted identity (`receiptMatches` would then return false). The receipt now binds to the REGISTERED envelope `openDelegation` returned — `open.envelope.requestId` / `payloadDigest` / `subject.revision` — not the candidate spec.
+- Gates: bus tsc 0, scripts tsc 0, bus vitest 1132/1132 (board-envelope test 8 — pure `planGrantEnvelope` unchanged; EO2/EO3 are driver-IO consistency, new `settled` status added to the open result).
 
 ## Round 2 — round-1 REMAIN resolved (EO1/EO2/EO3)
 - EO1 (P1) a failed OPEN no longer marks granted. `openGrantEnvelope` returns a tri-state (`none` | `deferred` | `opened`); on `deferred` the consumer KEEPS the claim (the grant attempt is already durable; the receipt + granted-rename wait) so the next tick's reconcile RETRIES OPEN — never granted-without-envelope. `none` (node has no required output) marks granted normally. The retry is the existing reconcile path (a still-`claimed` item whose live attempt carries our board-exec wait + same owner), so a transient failure (seq conflict / unreadable registry) self-heals in a tick or two; a persistent failure stalls the claim honestly rather than marking a granted item that has no envelope.
