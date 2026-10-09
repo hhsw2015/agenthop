@@ -379,7 +379,20 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // identity's keys (Codex P2-8), so this covers both the initial run-id and any later-adopted stableId. Unref'd — the
   // broker socket keeps the process alive; this timer must not by itself.
   void flushInbox();
-  const flushTimer = setInterval(() => { void flushInbox(); retryCheckIn(); }, 5000); // B5: the timer also retries a missed check-in
+  // F47: proactively adopt the Codex thread id from the daemon as our roster stableId. Under Codex 0.162 (rmcp client) an
+  // MCP call no longer carries x-codex-turn-metadata, so the node never learns its thread id from a call and — if it also
+  // never receives an inbound (handleInbound's adopt) — stays an un-addressable "unknown" in the roster, restart and all.
+  // The daemon's cwd-UNAMBIGUOUS activeThread is a restart-stable id; adopt it as a NON-authoritative guess (real call
+  // metadata still upgrades it, a wrong/ambiguous cwd yields undefined and is skipped). Covers the lazy MCP node AND the
+  // presence daemon (both run startBusCore). Runs until an authoritative id arrives.
+  const adoptCodexIdentity = (): void => { if (codexDaemon && !stableIdAuthoritative) learnStableId(codexDaemon.activeThread(self.cwd), false); };
+  // Fast initial adoption: the daemon handshake + thread list take ~1-2s, so poll briefly until we hold an id (then stop).
+  if (codexDaemon) {
+    let tries = 0;
+    const idTimer = setInterval(() => { adoptCodexIdentity(); if (self.stableId !== undefined || ++tries >= 20) clearInterval(idTimer); }, 1000);
+    idTimer.unref?.();
+  }
+  const flushTimer = setInterval(() => { void flushInbox(); retryCheckIn(); adoptCodexIdentity(); }, 5000); // B5: the timer also retries a missed check-in; the steady backstop for a late daemon / thread drift
   flushTimer.unref?.();
 
   // Recipient fs-watch (B2/B3 option b): a sender now writes same-machine messages straight to our durable inbox, so watch our
