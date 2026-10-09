@@ -91,6 +91,17 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
     if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
     openSock();
   };
+  // SU3: like syncSidFor but OVERRIDES a fixedSid — used ONLY on a proven succession adoption to move the liveness socket to the
+  // adopted sid (a seeded presence's fixedSid would otherwise pin the socket to the wrong identity, so resolveSession(adopted)
+  // would find nothing and fall to relay). The one place a fixedSid is overridden.
+  const forceSockSidTo = (want: string): void => {
+    if (!want || want === sockSid) return;
+    sockSid = want;
+    bindGen++;
+    binding = false;
+    if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
+    openSock();
+  };
   const core = startBusCore({ ...opts, onIdentityChange: (self) => syncSidFor(self.stableId ?? self.id) });
   if (!fixedSid) sockSid = core.self.stableId ?? core.self.id; // initial sid from the core (the per-run id until a late adopt)
   dbg(`presence up: ${core.self.title} (tool=${core.self.tool} stable=${core.self.stableId ?? "-"})`);
@@ -100,13 +111,19 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
   // the pid slot is taken over inside runSuccessionAtStartup; core.adoptStableId then drains that sid's inbox ("扫箱") and
   // rebinds the liveness socket (via onIdentityChange) so resolveSession(stableSid) finds this instance. Fail-soft.
   if (successionEnabled()) {
-    try {
-      // SECOND consumption point (coordinator ruling a): the primary gather is at the AGENT's bus-core-init (mcp.ts); this
-      // fail-closed path covers the presence daemon too. The credential (resume target) is read from the AGENT's argv via the
-      // host pid the hook recorded (AGENTHOP_HOST_PID = the codex/claude process), never this daemon's own `node presence.mjs`.
-      const adopted = runSuccessionAtStartup(home, core.self.tool, core.self.stableId ?? core.self.id, Number(process.env.AGENTHOP_HOST_PID) || undefined, dbg);
-      if (adopted) core.adoptStableId(adopted);
-    } catch (e) { dbg(`succession startup failed (ignored): ${e instanceof Error ? e.message : e}`); }
+    // SOLE completion point (coordinator SU3 pivot): adoption completes ONLY here — the presence daemon is the single instance
+    // that owns a liveness socket, so one completion point avoids the double-write surface F45 closed. The credential (resume
+    // target) is the AGENT's own argv, read via ps / /proc on the host pid the hook recorded (AGENTHOP_HOST_PID = the codex/
+    // claude process), never this daemon's `node presence.mjs`. Async because the incumbent check probes the live socket (SU1).
+    void (async () => {
+      try {
+        const adopted = await runSuccessionAtStartup(home, core.self.tool, core.self.stableId ?? core.self.id, Number(process.env.AGENTHOP_HOST_PID) || undefined, dbg);
+        if (adopted && !closing) {
+          core.adoptStableId(adopted);  // drain the adopted inbox + publish the identity
+          forceSockSidTo(adopted);      // SU3: move the liveness socket to the adopted sid (overrides a seeded fixedSid)
+        }
+      } catch (e) { dbg(`succession startup failed (ignored): ${e instanceof Error ? e.message : e}`); }
+    })();
   }
 
   // Keep the process alive (a ref'd timer holds the detached loop open — a non-compiled bun/node script stays up on that alone).

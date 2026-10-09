@@ -7,9 +7,6 @@ import { formatHandoff } from "./handoff.js";
 import { despawnAgent, readRegistry, spawnAgent, startClaimRetry } from "./spawn.js";
 import { omniwmctl, splitArgs } from "./wm.js";
 import { version } from "./version.js";
-import { successionEnabled, runSuccessionAtStartup } from "./swarm/shell-succession.js";
-import { dbg } from "./debug.js";
-import { homedir } from "node:os";
 
 /**
  * The bus tools — agenthop_peers / send / recv — that make every session discoverable and reachable
@@ -59,17 +56,10 @@ Incoming messages arrive on their own: on agents with a native inbox (e.g. Claud
 export function registerBusTools(server: McpServer, options: BusMcpOptions = {}): () => void {
   const core: BusCore = startBusCore(options);
 
-  // F45 ① PRIMARY consumption point (coordinator ruling a): the AGENT's bus-core-init. The binding credential (resume target)
-  // is read from the AGENT's OWN argv — ps on the host pid (AGENTHOP_HOST_PID the hook recorded, else this MCP server's parent
-  // = the agent process) — the truest source (not a relayable file / not the roster snapshot). On "adopt" the stable sid's
-  // presence slot is taken over and core.adoptStableId drains its inbox + rebinds the liveness socket + makes resolveSession
-  // find it. DORMANT (SWARM_SUCCESSION off). Fail-soft; dbg goes to stderr/debug ONLY (stdout here is the MCP JSON-RPC stream).
-  if (successionEnabled()) {
-    try {
-      const adopted = runSuccessionAtStartup(options.home ?? homedir(), core.self.tool, core.self.stableId ?? core.self.id, Number(process.env.AGENTHOP_HOST_PID) || process.ppid, dbg);
-      if (adopted) core.adoptStableId(adopted);
-    } catch (e) { dbg(`mcp succession failed (ignored): ${e instanceof Error ? e.message : e}`); }
-  }
+  // Note: SWARM_SUCCESSION adoption is NOT wired here. Adoption can only COMPLETE at the presence daemon — the single instance
+  // that owns a liveness socket (coordinator SU3 pivot: one completion point avoids the double-write surface F45 closed). The
+  // MCP node has no liveness socket, so an adoption here could not make resolveSession(adopted) work. Credential source is still
+  // the agent's argv, read at the presence daemon via ps/_proc on the host pid.
 
   // If THIS session was launched by agenthop_spawn, self-register the Ghostty surface it runs in so
   // despawn has an authoritative (agent-claimed) target. Bounded retry; a no-op unless spawned.

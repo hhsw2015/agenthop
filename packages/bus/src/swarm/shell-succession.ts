@@ -146,12 +146,17 @@ import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { ROSTER_FILE, type RosterMember } from "./resume.js";
-import { makeFileLiveness } from "./task-liveness.js";
+import { makeFileLiveness, probeSessionAlive } from "./task-liveness.js";
 
 export interface IncumbentLiveness { pid: number | null; liveness: "alive" | "dead" | "absent"; }
 
-/** Normalize a cwd for comparison (strip trailing slashes). Local mirror of resume.normCwd (not exported). */
-function normCwd(cwd: string): string { return cwd.replace(/\/+$/, "") || "/"; }
+/** Normalize a cwd for comparison (strip trailing slashes). SP2: an UNKNOWN/empty cwd stays "" — it is NEVER normalized to
+ *  root, so a record with no cwd can't accidentally match a shell whose cwd is "/". A real "/" (or all-slashes) stays "/". */
+function normCwd(cwd: string): string {
+  if (!cwd) return "";                  // unknown/empty ⇒ empty (not "/"): the caller rejects it (SP2)
+  const n = cwd.replace(/\/+$/, "");
+  return n === "" ? "/" : n;            // "/" or "///" ⇒ "/"; "/w/" ⇒ "/w" (trailing-slash equivalence preserved)
+}
 
 /**
  * PURE succession plan against a roster snapshot. Choose a prior stable identity this restarting shell might continue —
@@ -161,13 +166,20 @@ function normCwd(cwd: string): string { return cwd.replace(/\/+$/, "") || "/"; }
  * decision is unit-tested without fs. NOTE (consumption-point caveat, surfaced to the coordinator): the binding credential
  * must come from the shell's OWN launch context (resumeTargetSid from `codex resume <sid>` argv, or an inherited pane); a
  * detached presence daemon rarely carries one, so this adopts only when such a credential is genuinely present. */
-export function planSuccession(att: Attestation, members: readonly RosterMember[], incumbentOf: (stableSid: string) => IncumbentLiveness): SuccessionResult {
+export async function planSuccession(att: Attestation, members: readonly RosterMember[], incumbentOf: (stableSid: string) => Promise<IncumbentLiveness>): Promise<SuccessionResult> {
   // Normalize the cwd on BOTH sides consistently — the candidate filter AND the continuity proof must agree, so a trailing
   // slash never makes provesContinuity (which compares att.cwd to recordedCwd) reject a real match the filter accepted.
   const attN: Attestation = { ...att, cwd: normCwd(att.cwd) };
-  const cand = members.find((m) => m.member && m.member !== attN.newNativeSid && m.tool === attN.tool && normCwd(m.cwd) === attN.cwd);
-  if (!cand) return { action: "fresh", reason: "no prior roster member matches this shell's tool+cwd on this machine — coming up fresh" };
-  const live = incumbentOf(cand.member);
+  if (attN.cwd === "") return { action: "fresh", reason: "unknown/empty cwd — environment cannot be proven, coming up fresh" }; // SP2
+  // SP1: select the UNIQUE candidate by the IDENTITY CREDENTIAL — the resume target (codex), else the shell's OWN native sid
+  // (the Claude same-sid fix). NOT by roster order: a bare tool/cwd `find` picks an arbitrary first entry and ignores which sid
+  // the shell actually continues. The same-sid case is KEPT (not excluded) so a Claude restart that lost its PID binding can
+  // re-take its own slot. A credential with no matching member ⇒ fresh (fail-closed).
+  const credentialSid = att.resumeTargetSid || att.newNativeSid;
+  if (!credentialSid) return { action: "fresh", reason: "no identity credential (no resume target, no native sid) — coming up fresh" };
+  const cand = members.find((m) => m.member === credentialSid && m.tool === attN.tool && normCwd(m.cwd) === attN.cwd);
+  if (!cand) return { action: "fresh", reason: `no roster member matches the credential identity ${credentialSid} with this tool+cwd — coming up fresh` };
+  const live = await incumbentOf(cand.member);
   const inc: IncumbentBinding = {
     stableSid: cand.member,
     mintedId: null,                // the roster snapshot carries no mintedId (bus-identity supplies it in future); null ⇒ no reuse
@@ -191,14 +203,31 @@ export function readRosterMembers(home: string): RosterMember[] {
   } catch { return []; }
 }
 
-/** IncumbentLiveness for a stable sid from presence/<sid>.pid + signal-0 (reuses makeFileLiveness). "unknown" (any non-ESRCH
- *  errno, F17) maps to "alive" — never convict a maybe-live incumbent, so the verdict rejects rather than stealing a live slot. */
-export function incumbentLivenessOf(home: string): (stableSid: string) => IncumbentLiveness {
+/** Read presence/<sid>.pid with ERRNO detail — distinguish a truly-ABSENT file (adoptable) from an UNREADABLE one (EACCES,
+ *  SU1: unreadable metadata must NEVER authorize takeover). makeFileLiveness.readPid collapses both to null, which is the bug. */
+function readPidDetailed(home: string, sid: string): { kind: "missing" | "unreadable" | "ok"; pid: number | null } {
+  try {
+    const raw = readFileSync(path.join(home, ".agenthop", presencePidRelPath(sid)), "utf8").trim();
+    const n = Number(raw);
+    return { kind: "ok", pid: Number.isInteger(n) && n > 0 ? n : null };
+  } catch (e) {
+    return { kind: (e as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable", pid: null };
+  }
+}
+
+/** SU1: the WINDOW-FREE live liveness SOCKET is the occupancy authority. If the sid's socket answers (and proves it owns the
+ *  sid, via the F45 full-SID back-verify in probeSessionAlive), the incumbent is ALIVE regardless of PID-file readability — a
+ *  shell can never adopt a live identity by deleting/locking its PID metadata. Only when NO live socket answers do we consult
+ *  the PID file: ABSENT (ENOENT) ⇒ adoptable; UNREADABLE (EACCES) ⇒ "alive" (never authorize on unreadable, SU1); a readable
+ *  DEAD pid ⇒ dead (adoptable); a readable LIVE pid with no socket ⇒ conservatively "alive" (don't steal a maybe-live slot). */
+export function incumbentLivenessOf(home: string): (stableSid: string) => Promise<IncumbentLiveness> {
   const io = makeFileLiveness(home);
-  return (sid) => {
-    const pid = io.readPid(sid);
-    if (pid === null) return { pid: null, liveness: "absent" };
-    return { pid, liveness: io.procAlive(pid) === "dead" ? "dead" : "alive" };
+  return async (sid) => {
+    if (await probeSessionAlive(home, sid)) return { pid: readPidDetailed(home, sid).pid, liveness: "alive" };
+    const d = readPidDetailed(home, sid);
+    if (d.kind === "missing") return { pid: null, liveness: "absent" };
+    if (d.kind === "unreadable" || d.pid === null) return { pid: d.pid, liveness: "alive" }; // SU1: unreadable/unparseable ⇒ do not authorize
+    return { pid: d.pid, liveness: io.procAlive(d.pid) === "dead" ? "dead" : "alive" };
   };
 }
 
@@ -208,11 +237,21 @@ export function incumbentLivenessOf(home: string): (stableSid: string) => Incumb
  *  (resume sids/paths rarely contain spaces; mirrors resume.ts's capture). Empty on any fault. */
 export function readHostArgv(hostPid: number | undefined): string[] {
   if (!hostPid || !Number.isInteger(hostPid) || hostPid <= 1) return [];
+  // SP3: prefer /proc/<pid>/cmdline — argv is NUL-separated with EXACT boundaries, so a program path containing spaces
+  // (e.g. `Tool Install/codex`) survives and argv[0] basename is correct. Linux only.
+  try {
+    const raw = readFileSync(`/proc/${hostPid}/cmdline`, "utf8");
+    const argv = raw.split("\0").filter(Boolean);
+    if (argv.length) return argv;
+  } catch { /* no /proc (macOS) — fall through to ps */ }
+  // ps fallback (no /proc): `ps -o args=` is a display string that LOSES arg boundaries, so a space in the path mis-splits
+  // and parseResumeTargetFromArgv returns null ⇒ FRESH (fail-closed: a miss, never a mis-adopt). We do NOT quote-reconstruct
+  // a boundary-lost string (SP3 threshold).
   try {
     const r = spawnSync("ps", ["-o", "args=", "-p", String(hostPid)], { encoding: "utf8", timeout: 2000 });
-    if (r.status !== 0 || !r.stdout) return [];
-    return r.stdout.trim().split(/\s+/).filter(Boolean);
-  } catch { return []; }
+    if (r.status === 0 && r.stdout) return r.stdout.trim().split(/\s+/).filter(Boolean);
+  } catch { /* noop */ }
+  return [];
 }
 
 /**
@@ -223,7 +262,7 @@ export function readHostArgv(hostPid: number | undefined): string[] {
  * `core.adoptStableId(sid)` (drains its inbox + rebinds the liveness socket + makes resolveSession find it). Returns null on
  * fresh/reject or any IO fault (fail-closed — never hijack on error).
  */
-export function runSuccessionAtStartup(home: string, selfTool: string, selfNativeSid: string, hostPid: number | undefined, log: (m: string) => void = () => {}): string | null {
+export async function runSuccessionAtStartup(home: string, selfTool: string, selfNativeSid: string, hostPid: number | undefined, log: (m: string) => void = () => {}): Promise<string | null> {
   const hostArgv = readHostArgv(hostPid); // the AGENT's real launch argv (e.g. `codex resume <sid>`) — the credential source
   const att: Attestation = {
     machine: os.hostname(),
@@ -236,7 +275,7 @@ export function runSuccessionAtStartup(home: string, selfTool: string, selfNativ
     newNativeSid: selfNativeSid,
   };
   let result: SuccessionResult;
-  try { result = planSuccession(att, readRosterMembers(home), incumbentLivenessOf(home)); }
+  try { result = await planSuccession(att, readRosterMembers(home), incumbentLivenessOf(home)); }
   catch (e) { log(`succession: plan failed (coming up fresh): ${e instanceof Error ? e.message : e}`); return null; }
   if (result.action !== "adopt" || !result.rebind) { log(`succession: ${result.action} — ${result.reason}`); return null; }
   const sid = result.rebind.stableSid;
