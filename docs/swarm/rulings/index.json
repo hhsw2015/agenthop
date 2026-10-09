@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAtSec": 1791521590,
+  "generatedAtSec": 1791522050,
   "count": 63,
   "bySeriesCount": {
     "R": 26,
@@ -254,7 +254,7 @@
     {
       "id": "S28-b",
       "series": "S",
-      "title": "补强:ste100 + i-have-adhd 全员强制",
+      "title": "产出规范三件套全员强制(adhd+ste100+stcn100)",
       "status": "active"
     },
     {
