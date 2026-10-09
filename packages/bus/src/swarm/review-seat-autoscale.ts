@@ -136,6 +136,34 @@ export function scaleDecision(
   return { action: "hold", reason: wantDown ? "at floor" : "within band" };
 }
 
+/**
+ * SUGGESTION-MODE planner (user ruling 2026-10-08: the autoscale flag is HALF-flipped — the dispatcher only ADVISES the
+ * coordinator, it NEVER spawns or reclaims a seat itself). Composes the phantom-depth filter → queue-depth → scaleDecision
+ * and renders a non-hold action as a one-line suggestion; returns null on hold (nothing to advise). Pure — the dispatcher
+ * gathers presence + the cross-tick timings and delivers the text to the coordinator's durable inbox (S11, taskRef=
+ * autoscale-suggest). The action is returned alongside the text purely so a caller can log/key on it; it is NOT executed.
+ */
+export function planAutoscaleSuggestion(input: {
+  records: readonly ReviewRecord[];
+  liveAuthors: ReadonlySet<string>;
+  liveSeats: ReadonlySet<SeatId>;
+  seats: readonly SeatState[];
+  cfg: ScaleConfig;
+  sinceLastActionSec: number;
+  sustainedSec: number;
+}): { action: ScaleAction; text: string } | null {
+  const open = filterLiveRecords(input.records, input.liveAuthors, input.liveSeats);
+  const signal = queueDepth(open);
+  const action = scaleDecision(signal, input.seats, input.cfg, input.sinceLastActionSec, input.sustainedSec);
+  if (action.action === "hold") return null;
+  const nLive = input.seats.filter((s) => s.live).length;
+  const text =
+    action.action === "scale-up"
+      ? `review queue deep: ${signal.totalOpen} open across ${nLive} live seat(s) (K_up=${input.cfg.kUp}) — SUGGEST spawning one more review seat`
+      : `review queue drained: ${signal.totalOpen} open across ${nLive} live seat(s) — SUGGEST reclaiming idle seat "${action.seat}"`;
+  return { action, text };
+}
+
 export interface SeatBirthCert {
   roleProfile: "reviewer";
   tool: "codex";
@@ -181,6 +209,92 @@ export function parseReviewFileName(name: string): { ticket: string; seat: strin
   const seat = stem.slice(dot + 1);
   if (!isValidReviewId(ticket) || !isValidReviewId(seat)) return null; // non-round-trippable id ⇒ reject
   return { ticket, seat, done };
+}
+
+/**
+ * The raw instantaneous want BEFORE the sustain/dwell gates — for a caller that tracks how long a want has continuously held
+ * (suggestion mode tracks this across ticks to feed sustainedSec into planAutoscaleSuggestion). Mirrors scaleDecision's
+ * wantUp/wantDown exactly, including the below-floor and at-floor guards (so a tracked "none" matches scaleDecision's hold).
+ * Pure.
+ */
+export function instantaneousWant(signal: QueueSignal, seats: readonly SeatState[], cfg: ScaleConfig): "up" | "down" | "none" {
+  const n = seats.filter((s) => s.live).length;
+  if (n < cfg.floor) return "none"; // below floor: roster restores the baseline, autoscaler flexes only above
+  if (signal.totalOpen > n * cfg.kUp) return "up";
+  if (signal.totalOpen < (n - 1) * cfg.kDown && n > cfg.floor) return "down";
+  return "none";
+}
+
+/**
+ * Derive SeatState[] for SUGGESTION mode from the durable ledger + a live-seat set (presence). Pure. Per seat that appears
+ * in the ledger: inFlight = its open records, completedReviews = its done records, spawnedSec = its earliest record's
+ * sentSec (a seniority proxy), live = membership in liveSeats, idle = inFlight === 0 (a LEDGER proxy — a seat with no open
+ * record is treated as idle; the coordinator verifies true idle before acting on a reclaim suggestion). floor = the
+ * cfg.floor most-senior LIVE seats (never reclaimed). KNOWN BOUNDARY: only seats that appear in the ledger are built, so a
+ * live reviewer seat that has never held a review is NOT counted — n is biased low, i.e. toward an over-provisioning
+ * (scale-up) suggestion; acceptable because the output is advisory and the coordinator confirms the real seat count. Uses a
+ * Map (not an object) so a seat named `toString`/`__proto__`/`constructor` is a plain key (no prototype collision).
+ */
+export function buildSeatStatesFromLedger(
+  records: readonly ReviewRecord[],
+  liveSeats: ReadonlySet<SeatId>,
+  cfg: ScaleConfig,
+  nowSec: number,
+): SeatState[] {
+  const agg = new Map<SeatId, { inFlight: number; completed: number; earliest: number }>();
+  for (const r of records) {
+    const e = agg.get(r.seat) ?? { inFlight: 0, completed: 0, earliest: r.sentSec > 0 ? r.sentSec : nowSec };
+    if (r.done) e.completed += 1; else e.inFlight += 1;
+    if (r.sentSec > 0 && r.sentSec < e.earliest) e.earliest = r.sentSec;
+    agg.set(r.seat, e);
+  }
+  const seniority = (a: [SeatId, { earliest: number }], b: [SeatId, { earliest: number }]): number =>
+    a[1].earliest - b[1].earliest || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  const floorSet = new Set<SeatId>(
+    [...agg].filter(([seat]) => liveSeats.has(seat)).sort(seniority).slice(0, Math.max(0, cfg.floor)).map(([seat]) => seat),
+  );
+  return [...agg].map(([seat, e]) => ({
+    seat,
+    live: liveSeats.has(seat),
+    idle: e.inFlight === 0,
+    inFlight: e.inFlight,
+    completedReviews: e.completed,
+    spawnedSec: e.earliest,
+    floor: floorSet.has(seat),
+  }));
+}
+
+/**
+ * Canonicalize review records against presence for suggestion mode (AS-P2-1 + AS-P2-2). `resolveLive(id)` must resolve an
+ * identity to its CANONICAL native session id AND confirm the process is actually alive (a pid file alone is not life — a
+ * stale file pointing at a dead pid resolves but is NOT live), returning null for a dead/unresolvable id. Each record keeps
+ * ALL its work (a 5-ticket queue stays 5 tickets), but two ALIASES of one seat (e.g. a full sid and its short prefix) both
+ * map to the one canonical id, so capacity is never inflated by an alias; a dead/unresolvable seat or author keeps its RAW id
+ * (absent from liveSeats/liveAuthors ⇒ excluded downstream, never counted). Returns the canonicalized records + the canonical
+ * live id sets. Pure; `resolveLive` is injected (the IO — presence + kill(0) — lives in the caller). resolveLive is memoized
+ * per distinct id.
+ */
+export function canonicalizeLiveRecords(
+  records: readonly ReviewRecord[],
+  resolveLive: (id: string) => string | null,
+): { records: ReviewRecord[]; liveAuthors: Set<string>; liveSeats: Set<SeatId> } {
+  const liveAuthors = new Set<string>();
+  const liveSeats = new Set<SeatId>();
+  const memo = new Map<string, string | null>();
+  const canon = (id: string): string | null => {
+    if (memo.has(id)) return memo.get(id)!;
+    const c = resolveLive(id);
+    memo.set(id, c);
+    return c;
+  };
+  const out = records.map((r) => {
+    const cSeat = canon(r.seat);
+    const cAuthor = r.author !== "" ? canon(r.author) : null;
+    if (cSeat !== null) liveSeats.add(cSeat);
+    if (cAuthor !== null) liveAuthors.add(cAuthor);
+    return { ...r, seat: cSeat ?? r.seat, author: cAuthor ?? r.author };
+  });
+  return { records: out, liveAuthors, liveSeats };
 }
 
 // ============================================================================================================
