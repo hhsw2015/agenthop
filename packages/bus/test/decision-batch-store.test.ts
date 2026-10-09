@@ -5,7 +5,7 @@ import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { openBatch, readBatch, writeDecisions, readDecisions, consumeDecisions, listBatches, listBatchesStrict, recordDecision } from "../src/swarm/decision-batch-store.js";
-import { type DecisionItem } from "../src/swarm/decision-batch.js";
+import { type DecisionItem, foldDecisionDocs } from "../src/swarm/decision-batch.js";
 import { collectBandwidthEvents } from "../src/swarm/dual-bandwidth-store.js";
 import { claimInbox } from "../src/inbox.js";
 
@@ -660,5 +660,41 @@ describe("TG r8: legacy import lifecycle (stable across seal; rejected-claim imp
     openBatch(HOME, { batchId: "rb2", owner: "coord", items: [item("a")], nowSec: 1 });
     writeFileSync(path.join(dd("rb2"), "decisions-rejected-claim.json"), JSON.stringify({ batchId: "OTHER", decidedAtSec: 5, decisions: [{ id: "a", verdict: "approve" }] }));
     expect(consumeDecisions(HOME, "rb2").consumed).toBe(false); // a foreign (batchId != dir) rejected-claim is never imported
+  });
+});
+
+// B8-1 (batch-8 push-gate, FC-6): the slot number is the SOLE publish-order arbiter. A leading-zero alias (00.json) must not
+// parse to the same order as 0.json and let a planted file swing the verdict by its clock — the store canonicalizes slot names
+// and fails closed; the fold never timestamp-decides a same-order duplicate.
+describe("B8-1: canonical slot names; a leading-zero alias fails closed (never timestamp-decided)", () => {
+  const d8 = (id: string) => path.join(HOME, ".agenthop", "console", "decision-batches", id);
+  const rawSeq = (id: string, name: string, doc: unknown) => { mkdirSync(path.join(d8(id), "seq"), { recursive: true }); writeFileSync(path.join(d8(id), "seq", name), JSON.stringify(doc)); };
+
+  test("a planted leading-zero alias (00.json) makes read + consume FAIL-CLOSED, not timestamp-decide the verdict", () => {
+    openBatch(HOME, { batchId: "b8", owner: "coord", items: [item("a")], nowSec: 1 });
+    rawSeq("b8", "0.json", { batchId: "b8", decidedAtSec: 10, decisions: [{ id: "a", verdict: "approve" }], kind: "snapshot" });    // the real slot 0
+    rawSeq("b8", "00.json", { batchId: "b8", decidedAtSec: 9999, decisions: [{ id: "a", verdict: "reject" }], kind: "snapshot" });  // a planted alias with a crafted clock
+    expect(() => readDecisions(HOME, "b8")).toThrow(/non-canonical/i);     // fail-closed — never returns the planted verdict
+    expect(() => consumeDecisions(HOME, "b8")).toThrow(/non-canonical/i);  // never consumes the planted reject
+    expect(existsSync(path.join(d8("b8"), "consumed.json"))).toBe(false);  // and never seals a tampered batch
+  });
+
+  test("a canonical ledger (incl. two-digit slots) reads + consumes normally; a createExclusiveAtomic temp is skipped", () => {
+    openBatch(HOME, { batchId: "b8ok", owner: "coord", items: [item("a"), item("b"), item("c")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "b8ok", decidedAtSec: 10, decisions: [{ id: "a", verdict: "approve" }] }); // slot 0
+    expect(recordDecision(HOME, "b8ok", { id: "b", verdict: "reject" }, 11)).toBe("recorded");                 // slot 1
+    for (let i = 0; i < 10; i += 1) expect(recordDecision(HOME, "b8ok", { id: "c", verdict: "defer" }, 12 + i)).toBe("recorded"); // slots 2..11 (two-digit canonical)
+    rawSeq("b8ok", "0.json.tmp-deadbeef", { junk: true }); // a publish temp — must be skipped (not a slot), never throw
+    const got = consumeDecisions(HOME, "b8ok");
+    expect(got.consumed).toBe(true);
+    expect(got.resolved.map((r) => [r.item.id, r.verdict]).sort()).toEqual([["a", "approve"], ["b", "reject"], ["c", "defer"]]);
+  });
+
+  test("foldDecisionDocs fails closed on a duplicate publish order (never timestamp-decides)", () => {
+    const dup = [
+      { doc: { batchId: "x", decidedAtSec: 1, decisions: [{ id: "a", verdict: "approve" as const }] }, order: 5n, kind: "snapshot" as const },
+      { doc: { batchId: "x", decidedAtSec: 9999, decisions: [{ id: "a", verdict: "reject" as const }] }, order: 5n, kind: "snapshot" as const },
+    ];
+    expect(() => foldDecisionDocs(dup, "x")).toThrow(/duplicate publish order/i);
   });
 });
