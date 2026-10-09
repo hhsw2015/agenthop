@@ -36,7 +36,18 @@ Inbox messages are ephemeral (best-effort early signal; `foldedFrom` is the dura
 boxes each gauge read is O(messages) — acceptable for a dormant periodic reader. Two byte-identical submissions by one author
 de-dup to one (benign resend collapse).
 
+## Round-1 fixes (0P1/3P2/0P3 @54ea582 → this SHA)
+
+- **ST-P2-1** (fan-out dropped intent): `chat-room-store.ts` postToRoom's fan-out now carries `post.intent` into the InboxMsg
+  copy — same from/text/ts ⇒ same submitDigest ⇒ the room post and its inbox copies count once, and a recipient can identify a 呈批.
+- **ST-P2-2** (bad foldedFrom passed the write boundary): `validDecisionItem` now validates each slot by INDEX (no
+  `Array.prototype.every`, which skips sparse holes and runs an input-supplied method) — a hole / null / non-string whole-rejects,
+  and the stored value is a CLEAN copy. `new Array(1)` and `[42]` are now rejected (were written as `[null]`/`[42]`).
+- **ST-P2-3** (floor changed window attribution): the submit scan keeps fractional seconds (`ts / 1000`, no `Math.floor`) on
+  both the chat-room and inbox paths — a submit just inside `(now-windowSec, now+skew]` is no longer dropped, and a future submit
+  just past `skew` is no longer wrongly included (matches the decision-batch consume path's `consumedAtMs / 1000`).
+
 ## Verification already run
 
-submit-tag.test.ts 12/12 · dual-bandwidth-store.test.ts 21/21 (5 new) · bus tsc 0 · scripts tsc 0 · full bus 87 files / 1164
-tests pass. Not pushed, not merged (merge/enable gate = coordinator + user).
+submit-tag.test.ts 13/13 · dual-bandwidth-store.test.ts 23/23 (7 new) · reviewer probe `submit-boundaries.test.ts` 11/11 (was
+6/11) · bus tsc 0 · scripts tsc 0 · full bus 87 files / 1167 tests pass. Not pushed, not merged (merge/enable gate = coordinator + user).

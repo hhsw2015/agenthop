@@ -184,6 +184,7 @@ export function postToRoom(home: string, roomId: string, draft: RoomPostDraft, n
       writeInbox(home, target, composeInboxMsg({
         from: post.from, fromLabel: post.fromLabel, text: post.text,
         via: "room", ts: post.ts, taskRef: `room:${roomId}`, title: meta.topic.slice(0, 48),
+        ...(post.intent !== undefined ? { intent: post.intent } : {}), // ST-P2-1: the fan-out copy must carry the post's intent (same from/text/ts ⇒ same submitDigest ⇒ counted once, and the recipient can identify a 呈批)
       }));
       fannedOut.push(target);
     } catch { /* best-effort: the log is the source of truth; the member recovers the post by tailing the log */ }

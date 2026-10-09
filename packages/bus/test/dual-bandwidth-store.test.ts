@@ -5,7 +5,7 @@ import path from "node:path";
 import { openBatch, writeDecisions, consumeDecisions } from "../src/swarm/decision-batch-store.js";
 import { type DecisionItem } from "../src/swarm/decision-batch.js";
 import { collectBandwidthEvents, computeGauge, writeBandwidthProjection, readBandwidthProjection, submitTagEnabled } from "../src/swarm/dual-bandwidth-store.js";
-import { openRoom, appendPost } from "../src/swarm/chat-room-store.js";
+import { openRoom, appendPost, postToRoom } from "../src/swarm/chat-room-store.js";
 import { writeInbox, composeInboxMsg } from "../src/inbox.js";
 import { submitDigest } from "../src/swarm/dual-bandwidth.js";
 
@@ -250,6 +250,28 @@ describe("dual-bandwidth IO store — submit-tag secondary source (SWARM_SUBMIT_
     ], nowSec: t });
     // submit(alice/"ship it") === item A's fold ⇒ once; item B native ⇒ once ⇒ 2 total (NOT 3 — no double-count)
     withTag(true, () => { expect(collectBandwidthEvents(h).produceAtSec.length).toBe(2); });
+  });
+
+  test("ST-P2-1: chat-room fan-out preserves intent; the post + its inbox copies count ONCE (same digest)", () => {
+    const h = mkHome(); const t = nowSec();
+    openRoom(h, { roomId: "r1", topic: "x", owner: "coord", roster: ["coord", "alice", "bob"], nowSec: t });
+    const res = postToRoom(h, "r1", { from: "alice", fromLabel: "alice", text: "呈批 ship", intent: "submit" }, t);
+    if (!("post" in res)) throw new Error("unexpected throttle (no limiter supplied)");
+    expect(res.post.intent).toBe("submit");
+    const bobBox = path.join(h, ".agenthop", "inbox", "bob");
+    const copy = JSON.parse(readFileSync(path.join(bobBox, readdirSync(bobBox).filter((f) => f.endsWith(".json"))[0]!), "utf8"));
+    expect(copy.intent).toBe("submit"); // fan-out carried intent (was dropped before the fix)
+    expect(copy.from).toBe("alice"); expect(copy.text).toBe("呈批 ship"); // same from/text ⇒ same submitDigest
+    // room post + coord's copy + bob's copy all share (from,text,ts) ⇒ ONE produce
+    withTag(true, () => { expect(collectBandwidthEvents(h).produceAtSec.length).toBe(1); });
+  });
+
+  test("ST-P2-3: a fractional-ms submit keeps window attribution (floor would drop a just-inside submit)", () => {
+    const h = mkHome();
+    openRoom(h, { roomId: "r1", topic: "x", owner: "coord", nowSec: 1 });
+    // 100500ms = 100.5s. At now=3700,windowSec=3600,skew=0 the window is (100,3700]: 100.5 is IN, but floor(100.5)=100 is OUT.
+    appendPost(h, "r1", { from: "a", fromLabel: "a", text: "near-lower", ts: 100500, intent: "submit" }, 1);
+    withTag(true, () => { expect(computeGauge(h, 3700, { windowSec: 3600, skewToleranceSec: 0 }).bProd1h).toBe(1); });
   });
 
   test("ON: an inbox access fault during the submit scan propagates (never a silent under-count)", () => {

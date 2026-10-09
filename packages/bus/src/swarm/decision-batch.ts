@@ -37,13 +37,25 @@ export function validDecisionItem(raw: unknown): DecisionItem | null {
   const r = raw as Record<string, unknown>;
   if (!isNonEmptyStr(r.id) || !isNonEmptyStr(r.kind) || !isNonEmptyStr(r.summary) || !isNonEmptyStr(r.suggestedAction)) return null;
   if (r.evidenceRef !== undefined && !isStr(r.evidenceRef)) return null;
-  // submit-tag (T5-2): foldedFrom records the content digests of the chat-room/inbox submits this item compressed, so the
-  // gauge counts each logical submission once (B_prod=N) and never double-counts a submit and the batch item it folds into.
-  if (r.foldedFrom !== undefined && !(Array.isArray(r.foldedFrom) && r.foldedFrom.every((x) => isNonEmptyStr(x)))) return null;
+  // submit-tag (T5-2): foldedFrom records the content digests of the chat-room/inbox submits this item compressed, so the gauge
+  // counts each logical submission once (B_prod=N) and never double-counts a submit and the batch item it folds into. Validate
+  // EACH slot explicitly (ST-P2-2): Array.prototype.every SKIPS sparse holes and would run an input-supplied `every` — iterate
+  // by index over a genuine array, reject a hole (undefined) or a non-string, and emit a CLEAN copy (never alias the input).
+  let foldedFrom: string[] | undefined;
+  if (r.foldedFrom !== undefined) {
+    if (!Array.isArray(r.foldedFrom)) return null;
+    const ff: string[] = [];
+    for (let i = 0; i < r.foldedFrom.length; i += 1) {
+      const v = r.foldedFrom[i];
+      if (!isNonEmptyStr(v)) return null; // a hole or a non-empty-string element ⇒ whole-reject (never write a [null])
+      ff.push(v);
+    }
+    foldedFrom = ff;
+  }
   return {
     id: r.id, kind: r.kind, summary: r.summary, suggestedAction: r.suggestedAction,
     ...(isStr(r.evidenceRef) ? { evidenceRef: r.evidenceRef } : {}),
-    ...(Array.isArray(r.foldedFrom) ? { foldedFrom: r.foldedFrom as string[] } : {}),
+    ...(foldedFrom !== undefined ? { foldedFrom } : {}),
   };
 }
 

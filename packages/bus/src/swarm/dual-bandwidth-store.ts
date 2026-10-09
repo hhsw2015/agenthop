@@ -97,7 +97,7 @@ function scanSubmits(home: string): { digest: string; atSec: number }[] {
   const out: { digest: string; atSec: number }[] = [];
   for (const roomId of listRooms(home)) {
     for (const post of readPosts(home, roomId)) {
-      if (post.intent === "submit") out.push({ digest: submitDigest(post.from, post.text), atSec: Math.floor(post.ts / 1000) });
+      if (post.intent === "submit") out.push({ digest: submitDigest(post.from, post.text), atSec: post.ts / 1000 }); // ST-P2-3: keep fractional seconds (no floor) so window attribution matches (now-windowSec, now+skew]
     }
   }
   let boxes;
@@ -112,7 +112,7 @@ function scanSubmits(home: string): { digest: string; atSec: number }[] {
     for (const f of files) {
       if (!f.endsWith(".json")) continue; // final envelopes only; skip .tmp/.claim-* + the quarantine/ sub-dir
       const msg = validInboxMsg(readJsonOrNull(path.join(dir, f)));
-      if (msg && msg.intent === "submit") out.push({ digest: submitDigest(msg.from, msg.text), atSec: Math.floor(msg.ts / 1000) });
+      if (msg && msg.intent === "submit") out.push({ digest: submitDigest(msg.from, msg.text), atSec: msg.ts / 1000 }); // ST-P2-3: keep fractional seconds (no floor)
     }
   }
   return out;

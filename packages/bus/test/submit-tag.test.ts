@@ -79,8 +79,17 @@ describe("submit-tag — foldedFrom validation on a decision item", () => {
   test("string[] accepted + preserved; absent ok; non-array / non-string-element rejected", () => {
     expect(validDecisionItem({ ...base, foldedFrom: ["d1", "d2"] })?.foldedFrom).toEqual(["d1", "d2"]);
     expect(validDecisionItem(base)!.foldedFrom).toBeUndefined();
+    expect(validDecisionItem({ ...base, foldedFrom: [] })!.foldedFrom).toEqual([]); // empty array keeps its semantics
     expect(validDecisionItem({ ...base, foldedFrom: "d1" })).toBeNull(); // not an array
     expect(validDecisionItem({ ...base, foldedFrom: ["d1", 2] })).toBeNull(); // non-string element
     expect(validDecisionItem({ ...base, foldedFrom: ["d1", ""] })).toBeNull(); // empty-string element
+  });
+  test("ST-P2-2: a sparse hole / null / non-string array is whole-rejected (never written as [null]); result is a clean copy", () => {
+    expect(validDecisionItem({ ...base, foldedFrom: new Array(1) })).toBeNull(); // sparse hole — .every would skip it
+    expect(validDecisionItem({ ...base, foldedFrom: [null] })).toBeNull();
+    expect(validDecisionItem({ ...base, foldedFrom: [42] })).toBeNull();
+    const inp = ["d1", "d2"]; const out = validDecisionItem({ ...base, foldedFrom: inp })!;
+    expect(out.foldedFrom).toEqual(inp);
+    expect(out.foldedFrom).not.toBe(inp); // a clean copy, never the aliased input array
   });
 });
