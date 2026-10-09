@@ -66,6 +66,20 @@ describe("force-pipeline — forcedSuccessors + pipelineOrder (deterministic)", 
   });
 });
 
+describe("force-pipeline — round-1 fixes (dedup collision, knownNodes iterator)", () => {
+  test("FP-P2-1: a NUL inside an endpoint does not collide two legitimately-different edges; a true duplicate still rejects", () => {
+    expect(validateForcePipeline(P([{ from: "a\u0000b", to: "c" }, { from: "a", to: "b\u0000c" }])).ok).toBe(true);
+    expect(validateForcePipeline(P([{ from: "a\u0000b", to: "c" }, { from: "a\u0000b", to: "c" }])).ok).toBe(false);
+  });
+  test("FP-P2-2: the known-node set is built from actual slots, not a hijacked iterator", () => {
+    const known = ["a", "b"];
+    (known as { [Symbol.iterator]: unknown })[Symbol.iterator] = function* () { yield "a"; yield "ghost"; };
+    expect(validateForcePipeline(P([{ from: "a", to: "ghost" }]), known).ok).toBe(false); // ghost is not an actual element ⇒ dangling
+    expect(validateForcePipeline(P([{ from: "a", to: "b" }]), known).ok).toBe(true); // b is an actual element
+    expect(validateForcePipeline(P([{ from: "a", to: "b" }]), {} as unknown as string[]).ok).toBe(false); // non-array knownNodes rejects
+  });
+});
+
 describe("force-pipeline — forcePipelineEnabled (dormant, default OFF)", () => {
   test("default OFF; truthy words ON", () => {
     expect(forcePipelineEnabled({})).toBe(false);

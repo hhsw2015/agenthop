@@ -59,8 +59,17 @@ export function validateForcePipeline(input: unknown, knownNodes?: readonly stri
   if (ownVal(input, "schema") !== "force-pipeline/v1") return { ok: false, reason: "schema must be \"force-pipeline/v1\"" };
   const stagesRaw = ownVal(input, "stages");
   if (!Array.isArray(stagesRaw)) return { ok: false, reason: "stages must be an array" };
-  const known = knownNodes ? new Set<string>(knownNodes) : null;
-  const seenEdge = new Set<string>();
+  // FP-P2-2: build the known-node set from the ACTUAL array slots by index — never `new Set(knownNodes)`, which would run the
+  // input's (hijackable) iterator and could admit/deny nodes the real array does not contain.
+  let known: Set<string> | null = null;
+  if (knownNodes !== undefined) {
+    if (!Array.isArray(knownNodes)) return { ok: false, reason: "knownNodes must be an array" };
+    known = new Set<string>();
+    for (let i = 0; i < knownNodes.length; i += 1) known.add(knownNodes[i]!);
+  }
+  // FP-P2-1: de-dup edges with a NESTED map (from → set of to), NOT a `from + NUL + to` string key — a NUL inside an endpoint
+  // would collide two legitimately-different edges. A structural key cannot collide.
+  const seenEdge = new Map<string, Set<string>>();
   const stages: ForceStage[] = [];
   const nodeOrder: string[] = [];
   const nodeSet = new Set<string>();
@@ -75,9 +84,10 @@ export function validateForcePipeline(input: unknown, knownNodes?: readonly stri
     if (from === to) return { ok: false, reason: `stage[${i}] is a self-reference ("${from}" → itself)` };
     if (known && !known.has(from)) return { ok: false, reason: `stage[${i}].from "${from}" is not a known node (dangling)` };
     if (known && !known.has(to)) return { ok: false, reason: `stage[${i}].to "${to}" is not a known node (dangling)` };
-    const key = `${from}\u0000${to}`;
-    if (seenEdge.has(key)) return { ok: false, reason: `duplicate stage "${from}" → "${to}"` };
-    seenEdge.add(key);
+    let tos = seenEdge.get(from);
+    if (!tos) { tos = new Set<string>(); seenEdge.set(from, tos); }
+    if (tos.has(to)) return { ok: false, reason: `duplicate stage "${from}" → "${to}"` };
+    tos.add(to);
     stages.push({ from, to });
     note(from); note(to);
     const outs = adj.get(from) ?? [];

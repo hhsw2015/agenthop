@@ -42,7 +42,14 @@ here (independent file, flag OFF).
 4. Determinism — `forcedSuccessors` is edge-order; `pipelineOrder` is a deterministic topological order.
 5. Dormant + non-invasive — `SWARM_FORCE_PIPELINE` default OFF; independent file, no T3/task-plan change.
 
+## Round-1 fixes (0P1/2P2/0P3 @89b3116 → this SHA)
+
+- **FP-P2-1** (dedup key collision): the edge key `from + NUL + to` collided `("a\0b","c")` with `("a","b\0c")` (NUL is a legal
+  endpoint char). De-dup now uses a NESTED `Map<from, Set<to>>` — a structural key that cannot collide; true duplicates still reject.
+- **FP-P2-2** (knownNodes iterator): `new Set(knownNodes)` ran the input array's (hijackable) iterator. The set is now built from
+  the actual slots by index (with an Array.isArray guard); existence checks use the real node list.
+
 ## Verification
 
-force-pipeline.test.ts 11/11 · bus tsc 0 · full bus 87 files / 1158 pass. Not pushed, not merged (merge/enable gate =
-coordinator + user).
+force-pipeline.test.ts 13/13 (2 new round-1 regressions) · reviewer probe `pipeline-boundaries.test.ts` 7/7 (was 5/7) · bus tsc
+0 · full bus 87 files / 1160 pass. Not pushed, not merged (merge/enable gate = coordinator + user).
