@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { openBatch, writeDecisions, consumeDecisions } from "../src/swarm/decision-batch-store.js";
 import { type DecisionItem } from "../src/swarm/decision-batch.js";
-import { collectBandwidthEvents, computeGauge, writeBandwidthProjection, readBandwidthProjection, submitTagEnabled } from "../src/swarm/dual-bandwidth-store.js";
+import { collectBandwidthEvents, computeGauge, writeBandwidthProjection, readBandwidthProjection, submitTagEnabled, gaugeSamplingEnabled, shouldSampleGauge } from "../src/swarm/dual-bandwidth-store.js";
 import { openRoom, appendPost, postToRoom } from "../src/swarm/chat-room-store.js";
 import { writeInbox, composeInboxMsg } from "../src/inbox.js";
 import { submitDigest } from "../src/swarm/dual-bandwidth.js";
@@ -301,6 +301,35 @@ describe("dual-bandwidth IO store — submit-tag secondary source (SWARM_SUBMIT_
       const g = computeGauge(h, nowSec());
       expect(g.dBacklogDtPerHour).toBe(0);           // B6-2 fix: item-consistent (was bProd-bCons = 5-1 = 4)
       expect(g.bProd1h).toBe(5);                     // B_prod=N preserved (the ruled contract)
+    });
+  });
+
+  describe("T5-2 gauge timed-sampling seam (gaugeSamplingEnabled + shouldSampleGauge)", () => {
+    test("gaugeSamplingEnabled default OFF; truthy words ON", () => {
+      expect(gaugeSamplingEnabled({})).toBe(false);
+      expect(gaugeSamplingEnabled({ SWARM_GAUGE_SAMPLING: "0" })).toBe(false);
+      for (const on of ["1", "true", "yes", "on", "YES"]) expect(gaugeSamplingEnabled({ SWARM_GAUGE_SAMPLING: on })).toBe(true);
+    });
+    test("shouldSampleGauge: first sample fires, then throttles until the interval elapses (>= boundary)", () => {
+      expect(shouldSampleGauge(1_000_000, 0, 60)).toBe(true);        // first ever (last=0) ⇒ sample
+      expect(shouldSampleGauge(1_000_030, 1_000_000, 60)).toBe(false); // 30s < 60s ⇒ throttled
+      expect(shouldSampleGauge(1_000_059, 1_000_000, 60)).toBe(false); // 59s < 60s ⇒ throttled
+      expect(shouldSampleGauge(1_000_060, 1_000_000, 60)).toBe(true);  // exactly 60s ⇒ sample (>= boundary)
+      expect(shouldSampleGauge(1_000_120, 1_000_000, 60)).toBe(true);  // well past ⇒ sample
+    });
+    test("shouldSampleGauge fail-soft on misconfig: no clock ⇒ never; bad interval ⇒ always (never wedge to never)", () => {
+      expect(shouldSampleGauge(NaN, 0, 60)).toBe(false);            // non-finite now ⇒ no write
+      expect(shouldSampleGauge(1_000_000, 0, NaN)).toBe(true);      // non-finite interval ⇒ sample every call
+      expect(shouldSampleGauge(1_000_000, 0, 0)).toBe(true);        // zero interval ⇒ always
+      expect(shouldSampleGauge(1_000_000, 0, -5)).toBe(true);       // negative interval ⇒ always
+    });
+    test("a sampled write lands a readable fresh projection (what the sampler calls each interval)", () => {
+      const h = mkHome(); const t = nowSec();
+      openBatch(h, { batchId: "b1", owner: "coord", items: items(3), nowSec: t });
+      writeBandwidthProjection(h, t); // what runGaugeSampling() invokes
+      const proj = readBandwidthProjection(h);
+      expect(proj?.schema).toBe("bandwidth-gauge/v1");
+      expect(proj?.generatedAtSec).toBe(t);
     });
   });
 });
