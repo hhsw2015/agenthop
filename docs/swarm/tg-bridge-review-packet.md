@@ -1,6 +1,17 @@
-# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 1
+# Review packet — TG user-entry v1 (notify + collect-approvals), ROUND 2
 
-- **Branch** `feat/tg-bridge`  **HEAD** `7c6dff0`  **Base** `main` (`bdd93d7`)
+- **Branch** `feat/tg-bridge`  **HEAD** `f34ca77`  **Base** `main` (`bdd93d7`)  (round-1 `7c6dff0`)
+
+## Round 2 — round-1 REMAIN resolved (TG-P1-1..P2-4; P2-5 phased)
+- **TG-P1-1 (P1)** `allowedScopes` is ENFORCED on the REAL item via the pure `enforceScope`, at BOTH boundaries that touch the ledger: the write (`recordDecision`) and the resolve (`resolveBatch`). A hard-gate item's approve scope is clamped to `once` — it can never RECORD a `this-chat`/`always` grant, from TG or console. The UI buttons are no longer the permission boundary.
+- **TG-P1-2 (P1)** a single-item tap MERGES: the new pure `upsertDecision` + the atomic, per-batch-locked `recordDecision` upsert the one item and PRESERVE every sibling a console already recorded (a re-tap updates one entry; concurrent taps serialize under the consume lock). The driver uses `recordDecision`, never the snapshot-replacing `writeDecisions`.
+- **TG-P1-3 (P1)** the bot token is 0600 from the first byte — a 0600 temp + atomic rename over the target (replaces a pre-existing 0644); no post-hoc chmod window.
+- **TG-P2-1 (P2)** the `getUpdates` offset advances ONLY on a terminal outcome (recorded / consumed / unknown-item / ignored / expired-ref); a transient IO error or a contended lock STOPS the poll without advancing, so the update is retried — never a false "already decided".
+- **TG-P2-2 (P2)** a batch is marked notified ONLY after FULL successful delivery to a non-empty allowlist; a failed send or zero recipients leaves the retry obligation (no zero-delivery completion proof).
+- **TG-P2-3 (P2)** `callback_data` is a compact hash-ref `<batchHash10>.<itemIndex>` the driver resolves against live batches — ANY legal batchId/itemId (64-char, CJK, containing `|`) round-trips unambiguously under 64 UTF-8 bytes, no truncation.
+- **TG-P2-4 (P2)** `parseUpdate`/`parseCallback` shape-validate and return `ignore` (NEVER throw) on a non-string/object/null/malformed update; off-allowlist still writes nothing. First-contact: an un-allowlisted chat_id is surfaced so the user can add it (the design detail).
+- **TG-P2-5 (P2) — phasing proposed.** The decision-notify entry (the v1 core value) + first-contact are fully wired + verified. The remaining approved-case outbound — scheduled morning digest, bandwidth-gauge read, S19-receipt render, `sendDocument` multipart + the gauge-card rasterizer — have their PURE cores ready (`composeDigest`, `renderProjection`) but need driver wiring. **Requesting the coordinator confirm these as an explicit v1.1 phase** (vs blocking v1 on the rasterizer). If not phased, I wire them next.
+- Gates: bus tsc 0, scripts tsc 0, tg-entry selftest 37, decision-batch 40 (recordDecision merge/clamp/consumed + the two-entry no-fork), full bus vitest no new failures vs the env baseline.
 - **Reviewer** codex `01a0ead5` (cross-family)  **Author** bus-pen `d7f6c917`
 - **Design** `docs/swarm/tg-bridge-design.md` @`dc76d57` (coordinator-APPROVED full case). **User gate PASSED**: user authorized Telegram + ruled it an entry-layer peer to the console.
 
