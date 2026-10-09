@@ -1,0 +1,15 @@
+{
+  "id": "R22",
+  "series": "R",
+  "title": "DHH 经验定为设计基准",
+  "status": "active",
+  "by": "user",
+  "since": "2026-10-08",
+  "statement": "user 原话:「这是真实的…非常宝贵的经验。我们应该严格按照他的这种经验和从中获得的东西,来设计我们的系统。」dhh-16thread-eval.md 变更清单全单采纳,P1 三件即刻立项:①批量决策视图 ②控制台主形态转任务队列/看板(chat-room 降为议题线程投影) ③跨件架构整体性审查维度;P2 四件(task-plan 接力棒/R18 判断带宽约束/Tailscale 等)。",
+  "relates": [
+    "R18"
+  ],
+  "sources": [
+    "PROGRESS.md:468 (2026-10-08)"
+  ]
+}

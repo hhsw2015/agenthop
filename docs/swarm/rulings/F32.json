@@ -1,0 +1,10 @@
+{
+  "id": "F32",
+  "series": "F",
+  "title": "活 pid 推送永不 settle 整批卡死",
+  "status": "active",
+  "statement": "补充判决(合并 4P1+4P2):B7/P1=活 pid 推送永不 settle 时整批认领无租约卡死(flushing 挡死后续,recoverStaleClaims 只管死 pid),重启晨「认领后推送卡死」的代码级实锤。",
+  "sources": [
+    "PROGRESS.md:152"
+  ]
+}

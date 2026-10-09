@@ -1,0 +1,15 @@
+{
+  "id": "F44",
+  "series": "F",
+  "title": "哨兵降噪:同卡点多封无去重等",
+  "status": "active",
+  "since": "2026-10-09",
+  "statement": "哨兵观察模式首日=三真一假全记账(真停摆 4 死箱 13 件滞留+1 孤儿 presence 守护);F44-⑧=同一卡点 7 封无去重;F44-⑨=ghost 判定的 roster 源须与 roster-snapshot 同源(哨兵读的 roster 面与快照不一致致误报)。",
+  "relates": [
+    "S30"
+  ],
+  "sources": [
+    "PROGRESS.md:591 (2026-10-09)",
+    "PROGRESS.md:806 (2026-10-09)"
+  ]
+}

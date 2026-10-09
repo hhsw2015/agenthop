@@ -1,0 +1,11 @@
+{
+  "id": "R12",
+  "series": "R",
+  "title": "哨兵 escalate-only 降级",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "herdr 无「当前待答提示」结构化信号,文本匹配经两轮审查反复误判,风险非对称(误 Enter=灾难,呈批=慢但安全)。裁:whitelist v1 整体降级,sentinelDecision 恒 escalate;auto-clear 关闭,待 herdr 上游提供结构化待答信号后另行开启(届时新 SHA 过审为门)。",
+  "sources": [
+    "PROGRESS.md:296"
+  ]
+}

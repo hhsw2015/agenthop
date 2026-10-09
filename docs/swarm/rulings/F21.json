@@ -1,0 +1,13 @@
+{
+  "id": "F21",
+  "series": "F",
+  "title": "完成槽 observer 根治消息全丢",
+  "status": "active",
+  "statement": "L2-struct §2c 完成槽独立 observer:目录扫描核对目标摘要,验收同批 close+交棒,F22/F21 根治=消息全丢仍被发现消费。",
+  "relates": [
+    "S11"
+  ],
+  "sources": [
+    "PROGRESS.md:36"
+  ]
+}

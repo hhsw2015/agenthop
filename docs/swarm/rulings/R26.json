@@ -1,0 +1,14 @@
+{
+  "id": "R26",
+  "series": "R",
+  "title": "DB-R7 探针互斥:裁保守解",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "两轮探针被证互斥(回收外部空目录 vs 回收间隙不安全),裁=外部空目录永不回收恒 contended,只收本进程自遗目录(vm-ssh withIdLock 同纪律);矛盾探针按新语义改判。依据=R24 先例+「读不准不动手」总纲。终锤轮。",
+  "relates": [
+    "R24"
+  ],
+  "sources": [
+    "PROGRESS.md:560 (2026-10-09)"
+  ]
+}

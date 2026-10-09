@@ -1,0 +1,11 @@
+{
+  "id": "F43",
+  "series": "F",
+  "title": "user 跑成员终端敲 go 违反自动化原则",
+  "status": "active",
+  "since": "2026-10-09",
+  "statement": "user 点破:根因=user 意志只有一条可信入口(协调者会话),传到成员处必然降级为 peer 转述;harness 防线(正确)挡转述 ⇒ 宪法级变更卡死 ⇒ user 手动。机制修法=给 user 意志建第二条可信入口:控制台通道(user 在网页控制台发言 ⇒ 导管落盘带 user 身份的耐久件)。",
+  "sources": [
+    "PROGRESS.md:433 (2026-10-09)"
+  ]
+}

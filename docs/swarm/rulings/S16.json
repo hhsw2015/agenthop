@@ -1,0 +1,11 @@
+{
+  "id": "S16",
+  "series": "S",
+  "title": "交付产物落档 + 内联",
+  "status": "active",
+  "statement": "交付产物(解释/研究/报告)定点落档;控制台 S16 产物内联(中文名+穿越拦截)。pr-to-video/console v1 均按此落档。",
+  "sources": [
+    "PROGRESS.md:239",
+    "PROGRESS.md:333"
+  ]
+}

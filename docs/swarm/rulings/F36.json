@@ -1,0 +1,13 @@
+{
+  "id": "F36",
+  "series": "F",
+  "title": "出生证补完整 resumeCmd(非裸 --resume)",
+  "status": "active",
+  "statement": "swarm-resume:出生证补完整 resumeCmd(非裸 --resume),schema v1→v2 老快照可读,resumeCmdFor:claude 从 ps arg 还原 permission mode/模型/effort。",
+  "relates": [
+    "F42"
+  ],
+  "sources": [
+    "PROGRESS.md:18"
+  ]
+}

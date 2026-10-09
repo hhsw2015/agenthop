@@ -1,0 +1,15 @@
+{
+  "id": "F40",
+  "series": "F",
+  "title": "codex 线程漂移致死箱投递",
+  "status": "active",
+  "since": "2026-10-09",
+  "statement": "事故:01a0ead5 席位重启(a058b168→a8fa0581),按旧「路由确认」把 v2 送审件投进已死节点的耐久箱,无人认领,审查静默未启,user 发现。根因:codex 重启必换线程 id,稳定身份与 run-id 漂移 ⇒ 稳定寻址根修(F40 stable-inbox)+裁 R15 身份边界。",
+  "relates": [
+    "F46",
+    "R15"
+  ],
+  "sources": [
+    "PROGRESS.md:362 (2026-10-09)"
+  ]
+}

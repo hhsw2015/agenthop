@@ -1,0 +1,14 @@
+{
+  "id": "F46",
+  "series": "F",
+  "title": "送审投错箱(run-id 而非线程 id)",
+  "status": "active",
+  "since": "2026-10-09",
+  "statement": "嫌疑立案(轻):autoscale 送审投到 codex:happycapy-d4a3eb58(run id)的耐久箱,无人读。审查席稳定耐久地址=01a0ff49(线程 id)。已回执更正+补投。run-id 箱≈F40 族地址漂移的新变种。",
+  "relates": [
+    "F40"
+  ],
+  "sources": [
+    "PROGRESS.md:711 (2026-10-09)"
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "id": "S14",
+  "series": "S",
+  "title": "派单全字段契约",
+  "status": "active",
+  "statement": "板准入/派单须带 S14 全字段:字段齐=对方零澄清可做(送审即停,A2 另门);S29 以此为「一单两信」的派单信质量门。",
+  "relates": [
+    "S29"
+  ],
+  "sources": [
+    "PROGRESS.md:268"
+  ]
+}

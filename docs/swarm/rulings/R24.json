@@ -1,0 +1,15 @@
+{
+  "id": "R24",
+  "series": "R",
+  "title": "决策批窗 B:探针不可实现时门槛回到语义",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "作者证明探针两条件因果互斥(创建销毁绑同一 rename);裁=等效验证核销(同故障注入下断言「被替换不提交+有效可恢复」),审查席复核等效性;若真有丢失序列则给序列照修,不许按字面探针回摆。不改 linkSync(保 C 的 EACCES 断言)。",
+  "relates": [
+    "R25",
+    "R26"
+  ],
+  "sources": [
+    "PROGRESS.md:510 (2026-10-08)"
+  ]
+}

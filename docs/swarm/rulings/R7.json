@@ -1,0 +1,16 @@
+{
+  "id": "R7",
+  "series": "R",
+  "title": "换源②③边界:导管 Dot 无大脑",
+  "status": "superseded",
+  "by": "user",
+  "supersededBy": "R10",
+  "statement": "导管 Dot 永不得有自己的大脑(user 原话「他是要和你直接沟通啊」);CPA 能力(research/生图)调用点在协调者,结果回灌聊天流=能力不剥夺(「云功能对接 CPA 而非砍掉」)。单线维持,多 Dot 不解禁。",
+  "rationale": "其「文字直连协调者」条款后由 R10 终定废止(历史语境=前台无脑时代);语音半边先经 R9 修订。",
+  "relates": [
+    "R9"
+  ],
+  "sources": [
+    "PROGRESS.md:267"
+  ]
+}

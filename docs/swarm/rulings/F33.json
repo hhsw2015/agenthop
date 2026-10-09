@@ -1,0 +1,13 @@
+{
+  "id": "F33",
+  "series": "F",
+  "title": "pr-to-video 无账号边界实测",
+  "status": "active",
+  "statement": "pr-to-video 集成:兄弟件装齐(Node≥22 nvm)/无账号边界实测(auth status 原文留档,本地引擎免费离线,不暗扣费为自带设计)/真跑试片 PR#5 出 6s 静默片(零 HeyGen 零付费)/S16 落档。",
+  "relates": [
+    "S16"
+  ],
+  "sources": [
+    "PROGRESS.md:219"
+  ]
+}

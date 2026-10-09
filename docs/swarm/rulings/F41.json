@@ -1,0 +1,15 @@
+{
+  "id": "F41",
+  "series": "F",
+  "title": "成员侧安全拦截造成不可见卡死",
+  "status": "active",
+  "since": "2026-10-09",
+  "statement": "事故:01a0ead5 复验被 codex 自家安全分类器拦截(cybersecurity 提示卡),整单停屏等人点,零感知,presence 仍显 working/unknown,无弹框语义,F40 哨兵也照不到。user 肉眼发现+手动续。定性:空等族第四张面孔。",
+  "relates": [
+    "R23",
+    "F40"
+  ],
+  "sources": [
+    "PROGRESS.md:368 (2026-10-09)"
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "id": "R3",
+  "series": "R",
+  "title": "凭证收窄:--init 非敏感+secret 引用",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "凭证不走普通 workflow input:--init 收窄为非敏感+secret 引用;fixOwner 按此口径修。审查者判决与本裁定完全同向。",
+  "sources": [
+    "PROGRESS.md:213"
+  ]
+}

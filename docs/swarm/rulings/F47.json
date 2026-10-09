@@ -1,0 +1,14 @@
+{
+  "id": "F47",
+  "series": "F",
+  "title": "codex CLI 升级后总线身份失联",
+  "status": "active",
+  "since": "2026-10-09",
+  "statement": "立案:codex CLI 升级后总线身份失联(Work 席 unknown/happycapy 席不在 peers),重启也不自愈。查接入点(升级是否清了钩子/插件注册),修复后 codex 席横幅回归。",
+  "relates": [
+    "F45"
+  ],
+  "sources": [
+    "PROGRESS.md:770 (2026-10-09)"
+  ]
+}

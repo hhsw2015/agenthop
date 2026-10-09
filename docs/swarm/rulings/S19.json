@@ -1,0 +1,13 @@
+{
+  "id": "S19",
+  "series": "S",
+  "title": "审批件经协调者(单线宪法下)",
+  "status": "active",
+  "statement": "卡点哨兵读屏后,白名单外一律组审批件(含读屏摘要)投协调者,user 裁决经 send-keys 回注;白名单外永不代答,三门项仅读屏呈批+回注。",
+  "relates": [
+    "S21"
+  ],
+  "sources": [
+    "PROGRESS.md:277"
+  ]
+}

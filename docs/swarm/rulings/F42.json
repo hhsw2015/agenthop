@@ -1,0 +1,14 @@
+{
+  "id": "F42",
+  "series": "F",
+  "title": "herdr 自动恢复丢启动参数",
+  "status": "active",
+  "since": "2026-10-09",
+  "statement": "现象:herdr 重启后自动恢复 pane 里的 claude,但用裸命令恢复:permission mode 变 auto(非 bypass)、模型回落默认(非 opus-5-5[1m]/effort xhigh)。F36 同族(bare resume 丢参数),肇事者是 herdr 的 session restore。",
+  "relates": [
+    "F36"
+  ],
+  "sources": [
+    "PROGRESS.md:423 (2026-10-09)"
+  ]
+}

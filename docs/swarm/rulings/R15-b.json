@@ -1,0 +1,14 @@
+{
+  "id": "R15-b",
+  "series": "R",
+  "title": "legacyInboxKeys 收紧口径核准",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "只排水「与 self.stableId 共享硬原生(同一会话跨 run=重启)」实体的 run-id 箱;删 run-id 兄弟桥(F1 偷信向量);presence/MCP 分叉场景如实「桥不到」=R15 设计选择非债,哨兵+人工路由兜底。",
+  "relates": [
+    "R15"
+  ],
+  "sources": [
+    "PROGRESS.md:378"
+  ]
+}

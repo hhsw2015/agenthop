@@ -1,0 +1,16 @@
+{
+  "id": "S28-b",
+  "series": "S",
+  "title": "产出规范三件套全员强制(adhd+ste100+stcn100)",
+  "status": "active",
+  "by": "user",
+  "statement": "user 直令:产出规范三件套升为全员强制(非可选):①i-have-adhd=输出形状(答案先行/编号步骤/无前言无复述无客套/列表≤5项),此即 S28「精准」的操作化定义(中文产出同遵其形,规则语言无关);②asd-ste100=英文技术面 strict;③stcn100=中文受控写作标准(ASD-STE100 中文对位),三层执法:写时遵规则(短句/无模糊语/标点/直角引号)、送审前自跑 lint deterministic 清零、审查人/协调者退件附机器报告。宪法句(user,统摄 S26-S29):「我们不是为了沟通而沟通,而是为了高效而沟通。」",
+  "relates": [
+    "S28"
+  ],
+  "sources": [
+    "PROGRESS.md:419",
+    "PROGRESS.md:421",
+    "PROGRESS.md:427"
+  ]
+}

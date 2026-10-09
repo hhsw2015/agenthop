@@ -1,0 +1,13 @@
+{
+  "id": "F24",
+  "series": "F",
+  "title": "bus-reachability 通信根治四机制",
+  "status": "active",
+  "statement": "bus-reachability(user 直令 via fe0376cd):通信根治 4 机制全落 bus core(core.ts/push.ts/inbox.ts=单编辑面):send 耐久兜底/永久重连/sid 寻址/代码级报到。",
+  "relates": [
+    "F30"
+  ],
+  "sources": [
+    "PROGRESS.md:71"
+  ]
+}

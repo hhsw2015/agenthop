@@ -1,0 +1,14 @@
+{
+  "id": "R23",
+  "series": "R",
+  "title": "LS4 双故障边界:裁 A",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "呈批义务一旦形成,投递每 tick 重试,不受 herdr 可达门暂停:收件方是协调者耐久箱(bus 侧),herdr 只是观测来源;选 B(随 herdr 门暂停)会造 F41 式静默窗。残留照计,d7f6c917 修。",
+  "relates": [
+    "F41"
+  ],
+  "sources": [
+    "PROGRESS.md:474 (2026-10-08)"
+  ]
+}

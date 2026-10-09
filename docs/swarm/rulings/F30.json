@@ -1,0 +1,13 @@
+{
+  "id": "F30",
+  "series": "F",
+  "title": "bus-reachability 从根本解决",
+  "status": "active",
+  "statement": "通信根治四件套(user 直令:从根本上解决):send 耐久兜底/永久重连/sid 寻址/代码级报到。F30+协调者聋哑并治。",
+  "relates": [
+    "F24"
+  ],
+  "sources": [
+    "PROGRESS.md:69"
+  ]
+}

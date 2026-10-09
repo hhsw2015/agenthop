@@ -1,0 +1,11 @@
+{
+  "id": "R8",
+  "series": "R",
+  "title": "语音直通路(user 方向)",
+  "status": "active",
+  "by": "user",
+  "statement": "语音 broker 转写后经 herdr agent prompt 直打协调者会话:用户话音以真实用户回合落地(「无身份」在此恰是正确语义:说话者就是 user),流式回答即起,文件通道 10-20s 往返退役。herdr prompt injection 权限=语音 broker(用户的嘴)+运维救援,成员间仍禁。",
+  "sources": [
+    "PROGRESS.md:275"
+  ]
+}

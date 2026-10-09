@@ -1,0 +1,10 @@
+{
+  "id": "F28",
+  "series": "F",
+  "title": "inbox 定向补查(IO/rename/审计)",
+  "status": "active",
+  "statement": "F28 定向补查:依协调者明确验收补 IO/rename/审计;合并 REMAIN 0P1+3P2(S11 字段/可恢复真实隔离审计/隔离覆盖),原防崩链保持通过。",
+  "sources": [
+    "PROGRESS.md:57"
+  ]
+}

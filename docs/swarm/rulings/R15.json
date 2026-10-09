@@ -1,0 +1,15 @@
+{
+  "id": "R15",
+  "series": "R",
+  "title": "F40 自动恢复身份边界:裁 A",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "无明确同一会话证据不跨线程继承(审查人实弹:共享 MCP 同 cwd 切两会话,血缘合并会偷走 A 的私件给 B;错配=静默污染,比死箱更坏);无证据场景停摆走哨兵呈报人工路由,与 R12 宁呈批勿代答同哲学。可信 lineage 来源留后续批。",
+  "relates": [
+    "R15-b",
+    "R12"
+  ],
+  "sources": [
+    "PROGRESS.md:376"
+  ]
+}
