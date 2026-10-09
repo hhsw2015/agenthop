@@ -60,6 +60,7 @@ import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inb
 import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
 import { AlertDedup, alertKey, classifyMemberHealth, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
+import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
@@ -169,6 +170,19 @@ const SENTINEL_IDLE_SEC = envInt(process.env.SWARM_SENTINEL_IDLE_SEC, 1800);
 // Inter-sample block / backoff for a working member's fake-death content sampling (LS1/LS2): bounds the loop so a quirky
 // wait-output can never tight-spin, and sets how often the pane content hash is re-sampled within the fake-death window.
 const SENTINEL_SAMPLE_SEC = envInt(process.env.SWARM_SENTINEL_SAMPLE_SEC, 60);
+
+// T5-5 review-seat autoscale — SUGGESTION MODE ONLY (user ruling 2026-10-08: the flag is half-flipped). When
+// SWARM_REVIEW_AUTOSCALE is on, the sweep reads the durable review-queue ledger, runs the pure planner, and ADVISES the
+// coordinator (a durable-inbox suggestion, taskRef=autoscale-suggest); it NEVER spawns/reclaims a seat. Default OFF
+// (dormant-ahead-of-use, like SWARM_BOARD_ADMIT). The thresholds are TUNABLE (same discipline as the dual-bandwidth gauge):
+// kUp>kDown gives hysteresis; sustainSec debounces a transient spike; minDwellSec throttles how often a suggestion re-fires.
+const SCALE_CFG: ScaleConfig = {
+  kUp: envInt(process.env.SWARM_REVIEW_KUP, 2),
+  kDown: envInt(process.env.SWARM_REVIEW_KDOWN, 1),
+  floor: envInt(process.env.SWARM_REVIEW_FLOOR, 2),
+  sustainSec: envInt(process.env.SWARM_REVIEW_SUSTAIN_SEC, 60),
+  minDwellSec: envInt(process.env.SWARM_REVIEW_MIN_DWELL_SEC, 300),
+};
 
 function log(m: string): void { console.error(`[dispatch ${SELF}] ${m}`); }
 function nowSec(): number { return Math.floor(Date.now() / 1000); }
@@ -1343,6 +1357,34 @@ async function main(): Promise<void> {
     } catch (e) { log(`live sentinel failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
+  // T5-5 review-seat autoscale — SUGGESTION MODE ONLY (user ruling: half-flip). Each sweep, if SWARM_REVIEW_AUTOSCALE is on,
+  // read the durable review-queue ledger, filter phantom depth against presence, run the pure planner, and ADVISE the
+  // coordinator (a durable-inbox suggestion); it NEVER spawns/reclaims a seat (that is the coordinator's call, R16 money gate).
+  // Cross-tick state tracks how long the current want has held (sustain) + when a suggestion last fired (min-dwell throttle).
+  // Fail-soft: the ledger scan + inbox write are isolated and never break the sweep.
+  let autoscaleWant: "up" | "down" | "none" = "none";
+  let autoscaleWantSinceSec = nowSec();
+  let lastAutoscaleSuggestSec = 0;
+  const runReviewAutoscaleSuggest = (): void => {
+    if (!autoscaleEnabled()) return; // SWARM_REVIEW_AUTOSCALE default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT)
+    void (async () => {
+      const records = await readReviewLedger(reviewQueueDir(HOME));
+      if (records.length === 0) { autoscaleWant = "none"; autoscaleWantSinceSec = nowSec(); return; } // empty ledger ⇒ nothing to advise
+      const sessions = listSessions(HOME);
+      const liveOf = (id: string): boolean => resolveSession(id, sessions) !== null; // phantom-depth guard: a dead author/seat does not count
+      const liveAuthors = new Set(records.map((r) => r.author).filter((a) => a !== "" && liveOf(a)));
+      const liveSeats = new Set(records.map((r) => r.seat).filter((s) => liveOf(s)));
+      const seats = buildSeatStatesFromLedger(records, liveSeats, SCALE_CFG, nowSec());
+      // Track the raw want's continuity across ticks (reset on flip), feeding the planner's sustain gate.
+      const want = instantaneousWant(queueDepth(filterLiveRecords(records, liveAuthors, liveSeats)), seats, SCALE_CFG);
+      if (want !== autoscaleWant) { autoscaleWant = want; autoscaleWantSinceSec = nowSec(); }
+      const sustainedSec = nowSec() - autoscaleWantSinceSec;
+      const sinceLastActionSec = nowSec() - lastAutoscaleSuggestSec; // no seats move; min-dwell just throttles re-suggesting
+      const sug = planAutoscaleSuggestion({ records, liveAuthors, liveSeats, seats, cfg: SCALE_CFG, sinceLastActionSec, sustainedSec });
+      if (sug && notifyCoordinator(sug.text, { taskRef: "autoscale-suggest", title: "autoscale" }) !== "failed") lastAutoscaleSuggestSec = nowSec();
+    })().catch((e) => log(`review-autoscale suggest failed (isolated): ${e instanceof Error ? e.message : e}`));
+  };
+
   await runDispatchLoops({
     // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
     // dispatches). T1.5 RED LINE (fe0376cd): --task dispatch stays off (SWARM_TASK_EXEC) until the resume adapter +
@@ -1383,6 +1425,9 @@ async function main(): Promise<void> {
       // S14: live member sentinel — herdr-identified blocked/fake-death/idle-timeout ⇒ escalate (blocked ⇒ S19 approval). Gated
       // on SWARM_SENTINEL + herdr reachability; dormant otherwise.
       await runLiveSentinel();
+      // T5-5: review-seat autoscale SUGGESTION (never acts) — read the review-queue ledger, advise the coordinator on seat
+      // scaling. Gated on SWARM_REVIEW_AUTOSCALE (default OFF); fully fail-soft.
+      runReviewAutoscaleSuggest();
     },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     passIntervalMs: 5000,

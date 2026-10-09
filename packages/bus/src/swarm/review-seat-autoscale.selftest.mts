@@ -4,6 +4,9 @@ import {
   canRouteToSeat,
   selectSeatToReclaim,
   scaleDecision,
+  planAutoscaleSuggestion,
+  instantaneousWant,
+  buildSeatStatesFromLedger,
   buildReviewSeatBirthCert,
   parseReviewFileName,
   isValidReviewId,
@@ -97,5 +100,37 @@ for (const [tk, st2] of [["remote-herdr-view", "codex-work"], ["t5-5", "happycap
 }
 t("T55-P2-3: seat 'done' open file not misread as done-marker", parseReviewFileName("x.done.json") === null);
 t("T55-P2-3: dotted ticket rejected (no mis-split)", parseReviewFileName("a.b.c.json") === null);
+
+// --- instantaneousWant: the raw want before the sustain/dwell gates (for cross-tick sustain tracking) ---
+t("instantaneousWant up (deep)", instantaneousWant({ totalOpen: 5, perSeat: {} }, twoSeats, CFG) === "up");
+t("instantaneousWant none (in band)", instantaneousWant({ totalOpen: 4, perSeat: {} }, twoSeats, CFG) === "none");
+t("instantaneousWant down (drained, >floor)", instantaneousWant({ totalOpen: 1, perSeat: {} }, threeSeats, CFG) === "down");
+t("instantaneousWant none at floor (never down below floor)", instantaneousWant({ totalOpen: 0, perSeat: {} }, twoSeats, CFG) === "none");
+t("instantaneousWant none below floor (roster restores)", instantaneousWant({ totalOpen: 99, perSeat: {} }, [seat("s1", { floor: true })], CFG) === "none");
+
+// --- buildSeatStatesFromLedger: derive SeatState[] for suggestion mode from ledger + presence ---
+const bl = buildSeatStatesFromLedger([rec("a", "s1", "x"), rec("b", "s1", "x"), rec("c", "s2", "x"), rec("d", "s2", "x", true)], new Set(["s1", "s2"]), CFG, 1000);
+const bS1 = bl.find((s) => s.seat === "s1")!, bS2 = bl.find((s) => s.seat === "s2")!;
+t("buildSeatStates: inFlight = open records per seat", bS1.inFlight === 2 && bS2.inFlight === 1);
+t("buildSeatStates: completedReviews = done records per seat", bS2.completedReviews === 1 && bS1.completedReviews === 0);
+t("buildSeatStates: live from presence set", bS1.live === true && bS2.live === true);
+t("buildSeatStates: idle = inFlight===0 (ledger proxy)", bS1.idle === false && buildSeatStatesFromLedger([rec("d", "s2", "x", true)], new Set(["s2"]), CFG, 1000)[0]!.idle === true);
+t("buildSeatStates: a ledger seat NOT in presence is not live", buildSeatStatesFromLedger([rec("a", "dead", "x")], new Set<string>(), CFG, 1000)[0]!.live === false);
+t("buildSeatStates: floor marks the cfg.floor most-senior LIVE seats", (() => { const r = buildSeatStatesFromLedger([{ ...rec("a", "old", "x"), sentSec: 5 }, { ...rec("b", "new", "x"), sentSec: 50 }, { ...rec("c", "newest", "x"), sentSec: 99 }], new Set(["old", "new", "newest"]), CFG, 1000); return r.find((s) => s.seat === "old")!.floor && r.find((s) => s.seat === "new")!.floor && !r.find((s) => s.seat === "newest")!.floor; })());
+t("buildSeatStates: prototype-key seat names are plain keys (Map-based)", (() => { const r = buildSeatStatesFromLedger([rec("a", "toString", "x"), rec("b", "__proto__", "x")], new Set(["toString", "__proto__"]), CFG, 1000); return r.length === 2 && r.every((s) => s.inFlight === 1); })());
+
+// --- planAutoscaleSuggestion: suggestion mode (compose filter→depth→scaleDecision→render; NEVER acts) ---
+const upRecs = [rec("t1", "s1", "alice"), rec("t2", "s1", "alice"), rec("t3", "s2", "alice"), rec("t4", "s2", "alice"), rec("t5", "s1", "alice")]; // 5 live open
+const upSug = planAutoscaleSuggestion({ records: upRecs, liveAuthors: new Set(["alice"]), liveSeats: new Set(["s1", "s2"]), seats: twoSeats, cfg: CFG, sinceLastActionSec: 999, sustainedSec: 60 });
+t("suggest scale-up: non-null, action scale-up, text advises spawning", upSug !== null && upSug.action.action === "scale-up" && upSug.text.includes("SUGGEST spawning"));
+const holdSug = planAutoscaleSuggestion({ records: [rec("t1", "s1", "alice"), rec("t2", "s2", "alice")], liveAuthors: new Set(["alice"]), liveSeats: new Set(["s1", "s2"]), seats: twoSeats, cfg: CFG, sinceLastActionSec: 999, sustainedSec: 999 });
+t("suggest hold -> null (nothing to advise)", holdSug === null);
+// phantom-depth guard feeds the suggestion: 5 records but 3 by a dead author ⇒ only 2 live ⇒ in band ⇒ no needless suggestion
+const phantomSug = planAutoscaleSuggestion({ records: [rec("t1", "s1", "alice"), rec("t2", "s2", "alice"), rec("g1", "s1", "ghost"), rec("g2", "s1", "ghost"), rec("g3", "s2", "ghost")], liveAuthors: new Set(["alice"]), liveSeats: new Set(["s1", "s2"]), seats: twoSeats, cfg: CFG, sinceLastActionSec: 999, sustainedSec: 60 });
+t("suggest: a dead-author phantom depth does NOT trigger a scale-up suggestion", phantomSug === null);
+const downSug = planAutoscaleSuggestion({ records: [rec("t1", "s1", "alice")], liveAuthors: new Set(["alice"]), liveSeats: new Set(["s1", "s2", "s3"]), seats: threeSeats, cfg: CFG, sinceLastActionSec: 999, sustainedSec: 60 });
+t("suggest scale-down: non-null, names the eligible idle seat", downSug !== null && downSug.action.action === "scale-down" && downSug.text.includes('reclaiming idle seat "s3"'));
+// not sustained ⇒ scaleDecision holds ⇒ no suggestion (debounce still governs advice, just not seats)
+t("suggest: an un-sustained spike yields no suggestion (debounce)", planAutoscaleSuggestion({ records: upRecs, liveAuthors: new Set(["alice"]), liveSeats: new Set(["s1", "s2"]), seats: twoSeats, cfg: CFG, sinceLastActionSec: 999, sustainedSec: 10 }) === null);
 
 console.log("all review-seat-autoscale selftests passed");
