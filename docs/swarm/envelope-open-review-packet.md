@@ -1,6 +1,10 @@
-# Review packet — envelope-open side (§2b OPEN, an R14 pre-flight, dual to BA9), ROUND 3
+# Review packet — envelope-open side (§2b OPEN, an R14 pre-flight, dual to BA9), ROUND 4
 
-- **Branch** `feat/envelope-open`  **HEAD** `df83be7`  **Base** `main` (`3732f4b`)  (round-1 `a39d129`, round-2 `db43600`)
+- **Branch** `feat/envelope-open`  **HEAD** `0284f6f`  **Base** `main` (`3732f4b`)  (round-1 `a39d129`, round-2 `db43600`, round-3 `df83be7`)
+
+## Round 4 — round-3 REMAIN resolved (EO2; the op-conflict freeze branch)
+- EO2 (P2) round-3 recovered by `wait.state` alone, but a FREEZE (op-conflict) lives in `LogState.frozen`, separate from state — a frozen production wait can still read `state: "open"`, so a conflicting commit that froze the wait was still re-declared as an active OPEN (production envelope persisted + OPEN receipt). `openGrantEnvelope` now checks `st.frozen.includes(\`wait:<id>\`)` FIRST: a frozen production is BLOCKED (not concluded), so it returns `deferred` — retain the claim + recovery obligation, declare no OPEN, persist nothing over the conflict, re-evaluate once the freeze is lifted. A resolved/concluded wait stays `settled` (terminal — the grant stands, no re-open); the two outcomes are now distinct.
+- Gates: bus tsc 0, scripts tsc 0, bus vitest 1132/1132 (board-envelope test 8 — pure `planGrantEnvelope` unchanged; EO2 freeze branch is driver-IO).
 
 ## Round 3 — round-2 REMAIN resolved (EO2/EO3; the two consistency edges)
 - EO2 (P2) a production wait already RESOLVED/frozen in CONTROL (produced / cancelled / revoked) was still re-declared as an active OPEN — the registry persisted a production-phase envelope and the receipt announced OPEN, contradicting CONTROL's two durable faces. `openGrantEnvelope` now reads the wait by the REGISTERED envelope's `productionWaitId` (not a re-derived formula) and recovers by its ACTUAL lifecycle: a non-live wait (not `open`/`action_pending`) returns `settled` (the grant stands, NO OPEN receipt, nothing persisted over it); the production-wait is committed ONLY when ABSENT; a live existing wait is adopted as-is (its deadline + close reason untouched, never re-committed).
