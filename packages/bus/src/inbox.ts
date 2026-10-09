@@ -12,8 +12,9 @@
 import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
+import { isSubmitIntent, type SubmitIntent } from "./submit-intent.js";
 
-export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: string; ts: number; actionId?: string; taskRef?: string; title?: string };
+export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: string; ts: number; actionId?: string; taskRef?: string; title?: string; intent?: SubmitIntent };
 export type Claimed = { file: string; msg: InboxMsg };
 
 /** Validate a parsed inbox record against the transport schema (F28 poison-pill defense). from/fromLabel/text are REQUIRED
@@ -35,12 +36,14 @@ export function validInboxMsg(raw: unknown): InboxMsg | null {
   // validator rebuild was silently losing them). A present-but-mistyped one is rejected like the other optionals.
   if (r.taskRef !== undefined && typeof r.taskRef !== "string") return null;
   if (r.title !== undefined && typeof r.title !== "string") return null;
+  if (r.intent !== undefined && !isSubmitIntent(r.intent)) return null; // submit-tag: a present intent must be a known value
   return {
     from: r.from, fromLabel: r.fromLabel, text: r.text, via: r.via, ts: r.ts,
     ...(typeof r.fromMode === "string" ? { fromMode: r.fromMode } : {}),
     ...(typeof r.actionId === "string" ? { actionId: r.actionId } : {}),
     ...(typeof r.taskRef === "string" ? { taskRef: r.taskRef } : {}),
     ...(typeof r.title === "string" ? { title: r.title } : {}),
+    ...(isSubmitIntent(r.intent) ? { intent: r.intent } : {}),
   };
 }
 
@@ -49,7 +52,7 @@ export function validInboxMsg(raw: unknown): InboxMsg | null {
  *  via label ("durable-inbox") when omitted, keeps only known fields, and re-validates — throwing on anything the receiver
  *  would quarantine. S11 docs point here instead of hand-writing JSON. */
 export function composeInboxMsg(i: {
-  from: string; fromLabel: string; text: string; via?: string; ts?: number; fromMode?: string; actionId?: string; taskRef?: string; title?: string;
+  from: string; fromLabel: string; text: string; via?: string; ts?: number; fromMode?: string; actionId?: string; taskRef?: string; title?: string; intent?: SubmitIntent;
 }): InboxMsg {
   const msg: InboxMsg = {
     from: i.from, fromLabel: i.fromLabel, text: i.text,
@@ -59,6 +62,7 @@ export function composeInboxMsg(i: {
     ...(i.actionId !== undefined ? { actionId: i.actionId } : {}),
     ...(i.taskRef !== undefined ? { taskRef: i.taskRef } : {}),
     ...(i.title !== undefined ? { title: i.title } : {}),
+    ...(i.intent !== undefined ? { intent: i.intent } : {}),
   };
   const valid = validInboxMsg(msg);
   if (valid === null) throw new Error("composeInboxMsg: produced an invalid inbox message (from/fromLabel/text must be strings, via a non-empty string, ts finite)");

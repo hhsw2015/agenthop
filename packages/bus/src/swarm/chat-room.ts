@@ -16,6 +16,8 @@
  * unit-tested without a disk or a broker. The IO half (append/read/fan-out) lives in chat-room-store.ts.
  */
 
+import { isSubmitIntent, type SubmitIntent } from "../submit-intent.js";
+
 export type RoomState = "open" | "closed";
 
 /** Room metadata: the roster + lifecycle. `owner` is the single writer that assigns `seq` (the sequencer). `roster` are the
@@ -31,10 +33,10 @@ export type RoomMeta = {
 
 /** One ordered post in a room's append-only log. `seq` is the per-room monotonic sequence assigned by the owner at append
  *  time; `from`/`fromLabel` reuse the bus-delivered envelope shape so a fan-out copy maps 1:1 to a durable inbox message. */
-export type RoomPost = { seq: number; from: string; fromLabel: string; text: string; ts: number };
+export type RoomPost = { seq: number; from: string; fromLabel: string; text: string; ts: number; intent?: SubmitIntent };
 
 /** A post as handed in before the owner assigns a seq (the input to appendPost). */
-export type RoomPostDraft = { from: string; fromLabel: string; text: string; ts?: number };
+export type RoomPostDraft = { from: string; fromLabel: string; text: string; ts?: number; intent?: SubmitIntent };
 
 const isNonEmptyStr = (v: unknown): v is string => typeof v === "string" && v.length > 0;
 
@@ -48,7 +50,8 @@ export function validRoomPost(raw: unknown): RoomPost | null {
   if (typeof r.seq !== "number" || !Number.isInteger(r.seq) || r.seq <= 0) return null;
   if (!isNonEmptyStr(r.from) || !isNonEmptyStr(r.fromLabel) || typeof r.text !== "string") return null;
   if (typeof r.ts !== "number" || !Number.isFinite(r.ts)) return null;
-  return { seq: r.seq, from: r.from, fromLabel: r.fromLabel, text: r.text, ts: r.ts };
+  if (r.intent !== undefined && !isSubmitIntent(r.intent)) return null; // submit-tag: a present intent must be a known value
+  return { seq: r.seq, from: r.from, fromLabel: r.fromLabel, text: r.text, ts: r.ts, ...(isSubmitIntent(r.intent) ? { intent: r.intent } : {}) };
 }
 
 /** Validate parsed room metadata. roomId/topic/owner non-empty strings, roster a string[] (deduped on read), state a known
@@ -100,7 +103,7 @@ export function maxSeq(posts: RoomPost[]): number {
  *  MILLISECONDS (matching the inbox envelope + the frozen contract), so the default CONVERTS `nowSec * 1000`. An explicit
  *  `draft.ts` is already ms and is kept verbatim. */
 export function stampPost(draft: RoomPostDraft, lastSeq: number, nowSec: number): RoomPost {
-  return { seq: lastSeq + 1, from: draft.from, fromLabel: draft.fromLabel, text: draft.text, ts: draft.ts ?? nowSec * 1000 };
+  return { seq: lastSeq + 1, from: draft.from, fromLabel: draft.fromLabel, text: draft.text, ts: draft.ts ?? nowSec * 1000, ...(draft.intent !== undefined ? { intent: draft.intent } : {}) };
 }
 
 /** The incremental read the console tail uses: posts with seq STRICTLY greater than `sinceSeq`, in seq order. `sinceSeq=0`
