@@ -143,7 +143,7 @@ function acquireLease(home: string, cap: number, label: string): string | null {
   try {
     for (const f of readdirSync(dir)) {
       if (!f.endsWith(".lease")) continue;
-      const rec = readJsonOrNull(path.join(dir, f)) as { pid?: number; childPid?: number; zoneId?: string; rcPath?: string } | null;
+      const rec = readJsonOrNull(path.join(dir, f)) as { pid?: number; childPid?: number; zoneId?: string; rcPath?: string; launched?: boolean } | null;
       // FN9: a lease binds the ACTUAL execution — a slot frees ONLY on POSITIVE terminal evidence (leaseOccupied, pure),
       // never on driver death nor on the ABSENCE of a cleanup todo. headless -> the child's death; visible -> THIS launch's
       // rc sidecar exists (the command exited). An explicit close removes the lease out-of-band.
@@ -185,6 +185,16 @@ function bindLeaseChild(file: string | null, childPid: number): boolean {
   if (!file) return false;
   const rec = readJsonOrNull(file) as Record<string, unknown> | null;
   return rec !== null && writeJsonAtomic(file, { ...rec, childPid });
+}
+// FN9: durably mark a lease as a STARTED execution BEFORE spawning — the write-fail fallback for the post-spawn childPid
+// bind. Even if bindLeaseChild later fails (childPid unwritable), this `launched` flag is already on disk, so acquireLease
+// (in any driver) distinguishes a started HOLD from an un-executed reservation and never reaps it on driver death. Written
+// while the lease is still writable (right after acquire); if THIS write fails the caller must NOT spawn (no durable
+// obligation can be recorded). Returns whether the mark is durable.
+function markLeaseLaunched(file: string | null): boolean {
+  if (!file) return false;
+  const rec = readJsonOrNull(file) as Record<string, unknown> | null;
+  return rec !== null && writeJsonAtomic(file, { ...rec, launched: true });
 }
 // FN9: bind a VISIBLE lease to its ZONE + THIS launch's rc sidecar path, so its capacity obligation survives the driver's
 // exit — acquireLease holds the slot until the rc proves the command EXITED (positive terminal evidence), never on driver
@@ -315,6 +325,11 @@ export async function runFanout(req: FanoutRequest, env: NodeJS.ProcessEnv = pro
         l.row.startedAt = Date.now();
         const model = tierModel(effectiveTier(unitOfRow(req, l.row)), env);
         if (mode === "headless") {
+          // FN9: durably commit "a started execution owns this slot" BEFORE spawning. childPid is only known AFTER spawn, so
+          // if its post-spawn bind fails this `launched` flag is the durable responsibility that keeps the slot HELD across
+          // driver exit (never reaped as a bare reservation). If this durable commit itself fails, do NOT spawn — the
+          // obligation cannot be recorded, so release the reservation + fail the unit (nothing is launched to leak).
+          if (!markLeaseLaunched(lease)) { releaseLease(lease); l.lease = null; l.row.status = "failed"; l.row.endedAt = Date.now(); launchedAll.push(l); continue; }
           const r = await spawnAgent({ tool: "claude", task: promptOfRow(req, l.row), visible: false, ...(cwdOfRow(req, l.row) ? { cwd: cwdOfRow(req, l.row)! } : {}) }, { ...env, ANTHROPIC_MODEL: model, FANOUT_DEPTH: String(depth + 1) });
           l.row.spawnOk = r.ok;
           if (r.launchId !== undefined) l.row.id = r.launchId;

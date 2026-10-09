@@ -214,8 +214,12 @@ const okReq = () => ({ runKey: "r1", units: [unit("u1"), unit("u2", "judge")], m
   t("visible: no rc + driver ALIVE -> occupied", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: true, rcPresent: false })) === true);
   t("visible: THIS execution's rc present -> free (positive terminal evidence)", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: false, rcPresent: true })) === false);
   t("visible: rc absence is NOT 'closed' (a missing/unwritable todo cannot free the slot)", leaseOccupied({ zoneId: "z", pid: 1 }, P({ driverAlive: false, rcPresent: false })) === true);
-  t("unbound (no child/zone): held while driver lives", leaseOccupied({ pid: 1 }, P({ driverAlive: true })) === true);
-  t("unbound: driver dead -> free", leaseOccupied({ pid: 1 }, P({ driverAlive: false })) === false);
+  t("unbound reservation: held while driver lives", leaseOccupied({ pid: 1 }, P({ driverAlive: true })) === true);
+  t("unbound reservation: driver dead -> free", leaseOccupied({ pid: 1 }, P({ driverAlive: false })) === false);
+  // FN9 cross-driver: a `launched` HOLD (childPid write failed) is NOT a reservation — never reaped on driver death.
+  t("launched HOLD (no childPid): driver dead -> STILL occupied (the r12 fix: started-HOLD survives driver exit)", leaseOccupied({ pid: 1, launched: true }, P({ driverAlive: false })) === true);
+  t("launched HOLD: driver alive -> occupied", leaseOccupied({ pid: 1, launched: true }, P({ driverAlive: true })) === true);
+  t("launched + childPid bound: the precise child check wins over the launched flag (dead child -> free)", leaseOccupied({ pid: 1, launched: true, childPid: 9 }, P({ childAlive: false, driverAlive: true })) === false);
 }
 
 // --- FN9: rowReleasable — the ONE settle/cleanup release rule; a HELD (failed-but-running) row is NEVER reaped ---

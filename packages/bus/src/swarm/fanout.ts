@@ -343,11 +343,15 @@ export function validSpent(s: unknown): boolean {
 // state are irrelevant. An explicit CLOSE fact frees it out-of-band by removing the lease (settleUnit / the run's outer
 // finally on a confirmed close / a future zone-reaper), so acquireLease only ever auto-reaps on the rc fact. Neither bound
 // yet -> while the driver lives.
-export function leaseOccupied(rec: { pid?: number; childPid?: number; zoneId?: string } | null, probe: { childAlive: boolean; driverAlive: boolean; rcPresent: boolean }): boolean {
+export function leaseOccupied(rec: { pid?: number; childPid?: number; zoneId?: string; launched?: boolean } | null, probe: { childAlive: boolean; driverAlive: boolean; rcPresent: boolean }): boolean {
   if (rec === null) return false;
-  if (rec.childPid !== undefined) return probe.childAlive;
+  if (rec.childPid !== undefined) return probe.childAlive; // headless with a bound handle: verify the CHILD by pid (survives the driver)
   if (rec.zoneId !== undefined) return !probe.rcPresent; // visible: held until THIS execution's rc; driver death / todo absence NEVER release it
-  return probe.driverAlive;
+  // FN9: a `launched` lease with NO precise handle is a STARTED HOLD whose childPid/zoneId write FAILED. It is NOT an
+  // un-executed reservation and must NOT be reaped on driver death — there is no terminal handle to verify, so hold it
+  // (positive terminal evidence only; a conservative leak beats over-admitting against a maybe-live child).
+  if (rec.launched) return true;
+  return probe.driverAlive; // un-executed reservation: held only while the driver that reserved it lives
 }
 
 // FN9: is a settled row's slot RELEASABLE (confirmed terminal)? The ONE rule every settle/cleanup entry shares (settleUnit
