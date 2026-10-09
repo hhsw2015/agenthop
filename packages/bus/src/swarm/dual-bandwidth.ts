@@ -45,16 +45,21 @@ export type DualBandwidthReading = {
   bConsTotal: number;         // cumulative consume events this session
   ratio: number | null;       // bProd1h / bCons1h; null when bCons1h === 0 (undefined)
   backlog: number;            // D — current undecided count
-  dBacklogDtPerHour: number;  // net backlog growth rate = bProd1h - bCons1h (dD/dt)
+  dBacklogDtPerHour: number;  // net backlog growth rate (dD/dt), in DECISION-ITEM units/hour — consume-consistent (B6-2), NOT bProd1h-bCons1h when B_prod is submission-unit
   tDrainHours: number | null; // backlog / bCons1h; 0 when backlog === 0; null when bCons1h === 0 and backlog > 0 (never drains)
   zone: BwZone;
 };
 
 export type DualBandwidthInput = {
   nowSec: number;
-  produceAtSec: readonly number[]; // timestamps (sec) of items that needed a human verdict (decision-batch opens + 呈批/签收/并库/立项)
+  produceAtSec: readonly number[]; // timestamps (sec) of items that needed a human verdict — the B_prod gauge stream. May be in
+                                   // SUBMISSION units (submit-tag folds N submits into one decision item, B_prod=N, a ruled contract).
   consumeAtSec: readonly number[]; // timestamps (sec) of REAL decisions cleared (consume verdicts + 呈批 verdicts) — NO chat sign-offs
-  backlog: number;                 // D — current undecided count (from the IO layer)
+  backlog: number;                 // D — current undecided count (from the IO layer), in DECISION-ITEM units
+  // B6-2: the produce stream for the backlog DERIVATIVE, in the SAME DECISION-ITEM unit as consume+backlog (one event per batch
+  // item at open). Separate from produceAtSec so dD/dt never subtracts submission-unit produce from item-unit consume (a folded
+  // batch would otherwise report a phantom backlogGrowth). Defaults to produceAtSec when absent (B_prod is already item-unit then).
+  backlogProduceAtSec?: readonly number[];
   config?: DualBandwidthConfig;
 };
 
@@ -115,7 +120,10 @@ export function computeDualBandwidth(input: DualBandwidthInput): DualBandwidthRe
   const backlog = input.backlog;
 
   const ratio = consuming ? bProd1h / bCons1h : null;
-  const dBacklogDtPerHour = bProd1h - bCons1h;
+  // B6-2: dD/dt is produce-minus-consume in DECISION-ITEM units — use the item-unit backlog produce stream (falls back to
+  // produceAtSec when B_prod is already item-unit), so a folded submit batch (B_prod=N submissions) never fabricates growth.
+  const bProdBacklog1h = rateInWindow(input.backlogProduceAtSec ?? input.produceAtSec, input.nowSec, cfg.windowSec, upperSec);
+  const dBacklogDtPerHour = bProdBacklog1h - bCons1h;
   const tDrainHours = backlog === 0 ? 0 : consuming ? backlog / bCons1h : null; // null ⇒ never drains (no consumption)
 
   // Zone, precedence RED > AMBER > GREEN.

@@ -33,7 +33,11 @@ Code: `packages/bus/src/swarm/dual-bandwidth.ts` (pure core) + `dual-bandwidth-s
 
 - `ratio = B_prod / B_cons` (null when B_cons = 0 in the window — undefined, never a non-serializable Infinity).
 - `backlog D` = undecided items of every not-yet-consumed batch (derived READ-ONLY; the gauge never calls the mutating consume).
-- `backlogGrowthPerHour = B_prod - B_cons` (dD/dt). `drainHours = D / B_cons` (0 when D = 0; null when B_cons = 0 and D > 0 — never drains).
+- `backlogGrowthPerHour` (dD/dt) is in **decision-item units/hour**, consume/backlog-consistent: `itemProduceRate − B_cons`, where
+  `itemProduceRate` counts ONE produce event per decision-batch item at open — NOT `B_prod − B_cons`. When submit-tag folds N
+  submissions into one item, `B_prod` is submission-unit (B_prod=N, a ruled contract) while backlog/consume are item-unit; so the
+  derivative MUST use the item-unit produce stream or it reports phantom growth (B6-2: 5 folded submits, all approved, D 0→1→0 would
+  wrongly read `backlogGrowthPerHour=4`). `drainHours = D / B_cons` (0 when D = 0; null when B_cons = 0 and D > 0 — never drains).
 - **Zone** (precedence RED > AMBER > GREEN; thresholds are TUNABLE constants, ruling (2), recalibrate after a week):
   - **GREEN**: ratio ≤ 0.8 and backlog below soft cap and not rising → carry on.
   - **AMBER**: ratio ∈ (0.8, 1.2] or backlog rising or backlog ≥ soft cap → coordinator COMPRESSES harder (bigger batches, defer
@@ -70,10 +74,12 @@ severity in those cases.
 
 ## API
 
-- pure `computeDualBandwidth({ nowSec, produceAtSec, consumeAtSec, backlog, config? }) → reading` (no fs/clock beyond `nowSec`;
-  validates config loudly). Rate normalized to per-hour over `windowSec`.
-- IO `collectBandwidthEvents(home) → { produceAtSec, consumeAtSec, backlog }` (read-only scan of decision-batch dirs; ENOENT =
-  absent, other read errors THROW; a corrupt/foreign per-batch file is skipped, never fatal).
+- pure `computeDualBandwidth({ nowSec, produceAtSec, consumeAtSec, backlog, backlogProduceAtSec?, config? }) → reading` (no fs/clock
+  beyond `nowSec`; validates config loudly). Rate normalized to per-hour over `windowSec`. `backlogProduceAtSec` (item-unit produce
+  for dD/dt) defaults to `produceAtSec` when absent — identical behavior when B_prod is already item-unit (submit-tag OFF).
+- IO `collectBandwidthEvents(home) → { produceAtSec, consumeAtSec, backlog, backlogProduceAtSec }` (read-only scan of decision-batch
+  dirs; ENOENT = absent, other read errors THROW; a corrupt/foreign per-batch file is skipped, never fatal). `backlogProduceAtSec` is
+  always one event per batch item at open (item-unit), even when `produceAtSec` folds to submission-unit under submit-tag.
 - IO `computeGauge(home, nowSec, config?) → reading`.
 - IO `writeBandwidthProjection(home, nowSec, config?) → reading` (computes + atomically writes the projection).
 - IO `readBandwidthProjection(home) → projection|null` (console/tests). Validates STRUCTURE + NUMERICS, not just the schema string

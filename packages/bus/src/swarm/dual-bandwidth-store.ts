@@ -46,7 +46,7 @@ function readJsonOrNull(file: string): unknown {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
-export type BandwidthEvents = { produceAtSec: number[]; consumeAtSec: number[]; backlog: number };
+export type BandwidthEvents = { produceAtSec: number[]; consumeAtSec: number[]; backlog: number; backlogProduceAtSec: number[] };
 
 /** STRICT enumeration of batch ids (T52-P2-1): unlike the lenient listBatches, an access fault (EACCES) on the batches dir or a
  *  sub-dir's batch.json PROPAGATES — it is never folded to "no batches", which would overwrite a RED projection with a false
@@ -125,12 +125,16 @@ function scanSubmits(home: string): { digest: string; atSec: number }[] {
 export function collectBandwidthEvents(home: string): BandwidthEvents {
   const produceAtSec: number[] = [];
   const consumeAtSec: number[] = [];
+  // B6-2: the produce stream for dD/dt, ALWAYS in DECISION-ITEM units (one event per batch item at open) regardless of
+  // SWARM_SUBMIT_TAG — so the backlog derivative stays consume/backlog-consistent even when produceAtSec is submission-unit.
+  const backlogProduceAtSec: number[] = [];
   let backlog = 0;
   const submitTag = submitTagEnabled();
   const batchItemsForMerge: { digest: string; createdAtSec: number; foldedFrom: readonly string[] }[] = [];
   for (const id of listBatchIdsStrict(home)) {
     const batch = readBatch(home, id); // dir-bound; a foreign/garbled batch.json reads as null (throws on an access fault)
     if (!batch) continue;
+    for (let i = 0; i < batch.items.length; i += 1) backlogProduceAtSec.push(batch.createdAtSec); // item-unit, for dD/dt (B6-2)
     if (submitTag) {
       // defer produce to the merge (de-dup): a per-item stable digest (never collides with a submitDigest — different key shape).
       for (const it of batch.items) batchItemsForMerge.push({ digest: digestOf({ batchId: id, itemId: it.id }), createdAtSec: batch.createdAtSec, foldedFrom: it.foldedFrom ?? [] });
@@ -163,13 +167,13 @@ export function collectBandwidthEvents(home: string): BandwidthEvents {
     const merged = mergeProduceEvents({ batchItems: batchItemsForMerge, submits: scanSubmits(home) });
     for (const atSec of merged) produceAtSec.push(atSec);
   }
-  return { produceAtSec, consumeAtSec, backlog };
+  return { produceAtSec, consumeAtSec, backlog, backlogProduceAtSec };
 }
 
 /** Compute the current gauge reading from on-disk decision-batch state. Deterministic in `nowSec`. */
 export function computeGauge(home: string, nowSec: number, config?: DualBandwidthConfig): DualBandwidthReading {
-  const { produceAtSec, consumeAtSec, backlog } = collectBandwidthEvents(home);
-  return computeDualBandwidth({ nowSec, produceAtSec, consumeAtSec, backlog, config });
+  const { produceAtSec, consumeAtSec, backlog, backlogProduceAtSec } = collectBandwidthEvents(home);
+  return computeDualBandwidth({ nowSec, produceAtSec, consumeAtSec, backlog, backlogProduceAtSec, config });
 }
 
 /** The frozen projection schema the console reads (viz frozen-read-contract pattern). Null ratio/drainHours = undefined (no
