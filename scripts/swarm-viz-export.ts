@@ -417,20 +417,24 @@ export function foldFlows(entries: MsgLogEntry[], limit = 60): VizFlow[] {
 }
 
 /**
- * Parse `git worktree list --porcelain` into floors. Pure (selftest-covered). Blocks are separated by a
- * blank line; each has a `worktree <path>` line, a `HEAD <sha>` line, and either `branch refs/heads/<name>`
- * or `detached`, and `bare` for the bare repo. A block with no `worktree` line is skipped.
+ * Parse `git worktree list --porcelain -z` into floors. Pure (selftest-covered). With `-z` every attribute
+ * line is NUL-terminated and the blank line between records becomes a second NUL, so records are
+ * "\0\0"-separated and each attribute is "\0"-separated. NUL is the ONLY delimiter — the `worktree <path>`
+ * value is kept BYTE-FOR-BYTE (never split on or trimmed), so a worktree dir that legally contains a
+ * newline or a trailing space survives (CC-P2-5). Each record has a `worktree <path>` line, a `HEAD <sha>`
+ * line, and either `branch refs/heads/<name>` or `detached`, and `bare` for the bare repo. A record with no
+ * `worktree` line is skipped.
  */
 export function parseWorktreePorcelain(raw: string): VizWorktree[] {
   const out: VizWorktree[] = [];
-  for (const block of raw.split(/\n\s*\n/)) {
+  for (const block of raw.split("\0\0")) {
     let wtPath = "", branch = "", head = "", detached = false, bare = false;
-    for (const line of block.split("\n")) {
-      if (line.startsWith("worktree ")) wtPath = line.slice("worktree ".length).trim();
-      else if (line.startsWith("HEAD ")) head = line.slice("HEAD ".length).trim().slice(0, 8);
-      else if (line.startsWith("branch ")) branch = line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
-      else if (line.trim() === "detached") detached = true;
-      else if (line.trim() === "bare") bare = true;
+    for (const line of block.split("\0")) {
+      if (line.startsWith("worktree ")) wtPath = line.slice("worktree ".length); // verbatim: no trim, newline-safe
+      else if (line.startsWith("HEAD ")) head = line.slice("HEAD ".length).slice(0, 8);
+      else if (line.startsWith("branch ")) branch = line.slice("branch ".length).replace(/^refs\/heads\//, "");
+      else if (line === "detached") detached = true;
+      else if (line === "bare") bare = true;
     }
     if (!wtPath) continue;
     out.push({ path: wtPath, head, branch: branch || (bare ? "(bare)" : detached ? "(detached)" : "") });
@@ -439,10 +443,10 @@ export function parseWorktreePorcelain(raw: string): VizWorktree[] {
 }
 
 /** Floors for the canvas: the git worktrees of the repo this exporter runs in. Best-effort and read-only
- *  — a git failure (not a repo, git absent) yields [], never breaks the snapshot. */
+ *  — a git failure (not a repo, git absent) yields [], never breaks the snapshot. `-z` keeps paths exact. */
 export function readWorktrees(cwd: string = process.cwd()): VizWorktree[] {
   try {
-    const raw = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const raw = execFileSync("git", ["worktree", "list", "--porcelain", "-z"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     return parseWorktreePorcelain(raw);
   } catch {
     return [];
@@ -723,30 +727,30 @@ function selftest(): void {
     }
   }
 
-  // Worktree porcelain parsing (floors): blank-line-separated blocks; branch stripped; detached/bare labelled.
+  // Worktree porcelain (-z) parsing (floors): NUL-terminated attrs; "\0\0"-separated records; branch
+  // stripped; detached/bare labelled; path kept BYTE-FOR-BYTE (newline/trailing-space safe — CC-P2-5).
   {
-    const raw = [
-      "worktree /Users/x/Dev/agenthop",
-      "HEAD c46ac1aabcdef0123456789",
-      "branch refs/heads/main",
-      "",
-      "worktree /Users/x/Dev/agenthop-wt/console-canvas",
-      "HEAD deadbeefcafef00d",
-      "branch refs/heads/feat/console-canvas",
-      "",
-      "worktree /tmp/detached-wt",
-      "HEAD 0123456789abcdef",
-      "detached",
-      "",
-    ].join("\n");
+    const rec = (...lines: string[]) => lines.join("\0");     // attrs within a record, NUL-joined
+    const z = (...recs: string[]) => recs.join("\0\0") + "\0\0"; // records "\0\0"-separated, as git -z emits
+    const raw = z(
+      rec("worktree /Users/x/Dev/agenthop", "HEAD c46ac1aabcdef0123456789", "branch refs/heads/main"),
+      rec("worktree /Users/x/Dev/agenthop-wt/console-canvas", "HEAD deadbeefcafef00d", "branch refs/heads/feat/console-canvas"),
+      rec("worktree /tmp/detached-wt", "HEAD 0123456789abcdef", "detached"),
+    );
     const wts = parseWorktreePorcelain(raw);
     t("parseWorktreePorcelain finds every worktree block", wts.length === 3);
     t("branch is stripped of refs/heads/", wts[0]!.branch === "main" && wts[1]!.branch === "feat/console-canvas");
     t("HEAD is shortened to 8", wts[0]!.head === "c46ac1aa" && wts[0]!.head.length === 8);
     t("a detached worktree is labelled, not blank", wts[2]!.branch === "(detached)");
     t("the path is kept verbatim", wts[1]!.path === "/Users/x/Dev/agenthop-wt/console-canvas");
-    t("a bare entry is labelled (bare)", parseWorktreePorcelain("worktree /r\nHEAD abc\nbare\n")[0]!.branch === "(bare)");
-    t("empty / no-worktree input yields []", parseWorktreePorcelain("").length === 0 && parseWorktreePorcelain("HEAD abc\nbranch refs/heads/x").length === 0);
+    t("a bare entry is labelled (bare)", parseWorktreePorcelain(z(rec("worktree /r", "HEAD abc", "bare")))[0]!.branch === "(bare)");
+    t("empty / no-worktree input yields []", parseWorktreePorcelain("").length === 0 && parseWorktreePorcelain(z(rec("HEAD abc", "branch refs/heads/x"))).length === 0);
+    // CC-P2-5: a legal path with a newline or a trailing space must survive byte-for-byte (NUL is the only
+    // delimiter). The previous newline-split + trim parser truncated the first and dropped the second.
+    const nl = "/tmp/wt\nwith-newline";
+    t("a path containing a newline is preserved (not truncated)", parseWorktreePorcelain(z(rec(`worktree ${nl}`, "HEAD abc00000", "branch refs/heads/x")))[0]!.path === nl);
+    const sp = "/tmp/wt-trailing  ";
+    t("a path with trailing spaces is preserved (not trimmed)", parseWorktreePorcelain(z(rec(`worktree ${sp}`, "HEAD abc00000", "detached")))[0]!.path === sp);
   }
 
   console.log("all selftests passed");

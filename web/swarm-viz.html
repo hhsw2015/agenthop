@@ -254,6 +254,11 @@
   .cedge { fill: none; stroke-width: 1.5; opacity: .75; }
   .cedge.handoff { stroke: #c58fff; }
   .cedge.dispatch { stroke: #5aa9ff; }
+  .cnode.dim { opacity: .12; pointer-events: none; }
+  .cedge.dim { opacity: .08; }
+  /* "was green, now stale" (SUCCEEDED but upstream superseded) in the gated DAG overlay — same loud treatment
+     the legacy jobs view uses, so a historical success is never shown as currently valid (CC-P2-3). */
+  .cnode.stale .stale-ring { stroke-dasharray: 3 3; animation: pulse 2s ease-out infinite; opacity: .9; }
 
   /* jobs-view members strip (G5/F1) — hidden outside jobs view */
   .jobsmembers { display: none; }
@@ -848,10 +853,10 @@
     // Build the seat graph. A box linked to a peer is represented BY that peer (one node), not twice.
     const boxRep = new Map(); // launchId -> representative node id
     const seats = [];
-    state.nodes.forEach((n) => seats.push({ id: n.id, kind: "seat", label: n.title, status: n.status ?? "unknown", cwd: n.cwd, data: n }));
+    state.nodes.forEach((n) => seats.push({ id: n.id, kind: "seat", label: n.title, status: n.status ?? "unknown", cwd: n.cwd, machine: n.machine, data: n }));
     state.boxes.forEach((b) => {
       if (b.nodeIndex >= 0) boxRep.set(b.launchId, state.nodes[b.nodeIndex].id);
-      else { const id = "box:" + b.launchId; boxRep.set(b.launchId, id); seats.push({ id, kind: "box", label: b.shortId, status: b.recoverable ? "blocked" : "unknown", data: b }); }
+      else { const id = "box:" + b.launchId; boxRep.set(b.launchId, id); seats.push({ id, kind: "box", label: b.shortId, status: b.recoverable ? "blocked" : "unknown", machine: b.launchId, data: b }); }
     });
     const byId = new Map(seats.map((s) => [s.id, s]));
     const resolve = (ref) => {
@@ -885,15 +890,20 @@
       maxLayer = Math.max(maxLayer, L);
     }
 
+    // CC-P2-1: honour the live search box + status/via filters, same as topology — dim what does not match
+    // (and any edge touching a dimmed node). matches() returns true when neither a query nor a filter is set.
+    const dimmed = new Set(seats.filter((s) => !matches(s)).map((s) => s.id));
+
     for (const e of edges) {
       const a = pos.get(e.from), b = pos.get(e.to); if (!a || !b) continue;
-      view.appendChild(el("path", { class: "cedge " + e.kind, "marker-end": `url(#${e.kind === "dispatch" ? "arrowblue" : "arrow"})`,
+      const dim = dimmed.has(e.from) || dimmed.has(e.to);
+      view.appendChild(el("path", { class: "cedge " + e.kind + (dim ? " dim" : ""), "marker-end": `url(#${e.kind === "dispatch" ? "arrowblue" : "arrow"})`,
         d: `M${a.x + R},${a.y} C${a.x + R + 48},${a.y} ${b.x - R - 48},${b.y} ${b.x - R},${b.y}` }));
     }
     for (const s of seats) {
       const p = pos.get(s.id); if (!p) continue;
       const color = STATUS_COLOR[s.status] ?? STATUS_COLOR.unknown;
-      const g = el("g", { class: "cnode" + (sel === s.id ? " sel" : ""), transform: `translate(${p.x},${p.y})` });
+      const g = el("g", { class: "cnode" + (sel === s.id ? " sel" : "") + (dimmed.has(s.id) ? " dim" : ""), transform: `translate(${p.x},${p.y})` });
       g.appendChild(el("title", {})).textContent = `${s.label}\n${s.kind}${s.cwd ? " · " + s.cwd : ""}\n${s.status}`;
       if (s.kind === "box") g.appendChild(el("rect", { class: "body", x: -R, y: -R + 6, width: R * 2, height: (R - 6) * 2, rx: 6, fill: color + "22", stroke: color }));
       else g.appendChild(el("circle", { class: "body", r: R, fill: color + "22", stroke: color }));
@@ -905,39 +915,47 @@
     }
 
     // Gated dependency-DAG overlay — stays dark until the brain projection lands (projection.present).
-    let dagRight = 0;
-    if (state.projection && state.projection.present) dagRight = renderCanvasJobOverlay(view, 70 + (maxLayer + 1) * COLW + 40);
+    // Returns its full extent {x,y} so the initial fit includes the DAG's HEIGHT, not just the seats (CC-P2-4).
+    let dag = { x: 0, y: 0 };
+    if (state.projection && state.projection.present) dag = renderCanvasJobOverlay(view, 70 + (maxLayer + 1) * COLW + 40);
 
-    const x1 = Math.max(70 + (maxLayer + 1) * COLW, dagRight, 320);
-    model = { bounds: { x0: 0, y0: 0, x1, y1: 90 + (maxRow + 1) * ROWH + 60 } };
+    const x1 = Math.max(70 + (maxLayer + 1) * COLW, dag.x, 320);
+    const y1 = Math.max(90 + (maxRow + 1) * ROWH, dag.y) + 60;
+    // CC-P2-2: expose the seat items so renderDrawer() can open detail for a clicked canvas node (it looks
+    // up sel in model.items and renders peerDrawer/boxDrawer); model must carry data, not just bounds.
+    model = { bounds: { x0: 0, y0: 0, x1, y1 }, items: seats };
     if (!didFit || lastView !== "canvas") { didFit = true; lastView = "canvas"; fit(); }
   }
 
   /** The gated dependency-DAG layer, to the right of the seats. Reuses the job's layers + acceptance colours
    *  (never re-derived). Returns the rightmost x used. Called only when projection.present. */
   function renderCanvasJobOverlay(view, x0) {
-    const job = currentJob(); if (!job) return x0;
+    const job = currentJob(); if (!job) return { x: x0, y: 0 };
     const nodes = job.plan.nodes;
     const layers = new Map();
     for (const n of nodes) { const L = n.layer ?? 0; (layers.get(L) ?? layers.set(L, []).get(L)).push(n); }
     const COLW = 170, ROWH = 84, R = 22;
-    const pos = new Map(); let maxL = 0;
+    const pos = new Map(); let maxL = 0, maxRow = 0;
     for (const [L, group] of [...layers.entries()].sort((a, b) => a[0] - b[0])) {
       group.sort((a, b) => a.nodeId.localeCompare(b.nodeId));
-      group.forEach((n, i) => pos.set(n.nodeId, { x: x0 + L * COLW, y: 90 + i * ROWH }));
+      group.forEach((n, i) => { pos.set(n.nodeId, { x: x0 + L * COLW, y: 90 + i * ROWH }); maxRow = Math.max(maxRow, i); });
       maxL = Math.max(maxL, L);
     }
     for (const n of nodes) for (const dep of n.dependsOn) { const a = pos.get(dep), b = pos.get(n.nodeId); if (a && b) view.appendChild(el("path", { class: "dagedge", d: `M${a.x + R},${a.y} C${a.x + R + 48},${a.y} ${b.x - R - 48},${b.y} ${b.x - R},${b.y}` })); }
     for (const n of nodes) {
       const p = pos.get(n.nodeId); const att = job.attempts[n.nodeId]?.current; const status = att?.status ?? "no-attempt";
       const color = ACCEPT_COLOR[status] ?? "#6b7080";
-      const g = el("g", { class: "cnode task", transform: `translate(${p.x},${p.y})` });
-      g.appendChild(el("title", {})).textContent = `${n.nodeId} (${n.kind})\n${status}`;
+      // CC-P2-3: a SUCCEEDED attempt whose upstream was later superseded is NOT currently valid. The
+      // projection carries complete=false; render "was green, now stale" explicitly (never re-derived).
+      const stale = status === "SUCCEEDED" && att && att.complete === false;
+      const g = el("g", { class: "cnode task" + (stale ? " stale" : ""), transform: `translate(${p.x},${p.y})` });
+      g.appendChild(el("title", {})).textContent = `${n.nodeId} (${n.kind})\n${status}${stale ? " — upstream superseded (stale, pending rerun)" : ""}`;
       g.appendChild(el("circle", { class: "body", r: R, fill: color + "22", stroke: color }));
+      if (stale) g.appendChild(el("circle", { class: "stale-ring", r: R - 1, fill: "none", stroke: color }));
       const t = el("text", { class: "clabel", "text-anchor": "middle", y: 3 }); t.textContent = clip(n.nodeId, 11); g.appendChild(t);
       view.appendChild(g);
     }
-    return x0 + (maxL + 1) * COLW;
+    return { x: x0 + (maxL + 1) * COLW, y: 90 + (maxRow + 1) * ROWH + 30 };
   }
 
   function render() {
@@ -952,7 +970,7 @@
     if (viewMode === "kanban") { renderKanban(); renderHeader(); renderStall(); return; }
     $("timeline").style.display = viewMode === "timeline" ? "block" : "none";
     if (viewMode === "timeline") { renderTimeline(); renderHeader(); renderStall(); return; }
-    if (viewMode === "canvas") { document.body.classList.remove("jobs-view"); renderCanvas(); renderHeader(); renderStall(); return; }
+    if (viewMode === "canvas") { document.body.classList.remove("jobs-view"); renderCanvas(); renderDrawer(); renderHeader(); renderStall(); return; }
     if (viewMode === "jobs" && snap.projection && snap.projection.present) {
       document.body.classList.add("jobs-view");
       renderJobsView();
