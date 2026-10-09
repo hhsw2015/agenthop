@@ -382,15 +382,18 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // F47: proactively adopt the Codex thread id from the daemon as our roster stableId. Under Codex 0.162 (rmcp client) an
   // MCP call no longer carries x-codex-turn-metadata, so the node never learns its thread id from a call and — if it also
   // never receives an inbound (handleInbound's adopt) — stays an un-addressable "unknown" in the roster, restart and all.
-  // The daemon's cwd-UNAMBIGUOUS activeThread is a restart-stable id; adopt it as a NON-authoritative guess (real call
-  // metadata still upgrades it, a wrong/ambiguous cwd yields undefined and is skipped). Covers the lazy MCP node AND the
-  // presence daemon (both run startBusCore). Runs until an authoritative id arrives.
-  const adoptCodexIdentity = (): void => { if (codexDaemon && !stableIdAuthoritative) learnStableId(codexDaemon.activeThread(self.cwd), false); };
+  // F47-1: adopt ONLY via the STRICT ownThread (a loaded thread whose cwd UNIQUELY equals ours) — NOT the lenient
+  // delivery fallback `activeThread`, which would adopt the sole loaded thread even when its cwd clearly belongs to another
+  // session (stealing its identity). A NON-authoritative guess (real call metadata still upgrades it); no unique cwd match
+  // -> stay unconfirmed. F47-2: skip once `closed` so a torn-down instance never adopts or records identity.
+  let closedForAdopt = false;
+  const adoptCodexIdentity = (): void => { if (closedForAdopt || !codexDaemon || stableIdAuthoritative) return; learnStableId(codexDaemon.ownThread(self.cwd), false); };
   // Fast initial adoption: the daemon handshake + thread list take ~1-2s, so poll briefly until we hold an id (then stop).
+  let codexIdTimer: ReturnType<typeof setInterval> | undefined;
   if (codexDaemon) {
     let tries = 0;
-    const idTimer = setInterval(() => { adoptCodexIdentity(); if (self.stableId !== undefined || ++tries >= 20) clearInterval(idTimer); }, 1000);
-    idTimer.unref?.();
+    codexIdTimer = setInterval(() => { adoptCodexIdentity(); if (self.stableId !== undefined || ++tries >= 20) { if (codexIdTimer) clearInterval(codexIdTimer); codexIdTimer = undefined; } }, 1000);
+    codexIdTimer.unref?.();
   }
   const flushTimer = setInterval(() => { void flushInbox(); retryCheckIn(); adoptCodexIdentity(); }, 5000); // B5: the timer also retries a missed check-in; the steady backstop for a late daemon / thread drift
   flushTimer.unref?.();
@@ -522,6 +525,8 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       return `local broker: ${local.role()}; ${team_}; ${unified().filter((p) => p.id !== self.id).length} other session(s)`;
     },
     async close() {
+      closedForAdopt = true; // F47-2: a closed instance must never adopt or record identity again
+      if (codexIdTimer) { clearInterval(codexIdTimer); codexIdTimer = undefined; } // F47-2: clear the fast-adopt timer (flushTimer is cleared below)
       clearInterval(flushTimer);
       stopInboxWatch();
       stopStatusWatch();

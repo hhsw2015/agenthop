@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { pickThreadForCwd } from "../src/codex.js";
+import { pickThreadForCwd, ownThreadByCwd } from "../src/codex.js";
 
 // cwd-pinned delivery target selection (reaches an idle Codex among several sharing one daemon, no cross-talk).
 describe("pickThreadForCwd", () => {
@@ -41,5 +41,25 @@ describe("pickThreadForCwd", () => {
     expect(pickThreadForCwd([A, B], new Map([[A, "/work/happycapy"]]), "/work/happycapy")).toBeUndefined();
     // once B's cwd is known (and differs), A becomes the unambiguous unique match
     expect(pickThreadForCwd([A, B], new Map([[A, "/work/happycapy"], [B, "/work/other"]]), "/work/happycapy")).toBe(A);
+  });
+});
+
+// F47-1: STRICT identity resolver — must require a UNIQUE cwd match, NEVER the sole-loaded delivery fallback.
+describe("ownThreadByCwd (identity adoption: unique cwd match only, no sole-loaded fallback)", () => {
+  const A = "thread-A", B = "thread-B", C = "thread-C";
+  test("unique cwd match -> adopt it", () => {
+    expect(ownThreadByCwd([A, B], new Map([[A, "/projects/own"], [B, "/projects/other"]]), "/projects/own")).toBe(A);
+  });
+  test("F47-1 counterexample: sole loaded whose cwd CLEARLY differs -> undefined (never steal its identity)", () => {
+    expect(ownThreadByCwd([B], new Map([[B, "/projects/other"]]), "/projects/own")).toBeUndefined();
+  });
+  test("ambiguous (two threads in my cwd) -> undefined", () => {
+    expect(ownThreadByCwd([A, C], new Map([[A, "/projects/own"], [C, "/projects/own"]]), "/projects/own")).toBeUndefined();
+  });
+  test("incomplete cwd map (a thread's cwd unknown) -> undefined (never guess)", () => {
+    expect(ownThreadByCwd([A, B], new Map([[A, "/projects/own"]]), "/projects/own")).toBeUndefined();
+  });
+  test("no cwd given -> undefined (identity needs cwd evidence)", () => {
+    expect(ownThreadByCwd([A], new Map([[A, "/projects/own"]]))).toBeUndefined();
   });
 });

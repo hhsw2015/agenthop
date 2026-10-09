@@ -23,6 +23,9 @@ export type CodexDaemon = {
    *  it (unambiguously) — so an IDLE session that never touched the bus is still reachable. Falls back to
    *  the sole loaded thread when there is only one, else undefined. */
   activeThread(cwd?: string): string | undefined;
+  /** F47-1: the STRICT identity resolver — the loaded thread whose cwd UNIQUELY equals `cwd` (no sole-loaded fallback).
+   *  For ADOPTING this session's roster identity, where a wrong guess would steal another session's id. */
+  ownThread(cwd?: string): string | undefined;
   /** The daemon's CODEX_HOME (from the initialize handshake). `codex queue` needs it to find the thread's
    *  rollout; the MCP subprocess's own env does not carry it. Undefined until the handshake completes. */
   codexHome(): string | undefined;
@@ -212,6 +215,7 @@ export function startCodexDaemon(): CodexDaemon | undefined {
     // durably queued for agenthop_recv rather than risk the wrong session. The authoritative binding is
     // still ownCodexThread (the thread that actually called this bus), handled in core before this.
     activeThread: (cwd) => pickThreadForCwd(loaded, cwdByThread, cwd),
+    ownThread: (cwd) => ownThreadByCwd(loaded, cwdByThread, cwd), // F47-1: strict unique-cwd-match for identity adoption
     codexHome: () => codexHome,
     close: () => {
       closed = true;
@@ -306,6 +310,16 @@ export function pickThreadForCwd(loaded: string[], cwdByThread: Map<string, stri
     if (matches.length === 1) return matches[0];
   }
   return loaded.length === 1 ? loaded[0] : undefined;
+}
+
+/** F47-1: the STRICT identity resolver — the loaded thread whose cwd UNIQUELY equals the caller's own cwd, with NO
+ *  sole-loaded fallback. IDENTITY adoption must prove OWNERSHIP: the lenient `pickThreadForCwd` sole-loaded fallback is a
+ *  DELIVERY last-resort (deliver into the only session around), not an ownership claim — adopting the sole loaded thread
+ *  when its cwd clearly differs would steal another session's identity. No unique cwd match -> undefined (stay unconfirmed). */
+export function ownThreadByCwd(loaded: string[], cwdByThread: Map<string, string>, cwd?: string): string | undefined {
+  if (!cwd || loaded.length === 0 || !loaded.every((id) => cwdByThread.has(id))) return undefined;
+  const matches = loaded.filter((id) => cwdByThread.get(id) === cwd);
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 /** thread/loaded/list data is id strings on Codex 0.158; be lenient about object shapes too. */
