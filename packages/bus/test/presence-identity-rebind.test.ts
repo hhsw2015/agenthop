@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, afterAll, beforeAll, expect, test } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { startBusCore } from "../src/core.js";
 import { runPresence } from "../src/presence.js";
@@ -77,6 +77,27 @@ test("B7-1 (send contract): after the re-bind, a same-machine relay peer routes 
     const target = resolveInboxTarget("codex:Work-drift", relayPeer, null, relayLocalSid);
     expect(target).toMatchObject({ kind: "durable", sid: stableId }); // the send lands in the stable id's durable inbox (not relay-only)
   } finally { await stop(); }
+});
+
+test("B7-1-R1: A→B→A with overlapping in-flight binds keeps exactly ONE endpoint (no orphaned listener)", async () => {
+  const socks = () => readdirSync(path.join(HOME, ".agenthop", "presence")).filter((f) => f.endsWith(".sock"));
+  const { core, stop } = runPresence({ home: HOME });
+  try {
+    // Drive A→B→A back-to-back so all three binds are in flight at once (the leak needs a sid change while a bind is incomplete).
+    core.noteThread("A"); core.noteThread("B"); core.noteThread("A");
+    await delay(150); // let every in-flight bind settle
+    expect(socks().length).toBe(1);                              // exactly ONE endpoint on disk — pre-fix a duplicate A leaked a second
+    expect(await probeSessionAlive(HOME, "A")).toBe(true);
+    expect(await probeSessionAlive(HOME, "B")).toBe(false);
+
+    core.noteThread("C"); // establishing a new identity must not retain a live A listener of this instance
+    await delay(150);
+    expect(socks().length).toBe(1);
+    expect(await probeSessionAlive(HOME, "C")).toBe(true);
+    expect(await probeSessionAlive(HOME, "A")).toBe(false);      // the old A endpoint is gone (not retained)
+  } finally { await stop(); }
+  await delay(50);
+  expect(socks().length).toBe(0); // stop clears the endpoint (and any in-flight bind self-closes under `closing`)
 });
 
 test("positive case preserved: a pid-file presence (pre-set sid) binds + probes alive and does not drift", async () => {

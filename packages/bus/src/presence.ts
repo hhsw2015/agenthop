@@ -55,21 +55,38 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
   // keeps relay — the same-machine durable guarantee to the stable id's inbox silently breaks.
   const fixedSid = pidFile ? path.basename(pidFile).replace(/\.pid$/, "") : null;
   let sockSid = fixedSid ?? "";
+  // Every bind attempt carries a GENERATION. Only the LATEST generation's socket is ever kept; any earlier/duplicate result is
+  // closed on arrival (B7-1-R1: comparing the SID alone let two concurrent binds for the SAME sid — e.g. an A→B→A switch while a
+  // bind is still in flight — both pass and both assign sockServer, orphaning the first listener). `binding` elides a redundant
+  // concurrent attempt for the current sid; a sid change bumps the generation (superseding the in-flight bind) and clears it.
+  let bindGen = 0;
+  let binding = false;
   const openSock = (): void => {
-    if (sockServer || closing || !sockSid) return;
-    const bindFor = sockSid;                            // capture: an identity change mid-bind must discard a socket for the superseded sid
-    void openLivenessSocket(home, bindFor).then((res) => {
-      if (!res) return;                                 // path too long (relay-only) or a transient bind failure — retry next tick
-      if (closing || sockSid !== bindFor) { try { res.server.close(); } catch { /* best effort */ } return; }
-      sockServer = res.server;
-    });
+    if (sockServer || closing || !sockSid || binding) return;
+    const gen = ++bindGen;
+    const bindFor = sockSid;
+    binding = true;
+    void openLivenessSocket(home, bindFor).then(
+      (res) => {
+        binding = false;
+        if (!res) return;                               // path too long (relay-only) or a transient bind failure — retry next tick
+        // Keep ONLY if this is still the latest attempt and we are not shutting down; otherwise it is stale/duplicate — close it
+        // (unlinks its own path) so no superseded or orphaned listener survives (B7-1-R1).
+        if (closing || gen !== bindGen) { try { res.server.close(); } catch { /* best effort */ } return; }
+        sockServer = res.server;
+      },
+      () => { binding = false; },                       // openLivenessSocket resolves null on failure; guard a reject regardless
+    );
   };
   // B7-1: the stable identity was (re)assigned after startup (no pre-set SID + no pid file). Re-bind with NO poll window — close
   // the old-sid listener (close() unlinks only OUR OWN path, never another instance's) and open a fresh one at hash(new sid), so
-  // a sender probing hash(stableId) proves THIS instance alive and routes its send to the stable id's durable inbox.
+  // a sender probing hash(stableId) proves THIS instance alive and routes its send to the stable id's durable inbox. Bumping the
+  // generation here supersedes any in-flight old-sid bind (it will close itself on arrival), so the old identity keeps no listener.
   const syncSidFor = (want: string): void => {
     if (fixedSid || want === sockSid || !want) return; // a pid-file sid is fixed; no-op if unchanged
     sockSid = want;
+    bindGen++;                                          // supersede an in-flight bind for the superseded sid
+    binding = false;                                    // allow openSock to start a fresh bind for the new sid
     if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
     openSock();
   };
