@@ -50,35 +50,64 @@ export type RulingLoad = { ok: true; ruling: Ruling } | { ok: false; reason: str
 export type LedgerLoad = { ok: true; rulings: Ruling[] } | { ok: false; reason: string };
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-const isNonEmptyStr = (v: unknown): v is string => typeof v === "string" && v.length > 0;
-const isIdArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string" && RULING_ID_RE.test(x));
-const isStrArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
+
+/**
+ * Validate an array field POSITIONALLY and return a fresh copy built from the SAME indexed reads that were checked
+ * (RL-P2-1 / RL-P2-2): never `.every` (an input can override it, and it SKIPS sparse holes), never spread / iteration (a
+ * custom iterator could yield values other than the indexed ones). A sparse hole, a non-string, or a value failing `ok`
+ * rejects the WHOLE field (null). The returned copy is exactly what was validated, so re-validating the output passes. */
+function copyValidatedStrArray(v: unknown, ok: (s: string) => boolean): string[] | null {
+  if (!Array.isArray(v)) return null;
+  const out: string[] = [];
+  const n = v.length;
+  for (let i = 0; i < n; i++) {
+    const el: unknown = v[i]; // ONE indexed read — validate AND copy the SAME value (no re-read, no iterator)
+    if (typeof el !== "string" || !ok(el)) return null; // a sparse hole reads as undefined ⇒ rejected
+    out.push(el);
+  }
+  return out;
+}
 
 /**
  * Validate ONE ruling record from untrusted input. Whole-record reject on any malformation (bad id pattern, series not
  * matching the id prefix, status not in the enum, missing/empty title or statement, an optional id-ref field that is not
  * an array of valid ids, a self-reference). Unknown extra fields are tolerated (the schema may grow) but never copied
- * into the returned record — the result carries ONLY the known fields. No silent repair. Pure. */
+ * into the returned record — the result carries ONLY the known fields. No silent repair.
+ *
+ * RL-P2-2: every field is read EXACTLY ONCE into a local const, then validated AND assigned from that SAME const — a
+ * getter can never return one value to the validator and another to the result. Array copies are built positionally
+ * (copyValidatedStrArray), so the returned array is exactly what was checked. Pure. */
 export function loadRuling(input: unknown): RulingLoad {
   if (!isObj(input)) return { ok: false, reason: "ruling must be a non-null object" };
   const o = input;
-  if (typeof o.id !== "string" || !RULING_ID_RE.test(o.id)) return { ok: false, reason: `invalid id (want ${RULING_ID_RE})` };
   const id = o.id;
-  if (typeof o.series !== "string" || !SERIES.has(o.series as RulingSeries)) return { ok: false, reason: `invalid series for ${id} (want R|S|F)` };
-  if (o.series !== id[0]) return { ok: false, reason: `series "${o.series}" does not match id prefix of ${id}` };
-  if (!isNonEmptyStr(o.title)) return { ok: false, reason: `missing/empty title for ${id}` };
-  if (!isNonEmptyStr(o.statement)) return { ok: false, reason: `missing/empty statement for ${id}` };
-  if (typeof o.status !== "string" || !STATUSES.has(o.status as RulingStatus)) return { ok: false, reason: `invalid status for ${id} (want active|superseded|retired)` };
+  if (typeof id !== "string" || !RULING_ID_RE.test(id)) return { ok: false, reason: `invalid id (want ${RULING_ID_RE})` };
+  const series = o.series;
+  if (typeof series !== "string" || !SERIES.has(series as RulingSeries)) return { ok: false, reason: `invalid series for ${id} (want R|S|F)` };
+  if (series !== id[0]) return { ok: false, reason: `series "${series}" does not match id prefix of ${id}` };
+  const title = o.title;
+  if (typeof title !== "string" || title.length === 0) return { ok: false, reason: `missing/empty title for ${id}` };
+  const statement = o.statement;
+  if (typeof statement !== "string" || statement.length === 0) return { ok: false, reason: `missing/empty statement for ${id}` };
+  const status = o.status;
+  if (typeof status !== "string" || !STATUSES.has(status as RulingStatus)) return { ok: false, reason: `invalid status for ${id} (want active|superseded|retired)` };
 
-  const out: Ruling = { id, series: o.series as RulingSeries, title: o.title, statement: o.statement, status: o.status as RulingStatus };
+  const out: Ruling = { id, series: series as RulingSeries, title, statement, status: status as RulingStatus };
 
-  if (o.rationale !== undefined) { if (typeof o.rationale !== "string") return { ok: false, reason: `rationale must be a string for ${id}` }; out.rationale = o.rationale; }
-  if (o.supersedes !== undefined) { if (!isIdArray(o.supersedes)) return { ok: false, reason: `supersedes must be an array of valid ids for ${id}` }; out.supersedes = [...o.supersedes]; }
-  if (o.supersededBy !== undefined) { if (typeof o.supersededBy !== "string" || !RULING_ID_RE.test(o.supersededBy)) return { ok: false, reason: `supersededBy must be a valid id for ${id}` }; out.supersededBy = o.supersededBy; }
-  if (o.relates !== undefined) { if (!isIdArray(o.relates)) return { ok: false, reason: `relates must be an array of valid ids for ${id}` }; out.relates = [...o.relates]; }
-  if (o.sources !== undefined) { if (!isStrArray(o.sources)) return { ok: false, reason: `sources must be an array of strings for ${id}` }; out.sources = [...o.sources]; }
-  if (o.since !== undefined) { if (typeof o.since !== "string") return { ok: false, reason: `since must be a string for ${id}` }; out.since = o.since; }
-  if (o.by !== undefined) { if (typeof o.by !== "string") return { ok: false, reason: `by must be a string for ${id}` }; out.by = o.by; }
+  const rationale = o.rationale;
+  if (rationale !== undefined) { if (typeof rationale !== "string") return { ok: false, reason: `rationale must be a string for ${id}` }; out.rationale = rationale; }
+  const supersedes = o.supersedes;
+  if (supersedes !== undefined) { const c = copyValidatedStrArray(supersedes, (s) => RULING_ID_RE.test(s)); if (!c) return { ok: false, reason: `supersedes must be an array of valid ids for ${id}` }; out.supersedes = c; }
+  const supersededBy = o.supersededBy;
+  if (supersededBy !== undefined) { if (typeof supersededBy !== "string" || !RULING_ID_RE.test(supersededBy)) return { ok: false, reason: `supersededBy must be a valid id for ${id}` }; out.supersededBy = supersededBy; }
+  const relates = o.relates;
+  if (relates !== undefined) { const c = copyValidatedStrArray(relates, (s) => RULING_ID_RE.test(s)); if (!c) return { ok: false, reason: `relates must be an array of valid ids for ${id}` }; out.relates = c; }
+  const sources = o.sources;
+  if (sources !== undefined) { const c = copyValidatedStrArray(sources, () => true); if (!c) return { ok: false, reason: `sources must be an array of strings for ${id}` }; out.sources = c; }
+  const since = o.since;
+  if (since !== undefined) { if (typeof since !== "string") return { ok: false, reason: `since must be a string for ${id}` }; out.since = since; }
+  const by = o.by;
+  if (by !== undefined) { if (typeof by !== "string") return { ok: false, reason: `by must be a string for ${id}` }; out.by = by; }
 
   // A ruling cannot reference itself (supersede/be-superseded-by/relate-to itself).
   if (out.supersededBy === id) return { ok: false, reason: `${id} cannot be superseded by itself` };
@@ -147,11 +176,13 @@ export interface Index {
 export const INDEX_VERSION = 1;
 const SERIES_RANK: Record<RulingSeries, number> = { R: 0, S: 1, F: 2 };
 
-/** Deterministic sort key for an id: series (R→S→F), then the number, then the sub-letter. Pure. */
-export function idSortKey(id: string): [number, number, string] {
+/** Deterministic sort key for an id: series (R→S→F), then the number, then the sub-letter. The number is a BigInt so it
+ *  compares LOSSLESSLY across the whole accepted domain (`\d+` is unbounded — parseInt collapses values past 2^53 and
+ *  turns a 300-digit number into Infinity, which would misorder or degrade to input order, RL-P2-3). Pure. */
+export function idSortKey(id: string): [number, bigint, string] {
   const m = /^([RSF])(\d+)(?:-([a-z]))?$/.exec(id);
-  if (!m) return [99, Number.MAX_SAFE_INTEGER, id]; // shouldn't happen on validated input; sorts unknowns last, deterministically
-  return [SERIES_RANK[m[1] as RulingSeries], parseInt(m[2], 10), m[3] ?? ""];
+  if (!m) return [99, -1n, id]; // shouldn't happen on validated input; sorts unknowns last, deterministically
+  return [SERIES_RANK[m[1] as RulingSeries], BigInt(m[2]), m[3] ?? ""];
 }
 
 /** Build the index projection from validated rulings — a pure, deterministically-ordered rebuild (never hand-edited).
@@ -163,7 +194,9 @@ export function buildIndex(rulings: readonly Ruling[], nowSec: number): Index {
     .map((r) => ({ id: r.id, series: r.series, title: r.title, status: r.status, ...(r.supersededBy ? { supersededBy: r.supersededBy } : {}) }))
     .sort((a, b) => {
       const ka = idSortKey(a.id), kb = idSortKey(b.id);
-      return ka[0] - kb[0] || ka[1] - kb[1] || (ka[2] < kb[2] ? -1 : ka[2] > kb[2] ? 1 : 0);
+      if (ka[0] !== kb[0]) return ka[0] - kb[0];
+      if (ka[1] !== kb[1]) return ka[1] < kb[1] ? -1 : 1; // BigInt compare (lossless)
+      return ka[2] < kb[2] ? -1 : ka[2] > kb[2] ? 1 : 0;
     });
   return { version: INDEX_VERSION, generatedAtSec: Number.isFinite(nowSec) ? Math.floor(nowSec) : 0, count: rulings.length, bySeriesCount, entries };
 }

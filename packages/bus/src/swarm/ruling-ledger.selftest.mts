@@ -27,6 +27,26 @@ t("reject: self supersededBy / supersedes / relates", loadRuling({ id: "R3", ser
   && loadRuling({ id: "R3", series: "R", title: "t", statement: "s", status: "active", relates: ["R3"] }).ok === false);
 t("tolerate: unknown extra field (accepted, not copied)", (() => { const r = loadRuling({ id: "R3", series: "R", title: "t", statement: "s", status: "active", extra: "x" }); return r.ok === true && r.ok && !("extra" in r.ruling); })());
 
+// --- RL-P2-1: array validation is positional (no .every, no sparse-hole pass, no overridable method) ---
+t("RL-P2-1: sparse array (new Array(1)) rejected", loadRuling({ id: "R1", series: "R", title: "t", statement: "s", status: "active", sources: new Array(1) }).ok === false);
+t("RL-P2-1: a sparse hole in supersedes rejected", (() => { const a: any[] = ["R2"]; a[2] = "R3"; /* index 1 is a hole */ return loadRuling({ id: "R1", series: "R", title: "t", statement: "s", status: "superseded", supersededBy: "R2", supersedes: [], relates: a }).ok === false; })());
+t("RL-P2-1: a non-string element ([42]) rejected (not vacuously via every)", loadRuling({ id: "R1", series: "R", title: "t", statement: "s", status: "active", sources: [42] }).ok === false);
+t("RL-P2-1: an overridden .every cannot force-pass", (() => { const a: any = ["R2"]; a.every = () => true; const r = loadRuling({ id: "R1", series: "R", title: "t", statement: "s", status: "active", relates: a }); return r.ok === true && r.ok && JSON.stringify(r.ruling.relates) === '["R2"]'; })());
+t("RL-P2-1: valid string array stays usable", (() => { const r = loadRuling({ id: "R1", series: "R", title: "t", statement: "s", status: "active", sources: ["a", "b"] }); return r.ok === true && r.ok && r.ruling.sources?.length === 2; })());
+
+// --- RL-P2-2: validate and return the SAME captured value (a getter is not re-read; the output re-validates) ---
+t("RL-P2-2: a flipping status getter is read ONCE; output re-validates", (() => {
+  let n = 0; const obj = { id: "R1", series: "R", title: "t", statement: "s", get status() { n++; return n <= 1 ? "active" : "invalid"; } };
+  const r = loadRuling(obj);
+  if (!(r.ok === true && r.ok && r.ruling.status === "active")) return false;
+  return loadLedger([r.ruling]).ok === true; // the RETURNED record re-validates cleanly
+})());
+t("RL-P2-2: array copy comes from indexed reads, not a custom iterator", (() => {
+  const a: any = ["R2"]; a[Symbol.iterator] = function* () { yield 42 as any; }; // iterator lies; indexed read is "R2"
+  const r = loadRuling({ id: "R1", series: "R", title: "t", statement: "s", status: "active", relates: a });
+  return r.ok === true && r.ok && JSON.stringify(r.ruling.relates) === '["R2"]';
+})());
+
 // --- loadLedger ---
 const pair = [
   { id: "R3", series: "R", title: "old", statement: "s", status: "superseded", supersededBy: "R3-b" },
@@ -56,6 +76,18 @@ t("ledger: superseded ruling still active rejects", loadLedger([
 t("idSortKey: numeric not lexical (R3 < R10)", (() => { const a = idSortKey("R3"), b = idSortKey("R10"); return a[0] === b[0] && a[1] < b[1]; })());
 t("idSortKey: base before sub-letter (R3 < R3-a)", idSortKey("R3")[2] < idSortKey("R3-a")[2]);
 t("idSortKey: series rank R<S<F", idSortKey("R1")[0] < idSortKey("S1")[0] && idSortKey("S1")[0] < idSortKey("F1")[0]);
+// RL-P2-3: numbers past 2^53 must compare losslessly (parseInt would collapse these two to equal)
+t("RL-P2-3: huge numeric ids order losslessly (no 2^53 collision)", (() => {
+  const big = loadLedger([R({ id: "R9007199254740993-a" }), R({ id: "R9007199254740992-b" })]);
+  if (!big.ok) return false;
+  return buildIndex(big.rulings, 1).entries.map((e) => e.id).join(",") === "R9007199254740992-b,R9007199254740993-a";
+})());
+t("RL-P2-3: 300-digit id does not become Infinity (still ordered under its smaller sibling)", (() => {
+  const d = "9".repeat(300);
+  const big = loadLedger([R({ id: "R" + d }), R({ id: "R1" })]);
+  if (!big.ok) return false;
+  return buildIndex(big.rulings, 1).entries.map((e) => e.id).join(",") === "R1,R" + d;
+})());
 
 const many = loadLedger([R({ id: "F45" }), R({ id: "R10" }), R({ id: "S29" }), R({ id: "R3-b" }), R({ id: "R3" }), R({ id: "R2" })]);
 t("buildIndex: deterministic R→S→F, numeric, sub-letter", (() => {
