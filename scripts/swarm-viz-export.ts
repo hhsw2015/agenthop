@@ -27,6 +27,7 @@ import { createServer } from "node:http";
 delete process.env.CLAUDE_CODE_SESSION_ID;
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startBusCore } from "../packages/bus/src/core.js";
@@ -171,6 +172,16 @@ export type VizEdge = {
   to: string; // successor launchId
 };
 
+/** A git worktree = a FLOOR (parallel repo checkout on its own branch). Read-only, from `git worktree
+ *  list --porcelain` — the floor-pill source for the canvas view (DA2-R6 / console-canvas v1). */
+export type VizWorktree = {
+  path: string;
+  /** Short branch name (refs/heads/ stripped), or "(detached)" / "(bare)" when there is no branch. */
+  branch: string;
+  /** Short HEAD sha (first 8), or "" when unknown. */
+  head: string;
+};
+
 export type Snapshot = {
   generatedAt: number;
   observerId: string;
@@ -212,6 +223,9 @@ export type Snapshot = {
   /** 停摆定理: all peers idle + no unresolved wait + unfinished work = silence over unfinished business.
    *  DERIVED here (like allocExhausted), from reported statuses and wait states — never from re-judging. */
   stall: StallVerdict;
+  /** Floors: git worktrees of the repo this exporter runs in (read-only). The canvas draws these as floor
+   *  pills (branch + status). Empty when not a git repo / git absent. */
+  worktrees: VizWorktree[];
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -402,6 +416,39 @@ export function foldFlows(entries: MsgLogEntry[], limit = 60): VizFlow[] {
   return [...byPair.values()].sort((a, b) => b.lastTs - a.lastTs).slice(0, limit);
 }
 
+/**
+ * Parse `git worktree list --porcelain` into floors. Pure (selftest-covered). Blocks are separated by a
+ * blank line; each has a `worktree <path>` line, a `HEAD <sha>` line, and either `branch refs/heads/<name>`
+ * or `detached`, and `bare` for the bare repo. A block with no `worktree` line is skipped.
+ */
+export function parseWorktreePorcelain(raw: string): VizWorktree[] {
+  const out: VizWorktree[] = [];
+  for (const block of raw.split(/\n\s*\n/)) {
+    let wtPath = "", branch = "", head = "", detached = false, bare = false;
+    for (const line of block.split("\n")) {
+      if (line.startsWith("worktree ")) wtPath = line.slice("worktree ".length).trim();
+      else if (line.startsWith("HEAD ")) head = line.slice("HEAD ".length).trim().slice(0, 8);
+      else if (line.startsWith("branch ")) branch = line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
+      else if (line.trim() === "detached") detached = true;
+      else if (line.trim() === "bare") bare = true;
+    }
+    if (!wtPath) continue;
+    out.push({ path: wtPath, head, branch: branch || (bare ? "(bare)" : detached ? "(detached)" : "") });
+  }
+  return out;
+}
+
+/** Floors for the canvas: the git worktrees of the repo this exporter runs in. Best-effort and read-only
+ *  — a git failure (not a repo, git absent) yields [], never breaks the snapshot. */
+export function readWorktrees(cwd: string = process.cwd()): VizWorktree[] {
+  try {
+    const raw = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return parseWorktreePorcelain(raw);
+  } catch {
+    return [];
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Snapshot assembly
 // ---------------------------------------------------------------------------------------------
@@ -519,6 +566,7 @@ export function buildSnapshot(
     kanban,
     timeline,
     stall,
+    worktrees: readWorktrees(),
     payloadLogged: msgLog.some((e) => typeof e.text === "string" && e.text.length > 0),
     msgLogEnabled: msgLogEnabled(),
   };
@@ -673,6 +721,32 @@ function selftest(): void {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+
+  // Worktree porcelain parsing (floors): blank-line-separated blocks; branch stripped; detached/bare labelled.
+  {
+    const raw = [
+      "worktree /Users/x/Dev/agenthop",
+      "HEAD c46ac1aabcdef0123456789",
+      "branch refs/heads/main",
+      "",
+      "worktree /Users/x/Dev/agenthop-wt/console-canvas",
+      "HEAD deadbeefcafef00d",
+      "branch refs/heads/feat/console-canvas",
+      "",
+      "worktree /tmp/detached-wt",
+      "HEAD 0123456789abcdef",
+      "detached",
+      "",
+    ].join("\n");
+    const wts = parseWorktreePorcelain(raw);
+    t("parseWorktreePorcelain finds every worktree block", wts.length === 3);
+    t("branch is stripped of refs/heads/", wts[0]!.branch === "main" && wts[1]!.branch === "feat/console-canvas");
+    t("HEAD is shortened to 8", wts[0]!.head === "c46ac1aa" && wts[0]!.head.length === 8);
+    t("a detached worktree is labelled, not blank", wts[2]!.branch === "(detached)");
+    t("the path is kept verbatim", wts[1]!.path === "/Users/x/Dev/agenthop-wt/console-canvas");
+    t("a bare entry is labelled (bare)", parseWorktreePorcelain("worktree /r\nHEAD abc\nbare\n")[0]!.branch === "(bare)");
+    t("empty / no-worktree input yields []", parseWorktreePorcelain("").length === 0 && parseWorktreePorcelain("HEAD abc\nbranch refs/heads/x").length === 0);
   }
 
   console.log("all selftests passed");

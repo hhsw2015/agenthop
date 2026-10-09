@@ -236,6 +236,25 @@
   .dagnode .nverdict { font-size: 9.5px; font-weight: 600; }
   .dagnode .nrecall { fill: var(--warn); font-size: 9px; font-weight: 600; }
   .dagnode.recalled .body { stroke-dasharray: 4 3; }
+  /* ---------- canvas (unified system-derived task graph: seats + edges + floors + attention) ---------- */
+  .viewbtn.on { border-color: var(--accent); background: rgba(110,168,254,.22); color: var(--ink); }
+  body.canvas-view #panels, body.canvas-view #river, body.canvas-view #ticker { display: none; }
+  .floorstrip { display: none; }
+  body.canvas-view .floorstrip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; position: absolute; left: 16px; top: 16px; right: 16px; z-index: 3; }
+  .floorstrip .jm-title { margin: 0 4px 0 0; }
+  .floorpill { display: inline-flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; font-size: 11px; backdrop-filter: blur(14px); }
+  .floorpill .fp-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .floorpill .fp-branch { color: var(--ink); font-weight: 600; }
+  .floorpill .fp-head { color: var(--faint); font-variant-numeric: tabular-nums; font-size: 10px; }
+  .cnode { cursor: pointer; }
+  .cnode .clabel { fill: var(--ink); font-size: 10px; font-weight: 600; }
+  .cnode .csub { fill: var(--faint); font-size: 9px; }
+  .cnode.sel .body { stroke-width: 2.4; }
+  .cnode .att { fill: #ff5c5c; }
+  .cedge { fill: none; stroke-width: 1.5; opacity: .75; }
+  .cedge.handoff { stroke: #c58fff; }
+  .cedge.dispatch { stroke: #5aa9ff; }
+
   /* jobs-view members strip (G5/F1) — hidden outside jobs view */
   .jobsmembers { display: none; }
   body.jobs-view .jobsmembers { display: block; position: absolute; left: 16px; top: 16px; width: 232px; z-index: 3;
@@ -449,9 +468,14 @@
     <div class="spacer"></div>
     <div class="filters" id="filters"></div>
     <input class="search" id="search" placeholder="Search sessions, cwd, machine…" />
-    <button class="viewbtn" id="viewtoggle" title="Topology (by machine) ⇄ Jobs (by task DAG)">jobs ▸</button>
+    <button class="viewbtn on" id="canvasbtn" title="Canvas: the system-derived task graph (seats, dispatch/handoff edges, floors, attention) — read-only">canvas</button>
     <button class="viewbtn" id="kanbanbtn" title="Kanban: board columns (todo/in-progress/done) + member swimlanes">kanban ▸</button>
     <button class="viewbtn" id="timelinebtn" title="Timeline: worklog (per-day project lanes, where the time went, stall blanks)">timeline ▸</button>
+    <select class="viewbtn" id="legacy" title="Legacy views (one transition version — folding into canvas)">
+      <option value="">legacy ▾</option>
+      <option value="topology">topology (by machine)</option>
+      <option value="jobs">jobs (task DAG)</option>
+    </select>
     <button class="themebtn" id="theme" title="Toggle light / dark">◐</button>
   </header>
   <div id="stage">
@@ -469,6 +493,7 @@
     <div class="kanban-view" id="kanban"></div>
     <div class="timeline-view" id="timeline"></div>
     <div class="jobsmembers" id="jobsmembers"></div>
+    <div class="floorstrip" id="floorstrip"></div>
     <div class="ticker" id="ticker">
       <div class="ttitle"><span>Events</span><span class="tsub" id="tsub"></span>
         <button class="rcollapse" id="tcollapse" title="Collapse / expand">▾</button></div>
@@ -502,7 +527,7 @@
   let sel = null;           // selected node id
   let query = "";
   const filters = new Set(); // active status/via/box filters
-  let viewMode = "topology"; // "topology" (by machine) | "jobs" (by task DAG)
+  let viewMode = "canvas"; // "canvas" (unified graph, default) | "kanban" | "timeline" | legacy: "topology" | "jobs"
   let selJob = null;         // selected jobId in jobs view (null = first)
   let jobSel = null;         // selected nodeId in jobs view
 
@@ -789,9 +814,136 @@
     if (!didFit || lastView !== "jobs") { didFit = true; lastView = "jobs"; fit(); }
   }
 
+  // ---------------------------------------------------------------- canvas (unified system-derived graph)
+  /** Floor pills: the repo's git worktrees (branch + short HEAD), coloured by the loudest status of any
+   *  seat whose cwd sits under that worktree. Read-only, from snap.worktrees (exporter git worktree list). */
+  function renderFloorStrip() {
+    const box = $("floorstrip");
+    const wts = state?.worktrees ?? [];
+    if (!wts.length) { box.innerHTML = ""; return; }
+    const statusFor = (p) => {
+      const under = state.nodes.filter((n) => n.cwd && (n.cwd === p || String(n.cwd).startsWith(p + "/")));
+      if (under.some((n) => n.status === "blocked")) return "blocked";
+      if (under.some((n) => n.status === "working")) return "working";
+      if (under.some((n) => n.status === "idle")) return "idle";
+      return "unknown";
+    };
+    box.innerHTML = `<span class="jm-title">floors</span>` + wts.map((w) => {
+      const st = statusFor(w.path);
+      return `<span class="floorpill" title="${esc(w.path)}"><span class="fp-dot" style="background:${STATUS_COLOR[st]}"></span>`
+        + `<span class="fp-branch">${esc(w.branch || "(no branch)")}</span><span class="fp-head">${esc(w.head)}</span></span>`;
+    }).join("");
+  }
+
+  /** Canvas: the unified, system-derived, READ-ONLY spatial graph (console-canvas v1). Nodes = seats (bus
+   *  peers) + unattached boxes. Edges = handoff (control.successor — real today) + dispatch (dispatchedBy —
+   *  when present). Layers come from the edge DAG (deterministic longest-path; NO force sim). The dependency
+   *  task-DAG (dependsOn) overlays to the right ONLY when the brain projection is present (gated — dark until
+   *  it lands). Attention = a red dot on a blocked seat. Positions key off stable ids so nodes don't jump. */
+  function renderCanvas() {
+    document.querySelectorAll("#svg > g#view > *").forEach((n) => n.remove());
+    const view = $("view");
+    renderFloorStrip();
+
+    // Build the seat graph. A box linked to a peer is represented BY that peer (one node), not twice.
+    const boxRep = new Map(); // launchId -> representative node id
+    const seats = [];
+    state.nodes.forEach((n) => seats.push({ id: n.id, kind: "seat", label: n.title, status: n.status ?? "unknown", cwd: n.cwd, data: n }));
+    state.boxes.forEach((b) => {
+      if (b.nodeIndex >= 0) boxRep.set(b.launchId, state.nodes[b.nodeIndex].id);
+      else { const id = "box:" + b.launchId; boxRep.set(b.launchId, id); seats.push({ id, kind: "box", label: b.shortId, status: b.recoverable ? "blocked" : "unknown", data: b }); }
+    });
+    const byId = new Map(seats.map((s) => [s.id, s]));
+    const resolve = (ref) => {
+      if (!ref) return null;
+      if (byId.has(ref)) return ref;
+      const bl = boxRep.get(ref);
+      if (bl && byId.has(bl)) return bl;
+      const hit = seats.find((s) => s.id === ref || s.data?.stableId === ref || (s.data?.title && String(s.data.title).includes(ref)));
+      return hit ? hit.id : null;
+    };
+
+    const edges = []; // {from, to, kind}
+    for (const e of state.edges) { const a = resolve(e.from), b = resolve(e.to); if (a && b && a !== b) edges.push({ from: a, to: b, kind: "handoff" }); }
+    for (const n of state.nodes) { if (n.dispatchedBy) { const a = resolve(n.dispatchedBy), b = resolve(n.id); if (a && b && a !== b) edges.push({ from: a, to: b, kind: "dispatch" }); } }
+
+    // Deterministic layering: longest path from roots, capped at |nodes| passes so a cycle cannot loop forever.
+    const layer = new Map(seats.map((s) => [s.id, 0]));
+    for (let pass = 0; pass < seats.length + 1; pass++) {
+      let changed = false;
+      for (const e of edges) { const L = (layer.get(e.from) ?? 0) + 1; if (L > (layer.get(e.to) ?? 0)) { layer.set(e.to, L); changed = true; } }
+      if (!changed) break;
+    }
+    const COLW = 190, ROWH = 86, R = 24;
+    const groups = new Map();
+    for (const s of seats) { const L = layer.get(s.id) ?? 0; (groups.get(L) ?? groups.set(L, []).get(L)).push(s); }
+    const pos = new Map();
+    let maxRow = 0, maxLayer = 0;
+    for (const [L, group] of [...groups.entries()].sort((a, b) => a[0] - b[0])) {
+      group.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      group.forEach((s, i) => { pos.set(s.id, { x: 70 + L * COLW, y: 90 + i * ROWH }); maxRow = Math.max(maxRow, i); });
+      maxLayer = Math.max(maxLayer, L);
+    }
+
+    for (const e of edges) {
+      const a = pos.get(e.from), b = pos.get(e.to); if (!a || !b) continue;
+      view.appendChild(el("path", { class: "cedge " + e.kind, "marker-end": `url(#${e.kind === "dispatch" ? "arrowblue" : "arrow"})`,
+        d: `M${a.x + R},${a.y} C${a.x + R + 48},${a.y} ${b.x - R - 48},${b.y} ${b.x - R},${b.y}` }));
+    }
+    for (const s of seats) {
+      const p = pos.get(s.id); if (!p) continue;
+      const color = STATUS_COLOR[s.status] ?? STATUS_COLOR.unknown;
+      const g = el("g", { class: "cnode" + (sel === s.id ? " sel" : ""), transform: `translate(${p.x},${p.y})` });
+      g.appendChild(el("title", {})).textContent = `${s.label}\n${s.kind}${s.cwd ? " · " + s.cwd : ""}\n${s.status}`;
+      if (s.kind === "box") g.appendChild(el("rect", { class: "body", x: -R, y: -R + 6, width: R * 2, height: (R - 6) * 2, rx: 6, fill: color + "22", stroke: color }));
+      else g.appendChild(el("circle", { class: "body", r: R, fill: color + "22", stroke: color }));
+      if (s.status === "blocked") g.appendChild(el("circle", { class: "att", cx: R - 4, cy: -R + 4, r: 5 }));
+      const t = el("text", { class: "clabel", "text-anchor": "middle", y: 3 }); t.textContent = clip(s.label, 12); g.appendChild(t);
+      const sub = el("text", { class: "csub", "text-anchor": "middle", y: R + 13 }); sub.textContent = s.kind === "box" ? "box" : (s.data?.via === "relay" ? "remote" : "seat"); g.appendChild(sub);
+      g.addEventListener("click", (ev) => { ev.stopPropagation(); sel = sel === s.id ? null : s.id; render(); });
+      view.appendChild(g);
+    }
+
+    // Gated dependency-DAG overlay — stays dark until the brain projection lands (projection.present).
+    let dagRight = 0;
+    if (state.projection && state.projection.present) dagRight = renderCanvasJobOverlay(view, 70 + (maxLayer + 1) * COLW + 40);
+
+    const x1 = Math.max(70 + (maxLayer + 1) * COLW, dagRight, 320);
+    model = { bounds: { x0: 0, y0: 0, x1, y1: 90 + (maxRow + 1) * ROWH + 60 } };
+    if (!didFit || lastView !== "canvas") { didFit = true; lastView = "canvas"; fit(); }
+  }
+
+  /** The gated dependency-DAG layer, to the right of the seats. Reuses the job's layers + acceptance colours
+   *  (never re-derived). Returns the rightmost x used. Called only when projection.present. */
+  function renderCanvasJobOverlay(view, x0) {
+    const job = currentJob(); if (!job) return x0;
+    const nodes = job.plan.nodes;
+    const layers = new Map();
+    for (const n of nodes) { const L = n.layer ?? 0; (layers.get(L) ?? layers.set(L, []).get(L)).push(n); }
+    const COLW = 170, ROWH = 84, R = 22;
+    const pos = new Map(); let maxL = 0;
+    for (const [L, group] of [...layers.entries()].sort((a, b) => a[0] - b[0])) {
+      group.sort((a, b) => a.nodeId.localeCompare(b.nodeId));
+      group.forEach((n, i) => pos.set(n.nodeId, { x: x0 + L * COLW, y: 90 + i * ROWH }));
+      maxL = Math.max(maxL, L);
+    }
+    for (const n of nodes) for (const dep of n.dependsOn) { const a = pos.get(dep), b = pos.get(n.nodeId); if (a && b) view.appendChild(el("path", { class: "dagedge", d: `M${a.x + R},${a.y} C${a.x + R + 48},${a.y} ${b.x - R - 48},${b.y} ${b.x - R},${b.y}` })); }
+    for (const n of nodes) {
+      const p = pos.get(n.nodeId); const att = job.attempts[n.nodeId]?.current; const status = att?.status ?? "no-attempt";
+      const color = ACCEPT_COLOR[status] ?? "#6b7080";
+      const g = el("g", { class: "cnode task", transform: `translate(${p.x},${p.y})` });
+      g.appendChild(el("title", {})).textContent = `${n.nodeId} (${n.kind})\n${status}`;
+      g.appendChild(el("circle", { class: "body", r: R, fill: color + "22", stroke: color }));
+      const t = el("text", { class: "clabel", "text-anchor": "middle", y: 3 }); t.textContent = clip(n.nodeId, 11); g.appendChild(t);
+      view.appendChild(g);
+    }
+    return x0 + (maxL + 1) * COLW;
+  }
+
   function render() {
     const snap = state;
     if (!snap) return;
+    document.body.classList.toggle("canvas-view", viewMode === "canvas");
     // Task-logical (DAG) view is a different ORGANIZING AXIS of the same stage: topology = by machine,
     // jobs = by dependency. It renders only when the brain projection is present.
     // Kanban is a distinct overlay view (board columns + member swimlanes), not the SVG stage. The stall
@@ -800,6 +952,7 @@
     if (viewMode === "kanban") { renderKanban(); renderHeader(); renderStall(); return; }
     $("timeline").style.display = viewMode === "timeline" ? "block" : "none";
     if (viewMode === "timeline") { renderTimeline(); renderHeader(); renderStall(); return; }
+    if (viewMode === "canvas") { document.body.classList.remove("jobs-view"); renderCanvas(); renderHeader(); renderStall(); return; }
     if (viewMode === "jobs" && snap.projection && snap.projection.present) {
       document.body.classList.add("jobs-view");
       renderJobsView();
@@ -971,7 +1124,7 @@
   // ---------------------------------------------------------------- pannable view transform + zoom
   let view = { x: 0, y: 0, k: 1 };
   let didFit = false;
-  let lastView = "topology"; // re-fit when switching between topology and jobs
+  let lastView = "canvas"; // re-fit when switching between the SVG-stage views (canvas / jobs / topology)
   let lastReserved = -1; // last river-reserved height the view was fitted against
   function fit() {
     if (!model || !model.bounds) return;
@@ -1794,10 +1947,15 @@
 
   function renderHeader() {
     const s = state;
-    // Toggle is only meaningful once a projection exists; dim it otherwise.
+    // The legacy "jobs" view needs a projection; disable that option and fall back to canvas without one.
     const hasProj = !!(s.projection && s.projection.present && (s.projection.jobs || []).length);
-    const vt = $("viewtoggle");
-    if (vt) { vt.style.display = hasProj ? "" : "none"; if (!hasProj && viewMode === "jobs") { viewMode = "topology"; } }
+    const lg = $("legacy");
+    if (lg) {
+      const jobsOpt = lg.querySelector('option[value="jobs"]');
+      if (jobsOpt) jobsOpt.disabled = !hasProj;
+      if (!hasProj && viewMode === "jobs") { viewMode = "canvas"; }
+    }
+    syncViewButtons();
     if (viewMode === "jobs" && hasProj) { renderJobsHeader(); return; }
     const byStatus = {};
     for (const n of s.nodes) byStatus[n.status ?? "unknown"] = (byStatus[n.status ?? "unknown"] ?? 0) + 1;
@@ -1906,30 +2064,20 @@
       localStorage.setItem("swarm-viz-theme", next);
     };
   })();
+  // The three top-level projections are canvas (default) / kanban / timeline; topology + jobs are folded into
+  // the "legacy ▾" dropdown for one transition version. Clicking an active kanban/timeline returns to canvas.
   function syncViewButtons() {
-    $("viewtoggle").textContent = viewMode === "jobs" ? "◂ topology" : "jobs ▸";
-    $("kanbanbtn").textContent = viewMode === "kanban" ? "◂ topology" : "kanban ▸";
-    $("timelinebtn").textContent = viewMode === "timeline" ? "◂ topology" : "timeline ▸";
+    const set = (id, on, label) => { const b = $(id); if (!b) return; b.textContent = label; b.classList.toggle("on", on); };
+    set("canvasbtn", viewMode === "canvas", "canvas");
+    set("kanbanbtn", viewMode === "kanban", "kanban ▸");
+    set("timelinebtn", viewMode === "timeline", "timeline ▸");
+    const lg = $("legacy"); if (lg) lg.value = (viewMode === "topology" || viewMode === "jobs") ? viewMode : "";
   }
-  $("kanbanbtn").onclick = () => {
-    viewMode = viewMode === "kanban" ? "topology" : "kanban";
-    syncViewButtons();
-    sel = null; jobSel = null;
-    render();
-  };
-  $("timelinebtn").onclick = () => {
-    viewMode = viewMode === "timeline" ? "topology" : "timeline";
-    syncViewButtons();
-    sel = null; jobSel = null;
-    render();
-  };
-  $("viewtoggle").onclick = () => {
-    viewMode = viewMode === "jobs" ? "topology" : "jobs";
-    syncViewButtons();
-    didFit = false; // re-fit for the new axis
-    jobSel = null; sel = null;
-    render();
-  };
+  const switchView = (next) => { viewMode = next; didFit = false; sel = null; jobSel = null; syncViewButtons(); render(); };
+  $("canvasbtn").onclick = () => switchView("canvas");
+  $("kanbanbtn").onclick = () => switchView(viewMode === "kanban" ? "canvas" : "kanban");
+  $("timelinebtn").onclick = () => switchView(viewMode === "timeline" ? "canvas" : "timeline");
+  $("legacy").onchange = (e) => switchView(e.target.value || "canvas");
   // Pause everything while the tab is hidden — timers keep firing in a background tab, so an
   // all-day-open page would otherwise animate and re-render for nobody.
   document.addEventListener("visibilitychange", () => {
