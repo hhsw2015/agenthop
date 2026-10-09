@@ -41,12 +41,14 @@ function rejectedClaimPath(home: string, batchId: string): string { return path.
 function notifiedMarkerPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.json"); }
 function notifyLockPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.lock"); }
 function notifiedSentPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.sent"); }
-/** TG-P1-2 (round 3): per-item entry TAPS. An entry (TG tap) records ONE item into its OWN file `taps/<sha256(itemId)[:32]>.json`
- *  (a single-decision DecisionsDoc), so it never read-merge-overwrites the shared decisions.json — a console full-snapshot
- *  writeDecisions is a DIFFERENT file, each item is a DIFFERENT file, and a decision stranded in a recoverable claim is a
- *  DIFFERENT file. readDecisions/consume FOLD all of them (latest-per-id). No shared-file write race ⇒ no lost sibling. */
+/** TG-P1-2 (round 4): per-item entry TAPS. An entry (TG tap) records ONE item into its OWN file `taps/<itemIndex>.json` (a
+ *  single-decision DecisionsDoc). The filename is the item's INDEX in the batch — a LOSSLESS, collision-free key. (Round 3 hashed
+ *  the item id, which aliased DISTINCT valid ids whose UTF-8 encodings coincide — e.g. an unpaired surrogate U+D800 and U+FFFD
+ *  both encode to the U+FFFD bytes — so one tap silently overwrote the other. The index is unique per item and always path-safe.)
+ *  A tap never read-merge-overwrites the shared decisions.json (a console full-snapshot is a DIFFERENT file, each item a DIFFERENT
+ *  file, a recoverable claim a DIFFERENT file); readDecisions/consume FOLD them all by write order. No write race ⇒ no lost sibling. */
 function tapsDir(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "taps"); }
-function tapPath(home: string, batchId: string, itemId: string): string { return path.join(tapsDir(home, batchId), `${createHash("sha256").update(itemId).digest("hex").slice(0, 32)}.json`); }
+function tapPath(home: string, batchId: string, itemIndex: number): string { return path.join(tapsDir(home, batchId), `${itemIndex}.json`); }
 
 /** Atomically create `target` with COMPLETE `content`, exclusively (no overwrite): write a temp fully, then `link` it into
  *  place. The name appears only once the bytes are all written (a partial/interrupted write — EFBIG, a crash — never yields a
@@ -222,26 +224,35 @@ export function readBatch(home: string, batchId: string): DecisionBatch | null {
 }
 
 export function readDecisions(home: string, batchId: string): DecisionsDoc | null {
-  const snap = readJsonOrNull(decisionsPath(home, batchId), validDecisionsDoc);
-  // DB-P1-1 (IO side): a doc whose batchId ≠ the directory it sits in is MISBOUND (a foreign/stale drop) — not valid decisions
-  // for this batch. Treat it as absent so no verdict is ever read from the wrong batch's directory.
-  const base = snap && snap.batchId === batchId ? snap : null;
-  // TG-P1-2 (round 3): the EFFECTIVE ledger = the console's full-snapshot decisions.json FOLDED with every per-item entry tap
-  // (latest-per-id; [snapshot, ...taps] order so a tap wins an equal-second tie). null when there is neither.
-  return foldDecisionDocs([...(base ? [base] : []), ...readTaps(home, batchId)], batchId);
+  // TG-R3-P2-1: the EFFECTIVE ledger folds THREE sources so a reader always sees the complete valid decisions: the console's
+  // full-snapshot decisions.json, a RECOVERABLE claim (a consume moved decisions.json here then faulted — a reader must still
+  // see it, else backlog miscounts), and every per-item tap. Folded by actual WRITE order (readDocEntry's mtime token,
+  // TG-R3-P1-1). A misbound doc (batchId ≠ dir) is dropped inside foldDecisionDocs. null when there is nothing to read.
+  const entries = [readDocEntry(decisionsPath(home, batchId)), readDocEntry(claimPath(home, batchId)), ...readTaps(home, batchId)];
+  return foldDecisionDocs(entries.filter((e): e is { doc: DecisionsDoc; order: bigint } => e !== null), batchId);
 }
 
-/** Read every per-item TAP for a batch as single-decision docs. A dir read error PROPAGATES (never folded to [] — a lost tap is
- *  a lost approval, TG-P2-1); a missing dir ⇒ none; a corrupt/misbound tap file ⇒ skipped (readable-but-not-a-verdict). */
-function readTaps(home: string, batchId: string): DecisionsDoc[] {
+/** Read a DecisionsDoc at `file` with its WRITE-ORDER token (mtime in ns — finer than the 1-second decidedAtSec, TG-R3-P1-1).
+ *  A real read error PROPAGATES (never silently dropped — a lost source is a lost/miscounted verdict); ENOENT or corrupt ⇒ null. */
+function readDocEntry(file: string): { doc: DecisionsDoc; order: bigint } | null {
+  const doc = readJsonOrNull(file, validDecisionsDoc);
+  if (!doc) return null;
+  let order = 0n;
+  try { order = statSync(file, { bigint: true }).mtimeNs; } catch { /* vanished right after the read ⇒ treat as oldest */ }
+  return { doc, order };
+}
+
+/** Read every per-item TAP for a batch (with its write-order token). A dir/file read error PROPAGATES (never folded to [] — a
+ *  lost tap is a lost approval, TG-P2-1); a missing dir ⇒ none; a corrupt/misbound tap file ⇒ skipped. */
+function readTaps(home: string, batchId: string): { doc: DecisionsDoc; order: bigint }[] {
   let names: string[];
   try { names = readdirSync(tapsDir(home, batchId)); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
-  const out: DecisionsDoc[] = [];
+  const out: { doc: DecisionsDoc; order: bigint }[] = [];
   for (const n of names) {
     if (!n.endsWith(".json")) continue;
-    const doc = readJsonOrNull(path.join(tapsDir(home, batchId), n), validDecisionsDoc); // throws on a real read error ⇒ kept, not dropped
-    if (doc && doc.batchId === batchId) out.push(doc);
+    const e = readDocEntry(path.join(tapsDir(home, batchId), n)); // throws on a real read error ⇒ kept, not dropped
+    if (e && e.doc.batchId === batchId) out.push(e);
   }
   return out;
 }
@@ -285,15 +296,16 @@ export function writeDecisions(home: string, doc: DecisionsDoc): void {
 export function recordDecision(home: string, batchId: string, decision: Decision, nowSec: number): "recorded" | "consumed" | "unknown-item" | "contended" {
   const batch = readBatch(home, batchId);
   if (!batch) throw new Error(`recordDecision: no such batch ${batchId}`);
-  const item = batch.items.find((it) => it.id === decision.id);
-  if (!item) return "unknown-item";
+  const idx = batch.items.findIndex((it) => it.id === decision.id);
+  if (idx < 0) return "unknown-item";
   const token = acquireConsumeLock(home, batchId);
   if (token === null) return "contended";
   try {
     if (existsStrict(consumedMarkerPath(home, batchId))) return "consumed"; // sealed — no fork, the tap is a no-op
-    // One file per item (keyed by item id): a re-tap overwrites ITS OWN file (latest wins); two items are two files (no collision);
-    // the console's decisions.json and a recoverable claim are separate files folded in at read/consume.
-    writeJsonAtomic(tapPath(home, batchId, decision.id), { batchId, decidedAtSec: nowSec, decisions: [enforceScope(item, decision)] });
+    // One file per item, keyed by the item's INDEX (lossless/collision-free — TG-P1-2): a re-tap overwrites ITS OWN file (latest
+    // wins); two distinct items are two files even if their ids UTF-8-alias; the console's decisions.json and a recoverable claim
+    // are separate files folded in at read/consume.
+    writeJsonAtomic(tapPath(home, batchId, idx), { batchId, decidedAtSec: nowSec, decisions: [enforceScope(batch.items[idx]!, decision)] });
     return "recorded";
   } finally { releaseConsumeLock(home, batchId, token); }
 }
@@ -394,28 +406,33 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
       }
     }
     if (existsStrict(dpath)) renameSync(dpath, claim); // R25 (newer wins): a write that landed during acquire/recover supersedes
-    // TG-P1-2 (round 3): read every per-item entry tap under the lock (serialized vs recordDecision). The EFFECTIVE ledger folds
-    // the console snapshot (the claim) with the taps — a read failure PROPAGATES (never silently drops a tap => a lost approval).
+    // TG-P1-2/R3-P2-1: read every per-item entry tap under the lock (serialized vs recordDecision), each with its write-order
+    // token. The EFFECTIVE ledger folds the console snapshot (the claim) with the taps BY WRITE ORDER — a read failure PROPAGATES
+    // (never silently drops a tap => a lost approval).
     const taps = readTaps(home, batchId);
-    let base: DecisionsDoc | null = null;
+    let base: { doc: DecisionsDoc; order: bigint } | null = null;
     if (existsStrict(claim)) {
-      const claimed = readJsonOrNull(claim, validDecisionsDoc);
+      const entry = readDocEntry(claim);
       // DB-P1-1: the claimed doc MUST be bound to this batch; a misbound/corrupt claim yields NO verdict — set it aside (the taps,
       // if any, still resolve for THIS batch).
-      if (claimed && claimed.batchId === batchId) base = claimed;
+      if (entry && entry.doc.batchId === batchId) base = entry;
       else {
         try { renameSync(claim, rejectedClaimPath(home, batchId)); } catch { /* raced away */ }
-        if (taps.length === 0) return { ...none, unknownIds: claimed ? claimed.decisions.map((d) => d.id) : [] };
+        if (taps.length === 0) return { ...none, unknownIds: entry ? entry.doc.decisions.map((d) => d.id) : [] };
       }
     }
     if (!base && taps.length === 0) return none; // nothing to consume (no decisions yet)
     const doc = foldDecisionDocs([...(base ? [base] : []), ...taps], batchId) ?? { batchId, decidedAtSec: 0, decisions: [] };
     const res = resolveBatch(batch, doc);
+    // TG-R3-P2-1: persist the FULL merged ledger to the claim (the CANONICAL consumed record) BEFORE the terminal seal — so the
+    // existing read side (readDecisions and the bandwidth collector's readBoundDoc(claim)) always sees the complete consumed
+    // decisions, not a subset snapshot and not just the digest, with no post-seal window where the record is incomplete.
+    writeJsonAtomic(claim, doc);
     // FINAL terminal commit (temp+link). DB-R7: if a concurrent consumer already created consumed.json ("exists"), we LOST the
     // race — return NOT consumed (never return an executable verdict for a lost commit; no double-execute). EFBIG/EACCES THROWS
     // with the claim intact ⇒ finally releases the lock, a retry resumes the SAME claim.
     if (createExclusiveAtomic(consumedMarker, JSON.stringify({ batchId, decidedAtSec: doc.decidedAtSec, consumedAtMs: Date.now(), digest: digestDoc(doc) })) === "exists") return none;
-    removeTaps(home, batchId); // sealed ⇒ the taps are consumed-once (a fault BEFORE the seal leaves them recoverable for a retry)
+    removeTaps(home, batchId); // sealed ⇒ the taps are consumed-once (the merged claim now carries the whole record; a fault BEFORE the seal leaves taps recoverable)
     emitOrphanSignal(home, batchId, batch.owner); // a decision that landed during this consume (now terminal) is an orphan — signal it (R25)
     return { ...res, consumed: true };
   } finally { releaseConsumeLock(home, batchId, token); }

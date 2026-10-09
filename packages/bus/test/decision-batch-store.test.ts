@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { openBatch, readBatch, writeDecisions, readDecisions, consumeDecisions, listBatches, listBatchesStrict, recordDecision } from "../src/swarm/decision-batch-store.js";
 import { type DecisionItem } from "../src/swarm/decision-batch.js";
+import { collectBandwidthEvents } from "../src/swarm/dual-bandwidth-store.js";
 import { claimInbox } from "../src/inbox.js";
 
 let HOME: string;
@@ -472,5 +473,74 @@ describe("TG-P1-2 (round 3): a tap never drops a sibling (recoverable claim / co
   test("a confirmed-absent batches dir is [] for BOTH listers (ENOENT ⇒ no batches, not an error)", () => {
     expect(listBatchesStrict(HOME)).toEqual([]);
     expect(listBatches(HOME)).toEqual([]);
+  });
+});
+
+// TG round-4 counterexamples (codex r3 verdict, 3 REMAIN): fold by WRITE order (not the 1s decidedAtSec), a LOSSLESS tap key
+// (distinct ids that UTF-8-alias must not collide), and a CANONICAL consumed record the existing read/bandwidth side can read.
+describe("TG r4: write-order fold, lossless tap key, canonical consumed record", () => {
+  const d = (id: string) => path.join(HOME, ".agenthop", "console", "decision-batches", id);
+
+  test("TG-R3-P1-1: a later-WRITTEN console reject in the SAME second beats an earlier tap approve", () => {
+    openBatch(HOME, { batchId: "wo", owner: "coord", items: [item("a")], nowSec: 1 });
+    expect(recordDecision(HOME, "wo", { id: "a", verdict: "approve" }, 1000)).toBe("recorded"); // tap, written first
+    writeDecisions(HOME, { batchId: "wo", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "reject" }] }); // console, written AFTER
+    expect(readDecisions(HOME, "wo")!.decisions.find((x) => x.id === "a")!.verdict).toBe("reject");
+    expect(consumeDecisions(HOME, "wo").resolved[0]!.verdict).toBe("reject"); // the later write wins, not a fixed entry preference
+  });
+
+  test("TG-R3-P1-1 reverse: a later-WRITTEN tap beats an earlier console write (same second)", () => {
+    openBatch(HOME, { batchId: "wr", owner: "coord", items: [item("a")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "wr", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "reject" }] }); // console first
+    expect(recordDecision(HOME, "wr", { id: "a", verdict: "approve" }, 1000)).toBe("recorded"); // tap written AFTER
+    expect(consumeDecisions(HOME, "wr").resolved[0]!.verdict).toBe("approve");
+  });
+
+  test("TG-P1-2: distinct item ids whose UTF-8 encodings ALIAS do not overwrite each other's tap", () => {
+    const ids = ["\ud800", "�"]; // an unpaired surrogate vs the replacement char: distinct ids, identical UTF-8 bytes
+    expect(ids[0]).not.toBe(ids[1]);
+    openBatch(HOME, { batchId: "al", owner: "coord", items: ids.map((x) => item(x)), nowSec: 1 });
+    expect(recordDecision(HOME, "al", { id: ids[0]!, verdict: "approve" }, 1000)).toBe("recorded");
+    expect(recordDecision(HOME, "al", { id: ids[1]!, verdict: "reject" }, 1001)).toBe("recorded");
+    const got = consumeDecisions(HOME, "al");
+    expect(got.resolved.length).toBe(2); // both survive — no silent overwrite
+    expect(got.undecided.length).toBe(0);
+  });
+
+  for (const mode of ["tap-only", "mixed"] as const) {
+    test(`TG-R3-P2-1 (${mode}): the consumed claim holds the FULL merged record; bandwidth counts every consumed item`, () => {
+      openBatch(HOME, { batchId: "cr", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
+      if (mode === "mixed") writeDecisions(HOME, { batchId: "cr", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] });
+      else expect(recordDecision(HOME, "cr", { id: "a", verdict: "approve" }, 1000)).toBe("recorded");
+      expect(recordDecision(HOME, "cr", { id: "b", verdict: "reject" }, 1001)).toBe("recorded");
+      expect(consumeDecisions(HOME, "cr").resolved.length).toBe(2);
+      const claim = JSON.parse(readFileSync(path.join(d("cr"), "decisions-consumed-claim.json"), "utf8"));
+      expect(claim.decisions.length).toBe(2);                              // canonical consumed record is complete
+      expect(collectBandwidthEvents(HOME).consumeAtSec.length).toBe(2);    // bandwidth sees both consumed items (not 0/1)
+    });
+  }
+
+  test("TG-R3-P2-1: a recoverable claim + a tap BOTH appear in readDecisions (backlog not miscounted)", () => {
+    openBatch(HOME, { batchId: "rc", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "rc", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] });
+    // a consume that claimed (decisions.json -> claim) then FAULTED before sealing leaves a recoverable claim:
+    renameSync(path.join(d("rc"), "decisions.json"), path.join(d("rc"), "decisions-consumed-claim.json"));
+    expect(recordDecision(HOME, "rc", { id: "b", verdict: "reject" }, 1001)).toBe("recorded");
+    expect(readDecisions(HOME, "rc")!.decisions.map((x) => x.id).sort()).toEqual(["a", "b"]); // claim's a AND tap's b
+    expect(collectBandwidthEvents(HOME).backlog).toBe(0);                 // both decided -> no backlog miscount
+  });
+
+  test("TG-P2-1: an unreadable taps dir does NOT seal (throws, recovers on retry)", () => {
+    openBatch(HOME, { batchId: "ut", owner: "coord", items: [item("a")], nowSec: 1 });
+    expect(recordDecision(HOME, "ut", { id: "a", verdict: "approve" }, 1000)).toBe("recorded");
+    const taps = path.join(d("ut"), "taps"); const mode = statSync(taps).mode;
+    chmodSync(taps, 0o000);
+    try {
+      expect(() => readDecisions(HOME, "ut")).toThrow();
+      expect(() => consumeDecisions(HOME, "ut")).toThrow();
+      expect(existsSync(path.join(d("ut"), "consumed.json"))).toBe(false); // never sealed on a read failure
+    } finally { chmodSync(taps, mode); }
+    const got = consumeDecisions(HOME, "ut");
+    expect(got.consumed).toBe(true); expect(got.resolved.length).toBe(1); // recovers once readable
   });
 });

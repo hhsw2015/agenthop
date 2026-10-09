@@ -141,19 +141,22 @@ export function upsertDecision(existing: DecisionsDoc | null, batchId: string, d
  *  decision from a doc with an EQUAL-OR-GREATER decidedAtSec supersedes an earlier one (so a tap wins an equal-second tie over
  *  the console snapshot — a targeted single-item action is the more recent intent). Only docs bound to `batchId` count; returns
  *  null when there is nothing to fold (no snapshot, no taps). Pure. */
-export function foldDecisionDocs(docs: DecisionsDoc[], batchId: string): DecisionsDoc | null {
-  const bound = docs.filter((d) => d.batchId === batchId);
+export function foldDecisionDocs(entries: { doc: DecisionsDoc; order: bigint }[], batchId: string): DecisionsDoc | null {
+  const bound = entries.filter((e) => e.doc.batchId === batchId);
   if (bound.length === 0) return null;
-  const latest = new Map<string, { d: Decision; ts: number }>();
+  // TG-R3-P1-1: order by the ACTUAL WRITE order (an `order` token — the source file's mtime in ns), NOT the 1-second
+  // `decidedAtSec`. A later-WRITTEN decision for an id supersedes an earlier one even within the same second (a console reject
+  // written after a tap approve wins; a tap written after a snapshot wins) — the entries never fix-prefer one writer. A true
+  // mtime tie breaks deterministically by decidedAtSec (and, equal, input order) — only a genuinely simultaneous write.
+  const sorted = [...bound].sort((a, b) =>
+    a.order < b.order ? -1 : a.order > b.order ? 1 : a.doc.decidedAtSec - b.doc.decidedAtSec);
+  const latest = new Map<string, Decision>();
   let maxTs = 0;
-  for (const doc of bound) {
+  for (const { doc } of sorted) { // ascending ⇒ a later entry overwrites ⇒ the latest-WRITTEN decision per id wins
     maxTs = Math.max(maxTs, doc.decidedAtSec);
-    for (const d of doc.decisions) {
-      const cur = latest.get(d.id);
-      if (!cur || doc.decidedAtSec >= cur.ts) latest.set(d.id, { d, ts: doc.decidedAtSec });
-    }
+    for (const d of doc.decisions) latest.set(d.id, d);
   }
-  return { batchId, decidedAtSec: maxTs, decisions: [...latest.values()].map((v) => v.d) };
+  return { batchId, decidedAtSec: maxTs, decisions: [...latest.values()] };
 }
 
 /**
