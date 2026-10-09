@@ -10,18 +10,21 @@ const threw = (fn: () => unknown) => { try { fn(); return false; } catch { retur
 const sp = (o: Partial<SpawnRequest> = {}): SpawnRequest => ({ reserveKey: 'r1', consumer: 'c1', estUsd: 10, estTokens: 0, ...o });
 const draw = (o: Partial<PoolDraw> = {}): PoolDraw => ({ drawKey: 'd1', consumer: 'c1', usd: 1, tokens: 0, atSec: 10, ...o });
 const inboxFileCount = (home: string) => { try { let n = 0; for (const d of readdirSync(join(home, '.agenthop', 'inbox'), { withFileTypes: true })) if (d.isDirectory()) n += readdirSync(join(home, '.agenthop', 'inbox', d.name)).filter((f) => f.endsWith('.json')).length; return n; } catch { return 0; } };
-const lastInboxCard = (home: string): { text: string; title: string } => {
+// Read THIS ticket's card by its DETERMINISTIC identity (taskRef = spend-breaker:<ticketId>), never by a
+// timestamp (SBK-R2-P2-1 / FC-6: no clock-based latest-wins — two publications may share a millisecond and
+// filename order is not publish order). Exactly one card per ticket trip in these tests.
+const cardForTicket = (home: string, ticketId: string): { text: string; title: string } => {
   const base = join(home, '.agenthop', 'inbox');
-  let best: { ts: number; text: string; title: string } = { ts: -1, text: '', title: '' };
+  const want = `spend-breaker:${ticketId}`;
   for (const d of readdirSync(base, { withFileTypes: true })) {
     if (!d.isDirectory()) continue;
     for (const f of readdirSync(join(base, d.name))) {
       if (!f.endsWith('.json')) continue;
       const m = JSON.parse(readFileSync(join(base, d.name, f), 'utf8'));
-      if (typeof m.ts === 'number' && m.ts > best.ts) best = { ts: m.ts, text: String(m.text ?? ''), title: String(m.title ?? '') };
+      if (m.taskRef === want) return { text: String(m.text ?? ''), title: String(m.title ?? '') };
     }
   }
-  return { text: best.text, title: best.title };
+  return { text: '', title: '' };
 };
 
 // ---------------- pure core ----------------
@@ -86,7 +89,7 @@ t('ticketCeiling shape', (() => { const c = ticketCeiling(10); return c.maxUsd =
     const tv = requestSpawn(home, 'toks', sp({ reserveKey: 'T2', estUsd: 0, estTokens: 1 }));
     t('SBK-P2-1: a token-only cap trips (token dimension exhausted)', tv.allowed === false);
     if (tv.allowed === false) presentTripToCoordinator(home, 'coord-sid', 'toks', tv);
-    const card = lastInboxCard(home);
+    const card = cardForTicket(home, 'toks');
     t('SBK-P2-1: S19 card names the TOKEN dimension that tripped', /token/i.test(card.text) && /token/i.test(card.title));
     t('SBK-P2-1: S19 card shows the token balance with units (17 cap, 0 remaining)', card.text.includes('of 17 cap') && card.text.includes('remaining 0'));
     t('SBK-P2-1: S19 card does NOT present the unbounded USD axis as a balance (no ∞, no USD line)', !card.text.includes('∞') && !/USD/.test(card.text));

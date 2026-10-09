@@ -68,7 +68,8 @@ export function presentTripToCoordinator(
   // SBK-P2-1: the card must NAME the dimension(s) that tripped and show per-axis balances WITH UNITS,
   // distinguishing committed spend from in-flight liability — and must NOT present an unbounded (null-ceiling)
   // axis as "the balance". Derive from the pool ledger; fall back to the verdict's remaining only if the pool
-  // is unreadable (then without the committed/in-flight split, which only the ledger carries).
+  // is ABSENT (the ticket was never registered — taskBudget returns null; a read error EACCES/… THROWS out of
+  // taskBudget to the caller to retry, it does not reach this fallback).
   const st = taskBudget(home, ticketId);
   const lines: string[] = [];
   const tripped: string[] = [];
@@ -85,8 +86,9 @@ export function presentTripToCoordinator(
       if (r <= 0) tripped.push("tokens");
     }
   } else {
-    // pool unreadable — least-bad fallback from the verdict (no committed/in-flight split), still unit-tagged
-    // and still skipping any unbounded axis.
+    // pool ABSENT (taskBudget → null: the ticket was never registered). A read error (EACCES/…) does NOT land
+    // here — it throws out of taskBudget to the caller. Least-bad fallback from the verdict (no committed/
+    // in-flight split, which only the ledger carries), still unit-tagged and still skipping any unbounded axis.
     if (v.remaining.usd !== null) { lines.push(`USD remaining $${v.remaining.usd.toFixed(2)}`); if (v.remaining.usd <= 0) tripped.push("USD"); }
     if (v.remaining.tokens !== null) { lines.push(`tokens remaining ${v.remaining.tokens}`); if (v.remaining.tokens <= 0) tripped.push("tokens"); }
   }
