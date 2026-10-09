@@ -24,7 +24,6 @@ function assertSafeBatchId(id: string): void {
 function batchesDir(home: string): string { return path.join(home, ".agenthop", "console", "decision-batches"); }
 function batchDir(home: string, batchId: string): string { assertSafeBatchId(batchId); return path.join(batchesDir(home), batchId); }
 function batchPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "batch.json"); }
-function decisionsPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "decisions.json"); }
 /** Durable per-batch files (existence = the fact), all inside the batch dir.
  *  - `consumed.json`: the TERMINAL marker. Committed via temp+link (`createExclusiveAtomic`) so it appears ONLY with COMPLETE
  *    content (a half-written marker never seals the batch, DB-R2-P1-1) and is the atomic batch-level single winner (DB-P1-3).
@@ -37,18 +36,17 @@ function decisionsPath(home: string, batchId: string): string { return path.join
  *    intent — is the only "definitely sent" signal. */
 function consumedMarkerPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "consumed.json"); }
 function claimPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "decisions-consumed-claim.json"); }
-function rejectedClaimPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "decisions-rejected-claim.json"); }
 function notifiedMarkerPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.json"); }
 function notifyLockPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.lock"); }
 function notifiedSentPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.sent"); }
-/** TG-P1-2 (round 4): per-item entry TAPS. An entry (TG tap) records ONE item into its OWN file `taps/<itemIndex>.json` (a
- *  single-decision DecisionsDoc). The filename is the item's INDEX in the batch — a LOSSLESS, collision-free key. (Round 3 hashed
- *  the item id, which aliased DISTINCT valid ids whose UTF-8 encodings coincide — e.g. an unpaired surrogate U+D800 and U+FFFD
- *  both encode to the U+FFFD bytes — so one tap silently overwrote the other. The index is unique per item and always path-safe.)
- *  A tap never read-merge-overwrites the shared decisions.json (a console full-snapshot is a DIFFERENT file, each item a DIFFERENT
- *  file, a recoverable claim a DIFFERENT file); readDecisions/consume FOLD them all by write order. No write race ⇒ no lost sibling. */
-function tapsDir(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "taps"); }
-function tapPath(home: string, batchId: string, itemIndex: number): string { return path.join(tapsDir(home, batchId), `${itemIndex}.json`); }
+/** TG-R3 (round 6): the APPEND-ONLY SLOT LEDGER. EVERY publish — a console full-snapshot (writeDecisions) and a single-item entry
+ *  tap (recordDecision) — grabs the next free monotonic slot `seq/<n>.json` via an EXCLUSIVE create (O_CREAT|O_EXCL semantics,
+ *  reusing createExclusiveAtomic's temp+link). Winning slot `n` atomically fixes this decision's PUBLISH ORDER; the record is
+ *  IMMUTABLE (never rewritten/renamed/chmod-reordered), so the order is DURABLE and BOUND to that exact decision version — unlike a
+ *  filesystem ctime/mtime (which a rename or chmod shifts, and a stat-after-read can skew). The fold orders by the slot number, so
+ *  read and consume share ONE order (naturally consistent, no per-consumer stack-variable ordering). No post-hoc marker needed. */
+function slotsDir(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "seq"); }
+function slotPath(home: string, batchId: string, n: number): string { return path.join(slotsDir(home, batchId), `${n}.json`); }
 
 /** Atomically create `target` with COMPLETE `content`, exclusively (no overwrite): write a temp fully, then `link` it into
  *  place. The name appears only once the bytes are all written (a partial/interrupted write — EFBIG, a crash — never yields a
@@ -181,8 +179,8 @@ function digestDoc(doc: DecisionsDoc): string {
 }
 function orphanSentPath(home: string, batchId: string, digest: string): string { return path.join(batchDir(home, batchId), `orphan-${digest}.sent`); }
 function emitOrphanSignal(home: string, batchId: string, owner: string): void {
-  const orphan = readJsonOrNull(decisionsPath(home, batchId), validDecisionsDoc);
-  if (!orphan || orphan.batchId !== batchId) return; // no valid pending decision
+  const orphan = readDecisions(home, batchId); // the CURRENT folded slot ledger (every published decision, by slot order)
+  if (!orphan) return; // no valid pending decision
   const digest = digestDoc(orphan);
   const consumed = readJsonOrNull(consumedMarkerPath(home, batchId), (raw) => (raw !== null && typeof raw === "object" && typeof (raw as Record<string, unknown>).digest === "string" ? (raw as { digest: string }) : null));
   if (consumed && consumed.digest === digest) return; // this IS the consumed verdict (already fulfilled) ⇒ not an orphan
@@ -224,60 +222,51 @@ export function readBatch(home: string, batchId: string): DecisionBatch | null {
 }
 
 export function readDecisions(home: string, batchId: string): DecisionsDoc | null {
-  // TG-R3-P2-1: the BASE is the console's authoritative snapshot, with the SAME precedence consume uses — a FRESH decisions.json
-  // SUPERSEDES a stale claim (only recover the claim when there is no fresh snapshot, then a stranded rejected-claim), so read and
-  // consume mean ONE thing. Then FOLD the per-item taps onto the base by PUBLISH order (TG-R3-P1-1). null when there is nothing.
-  const base = readDocEntry(decisionsPath(home, batchId), batchId)
-            ?? readDocEntry(claimPath(home, batchId), batchId)
-            ?? readDocEntry(rejectedClaimPath(home, batchId), batchId);
-  return foldDecisionDocs([...(base ? [base] : []), ...readTaps(home, batchId)], batchId);
+  // The EFFECTIVE ledger = every published slot FOLDED by slot number (the durable publish order), latest-per-id wins. read and
+  // consume fold the SAME slots, so they are naturally consistent (TG-R3-P2-1); the order is the immutable slot index, not a
+  // drift-prone filesystem timestamp (TG-R3-P1-1). null when no slot is published yet.
+  return foldDecisionDocs(readSlots(home, batchId), batchId);
 }
 
-/** Read a DecisionsDoc at `file` with its PUBLISH-ORDER token — the ctime (set by the atomic temp->rename PUBLISH). mtime is the
- *  TEMP's content-write time and does NOT reflect publish order (a content written first but renamed last, TG-R3-P1-1), so it is
- *  never used for ordering. CONSISTENT SNAPSHOT (TG-R3-P2-1): stat, read, re-stat and retry until ctime+ino are stable across the
- *  read, so the content and its order token always belong to the SAME version. A real read error (EACCES) PROPAGATES — it is NEVER
- *  fabricated into order=0 (which would release a stale verdict as if it were oldest). ENOENT ⇒ null; corrupt ⇒ null; a doc not
- *  bound to `batchId` (when given) ⇒ null (misbound/foreign). */
-function readDocEntry(file: string, batchId?: string): { doc: DecisionsDoc; order: bigint } | null {
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    let st1: import("node:fs").BigIntStats;
-    try { st1 = statSync(file, { bigint: true }); }
-    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; } // EACCES etc PROPAGATE (never order=0)
-    let raw: string;
-    try { raw = readFileSync(file, "utf8"); }
-    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
-    let st2: import("node:fs").BigIntStats;
-    try { st2 = statSync(file, { bigint: true }); }
-    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
-    if (st1.ctimeNs !== st2.ctimeNs || st1.ino !== st2.ino) continue; // changed under the read ⇒ retry for a consistent snapshot
-    let doc: DecisionsDoc | null;
-    try { doc = validDecisionsDoc(JSON.parse(raw)); } catch { doc = null; }
-    if (!doc || (batchId !== undefined && doc.batchId !== batchId)) return null;
-    return { doc, order: st2.ctimeNs };
-  }
-  throw new Error(`readDocEntry: ${file} kept changing under read (no consistent snapshot)`); // a read error ⇒ retry, never a seal
-}
-
-/** Read every per-item TAP for a batch (with its publish-order token). A dir/file read error PROPAGATES (never folded to [] — a
- *  lost tap is a lost approval, TG-P2-1); a missing dir ⇒ none; a corrupt/misbound tap file ⇒ skipped. */
-function readTaps(home: string, batchId: string): { doc: DecisionsDoc; order: bigint }[] {
+/** Read every published SLOT for a batch as {doc, order=slot#}. A dir/file read error PROPAGATES (never folded to [] — a lost slot
+ *  is a lost/miscounted verdict); a missing dir ⇒ none; a corrupt/misbound slot ⇒ skipped. The slot is IMMUTABLE, so one read is a
+ *  consistent snapshot (no stat/ctime race): the order is the filename's integer, bound to the record written at slot creation. */
+function readSlots(home: string, batchId: string): { doc: DecisionsDoc; order: bigint }[] {
   let names: string[];
-  try { names = readdirSync(tapsDir(home, batchId)); }
+  try { names = readdirSync(slotsDir(home, batchId)); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
   const out: { doc: DecisionsDoc; order: bigint }[] = [];
-  for (const n of names) {
-    if (!n.endsWith(".json")) continue;
-    const e = readDocEntry(path.join(tapsDir(home, batchId), n), batchId); // throws on a real read error ⇒ kept, not dropped
-    if (e) out.push(e);
+  for (const name of names) {
+    const m = /^(\d+)\.json$/.exec(name); // only canonical slot files (skip temps / anything else)
+    if (!m) continue;
+    const doc = readJsonOrNull(path.join(slotsDir(home, batchId), name), validDecisionsDoc); // throws on a real read error ⇒ kept, not dropped
+    if (doc && doc.batchId === batchId) out.push({ doc, order: BigInt(m[1]!) });
   }
   return out;
 }
 
-/** Drop all taps after a batch is SEALED (consumed-once). Best-effort: the terminal marker is the truth — a leftover tap can
- *  never re-consume (consume refuses a sealed batch), and a fault BEFORE the seal keeps the taps recoverable for a retry. */
-function removeTaps(home: string, batchId: string): void {
-  try { rmSync(tapsDir(home, batchId), { recursive: true, force: true }); } catch { /* best-effort; sealed is terminal */ }
+/** The highest published slot number + 1 (the probe start for the next publish). ENOENT ⇒ 0; a read error PROPAGATES (a publisher
+ *  must not silently start at 0 against an unreadable ledger). */
+function nextSlotStart(home: string, batchId: string): number {
+  let names: string[];
+  try { names = readdirSync(slotsDir(home, batchId)); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return 0; throw e; }
+  let max = -1;
+  for (const name of names) { const m = /^(\d+)\.json$/.exec(name); if (m) max = Math.max(max, Number(m[1])); }
+  return max + 1;
+}
+
+/** Publish ONE decision record by COMPETING for the next free monotonic slot: probe n = highest+1, EXCLUSIVE-create seq/<n>.json;
+ *  on EEXIST (a concurrent publisher won n) probe n+1 and retry. The slot that is exclusively created IS the acceptance point — the
+ *  publish order is fixed atomically and the record is immutable, so no later op (rename/chmod/retry) can drift it. Returns the slot
+ *  number. The caller refuses a sealed batch first; a slot that still lands after a seal is surfaced as an orphan by consume (R25). */
+function publishSlot(home: string, batchId: string, record: DecisionsDoc): number {
+  mkdirSync(slotsDir(home, batchId), { recursive: true, mode: 0o700 });
+  let n = nextSlotStart(home, batchId);
+  for (;;) {
+    if (createExclusiveAtomic(slotPath(home, batchId, n), JSON.stringify(record)) === "created") return n;
+    n += 1; // the slot was taken by a concurrent publisher ⇒ a LATER publisher gets a HIGHER slot ⇒ publish order preserved
+  }
 }
 
 /** Persist a batch (validate at the write boundary — never persist a batch the read side would reject, e.g. a duplicate id). */
@@ -287,13 +276,14 @@ function writeBatch(home: string, batch: DecisionBatch): void {
   writeJsonAtomic(batchPath(home, valid.batchId), valid);
 }
 
-/** Write the user's decisions (validate at the write boundary). The console/CLI calls this after the user clears the batch. */
+/** Write the user's decisions (validate at the write boundary). The console/CLI calls this after the user clears the batch —
+ *  ONE publish event = ONE immutable slot (the full snapshot). */
 export function writeDecisions(home: string, doc: DecisionsDoc): void {
   const valid = validDecisionsDoc(doc);
   if (!valid) throw new Error("writeDecisions: refusing to persist an invalid decisions doc");
-  // DB-P1-3 (write boundary): a batch consumed once is DONE — refuse to persist fresh decisions into it. A concurrent write
-  // DURING a consume is intentionally ALLOWED (not locked): the newer decision must be able to win (R24: valid verdict
-  // recoverable / latest wins), and the consume RE-CLAIMS the latest decisions.json right before it commits.
+  // DB-P1-3 (write boundary): a batch consumed once is DONE — refuse to persist fresh decisions into it. A concurrent publish
+  // DURING a consume is intentionally ALLOWED (not locked, R24/R25): it grabs a HIGHER slot, so if it lands before the seal it
+  // wins by slot order; if after, consume surfaces it as an orphan.
   if (existsStrict(consumedMarkerPath(home, valid.batchId))) throw new Error(`writeDecisions: batch ${valid.batchId} already consumed — remaining items are re-batched under a new batchId`);
   // TG-P1-1 (round 3): enforce the scope ladder at the WRITE boundary too (not only at resolve) — a hard-gate item can NEVER be
   // SAVED with a this-chat/always grant, from console or TG. Clamp against the REAL item; the consume-side clamp stays a backstop.
@@ -301,15 +291,15 @@ export function writeDecisions(home: string, doc: DecisionsDoc): void {
   const enforced: DecisionsDoc = batch
     ? { ...valid, decisions: valid.decisions.map((d) => { const it = batch.items.find((i) => i.id === d.id); return it ? enforceScope(it, d) : d; }) }
     : valid;
-  writeJsonAtomic(decisionsPath(home, valid.batchId), enforced);
+  publishSlot(home, valid.batchId, enforced); // append-only slot ⇒ durable publish order, never overwrites a sibling
 }
 
-/** TG-P1-2 (round 3): record ONE item's decision as its OWN tap file — NEVER a read-merge-write of the shared decisions.json
- *  (which races the console's full-snapshot writeDecisions and misses a decision stranded in a recoverable claim). readDecisions
- *  and consume FOLD decisions.json + the claim + every tap, latest-per-id, so no sibling is ever lost. Under the per-batch lock
- *  (serialized vs consume so a tap never lands mid-seal): refuse if already consumed (sealed -> a no-op, no fork), enforce the
- *  scope against the REAL item (TG-P1-1), write the one-item tap. "contended" => a concurrent holder has the lock, the caller
- *  must retry (do NOT treat as decided). "unknown-item" => the id is not in this batch. */
+/** Record ONE item's decision as its OWN immutable slot (an entry tap). Each tap COMPETES for the next slot, so the publish order
+ *  is durable + bound to this exact decision (TG-R3-P1-1/P2-1) — a re-tap of the same item just grabs a LATER slot that supersedes
+ *  it by order (the fold keeps the latest-per-id). Under the per-batch lock (serialized vs consume so a tap never lands mid-seal):
+ *  refuse if already consumed (sealed -> a no-op, no fork), enforce the scope against the REAL item (TG-P1-1), publish the one-item
+ *  slot. "contended" => a concurrent holder has the lock, the caller must retry (do NOT treat as decided). "unknown-item" => the id
+ *  is not in this batch. */
 export function recordDecision(home: string, batchId: string, decision: Decision, nowSec: number): "recorded" | "consumed" | "unknown-item" | "contended" {
   const batch = readBatch(home, batchId);
   if (!batch) throw new Error(`recordDecision: no such batch ${batchId}`);
@@ -319,10 +309,7 @@ export function recordDecision(home: string, batchId: string, decision: Decision
   if (token === null) return "contended";
   try {
     if (existsStrict(consumedMarkerPath(home, batchId))) return "consumed"; // sealed — no fork, the tap is a no-op
-    // One file per item, keyed by the item's INDEX (lossless/collision-free — TG-P1-2): a re-tap overwrites ITS OWN file (latest
-    // wins); two distinct items are two files even if their ids UTF-8-alias; the console's decisions.json and a recoverable claim
-    // are separate files folded in at read/consume.
-    writeJsonAtomic(tapPath(home, batchId, idx), { batchId, decidedAtSec: nowSec, decisions: [enforceScope(batch.items[idx]!, decision)] });
+    publishSlot(home, batchId, { batchId, decidedAtSec: nowSec, decisions: [enforceScope(batch.items[idx]!, decision)] });
     return "recorded";
   } finally { releaseConsumeLock(home, batchId, token); }
 }
@@ -388,12 +375,12 @@ export type ConsumeResult = { resolved: ResolvedDecision[]; undecided: DecisionI
 
 /**
  * Consume the user's decisions for a batch EXACTLY ONCE across concurrent consumers, sequential re-submits, AND a fault +
- * retry. Shape: (1) a batch consumed once is TERMINAL (consumed.json, which only ever appears COMPLETE); (2) a claim moves
- * decisions.json → a STABLE name (decisions-consumed-claim.json) and reads THAT — a mid-consume fault leaves a recoverable claim
- * a retry finishes (never a stranded throwaway), and a newer claim atomically overwrites an older one so the latest decision
- * wins without wall-clock ordering; (3) the batch's single winner is whoever EXCLUSIVE-creates consumed.json (a claim rename
- * alone is not a batch-level commit). `consumed:false` + all-undecided means: not decided yet, OR a racer already closed the
- * batch. The coordinator executes `resolved` (approve/reject) and re-batches `undecided` + deferred under a NEW batchId.
+ * retry. Shape: (1) a batch consumed once is TERMINAL (consumed.json, which only ever appears COMPLETE); (2) the decisions are the
+ * append-only SLOT LEDGER (seq/<n>.json), folded by slot order — IMMUTABLE records, so a mid-consume fault leaves them intact for a
+ * retry to re-fold identically, and the latest decision wins by its higher slot (no wall-clock / ctime ordering); the merged result
+ * is projected to decisions-consumed-claim.json for the existing read side; (3) the batch's single winner is whoever EXCLUSIVE-creates
+ * consumed.json. `consumed:false` + all-undecided means: not decided yet, OR a racer already closed the batch. The coordinator
+ * executes `resolved` (approve/reject) and re-batches `undecided` + deferred under a NEW batchId.
  */
 export function consumeDecisions(home: string, batchId: string): ConsumeResult {
   const batch = readBatch(home, batchId); // DB-P1-1: dir-bound — a planted/foreign batch.json reads as null ⇒ "no such batch"
@@ -408,54 +395,24 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
   if (token === null) return { ...none, contended: true };
   try {
     if (existsStrict(consumedMarker)) { emitOrphanSignal(home, batchId, batch.owner); return none; } // terminal — surface any orphan (R25), under the lock
-    const claim = claimPath(home, batchId);
-    const dpath = decisionsPath(home, batchId);
-    // Claim the LATEST decision: a FRESH decisions.json first; else RESUME a prior in-progress claim; else RECOVER a VALID doc
-    // stranded in the rejected slot (foreign — batchId≠dir — left there). writeDecisions is NOT locked (R25: concurrent writes
-    // are accepted, not refused), so a newer decision may land concurrently — we re-claim it below so the latest wins. TG-R3-P1-1:
-    // CAPTURE each fresh snapshot's PUBLISH ctime BEFORE the rename (a rename resets ctime, so the claim's own ctime would be the
-    // consume time, not the console's publish). A stat read error PROPAGATES (never a fabricated order).
-    let baseOrder: bigint | null = null;
-    const claimFresh = (): void => { baseOrder = statSync(dpath, { bigint: true }).ctimeNs; renameSync(dpath, claim); };
-    if (existsStrict(dpath)) {
-      claimFresh();
-    } else if (!existsStrict(claim)) {
-      const rejected = rejectedClaimPath(home, batchId);
-      if (existsStrict(rejected)) {
-        const r = readDocEntry(rejected); // no filter: recover only a doc bound to THIS batch, carrying its own publish ctime
-        if (r && r.doc.batchId === batchId) { baseOrder = r.order; renameSync(rejected, claim); }
-      }
-    }
-    if (existsStrict(dpath)) claimFresh(); // R25 (newer wins): a write that landed during acquire/recover supersedes
-    // TG-P1-2/R3-P2-1: read every per-item entry tap under the lock (serialized vs recordDecision), each with its publish-order
-    // token. The EFFECTIVE ledger folds the console snapshot (the claim) with the taps BY PUBLISH ORDER — a read failure PROPAGATES
-    // (never silently drops a tap => a lost approval).
-    const taps = readTaps(home, batchId);
-    let base: { doc: DecisionsDoc; order: bigint } | null = null;
-    if (existsStrict(claim)) {
-      const entry = readDocEntry(claim); // no filter: get the doc even if misbound (to set aside + report its ids)
-      // DB-P1-1: the claimed doc MUST be bound to this batch; a misbound/corrupt claim yields NO verdict — set it aside (the taps,
-      // if any, still resolve for THIS batch). The base's order is the console PUBLISH ctime captured before the rename (or the
-      // claim's own ctime for a resumed claim with no fresh snapshot this pass).
-      if (entry && entry.doc.batchId === batchId) base = { doc: entry.doc, order: baseOrder ?? entry.order };
-      else {
-        try { renameSync(claim, rejectedClaimPath(home, batchId)); } catch { /* raced away */ }
-        if (taps.length === 0) return { ...none, unknownIds: entry ? entry.doc.decisions.map((d) => d.id) : [] };
-      }
-    }
-    if (!base && taps.length === 0) return none; // nothing to consume (no decisions yet)
-    const doc = foldDecisionDocs([...(base ? [base] : []), ...taps], batchId) ?? { batchId, decidedAtSec: 0, decisions: [] };
+    // Read the append-only SLOT LEDGER (the single authority) and FOLD by slot order (TG-R3). Read as late as possible — right
+    // before resolve+seal — so a publish that just landed (a HIGHER slot) is included (R25 newest-wins); a slot that lands AFTER
+    // this read is surfaced as an orphan below. A slot read failure PROPAGATES (never a silent drop ⇒ a lost approval). The slots
+    // are IMMUTABLE, so their order is the same for every reader and every retry — no claim move / permission change / stack-local
+    // ordering can drift it.
+    const slots = readSlots(home, batchId);
+    if (slots.length === 0) return none; // nothing to consume yet
+    const doc = foldDecisionDocs(slots, batchId) ?? { batchId, decidedAtSec: 0, decisions: [] };
     const res = resolveBatch(batch, doc);
-    // TG-R3-P2-1: persist the FULL merged ledger to the claim (the CANONICAL consumed record) BEFORE the terminal seal — so the
-    // existing read side (readDecisions and the bandwidth collector's readBoundDoc(claim)) always sees the complete consumed
-    // decisions, not a subset snapshot and not just the digest, with no post-seal window where the record is incomplete.
-    writeJsonAtomic(claim, doc);
-    // FINAL terminal commit (temp+link). DB-R7: if a concurrent consumer already created consumed.json ("exists"), we LOST the
-    // race — return NOT consumed (never return an executable verdict for a lost commit; no double-execute). EFBIG/EACCES THROWS
-    // with the claim intact ⇒ finally releases the lock, a retry resumes the SAME claim.
+    // The CANONICAL consumed record — a PROJECTION of the folded ledger for the existing read side (the bandwidth collector's
+    // readBoundDoc(claim), any post-consume canonical read). The slots remain the authority and keep their order; the claim never
+    // changes it (reviewer ruling). Written BEFORE the seal so the projection is complete the instant the batch is terminal.
+    writeJsonAtomic(claimPath(home, batchId), doc);
+    // FINAL terminal commit (temp+link). DB-R7: if a concurrent consumer already created consumed.json ("exists"), we LOST the race
+    // — return NOT consumed (never return an executable verdict for a lost commit; no double-execute). EFBIG/EACCES THROWS with the
+    // slots intact ⇒ finally releases the lock, a retry re-folds the SAME slots (idempotent).
     if (createExclusiveAtomic(consumedMarker, JSON.stringify({ batchId, decidedAtSec: doc.decidedAtSec, consumedAtMs: Date.now(), digest: digestDoc(doc) })) === "exists") return none;
-    removeTaps(home, batchId); // sealed ⇒ the taps are consumed-once (the merged claim now carries the whole record; a fault BEFORE the seal leaves taps recoverable)
-    emitOrphanSignal(home, batchId, batch.owner); // a decision that landed during this consume (now terminal) is an orphan — signal it (R25)
+    emitOrphanSignal(home, batchId, batch.owner); // a decision that landed during this consume (a higher slot now visible, now terminal) is an orphan — signal it (R25)
     return { ...res, consumed: true };
   } finally { releaseConsumeLock(home, batchId, token); }
 }

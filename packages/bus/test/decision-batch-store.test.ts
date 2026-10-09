@@ -85,18 +85,22 @@ describe("decision-batch store (IO)", () => {
   });
 
   const dbDir = (id: string) => path.join(HOME, ".agenthop", "console", "decision-batches", id);
+  // Write a RAW slot into the append-only ledger (bypassing the API) — simulates a planted/late/foreign publish for the invariant tests.
+  const rawSlot = (id: string, n: number, doc: unknown) => {
+    mkdirSync(path.join(dbDir(id), "seq"), { recursive: true });
+    writeFileSync(path.join(dbDir(id), "seq", `${n}.json`), JSON.stringify(doc));
+  };
 
-  test("DB-P1-1: a decisions doc bound to another batch, dropped into this batch's dir, is never consumed as its verdicts", () => {
+  test("DB-P1-1: a slot bound to another batch, planted in this batch's dir, is never consumed as its verdicts", () => {
     openBatch(HOME, { batchId: "A", owner: "coord", items: [item("1")], nowSec: 1 });
     openBatch(HOME, { batchId: "B", owner: "coord", items: [item("1")], nowSec: 1 });
-    // a foreign/misplaced write bypassing writeDecisions' dir derivation: batch B's doc sitting in batch A's directory
-    writeFileSync(path.join(dbDir("A"), "decisions.json"), JSON.stringify({ batchId: "B", decidedAtSec: 2, decisions: [{ id: "1", verdict: "approve" }] }));
+    // a foreign/misplaced publish: batch B's decision sitting as a slot in batch A's ledger
+    rawSlot("A", 0, { batchId: "B", decidedAtSec: 2, decisions: [{ id: "1", verdict: "approve" }] });
     const got = consumeDecisions(HOME, "A");
     expect(got.consumed).toBe(false);
-    expect(got.resolved).toEqual([]);                 // B's approve never authorizes A's item 1 (same id, different batch)
+    expect(got.resolved).toEqual([]);                 // B's approve never authorizes A's item 1 (same id, different batch) — readSlots drops it
     expect(got.undecided.map((i) => i.id)).toEqual(["1"]);
-    expect(got.unknownIds).toEqual(["1"]);            // reported as foreign, acted on by nothing
-    // the misbound claim did NOT mark A consumed ⇒ A's REAL decisions still work afterwards (no foreign-drop DoS)
+    // the foreign slot did NOT mark A consumed ⇒ A's REAL decisions still work afterwards (no foreign-drop DoS)
     writeDecisions(HOME, { batchId: "A", decidedAtSec: 3, decisions: [{ id: "1", verdict: "reject" }] });
     const real = consumeDecisions(HOME, "A");
     expect(real.consumed).toBe(true);
@@ -108,10 +112,8 @@ describe("decision-batch store (IO)", () => {
     writeDecisions(HOME, { batchId: "b1", decidedAtSec: 2, decisions: [{ id: "1", verdict: "reject", reason: "dup" }] });
     const got = consumeDecisions(HOME, "b1");
     expect(got.resolved.map((r) => [r.item.id, r.verdict])).toEqual([["1", "reject"]]);
-    // what we returned == the bytes renamed aside under decisions-consumed-* (the claimed file), not whatever decisions.json held
-    const consumedName = readdirSync(dbDir("b1")).find((n) => n.startsWith("decisions-consumed-"));
-    expect(consumedName).toBeTruthy();
-    const claimed = JSON.parse(readFileSync(path.join(dbDir("b1"), consumedName!), "utf8"));
+    // what we returned == the canonical consumed-record projection (the folded slot ledger), written at consume
+    const claimed = JSON.parse(readFileSync(path.join(dbDir("b1"), "decisions-consumed-claim.json"), "utf8"));
     expect(claimed.decisions).toEqual([{ id: "1", verdict: "reject", reason: "dup" }]);
   });
 
@@ -123,8 +125,8 @@ describe("decision-batch store (IO)", () => {
     expect(first.resolved.map((r) => [r.item.id, r.verdict])).toEqual([["1", "approve"], ["2", "defer"]]);
     // write boundary: the console cannot resubmit into a consumed batch — a deferred item can't be flipped to approve here
     expect(() => writeDecisions(HOME, { batchId: "b1", decidedAtSec: 3, decisions: [{ id: "2", verdict: "approve" }] })).toThrow(/already consumed/);
-    // even a raw/foreign re-write of decisions.json is not re-consumed (same approve never becomes actionable twice)
-    writeFileSync(path.join(dbDir("b1"), "decisions.json"), JSON.stringify({ batchId: "b1", decidedAtSec: 4, decisions: [{ id: "1", verdict: "approve" }, { id: "2", verdict: "approve" }] }));
+    // even a raw late slot appended after the seal is not re-consumed (same approve never becomes actionable twice)
+    rawSlot("b1", 1, { batchId: "b1", decidedAtSec: 4, decisions: [{ id: "1", verdict: "approve" }, { id: "2", verdict: "approve" }] });
     const again = consumeDecisions(HOME, "b1");
     expect(again.consumed).toBe(false);
     expect(again.resolved).toEqual([]);
@@ -171,45 +173,35 @@ describe("decision-batch store (IO)", () => {
     expect(got.resolved).toEqual([]);
   });
 
-  test("DB-R2-P1-1: a read fault after claiming leaves a RECOVERABLE claim — retry completes the SAME consume, no resubmit", () => {
+  test("DB-R2-P1-1 (slot): a read fault on a slot during consume is RECOVERABLE — retry completes the SAME verdict, no resubmit, no seal on the fault", () => {
     if (typeof process.getuid === "function" && process.getuid() === 0) return; // root bypasses chmod
     openBatch(HOME, { batchId: "b1", owner: "c", items: [item("1")], nowSec: 1 });
-    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 2, decisions: [{ id: "1", verdict: "approve", reason: "ok" }] });
-    const dpath = path.join(dbDir("b1"), "decisions.json");
-    const mode = statSync(dpath).mode & 0o777;
-    chmodSync(dpath, 0o000); // consume CLAIMS it (rename needs only dir write), then faults READING the claimed file
-    let blind = false; try { readFileSync(dpath); } catch { blind = true; }
+    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 2, decisions: [{ id: "1", verdict: "approve", reason: "ok" }] }); // slot 0
+    const s0 = path.join(dbDir("b1"), "seq", "0.json");
+    const mode = statSync(s0).mode & 0o777;
+    chmodSync(s0, 0o000); // consume reads the slot ledger and FAULTS reading slot 0 — the immutable slot is intact, just unreadable now
+    let blind = false; try { readFileSync(s0); } catch { blind = true; }
     try {
       if (!blind) return; // environment can still read (root-ish)
-      expect(() => consumeDecisions(HOME, "b1")).toThrow();                     // read fault surfaces; the claim persists as decisions-consumed-* (NOT "undecided")
-      expect(existsSync(path.join(dbDir("b1"), "consumed.json"))).toBe(false);  // not closed on a fault
-    } finally {
-      // restore perms on the claimed file (named decisions-consumed-*, exactly the reviewer's probe restore pattern)
-      for (const f of readdirSync(dbDir("b1"))) if (f === "decisions.json" || f.startsWith("decisions-consumed-")) chmodSync(path.join(dbDir("b1"), f), mode);
-    }
-    // recover permissions ⇒ retry RESUMES the claim and completes the SAME verdict with no user resubmit
+      expect(() => consumeDecisions(HOME, "b1")).toThrow();                     // read fault PROPAGATES (never a silent drop)
+      expect(existsSync(path.join(dbDir("b1"), "consumed.json"))).toBe(false);  // NOT sealed on a fault
+    } finally { chmodSync(s0, mode); }
+    // recover permissions ⇒ retry re-reads the SAME immutable slot and completes the SAME verdict with no user resubmit
     const got = consumeDecisions(HOME, "b1");
     expect(got.consumed).toBe(true);
     expect(got.resolved.map((r) => [r.item.id, r.verdict])).toEqual([["1", "approve"]]);
   });
 
-  test("DB-R3-P1-1: a newer failed claim supersedes an older one (stable claim name, no wall-clock ordering)", () => {
-    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root bypasses chmod
+  test("DB-R3-P1-1 (slot): a LATER slot supersedes an earlier one by slot order — DURABLE under a permission change (ctime drift can't reorder)", () => {
     openBatch(HOME, { batchId: "b1", owner: "c", items: [item("same")], nowSec: 1 });
-    const dpath = path.join(dbDir("b1"), "decisions.json");
-    const failClaim = (verdict: "approve" | "reject", ts: number) => {
-      writeDecisions(HOME, { batchId: "b1", decidedAtSec: ts, decisions: [{ id: "same", verdict }] });
-      const mode = statSync(dpath).mode & 0o777;
-      chmodSync(dpath, 0o000); // consume CLAIMS it (rename), then faults reading — leaving a recoverable claim
-      try { consumeDecisions(HOME, "b1"); } catch { /* read fault expected */ }
-      for (const f of readdirSync(dbDir("b1"))) if (f === "decisions.json" || f.startsWith("decisions-consumed-")) chmodSync(path.join(dbDir("b1"), f), mode);
-    };
-    let blind = false; writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
-    chmodSync(dpath, 0o000); try { readFileSync(dpath); } catch { blind = true; } chmodSync(dpath, 0o600);
-    if (!blind) return; // environment can still read (root-ish)
-    failClaim("approve", 20); // older claim
-    failClaim("reject", 21);  // newer claim OVERWRITES the stale approve claim (stable name)
-    const got = consumeDecisions(HOME, "b1"); // retry: the later (reject) wins, never the revived older approve
+    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] }); // slot 0
+    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 21, decisions: [{ id: "same", verdict: "reject" }] });  // slot 1 (later publish)
+    // a permission change on the OLDER slot advances its ctime but NOT its slot number — the order must not drift (the ctime-killer).
+    if (!(typeof process.getuid === "function" && process.getuid() === 0)) {
+      const s0 = path.join(dbDir("b1"), "seq", "0.json"); const mode = statSync(s0).mode & 0o777;
+      chmodSync(s0, 0o400); chmodSync(s0, mode);
+    }
+    const got = consumeDecisions(HOME, "b1"); // the later slot (reject) wins, never the revived older approve
     expect(got.consumed).toBe(true);
     expect(got.resolved.map((r) => r.verdict)).toEqual(["reject"]);
   });
@@ -230,50 +222,17 @@ describe("decision-batch store (IO)", () => {
     expect(readdirSync(dbDir("b1")).some((n) => n.includes(".tmp-"))).toBe(false); // temp cleaned up
   });
 
-  test("DB-R3-P1-1 (instance): an old reader whose claim was replaced does NOT commit its stale verdict (inode binding)", () => {
+  // (The round-5 claim-inode / commit-verify-undo / rejected-slot-recovery tests are retired: the slot ledger has NO mutable claim
+  //  to swap or mis-archive — each slot is an IMMUTABLE record, never renamed, so those races cannot occur. The invariant they
+  //  guarded — a stale verdict is never committed and no valid decision is lost — is now structural and covered below + by DB-R3-P1-1 (slot).)
+  test("DB-R3-P1-1 (slot): concurrent publishers get DISTINCT slots and the later one wins the fold; a foreign slot is dropped, not lost-as", () => {
     openBatch(HOME, { batchId: "b1", owner: "c", items: [item("same")], nowSec: 1 });
-    // old consumer's claim sits as approve; simulate a concurrent replacement AFTER it read by swapping the claim inode
-    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
-    const claim = path.join(dbDir("b1"), "decisions-consumed-claim.json");
-    renameSync(path.join(dbDir("b1"), "decisions.json"), claim); // the old claim (approve)
-    const readIno = statSync(claim).ino;
-    // a newer consumer replaces the claim instance (reject) — different inode at the same path
-    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 21, decisions: [{ id: "same", verdict: "reject" }] });
-    renameSync(path.join(dbDir("b1"), "decisions.json"), claim); // overwrite ⇒ new inode
-    expect(statSync(claim).ino).not.toBe(readIno); // precondition: the instance changed
-    // a consume now reads the CURRENT claim (reject) and commits it; the stale approve instance is gone
+    rawSlot("b1", 0, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] }); // slot 0
+    rawSlot("b1", 1, { batchId: "b1", decidedAtSec: 21, decisions: [{ id: "same", verdict: "reject" }] });  // slot 1 (later)
+    rawSlot("b1", 2, { batchId: "OTHER", decidedAtSec: 99, decisions: [{ id: "same", verdict: "approve" }] }); // foreign slot — dropped by readSlots
     const got = consumeDecisions(HOME, "b1");
     expect(got.consumed).toBe(true);
-    expect(got.resolved.map((r) => r.verdict)).toEqual(["reject"]); // the live instance wins, never the replaced approve
-  });
-
-  test("DB-R3-P1-1 (commit verify-undo): a committed marker is UNDONE when the claim was replaced before the link", () => {
-    openBatch(HOME, { batchId: "b1", owner: "c", items: [item("same")], nowSec: 1 });
-    writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
-    const claim = path.join(dbDir("b1"), "decisions-consumed-claim.json");
-    renameSync(path.join(dbDir("b1"), "decisions.json"), claim); // O's claim (approve)
-    const readIno = statSync(claim).ino;
-    // simulate: O read approve, then a newer consumer replaced the claim instance (reject) before O's terminal commit
-    writeFileSync(path.join(dbDir("b1"), "decisions.json"), JSON.stringify({ batchId: "b1", decidedAtSec: 21, decisions: [{ id: "same", verdict: "reject" }] }));
-    renameSync(path.join(dbDir("b1"), "decisions.json"), claim); // overwrite ⇒ new inode (reject)
-    expect(statSync(claim).ino).not.toBe(readIno);
-    // retry consumes the live reject instance (not the stale approve); verify-undo guarantees no stale commit
-    const got = consumeDecisions(HOME, "b1");
-    expect(got.consumed).toBe(true);
-    expect(got.resolved.map((r) => r.verdict)).toEqual(["reject"]);
-  });
-
-  test("DB-R3-P1-1 (equiv verification): a mis-archived VALID doc is recovered from the rejected slot — no valid decision lost", () => {
-    openBatch(HOME, { batchId: "b1", owner: "c", items: [item("same")], nowSec: 1 });
-    // a bound (valid) decisions doc stranded in the rejected slot — e.g. an archive restore that faulted (DB-R2-P1-1 window C)
-    writeFileSync(path.join(dbDir("b1"), "decisions-rejected-claim.json"), JSON.stringify({ batchId: "b1", decidedAtSec: 9, decisions: [{ id: "same", verdict: "reject" }] }));
-    const got = consumeDecisions(HOME, "b1"); // resume-fallback recovers it
-    expect(got.consumed).toBe(true);
-    expect(got.resolved.map((r) => r.verdict)).toEqual(["reject"]);
-    // a genuinely-foreign doc in the rejected slot is NEVER recovered (stays discarded)
-    openBatch(HOME, { batchId: "b2", owner: "c", items: [item("same")], nowSec: 1 });
-    writeFileSync(path.join(dbDir("b2"), "decisions-rejected-claim.json"), JSON.stringify({ batchId: "OTHER", decidedAtSec: 9, decisions: [{ id: "same", verdict: "approve" }] }));
-    expect(consumeDecisions(HOME, "b2").consumed).toBe(false);
+    expect(got.resolved.map((r) => r.verdict)).toEqual(["reject"]); // the later bound slot wins; the foreign slot never authorizes anything
   });
 
   // ---- R24: unified per-batch lock (no stale commit + valid recoverable, by excluding concurrent replacement) ----
@@ -320,8 +279,8 @@ describe("decision-batch store (IO)", () => {
     openBatch(HOME, { batchId: "b1", owner: "coord-sid", items: [item("same")], nowSec: 1 });
     writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
     expect(consumeDecisions(HOME, "b1").resolved.map((r) => r.verdict)).toEqual(["approve"]); // consumed.decidedAtSec=20
-    // a NEWER valid decision lands after the batch is terminal — an orphan
-    writeFileSync(path.join(dbDir("b1"), "decisions.json"), JSON.stringify({ batchId: "b1", decidedAtSec: 21, decisions: [{ id: "same", verdict: "reject" }] }));
+    // a NEWER valid decision lands (a later slot) after the batch is terminal — an orphan
+    rawSlot("b1", 1, { batchId: "b1", decidedAtSec: 21, decisions: [{ id: "same", verdict: "reject" }] });
     expect(consumeDecisions(HOME, "b1").consumed).toBe(false); // terminal — detects the orphan + signals the owner
     const first = claimInbox(HOME, ["coord-sid"], "probe").map((c) => c.msg);
     const orphan = first.find((m) => m.title === "orphan decision — re-batch");
@@ -337,7 +296,7 @@ describe("decision-batch store (IO)", () => {
     const d = { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "reject" as const }] };
     writeDecisions(HOME, d);
     consumeDecisions(HOME, "b1"); // consumed.json records the content digest of d
-    writeFileSync(path.join(dbDir("b1"), "decisions.json"), JSON.stringify(d)); // re-write the SAME decision (same content)
+    rawSlot("b1", 1, d); // a later slot with the SAME decision (same content)
     consumeDecisions(HOME, "b1");
     expect(claimInbox(HOME, ["coord-sid"], "probe").some((c) => c.msg.title === "orphan decision — re-batch")).toBe(false); // identical ⇒ already fulfilled ⇒ no signal
   });
@@ -346,9 +305,9 @@ describe("decision-batch store (IO)", () => {
     openBatch(HOME, { batchId: "b1", owner: "coord-sid", items: [item("same")], nowSec: 1 });
     writeDecisions(HOME, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "approve" }] });
     consumeDecisions(HOME, "b1");
-    writeFileSync(path.join(dbDir("b1"), "decisions.json"), JSON.stringify({ batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "reject" }] })); // SAME second, different content
+    rawSlot("b1", 1, { batchId: "b1", decidedAtSec: 20, decisions: [{ id: "same", verdict: "reject" }] }); // a later slot, SAME second, different content
     consumeDecisions(HOME, "b1");
-    expect(claimInbox(HOME, ["coord-sid"], "probe").some((c) => c.msg.title === "orphan decision — re-batch")).toBe(true); // different content at the same second ⇒ orphan (A)
+    expect(claimInbox(HOME, ["coord-sid"], "probe").some((c) => c.msg.title === "orphan decision — re-batch")).toBe(true); // different content ⇒ orphan (digest, not decidedAtSec)
   });
 
   test("DB-R7: a consume NEVER steals or deletes a LIVE holder's lock (instance-bound; the race can't double-execute)", () => {
@@ -432,18 +391,8 @@ describe("TG-P1-2 (round 3): a tap never drops a sibling (recoverable claim / co
   const dbDir = (id: string) => path.join(HOME, ".agenthop", "console", "decision-batches", id);
   const batchesDir = () => path.join(HOME, ".agenthop", "console", "decision-batches");
 
-  test("counterexample A: a tap preserves a decision stranded in a RECOVERABLE claim (faulted consume)", () => {
-    openBatch(HOME, { batchId: "ca", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
-    writeDecisions(HOME, { batchId: "ca", decidedAtSec: 2, decisions: [{ id: "a", verdict: "approve" }] }); // console
-    // simulate a consume that claimed (decisions.json -> claim) then FAULTED before sealing: a recoverable claim remains.
-    renameSync(path.join(dbDir("ca"), "decisions.json"), path.join(dbDir("ca"), "decisions-consumed-claim.json"));
-    expect(recordDecision(HOME, "ca", { id: "b", verdict: "reject" }, 3)).toBe("recorded"); // TG tap for the OTHER item
-    const r = consumeDecisions(HOME, "ca");
-    expect(r.consumed).toBe(true);
-    const byId = Object.fromEntries(r.resolved.map((x) => [x.item.id, x.verdict]));
-    expect(byId).toEqual({ a: "approve", b: "reject" }); // the claim's `a` is NOT lost — both are consumed
-  });
-
+  // (counterexample A — "a tap preserves a decision stranded in a recoverable claim" — is retired: the slot ledger has no claim
+  //  to strand; both the console publish and the tap are independent immutable slots, so neither can lose the other, as below.)
   test("counterexample B: a tap and a concurrent console full-snapshot write BOTH survive (no overwrite)", () => {
     openBatch(HOME, { batchId: "cb", owner: "coord", items: [item("a"), item("c")], nowSec: 1 });
     expect(recordDecision(HOME, "cb", { id: "a", verdict: "approve" }, 2)).toBe("recorded"); // TG tap (own file)
@@ -522,107 +471,62 @@ describe("TG r4: write-order fold, lossless tap key, canonical consumed record",
     });
   }
 
-  test("TG-R3-P2-1: a recoverable claim + a tap BOTH appear in readDecisions (backlog not miscounted)", () => {
+  test("TG-R3-P2-1: a console slot + a tap slot BOTH appear in readDecisions (backlog not miscounted)", () => {
     openBatch(HOME, { batchId: "rc", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
-    writeDecisions(HOME, { batchId: "rc", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] });
-    // a consume that claimed (decisions.json -> claim) then FAULTED before sealing leaves a recoverable claim:
-    renameSync(path.join(d("rc"), "decisions.json"), path.join(d("rc"), "decisions-consumed-claim.json"));
-    expect(recordDecision(HOME, "rc", { id: "b", verdict: "reject" }, 1001)).toBe("recorded");
-    expect(readDecisions(HOME, "rc")!.decisions.map((x) => x.id).sort()).toEqual(["a", "b"]); // claim's a AND tap's b
+    writeDecisions(HOME, { batchId: "rc", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] }); // slot 0
+    expect(recordDecision(HOME, "rc", { id: "b", verdict: "reject" }, 1001)).toBe("recorded");                 // slot 1
+    expect(readDecisions(HOME, "rc")!.decisions.map((x) => x.id).sort()).toEqual(["a", "b"]); // both slots fold in
     expect(collectBandwidthEvents(HOME).backlog).toBe(0);                 // both decided -> no backlog miscount
   });
 
-  test("TG-P2-1: an unreadable taps dir does NOT seal (throws, recovers on retry)", () => {
+  test("TG-P2-1: an unreadable slot dir does NOT seal (throws, recovers on retry)", () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root bypasses chmod
     openBatch(HOME, { batchId: "ut", owner: "coord", items: [item("a")], nowSec: 1 });
     expect(recordDecision(HOME, "ut", { id: "a", verdict: "approve" }, 1000)).toBe("recorded");
-    const taps = path.join(d("ut"), "taps"); const mode = statSync(taps).mode;
-    chmodSync(taps, 0o000);
+    const seq = path.join(d("ut"), "seq"); const mode = statSync(seq).mode;
+    chmodSync(seq, 0o000);
     try {
       expect(() => readDecisions(HOME, "ut")).toThrow();
       expect(() => consumeDecisions(HOME, "ut")).toThrow();
       expect(existsSync(path.join(d("ut"), "consumed.json"))).toBe(false); // never sealed on a read failure
-    } finally { chmodSync(taps, mode); }
+    } finally { chmodSync(seq, mode); }
     const got = consumeDecisions(HOME, "ut");
     expect(got.consumed).toBe(true); expect(got.resolved.length).toBe(1); // recovers once readable
   });
 });
 
-// TG round-5 counterexamples (codex r4 verdict): ORDER must be PUBLISH order (the atomic temp->rename), not temp-content mtime;
-// content + order must bind to one version; an order-read error must propagate (no fabricated order=0); a fresh full snapshot
-// supersedes a stale claim. Ordering now uses the file's ctime (set by the rename = the publish), read as a consistent snapshot.
-describe("TG r5: publish-order (ctime, not temp mtime), same-version binding, read-error propagation", () => {
+
+// TG round-6 (codex r5 verdict + coordinator ruling): ctime is NOT a durable, version-bound publish order — a rename moves it, a
+// CHMOD advances it with identical content (proven on APFS), a stat-after-read skews it, a retry loses a stack-local order. The
+// publish order is now the APPEND-ONLY SLOT LEDGER: each decision EXCLUSIVE-creates the next seq/<n>.json; the slot NUMBER is the
+// durable, immutable, version-bound order; read and consume fold the SAME slots. These assert the properties ctime failed to hold.
+describe("TG r6: slot-ledger durable publish order", () => {
   const d = (id: string) => path.join(HOME, ".agenthop", "console", "decision-batches", id);
+  const slot = (id: string, n: number, doc: unknown) => { mkdirSync(path.join(d(id), "seq"), { recursive: true }); writeFileSync(path.join(d(id), "seq", `${n}.json`), JSON.stringify(doc)); };
 
-  test("TG-R4-P1-1: a console reject whose RENAME completes AFTER a tap approve wins (publish order, not temp-content time)", () => {
-    openBatch(HOME, { batchId: "ap", owner: "coord", items: [item("a")], nowSec: 1 });
-    const snap = path.join(d("ap"), "decisions.json");
-    const orig = fs.renameSync; let entered = false;
-    // console serializes its temp FIRST; the tap publishes DURING the console rename (before it completes); console publishes LAST.
-    const spy = vi.spyOn(fs, "renameSync").mockImplementation(((src: unknown, dst: unknown) => {
-      if (String(dst) === snap && !entered) { entered = true; expect(recordDecision(HOME, "ap", { id: "a", verdict: "approve" }, 1000)).toBe("recorded"); }
-      return (orig as (s: unknown, dd: unknown) => void)(src, dst);
-    }) as typeof fs.renameSync);
-    syncBuiltinESMExports();
-    try { writeDecisions(HOME, { batchId: "ap", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "reject" }] }); }
-    finally { spy.mockRestore(); syncBuiltinESMExports(); }
-    expect(entered).toBe(true);
-    expect(readDecisions(HOME, "ap")!.decisions[0]!.verdict).toBe("reject");          // the later-PUBLISHED console reject
-    expect(consumeDecisions(HOME, "ap").resolved[0]!.verdict).toBe("reject");
+  test("the ctime-killer: a permission change on the older slot (identical content, advanced ctime) does NOT reorder — the later slot wins", () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root bypasses chmod
+    openBatch(HOME, { batchId: "ck", owner: "coord", items: [item("a")], nowSec: 1 });
+    slot("ck", 0, { batchId: "ck", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] }); // earlier publish
+    slot("ck", 1, { batchId: "ck", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "reject" }] });  // later publish (SAME second)
+    const s0 = path.join(d("ck"), "seq", "0.json"); const mode = statSync(s0).mode & 0o777;
+    chmodSync(s0, 0o400); chmodSync(s0, mode); // advances slot 0's ctime with UNCHANGED content — a ctime order would now wrongly pick approve
+    expect(readDecisions(HOME, "ck")!.decisions[0]!.verdict).toBe("reject"); // slot order is immune to the ctime bump
+    expect(consumeDecisions(HOME, "ck").resolved[0]!.verdict).toBe("reject");
   });
 
-  test("TG-R4-P1-1: an order-metadata (stat) read error PROPAGATES — no seal, no stale approval", () => {
-    openBatch(HOME, { batchId: "se", owner: "coord", items: [item("a")], nowSec: 1 });
-    expect(recordDecision(HOME, "se", { id: "a", verdict: "approve" }, 1000)).toBe("recorded");
-    writeDecisions(HOME, { batchId: "se", decidedAtSec: 1001, decisions: [{ id: "a", verdict: "reject" }] });
-    const claim = path.join(d("se"), "decisions-consumed-claim.json");
-    const orig = fs.statSync; let injected = false;
-    const spy = vi.spyOn(fs, "statSync").mockImplementation(((f: unknown, ...a: unknown[]) => {
-      if (String(f) === claim && (a[0] as { bigint?: boolean } | undefined)?.bigint && !injected) { injected = true; throw Object.assign(new Error("metadata unavailable"), { code: "EACCES" }); }
-      return (orig as (ff: unknown, ...aa: unknown[]) => unknown)(f, ...a);
-    }) as typeof fs.statSync);
-    syncBuiltinESMExports();
-    let threw = false;
-    try { consumeDecisions(HOME, "se"); } catch { threw = true; } finally { spy.mockRestore(); syncBuiltinESMExports(); }
-    expect(injected).toBe(true);
-    expect(threw).toBe(true);
-    expect(existsSync(path.join(d("se"), "consumed.json"))).toBe(false);              // never sealed on an order-read error
+  test("read and consume agree on the SAME slot order (no per-reader divergence)", () => {
+    openBatch(HOME, { batchId: "ag", owner: "coord", items: [item("a")], nowSec: 1 });
+    expect(recordDecision(HOME, "ag", { id: "a", verdict: "approve" }, 1000)).toBe("recorded"); // slot 0
+    writeDecisions(HOME, { batchId: "ag", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "reject" }] }); // slot 1 (later)
+    expect(readDecisions(HOME, "ag")!.decisions[0]!.verdict).toBe("reject"); // read
+    expect(consumeDecisions(HOME, "ag").resolved[0]!.verdict).toBe("reject"); // consume — identical order
   });
 
-  test("TG-R4-P2-1: content and order metadata belong to the SAME version (a mid-read swap is not skewed)", () => {
-    openBatch(HOME, { batchId: "sv", owner: "coord", items: [item("a")], nowSec: 1 });
-    writeDecisions(HOME, { batchId: "sv", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] });
-    expect(recordDecision(HOME, "sv", { id: "a", verdict: "reject" }, 1001)).toBe("recorded");
-    const snap = path.join(d("sv"), "decisions.json");
-    const orig = fs.readFileSync; let replaced = false;
-    const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((f: unknown, ...a: unknown[]) => {
-      const v = (orig as (ff: unknown, ...aa: unknown[]) => unknown)(f, ...a);
-      if (String(f) === snap && !replaced) { replaced = true; writeDecisions(HOME, { batchId: "sv", decidedAtSec: 1002, decisions: [{ id: "a", verdict: "reject" }] }); }
-      return v;
-    }) as typeof fs.readFileSync);
-    syncBuiltinESMExports();
-    let read: ReturnType<typeof readDecisions>;
-    try { read = readDecisions(HOME, "sv"); } finally { spy.mockRestore(); syncBuiltinESMExports(); }
-    expect(replaced).toBe(true);
-    expect(read!.decisions[0]!.verdict).toBe("reject");                               // not a v1-content paired with v2-order
-  });
-
-  test("TG-R4-P2-1: a fresh full snapshot SUPERSEDES a stale recoverable claim (not a union)", () => {
-    openBatch(HOME, { batchId: "fs", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
-    writeDecisions(HOME, { batchId: "fs", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] });
-    const cur = path.join(d("fs"), "decisions.json"), claim = path.join(d("fs"), "decisions-consumed-claim.json");
-    chmodSync(cur, 0o000); // a consume that claims (rename -> claim) then faults reading it
-    try { expect(() => consumeDecisions(HOME, "fs")).toThrow(); } finally { for (const p of [cur, claim]) if (existsSync(p)) chmodSync(p, 0o600); }
-    writeDecisions(HOME, { batchId: "fs", decidedAtSec: 1001, decisions: [{ id: "b", verdict: "reject" }] }); // fresh full snapshot
-    const read = readDecisions(HOME, "fs")!;
-    expect(read.decisions.length).toBe(1); expect(read.decisions[0]!.id).toBe("b");   // the stale claim's a is NOT unioned in
-    expect(collectBandwidthEvents(HOME).backlog).toBe(1);
-    expect(consumeDecisions(HOME, "fs").resolved.length).toBe(1);
-  });
-
-  test("TG-R4-P2-1 control: the canonical claim survives a seal failure; a later tap + retry still consumes all", () => {
+  test("control: the canonical claim survives a seal failure; a later tap + retry still consumes all (latest wins by slot)", () => {
     openBatch(HOME, { batchId: "cf", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
-    writeDecisions(HOME, { batchId: "cf", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] });
-    expect(recordDecision(HOME, "cf", { id: "b", verdict: "approve" }, 1001)).toBe("recorded");
+    writeDecisions(HOME, { batchId: "cf", decidedAtSec: 1000, decisions: [{ id: "a", verdict: "approve" }] }); // slot 0
+    expect(recordDecision(HOME, "cf", { id: "b", verdict: "approve" }, 1001)).toBe("recorded");               // slot 1
     const marker = path.join(d("cf"), "consumed.json");
     const orig = fs.linkSync; let injected = false;
     const spy = vi.spyOn(fs, "linkSync").mockImplementation(((s: unknown, dst: unknown) => {
@@ -632,11 +536,11 @@ describe("TG r5: publish-order (ctime, not temp mtime), same-version binding, re
     syncBuiltinESMExports();
     try { expect(() => consumeDecisions(HOME, "cf")).toThrow(); } finally { spy.mockRestore(); syncBuiltinESMExports(); }
     expect(injected).toBe(true);
-    expect(existsSync(marker)).toBe(false);
-    expect(readDecisions(HOME, "cf")!.decisions.length).toBe(2);                      // the merged claim survived the seal failure
-    expect(recordDecision(HOME, "cf", { id: "a", verdict: "reject" }, 1002)).toBe("recorded");
+    expect(existsSync(marker)).toBe(false);                                   // not sealed on the seal fault
+    expect(readDecisions(HOME, "cf")!.decisions.length).toBe(2);              // the immutable slots survived the fault
+    expect(recordDecision(HOME, "cf", { id: "a", verdict: "reject" }, 1002)).toBe("recorded"); // slot 2 (later)
     const got = consumeDecisions(HOME, "cf");
-    expect(got.resolved.find((r) => r.item.id === "a")!.verdict).toBe("reject");      // the later tap wins on retry
+    expect(got.resolved.find((r) => r.item.id === "a")!.verdict).toBe("reject"); // the later slot wins on retry
     expect(collectBandwidthEvents(HOME).consumeAtSec.length).toBe(2);
   });
 });

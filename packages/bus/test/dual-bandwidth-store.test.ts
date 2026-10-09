@@ -164,12 +164,11 @@ describe("dual-bandwidth IO store", () => {
     const h = mkHome();
     const t = nowSec();
     openBatch(h, { batchId: "b1", owner: "coord", items: items(3), nowSec: t });
-    writeDecisions(h, { batchId: "b1", decidedAtSec: t, decisions: [{ id: "it0", verdict: "approve" }] }); // 1 decided ⇒ backlog 2
-    // simulate consumeDecisions that CLAIMED decisions.json then faulted before committing consumed.json:
-    renameSync(path.join(batchesDir(h), "b1", "decisions.json"), path.join(batchesDir(h), "b1", "decisions-consumed-claim.json"));
+    writeDecisions(h, { batchId: "b1", decidedAtSec: t, decisions: [{ id: "it0", verdict: "approve" }] }); // 1 decided (slot 0) ⇒ backlog 2
+    // a decided-but-NOT-consumed batch (a slot published, no consumed.json): the decided item must not count as backlog.
     const ev = collectBandwidthEvents(h);
     expect(ev.consumeAtSec.length).toBe(0); // no consumed.json ⇒ not consumed
-    expect(ev.backlog).toBe(2); // it1, it2 undecided; the claimed it0 is recognized (was wrongly 3 before the fix)
+    expect(ev.backlog).toBe(2); // it1, it2 undecided; the decided it0 is recognized via readDecisions(slots)
   });
 
   test("T52-P2-5: reader rejects same-schema objects that are structurally or numerically invalid", () => {
