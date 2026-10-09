@@ -57,9 +57,9 @@ import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys,
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
-import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
+import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
-import { AlertDedup, alertKey, classifyMemberHealth, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
+import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
@@ -1231,6 +1231,7 @@ async function main(): Promise<void> {
   // This is the inline mirror of the pure `GhostOnce` helper in sentinel-denoise.ts (the live-sentinel test harness injects a
   // FIXED dep set with no GhostOnce, so the dispatcher cannot import it — the helper is unit-tested there, the logic lives here).
   const ghostFired = new Set<string>();
+  const blockedOnceFired = new Set<string>(); // F44-⑧: non-roster blocked → at-most-once per episode (same reconcile as ghostFired)
   const sentinelPending = new Map<string, { text: string; taskRef: string; title: string }>(); // LS4: failed deliveries ⇒ retried each tick
   const sentinelCfg = { fakeDeathSec: SENTINEL_FAKEDEATH_SEC, idleTimeoutSec: SENTINEL_IDLE_SEC, reArmSec: SENTINEL_IDLE_SEC, doneWakeSec: SENTINEL_IDLE_SEC, sampleSec: SENTINEL_SAMPLE_SEC, backoffSec: SENTINEL_SAMPLE_SEC };
   // LS4: deliver with a durable pending-retry. A FAILED notifyCoordinator does NOT consume the dedup slot AND the rendered
@@ -1249,7 +1250,11 @@ async function main(): Promise<void> {
     if (sentinelPending.has(dk)) return; // already queued for retry (LS4) — don't rebuild/double-send
     let msg: { text: string; taskRef: string; title: string };
     if (ev.kind === "blocked") {
-      const screen = await herdrReadClean(ev.member).catch(() => ""); // "" for a presence-only member (no herdr pane)
+      // F44-⑦: a nameless / presence-only member (every claude agent is nameless in `agent list`) can't be read by
+      // sid-as-herdr-name (agent_not_found). Map the sid → its pane via `agent list` and read by pane_id (herdr accepts a
+      // pane_id as the agent target, verified: `agent explain w1:p1`); fall back to the member handle for a named agent.
+      const paneId = await herdrPaneIdForSession(ev.member).catch(() => null);
+      const screen = await herdrReadClean(paneId ?? ev.member).catch(() => "");
       if (sentinelDecision(screen).action !== "escalate") return;     // R12: always escalate; a future auto-clear would branch here
       const summary = [ev.explain ? `定性:${ev.explain}` : "", screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
       const doc = buildApprovalDoc({
@@ -1314,19 +1319,37 @@ async function main(): Promise<void> {
         const owner = resolveSession(w.owner ?? "", sids); // handle/short-id ⇒ unique sid, else null (unassigned/ambiguous)
         if (owner) activeOwners.add(owner);
       }
+      // F44-⑨: the roster-snapshot (resume.ts ROSTER_FILE) is an authoritative member source too — include it so a captured
+      // member (e.g. the swarm-viz front end 3e097dfe) with no in-flight wait and no identity-log entity is NOT mislabeled a
+      // ghost. Fail-soft: no/garbled snapshot ⇒ no extra members.
+      const snapshotMembers = new Set<string>();
+      try {
+        const snap = JSON.parse(readFileSync(path.join(HOME, ".agenthop", "swarm", "roster-snapshot.json"), "utf8"));
+        for (const m of snap?.members ?? []) if (typeof m?.member === "string") snapshotMembers.add(m.member);
+      } catch { /* no snapshot ⇒ no extra members */ }
       const currentGhosts: { sid: string; idleSec: number }[] = [];
+      const blockedThisTick = new Set<string>();
       for (const sid of sids) {
         if (identified.has(sid)) continue; // best-effort exclusion (exact name match) — see the herdr-name↔sid mapping note above
         const st = readStatusFile(HOME, sid);
         if (!st) continue;
-        if (st.state === "blocked") { void sentinelEscalate({ kind: "blocked", member: sid, explain: "(presence-only member; no herdr screen/explain)" }); continue; }
+        const onRoster = isOnRoster(sid, { activeOwners, identityEntity: whois(proj2, sid).kind === "entity", snapshotMembers }); // F44-⑨
+        if (st.state === "blocked") {
+          // F44-⑧: a ROSTER member's block is swarm work ⇒ escalate (windowed). A NON-roster presence (e.g. the user's private
+          // session) is not ⇒ escalate at most ONCE per episode (it might be a member whose identity has not resolved yet).
+          blockedThisTick.add(sid);
+          if (classifyBlockedEscalation(onRoster) === "escalate") void sentinelEscalate({ kind: "blocked", member: sid, explain: "(presence-only roster member; no herdr screen/explain)" });
+          else if (!blockedOnceFired.has(sid)) { blockedOnceFired.add(sid); void sentinelEscalate({ kind: "blocked", member: sid, explain: "(non-roster presence; surfaced once)" }); }
+          continue;
+        }
         if (st.state !== "idle" || !Number.isFinite(st.seq)) continue;
         const idleSec = Math.max(0, now - Math.floor(st.seq / 1000));
-        const onRoster = activeOwners.has(sid) || whois(proj2, sid).kind === "entity";
         const health = classifyMemberHealth({ onRoster, hasInFlight: activeOwners.has(sid), idleSec, presenceSeen: true }, { idleTimeoutSec: SENTINEL_IDLE_SEC });
         if (health === "disconnect-candidate") void sentinelEscalate({ kind: "idle-timeout", member: sid, idleSec });
         else if (health === "ghost-daemon") currentGhosts.push({ sid, idleSec });
       }
+      // F44-⑧ reconcile: forget a one-time non-roster blocked alert once the member is no longer blocked (a later re-block re-fires).
+      for (const m of [...blockedOnceFired]) if (!blockedThisTick.has(m)) blockedOnceFired.delete(m);
       // F44-P2-3: fire each ghost ONCE per episode. Reconcile first — forget any member no longer observed as a ghost — so a
       // member that recovers and later re-ghosts fires again. The slot is taken only on a non-failed delivery, so an undelivered
       // ghost alert retries next tick (the member is still a ghost). This bypasses sentinelDedup (which would re-remind on cooldown).

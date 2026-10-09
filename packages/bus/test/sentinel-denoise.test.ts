@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  AlertDedup, alertKey, isValidInboxKey, classifyMemberHealth, GhostOnce,
+  AlertDedup, alertKey, isValidInboxKey, classifyMemberHealth, GhostOnce, isOnRoster, classifyBlockedEscalation,
   parsePsOutput, selfTree, isDispatcherLoopCommand, isDispatcherAlreadyRunning, shouldEmitWatchNotice,
   type ProcInfo,
 } from "../src/swarm/sentinel-denoise.js";
@@ -100,6 +100,31 @@ describe("F44 sentinel-denoise — ③④ classifyMemberHealth", () => {
   test("no presence ⇒ ok; NaN idle ⇒ ok (never convicts on an undefined duration)", () => {
     expect(classifyMemberHealth({ onRoster: false, hasInFlight: false, idleSec: 9999, presenceSeen: false }, cfg)).toBe("ok");
     expect(classifyMemberHealth({ onRoster: false, hasInFlight: false, idleSec: NaN, presenceSeen: true }, cfg)).toBe("ok");
+  });
+});
+
+describe("F44-⑨ isOnRoster — union of ALL roster sources (identity log + in-flight owners + roster-snapshot)", () => {
+  const S = (...xs: string[]) => new Set(xs);
+  test("in roster-snapshot only ⇒ on roster (the 3e097dfe incident: registered member, no in-flight, no identity entity)", () => {
+    expect(isOnRoster("3e097dfe", { activeOwners: S(), identityEntity: false, snapshotMembers: S("3e097dfe") })).toBe(true);
+  });
+  test("an in-flight owner ⇒ on roster", () => {
+    expect(isOnRoster("x", { activeOwners: S("x"), identityEntity: false, snapshotMembers: S() })).toBe(true);
+  });
+  test("an identity-log entity ⇒ on roster", () => {
+    expect(isOnRoster("x", { activeOwners: S(), identityEntity: true, snapshotMembers: S() })).toBe(true);
+  });
+  test("in NO source ⇒ not on roster (a genuine stray ⇒ still a ghost)", () => {
+    expect(isOnRoster("stray", { activeOwners: S("other"), identityEntity: false, snapshotMembers: S("member") })).toBe(false);
+  });
+});
+
+describe("F44-⑧ classifyBlockedEscalation — roster-gate the blocked alert", () => {
+  test("roster member blocked ⇒ escalate (swarm work)", () => {
+    expect(classifyBlockedEscalation(true)).toBe("escalate");
+  });
+  test("non-roster (e.g. user's private session) blocked ⇒ escalate-once (not repeated coordinator noise)", () => {
+    expect(classifyBlockedEscalation(false)).toBe("escalate-once");
   });
 });
 

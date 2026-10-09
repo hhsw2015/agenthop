@@ -157,6 +157,23 @@ export function paneBound(getJson: unknown, expectedPane: string): boolean {
   return !!expectedPane && agentPaneId(getJson) === expectedPane;
 }
 
+/** F44-⑦: the pane_id bound to a session id, from an `agent list` (result.agents[]) or `pane list` (result.panes[])
+ *  result — the entry whose `agent_session.value === sid`. A blocked member with NO herdr `name` (every claude agent is
+ *  nameless in the list — see herdrAgentStates) cannot be read by `agent read <name>`; its screen must be read by this
+ *  pane_id (herdr accepts a pane_id as the agent target — verified live: `agent explain w1:p1`). So the blocked-alert
+ *  screen read maps sid → pane_id HERE instead of passing the sid as a herdr name (which yields agent_not_found).
+ *  Defensive across the agents[]/panes[] shapes; null when no entry matches. Pure. */
+export function paneIdForSession(listJson: unknown, sid: string): string | null {
+  if (!sid) return null;
+  const r = (listJson as any)?.result;
+  const rows: unknown[] = Array.isArray(r?.agents) ? r.agents : Array.isArray(r?.panes) ? r.panes : [];
+  for (const row of rows) {
+    const rec = row as any;
+    if (rec?.agent_session?.value === sid && typeof rec?.pane_id === "string" && rec.pane_id) return rec.pane_id;
+  }
+  return null;
+}
+
 export type StartState = "started" | "not-started" | "unconfirmed";
 // Hard error codes that prove the agent NEVER launched (safe to clean the empty pane + fall back). Anything else
 // (agent_not_ready, timeouts, empty/garbled output) is UNCONFIRMED: it may already be a live agent, so we keep
@@ -342,6 +359,14 @@ export async function herdrAgentStates(): Promise<{ name: string; state: AgentSt
   const { json } = await herdrRun(["agent", "list"]);
   const agents: any[] = json?.result?.agents ?? [];
   return agents.filter((a) => typeof a?.name === "string").map((a) => ({ name: a.name, state: (a.agent_status ?? "unknown") as AgentState }));
+}
+
+/** F44-⑦: resolve a session id to its herdr pane_id via `agent list` (paneIdForSession). The blocked-alert screen read uses
+ *  this so a NAMELESS agent (every claude) is read by its pane (`agent read <pane_id>`) instead of by the sid-as-name
+ *  (agent_not_found). null when the server is unreachable or no entry matches. */
+export async function herdrPaneIdForSession(sid: string): Promise<string | null> {
+  const { json } = await herdrRun(["agent", "list"]);
+  return paneIdForSession(json, sid);
 }
 
 export interface HerdrLaunchOutcome { state: StartState; paneId?: string; name?: string; note: string }
