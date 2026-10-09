@@ -13,6 +13,16 @@ Consequences (what "同层异端, 不改核" forces):
 - **Add an entry without touching the core**: a PWA or a third entry plugs in by consuming the same projections + writing the same ledger. The core gains nothing entry-specific.
 - Any logic beyond render+write (the scope ladder's allowed scopes, the digest composition) lives in the CORE so every entry behaves identically — it is NOT TG-local.
 
+## Multimodal delivery surface (entry-side rendering; user point: "TG 天然适合多模态")
+Multimodal is the FORM of a notification, not a new capability — v1 stays "notify + collect-approvals". The hard invariant: the projection is the ONLY source of truth; an image/card is the ENTRY's PRESENTATION of that projection, rendered entry-side. NEVER change a projection contract to emit images — the projection stays json; the entry renders json -> medium.
+- The morning digest need not be plain text: `bandwidth-gauge/v1`'s red/yellow/green zones render to an image CARD (projection json -> card, entry-side); a herdr screen-read / viz snapshot rides as an image attachment; an S19 approval can carry a context screenshot.
+- TG message-primitive mapping (entry-side):
+  - `sendPhoto` — a gauge card / a screen shot (gauge projection or a viz/herdr snapshot).
+  - `sendDocument` — a research report `.md` / a review report (the artifact the projection POINTS to via its evidenceRef; S18 pointer, not inlined into the projection).
+  - inline keyboard — approval buttons (`approve` / `decline` / the scope tier), a closer fit to the scope ladder than a typed reply.
+  - pinned message — a RED-zone alert from the bandwidth gauge.
+- `renderProjection` (pure) therefore returns a RENDER SPEC (primitive + caption/keyboard + a pointer to any attachment to build), not just text; the thin IO executes the spec (rasterize a card / attach a file / `sendPhoto`). console + TG = same projection, different presentation — the natural corollary of the entry-layer ruling.
+
 ## What this charter delivers
 1. **The TG entry adapter** (`scripts/swarm-tg-entry.ts` IO driver + `packages/bus/src/swarm/tg-entry.ts` pure render/parse) — reads the frozen projections, pushes to a bot, collects taps, writes the ledger.
 2. **Scope ladder as a CORE decision-contract extension** (in decision-batch / S19, shared by all entries): an approve verdict may carry a remembered scope `once | this-chat | always`; a HARD-gate item (spend / publish / irreversible) offers ONLY `once` (never `always` — R16: no blanket consent to the three gates). Both console and TG render the same allowed set from the core.
@@ -20,7 +30,7 @@ Consequences (what "同层异端, 不改核" forces):
 
 ## Pure core (selftested; the reviewable decisions)
 TG-entry pure (`tg-entry.ts`):
-- `renderProjection(proj) -> {text, keyboard?}` — render a FROZEN projection (DecisionBatch item / bandwidth gauge / chat-room post / S19 doc / digest) into a TG message; a decision item carries an inline keyboard of the CORE-allowed scopes.
+- `renderProjection(proj) -> RenderSpec` — render a FROZEN projection (DecisionBatch item / bandwidth gauge / chat-room post / S19 doc / digest) into a TG RENDER SPEC: the primitive (`message` / `photo` / `document` / `pin`), caption/text, an optional inline keyboard of the CORE-allowed scopes (decision items), and a pointer to any attachment the IO must build (a gauge card, a screenshot, an evidenceRef document). Pure: it picks the primitive + content from the projection; it does NOT do IO or change the projection.
 - `parseUpdate(update, allowlist) -> DecisionWrite | Ignore` — allowlist-gate the `chat_id`, shape-validate a `callback_query`/`message`, map it to a `DecisionsDoc` verdict (`approve[/scope] | reject | defer`) addressed to `batchId`+`id`. Untrusted input: anything off-allowlist or malformed -> Ignore (logged, never acted on).
 Shared CORE (so every entry matches):
 - `allowedScopes(item) -> ("once"|"this-chat"|"always")[]` — the scope ladder; hard-gate item -> `["once"]` only.
