@@ -60,7 +60,7 @@ import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
 import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
-import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
+import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
@@ -1441,7 +1441,11 @@ async function main(): Promise<void> {
         const paneId = await herdrPaneIdForSession(ev.member).catch(() => null);
         const screen = await herdrReadClean(paneId ?? ev.member).catch(() => "");
         if (sentinelDecision(screen).action !== "escalate") return;     // R12: always escalate; a future auto-clear would branch here
-        const summary = [ev.explain ? `定性:${ev.explain}` : "", screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
+        // F44-⑩ (P1-1 fix): a content-filter anchor on screen is only a HINT — a whole-screen text match can be scrollback, a
+        // quote, or displayed code, and a genuine approval may be live alongside it. It NEVER cancels the S19 approval; it only
+        // ANNOTATES it (neutral note, N1). Always build the approval doc; append the hint note when detected.
+        const cfHint = screenIndicatesContentFilter(screen) ? contentFilterHintNote() : "";
+        const summary = [ev.explain ? `定性:${ev.explain}` : "", cfHint, screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
         const doc = buildApprovalDoc({
           from: SELF, fromLabel: "swarm-sentinel", nowSec: nowSec(), member: ev.member, screenSummary: summary,
           options: [{ label: "读屏后裁决", consequence: "批准/拒绝由授权方按实际界面回注(blocked 态不可用 prompt,须按 UI 选择 send-keys 等);或中止/另派" }], // N1: prompt is rejected for a blocked agent
