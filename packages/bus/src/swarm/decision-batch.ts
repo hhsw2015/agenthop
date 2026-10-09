@@ -135,6 +135,27 @@ export function upsertDecision(existing: DecisionsDoc | null, batchId: string, d
   return { batchId, decidedAtSec: nowSec, decisions: [...kept, decision] };
 }
 
+/** TG-P1-2 (round 3): FOLD many decision docs for one batch into one effective ledger, UNION by id, LATEST-per-id wins. The
+ *  store writes one file per entry tap (plus the console's full-snapshot decisions.json and a recoverable claim), so no single
+ *  writer ever read-merge-overwrites a shared file and loses a sibling. Callers pass docs in [snapshot, ...taps] order; a
+ *  decision from a doc with an EQUAL-OR-GREATER decidedAtSec supersedes an earlier one (so a tap wins an equal-second tie over
+ *  the console snapshot — a targeted single-item action is the more recent intent). Only docs bound to `batchId` count; returns
+ *  null when there is nothing to fold (no snapshot, no taps). Pure. */
+export function foldDecisionDocs(docs: DecisionsDoc[], batchId: string): DecisionsDoc | null {
+  const bound = docs.filter((d) => d.batchId === batchId);
+  if (bound.length === 0) return null;
+  const latest = new Map<string, { d: Decision; ts: number }>();
+  let maxTs = 0;
+  for (const doc of bound) {
+    maxTs = Math.max(maxTs, doc.decidedAtSec);
+    for (const d of doc.decisions) {
+      const cur = latest.get(d.id);
+      if (!cur || doc.decidedAtSec >= cur.ts) latest.set(d.id, { d, ts: doc.decidedAtSec });
+    }
+  }
+  return { batchId, decidedAtSec: maxTs, decisions: [...latest.values()].map((v) => v.d) };
+}
+
 /**
  * Match the user's decisions onto the batch. Returns:
  *  - `resolved`: items with an approve/reject/defer verdict (first decision per id wins; a duplicate is ignored),

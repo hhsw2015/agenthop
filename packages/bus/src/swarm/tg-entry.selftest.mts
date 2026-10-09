@@ -40,9 +40,9 @@ const hard: DecisionItem = { id: "n2", kind: "spend", summary: "pay $40 invoice"
 {
   t("encode/parse round-trips approve+scope", (() => { const c = parseCallback(encodeDecisionCb("abcd012345.3", "approve", "this-chat")); return !!c && c.ref === "abcd012345.3" && c.verdict === "approve" && c.scope === "this-chat"; })());
   t("reject carries no scope", (() => { const c = parseCallback(encodeDecisionCb("h.0", "reject")); return !!c && c.verdict === "reject" && c.scope === undefined; })());
-  // a ref from a 64-char batchId is still hash10.index -> the callback is tiny:
+  // a ref from a 64-char batchId is still hash32.index (the driver's sha256 slice(0,32) . index) -> the callback stays tiny:
   const longBatch = "B".repeat(64);
-  const ref = `${"0123456789"}.${999}`; // shape the driver produces (sha256 slice(0,10) . index)
+  const ref = `${"0123456789abcdef0123456789abcdef"}.${999}`; // shape the driver produces (sha256 slice(0,32) . index)
   t("callback for any ref stays <= 64 bytes", Buffer.byteLength(encodeDecisionCb(ref, "approve", "always"), "utf8") <= 64);
   void longBatch;
 }

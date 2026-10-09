@@ -14,7 +14,7 @@ import path from "node:path";
 import https from "node:https";
 import { createHash } from "node:crypto";
 import { renderProjection, parseUpdate, type RenderSpec, type TgUpdate } from "../packages/bus/src/swarm/tg-entry.js";
-import { listBatches, readBatch, recordDecision } from "../packages/bus/src/swarm/decision-batch-store.js";
+import { listBatchesStrict, readBatch, recordDecision } from "../packages/bus/src/swarm/decision-batch-store.js";
 import type { Verdict, ApprovalScope } from "../packages/bus/src/swarm/decision-batch.js";
 
 const HOME = homedir();
@@ -40,21 +40,25 @@ const writeOffset = (n: number): void => { try { writeFileSync(offsetFile(), Str
 const readNotified = (): Set<string> => { try { return new Set(JSON.parse(readFileSync(notifiedFile(), "utf8"))); } catch { return new Set(); } };
 const writeNotified = (s: Set<string>): void => { try { writeFileSync(notifiedFile(), JSON.stringify([...s]), { mode: 0o600 }); } catch { /* best-effort */ } };
 
-// TG-P2-3: a compact ref that round-trips ANY legal batchId/itemId inside Telegram's 64-byte callback_data. The ref is
-// `<batchHash10>.<itemIndex>` — the driver (which holds the batch) resolves it back; no arbitrary id is ever embedded.
-const batchRef = (batchId: string): string => createHash("sha256").update(batchId).digest("hex").slice(0, 10);
+// TG-P2-3 (round 3): a compact ref that round-trips ANY legal batchId/itemId inside Telegram's 64-byte callback_data. The ref is
+// `<batchHash32>.<itemIndex>` — the driver (which holds the batch) resolves it back; no arbitrary id is ever embedded. 32 hex =
+// 128 bits: a birthday collision is ~2^64 batches (astronomically beyond reach), and even so resolveRef REJECTS an ambiguous
+// hash (it never first-hits a wrong batch). callback = `d|<32hex>.<idx>|<verdict>[|<scope>]` ≈ 55 bytes ≤ 64.
+const batchRef = (batchId: string): string => createHash("sha256").update(batchId).digest("hex").slice(0, 32);
 const encodeRef = (batchId: string, idx: number): string => `${batchRef(batchId)}.${idx}`;
+/** Resolve a callback ref back to its batch+item. Returns null ONLY on a CONFIRMED-unresolvable ref — no batch matches the hash
+ *  (genuinely gone), the index is out of range, or (TG-P2-3) MORE THAN ONE batch matches the hash (ambiguous: never guess, never
+ *  first-hit a wrong batch). A dir/batch READ ERROR PROPAGATES (listBatchesStrict/readBatch throw) so the caller keeps the retry
+ *  obligation instead of treating an unreadable store as "expired" (TG-P2-1). */
 function resolveRef(ref: string): { batchId: string; itemId: string } | null {
   const dot = ref.lastIndexOf(".");
   if (dot < 0) return null;
   const bh = ref.slice(0, dot), idx = Number(ref.slice(dot + 1));
   if (!bh || !Number.isInteger(idx) || idx < 0) return null;
-  for (const batchId of listBatches(HOME)) {
-    if (batchRef(batchId) !== bh) continue;
-    const item = readBatch(HOME, batchId)?.items[idx];
-    if (item) return { batchId, itemId: item.id };
-  }
-  return null;
+  const matches = listBatchesStrict(HOME).filter((b) => batchRef(b) === bh);
+  if (matches.length !== 1) return null; // 0 = gone (terminal expire); >1 = ambiguous collision ⇒ never resolve to a guess
+  const item = readBatch(HOME, matches[0]!)?.items[idx];
+  return item ? { batchId: matches[0]!, itemId: item.id } : null;
 }
 
 function tg(token: string, method: string, body: unknown): Promise<any> {
@@ -83,7 +87,7 @@ async function send(token: string, chatId: number, spec: RenderSpec): Promise<vo
 async function notifyNewBatches(token: string, allow: Set<number>): Promise<void> {
   if (allow.size === 0) return; // no recipient => no delivery => never a completion proof
   const notified = readNotified();
-  for (const batchId of listBatches(HOME)) {
+  for (const batchId of listBatchesStrict(HOME)) { // strict: a read glitch throws -> the loop retries; never a silently-skipped notify
     if (notified.has(batchId)) continue;
     const batch = readBatch(HOME, batchId);
     if (!batch) continue;
@@ -110,8 +114,12 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
     const upd: TgUpdate = cq ? { chatId, callbackData: cq.data } : { chatId, text: u.message?.text };
     const r = parseUpdate(upd, allow);
     if (r.kind === "ignore") { writeOffset(u.update_id + 1); await ack(); continue; }
-    const resolved = resolveRef(r.ref);
-    if (!resolved) { writeOffset(u.update_id + 1); await ack("expired"); continue; } // the batch is gone -> terminal
+    // TG-P2-1: resolveRef throws on a STORE READ ERROR (unreadable batches dir/batch.json) — that is TRANSIENT, so STOP the poll
+    // WITHOUT advancing the offset; the same tap is retried next loop (never a false "expired" that permanently skips an approval).
+    let resolved: { batchId: string; itemId: string } | null;
+    try { resolved = resolveRef(r.ref); }
+    catch (e) { console.error(`swarm-tg-entry: ref lookup read error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return; }
+    if (!resolved) { writeOffset(u.update_id + 1); await ack("expired"); continue; } // CONFIRMED gone/ambiguous -> terminal
     const decision = { id: resolved.itemId, verdict: r.verdict as Verdict, ...(r.scope ? { scope: r.scope as ApprovalScope } : {}) };
     let outcome: "recorded" | "consumed" | "unknown-item" | "contended";
     try { outcome = recordDecision(HOME, resolved.batchId, decision, Math.floor(Date.now() / 1000)); }

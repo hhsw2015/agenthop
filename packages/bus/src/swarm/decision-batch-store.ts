@@ -13,7 +13,7 @@ import path from "node:path";
 import { writeInbox, composeInboxMsg } from "../inbox.js";
 import {
   type DecisionBatch, type DecisionsDoc, type DecisionItem, type ResolvedDecision, type Decision,
-  validDecisionBatch, validDecisionsDoc, buildBatch, resolveBatch, enforceScope, upsertDecision,
+  validDecisionBatch, validDecisionsDoc, buildBatch, resolveBatch, enforceScope, foldDecisionDocs,
 } from "./decision-batch.js";
 
 const SAFE_BATCH_ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -41,6 +41,12 @@ function rejectedClaimPath(home: string, batchId: string): string { return path.
 function notifiedMarkerPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.json"); }
 function notifyLockPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.lock"); }
 function notifiedSentPath(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "notified.sent"); }
+/** TG-P1-2 (round 3): per-item entry TAPS. An entry (TG tap) records ONE item into its OWN file `taps/<sha256(itemId)[:32]>.json`
+ *  (a single-decision DecisionsDoc), so it never read-merge-overwrites the shared decisions.json — a console full-snapshot
+ *  writeDecisions is a DIFFERENT file, each item is a DIFFERENT file, and a decision stranded in a recoverable claim is a
+ *  DIFFERENT file. readDecisions/consume FOLD all of them (latest-per-id). No shared-file write race ⇒ no lost sibling. */
+function tapsDir(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "taps"); }
+function tapPath(home: string, batchId: string, itemId: string): string { return path.join(tapsDir(home, batchId), `${createHash("sha256").update(itemId).digest("hex").slice(0, 32)}.json`); }
 
 /** Atomically create `target` with COMPLETE `content`, exclusively (no overwrite): write a temp fully, then `link` it into
  *  place. The name appears only once the bytes are all written (a partial/interrupted write — EFBIG, a crash — never yields a
@@ -216,11 +222,34 @@ export function readBatch(home: string, batchId: string): DecisionBatch | null {
 }
 
 export function readDecisions(home: string, batchId: string): DecisionsDoc | null {
-  const doc = readJsonOrNull(decisionsPath(home, batchId), validDecisionsDoc);
+  const snap = readJsonOrNull(decisionsPath(home, batchId), validDecisionsDoc);
   // DB-P1-1 (IO side): a doc whose batchId ≠ the directory it sits in is MISBOUND (a foreign/stale drop) — not valid decisions
   // for this batch. Treat it as absent so no verdict is ever read from the wrong batch's directory.
-  if (doc && doc.batchId !== batchId) return null;
-  return doc;
+  const base = snap && snap.batchId === batchId ? snap : null;
+  // TG-P1-2 (round 3): the EFFECTIVE ledger = the console's full-snapshot decisions.json FOLDED with every per-item entry tap
+  // (latest-per-id; [snapshot, ...taps] order so a tap wins an equal-second tie). null when there is neither.
+  return foldDecisionDocs([...(base ? [base] : []), ...readTaps(home, batchId)], batchId);
+}
+
+/** Read every per-item TAP for a batch as single-decision docs. A dir read error PROPAGATES (never folded to [] — a lost tap is
+ *  a lost approval, TG-P2-1); a missing dir ⇒ none; a corrupt/misbound tap file ⇒ skipped (readable-but-not-a-verdict). */
+function readTaps(home: string, batchId: string): DecisionsDoc[] {
+  let names: string[];
+  try { names = readdirSync(tapsDir(home, batchId)); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
+  const out: DecisionsDoc[] = [];
+  for (const n of names) {
+    if (!n.endsWith(".json")) continue;
+    const doc = readJsonOrNull(path.join(tapsDir(home, batchId), n), validDecisionsDoc); // throws on a real read error ⇒ kept, not dropped
+    if (doc && doc.batchId === batchId) out.push(doc);
+  }
+  return out;
+}
+
+/** Drop all taps after a batch is SEALED (consumed-once). Best-effort: the terminal marker is the truth — a leftover tap can
+ *  never re-consume (consume refuses a sealed batch), and a fault BEFORE the seal keeps the taps recoverable for a retry. */
+function removeTaps(home: string, batchId: string): void {
+  try { rmSync(tapsDir(home, batchId), { recursive: true, force: true }); } catch { /* best-effort; sealed is terminal */ }
 }
 
 /** Persist a batch (validate at the write boundary — never persist a batch the read side would reject, e.g. a duplicate id). */
@@ -238,13 +267,21 @@ export function writeDecisions(home: string, doc: DecisionsDoc): void {
   // DURING a consume is intentionally ALLOWED (not locked): the newer decision must be able to win (R24: valid verdict
   // recoverable / latest wins), and the consume RE-CLAIMS the latest decisions.json right before it commits.
   if (existsStrict(consumedMarkerPath(home, valid.batchId))) throw new Error(`writeDecisions: batch ${valid.batchId} already consumed — remaining items are re-batched under a new batchId`);
-  writeJsonAtomic(decisionsPath(home, valid.batchId), valid);
+  // TG-P1-1 (round 3): enforce the scope ladder at the WRITE boundary too (not only at resolve) — a hard-gate item can NEVER be
+  // SAVED with a this-chat/always grant, from console or TG. Clamp against the REAL item; the consume-side clamp stays a backstop.
+  const batch = readBatch(home, valid.batchId);
+  const enforced: DecisionsDoc = batch
+    ? { ...valid, decisions: valid.decisions.map((d) => { const it = batch.items.find((i) => i.id === d.id); return it ? enforceScope(it, d) : d; }) }
+    : valid;
+  writeJsonAtomic(decisionsPath(home, valid.batchId), enforced);
 }
 
-/** TG-P1-2: record ONE item's decision, MERGING with the batch's other decisions (never a snapshot-overwrite that wipes a
- *  sibling another entry recorded). Atomic under the per-batch lock: refuse if already consumed (sealed -> a no-op, no fork),
- *  enforce the scope against the REAL item (TG-P1-1), upsert by id, write. "contended" => a concurrent holder has the lock,
- *  the caller must retry (do NOT treat as decided). "unknown-item" => the id is not in this batch. */
+/** TG-P1-2 (round 3): record ONE item's decision as its OWN tap file — NEVER a read-merge-write of the shared decisions.json
+ *  (which races the console's full-snapshot writeDecisions and misses a decision stranded in a recoverable claim). readDecisions
+ *  and consume FOLD decisions.json + the claim + every tap, latest-per-id, so no sibling is ever lost. Under the per-batch lock
+ *  (serialized vs consume so a tap never lands mid-seal): refuse if already consumed (sealed -> a no-op, no fork), enforce the
+ *  scope against the REAL item (TG-P1-1), write the one-item tap. "contended" => a concurrent holder has the lock, the caller
+ *  must retry (do NOT treat as decided). "unknown-item" => the id is not in this batch. */
 export function recordDecision(home: string, batchId: string, decision: Decision, nowSec: number): "recorded" | "consumed" | "unknown-item" | "contended" {
   const batch = readBatch(home, batchId);
   if (!batch) throw new Error(`recordDecision: no such batch ${batchId}`);
@@ -254,9 +291,9 @@ export function recordDecision(home: string, batchId: string, decision: Decision
   if (token === null) return "contended";
   try {
     if (existsStrict(consumedMarkerPath(home, batchId))) return "consumed"; // sealed — no fork, the tap is a no-op
-    const existing = readJsonOrNull(decisionsPath(home, batchId), validDecisionsDoc);
-    const merged = upsertDecision(existing, batchId, enforceScope(item, decision), nowSec); // preserve siblings + clamp scope
-    writeJsonAtomic(decisionsPath(home, batchId), merged);
+    // One file per item (keyed by item id): a re-tap overwrites ITS OWN file (latest wins); two items are two files (no collision);
+    // the console's decisions.json and a recoverable claim are separate files folded in at read/consume.
+    writeJsonAtomic(tapPath(home, batchId, decision.id), { batchId, decidedAtSec: nowSec, decisions: [enforceScope(item, decision)] });
     return "recorded";
   } finally { releaseConsumeLock(home, batchId, token); }
 }
@@ -357,18 +394,28 @@ export function consumeDecisions(home: string, batchId: string): ConsumeResult {
       }
     }
     if (existsStrict(dpath)) renameSync(dpath, claim); // R25 (newer wins): a write that landed during acquire/recover supersedes
-    if (!existsStrict(claim)) return none; // nothing to consume (no decisions yet)
-    const doc = readJsonOrNull(claim, validDecisionsDoc);
-    // DB-P1-1: the claimed doc MUST be bound to this batch; a misbound/corrupt claim yields NO actionable verdict, set aside.
-    if (!doc || doc.batchId !== batchId) {
-      try { renameSync(claim, rejectedClaimPath(home, batchId)); } catch { /* raced away */ }
-      return { ...none, unknownIds: doc ? doc.decisions.map((d) => d.id) : [] };
+    // TG-P1-2 (round 3): read every per-item entry tap under the lock (serialized vs recordDecision). The EFFECTIVE ledger folds
+    // the console snapshot (the claim) with the taps — a read failure PROPAGATES (never silently drops a tap => a lost approval).
+    const taps = readTaps(home, batchId);
+    let base: DecisionsDoc | null = null;
+    if (existsStrict(claim)) {
+      const claimed = readJsonOrNull(claim, validDecisionsDoc);
+      // DB-P1-1: the claimed doc MUST be bound to this batch; a misbound/corrupt claim yields NO verdict — set it aside (the taps,
+      // if any, still resolve for THIS batch).
+      if (claimed && claimed.batchId === batchId) base = claimed;
+      else {
+        try { renameSync(claim, rejectedClaimPath(home, batchId)); } catch { /* raced away */ }
+        if (taps.length === 0) return { ...none, unknownIds: claimed ? claimed.decisions.map((d) => d.id) : [] };
+      }
     }
+    if (!base && taps.length === 0) return none; // nothing to consume (no decisions yet)
+    const doc = foldDecisionDocs([...(base ? [base] : []), ...taps], batchId) ?? { batchId, decidedAtSec: 0, decisions: [] };
     const res = resolveBatch(batch, doc);
     // FINAL terminal commit (temp+link). DB-R7: if a concurrent consumer already created consumed.json ("exists"), we LOST the
     // race — return NOT consumed (never return an executable verdict for a lost commit; no double-execute). EFBIG/EACCES THROWS
     // with the claim intact ⇒ finally releases the lock, a retry resumes the SAME claim.
     if (createExclusiveAtomic(consumedMarker, JSON.stringify({ batchId, decidedAtSec: doc.decidedAtSec, consumedAtMs: Date.now(), digest: digestDoc(doc) })) === "exists") return none;
+    removeTaps(home, batchId); // sealed ⇒ the taps are consumed-once (a fault BEFORE the seal leaves them recoverable for a retry)
     emitOrphanSignal(home, batchId, batch.owner); // a decision that landed during this consume (now terminal) is an orphan — signal it (R25)
     return { ...res, consumed: true };
   } finally { releaseConsumeLock(home, batchId, token); }
@@ -381,4 +428,15 @@ export function listBatches(home: string): string[] {
       .filter((d) => d.isDirectory() && existsSync(batchPath(home, d.name)))
       .map((d) => d.name);
   } catch { return []; }
+}
+
+/** Like listBatches but a dir/batch read error PROPAGATES (never folded to []): a caller resolving a callback ref must tell a
+ *  batch that is GENUINELY GONE (terminal — safe to expire the tap) from a dir that is momentarily UNREADABLE (transient — the
+ *  tap must be retried, never silently skipped, TG-P2-1). ENOENT (no batches dir yet) ⇒ []. existsStrict throws on an unreadable
+ *  batch.json so an EACCES can't masquerade as "absent". */
+export function listBatchesStrict(home: string): string[] {
+  let entries;
+  try { entries = readdirSync(batchesDir(home), { withFileTypes: true }); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
+  return entries.filter((d) => d.isDirectory() && existsStrict(batchPath(home, d.name))).map((d) => d.name);
 }

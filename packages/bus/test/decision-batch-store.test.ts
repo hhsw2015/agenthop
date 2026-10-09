@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync, chmodSync, statSync, readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, renameSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { openBatch, readBatch, writeDecisions, readDecisions, consumeDecisions, listBatches, recordDecision } from "../src/swarm/decision-batch-store.js";
+import { openBatch, readBatch, writeDecisions, readDecisions, consumeDecisions, listBatches, listBatchesStrict, recordDecision } from "../src/swarm/decision-batch-store.js";
 import { type DecisionItem } from "../src/swarm/decision-batch.js";
 import { claimInbox } from "../src/inbox.js";
 
@@ -420,5 +420,57 @@ describe("recordDecision (atomic single-item merge for an entry tap)", () => {
     openBatch(HOME, { batchId: "m4", owner: "coord", items: [item("a")], nowSec: 1 });
     expect(recordDecision(HOME, "m4", { id: "ghost", verdict: "approve" }, 2)).toBe("unknown-item");
     expect(readDecisions(HOME, "m4")).toBeNull();
+  });
+});
+
+// TG round-3 counterexamples: a single-item entry tap must NEVER lose a sibling decision — not one stranded in a recoverable
+// claim (a faulted consume), nor one a concurrent console full-snapshot write landed. Plus the strict lister's read-error vs absence.
+describe("TG-P1-2 (round 3): a tap never drops a sibling (recoverable claim / concurrent snapshot)", () => {
+  const dbDir = (id: string) => path.join(HOME, ".agenthop", "console", "decision-batches", id);
+  const batchesDir = () => path.join(HOME, ".agenthop", "console", "decision-batches");
+
+  test("counterexample A: a tap preserves a decision stranded in a RECOVERABLE claim (faulted consume)", () => {
+    openBatch(HOME, { batchId: "ca", owner: "coord", items: [item("a"), item("b")], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "ca", decidedAtSec: 2, decisions: [{ id: "a", verdict: "approve" }] }); // console
+    // simulate a consume that claimed (decisions.json -> claim) then FAULTED before sealing: a recoverable claim remains.
+    renameSync(path.join(dbDir("ca"), "decisions.json"), path.join(dbDir("ca"), "decisions-consumed-claim.json"));
+    expect(recordDecision(HOME, "ca", { id: "b", verdict: "reject" }, 3)).toBe("recorded"); // TG tap for the OTHER item
+    const r = consumeDecisions(HOME, "ca");
+    expect(r.consumed).toBe(true);
+    const byId = Object.fromEntries(r.resolved.map((x) => [x.item.id, x.verdict]));
+    expect(byId).toEqual({ a: "approve", b: "reject" }); // the claim's `a` is NOT lost — both are consumed
+  });
+
+  test("counterexample B: a tap and a concurrent console full-snapshot write BOTH survive (no overwrite)", () => {
+    openBatch(HOME, { batchId: "cb", owner: "coord", items: [item("a"), item("c")], nowSec: 1 });
+    expect(recordDecision(HOME, "cb", { id: "a", verdict: "approve" }, 2)).toBe("recorded"); // TG tap (own file)
+    writeDecisions(HOME, { batchId: "cb", decidedAtSec: 5, decisions: [{ id: "c", verdict: "approve" }] }); // console full snapshot
+    const doc = readDecisions(HOME, "cb")!;
+    expect(doc.decisions.map((d) => d.id).sort()).toEqual(["a", "c"]); // the snapshot did not clobber the tap, nor vice versa
+    const r = consumeDecisions(HOME, "cb");
+    expect(r.resolved.map((x) => x.item.id).sort()).toEqual(["a", "c"]);
+  });
+
+  test("TG-P1-1: writeDecisions (console path) clamps a hard-gate 'always' to once at the WRITE boundary", () => {
+    openBatch(HOME, { batchId: "wd", owner: "coord", items: [{ id: "x", kind: "spend", summary: "pay", suggestedAction: "approve", hardGate: true }], nowSec: 1 });
+    writeDecisions(HOME, { batchId: "wd", decidedAtSec: 2, decisions: [{ id: "x", verdict: "approve", scope: "always" }] });
+    expect(readDecisions(HOME, "wd")!.decisions[0]!.scope).toBe("once"); // never SAVES the expanded grant
+  });
+
+  test("TG-P2-1: listBatchesStrict THROWS on an unreadable batches dir (listBatches folds to [])", () => {
+    openBatch(HOME, { batchId: "s1", owner: "coord", items: [item("a")], nowSec: 1 });
+    openBatch(HOME, { batchId: "s2", owner: "coord", items: [item("a")], nowSec: 1 });
+    expect(listBatchesStrict(HOME).sort()).toEqual(["s1", "s2"]);
+    const dir = batchesDir(); const mode = statSync(dir).mode;
+    chmodSync(dir, 0o000);
+    try {
+      expect(() => listBatchesStrict(HOME)).toThrow();   // a read error is NOT "no batches" (keep the retry obligation)
+      expect(listBatches(HOME)).toEqual([]);             // the best-effort lister still folds it to []
+    } finally { chmodSync(dir, mode); }
+  });
+
+  test("a confirmed-absent batches dir is [] for BOTH listers (ENOENT ⇒ no batches, not an error)", () => {
+    expect(listBatchesStrict(HOME)).toEqual([]);
+    expect(listBatches(HOME)).toEqual([]);
   });
 });
