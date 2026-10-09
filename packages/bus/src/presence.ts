@@ -2,7 +2,7 @@ import net from "node:net";
 import { rmSync, writeFileSync, utimesSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { startBusCore, type BusCoreOptions } from "./core.js";
+import { startBusCore, type BusCore, type BusCoreOptions } from "./core.js";
 import { PRESENCE_HEARTBEAT_SEC, openLivenessSocket } from "./swarm/task-liveness.js";
 import { dbg } from "./debug.js";
 
@@ -31,7 +31,7 @@ import { dbg } from "./debug.js";
  * two local nodes into one roster entry (so resolve isn't "ambiguous"), and the atomic durable-inbox claim + unicast
  * DM routing mean a message is delivered exactly once even while both run.
  */
-export function runPresence(opts: BusCoreOptions = {}): void {
+export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: () => Promise<void> } {
   // Record our pid as EARLY as possible. This doubles as the bootstrap's handshake: the detached-spawn parent polls for
   // this file to confirm the daemon is up in its own session before it exits (see presence-entry.ts). SessionEnd reads
   // it to stop us; we remove it on shutdown. We are already post-setsid here (the child runs after detached spawn).
@@ -43,66 +43,68 @@ export function runPresence(opts: BusCoreOptions = {}): void {
       // best effort — the host-pid guard + SessionEnd are the other stops
     }
   }
-  const core = startBusCore(opts);
-  dbg(`presence up: ${core.self.title} (tool=${core.self.tool} stable=${core.self.stableId ?? "-"})`);
-  // Keep the process alive. The daemon is detached (its own session, no controlling terminal, stdio ignored), so a
-  // ref'd timer is what holds the event loop open — a non-compiled bun/node script stays up on that alone. This timer
-  // ALSO HEARTBEATS the pid file's mtime (F45-P1-2): a live same-machine peer proves THIS instance is current by the file
-  // being fresh; a stale mtime means the daemon is gone and the pid may be recycled, so the send path keeps relay rather
-  // than a false local durable redirect. Keyed on the file's freshness (an active association), not on process start time
-  // (whose 1s granularity let a same-second recycle masquerade as the original writer).
-  // F45-R1 (coordinator ruling B): a per-session LIVENESS SOCKET. A live instance LISTENS; when it dies the kernel drops the
-  // listener, so a receiver's connect-probe is a WINDOW-FREE "is the current instance alive?" check (ownership — the mtime
-  // heartbeat below is only a sentinel-classification aid). F45-R7 (rounds 7-9): the socket lives at
-  // `presence/<hash(sid)>.<nonce>.sock` — a BOUNDED hash of the sid (so a crafted/long sid can neither traverse nor truncate-
-  // collide, P1) plus a per-INSTANCE nonce (so each daemon owns a UNIQUE path; close() unlinks only its own, never another
-  // instance's — no shared path, no reclaim race, P2). We key by the pid-file's identity so the socket, the pid file, and the
-  // sender's probe all agree on the sid. openLivenessSocket binds a fresh unique path (no contention) and sweeps only
-  // definitely-dead orphans of this sid.
   const home = opts.home ?? homedir();
-  const sockSid = pidFile ? path.basename(pidFile).replace(/\.pid$/, "") : (core.self.stableId ?? core.self.id);
   let sockServer: net.Server | null = null;
   let closing = false;
+  // The per-session LIVENESS SOCKET's sid. F45-R1/R7: a live instance LISTENS at `presence/<hash(sid)>.<nonce>.sock` (a BOUNDED
+  // hash of the sid — no traversal/truncation-collision — plus a per-instance nonce so close() unlinks only our own path); the
+  // kernel drops the listener the instant we die, so a receiver's connect-probe is a WINDOW-FREE "current instance alive?" check.
+  // When a pid file is set the sid is FIXED from its name (stable from byte one). Otherwise it follows the core's identity — and
+  // for Codex the stable id is adopted LATE (cwd-match), so the listener MUST re-bind to hash(stableId) when that id is learned
+  // (B7-1): a socket left at hash(run-id) answers for the wrong sid, so a sender probing the stable id finds nothing and wrongly
+  // keeps relay — the same-machine durable guarantee to the stable id's inbox silently breaks.
+  const fixedSid = pidFile ? path.basename(pidFile).replace(/\.pid$/, "") : null;
+  let sockSid = fixedSid ?? "";
   const openSock = (): void => {
-    if (sockServer || closing) return;
-    void openLivenessSocket(home, sockSid).then((res) => {
+    if (sockServer || closing || !sockSid) return;
+    const bindFor = sockSid;                            // capture: an identity change mid-bind must discard a socket for the superseded sid
+    void openLivenessSocket(home, bindFor).then((res) => {
       if (!res) return;                                 // path too long (relay-only) or a transient bind failure — retry next tick
-      if (closing) { try { res.server.close(); } catch { /* best effort */ } return; }
+      if (closing || sockSid !== bindFor) { try { res.server.close(); } catch { /* best effort */ } return; }
       sockServer = res.server;
     });
   };
+  // B7-1: the stable identity was (re)assigned after startup (no pre-set SID + no pid file). Re-bind with NO poll window — close
+  // the old-sid listener (close() unlinks only OUR OWN path, never another instance's) and open a fresh one at hash(new sid), so
+  // a sender probing hash(stableId) proves THIS instance alive and routes its send to the stable id's durable inbox.
+  const syncSidFor = (want: string): void => {
+    if (fixedSid || want === sockSid || !want) return; // a pid-file sid is fixed; no-op if unchanged
+    sockSid = want;
+    if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
+    openSock();
+  };
+  const core = startBusCore({ ...opts, onIdentityChange: (self) => syncSidFor(self.stableId ?? self.id) });
+  if (!fixedSid) sockSid = core.self.stableId ?? core.self.id; // initial sid from the core (the per-run id until a late adopt)
+  dbg(`presence up: ${core.self.title} (tool=${core.self.tool} stable=${core.self.stableId ?? "-"})`);
 
-  // Keep the process alive. The daemon is detached (its own session, no controlling terminal, stdio ignored), so a
-  // ref'd timer is what holds the event loop open — a non-compiled bun/node script stays up on that alone. This timer
-  // ALSO HEARTBEATS the pid file's mtime (sentinel aux only — NOT ownership, which is the liveness socket) and (re)opens
-  // the liveness socket when we don't hold it (first start, or after a transient bind failure).
+  // Keep the process alive (a ref'd timer holds the detached loop open — a non-compiled bun/node script stays up on that alone).
+  // Heartbeat the pid file's mtime (sentinel aux only — NOT ownership, which is the liveness socket), re-sync the sid defensively
+  // (belt-and-suspenders should an identity change ever land without the callback), and (re)open the socket when we don't hold it.
   const keepAlive = setInterval(() => {
     if (pidFile) { try { const t = new Date(); utimesSync(pidFile, t, t); } catch { /* best effort — the pid file may be gone on shutdown */ } }
+    if (!fixedSid) syncSidFor(core.self.stableId ?? core.self.id);
     openSock();
   }, PRESENCE_HEARTBEAT_SEC * 1000);
   openSock(); // open immediately at startup; the keepAlive tick is only the retry path
 
   const timers: Array<ReturnType<typeof setInterval>> = [keepAlive];
-  const shutdown = (code = 0): void => {
-    if (closing) return;
+  // Cleanup WITHOUT exiting the process, so an embedder (or a test) can stop one instance cleanly; shutdown() wraps it with
+  // process.exit for the signal/orphan-guard paths.
+  const stop = (): Promise<void> => {
+    if (closing) return Promise.resolve();
     closing = true;
     for (const tmr of timers) clearInterval(tmr);
     // Close the liveness socket we OWN. server.close() unlinks our own socket file — we only ever hold a path we bound (a
-    // live incumbent is deferred, never replaced), so this cannot delete another instance's endpoint (F45-R7-P2-1). No
-    // unconditional rmSync: a deferring instance (sockServer null) must not touch the live incumbent's file; a crashed
-    // daemon's leftover file is reclaimed by the next start's probe-then-unlink.
-    if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } }
+    // live incumbent is deferred, never replaced; a re-bind already closed the superseded one), so this cannot delete another
+    // instance's endpoint (F45-R7-P2-1). No unconditional rmSync: a crashed daemon's leftover file is reclaimed by the next
+    // start's probe-then-skip.
+    if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
     // Remove our own pid file (the entry wrote it, the SessionEnd hook also removes it — harmless to do both).
     const pidFile = process.env.AGENTHOP_PID_FILE;
-    if (pidFile) {
-      try {
-        rmSync(pidFile, { force: true });
-      } catch {
-        // best effort
-      }
-    }
-    void core.close().finally(() => process.exit(code));
+    if (pidFile) { try { rmSync(pidFile, { force: true }); } catch { /* best effort */ } }
+    return core.close();
   };
+  const shutdown = (code = 0): void => { void stop().finally(() => process.exit(code)); };
   process.on("SIGTERM", () => shutdown(0));
   process.on("SIGINT", () => shutdown(0));
 
@@ -137,4 +139,6 @@ export function runPresence(opts: BusCoreOptions = {}): void {
     guard.unref?.();
     timers.push(guard);
   }
+
+  return { core, stop };
 }
