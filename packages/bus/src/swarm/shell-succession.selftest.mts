@@ -1,8 +1,8 @@
-import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, presencePidRelPath, planSuccession, acquireAdoptLock, releaseAdoptLock, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
+import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, presencePidRelPath, planSuccession, adoptLockSite, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
+import { acquireHolderLock, releaseHolderLock } from "./holder-lock.js";
 import type { RosterMember } from "./resume.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
@@ -85,19 +85,25 @@ t("plan: match but LIVE incumbent -> reject (never steal a live slot)", (await p
 t("plan: credential names a sid with no roster member -> fresh", (await planSuccession(att({ resumeTargetSid: undefined, herdrPane: undefined, newNativeSid: "new-sid" }), [mem({ member: "fe0376cd" })], deadInc)).action === "fresh");
 t("plan: cwd compared normalized (trailing slash)", (await planSuccession(att({ cwd: "/w/", resumeTargetSid: "fe0376cd", newNativeSid: "new-sid" }), [mem({ cwd: "/w" })], deadInc)).action === "adopt");
 
-// --- SU2 single-winner adopt lock (real fs) ---
+// --- SU2 single-winner adopt lock (holder-lock via adoptLockSite; real fs). Deep stale/own-recovery cases live in holder-lock's
+//     own selftest (DA2); here we verify the SITE + single-winner integration. ---
 const lockHome = mkdtempSync(path.join(tmpdir(), "f45-lock-"));
 mkdirSync(path.join(lockHome, ".agenthop", "presence"), { recursive: true });
-t("SU2 lock: first acquire wins", acquireAdoptLock(lockHome, "sidL", process.pid) === true);
-t("SU2 lock: second acquire while the holder (this live process) holds it -> loses", acquireAdoptLock(lockHome, "sidL", process.pid) === false);
-releaseAdoptLock(lockHome, "sidL");
-t("SU2 lock: release then re-acquire wins", acquireAdoptLock(lockHome, "sidL", process.pid) === true);
-writeFileSync(path.join(lockHome, ".agenthop", "presence", "sidG.adopt.lock"), "garbage"); // unreadable (non-numeric) holder
-t("SU2 lock: a lock with an unreadable holder is NOT stolen (fail-closed)", acquireAdoptLock(lockHome, "sidG", process.pid) === false);
-// SU2 rename-based reclaim: a DEFINITELY-dead holder (a reaped child's freed pid) is reclaimed; a live holder (above) is not.
-const reaped = spawnSync(process.execPath, ["-e", ""]); const deadPid = reaped.pid ?? 0; // spawnSync blocks until exit+reap ⇒ pid is dead
-writeFileSync(path.join(lockHome, ".agenthop", "presence", "sidR.adopt.lock"), String(deadPid));
-t("SU2 lock: a dead holder's stale lock is reclaimed (rename-atomic)", deadPid > 0 && acquireAdoptLock(lockHome, "sidR", process.pid) === true);
+const siteL = adoptLockSite(lockHome, "sidL");
+const tok1 = acquireHolderLock(siteL);
+t("SU2 lock: first acquire wins (token)", typeof tok1 === "string");
+if (tok1) releaseHolderLock(siteL, tok1);
+const tok2 = acquireHolderLock(siteL);
+t("SU2 lock: release then re-acquire wins", typeof tok2 === "string");
+if (tok2) releaseHolderLock(siteL, tok2);
+// a FOREIGN LIVE holder (a different, live pid published inside the lock dir) ⇒ contended (never stolen). pid 1 (init/launchd)
+// is always live and not ours (process.kill(1,0) ⇒ EPERM, not ESRCH ⇒ not reclaimable).
+const siteF = adoptLockSite(lockHome, "sidF");
+mkdirSync(siteF.lockDir); writeFileSync(path.join(siteF.lockDir, "1.deadbeef"), "");
+t("SU2 lock: a live FOREIGN holder is contended (null), never stolen", acquireHolderLock(siteF) === null);
+const sA = acquireHolderLock(adoptLockSite(lockHome, "sidA"));
+const sB = acquireHolderLock(adoptLockSite(lockHome, "sidB"));
+t("SU2 lock: distinct sids are independent locks (both win)", typeof sA === "string" && typeof sB === "string");
 rmSync(lockHome, { recursive: true, force: true });
 
 console.log("all shell-succession selftests passed");

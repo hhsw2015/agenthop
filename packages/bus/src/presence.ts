@@ -99,15 +99,19 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
   // treat the adoption as incomplete and roll back its pid claim.
   const ensureSockBoundTo = async (want: string): Promise<boolean> => {
     if (!want || closing) return false;
+    const prev = sockSid;                             // the identity to fall back to if this bind does not complete (SU3)
     sockSid = want;
     const gen = ++bindGen;                            // supersede any in-flight bind (incl. syncSidFor's from onIdentityChange)
     binding = false;
     if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
     const res = await openLivenessSocket(home, want);
-    if (!res) return false;                           // path too long / bind failed ⇒ NOT ready
-    if (closing || gen !== bindGen) { try { res.server.close(); } catch { /* best effort */ } return false; } // superseded/shutting down ⇒ NOT ready
-    sockServer = res.server;
-    return true;                                      // the listener for `want` is bound + current
+    if (res && !closing && gen === bindGen) { sockServer = res.server; return true; } // bound + current ⇒ ready
+    if (res) { try { res.server.close(); } catch { /* best effort */ } }              // superseded / shutting down ⇒ discard
+    // SU3: the bind did NOT complete for `want`. If we are still the latest attempt, REVERT sockSid to the previous identity and
+    // re-open ITS socket — so a failed/cancelled adoption never leaves the un-adopted target as the published identity, and the
+    // keepAlive heartbeat serves our own sid, not the target. (A newer generation = a real adopt; leave it alone.)
+    if (gen === bindGen && sockSid === want) { sockSid = prev; bindGen++; binding = false; openSock(); }
+    return false;                                     // NOT ready
   };
   const core = startBusCore({ ...opts, onIdentityChange: (self) => syncSidFor(self.stableId ?? self.id) });
   if (!fixedSid) sockSid = core.self.stableId ?? core.self.id; // initial sid from the core (the per-run id until a late adopt)
@@ -129,7 +133,10 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
         // The lock is released only after this resolves, covering the pre-publish interval.
         await runSuccessionAtStartup(
           home, core.self.tool, core.self.stableId ?? core.self.id, Number(process.env.AGENTHOP_HOST_PID) || undefined,
-          async (sid) => { if (closing) return false; core.adoptStableId(sid); return await ensureSockBoundTo(sid); },
+          // SU3: bind the target's liveness socket FIRST; only adopt the core identity (+ drain inbox) once the socket is confirmed
+          // ready. On a bind failure core identity is left untouched and sockSid is reverted — nothing to roll back in core, and the
+          // heartbeat keeps serving our own sid. (syncSidFor from adoptStableId is a same-sid no-op: the socket is already bound.)
+          async (sid) => { if (closing) return false; const bound = await ensureSockBoundTo(sid); if (!bound) return false; core.adoptStableId(sid); return true; },
           dbg,
         );
       } catch (e) { dbg(`succession startup failed (ignored): ${e instanceof Error ? e.message : e}`); }
