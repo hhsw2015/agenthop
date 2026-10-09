@@ -5,7 +5,7 @@ import path from "node:path";
 import {
   AlertDedup, alertKey, isValidInboxKey, classifyMemberHealth, GhostOnce, isOnRoster, classifyBlockedEscalation, resolveSnapshotMembers,
   parsePsOutput, selfTree, isDispatcherLoopCommand, isDispatcherAlreadyRunning, shouldEmitWatchNotice,
-  screenIndicatesContentFilter, classifyBlockedScreen, CONTENT_FILTER_ANCHORS,
+  screenIndicatesContentFilter, contentFilterHintNote, CONTENT_FILTER_ANCHORS,
   type ProcInfo,
 } from "../src/swarm/sentinel-denoise.js";
 import { scanInboxes } from "../src/swarm/inbox-sentinel.js";
@@ -280,25 +280,20 @@ describe("F44 sentinel-denoise — P2-3 GhostOnce (one-time-per-episode gate)", 
   });
 });
 
-describe("sentinel-denoise — F44-⑩ content-filter screen classification", () => {
+describe("sentinel-denoise — F44-⑩ content-filter HINT (annotates, never replaces an approval)", () => {
   const codex = "Working...\nThis content can't be shown\nDaybreak\n"; // observed codex platform block
-  test("matches a known vendor block (exact, mixed case, typographic apostrophe, embedded)", () => {
+  test("detects a known vendor string (exact, mixed case, typographic apostrophe, embedded)", () => {
     expect(screenIndicatesContentFilter(codex)).toBe(true);
     expect(screenIndicatesContentFilter("THIS CONTENT CAN'T BE SHOWN")).toBe(true);        // case-insensitive
     expect(screenIndicatesContentFilter("this content can’t be shown … Daybreak")).toBe(true); // ’ folded to '
     expect(screenIndicatesContentFilter("…noise… content can't be shown …more…")).toBe(true);  // substring anywhere
   });
-  test("a normal/approval screen is NOT a content-filter (no false positive ⇒ a real approval is never masked)", () => {
+  test("a normal/approval screen is not a hint; non-string/empty ⇒ false", () => {
     expect(screenIndicatesContentFilter("Allow command rm -rf? (y/n)")).toBe(false);
     expect(screenIndicatesContentFilter("Waiting for your approval to continue")).toBe(false);
     expect(screenIndicatesContentFilter("")).toBe(false);
     expect(screenIndicatesContentFilter(undefined as unknown as string)).toBe(false);
     expect(screenIndicatesContentFilter(42 as unknown as string)).toBe(false);
-  });
-  test("classifyBlockedScreen routes content-filter vs generic (generic keeps the S19 approval path)", () => {
-    expect(classifyBlockedScreen(codex)).toBe("content-filter");
-    expect(classifyBlockedScreen("Allow command? (y/n)")).toBe("generic");
-    expect(classifyBlockedScreen("")).toBe("generic"); // no screen ⇒ generic (default to approval, never mask a decision)
   });
   test("every anchor is pre-normalized (lowercase, ASCII apostrophe) so it matches a normalized screen", () => {
     for (const a of CONTENT_FILTER_ANCHORS) {
@@ -306,5 +301,14 @@ describe("sentinel-denoise — F44-⑩ content-filter screen classification", ()
       expect(a).not.toMatch(/[‘’“”ʼ]/);                 // no typographic marks that a folded screen could never contain
       expect(screenIndicatesContentFilter(a)).toBe(true); // an anchor matches itself
     }
+  });
+  test("F44-10-N1: the hint note is NEUTRAL — a clue not a verdict, defers to platform guidance, no bypass license, S19 intact", () => {
+    const note = contentFilterHintNote();
+    expect(note).toMatch(/线索/);                 // framed as a clue, not proof of the current block
+    expect(note).toMatch(/不证明当前阻塞/);        // explicitly not a verdict on the current block
+    expect(note).toMatch(/平台说明/);              // defer to the platform's own guidance
+    expect(note).toMatch(/合规范围内/);            // only an in-policy reword
+    expect(note).toMatch(/不构成绕过限制的许可/);   // NOT a license to bypass the limit
+    expect(note).toMatch(/S19/);                  // the approval boundary is unchanged
   });
 });

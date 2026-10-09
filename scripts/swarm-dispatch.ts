@@ -60,7 +60,7 @@ import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
 import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
-import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, classifyBlockedScreen, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
+import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
@@ -1441,21 +1441,16 @@ async function main(): Promise<void> {
         const paneId = await herdrPaneIdForSession(ev.member).catch(() => null);
         const screen = await herdrReadClean(paneId ?? ev.member).catch(() => "");
         if (sentinelDecision(screen).action !== "escalate") return;     // R12: always escalate; a future auto-clear would branch here
-        if (classifyBlockedScreen(screen) === "content-filter") {
-          // F44-⑩: a PLATFORM content-filter block (e.g. codex "This content can't be shown … Daybreak"). The member is stuck
-          // but no user decision is owed — the fix is to reword the prompt and retry. Report a SUGGESTION, not an S19 approval.
-          const body = [`[live-sentinel] content-filter: 成员 ${ev.member} 屏上出现平台内容过滤拦截。`,
-            "建议:换表述重试(非 user 审批项);若持续,人工改写提示后再派。",
-            screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n");
-          msg = { text: body, taskRef: `content-filter:${ev.member}`, title: `member content-filter` };
-        } else {
-          const summary = [ev.explain ? `定性:${ev.explain}` : "", screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
-          const doc = buildApprovalDoc({
-            from: SELF, fromLabel: "swarm-sentinel", nowSec: nowSec(), member: ev.member, screenSummary: summary,
-            options: [{ label: "读屏后裁决", consequence: "批准/拒绝由授权方按实际界面回注(blocked 态不可用 prompt,须按 UI 选择 send-keys 等);或中止/另派" }], // N1: prompt is rejected for a blocked agent
-          });
-          msg = { text: doc.body.text, taskRef: `approval:${ev.member}`, title: doc.body.title };
-        }
+        // F44-⑩ (P1-1 fix): a content-filter anchor on screen is only a HINT — a whole-screen text match can be scrollback, a
+        // quote, or displayed code, and a genuine approval may be live alongside it. It NEVER cancels the S19 approval; it only
+        // ANNOTATES it (neutral note, N1). Always build the approval doc; append the hint note when detected.
+        const cfHint = screenIndicatesContentFilter(screen) ? contentFilterHintNote() : "";
+        const summary = [ev.explain ? `定性:${ev.explain}` : "", cfHint, screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
+        const doc = buildApprovalDoc({
+          from: SELF, fromLabel: "swarm-sentinel", nowSec: nowSec(), member: ev.member, screenSummary: summary,
+          options: [{ label: "读屏后裁决", consequence: "批准/拒绝由授权方按实际界面回注(blocked 态不可用 prompt,须按 UI 选择 send-keys 等);或中止/另派" }], // N1: prompt is rejected for a blocked agent
+        });
+        msg = { text: doc.body.text, taskRef: `approval:${ev.member}`, title: doc.body.title };
       } else {
         // F44-P2-3: ghost-daemon is NOT routed here — it has a one-time gate (ghostFired), not this cooldown dedup. This branch is
         // fake-death / idle-timeout only (both carry idleSec/silentSec); the type still admits ghost-daemon but it is never emitted.

@@ -105,13 +105,14 @@ export function classifyBlockedEscalation(onRoster: boolean): BlockedRoute {
 }
 
 /**
- * F44-⑩ — platform content-filter anchors. When a member/reviewer's agent hits a PLATFORM content-moderation block, the
- * screen shows a fixed vendor string (e.g. codex: "This content can't be shown … Daybreak"); the agent is stuck but it is
- * NOT a user-approval decision — the fix is to reword the prompt and retry. Anchors are matched against the (ANSI-stripped)
- * screen after lowercasing + folding typographic apostrophes/quotes to ASCII. CONSERVATIVE by design (same discipline as
- * isValidInboxKey): a FALSE POSITIVE would downgrade a genuine blocked-decision to a "just retry" notice and MASK a real
- * approval, so only CONFIRMED vendor strings go here. Extensible — add a vendor's string when a real screen is captured
- * (never guess: an unconfirmed anchor risks masking a real block). Each anchor is pre-normalized (lowercase + ASCII apostrophe). */
+ * F44-⑩ — platform content-filter HINT (F44-10-P1-1: a HINT, never a verdict). When a member's agent hits a PLATFORM
+ * content-moderation block, the screen shows a fixed vendor string (e.g. codex: "This content can't be shown … Daybreak").
+ * But a WHOLE-SCREEN text match cannot tell the CURRENT control from scrollback, a quoted/displayed code fragment, or a
+ * mixed screen where a genuine approval is live ALONGSIDE the string — so this hint MUST NOT cancel an S19 approval. The
+ * dispatcher ALWAYS builds the approval doc and merely ANNOTATES it when the hint fires (contentFilterHintNote). Because the
+ * hint only annotates (never suppresses a decision), a loose match is low-harm. Anchors match the (ANSI-stripped) screen after
+ * lowercasing + folding typographic apostrophes/quotes to ASCII; each is pre-normalized (lowercase + ASCII apostrophe).
+ * Extensible — add a vendor's string when a real screen is captured. */
 export const CONTENT_FILTER_ANCHORS: readonly string[] = [
   "content can't be shown", // codex platform content filter ("This content can't be shown … Daybreak"), observed 2026-10-09
 ];
@@ -122,8 +123,8 @@ function normalizeScreenText(s: string): string {
   return s.replace(/[‘’ʼ]/g, "'").replace(/[“”]/g, '"').toLowerCase();
 }
 
-/** F44-⑩ — does the screen show a KNOWN platform content-filter block? Own-anchor substring match on the normalized screen;
- *  a non-string or empty screen is never a filter (no evidence ⇒ false). Pure, no IO. */
+/** F44-⑩ — does the screen CONTAIN a known platform content-filter string? A HINT ONLY (see CONTENT_FILTER_ANCHORS): the
+ *  caller must STILL present the S19 approval; this decides only whether to annotate it. Non-string/empty ⇒ false. Pure. */
 export function screenIndicatesContentFilter(screen: unknown): boolean {
   if (typeof screen !== "string" || screen.length === 0) return false;
   const norm = normalizeScreenText(screen);
@@ -131,14 +132,13 @@ export function screenIndicatesContentFilter(screen: unknown): boolean {
   return false;
 }
 
-export type BlockedScreenKind = "content-filter" | "generic";
-
 /**
- * F44-⑩ — sub-classify an escalate-worthy blocked SCREEN. "content-filter" ⇒ a platform moderation block: report a
- * reword-and-retry SUGGESTION to the coordinator, NOT an S19 user-approval (no human decision is owed; the member just needs
- * its prompt reworded). "generic" ⇒ the existing path (an approval the authorized party must adjudicate). Pure. */
-export function classifyBlockedScreen(screen: unknown): BlockedScreenKind {
-  return screenIndicatesContentFilter(screen) ? "content-filter" : "generic";
+ * F44-⑩ / F44-10-N1 — the NEUTRAL annotation appended to a blocked APPROVAL when a content-filter hint fires. It must not
+ * frame the limit as a bypassable display glitch nor license circumvention: it states the hint is NOT proof of the current
+ * block type, directs verification against the platform's own guidance and the current task/approval state, and permits only
+ * an in-policy reword through the normal recovery flow. The S19 approval itself is unchanged and still presented. Pure. */
+export function contentFilterHintNote(): string {
+  return "注:屏上检出疑似平台内容过滤文案(命中已知锚点)。这是线索,不证明当前阻塞即为内容过滤——请按实际界面核对平台说明与当前任务/审批状态后再裁决。若确为内容限制,仅可在平台允许的合规范围内调整表述、走正常恢复流程;命中本身不构成绕过限制的许可,原 S19 审批边界不变。";
 }
 
 export type ProcInfo = { pid: number; ppid: number; command: string };
