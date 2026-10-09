@@ -7,10 +7,11 @@
  * Hardened with the chat-room review lessons: safe batchId (reject, never sanitize), validate at the write boundary, ENOENT
  * (absent) distinguished from a real read error (EACCES → throw, never treated as empty), corrupt-but-readable → null.
  */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, existsSync, statSync, unlinkSync, linkSync, rmSync, rmdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, existsSync, statSync, unlinkSync, linkSync } from "node:fs";
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
 import { writeInbox, composeInboxMsg } from "../inbox.js";
+import { acquireHolderLock, releaseHolderLock, type LockSite } from "./holder-lock.js";
 import {
   type DecisionBatch, type DecisionsDoc, type DecisionItem, type ResolvedDecision,
   validDecisionBatch, validDecisionsDoc, buildBatch, resolveBatch,
@@ -70,93 +71,18 @@ function existsStrict(file: string): boolean {
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return false; throw e; }
 }
 
-/** The per-batch EXCLUSIVE consume lock — a lock DIRECTORY (atomic mkdir) whose HOLDER IDENTITY is the NAME of the single file
- *  inside it (`<pid>.<nonce>`), ported from the proven vm-ssh `withIdLock`. Identity-in-the-FILENAME makes reclaim structurally
- *  race-free (DB-R7): a dead holder is reclaimed by removing its EXACT-named file, never a successor's. The mkdir→publish step
- *  leaves the dir momentarily EMPTY, and an empty dir ALONE is indistinguishable from a LIVE in-flight acquisition (which must
- *  NEVER be stolen). So every acquirer first writes a pre-mkdir HOLD-INTENT credential `consume.lockd.hold.<pid>.<nonce>` while
- *  the parent is still writable — it SURVIVES even a compensation that itself faults (the parent/lock dir turning unwritable
- *  mid-cleanup) and names the faulter's pid. An empty lock dir is then recoverable iff NO hold-intent of a LIVE FOREIGN pid
- *  exists (a faulted holder's intent is dead/own ⇒ reclaim; a live holder's intent is alive ⇒ contend) — so a faulted empty dir
- *  recovers the original verdict on retry while a live in-flight one is never reclaimed. */
-function consumeLockDir(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "consume.lockd"); }
-const HOLD_INTENT_PREFIX = "consume.lockd.hold.";
-function holdIntentPath(home: string, batchId: string, token: string): string { return path.join(batchDir(home, batchId), `${HOLD_INTENT_PREFIX}${token}`); }
-/** True while pid is a running process (EPERM = exists, not ours = alive). Only a definite ESRCH is "dead". */
-function pidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+/** The per-batch EXCLUSIVE consume lock, now the shared holder-identity lock (DA2-R6, extracted to ./holder-lock.ts — the proven
+ *  DB-R7 lock, ported from vm-ssh `withIdLock`). The lock DIRECTORY is `consume.lockd` inside the batch dir; its hold-intents
+ *  live beside it in the batch dir under the `consume.lockd.hold.` prefix. These paths are UNCHANGED from the in-file version, so
+ *  behavior is identical — the logic simply lives in one shared module both this store and the shared-budget pool call. */
+function consumeLockSite(home: string, batchId: string): LockSite {
+  const bdir = batchDir(home, batchId);
+  return { lockDir: path.join(bdir, "consume.lockd"), intentDir: bdir, intentPrefix: "consume.lockd.hold." };
 }
-/** Hold-intents in the batch dir, with the owning pid parsed from each name. A READ FAILURE (EACCES/…) PROPAGATES — inability to
- *  read the intents must NEVER be folded to "no intents" (DB-R7 A): it cannot authorize touching an empty lock dir a holder owns. */
-function listHoldIntents(home: string, batchId: string): { name: string; pid: number }[] {
-  return readdirSync(batchDir(home, batchId)).filter((n) => n.startsWith(HOLD_INTENT_PREFIX)).map((n) => ({ name: n, pid: Number(n.slice(HOLD_INTENT_PREFIX.length).split(".")[0]) }));
-}
-/** Lock DIRECTORIES THIS PROCESS created but could not publish into or drop on release — its OWN unfinished occupancy. Own-recovery
- *  is bound to THIS in-process fact, NOT to a same-pid hold-intent on disk: a prior COMPLETED call whose cleanup merely faulted
- *  leaves a stale own intent that is NOT current occupancy (DB-R7). No other process ever touches a foreign empty lock dir, so a dir
- *  we stranded stays ours alone to recover. */
-const strandedLockDirs = new Set<string>();
 /** Acquire the per-batch consume lock. Returns our identity token (`<pid>.<nonce>`) if held by us, else null (contended). */
-function acquireConsumeLock(home: string, batchId: string): string | null {
-  const dir = consumeLockDir(home, batchId);
-  const token = `${process.pid}.${randomBytes(6).toString("hex")}`;
-  const mine = path.join(dir, token);
-  const intent = holdIntentPath(home, batchId, token);
-  // Stage our hold-intent FIRST, while the parent is writable: it tells a concurrent acquirer we hold the empty mkdir→publish
-  // window (⇒ they contend, never steal), and if we DIE mid-window it is the DEAD credential another process recovers us by.
-  try { writeFileSync(intent, "", { flag: "wx", mode: 0o600 }); } catch { return null; } // cannot even stage ⇒ contended (rare)
-  const dropIntent = () => { try { unlinkSync(intent); } catch { /* best-effort */ } };
-  // Win the atomic mkdir, then publish our identity INSIDE the lock. If the publish faults, the empty dir we just made is OUR OWN
-  // unfinished occupancy ⇒ record it so a same-process retry recovers it (never leave an identity-less dir to a stale-intent guess).
-  const take = (): boolean => {
-    try { mkdirSync(dir); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; return false; } // held by someone
-    try { writeFileSync(mine, "", { mode: 0o600 }); } catch (e) { strandedLockDirs.add(dir); throw e; }
-    strandedLockDirs.delete(dir); return true;
-  };
-  if (take()) return token; // won; identity published
-  // Lock dir exists.
-  let entries: string[]; try { entries = readdirSync(dir); } catch { dropIntent(); return null; } // vanished mid-check ⇒ contended
-  if (entries.length === 1) {
-    // A PUBLISHED holder. Reclaim by its EXACT name iff dead/own (never a successor's differently-named file).
-    const holder = entries[0]!;
-    const hpid = Number(holder.split(".")[0]);
-    if (Number.isInteger(hpid) && hpid > 0 && (hpid === process.pid || !pidAlive(hpid))) {
-      let removed = false; try { rmSync(path.join(dir, holder)); removed = true; } catch { /* a peer reclaimed it first */ }
-      if (removed) { try { rmdirSync(dir); strandedLockDirs.delete(dir); } catch { strandedLockDirs.add(dir); } } // dropped it ⇒ any stale own record is void (DB-R7 B); could not drop ⇒ ours to recover (retry adopts)
-      try { if (take()) return token; } catch (e) { throw e; }
-    }
-    dropIntent(); return null; // live published holder, or reclaim lost ⇒ contended
-  }
-  if (entries.length === 0) {
-    // EMPTY lock dir. We recover it ONLY to continue OUR OWN unfinished occupancy, by ADOPTION (publish our identity straight INTO
-    // it — NO rmdir, so no remove→recreate gap a live holder could fall into). Any other empty dir ⇒ CONTEND:
-    //  (A) reading the hold-intents MUST succeed — a read fault cannot prove recoverability ⇒ contend (never fold to empty);
-    //  (B) a LIVE FOREIGN hold-intent ⇒ a holder is mid-publish/arriving ⇒ contend (never steal — DB-R7 occupancy protection);
-    //  (C) OUR OWN unfinished occupancy (this process stranded THIS dir, tracked in-process) ⇒ adopt.
-    // An EXTERNAL empty dir — including a DEAD holder's stranded one — is NEVER adopted here: a stale on-disk credential cannot
-    // prove the CURRENT dir is unoccupied (DB-R7 A/B — a dead intent may outlive the dir it named), and a crashed external holder's
-    // recovery is handled out of band (R26). So external empty dirs are simply contended.
-    const bdir = batchDir(home, batchId);
-    let others: { name: string; pid: number }[];
-    try { others = listHoldIntents(home, batchId).filter((i) => i.name !== path.basename(intent)); } catch { dropIntent(); return null; }
-    if (others.some((i) => i.pid !== process.pid && pidAlive(i.pid))) { dropIntent(); return null; } // (B) live foreign ⇒ contend
-    if (!strandedLockDirs.has(dir)) { dropIntent(); return null; } // (C-neg) not our own unfinished occupancy ⇒ contend
-    try { writeFileSync(mine, "", { mode: 0o600 }); } catch { dropIntent(); return null; } // (C) adopt; dir not writable/vanished ⇒ contend (a later retry re-adopts or wins fresh)
-    strandedLockDirs.delete(dir);
-    for (const i of others) { if (i.pid === process.pid) { try { unlinkSync(path.join(bdir, i.name)); } catch { /* best-effort cleanup of our OWN stale intents (a dead foreign intent is left for R26) */ } } }
-    return token;
-  }
-  dropIntent(); return null; // >1 identity (ambiguous) ⇒ contended
-}
-/** Release: remove our identity file, drop the (now-empty) lock dir, then remove our hold-intent. NEVER throws. If the rmdir
- *  faults, the empty dir is OUR OWN unfinished occupancy ⇒ record it so a same-process retry recovers it (adopts it). */
-function releaseConsumeLock(home: string, batchId: string, token: string): void {
-  const dir = consumeLockDir(home, batchId);
-  try { rmSync(path.join(dir, token), { force: true }); } catch { /* best-effort */ }
-  try { rmdirSync(dir); strandedLockDirs.delete(dir); } catch { strandedLockDirs.add(dir); } // could not drop the empty dir ⇒ ours to recover
-  try { unlinkSync(holdIntentPath(home, batchId, token)); } catch { /* best-effort */ }
-}
+function acquireConsumeLock(home: string, batchId: string): string | null { return acquireHolderLock(consumeLockSite(home, batchId)); }
+/** Release: remove our identity file, drop the (now-empty) lock dir, then remove our hold-intent. NEVER throws. */
+function releaseConsumeLock(home: string, batchId: string, token: string): void { releaseHolderLock(consumeLockSite(home, batchId), token); }
 
 /** DB-R3-P1-1 / R25 orphan-recovery contract. An ORPHAN is a decision in decisions.json that is valid, bound to this batch, and
  *  NOT the verdict that was consumed — a subsequent user decision the batch never fulfilled. Identity is by CONTENT DIGEST (never a
