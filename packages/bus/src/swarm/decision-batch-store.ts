@@ -53,6 +53,18 @@ function notifiedSentPath(home: string, batchId: string): string { return path.j
  *  read and consume share ONE order (naturally consistent, no per-consumer stack-variable ordering). No post-hoc marker needed. */
 function slotsDir(home: string, batchId: string): string { return path.join(batchDir(home, batchId), "seq"); }
 function slotPath(home: string, batchId: string, n: number): string { return path.join(slotsDir(home, batchId), `${n}.json`); }
+/** Parse a `seq/` entry name to its slot number. B8-1/FC-6: the slot number is the SOLE publish-order arbiter, so its name must be
+ *  CANONICAL (no leading zeros) — `publishSlot` only ever creates `<n>.json` with n in canonical form. A non-slot entry (a temp
+ *  `<n>.json.tmp-<hex>`, or any non-`<digits>.json`) ⇒ null (skip). A numeric-looking `.json` name that is NOT canonical (a
+ *  leading-zero alias like `00.json`, which a bare `\d+` would parse to the SAME number as `0.json`) ⇒ THROW: an alias can only be a
+ *  planted collision, so fail-closed rather than admit a same-order duplicate the fold would otherwise have to timestamp-decide. */
+function parseSlotName(name: string): bigint | null {
+  if (!name.endsWith(".json")) return null;                 // temps (.json.tmp-*) and non-json files are not slots
+  const stem = name.slice(0, -".json".length);
+  if (!/^[0-9]+$/.test(stem)) return null;                  // not a numeric slot name at all ⇒ skip (never a slot-number collision)
+  if (!/^(0|[1-9][0-9]*)$/.test(stem)) throw new Error(`decision-batch: non-canonical slot name ${JSON.stringify(name)} in seq/ (a leading-zero alias of slot ${BigInt(stem)}) — refusing to read a tampered batch (B8-1/FC-6)`);
+  return BigInt(stem);
+}
 
 /** Atomically create `target` with COMPLETE `content`, exclusively (no overwrite): write a temp fully, then `link` it into
  *  place. The name appears only once the bytes are all written (a partial/interrupted write — EFBIG, a crash — never yields a
@@ -188,10 +200,10 @@ function readSlots(home: string, batchId: string): { doc: DecisionsDoc; order: b
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
   const out: { doc: DecisionsDoc; order: bigint; kind: SlotKind }[] = [];
   for (const name of names) {
-    const m = /^(\d+)\.json$/.exec(name); // only canonical slot files (skip temps / anything else)
-    if (!m) continue;
+    const n = parseSlotName(name); // null ⇒ skip a temp/non-slot; a non-canonical numeric alias THROWS (fail-closed, B8-1/FC-6)
+    if (n === null) continue;
     const slot = readSlotFile(path.join(slotsDir(home, batchId), name)); // throws on a real read error ⇒ kept, not dropped
-    if (slot && slot.doc.batchId === batchId) out.push({ doc: slot.doc, order: BigInt(m[1]!), kind: slot.kind });
+    if (slot && slot.doc.batchId === batchId) out.push({ doc: slot.doc, order: n, kind: slot.kind });
   }
   return out;
 }
@@ -216,9 +228,9 @@ function nextSlotStart(home: string, batchId: string): number {
   let names: string[];
   try { names = readdirSync(slotsDir(home, batchId)); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return 0; throw e; }
-  let max = -1;
-  for (const name of names) { const m = /^(\d+)\.json$/.exec(name); if (m) max = Math.max(max, Number(m[1])); }
-  return max + 1;
+  let max = -1n;
+  for (const name of names) { const n = parseSlotName(name); if (n !== null && n > max) max = n; } // canonical-only; a tampered alias fails closed
+  return Number(max + 1n);
 }
 
 /** Publish ONE decision record (with its KIND) by COMPETING for the next free monotonic slot: probe n = highest+1, EXCLUSIVE-create

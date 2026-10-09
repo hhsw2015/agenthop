@@ -167,9 +167,16 @@ export function foldDecisionDocs(entries: { doc: DecisionsDoc; order: bigint; ki
   // Fold by PUBLISH ORDER (the immutable slot number) PRESERVING publish SEMANTICS (TG-R6-P1-1): a "snapshot" (a console full
   // clear) REPLACES all prior decisions — a later snapshot that omits an item un-decides it (baseline parity), an empty snapshot
   // clears everything; a "tap" (a single-item entry) MERGES, preserving untouched items. So the effective state is the LATEST
-  // snapshot's items plus every tap published after it. Order ties (same slot — impossible for real slots) break by decidedAtSec.
-  const sorted = [...bound].sort((a, b) =>
-    a.order < b.order ? -1 : a.order > b.order ? 1 : a.doc.decidedAtSec - b.doc.decidedAtSec);
+  // snapshot's items plus every tap published after it. Order is the SOLE arbiter — NEVER a timestamp (B8-1/FC-6): a decidedAtSec
+  // tiebreak would let a planted same-order file swing the verdict by its clock. Slot numbers are canonical + unique (the store
+  // rejects leading-zero aliases) and legacy-import ranks are distinct, so a DUPLICATE order cannot occur via O_EXCL slot
+  // competition — if one appears it is tampering ⇒ fail-closed (throw), never a timestamp decision.
+  const sorted = [...bound].sort((a, b) => (a.order < b.order ? -1 : a.order > b.order ? 1 : 0));
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (sorted[i]!.order === sorted[i - 1]!.order) {
+      throw new Error(`foldDecisionDocs: duplicate publish order ${sorted[i]!.order} for batch ${batchId} — a same-sequence slot collision cannot occur via O_EXCL; refusing to timestamp-decide a tampered batch (B8-1/FC-6)`);
+    }
+  }
   const latest = new Map<string, Decision>();
   let maxTs = 0;
   for (const { doc, kind } of sorted) {
