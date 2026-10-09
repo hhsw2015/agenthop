@@ -1,8 +1,10 @@
 import { describe, expect, test } from "vitest";
 import {
   boardItemsToPost, planBoardWrites, buildGrantBodies, grantWaitId, planClaimAdmission, parseClaimApplication, boardItemId,
-  postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName,
-  parseBoardItemName, isValidItemId, boardAdmitEnabled, type BoardItem, type AdmissionParams, type ExistingBoardFile, type ClaimApplication,
+  postedFileName, claimedFileName, grantedFileName, rejectedFileName, doneFileName, reclaimedFileName,
+  parseBoardItemName, isValidItemId, boardAdmitEnabled, superviseBoardPost, planBoardSupervision, parsePolicyNum,
+  repostTmpAction, suppressPendingReposts, boardFileIdentityVerified,
+  type BoardItem, type AdmissionParams, type ExistingBoardFile, type ClaimApplication, type BoardSupervisionPolicy,
 } from "../src/swarm/task-board.js";
 import { commit, entityKeyOf, initialLogState, type ChangeBody, type LogState, type WaitRecord } from "../src/swarm/control-log.js";
 import { loadPlan, type TaskPlan } from "../src/swarm/task-plan.js";
@@ -285,5 +287,122 @@ describe("task-board dormancy gate (coordinator boundary #1: default OFF)", () =
     expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: "0" })).toBe(false);
     expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: "off" })).toBe(false);
     for (const v of ["1", "true", "yes", "on", "ON", "True"]) expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: v })).toBe(true);
+  });
+});
+
+
+describe("task-board BA9 superviseBoardPost + planBoardSupervision (§2d-a escalation, R14 pre-flight)", () => {
+  const POLICY: BoardSupervisionPolicy = { claimTtlSec: 100, maxReposts: 2, reportGraceSec: 50 };
+  const mkPosted = (nodeId: string, postedAtSec: number, over: Partial<BoardItem> = {}): ExistingBoardFile => {
+    const body = { ...boardItemsToPost([ready(nodeId)], plan([node(nodeId)]), { postedBy: "coord", nowSec: postedAtSec })[0]!, ...over };
+    return { file: postedFileName(boardItemId("J", nodeId)), body };
+  };
+
+  test("within the claim deadline -> ok", () => {
+    expect(superviseBoardPost(mkPosted("a", 1000).body!, 1050, POLICY)).toEqual({ kind: "ok" });
+  });
+  test("past deadline, under cap -> REPOST (fresh postedAtSec, repostCount+1, reportedAtSec cleared)", () => {
+    const act = superviseBoardPost(mkPosted("a", 1000).body!, 1200, POLICY);
+    expect(act.kind === "repost" && act.item.postedAtSec === 1200 && act.item.repostCount === 1 && act.item.reportedAtSec === undefined).toBe(true);
+  });
+  test("BP1: at cap with NO prior report -> REPORT first, even on a very late scan (never straight to reclaim)", () => {
+    const act = superviseBoardPost(mkPosted("a", 1000, { repostCount: 2 }).body!, 99999, POLICY); // age huge, no reportedAtSec
+    expect(act.kind === "report" && act.item.reportedAtSec === 99999).toBe(true);
+  });
+  test("BP1: reported, still within grace -> ok (grace runs from reportedAtSec, not postedAtSec)", () => {
+    expect(superviseBoardPost(mkPosted("a", 1000, { repostCount: 2, reportedAtSec: 1100 }).body!, 1149, POLICY)).toEqual({ kind: "ok" }); // 1149 < 1100+50
+  });
+  test("BP1: reported + grace elapsed -> RECLAIM (full 50s from the report, not 2s from postedAtSec)", () => {
+    expect(superviseBoardPost(mkPosted("a", 1000, { repostCount: 2, reportedAtSec: 1100 }).body!, 1150, POLICY)).toEqual({ kind: "reclaim", itemId: boardItemId("J", "a") });
+  });
+
+  test("planBoardSupervision: repost/report/reclaim, reports stamp reportedAtSec, all use the DERIVED id (BP4)", () => {
+    const readyIds = new Set([boardItemId("J", "a"), boardItemId("J", "b"), boardItemId("J", "c")]);
+    const overdue = mkPosted("a", 1000, { repostCount: 0 });
+    const toReport = mkPosted("b", 1000, { repostCount: 2 });
+    const toReclaim = mkPosted("c", 1000, { repostCount: 2, reportedAtSec: 1000 });
+    const r = planBoardSupervision([overdue, toReport, toReclaim], readyIds, 1120, POLICY);
+    expect(r.reposts.map((i) => i.nodeId)).toEqual(["a"]);
+    expect(r.reports.length === 1 && r.reports[0]!.itemId === boardItemId("J", "b") && r.reports[0]!.reportedAtSec === 1120).toBe(true);
+    expect(r.reclaims).toEqual([{ file: postedFileName(boardItemId("J", "c")), itemId: boardItemId("J", "c") }]);
+  });
+  test("BP4: a tampered body.itemId (`../foreign`) never reaches an output path — the DERIVED id is used", () => {
+    const evil: ExistingBoardFile = { file: postedFileName(boardItemId("J", "a")), body: { ...mkPosted("a", 1000, { repostCount: 2, reportedAtSec: 1000 }).body!, itemId: "../foreign" } };
+    const r = planBoardSupervision([evil], new Set([boardItemId("J", "a")]), 1120, POLICY);
+    expect(r.reclaims).toEqual([{ file: postedFileName(boardItemId("J", "a")), itemId: boardItemId("J", "a") }]); // NOT "../foreign"
+  });
+  test("acts ONLY on still-ready posted files — not no-longer-ready, not claimed", () => {
+    const overdue = mkPosted("a", 1000, { repostCount: 0 });
+    expect(planBoardSupervision([overdue], new Set(), 1200, POLICY)).toEqual({ reposts: [], reports: [], reclaims: [] });
+    const claimed: ExistingBoardFile = { file: claimedFileName(boardItemId("J", "a"), "w1"), body: overdue.body };
+    expect(planBoardSupervision([claimed], new Set([boardItemId("J", "a")]), 1200, POLICY)).toEqual({ reposts: [], reports: [], reclaims: [] });
+  });
+
+  test("BP6: parsePolicyNum validates finiteness / non-negativity / integer, and preserves an explicit 0", () => {
+    expect(parsePolicyNum("0", 2)).toBe(0);                         // explicit zero preserved (not the default)
+    expect(parsePolicyNum(undefined, 2)).toBe(2);                   // absent -> default
+    expect(parsePolicyNum("Infinity", 2, { integer: true })).toBe(2); // non-finite -> default (cap cannot be disabled)
+    expect(parsePolicyNum("-1", 300)).toBe(300);                    // negative -> default
+    expect(parsePolicyNum("1.5", 2, { integer: true })).toBe(2);    // non-integer count -> default
+    expect(parsePolicyNum("3", 2, { integer: true })).toBe(3);      // valid
+  });
+});
+
+describe("task-board BA9 reclaim is terminal: planBoardWrites never auto-re-posts a dead-lettered node", () => {
+  test("a `reclaimed` file blocks re-post even when the node is READY (no reclaim->repost loop)", () => {
+    const p = plan([node("a")]);
+    const reclaimed: ExistingBoardFile = { file: reclaimedFileName(boardItemId("J", "a"), "coord"), body: boardItemsToPost([ready("a")], p, { postedBy: "coord", nowSec: 1000 })[0]! };
+    const { post, reap } = planBoardWrites([ready("a")], p, [reclaimed], { postedBy: "coord", nowSec: 2000 });
+    expect(post).toEqual([]);
+    expect(reap).toEqual([]);
+  });
+});
+
+describe("task-board BP3 repost-tmp recovery (crash between acquire + rewrite/restore must not revive a moved item or reset escalation)", () => {
+  test("genuinely-missing item -> restore (no live state for its itemId)", () => {
+    expect(repostTmpAction("item-a", new Set())).toBe("restore");
+  });
+  test("counterexample A: a claimed/moved item -> DROP the stale tmp (never revive -> claimed+posted coexisting)", () => {
+    expect(repostTmpAction("item-a", new Set(["item-a"]))).toBe("drop"); // any live state (posted back / claimed / terminal)
+    expect(repostTmpAction("item-b", new Set(["item-a"]))).toBe("restore"); // a different item's state does not block
+  });
+  test("counterexample B: a node with an UNRESTORED tmp is suppressed from a fresh first post (obligation retained)", () => {
+    const post = [{ itemId: "item-a" }, { itemId: "item-b" }];
+    expect(suppressPendingReposts(post, new Set(["item-a"]))).toEqual([{ itemId: "item-b" }]);
+  });
+  test("a successfully-restored (not pending) item is NOT suppressed", () => {
+    const post = [{ itemId: "item-a" }, { itemId: "item-b" }];
+    expect(suppressPendingReposts(post, new Set())).toEqual(post); // empty pending set -> nothing suppressed
+  });
+});
+
+describe("task-board BP3 round-5 (body-verified eviction + obligation retained under a live/recycled writer pid)", () => {
+  const itemId = boardItemId("J", "a");
+  test("a body whose identity matches the filename itemId is VERIFIED", () => {
+    expect(boardFileIdentityVerified(itemId, { jobId: "J", nodeId: "a" })).toBe(true);
+  });
+  test("counterexample A: a claim whose BODY is another job's entry is NOT verified (cannot evict a legit tmp)", () => {
+    expect(boardFileIdentityVerified(itemId, { jobId: "OTHER", nodeId: "a" })).toBe(false); // body→different itemId
+    expect(boardFileIdentityVerified(itemId, { nodeId: "a" })).toBe(false); // missing jobId
+    expect(boardFileIdentityVerified(itemId, null)).toBe(false);
+    // so liveItemIds (built from VERIFIED bodies only) would NOT contain itemId -> the tmp is restored, not dropped:
+    expect(repostTmpAction(itemId, new Set())).toBe("restore");
+  });
+  test("a verified live state DOES evict (drop) the stale tmp", () => {
+    const live = new Set(boardFileIdentityVerified(itemId, { jobId: "J", nodeId: "a" }) ? [itemId] : []);
+    expect(repostTmpAction(itemId, live)).toBe("drop");
+  });
+  test("counterexample B: an unrestored tmp (live/recycled writer) still suppresses the fresh first post", () => {
+    const post = [{ itemId }, { itemId: boardItemId("J", "b") }];
+    expect(suppressPendingReposts(post, new Set([itemId]))).toEqual([{ itemId: boardItemId("J", "b") }]);
+  });
+});
+
+describe("task-board BP3 round-6 (identity encoding: a lone surrogate cannot impersonate a real U+FFFD to evict a tmp)", () => {
+  test("a genuine U+FFFD body is VERIFIED; a lone-surrogate body that hashes to the same key is REJECTED before it can evict", () => {
+    const key = boardItemId("�", "a"); // a real replacement char — well-formed
+    expect(boardItemId("\uD800", "a")).toBe(key); // the collision the fix defends against: a lone surrogate folds to U+FFFD bytes
+    expect(boardFileIdentityVerified(key, { jobId: "�", nodeId: "a" })).toBe(true); // real U+FFFD stays legit
+    expect(boardFileIdentityVerified(key, { jobId: "\uD800", nodeId: "a" })).toBe(false); // ill-formed -> not verified -> never evicts the legit tmp
   });
 });

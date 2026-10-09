@@ -281,7 +281,7 @@ export type WaitRecord = {
   [k: string]: unknown;
 };
 
-export type BoardItemStatus = "open" | "claimed" | "granted" | "rejected" | "done";
+export type BoardItemStatus = "open" | "claimed" | "granted" | "rejected" | "done" | "reclaimed";
 export type BoardItem = {
   itemId: string;
   status: BoardItemStatus;
@@ -357,7 +357,7 @@ export function parseBoardFileName(name: string): { itemId: string; status: Boar
   if (!name.endsWith(".json")) return null;
   const stem = name.slice(0, -".json".length);
   const parts = stem.split(".");
-  if (parts.length >= 2 && (parts[1] === "claimed" || parts[1] === "granted" || parts[1] === "rejected" || parts[1] === "done")) {
+  if (parts.length >= 2 && (parts[1] === "claimed" || parts[1] === "granted" || parts[1] === "rejected" || parts[1] === "done" || parts[1] === "reclaimed")) {
     return { itemId: parts[0]!, status: parts[1], claimant: parts.length > 2 ? parts.slice(2).join(".") : null };
   }
   return { itemId: stem, status: "open", claimant: null };

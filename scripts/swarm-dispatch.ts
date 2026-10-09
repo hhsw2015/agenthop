@@ -35,7 +35,7 @@ import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/ta
 import type { Assignment } from "../packages/bus/src/swarm/task-assignment.js";
 import { taskPass, buildSched, physicalSlotsOccupied, type TaskOps, type GitFacts } from "../packages/bus/src/swarm/task-pass.js";
 import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
-import { boardAdmitEnabled, planBoardWrites, postedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
+import { boardAdmitEnabled, planBoardWrites, planBoardSupervision, parsePolicyNum, postedFileName, reclaimedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, repostTmpAction, suppressPendingReposts, boardFileIdentityVerified, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
@@ -823,6 +823,40 @@ async function main(): Promise<void> {
       const usage = { totalAttempts: attempts.length, wallClockSec: Math.max(0, nowSec() - jobStartSec(cur.jobId)) };
       const ready = readyTasks({ plan: cur, attempts, acceptedResults, now: nowSec(), jobUsage: usage });
       mkdirSync(BOARD_DIR, { recursive: true });
+      // BP3: adopt an orphaned `.repost.<pid>.tmp` left when a crash hit BETWEEN the repost's rename-acquire
+      // (posted -> tmp) and its rewrite/restore, so the item's escalation progress (repostCount + deadline) survives a
+      // restart. Restore ONLY a genuinely-missing item: if ANY live state exists for its itemId (posted already back, or
+      // claimed/granted/terminal) the item MOVED ON -> the tmp is stale, drop it (never revive a claimed/moved item ->
+      // claimed+posted coexisting). A restore that itself FAILS keeps the itemId a PENDING obligation (below), so a fresh
+      // first post is suppressed (never reset the count by re-creating the item). Only touch a tmp whose writer is gone.
+      const boardFiles = readdirSync(BOARD_DIR);
+      // BP3 counterexample A: liveItemIds counts ONLY body-VERIFIED states — a forged/mismatched file (filename itemId ≠
+      // body identity) must NOT evict a legit tmp (the consumer rejects it on BA2b, so trusting its filename would drop a
+      // real obligation and re-post a fresh count-less item). Verify each candidate state's body against its filename.
+      const liveItemIds = new Set<string>();
+      for (const bf of boardFiles) {
+        const p = parseBoardItemName(bf);
+        if (!p) continue;
+        let body: unknown = null;
+        try { body = JSON.parse(readFileSync(path.join(BOARD_DIR, bf), "utf8")); } catch { /* unreadable ⇒ unverified */ }
+        if (boardFileIdentityVerified(p.itemId, body)) liveItemIds.add(p.itemId);
+      }
+      const pendingTmpItemIds = new Set<string>();
+      for (const f of boardFiles) {
+        const m = /^(.+)\.json\.repost\.(\d+)\.tmp$/.exec(f);
+        if (!m) continue;
+        const itemId = m[1]!;
+        const writerPid = Number(m[2]);
+        let writerAlive = false; try { process.kill(writerPid, 0); writerAlive = true; } catch { /* dead */ }
+        // BP3 counterexample B: an UNRESTORED legit tmp ALWAYS suppresses a fresh first post — a live/recycled/ambiguous
+        // writer pid is NO exception; its escalation obligation still lives in the tmp. Leave the tmp (don't steal a
+        // possibly-live producer's in-flight work), but retain the obligation so planBoardWrites can't re-post it fresh.
+        if (writerAlive && writerPid !== process.pid) { pendingTmpItemIds.add(itemId); continue; }
+        const tmp = path.join(BOARD_DIR, f);
+        if (repostTmpAction(itemId, liveItemIds) === "drop") { try { unlinkSync(tmp); } catch { /* fine */ } continue; } // body-verified moved-on -> stale
+        try { renameSync(tmp, path.join(BOARD_DIR, postedFileName(itemId))); liveItemIds.add(itemId); } // recovered -> now live
+        catch { pendingTmpItemIds.add(itemId); } // restore FAILED -> obligation still pending; suppress a fresh first post
+      }
       // Read each existing board file's body so the producer can refresh a stale-revision post (BA8b) and tell its own job's
       // entries from another job's (BA4). Unreadable ⇒ body null.
       const existing: ExistingBoardFile[] = readdirSync(BOARD_DIR).map((f) => {
@@ -834,9 +868,74 @@ async function main(): Promise<void> {
       // Reap BEFORE post (BA8a): a stale-revision refresh overwrites the posted file in place via atomicWrite, so post must run
       // AFTER any unlink — never write the fresh item and then delete it. (planBoardWrites keeps the two sets path-disjoint,
       // but ordering reap-first is the robust guarantee.)
+      // BP3: suppress a fresh first post for any node whose itemId still has an UNRESTORED repost tmp — its escalation
+      // obligation lives in that tmp; re-posting fresh would reset repostCount + deadline and bypass the cap.
+      const toPost = suppressPendingReposts(post, pendingTmpItemIds);
       for (const f of reap) { try { unlinkSync(path.join(BOARD_DIR, f)); } catch { /* raced away — fine */ } }
-      for (const item of post) atomicWrite(path.join(BOARD_DIR, postedFileName(item.itemId)), JSON.stringify(item));
-      if (post.length || reap.length) log(`board producer: posted ${post.length}, reaped ${reap.length} stale`);
+      for (const item of toPost) atomicWrite(path.join(BOARD_DIR, postedFileName(item.itemId)), JSON.stringify(item));
+      if (toPost.length || reap.length) log(`board producer: posted ${toPost.length}, reaped ${reap.length} stale`);
+
+      // BA9: supervise STILL-READY posted-but-unclaimed items past their claim deadline — REPOST (bounded) ->
+      // REPORT (S19-form incident, deduped by a `.report.json` marker) -> RECLAIM (rename to the terminal
+      // `reclaimed` dead-letter, which planBoardWrites then never auto-re-posts). Still inside the board gate.
+      const supPolicy = {
+        claimTtlSec: parsePolicyNum(process.env.SWARM_BOARD_CLAIM_TTL_SEC, 300),
+        maxReposts: parsePolicyNum(process.env.SWARM_BOARD_MAX_REPOSTS, 2, { integer: true }), // BP6: finite non-neg int, preserve 0
+        reportGraceSec: parsePolicyNum(process.env.SWARM_BOARD_REPORT_GRACE_SEC, 300),
+      };
+      const readyItemIds = new Set(ready.map((r) => boardItemId(cur.jobId, r.nodeId)));
+      // BP2: supervise a FRESH snapshot taken AFTER the post/reap writes — never the pre-write `existing`.
+      const fresh: ExistingBoardFile[] = readdirSync(BOARD_DIR).map((f) => {
+        let body: ExistingBoardFile["body"] = null;
+        try { body = JSON.parse(readFileSync(path.join(BOARD_DIR, f), "utf8")); } catch { /* unreadable ⇒ null */ }
+        return { file: f, body };
+      });
+      const sup = planBoardSupervision(fresh, readyItemIds, nowSec(), supPolicy);
+      // BP3: repost/report migrate the SAME posted file atomically — acquire it by rename (skip if a member
+      // claimed it first), rewrite, release. Losing the source never publishes a new state.
+      const atomicRepost = (itemId: string, body: unknown): boolean => {
+        const posted = path.join(BOARD_DIR, postedFileName(itemId));
+        const tmp = `${posted}.repost.${process.pid}.tmp`;
+        try { renameSync(posted, tmp); } catch { return false; } // gone/claimed ⇒ never revive
+        try {
+          atomicWrite(posted, JSON.stringify(body));
+        } catch {
+          // BP3: the rewrite failed — RESTORE the acquired original (with its repostCount/postedAtSec) so the
+          // item's escalation progress is never lost. A failure that leaves only the tmp would make the next
+          // planBoardWrites re-post a fresh first item (count/deadline reset, cap bypassed). If restore also fails,
+          // the tmp survives for the next tick's adoption sweep to recover.
+          try { renameSync(tmp, posted); } catch { /* adoption sweep will recover the tmp */ }
+          return false;
+        }
+        try { unlinkSync(tmp); } catch { /* fine */ }
+        return true;
+      };
+      for (const it of sup.reposts) atomicRepost(it.itemId, it);
+      for (const it of sup.reports) {
+        // BP1: the reportedAtSec stamp is what starts the reclaim grace, so it must mean "a report was durably
+        // saved". Write the S19 incident FIRST; ONLY a confirmed save then stamps the posted file. A failed save
+        // leaves reportedAtSec unset, so the next tick re-emits the report (the obligation is retained) — never
+        // stamp-then-grace-then-reclaim with no report file. The incident content is fixed per item, so a re-write
+        // before the stamp lands is idempotent.
+        const doc = buildApprovalDoc({
+          from: SELF, fromLabel: "swarm-board", nowSec: nowSec(), member: it.itemId,
+          screenSummary: `board item ${it.itemId} unclaimed after ${supPolicy.maxReposts} reposts — no capable member claimed it`,
+          options: [{ label: "reassign / raise capacity", consequence: "a capable member claims the item" }, { label: "let it reclaim", consequence: "the node returns to the dead-letter lane after the grace" }],
+        });
+        let saved = false;
+        try { atomicWrite(path.join(BOARD_DIR, `${it.itemId}.report.json`), JSON.stringify(doc.body)); saved = true; } catch { /* not durable — retry next tick, do NOT stamp */ }
+        if (!saved) continue;
+        atomicRepost(it.itemId, it); // persist reportedAtSec on the still-unclaimed file (grace starts here); claimed/gone ⇒ harmless skip
+      }
+      for (const rc of sup.reclaims) {
+        const from = path.join(BOARD_DIR, rc.file);
+        const to = path.join(BOARD_DIR, reclaimedFileName(rc.itemId, SELF));
+        let body: unknown = { itemId: rc.itemId };
+        try { body = JSON.parse(readFileSync(from, "utf8")); } catch { /* minimal */ }
+        try { renameSync(from, to); } catch { continue; } // BP3: ATOMIC state migration; skip if claimed/gone (never posted+reclaimed, never half-done)
+        atomicWrite(to, JSON.stringify({ ...(body as object), reclaimedBy: SELF, reclaimedAtSec: nowSec(), deadLetter: true, note: "unclaimed past the repost cap + grace; dead-lettered (coordinator must re-enqueue)" }));
+      }
+      if (sup.reposts.length || sup.reports.length || sup.reclaims.length) log(`board supervision: reposted ${sup.reposts.length}, reported ${sup.reports.length}, reclaimed ${sup.reclaims.length}`);
     } catch (e) { log(`board producer failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
