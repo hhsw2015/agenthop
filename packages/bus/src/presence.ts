@@ -91,16 +91,20 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
     if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
     openSock();
   };
-  // SU3: like syncSidFor but OVERRIDES a fixedSid — used ONLY on a proven succession adoption to move the liveness socket to the
-  // adopted sid (a seeded presence's fixedSid would otherwise pin the socket to the wrong identity, so resolveSession(adopted)
-  // would find nothing and fall to relay). The one place a fixedSid is overridden.
-  const forceSockSidTo = (want: string): void => {
+  // SU3: like syncSidFor but OVERRIDES a fixedSid AND resolves only once the new socket is actually bound — used ONLY on a proven
+  // succession adoption to move the liveness socket to the adopted sid (a seeded presence's fixedSid would otherwise pin the
+  // socket to the wrong identity, so resolveSession(adopted) would find nothing and fall to relay). AWAITABLE so SU2's adopt lock
+  // can be held until the listener is published. The one place a fixedSid is overridden.
+  const forceSockSidToAsync = async (want: string): Promise<void> => {
     if (!want || want === sockSid) return;
     sockSid = want;
-    bindGen++;
+    const gen = ++bindGen;
     binding = false;
     if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
-    openSock();
+    const res = await openLivenessSocket(home, want);
+    if (!res) return;                                 // path too long / bind failed ⇒ relay-only (retry on the keepAlive tick)
+    if (closing || gen !== bindGen) { try { res.server.close(); } catch { /* best effort */ } return; } // superseded/shutting down
+    sockServer = res.server;
   };
   const core = startBusCore({ ...opts, onIdentityChange: (self) => syncSidFor(self.stableId ?? self.id) });
   if (!fixedSid) sockSid = core.self.stableId ?? core.self.id; // initial sid from the core (the per-run id until a late adopt)
@@ -117,11 +121,13 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
     // claude process), never this daemon's `node presence.mjs`. Async because the incumbent check probes the live socket (SU1).
     void (async () => {
       try {
-        const adopted = await runSuccessionAtStartup(home, core.self.tool, core.self.stableId ?? core.self.id, Number(process.env.AGENTHOP_HOST_PID) || undefined, dbg);
-        if (adopted && !closing) {
-          core.adoptStableId(adopted);  // drain the adopted inbox + publish the identity
-          forceSockSidTo(adopted);      // SU3: move the liveness socket to the adopted sid (overrides a seeded fixedSid)
-        }
+        // The publish runs UNDER SU2's single-winner adopt lock: adopt the identity (drain its inbox) then bind its liveness
+        // socket (SU3) — the lock is released only after this resolves, covering the pre-publish interval.
+        await runSuccessionAtStartup(
+          home, core.self.tool, core.self.stableId ?? core.self.id, Number(process.env.AGENTHOP_HOST_PID) || undefined,
+          async (sid) => { if (closing) return; core.adoptStableId(sid); await forceSockSidToAsync(sid); },
+          dbg,
+        );
       } catch (e) { dbg(`succession startup failed (ignored): ${e instanceof Error ? e.message : e}`); }
     })();
   }

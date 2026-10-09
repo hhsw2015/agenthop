@@ -141,7 +141,7 @@ export function successionEnabled(env: NodeJS.ProcessEnv = process.env): boolean
   return /^(1|true|yes|on)$/i.test(env.SWARM_SUCCESSION ?? "");
 }
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -254,6 +254,32 @@ export function readHostArgv(hostPid: number | undefined): string[] {
   return [];
 }
 
+function adoptLockPath(home: string, sid: string): string { return path.join(home, ".agenthop", "presence", `${sid}.adopt.lock`); }
+
+/** signal-0: true ONLY on ESRCH (definitely dead). alive / EPERM (exists, not ours) / any other errno ⇒ false (never convict). */
+function procIsDead(pid: number): boolean {
+  try { process.kill(pid, 0); return false; }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ESRCH"; }
+}
+
+/** SU2: acquire the single-winner adopt lock for `sid` via O_EXCL (`wx`). true ⇒ WE hold it (proceed with the commit); false ⇒
+ *  another shell holds a LIVE adopt and we must NOT adopt (loser → fresh). A lock whose holder pid is DEFINITIVELY dead (ESRCH)
+ *  is reclaimed exactly once; an unreadable lock or a live holder is never stolen. The O_EXCL create is the serializer, so even
+ *  with concurrent reclaimers at most one re-create wins. */
+export function acquireAdoptLock(home: string, sid: string, selfPid: number): boolean {
+  const p = adoptLockPath(home, sid);
+  try { writeFileSync(p, String(selfPid), { flag: "wx" }); return true; }
+  catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") return false; // any other error ⇒ fail-closed (do not adopt)
+    let holder: number | null = null;
+    try { const n = Number(readFileSync(p, "utf8").trim()); holder = Number.isInteger(n) && n > 0 ? n : null; } catch { holder = null; }
+    if (holder === null || !procIsDead(holder)) return false;         // unreadable, or a LIVE holder ⇒ loser (never steal a live adopt)
+    try { unlinkSync(p); } catch { return false; }                    // reclaim a provably-dead holder's lock, once
+    try { writeFileSync(p, String(selfPid), { flag: "wx" }); return true; } catch { return false; }
+  }
+}
+export function releaseAdoptLock(home: string, sid: string): void { try { unlinkSync(adoptLockPath(home, sid)); } catch { /* best effort */ } }
+
 /**
  * Bus-core-init / presence-startup consumption point (dormant: SWARM_SUCCESSION off). Gather this shell's attestation — the
  * binding credential (resume target) comes from the AGENT's OWN argv via ps on `hostPid` (coordinator ruling a: argv is the
@@ -262,7 +288,7 @@ export function readHostArgv(hostPid: number | undefined): string[] {
  * `core.adoptStableId(sid)` (drains its inbox + rebinds the liveness socket + makes resolveSession find it). Returns null on
  * fresh/reject or any IO fault (fail-closed — never hijack on error).
  */
-export async function runSuccessionAtStartup(home: string, selfTool: string, selfNativeSid: string, hostPid: number | undefined, log: (m: string) => void = () => {}): Promise<string | null> {
+export async function runSuccessionAtStartup(home: string, selfTool: string, selfNativeSid: string, hostPid: number | undefined, publish: (adoptedSid: string) => Promise<void> | void, log: (m: string) => void = () => {}): Promise<string | null> {
   const hostArgv = readHostArgv(hostPid); // the AGENT's real launch argv (e.g. `codex resume <sid>`) — the credential source
   const att: Attestation = {
     machine: os.hostname(),
@@ -279,8 +305,18 @@ export async function runSuccessionAtStartup(home: string, selfTool: string, sel
   catch (e) { log(`succession: plan failed (coming up fresh): ${e instanceof Error ? e.message : e}`); return null; }
   if (result.action !== "adopt" || !result.rebind) { log(`succession: ${result.action} — ${result.reason}`); return null; }
   const sid = result.rebind.stableSid;
-  try { writeFileSync(path.join(home, ".agenthop", presencePidRelPath(sid)), String(att.newPid)); }
-  catch (e) { log(`succession: adopt pid-write failed (not adopting): ${e instanceof Error ? e.message : e}`); return null; }
-  log(`succession: ADOPTED stable sid ${sid} — ${result.reason}`);
-  return sid;
+  // SU2: SINGLE-WINNER occupancy. Hold an O_EXCL lock across the re-check + pid-write + listener publish, so two shells racing
+  // to adopt the same prior sid can't both commit; the loser (EEXIST on a live holder) comes up fresh and never overwrites the
+  // winner. The lock is held until `publish` resolves (the winner's liveness socket is actually bound — covering the pre-publish
+  // interval), then released.
+  if (!acquireAdoptLock(home, sid, att.newPid)) { log(`succession: another shell is adopting ${sid} — coming up fresh`); return null; }
+  try {
+    // Re-check UNDER the lock: a winner may have published a live socket between the plan and the lock acquire.
+    if (await probeSessionAlive(home, sid)) { log(`succession: ${sid} became live under the lock — not adopting`); return null; }
+    writeFileSync(path.join(home, ".agenthop", presencePidRelPath(sid)), String(att.newPid));
+    await publish(sid); // core.adoptStableId + bind the liveness socket — the listener is published WHILE we hold the lock
+    log(`succession: ADOPTED stable sid ${sid} — ${result.reason}`);
+    return sid;
+  } catch (e) { log(`succession: adopt commit failed (coming up fresh): ${e instanceof Error ? e.message : e}`); return null; }
+  finally { releaseAdoptLock(home, sid); }
 }

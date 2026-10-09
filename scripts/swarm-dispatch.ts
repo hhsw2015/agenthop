@@ -58,9 +58,8 @@ import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys,
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
-import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrSendKeys, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
+import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { coordinatorReportPlan, coordEscalateEnabled, type ReportSeverity } from "../packages/bus/src/swarm/coordinator-report.js";
-import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
@@ -805,12 +804,14 @@ async function main(): Promise<void> {
   // defect — a declared log-only mode); "failed" = routable but the inbox write errored (transient ⇒ the caller holds the
   // snapshot + retries so the event is not lost — review P2-2).
   const notifySent = new Map<string, number>(); // dedup: (taskRef\0text) -> last-sent ms; suppress an identical re-send within NOTIFY_DEDUP_MS
+  const isStableSid = (s: string): boolean => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s); // CE2: a verified stable SID, not a routable display handle
   const notifyCoordinator = (text: string, opts: { taskRef?: string; title?: string; severity?: ReportSeverity } = {}): "delivered" | "logged" | "failed" | "deduped" => {
     const now = Date.now();
     for (const [k, t] of notifySent) if (now - t >= NOTIFY_DEDUP_MS) notifySent.delete(k); // prune expired (bounds the map)
     const key = `${opts.taskRef ?? ""}\u0000${text}`;
-    if ((notifySent.get(key) ?? -Infinity) > now - NOTIFY_DEDUP_MS) return "deduped"; // identical notice just sent — skip the duplicate (not a failure: the original went out)
-    const s11 = { ...(opts.taskRef ? { taskRef: opts.taskRef } : {}), ...(opts.title ? { title: opts.title } : {}) }; // S11 structured header (validInboxMsg preserves these)
+    if ((notifySent.get(key) ?? -Infinity) > now - NOTIFY_DEDUP_MS) return "deduped"; // identical notice just DELIVERED — skip (CE4: sync delivery records dedup, so a later tick is suppressed)
+    const s11 = { ...(opts.taskRef ? { taskRef: opts.taskRef } : {}), ...(opts.title ? { title: opts.title } : {}) }; // S11 structured header
+    // RESOLVED coordinator ⇒ the durable inbox (the normal path).
     if (COORDINATOR !== "") {
       const sid = resolveSession(COORDINATOR, listSessions(HOME));
       if (sid) {
@@ -818,35 +819,25 @@ async function main(): Promise<void> {
         catch (e) { log(`observer notify write failed (transient) — will retry: ${e instanceof Error ? e.message : e}`); return "failed"; } // not recorded ⇒ retry not suppressed
       }
     }
-    // F45 ② (SWARM_COORD_ESCALATE): the coordinator is UNRESOLVED (unset, or no live presence binding — the DEAF-coordinator
-    // incident). A log is NOT a report. When the flag is ON, route the notice by coordinatorReportPlan to a REAL surface instead
-    // of only logging. DORMANT by default (flag off ⇒ the plain log below, unchanged behavior). notifyCoordinator is sync, so the
-    // async herdr-pane probe/send run fire-and-forget (best-effort — coordinatorReportPlan's isReport is a ROUTING decision, not a
-    // delivery receipt). An S19 incident is a DURABLE write to the coordinator's STABLE inbox (survives the presence gap); a real
-    // escalation records dedup (so repeated identical notices don't spam), a degraded/failed one does NOT (so recovery re-delivers).
-    if (coordEscalateEnabled()) {
-      const coordSid = COORDINATOR;
-      const s19Available = coordSid !== "" && isValidSessionId(coordSid); // can key a durable S19 incident to the stable inbox
-      void (async () => {
-        const paneId = coordSid !== "" ? await herdrPaneIdForSession(coordSid).catch(() => null) : null;
-        const plan = coordinatorReportPlan({ coordinatorResolved: false, s19Available, herdrPaneAvailable: paneId !== null, severity: opts.severity ?? "stall" });
-        if (plan.surface === "s19") {
-          try { writeInbox(HOME, coordSid, { from: SELF, fromLabel: "swarm-observer", ...s11, text: `[S19 incident] ${text}`, via: "local", ts: Date.now() }); notifySent.set(key, Date.now()); log(`[observer→coordinator] escalated to S19 durable incident (coordinator unresolved): ${text}`); }
-          catch (e) { log(`[observer→coordinator] S19 escalation write FAILED — UNHEARD: ${e instanceof Error ? e.message : e}`); } // no dedup ⇒ retried
-        } else if (plan.surface === "herdr-pane" && paneId) {
-          const r = await herdrSendKeys(paneId, [text]).catch(() => ({ ok: false, note: "send threw" }));
-          if (r.ok) { notifySent.set(key, Date.now()); log(`[observer→coordinator] escalated to herdr pane ${paneId}: ${text}`); }
-          else log(`[observer→coordinator] herdr-pane escalation FAILED (${r.note}) — UNHEARD: ${text}`); // no dedup ⇒ retried
-        } else {
-          log(`[observer→coordinator] UNHEARD — no reporting surface available (coordinator unresolved): ${text}`); // plan=log, isReport=false
-        }
-      })();
-      return "logged"; // sync contract unchanged; the real escalation is best-effort in flight
+    // UNRESOLVED + escalate flag OFF ⇒ the historical log-only mode (a declared best-effort; callers move on; no dedup so recovery re-delivers).
+    if (!coordEscalateEnabled()) {
+      log(`[observer→coordinator] ${text}${COORDINATOR === "" ? " (SWARM_COORDINATOR unset — logged)" : " (coordinator unresolved — logged)"}`);
+      return "logged";
     }
-    log(`[observer→coordinator] ${text}${COORDINATOR === "" ? " (SWARM_COORDINATOR unset — logged)" : " (coordinator unresolved — logged)"}`);
-    // Do NOT record dedup on the log-only path (AS-P2-3): nothing was delivered to the inbox, so an identical notice that
-    // CAN be delivered once the coordinator becomes resolvable must not be suppressed as a "deduped" success. notifySent is
-    // recorded ONLY on a real delivery (above), so a later recovery re-delivers instead of silently dropping the advice.
+    // F45 ② (SWARM_COORD_ESCALATE): escalate to a REAL surface, SYNCHRONOUSLY, so the return reflects the actual IO (CE1): a
+    // successful durable S19 write discharges the obligation (dedup recorded); a write FAILURE returns "failed" (caller retries,
+    // obligation retained); a notice with no verified surface returns "logged" (honest UNHEARD). CE2: the S19 inbox KEY must be a
+    // VERIFIED STABLE SID (UUID) — never a routable display handle, which no identity drains. CE3: S19 is the preferred durable
+    // route and is written directly (no herdr-pane query). The pane rung of coordinatorReportPlan is intentionally NOT exercised
+    // here — it is async, the historical source of the early-discharge / duplicate-tick defects, and the coordinator is a stable
+    // SID in practice so S19 always covers it; herdrPaneAvailable is passed false.
+    const s19Sid = isStableSid(COORDINATOR) ? COORDINATOR : null;
+    const plan = coordinatorReportPlan({ coordinatorResolved: false, s19Available: s19Sid !== null, herdrPaneAvailable: false, severity: opts.severity ?? "stall" });
+    if (plan.surface === "s19" && s19Sid) {
+      try { writeInbox(HOME, s19Sid, { from: SELF, fromLabel: "swarm-observer", ...s11, text: `[S19 incident] ${text}`, via: "local", ts: now }); notifySent.set(key, now); log(`[observer→coordinator] escalated to S19 durable incident (coordinator unresolved): ${text}`); return "delivered"; }
+      catch (e) { log(`[observer→coordinator] S19 escalation write FAILED — retry: ${e instanceof Error ? e.message : e}`); return "failed"; } // CE1: failure keeps the obligation
+    }
+    log(`[observer→coordinator] UNHEARD/logged (coordinator unresolved${s19Sid ? "" : ", no verified stable SID"}): ${text}`); // plan=log (info severity, or no verified SID) — isReport=false
     return "logged";
   };
 

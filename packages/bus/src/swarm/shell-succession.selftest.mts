@@ -1,5 +1,8 @@
-import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, presencePidRelPath, planSuccession, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
+import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, presencePidRelPath, planSuccession, acquireAdoptLock, releaseAdoptLock, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
 import type { RosterMember } from "./resume.js";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
@@ -80,5 +83,16 @@ t("plan: match + resume-target credential + dead incumbent -> ADOPT", spAdopt.ac
 t("plan: match but LIVE incumbent -> reject (never steal a live slot)", (await planSuccession(att({ resumeTargetSid: "fe0376cd", newNativeSid: "new-sid" }), [mem({ member: "fe0376cd" })], aliveInc)).action === "reject");
 t("plan: credential names a sid with no roster member -> fresh", (await planSuccession(att({ resumeTargetSid: undefined, herdrPane: undefined, newNativeSid: "new-sid" }), [mem({ member: "fe0376cd" })], deadInc)).action === "fresh");
 t("plan: cwd compared normalized (trailing slash)", (await planSuccession(att({ cwd: "/w/", resumeTargetSid: "fe0376cd", newNativeSid: "new-sid" }), [mem({ cwd: "/w" })], deadInc)).action === "adopt");
+
+// --- SU2 single-winner adopt lock (real fs) ---
+const lockHome = mkdtempSync(path.join(tmpdir(), "f45-lock-"));
+mkdirSync(path.join(lockHome, ".agenthop", "presence"), { recursive: true });
+t("SU2 lock: first acquire wins", acquireAdoptLock(lockHome, "sidL", process.pid) === true);
+t("SU2 lock: second acquire while the holder (this live process) holds it -> loses", acquireAdoptLock(lockHome, "sidL", process.pid) === false);
+releaseAdoptLock(lockHome, "sidL");
+t("SU2 lock: release then re-acquire wins", acquireAdoptLock(lockHome, "sidL", process.pid) === true);
+writeFileSync(path.join(lockHome, ".agenthop", "presence", "sidG.adopt.lock"), "garbage"); // unreadable (non-numeric) holder
+t("SU2 lock: a lock with an unreadable holder is NOT stolen (fail-closed)", acquireAdoptLock(lockHome, "sidG", process.pid) === false);
+rmSync(lockHome, { recursive: true, force: true });
 
 console.log("all shell-succession selftests passed");
