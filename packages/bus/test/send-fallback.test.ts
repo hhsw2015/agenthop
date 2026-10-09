@@ -163,6 +163,15 @@ describe("F45-R7 openLivenessSocket + probeSessionAlive — per-instance ownersh
     expect(await probeSessionAlive(home, b, 400)).toBe(false); // distinct hash ⇒ no shared endpoint ⇒ no false durable
   });
 
+  test("hint ①: a socket under the sid's prefix that EMITS A DIFFERENT sid is rejected (identity back-verification)", async () => {
+    const home = mkHome();
+    const fakePath = instanceSockPath(home, "sid-A", "beefbeef"); // same hash prefix as sid-A, a different instance slot
+    const fake = net.createServer((c) => c.end("sid-OTHER")); fake.on("error", () => {});
+    await new Promise<void>((r) => fake.listen(fakePath, r));
+    servers.push(fake);
+    expect(await probeSessionAlive(home, "sid-A", 400)).toBe(false); // the socket does not own sid-A ⇒ not alive ⇒ keep relay
+  });
+
   test("P2-1: two instances of the SAME sid own DISTINCT paths; closing one leaves the other alive (no cross-delete)", async () => {
     const home = mkHome();
     const r1 = await openLivenessSocket(home, "sid-S", 400);

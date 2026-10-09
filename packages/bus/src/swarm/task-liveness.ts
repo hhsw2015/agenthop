@@ -111,11 +111,30 @@ export function probeLivenessSock(sockPath: string, timeoutMs: number = PRESENCE
   });
 }
 
+/** Connect to a liveness socket and read the FULL sid it emits (openLivenessSocket writes the owning sid on accept, then closes).
+ *  Returns the emitted sid, or null on error/timeout/empty. Used to back-VERIFY identity (coordinator r9 hint ①): the hashed
+ *  filename is only a bounded, collision-free KEY — the connect then confirms the socket actually belongs to the probed sid, so
+ *  even an (infeasible) 128-bit collision or a same-prefix leftover cannot answer for a sid it does not own. */
+export function probeSocketSid(sockPath: string, timeoutMs: number = PRESENCE_PROBE_MS): Promise<string | null> {
+  return new Promise((resolve) => {
+    let done = false; let buf = "";
+    const sock = net.connect(sockPath);
+    const finish = (v: string | null): void => { if (done) return; done = true; try { sock.destroy(); } catch { /* noop */ } resolve(v); };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    timer.unref?.();
+    sock.setEncoding("utf8");
+    sock.on("data", (d) => { buf += d; if (buf.length > 4096) finish(buf.slice(0, 4096)); }); // a sid is short; cap a rogue stream
+    sock.once("end", () => { clearTimeout(timer); finish(buf.length ? buf : null); });
+    sock.once("error", () => { clearTimeout(timer); finish(null); });
+  });
+}
+
 /** F45-R7 (ruling B, rounds 7-9): is the SAME-MACHINE current instance of `sessionId` alive? The socket name is a bounded hash
  *  of the sid (no traversal, no truncation collision) + a per-instance nonce, so we LIST the presence dir for this sid's prefix
- *  and probe each candidate — ANY accepted connection ⇒ alive. A candidate whose path would not fit sun_path is skipped (never
- *  trust a truncatable path that could answer for a different sid). A readdir fault ⇒ false (keep relay). Pure connect: no
- *  pid/mtime/start-time proof; stops at the first live match. */
+ *  and probe each candidate. A candidate is ALIVE only if the connect is accepted AND the socket EMITS the exact probed sid
+ *  (coordinator r9 hint ①: the hashed filename is the key, the emitted sid is the back-verification — a collision/leftover that
+ *  does not own this sid is rejected). A candidate whose path would not fit sun_path is skipped (never trust a truncatable path).
+ *  A readdir fault ⇒ false (keep relay). No pid/mtime/start-time proof; stops at the first verified live match. */
 export async function probeSessionAlive(home: string, sessionId: string, timeoutMs: number = PRESENCE_PROBE_MS): Promise<boolean> {
   const prefix = sidSockPrefix(sessionId);
   let files: string[];
@@ -124,7 +143,7 @@ export async function probeSessionAlive(home: string, sessionId: string, timeout
     if (!f.startsWith(`${prefix}.`) || !f.endsWith(".sock")) continue;
     const p = path.join(presenceDir(home), f);
     if (!sockPathFits(p)) continue; // a truncatable path could answer for a different sid — never trust it
-    if (await probeLivenessSock(p, timeoutMs)) return true;
+    if (await probeSocketSid(p, timeoutMs) === sessionId) return true; // connect + the socket proves it owns THIS sid
   }
   return false;
 }
@@ -146,7 +165,9 @@ export async function openLivenessSocket(home: string, sessionId: string, _timeo
   if (!sockPathFits(sockPath)) return null; // can't express this endpoint without truncation ⇒ relay-only
   try {
     const server = await new Promise<net.Server>((resolve, reject) => {
-      const srv = net.createServer((c) => c.destroy());
+      // On accept, EMIT the owning sid then close (coordinator r9 hint ①: lets a prober back-verify this socket owns the sid —
+      // the hashed filename alone is just a key). A write error never crashes the daemon.
+      const srv = net.createServer((c) => { try { c.end(sessionId); } catch { try { c.destroy(); } catch { /* noop */ } } });
       srv.once("error", reject);
       srv.listen(sockPath, () => { srv.removeListener("error", reject); srv.on("error", () => { /* never crash on a socket error */ }); srv.unref?.(); resolve(srv); });
     });
