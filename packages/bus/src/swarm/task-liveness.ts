@@ -61,14 +61,36 @@ export function resolveSession(ownerHandle: string, sessionIds: string[]): strin
 
 // --- real-fs binding (the TEMP v1; bus-identity replaces it). Thin; the testable decisions are above. -------------
 import { readFileSync, readdirSync, statSync } from "node:fs";
+import net from "node:net";
 import path from "node:path";
 
-/** F45-P1-2: the presence daemon refreshes its pid file's mtime this often (presence.ts), so a live same-machine instance
- *  keeps the file FRESH; a pid file older than PRESENCE_FRESH_MAX_SEC means the daemon is gone (and the pid may be recycled
- *  to an unrelated process) — the send path then keeps relay instead of a false local durable redirect. The window is a few
- *  missed heartbeats so a merely-busy daemon is never misjudged. */
+/** The presence daemon refreshes its pid-file mtime this often (presence.ts) — a liveness-classification aid for the
+ *  sentinel; it is NOT used for durable-redirect OWNERSHIP (that is the liveness socket, F45-R1). */
 export const PRESENCE_HEARTBEAT_SEC = 30;
-export const PRESENCE_FRESH_MAX_SEC = 95;
+/** connect timeout for the per-session liveness socket probe — short so a dead/unreachable sock never hangs a send. */
+export const PRESENCE_PROBE_MS = 200;
+
+/** The per-session liveness socket the presence daemon listens on (presence/<sid>.sock). The filename IS the sid (natural
+ *  binding). Pure. */
+export function presenceSockPath(home: string, sessionId: string): string {
+  return path.join(home, ".agenthop", "presence", `${sessionId}.sock`);
+}
+
+/** F45-R1 (coordinator ruling B): probe a per-session liveness socket. A live instance LISTENS; death drops the listener,
+ *  so a successful connect proves the CURRENT instance is alive — window-free (unlike any last-write/mtime freshness scheme).
+ *  A stale sock file from a dead daemon connects to nothing ⇒ ECONNREFUSED ⇒ false; a missing file ⇒ ENOENT ⇒ false; a hang
+ *  ⇒ timeout ⇒ false. Resolves true ONLY on an accepted connection. */
+export function probeLivenessSock(sockPath: string, timeoutMs: number = PRESENCE_PROBE_MS): Promise<boolean> {
+  return new Promise((resolve) => {
+    let done = false;
+    const sock = net.connect(sockPath);
+    const finish = (ok: boolean): void => { if (done) return; done = true; try { sock.destroy(); } catch { /* noop */ } resolve(ok); };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref?.();
+    sock.once("connect", () => { clearTimeout(timer); finish(true); });
+    sock.once("error", () => { clearTimeout(timer); finish(false); });
+  });
+}
 
 /** Native sessionIds that have a presence pid file under <home>/.agenthop/presence/<id>.pid (for resolveSession). */
 export function listSessions(home: string): string[] {

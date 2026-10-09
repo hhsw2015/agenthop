@@ -1,5 +1,10 @@
-import { describe, expect, test } from "vitest";
-import { fallbackForUnresolved, fallbackForMissedDelivery, resolveInboxTarget, relaySameMachineSid, pidFileFresh } from "../src/send-fallback.js";
+import { afterEach, describe, expect, test } from "vitest";
+import net from "node:net";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fallbackForUnresolved, fallbackForMissedDelivery, resolveInboxTarget } from "../src/send-fallback.js";
+import { probeLivenessSock } from "../src/swarm/task-liveness.js";
 import type { UnifiedPeer, ResolveError } from "../src/resolve.js";
 
 const peer = (p: Partial<UnifiedPeer>): UnifiedPeer => ({ id: "run-1", tool: "claude", cwd: "/x", title: "t", via: "local", ...p });
@@ -56,52 +61,33 @@ describe("F40 resolveInboxTarget — the single write-side addressing entry", ()
   });
 });
 
-describe("F45-P1-2 relaySameMachineSid — a live pid is not proof; the instance must OWN the sid", () => {
-  const relayPeer = (sid?: string) => peer({ via: "relay", stableId: sid, title: "claude:agenthop-x", pub: "pk" });
-
-  test("instance-ownership PROVEN ⇒ route durable to the peer's own sid", () => {
-    expect(relaySameMachineSid(relayPeer("sid-1"), (sid) => sid === "sid-1")).toBe("sid-1");
-  });
-  test("ownership UNPROVEN (stale file / recycled unrelated pid) ⇒ null (keep relay, no false durable)", () => {
-    expect(relaySameMachineSid(relayPeer("sid-1"), () => false)).toBeNull();
-  });
-  test("a LOCAL peer is not this helper's concern ⇒ null", () => {
-    expect(relaySameMachineSid(peer({ via: "local", stableId: "sid-1" }), () => true)).toBeNull();
-  });
-  test("relay peer with no stableId ⇒ null", () => {
-    expect(relaySameMachineSid(relayPeer(undefined), () => true)).toBeNull();
-  });
-
-  // pidFileFresh (F45-P1-2 round-6): the live daemon HEARTBEATS presence/<sid>.pid, so a CURRENT instance keeps its mtime
-  // fresh; a recycled pid behind a stale file does not. Freshness (an active association), not a start-time compare whose
-  // 1s granularity let a same-second recycle pass.
-  const MAX = 95;
-  test("a freshly heartbeated file ⇒ fresh (the live current instance)", () => {
-    expect(pidFileFresh(1000, 1000, MAX)).toBe(true);   // just touched
-    expect(pidFileFresh(1000, 1000 + 30, MAX)).toBe(true); // one heartbeat interval old
-    expect(pidFileFresh(1000, 1000 + MAX, MAX)).toBe(true); // edge of the window
-  });
-  test("a stale file (daemon gone; pid may be recycled) ⇒ NOT fresh ⇒ keep relay", () => {
-    expect(pidFileFresh(1000, 1000 + MAX + 1, MAX)).toBe(false); // just past the window
-    expect(pidFileFresh(1000, 5000, MAX)).toBe(false);          // long dead
-  });
-  test("round-5 hole closed: a same-second-later process cannot pass (freshness is file-based, not start-time)", () => {
-    // file last heartbeated at T=1000 but now is far later ⇒ stale regardless of any process's start time
-    expect(pidFileFresh(1000, 1000 + 3600, MAX)).toBe(false);
-  });
-  test("unknown (non-finite) mtime/now/max ⇒ not fresh (keep relay)", () => {
-    expect(pidFileFresh(NaN, 1000, MAX)).toBe(false);
-    expect(pidFileFresh(1000, NaN, MAX)).toBe(false);
-    expect(pidFileFresh(1000, 1000, NaN)).toBe(false);
-  });
-
+describe("F40 resolveInboxTarget — offline / ambiguous fallback (continued)", () => {
   test("UNRESOLVED no-match + an offline presence sid ⇒ durable to THAT sid (label = the address); no sid ⇒ none", () => {
     expect(resolveInboxTarget("who", err("none", "no match"), "off-sid")).toMatchObject({ kind: "durable", sid: "off-sid", label: "who" });
     expect(resolveInboxTarget("who", err("none", "no match"), null)).toEqual({ kind: "none", reason: "no match" });
   });
-
   test("AMBIGUOUS / empty ⇒ none, NEVER a durable fallback even if an offline sid exists (B1: no weak-match misroute)", () => {
     expect(resolveInboxTarget("x", err("ambiguous", "2 match"), "off-sid")).toEqual({ kind: "none", reason: "2 match" });
     expect(resolveInboxTarget("", err("empty", "empty"), "off-sid")).toEqual({ kind: "none", reason: "empty" });
+  });
+});
+
+describe("F45-R1 probeLivenessSock — a live LISTENER proves the current instance (window-free, ruling B)", () => {
+  const dirs: string[] = [];
+  const mk = () => { const d = mkdtempSync(path.join(tmpdir(), "f45-sock-")); dirs.push(d); return d; };
+  afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+
+  test("a live listener ⇒ true (connect accepted = current instance alive)", async () => {
+    const sock = path.join(mk(), "s.sock");
+    const srv = net.createServer((c) => c.destroy()); await new Promise<void>((r) => srv.listen(sock, r));
+    try { expect(await probeLivenessSock(sock, 500)).toBe(true); } finally { srv.close(); }
+  });
+  test("no file (dead/never-ran) ⇒ false (ENOENT, keep relay)", async () => {
+    expect(await probeLivenessSock(path.join(mk(), "absent.sock"), 300)).toBe(false);
+  });
+  test("a STALE sock file with no listener (daemon died) ⇒ false (keep relay)", async () => {
+    const sock = path.join(mk(), "stale.sock");
+    writeFileSync(sock, ""); // a leftover file that is NOT a live listener ⇒ connect fails ⇒ false
+    expect(await probeLivenessSock(sock, 300)).toBe(false);
   });
 });

@@ -10,8 +10,8 @@ import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
-import { resolveInboxTarget, relaySameMachineSid, pidFileFresh } from "./send-fallback.js";
-import { resolveSession, listSessions, fileIsAlive, makeFileLiveness, pidFileMtimeSec, PRESENCE_FRESH_MAX_SEC } from "./swarm/task-liveness.js";
+import { resolveInboxTarget } from "./send-fallback.js";
+import { resolveSession, listSessions, presenceSockPath, probeLivenessSock } from "./swarm/task-liveness.js";
 import { reportCheckIn } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
@@ -426,19 +426,17 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // never the routing name, which can drift on restart and strand mail in a box no live node drains (the F40 incident).
       const resolvedPeer = resolve(to);
       const sessionList = listSessions(home);
-      const liveness = makeFileLiveness(home);
-      // F45 ③ (P1-2 hardened): a relay-resolved peer is cross-BROKER, not necessarily cross-MACHINE. Route durable to it ONLY
-      // if its OWN full sid owns a presence pid that is (a) alive AND (b) part of a CURRENT instance — proven by the pid
-      // file being FRESH (the live daemon heartbeats presence/<sid>.pid; a pid recycled to an unrelated process does not,
-      // so a stale mtime ⇒ reject). An active local association, not a start-time compare (whose 1s granularity let a
-      // same-second recycle pass). Unproven ⇒ keep relay (never silently redirect a remote peer to a local inbox nobody drains).
-      const nowSec = Date.now() / 1000;
-      const isLocalInstance = (sid: string): boolean => {
-        if (fileIsAlive(sid, liveness) !== "alive") return false;      // (a) a live pid in presence/<sid>.pid
-        const mtime = pidFileMtimeSec(home, sid);
-        return mtime != null && pidFileFresh(mtime, nowSec, PRESENCE_FRESH_MAX_SEC); // (b) the daemon is actively heartbeating it (current, not a recycle)
-      };
-      const relayLocalSid = !("error" in resolvedPeer) ? relaySameMachineSid(resolvedPeer, isLocalInstance) : null;
+      // F45-R1 (coordinator ruling B): a relay-resolved peer is cross-BROKER, not necessarily cross-MACHINE. It is same-machine
+      // (⇒ route durable to its local inbox) IFF its per-session LIVENESS SOCKET answers: the presence daemon listens on
+      // presence/<sid>.sock, and the kernel drops that listener the instant the daemon dies, so a successful connect proves the
+      // CURRENT instance is alive — window-free (no last-write/mtime freshness, so no pid-recycle window). A stale sock from a
+      // dead daemon ⇒ ECONNREFUSED; a recycled pid never listens on it ⇒ connect fails ⇒ keep relay (no false durable). The
+      // sock filename IS the sid, so the probe is naturally bound to the exact identity.
+      let relayLocalSid: string | null = null;
+      if (!("error" in resolvedPeer) && resolvedPeer.via === "relay" && resolvedPeer.stableId
+          && (await probeLivenessSock(presenceSockPath(home, resolvedPeer.stableId)))) {
+        relayLocalSid = resolvedPeer.stableId;
+      }
       const target = resolveInboxTarget(to, resolvedPeer, resolveSession(to, sessionList), relayLocalSid);
       if (target.kind === "none") return { ok: false, error: target.reason };
       if (target.kind === "durable") {

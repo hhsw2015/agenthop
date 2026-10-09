@@ -47,35 +47,6 @@ export type InboxTarget =
   | { kind: "relay"; peer: UnifiedPeer }                                 // cross-machine ⇒ the caller does a live relay send
   | { kind: "none"; reason: string };                                    // undeliverable ⇒ { ok:false, error:reason }
 
-/**
- * F45-P1-2: decide whether a RELAY-resolved peer is actually SAME-MACHINE, returning the sid to deliver durably to, or
- * null. The proof is NOT a mere filename: the peer's OWN full stableId must own a presence pid (exact match, so a short-id
- * collision cannot misroute) AND that pid must be LIVE on this host (`liveness(sid) === "alive"`). A dead or corrupt
- * presence file — e.g. left behind by a session that once ran here, or an isolation fixture for a remote peer — is NOT
- * proof of a shared filesystem and must NOT redirect a remote peer to a local inbox (which no live local node would drain,
- * while the real remote peer gets nothing and the send falsely reports "durable"). Insufficient proof ⇒ null ⇒ the caller
- * keeps the relay path. `liveness` is injected (fileIsAlive) so this stays pure and unit-testable. Pure. */
-export function relaySameMachineSid(peer: UnifiedPeer, isLocalInstance: (sid: string) => boolean): string | null {
-  if (peer.via !== "relay" || !peer.stableId) return null;
-  // F45-P1-2: a live presence pid (signal-0) is NOT enough — a stale presence file may name a pid RECYCLED to an unrelated
-  // live process, which would silently redirect a remote peer to a local inbox nobody drains. `isLocalInstance` must PROVE
-  // the peer's current instance owns the local pid (see argvBoundToSid); unproven ⇒ null ⇒ the caller keeps the relay path.
-  return isLocalInstance(peer.stableId) ? peer.stableId : null;
-}
-
-/** F45-P1-2 (round-6): a live presence pid belongs to session `sid`'s CURRENT instance only if that instance is ACTIVELY
- *  maintaining `presence/<sid>.pid` — i.e. the file's mtime is FRESH (the daemon heartbeats it every PRESENCE_HEARTBEAT_SEC;
- *  see presence.ts). A pid RECYCLED to an unrelated process does NOT heartbeat the stale file, so its mtime goes cold ⇒
- *  rejected ⇒ keep relay. This binds to an ACTIVE local association rather than a start-time comparison, whose 1-second
- *  `ps` granularity let a same-second recycle (procStart within the tolerance of fileMtime) masquerade as the writer — the
- *  round-5 hole. `maxAgeSec` spans a few missed heartbeats so a merely-busy daemon is never misjudged. Non-finite inputs ⇒
- *  false (unknown ⇒ keep relay, never a false durable). Pure. */
-export function pidFileFresh(fileMtimeSec: number, nowSec: number, maxAgeSec: number): boolean {
-  if (!Number.isFinite(fileMtimeSec) || !Number.isFinite(nowSec) || !Number.isFinite(maxAgeSec)) return false;
-  const age = nowSec - fileMtimeSec;
-  return age >= 0 ? age <= maxAgeSec : -age <= maxAgeSec; // fresh within the window (a small future skew is tolerated symmetrically)
-}
-
 export function resolveInboxTarget(to: string, resolved: UnifiedPeer | ResolveError, offlineSid: string | null, relayLocalSid: string | null = null): InboxTarget {
   if ("error" in resolved) {
     // B1: an AMBIGUOUS (or empty) target must NEVER fall back — a weaker handle match could pick one of several live matches

@@ -37,7 +37,7 @@ user 重启协调者后，新壳拿到全新 native sid，未继承稳定 sid（
 
 **现场证据**（本单实时复现）：我的 `~/.agenthop/inbox/90b58f9c-…/` 顶层空，吸收批与 F45 两次派单都不在；派单仅经总线桥到达。唯一的隔离件是 10-05 的旧 reboot-rollcall（与本缺口无关）。
 
-**修复**（round-6 收口，F45-P1-2：时间容差把同秒复用的 PID 误授权为原写入者）：弃启动时刻比较，改**文件新鲜度=活动本地关联**。presence 守护进程每 `PRESENCE_HEARTBEAT_SEC`（30s）心跳刷新 `presence/<sid>.pid` 的 mtime（presence.ts keepAlive）；`pidFileFresh(fileMtime, now, maxAge=95s)` 判 mtime 是否新鲜。被回收到无关进程的 pid **不**心跳那陈旧文件 ⇒ mtime 变冷 ⇒ 拒 ⇒ 保留 relay。core `isLocalInstance`=signal-0 活 AND pidFileFresh。窗口=数个心跳容忍繁忙守护；只读文件 mtime 不读 argv/env/启动时刻、无 1s 粒度洞。**scope 注：本轮扩及 presence.ts 守护进程（+心跳一行、安全：仅 touch 自有 pid 文件、无其他读者依赖其 mtime 作启动时刻）——这是「等价本地关联」所需的守护侧配合。** 真跨机（无本地新鲜 presence）仍 relay。
+**修复**（round-7 定案，F45-R1 协调者裁 B：每会话活性 socket）：归属只认 socket，不认时间。presence 守护进程在 `presence/<sid>.sock` 监听（bind 前 unlink 旧文件；accept 即关，监听器存在本身即活证）；收端 `probeLivenessSock` connect 探测，200 ms 超时。连上=当前实例活（内核在守护死时即丢监听器，故无窗——不同于任何 last-write/mtime 新鲜度方案）；陈旧 sock（守护死残留）connect 得 ECONNREFUSED、缺文件得 ENOENT、挂起得 timeout，皆 false⇒保留 relay。sock 文件名即 sid=天然绑定。core 的 relayLocalSid=await probeLivenessSock（presenceSockPath（sid））。r6 的 mtime 心跳保留作哨兵 liveness 辅证（分类用），归属不认。**scope：send 路径 + presence 守护进程（+socket 监听/清理、保留心跳）。** 真跨机（无本地活 socket）仍 relay。
 
 这是修 bug（非 dormant 新机制）：改在本分支、未合并故 main 不受影响，经合并门后应**默认生效**。
 
