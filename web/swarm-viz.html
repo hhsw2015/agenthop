@@ -26,11 +26,14 @@
       linear-gradient(180deg, var(--bg1), var(--bg0));
     -webkit-font-smoothing: antialiased;
   }
-  #app { display: grid; grid-template-rows: 58px 1fr; height: 100%; }
+  /* Header row is at least 58px but GROWS to its real height when the top bar wraps (flex-wrap) on a narrow
+     viewport, so wrapped controls stay inside the header and push the content row down — never overlap it
+     (CDV-R2-P2-1). A single-line header stays exactly 58px; wide-screen layout is unchanged. */
+  #app { display: grid; grid-template-rows: minmax(58px, auto) 1fr; height: 100%; }
 
   /* ---------- top bar ---------- */
   header {
-    display: flex; align-items: center; gap: 18px; padding: 0 20px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 18px; padding: 0 20px;
     border-bottom: 1px solid var(--line);
     background: var(--panel); backdrop-filter: blur(16px) saturate(1.4);
     z-index: 5;
@@ -329,6 +332,19 @@
 
   /* ---------- kanban (board-viz second view: columns + swimlanes) ---------- */
   .kanban-view { display:none; position:absolute; inset:0; overflow:auto; background:var(--bg); z-index:4; padding:16px 18px 44px; }
+  /* ---------- morning digest (read-only daily report: date + sections) ---------- */
+  .digest-view { display:none; position:absolute; inset:0; overflow:auto; background:var(--bg); z-index:4; padding:16px 18px 44px; }
+  .digest-view .dhead { display:flex; align-items:baseline; gap:12px; margin-bottom:14px; flex-wrap:wrap; }
+  .digest-view .dhead h3 { margin:0; font-size:15px; }
+  .digest-view .dhead .ddate { color:var(--faint); font-size:12px; font-variant-numeric:tabular-nums; }
+  .dgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:12px; }
+  .dsection { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 13px; }
+  .dsection h4 { margin:0 0 9px; font-size:10px; font-weight:650; letter-spacing:.14em; text-transform:uppercase; color:var(--faint); display:flex; align-items:center; justify-content:space-between; }
+  .dsection h4 .n { color:var(--ink-dim); letter-spacing:0; }
+  .dsection ul { margin:0; padding:0; list-style:none; display:flex; flex-direction:column; gap:6px; }
+  .dsection li { font-size:12px; color:var(--ink); line-height:1.4; }
+  .dsection .dempty { color:var(--faint); font-size:11px; font-style:italic; }
+  .digest-empty { color:var(--ink-dim); text-align:center; padding:48px 16px; font-size:13px; line-height:1.6; }
   .kanban-view .khead { display:flex; align-items:baseline; gap:14px; margin-bottom:12px; }
   .kanban-view .khead h3 { margin:0; font-size:15px; }
   .kcols { display:flex; gap:14px; align-items:flex-start; }
@@ -474,6 +490,7 @@
     <div class="filters" id="filters"></div>
     <input class="search" id="search" placeholder="Search sessions, cwd, machine…" />
     <button class="viewbtn on" id="canvasbtn" title="Canvas: the system-derived task graph (seats, dispatch/handoff edges, floors, attention) — read-only">canvas</button>
+    <button class="viewbtn" id="digestbtn" title="Morning digest: yesterday's sign-offs / merges / in-review / alerts / today's pending decisions — read-only">digest ▸</button>
     <button class="viewbtn" id="kanbanbtn" title="Kanban: board columns (todo/in-progress/done) + member swimlanes">kanban ▸</button>
     <button class="viewbtn" id="timelinebtn" title="Timeline: worklog (per-day project lanes, where the time went, stall blanks)">timeline ▸</button>
     <select class="viewbtn" id="legacy" title="Legacy views (one transition version — folding into canvas)">
@@ -497,6 +514,7 @@
 <div class="stallbar" id="stallbar"></div>
     <div class="kanban-view" id="kanban"></div>
     <div class="timeline-view" id="timeline"></div>
+    <div class="digest-view" id="digest"></div>
     <div class="jobsmembers" id="jobsmembers"></div>
     <div class="floorstrip" id="floorstrip"></div>
     <div class="ticker" id="ticker">
@@ -819,6 +837,30 @@
     if (!didFit || lastView !== "jobs") { didFit = true; lastView = "jobs"; fit(); }
   }
 
+  // ---------------------------------------------------------------- morning digest (read-only daily report)
+  /** Render the morning digest: a date header + one card per section (title + items), from state.digest (the
+   *  exporter reads the generator's morning-digest/v1 file). Null/absent ⇒ a placeholder — the generator
+   *  (digest-wiring) may not have written one yet (graceful degrade, like the gauge precedent). Defensive:
+   *  tolerates missing sections/items so a partial digest still renders. */
+  function renderDigest() {
+    const box = $("digest");
+    const d = state?.digest;
+    if (!d) {
+      box.innerHTML = `<div class="digest-empty">No morning digest yet.<br>The generator (digest-wiring) has not written <code>~/.agenthop/console/morning-digest/digest.json</code> for today — this view lights up when it does.</div>`;
+      return;
+    }
+    const sections = Array.isArray(d.sections) ? d.sections : [];
+    const cards = sections.map((s) => {
+      const lines = Array.isArray(s.lines) ? s.lines : []; // generator shape: sections[].lines: string[]
+      const body = lines.length
+        ? `<ul>${lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>`
+        : `<div class="dempty">— none —</div>`;
+      return `<div class="dsection"><h4>${esc(s.title)}<span class="n">${lines.length}</span></h4>${body}</div>`;
+    }).join("");
+    box.innerHTML = `<div class="dhead"><h3>Morning digest</h3><span class="ddate">${esc(d.date)}</span></div>`
+      + (sections.length ? `<div class="dgrid">${cards}</div>` : `<div class="digest-empty">Digest for ${esc(d.date)} has no sections.</div>`);
+  }
+
   // ---------------------------------------------------------------- canvas (unified system-derived graph)
   /** Floor pills: the repo's git worktrees (branch + short HEAD), coloured by the loudest status of any
    *  seat whose cwd sits under that worktree. Read-only, from snap.worktrees (exporter git worktree list). */
@@ -966,10 +1008,15 @@
     // jobs = by dependency. It renders only when the brain projection is present.
     // Kanban is a distinct overlay view (board columns + member swimlanes), not the SVG stage. The stall
     // banner still shows (renderStall never hides). Hidden unless selected, so it never covers the stage.
+    // Set EVERY overlay's visibility BEFORE any view branch returns (CDV-P2-2): the kanban/timeline branches
+    // return early, so a per-branch toggle placed after them would leave a prior full-width overlay (digest,
+    // z-index:4) on top of the target view. Hoisting all three keeps exactly one overlay shown.
     $("kanban").style.display = viewMode === "kanban" ? "block" : "none";
-    if (viewMode === "kanban") { renderKanban(); renderHeader(); renderStall(); return; }
     $("timeline").style.display = viewMode === "timeline" ? "block" : "none";
+    $("digest").style.display = viewMode === "digest" ? "block" : "none";
+    if (viewMode === "kanban") { renderKanban(); renderHeader(); renderStall(); return; }
     if (viewMode === "timeline") { renderTimeline(); renderHeader(); renderStall(); return; }
+    if (viewMode === "digest") { renderDigest(); renderHeader(); renderStall(); return; }
     if (viewMode === "canvas") { document.body.classList.remove("jobs-view"); renderCanvas(); renderDrawer(); renderHeader(); renderStall(); return; }
     if (viewMode === "jobs" && snap.projection && snap.projection.present) {
       document.body.classList.add("jobs-view");
@@ -2087,12 +2134,14 @@
   function syncViewButtons() {
     const set = (id, on, label) => { const b = $(id); if (!b) return; b.textContent = label; b.classList.toggle("on", on); };
     set("canvasbtn", viewMode === "canvas", "canvas");
+    set("digestbtn", viewMode === "digest", "digest ▸");
     set("kanbanbtn", viewMode === "kanban", "kanban ▸");
     set("timelinebtn", viewMode === "timeline", "timeline ▸");
     const lg = $("legacy"); if (lg) lg.value = (viewMode === "topology" || viewMode === "jobs") ? viewMode : "";
   }
   const switchView = (next) => { viewMode = next; didFit = false; sel = null; jobSel = null; syncViewButtons(); render(); };
   $("canvasbtn").onclick = () => switchView("canvas");
+  $("digestbtn").onclick = () => switchView(viewMode === "digest" ? "canvas" : "digest");
   $("kanbanbtn").onclick = () => switchView(viewMode === "kanban" ? "canvas" : "kanban");
   $("timelinebtn").onclick = () => switchView(viewMode === "timeline" ? "canvas" : "timeline");
   $("legacy").onchange = (e) => switchView(e.target.value || "canvas");
