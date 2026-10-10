@@ -87,12 +87,14 @@ function statProbe(p: string): { kind: "absent" } | { kind: "ok"; st: Stats } | 
 }
 
 /** OC-4: a report's commit citation must be CONTEXT-ANCHORED — a label (固定 / sha / sha256 / commit / @) immediately
- *  before a 7-64 hex token that STANDS ALONE. A bare unlabeled hex run (a date "20261011", a session UUID) is NOT a
- *  commit reference; neither is a labeled UUID — the trailing `(?![0-9a-f-])` rejects a hex run that continues with a
- *  hyphen+hex (a UUID segment: "@11111111-2222-…") or more hex, so only a whole, self-terminating sha passes (OC-4 r3).
- *  The repo's real citation forms ("固定 SHA:ddb8cda", "@7b8e87c", "报告SHA256: <64hex>", "fixed SHA <40hex>") all carry
- *  such a label AND terminate cleanly; a date/UUID does not. */
-const COMMIT_REF = /(?:固定\s*)?(?:\bsha(?:[-\s]?256)?\b|\bcommit\b|@)[:\s]*\b[0-9a-f]{7,64}(?![0-9a-f-])/i;
+ *  before a 7-64 hex token that is a WHOLE WORD and does not continue as a hyphenated suffix. The hex token carries two
+ *  end constraints: a trailing `\b` (OC-4 r4 — a word boundary, so a longer identifier like "deadbeefg" / "deadbeef_owner"
+ *  / "<64a>z" whose hex prefix is not the whole token is rejected) AND a trailing `(?!-)` (OC-4 r3 — so a UUID segment
+ *  "@11111111-2222-…" whose first run IS a whole word before the hyphen is rejected too). Both are needed: `\b` alone
+ *  admitted the UUID (hyphen is a boundary), `(?!-)` alone admitted the letter/underscore suffixes. A bare unlabeled hex
+ *  run (a date "20261011", a session UUID) also fails for lack of a label. The repo's real forms ("固定 SHA:ddb8cda",
+ *  "@7b8e87c", "报告SHA256: <64hex>", "fixed SHA <40hex>") carry a label AND terminate cleanly. */
+const COMMIT_REF = /(?:固定\s*)?(?:\bsha(?:[-\s]?256)?\b|\bcommit\b|@)[:\s]*\b[0-9a-f]{7,64}\b(?!-)/i;
 function reportCitesCommit(txt: string): boolean { return COMMIT_REF.test(txt); }
 
 /** Apply the same path sanitization writeInbox uses, so the inbox probe reads the SAME directory a real publish wrote. */

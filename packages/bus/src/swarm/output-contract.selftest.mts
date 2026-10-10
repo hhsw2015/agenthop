@@ -85,6 +85,13 @@ t('FC-6: verify is deterministic, no clock', verifyExpectedOutput({ kind: "file"
     t('OC-4 r3 probe report: a labeled "SHA: <UUID>" ⇒ unmet, never met', verifyExpectedOutput({ kind: "report", ref: repShaUuid }, probeExpectedOutput({ kind: "report", ref: repShaUuid })) === "unmet");
     const repShort = join(home, "short.md"); writeFileSync(repShort, "SHA: abc12");
     t('OC-4 probe report: a labeled too-short (5) hex ⇒ unmet', verifyExpectedOutput({ kind: "report", ref: repShort }, probeExpectedOutput({ kind: "report", ref: repShort })) === "unmet");
+    // OC-4 r4: the hex token must be a WHOLE WORD — a hex PREFIX of a longer identifier (non-hex letter / underscore / over-max run) must not pass
+    const repLetter = join(home, "letter.md"); writeFileSync(repLetter, "SHA: deadbeefg");
+    t('OC-4 r4 probe report: hex prefix + non-hex letter ("deadbeefg") ⇒ unmet, never met', verifyExpectedOutput({ kind: "report", ref: repLetter }, probeExpectedOutput({ kind: "report", ref: repLetter })) === "unmet");
+    const repUnder = join(home, "under.md"); writeFileSync(repUnder, "review owner @deadbeef_owner; report pending");
+    t('OC-4 r4 probe report: hex prefix + underscore ("@deadbeef_owner") ⇒ unmet, never met', verifyExpectedOutput({ kind: "report", ref: repUnder }, probeExpectedOutput({ kind: "report", ref: repUnder })) === "unmet");
+    const repOver = join(home, "over.md"); writeFileSync(repOver, "SHA256: " + "a".repeat(64) + "z");
+    t('OC-4 r4 probe report: a 64-hex run continuing (max-len then "z") ⇒ unmet, never met', verifyExpectedOutput({ kind: "report", ref: repOver }, probeExpectedOutput({ kind: "report", ref: repOver })) === "unmet");
 
     // --- inbox-delivery: processed/ archive still counts, + OC-5 (the REAL writeInbox→claim→ack lifecycle) ---
     const sid = "sid-xyz"; const pdir = join(home, ".agenthop", "inbox", sid, "processed"); mkdirSync(pdir, { recursive: true });
