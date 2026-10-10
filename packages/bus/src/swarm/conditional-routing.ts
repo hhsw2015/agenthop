@@ -62,21 +62,41 @@ function validateCondition(w: unknown, where: string): Res<EdgeCondition> {
 }
 
 /**
- * Validate an untrusted conditional-routing pipeline. Reuses `validateForcePipeline` for the {from,to} structure (schema /
- * self-ref / duplicate / dangling / cycle), then attaches the optional `when` per edge by INDEX. A when-less edge produces
- * exactly `{from,to}` (byte-identical to force-pipeline, FC-7). Any illegal `when` ⇒ whole-reject.
+ * Validate an untrusted conditional-routing pipeline. Accepts either `conditional-routing/v1` (the declared schema) or a legacy
+ * `force-pipeline/v1` (FC-7), and ALWAYS outputs `conditional-routing/v1` — so a legal input validates and the output
+ * round-trips through this same validator (CR-P2-1). The raw input is captured EXACTLY ONCE into a plain snapshot (stages array
+ * and each stage's own-data from/to/when); both the structural check and the `when` come from that single snapshot — the raw is
+ * never re-read, so a mutating/getter slot cannot detach a condition from its edge (CR-P2-2). The structural check (self-ref /
+ * duplicate / dangling / cycle / from-to) is delegated to the signed `validateForcePipeline` by handing it a CONTROLLED
+ * `force-pipeline/v1` projection built from the snapshot (plain objects, no accessors). A when-less edge produces exactly
+ * `{from,to}` (stage byte-identical to force-pipeline, FC-7). Any illegal `when`, an uncapturable stages array, or a bad stage
+ * ⇒ whole-reject.
  */
 export function validateConditionalPipeline(input: unknown, knownNodes?: readonly string[]): Res<ConditionalPipeline> {
-  const base = validateForcePipeline(input, knownNodes);
-  if (!base.ok) return base;
-  // base guaranteed input is an object with an array `stages`; re-read defensively (own-data) and walk by index.
-  const stagesRaw = isObj(input) ? ownVal(input, "stages") : undefined;
+  if (!isObj(input)) return { ok: false, reason: "conditional-routing must be an object" };
+  const schema = ownVal(input, "schema");
+  if (schema !== "conditional-routing/v1" && schema !== "force-pipeline/v1") {
+    return { ok: false, reason: "schema must be \"conditional-routing/v1\" or \"force-pipeline/v1\"" };
+  }
+  const stagesRaw = ownVal(input, "stages");
   if (!Array.isArray(stagesRaw)) return { ok: false, reason: "stages must be an array" };
+  // SINGLE capture (CR-P2-2): snapshot each stage's own-data {from,to,when} once. Every slot is read exactly once here; nothing
+  // downstream re-reads the raw input.
+  const snap: { from: unknown; to: unknown; when: unknown }[] = [];
+  for (let i = 0; i < stagesRaw.length; i += 1) {           // index walk (never the input's iterator)
+    const raw = stagesRaw[i];                               // one read of slot i
+    if (!isObj(raw)) return { ok: false, reason: `stage[${i}] must be an object` };
+    snap.push({ from: ownVal(raw, "from"), to: ownVal(raw, "to"), when: ownVal(raw, "when") });
+  }
+  // CR-P2-1: hand a CONTROLLED force-pipeline/v1 projection (plain objects from the snapshot) to the signed validator — never
+  // the raw input (whose schema may be conditional-routing/v1). Order is preserved, so base.value.stages[i] ↔ snap[i].
+  const projection = { schema: "force-pipeline/v1" as const, stages: snap.map((s) => ({ from: s.from, to: s.to })) };
+  const base = validateForcePipeline(projection, knownNodes);
+  if (!base.ok) return base;
   const stages: ConditionalEdge[] = [];
   for (let i = 0; i < base.value.stages.length; i += 1) {
-    const vs = base.value.stages[i]!;                       // validated {from,to}
-    const raw = stagesRaw[i];                               // same index in the raw input
-    const whenRaw = isObj(raw) ? ownVal(raw, "when") : undefined;
+    const vs = base.value.stages[i]!;                       // validated {from,to} (from the snapshot projection)
+    const whenRaw = snap[i]!.when;                          // the SAME-capture when (not re-read from the raw)
     if (whenRaw === undefined) { stages.push({ from: vs.from, to: vs.to }); continue; }
     const vc = validateCondition(whenRaw, `stage[${i}]`);
     if (!vc.ok) return { ok: false, reason: vc.reason };
@@ -95,21 +115,31 @@ export function evalEdgeCondition(edge: ConditionalEdge, upstream: UpstreamView 
   const w = edge.when;
   if (w === undefined) return "take";                       // unconditional edge (back-compat)
   if (upstream === null || upstream === undefined) return "unknown"; // whole result unreadable
-  switch (w.kind) {
-    case "status-ok":
-      if (upstream.status === undefined) return "unknown";
-      return upstream.status === "ok" ? "take" : "skip";
-    case "result-exists":
-      if (upstream.resultRef === undefined) return "unknown"; // don't know whether a result exists
-      return isNonEmptyStr(upstream.resultRef) ? "take" : "skip"; // null / "" ⇒ explicitly no result ⇒ skip
-    case "field-eq": {
-      const fields = upstream.fields;
-      if (!isObj(fields) || !Object.prototype.hasOwnProperty.call(fields, w.field)) return "unknown"; // enum not readable ⇒ retry
-      const v = ownVal(fields, w.field);                    // own-data read (proto-safe)
-      if (typeof v !== "string") return "unknown";          // malformed enum ⇒ cannot compare ⇒ retry
-      return v === w.value ? "take" : "skip";
+  // CR-P2-3: read EVERY upstream datum as OWN DATA via ownVal (a getter has no descriptor `value` ⇒ returns undefined ⇒ treated
+  // as not-readable; the untrusted getter is never invoked), and wrap the whole decision so a hostile Proxy trap on
+  // getOwnPropertyDescriptor cannot escape the three states. Any unreadable datum ⇒ unknown (preserve retry), never skip, never throw.
+  try {
+    switch (w.kind) {
+      case "status-ok": {
+        const status = ownVal(upstream, "status");
+        if (status === undefined) return "unknown";         // absent / getter / explicit-undefined ⇒ not readable
+        return status === "ok" ? "take" : "skip";
+      }
+      case "result-exists": {
+        const ref = ownVal(upstream, "resultRef");
+        if (ref === undefined) return "unknown";            // absent / getter ⇒ don't know whether a result exists
+        return isNonEmptyStr(ref) ? "take" : "skip";        // own-data null / "" ⇒ explicitly no result ⇒ skip
+      }
+      case "field-eq": {
+        const fields = ownVal(upstream, "fields");
+        if (!isObj(fields)) return "unknown";               // fields absent / getter / not an object ⇒ enum not readable
+        const v = ownVal(fields, w.field);                  // own-data leaf read (proto-safe; getter ⇒ undefined)
+        if (typeof v !== "string") return "unknown";        // field absent / getter / malformed ⇒ cannot compare ⇒ retry
+        return v === w.value ? "take" : "skip";
+      }
     }
-  }
+  } catch { return "unknown"; }                             // a Proxy descriptor trap threw ⇒ unreadable ⇒ unknown
+  return "unknown";                                         // unreachable (exhaustive switch); defensive
 }
 
 // ── ② dynamic fan-out (Send semantics) ─────────────────────────────────────────────────────────────────────────────────

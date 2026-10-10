@@ -25,9 +25,10 @@ EdgeDecision = "take" | "skip" | "unknown"
 `UpstreamView` 是 evalEdgeCondition 读的**纯投影**:dispatcher IO 层把真实 `AcceptedResult`/`TaskResult`(task-result.ts:outcome/outputs/…)映射成它,纯核不碰 task-state 机器。禁自由表达式:`when` 只认上述三种 `kind`,其余整体拒绝。
 
 **校验** `validateConditionalPipeline(input, knownNodes?) → Res<ConditionalPipeline>`:
-- 先把原始 stages 投影到 {from,to} 交给已签 `validateForcePipeline`(复用:schema/非数组/自引用/重复边/悬空/环=Kahn,trust-boundary 一致)。
-- 通过后按**索引对齐**逐边取可选 `when`(ownVal 自有数据读,一次捕获),经 `validateCondition` 整树校验(`kind` 枚举;`field-eq` 的 field 非空串、value 为串);无 `when` 的边输出 `{from,to}`(与 force-pipeline 字节一致,FC-7)。
-- 任一 `when` 非法 ⇒ 整体拒绝(whole-reject)。
+- **入 schema 二选一**:`conditional-routing/v1`(本件声明)或 `force-pipeline/v1`(旧,FC-7);**出恒 `conditional-routing/v1`**,故合法输入既过校验、**输出又能再过同一校验器**(往返,CR-P2-1)。
+- **单次捕获**(CR-P2-2):把原始 `stages` 数组及每边的自有数据 `{from,to,when}` **一次性**快照进 plain 数组(每槽只读一次);结构校验与 `when` 都取自这同一快照,**绝不复读原输入**——可变/getter 槽无法让条件脱离其边。`stages` 不是数组(含 getter 返回非数组)⇒ 整体拒绝(无法可靠捕获)。
+- 把由快照构建的**受控 `force-pipeline/v1` 投影**(plain 对象,无访问器)交给已签 `validateForcePipeline`(复用:自引用/重复边/悬空/环=Kahn/from-to 类型,trust-boundary 一致)——**绝不把原输入交给它**(其 schema 可能是 conditional-routing/v1)。投影保序 ⇒ base.stages[i] ↔ snap[i]。
+- 按**索引对齐**给每条已校验边挂同一快照的 `when`,经 `validateCondition` 整树校验(`kind` 枚举;`field-eq` 的 field 非空串、value 为串);无 `when` 的边输出 `{from,to}`(与 force-pipeline **边**字节一致,FC-7)。任一 `when` 非法 ⇒ 整体拒绝。
 
 **裁决** `evalEdgeCondition(edge, upstream) → EdgeDecision`(纯,无时钟/IO/随机;FC-6 确定性表):
 | 情形 | 结果 | 理由 |
@@ -42,6 +43,7 @@ EdgeDecision = "take" | "skip" | "unknown"
 | field-eq:值===value | take / 否则 **skip** | 可读且判定 |
 
 三态语义(**关键**):`take`=走边(强制派发后继);`skip`=已判定不走(该分支永不取,可剪枝);`unknown`=**此刻无法判定**(上游/字段不可读)⇒ 不走、不报错、保留重试,**绝不当 skip 静默丢后继**(宁可见挂起,不可静默丢—CLAUDE.md 不退条)。`skip` 与 `unknown` 必须可区分:dispatcher 对 skip 剪边,对 unknown 留挂起下轮再评(受既有重试预算约束)。
+`evalEdgeCondition` 读 upstream 的 status/resultRef/fields **全走自有数据捕获**(ownVal,getter 无 descriptor.value ⇒ 视为不可读,**绝不调用不可信 getter**),整体 try/catch 兜底——任一读取/描述符陷阱抛错 ⇒ 统一 `unknown`,**绝不以异常或 skip 代替未知**(CR-P2-3)。顶层与叶层处理一致。
 
 ## ② 动态扇出(dynamic fan-out,Send 语义)
 

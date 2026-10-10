@@ -73,6 +73,35 @@ const edge = (over: Partial<ConditionalEdge> = {}): ConditionalEdge => ({ from: 
   ok(idSame, "FC-6: 1000x fanoutSubtaskId same (templateId,index) ⇒ identical id");
 }
 
+// ── round-1 fixes: CR-P2-1 schema round-trip / CR-P2-2 single capture / CR-P2-3 unreadable ⇒ unknown ──
+{
+  const input = { schema: "conditional-routing/v1", stages: [{ from: "a", to: "b", when: { kind: "status-ok" } }] };
+  const r1 = validateConditionalPipeline(input);
+  ok(r1.ok, "CR-P2-1: a conditional-routing/v1 input validates");
+  if (r1.ok) {
+    const r2 = validateConditionalPipeline(r1.value);
+    ok(r2.ok && JSON.stringify(r2.value) === JSON.stringify(r1.value), "CR-P2-1: the output round-trips through the same validator");
+  }
+  const legacy = validateConditionalPipeline({ schema: "force-pipeline/v1", stages: [{ from: "a", to: "b" }] });
+  ok(legacy.ok && validateConditionalPipeline(legacy.value).ok, "CR-P2-1: legacy force-pipeline/v1 accepted (FC-7) and its output round-trips");
+  // CR-P2-2: a mutating stage slot is read once; its when is not lost.
+  const withWhen = { from: "a", to: "b", when: { kind: "status-ok" } }, withoutWhen = { from: "a", to: "b" };
+  let reads = 0;
+  const stages: unknown[] = [withWhen];
+  Object.defineProperty(stages, "0", { enumerable: true, configurable: true, get() { reads += 1; return reads === 1 ? withWhen : withoutWhen; } });
+  const rc = validateConditionalPipeline({ schema: "conditional-routing/v1", stages });
+  ok(rc.ok && JSON.stringify((rc.value.stages[0] as { when?: unknown }).when) === JSON.stringify({ kind: "status-ok" }) && reads === 1, "CR-P2-2: single capture — slot read once, condition survives");
+  const getterStages: Record<string, unknown> = { schema: "conditional-routing/v1" };
+  Object.defineProperty(getterStages, "stages", { enumerable: true, get() { return [{ from: "a", to: "b" }]; } });
+  ok(!validateConditionalPipeline(getterStages).ok, "CR-P2-2: an uncapturable `stages` getter is rejected whole");
+  // CR-P2-3: throwing getters / Proxy trap ⇒ unknown (never throw, never skip).
+  const boom = {} as UpstreamView;
+  for (const k of ["status", "resultRef", "fields"]) Object.defineProperty(boom, k, { enumerable: true, get() { throw new Error("boom"); } });
+  ok(evalEdgeCondition(edge({ when: { kind: "status-ok" } }), boom) === "unknown" && evalEdgeCondition(edge({ when: { kind: "result-exists" } }), boom) === "unknown" && evalEdgeCondition(edge({ when: { kind: "field-eq", field: "c", value: "x" } }), boom) === "unknown", "CR-P2-3: throwing upstream getters ⇒ unknown");
+  const proxied = new Proxy({}, { getOwnPropertyDescriptor() { throw new Error("trap"); } }) as UpstreamView;
+  ok(evalEdgeCondition(edge({ when: { kind: "status-ok" } }), proxied) === "unknown", "CR-P2-3: a Proxy descriptor trap that throws ⇒ unknown (never escapes the three states)");
+}
+
 // ── flags ──
 {
   ok(fanoutMax({}) === DEFAULT_FANOUT_MAX, "fanoutMax default 8");

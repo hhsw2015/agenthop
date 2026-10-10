@@ -119,6 +119,50 @@ describe("conditional-routing — planFanout (positional, capped, visible overfl
   });
 });
 
+describe("conditional-routing — round-1 fixes (schema round-trip / single-capture / unreadable-upstream)", () => {
+  test("CR-P2-1: a conditional-routing/v1 input validates and the output round-trips; legacy force-pipeline/v1 still accepted (FC-7)", () => {
+    const input = { schema: "conditional-routing/v1", stages: [{ from: "a", to: "b", when: { kind: "status-ok" } }] };
+    const r1 = validateConditionalPipeline(input);
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+    const r2 = validateConditionalPipeline(r1.value); // the output is conditional-routing/v1 — must re-validate
+    expect(r2.ok).toBe(true);
+    expect(r2.ok && r2.value).toEqual(r1.value);
+    const legacy = validateConditionalPipeline({ schema: "force-pipeline/v1", stages: [{ from: "a", to: "b" }] });
+    expect(legacy.ok).toBe(true);
+    expect(legacy.ok && validateConditionalPipeline(legacy.value).ok).toBe(true);
+    expect(validateConditionalPipeline({ schema: "nope/v1", stages: [] }).ok).toBe(false); // an unknown schema still rejects
+  });
+  test("CR-P2-2: structure and condition come from ONE capture — a mutating stage slot is read once and its `when` is not lost", () => {
+    const withWhen = { from: "a", to: "b", when: { kind: "status-ok" } };
+    const withoutWhen = { from: "a", to: "b" };
+    let reads = 0;
+    const stages: unknown[] = [withWhen]; // length 1
+    Object.defineProperty(stages, "0", { enumerable: true, configurable: true, get() { reads += 1; return reads === 1 ? withWhen : withoutWhen; } });
+    const r = validateConditionalPipeline({ schema: "conditional-routing/v1", stages });
+    expect(r.ok).toBe(true);
+    expect(r.ok && r.value.stages[0]!.when).toEqual({ kind: "status-ok" }); // the first-captured condition survives
+    expect(reads).toBe(1); // the slot is read EXACTLY once (no second read to detach the condition)
+  });
+  test("CR-P2-2: an uncapturable `stages` (a getter) is rejected whole (cannot reliably capture)", () => {
+    const input: Record<string, unknown> = { schema: "conditional-routing/v1" };
+    Object.defineProperty(input, "stages", { enumerable: true, get() { return [{ from: "a", to: "b", when: { kind: "status-ok" } }]; } });
+    expect(validateConditionalPipeline(input).ok).toBe(false);
+  });
+  test("CR-P2-3: an unreadable upstream (throwing getter / Proxy descriptor trap) ⇒ unknown, never throws, never skip", () => {
+    const getterBoom = {} as UpstreamView;
+    for (const k of ["status", "resultRef", "fields"]) Object.defineProperty(getterBoom, k, { enumerable: true, get() { throw new Error("boom"); } });
+    expect(evalEdgeCondition(edge({ when: { kind: "status-ok" } }), getterBoom)).toBe("unknown");
+    expect(evalEdgeCondition(edge({ when: { kind: "result-exists" } }), getterBoom)).toBe("unknown");
+    expect(evalEdgeCondition(edge({ when: { kind: "field-eq", field: "c", value: "x" } }), getterBoom)).toBe("unknown");
+    const f = {}; Object.defineProperty(f, "c", { enumerable: true, get() { throw new Error("boom"); } });
+    expect(evalEdgeCondition(edge({ when: { kind: "field-eq", field: "c", value: "x" } }), { fields: f } as UpstreamView)).toBe("unknown");
+    const proxied = new Proxy({}, { getOwnPropertyDescriptor() { throw new Error("trap"); } }) as UpstreamView;
+    expect(evalEdgeCondition(edge({ when: { kind: "status-ok" } }), proxied)).toBe("unknown");
+    expect(evalEdgeCondition(edge({ when: { kind: "field-eq", field: "c", value: "x" } }), proxied)).toBe("unknown");
+  });
+});
+
 describe("conditional-routing — flags", () => {
   test("fanoutMax: default 8; integer in [1,1000] honored; bad value falls back", () => {
     expect(fanoutMax({})).toBe(DEFAULT_FANOUT_MAX);
