@@ -153,7 +153,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   let checkInPending = false;
   const retryCheckIn = (): void => {
     if (!checkInPending) return;
-    if (reportCheckIn(home, self, process.env.SWARM_COORDINATOR) !== "retry") checkInPending = false; // sent or permanently-skipped ⇒ obligation discharged
+    if (reportCheckIn(home, self, process.env.SWARM_COORDINATOR, process.env.SWARM_CHECKIN_NOTE) !== "retry") checkInPending = false; // sent or permanently-skipped ⇒ obligation discharged
   };
   // Work-status is per SESSION IDENTITY, not per MCP-server process: one Codex daemon-backed server can
   // adopt several thread identities over its life (see learnStableId), and each must keep its own status
@@ -356,7 +356,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     // the durable identity is learned (bootstrap / thread-switch / correction), re-report to the coordinator with the STABLE sid
     // so the session is durably addressable — the earlier provisional per-run line is superseded (idempotent at the coordinator
     // by sid). Gated on SWARM_COORDINATOR, never to self, fail-soft (reportCheckIn). Retain a retry obligation on a transient miss (B5).
-    checkInPending = reportCheckIn(home, self, process.env.SWARM_COORDINATOR) === "retry";
+    checkInPending = reportCheckIn(home, self, process.env.SWARM_COORDINATOR, process.env.SWARM_CHECKIN_NOTE) === "retry";
     refreshLegacyKeys(true); // F40: self's native just changed ⇒ force a recompute (the keys depend on self.stableId, not only the log)
     // B7-1: the published identity just (re)assigned — notify the owner (presence) so a LISTENER bound to the old id (run-id)
     // re-binds to the new stable id. Fired only on an actual reassignment (the same-id/guess-only early returns above skip it).
@@ -479,7 +479,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // the session without relying on a prompt the LLM must remember to send. Gated on SWARM_COORDINATOR, never to self,
   // fail-soft. A Claude node has its stableId at startup; a Codex node that learns its thread id later gets its durable
   // re-announce through the reconnect/re-register path (Stage C), not here.
-  if (reportCheckIn(home, self, process.env.SWARM_COORDINATOR) === "retry") checkInPending = true; // B5: coordinator not reachable yet / write failed ⇒ retry on the timer + reconnect
+  if (reportCheckIn(home, self, process.env.SWARM_COORDINATOR, process.env.SWARM_CHECKIN_NOTE) === "retry") checkInPending = true; // B5: coordinator not reachable yet / write failed ⇒ retry on the timer + reconnect
 
   return {
     self,

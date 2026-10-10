@@ -265,3 +265,42 @@ export function shouldEmitWatchNotice(evKind: string, watchProgressEnv: string |
   if (evKind === "board") return true;
   return /^(1|true|yes|on)$/i.test(watchProgressEnv ?? "");
 }
+
+/**
+ * D-multica ① — failure taxonomy (taskfailure.classify). Bucket a stuck/blocked screen (or an explain string) into a coarse
+ * failure class, so the sentinel ALERT can name the likely kind. A HINT ONLY: the caller STILL builds the S19/approval and the
+ * DISPOSITION is unchanged — this never auto-retries, auto-clears, or cancels an approval. Two safety rails from Multica:
+ *  (a) number-boundary guard — HTTP codes are matched with `\b` so `401` never matches inside `2401`/`4019`;
+ *  (b) non-retryable is tested FIRST, so an auth/payment/config failure (401/402/403) can NEVER fall through into "retryable"
+ *      (the "401 never on the retry whitelist" rule). When nothing matches with confidence the result is "unknown" — the
+ *      SAFE direction ("宁可不匹配"): an unknown class carries NO hint and triggers no disposition. Pure (no IO / clock). */
+export type FailureClass = "retryable" | "non-retryable" | "context-exhausted" | "environment" | "unknown";
+
+export function classifyFailure(raw: unknown): FailureClass {
+  if (typeof raw !== "string" || raw.length === 0) return "unknown";
+  const t = raw.toLowerCase();
+  const any = (needles: readonly string[]): boolean => needles.some((n) => t.includes(n));
+  // (1) NON-RETRYABLE FIRST — auth / payment / config. Boundary-anchored 401/402/403 (the number guard) OR an auth phrase. This
+  //     ordering is the "401 never retries" rail: a non-retryable signal dominates even if a 5xx also appears on the screen.
+  if (/\b(401|402|403)\b/.test(t) || any(["unauthorized", "forbidden", "invalid api key", "authentication failed", "payment required", "invalid token", "expired token", "access denied", "permission denied"])) return "non-retryable";
+  // (2) CONTEXT-EXHAUSTED — needs a smaller prompt, not a replay; a distinct bucket from transport retry.
+  if (any(["context length", "context window", "maximum context", "context exhausted", "token limit", "too many tokens", "prompt is too long"])) return "context-exhausted";
+  // (3) ENVIRONMENT — a prepare-the-box failure (missing tool / file / module / disk), not a provider retry.
+  if (/\b(enoent|eacces)\b/.test(t) || any(["command not found", "no such file", "cannot find module", "module not found", "not installed", "no space left"])) return "environment";
+  // (4) RETRYABLE — transient transport: boundary-anchored 5xx / 429 / 408, or a network/timeout/rate-limit phrase.
+  if (/\b(5\d\d|429|408)\b/.test(t) || any(["econnreset", "etimedout", "timeout", "timed out", "connection refused", "socket hang up", "network error", "temporarily unavailable", "rate limit", "try again"])) return "retryable";
+  // (5) UNKNOWN — nothing matched with confidence ⇒ the SAFE direction: no hint, no auto-disposition.
+  return "unknown";
+}
+
+/** D-multica ① — the NEUTRAL alert annotation for a failure class. A HINT that only names the likely kind and ALWAYS restates
+ *  that disposition stays with S19/approval; "unknown" returns "" (no annotation). Never frames the class as a verdict. Pure. */
+export function failureHintNote(cls: FailureClass): string {
+  switch (cls) {
+    case "retryable": return "注:屏上线索疑似可重试故障(网络/5xx/限流类)。仅为告警提示,是否重试与处置仍按 S19/审批由授权方裁决。";
+    case "non-retryable": return "注:屏上线索疑似不可重试故障(鉴权/付费/配置类,如 401/402/403)。不应自动重试;处置仍按 S19/审批裁决。";
+    case "context-exhausted": return "注:屏上线索疑似上下文超限。需缩小输入而非重放;处置仍按 S19/审批裁决。";
+    case "environment": return "注:屏上线索疑似环境/依赖缺失(工具/文件/模块/磁盘)。需先修复环境;处置仍按 S19/审批裁决。";
+    case "unknown": return "";
+  }
+}

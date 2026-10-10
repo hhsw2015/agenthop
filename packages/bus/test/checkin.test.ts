@@ -37,4 +37,40 @@ describe("startup check-in (bus-reachability §4)", () => {
     expect(reportCheckIn(HOME, self(), "claude:agenthop-coordsid01")).toBe("sent");
     expect(inboxFiles("coordsid01").length).toBe(1);
   });
+
+  // D-multica ③ (checkin --note): an optional status note passes through to S11 title + the JSON `note` field, pure (no parse,
+  // no verdict). FT-1: the report text MUST stay a single JSON line — strip only the "[checkin] " prefix, then JSON.parse works.
+  test("an optional note rides in the title + JSON payload while the text stays one parseable report line", () => {
+    presence("coordsid01");
+    expect(reportCheckIn(HOME, self(), "claude:agenthop-coordsid01", "CI still running")).toBe("sent");
+    const files = inboxFiles("coordsid01");
+    expect(files.length).toBe(1);
+    const msg = JSON.parse(readFileSync(path.join(HOME, ".agenthop", "inbox", "coordsid01", files[0]!), "utf8")) as { text: string; title?: string };
+    expect(msg.title).toBe("CI still running");             // S11 title carries the note
+    // the established contract (checkin.test.ts base: strip "[checkin] " then JSON.parse directly, NO suffix removal):
+    const payload = JSON.parse(msg.text.replace("[checkin] ", "")) as { note?: string; sid: string; handle: string };
+    expect(payload).toMatchObject({ sid: "mysid99", handle: "claude:Work-mysid99", pid: 999, startedAt: 111, note: "CI still running" });
+  });
+
+  test("a note with quotes/dashes/newlines stays inside the JSON — the report text is still one parseable line", () => {
+    presence("coordsid01");
+    const note = 'build "x" — step 2\nreticulating';
+    expect(reportCheckIn(HOME, self(), "claude:agenthop-coordsid01", note)).toBe("sent");
+    const files = inboxFiles("coordsid01");
+    const msg = JSON.parse(readFileSync(path.join(HOME, ".agenthop", "inbox", "coordsid01", files[0]!), "utf8")) as { text: string; title?: string };
+    const payload = JSON.parse(msg.text.replace("[checkin] ", "")) as { note?: string }; // JSON.stringify escaped it ⇒ still one line
+    expect(payload.note).toBe(note);
+    expect(msg.title).toBe(note);
+  });
+
+  test("a blank / whitespace note is omitted (no empty title, no note field, unchanged base behavior)", () => {
+    presence("coordsid01");
+    expect(reportCheckIn(HOME, self(), "claude:agenthop-coordsid01", "   ")).toBe("sent");
+    const files = inboxFiles("coordsid01");
+    const msg = JSON.parse(readFileSync(path.join(HOME, ".agenthop", "inbox", "coordsid01", files[0]!), "utf8")) as { text: string; title?: string };
+    expect(msg.title).toBeUndefined();                      // no empty title field
+    const payload = JSON.parse(msg.text.replace("[checkin] ", "")) as { note?: string; sid: string };
+    expect(payload).toMatchObject({ sid: "mysid99", handle: "claude:Work-mysid99" });
+    expect(payload.note).toBeUndefined();                  // no note field when blank
+  });
 });

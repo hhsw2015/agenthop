@@ -6,7 +6,8 @@ import {
   AlertDedup, alertKey, isValidInboxKey, classifyMemberHealth, GhostOnce, isOnRoster, classifyBlockedEscalation, resolveSnapshotMembers,
   parsePsOutput, selfTree, isDispatcherLoopCommand, isDispatcherAlreadyRunning, shouldEmitWatchNotice,
   screenIndicatesContentFilter, contentFilterHintNote, CONTENT_FILTER_ANCHORS,
-  type ProcInfo,
+  classifyFailure, failureHintNote,
+  type ProcInfo, type FailureClass,
 } from "../src/swarm/sentinel-denoise.js";
 import { scanInboxes } from "../src/swarm/inbox-sentinel.js";
 
@@ -310,5 +311,46 @@ describe("sentinel-denoise — F44-⑩ content-filter HINT (annotates, never rep
     expect(note).toMatch(/合规范围内/);            // only an in-policy reword
     expect(note).toMatch(/不构成绕过限制的许可/);   // NOT a license to bypass the limit
     expect(note).toMatch(/S19/);                  // the approval boundary is unchanged
+  });
+
+  // D-multica ① — failure taxonomy
+  test("classifyFailure buckets each class", () => {
+    expect(classifyFailure("Error: 503 Service Unavailable")).toBe("retryable");
+    expect(classifyFailure("ECONNRESET while connecting")).toBe("retryable");
+    expect(classifyFailure("got 429, rate limit")).toBe("retryable");
+    expect(classifyFailure("HTTP 401 Unauthorized")).toBe("non-retryable");
+    expect(classifyFailure("402 Payment Required")).toBe("non-retryable");
+    expect(classifyFailure("invalid api key")).toBe("non-retryable");
+    expect(classifyFailure("maximum context length exceeded")).toBe("context-exhausted");
+    expect(classifyFailure("Error: Cannot find module 'foo'")).toBe("environment");
+    expect(classifyFailure("ENOENT: no such file or directory")).toBe("environment");
+  });
+
+  test("classifyFailure: number-boundary guard — 401 inside a larger number is NOT a status code", () => {
+    expect(classifyFailure("processed 2401 rows in 5000 ms")).toBe("unknown"); // 2401 / 5000 are not 401 / 5xx
+    expect(classifyFailure("line 50123 of 40199")).toBe("unknown");            // no standalone 5xx / 4xx code
+    expect(classifyFailure("vite on port 5173")).toBe("unknown");             // 5173 is not a 3-digit 5xx
+  });
+
+  test("classifyFailure: non-retryable WINS over a co-present 5xx (the 401-never-retries rail)", () => {
+    expect(classifyFailure("saw 500 earlier; now 401 Unauthorized")).toBe("non-retryable");
+  });
+
+  test("classifyFailure: unknown / empty / non-string ⇒ unknown (the safe direction)", () => {
+    expect(classifyFailure("just some ordinary screen output")).toBe("unknown");
+    expect(classifyFailure("")).toBe("unknown");
+    expect(classifyFailure(undefined)).toBe("unknown");
+    expect(classifyFailure(12345)).toBe("unknown");
+  });
+
+  test("failureHintNote: a HINT only — restates disposition stays with S19, unknown has no note", () => {
+    expect(failureHintNote("unknown")).toBe("");                 // no annotation for an unknown class
+    const classes: FailureClass[] = ["retryable", "non-retryable", "context-exhausted", "environment"];
+    for (const c of classes) {
+      const note = failureHintNote(c);
+      expect(note).toMatch(/线索/);        // framed as a clue
+      expect(note).toMatch(/S19|审批/);    // disposition stays with S19/approval
+    }
+    expect(failureHintNote("non-retryable")).toMatch(/不应自动重试/); // explicitly never auto-retry
   });
 });
