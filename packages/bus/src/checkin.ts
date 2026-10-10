@@ -25,13 +25,15 @@ export function reportCheckIn(home: string, self: SelfInfo, coordinatorHandle: s
     if (!coordSid) return "retry";          // coordinator not resolvable on this machine YET -> retain + retry when it appears (B5)
     const mySid = self.stableId ?? self.id;
     if (coordSid === mySid) return "skip";  // we ARE the coordinator -> don't check in to ourselves — permanent
-    // D-multica ③ (checkin --note): an OPTIONAL one-line status annotation ("CI still running") passed straight through into the
-    // S11 title + text. PURE passthrough — never parsed, never a verdict; the coordinator reads it as context, nothing acts on it.
+    // D-multica ③ (checkin --note): an OPTIONAL one-line status annotation ("CI still running") carried as a `note` FIELD INSIDE
+    // the JSON object and in the S11 title — PURE passthrough, never parsed, never a verdict. FT-1: the text stays exactly
+    // `[checkin] ${line}` so the established contract (strip `[checkin] ` ⇒ a single JSON.parse-able object) is preserved; the
+    // note must NOT be appended after the JSON as free text (that would make the report frame undecodable by existing readers).
     const trimmedNote = note && note.trim() ? note.trim() : "";
     const line = JSON.stringify({ sid: mySid, handle: self.title, pid: self.pid, startedAt: self.startedAt, ...(trimmedNote ? { note: trimmedNote } : {}) });
     writeInbox(home, coordSid, {
       from: mySid, fromLabel: self.title, ...(self.mode ? { fromMode: self.mode } : {}),
-      text: trimmedNote ? `[checkin] ${line} — ${trimmedNote}` : `[checkin] ${line}`, via: "local", ts: Date.now(),
+      text: `[checkin] ${line}`, via: "local", ts: Date.now(),
       ...(trimmedNote ? { title: trimmedNote } : {}),
     });
     return "sent";
