@@ -64,8 +64,8 @@ import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
-import { digestEnabled, digestActions, composeDigest } from "../packages/bus/src/swarm/morning-digest.js";
-import { writeDigestProjection, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources } from "../packages/bus/src/swarm/morning-digest-store.js";
+import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
+import { writeDigestProjection, readDigestProjection, readNotifiedState, markNotified, clearNotified, gatherDigestSources } from "../packages/bus/src/swarm/morning-digest-store.js";
 import { successionEnabled } from "../packages/bus/src/swarm/shell-succession.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
@@ -1670,13 +1670,22 @@ async function main(): Promise<void> {
       if (!act.writeProjection && !act.notify) return; // both already delivered today (or before the hour)
       if (nowSec() - lastDigestAttemptSec < DIGEST_RETRY_SEC) return; // backoff: never a tight per-tick retry on a persistent fault
       lastDigestAttemptSec = nowSec();
-      const sources = gatherDigestSources(HOME);
-      if (sources === null) return; // MD-P2-2: sources unreadable (unknown) ⇒ cannot assert content ⇒ retry later (no false quiet night)
-      if (act.writeProjection) writeDigestProjection(HOME, sources, today, nowSec()); // atomic; (re)writes absent/corrupt; retry if it fails
+      // (1) Projection obligation: gather the night's sources ONCE and write the FROZEN body for today (MD-R2-P2-1 — the projection
+      //     IS the single generated content; a later retry never re-gathers).
+      if (act.writeProjection) {
+        const sources = gatherDigestSources(HOME);
+        if (sources === null) return; // MD-P2-2: sources unreadable (unknown) ⇒ cannot assert content ⇒ retry later (no false quiet night)
+        writeDigestProjection(HOME, sources, today, nowSec()); // atomic; (re)writes absent/corrupt; retry if it fails
+      }
+      // (2) Notify obligation: deliver the SAME frozen body the projection carries — render the on-disk projection, NEVER a
+      //     re-gather (MD-R2-P2-1), so the projection and the coordinator brief (first send + every retry) are byte-identical.
       if (act.notify) {
+        const p = readDigestProjection(HOME);
+        if (p.kind !== "valid" || p.date !== today) return; // the frozen body is not on disk yet (projection write failed) ⇒ retry both next tick
         const coord = process.env.SWARM_COORDINATOR;
-        if (!coord || !coord.trim()) markNotified(HOME, today); // no coordinator ⇒ the brief has no target; the projection is the artifact
-        else if (["delivered", "deduped"].includes(notifyCoordinator(composeDigest(sources, today), { taskRef: "morning-digest", title: "morning brief", intent: "fyi" }))) markNotified(HOME, today); // CONFIRMED ⇒ record; logged/failed ⇒ retry next eligible tick
+        if (!coord || !coord.trim()) { markNotified(HOME, today); return; } // no coordinator ⇒ the brief has no target; the projection is the artifact
+        if (!markNotified(HOME, today)) return; // MD-P2-1: durably CLAIM today BEFORE sending — if the claim can't persist, do NOT send (retry); a land-then-crash then never re-sends
+        if (!["delivered", "deduped"].includes(notifyCoordinator(digestTextFromProjection(p.projection), { taskRef: "morning-digest", title: "morning brief", intent: "fyi" }))) clearNotified(HOME); // NORMAL send failure ⇒ revert the claim ⇒ retry (no lost fyi); a crash keeps the claim (no re-send)
       }
     } catch (e) { log(`morning digest failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };

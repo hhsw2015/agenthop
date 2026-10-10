@@ -3,10 +3,10 @@
 // marker (separate obligation from the projection, MD-P2-1), and classifies the four projection read states (MD-P2-4). Fail-soft:
 // a source READ ERROR is reported as "unknown" (never a false quiet night, MD-P2-2); the pure composition lives in morning-digest.ts.
 
-import { mkdirSync, writeFileSync, renameSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readFileSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
-import { digestProjection, type DigestSources, type ProjState, type NotifyState } from "./morning-digest.js";
+import { digestProjection, type DigestSources, type ProjState, type NotifyState, type DigestProjection } from "./morning-digest.js";
 
 function digestDir(home: string): string { return path.join(home, ".agenthop", "console", "morning-digest"); }
 function digestPath(home: string): string { return path.join(digestDir(home), "digest.json"); }
@@ -43,10 +43,13 @@ export function readDigestProjection(home: string): ProjState {
   if (parsed.schema !== "morning-digest/v1" || typeof parsed.date !== "string" || parsed.date.length === 0) return { kind: "corrupt" };
   if (typeof parsed.generatedAtSec !== "number" || !Number.isFinite(parsed.generatedAtSec)) return { kind: "corrupt" };
   if (!Array.isArray(parsed.sections)) return { kind: "corrupt" };
+  const sections: { title: string; lines: string[] }[] = [];
   for (const s of parsed.sections) {
     if (!isObj(s) || typeof s.title !== "string" || !Array.isArray(s.lines) || s.lines.some((l) => typeof l !== "string")) return { kind: "corrupt" };
+    sections.push({ title: s.title, lines: s.lines as string[] });
   }
-  return { kind: "valid", date: parsed.date };
+  const projection: DigestProjection = { schema: "morning-digest/v1", date: parsed.date, generatedAtSec: parsed.generatedAtSec, sections };
+  return { kind: "valid", date: parsed.date, projection }; // carries the FROZEN body for the notify to render (MD-R2-P2-1)
 }
 
 /** MD-P2-1 — read the coordinator-brief delivery marker (separate obligation from the projection). "notified" (confirmed for a
@@ -55,14 +58,21 @@ export function readNotifiedState(home: string): NotifyState {
   let raw: string;
   try { raw = readFileSync(notifiedPath(home), "utf8"); }
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "none" } : { kind: "unknown" }; }
-  try { const o = JSON.parse(raw) as Record<string, unknown>; return typeof o.date === "string" && o.date.length > 0 ? { kind: "notified", date: o.date } : { kind: "none" }; }
-  catch { return { kind: "none" }; } // corrupt marker ⇒ treat as not-notified (a re-send is deduped by notifyCoordinator)
+  let o: unknown;
+  try { o = JSON.parse(raw); } catch { return { kind: "unknown" }; } // MD-P2-1: a corrupt marker must NOT prove "not sent" ⇒ unknown (no re-send)
+  return isObj(o) && typeof o.date === "string" && o.date.length > 0 ? { kind: "notified", date: o.date } : { kind: "unknown" };
 }
 
-/** MD-P2-1 — record a CONFIRMED coordinator-brief delivery for `dateStr`, so a restart does not re-send today's brief. Returns
- *  true on success; a write fault leaves the obligation open for a later retry. Never throws. */
+/** MD-P2-1 — CLAIM today's coordinator-brief delivery (written BEFORE the send, so a land-then-crash never re-sends — the marker
+ *  already names today). The caller sends only after this returns true, and reverts via clearNotified on a normal send failure.
+ *  Returns false on a write fault (then the caller must NOT send — retry next tick). Never throws. */
 export function markNotified(home: string, dateStr: string): boolean {
   return atomicWriteJson(notifiedPath(home), { date: dateStr });
+}
+
+/** MD-P2-1 — revert the claim after a NORMAL send failure (not a crash), so the brief is retried rather than lost. Best-effort. */
+export function clearNotified(home: string): void {
+  try { rmSync(notifiedPath(home), { force: true }); } catch { /* already gone */ }
 }
 
 /** Gather the digest sources, fail-soft. PROGRESS.md is the coordinator's narrative projection of the control log + reviews (the
@@ -77,7 +87,10 @@ export function gatherDigestSources(home: string, tailLines = 80, perGroup = 8):
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { alerts: [], clearedReviews: [], shipped: [], pending: [] } : null; }
   const alerts: string[] = [], clearedReviews: string[] = [], shipped: string[] = [], pending: string[] = [];
   const all = raw.split("\n");
-  const pendingRe = /待签|待复审|待审|尚未|未签|送审|候审|候签|\bpending\b|[1-9]\d*\s*remain/i; // NON-zero remain + awaiting forms
+  // MD-P2-3: match ALL awaiting forms (待办 / 待裁 / 待处理 / 待签 / 待复审 / 待审 …, i.e. any 待X) + 尚未 / 未签 / 送审 / a NON-zero
+  // REMAIN. Checked BEFORE the cleared markers so "待签收 … 2 REMAIN" / "尚未签收 … 待复审" stay pending — while a positive sign-off
+  // (✅ / 0 REMAIN / 已签收, none of which carry 待/尚未) still clears.
+  const pendingRe = /待|尚未|未签|送审|候审|候签|\bpending\b|[1-9]\d*\s*remain/i;
   for (const line of all.slice(Math.max(0, all.length - tailLines))) {
     const t = line.trim();
     if (!t.startsWith("- ") && !t.startsWith("* ")) continue; // bullet lines only

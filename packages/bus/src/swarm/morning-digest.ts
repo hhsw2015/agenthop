@@ -58,9 +58,19 @@ export function digestEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 
 /** The on-disk PROJECTION state (MD-P2-4): only a COMPLETE valid projection for today proves today's brief was generated. The
- *  four states are kept distinct — "valid" (proven), "absent" (never written), "corrupt" (parseable but malformed ⇒ repairable),
- *  "unknown" (a read error ⇒ can't tell). The store's reader classifies; the pure decision below consumes it. */
-export type ProjState = { kind: "valid"; date: string } | { kind: "absent" } | { kind: "corrupt" } | { kind: "unknown" };
+ *  four states are kept distinct — "valid" (proven; carries the parsed projection = the FROZEN body the notify renders, MD-R2-P2-1),
+ *  "absent" (never written), "corrupt" (parseable but malformed ⇒ repairable), "unknown" (a read error ⇒ can't tell). The store's
+ *  reader classifies; the pure decision below consumes kind/date. */
+export type ProjState = { kind: "valid"; date: string; projection: DigestProjection } | { kind: "absent" } | { kind: "corrupt" } | { kind: "unknown" };
+
+/** Render a PROJECTION back to the brief text — the notify delivers the SAME frozen body the projection carries (MD-R2-P2-1), not
+ *  a re-gather. Format parity with composeDigest (a lone "quiet night" section ⇒ the quiet line). Pure. */
+export function digestTextFromProjection(p: DigestProjection): string {
+  const head = `morning brief — ${p.date}`;
+  if (p.sections.length === 1 && p.sections[0]!.title === "quiet night") return `${head}\n(quiet night — nothing to report)`;
+  const body = p.sections.flatMap((s) => [`${s.title}:`, ...s.lines.map((l) => `  - ${l}`)]);
+  return [head, ...body].join("\n");
+}
 /** The NOTIFY state (MD-P2-1): the daily coordinator-brief delivery is a SEPARATE obligation from the projection, tracked by its
  *  own durable marker — "notified" (confirmed for a date), "none" (not yet), "unknown" (marker unreadable ⇒ don't risk a double). */
 export type NotifyState = { kind: "notified"; date: string } | { kind: "none" } | { kind: "unknown" };
