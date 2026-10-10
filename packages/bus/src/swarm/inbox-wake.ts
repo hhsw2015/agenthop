@@ -7,8 +7,8 @@
 // the FILESYSTEM, so a same-batch burst AND independent writer processes all collapse to one inject per window. The dispatcher watch
 // is demoted to a BACKSTOP: re-inject only for items that have lain unclaimed past a window (a write-side wake that missed).
 
-import { mkdirSync, writeFileSync, readdirSync, readFileSync, lstatSync, unlinkSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { mkdirSync, writeFileSync, readdirSync, readFileSync, lstatSync, renameSync, unlinkSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
 import { setInboxWakeHook, scanUnclaimedInbox } from "../inbox.js";
@@ -43,56 +43,80 @@ export function shouldInjectWake(now: number, last: number, paneState: string, c
   return true;
 }
 
-/** 先占后发 — atomically claim the per-target wake slot BEFORE any send. The rejection AUTHORITY is the GLOBAL high-water TIMESTAMP:
- *  MAX over the CONTENT (claim timestamp) of ALL this sid's markers, regardless of interval family or legacy format. The admit is purely
- *  time-based — `now - maxTs >= cooldownMs` — so it is parameter-independent (a cooldown change just compares against the new width,
- *  IW-R4-P2-1), legacy-aware (an r4 `<sid>.<window>` marker also stores a timestamp ⇒ still blocks, IW-R5-P2-1), and cross-family-safe
- *  (a GC that drops one family's marker cannot re-open a used window, because a MORE-RECENT marker's timestamp remains the authority,
- *  IW-P2-1). Atomicity is a per-cooldown-window O_EXCL marker `console/inbox-wake/<sha256(sid)>.w<cooldownMs>.<window>` (window =
- *  floor(now/cooldownMs)) — 20 concurrent / 8-in-a-row / cross-process within one cooldown period ⇒ exactly one winner. The marker
- *  create is the sole durable evidence (a create fault ⇒ reject; FC-2 publish-after-fact). A readdir FAULT (non-ENOENT) ⇒ UNKNOWN ⇒
- *  reject (fail-closed, FC-2 r3). After creating we RE-READ the max: a concurrent LATER inject ⇒ yield. The age-GC deletes markers whose
- *  timestamp is older than one cooldown — so it preserves the high-water EXACTLY while it is still within the cooldown (its rejection
- *  duty) and only retires expired evidence (where the admit would pass anyway). Returns true iff THIS caller won a fresh, confirmed
- *  claim. Never throws. */
+const WAKE_GATE_STALE_MS = 10_000;                   // real-time hold ceiling: a gate older than this is a crashed holder's, safe to steal
+
+/** 先占后发 — atomically claim the per-target wake slot BEFORE any send. ONE anchor does both jobs (IW-P2-1): the admit TEST and the
+ *  occupy are serialized behind a single per-target O_EXCL gate `console/inbox-wake/<sha256(sid)>.gate`, so two concurrent claims of
+ *  ANY interval / window contend on the SAME file — exactly one enters, decides, and records; the rest yield. The rejection AUTHORITY
+ *  inside the gate is the GLOBAL high-water TIMESTAMP: MAX over the CONTENT (claim timestamp) of ALL this sid's history markers,
+ *  regardless of interval family or legacy format. The admit is purely time-based — `now - maxTs >= cooldownMs` — so it is
+ *  parameter-independent (a cooldown change compares against the new width, IW-R4-P2-1), legacy-aware (an r4 `<sid>.<window>` marker
+ *  also stores a timestamp ⇒ still blocks, IW-R5-P2-1), and cross-family-safe (a GC dropping one family's marker cannot re-open a used
+ *  window — a more-recent marker's timestamp stays the authority, IW-P2-1). The history marker `<sha256(sid)>.w<cooldownMs>.<window>`
+ *  is written (atomic tmp+rename) only AFTER the admit passes, under the gate — it is pure evidence for the NEXT claim, never the
+ *  same-period gate. A dir/gate read or create FAULT ⇒ UNKNOWN ⇒ reject (fail-closed, FC-2 r3 / publish-after-fact). The gate is held
+ *  only across the sub-ms check+record and released in `finally`; a holder that crashed leaves a gate stolen after
+ *  WAKE_GATE_STALE_MS so the target is never permanently blocked. The age-GC retires only this family's EXPIRED windows, preserving
+ *  the high-water exactly while it is still within the cooldown. Returns true iff THIS caller won a fresh, confirmed claim. Never throws. */
 export function claimWakeSlot(home: string, sid: string, now: number, cooldownMs: number): boolean {
   if (!sid || !Number.isFinite(now) || !(cooldownMs > 0)) return false;
   const dir = path.join(home, ".agenthop", "console", "inbox-wake");
   const safe = createHash("sha256").update(sid).digest("hex");
   const sidPrefix = `${safe}.`;                      // EVERY marker of this sid — every interval family, legacy format, and future schema
   const famPrefix = `${safe}.w${cooldownMs}.`;       // only THIS interval family (what this process is allowed to GC)
+  const gateName = `${safe}.gate`;                   // the SINGLE global occupy+admit anchor for this sid (never a timestamp marker)
+  const gatePath = path.join(dir, gateName);
   const window = Math.floor(now / cooldownMs);
   const slotName = `${safe}.w${cooldownMs}.${window}`;
   const slot = path.join(dir, slotName);
-  // EFFECTIVE timestamp of a marker (fail-closed recognition, coordinator's "any unknown file is EVIDENCE, not garbage"): its parseable
-  // CONTENT (the claim timestamp) if finite; else — an unrecognized / future-schema / corrupt file — its MTIME, so it STILL counts as
-  // recent evidence and STILL ages out. null only when the entry truly vanished (gone ⇒ not evidence).
+  const token = `${now}.${randomBytes(6).toString("hex")}`;
+  // EFFECTIVE timestamp of a history marker (fail-closed recognition — coordinator r7: "any unknown file is EVIDENCE, not garbage; a
+  // read fault ⇒ UNKNOWN ⇒ most conservative; empty/non-numeric content ⇒ mtime, never 0"). ENOENT ⇒ null (the entry truly vanished ⇒
+  // not evidence). Any OTHER read fault (EACCES, ...) ⇒ `now`, so an unreadable-but-present marker counts as a just-happened inject and
+  // BLOCKS this claim. Empty or non-numeric content ⇒ fall back to MTIME (never Number("") ⇒ 0); mtime unreadable ⇒ `now`.
   const effTs = (name: string): number | null => {
     const p = path.join(dir, name);
-    try { const c = Number(readFileSync(p, "utf8").trim()); if (Number.isFinite(c)) return c; } catch { return null; } // vanished mid-scan
-    try { return lstatSync(p).mtimeMs; } catch { return null; }
+    let raw: string;
+    try { raw = readFileSync(p, "utf8"); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; try { return lstatSync(p).mtimeMs; } catch { return now; } }
+    const t = raw.trim();
+    if (t !== "" && Number.isFinite(Number(t))) return Number(t);
+    try { return lstatSync(p).mtimeMs; } catch { return now; } // present but unparseable ⇒ mtime (never 0); mtime gone ⇒ conservative now
   };
-  // GLOBAL high-water = MAX effective-timestamp over EVERY marker of this sid (any family / legacy / unrecognized). -Infinity when
+  // GLOBAL high-water = MAX effective-timestamp over EVERY history marker of this sid (excluding the gate). -Infinity when
   // confirmed-empty (ENOENT dir / none); null on a dir read FAULT (non-ENOENT) ⇒ caller fails closed.
   const readMaxTs = (): number | null => {
     let names: string[];
     try { names = readdirSync(dir); } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? -Infinity : null; }
     let max = -Infinity;
-    for (const n of names) { if (!n.startsWith(sidPrefix)) continue; const ts = effTs(n); if (ts !== null && ts > max) max = ts; }
+    for (const n of names) { if (!n.startsWith(sidPrefix) || n === gateName) continue; const ts = effTs(n); if (ts !== null && ts > max) max = ts; }
     return max;
   };
   try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return false; }
-  const max0 = readMaxTs();
-  if (max0 === null) return false;                   // read fault ⇒ UNKNOWN ⇒ fail-closed
-  if (now - max0 < cooldownMs) return false;         // within cooldown of the last inject (ANY family / legacy / unrecognized) ⇒ reject
-  try { writeFileSync(slot, String(now), { flag: "wx", mode: 0o600 }); } catch { return false; } // O_EXCL same-window gate + persist(timestamp); fault ⇒ no authorize
-  const max1 = readMaxTs();
-  if (max1 === null || max1 > now) { try { unlinkSync(slot); } catch { /* ignore */ } return false; } // a concurrent LATER inject won ⇒ yield
-  // GC ONLY this process's OWN interval family, and only its EXPIRED windows (effective-ts older than one cooldown). Other families,
-  // legacy files and anything unrecognized are EVIDENCE, never this process's garbage (IW-P2-1 / IW-R5-P2-1) — they are left untouched
-  // (each family self-cleans) and stay in readMaxTs. A within-cooldown marker (the live rejection authority) is never removed.
-  try { for (const n of readdirSync(dir)) { if (!n.startsWith(famPrefix) || n === slotName) continue; const ts = effTs(n); if (ts !== null && ts < now - cooldownMs) { try { unlinkSync(path.join(dir, n)); } catch { /* ignore */ } } } } catch { /* GC best-effort */ }
-  return true;
+  // Acquire the SINGLE global gate (O_EXCL). A live holder (gate younger than WAKE_GATE_STALE_MS, by REAL wall-clock) ⇒ another claim
+  // is deciding right now ⇒ yield. A stale gate (crashed holder) is stolen. Any non-EEXIST create fault ⇒ fail-closed.
+  let held = false;
+  try { writeFileSync(gatePath, token, { flag: "wx", mode: 0o600 }); held = true; }
+  catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") return false;
+    let fresh = true;
+    try { fresh = Date.now() - lstatSync(gatePath).mtimeMs < WAKE_GATE_STALE_MS; } catch { fresh = false; } // vanished ⇒ try to steal
+    if (fresh) return false;                         // an active claim holds the gate ⇒ its decision stands ⇒ yield
+    try { unlinkSync(gatePath); writeFileSync(gatePath, token, { flag: "wx", mode: 0o600 }); held = true; } catch { return false; } // lost the steal race ⇒ fail-closed
+  }
+  try {
+    const max0 = readMaxTs();
+    if (max0 === null) return false;                 // read fault ⇒ UNKNOWN ⇒ fail-closed
+    if (now - max0 < cooldownMs) return false;       // within cooldown of the last inject (ANY family / legacy / unrecognized) ⇒ reject
+    try { const tmp = `${slot}.tmp-${randomBytes(4).toString("hex")}`; writeFileSync(tmp, String(now), { mode: 0o600 }); renameSync(tmp, slot); } catch { return false; } // record evidence; fault ⇒ no authorize (publish-after-fact)
+    // GC ONLY this process's OWN interval family, and only its EXPIRED windows (effective-ts older than one cooldown). Other families,
+    // legacy files and anything unrecognized are EVIDENCE, never this process's garbage — left untouched (each family self-cleans) and
+    // kept in readMaxTs. The within-cooldown marker just written (the live rejection authority) is never removed.
+    try { for (const n of readdirSync(dir)) { if (!n.startsWith(famPrefix) || n === slotName) continue; const ts = effTs(n); if (ts !== null && ts < now - cooldownMs) { try { unlinkSync(path.join(dir, n)); } catch { /* ignore */ } } } } catch { /* GC best-effort */ }
+    return true;
+  } finally {
+    if (held) { try { if (readFileSync(gatePath, "utf8") === token) unlinkSync(gatePath); } catch { /* released / stolen / gone */ } }
+  }
 }
 
 export type PaneInfo = { paneId: string; state: AgentState };

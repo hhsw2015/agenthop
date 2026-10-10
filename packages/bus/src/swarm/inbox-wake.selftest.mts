@@ -1,6 +1,6 @@
 // Standalone FC-6 (deterministic decision + 先占后发 claim) / FC-7 (hook unset = byte-for-byte v0 delivery) selftest for the inbox
 // real-time wake. Run: tsx packages/bus/src/swarm/inbox-wake.selftest.mts
-import { mkdtempSync, rmSync, readdirSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, writeFileSync, mkdirSync, chmodSync, utimesSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -106,6 +106,27 @@ ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite cloc
     writeFileSync(path.join(dir2, `${safe}.v99.weird`), "not-a-timestamp");
     ok(claimWakeSlot(HOME2, "c", Date.now(), C120) === false, "IW-R5-P2-1: an unrecognized file (non-numeric content) is EVIDENCE via mtime ⇒ a fresh claim is blocked (fail-closed recognition)");
     rmSync(HOME2, { recursive: true, force: true });
+  } finally { rmSync(HOME, { recursive: true, force: true }); }
+}
+// IW-P2-1 (r7): the admit TEST and the occupy share ONE anchor — a single per-sid gate `<sha>.gate`. A concurrent claim that is
+// mid-decision (gate present + fresh) makes a second claim YIELD even when the time-admit WOULD pass (stale max). This is the exact
+// two-concurrent hole the per-window O_EXCL could NOT catch: different windows/families ⇒ different files ⇒ both passed. A crashed
+// holder's gate is stolen after the stale ceiling, so the target is never permanently blocked.
+{
+  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakegate-"));
+  const dir = path.join(HOME, ".agenthop/console/inbox-wake"); mkdirSync(dir, { recursive: true });
+  const safe = createHash("sha256").update("c").digest("hex");
+  const gate = path.join(dir, `${safe}.gate`);
+  try {
+    writeFileSync(path.join(dir, `${safe}.w${COOL}.0`), "0");                 // an OLD marker ⇒ the time-admit (now - max >= cd) WOULD pass alone
+    writeFileSync(gate, "other.holder", { flag: "wx", mode: 0o600 });         // a live holder is mid-decision: a FRESH gate present
+    ok(claimWakeSlot(HOME, "c", 10 * COOL, COOL) === false, "IW-P2-1 r7: a fresh global gate (concurrent holder) blocks a claim the time-admit would ADMIT — occupy and admit share one anchor");
+    rmSync(gate, { force: true });                                            // the holder finished (released the gate) WITHOUT a newer marker
+    ok(claimWakeSlot(HOME, "c", 10 * COOL, COOL) === true, "IW-P2-1 r7: once the gate is free, the admitted claim wins and records");
+    ok(claimWakeSlot(HOME, "c", 30 * COOL, COOL) === true, "IW-P2-1 r7: the gate is transient (released in finally), not a persistent lock — a later admitted window still claims");
+    writeFileSync(gate, "crashed.holder", { flag: "wx", mode: 0o600 });       // a CRASHED holder left a gate behind...
+    const old = new Date(Date.now() - 120_000); utimesSync(gate, old, old);   // ...with an mtime far past the stale ceiling (real wall-clock)
+    ok(claimWakeSlot(HOME, "c", 60 * COOL, COOL) === true, "IW-P2-1 r7: a stale gate (crashed holder) is stolen ⇒ never a permanent block");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
 

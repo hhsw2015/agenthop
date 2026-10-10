@@ -81,6 +81,21 @@ describe("inbox-wake — claimWakeSlot (先占后发, cross-process atomic)", ()
     expect(ok3).toBe(false);                                        // ③ persist fault ⇒ not authorized
     expect(claimWakeSlot(HOME, "c", w(15), COOL)).toBe(true);       // recovers after the faults clear
   });
+
+  test("IW-P2-1 (r7): a single per-sid gate unifies admit+occupy — a fresh concurrent gate blocks a would-be-admitted claim; a stale one is stolen", () => {
+    const dir = path.join(HOME, ".agenthop/console/inbox-wake"); mkdirSync(dir, { recursive: true });
+    const safe = createHash("sha256").update("c").digest("hex");
+    const gate = path.join(dir, `${safe}.gate`);
+    writeFileSync(path.join(dir, `${safe}.w${COOL}.0`), "0");                 // old marker ⇒ time-admit alone WOULD pass
+    writeFileSync(gate, "other.holder", { flag: "wx", mode: 0o600 });         // a concurrent holder mid-decision (fresh gate)
+    expect(claimWakeSlot(HOME, "c", 10 * COOL, COOL)).toBe(false);            // the gate alone blocks it (the per-window O_EXCL could not)
+    rmSync(gate, { force: true });
+    expect(claimWakeSlot(HOME, "c", 10 * COOL, COOL)).toBe(true);             // gate free ⇒ the admitted claim wins
+    expect(claimWakeSlot(HOME, "c", 30 * COOL, COOL)).toBe(true);             // gate is transient (released in finally), not a cooldown
+    writeFileSync(gate, "crashed.holder", { flag: "wx", mode: 0o600 });
+    const old = new Date(Date.now() - 120_000); utimesSync(gate, old, old);   // crashed holder, mtime past the stale ceiling
+    expect(claimWakeSlot(HOME, "c", 60 * COOL, COOL)).toBe(true);             // stale gate stolen ⇒ never a permanent block
+  });
 });
 
 describe("inbox-wake — wakeSession (injected deps, fail-soft, claim-before-send)", () => {
