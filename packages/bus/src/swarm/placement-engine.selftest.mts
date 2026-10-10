@@ -11,6 +11,8 @@ import {
   buildPlacementSuggestion,
   planPlacementSuggest,
   shouldSuggestPlacement,
+  fleetFromMetas,
+  vmIdToView,
   type MachineView,
   type ReconcileConfig,
   type BackendOption,
@@ -329,5 +331,75 @@ t("notice-dwell: invalid dwell -> always", shouldSuggestPlacement(1000, 0, NaN) 
   const zero = sim(0); // the reviewer's zero-floor control
   t("PW-1 pinned: zero-floor control has the SAME cadence (t=1000, t=1300)", zero.length === 2 && zero[0]!.now === 1000 && zero[1]!.now === 1300 && zero.every((d) => d.funded === 3 && d.gate === 7));
 }
+
+// ============================================================================================================
+// fleet ledger read — fleetFromMetas (mirrors vm-ssh phase + legacy + lifetime semantics) + vmIdToView (pure)
+// ============================================================================================================
+const NOW = 1_000_000; // test clock (seconds). railway TTL = 3600 ⇒ expired iff createdSec + 3600 <= NOW (createdSec <= 996400)
+const FRESH = NOW - 100; // 100s old ⇒ not expired
+const OLD = NOW - 7200;  // 7200s old ⇒ past the 3600s railway lifetime
+// a meta record; defaults gha (not time-excluded) so phase-only tests are lifetime-independent. Pass overrides for lifetime tests.
+const meta = (id: string, phase: string | undefined, over: Record<string, unknown> = {}) =>
+  ({ id, ...(phase === undefined ? {} : { phase }), mode: "keyed", backend: "gha", createdSec: FRESH, addrFile: `/x/${id}.addr`, ...over });
+
+// three-state: dir-read error (metas null) ⇒ unknown; dir ok ⇒ confirmed ⇒ ok, else empty
+t("fleet: metas null (dir read error) -> unknown (PL-2; never fabricate empty/capacity)", fleetFromMetas(null, NOW).status === "unknown");
+t("fleet: dir ok, no metas -> empty (advise full demand)", fleetFromMetas([], NOW).status === "empty");
+// PL-1: reserved / requesting / running are in-flight / unproven ⇒ NOT counted
+t("PL-1: a reserved record is NOT live (excluded) -> empty", fleetFromMetas([meta("a", "reserved")], NOW).status === "empty");
+t("PL-1: requesting / running are NOT live (in-flight) -> empty", fleetFromMetas([meta("a", "requesting"), meta("b", "running")], NOW).status === "empty");
+{
+  const f = fleetFromMetas([meta("ready1", "ready"), meta("ready2", "ready")], NOW);
+  t("fleet: two phase:ready records -> ok, 2 live machines", f.status === "ok" && f.machines.length === 2);
+  t("fleet: confirmed machines are live but NOT ready (readiness unasserted)", f.status === "ok" && f.machines.every((m) => m.live === true && m.ready === false));
+}
+{
+  const f = fleetFromMetas([meta("r", "ready"), meta("x", "reserved"), meta("y", "running"), null, {}, { id: "", phase: "ready" }, "notamachine", meta("g", "bogusphase")], NOW);
+  t("PL-1: mixed metas -> only the committed one counts (reserved/running/garbled/garbage-phase excluded)", f.status === "ok" && f.machines.length === 1 && f.machines[0]!.id === "r");
+}
+// r4 PL-1 — LEGACY normalization (mirror vm-ssh): a record with NO phase = ready; NO backend = railway.
+t("r4 legacy: missing phase (legacy=ready), missing backend (legacy=railway), FRESH -> live", (() => {
+  const f = fleetFromMetas([{ id: "leg", createdSec: FRESH, addrFile: "/x/leg.addr" }], NOW); // no phase, no backend
+  return f.status === "ok" && f.machines.length === 1 && f.machines[0]!.id === "leg";
+})());
+t("r4 legacy: missing-phase BUT expired railway (legacy default) -> excluded (empty)", fleetFromMetas([{ id: "leg", createdSec: OLD, addrFile: "/x" }], NOW).status === "empty");
+// r4 PL-1 — LIFETIME (mirror vm-ssh): expired railway excluded; fresh railway kept; GHA never time-excluded.
+t("r4 lifetime: EXPIRED railway ready (7200s > 3600 TTL) -> excluded (empty)", fleetFromMetas([meta("rw", "ready", { backend: "railway", createdSec: OLD })], NOW).status === "empty");
+t("r4 lifetime: FRESH railway ready -> live", (() => { const f = fleetFromMetas([meta("rw", "ready", { backend: "railway", createdSec: FRESH })], NOW); return f.status === "ok" && f.machines.length === 1; })());
+t("r4 lifetime: EXPIRED GHA ready -> STILL live (GHA TTL is an estimate, not termination)", (() => { const f = fleetFromMetas([meta("g", "ready", { backend: "gha", createdSec: OLD })], NOW); return f.status === "ok" && f.machines.length === 1; })());
+t("r4 lifetime: railway with non-finite createdSec -> NOT excluded (mirror vm-ssh NaN remainingSec) ", (() => { const f = fleetFromMetas([meta("rw", "ready", { backend: "railway", createdSec: "x" })], NOW); return f.status === "ok" && f.machines.length === 1; })());
+t("vmIdToView: live=true (confirmed), ready=false, idle 0, remaining null, inFlight 0", (() => {
+  const v = vmIdToView("x");
+  return v.id === "x" && v.live === true && v.ready === false && v.idleSec === 0 && v.remainingSec === null && v.inFlight === 0;
+})());
+// PL-1 regression: ready=false ⇒ a confirmed machine is NEVER a surplus-reclaim candidate, even at reclaimIdleSec=0 + demand 0
+t("PL-1: confirmed machine at reclaimIdleSec=0 + demand 0 -> NO reclaim advised (unknown readiness never reclaims)", (() => {
+  const sug = planPlacementSuggest(specOf({ demand: { boardUnits: 0, fanoutMachines: 0 }, cfg: { perMachineCapacity: 1, floor: 0, reclaimIdleSec: 0, expiringSec: 30, minDwellSec: 0 } }), [vmIdToView("m1")]);
+  return sug.reclaims === 0 && sug.rebuilds === 0 && sug.hasContent === false;
+})());
+// PL-1 regression: a fleet read NEVER yields reclaim/rebuild (only spawn shortfall)
+t("PL-1: any fleet read advises only SPAWN, never reclaim/rebuild (demand 2, 5 live -> no reclaim of the 3 surplus)", (() => {
+  const f = fleetFromMetas([meta("a", "ready"), meta("b", "ready"), meta("c", "ready"), meta("d", "ready"), meta("e", "ready")], NOW);
+  if (f.status !== "ok") return false;
+  const sug = planPlacementSuggest(specOf({ demand: { boardUnits: 2, fanoutMachines: 0 }, cfg: { perMachineCapacity: 1, floor: 0, reclaimIdleSec: 0, expiringSec: 30, minDwellSec: 0 } }), f.machines);
+  return sug.reclaims === 0 && sug.rebuilds === 0;
+})());
+// PL-1 regression: a reserved-only dir ⇒ empty ⇒ caller advises the FULL demand
+t("PL-1: reserved-only fleet + demand 1 -> empty ⇒ full demand (reserved never counts as capacity)", (() => {
+  const f = fleetFromMetas([meta("resv", "reserved")], NOW);
+  if (f.status !== "empty") return false;
+  const sug = planPlacementSuggest(specOf({ demand: { boardUnits: 1, fanoutMachines: 0 }, budgetMicroUsd: 100_000_000 }), []);
+  return sug.spawnFunded === 1;
+})());
+// integration: confirmed machines reduce the spawn shortfall (demand 10, 3 live ⇒ advise spawn 7) — the point of 接真
+t("fleet -> reconcile: 3 confirmed machines reduce the shortfall (demand 10 -> funded 7)", (() => {
+  const f = fleetFromMetas([meta("a", "ready"), meta("b", "ready"), meta("c", "ready")], NOW);
+  if (f.status !== "ok") return false;
+  const sug = planPlacementSuggest(specOf({ budgetMicroUsd: 100_000_000 }), f.machines);
+  return sug.spawnFunded === 7;
+})());
+t("fleet three facts DISTINCT: empty (full demand) vs unknown (dir error, skip) vs reserved-only (empty, not unknown)", (() => {
+  return fleetFromMetas([], NOW).status === "empty" && fleetFromMetas(null, NOW).status === "unknown" && fleetFromMetas([meta("a", "reserved")], NOW).status === "empty";
+})());
 
 console.log("all placement-engine selftests passed");
