@@ -14,6 +14,7 @@
  * a money gate that belongs to the user, R16).
  */
 
+import { flagDefaultOn } from "./flag-default.js";
 import type { ModelTier } from "./task-plan.js";
 
 // ============================================================================================================
@@ -305,9 +306,11 @@ import { readdir, readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-/** `review-seat-autoscale` on, default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT). */
+/** `review-seat-autoscale` — LIVE BY DEFAULT (opt-out via [[flagDefaultOn]], user ruling 2026-10-10): on unless
+ *  SWARM_REVIEW_AUTOSCALE is explicitly OFF (`=0`). Still SUGGESTION-only (never auto-spawns); the kill-switch disables the sweep's
+ *  autoscale advice. (Was opt-in default-OFF while dormant.) */
 export function autoscaleEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env.SWARM_REVIEW_AUTOSCALE ?? "");
+  return flagDefaultOn(env.SWARM_REVIEW_AUTOSCALE);
 }
 
 export function reviewQueueDir(home: string = homedir()): string {

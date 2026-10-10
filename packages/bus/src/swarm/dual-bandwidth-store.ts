@@ -22,6 +22,7 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, statSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
+import { flagDefaultOn } from "./flag-default.js";
 import { readBatch, readDecisions } from "./decision-batch-store.js";
 import { resolveBatch, validDecisionsDoc, type DecisionsDoc } from "./decision-batch.js";
 import { computeDualBandwidth, mergeProduceEvents, submitDigest, type DualBandwidthReading, type DualBandwidthConfig } from "./dual-bandwidth.js";
@@ -81,17 +82,18 @@ function readBoundDoc(file: string, id: string): DecisionsDoc | null {
 
 function inboxRoot(home: string): string { return path.join(home, ".agenthop", "inbox"); }
 
-/** submit-tag dormant gate (SWARM_SUBMIT_TAG, default OFF, dormant-ahead-of-use like SWARM_BOARD_ADMIT). OFF ⇒
+/** submit-tag dormant gate (SWARM_SUBMIT_TAG, default OFF, dormant-ahead-of-use like SWARM_VM_CTL). OFF ⇒
  *  collectBandwidthEvents keeps the v0 decision-batch-only behavior byte-for-byte; ON ⇒ the tagged-submit secondary source +
  *  foldedFrom de-dup activate. */
 export function submitTagEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return /^(1|true|yes|on)$/i.test(env.SWARM_SUBMIT_TAG ?? "");
 }
 
-/** T5-2 DEFERRED seam — gauge timed-sampling dormant gate (SWARM_GAUGE_SAMPLING, default OFF, dormant-ahead-of-use like
- *  SWARM_BOARD_ADMIT). OFF ⇒ the dispatcher never auto-writes gauge.json (unchanged v0: the gauge refreshes only on a manual run). */
+/** T5-2 gauge timed-sampling — LIVE BY DEFAULT (opt-out via [[flagDefaultOn]], user ruling 2026-10-10): the dispatcher
+ *  auto-writes gauge.json on the sweep unless SWARM_GAUGE_SAMPLING is explicitly OFF (`=0`), which reverts to v0 (manual refresh
+ *  only). (Was opt-in default-OFF while dormant.) */
 export function gaugeSamplingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env.SWARM_GAUGE_SAMPLING ?? "");
+  return flagDefaultOn(env.SWARM_GAUGE_SAMPLING);
 }
 
 /** T5-2 seam — pure throttle for the dispatcher's gauge sampler: the sweep ticks faster than the sample interval, so each tick

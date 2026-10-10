@@ -24,6 +24,9 @@ const allowFile = (): string => path.join(tgDir(), "allow.json");
 const offsetFile = (): string => path.join(tgDir(), "offset");
 const notifiedFile = (): string => path.join(tgDir(), "notified-batches.json");
 
+// EXCEPTION to the 2026-10-10 "flags default ON" ruling: SWARM_TG_ENTRY stays OPT-IN (default OFF). The bridge needs a
+// user-seeded bot token + allow-list; defaulting ON would spin an errored bridge on every host with no token. So this keeps the
+// opt-in reader (NOT flagDefaultOn) — the user must explicitly start the bridge (v1 red line: "user starts the bridge").
 const enabled = (env = process.env): boolean => /^(1|true|yes|on)$/i.test(env.SWARM_TG_ENTRY ?? "");
 
 function readToken(): string {

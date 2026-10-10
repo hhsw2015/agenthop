@@ -11,7 +11,7 @@
  *
  * Generalizes the proven `mint.ts` HMAC pattern (CPA eph-token) and ADDS the verify half (the gate execution points
  * call). Pure mint/verify above the line (selftested); the dispatcher-secret reader (IO) below. The two wiring points —
- * ISSUE at spawn, VERIFY at execution — are dormant until separately flipped (like SWARM_BOARD_ADMIT); this module
+ * ISSUE at spawn, VERIFY at execution — are dormant until separately flipped (like SWARM_VM_CTL); this module
  * changes no existing runtime.
  *
  * HARD BOUNDARY (unchanged stance): a `cap` proves DISPATCHER authorization, NOT user authorization. For the three
@@ -144,7 +144,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
-/** `seat-identity-caps` wiring flip, default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT). */
+/** `seat-identity-caps` wiring flip, default OFF (dormant-ahead-of-use, like SWARM_VM_CTL). */
 export function seatCapsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return /^(1|true|yes|on)$/i.test(env.SWARM_SEAT_CAPS ?? "");
 }

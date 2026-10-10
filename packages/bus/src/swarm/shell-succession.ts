@@ -13,8 +13,8 @@
  * HMAC and alias the roster). Fail-closed: anything short of proof ⇒ "fresh" (come up as a new identity, never hijack the
  * stable slot); a live other incumbent ⇒ "reject" (two live claimants must never both bind the one identity).
  *
- * Pure core below (selftested); the IO shell that gathers the attestation + rewrites the presence pid is dormant
- * (`SWARM_SUCCESSION` off).
+ * Pure core below (selftested); the IO shell that gathers the attestation + rewrites the presence pid is LIVE BY DEFAULT
+ * (opt-out — `SWARM_SUCCESSION=0` is the kill-switch; user ruling 2026-10-10).
  */
 
 // ============================================================================================================
@@ -133,17 +133,19 @@ export function presencePidRelPath(stableSid: string): string {
 }
 
 // ============================================================================================================
-// IO shell — gather the attestation + rewrite the presence pid (dormant: SWARM_SUCCESSION off; exercised by live runs)
+// IO shell — gather the attestation + rewrite the presence pid (LIVE BY DEFAULT; kill with SWARM_SUCCESSION=0)
 // ============================================================================================================
 
-/** shell-succession wiring flip, default OFF (dormant-ahead-of-use). */
+/** shell-succession — LIVE BY DEFAULT (opt-out via [[flagDefaultOn]], user ruling 2026-10-10): on unless SWARM_SUCCESSION is
+ *  explicitly OFF (`SWARM_SUCCESSION=0`) — the kill-switch. (Was opt-in default-OFF while dormant.) */
 export function successionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env.SWARM_SUCCESSION ?? "");
+  return flagDefaultOn(env.SWARM_SUCCESSION);
 }
 
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { flagDefaultOn } from "./flag-default.js";
 import { ROSTER_FILE, type RosterMember } from "./resume.js";
 import { makeFileLiveness, probeSessionLiveness } from "./task-liveness.js";
 import { acquireHolderLock, releaseHolderLock, type LockSite } from "./holder-lock.js";
@@ -280,7 +282,7 @@ export function adoptLockSite(home: string, sid: string): LockSite {
 }
 
 /**
- * Bus-core-init / presence-startup consumption point (dormant: SWARM_SUCCESSION off). Gather this shell's attestation — the
+ * Bus-core-init / presence-startup consumption point (LIVE BY DEFAULT; kill with SWARM_SUCCESSION=0). Gather this shell's attestation — the
  * binding credential (resume target) comes from the AGENT's OWN argv via ps on `hostPid` (coordinator ruling a: argv is the
  * truest source; not a relayable file / not the roster snapshot) — plan succession against the roster snapshot, and on "adopt"
  * TAKE OVER the stable sid's presence slot (write presence/<sid>.pid), returning the adopted sid so the caller does

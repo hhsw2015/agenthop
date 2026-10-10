@@ -29,6 +29,7 @@
  * is DEFERRED under coordinator ruling #R14 — a hard precondition before SWARM_BOARD_ADMIT is ever flipped on (tracked with
  * envelope-open + §2d-c ping).
  */
+import { flagDefaultOn } from "./flag-default.js";
 import type { TaskPlan } from "./task-plan.js";
 import { readyTasks, type ReadyTask } from "./task-ready.js";
 import type { TaskAttempt, ExecutionBinding } from "./task-state.js";
@@ -428,8 +429,8 @@ export function isValidItemId(itemId: string): boolean {
   return itemId.length > 0 && !itemId.includes(".") && !itemId.includes("/") && !/\s/.test(itemId);
 }
 
-/** The dormancy gate (coordinator boundary #1): board admission is OFF unless SWARM_BOARD_ADMIT is explicitly truthy. Same
- *  pattern as SWARM_EXEC/SWARM_TASK_EXEC/SWARM_SWEEP. Nothing in this batch sets it; turning it on is the A2 gate. */
+/** Board admission gate — LIVE BY DEFAULT (opt-out, user ruling 2026-10-10 via [[flagDefaultOn]]): on unless SWARM_BOARD_ADMIT
+ *  is explicitly OFF (`SWARM_BOARD_ADMIT=0`). Kill-switch, not a turn-on. (Was opt-in default-OFF while dormant-ahead-of-use.) */
 export function boardAdmitEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env.SWARM_BOARD_ADMIT ?? "");
+  return flagDefaultOn(env.SWARM_BOARD_ADMIT);
 }

@@ -123,7 +123,7 @@ export function pipelineOrder(pipeline: ForcePipeline): string[] {
   return kahnOrder(nodeOrder, adj) ?? []; // validated ⇒ never a cycle; [] only for an empty pipeline
 }
 
-/** Dormant wiring flip, default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT). T3/dispatch force-dispatches successors only when on. */
+/** Dormant wiring flip, default OFF (dormant-ahead-of-use, like SWARM_VM_CTL). T3/dispatch force-dispatches successors only when on. */
 export function forcePipelineEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return /^(1|true|yes|on)$/i.test(env.SWARM_FORCE_PIPELINE ?? "");
 }

@@ -280,13 +280,12 @@ describe("task-board planClaimAdmission (§2d-b admit v3: consistent-cut + job-i
   });
 });
 
-describe("task-board dormancy gate (coordinator boundary #1: default OFF)", () => {
-  test("SWARM_BOARD_ADMIT default-off; only explicit truthy enables", () => {
-    expect(boardAdmitEnabled({})).toBe(false);
-    expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: "" })).toBe(false);
-    expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: "0" })).toBe(false);
-    expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: "off" })).toBe(false);
-    for (const v of ["1", "true", "yes", "on", "ON", "True"]) expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: v })).toBe(true);
+describe("task-board admission gate (coordinator boundary #1: LIVE BY DEFAULT, opt-out — user ruling 2026-10-10)", () => {
+  test("SWARM_BOARD_ADMIT default-ON; only an explicit negation disables", () => {
+    expect(boardAdmitEnabled({})).toBe(true);                             // unset ⇒ ON (flipped)
+    expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: "" })).toBe(true);      // empty ⇒ ON
+    for (const off of ["0", "false", "no", "off", "OFF", "Off"]) expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: off })).toBe(false); // explicit kill
+    for (const v of ["1", "true", "yes", "on", "garbage"]) expect(boardAdmitEnabled({ SWARM_BOARD_ADMIT: v })).toBe(true);          // non-negation ⇒ ON
   });
 });
 

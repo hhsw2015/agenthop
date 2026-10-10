@@ -305,10 +305,10 @@ describe("dual-bandwidth IO store — submit-tag secondary source (SWARM_SUBMIT_
   });
 
   describe("T5-2 gauge timed-sampling seam (gaugeSamplingEnabled + shouldSampleGauge)", () => {
-    test("gaugeSamplingEnabled default OFF; truthy words ON", () => {
-      expect(gaugeSamplingEnabled({})).toBe(false);
-      expect(gaugeSamplingEnabled({ SWARM_GAUGE_SAMPLING: "0" })).toBe(false);
-      for (const on of ["1", "true", "yes", "on", "YES"]) expect(gaugeSamplingEnabled({ SWARM_GAUGE_SAMPLING: on })).toBe(true);
+    test("gaugeSamplingEnabled LIVE BY DEFAULT (opt-out, user ruling 2026-10-10); only explicit negation disables", () => {
+      expect(gaugeSamplingEnabled({})).toBe(true);                                 // unset ⇒ ON (flipped)
+      for (const off of ["0", "false", "no", "off", "OFF"]) expect(gaugeSamplingEnabled({ SWARM_GAUGE_SAMPLING: off })).toBe(false); // explicit kill
+      for (const on of ["1", "true", "yes", "on", "garbage"]) expect(gaugeSamplingEnabled({ SWARM_GAUGE_SAMPLING: on })).toBe(true); // non-negation ⇒ ON
     });
     test("shouldSampleGauge: first sample fires, then throttles until the interval elapses (>= boundary)", () => {
       expect(shouldSampleGauge(1_000_000, 0, 60)).toBe(true);        // first ever (last=0) ⇒ sample

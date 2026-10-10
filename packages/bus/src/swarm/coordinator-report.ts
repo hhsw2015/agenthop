@@ -8,13 +8,15 @@
  * that) a herdr send-text to the coordinator's pane. Only when neither surface exists does it fall to a log, and that case
  * is reported honestly as a NON-report (isReport=false) so the caller knows the notice went unheard.
  *
- * Pure decision below (selftested); wiring the escalation into the dispatcher's notifyCoordinator is dormant
- * (`SWARM_COORD_ESCALATE` off) so the live default is unchanged until the merge gate turns it on.
+ * Pure decision below (selftested); wiring the escalation into the dispatcher's notifyCoordinator is LIVE BY DEFAULT
+ * (opt-out — `SWARM_COORD_ESCALATE=0` reverts to log-only escalation; user ruling 2026-10-10).
  */
 
 // ============================================================================================================
 // Pure core (selftested in coordinator-report.selftest.mts)
 // ============================================================================================================
+
+import { flagDefaultOn } from "./flag-default.js";
 
 export type ReportSurface = "inbox" | "s19" | "herdr-pane" | "log";
 
@@ -50,10 +52,11 @@ export function coordinatorReportPlan(opts: { coordinatorResolved: boolean; s19A
 }
 
 // ============================================================================================================
-// IO shell — wiring the escalation into notifyCoordinator (dormant: SWARM_COORD_ESCALATE off; exercised by live runs)
+// IO shell — wiring the escalation into notifyCoordinator (LIVE BY DEFAULT; kill with SWARM_COORD_ESCALATE=0)
 // ============================================================================================================
 
-/** coordinator-escalation wiring flip, default OFF (dormant-ahead-of-use; live default stays log-only until the gate). */
+/** coordinator-escalation — LIVE BY DEFAULT (opt-out via [[flagDefaultOn]], user ruling 2026-10-10): on unless
+ *  SWARM_COORD_ESCALATE is explicitly OFF (`=0`), which reverts to log-only escalation. (Was opt-in default-OFF while dormant.) */
 export function coordEscalateEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env.SWARM_COORD_ESCALATE ?? "");
+  return flagDefaultOn(env.SWARM_COORD_ESCALATE);
 }
