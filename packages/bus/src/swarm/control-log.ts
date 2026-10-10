@@ -35,6 +35,7 @@ import type { TaskPlan } from "./task-plan.js";
 import type { TaskAttempt } from "./task-state.js";
 import type { AcceptedResult } from "./task-result.js";
 import type { ControlRecord } from "./control.js";
+import type { PermissionDecision } from "./approval-delegation.js";
 
 /** Dispatch intent (§4.3). Type lives HERE (co-located with Change); the dispatch side imports it and owns the
  *  CONSTRUCTION logic (allocOutcome / physicalEvidence / physicalExpiresAtSec CAS-then-IO semantics). */
@@ -172,7 +173,12 @@ export type ChangeBody =
   | { put: "validationRun"; validationRun: ValidationRun }
   | { put: "lifecycle"; record: ControlRecord }
   | { put: "scan"; branch: string; cursor: string | null }
-  | { put: "tombstone"; launchId: string };
+  | { put: "tombstone"; launchId: string }
+  // approval-delegation ② 留痕: a coordinator's delegated permission decision, keyed by the member's Claude prompt_id. One
+  // write serves BOTH the audit trail AND the hook's flowback (the sync permission-gate hook polls this entity by promptId and
+  // applies `behavior`). v1 writes it only for a DELEGATE (behavior "allow"); an escalation writes none (the hook times out to
+  // the user). Additive (FC-7): old records lack it; the projection stores it last-write-wins by `permissionDecision:<promptId>`.
+  | { put: "permissionDecision"; permissionDecision: PermissionDecision };
 
 /** Each Change carries its operation identity (§2.6): a globally-unique operationId and the entityRevision the caller
  *  believed the target entity was at. */
@@ -213,6 +219,7 @@ export function entityKeyOf(c: ChangeBody): string {
     case "lifecycle": return `lifecycle:${c.record.launchId}`;
     case "scan": return `scan:${c.branch}`;
     case "tombstone": return `tombstone:${c.launchId}`;
+    case "permissionDecision": return `permissionDecision:${c.permissionDecision.promptId}`;
   }
 }
 
