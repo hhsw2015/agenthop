@@ -98,8 +98,9 @@ export function buildRoundDoctorNote(taskRef: string, v: RoundDoctorVerdict): st
 //    ("placement_ledger …"), and a line whose subject is another ticket all FAIL the header, with no keyword blocklist (RD-1/RD-2);
 //  - the round number is a bounded 1..999 integer; a pathological/overflowing number is not a round, and only a BOUNDED last-K
 //    window is materialised — never a 1..maxRound array sized by an unchecked external value (RD-4);
-//  - CLEARED is TICKET-level only (终审, or remain === 0), never a sub-finding "RD-1 CLEARED" (RD-1); a round whose remain can't be
-//    read stays UNKNOWN (-1), never dropped; REMAIN is sign-/conditional-safe and a finding tally is not summed (RD-3); a body
+//  - a ticket is "cleared" ONLY when its REMAIN parsed to 0 — a CLEARED keyword never participates (it may be a sub-finding like
+//    "RD-1 CLEARED" and must never override a positive remain) (RD-1); a round whose remain can't be read stays UNKNOWN (-1),
+//    never dropped; REMAIN is sign-/conditional-safe and a finding tally is not summed (RD-3); a body
 //    that names ANOTHER known ticket makes this round's metric UNKNOWN (never cross-attributed) while the round still counts (RD-2).
 // ------------------------------------------------------------------------------------------------------------------------
 
@@ -154,8 +155,8 @@ export function parseNewPSafe(line: string): number {
 /**
  * Parse ONE rendered verdict for `ticket` from a line, or null. The line (after leading markup) MUST START with the ticket
  * (id-boundary) followed by a round-verb: `首审` (round 1), `rN 判` (round N, N ≤ 999), or `终审` (a final verdict; its round is
- * the `rN` found on the line, if any). The body is ignored for subject/round/clear. round < 1 (unplaceable) ⇒ null. CLEARED counts
- * only for a 终审 verb or a literal `0 REMAIN`, never a sub-finding `RD-1 CLEARED`. Pure. */
+ * the `rN` found on the line, if any). The body is ignored for subject/round. round < 1 (unplaceable) ⇒ null. A CLEARED keyword
+ * is NOT read at all — "cleared" is derived later solely from remain===0, so a sub-finding `RD-1 CLEARED` never clears. Pure. */
 export function parseVerdictLine(line: string, ticket: string): { round: number; remain: number; newP: number } | null {
   const head = stripLeadMarkup(line);
   const m = new RegExp(`^${escapeRegExp(ticket)}(?![${TICKET_EDGE}])\\s+(首审|终审|r\\d{1,3}\\s*(?:判|终审))(?![${TICKET_EDGE}])`).exec(head);
@@ -180,7 +181,7 @@ export interface TicketRounds {
  * Reconstruct a ticket's round state from PROGRESS `lines` (oldest→newest). `otherTickets` = ALL other KNOWN tickets (open OR
  * done) — a line whose body also names one makes this round's METRIC unknown (never cross-attributed), independent of that
  * ticket's current done/open status. Rounds are keyed by the header's round number (same-round mentions merge, preferring a known
- * metric + a CLEARED fact). Only a BOUNDED window of the last `cfg.degradeWindow` rounds is materialised; `rounds` is the max
+ * remain/newP). Only a BOUNDED window of the last `cfg.degradeWindow` rounds is materialised; `rounds` is the max
  * round number (≤ MAX_ROUND). Pure; never allocates by an unchecked number. */
 export function extractTicketRounds(lines: readonly string[], ticket: string, otherTickets: readonly string[] = [], cfg: RoundDoctorConfig = DEFAULT_ROUND_DOCTOR_CONFIG): TicketRounds {
   const byRound = new Map<number, RoundRecord>();
