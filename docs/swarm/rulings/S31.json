@@ -1,0 +1,10 @@
+{
+  "id": "S31",
+  "series": "S",
+  "title": "双通道尸件结晶:耐久箱载全文,队列只作唤醒 ping",
+  "status": "active",
+  "by": "coordinator",
+  "statement": "复盘 archive-dead-boxes-20261009 尸件样本:消息死亡的共因是内容骑易逝通道(总线队列)而非持久通道(耐久箱)——收方离线/消失/sid 变更/重复时,队列内容无处落地即死(already-reviewed-da2r6b=收方已审且 sid 变更的冗余件、b8-1-dup=重复件、5 个消失席位的收件箱残件)。裁定:①全文永远写耐久箱(writeInbox:持久、抗离线/重启/sid 变、可归档重放);②总线/队列仅作『你有新件』唤醒 ping=加速器,绝不承载内容;③send 成功≠内容已达(对方会话可能离线/拒收/过期),唯耐久箱落盘=事实。续 S14 七字段信封(全文结构)与 S29 一单两信(耐久箱为记录、总线为加速)。防复发检查点见 docs/swarm/dual-channel-protocol.md。",
+  "relates": ["S14", "S29"],
+  "sources": ["docs/swarm/dual-channel-protocol.md", "~/.agenthop/swarm/archive-dead-boxes-20261009/"]
+}
