@@ -1700,14 +1700,14 @@ async function main(): Promise<void> {
         if (notified.kind === "pending" && !notified.body && notified.date === today) { log(`morning digest: legacy date-only notify marker (${notified.date}) — retained for migration, not auto-resent`); return; }
         const p = readDigestProjection(HOME);
         if (p.kind !== "valid" || p.date !== today) return; // the frozen body is not on disk yet (projection write failed) ⇒ retry
+        // MD-R7-P2-2: a LEGACY date-only marker from an EARLIER day is the only record of that day's un-migrated obligation. EVERY
+        // branch below overwrites notified.json via markNotified (the no-target branch too), so durably ARCHIVE it FIRST (per-date,
+        // append-only). If the archive can't persist, do NOT overwrite — keep the old marker recoverable and retry next tick.
+        if (notified.kind === "pending" && !notified.body && notified.date !== today && !archiveLegacyMigration(HOME, notified.date)) return;
         const coord = process.env.SWARM_COORDINATOR;
         if (!coord || !coord.trim()) { markNotified(HOME, today, "sent", p.projection); return; } // no coordinator ⇒ no target; the projection is the artifact
         const coordSid = resolveSession(coord, listSessions(HOME));
         if (!coordSid) return; // coordinator not resolvable on this machine yet ⇒ retry (leave none/pending)
-        // MD-R7-P2-2: a LEGACY date-only marker from an EARLIER day is the only record of that day's un-migrated obligation; the
-        // markNotified below overwrites notified.json, so durably ARCHIVE it first (per-date, append-only). If the archive can't
-        // persist, do NOT overwrite — keep the old marker recoverable and retry next tick.
-        if (notified.kind === "pending" && !notified.body && notified.date !== today && !archiveLegacyMigration(HOME, notified.date)) return;
         if (!markNotified(HOME, today, "pending", p.projection)) return; // MD-P2-1: claim + freeze the body BEFORE sending; if it can't persist, do NOT send (retry)
         try {
           // MD-P2-1: the durable-first credential makes writeInbox exactly-once across the coordinator's claim/ack/restart. Confirm
