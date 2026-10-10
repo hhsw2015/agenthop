@@ -207,7 +207,7 @@ function pathsScopeOk(pathArgs: string[], scope?: ApprovalScope): boolean {
     const entries = scope.resolvedPaths.filter(r => r.raw === p);
     if (entries.length === 0) return false;                                           // no fact for this operand
     if (entries.some(r => !r.resolvedWithinCwd || r.resolvedSensitive)) return false; // ANY escape/credential fact wins, order-
-    // independent — a contradictory pair never delegates by array position (AD-R3-P2-1; validApprovalScope also rejects dup raw)
+    // independent — validApprovalScope KEEPS duplicate raws and this deny-sticky merge resolves them (AD-R3-P2-1; AD-R4-N1)
   }
   return true; // pathArgs empty (e.g. `ls` listing cwd) ⇒ vacuously within cwd once cwdVerified
 }

@@ -22,7 +22,7 @@ stays inside the member cwd**. Three laws:
    filesystem; the hook supplies the facts (`ApprovalScope`) in the IO round. Until then path forms fail closed.
 3. **Fail-closed + allow-only.** Unknown → user. v1 delegates allow only; a deny always reaches the user (auto-deny is v2).
 
-Narrow is the point: the north star is fewer popups, and the handful of fixed forms below (status / log / ls / cat …) already
+Narrow is the point: the north star is fewer popups, and the handful of fixed forms below (`ls` / `cat` / `pwd` …) already
 covers the bulk of them.
 
 ## Gate order (planDelegation, then classifyApproval applies facts)
