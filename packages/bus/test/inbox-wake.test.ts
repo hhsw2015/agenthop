@@ -32,13 +32,13 @@ describe("inbox-wake — claimWakeSlot (先占后发, cross-process atomic)", ()
     expect(claimWakeSlot(HOME, "..", w(8), COOL)).toBe(true);      // reserved-dot sid hashed to a safe filename (no traversal)
     expect(claimWakeSlot(HOME, "c", NaN, COOL)).toBe(false);       // fail-safe
   });
-  test("IW-P2-1: a GC'd old window re-claimed late is rejected by the family MAX (cleanup never re-admits)", () => {
-    expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);
-    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);       // family max ⇒ 9
+  test("IW-P2-1: a GC'd old generation re-claimed late is rejected by the high-water MAX (cleanup never re-admits)", () => {
+    expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);       // gen0 (ts 8)
+    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);       // gen1 (ts 9) ⇒ high-water 9
     const safe = createHash("sha256").update("c").digest("hex");
-    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.w${COOL}.8`), { force: true }); // simulate cleanup removing window 8
-    expect(claimWakeSlot(HOME, "c", w(8) + 5, COOL)).toBe(false);  // late window-8: reopened slot, but family max 9 rejects it
-    expect(claimWakeSlot(HOME, "c", w(10), COOL)).toBe(true);      // a genuinely newer window still claims
+    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.gen0`), { force: true }); // simulate cleanup removing the older generation
+    expect(claimWakeSlot(HOME, "c", w(8) + 5, COOL)).toBe(false);  // a late ts-8 claim: the gen1 timestamp (9) is still the authority ⇒ rejects
+    expect(claimWakeSlot(HOME, "c", w(10), COOL)).toBe(true);      // a genuinely newer claim still wins (new generation)
   });
 
   test("IW-R4-P2-1: a cooldown parameter change does not let old window numbers block new wakes", () => {
@@ -82,19 +82,17 @@ describe("inbox-wake — claimWakeSlot (先占后发, cross-process atomic)", ()
     expect(claimWakeSlot(HOME, "c", w(15), COOL)).toBe(true);       // recovers after the faults clear
   });
 
-  test("IW-P2-1 (r7): a single per-sid gate unifies admit+occupy — a fresh concurrent gate blocks a would-be-admitted claim; a stale one is stolen", () => {
+  test("IW-P2-1 (r8): generation chain replaces the stealable gate — a newer gen's recent ts blocks; an old gen never permanently blocks (no steal/age)", () => {
     const dir = path.join(HOME, ".agenthop/console/inbox-wake"); mkdirSync(dir, { recursive: true });
     const safe = createHash("sha256").update("c").digest("hex");
-    const gate = path.join(dir, `${safe}.gate`);
-    writeFileSync(path.join(dir, `${safe}.w${COOL}.0`), "0");                 // old marker ⇒ time-admit alone WOULD pass
-    writeFileSync(gate, "other.holder", { flag: "wx", mode: 0o600 });         // a concurrent holder mid-decision (fresh gate)
-    expect(claimWakeSlot(HOME, "c", 10 * COOL, COOL)).toBe(false);            // the gate alone blocks it (the per-window O_EXCL could not)
-    rmSync(gate, { force: true });
-    expect(claimWakeSlot(HOME, "c", 10 * COOL, COOL)).toBe(true);             // gate free ⇒ the admitted claim wins
-    expect(claimWakeSlot(HOME, "c", 30 * COOL, COOL)).toBe(true);             // gate is transient (released in finally), not a cooldown
-    writeFileSync(gate, "crashed.holder", { flag: "wx", mode: 0o600 });
-    const old = new Date(Date.now() - 120_000); utimesSync(gate, old, old);   // crashed holder, mtime past the stale ceiling
-    expect(claimWakeSlot(HOME, "c", 60 * COOL, COOL)).toBe(true);             // stale gate stolen ⇒ never a permanent block
+    // A concurrent claimer already advanced the chain: gen0 (old) + gen1 (recent). A claim the time-admit would pass on gen0 alone still
+    // yields — the newest generation's recent timestamp is the high-water, so no interleaving injects twice and there is no lock to steal.
+    writeFileSync(path.join(dir, `${safe}.gen0`), String(w(0)));
+    writeFileSync(path.join(dir, `${safe}.gen1`), String(w(9)));
+    expect(claimWakeSlot(HOME, "c", w(9) + 1, COOL)).toBe(false);             // within cooldown of gen1 ⇒ yield
+    expect(claimWakeSlot(HOME, "c", w(10), COOL)).toBe(true);                 // a full cooldown past gen1 ⇒ admits (new generation)
+    // A crashed holder left only OLD generation markers: no gate to steal, no age to wait out — the next past-cooldown claim just wins.
+    expect(claimWakeSlot(HOME, "c", w(200), COOL)).toBe(true);                // far past ⇒ admits again; a stalled/crashed holder never blocks forever
   });
 });
 

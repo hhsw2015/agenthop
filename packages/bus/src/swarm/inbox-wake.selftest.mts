@@ -1,6 +1,6 @@
 // Standalone FC-6 (deterministic decision + 先占后发 claim) / FC-7 (hook unset = byte-for-byte v0 delivery) selftest for the inbox
 // real-time wake. Run: tsx packages/bus/src/swarm/inbox-wake.selftest.mts
-import { mkdtempSync, rmSync, readdirSync, writeFileSync, mkdirSync, chmodSync, utimesSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -21,34 +21,34 @@ ok(shouldInjectWake(1e6, 1e6 - COOL, "idle", 3, COOL) === true, "at cooldown bou
 ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite clock ⇒ fail-safe no");
 { let same = true; for (let i = 0; i < 1000; i++) if (shouldInjectWake(5e6, 4e6, "idle", 2, COOL) !== true) same = false; ok(same, "FC-6: 1000x same inputs ⇒ identical output (no clock/IO inside)"); }
 
-// 先占后发 — the atomic filesystem claim (cross-process cooldown + monotonic stale-window gate).
+// 先占后发 — the atomic filesystem claim as a monotonic GENERATION chain (cross-process cooldown; admit and occupy share one anchor).
 {
   const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakeclaim-"));
   const w = (n: number) => n * COOL; // exact window-n timestamp
   try {
-    ok(claimWakeSlot(HOME, "c", w(8), COOL) === true, "claimWakeSlot: first claim of window 8 wins");
-    ok(claimWakeSlot(HOME, "c", w(8) + 1, COOL) === false, "claimWakeSlot: a 2nd claim of the SAME window (another process) loses");
-    ok(claimWakeSlot(HOME, "c", w(9), COOL) === true, "claimWakeSlot: the next window (9) claims again (advances high-water)");
-    ok(claimWakeSlot(HOME, "c", w(8) + 2, COOL) === false, "claimWakeSlot: a late window-8 re-claim with the marker still present ⇒ EEXIST reject");
-    // IW-P2-1 cross-window interleave: simulate GC/cleanup removing window 8's marker, then a LATE window-8 request resuming.
+    ok(claimWakeSlot(HOME, "c", w(8), COOL) === true, "claimWakeSlot: first claim wins (gen0, ts 8)");
+    ok(claimWakeSlot(HOME, "c", w(8) + 1, COOL) === false, "claimWakeSlot: a 2nd claim within the cooldown (another process) loses");
+    ok(claimWakeSlot(HOME, "c", w(9), COOL) === true, "claimWakeSlot: a full cooldown later claims again (gen1, advances high-water)");
+    ok(claimWakeSlot(HOME, "c", w(8) + 2, COOL) === false, "claimWakeSlot: a late ts-8 re-claim is rejected by the gen1 timestamp");
+    // IW-P2-1: simulate GC/cleanup removing the older generation's marker, then a LATE ts-8 request resuming.
     const safe = createHash("sha256").update("c").digest("hex");
-    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.w${COOL}.8`), { force: true });
-    ok(claimWakeSlot(HOME, "c", w(8) + 3, COOL) === false, "IW-P2-1: a REOPENED (GC'd) old window is rejected by the family MAX — cleanup cannot re-admit");
-    ok(claimWakeSlot(HOME, "c", w(10), COOL) === true, "claimWakeSlot: a genuinely newer window (10 > fam-max 9) still claims");
+    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.gen0`), { force: true });
+    ok(claimWakeSlot(HOME, "c", w(8) + 3, COOL) === false, "IW-P2-1: a GC'd old generation does not re-admit — the gen1 timestamp is still the authority");
+    ok(claimWakeSlot(HOME, "c", w(10), COOL) === true, "claimWakeSlot: a genuinely newer claim still wins (new generation)");
     ok(claimWakeSlot(HOME, "..", w(8), COOL) === true, "claimWakeSlot: a reserved-dot sid is a safe hashed filename (no traversal)");
     ok(claimWakeSlot(HOME, "c", NaN, COOL) === false, "claimWakeSlot: bad clock ⇒ fail-safe, no claim");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
-// IW-P2-1 the three hw holes the reviewer found, now closed at the root (no mutable hw file; markers ARE the high-water).
+// IW-P2-1 three holes closed at the root: the generation markers ARE the high-water (no mutable hw file, no stealable gate).
 {
   const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakehole-"));
   const w = (n: number) => n * COOL;
   const dir = path.join(HOME, ".agenthop/console/inbox-wake");
   try {
-    // ① concurrent-regression CONSEQUENCE: advance far, let GC drop old window markers, then a late GC'd window must NOT re-admit.
-    for (const n of [8, 9, 10, 11, 12]) ok(claimWakeSlot(HOME, "c", w(n), COOL) === true, `sequential claim window ${n}`);
-    ok(claimWakeSlot(HOME, "c", w(10) + 1, COOL) === false, "① a late request for a GC'd middle window (10) is rejected by MAX — no high-water regression re-admits it");
-    ok(claimWakeSlot(HOME, "c", w(9) + 1, COOL) === false, "① a late request for a GC'd window (9) is rejected by MAX");
+    // ① concurrent-regression CONSEQUENCE: advance far, let GC drop old generation markers, then a late GC'd slot must NOT re-admit.
+    for (const n of [8, 9, 10, 11, 12]) ok(claimWakeSlot(HOME, "c", w(n), COOL) === true, `sequential claim generation at ts ${n}`);
+    ok(claimWakeSlot(HOME, "c", w(10) + 1, COOL) === false, "① a late request at ts 10 is rejected by the high-water MAX — no regression re-admits it");
+    ok(claimWakeSlot(HOME, "c", w(9) + 1, COOL) === false, "① a late request at ts 9 is rejected by the high-water MAX");
     // ② read fault ≠ absent: an unreadable marker dir ⇒ UNKNOWN ⇒ fail-closed (reject), never treated as initial.
     chmodSync(dir, 0o000);
     try { ok(claimWakeSlot(HOME, "c", w(13), COOL) === false, "② readdir EACCES ⇒ UNKNOWN ⇒ reject (not treated as empty/initial)"); }
@@ -108,25 +108,25 @@ ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite cloc
     rmSync(HOME2, { recursive: true, force: true });
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
-// IW-P2-1 (r7): the admit TEST and the occupy share ONE anchor — a single per-sid gate `<sha>.gate`. A concurrent claim that is
-// mid-decision (gate present + fresh) makes a second claim YIELD even when the time-admit WOULD pass (stale max). This is the exact
-// two-concurrent hole the per-window O_EXCL could NOT catch: different windows/families ⇒ different files ⇒ both passed. A crashed
-// holder's gate is stolen after the stale ceiling, so the target is never permanently blocked.
+// IW-P2-1 (r8): the GENERATION chain replaces the stealable gate. The admit TEST and the occupy are the SAME anchor — the next
+// generation file (`<sha>.gen<N>`), so two claimers that observe the same state target the same file and O_EXCL admits exactly one; a
+// claimer that observes a newer generation also reads its recent timestamp and fails the admit. There is NO lock to steal, NO lease to
+// expire, NO recycle — so the r7 gate-recovery holes (paused-holder-stolen, late-recycler-deletes-fresh-gate, read-error-authorizes-steal)
+// vanish by construction. A crashed holder leaves a valid gen marker that just enforces the cooldown and is superseded next generation.
 {
-  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakegate-"));
+  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakegen-"));
   const dir = path.join(HOME, ".agenthop/console/inbox-wake"); mkdirSync(dir, { recursive: true });
   const safe = createHash("sha256").update("c").digest("hex");
-  const gate = path.join(dir, `${safe}.gate`);
+  const w = (n: number) => n * COOL;
   try {
-    writeFileSync(path.join(dir, `${safe}.w${COOL}.0`), "0");                 // an OLD marker ⇒ the time-admit (now - max >= cd) WOULD pass alone
-    writeFileSync(gate, "other.holder", { flag: "wx", mode: 0o600 });         // a live holder is mid-decision: a FRESH gate present
-    ok(claimWakeSlot(HOME, "c", 10 * COOL, COOL) === false, "IW-P2-1 r7: a fresh global gate (concurrent holder) blocks a claim the time-admit would ADMIT — occupy and admit share one anchor");
-    rmSync(gate, { force: true });                                            // the holder finished (released the gate) WITHOUT a newer marker
-    ok(claimWakeSlot(HOME, "c", 10 * COOL, COOL) === true, "IW-P2-1 r7: once the gate is free, the admitted claim wins and records");
-    ok(claimWakeSlot(HOME, "c", 30 * COOL, COOL) === true, "IW-P2-1 r7: the gate is transient (released in finally), not a persistent lock — a later admitted window still claims");
-    writeFileSync(gate, "crashed.holder", { flag: "wx", mode: 0o600 });       // a CRASHED holder left a gate behind...
-    const old = new Date(Date.now() - 120_000); utimesSync(gate, old, old);   // ...with an mtime far past the stale ceiling (real wall-clock)
-    ok(claimWakeSlot(HOME, "c", 60 * COOL, COOL) === true, "IW-P2-1 r7: a stale gate (crashed holder) is stolen ⇒ never a permanent block");
+    // a concurrent claimer already advanced the chain: gen0 (old) + gen1 (recent). A claim the time-admit would pass on gen0 alone still
+    // yields — the newest generation's recent timestamp is the high-water, so no interleaving injects twice and there is no lock to steal.
+    writeFileSync(path.join(dir, `${safe}.gen0`), String(w(0)));
+    writeFileSync(path.join(dir, `${safe}.gen1`), String(w(9)));
+    ok(claimWakeSlot(HOME, "c", w(9) + 1, COOL) === false, "IW-P2-1 r8: a newer generation's recent timestamp blocks a claim the time-admit would pass on the old generation alone");
+    ok(claimWakeSlot(HOME, "c", w(10), COOL) === true, "IW-P2-1 r8: a full cooldown past the newest generation admits (new generation)");
+    // a crashed holder left only OLD generation markers: no gate to steal, no age to wait out — the next past-cooldown claim simply wins.
+    ok(claimWakeSlot(HOME, "c", w(200), COOL) === true, "IW-P2-1 r8: a stalled/crashed holder's old generation never permanently blocks — a far-later claim admits");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
 
