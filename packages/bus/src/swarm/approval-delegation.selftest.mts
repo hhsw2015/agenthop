@@ -10,7 +10,7 @@ import {
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
 const req = (command: string, scope?: ApprovalScope, over: Partial<ApprovalRequest> = {}): ApprovalRequest =>
-  ({ member: "m1", tool: "Bash", command, cwd: "/w", promptId: "p1", nowSec: 1000, ...(scope ? { scope } : {}), ...over });
+  ({ requestId: "r1", member: "m1", tool: "Bash", command, cwd: "/w", promptId: "p1", nowSec: 1000, ...(scope ? { scope } : {}), ...over });
 // Clean facts: cwd verified, every listed operand realpath-resolved within cwd and NOT a credential.
 const okScope = (paths: string[] = []): ApprovalScope =>
   ({ cwdVerified: true, resolvedPaths: paths.map(raw => ({ raw, resolvedWithinCwd: true, resolvedSensitive: false })) });
@@ -170,16 +170,19 @@ t("invalid scope: resolvedPaths not array", validApprovalScope({ cwdVerified: tr
 t("invalid scope: missing resolvedSensitive", validApprovalScope({ cwdVerified: true, resolvedPaths: [{ raw: "a", resolvedWithinCwd: true }] }) === null);
 
 // ── validApprovalRequest (cwd must be absolute; AD-P1-3) ──────────────────────────────────────────────────────
-t("valid full request", validApprovalRequest({ member: "m", tool: "Bash", command: "cat x", cwd: "/w", promptId: "p", nowSec: 1 }) !== null);
-t("valid with scope", validApprovalRequest({ member: "m", tool: "Bash", command: "cat x", cwd: "/w", promptId: "p", nowSec: 1, scope: { cwdVerified: true, resolvedPaths: [] } }) !== null);
-t("invalid: empty cwd (AD-P1-3)", validApprovalRequest({ member: "m", tool: "Bash", command: "c", cwd: "", promptId: "p", nowSec: 1 }) === null);
-t("invalid: relative cwd (AD-P1-3)", validApprovalRequest({ member: "m", tool: "Bash", command: "c", cwd: "rel/dir", promptId: "p", nowSec: 1 }) === null);
+t("valid full request", validApprovalRequest({ requestId: "r", member: "m", tool: "Bash", command: "cat x", cwd: "/w", promptId: "p", nowSec: 1 }) !== null);
+t("valid with scope (resolved present)", validApprovalRequest({ requestId: "r", member: "m", tool: "Bash", command: "cat x", cwd: "/w", promptId: "p", nowSec: 1, scope: { cwdVerified: true, resolvedPaths: [{ raw: "x", resolved: "/w/x", resolvedWithinCwd: true, resolvedSensitive: false }] } }) !== null);
+t("valid with scope (resolved absent ⇒ tolerated null)", validApprovalRequest({ requestId: "r", member: "m", tool: "Bash", command: "cat x", cwd: "/w", promptId: "p", nowSec: 1, scope: { cwdVerified: true, resolvedPaths: [{ raw: "x", resolvedWithinCwd: true, resolvedSensitive: false }] } }) !== null);
+t("invalid: missing requestId (ADIO-P1-1)", validApprovalRequest({ member: "m", tool: "Bash", command: "c", cwd: "/w", promptId: "p", nowSec: 1 }) === null);
+t("invalid: empty cwd (AD-P1-3)", validApprovalRequest({ requestId: "r", member: "m", tool: "Bash", command: "c", cwd: "", promptId: "p", nowSec: 1 }) === null);
+t("invalid: relative cwd (AD-P1-3)", validApprovalRequest({ requestId: "r", member: "m", tool: "Bash", command: "c", cwd: "rel/dir", promptId: "p", nowSec: 1 }) === null);
 t("invalid: not an object", validApprovalRequest("x") === null);
-t("invalid: missing member", validApprovalRequest({ tool: "Bash", command: "c", cwd: "/w", promptId: "p", nowSec: 1 }) === null);
-t("invalid: missing promptId", validApprovalRequest({ member: "m", tool: "Bash", command: "c", cwd: "/w", nowSec: 1 }) === null);
-t("invalid: command non-string", validApprovalRequest({ member: "m", tool: "Bash", command: 5, cwd: "/w", promptId: "p", nowSec: 1 }) === null);
-t("invalid: nowSec NaN", validApprovalRequest({ member: "m", tool: "Bash", command: "c", cwd: "/w", promptId: "p", nowSec: NaN }) === null);
-t("invalid: bad scope rejects whole request", validApprovalRequest({ member: "m", tool: "Bash", command: "c", cwd: "/w", promptId: "p", nowSec: 1, scope: { cwdVerified: "x", resolvedPaths: [] } }) === null);
+t("invalid: missing member", validApprovalRequest({ requestId: "r", tool: "Bash", command: "c", cwd: "/w", promptId: "p", nowSec: 1 }) === null);
+t("invalid: missing promptId", validApprovalRequest({ requestId: "r", member: "m", tool: "Bash", command: "c", cwd: "/w", nowSec: 1 }) === null);
+t("invalid: command non-string", validApprovalRequest({ requestId: "r", member: "m", tool: "Bash", command: 5, cwd: "/w", promptId: "p", nowSec: 1 }) === null);
+t("invalid: nowSec NaN", validApprovalRequest({ requestId: "r", member: "m", tool: "Bash", command: "c", cwd: "/w", promptId: "p", nowSec: NaN }) === null);
+t("invalid: bad scope rejects whole request", validApprovalRequest({ requestId: "r", member: "m", tool: "Bash", command: "c", cwd: "/w", promptId: "p", nowSec: 1, scope: { cwdVerified: "x", resolvedPaths: [] } }) === null);
+t("invalid: scope resolved wrong type", validApprovalRequest({ requestId: "r", member: "m", tool: "Bash", command: "c", cwd: "/w", promptId: "p", nowSec: 1, scope: { cwdVerified: true, resolvedPaths: [{ raw: "x", resolved: 5, resolvedWithinCwd: true, resolvedSensitive: false }] } }) === null);
 
 // ── dormant flag: default OFF, opt-in ─────────────────────────────────────────────────────────────────────────
 t("flag default OFF (unset)", approvalDelegateEnabled({}) === false);

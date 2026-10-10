@@ -48,7 +48,8 @@ export function resolveApprovalScope(command: string, cwd: string): ApprovalScop
       try { resolved = realpathSync(path.resolve(anchor, raw)); } catch { resolved = null; }
       const resolvedWithinCwd = resolved !== null && (resolved === anchor || resolved.startsWith(anchor + path.sep));
       const resolvedSensitive = resolved !== null && isSensitivePath(resolved);
-      scope.resolvedPaths.push({ raw, resolvedWithinCwd, resolvedSensitive });
+      scope.resolvedPaths.push({ raw, resolved, resolvedWithinCwd, resolvedSensitive }); // `resolved` is the ADIO-P1-2 TOCTOU snapshot
+
     }
   } else if (plan.gate === "scope-git") {
     // git-recall (Hole 2 then scope): verify the member env is clean FIRST; only probe the repo root with a clean env.

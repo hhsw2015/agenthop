@@ -56,7 +56,7 @@ import { subjectProgressSeq, hasFreshSubjectEvidence, renewOperationId, renewalC
 import { resolveSession, listSessions, makeFileLiveness } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
-import { writeInbox, inboxDirName, claimInbox, ackInbox, releaseInbox } from "../packages/bus/src/inbox.js";
+import { writeInbox, inboxDirName, claimInbox, ackInbox, releaseInbox, recoverStaleClaims } from "../packages/bus/src/inbox.js";
 import { approvalDelegateEnabled } from "../packages/bus/src/swarm/approval-delegation.js";
 import { planCoordinatorAction, approvalInboxKey } from "../packages/bus/src/swarm/approval-gate.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
@@ -1705,19 +1705,28 @@ async function main(): Promise<void> {
     try {
       const coordSid = resolveSession(COORDINATOR, listSessions(HOME));
       if (!coordSid || !isStableSid(coordSid)) return; // no stable coordinator identity ⇒ can't key the dedicated approval box
-      const claimed = claimInbox(HOME, [approvalInboxKey(coordSid)], SELF);
+      const key = approvalInboxKey(coordSid);
+      recoverStaleClaims(HOME, [key]); // ADIO-P2-1: reclaim any dead-pid stranded claims (incl. .claim-disp-<pid>) before claiming
+      const claimed = claimInbox(HOME, [key], SELF);
       if (claimed.length === 0) return;
       let st = loadControlLog(CONTROL_LOG_DIR);
       for (const { file, msg } of claimed) {
-        const req = msg.approval;
-        if (!req) { ackInbox(file); continue; } // a stray non-approval on the dedicated key ⇒ drop (the key is the dispatcher's)
-        const action = planCoordinatorAction(req, coordSid, nowSec());
-        if (action.act === "delegate") {
-          const { state, result } = commitTask(st, [{ put: "permissionDecision", permissionDecision: action.decision }]);
-          if (result.ok) { st = state; ackInbox(file); } // ok covers a fresh commit AND an idempotent replay
-          else { st = loadControlLog(CONTROL_LOG_DIR); releaseInbox(file); } // seq conflict ⇒ reload + retry next tick
-        } else {
-          ackInbox(file); // escalate: no decision ⇒ member hook times out to the user; the live-sentinel supervises the block
+        // ADIO-P2-1: every claimed file keeps a release/ack obligation. try/finally guarantees a release if processing throws, so
+        // one bad file never strands the batch remainder (the outer catch alone would lose the obligation).
+        let done = false;
+        try {
+          const req = msg.approval;
+          if (!req) { ackInbox(file); done = true; continue; } // a stray non-approval on the dedicated key ⇒ drop (key is ours)
+          const action = planCoordinatorAction(req, coordSid, nowSec());
+          if (action.act === "delegate") {
+            const { state, result } = commitTask(st, [{ put: "permissionDecision", permissionDecision: action.decision }]);
+            if (result.ok) { st = state; ackInbox(file); done = true; } // ok covers a fresh commit AND an idempotent replay
+            else { st = loadControlLog(CONTROL_LOG_DIR); releaseInbox(file); done = true; } // seq conflict ⇒ reload + retry next tick
+          } else {
+            ackInbox(file); done = true; // escalate: no decision ⇒ member hook times out to the user; live-sentinel supervises
+          }
+        } finally {
+          if (!done) releaseInbox(file); // processing threw ⇒ release so a later sweep / recoverStaleClaims retries this file
         }
       }
     } catch (e) { log(`approval delegation failed (isolated): ${e instanceof Error ? e.message : e}`); }

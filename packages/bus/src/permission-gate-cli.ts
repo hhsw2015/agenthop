@@ -50,9 +50,9 @@ export async function runPermissionGateCli(startedAt: number, readStdin: () => P
         return true;
       } catch { return false; }
     },
-    readDecision: (promptId) => {
+    readDecision: (requestId) => {
       try {
-        const entity = liveEntities(loadControlLog(controlDir))[`permissionDecision:${promptId}`];
+        const entity = liveEntities(loadControlLog(controlDir))[`permissionDecision:${requestId}`];
         return entity && entity.put === "permissionDecision" ? entity.permissionDecision : null;
       } catch { return null; }
     },

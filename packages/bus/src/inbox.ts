@@ -421,9 +421,11 @@ export function recoverStaleClaims(home: string, keys: string[]): void {
     let names: string[];
     try { names = readdirSync(dir); } catch { continue; }
     for (const n of names) {
-      const m = n.match(/\.claim-(\d+)$/);
+      // Recognise both claim forms (ADIO-P2-1, FC-7 old-form收编): the bare numeric `.claim-<pid>` AND the dispatcher's
+      // `.claim-disp-<pid>` (SELF = `disp-<pid>`). Extract the numeric pid for the liveness check; a dead pid ⇒ reclaim.
+      const m = n.match(/\.claim-(?:disp-)?(\d+)$/);
       if (!m || alive(Number(m[1]))) continue;
-      try { renameSync(path.join(dir, n), path.join(dir, n.replace(/\.claim-\d+$/, ""))); } catch { /* best-effort */ }
+      try { renameSync(path.join(dir, n), path.join(dir, n.replace(/\.claim-(?:disp-)?\d+$/, ""))); } catch { /* best-effort */ }
     }
   }
 }

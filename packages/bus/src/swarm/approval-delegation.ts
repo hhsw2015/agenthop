@@ -51,6 +51,8 @@ export interface ApprovalScope {
   cwdVerified: boolean;  // the hook confirmed cwd is a trustworthy absolute, existing directory (the containment anchor)
   resolvedPaths: Array<{
     raw: string;                 // the raw operand as parsed from the command (must match planDelegation's pathArgs)
+    resolved?: string | null;    // the realpath target at resolution time (null = unresolvable, absent treated as null) — the TOCTOU
+                                 // snapshot (ADIO-P1-2): the hook re-resolves at emit and DISCARDS if this changed (a swap, even safe→safe)
     resolvedWithinCwd: boolean;  // realpath(raw) resolved AND stayed within realpath(cwd), symlinks followed
     resolvedSensitive: boolean;  // the resolved target is a credential/secret file (AD-R2-P1-2) ⇒ never delegate
   }>;
@@ -63,11 +65,14 @@ export interface ApprovalScope {
  *  tool_name→tool, tool_input.command→command (""` for a structured tool), session_id→member, cwd, prompt_id→promptId.
  *  `scope` carries the hook's IO-verified facts (absent until the IO round ⇒ path forms fail closed). */
 export interface ApprovalRequest {
-  member: string;   // requesting member's session id (Claude)
-  tool: string;     // tool_name (Bash | Read | Write | mcp__… | …)
-  command: string;  // tool_input.command for Bash; "" for a structured tool
+  requestId: string; // a FRESH per-hook-invocation id (ADIO-P1-1) — the flowback key. NOT the user prompt_id: a prompt_id is
+                     // shared across every tool call in one user turn, so keying on it would let one call's allow authorize a
+                     // later call. The hook mints a unique requestId per PermissionRequest; a decision binds to THIS call.
+  member: string;   // requesting member's session id (Claude) — also a binding field of the decision
+  tool: string;     // tool_name (Bash | Read | Write | mcp__… | …) — binding field
+  command: string;  // tool_input.command for Bash; "" for a structured tool — binding field
   cwd: string;      // the member's cwd — a verified ABSOLUTE path (the within-cwd anchor)
-  promptId: string; // Claude's prompt_id — the delegated decision is matched back by this
+  promptId: string; // Claude's prompt_id — AUDIT/context only (shared across a turn's tool calls; never the flowback key)
   nowSec: number;
   scope?: ApprovalScope;
 }
@@ -81,12 +86,16 @@ export type ApprovalVerdict =
 /** A recorded (② 留痕) delegated decision — the control-log `permissionDecision` payload (IO round) AND the hook's flowback
  *  key: the hook polls the control-log for its `promptId` and applies `behavior`. */
 export interface PermissionDecision {
-  promptId: string;
-  member: string;
+  requestId: string; // the flowback key (ADIO-P1-1) = ApprovalRequest.requestId, unique per hook invocation; the control-log
+                     // entity is permissionDecision:<requestId>. An old decision can never match a new call's fresh requestId.
+  member: string;    // binding: the member this decision authorizes (the hook re-checks it matches its own request)
+  tool: string;      // binding: the tool this decision authorizes
+  command: string;   // binding: the exact command this decision authorizes
   behavior: "allow" | "deny";
   by: string;        // the deciding coordinator sid
   reason: string;
   atSec: number;
+  promptId: string;  // AUDIT/context only (never the key)
   rewrite?: string;  // git-recall: the config-immune rewritten command the hook applies via decision.updatedInput (additive/optional)
 }
 
@@ -304,7 +313,9 @@ export function validApprovalScope(raw: unknown): ApprovalScope | null {
     if (typeof e !== "object" || e === null) return null;
     const p = e as Record<string, unknown>;
     if (typeof p.raw !== "string" || typeof p.resolvedWithinCwd !== "boolean" || typeof p.resolvedSensitive !== "boolean") return null;
-    resolved.push({ raw: p.raw, resolvedWithinCwd: p.resolvedWithinCwd, resolvedSensitive: p.resolvedSensitive });
+    const rp = p.resolved === undefined ? null : p.resolved; // the TOCTOU realpath snapshot (string | null); tolerate absent ⇒ null (FC-7)
+    if (rp !== null && typeof rp !== "string") return null;
+    resolved.push({ raw: p.raw, resolved: rp, resolvedWithinCwd: p.resolvedWithinCwd, resolvedSensitive: p.resolvedSensitive });
   }
   // Duplicate raws are KEPT, not rejected — pathsScopeOk merges them DENY-STICKY (any negative entry wins, order-independent;
   // coordinator r4 ③ "归并单调向严,不许后项覆盖前项" — the FC-6 monotonic family), so a contradictory pair always escalates.
@@ -323,6 +334,7 @@ export function validApprovalScope(raw: unknown): ApprovalScope | null {
 export function validApprovalRequest(raw: unknown): ApprovalRequest | null {
   if (typeof raw !== "object" || raw === null) return null;
   const r = raw as Record<string, unknown>;
+  if (typeof r.requestId !== "string" || !r.requestId) return null; // the per-invocation flowback key (ADIO-P1-1)
   if (typeof r.member !== "string" || !r.member) return null;
   if (typeof r.tool !== "string" || !r.tool) return null;
   if (typeof r.command !== "string") return null;          // "" is valid (structured tool)
@@ -331,7 +343,7 @@ export function validApprovalRequest(raw: unknown): ApprovalRequest | null {
   if (typeof r.nowSec !== "number" || !Number.isFinite(r.nowSec)) return null;
   let scope: ApprovalScope | undefined;
   if (r.scope !== undefined) { const s = validApprovalScope(r.scope); if (s === null) return null; scope = s; }
-  return { member: r.member, tool: r.tool, command: r.command, cwd: r.cwd, promptId: r.promptId, nowSec: r.nowSec, ...(scope ? { scope } : {}) };
+  return { requestId: r.requestId, member: r.member, tool: r.tool, command: r.command, cwd: r.cwd, promptId: r.promptId, nowSec: r.nowSec, ...(scope ? { scope } : {}) };
 }
 
 // ============================================================================================================

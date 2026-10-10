@@ -174,10 +174,11 @@ export type ChangeBody =
   | { put: "lifecycle"; record: ControlRecord }
   | { put: "scan"; branch: string; cursor: string | null }
   | { put: "tombstone"; launchId: string }
-  // approval-delegation ② 留痕: a coordinator's delegated permission decision, keyed by the member's Claude prompt_id. One
-  // write serves BOTH the audit trail AND the hook's flowback (the sync permission-gate hook polls this entity by promptId and
-  // applies `behavior`). v1 writes it only for a DELEGATE (behavior "allow"); an escalation writes none (the hook times out to
-  // the user). Additive (FC-7): old records lack it; the projection stores it last-write-wins by `permissionDecision:<promptId>`.
+  // approval-delegation ② 留痕: a coordinator's delegated permission decision, keyed by the hook's per-invocation requestId
+  // (ADIO-P1-1 — NOT the user prompt_id, which is shared across a turn's tool calls). One write serves BOTH the audit trail AND
+  // the hook's flowback (the sync permission-gate hook polls this entity by requestId, re-checks the member/tool/command binding,
+  // and applies `behavior`). v1 writes it only for a DELEGATE (behavior "allow"); an escalation writes none (the hook times out
+  // to the user). Additive (FC-7): old records lack it; the projection stores it last-write-wins by `permissionDecision:<requestId>`.
   | { put: "permissionDecision"; permissionDecision: PermissionDecision };
 
 /** Each Change carries its operation identity (§2.6): a globally-unique operationId and the entityRevision the caller
@@ -219,7 +220,7 @@ export function entityKeyOf(c: ChangeBody): string {
     case "lifecycle": return `lifecycle:${c.record.launchId}`;
     case "scan": return `scan:${c.branch}`;
     case "tombstone": return `tombstone:${c.launchId}`;
-    case "permissionDecision": return `permissionDecision:${c.permissionDecision.promptId}`;
+    case "permissionDecision": return `permissionDecision:${c.permissionDecision.requestId}`; // ADIO-P1-1: per-invocation key, NOT promptId
   }
 }
 

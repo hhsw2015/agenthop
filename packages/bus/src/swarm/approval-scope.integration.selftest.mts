@@ -13,7 +13,7 @@ const roots: string[] = [];
 function fixture() { const root = fs.mkdtempSync("/tmp/approval-scope-selftest-"); roots.push(root); const cwd = path.join(root, "work"); fs.mkdirSync(cwd); return { root, cwd }; }
 const verdict = (command: string, cwd: string) => {
   const scope = resolveApprovalScope(command, cwd);
-  const req: ApprovalRequest = { member: "m", tool: "Bash", command, cwd, promptId: "p", nowSec: 1, ...(scope ? { scope } : {}) };
+  const req: ApprovalRequest = { requestId: "r", member: "m", tool: "Bash", command, cwd, promptId: "p", nowSec: 1, ...(scope ? { scope } : {}) };
   return classifyApproval(req);
 };
 const isDelegate = (v: ReturnType<typeof classifyApproval>) => v.kind === "delegate";
