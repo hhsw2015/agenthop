@@ -428,3 +428,23 @@ describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
     expect(recordPoisonStrike(base, new Map())).toBe(3);  // max(2, 0) + 1
   });
 });
+
+describe("writeInbox — idempotency key (receiver-side dedup by stable event identity)", () => {
+  const dirOf = (key: string) => path.join(HOME, ".agenthop", "inbox", key);
+  test("a stable idempotencyKey ⇒ deterministic filename ⇒ a re-send OVERWRITES (no duplicate); absent ⇒ unique names", () => {
+    writeInbox(HOME, "s1", msg("one", 1), "morning-digest-2026-10-10");
+    writeInbox(HOME, "s1", msg("two", 2), "morning-digest-2026-10-10"); // SAME event identity ⇒ overwrite, not a 2nd message
+    const files = readdirSync(dirOf("s1")).filter((n) => n.endsWith(".json"));
+    expect(files).toEqual(["morning-digest-2026-10-10.json"]);           // exactly ONE file
+    expect(JSON.parse(readFileSync(path.join(dirOf("s1"), files[0]!), "utf8")).text).toBe("two"); // latest content
+    writeInbox(HOME, "s1", msg("r1", 3)); // no key ⇒ unique random names (every write a new message)
+    writeInbox(HOME, "s1", msg("r2", 4));
+    expect(readdirSync(dirOf("s1")).filter((n) => n.endsWith(".json")).length).toBe(3);
+  });
+  test("a path-unsafe idempotencyKey falls back to a unique random name (no traversal)", () => {
+    writeInbox(HOME, "s2", msg("x", 1), "../escape");
+    const files = readdirSync(dirOf("s2")).filter((n) => n.endsWith(".json"));
+    expect(files.length).toBe(1);
+    expect(files[0]).not.toContain("escape"); // rejected ⇒ random name, never wrote outside the dir
+  });
+});

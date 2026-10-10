@@ -159,14 +159,19 @@ export function watchInbox(home: string, keys: string[], onChange: () => void): 
  *  not a substitute for refusing an invalid write at the source. Throwing is the fail-fast rejection; every caller passes a
  *  well-formed envelope, so this never fires on the live paths — it guards a future/untrusted producer. The NORMALIZED record
  *  (known fields only) is what gets persisted, so no junk field is ever written. */
-export function writeInbox(home: string, key: string, msg: InboxMsg): void {
+export function writeInbox(home: string, key: string, msg: InboxMsg, idempotencyKey?: string): void {
   const valid = validInboxMsg(msg);
   if (valid === null) throw new Error("writeInbox: refusing to publish an invalid inbox message (from/fromLabel/text must be strings, via a non-empty string, ts a finite number)");
   const dir = inboxDir(home, key);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const base = `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
+  // A stable `idempotencyKey` ⇒ a DETERMINISTIC filename, so re-publishing the SAME logical event OVERWRITES rather than adding a
+  // second message — receiver-side dedup by event identity (a re-send after a crash/retry can never duplicate). Validated to one
+  // safe path segment (no traversal). Absent ⇒ the historical unique random name (every write is a new message).
+  const base = idempotencyKey !== undefined && /^[A-Za-z0-9._-]{1,120}$/.test(idempotencyKey)
+    ? `${idempotencyKey}.json`
+    : `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
   const file = path.join(dir, base);
-  const tmp = `${file}.tmp`;
+  const tmp = `${file}.tmp-${Math.random().toString(36).slice(2, 8)}`; // unique tmp so two concurrent writers of the same idempotencyKey don't clash on the tmp
   writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
   renameSync(tmp, file);
 }

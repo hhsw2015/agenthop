@@ -29,48 +29,62 @@ export function writeDigestProjection(home: string, sources: DigestSources, date
   return atomicWriteJson(digestPath(home), digestProjection(sources, dateStr, generatedAtSec));
 }
 
-/** MD-P2-4 — classify the on-disk projection into its FOUR distinct states: only a COMPLETE valid projection (schema + non-empty
- *  date + finite generatedAtSec + a well-formed sections array) proves today's generation. ENOENT ⇒ "absent"; a parse/shape
- *  failure ⇒ "corrupt" (repairable by an idempotent rewrite); any other read error ⇒ "unknown" (can't tell — must not be treated
- *  as "never generated"). Never throws. */
+/** Validate a parsed value as a COMPLETE morning-digest/v1 projection (schema + non-empty date + finite generatedAtSec + a
+ *  well-formed sections array of {title, lines:string[]}). Returns the normalized projection or null. Pure. */
+function parseProjection(parsed: unknown): DigestProjection | null {
+  if (!isObj(parsed)) return null;
+  if (parsed.schema !== "morning-digest/v1" || typeof parsed.date !== "string" || parsed.date.length === 0) return null;
+  if (typeof parsed.generatedAtSec !== "number" || !Number.isFinite(parsed.generatedAtSec)) return null;
+  if (!Array.isArray(parsed.sections)) return null;
+  const sections: { title: string; lines: string[] }[] = [];
+  for (const s of parsed.sections) {
+    if (!isObj(s) || typeof s.title !== "string" || !Array.isArray(s.lines) || s.lines.some((l) => typeof l !== "string")) return null;
+    sections.push({ title: s.title, lines: s.lines as string[] });
+  }
+  return { schema: "morning-digest/v1", date: parsed.date, generatedAtSec: parsed.generatedAtSec, sections };
+}
+
+/** MD-P2-4 — classify the on-disk projection into FOUR distinct states: a COMPLETE valid projection proves today's generation
+ *  (and carries the frozen body); ENOENT ⇒ "absent"; a parse/shape failure ⇒ "corrupt" (carrier damaged); any other read error ⇒
+ *  "unknown" (can't tell — must not be treated as "never generated"). Never throws. */
 export function readDigestProjection(home: string): ProjState {
   let raw: string;
   try { raw = readFileSync(digestPath(home), "utf8"); }
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "unknown" }; }
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { return { kind: "corrupt" }; }
-  if (!isObj(parsed)) return { kind: "corrupt" };
-  if (parsed.schema !== "morning-digest/v1" || typeof parsed.date !== "string" || parsed.date.length === 0) return { kind: "corrupt" };
-  if (typeof parsed.generatedAtSec !== "number" || !Number.isFinite(parsed.generatedAtSec)) return { kind: "corrupt" };
-  if (!Array.isArray(parsed.sections)) return { kind: "corrupt" };
-  const sections: { title: string; lines: string[] }[] = [];
-  for (const s of parsed.sections) {
-    if (!isObj(s) || typeof s.title !== "string" || !Array.isArray(s.lines) || s.lines.some((l) => typeof l !== "string")) return { kind: "corrupt" };
-    sections.push({ title: s.title, lines: s.lines as string[] });
-  }
-  const projection: DigestProjection = { schema: "morning-digest/v1", date: parsed.date, generatedAtSec: parsed.generatedAtSec, sections };
-  return { kind: "valid", date: parsed.date, projection }; // carries the FROZEN body for the notify to render (MD-R2-P2-1)
+  const projection = parseProjection(parsed);
+  return projection ? { kind: "valid", date: projection.date, projection } : { kind: "corrupt" };
 }
 
-/** MD-P2-1 — read the coordinator-brief delivery marker (separate obligation from the projection). "notified" (confirmed for a
- *  date), "none" (absent — not yet), "unknown" (a read error — don't risk a double-send). Never throws. */
+/** MD-R2-P2-1 — atomically (over)write a READY projection. Used to RESTORE a corrupt carrier from the frozen body kept in the
+ *  notify marker — the SAME published content, never a re-gather. Returns true on success. Never throws. */
+export function writeDigestProjectionRaw(home: string, projection: DigestProjection): boolean {
+  return atomicWriteJson(digestPath(home), projection);
+}
+
+/** MD-P2-1 — read the two-phase coordinator-brief marker. "sent" / "pending" carry today's FROZEN body (the MD-R2-P2-1 restore
+ *  source). A LEGACY date-only record (no `state`, FC-7) is read as "pending" — NEVER guessed "sent" (that would lose an un-sent
+ *  r3 claim); the inbox idempotency key makes continuing it safe (a re-send overwrites, never duplicates). A read error / corrupt
+ *  JSON / missing date ⇒ "unknown" (must not prove not-sent). Never throws. */
 export function readNotifiedState(home: string): NotifyState {
   let raw: string;
   try { raw = readFileSync(notifiedPath(home), "utf8"); }
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "none" } : { kind: "unknown" }; }
   let o: unknown;
-  try { o = JSON.parse(raw); } catch { return { kind: "unknown" }; } // MD-P2-1: a corrupt marker must NOT prove "not sent" ⇒ unknown (no re-send)
+  try { o = JSON.parse(raw); } catch { return { kind: "unknown" }; } // MD-P2-1: a corrupt marker must NOT prove "not sent" ⇒ unknown
   if (!isObj(o) || typeof o.date !== "string" || o.date.length === 0) return { kind: "unknown" };
-  if (o.state === "pending") return { kind: "pending", date: o.date }; // an unfinished delivery ⇒ recovery CONTINUES it (no loss)
-  // "sent", or a legacy date-only marker (treated as sent — conservative: never re-send a possibly-delivered brief).
-  return { kind: "sent", date: o.date };
+  const body = parseProjection(o.body) ?? undefined;
+  if (o.state === "sent") return { kind: "sent", date: o.date, ...(body ? { body } : {}) };     // CONFIRMED ⇒ never re-send
+  if (o.state === "pending") return { kind: "pending", date: o.date, ...(body ? { body } : {}) }; // unfinished ⇒ CONTINUE
+  return { kind: "pending", date: o.date }; // FC-7 legacy date-only: re-send-eligible (idempotency-key-safe), never guessed "sent"
 }
 
-/** MD-P2-1 — write the two-phase delivery marker. "pending" is CLAIMED before the send (a crash/failure then CONTINUES, never
- *  re-sends-as-confirmed); "sent" is written only AFTER a confirmed delivery (⇒ never re-send). Returns false on a write fault —
- *  the caller must NOT send on a failed "pending" claim (retry next tick). Never throws. */
-export function markNotified(home: string, dateStr: string, state: "pending" | "sent"): boolean {
-  return atomicWriteJson(notifiedPath(home), { date: dateStr, state });
+/** MD-P2-1 — write the two-phase delivery marker, carrying the FROZEN body (the MD-R2-P2-1 restore source). "pending" is CLAIMED
+ *  before the send; "sent" is written only AFTER a confirmed delivery. Returns false on a write fault — the caller must NOT send
+ *  on a failed "pending" claim (retry next tick). Never throws. */
+export function markNotified(home: string, dateStr: string, state: "pending" | "sent", body: DigestProjection): boolean {
+  return atomicWriteJson(notifiedPath(home), { date: dateStr, state, body });
 }
 
 /** Gather the digest sources, fail-soft. PROGRESS.md is the coordinator's narrative projection of the control log + reviews (the

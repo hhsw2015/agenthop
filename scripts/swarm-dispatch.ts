@@ -65,7 +65,7 @@ import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlocked
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
-import { writeDigestProjection, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources } from "../packages/bus/src/swarm/morning-digest-store.js";
+import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources } from "../packages/bus/src/swarm/morning-digest-store.js";
 import { successionEnabled } from "../packages/bus/src/swarm/shell-succession.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
@@ -816,12 +816,12 @@ async function main(): Promise<void> {
   // snapshot + retries so the event is not lost — review P2-2).
   const notifySent = new Map<string, number>(); // dedup: (taskRef\0text) -> last-sent ms; suppress an identical re-send within NOTIFY_DEDUP_MS
   const isStableSid = (s: string): boolean => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s); // CE2: a verified stable SID, not a routable display handle
-  const notifyCoordinator = (text: string, opts: { taskRef?: string; title?: string; severity?: ReportSeverity; intent?: "submit" | "report" | "fyi" } = {}): "delivered" | "logged" | "failed" | "deduped" => {
+  const notifyCoordinator = (text: string, opts: { taskRef?: string; title?: string; severity?: ReportSeverity } = {}): "delivered" | "logged" | "failed" | "deduped" => {
     const now = Date.now();
     for (const [k, t] of notifySent) if (now - t >= NOTIFY_DEDUP_MS) notifySent.delete(k); // prune expired (bounds the map)
     const key = `${opts.taskRef ?? ""}\u0000${text}`;
     if ((notifySent.get(key) ?? -Infinity) > now - NOTIFY_DEDUP_MS) return "deduped"; // identical notice just DELIVERED — skip (CE4: sync delivery records dedup, so a later tick is suppressed)
-    const s11 = { ...(opts.taskRef ? { taskRef: opts.taskRef } : {}), ...(opts.title ? { title: opts.title } : {}), ...(opts.intent ? { intent: opts.intent } : {}) }; // S11 structured header
+    const s11 = { ...(opts.taskRef ? { taskRef: opts.taskRef } : {}), ...(opts.title ? { title: opts.title } : {}) }; // S11 structured header
     // RESOLVED coordinator ⇒ the durable inbox (the normal path).
     if (COORDINATOR !== "") {
       const sid = resolveSession(COORDINATOR, listSessions(HOME));
@@ -1666,26 +1666,42 @@ async function main(): Promise<void> {
     try {
       const d = new Date();
       const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; // local date
-      const act = digestActions(today, d.getHours(), DIGEST_HOUR, readDigestProjection(HOME), readNotifiedState(HOME));
-      if (!act.writeProjection && !act.notify) return; // both already delivered today (or before the hour)
+      let proj = readDigestProjection(HOME);
+      const notified = readNotifiedState(HOME);
+      const act0 = digestActions(today, d.getHours(), DIGEST_HOUR, proj, notified);
+      if (!act0.writeProjection && !act0.notify) return; // both already delivered today (or before the hour)
       if (nowSec() - lastDigestAttemptSec < DIGEST_RETRY_SEC) return; // backoff: never a tight per-tick retry on a persistent fault
       lastDigestAttemptSec = nowSec();
-      // (1) Projection obligation: gather the night's sources ONCE and write the FROZEN body for today (MD-R2-P2-1 — the projection
-      //     IS the single generated content; a later retry never re-gathers).
+      // MD-R2-P2-1: a CORRUPT carrier whose frozen body is recoverable from today's notify marker is RESTORED to that SAME body —
+      // never re-gathered into a different one (corrupt ≠ absent; the body was already published). Then the projection is valid again.
+      if (proj.kind === "corrupt" && (notified.kind === "pending" || notified.kind === "sent") && notified.date === today && notified.body) {
+        writeDigestProjectionRaw(HOME, notified.body);
+        proj = readDigestProjection(HOME);
+      }
+      const act = digestActions(today, d.getHours(), DIGEST_HOUR, proj, notified);
+      // (1) Projection obligation: gather the night's sources ONCE and write the FROZEN body for today (a later retry/restore never
+      //     re-gathers a different body).
       if (act.writeProjection) {
         const sources = gatherDigestSources(HOME);
         if (sources === null) return; // MD-P2-2: sources unreadable (unknown) ⇒ cannot assert content ⇒ retry later (no false quiet night)
-        writeDigestProjection(HOME, sources, today, nowSec()); // atomic; (re)writes absent/corrupt; retry if it fails
+        writeDigestProjection(HOME, sources, today, nowSec()); // atomic; writes absent / repairs corrupt-without-a-recoverable-body
       }
       // (2) Notify obligation: deliver the SAME frozen body the projection carries — render the on-disk projection, NEVER a
-      //     re-gather (MD-R2-P2-1), so the projection and the coordinator brief (first send + every retry) are byte-identical.
+      //     re-gather, with a DETERMINISTIC inbox idempotency key so a re-send OVERWRITES (receiver-side dedup, never a duplicate).
       if (act.notify) {
         const p = readDigestProjection(HOME);
-        if (p.kind !== "valid" || p.date !== today) return; // the frozen body is not on disk yet (projection write failed) ⇒ retry both next tick
+        if (p.kind !== "valid" || p.date !== today) return; // the frozen body is not on disk yet (projection write failed) ⇒ retry
         const coord = process.env.SWARM_COORDINATOR;
-        if (!coord || !coord.trim()) { markNotified(HOME, today, "sent"); return; } // no coordinator ⇒ the brief has no target; the projection is the artifact
-        if (!markNotified(HOME, today, "pending")) return; // MD-P2-1: persist the PENDING intent before sending; if it can't persist, do NOT send (retry)
-        if (["delivered", "deduped"].includes(notifyCoordinator(digestTextFromProjection(p.projection), { taskRef: "morning-digest", title: "morning brief", intent: "fyi" }))) markNotified(HOME, today, "sent"); // CONFIRMED ⇒ flip pending→sent (never re-send). A crash/failure leaves "pending" ⇒ recovery CONTINUES the delivery (no loss, no masquerade)
+        if (!coord || !coord.trim()) { markNotified(HOME, today, "sent", p.projection); return; } // no coordinator ⇒ no target; the projection is the artifact
+        const coordSid = resolveSession(coord, listSessions(HOME));
+        if (!coordSid) return; // coordinator not resolvable on this machine yet ⇒ retry (leave none/pending)
+        if (!markNotified(HOME, today, "pending", p.projection)) return; // MD-P2-1: claim + freeze the body BEFORE sending; if it can't persist, do NOT send (retry)
+        try {
+          // MD-P2-1: a STABLE per-date idempotency key ⇒ the coordinator inbox dedups by event identity — a crash-after-land or a
+          // failed "sent" flip re-sends, but the deterministic filename OVERWRITES rather than adding a second message.
+          writeInbox(HOME, coordSid, { from: SELF, fromLabel: "swarm-digest", text: digestTextFromProjection(p.projection), via: "local", ts: Date.now(), taskRef: "morning-digest", title: "morning brief", intent: "fyi" }, `morning-digest-${today}`);
+          markNotified(HOME, today, "sent", p.projection); // confirmed (optimization: skip future sends); the idempotency key is the hard dedup
+        } catch (e) { log(`morning digest notify failed (isolated): ${e instanceof Error ? e.message : e}`); } // leave "pending" ⇒ retry (overwrites, no dup)
       }
     } catch (e) { log(`morning digest failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };

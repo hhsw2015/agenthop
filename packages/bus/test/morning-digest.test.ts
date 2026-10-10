@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { composeDigest, digestProjection, digestEnabled, digestActions, digestTextFromProjection, type ProjState } from "../src/swarm/morning-digest.js";
-import { writeDigestProjection, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources } from "../src/swarm/morning-digest-store.js";
+import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources } from "../src/swarm/morning-digest-store.js";
 
 const validProj = (date: string): ProjState => ({ kind: "valid", date, projection: { schema: "morning-digest/v1", date, generatedAtSec: 0, sections: [] } });
 
@@ -77,16 +77,26 @@ describe("morning-digest-store — projection + two-phase notify marker (durable
     expect(readDigestProjection(HOME).kind).toBe("corrupt");
   });
 
-  test("MD-P2-1: two-phase marker — none ⇒ none; pending ⇒ pending; sent ⇒ sent; legacy {date} ⇒ sent; corrupt ⇒ unknown", () => {
+  test("MD-P2-1: two-phase marker carries the frozen body; legacy date-only ⇒ pending (FC-7, never 'sent'); corrupt ⇒ unknown", () => {
+    const body = digestProjection({ shipped: ["x"] }, "2026-10-10", 0);
     expect(readNotifiedState(HOME)).toEqual({ kind: "none" });
-    expect(markNotified(HOME, "2026-10-10", "pending")).toBe(true);
-    expect(readNotifiedState(HOME)).toEqual({ kind: "pending", date: "2026-10-10" }); // unfinished ⇒ recovery continues
-    expect(markNotified(HOME, "2026-10-10", "sent")).toBe(true);
-    expect(readNotifiedState(HOME)).toEqual({ kind: "sent", date: "2026-10-10" });     // confirmed ⇒ never re-send
-    rawWrite("notified.json", JSON.stringify({ date: "2026-10-10" }));                 // legacy date-only
-    expect(readNotifiedState(HOME)).toEqual({ kind: "sent", date: "2026-10-10" });     // conservative: treat as sent (don't re-send)
+    expect(markNotified(HOME, "2026-10-10", "pending", body)).toBe(true);
+    expect(readNotifiedState(HOME)).toEqual({ kind: "pending", date: "2026-10-10", body }); // unfinished ⇒ recovery continues
+    expect(markNotified(HOME, "2026-10-10", "sent", body)).toBe(true);
+    expect(readNotifiedState(HOME)).toEqual({ kind: "sent", date: "2026-10-10", body });     // confirmed ⇒ never re-send
+    rawWrite("notified.json", JSON.stringify({ date: "2026-10-10" }));                        // legacy date-only (an r3 claim)
+    expect(readNotifiedState(HOME)).toEqual({ kind: "pending", date: "2026-10-10" });         // FC-7: re-send-eligible (idempotency-key-safe), NEVER guessed 'sent'
     rawWrite("notified.json", "not json{");
-    expect(readNotifiedState(HOME)).toEqual({ kind: "unknown" });                      // corrupt ⇒ must NOT read as not-sent
+    expect(readNotifiedState(HOME)).toEqual({ kind: "unknown" });                             // corrupt ⇒ must NOT read as not-sent
+  });
+
+  test("MD-R2-P2-1: writeDigestProjectionRaw restores an EXACT frozen body over a corrupt carrier (no re-gather)", () => {
+    const body = digestProjection({ alerts: ["keepme"] }, "2026-10-10", 7);
+    rawWrite("digest.json", "corrupt{");
+    expect(readDigestProjection(HOME).kind).toBe("corrupt");
+    expect(writeDigestProjectionRaw(HOME, body)).toBe(true);
+    const st = readDigestProjection(HOME);
+    expect(st.kind === "valid" && st.projection).toEqual(body); // SAME published body restored, not a different gather
   });
 });
 

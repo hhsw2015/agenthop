@@ -75,7 +75,7 @@ export function digestTextFromProjection(p: DigestProjection): string {
  *  own durable TWO-PHASE marker so a pending INTENT never masquerades as a delivery confirmation — "pending" (claimed before the
  *  send; a crash/failure here ⇒ recovery CONTINUES the unfinished delivery, no loss), "sent" (CONFIRMED delivered for a date ⇒
  *  never re-send), "none" (not yet), "unknown" (marker unreadable/corrupt ⇒ don't re-send, don't prove not-sent). */
-export type NotifyState = { kind: "sent"; date: string } | { kind: "pending"; date: string } | { kind: "none" } | { kind: "unknown" };
+export type NotifyState = { kind: "sent"; date: string; body?: DigestProjection } | { kind: "pending"; date: string; body?: DigestProjection } | { kind: "none" } | { kind: "unknown" };
 
 /** Pure daily decision: at/after the local target hour, decide INDEPENDENTLY whether to (re)write today's projection and whether
  *  to send today's coordinator brief (MD-P2-1: two obligations, not one date). Before the hour, or on a non-finite clock, do
