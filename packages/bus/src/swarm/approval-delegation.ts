@@ -15,7 +15,7 @@
  *   / `basename` / `dirname` — AND whose execution is PINNED via a `builtin command <abspath>` rewrite (AD-V1-P1-1: a command NAME
  *   does not bind its implementation; a member shell alias/function/PATH entry could shadow `pwd`/`echo`, so the verdict rewrites
  *   the command to e.g. `builtin command /bin/pwd` via the hook's `updatedInput`, and the member hook lstat-verifies the binary
- *   before emitting). Everything else escalates. Deliberate and bounded (PINNED lists the accepted non-differential residuals):
+ *   before emitting). Everything else escalates. Deliberate and bounded (PINNED lists the residuals EXCLUDED by coordinator scope):
  *     - PATH reads (cat/ls/…) are OUT: a hook decision cannot bind the EXECUTION target — the gap between the hook's final
  *       resolve and the actual read is an irreducible TOCTOU (a symlink repoint, even to a safe→safe swap), and re-query /
  *       rewrite-to-realpath cannot close it (happycapy ADIO-P1-2, proven).
@@ -86,11 +86,11 @@ export const APPROVAL_POLL_SEC = 15;
  *  implementation. The verdict rewrites the command to `builtin command <abspath>` (planDelegation): `command` skips
  *  function/alias lookup, `builtin` forces the real `command` builtin — the member shell's name resolution no longer
  *  participates. Standard POSIX locations (macOS + Linux); the member hook lstat-verifies the path is a real regular file in ITS
- *  env before emitting (dangling link / directory / symlink-replacement ⇒ escalate). ACCEPTED RESIDUALS (bounded contract,
- *  coordinator-ruled NON-DIFFERENTIAL — each defeats a USER's own approval of the SAME command equally, so auto-allow need only
- *  be no-worse-than-user-approval): a member function shadowing `builtin`/`command` themselves; a BASH_ENV/ENV startup file that
- *  executes arbitrary code at shell init; /bin itself tampered. All are shell-/system-compromise level, outside the
- *  differential-auto-allow threat model (a sanitized read could not defend them either). */
+ *  env before emitting (dangling link / directory / symlink-replacement ⇒ escalate). EXCLUDED FROM THIS REVIEW BY COORDINATOR
+ *  SCOPE (a scope decision, NOT a verified equivalence with manual approval): a member function that replaces `builtin`/`command`
+ *  themselves; a BASH_ENV/ENV shell-startup file that runs arbitrary code at shell init; /bin itself tampered. This is a scope
+ *  ruling, not a behavioral fact — the builtin-function fixture produced DIFFERENT outputs for the original `pwd` and its rewrite
+ *  (so the rewrite can be differential, not provably no-worse-than manual approval). Re-opening any of these is a coordinator+user call. */
 const PINNED = new Map<string, string>([
   ["pwd", "/bin/pwd"], ["echo", "/bin/echo"], ["which", "/usr/bin/which"], ["basename", "/usr/bin/basename"], ["dirname", "/usr/bin/dirname"],
 ]); // a Map, NOT a plain object (AD-V1-R2-P2-1 / AD-R2-P1-1 lineage): `PINNED.get("constructor"|"toString"|"__proto__"|…)` is

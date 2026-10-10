@@ -23,10 +23,10 @@ the command to `builtin command <abspath>` (e.g. `builtin command /bin/pwd`) via
 function/alias lookup, `builtin` forces the real `command` builtin. The member hook lstat-verifies the pinned binary is a real
 regular file in ITS OWN env before emitting (dangling link / symlink-replacement / directory ⇒ escalate), and recomputes the
 rewrite locally (it never executes the rewrite string carried in the control-log decision — the log authorizes WHETHER, the
-member binds WHAT runs). **Accepted residuals** (coordinator-ruled NON-DIFFERENTIAL — each defeats a user's own approval of the
-same command equally, so auto-allow need only be no-worse-than-user-approval): a function shadowing `builtin`/`command`
-themselves; a `BASH_ENV`/`ENV` startup file that runs arbitrary code at shell init; `/bin` tampering. These are
-shell-/system-compromise level, outside the differential-auto-allow threat model (a sanitized read could not defend them either).
+member binds WHAT runs). **Excluded from this review by coordinator scope** (a scope decision, NOT a verified equivalence with
+manual approval): a function that replaces `builtin`/`command` themselves; a `BASH_ENV`/`ENV` shell-startup file that runs
+arbitrary code at shell init; `/bin` tampering. The builtin-function fixture produced DIFFERENT outputs for the original `pwd`
+and its rewrite, so this is a scope ruling, not a behavioral-equivalence claim. Re-opening any of these is a coordinator + user decision.
 
 Everything else escalates to the user:
 - **privilege** (escalate:"privilege") — the blacklist backstop: `sudo`/`rm`/`mv`/`chmod`/`curl`/`wget`/pkg-managers/`env`/
