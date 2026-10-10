@@ -3,7 +3,7 @@
 // marker (separate obligation from the projection, MD-P2-1), and classifies the four projection read states (MD-P2-4). Fail-soft:
 // a source READ ERROR is reported as "unknown" (never a false quiet night, MD-P2-2); the pure composition lives in morning-digest.ts.
 
-import { mkdirSync, writeFileSync, renameSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { digestProjection, type DigestSources, type ProjState, type NotifyState, type DigestProjection } from "./morning-digest.js";
@@ -60,19 +60,17 @@ export function readNotifiedState(home: string): NotifyState {
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "none" } : { kind: "unknown" }; }
   let o: unknown;
   try { o = JSON.parse(raw); } catch { return { kind: "unknown" }; } // MD-P2-1: a corrupt marker must NOT prove "not sent" ⇒ unknown (no re-send)
-  return isObj(o) && typeof o.date === "string" && o.date.length > 0 ? { kind: "notified", date: o.date } : { kind: "unknown" };
+  if (!isObj(o) || typeof o.date !== "string" || o.date.length === 0) return { kind: "unknown" };
+  if (o.state === "pending") return { kind: "pending", date: o.date }; // an unfinished delivery ⇒ recovery CONTINUES it (no loss)
+  // "sent", or a legacy date-only marker (treated as sent — conservative: never re-send a possibly-delivered brief).
+  return { kind: "sent", date: o.date };
 }
 
-/** MD-P2-1 — CLAIM today's coordinator-brief delivery (written BEFORE the send, so a land-then-crash never re-sends — the marker
- *  already names today). The caller sends only after this returns true, and reverts via clearNotified on a normal send failure.
- *  Returns false on a write fault (then the caller must NOT send — retry next tick). Never throws. */
-export function markNotified(home: string, dateStr: string): boolean {
-  return atomicWriteJson(notifiedPath(home), { date: dateStr });
-}
-
-/** MD-P2-1 — revert the claim after a NORMAL send failure (not a crash), so the brief is retried rather than lost. Best-effort. */
-export function clearNotified(home: string): void {
-  try { rmSync(notifiedPath(home), { force: true }); } catch { /* already gone */ }
+/** MD-P2-1 — write the two-phase delivery marker. "pending" is CLAIMED before the send (a crash/failure then CONTINUES, never
+ *  re-sends-as-confirmed); "sent" is written only AFTER a confirmed delivery (⇒ never re-send). Returns false on a write fault —
+ *  the caller must NOT send on a failed "pending" claim (retry next tick). Never throws. */
+export function markNotified(home: string, dateStr: string, state: "pending" | "sent"): boolean {
+  return atomicWriteJson(notifiedPath(home), { date: dateStr, state });
 }
 
 /** Gather the digest sources, fail-soft. PROGRESS.md is the coordinator's narrative projection of the control log + reviews (the

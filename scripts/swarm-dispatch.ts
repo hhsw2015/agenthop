@@ -65,7 +65,7 @@ import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlocked
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
-import { writeDigestProjection, readDigestProjection, readNotifiedState, markNotified, clearNotified, gatherDigestSources } from "../packages/bus/src/swarm/morning-digest-store.js";
+import { writeDigestProjection, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources } from "../packages/bus/src/swarm/morning-digest-store.js";
 import { successionEnabled } from "../packages/bus/src/swarm/shell-succession.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
@@ -1683,9 +1683,9 @@ async function main(): Promise<void> {
         const p = readDigestProjection(HOME);
         if (p.kind !== "valid" || p.date !== today) return; // the frozen body is not on disk yet (projection write failed) ⇒ retry both next tick
         const coord = process.env.SWARM_COORDINATOR;
-        if (!coord || !coord.trim()) { markNotified(HOME, today); return; } // no coordinator ⇒ the brief has no target; the projection is the artifact
-        if (!markNotified(HOME, today)) return; // MD-P2-1: durably CLAIM today BEFORE sending — if the claim can't persist, do NOT send (retry); a land-then-crash then never re-sends
-        if (!["delivered", "deduped"].includes(notifyCoordinator(digestTextFromProjection(p.projection), { taskRef: "morning-digest", title: "morning brief", intent: "fyi" }))) clearNotified(HOME); // NORMAL send failure ⇒ revert the claim ⇒ retry (no lost fyi); a crash keeps the claim (no re-send)
+        if (!coord || !coord.trim()) { markNotified(HOME, today, "sent"); return; } // no coordinator ⇒ the brief has no target; the projection is the artifact
+        if (!markNotified(HOME, today, "pending")) return; // MD-P2-1: persist the PENDING intent before sending; if it can't persist, do NOT send (retry)
+        if (["delivered", "deduped"].includes(notifyCoordinator(digestTextFromProjection(p.projection), { taskRef: "morning-digest", title: "morning brief", intent: "fyi" }))) markNotified(HOME, today, "sent"); // CONFIRMED ⇒ flip pending→sent (never re-send). A crash/failure leaves "pending" ⇒ recovery CONTINUES the delivery (no loss, no masquerade)
       }
     } catch (e) { log(`morning digest failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };

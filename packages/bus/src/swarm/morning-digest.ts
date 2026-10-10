@@ -72,17 +72,22 @@ export function digestTextFromProjection(p: DigestProjection): string {
   return [head, ...body].join("\n");
 }
 /** The NOTIFY state (MD-P2-1): the daily coordinator-brief delivery is a SEPARATE obligation from the projection, tracked by its
- *  own durable marker — "notified" (confirmed for a date), "none" (not yet), "unknown" (marker unreadable ⇒ don't risk a double). */
-export type NotifyState = { kind: "notified"; date: string } | { kind: "none" } | { kind: "unknown" };
+ *  own durable TWO-PHASE marker so a pending INTENT never masquerades as a delivery confirmation — "pending" (claimed before the
+ *  send; a crash/failure here ⇒ recovery CONTINUES the unfinished delivery, no loss), "sent" (CONFIRMED delivered for a date ⇒
+ *  never re-send), "none" (not yet), "unknown" (marker unreadable/corrupt ⇒ don't re-send, don't prove not-sent). */
+export type NotifyState = { kind: "sent"; date: string } | { kind: "pending"; date: string } | { kind: "none" } | { kind: "unknown" };
 
 /** Pure daily decision: at/after the local target hour, decide INDEPENDENTLY whether to (re)write today's projection and whether
  *  to send today's coordinator brief (MD-P2-1: two obligations, not one date). Before the hour, or on a non-finite clock, do
- *  nothing. writeProjection is true unless a VALID today projection already exists (absent/corrupt/unknown ⇒ (re)write — the
- *  write is idempotent and repairs a corrupt/missing file, MD-P2-4). notify is true only when the marker says not-yet-today
- *  ("none", or "notified" for an earlier date); an UNKNOWN marker ⇒ false (never risk a double-send; retry when readable). Pure. */
+ *  nothing.
+ *  writeProjection: regenerate only when a body is genuinely needed — "absent" (never written), "corrupt" (repair, MD-P2-4), or a
+ *  "valid" projection for an EARLIER date (new day). An "unknown" (unreadable) projection ⇒ FALSE: retain + retry, never overwrite
+ *  a possibly-valid body with a freshly-gathered different one (MD-R2-P2-1); a "valid" today projection ⇒ FALSE (already have it).
+ *  notify: send unless today's delivery is already CONFIRMED ("sent" for today) — a "pending" (unfinished) delivery is CONTINUED
+ *  (true), "none" and an earlier-date marker send (true); an "unknown" marker ⇒ FALSE (don't re-send / don't prove not-sent). Pure. */
 export function digestActions(todayStr: string, hourNow: number, targetHour: number, proj: ProjState, notified: NotifyState): { writeProjection: boolean; notify: boolean } {
   if (!Number.isFinite(hourNow) || !Number.isFinite(targetHour) || hourNow < targetHour) return { writeProjection: false, notify: false };
-  const writeProjection = !(proj.kind === "valid" && proj.date === todayStr);
-  const notify = notified.kind === "none" || (notified.kind === "notified" && notified.date !== todayStr);
+  const writeProjection = proj.kind === "absent" || proj.kind === "corrupt" || (proj.kind === "valid" && proj.date !== todayStr);
+  const notify = notified.kind !== "unknown" && !(notified.kind === "sent" && notified.date === todayStr);
   return { writeProjection, notify };
 }
