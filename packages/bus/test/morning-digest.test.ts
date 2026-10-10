@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { composeDigest, digestProjection, digestEnabled, digestActions, digestTextFromProjection, type ProjState } from "../src/swarm/morning-digest.js";
-import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources } from "../src/swarm/morning-digest-store.js";
+import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources, archiveLegacyMigration } from "../src/swarm/morning-digest-store.js";
 
 const validProj = (date: string): ProjState => ({ kind: "valid", date, projection: { schema: "morning-digest/v1", date, generatedAtSec: 0, sections: [] } });
 
@@ -126,5 +126,33 @@ describe("morning-digest-store — gatherDigestSources (negation-aware, unknown-
     chmodSync(f, 0o000);
     expect(gatherDigestSources(HOME)).toBeNull();
     chmodSync(f, 0o600);
+  });
+});
+
+describe("morning-digest-store — archiveLegacyMigration (MD-R7-P2-2, per-date append-only)", () => {
+  let HOME: string;
+  beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-digest-")); });
+  afterEach(() => { try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ } });
+  const migFile = (date: string): string => path.join(HOME, ".agenthop", "console", "morning-digest", "needs-migration", `${date}.json`);
+
+  test("archives a legacy date per file, carrying the date; append-only (never modifies an existing record)", () => {
+    expect(archiveLegacyMigration(HOME, "2026-10-10")).toBe(true);
+    const raw = readFileSync(migFile("2026-10-10"), "utf8");
+    expect(JSON.parse(raw).date).toBe("2026-10-10");
+    expect(raw).toContain("2026-10-10");
+    // a second archive of the SAME date is a no-op success — the original record is untouched (append-only)
+    writeFileSync(migFile("2026-10-10"), JSON.stringify({ date: "2026-10-10", sentinel: "kept" }));
+    expect(archiveLegacyMigration(HOME, "2026-10-10")).toBe(true);
+    expect(JSON.parse(readFileSync(migFile("2026-10-10"), "utf8")).sentinel).toBe("kept"); // not overwritten
+    // a DIFFERENT date is a distinct file (only ever grows)
+    expect(archiveLegacyMigration(HOME, "2026-10-11")).toBe(true);
+    expect(readdirSync(path.dirname(migFile("2026-10-10"))).sort()).toEqual(["2026-10-10.json", "2026-10-11.json"]);
+  });
+
+  test("a path-unsafe date is sanitized to one safe segment (no traversal)", () => {
+    expect(archiveLegacyMigration(HOME, "../evil")).toBe(true);
+    const dir = path.join(HOME, ".agenthop", "console", "morning-digest", "needs-migration");
+    expect(readdirSync(dir).every((n) => !n.includes("/") && n.endsWith(".json"))).toBe(true);
+    expect(existsSync(path.join(HOME, ".agenthop", "console", "evil.json"))).toBe(false); // never escaped
   });
 });

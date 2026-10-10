@@ -65,7 +65,7 @@ import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlocked
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
-import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources } from "../packages/bus/src/swarm/morning-digest-store.js";
+import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources, archiveLegacyMigration } from "../packages/bus/src/swarm/morning-digest-store.js";
 import { successionEnabled } from "../packages/bus/src/swarm/shell-succession.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
@@ -1704,6 +1704,10 @@ async function main(): Promise<void> {
         if (!coord || !coord.trim()) { markNotified(HOME, today, "sent", p.projection); return; } // no coordinator ⇒ no target; the projection is the artifact
         const coordSid = resolveSession(coord, listSessions(HOME));
         if (!coordSid) return; // coordinator not resolvable on this machine yet ⇒ retry (leave none/pending)
+        // MD-R7-P2-2: a LEGACY date-only marker from an EARLIER day is the only record of that day's un-migrated obligation; the
+        // markNotified below overwrites notified.json, so durably ARCHIVE it first (per-date, append-only). If the archive can't
+        // persist, do NOT overwrite — keep the old marker recoverable and retry next tick.
+        if (notified.kind === "pending" && !notified.body && notified.date !== today && !archiveLegacyMigration(HOME, notified.date)) return;
         if (!markNotified(HOME, today, "pending", p.projection)) return; // MD-P2-1: claim + freeze the body BEFORE sending; if it can't persist, do NOT send (retry)
         try {
           // MD-P2-1: the durable-first credential makes writeInbox exactly-once across the coordinator's claim/ack/restart. Confirm

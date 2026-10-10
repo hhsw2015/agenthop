@@ -3,7 +3,7 @@
 // marker (separate obligation from the projection, MD-P2-1), and classifies the four projection read states (MD-P2-4). Fail-soft:
 // a source READ ERROR is reported as "unknown" (never a false quiet night, MD-P2-2); the pure composition lives in morning-digest.ts.
 
-import { mkdirSync, writeFileSync, renameSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readFileSync, existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { digestProjection, type DigestSources, type ProjState, type NotifyState, type DigestProjection } from "./morning-digest.js";
@@ -85,6 +85,18 @@ export function readNotifiedState(home: string): NotifyState {
  *  on a failed "pending" claim (retry next tick). Never throws. */
 export function markNotified(home: string, dateStr: string, state: "pending" | "sent", body: DigestProjection): boolean {
   return atomicWriteJson(notifiedPath(home), { date: dateStr, state, body });
+}
+
+/** MD-R7-P2-2 — durably ARCHIVE a legacy (pre-credential, date-only) notify marker before the daily `notified.json` is overwritten
+ *  by a newer day, so its un-migrated obligation is not silently discharged. One file PER DATE under `needs-migration/` (append-only:
+ *  an existing record is NEVER modified), so the old evidence only ever grows. The date is sanitized to one safe path segment and
+ *  also stored verbatim in the body. Returns true if the record is durably present (newly written OR already archived); false on a
+ *  write fault — the caller must then NOT overwrite the marker (keep the old record recoverable, retry). Never throws. */
+export function archiveLegacyMigration(home: string, dateStr: string): boolean {
+  const safe = dateStr.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "unknown-date";
+  const file = path.join(digestDir(home), "needs-migration", `${safe}.json`);
+  if (existsSync(file)) return true; // append-only: an archived migration record is never modified
+  return atomicWriteJson(file, { schema: "morning-digest-migration/v1", date: dateStr, archivedAtSec: Math.floor(Date.now() / 1000), reason: "legacy date-only notify marker superseded by a newer day; pre-credential delivery is unconfirmable — migrate manually, never auto-resend" });
 }
 
 /** Gather the digest sources, fail-soft. PROGRESS.md is the coordinator's narrative projection of the control log + reviews (the

@@ -195,6 +195,13 @@ export function writeInbox(home: string, key: string, msg: InboxMsg, idempotency
  *  credential is unreadable). Only "published" / "already" are confirmed; the rest must keep the obligation VISIBLE for a later retry. */
 export type WriteResult = "published" | "already" | "deferred" | "pending" | "unknown";
 
+/** Three-state existence probe for a marker file: "present" / "absent" (confirmed ENOENT) / "unknown" (any other error — a read
+ *  fault must NOT be read as absence, or a crafted/transient EACCES would license a re-publish). lstat (no symlink follow). */
+function probeMarker(markerPath: string): "present" | "absent" | "unknown" {
+  try { lstatSync(markerPath); return "present"; }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
+}
+
 function credDirOf(dir: string): string { return path.join(dir, ".pubcred"); }
 function credPathOf(dir: string, idempotencyKey: string): string {
   return path.join(credDirOf(dir), createHash("sha256").update(idempotencyKey).digest("hex"));
@@ -228,12 +235,17 @@ function eventMessagePresent(dir: string, idempotencyKey: string): boolean {
 function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg): WriteResult {
   const cred = credPathOf(dir, idempotencyKey);
   const msgFile = path.join(dir, `${idempotencyKey}.json`);
-  // Prior-version (r6) credential compat import: r6 recorded publication as a `.published/<key>` marker (raw-key filename). If it is
-  // present, this event was already published+confirmed under r6 ⇒ do NOT republish on upgrade (MD-R7-P2-1) — a confirmed historical
-  // delivery carried across the credential format change. Exclude "." / ".." (r6 itself could never have written a VALID marker for
-  // them — path.join would have escaped `.published`, the very MD-R6-P2-1 bug — so there is nothing legitimate to import, and probing
-  // `.published/..` would resolve to the inbox dir and falsely report "already").
-  if (idempotencyKey !== "." && idempotencyKey !== ".." && existsSync(path.join(dir, ".published", idempotencyKey))) return "already";
+  // Prior-version (r6) credential compat import: r6 recorded publication as a `.published/<key>` marker (raw-key filename). The probe
+  // is THREE-state (MD-R7-P2-1, FC-2 r3 recipe "read-error/absent KEEP vs read-and-invalid"): present ⇒ a confirmed historical r6
+  // delivery ⇒ never republish on upgrade; UNKNOWN (a read fault — e.g. the `.published` dir temporarily unreadable, EACCES) ⇒ can't
+  // tell ⇒ retain the obligation and retry (an `existsSync` here would read EACCES as "absent" and re-deliver); only a confirmed
+  // ENOENT absent ⇒ no prior delivery ⇒ fall through. Exclude "." / ".." (r6 never wrote a valid marker for them, and probing
+  // `.published/..` would resolve to the inbox dir).
+  if (idempotencyKey !== "." && idempotencyKey !== "..") {
+    const r6 = probeMarker(path.join(dir, ".published", idempotencyKey));
+    if (r6 === "present") return "already";
+    if (r6 === "unknown") return "unknown";
+  }
   const state = readCredState(cred);
   if (state === "published") return "already";  // confirmed delivered
   if (state === "unknown") return "unknown";    // unreadable credential ⇒ can't tell; caller keeps the obligation visible, never confirms
