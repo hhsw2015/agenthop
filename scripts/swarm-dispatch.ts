@@ -64,6 +64,7 @@ import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
+import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
 import { successionEnabled } from "../packages/bus/src/swarm/shell-succession.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
@@ -1650,6 +1651,33 @@ async function main(): Promise<void> {
     catch (e) { log(`gauge sampling failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
+  // placement wiring — SUGGESTION MODE ONLY (coordinator ruling, same discipline as review-seat autoscale). Each sweep, if
+  // SWARM_PLACEMENT is on, read the declarative spec, run the pure chain (reconcile → selectBackends on the shortfall), and
+  // ADVISE the coordinator (a durable S19 suggestion, taskRef=placement-suggest) — it NEVER spawns/reclaims and never spends
+  // (real VM ops + budget are the user money gate, R16). Default OFF. Only a REAL delivery consumes the min-dwell slot (so a
+  // logged/deduped/failed advisory re-delivers once the coordinator is reachable). Fully fail-soft: never breaks the sweep.
+  let lastPlacementSuggestSec = 0;
+  let placementReadInFlight = false;
+  const runPlacementSuggest = (): void => {
+    if (!placementEnabled()) return; // SWARM_PLACEMENT default OFF (dormant-ahead-of-use, like SWARM_VM_CTL)
+    if (placementReadInFlight) return; // single-flight: never overlap reads
+    placementReadInFlight = true;
+    void (async () => {
+      try {
+        const spec = readPlacementSpec(HOME);
+        if (!spec) return; // no declarative desired-state ⇒ nothing to advise
+        const now = nowSec();
+        // PW-1: the NOTICE dwell is the wiring's OWN throttle (separate from reconcile's action dwell). The plan below is always
+        // the FULL desired plan; this gate just paces how often we tell the coordinator. Only a real "delivered" advances the
+        // window, so a failed/unreported advisory retries next tick.
+        if (!shouldSuggestPlacement(now, lastPlacementSuggestSec, spec.cfg.minDwellSec)) return;
+        const machines = readLedgerMachines(HOME); // actual state (vm-ctl ledger seam; empty until wired)
+        const sug = planPlacementSuggest(spec, machines);
+        if (sug.hasContent && notifyCoordinator(sug.text, { taskRef: "placement-suggest", title: "placement" }) === "delivered") lastPlacementSuggestSec = now;
+      } finally { placementReadInFlight = false; }
+    })().catch((e) => log(`placement suggest failed (isolated): ${e instanceof Error ? e.message : e}`));
+  };
+
   await runDispatchLoops({
     // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
     // dispatches). T1.5 RED LINE (fe0376cd): --task dispatch stays off (SWARM_TASK_EXEC) until the resume adapter +
@@ -1693,6 +1721,9 @@ async function main(): Promise<void> {
       // T5-5: review-seat autoscale SUGGESTION (never acts) — read the review-queue ledger, advise the coordinator on seat
       // scaling. Gated on SWARM_REVIEW_AUTOSCALE (live by default; kill with =0); fully fail-soft.
       runReviewAutoscaleSuggest();
+      // placement suggestion (reconcile → selectBackends → coordinator advisory). Gated on SWARM_PLACEMENT (default OFF); never
+      // spawns/spends (R16); fully fail-soft.
+      runPlacementSuggest();
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
       // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
       runGaugeSampling();

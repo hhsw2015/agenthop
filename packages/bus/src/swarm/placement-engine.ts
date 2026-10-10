@@ -11,7 +11,16 @@
  * Pure decisions below (selftested): health classification, bin-packing, desired-count diff, the fork health-gate
  * (Betabrand invariant), and the reconcile decision. IO (the loop that reads presence + calls vm-ctl) is dormant
  * (`SWARM_PLACEMENT` off) and lives in the caller. North star: zero external activation.
+ *
+ * phase-2b (below the reconcile): multi-backend + cost-aware spawn selection — a PURE `selectBackends` that turns
+ * reconcile's backend-agnostic `{spawn,n}` into a cheapest-first per-backend plan bounded by each backend's free capacity
+ * AND a budget. The engine DECIDES; the live caller still owns the real spend (an over-budget shortfall is routed to the
+ * user money gate, R16 — never auto-spent). reconcile and the one-way vm-ctl seam are untouched.
  */
+
+import { readFileSync } from "node:fs"; // wiring IO: read the declarative placement spec (dormant: SWARM_PLACEMENT off)
+import path from "node:path";
+import type { Backend } from "./vm-ctl.js"; // phase-2b: reuse vm-ctl's Backend abstraction (type-only; no new backend interface, no runtime coupling)
 
 // ============================================================================================================
 // Pure core (selftested in placement-engine.selftest.mts)
@@ -185,10 +194,225 @@ export function reconcile(d: Demand, machines: readonly MachineView[], cfg: Reco
 }
 
 // ============================================================================================================
+// phase-2b — cost-aware, multi-backend spawn selection (pure; composes with reconcile, does NOT change it)
+// ============================================================================================================
+
+/** A candidate backend for a spawn. `backend` is vm-ctl's Backend id (reused, not re-invented). `costPerMachineMicroUsd` is the
+ *  cost to run ONE machine over the placement horizon as an INTEGER micro-USD (1e-6 USD; 0 = a free tier) — money is carried as
+ *  an integer, never a float (PE2B-1 / the "钱不走 float" ruling family): all budget arithmetic below is then exact. `freeSlots`
+ *  is how many more machines this backend can accept now (its quota/capacity). `priority` is a deterministic tiebreak when cost
+ *  is equal (lower = preferred). */
+export interface BackendOption {
+  backend: Backend;
+  costPerMachineMicroUsd: number;
+  freeSlots: number;
+  priority?: number;
+}
+
+export interface BackendAllocation { backend: Backend; count: number; costMicroUsd: number; } // integer micro-USD
+
+/** The selection outcome. The three shortfall faces are a clean partition of `want`: funded + unfundedByBudget +
+ *  unplaceableByCapacity === want.
+ *  - `funded`: machines placeable within BOTH budget and capacity (the allocation sums to this).
+ *  - `unfundedByBudget`: wanted, capacity exists, but unaffordable within the budget ⇒ the live caller routes these to the
+ *    user money gate (R16); the engine NEVER auto-spends past budget.
+ *  - `unplaceableByCapacity`: wanted but no backend has capacity at ANY price (a hard shortfall). */
+export interface BackendSelection {
+  allocation: BackendAllocation[];
+  funded: number;
+  unfundedByBudget: number;
+  unplaceableByCapacity: number;
+  totalCostMicroUsd: number; // integer; == the allocation-cost sum; always <= budgetMicroUsd (exact integer arithmetic)
+}
+
+const validOption = (o: BackendOption): boolean =>
+  typeof o?.backend === "string" && o.backend.length > 0 &&
+  Number.isSafeInteger(o.costPerMachineMicroUsd) && o.costPerMachineMicroUsd >= 0 && // integer micro-USD (PE2B-1: money is never a float)
+  Number.isInteger(o.freeSlots) && o.freeSlots >= 0 &&
+  (o.priority === undefined || Number.isFinite(o.priority)); // PE2B-3: an invalid (NaN/Inf/non-number) priority drops the whole option — it must NEVER reach the comparator (NaN ?? 0 is still NaN, which sort treats as equal and silently skips the name tiebreak)
+
+/**
+ * Cost-aware, multi-backend selection: place `want` new machines cheapest-first across `options`, bounded by each backend's
+ * `freeSlots` and the `budgetMicroUsd` ceiling. All money is INTEGER micro-USD, so the budget contract
+ * (`totalCostMicroUsd <= budgetMicroUsd`) holds EXACTLY — no float rounding, no epsilon (PE2B-1). Deterministic order: cost
+ * asc, then priority asc, then backend name asc — NO timestamp / "latest wins" (FC-6). An affordable count is the exact
+ * integer-division floor(budgetLeft / cost); a repeated backend id is deduped (first wins — a duplicate must not double its
+ * capacity). `want` MUST be a positive safe integer — a fractional/illegal demand is rejected whole (no floor; matches
+ * reconcile's PE4 contract), yielding an empty plan (fail-closed: never fabricate a spawn). Pure. */
+export function selectBackends(want: number, options: readonly BackendOption[], budgetMicroUsd: number): BackendSelection {
+  const empty: BackendSelection = { allocation: [], funded: 0, unfundedByBudget: 0, unplaceableByCapacity: 0, totalCostMicroUsd: 0 };
+  // PE2B-2: want MUST already be a positive safe integer — never floor a fractional/illegal demand into an executable count.
+  if (!Number.isSafeInteger(want) || want <= 0) return empty;
+  const wantN = want;
+  const budget = Number.isSafeInteger(budgetMicroUsd) && budgetMicroUsd >= 0 ? budgetMicroUsd : 0; // integer micro-USD; invalid ⇒ 0 (nothing affordable)
+
+  const seen = new Set<Backend>();
+  const opts: BackendOption[] = [];
+  for (const o of options) { if (!validOption(o) || seen.has(o.backend)) continue; seen.add(o.backend); opts.push(o); } // dedupe + drop invalid
+  const totalCapacity = opts.reduce((s, o) => s + o.freeSlots, 0);
+  const sorted = [...opts].sort((a, b) =>
+    a.costPerMachineMicroUsd !== b.costPerMachineMicroUsd ? a.costPerMachineMicroUsd - b.costPerMachineMicroUsd
+      : (a.priority ?? 0) !== (b.priority ?? 0) ? (a.priority ?? 0) - (b.priority ?? 0)
+        : a.backend < b.backend ? -1 : a.backend > b.backend ? 1 : 0);
+
+  const allocation: BackendAllocation[] = [];
+  let remaining = wantN, budgetLeft = budget, totalMicro = 0;
+  for (const o of sorted) {
+    if (remaining <= 0) break;
+    if (o.freeSlots <= 0) continue;
+    // integer arithmetic throughout: affordable = exact integer division; take*cost <= budgetLeft <= budget (a safe integer),
+    // so no product/accumulation ever overflows a safe integer or rounds — totalMicro <= budget holds exactly (PE2B-1).
+    const affordable = o.costPerMachineMicroUsd <= 0 ? remaining : Math.floor(budgetLeft / o.costPerMachineMicroUsd);
+    const take = Math.min(remaining, o.freeSlots, affordable);
+    if (take <= 0) continue;
+    const costMicroUsd = take * o.costPerMachineMicroUsd;
+    allocation.push({ backend: o.backend, count: take, costMicroUsd });
+    remaining -= take; budgetLeft -= costMicroUsd; totalMicro += costMicroUsd;
+  }
+
+  const funded = wantN - remaining;
+  const unplaceableByCapacity = Math.max(0, wantN - totalCapacity); // no capacity at any price
+  const unfundedByBudget = remaining - unplaceableByCapacity;       // the rest of the shortfall is budget-limited (>= 0 by construction)
+  return { allocation, funded, unfundedByBudget, unplaceableByCapacity, totalCostMicroUsd: totalMicro };
+}
+
+// ============================================================================================================
+// placement wiring (SUGGESTION MODE) — reconcile → selectBackends → a coordinator advisory. PURE: the engine ADVISES,
+// it NEVER spawns/reclaims (the autoscale-suggest ruling; real VM ops + spend are the user money gate, R16).
+// ============================================================================================================
+
+/** The declarative desired-state spec the coordinator/user authors (read-only INPUT, never written by the engine): the
+ *  demand to satisfy, the reconcile config, the candidate backends (integer micro-USD cost + capacity), and the budget. */
+export interface PlacementSpec {
+  demand: Demand;
+  cfg: ReconcileConfig;
+  backends: BackendOption[];
+  budgetMicroUsd: number;
+}
+
+export type PlacementSpecLoad = { ok: true; spec: PlacementSpec } | { ok: false; reason: string };
+
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** Validate an untrusted spec record and REBUILD it from the validated reads (never trust input methods/extra keys). Money is
+ *  integer micro-USD throughout (PE2B-1). Fail-closed: any illegal field rejects the WHOLE spec (a bad desired-state must never
+ *  drive an advisory). Pure. */
+export function loadPlacementSpec(raw: unknown): PlacementSpecLoad {
+  if (!isObj(raw)) return { ok: false, reason: "spec is not an object" };
+  const d = raw.demand, c = raw.cfg, b = raw.backends;
+  if (!isObj(d)) return { ok: false, reason: "demand missing" };
+  if (!(Number.isFinite(d.boardUnits) && (d.boardUnits as number) >= 0)) return { ok: false, reason: "demand.boardUnits must be a finite >= 0 number" };
+  if (!(Number.isInteger(d.fanoutMachines) && (d.fanoutMachines as number) >= 0)) return { ok: false, reason: "demand.fanoutMachines must be a whole >= 0 number" };
+  if (!isObj(c)) return { ok: false, reason: "cfg missing" };
+  if (!(Number.isFinite(c.perMachineCapacity) && (c.perMachineCapacity as number) > 0)) return { ok: false, reason: "cfg.perMachineCapacity must be > 0" };
+  if (!(Number.isInteger(c.floor) && (c.floor as number) >= 0)) return { ok: false, reason: "cfg.floor must be a whole >= 0 number" };
+  for (const k of ["reclaimIdleSec", "expiringSec", "minDwellSec"] as const) {
+    if (!(Number.isFinite(c[k]) && (c[k] as number) >= 0)) return { ok: false, reason: `cfg.${k} must be a finite >= 0 number` };
+  }
+  if (!Array.isArray(b)) return { ok: false, reason: "backends must be an array" };
+  const backends: BackendOption[] = [];
+  for (let i = 0; i < b.length; i++) { // index walk — never iterate/spread untrusted input
+    const o = b[i];
+    if (!isObj(o)) return { ok: false, reason: `backends[${i}] is not an object` };
+    if (!(typeof o.backend === "string" && o.backend.length > 0)) return { ok: false, reason: `backends[${i}].backend must be a non-empty string` };
+    if (!(Number.isSafeInteger(o.costPerMachineMicroUsd) && (o.costPerMachineMicroUsd as number) >= 0)) return { ok: false, reason: `backends[${i}].costPerMachineMicroUsd must be a non-negative safe integer (micro-USD)` };
+    if (!(Number.isInteger(o.freeSlots) && (o.freeSlots as number) >= 0)) return { ok: false, reason: `backends[${i}].freeSlots must be a whole >= 0 number` };
+    if (!(o.priority === undefined || Number.isFinite(o.priority))) return { ok: false, reason: `backends[${i}].priority must be a finite number when present` };
+    backends.push({ backend: o.backend, costPerMachineMicroUsd: o.costPerMachineMicroUsd as number, freeSlots: o.freeSlots as number, ...(o.priority === undefined ? {} : { priority: o.priority as number }) });
+  }
+  if (!(Number.isSafeInteger(raw.budgetMicroUsd) && (raw.budgetMicroUsd as number) >= 0)) return { ok: false, reason: "budgetMicroUsd must be a non-negative safe integer (micro-USD)" };
+  const spec: PlacementSpec = {
+    demand: { boardUnits: d.boardUnits as number, fanoutMachines: d.fanoutMachines as number },
+    cfg: { perMachineCapacity: c.perMachineCapacity as number, floor: c.floor as number, reclaimIdleSec: c.reclaimIdleSec as number, expiringSec: c.expiringSec as number, minDwellSec: c.minDwellSec as number },
+    backends,
+    budgetMicroUsd: raw.budgetMicroUsd as number,
+  };
+  return { ok: true, spec };
+}
+
+/** The advisory the wiring delivers. `hasContent` false ⇒ a pure hold (nothing worth advising) ⇒ the caller sends nothing. */
+export interface PlacementSuggestion {
+  hasContent: boolean;
+  text: string;
+  spawnFunded: number;
+  needUserGate: number; // unfundedByBudget — capacity exists but over budget ⇒ the R16 user money gate
+  capacityGap: number;  // unplaceableByCapacity — no backend capacity at any price
+  reclaims: number;
+  rebuilds: number;
+}
+
+/** Fold reconcile's actions + the spawn's backend selection into a coordinator advisory. The spawn's three faces are reported
+ *  distinctly: the FUNDED per-backend plan, the UNFUNDED-by-budget count (needs the R16 user money gate), and the capacity gap.
+ *  reclaim/rebuild actions are advised, never executed. Pure. */
+export function buildPlacementSuggestion(actions: readonly Action[], selection: BackendSelection | null): PlacementSuggestion {
+  const spawn = actions.find((a): a is Extract<Action, { kind: "spawn" }> => a.kind === "spawn");
+  const reclaims = actions.filter((a): a is Extract<Action, { kind: "reclaim" }> => a.kind === "reclaim");
+  const rebuilds = actions.filter((a): a is Extract<Action, { kind: "rebuild" }> => a.kind === "rebuild");
+  const sel = spawn ? selection : null;
+  const spawnFunded = sel?.funded ?? 0;
+  const needUserGate = sel?.unfundedByBudget ?? 0;
+  const capacityGap = sel?.unplaceableByCapacity ?? 0;
+  const lines: string[] = ["[placement suggestion] SUGGESTION MODE — the engine ADVISES; it never spawns/reclaims (R16: real VM ops + spend are the user's gate)."];
+  if (sel) {
+    if (sel.allocation.length) {
+      lines.push(`spawn plan — funded ${spawnFunded} within budget ${sel.totalCostMicroUsd}µUSD:`);
+      for (const a of sel.allocation) lines.push(`  - ${a.backend}: ${a.count} machine(s) @ ${a.costMicroUsd}µUSD`);
+    }
+    if (needUserGate > 0) lines.push(`USER MONEY GATE (R16): ${needUserGate} machine(s) have capacity but exceed the budget — approve spend to place them.`);
+    if (capacityGap > 0) lines.push(`capacity shortfall: ${capacityGap} machine(s) cannot be placed on any backend at any price — add backend capacity.`);
+  }
+  for (const r of reclaims) lines.push(`advise reclaim ${r.id} (${r.reason})`);
+  for (const r of rebuilds) lines.push(`advise rebuild ${r.id} (expiring)`);
+  const hasContent = (!!sel && (spawnFunded > 0 || needUserGate > 0 || capacityGap > 0)) || reclaims.length > 0 || rebuilds.length > 0;
+  return { hasContent, text: lines.join("\n"), spawnFunded, needUserGate, capacityGap, reclaims: reclaims.length, rebuilds: rebuilds.length };
+}
+
+/** The whole suggestion chain, PURE + end-to-end testable: reconcile (desired vs actual machines) → selectBackends on the
+ *  spawn shortfall (cheapest-first within budget) → fold into an advisory. No IO, no spend, no VM ops.
+ *
+ *  PW-1: suggestion mode shows the COMPLETE desired plan, so reconcile is run with its action-dwell SATISFIED (`minDwellSec`
+ *  passed as the since-last) — never the urgent-floor SUBSET that reconcile returns inside an unexpired action dwell. Mixing
+ *  reconcile's action dwell with the wiring's notice timing (the first cut) let that floor subset re-fire and perpetually
+ *  postpone the full-demand advisory. Here the engine always advises the full plan; HOW OFTEN it is delivered is the wiring's
+ *  job (shouldSuggestPlacement), a responsibility kept entirely separate from reconcile's (signed, untouched) heal semantics. */
+export function planPlacementSuggest(spec: PlacementSpec, machines: readonly MachineView[]): PlacementSuggestion {
+  const actions = reconcile(spec.demand, machines, spec.cfg, spec.cfg.minDwellSec); // minDwellSec >= minDwellSec ⇒ dwellOk ⇒ full plan (not the urgent subset)
+  const spawn = actions.find((a): a is Extract<Action, { kind: "spawn" }> => a.kind === "spawn");
+  const selection = spawn ? selectBackends(spawn.n, spec.backends, spec.budgetMicroUsd) : null;
+  return buildPlacementSuggestion(actions, selection);
+}
+
+/** PW-1: the NOTICE dwell — the wiring's OWN delivery throttle, independent of reconcile's action dwell. True ⇒ a suggestion
+ *  may be delivered this tick. Non-finite clock ⇒ false (never fire without a clock); non-positive/invalid dwell ⇒ true (no
+ *  throttle — every tick). Only a real "delivered" should advance `lastSuggestSec` (the caller's job), so a failed/unreported
+ *  advisory retries next tick. Pure (mirrors shouldSampleGauge). */
+export function shouldSuggestPlacement(nowSec: number, lastSuggestSec: number, minDwellSec: number): boolean {
+  if (!Number.isFinite(nowSec)) return false;
+  if (!(Number.isFinite(minDwellSec) && minDwellSec > 0)) return true;
+  return nowSec - lastSuggestSec >= minDwellSec;
+}
+
+// ============================================================================================================
 // IO shell — the reconcile loop (dormant: SWARM_PLACEMENT off; lives in the caller, exercised by live runs)
 // ============================================================================================================
 
 /** placement wiring flip, default OFF (dormant-ahead-of-use, like SWARM_VM_CTL / SWARM_SEAT_CAPS). */
 export function placementEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return /^(1|true|yes|on)$/i.test(env.SWARM_PLACEMENT ?? "");
+}
+
+/** Read the declarative placement spec from `<home>/.agenthop/placement/spec.json`, validated through loadPlacementSpec.
+ *  Fail-soft: absent / unreadable / malformed / invalid ⇒ null (the sweep simply advises nothing this tick). */
+export function readPlacementSpec(home: string): PlacementSpec | null {
+  try {
+    const raw = JSON.parse(readFileSync(path.join(home, ".agenthop", "placement", "spec.json"), "utf8"));
+    const res = loadPlacementSpec(raw);
+    return res.ok ? res.spec : null;
+  } catch { return null; }
+}
+
+/** Observed actual machines (reconcile's ACTUAL state). SEAM: the vm-ctl ledger read lands HERE when vm-ctl is wired; until
+ *  then there is no live machine ledger, so this is empty (⇒ the advisory recommends the full demand plan). Fail-soft. */
+export function readLedgerMachines(_home: string): MachineView[] {
+  return []; // no vm-ctl ledger merged yet — the one place a future ledger read plugs in (SWARM_PLACEMENT stays OFF until then)
 }
