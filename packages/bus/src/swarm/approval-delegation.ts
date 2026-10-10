@@ -12,41 +12,53 @@
  * (control-log — the IO round); ③ reuse writeInbox/S11/sweep + control-log (no new persistent surface); ④ Claude members
  * only (Codex has no equivalent decision hook). v1: delegate ALLOW only (deny → user).
  *
- * DESIGN (coordinator r2 ruling, after happycapy's first review caught 3 real pass-throughs AD-P1-1/2/3):
- *   The v0 allowlist is a CLOSED-FORM list, NOT a command-name list. A command name alone (`cat`, `git`) means nothing —
- *   a poisoned option (`find … -delete`, `rg --pre=sh`, `git diff --output=f`), a quote-concatenated path (`cat .e''nv` →
- *   `.env`), or a bare relative name that is actually a symlink (`cat alias` → ../outside) all defeat name-matching. So:
- *     1. planDelegation recognises ONLY an enumerated set of closed forms: a known command with NO options, or ONLY options
- *        from that command's exact whitelist (value-less flag tokens). Any un-enumerated option / redirect / `$`/quote/
- *        backslash anomaly / shell metacharacter / multi-command → needs-user. There is no generic flag parser to fool.
- *     2. A path operand is delegated ONLY against an IO-VERIFIED fact that its realpath (symlinks followed to the end) stays
- *        inside the member cwd; a missing fact or a failed/escaping resolution → needs-user. The pure core holds no FS; the
- *        hook supplies `ApprovalScope` in the IO round. This keeps the core pure AND sound: it never infers scope from spelling.
- *     3. A git read form reads repo-wide, so it is delegated ONLY when the IO fact says cwd IS the git repo root.
- *   Narrow is the point — the north star is fewer popups, and the handful of fixed forms (status/log/ls/cat …) already covers
- *   the bulk of them. grep/rg/find are DEFERRED (not closed forms; pending a sound model or a wider ruling) → needs-user.
+ * DESIGN (coordinator r2/r3 rulings, hardened through happycapy's review rounds — every rule below was an adversarial finding
+ * first):
+ *   The v0 allowlist is a CLOSED-FORM list, NOT a command-name list. A command name alone means nothing — a poisoned option
+ *   (`find … -delete`), a quote-concatenated path (`cat .e''nv`→`.env`), a glob (`cat .e*`), a symlink (`cat alias`→`.env`),
+ *   or an inherited object key (`constructor`) all defeat name-matching. So:
+ *     1. Only an ENUMERATED closed form is recognised — a known command (looked up in a Map, so inherited keys like
+ *        `constructor`/`toString` can NEVER match: AD-R2-P1-1) with NO options or ONLY its exact value-less flag whitelist.
+ *        Any un-enumerated option / redirect / pipe / chain / glob / brace / tilde / `$`-expansion / quote / backslash /
+ *        command-substitution → escalate (coordinator r3 ②: ban every metacharacter arg — narrower and more stable than
+ *        expanding it). No generic flag parser to fool (AD-P1-1, AD-P1-2).
+ *     2. A path operand is delegated ONLY against IO-VERIFIED facts that its realpath (symlinks followed) stays inside cwd AND
+ *        is NOT a credential/secret target (AD-R2-P1-2 — within-cwd ≠ credential-safe: a symlink to `./.env` resolves within
+ *        cwd). The secret-name blacklist is applied BOTH to the raw command (black-before-white) AND, via the hook's resolver,
+ *        to the realpath target (coordinator r3 ④: extend the sensitive-name gate to the argument/target level).
+ *     3. git is KICKED OUT of v0 (coordinator r3 ①): a git read command run AS THE MEMBER TYPED IT honours repo/global config
+ *        (diff.external, *.textconv, core.fsmonitor, core.pager, aliases) and so can EXECUTE an external program, and `git
+ *        show`/`git diff` can DUMP committed credential content — neither is config-immune without rewriting the command with
+ *        `-c` overrides, which the allow/deny decision cannot do. So all git → escalate. git returns via a future ruling once
+ *        a command-rewrite (`git -c diff.external= -c core.pager=cat --no-ext-diff …`) mechanism is confirmed for the hook.
+ *   The pure core holds NO filesystem; the facts (ApprovalScope) are the hook's job in the IO round. Until then path forms fail
+ *   closed. Narrow is the point (coordinator: fewer popups; ls/cat fixed forms cover the bulk). grep/rg/find/git are DEFERRED
+ *   (not safe closed forms) → needs-user.
  *
  * Pure core below (selftested). IO (the sync hook CLI, the coordinator wiring, the control-log `permissionDecision` record,
- * the InboxMsg `approval?` field, the realpath resolver that fills ApprovalScope) is the dormant seam — this round ships the
- * classifier + the closed-form table + the scope-fact contract + flag + selftest first.
+ * the InboxMsg `approval?` field, the realpath+credential resolver that fills ApprovalScope) is the dormant seam.
  */
 
 // ============================================================================================================
 // Pure core (selftested in approval-delegation.selftest.mts)
 // ============================================================================================================
 
-/** IO-VERIFIED filesystem-scope facts the hook attaches to a request (realpath each path operand, following symlinks to the
- *  end, and test containment in realpath(cwd); detect the git repo root). Absent until the IO round / when the hook cannot
- *  resolve — and the classifier FAILS CLOSED without them (never infers scope from the raw spelling; AD-P1-3). */
+/** IO-VERIFIED filesystem-scope facts the hook attaches to a request. The hook realpaths each path operand (following
+ *  symlinks to the end), tests containment in realpath(cwd), and classifies the resolved target as a credential. Absent until
+ *  the IO round / when unresolvable — and the classifier FAILS CLOSED without them (never infers safety from the raw spelling;
+ *  AD-P1-3 / AD-R2-P1-2). */
 export interface ApprovalScope {
   cwdVerified: boolean;  // the hook confirmed cwd is a trustworthy absolute, existing directory (the containment anchor)
-  resolvedPaths: Array<{ raw: string; resolvedWithinCwd: boolean }>; // per path operand: realpath resolved AND stayed within cwd
-  cwdIsGitRoot?: boolean; // for a git read form: cwd == git repo root (so repo-wide read is confined to cwd). absent ⇒ unknown
+  resolvedPaths: Array<{
+    raw: string;                 // the raw operand as parsed from the command (must match planDelegation's pathArgs)
+    resolvedWithinCwd: boolean;  // realpath(raw) resolved AND stayed within realpath(cwd), symlinks followed
+    resolvedSensitive: boolean;  // the resolved target is a credential/secret file (AD-R2-P1-2) ⇒ never delegate
+  }>;
 }
 
 /** The S11 payload a PermissionRequest hook writes to the coordinator. Built from the Claude hook stdin:
  *  tool_name→tool, tool_input.command→command (""` for a structured tool), session_id→member, cwd, prompt_id→promptId.
- *  `scope` carries the hook's IO-verified facts (absent until the IO round ⇒ path/git forms fail closed). */
+ *  `scope` carries the hook's IO-verified facts (absent until the IO round ⇒ path forms fail closed). */
 export interface ApprovalRequest {
   member: string;   // requesting member's session id (Claude)
   tool: string;     // tool_name (Bash | Read | Write | mcp__… | …)
@@ -79,38 +91,38 @@ export interface PermissionDecision {
  *  was blocked at the dialog anyway) and NEVER an auto-grant. */
 export const APPROVAL_POLL_SEC = 15;
 
-// ── The CLOSED-FORM table (coordinator r2: a form = a command + an EXACT value-less flag whitelist). Any option not listed,
-//    any value-taking flag, any positional where none is allowed ⇒ not a recognised form ⇒ needs-user. Narrow by design. ──
+// ── The CLOSED-FORM table (coordinator r2: a form = a command + an EXACT value-less flag whitelist). A Map — NOT a plain
+//    object — so an inherited key (`constructor`, `toString`, `hasOwnProperty`) can never resolve to a form (AD-R2-P1-1). ──
 
 /** A non-git read command: its exact allowed value-less flag tokens, and whether it takes path operands (scope-checked). */
 interface ReadForm { flags: Set<string>; takesPaths: boolean }
-const READ_FORMS: Record<string, ReadForm> = {
-  cat:   { flags: new Set(["-n", "-b"]), takesPaths: true },
-  head:  { flags: new Set([]), takesPaths: true },
-  tail:  { flags: new Set([]), takesPaths: true },
-  wc:    { flags: new Set(["-l", "-w", "-c", "-m", "-lw", "-wl"]), takesPaths: true },
-  ls:    { flags: new Set(["-l", "-a", "-la", "-al", "-lh", "-alh", "-lah", "-h", "-1", "-R", "-lR", "-t", "-lt", "-rt", "-lrt", "-ltr", "-r"]), takesPaths: true },
-  file:  { flags: new Set([]), takesPaths: true },
-  stat:  { flags: new Set([]), takesPaths: true },
-};
+const READ_FORMS = new Map<string, ReadForm>([
+  ["cat",  { flags: new Set(["-n", "-b"]), takesPaths: true }],
+  ["head", { flags: new Set([]), takesPaths: true }],
+  ["tail", { flags: new Set([]), takesPaths: true }],
+  ["wc",   { flags: new Set(["-l", "-w", "-c", "-m", "-lw", "-wl"]), takesPaths: true }],
+  ["ls",   { flags: new Set(["-l", "-a", "-la", "-al", "-lh", "-alh", "-lah", "-h", "-1", "-R", "-lR", "-t", "-lt", "-rt", "-lrt", "-ltr", "-r"]), takesPaths: true }],
+  ["file", { flags: new Set([]), takesPaths: true }],
+  ["stat", { flags: new Set([]), takesPaths: true }],
+]);
 /** Scope-free commands: no filesystem read by a cwd-relative path (their args are literals / command names / cwd itself). */
 const SCOPE_FREE = new Set(["pwd", "echo", "which", "basename", "dirname"]);
-/** git read subcommands and their exact allowed value-less flag tokens (NO positional operand — a ref/pathspec widens scope
- *  past cwd, so `git diff HEAD` / `git branch X` / `git remote add …` are all un-enumerated ⇒ needs-user). git log also
- *  allows a bare `-<digits>` count. A git read form reads repo-wide ⇒ it is delegated only when cwd IS the repo root. */
-const GIT_FORMS: Record<string, Set<string>> = {
-  status: new Set(["-s", "--short", "--porcelain", "-b", "--branch", "-sb", "--long"]),
-  log:    new Set(["--oneline", "--stat", "--graph", "--decorate", "--no-color", "--numstat", "--shortstat", "--name-only", "--name-status", "--all"]),
-  diff:   new Set(["--stat", "--cached", "--staged", "--name-only", "--name-status", "--numstat", "--shortstat", "--summary"]),
-  show:   new Set(["--stat", "--numstat", "--name-only", "--name-status"]),
-  branch: new Set(["-a", "--all", "-v", "-vv", "-r", "--list", "-l"]),
-  remote: new Set(["-v", "--verbose"]),
-};
 
-/** A clearly cwd-escaping path spelling — an absolute path, a home expansion, or a `..` component. A fast structural reject
- *  (→ needs-user); a non-escaping relative spelling is NOT trusted either, it still requires the realpath scope fact. */
+/** The credential/secret path signature — shared by the blacklist (raw command) and isSensitivePath (resolved target). Covers
+ *  the coordinator r3 ④ list: `.env*`, `.git/credentials`, `*.pem`, `*.key`, `id_rsa*`, ssh/aws material, tokens/passwords. */
+const SECRET_RE = /(\.env\b|id_rsa|id_ed25519|id_dsa|id_ecdsa|\.pem\b|\.key\b|credentials|\.aws\b|\.ssh\b|\.npmrc|\.git-credentials|\.netrc|secret|token|password|passwd|\.agenthop\/identity)/;
+
+/** True iff a (realpath-resolved) target is a credential/secret file. The IO resolver calls this on each realpath to fill
+ *  `resolvedSensitive`, so the hook and the contract agree; the pure classifier then trusts that boolean. Pure. */
+export function isSensitivePath(resolvedPath: string): boolean {
+  return SECRET_RE.test(resolvedPath.toLowerCase());
+}
+
+/** A clearly cwd-escaping path spelling — an absolute path or a `..` component. A fast structural reject (→ needs-user); a
+ *  non-escaping relative spelling is NOT trusted either, it still requires the realpath scope fact. (A `~` is rejected earlier
+ *  as an expansion metacharacter, so it never reaches here.) */
 function isEscapingPath(tok: string): boolean {
-  return tok.startsWith("/") || tok.startsWith("~") || tok.split("/").includes("..");
+  return tok.startsWith("/") || tok.split("/").includes("..");
 }
 
 /**
@@ -131,77 +143,63 @@ export function isBlacklisted(tool: string, command: string): boolean {
     /[>]/.test(c) ||                                                                                   // any redirect-write (non-read-only)
     /\|\s*(sh|bash|zsh|python[0-9.]*|node|ruby|perl|eval)\b/.test(c) ||                                // pipe-to-interpreter
     /(^|[\s;&|(])git\s+(push|commit|reset|clean|checkout|switch|restore|rebase|merge|stash|rm|mv|apply|am|cherry-pick|tag\s|branch\s+-[dDmM]|config)\b/.test(c) || // git mutation
-    /(\.env\b|id_rsa|id_ed25519|id_dsa|id_ecdsa|\.pem\b|\.key\b|credentials|\.aws\b|\.ssh\b|\.npmrc|\.git-credentials|\.netrc|secret|token|password|passwd|\.agenthop\/identity)/.test(c) // cred/secret paths
+    SECRET_RE.test(c) // cred/secret paths in the raw command (black-before-white, extended to the argument level — r3 ④)
   );
 }
 
 /** The structural plan for a Bash command — PURE, no filesystem facts. The single source of truth for both the classifier
  *  (which then applies scope facts) and the IO hook (which reads `pathArgs` to know what to realpath-resolve). Everything not
- *  an enumerated closed form resolves to `escalate` (privilege for the blacklist backstop / command substitution, else
- *  needs-user). Pure. */
+ *  an enumerated closed form resolves to `escalate`. Pure. */
 export type DelegationPlan =
   | { gate: "escalate"; reason: "privilege" | "needs-user" }
   | { gate: "scope-free" }                           // delegate with no facts (pwd/echo/which/basename/dirname)
-  | { gate: "scope-paths"; pathArgs: string[] }      // delegate iff facts prove every operand's realpath within cwd
-  | { gate: "scope-git" };                            // delegate iff cwd is the git repo root
+  | { gate: "scope-paths"; pathArgs: string[] };     // delegate iff facts prove every operand within cwd AND not sensitive
+
+const esc = (reason: "privilege" | "needs-user"): DelegationPlan => ({ gate: "escalate", reason });
 
 export function planDelegation(command: string): DelegationPlan {
   const c = command.trim();
-  if (c === "") return { gate: "escalate", reason: "needs-user" };
-  if (/`|\$\(/.test(c)) return { gate: "escalate", reason: "privilege" };   // command substitution (dangerous intent)
-  if (/\$/.test(c)) return { gate: "escalate", reason: "needs-user" };      // variable expansion — unanalyzable
-  if (/['"\\]/.test(c)) return { gate: "escalate", reason: "needs-user" };  // quote/backslash anomaly (AD-P1-2 concatenation)
-  if (isBlacklisted("Bash", c)) return { gate: "escalate", reason: "privilege" };
-  if (/[;&|<>(){}\n]/.test(c)) return { gate: "escalate", reason: "needs-user" }; // redirect / chain / multi-command
+  if (c === "") return esc("needs-user");
+  if (/`|\$\(/.test(c)) return esc("privilege");   // command substitution (dangerous intent)
+  if (/\$/.test(c)) return esc("needs-user");       // variable expansion — unanalyzable
+  if (/['"\\]/.test(c)) return esc("needs-user");   // quote/backslash anomaly (AD-P1-2 concatenation)
+  if (isBlacklisted("Bash", c)) return esc("privilege");
+  if (/[;&|<>(){}\n]/.test(c)) return esc("needs-user"); // redirect / chain / multi-command / brace group
+  if (/[*?[\]{}~]/.test(c)) return esc("needs-user");    // glob / brace / tilde — expansion widens the operand set (r3 ②)
 
   const tokens = c.split(/\s+/).filter(t => t.length > 0);
   const cmd = tokens[0].toLowerCase();
   const rest = tokens.slice(1);
 
-  if (cmd === "pwd") return rest.length === 0 ? { gate: "scope-free" } : { gate: "escalate", reason: "needs-user" };
+  if (cmd === "pwd") return rest.length === 0 ? { gate: "scope-free" } : esc("needs-user");
   if (SCOPE_FREE.has(cmd)) return { gate: "scope-free" }; // echo/which/basename/dirname: args are literals, not file reads
-  if (cmd === "git") return planGit(rest);
 
-  const form = READ_FORMS[cmd];
-  if (!form) return { gate: "escalate", reason: "needs-user" };
+  const form = READ_FORMS.get(cmd);                  // Map.get ⇒ inherited keys (constructor/…) return undefined (AD-R2-P1-1)
+  if (!form) return esc("needs-user");               // unknown command, incl. git (kicked out of v0 — r3 ①)
   const pathArgs: string[] = [];
   for (const tok of rest) {
     if (tok.startsWith("-")) {
-      if (!form.flags.has(tok)) return { gate: "escalate", reason: "needs-user" }; // un-enumerated option
+      if (!form.flags.has(tok)) return esc("needs-user"); // un-enumerated option
       continue;
     }
-    if (!form.takesPaths) return { gate: "escalate", reason: "needs-user" };
-    if (isEscapingPath(tok)) return { gate: "escalate", reason: "needs-user" };    // fast escape reject
+    if (!form.takesPaths) return esc("needs-user");
+    if (isEscapingPath(tok)) return esc("needs-user");    // fast escape reject
     pathArgs.push(tok);
   }
   return { gate: "scope-paths", pathArgs };
 }
 
-function planGit(rest: string[]): DelegationPlan {
-  if (rest.length === 0) return { gate: "escalate", reason: "needs-user" };
-  const sub = rest[0].toLowerCase();
-  const flags = GIT_FORMS[sub];
-  if (!flags) return { gate: "escalate", reason: "needs-user" };
-  for (const tok of rest.slice(1)) {
-    if (sub === "log" && /^-\d+$/.test(tok)) continue; // git log -5
-    if (flags.has(tok)) continue;
-    return { gate: "escalate", reason: "needs-user" };  // unknown flag OR a positional ref/pathspec (widens scope)
-  }
-  return { gate: "scope-git" };
-}
-
 /** Scope gate for a path form: delegate ONLY when cwd is verified AND every parsed operand has an IO fact that its realpath
- *  resolved inside cwd (symlinks followed). A missing fact, a failed/escaping resolution, or an un-covered operand ⇒ false. */
+ *  resolved inside cwd (symlinks followed) AND the resolved target is NOT a credential. Any missing fact / escape / sensitive
+ *  target / un-covered operand ⇒ false. */
 function pathsScopeOk(pathArgs: string[], scope?: ApprovalScope): boolean {
   if (!scope || !scope.cwdVerified) return false;
-  const verdict = new Map(scope.resolvedPaths.map(r => [r.raw, r.resolvedWithinCwd]));
-  for (const p of pathArgs) if (verdict.get(p) !== true) return false; // includes the missing-fact case
+  const byRaw = new Map(scope.resolvedPaths.map(r => [r.raw, r]));
+  for (const p of pathArgs) {
+    const r = byRaw.get(p);
+    if (!r || !r.resolvedWithinCwd || r.resolvedSensitive) return false; // missing fact, escape, or credential (AD-R2-P1-2)
+  }
   return true; // pathArgs empty (e.g. `ls` listing cwd) ⇒ vacuously within cwd once cwdVerified
-}
-
-/** Scope gate for a git read form: delegate ONLY when cwd is verified AND is the git repo root (AD-P1-3 parent-repo scope). */
-function gitScopeOk(scope?: ApprovalScope): boolean {
-  return !!scope && scope.cwdVerified && scope.cwdIsGitRoot === true;
 }
 
 /**
@@ -214,7 +212,6 @@ export function classifyApproval(req: ApprovalRequest): ApprovalVerdict {
   switch (plan.gate) {
     case "escalate":    return { kind: "escalate", reason: plan.reason };
     case "scope-free":  return { kind: "delegate", behavior: "allow" };
-    case "scope-git":   return gitScopeOk(req.scope) ? { kind: "delegate", behavior: "allow" } : { kind: "escalate", reason: "needs-user" };
     case "scope-paths": return pathsScopeOk(plan.pathArgs, req.scope) ? { kind: "delegate", behavior: "allow" } : { kind: "escalate", reason: "needs-user" };
   }
 }
@@ -225,15 +222,14 @@ export function validApprovalScope(raw: unknown): ApprovalScope | null {
   const r = raw as Record<string, unknown>;
   if (typeof r.cwdVerified !== "boolean") return null;
   if (!Array.isArray(r.resolvedPaths)) return null;
-  const resolved: Array<{ raw: string; resolvedWithinCwd: boolean }> = [];
+  const resolved: ApprovalScope["resolvedPaths"] = [];
   for (const e of r.resolvedPaths) {
     if (typeof e !== "object" || e === null) return null;
     const p = e as Record<string, unknown>;
-    if (typeof p.raw !== "string" || typeof p.resolvedWithinCwd !== "boolean") return null;
-    resolved.push({ raw: p.raw, resolvedWithinCwd: p.resolvedWithinCwd });
+    if (typeof p.raw !== "string" || typeof p.resolvedWithinCwd !== "boolean" || typeof p.resolvedSensitive !== "boolean") return null;
+    resolved.push({ raw: p.raw, resolvedWithinCwd: p.resolvedWithinCwd, resolvedSensitive: p.resolvedSensitive });
   }
-  if (r.cwdIsGitRoot !== undefined && typeof r.cwdIsGitRoot !== "boolean") return null;
-  return { cwdVerified: r.cwdVerified, resolvedPaths: resolved, ...(typeof r.cwdIsGitRoot === "boolean" ? { cwdIsGitRoot: r.cwdIsGitRoot } : {}) };
+  return { cwdVerified: r.cwdVerified, resolvedPaths: resolved };
 }
 
 /** Validate an untrusted ApprovalRequest (the S11 payload the coordinator reads) — fail-closed: a malformed request is not an
@@ -254,7 +250,8 @@ export function validApprovalRequest(raw: unknown): ApprovalRequest | null {
 }
 
 // ============================================================================================================
-// IO shell — dormant (SWARM_APPROVAL_DELEGATE off; the sync hook + coordinator wiring + realpath resolver land in the IO round)
+// IO shell — dormant (SWARM_APPROVAL_DELEGATE off; the sync hook + coordinator wiring + realpath/credential resolver land in
+// the IO round)
 // ============================================================================================================
 
 /** Dormant wiring flip, default OFF (opt-in; the sync PermissionRequest hook + coordinator delegation only run when on —

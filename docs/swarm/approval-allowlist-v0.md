@@ -32,21 +32,25 @@ tool != Bash                                  -> needs-user  (v0 inspects Bash o
 command substitution  $( )  or backticks      -> privilege
 $ variable expansion                          -> needs-user  (unanalyzable)
 ' " \  quote / backslash                       -> needs-user  (AD-P1-2 concatenation anomaly)
-BLACKLIST backstop (rm/sudo/redirect/…)        -> privilege
-; & | < > ( ) { }  other metacharacter         -> needs-user  (redirect / chain / multi-command)
+BLACKLIST backstop (rm/sudo/redirect/secret…)  -> privilege
+; & | < > ( ) { }  control metacharacter       -> needs-user  (redirect / chain / multi-command / brace group)
+* ? [ ] { } ~  expansion metacharacter         -> needs-user  (glob/brace/tilde widen the operand set past the scoped word; r3 ②)
 enumerated closed form:
   scope-free form                              -> delegate:allow          (no facts needed)
-  git read form   + cwd IS git repo root       -> delegate:allow          (else needs-user)
-  path form       + every operand realpath∈cwd -> delegate:allow          (else needs-user)
-anything else                                  -> needs-user
+  path form  + every operand realpath∈cwd AND not a credential -> delegate:allow  (else needs-user)
+anything else (incl. ALL git — r3 ①)           -> needs-user
 ```
+
+Tables are **Maps**, not plain objects, so an inherited key (`constructor`, `toString`, `__proto__`) can never resolve to a
+form (AD-R2-P1-1).
 
 ## The delegable closed forms
 
 **Scope-free (delegate with no facts — no cwd-relative file read):**
 `pwd` (no args) · `echo …` (args are literals) · `which …` · `basename …` · `dirname …`
 
-**Path forms (delegate only with verified realpath-within-cwd facts for every operand):**
+**Path forms (delegate only when the IO facts prove EVERY operand's realpath (symlinks followed) stays within cwd AND is NOT a
+credential — within-cwd ≠ credential-safe, AD-R2-P1-2):**
 
 | command | allowed options (exact, value-less) | operands |
 |---|---|---|
@@ -58,16 +62,7 @@ anything else                                  -> needs-user
 | `file` | (none) | path(s) |
 | `stat` | (none) | path(s) |
 
-**git read forms (delegate only when the IO fact says cwd IS the git repo root; NO positional ref/pathspec):**
-
-| subcommand | allowed options (exact) |
-|---|---|
-| `git status` | `-s --short --porcelain -b --branch -sb --long` |
-| `git log`    | `--oneline --stat --graph --decorate --no-color --numstat --shortstat --name-only --name-status --all` and `-<N>` |
-| `git diff`   | `--stat --cached --staged --name-only --name-status --numstat --shortstat --summary` |
-| `git show`   | `--stat --numstat --name-only --name-status` |
-| `git branch` | `-a --all -v -vv -r --list -l` |
-| `git remote` | `-v --verbose` |
+No git form is delegable in v0 — see Deferred.
 
 ## The BLACKLIST backstop (→ escalate:"privilege")
 
@@ -79,12 +74,19 @@ redirect · `… | sh|bash|python|node|…` · `$(…)` / backticks · `git push
 credential/secret paths (`.env id_rsa .pem .key credentials .aws .ssh .npmrc .git-credentials .netrc secret token password
 ~/.agenthop/identity`).
 
-## Deferred (named in the original freeze, NOT closed forms yet ⇒ escalate for now)
+## Deferred (NOT safe closed forms yet ⇒ escalate for now)
 
-`grep` / `rg` / `find` are deferred: `find` has an open-ended action grammar (`-delete`/`-exec`), `rg` is recursive-by-default
-(can't pre-enumerate the files it reads), and `grep`'s pattern+recursion surface needs a sound model. They route to
-`needs-user` in v0 and return via a future ruling with a verified model. This narrows v0 below the original example list on
-purpose (coordinator r2: "宁可代理集窄到只剩十几个形态").
+- **git — ALL subcommands (coordinator r3 ①).** A git read command run AS THE MEMBER TYPED IT honours repo/global config
+  (`diff.external`, `*.textconv`, `core.fsmonitor`, `core.pager`, aliases) and can therefore EXECUTE an external program, and
+  `git show`/`git diff` can DUMP committed credential content. Neither is config-immune without rewriting the command with
+  `-c` overrides (`git -c diff.external= -c core.pager=cat --no-ext-diff …`), which an allow/deny decision cannot do. So git
+  is kicked out of v0 and returns via a future ruling once a command-rewrite mechanism is confirmed for the hook (the IO
+  round). (The blacklist still labels git MUTATIONS `privilege`; git reads fall to `needs-user`.)
+- **grep / rg / find** — not closed forms: `find` has an open-ended action grammar (`-delete`/`-exec`), `rg` is
+  recursive-by-default (can't pre-enumerate the files it reads), `grep`'s pattern+recursion surface needs a sound model.
+
+All route to `needs-user` in v0 and return via a future ruling with a verified model. This narrows v0 below the original
+example list on purpose (coordinator: "宁可代理集窄到只剩十几个形态").
 
 ## How to change this
 
