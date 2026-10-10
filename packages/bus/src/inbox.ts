@@ -392,14 +392,25 @@ function parsePoisonNotice(raw: string): { kind: "current"; target: string; sour
   return validInboxMsg(parsed) ? { kind: "migrate" } : null; // FC-7: a bare-InboxMsg legacy record (never target-guessed)
 }
 
-/** FC-2 — is the poison SOURCE actually quarantined? quarantineInbox links the bytes to `<dir>/quarantine/<base>.<ts>.<hex>`, so a
- *  file there whose name starts with the source basename is proof the move happened. The drain uses this instead of a separately
- *  -persisted "confirmed" flag, so a crash or write fault between the move and a flag write can never strand the report
- *  (PD-R5-P2-2). A missing/unreadable quarantine dir => not confirmed (keep + retry). Pure over the fs. */
+/** FC-2 — is the poison SOURCE actually quarantined? quarantineInbox links the bytes to `<dir>/quarantine/<base>.<ts>.<hex>`
+ *  (ts = Date.now() digits, hex = 16 lowercase hex). PROOF requires an EXACT match of THIS event's receipt shape, not a mere
+ *  prefix (PD-R6-P2-1 A: a different event `<base>.other.json` would receipt as `<base>.other.json.<ts>.<hex>`, which shares the
+ *  `<base>.` prefix — so match the full `^<base>\.\d+\.[0-9a-f]{16}$` where the segment after the source basename is strictly the
+ *  generated suffix), AND the entry must be a regular FILE (PD-R6-P2-1 B: a directory or a broken/sym-link named like a receipt
+ *  is not our quarantined bytes; quarantineInbox hard-links, so a real receipt is always a plain file). A missing/unreadable
+ *  quarantine dir, or an entry that vanishes/can't be stat'd, is NOT proof (keep + retry). Pure over the fs. */
 function isQuarantineConfirmed(source: string): boolean {
   const qdir = path.join(path.dirname(source), "quarantine");
-  const prefix = `${path.basename(source)}.`; // quarantined name = "<base>.<ts>.<hex>"
-  try { return readdirSync(qdir).some((n) => n.startsWith(prefix)); } catch { return false; }
+  const base = path.basename(source);
+  const receipt = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\d+\\.[0-9a-f]{16}$`);
+  let names: string[];
+  try { names = readdirSync(qdir); } catch { return false; } // missing/unreadable quarantine dir ⇒ not confirmed
+  for (const n of names) {
+    if (!receipt.test(n)) continue; // not THIS event's receipt shape (distinguishes the source basename from the generated suffix)
+    try { if (lstatSync(path.join(qdir, n)).isFile()) return true; } catch { /* vanished / unstattable ⇒ not proof */ }
+    // a directory / symlink / broken link named like a receipt is NOT the quarantined bytes ⇒ keep scanning
+  }
+  return false;
 }
 
 /** FC-2 (PD-P2-2) — persist the durable obligation for a poison EVENT BEFORE its quarantine move (keyed by the source =>

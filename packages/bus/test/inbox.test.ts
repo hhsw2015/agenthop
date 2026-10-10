@@ -371,6 +371,34 @@ describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
     expect(enqueuePoisonNotice(HOME, srcPath("s1", "b.json"), "coord-a", pnMsg("b", 9))).toBe(false);
   });
 
+  test("PD-R6-P2-1 A: a DIFFERENT event's receipt sharing the source-name prefix does NOT confirm this event (exact match)", () => {
+    const source = srcPath("s1", "event.json");
+    enqueuePoisonNotice(HOME, source, "coord-a", pnMsg("mine", 1));
+    const q = path.join(HOME, ".agenthop", "inbox", "s1", "quarantine");
+    mkdirSync(q, { recursive: true });
+    // another event `event.json.other.json` quarantined — receipt shares the "event.json." PREFIX but is NOT ours
+    writeFileSync(path.join(q, "event.json.other.json.123456.cafebabecafebabe"), "other-bytes");
+    let calls = 0;
+    drainPoisonNotices(HOME, () => { calls++; return "sent"; });
+    expect(calls).toBe(0);           // our event is NOT confirmed by the other's receipt
+    expect(pnJsonCount()).toBe(1);   // obligation retained (our event really isn't quarantined yet)
+  });
+
+  test("PD-R6-P2-1 B: a directory named like a receipt does NOT confirm quarantine (must be a regular file)", () => {
+    const source = srcPath("s1", "evt.json");
+    enqueuePoisonNotice(HOME, source, "coord-a", pnMsg("mine", 2));
+    const q = path.join(HOME, ".agenthop", "inbox", "s1", "quarantine");
+    mkdirSync(path.join(q, "evt.json.123456.cafebabecafebabe"), { recursive: true }); // a DIR with a receipt-shaped name
+    let calls = 0;
+    drainPoisonNotices(HOME, () => { calls++; return "sent"; });
+    expect(calls).toBe(0);           // a dir is not the quarantined bytes
+    expect(pnJsonCount()).toBe(1);
+    writeFileSync(path.join(q, "evt.json.123457.cafebabecafebabe"), "bytes"); // a real FILE receipt DOES confirm
+    let delivered = 0;
+    drainPoisonNotices(HOME, () => { delivered++; return "sent"; });
+    expect(delivered).toBe(1);
+  });
+
   test("the durable queue has no in-memory cap — 300 confirmed notices all drain over bounded passes, a corrupt one is dropped", () => {
     const dir = pnDir(); mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, "00000000000000000000000000000001.json"), "not valid json{"); // read-OK but invalid ⇒ corrupt ⇒ dropped
