@@ -37,4 +37,28 @@ describe("startup check-in (bus-reachability §4)", () => {
     expect(reportCheckIn(HOME, self(), "claude:agenthop-coordsid01")).toBe("sent");
     expect(inboxFiles("coordsid01").length).toBe(1);
   });
+
+  // D-multica ③ (checkin --note): an optional status note passes through to S11 title + text, pure (no parse, no verdict).
+  test("an optional note is carried verbatim into the checkin title + text + payload", () => {
+    presence("coordsid01");
+    expect(reportCheckIn(HOME, self(), "claude:agenthop-coordsid01", "CI still running")).toBe("sent");
+    const files = inboxFiles("coordsid01");
+    expect(files.length).toBe(1);
+    const msg = JSON.parse(readFileSync(path.join(HOME, ".agenthop", "inbox", "coordsid01", files[0]!), "utf8")) as { text: string; title?: string };
+    expect(msg.title).toBe("CI still running");            // S11 title carries the note
+    expect(msg.text).toContain("CI still running");         // and the text
+    const payload = JSON.parse(msg.text.replace("[checkin] ", "").replace(/ — CI still running$/, "")) as { note?: string; sid: string };
+    expect(payload.note).toBe("CI still running");          // structured payload too
+    expect(payload.sid).toBe("mysid99");                    // base fields intact
+  });
+
+  test("a blank / whitespace note is omitted (no empty title, unchanged base behavior)", () => {
+    presence("coordsid01");
+    expect(reportCheckIn(HOME, self(), "claude:agenthop-coordsid01", "   ")).toBe("sent");
+    const files = inboxFiles("coordsid01");
+    const msg = JSON.parse(readFileSync(path.join(HOME, ".agenthop", "inbox", "coordsid01", files[0]!), "utf8")) as { text: string; title?: string };
+    expect(msg.title).toBeUndefined();                      // no empty title field
+    expect(JSON.parse(msg.text.replace("[checkin] ", ""))).toMatchObject({ sid: "mysid99", handle: "claude:Work-mysid99" });
+    expect(msg.text).not.toContain("—");                    // no trailing note separator
+  });
 });

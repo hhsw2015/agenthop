@@ -61,7 +61,7 @@ import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inb
 import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { coordinatorReportPlan, coordEscalateEnabled, type ReportSeverity } from "../packages/bus/src/swarm/coordinator-report.js";
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
-import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
+import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, classifyFailure, failureHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
@@ -1475,7 +1475,10 @@ async function main(): Promise<void> {
         // quote, or displayed code, and a genuine approval may be live alongside it. It NEVER cancels the S19 approval; it only
         // ANNOTATES it (neutral note, N1). Always build the approval doc; append the hint note when detected.
         const cfHint = screenIndicatesContentFilter(screen) ? contentFilterHintNote() : "";
-        const summary = [ev.explain ? `定性:${ev.explain}` : "", cfHint, screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
+        // D-multica ①: bucket the screen+explain into a failure class and ANNOTATE the alert text only — disposition is unchanged
+        // (the S19 approval below is always built the same way). "unknown" ⇒ "" (no note), the safe direction.
+        const failHint = failureHintNote(classifyFailure(`${ev.explain ?? ""}\n${screen}`));
+        const summary = [ev.explain ? `定性:${ev.explain}` : "", cfHint, failHint, screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
         const doc = buildApprovalDoc({
           from: SELF, fromLabel: "swarm-sentinel", nowSec: nowSec(), member: ev.member, screenSummary: summary,
           options: [{ label: "读屏后裁决", consequence: "批准/拒绝由授权方按实际界面回注(blocked 态不可用 prompt,须按 UI 选择 send-keys 等);或中止/另派" }], // N1: prompt is rejected for a blocked agent
