@@ -63,7 +63,7 @@ import { coordinatorReportPlan, coordEscalateEnabled, type ReportSeverity } from
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, classifyFailure, failureHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
-import { roundDoctorEnabled, roundAlertN, diagnoseRounds, buildRoundDoctorNote, parseRoundHistory, DEFAULT_ROUND_DOCTOR_CONFIG } from "../packages/bus/src/swarm/round-doctor.js";
+import { roundDoctorEnabled, roundAlertN, diagnoseRounds, buildRoundDoctorNote, extractTicketRounds, DEFAULT_ROUND_DOCTOR_CONFIG } from "../packages/bus/src/swarm/round-doctor.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
@@ -1667,7 +1667,8 @@ async function main(): Promise<void> {
         try { progressLines = readFileSync(PROGRESS_FILE, "utf8").split("\n"); } catch { /* no PROGRESS yet ⇒ nothing to diagnose */ }
         if (progressLines.length === 0) return;
         for (const ticket of openTickets) {
-          const history = parseRoundHistory(progressLines.filter((l) => l.includes(ticket))); // existing verdict lines for this ticket, oldest→newest
+          const otherTickets = openTickets.filter((t) => t !== ticket); // reject ambiguous multi-ticket lines (RD-2)
+          const history = extractTicketRounds(progressLines, ticket, otherTickets); // completed verdict rounds for THIS ticket, round-keyed + unknown-preserving
           const verdict = diagnoseRounds(history.length, history, cfg);
           if (!verdict.concern) continue;
           notifyCoordinator(buildRoundDoctorNote(ticket, verdict), { taskRef: `round-doctor:${ticket}`, title: "round-doctor" });

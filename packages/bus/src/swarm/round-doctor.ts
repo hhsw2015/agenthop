@@ -90,32 +90,89 @@ export function buildRoundDoctorNote(taskRef: string, v: RoundDoctorVerdict): st
 }
 
 // ------------------------------------------------------------------------------------------------------------------------
-// Best-effort extraction from existing round records (PROGRESS verdict lines). PURE + fail-soft — never throws, never fabricates.
+// Extraction from EXISTING round records (PROGRESS verdict lines). PURE + fail-soft. Soundness rails (review RD-1/RD-2/RD-3):
+//  - a round is keyed by its explicit ROUND NUMBER (首审=1, rN=n), NOT by "a line that mentions a REMAIN"; same-round mentions
+//    DEDUP, so a verdict + its summary + an author echo collapse to ONE round (never a fabricated degradation run);
+//  - only a RENDERED verdict counts — a submission (投审/送审), a queue/await line (候/在途/池/排队) or a conditional ("0 REMAIN
+//    即并批") is NOT a completed round;
+//  - a ticket is bound EXACTLY (slug-boundary, so `placement` never matches `placement-ledger`); a line that also names ANOTHER
+//    open ticket is ambiguous and skipped — no substring cross-attribution;
+//  - a completed round whose remain/newP cannot be read stays as UNKNOWN (-1), never dropped and never fabricated; unparsed
+//    middle rounds are gap-filled as unknown so a degradation window never stitches across them; REMAIN parsing is sign-safe
+//    (`-1 REMAIN` ⇒ unknown, not 1). Round COUNT is therefore independent of whether any remain parsed.
 // ------------------------------------------------------------------------------------------------------------------------
 
-/** Pull the REMAIN count from one verdict-ish line, or -1 if the line carries no remain signal. Recognizes `<n> REMAIN`
- *  (English, the verdict banner) and `余 <n>P` / `余 <n> REMAIN` (Chinese shorthand). A bare `0 REMAIN` ⇒ 0 (cleared). Pure. */
-export function parseRemainFromLine(line: string): number {
-  const m = /(\d+)\s*REMAIN/i.exec(line) ?? /余\s*(\d+)\s*(?:P|REMAIN)/i.exec(line);
+const SUBMIT_RE = /(投审|投复审|送审|送复审|自投)/;        // the author SENT for review — not a verdict
+const QUEUE_RE = /(候\s|在途|排队|池[::]|⏳|即并批|即开批|拟判|将判)/; // awaiting / pooled / conditional — not a completed verdict
+const VERDICT_MARK_RE = /(判|首审|终审|CLEARED)/;         // a rendered judgment banner (NOT a bare "REMAIN" mention — a quote is not a verdict)
+
+function escapeRegExp(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+/** Exact, slug-boundary mention of a ticket (kebab `[A-Za-z0-9-]`) — never as a prefix of a longer slug. So `placement` does NOT
+ *  match inside `placement-ledger`, and vice-versa. Empty ticket ⇒ false. Pure. */
+export function mentionsTicket(line: string, ticket: string): boolean {
+  if (!ticket) return false;
+  return new RegExp(`(?<![A-Za-z0-9-])${escapeRegExp(ticket)}(?![A-Za-z0-9-])`).test(line);
+}
+
+/** The round number a verdict line reports, or 0 if none: `首审` ⇒ 1; an explicit `rN` ⇒ N (used by 终审/复审 lines too). Pure. */
+export function parseRoundNumber(line: string): number {
+  const m = /\br(\d+)\b/i.exec(line);
+  if (m) return Number(m[1]);
+  return /首审/.test(line) ? 1 : 0;
+}
+
+/** The REMAIN count a verdict line asserts, or -1 (unknown) if none can be read RELIABLY. Sign-safe: a digit preceded by `-` or
+ *  another digit is not taken (so `-1 REMAIN` ⇒ unknown). Conditional-safe: `N REMAIN` immediately followed by 即/若/将/拟 is a
+ *  future clause, not a fact ⇒ skipped. Also reads `余 <n>` (Chinese shorthand; `余 4P1` ⇒ 4, `余 IW-..`/`余 一寸` ⇒ unknown).
+ *  A finding tally like `1P1+2P2` is intentionally NOT summed into a remain (P-tokens also appear in finding IDs like IW-P2-1). */
+export function parseRemainSafe(line: string): number {
+  for (const m of line.matchAll(/(?<![\d-])(\d+)\s*REMAIN/gi)) {
+    const after = line.slice((m.index ?? 0) + m[0].length);
+    if (/^\s*(即|若|将|拟)/.test(after)) continue; // a conditional/future REMAIN is not a rendered fact
+    return Number(m[1]);
+  }
+  const z = /余\s*(\d+)/.exec(line);
+  return z ? Number(z[1]) : -1;
+}
+
+/** The count of NEW P-findings opened this round, or -1 (unknown) if no EXPLICIT count. Only `新开/新增/开 <n> P`; a bare
+ *  `新开 IW-..` (an id, no count) stays unknown — so fix-one-open-one never false-fires. Pure. */
+export function parseNewPSafe(line: string): number {
+  const m = /(?:新开|新增|开)\s*(\d+)\s*P/i.exec(line);
   return m ? Number(m[1]) : -1;
 }
 
-/** Pull the count of NEW P-findings opened this round, or -1 if the line carries no such signal. Recognizes `新开 <n> P` /
- *  `开 <n> P` / `<n> 新 P`. Conservative: no explicit "new P" phrase ⇒ -1 (unknown), so fix-one-open-one never false-fires. Pure. */
-export function parseNewPFromLine(line: string): number {
-  const m = /(?:新开|开|新增)\s*(\d+)\s*P/i.exec(line) ?? /(\d+)\s*新\s*P/i.exec(line);
-  return m ? Number(m[1]) : -1;
-}
-
-/** Best-effort per-round {remain,newP} sequence from PROGRESS-style `lines` ALREADY filtered to ONE task and ordered
- *  oldest→newest (the dispatcher substring-filters by the ticket slug). A line with no remain signal is NOT a verdict and is
- *  skipped; a line with a remain but no new-P signal records newP = -1 (unknown). No matches ⇒ []. Pure; never throws. */
-export function parseRoundHistory(lines: readonly string[]): RoundRecord[] {
-  const out: RoundRecord[] = [];
+/**
+ * Reconstruct a ticket's per-round {remain,newP} history from PROGRESS `lines` (oldest→newest). `otherTickets` = the other OPEN
+ * tickets, used to reject ambiguous multi-ticket lines. A line contributes a round only if it (a) names `ticket` exactly and no
+ * other open ticket, (b) is not a submission / queue / conditional line, (c) carries a verdict marker AND an explicit round
+ * number. Rounds are keyed by that number (same-round mentions merge, preferring a KNOWN remain/newP and a CLEARED fact). The
+ * result is indexed 1..maxRound; a round with no verdict line is an UNKNOWN placeholder (so a degradation window breaks across
+ * it). `length === maxRound` ⇒ the round COUNT, independent of how many remains parsed. [] when no verdict is found. Pure. */
+export function extractTicketRounds(lines: readonly string[], ticket: string, otherTickets: readonly string[] = []): RoundRecord[] {
+  const byRound = new Map<number, { remain: number; newP: number; cleared: boolean }>();
   for (const line of lines) {
-    const remain = parseRemainFromLine(line);
-    if (remain < 0) continue;
-    out.push({ remain, newP: parseNewPFromLine(line) });
+    if (!mentionsTicket(line, ticket)) continue;
+    if (otherTickets.some((t) => t !== ticket && mentionsTicket(line, t))) continue; // ambiguous multi-ticket ⇒ skip
+    if (SUBMIT_RE.test(line) || QUEUE_RE.test(line)) continue;                        // not a completed verdict
+    if (!VERDICT_MARK_RE.test(line)) continue;
+    const round = parseRoundNumber(line);
+    if (round <= 0) continue;                                                         // no placeable round identity
+    const remain = parseRemainSafe(line);
+    const cleared = /CLEARED/.test(line) || remain === 0;
+    const newP = parseNewPSafe(line);
+    const prev = byRound.get(round);
+    byRound.set(round, prev
+      ? { remain: prev.remain >= 0 ? prev.remain : remain, newP: prev.newP >= 0 ? prev.newP : newP, cleared: prev.cleared || cleared }
+      : { remain, newP, cleared });
+  }
+  if (byRound.size === 0) return [];
+  const maxRound = Math.max(...byRound.keys());
+  const out: RoundRecord[] = [];
+  for (let r = 1; r <= maxRound; r += 1) {
+    const e = byRound.get(r);
+    out.push(e ? { remain: e.cleared ? 0 : e.remain, newP: e.newP } : { remain: -1, newP: -1 });
   }
   return out;
 }
