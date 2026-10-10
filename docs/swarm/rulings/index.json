@@ -1,10 +1,10 @@
 {
   "version": 1,
-  "generatedAtSec": 1791522050,
-  "count": 63,
+  "generatedAtSec": 1791606277,
+  "count": 64,
   "bySeriesCount": {
     "R": 26,
-    "S": 17,
+    "S": 18,
     "F": 20
   },
   "entries": [
@@ -267,6 +267,12 @@
       "id": "S30",
       "series": "S",
       "title": "派单模板补强:user 已裁事项注明原话",
+      "status": "active"
+    },
+    {
+      "id": "S31",
+      "series": "S",
+      "title": "双通道尸件结晶:耐久箱载全文,队列只作唤醒 ping",
       "status": "active"
     },
     {
