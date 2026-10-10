@@ -488,4 +488,21 @@ describe("writeInbox — idempotency key (durable-first credential, exactly-once
     writeInbox(HOME, "s1", digest("brief", 2), "evt-k");
     expect(jsonFiles("s1").length).toBe(2);
   });
+
+  test("an unsafe key (separator/traversal) is CONFINED: random fallback in the selected box, no sibling-box overwrite (MD-R7-P1-1)", () => {
+    const victimDir = path.join(HOME, ".agenthop", "inbox", "victim"); mkdirSync(victimDir, { recursive: true });
+    const victim = path.join(victimDir, "kept.json");
+    writeFileSync(victim, JSON.stringify({ from: "v", fromLabel: "v", text: "keep", via: "local", ts: 1 }));
+    const before = readFileSync(victim, "utf8");
+    writeInbox(HOME, "s1", msg("escape-attempt", 9), "../victim/kept");    // unsafe key ⇒ never used as a path segment
+    expect(readFileSync(victim, "utf8")).toBe(before);                      // sibling box untouched (no escape)
+    expect(jsonFiles("s1").length).toBe(1);                                 // delivered to the SELECTED box (random name, no dedup)
+    expect(existsSync(path.join(dirOf("s1"), ".pubcred"))).toBe(false);     // unsafe key ⇒ no credential (treated as no-key)
+  });
+
+  test("writeInbox returns a confirmed status: published on first, already on a confirmed re-send (MD-P2-1)", () => {
+    expect(writeInbox(HOME, "s1", digest("brief", 1), "evt-k")).toBe("published");
+    expect(writeInbox(HOME, "s1", digest("brief", 2), "evt-k")).toBe("already"); // credential published ⇒ confirmed, no 2nd copy
+    expect(writeInbox(HOME, "s1", msg("nokey", 3))).toBe("published");           // no key ⇒ always a fresh publish
+  });
 });

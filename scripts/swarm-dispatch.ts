@@ -1694,9 +1694,10 @@ async function main(): Promise<void> {
       //     coordinator's claim/ack/restart — so a crash-after-land or a failed "sent" flip re-sends without ever duplicating.
       if (act.notify) {
         // FC-7 unknown-in-migration: a LEGACY date-only notify marker (pending WITHOUT a frozen body) predates the durable
-        // credential — a pre-key publication that was consumed leaves NO trace, so we cannot prove it was never delivered. Do NOT
-        // auto-resend (dup risk); retain + surface for manual migration rather than re-send a possibly-already-delivered brief.
-        if (notified.kind === "pending" && !notified.body) { log(`morning digest: legacy date-only notify marker (${notified.date}) — retained for migration, not auto-resent`); return; }
+        // credential — a pre-key publication that was consumed leaves NO trace, so we cannot prove it was never delivered. Retain +
+        // surface it rather than resend a possibly-already-delivered brief — but ONLY for ITS OWN date (MD-R7-P2-2): a stale marker
+        // from an earlier day must NOT block a NEW day's brief (the new date is a distinct event with its own credential).
+        if (notified.kind === "pending" && !notified.body && notified.date === today) { log(`morning digest: legacy date-only notify marker (${notified.date}) — retained for migration, not auto-resent`); return; }
         const p = readDigestProjection(HOME);
         if (p.kind !== "valid" || p.date !== today) return; // the frozen body is not on disk yet (projection write failed) ⇒ retry
         const coord = process.env.SWARM_COORDINATOR;
@@ -1705,12 +1706,13 @@ async function main(): Promise<void> {
         if (!coordSid) return; // coordinator not resolvable on this machine yet ⇒ retry (leave none/pending)
         if (!markNotified(HOME, today, "pending", p.projection)) return; // MD-P2-1: claim + freeze the body BEFORE sending; if it can't persist, do NOT send (retry)
         try {
-          // MD-P2-1: a STABLE per-date idempotency key ⇒ writeInbox records a durable PUBLISHED marker that survives the
-          // coordinator's claim/ack/restart, so a crash-after-land or a failed "sent" flip re-sends as a hard no-op (never a
-          // second consumable copy); a legacy keyless publication is migrated into the same keyed ledger.
-          writeInbox(HOME, coordSid, { from: SELF, fromLabel: "swarm-digest", text: digestTextFromProjection(p.projection), via: "local", ts: Date.now(), taskRef: "morning-digest", title: "morning brief", intent: "fyi" }, `morning-digest-${today}`);
-          markNotified(HOME, today, "sent", p.projection); // confirmed (optimization: skip future sends); the published marker is the hard dedup
-        } catch (e) { log(`morning digest notify failed (isolated): ${e instanceof Error ? e.message : e}`); } // leave "pending" ⇒ retry (published marker ⇒ no dup)
+          // MD-P2-1: the durable-first credential makes writeInbox exactly-once across the coordinator's claim/ack/restart. Confirm
+          // "sent" ONLY when the publish is actually confirmed ("published" now, or "already" delivered) — a "deferred" (a concurrent
+          // winner), "pending" (an unconfirmable prior attempt) or "unknown" (unreadable credential) must leave the marker "pending"
+          // so the obligation stays VISIBLE and retries; a loser must never settle the winner's work as done.
+          const res = writeInbox(HOME, coordSid, { from: SELF, fromLabel: "swarm-digest", text: digestTextFromProjection(p.projection), via: "local", ts: Date.now(), taskRef: "morning-digest", title: "morning brief", intent: "fyi" }, `morning-digest-${today}`);
+          if (res === "published" || res === "already") markNotified(HOME, today, "sent", p.projection); // confirmed delivery ⇒ never re-send
+        } catch (e) { log(`morning digest notify failed (isolated): ${e instanceof Error ? e.message : e}`); } // leave "pending" ⇒ retry (credential ⇒ no dup)
       }
     } catch (e) { log(`morning digest failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
