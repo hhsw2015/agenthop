@@ -9,10 +9,10 @@ import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox } from "./inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, poisonNoticeSource } from "./inbox.js";
 import { resolveInboxTarget, isValidSessionId } from "./send-fallback.js";
 import { resolveSession, listSessions, probeSessionAlive } from "./swarm/task-liveness.js";
-import { reportCheckIn } from "./checkin.js";
+import { reportCheckIn, deliverToCoordinator } from "./checkin.js";
 
 export { dedupLocalPeers, resolvePeer, type UnifiedPeer } from "./resolve.js";
 
@@ -131,6 +131,17 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // frees DEAD-pid claims, so our own live-pid claim would otherwise stay `.claim-<pid>` forever. flushInbox retries releasing
   // these at the top of each pass; on success the file is back to `.json` and the normal claim path re-delivers it.
   const stuckRelease = new Set<string>();
+  // FC-2: per-process poison strike counts, AUTHORITATIVE over the sidecar (PD-P2-3: a persistent sidecar-write fault must not
+  // re-read 0 forever and never reach the threshold). Coordinator notices are DURABLE on disk (inbox.ts enqueue/drain, PD-P2-2):
+  // a restart or an overflow must not discharge the obligation, so there is no in-memory queue — drainPoisonNotices re-scans the
+  // durable dir each flush and clears a notice only after a confirmed send.
+  const poisonStrikes = new Map<string, number>();
+  const retryPoisonNotices = (): void => {
+    if (!poisonDlqEnabled()) return; // PD-R3-P1-1: an OFF (or unrelated) drainer must never consume/reroute others' durable notices
+    // Deliver each CONFIRMED notice to its OWN bound target (PD-R3-P1-1 — never substitute our SWARM_COORDINATOR). Legacy records
+    // carry no bound target and are moved to needs-migration by the drain itself (never target-guessed).
+    drainPoisonNotices(home, (target, m) => deliverToCoordinator(home, self, target, m));
+  };
   // C2 (review 01b773d): watch-triggered flushes back off until this time after a no-progress flush, so our OWN claim/release
   // renames (which also fire the inbox fs-watch) cannot self-excite a tight flush loop while the push channel is down. The 5s
   // flush timer stays the retry floor during the backoff; a flush that DELIVERS clears it so near-live resumes.
@@ -178,6 +189,8 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       recoverStaleClaims(home, inboxKeys());
       // Re-attempt any poison stuck from a prior flush (quarantine+release both failed then); clears once the FS heals.
       retryStuckPoison(home, stuckPoison);
+      // FC-2: re-attempt any poison quarantine notices the coordinator could not receive yet (PD-P2-2).
+      retryPoisonNotices();
       // B7: re-attempt releasing HEALTHY claims whose release failed earlier; on success the file is back to `.json` and the
       // claim below re-delivers it. recoverStaleClaims can't help (this is our own LIVE pid).
       for (const f of [...stuckRelease]) if (releaseInbox(f)) stuckRelease.delete(f);
@@ -189,11 +202,45 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       let delivered = 0;
       for (let i = 0; i < claimed.length; i++) {
         // F28 defense-in-depth: a push that THREW (not just returned false) must never escape flushInbox — this runs as
-        // `void flushInbox()`, so an unhandled rejection would crash the whole bus server. Treat a throw as a delivery miss.
+        // `void flushInbox()`, so an unhandled rejection would crash the whole bus server. Treat a throw as a delivery miss,
+        // but REMEMBER it threw (FC-2: a throw is a poison strike; a return-false is channel-not-ready and never strikes).
         let ok = false;
+        let threw: string | null = null;
         try { ok = await pushToHost(claimed[i].msg.fromLabel, claimed[i].msg.text, { codexThread, codexHome: codexDaemon?.codexHome(), fromMode: claimed[i].msg.fromMode, to: self.title }); }
-        catch (e) { dbg(`flushInbox push threw (treating as miss): ${e instanceof Error ? e.message : e}`); ok = false; }
-        if (ok) { ackInbox(claimed[i].file); delivered++; continue; }
+        catch (e) { threw = e instanceof Error ? e.message : String(e); dbg(`flushInbox push threw (treating as miss): ${threw}`); ok = false; }
+        if (ok) { if (poisonDlqEnabled()) clearPoisonStrikes(claimed[i].file, poisonStrikes); ackInbox(claimed[i].file); delivered++; continue; }
+        // FC-2 poison dead-letter: a push that THREW (the host erring on THIS message's content) is a poison strike — a push
+        // that returned false is channel-not-ready and does NOT strike (no false-quarantine during an outage). After the
+        // threshold the message is quarantined (bytes preserved + the coordinator told) and we CONTINUE the batch so the
+        // head-of-line poison stops blocking the rest. Dormant unless SWARM_POISON_DLQ; quarantine is recoverable, never a drop.
+        if (threw !== null && poisonDlqEnabled()) {
+          const strikes = recordPoisonStrike(claimed[i].file, poisonStrikes); // in-memory authoritative (PD-P2-3)
+          if (shouldQuarantinePoison(strikes, poisonDlqThreshold())) {
+            const qReason = `poison: delivery threw ${strikes}x: ${threw}`;
+            const coord = process.env.SWARM_COORDINATOR;
+            if (coord === undefined || coord.trim() === "") {
+              // No coordinator to notify ⇒ nothing to persist; quarantine directly (the F26 dead-letter ledger is the audit record).
+              if (quarantineInbox(home, claimed[i].file, qReason, JSON.stringify(claimed[i].msg)) !== "failed") {
+                clearPoisonStrikes(claimed[i].file, poisonStrikes);
+                continue;
+              }
+            } else {
+              // PD-P2-2 + PD-R4-P2-1 + PD-R5-P2-2: persist the durable obligation (bound to this poison EVENT, keyed by source ⇒
+              // idempotent) BEFORE the quarantine move, so it survives a notice-write failure and a retry overwrites rather than
+              // piling up. We do NOT write a separate "confirmed" flag afterwards — the drain VERIFIES the quarantine on the
+              // filesystem (the quarantined bytes are the proof) before delivering, so no premature "已隔离" report and no crash/
+              // write-fault window that could strand it. If the obligation can't be persisted, do NOT quarantine (keep source+strike).
+              const source = poisonNoticeSource(claimed[i].file);
+              const notice = buildPoisonS19(self.stableId ?? self.id, self.title, claimed[i].msg, strikes, threw);
+              if (enqueuePoisonNotice(home, source, coord, notice) &&
+                  quarantineInbox(home, claimed[i].file, qReason, JSON.stringify(claimed[i].msg)) !== "failed") {
+                clearPoisonStrikes(claimed[i].file, poisonStrikes);
+                continue; // poison removed + obligation persisted ⇒ the drain verifies + delivers; try the rest of the batch
+              }
+              // else: fall through to release+bail — source + strike retained, retried next flush (idempotent by source)
+            }
+          }
+        }
         // B7: a failed release for a HEALTHY message must not silently strand it — track it for retry (not stuckPoison; it is not
         // a bad message, and recoverStaleClaims won't free a live-pid claim).
         for (let j = i; j < claimed.length; j++) if (!releaseInbox(claimed[j].file)) stuckRelease.add(claimed[j].file);

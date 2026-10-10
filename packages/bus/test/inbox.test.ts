@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
+import { deliverToCoordinator } from "../src/checkin.js";
+import type { SelfInfo } from "../src/label.js";
 
 let HOME: string;
 beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-inbox-")); });
@@ -195,5 +197,234 @@ describe("F28 poison-pill defense", () => {
     const names = readdirSync(inboxDirOf("s1"));
     expect(names).toContain("0000000000001000-dddddd.json");         // RELEASED back to .json for a later retry
     expect(names.some((n) => n.includes(".claim-"))).toBe(false);    // NOT left stuck as .claim-<live-pid>
+  });
+});
+
+describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
+  const dirOf = (key: string) => path.join(HOME, ".agenthop", "inbox", key);
+
+  test("poisonDlqEnabled default OFF; truthy words ON", () => {
+    expect(poisonDlqEnabled({})).toBe(false);
+    expect(poisonDlqEnabled({ SWARM_POISON_DLQ: "0" })).toBe(false);
+    for (const on of ["1", "true", "yes", "on", "YES"]) expect(poisonDlqEnabled({ SWARM_POISON_DLQ: on })).toBe(true);
+  });
+
+  test("poisonDlqThreshold default 3; valid int >= 1 honored; junk/0/negative ⇒ 3", () => {
+    expect(poisonDlqThreshold({})).toBe(3);
+    expect(poisonDlqThreshold({ SWARM_POISON_DLQ_THRESHOLD: "5" })).toBe(5);
+    expect(poisonDlqThreshold({ SWARM_POISON_DLQ_THRESHOLD: "1" })).toBe(1);
+    for (const bad of ["0", "-2", "2.5", "abc", ""]) expect(poisonDlqThreshold({ SWARM_POISON_DLQ_THRESHOLD: bad })).toBe(3);
+  });
+
+  test("shouldQuarantinePoison: fires at/above threshold, never below; guards NaN strikes + bad threshold", () => {
+    expect(shouldQuarantinePoison(3, 3)).toBe(true);
+    expect(shouldQuarantinePoison(4, 3)).toBe(true);
+    expect(shouldQuarantinePoison(2, 3)).toBe(false);
+    expect(shouldQuarantinePoison(NaN, 3)).toBe(false);  // no count ⇒ never
+    expect(shouldQuarantinePoison(5, 0)).toBe(false);    // threshold < 1 ⇒ never (guards misconfig)
+  });
+
+  test("recordPoisonStrike increments and the count is keyed by the STABLE base (survives claim→release→reclaim)", () => {
+    const base = path.join(dirOf("s1"), "0000000000001000-aaaaaa.json");
+    mkdirSync(dirOf("s1"), { recursive: true });
+    const mem = new Map<string, number>();
+    expect(recordPoisonStrike(`${base}.claim-123`, mem)).toBe(1); // claimed form
+    expect(recordPoisonStrike(base, mem)).toBe(2);                // released form ⇒ SAME key
+    expect(recordPoisonStrike(`${base}.claim-456`, mem)).toBe(3); // reclaimed by a new pid ⇒ still the same count
+    clearPoisonStrikes(base, mem);
+    expect(recordPoisonStrike(base, mem)).toBe(1);                // cleared (sidecar + mem) ⇒ starts over
+  });
+
+  test("the strike sidecar is NOT a .json ⇒ claimInbox never lists it as a deliverable message", () => {
+    writeInbox(HOME, "s1", msg("hello", 1000));
+    const jsonName = readdirSync(dirOf("s1")).find((n) => n.endsWith(".json"))!;
+    recordPoisonStrike(path.join(dirOf("s1"), jsonName), new Map()); // drop a .poison sidecar next to the message
+    const claimed = claimInbox(HOME, ["s1"], "p");
+    expect(claimed.length).toBe(1);                         // ONLY the message, not the sidecar
+    expect(claimed[0].msg.text).toBe("hello");
+    expect(existsSync(path.join(dirOf("s1"), `${jsonName}.poison`))).toBe(true); // sidecar untouched by the claim
+  });
+
+  test("buildPoisonS19 carries strikes + trace + source + a bounded preview", () => {
+    const poison = { from: "x", fromLabel: "alice", text: "A".repeat(500), via: "durable-inbox", ts: 42 };
+    const s19 = buildPoisonS19("my-sid", "me", poison, 3, "TypeError: boom");
+    expect(s19.taskRef).toBe("poison-dlq");
+    expect(s19.title).toBe("poison quarantine");
+    expect(s19.from).toBe("my-sid");
+    expect(s19.fromLabel).toBe("me");
+    expect(s19.text).toContain("3");                 // strike count
+    expect(s19.text).toContain("TypeError: boom");   // failure trace
+    expect(s19.text).toContain("alice");             // source label
+    expect(s19.text).toContain("durable-inbox");     // source via
+    expect(s19.text).toContain("…");                 // preview truncated (500 > 240)
+    expect(validInboxMsg(s19)).not.toBeNull();       // a well-formed inbox message
+  });
+
+  test("PD-P2-1: buildPoisonS19 strips transport-unsafe control chars so the NOTICE is not itself poison", () => {
+    const poison = { from: "x", fromLabel: "al\u0000ice", text: "payload\u0000with NUL", via: "dur\u0000able", ts: 42 };
+    const s19 = buildPoisonS19("my-sid", "me", poison, 3, "Error\u0000trace");
+    expect(s19.text).not.toContain("\u0000");        // no NUL anywhere ⇒ a real push won't ERR_INVALID_ARG_VALUE on the alert
+    expect(s19.text).toContain("�");            // replaced with the visible marker
+    expect(s19.text).toContain("payload");           // the safe content survives
+    expect(validInboxMsg(s19)).not.toBeNull();
+  });
+
+  test("PD-P2-2: deliverToCoordinator is 3-state — skip (no coordinator) vs retry (unresolvable) so the obligation is retained", () => {
+    const self = { id: "me", stableId: "me", title: "me" } as SelfInfo;
+    const m = buildPoisonS19("me", "me", { from: "x", fromLabel: "alice", text: "boom", via: "local", ts: 1 }, 3, "t");
+    expect(deliverToCoordinator(HOME, self, undefined, m)).toBe("skip");    // no coordinator ⇒ permanent
+    expect(deliverToCoordinator(HOME, self, "", m)).toBe("skip");           // blank handle ⇒ permanent
+    expect(deliverToCoordinator(HOME, self, "coord-ghost", m)).toBe("retry"); // not resolvable here ⇒ retain + retry
+  });
+
+  const pnMsg = (text: string, ts: number): InboxMsg => buildPoisonS19("me", "me", { from: "x", fromLabel: "a", text, via: "local", ts }, 3, "t");
+  const pnDir = (): string => path.join(HOME, ".agenthop", "swarm", "poison-notices");
+  const pnJsonCount = (): number => { try { return readdirSync(pnDir()).filter((n) => n.endsWith(".json")).length; } catch { return 0; } };
+  const srcPath = (sid: string, base: string): string => path.join(HOME, ".agenthop", "inbox", sid, base);
+  const confirmQuarantine = (source: string): void => { const q = path.join(path.dirname(source), "quarantine"); mkdirSync(q, { recursive: true }); writeFileSync(path.join(q, `${path.basename(source)}.${Date.now()}.cafebabecafebabe`), "bytes"); };
+
+  test("PD-P2-2 + PD-R4-P2-1: a record delivers to its BOUND target ONLY after the quarantine is VERIFIED on disk", () => {
+    const source = srcPath("s1", "0000000000001000-aaaaaa.json");
+    expect(enqueuePoisonNotice(HOME, source, "coord-a", pnMsg("boom", 1000))).toBe(true);
+    expect(pnJsonCount()).toBe(1);
+    let calls = 0;
+    drainPoisonNotices(HOME, () => { calls++; return "sent"; }); // quarantine NOT yet confirmed ⇒ keep, never a premature report
+    expect(calls).toBe(0);
+    expect(pnJsonCount()).toBe(1);
+    confirmQuarantine(source);                                   // bytes now in quarantine/ ⇒ verified
+    const sent: { target: string; msg: InboxMsg }[] = [];
+    drainPoisonNotices(HOME, (target, m) => { sent.push({ target, msg: m }); return "sent"; });
+    expect(sent.length).toBe(1);
+    expect(sent[0]!.target).toBe("coord-a");                     // BOUND target (PD-R3-P1-1)
+    expect(sent[0]!.msg.text).toContain("boom");
+    expect(pnJsonCount()).toBe(0);                               // cleared only after the confirmed send
+  });
+
+  test("PD-R5-P2-2: a FRESH drain (restart) recovers via fs verification — no separate confirmation write to lose", () => {
+    const source = srcPath("s1", "0000000000002000-bbbb.json");
+    enqueuePoisonNotice(HOME, source, "coord-a", pnMsg("recover", 2000)); // process 1 wrote the obligation BEFORE the move
+    confirmQuarantine(source);                                            // the move happened; process 1 crashed before any confirm
+    let delivered = 0;
+    drainPoisonNotices(HOME, () => { delivered++; return "sent"; });       // process 2 verifies from the fs
+    expect(delivered).toBe(1);                                            // recovered — obligation never stranded
+    expect(pnJsonCount()).toBe(0);
+  });
+
+  test("PD-R5-P2-1 / FC-7: a PRIOR bound v1 record is MOVED to needs-migration (importable), never deleted as corrupt", () => {
+    const dir = pnDir(); mkdirSync(dir, { recursive: true });
+    const v1 = { schema: "poison-notice/v1", target: "coord-a", msg: pnMsg("priorbound", 5) }; // last version's bound record (no `source`)
+    writeFileSync(path.join(dir, "aaaa0000000000000000000000000001.json"), JSON.stringify(v1));
+    let calls = 0;
+    drainPoisonNotices(HOME, () => { calls++; return "sent"; });
+    expect(calls).toBe(0);                 // not delivered (stage unverifiable)
+    expect(pnJsonCount()).toBe(0);         // moved out of the active queue (NOT deleted)
+    expect(readdirSync(path.join(dir, "needs-migration")).length).toBe(1); // kept + exposed for manual migration
+  });
+
+  test("FC-7 / PD-R3-P1-1 A: a legacy bare-InboxMsg record is MOVED to needs-migration (never target-guessed/deleted)", () => {
+    const dir = pnDir(); mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "bbbb0000000000000000000000000002.json"), JSON.stringify(pnMsg("legacy", 6)));
+    let calls = 0;
+    drainPoisonNotices(HOME, () => { calls++; return "sent"; });
+    expect(calls).toBe(0);
+    expect(pnJsonCount()).toBe(0);
+    expect(readdirSync(path.join(dir, "needs-migration")).length).toBe(1);
+  });
+
+  test("PD-R3-P1-1: delivers each confirmed record to its OWN bound target, never the drainer's coordinator", () => {
+    const s1 = srcPath("s1", "m1.json"), s2 = srcPath("s2", "m2.json");
+    enqueuePoisonNotice(HOME, s1, "coord-a", pnMsg("t1", 10)); confirmQuarantine(s1);
+    enqueuePoisonNotice(HOME, s2, "coord-b", pnMsg("t2", 20)); confirmQuarantine(s2);
+    const targets: string[] = [];
+    drainPoisonNotices(HOME, (t) => { targets.push(t); return "sent"; });
+    expect(targets.sort()).toEqual(["coord-a", "coord-b"]);
+  });
+
+  test("PD-R4-P2-1: the same source is idempotent — re-enqueue OVERWRITES, never piling up duplicate reports", () => {
+    const source = srcPath("s1", "dup.json");
+    enqueuePoisonNotice(HOME, source, "coord-a", pnMsg("dup", 3000));
+    enqueuePoisonNotice(HOME, source, "coord-a", pnMsg("dup", 3000));
+    enqueuePoisonNotice(HOME, source, "coord-a", pnMsg("dup", 3000));
+    expect(pnJsonCount()).toBe(1);         // ONE record
+    confirmQuarantine(source);
+    let delivered = 0;
+    drainPoisonNotices(HOME, () => { delivered++; return "sent"; });
+    expect(delivered).toBe(1);             // delivered exactly once
+  });
+
+  test("PD-R3-P2-1: a valid but momentarily UNREADABLE record is KEPT (not dropped as corrupt); deliver not called", () => {
+    const source = srcPath("s1", "keep.json");
+    enqueuePoisonNotice(HOME, source, "coord-a", pnMsg("keep", 7)); confirmQuarantine(source);
+    const f = path.join(pnDir(), readdirSync(pnDir()).find((n) => n.endsWith(".json"))!);
+    chmodSync(f, 0o000);
+    let calls = 0;
+    drainPoisonNotices(HOME, () => { calls++; return "sent"; });
+    expect(calls).toBe(0);
+    expect(existsSync(f)).toBe(true);
+    chmodSync(f, 0o600);
+  });
+
+  test("PD-P2-2: enqueuePoisonNotice returns false when it cannot persist (caller keeps the source + strike)", () => {
+    const swarmDir = path.join(HOME, ".agenthop", "swarm");
+    mkdirSync(swarmDir, { recursive: true });
+    writeFileSync(path.join(swarmDir, "poison-notices"), "blocker"); // a FILE where the queue dir should be ⇒ mkdir fails
+    expect(enqueuePoisonNotice(HOME, srcPath("s1", "b.json"), "coord-a", pnMsg("b", 9))).toBe(false);
+  });
+
+  test("PD-R6-P2-1 A: a DIFFERENT event's receipt sharing the source-name prefix does NOT confirm this event (exact match)", () => {
+    const source = srcPath("s1", "event.json");
+    enqueuePoisonNotice(HOME, source, "coord-a", pnMsg("mine", 1));
+    const q = path.join(HOME, ".agenthop", "inbox", "s1", "quarantine");
+    mkdirSync(q, { recursive: true });
+    // another event `event.json.other.json` quarantined — receipt shares the "event.json." PREFIX but is NOT ours
+    writeFileSync(path.join(q, "event.json.other.json.123456.cafebabecafebabe"), "other-bytes");
+    let calls = 0;
+    drainPoisonNotices(HOME, () => { calls++; return "sent"; });
+    expect(calls).toBe(0);           // our event is NOT confirmed by the other's receipt
+    expect(pnJsonCount()).toBe(1);   // obligation retained (our event really isn't quarantined yet)
+  });
+
+  test("PD-R6-P2-1 B: a directory named like a receipt does NOT confirm quarantine (must be a regular file)", () => {
+    const source = srcPath("s1", "evt.json");
+    enqueuePoisonNotice(HOME, source, "coord-a", pnMsg("mine", 2));
+    const q = path.join(HOME, ".agenthop", "inbox", "s1", "quarantine");
+    mkdirSync(path.join(q, "evt.json.123456.cafebabecafebabe"), { recursive: true }); // a DIR with a receipt-shaped name
+    let calls = 0;
+    drainPoisonNotices(HOME, () => { calls++; return "sent"; });
+    expect(calls).toBe(0);           // a dir is not the quarantined bytes
+    expect(pnJsonCount()).toBe(1);
+    writeFileSync(path.join(q, "evt.json.123457.cafebabecafebabe"), "bytes"); // a real FILE receipt DOES confirm
+    let delivered = 0;
+    drainPoisonNotices(HOME, () => { delivered++; return "sent"; });
+    expect(delivered).toBe(1);
+  });
+
+  test("the durable queue has no in-memory cap — 300 confirmed notices all drain over bounded passes, a corrupt one is dropped", () => {
+    const dir = pnDir(); mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "00000000000000000000000000000001.json"), "not valid json{"); // read-OK but invalid ⇒ corrupt ⇒ dropped
+    for (let i = 0; i < 300; i++) { const s = srcPath("s1", `m${i}.json`); expect(enqueuePoisonNotice(HOME, s, "coord-a", pnMsg(`m${i}`, 2000 + i))).toBe(true); confirmQuarantine(s); }
+    expect(pnJsonCount()).toBe(301);
+    let delivered = 0;
+    for (let pass = 0; pass < 6; pass++) drainPoisonNotices(HOME, () => { delivered++; return "sent"; }); // bounded per tick (64)
+    expect(delivered).toBe(300);
+    expect(pnJsonCount()).toBe(0);
+  });
+
+  test("PD-P2-3: the in-memory map drives the count to threshold even when the sidecar write keeps failing", () => {
+    const mem = new Map<string, number>();
+    const base = path.join(HOME, "no-such-dir", "x.json"); // parent missing ⇒ sidecar read AND write both fail
+    expect(recordPoisonStrike(base, mem)).toBe(1);
+    expect(recordPoisonStrike(base, mem)).toBe(2);
+    expect(recordPoisonStrike(base, mem)).toBe(3);          // reaches threshold despite zero successful persistence
+    expect(existsSync(`${base}.poison`)).toBe(false);       // nothing was ever written
+  });
+
+  test("PD-P2-4: a corrupt sidecar (prefix-parse bait) is ignored, never authorizing an early quarantine", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    const base = path.join(dirOf("s1"), "0000000000002000-bbbbbb.json");
+    writeFileSync(`${base}.poison`, "2-not-a-counter"); // parseInt would read 2 ⇒ next 3 ⇒ premature quarantine
+    expect(recordPoisonStrike(base, new Map())).toBe(1);  // whole-string parse rejects it ⇒ treated as 0 ⇒ starts at 1
+    writeFileSync(`${base}.poison`, "2");                 // a VALID complete integer IS honored
+    expect(recordPoisonStrike(base, new Map())).toBe(3);  // max(2, 0) + 1
   });
 });
