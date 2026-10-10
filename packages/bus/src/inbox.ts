@@ -13,6 +13,7 @@ import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSyn
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
 import { isSubmitIntent, type SubmitIntent } from "./submit-intent.js";
+import { redactSecrets } from "./redact.js";
 
 export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: string; ts: number; actionId?: string; taskRef?: string; title?: string; intent?: SubmitIntent };
 export type Claimed = { file: string; msg: InboxMsg };
@@ -468,9 +469,11 @@ export function clearPoisonStrikes(file: string, mem: Map<string, number>): void
 /** FC-2 (PD-P2-1) — strip transport-UNSAFE control chars (NUL + other C0/DEL, keeping \t \n \r) so the NOTICE itself can never
  *  become a poison message. A legal envelope may carry U+0000, which a real Codex push rejects (ERR_INVALID_ARG_VALUE); copying
  *  it verbatim into the alert would make the ALERT a poison that blocks the coordinator's inbox. The original bytes stay intact
- *  in quarantine/; only this human-facing notice is sanitized. */
+ *  in quarantine/; only this human-facing notice is sanitized. D-multica ②: after the control-char strip, `redactSecrets` masks
+ *  any secret token (AWS/GitHub/OpenAI/Anthropic/Slack/PEM) so a quarantined poison's content preview cannot leak a key when the
+ *  notice is forwarded to the coordinator / persisted. */
 function sanitizeForTransport(s: string): string {
-  return s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "�");
+  return redactSecrets(s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "�"));
 }
 
 /** FC-2 — build the S19 dead-letter notification for the coordinator when a poison message is quarantined: content preview +

@@ -270,6 +270,16 @@ describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
     expect(validInboxMsg(s19)).not.toBeNull();
   });
 
+  test("D-multica ②: buildPoisonS19 redacts a secret in the preview so the forwarded notice cannot leak a key", () => {
+    const akid = "AKIA" + "A".repeat(16); // synthetic AWS-AKID-shaped token, built from fragments
+    const poison = { from: "x", fromLabel: "alice", text: "crash dumped creds " + akid + " end", via: "local", ts: 7 };
+    const s19 = buildPoisonS19("my-sid", "me", poison, 3, "boom");
+    expect(s19.text).not.toContain(akid);            // the secret is gone from the human-facing notice
+    expect(s19.text).toContain("[REDACTED:AWS_AKID]"); // replaced with the typed marker
+    expect(s19.text).toContain("crash dumped creds"); // surrounding content preserved
+    expect(validInboxMsg(s19)).not.toBeNull();
+  });
+
   test("PD-P2-2: deliverToCoordinator is 3-state — skip (no coordinator) vs retry (unresolvable) so the obligation is retained", () => {
     const self = { id: "me", stableId: "me", title: "me" } as SelfInfo;
     const m = buildPoisonS19("me", "me", { from: "x", fromLabel: "alice", text: "boom", via: "local", ts: 1 }, 3, "t");
