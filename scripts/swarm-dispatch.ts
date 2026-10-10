@@ -1694,7 +1694,7 @@ async function main(): Promise<void> {
       // scaling. Gated on SWARM_REVIEW_AUTOSCALE (live by default; kill with =0); fully fail-soft.
       runReviewAutoscaleSuggest();
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
-      // (default OFF), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
+      // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
       runGaugeSampling();
     },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),

@@ -188,7 +188,7 @@ export function reconcile(d: Demand, machines: readonly MachineView[], cfg: Reco
 // IO shell — the reconcile loop (dormant: SWARM_PLACEMENT off; lives in the caller, exercised by live runs)
 // ============================================================================================================
 
-/** placement wiring flip, default OFF (dormant-ahead-of-use, like SWARM_VM_CTL / SWARM_BOARD_ADMIT). */
+/** placement wiring flip, default OFF (dormant-ahead-of-use, like SWARM_VM_CTL / SWARM_SEAT_CAPS). */
 export function placementEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return /^(1|true|yes|on)$/i.test(env.SWARM_PLACEMENT ?? "");
 }
