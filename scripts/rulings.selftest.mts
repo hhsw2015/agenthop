@@ -21,6 +21,11 @@ t("classify: list --series with no value -> usage error", (() => { const q = cla
 t("classify: list unknown option -> usage error", (() => { const q = classifyArgs(["list", "--wat"]); return q.mode === "usage" && !!q.error; })());
 t("classify: grep <word> -> grep", (() => { const q = classifyArgs(["grep", "token"]); return q.mode === "grep" && q.word === "token"; })());
 t("classify: grep with no word -> usage error", (() => { const q = classifyArgs(["grep"]); return q.mode === "usage" && !!q.error; })());
+// RCLI-P2-1: trailing args are NEVER silently dropped
+t("classify: <id> with extra arg -> usage error (R1 R2)", (() => { const q = classifyArgs(["R1", "R2"]); return q.mode === "usage" && !!q.error; })());
+t("classify: grep with extra word -> usage error (grep a b)", (() => { const q = classifyArgs(["grep", "a", "b"]); return q.mode === "usage" && !!q.error; })());
+t("classify: <id> with trailing flag -> usage error", (() => { const q = classifyArgs(["R1", "--series"]); return q.mode === "usage" && !!q.error; })());
+t("classify: list with stray positional -> usage error", (() => { const q = classifyArgs(["list", "R1"]); return q.mode === "usage" && !!q.error; })());
 
 // --- sort (series R→S→F, number, sub-letter) ---
 t("sort: R→S→F, numeric, sub-letter", sortRulings([R({ id: "S29" }), R({ id: "F45" }), R({ id: "R10" }), R({ id: "R3-b" }), R({ id: "R3" }), R({ id: "R2" })]).map((r) => r.id).join(",") === "R2,R3,R3-b,R10,S29,F45");

@@ -44,9 +44,13 @@ export function classifyArgs(argv: readonly string[]): Query {
   if (first === "grep") {
     const word = argv[1];
     if (!word) return { mode: "usage", error: "grep needs a <word>" };
+    if (argv.length > 2) return { mode: "usage", error: `grep takes exactly one <word> (got extra: ${argv.slice(2).join(" ")})` }; // RCLI-P2-1: never silently drop trailing args
     return { mode: "grep", word };
   }
-  if (RULING_ID_RE.test(first)) return { mode: "show", id: first };
+  if (RULING_ID_RE.test(first)) {
+    if (argv.length > 1) return { mode: "usage", error: `unexpected argument(s) after ${first}: ${argv.slice(1).join(" ")}` }; // RCLI-P2-1
+    return { mode: "show", id: first };
+  }
   return { mode: "usage", error: `unrecognized argument ${JSON.stringify(first)}` };
 }
 
@@ -141,6 +145,21 @@ function run(argv: readonly string[]): number {
 
 const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
-  try { process.exit(run(process.argv.slice(2))); }
-  catch (e) { process.stderr.write(`rulings: ${e instanceof Error ? e.message : String(e)}\n`); process.exit(1); }
+  // RCLI-P2-2b / R2-P2-1: pipe-safe WITHOUT masking failures. A reader that closes early (`rulings list | head`, or a closed
+  // stderr on an error path) makes the next write emit EPIPE; swallow it so Node does not throw an unhandled 'error' and crash
+  // with a stack trace — but exit with the ALREADY-DETERMINED code, never an unconditional 0. The code is set synchronously by
+  // the try/catch below before any stream 'error' fires (stream errors are async), so a usage/ledger failure keeps its 2/1 even
+  // when it is the STDERR pipe that broke; a successful query whose stdout closed early still exits 0. (A non-EPIPE stream error
+  // is genuinely exceptional — surface it.)
+  const onPipeError = (e: NodeJS.ErrnoException): void => {
+    if (e.code === "EPIPE") process.exit(typeof process.exitCode === "number" ? process.exitCode : 0);
+    throw e;
+  };
+  process.stdout.on("error", onPipeError);
+  process.stderr.on("error", onPipeError);
+  // RCLI-P2-2: set exitCode and let Node exit NATURALLY — a forced process.exit() truncates a piped stdout mid-write (stdout to
+  // a pipe is async). All IO here is synchronous, so nothing keeps the loop alive; Node drains stdout/stderr then exits with the
+  // code. This guarantees piped output equals fullText() byte-for-byte, and that an error message is written in full.
+  try { process.exitCode = run(process.argv.slice(2)); }
+  catch (e) { process.stderr.write(`rulings: ${e instanceof Error ? e.message : String(e)}\n`); process.exitCode = 1; }
 }
