@@ -1672,22 +1672,26 @@ async function main(): Promise<void> {
       if (!act0.writeProjection && !act0.notify) return; // both already delivered today (or before the hour)
       if (nowSec() - lastDigestAttemptSec < DIGEST_RETRY_SEC) return; // backoff: never a tight per-tick retry on a persistent fault
       lastDigestAttemptSec = nowSec();
-      // MD-R2-P2-1: a CORRUPT carrier whose frozen body is recoverable from today's notify marker is RESTORED to that SAME body —
-      // never re-gathered into a different one (corrupt ≠ absent; the body was already published). Then the projection is valid again.
-      if (proj.kind === "corrupt" && (notified.kind === "pending" || notified.kind === "sent") && notified.date === today && notified.body) {
-        writeDigestProjectionRaw(HOME, notified.body);
+      // MD-R2-P2-1: today's frozen body (carried in the notify marker) is the ONE TRUTH. When the carrier is CORRUPT or MISSING but
+      // that body is recoverable, RESTORE the SAME body — never re-gather a different one (the body was already published). A restore
+      // that FAILS keeps the SAME recovery obligation: return + retry, never fall through to a fresh gather (which would publish a
+      // second, different body). An UNKNOWN (unreadable) carrier is left untouched (it may still be the valid body — do not overwrite).
+      const frozenToday = (notified.kind === "pending" || notified.kind === "sent") && notified.date === today && notified.body ? notified.body : null;
+      if ((proj.kind === "corrupt" || proj.kind === "absent") && frozenToday) {
+        if (!writeDigestProjectionRaw(HOME, frozenToday)) return; // restore failed ⇒ retain the obligation, retry; never re-gather a new body
         proj = readDigestProjection(HOME);
       }
       const act = digestActions(today, d.getHours(), DIGEST_HOUR, proj, notified);
-      // (1) Projection obligation: gather the night's sources ONCE and write the FROZEN body for today (a later retry/restore never
-      //     re-gathers a different body).
+      // (1) Projection obligation: reached ONLY when there is NO recoverable frozen body (a genuinely never-generated event) ⇒ gather
+      //     the night's sources ONCE and write the FROZEN body for today (a later retry/restore never re-gathers a different body).
       if (act.writeProjection) {
         const sources = gatherDigestSources(HOME);
         if (sources === null) return; // MD-P2-2: sources unreadable (unknown) ⇒ cannot assert content ⇒ retry later (no false quiet night)
         writeDigestProjection(HOME, sources, today, nowSec()); // atomic; writes absent / repairs corrupt-without-a-recoverable-body
       }
       // (2) Notify obligation: deliver the SAME frozen body the projection carries — render the on-disk projection, NEVER a
-      //     re-gather, with a DETERMINISTIC inbox idempotency key so a re-send OVERWRITES (receiver-side dedup, never a duplicate).
+      //     re-gather, under a per-date idempotency key whose durable PUBLISHED marker (writeInbox) dedups the delivery across the
+      //     coordinator's claim/ack/restart — so a crash-after-land or a failed "sent" flip re-sends without ever duplicating.
       if (act.notify) {
         const p = readDigestProjection(HOME);
         if (p.kind !== "valid" || p.date !== today) return; // the frozen body is not on disk yet (projection write failed) ⇒ retry
@@ -1697,11 +1701,12 @@ async function main(): Promise<void> {
         if (!coordSid) return; // coordinator not resolvable on this machine yet ⇒ retry (leave none/pending)
         if (!markNotified(HOME, today, "pending", p.projection)) return; // MD-P2-1: claim + freeze the body BEFORE sending; if it can't persist, do NOT send (retry)
         try {
-          // MD-P2-1: a STABLE per-date idempotency key ⇒ the coordinator inbox dedups by event identity — a crash-after-land or a
-          // failed "sent" flip re-sends, but the deterministic filename OVERWRITES rather than adding a second message.
+          // MD-P2-1: a STABLE per-date idempotency key ⇒ writeInbox records a durable PUBLISHED marker that survives the
+          // coordinator's claim/ack/restart, so a crash-after-land or a failed "sent" flip re-sends as a hard no-op (never a
+          // second consumable copy); a legacy keyless publication is migrated into the same keyed ledger.
           writeInbox(HOME, coordSid, { from: SELF, fromLabel: "swarm-digest", text: digestTextFromProjection(p.projection), via: "local", ts: Date.now(), taskRef: "morning-digest", title: "morning brief", intent: "fyi" }, `morning-digest-${today}`);
-          markNotified(HOME, today, "sent", p.projection); // confirmed (optimization: skip future sends); the idempotency key is the hard dedup
-        } catch (e) { log(`morning digest notify failed (isolated): ${e instanceof Error ? e.message : e}`); } // leave "pending" ⇒ retry (overwrites, no dup)
+          markNotified(HOME, today, "sent", p.projection); // confirmed (optimization: skip future sends); the published marker is the hard dedup
+        } catch (e) { log(`morning digest notify failed (isolated): ${e instanceof Error ? e.message : e}`); } // leave "pending" ⇒ retry (published marker ⇒ no dup)
       }
     } catch (e) { log(`morning digest failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };

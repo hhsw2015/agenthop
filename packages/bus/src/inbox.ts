@@ -164,16 +164,59 @@ export function writeInbox(home: string, key: string, msg: InboxMsg, idempotency
   if (valid === null) throw new Error("writeInbox: refusing to publish an invalid inbox message (from/fromLabel/text must be strings, via a non-empty string, ts a finite number)");
   const dir = inboxDir(home, key);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  // A stable `idempotencyKey` ⇒ a DETERMINISTIC filename, so re-publishing the SAME logical event OVERWRITES rather than adding a
-  // second message — receiver-side dedup by event identity (a re-send after a crash/retry can never duplicate). Validated to one
-  // safe path segment (no traversal). Absent ⇒ the historical unique random name (every write is a new message).
-  const base = idempotencyKey !== undefined && /^[A-Za-z0-9._-]{1,120}$/.test(idempotencyKey)
-    ? `${idempotencyKey}.json`
-    : `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
+  // A stable `idempotencyKey` ⇒ exactly-once publication of one logical EVENT, dedup'd by a durable PUBLISHED marker — the
+  // sender-side delivery credential. The message .json is the delivery TARGET (claim renames it, ack deletes it), so its mere
+  // presence can NEVER prove delivery: once consumed, a naive re-send would re-create it (a second consumable copy). The marker
+  // lives in a `.published/` sidecar (like quarantine/, invisible to claimInbox) that NO claim/ack ever touches, so it survives
+  // claim, ack and restart. Recovery verifies it atomically: present ⇒ this event was already published ⇒ no-op. (digest MD-P2-1)
+  if (idempotencyKey !== undefined && /^[A-Za-z0-9._-]{1,120}$/.test(idempotencyKey)) {
+    const pubDir = path.join(dir, ".published");
+    const marker = path.join(pubDir, idempotencyKey);
+    if (existsSync(marker)) return; // already published this event (survives the consumed/absent message file) ⇒ idempotent no-op
+    // FC-7 migration: an IDENTICAL notice already published under a legacy RANDOM name (pre-key) must not be duplicated by the new
+    // key. Adopt it — record the marker, keep the legacy message, skip the new write — so the old keyless record is migrated into
+    // the keyed dedup ledger instead of co-existing as a second copy. Scoped to a matching non-empty taskRef + identical text so
+    // distinct keyless messages (no taskRef) are never collapsed. Best-effort scan; a read fault just falls through to a fresh write.
+    if (typeof valid.taskRef === "string" && valid.taskRef.length > 0) {
+      let names: string[] = [];
+      try { names = readdirSync(dir).filter((n) => n.endsWith(".json") && n !== `${idempotencyKey}.json`); } catch { /* unreadable ⇒ no legacy */ }
+      for (const n of names) {
+        let prior: unknown;
+        try { prior = JSON.parse(readFileSync(path.join(dir, n), "utf8")); } catch { continue; }
+        if (prior !== null && typeof prior === "object" && (prior as InboxMsg).taskRef === valid.taskRef && (prior as InboxMsg).text === valid.text) {
+          writePublishedMarker(pubDir, marker, valid.ts); // migrate the legacy keyless publication into the keyed ledger
+          return;
+        }
+      }
+    }
+    // Publish the message FIRST (deterministic name ⇒ a pre-consume retry OVERWRITES, never a second copy), THEN the durable
+    // marker: a crash BETWEEN the two leaves the marker absent, so a retry safely re-publishes — it never records "published"
+    // without the message (which would silently drop the only copy).
+    const file = path.join(dir, `${idempotencyKey}.json`);
+    const tmp = `${file}.tmp-${Math.random().toString(36).slice(2, 8)}`;
+    writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
+    renameSync(tmp, file);
+    writePublishedMarker(pubDir, marker, valid.ts);
+    return;
+  }
+  // No key ⇒ the historical unique random name (every write is a new, independent message).
+  const base = `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
   const file = path.join(dir, base);
-  const tmp = `${file}.tmp-${Math.random().toString(36).slice(2, 8)}`; // unique tmp so two concurrent writers of the same idempotencyKey don't clash on the tmp
+  const tmp = `${file}.tmp-${Math.random().toString(36).slice(2, 8)}`;
   writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
   renameSync(tmp, file);
+}
+
+/** Write the durable PUBLISHED marker for an idempotency key (tmp+rename). Best-effort: the message is already on disk, so a
+ *  marker-write fault must not be reported as a failed send (the deterministic filename still coalesces a pre-consume retry); the
+ *  only exposure is a post-consume retry in the crash window between the two writes, which is the irreducible minimum. Never throws. */
+function writePublishedMarker(pubDir: string, marker: string, ts: number): void {
+  try {
+    mkdirSync(pubDir, { recursive: true, mode: 0o700 });
+    const tmp = `${marker}.tmp-${randomBytes(4).toString("hex")}`;
+    writeFileSync(tmp, String(ts), { mode: 0o600 });
+    renameSync(tmp, marker);
+  } catch { /* best-effort: the message is published; the marker is a dedup optimization that a retry re-attempts */ }
 }
 
 /** Atomically claim every pending message under ANY of `keys` (oldest first). The claimer must ack or release each.
