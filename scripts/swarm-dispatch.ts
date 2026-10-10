@@ -64,6 +64,8 @@ import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
+import { digestEnabled, shouldGenerateDigest, composeDigest } from "../packages/bus/src/swarm/morning-digest.js";
+import { writeDigestProjection, readDigestDate, gatherDigestSources } from "../packages/bus/src/swarm/morning-digest-store.js";
 import { successionEnabled } from "../packages/bus/src/swarm/shell-succession.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
@@ -175,6 +177,7 @@ const SENTINEL_IDLE_SEC = envInt(process.env.SWARM_SENTINEL_IDLE_SEC, 1800);
 // wait-output can never tight-spin, and sets how often the pane content hash is re-sampled within the fake-death window.
 const SENTINEL_SAMPLE_SEC = envInt(process.env.SWARM_SENTINEL_SAMPLE_SEC, 60);
 const GAUGE_SAMPLE_SEC = envInt(process.env.SWARM_GAUGE_SAMPLE_SEC, 60); // T5-2 seam: gauge sampling interval (sweep ticks faster, every 5s)
+const DIGEST_HOUR = Math.min(23, envInt(process.env.SWARM_DIGEST_HOUR, 7, 0)); // morning-digest local target hour (clamped 0..23)
 
 // T5-5 review-seat autoscale — SUGGESTION MODE ONLY (user ruling 2026-10-08: the flag is half-flipped). When
 // SWARM_REVIEW_AUTOSCALE is on, the sweep reads the durable review-queue ledger, runs the pure planner, and ADVISES the
@@ -653,7 +656,7 @@ async function main(): Promise<void> {
   // kill with SWARM_<X>=0). Calls the SAME readers the features use, so the line reflects the real decision. SWARM_TG_ENTRY is the
   // deliberate exception (opt-in — the bridge needs a user-seeded token), read with its own opt-in form.
   const onoff = (b: boolean): string => (b ? "on" : "off");
-  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
+  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
   const records = loadMirror();
   const ops = buildOps();
   const taskStateRef = { s: loadControlLog(CONTROL_LOG_DIR) };
@@ -813,12 +816,12 @@ async function main(): Promise<void> {
   // snapshot + retries so the event is not lost — review P2-2).
   const notifySent = new Map<string, number>(); // dedup: (taskRef\0text) -> last-sent ms; suppress an identical re-send within NOTIFY_DEDUP_MS
   const isStableSid = (s: string): boolean => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s); // CE2: a verified stable SID, not a routable display handle
-  const notifyCoordinator = (text: string, opts: { taskRef?: string; title?: string; severity?: ReportSeverity } = {}): "delivered" | "logged" | "failed" | "deduped" => {
+  const notifyCoordinator = (text: string, opts: { taskRef?: string; title?: string; severity?: ReportSeverity; intent?: "submit" | "report" | "fyi" } = {}): "delivered" | "logged" | "failed" | "deduped" => {
     const now = Date.now();
     for (const [k, t] of notifySent) if (now - t >= NOTIFY_DEDUP_MS) notifySent.delete(k); // prune expired (bounds the map)
     const key = `${opts.taskRef ?? ""}\u0000${text}`;
     if ((notifySent.get(key) ?? -Infinity) > now - NOTIFY_DEDUP_MS) return "deduped"; // identical notice just DELIVERED — skip (CE4: sync delivery records dedup, so a later tick is suppressed)
-    const s11 = { ...(opts.taskRef ? { taskRef: opts.taskRef } : {}), ...(opts.title ? { title: opts.title } : {}) }; // S11 structured header
+    const s11 = { ...(opts.taskRef ? { taskRef: opts.taskRef } : {}), ...(opts.title ? { title: opts.title } : {}), ...(opts.intent ? { intent: opts.intent } : {}) }; // S11 structured header
     // RESOLVED coordinator ⇒ the durable inbox (the normal path).
     if (COORDINATOR !== "") {
       const sid = resolveSession(COORDINATOR, listSessions(HOME));
@@ -1650,6 +1653,27 @@ async function main(): Promise<void> {
     catch (e) { log(`gauge sampling failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
+  // Morning digest (TG v1 CORE composeDigest had no trigger ⇒ never produced). Once per calendar date, at/after the local target
+  // hour, gather the night's sources + write the morning-digest/v1 projection (console/TG both read it — one generation, multi-end
+  // delivery, the generator touches no entry) + push the same brief to the coordinator durable box (S11, fyi). Idempotent per
+  // date, seeded from the on-disk projection so a mid-day restart does not re-generate. Live by default (SWARM_DIGEST, opt-out);
+  // fully fail-soft — never breaks the sweep.
+  let digestLastDate: string | null = null;
+  let digestSeeded = false;
+  const runDigest = (): void => {
+    if (!digestEnabled()) return; // SWARM_DIGEST live by default (opt-out; kill with =0)
+    try {
+      const d = new Date();
+      const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; // local date
+      if (!digestSeeded) { digestLastDate = readDigestDate(HOME); digestSeeded = true; } // survive restart: don't re-gen today's brief
+      if (!shouldGenerateDigest(today, d.getHours(), DIGEST_HOUR, digestLastDate)) return;
+      digestLastDate = today; // advance BEFORE generating ⇒ one attempt per day even if it throws (no tight retry)
+      const sources = gatherDigestSources(HOME);
+      writeDigestProjection(HOME, sources, today, nowSec()); // atomic morning-digest/v1 projection (console + TG read it)
+      notifyCoordinator(composeDigest(sources, today), { taskRef: "morning-digest", title: "morning brief", intent: "fyi" }); // same brief to the coordinator box (fyi)
+    } catch (e) { log(`morning digest failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   await runDispatchLoops({
     // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
     // dispatches). T1.5 RED LINE (fe0376cd): --task dispatch stays off (SWARM_TASK_EXEC) until the resume adapter +
@@ -1696,6 +1720,9 @@ async function main(): Promise<void> {
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
       // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
       runGaugeSampling();
+      // Morning digest — generate the daily brief projection + coordinator fyi once per day at/after SWARM_DIGEST_HOUR. Gated on
+      // SWARM_DIGEST (live by default; kill with =0); fully fail-soft.
+      runDigest();
     },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     passIntervalMs: 5000,
