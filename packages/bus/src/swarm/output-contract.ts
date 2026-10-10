@@ -87,10 +87,12 @@ function statProbe(p: string): { kind: "absent" } | { kind: "ok"; st: Stats } | 
 }
 
 /** OC-4: a report's commit citation must be CONTEXT-ANCHORED — a label (固定 / sha / sha256 / commit / @) immediately
- *  before a 7-64 hex token at word boundaries. A bare unlabeled hex run (a date "20261011", a session-UUID segment)
- *  is NOT a commit reference and must not pass. The repo's real citation forms ("固定 SHA:ddb8cda", "@7b8e87c",
- *  "报告SHA256: <64hex>", "fixed SHA <40hex>") all carry such a label; a date/UUID does not. */
-const COMMIT_REF = /(?:固定\s*)?(?:\bsha(?:[-\s]?256)?\b|\bcommit\b|@)[:\s]*\b[0-9a-f]{7,64}\b/i;
+ *  before a 7-64 hex token that STANDS ALONE. A bare unlabeled hex run (a date "20261011", a session UUID) is NOT a
+ *  commit reference; neither is a labeled UUID — the trailing `(?![0-9a-f-])` rejects a hex run that continues with a
+ *  hyphen+hex (a UUID segment: "@11111111-2222-…") or more hex, so only a whole, self-terminating sha passes (OC-4 r3).
+ *  The repo's real citation forms ("固定 SHA:ddb8cda", "@7b8e87c", "报告SHA256: <64hex>", "fixed SHA <40hex>") all carry
+ *  such a label AND terminate cleanly; a date/UUID does not. */
+const COMMIT_REF = /(?:固定\s*)?(?:\bsha(?:[-\s]?256)?\b|\bcommit\b|@)[:\s]*\b[0-9a-f]{7,64}(?![0-9a-f-])/i;
 function reportCitesCommit(txt: string): boolean { return COMMIT_REF.test(txt); }
 
 /** Apply the same path sanitization writeInbox uses, so the inbox probe reads the SAME directory a real publish wrote. */
@@ -134,8 +136,13 @@ export function probeExpectedOutput(expected: ExpectedOutput, ctx: { repoDir?: s
         let names: string[];
         try { names = readdirSync(dir); } catch { return false; } // dir absent/unreadable ⇒ no positive match here (⇒ unknown overall, never unmet)
         for (const f of names) {
-          if (!(f.endsWith(".json") || f.includes(".claim-"))) continue; // a published `.json` or an in-flight `.claim-<claimer>`
-          try { if (matches(readFileSync(path.join(dir, f), "utf8"))) return true; } catch { /* one unreadable file: keep scanning */ }
+          // A real delivery file is a published `<name>.json` OR a claimed `<name>.json.claim-<claimer>` — match it by the
+          // SAME stable-base rule inbox.ts uses (strip an in-flight claim suffix, then require `.json`). A bare substring
+          // search for ".claim-" wrongly admitted a pre-publish temp `<key>.json.tmp-<suffix>` of a legal dotted/hyphened
+          // key (e.g. "event.claim-stage") — an un-landed message that must NOT count as delivered (OC-5 r3).
+          const stable = f.replace(/\.claim-[^.]+$/, "");
+          if (!stable.endsWith(".json")) continue; // excludes `.tmp-*` temps and the `.pubcred`/`.published`/quarantine sidecars
+          try { if (matches(readFileSync(path.join(dir, f), "utf8"))) return true; } catch { /* one unreadable file (e.g. an EISDIR placeholder): keep scanning */ }
         }
         return false;
       };

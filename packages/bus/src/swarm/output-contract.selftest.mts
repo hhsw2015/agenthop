@@ -76,6 +76,15 @@ t('FC-6: verify is deterministic, no clock', verifyExpectedOutput({ kind: "file"
     t('OC-4 probe report: a labeled "固定 SHA:ddb8cda" ⇒ met', verifyExpectedOutput({ kind: "report", ref: repCn }, probeExpectedOutput({ kind: "report", ref: repCn })) === "met");
     const repAt = join(home, "at.md"); writeFileSync(repAt, "基线 main @7b8e87c");
     t('OC-4 probe report: an "@7b8e87c" citation ⇒ met', verifyExpectedOutput({ kind: "report", ref: repAt }, probeExpectedOutput({ kind: "report", ref: repAt })) === "met");
+    const repSha256 = join(home, "sha256.md"); writeFileSync(repSha256, "报告 SHA256: " + "a".repeat(64) + "\n");
+    t('OC-4 probe report: a labeled standalone 64-hex sha256 ⇒ met', verifyExpectedOutput({ kind: "report", ref: repSha256 }, probeExpectedOutput({ kind: "report", ref: repSha256 })) === "met");
+    // OC-4 r3: a LABELED UUID must NOT pass — the trailing `(?![0-9a-f-])` rejects a hex run that continues as a UUID segment
+    const repAtUuid = join(home, "atuuid.md"); writeFileSync(repAtUuid, "review owner @11111111-2222-4333-8444-555555555555; report pending");
+    t('OC-4 r3 probe report: a labeled "@<UUID>" (first-segment hex) ⇒ unmet, never met', verifyExpectedOutput({ kind: "report", ref: repAtUuid }, probeExpectedOutput({ kind: "report", ref: repAtUuid })) === "unmet");
+    const repShaUuid = join(home, "shauuid.md"); writeFileSync(repShaUuid, "SHA: 11111111-2222-4333-8444-555555555555");
+    t('OC-4 r3 probe report: a labeled "SHA: <UUID>" ⇒ unmet, never met', verifyExpectedOutput({ kind: "report", ref: repShaUuid }, probeExpectedOutput({ kind: "report", ref: repShaUuid })) === "unmet");
+    const repShort = join(home, "short.md"); writeFileSync(repShort, "SHA: abc12");
+    t('OC-4 probe report: a labeled too-short (5) hex ⇒ unmet', verifyExpectedOutput({ kind: "report", ref: repShort }, probeExpectedOutput({ kind: "report", ref: repShort })) === "unmet");
 
     // --- inbox-delivery: processed/ archive still counts, + OC-5 (the REAL writeInbox→claim→ack lifecycle) ---
     const sid = "sid-xyz"; const pdir = join(home, ".agenthop", "inbox", sid, "processed"); mkdirSync(pdir, { recursive: true });
@@ -91,6 +100,17 @@ t('FC-6: verify is deterministic, no clock', verifyExpectedOutput({ kind: "file"
     ackInbox(claimed[0].file);
     t('OC-5 probe inbox: after ack (file deleted) ⇒ unknown, NOT unmet', verifyExpectedOutput({ kind: "inbox-delivery", ref: live }, probeExpectedOutput({ kind: "inbox-delivery", ref: live }, { home, taskRef: "task-live" })) === "unknown");
     t('OC-5 probe inbox: never-sent ⇒ unknown, NOT unmet', verifyExpectedOutput({ kind: "inbox-delivery", ref: "sid-never" }, probeExpectedOutput({ kind: "inbox-delivery", ref: "sid-never" }, { home, taskRef: "task-x" })) === "unknown");
+    // OC-5 r3: a pre-publish TEMP of a legal dotted/hyphened idempotency key (e.g. "event.claim-stage") lands as
+    // "<key>.json.tmp-<suffix>" — it CONTAINS ".claim-" but is NOT a published/claimed message. It must NOT count as delivered.
+    const ksid = "sid-keyed"; const kdir = join(home, ".agenthop", "inbox", ksid); mkdirSync(kdir, { recursive: true });
+    writeFileSync(join(kdir, "event.claim-stage.json.tmp-deadbeef"), JSON.stringify({ taskRef: "task-keyed", text: "unlanded" }));
+    t('OC-5 r3 probe inbox: a pre-publish .tmp-* of a dotted key ⇒ unknown, never met', verifyExpectedOutput({ kind: "inbox-delivery", ref: ksid }, probeExpectedOutput({ kind: "inbox-delivery", ref: ksid }, { home, taskRef: "task-keyed" })) === "unknown");
+    // and a REAL keyed publish with that same legal dotted key DOES land as "<key>.json" ⇒ met (the fix must not reject legal keyed delivery)
+    const ksid2 = "sid-keyed2";
+    writeInbox(home, ksid2, composeInboxMsg({ from: "w", fromLabel: "worker", text: "landed", via: "test", taskRef: "task-keyed2" }), "event.claim-stage");
+    t('OC-5 r3 probe inbox: a real keyed publish ("<key>.json") ⇒ met', verifyExpectedOutput({ kind: "inbox-delivery", ref: ksid2 }, probeExpectedOutput({ kind: "inbox-delivery", ref: ksid2 }, { home, taskRef: "task-keyed2" })) === "met");
+    const kclaimed = claimInbox(home, [ksid2], "claimer");
+    t('OC-5 r3 probe inbox: a claimed keyed message ("<key>.json.claim-<pid>") still ⇒ met', kclaimed.length === 1 && verifyExpectedOutput({ kind: "inbox-delivery", ref: ksid2 }, probeExpectedOutput({ kind: "inbox-delivery", ref: ksid2 }, { home, taskRef: "task-keyed2" })) === "met");
 
     // --- OC-1: a read fault (EACCES / not-a-repo) degrades to unknown, NEVER unmet (FC-2 r3) ---
     const notRepo = join(home, "notrepo"); mkdirSync(notRepo);
