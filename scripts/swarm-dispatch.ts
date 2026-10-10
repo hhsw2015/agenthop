@@ -53,10 +53,12 @@ import { planGrantEnvelope } from "../packages/bus/src/swarm/board-envelope.js";
 import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, ingestLedgerChunk, pruneDeadLetterWindow, consolidatePending, readDeadLetterWatch, writeDeadLetterWatch, routeKeyOf, routingGroupKey, routeKeyOfGroup, routingActiveSignal, type ReadArtifact, type WatchSnapshot, type DeadLetterWatch } from "../packages/bus/src/swarm/delegation-observer.js";
 import { advanceWait, isRenewable } from "../packages/bus/src/swarm/task-wait.js";
 import { subjectProgressSeq, hasFreshSubjectEvidence, renewOperationId, renewalCount } from "../packages/bus/src/swarm/evidence-renewal.js";
-import { resolveSession, listSessions, makeFileLiveness } from "../packages/bus/src/swarm/task-liveness.js";
+import { resolveSession, listSessions, makeFileLiveness, pidFileMtimeSec } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
-import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
+import { writeInbox, inboxDirName, scanInboxMessages } from "../packages/bus/src/inbox.js";
+import { verifyOpsAction, applyOpsVerdict, opsReceiptOpen, successionHeartbeatDue, successionHeartbeatSec, type OpsReceiptRecord, type OpsEvidence, type SuccessionLiveness } from "../packages/bus/src/swarm/coordinator-ops-receipt.js";
+import { readSuccessionSwapSec } from "../packages/bus/src/swarm/shell-succession.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
 import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { coordinatorReportPlan, coordEscalateEnabled, type ReportSeverity } from "../packages/bus/src/swarm/coordinator-report.js";
@@ -94,6 +96,14 @@ const SWARM_TEAM = process.env.SWARM_TEAM || "";
 // lifecycle record (drain/expire/milestone/checkpoint) to the mirror, but allocates no VM until SWARM_EXEC=1.
 // Only explicit enabling values count — `!!"0"`/`!!"false"` are truthy, so SWARM_EXEC=0 must NOT enable (Codex P1).
 const EXEC_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_EXEC ?? "");
+// F53 ② (SWARM_OPS_RECEIPT): verify the coordinator's OWN spawn/inject ops by DURABLE evidence (not an API's instant return);
+// on an unverified op ACCOUNT (notify the coordinator), NEVER auto-redo (re-fire idempotency is not dispatcher-provable). Opt-in,
+// default OFF (new feature, observation period) — same idiom/posture as SWARM_PLACEMENT / SWARM_VM_CTL, NOT flagDefaultOn.
+const OPS_RECEIPT_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_OPS_RECEIPT ?? "");
+// F53 ③ (SWARM_SUCCESSION_HEARTBEAT): a swapped member with no proof of life past the window ⇒ S19. Opt-in, default OFF. The
+// window is SWARM_SUCCESSION_HEARTBEAT_SEC (pure core, default 600). The swap-record WRITE rides SWARM_SUCCESSION (always recorded);
+// only this CONSUMPTION is gated here, so enabling the heartbeat later still sees swaps that happened while it was off.
+const SUCCESSION_HEARTBEAT_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_SUCCESSION_HEARTBEAT ?? "");
 // F40 unclaimed-mail sentinel: a durable inbox with unread mail older than this AND no live session draining it ⇒ escalate to
 // the coordinator (silent-stall detection). 10min default — long enough that an ordinary flush cadence never trips it.
 const INBOX_STALL_SEC = Number(process.env.SWARM_INBOX_STALL_SEC || "600");
@@ -340,6 +350,11 @@ async function allocateSuccessor(_pred: ControlRecord, successorId: string): Pro
   // (box may exist). SWARM_TEAM still matters for swarm-task --resume (the successor's worker joins the team).
   if (!SWARM_TEAM) log("allocateSuccessor: SWARM_TEAM is unset — the resumed successor would join teamless/invisible");
   const r = await runScript(SWARM_LAUNCH, ["claude", SWARM_TEAM, "new"], { AGENTHOP_ALLOCATE_ONLY: "1", AGENTHOP_LAUNCH_ID: successorId });
+  // F53 ② fire-site SEAM (TODO, dormant): when the lifecycle pass commits this allocate, also commit a pending receipt so
+  // runOpsReceipt can verify it by durable evidence — commitTask(state, [{ put: "opsReceipt",
+  // ops: pendingOpsReceipt({ kind: "spawn", target: successorId }, successorId, nowSec()) }]). Left unwired here because these
+  // op fns don't hold the control-log state (the lifecycle axis persists via saveRecord); the minimal correct placement is the
+  // commit point in the pass. Until wired, runOpsReceipt finds no pending records ⇒ a safe no-op. (import: pendingOpsReceipt.)
   if (r.code === 0) { log(`allocateSuccessor: allocated ${successorId}`); return "ok"; }
   if (r.code === 3) { log(`allocateSuccessor ${successorId}: clean refusal (not created)`); return "clean-fail"; }
   log(`allocateSuccessor ${successorId}: result unknown (exit ${r.code})`);
@@ -351,6 +366,8 @@ async function resumeSuccessor(a: { successor: string; handoffSha: string; gener
   const r = await runScript(SWARM_TASK, [a.successor, "--resume", a.handoffSha, String(a.generation)],
     WORK_REPO ? { SWARM_WORK_REPO: repoSlug(WORK_REPO) } : {});
   if (r.code !== 0) { log(`resumeSuccessor ${a.successor}: swarm-task --resume failed (code ${r.code}): ${(r.stderr || r.stdout).trim().slice(0, 200)}`); return false; }
+  // F53 ② fire-site SEAM (TODO, dormant): on a successful resume, the pass should commit a pending receipt
+  // { put: "opsReceipt", ops: pendingOpsReceipt({ kind: "inject", target: a.successor }, a.successor, nowSec()) } (see allocateSuccessor).
   return true;
 }
 async function scrubBox(launchId: string): Promise<boolean> {
@@ -494,6 +511,10 @@ async function startTaskIO(a: { assignment: Assignment; launchId: string }): Pro
       delivered = t.code === 0;
       if (!delivered) log(`startTask ${a.launchId}: box created but swarm-task --task exit ${t.code} (worker not started): ${(t.stderr || t.stdout).trim().slice(0, 200)}`);
     }
+    // F53 ② fire-site SEAM (TODO, dormant): the task pass (which holds the control-log state) should commit a pending receipt
+    // for the box when alloc==="created" (kind:"spawn") and, once delivered, for the worker inject (kind:"inject"), both keyed by
+    // a.launchId — { put: "opsReceipt", ops: pendingOpsReceipt({ kind, target: a.launchId }, a.launchId, nowSec()) } — so
+    // runOpsReceipt verifies them by durable evidence. Unwired until the pass-side placement lands (see allocateSuccessor seam).
     return { alloc, delivered };
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -1519,6 +1540,75 @@ async function main(): Promise<void> {
       .catch((e) => log(`live sentinel watcher ${name} ended: ${e instanceof Error ? e.message : e}`))
       .finally(() => { if (sentinelWatchers.get(name) === ac) sentinelWatchers.delete(name); });
   };
+  // F53 ②: ops-receipt — verify the coordinator's OWN fired spawn/inject ops by DURABLE evidence (never the op's instant return,
+  // the F53 trap). Reads the OPEN opsReceipt records (pending/unknown), gathers evidence for each target, runs verifyOpsAction,
+  // and commits the verdict ONLY when the status changes (FC-6 explicit transition — no revision churn). confirmed ⇒ discharged;
+  // unknown/failed ⇒ ACCOUNT via notifyCoordinator, NEVER auto-redo (②b: re-fire idempotency is not dispatcher-provable). Gated
+  // on SWARM_OPS_RECEIPT (default OFF); sync; fully fail-soft; spawns/acts on nothing.
+  const runOpsReceipt = (): void => {
+    if (!OPS_RECEIPT_ENABLED) return;
+    try {
+      let st = loadControlLog(CONTROL_LOG_DIR);
+      const sids = listSessions(HOME);
+      const coordSid = resolveSession(COORDINATOR, sids);
+      const checkins = coordSid ? scanInboxMessages(HOME, coordSid) : [];
+      const open = Object.values(liveEntities(st))
+        .filter((b): b is Extract<ChangeBody, { put: "opsReceipt" }> => b.put === "opsReceipt")
+        .map((b) => b.ops).filter(opsReceiptOpen);
+      for (const rec of open) {
+        // DURABLE evidence against the target (the op's instant return is deliberately NOT consulted — F53).
+        const busVisible = resolveSession(rec.target, sids) !== null;
+        const checkinInInbox = checkins.some((m) => m.from === rec.target && m.text.startsWith("[checkin]"));
+        const inboxReceipt = checkins.some((m) => m.from === rec.target);
+        let reportFile = false;
+        try { reportFile = existsSync(path.join(BOARD_DIR, `${rec.target}.report.json`)); } catch { /* no board file ⇒ not that signal */ }
+        const evidence: OpsEvidence = rec.kind === "spawn" ? { busVisible, checkinInInbox } : { inboxReceipt, reportFile };
+        const verdict = verifyOpsAction({ kind: rec.kind, target: rec.target }, evidence);
+        if (verdict === rec.status) continue; // unchanged ⇒ no commit (avoid revision churn)
+        const { state, result } = commitTask(st, [{ put: "opsReceipt", ops: applyOpsVerdict(rec, verdict, nowSec()) }]);
+        if (result.ok) st = state; else { st = loadControlLog(CONTROL_LOG_DIR); continue; } // seq race ⇒ reload, retry next tick
+        if (verdict !== "confirmed") // ②b: account, never auto-redo
+          notifyCoordinator(`[ops-receipt] ${rec.kind} ${rec.target} UNCONFIRMED (${verdict}) — needs attention (no auto-redo)`, { taskRef: `ops-receipt:${rec.opId}`, title: "op unverified" });
+      }
+    } catch (e) { log(`ops receipt failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
+  // F53 ③: succession-heartbeat — a swapped member (swap record present) with NO bus heartbeat AND no [checkin] since the swap,
+  // past the window, ⇒ S19. A SIBLING of runLiveSentinel so it is gated INDEPENDENTLY of SWARM_SENTINEL (SWARM_SUCCESSION_HEARTBEAT,
+  // default OFF). Reuses notifyCoordinator (built-in dedup) + a per-episode one-shot re-armed on recovery. Consumes the swap record
+  // written on adopt under SWARM_SUCCESSION. Sync; fully fail-soft.
+  const succHeartbeatFired = new Set<string>();
+  const runSuccessionHeartbeat = (): void => {
+    if (!SUCCESSION_HEARTBEAT_ENABLED) { succHeartbeatFired.clear(); return; }
+    try {
+      const sids = listSessions(HOME);
+      const coordSid = resolveSession(COORDINATOR, sids);
+      const checkins = coordSid ? scanInboxMessages(HOME, coordSid) : [];
+      const thresholdSec = successionHeartbeatSec();
+      const now = nowSec();
+      const roster = new Set<string>(sids);
+      try {
+        const snap = JSON.parse(readFileSync(path.join(HOME, ".agenthop", "swarm", "roster-snapshot.json"), "utf8"));
+        for (const s of resolveSnapshotMembers(snap?.members ?? [], (h) => resolveSession(h, sids))) roster.add(s);
+      } catch { /* no snapshot ⇒ presence sids only */ }
+      const dueNow = new Set<string>();
+      for (const sid of roster) {
+        const swappedAtSec = readSuccessionSwapSec(HOME, sid);
+        if (swappedAtSec === undefined) continue; // not a swapped member ⇒ never heartbeat-checked (FC-7 fail-closed)
+        const lastBusSec = pidFileMtimeSec(HOME, sid) ?? undefined; // presence pid heartbeat mtime (seconds); null ⇒ undefined (never)
+        let lastCheckinSec: number | undefined;
+        for (const m of checkins) if (m.from === sid && m.text.startsWith("[checkin]")) { const s = Math.floor(m.ts / 1000); if (lastCheckinSec === undefined || s > lastCheckinSec) lastCheckinSec = s; }
+        const live: SuccessionLiveness = { member: sid, swappedAtSec, ...(lastBusSec !== undefined ? { lastBusSec } : {}), ...(lastCheckinSec !== undefined ? { lastCheckinSec } : {}) };
+        if (!successionHeartbeatDue(live, now, thresholdSec)) continue;
+        dueNow.add(sid);
+        if (succHeartbeatFired.has(sid)) continue; // already surfaced this episode
+        const r = notifyCoordinator(`[succession] swapped member ${sid} shows no proof of life (bus/checkin) since swap`, { taskRef: `succession:heartbeat:${sid}`, title: "successor silent" });
+        if (r !== "failed") succHeartbeatFired.add(sid); // transient failure ⇒ leave unfired so a later tick retries
+      }
+      for (const sid of [...succHeartbeatFired]) if (!dueNow.has(sid)) succHeartbeatFired.delete(sid); // recovered ⇒ re-arm
+    } catch (e) { log(`succession heartbeat failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   const runLiveSentinel = async (): Promise<void> => {
     const abortAll = (): void => { for (const ac of sentinelWatchers.values()) ac.abort(); sentinelWatchers.clear(); };
     if (!SENTINEL_ENABLED) { abortAll(); sentinelPending.clear(); return; }
@@ -1801,6 +1891,12 @@ async function main(): Promise<void> {
       // S14: live member sentinel — herdr-identified blocked/fake-death/idle-timeout ⇒ escalate (blocked ⇒ S19 approval). Gated
       // on SWARM_SENTINEL + herdr reachability; dormant otherwise.
       await runLiveSentinel();
+      // F53 ②: ops-receipt — verify the coordinator's own fired spawn/inject ops by durable evidence; account (never auto-redo) on
+      // an unverified op. Gated on SWARM_OPS_RECEIPT (default OFF); fully fail-soft.
+      runOpsReceipt();
+      // F53 ③: succession-heartbeat — a swapped member silent past the window ⇒ S19. Gated on SWARM_SUCCESSION_HEARTBEAT
+      // (default OFF), independent of SWARM_SENTINEL; fully fail-soft.
+      runSuccessionHeartbeat();
       // T5-5: review-seat autoscale SUGGESTION (never acts) — read the review-queue ledger, advise the coordinator on seat
       // scaling. Gated on SWARM_REVIEW_AUTOSCALE (live by default; kill with =0); fully fail-soft.
       runReviewAutoscaleSuggest();

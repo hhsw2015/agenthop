@@ -40,6 +40,18 @@ describe("commit — basics", () => {
     expect(state.entities["intent:as1"]).toBeDefined();
     expect(entityKeyOf({ put: "intent", intent })).toBe("intent:as1");
   });
+  test("F53 opsReceipt keys to opsReceipt:<opId>, projects, and advances by revision (no latest-wins)", () => {
+    const pending: ChangeBody = { put: "opsReceipt", ops: { opId: "spawn:L1", kind: "spawn", target: "m1", firedAtSec: 100, status: "pending" } };
+    expect(entityKeyOf(pending)).toBe("opsReceipt:spawn:L1");
+    const s1 = commit(initialLogState(), 0, [ch(pending, "op-ops-1")]).state;
+    expect(s1.revisions["opsReceipt:spawn:L1"]).toBe(1);
+    expect((s1.entities["opsReceipt:spawn:L1"] as Extract<ChangeBody, { put: "opsReceipt" }>).ops.status).toBe("pending");
+    // a status transition is a NEW revision of the SAME entity (FC-6 explicit transition)
+    const confirmed: ChangeBody = { put: "opsReceipt", ops: { opId: "spawn:L1", kind: "spawn", target: "m1", firedAtSec: 100, status: "confirmed", verdict: "confirmed", checkedAtSec: 200 } };
+    const s2 = commit(s1, 1, [ch(confirmed, "op-ops-2", 1)]).state;
+    expect(s2.revisions["opsReceipt:spawn:L1"]).toBe(2);
+    expect((liveEntities(s2)["opsReceipt:spawn:L1"] as Extract<ChangeBody, { put: "opsReceipt" }>).ops.status).toBe("confirmed");
+  });
 });
 
 describe("decision order (Codex §2.6 v2; fe0376cd traps)", () => {

@@ -35,6 +35,7 @@ import type { TaskPlan } from "./task-plan.js";
 import type { TaskAttempt } from "./task-state.js";
 import type { AcceptedResult } from "./task-result.js";
 import type { ControlRecord } from "./control.js";
+import type { OpsReceiptRecord } from "./coordinator-ops-receipt.js";
 
 /** Dispatch intent (§4.3). Type lives HERE (co-located with Change); the dispatch side imports it and owns the
  *  CONSTRUCTION logic (allocOutcome / physicalEvidence / physicalExpiresAtSec CAS-then-IO semantics). */
@@ -172,7 +173,8 @@ export type ChangeBody =
   | { put: "validationRun"; validationRun: ValidationRun }
   | { put: "lifecycle"; record: ControlRecord }
   | { put: "scan"; branch: string; cursor: string | null }
-  | { put: "tombstone"; launchId: string };
+  | { put: "tombstone"; launchId: string }
+  | { put: "opsReceipt"; ops: OpsReceiptRecord }; // F53: a coordinator spawn/inject fired, awaiting durable proof (additive, FC-7)
 
 /** Each Change carries its operation identity (§2.6): a globally-unique operationId and the entityRevision the caller
  *  believed the target entity was at. */
@@ -213,6 +215,7 @@ export function entityKeyOf(c: ChangeBody): string {
     case "lifecycle": return `lifecycle:${c.record.launchId}`;
     case "scan": return `scan:${c.branch}`;
     case "tombstone": return `tombstone:${c.launchId}`;
+    case "opsReceipt": return `opsReceipt:${c.ops.opId}`;
   }
 }
 

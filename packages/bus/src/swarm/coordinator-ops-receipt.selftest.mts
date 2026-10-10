@@ -3,6 +3,7 @@
 // evidence) + opsNeedsRedo, and the succession-heartbeat decision (successionHeartbeatDue) + its configured window.
 import {
   verifyOpsAction, opsNeedsRedo, successionHeartbeatSec, successionHeartbeatDue, SUCCESSION_HEARTBEAT_SEC_DEFAULT,
+  pendingOpsReceipt, applyOpsVerdict, opsReceiptOpen,
   type OpsAction, type OpsEvidence, type SuccessionLiveness,
 } from "./coordinator-ops-receipt.js";
 
@@ -51,5 +52,16 @@ t("due: check-in before swap (stale) -> true", successionHeartbeatDue(m({ lastCh
 t("not due: not a swapped member (NaN swappedAt)", successionHeartbeatDue(m({ swappedAtSec: NaN }), 9999, TH) === false);
 t("not due: bus exactly at swap instant counts as life", successionHeartbeatDue(m({ lastBusSec: 1000 }), 2000, TH) === false);
 t("not due: nowSec non-finite", successionHeartbeatDue(m(), NaN, TH) === false);
+
+// ── ② opsReceipt record: pendingOpsReceipt / applyOpsVerdict / opsReceiptOpen ───────────────────────────────────
+const pend = pendingOpsReceipt(spawn, "L1", 500);
+t("pendingOpsReceipt: opId=kind:launchId, status pending, binds kind/target/firedAt, no verdict", pend.opId === "spawn:L1" && pend.status === "pending" && pend.kind === "spawn" && pend.target === "m1" && pend.firedAtSec === 500 && pend.verdict === undefined);
+t("pendingOpsReceipt inject keys inject:<id>", pendingOpsReceipt(inject, "L2", 1).opId === "inject:L2");
+t("opsReceiptOpen: pending is open", opsReceiptOpen(pend) === true);
+const conf = applyOpsVerdict(pend, "confirmed", 600);
+t("applyOpsVerdict confirmed: status+verdict+checkedAt set; discharged (not open)", conf.status === "confirmed" && conf.verdict === "confirmed" && conf.checkedAtSec === 600 && opsReceiptOpen(conf) === false);
+t("applyOpsVerdict failed: terminal (not open)", opsReceiptOpen(applyOpsVerdict(pend, "failed", 600)) === false);
+t("applyOpsVerdict unknown: still open (re-check next round)", opsReceiptOpen(applyOpsVerdict(pend, "unknown", 600)) === true);
+t("applyOpsVerdict is immutable (input left pending)", pend.status === "pending" && pend.verdict === undefined);
 
 console.log("all coordinator-ops-receipt selftests passed");

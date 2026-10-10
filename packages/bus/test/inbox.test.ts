@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSyn
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, scanInboxMessages, inboxDirName, type InboxMsg } from "../src/inbox.js";
 import { deliverToCoordinator } from "../src/checkin.js";
 import type { SelfInfo } from "../src/label.js";
 
@@ -21,6 +21,24 @@ describe("durable inbox", () => {
     expect(c[0].msg.text).toBe("hello");
     ackInbox(c[0].file);
     expect(claimInbox(HOME, ["s1"], "pidA").length).toBe(0);
+  });
+
+  test("scanInboxMessages is READ-ONLY (F53 ②c): returns valid msgs, consumes nothing, skips claimed + poison", () => {
+    writeInbox(HOME, "s1", msg("one", 1000));
+    writeInbox(HOME, "s1", msg("two", 2000));
+    const seen = scanInboxMessages(HOME, "s1").map((m) => m.text).sort();
+    expect(seen).toEqual(["one", "two"]);
+    // non-destructive: the messages are STILL claimable afterwards (nothing was renamed/unlinked)
+    expect(claimInbox(HOME, ["s1"], "p").length).toBe(2);
+    // a claimed (renamed .claim-*) message is NOT returned by a scan, and a poison .json is skipped
+    const dir = path.join(HOME, ".agenthop", "inbox", inboxDirName("s2"));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "0000000000000001-aaaaaa.json"), JSON.stringify(msg("good", 1)));
+    writeFileSync(path.join(dir, "0000000000000002-bbbbbb.json"), "{ not json");
+    writeFileSync(path.join(dir, "0000000000000003-cccccc.json.claim-pidX"), JSON.stringify(msg("claimed", 3)));
+    const s2 = scanInboxMessages(HOME, "s2").map((m) => m.text);
+    expect(s2).toEqual(["good"]);
+    expect(scanInboxMessages(HOME, "missing-key")).toEqual([]);
   });
 
   test("claim is atomic: a second claimer gets nothing until the first releases", () => {

@@ -63,6 +63,40 @@ export function opsNeedsRedo(v: OpsVerdict): boolean {
   return v !== "confirmed";
 }
 
+/** A durable "coordinator op fired, awaiting durable proof" record — the control-log `opsReceipt` put kind's payload (FC-7
+ *  additive, mirrors the approval ticket's `permissionDecision` precedent). Written `status:"pending"` at fire time, then
+ *  advanced by the sweep's receipt step (verifyOpsAction) to a terminal verdict. Keyed by a stable `opId` so a re-check
+ *  updates the SAME entity by its control-log revision (FC-6: explicit status transition, never latest-wins). */
+export type OpsReceiptStatus = "pending" | OpsVerdict; // "pending" | "confirmed" | "failed" | "unknown"
+export interface OpsReceiptRecord {
+  opId: string;            // stable per-op id = the entity key suffix (e.g. `${kind}:${launchId}`)
+  kind: OpsActionKind;     // spawn | inject (selects which OpsEvidence fields verifyOpsAction reads)
+  target: string;          // the member/session the op acted on (evidence is gathered against it)
+  firedAtSec: number;      // when the op was fired (audit; never used as a latest-wins key)
+  status: OpsReceiptStatus;
+  verdict?: OpsVerdict;    // the last verifyOpsAction result (absent while "pending")
+  checkedAtSec?: number;   // when the receipt step last verified (audit)
+}
+
+/** Pure: fold a fresh verdict into a receipt record (the sweep commits the result ONLY when `status` actually changes — FC-6
+ *  explicit transition, no churn). `confirmed` discharges; `failed`/`unknown` are the account-not-auto-redo states (the caller
+ *  notifies the coordinator and never re-fires, since re-fire idempotency is not dispatcher-provable). */
+export function applyOpsVerdict(rec: OpsReceiptRecord, verdict: OpsVerdict, nowSec: number): OpsReceiptRecord {
+  return { ...rec, status: verdict, verdict, checkedAtSec: nowSec };
+}
+
+/** Pure: a receipt still needs checking next round when it is unproven — `pending` (never checked) or `unknown` (checked, no
+ *  durable proof either way; may still become confirmed later). `confirmed` (discharged) and `failed` (durable negative,
+ *  accounted) are terminal. */
+export function opsReceiptOpen(rec: OpsReceiptRecord): boolean {
+  return rec.status === "pending" || rec.status === "unknown";
+}
+
+/** Pure: build a fresh pending receipt at op-fire time. */
+export function pendingOpsReceipt(action: OpsAction, launchId: string, firedAtSec: number): OpsReceiptRecord {
+  return { opId: `${action.kind}:${launchId}`, kind: action.kind, target: action.target, firedAtSec, status: "pending" };
+}
+
 // ============================================================================================================
 // ③ sentinel succession-heartbeat — successionHeartbeatDue: a swapped member with no proof of life ⇒ S19
 // ============================================================================================================

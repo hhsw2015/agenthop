@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { startBusCore, type BusCore, type BusCoreOptions } from "./core.js";
 import { PRESENCE_HEARTBEAT_SEC, openLivenessSocket } from "./swarm/task-liveness.js";
-import { successionEnabled, runSuccessionAtStartup } from "./swarm/shell-succession.js";
+import { successionEnabled, runSuccessionAtStartup, writeSuccessionSwap } from "./swarm/shell-succession.js";
 import { dbg } from "./debug.js";
 
 /**
@@ -141,7 +141,7 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
           // SU3: bind the target's liveness socket FIRST; only adopt the core identity (+ drain inbox) once the socket is confirmed
           // ready. On a bind failure core identity is left untouched and sockSid is reverted — nothing to roll back in core, and the
           // heartbeat keeps serving our own sid. (syncSidFor from adoptStableId is a same-sid no-op: the socket is already bound.)
-          async (sid) => { if (closing) return false; const bound = await ensureSockBoundTo(sid); if (!bound) return false; core.adoptStableId(sid); return true; },
+          async (sid) => { if (closing) return false; const bound = await ensureSockBoundTo(sid); if (!bound) return false; core.adoptStableId(sid); writeSuccessionSwap(home, sid, Math.floor(Date.now() / 1000)); return true; }, // F53 ③: record the swap time (fail-soft) so the sentinel's succession-heartbeat can watch this swapped identity
           dbg,
         );
       } catch (e) { dbg(`succession startup failed (ignored): ${e instanceof Error ? e.message : e}`); }
