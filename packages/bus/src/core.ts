@@ -132,7 +132,10 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   // durable dir each flush and clears a notice only after a confirmed send.
   const poisonStrikes = new Map<string, number>();
   const retryPoisonNotices = (): void => {
-    drainPoisonNotices(home, (m) => deliverToCoordinator(home, self, process.env.SWARM_COORDINATOR, m));
+    if (!poisonDlqEnabled()) return; // PD-R3-P1-1: an OFF (or unrelated) drainer must never consume/reroute others' durable notices
+    // Deliver each notice to its OWN bound target (PD-R3-P1-1 — never substitute our SWARM_COORDINATOR); a legacy record with no
+    // bound target falls back to our coordinator best-effort (FC-7).
+    drainPoisonNotices(home, (target, m) => deliverToCoordinator(home, self, target ?? process.env.SWARM_COORDINATOR, m));
   };
   // C2 (review 01b773d): watch-triggered flushes back off until this time after a no-progress flush, so our OWN claim/release
   // renames (which also fire the inbox fs-watch) cannot self-excite a tight flush loop while the push channel is down. The 5s
@@ -207,14 +210,21 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
         // head-of-line poison stops blocking the rest. Dormant unless SWARM_POISON_DLQ; quarantine is recoverable, never a drop.
         if (threw !== null && poisonDlqEnabled()) {
           const strikes = recordPoisonStrike(claimed[i].file, poisonStrikes); // in-memory authoritative (PD-P2-3)
-          if (shouldQuarantinePoison(strikes, poisonDlqThreshold()) &&
-              quarantineInbox(home, claimed[i].file, `poison: delivery threw ${strikes}x: ${threw}`, JSON.stringify(claimed[i].msg)) !== "failed") {
-            clearPoisonStrikes(claimed[i].file, poisonStrikes);
-            // PD-P2-2: build the notice, try to deliver NOW; if the coordinator is not reachable yet, PERSIST it to the durable
-            // queue so the obligation survives a restart + has no memory cap (drainPoisonNotices retries it, clears on send).
+          if (shouldQuarantinePoison(strikes, poisonDlqThreshold())) {
+            // PD-P2-2: the obligation must be DURABLE BEFORE we quarantine (which removes the source + clears the count). Try to
+            // deliver now; "sent"/"skip" ⇒ no pending obligation to persist; "retry" ⇒ persist first and only proceed if the
+            // write succeeded. If we can neither deliver NOR persist, do NOT quarantine — keep the source + strike so a later
+            // flush retries the whole thing (never discharge the obligation on a notice-write failure).
+            const coord = process.env.SWARM_COORDINATOR;
             const notice = buildPoisonS19(self.stableId ?? self.id, self.title, claimed[i].msg, strikes, threw);
-            if (deliverToCoordinator(home, self, process.env.SWARM_COORDINATOR, notice) === "retry") enqueuePoisonNotice(home, notice);
-            continue; // poison removed ⇒ try the rest of the batch
+            const d = deliverToCoordinator(home, self, coord, notice);
+            const obligationSafe = d === "sent" || d === "skip" || (d === "retry" && coord !== undefined && enqueuePoisonNotice(home, coord, notice));
+            if (obligationSafe &&
+                quarantineInbox(home, claimed[i].file, `poison: delivery threw ${strikes}x: ${threw}`, JSON.stringify(claimed[i].msg)) !== "failed") {
+              clearPoisonStrikes(claimed[i].file, poisonStrikes);
+              continue; // poison removed + obligation secured ⇒ try the rest of the batch
+            }
+            // else: fall through to release+bail — source + strike retained, retried next flush
           }
         }
         // B7: a failed release for a HEALTHY message must not silently strand it — track it for retry (not stuckPoison; it is not
