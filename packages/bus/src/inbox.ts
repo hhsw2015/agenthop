@@ -13,6 +13,7 @@ import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSyn
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
 import { isSubmitIntent, type SubmitIntent } from "./submit-intent.js";
+import { redactSecrets } from "./redact.js";
 
 export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: string; ts: number; actionId?: string; taskRef?: string; title?: string; intent?: SubmitIntent };
 export type Claimed = { file: string; msg: InboxMsg };
@@ -468,16 +469,21 @@ export function clearPoisonStrikes(file: string, mem: Map<string, number>): void
 /** FC-2 (PD-P2-1) — strip transport-UNSAFE control chars (NUL + other C0/DEL, keeping \t \n \r) so the NOTICE itself can never
  *  become a poison message. A legal envelope may carry U+0000, which a real Codex push rejects (ERR_INVALID_ARG_VALUE); copying
  *  it verbatim into the alert would make the ALERT a poison that blocks the coordinator's inbox. The original bytes stay intact
- *  in quarantine/; only this human-facing notice is sanitized. */
+ *  in quarantine/; only this human-facing notice is sanitized. D-multica ②: after the control-char strip, `redactSecrets` masks
+ *  any secret token (AWS/GitHub/OpenAI/Anthropic/Slack/PEM) so a quarantined poison's content preview cannot leak a key when the
+ *  notice is forwarded to the coordinator / persisted. */
 function sanitizeForTransport(s: string): string {
-  return s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "�");
+  return redactSecrets(s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "�"));
 }
 
 /** FC-2 — build the S19 dead-letter notification for the coordinator when a poison message is quarantined: content preview +
  *  failure trace + strike count, as an InboxMsg, all TRANSPORT-SANITIZED (PD-P2-1). Pure (no IO); the caller writes it. */
 export function buildPoisonS19(mySid: string, myLabel: string, poison: InboxMsg, strikes: number, trace: string): InboxMsg {
-  const clipped = poison.text.length > 240 ? `${poison.text.slice(0, 240)}…` : poison.text;
-  const preview = sanitizeForTransport(clipped);
+  // RS-1: sanitize (control-char strip + secret redaction) the FULL text FIRST, THEN bound for display. Clipping first would
+  // split a PEM block or a fixed-length token across the 240 boundary, so redactSecrets could not match it and a sensitive
+  // fragment would survive into this notice (and the durable poison-notices queue, and the forward). quarantine/ keeps originals.
+  const safe = sanitizeForTransport(poison.text);
+  const preview = safe.length > 240 ? `${safe.slice(0, 240)}…` : safe;
   const text = `[poison-dlq] 毒件已隔离(投递崩溃 ${strikes} 次,已达阈值)。来源 ${sanitizeForTransport(poison.fromLabel)} via ${sanitizeForTransport(poison.via)};失败轨迹: ${sanitizeForTransport(trace)};内容预览: ${preview}`;
   return { from: mySid, fromLabel: myLabel, text, via: "local", ts: Date.now(), taskRef: "poison-dlq", title: "poison quarantine" };
 }

@@ -270,6 +270,32 @@ describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
     expect(validInboxMsg(s19)).not.toBeNull();
   });
 
+  test("D-multica ②: buildPoisonS19 redacts a secret in the preview so the forwarded notice cannot leak a key", () => {
+    const akid = "AKIA" + "A".repeat(16); // synthetic AWS-AKID-shaped token, built from fragments
+    const poison = { from: "x", fromLabel: "alice", text: "crash dumped creds " + akid + " end", via: "local", ts: 7 };
+    const s19 = buildPoisonS19("my-sid", "me", poison, 3, "boom");
+    expect(s19.text).not.toContain(akid);            // the secret is gone from the human-facing notice
+    expect(s19.text).toContain("[REDACTED:AWS_AKID]"); // replaced with the typed marker
+    expect(s19.text).toContain("crash dumped creds"); // surrounding content preserved
+    expect(validInboxMsg(s19)).not.toBeNull();
+  });
+
+  test("RS-1: a PEM whose END marker is past the 240 preview boundary is still fully redacted (redact-before-clip)", () => {
+    const tag = "PRIV" + "ATE KEY-----"; // split mid-word so no contiguous PEM marker hits source (host scanner)
+    const pem = "-----BEGIN RSA " + tag + "\n" + "x".repeat(300) + "\n-----END RSA " + tag; // END sits well past char 240
+    const s19 = buildPoisonS19("my-sid", "me", { from: "x", fromLabel: "a", text: pem, via: "local", ts: 1 }, 3, "t");
+    expect(s19.text).toContain("[REDACTED:PEM_PRIVATE_KEY]"); // the whole block is masked
+    expect(s19.text).not.toContain("x".repeat(20));           // no body fragment leaks (old clip-then-redact leaked it)
+  });
+
+  test("RS-1: a fixed-length GitHub token straddling the 240 boundary is redacted, not leaked as a fragment", () => {
+    const tok = "ghp_" + "a".repeat(36);                       // 40 chars; the fixed-length rule needs the WHOLE token to match
+    const text = "Z".repeat(204) + " " + tok + " " + "W".repeat(40); // token at index 205, ends at 245 — straddles the 240 clip
+    const s19 = buildPoisonS19("my-sid", "me", { from: "x", fromLabel: "a", text, via: "local", ts: 1 }, 3, "t");
+    expect(s19.text).toContain("[REDACTED:GITHUB_TOKEN]");
+    expect(s19.text).not.toContain("ghp_");              // no prefix+fragment survives (old path leaked the first 35 chars)
+  });
+
   test("PD-P2-2: deliverToCoordinator is 3-state — skip (no coordinator) vs retry (unresolvable) so the obligation is retained", () => {
     const self = { id: "me", stableId: "me", title: "me" } as SelfInfo;
     const m = buildPoisonS19("me", "me", { from: "x", fromLabel: "alice", text: "boom", via: "local", ts: 1 }, 3, "t");
@@ -308,6 +334,23 @@ describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
     let delivered = 0;
     drainPoisonNotices(HOME, () => { delivered++; return "sent"; });       // process 2 verifies from the fs
     expect(delivered).toBe(1);                                            // recovered — obligation never stranded
+    expect(pnJsonCount()).toBe(0);
+  });
+
+  test("RS-1: the PERSISTED notice and the delivered callback carry no secret fragment (redact-before-clip, end-to-end)", () => {
+    const tag = "PRIV" + "ATE KEY-----";
+    const pem = "-----BEGIN RSA " + tag + "\n" + "x".repeat(300) + "\n-----END RSA " + tag; // END past 240
+    const source = srcPath("s1", "0000000000003000-cccc.json");
+    expect(enqueuePoisonNotice(HOME, source, "coord-a", pnMsg(pem, 3000))).toBe(true);
+    const diskFile = readdirSync(pnDir()).find((n) => n.endsWith(".json"))!;
+    const onDisk = readFileSync(path.join(pnDir(), diskFile), "utf8");
+    expect(onDisk).not.toContain("x".repeat(20));          // the durable queue record never holds the body
+    expect(onDisk).toContain("REDACTED:PEM_PRIVATE_KEY");
+    confirmQuarantine(source);
+    const sent: InboxMsg[] = [];
+    drainPoisonNotices(HOME, (_t, m) => { sent.push(m); return "sent"; });
+    expect(sent.length).toBe(1);
+    expect(sent[0]!.text).not.toContain("x".repeat(20));   // nor does the forwarded message
     expect(pnJsonCount()).toBe(0);
   });
 
