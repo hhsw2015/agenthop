@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, poisonNoticeKey, type InboxMsg } from "../src/inbox.js";
 import { deliverToCoordinator } from "../src/checkin.js";
 import type { SelfInfo } from "../src/label.js";
 
@@ -277,69 +277,92 @@ describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
     expect(deliverToCoordinator(HOME, self, "coord-ghost", m)).toBe("retry"); // not resolvable here ⇒ retain + retry
   });
 
-  test("PD-P2-2: an undelivered notice is DURABLE — survives on disk and a later drain delivers it to its BOUND target", () => {
-    const dir = path.join(HOME, ".agenthop", "swarm", "poison-notices");
-    expect(enqueuePoisonNotice(HOME, "coord-a", buildPoisonS19("me", "me", { from: "x", fromLabel: "a", text: "boom", via: "local", ts: 1000 }, 3, "trace"))).toBe(true);
-    expect(readdirSync(dir).filter((n) => n.endsWith(".json")).length).toBe(1); // persisted (process 1 could not reach coordinator)
-    drainPoisonNotices(HOME, () => "retry"); // FRESH drain (process 2), coordinator still unreachable ⇒ KEEP
-    expect(readdirSync(dir).filter((n) => n.endsWith(".json")).length).toBe(1); // retained across the "restart"
-    const sent: { target: string | undefined; msg: InboxMsg }[] = [];
-    drainPoisonNotices(HOME, (target, m) => { sent.push({ target, msg: m }); return "sent"; }); // coordinator now reachable
+  const pnMsg = (text: string, ts: number): InboxMsg => buildPoisonS19("me", "me", { from: "x", fromLabel: "a", text, via: "local", ts }, 3, "t");
+  const pnDir = (): string => path.join(HOME, ".agenthop", "swarm", "poison-notices");
+  const pnJsonCount = (): number => { try { return readdirSync(pnDir()).filter((n) => n.endsWith(".json")).length; } catch { return 0; } };
+
+  test("PD-P2-2: a CONFIRMED notice is DURABLE — survives on disk and a later drain delivers it to its BOUND target", () => {
+    const key = poisonNoticeKey(path.join(HOME, ".agenthop", "inbox", "s1", "0000000000001000-aaaaaa.json"));
+    expect(enqueuePoisonNotice(HOME, key, "coord-a", pnMsg("boom", 1000), "quarantined")).toBe(true);
+    expect(pnJsonCount()).toBe(1);
+    drainPoisonNotices(HOME, () => "retry"); // FRESH drain (process 2), coordinator unreachable ⇒ KEEP
+    expect(pnJsonCount()).toBe(1);           // retained across the "restart"
+    const sent: { target: string; msg: InboxMsg }[] = [];
+    drainPoisonNotices(HOME, (target, m) => { sent.push({ target, msg: m }); return "sent"; });
     expect(sent.length).toBe(1);
-    expect(sent[0]!.target).toBe("coord-a");     // delivered to the BOUND target, not the drainer's own config (PD-R3-P1-1)
+    expect(sent[0]!.target).toBe("coord-a"); // delivered to the BOUND target (PD-R3-P1-1)
     expect(sent[0]!.msg.text).toContain("boom");
-    expect(readdirSync(dir).filter((n) => n.endsWith(".json")).length).toBe(0); // cleared only after the confirmed send
+    expect(pnJsonCount()).toBe(0);           // cleared only after the confirmed send
   });
 
-  test("PD-R3-P1-1: the drain delivers each notice to its OWN bound target, never substituting the drainer's coordinator", () => {
-    enqueuePoisonNotice(HOME, "coord-a", buildPoisonS19("me", "me", { from: "x", fromLabel: "a", text: "t1", via: "local", ts: 10 }, 3, "x"));
-    enqueuePoisonNotice(HOME, "coord-b", buildPoisonS19("me", "me", { from: "x", fromLabel: "a", text: "t2", via: "local", ts: 20 }, 3, "x"));
-    const targets: (string | undefined)[] = [];
+  test("PD-R4-P2-1: a PENDING record (intent, not yet quarantined) is NEVER delivered — only a confirmed fact is", () => {
+    const key = poisonNoticeKey(path.join(HOME, ".agenthop", "inbox", "s1", "0000000000002000-bbbb.json"));
+    enqueuePoisonNotice(HOME, key, "coord-a", pnMsg("pend", 2000), "pending");
+    let calls = 0;
+    drainPoisonNotices(HOME, () => { calls++; return "sent"; });
+    expect(calls).toBe(0);                    // pending intent ⇒ no premature "quarantined" report
+    expect(pnJsonCount()).toBe(1);            // left in place (obligation retained until quarantine confirms)
+  });
+
+  test("PD-R4-P2-1: the same event key is idempotent — pending→quarantined + retries overwrite, never pile up duplicate reports", () => {
+    const key = poisonNoticeKey(path.join(HOME, ".agenthop", "inbox", "s1", "0000000000003000-cccc.json"));
+    enqueuePoisonNotice(HOME, key, "coord-a", pnMsg("dup", 3000), "pending");      // intent
+    enqueuePoisonNotice(HOME, key, "coord-a", pnMsg("dup", 3000), "quarantined");  // upgrade (same key)
+    enqueuePoisonNotice(HOME, key, "coord-a", pnMsg("dup", 3000), "quarantined");  // a retry re-stamp (same key)
+    expect(pnJsonCount()).toBe(1);            // ONE record, never piled up
+    let delivered = 0;
+    drainPoisonNotices(HOME, () => { delivered++; return "sent"; });
+    expect(delivered).toBe(1);                // delivered exactly once
+  });
+
+  test("PD-R3-P1-1: the drain delivers each confirmed notice to its OWN bound target, never the drainer's coordinator", () => {
+    enqueuePoisonNotice(HOME, poisonNoticeKey("/a/s1/m1.json"), "coord-a", pnMsg("t1", 10), "quarantined");
+    enqueuePoisonNotice(HOME, poisonNoticeKey("/a/s2/m2.json"), "coord-b", pnMsg("t2", 20), "quarantined");
+    const targets: string[] = [];
     drainPoisonNotices(HOME, (target) => { targets.push(target); return "sent"; });
     expect(targets.sort()).toEqual(["coord-a", "coord-b"]); // each to its own bound target
   });
 
-  test("FC-7: a legacy bare-InboxMsg queue file is tolerated (delivered best-effort), not deleted as corrupt", () => {
-    const dir = path.join(HOME, ".agenthop", "swarm", "poison-notices");
+  test("PD-R3-P1-1 A / FC-7: a legacy bare record is MOVED to needs-migration (never target-guessed, never delivered, never deleted)", () => {
+    const dir = pnDir();
     mkdirSync(dir, { recursive: true });
     const legacy = buildPoisonS19("me", "me", { from: "x", fromLabel: "a", text: "old", via: "local", ts: 5 }, 3, "x");
-    writeFileSync(path.join(dir, "0000000000000005-leg1.json"), JSON.stringify(legacy)); // earlier bare-msg format
-    const seen: { target: string | undefined; text: string }[] = [];
-    drainPoisonNotices(HOME, (target, m) => { seen.push({ target, text: m.text }); return "sent"; });
-    expect(seen.length).toBe(1);
-    expect(seen[0]!.target).toBeUndefined();     // legacy ⇒ no bound target ⇒ drainer's coordinator (best-effort)
-    expect(seen[0]!.text).toContain("old");
+    writeFileSync(path.join(dir, "deadbeef00000000000000000000aaaa.json"), JSON.stringify(legacy)); // earlier bare-msg format
+    let calls = 0;
+    drainPoisonNotices(HOME, () => { calls++; return "sent"; });
+    expect(calls).toBe(0);                    // never target-guessed / delivered
+    expect(pnJsonCount()).toBe(0);            // moved out of the active queue
+    expect(readdirSync(path.join(dir, "needs-migration")).length).toBe(1); // kept + exposed for manual migration
   });
 
   test("PD-R3-P2-1: a valid but momentarily UNREADABLE notice is KEPT (not dropped as corrupt); deliver is not called", () => {
-    const dir = path.join(HOME, ".agenthop", "swarm", "poison-notices");
-    enqueuePoisonNotice(HOME, "coord-a", buildPoisonS19("me", "me", { from: "x", fromLabel: "a", text: "keep", via: "local", ts: 7 }, 3, "x"));
-    const f = path.join(dir, readdirSync(dir).find((n) => n.endsWith(".json"))!);
-    chmodSync(f, 0o000);                          // unreadable (EACCES) but the parent dir can still unlink it
+    enqueuePoisonNotice(HOME, poisonNoticeKey("/a/s1/keep.json"), "coord-a", pnMsg("keep", 7), "quarantined");
+    const f = path.join(pnDir(), readdirSync(pnDir()).find((n) => n.endsWith(".json"))!);
+    chmodSync(f, 0o000);                       // unreadable (EACCES) but the parent dir can still unlink it
     let calls = 0;
     drainPoisonNotices(HOME, () => { calls++; return "sent"; });
-    expect(calls).toBe(0);                        // never parsed ⇒ deliver not invoked
-    expect(existsSync(f)).toBe(true);             // KEPT for a later retry, never dropped as corrupt
-    chmodSync(f, 0o600);                          // restore so afterEach can clean up
+    expect(calls).toBe(0);                     // never parsed ⇒ deliver not invoked
+    expect(existsSync(f)).toBe(true);          // KEPT for a later retry, never dropped as corrupt
+    chmodSync(f, 0o600);                       // restore so afterEach can clean up
   });
 
   test("PD-P2-2: enqueuePoisonNotice returns false when it cannot persist (caller keeps the source + strike)", () => {
     const swarmDir = path.join(HOME, ".agenthop", "swarm");
     mkdirSync(swarmDir, { recursive: true });
     writeFileSync(path.join(swarmDir, "poison-notices"), "blocker"); // a FILE where the queue dir should be ⇒ mkdir fails
-    expect(enqueuePoisonNotice(HOME, "coord-a", buildPoisonS19("me", "me", { from: "x", fromLabel: "a", text: "b", via: "local", ts: 9 }, 3, "x"))).toBe(false);
+    expect(enqueuePoisonNotice(HOME, poisonNoticeKey("/a/s1/b.json"), "coord-a", pnMsg("b", 9), "pending")).toBe(false);
   });
 
-  test("the durable queue has no in-memory cap — 300 notices all drain over bounded passes, a corrupt one is dropped", () => {
-    const dir = path.join(HOME, ".agenthop", "swarm", "poison-notices");
+  test("the durable queue has no in-memory cap — 300 confirmed notices all drain over bounded passes, a corrupt one is dropped", () => {
+    const dir = pnDir();
     mkdirSync(dir, { recursive: true });
-    writeFileSync(path.join(dir, "0000000000000001-aaaa.json"), "not valid json{"); // read-OK but invalid ⇒ corrupt ⇒ dropped
-    for (let i = 0; i < 300; i++) expect(enqueuePoisonNotice(HOME, "coord-a", buildPoisonS19("me", "me", { from: "x", fromLabel: "a", text: `m${i}`, via: "local", ts: 2000 + i }, 3, "t"))).toBe(true);
-    expect(readdirSync(dir).filter((n) => n.endsWith(".json")).length).toBe(301); // all persisted, no cap drop
+    writeFileSync(path.join(dir, "00000000000000000000000000000001.json"), "not valid json{"); // read-OK but invalid ⇒ corrupt ⇒ dropped
+    for (let i = 0; i < 300; i++) expect(enqueuePoisonNotice(HOME, poisonNoticeKey(`/a/s1/m${i}.json`), "coord-a", pnMsg(`m${i}`, 2000 + i), "quarantined")).toBe(true);
+    expect(pnJsonCount()).toBe(301);          // all persisted, no cap drop
     let delivered = 0;
     for (let pass = 0; pass < 6; pass++) drainPoisonNotices(HOME, () => { delivered++; return "sent"; }); // bounded per tick (64)
-    expect(delivered).toBe(300);                  // all 300 valid delivered, none lost to a cap
-    expect(readdirSync(dir).filter((n) => n.endsWith(".json")).length).toBe(0);
+    expect(delivered).toBe(300);              // all 300 confirmed delivered, none lost to a cap
+    expect(pnJsonCount()).toBe(0);
   });
 
   test("PD-P2-3: the in-memory map drives the count to threshold even when the sidecar write keeps failing", () => {

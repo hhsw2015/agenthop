@@ -37,15 +37,17 @@ export function reportCheckIn(home: string, self: SelfInfo, coordinatorHandle: s
 /** FC-2 (PD-P2-2) — deliver an already-built notice to the coordinator, reusing the same coordinator-handle resolution as the
  *  check-in. THREE-STATE so the caller can RETAIN a retry obligation: "sent" = written to the coordinator inbox; "retry" =
  *  TRANSIENT (coordinator not resolvable yet, or the write failed) ⇒ keep the durable notice + retry on a later flush; "skip" =
- *  PERMANENT (no coordinator configured, or we ARE the coordinator) ⇒ discharge. NEVER throws. The durable poison-notice queue
- *  (inbox.ts enqueue/drain) + the F26 ledger are the durable record; this is the delivery step. */
+ *  PERMANENT (no coordinator configured) ⇒ discharge. Delivery to the target happens even when the target is ourselves (PD-R3-P1-1
+ *  B — a self-skip would discharge the coordinator's own notice without surfacing it). NEVER throws. The durable poison-notice
+ *  queue (inbox.ts enqueue/drain) + the F26 ledger are the durable record; this is the delivery step. */
 export function deliverToCoordinator(home: string, self: SelfInfo, coordinatorHandle: string | undefined, msg: InboxMsg): "sent" | "retry" | "skip" {
   try {
     if (!coordinatorHandle || !coordinatorHandle.trim()) return "skip"; // no coordinator ⇒ permanent
     const coordSid = resolveSession(coordinatorHandle, listSessions(home));
     if (!coordSid) return "retry"; // not resolvable on this machine YET ⇒ retain + retry
-    const mySid = self.stableId ?? self.id;
-    if (coordSid === mySid) return "skip"; // never to self ⇒ permanent
+    // PD-R3-P1-1 B: deliver to the target EVEN WHEN it is ourselves. If the coordinator is also a bus drainer, a self-skip would
+    // discharge its OWN targeted poison notice without ever surfacing it in its inbox (the F26 audit line is not the notice).
+    // Writing to our own box lands it in the next flush's host delivery — the coordinator actually sees it.
     writeInbox(home, coordSid, msg);
     return "sent";
   } catch { return "retry"; } // write failed ⇒ retain + retry; fail-soft, never throw
