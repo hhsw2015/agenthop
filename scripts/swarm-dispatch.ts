@@ -1709,24 +1709,27 @@ async function main(): Promise<void> {
       recoverStaleClaims(HOME, [key]); // ADIO-P2-1: reclaim any dead-pid stranded claims (incl. .claim-disp-<pid>) before claiming
       const claimed = claimInbox(HOME, [key], SELF);
       if (claimed.length === 0) return;
-      let st = loadControlLog(CONTROL_LOG_DIR);
+      // ADIO-P2-1: from the moment the batch is claimed, EVERY item keeps a release/retry obligation. A shared load failure must
+      // release ALL claimed items (not strand them), and a per-item failure must release THAT item and CONTINUE (not exit the
+      // loop and strand the remainder — the earlier `finally` propagated the throw and did exactly that).
+      let st: ReturnType<typeof loadControlLog>;
+      try { st = loadControlLog(CONTROL_LOG_DIR); }
+      catch (e) { for (const { file } of claimed) releaseInbox(file); log(`approval delegation: shared load failed, released ${claimed.length} claim(s): ${e instanceof Error ? e.message : e}`); return; }
       for (const { file, msg } of claimed) {
-        // ADIO-P2-1: every claimed file keeps a release/ack obligation. try/finally guarantees a release if processing throws, so
-        // one bad file never strands the batch remainder (the outer catch alone would lose the obligation).
-        let done = false;
         try {
           const req = msg.approval;
-          if (!req) { ackInbox(file); done = true; continue; } // a stray non-approval on the dedicated key ⇒ drop (key is ours)
+          if (!req) { ackInbox(file); continue; } // a stray non-approval on the dedicated key ⇒ drop (key is ours)
           const action = planCoordinatorAction(req, coordSid, nowSec());
           if (action.act === "delegate") {
             const { state, result } = commitTask(st, [{ put: "permissionDecision", permissionDecision: action.decision }]);
-            if (result.ok) { st = state; ackInbox(file); done = true; } // ok covers a fresh commit AND an idempotent replay
-            else { st = loadControlLog(CONTROL_LOG_DIR); releaseInbox(file); done = true; } // seq conflict ⇒ reload + retry next tick
+            if (result.ok) { st = state; ackInbox(file); } // ok covers a fresh commit AND an idempotent replay
+            else { st = loadControlLog(CONTROL_LOG_DIR); releaseInbox(file); } // seq conflict ⇒ reload + retry next tick
           } else {
-            ackInbox(file); done = true; // escalate: no decision ⇒ member hook times out to the user; live-sentinel supervises
+            ackInbox(file); // escalate: no decision ⇒ member hook times out to the user; live-sentinel supervises
           }
-        } finally {
-          if (!done) releaseInbox(file); // processing threw ⇒ release so a later sweep / recoverStaleClaims retries this file
+        } catch (e) {
+          try { releaseInbox(file); } catch { /* best-effort: recoverStaleClaims is the backstop */ }
+          log(`approval delegation: item ${file} failed (released, continuing): ${e instanceof Error ? e.message : e}`);
         }
       }
     } catch (e) { log(`approval delegation failed (isolated): ${e instanceof Error ? e.message : e}`); }

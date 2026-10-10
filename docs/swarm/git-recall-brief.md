@@ -1,4 +1,11 @@
-# git-recall — design brief (contract; FROZEN 2026-10-11)
+# git-recall — design brief (SUPERSEDED 2026-10-11)
+
+> SUPERSEDED: happycapy proved `-c` cannot close git exec vectors (.gitattributes clean/process filters are un-enumerable;
+> `git show` leaks blob content). The coordinator ruled git out of the auto-allow v1 (scope-free-only) and routes git (+ path)
+> reads through the NEW sanitized-read ticket (coordinator runs a hardened read, injects output). This brief is kept for its
+> env/exec threat analysis, which the sanitized-read brief reuses; the `-c`-rewrite mechanism here is NOT the chosen path.
+
+# git-recall — design brief (original, FROZEN 2026-10-11)
 
 owner 90b58f9c · focused ticket off the approval-delegation IO-round stack (`feat/approval-delegation` @e5a40c2) ·
 reviewer happycapy (queued after the IO-round verdict) · **FROZEN by coordinator fe0376cd (three rulings folded in: §Hole 2

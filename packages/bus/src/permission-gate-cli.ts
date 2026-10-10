@@ -10,13 +10,13 @@
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { statusHome, writeStatusFile } from "./statusfile.js";
 import { writeInbox, composeInboxMsg } from "./inbox.js";
 import { resolveSession, listSessions } from "./swarm/task-liveness.js";
 import { loadControlLog } from "./swarm/control-store.js";
 import { liveEntities } from "./swarm/control-log.js";
 import { approvalDelegateEnabled } from "./swarm/approval-delegation.js";
-import { resolveApprovalScope } from "./swarm/approval-scope.js";
 import { runPermissionGate, approvalInboxKey } from "./swarm/approval-gate.js";
 
 /** Build the real deps and run the member-side gate. `startedAt` is the hook's event-time proxy (for the status seq);
@@ -33,13 +33,13 @@ export async function runPermissionGateCli(startedAt: number, readStdin: () => P
 
   await runPermissionGate({
     enabled: approvalDelegateEnabled(),
+    newRequestId: () => randomUUID(), // a FRESH per-invocation flowback id (ADIO-P1-1) — never the user prompt_id, never a content hash
     readStdin,
     reportBlocked: (member) => { try { writeStatusFile(statusHome(), member, "blocked", { seq: startedAt }); } catch { /* status is best-effort */ } },
-    resolveScope: (command, cwd) => resolveApprovalScope(command, cwd),
     writeApprovalRequest: (req) => {
       // Write to the coordinator's dedicated approval key (approvals:<coordSid>) the dispatcher drains — NOT the coordinator's
       // session inbox (no contention). The dispatcher polls it on its 5s sweep; a delegated decision lands in the control-log,
-      // which the poll below reads back by promptId.
+      // which the poll below reads back by this invocation's requestId.
       if (!coordSid) return false;
       try {
         writeInbox(home, approvalInboxKey(coordSid), composeInboxMsg({

@@ -220,7 +220,10 @@ export function entityKeyOf(c: ChangeBody): string {
     case "lifecycle": return `lifecycle:${c.record.launchId}`;
     case "scan": return `scan:${c.branch}`;
     case "tombstone": return `tombstone:${c.launchId}`;
-    case "permissionDecision": return `permissionDecision:${c.permissionDecision.requestId}`; // ADIO-P1-1: per-invocation key, NOT promptId
+    // ADIO-P1-1: per-invocation requestId key (NOT the shared promptId). ADIO-R2-P2-2 (FC-7): a legacy record written before
+    // requestId existed carries only promptId — fall back to it so old records keep DISTINCT identities on replay (never collapse
+    // to `permissionDecision:undefined`).
+    case "permissionDecision": return `permissionDecision:${c.permissionDecision.requestId ?? c.permissionDecision.promptId}`;
   }
 }
 
