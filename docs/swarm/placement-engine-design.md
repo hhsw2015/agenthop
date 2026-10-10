@@ -33,3 +33,13 @@
 - **门控不变**:spawn 只在预算票内自批;`unfundedByBudget>0` 由**活调用方**路由到 user 钱门(R16,peer 转述不代 user 同意)。引擎只**决策**,真实花钱仍归 user。`SWARM_PLACEMENT` 仍默认关。
 - 幂等/纯:同输入同输出;重复 backend 去重(首个赢,不翻倍容量);**want 须非负安全整数(PE2B-2,对齐 reconcile PE4,不 floor 不猜)**;**priority 非 undefined 时须有限数(PE2B-3,NaN/Inf 整条拒,绝不进比较器)**;非法 want/budget/option fail-closed(空计划,绝不伪造 spawn)。
 - FC-7:纯函数,不碰任何 store/序列化格式(无旧记录导入问题)。
+
+## placement 接线（建议模式，SWARM_PLACEMENT dormant）
+
+phase-2b 签收报自述的「接线=后续」落地。**建议模式**（同 autoscale-suggest 判例）：引擎只 ADVISE,绝不自动 spawn/reclaim/花钱(真实 VM 操作+预算=user 钱门 R16)。
+
+- **声明式 spec**（desired，read-only 输入,引擎只读不写）：`<home>/.agenthop/placement/spec.json` = `{demand, cfg, backends(整数µUSD), budgetMicroUsd}`,经纯 `loadPlacementSpec` 整树校验+重建(拒非法,money 全整数 µUSD)。**actual 机器**=reconcile 的 ACTUAL,由 `readLedgerMachines` 读 vm-ctl 账本——**缝:账本未并故现返空**([]⇒建议满需求计划);vm-ctl 接线后此一处插真读。
+- **纯链 `planPlacementSuggest(spec, machines, sinceLast)`**:reconcile(desired vs actual)→对 spawn 缺口 selectBackends(最便宜优先+预算)→`buildPlacementSuggestion` 折三面:**funded** 列按后端计划、**unfundedByBudget** 标「需 user 钱门 R16」、**unplaceableByCapacity** 报容量缺口;reclaim/rebuild 仅建议不执行;纯 hold⇒无内容不呈报。
+- **接线**:dispatcher sweep tick `runPlacementSuggest()`(参照 gauge-sampling/autoscale-suggest 样式):gated on `placementEnabled()`(默认 OFF),single-flight,读 spec(无⇒不呈报)→纯链→`notifyCoordinator(text,{taskRef:"placement-suggest"})`;只有真 "delivered" 推进通知窗(logged/deduped/failed 则协调者可达后补投);全程 fail-soft 不断 sweep。
+- **PW-1 两个时钟分离**:通知节流与 reconcile 的动作 dwell 是**两个独立时钟**。建议模式下 `planPlacementSuggest` 以「动作 dwell 已满足」跑 reconcile(传 `minDwellSec` 作 since-last)⇒ 恒呈**完整需求**计划,绝不出现 reconcile 的紧急-floor 子集(那只在未过的动作 dwell 内出现);HOW OFTEN 投递由纯 `shouldSuggestPlacement(now,last,minDwellSec)` 独立管;`last` 仅在真 "delivered" 推进。故未变化的 floor 建议绝不刷新完整需求窗口(已签 reconcile 紧急语义不动)。
+- **门控**:`SWARM_PLACEMENT` 默认 OFF 不变;绝不自动花钱(R16)。FC-6:无时间戳裁决(dwell 用时长);FC-7:spec.json 为全新只读输入格式(无旧记录),引擎不写任何 store 格式(S19 复用 writeInbox)。

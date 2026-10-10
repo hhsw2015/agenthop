@@ -7,9 +7,15 @@ import {
   reconcile,
   dedupeById,
   selectBackends,
+  loadPlacementSpec,
+  buildPlacementSuggestion,
+  planPlacementSuggest,
+  shouldSuggestPlacement,
   type MachineView,
   type ReconcileConfig,
   type BackendOption,
+  type PlacementSpec,
+  type Action,
 } from "./placement-engine.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
@@ -213,5 +219,115 @@ t("2b: invalid budget (NaN) -> only free backends fund", (() => { const s = sele
 t("2b: non-integer budget -> treated as 0 (only free)", (() => { const s = selectBackends(3, [opt("gha", U, 5), opt("railway", 0, 5)], 2.5 * U + 0.5); return s.allocation.every((a) => a.backend === "railway"); })());
 t("2b: invalid option fields dropped (negative cost)", (() => { const s = selectBackends(2, [{ backend: "bad", costPerMachineMicroUsd: -1, freeSlots: 5 }, opt("railway", 0, 5)], 100 * U); return s.funded === 2 && s.allocation.every((a) => a.backend === "railway"); })());
 t("2b: no options -> all unplaceableByCapacity", (() => { const s = selectBackends(4, [], 100 * U); return s.unplaceableByCapacity === 4 && s.funded === 0 && partitions(4, s); })());
+
+// ============================================================================================================
+// placement wiring (suggestion mode) — loadPlacementSpec / buildPlacementSuggestion / planPlacementSuggest (pure)
+// ============================================================================================================
+const specOf = (over: Partial<PlacementSpec> = {}): PlacementSpec => ({
+  demand: { boardUnits: 10, fanoutMachines: 0 },
+  cfg: { perMachineCapacity: 1, floor: 0, reclaimIdleSec: 60, expiringSec: 30, minDwellSec: 0 },
+  backends: [{ backend: "railway", costPerMachineMicroUsd: 0, freeSlots: 3 }, { backend: "gha", costPerMachineMicroUsd: 1_000_000, freeSlots: 100 }],
+  budgetMicroUsd: 5_000_000,
+  ...over,
+});
+
+// --- loadPlacementSpec: validate + rebuild (fail-closed) ---
+t("spec: valid -> ok", loadPlacementSpec(specOf()).ok === true);
+t("spec: non-object -> reject", loadPlacementSpec(42).ok === false);
+t("spec: missing demand -> reject", loadPlacementSpec({ ...specOf(), demand: undefined }).ok === false);
+t("spec: negative boardUnits -> reject", loadPlacementSpec({ ...specOf(), demand: { boardUnits: -1, fanoutMachines: 0 } }).ok === false);
+t("spec: non-integer fanoutMachines -> reject", loadPlacementSpec({ ...specOf(), demand: { boardUnits: 0, fanoutMachines: 1.5 } }).ok === false);
+t("spec: perMachineCapacity 0 -> reject", loadPlacementSpec({ ...specOf(), cfg: { ...specOf().cfg, perMachineCapacity: 0 } }).ok === false);
+t("spec: negative minDwellSec -> reject", loadPlacementSpec({ ...specOf(), cfg: { ...specOf().cfg, minDwellSec: -1 } }).ok === false);
+t("spec: backends not array -> reject", loadPlacementSpec({ ...specOf(), backends: "x" }).ok === false);
+t("spec: FLOAT cost in a backend -> reject (money is integer µUSD)", loadPlacementSpec({ ...specOf(), backends: [{ backend: "x", costPerMachineMicroUsd: 0.5, freeSlots: 1 }] }).ok === false);
+t("spec: NaN priority in a backend -> reject", loadPlacementSpec({ ...specOf(), backends: [{ backend: "x", costPerMachineMicroUsd: 0, freeSlots: 1, priority: NaN }] }).ok === false);
+t("spec: float budget -> reject", loadPlacementSpec({ ...specOf(), budgetMicroUsd: 1.5 }).ok === false);
+t("spec: negative budget -> reject", loadPlacementSpec({ ...specOf(), budgetMicroUsd: -1 }).ok === false);
+t("spec: rebuilt from validated reads (extra keys dropped)", (() => {
+  const r = loadPlacementSpec({ ...specOf(), evil: 1, demand: { boardUnits: 2, fanoutMachines: 0, extra: 9 } });
+  return r.ok && (r.spec as any).evil === undefined && (r.spec.demand as any).extra === undefined && r.spec.demand.boardUnits === 2;
+})());
+
+// --- buildPlacementSuggestion: the three spawn faces + reclaim/rebuild advisories ---
+{
+  const sel = selectBackends(5, [{ backend: "railway", costPerMachineMicroUsd: 0, freeSlots: 5 }], 0);
+  const sug = buildPlacementSuggestion([{ kind: "spawn", n: 5 }], sel);
+  t("suggest: funded plan -> hasContent + spawnFunded", sug.hasContent && sug.spawnFunded === 5 && /spawn plan/.test(sug.text) && /railway: 5/.test(sug.text));
+}
+{
+  const sel = selectBackends(10, [{ backend: "gha", costPerMachineMicroUsd: 1_000_000, freeSlots: 10 }], 3_000_000);
+  const sug = buildPlacementSuggestion([{ kind: "spawn", n: 10 }], sel);
+  t("suggest: over-budget -> R16 user money gate line", sug.needUserGate === 7 && /USER MONEY GATE \(R16\)/.test(sug.text));
+}
+{
+  const sel = selectBackends(10, [{ backend: "railway", costPerMachineMicroUsd: 0, freeSlots: 4 }], 0);
+  const sug = buildPlacementSuggestion([{ kind: "spawn", n: 10 }], sel);
+  t("suggest: capacity gap -> capacity shortfall line", sug.capacityGap === 6 && /capacity shortfall/.test(sug.text));
+}
+t("suggest: reclaim + rebuild advised (never executed)", (() => {
+  const sug = buildPlacementSuggestion([{ kind: "reclaim", id: "m1", reason: "surplus" }, { kind: "rebuild", id: "m2", reason: "expiring" }], null);
+  return sug.hasContent && sug.reclaims === 1 && sug.rebuilds === 1 && /advise reclaim m1/.test(sug.text) && /advise rebuild m2/.test(sug.text);
+})());
+t("suggest: pure hold -> no content (caller sends nothing)", buildPlacementSuggestion([{ kind: "hold", reason: "at desired" }], null).hasContent === false);
+t("suggest: SUGGESTION MODE banner always present (never auto-acts)", /SUGGESTION MODE/.test(buildPlacementSuggestion([{ kind: "spawn", n: 1 }], selectBackends(1, [{ backend: "railway", costPerMachineMicroUsd: 0, freeSlots: 1 }], 0)).text));
+
+// --- planPlacementSuggest: the full chain (reconcile -> selectBackends -> fold), empty actual machines ---
+t("plan: demand 10, free cap 3 + paid $1 cap 100, budget $7 -> funded 10 (3 free + 7 paid within budget)", (() => {
+  const sug = planPlacementSuggest(specOf({ budgetMicroUsd: 7_000_000 }), []);
+  return sug.hasContent && sug.spawnFunded === 10 && sug.needUserGate === 0;
+})());
+t("plan: same but budget $5 -> funded 8 (3 free + 5 paid), 2 need R16 gate", (() => {
+  const sug = planPlacementSuggest(specOf(), []); // specOf budget = $5
+  return sug.spawnFunded === 8 && sug.needUserGate === 2;
+})());
+t("plan: demand 10, only paid $1/machine, budget $3 -> 3 funded, 7 need R16 gate", (() => {
+  const sug = planPlacementSuggest(specOf({ backends: [{ backend: "gha", costPerMachineMicroUsd: 1_000_000, freeSlots: 100 }], budgetMicroUsd: 3_000_000 }), []);
+  return sug.spawnFunded === 3 && sug.needUserGate === 7;
+})());
+t("plan: demand 10, total capacity 4 -> 6 capacity gap", (() => {
+  const sug = planPlacementSuggest(specOf({ backends: [{ backend: "railway", costPerMachineMicroUsd: 0, freeSlots: 4 }] }), []);
+  return sug.capacityGap === 6;
+})());
+t("plan: zero demand + floor 0 + no machines -> pure hold, no content", (() => {
+  const sug = planPlacementSuggest(specOf({ demand: { boardUnits: 0, fanoutMachines: 0 }, cfg: { perMachineCapacity: 1, floor: 0, reclaimIdleSec: 60, expiringSec: 30, minDwellSec: 0 } }), []);
+  return sug.hasContent === false;
+})());
+// PW-1: in suggestion mode the plan is ALWAYS the FULL demand — never reconcile's urgent-FLOOR subset (which only exists inside
+// an unexpired ACTION dwell). With demand 10 + floor 2 + a HIGH minDwellSec, the advisory is still funded=full (3), not floor=2.
+t("PW-1: full demand advised regardless of floor/minDwell (never the floor subset)", (() => {
+  const sug = planPlacementSuggest(specOf({ demand: { boardUnits: 10, fanoutMachines: 0 }, cfg: { perMachineCapacity: 1, floor: 2, reclaimIdleSec: 60, expiringSec: 30, minDwellSec: 300 }, backends: [{ backend: "gha", costPerMachineMicroUsd: 1_000_000, freeSlots: 100 }], budgetMicroUsd: 3_000_000 }), []);
+  return sug.spawnFunded === 3 && sug.needUserGate === 7; // full demand (want 10): 3 funded + 7 gate — NOT floor 2 / gate 0
+})());
+
+// --- shouldSuggestPlacement: the NOTICE dwell (separate clock from reconcile's action dwell) ---
+t("notice-dwell: first ever (last 0) fires", shouldSuggestPlacement(1000, 0, 300) === true);
+t("notice-dwell: within window throttled", shouldSuggestPlacement(1005, 1000, 300) === false);
+t("notice-dwell: at boundary fires (>=)", shouldSuggestPlacement(1300, 1000, 300) === true);
+t("notice-dwell: minDwell 0 -> always (no throttle)", shouldSuggestPlacement(1001, 1000, 0) === true);
+t("notice-dwell: non-finite clock -> never", shouldSuggestPlacement(NaN, 0, 300) === false);
+t("notice-dwell: invalid dwell -> always", shouldSuggestPlacement(1000, 0, NaN) === true && shouldSuggestPlacement(1000, 0, -5) === true);
+
+// PW-1 counterexample PINNED: the reviewer's timeline — a floor advisory must NOT re-fire every notice window and reset `last`,
+// starving the full-demand advisory. Simulate the wiring tick (shouldSuggestPlacement gate → plan → deliver → last advances ONLY
+// on delivery). Every delivery is the FULL demand (funded 3 / gate 7), and it re-matures exactly every minDwell (300s) — not 61s.
+{
+  const sim = (floor: number) => {
+    const spec = specOf({ demand: { boardUnits: 10, fanoutMachines: 0 }, cfg: { perMachineCapacity: 1, floor, reclaimIdleSec: 60, expiringSec: 30, minDwellSec: 300 }, backends: [{ backend: "gha", costPerMachineMicroUsd: 1_000_000, freeSlots: 100 }], budgetMicroUsd: 3_000_000 });
+    let last = 0;
+    const delivered: Array<{ now: number; funded: number; gate: number }> = [];
+    for (const now of [1000, 1005, 1066, 1127, 1188, 1249, 1300, 1305]) {
+      if (!shouldSuggestPlacement(now, last, spec.cfg.minDwellSec)) continue; // notice gate
+      const sug = planPlacementSuggest(spec, []);
+      if (sug.hasContent) { delivered.push({ now, funded: sug.spawnFunded, gate: sug.needUserGate }); last = now; } // only delivered advances `last`
+    }
+    return delivered;
+  };
+  const pos = sim(2); // the PW-1 positive-floor config
+  t("PW-1 pinned: positive floor delivers ONLY at t=1000 and t=1300 (not every 61s)", pos.length === 2 && pos[0]!.now === 1000 && pos[1]!.now === 1300);
+  t("PW-1 pinned: every delivery is the FULL demand (funded 3 / gate 7), never the floor subset (2 / 0)", pos.every((d) => d.funded === 3 && d.gate === 7));
+  const zero = sim(0); // the reviewer's zero-floor control
+  t("PW-1 pinned: zero-floor control has the SAME cadence (t=1000, t=1300)", zero.length === 2 && zero[0]!.now === 1000 && zero[1]!.now === 1300 && zero.every((d) => d.funded === 3 && d.gate === 7));
+}
 
 console.log("all placement-engine selftests passed");
