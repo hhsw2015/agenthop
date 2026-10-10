@@ -300,7 +300,7 @@ export function buildBootPlan(opts: { herdrInstallUrl?: string } = {}): string[]
 // IO shell — exec wrappers (dormant: SWARM_VM_CTL off; exercised by live runs, NOT the selftest)
 // ============================================================================================================
 
-/** vm-ctl wiring flip, default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT / SWARM_SEAT_CAPS). */
+/** vm-ctl wiring flip, default OFF (dormant-ahead-of-use, like SWARM_SEAT_CAPS). */
 export function vmCtlEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return /^(1|true|yes|on)$/i.test(env.SWARM_VM_CTL ?? "");
 }

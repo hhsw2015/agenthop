@@ -128,7 +128,7 @@ export function sameBootPin(a: BootManifest, b: BootManifest): boolean {
   return true;
 }
 
-/** Dormant wiring flip, default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT). vm-ctl boot enforces digest-pin only when on. */
+/** Dormant wiring flip, default OFF (dormant-ahead-of-use, like SWARM_VM_CTL). vm-ctl boot enforces digest-pin only when on. */
 export function bootDigestPinEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return /^(1|true|yes|on)$/i.test(env.SWARM_BOOT_DIGEST_PIN ?? "");
 }

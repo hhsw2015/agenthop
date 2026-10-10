@@ -19,7 +19,7 @@
  * "answered" by an inherited value. Tree traversal is ITERATIVE (GG-P2-2): liveness, ordering and resolution are O(n) with
  * no recursion, so an arbitrarily deep but legal chain resolves instead of overflowing the stack (there is no depth cap).
  *
- * SEAM / DORMANT-AHEAD-OF-USE (coordinator dispatch: "T3 规划器前置接缝(dormant 旗)", same discipline as SWARM_BOARD_ADMIT /
+ * SEAM / DORMANT-AHEAD-OF-USE (coordinator dispatch: "T3 规划器前置接缝(dormant 旗)", same discipline as SWARM_VM_CTL /
  * review-seat-autoscale / seat-identity-caps): this module is pure and self-contained. grill-gate has NO runtime caller —
  * the live T3 orchestrator that would call grillGateEnabled() → run the interactive loop (nextQuestion) → resolveDecisions →
  * foldDecisionsIntoPrd(prd, …) → draftPlan is not wired. (The manual A1 live-fire script packages/bus/scripts/t3-draft-live.ts
@@ -245,7 +245,7 @@ export function resolveDecisions(tree: GrillTree, answers: GrillAnswers): GrillR
   return { ok: true, resolved: { decisions } };
 }
 
-/** The dormant wiring flip, default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT). The live T3 orchestrator runs the
+/** The dormant wiring flip, default OFF (dormant-ahead-of-use, like SWARM_VM_CTL). The live T3 orchestrator runs the
  *  gate only when this is explicitly truthy. */
 export function grillGateEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return /^(1|true|yes|on)$/i.test(env.SWARM_GRILL_GATE ?? "");

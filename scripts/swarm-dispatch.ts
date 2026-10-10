@@ -64,6 +64,7 @@ import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
+import { successionEnabled } from "../packages/bus/src/swarm/shell-succession.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
 const HOME = process.env.AH_HOME ?? homedir();
@@ -177,8 +178,8 @@ const GAUGE_SAMPLE_SEC = envInt(process.env.SWARM_GAUGE_SAMPLE_SEC, 60); // T5-2
 
 // T5-5 review-seat autoscale — SUGGESTION MODE ONLY (user ruling 2026-10-08: the flag is half-flipped). When
 // SWARM_REVIEW_AUTOSCALE is on, the sweep reads the durable review-queue ledger, runs the pure planner, and ADVISES the
-// coordinator (a durable-inbox suggestion, taskRef=autoscale-suggest); it NEVER spawns/reclaims a seat. Default OFF
-// (dormant-ahead-of-use, like SWARM_BOARD_ADMIT). The thresholds are TUNABLE (same discipline as the dual-bandwidth gauge):
+// coordinator (a durable-inbox suggestion, taskRef=autoscale-suggest); it NEVER spawns/reclaims a seat. LIVE BY DEFAULT
+// (opt-out, user ruling 2026-10-10; kill with SWARM_REVIEW_AUTOSCALE=0). The thresholds are TUNABLE (same discipline as the dual-bandwidth gauge):
 // kUp>kDown gives hysteresis; sustainSec debounces a transient spike; minDwellSec throttles how often a suggestion re-fires.
 const SCALE_CFG: ScaleConfig = {
   kUp: envInt(process.env.SWARM_REVIEW_KUP, 2),
@@ -648,6 +649,11 @@ async function main(): Promise<void> {
   const plan = loadPlanFile();
   const taskOn = plan !== null && TASK_EXEC;
   log(`single-active dispatcher up (cap=${CAP}, budget=${BUDGET_SEC}s, workRepo=${WORK_REPO || "<unset>"}, exec=${EXEC_ENABLED}, task=${taskOn ? `on:${plan!.jobId}` : "off"})`);
+  // Flag status at startup (ops visibility; user ruling 2026-10-10 — the swarm wiring flags are now LIVE BY DEFAULT / opt-out,
+  // kill with SWARM_<X>=0). Calls the SAME readers the features use, so the line reflects the real decision. SWARM_TG_ENTRY is the
+  // deliberate exception (opt-in — the bridge needs a user-seeded token), read with its own opt-in form.
+  const onoff = (b: boolean): string => (b ? "on" : "off");
+  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
   const records = loadMirror();
   const ops = buildOps();
   const taskStateRef = { s: loadControlLog(CONTROL_LOG_DIR) };
@@ -1058,7 +1064,7 @@ async function main(): Promise<void> {
   // plan (BA1), validate the untrusted claim BODY against it (BA2), isolate the scheduler input to the claim's job (BA3), gate
   // on free capacity (BA6) → GRANT (commit intent+attempt(+retired)+supervision wait, receipt-first then mark granted) /
   // REJECT (terminal, mark + reason) / RECONCILE (already granted to this member — re-deliver receipt + fix board) / DEFER
-  // (transient: no plan yet / capacity full — leave the claim). DORMANT under SWARM_BOARD_ADMIT (boundary #1/#2). NO startTask
+  // (transient: no plan yet / capacity full — leave the claim). Gated by SWARM_BOARD_ADMIT (live by default; kill with =0; boundary #1/#2). NO startTask
   // (boundary #3). The board is an app-queue + projection, never a 2nd ledger: a grant whose commit fails leaves the claim for
   // re-review. Fail-soft, per-claim isolated.
   const runBoardConsumer = (): void => {
@@ -1593,7 +1599,7 @@ async function main(): Promise<void> {
   let lastAutoscaleSuggestSec = 0;
   let autoscaleReadInFlight = false;
   const runReviewAutoscaleSuggest = (): void => {
-    if (!autoscaleEnabled()) return; // SWARM_REVIEW_AUTOSCALE default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT)
+    if (!autoscaleEnabled()) return; // SWARM_REVIEW_AUTOSCALE live by default (opt-out; kill with =0)
     if (autoscaleReadInFlight) return; // single-flight (AS-P2-4): never overlap reads, so a slow older read cannot resolve late and clobber a newer snapshot
     autoscaleReadInFlight = true;
     void (async () => {
@@ -1636,7 +1642,7 @@ async function main(): Promise<void> {
   // write fault logs once per interval, not every tick. Fully fail-soft: a sampling failure NEVER breaks the sweep.
   let lastGaugeSampleSec = 0;
   const runGaugeSampling = (): void => {
-    if (!gaugeSamplingEnabled()) return; // SWARM_GAUGE_SAMPLING default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT)
+    if (!gaugeSamplingEnabled()) return; // SWARM_GAUGE_SAMPLING live by default (opt-out; kill with =0)
     const now = nowSec();
     if (!shouldSampleGauge(now, lastGaugeSampleSec, GAUGE_SAMPLE_SEC)) return; // throttle to the sample interval
     lastGaugeSampleSec = now; // advance BEFORE the write ⇒ one attempt per interval even if it throws (no tight retry loop)
@@ -1651,7 +1657,7 @@ async function main(): Promise<void> {
     passTick: async () => {
       await pass(records, ops);
       if (plan && taskOn && taskOps) { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
-      // §2d board admission (PULL path) — both self-gated on SWARM_BOARD_ADMIT (default off ⇒ no-op), independent of
+      // §2d board admission (PULL path) — both self-gated on SWARM_BOARD_ADMIT (live by default; =0 ⇒ no-op), independent of
       // SWARM_TASK_EXEC push. Producer posts ready nodes as claimable items; consumer admits claims (prepareDispatch on current
       // CONTROL → grant intent+binding+supervision wait+receipt / reject), NO execution (A2). Dormant-ahead-of-use.
       runBoardProducer();
@@ -1685,10 +1691,10 @@ async function main(): Promise<void> {
       // on SWARM_SENTINEL + herdr reachability; dormant otherwise.
       await runLiveSentinel();
       // T5-5: review-seat autoscale SUGGESTION (never acts) — read the review-queue ledger, advise the coordinator on seat
-      // scaling. Gated on SWARM_REVIEW_AUTOSCALE (default OFF); fully fail-soft.
+      // scaling. Gated on SWARM_REVIEW_AUTOSCALE (live by default; kill with =0); fully fail-soft.
       runReviewAutoscaleSuggest();
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
-      // (default OFF), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
+      // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
       runGaugeSampling();
     },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),

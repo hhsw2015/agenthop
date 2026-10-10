@@ -123,7 +123,7 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
   dbg(`presence up: ${core.self.title} (tool=${core.self.tool} stable=${core.self.stableId ?? "-"})`);
 
   // F45 ① (SWARM_SUCCESSION): a restarted shell proving it continues a stable identity may re-take that identity's presence
-  // slot + durable-inbox scan instead of coming up a stranger. DORMANT by default (flag off ⇒ skipped entirely). On "adopt"
+  // slot + durable-inbox scan instead of coming up a stranger. LIVE BY DEFAULT (kill with SWARM_SUCCESSION=0 ⇒ skipped entirely). On "adopt"
   // the pid slot is taken over inside runSuccessionAtStartup; core.adoptStableId then drains that sid's inbox ("扫箱") and
   // rebinds the liveness socket (via onIdentityChange) so resolveSession(stableSid) finds this instance. Fail-soft.
   if (successionEnabled()) {

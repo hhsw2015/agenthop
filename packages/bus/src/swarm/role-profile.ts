@@ -319,7 +319,7 @@ export function resolveRoleProfile(library: FragmentLibrary, loaded: LoadedRole,
   } };
 }
 
-/** Dormant wiring flip, default OFF (dormant-ahead-of-use, like SWARM_BOARD_ADMIT). The live spawn/launcher resolves v2 only when on. */
+/** Dormant wiring flip, default OFF (dormant-ahead-of-use, like SWARM_VM_CTL). The live spawn/launcher resolves v2 only when on. */
 export function roleProfileV2Enabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return /^(1|true|yes|on)$/i.test(env.SWARM_ROLEPROFILE_V2 ?? "");
 }

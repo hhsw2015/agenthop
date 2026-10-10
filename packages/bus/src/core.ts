@@ -41,7 +41,7 @@ export type BusCore = {
   /** F45 ① (shell-succession): AUTHORITATIVELY adopt a stable sid as this node's identity — the SAME path a Codex thread
    *  adoption takes (learnStableId authoritative). On adoption the node's inboxKeys() start including `sid` (so its durable
    *  inbox is drained — "扫箱"), the liveness socket re-binds via onIdentityChange, and resolveSession(sid) finds this node.
-   *  Used by presence's succession consumption point after successionVerdict returns "adopt"; dormant (SWARM_SUCCESSION off). */
+   *  Used by presence's succession consumption point after successionVerdict returns "adopt"; LIVE BY DEFAULT (kill: SWARM_SUCCESSION=0). */
   adoptStableId(sid: string): void;
   status(): string;
   /** Set this session's own work state (working|idle|blocked|unknown); it rides the roster to peers.

@@ -6,8 +6,9 @@
  * aligned on the states this emits), and the dormancy gate. All filesystem IO + the CONTROL-side admission (prepareDispatch
  * on the current log, the grant intent+binding+wait commit, the receipt) live in the dispatcher shell, gated.
  *
- * DORMANT-AHEAD-OF-USE (coordinator ruling, 3 hard boundaries): SWARM_BOARD_ADMIT defaults OFF and nothing in this batch
- * flips it on; when off the whole chain is dry (decision computable, nothing written to board or CONTROL); a grant's
+ * ADMISSION GATE (coordinator ruling, 3 hard boundaries): SWARM_BOARD_ADMIT is LIVE BY DEFAULT (opt-out — user ruling
+ * 2026-10-10; kill with SWARM_BOARD_ADMIT=0). When killed the whole chain is dry (decision computable, nothing written to
+ * board or CONTROL); a grant's
  * commit happens only inside the gate-open branch; and a receipt never triggers execution (startTask/V8 is A2, a separate
  * gate). The board is an APPLICATION QUEUE + FACT PROJECTION, never a second execution ledger (§2d-b) — authority to run
  * comes ONLY from dispatcher admission on the current CONTROL, re-checked at claim time, not from holding a board file.
@@ -26,9 +27,11 @@
  * A producer judges ownership from the item BODY + a filename↔body binding — never a string prefix
  * (BA4). The claim body's jobId/nodeId are validated as path-safe identifiers before any path is built from them (BA2), and a
  * reconcile must match the committed grant's INPUT identity, not just its owner (BA2c). BA9 (posted-but-unclaimed supervision)
- * is DEFERRED under coordinator ruling #R14 — a hard precondition before SWARM_BOARD_ADMIT is ever flipped on (tracked with
- * envelope-open + §2d-c ping).
+ * is DEFERRED under coordinator ruling #R14 — originally framed as a precondition before board admission is flipped on; the
+ * 2026-10-10 user ruling flipped the default ON regardless, so BA9 supervision remains OUTSTANDING work (tracked with
+ * envelope-open + §2d-c ping), not a gate on the default.
  */
+import { flagDefaultOn } from "./flag-default.js";
 import type { TaskPlan } from "./task-plan.js";
 import { readyTasks, type ReadyTask } from "./task-ready.js";
 import type { TaskAttempt, ExecutionBinding } from "./task-state.js";
@@ -428,8 +431,8 @@ export function isValidItemId(itemId: string): boolean {
   return itemId.length > 0 && !itemId.includes(".") && !itemId.includes("/") && !/\s/.test(itemId);
 }
 
-/** The dormancy gate (coordinator boundary #1): board admission is OFF unless SWARM_BOARD_ADMIT is explicitly truthy. Same
- *  pattern as SWARM_EXEC/SWARM_TASK_EXEC/SWARM_SWEEP. Nothing in this batch sets it; turning it on is the A2 gate. */
+/** Board admission gate — LIVE BY DEFAULT (opt-out, user ruling 2026-10-10 via [[flagDefaultOn]]): on unless SWARM_BOARD_ADMIT
+ *  is explicitly OFF (`SWARM_BOARD_ADMIT=0`). Kill-switch, not a turn-on. (Was opt-in default-OFF while dormant-ahead-of-use.) */
 export function boardAdmitEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env.SWARM_BOARD_ADMIT ?? "");
+  return flagDefaultOn(env.SWARM_BOARD_ADMIT);
 }
