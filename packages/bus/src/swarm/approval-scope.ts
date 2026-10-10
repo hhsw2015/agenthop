@@ -11,8 +11,19 @@
  * an unresolvable operand (missing file, broken symlink, EACCES) ⇒ resolvedWithinCwd:false ⇒ the classifier escalates it.
  */
 import { realpathSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
-import { planDelegation, isSensitivePath, type ApprovalScope } from "./approval-delegation.js";
+import { planDelegation, isSensitivePath, isGitEnvClean, type ApprovalScope } from "./approval-delegation.js";
+
+/** git-recall: is `anchor` (a realpath'd dir) the git repo ROOT? `git rev-parse --show-toplevel` realpath-compared to anchor.
+ *  Called ONLY after gitEnvClean is confirmed (a dirty env — e.g. GIT_DIR — could otherwise mislead rev-parse). Fail-soft. */
+function gitRootIsCwd(anchor: string): boolean {
+  try {
+    const r = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: anchor, encoding: "utf8", timeout: 5000 });
+    if (r.status !== 0 || typeof r.stdout !== "string" || !r.stdout.trim()) return false;
+    return realpathSync(r.stdout.trim()) === anchor;
+  } catch { return false; }
+}
 
 /**
  * Resolve IO-verified scope facts for `command` in `cwd`. Returns null when cwd is not a trustworthy absolute, existing
@@ -39,6 +50,10 @@ export function resolveApprovalScope(command: string, cwd: string): ApprovalScop
       const resolvedSensitive = resolved !== null && isSensitivePath(resolved);
       scope.resolvedPaths.push({ raw, resolvedWithinCwd, resolvedSensitive });
     }
+  } else if (plan.gate === "scope-git") {
+    // git-recall (Hole 2 then scope): verify the member env is clean FIRST; only probe the repo root with a clean env.
+    scope.gitEnvClean = isGitEnvClean(process.env);
+    scope.cwdIsGitRoot = scope.gitEnvClean ? gitRootIsCwd(anchor) : false;
   }
   return scope;
 }

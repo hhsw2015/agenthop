@@ -4,6 +4,7 @@
 // end-to-end resolve→classify path so a symlink-escape / symlink-to-.env is proven to escalate, and a clean local read delegates.
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { resolveApprovalScope } from "./approval-scope.js";
 import { classifyApproval, type ApprovalRequest } from "./approval-delegation.js";
 
@@ -57,9 +58,47 @@ try {
   { const f = fixture(); fs.writeFileSync(path.join(f.cwd, "a.txt"), "x\n");
     t("ls (no operand) -> delegate (e2e)", isDelegate(verdict("ls", f.cwd))); }
 
-  // git is out of v0: resolver returns a scope but classify escalates regardless
-  { const f = fixture();
-    t("git status -> escalate (e2e, git out of v0)", isEscalate(verdict("git status", f.cwd))); }
+  // git-recall (real git fixtures). Control the env so gitEnvClean is deterministic: snapshot + clear every GIT_ var and the
+  // explicit non-GIT_ vectors for the duration, then restore.
+  {
+    const snapshot: Record<string, string | undefined> = {};
+    const toClear = [...Object.keys(process.env).filter((k) => k.startsWith("GIT_")), "PAGER", "EDITOR", "SSH_ASKPASS", "XDG_CONFIG_HOME"];
+    for (const k of toClear) { snapshot[k] = process.env[k]; delete process.env[k]; }
+    try {
+      // a real git repo at cwd, clean env -> cwdIsGitRoot true, gitEnvClean true -> delegate a non-content form with a rewrite
+      const f = fixture();
+      const init = spawnSync("git", ["init", "-q"], { cwd: f.cwd, encoding: "utf8" });
+      if (init.status === 0) {
+        const s = resolveApprovalScope("git status -s", f.cwd)!;
+        t("git repo root + clean env: cwdIsGitRoot=true, gitEnvClean=true", s.cwdIsGitRoot === true && s.gitEnvClean === true);
+        const v = verdict("git status -s", f.cwd);
+        t("git non-content form at root + clean env -> delegate", v.kind === "delegate");
+        t("git delegate carries the config-immune rewrite", v.kind === "delegate" && typeof v.rewrite === "string" && v.rewrite.startsWith("git --no-pager -c diff.external="));
+        // a subdirectory of the repo is NOT the repo root -> escalate
+        const sub = path.join(f.cwd, "subdir"); fs.mkdirSync(sub);
+        t("git in a repo SUBDIR (not root) -> escalate", isEscalate(verdict("git status -s", sub)));
+        // bare content form even at root -> escalate (Hole 3)
+        t("bare git diff (content) at root -> escalate", isEscalate(verdict("git diff", f.cwd)));
+      } else {
+        console.log("ok  (git not available — skipped real-repo git-recall cases)");
+      }
+      // not a git repo -> cwdIsGitRoot false -> escalate
+      const f2 = fixture();
+      t("git status in a non-repo dir -> escalate", isEscalate(verdict("git status -s", f2.cwd)));
+      // a dirty env (GIT_DIR set) -> gitEnvClean false -> escalate even in a real repo
+      const f3 = fixture();
+      if (spawnSync("git", ["init", "-q"], { cwd: f3.cwd }).status === 0) {
+        process.env.GIT_DIR = ".git";
+        try {
+          const s3 = resolveApprovalScope("git status -s", f3.cwd)!;
+          t("dirty env (GIT_DIR): gitEnvClean=false, cwdIsGitRoot=false (not probed)", s3.gitEnvClean === false && s3.cwdIsGitRoot === false);
+          t("git form with a dirty env -> escalate", isEscalate(verdict("git status -s", f3.cwd)));
+        } finally { delete process.env.GIT_DIR; }
+      }
+    } finally {
+      for (const k of toClear) { if (snapshot[k] === undefined) delete process.env[k]; else process.env[k] = snapshot[k]; }
+    }
+  }
 
   console.log("all approval-scope integration selftests passed");
 } finally {

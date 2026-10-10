@@ -3,7 +3,7 @@
 // planner (Map-backed, proto-safe), IO-verified realpath+credential scope facts, the metacharacter/glob/quote bans, git
 // kicked out of v0, fail-closed scope, v1 allow-only, the validators, and the dormant flag.
 import {
-  classifyApproval, planDelegation, isBlacklisted, isSensitivePath, validApprovalRequest, validApprovalScope,
+  classifyApproval, planDelegation, isBlacklisted, isSensitivePath, isGitEnvClean, validApprovalRequest, validApprovalScope,
   approvalDelegateEnabled, APPROVAL_POLL_SEC, type ApprovalRequest, type ApprovalScope, type ApprovalVerdict,
 } from "./approval-delegation.js";
 
@@ -55,11 +55,38 @@ for (const c of ["constructor", "toString", "hasOwnProperty", "valueOf", "__prot
   t(`git <inherited> is not a form -> escalate: git ${c}`, classifyApproval(req("git " + c, okScope([]))).kind === "escalate");
 }
 
-// ── AD-P1-1 / r3 ①: git is kicked out of v0 (config-exec + content-dump) -> never delegate ─────────────────────
-for (const c of ["git status", "git log --oneline", "git diff --stat", "git show --stat", "git diff", "git show",
-                 "git branch", "git remote -v", "git diff HEAD", "git diff --output=f"]) {
-  t(`git form is OUT of v0 -> escalate: ${c}`, classifyApproval(req(c, okScope([]))).kind === "escalate");
+// ── git-recall: NON-CONTENT forms delegate ONLY with the full git scope (cwdIsGitRoot && gitEnvClean); else escalate ────────
+const gitScope = (over: Partial<ApprovalScope> = {}): ApprovalScope => ({ cwdVerified: true, resolvedPaths: [], cwdIsGitRoot: true, gitEnvClean: true, ...over });
+for (const c of ["git status", "git status -s", "git log", "git log --oneline", "git log --oneline -5", "git diff --stat",
+                 "git diff --name-only", "git show --stat", "git branch", "git branch -a", "git remote -v"]) {
+  t(`git non-content form + full git scope -> delegate: ${c}`, isDelegate(classifyApproval(req(c, gitScope()))));
+  t(`git form WITHOUT git facts -> escalate: ${c}`, isNeedsUser(classifyApproval(req(c, okScope([])))));
 }
+// a git delegate carries a config-immune rewrite (updatedInput)
+(() => { const v = classifyApproval(req("git log --oneline", gitScope())); t("git log rewrite = config-immune (log is diff-family ⇒ --no-ext-diff)", v.kind === "delegate" && v.rewrite === "git --no-pager -c diff.external= -c core.fsmonitor= log --no-ext-diff --oneline"); })();
+(() => { const v = classifyApproval(req("git diff --stat", gitScope())); t("git diff rewrite has --no-ext-diff (diff-family)", v.kind === "delegate" && v.rewrite === "git --no-pager -c diff.external= -c core.fsmonitor= diff --no-ext-diff --stat"); })();
+(() => { const v = classifyApproval(req("git status -s", gitScope())); t("git status rewrite has no --no-ext-diff", v.kind === "delegate" && v.rewrite === "git --no-pager -c diff.external= -c core.fsmonitor= status -s"); })();
+// content forms / positional ref / unknown flag -> escalate EVEN with full git scope (Hole 3 + closed-form)
+for (const c of ["git diff", "git show", "git diff HEAD", "git show HEAD", "git log -p", "git diff --output=f", "git branch newbr", "git remote add x y"]) {
+  t(`git content/positional/unknown -> escalate even with git scope: ${c}`, isNeedsUser(classifyApproval(req(c, gitScope()))));
+}
+// Hole 2 / scope facts missing or false -> escalate even for a non-content form
+t("git form, env dirty -> escalate", isNeedsUser(classifyApproval(req("git status", gitScope({ gitEnvClean: false })))));
+t("git form, cwd not repo root -> escalate", isNeedsUser(classifyApproval(req("git status", gitScope({ cwdIsGitRoot: false })))));
+t("git form, cwd not verified -> escalate", isNeedsUser(classifyApproval(req("git status", gitScope({ cwdVerified: false })))));
+t("git form, path-scope facts only (no git facts) -> escalate", isNeedsUser(classifyApproval(req("git status", okScope([])))));
+// git mutations still blacklisted -> privilege (unchanged)
+for (const c of ["git push", "git commit -m x", "git reset --hard"]) t(`git mutation -> privilege: ${c}`, isPriv(classifyApproval(req(c, gitScope()))));
+
+// ── isGitEnvClean (git-recall Hole 2 GIT_ prefix rule) ────────────────────────────────────────────────────────
+t("isGitEnvClean {} -> true", isGitEnvClean({}) === true);
+t("isGitEnvClean HOME/PATH only -> true (HOME residual allowed)", isGitEnvClean({ HOME: "/h", PATH: "/bin" }) === true);
+t("isGitEnvClean GIT_DIR -> false", isGitEnvClean({ GIT_DIR: ".git" }) === false);
+t("isGitEnvClean GIT_EXEC_PATH -> false", isGitEnvClean({ GIT_EXEC_PATH: "/x" }) === false);
+t("isGitEnvClean GIT_<future> -> false (prefix rule complete)", isGitEnvClean({ GIT_FUTURE_VECTOR: "1" }) === false);
+t("isGitEnvClean GIT_CONFIG_PARAMETERS -> false", isGitEnvClean({ GIT_CONFIG_PARAMETERS: "'x=y'" }) === false);
+t("isGitEnvClean PAGER -> false (non-GIT_ vector)", isGitEnvClean({ PAGER: "less" }) === false);
+t("isGitEnvClean XDG_CONFIG_HOME -> false", isGitEnvClean({ XDG_CONFIG_HOME: "/c" }) === false);
 
 // ── AD-P1-2 / r3 ②: metacharacter args (glob/brace/tilde/quote/backslash) -> escalate (never delegate) ─────────
 for (const c of ["cat .e*", "cat ?.txt", "ls [ab]*", "cat {a,b}.txt", "cat ~/x", "ls ~", "cat .e''nv",
@@ -128,7 +155,8 @@ t("no verdict is a delegate-deny (v1 allow-only)", (() => {
 t("planDelegation scope-free for pwd", planDelegation("pwd").gate === "scope-free");
 (() => { const p = planDelegation("cat a.txt b.txt"); t("planDelegation scope-paths exposes operands", p.gate === "scope-paths" && JSON.stringify((p as any).pathArgs) === JSON.stringify(["a.txt", "b.txt"])); })();
 t("planDelegation privilege for substitution", (() => { const p = planDelegation("echo `id`"); return p.gate === "escalate" && (p as any).reason === "privilege"; })());
-t("planDelegation needs-user for git (out of v0)", (() => { const p = planDelegation("git status"); return p.gate === "escalate" && (p as any).reason === "needs-user"; })());
+t("planDelegation scope-git for git status (recalled)", (() => { const p = planDelegation("git status"); return p.gate === "scope-git" && typeof (p as any).rewrite === "string"; })());
+t("planDelegation escalate for bare git diff (content)", (() => { const p = planDelegation("git diff"); return p.gate === "escalate"; })());
 t("isSensitivePath: resolved .env", isSensitivePath("/w/.env") === true);
 t("isSensitivePath: resolved id_rsa.pub", isSensitivePath("/w/keys/id_rsa.pub") === true);
 t("isSensitivePath: plain file false", isSensitivePath("/w/src/main.ts") === false);

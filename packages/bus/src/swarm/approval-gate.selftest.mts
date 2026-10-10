@@ -19,7 +19,13 @@ const req = (command: string, scope?: ApprovalScope): ApprovalRequest => ({ memb
 t("privilege -> escalate:privilege", (() => { const a = planCoordinatorAction(req("rm -rf /", okScope([])), "c", 1); return a.act === "escalate" && a.reason === "privilege"; })());
 t("unknown -> escalate:needs-user", (() => { const a = planCoordinatorAction(req("make", okScope([])), "c", 1); return a.act === "escalate" && a.reason === "needs-user"; })());
 t("path form w/o facts -> escalate", planCoordinatorAction(req("cat a.txt"), "c", 1).act === "escalate");
-t("git (out of v0) -> escalate", planCoordinatorAction(req("git status", okScope([])), "c", 1).act === "escalate");
+t("git form w/o git facts -> escalate", planCoordinatorAction(req("git status", okScope([])), "c", 1).act === "escalate");
+// git-recall: a git delegate carries a config-immune rewrite in the decision
+(() => {
+  const gitScope: ApprovalScope = { cwdVerified: true, resolvedPaths: [], cwdIsGitRoot: true, gitEnvClean: true };
+  const a = planCoordinatorAction(req("git status -s", gitScope), "c", 7);
+  t("git delegate: decision.rewrite is the config-immune command", a.act === "delegate" && a.decision.rewrite === "git --no-pager -c diff.external= -c core.fsmonitor= status -s");
+})();
 t("allow-only: no delegate carries deny", [req("cat a.txt", okScope(["a.txt"])), req("rm x"), req("git status", okScope([]))].every(s => { const a = planCoordinatorAction(s, "c", 1); return a.act === "escalate" || a.decision.behavior === "allow"; }));
 
 // ── parsePermissionHook (takes the parsed object) ─────────────────────────────────────────────────────────────
@@ -115,6 +121,14 @@ await (async () => {
   const { deps, out } = mkDeps({ decisions: { pr1: { promptId: "pr1", member: "mem1", behavior: "deny", by: "c", reason: "x", atSec: 1 } } });
   await runPermissionGate(deps);
   t("gate: delegated deny is never emitted (emits nothing)", out.length === 0);
+})();
+
+// git-recall: a delegated allow WITH a rewrite -> emit allow carrying decision.updatedInput.command (the config-immune form)
+await (async () => {
+  const rewrite = "git --no-pager -c diff.external= -c core.fsmonitor= status -s";
+  const { deps, out } = mkDeps({ decisions: { pr1: { promptId: "pr1", member: "mem1", behavior: "allow", by: "c", reason: "x", atSec: 1, rewrite } } });
+  await runPermissionGate(deps);
+  t("gate: git delegate emits allow WITH updatedInput rewrite", out.length === 1 && JSON.parse(out[0]).hookSpecificOutput.decision.updatedInput.command === rewrite);
 })();
 
 console.log("all approval-gate selftests passed");

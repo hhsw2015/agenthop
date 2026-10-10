@@ -36,7 +36,9 @@ export function planCoordinatorAction(req: ApprovalRequest, by: string, nowSec: 
   if (verdict.kind === "delegate") {
     return {
       act: "delegate",
-      decision: { promptId: req.promptId, member: req.member, behavior: verdict.behavior, by, reason: `auto-allow:${req.tool}:read-only-within-cwd`, atSec: nowSec },
+      // git-recall: a git delegate carries a config-immune `rewrite` (verdict.rewrite) the hook applies via updatedInput; a plain
+      // read form has none. The reason string is audit-only.
+      decision: { promptId: req.promptId, member: req.member, behavior: verdict.behavior, by, reason: `auto-allow:${req.tool}:read-only-within-cwd`, atSec: nowSec, ...(verdict.rewrite ? { rewrite: verdict.rewrite } : {}) },
     };
   }
   return { act: "escalate", reason: verdict.reason };
@@ -122,7 +124,9 @@ export async function runPermissionGate(deps: PermissionGateDeps): Promise<void>
   const interval = deps.intervalMs ?? APPROVAL_POLL_INTERVAL_MS;
   while (deps.nowMs() < deadline) {
     const dec = deps.readDecision(parsed.promptId);
-    if (dec && dec.promptId === parsed.promptId && dec.behavior === "allow") { deps.emit(allowDecisionOutput()); return; }
+    // git-recall: a delegated ALLOW may carry a config-immune `rewrite` ⇒ emit it as decision.updatedInput.command; a plain read
+    // form has none ⇒ a bare allow. Either way the command Claude runs is exactly what the coordinator authorized.
+    if (dec && dec.promptId === parsed.promptId && dec.behavior === "allow") { deps.emit(allowDecisionOutput(dec.rewrite ? { command: dec.rewrite } : undefined)); return; }
     // v1 never records a delegated deny; if one ever appears, we still do NOT emit it here (deny stays a user decision) — fall through.
     await deps.sleep(interval);
   }

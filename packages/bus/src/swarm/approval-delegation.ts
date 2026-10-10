@@ -26,14 +26,14 @@
  *        is NOT a credential/secret target (AD-R2-P1-2 — within-cwd ≠ credential-safe: a symlink to `./.env` resolves within
  *        cwd). The secret-name blacklist is applied BOTH to the raw command (black-before-white) AND, via the hook's resolver,
  *        to the realpath target (coordinator r3 ④: extend the sensitive-name gate to the argument/target level).
- *     3. git is KICKED OUT of v0 (coordinator r3 ①): a git read command run AS THE MEMBER TYPED IT honours repo/global config
- *        (diff.external, *.textconv, core.fsmonitor, core.pager, aliases) and so can EXECUTE an external program, and `git
- *        show`/`git diff` can DUMP committed credential content — neither is config-immune without rewriting the command with
- *        `-c` overrides, which the allow/deny decision cannot do. So all git → escalate. git returns via a future ruling once
- *        a command-rewrite (`git -c diff.external= -c core.pager=cat --no-ext-diff …`) mechanism is confirmed for the hook.
- *   The pure core holds NO filesystem; the facts (ApprovalScope) are the hook's job in the IO round. Until then path forms fail
- *   closed. Narrow is the point (coordinator: fewer popups; ls/cat fixed forms cover the bulk). grep/rg/find/git are DEFERRED
- *   (not safe closed forms) → needs-user.
+ *     3. git RECALLED for NON-CONTENT read forms via a config-immune rewrite (git-recall-brief.md, FROZEN). A git read run as
+ *        typed can EXECUTE via config/env (diff.external, pager.<sub>, core.fsmonitor, textconv) and `git show`/`git diff` DUMP
+ *        committed content — so a git form delegates ONLY when (Hole 1) the decision rewrites it config-immune (`git --no-pager
+ *        -c diff.external= -c core.fsmonitor= … --no-ext-diff`), (Hole 2) the IO fact `gitEnvClean` says the member env has no
+ *        `GIT_`-prefixed var nor an explicit non-GIT_ vector, (Hole 3) the form is non-content (status/log-sans-p/diff|show with
+ *        name/stat flags/branch/remote), AND `cwdIsGitRoot`. Miss one ⇒ escalate. grep/rg/find remain DEFERRED → needs-user.
+ *   The pure core holds NO filesystem; the facts (ApprovalScope) are the hook's job in the IO round. Until then path/git forms
+ *   fail closed. Narrow is the point (coordinator: fewer popups; ls/cat/status/log fixed forms cover the bulk).
  *
  * Pure core below (selftested). IO (the sync hook CLI, the coordinator wiring, the control-log `permissionDecision` record,
  * the InboxMsg `approval?` field, the realpath+credential resolver that fills ApprovalScope) is the dormant seam.
@@ -54,6 +54,9 @@ export interface ApprovalScope {
     resolvedWithinCwd: boolean;  // realpath(raw) resolved AND stayed within realpath(cwd), symlinks followed
     resolvedSensitive: boolean;  // the resolved target is a credential/secret file (AD-R2-P1-2) ⇒ never delegate
   }>;
+  // git-recall facts (git-recall-brief.md); additive/optional (FC-7). Absent ⇒ a git form fails closed (never delegated).
+  cwdIsGitRoot?: boolean;  // cwd == `git rev-parse --show-toplevel` (realpath-compared): a repo-wide read is confined to cwd
+  gitEnvClean?: boolean;   // the member env has NO GIT_-prefixed var and none of the explicit non-GIT_ vectors (Hole 2)
 }
 
 /** The S11 payload a PermissionRequest hook writes to the coordinator. Built from the Claude hook stdin:
@@ -72,7 +75,7 @@ export interface ApprovalRequest {
 /** The coordinator's verdict. `delegate` is auto-APPLIED (allow only, v1) and recorded; `escalate` goes to the user and is
  *  NEVER auto-granted (`privilege` = the hard blacklist / never-delegable; `needs-user` = not-safe-enough, fail-closed). */
 export type ApprovalVerdict =
-  | { kind: "delegate"; behavior: "allow" }
+  | { kind: "delegate"; behavior: "allow"; rewrite?: string } // `rewrite` (git-recall): the config-immune command the hook emits via updatedInput
   | { kind: "escalate"; reason: "privilege" | "needs-user" };
 
 /** A recorded (② 留痕) delegated decision — the control-log `permissionDecision` payload (IO round) AND the hook's flowback
@@ -84,6 +87,7 @@ export interface PermissionDecision {
   by: string;        // the deciding coordinator sid
   reason: string;
   atSec: number;
+  rewrite?: string;  // git-recall: the config-immune rewritten command the hook applies via decision.updatedInput (additive/optional)
 }
 
 /** The member blocks on the sync hook at most this long before the request falls through to the user dialog (coordinator
@@ -107,6 +111,60 @@ const READ_FORMS = new Map<string, ReadForm>([
 ]);
 /** Scope-free commands: no filesystem read by a cwd-relative path (their args are literals / command names / cwd itself). */
 const SCOPE_FREE = new Set(["pwd", "echo", "which", "basename", "dirname"]);
+
+// ── git-recall (git-recall-brief.md, FROZEN): the NON-CONTENT git read forms, recalled via a config-immune rewrite. A Map (not
+//    a plain object) so inherited keys can't resolve (AD-R2-P1-1). `requireFlag` ⇒ the bare form emits file CONTENT (bare `git
+//    diff`/`git show`) so a no-content flag is mandatory. `allowCount` ⇒ a bare `-<N>` is allowed (git log -5). NO positional
+//    operand (a ref/pathspec widens scope/content ⇒ escalate). Every git form ALSO requires cwdIsGitRoot && gitEnvClean. ──
+interface GitForm { flags: Set<string>; requireFlag: boolean; allowCount?: boolean }
+const GIT_FORMS = new Map<string, GitForm>([
+  ["status", { flags: new Set(["-s", "--short", "--porcelain", "-b", "--branch", "-sb", "--long"]), requireFlag: false }],
+  ["log",    { flags: new Set(["--oneline", "--stat", "--graph", "--decorate", "--no-color", "--numstat", "--shortstat", "--name-only", "--name-status", "--all"]), requireFlag: false, allowCount: true }],
+  ["diff",   { flags: new Set(["--stat", "--name-only", "--name-status", "--numstat", "--shortstat", "--summary"]), requireFlag: true }],
+  ["show",   { flags: new Set(["--stat", "--numstat", "--name-only", "--name-status"]), requireFlag: true }],
+  ["branch", { flags: new Set(["-a", "--all", "-v", "-vv", "-r", "--list", "-l"]), requireFlag: false }],
+  ["remote", { flags: new Set(["-v", "--verbose"]), requireFlag: false }],
+]);
+/** The diff-family subcommands that accept `--no-ext-diff` (others reject it as an unknown option). */
+const GIT_DIFF_FAMILY = new Set(["diff", "log", "show"]);
+/** The config-immune rewrite of a git read command (git-recall Hole 1, FROZEN). Pure string transform over the ALREADY-VALIDATED
+ *  subcommand + closed-form flags: `--no-pager` (kills every pager path incl. pager.<sub>) + `-c diff.external=` + `-c
+ *  core.fsmonitor=` as git GLOBAL options, then the subcommand, then `--no-ext-diff` for the diff family only, then the flags. */
+function gitImmuneRewrite(sub: string, flags: string[]): string {
+  const extDiff = GIT_DIFF_FAMILY.has(sub) ? " --no-ext-diff" : "";
+  const tail = flags.length ? " " + flags.join(" ") : "";
+  return `git --no-pager -c diff.external= -c core.fsmonitor= ${sub}${extDiff}${tail}`;
+}
+/** Plan a git read command (git-recall). Returns scope-git with the config-immune rewrite for a recognised NON-CONTENT closed
+ *  form, else escalate (unknown subcommand/flag, a bare content form, or a positional operand). Pure. */
+function planGit(rest: string[]): DelegationPlan {
+  if (rest.length === 0) return esc("needs-user");
+  const sub = rest[0].toLowerCase();
+  const form = GIT_FORMS.get(sub);                   // Map.get ⇒ inherited keys return undefined (AD-R2-P1-1)
+  if (!form) return esc("needs-user");
+  const flags: string[] = [];
+  let sawFlag = false;
+  for (const tok of rest.slice(1)) {
+    if (form.allowCount && /^-\d+$/.test(tok)) { flags.push(tok); sawFlag = true; continue; } // git log -5
+    if (form.flags.has(tok)) { flags.push(tok); sawFlag = true; continue; }
+    return esc("needs-user");                         // unknown flag OR a positional ref/pathspec (widens scope / content)
+  }
+  if (form.requireFlag && !sawFlag) return esc("needs-user"); // bare `git diff`/`git show` emit file content (Hole 3)
+  return { gate: "scope-git", rewrite: gitImmuneRewrite(sub, flags) };
+}
+
+/** The explicit non-`GIT_`-prefixed env vectors (git-recall Hole 2): config-injection / exec that do not start with `GIT_`. */
+const GIT_ENV_NON_PREFIX = ["PAGER", "EDITOR", "SSH_ASKPASS", "XDG_CONFIG_HOME"];
+/** gitEnvClean (git-recall Hole 2, FROZEN GIT_ PREFIX RULE): true iff NO env var name starts with `GIT_` (any value) AND none
+ *  of the explicit non-`GIT_` vectors is set. The prefix rule is complete by construction — a future `GIT_*` exec/config/scope
+ *  vector is caught without a code edit. `HOME` is a known accepted residual (always present; mitigated by the `-c` rewrite +
+ *  the non-content restriction). The IO resolver calls this with the member's process.env to fill `ApprovalScope.gitEnvClean`;
+ *  the pure classifier then trusts that boolean. Pure. */
+export function isGitEnvClean(env: NodeJS.ProcessEnv): boolean {
+  for (const k of Object.keys(env)) if (k.startsWith("GIT_") && env[k] !== undefined) return false;
+  for (const k of GIT_ENV_NON_PREFIX) if (env[k] !== undefined) return false;
+  return true;
+}
 
 /** The credential/secret path signature — shared by the blacklist (raw command) and isSensitivePath (resolved target). Covers
  *  the coordinator r3 ④ list: `.env*`, `.git/credentials`, `*.pem`, `*.key`, `id_rsa*`, ssh/aws material, tokens/passwords. */
@@ -156,7 +214,8 @@ export function isBlacklisted(tool: string, command: string): boolean {
 export type DelegationPlan =
   | { gate: "escalate"; reason: "privilege" | "needs-user" }
   | { gate: "scope-free" }                           // delegate with no facts (pwd/echo/which/basename/dirname)
-  | { gate: "scope-paths"; pathArgs: string[] };     // delegate iff facts prove every operand within cwd AND not sensitive
+  | { gate: "scope-paths"; pathArgs: string[] }      // delegate iff facts prove every operand within cwd AND not sensitive
+  | { gate: "scope-git"; rewrite: string };          // git-recall: delegate iff cwdIsGitRoot && gitEnvClean; emit `rewrite`
 
 const esc = (reason: "privilege" | "needs-user"): DelegationPlan => ({ gate: "escalate", reason });
 
@@ -182,9 +241,10 @@ export function planDelegation(command: string): DelegationPlan {
 
   if (cmd === "pwd") return rest.length === 0 ? { gate: "scope-free" } : esc("needs-user");
   if (SCOPE_FREE.has(cmd)) return { gate: "scope-free" }; // echo/which/basename/dirname: args are literals, not file reads
+  if (cmd === "git") return planGit(rest);           // git-recall: non-content forms via a config-immune rewrite (git-recall-brief)
 
   const form = READ_FORMS.get(cmd);                  // Map.get ⇒ inherited keys (constructor/…) return undefined (AD-R2-P1-1)
-  if (!form) return esc("needs-user");               // unknown command, incl. git (kicked out of v0 — r3 ①)
+  if (!form) return esc("needs-user");               // unknown command
   const pathArgs: string[] = [];
   for (const tok of rest) {
     if (tok.startsWith("-")) {
@@ -212,6 +272,12 @@ function pathsScopeOk(pathArgs: string[], scope?: ApprovalScope): boolean {
   return true; // pathArgs empty (e.g. `ls` listing cwd) ⇒ vacuously within cwd once cwdVerified
 }
 
+/** Scope gate for a git read form (git-recall): delegate ONLY when cwd is verified, IS the git repo root (scope confined), AND
+ *  the member env is clean of every exec/config/scope vector (Hole 2). Any missing/false fact ⇒ false ⇒ escalate. */
+function gitScopeOk(scope?: ApprovalScope): boolean {
+  return !!scope && scope.cwdVerified && scope.cwdIsGitRoot === true && scope.gitEnvClean === true;
+}
+
 /**
  * The verdict (board ①). Bash-only (structured tools ⇒ needs-user, v0). The structural `planDelegation` decides the FORM;
  * a delegate form additionally requires the IO-verified scope facts (fail-closed without them). v1 delegates ALLOW only; a
@@ -223,6 +289,7 @@ export function classifyApproval(req: ApprovalRequest): ApprovalVerdict {
     case "escalate":    return { kind: "escalate", reason: plan.reason };
     case "scope-free":  return { kind: "delegate", behavior: "allow" };
     case "scope-paths": return pathsScopeOk(plan.pathArgs, req.scope) ? { kind: "delegate", behavior: "allow" } : { kind: "escalate", reason: "needs-user" };
+    case "scope-git":   return gitScopeOk(req.scope) ? { kind: "delegate", behavior: "allow", rewrite: plan.rewrite } : { kind: "escalate", reason: "needs-user" };
   }
 }
 
@@ -241,7 +308,13 @@ export function validApprovalScope(raw: unknown): ApprovalScope | null {
   }
   // Duplicate raws are KEPT, not rejected — pathsScopeOk merges them DENY-STICKY (any negative entry wins, order-independent;
   // coordinator r4 ③ "归并单调向严,不许后项覆盖前项" — the FC-6 monotonic family), so a contradictory pair always escalates.
-  return { cwdVerified: r.cwdVerified, resolvedPaths: resolved };
+  if (r.cwdIsGitRoot !== undefined && typeof r.cwdIsGitRoot !== "boolean") return null; // git-recall facts: optional booleans
+  if (r.gitEnvClean !== undefined && typeof r.gitEnvClean !== "boolean") return null;
+  return {
+    cwdVerified: r.cwdVerified, resolvedPaths: resolved,
+    ...(typeof r.cwdIsGitRoot === "boolean" ? { cwdIsGitRoot: r.cwdIsGitRoot } : {}),
+    ...(typeof r.gitEnvClean === "boolean" ? { gitEnvClean: r.gitEnvClean } : {}),
+  };
 }
 
 /** Validate an untrusted ApprovalRequest (the S11 payload the coordinator reads) — fail-closed: a malformed request is not an
