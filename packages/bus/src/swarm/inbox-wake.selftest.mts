@@ -78,6 +78,37 @@ ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite cloc
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
 
+// IW-P2-1 r5-regression: a cross-family GC must not re-open a used window — the GLOBAL max timestamp is the authority.
+{
+  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakexfam-"));
+  const C60 = 60_000, C120 = 120_000;
+  try {
+    ok(claimWakeSlot(HOME, "x", 1_000_000, C120) === true, "xfam: 120s family injects at t=1,000,000 (window 8)");
+    ok(claimWakeSlot(HOME, "x", 1_061_000, C60) === true, "xfam: 60s family injects at t=1,061,000 (its GC may drop the 120s marker)");
+    ok(claimWakeSlot(HOME, "x", 1_062_000, C120) === false, "IW-P2-1: 120s re-claim at t=1,062,000 is rejected by the 60s inject's timestamp (global MAX) — no window-8 revival");
+    ok(claimWakeSlot(HOME, "x", 1_181_001, C120) === true, "xfam: once 120s has truly elapsed since the last inject, the 120s family admits again");
+  } finally { rmSync(HOME, { recursive: true, force: true }); }
+}
+// IW-R5-P2-1: a still-valid marker in a DIFFERENT/legacy/unknown schema is EVIDENCE (blocks), never ignored.
+{
+  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakelegacy-"));
+  const C120 = 120_000;
+  const dir = path.join(HOME, ".agenthop/console/inbox-wake"); mkdirSync(dir, { recursive: true });
+  const safe = createHash("sha256").update("c").digest("hex");
+  try {
+    // a legacy r4-style marker: bare "<sid>.<window>" whose CONTENT is the claim timestamp.
+    writeFileSync(path.join(dir, `${safe}.8`), String(1_000_000));
+    ok(claimWakeSlot(HOME, "c", 1_001_000, C120) === false, "IW-R5-P2-1: a legacy (no-interval) marker still within cooldown BLOCKS the upgraded claim (not ignored)");
+    ok(claimWakeSlot(HOME, "c", 1_120_001, C120) === true, "legacy marker past the cooldown no longer blocks (time-based, parameter-independent)");
+    // an UNRECOGNIZED file with non-numeric content: counts as evidence via its mtime (conservative), still within cooldown ⇒ blocks.
+    const HOME2 = mkdtempSync(path.join(os.tmpdir(), "ah-wakeunk-"));
+    const dir2 = path.join(HOME2, ".agenthop/console/inbox-wake"); mkdirSync(dir2, { recursive: true });
+    writeFileSync(path.join(dir2, `${safe}.v99.weird`), "not-a-timestamp");
+    ok(claimWakeSlot(HOME2, "c", Date.now(), C120) === false, "IW-R5-P2-1: an unrecognized file (non-numeric content) is EVIDENCE via mtime ⇒ a fresh claim is blocked (fail-closed recognition)");
+    rmSync(HOME2, { recursive: true, force: true });
+  } finally { rmSync(HOME, { recursive: true, force: true }); }
+}
+
 // wakeSession with INJECTED deps (claim mimics the per-window O_EXCL; no herdr subprocess).
 const makeDeps = (over: Partial<WakeDeps> = {}): { d: WakeDeps; injects: string[]; clock: { t: number } } => {
   const injects: string[] = []; const clock = { t: 1e6 }; const claimed = new Set<string>();

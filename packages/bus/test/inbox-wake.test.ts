@@ -44,10 +44,29 @@ describe("inbox-wake — claimWakeSlot (先占后发, cross-process atomic)", ()
   test("IW-R4-P2-1: a cooldown parameter change does not let old window numbers block new wakes", () => {
     const C60 = 60_000, C120 = 120_000;
     expect(claimWakeSlot(HOME, "c", 1_000_000, C60)).toBe(true);   // 60s window 16
-    expect(claimWakeSlot(HOME, "c", 1_240_000, C120)).toBe(true);  // 60→120 +240s: new interval family admits (not blocked by 16)
+    expect(claimWakeSlot(HOME, "c", 1_240_000, C120)).toBe(true);  // 60→120 +240s: admits (time-based, not blocked by old number)
     expect(claimWakeSlot(HOME, "d", 1_000_000, C120)).toBe(true);  // reverse
-    expect(claimWakeSlot(HOME, "d", 1_240_000, C60)).toBe(true);   // 120→60 +240s: new family admits
-    expect(claimWakeSlot(HOME, "d", 1_245_000, C60)).toBe(false);  // same 60s window ⇒ still rejected
+    expect(claimWakeSlot(HOME, "d", 1_240_000, C60)).toBe(true);   // 120→60 +240s: admits
+    expect(claimWakeSlot(HOME, "d", 1_245_000, C60)).toBe(false);  // only 5s since last inject ⇒ rejected
+  });
+
+  test("IW-P2-1 (r5 regression): a cross-family GC cannot re-open a used window (global max timestamp is the authority)", () => {
+    const C60 = 60_000, C120 = 120_000;
+    expect(claimWakeSlot(HOME, "x", 1_000_000, C120)).toBe(true);  // 120s family injects (window 8)
+    expect(claimWakeSlot(HOME, "x", 1_061_000, C60)).toBe(true);   // 60s family injects
+    expect(claimWakeSlot(HOME, "x", 1_062_000, C120)).toBe(false); // 120s re-claim blocked by the 60s inject's timestamp — no revival
+  });
+
+  test("IW-R5-P2-1: a still-valid legacy / unrecognized marker is evidence (blocks), never ignored", () => {
+    const C120 = 120_000;
+    const dir = path.join(HOME, ".agenthop/console/inbox-wake"); mkdirSync(dir, { recursive: true });
+    const safe = createHash("sha256").update("c").digest("hex");
+    writeFileSync(path.join(dir, `${safe}.8`), String(1_000_000));            // legacy r4-style (no interval), content = timestamp
+    expect(claimWakeSlot(HOME, "c", 1_001_000, C120)).toBe(false);            // within cooldown ⇒ blocked (not ignored)
+    expect(claimWakeSlot(HOME, "c", 1_120_001, C120)).toBe(true);             // past cooldown ⇒ admits
+    const safeU = createHash("sha256").update("u").digest("hex");
+    writeFileSync(path.join(dir, `${safeU}.v99.weird`), "not-a-timestamp");   // unrecognized schema, non-numeric content
+    expect(claimWakeSlot(HOME, "u", Date.now(), C120)).toBe(false);           // evidence via mtime ⇒ blocked (fail-closed recognition)
   });
 
   test("IW-P2-1 three holes closed: GC'd-window / read-fault / persist-fault never re-admit", () => {
