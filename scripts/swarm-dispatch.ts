@@ -1660,16 +1660,17 @@ async function main(): Promise<void> {
     void (async () => {
       try {
         const records = await readReviewLedger(reviewQueueDir(HOME));
-        const openTickets = [...new Set(records.filter((r) => !r.done).map((r) => r.ticket))].filter(Boolean); // not-yet-cleared only
+        const allTickets = [...new Set(records.map((r) => r.ticket))].filter(Boolean);                      // every known ticket (open OR done)
+        const openTickets = [...new Set(records.filter((r) => !r.done).map((r) => r.ticket))].filter(Boolean); // diagnose the not-yet-cleared ones
         if (openTickets.length === 0) return;
         const cfg = { alertN: roundAlertN(process.env.SWARM_ROUND_ALERT_N), degradeWindow: DEFAULT_ROUND_DOCTOR_CONFIG.degradeWindow };
         let progressLines: string[] = [];
         try { progressLines = readFileSync(PROGRESS_FILE, "utf8").split("\n"); } catch { /* no PROGRESS yet ⇒ nothing to diagnose */ }
         if (progressLines.length === 0) return;
         for (const ticket of openTickets) {
-          const otherTickets = openTickets.filter((t) => t !== ticket); // reject ambiguous multi-ticket lines (RD-2)
-          const history = extractTicketRounds(progressLines, ticket, otherTickets); // completed verdict rounds for THIS ticket, round-keyed + unknown-preserving
-          const verdict = diagnoseRounds(history.length, history, cfg);
+          const otherTickets = allTickets.filter((t) => t !== ticket); // ALL other known tickets — attribution must not depend on done/open (RD-2)
+          const { rounds, history } = extractTicketRounds(progressLines, ticket, otherTickets, cfg); // header-anchored verdict rounds, bounded window
+          const verdict = diagnoseRounds(rounds, history, cfg);
           if (!verdict.concern) continue;
           notifyCoordinator(buildRoundDoctorNote(ticket, verdict), { taskRef: `round-doctor:${ticket}`, title: "round-doctor" });
         }
