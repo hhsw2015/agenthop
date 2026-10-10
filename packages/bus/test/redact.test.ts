@@ -48,6 +48,20 @@ test("AWS secret access key (contextual, via key name)", () => {
   expect(redactSecrets("aws_secret_access_key=" + awsSecret)).toBe("aws_secret_access_key=[REDACTED:AWS_SECRET]");
 });
 
+// RS-2: common wrapper forms beyond the bare / double-quote assignment must also match.
+test("RS-2: AWS secret in single-quote env assignment", () => {
+  expect(redactSecrets("aws_secret_access_key='" + awsSecret + "'")).toBe("aws_secret_access_key='[REDACTED:AWS_SECRET]'");
+});
+
+test("RS-2: AWS secret in YAML colon value (bare and quoted)", () => {
+  expect(redactSecrets("aws_secret_access_key: " + awsSecret)).toBe("aws_secret_access_key: [REDACTED:AWS_SECRET]");
+  expect(redactSecrets('aws_secret_access_key: "' + awsSecret + '"')).toBe('aws_secret_access_key: "[REDACTED:AWS_SECRET]"');
+});
+
+test("RS-2: Slack xoxc- prefix (xox* family completion)", () => {
+  expect(redactSecrets("xoxc-" + "9".repeat(16))).toBe("[REDACTED:SLACK_TOKEN]");
+});
+
 test("multiple secrets in one blob, each masked", () => {
   const got = redactSecrets("id " + akid + " tok ghp_" + "z".repeat(36));
   expect(got).toBe("id [REDACTED:AWS_AKID] tok [REDACTED:GITHUB_TOKEN]");

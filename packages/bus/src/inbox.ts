@@ -479,8 +479,11 @@ function sanitizeForTransport(s: string): string {
 /** FC-2 — build the S19 dead-letter notification for the coordinator when a poison message is quarantined: content preview +
  *  failure trace + strike count, as an InboxMsg, all TRANSPORT-SANITIZED (PD-P2-1). Pure (no IO); the caller writes it. */
 export function buildPoisonS19(mySid: string, myLabel: string, poison: InboxMsg, strikes: number, trace: string): InboxMsg {
-  const clipped = poison.text.length > 240 ? `${poison.text.slice(0, 240)}…` : poison.text;
-  const preview = sanitizeForTransport(clipped);
+  // RS-1: sanitize (control-char strip + secret redaction) the FULL text FIRST, THEN bound for display. Clipping first would
+  // split a PEM block or a fixed-length token across the 240 boundary, so redactSecrets could not match it and a sensitive
+  // fragment would survive into this notice (and the durable poison-notices queue, and the forward). quarantine/ keeps originals.
+  const safe = sanitizeForTransport(poison.text);
+  const preview = safe.length > 240 ? `${safe.slice(0, 240)}…` : safe;
   const text = `[poison-dlq] 毒件已隔离(投递崩溃 ${strikes} 次,已达阈值)。来源 ${sanitizeForTransport(poison.fromLabel)} via ${sanitizeForTransport(poison.via)};失败轨迹: ${sanitizeForTransport(trace)};内容预览: ${preview}`;
   return { from: mySid, fromLabel: myLabel, text, via: "local", ts: Date.now(), taskRef: "poison-dlq", title: "poison quarantine" };
 }
