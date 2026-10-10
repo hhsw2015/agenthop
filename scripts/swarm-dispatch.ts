@@ -64,8 +64,8 @@ import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
-import { digestEnabled, shouldGenerateDigest, composeDigest } from "../packages/bus/src/swarm/morning-digest.js";
-import { writeDigestProjection, readDigestDate, gatherDigestSources } from "../packages/bus/src/swarm/morning-digest-store.js";
+import { digestEnabled, digestActions, composeDigest } from "../packages/bus/src/swarm/morning-digest.js";
+import { writeDigestProjection, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources } from "../packages/bus/src/swarm/morning-digest-store.js";
 import { successionEnabled } from "../packages/bus/src/swarm/shell-succession.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
@@ -1653,24 +1653,31 @@ async function main(): Promise<void> {
     catch (e) { log(`gauge sampling failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
-  // Morning digest (TG v1 CORE composeDigest had no trigger ⇒ never produced). Once per calendar date, at/after the local target
-  // hour, gather the night's sources + write the morning-digest/v1 projection (console/TG both read it — one generation, multi-end
-  // delivery, the generator touches no entry) + push the same brief to the coordinator durable box (S11, fyi). Idempotent per
-  // date, seeded from the on-disk projection so a mid-day restart does not re-generate. Live by default (SWARM_DIGEST, opt-out);
-  // fully fail-soft — never breaks the sweep.
-  let digestLastDate: string | null = null;
-  let digestSeeded = false;
+  // Morning digest (TG v1 CORE composeDigest had no trigger ⇒ never produced). At/after the local target hour, once per calendar
+  // date, run TWO INDEPENDENT obligations (MD-P2-1): (1) write the morning-digest/v1 projection (console + TG read it — one
+  // generation, multi-end delivery, the generator touches no entry); (2) push the same brief to the coordinator durable box (S11,
+  // fyi). Each is tracked by its OWN durable date-marker (the projection file / notified.json), so a write/deliver failure retains
+  // the obligation, a restart recovers it, and a CONFIRMED delivery is never repeated. Backoff so a persistent failure does not
+  // retry every tick. Live by default (SWARM_DIGEST, opt-out); fully fail-soft — never breaks the sweep.
+  let lastDigestAttemptSec = 0;
+  const DIGEST_RETRY_SEC = 300; // on a failed obligation, retry at most every 5 min (not every 5s sweep tick)
   const runDigest = (): void => {
     if (!digestEnabled()) return; // SWARM_DIGEST live by default (opt-out; kill with =0)
     try {
       const d = new Date();
       const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; // local date
-      if (!digestSeeded) { digestLastDate = readDigestDate(HOME); digestSeeded = true; } // survive restart: don't re-gen today's brief
-      if (!shouldGenerateDigest(today, d.getHours(), DIGEST_HOUR, digestLastDate)) return;
-      digestLastDate = today; // advance BEFORE generating ⇒ one attempt per day even if it throws (no tight retry)
+      const act = digestActions(today, d.getHours(), DIGEST_HOUR, readDigestProjection(HOME), readNotifiedState(HOME));
+      if (!act.writeProjection && !act.notify) return; // both already delivered today (or before the hour)
+      if (nowSec() - lastDigestAttemptSec < DIGEST_RETRY_SEC) return; // backoff: never a tight per-tick retry on a persistent fault
+      lastDigestAttemptSec = nowSec();
       const sources = gatherDigestSources(HOME);
-      writeDigestProjection(HOME, sources, today, nowSec()); // atomic morning-digest/v1 projection (console + TG read it)
-      notifyCoordinator(composeDigest(sources, today), { taskRef: "morning-digest", title: "morning brief", intent: "fyi" }); // same brief to the coordinator box (fyi)
+      if (sources === null) return; // MD-P2-2: sources unreadable (unknown) ⇒ cannot assert content ⇒ retry later (no false quiet night)
+      if (act.writeProjection) writeDigestProjection(HOME, sources, today, nowSec()); // atomic; (re)writes absent/corrupt; retry if it fails
+      if (act.notify) {
+        const coord = process.env.SWARM_COORDINATOR;
+        if (!coord || !coord.trim()) markNotified(HOME, today); // no coordinator ⇒ the brief has no target; the projection is the artifact
+        else if (["delivered", "deduped"].includes(notifyCoordinator(composeDigest(sources, today), { taskRef: "morning-digest", title: "morning brief", intent: "fyi" }))) markNotified(HOME, today); // CONFIRMED ⇒ record; logged/failed ⇒ retry next eligible tick
+      }
     } catch (e) { log(`morning digest failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 

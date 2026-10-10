@@ -57,13 +57,22 @@ export function digestEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return flagDefaultOn(env.SWARM_DIGEST);
 }
 
-/** Pure daily-trigger throttle: generate today's digest at/after `targetHour` (local), at most ONCE per calendar date. True iff
- *  it is the target hour or later AND today's brief was not already generated (`lastDate` !== `todayStr`). A non-finite hour ⇒
- *  false (no clock ⇒ never spam). The caller SEEDS `lastDate` from the on-disk projection's date so a mid-day restart does not
- *  re-generate the same day's brief (idempotent per date — like the gauge-sampling throttle, but keyed on the calendar date
- *  rather than an elapsed interval). Pure. */
-export function shouldGenerateDigest(todayStr: string, hourNow: number, targetHour: number, lastDate: string | null): boolean {
-  if (!Number.isFinite(hourNow) || !Number.isFinite(targetHour)) return false;
-  if (lastDate === todayStr) return false;
-  return hourNow >= targetHour;
+/** The on-disk PROJECTION state (MD-P2-4): only a COMPLETE valid projection for today proves today's brief was generated. The
+ *  four states are kept distinct — "valid" (proven), "absent" (never written), "corrupt" (parseable but malformed ⇒ repairable),
+ *  "unknown" (a read error ⇒ can't tell). The store's reader classifies; the pure decision below consumes it. */
+export type ProjState = { kind: "valid"; date: string } | { kind: "absent" } | { kind: "corrupt" } | { kind: "unknown" };
+/** The NOTIFY state (MD-P2-1): the daily coordinator-brief delivery is a SEPARATE obligation from the projection, tracked by its
+ *  own durable marker — "notified" (confirmed for a date), "none" (not yet), "unknown" (marker unreadable ⇒ don't risk a double). */
+export type NotifyState = { kind: "notified"; date: string } | { kind: "none" } | { kind: "unknown" };
+
+/** Pure daily decision: at/after the local target hour, decide INDEPENDENTLY whether to (re)write today's projection and whether
+ *  to send today's coordinator brief (MD-P2-1: two obligations, not one date). Before the hour, or on a non-finite clock, do
+ *  nothing. writeProjection is true unless a VALID today projection already exists (absent/corrupt/unknown ⇒ (re)write — the
+ *  write is idempotent and repairs a corrupt/missing file, MD-P2-4). notify is true only when the marker says not-yet-today
+ *  ("none", or "notified" for an earlier date); an UNKNOWN marker ⇒ false (never risk a double-send; retry when readable). Pure. */
+export function digestActions(todayStr: string, hourNow: number, targetHour: number, proj: ProjState, notified: NotifyState): { writeProjection: boolean; notify: boolean } {
+  if (!Number.isFinite(hourNow) || !Number.isFinite(targetHour) || hourNow < targetHour) return { writeProjection: false, notify: false };
+  const writeProjection = !(proj.kind === "valid" && proj.date === todayStr);
+  const notify = notified.kind === "none" || (notified.kind === "notified" && notified.date !== todayStr);
+  return { writeProjection, notify };
 }
