@@ -32,13 +32,22 @@ describe("inbox-wake — claimWakeSlot (先占后发, cross-process atomic)", ()
     expect(claimWakeSlot(HOME, "..", w(8), COOL)).toBe(true);      // reserved-dot sid hashed to a safe filename (no traversal)
     expect(claimWakeSlot(HOME, "c", NaN, COOL)).toBe(false);       // fail-safe
   });
-  test("IW-P2-1: a GC'd old window re-claimed late is rejected by the MAX marker (cleanup never re-admits)", () => {
+  test("IW-P2-1: a GC'd old window re-claimed late is rejected by the family MAX (cleanup never re-admits)", () => {
     expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);
-    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);       // max ⇒ 9
+    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);       // family max ⇒ 9
     const safe = createHash("sha256").update("c").digest("hex");
-    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.8`), { force: true }); // simulate cleanup removing window 8
-    expect(claimWakeSlot(HOME, "c", w(8) + 5, COOL)).toBe(false);  // late window-8: reopened slot, but max marker 9 rejects it
+    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.w${COOL}.8`), { force: true }); // simulate cleanup removing window 8
+    expect(claimWakeSlot(HOME, "c", w(8) + 5, COOL)).toBe(false);  // late window-8: reopened slot, but family max 9 rejects it
     expect(claimWakeSlot(HOME, "c", w(10), COOL)).toBe(true);      // a genuinely newer window still claims
+  });
+
+  test("IW-R4-P2-1: a cooldown parameter change does not let old window numbers block new wakes", () => {
+    const C60 = 60_000, C120 = 120_000;
+    expect(claimWakeSlot(HOME, "c", 1_000_000, C60)).toBe(true);   // 60s window 16
+    expect(claimWakeSlot(HOME, "c", 1_240_000, C120)).toBe(true);  // 60→120 +240s: new interval family admits (not blocked by 16)
+    expect(claimWakeSlot(HOME, "d", 1_000_000, C120)).toBe(true);  // reverse
+    expect(claimWakeSlot(HOME, "d", 1_240_000, C60)).toBe(true);   // 120→60 +240s: new family admits
+    expect(claimWakeSlot(HOME, "d", 1_245_000, C60)).toBe(false);  // same 60s window ⇒ still rejected
   });
 
   test("IW-P2-1 three holes closed: GC'd-window / read-fault / persist-fault never re-admit", () => {

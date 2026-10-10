@@ -7,7 +7,7 @@
 // the FILESYSTEM, so a same-batch burst AND independent writer processes all collapse to one inject per window. The dispatcher watch
 // is demoted to a BACKSTOP: re-inject only for items that have lain unclaimed past a window (a write-side wake that missed).
 
-import { mkdirSync, writeFileSync, readdirSync, unlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
@@ -43,44 +43,45 @@ export function shouldInjectWake(now: number, last: number, paneState: string, c
   return true;
 }
 
-/** 先占后发 — atomically claim the per-target wake slot for the current window BEFORE any send. The high-water IS the set of per-window
- *  O_EXCL markers `console/inbox-wake/<sha256(sid)>.<window>`; the effective high-water is MAX(window). There is NO separately-mutated
- *  high-water file, so the whole class of "unconfirmed evidence authorizes" bugs is gone at the root (IW-P2-1):
+/** 先占后发 — atomically claim the per-target wake slot for the current cooldown window BEFORE any send. Markers are O_EXCL files
+ *  `console/inbox-wake/<sha256(sid)>.w<cooldownMs>.<window>` where window = floor(now / cooldownMs). The high-water is MAX(window)
+ *  WITHIN THE SAME INTERVAL FAMILY (`w<cooldownMs>`), so a cooldown PARAMETER change never mis-compares window numbers of different
+ *  scales (IW-R4-P2-1): the new interval starts a FRESH family (empty ⇒ admits immediately), and old-interval markers are ignored for
+ *  this family's MAX and aged out by GC (FC-7). No separately-mutated high-water file ⇒ no "unconfirmed evidence authorizes" class:
  *   - the O_EXCL create is the SAME-window gate (20 concurrent / 8-in-a-row / cross-process ⇒ one winner) AND the sole durable
  *     evidence — a create fault ⇒ reject (never authorize on an unpersisted claim; FC-2 publish-after-fact);
- *   - MAX over the markers is MONOTONIC with no blind write: adding a lower marker can never lower the max, and the GC only ever
- *     deletes markers STRICTLY BELOW the top (keeps window and window-1), so a cleaned-then-re-created old window is rejected by the
- *     surviving higher markers — no CAS needed;
- *   - a readdir FAULT (EACCES, not ENOENT) ⇒ UNKNOWN ⇒ reject (fail-closed; never treated as "no markers = initial", FC-2 r3);
- *   - after creating our marker we RE-READ the max: if a concurrent LATER window already won, we yield (unlink + reject), so a paused
- *     late window can never ride in above a newer one.
- *  The sid is hashed to a safe single filename segment (any sid). Returns true iff THIS caller won a FRESH, confirmed top window. Never
- *  throws. */
+ *   - MAX over same-family window markers is monotonic with no blind write (a lower marker can't lower it; GC never deletes the top);
+ *   - a readdir FAULT (non-ENOENT) ⇒ UNKNOWN ⇒ reject (fail-closed, never "no markers = initial", FC-2 r3);
+ *   - after creating our marker we RE-READ the family MAX: a concurrent LATER window ⇒ yield (unlink + reject).
+ *  Each marker's CONTENT is the claim timestamp, used only by the age-based GC (parameter-independent) to retire this-family old windows
+ *  AND cross-interval orphans. Returns true iff THIS caller won a FRESH, confirmed top window of its interval family. Never throws. */
 export function claimWakeSlot(home: string, sid: string, now: number, cooldownMs: number): boolean {
   if (!sid || !Number.isFinite(now) || !(cooldownMs > 0)) return false;
   const dir = path.join(home, ".agenthop", "console", "inbox-wake");
   const safe = createHash("sha256").update(sid).digest("hex");
-  const prefix = `${safe}.`;
+  const sidPrefix = `${safe}.`;                      // ALL of this sid's markers (every interval family + legacy)
+  const famPrefix = `${safe}.w${cooldownMs}.`;       // only THIS interval family
   const window = Math.floor(now / cooldownMs);
-  const slot = path.join(dir, `${safe}.${window}`);
-  // MAX window marker: -1 when confirmed-empty (ENOENT dir / no markers); null when a read FAULT means we cannot tell (fail-closed).
-  const readMax = (): number | null => {
+  const slotName = `${safe}.w${cooldownMs}.${window}`;
+  const slot = path.join(dir, slotName);
+  // MAX window within THIS interval family: -1 confirmed-empty (ENOENT dir / none); null on read FAULT (fail-closed).
+  const readFamMax = (): number | null => {
     let names: string[];
     try { names = readdirSync(dir); } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? -1 : null; }
     let max = -1;
-    for (const n of names) { if (!n.startsWith(prefix)) continue; const w = Number(n.slice(prefix.length)); if (Number.isInteger(w) && w > max) max = w; }
+    for (const n of names) { if (!n.startsWith(famPrefix)) continue; const w = Number(n.slice(famPrefix.length)); if (Number.isInteger(w) && w > max) max = w; }
     return max;
   };
   try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return false; }
-  const max0 = readMax();
-  if (max0 === null) return false;              // read fault ⇒ UNKNOWN ⇒ fail-closed (never treat as initial)
-  if (window <= max0) return false;             // this window, or a later one, already claimed ⇒ stale/dup ⇒ reject (no blind write)
-  try { writeFileSync(slot, String(now), { flag: "wx", mode: 0o600 }); } catch { return false; } // O_EXCL + persist; any fault ⇒ no authorize
-  const max1 = readMax();
+  const max0 = readFamMax();
+  if (max0 === null) return false;                   // read fault ⇒ UNKNOWN ⇒ fail-closed
+  if (window <= max0) return false;                  // this/later window in THIS family already claimed ⇒ reject (no blind write)
+  try { writeFileSync(slot, String(now), { flag: "wx", mode: 0o600 }); } catch { return false; } // O_EXCL + persist(timestamp); fault ⇒ no authorize
+  const max1 = readFamMax();
   if (max1 === null || max1 > window) { try { unlinkSync(slot); } catch { /* ignore */ } return false; } // a concurrent LATER window won ⇒ yield
-  // Bounded GC — only AFTER our claim is confirmed the top. Delete markers strictly older than window-1 (keep window + window-1 as the
-  // high-water record), so the max marker is never removed by any claim ⇒ the high-water never regresses.
-  try { for (const n of readdirSync(dir)) { if (!n.startsWith(prefix)) continue; const w = Number(n.slice(prefix.length)); if (Number.isInteger(w) && w < window - 1) { try { unlinkSync(path.join(dir, n)); } catch { /* ignore */ } } } } catch { /* GC best-effort */ }
+  // Age-based GC (parameter-independent): retire any of this sid's markers whose timestamp is older than one cooldown — this family's
+  // superseded windows AND cross-interval orphans / legacy files. The just-won slot (ts = now) is always kept, so MAX never regresses.
+  try { for (const n of readdirSync(dir)) { if (!n.startsWith(sidPrefix) || n === slotName) continue; let ts = NaN; try { ts = Number(readFileSync(path.join(dir, n), "utf8").trim()); } catch { continue; } if (Number.isFinite(ts) && ts < now - cooldownMs) { try { unlinkSync(path.join(dir, n)); } catch { /* ignore */ } } } } catch { /* GC best-effort */ }
   return true;
 }
 

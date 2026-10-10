@@ -32,9 +32,9 @@ ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite cloc
     ok(claimWakeSlot(HOME, "c", w(8) + 2, COOL) === false, "claimWakeSlot: a late window-8 re-claim with the marker still present ⇒ EEXIST reject");
     // IW-P2-1 cross-window interleave: simulate GC/cleanup removing window 8's marker, then a LATE window-8 request resuming.
     const safe = createHash("sha256").update("c").digest("hex");
-    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.8`), { force: true });
-    ok(claimWakeSlot(HOME, "c", w(8) + 3, COOL) === false, "IW-P2-1: a REOPENED (GC'd) old window is rejected by the monotonic high-water — cleanup cannot re-admit");
-    ok(claimWakeSlot(HOME, "c", w(10), COOL) === true, "claimWakeSlot: a genuinely newer window (10 > hw 9) still claims");
+    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.w${COOL}.8`), { force: true });
+    ok(claimWakeSlot(HOME, "c", w(8) + 3, COOL) === false, "IW-P2-1: a REOPENED (GC'd) old window is rejected by the family MAX — cleanup cannot re-admit");
+    ok(claimWakeSlot(HOME, "c", w(10), COOL) === true, "claimWakeSlot: a genuinely newer window (10 > fam-max 9) still claims");
     ok(claimWakeSlot(HOME, "..", w(8), COOL) === true, "claimWakeSlot: a reserved-dot sid is a safe hashed filename (no traversal)");
     ok(claimWakeSlot(HOME, "c", NaN, COOL) === false, "claimWakeSlot: bad clock ⇒ fail-safe, no claim");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
@@ -59,6 +59,22 @@ ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite cloc
     try { created = claimWakeSlot(HOME, "c", w(14), COOL); } finally { chmodSync(dir, 0o700); }
     ok(created === false, "③ create/persist fault ⇒ not authorized (publish-after-fact: no marker ⇒ no inject)");
     ok(claimWakeSlot(HOME, "c", w(15), COOL) === true, "after faults clear, a genuinely new window still claims (max intact)");
+  } finally { rmSync(HOME, { recursive: true, force: true }); }
+}
+// IW-R4-P2-1: a cooldown PARAMETER change must not let old window numbers block new wakes (interval-family scoping).
+{
+  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakeparam-"));
+  const C60 = 60_000, C120 = 120_000;
+  try {
+    // 60s cooldown: claim at t=1_000_000 (60s window 16).
+    ok(claimWakeSlot(HOME, "c", 1_000_000, C60) === true, "param: 60s claim at t=1,000,000 (window 16) wins");
+    // restart to 120s, clock +240s (t=1,240,000; 120s window 10). Under a shared window sequence 10<=16 would FALSELY reject.
+    ok(claimWakeSlot(HOME, "c", 1_240_000, C120) === true, "IW-R4-P2-1: 60→120 then +240s ⇒ NEW interval family admits (old window 16 does not block window 10)");
+    // reverse: another target, 120s then 60s.
+    ok(claimWakeSlot(HOME, "d", 1_000_000, C120) === true, "param: 120s claim (window 8) wins");
+    ok(claimWakeSlot(HOME, "d", 1_240_000, C60) === true, "IW-R4-P2-1 reverse: 120→60 then +240s ⇒ new family admits (window 20)");
+    // same-interval cooldown still holds within a family: a re-send in the SAME 60s window is rejected.
+    ok(claimWakeSlot(HOME, "d", 1_245_000, C60) === false, "within the new 60s family, a re-send in the same window (20) is still rejected");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
 
