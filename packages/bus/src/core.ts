@@ -9,7 +9,7 @@ import { readStatusFile, watchStatusDir } from "./statusfile.js";
 import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, poisonNoticeKey } from "./inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, poisonNoticeSource } from "./inbox.js";
 import { resolveInboxTarget, isValidSessionId } from "./send-fallback.js";
 import { resolveSession, listSessions, probeSessionAlive } from "./swarm/task-liveness.js";
 import { reportCheckIn, deliverToCoordinator } from "./checkin.js";
@@ -220,19 +220,19 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
                 continue;
               }
             } else {
-              // PD-P2-2 + PD-R4-P2-1: record the quarantine INTENT durably BEFORE the move (keyed per event ⇒ idempotent), so the
-              // obligation survives a notice-write failure AND a retry overwrites rather than piling up. Only AFTER the move
-              // CONFIRMS do we upgrade the same record to "quarantined" — the drain delivers ONLY confirmed records, so no
-              // premature/duplicate "已隔离" report. If the intent can't be persisted, do NOT quarantine (keep source + strike).
-              const key = poisonNoticeKey(claimed[i].file);
+              // PD-P2-2 + PD-R4-P2-1 + PD-R5-P2-2: persist the durable obligation (bound to this poison EVENT, keyed by source ⇒
+              // idempotent) BEFORE the quarantine move, so it survives a notice-write failure and a retry overwrites rather than
+              // piling up. We do NOT write a separate "confirmed" flag afterwards — the drain VERIFIES the quarantine on the
+              // filesystem (the quarantined bytes are the proof) before delivering, so no premature "已隔离" report and no crash/
+              // write-fault window that could strand it. If the obligation can't be persisted, do NOT quarantine (keep source+strike).
+              const source = poisonNoticeSource(claimed[i].file);
               const notice = buildPoisonS19(self.stableId ?? self.id, self.title, claimed[i].msg, strikes, threw);
-              if (enqueuePoisonNotice(home, key, coord, notice, "pending") &&
+              if (enqueuePoisonNotice(home, source, coord, notice) &&
                   quarantineInbox(home, claimed[i].file, qReason, JSON.stringify(claimed[i].msg)) !== "failed") {
                 clearPoisonStrikes(claimed[i].file, poisonStrikes);
-                enqueuePoisonNotice(home, key, coord, notice, "quarantined"); // CONFIRMED ⇒ upgrade the SAME record to the deliverable fact
-                continue; // poison removed + obligation secured ⇒ try the rest of the batch
+                continue; // poison removed + obligation persisted ⇒ the drain verifies + delivers; try the rest of the batch
               }
-              // else: fall through to release+bail — source + strike retained, retried next flush (idempotent by key)
+              // else: fall through to release+bail — source + strike retained, retried next flush (idempotent by source)
             }
           }
         }

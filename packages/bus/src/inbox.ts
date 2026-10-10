@@ -356,49 +356,61 @@ export function buildPoisonS19(mySid: string, myLabel: string, poison: InboxMsg,
  *  obligation). Each obligation is a file here; a later flush (any process) re-scans and delivers it, deleting only after a
  *  CONFIRMED send. Under `.agenthop/swarm/` (NOT an inbox key) so claimInbox/inboxKeys never touch it. */
 function poisonNoticeDir(home: string): string { return path.join(home, ".agenthop", "swarm", "poison-notices"); }
-/** Legacy queue files (no bound target) are moved HERE — kept + exposed for manual migration, never target-guessed nor deleted
- *  (PD-R3-P1-1 A / FC-7). A subdir of the queue (no `.json` of its own) so the drain scan never re-reads it. */
+/** Prior-version / legacy queue files are MOVED here — kept + exposed for manual migration, never target-guessed nor deleted
+ *  (FC-7 / PD-R5-P2-1 / PD-R3-P1-1 A). A subdir of the queue (no `.json` of its own) so the drain scan never re-reads it. */
 function poisonMigrationDir(home: string): string { return path.join(poisonNoticeDir(home), "needs-migration"); }
 
-/** FC-2 — a persisted notice binds its TARGET coordinator (PD-R3-P1-1: the queue is machine-global, so a drainer must deliver to
- *  the record's OWN target, never substitute its own SWARM_COORDINATOR) and a STATUS (PD-R4-P2-1): "pending" = the quarantine
- *  INTENT, recorded BEFORE the move so the obligation survives a notice-write failure (PD-P2-2); "quarantined" = the move is
- *  CONFIRMED, so the success fact may be delivered. Only a "quarantined" record is ever delivered. */
-type PoisonStatus = "pending" | "quarantined";
-type PoisonNotice = { schema: "poison-notice/v1"; target: string; status: PoisonStatus; msg: InboxMsg };
+/** FC-2 — a persisted notice (schema v2) binds its TARGET coordinator (PD-R3-P1-1: deliver to the record's OWN target, never the
+ *  drainer's SWARM_COORDINATOR) and the SOURCE message path (PD-R4-P2-1 / PD-R5-P2-2: the drain delivers ONLY after it VERIFIES
+ *  from the filesystem that the source was really quarantined — the quarantined bytes are the proof, so no separately-written
+ *  "confirmed" flag can be lost to a crash or a write fault). Written BEFORE the quarantine move so the obligation survives a
+ *  notice-write failure (PD-P2-2). */
+type PoisonNotice = { schema: "poison-notice/v2"; target: string; source: string; msg: InboxMsg };
 
-/** FC-2 (PD-R4-P2-1) — the deterministic queue key for a poison EVENT (the message's stable base, minus any `.claim-<pid>`), so a
- *  retry OVERWRITES the same record instead of piling up duplicate reports. Pure. */
-export function poisonNoticeKey(file: string): string {
-  return createHash("sha256").update(stableBase(file)).digest("hex").slice(0, 32);
-}
+/** FC-2 — the stable SOURCE path of a (claimed) message file, minus any `.claim-<pid>` — identifies the poison EVENT. Pure. */
+export function poisonNoticeSource(file: string): string { return stableBase(file); }
+/** The deterministic queue filename key for a source (so a retry OVERWRITES the same record, never piling up). Pure. */
+function keyForSource(source: string): string { return createHash("sha256").update(source).digest("hex").slice(0, 32); }
 
-/** Parse a queue file. New form = {schema:"poison-notice/v1",target,status,msg}. A LEGACY bare-InboxMsg file (an earlier format)
- *  is recognized as `legacy` — NEVER target-guessed (PD-R3-P1-1 A) and never deleted as corrupt (FC-7). A read-OK but
- *  structurally invalid file ⇒ null (corrupt). Pure. */
-function parsePoisonNotice(raw: string): { legacy: false; target: string; status: PoisonStatus; msg: InboxMsg } | { legacy: true } | null {
+/** Parse a queue file. Current form = schema "poison-notice/v2" {target,source,msg}. A PRIOR bound version (schema
+ *  "poison-notice/v1") OR a LEGACY bare-InboxMsg file is recognized as `migrate` — kept + exposed for manual migration, NEVER
+ *  target-guessed and NEVER deleted (FC-7 / PD-R5-P2-1 / PD-R3-P1-1 A). A read-OK but structurally invalid file => null (corrupt). */
+function parsePoisonNotice(raw: string): { kind: "current"; target: string; source: string; msg: InboxMsg } | { kind: "migrate" } | null {
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { return null; }
-  if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) && (parsed as { schema?: unknown }).schema === "poison-notice/v1") {
-    const t = (parsed as { target?: unknown }).target;
-    const s = (parsed as { status?: unknown }).status;
-    const m = validInboxMsg((parsed as { msg?: unknown }).msg);
-    if (typeof t === "string" && t.length > 0 && (s === "pending" || s === "quarantined") && m) return { legacy: false, target: t, status: s, msg: m };
-    return null; // declared v1 but malformed ⇒ corrupt
+  if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+    const schema = (parsed as { schema?: unknown }).schema;
+    if (schema === "poison-notice/v2") {
+      const t = (parsed as { target?: unknown }).target;
+      const s = (parsed as { source?: unknown }).source;
+      const m = validInboxMsg((parsed as { msg?: unknown }).msg);
+      if (typeof t === "string" && t.length > 0 && typeof s === "string" && s.length > 0 && m) return { kind: "current", target: t, source: s, msg: m };
+      return null; // malformed v2 => corrupt
+    }
+    if (schema === "poison-notice/v1") return { kind: "migrate" }; // PD-R5-P2-1: a prior bound version — import, never delete
   }
-  return validInboxMsg(parsed) ? { legacy: true } : null; // FC-7: a bare-InboxMsg legacy record (never target-guessed)
+  return validInboxMsg(parsed) ? { kind: "migrate" } : null; // FC-7: a bare-InboxMsg legacy record (never target-guessed)
 }
 
-/** FC-2 (PD-P2-2 / PD-R4-P2-1) — write/overwrite the durable obligation for a poison EVENT (keyed by `key` ⇒ idempotent; a retry
- *  reuses the same record, never piling up). `status`: "pending" = recorded BEFORE the quarantine move so the obligation survives
- *  a notice-write failure; "quarantined" = the move CONFIRMED ⇒ now deliverable. Atomic tmp+rename. Returns TRUE on success /
- *  FALSE on any write fault — the caller MUST keep the source + strike when this fails. Never throws. */
-export function enqueuePoisonNotice(home: string, key: string, target: string, notice: InboxMsg, status: PoisonStatus): boolean {
+/** FC-2 — is the poison SOURCE actually quarantined? quarantineInbox links the bytes to `<dir>/quarantine/<base>.<ts>.<hex>`, so a
+ *  file there whose name starts with the source basename is proof the move happened. The drain uses this instead of a separately
+ *  -persisted "confirmed" flag, so a crash or write fault between the move and a flag write can never strand the report
+ *  (PD-R5-P2-2). A missing/unreadable quarantine dir => not confirmed (keep + retry). Pure over the fs. */
+function isQuarantineConfirmed(source: string): boolean {
+  const qdir = path.join(path.dirname(source), "quarantine");
+  const prefix = `${path.basename(source)}.`; // quarantined name = "<base>.<ts>.<hex>"
+  try { return readdirSync(qdir).some((n) => n.startsWith(prefix)); } catch { return false; }
+}
+
+/** FC-2 (PD-P2-2) — persist the durable obligation for a poison EVENT BEFORE its quarantine move (keyed by the source =>
+ *  idempotent; a retry OVERWRITES, never piling up). Atomic tmp+rename. Returns TRUE on success / FALSE on any write fault — the
+ *  caller MUST keep the source + strike when this fails (never quarantine-then-lose the obligation). Never throws. */
+export function enqueuePoisonNotice(home: string, source: string, target: string, notice: InboxMsg): boolean {
   try {
     const dir = poisonNoticeDir(home);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const rec: PoisonNotice = { schema: "poison-notice/v1", target, status, msg: notice };
-    const file = path.join(dir, `${key}.json`);
+    const rec: PoisonNotice = { schema: "poison-notice/v2", target, source, msg: notice };
+    const file = path.join(dir, `${keyForSource(source)}.json`);
     const tmp = `${file}.tmp-${randomBytes(4).toString("hex")}`;
     writeFileSync(tmp, JSON.stringify(rec), { mode: 0o600 });
     renameSync(tmp, file);
@@ -406,31 +418,32 @@ export function enqueuePoisonNotice(home: string, key: string, target: string, n
   } catch { return false; } // caller keeps the source + strike (PD-P2-2) when the obligation can't be persisted
 }
 
-/** FC-2 — the deterministic re-scan entry. Delivers ONLY CONFIRMED ("quarantined") records to their BOUND target (PD-R4-P2-1 +
- *  PD-R3-P1-1): a "pending" record is a not-yet-confirmed intent ⇒ LEFT in place (never a premature success report); a LEGACY
- *  bare record is MOVED to needs-migration/ (kept + exposed, never target-guessed, never deleted, PD-R3-P1-1 A / FC-7); a
- *  read-OK-but-invalid file is dropped as corrupt; a READ ERROR or missing file is KEPT (PD-R3-P2-1). `deliver` gets the record's
- *  own target and returns "sent"/"skip" (⇒ delete) or "retry" (⇒ keep). The caller gates this on SWARM_POISON_DLQ. Never throws. */
+/** FC-2 — the deterministic re-scan entry. A "migrate" record (a prior bound version or a legacy bare msg) is MOVED to
+ *  needs-migration/ (kept + exposed, never target-guessed/deleted, FC-7 / PD-R5-P2-1 / PD-R3-P1-1 A); a corrupt (read-OK but
+ *  invalid) file is dropped; a READ ERROR or missing file is KEPT (PD-R3-P2-1). A "current" record is delivered to its BOUND
+ *  target ONLY ONCE its quarantine is VERIFIED on the filesystem (PD-R4-P2-1: never a premature success; PD-R5-P2-2: the fs is
+ *  the recoverable confirmation, so a crash/write fault can't strand it) — else KEPT. `deliver` returns "sent"/"skip" (=> delete)
+ *  or "retry" (=> keep). The caller gates this on SWARM_POISON_DLQ. Never throws. */
 export function drainPoisonNotices(home: string, deliver: (target: string, msg: InboxMsg) => "sent" | "retry" | "skip", cap = 64): void {
   const dir = poisonNoticeDir(home);
   let names: string[];
-  try { names = readdirSync(dir).filter((n) => n.endsWith(".json")).sort(); } catch { return; } // no dir ⇒ nothing pending
+  try { names = readdirSync(dir).filter((n) => n.endsWith(".json")).sort(); } catch { return; } // no dir => nothing pending
   let processed = 0;
   for (const n of names) {
     if (processed >= cap) break; // bound the per-tick batch; the rest drain next flush
     const f = path.join(dir, n);
     let raw: string;
-    try { raw = readFileSync(f, "utf8"); } catch { continue; } // gone OR a transient read error (EACCES/EIO) ⇒ KEEP (PD-R3-P2-1)
+    try { raw = readFileSync(f, "utf8"); } catch { continue; } // gone OR a transient read error (EACCES/EIO) => KEEP (PD-R3-P2-1)
     const rec = parsePoisonNotice(raw);
-    if (rec === null) { try { unlinkSync(f); } catch { /* gone */ } continue; } // read OK but invalid ⇒ corrupt ⇒ drop
-    if (rec.legacy) { // FC-7 / PD-R3-P1-1 A: never guess a target — move aside (keep + expose), never deliver, never delete
+    if (rec === null) { try { unlinkSync(f); } catch { /* gone */ } continue; } // read OK but invalid => corrupt => drop
+    if (rec.kind === "migrate") { // FC-7 / PD-R5-P2-1 / PD-R3-P1-1 A: keep + expose, never guess/deliver/delete
       try { mkdirSync(poisonMigrationDir(home), { recursive: true, mode: 0o700 }); renameSync(f, path.join(poisonMigrationDir(home), n)); } catch { /* best-effort; leave in place if the move fails */ }
       continue;
     }
-    if (rec.status !== "quarantined") continue; // PD-R4-P2-1: a pending intent is not a confirmed fact ⇒ never deliver it
+    if (!isQuarantineConfirmed(rec.source)) continue; // PD-R4-P2-1 / PD-R5-P2-2: quarantine not yet verified => keep (no premature/false report)
     processed += 1;
     let r: "sent" | "retry" | "skip";
-    try { r = deliver(rec.target, rec.msg); } catch { r = "retry"; } // a throwing deliver ⇒ keep + retry
-    if (r !== "retry") { try { unlinkSync(f); } catch { /* gone */ } } // delivered or permanently-skipped ⇒ discharged
+    try { r = deliver(rec.target, rec.msg); } catch { r = "retry"; } // a throwing deliver => keep + retry
+    if (r !== "retry") { try { unlinkSync(f); } catch { /* gone */ } } // delivered or permanently-skipped => discharged
   }
 }
