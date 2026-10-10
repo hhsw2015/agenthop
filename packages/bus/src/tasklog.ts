@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
-import { type ResolutionLevel } from "./swarm/attribution.js";
+import { isResolutionLevel, type ResolutionLevel } from "./swarm/attribution.js";
 
 /**
  * The task log: the durable, on-disk envelope for "one unit of work handed to one or more sessions".
@@ -185,9 +185,9 @@ export function createTask(
     results: [],
     ...(input.goal ? { goal: input.goal } : {}),
     ...(input.role ? { role: input.role } : {}),
-    // attribution-chain seam (dormant): carried through only when a caller computes it (SWARM_ATTRIBUTION on).
-    ...(input.accountableHuman ? { accountableHuman: input.accountableHuman } : {}),
-    ...(input.resolutionLevel ? { resolutionLevel: input.resolutionLevel } : {}),
+    // attribution-chain seam (dormant): carried through only as a COMPLETE pair (both set), and only when a
+    // caller computed it (SWARM_ATTRIBUTION on). A lone half is never stored (atomic with the read-side guard).
+    ...(input.accountableHuman && input.resolutionLevel ? { accountableHuman: input.accountableHuman, resolutionLevel: input.resolutionLevel } : {}),
   };
   return writeTask(home, rec) ? rec : undefined;
 }
@@ -231,6 +231,15 @@ export function parseTask(raw: string): TaskRecord | undefined {
     if (typeof r.dispatchedBy !== "string") return undefined;
     if (!Array.isArray(r.assignees) || !Array.isArray(r.results)) return undefined;
     if (typeof r.createdAt !== "number" || typeof r.updatedAt !== "number") return undefined;
+    // AC-1: the optional attribution pair is a SOURCE tag — only a COMPLETE, well-formed pair (a non-empty
+    // string human + a canonical level) may enter the returned record. An unknown level, a non-string human,
+    // or a lone half ⇒ DEGRADE the attribution to absent (drop both) so corrupt/unknown metadata never persists
+    // as a valid Attribution — the base task stays readable (never reject the whole record). TS cannot guard
+    // disk JSON, so validate here with the same helper the module exports.
+    if (!(typeof r.accountableHuman === "string" && r.accountableHuman.trim().length > 0 && isResolutionLevel(r.resolutionLevel))) {
+      delete r.accountableHuman;
+      delete r.resolutionLevel;
+    }
     return r;
   } catch {
     return undefined;

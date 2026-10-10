@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { attributionEnabled, resolveAccountable, isResolutionLevel, RESOLUTION_LEVELS, type AttributionInput } from './attribution.js';
-import { createTask, readTask, parseTask } from '../tasklog.js';
+import { createTask, readTask, parseTask, applyResult, taskLogDir } from '../tasklog.js';
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error('FAILED: ' + n); console.log('ok  ' + n); };
 
@@ -51,6 +51,33 @@ t('FC-6: a higher level ALWAYS wins regardless of order of other fields (no late
     const legacy = { taskId: "t-legacy-0001", dispatchedBy: "old", assignees: ["x"], state: "PENDING", createdAt: 1, updatedAt: 1, results: [] };
     const lp = parseTask(JSON.stringify(legacy));
     t('FC-7: a legacy record (no attribution fields) parses, fields undefined', !!lp && lp.accountableHuman === undefined && lp.resolutionLevel === undefined);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+// ---------------- AC-1: read-side validation of the ledger attribution pair ----------------
+{
+  const base = { taskId: "t-ac1-0001", dispatchedBy: "d", assignees: ["w"], state: "PENDING", createdAt: 1, updatedAt: 1, results: [] };
+  const p = (extra: Record<string, unknown>) => parseTask(JSON.stringify({ ...base, ...extra }));
+  const dropped = (r: ReturnType<typeof parseTask>) => !!r && r.accountableHuman === undefined && r.resolutionLevel === undefined;
+  t('AC-1: unknown level string ⇒ attribution dropped, base task kept', (() => { const r = p({ accountableHuman: "u", resolutionLevel: "bogus" }); return dropped(r) && r!.taskId === "t-ac1-0001"; })());
+  t('AC-1: numeric level ⇒ dropped', dropped(p({ accountableHuman: "u", resolutionLevel: 7 as unknown as string })));
+  t('AC-1: non-string human (object/array/null) ⇒ dropped', dropped(p({ accountableHuman: {} as unknown as string, resolutionLevel: "direct" })) && dropped(p({ accountableHuman: [] as unknown as string, resolutionLevel: "direct" })) && dropped(p({ accountableHuman: null as unknown as string, resolutionLevel: "direct" })));
+  t('AC-1: empty/whitespace human ⇒ dropped', dropped(p({ accountableHuman: "   ", resolutionLevel: "direct" })));
+  t('AC-1: a lone half (human without level, or level without human) ⇒ dropped', dropped(p({ accountableHuman: "u" })) && dropped(p({ resolutionLevel: "direct" })));
+  t('AC-1: a COMPLETE valid pair is kept', (() => { const r = p({ accountableHuman: "wowdd1", resolutionLevel: "delegated" }); return !!r && r.accountableHuman === "wowdd1" && r.resolutionLevel === "delegated"; })());
+
+  // real-disk regression: a corrupt record on disk → read drops the bad attribution → write-back (applyResult)
+  // → re-read is clean, and the base task survived + the result applied.
+  const home = mkdtempSync(join(tmpdir(), 'attr-ac1-'));
+  try {
+    mkdirSync(taskLogDir(home), { recursive: true });
+    const badId = "t-ac1-disk-01";
+    writeFileSync(join(taskLogDir(home), `${badId}.json`), JSON.stringify({ taskId: badId, dispatchedBy: "d", assignees: ["w"], state: "PENDING", createdAt: 1, updatedAt: 1, results: [], accountableHuman: { evil: 1 }, resolutionLevel: "unrecognized" }));
+    const read1 = readTask(home, badId)!;
+    t('AC-1 disk: readTask drops the corrupt attribution, keeps the base task', read1.accountableHuman === undefined && read1.resolutionLevel === undefined && read1.dispatchedBy === "d" && read1.assignees[0] === "w");
+    applyResult(home, badId, { launchId: "w", state: "done" });
+    const read2 = readTask(home, badId)!;
+    t('AC-1 disk: after apply+write-back, disk is clean of the illegal attribution', read2.accountableHuman === undefined && read2.resolutionLevel === undefined && read2.results.some((x) => x.launchId === "w"));
   } finally { rmSync(home, { recursive: true, force: true }); }
 }
 
