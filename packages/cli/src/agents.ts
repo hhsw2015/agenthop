@@ -203,6 +203,7 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
   // approval's tool runs — success or failure — there is no dedicated "unblocked" event); idle on stop,
   // including a turn that ended on an API error (StopFailure) so it never sticks at `working`; blocked the
   // instant an approval is requested. (All event names verified against the Claude Code hooks reference.)
+  const delegate = approvalDelegateOn(); // approval-delegation: PermissionRequest becomes a SYNC permission-gate when on
   const events = [
     // SessionStart only on startup/resume — NOT compact (a mid-turn compaction fires SessionStart too, and
     // an unmatched idle would flip a working turn to idle and wrongly satisfy a wait-for-idle).
@@ -212,9 +213,14 @@ export function installClaudeStatusHooks(bin: string, home = homedir()): string 
     { event: "PostToolUseFailure", state: "working" },
     { event: "Stop", state: "idle" },
     { event: "StopFailure", state: "idle" },
-    { event: "PermissionRequest", state: "blocked" },
+    // PermissionRequest is the async `blocked` hook UNLESS approval-delegation is on — then it becomes the SYNC permission-gate
+    // (installed below), so the hook can RETURN a delegated allow. Claude only (constraint ④).
+    ...(delegate ? [] : [{ event: "PermissionRequest", state: "blocked" }]),
   ];
-  const changed = mergeStatusHookEvents(config, events, bin, (command, matcher) => ({ ...(matcher ? { matcher } : {}), hooks: [{ type: "command", command, async: true }] }));
+  let changed = mergeStatusHookEvents(config, events, bin, (command, matcher) => ({ ...(matcher ? { matcher } : {}), hooks: [{ type: "command", command, async: true }] }));
+  // approval-delegation: when ON, flip PermissionRequest to the sync permission-gate; when OFF, strip any stale gate hook so a
+  // flag toggle back to OFF cleanly restores the async blocked hook mergeStatusHookEvents just (re)installed.
+  changed += delegate ? installApprovalGateHook(config, bin) : stripPermissionRequestHooks(config, [APPROVAL_GATE_SENTINEL]);
   if (changed === 0) return t(`${file} already has agenthop status hooks; nothing changed`, `${file} 里已有 agenthop 状态 hook，没有改动`);
   placeJson(file, config);
   return t(`wrote ${changed} status hook change(s) to ${file}`, `已写 ${changed} 处状态 hook 改动到 ${file}`);
@@ -413,6 +419,55 @@ function ownedBy(command: unknown, mark: string): command is string {
 function statusHookCommand(bin: string, state: string): string {
   const q = shQuote(bin); // POSIX single-quote so a path with $()/backtick/space can't be expanded by the shell
   return `_ahT=$(${statusHookTimeMs()} 2>/dev/null); ${q} report-status ${state} \${_ahT:+--seq "\$_ahT"} >/dev/null 2>&1 || true ${sentinelFor(state)}`;
+}
+
+// --- approval-delegation (IO round ①): the SYNC PermissionRequest hook. Installed for CLAUDE members ONLY (constraint ④ — Codex
+// has no decision-returning permission hook), and ONLY when SWARM_APPROVAL_DELEGATE is on; otherwise PermissionRequest stays the
+// async `report-status blocked` hook exactly as today. The flag read is DUPLICATED here on purpose: cli must not import bus
+// (bus→cli already; a cli→bus import would cycle), and the hook is just a command string, so no bus import is needed. ---
+function approvalDelegateOn(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(1|true|yes|on)$/i.test(env.SWARM_APPROVAL_DELEGATE ?? "");
+}
+const APPROVAL_GATE_SENTINEL = "# agenthop-approval-gate";
+// ≥ APPROVAL_POLL_SEC (15, approval-delegation.ts) so the member's bounded poll completes before the sync hook times out.
+// NOTE (verify before enabling): the Claude settings.json hook `timeout` unit is taken as SECONDS here, matching the Codex hook.
+const APPROVAL_GATE_TIMEOUT_SEC = 20;
+function approvalGateCommand(bin: string): string {
+  const q = shQuote(bin);
+  // SYNC: reads the PermissionRequest payload on stdin, prints the decision JSON to STDOUT (never suppressed — it is the
+  // protocol), stderr discarded, exit forced 0 so a fault can never break the agent (⇒ no decision ⇒ user dialog).
+  return `${q} permission-gate 2>/dev/null || true ${APPROVAL_GATE_SENTINEL}`;
+}
+/** Remove our PermissionRequest hooks matching `marks` (endsWith sentinel), dropping groups we empty but NEVER touching a
+ *  user's own hook/group. Returns the count removed. Never throws. */
+function stripPermissionRequestHooks(config: Record<string, unknown>, marks: string[]): number {
+  try {
+    const hooks = config.hooks as Record<string, unknown> | undefined;
+    const arr = hooks?.PermissionRequest;
+    if (!Array.isArray(arr)) return 0;
+    let removed = 0;
+    const kept = arr.map((g) => {
+      const grp = g as { hooks?: Array<{ command?: unknown }> };
+      if (!Array.isArray(grp.hooks)) return g;
+      const h2 = grp.hooks.filter((h) => !marks.some((m) => ownedBy(h.command, m)));
+      removed += grp.hooks.length - h2.length;
+      return { ...grp, hooks: h2 };
+    }).filter((g) => { const grp = g as { hooks?: unknown[] }; return !Array.isArray(grp.hooks) || grp.hooks.length > 0; });
+    (hooks as Record<string, unknown>).PermissionRequest = kept;
+    return removed;
+  } catch { return 0; } // install must never throw
+}
+/** Install the SYNC permission-gate hook (idempotent: strips OUR prior PermissionRequest hooks — async blocked AND any prior
+ *  gate — first, then adds the gate group). Returns the change count. */
+function installApprovalGateHook(config: Record<string, unknown>, bin: string): number {
+  try {
+    const removed = stripPermissionRequestHooks(config, [sentinelFor("blocked"), APPROVAL_GATE_SENTINEL]);
+    const hooks = (config.hooks ??= {}) as Record<string, unknown>;
+    const arr = (hooks.PermissionRequest ??= []) as unknown[];
+    if (!Array.isArray(arr)) return removed;
+    arr.push({ hooks: [{ type: "command", command: approvalGateCommand(bin), async: false, timeout: APPROVAL_GATE_TIMEOUT_SEC }] });
+    return removed + 1;
+  } catch { return 0; }
 }
 
 /**

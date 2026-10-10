@@ -188,6 +188,54 @@ describe("plugging into agents as an MCP server", () => {
     expect((cfg2.hooks.Stop as unknown[]).length).toBe(2); // user's + ours, no duplicate
   });
 
+  it("approval-delegation OFF (default): PermissionRequest stays the async report-status blocked hook", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    const prev = process.env.SWARM_APPROVAL_DELEGATE; delete process.env.SWARM_APPROVAL_DELEGATE;
+    try {
+      installClaudeStatusHooks(BIN, dir);
+      const cfg = JSON.parse(await readFile(file, "utf8"));
+      const pr = cfg.hooks.PermissionRequest as { hooks: { command: string; async?: boolean }[] }[];
+      const flat = pr.flatMap((g) => g.hooks);
+      expect(flat.some((h) => h.command.includes("report-status blocked") && h.async === true)).toBe(true);
+      expect(flat.some((h) => h.command.includes("permission-gate"))).toBe(false); // dormant: no gate hook
+    } finally { if (prev === undefined) delete process.env.SWARM_APPROVAL_DELEGATE; else process.env.SWARM_APPROVAL_DELEGATE = prev; }
+  });
+
+  it("approval-delegation ON: PermissionRequest becomes the SYNC permission-gate hook (async:false), no blocked hook", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    const prev = process.env.SWARM_APPROVAL_DELEGATE; process.env.SWARM_APPROVAL_DELEGATE = "1";
+    try {
+      installClaudeStatusHooks(BIN, dir);
+      const cfg = JSON.parse(await readFile(file, "utf8"));
+      const pr = cfg.hooks.PermissionRequest as { hooks: { command: string; async?: boolean; timeout?: number }[] }[];
+      const flat = pr.flatMap((g) => g.hooks);
+      const gate = flat.find((h) => h.command.includes("permission-gate"));
+      expect(gate).toBeDefined();
+      expect(gate!.async).toBe(false);           // SYNC — it must be able to RETURN a decision
+      expect(gate!.timeout).toBeGreaterThanOrEqual(15); // >= APPROVAL_POLL_SEC so the poll completes
+      expect(flat.some((h) => h.command.includes("report-status blocked"))).toBe(false); // the async blocked hook is replaced
+      // other events are unaffected by the flag
+      const cmds = (e: string) => (cfg.hooks[e] as { hooks: { command: string }[] }[]).flatMap((g) => g.hooks.map((h) => h.command));
+      expect(cmds("Stop").some((c) => c.includes("report-status idle"))).toBe(true);
+    } finally { if (prev === undefined) delete process.env.SWARM_APPROVAL_DELEGATE; else process.env.SWARM_APPROVAL_DELEGATE = prev; }
+  });
+
+  it("approval-delegation toggle ON then OFF restores the async blocked hook (no stale gate left)", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    const prev = process.env.SWARM_APPROVAL_DELEGATE;
+    try {
+      process.env.SWARM_APPROVAL_DELEGATE = "1"; installClaudeStatusHooks(BIN, dir);
+      delete process.env.SWARM_APPROVAL_DELEGATE; installClaudeStatusHooks(BIN, dir);
+      const cfg = JSON.parse(await readFile(file, "utf8"));
+      const flat = (cfg.hooks.PermissionRequest as { hooks: { command: string; async?: boolean }[] }[]).flatMap((g) => g.hooks);
+      expect(flat.some((h) => h.command.includes("permission-gate"))).toBe(false); // stale gate stripped
+      expect(flat.some((h) => h.command.includes("report-status blocked") && h.async === true)).toBe(true); // async blocked restored
+    } finally { if (prev === undefined) delete process.env.SWARM_APPROVAL_DELEGATE; else process.env.SWARM_APPROVAL_DELEGATE = prev; }
+  });
+
   it("does not clobber a user hook that merely mentions report-status (ownership via sentinel)", async () => {
     const dir = await home();
     const file = path.join(dir, ".claude", "settings.json");
