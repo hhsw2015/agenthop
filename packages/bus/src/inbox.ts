@@ -164,41 +164,7 @@ export function writeInbox(home: string, key: string, msg: InboxMsg, idempotency
   if (valid === null) throw new Error("writeInbox: refusing to publish an invalid inbox message (from/fromLabel/text must be strings, via a non-empty string, ts a finite number)");
   const dir = inboxDir(home, key);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  // A stable `idempotencyKey` ⇒ exactly-once publication of one logical EVENT, dedup'd by a durable PUBLISHED marker — the
-  // sender-side delivery credential. The message .json is the delivery TARGET (claim renames it, ack deletes it), so its mere
-  // presence can NEVER prove delivery: once consumed, a naive re-send would re-create it (a second consumable copy). The marker
-  // lives in a `.published/` sidecar (like quarantine/, invisible to claimInbox) that NO claim/ack ever touches, so it survives
-  // claim, ack and restart. Recovery verifies it atomically: present ⇒ this event was already published ⇒ no-op. (digest MD-P2-1)
-  if (idempotencyKey !== undefined && /^[A-Za-z0-9._-]{1,120}$/.test(idempotencyKey)) {
-    const pubDir = path.join(dir, ".published");
-    const marker = path.join(pubDir, idempotencyKey);
-    if (existsSync(marker)) return; // already published this event (survives the consumed/absent message file) ⇒ idempotent no-op
-    // FC-7 migration: an IDENTICAL notice already published under a legacy RANDOM name (pre-key) must not be duplicated by the new
-    // key. Adopt it — record the marker, keep the legacy message, skip the new write — so the old keyless record is migrated into
-    // the keyed dedup ledger instead of co-existing as a second copy. Scoped to a matching non-empty taskRef + identical text so
-    // distinct keyless messages (no taskRef) are never collapsed. Best-effort scan; a read fault just falls through to a fresh write.
-    if (typeof valid.taskRef === "string" && valid.taskRef.length > 0) {
-      let names: string[] = [];
-      try { names = readdirSync(dir).filter((n) => n.endsWith(".json") && n !== `${idempotencyKey}.json`); } catch { /* unreadable ⇒ no legacy */ }
-      for (const n of names) {
-        let prior: unknown;
-        try { prior = JSON.parse(readFileSync(path.join(dir, n), "utf8")); } catch { continue; }
-        if (prior !== null && typeof prior === "object" && (prior as InboxMsg).taskRef === valid.taskRef && (prior as InboxMsg).text === valid.text) {
-          writePublishedMarker(pubDir, marker, valid.ts); // migrate the legacy keyless publication into the keyed ledger
-          return;
-        }
-      }
-    }
-    // Publish the message FIRST (deterministic name ⇒ a pre-consume retry OVERWRITES, never a second copy), THEN the durable
-    // marker: a crash BETWEEN the two leaves the marker absent, so a retry safely re-publishes — it never records "published"
-    // without the message (which would silently drop the only copy).
-    const file = path.join(dir, `${idempotencyKey}.json`);
-    const tmp = `${file}.tmp-${Math.random().toString(36).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
-    renameSync(tmp, file);
-    writePublishedMarker(pubDir, marker, valid.ts);
-    return;
-  }
+  if (idempotencyKey !== undefined) { publishOnce(dir, idempotencyKey, valid); return; }
   // No key ⇒ the historical unique random name (every write is a new, independent message).
   const base = `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
   const file = path.join(dir, base);
@@ -207,16 +173,101 @@ export function writeInbox(home: string, key: string, msg: InboxMsg, idempotency
   renameSync(tmp, file);
 }
 
-/** Write the durable PUBLISHED marker for an idempotency key (tmp+rename). Best-effort: the message is already on disk, so a
- *  marker-write fault must not be reported as a failed send (the deterministic filename still coalesces a pre-consume retry); the
- *  only exposure is a post-consume retry in the crash window between the two writes, which is the irreducible minimum. Never throws. */
-function writePublishedMarker(pubDir: string, marker: string, ts: number): void {
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Exactly-once publication of one logical EVENT (an idempotencyKey) — the DURABLE-FIRST credential protocol (the dual of FC-2's
+// publish-after-fact). The message .json is the delivery TARGET only (claim renames it, ack deletes it), so its presence can never
+// prove delivery. A separate CREDENTIAL under `.pubcred/` records the event's publication lifecycle and NO claim/ack ever touches
+// it, so it survives claim, ack and restart. The credential filename is a SHA-256 of the key (never the key itself), so any key —
+// including "." / ".." — is a safe single path segment (MD-R6-P2-1). Protocol: claim the credential PENDING (O_EXCL single-winner)
+// BEFORE publishing, publish the message, then upgrade to PUBLISHED. Recovery on a PENDING credential fs-verifies whether the
+// message landed (FC-2 r6 recipe): present ⇒ upgrade (never resend); absent ⇒ insufficient evidence (consumed OR never-sent) ⇒
+// retain pending (no resend, no silent drop). (digest MD-P2-1)
+// ---------------------------------------------------------------------------------------------------------------------------------
+function credDirOf(dir: string): string { return path.join(dir, ".pubcred"); }
+function credPathOf(dir: string, idempotencyKey: string): string {
+  return path.join(credDirOf(dir), createHash("sha256").update(idempotencyKey).digest("hex"));
+}
+/** Credential state: "absent" (never claimed) / "pending" (claimed, publish in flight or interrupted) / "published" (confirmed
+ *  delivered) / "unknown" (a non-ENOENT read fault OR an unrecognized body — must NOT be read as not-published). */
+function readCredState(cred: string): "absent" | "pending" | "published" | "unknown" {
+  let raw: string;
+  try { raw = readFileSync(cred, "utf8"); }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
+  const t = raw.trim();
+  return t === "published" ? "published" : t === "pending" ? "pending" : "unknown";
+}
+/** Atomically set the credential to a terminal/intermediate state (tmp+rename). Best-effort; never throws. */
+function writeCredState(cred: string, state: "pending" | "published"): void {
   try {
-    mkdirSync(pubDir, { recursive: true, mode: 0o700 });
-    const tmp = `${marker}.tmp-${randomBytes(4).toString("hex")}`;
-    writeFileSync(tmp, String(ts), { mode: 0o600 });
-    renameSync(tmp, marker);
-  } catch { /* best-effort: the message is published; the marker is a dedup optimization that a retry re-attempts */ }
+    mkdirSync(path.dirname(cred), { recursive: true, mode: 0o700 });
+    const tmp = `${cred}.tmp-${randomBytes(4).toString("hex")}`;
+    writeFileSync(tmp, state, { mode: 0o600 });
+    renameSync(tmp, cred);
+  } catch { /* best-effort */ }
+}
+/** Is the message for this event on disk right now — unclaimed (`<key>.json`) OR in-flight (`<key>.json.claim-<pid>`)? The message
+ *  keeps the KEY as its basename (deterministic, and `${key}.json` is a safe filename even for "." / ".."), so recovery can fs-verify
+ *  the landing without the credential. */
+function eventMessagePresent(dir: string, idempotencyKey: string): boolean {
+  const base = `${idempotencyKey}.json`;
+  if (existsSync(path.join(dir, base))) return true;
+  try { return readdirSync(dir).some((n) => n === base || n.startsWith(`${base}.claim-`)); } catch { return false; }
+}
+function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg): void {
+  const cred = credPathOf(dir, idempotencyKey);
+  const msgFile = path.join(dir, `${idempotencyKey}.json`);
+  const state = readCredState(cred);
+  if (state === "published" || state === "unknown") return; // delivered, or can't tell ⇒ never risk a duplicate
+  if (state === "pending") {
+    // Recovery: a pending credential proves a publish was ATTEMPTED. fs-verify whether the message landed.
+    if (eventMessagePresent(dir, idempotencyKey)) writeCredState(cred, "published"); // landed/in-flight ⇒ confirm, never resend
+    return; // message absent ⇒ consumed OR never-sent (indistinguishable) ⇒ retain pending (no resend, no silent drop)
+  }
+  // state === "absent" ⇒ fresh publish, DURABLE-FIRST: claim the credential EXCLUSIVELY so two racing publishers that both saw
+  // "absent" cannot both publish — exactly one wins the O_EXCL create; the loser defers.
+  try {
+    mkdirSync(credDirOf(dir), { recursive: true, mode: 0o700 });
+    writeFileSync(cred, "pending", { flag: "wx", mode: 0o600 }); // O_EXCL: EEXIST ⇒ a concurrent publisher already claimed
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") return; // a concurrent publisher won the claim ⇒ defer to it (no dup)
+    throw e; // the credential store is unwritable ⇒ do NOT publish without a durable claim; re-throw so the caller retries (+ logs)
+  }
+  // FC-7: an IDENTICAL notice already published under a legacy RANDOM name (pre-key), still on disk (unclaimed or in-flight), is
+  // ADOPTED into the keyed ledger — upgrade to published, keep the legacy message, skip the new write — instead of co-existing as a
+  // second copy. Scoped to a matching non-empty taskRef + identical text so distinct keyless messages are never collapsed. (A
+  // legacy message already CONSUMED leaves no trace: that is the "insufficient evidence ⇒ unknown-in-migration" case.)
+  if (typeof valid.taskRef === "string" && valid.taskRef.length > 0 && adoptLegacyKeyless(dir, idempotencyKey, valid)) {
+    writeCredState(cred, "published");
+    return;
+  }
+  try {
+    const tmp = `${msgFile}.tmp-${Math.random().toString(36).slice(2, 8)}`;
+    writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
+    renameSync(tmp, msgFile);      // publish (claim renames this, ack deletes it)
+  } catch (e) {
+    // The message write FAILED in-process ⇒ we KNOW it did not land ("confirmed absent"). Roll back the pending claim so the next
+    // retry re-publishes from "absent" — never leave it stuck pending, which recovery would retain as unknown (a silent drop). Re-throw
+    // so the caller leaves ITS obligation open and retries (matching the historical throw-on-write-fault contract).
+    try { unlinkSync(cred); } catch { /* best-effort rollback */ }
+    throw e;
+  }
+  writeCredState(cred, "published"); // confirm
+}
+
+/** FC-7 — scan for a LEGACY keyless publication (a different basename) of the SAME notice (matching taskRef + identical text),
+ *  whether unclaimed (`<rand>.json`) or in-flight (`<rand>.json.claim-<pid>`). Pure read; a fault ⇒ false (fall through to publish). */
+function adoptLegacyKeyless(dir: string, idempotencyKey: string, valid: InboxMsg): boolean {
+  const self = `${idempotencyKey}.json`;
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return false; }
+  for (const n of names) {
+    const base = n.replace(/\.claim-[^.]+$/, "");       // stable base (strip any in-flight claim suffix)
+    if (!base.endsWith(".json") || base === self) continue; // only OTHER messages (not this event's own file)
+    let prior: unknown;
+    try { prior = JSON.parse(readFileSync(path.join(dir, n), "utf8")); } catch { continue; }
+    if (prior !== null && typeof prior === "object" && (prior as InboxMsg).taskRef === valid.taskRef && (prior as InboxMsg).text === valid.text) return true;
+  }
+  return false;
 }
 
 /** Atomically claim every pending message under ANY of `keys` (oldest first). The claimer must ack or release each.

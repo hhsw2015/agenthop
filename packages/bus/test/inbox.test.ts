@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
@@ -429,58 +430,62 @@ describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
   });
 });
 
-describe("writeInbox — idempotency key (durable published marker, dedup across claim/ack/restart — digest MD-P2-1)", () => {
+describe("writeInbox — idempotency key (durable-first credential, exactly-once across claim/ack/restart — digest MD-P2-1)", () => {
   const dirOf = (key: string) => path.join(HOME, ".agenthop", "inbox", key);
   const jsonFiles = (key: string) => readdirSync(dirOf(key)).filter((n) => n.endsWith(".json"));
+  const cred = (sid: string, idk: string) => path.join(dirOf(sid), ".pubcred", createHash("sha256").update(idk).digest("hex"));
   const digest = (text: string, ts: number) => ({ from: "d", fromLabel: "swarm-digest", text, via: "local" as const, ts, taskRef: "morning-digest" });
 
-  test("a stable key publishes ONE message + a durable .published marker; absent ⇒ unique names", () => {
-    writeInbox(HOME, "s1", msg("one", 1), "morning-digest-2026-10-10");
-    writeInbox(HOME, "s1", msg("two", 2), "morning-digest-2026-10-10"); // SAME event ⇒ no-op (first content retained)
-    expect(jsonFiles("s1")).toEqual(["morning-digest-2026-10-10.json"]);           // exactly ONE message
-    expect(JSON.parse(readFileSync(path.join(dirOf("s1"), "morning-digest-2026-10-10.json"), "utf8")).text).toBe("one"); // first publication is the truth
-    expect(existsSync(path.join(dirOf("s1"), ".published", "morning-digest-2026-10-10"))).toBe(true); // durable credential
-    writeInbox(HOME, "s1", msg("r1", 3)); // no key ⇒ unique random names (every write a new message)
-    writeInbox(HOME, "s1", msg("r2", 4));
+  test("a keyed publish writes ONE message + a PUBLISHED credential; a re-send is a no-op; no key => unique names", () => {
+    writeInbox(HOME, "s1", msg("one", 1), "evt-k");
+    writeInbox(HOME, "s1", msg("two", 2), "evt-k");                       // SAME event => no-op (first publication retained)
+    expect(jsonFiles("s1")).toEqual(["evt-k.json"]);
+    expect(JSON.parse(readFileSync(path.join(dirOf("s1"), "evt-k.json"), "utf8")).text).toBe("one");
+    expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("published");  // durable credential, confirmed
+    writeInbox(HOME, "s1", msg("r1", 3)); writeInbox(HOME, "s1", msg("r2", 4)); // no key => unique random names
     expect(jsonFiles("s1").length).toBe(3);
   });
 
-  test("REPLAY: a re-send AFTER the receiver claimed+acked the message is a no-op (no second consumable copy)", () => {
-    writeInbox(HOME, "s1", digest("brief", 1), "morning-digest-2026-10-10");
+  test("REPLAY: a re-send after the receiver claimed+acked is a no-op (the credential survives consumption)", () => {
+    writeInbox(HOME, "s1", digest("brief", 1), "evt-k");
     const first = claimInbox(HOME, ["s1"], "pidA"); expect(first.length).toBe(1);
-    ackInbox(first[0]!.file);                                  // consumed ⇒ the .json is gone
+    ackInbox(first[0]!.file);                                             // consumed => the message .json is gone
     expect(jsonFiles("s1").length).toBe(0);
-    writeInbox(HOME, "s1", digest("brief", 2), "morning-digest-2026-10-10"); // recovery re-send
-    expect(claimInbox(HOME, ["s1"], "pidB").length).toBe(0);   // the published marker ⇒ NOT re-delivered
+    writeInbox(HOME, "s1", digest("brief", 2), "evt-k");                  // recovery re-send
+    expect(claimInbox(HOME, ["s1"], "pidB").length).toBe(0);             // credential published => NOT re-delivered
   });
 
-  test("REPLAY: a re-send while the first copy is still CLAIMED (unacked) adds no second copy", () => {
-    writeInbox(HOME, "s1", digest("brief", 1), "morning-digest-2026-10-10");
-    const first = claimInbox(HOME, ["s1"], "pidA"); expect(first.length).toBe(1); // claimed, not acked
-    writeInbox(HOME, "s1", digest("brief", 2), "morning-digest-2026-10-10"); // re-send
-    ackInbox(first[0]!.file);
-    expect(claimInbox(HOME, ["s1"], "pidB").length).toBe(0);   // only the original event was ever deliverable
+  test("durable-first recovery: PENDING credential + message present => upgrade (no resend); + message absent => retain (no resend)", () => {
+    mkdirSync(path.dirname(cred("s1", "evt-k")), { recursive: true });
+    writeFileSync(cred("s1", "evt-k"), "pending");                        // simulate a crash after the send, before the upgrade
+    writeFileSync(path.join(dirOf("s1"), "evt-k.json"), JSON.stringify(validInboxMsg(digest("brief", 1))));
+    writeInbox(HOME, "s1", digest("brief", 2), "evt-k");                  // recovery: message present => upgrade, no 2nd copy
+    expect(jsonFiles("s1")).toEqual(["evt-k.json"]);
+    expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("published");
+    for (const c of claimInbox(HOME, ["s1"], "p")) ackInbox(c.file);     // receiver consumes it
+    writeFileSync(cred("s1", "evt-k"), "pending");                        // force back to an unconfirmable pending state
+    writeInbox(HOME, "s1", digest("brief", 3), "evt-k");                  // pending + message absent => insufficient evidence
+    expect(claimInbox(HOME, ["s1"], "p2").length).toBe(0);               // retain, never resend (no dup)
   });
 
-  test("FC-7: a legacy keyless publication of the SAME notice is migrated, not duplicated by the new key", () => {
-    writeInbox(HOME, "s1", digest("morning brief — 2026-10-10", 1));            // legacy random name, no key
-    expect(jsonFiles("s1").length).toBe(1);
-    writeInbox(HOME, "s1", digest("morning brief — 2026-10-10", 2), "morning-digest-2026-10-10"); // keyed re-publish of the SAME notice
-    expect(jsonFiles("s1").length).toBe(1);                    // adopted the legacy one, no second message
-    expect(existsSync(path.join(dirOf("s1"), ".published", "morning-digest-2026-10-10"))).toBe(true); // marker records the migration
-    const c = claimInbox(HOME, ["s1"], "p"); expect(c.length).toBe(1); // exactly one deliverable
+  test("a reserved dot key (. / ..) is a SAFE sha256 filename: publishes, no path traversal (MD-R6-P2-1)", () => {
+    writeInbox(HOME, "s1", msg("dotdot", 1), "..");
+    writeInbox(HOME, "s1", msg("dot", 2), ".");
+    expect(claimInbox(HOME, ["s1"], "p").length).toBe(2);                 // both delivered
+    expect(readdirSync(path.join(HOME, ".agenthop", "inbox"))).toEqual(["s1"]); // only s1 — no sibling dir created by a `..` escape
+  });
+
+  test("FC-7: a legacy keyless publication of the SAME notice is adopted, not duplicated by the new key", () => {
+    writeInbox(HOME, "s1", digest("morning brief", 1));                   // legacy random name, no key
+    writeInbox(HOME, "s1", digest("morning brief", 2), "evt-k");          // keyed re-publish of the SAME notice
+    expect(jsonFiles("s1").length).toBe(1);                               // adopted the legacy one, no second message
+    expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("published");
+    expect(claimInbox(HOME, ["s1"], "p").length).toBe(1);
   });
 
   test("a DIFFERENT keyless notice (distinct taskRef/text) is never collapsed by the key", () => {
-    writeInbox(HOME, "s1", msg("unrelated", 1));               // no taskRef
-    writeInbox(HOME, "s1", digest("brief", 2), "morning-digest-2026-10-10"); // keyed, different identity
-    expect(jsonFiles("s1").length).toBe(2);                    // both kept
-  });
-
-  test("a path-unsafe idempotencyKey falls back to a unique random name (no traversal, no marker)", () => {
-    writeInbox(HOME, "s2", msg("x", 1), "../escape");
-    const files = jsonFiles("s2");
-    expect(files.length).toBe(1);
-    expect(files[0]).not.toContain("escape"); // rejected ⇒ random name, never wrote outside the dir
+    writeInbox(HOME, "s1", msg("unrelated", 1));
+    writeInbox(HOME, "s1", digest("brief", 2), "evt-k");
+    expect(jsonFiles("s1").length).toBe(2);
   });
 });

@@ -1693,6 +1693,10 @@ async function main(): Promise<void> {
       //     re-gather, under a per-date idempotency key whose durable PUBLISHED marker (writeInbox) dedups the delivery across the
       //     coordinator's claim/ack/restart — so a crash-after-land or a failed "sent" flip re-sends without ever duplicating.
       if (act.notify) {
+        // FC-7 unknown-in-migration: a LEGACY date-only notify marker (pending WITHOUT a frozen body) predates the durable
+        // credential — a pre-key publication that was consumed leaves NO trace, so we cannot prove it was never delivered. Do NOT
+        // auto-resend (dup risk); retain + surface for manual migration rather than re-send a possibly-already-delivered brief.
+        if (notified.kind === "pending" && !notified.body) { log(`morning digest: legacy date-only notify marker (${notified.date}) — retained for migration, not auto-resent`); return; }
         const p = readDigestProjection(HOME);
         if (p.kind !== "valid" || p.date !== today) return; // the frozen body is not on disk yet (projection write failed) ⇒ retry
         const coord = process.env.SWARM_COORDINATOR;
