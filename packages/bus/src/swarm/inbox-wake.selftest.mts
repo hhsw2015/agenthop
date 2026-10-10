@@ -49,6 +49,30 @@ ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite cloc
     ok(claimWakeSlot(HOME, "c", w(200), COOL, () => { /* no interference */ }) === true, "ABA control: no concurrent advance ⇒ the admitted claim's rename-CAS succeeds");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
+// IW-P2-1 (r10 BOOTSTRAP-ABA): the epoch head name is a constant ⇒ a late no-head snapshot could O_EXCL-recreate it after it was consumed.
+// A PERMANENT genesis sentinel gates the epoch: only the genesis winner creates it; a late no-head claimer finds genesis EEXIST and must
+// NOT resurrect the epoch. A no-head state with genesis present is UNKNOWN ⇒ yield (never revive a consumed source).
+{
+  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakeboot-"));
+  const dir = path.join(HOME, ".agenthop/console/inbox-wake");
+  const safe = createHash("sha256").update("c").digest("hex");
+  const w = (n: number) => n * COOL;
+  const heads = (): string[] => readdirSync(dir).filter((n) => n.startsWith(`${safe}.head.`));
+  try {
+    let done = false;
+    const bootstrapB = (): void => { if (!done) { done = true; ok(claimWakeSlot(HOME, "c", w(8), COOL) === true, "BOOTSTRAP-ABA: concurrent B bootstraps + injects under A"); } };
+    ok(claimWakeSlot(HOME, "c", w(8), COOL, bootstrapB) === false, "IW-P2-1 r10: A scanned empty; B bootstrapped under A ⇒ A finds genesis (EEXIST) + B's head ⇒ yields, no epoch resurrection");
+    ok(heads().length === 1, "IW-P2-1 r10: exactly ONE head after the bootstrap race (the consumed epoch was never resurrected)");
+    ok(readdirSync(dir).includes(`${safe}.genesis`), "IW-P2-1 r10: the permanent genesis sentinel is present");
+  } finally { rmSync(HOME, { recursive: true, force: true }); }
+  const HOME2 = mkdtempSync(path.join(os.tmpdir(), "ah-wakeboot2-"));
+  const dir2 = path.join(HOME2, ".agenthop/console/inbox-wake"); mkdirSync(dir2, { recursive: true });
+  const safe2 = createHash("sha256").update("c").digest("hex");
+  try {
+    writeFileSync(path.join(dir2, `${safe2}.genesis`), "nonce"); // genesis present but NO head (consumed-and-lost / crashed bootstrap)
+    ok(claimWakeSlot(HOME2, "c", Date.now(), COOL) === false, "IW-P2-1 r10: a no-head state with genesis present is UNKNOWN ⇒ yield (fail-closed, never recreate the epoch)");
+  } finally { rmSync(HOME2, { recursive: true, force: true }); }
+}
 // Fail-closed: a late lower-ts claim is rejected by the high-water MAX; a dir read fault and a persist fault never admit.
 {
   const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakehole-"));

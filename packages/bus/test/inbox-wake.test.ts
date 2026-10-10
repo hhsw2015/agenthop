@@ -49,6 +49,27 @@ describe("inbox-wake — claimWakeSlot (先占后发, cross-process atomic)", ()
     expect(claimWakeSlot(HOME, "c", w(20), COOL, () => { /* no interference */ })).toBe(true); // head.1→head.2, CAS succeeds
   });
 
+  test("IW-P2-1 (r10): the genesis sentinel closes the BOOTSTRAP ABA — a late no-head snapshot cannot resurrect a consumed epoch", () => {
+    const dir = path.join(HOME, ".agenthop/console/inbox-wake");
+    const safe = createHash("sha256").update("c").digest("hex");
+    const heads = () => readdirSync(dir).filter((n) => n.startsWith(`${safe}.head.`));
+    // A scans an EMPTY dir; the seam fires a full concurrent bootstrap+inject (B) under A (genesis + epoch head, epoch then consumed by B's
+    // rename). A resumes with its cached no-head view, but O_EXCL genesis now EEXISTs ⇒ A is NOT the genesis winner ⇒ A must NOT recreate the
+    // epoch. Under r9 (no sentinel) A re-created the epoch head (a 2nd head) and a stale rename could double-inject; the sentinel closes it.
+    let done = false;
+    const bootstrapB = () => { if (!done) { done = true; expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true); } };
+    expect(claimWakeSlot(HOME, "c", w(8), COOL, bootstrapB)).toBe(false); // A: genesis EEXIST + B's head found ⇒ admit cooldown ⇒ yield (no resurrection)
+    expect(heads().length).toBe(1);                                       // exactly ONE head (the epoch was never resurrected)
+    expect(readdirSync(dir).includes(`${safe}.genesis`)).toBe(true);     // the permanent genesis sentinel is present
+  });
+
+  test("IW-P2-1 (r10): a no-head state with genesis present is UNKNOWN ⇒ yield (never recreate a consumed/lost epoch)", () => {
+    const dir = path.join(HOME, ".agenthop/console/inbox-wake"); mkdirSync(dir, { recursive: true });
+    const safe = createHash("sha256").update("c").digest("hex");
+    writeFileSync(path.join(dir, `${safe}.genesis`), "nonce");           // genesis present but NO head (consumed-and-lost / crashed bootstrap)
+    expect(claimWakeSlot(HOME, "c", Date.now(), COOL)).toBe(false);       // fail-closed: do not recreate the epoch (manual/migration path)
+  });
+
   test("IW-R4-P2-1: a cooldown parameter change does not let old window numbers block new wakes", () => {
     const C60 = 60_000, C120 = 120_000;
     expect(claimWakeSlot(HOME, "c", 1_000_000, C60)).toBe(true);   // inject at a 60s cooldown

@@ -8,7 +8,7 @@
 // is demoted to a BACKSTOP: re-inject only for items that have lain unclaimed past a window (a write-side wake that missed).
 
 import { mkdirSync, writeFileSync, readdirSync, readFileSync, lstatSync, renameSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
 import { setInboxWakeHook, scanUnclaimedInbox } from "../inbox.js";
@@ -52,17 +52,20 @@ export function shouldInjectWake(now: number, last: number, paneState: string, c
  *  tombstone, and exactly one head file. The REJECTION AUTHORITY for the cooldown is the GLOBAL high-water TIMESTAMP: MAX over the head's
  *  ts AND the effective-ts of every other `<sha256(sid)>.*` marker (legacy / unrecognized), so the admit is purely time-based
  *  (`now - maxTs >= cooldownMs`) — parameter-independent (IW-R4-P2-1) and FC-7-aware (any file is evidence: parseable content else mtime,
- *  never ignored, never Number("") ⇒ 0). First-ever claim O_EXCL-creates the epoch head `<sha>.head.0.0` (concurrent bootstrappers dedup
- *  on EEXIST), then everyone races the same rename CAS ⇒ exactly one winner injects. A readdir/stat FAULT ⇒ UNKNOWN ⇒ reject
- *  (fail-closed, FC-2 r3); an unparseable head with no valid head present ⇒ reject (never bootstrap over corruption); a bootstrap/rename
- *  fault ⇒ reject (publish-after-fact). `onAfterScan` is a TEST-ONLY concurrency seam (undefined in production). Returns true iff THIS
- *  caller won the advance. Never throws. */
+ *  never ignored, never Number("") ⇒ 0). The epoch head itself has a constant name, so it is gated by a PERMANENT `<sha256(sid)>.genesis`
+ *  sentinel (O_EXCL once, never deleted): only the genesis winner creates `<sha>.head.0.0`, and once genesis exists a no-head state is
+ *  UNKNOWN ⇒ never re-created — so a consumed epoch source name can never be O_EXCL-revived by a late no-head snapshot (BOOTSTRAP-ABA).
+ *  A readdir/stat FAULT ⇒ UNKNOWN ⇒ reject (fail-closed, FC-2 r3); an unparseable head with no valid head present ⇒ reject (never
+ *  bootstrap over corruption); a genesis/bootstrap/rename fault ⇒ reject (publish-after-fact). `onAfterScan` is a TEST-ONLY concurrency
+ *  seam (undefined in production). Returns true iff THIS caller won the advance. Never throws. */
 export function claimWakeSlot(home: string, sid: string, now: number, cooldownMs: number, onAfterScan?: () => void): boolean {
   if (!sid || !Number.isFinite(now) || !(cooldownMs > 0)) return false;
   const dir = path.join(home, ".agenthop", "console", "inbox-wake");
   const safe = createHash("sha256").update(sid).digest("hex");
   const sidPrefix = `${safe}.`;
   const headPrefix = `${safe}.head.`;
+  const genesisName = `${safe}.genesis`;             // permanent "this sid was bootstrapped" sentinel (O_EXCL once, never deleted)
+  const genesisPath = path.join(dir, genesisName);
   // EFFECTIVE timestamp of a NON-head marker (FC-7 fail-closed recognition): ENOENT ⇒ null (vanished ⇒ not evidence); any OTHER read
   // fault (EACCES / EIO / ...) ⇒ `now` (conservative: a present-but-unreadable marker blocks); empty / non-numeric content ⇒ MTIME
   // (never Number("") ⇒ 0); mtime unreadable ⇒ `now`.
@@ -95,7 +98,7 @@ export function claimWakeSlot(home: string, sid: string, now: number, cooldownMs
     try { names = readdirSync(dir); } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { maxTs: -Infinity, head: null, headName: null, corruptHead: false } : null; }
     let maxTs = -Infinity, head: { gen: number; ts: number } | null = null, headName: string | null = null, corruptHead = false;
     for (const n of names) {
-      if (!n.startsWith(sidPrefix)) continue;
+      if (!n.startsWith(sidPrefix) || n === genesisName) continue; // the genesis sentinel is not an inject marker ⇒ never counts toward the high-water
       if (n.startsWith(headPrefix)) {
         const h = parseHead(n);
         if (h === null) { corruptHead = true; const t = effTs(n); if (t !== null && t > maxTs) maxTs = t; continue; }
@@ -113,11 +116,21 @@ export function claimWakeSlot(home: string, sid: string, now: number, cooldownMs
   if (s.corruptHead && s.head === null) return false;        // an unparseable head and no valid one ⇒ fail-closed (never bootstrap over corruption)
   if (onAfterScan) { try { onAfterScan(); } catch { /* test seam only */ } } // TEST-ONLY: simulate another process advancing the head between our scan and our CAS (undefined in production ⇒ no effect)
   if (s.head === null) {
-    // bootstrap the epoch head (gen 0, ts 0); O_EXCL dedups concurrent bootstrappers (EEXIST is expected and fine).
-    try { writeFileSync(path.join(dir, `${headPrefix}0.0`), "", { flag: "wx", mode: 0o600 }); }
-    catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") return false; }
+    // Bootstrap. The epoch head name is a constant, so a LATE no-head snapshot could O_EXCL-recreate it after it was consumed and renamed
+    // away (BOOTSTRAP-ABA), reviving a consumed source for a stale claimer's cached rename. Gate the epoch on a PERMANENT genesis sentinel
+    // (O_EXCL once, never deleted ⇒ it can never itself ABA): ONLY the genesis winner — the genuine first-ever bootstrapper — may create
+    // the epoch head. Once genesis exists, a no-head state is UNKNOWN (the epoch was already consumed, or a bootstrap crashed) ⇒ we NEVER
+    // recreate the epoch, so a consumed source name can never be revived. A head lost while genesis persists is a manual / migration path
+    // (remove the genesis sentinel to re-bootstrap) — the fail-closed cost of never reasoning a consumed source back to life.
+    let wonGenesis = false;
+    try { writeFileSync(genesisPath, randomBytes(8).toString("hex"), { flag: "wx", mode: 0o600 }); wonGenesis = true; }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") return false; } // genesis already exists (not first) or a store fault
+    if (wonGenesis) {
+      try { writeFileSync(path.join(dir, `${headPrefix}0.0`), "", { flag: "wx", mode: 0o600 }); } // the SOLE place the epoch head is ever created
+      catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") return false; }
+    }
     s = scan();
-    if (s === null || s.head === null || s.headName === null) return false; // vanished / fault ⇒ bail
+    if (s === null || s.head === null || s.headName === null) return false; // genesis present but still no head ⇒ UNKNOWN ⇒ yield (never resurrect)
   }
   if (now - s.maxTs < cooldownMs) return false;              // within cooldown of the last inject (head ts or any legacy/unrecognized) ⇒ reject
   // CAS ADVANCE: rename the current head forward. rename FROM the exact current head name fails (ENOENT) if another claimer already
