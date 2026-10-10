@@ -12,6 +12,16 @@
  */
 import { classifyApproval, APPROVAL_POLL_SEC, type ApprovalRequest, type ApprovalScope, type PermissionDecision } from "./approval-delegation.js";
 
+/** The dedicated durable-inbox key the member hook writes an approval request to and the dispatcher (coordinator-replacement
+ *  sweep) drains — `approvals:<coordSid>` (coordinator r4 ruling): in the coordinator's authority domain, but a RESERVED key,
+ *  not the coordinator SESSION's own sid, so draining it never races that session's flushInbox (the contention the wiring
+ *  flagged). Still the same writeInbox/S11/sweep surface (no new store/format ⇒ FC-7 holds). The dispatcher's 5s sweep polls it
+ *  (never worse than the APPROVAL_POLL_SEC=15s window); inbox-wake fires best-effort on write (its pane ping is a no-op for a
+ *  non-session key, harmless). */
+export function approvalInboxKey(coordSid: string): string {
+  return `approvals:${coordSid}`;
+}
+
 /** The coordinator's action for a classified request. v1: delegate ALWAYS carries behavior "allow" (a deny is never delegated —
  *  it escalates). An escalate writes NO control-log decision (the hook polls, finds none, times out to the user dialog). */
 export type CoordinatorAction =

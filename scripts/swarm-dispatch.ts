@@ -56,7 +56,9 @@ import { subjectProgressSeq, hasFreshSubjectEvidence, renewOperationId, renewalC
 import { resolveSession, listSessions, makeFileLiveness } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
-import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
+import { writeInbox, inboxDirName, claimInbox, ackInbox, releaseInbox } from "../packages/bus/src/inbox.js";
+import { approvalDelegateEnabled } from "../packages/bus/src/swarm/approval-delegation.js";
+import { planCoordinatorAction, approvalInboxKey } from "../packages/bus/src/swarm/approval-gate.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
 import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { coordinatorReportPlan, coordEscalateEnabled, type ReportSeverity } from "../packages/bus/src/swarm/coordinator-report.js";
@@ -1693,6 +1695,34 @@ async function main(): Promise<void> {
     })().catch((e) => log(`placement suggest failed (isolated): ${e instanceof Error ? e.message : e}`));
   };
 
+  // approval-delegation (IO round): drain the coordinator's dedicated approval key, classify each member PermissionRequest, and
+  // DELEGATE the safe ones by committing a permissionDecision to the control-log (the member hook polls it back by promptId and
+  // auto-allows — no user dialog). An escalate writes NO decision: the member hook times out to the user dialog, and that blocked
+  // member is surfaced + supervised by the existing live-sentinel (S14 blocked⇒S19), so ③ needs no new wait here. Gated on
+  // SWARM_APPROVAL_DELEGATE (default OFF); fully fail-soft — never breaks the sweep, never auto-grants.
+  const runApprovalDelegation = (): void => {
+    if (!approvalDelegateEnabled()) return;
+    try {
+      const coordSid = resolveSession(COORDINATOR, listSessions(HOME));
+      if (!coordSid || !isStableSid(coordSid)) return; // no stable coordinator identity ⇒ can't key the dedicated approval box
+      const claimed = claimInbox(HOME, [approvalInboxKey(coordSid)], SELF);
+      if (claimed.length === 0) return;
+      let st = loadControlLog(CONTROL_LOG_DIR);
+      for (const { file, msg } of claimed) {
+        const req = msg.approval;
+        if (!req) { ackInbox(file); continue; } // a stray non-approval on the dedicated key ⇒ drop (the key is the dispatcher's)
+        const action = planCoordinatorAction(req, coordSid, nowSec());
+        if (action.act === "delegate") {
+          const { state, result } = commitTask(st, [{ put: "permissionDecision", permissionDecision: action.decision }]);
+          if (result.ok) { st = state; ackInbox(file); } // ok covers a fresh commit AND an idempotent replay
+          else { st = loadControlLog(CONTROL_LOG_DIR); releaseInbox(file); } // seq conflict ⇒ reload + retry next tick
+        } else {
+          ackInbox(file); // escalate: no decision ⇒ member hook times out to the user; the live-sentinel supervises the block
+        }
+      }
+    } catch (e) { log(`approval delegation failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   // Morning digest (TG v1 CORE composeDigest had no trigger ⇒ never produced). At/after the local target hour, once per calendar
   // date, run TWO INDEPENDENT obligations (MD-P2-1): (1) write the morning-digest/v1 projection (console + TG read it — one
   // generation, multi-end delivery, the generator touches no entry); (2) push the same brief to the coordinator durable box (S11,
@@ -1807,6 +1837,10 @@ async function main(): Promise<void> {
       // placement suggestion (reconcile → selectBackends → coordinator advisory). Gated on SWARM_PLACEMENT (default OFF); never
       // spawns/spends (R16); fully fail-soft.
       runPlacementSuggest();
+      // approval-delegation (IO round): classify members' PermissionRequests from the dedicated approval key and delegate the
+      // safe reads (commit a control-log permissionDecision the member hook polls back). Gated on SWARM_APPROVAL_DELEGATE
+      // (default OFF); fully fail-soft; never auto-grants (an escalate falls to the user).
+      runApprovalDelegation();
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
       // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
       runGaugeSampling();

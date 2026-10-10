@@ -2,7 +2,7 @@
 // Pins the IO-round logic layer: planCoordinatorAction, the Claude PermissionRequest hook parse/build, the allow-decision stdout
 // JSON, and runPermissionGate (dependency-injected member-side flow) — delegate-allow emits, everything else emits nothing.
 import {
-  planCoordinatorAction, parsePermissionHook, buildApprovalRequest, allowDecisionOutput, runPermissionGate,
+  planCoordinatorAction, parsePermissionHook, buildApprovalRequest, allowDecisionOutput, runPermissionGate, approvalInboxKey,
   type PermissionGateDeps,
 } from "./approval-gate.js";
 import { type ApprovalRequest, type ApprovalScope, type PermissionDecision } from "./approval-delegation.js";
@@ -40,6 +40,9 @@ t("parse tool_input without command -> ''", (() => { const p = parsePermissionHo
   t("build: carries fields + scope + nowSec", (() => { const r = buildApprovalRequest(parsed, scope, 999); return r.member === "s" && r.command === "cat x" && r.nowSec === 999 && r.scope === scope; })());
   t("build: omits scope when undefined", buildApprovalRequest(parsed, undefined, 999).scope === undefined);
 }
+
+// ── approvalInboxKey: the dedicated per-coordinator key (approvals:<coordSid>) ─────────────────────────────────
+t("approvalInboxKey(coordSid)", approvalInboxKey("fe0376cd-sid") === "approvals:fe0376cd-sid");
 
 // ── allowDecisionOutput: exact hook stdout JSON ───────────────────────────────────────────────────────────────
 t("allow output shape", allowDecisionOutput() === JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } }));
