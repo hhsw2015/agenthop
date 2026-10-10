@@ -19,6 +19,8 @@
  */
 
 import { readFileSync } from "node:fs"; // wiring IO: read the declarative placement spec (dormant: SWARM_PLACEMENT off)
+import { readdir, readFile } from "node:fs/promises"; // ledger IO: read the vm-ssh meta store ASYNC (non-blocking, PL-3)
+import { homedir } from "node:os";
 import path from "node:path";
 import type { Backend } from "./vm-ctl.js"; // phase-2b: reuse vm-ctl's Backend abstraction (type-only; no new backend interface, no runtime coupling)
 
@@ -411,8 +413,85 @@ export function readPlacementSpec(home: string): PlacementSpec | null {
   } catch { return null; }
 }
 
-/** Observed actual machines (reconcile's ACTUAL state). SEAM: the vm-ctl ledger read lands HERE when vm-ctl is wired; until
- *  then there is no live machine ledger, so this is empty (⇒ the advisory recommends the full demand plan). Fail-soft. */
-export function readLedgerMachines(_home: string): MachineView[] {
-  return []; // no vm-ctl ledger merged yet — the one place a future ledger read plugs in (SWARM_PLACEMENT stays OFF until then)
+/** The three-state observed-fleet read. `ok`/`empty` ⇒ proceed (a confirmed-empty account genuinely has no machines ⇒ advise the
+ *  full demand); `unknown` ⇒ the account could not be CONFIRMED (read failed, OR a non-empty body that could not be fully parsed),
+ *  so this tick advises NOTHING (FC-2 r3 "read-error KEEP" at the SET level — an unconfirmable list is NOT treated as empty, which
+ *  would over-advise spawning; nor as live capacity). */
+export type FleetRead = { status: "ok"; machines: MachineView[] } | { status: "empty" } | { status: "unknown" };
+
+/** Map a CONFIRMED-provisioned machine id to reconcile's MachineView. `live=true` means the vm-ssh meta is `phase:"ready"` — the
+ *  address was committed, i.e. the backend confirmed the VM exists (PL-1: a `reserved`/`requesting`/`running` record is NOT counted;
+ *  it has no committed address, so it is unproven capacity). Readiness / idle-time / in-flight have NO evidence face here, so they
+ *  are UNASSERTED: `ready=false` (⇒ NEVER a surplus-reclaim candidate, regardless of reclaimIdleSec, incl. 0), `remainingSec=null`
+ *  (⇒ never "expiring"), `inFlight=0`. With every machine live + not-ready, reconcile can only ever advise SPAWNING a real
+ *  shortfall — it never advises reclaim/rebuild from health the ledger does not prove ("不确定不授权"). Pure. */
+export function vmIdToView(id: string): MachineView {
+  return { id, live: true, ready: false, idleSec: 0, remainingSec: null, inFlight: 0 };
+}
+
+/** Railway's platform auto-destroy lifetime — MIRRORS scripts/vm-ssh.ts `TTL_SEC` (3600s, "~1h, not our knob"). A railway box
+ *  past this is destroyed by the platform, so it no longer provides capacity. (GHA has no such fact — see below.) */
+const RAILWAY_TTL_SEC = 3600;
+
+/** Is a vm-ssh meta record a CONFIRMED-LIVE machine for placement? MIRRORS vm-ssh.ts's capacity semantics in full (coordinator
+ *  direction), with placement's stricter in-flight exclusion:
+ *   - phase `reserved`/`requesting`/`running` ⇒ in-flight/unproven ⇒ NOT live (stricter than vm-ssh `ls`, kept from r2/r3);
+ *   - phase `ready` OR ABSENT (legacy = ready, vm-ssh.ts:666) ⇒ committed; any other/garbage phase ⇒ not live (conservative);
+ *   - backend ABSENT ⇒ railway (legacy default, vm-ssh.ts:670 `backendOf`);
+ *   - a RAILWAY box past its lifetime (createdSec+TTL ≤ now, i.e. vm-ssh `remainingSec ≤ 0`) ⇒ destroyed ⇒ NOT live (vm-ssh.ts:927
+ *     `ls` drops it before listing). A non-finite createdSec can't prove expiry ⇒ not excluded (mirrors vm-ssh: NaN remainingSec
+ *     is not `≤ 0`). We NEVER write/prune the store, only read.
+ *   - GHA is NEVER time-excluded: createdSec+ttlMin is a DISPLAY ESTIMATE, not termination evidence (vm-ssh.ts:791-795).
+ *  `nowSec` is a DURATION bound (lifetime), not a latest-wins timestamp (FC-6-safe). Pure. */
+function metaIsLive(m: Record<string, unknown>, nowSec: number): boolean {
+  const phase = m.phase;
+  if (phase === "reserved" || phase === "requesting" || phase === "running") return false; // in-flight
+  if (!(phase === "ready" || phase === undefined)) return false; // committed = ready | absent(legacy); anything else ⇒ exclude
+  const backend = typeof m.backend === "string" && m.backend ? m.backend : "railway"; // legacy default (backendOf)
+  if (backend !== "gha") { // timePrunable: railway (incl. legacy-default) is destroyed at its platform lifetime
+    const cs = typeof m.createdSec === "number" ? m.createdSec : NaN;
+    if (Number.isFinite(cs) && cs + RAILWAY_TTL_SEC <= nowSec) return false; // expired railway (remainingSec ≤ 0)
+  }
+  return true;
+}
+
+/** Fold the vm-ssh meta records into the three-state fleet. `metas === null` means the meta DIRECTORY could not be enumerated —
+ *  a set-level read error (EACCES / ENOTDIR / …) ⇒ `unknown` (PL-2 / coordinator ②: a dir-read failure is NOT an empty fleet; the
+ *  caller skips the tick, never fabricating empty/capacity). Otherwise a record counts as live per `metaIsLive` (mirrors vm-ssh's
+ *  phase + legacy + lifetime semantics in full — PL-1); a garbled individual record is simply absent from the parsed list
+ *  (per-record, the dir read still succeeded). No confirmed-live records ⇒ `empty` (advise the full demand — over-advise is safe;
+ *  the money gate is the user's). `nowSec` is the lifetime bound. Pure. */
+export function fleetFromMetas(metas: readonly unknown[] | null, nowSec: number): FleetRead {
+  if (metas === null) return { status: "unknown" }; // meta dir unreadable (set-level read error) ⇒ advise nothing this tick
+  const machines: MachineView[] = [];
+  for (const m of metas) {
+    if (m && typeof m === "object" && typeof (m as { id?: unknown }).id === "string" && (m as { id: string }).id && metaIsLive(m as Record<string, unknown>, nowSec)) {
+      machines.push(vmIdToView((m as { id: string }).id));
+    }
+  }
+  return machines.length ? { status: "ok", machines } : { status: "empty" };
+}
+
+/** Observed actual machines (reconcile's ACTUAL state) — read the vm-ssh META STORE directly (coordinator direction: filter by
+ *  the meta STATE face; `vm-ssh ls` enumerates LOCAL reservations incl. `reserved`/`requesting` and SWALLOWS dir-read errors into
+ *  an empty success, so it proves neither provisioning nor read-success). This mirrors vm-ssh.ts `addrDir()` (VM_SSH_DIR or
+ *  ~/.vm-ssh) + `Meta.phase`; reading the dir ourselves means a dir-read error is SEEN, never swallowed. ASYNC (PL-3): fs/promises,
+ *  never a blocking subprocess. Three-state: dir missing (ENOENT) ⇒ empty; dir unreadable (other errno) ⇒ unknown; dir enumerated
+ *  ⇒ confirmed-`ready` records (ok/empty). Dormant until SWARM_PLACEMENT is on. */
+export async function readLedgerMachines(_home: string, env: NodeJS.ProcessEnv = process.env): Promise<FleetRead> {
+  const dir = env.VM_SSH_DIR?.trim() || path.join(homedir(), ".vm-ssh"); // mirrors scripts/vm-ssh.ts addrDir()
+  let files: string[];
+  try {
+    files = await readdir(dir);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { status: "empty" }; // dir absent = no VMs provisioned
+    return { status: "unknown" }; // EACCES / ENOTDIR / any other read error ⇒ NOT empty (PL-2: dir-read error propagates as unknown)
+  }
+  const metas: unknown[] = [];
+  for (const f of files) {
+    if (!f.endsWith(".meta.json")) continue;
+    try { metas.push(JSON.parse(await readFile(path.join(dir, f), "utf8"))); }
+    catch { /* a single unreadable/garbled meta ⇒ skip that record; the DIR read succeeded, so this is not a set-level error */ }
+  }
+  return fleetFromMetas(metas, Math.floor(Date.now() / 1000)); // nowSec = the railway-lifetime bound (mirrors vm-ssh remainingSec)
 }

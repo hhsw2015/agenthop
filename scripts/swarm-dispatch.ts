@@ -1674,7 +1674,12 @@ async function main(): Promise<void> {
         // the FULL desired plan; this gate just paces how often we tell the coordinator. Only a real "delivered" advances the
         // window, so a failed/unreported advisory retries next tick.
         if (!shouldSuggestPlacement(now, lastPlacementSuggestSec, spec.cfg.minDwellSec)) return;
-        const machines = readLedgerMachines(HOME); // actual state (vm-ctl ledger seam; empty until wired)
+        // ACTUAL state = the vm-ctl backend account (`vm-ssh ls --json`), read ASYNChronously so the exec never blocks the
+        // dispatcher's main loop (PL-3); the await stays inside this single-flight detached worker. Three-state: unknown (read
+        // unconfirmed) ⇒ advise NOTHING this tick and do NOT advance the window — never fabricate an empty fleet / live capacity.
+        const fleet = await readLedgerMachines(HOME);
+        if (fleet.status === "unknown") return;
+        const machines = fleet.status === "ok" ? fleet.machines : []; // empty ⇒ genuinely no machines ⇒ advise the full demand
         const sug = planPlacementSuggest(spec, machines);
         if (sug.hasContent && notifyCoordinator(sug.text, { taskRef: "placement-suggest", title: "placement" }) === "delivered") lastPlacementSuggestSec = now;
       } finally { placementReadInFlight = false; }
