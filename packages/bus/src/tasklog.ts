@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
+import { type ResolutionLevel } from "./swarm/attribution.js";
 
 /**
  * The task log: the durable, on-disk envelope for "one unit of work handed to one or more sessions".
@@ -62,6 +63,11 @@ export type TaskRecord = {
   results: TaskResult[];
   /** True once a terminal state is reached; kept so a reader need not re-derive it. */
   closed?: boolean;
+  /** attribution-chain (dormant, SWARM_ATTRIBUTION): the ONE accountable human this dispatch represents, and the
+   *  waterfall LEVEL it resolved at — a SOURCE tag for TRACEABILITY ONLY (no permission decision reads it;
+   *  authorization stays with the C8 cap). Absent on legacy records (FC-7 tolerated) and whenever the seam is off. */
+  accountableHuman?: string;
+  resolutionLevel?: ResolutionLevel;
 };
 
 /** States that mean "nothing more will change". */
@@ -166,7 +172,7 @@ export function writeTask(home: string, rec: TaskRecord): boolean {
 /** Create a new task and persist it. Returns the record, or undefined if it could not be written. */
 export function createTask(
   home: string,
-  input: { dispatchedBy: string; assignees: string[]; goal?: string; role?: string; taskId?: string; createdAt?: number },
+  input: { dispatchedBy: string; assignees: string[]; goal?: string; role?: string; taskId?: string; createdAt?: number; accountableHuman?: string; resolutionLevel?: ResolutionLevel },
 ): TaskRecord | undefined {
   const now = input.createdAt ?? Date.now();
   const rec: TaskRecord = {
@@ -179,6 +185,9 @@ export function createTask(
     results: [],
     ...(input.goal ? { goal: input.goal } : {}),
     ...(input.role ? { role: input.role } : {}),
+    // attribution-chain seam (dormant): carried through only when a caller computes it (SWARM_ATTRIBUTION on).
+    ...(input.accountableHuman ? { accountableHuman: input.accountableHuman } : {}),
+    ...(input.resolutionLevel ? { resolutionLevel: input.resolutionLevel } : {}),
   };
   return writeTask(home, rec) ? rec : undefined;
 }
