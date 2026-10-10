@@ -182,13 +182,15 @@ export type VizWorktree = {
   head: string;
 };
 
-/** Morning digest (schema morning-digest/v1), produced by the digest-wiring generator (f32a0507) at
- *  ~/.agenthop/console/morning-digest/digest.json; the console renders it read-only. Sections are generic
- *  (title + items) so the view survives the generator adding/renaming sections; the five v1 sections are
- *  昨日签收/并库/在审/告警/今日待裁 (signed-off / merged / in-review / alerts / pending-decisions). */
-export type DigestItem = { text: string; ref?: string };
-export type DigestSection = { key?: string; title: string; items: DigestItem[] };
-export type MorningDigest = { schema: "morning-digest/v1"; date: string; sections: DigestSection[] };
+/** Morning digest (schema morning-digest/v1), produced by the digest-wiring generator (f32a0507,
+ *  packages/bus/src/swarm/morning-digest.ts `digestProjection`) at ~/.agenthop/console/morning-digest/
+ *  digest.json; the console renders it read-only. This mirrors the GENERATOR's frozen shape exactly (CDV-P2-1):
+ *  a section is `{ title, lines: string[] }` — lines are already-formatted, user-facing strings — and the
+ *  projection carries `generatedAtSec`. The generator's titles are needs you / cleared / shipped / still
+ *  pending (alerts lead), or a single "quiet night" section. Sections stay generic so the view survives the
+ *  generator adding/renaming them. */
+export type DigestSection = { title: string; lines: string[] };
+export type MorningDigest = { schema: "morning-digest/v1"; date: string; generatedAtSec: number; sections: DigestSection[] };
 
 export type Snapshot = {
   generatedAt: number;
@@ -475,23 +477,19 @@ export function parseMorningDigest(raw: string): MorningDigest | null {
   if (!o || typeof o !== "object") return null;
   const d = o as Record<string, unknown>;
   if (d.schema !== "morning-digest/v1") return null;
-  if (typeof d.date !== "string") return null;
+  if (typeof d.date !== "string" || d.date.length === 0) return null;
   if (!Array.isArray(d.sections)) return null;
   const sections: DigestSection[] = [];
   for (const s of d.sections) {
     if (!s || typeof s !== "object") continue;
     const so = s as Record<string, unknown>;
-    if (typeof so.title !== "string") continue;
-    const items: DigestItem[] = [];
-    for (const it of Array.isArray(so.items) ? so.items : []) {
-      if (!it || typeof it !== "object") continue;
-      const io = it as Record<string, unknown>;
-      if (typeof io.text !== "string") continue;
-      items.push(typeof io.ref === "string" ? { text: io.text, ref: io.ref } : { text: io.text });
-    }
-    sections.push(typeof so.key === "string" ? { key: so.key, title: so.title, items } : { title: so.title, items });
+    if (typeof so.title !== "string" || !Array.isArray(so.lines)) continue; // a malformed section is dropped, not fatal
+    sections.push({ title: so.title, lines: so.lines.filter((l): l is string => typeof l === "string") }); // keep only string lines
   }
-  return { schema: "morning-digest/v1", date: d.date, sections };
+  // generatedAtSec: the generator always writes a finite number; tolerate a missing/odd one (default 0) rather
+  // than blank an otherwise-good brief — content preservation is the point (CDV-P2-1).
+  const g = typeof d.generatedAtSec === "number" && Number.isFinite(d.generatedAtSec) ? Math.floor(d.generatedAtSec) : 0;
+  return { schema: "morning-digest/v1", date: d.date, generatedAtSec: g, sections };
 }
 
 /** Read the morning digest (read-only, best-effort). Absent / unreadable / corrupt ⇒ null; the console view
@@ -806,27 +804,35 @@ function selftest(): void {
     t("a path with trailing spaces is preserved (not trimmed)", parseWorktreePorcelain(z(rec(`worktree ${sp}`, "HEAD abc00000", "detached")))[0]!.path === sp);
   }
 
-  // Morning digest (morning-digest/v1) defensive parsing: well-formed round-trips; wrong/absent schema or shape
-  // ⇒ null (view degrades); malformed sections/items are dropped, a partial digest still renders.
+  // Morning digest (morning-digest/v1) parsing — ALIGNED to the generator's frozen shape (morning-digest.ts
+  // digestProjection: sections[].lines: string[] + generatedAtSec). CDV-P2-1: the real producer's lines must
+  // survive the round-trip; an unknown/partial shape degrades, it is never silently read as empty content.
   {
-    const good = JSON.stringify({
-      schema: "morning-digest/v1", date: "2026-10-09", extra: "ignored",
+    // Faithful to digestProjection's output: titles needs you / cleared / shipped / still pending; 4 lines.
+    const producer = JSON.stringify({
+      schema: "morning-digest/v1", date: "2026-10-09", generatedAtSec: 1_900_000_000, extra: "ignored",
       sections: [
-        { key: "signed-off", title: "昨日签收", items: [{ text: "DA2 @ddb8cda", ref: "spend-breaker:x" }, { text: "canvas @2cacfbb" }] },
-        { key: "alerts", title: "告警", items: [] },
-        { title: "no-key section ok", items: [{ text: "ok" }, { bad: 1 }, { text: 7 }] }, // 2 malformed items dropped
-        { items: [{ text: "no-title dropped" }] }, // section without a title dropped
+        { title: "needs you", lines: ["blocked: T5-1 awaiting review"] },
+        { title: "cleared", lines: ["DA2 shared-budget 0-remain @ddb8cda"] },
+        { title: "shipped", lines: ["console-canvas @2cacfbb merged"] },
+        { title: "still pending", lines: ["FC-4 awaiting integration"] },
       ],
     });
-    const d = parseMorningDigest(good)!;
-    t("digest: well-formed parses with date + sections", d !== null && d.date === "2026-10-09" && d.sections.length === 3);
-    t("digest: section items + optional ref preserved", d.sections[0]!.items.length === 2 && d.sections[0]!.items[0]!.ref === "spend-breaker:x" && d.sections[0]!.items[1]!.ref === undefined);
-    t("digest: a malformed item (non-string text) is dropped, partial still renders", d.sections[2]!.items.length === 1 && d.sections[2]!.items[0]!.text === "ok");
-    t("digest: an empty section is kept (empty kanban-style lane)", d.sections[1]!.title === "告警" && d.sections[1]!.items.length === 0);
-    t("digest: wrong/absent schema ⇒ null", parseMorningDigest(JSON.stringify({ schema: "x", date: "d", sections: [] })) === null && parseMorningDigest(JSON.stringify({ date: "d", sections: [] })) === null);
-    t("digest: non-string date or non-array sections ⇒ null", parseMorningDigest(JSON.stringify({ schema: "morning-digest/v1", date: 1, sections: [] })) === null && parseMorningDigest(JSON.stringify({ schema: "morning-digest/v1", date: "d", sections: {} })) === null);
+    const d = parseMorningDigest(producer)!;
+    t("digest: generator-shape parses (4 sections + generatedAtSec)", d !== null && d.date === "2026-10-09" && d.sections.length === 4 && d.generatedAtSec === 1_900_000_000);
+    t("digest/CDV-P2-1: all four real lines survive (content not emptied)", d.sections.map((s) => s.lines.length).join(",") === "1,1,1,1" && d.sections[0]!.lines[0] === "blocked: T5-1 awaiting review");
+    t("digest: quiet-night single section round-trips", (() => { const q = parseMorningDigest(JSON.stringify({ schema: "morning-digest/v1", date: "d", generatedAtSec: 0, sections: [{ title: "quiet night", lines: ["nothing to report"] }] }))!; return q.sections.length === 1 && q.sections[0]!.lines[0] === "nothing to report"; })());
+    t("digest: malformed section (no lines array) dropped; non-string lines filtered; good kept", (() => { const p = parseMorningDigest(JSON.stringify({ schema: "morning-digest/v1", date: "d", generatedAtSec: 0, sections: [{ title: "ok", lines: ["a", 7, "b"] }, { title: "bad" }, { lines: ["x"] }] }))!; return p.sections.length === 1 && p.sections[0]!.lines.join(",") === "a,b"; })());
+    t("digest: wrong/absent schema or empty date ⇒ null", parseMorningDigest(JSON.stringify({ schema: "x", date: "d", sections: [] })) === null && parseMorningDigest(JSON.stringify({ date: "d", sections: [] })) === null && parseMorningDigest(JSON.stringify({ schema: "morning-digest/v1", date: "", sections: [] })) === null);
+    t("digest: non-array sections ⇒ null; missing generatedAtSec tolerated (⇒ 0)", parseMorningDigest(JSON.stringify({ schema: "morning-digest/v1", date: "d", sections: {} })) === null && parseMorningDigest(JSON.stringify({ schema: "morning-digest/v1", date: "d", sections: [] }))!.generatedAtSec === 0);
     t("digest: corrupt / empty JSON ⇒ null (graceful degrade)", parseMorningDigest("{not json") === null && parseMorningDigest("") === null);
-    t("digest: readMorningDigest on an absent file ⇒ null", readMorningDigest(mkdtempSync(path.join(tmpdir(), "md-"))) === null);
+    // Real writer → reader at the FILE boundary (the integration contract): the producer shape on disk, read back.
+    const mdHome = mkdtempSync(path.join(tmpdir(), "md-"));
+    mkdirSync(path.join(mdHome, ".agenthop", "console", "morning-digest"), { recursive: true });
+    writeFileSync(path.join(mdHome, ".agenthop", "console", "morning-digest", "digest.json"), producer);
+    t("digest/CDV-P2-1: writer→reader at the file boundary preserves all 4 lines", (() => { const r = readMorningDigest(mdHome); return r !== null && r.sections.reduce((n, s) => n + s.lines.length, 0) === 4; })());
+    rmSync(mdHome, { recursive: true, force: true });
+    t("digest: readMorningDigest on an absent file ⇒ null", readMorningDigest(mkdtempSync(path.join(tmpdir(), "md-none-"))) === null);
   }
 
   console.log("all selftests passed");

@@ -30,7 +30,7 @@
 
   /* ---------- top bar ---------- */
   header {
-    display: flex; align-items: center; gap: 18px; padding: 0 20px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 18px; padding: 0 20px;
     border-bottom: 1px solid var(--line);
     background: var(--panel); backdrop-filter: blur(16px) saturate(1.4);
     z-index: 5;
@@ -340,7 +340,6 @@
   .dsection h4 .n { color:var(--ink-dim); letter-spacing:0; }
   .dsection ul { margin:0; padding:0; list-style:none; display:flex; flex-direction:column; gap:6px; }
   .dsection li { font-size:12px; color:var(--ink); line-height:1.4; }
-  .dsection li .dref { color:var(--faint); font-size:10.5px; font-variant-numeric:tabular-nums; margin-left:6px; }
   .dsection .dempty { color:var(--faint); font-size:11px; font-style:italic; }
   .digest-empty { color:var(--ink-dim); text-align:center; padding:48px 16px; font-size:13px; line-height:1.6; }
   .kanban-view .khead { display:flex; align-items:baseline; gap:14px; margin-bottom:12px; }
@@ -849,11 +848,11 @@
     }
     const sections = Array.isArray(d.sections) ? d.sections : [];
     const cards = sections.map((s) => {
-      const items = Array.isArray(s.items) ? s.items : [];
-      const body = items.length
-        ? `<ul>${items.map((it) => `<li>${esc(it.text)}${it.ref ? `<span class="dref">${esc(it.ref)}</span>` : ""}</li>`).join("")}</ul>`
+      const lines = Array.isArray(s.lines) ? s.lines : []; // generator shape: sections[].lines: string[]
+      const body = lines.length
+        ? `<ul>${lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>`
         : `<div class="dempty">— none —</div>`;
-      return `<div class="dsection"><h4>${esc(s.title)}<span class="n">${items.length}</span></h4>${body}</div>`;
+      return `<div class="dsection"><h4>${esc(s.title)}<span class="n">${lines.length}</span></h4>${body}</div>`;
     }).join("");
     box.innerHTML = `<div class="dhead"><h3>Morning digest</h3><span class="ddate">${esc(d.date)}</span></div>`
       + (sections.length ? `<div class="dgrid">${cards}</div>` : `<div class="digest-empty">Digest for ${esc(d.date)} has no sections.</div>`);
@@ -1006,11 +1005,14 @@
     // jobs = by dependency. It renders only when the brain projection is present.
     // Kanban is a distinct overlay view (board columns + member swimlanes), not the SVG stage. The stall
     // banner still shows (renderStall never hides). Hidden unless selected, so it never covers the stage.
+    // Set EVERY overlay's visibility BEFORE any view branch returns (CDV-P2-2): the kanban/timeline branches
+    // return early, so a per-branch toggle placed after them would leave a prior full-width overlay (digest,
+    // z-index:4) on top of the target view. Hoisting all three keeps exactly one overlay shown.
     $("kanban").style.display = viewMode === "kanban" ? "block" : "none";
-    if (viewMode === "kanban") { renderKanban(); renderHeader(); renderStall(); return; }
     $("timeline").style.display = viewMode === "timeline" ? "block" : "none";
-    if (viewMode === "timeline") { renderTimeline(); renderHeader(); renderStall(); return; }
     $("digest").style.display = viewMode === "digest" ? "block" : "none";
+    if (viewMode === "kanban") { renderKanban(); renderHeader(); renderStall(); return; }
+    if (viewMode === "timeline") { renderTimeline(); renderHeader(); renderStall(); return; }
     if (viewMode === "digest") { renderDigest(); renderHeader(); renderStall(); return; }
     if (viewMode === "canvas") { document.body.classList.remove("jobs-view"); renderCanvas(); renderDrawer(); renderHeader(); renderStall(); return; }
     if (viewMode === "jobs" && snap.projection && snap.projection.present) {
