@@ -12,10 +12,10 @@
  *
  * SCOPE — v1 is SCOPE-FREE-ONLY (coordinator architecture ruling A(a)+B(a), after happycapy's adversarial review):
  *   The ONLY auto-allowable commands are ones that touch NO filesystem path at execution — `pwd` / `echo` (literals) / `which`
- *   / `basename` / `dirname` — AND whose execution is PINNED to a trusted absolute path (AD-V1-P1-1: a command NAME does not
- *   bind its implementation; a member shell alias/function/PATH entry could shadow `pwd`/`echo`, so the verdict rewrites the
- *   command to e.g. `/bin/pwd` via the hook's `updatedInput`, and the member hook lstat-verifies the binary before emitting).
- *   Everything else escalates. This is deliberate and airtight:
+ *   / `basename` / `dirname` — AND whose execution is PINNED via a `builtin command <abspath>` rewrite (AD-V1-P1-1: a command NAME
+ *   does not bind its implementation; a member shell alias/function/PATH entry could shadow `pwd`/`echo`, so the verdict rewrites
+ *   the command to e.g. `builtin command /bin/pwd` via the hook's `updatedInput`, and the member hook lstat-verifies the binary
+ *   before emitting). Everything else escalates. Deliberate and bounded (PINNED lists the accepted non-differential residuals):
  *     - PATH reads (cat/ls/…) are OUT: a hook decision cannot bind the EXECUTION target — the gap between the hook's final
  *       resolve and the actual read is an irreducible TOCTOU (a symlink repoint, even to a safe→safe swap), and re-query /
  *       rewrite-to-realpath cannot close it (happycapy ADIO-P1-2, proven).
@@ -82,11 +82,15 @@ export const APPROVAL_POLL_SEC = 15;
 /** AD-V1-P1-1 — the v1 scope-free allowlist AS trusted ABSOLUTE PATHS. These commands read NO filesystem path at execution (no
  *  execution-target TOCTOU); their args are literals (echo), command names (which), or lexical string ops (basename/dirname);
  *  pwd prints cwd. But a command NAME does not bind its execution: `pwd`/`echo`/… can be shadowed by a member shell alias /
- *  function / PATH entry, so auto-allowing the NAME would run an attacker's implementation. The verdict rewrites the command to
- *  its absolute path here, removing the member shell's name resolution from the path entirely. Standard POSIX locations (macOS +
- *  Linux); the member hook lstat-verifies the path is a real regular file in ITS env before emitting (dangling link / directory /
- *  symlink-replacement ⇒ escalate). The one residual — /bin itself tampered — is system-compromise level, outside any user-space
- *  threat model (coordinator ruling; a sanitized read could not defend it either). */
+ *  function / PATH entry (incl. a slash-named BASH_ENV function), so auto-allowing the NAME would run an attacker's
+ *  implementation. The verdict rewrites the command to `builtin command <abspath>` (planDelegation): `command` skips
+ *  function/alias lookup, `builtin` forces the real `command` builtin — the member shell's name resolution no longer
+ *  participates. Standard POSIX locations (macOS + Linux); the member hook lstat-verifies the path is a real regular file in ITS
+ *  env before emitting (dangling link / directory / symlink-replacement ⇒ escalate). ACCEPTED RESIDUALS (bounded contract,
+ *  coordinator-ruled NON-DIFFERENTIAL — each defeats a USER's own approval of the SAME command equally, so auto-allow need only
+ *  be no-worse-than-user-approval): a member function shadowing `builtin`/`command` themselves; a BASH_ENV/ENV startup file that
+ *  executes arbitrary code at shell init; /bin itself tampered. All are shell-/system-compromise level, outside the
+ *  differential-auto-allow threat model (a sanitized read could not defend them either). */
 const PINNED = new Map<string, string>([
   ["pwd", "/bin/pwd"], ["echo", "/bin/echo"], ["which", "/usr/bin/which"], ["basename", "/usr/bin/basename"], ["dirname", "/usr/bin/dirname"],
 ]); // a Map, NOT a plain object (AD-V1-R2-P2-1 / AD-R2-P1-1 lineage): `PINNED.get("constructor"|"toString"|"__proto__"|…)` is

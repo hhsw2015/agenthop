@@ -2,16 +2,31 @@
 
 owner 90b58f9c · board `approval-delegation` · **coordinator architecture ruling A(a)+B(a) (2026-10-11), after happycapy's
 adversarial review proved the auto-allow approach cannot soundly cover path/git reads.** v1 is **SCOPE-FREE-ONLY**. Encoded in
-`packages/bus/src/swarm/approval-delegation.ts` (`planDelegation` + `SCOPE_FREE`); this file is the human-readable contract.
+`packages/bus/src/swarm/approval-delegation.ts` (`planDelegation` + the `PINNED` Map); this file is the human-readable contract.
 
 ## Principle — v1 delegates ONLY commands that read no filesystem path
 
-A hook decision cannot bind the EXECUTION of the member's own command: the gap between the hook's final check and the actual
-read is an irreducible TOCTOU, and the member's env/config drive hidden execution. So v1 auto-allows ONLY commands whose
-execution touches no cwd-relative path and no repo — their safety is structural, not fact-dependent:
+A hook decision cannot bind the EXECUTION of a member command that READS a member-supplied path: the gap between the hook's
+final check and the actual read is an irreducible TOCTOU. So v1 auto-allows ONLY commands whose execution touches no cwd-relative
+path and no repo (no path-read TOCTOU); execution is then bound by rewriting to `builtin command <abspath>` + an lstat of the
+FIXED pinned binary (see **Execution binding** below):
 
-**Delegable (auto-allow, no facts needed):** `pwd` (no args) · `echo …` (args are literals) · `which …` · `basename …` ·
-`dirname …`
+**Delegable (auto-allow):** `pwd` (no args) · `echo …` (args are literals) · `which …` · `basename …` · `dirname …` — each
+case-SENSITIVE (only the exact lowercase name; `ECHO`/`Pwd` escalate) and classified via a `Map` lookup, so a prototype-inherited
+name (`constructor`/`toString`/`__proto__`/…) is never delegable and never recorded.
+
+## Execution binding (AD-V1-P1-1)
+
+A command NAME does not bind its implementation: a member shell alias / function / PATH entry — including a slash-named
+`BASH_ENV` function that shadows the `/bin/pwd` literal — can make the name run attacker code. So the delegate verdict REWRITES
+the command to `builtin command <abspath>` (e.g. `builtin command /bin/pwd`) via the hook's `updatedInput`: `command` skips
+function/alias lookup, `builtin` forces the real `command` builtin. The member hook lstat-verifies the pinned binary is a real
+regular file in ITS OWN env before emitting (dangling link / symlink-replacement / directory ⇒ escalate), and recomputes the
+rewrite locally (it never executes the rewrite string carried in the control-log decision — the log authorizes WHETHER, the
+member binds WHAT runs). **Accepted residuals** (coordinator-ruled NON-DIFFERENTIAL — each defeats a user's own approval of the
+same command equally, so auto-allow need only be no-worse-than-user-approval): a function shadowing `builtin`/`command`
+themselves; a `BASH_ENV`/`ENV` startup file that runs arbitrary code at shell init; `/bin` tampering. These are
+shell-/system-compromise level, outside the differential-auto-allow threat model (a sanitized read could not defend them either).
 
 Everything else escalates to the user:
 - **privilege** (escalate:"privilege") — the blacklist backstop: `sudo`/`rm`/`mv`/`chmod`/`curl`/`wget`/pkg-managers/`env`/
@@ -44,5 +59,5 @@ them on the user's behalf.
 
 ## How to change this
 
-The user vetoes or expands by ruling; the owner edits both this file and `planDelegation`/`SCOPE_FREE` in the same change, and
+The user vetoes or expands by ruling; the owner edits both this file and `planDelegation`/`PINNED` in the same change, and
 the selftest pins the new forms. No silent drift.
