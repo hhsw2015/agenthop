@@ -1807,8 +1807,11 @@ async function main(): Promise<void> {
       runDigest();
       // SWARM_INBOX_WAKE backstop: the write-side hook pings on every new message; this only re-pings the COORDINATOR's box if an
       // item has lain unclaimed past the window (a write-side wake that was missed because herdr was briefly down). Shares the hook's
-      // cooldown ledger, so it never double-fires a just-pinged box. Gated on a stable coordinator sid; fully fail-soft.
-      if (isStableSid(COORDINATOR)) await backstopWake(HOME, COORDINATOR, log);
+      // filesystem claim, so it never double-fires a just-pinged box. IW-P2-2: resolve the coordinator through the SAME identity
+      // resolver the normal notify path uses (resolveSession) — a configured handle resolves to its stable SID; no-resolution or a
+      // non-stable result is skipped (never use a display handle as the box key). Fully fail-soft.
+      const wakeCoordSid = resolveSession(COORDINATOR, listSessions(HOME));
+      if (wakeCoordSid && isStableSid(wakeCoordSid)) await backstopWake(HOME, wakeCoordSid, log);
     },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     passIntervalMs: 5000,

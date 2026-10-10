@@ -1,36 +1,47 @@
-// Standalone FC-6 (deterministic decision) / FC-7 (hook unset = byte-for-byte v0 delivery) selftest for the inbox real-time wake.
-// Run: tsx packages/bus/src/swarm/inbox-wake.selftest.mts
+// Standalone FC-6 (deterministic decision + 先占后发 claim) / FC-7 (hook unset = byte-for-byte v0 delivery) selftest for the inbox
+// real-time wake. Run: tsx packages/bus/src/swarm/inbox-wake.selftest.mts
 import { mkdtempSync, rmSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { shouldInjectWake, wakeSession, runWakeBackstop, inboxWakeEnabled, wakeText, type WakeDeps, type PaneInfo } from "./inbox-wake.js";
+import { shouldInjectWake, wakeSession, runWakeBackstop, inboxWakeEnabled, installInboxWake, claimWakeSlot, wakeText, type WakeDeps, type PaneInfo } from "./inbox-wake.js";
 import { writeInbox, setInboxWakeHook, scanUnclaimedInbox } from "../inbox.js";
 
 let pass = 0;
 const ok = (cond: boolean, msg: string): void => { if (!cond) { console.error(`FAIL ${msg}`); process.exit(1); } pass++; console.log(`ok  ${msg}`); };
 
 const COOL = 120_000;
-// FC-6 — shouldInjectWake is a PURE, deterministic decision.
-ok(shouldInjectWake(1_000_000, -Infinity, "idle", 1, COOL) === true, "idle + unclaimed + past-cooldown ⇒ inject");
-ok(shouldInjectWake(1_000_000, -Infinity, "working", 1, COOL) === false, "working pane ⇒ never interrupt");
-ok(shouldInjectWake(1_000_000, -Infinity, "unknown", 1, COOL) === false, "unknown state ⇒ can't confirm not-working ⇒ safe no");
-ok(shouldInjectWake(1_000_000, -Infinity, "idle", 0, COOL) === false, "nothing unclaimed ⇒ no");
-ok(shouldInjectWake(1_000_000, 1_000_000 - 1, "idle", 3, COOL) === false, "within cooldown of last inject ⇒ no (anti-storm)");
-ok(shouldInjectWake(1_000_000, 1_000_000 - COOL, "idle", 3, COOL) === true, "exactly at cooldown boundary ⇒ inject");
+// FC-6 — shouldInjectWake is a PURE, deterministic decision (state + count + optional cooldown contract).
+ok(shouldInjectWake(1e6, -Infinity, "idle", 1, COOL) === true, "idle + unclaimed ⇒ wakeable");
+ok(shouldInjectWake(1e6, -Infinity, "working", 9, COOL) === false, "working pane ⇒ never interrupt");
+ok(shouldInjectWake(1e6, -Infinity, "unknown", 9, COOL) === false, "unknown state ⇒ can't confirm not-working ⇒ safe no");
+ok(shouldInjectWake(1e6, -Infinity, "idle", 0, COOL) === false, "nothing unclaimed ⇒ no");
+ok(shouldInjectWake(1e6, 1e6 - 1, "idle", 3, COOL) === false, "within cooldown ⇒ no");
+ok(shouldInjectWake(1e6, 1e6 - COOL, "idle", 3, COOL) === true, "at cooldown boundary ⇒ yes");
 ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite clock ⇒ fail-safe no");
-ok(shouldInjectWake(Infinity, -Infinity, "idle", 1, COOL) === false, "infinite clock ⇒ fail-safe no");
-// determinism: same inputs, many calls, identical output.
-{ let same = true; for (let i = 0; i < 1000; i++) if (shouldInjectWake(5_000_000, 4_000_000, "idle", 2, COOL) !== true) same = false; ok(same, "FC-6: 1000x same inputs ⇒ identical output (no clock/IO inside)"); }
+{ let same = true; for (let i = 0; i < 1000; i++) if (shouldInjectWake(5e6, 4e6, "idle", 2, COOL) !== true) same = false; ok(same, "FC-6: 1000x same inputs ⇒ identical output (no clock/IO inside)"); }
 
-// wakeSession with INJECTED deps (no herdr subprocess).
+// 先占后发 — the atomic filesystem claim (cross-process cooldown).
+{
+  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakeclaim-"));
+  try {
+    ok(claimWakeSlot(HOME, "c", 1e6, COOL) === true, "claimWakeSlot: first claim of a window wins");
+    ok(claimWakeSlot(HOME, "c", 1e6, COOL) === false, "claimWakeSlot: a 2nd claim of the SAME window (another process) loses (cross-process cooldown)");
+    ok(claimWakeSlot(HOME, "c", 1e6 + 1, COOL) === false, "claimWakeSlot: still the same window ⇒ loses");
+    ok(claimWakeSlot(HOME, "c", 1e6 + COOL, COOL) === true, "claimWakeSlot: the next window claims again (expiry)");
+    ok(claimWakeSlot(HOME, "..", 1e6, COOL) === true, "claimWakeSlot: a reserved-dot sid is a safe hashed filename (no traversal)");
+    ok(claimWakeSlot(HOME, "c", NaN, COOL) === false, "claimWakeSlot: bad clock ⇒ fail-safe, no claim");
+  } finally { rmSync(HOME, { recursive: true, force: true }); }
+}
+
+// wakeSession with INJECTED deps (claim mimics the per-window O_EXCL; no herdr subprocess).
 const makeDeps = (over: Partial<WakeDeps> = {}): { d: WakeDeps; injects: string[]; clock: { t: number } } => {
-  const injects: string[] = []; const clock = { t: 1_000_000 };
+  const injects: string[] = []; const clock = { t: 1e6 }; const claimed = new Set<string>();
   const d: WakeDeps = {
     now: () => clock.t,
     cooldownMs: COOL,
-    last: new Map(),
-    paneInfo: async (_sid): Promise<PaneInfo | null> => ({ paneId: "w1:p1", state: "idle" }),
-    scan: (_h, _s) => ({ count: 2, oldestMtimeMs: 1 }),
+    claim: (_h, sid, now, cd) => { const w = `${sid}.${Math.floor(now / cd)}`; if (claimed.has(w)) return false; claimed.add(w); return true; },
+    paneInfo: async (): Promise<PaneInfo | null> => ({ paneId: "w1:p1", state: "idle" }),
+    scan: () => ({ count: 2, oldestMtimeMs: 1 }),
     inject: async (_p, text) => { injects.push(text); return true; },
     ...over,
   };
@@ -38,25 +49,29 @@ const makeDeps = (over: Partial<WakeDeps> = {}): { d: WakeDeps; injects: string[
 };
 
 await (async () => {
-  { const { d, injects } = makeDeps(); const r = await wakeSession("/h", "sid", d); ok(r === "injected" && injects.length === 1 && injects[0] === wakeText(2), "wakeSession: idle ⇒ injects the fixed wake line once"); ok(d.last.get("sid") === 1_000_000, "wakeSession: records last-inject for cooldown"); }
-  { const { d, injects } = makeDeps(); await wakeSession("/h", "sid", d); const r2 = await wakeSession("/h", "sid", d); ok(r2 === "cooldown" && injects.length === 1, "wakeSession: a 2nd fire within cooldown (same burst) ⇒ one inject only"); }
-  { const { d, injects, clock } = makeDeps(); await wakeSession("/h", "sid", d); clock.t += COOL; const r2 = await wakeSession("/h", "sid", d); ok(r2 === "injected" && injects.length === 2, "wakeSession: past cooldown ⇒ injects again"); }
-  { const { d, injects } = makeDeps({ paneInfo: async () => ({ paneId: "w1:p1", state: "working" }) }); const r = await wakeSession("/h", "sid", d); ok(r === "state" && injects.length === 0 && d.last.get("sid") === undefined, "wakeSession: working pane ⇒ no inject, no cooldown burned (re-checks next trigger)"); }
-  { const { d, injects } = makeDeps({ paneInfo: async () => null }); const r = await wakeSession("/h", "sid", d); ok(r === "no-pane" && injects.length === 0, "wakeSession: sid not a herdr pane ⇒ no-op (codex-queue seam)"); }
-  { const { d } = makeDeps({ inject: async () => { throw new Error("herdr down"); } }); const r = await wakeSession("/h", "sid", d); ok(r === "error", "wakeSession: an inject throw is isolated (fail-soft)"); }
-  { const { d, injects } = makeDeps({ scan: () => ({ count: 0, oldestMtimeMs: 0 }) }); const r = await wakeSession("/h", "sid", d); ok(r === "empty" && injects.length === 0, "wakeSession: empty box ⇒ no inject"); }
-
-  // backstop: only re-pings when an item has lain past the window.
-  { const { d, injects } = makeDeps({ scan: () => ({ count: 1, oldestMtimeMs: 1_000_000 }) }); const r = await runWakeBackstop("/h", "sid", d, 60_000); ok(r === "fresh" && injects.length === 0, "backstop: item within the window (age 0) ⇒ no re-ping"); }
-  { const { d, injects } = makeDeps({ scan: () => ({ count: 1, oldestMtimeMs: 1_000_000 - 61_000 }) }); const r = await runWakeBackstop("/h", "sid", d, 60_000); ok(r === "injected" && injects.length === 1, "backstop: item lain past the window ⇒ re-ping"); }
-  { const { d, injects } = makeDeps({ scan: () => ({ count: 0, oldestMtimeMs: 0 }) }); const r = await runWakeBackstop("/h", "sid", d, 60_000); ok(r === "empty" && injects.length === 0, "backstop: empty box ⇒ no re-ping"); }
+  { const { d, injects } = makeDeps(); ok((await wakeSession("/h", "s", d)) === "injected" && injects[0] === wakeText(2), "wakeSession: idle ⇒ injects the fixed line once"); }
+  { const { d, injects } = makeDeps(); await wakeSession("/h", "s", d); ok((await wakeSession("/h", "s", d)) === "cooldown" && injects.length === 1, "wakeSession: a 2nd fire in the window (same burst) ⇒ claim lost ⇒ one inject"); }
+  { const { d, injects, clock } = makeDeps(); await wakeSession("/h", "s", d); clock.t += COOL; ok((await wakeSession("/h", "s", d)) === "injected" && injects.length === 2, "wakeSession: next window ⇒ injects again"); }
+  { const { d, injects } = makeDeps({ paneInfo: async () => ({ paneId: "w1:p1", state: "working" }) }); ok((await wakeSession("/h", "s", d)) === "state" && injects.length === 0, "wakeSession: working pane ⇒ no inject (claim burned = 先占后发)"); }
+  { const { d, injects } = makeDeps({ paneInfo: async () => null }); ok((await wakeSession("/h", "s", d)) === "no-pane" && injects.length === 0, "wakeSession: sid not a herdr pane ⇒ no-op (codex-queue seam)"); }
+  { const { d } = makeDeps({ inject: async () => { throw new Error("herdr down"); } }); ok((await wakeSession("/h", "s", d)) === "error", "wakeSession: an inject throw is isolated (fail-soft)"); }
+  { const { d, injects } = makeDeps({ claim: () => false }); ok((await wakeSession("/h", "s", d)) === "cooldown" && injects.length === 0, "wakeSession: a lost claim (another process won) ⇒ no inject"); }
+  { const { d, injects } = makeDeps({ scan: () => ({ count: 0, oldestMtimeMs: 0 }) }); ok((await wakeSession("/h", "s", d)) === "empty" && injects.length === 0, "wakeSession: empty box ⇒ no inject"); }
+  // backstop: re-pings only when an item has lain past the window.
+  { const { d, injects } = makeDeps({ scan: () => ({ count: 1, oldestMtimeMs: 1e6 }) }); ok((await runWakeBackstop("/h", "s", d, 60_000)) === "fresh" && injects.length === 0, "backstop: item within window (age 0) ⇒ no re-ping"); }
+  { const { d, injects } = makeDeps({ scan: () => ({ count: 1, oldestMtimeMs: 1e6 - 61_000 }) }); ok((await runWakeBackstop("/h", "s", d, 60_000)) === "injected" && injects.length === 1, "backstop: item lain past the window ⇒ re-ping"); }
+  { const { d } = makeDeps({ scan: () => ({ count: 0, oldestMtimeMs: 0 }) }); ok((await runWakeBackstop("/h", "s", d, 60_000)) === "empty", "backstop: empty box ⇒ no re-ping"); }
 })();
 
-// flag
+// flag + install gate (library-init path).
 ok(inboxWakeEnabled({}) === true, "SWARM_INBOX_WAKE live by default");
 ok(inboxWakeEnabled({ SWARM_INBOX_WAKE: "0" }) === false, "SWARM_INBOX_WAKE=0 ⇒ off");
+ok(installInboxWake(undefined, { SWARM_INBOX_WAKE: "0", HERDR_ENV: "1", HERDR_PANE_ID: "p1" }) === false, "install: flag off ⇒ not installed");
+ok(installInboxWake(undefined, { HERDR_ENV: "", HERDR_PANE_ID: "" }) === false, "install: no herdr in this process ⇒ silently skip (fail-soft, no cost off-pane)");
+ok(installInboxWake(undefined, { HERDR_ENV: "1", HERDR_PANE_ID: "p1" }) === true, "install: flag on + herdr reachable ⇒ installed (library-init path)");
+setInboxWakeHook(null);
 
-// FC-7 — the delivery primitive with the hook UNSET is byte-for-byte v0 (and a throwing hook never breaks delivery).
+// FC-7 — the delivery primitive with the hook UNSET is byte-for-byte v0; a throwing hook never breaks delivery; only "published" fires.
 {
   const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wake-"));
   try {
@@ -65,14 +80,12 @@ ok(inboxWakeEnabled({ SWARM_INBOX_WAKE: "0" }) === false, "SWARM_INBOX_WAKE=0 �
     ok(scanUnclaimedInbox(HOME, "s1").count === 1, "FC-7: hook unset ⇒ writeInbox writes normally (v0)");
     let fired = 0;
     setInboxWakeHook((_h, sid) => { fired++; if (sid === "boom") throw new Error("hook blew up"); });
-    const r = writeInbox(HOME, "s1", { from: "a", fromLabel: "a", text: "two", via: "local", ts: 2 });
-    ok(r === "published" && fired === 1, "hook fires on a new (published) delivery");
+    ok(writeInbox(HOME, "s1", { from: "a", fromLabel: "a", text: "two", via: "local", ts: 2 }) === "published" && fired === 1, "hook fires on a new (published) delivery");
     const r2 = writeInbox(HOME, "s2", { from: "a", fromLabel: "a", text: "x", via: "local", ts: 3 }, "evt");
-    const r3 = writeInbox(HOME, "s2", { from: "a", fromLabel: "a", text: "x", via: "local", ts: 4 }, "evt"); // re-send ⇒ "already", no fire
+    const r3 = writeInbox(HOME, "s2", { from: "a", fromLabel: "a", text: "x", via: "local", ts: 4 }, "evt");
     ok(r2 === "published" && r3 === "already" && fired === 2, "hook fires only on the FIRST (published) keyed write, not the no-op re-send");
     const before = scanUnclaimedInbox(HOME, "boom").count;
-    const rb = writeInbox(HOME, "boom", { from: "a", fromLabel: "a", text: "z", via: "local", ts: 5 });
-    ok(rb === "published" && scanUnclaimedInbox(HOME, "boom").count === before + 1, "a THROWING hook never breaks the delivery (fail-soft)");
+    ok(writeInbox(HOME, "boom", { from: "a", fromLabel: "a", text: "z", via: "local", ts: 5 }) === "published" && scanUnclaimedInbox(HOME, "boom").count === before + 1, "a THROWING hook never breaks the delivery (fail-soft)");
   } finally { setInboxWakeHook(null); rmSync(HOME, { recursive: true, force: true }); }
 }
 
