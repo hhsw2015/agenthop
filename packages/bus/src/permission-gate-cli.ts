@@ -11,6 +11,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { lstatSync } from "node:fs";
 import { statusHome, writeStatusFile } from "./statusfile.js";
 import { writeInbox, composeInboxMsg } from "./inbox.js";
 import { resolveSession, listSessions } from "./swarm/task-liveness.js";
@@ -56,6 +57,9 @@ export async function runPermissionGateCli(startedAt: number, readStdin: () => P
         return entity && entity.put === "permissionDecision" ? entity.permissionDecision : null;
       } catch { return null; }
     },
+    // AD-V1-P1-1: verify the pinned binary is a real regular file in THIS (the member's) env. lstat does NOT follow symlinks, so
+    // a symlink-replacement / dangling link / directory all fail isFile() ⇒ the gate escalates. Absolute paths only; any fault ⇒ false.
+    pinnedPathOk: (absPath) => { try { return absPath.startsWith("/") && lstatSync(absPath).isFile(); } catch { return false; } },
     emit: (jsonStr) => { process.stdout.write(jsonStr + "\n"); },
     nowMs: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),

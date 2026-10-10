@@ -12,7 +12,10 @@
  *
  * SCOPE — v1 is SCOPE-FREE-ONLY (coordinator architecture ruling A(a)+B(a), after happycapy's adversarial review):
  *   The ONLY auto-allowable commands are ones that touch NO filesystem path at execution — `pwd` / `echo` (literals) / `which`
- *   / `basename` / `dirname`. Everything else escalates. This is deliberate and airtight:
+ *   / `basename` / `dirname` — AND whose execution is PINNED to a trusted absolute path (AD-V1-P1-1: a command NAME does not
+ *   bind its implementation; a member shell alias/function/PATH entry could shadow `pwd`/`echo`, so the verdict rewrites the
+ *   command to e.g. `/bin/pwd` via the hook's `updatedInput`, and the member hook lstat-verifies the binary before emitting).
+ *   Everything else escalates. This is deliberate and airtight:
  *     - PATH reads (cat/ls/…) are OUT: a hook decision cannot bind the EXECUTION target — the gap between the hook's final
  *       resolve and the actual read is an irreducible TOCTOU (a symlink repoint, even to a safe→safe swap), and re-query /
  *       rewrite-to-realpath cannot close it (happycapy ADIO-P1-2, proven).
@@ -50,7 +53,7 @@ export interface ApprovalRequest {
 /** The coordinator's verdict. `delegate` is auto-APPLIED (allow only, v1) and recorded; `escalate` goes to the user and is
  *  NEVER auto-granted (`privilege` = the hard blacklist; `needs-user` = not-safe-enough, fail-closed). */
 export type ApprovalVerdict =
-  | { kind: "delegate"; behavior: "allow" }
+  | { kind: "delegate"; behavior: "allow"; rewrite: string }  // rewrite = the pinned-absolute-path command (execution binding)
   | { kind: "escalate"; reason: "privilege" | "needs-user" };
 
 /** A recorded (② 留痕) delegated decision — the control-log `permissionDecision` payload AND the hook's flowback. Keyed by the
@@ -63,6 +66,9 @@ export interface PermissionDecision {
   command: string;
   toolInputDigest: string;
   behavior: "allow" | "deny";
+  rewrite: string;   // AD-V1-P1-1: the pinned-absolute-path command, recorded for audit (② 留痕). The member hook RECOMPUTES its
+                     // own rewrite at emit and NEVER executes this logged string — the log authorizes WHETHER to allow, the
+                     // member binds WHAT runs (defence against a stale/tampered control-log).
   by: string;        // the deciding coordinator sid
   reason: string;
   atSec: number;
@@ -73,9 +79,17 @@ export interface PermissionDecision {
  *  SAFE direction (the member was blocked at the dialog anyway) and NEVER an auto-grant. */
 export const APPROVAL_POLL_SEC = 15;
 
-/** The v1 scope-free allowlist: commands that read NO filesystem path at execution (so there is no execution-target TOCTOU).
- *  Their args are literals (echo), command names (which), or lexical string ops (basename/dirname); pwd prints cwd. */
-const SCOPE_FREE = new Set(["pwd", "echo", "which", "basename", "dirname"]);
+/** AD-V1-P1-1 — the v1 scope-free allowlist AS trusted ABSOLUTE PATHS. These commands read NO filesystem path at execution (no
+ *  execution-target TOCTOU); their args are literals (echo), command names (which), or lexical string ops (basename/dirname);
+ *  pwd prints cwd. But a command NAME does not bind its execution: `pwd`/`echo`/… can be shadowed by a member shell alias /
+ *  function / PATH entry, so auto-allowing the NAME would run an attacker's implementation. The verdict rewrites the command to
+ *  its absolute path here, removing the member shell's name resolution from the path entirely. Standard POSIX locations (macOS +
+ *  Linux); the member hook lstat-verifies the path is a real regular file in ITS env before emitting (dangling link / directory /
+ *  symlink-replacement ⇒ escalate). The one residual — /bin itself tampered — is system-compromise level, outside any user-space
+ *  threat model (coordinator ruling; a sanitized read could not defend it either). */
+const PINNED: Record<string, string> = {
+  pwd: "/bin/pwd", echo: "/bin/echo", which: "/usr/bin/which", basename: "/usr/bin/basename", dirname: "/usr/bin/dirname",
+};
 
 /** The credential/secret path signature — the privilege backstop inspects the raw command for it (black-before-white). */
 const SECRET_RE = /(\.env|id_rsa|id_ed25519|id_dsa|id_ecdsa|\.pem|\.key|credentials|\.aws|\.ssh|\.npmrc|\.git-credentials|\.netrc|secret|token|password|passwd|\.agenthop\/identity)/;
@@ -105,7 +119,7 @@ export function isBlacklisted(tool: string, command: string): boolean {
  *  blacklist backstop / command substitution, else needs-user). No filesystem facts are ever needed (scope-free touches none). */
 export type DelegationPlan =
   | { gate: "escalate"; reason: "privilege" | "needs-user" }
-  | { gate: "scope-free" };
+  | { gate: "scope-free"; rewrite: string };   // rewrite = the pinned-absolute-path command (AD-V1-P1-1 execution binding)
 
 const esc = (reason: "privilege" | "needs-user"): DelegationPlan => ({ gate: "escalate", reason });
 
@@ -124,12 +138,17 @@ export function planDelegation(command: string): DelegationPlan {
   if (/[*?[\]{}~]/.test(c)) return esc("needs-user");    // glob / brace / tilde expansion
 
   const tokens = c.split(/[ \t]+/).filter(t => t.length > 0); // Bash IFS word-split is space/tab only
-  const cmd = tokens[0].toLowerCase();
-  const rest = tokens.slice(1);
+  const cmd = tokens[0];        // case-SENSITIVE (AD-V1-P1-1): only the EXACT lowercase name delegates — `ECHO`/`Pwd` are NOT
+  const rest = tokens.slice(1); // scope-free (they would otherwise pass the table then EXECUTE the raw spelling, which the
+                                // member's PATH resolves to a different/attacker binary — the uppercase-ECHO hole)
 
-  if (cmd === "pwd") return rest.length === 0 ? { gate: "scope-free" } : esc("needs-user");
-  if (SCOPE_FREE.has(cmd)) return { gate: "scope-free" }; // echo/which/basename/dirname: literals / names, not file reads
-  return esc("needs-user");                                // path reads, git, and everything else ⇒ user (v1; see module header)
+  const pin = PINNED[cmd];
+  if (pin === undefined) return esc("needs-user");                // path reads, git, uppercase spellings, unknown ⇒ user (v1)
+  if (cmd === "pwd" && rest.length > 0) return esc("needs-user"); // pwd takes no args
+  // AD-V1-P1-1 execution binding: pin the command to its trusted ABSOLUTE PATH (the member shell's alias/function/PATH name
+  // resolution no longer participates). Keep the args VERBATIM — they already passed every guard above; `c` is trimmed so it
+  // starts with tokens[0], and slicing keeps the original inter-arg spacing.
+  return { gate: "scope-free", rewrite: pin + c.slice(tokens[0].length) };
 }
 
 /**
@@ -140,7 +159,7 @@ export function classifyApproval(req: ApprovalRequest): ApprovalVerdict {
   const plan = planDelegation(req.command);
   switch (plan.gate) {
     case "escalate":   return { kind: "escalate", reason: plan.reason };
-    case "scope-free": return { kind: "delegate", behavior: "allow" };
+    case "scope-free": return { kind: "delegate", behavior: "allow", rewrite: plan.rewrite };
   }
 }
 

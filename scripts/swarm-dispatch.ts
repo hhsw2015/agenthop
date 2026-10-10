@@ -1700,9 +1700,22 @@ async function main(): Promise<void> {
   // auto-allows — no user dialog). An escalate writes NO decision: the member hook times out to the user dialog, and that blocked
   // member is surfaced + supervised by the existing live-sentinel (S14 blocked⇒S19), so ③ needs no new wait here. Gated on
   // SWARM_APPROVAL_DELEGATE (default OFF); fully fail-soft — never breaks the sweep, never auto-grants.
+  // ADIO-P2-1: releaseInbox returns false when the unclaim rename fails; while THIS process is alive recoverStaleClaims skips our
+  // own .claim-disp-<pid>, so a failed release would strand the claim with no auto-retry. Mirror claimInbox's `stuck` pattern — a
+  // failed release is an OBLIGATION kept in this in-process set and retried on the next sweep (a claim that has since vanished is
+  // dropped — nothing stranded). NEVER log "released" for a deferred one.
+  const approvalPendingRelease = new Set<string>();
+  const releaseOrDefer = (file: string): void => {
+    let released = false;
+    try { released = releaseInbox(file); } catch { released = false; }
+    if (released) { approvalPendingRelease.delete(file); return; }
+    if (!existsSync(file)) { approvalPendingRelease.delete(file); return; } // claim already gone ⇒ nothing stranded
+    approvalPendingRelease.add(file);                                       // still present + unreleased ⇒ retry next sweep
+  };
   const runApprovalDelegation = (): void => {
     if (!approvalDelegateEnabled()) return;
     try {
+      for (const f of [...approvalPendingRelease]) releaseOrDefer(f); // ADIO-P2-1: first retry any release deferred last sweep
       const coordSid = resolveSession(COORDINATOR, listSessions(HOME));
       if (!coordSid || !isStableSid(coordSid)) return; // no stable coordinator identity ⇒ can't key the dedicated approval box
       const key = approvalInboxKey(coordSid);
@@ -1714,7 +1727,7 @@ async function main(): Promise<void> {
       // loop and strand the remainder — the earlier `finally` propagated the throw and did exactly that).
       let st: ReturnType<typeof loadControlLog>;
       try { st = loadControlLog(CONTROL_LOG_DIR); }
-      catch (e) { for (const { file } of claimed) releaseInbox(file); log(`approval delegation: shared load failed, released ${claimed.length} claim(s): ${e instanceof Error ? e.message : e}`); return; }
+      catch (e) { for (const { file } of claimed) releaseOrDefer(file); log(`approval delegation: shared load failed, released/deferred ${claimed.length} claim(s): ${e instanceof Error ? e.message : e}`); return; }
       for (const { file, msg } of claimed) {
         try {
           const req = msg.approval;
@@ -1723,13 +1736,13 @@ async function main(): Promise<void> {
           if (action.act === "delegate") {
             const { state, result } = commitTask(st, [{ put: "permissionDecision", permissionDecision: action.decision }]);
             if (result.ok) { st = state; ackInbox(file); } // ok covers a fresh commit AND an idempotent replay
-            else { st = loadControlLog(CONTROL_LOG_DIR); releaseInbox(file); } // seq conflict ⇒ reload + retry next tick
+            else { st = loadControlLog(CONTROL_LOG_DIR); releaseOrDefer(file); } // seq conflict ⇒ reload + release (or defer) for retry
           } else {
             ackInbox(file); // escalate: no decision ⇒ member hook times out to the user; live-sentinel supervises
           }
         } catch (e) {
-          try { releaseInbox(file); } catch { /* best-effort: recoverStaleClaims is the backstop */ }
-          log(`approval delegation: item ${file} failed (released, continuing): ${e instanceof Error ? e.message : e}`);
+          releaseOrDefer(file); // release, or keep the obligation for a later sweep; never claim "released" on a failed unclaim
+          log(`approval delegation: item ${file} failed (released/deferred, continuing): ${e instanceof Error ? e.message : e}`);
         }
       }
     } catch (e) { log(`approval delegation failed (isolated): ${e instanceof Error ? e.message : e}`); }

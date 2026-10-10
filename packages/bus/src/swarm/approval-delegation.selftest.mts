@@ -22,6 +22,18 @@ for (const c of ["pwd", "echo hi", "echo ../anything is a literal", "which tsx",
 }
 t("pwd with an arg -> needs-user", isNeedsUser(classifyApproval(req("pwd extra"))));
 
+// ── AD-V1-P1-1: the delegate carries the pinned-absolute-path rewrite (execution binding), args verbatim ─────────
+const rw = (c: string) => { const v = classifyApproval(req(c)); return v.kind === "delegate" ? v.rewrite : null; };
+t("rewrite pins pwd", rw("pwd") === "/bin/pwd");
+t("rewrite pins echo + keeps args verbatim", rw("echo hi") === "/bin/echo hi");
+t("rewrite pins echo with collapsed-safe spacing verbatim", rw("echo  a   b") === "/bin/echo  a   b");
+t("rewrite pins which", rw("which tsx") === "/usr/bin/which tsx");
+t("rewrite pins basename", rw("basename a/b/c") === "/usr/bin/basename a/b/c");
+t("rewrite pins dirname", rw("dirname a/b") === "/usr/bin/dirname a/b");
+
+// ── AD-V1-P1-1: match is case-SENSITIVE — a raw/uppercase spelling is NOT scope-free (would execute the raw spelling) ──
+for (const c of ["ECHO hi", "Pwd", "WHICH tsx", "Echo hi", "PWD"]) t(`case-sensitive escalate: ${c}`, isNeedsUser(classifyApproval(req(c))));
+
 // ── v1 DROPPED: path reads + git + search all escalate (not scope-free, not blacklisted ⇒ needs-user) ──────────
 for (const c of ["cat a.txt", "ls", "ls -la", "head a.txt", "tail f.log", "wc -l x", "file x", "stat x",
                  "git status", "git log --oneline", "git diff --stat", "git show --stat", "git branch",
@@ -51,7 +63,7 @@ for (const tool of ["Write", "Read", "Edit", "mcp__x__y"]) t(`structured ${tool}
 t("no delegate-deny", ["pwd", "cat x", "rm x", "git status"].every(c => { const v = classifyApproval(req(c)); return v.kind === "escalate" || (v.kind === "delegate" && v.behavior === "allow"); }));
 
 // ── planDelegation / isBlacklisted ────────────────────────────────────────────────────────────────────────────
-t("planDelegation scope-free for pwd", planDelegation("pwd").gate === "scope-free");
+t("planDelegation scope-free for pwd + pinned rewrite", (() => { const p = planDelegation("pwd"); return p.gate === "scope-free" && p.rewrite === "/bin/pwd"; })());
 t("planDelegation escalate needs-user for cat", (() => { const p = planDelegation("cat x"); return p.gate === "escalate" && (p as any).reason === "needs-user"; })());
 t("planDelegation escalate privilege for rm", (() => { const p = planDelegation("rm x"); return p.gate === "escalate" && (p as any).reason === "privilege"; })());
 t("planDelegation privilege for substitution", (() => { const p = planDelegation("echo `id`"); return p.gate === "escalate" && (p as any).reason === "privilege"; })());

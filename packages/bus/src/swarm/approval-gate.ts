@@ -10,7 +10,7 @@
  *     emit allow/empty), every IO edge injected so it is testable without a filesystem or a coordinator.
  */
 import { createHash } from "node:crypto";
-import { classifyApproval, APPROVAL_POLL_SEC, type ApprovalRequest, type PermissionDecision } from "./approval-delegation.js";
+import { classifyApproval, planDelegation, APPROVAL_POLL_SEC, type ApprovalRequest, type PermissionDecision } from "./approval-delegation.js";
 
 /** The dedicated durable-inbox key the member hook writes an approval request to and the dispatcher drains — `approvals:<coordSid>`
  *  (coordinator ruling): in the coordinator's authority domain but a RESERVED key, not the coordinator SESSION's own sid, so
@@ -46,7 +46,7 @@ export function planCoordinatorAction(req: ApprovalRequest, by: string, nowSec: 
   if (verdict.kind === "delegate") {
     return {
       act: "delegate",
-      decision: { requestId: req.requestId, member: req.member, tool: req.tool, command: req.command, toolInputDigest: req.toolInputDigest, behavior: verdict.behavior, by, reason: `auto-allow:${req.tool}:scope-free`, atSec: nowSec, promptId: req.promptId },
+      decision: { requestId: req.requestId, member: req.member, tool: req.tool, command: req.command, toolInputDigest: req.toolInputDigest, behavior: verdict.behavior, rewrite: verdict.rewrite, by, reason: `auto-allow:${req.tool}:scope-free`, atSec: nowSec, promptId: req.promptId },
     };
   }
   return { act: "escalate", reason: verdict.reason };
@@ -88,10 +88,13 @@ export function decisionBindsTo(dec: PermissionDecision, requestId: string, p: P
   return dec.requestId === requestId && dec.member === p.member && dec.tool === p.tool && dec.command === p.command && dec.toolInputDigest === toolInputDigest(p.toolInput);
 }
 
-/** The exact stdout JSON a SYNC PermissionRequest hook prints to AUTO-ALLOW (verified against the hooks reference). v1 scope-free
- *  commands run as-is (no input rewrite), so this is a plain allow with no updatedInput. Pure. */
-export function allowDecisionOutput(): string {
-  return JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
+/** The exact stdout JSON a SYNC PermissionRequest hook prints to AUTO-ALLOW (verified against the hooks reference). With no
+ *  argument it is a bare allow; with `updatedInput` it carries the AD-V1-P1-1 execution-pinned input — the hooks contract
+ *  REPLACES the ENTIRE tool input, so the caller passes the FULL original input with only `command` swapped to the pinned path. Pure. */
+export function allowDecisionOutput(updatedInput?: unknown): string {
+  const decision: Record<string, unknown> = { behavior: "allow" };
+  if (updatedInput !== undefined) decision.updatedInput = updatedInput;
+  return JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision } });
 }
 
 /** The poll cadence inside the hook's bounded window. */
@@ -105,6 +108,7 @@ export interface PermissionGateDeps {
   reportBlocked: (member: string) => void;                          // writeStatusFile blocked (status visibility, kept)
   writeApprovalRequest: (req: ApprovalRequest) => boolean;          // writeInbox S11 to coordinator; false ⇒ undeliverable
   readDecision: (requestId: string) => PermissionDecision | null;   // loadControlLog ⇒ permissionDecision:<requestId>
+  pinnedPathOk: (absPath: string) => boolean;                       // lstat in the MEMBER's env: pinned binary is a real regular file (AD-V1-P1-1)
   emit: (json: string) => void;                                     // stdout (the decision)
   nowMs: () => number;
   sleep: (ms: number) => Promise<void>;
@@ -132,8 +136,17 @@ export async function runPermissionGate(deps: PermissionGateDeps): Promise<void>
   while (deps.nowMs() < deadline) {
     const dec = deps.readDecision(requestId);
     // The decision must bind to THIS invocation and be an allow (v1 never records a delegated deny; a deny stays a user decision).
-    // A scope-free command reads no path, so there is no execution-target to re-verify — a bound allow is emitted directly.
-    if (dec && decisionBindsTo(dec, requestId, parsed) && dec.behavior === "allow") { deps.emit(allowDecisionOutput()); return; }
+    if (dec && decisionBindsTo(dec, requestId, parsed) && dec.behavior === "allow") {
+      // AD-V1-P1-1: the hook RECOMPUTES the execution-pinned rewrite from the (bound) original command — it NEVER executes the
+      // rewrite string carried in the control-log decision (the log authorizes WHETHER to allow; the member binds WHAT runs).
+      const plan = planDelegation(parsed.command);
+      if (plan.gate !== "scope-free") return;                 // a bound decision for a non-scope-free command ⇒ user dialog (defensive)
+      const bin = plan.rewrite.split(/[ \t]+/)[0];            // the pinned absolute path (no spaces) is the first token
+      if (!deps.pinnedPathOk(bin)) return;                    // missing / symlink / dir in THIS env ⇒ escalate to the user
+      const updatedInput = { ...(parsed.toolInput as Record<string, unknown>), command: plan.rewrite };
+      deps.emit(allowDecisionOutput(updatedInput));           // full original input, only `command` swapped to the pinned path
+      return;
+    }
     await deps.sleep(interval);
   }
   // window elapsed, no bound decision ⇒ emit nothing ⇒ user dialog / auto-deny
