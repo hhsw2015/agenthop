@@ -21,72 +21,80 @@ ok(shouldInjectWake(1e6, 1e6 - COOL, "idle", 3, COOL) === true, "at cooldown bou
 ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite clock ⇒ fail-safe no");
 { let same = true; for (let i = 0; i < 1000; i++) if (shouldInjectWake(5e6, 4e6, "idle", 2, COOL) !== true) same = false; ok(same, "FC-6: 1000x same inputs ⇒ identical output (no clock/IO inside)"); }
 
-// 先占后发 — the atomic filesystem claim as a monotonic GENERATION chain (cross-process cooldown; admit and occupy share one anchor).
+// 先占后发 — the atomic filesystem claim as a SINGLE monotonic head advanced by a rename CAS (cross-process cooldown; one file, no GC).
 {
   const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakeclaim-"));
-  const w = (n: number) => n * COOL; // exact window-n timestamp
+  const w = (n: number) => n * COOL; // exact cooldown-n timestamp
   try {
-    ok(claimWakeSlot(HOME, "c", w(8), COOL) === true, "claimWakeSlot: first claim wins (gen0, ts 8)");
+    ok(claimWakeSlot(HOME, "c", w(8), COOL) === true, "claimWakeSlot: bootstrap + first claim wins (head.1.<w8>)");
     ok(claimWakeSlot(HOME, "c", w(8) + 1, COOL) === false, "claimWakeSlot: a 2nd claim within the cooldown (another process) loses");
-    ok(claimWakeSlot(HOME, "c", w(9), COOL) === true, "claimWakeSlot: a full cooldown later claims again (gen1, advances high-water)");
-    ok(claimWakeSlot(HOME, "c", w(8) + 2, COOL) === false, "claimWakeSlot: a late ts-8 re-claim is rejected by the gen1 timestamp");
-    // IW-P2-1: simulate GC/cleanup removing the older generation's marker, then a LATE ts-8 request resuming.
-    const safe = createHash("sha256").update("c").digest("hex");
-    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.gen0`), { force: true });
-    ok(claimWakeSlot(HOME, "c", w(8) + 3, COOL) === false, "IW-P2-1: a GC'd old generation does not re-admit — the gen1 timestamp is still the authority");
-    ok(claimWakeSlot(HOME, "c", w(10), COOL) === true, "claimWakeSlot: a genuinely newer claim still wins (new generation)");
+    ok(claimWakeSlot(HOME, "c", w(9), COOL) === true, "claimWakeSlot: a full cooldown later advances the head");
+    ok(claimWakeSlot(HOME, "c", w(8) + 2, COOL) === false, "claimWakeSlot: a late ts-8 re-claim is rejected by the head timestamp");
     ok(claimWakeSlot(HOME, "..", w(8), COOL) === true, "claimWakeSlot: a reserved-dot sid is a safe hashed filename (no traversal)");
     ok(claimWakeSlot(HOME, "c", NaN, COOL) === false, "claimWakeSlot: bad clock ⇒ fail-safe, no claim");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
-// IW-P2-1 three holes closed at the root: the generation markers ARE the high-water (no mutable hw file, no stealable gate).
+// IW-P2-1 (r9 ABA): rename-CAS makes a consumed generation un-reusable. A stale snapshot whose head advanced under it renames FROM a name
+// that is gone ⇒ ENOENT ⇒ yields — unlike O_EXCL create, which (r8) succeeded on a GC-freed name and double-injected.
+{
+  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakeaba-"));
+  const w = (n: number) => n * COOL;
+  try {
+    ok(claimWakeSlot(HOME, "c", w(8), COOL) === true, "ABA: bootstrap + first inject (head.1.<w8>)");
+    let advanced = false;
+    const advance = (): void => { if (!advanced) { advanced = true; ok(claimWakeSlot(HOME, "c", w(20), COOL) === true, "ABA: concurrent B advances the head under A"); } };
+    ok(claimWakeSlot(HOME, "c", w(20), COOL, advance) === false, "IW-P2-1 r9: A scanned the old head; it advanced under A ⇒ rename-CAS ENOENT ⇒ A yields (no GC-enabled reuse)");
+    ok(claimWakeSlot(HOME, "c", w(20) + 1, COOL) === false, "ABA: still within cooldown of B's inject ⇒ yield");
+    ok(claimWakeSlot(HOME, "c", w(21), COOL) === true, "ABA: a full cooldown past B ⇒ a genuine new claim advances");
+    ok(claimWakeSlot(HOME, "c", w(200), COOL, () => { /* no interference */ }) === true, "ABA control: no concurrent advance ⇒ the admitted claim's rename-CAS succeeds");
+  } finally { rmSync(HOME, { recursive: true, force: true }); }
+}
+// Fail-closed: a late lower-ts claim is rejected by the high-water MAX; a dir read fault and a persist fault never admit.
 {
   const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakehole-"));
   const w = (n: number) => n * COOL;
   const dir = path.join(HOME, ".agenthop/console/inbox-wake");
   try {
-    // ① concurrent-regression CONSEQUENCE: advance far, let GC drop old generation markers, then a late GC'd slot must NOT re-admit.
-    for (const n of [8, 9, 10, 11, 12]) ok(claimWakeSlot(HOME, "c", w(n), COOL) === true, `sequential claim generation at ts ${n}`);
-    ok(claimWakeSlot(HOME, "c", w(10) + 1, COOL) === false, "① a late request at ts 10 is rejected by the high-water MAX — no regression re-admits it");
+    // advance the head several cooldowns, then a late lower-ts request must NOT re-admit (the head timestamp is the authority).
+    for (const n of [8, 9, 10, 11, 12]) ok(claimWakeSlot(HOME, "c", w(n), COOL) === true, `sequential claim at ts ${n}`);
+    ok(claimWakeSlot(HOME, "c", w(10) + 1, COOL) === false, "① a late request at ts 10 is rejected by the high-water MAX");
     ok(claimWakeSlot(HOME, "c", w(9) + 1, COOL) === false, "① a late request at ts 9 is rejected by the high-water MAX");
-    // ② read fault ≠ absent: an unreadable marker dir ⇒ UNKNOWN ⇒ fail-closed (reject), never treated as initial.
+    // ② read fault != absent: an unreadable marker dir ⇒ UNKNOWN ⇒ fail-closed (reject), never treated as initial.
     chmodSync(dir, 0o000);
     try { ok(claimWakeSlot(HOME, "c", w(13), COOL) === false, "② readdir EACCES ⇒ UNKNOWN ⇒ reject (not treated as empty/initial)"); }
     finally { chmodSync(dir, 0o700); }
-    // ③ persist fault: a read-only marker dir ⇒ the O_EXCL create fails ⇒ no authorize (no marker, no GC).
+    // ③ persist fault: a read-only marker dir ⇒ the bootstrap/rename fails ⇒ no authorize.
     chmodSync(dir, 0o500);
     let created = true;
     try { created = claimWakeSlot(HOME, "c", w(14), COOL); } finally { chmodSync(dir, 0o700); }
-    ok(created === false, "③ create/persist fault ⇒ not authorized (publish-after-fact: no marker ⇒ no inject)");
-    ok(claimWakeSlot(HOME, "c", w(15), COOL) === true, "after faults clear, a genuinely new window still claims (max intact)");
+    ok(created === false, "③ create/persist fault ⇒ not authorized (publish-after-fact: no advance ⇒ no inject)");
+    ok(claimWakeSlot(HOME, "c", w(15), COOL) === true, "after faults clear, a genuinely new claim still advances (head intact)");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
-// IW-R4-P2-1: a cooldown PARAMETER change must not let old window numbers block new wakes (interval-family scoping).
+// IW-R4-P2-1: a cooldown PARAMETER change must not let a stale interpretation block new wakes (the admit is purely time-based).
 {
   const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakeparam-"));
   const C60 = 60_000, C120 = 120_000;
   try {
-    // 60s cooldown: claim at t=1_000_000 (60s window 16).
-    ok(claimWakeSlot(HOME, "c", 1_000_000, C60) === true, "param: 60s claim at t=1,000,000 (window 16) wins");
-    // restart to 120s, clock +240s (t=1,240,000; 120s window 10). Under a shared window sequence 10<=16 would FALSELY reject.
-    ok(claimWakeSlot(HOME, "c", 1_240_000, C120) === true, "IW-R4-P2-1: 60→120 then +240s ⇒ NEW interval family admits (old window 16 does not block window 10)");
+    ok(claimWakeSlot(HOME, "c", 1_000_000, C60) === true, "param: a 60s-cooldown claim at t=1,000,000 wins");
+    // switch to a 120s cooldown, clock +240s: the admit is now - headTs >= cooldown, parameter-independent ⇒ admits.
+    ok(claimWakeSlot(HOME, "c", 1_240_000, C120) === true, "IW-R4-P2-1: 60→120 then +240s ⇒ admits (time-based, not blocked by the old cooldown)");
     // reverse: another target, 120s then 60s.
-    ok(claimWakeSlot(HOME, "d", 1_000_000, C120) === true, "param: 120s claim (window 8) wins");
-    ok(claimWakeSlot(HOME, "d", 1_240_000, C60) === true, "IW-R4-P2-1 reverse: 120→60 then +240s ⇒ new family admits (window 20)");
-    // same-interval cooldown still holds within a family: a re-send in the SAME 60s window is rejected.
-    ok(claimWakeSlot(HOME, "d", 1_245_000, C60) === false, "within the new 60s family, a re-send in the same window (20) is still rejected");
+    ok(claimWakeSlot(HOME, "d", 1_000_000, C120) === true, "param: a 120s-cooldown claim wins");
+    ok(claimWakeSlot(HOME, "d", 1_240_000, C60) === true, "IW-R4-P2-1 reverse: 120→60 then +240s ⇒ admits");
+    ok(claimWakeSlot(HOME, "d", 1_245_000, C60) === false, "only 5s since the last inject ⇒ rejected (the new 60s cooldown holds)");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
 
-// IW-P2-1 r5-regression: a cross-family GC must not re-open a used window — the GLOBAL max timestamp is the authority.
+// IW-P2-1 r5-regression: the GLOBAL max timestamp is the authority across cooldown-parameter changes (no revival).
 {
   const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakexfam-"));
   const C60 = 60_000, C120 = 120_000;
   try {
-    ok(claimWakeSlot(HOME, "x", 1_000_000, C120) === true, "xfam: 120s family injects at t=1,000,000 (window 8)");
-    ok(claimWakeSlot(HOME, "x", 1_061_000, C60) === true, "xfam: 60s family injects at t=1,061,000 (its GC may drop the 120s marker)");
-    ok(claimWakeSlot(HOME, "x", 1_062_000, C120) === false, "IW-P2-1: 120s re-claim at t=1,062,000 is rejected by the 60s inject's timestamp (global MAX) — no window-8 revival");
-    ok(claimWakeSlot(HOME, "x", 1_181_001, C120) === true, "xfam: once 120s has truly elapsed since the last inject, the 120s family admits again");
+    ok(claimWakeSlot(HOME, "x", 1_000_000, C120) === true, "xfam: inject at a 120s cooldown (t=1,000,000)");
+    ok(claimWakeSlot(HOME, "x", 1_061_000, C60) === true, "xfam: inject at a 60s cooldown (t=1,061,000, advances the head)");
+    ok(claimWakeSlot(HOME, "x", 1_062_000, C120) === false, "IW-P2-1: a 120s re-claim at t=1,062,000 is rejected by the last inject's timestamp (global MAX) — no revival");
+    ok(claimWakeSlot(HOME, "x", 1_181_001, C120) === true, "xfam: once 120s has truly elapsed since the last inject, the claim admits again");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
 // IW-R5-P2-1: a still-valid marker in a DIFFERENT/legacy/unknown schema is EVIDENCE (blocks), never ignored.
@@ -108,26 +116,28 @@ ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite cloc
     rmSync(HOME2, { recursive: true, force: true });
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
-// IW-P2-1 (r8): the GENERATION chain replaces the stealable gate. The admit TEST and the occupy are the SAME anchor — the next
-// generation file (`<sha>.gen<N>`), so two claimers that observe the same state target the same file and O_EXCL admits exactly one; a
-// claimer that observes a newer generation also reads its recent timestamp and fails the admit. There is NO lock to steal, NO lease to
-// expire, NO recycle — so the r7 gate-recovery holes (paused-holder-stolen, late-recycler-deletes-fresh-gate, read-error-authorizes-steal)
-// vanish by construction. A crashed holder leaves a valid gen marker that just enforces the cooldown and is superseded next generation.
+// IW-P2-1 (r9): a SINGLE head file advanced by rename — one file (never accumulates), no GC, no permanent block; an unparseable head with
+// no valid head present fails closed (never bootstrap a fresh epoch over corruption).
 {
-  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakegen-"));
-  const dir = path.join(HOME, ".agenthop/console/inbox-wake"); mkdirSync(dir, { recursive: true });
+  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakehead-"));
+  const dir = path.join(HOME, ".agenthop/console/inbox-wake");
   const safe = createHash("sha256").update("c").digest("hex");
   const w = (n: number) => n * COOL;
+  const heads = (): string[] => readdirSync(dir).filter((n) => n.startsWith(`${safe}.head.`));
   try {
-    // a concurrent claimer already advanced the chain: gen0 (old) + gen1 (recent). A claim the time-admit would pass on gen0 alone still
-    // yields — the newest generation's recent timestamp is the high-water, so no interleaving injects twice and there is no lock to steal.
-    writeFileSync(path.join(dir, `${safe}.gen0`), String(w(0)));
-    writeFileSync(path.join(dir, `${safe}.gen1`), String(w(9)));
-    ok(claimWakeSlot(HOME, "c", w(9) + 1, COOL) === false, "IW-P2-1 r8: a newer generation's recent timestamp blocks a claim the time-admit would pass on the old generation alone");
-    ok(claimWakeSlot(HOME, "c", w(10), COOL) === true, "IW-P2-1 r8: a full cooldown past the newest generation admits (new generation)");
-    // a crashed holder left only OLD generation markers: no gate to steal, no age to wait out — the next past-cooldown claim simply wins.
-    ok(claimWakeSlot(HOME, "c", w(200), COOL) === true, "IW-P2-1 r8: a stalled/crashed holder's old generation never permanently blocks — a far-later claim admits");
+    ok(claimWakeSlot(HOME, "c", w(8), COOL) === true, "r9: bootstrap + advance (head.0.0 ⇒ head.1.<w8>)");
+    ok(heads().length === 1, "r9: exactly ONE head file (renamed in place, never accumulates)");
+    ok(claimWakeSlot(HOME, "c", w(9), COOL) === true, "r9: advance");
+    ok(heads().length === 1, "r9: still exactly one head file");
+    ok(claimWakeSlot(HOME, "c", w(500), COOL) === true, "r9: a far-later claim advances — a stalled/crashed holder's head never permanently blocks");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
+  const HOME2 = mkdtempSync(path.join(os.tmpdir(), "ah-wakecorrupt-"));
+  const dir2 = path.join(HOME2, ".agenthop/console/inbox-wake"); mkdirSync(dir2, { recursive: true });
+  const safe2 = createHash("sha256").update("c").digest("hex");
+  try {
+    writeFileSync(path.join(dir2, `${safe2}.head.notanumber`), "");
+    ok(claimWakeSlot(HOME2, "c", Date.now(), COOL) === false, "IW-P2-1 r9: an unparseable head with no valid head ⇒ fail-closed (never bootstrap over corruption)");
+  } finally { rmSync(HOME2, { recursive: true, force: true }); }
 }
 
 // wakeSession with INJECTED deps (claim mimics the per-window O_EXCL; no herdr subprocess).

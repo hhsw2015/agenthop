@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, utimesSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, utimesSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -25,36 +25,44 @@ describe("inbox-wake — claimWakeSlot (先占后发, cross-process atomic)", ()
   beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wake-")); });
   afterEach(() => { try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ } });
   const w = (n: number) => n * COOL;
-  test("one winner per window; same-window loses; newer window wins; bad clock ⇒ no claim; dot-sid safe", () => {
-    expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);       // window 8 wins
-    expect(claimWakeSlot(HOME, "c", w(8) + 1, COOL)).toBe(false);  // same window, another process ⇒ loses
-    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);       // next window (advances high-water)
+  test("one winner per cooldown; within-cooldown loses; a cooldown later wins; bad clock ⇒ no claim; dot-sid safe", () => {
+    expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);       // bootstrap + first claim wins (head.1.<w8>)
+    expect(claimWakeSlot(HOME, "c", w(8) + 1, COOL)).toBe(false);  // within the cooldown, another process ⇒ loses
+    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);       // a full cooldown later ⇒ advances the head
     expect(claimWakeSlot(HOME, "..", w(8), COOL)).toBe(true);      // reserved-dot sid hashed to a safe filename (no traversal)
     expect(claimWakeSlot(HOME, "c", NaN, COOL)).toBe(false);       // fail-safe
   });
-  test("IW-P2-1: a GC'd old generation re-claimed late is rejected by the high-water MAX (cleanup never re-admits)", () => {
-    expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);       // gen0 (ts 8)
-    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);       // gen1 (ts 9) ⇒ high-water 9
-    const safe = createHash("sha256").update("c").digest("hex");
-    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.gen0`), { force: true }); // simulate cleanup removing the older generation
-    expect(claimWakeSlot(HOME, "c", w(8) + 5, COOL)).toBe(false);  // a late ts-8 claim: the gen1 timestamp (9) is still the authority ⇒ rejects
-    expect(claimWakeSlot(HOME, "c", w(10), COOL)).toBe(true);      // a genuinely newer claim still wins (new generation)
+  test("IW-P2-1 (r9): rename-CAS closes the ABA — a stale snapshot cannot re-commit after the head advanced (no GC-enabled reuse)", () => {
+    expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);        // bootstrap + first inject ⇒ head.1.<w8>
+    // A scans the head at w(20); the seam fires BEFORE A's rename-CAS, advancing the head (a concurrent claimer B). A's rename is FROM
+    // the old head name, which is now gone ⇒ ENOENT ⇒ A yields. Under the r8 gen-chain, A's O_EXCL create of the freed number succeeded
+    // and double-injected; the rename-CAS cannot (you cannot rename from a vanished name), so the ABA is closed by construction.
+    let advanced = false;
+    const advance = () => { if (!advanced) { advanced = true; expect(claimWakeSlot(HOME, "c", w(20), COOL)).toBe(true); } }; // B advances head.1→head.2
+    expect(claimWakeSlot(HOME, "c", w(20), COOL, advance)).toBe(false); // A: scanned head.1, head advanced under it ⇒ CAS rename ENOENT ⇒ yield
+    expect(claimWakeSlot(HOME, "c", w(20) + 1, COOL)).toBe(false);  // still within cooldown of B's inject (w20) ⇒ yield
+    expect(claimWakeSlot(HOME, "c", w(21), COOL)).toBe(true);       // a full cooldown past B ⇒ a genuine new claim advances (head.3)
+  });
+
+  test("IW-P2-1 (r9) control: with no concurrent advance, the admitted claim wins (rename-CAS succeeds)", () => {
+    expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);        // head.1.<w8>
+    expect(claimWakeSlot(HOME, "c", w(20), COOL, () => { /* no interference */ })).toBe(true); // head.1→head.2, CAS succeeds
   });
 
   test("IW-R4-P2-1: a cooldown parameter change does not let old window numbers block new wakes", () => {
     const C60 = 60_000, C120 = 120_000;
-    expect(claimWakeSlot(HOME, "c", 1_000_000, C60)).toBe(true);   // 60s window 16
+    expect(claimWakeSlot(HOME, "c", 1_000_000, C60)).toBe(true);   // inject at a 60s cooldown
     expect(claimWakeSlot(HOME, "c", 1_240_000, C120)).toBe(true);  // 60→120 +240s: admits (time-based, not blocked by old number)
     expect(claimWakeSlot(HOME, "d", 1_000_000, C120)).toBe(true);  // reverse
     expect(claimWakeSlot(HOME, "d", 1_240_000, C60)).toBe(true);   // 120→60 +240s: admits
     expect(claimWakeSlot(HOME, "d", 1_245_000, C60)).toBe(false);  // only 5s since last inject ⇒ rejected
   });
 
-  test("IW-P2-1 (r5 regression): a cross-family GC cannot re-open a used window (global max timestamp is the authority)", () => {
+  test("IW-P2-1 (r5 regression): the global max timestamp is the authority across cooldown-parameter changes (no revival)", () => {
     const C60 = 60_000, C120 = 120_000;
-    expect(claimWakeSlot(HOME, "x", 1_000_000, C120)).toBe(true);  // 120s family injects (window 8)
-    expect(claimWakeSlot(HOME, "x", 1_061_000, C60)).toBe(true);   // 60s family injects
-    expect(claimWakeSlot(HOME, "x", 1_062_000, C120)).toBe(false); // 120s re-claim blocked by the 60s inject's timestamp — no revival
+    expect(claimWakeSlot(HOME, "x", 1_000_000, C120)).toBe(true);  // inject at a 120s cooldown
+    expect(claimWakeSlot(HOME, "x", 1_061_000, C60)).toBe(true);   // inject at a 60s cooldown (advances the head)
+    expect(claimWakeSlot(HOME, "x", 1_062_000, C120)).toBe(false); // a 120s re-claim blocked by the last inject's timestamp — no revival
   });
 
   test("IW-R5-P2-1: a still-valid legacy / unrecognized marker is evidence (blocks), never ignored", () => {
@@ -69,10 +77,10 @@ describe("inbox-wake — claimWakeSlot (先占后发, cross-process atomic)", ()
     expect(claimWakeSlot(HOME, "u", Date.now(), C120)).toBe(false);           // evidence via mtime ⇒ blocked (fail-closed recognition)
   });
 
-  test("IW-P2-1 three holes closed: GC'd-window / read-fault / persist-fault never re-admit", () => {
+  test("fail-closed: a late lower-ts claim / read-fault / persist-fault never admit", () => {
     const dir = path.join(HOME, ".agenthop/console/inbox-wake");
     for (const n of [8, 9, 10, 11, 12]) expect(claimWakeSlot(HOME, "c", w(n), COOL)).toBe(true);
-    expect(claimWakeSlot(HOME, "c", w(10) + 1, COOL)).toBe(false); // ① GC'd middle window rejected by MAX (no hw regression)
+    expect(claimWakeSlot(HOME, "c", w(10) + 1, COOL)).toBe(false); // ① a late lower-ts claim rejected by the high-water MAX
     chmodSync(dir, 0o000);
     try { expect(claimWakeSlot(HOME, "c", w(13), COOL)).toBe(false); } finally { chmodSync(dir, 0o700); } // ② read fault ⇒ fail-closed
     chmodSync(dir, 0o500);
@@ -82,17 +90,23 @@ describe("inbox-wake — claimWakeSlot (先占后发, cross-process atomic)", ()
     expect(claimWakeSlot(HOME, "c", w(15), COOL)).toBe(true);       // recovers after the faults clear
   });
 
-  test("IW-P2-1 (r8): generation chain replaces the stealable gate — a newer gen's recent ts blocks; an old gen never permanently blocks (no steal/age)", () => {
+  test("IW-P2-1 (r9): a single head file advances by rename (one file, no GC, no permanent block); a crashed holder's head is just superseded", () => {
+    const dir = path.join(HOME, ".agenthop/console/inbox-wake");
+    expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);        // bootstrap + advance ⇒ head.2? no: head.0.0 → head.1.<w8>
+    const safe = createHash("sha256").update("c").digest("hex");
+    const heads = () => readdirSync(dir).filter((n) => n.startsWith(`${safe}.head.`));
+    expect(heads().length).toBe(1);                                // exactly ONE head file (renamed in place, never accumulates)
+    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);        // advance
+    expect(heads().length).toBe(1);                                // still one
+    // a stalled/crashed holder leaves the head where it was: a far-later claim simply advances it (no lease to wait out, no permanent block).
+    expect(claimWakeSlot(HOME, "c", w(500), COOL)).toBe(true);
+  });
+
+  test("IW-P2-1 (r9): an unparseable head with no valid head present ⇒ fail-closed (never bootstrap over corruption)", () => {
     const dir = path.join(HOME, ".agenthop/console/inbox-wake"); mkdirSync(dir, { recursive: true });
     const safe = createHash("sha256").update("c").digest("hex");
-    // A concurrent claimer already advanced the chain: gen0 (old) + gen1 (recent). A claim the time-admit would pass on gen0 alone still
-    // yields — the newest generation's recent timestamp is the high-water, so no interleaving injects twice and there is no lock to steal.
-    writeFileSync(path.join(dir, `${safe}.gen0`), String(w(0)));
-    writeFileSync(path.join(dir, `${safe}.gen1`), String(w(9)));
-    expect(claimWakeSlot(HOME, "c", w(9) + 1, COOL)).toBe(false);             // within cooldown of gen1 ⇒ yield
-    expect(claimWakeSlot(HOME, "c", w(10), COOL)).toBe(true);                 // a full cooldown past gen1 ⇒ admits (new generation)
-    // A crashed holder left only OLD generation markers: no gate to steal, no age to wait out — the next past-cooldown claim just wins.
-    expect(claimWakeSlot(HOME, "c", w(200), COOL)).toBe(true);                // far past ⇒ admits again; a stalled/crashed holder never blocks forever
+    writeFileSync(path.join(dir, `${safe}.head.notanumber`), "");  // a head-like but unparseable name, no valid head alongside
+    expect(claimWakeSlot(HOME, "c", Date.now(), COOL)).toBe(false); // fail-closed: do not bootstrap a fresh epoch over a corrupt head
   });
 });
 

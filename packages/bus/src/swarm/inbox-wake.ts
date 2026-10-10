@@ -7,7 +7,7 @@
 // the FILESYSTEM, so a same-batch burst AND independent writer processes all collapse to one inject per window. The dispatcher watch
 // is demoted to a BACKSTOP: re-inject only for items that have lain unclaimed past a window (a write-side wake that missed).
 
-import { mkdirSync, writeFileSync, readdirSync, readFileSync, lstatSync, unlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, readdirSync, readFileSync, lstatSync, renameSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
@@ -43,33 +43,29 @@ export function shouldInjectWake(now: number, last: number, paneState: string, c
   return true;
 }
 
-/** 先占后发 — atomically claim the per-target wake slot BEFORE any send, as a monotonic GENERATION chain. There is NO lock to steal and
- *  NO lease to expire — the two mechanisms a gate foundered on (a paused-not-dead holder gets its gate stolen then resumes ⇒ two
- *  injects; recycle is not generation-bound ⇒ a late recycler deletes a new holder's fresh gate; a read error wrongly authorizes a
- *  steal). Instead the generation is bound to the inject MARKER itself: the admit TEST and the occupy are the SAME anchor — the next
- *  generation file. Each inject appends `console/inbox-wake/<sha256(sid)>.gen<N>` (N = prevMaxGen + 1, content = claim timestamp) with
- *  O_EXCL. Two claimers that observe the same state target the SAME `gen<N+1>` and O_EXCL admits exactly ONE; a claimer that observes a
- *  NEWER generation necessarily also reads its recent timestamp and fails the admit — so no interleaving injects twice. (A fencing gate
- *  can never tighten this: herdr cannot validate a token, so a steal between a "still-my-generation" re-check and the inject itself
- *  would still double-inject; the ONLY fs-atomic serialization point is the O_EXCL create, so that IS the claim.) The rejection
- *  AUTHORITY is the GLOBAL high-water TIMESTAMP: MAX effective-ts over EVERY `<sha256(sid)>.*` marker (gen / legacy / unrecognized), so
- *  the admit is purely time-based (`now - maxTs >= cooldownMs`) — parameter-independent (IW-R4-P2-1) and FC-7-aware (any file is
- *  evidence: parseable content else mtime, never ignored, never Number("") ⇒ 0). A crashed holder simply leaves a valid gen marker that
- *  enforces the cooldown and is superseded by the next generation — no permanent block, no recovery race, no steal, so the three
- *  IW-P2-1 gate-recycle holes vanish by construction. A readdir FAULT (non-ENOENT) ⇒ UNKNOWN ⇒ reject (fail-closed, FC-2 r3); a create
- *  fault (incl. EEXIST: a concurrent same-gen winner) ⇒ reject (publish-after-fact). The age-GC retires only markers older than one
- *  cooldown, never our own fresh generation, so the high-water is preserved exactly while it is the live rejection authority. Returns
- *  true iff THIS caller won a fresh, confirmed claim. Never throws. */
-export function claimWakeSlot(home: string, sid: string, now: number, cooldownMs: number): boolean {
+/** 先占后发 — atomically claim the per-target wake slot BEFORE any send, via a SINGLE monotonic head advanced by a rename CAS. The chain
+ *  head is one file `console/inbox-wake/<sha256(sid)>.head.<gen>.<ts>` (generation and last-inject timestamp both in the NAME, so they
+ *  advance together atomically). To claim, rename the CURRENT head forward to `<...>.head.<gen+1>.<now>`. rename is the whole guarantee:
+ *  it is atomic, and it renames FROM the exact current head name — so if another claimer already advanced the head, that name is GONE and
+ *  our rename fails with ENOENT. This is the ABA fix the gen-chain lacked: O_EXCL *create* succeeds on a name a GC freed, letting a stale
+ *  snapshot re-use a consumed generation; rename *from* a vanished name cannot — a used generation is never reusable, with no GC, no
+ *  tombstone, and exactly one head file. The REJECTION AUTHORITY for the cooldown is the GLOBAL high-water TIMESTAMP: MAX over the head's
+ *  ts AND the effective-ts of every other `<sha256(sid)>.*` marker (legacy / unrecognized), so the admit is purely time-based
+ *  (`now - maxTs >= cooldownMs`) — parameter-independent (IW-R4-P2-1) and FC-7-aware (any file is evidence: parseable content else mtime,
+ *  never ignored, never Number("") ⇒ 0). First-ever claim O_EXCL-creates the epoch head `<sha>.head.0.0` (concurrent bootstrappers dedup
+ *  on EEXIST), then everyone races the same rename CAS ⇒ exactly one winner injects. A readdir/stat FAULT ⇒ UNKNOWN ⇒ reject
+ *  (fail-closed, FC-2 r3); an unparseable head with no valid head present ⇒ reject (never bootstrap over corruption); a bootstrap/rename
+ *  fault ⇒ reject (publish-after-fact). `onAfterScan` is a TEST-ONLY concurrency seam (undefined in production). Returns true iff THIS
+ *  caller won the advance. Never throws. */
+export function claimWakeSlot(home: string, sid: string, now: number, cooldownMs: number, onAfterScan?: () => void): boolean {
   if (!sid || !Number.isFinite(now) || !(cooldownMs > 0)) return false;
   const dir = path.join(home, ".agenthop", "console", "inbox-wake");
   const safe = createHash("sha256").update(sid).digest("hex");
-  const sidPrefix = `${safe}.`;                      // EVERY marker of this sid — gen chain, legacy format, and anything unrecognized
-  const genPrefix = `${safe}.gen`;                   // only the generation chain (parsed for the next slot number)
-  // EFFECTIVE timestamp of a marker (FC-7 fail-closed recognition): ENOENT ⇒ null (the entry truly vanished ⇒ not evidence). Any OTHER
-  // read fault (EACCES / EIO / ...) ⇒ `now`, so a present-but-unreadable marker counts as a just-happened inject and BLOCKS this claim
-  // (a read error NEVER authorizes a fresh claim — FC-2 r3). Empty or non-numeric content ⇒ fall back to MTIME (never Number("") ⇒ 0);
-  // mtime unreadable ⇒ `now`.
+  const sidPrefix = `${safe}.`;
+  const headPrefix = `${safe}.head.`;
+  // EFFECTIVE timestamp of a NON-head marker (FC-7 fail-closed recognition): ENOENT ⇒ null (vanished ⇒ not evidence); any OTHER read
+  // fault (EACCES / EIO / ...) ⇒ `now` (conservative: a present-but-unreadable marker blocks); empty / non-numeric content ⇒ MTIME
+  // (never Number("") ⇒ 0); mtime unreadable ⇒ `now`.
   const effTs = (name: string): number | null => {
     const p = path.join(dir, name);
     let raw: string;
@@ -79,29 +75,55 @@ export function claimWakeSlot(home: string, sid: string, now: number, cooldownMs
     if (t !== "" && Number.isFinite(Number(t))) return Number(t);
     try { return lstatSync(p).mtimeMs; } catch { return now; }
   };
-  // Scan every marker of this sid ONCE: the GLOBAL high-water timestamp (admit authority) and the MAX generation number (next slot).
-  // null on a dir read FAULT (non-ENOENT) ⇒ caller fails closed; a confirmed-empty dir ⇒ { -Infinity, -1 }.
-  const scan = (): { maxTs: number; maxGen: number; names: string[] } | null => {
+  // Parse a head NAME `<sha>.head.<gen>.<ts>` ⇒ { gen, ts } (both the generation and the inject timestamp live in the name so a rename
+  // advances them atomically). null when it is not a well-formed head name.
+  const parseHead = (name: string): { gen: number; ts: number } | null => {
+    if (!name.startsWith(headPrefix)) return null;
+    const rest = name.slice(headPrefix.length);
+    const dot = rest.indexOf(".");
+    if (dot <= 0 || dot >= rest.length - 1) return null;
+    const g = rest.slice(0, dot), t = rest.slice(dot + 1);
+    if (!/^\d+$/.test(g) || !/^\d+$/.test(t)) return null;
+    const gen = Number(g), ts = Number(t);
+    if (!Number.isSafeInteger(gen) || !Number.isFinite(ts)) return null;
+    return { gen, ts };
+  };
+  // Scan ONCE: the GLOBAL high-water ts (admit authority: head ts + every legacy/unrecognized effTs, FC-7), the current head (the
+  // MAX-generation well-formed head file), and whether an unparseable head-like file is present. null on a dir read FAULT (non-ENOENT).
+  const scan = (): { maxTs: number; head: { gen: number; ts: number } | null; headName: string | null; corruptHead: boolean } | null => {
     let names: string[];
-    try { names = readdirSync(dir); } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { maxTs: -Infinity, maxGen: -1, names: [] } : null; }
-    let maxTs = -Infinity, maxGen = -1;
+    try { names = readdirSync(dir); } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { maxTs: -Infinity, head: null, headName: null, corruptHead: false } : null; }
+    let maxTs = -Infinity, head: { gen: number; ts: number } | null = null, headName: string | null = null, corruptHead = false;
     for (const n of names) {
       if (!n.startsWith(sidPrefix)) continue;
-      const ts = effTs(n); if (ts !== null && ts > maxTs) maxTs = ts;
-      if (n.startsWith(genPrefix)) { const g = n.slice(genPrefix.length); if (/^\d+$/.test(g)) { const num = Number(g); if (Number.isSafeInteger(num) && num > maxGen) maxGen = num; } }
+      if (n.startsWith(headPrefix)) {
+        const h = parseHead(n);
+        if (h === null) { corruptHead = true; const t = effTs(n); if (t !== null && t > maxTs) maxTs = t; continue; }
+        if (h.ts > maxTs) maxTs = h.ts;
+        if (head === null || h.gen > head.gen) { head = h; headName = n; }
+      } else {
+        const t = effTs(n); if (t !== null && t > maxTs) maxTs = t; // legacy / unrecognized evidence (FC-7)
+      }
     }
-    return { maxTs, maxGen, names };
+    return { maxTs, head, headName, corruptHead };
   };
   try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return false; }
-  const s = scan();
-  if (s === null) return false;                       // dir read fault ⇒ UNKNOWN ⇒ fail-closed
-  if (now - s.maxTs < cooldownMs) return false;       // within cooldown of the last inject (any gen / legacy / unrecognized) ⇒ reject
-  const slotName = `${safe}.gen${s.maxGen + 1}`;      // admit and occupy share ONE anchor: the next generation
-  const slot = path.join(dir, slotName);
-  try { writeFileSync(slot, String(now), { flag: "wx", mode: 0o600 }); } catch { return false; } // O_EXCL: a concurrent same-gen claimer gets EEXIST ⇒ yields; a store fault ⇒ no authorize (publish-after-fact)
-  // GC: retire only markers whose effective-ts is older than one cooldown (never our own fresh generation). The high-water is preserved
-  // exactly while within the cooldown (its live rejection duty); legacy / unrecognized files self-retire the same way (FC-7).
-  for (const n of s.names) { if (n === slotName || !n.startsWith(sidPrefix)) continue; const ts = effTs(n); if (ts !== null && ts < now - cooldownMs) { try { unlinkSync(path.join(dir, n)); } catch { /* ignore */ } } }
+  let s = scan();
+  if (s === null) return false;                              // dir read fault ⇒ UNKNOWN ⇒ fail-closed
+  if (s.corruptHead && s.head === null) return false;        // an unparseable head and no valid one ⇒ fail-closed (never bootstrap over corruption)
+  if (onAfterScan) { try { onAfterScan(); } catch { /* test seam only */ } } // TEST-ONLY: simulate another process advancing the head between our scan and our CAS (undefined in production ⇒ no effect)
+  if (s.head === null) {
+    // bootstrap the epoch head (gen 0, ts 0); O_EXCL dedups concurrent bootstrappers (EEXIST is expected and fine).
+    try { writeFileSync(path.join(dir, `${headPrefix}0.0`), "", { flag: "wx", mode: 0o600 }); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") return false; }
+    s = scan();
+    if (s === null || s.head === null || s.headName === null) return false; // vanished / fault ⇒ bail
+  }
+  if (now - s.maxTs < cooldownMs) return false;              // within cooldown of the last inject (head ts or any legacy/unrecognized) ⇒ reject
+  // CAS ADVANCE: rename the current head forward. rename FROM the exact current head name fails (ENOENT) if another claimer already
+  // advanced it ⇒ a stale snapshot can NEVER re-commit a consumed generation (the old head name is gone; you cannot rename from it).
+  // Exactly the single rename winner injects.
+  try { renameSync(path.join(dir, s.headName as string), path.join(dir, `${headPrefix}${(s.head as { gen: number }).gen + 1}.${now}`)); } catch { return false; }
   return true;
 }
 
