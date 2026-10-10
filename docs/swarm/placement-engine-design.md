@@ -21,3 +21,15 @@
 - 分期：**2a=单后端 Railway Free reconcile**（期望→up/boot/ready/reclaim 一环，一个 backend）；**2b=多后端 + 成本感知装箱**（按成本/容量选 backend,CPA 预算感知）。
 - 不变量：电平触发幂等 reconcile；两证据面健康；**Betabrand 预警（三态同镜像）**——`snapshot` 谱系 checkpoint/template/fork 同出一镜像，**fork 前必验 template 健康**：中毒的 golden = N 台中毒，reconcile 绝不把一个坏快照放大成坏机群（fail-closed：未验 template 不 fork）。
 - 门控：spawn 只在 CPA 预算票内自批；超票=钱门归 user（R16,peer 转述不代 user 同意）。`SWARM_PLACEMENT` 默认关（dormant-ahead-of-use，同 SWARM_VM_CTL/BOARD_ADMIT）；纯核（diff/装箱/健康分类/reconcile 决策）+ selftest 先行，接线后续翻。
+
+## phase-2b 实现（多后端 + 成本感知选择，纯核）
+
+接 ⑤ 的分期：2b 不动 reconcile（期望态 vs 账本）与 vm-ctl 单向缝，只在 reconcile 的 backend-**无关** `{spawn,n}` 之下加一个纯选择函数，把 N 台缺口变成**按后端的 spawn 计划**。
+
+- `selectBackends(want, options, budgetMicroUsd) → BackendSelection`：`options` 的 `backend` 复用 vm-ctl 的 `Backend` 类型（不新造接口，type-only import）。每个候选带 `costPerMachineMicroUsd`（**整数 micro-USD**，0=免费层）+ `freeSlots`（配额）+ 可选 `priority`。
+- **钱不走 float（PE2B-1）**：成本/预算全程**整数 micro-USD**（1 USD=1e6 µ），预算守恒 `totalCostMicroUsd <= budgetMicroUsd` **精确整数成立**——无浮点除法尾差、无 epsilon。affordable=floor(budgetLeft/cost) 是精确整数除法；take*cost 受 budgetLeft 约束不溢出安全整数。
+- **成本感知装箱**：最便宜优先铺（cost 升 → priority 升 → backend 名升，**确定性、无时间戳**——FC-6），受每后端 `freeSlots` 与 `budgetMicroUsd` 上限双重约束。
+- **三面缺口是 `want` 的干净划分**：`funded`(预算+容量内可放) + `unfundedByBudget`(有容量但预算不够→**钱门归 user, R16**,引擎绝不自动超支) + `unplaceableByCapacity`(任何价都无容量) === want。
+- **门控不变**:spawn 只在预算票内自批;`unfundedByBudget>0` 由**活调用方**路由到 user 钱门(R16,peer 转述不代 user 同意)。引擎只**决策**,真实花钱仍归 user。`SWARM_PLACEMENT` 仍默认关。
+- 幂等/纯:同输入同输出;重复 backend 去重(首个赢,不翻倍容量);**want 须非负安全整数(PE2B-2,对齐 reconcile PE4,不 floor 不猜)**;**priority 非 undefined 时须有限数(PE2B-3,NaN/Inf 整条拒,绝不进比较器)**;非法 want/budget/option fail-closed(空计划,绝不伪造 spawn)。
+- FC-7:纯函数,不碰任何 store/序列化格式(无旧记录导入问题)。
