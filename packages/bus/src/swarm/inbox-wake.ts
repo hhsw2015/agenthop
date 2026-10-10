@@ -7,8 +7,8 @@
 // the FILESYSTEM, so a same-batch burst AND independent writer processes all collapse to one inject per window. The dispatcher watch
 // is demoted to a BACKSTOP: re-inject only for items that have lain unclaimed past a window (a write-side wake that missed).
 
-import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { mkdirSync, writeFileSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
 import { setInboxWakeHook, scanUnclaimedInbox } from "../inbox.js";
@@ -43,22 +43,35 @@ export function shouldInjectWake(now: number, last: number, paneState: string, c
   return true;
 }
 
-/** 先占后发 — atomically claim the per-target wake slot for the current window BEFORE any send. Cross-process AND intra-process: the
- *  slot is an O_EXCL marker `console/inbox-wake/<sha256(sid)>.<window>`, so 20 concurrent fires, an 8-in-a-row burst, and independent
- *  writer processes all resolve to exactly ONE winner per window (the others get EEXIST). A claimed slot is never rolled back, so a
- *  withheld or failed inject is also throttled — it simply expires at the next window (FC durable-first: claim before act). The sid is
- *  hashed to a safe single filename segment (any sid). Returns true iff THIS caller won the window. Fail-safe: a bad clock or an
- *  unwritable store ⇒ false (do not inject uncoordinated). Never throws. */
+/** 先占后发 — atomically claim the per-target wake slot for the current window BEFORE any send. Two durable guards, both ONLY-GROWING
+ *  (FC-6 family: cleanup never re-opens a used window, IW-P2-1):
+ *   1. a per-window O_EXCL marker `console/inbox-wake/<sha256(sid)>.<window>` — 20 concurrent fires, an 8-in-a-row burst, and
+ *      independent writer processes all resolve to exactly ONE winner per window (the rest get EEXIST). This is the SAME-window gate.
+ *   2. a monotonic high-water `<sha256(sid)>.hw` holding the highest window ever claimed — a late request that re-wins a window whose
+ *      marker was already garbage-collected is still REJECTED here (its window <= hw), so a cleanup can never re-admit a used window,
+ *      no matter how long the late request paused. This is the STALE-window gate.
+ *  A won slot is never rolled back, so a withheld or failed inject is throttled too (expires at the next window). Old window markers
+ *  are GC'd two windows back — safe because the high-water, not the marker, is the authority for staleness. The sid is hashed to a
+ *  safe single filename segment (any sid). Returns true iff THIS caller won a FRESH window. Fail-safe: a bad clock / unwritable store
+ *  ⇒ false (never inject uncoordinated). Never throws. */
 export function claimWakeSlot(home: string, sid: string, now: number, cooldownMs: number): boolean {
   if (!sid || !Number.isFinite(now) || !(cooldownMs > 0)) return false;
   const dir = path.join(home, ".agenthop", "console", "inbox-wake");
   const safe = createHash("sha256").update(sid).digest("hex");
   const window = Math.floor(now / cooldownMs);
+  const slot = path.join(dir, `${safe}.${window}`);
+  const hwPath = path.join(dir, `${safe}.hw`);
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    writeFileSync(path.join(dir, `${safe}.${window}`), String(now), { flag: "wx", mode: 0o600 }); // O_EXCL: EEXIST ⇒ window already claimed
+    writeFileSync(slot, String(now), { flag: "wx", mode: 0o600 }); // O_EXCL same-window gate: EEXIST ⇒ this window already claimed
   } catch { return false; }
-  try { unlinkSync(path.join(dir, `${safe}.${window - 1}`)); } catch { /* bounded cleanup; the previous window may not exist */ }
+  // Stale-window gate: reject any window at or below the highest ever claimed — so a cleaned-then-re-created old window can never
+  // re-admit (the reviewer's cross-window interleave). The high-water only ever advances; it is never deleted.
+  let hw = -1;
+  try { const r = Number(readFileSync(hwPath, "utf8").trim()); if (Number.isFinite(r)) hw = r; } catch { /* absent ⇒ -1 */ }
+  if (window <= hw) { try { unlinkSync(slot); } catch { /* ignore */ } return false; }
+  try { const tmp = `${hwPath}.tmp-${randomBytes(4).toString("hex")}`; writeFileSync(tmp, String(window), { mode: 0o600 }); renameSync(tmp, hwPath); } catch { /* best-effort advance */ }
+  try { unlinkSync(path.join(dir, `${safe}.${window - 2}`)); } catch { /* bounded GC; the window may not exist */ }
   return true;
 }
 

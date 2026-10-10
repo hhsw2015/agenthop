@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, utimesSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { shouldInjectWake, wakeSession, runWakeBackstop, inboxWakeEnabled, installInboxWake, claimWakeSlot, wakeText, type WakeDeps } from "../src/swarm/inbox-wake.js";
 import { writeInbox, setInboxWakeHook, scanUnclaimedInbox } from "../src/inbox.js";
 
@@ -23,13 +24,21 @@ describe("inbox-wake — claimWakeSlot (先占后发, cross-process atomic)", ()
   let HOME: string;
   beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wake-")); });
   afterEach(() => { try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ } });
-  test("one winner per window; expires next window; bad clock ⇒ no claim; dot-sid safe", () => {
-    expect(claimWakeSlot(HOME, "c", 1e6, COOL)).toBe(true);        // first wins
-    expect(claimWakeSlot(HOME, "c", 1e6, COOL)).toBe(false);       // same window, another process ⇒ loses
-    expect(claimWakeSlot(HOME, "c", 1e6 + 1, COOL)).toBe(false);   // still the window
-    expect(claimWakeSlot(HOME, "c", 1e6 + COOL, COOL)).toBe(true); // next window
-    expect(claimWakeSlot(HOME, "..", 1e6, COOL)).toBe(true);       // reserved-dot sid hashed to a safe filename (no traversal)
+  const w = (n: number) => n * COOL;
+  test("one winner per window; same-window loses; newer window wins; bad clock ⇒ no claim; dot-sid safe", () => {
+    expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);       // window 8 wins
+    expect(claimWakeSlot(HOME, "c", w(8) + 1, COOL)).toBe(false);  // same window, another process ⇒ loses
+    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);       // next window (advances high-water)
+    expect(claimWakeSlot(HOME, "..", w(8), COOL)).toBe(true);      // reserved-dot sid hashed to a safe filename (no traversal)
     expect(claimWakeSlot(HOME, "c", NaN, COOL)).toBe(false);       // fail-safe
+  });
+  test("IW-P2-1: a GC'd old window re-claimed late is rejected by the monotonic high-water (cleanup never re-admits)", () => {
+    expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);
+    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);       // hw ⇒ 9
+    const safe = createHash("sha256").update("c").digest("hex");
+    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.8`), { force: true }); // simulate cleanup removing window 8
+    expect(claimWakeSlot(HOME, "c", w(8) + 5, COOL)).toBe(false);  // late window-8 request: reopened marker, but hw=9 rejects it
+    expect(claimWakeSlot(HOME, "c", w(10), COOL)).toBe(true);      // a genuinely newer window still claims
   });
 });
 

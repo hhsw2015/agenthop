@@ -3,6 +3,7 @@
 import { mkdtempSync, rmSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { shouldInjectWake, wakeSession, runWakeBackstop, inboxWakeEnabled, installInboxWake, claimWakeSlot, wakeText, type WakeDeps, type PaneInfo } from "./inbox-wake.js";
 import { writeInbox, setInboxWakeHook, scanUnclaimedInbox } from "../inbox.js";
 
@@ -20,15 +21,21 @@ ok(shouldInjectWake(1e6, 1e6 - COOL, "idle", 3, COOL) === true, "at cooldown bou
 ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite clock ⇒ fail-safe no");
 { let same = true; for (let i = 0; i < 1000; i++) if (shouldInjectWake(5e6, 4e6, "idle", 2, COOL) !== true) same = false; ok(same, "FC-6: 1000x same inputs ⇒ identical output (no clock/IO inside)"); }
 
-// 先占后发 — the atomic filesystem claim (cross-process cooldown).
+// 先占后发 — the atomic filesystem claim (cross-process cooldown + monotonic stale-window gate).
 {
   const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakeclaim-"));
+  const w = (n: number) => n * COOL; // exact window-n timestamp
   try {
-    ok(claimWakeSlot(HOME, "c", 1e6, COOL) === true, "claimWakeSlot: first claim of a window wins");
-    ok(claimWakeSlot(HOME, "c", 1e6, COOL) === false, "claimWakeSlot: a 2nd claim of the SAME window (another process) loses (cross-process cooldown)");
-    ok(claimWakeSlot(HOME, "c", 1e6 + 1, COOL) === false, "claimWakeSlot: still the same window ⇒ loses");
-    ok(claimWakeSlot(HOME, "c", 1e6 + COOL, COOL) === true, "claimWakeSlot: the next window claims again (expiry)");
-    ok(claimWakeSlot(HOME, "..", 1e6, COOL) === true, "claimWakeSlot: a reserved-dot sid is a safe hashed filename (no traversal)");
+    ok(claimWakeSlot(HOME, "c", w(8), COOL) === true, "claimWakeSlot: first claim of window 8 wins");
+    ok(claimWakeSlot(HOME, "c", w(8) + 1, COOL) === false, "claimWakeSlot: a 2nd claim of the SAME window (another process) loses");
+    ok(claimWakeSlot(HOME, "c", w(9), COOL) === true, "claimWakeSlot: the next window (9) claims again (advances high-water)");
+    ok(claimWakeSlot(HOME, "c", w(8) + 2, COOL) === false, "claimWakeSlot: a late window-8 re-claim with the marker still present ⇒ EEXIST reject");
+    // IW-P2-1 cross-window interleave: simulate GC/cleanup removing window 8's marker, then a LATE window-8 request resuming.
+    const safe = createHash("sha256").update("c").digest("hex");
+    rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.8`), { force: true });
+    ok(claimWakeSlot(HOME, "c", w(8) + 3, COOL) === false, "IW-P2-1: a REOPENED (GC'd) old window is rejected by the monotonic high-water — cleanup cannot re-admit");
+    ok(claimWakeSlot(HOME, "c", w(10), COOL) === true, "claimWakeSlot: a genuinely newer window (10 > hw 9) still claims");
+    ok(claimWakeSlot(HOME, "..", w(8), COOL) === true, "claimWakeSlot: a reserved-dot sid is a safe hashed filename (no traversal)");
     ok(claimWakeSlot(HOME, "c", NaN, COOL) === false, "claimWakeSlot: bad clock ⇒ fail-safe, no claim");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
