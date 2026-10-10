@@ -8,7 +8,7 @@
  * inbox, present an unmet to the coordinator). DORMANT: gated behind SWARM_OUTPUT_CONTRACT (default OFF) — nothing
  * probes or stores a verdict, and it is wired into no live delivery path.
  */
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, type Stats } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { writeInbox, composeInboxMsg } from "../inbox.js";
@@ -72,41 +72,75 @@ export function verifyExpectedOutput(expected: ExpectedOutput, facts: OutputFact
   return "unknown";
 }
 
-// ---- IO shell (best-effort; every read error degrades to null ⇒ unknown) -----
+// ---- IO shell (best-effort; a read fault degrades to null ⇒ unknown, NEVER a false `unmet` — FC-2 r3) ----------
+//
+// Every probe here must itself pass the FC-2 r3 judgment: a read it could not complete is UNKNOWN, never a negative
+// verdict. The three probe discriminators below each defeat a concrete way the old loose probes mis-classified
+// evidence (OC-1 swallowed read errors as `unmet`; OC-2 a dir passed `file`; OC-3 a tag passed `branch`; OC-4 a
+// date/UUID passed `report`; OC-5 a normally-delivered message was judged `unmet` because ack had deleted it).
 
-const SHA_LINE = /\b[0-9a-f]{7,64}\b/; // a git/sha token the report must cite (evidence it reviewed a real commit)
+/** errno-aware stat. A path is "absent" ONLY on a CONFIRMED ENOENT; any other error ("unknown") must NOT be read as
+ *  absence — a transient/EACCES fault read as absence would license a false `unmet` (OC-1 / FC-2 r3). */
+function statProbe(p: string): { kind: "absent" } | { kind: "ok"; st: Stats } | { kind: "unknown" } {
+  try { return { kind: "ok", st: statSync(p) }; }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "unknown" }; }
+}
 
-/** Probe the filesystem for the declared evidence. Best-effort: a read error on any probe yields null (⇒ unknown,
- *  FC-2 r3 — never a false `unmet`). `ctx.repoDir` for branch rev-parse, `ctx.home` + `ctx.taskRef` for inbox. */
+/** OC-4: a report's commit citation must be CONTEXT-ANCHORED — a label (固定 / sha / sha256 / commit / @) immediately
+ *  before a 7-64 hex token at word boundaries. A bare unlabeled hex run (a date "20261011", a session-UUID segment)
+ *  is NOT a commit reference and must not pass. The repo's real citation forms ("固定 SHA:ddb8cda", "@7b8e87c",
+ *  "报告SHA256: <64hex>", "fixed SHA <40hex>") all carry such a label; a date/UUID does not. */
+const COMMIT_REF = /(?:固定\s*)?(?:\bsha(?:[-\s]?256)?\b|\bcommit\b|@)[:\s]*\b[0-9a-f]{7,64}\b/i;
+function reportCitesCommit(txt: string): boolean { return COMMIT_REF.test(txt); }
+
+/** Apply the same path sanitization writeInbox uses, so the inbox probe reads the SAME directory a real publish wrote. */
+function inboxSid(ref: string): string { return ref.replace(/[^A-Za-z0-9._-]/g, "_") || "unknown"; }
+
+/** Probe the filesystem for the declared evidence. Best-effort: a read fault on any probe yields null (⇒ unknown,
+ *  FC-2 r3 — never a false `unmet`). `ctx.repoDir` for the branch check, `ctx.home` + `ctx.taskRef` for the inbox. */
 export function probeExpectedOutput(expected: ExpectedOutput, ctx: { repoDir?: string; home?: string; taskRef?: string } = {}): OutputFacts {
   switch (expected.kind) {
     case "file": {
       if (!expected.ref) return { fileExistsNonEmpty: null };
-      try { return { fileExistsNonEmpty: existsSync(expected.ref) && statSync(expected.ref).size > 0 }; }
-      catch { return { fileExistsNonEmpty: null }; }
+      const s = statProbe(expected.ref);
+      if (s.kind === "unknown") return { fileExistsNonEmpty: null };   // OC-1: read fault ⇒ unknown, never unmet
+      if (s.kind === "absent") return { fileExistsNonEmpty: false };   // confirmed ENOENT ⇒ unmet
+      return { fileExistsNonEmpty: s.st.isFile() && s.st.size > 0 };   // OC-2: a dir (or an empty file) is NOT a delivered file
     }
     case "branch": {
       if (!expected.ref) return { branchResolves: null };
-      try { execFileSync("git", ["rev-parse", "--verify", "--quiet", expected.ref], { cwd: ctx.repoDir ?? process.cwd(), stdio: ["ignore", "ignore", "ignore"] }); return { branchResolves: true }; }
-      catch (e) { return { branchResolves: (e as { status?: number }).status === 1 ? false : null }; } // exit 1 = no such rev; git missing/other = unknown
+      const name = expected.ref.replace(/^refs\/heads\//, "");         // OC-3: always verify the BRANCH namespace, never a tag/commit
+      try { execFileSync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${name}`], { cwd: ctx.repoDir ?? process.cwd(), stdio: ["ignore", "ignore", "ignore"] }); return { branchResolves: true }; }
+      catch (e) { return { branchResolves: (e as { status?: number }).status === 1 ? false : null }; } // exit 1 = no such branch; git missing/not-a-repo (128) ⇒ unknown
     }
     case "report": {
       if (!expected.ref) return { reportPresentWithSha: null };
-      try { if (!existsSync(expected.ref)) return { reportPresentWithSha: false }; return { reportPresentWithSha: SHA_LINE.test(readFileSync(expected.ref, "utf8")) }; }
-      catch { return { reportPresentWithSha: null }; }
+      const s = statProbe(expected.ref);
+      if (s.kind === "unknown") return { reportPresentWithSha: null }; // OC-1
+      if (s.kind === "absent") return { reportPresentWithSha: false };
+      if (!s.st.isFile()) return { reportPresentWithSha: false };      // a directory is not a report
+      try { return { reportPresentWithSha: reportCitesCommit(readFileSync(expected.ref, "utf8")) }; } // OC-4
+      catch { return { reportPresentWithSha: null }; }                 // OC-1: read fault ⇒ unknown
     }
     case "inbox-delivery": {
       if (!expected.ref || !ctx.taskRef || !ctx.home) return { inboxDelivered: null };
-      try {
-        const dir = path.join(ctx.home, ".agenthop", "inbox", expected.ref, "processed");
-        if (!existsSync(dir)) return { inboxDelivered: false };
-        for (const f of readdirSync(dir)) {
-          if (!f.endsWith(".json")) continue;
-          try { const m = JSON.parse(readFileSync(path.join(dir, f), "utf8")) as { taskRef?: unknown }; if (m && m.taskRef === ctx.taskRef) return { inboxDelivered: true }; }
-          catch { /* skip one unreadable/corrupt file, keep scanning */ }
+      // OC-5: the durable landing credential is "the message is in the box" — a top-level file (a published `.json`, or an
+      // in-flight `.claim-<pid>` rename) OR a `processed/` archive. A taskRef match ⇒ met. ABSENCE is NOT proof of
+      // non-delivery: ack DELETES the claimed file, so a normally delivered+consumed message leaves no trace ⇒ unknown
+      // (never `unmet`; FC-2 r3 family). A read fault likewise yields no positive match ⇒ unknown, never a false unmet.
+      const base = path.join(ctx.home, ".agenthop", "inbox", inboxSid(expected.ref));
+      const matches = (raw: string): boolean => { try { const m = JSON.parse(raw) as { taskRef?: unknown }; return !!m && m.taskRef === ctx.taskRef; } catch { return false; } };
+      const scan = (dir: string): boolean => {
+        let names: string[];
+        try { names = readdirSync(dir); } catch { return false; } // dir absent/unreadable ⇒ no positive match here (⇒ unknown overall, never unmet)
+        for (const f of names) {
+          if (!(f.endsWith(".json") || f.includes(".claim-"))) continue; // a published `.json` or an in-flight `.claim-<claimer>`
+          try { if (matches(readFileSync(path.join(dir, f), "utf8"))) return true; } catch { /* one unreadable file: keep scanning */ }
         }
-        return { inboxDelivered: false };
-      } catch { return { inboxDelivered: null }; }
+        return false;
+      };
+      const found = scan(base) || scan(path.join(base, "processed"));
+      return { inboxDelivered: found ? true : null }; // OC-5: found ⇒ met; otherwise unknown (never unmet — absence is ambiguous post-ack)
     }
   }
 }
