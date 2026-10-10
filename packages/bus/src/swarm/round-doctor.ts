@@ -103,11 +103,26 @@ export function buildRoundDoctorNote(taskRef: string, v: RoundDoctorVerdict): st
 //    that names ANOTHER known ticket makes this round's metric UNKNOWN (never cross-attributed) while the round still counts (RD-2).
 // ------------------------------------------------------------------------------------------------------------------------
 
-const LEAD_MARKUP = /^[\s\p{P}\p{S}]+/u;  // leading whitespace / punctuation / symbols (markdown + emoji); stops at the first letter or digit
 const TICKET_EDGE = "A-Za-z0-9_-";         // the review-queue id alphabet (isValidReviewId) — a slug boundary must exclude '_' too
 const MAX_ROUND = 999;                      // a round number beyond this is pathological, not a real review round (RD-4 bound)
 
 function escapeRegExp(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+/** Strip ONLY real leading markup (whitespace, emoji/symbols/marks/format, markdown emphasis `* \` ~ # > |`, and a `-`/`+`/`*`
+ *  list marker that is FOLLOWED BY whitespace) — never a legal id char. A `_` or a `-`/`+` GLUED to a word is preserved, because
+ *  a review-queue id may legally start with `_`/`-` (isValidReviewId: `^[A-Za-z0-9_-]+$`); a leading CJK word is preserved too, so
+ *  a summary line like "协调者收卷:…" never collapses into a false ticket header (RD-2: no alias via character deletion). Pure. */
+export function stripLeadMarkup(s: string): string {
+  let t = s;
+  for (;;) {
+    const sym = /^[\p{S}\p{M}\p{Cf}\s]+/u.exec(t);          // whitespace, symbols (emoji), combining marks, format (ZWJ/VS)
+    if (sym) { t = t.slice(sym[0].length); continue; }
+    if (/^[-+*](?=\s)/.test(t)) { t = t.slice(1); continue; } // a list marker: dash/plus/star BEFORE whitespace (not `-id`/`_id`)
+    if (/^[*`~#>|]/.test(t)) { t = t.slice(1); continue; }    // markdown emphasis/code/quote/header — never an id char
+    break;
+  }
+  return t;
+}
 
 /** Exact, id-boundary mention of a ticket ANYWHERE in the line — never as a prefix/suffix of a longer id. Uses the real
  *  review-queue alphabet (incl. `_`), so `placement` matches neither `placement-ledger` nor `placement_ledger`. Pure. */
@@ -141,8 +156,8 @@ export function parseNewPSafe(line: string): number {
  * (id-boundary) followed by a round-verb: `首审` (round 1), `rN 判` (round N, N ≤ 999), or `终审` (a final verdict; its round is
  * the `rN` found on the line, if any). The body is ignored for subject/round/clear. round < 1 (unplaceable) ⇒ null. CLEARED counts
  * only for a 终审 verb or a literal `0 REMAIN`, never a sub-finding `RD-1 CLEARED`. Pure. */
-export function parseVerdictLine(line: string, ticket: string): { round: number; remain: number; newP: number; cleared: boolean } | null {
-  const head = line.replace(LEAD_MARKUP, "");
+export function parseVerdictLine(line: string, ticket: string): { round: number; remain: number; newP: number } | null {
+  const head = stripLeadMarkup(line);
   const m = new RegExp(`^${escapeRegExp(ticket)}(?![${TICKET_EDGE}])\\s+(首审|终审|r\\d{1,3}\\s*(?:判|终审))(?![${TICKET_EDGE}])`).exec(head);
   if (!m) return null;
   const verb = m[1]!;
@@ -150,10 +165,10 @@ export function parseVerdictLine(line: string, ticket: string): { round: number;
   const rm = /r(\d{1,3})(?!\d)/i.exec(verb) ?? (isFinal ? /\br(\d{1,3})(?!\d)/i.exec(line) : null);
   const round = /首审/.test(verb) ? 1 : rm ? Number(rm[1]) : 0;
   if (!Number.isSafeInteger(round) || round < 1 || round > MAX_ROUND) return null; // unplaceable / out-of-bound ⇒ not a counted round
-  let remain = parseRemainSafe(line);
-  const cleared = remain === 0 || (isFinal && /\bCLEARED\b/.test(line)); // TICKET-level clear only
-  if (cleared && remain < 0) remain = 0;
-  return { round, remain, newP: parseNewPSafe(line), cleared };
+  // RD-1: the ONLY ticket-level clear signal is an explicit remain of 0. A CLEARED keyword — even on a 终审 line — is NOT a clear:
+  // it may be a sub-finding ("RD-1 CLEARED") and must never override a parsed POSITIVE remain. A genuinely cleared ticket is marked
+  // done in the review-queue ledger (filtered upstream), so reading clear only from remain===0 stays conservative = keep surfacing.
+  return { round, remain: parseRemainSafe(line), newP: parseNewPSafe(line) };
 }
 
 export interface TicketRounds {
@@ -168,26 +183,24 @@ export interface TicketRounds {
  * metric + a CLEARED fact). Only a BOUNDED window of the last `cfg.degradeWindow` rounds is materialised; `rounds` is the max
  * round number (≤ MAX_ROUND). Pure; never allocates by an unchecked number. */
 export function extractTicketRounds(lines: readonly string[], ticket: string, otherTickets: readonly string[] = [], cfg: RoundDoctorConfig = DEFAULT_ROUND_DOCTOR_CONFIG): TicketRounds {
-  const byRound = new Map<number, { remain: number; newP: number; cleared: boolean }>();
+  const byRound = new Map<number, RoundRecord>();
   for (const line of lines) {
     const v = parseVerdictLine(line, ticket);
     if (!v) continue;
     const crossRef = otherTickets.some((t) => t !== ticket && mentionsTicket(line, t)); // body names another known ticket ⇒ don't trust its metric
     const remain = crossRef ? -1 : v.remain;
     const newP = crossRef ? -1 : v.newP;
-    const cleared = crossRef ? false : v.cleared;
     const prev = byRound.get(v.round);
     byRound.set(v.round, prev
-      ? { remain: prev.remain >= 0 ? prev.remain : remain, newP: prev.newP >= 0 ? prev.newP : newP, cleared: prev.cleared || cleared }
-      : { remain, newP, cleared });
+      ? { remain: prev.remain >= 0 ? prev.remain : remain, newP: prev.newP >= 0 ? prev.newP : newP } // same round merges, preferring a KNOWN metric
+      : { remain, newP });
   }
   if (byRound.size === 0) return { rounds: 0, history: [] };
   const maxRound = Math.max(...byRound.keys());
   const k = Math.max(1, cfg.degradeWindow);
   const history: RoundRecord[] = [];
   for (let r = Math.max(1, maxRound - k + 1); r <= maxRound; r += 1) { // BOUNDED to k entries — never 1..maxRound (RD-4)
-    const e = byRound.get(r);
-    history.push(e ? { remain: e.cleared ? 0 : e.remain, newP: e.newP } : { remain: -1, newP: -1 });
+    history.push(byRound.get(r) ?? { remain: -1, newP: -1 });
   }
   return { rounds: maxRound, history };
 }

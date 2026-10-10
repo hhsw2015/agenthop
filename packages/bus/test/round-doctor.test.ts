@@ -1,7 +1,7 @@
 import { expect, test } from "vitest";
 import {
   assessRoundHealth, detectDegradation, diagnoseRounds, buildRoundDoctorNote,
-  roundDoctorEnabled, roundAlertN, mentionsTicket, parseVerdictLine, parseRemainSafe, parseNewPSafe, extractTicketRounds,
+  roundDoctorEnabled, roundAlertN, mentionsTicket, stripLeadMarkup, parseVerdictLine, parseRemainSafe, parseNewPSafe, extractTicketRounds,
   DEFAULT_ROUND_DOCTOR_CONFIG, type RoundRecord,
 } from "../src/swarm/round-doctor.js";
 
@@ -90,9 +90,24 @@ test("parseNewPSafe: explicit count only; a bare id ⇒ unknown", () => {
 // ===== parseVerdictLine — the header grammar (RD-1/RD-2/RD-4) =====
 
 test("parseVerdictLine: recognizes 首审 / rN 判 / 终审 headers after leading markup", () => {
-  expect(parseVerdictLine("📥 **inbox-wake 首审 1P1+2P2 @2c5f904**(happycapy):body", "inbox-wake")).toMatchObject({ round: 1, cleared: false });
+  expect(parseVerdictLine("📥 **inbox-wake 首审 1P1+2P2 @2c5f904**(happycapy):body", "inbox-wake")).toMatchObject({ round: 1, remain: -1 });
   expect(parseVerdictLine("📥 **inbox-wake r2 判 @b7a4e6a**(happycapy):余 IW-P2-1", "inbox-wake")).toMatchObject({ round: 2 });
-  expect(parseVerdictLine("✅ **inbox-wake 终审 CLEARED @713d7be**(happycapy r10,0 REMAIN)", "inbox-wake")).toMatchObject({ round: 10, cleared: true });
+  expect(parseVerdictLine("✅ **inbox-wake 终审 CLEARED @713d7be**(happycapy r10,0 REMAIN)", "inbox-wake")).toMatchObject({ round: 10, remain: 0 });
+});
+
+test("stripLeadMarkup: strips emoji/markdown/list markers but PRESERVES leading id chars (_ / -) and CJK (RD-2)", () => {
+  expect(stripLeadMarkup("📥 **inbox-wake r2 判**")).toBe("inbox-wake r2 判**");
+  expect(stripLeadMarkup("- 📥 ticket r5 判")).toBe("ticket r5 判");
+  expect(stripLeadMarkup("_ticket r5 判")).toBe("_ticket r5 判");   // leading '_' is a legal id char — kept
+  expect(stripLeadMarkup("-ticket r5 判")).toBe("-ticket r5 判");   // '-' glued to a word is an id, not a list marker — kept
+  expect(stripLeadMarkup("协调者收卷:inbox-wake")).toBe("协调者收卷:inbox-wake"); // CJK summary — kept (never a false header)
+});
+
+test("RD-2 residual: a legal ticket starting with _ or - keeps its identity (no alias via stripping)", () => {
+  expect(parseVerdictLine("_ticket r5 判: 2 REMAIN", "_ticket")).toMatchObject({ round: 5, remain: 2 });
+  expect(parseVerdictLine("_ticket r5 判: 2 REMAIN", "ticket")).toBeNull();   // subject is _ticket, not ticket
+  expect(parseVerdictLine("-ticket r5 判: 2 REMAIN", "-ticket")).toMatchObject({ round: 5, remain: 2 });
+  expect(parseVerdictLine("-ticket r5 判: 2 REMAIN", "ticket")).toBeNull();
 });
 
 test("parseVerdictLine: non-verdicts return null — queue / summary / submission / 待判 (RD-1)", () => {
@@ -104,8 +119,9 @@ test("parseVerdictLine: non-verdicts return null — queue / summary / submissio
 });
 
 test("parseVerdictLine: body keywords do NOT change ticket state (RD-1)", () => {
-  // a sub-finding CLEARED does not clear the ticket when the ticket still has REMAIN
-  expect(parseVerdictLine("inbox-wake r5 判 @s:RD-1 CLEARED,2 REMAIN", "inbox-wake")).toMatchObject({ round: 5, remain: 2, cleared: false });
+  // a sub-finding CLEARED does not clear the ticket when the ticket still has REMAIN — even on a 终审 line (RD-1 residual)
+  expect(parseVerdictLine("inbox-wake r5 判 @s:RD-1 CLEARED,2 REMAIN", "inbox-wake")).toMatchObject({ round: 5, remain: 2 });
+  expect(parseVerdictLine("inbox-wake r5 终审 @s:RD-1 CLEARED,2 REMAIN", "inbox-wake")).toMatchObject({ round: 5, remain: 2 });
   // a follow-up "送审" in the body does not drop a real verdict
   expect(parseVerdictLine("inbox-wake r5 判 @s:2 REMAIN;返修后再送审", "inbox-wake")).toMatchObject({ round: 5, remain: 2 });
 });
@@ -163,6 +179,20 @@ test("RD-1c: a 5th verdict with a sub-finding CLEARED still counts and does NOT 
   const r2 = extractTicketRounds(cleared, "inbox-wake");
   expect(r2.rounds).toBe(6);
   expect(diagnoseRounds(r2.rounds, r2.history).overLong).toBe(false);
+});
+
+test("RD-1 residual: a 终审 whose body sub-finding is CLEARED but the ticket has positive REMAIN still alerts", () => {
+  const lines = [
+    "round-sample 首审 5 REMAIN @r1(happycapy)",
+    "round-sample r2 判 4 REMAIN @r2(happycapy)",
+    "round-sample r3 判 3 REMAIN @r3(happycapy)",
+    "round-sample r4 判 2 REMAIN @r4(happycapy)",
+    "round-sample r5 终审 @r5(happycapy):RD-1 CLEARED,2 REMAIN", // 终审 header, sub-finding CLEARED, ticket still 2 REMAIN
+  ];
+  const { rounds, history } = extractTicketRounds(lines, "round-sample");
+  expect(rounds).toBe(5);
+  expect(history[history.length - 1]).toEqual({ remain: 2, newP: -1 }); // NOT forced to 0
+  expect(diagnoseRounds(rounds, history).overLong).toBe(true);
 });
 
 test("RD-2a: an underscore sibling (placement_ledger) does NOT attribute to placement", () => {
