@@ -10,7 +10,7 @@
 //
 // This file is the PURE layer (selftested). The IO state machine (create -> split -> run -> wait -> read ->
 // close, with per-step confirmation + failure reclaim) lives in the fanout driver over herdrRun.
-import { shquote } from "../spawn.js";
+import { shquote } from "../shquote.js";
 
 // ---- argv builders (pure) ----
 export function buildWorkspaceCreate(): string[] {

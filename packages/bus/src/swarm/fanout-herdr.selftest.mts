@@ -4,7 +4,7 @@ import {
   buildPaneRead, buildPaneRun, buildPaneSplitIn, buildPaneWaitOutput, buildWorkspaceClose, buildWorkspaceCreate,
   buildWorkspaceRename, doneMarker, paneIdFromSplit, unitCommand, workspaceFromCreate,
 } from "./fanout-herdr.js";
-import { shquote } from "../spawn.js";
+import { shquote } from "../shquote.js";
 
 const t = (name: string, cond: boolean) => { if (!cond) throw new Error("FAILED: " + name); console.log("ok  " + name); };
 

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { mintEphToken, readEphSecret } from "./mint.js";
 import { openTaskRoom } from "./room.js";
-import { shquote } from "../spawn.js";
+import { shquote } from "../shquote.js";
 
 /**
  * The SSH-inject runner — the dispatcher half of swarm-on-Railway. Per task: a fresh launchId binds ONE
