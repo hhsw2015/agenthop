@@ -1,70 +1,92 @@
-# approval-allowlist v0 — the delegable set (attached to approval-delegation-brief.md)
+# approval-allowlist v0 — the delegable closed forms (attached to approval-delegation-brief.md)
 
-owner 90b58f9c · board `approval-delegation` · frozen by coordinator fe0376cd (five-question ruling ①) · **user can veto or
-expand at any time; until then the classifier runs by this v0.** Encoded in `packages/bus/src/swarm/approval-delegation.ts`
-(`isBlacklisted` / `isReadOnlyWithinCwd`); this file is the human-readable contract those two functions must match.
+owner 90b58f9c · board `approval-delegation` · frozen by coordinator fe0376cd, **r2 ruling** after happycapy's first review
+(the name-list v0 was defeated by poisoned options / quote tricks / symlinks — AD-P1-1/2/3). **user can veto or expand at any
+time; until then the classifier runs by this v0.** Encoded in `packages/bus/src/swarm/approval-delegation.ts`
+(`planDelegation` + the `READ_FORMS` / `GIT_FORMS` / `SCOPE_FREE` tables + the scope gates); this file is the human-readable
+contract those must match.
 
-## Principle — most-conservative start
+## Principle — a CLOSED-FORM list, not a command-name list
 
-v0 delegates (auto-ALLOW, no user dialog) ONLY a request that is **read-only AND within the member's cwd**. Everything else
-reaches the user. This is the blast-radius knob at its tightest; it grows by explicit ruling, never by drift. Two laws:
+A command NAME means nothing on its own: `cat` can read `.env` via `cat .e''nv`; `find` can delete via `find … -delete`;
+`git diff --output=f` writes; a bare `cat alias` can be a symlink to `../outside`. So v0 delegates (auto-ALLOW, no user
+dialog) ONLY an **enumerated closed form** — a known command with **no options, or only options from that command's exact
+whitelist** — AND, for any path it touches, an **IO-verified fact that the path's realpath (symlinks followed to the end)
+stays inside the member cwd**. Three laws:
 
-1. **The blacklist precedes the allowlist.** A command that matches any blacklist form is NEVER delegated, even if its
-   entrypoint looks read-only (`cat .env` reads, but `.env` is a secret → blacklist wins → user).
-2. **Fail-closed.** Anything neither clearly blacklisted nor clearly on the allowlist → the user decides (`needs-user`). An
-   unknown tool, a structured tool, a shell pipe, a redirect — none are auto-granted in v0.
+1. **Un-enumerated form ⇒ user.** Any option not in the command's whitelist, any value-taking flag, any positional where none
+   is allowed, any redirect / pipe / chain / `$`-expansion / quote / backslash / command-substitution → `needs-user` (or
+   `privilege` for the blacklist backstop). There is no generic flag parser to trick.
+2. **No scope inference from spelling.** A path operand is delegated only against a verified realpath-within-cwd fact. A
+   missing fact, a failed resolution, or an escape → `needs-user`. The pure core holds no filesystem; the hook supplies the
+   facts (`ApprovalScope`) in the IO round. Until then path/git forms fail closed.
+3. **Fail-closed + allow-only.** Unknown → user. v1 delegates allow only; a deny always reaches the user (auto-deny is v2).
 
-## Gate order (classifyApproval)
+Narrow is the point: the north star is fewer popups, and the handful of fixed forms below (status / log / ls / cat …) already
+covers the bulk of them.
+
+## Gate order (planDelegation, then classifyApproval applies facts)
 
 ```
-BLACKLIST  → escalate:"privilege"   (never delegate; the hard never-delegable set)
-ALLOWLIST  → delegate:"allow"       (read-only within cwd; the only auto-grant)
-otherwise  → escalate:"needs-user"  (fail-closed to the user)
+tool != Bash                                  -> needs-user  (v0 inspects Bash only)
+command substitution  $( )  or backticks      -> privilege
+$ variable expansion                          -> needs-user  (unanalyzable)
+' " \  quote / backslash                       -> needs-user  (AD-P1-2 concatenation anomaly)
+BLACKLIST backstop (rm/sudo/redirect/…)        -> privilege
+; & | < > ( ) { }  other metacharacter         -> needs-user  (redirect / chain / multi-command)
+enumerated closed form:
+  scope-free form                              -> delegate:allow          (no facts needed)
+  git read form   + cwd IS git repo root       -> delegate:allow          (else needs-user)
+  path form       + every operand realpath∈cwd -> delegate:allow          (else needs-user)
+anything else                                  -> needs-user
 ```
 
-v1 delegates **allow only**. A deny is never delegated — it always reaches the user (auto-deny is a v2 question).
+## The delegable closed forms
 
-## The ALLOWLIST (delegable → auto-allow)
+**Scope-free (delegate with no facts — no cwd-relative file read):**
+`pwd` (no args) · `echo …` (args are literals) · `which …` · `basename …` · `dirname …`
 
-A request is delegable iff ALL of:
+**Path forms (delegate only with verified realpath-within-cwd facts for every operand):**
 
-- `tool === "Bash"` (v0 inspects Bash only; a structured tool — Read / Write / Edit / `mcp__…` — is `needs-user`).
-- The command contains **no shell metacharacter**: none of `; & | < > \` $ ( ) { }`, no newline, no backslash. A single
-  simple command only — a pipe or chain (`cat x | grep y`) degrades to `needs-user` in v0 (safe, not delegated).
-- The entrypoint (first token) is a read-only tool:
-  `cat ls head tail wc grep rg egrep fgrep find file stat tree pwd echo which basename dirname`,
-  or `git` with a read subcommand: `status diff log show branch remote rev-parse describe`.
-- Every argument stays within cwd: **no absolute path** (`/…`), **no parent escape** (`..`), **no home expansion** (`~`).
+| command | allowed options (exact, value-less) | operands |
+|---|---|---|
+| `cat`  | `-n -b` | path(s) |
+| `head` | (none) | path(s) |
+| `tail` | (none; `-f` excluded) | path(s) |
+| `wc`   | `-l -w -c -m -lw -wl` | path(s) |
+| `ls`   | `-l -a -la -al -lh -alh -lah -h -1 -R -lR -t -lt -rt -lrt -ltr -r` | optional path(s); none = cwd |
+| `file` | (none) | path(s) |
+| `stat` | (none) | path(s) |
 
-Examples delegated: `cat src/foo.ts` · `ls -la packages` · `grep -rn TODO src` · `git status` · `git diff HEAD` ·
-`rg classifyApproval` · `wc -l README.md`.
+**git read forms (delegate only when the IO fact says cwd IS the git repo root; NO positional ref/pathspec):**
 
-## The BLACKLIST (never delegate → escalate:"privilege")
+| subcommand | allowed options (exact) |
+|---|---|
+| `git status` | `-s --short --porcelain -b --branch -sb --long` |
+| `git log`    | `--oneline --stat --graph --decorate --no-color --numstat --shortstat --name-only --name-status --all` and `-<N>` |
+| `git diff`   | `--stat --cached --staged --name-only --name-status --numstat --shortstat --summary` |
+| `git show`   | `--stat --numstat --name-only --name-status` |
+| `git branch` | `-a --all -v -vv -r --list -l` |
+| `git remote` | `-v --verbose` |
 
-Any Bash command matching a form below is never delegated (over-matching is safe — it only loses a delegation, never grants
-one wrongly):
+## The BLACKLIST backstop (→ escalate:"privilege")
 
-- **privilege:** `sudo`, `doas`
-- **destructive / perms:** `rm rmdir mv cp dd mkfs chmod chown chgrp ln truncate shred`
-- **process / host control:** `kill killall pkill reboot shutdown halt launchctl systemctl service`
-- **network:** `curl wget nc ncat netcat telnet ssh scp sftp rsync ftp`
-- **package / fetch / deploy:** `npm pnpm yarn npx pip pip3 cargo gem bundle apt apt-get yum dnf brew go docker kubectl`
-- **env dump / leak:** `env printenv export set`
-- **any redirect-write:** a `>` of any kind (non-read-only)
-- **pipe to an interpreter:** `… | sh|bash|zsh|python|node|ruby|perl|eval`
-- **command substitution:** `$(…)` or backticks
-- **git mutation:** `git push|commit|reset|clean|checkout|switch|restore|rebase|merge|stash|rm|mv|apply|am|cherry-pick|tag|branch -d|config` (non-`--get`)
-- **credential / secret paths:** `.env id_rsa id_ed25519 id_dsa id_ecdsa .pem .key credentials .aws .ssh .npmrc .git-credentials .netrc secret token password passwd ~/.agenthop/identity`
+The closed-form table already fails closed on everything un-enumerated; the blacklist only sharpens the REASON so a dangerous
+command is labelled `privilege` rather than `needs-user`. Matched forms: `sudo doas` · `rm rmdir mv cp dd mkfs chmod chown
+chgrp ln truncate shred` · `kill killall pkill reboot shutdown halt launchctl systemctl service` · `curl wget nc telnet ssh
+scp sftp rsync ftp` · `npm pnpm yarn npx pip cargo gem apt brew go docker kubectl` · `env printenv export set` · any `>`
+redirect · `… | sh|bash|python|node|…` · `$(…)` / backticks · `git push|commit|reset|clean|checkout|…|config` ·
+credential/secret paths (`.env id_rsa .pem .key credentials .aws .ssh .npmrc .git-credentials .netrc secret token password
+~/.agenthop/identity`).
 
-## Out of scope for v0 (→ user, by design)
+## Deferred (named in the original freeze, NOT closed forms yet ⇒ escalate for now)
 
-- Structured tools (Read / Glob / Grep / Write / Edit / `mcp__…`) — a write is non-read-only; a read tool rarely prompts
-  anyway. v0 does not delegate any structured tool.
-- A safe pipe or chain of read-only commands (`cat x | grep y`) — the metacharacter rule routes it to the user. A future
-  ruling may delegate a validated read-only pipeline.
-- A read of a within-cwd file that happens to match a secret name — the blacklist wins (user decides).
+`grep` / `rg` / `find` are deferred: `find` has an open-ended action grammar (`-delete`/`-exec`), `rg` is recursive-by-default
+(can't pre-enumerate the files it reads), and `grep`'s pattern+recursion surface needs a sound model. They route to
+`needs-user` in v0 and return via a future ruling with a verified model. This narrows v0 below the original example list on
+purpose (coordinator r2: "宁可代理集窄到只剩十几个形态").
 
 ## How to change this
 
-The user vetoes or expands by ruling; the owner then edits both this file and the two functions in
-`approval-delegation.ts` in the same change, and the selftest pins the new cases. No silent drift between the doc and the code.
+The user vetoes or expands by ruling; the owner then edits both this file and the tables in `approval-delegation.ts` in the
+same change, and the selftest pins the new forms. No silent drift between the doc and the code.
