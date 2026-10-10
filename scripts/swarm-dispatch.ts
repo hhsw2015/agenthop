@@ -66,6 +66,7 @@ import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, 
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
+import { inboxWakeEnabled, installInboxWake, backstopWake } from "../packages/bus/src/swarm/inbox-wake.js";
 import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources, archiveLegacyMigration } from "../packages/bus/src/swarm/morning-digest-store.js";
 import { successionEnabled } from "../packages/bus/src/swarm/shell-succession.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
@@ -657,7 +658,10 @@ async function main(): Promise<void> {
   // kill with SWARM_<X>=0). Calls the SAME readers the features use, so the line reflects the real decision. SWARM_TG_ENTRY is the
   // deliberate exception (opt-in — the bridge needs a user-seeded token), read with its own opt-in form.
   const onoff = (b: boolean): string => (b ? "on" : "off");
-  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
+  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${onoff(inboxWakeEnabled())} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
+  // SWARM_INBOX_WAKE: bake a real-time ping into the delivery primitive — writeInbox pings the target's herdr pane on every new
+  // message (any caller, zero discipline). No-op + hook left unset when the flag is off (byte-for-byte v0 delivery).
+  installInboxWake(log);
   const records = loadMirror();
   const ops = buildOps();
   const taskStateRef = { s: loadControlLog(CONTROL_LOG_DIR) };
@@ -1809,6 +1813,13 @@ async function main(): Promise<void> {
       // Morning digest — generate the daily brief projection + coordinator fyi once per day at/after SWARM_DIGEST_HOUR. Gated on
       // SWARM_DIGEST (live by default; kill with =0); fully fail-soft.
       runDigest();
+      // SWARM_INBOX_WAKE backstop: the write-side hook pings on every new message; this only re-pings the COORDINATOR's box if an
+      // item has lain unclaimed past the window (a write-side wake that was missed because herdr was briefly down). Shares the hook's
+      // filesystem claim, so it never double-fires a just-pinged box. IW-P2-2: resolve the coordinator through the SAME identity
+      // resolver the normal notify path uses (resolveSession) — a configured handle resolves to its stable SID; no-resolution or a
+      // non-stable result is skipped (never use a display handle as the box key). Fully fail-soft.
+      const wakeCoordSid = resolveSession(COORDINATOR, listSessions(HOME));
+      if (wakeCoordSid && isStableSid(wakeCoordSid)) await backstopWake(HOME, wakeCoordSid, log);
     },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     passIntervalMs: 5000,

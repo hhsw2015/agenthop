@@ -160,23 +160,55 @@ export function watchInbox(home: string, keys: string[], onChange: () => void): 
  *  not a substitute for refusing an invalid write at the source. Throwing is the fail-fast rejection; every caller passes a
  *  well-formed envelope, so this never fires on the live paths — it guards a future/untrusted producer. The NORMALIZED record
  *  (known fields only) is what gets persisted, so no junk field is ever written. */
+/** Optional, INJECTED real-time wake hook (SWARM_INBOX_WAKE). writeInbox fires it AFTER a genuinely new durable message lands, so the
+ *  target session is pinged (e.g. a herdr pane injection) in real time instead of waiting for its next poll — baked into the delivery
+ *  PRIMITIVE so any caller writing any session's box auto-pings, with zero caller discipline. Unset by default: the core inbox stays
+ *  transport-agnostic (no herdr coupling) and tests / one-shot writers do nothing, byte-for-byte v0. The production hook (swarm
+ *  installInboxWake) is fire-and-forget + fail-soft — a wake fault never touches the already-established delivery. */
+let inboxWakeHook: ((home: string, sid: string) => void) | null = null;
+export function setInboxWakeHook(hook: ((home: string, sid: string) => void) | null): void { inboxWakeHook = hook; }
+
 export function writeInbox(home: string, key: string, msg: InboxMsg, idempotencyKey?: string): WriteResult {
   const valid = validInboxMsg(msg);
   if (valid === null) throw new Error("writeInbox: refusing to publish an invalid inbox message (from/fromLabel/text must be strings, via a non-empty string, ts a finite number)");
   const dir = inboxDir(home, key);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  let result: WriteResult;
   // The key is used as the MESSAGE file's basename (and in the recovery scan), so it MUST be a safe single path segment — no
   // separators, no traversal — or a crafted key could write/overwrite OUTSIDE `dir`, into another session's box (MD-R7-P1-1). A key
   // that is NOT one safe segment falls through to the random-name path (no dedup), which is always confined to `dir`. "." / ".." are
   // allowed: they yield the safe filenames "..json" / "...json", never a parent reference; only separators (and oversized keys) are rejected.
-  if (idempotencyKey !== undefined && /^[A-Za-z0-9._-]{1,120}$/.test(idempotencyKey)) return publishOnce(dir, idempotencyKey, valid);
-  // No key (or an unsafe key) ⇒ the historical unique random name (every write is a new, independent message, confined to `dir`).
-  const base = `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
-  const file = path.join(dir, base);
-  const tmp = `${file}.tmp-${Math.random().toString(36).slice(2, 8)}`;
-  writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
-  renameSync(tmp, file);
-  return "published";
+  if (idempotencyKey !== undefined && /^[A-Za-z0-9._-]{1,120}$/.test(idempotencyKey)) {
+    result = publishOnce(dir, idempotencyKey, valid);
+  } else {
+    // No key (or an unsafe key) ⇒ the historical unique random name (every write is a new, independent message, confined to `dir`).
+    const base = `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
+    const file = path.join(dir, base);
+    const tmp = `${file}.tmp-${Math.random().toString(36).slice(2, 8)}`;
+    writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
+    renameSync(tmp, file);
+    result = "published";
+  }
+  // A genuinely NEW unclaimed message just landed ⇒ fire the (optional, injected) wake hook so the target is pinged in real time.
+  // ONLY on "published": a no-op re-send (already/deferred/pending/unknown) added nothing to claim, so it must not ping. Guarded so
+  // a wake-hook throw can never corrupt the delivery contract (fail-soft is also the hook's own job; this is belt-and-suspenders).
+  if (result === "published" && inboxWakeHook !== null) { try { inboxWakeHook(home, key); } catch { /* fail-soft: a wake fault never breaks delivery */ } }
+  return result;
+}
+
+/** Scan a session's inbox for UNCLAIMED top-level messages (the same `.json` set claimInbox would claim — excludes `.claim-<pid>`,
+ *  and the quarantine/ .pubcred/ .published/ sidecars, which are dirs not `.json`). Returns the count and the OLDEST message's mtime
+ *  (ms; 0 when none) so a caller can decide, with its own clock, whether an item has lain unread past a threshold (the wake backstop).
+ *  Fail-soft: a missing/unreadable dir ⇒ {count:0, oldestMtimeMs:0}. No clock inside (keeps it deterministic to test). Never throws. */
+export function scanUnclaimedInbox(home: string, key: string): { count: number; oldestMtimeMs: number } {
+  const dir = inboxDir(home, key);
+  let names: string[];
+  try { names = readdirSync(dir).filter((n) => n.endsWith(".json")); } catch { return { count: 0, oldestMtimeMs: 0 }; }
+  let oldest = 0;
+  for (const n of names) {
+    try { const m = lstatSync(path.join(dir, n)).mtimeMs; if (oldest === 0 || m < oldest) oldest = m; } catch { /* vanished mid-scan ⇒ skip */ }
+  }
+  return { count: names.length, oldestMtimeMs: oldest };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------

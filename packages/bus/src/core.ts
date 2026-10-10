@@ -10,6 +10,7 @@ import { msgLogEnabled, writeMsgLog } from "./msglog.js";
 import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, poisonNoticeSource } from "./inbox.js";
+import { installInboxWake } from "./swarm/inbox-wake.js";
 import { resolveInboxTarget, isValidSessionId } from "./send-fallback.js";
 import { resolveSession, listSessions, probeSessionAlive } from "./swarm/task-liveness.js";
 import { reportCheckIn, deliverToCoordinator } from "./checkin.js";
@@ -81,6 +82,11 @@ export function codexDeliveryThread(
 export function startBusCore(options: BusCoreOptions = {}): BusCore {
   const self = selfInfo();
   const home = options.home ?? homedir(); // resolved early: used by handleInbound (below) + status watch (later)
+  // SWARM_INBOX_WAKE: bake the real-time ping into the delivery primitive for THIS bus process (MCP / presence / CLI — any writer that
+  // starts the core), so core.send -> writeInbox auto-pings the target with zero per-caller discipline. No-op unless the flag is on AND
+  // herdr is reachable here (installInboxWake's gate); never logs to this process's stdout (the MCP protocol stream) — the hook logs
+  // only via the dispatcher's injected logger. Fail-soft inside the hook; it never affects an established delivery. (IW-P1-1)
+  installInboxWake();
   // Durable inbox: a message that cannot be pushed to the host's live UI yet (channel not ready) is persisted to disk
   // and retried, instead of sitting in a volatile array only agenthop_recv drains. Keys: the stable identity (survives
   // an MCP-subprocess restart) plus the per-run id (used before stableId was learned).

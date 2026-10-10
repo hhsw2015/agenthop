@@ -369,6 +369,27 @@ export async function herdrPaneIdForSession(sid: string): Promise<string | null>
   return paneIdForSession(json, sid);
 }
 
+/** The pane_id AND current agent_status bound to a session id, from one `agent list` — so the inbox-wake path resolves both the
+ *  inject target and the working/idle gate in a single herdr call. Mirrors paneIdForSession's defensive agents[]/panes[] shape;
+ *  status defaults to "unknown" when absent. null when no row matches the sid. Pure. */
+export function paneInfoForSession(listJson: unknown, sid: string): { paneId: string; state: AgentState } | null {
+  if (!sid) return null;
+  const r = (listJson as any)?.result;
+  const rows: unknown[] = Array.isArray(r?.agents) ? r.agents : Array.isArray(r?.panes) ? r.panes : [];
+  for (const row of rows) {
+    const rec = row as any;
+    if (rec?.agent_session?.value === sid && typeof rec?.pane_id === "string" && rec.pane_id) {
+      return { paneId: rec.pane_id, state: (rec.agent_status ?? "unknown") as AgentState };
+    }
+  }
+  return null;
+}
+
+export async function herdrPaneInfoForSession(sid: string): Promise<{ paneId: string; state: AgentState } | null> {
+  const { json } = await herdrRun(["agent", "list"]);
+  return paneInfoForSession(json, sid);
+}
+
 export interface HerdrLaunchOutcome { state: StartState; paneId?: string; name?: string; note: string }
 
 /**
