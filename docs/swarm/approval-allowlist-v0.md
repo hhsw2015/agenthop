@@ -1,10 +1,10 @@
 # approval-allowlist v0 — the delegable closed forms (attached to approval-delegation-brief.md)
 
-owner 90b58f9c · board `approval-delegation` · frozen by coordinator fe0376cd, **r2 ruling** after happycapy's first review
-(the name-list v0 was defeated by poisoned options / quote tricks / symlinks — AD-P1-1/2/3). **user can veto or expand at any
-time; until then the classifier runs by this v0.** Encoded in `packages/bus/src/swarm/approval-delegation.ts`
-(`planDelegation` + the `READ_FORMS` / `GIT_FORMS` / `SCOPE_FREE` tables + the scope gates); this file is the human-readable
-contract those must match.
+owner 90b58f9c · board `approval-delegation` · frozen by coordinator fe0376cd, **r2+r3 rulings** across happycapy's reviews
+(the name-list v0 was defeated by poisoned options / quote tricks / symlinks / inherited keys / git config exec —
+AD-P1-1/2/3, AD-R2-P1-1/2). **user can veto or expand at any time; until then the classifier runs by this v0.** Encoded in
+`packages/bus/src/swarm/approval-delegation.ts` (`planDelegation` + the `READ_FORMS` / `SCOPE_FREE` Map/Set tables + the path
+scope gate); this file is the human-readable contract those must match. **git is NOT in v0 — see Deferred (r3 ①).**
 
 ## Principle — a CLOSED-FORM list, not a command-name list
 
@@ -18,8 +18,8 @@ stays inside the member cwd**. Three laws:
    is allowed, any redirect / pipe / chain / `$`-expansion / quote / backslash / command-substitution → `needs-user` (or
    `privilege` for the blacklist backstop). There is no generic flag parser to trick.
 2. **No scope inference from spelling.** A path operand is delegated only against a verified realpath-within-cwd fact. A
-   missing fact, a failed resolution, or an escape → `needs-user`. The pure core holds no filesystem; the hook supplies the
-   facts (`ApprovalScope`) in the IO round. Until then path/git forms fail closed.
+   missing fact, a failed resolution, an escape, or a resolved credential target → `needs-user`. The pure core holds no
+   filesystem; the hook supplies the facts (`ApprovalScope`) in the IO round. Until then path forms fail closed.
 3. **Fail-closed + allow-only.** Unknown → user. v1 delegates allow only; a deny always reaches the user (auto-deny is v2).
 
 Narrow is the point: the north star is fewer popups, and the handful of fixed forms below (status / log / ls / cat …) already

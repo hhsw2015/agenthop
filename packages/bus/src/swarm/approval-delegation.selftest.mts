@@ -67,6 +67,34 @@ for (const c of ["cat .e*", "cat ?.txt", "ls [ab]*", "cat {a,b}.txt", "cat ~/x",
   t(`metachar/anomaly -> escalate (never delegate): ${c}`, classifyApproval(req(c, okScope(["note.txt"]))).kind === "escalate");
 }
 
+// ── AD-P1-2 r3: JS whitespace != Bash IFS — CR / NBSP / Unicode-space / control chars are NOT word separators ──
+t("CR in command -> needs-user (would have mis-split)", isNeedsUser(classifyApproval(req("cat alpha\rbeta", okScope(["alpha", "beta"])))));
+t("NBSP in command -> needs-user", isNeedsUser(classifyApproval(req("cat alpha beta", okScope(["alpha", "beta"])))));
+t("FF control -> needs-user", isNeedsUser(classifyApproval(req("cat a\fb", okScope([])))));
+t("VT control -> needs-user", isNeedsUser(classifyApproval(req("cat a\vb", okScope([])))));
+t("U+2028 line sep -> needs-user", isNeedsUser(classifyApproval(req("cat a b", okScope([])))));
+t("U+3000 ideographic space -> needs-user", isNeedsUser(classifyApproval(req("cat a　b", okScope([])))));
+t("tab IS a Bash IFS separator: cat a<tab>b + facts -> delegate", isDelegate(classifyApproval(req("cat a\tb", okScope(["a", "b"])))));
+
+// ── AD-R2-P1-2 r3: the sensitive rule must cover the whole .env* family (letters + underscore suffixes) ─────────
+t("cat .envrc (raw .env* family) -> privilege", isPriv(classifyApproval(req("cat .envrc", okScope([])))));
+t("cat sub/.env_local -> privilege", isPriv(classifyApproval(req("cat sub/.env_local", okScope([])))));
+t("isSensitivePath .envrc -> true", isSensitivePath("/w/.envrc") === true);
+t("isSensitivePath .env_local -> true", isSensitivePath("/w/sub/.env_local") === true);
+t("isSensitivePath .env.production -> true", isSensitivePath("/w/.env.production") === true);
+t("alias realpath to .env_local (fact sensitive) -> needs-user", isNeedsUser(classifyApproval(req("cat alias.txt",
+  { cwdVerified: true, resolvedPaths: [{ raw: "alias.txt", resolvedWithinCwd: true, resolvedSensitive: true }] }))));
+
+// ── AD-R3-P2-1: contradictory scope facts must stably escalate (no array-order flip) ──────────────────────────
+t("validApprovalScope KEEPS duplicate raws (merged deny-sticky, not rejected — r4 ③)", validApprovalScope({ cwdVerified: true, resolvedPaths: [{ raw: "x", resolvedWithinCwd: true, resolvedSensitive: false }, { raw: "x", resolvedWithinCwd: true, resolvedSensitive: true }] }) !== null);
+t("contradictory scope still escalates via deny-sticky merge (valid request)", isNeedsUser(classifyApproval(req("cat x", { cwdVerified: true, resolvedPaths: [{ raw: "x", resolvedWithinCwd: true, resolvedSensitive: false }, { raw: "x", resolvedWithinCwd: false, resolvedSensitive: false }] }))));
+t("conservative merge: sensitive-first contradictory -> needs-user", isNeedsUser(classifyApproval(req("cat x",
+  { cwdVerified: true, resolvedPaths: [{ raw: "x", resolvedWithinCwd: true, resolvedSensitive: true }, { raw: "x", resolvedWithinCwd: true, resolvedSensitive: false }] }))));
+t("conservative merge: sensitive-last contradictory -> needs-user", isNeedsUser(classifyApproval(req("cat x",
+  { cwdVerified: true, resolvedPaths: [{ raw: "x", resolvedWithinCwd: true, resolvedSensitive: false }, { raw: "x", resolvedWithinCwd: true, resolvedSensitive: true }] }))));
+t("conservative merge: escape-first contradictory -> needs-user", isNeedsUser(classifyApproval(req("cat x",
+  { cwdVerified: true, resolvedPaths: [{ raw: "x", resolvedWithinCwd: false, resolvedSensitive: false }, { raw: "x", resolvedWithinCwd: true, resolvedSensitive: false }] }))));
+
 // ── AD-P1-1 (poisoned options) stays closed: un-enumerated option -> needs-user ────────────────────────────────
 for (const c of ["find victim.txt -delete", "cat --help", "ls --color=always", "tail -f server.log", "head -n 5 a.txt"]) {
   t(`poisoned/un-enumerated form -> needs-user: ${c}`, isNeedsUser(classifyApproval(req(c, okScope(["victim.txt", "a.txt"])))));

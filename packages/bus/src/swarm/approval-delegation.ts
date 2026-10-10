@@ -110,7 +110,10 @@ const SCOPE_FREE = new Set(["pwd", "echo", "which", "basename", "dirname"]);
 
 /** The credential/secret path signature — shared by the blacklist (raw command) and isSensitivePath (resolved target). Covers
  *  the coordinator r3 ④ list: `.env*`, `.git/credentials`, `*.pem`, `*.key`, `id_rsa*`, ssh/aws material, tokens/passwords. */
-const SECRET_RE = /(\.env\b|id_rsa|id_ed25519|id_dsa|id_ecdsa|\.pem\b|\.key\b|credentials|\.aws\b|\.ssh\b|\.npmrc|\.git-credentials|\.netrc|secret|token|password|passwd|\.agenthop\/identity)/;
+// NO word boundaries — every family is a PREFIX/substring match so the whole `.env*`/`.pem*`/`.key*`/… families are covered
+// (`.envrc`, `.env_local`, `foo.pembak`, …); a `\b` wrongly passed `.envrc`/`.env_local` (AD-R2-P1-2). Over-matching is the
+// intent (coordinator r4 ②: 宁误杀不漏 — a false positive only escalates to the user, never wrongly delegates).
+const SECRET_RE = /(\.env|id_rsa|id_ed25519|id_dsa|id_ecdsa|\.pem|\.key|credentials|\.aws|\.ssh|\.npmrc|\.git-credentials|\.netrc|secret|token|password|passwd|\.agenthop\/identity)/;
 
 /** True iff a (realpath-resolved) target is a credential/secret file. The IO resolver calls this on each realpath to fill
  *  `resolvedSensitive`, so the hook and the contract agree; the pure classifier then trusts that boolean. Pure. */
@@ -158,6 +161,12 @@ export type DelegationPlan =
 const esc = (reason: "privilege" | "needs-user"): DelegationPlan => ({ gate: "escalate", reason });
 
 export function planDelegation(command: string): DelegationPlan {
+  // Reject control chars (CR/VT/FF/…; tab \x09 and newline \x0a excepted) and non-ASCII / NBSP / Unicode whitespace BEFORE any
+  // JS whitespace handling — JS trim() and \s treat CR/NBSP/Unicode-space as whitespace but Bash's IFS word-splitting does not,
+  // so such a byte would be dropped by trim() or wrongly split, planning a different operand set than Bash actually reads
+  // (AD-P1-2). Unsupported whitespace/control ⇒ escalate; literal space and tab are preserved as real IFS separators.
+  if (/[\x00-\x08\x0b-\x1f\x7f]/.test(command)) return esc("needs-user");
+  if (/[\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]/.test(command)) return esc("needs-user"); // NBSP / Unicode whitespace Bash does not IFS-split
   const c = command.trim();
   if (c === "") return esc("needs-user");
   if (/`|\$\(/.test(c)) return esc("privilege");   // command substitution (dangerous intent)
@@ -167,7 +176,7 @@ export function planDelegation(command: string): DelegationPlan {
   if (/[;&|<>(){}\n]/.test(c)) return esc("needs-user"); // redirect / chain / multi-command / brace group
   if (/[*?[\]{}~]/.test(c)) return esc("needs-user");    // glob / brace / tilde — expansion widens the operand set (r3 ②)
 
-  const tokens = c.split(/\s+/).filter(t => t.length > 0);
+  const tokens = c.split(/[ \t]+/).filter(t => t.length > 0); // Bash IFS word-split is space/tab only (CR/NBSP rejected above; newline by the meta gate)
   const cmd = tokens[0].toLowerCase();
   const rest = tokens.slice(1);
 
@@ -194,10 +203,11 @@ export function planDelegation(command: string): DelegationPlan {
  *  target / un-covered operand ⇒ false. */
 function pathsScopeOk(pathArgs: string[], scope?: ApprovalScope): boolean {
   if (!scope || !scope.cwdVerified) return false;
-  const byRaw = new Map(scope.resolvedPaths.map(r => [r.raw, r]));
   for (const p of pathArgs) {
-    const r = byRaw.get(p);
-    if (!r || !r.resolvedWithinCwd || r.resolvedSensitive) return false; // missing fact, escape, or credential (AD-R2-P1-2)
+    const entries = scope.resolvedPaths.filter(r => r.raw === p);
+    if (entries.length === 0) return false;                                           // no fact for this operand
+    if (entries.some(r => !r.resolvedWithinCwd || r.resolvedSensitive)) return false; // ANY escape/credential fact wins, order-
+    // independent — a contradictory pair never delegates by array position (AD-R3-P2-1; validApprovalScope also rejects dup raw)
   }
   return true; // pathArgs empty (e.g. `ls` listing cwd) ⇒ vacuously within cwd once cwdVerified
 }
@@ -229,6 +239,8 @@ export function validApprovalScope(raw: unknown): ApprovalScope | null {
     if (typeof p.raw !== "string" || typeof p.resolvedWithinCwd !== "boolean" || typeof p.resolvedSensitive !== "boolean") return null;
     resolved.push({ raw: p.raw, resolvedWithinCwd: p.resolvedWithinCwd, resolvedSensitive: p.resolvedSensitive });
   }
+  // Duplicate raws are KEPT, not rejected — pathsScopeOk merges them DENY-STICKY (any negative entry wins, order-independent;
+  // coordinator r4 ③ "归并单调向严,不许后项覆盖前项" — the FC-6 monotonic family), so a contradictory pair always escalates.
   return { cwdVerified: r.cwdVerified, resolvedPaths: resolved };
 }
 
