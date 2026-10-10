@@ -182,6 +182,14 @@ export type VizWorktree = {
   head: string;
 };
 
+/** Morning digest (schema morning-digest/v1), produced by the digest-wiring generator (f32a0507) at
+ *  ~/.agenthop/console/morning-digest/digest.json; the console renders it read-only. Sections are generic
+ *  (title + items) so the view survives the generator adding/renaming sections; the five v1 sections are
+ *  昨日签收/并库/在审/告警/今日待裁 (signed-off / merged / in-review / alerts / pending-decisions). */
+export type DigestItem = { text: string; ref?: string };
+export type DigestSection = { key?: string; title: string; items: DigestItem[] };
+export type MorningDigest = { schema: "morning-digest/v1"; date: string; sections: DigestSection[] };
+
 export type Snapshot = {
   generatedAt: number;
   observerId: string;
@@ -226,6 +234,9 @@ export type Snapshot = {
   /** Floors: git worktrees of the repo this exporter runs in (read-only). The canvas draws these as floor
    *  pills (branch + status). Empty when not a git repo / git absent. */
   worktrees: VizWorktree[];
+  /** Morning digest (morning-digest/v1), or null when the generator has not written one / it is unreadable.
+   *  The console renders it read-only; null ⇒ the digest view shows a placeholder (graceful degrade). */
+  digest: MorningDigest | null;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -453,6 +464,47 @@ export function readWorktrees(cwd: string = process.cwd()): VizWorktree[] {
   }
 }
 
+/** Parse morning-digest JSON (schema morning-digest/v1) DEFENSIVELY. A non-object, a wrong/absent schema tag, a
+ *  non-string date, or non-array sections ⇒ null (the view degrades to a placeholder). Unknown extra fields are
+ *  ignored; a malformed section (no string title) or item (no string text) is DROPPED, not fatal — a partial
+ *  digest still renders what is well-formed. The generator (digest-wiring, f32a0507) is still in build, so this
+ *  tolerates its absence and shape drift until the schema lands (same posture as the bandwidth-gauge precedent). */
+export function parseMorningDigest(raw: string): MorningDigest | null {
+  let o: unknown;
+  try { o = JSON.parse(raw); } catch { return null; }
+  if (!o || typeof o !== "object") return null;
+  const d = o as Record<string, unknown>;
+  if (d.schema !== "morning-digest/v1") return null;
+  if (typeof d.date !== "string") return null;
+  if (!Array.isArray(d.sections)) return null;
+  const sections: DigestSection[] = [];
+  for (const s of d.sections) {
+    if (!s || typeof s !== "object") continue;
+    const so = s as Record<string, unknown>;
+    if (typeof so.title !== "string") continue;
+    const items: DigestItem[] = [];
+    for (const it of Array.isArray(so.items) ? so.items : []) {
+      if (!it || typeof it !== "object") continue;
+      const io = it as Record<string, unknown>;
+      if (typeof io.text !== "string") continue;
+      items.push(typeof io.ref === "string" ? { text: io.text, ref: io.ref } : { text: io.text });
+    }
+    sections.push(typeof so.key === "string" ? { key: so.key, title: so.title, items } : { title: so.title, items });
+  }
+  return { schema: "morning-digest/v1", date: d.date, sections };
+}
+
+/** Read the morning digest (read-only, best-effort). Absent / unreadable / corrupt ⇒ null; the console view
+ *  then shows a "no digest yet" placeholder (graceful degrade — the generator may not have written one yet, or
+ *  none for today). Zero backend: a plain file read of the generator's output, no service. */
+export function readMorningDigest(home: string = resolveHome()): MorningDigest | null {
+  try {
+    return parseMorningDigest(readFileSync(path.join(home, ".agenthop", "console", "morning-digest", "digest.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Snapshot assembly
 // ---------------------------------------------------------------------------------------------
@@ -571,6 +623,7 @@ export function buildSnapshot(
     timeline,
     stall,
     worktrees: readWorktrees(),
+    digest: readMorningDigest(home),
     payloadLogged: msgLog.some((e) => typeof e.text === "string" && e.text.length > 0),
     msgLogEnabled: msgLogEnabled(),
   };
@@ -751,6 +804,29 @@ function selftest(): void {
     t("a path containing a newline is preserved (not truncated)", parseWorktreePorcelain(z(rec(`worktree ${nl}`, "HEAD abc00000", "branch refs/heads/x")))[0]!.path === nl);
     const sp = "/tmp/wt-trailing  ";
     t("a path with trailing spaces is preserved (not trimmed)", parseWorktreePorcelain(z(rec(`worktree ${sp}`, "HEAD abc00000", "detached")))[0]!.path === sp);
+  }
+
+  // Morning digest (morning-digest/v1) defensive parsing: well-formed round-trips; wrong/absent schema or shape
+  // ⇒ null (view degrades); malformed sections/items are dropped, a partial digest still renders.
+  {
+    const good = JSON.stringify({
+      schema: "morning-digest/v1", date: "2026-10-09", extra: "ignored",
+      sections: [
+        { key: "signed-off", title: "昨日签收", items: [{ text: "DA2 @ddb8cda", ref: "spend-breaker:x" }, { text: "canvas @2cacfbb" }] },
+        { key: "alerts", title: "告警", items: [] },
+        { title: "no-key section ok", items: [{ text: "ok" }, { bad: 1 }, { text: 7 }] }, // 2 malformed items dropped
+        { items: [{ text: "no-title dropped" }] }, // section without a title dropped
+      ],
+    });
+    const d = parseMorningDigest(good)!;
+    t("digest: well-formed parses with date + sections", d !== null && d.date === "2026-10-09" && d.sections.length === 3);
+    t("digest: section items + optional ref preserved", d.sections[0]!.items.length === 2 && d.sections[0]!.items[0]!.ref === "spend-breaker:x" && d.sections[0]!.items[1]!.ref === undefined);
+    t("digest: a malformed item (non-string text) is dropped, partial still renders", d.sections[2]!.items.length === 1 && d.sections[2]!.items[0]!.text === "ok");
+    t("digest: an empty section is kept (empty kanban-style lane)", d.sections[1]!.title === "告警" && d.sections[1]!.items.length === 0);
+    t("digest: wrong/absent schema ⇒ null", parseMorningDigest(JSON.stringify({ schema: "x", date: "d", sections: [] })) === null && parseMorningDigest(JSON.stringify({ date: "d", sections: [] })) === null);
+    t("digest: non-string date or non-array sections ⇒ null", parseMorningDigest(JSON.stringify({ schema: "morning-digest/v1", date: 1, sections: [] })) === null && parseMorningDigest(JSON.stringify({ schema: "morning-digest/v1", date: "d", sections: {} })) === null);
+    t("digest: corrupt / empty JSON ⇒ null (graceful degrade)", parseMorningDigest("{not json") === null && parseMorningDigest("") === null);
+    t("digest: readMorningDigest on an absent file ⇒ null", readMorningDigest(mkdtempSync(path.join(tmpdir(), "md-"))) === null);
   }
 
   console.log("all selftests passed");
