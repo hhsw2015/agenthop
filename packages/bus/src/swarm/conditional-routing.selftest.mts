@@ -101,6 +101,16 @@ const edge = (over: Partial<ConditionalEdge> = {}): ConditionalEdge => ({ from: 
   Object.defineProperty(mutStages, "1", { enumerable: true, configurable: true, get() { if (!mutated) { mutated = true; e0.when = { kind: "result-exists" }; } return { from: "c", to: "d" }; } });
   const rm = validateConditionalPipeline({ schema: "conditional-routing/v1", stages: mutStages });
   ok(rm.ok && JSON.stringify((rm.value.stages[0] as { when?: unknown }).when) === JSON.stringify({ kind: "status-ok" }), "CR-P2-2 r2: predicate content copied at capture — a later-stage mutation cannot swap it");
+  // CR-R3-P2-1: a descriptor/Proxy trap during capture ⇒ {ok:false}, never throws; an accessor when stays no-when (distinct).
+  const trapWhen = new Proxy({}, { getOwnPropertyDescriptor() { throw new Error("trap"); } });
+  ok(!validateConditionalPipeline({ schema: "conditional-routing/v1", stages: [{ from: "a", to: "b", when: trapWhen }] }).ok, "CR-R3-P2-1: a when descriptor trap ⇒ {ok:false} (not thrown)");
+  const trapStage = new Proxy({ from: "a", to: "b" }, { getOwnPropertyDescriptor() { throw new Error("trap"); } });
+  ok(!validateConditionalPipeline({ schema: "conditional-routing/v1", stages: [trapStage] }).ok, "CR-R3-P2-1: a stage descriptor trap ⇒ {ok:false} (not thrown)");
+  ok(!validateConditionalPipeline({ schema: "conditional-routing/v1", stages: [{ from: "", to: "b", when: trapWhen }] }).ok, "CR-R3-P2-1: empty from + unreadable when ⇒ {ok:false} (matches r2, no throw regression)");
+  const sg: Record<string, unknown> = { from: "a", to: "b" };
+  Object.defineProperty(sg, "when", { enumerable: true, get() { return { kind: "status-ok" }; } });
+  const rg = validateConditionalPipeline({ schema: "conditional-routing/v1", stages: [sg] });
+  ok(rg.ok && (rg.value.stages[0] as { when?: unknown }).when === undefined, "CR-R3-P2-1: an accessor when stays no-when (read as absent, not a capture failure)");
   // CR-P2-3: throwing getters / Proxy trap ⇒ unknown (never throw, never skip).
   const boom = {} as UpstreamView;
   for (const k of ["status", "resultRef", "fields"]) Object.defineProperty(boom, k, { enumerable: true, get() { throw new Error("boom"); } });

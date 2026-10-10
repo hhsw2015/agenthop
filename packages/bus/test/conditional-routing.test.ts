@@ -169,6 +169,24 @@ describe("conditional-routing — round-1 fixes (schema round-trip / single-capt
     expect(r.ok).toBe(true);
     if (r.ok) { expect(r.value.stages[0]!.from).toBe("a"); expect(r.value.stages[0]!.when).toEqual({ kind: "field-eq", field: "cat", value: "bug" }); }
   });
+  test("CR-R3-P2-1: a descriptor/Proxy trap during capture ⇒ {ok:false}, never throws out of the validator", () => {
+    const trapWhen = new Proxy({}, { getOwnPropertyDescriptor() { throw new Error("trap"); } });
+    expect(validateConditionalPipeline({ schema: "conditional-routing/v1", stages: [{ from: "a", to: "b", when: trapWhen }] }).ok).toBe(false);
+    const trapStage = new Proxy({ from: "a", to: "b" }, { getOwnPropertyDescriptor() { throw new Error("trap"); } });
+    expect(validateConditionalPipeline({ schema: "conditional-routing/v1", stages: [trapStage] }).ok).toBe(false);
+    // empty from + unreadable when ⇒ {ok:false} (matches r2), not a throw (the r3 regression)
+    expect(validateConditionalPipeline({ schema: "conditional-routing/v1", stages: [{ from: "", to: "b", when: trapWhen }] }).ok).toBe(false);
+    // a knownNodes slot whose read throws ⇒ {ok:false}
+    const trapKnown = new Proxy(["a", "b"], { get(t, p, r) { if (p === "0") throw new Error("trap"); return Reflect.get(t, p, r); } });
+    expect(validateConditionalPipeline({ schema: "conditional-routing/v1", stages: [{ from: "a", to: "ghost" }] }, trapKnown as unknown as string[]).ok).toBe(false);
+  });
+  test("CR-R3-P2-1: an accessor `when` stays 'no-when' (read as absent, NOT a capture failure) — distinct from a descriptor throw", () => {
+    const stageGetter: Record<string, unknown> = { from: "a", to: "b" };
+    Object.defineProperty(stageGetter, "when", { enumerable: true, get() { return { kind: "status-ok" }; } });
+    const r = validateConditionalPipeline({ schema: "conditional-routing/v1", stages: [stageGetter] });
+    expect(r.ok).toBe(true); // accessor when ⇒ getOwnPropertyDescriptor returns it without invoking ⇒ read as absent ⇒ no-when
+    expect(r.ok && r.value.stages[0]!.when).toBeUndefined();
+  });
   test("CR-P2-3: an unreadable upstream (throwing getter / Proxy descriptor trap) ⇒ unknown, never throws, never skip", () => {
     const getterBoom = {} as UpstreamView;
     for (const k of ["status", "resultRef", "fields"]) Object.defineProperty(getterBoom, k, { enumerable: true, get() { throw new Error("boom"); } });

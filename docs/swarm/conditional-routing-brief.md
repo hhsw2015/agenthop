@@ -70,6 +70,7 @@ FanoutPlan    = { subtasks: FanoutSubtask[]; total: number; capped: boolean; dro
 - **FC-6 确定性**:evalEdgeCondition、planFanout、fanoutSubtaskId 纯函数,同输入恒同输出(无时钟/IO/随机/自由表达式);自测钉 1000× 一致。
 - **FC-7 向后兼容**:无 `when` 的 force-pipeline/v1 边经 validateConditionalPipeline 产出 `{from,to}` 与 force-pipeline 一致;evalEdgeCondition 对无 when 边恒 take(= 旧无条件强制边行为)。
 - **trust-boundary**(同 force-pipeline/task-plan/grill-gate):untrusted 整树校验或整体拒绝;ownVal 自有数据读一次捕获;数组 by-index 走(不走输入迭代器);枚举 proto-safe。
+- **异常边界**(CR-R3-P2-1):validateConditionalPipeline 整体有异常边界——任何读取(schema/stages/边 from-to-when/谓词标量/knownNodes 槽)的描述符或 Proxy 陷阱抛错 ⇒ 返回 `{ok:false}`,**绝不外抛、绝不吞成 undefined 按无 when 放行**。与「accessor `when` ⇒ 无 when」区分:getOwnPropertyDescriptor 取访问器**不调用**它(⇒ 读为缺失=无 when),描述符访问**失败**则是捕获失败(⇒ 拒绝)。evalEdgeCondition 同样对不可读(含 Proxy 陷阱)统一返 unknown。
 - **不静默丢**:unknown≠skip(保留重试);扇出超限 capped/dropped 显式报。
 - **force-pipeline.ts 零改**(字节稳定,landed);本件纯加法。
 

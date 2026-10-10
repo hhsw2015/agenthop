@@ -73,6 +73,15 @@ function validateCondition(w: unknown, where: string): Res<EdgeCondition> {
  * ⇒ whole-reject.
  */
 export function validateConditionalPipeline(input: unknown, knownNodes?: readonly string[]): Res<ConditionalPipeline> {
+  // CR-R3-P2-1: the whole capture/validation has an exception boundary. A hostile descriptor / Proxy trap thrown by ANY read
+  // (schema, stages, a stage's from/to/when, a predicate scalar, or a knownNodes slot) returns {ok:false} instead of escaping the
+  // validator. This is distinct from the accepted "accessor `when` ⇒ no-when" rule: getOwnPropertyDescriptor returns an accessor
+  // WITHOUT invoking it (⇒ read as absent ⇒ no-when), whereas a descriptor ACCESS that throws is a capture failure ⇒ reject (never
+  // swallowed to "no when", never thrown out).
+  try { return captureConditionalPipeline(input, knownNodes); }
+  catch { return { ok: false, reason: "conditional-routing input is unreadable (descriptor access failed)" }; }
+}
+function captureConditionalPipeline(input: unknown, knownNodes?: readonly string[]): Res<ConditionalPipeline> {
   if (!isObj(input)) return { ok: false, reason: "conditional-routing must be an object" };
   const schema = ownVal(input, "schema");
   if (schema !== "conditional-routing/v1" && schema !== "force-pipeline/v1") {
