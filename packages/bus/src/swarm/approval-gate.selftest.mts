@@ -15,7 +15,7 @@ const reqOf = (command: string, over: Partial<ApprovalRequest> = {}): ApprovalRe
 // ── planCoordinatorAction ─────────────────────────────────────────────────────────────────────────────────────
 {
   const a = planCoordinatorAction(reqOf("pwd"), "coord", 1234);
-  t("scope-free delegate: binds requestId/member/tool/command/digest + behavior/rewrite/by/atSec", a.act === "delegate" && a.decision.requestId === "rid" && a.decision.member === "mem1" && a.decision.tool === "Bash" && a.decision.command === "pwd" && a.decision.toolInputDigest === toolInputDigest({ command: "pwd" }) && a.decision.behavior === "allow" && a.decision.rewrite === "/bin/pwd" && a.decision.by === "coord" && a.decision.atSec === 1234);
+  t("scope-free delegate: binds requestId/member/tool/command/digest + behavior/rewrite/by/atSec", a.act === "delegate" && a.decision.requestId === "rid" && a.decision.member === "mem1" && a.decision.tool === "Bash" && a.decision.command === "pwd" && a.decision.toolInputDigest === toolInputDigest({ command: "pwd" }) && a.decision.behavior === "allow" && a.decision.rewrite === "builtin command /bin/pwd" && a.decision.by === "coord" && a.decision.atSec === 1234);
 }
 t("path read -> escalate (v1 dropped)", planCoordinatorAction(reqOf("cat a.txt"), "c", 1).act === "escalate");
 t("git -> escalate (v1 dropped)", planCoordinatorAction(reqOf("git status"), "c", 1).act === "escalate");
@@ -41,7 +41,7 @@ t("toolInputDigest distinguishes structured inputs (command '')", toolInputDiges
 
 // ── decisionBindsTo ───────────────────────────────────────────────────────────────────────────────────────────
 const parsed = { member: "mem1", tool: "Bash", command: "pwd", toolInput: { command: "pwd" }, cwd: "/w", promptId: "pr1" };
-const dec = (over: Partial<PermissionDecision> = {}): PermissionDecision => ({ requestId: "RID", member: "mem1", tool: "Bash", command: "pwd", toolInputDigest: toolInputDigest({ command: "pwd" }), behavior: "allow", rewrite: "/bin/pwd", by: "c", reason: "x", atSec: 1, promptId: "pr1", ...over });
+const dec = (over: Partial<PermissionDecision> = {}): PermissionDecision => ({ requestId: "RID", member: "mem1", tool: "Bash", command: "pwd", toolInputDigest: toolInputDigest({ command: "pwd" }), behavior: "allow", rewrite: "builtin command /bin/pwd", by: "c", reason: "x", atSec: 1, promptId: "pr1", ...over });
 t("bindsTo: full match", decisionBindsTo(dec(), "RID", parsed) === true);
 t("bindsTo: requestId mismatch -> false", decisionBindsTo(dec(), "OTHER", parsed) === false);
 t("bindsTo: member mismatch -> false", decisionBindsTo(dec({ member: "memX" }), "RID", parsed) === false);
@@ -51,12 +51,12 @@ t("bindsTo: digest mismatch -> false", decisionBindsTo(dec({ toolInputDigest: "n
 
 // ── allowDecisionOutput + approvalInboxKey ────────────────────────────────────────────────────────────────────
 t("allowDecisionOutput() is a bare allow (no updatedInput)", allowDecisionOutput() === JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } }));
-t("allowDecisionOutput(updatedInput) carries the pinned input (AD-V1-P1-1)", allowDecisionOutput({ command: "/bin/pwd" }) === JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedInput: { command: "/bin/pwd" } } } }));
+t("allowDecisionOutput(updatedInput) carries the pinned input (AD-V1-P1-1)", allowDecisionOutput({ command: "builtin command /bin/pwd" }) === JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedInput: { command: "builtin command /bin/pwd" } } } }));
 t("approvalInboxKey", approvalInboxKey("fe0376cd") === "approvals:fe0376cd");
 
 // ── runPermissionGate ─────────────────────────────────────────────────────────────────────────────────────────
 const payload = { session_id: "mem1", tool_name: "Bash", tool_input: { command: "pwd" }, cwd: "/w", prompt_id: "pr1" };
-const boundAllow = (rid: string, over: Partial<PermissionDecision> = {}): PermissionDecision => ({ requestId: rid, member: "mem1", tool: "Bash", command: "pwd", toolInputDigest: toolInputDigest({ command: "pwd" }), behavior: "allow", rewrite: "/bin/pwd", by: "c", reason: "x", atSec: 1, promptId: "pr1", ...over });
+const boundAllow = (rid: string, over: Partial<PermissionDecision> = {}): PermissionDecision => ({ requestId: rid, member: "mem1", tool: "Bash", command: "pwd", toolInputDigest: toolInputDigest({ command: "pwd" }), behavior: "allow", rewrite: "builtin command /bin/pwd", by: "c", reason: "x", atSec: 1, promptId: "pr1", ...over });
 function mkDeps(over: Partial<PermissionGateDeps> & { decisions?: Record<string, PermissionDecision>; rid?: string } = {}): { deps: PermissionGateDeps; out: string[]; blocked: string[]; written: ApprovalRequest[]; rid: string } {
   const out: string[] = [], blocked: string[] = [], written: ApprovalRequest[] = [];
   const rid = over.rid ?? "nonce-1";
@@ -79,7 +79,7 @@ function mkDeps(over: Partial<PermissionGateDeps> & { decisions?: Record<string,
   return { deps, out, blocked, written, rid };
 }
 
-await (async () => { const { deps, out, blocked, written } = mkDeps({ decisions: { "nonce-1": boundAllow("nonce-1") } }); await runPermissionGate(deps); t("gate: bound allow -> emits allow+pinned updatedInput; blocked; wrote S11 with requestId", out.length === 1 && out[0] === allowDecisionOutput({ command: "/bin/pwd" }) && blocked[0] === "mem1" && written[0].requestId === "nonce-1"); })();
+await (async () => { const { deps, out, blocked, written } = mkDeps({ decisions: { "nonce-1": boundAllow("nonce-1") } }); await runPermissionGate(deps); t("gate: bound allow -> emits allow+pinned updatedInput; blocked; wrote S11 with requestId", out.length === 1 && out[0] === allowDecisionOutput({ command: "builtin command /bin/pwd" }) && blocked[0] === "mem1" && written[0].requestId === "nonce-1"); })();
 // AD-V1-P1-1: the hook recomputes the rewrite locally; a pinned binary that is NOT a real regular file in THIS env ⇒ no emit (user)
 await (async () => { const { deps, out } = mkDeps({ decisions: { "nonce-1": boundAllow("nonce-1") }, pinnedPathOk: () => false }); await runPermissionGate(deps); t("gate: pinned path not a regular file -> nothing (escalate to user)", out.length === 0); })();
 await (async () => { const { deps, out } = mkDeps({}); await runPermissionGate(deps); t("gate: no decision -> nothing", out.length === 0); })();

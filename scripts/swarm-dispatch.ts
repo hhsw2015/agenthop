@@ -19,7 +19,7 @@
 //      SWARM_HANDOFF_LEAD_SEC (180), SWARM_LAUNCH (scripts/swarm-launch.sh), AH_HOME, SWARM_SELF.
 
 import { spawn, execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync, statSync, unlinkSync, openSync, readSync, fstatSync, closeSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync, statSync, lstatSync, unlinkSync, openSync, readSync, fstatSync, closeSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1709,8 +1709,13 @@ async function main(): Promise<void> {
     let released = false;
     try { released = releaseInbox(file); } catch { released = false; }
     if (released) { approvalPendingRelease.delete(file); return; }
-    if (!existsSync(file)) { approvalPendingRelease.delete(file); return; } // claim already gone ⇒ nothing stranded
-    approvalPendingRelease.add(file);                                       // still present + unreleased ⇒ retry next sweep
+    // ADIO-P2-1 (existence is THREE-state, FC-2 lineage): discharge the obligation ONLY on a CONFIRMED ENOENT (the claim truly
+    // vanished). A permission/IO error (EACCES/EIO) is UNKNOWN, not "gone" — existsSync()'s bare false conflates them and would
+    // drop a still-stranded claim; lstat + inspect the error code, keep the obligation for present OR unknown.
+    let state: "present" | "absent" | "unknown" = "unknown";
+    try { lstatSync(file); state = "present"; } catch (e) { state = (e as NodeJS.ErrnoException)?.code === "ENOENT" ? "absent" : "unknown"; }
+    if (state === "absent") { approvalPendingRelease.delete(file); return; } // truly gone ⇒ nothing stranded
+    approvalPendingRelease.add(file);                                        // present OR unknown ⇒ retry next sweep
   };
   const runApprovalDelegation = (): void => {
     if (!approvalDelegateEnabled()) return;

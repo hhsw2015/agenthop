@@ -87,9 +87,11 @@ export const APPROVAL_POLL_SEC = 15;
  *  Linux); the member hook lstat-verifies the path is a real regular file in ITS env before emitting (dangling link / directory /
  *  symlink-replacement ⇒ escalate). The one residual — /bin itself tampered — is system-compromise level, outside any user-space
  *  threat model (coordinator ruling; a sanitized read could not defend it either). */
-const PINNED: Record<string, string> = {
-  pwd: "/bin/pwd", echo: "/bin/echo", which: "/usr/bin/which", basename: "/usr/bin/basename", dirname: "/usr/bin/dirname",
-};
+const PINNED = new Map<string, string>([
+  ["pwd", "/bin/pwd"], ["echo", "/bin/echo"], ["which", "/usr/bin/which"], ["basename", "/usr/bin/basename"], ["dirname", "/usr/bin/dirname"],
+]); // a Map, NOT a plain object (AD-V1-R2-P2-1 / AD-R2-P1-1 lineage): `PINNED.get("constructor"|"toString"|"__proto__"|…)` is
+   // undefined, so a prototype-inherited name is never classified scope-free (a plain-object `PINNED[name]` would return the
+   // inherited function and wrongly delegate — and record a bogus permissionDecision).
 
 /** The credential/secret path signature — the privilege backstop inspects the raw command for it (black-before-white). */
 const SECRET_RE = /(\.env|id_rsa|id_ed25519|id_dsa|id_ecdsa|\.pem|\.key|credentials|\.aws|\.ssh|\.npmrc|\.git-credentials|\.netrc|secret|token|password|passwd|\.agenthop\/identity)/;
@@ -119,7 +121,7 @@ export function isBlacklisted(tool: string, command: string): boolean {
  *  blacklist backstop / command substitution, else needs-user). No filesystem facts are ever needed (scope-free touches none). */
 export type DelegationPlan =
   | { gate: "escalate"; reason: "privilege" | "needs-user" }
-  | { gate: "scope-free"; rewrite: string };   // rewrite = the pinned-absolute-path command (AD-V1-P1-1 execution binding)
+  | { gate: "scope-free"; rewrite: string; pinnedPath: string };   // rewrite = `builtin command <abspath> <args>`; pinnedPath = the abspath the member hook lstat-verifies
 
 const esc = (reason: "privilege" | "needs-user"): DelegationPlan => ({ gate: "escalate", reason });
 
@@ -142,13 +144,14 @@ export function planDelegation(command: string): DelegationPlan {
   const rest = tokens.slice(1); // scope-free (they would otherwise pass the table then EXECUTE the raw spelling, which the
                                 // member's PATH resolves to a different/attacker binary — the uppercase-ECHO hole)
 
-  const pin = PINNED[cmd];
-  if (pin === undefined) return esc("needs-user");                // path reads, git, uppercase spellings, unknown ⇒ user (v1)
+  const pin = PINNED.get(cmd);  // Map.get ⇒ undefined for a prototype-inherited name (AD-V1-R2-P2-1): no delegate, no record
+  if (pin === undefined) return esc("needs-user");                // path reads, git, uppercase/prototype names, unknown ⇒ user
   if (cmd === "pwd" && rest.length > 0) return esc("needs-user"); // pwd takes no args
-  // AD-V1-P1-1 execution binding: pin the command to its trusted ABSOLUTE PATH (the member shell's alias/function/PATH name
-  // resolution no longer participates). Keep the args VERBATIM — they already passed every guard above; `c` is trimmed so it
-  // starts with tokens[0], and slicing keeps the original inter-arg spacing.
-  return { gate: "scope-free", rewrite: pin + c.slice(tokens[0].length) };
+  // AD-V1-P1-1 execution binding: invoke the trusted ABSOLUTE PATH via `builtin command` so the member shell's name resolution
+  // never participates — `command` skips function/alias lookup (closing a BASH_ENV function that shadows the `/bin/pwd` literal),
+  // `builtin` forces the real `command` builtin (not a member function named `command`). Args kept VERBATIM (`c` is trimmed so it
+  // starts with tokens[0]; slice keeps the inter-arg spacing). pinnedPath is the bare abspath the member hook lstat-verifies.
+  return { gate: "scope-free", rewrite: `builtin command ${pin}${c.slice(tokens[0].length)}`, pinnedPath: pin };
 }
 
 /**

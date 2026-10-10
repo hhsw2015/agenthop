@@ -22,17 +22,24 @@ for (const c of ["pwd", "echo hi", "echo ../anything is a literal", "which tsx",
 }
 t("pwd with an arg -> needs-user", isNeedsUser(classifyApproval(req("pwd extra"))));
 
-// ── AD-V1-P1-1: the delegate carries the pinned-absolute-path rewrite (execution binding), args verbatim ─────────
+// ── AD-V1-P1-1: the delegate rewrite invokes the pinned ABSOLUTE PATH via `builtin command` (bypasses a BASH_ENV function that
+//    shadows the /bin/pwd literal AND a member function named `command`); args verbatim ─────────────────────────
 const rw = (c: string) => { const v = classifyApproval(req(c)); return v.kind === "delegate" ? v.rewrite : null; };
-t("rewrite pins pwd", rw("pwd") === "/bin/pwd");
-t("rewrite pins echo + keeps args verbatim", rw("echo hi") === "/bin/echo hi");
-t("rewrite pins echo with collapsed-safe spacing verbatim", rw("echo  a   b") === "/bin/echo  a   b");
-t("rewrite pins which", rw("which tsx") === "/usr/bin/which tsx");
-t("rewrite pins basename", rw("basename a/b/c") === "/usr/bin/basename a/b/c");
-t("rewrite pins dirname", rw("dirname a/b") === "/usr/bin/dirname a/b");
+t("rewrite pins pwd via builtin command", rw("pwd") === "builtin command /bin/pwd");
+t("rewrite pins echo + keeps args verbatim", rw("echo hi") === "builtin command /bin/echo hi");
+t("rewrite pins echo with inner spacing verbatim", rw("echo  a   b") === "builtin command /bin/echo  a   b");
+t("rewrite pins which", rw("which tsx") === "builtin command /usr/bin/which tsx");
+t("rewrite pins basename", rw("basename a/b/c") === "builtin command /usr/bin/basename a/b/c");
+t("rewrite pins dirname", rw("dirname a/b") === "builtin command /usr/bin/dirname a/b");
+t("every scope-free rewrite is invoked via `builtin command /`", ["pwd", "echo hi", "which x", "basename a", "dirname a"].every(c => (rw(c) ?? "").startsWith("builtin command /")));
 
 // ── AD-V1-P1-1: match is case-SENSITIVE — a raw/uppercase spelling is NOT scope-free (would execute the raw spelling) ──
 for (const c of ["ECHO hi", "Pwd", "WHICH tsx", "Echo hi", "PWD"]) t(`case-sensitive escalate: ${c}`, isNeedsUser(classifyApproval(req(c))));
+
+// ── AD-V1-R2-P2-1: PINNED is a Map, so a prototype-inherited name is NOT scope-free — no delegate verdict, no committed record ──
+for (const c of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "constructor x", "__proto__ y"]) {
+  t(`prototype name escalates (not scope-free): ${c}`, isNeedsUser(classifyApproval(req(c))));
+}
 
 // ── v1 DROPPED: path reads + git + search all escalate (not scope-free, not blacklisted ⇒ needs-user) ──────────
 for (const c of ["cat a.txt", "ls", "ls -la", "head a.txt", "tail f.log", "wc -l x", "file x", "stat x",
@@ -63,7 +70,8 @@ for (const tool of ["Write", "Read", "Edit", "mcp__x__y"]) t(`structured ${tool}
 t("no delegate-deny", ["pwd", "cat x", "rm x", "git status"].every(c => { const v = classifyApproval(req(c)); return v.kind === "escalate" || (v.kind === "delegate" && v.behavior === "allow"); }));
 
 // ── planDelegation / isBlacklisted ────────────────────────────────────────────────────────────────────────────
-t("planDelegation scope-free for pwd + pinned rewrite", (() => { const p = planDelegation("pwd"); return p.gate === "scope-free" && p.rewrite === "/bin/pwd"; })());
+t("planDelegation scope-free for pwd + builtin-command rewrite + pinnedPath", (() => { const p = planDelegation("pwd"); return p.gate === "scope-free" && p.rewrite === "builtin command /bin/pwd" && p.pinnedPath === "/bin/pwd"; })());
+t("planDelegation prototype name (constructor) escalates needs-user", (() => { const p = planDelegation("constructor"); return p.gate === "escalate" && (p as any).reason === "needs-user"; })());
 t("planDelegation escalate needs-user for cat", (() => { const p = planDelegation("cat x"); return p.gate === "escalate" && (p as any).reason === "needs-user"; })());
 t("planDelegation escalate privilege for rm", (() => { const p = planDelegation("rm x"); return p.gate === "escalate" && (p as any).reason === "privilege"; })());
 t("planDelegation privilege for substitution", (() => { const p = planDelegation("echo `id`"); return p.gate === "escalate" && (p as any).reason === "privilege"; })());

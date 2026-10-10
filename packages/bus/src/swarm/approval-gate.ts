@@ -141,10 +141,9 @@ export async function runPermissionGate(deps: PermissionGateDeps): Promise<void>
       // rewrite string carried in the control-log decision (the log authorizes WHETHER to allow; the member binds WHAT runs).
       const plan = planDelegation(parsed.command);
       if (plan.gate !== "scope-free") return;                 // a bound decision for a non-scope-free command ⇒ user dialog (defensive)
-      const bin = plan.rewrite.split(/[ \t]+/)[0];            // the pinned absolute path (no spaces) is the first token
-      if (!deps.pinnedPathOk(bin)) return;                    // missing / symlink / dir in THIS env ⇒ escalate to the user
+      if (!deps.pinnedPathOk(plan.pinnedPath)) return;        // the pinned binary missing / symlink / dir in THIS env ⇒ escalate to the user
       const updatedInput = { ...(parsed.toolInput as Record<string, unknown>), command: plan.rewrite };
-      deps.emit(allowDecisionOutput(updatedInput));           // full original input, only `command` swapped to the pinned path
+      deps.emit(allowDecisionOutput(updatedInput));           // full original input, command swapped to `builtin command <abspath>`
       return;
     }
     await deps.sleep(interval);
