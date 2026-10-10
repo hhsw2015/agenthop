@@ -26,9 +26,9 @@ EdgeDecision = "take" | "skip" | "unknown"
 
 **校验** `validateConditionalPipeline(input, knownNodes?) → Res<ConditionalPipeline>`:
 - **入 schema 二选一**:`conditional-routing/v1`(本件声明)或 `force-pipeline/v1`(旧,FC-7);**出恒 `conditional-routing/v1`**,故合法输入既过校验、**输出又能再过同一校验器**(往返,CR-P2-1)。
-- **单次捕获**(CR-P2-2):把原始 `stages` 数组及每边的自有数据 `{from,to,when}` **一次性**快照进 plain 数组(每槽只读一次);结构校验与 `when` 都取自这同一快照,**绝不复读原输入**——可变/getter 槽无法让条件脱离其边。`stages` 不是数组(含 getter 返回非数组)⇒ 整体拒绝(无法可靠捕获)。
+- **单次捕获 + 捕获时即复制谓词标量**(CR-P2-2):逐边读自有数据 from/to,并**当场** `validateCondition` 把 `when` 的 kind/field/value **校验+复制成独立对象**(不在 snap 里留原 `when` 引用待稍后解读)。这一步在**结构校验之前、任何 knownNodes 读取之前**完成,故后续读取后继阶段或读 knownNodes 时触发的原输入突变,改不动已捕获边的端点或谓词内容。`stages` 非数组(含 getter 返回非数组)、`when` 非法或不可靠捕获 ⇒ 整体拒绝。
 - 把由快照构建的**受控 `force-pipeline/v1` 投影**(plain 对象,无访问器)交给已签 `validateForcePipeline`(复用:自引用/重复边/悬空/环=Kahn/from-to 类型,trust-boundary 一致)——**绝不把原输入交给它**(其 schema 可能是 conditional-routing/v1)。投影保序 ⇒ base.stages[i] ↔ snap[i]。
-- 按**索引对齐**给每条已校验边挂同一快照的 `when`,经 `validateCondition` 整树校验(`kind` 枚举;`field-eq` 的 field 非空串、value 为串);无 `when` 的边输出 `{from,to}`(与 force-pipeline **边**字节一致,FC-7)。任一 `when` 非法 ⇒ 整体拒绝。
+- 组装:已校验 `{from,to}` + 捕获时已复制的 `when`(皆独立于原输入,组装阶段不再读原输入);无 `when` 的边输出 `{from,to}`(与 force-pipeline **边**字节一致,FC-7)。
 
 **裁决** `evalEdgeCondition(edge, upstream) → EdgeDecision`(纯,无时钟/IO/随机;FC-6 确定性表):
 | 情形 | 结果 | 理由 |

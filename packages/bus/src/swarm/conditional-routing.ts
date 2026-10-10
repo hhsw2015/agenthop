@@ -80,27 +80,32 @@ export function validateConditionalPipeline(input: unknown, knownNodes?: readonl
   }
   const stagesRaw = ownVal(input, "stages");
   if (!Array.isArray(stagesRaw)) return { ok: false, reason: "stages must be an array" };
-  // SINGLE capture (CR-P2-2): snapshot each stage's own-data {from,to,when} once. Every slot is read exactly once here; nothing
-  // downstream re-reads the raw input.
-  const snap: { from: unknown; to: unknown; when: unknown }[] = [];
+  // SINGLE capture (CR-P2-2): per edge, read own-data from/to AND fully VALIDATE+COPY the `when` predicate into independent
+  // scalar data RIGHT HERE — never keep a raw `when` reference to interpret later. This happens BEFORE the structural check and
+  // before any knownNodes read, so a mutation of the raw input triggered by a later stage-read or a knownNodes-read cannot swap a
+  // captured edge's endpoints or predicate content. An illegal/uncapturable `when` ⇒ whole-reject.
+  const snap: { from: unknown; to: unknown; when?: EdgeCondition }[] = [];
   for (let i = 0; i < stagesRaw.length; i += 1) {           // index walk (never the input's iterator)
     const raw = stagesRaw[i];                               // one read of slot i
     if (!isObj(raw)) return { ok: false, reason: `stage[${i}] must be an object` };
-    snap.push({ from: ownVal(raw, "from"), to: ownVal(raw, "to"), when: ownVal(raw, "when") });
+    const from = ownVal(raw, "from"), to = ownVal(raw, "to"), whenRaw = ownVal(raw, "when");
+    if (whenRaw === undefined) { snap.push({ from, to }); continue; }
+    const vc = validateCondition(whenRaw, `stage[${i}]`);   // reads kind/field/value NOW and returns a FRESH object (copied scalars)
+    if (!vc.ok) return { ok: false, reason: vc.reason };
+    snap.push({ from, to, when: vc.value });                // independent condition data — not a raw reference
   }
   // CR-P2-1: hand a CONTROLLED force-pipeline/v1 projection (plain objects from the snapshot) to the signed validator — never
   // the raw input (whose schema may be conditional-routing/v1). Order is preserved, so base.value.stages[i] ↔ snap[i].
   const projection = { schema: "force-pipeline/v1" as const, stages: snap.map((s) => ({ from: s.from, to: s.to })) };
   const base = validateForcePipeline(projection, knownNodes);
   if (!base.ok) return base;
+  // Assemble: validated {from,to} (from the snapshot projection) + the already-copied `when` — both independent of the raw since
+  // the capture loop, so nothing here re-reads the untrusted input.
   const stages: ConditionalEdge[] = [];
   for (let i = 0; i < base.value.stages.length; i += 1) {
-    const vs = base.value.stages[i]!;                       // validated {from,to} (from the snapshot projection)
-    const whenRaw = snap[i]!.when;                          // the SAME-capture when (not re-read from the raw)
-    if (whenRaw === undefined) { stages.push({ from: vs.from, to: vs.to }); continue; }
-    const vc = validateCondition(whenRaw, `stage[${i}]`);
-    if (!vc.ok) return { ok: false, reason: vc.reason };
-    stages.push({ from: vs.from, to: vs.to, when: vc.value });
+    const vs = base.value.stages[i]!;
+    const when = snap[i]!.when;
+    stages.push(when === undefined ? { from: vs.from, to: vs.to } : { from: vs.from, to: vs.to, when });
   }
   return { ok: true, value: { schema: "conditional-routing/v1", stages } };
 }

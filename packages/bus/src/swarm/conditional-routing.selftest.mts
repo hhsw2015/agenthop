@@ -94,6 +94,13 @@ const edge = (over: Partial<ConditionalEdge> = {}): ConditionalEdge => ({ from: 
   const getterStages: Record<string, unknown> = { schema: "conditional-routing/v1" };
   Object.defineProperty(getterStages, "stages", { enumerable: true, get() { return [{ from: "a", to: "b" }]; } });
   ok(!validateConditionalPipeline(getterStages).ok, "CR-P2-2: an uncapturable `stages` getter is rejected whole");
+  // CR-P2-2 r2: the predicate CONTENT is validated+copied at capture; a later stage-read mutating edge0.when cannot detach it.
+  const e0 = { from: "a", to: "b", when: { kind: "status-ok" } as Record<string, unknown> };
+  const mutStages: unknown[] = [e0, { from: "c", to: "d" }];
+  let mutated = false;
+  Object.defineProperty(mutStages, "1", { enumerable: true, configurable: true, get() { if (!mutated) { mutated = true; e0.when = { kind: "result-exists" }; } return { from: "c", to: "d" }; } });
+  const rm = validateConditionalPipeline({ schema: "conditional-routing/v1", stages: mutStages });
+  ok(rm.ok && JSON.stringify((rm.value.stages[0] as { when?: unknown }).when) === JSON.stringify({ kind: "status-ok" }), "CR-P2-2 r2: predicate content copied at capture — a later-stage mutation cannot swap it");
   // CR-P2-3: throwing getters / Proxy trap ⇒ unknown (never throw, never skip).
   const boom = {} as UpstreamView;
   for (const k of ["status", "resultRef", "fields"]) Object.defineProperty(boom, k, { enumerable: true, get() { throw new Error("boom"); } });

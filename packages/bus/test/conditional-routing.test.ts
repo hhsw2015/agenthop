@@ -149,6 +149,26 @@ describe("conditional-routing — round-1 fixes (schema round-trip / single-capt
     Object.defineProperty(input, "stages", { enumerable: true, get() { return [{ from: "a", to: "b", when: { kind: "status-ok" } }]; } });
     expect(validateConditionalPipeline(input).ok).toBe(false);
   });
+  test("CR-P2-2 (r2): predicate CONTENT is copied at capture — a later stage-read that mutates an earlier edge's `when` cannot detach it", () => {
+    const edge0 = { from: "a", to: "b", when: { kind: "status-ok" } as Record<string, unknown> };
+    const stages: unknown[] = [edge0, { from: "c", to: "d" }];
+    let mutated = false;
+    // reading stage[1] mutates the already-captured edge0.when (hostile late mutation during the capture walk)
+    Object.defineProperty(stages, "1", { enumerable: true, configurable: true, get() { if (!mutated) { mutated = true; edge0.when = { kind: "result-exists" }; } return { from: "c", to: "d" }; } });
+    const r = validateConditionalPipeline({ schema: "conditional-routing/v1", stages });
+    expect(r.ok).toBe(true);
+    expect(r.ok && r.value.stages[0]!.when).toEqual({ kind: "status-ok" }); // the first-captured predicate CONTENT survives
+  });
+  test("CR-P2-2 (r2): a knownNodes read that mutates the raw cannot alter a captured edge's endpoints or predicate", () => {
+    const edge0 = { from: "a", to: "b", when: { kind: "field-eq", field: "cat", value: "bug" } as Record<string, unknown> };
+    const stages = [edge0];
+    const known: string[] = ["a", "b"];
+    // reading knownNodes[0] (during the structural check, AFTER capture) mutates edge0 — must not affect the output
+    Object.defineProperty(known, "0", { enumerable: true, configurable: true, get() { edge0.from = "X"; edge0.when = { kind: "result-exists" }; return "a"; } });
+    const r = validateConditionalPipeline({ schema: "conditional-routing/v1", stages }, known);
+    expect(r.ok).toBe(true);
+    if (r.ok) { expect(r.value.stages[0]!.from).toBe("a"); expect(r.value.stages[0]!.when).toEqual({ kind: "field-eq", field: "cat", value: "bug" }); }
+  });
   test("CR-P2-3: an unreadable upstream (throwing getter / Proxy descriptor trap) ⇒ unknown, never throws, never skip", () => {
     const getterBoom = {} as UpstreamView;
     for (const k of ["status", "resultRef", "fields"]) Object.defineProperty(getterBoom, k, { enumerable: true, get() { throw new Error("boom"); } });
