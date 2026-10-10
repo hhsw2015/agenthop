@@ -1,7 +1,8 @@
-# git-recall — design brief (contract; FREEZE before code)
+# git-recall — design brief (contract; FROZEN 2026-10-11)
 
 owner 90b58f9c · focused ticket off the approval-delegation IO-round stack (`feat/approval-delegation` @e5a40c2) ·
-reviewer happycapy (queued after the IO-round verdict) · **contract-first: no code until this is frozen.**
+reviewer happycapy (queued after the IO-round verdict) · **FROZEN by coordinator fe0376cd (three rulings folded in: §Hole 2
+GIT_ prefix rule + §Hole 1 `--no-pager`, + `git log` messages allowed); code may proceed.**
 
 ## Why this is a separate ticket
 
@@ -25,44 +26,58 @@ A git read form is delegated ONLY when ALL THREE are closed; **miss one ⇒ esca
 
 ### Hole 1 — config-driven execution (closed by the `-c` rewrite)
 
-Repo/global config can make an innocent read exec a program: `diff.external`, `core.pager`, `core.fsmonitor`, `diff.*.textconv`.
-The delegate decision rewrites the command to a config-immune form, injected right after `git`:
+Repo/global config can make an innocent read exec a program: `diff.external`, `core.pager`, `pager.<subcommand>`,
+`core.fsmonitor`, `diff.*.textconv`, a custom `diff.<driver>.command`. The delegate decision rewrites the command to a
+config-immune form. Global options go right after `git`; `--no-ext-diff` is a diff-family option and is appended after the
+subcommand for `diff`/`log`/`show` only (the other subcommands reject it):
 
 ```
-git -c diff.external= -c core.pager=cat -c core.fsmonitor= --no-ext-diff <subcommand> <safe-flags…>
+git --no-pager -c diff.external= -c core.fsmonitor= <subcommand> [--no-ext-diff for diff|log|show] <safe-flags…>
 ```
 
-- `-c diff.external=` + `--no-ext-diff` — no external diff driver.
-- `-c core.pager=cat` — no pager exec (also `--no-pager` is implied by non-TTY, belt-and-suspenders).
+- `--no-pager` (FROZEN addition) — kills ALL pager exec in one flag. `core.pager=cat` is INSUFFICIENT: `pager.<subcommand>`
+  (e.g. `pager.status=evil`) is a SEPARATE config key that `core.pager` does not cover; `--no-pager` disables every pager path.
+  So we drop `-c core.pager=cat` in favour of `--no-pager`.
+- `-c diff.external=` + `--no-ext-diff` (diff-family) — no external diff driver.
 - `-c core.fsmonitor=` — no fsmonitor hook exec (relevant to `status`).
-- textconv (`diff.*.textconv`) runs a program only to render CONTENT; the non-content restriction (Hole 3) sidesteps it
-  entirely (no `-c` glob exists to clear all textconv drivers, so we do NOT rely on `-c` for it).
+- textconv (`diff.*.textconv`) and a custom `diff.<driver>.command` (referenced via `.gitattributes`) run a program only to
+  render CONTENT; the non-content restriction (Hole 3) means they NEVER fire — recorded as an explicit DEPENDENCY: **if a future
+  version allows content forms, this `-c` set is NOT sufficient and Hole 1 must be re-reviewed** (no `-c` glob clears all
+  textconv/custom drivers).
 - Aliases cannot shadow a builtin read subcommand (git ignores an alias that names an existing command), so the rewrite's
   builtin subcommand cannot be hijacked.
 
 `updatedInput` replaces the whole Bash input object — the rewrite MUST carry over every original field (`description`,
 `timeout`, …), changing only `command`. The rewritten command is re-checked against deny/ask rules (it must not trip one).
 
-### Hole 2 — ENV-injected execution + scope redirect (closed by the `gitEnvClean` IO fact)
+### Hole 2 — ENV-injected execution + scope redirect (closed by the `gitEnvClean` IO fact) — FROZEN RULE: GIT_ PREFIX
 
 `updatedInput` rewrites the COMMAND, but the command runs in the MEMBER'S ENVIRONMENT, and env vars OVERRIDE `-c` / are
-env-only — so `-c` CANNOT close these. The hook (in the member env) must verify NONE of the following is set, else escalate.
-This is the security core of the ticket; the list must be exhaustive. **gitEnvClean = none of these present:**
+env-only — so `-c` CANNOT close these. Per-variable enumeration WILL miss one (the coordinator's freeze found at least five the
+first pass missed: `GIT_EXEC_PATH` = redirects the git-subcommand executable search path = a direct exec hole; `GIT_CONFIG_PARAMETERS`
+= the env transport channel for `-c` = direct config injection; the `GIT_TRACE`/`GIT_TRACE_*` family = can point at an arbitrary
+file path = a file-WRITE vector; `GIT_INDEX_FILE` = scope redirect; `XDG_CONFIG_HOME` = a NON-`GIT_` config-injection point, since
+git reads `$XDG_CONFIG_HOME/git/config`). So the FROZEN rule is a PREFIX rule, not a list:
 
-- **Exec vectors:** `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `PAGER`, `GIT_SEQUENCE_EDITOR`, `GIT_EDITOR`, `EDITOR`,
-  `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_MERGE_DRIVER`?(n/a to reads but listed),
-  `GIT_TEXTCONV_*`? (textconv driven by attributes+config), `GIT_HOOKS_PATH`/`GIT_HOOKSPATH`? (hooks don't run on these reads,
-  but cleared defensively).
-- **Config-injection vectors (re-open Hole 1 via env):** `GIT_CONFIG`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`,
-  `GIT_CONFIG_COUNT` (+ the `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` family it enables).
-- **Scope-redirect vectors (defeat `cwdIsGitRoot`):** `GIT_DIR`, `GIT_WORK_TREE`, `GIT_OBJECT_DIRECTORY`,
-  `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`, `GIT_CEILING_DIRECTORIES`, `GIT_NAMESPACE`.
-- **Prompt/terminal:** `GIT_TERMINAL_PROMPT` (set to anything ⇒ escalate, conservative).
+> **`gitEnvClean` = (no environment variable whose name starts with `GIT_` is present, for ANY value) AND (none of the explicit
+> non-`GIT_` vectors `PAGER`, `EDITOR`, `SSH_ASKPASS`, `XDG_CONFIG_HOME` is present).**
 
-Conservative: ANY of the above present (any value) ⇒ `gitEnvClean = false` ⇒ escalate. Over-rejection only loses a delegation,
-never grants one. The hook reports `gitEnvClean` as an IO fact in `ApprovalScope`; the pure classifier fails closed without it.
-(`GIT_CONFIG_NOSYSTEM` / `GIT_CONFIG_GLOBAL=/dev/null` are hardening, not threats — but presence of `GIT_CONFIG_GLOBAL` with a
-non-`/dev/null` value IS a threat, so the simplest rule is: its mere presence ⇒ escalate. The list errs toward escalation.)
+Any such variable present (any value) ⇒ `gitEnvClean = false` ⇒ escalate. The prefix rule is complete by construction — a future
+`GIT_<anything>` vector is caught without a brief edit. Over-rejection only loses a delegation, never grants one (a member with a
+`GIT_` var set simply falls to the user for git; the common member shell has none). Hardening vars (`GIT_CONFIG_NOSYSTEM`, …) are
+also `GIT_`-prefixed and thus escalate — fail-closed is fine (we do not reason about which `GIT_` is safe).
+
+**Known residual — `HOME`:** `HOME` cannot be required absent (it is always set), and `$HOME/.gitconfig` can carry
+`diff.external` / `pager.*` / `core.fsmonitor` / a custom diff driver. This residual is MITIGATED, not closed, by Hole 1's `-c`
+overrides + `--no-pager` (which beat `$HOME/.gitconfig` for exec/pager) and by Hole 3's non-content restriction (no content ⇒ no
+textconv/content-diff driver fires). It is NOT fully closed: a `$HOME/.gitconfig` `core.fsmonitor` is overridden by our
+`-c core.fsmonitor=`, external diff by `-c diff.external=` + `--no-ext-diff`, pagers by `--no-pager` — so the known exec paths ARE
+covered; what remains unmodelled is any FUTURE git config knob that execs and is not in our `-c` set and is not a content path.
+Recorded here as an explicit accepted residual (re-review if content forms are ever allowed — see Hole 3 dependency).
+
+The hook reports `gitEnvClean` as an IO fact in `ApprovalScope`; the pure classifier fails closed without it. The resolver
+computes `gitEnvClean` FIRST and only runs `git rev-parse` (for `cwdIsGitRoot`) when the env is clean (so a dirty env can never
+influence the root probe).
 
 ### Hole 3 — committed-content leak (closed by the NON-CONTENT form restriction)
 
@@ -122,11 +137,15 @@ rewritten command (an additive optional field). The member hook emits `allowDeci
 - v1 in scope: the six non-content read subcommands above, no positional operands. OUT: content forms (`git show`/`diff`
   with content), pathspec/ref operands, `grep`/`rg`/`find` (still deferred), any mutation.
 
-## Open questions for the freeze
+## Frozen rulings (coordinator 2026-10-11)
 
-1. **The env threat list (§Hole 2) — is it complete?** This is the security crux. Confirm the set, or add any missing GIT_*
-   exec/config/scope vector. Err toward escalation (presence ⇒ escalate).
-2. `git log` with commit MESSAGES (no `-p`) — allow (metadata), or restrict to `--oneline` (subject only) to avoid a secret
-   pasted into a commit message? Recommend: allow (messages are not file content; the north star is fewer popups).
-3. The `-c` rewrite set (§Hole 1) — confirm `diff.external=` + `core.pager=cat` + `core.fsmonitor=` + `--no-ext-diff` is the
-   right minimal config-immune set for non-content reads (textconv handled by the non-content restriction, not `-c`).
+1. **env (§Hole 2) — FROZEN: the GIT_ PREFIX rule** (any `GIT_`-prefixed var ⇒ escalate) + explicit non-`GIT_` list
+   (`PAGER`, `EDITOR`, `SSH_ASKPASS`, `XDG_CONFIG_HOME`); `HOME` is a recorded accepted residual mitigated by Holes 1+3. The
+   coordinator's five additional finds (`GIT_EXEC_PATH`, `GIT_CONFIG_PARAMETERS`, `GIT_TRACE*`, `GIT_INDEX_FILE`,
+   `XDG_CONFIG_HOME`) motivated the prefix rule — per-var enumeration is abandoned as incomplete-by-nature.
+2. **`git log` with commit MESSAGES (no `-p`) — FROZEN: allowed** (messages are repo metadata, not file content, and the member
+   can already read them; `sanitizeForTransport` still escapes on the wire).
+3. **`-c` set (§Hole 1) — FROZEN: add `--no-pager`** (supersedes `core.pager=cat`; `pager.<subcommand>` is a separate key
+   `core.pager` cannot cover). Keep `-c diff.external=` + `-c core.fsmonitor=` + `--no-ext-diff` (diff-family). A custom
+   `diff.<driver>.command`/textconv is handled by the non-content restriction (Hole 3), recorded as a dependency to re-review if
+   content forms are ever allowed.
