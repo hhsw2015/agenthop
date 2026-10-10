@@ -7,8 +7,8 @@
 // the FILESYSTEM, so a same-batch burst AND independent writer processes all collapse to one inject per window. The dispatcher watch
 // is demoted to a BACKSTOP: re-inject only for items that have lain unclaimed past a window (a write-side wake that missed).
 
-import { mkdirSync, writeFileSync, readFileSync, renameSync, unlinkSync } from "node:fs";
-import { createHash, randomBytes } from "node:crypto";
+import { mkdirSync, writeFileSync, readdirSync, unlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
 import { setInboxWakeHook, scanUnclaimedInbox } from "../inbox.js";
@@ -43,35 +43,44 @@ export function shouldInjectWake(now: number, last: number, paneState: string, c
   return true;
 }
 
-/** 先占后发 — atomically claim the per-target wake slot for the current window BEFORE any send. Two durable guards, both ONLY-GROWING
- *  (FC-6 family: cleanup never re-opens a used window, IW-P2-1):
- *   1. a per-window O_EXCL marker `console/inbox-wake/<sha256(sid)>.<window>` — 20 concurrent fires, an 8-in-a-row burst, and
- *      independent writer processes all resolve to exactly ONE winner per window (the rest get EEXIST). This is the SAME-window gate.
- *   2. a monotonic high-water `<sha256(sid)>.hw` holding the highest window ever claimed — a late request that re-wins a window whose
- *      marker was already garbage-collected is still REJECTED here (its window <= hw), so a cleanup can never re-admit a used window,
- *      no matter how long the late request paused. This is the STALE-window gate.
- *  A won slot is never rolled back, so a withheld or failed inject is throttled too (expires at the next window). Old window markers
- *  are GC'd two windows back — safe because the high-water, not the marker, is the authority for staleness. The sid is hashed to a
- *  safe single filename segment (any sid). Returns true iff THIS caller won a FRESH window. Fail-safe: a bad clock / unwritable store
- *  ⇒ false (never inject uncoordinated). Never throws. */
+/** 先占后发 — atomically claim the per-target wake slot for the current window BEFORE any send. The high-water IS the set of per-window
+ *  O_EXCL markers `console/inbox-wake/<sha256(sid)>.<window>`; the effective high-water is MAX(window). There is NO separately-mutated
+ *  high-water file, so the whole class of "unconfirmed evidence authorizes" bugs is gone at the root (IW-P2-1):
+ *   - the O_EXCL create is the SAME-window gate (20 concurrent / 8-in-a-row / cross-process ⇒ one winner) AND the sole durable
+ *     evidence — a create fault ⇒ reject (never authorize on an unpersisted claim; FC-2 publish-after-fact);
+ *   - MAX over the markers is MONOTONIC with no blind write: adding a lower marker can never lower the max, and the GC only ever
+ *     deletes markers STRICTLY BELOW the top (keeps window and window-1), so a cleaned-then-re-created old window is rejected by the
+ *     surviving higher markers — no CAS needed;
+ *   - a readdir FAULT (EACCES, not ENOENT) ⇒ UNKNOWN ⇒ reject (fail-closed; never treated as "no markers = initial", FC-2 r3);
+ *   - after creating our marker we RE-READ the max: if a concurrent LATER window already won, we yield (unlink + reject), so a paused
+ *     late window can never ride in above a newer one.
+ *  The sid is hashed to a safe single filename segment (any sid). Returns true iff THIS caller won a FRESH, confirmed top window. Never
+ *  throws. */
 export function claimWakeSlot(home: string, sid: string, now: number, cooldownMs: number): boolean {
   if (!sid || !Number.isFinite(now) || !(cooldownMs > 0)) return false;
   const dir = path.join(home, ".agenthop", "console", "inbox-wake");
   const safe = createHash("sha256").update(sid).digest("hex");
+  const prefix = `${safe}.`;
   const window = Math.floor(now / cooldownMs);
   const slot = path.join(dir, `${safe}.${window}`);
-  const hwPath = path.join(dir, `${safe}.hw`);
-  try {
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    writeFileSync(slot, String(now), { flag: "wx", mode: 0o600 }); // O_EXCL same-window gate: EEXIST ⇒ this window already claimed
-  } catch { return false; }
-  // Stale-window gate: reject any window at or below the highest ever claimed — so a cleaned-then-re-created old window can never
-  // re-admit (the reviewer's cross-window interleave). The high-water only ever advances; it is never deleted.
-  let hw = -1;
-  try { const r = Number(readFileSync(hwPath, "utf8").trim()); if (Number.isFinite(r)) hw = r; } catch { /* absent ⇒ -1 */ }
-  if (window <= hw) { try { unlinkSync(slot); } catch { /* ignore */ } return false; }
-  try { const tmp = `${hwPath}.tmp-${randomBytes(4).toString("hex")}`; writeFileSync(tmp, String(window), { mode: 0o600 }); renameSync(tmp, hwPath); } catch { /* best-effort advance */ }
-  try { unlinkSync(path.join(dir, `${safe}.${window - 2}`)); } catch { /* bounded GC; the window may not exist */ }
+  // MAX window marker: -1 when confirmed-empty (ENOENT dir / no markers); null when a read FAULT means we cannot tell (fail-closed).
+  const readMax = (): number | null => {
+    let names: string[];
+    try { names = readdirSync(dir); } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? -1 : null; }
+    let max = -1;
+    for (const n of names) { if (!n.startsWith(prefix)) continue; const w = Number(n.slice(prefix.length)); if (Number.isInteger(w) && w > max) max = w; }
+    return max;
+  };
+  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return false; }
+  const max0 = readMax();
+  if (max0 === null) return false;              // read fault ⇒ UNKNOWN ⇒ fail-closed (never treat as initial)
+  if (window <= max0) return false;             // this window, or a later one, already claimed ⇒ stale/dup ⇒ reject (no blind write)
+  try { writeFileSync(slot, String(now), { flag: "wx", mode: 0o600 }); } catch { return false; } // O_EXCL + persist; any fault ⇒ no authorize
+  const max1 = readMax();
+  if (max1 === null || max1 > window) { try { unlinkSync(slot); } catch { /* ignore */ } return false; } // a concurrent LATER window won ⇒ yield
+  // Bounded GC — only AFTER our claim is confirmed the top. Delete markers strictly older than window-1 (keep window + window-1 as the
+  // high-water record), so the max marker is never removed by any claim ⇒ the high-water never regresses.
+  try { for (const n of readdirSync(dir)) { if (!n.startsWith(prefix)) continue; const w = Number(n.slice(prefix.length)); if (Number.isInteger(w) && w < window - 1) { try { unlinkSync(path.join(dir, n)); } catch { /* ignore */ } } } } catch { /* GC best-effort */ }
   return true;
 }
 

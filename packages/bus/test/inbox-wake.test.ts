@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, utimesSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, utimesSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -32,13 +32,26 @@ describe("inbox-wake — claimWakeSlot (先占后发, cross-process atomic)", ()
     expect(claimWakeSlot(HOME, "..", w(8), COOL)).toBe(true);      // reserved-dot sid hashed to a safe filename (no traversal)
     expect(claimWakeSlot(HOME, "c", NaN, COOL)).toBe(false);       // fail-safe
   });
-  test("IW-P2-1: a GC'd old window re-claimed late is rejected by the monotonic high-water (cleanup never re-admits)", () => {
+  test("IW-P2-1: a GC'd old window re-claimed late is rejected by the MAX marker (cleanup never re-admits)", () => {
     expect(claimWakeSlot(HOME, "c", w(8), COOL)).toBe(true);
-    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);       // hw ⇒ 9
+    expect(claimWakeSlot(HOME, "c", w(9), COOL)).toBe(true);       // max ⇒ 9
     const safe = createHash("sha256").update("c").digest("hex");
     rmSync(path.join(HOME, ".agenthop/console/inbox-wake", `${safe}.8`), { force: true }); // simulate cleanup removing window 8
-    expect(claimWakeSlot(HOME, "c", w(8) + 5, COOL)).toBe(false);  // late window-8 request: reopened marker, but hw=9 rejects it
+    expect(claimWakeSlot(HOME, "c", w(8) + 5, COOL)).toBe(false);  // late window-8: reopened slot, but max marker 9 rejects it
     expect(claimWakeSlot(HOME, "c", w(10), COOL)).toBe(true);      // a genuinely newer window still claims
+  });
+
+  test("IW-P2-1 three holes closed: GC'd-window / read-fault / persist-fault never re-admit", () => {
+    const dir = path.join(HOME, ".agenthop/console/inbox-wake");
+    for (const n of [8, 9, 10, 11, 12]) expect(claimWakeSlot(HOME, "c", w(n), COOL)).toBe(true);
+    expect(claimWakeSlot(HOME, "c", w(10) + 1, COOL)).toBe(false); // ① GC'd middle window rejected by MAX (no hw regression)
+    chmodSync(dir, 0o000);
+    try { expect(claimWakeSlot(HOME, "c", w(13), COOL)).toBe(false); } finally { chmodSync(dir, 0o700); } // ② read fault ⇒ fail-closed
+    chmodSync(dir, 0o500);
+    let ok3 = true;
+    try { ok3 = claimWakeSlot(HOME, "c", w(14), COOL); } finally { chmodSync(dir, 0o700); }
+    expect(ok3).toBe(false);                                        // ③ persist fault ⇒ not authorized
+    expect(claimWakeSlot(HOME, "c", w(15), COOL)).toBe(true);       // recovers after the faults clear
   });
 });
 

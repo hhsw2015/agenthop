@@ -1,6 +1,6 @@
 // Standalone FC-6 (deterministic decision + 先占后发 claim) / FC-7 (hook unset = byte-for-byte v0 delivery) selftest for the inbox
 // real-time wake. Run: tsx packages/bus/src/swarm/inbox-wake.selftest.mts
-import { mkdtempSync, rmSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -37,6 +37,28 @@ ok(shouldInjectWake(NaN, -Infinity, "idle", 1, COOL) === false, "non-finite cloc
     ok(claimWakeSlot(HOME, "c", w(10), COOL) === true, "claimWakeSlot: a genuinely newer window (10 > hw 9) still claims");
     ok(claimWakeSlot(HOME, "..", w(8), COOL) === true, "claimWakeSlot: a reserved-dot sid is a safe hashed filename (no traversal)");
     ok(claimWakeSlot(HOME, "c", NaN, COOL) === false, "claimWakeSlot: bad clock ⇒ fail-safe, no claim");
+  } finally { rmSync(HOME, { recursive: true, force: true }); }
+}
+// IW-P2-1 the three hw holes the reviewer found, now closed at the root (no mutable hw file; markers ARE the high-water).
+{
+  const HOME = mkdtempSync(path.join(os.tmpdir(), "ah-wakehole-"));
+  const w = (n: number) => n * COOL;
+  const dir = path.join(HOME, ".agenthop/console/inbox-wake");
+  try {
+    // ① concurrent-regression CONSEQUENCE: advance far, let GC drop old window markers, then a late GC'd window must NOT re-admit.
+    for (const n of [8, 9, 10, 11, 12]) ok(claimWakeSlot(HOME, "c", w(n), COOL) === true, `sequential claim window ${n}`);
+    ok(claimWakeSlot(HOME, "c", w(10) + 1, COOL) === false, "① a late request for a GC'd middle window (10) is rejected by MAX — no high-water regression re-admits it");
+    ok(claimWakeSlot(HOME, "c", w(9) + 1, COOL) === false, "① a late request for a GC'd window (9) is rejected by MAX");
+    // ② read fault ≠ absent: an unreadable marker dir ⇒ UNKNOWN ⇒ fail-closed (reject), never treated as initial.
+    chmodSync(dir, 0o000);
+    try { ok(claimWakeSlot(HOME, "c", w(13), COOL) === false, "② readdir EACCES ⇒ UNKNOWN ⇒ reject (not treated as empty/initial)"); }
+    finally { chmodSync(dir, 0o700); }
+    // ③ persist fault: a read-only marker dir ⇒ the O_EXCL create fails ⇒ no authorize (no marker, no GC).
+    chmodSync(dir, 0o500);
+    let created = true;
+    try { created = claimWakeSlot(HOME, "c", w(14), COOL); } finally { chmodSync(dir, 0o700); }
+    ok(created === false, "③ create/persist fault ⇒ not authorized (publish-after-fact: no marker ⇒ no inject)");
+    ok(claimWakeSlot(HOME, "c", w(15), COOL) === true, "after faults clear, a genuinely new window still claims (max intact)");
   } finally { rmSync(HOME, { recursive: true, force: true }); }
 }
 
