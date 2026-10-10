@@ -159,16 +159,147 @@ export function watchInbox(home: string, keys: string[], onChange: () => void): 
  *  not a substitute for refusing an invalid write at the source. Throwing is the fail-fast rejection; every caller passes a
  *  well-formed envelope, so this never fires on the live paths — it guards a future/untrusted producer. The NORMALIZED record
  *  (known fields only) is what gets persisted, so no junk field is ever written. */
-export function writeInbox(home: string, key: string, msg: InboxMsg): void {
+export function writeInbox(home: string, key: string, msg: InboxMsg, idempotencyKey?: string): WriteResult {
   const valid = validInboxMsg(msg);
   if (valid === null) throw new Error("writeInbox: refusing to publish an invalid inbox message (from/fromLabel/text must be strings, via a non-empty string, ts a finite number)");
   const dir = inboxDir(home, key);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // The key is used as the MESSAGE file's basename (and in the recovery scan), so it MUST be a safe single path segment — no
+  // separators, no traversal — or a crafted key could write/overwrite OUTSIDE `dir`, into another session's box (MD-R7-P1-1). A key
+  // that is NOT one safe segment falls through to the random-name path (no dedup), which is always confined to `dir`. "." / ".." are
+  // allowed: they yield the safe filenames "..json" / "...json", never a parent reference; only separators (and oversized keys) are rejected.
+  if (idempotencyKey !== undefined && /^[A-Za-z0-9._-]{1,120}$/.test(idempotencyKey)) return publishOnce(dir, idempotencyKey, valid);
+  // No key (or an unsafe key) ⇒ the historical unique random name (every write is a new, independent message, confined to `dir`).
   const base = `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
   const file = path.join(dir, base);
-  const tmp = `${file}.tmp`;
+  const tmp = `${file}.tmp-${Math.random().toString(36).slice(2, 8)}`;
   writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
   renameSync(tmp, file);
+  return "published";
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Exactly-once publication of one logical EVENT (an idempotencyKey) — the DURABLE-FIRST credential protocol (the dual of FC-2's
+// publish-after-fact). The message .json is the delivery TARGET only (claim renames it, ack deletes it), so its presence can never
+// prove delivery. A separate CREDENTIAL under `.pubcred/` records the event's publication lifecycle and NO claim/ack ever touches
+// it, so it survives claim, ack and restart. The credential filename is a SHA-256 of the key (never the key itself), so any key —
+// including "." / ".." — is a safe single path segment (MD-R6-P2-1). Protocol: claim the credential PENDING (O_EXCL single-winner)
+// BEFORE publishing, publish the message, then upgrade to PUBLISHED. Recovery on a PENDING credential fs-verifies whether the
+// message landed (FC-2 r6 recipe): present ⇒ upgrade (never resend); absent ⇒ insufficient evidence (consumed OR never-sent) ⇒
+// retain pending (no resend, no silent drop). (digest MD-P2-1)
+// ---------------------------------------------------------------------------------------------------------------------------------
+/** The outcome of a keyed publish, so the CALLER confirms its own obligation only on a real delivery — never on a defer/retain/unknown
+ *  (a loser must not settle the winner's work, MD-P2-1): "published" (this call delivered) / "already" (this event was ALREADY
+ *  delivered — a prior publish, an upgrade of a landed send, or a prior-version credential) / "deferred" (a concurrent winner is
+ *  publishing) / "pending" (a prior attempt is unconfirmable — message neither present nor provably un-sent) / "unknown" (the
+ *  credential is unreadable). Only "published" / "already" are confirmed; the rest must keep the obligation VISIBLE for a later retry. */
+export type WriteResult = "published" | "already" | "deferred" | "pending" | "unknown";
+
+/** Three-state existence probe for a marker file: "present" / "absent" (confirmed ENOENT) / "unknown" (any other error — a read
+ *  fault must NOT be read as absence, or a crafted/transient EACCES would license a re-publish). lstat (no symlink follow). */
+function probeMarker(markerPath: string): "present" | "absent" | "unknown" {
+  try { lstatSync(markerPath); return "present"; }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
+}
+
+function credDirOf(dir: string): string { return path.join(dir, ".pubcred"); }
+function credPathOf(dir: string, idempotencyKey: string): string {
+  return path.join(credDirOf(dir), createHash("sha256").update(idempotencyKey).digest("hex"));
+}
+/** Credential state: "absent" (never claimed) / "pending" (claimed, publish in flight or interrupted) / "published" (confirmed
+ *  delivered) / "unknown" (a non-ENOENT read fault OR an unrecognized body — must NOT be read as not-published). */
+function readCredState(cred: string): "absent" | "pending" | "published" | "unknown" {
+  let raw: string;
+  try { raw = readFileSync(cred, "utf8"); }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
+  const t = raw.trim();
+  return t === "published" ? "published" : t === "pending" ? "pending" : "unknown";
+}
+/** Atomically set the credential to a terminal/intermediate state (tmp+rename). Best-effort; never throws. */
+function writeCredState(cred: string, state: "pending" | "published"): void {
+  try {
+    mkdirSync(path.dirname(cred), { recursive: true, mode: 0o700 });
+    const tmp = `${cred}.tmp-${randomBytes(4).toString("hex")}`;
+    writeFileSync(tmp, state, { mode: 0o600 });
+    renameSync(tmp, cred);
+  } catch { /* best-effort */ }
+}
+/** Is the message for this event on disk right now — unclaimed (`<key>.json`) OR in-flight (`<key>.json.claim-<pid>`)? The message
+ *  keeps the KEY as its basename (deterministic, and `${key}.json` is a safe filename even for "." / ".."), so recovery can fs-verify
+ *  the landing without the credential. */
+function eventMessagePresent(dir: string, idempotencyKey: string): boolean {
+  const base = `${idempotencyKey}.json`;
+  if (existsSync(path.join(dir, base))) return true;
+  try { return readdirSync(dir).some((n) => n === base || n.startsWith(`${base}.claim-`)); } catch { return false; }
+}
+function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg): WriteResult {
+  const cred = credPathOf(dir, idempotencyKey);
+  const msgFile = path.join(dir, `${idempotencyKey}.json`);
+  // Prior-version (r6) credential compat import: r6 recorded publication as a `.published/<key>` marker (raw-key filename). The probe
+  // is THREE-state (MD-R7-P2-1, FC-2 r3 recipe "read-error/absent KEEP vs read-and-invalid"): present ⇒ a confirmed historical r6
+  // delivery ⇒ never republish on upgrade; UNKNOWN (a read fault — e.g. the `.published` dir temporarily unreadable, EACCES) ⇒ can't
+  // tell ⇒ retain the obligation and retry (an `existsSync` here would read EACCES as "absent" and re-deliver); only a confirmed
+  // ENOENT absent ⇒ no prior delivery ⇒ fall through. Exclude "." / ".." (r6 never wrote a valid marker for them, and probing
+  // `.published/..` would resolve to the inbox dir).
+  if (idempotencyKey !== "." && idempotencyKey !== "..") {
+    const r6 = probeMarker(path.join(dir, ".published", idempotencyKey));
+    if (r6 === "present") return "already";
+    if (r6 === "unknown") return "unknown";
+  }
+  const state = readCredState(cred);
+  if (state === "published") return "already";  // confirmed delivered
+  if (state === "unknown") return "unknown";    // unreadable credential ⇒ can't tell; caller keeps the obligation visible, never confirms
+  if (state === "pending") {
+    // Recovery: a pending credential proves a publish was ATTEMPTED. fs-verify whether the message landed.
+    if (eventMessagePresent(dir, idempotencyKey)) { writeCredState(cred, "published"); return "already"; } // landed/in-flight ⇒ confirm, never resend
+    return "pending"; // message absent ⇒ consumed OR never-sent (indistinguishable) ⇒ retain (no resend, no confirm, no drop)
+  }
+  // state === "absent" ⇒ fresh publish, DURABLE-FIRST: claim the credential EXCLUSIVELY so two racing publishers that both saw
+  // "absent" cannot both publish — exactly one wins the O_EXCL create; the loser defers.
+  try {
+    mkdirSync(credDirOf(dir), { recursive: true, mode: 0o700 });
+    writeFileSync(cred, "pending", { flag: "wx", mode: 0o600 }); // O_EXCL: EEXIST ⇒ a concurrent publisher already claimed
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") return "deferred"; // a concurrent publisher won the claim ⇒ defer (keep obligation)
+    throw e; // the credential store is unwritable ⇒ do NOT publish without a durable claim; re-throw so the caller retries (+ logs)
+  }
+  // FC-7: an IDENTICAL notice already published under a legacy RANDOM name (pre-key), still on disk (unclaimed or in-flight), is
+  // ADOPTED into the keyed ledger — upgrade to published, keep the legacy message, skip the new write — instead of co-existing as a
+  // second copy. Scoped to a matching non-empty taskRef + identical text so distinct keyless messages are never collapsed. (A
+  // legacy message already CONSUMED leaves no trace: that is the "insufficient evidence ⇒ unknown-in-migration" case.)
+  if (typeof valid.taskRef === "string" && valid.taskRef.length > 0 && adoptLegacyKeyless(dir, idempotencyKey, valid)) {
+    writeCredState(cred, "published");
+    return "already";
+  }
+  try {
+    const tmp = `${msgFile}.tmp-${Math.random().toString(36).slice(2, 8)}`;
+    writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
+    renameSync(tmp, msgFile);      // publish (claim renames this, ack deletes it)
+  } catch (e) {
+    // The message write FAILED in-process ⇒ we KNOW it did not land ("confirmed absent"). Roll back the pending claim so the next
+    // retry re-publishes from "absent" — never leave it stuck pending, which recovery would retain as unknown (a silent drop). Re-throw
+    // so the caller leaves ITS obligation open and retries (matching the historical throw-on-write-fault contract).
+    try { unlinkSync(cred); } catch { /* best-effort rollback */ }
+    throw e;
+  }
+  writeCredState(cred, "published"); // confirm
+  return "published";
+}
+
+/** FC-7 — scan for a LEGACY keyless publication (a different basename) of the SAME notice (matching taskRef + identical text),
+ *  whether unclaimed (`<rand>.json`) or in-flight (`<rand>.json.claim-<pid>`). Pure read; a fault ⇒ false (fall through to publish). */
+function adoptLegacyKeyless(dir: string, idempotencyKey: string, valid: InboxMsg): boolean {
+  const self = `${idempotencyKey}.json`;
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return false; }
+  for (const n of names) {
+    const base = n.replace(/\.claim-[^.]+$/, "");       // stable base (strip any in-flight claim suffix)
+    if (!base.endsWith(".json") || base === self) continue; // only OTHER messages (not this event's own file)
+    let prior: unknown;
+    try { prior = JSON.parse(readFileSync(path.join(dir, n), "utf8")); } catch { continue; }
+    if (prior !== null && typeof prior === "object" && (prior as InboxMsg).taskRef === valid.taskRef && (prior as InboxMsg).text === valid.text) return true;
+  }
+  return false;
 }
 
 /** Atomically claim every pending message under ANY of `keys` (oldest first). The claimer must ack or release each.

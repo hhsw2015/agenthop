@@ -65,6 +65,8 @@ import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlocked
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
+import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
+import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources, archiveLegacyMigration } from "../packages/bus/src/swarm/morning-digest-store.js";
 import { successionEnabled } from "../packages/bus/src/swarm/shell-succession.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
 
@@ -176,6 +178,7 @@ const SENTINEL_IDLE_SEC = envInt(process.env.SWARM_SENTINEL_IDLE_SEC, 1800);
 // wait-output can never tight-spin, and sets how often the pane content hash is re-sampled within the fake-death window.
 const SENTINEL_SAMPLE_SEC = envInt(process.env.SWARM_SENTINEL_SAMPLE_SEC, 60);
 const GAUGE_SAMPLE_SEC = envInt(process.env.SWARM_GAUGE_SAMPLE_SEC, 60); // T5-2 seam: gauge sampling interval (sweep ticks faster, every 5s)
+const DIGEST_HOUR = Math.min(23, envInt(process.env.SWARM_DIGEST_HOUR, 7, 0)); // morning-digest local target hour (clamped 0..23)
 
 // T5-5 review-seat autoscale — SUGGESTION MODE ONLY (user ruling 2026-10-08: the flag is half-flipped). When
 // SWARM_REVIEW_AUTOSCALE is on, the sweep reads the durable review-queue ledger, runs the pure planner, and ADVISES the
@@ -654,7 +657,7 @@ async function main(): Promise<void> {
   // kill with SWARM_<X>=0). Calls the SAME readers the features use, so the line reflects the real decision. SWARM_TG_ENTRY is the
   // deliberate exception (opt-in — the bridge needs a user-seeded token), read with its own opt-in form.
   const onoff = (b: boolean): string => (b ? "on" : "off");
-  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
+  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
   const records = loadMirror();
   const ops = buildOps();
   const taskStateRef = { s: loadControlLog(CONTROL_LOG_DIR) };
@@ -1678,6 +1681,74 @@ async function main(): Promise<void> {
     })().catch((e) => log(`placement suggest failed (isolated): ${e instanceof Error ? e.message : e}`));
   };
 
+  // Morning digest (TG v1 CORE composeDigest had no trigger ⇒ never produced). At/after the local target hour, once per calendar
+  // date, run TWO INDEPENDENT obligations (MD-P2-1): (1) write the morning-digest/v1 projection (console + TG read it — one
+  // generation, multi-end delivery, the generator touches no entry); (2) push the same brief to the coordinator durable box (S11,
+  // fyi). Each is tracked by its OWN durable date-marker (the projection file / notified.json), so a write/deliver failure retains
+  // the obligation, a restart recovers it, and a CONFIRMED delivery is never repeated. Backoff so a persistent failure does not
+  // retry every tick. Live by default (SWARM_DIGEST, opt-out); fully fail-soft — never breaks the sweep.
+  let lastDigestAttemptSec = 0;
+  const DIGEST_RETRY_SEC = 300; // on a failed obligation, retry at most every 5 min (not every 5s sweep tick)
+  const runDigest = (): void => {
+    if (!digestEnabled()) return; // SWARM_DIGEST live by default (opt-out; kill with =0)
+    try {
+      const d = new Date();
+      const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; // local date
+      let proj = readDigestProjection(HOME);
+      const notified = readNotifiedState(HOME);
+      const act0 = digestActions(today, d.getHours(), DIGEST_HOUR, proj, notified);
+      if (!act0.writeProjection && !act0.notify) return; // both already delivered today (or before the hour)
+      if (nowSec() - lastDigestAttemptSec < DIGEST_RETRY_SEC) return; // backoff: never a tight per-tick retry on a persistent fault
+      lastDigestAttemptSec = nowSec();
+      // MD-R2-P2-1: today's frozen body (carried in the notify marker) is the ONE TRUTH. When the carrier is CORRUPT or MISSING but
+      // that body is recoverable, RESTORE the SAME body — never re-gather a different one (the body was already published). A restore
+      // that FAILS keeps the SAME recovery obligation: return + retry, never fall through to a fresh gather (which would publish a
+      // second, different body). An UNKNOWN (unreadable) carrier is left untouched (it may still be the valid body — do not overwrite).
+      const frozenToday = (notified.kind === "pending" || notified.kind === "sent") && notified.date === today && notified.body ? notified.body : null;
+      if ((proj.kind === "corrupt" || proj.kind === "absent") && frozenToday) {
+        if (!writeDigestProjectionRaw(HOME, frozenToday)) return; // restore failed ⇒ retain the obligation, retry; never re-gather a new body
+        proj = readDigestProjection(HOME);
+      }
+      const act = digestActions(today, d.getHours(), DIGEST_HOUR, proj, notified);
+      // (1) Projection obligation: reached ONLY when there is NO recoverable frozen body (a genuinely never-generated event) ⇒ gather
+      //     the night's sources ONCE and write the FROZEN body for today (a later retry/restore never re-gathers a different body).
+      if (act.writeProjection) {
+        const sources = gatherDigestSources(HOME);
+        if (sources === null) return; // MD-P2-2: sources unreadable (unknown) ⇒ cannot assert content ⇒ retry later (no false quiet night)
+        writeDigestProjection(HOME, sources, today, nowSec()); // atomic; writes absent / repairs corrupt-without-a-recoverable-body
+      }
+      // (2) Notify obligation: deliver the SAME frozen body the projection carries — render the on-disk projection, NEVER a
+      //     re-gather, under a per-date idempotency key whose durable PUBLISHED marker (writeInbox) dedups the delivery across the
+      //     coordinator's claim/ack/restart — so a crash-after-land or a failed "sent" flip re-sends without ever duplicating.
+      if (act.notify) {
+        // FC-7 unknown-in-migration: a LEGACY date-only notify marker (pending WITHOUT a frozen body) predates the durable
+        // credential — a pre-key publication that was consumed leaves NO trace, so we cannot prove it was never delivered. Retain +
+        // surface it rather than resend a possibly-already-delivered brief — but ONLY for ITS OWN date (MD-R7-P2-2): a stale marker
+        // from an earlier day must NOT block a NEW day's brief (the new date is a distinct event with its own credential).
+        if (notified.kind === "pending" && !notified.body && notified.date === today) { log(`morning digest: legacy date-only notify marker (${notified.date}) — retained for migration, not auto-resent`); return; }
+        const p = readDigestProjection(HOME);
+        if (p.kind !== "valid" || p.date !== today) return; // the frozen body is not on disk yet (projection write failed) ⇒ retry
+        // MD-R7-P2-2: a LEGACY date-only marker from an EARLIER day is the only record of that day's un-migrated obligation. EVERY
+        // branch below overwrites notified.json via markNotified (the no-target branch too), so durably ARCHIVE it FIRST (per-date,
+        // append-only). If the archive can't persist, do NOT overwrite — keep the old marker recoverable and retry next tick.
+        if (notified.kind === "pending" && !notified.body && notified.date !== today && !archiveLegacyMigration(HOME, notified.date)) return;
+        const coord = process.env.SWARM_COORDINATOR;
+        if (!coord || !coord.trim()) { markNotified(HOME, today, "sent", p.projection); return; } // no coordinator ⇒ no target; the projection is the artifact
+        const coordSid = resolveSession(coord, listSessions(HOME));
+        if (!coordSid) return; // coordinator not resolvable on this machine yet ⇒ retry (leave none/pending)
+        if (!markNotified(HOME, today, "pending", p.projection)) return; // MD-P2-1: claim + freeze the body BEFORE sending; if it can't persist, do NOT send (retry)
+        try {
+          // MD-P2-1: the durable-first credential makes writeInbox exactly-once across the coordinator's claim/ack/restart. Confirm
+          // "sent" ONLY when the publish is actually confirmed ("published" now, or "already" delivered) — a "deferred" (a concurrent
+          // winner), "pending" (an unconfirmable prior attempt) or "unknown" (unreadable credential) must leave the marker "pending"
+          // so the obligation stays VISIBLE and retries; a loser must never settle the winner's work as done.
+          const res = writeInbox(HOME, coordSid, { from: SELF, fromLabel: "swarm-digest", text: digestTextFromProjection(p.projection), via: "local", ts: Date.now(), taskRef: "morning-digest", title: "morning brief", intent: "fyi" }, `morning-digest-${today}`);
+          if (res === "published" || res === "already") markNotified(HOME, today, "sent", p.projection); // confirmed delivery ⇒ never re-send
+        } catch (e) { log(`morning digest notify failed (isolated): ${e instanceof Error ? e.message : e}`); } // leave "pending" ⇒ retry (credential ⇒ no dup)
+      }
+    } catch (e) { log(`morning digest failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   await runDispatchLoops({
     // Lifecycle handoff pass, then the business-task pass (§4.5: handoff advances lifecycle, then task observes/accepts/
     // dispatches). T1.5 RED LINE (fe0376cd): --task dispatch stays off (SWARM_TASK_EXEC) until the resume adapter +
@@ -1727,6 +1798,9 @@ async function main(): Promise<void> {
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
       // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
       runGaugeSampling();
+      // Morning digest — generate the daily brief projection + coordinator fyi once per day at/after SWARM_DIGEST_HOUR. Gated on
+      // SWARM_DIGEST (live by default; kill with =0); fully fail-soft.
+      runDigest();
     },
     sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     passIntervalMs: 5000,
