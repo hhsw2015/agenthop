@@ -5,6 +5,7 @@ import { homedir, platform } from "node:os";
 import path from "node:path";
 import { omniwmctlBin, omniwmReady, runOmniwmctl } from "./wm.js";
 import { hasExplicitBinary, herdrAgentName, herdrAgentStates, herdrLaunch, herdrServerReachable, herdrSpawnable } from "./swarm/herdr.js";
+import { shquote } from "./shquote.js"; // D6-1: shquote is a pure leaf (split out) so pure command-builders don't value-import this IO module
 
 /**
  * Launch a chosen agent CLI as a dispatched sub-agent, in one of two modes the CALLING AGENT chooses
@@ -160,11 +161,6 @@ export function launchId(tool: string): string {
 
 function asEsc(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-/** POSIX single-quote a shell word so metacharacters cannot be re-interpreted. Pure. */
-export function shquote(s: string): string {
-  return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
 /**

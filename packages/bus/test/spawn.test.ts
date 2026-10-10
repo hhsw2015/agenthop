@@ -25,10 +25,10 @@ import {
   scrubbedEnv,
   despawnAgent,
   spawnHeadlessAgent,
-  shquote,
   tomlBasicString,
   writeClaim,
 } from "../src/spawn.js";
+import { shquote } from "../src/shquote.js"; // D6-1: shquote moved to its own pure leaf
 
 const env = (over: Record<string, string | undefined>): NodeJS.ProcessEnv => ({ PATH: "", ...over }) as NodeJS.ProcessEnv;
 
