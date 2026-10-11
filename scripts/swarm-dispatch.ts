@@ -63,6 +63,7 @@ import { coordinatorReportPlan, coordEscalateEnabled, type ReportSeverity } from
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, classifyFailure, failureHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
+import { roundDoctorEnabled, roundAlertN, diagnoseRounds, buildRoundDoctorNote, extractTicketRounds, DEFAULT_ROUND_DOCTOR_CONFIG } from "../packages/bus/src/swarm/round-doctor.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
@@ -658,7 +659,7 @@ async function main(): Promise<void> {
   // kill with SWARM_<X>=0). Calls the SAME readers the features use, so the line reflects the real decision. SWARM_TG_ENTRY is the
   // deliberate exception (opt-in — the bridge needs a user-seeded token), read with its own opt-in form.
   const onoff = (b: boolean): string => (b ? "on" : "off");
-  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${onoff(inboxWakeEnabled())} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
+  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${onoff(inboxWakeEnabled())} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
   // SWARM_INBOX_WAKE: bake a real-time ping into the delivery primitive — writeInbox pings the target's herdr pane on every new
   // message (any caller, zero discipline). No-op + hook left unset when the flag is off (byte-for-byte v0 delivery).
   installInboxWake(log);
@@ -1646,6 +1647,39 @@ async function main(): Promise<void> {
     })().catch((e) => log(`review-autoscale suggest failed (isolated): ${e instanceof Error ? e.message : e}`));
   };
 
+  // round-doctor — SUGGESTION MODE ONLY (double-mirror ①, AgentGate borrow). Each sweep, if SWARM_ROUND_DOCTOR is on, enumerate
+  // the OPEN (not-done) review-queue tickets, reconstruct each ticket's per-round REMAIN/newP sequence from the EXISTING PROGRESS
+  // verdict lines (no new persistence), run the pure diagnosis, and ADVISE the coordinator (taskRef=round-doctor:<ticket>). It
+  // NEVER interrupts a review or changes disposition (R16); notifyCoordinator dedups an identical standing suggestion. Single-
+  // flight + fully fail-soft: the ledger read, the PROGRESS read, and the notify are isolated and never break the sweep.
+  let roundDoctorInFlight = false;
+  const runRoundDoctor = (): void => {
+    if (!roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR)) return; // live by default (opt-out; kill with =0)
+    if (roundDoctorInFlight) return; // single-flight — never overlap reads
+    roundDoctorInFlight = true;
+    void (async () => {
+      try {
+        const records = await readReviewLedger(reviewQueueDir(HOME));
+        const allTickets = [...new Set(records.map((r) => r.ticket))].filter(Boolean);                      // every known ticket (open OR done)
+        const openTickets = [...new Set(records.filter((r) => !r.done).map((r) => r.ticket))].filter(Boolean); // diagnose the not-yet-cleared ones
+        if (openTickets.length === 0) return;
+        const cfg = { alertN: roundAlertN(process.env.SWARM_ROUND_ALERT_N), degradeWindow: DEFAULT_ROUND_DOCTOR_CONFIG.degradeWindow };
+        let progressLines: string[] = [];
+        try { progressLines = readFileSync(PROGRESS_FILE, "utf8").split("\n"); } catch { /* no PROGRESS yet ⇒ nothing to diagnose */ }
+        if (progressLines.length === 0) return;
+        for (const ticket of openTickets) {
+          const otherTickets = allTickets.filter((t) => t !== ticket); // ALL other known tickets — attribution must not depend on done/open (RD-2)
+          const { rounds, history } = extractTicketRounds(progressLines, ticket, otherTickets, cfg); // header-anchored verdict rounds, bounded window
+          const verdict = diagnoseRounds(rounds, history, cfg);
+          if (!verdict.concern) continue;
+          notifyCoordinator(buildRoundDoctorNote(ticket, verdict), { taskRef: `round-doctor:${ticket}`, title: "round-doctor" });
+        }
+      } finally {
+        roundDoctorInFlight = false;
+      }
+    })().catch((e) => log(`round-doctor failed (isolated): ${e instanceof Error ? e.message : e}`));
+  };
+
   // T5-2 DEFERRED seam: gauge timed sampling. The dual-bandwidth pure core + store shipped (batch-4) but had NO trigger, so
   // gauge.json only refreshed on a manual run and the (installed) console gauge read a stale projection. Each sweep, if
   // SWARM_GAUGE_SAMPLING is on and the sample interval has elapsed (sweep ticks every 5s, far faster than the 60s default),
@@ -1804,6 +1838,9 @@ async function main(): Promise<void> {
       // T5-5: review-seat autoscale SUGGESTION (never acts) — read the review-queue ledger, advise the coordinator on seat
       // scaling. Gated on SWARM_REVIEW_AUTOSCALE (live by default; kill with =0); fully fail-soft.
       runReviewAutoscaleSuggest();
+      // round-doctor SUGGESTION (never acts) — diagnose over-long / degrading review loops from the existing round records and
+      // advise the coordinator. Gated on SWARM_ROUND_DOCTOR (live by default; kill with =0); fully fail-soft.
+      runRoundDoctor();
       // placement suggestion (reconcile → selectBackends → coordinator advisory). Gated on SWARM_PLACEMENT (default OFF); never
       // spawns/spends (R16); fully fail-soft.
       runPlacementSuggest();
