@@ -55,7 +55,9 @@ GIT_CONFIG_SYSTEM=/dev/null` + the `-c` full-family (`diff.external=` `core.fsmo
   source bound to the real git-dir (`rev-parse --absolute-git-dir`, NOT the `core.worktree`-redirectable `--show-toplevel`); the source
   HEAD is REPLICATED into the clone (FULL `symbolic-ref HEAD`, branch/detached/error distinguished by exit code, escalate on
   probe/writeback failure) so an operand-less `log`/`show` reads the member's actual current history; rev operands validated by a
-  clone-side `rev-parse --verify ^{commit}`.
+  clone-side `rev-parse --verify ^{commit}`. `diff` requires committed-to-committed revs (two revs OR one `a..b`/`a...b` range) — a
+  0-rev or 1-non-range-rev `diff` is a WORKING-TREE diff (member live state) and escalates at the CLASSIFIER, before any clone (F53
+  spirit: don't spend budget cloning for an op known to fail-then-escalate).
 - **DEFERRED as a FAMILY (coordinator ruling — see ⑤): `branch` / `remote` / `status`** read member-repo LIVE STATE (current branch,
   upstream, worktree occupancy, symref aliases, remotes, working tree) that a clone does NOT reproduce. `branch` was attempted over 5
   review rounds; each surfaced a new live-state facet — the symptom of a tool mismatch, closed by one family ruling, not an endless

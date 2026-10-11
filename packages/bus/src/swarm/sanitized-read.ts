@@ -131,5 +131,9 @@ function planSanitizeGit(command: string): SanitizeSpec | null {
   }
   if (GIT_REQUIRE_FLAG.has(subcmd) && flags.length === 0) return null; // bare show/diff = content ⇒ escalate
   if (operands.length > (subcmd === "diff" ? 2 : 1)) return null;      // diff ≤2 revs (or 1 range); log/show ≤1
+  // `diff` is committed-to-committed ONLY: two revs, or one range (`a..b`/`a...b`). 0 revs (index vs worktree) or 1 non-range rev
+  // (rev vs worktree) is a WORKING-TREE diff = member live state (family-deferred) — escalate at the CLASSIFIER so the dispatcher
+  // never spends budget cloning for an op known to fail-then-escalate (F53 spirit: don't run an operation known to fail).
+  if (subcmd === "diff" && operands.length !== 2 && !(operands.length === 1 && operands[0].includes(".."))) return null;
   return { readKind: "git", subcmd, flags, operands };
 }

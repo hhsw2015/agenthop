@@ -81,6 +81,8 @@ for (const c of [
   "git show HEAD",             // show with a rev but NO stat flag = content
   "git diff",                  // bare diff = content
   "git diff HEAD~1 HEAD",      // diff with revs but NO stat flag = content
+  "git diff --stat",           // working-tree diff (index vs worktree) = live state ⇒ escalate at the classifier (no wasted clone)
+  "git diff --stat HEAD",      // working-tree diff (HEAD vs worktree, 1 non-range rev) = live state ⇒ escalate at the classifier
   "git log --format=%H",       // flag not in the closed table
   "git log --pretty=oneline",  // flag not in the table
   "git show --stat HEAD:secret.txt", // rev:path CONTENT form (has `:`)
