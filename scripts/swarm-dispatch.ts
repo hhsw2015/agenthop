@@ -73,6 +73,8 @@ import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlocked
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { roundDoctorEnabled, roundAlertN, diagnoseRounds, buildRoundDoctorNote, extractTicketRounds, DEFAULT_ROUND_DOCTOR_CONFIG } from "../packages/bus/src/swarm/round-doctor.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
+import { consoleProjectionEnabled, shouldWriteConsole } from "../packages/bus/src/swarm/console-projection.js";
+import { writeConsoleProjection } from "../packages/bus/src/swarm/console-projection-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
 import { inboxWakeEnabled, inboxWakeStatus, installInboxWake, backstopWake } from "../packages/bus/src/swarm/inbox-wake.js";
@@ -201,6 +203,7 @@ const SENTINEL_IDLE_SEC = envInt(process.env.SWARM_SENTINEL_IDLE_SEC, 1800);
 // wait-output can never tight-spin, and sets how often the pane content hash is re-sampled within the fake-death window.
 const SENTINEL_SAMPLE_SEC = envInt(process.env.SWARM_SENTINEL_SAMPLE_SEC, 60);
 const GAUGE_SAMPLE_SEC = envInt(process.env.SWARM_GAUGE_SAMPLE_SEC, 60); // T5-2 seam: gauge sampling interval (sweep ticks faster, every 5s)
+const CONSOLE_WRITE_SEC = envInt(process.env.SWARM_CONSOLE_SEC, 60); // swarm-console projection write interval (sweep ticks faster, every 5s)
 const DIGEST_HOUR = Math.min(23, envInt(process.env.SWARM_DIGEST_HOUR, 7, 0)); // morning-digest local target hour (clamped 0..23)
 
 // T5-5 review-seat autoscale — SUGGESTION MODE ONLY (user ruling 2026-10-08: the flag is half-flipped). When
@@ -680,7 +683,7 @@ async function main(): Promise<void> {
   // kill with SWARM_<X>=0). Calls the SAME readers the features use, so the line reflects the real decision. SWARM_TG_ENTRY is the
   // deliberate exception (opt-in — the bridge needs a user-seeded token), read with its own opt-in form.
   const onoff = (b: boolean): string => (b ? "on" : "off");
-  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
+  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} CONSOLE=${onoff(consoleProjectionEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
   // flags-default-flip batch-2 (user ruling 2026-10-11): the dormant flags flipped to default-on. "(unwired)" = the flag is
   // flipped but its behavior is not yet wired (an honest no-op until a later wiring round) — the flip only sets the DEFAULT.
   log(`flags(batch-2 default-on): OPS_RECEIPT=${onoff(OPS_RECEIPT_ENABLED)} SUCCESSION_HEARTBEAT=${onoff(SUCCESSION_HEARTBEAT_ENABLED)} POISON_DLQ=${onoff(flagDefaultOn(process.env.SWARM_POISON_DLQ))} APPROVAL_DELEGATE=${onoff(flagDefaultOn(process.env.SWARM_APPROVAL_DELEGATE))} SANITIZED_READ=${onoff(flagDefaultOn(process.env.SWARM_SANITIZED_READ))} ATTRIBUTION=${onoff(flagDefaultOn(process.env.SWARM_ATTRIBUTION))}(unwired) OUTPUT_CONTRACT=${onoff(flagDefaultOn(process.env.SWARM_OUTPUT_CONTRACT))}(unwired) SPEND_BREAKER=${onoff(flagDefaultOn(process.env.SWARM_SPEND_BREAKER))}(unwired) CONDITIONAL_ROUTING=${onoff(flagDefaultOn(process.env.SWARM_CONDITIONAL_ROUTING))}(unwired) (opt-out default-on; kill SWARM_<X>=0; APPROVAL_DELEGATE+SANITIZED_READ change member popup behavior)`);
@@ -1800,6 +1803,20 @@ async function main(): Promise<void> {
     catch (e) { log(`gauge sampling failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
+  // swarm-console read-only projections (①② console-projection-store): mirror the decision-batch "awaiting ruling" library +
+  // write a per-seat roster glance so the console (3e097dfe) reads a current snapshot. Pure read-only producers — never mutate
+  // any live state. Gated on SWARM_CONSOLE (live by default; kill with =0), throttled to SWARM_CONSOLE_SEC (sweep ticks every
+  // 5s, far faster). The interval advances whether or not the write succeeds (one attempt per interval). Fully fail-soft.
+  let lastConsoleWriteSec = 0;
+  const runConsoleProjection = (): void => {
+    if (!consoleProjectionEnabled()) return; // SWARM_CONSOLE live by default (opt-out; kill with =0)
+    const now = nowSec();
+    if (!shouldWriteConsole(now, lastConsoleWriteSec, CONSOLE_WRITE_SEC)) return; // throttle to the write interval
+    lastConsoleWriteSec = now; // advance BEFORE the write ⇒ one attempt per interval even if it throws (no tight retry loop)
+    try { writeConsoleProjection(HOME, now); }
+    catch (e) { log(`console projection failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   // placement wiring — SUGGESTION MODE ONLY (coordinator ruling, same discipline as review-seat autoscale). Each sweep, if
   // SWARM_PLACEMENT is on, read the declarative spec, run the pure chain (reconcile → selectBackends on the shortfall), and
   // ADVISE the coordinator (a durable S19 suggestion, taskRef=placement-suggest) — it NEVER spawns/reclaims and never spends
@@ -2057,6 +2074,10 @@ async function main(): Promise<void> {
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
       // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
       runGaugeSampling();
+      // swarm-console projections — decision-batch "awaiting ruling" mirror + roster glance for the console (3e097dfe). Read-only
+      // producers (never mutate live state). Gated on SWARM_CONSOLE (live by default; kill with =0), throttled to
+      // SWARM_CONSOLE_SEC; fully fail-soft (never breaks the sweep).
+      runConsoleProjection();
       // Morning digest — generate the daily brief projection + coordinator fyi once per day at/after SWARM_DIGEST_HOUR. Gated on
       // SWARM_DIGEST (live by default; kill with =0); fully fail-soft.
       runDigest();
