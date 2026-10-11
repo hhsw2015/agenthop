@@ -19,6 +19,7 @@
 import { digestOf } from "./digest.js";
 import { evaluateR4, overlapsAny, type OwnerDomainPolicy, type RiskPolicy, type NodeRisk } from "./task-r4.js";
 import type { AttributionInput } from "./attribution.js";
+import { validateExpectedOutput, type ExpectedOutput } from "./output-contract.js";
 
 // "design" (team-collab §0b R4): an adversarial-review GATE node a planner auto-prepends for a high-stakes change —
 // kind IS task identity (in specDigest), so it is a first-class kind, not a role annotation.
@@ -89,8 +90,15 @@ export type TaskSpec = {
    *  forge), the managed loader IGNORES this field unless the caller supplies matching trusted clarification evidence
    *  (ManagedT3Opts.resolvedRisk, derived from closed waits bound to the payloadRef). Set only by the recompile. */
   resolvedRisk?: NodeRisk;
+  /** OPTIONAL output-contract VERIFICATION tag (output-contract, SWARM_OUTPUT_CONTRACT): the PHYSICAL evidence this
+   *  node's delivery must leave (file / branch / report / inbox-delivery), declared by the plan author (runbook-filled,
+   *  exactly like a task record's expectedOutput). Carried onto the dispatch's intent and PROBED at the delivery receipt
+   *  (met / unmet / unknown) — a VERIFICATION tag, NEVER an authorization input. ANNOTATION class: EXCLUDED from specDigest
+   *  (a receipt-time check, not what the worker does — changing it must not V5-invalidate a running attempt, same family as
+   *  modelTier/roleProfile), kept in planDigest. Additive (FC-7): legacy plans lack it; loadPlan drops a malformed one. */
+  expectedOutput?: ExpectedOutput;
   /** canonical-JSON SHA-256 of the TASK IDENTITY fields — everything EXCEPT specDigest and the role annotations
-   *  required/runtime/visibility/modelTier/roleProfile/criticalPath/resolvedRisk (coveredSpecDigests stays IN: identity). */
+   *  required/runtime/visibility/modelTier/roleProfile/criticalPath/resolvedRisk/expectedOutput (coveredSpecDigests stays IN: identity). */
   specDigest: string;
 };
 
@@ -163,7 +171,7 @@ const VISIBILITIES: ReadonlySet<string> = new Set(["visible", "headless"]);
  *  retagged required/durable/visible/retiered/restaffed (§4.2 V5; fe0376cd review #2; T3 F-T3-2). coveredSpecDigests
  *  is NOT excluded — a design node's coverage set is part of its identity. */
 export function computeSpecDigest(spec: TaskSpec): string {
-  const { specDigest: _d, required: _r, runtime: _rt, visibility: _v, modelTier: _mt, roleProfile: _rp, criticalPath: _cp, resolvedRisk: _rr, ...identity } = spec;
+  const { specDigest: _d, required: _r, runtime: _rt, visibility: _v, modelTier: _mt, roleProfile: _rp, criticalPath: _cp, resolvedRisk: _rr, expectedOutput: _eo, ...identity } = spec;
   return digestOf(identity);
 }
 
@@ -229,6 +237,10 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
   if (o.criticalPath !== undefined && typeof o.criticalPath !== "boolean") return { reason: `${where}.criticalPath must be a boolean` };
   if (o.resolvedRisk !== undefined && o.resolvedRisk !== "reversible" && o.resolvedRisk !== "irreversible") return { reason: `${where}.resolvedRisk must be "reversible" or "irreversible"` };
 
+  // output-contract VERIFICATION tag (SWARM_OUTPUT_CONTRACT): tolerate per FC-7 — a malformed expectedOutput is DROPPED
+  // (sanitized copy kept, extra fields stripped), NEVER a reason to reject the node. Author/runbook-declared; the receipt
+  // seam probes it. Reuses the already-signed validateExpectedOutput (output-contract.ts pure core).
+  const expectedOutput = validateExpectedOutput(o.expectedOutput);
   const spec: TaskSpec = {
     nodeId: o.nodeId,
     kind: o.kind as TaskKind,
@@ -258,6 +270,7 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
     ...(o.coveredSpecDigests !== undefined ? { coveredSpecDigests: [...(o.coveredSpecDigests as string[])] } : {}),
     ...(o.criticalPath !== undefined ? { criticalPath: o.criticalPath as boolean } : {}),
     ...(o.resolvedRisk !== undefined ? { resolvedRisk: o.resolvedRisk as NodeRisk } : {}),
+    ...(expectedOutput ? { expectedOutput } : {}),
     specDigest: "",
   };
   return { spec };

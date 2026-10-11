@@ -37,6 +37,7 @@ import { taskPass, buildSched, physicalSlotsOccupied, type TaskOps, type GitFact
 import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
 import { boardAdmitEnabled, planBoardWrites, planBoardSupervision, parsePolicyNum, postedFileName, reclaimedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, repostTmpAction, suppressPendingReposts, boardFileIdentityVerified, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
+import { outputContractEnabled, probeExpectedOutput, verifyExpectedOutput, presentUnmetToCoordinator } from "../packages/bus/src/swarm/output-contract.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
 import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
@@ -548,6 +549,24 @@ function buildTaskOps(stateRef: { s: LogState }, planCommittedAtSec: number): Ta
     commit: (state, bodies) => { const r = commitTask(state, bodies); stateRef.s = r.state; return r; },
     observeGit: observeGitFor,
     startTask: startTaskIO,
+    // output-contract RECEIPT probe (SWARM_OUTPUT_CONTRACT): on an accepted result whose intent carries an expectedOutput,
+    // verify the declared physical evidence (fs / git / inbox) and, ONLY on `unmet`, write ONE S19 card to the coordinator.
+    // Tier A ADVISORY — never blocks acceptance (task-pass already committed). `unknown` (a read fault / ambiguous absence /
+    // a remote work branch we can't locally resolve) is NEVER presented (FC-2 r3: absence is not a verdict). Fully fail-soft:
+    // every fault is isolated here so the task pass is never broken. repoDir = the work repo (branch kind; a remote slug makes
+    // git fail ⇒ unknown, never a false unmet); HOME + taskRef scope the file/report/inbox-delivery probes.
+    verifyOutputContract: ({ intent, attempt }) => {
+      const eo = intent.expectedOutput;
+      if (!eo || !outputContractEnabled()) return;
+      const taskRef = `${attempt.jobId}/${attempt.nodeId}/${attempt.attemptId}`;
+      try {
+        const verdict = verifyExpectedOutput(eo, probeExpectedOutput(eo, { repoDir: WORK_REPO || undefined, home: HOME, taskRef }));
+        if (verdict === "unmet") {
+          if (COORDINATOR) presentUnmetToCoordinator(HOME, COORDINATOR, taskRef, eo);
+          else log(`output-contract ${taskRef}: UNMET (kind=${eo.kind}) — no SWARM_COORDINATOR set, not presenting`);
+        } else log(`output-contract ${taskRef}: ${verdict} (kind=${eo.kind})`);
+      } catch (e) { log(`output-contract ${taskRef} probe error (isolated): ${e instanceof Error ? e.message : e}`); }
+    },
     log,
   };
 }
@@ -683,7 +702,7 @@ async function main(): Promise<void> {
   log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
   // flags-default-flip batch-2 (user ruling 2026-10-11): the dormant flags flipped to default-on. "(unwired)" = the flag is
   // flipped but its behavior is not yet wired (an honest no-op until a later wiring round) — the flip only sets the DEFAULT.
-  log(`flags(batch-2 default-on): OPS_RECEIPT=${onoff(OPS_RECEIPT_ENABLED)} SUCCESSION_HEARTBEAT=${onoff(SUCCESSION_HEARTBEAT_ENABLED)} POISON_DLQ=${onoff(flagDefaultOn(process.env.SWARM_POISON_DLQ))} APPROVAL_DELEGATE=${onoff(flagDefaultOn(process.env.SWARM_APPROVAL_DELEGATE))} SANITIZED_READ=${onoff(flagDefaultOn(process.env.SWARM_SANITIZED_READ))} ATTRIBUTION=${onoff(flagDefaultOn(process.env.SWARM_ATTRIBUTION))} OUTPUT_CONTRACT=${onoff(flagDefaultOn(process.env.SWARM_OUTPUT_CONTRACT))}(unwired) SPEND_BREAKER=${onoff(flagDefaultOn(process.env.SWARM_SPEND_BREAKER))}(unwired) CONDITIONAL_ROUTING=${onoff(flagDefaultOn(process.env.SWARM_CONDITIONAL_ROUTING))}(unwired) (opt-out default-on; kill SWARM_<X>=0; APPROVAL_DELEGATE+SANITIZED_READ change member popup behavior)`);
+  log(`flags(batch-2 default-on): OPS_RECEIPT=${onoff(OPS_RECEIPT_ENABLED)} SUCCESSION_HEARTBEAT=${onoff(SUCCESSION_HEARTBEAT_ENABLED)} POISON_DLQ=${onoff(flagDefaultOn(process.env.SWARM_POISON_DLQ))} APPROVAL_DELEGATE=${onoff(flagDefaultOn(process.env.SWARM_APPROVAL_DELEGATE))} SANITIZED_READ=${onoff(flagDefaultOn(process.env.SWARM_SANITIZED_READ))} ATTRIBUTION=${onoff(flagDefaultOn(process.env.SWARM_ATTRIBUTION))} OUTPUT_CONTRACT=${onoff(flagDefaultOn(process.env.SWARM_OUTPUT_CONTRACT))} SPEND_BREAKER=${onoff(flagDefaultOn(process.env.SWARM_SPEND_BREAKER))}(unwired) CONDITIONAL_ROUTING=${onoff(flagDefaultOn(process.env.SWARM_CONDITIONAL_ROUTING))}(unwired) (opt-out default-on; kill SWARM_<X>=0; APPROVAL_DELEGATE+SANITIZED_READ change member popup behavior)`);
   // SWARM_INBOX_WAKE: bake a real-time ping into the delivery primitive — writeInbox pings the target's herdr pane on every new
   // message (any caller, zero discipline). No-op + hook left unset when the flag is off (byte-for-byte v0 delivery).
   installInboxWake(log);

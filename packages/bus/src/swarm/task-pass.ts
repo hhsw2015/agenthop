@@ -16,6 +16,7 @@ import { resolveAllocOutcome, abandonIntent, confirmIntent } from "./task-intent
 import type { Assignment } from "./task-assignment.js";
 import { liveEntities, type LogState, type ChangeBody, type CommitResult, type ResultObserved, type DispatchIntent } from "./control-log.js";
 import { resolveAccountable, attributionEnabled } from "./attribution.js";
+import { outputContractEnabled, validateExpectedOutput } from "./output-contract.js";
 
 /** The git/acceptance facts O1 reads off a candidate's WORK branch tip (everything in ValidationInput that needs IO). */
 export type GitFacts = {
@@ -53,6 +54,11 @@ export type TaskOps = {
    *  the BOX outcome; `delivered` says the worker actually started. created+!delivered = box exists (occupies, creation-
    *  bound expiry) but no worker ⇒ do NOT confirm the intent (Codex P2: alloc success ≠ delivery success). */
   startTask: (a: { assignment: Assignment; launchId: string }) => Promise<{ alloc: "created" | "clean-fail" | "unknown"; delivered: boolean }>;
+  /** output-contract (SWARM_OUTPUT_CONTRACT): at the delivery RECEIPT (an accepted result), probe + verify the intent's
+   *  declared expectedOutput evidence and, on `unmet`, advise the coordinator. OPTIONAL (legacy ops / tests omit it) and
+   *  Tier A ADVISORY — it NEVER changes the accept verdict. The IO (fs/git probe + S19 card) lives in the dispatcher; this
+   *  seam only hands over the accepted intent+attempt. Fired once per accepted result; callee + caller are fail-soft. */
+  verifyOutputContract?: (a: { intent: DispatchIntent; attempt: TaskAttempt }) => void;
   log: (m: string) => void;
 };
 
@@ -186,6 +192,21 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
     if (!r.result.ok) { ops.log(`task accept-pass ${attempt.attemptId}: commit rejected (${r.result.reason}) — re-observe next tick`); continue; } // disk-CAS consumer contract: a rejected commit is not success
     state = r.state;
     ops.log(`task accept-pass ${attempt.attemptId}: ${out.verdict.decision}`);
+
+    // output-contract VERIFICATION tag (SWARM_OUTPUT_CONTRACT): the delivery RECEIPT. On ACCEPTANCE, hand the accepted
+    // intent (if it carries an expectedOutput) to the injected probe, which verifies the declared physical evidence and, on
+    // `unmet`, advises the coordinator (Tier A — NEVER changes this verdict). Fires ONCE per accepted result: a later pass
+    // re-observes the same accepted result, judgeObservation yields no changes (idempotent replay) and `continue`s above, so
+    // this is not reached again (nor after a dispatcher restart — the replay re-folds the accepted result, same short-circuit).
+    // Gated on outputContractEnabled() so the kill-switch also silences a stale-stamped intent. Fail-soft (isolated).
+    if (out.verdict.decision === "accept" && ops.verifyOutputContract && outputContractEnabled()) {
+      let intent: DispatchIntent | undefined;
+      for (const b of Object.values(liveEntities(state))) if (b.put === "intent" && b.intent.launchId === binding.launchId) { intent = b.intent; break; }
+      if (intent?.expectedOutput !== undefined) {
+        try { ops.verifyOutputContract({ intent, attempt }); }
+        catch (e) { ops.log(`output-contract verify ${attempt.attemptId} error (isolated): ${e instanceof Error ? e.message : e}`); }
+      }
+    }
   }
 
   // ---- DISPATCH: ready set -> prepare -> commit intent+attempt (CAS) -> box IO -> commit outcome --------------------
@@ -223,7 +244,17 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
     if (!prep.ok) { ops.log(`dispatch ${task.nodeId}: skipped — ${prep.reason}`); continue; }
     // Stamp the attribution SOURCE tag (computed once above, gated on attributionEnabled) onto THIS dispatch's intent, if one
     // resolved. SOURCE tag only — no authz/permission/cap path may read intent.accountable (attribution.ts invariant ②).
-    const intent: DispatchIntent = accountable !== undefined ? { ...prep.intent, accountable } : prep.intent;
+    let intent: DispatchIntent = accountable !== undefined ? { ...prep.intent, accountable } : prep.intent;
+    // Stamp the output-contract VERIFICATION tag (SWARM_OUTPUT_CONTRACT — LIVE BY DEFAULT; =0 disables) onto THIS dispatch's
+    // intent from the plan node's declared expectedOutput, so the receipt seam probes the promised evidence against WHAT WAS
+    // DISPATCHED (not a later plan edit). VERIFICATION tag only — no authz path reads it. FAIL-SOFT: any error ⇒ dispatch
+    // without the tag (never break the sweep). Re-validated per FC-7 even though loadPlan already sanitized it (defense).
+    try {
+      if (outputContractEnabled()) {
+        const eo = validateExpectedOutput(specById.get(task.nodeId)?.expectedOutput);
+        if (eo) intent = { ...intent, expectedOutput: eo };
+      }
+    } catch { /* fail-soft: dispatch without the output-contract tag */ }
 
     // CAS-then-IO: persist the intent (pending) + the NEW attempt BEFORE the allocate IO, so a crash leaves a
     // reconcilable record, never a silent box with no intent. The retry-succession retires the OLD attempt in this SAME
