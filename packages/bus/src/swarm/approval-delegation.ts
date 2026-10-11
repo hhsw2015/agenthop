@@ -66,9 +66,13 @@ export interface PermissionDecision {
   command: string;
   toolInputDigest: string;
   behavior: "allow" | "deny";
-  rewrite: string;   // AD-V1-P1-1: the pinned-absolute-path command, recorded for audit (② 留痕). The member hook RECOMPUTES its
-                     // own rewrite at emit and NEVER executes this logged string — the log authorizes WHETHER to allow, the
-                     // member binds WHAT runs (defence against a stale/tampered control-log).
+  rewrite: string;   // AD-V1-P1-1: the pinned-absolute-path command, recorded for audit (② 留痕). For a DELEGATE the member hook
+                     // RECOMPUTES its own rewrite at emit and NEVER executes this logged string. For a SANITIZE (sanitized===true)
+                     // the member CANNOT recompute the coordinator-produced result path, so it TRUSTS this rewrite but VALIDATES
+                     // it (exact `builtin command /bin/cat <path>` shape, <path> under the sanitized-read result dir, lstat regular
+                     // file) before emitting — the one trust-model difference from delegate (see approval-gate runPermissionGate).
+  sanitized?: boolean; // sanitized-read (FC-7 additive): true ⇒ this decision's rewrite reads a COORDINATOR-produced result file
+                       // (the hardened read's captured output), not a member-recomputed pinned command. Absent/false ⇒ a v1 delegate.
   by: string;        // the deciding coordinator sid
   reason: string;
   atSec: number;
@@ -97,8 +101,9 @@ const PINNED = new Map<string, string>([
    // undefined, so a prototype-inherited name is never classified scope-free (a plain-object `PINNED[name]` would return the
    // inherited function and wrongly delegate — and record a bogus permissionDecision).
 
-/** The credential/secret path signature — the privilege backstop inspects the raw command for it (black-before-white). */
-const SECRET_RE = /(\.env|id_rsa|id_ed25519|id_dsa|id_ecdsa|\.pem|\.key|credentials|\.aws|\.ssh|\.npmrc|\.git-credentials|\.netrc|secret|token|password|passwd|\.agenthop\/identity)/;
+/** The credential/secret path signature — the privilege backstop inspects the raw command for it (black-before-white). EXPORTED
+ *  so sanitized-read reuses the SAME regex for its credential-path red-line (coordinator ④: reuse, do not recreate). */
+export const SECRET_RE = /(\.env|id_rsa|id_ed25519|id_dsa|id_ecdsa|\.pem|\.key|credentials|\.aws|\.ssh|\.npmrc|\.git-credentials|\.netrc|secret|token|password|passwd|\.agenthop\/identity)/;
 
 /**
  * The BLACKLIST — a privilege BACKSTOP so a dangerous command is labelled `privilege` (not merely `needs-user`). v1 delegates

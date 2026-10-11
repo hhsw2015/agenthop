@@ -57,8 +57,10 @@ import { resolveSession, listSessions, makeFileLiveness, pidFileMtimeSec } from 
 import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox, inboxDirName, claimInbox, ackInbox, releaseInbox, recoverStaleClaims } from "../packages/bus/src/inbox.js";
-import { approvalDelegateEnabled } from "../packages/bus/src/swarm/approval-delegation.js";
-import { planCoordinatorAction, approvalInboxKey } from "../packages/bus/src/swarm/approval-gate.js";
+import { approvalDelegateEnabled, type PermissionDecision } from "../packages/bus/src/swarm/approval-delegation.js";
+import { planCoordinatorAction, buildSanitizeDecision, approvalInboxKey } from "../packages/bus/src/swarm/approval-gate.js";
+import { sanitizedReadEnabled, SANITIZED_READ_BUDGET_SEC } from "../packages/bus/src/swarm/sanitized-read.js";
+import { resolveAndRead, writeSanitizedResult, gcSanitizedResults } from "../packages/bus/src/swarm/sanitized-read-io.js";
 import { verifyOpsAction, applyOpsVerdict, opsReceiptOpen, pendingOpsReceipt, successionHeartbeatDue, successionHeartbeatSec, type OpsEvidence, type SuccessionLiveness } from "../packages/bus/src/swarm/coordinator-ops-receipt.js";
 import { readSuccessionSwapSec, listSuccessionSwaps } from "../packages/bus/src/swarm/shell-succession.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
@@ -1846,9 +1848,10 @@ async function main(): Promise<void> {
     approvalPendingRelease.add(file);                                        // present OR unknown ⇒ retry next sweep
   };
   const runApprovalDelegation = (): void => {
-    if (!approvalDelegateEnabled()) return;
+    if (!approvalDelegateEnabled() && !sanitizedReadEnabled()) return; // drain the approvals key if EITHER feature is on
     try {
       for (const f of [...approvalPendingRelease]) releaseOrDefer(f); // ADIO-P2-1: first retry any release deferred last sweep
+      if (sanitizedReadEnabled()) gcSanitizedResults(HOME, 300); // sanitized-read: best-effort GC of stale one-shot result files (never throws)
       const coordSid = resolveSession(COORDINATOR, listSessions(HOME));
       if (!coordSid || !isStableSid(coordSid)) return; // no stable coordinator identity ⇒ can't key the dedicated approval box
       const key = approvalInboxKey(coordSid);
@@ -1866,12 +1869,26 @@ async function main(): Promise<void> {
           const req = msg.approval;
           if (!req) { ackInbox(file); continue; } // a stray non-approval on the dedicated key ⇒ drop (key is ours)
           const action = planCoordinatorAction(req, coordSid, nowSec());
+          // Resolve the action into an optional decision to commit: delegate = ready (only when ITS flag is on); sanitize = run
+          // the hardened read first (sanitized-read-io) under the budget, then build the decision; escalate / flag-off / a
+          // read-failure ⇒ NO decision ⇒ ack ⇒ the member hook times out to the user (fail-to-user).
+          let decision: PermissionDecision | null = null;
           if (action.act === "delegate") {
-            const { state, result } = commitTask(st, [{ put: "permissionDecision", permissionDecision: action.decision }]);
+            if (approvalDelegateEnabled()) decision = action.decision; // delegate only when SWARM_APPROVAL_DELEGATE is on
+          } else if (action.act === "sanitize") {
+            const startedMs = Date.now();
+            const rr = resolveAndRead(action.spec, req.cwd); // coordinator-side hardened read (O_NOFOLLOW + realpath + cwd-confined); no subprocess
+            if (rr.ok && Date.now() - startedMs <= SANITIZED_READ_BUDGET_SEC * 1000) {
+              const resultPath = writeSanitizedResult(HOME, rr.bytes, rr.truncated);
+              decision = buildSanitizeDecision(req, resultPath, coordSid, nowSec());
+            } // else: resolve failure OR over-budget ⇒ no decision ⇒ fail-to-user
+          }
+          if (decision) {
+            const { state, result } = commitTask(st, [{ put: "permissionDecision", permissionDecision: decision }]);
             if (result.ok) { st = state; ackInbox(file); } // ok covers a fresh commit AND an idempotent replay
             else { st = loadControlLog(CONTROL_LOG_DIR); releaseOrDefer(file); } // seq conflict ⇒ reload + release (or defer) for retry
           } else {
-            ackInbox(file); // escalate: no decision ⇒ member hook times out to the user; live-sentinel supervises
+            ackInbox(file); // escalate / flag-off / sanitize-read-failed ⇒ no decision ⇒ member hook times out to the user; live-sentinel supervises
           }
         } catch (e) {
           releaseOrDefer(file); // release, or keep the obligation for a later sweep; never claim "released" on a failed unclaim

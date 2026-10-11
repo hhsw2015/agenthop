@@ -18,6 +18,8 @@ import { resolveSession, listSessions } from "./swarm/task-liveness.js";
 import { loadControlLog } from "./swarm/control-store.js";
 import { liveEntities } from "./swarm/control-log.js";
 import { approvalDelegateEnabled } from "./swarm/approval-delegation.js";
+import { sanitizedReadEnabled } from "./swarm/sanitized-read.js";
+import { sanitizedReadDir } from "./swarm/sanitized-read-io.js";
 import { runPermissionGate, approvalInboxKey } from "./swarm/approval-gate.js";
 
 /** Build the real deps and run the member-side gate. `startedAt` is the hook's event-time proxy (for the status seq);
@@ -33,7 +35,7 @@ export async function runPermissionGateCli(startedAt: number, readStdin: () => P
   try { coordSid = coordHandle ? resolveSession(coordHandle, listSessions(home)) : null; } catch { coordSid = null; }
 
   await runPermissionGate({
-    enabled: approvalDelegateEnabled(),
+    enabled: approvalDelegateEnabled() || sanitizedReadEnabled(), // run the gate if EITHER feature is on (sanitize is independent of delegate)
     newRequestId: () => randomUUID(), // a FRESH per-invocation flowback id (ADIO-P1-1) — never the user prompt_id, never a content hash
     readStdin,
     reportBlocked: (member) => { try { writeStatusFile(statusHome(), member, "blocked", { seq: startedAt }); } catch { /* status is best-effort */ } },
@@ -60,6 +62,7 @@ export async function runPermissionGateCli(startedAt: number, readStdin: () => P
     // AD-V1-P1-1: verify the pinned binary is a real regular file in THIS (the member's) env. lstat does NOT follow symlinks, so
     // a symlink-replacement / dangling link / directory all fail isFile() ⇒ the gate escalates. Absolute paths only; any fault ⇒ false.
     pinnedPathOk: (absPath) => { try { return absPath.startsWith("/") && lstatSync(absPath).isFile(); } catch { return false; } },
+    sanitizedResultDir: sanitizedReadDir(home), // sanitized-read: a sanitize rewrite's result path MUST resolve under this dir
     emit: (jsonStr) => { process.stdout.write(jsonStr + "\n"); },
     nowMs: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
