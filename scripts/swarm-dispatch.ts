@@ -57,7 +57,7 @@ import { resolveSession, listSessions, makeFileLiveness, pidFileMtimeSec } from 
 import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox, inboxDirName, scanInboxMessages } from "../packages/bus/src/inbox.js";
-import { verifyOpsAction, applyOpsVerdict, opsReceiptOpen, successionHeartbeatDue, successionHeartbeatSec, type OpsReceiptRecord, type OpsEvidence, type SuccessionLiveness } from "../packages/bus/src/swarm/coordinator-ops-receipt.js";
+import { verifyOpsAction, applyOpsVerdict, opsReceiptOpen, pendingOpsReceipt, successionHeartbeatDue, successionHeartbeatSec, type OpsEvidence, type SuccessionLiveness } from "../packages/bus/src/swarm/coordinator-ops-receipt.js";
 import { readSuccessionSwapSec } from "../packages/bus/src/swarm/shell-succession.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
 import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
@@ -104,6 +104,9 @@ const OPS_RECEIPT_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_OPS_RECE
 // window is SWARM_SUCCESSION_HEARTBEAT_SEC (pure core, default 600). The swap-record WRITE rides SWARM_SUCCESSION (always recorded);
 // only this CONSUMPTION is gated here, so enabling the heartbeat later still sees swaps that happened while it was off.
 const SUCCESSION_HEARTBEAT_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_SUCCESSION_HEARTBEAT ?? "");
+// F53 ②: a freshly-spawned box that simply has not checkpointed yet reads "unknown" — hold it for this grace window before
+// recording/accounting, so a young box never spams the coordinator. Default 600s; SWARM_OPS_RECEIPT_GRACE_SEC overrides (>0).
+const OPS_RECEIPT_GRACE_SEC = (() => { const n = Number(process.env.SWARM_OPS_RECEIPT_GRACE_SEC); return Number.isFinite(n) && n > 0 ? n : 600; })();
 // F40 unclaimed-mail sentinel: a durable inbox with unread mail older than this AND no live session draining it ⇒ escalate to
 // the coordinator (silent-stall detection). 10min default — long enough that an ordinary flush cadence never trips it.
 const INBOX_STALL_SEC = Number(process.env.SWARM_INBOX_STALL_SEC || "600");
@@ -350,11 +353,6 @@ async function allocateSuccessor(_pred: ControlRecord, successorId: string): Pro
   // (box may exist). SWARM_TEAM still matters for swarm-task --resume (the successor's worker joins the team).
   if (!SWARM_TEAM) log("allocateSuccessor: SWARM_TEAM is unset — the resumed successor would join teamless/invisible");
   const r = await runScript(SWARM_LAUNCH, ["claude", SWARM_TEAM, "new"], { AGENTHOP_ALLOCATE_ONLY: "1", AGENTHOP_LAUNCH_ID: successorId });
-  // F53 ② fire-site SEAM (TODO, dormant): when the lifecycle pass commits this allocate, also commit a pending receipt so
-  // runOpsReceipt can verify it by durable evidence — commitTask(state, [{ put: "opsReceipt",
-  // ops: pendingOpsReceipt({ kind: "spawn", target: successorId }, successorId, nowSec()) }]). Left unwired here because these
-  // op fns don't hold the control-log state (the lifecycle axis persists via saveRecord); the minimal correct placement is the
-  // commit point in the pass. Until wired, runOpsReceipt finds no pending records ⇒ a safe no-op. (import: pendingOpsReceipt.)
   if (r.code === 0) { log(`allocateSuccessor: allocated ${successorId}`); return "ok"; }
   if (r.code === 3) { log(`allocateSuccessor ${successorId}: clean refusal (not created)`); return "clean-fail"; }
   log(`allocateSuccessor ${successorId}: result unknown (exit ${r.code})`);
@@ -366,8 +364,6 @@ async function resumeSuccessor(a: { successor: string; handoffSha: string; gener
   const r = await runScript(SWARM_TASK, [a.successor, "--resume", a.handoffSha, String(a.generation)],
     WORK_REPO ? { SWARM_WORK_REPO: repoSlug(WORK_REPO) } : {});
   if (r.code !== 0) { log(`resumeSuccessor ${a.successor}: swarm-task --resume failed (code ${r.code}): ${(r.stderr || r.stdout).trim().slice(0, 200)}`); return false; }
-  // F53 ② fire-site SEAM (TODO, dormant): on a successful resume, the pass should commit a pending receipt
-  // { put: "opsReceipt", ops: pendingOpsReceipt({ kind: "inject", target: a.successor }, a.successor, nowSec()) } (see allocateSuccessor).
   return true;
 }
 async function scrubBox(launchId: string): Promise<boolean> {
@@ -511,10 +507,6 @@ async function startTaskIO(a: { assignment: Assignment; launchId: string }): Pro
       delivered = t.code === 0;
       if (!delivered) log(`startTask ${a.launchId}: box created but swarm-task --task exit ${t.code} (worker not started): ${(t.stderr || t.stdout).trim().slice(0, 200)}`);
     }
-    // F53 ② fire-site SEAM (TODO, dormant): the task pass (which holds the control-log state) should commit a pending receipt
-    // for the box when alloc==="created" (kind:"spawn") and, once delivered, for the worker inject (kind:"inject"), both keyed by
-    // a.launchId — { put: "opsReceipt", ops: pendingOpsReceipt({ kind, target: a.launchId }, a.launchId, nowSec()) } — so
-    // runOpsReceipt verifies them by durable evidence. Unwired until the pass-side placement lands (see allocateSuccessor seam).
     return { alloc, delivered };
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -1540,35 +1532,38 @@ async function main(): Promise<void> {
       .catch((e) => log(`live sentinel watcher ${name} ended: ${e instanceof Error ? e.message : e}`))
       .finally(() => { if (sentinelWatchers.get(name) === ac) sentinelWatchers.delete(name); });
   };
-  // F53 ②: ops-receipt — verify the coordinator's OWN fired spawn/inject ops by DURABLE evidence (never the op's instant return,
-  // the F53 trap). Reads the OPEN opsReceipt records (pending/unknown), gathers evidence for each target, runs verifyOpsAction,
-  // and commits the verdict ONLY when the status changes (FC-6 explicit transition — no revision churn). confirmed ⇒ discharged;
-  // unknown/failed ⇒ ACCOUNT via notifyCoordinator, NEVER auto-redo (②b: re-fire idempotency is not dispatcher-provable). Gated
-  // on SWARM_OPS_RECEIPT (default OFF); sync; fully fail-soft; spawns/acts on nothing.
+  // F53 ②: ops-receipt — VERIFY the coordinator's OWN fired ops by DURABLE evidence (never the op's instant return, the F53 trap).
+  // (C) derive-from-mirror: the verify-set is the LIVE box mirror (loadMirror — the dispatcher's own durable fire record), NOT
+  // opsReceipt entities. ops-receipt is a VERIFIER, not a recorder: it stores ONLY the verdict in the control-log (audit ②留痕).
+  // KEY INSIGHT: a mirror ControlRecord carries NO bus session id, so spawn-family bus/checkin evidence is not gatherable here;
+  // the box's durable proof is its CONFIRMED checkpoint `sha` (ControlRecord.sha, set on first confirmed push) and/or a branch
+  // commit — the newCommit/inject evidence family, which is STRONGER than bus-presence — so every box is verified as kind:"inject".
+  // confirmed ⇒ discharged; unknown ⇒ ACCOUNT via notifyCoordinator, NEVER auto-redo (②b: re-fire idempotency is not dispatcher-
+  // provable). Commit ONLY on a status change (FC-6), which also dedups the notice to once per transition. Gated on
+  // SWARM_OPS_RECEIPT (default OFF); sync; fully fail-soft; spawns/acts on nothing.
   const runOpsReceipt = (): void => {
     if (!OPS_RECEIPT_ENABLED) return;
     try {
       let st = loadControlLog(CONTROL_LOG_DIR);
-      const sids = listSessions(HOME);
-      const coordSid = resolveSession(COORDINATOR, sids);
-      const checkins = coordSid ? scanInboxMessages(HOME, coordSid) : [];
-      const open = Object.values(liveEntities(st))
-        .filter((b): b is Extract<ChangeBody, { put: "opsReceipt" }> => b.put === "opsReceipt")
-        .map((b) => b.ops).filter(opsReceiptOpen);
-      for (const rec of open) {
-        // DURABLE evidence against the target (the op's instant return is deliberately NOT consulted — F53).
-        const busVisible = resolveSession(rec.target, sids) !== null;
-        const checkinInInbox = checkins.some((m) => m.from === rec.target && m.text.startsWith("[checkin]"));
-        const inboxReceipt = checkins.some((m) => m.from === rec.target);
+      for (const r of loadMirror().values()) {
+        const action = { kind: "inject" as const, target: r.launchId };
+        const opId = `inject:${r.launchId}`;
+        const pb = liveEntities(st)[`opsReceipt:${opId}`];
+        const prev = pb?.put === "opsReceipt" ? pb.ops : undefined;
+        if (prev && !opsReceiptOpen(prev)) continue; // terminal (confirmed discharged / failed accounted) ⇒ done
         let reportFile = false;
-        try { reportFile = existsSync(path.join(BOARD_DIR, `${rec.target}.report.json`)); } catch { /* no board file ⇒ not that signal */ }
-        const evidence: OpsEvidence = rec.kind === "spawn" ? { busVisible, checkinInInbox } : { inboxReceipt, reportFile };
-        const verdict = verifyOpsAction({ kind: rec.kind, target: rec.target }, evidence);
-        if (verdict === rec.status) continue; // unchanged ⇒ no commit (avoid revision churn)
-        const { state, result } = commitTask(st, [{ put: "opsReceipt", ops: applyOpsVerdict(rec, verdict, nowSec()) }]);
+        try { reportFile = existsSync(path.join(BOARD_DIR, `${r.launchId}.report.json`)); } catch { /* no board file ⇒ not that signal */ }
+        const evidence: OpsEvidence = { newCommit: r.sha !== undefined, reportFile }; // the box's confirmed checkpoint / report — durable proof it took
+        const verdict = verifyOpsAction(action, evidence);
+        // GRACE: a young box that simply hasn't checkpointed yet reads "unknown" — re-check later, no record/notice (avoid
+        // accounting-spam on fresh spawns). Only "unknown" is held; a "confirmed" is recorded immediately.
+        if (verdict === "unknown" && nowSec() - r.allocStart < OPS_RECEIPT_GRACE_SEC) continue;
+        if (prev && prev.status === verdict) continue; // FC-6: commit only on a status change (no revision churn / no re-notice)
+        const rec = applyOpsVerdict(pendingOpsReceipt(action, r.launchId, r.allocStart), verdict, nowSec());
+        const { state, result } = commitTask(st, [{ put: "opsReceipt", ops: rec }]);
         if (result.ok) st = state; else { st = loadControlLog(CONTROL_LOG_DIR); continue; } // seq race ⇒ reload, retry next tick
         if (verdict !== "confirmed") // ②b: account, never auto-redo
-          notifyCoordinator(`[ops-receipt] ${rec.kind} ${rec.target} UNCONFIRMED (${verdict}) — needs attention (no auto-redo)`, { taskRef: `ops-receipt:${rec.opId}`, title: "op unverified" });
+          notifyCoordinator(`[ops-receipt] box ${r.launchId} UNCONFIRMED (${verdict}) by durable evidence — needs attention (no auto-redo)`, { taskRef: `ops-receipt:${opId}`, title: "op unverified" });
       }
     } catch (e) { log(`ops receipt failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
