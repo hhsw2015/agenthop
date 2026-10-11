@@ -192,19 +192,28 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
     if (!r.result.ok) { ops.log(`task accept-pass ${attempt.attemptId}: commit rejected (${r.result.reason}) — re-observe next tick`); continue; } // disk-CAS consumer contract: a rejected commit is not success
     state = r.state;
     ops.log(`task accept-pass ${attempt.attemptId}: ${out.verdict.decision}`);
+  }
 
-    // output-contract VERIFICATION tag (SWARM_OUTPUT_CONTRACT): the delivery RECEIPT. On ACCEPTANCE, hand the accepted
-    // intent (if it carries an expectedOutput) to the injected probe, which verifies the declared physical evidence and, on
-    // `unmet`, advises the coordinator (Tier A — NEVER changes this verdict). Fires ONCE per accepted result: a later pass
-    // re-observes the same accepted result, judgeObservation yields no changes (idempotent replay) and `continue`s above, so
-    // this is not reached again (nor after a dispatcher restart — the replay re-folds the accepted result, same short-circuit).
-    // Gated on outputContractEnabled() so the kill-switch also silences a stale-stamped intent. Fail-soft (isolated).
-    if (out.verdict.decision === "accept" && ops.verifyOutputContract && outputContractEnabled()) {
-      let intent: DispatchIntent | undefined;
-      for (const b of Object.values(liveEntities(state))) if (b.put === "intent" && b.intent.launchId === binding.launchId) { intent = b.intent; break; }
-      if (intent?.expectedOutput !== undefined) {
-        try { ops.verifyOutputContract({ intent, attempt }); }
-        catch (e) { ops.log(`output-contract verify ${attempt.attemptId} error (isolated): ${e instanceof Error ? e.message : e}`); }
+  // ---- output-contract RECEIPT (recoverable, OW-2): offer EVERY accepted dispatch that declared an expectedOutput to the
+  //      verify hook, EVERY pass. The hook is idempotent + durably self-marking (the dispatcher no-ops a discharged item), so a
+  //      transient coordinator-present failure OR a crash between the accept commit and the verification is RETRIED until the
+  //      verification (+ any reminder) durably completes — not an at-most-once inline fire. The accept verdict is already
+  //      committed and is NEVER revisited here (Tier A advisory). Gated on the flag (kill-switch silent) + fail-soft. Join
+  //      accepted → its dispatch intent by the stable attemptId (1:1 per attempt); an unknown/unjoined pair is skipped. --------
+  if (ops.verifyOutputContract && outputContractEnabled()) {
+    const schedR = buildSched(plan, state);
+    if (schedR.acceptedResults.length > 0) {
+      const intentByAttempt = new Map<string, DispatchIntent>();
+      for (const b of Object.values(liveEntities(state))) if (b.put === "intent" && b.intent.expectedOutput !== undefined) intentByAttempt.set(b.intent.attemptId, b.intent);
+      if (intentByAttempt.size > 0) {
+        const attemptById = new Map(schedR.attempts.map((a) => [a.attemptId, a]));
+        for (const acc of schedR.acceptedResults) {
+          const intent = intentByAttempt.get(acc.attemptId);
+          const attempt = attemptById.get(acc.attemptId);
+          if (!intent || !attempt) continue; // no expectedOutput on this dispatch, or the attempt is gone — nothing to verify
+          try { ops.verifyOutputContract({ intent, attempt }); }
+          catch (e) { ops.log(`output-contract verify ${acc.attemptId} error (isolated): ${e instanceof Error ? e.message : e}`); }
+        }
       }
     }
   }

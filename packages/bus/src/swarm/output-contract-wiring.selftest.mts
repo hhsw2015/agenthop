@@ -9,14 +9,20 @@
 //  (d3) AW-1: the read-side trims the ENTITY VIEW ONLY — the OPERATION digest stays on the committed payload, so a historical
 //      record with a malformed/extra expectedOutput still accepts a BYTE-IDENTICAL retry (idempotent), while a genuinely
 //      different payload still conflicts. Also proves the SAME holds when an intent carries BOTH tags (accountable + expectedOutput);
-//  (e) RECEIPT seam: an accepted result whose intent carries expectedOutput fires ops.verifyOutputContract ONCE (gated on the
-//      flag — a kill-switch at accept-time silences even a stale-stamped intent); a node with no expectedOutput never fires it.
-//  (f) verifyExpectedOutput / probeExpectedOutput / validateExpectedOutput are BYTE-UNCHANGED — covered by
+//  (e) RECEIPT seam: an accepted result whose intent carries expectedOutput is OFFERED to ops.verifyOutputContract (gated on the
+//      flag — kill-switch silences it); a node with no expectedOutput is never offered. OW-2 RECOVERABLE: task-pass OFFERS every
+//      pass (no at-most-once in-memory flag), so a later pass re-offers an already-accepted item.
+//  (f) the DURABLE discharge seam (output-contract-receipt): the pure discharge rule + the marker round-trip (an idempotent no-op
+//      once discharged; an un-presented unmet is NOT discharged ⇒ retried).
+//  (g) verifyExpectedOutput / probeExpectedOutput / validateExpectedOutput are BYTE-UNCHANGED — covered by
 //      output-contract.selftest.mts (run separately).
 //
 // The contract math (validate/probe/verify) lives in the pure core; this selftest only proves the SEAM: stamp-at-dispatch
-// (gated on outputContractEnabled), read-side tolerance, and verify-at-receipt (gated, fail-soft, once).
+// (gated on outputContractEnabled), read-side tolerance, and the recoverable verify-at-receipt (offered every pass + durable discharge).
 
+import { mkdtempSync } from "node:fs";
+import os from "node:os";
+import nodePath from "node:path";
 import {
   commit, entityKeyOf, initialLogState, liveEntities, replayLog,
   type ChangeBody, type LogState, type DispatchIntent, type Change, type CommittedBatch,
@@ -24,6 +30,7 @@ import {
 import { loadPlan, type TaskPlan } from "./task-plan.js";
 import { taskPass, type TaskOps, type GitFacts } from "./task-pass.js";
 import type { TaskAttempt } from "./task-state.js";
+import { ocReceiptMarkerPath, ocReceiptDischarged, ocReceiptMark, shouldDischargeReceipt } from "./output-contract-receipt.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
@@ -219,23 +226,52 @@ try {
       && !!bothView.expectedOutput && (bothView.expectedOutput as Record<string, unknown>).y === undefined);
   }
 
-  // ---------------- (e) RECEIPT seam: verifyOutputContract fired ONCE on accept, gated on the flag ----------------
+  // ---------------- (e) RECEIPT seam: verifyOutputContract OFFERED on accept, gated on the flag, RE-OFFERED every pass (OW-2) --
   {
     setFlag(undefined); // ON for both passes
     const r1 = await driveAccept(mkPlan({ kind: "file", ref: "out/x.txt" }));
-    t("(e) accept with an expectedOutput-carrying intent ⇒ verifyOutputContract fired exactly once", r1.spy.calls.length === 1);
+    t("(e) accept with an expectedOutput-carrying intent ⇒ verifyOutputContract offered (once this pass)", r1.spy.calls.length === 1);
     t("(e) the receipt hook gets the intent WITH its expectedOutput + the accepted attempt",
       r1.spy.calls.length === 1 && !!r1.spy.calls[0]!.intent.expectedOutput && r1.spy.calls[0]!.intent.expectedOutput!.kind === "file" && r1.spy.calls[0]!.attempt.nodeId === "build");
+
+    // OW-2 RECOVERABLE: a FRESH pass over the already-accepted state RE-OFFERS the item — task-pass keeps NO at-most-once
+    // in-memory flag, so a transient present failure / a crash is retried (the durable dedup lives in the dispatcher — see (f)).
+    setFlag(undefined);
+    const sref = { s: r1.state };
+    const spy2: Spy = { calls: [] };
+    await taskPass(mkPlan({ kind: "file", ref: "out/x.txt" }), mkOps(sref, { verifyOutputContract: (a) => { spy2.calls.push(a); } }));
+    t("(e) OW-2 recoverable: a later pass RE-OFFERS the already-accepted item (not an at-most-once fire)",
+      spy2.calls.length === 1 && !!spy2.calls[0]!.intent.expectedOutput && spy2.calls[0]!.attempt.nodeId === "build");
 
     setFlag(undefined);
     const r2 = await driveAccept(mkPlan(undefined));
     t("(e) accept with NO expectedOutput on the intent ⇒ hook NOT fired", r2.spy.calls.length === 0);
 
     // kill-switch AT RECEIPT: dispatch with the flag ON (intent gets stamped), then flip OFF before the accept pass ⇒
-    // the receipt gate silences even a stale-stamped intent (hook not fired).
+    // the receipt gate silences even a stale-stamped intent (hook not offered).
     setFlag(undefined);
     const r3 = await driveAccept(mkPlan({ kind: "file", ref: "out/x.txt" }), "0");
-    t("(e) kill-switch at accept-time (flag flipped to 0 before accept) ⇒ hook NOT fired even on a stale-stamped intent", r3.spy.calls.length === 0);
+    t("(e) kill-switch at accept-time (flag flipped to 0 before accept) ⇒ hook NOT offered even on a stale-stamped intent", r3.spy.calls.length === 0);
+  }
+
+  // ---------------- (f) DURABLE discharge seam (output-contract-receipt) — the OW-2 idempotency + retry bookkeeping ----------
+  {
+    // the PURE discharge rule
+    t("(f) shouldDischargeReceipt: met ⇒ discharge", shouldDischargeReceipt("met", false) === true);
+    t("(f) shouldDischargeReceipt: unknown ⇒ discharge (verified; nothing to present, FC-2 r3)", shouldDischargeReceipt("unknown", false) === true);
+    t("(f) shouldDischargeReceipt: unmet + presented ⇒ discharge", shouldDischargeReceipt("unmet", true) === true);
+    t("(f) shouldDischargeReceipt: unmet + NOT presented ⇒ NOT discharged (⇒ retried next pass)", shouldDischargeReceipt("unmet", false) === false);
+
+    // the durable marker round-trip: discharged ⇒ a subsequent offer is an idempotent no-op in the dispatcher.
+    const home = mkdtempSync(nodePath.join(os.tmpdir(), "oc-receipt-"));
+    t("(f) undischarged before any mark", ocReceiptDischarged(home, "att-1") === false);
+    ocReceiptMark(home, "att-1", { verdict: "met", atSec: 1 });
+    t("(f) discharged after mark (the dispatcher's idempotent no-op signal)", ocReceiptDischarged(home, "att-1") === true);
+    t("(f) a DIFFERENT accepted item is independent (not discharged)", ocReceiptDischarged(home, "att-2") === false);
+    // path safety: a crafted attemptId can never escape the receipt dir (it becomes a filename).
+    const p = ocReceiptMarkerPath(home, "../../etc/evil");
+    t("(f) marker path stays inside the receipt dir (traversal sanitized)",
+      p.startsWith(nodePath.join(home, ".agenthop", "swarm", "output-contract") + nodePath.sep) && !p.includes(`${nodePath.sep}etc${nodePath.sep}evil`));
   }
 
   console.log("\noutput-contract-wiring self-check OK");

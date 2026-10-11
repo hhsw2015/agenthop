@@ -38,6 +38,7 @@ import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
 import { boardAdmitEnabled, planBoardWrites, planBoardSupervision, parsePolicyNum, postedFileName, reclaimedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, repostTmpAction, suppressPendingReposts, boardFileIdentityVerified, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
 import { outputContractEnabled, probeExpectedOutput, verifyExpectedOutput, presentUnmetToCoordinator } from "../packages/bus/src/swarm/output-contract.js";
+import { ocReceiptDischarged, ocReceiptMark, shouldDischargeReceipt } from "../packages/bus/src/swarm/output-contract-receipt.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
 import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
@@ -149,6 +150,9 @@ const OBSERVER_SNAPSHOT_FILE = path.join(HOME, ".agenthop", "swarm", "observer-s
 const BOARD_DIR = path.join(HOME, ".agenthop", "swarm", "board");
 const PROGRESS_FILE = path.join(HOME, ".agenthop", "swarm", "PROGRESS.md");
 const COORDINATOR = process.env.SWARM_COORDINATOR || "";
+// A VERIFIED full stable SID (UUID) — never a routable display handle, which no identity drains (mirrors the function-scoped
+// isStableSid used by the observer→coordinator notify; module-level so the output-contract receipt can reuse it).
+const isStableSidStr = (s: string): boolean => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 const CONSUMPTION_WINDOW_SEC = Number(process.env.SWARM_CONSUMPTION_WINDOW_SEC || "600");
 // Local artifact root for RELATIVE completion-slot locators (review f0a999f-P2-4): WORK_REPO is a Git remote id (may be an
 // HTTPS URL) — NEVER a filesystem base. A relative locator with no ARTIFACT_ROOT is skipped (not joined under a URL).
@@ -549,23 +553,34 @@ function buildTaskOps(stateRef: { s: LogState }, planCommittedAtSec: number): Ta
     commit: (state, bodies) => { const r = commitTask(state, bodies); stateRef.s = r.state; return r; },
     observeGit: observeGitFor,
     startTask: startTaskIO,
-    // output-contract RECEIPT probe (SWARM_OUTPUT_CONTRACT): on an accepted result whose intent carries an expectedOutput,
-    // verify the declared physical evidence (fs / git / inbox) and, ONLY on `unmet`, write ONE S19 card to the coordinator.
-    // Tier A ADVISORY — never blocks acceptance (task-pass already committed). `unknown` (a read fault / ambiguous absence /
-    // a remote work branch we can't locally resolve) is NEVER presented (FC-2 r3: absence is not a verdict). Fully fail-soft:
-    // every fault is isolated here so the task pass is never broken. repoDir = the work repo (branch kind; a remote slug makes
-    // git fail ⇒ unknown, never a false unmet); HOME + taskRef scope the file/report/inbox-delivery probes.
+    // output-contract RECEIPT probe (SWARM_OUTPUT_CONTRACT): taskPass offers every accepted dispatch that declared an
+    // expectedOutput EVERY pass; this verifies the declared physical evidence (fs / git / inbox) and, ONLY on `unmet`, writes
+    // ONE S19 card to the coordinator. Tier A ADVISORY — never blocks acceptance (task-pass already committed). `unknown` (a read
+    // fault / ambiguous absence / a remote work branch we can't locally resolve) is NEVER presented (FC-2 r3: absence is not a
+    // verdict). IDEMPOTENT + RECOVERABLE (OW-2): a durable `.done` marker (ocReceipt*) makes a discharged item a no-op, and an
+    // item we could NOT complete (transient present fault, crash, or an unresolved coordinator) is left UNDISCHARGED ⇒ re-offered
+    // next pass / after a restart. Fully fail-soft: every fault is isolated. repoDir = the work repo (branch kind; a remote slug
+    // makes git fail ⇒ unknown, never a false unmet); HOME + taskRef scope the file/report/inbox-delivery probes.
     verifyOutputContract: ({ intent, attempt }) => {
       const eo = intent.expectedOutput;
-      if (!eo || !outputContractEnabled()) return;
+      if (!eo || !outputContractEnabled()) return;                  // kill-switch silent
+      if (ocReceiptDischarged(HOME, attempt.attemptId)) return;     // OW-2: already durably discharged ⇒ idempotent no-op
       const taskRef = `${attempt.jobId}/${attempt.nodeId}/${attempt.attemptId}`;
       try {
         const verdict = verifyExpectedOutput(eo, probeExpectedOutput(eo, { repoDir: WORK_REPO || undefined, home: HOME, taskRef }));
+        let presented = false;
         if (verdict === "unmet") {
-          if (COORDINATOR) presentUnmetToCoordinator(HOME, COORDINATOR, taskRef, eo);
-          else log(`output-contract ${taskRef}: UNMET (kind=${eo.kind}) — no SWARM_COORDINATOR set, not presenting`);
+          // OW-1: deliver to the RESOLVED native coordinator SID — never the raw SWARM_COORDINATOR ref, which writeInbox would
+          // clean into a WRONG inbox for a short-id/member-name config. Fall back to the config only when it is already a full
+          // stable SID (the offline S19 route the observer notify uses).
+          const sid = resolveSession(COORDINATOR, listSessions(HOME)) || (isStableSidStr(COORDINATOR) ? COORDINATOR : "");
+          if (sid) { presentUnmetToCoordinator(HOME, sid, taskRef, eo); presented = true; log(`output-contract ${taskRef}: UNMET (kind=${eo.kind}) — S19 presented to coordinator`); }
+          else log(`output-contract ${taskRef}: UNMET (kind=${eo.kind}) — coordinator "${COORDINATOR || "(unset)"}" unresolved, NOT presenting (retry next pass)`);
         } else log(`output-contract ${taskRef}: ${verdict} (kind=${eo.kind})`);
-      } catch (e) { log(`output-contract ${taskRef} probe error (isolated): ${e instanceof Error ? e.message : e}`); }
+        // OW-2: discharge ONLY once the obligation is truly complete (met/unknown, or unmet+presented). An unmet we could not
+        // present stays UNDISCHARGED ⇒ re-offered next pass (retried once the coordinator resolves / the inbox becomes writable).
+        if (shouldDischargeReceipt(verdict, presented)) ocReceiptMark(HOME, attempt.attemptId, { verdict, atSec: nowSec() });
+      } catch (e) { log(`output-contract ${taskRef} probe/present error (isolated) — retry next pass: ${e instanceof Error ? e.message : e}`); } // no marker ⇒ retried
     },
     log,
   };
