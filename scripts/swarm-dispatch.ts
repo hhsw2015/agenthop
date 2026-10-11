@@ -1847,10 +1847,11 @@ async function main(): Promise<void> {
     if (state === "absent") { approvalPendingRelease.delete(file); return; } // truly gone ⇒ nothing stranded
     approvalPendingRelease.add(file);                                        // present OR unknown ⇒ retry next sweep
   };
-  let approvalDelegationInFlight = false; // SR-P2-1: single-flight — a slow async sanitize read must not let the next sweep overlap this drain
+  let approvalDelegationInFlight = false; // SR-P2-1: single-flight guard for the drain pass itself
+  let sanitizeInFlight: Promise<void> | null = null; // SR-P2-1: a sanitize op PAST its decision-budget is still reading/writing — hold single-flight until it SETTLES (no 2nd concurrent read on a re-submit), WITHOUT awaiting it in the sweep path (a hung fs stalls sanitize, never the sweep)
   const runApprovalDelegation = async (): Promise<void> => {
     if (!approvalDelegateEnabled() && !sanitizedReadEnabled()) return; // drain the approvals key if EITHER feature is on
-    if (approvalDelegationInFlight) return;
+    if (approvalDelegationInFlight || sanitizeInFlight) return; // a prior drain OR a still-running timed-out sanitize op is active
     approvalDelegationInFlight = true;
     try {
       for (const f of [...approvalPendingRelease]) releaseOrDefer(f); // ADIO-P2-1: first retry any release deferred last sweep
@@ -1879,18 +1880,26 @@ async function main(): Promise<void> {
           if (action.act === "delegate") {
             if (approvalDelegateEnabled()) decision = action.decision; // delegate only when SWARM_APPROVAL_DELEGATE is on
           } else if (action.act === "sanitize") {
-            // SR-P2-1: ONE budget over the WHOLE op (async read + write + build) — a slow read never blocks the sweep (the await
-            // yields the event loop) and the write phase is covered too; over-budget ⇒ null ⇒ NO decision ⇒ fail-to-user.
+            if (sanitizeInFlight) { releaseOrDefer(file); continue; } // SR-P2-1: a prior timed-out sanitize op still runs ⇒ no concurrent read; retry next drain
+            // SR-P2-1: ONE budget over the WHOLE op (async read + ASYNC write + build) — all IO async, so a slow op never blocks the
+            // sweep (the budget timer fires) and the write phase is covered. On timeout: no commit, and the still-running op is held
+            // in sanitizeInFlight so the next drain skips until it settles (no 2nd concurrent read), WITHOUT awaiting it here.
             const budgetMs = SANITIZED_READ_BUDGET_SEC * 1000;
+            const started = Date.now();
             let timer: ReturnType<typeof setTimeout> | undefined;
             const op = (async (): Promise<PermissionDecision | null> => {
               const rr = await resolveAndRead(action.spec, req.cwd); // coordinator-side hardened ASYNC read; no subprocess/shell/env
               if (!rr.ok) return null;
-              const resultPath = writeSanitizedResult(HOME, rr.bytes, rr.truncated);
+              const resultPath = await writeSanitizedResult(HOME, rr.bytes, rr.truncated); // ASYNC write (SR-P2-1)
               return buildSanitizeDecision(req, resultPath, coordSid, nowSec());
             })();
-            decision = await Promise.race([op, new Promise<null>((res) => { timer = setTimeout(() => res(null), budgetMs); })]);
+            const raced = await Promise.race([op.then((d) => ({ timedOut: false as const, d })), new Promise<{ timedOut: true }>((res) => { timer = setTimeout(() => res({ timedOut: true }), budgetMs); })]);
             if (timer) clearTimeout(timer);
+            if (raced.timedOut) {
+              sanitizeInFlight = op.then(() => {}, () => {}).finally(() => { sanitizeInFlight = null; }); // hold single-flight until the bg op settles
+              ackInbox(file); continue; // over decision-budget ⇒ no decision ⇒ member hook times out to the user (fail-to-user)
+            }
+            if (raced.d !== null && Date.now() - started <= budgetMs) decision = raced.d; // commit ONLY if the whole op finished within budget
           }
           if (decision) {
             const { state, result } = commitTask(st, [{ put: "permissionDecision", permissionDecision: decision }]);

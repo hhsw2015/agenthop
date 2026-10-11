@@ -13,10 +13,11 @@
  *     symlink component (never follow), then an inode-recheck (lstat == handle dev+ino) to catch a swap during walk/open,
  *   - read up to MAX_BYTES from that SAME handle (truncated marker if more).
  * Residual (coordinator-ruled NON-DIFFERENTIAL, the same-uid active-race class): the macOS lstat-walk is not openat-atomic — a
- * per-component race AND an inode reuse must BOTH hit in a sub-ms window; and a same-uid member can read the target directly
+ * member that ACTIVELY races directory-component swaps across the walk→recheck→read can still steer the read (NO inode reuse
+ * needed; the external file's inode is unchanged). Accepted scope exclusion — a same-uid member can read the target directly
  * anyway, so this bypasses only the user's look, never privilege/reachability (see the brief's residual section).
  */
-import { mkdirSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, promises as fsp, constants as FS } from "node:fs";
+import { readdirSync, statSync, unlinkSync, promises as fsp, constants as FS } from "node:fs";
 import { join, isAbsolute, sep, relative } from "node:path";
 import { randomBytes } from "node:crypto";
 import { SECRET_RE } from "./approval-delegation.js";
@@ -51,9 +52,11 @@ async function fdWithinCwd(handle: fsp.FileHandle, abs: string, realCwd: string)
     return { ok: true };
   } catch { /* no /proc (macOS/BSD) ⇒ incremental lstat-walk below */ }
   const rel = relative(realCwd, abs);
-  if (rel.startsWith("..") || isAbsolute(rel)) return { ok: false, reason: "escape-cwd" }; // lexically outside cwd
+  const parts = rel.split(sep).filter((s) => s.length > 0);
+  // SR-R2-P3-1: escape = an actual `..` PATH COMPONENT (or absolute), NOT a name that merely starts with ".." (e.g. a real `..note`).
+  if (isAbsolute(rel) || parts.some((p) => p === "..")) return { ok: false, reason: "escape-cwd" };
   let cur = realCwd;
-  for (const part of rel.split(sep).filter((s) => s.length > 0)) {
+  for (const part of parts) {
     cur = join(cur, part);
     let ls: Awaited<ReturnType<typeof fsp.lstat>>;
     try { ls = await fsp.lstat(cur); } catch { return { ok: false, reason: "walk-lstat-failed" }; }
@@ -104,17 +107,17 @@ export async function resolveAndRead(spec: SanitizeSpec, cwd: string): Promise<R
 }
 
 /** Write the sanitized bytes (+ the truncation marker if truncated — NEVER silent) to a 0600 file in the coordinator-owned result
- *  dir (mkdir 0700). Atomic (tmp + rename). Returns the absolute result path the member's rewrite will `cat`. Sync + fast (bounded
- *  by the cap); the dispatcher wraps read+write+commit in ONE budget (SR-P2-1). */
-export function writeSanitizedResult(home: string, bytes: Buffer, truncated: boolean, rand: () => string = () => randomBytes(12).toString("hex")): string {
+ *  dir (mkdir 0700). Atomic (tmp + rename). Returns the absolute result path the member's rewrite will `cat`. ASYNC (SR-P2-1: a
+ *  sync write would block the event loop so the budget timer could not fire); the dispatcher wraps read+write+build in ONE budget. */
+export async function writeSanitizedResult(home: string, bytes: Buffer, truncated: boolean, rand: () => string = () => randomBytes(12).toString("hex")): Promise<string> {
   const dir = sanitizedReadDir(home);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
   const name = `${rand()}.out`;
   const finalPath = join(dir, name);
   const tmp = `${finalPath}.tmp-${randomBytes(4).toString("hex")}`;
   const payload = truncated ? Buffer.concat([bytes, Buffer.from(SANITIZED_READ_TRUNCATION_MARKER)]) : bytes;
-  writeFileSync(tmp, payload, { mode: 0o600 });
-  renameSync(tmp, finalPath);
+  await fsp.writeFile(tmp, payload, { mode: 0o600 }); // SR-P2-1: ASYNC — a sync write would block the event loop so the budget timer can't even fire
+  await fsp.rename(tmp, finalPath);
   return finalPath;
 }
 

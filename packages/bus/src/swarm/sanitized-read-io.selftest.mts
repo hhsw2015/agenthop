@@ -94,12 +94,12 @@ try {
   // ── writeSanitizedResult ──────────────────────────────────────────────────────────────────────────────────
   const home = join(root, "home");
   {
-    const p = writeSanitizedResult(home, Buffer.from("RESULT-BODY"), false);
+    const p = await writeSanitizedResult(home, Buffer.from("RESULT-BODY"), false);
     t("writeSanitizedResult: under result dir", p.startsWith(sanitizedReadDir(home) + "/"));
     t("writeSanitizedResult: content + 0600", readFileSync(p, "utf8") === "RESULT-BODY" && (statSync(p).mode & 0o777) === 0o600);
   }
   {
-    const p = writeSanitizedResult(home, Buffer.from("BODY"), true);
+    const p = await writeSanitizedResult(home, Buffer.from("BODY"), true);
     t("writeSanitizedResult: truncated appends the explicit marker", /BODY[\s\S]*truncated at 1MiB/.test(readFileSync(p, "utf8")));
   }
 
