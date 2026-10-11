@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import { isResolutionLevel, type ResolutionLevel } from "./swarm/attribution.js";
+import { validateExpectedOutput, type ExpectedOutput } from "./swarm/output-contract.js";
 
 /**
  * The task log: the durable, on-disk envelope for "one unit of work handed to one or more sessions".
@@ -68,6 +69,10 @@ export type TaskRecord = {
    *  authorization stays with the C8 cap). Absent on legacy records (FC-7 tolerated) and whenever the seam is off. */
   accountableHuman?: string;
   resolutionLevel?: ResolutionLevel;
+  /** output-contract (dormant, SWARM_OUTPUT_CONTRACT): the physical evidence this dispatch must leave for its
+   *  delivery claim to verify (file/branch/report/inbox-delivery). A VERIFICATION tag — the delivery-receipt seam
+   *  probes it (met/unmet/unknown). Absent on legacy records (FC-7 tolerated) and whenever the seam is off. */
+  expectedOutput?: ExpectedOutput;
 };
 
 /** States that mean "nothing more will change". */
@@ -172,7 +177,7 @@ export function writeTask(home: string, rec: TaskRecord): boolean {
 /** Create a new task and persist it. Returns the record, or undefined if it could not be written. */
 export function createTask(
   home: string,
-  input: { dispatchedBy: string; assignees: string[]; goal?: string; role?: string; taskId?: string; createdAt?: number; accountableHuman?: string; resolutionLevel?: ResolutionLevel },
+  input: { dispatchedBy: string; assignees: string[]; goal?: string; role?: string; taskId?: string; createdAt?: number; accountableHuman?: string; resolutionLevel?: ResolutionLevel; expectedOutput?: ExpectedOutput },
 ): TaskRecord | undefined {
   const now = input.createdAt ?? Date.now();
   const rec: TaskRecord = {
@@ -188,6 +193,8 @@ export function createTask(
     // attribution-chain seam (dormant): carried through only as a COMPLETE pair (both set), and only when a
     // caller computed it (SWARM_ATTRIBUTION on). A lone half is never stored (atomic with the read-side guard).
     ...(input.accountableHuman && input.resolutionLevel ? { accountableHuman: input.accountableHuman, resolutionLevel: input.resolutionLevel } : {}),
+    // output-contract seam (dormant): only a well-formed ExpectedOutput is stored (validated, extra fields stripped).
+    ...((input.expectedOutput && validateExpectedOutput(input.expectedOutput)) ? { expectedOutput: validateExpectedOutput(input.expectedOutput)! } : {}),
   };
   return writeTask(home, rec) ? rec : undefined;
 }
@@ -239,6 +246,13 @@ export function parseTask(raw: string): TaskRecord | undefined {
     if (!(typeof r.accountableHuman === "string" && r.accountableHuman.trim().length > 0 && isResolutionLevel(r.resolutionLevel))) {
       delete r.accountableHuman;
       delete r.resolutionLevel;
+    }
+    // output-contract (same read-side discipline): the optional expectedOutput is a VERIFICATION tag — validate
+    // its shape on read; a malformed one (bad kind, non-string ref/check, non-object) ⇒ DROP it (degrade), the
+    // base task stays readable. A valid one is replaced by its sanitized copy (extra fields stripped).
+    if (r.expectedOutput !== undefined) {
+      const v = validateExpectedOutput(r.expectedOutput);
+      if (v) r.expectedOutput = v; else delete r.expectedOutput;
     }
     return r;
   } catch {
