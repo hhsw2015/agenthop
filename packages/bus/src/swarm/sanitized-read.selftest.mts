@@ -66,13 +66,14 @@ t("git log HEAD~3 ⇒ rev operand (tilde/caret ok)", (() => { const s = g("git l
 t("git show --stat HEAD ⇒ spec", (() => { const s = g("git show --stat HEAD"); return s !== null && s.readKind === "git" && s.subcmd === "show" && s.operands[0] === "HEAD"; })());
 t("git diff --stat HEAD~1 HEAD ⇒ 2 revs", (() => { const s = g("git diff --stat HEAD~1 HEAD"); return s !== null && s.readKind === "git" && s.operands.length === 2; })());
 t("git diff --name-only a..b ⇒ range operand", (() => { const s = g("git diff --name-only a..b"); return s !== null && s.readKind === "git" && s.operands[0] === "a..b"; })());
-t("git branch -a ⇒ spec", (() => { const s = g("git branch -a"); return s !== null && s.readKind === "git" && s.subcmd === "branch"; })());
-t("git branch --list ⇒ spec (non-verbose list, faithful)", (() => { const s = g("git branch --list"); return s !== null && s.readKind === "git" && s.subcmd === "branch"; })());
 
 for (const c of [
   "git",                       // no subcommand
-  "git status -s",             // status = working-tree (Phase 3), not in the table
-  "git remote -v",             // remote DEFERRED (coordinator 2026-10-11)
+  "git status -s",             // status DEFERRED — member-repo live-state (family ruling)
+  "git remote -v",             // remote DEFERRED — member-repo live-state (family ruling)
+  "git branch",                // branch DEFERRED — member-repo live-state (current */upstream/worktree/symref) outside the clone model (family ruling 2026-10-11)
+  "git branch -a",             // branch DEFERRED (family ruling) — even the plain ref listing escalates
+  "git branch --list",         // branch DEFERRED (family ruling)
   "git log -p",                // content (patch)
   "git log --patch",           // content
   "git log -U3",               // content (unified)
@@ -87,12 +88,6 @@ for (const c of [
   "git diff --stat ../etc",    // operand not rev-ish (leading `.`/path)
   "git log --stat /etc/passwd",// absolute-path operand (not a rev)
   "git log *.c",               // glob
-  "git branch -v",             // SR2-P2-2: `-v` shows [ahead/behind] upstream state ⇒ not faithful from a clone ⇒ escalate
-  "git branch -vv",            // SR2-P2-2: upstream tracking not faithful from a clone ⇒ escalate
-  "git branch -v -v",          // SR2-P2-2: verbosity COUNTS — two -v == -vv ⇒ escalate (dropping only the `-vv` spelling is insufficient)
-  "git branch --list -v -v",   // SR2-P2-2: mixed combo still reaches verbosity 2 ⇒ escalate
-  "git branch -d x",           // -d not in table (and a branch operand) = mutation-adjacent
-  "git branch main",           // a branch operand = create/rename-adjacent
   "git show --stat $(id)",     // command substitution
   "git log --stat; rm x",      // chain
   "git log --stat | cat",      // pipe

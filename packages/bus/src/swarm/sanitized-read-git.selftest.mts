@@ -50,11 +50,6 @@ try {
     const r = await resolveAndReadGit(spec("git diff --stat HEAD..feature"), repo, HOME);
     t("git diff --stat <range> ⇒ ok + no content", r.ok === true && r.bytes.toString().includes(".env") && !r.bytes.toString().includes("SUPERSECRETVALUE"));
   }
-  // 4. git branch -a ⇒ ok + lists feature (faithful via --mirror)
-  {
-    const r = await resolveAndReadGit(spec("git branch -a"), repo, HOME);
-    t("git branch -a ⇒ ok + lists feature", r.ok === true && /feature/.test(r.bytes.toString()));
-  }
 
   // 5. ADVERSARIAL (coordinator pin): the four planted exec vectors must have fired ZERO times across probe+clone+read.
   {
@@ -93,16 +88,18 @@ try {
     const out = r.ok ? r.bytes.toString() : "";
     t("core.worktree redirect ⇒ clone binds the REAL git-dir (A, not decoy B)", r.ok === true && out.includes("A-real-history") && !out.includes("B-decoy-history"));
   }
-  // 10. SR2-P2-2: a DETACHED-HEAD source ⇒ sanitized `git branch` must show detached, NOT falsely mark a branch current
+  // 10. SR2-R2-P2-1: a DETACHED-HEAD source ⇒ HEAD is replicated, so an operand-LESS `git log` reads from the DETACHED commit (not
+  //     the branch tip the --mirror clone would default HEAD to). Detach at the FIRST commit; `log` must then show only d1, not d2.
   {
     const D = join(root, "detached"); mkdirSync(D, { recursive: true });
     git(D, "init", "-q"); git(D, "config", "user.email", "t@t"); git(D, "config", "user.name", "t");
     writeFileSync(join(D, "f1"), "1\n"); git(D, "add", "f1"); git(D, "commit", "-qm", "d1");
+    const firstSha = git(D, "rev-parse", "HEAD").trim();
     writeFileSync(join(D, "f2"), "2\n"); git(D, "add", "f2"); git(D, "commit", "-qm", "d2");
-    git(D, "checkout", "-q", "--detach", "HEAD");
-    const r = await resolveAndReadGit(spec("git branch"), D, HOME);
+    git(D, "checkout", "-q", "--detach", firstSha); // HEAD detached at d1
+    const r = await resolveAndReadGit(spec("git log --oneline"), D, HOME);
     const out = r.ok ? r.bytes.toString() : "";
-    t("detached-HEAD source ⇒ branch shows detached (no false '* <branch>')", r.ok === true && /\*\s+\(/.test(out));
+    t("detached-HEAD source ⇒ operand-less log reads the detached commit (d1, not d2)", r.ok === true && /d1/.test(out) && !/d2/.test(out));
   }
   // 11. SR2-P2-3: git output LARGER than the cap ⇒ truncated=true (was silently false). A >1 MiB commit message overflows `git log`.
   {
@@ -121,11 +118,9 @@ try {
     git(C, "init", "-q"); git(C, "config", "user.email", "t@t"); git(C, "config", "user.name", "t");
     writeFileSync(join(C, "f"), "1\n"); git(C, "add", "f"); git(C, "commit", "-qm", "c1-collide");
     try { git(C, "branch", "-M", "main"); } catch { /* already main */ }
-    git(C, "tag", "main"); // branch main + tag main now collide
-    const rb = await resolveAndReadGit(spec("git branch"), C, HOME);
-    t("branch+tag same name ⇒ current '* main' preserved (full ref, not heads/main)", rb.ok === true && /\*\s+main\b/.test(rb.bytes.toString()));
+    git(C, "tag", "main"); // branch main + tag main now collide ⇒ --short HEAD is ambiguous; the FULL ref must be used for HEAD replication
     const rl = await resolveAndReadGit(spec("git log --oneline"), C, HOME);
-    t("branch+tag same name ⇒ log works (HEAD not broken)", rl.ok === true && /c1-collide/.test(rl.bytes.toString()));
+    t("branch+tag same name ⇒ HEAD replicated via full ref ⇒ log works (not broken by heads/main)", rl.ok === true && /c1-collide/.test(rl.bytes.toString()));
   }
   // 13. SR2-R2-P2-1: a HEAD probe exit code that is NEITHER 0 nor 1 (a real error, e.g. 128) ⇒ escalate, NOT a guessed detached
   {
@@ -150,26 +145,8 @@ try {
     t("HEAD writeback failure ⇒ escalate head-writeback-failed", r.ok === false && r.reason === "head-writeback-failed");
   }
 
-  // 15. SR2-R3-P2-1(b): `branch -r` must PRESERVE the `origin/HEAD -> origin/main` arrow (the mirror drops the symref ⇒ replicate it)
-  {
-    const Up = join(root, "up2"); mkdirSync(Up, { recursive: true });
-    git(Up, "init", "-q"); git(Up, "config", "user.email", "t@t"); git(Up, "config", "user.name", "t");
-    writeFileSync(join(Up, "f"), "1\n"); git(Up, "add", "f"); git(Up, "commit", "-qm", "u1"); git(Up, "branch", "-M", "main");
-    const Clone = join(root, "clone2");
-    execFileSync("git", ["clone", "-q", Up, Clone], { stdio: ["ignore", "pipe", "pipe"] }); // a real clone ⇒ origin/HEAD symref present
-    git(Clone, "config", "user.email", "t@t"); git(Clone, "config", "user.name", "t");
-    const r = await resolveAndReadGit(spec("git branch -r"), Clone, HOME);
-    t("branch -r preserves origin/HEAD -> origin/main arrow", r.ok === true && /origin\/HEAD -> origin\/main/.test(r.bytes.toString()));
-  }
-  // 16. SR2-R3-P2-1(a): a source with a LINKED worktree ⇒ `git branch` escalates (the `+ <branch>` occupancy marker is Phase-3 state)
-  {
-    const W = join(root, "wtmain"); mkdirSync(W, { recursive: true });
-    git(W, "init", "-q"); git(W, "config", "user.email", "t@t"); git(W, "config", "user.name", "t");
-    writeFileSync(join(W, "f"), "1\n"); git(W, "add", "f"); git(W, "commit", "-qm", "w1");
-    git(W, "worktree", "add", "-q", join(root, "wt-linked"), "-b", "sidebr");
-    const r = await resolveAndReadGit(spec("git branch"), W, HOME);
-    t("linked worktree ⇒ branch escalates (worktree-occupancy)", r.ok === false && r.reason === "worktree-occupancy");
-  }
+  // (branch deferred by the family ruling — its former fidelity tests [listing, -r arrow, detached marker, worktree occupancy] are
+  //  removed; HEAD replication is still exercised above via the detached + collision `git log` tests.)
 
   // 8. scratch self-cleanup (pins ①②): after all of the above, NO throwaway clone dir is left behind
   {

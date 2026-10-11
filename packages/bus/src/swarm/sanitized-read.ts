@@ -10,11 +10,11 @@
  * / budget / 0600 result / single-quoted rewrite) — sanitized-read-io.ts keys the producer off `readKind`. `file` is DEFERRED
  * (coordinator 2026-10-11: the fd-read model can't reproduce libmagic; a hardened `/usr/bin/file` subprocess is a new exec surface).
  *
- * PHASE 2: git COMMITTED-HISTORY reads (`log`/`show`/`diff`/`branch`, NON-content) — the coordinator runs them HARDENED in a
- * THROWAWAY `--mirror` clone (env scrubbed, `-c` family, `--no-pager`, no checkout/upload-pack ⇒ no config exec) and injects the
- * output (sanitized-read-git.ts). The closed flag table is REUSED from the frozen git-recall brief. `remote` pending a ruling; git
- * working-tree forms (`status`, unstaged diff) are Phase 3. Every form still reduces to the member cat-ing the coordinator's result,
- * so the verdict seam (approval-gate) is form-agnostic.
+ * PHASE 2: git COMMITTED-HISTORY reads (`log`/`show`/`diff`, NON-content) — the coordinator runs them HARDENED in a THROWAWAY
+ * `--mirror` clone (env scrubbed, `-c` family, `--no-pager`, no checkout/upload-pack ⇒ no config exec) and injects the output
+ * (sanitized-read-git.ts). The closed flag table is REUSED from the frozen git-recall brief. `branch`/`remote`/`status` are DEFERRED
+ * by the coordinator's FAMILY ruling (member-repo LIVE-STATE is outside the clone model's domain — see GitSubcmd). Every form still
+ * reduces to the member cat-ing the coordinator's result, so the verdict seam (approval-gate) is form-agnostic.
  */
 import { SECRET_RE } from "./approval-delegation.js";
 
@@ -37,9 +37,11 @@ export const SANITIZED_READ_DIRNAME = "sanitized-read";
 /** Phase-1b path-read forms (content of a regular file: cat/head/tail/wc; `ls` a DIRECTORY's entries; `stat` metadata). */
 export type PathReadKind = "cat" | "head" | "tail" | "wc" | "ls" | "stat";
 /** Phase-2 committed-history git subcommands (NON-content; the coordinator runs these HARDENED in a THROWAWAY `--mirror` clone and
- *  injects the output — sanitized-read-git.ts). `remote` is pending a coordinator ruling (a clone's `remote -v` shows the clone's
- *  origin, not the member's real remotes); `status`/unstaged diff are Phase 3 (working-tree-dependent). */
-export type GitSubcmd = "log" | "show" | "diff" | "branch";
+ *  injects the output — sanitized-read-git.ts). ONLY committed-history CONTENT/metadata reads. `branch`/`remote`/`status` are
+ *  DEFERRED by the coordinator's family ruling (2026-10-11): a "member-repo LIVE-STATE" form (current branch, upstream, worktree
+ *  occupancy, symref aliases, remotes, working tree) is OUTSIDE the clone model's domain — a clone faithfully reproduces committed
+ *  history but NOT live repo state — so the sanitize Phase does not handle them; they escalate to the user. */
+export type GitSubcmd = "log" | "show" | "diff";
 /** A parsed sanitizable read: a path form (`<form> <oneArg>`) OR a git committed-history read (subcmd + closed flags + rev operands).
  *  The IO side keys its producer off `readKind` (path ⇒ sanitized-read-io; git ⇒ sanitized-read-git). */
 export type SanitizeSpec =
@@ -55,7 +57,6 @@ const GIT_FLAGS: Record<GitSubcmd, Set<string>> = {
   log: new Set(["--oneline", "--stat", "--graph", "--decorate", "--no-color", "--numstat", "--shortstat", "--name-only", "--name-status", "--all"]),
   show: new Set(["--stat", "--numstat", "--name-only", "--name-status"]),
   diff: new Set(["--stat", "--name-only", "--name-status", "--numstat", "--shortstat", "--summary"]),
-  branch: new Set(["-a", "--all", "-r", "--list", "-l"]), // SR2-P2-2: NO verbosity at all — `-v` (and `-v -v` == `-vv` by count) prints `[ahead/behind]`/`[origin/main]` upstream state that a throwaway clone can't reproduce ⇒ any verbose branch escalates
 };
 /** show/diff default to CONTENT (a patch); a bare `git show`/`git diff` ⇒ escalate — require ≥1 non-content stat/name flag. */
 const GIT_REQUIRE_FLAG = new Set<GitSubcmd>(["show", "diff"]);
@@ -63,7 +64,7 @@ const GIT_REQUIRE_FLAG = new Set<GitSubcmd>(["show", "diff"]);
  *  First char alnum/_/@/^ (no leading `-`/`.`/`/`/`~` ⇒ no flag/path/home); body adds `.`/`/`/`~`/`-` (branch/tag/`HEAD~3`); an
  *  optional `..`/`...` range. Bans `:` (the `rev:path` CONTENT form), `*?[]{}` (glob/brace), and all shell metacharacters. */
 const GIT_REV_RE = /^[A-Za-z0-9_@^][A-Za-z0-9_.@^~/-]*(\.\.\.?[A-Za-z0-9_@^][A-Za-z0-9_.@^~/-]*)?$/;
-function isGitSubcmd(s: string): s is GitSubcmd { return s === "log" || s === "show" || s === "diff" || s === "branch"; }
+function isGitSubcmd(s: string): s is GitSubcmd { return s === "log" || s === "show" || s === "diff"; } // branch/remote/status deferred (family ruling)
 
 /**
  * PURE: parse a Bash command into a SanitizeSpec, or null (⇒ not sanitizable ⇒ the caller escalates to the user). Applies the
@@ -115,7 +116,7 @@ function planSanitizeGit(command: string): SanitizeSpec | null {
   const tokens = c.split(/[ \t]+/).filter(t => t.length > 0);
   if (tokens.length < 2 || tokens[0] !== "git") return null;
   const subcmd = tokens[1];
-  if (!isGitSubcmd(subcmd)) return null;    // only log/show/diff/branch (status/remote/… escalate)
+  if (!isGitSubcmd(subcmd)) return null;    // only log/show/diff (branch/remote/status escalate — family ruling)
   const flags: string[] = [];
   const operands: string[] = [];
   for (const tok of tokens.slice(2)) {
@@ -129,7 +130,6 @@ function planSanitizeGit(command: string): SanitizeSpec | null {
     operands.push(tok);
   }
   if (GIT_REQUIRE_FLAG.has(subcmd) && flags.length === 0) return null; // bare show/diff = content ⇒ escalate
-  if (subcmd === "branch" && operands.length > 0) return null;         // a branch operand is create/rename/delete-adjacent ⇒ escalate
   if (operands.length > (subcmd === "diff" ? 2 : 1)) return null;      // diff ≤2 revs (or 1 range); log/show ≤1
   return { readKind: "git", subcmd, flags, operands };
 }

@@ -1,5 +1,5 @@
 /**
- * sanitized-read-git — the COORDINATOR-side HARDENED git committed-history read (Phase 2: log/show/diff/branch, NON-content). The
+ * sanitized-read-git — the COORDINATOR-side HARDENED git committed-history read (Phase 2: log/show/diff, NON-content). The
  * coordinator runs git in a THROWAWAY `--mirror` clone of the member's repo, in a SCRUBBED env, and injects the captured output;
  * the member's rewrite (`builtin command /bin/cat <result>`) reads THAT — identical to every other sanitize form. It NEVER runs the
  * member's git command and never checks out a working tree. The ONLY git touches of the member's repo are three side-effect-free,
@@ -92,10 +92,10 @@ export async function resolveAndReadGit(spec: SanitizeSpec, cwd: string, home: s
   if (gd.code !== 0) return { ok: false, reason: "not-a-git-repo" };
   const gitdir = stripTrailingNewline(gd.stdout.toString("utf8"));
   if (!gitdir) return { ok: false, reason: "no-git-dir" };
-  // SR2-R2-P2-1: read the SOURCE HEAD state so the clone's current-branch marker is faithful (a `--mirror` clone does NOT preserve a
-  // detached HEAD). Use the FULL symbolic ref (NOT `--short`, which returns an ambiguous `heads/<x>` when a tag shares the name), and
-  // distinguish by EXIT CODE: 0 = on a branch (full ref in stdout), 1 = normal detached, anything else = a probe ERROR ⇒ escalate
-  // (never guess detached from an error). Each probe/writeback code is checked; "can't confirm" ⇒ fail-to-user.
+  // SR2-R2-P2-1: read the SOURCE HEAD state so an operand-LESS `log`/`show` reads the member's actual current history (a `--mirror`
+  // clone does NOT preserve a detached HEAD — it points HEAD at a branch). Use the FULL symbolic ref (NOT `--short`, which returns an
+  // ambiguous `heads/<x>` when a tag shares the name), and distinguish by EXIT CODE: 0 = on a branch (full ref in stdout), 1 = normal
+  // detached, anything else = a probe ERROR ⇒ escalate (never guess detached from an error). Each probe/writeback code is checked.
   const symref = await run(["-C", cwd, "--no-pager", "symbolic-ref", "-q", "HEAD"], 4096);
   let headFullRef = "";  // the full refs/heads/<branch> when on a branch
   let headSha = "";      // the sha when detached
@@ -111,19 +111,11 @@ export async function resolveAndReadGit(spec: SanitizeSpec, cwd: string, home: s
     return { ok: false, reason: "head-probe-failed" };                           // code >= 2 (e.g. 128 not-a-repo) ⇒ escalate, NOT detached
   }
 
-  // SR2-R3-P2-1 (a): `git branch` prints a `+ <branch>` marker for a branch checked out in a LINKED worktree — working-tree
-  // occupancy a bare clone can't reproduce (Phase-3 territory). If the source has >1 worktree, escalate the branch read.
-  if (spec.subcmd === "branch") {
-    const wl = await run(["-C", cwd, "--no-pager", "worktree", "list", "--porcelain"], 1_000_000);
-    if (wl.code !== 0) return { ok: false, reason: "worktree-probe-failed" };
-    if (wl.stdout.toString("utf8").split("\n").filter((l) => l.startsWith("worktree ")).length > 1) return { ok: false, reason: "worktree-occupancy" };
-  }
-
   const root = gitScratchRoot(home);
   await fsp.mkdir(root, { recursive: true, mode: 0o700 });            // SR2-P2-5: async so a slow FS never blocks the sweep
   const scratch = await fsp.mkdtemp(join(root, "r-"));
   try {
-    // `--mirror` (bare, no checkout, no upload-pack for a local source) ⇒ no exec vector; copies ALL refs so `branch -a/-r` is faithful.
+    // `--mirror` (bare, no checkout, no upload-pack for a local source) ⇒ no exec vector; copies all refs + HEAD for the committed-history read.
     const cl = await run(["clone", "--mirror", "--quiet", gitdir, scratch], 4096);
     if (cl.code !== 0) return { ok: false, reason: "clone-failed" };
 
@@ -134,22 +126,6 @@ export async function resolveAndReadGit(spec: SanitizeSpec, cwd: string, home: s
       : await run(["-C", scratch, "update-ref", "--no-deref", "HEAD", headSha], 256);
     if (wb.code !== 0) return { ok: false, reason: "head-writeback-failed" };
 
-    // SR2-R3-P2-1 (b): a `--mirror` clone copies refs/remotes/*/HEAD as a PLAIN ref, losing the `origin/HEAD -> origin/main` arrow
-    // that `branch -r`/`-a` prints. For those forms, replicate the source's remote-HEAD SYMBOLIC refs into the clone (re-pointing a
-    // ref, NOT copying config). A probe or replication failure ⇒ escalate (can't faithfully return the symref relationship).
-    if (spec.flags.some((f) => f === "-a" || f === "--all" || f === "-r")) {
-      const fer = await run(["-C", cwd, "--no-pager", "for-each-ref", "--format=%(refname) %(symref)", "refs/remotes/"], 1_000_000);
-      if (fer.code !== 0) return { ok: false, reason: "symref-probe-failed" };
-      for (const line of fer.stdout.toString("utf8").split("\n")) {
-        const sp = line.indexOf(" ");
-        if (sp < 0) continue;
-        const refname = line.slice(0, sp), target = line.slice(sp + 1).trim();
-        if (!target || !refname.endsWith("/HEAD")) continue;        // only the remote-HEAD symbolic refs carry the arrow
-        const w = await run(["-C", scratch, "symbolic-ref", refname, target], 256);
-        if (w.code !== 0) return { ok: false, reason: "symref-replication-failed" };
-      }
-    }
-
     // Operand soundness: each must peel to a COMMIT in the clone (a rev, not a pathspec/path/`rev:path` blob). A range endpoint too.
     for (const operand of spec.operands) {
       for (const rev of operand.split(/\.\.\.?/).filter((r) => r.length > 0)) {
@@ -158,8 +134,9 @@ export async function resolveAndReadGit(spec: SanitizeSpec, cwd: string, home: s
       }
     }
 
-    // The hardened non-content read. Global opts BEFORE the subcommand; `--no-ext-diff` (diff-family) AFTER it for diff/log/show.
-    const noExtDiff = spec.subcmd === "diff" || spec.subcmd === "log" || spec.subcmd === "show" ? ["--no-ext-diff"] : [];
+    // The hardened non-content read. Global opts BEFORE the subcommand; `--no-ext-diff` (diff-family) AFTER it. All remaining
+    // subcommands (log/show/diff) are diff-family, so it always applies (branch/remote/status are deferred — family ruling).
+    const noExtDiff = ["--no-ext-diff"];
     const args = ["-C", scratch, "--no-pager", "-c", "diff.external=", "-c", "core.fsmonitor=", spec.subcmd, ...noExtDiff, ...spec.flags, ...spec.operands];
     const rr = await run(args, SANITIZED_READ_MAX_BYTES);
     // A non-zero exit is a FAILURE only when NOT truncated: hitting the cap SIGKILLs git (close code != 0 by design), which must

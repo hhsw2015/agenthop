@@ -50,28 +50,18 @@ The hardened invocation base: `env -i PATH=<trusted>` (scrub BASH_ENV/GIT_*/all 
 GIT_CONFIG_SYSTEM=/dev/null` + the `-c` full-family (`diff.external=` `core.fsmonitor=` …) + `--no-pager`, with NO
 `filter.<x>.clean|process` drivers defined. Split by working-tree dependence:
 
-- **Working-tree-INDEPENDENT** (log/show/branch + committed history): run in a THROWAWAY `--mirror` clone of the member's
-  repo. A clean config means a `.gitattributes` filter names an UNDEFINED driver ⇒ git runs no filter program. (Phase-2
-  implementation note: `remote` was INTENDED here but is DEFERRED — a throwaway clone's `remote -v` shows the clone's origin, not
-  the member's configured remotes, so a clone cannot answer it faithfully; see the phasing section.) The implementation is
-  `sanitized-read-git.ts` (a `--mirror` clone, not the `task-observe.ts` bare `init+fetch` pattern — `--mirror` copies ALL refs so
-  `branch -a/-r` lists faithfully). **HEAD-state correction (SR2-P2-2): `--mirror` does NOT faithfully preserve the source HEAD** —
-  it points the clone HEAD at a branch even when the source is DETACHED — so the clone source is bound to the real git-dir
-  (`rev-parse --absolute-git-dir`, NOT the `core.worktree`-redirectable `--show-toplevel`, SR2-P2-1) and the source HEAD is
-  REPLICATED into the clone via the FULL symbolic ref (SR2-R2-P2-1: `symbolic-ref HEAD`, NOT `--short`, which returns an ambiguous
-  `heads/<x>` when a tag shares the branch name), distinguishing a normal detached HEAD (exit 1) from a probe error (exit >=2 ⇒
-  escalate) and checking the writeback exit code (escalate on failure — never a wrong marker). Upstream tracking (`[ahead/behind]` /
-  `[origin/main]`) is NOT reproducible from a clone, and git COUNTS verbosity (`-v -v` == `-vv`) ⇒ ALL `branch` verbosity is dropped
-  from the allowed flags (`-v`/`-vv`/`-v -v` escalate; only non-verbose `-a`/`--all`/`-r`/`--list`/`-l` remain). **Non-verbose
-  branch is faithful ONLY with two more fixes (SR2-R3-P2-1):** (a) a `+ <branch>` worktree-occupancy marker is working-tree state a
-  bare clone can't reproduce ⇒ if the source has a LINKED worktree (`worktree list` > 1), the branch read escalates; (b) a
-  `--mirror` clone drops the `origin/HEAD -> origin/main` symref arrow that `-r`/`-a` print ⇒ the source's remote-HEAD symbolic refs
-  are REPLICATED into the clone (re-pointing a ref, not copying config; escalate on probe/replication failure). All per "faithful or escalate".
-- **Working-tree-DEPENDENT** (status, unstaged diff): needs the member's ACTUAL working tree (a throwaway clone loses uncommitted
-  state) — see **open-Q 3** (in-place-hardened-with-residual vs copy-the-tree vs defer).
-- **Content forms** (show/diff WITH content): SAFE under sanitized-read — the exec surface is closed by the hardened env, and the
-  returned content is the member's OWN repo content (it is already entitled to read it; not a new leak). This is strictly MORE
-  coverage than v1 (which deferred all git). Credential content → see ⑤ / open-Q 4.
+- **SHIPPED (committed-history reads): `log` / `show` / `diff`** — run in a THROWAWAY `--mirror` clone of the member's repo (clean
+  config ⇒ a `.gitattributes` filter names an UNDEFINED driver ⇒ no filter program runs). Implementation `sanitized-read-git.ts`: clone
+  source bound to the real git-dir (`rev-parse --absolute-git-dir`, NOT the `core.worktree`-redirectable `--show-toplevel`); the source
+  HEAD is REPLICATED into the clone (FULL `symbolic-ref HEAD`, branch/detached/error distinguished by exit code, escalate on
+  probe/writeback failure) so an operand-less `log`/`show` reads the member's actual current history; rev operands validated by a
+  clone-side `rev-parse --verify ^{commit}`.
+- **DEFERRED as a FAMILY (coordinator ruling — see ⑤): `branch` / `remote` / `status`** read member-repo LIVE STATE (current branch,
+  upstream, worktree occupancy, symref aliases, remotes, working tree) that a clone does NOT reproduce. `branch` was attempted over 5
+  review rounds; each surfaced a new live-state facet — the symptom of a tool mismatch, closed by one family ruling, not an endless
+  per-form chase. These escalate to the user.
+- **Content forms** (show/diff WITH full patch content, `-p`): deferred for now — the current closed flag table is NON-content only
+  (`--stat`/`--name-only`/...). Credential content → see ⑤ / open-Q 4.
 
 The git env/exec threat list from the (superseded) `git-recall-brief.md` is the audit INPUT for the scrub set — reuse it.
 
@@ -144,6 +134,11 @@ per-item user sign-off (differential ≈ zero). Each bullet records its specific
   member's, but it IS the coordinator). Throwaway-worktree (copy) or defer avoids it.
 - **Coordinator blast radius:** a missed scrub vector exec's in the COORDINATOR's controlled process. The env-scrub + filter-disable
   set must be audited against the git-recall env/exec threat list.
+- **FAMILY RULING (coordinator 2026-10-11) — member-repo LIVE-STATE forms are OUTSIDE the clone-model domain; the sanitize Phase
+  does not handle them.** A clone faithfully reproduces committed-history CONTENT, but NOT live repo state (current branch, upstream,
+  worktree occupancy, symref aliases, configured remotes, the working tree). So `branch` / `remote` / `status` (and any future form
+  that reads live repo state) are DEFERRED to the user as a FAMILY — one ruling, not a per-form chase (the repeated "next facet"
+  rounds on `branch` were the symptom of a tool mismatch, not a fixable gap). Sanitize git scope = committed-history reads only.
 
 ## Scope / phasing (recommendation)
 
@@ -152,21 +147,20 @@ per-item user sign-off (differential ≈ zero). Each bullet records its specific
   the fd-read model can't reproduce libmagic, and a hardened `/usr/bin/file` subprocess would open a new exec surface beyond the
   sound cat path — not worth it for one low-frequency form). Cleanest, no git complexity. Delivers the
   `sanitize` verdict + the output-injection channel + the budget/fail-to-user + the dormant flag.
-- **Phase 2 — git committed-history (SHIPPED): `log`/`show`/`diff`/`branch`, NON-content**, via a throwaway `--mirror` clone +
+- **Phase 2 — git committed-history CONTENT reads (SHIPPED): `log`/`show`/`diff`, NON-content**, via a throwaway `--mirror` clone +
   scrubbed env (`env -i`-equivalent) + `-c diff.external=`/`-c core.fsmonitor=` + `--no-pager`/`--no-ext-diff`. A `--mirror` clone
   does NO checkout and uses git's LOCAL transport (no upload-pack) ⇒ no filter/fsmonitor/packObjectsHook exec (verified against four
   planted vectors). Closed flag table REUSED from the frozen git-recall brief; rev operands validated by a clone-side
-  `rev-parse --verify ^{commit}` (no pathspec/content). `remote` DEFERRED (coordinator 2026-10-11: a throwaway clone's `remote -v`
-  shows the clone's origin, not the member's real remotes; parsing `.git/config` diverges on includes; running in the member repo
-  breaks the categorical boundary — not worth it for one low-frequency form, same family as the `file` deferral). Content forms
-  (`show`/`diff` -p) stay escalated for now. **r2/r3/r4 fixes (happycapy SR2-P2-1..5 + SR2-R2-P2-1 + SR2-R3-P2-1):** bind the clone
-  source to `--absolute-git-dir` (not the `core.worktree`-redirectable toplevel) + preserve full path chars (strip only the trailing
-  newline); replicate the source HEAD via the FULL symbolic ref with exit-code checks (branch/detached/error distinguished; escalate on
-  probe or writeback failure) + DROP ALL `branch` verbosity (`-v`/`-vv`/`-v -v` — upstream not faithful); for `branch` escalate on a
-  LINKED worktree (`+` occupancy is Phase-3 state) + replicate remote-HEAD symrefs for `-r`/`-a` (the `origin/HEAD ->` arrow); mark
-  `truncated` on ANY over-cap byte (a complete output exactly filling the cap stays unmarked); GC cleans ONLY result files (never the
-  scratch-cleanup ledger / scratch dir); ALL scratch FS (mkdir/mkdtemp/rm/ledger) is ASYNC so a slow delete never blocks the sweep.
-- **Phase 3 (open) — git working-tree-dependent** (status, unstaged diff): pending open-Q 3.
+  `rev-parse --verify ^{commit}` (no pathspec/content); the source HEAD is replicated (full symbolic ref + exit-code checks) so an
+  operand-less `log`/`show` reads the member's actual current history. Patch-content forms (`show`/`diff` -p) stay escalated.
+  **r2-r5 review fixes (happycapy SR2-P2-1..5 + SR2-R2-P2-1):** `--absolute-git-dir` clone source (not the `core.worktree`-redirectable
+  toplevel) + full-path-char preserve; HEAD via the FULL symbolic ref with branch/detached/error exit-code distinction (escalate on
+  probe/writeback failure); `truncated` on ANY over-cap byte (exact-cap-complete stays unmarked); GC cleans ONLY result files (the
+  scratch-cleanup ledger + scratch dir survive); ALL scratch FS is ASYNC (a slow delete never blocks the sweep).
+  **FAMILY DEFERRAL (coordinator ruling 2026-10-11): `branch`/`remote`/`status` are OUT of the sanitize Phase domain** — see the
+  residual section's family-ruling line (member-repo LIVE-STATE is outside the clone model). `branch` was attempted then deferred
+  after 5 rounds proved its output (current `*`, upstream, worktree `+`, symref `->` arrows) is live state a clone can't reproduce.
+- **Phase 3 (open) — git working-tree-dependent** (status, unstaged diff): subsumed by the family deferral above (member-repo live state).
 
 Each phase is a separate reviewable unit; Phase 1 is the pipeline proof (mirrors how v1 shipped scope-free first).
 
@@ -196,4 +190,4 @@ Freeze answers (coordinator 2026-10-11): ① updatedInput rewrite + lstat the re
 `CoordinatorAction` act, above); ③ git working-tree → Phase 3; ④ keep `SECRET_RE` (case-insensitive; reuse, no new regex); ⑤
 tmpfile 0600 coordinator-owned; ⑥ budget 10s / cap 1 MiB / explicit `[truncated at 1MiB]` marker / fail-to-user. The two TOCTOU
 walls (SR-P1-1 fd-binding, SR-P1-3 result-swap) → /proc-on-Linux + lstat-walk-on-macOS + strict validation + the unified same-uid
-non-differential residual class (⑤). **Phase 1 (`cat`) + Phase 1b (head/tail/wc/ls/stat; `file` deferred) + Phase 2 (git log/show/diff/branch via `--mirror` clone; `remote` deferred) shipped; Phase 3 (git working-tree) next.**
+non-differential residual class (⑤). **Phase 1 (`cat`) + Phase 1b (head/tail/wc/ls/stat; `file` deferred) + Phase 2 (git `log`/`show`/`diff` via `--mirror` clone) shipped. FINAL git scope = committed-history reads only; `branch`/`remote`/`status` DEFERRED as a family (member-repo live-state, outside the clone model — ⑤). No further sanitize phases planned.**
