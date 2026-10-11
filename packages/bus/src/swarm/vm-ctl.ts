@@ -290,7 +290,9 @@ export function buildHerdrInstallStep(url: string = HERDR_INSTALL_URL): string[]
 export function buildBootPlan(opts: { herdrInstallUrl?: string } = {}): string[] {
   return [
     ...buildHerdrInstallStep(opts.herdrInstallUrl ?? HERDR_INSTALL_URL), // install herdr (the single construction point)
-    "agenthop install", // F53 ①: the spawned shell's first bus action — (re)install the swarm status/presence hooks (idempotent)
+    "agenthop install --mcp claude", // F53 ①: the spawned shell's first bus action — register the swarm hooks (idempotent). The
+                                     // `--mcp claude` is REQUIRED: bare `agenthop install` only PRINTS; registerMcp runs only
+                                     // under options.mcp (install.ts) — and a spawned box is a claude agent.
     CAPACITY_PROBE_CMD, // capacity probe → stdout (shared with remote-capacity's parsers)
     "# ensure every agent launcher uses `exec -a claude <real-binary>` (herdr argv0 identify)",
     "# reconcile hooks/config idempotently (safe to re-run)",

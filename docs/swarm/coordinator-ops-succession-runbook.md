@@ -21,20 +21,21 @@ is always safe to run.
 
 ## ② Ops-receipt — verify the coordinator's own spawn/inject by durable evidence
 
-`verifyOpsAction(action, evidence)` → `confirmed | failed | unknown` (the API's instant return is never evidence). The dispatcher
-sub-step `runOpsReceipt` (sweep, gated on **SWARM_OPS_RECEIPT**, default OFF) reads the OPEN `opsReceipt` control-log records,
-gathers durable evidence for each target (bus visibility, a `[checkin]` / receipt in the coordinator inbox via the read-only
-`scanInboxMessages`, a board report file), and advances each record's status — committing ONLY on a status change (FC-6).
+`verifyOpsAction(action, evidence)` → `confirmed | failed | unknown` (the API's instant return is never evidence). ops-receipt is
+a **verifier, not a recorder** (coordinator ruling C): the dispatcher sub-step `runOpsReceipt` (sweep, gated on **SWARM_OPS_RECEIPT**,
+default OFF) DERIVES its verify-set from the **live box mirror** (`loadMirror()` — the dispatcher's own durable fire record), so
+there is no fire-site recording. A mirror `ControlRecord` carries no bus session id, so each box is verified as `kind:"inject"`:
+its durable NEW output is a confirmed checkpoint `sha` that has **advanced beyond the inherited `handoffSha` anchor** (the child
+placeholder is born with `sha === handoffSha`), or a fresh box's first `sha` (`handoffSha` undefined) — a `newCommit`, stronger
+than bus-presence. `runOpsReceipt` writes ONLY the verdict to the control-log `opsReceipt` kind (audit), committing on a status
+change (FC-6).
 
-- **confirmed** ⇒ discharged.
-- **unknown / failed** ⇒ ACCOUNT: `notifyCoordinator` surfaces it; the dispatcher does **not** auto-redo. Re-firing an op is only
-  safe if `swarm-launch` is idempotent for an already-allocated `launchId`, which the dispatcher cannot prove — so v1 reports and
-  leaves the redo decision to the coordinator. (Auto-redo can land later, behind proof of re-fire idempotency.)
-
-Fire-site recording (writing the `pending` receipt when an op fires at `allocateSuccessor` / `resumeSuccessor` / `startTaskIO`,
-all behind `SWARM_EXEC` / `SWARM_TASK_EXEC`) is marked as a TODO seam in `swarm-dispatch.ts` (`pendingOpsReceipt(...)`): the op
-fns do not hold the control-log state, so the minimal correct placement is the pass's commit point. Until it lands, `runOpsReceipt`
-finds no pending records and is a safe no-op.
+- **confirmed** ⇒ discharged (terminal).
+- **unknown** ⇒ ACCOUNT: `notifyCoordinator` surfaces it; the dispatcher does **not** auto-redo (re-firing is only safe if
+  `swarm-launch` is idempotent for an already-allocated `launchId`, which the dispatcher cannot prove — the redo decision is the
+  coordinator's). The duty discharges only when the notice is actually **delivered**; a logged/failed notify retries each tick. A
+  **grace window** (`SWARM_OPS_RECEIPT_GRACE_SEC`, default 600) holds a young box that simply has not checkpointed past its anchor
+  yet, so a fresh spawn never spams the coordinator.
 
 ## ③ Succession-heartbeat — a swapped member that never comes back
 
@@ -57,8 +58,12 @@ non-finite `swappedAtSec`).
 | `SWARM_SUCCESSION` (existing) | ③ swap-record WRITE on adopt |
 | `SWARM_VM_CTL` (existing) | ① `agenthop install` boot line |
 
-With all new flags OFF, run-time behavior is byte-identical to before: `runOpsReceipt`/`runSuccessionHeartbeat` return immediately,
-the swap-record write only happens when `SWARM_SUCCESSION` is on (as today), and the boot line only composes under `SWARM_VM_CTL`.
+With the two new CONSUMER flags OFF (`SWARM_OPS_RECEIPT` / `SWARM_SUCCESSION_HEARTBEAT`), `runOpsReceipt` / `runSuccessionHeartbeat`
+return immediately and the boot line only composes under `SWARM_VM_CTL` (default OFF). The ONE behavior that is NOT gated by a new
+flag is the swap-record WRITE on adopt: it rides the existing `SWARM_SUCCESSION` (default ON) as an adoption side-effect — a new
+`~/.agenthop/swarm/succession/<sid>.json` file appears on a swap. It is inert (nothing reads it until `SWARM_SUCCESSION_HEARTBEAT`
+is on) but it is a real new write, so the "byte-identical with everything off" claim holds only for the two consumer flags, not for
+this write.
 
 FC-6: statuses advance by explicit transition keyed on `opId` (never latest-wins). FC-7: the `opsReceipt` put kind and the swap
 side file are additive — a legacy control-log with no opsReceipt records and a roster with no swap records keep working unchanged.

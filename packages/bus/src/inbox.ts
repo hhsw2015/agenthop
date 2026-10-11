@@ -211,26 +211,6 @@ export function scanUnclaimedInbox(home: string, key: string): { count: number; 
   return { count: names.length, oldestMtimeMs: oldest };
 }
 
-/** READ-ONLY, NON-DESTRUCTIVE scan of an inbox's currently-unclaimed messages (F53 ②c). Unlike claimInbox it NEVER renames,
- *  unlinks, or claims — so an evidence gatherer (e.g. the dispatcher reading the COORDINATOR's inbox for `[checkin]`/receipt
- *  lines) cannot steal the box owner's mail. Reads only `.json` files (a `.claim-<x>` in flight is skipped), parses + validates
- *  each (a poison/partial file is silently skipped, never surfaced), and returns the valid messages. Order: filename-sorted
- *  (the `<ts>-<rand>.json` basename is time-ordered). A missing dir ⇒ []. */
-export function scanInboxMessages(home: string, key: string): InboxMsg[] {
-  const dir = inboxDir(home, key);
-  let names: string[];
-  try { names = readdirSync(dir).filter((n) => n.endsWith(".json")).sort(); } catch { return []; }
-  const out: InboxMsg[] = [];
-  for (const n of names) {
-    let raw: string;
-    try { raw = readFileSync(path.join(dir, n), "utf8"); } catch { continue; } // vanished / unreadable mid-scan ⇒ skip
-    let msg: InboxMsg | null;
-    try { msg = validInboxMsg(JSON.parse(raw)); } catch { msg = null; }
-    if (msg !== null) out.push(msg);
-  }
-  return out;
-}
-
 // ---------------------------------------------------------------------------------------------------------------------------------
 // Exactly-once publication of one logical EVENT (an idempotencyKey) — the DURABLE-FIRST credential protocol (the dual of FC-2's
 // publish-after-fact). The message .json is the delivery TARGET only (claim renames it, ack deletes it), so its presence can never

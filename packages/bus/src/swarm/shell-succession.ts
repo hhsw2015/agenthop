@@ -142,7 +142,7 @@ export function successionEnabled(env: NodeJS.ProcessEnv = process.env): boolean
   return flagDefaultOn(env.SWARM_SUCCESSION);
 }
 
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
@@ -372,4 +372,14 @@ export function readSuccessionSwapSec(home: string, sid: string): number | undef
     const raw = JSON.parse(readFileSync(successionSwapPath(home, sid), "utf8")) as { swappedAtSec?: unknown };
     return typeof raw.swappedAtSec === "number" && Number.isFinite(raw.swappedAtSec) ? raw.swappedAtSec : undefined;
   } catch { return undefined; }
+}
+
+/** F53-H1: the sids that currently have a swap record — the heartbeat sentinel's candidate set. It MUST come from the records,
+ *  NOT from live sessions: a dead successor that never came up has a swap record but no presence PID file, so resolving via live
+ *  sessions would wrongly drop exactly the member to alert on. (sids are stable UUIDs ⇒ the sanitized filename IS the sid.) Fail-soft ⇒ []. */
+export function listSuccessionSwaps(home: string): string[] {
+  try {
+    const dir = path.join(home, ".agenthop", "swarm", "succession");
+    return readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5));
+  } catch { return []; }
 }

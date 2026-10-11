@@ -56,9 +56,9 @@ import { subjectProgressSeq, hasFreshSubjectEvidence, renewOperationId, renewalC
 import { resolveSession, listSessions, makeFileLiveness, pidFileMtimeSec } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
-import { writeInbox, inboxDirName, scanInboxMessages } from "../packages/bus/src/inbox.js";
+import { writeInbox, inboxDirName } from "../packages/bus/src/inbox.js";
 import { verifyOpsAction, applyOpsVerdict, opsReceiptOpen, pendingOpsReceipt, successionHeartbeatDue, successionHeartbeatSec, type OpsEvidence, type SuccessionLiveness } from "../packages/bus/src/swarm/coordinator-ops-receipt.js";
-import { readSuccessionSwapSec } from "../packages/bus/src/swarm/shell-succession.js";
+import { readSuccessionSwapSec, listSuccessionSwaps } from "../packages/bus/src/swarm/shell-succession.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
 import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { coordinatorReportPlan, coordEscalateEnabled, type ReportSeverity } from "../packages/bus/src/swarm/coordinator-report.js";
@@ -1541,6 +1541,7 @@ async function main(): Promise<void> {
   // confirmed ⇒ discharged; unknown ⇒ ACCOUNT via notifyCoordinator, NEVER auto-redo (②b: re-fire idempotency is not dispatcher-
   // provable). Commit ONLY on a status change (FC-6), which also dedups the notice to once per transition. Gated on
   // SWARM_OPS_RECEIPT (default OFF); sync; fully fail-soft; spawns/acts on nothing.
+  const opsNotified = new Set<string>(); // F53-N1: opIds whose UNCONFIRMED notice is DELIVERED (or deduped) — a logged/failed notify retries each tick
   const runOpsReceipt = (): void => {
     if (!OPS_RECEIPT_ENABLED) return;
     try {
@@ -1551,19 +1552,30 @@ async function main(): Promise<void> {
         const pb = liveEntities(st)[`opsReceipt:${opId}`];
         const prev = pb?.put === "opsReceipt" ? pb.ops : undefined;
         if (prev && !opsReceiptOpen(prev)) continue; // terminal (confirmed discharged / failed accounted) ⇒ done
-        let reportFile = false;
-        try { reportFile = existsSync(path.join(BOARD_DIR, `${r.launchId}.report.json`)); } catch { /* no board file ⇒ not that signal */ }
-        const evidence: OpsEvidence = { newCommit: r.sha !== undefined, reportFile }; // the box's confirmed checkpoint / report — durable proof it took
+        // F53-O1: the box's durable NEW output is a sha ADVANCED BEYOND the inherited handoffSha anchor (the child placeholder
+        // sets sha === handoffSha at birth), OR a fresh box's first sha (handoffSha undefined). Bare report-file existence is NOT
+        // evidence here — it is ambiguous AND the `<launchId>.report.json` suffix is reused by the S19 unclaimed-task alert.
+        const evidence: OpsEvidence = { newCommit: r.sha !== undefined && r.sha !== r.handoffSha };
         const verdict = verifyOpsAction(action, evidence);
-        // GRACE: a young box that simply hasn't checkpointed yet reads "unknown" — re-check later, no record/notice (avoid
-        // accounting-spam on fresh spawns). Only "unknown" is held; a "confirmed" is recorded immediately.
+        // GRACE: a young box that hasn't advanced past its anchor yet reads "unknown" — hold (no record/notice) until the window
+        // passes (avoid accounting-spam on fresh spawns). Only "unknown" is held; a "confirmed" is recorded immediately.
         if (verdict === "unknown" && nowSec() - r.allocStart < OPS_RECEIPT_GRACE_SEC) continue;
-        if (prev && prev.status === verdict) continue; // FC-6: commit only on a status change (no revision churn / no re-notice)
-        const rec = applyOpsVerdict(pendingOpsReceipt(action, r.launchId, r.allocStart), verdict, nowSec());
-        const { state, result } = commitTask(st, [{ put: "opsReceipt", ops: rec }]);
-        if (result.ok) st = state; else { st = loadControlLog(CONTROL_LOG_DIR); continue; } // seq race ⇒ reload, retry next tick
-        if (verdict !== "confirmed") // ②b: account, never auto-redo
-          notifyCoordinator(`[ops-receipt] box ${r.launchId} UNCONFIRMED (${verdict}) by durable evidence — needs attention (no auto-redo)`, { taskRef: `ops-receipt:${opId}`, title: "op unverified" });
+        // Audit (②留痕): commit the verdict ONLY on a status change (FC-6 — no revision churn). Does NOT gate the notice below.
+        if (!prev || prev.status !== verdict) {
+          const rec = applyOpsVerdict(pendingOpsReceipt(action, r.launchId, r.allocStart), verdict, nowSec());
+          const { state, result } = commitTask(st, [{ put: "opsReceipt", ops: rec }]);
+          if (result.ok) st = state; else { st = loadControlLog(CONTROL_LOG_DIR); continue; } // seq race ⇒ reload, retry next tick
+        }
+        // F53-N1: ACCOUNT — the duty discharges only when notifyCoordinator actually DELIVERS (or dedups); a logged/failed
+        // result retries each tick (even when the audit status is unchanged), never auto-redo. A confirm clears the latch.
+        if (verdict !== "confirmed") {
+          if (!opsNotified.has(opId)) {
+            const nr = notifyCoordinator(`[ops-receipt] box ${r.launchId} UNCONFIRMED (${verdict}) by durable evidence — needs attention (no auto-redo)`, { taskRef: `ops-receipt:${opId}`, title: "op unverified" });
+            if (nr === "delivered" || nr === "deduped") opsNotified.add(opId);
+          }
+        } else {
+          opsNotified.delete(opId);
+        }
       }
     } catch (e) { log(`ops receipt failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
@@ -1576,29 +1588,23 @@ async function main(): Promise<void> {
   const runSuccessionHeartbeat = (): void => {
     if (!SUCCESSION_HEARTBEAT_ENABLED) { succHeartbeatFired.clear(); return; }
     try {
-      const sids = listSessions(HOME);
-      const coordSid = resolveSession(COORDINATOR, sids);
-      const checkins = coordSid ? scanInboxMessages(HOME, coordSid) : [];
       const thresholdSec = successionHeartbeatSec();
       const now = nowSec();
-      const roster = new Set<string>(sids);
-      try {
-        const snap = JSON.parse(readFileSync(path.join(HOME, ".agenthop", "swarm", "roster-snapshot.json"), "utf8"));
-        for (const s of resolveSnapshotMembers(snap?.members ?? [], (h) => resolveSession(h, sids))) roster.add(s);
-      } catch { /* no snapshot ⇒ presence sids only */ }
       const dueNow = new Set<string>();
-      for (const sid of roster) {
+      // F53-H1: the candidate set is the SWAP RECORDS themselves (listSuccessionSwaps) — NOT listSessions/roster-snapshot, whose
+      // resolveSession needs a live PID file and would WRONGLY DROP a dead successor that never came up (exactly the case to
+      // alert). F53-H2: proof-of-life is the durable PID-file mtime ONLY — a consumable [checkin] can be drained by the
+      // coordinator between ticks and misread as "silent" (a false alert), so no check-in evidence.
+      for (const sid of listSuccessionSwaps(HOME)) {
         const swappedAtSec = readSuccessionSwapSec(HOME, sid);
-        if (swappedAtSec === undefined) continue; // not a swapped member ⇒ never heartbeat-checked (FC-7 fail-closed)
-        const lastBusSec = pidFileMtimeSec(HOME, sid) ?? undefined; // presence pid heartbeat mtime (seconds); null ⇒ undefined (never)
-        let lastCheckinSec: number | undefined;
-        for (const m of checkins) if (m.from === sid && m.text.startsWith("[checkin]")) { const s = Math.floor(m.ts / 1000); if (lastCheckinSec === undefined || s > lastCheckinSec) lastCheckinSec = s; }
-        const live: SuccessionLiveness = { member: sid, swappedAtSec, ...(lastBusSec !== undefined ? { lastBusSec } : {}), ...(lastCheckinSec !== undefined ? { lastCheckinSec } : {}) };
+        if (swappedAtSec === undefined) continue; // record vanished mid-scan ⇒ skip
+        const lastBusSec = pidFileMtimeSec(HOME, sid) ?? undefined; // presence pid heartbeat mtime (sec); absent ⇒ no heartbeat
+        const live: SuccessionLiveness = { member: sid, swappedAtSec, ...(lastBusSec !== undefined ? { lastBusSec } : {}) };
         if (!successionHeartbeatDue(live, now, thresholdSec)) continue;
         dueNow.add(sid);
         if (succHeartbeatFired.has(sid)) continue; // already surfaced this episode
-        const r = notifyCoordinator(`[succession] swapped member ${sid} shows no proof of life (bus/checkin) since swap`, { taskRef: `succession:heartbeat:${sid}`, title: "successor silent" });
-        if (r !== "failed") succHeartbeatFired.add(sid); // transient failure ⇒ leave unfired so a later tick retries
+        const r = notifyCoordinator(`[succession] swapped member ${sid} shows no proof of life (bus heartbeat) since swap`, { taskRef: `succession:heartbeat:${sid}`, title: "successor silent" });
+        if (r === "delivered" || r === "deduped") succHeartbeatFired.add(sid); // F53-N1: only a real delivery latches the one-shot (a logged/unroutable result must retry)
       }
       for (const sid of [...succHeartbeatFired]) if (!dueNow.has(sid)) succHeartbeatFired.delete(sid); // recovered ⇒ re-arm
     } catch (e) { log(`succession heartbeat failed (isolated): ${e instanceof Error ? e.message : e}`); }
