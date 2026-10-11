@@ -8,7 +8,7 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveAndReadGit } from "./sanitized-read-git.js";
-import { planSanitize, type SanitizeSpec } from "./sanitized-read.js";
+import { planSanitize, SANITIZED_READ_MAX_BYTES, type SanitizeSpec } from "./sanitized-read.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString();
@@ -78,6 +78,41 @@ try {
     const nonrepo = join(root, "notrepo"); mkdirSync(nonrepo, { recursive: true });
     const r = await resolveAndReadGit(spec("git log --oneline"), nonrepo, HOME);
     t("cwd not a git repo ⇒ reject not-a-git-repo", r.ok === false && r.reason === "not-a-git-repo");
+  }
+
+  // 9. SR2-P2-1: core.worktree can redirect the WORKTREE to a different repo — the clone must bind to the real GIT-DIR, not that.
+  {
+    const A = join(root, "wtA"), B = join(root, "wtB-decoy");
+    mkdirSync(A, { recursive: true }); mkdirSync(B, { recursive: true });
+    git(A, "init", "-q"); git(A, "config", "user.email", "t@t"); git(A, "config", "user.name", "t");
+    writeFileSync(join(A, "fa"), "REAL_A\n"); git(A, "add", "fa"); git(A, "commit", "-qm", "A-real-history");
+    git(B, "init", "-q"); git(B, "config", "user.email", "t@t"); git(B, "config", "user.name", "t");
+    writeFileSync(join(B, "fb"), "DECOY_B\n"); git(B, "add", "fb"); git(B, "commit", "-qm", "B-decoy-history");
+    git(A, "config", "core.worktree", B); // redirect A's worktree at the decoy B
+    const r = await resolveAndReadGit(spec("git log --oneline"), A, HOME);
+    const out = r.ok ? r.bytes.toString() : "";
+    t("core.worktree redirect ⇒ clone binds the REAL git-dir (A, not decoy B)", r.ok === true && out.includes("A-real-history") && !out.includes("B-decoy-history"));
+  }
+  // 10. SR2-P2-2: a DETACHED-HEAD source ⇒ sanitized `git branch` must show detached, NOT falsely mark a branch current
+  {
+    const D = join(root, "detached"); mkdirSync(D, { recursive: true });
+    git(D, "init", "-q"); git(D, "config", "user.email", "t@t"); git(D, "config", "user.name", "t");
+    writeFileSync(join(D, "f1"), "1\n"); git(D, "add", "f1"); git(D, "commit", "-qm", "d1");
+    writeFileSync(join(D, "f2"), "2\n"); git(D, "add", "f2"); git(D, "commit", "-qm", "d2");
+    git(D, "checkout", "-q", "--detach", "HEAD");
+    const r = await resolveAndReadGit(spec("git branch"), D, HOME);
+    const out = r.ok ? r.bytes.toString() : "";
+    t("detached-HEAD source ⇒ branch shows detached (no false '* <branch>')", r.ok === true && /\*\s+\(/.test(out));
+  }
+  // 11. SR2-P2-3: git output LARGER than the cap ⇒ truncated=true (was silently false). A >1 MiB commit message overflows `git log`.
+  {
+    const Big = join(root, "bigmsg"); mkdirSync(Big, { recursive: true });
+    git(Big, "init", "-q"); git(Big, "config", "user.email", "t@t"); git(Big, "config", "user.name", "t");
+    writeFileSync(join(Big, "f"), "x\n"); git(Big, "add", "f");
+    const msgFile = join(root, "bigmsg.txt"); writeFileSync(msgFile, "L".repeat(1_600_000)); // > 1 MiB cap (via -F to dodge ARG_MAX)
+    git(Big, "commit", "-qF", msgFile);
+    const r = await resolveAndReadGit(spec("git log"), Big, HOME);
+    t("git output > cap ⇒ truncated=true (not silently false)", r.ok === true && r.truncated === true && r.bytes.length === SANITIZED_READ_MAX_BYTES);
   }
 
   // 8. scratch self-cleanup (pins ①②): after all of the above, NO throwaway clone dir is left behind

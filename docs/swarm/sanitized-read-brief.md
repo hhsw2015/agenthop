@@ -54,8 +54,12 @@ GIT_CONFIG_SYSTEM=/dev/null` + the `-c` full-family (`diff.external=` `core.fsmo
   repo. A clean config means a `.gitattributes` filter names an UNDEFINED driver ⇒ git runs no filter program. (Phase-2
   implementation note: `remote` was INTENDED here but is DEFERRED — a throwaway clone's `remote -v` shows the clone's origin, not
   the member's configured remotes, so a clone cannot answer it faithfully; see the phasing section.) The implementation is
-  `sanitized-read-git.ts` (a `--mirror` clone, not the `task-observe.ts` bare `init+fetch` pattern — `--mirror` preserves HEAD + all
-  refs so `branch -a/-r` is faithful).
+  `sanitized-read-git.ts` (a `--mirror` clone, not the `task-observe.ts` bare `init+fetch` pattern — `--mirror` copies ALL refs so
+  `branch -a/-r` lists faithfully). **HEAD-state correction (SR2-P2-2): `--mirror` does NOT faithfully preserve the source HEAD** —
+  it points the clone HEAD at a branch even when the source is DETACHED — so the clone source is bound to the real git-dir
+  (`rev-parse --absolute-git-dir`, NOT the `core.worktree`-redirectable `--show-toplevel`, SR2-P2-1) and the source HEAD is
+  REPLICATED into the clone (branch ⇒ `symbolic-ref`; detached ⇒ detached). Upstream tracking (`branch -vv`'s `[origin/main]`) is
+  NOT reproducible from a clone ⇒ `-vv` is DROPPED from the allowed branch flags (escalates), per "faithful or escalate".
 - **Working-tree-DEPENDENT** (status, unstaged diff): needs the member's ACTUAL working tree (a throwaway clone loses uncommitted
   state) — see **open-Q 3** (in-place-hardened-with-residual vs copy-the-tree vs defer).
 - **Content forms** (show/diff WITH content): SAFE under sanitized-read — the exec surface is closed by the hardened env, and the
@@ -148,7 +152,11 @@ per-item user sign-off (differential ≈ zero). Each bullet records its specific
   `rev-parse --verify ^{commit}` (no pathspec/content). `remote` DEFERRED (coordinator 2026-10-11: a throwaway clone's `remote -v`
   shows the clone's origin, not the member's real remotes; parsing `.git/config` diverges on includes; running in the member repo
   breaks the categorical boundary — not worth it for one low-frequency form, same family as the `file` deferral). Content forms
-  (`show`/`diff` -p) stay escalated for now.
+  (`show`/`diff` -p) stay escalated for now. **r2 fixes (happycapy SR2-P2-1..5):** bind the clone source to `--absolute-git-dir`
+  (not the `core.worktree`-redirectable toplevel) + preserve full path chars (strip only the trailing newline); replicate the
+  source HEAD into the clone + DROP `branch -vv` (upstream not faithful from a clone); mark `truncated` on ANY over-cap byte (a
+  complete output exactly filling the cap stays unmarked); GC cleans ONLY result files (never the scratch-cleanup ledger / scratch
+  dir); ALL scratch FS (mkdir/mkdtemp/rm/ledger) is ASYNC so a slow delete never blocks the dispatcher sweep.
 - **Phase 3 (open) — git working-tree-dependent** (status, unstaged diff): pending open-Q 3.
 
 Each phase is a separate reviewable unit; Phase 1 is the pipeline proof (mirrors how v1 shipped scope-free first).

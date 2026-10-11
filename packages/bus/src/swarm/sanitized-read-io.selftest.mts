@@ -218,13 +218,29 @@ try {
   // ── gcSanitizedResults ────────────────────────────────────────────────────────────────────────────────────
   {
     const dir = sanitizedReadDir(home);
-    const old = join(dir, "stale.out");
+    const old = join(dir, "deadbeefcafe.out"); // a real result file is a hex name (randomBytes(12).toString("hex"))
     writeFileSync(old, "x");
     const past = Date.now() / 1000 - 10_000;
     utimesSync(old, past, past);
     gcSanitizedResults(home, 300);
     let gone = false; try { statSync(old); } catch { gone = true; }
     t("gc: removes a stale result file", gone);
+  }
+  // SR2-P2-4: GC must NEVER delete the git scratch-cleanup ledger or the git-scratch dir — only result files. Both live under the
+  // sanitized-read dir; an unresolved cleanup-failure record has to survive GC (else the coordinator silently loses it).
+  {
+    const dir = sanitizedReadDir(home);
+    const ledger = join(dir, "scratch-cleanup-errors.jsonl");
+    const scratchDir = join(dir, "git-scratch");
+    mkdirSync(scratchDir, { recursive: true });
+    const leftover = join(scratchDir, "r-abc123");
+    mkdirSync(leftover, { recursive: true });
+    writeFileSync(ledger, '{"ts":1,"scratch":"x","error":"cleanup failed"}\n');
+    const past = Date.now() / 1000 - 10_000;
+    utimesSync(ledger, past, past); utimesSync(scratchDir, past, past); // make them "old" — GC must STILL keep them
+    gcSanitizedResults(home, 300);
+    t("gc: PRESERVES the scratch-cleanup ledger (not a result file)", statSync(ledger).isFile());
+    t("gc: PRESERVES a leftover git-scratch dir (not a result file)", statSync(leftover).isDirectory());
   }
   t("gc: no dir ⇒ no throw", (() => { gcSanitizedResults(join(root, "nohome"), 300); return true; })());
 

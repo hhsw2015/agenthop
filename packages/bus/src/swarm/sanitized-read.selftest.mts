@@ -67,6 +67,7 @@ t("git show --stat HEAD ⇒ spec", (() => { const s = g("git show --stat HEAD");
 t("git diff --stat HEAD~1 HEAD ⇒ 2 revs", (() => { const s = g("git diff --stat HEAD~1 HEAD"); return s !== null && s.readKind === "git" && s.operands.length === 2; })());
 t("git diff --name-only a..b ⇒ range operand", (() => { const s = g("git diff --name-only a..b"); return s !== null && s.readKind === "git" && s.operands[0] === "a..b"; })());
 t("git branch -a ⇒ spec", (() => { const s = g("git branch -a"); return s !== null && s.readKind === "git" && s.subcmd === "branch"; })());
+t("git branch -v ⇒ spec (tip+subject, faithful)", (() => { const s = g("git branch -v"); return s !== null && s.readKind === "git" && s.subcmd === "branch"; })());
 
 for (const c of [
   "git",                       // no subcommand
@@ -86,6 +87,7 @@ for (const c of [
   "git diff --stat ../etc",    // operand not rev-ish (leading `.`/path)
   "git log --stat /etc/passwd",// absolute-path operand (not a rev)
   "git log *.c",               // glob
+  "git branch -vv",            // SR2-P2-2: upstream tracking not faithful from a clone ⇒ escalate
   "git branch -d x",           // -d not in table (and a branch operand) = mutation-adjacent
   "git branch main",           // a branch operand = create/rename-adjacent
   "git show --stat $(id)",     // command substitution

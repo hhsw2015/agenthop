@@ -275,12 +275,18 @@ export async function writeSanitizedResult(home: string, bytes: Buffer, truncate
   return finalPath;
 }
 
-/** Best-effort GC: unlink result files older than `maxAgeSec` (one-shot — read once by the member, then stale). Never throws. */
+/** A result file written by writeSanitizedResult: `<hex>.out` (or a leftover atomic-write temp `<hex>.out.tmp-<hex>`). */
+const RESULT_FILE_RE = /^[0-9a-f]+\.out(\.tmp-[0-9a-f]+)?$/;
+
+/** Best-effort GC: unlink RESULT FILES older than `maxAgeSec` (one-shot — read once by the member, then stale). SR2-P2-4: it
+ *  deletes ONLY names matching the result-file pattern, so it NEVER removes the git scratch-cleanup-errors ledger or the
+ *  `git-scratch/` dir (both live under this dir) — an unresolved cleanup-failure record must survive GC. Never throws. */
 export function gcSanitizedResults(home: string, maxAgeSec: number, nowMs: number = Date.now()): void {
   const dir = sanitizedReadDir(home);
   let names: string[];
   try { names = readdirSync(dir); } catch { return; } // no dir yet ⇒ nothing to GC
   for (const n of names) {
+    if (!RESULT_FILE_RE.test(n)) continue; // ONLY result files — leave the ledger, the git-scratch dir, and anything else alone
     const p = join(dir, n);
     try { if (nowMs - statSync(p).mtimeMs > maxAgeSec * 1000) unlinkSync(p); } catch { /* vanished / unreadable ⇒ skip */ }
   }
