@@ -150,6 +150,27 @@ try {
     t("HEAD writeback failure ⇒ escalate head-writeback-failed", r.ok === false && r.reason === "head-writeback-failed");
   }
 
+  // 15. SR2-R3-P2-1(b): `branch -r` must PRESERVE the `origin/HEAD -> origin/main` arrow (the mirror drops the symref ⇒ replicate it)
+  {
+    const Up = join(root, "up2"); mkdirSync(Up, { recursive: true });
+    git(Up, "init", "-q"); git(Up, "config", "user.email", "t@t"); git(Up, "config", "user.name", "t");
+    writeFileSync(join(Up, "f"), "1\n"); git(Up, "add", "f"); git(Up, "commit", "-qm", "u1"); git(Up, "branch", "-M", "main");
+    const Clone = join(root, "clone2");
+    execFileSync("git", ["clone", "-q", Up, Clone], { stdio: ["ignore", "pipe", "pipe"] }); // a real clone ⇒ origin/HEAD symref present
+    git(Clone, "config", "user.email", "t@t"); git(Clone, "config", "user.name", "t");
+    const r = await resolveAndReadGit(spec("git branch -r"), Clone, HOME);
+    t("branch -r preserves origin/HEAD -> origin/main arrow", r.ok === true && /origin\/HEAD -> origin\/main/.test(r.bytes.toString()));
+  }
+  // 16. SR2-R3-P2-1(a): a source with a LINKED worktree ⇒ `git branch` escalates (the `+ <branch>` occupancy marker is Phase-3 state)
+  {
+    const W = join(root, "wtmain"); mkdirSync(W, { recursive: true });
+    git(W, "init", "-q"); git(W, "config", "user.email", "t@t"); git(W, "config", "user.name", "t");
+    writeFileSync(join(W, "f"), "1\n"); git(W, "add", "f"); git(W, "commit", "-qm", "w1");
+    git(W, "worktree", "add", "-q", join(root, "wt-linked"), "-b", "sidebr");
+    const r = await resolveAndReadGit(spec("git branch"), W, HOME);
+    t("linked worktree ⇒ branch escalates (worktree-occupancy)", r.ok === false && r.reason === "worktree-occupancy");
+  }
+
   // 8. scratch self-cleanup (pins ①②): after all of the above, NO throwaway clone dir is left behind
   {
     let leftover: string[] = [];

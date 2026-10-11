@@ -111,6 +111,14 @@ export async function resolveAndReadGit(spec: SanitizeSpec, cwd: string, home: s
     return { ok: false, reason: "head-probe-failed" };                           // code >= 2 (e.g. 128 not-a-repo) ⇒ escalate, NOT detached
   }
 
+  // SR2-R3-P2-1 (a): `git branch` prints a `+ <branch>` marker for a branch checked out in a LINKED worktree — working-tree
+  // occupancy a bare clone can't reproduce (Phase-3 territory). If the source has >1 worktree, escalate the branch read.
+  if (spec.subcmd === "branch") {
+    const wl = await run(["-C", cwd, "--no-pager", "worktree", "list", "--porcelain"], 1_000_000);
+    if (wl.code !== 0) return { ok: false, reason: "worktree-probe-failed" };
+    if (wl.stdout.toString("utf8").split("\n").filter((l) => l.startsWith("worktree ")).length > 1) return { ok: false, reason: "worktree-occupancy" };
+  }
+
   const root = gitScratchRoot(home);
   await fsp.mkdir(root, { recursive: true, mode: 0o700 });            // SR2-P2-5: async so a slow FS never blocks the sweep
   const scratch = await fsp.mkdtemp(join(root, "r-"));
@@ -125,6 +133,22 @@ export async function resolveAndReadGit(spec: SanitizeSpec, cwd: string, home: s
       ? await run(["-C", scratch, "symbolic-ref", "HEAD", headFullRef], 256)     // headFullRef = "refs/heads/..." ⇒ not a flag
       : await run(["-C", scratch, "update-ref", "--no-deref", "HEAD", headSha], 256);
     if (wb.code !== 0) return { ok: false, reason: "head-writeback-failed" };
+
+    // SR2-R3-P2-1 (b): a `--mirror` clone copies refs/remotes/*/HEAD as a PLAIN ref, losing the `origin/HEAD -> origin/main` arrow
+    // that `branch -r`/`-a` prints. For those forms, replicate the source's remote-HEAD SYMBOLIC refs into the clone (re-pointing a
+    // ref, NOT copying config). A probe or replication failure ⇒ escalate (can't faithfully return the symref relationship).
+    if (spec.flags.some((f) => f === "-a" || f === "--all" || f === "-r")) {
+      const fer = await run(["-C", cwd, "--no-pager", "for-each-ref", "--format=%(refname) %(symref)", "refs/remotes/"], 1_000_000);
+      if (fer.code !== 0) return { ok: false, reason: "symref-probe-failed" };
+      for (const line of fer.stdout.toString("utf8").split("\n")) {
+        const sp = line.indexOf(" ");
+        if (sp < 0) continue;
+        const refname = line.slice(0, sp), target = line.slice(sp + 1).trim();
+        if (!target || !refname.endsWith("/HEAD")) continue;        // only the remote-HEAD symbolic refs carry the arrow
+        const w = await run(["-C", scratch, "symbolic-ref", refname, target], 256);
+        if (w.code !== 0) return { ok: false, reason: "symref-replication-failed" };
+      }
+    }
 
     // Operand soundness: each must peel to a COMMIT in the clone (a rev, not a pathspec/path/`rev:path` blob). A range endpoint too.
     for (const operand of spec.operands) {

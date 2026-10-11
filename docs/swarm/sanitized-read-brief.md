@@ -62,7 +62,11 @@ GIT_CONFIG_SYSTEM=/dev/null` + the `-c` full-family (`diff.external=` `core.fsmo
   `heads/<x>` when a tag shares the branch name), distinguishing a normal detached HEAD (exit 1) from a probe error (exit >=2 ⇒
   escalate) and checking the writeback exit code (escalate on failure — never a wrong marker). Upstream tracking (`[ahead/behind]` /
   `[origin/main]`) is NOT reproducible from a clone, and git COUNTS verbosity (`-v -v` == `-vv`) ⇒ ALL `branch` verbosity is dropped
-  from the allowed flags (`-v`/`-vv`/`-v -v` escalate; only non-verbose `-a`/`--all`/`-r`/`--list`/`-l` are faithful), per "faithful or escalate".
+  from the allowed flags (`-v`/`-vv`/`-v -v` escalate; only non-verbose `-a`/`--all`/`-r`/`--list`/`-l` remain). **Non-verbose
+  branch is faithful ONLY with two more fixes (SR2-R3-P2-1):** (a) a `+ <branch>` worktree-occupancy marker is working-tree state a
+  bare clone can't reproduce ⇒ if the source has a LINKED worktree (`worktree list` > 1), the branch read escalates; (b) a
+  `--mirror` clone drops the `origin/HEAD -> origin/main` symref arrow that `-r`/`-a` print ⇒ the source's remote-HEAD symbolic refs
+  are REPLICATED into the clone (re-pointing a ref, not copying config; escalate on probe/replication failure). All per "faithful or escalate".
 - **Working-tree-DEPENDENT** (status, unstaged diff): needs the member's ACTUAL working tree (a throwaway clone loses uncommitted
   state) — see **open-Q 3** (in-place-hardened-with-residual vs copy-the-tree vs defer).
 - **Content forms** (show/diff WITH content): SAFE under sanitized-read — the exec surface is closed by the hardened env, and the
@@ -155,12 +159,13 @@ per-item user sign-off (differential ≈ zero). Each bullet records its specific
   `rev-parse --verify ^{commit}` (no pathspec/content). `remote` DEFERRED (coordinator 2026-10-11: a throwaway clone's `remote -v`
   shows the clone's origin, not the member's real remotes; parsing `.git/config` diverges on includes; running in the member repo
   breaks the categorical boundary — not worth it for one low-frequency form, same family as the `file` deferral). Content forms
-  (`show`/`diff` -p) stay escalated for now. **r2/r3 fixes (happycapy SR2-P2-1..5 + SR2-R2-P2-1):** bind the clone source to
-  `--absolute-git-dir` (not the `core.worktree`-redirectable toplevel) + preserve full path chars (strip only the trailing newline);
-  replicate the source HEAD via the FULL symbolic ref with exit-code checks (branch/detached/error distinguished; escalate on probe or
-  writeback failure) + DROP ALL `branch` verbosity (`-v`/`-vv`/`-v -v` — upstream not faithful from a clone); mark `truncated` on ANY over-cap byte (a
-  complete output exactly filling the cap stays unmarked); GC cleans ONLY result files (never the scratch-cleanup ledger / scratch
-  dir); ALL scratch FS (mkdir/mkdtemp/rm/ledger) is ASYNC so a slow delete never blocks the dispatcher sweep.
+  (`show`/`diff` -p) stay escalated for now. **r2/r3/r4 fixes (happycapy SR2-P2-1..5 + SR2-R2-P2-1 + SR2-R3-P2-1):** bind the clone
+  source to `--absolute-git-dir` (not the `core.worktree`-redirectable toplevel) + preserve full path chars (strip only the trailing
+  newline); replicate the source HEAD via the FULL symbolic ref with exit-code checks (branch/detached/error distinguished; escalate on
+  probe or writeback failure) + DROP ALL `branch` verbosity (`-v`/`-vv`/`-v -v` — upstream not faithful); for `branch` escalate on a
+  LINKED worktree (`+` occupancy is Phase-3 state) + replicate remote-HEAD symrefs for `-r`/`-a` (the `origin/HEAD ->` arrow); mark
+  `truncated` on ANY over-cap byte (a complete output exactly filling the cap stays unmarked); GC cleans ONLY result files (never the
+  scratch-cleanup ledger / scratch dir); ALL scratch FS (mkdir/mkdtemp/rm/ledger) is ASYNC so a slow delete never blocks the sweep.
 - **Phase 3 (open) — git working-tree-dependent** (status, unstaged diff): pending open-Q 3.
 
 Each phase is a separate reviewable unit; Phase 1 is the pipeline proof (mirrors how v1 shipped scope-free first).
