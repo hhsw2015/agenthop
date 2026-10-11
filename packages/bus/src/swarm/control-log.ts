@@ -31,6 +31,7 @@
  */
 
 import { digestOf } from "./digest.js";
+import { isResolutionLevel, type ResolutionLevel } from "./attribution.js";
 import type { TaskPlan } from "./task-plan.js";
 import type { TaskAttempt } from "./task-state.js";
 import type { AcceptedResult } from "./task-result.js";
@@ -53,6 +54,11 @@ export type DispatchIntent = {
   physicalEvidence?: "provider-expiry" | "creation-bound" | null;
   allocOutcome: "pending" | "created" | "clean-fail" | "unknown";
   status: "pending" | "confirmed" | "abandoned";
+  /** OPTIONAL accountable SOURCE tag (attribution-chain, SWARM_ATTRIBUTION): the one accountable human + the waterfall
+   *  level it resolved at, computed by the DISPATCH layer from plan.provenance when attributionEnabled() (never here —
+   *  this type is pure). TRACEABILITY ONLY — NO permission/authz/cap path may ever read intent.accountable (attribution.ts
+   *  invariant ②). Additive (FC-7): legacy intents lack it; the read side (replayLog) drops a malformed one. */
+  accountable?: { accountableHuman: string; resolutionLevel: ResolutionLevel };
 };
 
 /** A result observed on a WORK branch by O1 (§4.2), before validation. Carries bindingId + workCommit so V3's binding
@@ -316,13 +322,35 @@ export function commit(state: LogState, expectedSeq: number, changes: Change[]):
   return { result: { ok: true, newSeq: state.seq + 1, replay: false }, state: applyChanges(state, changes) };
 }
 
+/** Read-side FC-7 tolerance for the optional `accountable` SOURCE tag on a DispatchIntent (attribution-chain wiring). Keep
+ *  the pair ONLY when accountableHuman is a non-empty string AND resolutionLevel is a canonical level; otherwise return
+ *  undefined so the field is DROPPED — never a reason to reject the whole intent. A SOURCE tag only: no authz path reads it. */
+export function tolerateAccountable(v: unknown): { accountableHuman: string; resolutionLevel: ResolutionLevel } | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const o = v as Record<string, unknown>;
+  if (typeof o.accountableHuman !== "string" || o.accountableHuman.trim().length === 0) return undefined;
+  if (!isResolutionLevel(o.resolutionLevel)) return undefined;
+  return { accountableHuman: o.accountableHuman, resolutionLevel: o.resolutionLevel }; // keep ONLY the two known fields (strip extras)
+}
+
+/** Apply the read-side accountable tolerance to one change on the read path (only a {put:"intent"} body carries it). A valid
+ *  pair is normalized to just its two known fields; a malformed one is dropped; anything else is returned unchanged. FC-7. */
+function tolerantChangeOnRead(c: Change): Change {
+  if (c.put !== "intent" || c.intent.accountable === undefined) return c;
+  const kept = tolerateAccountable(c.intent.accountable);
+  const { accountable: _drop, ...rest } = c.intent;
+  return { ...c, intent: kept !== undefined ? { ...rest, accountable: kept } : rest };
+}
+
 /** Rebuild LogState by folding the ordered, already-committed log — crash recovery + projection (§4.3). The log is
- *  authoritative, so this APPLIES each batch without re-deciding; it only asserts contiguous seq to catch a gap. */
+ *  authoritative, so this APPLIES each batch without re-deciding; it only asserts contiguous seq to catch a gap. The ONE
+ *  read-side tolerance is FC-7 on the optional attribution SOURCE tag (a malformed/forged `intent.accountable` is dropped,
+ *  never a reason to fail replay). */
 export function replayLog(batches: CommittedBatch[]): LogState {
   let state = initialLogState();
   for (const b of batches) {
     if (b.seq !== state.seq + 1) throw new Error(`replayLog: seq gap, expected ${state.seq + 1} got ${b.seq}`);
-    state = applyChanges(state, b.changes);
+    state = applyChanges(state, b.changes.map(tolerantChangeOnRead));
   }
   return state;
 }

@@ -14,7 +14,8 @@ import { computeResultClosureDigest, type ValidationInput, type AcceptedResult }
 import { prepareDispatch, judgeObservation, type DispatchParams } from "./task-dispatch.js";
 import { resolveAllocOutcome, abandonIntent, confirmIntent } from "./task-intent.js";
 import type { Assignment } from "./task-assignment.js";
-import { liveEntities, type LogState, type ChangeBody, type CommitResult, type ResultObserved } from "./control-log.js";
+import { liveEntities, type LogState, type ChangeBody, type CommitResult, type ResultObserved, type DispatchIntent } from "./control-log.js";
+import { resolveAccountable, attributionEnabled } from "./attribution.js";
 
 /** The git/acceptance facts O1 reads off a candidate's WORK branch tip (everything in ValidationInput that needs IO). */
 export type GitFacts = {
@@ -188,6 +189,17 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
   }
 
   // ---- DISPATCH: ready set -> prepare -> commit intent+attempt (CAS) -> box IO -> commit outcome --------------------
+  // Attribution SOURCE tag (attribution-chain, SWARM_ATTRIBUTION — LIVE BY DEFAULT; =0 disables): classify the plan author's
+  // declared provenance ONCE per pass (plan-level + deterministic), gated HERE at the caller (buildDispatchIntent stays pure,
+  // no env read). TRACEABILITY ONLY — stamped on each dispatch's intent below, never read by any permission/authz/cap path.
+  // FAIL-SOFT: any error ⇒ accountable stays undefined and dispatch proceeds WITHOUT it (never break the sweep/dispatch).
+  let accountable: DispatchIntent["accountable"] | undefined;
+  try {
+    if (plan.provenance !== undefined && attributionEnabled()) {
+      const a = resolveAccountable(plan.provenance);
+      if (a) accountable = { accountableHuman: a.accountableHuman, resolutionLevel: a.resolutionLevel };
+    }
+  } catch { accountable = undefined; }
   const sched = buildSched(plan, state);
   const usage: JobUsage = { totalAttempts: sched.attempts.length, wallClockSec: Math.max(0, ops.nowSec() - ops.planCommittedAtSec) };
   const ready = readyTasks({ ...sched, now: ops.nowSec(), jobUsage: usage });
@@ -209,13 +221,16 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
     };
     const prep = prepareDispatch(plan, task, liveAttempts, launchId, assignmentId, params);
     if (!prep.ok) { ops.log(`dispatch ${task.nodeId}: skipped — ${prep.reason}`); continue; }
+    // Stamp the attribution SOURCE tag (computed once above, gated on attributionEnabled) onto THIS dispatch's intent, if one
+    // resolved. SOURCE tag only — no authz/permission/cap path may read intent.accountable (attribution.ts invariant ②).
+    const intent: DispatchIntent = accountable !== undefined ? { ...prep.intent, accountable } : prep.intent;
 
     // CAS-then-IO: persist the intent (pending) + the NEW attempt BEFORE the allocate IO, so a crash leaves a
     // reconcilable record, never a silent box with no intent. The retry-succession retires the OLD attempt in this SAME
     // batch (§3.1 succession atomicity, Codex P1-1): never two live attempts after a crash/unknown. The lineage's
     // retriesUsed survives a later clean-fail via prepareDispatch's durable max(retriesUsed), NOT via a lingering
     // RETRY_WAIT — so retiring the old here is safe.
-    const preBodies: ChangeBody[] = [{ put: "intent", intent: prep.intent }, { put: "attempt", attempt: prep.attempt }];
+    const preBodies: ChangeBody[] = [{ put: "intent", intent }, { put: "attempt", attempt: prep.attempt }];
     for (const retired of prep.retired) preBodies.push({ put: "attempt", attempt: retired });
     // disk-CAS consumer contract (round-3 P1): a REJECTED pre-IO commit means a concurrent loop advanced the log, so our
     // state (and the whole ready/cap computation) is stale — abandon this dispatch WITHOUT starting the box (never an
@@ -228,7 +243,7 @@ export async function taskPass(plan: TaskPlan, ops: TaskOps): Promise<void> {
     // A concurrent sweep loop (R1) may have advanced the log DURING the allocate IO — reload so the outcome commits against
     // the current head (the intent entity's revision is untouched by the sweep, so the outcome still applies cleanly).
     state = ops.loadState();
-    const resolved = resolveAllocOutcome(prep.intent, alloc, { nowSec: ops.nowSec() });
+    const resolved = resolveAllocOutcome(intent, alloc, { nowSec: ops.nowSec() });
     // created+delivered => confirm; created+!delivered => leave resolved (box occupies via creation-bound expiry, but the
     // worker never started, so do NOT confirm — observation/expiry reconciles); clean-fail => abandon intent + revoke the
     // never-run NEW attempt (the old was already retired atomically above); unknown => leave pending.

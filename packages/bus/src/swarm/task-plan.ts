@@ -18,6 +18,7 @@
 
 import { digestOf } from "./digest.js";
 import { evaluateR4, overlapsAny, type OwnerDomainPolicy, type RiskPolicy, type NodeRisk } from "./task-r4.js";
+import type { AttributionInput } from "./attribution.js";
 
 // "design" (team-collab §0b R4): an adversarial-review GATE node a planner auto-prepends for a high-stakes change —
 // kind IS task identity (in specDigest), so it is a first-class kind, not a role annotation.
@@ -123,6 +124,12 @@ export type TaskPlan = {
   /** Explicitly phased capabilities (T3 P2-7): e.g. ["r4-threshold"] when R4 condition 3 isn't implemented yet. An
    *  honest marker (not a silent gap); round-trips through loadPlan, in planDigest. */
   notImplemented?: string[];
+  /** OPTIONAL attribution provenance (attribution-chain, SWARM_ATTRIBUTION) — the SIGNAL SOURCE for the accountable-human
+   *  tag, declared by the PLAN AUTHOR (派单方). SOURCE-only: a TRACEABILITY candidate set, NEVER an authorization input
+   *  (attribution.ts invariant ②); the dispatch layer CLASSIFIES it via resolveAccountable when attributionEnabled(). The
+   *  FILL-END is the runbook — manual/runbook-filled, exactly like a task record's expectedOutput. Round-trips through
+   *  loadPlan (tolerated per FC-7), in planDigest. Additive (FC-7): legacy plans lack it. */
+  provenance?: AttributionInput;
   /** canonical-JSON SHA-256 of the plan (excluding planDigest). Set by loadPlan. */
   planDigest: string;
 };
@@ -293,6 +300,19 @@ function validateFrozenRefs(v: unknown): { reason: string } | { refs: FrozenRefs
   };
 }
 
+/** Read-side FC-7 tolerance for the OPTIONAL plan `provenance` (attribution SOURCE signal, runbook-filled by the plan
+ *  author). Keep ONLY the KNOWN optional string fields that are strings; drop any other / garbage key. If the value is not
+ *  an object, or carries no usable string field, DROP the whole provenance — NEVER reject the plan. SOURCE tag only:
+ *  nothing here is an authz input, and the dispatch layer classifies it only when attributionEnabled(). */
+function tolerateProvenance(v: unknown): AttributionInput | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const o = v as Record<string, unknown>;
+  const keys = ["directHuman", "delegationOriginHuman", "commentSourceHuman", "automationOwnerHuman", "fallbackHuman"] as const;
+  const out: AttributionInput = {};
+  for (const k of keys) if (typeof o[k] === "string") out[k] = o[k] as string;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /** R4 structural coverage validation (T3 P1-2; policy-free — the four-condition OR re-run needs frozenContext and so
  *  stays in translateDraft). A kind=design gate must (a) cover at least one node, (b) cover only REAL node digests — no
  *  stale/dangling coverage (catches "change M, keep old D coverage"), and (c) be a transitive ANCESTOR of every node it
@@ -386,6 +406,9 @@ export function loadPlan(raw: unknown, opts?: ManagedT3Opts): LoadResult {
   const fr = validateFrozenRefs(o.frozenRefs);
   if ("reason" in fr) return { ok: false, reason: fr.reason };
   if (o.notImplemented !== undefined && !isStringArray(o.notImplemented)) return { ok: false, reason: "notImplemented must be a string[]" };
+  // attribution SOURCE signal (SWARM_ATTRIBUTION): tolerate per FC-7 — drop a malformed/empty provenance, NEVER reject the
+  // plan. SOURCE-only; the FILL-END is the runbook (the plan author declares it, the dispatch layer classifies it).
+  const provenance = tolerateProvenance(o.provenance);
 
   const specs: TaskSpec[] = [];
   for (let i = 0; i < o.nodes.length; i++) {
@@ -420,6 +443,7 @@ export function loadPlan(raw: unknown, opts?: ManagedT3Opts): LoadResult {
     },
     ...(fr.refs !== undefined ? { frozenRefs: fr.refs } : {}),
     ...(o.notImplemented !== undefined ? { notImplemented: [...(o.notImplemented as string[])] } : {}),
+    ...(provenance !== undefined ? { provenance } : {}),
     planDigest: "",
   };
   // Digests canonicalize the whole spec (including arbitrary acceptance.args), so a non-finite number smuggled in via
