@@ -74,6 +74,7 @@ import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, classifyFailure, failureHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { roundDoctorEnabled, roundAlertN, diagnoseRounds, buildRoundDoctorNote, extractTicketRounds, DEFAULT_ROUND_DOCTOR_CONFIG } from "../packages/bus/src/swarm/round-doctor.js";
+import { executorDigestEnabled, loadExecutorDigest, formatExecutorDigest, coerceSessionRef } from "../packages/bus/src/swarm/executor-digest.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { consoleProjectionEnabled, shouldWriteConsole } from "../packages/bus/src/swarm/console-projection.js";
 import { writeConsoleProjection } from "../packages/bus/src/swarm/console-projection-store.js";
@@ -721,7 +722,7 @@ async function main(): Promise<void> {
   // kill with SWARM_<X>=0). Calls the SAME readers the features use, so the line reflects the real decision. SWARM_TG_ENTRY is the
   // deliberate exception (opt-in — the bridge needs a user-seeded token), read with its own opt-in form.
   const onoff = (b: boolean): string => (b ? "on" : "off");
-  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} CONSOLE=${onoff(consoleProjectionEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
+  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} CONSOLE=${onoff(consoleProjectionEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} EXECUTOR_DIGEST=${onoff(executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
   // flags-default-flip batch-2 (user ruling 2026-10-11): the dormant flags flipped to default-on. "(unwired)" = the flag is
   // flipped but its behavior is not yet wired (an honest no-op until a later wiring round) — the flip only sets the DEFAULT.
   log(`flags(batch-2 default-on): OPS_RECEIPT=${onoff(OPS_RECEIPT_ENABLED)} SUCCESSION_HEARTBEAT=${onoff(SUCCESSION_HEARTBEAT_ENABLED)} POISON_DLQ=${onoff(flagDefaultOn(process.env.SWARM_POISON_DLQ))} APPROVAL_DELEGATE=${onoff(flagDefaultOn(process.env.SWARM_APPROVAL_DELEGATE))} SANITIZED_READ=${onoff(flagDefaultOn(process.env.SWARM_SANITIZED_READ))} ATTRIBUTION=${onoff(flagDefaultOn(process.env.SWARM_ATTRIBUTION))} OUTPUT_CONTRACT=${onoff(flagDefaultOn(process.env.SWARM_OUTPUT_CONTRACT))} SPEND_BREAKER=${onoff(flagDefaultOn(process.env.SWARM_SPEND_BREAKER))}(unwired) CONDITIONAL_ROUTING=${onoff(flagDefaultOn(process.env.SWARM_CONDITIONAL_ROUTING))}(unwired) (opt-out default-on; kill SWARM_<X>=0; APPROVAL_DELEGATE+SANITIZED_READ change member popup behavior)`);
@@ -1548,7 +1549,20 @@ async function main(): Promise<void> {
         // D-multica ①: bucket the screen+explain into a failure class and ANNOTATE the alert text only — disposition is unchanged
         // (the S19 approval below is always built the same way). "unknown" ⇒ "" (no note), the safe direction.
         const failHint = failureHintNote(classifyFailure(`${ev.explain ?? ""}\n${screen}`));
-        const summary = [ev.explain ? `定性:${ev.explain}` : "", cfHint, failHint, screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
+        // mirror-15 ②: a STRUCTURED executor digest from the member's transcript (last activity / tool calls / utterance),
+        // appended to the alert text only. The raw 读屏 above is untouched (content-filter detection). fail-soft + gated; a
+        // Codex member (no Claude transcript) ⇒ an honest "unavailable" note. Never changes disposition (R16).
+        // ED-1: resolve the herdr member name → native session id (the transcript filename) before locating the file; an
+        // UNRESOLVABLE identity is reported distinctly from "no transcript" (never conflated). Await — the IO is async (ED-3).
+        let digestNote = "";
+        if (executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST)) {
+          try { // ED-5: the supplement must never abort the alert — guard the untrusted ref + isolate any failure
+            const ref = coerceSessionRef(ev.member);
+            const memberSid = ref ? resolveSession(ref, listSessions(HOME)) : null;
+            digestNote = memberSid ? formatExecutorDigest(await loadExecutorDigest(memberSid)) : "执行器摘要:成员身份未解析,摘要不可用";
+          } catch { digestNote = ""; }
+        }
+        const summary = [ev.explain ? `定性:${ev.explain}` : "", cfHint, failHint, digestNote, screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
         const doc = buildApprovalDoc({
           from: SELF, fromLabel: "swarm-sentinel", nowSec: nowSec(), member: ev.member, screenSummary: summary,
           options: [{ label: "读屏后裁决", consequence: "批准/拒绝由授权方按实际界面回注(blocked 态不可用 prompt,须按 UI 选择 send-keys 等);或中止/另派" }], // N1: prompt is rejected for a blocked agent
@@ -1818,7 +1832,19 @@ async function main(): Promise<void> {
           const { rounds, history } = extractTicketRounds(progressLines, ticket, otherTickets, cfg); // header-anchored verdict rounds, bounded window
           const verdict = diagnoseRounds(rounds, history, cfg);
           if (!verdict.concern) continue;
-          notifyCoordinator(buildRoundDoctorNote(ticket, verdict), { taskRef: `round-doctor:${ticket}`, title: "round-doctor" });
+          // mirror-15 ②: append the ticket AUTHOR's executor digest (if its handle resolves to a Claude session) to the
+          // suggestion. ED-1: resolve author handle → native sid first; unresolvable ⇒ no digest line (the suggestion stands).
+          // ED-2: formatExecutorDigest is STABLE (absolute activity instant, no wall-clock), so an unchanged digest does not
+          // bypass notifyCoordinator's taskRef+text dedup. Await — the IO is async (ED-3).
+          let digestNote = "";
+          if (executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST)) {
+            try { // ED-5: a non-string / malformed ledger author must NOT throw out of the loop and drop this suggestion
+              const ref = coerceSessionRef(records.find((r) => r.ticket === ticket)?.author);
+              const authorSid = ref ? resolveSession(ref, listSessions(HOME)) : null;
+              digestNote = authorSid ? formatExecutorDigest(await loadExecutorDigest(authorSid)) : "";
+            } catch { digestNote = ""; }
+          }
+          notifyCoordinator([buildRoundDoctorNote(ticket, verdict), digestNote].filter(Boolean).join("\n"), { taskRef: `round-doctor:${ticket}`, title: "round-doctor" });
         }
       } finally {
         roundDoctorInFlight = false;

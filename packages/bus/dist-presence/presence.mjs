@@ -56656,6 +56656,13 @@ function legacyInboxKeys(proj, self) {
 
 // packages/bus/src/inbox.ts
 import { appendFileSync as appendFileSync4, existsSync as existsSync5, linkSync, lstatSync, mkdirSync as mkdirSync7, readFileSync as readFileSync6, readdirSync as readdirSync5, renameSync as renameSync3, unlinkSync as unlinkSync3, watch as watch2, writeFileSync as writeFileSync5 } from "node:fs";
+
+// packages/bus/src/swarm/flag-default.ts
+function flagDefaultOn(envVal) {
+  return !/^(0|false|no|off)$/i.test((envVal ?? "").trim());
+}
+
+// packages/bus/src/inbox.ts
 import { randomBytes as randomBytes6, createHash as createHash4 } from "node:crypto";
 import path14 from "node:path";
 
@@ -57095,7 +57102,7 @@ function alive(pid) {
   }
 }
 function poisonDlqEnabled(env2 = process.env) {
-  return /^(1|true|yes|on)$/i.test(env2.SWARM_POISON_DLQ ?? "");
+  return flagDefaultOn(env2.SWARM_POISON_DLQ);
 }
 function poisonDlqThreshold(env2 = process.env) {
   const n = Number(env2.SWARM_POISON_DLQ_THRESHOLD);
@@ -57272,11 +57279,6 @@ function drainPoisonNotices(home, deliver, cap = 64) {
 import { mkdirSync as mkdirSync8, writeFileSync as writeFileSync6, readdirSync as readdirSync6, readFileSync as readFileSync7, lstatSync as lstatSync2, renameSync as renameSync4 } from "node:fs";
 import { createHash as createHash5, randomBytes as randomBytes7 } from "node:crypto";
 import path15 from "node:path";
-
-// packages/bus/src/swarm/flag-default.ts
-function flagDefaultOn(envVal) {
-  return !/^(0|false|no|off)$/i.test((envVal ?? "").trim());
-}
 
 // packages/bus/src/swarm/herdr.ts
 import { execFile } from "node:child_process";
