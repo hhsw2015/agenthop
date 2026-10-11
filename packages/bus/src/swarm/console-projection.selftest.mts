@@ -286,6 +286,46 @@ if (canTestPerms) {
 }
 
 // =====================================================================================================================
+// CP-2 r2 — an UNRECOGNIZED roster SHAPE (not just torn JSON) is unknown ⇒ SKIP, never a false confirmed-empty
+// =====================================================================================================================
+{
+  const home = tmpHome();
+  mkdirSync(path.join(home, ".agenthop", "swarm"), { recursive: true });
+  writeFileSync(rosterSnap(home), JSON.stringify({ version: 2, members: [{ member: "sid-1", tool: "claude", cwd: "/w", role: null, title: "W1" }] }));
+  const first = writeRosterProjection(home, 100);
+  t("CP-2 r2 setup: valid roster ⇒ 1 seat", first !== null && first.seats.length === 1);
+  const before = readFileSync(rosterFile(home), "utf8");
+  for (const [label, body] of [
+    ["null", "null"],
+    ["non-object number", "7"],
+    ["{} (members absent)", "{}"],
+    ["members:7 (non-array)", JSON.stringify({ members: 7 })],
+    ["members:{} (non-array object)", JSON.stringify({ members: {} })],
+  ] as const) {
+    writeFileSync(rosterSnap(home), body);
+    t(`CP-2 r2: unrecognized roster shape (${label}) ⇒ publish SKIPPED (null)`, writeRosterProjection(home, 200) === null);
+  }
+  t("CP-2 r2: the last roster.json is untouched across every bad shape (no false-empty overwrite)", readFileSync(rosterFile(home), "utf8") === before);
+  // a STRUCTURALLY-VALID empty roster (members:[]) is a CONFIRMED empty ⇒ still publishes 0 seats.
+  writeFileSync(rosterSnap(home), JSON.stringify({ version: 2, members: [] }));
+  const empt = writeRosterProjection(home, 300);
+  t("CP-2 r2: a valid empty roster (members:[]) ⇒ publishes 0 seats (confirmed empty, not a skip)", empt !== null && empt.seats.length === 0);
+}
+
+// =====================================================================================================================
+// CP-2 r2 — a CONFIRMED-absent control-log (ENOENT) is empty (0 inflight), NOT a skip; the statSync errno-discrimination
+// (not loadControlLog's existsSync, which folds an access fault to "absent") decides empty-vs-unknown.
+// =====================================================================================================================
+{
+  const home = tmpHome();
+  mkdirSync(path.join(home, ".agenthop", "swarm"), { recursive: true });
+  writeFileSync(rosterSnap(home), JSON.stringify({ version: 2, members: [{ member: "sid-1", tool: "claude", cwd: "/w", role: null }] }));
+  // no control-log dir at all (ENOENT) ⇒ confirmed no waits ⇒ publishes with inflight 0 (NOT a skip).
+  const p = writeRosterProjection(home, 100);
+  t("CP-2 r2: ENOENT control-log ⇒ publishes (confirmed empty), 1 seat inflight 0", p !== null && p.seats.length === 1 && p.seats[0]!.inflight === 0);
+}
+
+// =====================================================================================================================
 // CP-3 — a pre-existing symlink on the output dir chain is REFUSED (no write/prune outside the console boundary)
 // =====================================================================================================================
 {

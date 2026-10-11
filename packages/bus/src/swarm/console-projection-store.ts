@@ -192,11 +192,15 @@ function readRosterStrict(home: string): RosterMember[] | null {
   let raw: string;
   try { raw = readFileSync(rosterSnapshotPath(home), "utf8"); }
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? [] : null; } // ENOENT ⇒ confirmed empty; else uncertain
-  try {
-    const snap = JSON.parse(raw) as { members?: unknown };
-    const ms = Array.isArray(snap?.members) ? snap.members : [];
-    return ms.filter((m: unknown): m is RosterMember => !!m && typeof (m as RosterMember).member === "string" && typeof (m as RosterMember).tool === "string" && typeof (m as RosterMember).cwd === "string");
-  } catch { return null; } // corrupt/torn JSON ⇒ UNCERTAIN (a torn write is transient; never publish a false-empty roster)
+  let snap: unknown;
+  try { snap = JSON.parse(raw); }
+  catch { return null; } // corrupt/torn JSON ⇒ UNCERTAIN (a torn write is transient; never publish a false-empty roster)
+  // CP-2 (r2): ONLY a RECOGNIZED shape is a confirmed roster — an object whose `members` IS AN ARRAY (an empty array is a
+  // confirmed-empty roster). `null`, a non-object, or a missing/non-array `members` is an UNRECOGNIZED shape ⇒ unknown (null ⇒
+  // SKIP), NEVER a false confirmed-empty that overwrites the last projection. Only a structurally-valid empty counts as empty.
+  if (!snap || typeof snap !== "object" || !Array.isArray((snap as { members?: unknown }).members)) return null;
+  return (snap as { members: unknown[] }).members
+    .filter((m: unknown): m is RosterMember => !!m && typeof (m as RosterMember).member === "string" && typeof (m as RosterMember).tool === "string" && typeof (m as RosterMember).cwd === "string");
 }
 
 /** CP-2 — count live (non-terminal) waits per native sid from the control-log — the SAME derivation the sentinel's `activeOwners`
@@ -205,9 +209,17 @@ function readRosterStrict(home: string): RosterMember[] | null {
  *  (CONFIRMED no waits); an UNREADABLE control-log (EACCES / corrupt batch) THROWS ⇒ null (UNCERTAIN — the caller must not
  *  publish a fresh "0 inflight everywhere"). READ-ONLY. */
 function computeInflightStrict(home: string, sids: string[]): Map<string, number> | null {
+  const dir = controlLogDir(home);
+  // CP-2 (r2): errno-discriminate the dir OURSELVES first. loadControlLog → readControlBatches gates on existsSync(dir), which
+  // folds an access fault (e.g. an unreadable PARENT) to "absent" and returns an empty seq=0 state with NO throw ⇒ a FALSE
+  // zero-inflight that would never reach the catch below. A direct stat distinguishes ENOENT (confirmed no control-log ⇒ empty)
+  // from any other fault (EACCES/… ⇒ unknown ⇒ SKIP). A readable dir with an unreadable/corrupt BATCH file still throws inside
+  // loadControlLog ⇒ caught ⇒ null.
+  try { statSync(dir); }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? new Map<string, number>() : null; }
   let live: Record<string, import("./control-log.js").ChangeBody>;
-  try { live = liveEntities(loadControlLog(controlLogDir(home))); }
-  catch { return null; } // control-log UNREADABLE ⇒ uncertain (NOT "zero inflight")
+  try { live = liveEntities(loadControlLog(dir)); }
+  catch { return null; } // a readable dir but an unreadable/corrupt batch ⇒ uncertain (NOT "zero inflight")
   const out = new Map<string, number>();
   for (const b of Object.values(live)) {
     if (b.put !== "wait") continue;
