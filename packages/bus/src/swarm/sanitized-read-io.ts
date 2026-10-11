@@ -117,16 +117,29 @@ async function produce(spec: SanitizeSpec, handle: fsp.FileHandle, fst: Stats, a
     case "cat": case "head": {
       const { buf, over } = await readFromStart(handle, cap);
       if (spec.readKind === "cat") return { ok: true, bytes: buf, truncated: over };
-      const sliced = firstNLines(buf, DEFAULT_LINES);
-      // head is complete once its N lines are in hand; truncated ONLY if the cap cut before the Nth line (slice == whole window).
-      return { ok: true, bytes: sliced, truncated: over && sliced.length === buf.length };
+      const { slice, complete } = firstNLines(buf, DEFAULT_LINES);
+      // faithful once the N lines are fully in hand; truncated ONLY if the cap cut BEFORE the Nth line (and the file is bigger).
+      return { ok: true, bytes: slice, truncated: over && !complete };
     }
     case "tail": {
       const over = fst.size > cap;                               // read the END window so tail is faithful on a large file
-      const buf = await readRange(handle, over ? fst.size - cap : 0, Math.min(fst.size, cap));
-      const sliced = lastNLines(buf, DEFAULT_LINES);
-      // the last N lines are faithful if they fit the window; truncated only if the (size-limited) window held < N lines.
-      return { ok: true, bytes: sliced, truncated: over && sliced.length === buf.length };
+      const start = over ? fst.size - cap : 0;
+      const buf = await readRange(handle, start, Math.min(fst.size, cap));
+      const { slice, found } = lastNLines(buf, DEFAULT_LINES);
+      // !over ⇒ the whole file is in the window, so the last N lines are exact (never truncated). over ⇒ faithful iff the window
+      // holds the full last N lines: found === N (a clean boundary inside the window), OR found === N-1 AND the window begins at a
+      // real line boundary (the byte before the window is \n ⇒ the window is exactly N complete lines). Otherwise a front line
+      // was cut / earlier lines are missing (SR1B-P3-1).
+      let truncated = false;
+      if (over) {
+        if (found === DEFAULT_LINES) truncated = false;
+        else if (found === DEFAULT_LINES - 1) {
+          const prev = Buffer.alloc(1);
+          const { bytesRead } = await handle.read(prev, 0, 1, start - 1);
+          truncated = !(bytesRead === 1 && prev[0] === NL);
+        } else truncated = true;
+      }
+      return { ok: true, bytes: slice, truncated };
     }
     case "wc": {
       const { lines, words, bytes } = await countAll(handle); // counts the WHOLE file (the cap bounds OUTPUT, not input)
@@ -163,25 +176,34 @@ async function readRange(handle: fsp.FileHandle, start: number, len: number): Pr
   return buf.subarray(0, total);
 }
 
-/** First `n` newline-delimited lines of `buf` (head). Includes the nth line's trailing \n; the whole buf if it has < n newlines. */
-function firstNLines(buf: Buffer, n: number): Buffer {
+/** First `n` lines of `buf` (head). `complete` = the nth line-terminating \n was FOUND within `buf`, so the n lines are fully in
+ *  hand (head wants no more — faithful regardless of the cap). The whole buf (complete=false) if it has < n newlines.
+ *  SR1B-P3-1: `complete` is a real found-the-nth-newline flag, NOT a slice-length heuristic — the nth \n landing exactly on the
+ *  last cap byte is a COMPLETE head, not a truncated one. */
+function firstNLines(buf: Buffer, n: number): { slice: Buffer; complete: boolean } {
   let count = 0;
-  for (let i = 0; i < buf.length; i++) if (buf[i] === NL && ++count === n) return buf.subarray(0, i + 1);
-  return buf;
+  for (let i = 0; i < buf.length; i++) if (buf[i] === NL && ++count === n) return { slice: buf.subarray(0, i + 1), complete: true };
+  return { slice: buf, complete: false };
 }
 
-/** Last `n` newline-delimited lines of `buf` (tail). A single trailing \n terminates the last line (not a boundary before it). */
-function lastNLines(buf: Buffer, n: number): Buffer {
+/** Last `n` lines of `buf` (tail). `found` = line separators consumed from the END (capped at n). `found === n` ⇒ a clean
+ *  boundary inside buf (exactly the last n lines). `found < n` ⇒ the whole buf is returned (buf holds ≤ n lines: `found + 1`, the
+ *  +1 being the first line, which has no preceding \n in buf). A single trailing \n terminates the last line, not a boundary. The
+ *  caller decides truncation from `found` + the window's left edge (SR1B-P3-1). */
+function lastNLines(buf: Buffer, n: number): { slice: Buffer; found: number } {
   let i = buf.length - 1;
   if (i >= 0 && buf[i] === NL) i--;              // the final \n ends the last line — don't count it as a separator
   let count = 0;
-  for (; i >= 0; i--) if (buf[i] === NL && ++count === n) return buf.subarray(i + 1);
-  return buf;
+  for (; i >= 0; i--) if (buf[i] === NL && ++count === n) return { slice: buf.subarray(i + 1), found: n };
+  return { slice: buf, found: count };
 }
 
 /** wc over the WHOLE file (unbounded input — the cap is an OUTPUT bound; the count line is tiny). O(1) memory via chunks; the ④
- *  budget guards a runaway. Whitespace = wc's isspace set; `inWord` carries across chunks so a word split at a chunk edge isn't
- *  double-counted. */
+ *  budget guards a runaway. `inWord` carries across chunks so a word split at a chunk edge isn't double-counted.
+ *  SR1B-N1 — FIXED CONTRACT: word boundaries use the **C/ASCII** isspace set (the six ASCII whitespace bytes below), matching
+ *  `wc` under the C/POSIX locale. This is intentional and locale-independent (a multibyte space like U+3000 is NOT a boundary —
+ *  GNU wc in a UTF-8 locale would split there). A UTF-8-locale-equivalent word count, if ever wanted, is a SEPARATE future
+ *  contract — this is not claimed to be cross-locale equivalent. */
 async function countAll(handle: fsp.FileHandle): Promise<{ lines: number; words: number; bytes: number }> {
   const chunk = Buffer.alloc(65536);
   let lines = 0, words = 0, bytes = 0, inWord = false, pos = 0;
@@ -227,9 +249,12 @@ async function listDir(handle: fsp.FileHandle, abs: string, cap: number): Promis
   let names: string[];
   try { names = await fsp.readdir(`/proc/self/fd/${handle.fd}`); } // Linux: the fd's real dir, not re-resolvable
   catch { names = await fsp.readdir(abs); }                         // macOS/BSD (no /proc): re-resolve (accepted residual); a throw ⇒ resolveAndRead's catch ⇒ read-failed
-  for (const n of names) if (SECRET_RE.test(n.toLowerCase())) return { ok: false, reason: "credential-entry" }; // same check as a cat target ⇒ escalate
-  names.sort();
-  const out = Buffer.from(names.length ? names.join("\n") + "\n" : "");
+  for (const n of names) if (SECRET_RE.test(n.toLowerCase())) return { ok: false, reason: "credential-entry" }; // SECRET_RE over ALL entries (incl dotfiles) ⇒ escalate — same check as a cat target
+  // SR1B-P2-1: the parser accepts only the BARE `ls` form, so the output must match bare `ls` — which OMITS dotfiles (not -a/-A).
+  // The SECRET_RE sweep above already ran over EVERY entry (a credential dotfile still escalates the whole ls); this only shapes
+  // the DISPLAY. (Node's readdir never yields `.`/`..`.)
+  const visible = names.filter((n) => !n.startsWith(".")).sort();
+  const out = Buffer.from(visible.length ? visible.join("\n") + "\n" : "");
   return out.length > cap ? { ok: true, bytes: out.subarray(0, cap), truncated: true } : { ok: true, bytes: out, truncated: false };
 }
 

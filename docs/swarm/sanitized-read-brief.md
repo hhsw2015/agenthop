@@ -36,7 +36,11 @@ The coordinator never execs the member's command string. It performs the EQUIVAL
   component), confine the resolved realpath to the member's cwd subtree (reject escapes). The member's `cwd` is a verified
   absolute path (carried in the S11 request, as in approval v1).
 - **Read** in the coordinator's process: file content (cat/head/tail/wc, applying the form's bounds), dir entries (ls), or
-  metadata (stat/file). No member env, no shell, no interpreter.
+  metadata (stat/file). No member env, no shell, no interpreter. **Phase-1b output semantics (frozen):** bare `head`/`tail` =
+  first/last 10 lines; bare `ls` omits dotfiles (matches bare `ls`, not `-a`/`-A`) AFTER the SECRET_RE sweep over every entry; `wc`
+  word boundaries use the **C/ASCII** isspace set (C/POSIX-locale `wc` — a multibyte space like U+3000 is not a boundary; a
+  UTF-8-locale word count is a separate future contract, not claimed equivalent); `stat` is a defined "sanitized stat format"
+  (faithful info, not byte-exact to native `stat`). `file` DEFERRED (fd-read can't reproduce libmagic).
 - **TOCTOU closed:** the coordinator does ONE resolve+open+read; the member never execs a path-read whose target can be swapped.
   The member later reads the CAPTURED RESULT (a coordinator-owned tmpfile) whose content is already the sanitized output.
 

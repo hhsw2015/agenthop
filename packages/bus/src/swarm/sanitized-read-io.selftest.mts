@@ -12,6 +12,7 @@ import { SANITIZED_READ_MAX_BYTES, type SanitizeSpec } from "./sanitized-read.js
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 const cat = (targetArg: string) => ({ readKind: "cat" as const, targetArg });
 const spec = (readKind: SanitizeSpec["readKind"], targetArg: string): SanitizeSpec => ({ readKind, targetArg });
+const NL = 0x0a;
 
 const root = mkdtempSync(join(tmpdir(), "sr-io-"));
 const CWD = join(root, "cwd");
@@ -155,6 +156,51 @@ try {
   {
     const r = await resolveAndRead(spec("ls", "../"), CWD);
     t("ls ../ ⇒ reject escape-cwd", r.ok === false && r.reason === "escape-cwd");
+  }
+  // 19. SR1B-P2-1: bare ls OMITS dotfiles (matches bare `ls`, not -a/-A) — AFTER the SECRET_RE sweep over every entry
+  mkdirSync(join(CWD, "mixeddir"));
+  writeFileSync(join(CWD, "mixeddir", "visible.txt"), "");
+  writeFileSync(join(CWD, "mixeddir", ".hidden"), "");
+  {
+    const r = await resolveAndRead(spec("ls", "mixeddir"), CWD);
+    t("ls omits dotfiles (bare ls, not -A)", r.ok === true && r.bytes.toString() === "visible.txt\n");
+  }
+  // 20. ls of a dir with only (non-credential) dotfiles ⇒ empty output
+  mkdirSync(join(CWD, "dotsonly"));
+  writeFileSync(join(CWD, "dotsonly", ".foo"), "");
+  writeFileSync(join(CWD, "dotsonly", ".bar"), "");
+  {
+    const r = await resolveAndRead(spec("ls", "dotsonly"), CWD);
+    t("ls of only-dotfiles ⇒ empty output", r.ok === true && r.bytes.toString() === "");
+  }
+
+  // ── SR1B-P3-1: head/tail must NOT mark truncation when the complete result EXACTLY fills the cap ───────────────
+  const cap = SANITIZED_READ_MAX_BYTES;
+  // 21. head: the first 10 lines occupy exactly `cap` bytes (10th \n on the last cap byte), file is bigger ⇒ NOT truncated
+  {
+    const head10 = Buffer.alloc(cap, 0x61);
+    for (let k = 0; k < 9; k++) head10[k] = NL;   // 9 newlines early + the 10th on the final cap byte = exactly 10 lines
+    head10[cap - 1] = NL;
+    writeFileSync(join(CWD, "headcap.txt"), Buffer.concat([head10, Buffer.from("extra\n")]));
+    const r = await resolveAndRead(spec("head", "headcap.txt"), CWD);
+    t("head: complete 10 lines == cap ⇒ NOT truncated", r.ok === true && r.truncated === false && r.bytes.equals(head10));
+  }
+  // 22. tail: the last 10 lines occupy exactly `cap` bytes and the window begins at a real line boundary ⇒ NOT truncated
+  {
+    const tail10 = Buffer.alloc(cap, 0x62);
+    for (let k = 0; k < 9; k++) tail10[k] = NL;   // 9 empty lines + 1 long line ending on the final cap byte = exactly 10 lines
+    tail10[cap - 1] = NL;
+    writeFileSync(join(CWD, "tailcap.txt"), Buffer.concat([Buffer.from("PREFIX\n"), tail10]));
+    const r = await resolveAndRead(spec("tail", "tailcap.txt"), CWD);
+    t("tail: complete 10 lines == cap at a boundary ⇒ NOT truncated", r.ok === true && r.truncated === false && r.bytes.equals(tail10));
+  }
+  // 23/24. a genuinely over-cap single line DOES still mark truncation (head + tail) — the marker is not suppressed wrongly
+  writeFileSync(join(CWD, "giant.txt"), Buffer.alloc(cap + 100, 0x63)); // one line, no newline, > cap
+  {
+    const rh = await resolveAndRead(spec("head", "giant.txt"), CWD);
+    t("head: an over-cap long line ⇒ truncated", rh.ok === true && rh.truncated === true && rh.bytes.length === cap);
+    const rt = await resolveAndRead(spec("tail", "giant.txt"), CWD);
+    t("tail: an over-cap long line ⇒ truncated", rt.ok === true && rt.truncated === true);
   }
 
   // ── writeSanitizedResult ──────────────────────────────────────────────────────────────────────────────────
