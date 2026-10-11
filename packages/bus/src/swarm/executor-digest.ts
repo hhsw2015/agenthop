@@ -8,7 +8,8 @@
  * Codex member, which has no Claude transcript) ⇒ null ⇒ the caller renders an HONEST "no transcript" annotation. Advisory only:
  * the raw screen-read is left untouched for content-filter detection; the digest never changes disposition (R16).
  */
-import { closeSync, existsSync, fstatSync, openSync, readdirSync, readSync } from "node:fs";
+import { constants as fsConstants } from "node:fs";
+import { open as fsOpen, readdir as fsReaddir, stat as fsStat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
@@ -67,64 +68,70 @@ export function parseExecutorDigest(jsonlTail: string): ExecutorDigest {
   return { lastActivityTs, lastThreeToolCalls: tools.slice(-3), lastUtterance };
 }
 
-/** A relative "<n><unit> 前" for a past epoch-ms, or "未知" when null/invalid. Pure. */
-function ago(ts: number | null, nowMs: number): string {
-  if (ts === null || !Number.isFinite(ts)) return "未知";
-  const sec = Math.max(0, Math.round((nowMs - ts) / 1000));
-  if (sec < 60) return `${sec}s 前`;
-  if (sec < 3600) return `${Math.round(sec / 60)}m 前`;
-  return `${Math.round(sec / 3600)}h 前`;
+/** The last-activity time as a STABLE absolute ISO instant, or "未知" when null/invalid. ED-2: a stable fact (not a relative
+ *  "Ns 前" that changes every call), so an unchanged digest renders identical text — the coordinator's `taskRef+text` dedup is not
+ *  bypassed by the display clock. Pure. */
+function whenIso(ts: number | null): string {
+  return ts !== null && Number.isFinite(ts) ? new Date(ts).toISOString() : "未知";
 }
 
-/** Render the digest as ONE alert-annotation block. `null` ⇒ the honest "no transcript" note (a Codex member / missing file).
- *  Advisory text only; never a verdict. Pure (now injected). */
-export function formatExecutorDigest(digest: ExecutorDigest | null, nowMs: number): string {
-  if (digest === null) return "执行器摘要:无 transcript(非 Claude 会话或文件缺失,honest 缺省)";
+/** Render the digest as ONE alert-annotation block. `null` ⇒ an HONEST "transcript unavailable" note — it does NOT claim the file
+ *  is MISSING, because a read FAILURE (ED-4) also maps to null; the merged wording covers "missing OR unreadable". Advisory text
+ *  only; never a verdict. Pure + STABLE (no wall-clock), so identical state ⇒ identical text (ED-2). */
+export function formatExecutorDigest(digest: ExecutorDigest | null): string {
+  if (digest === null) return "执行器摘要:transcript 不可用(缺失或读取失败,honest 缺省)";
   const tools = digest.lastThreeToolCalls.length
     ? digest.lastThreeToolCalls.map((t) => (t.summary ? `${t.tool}(${t.summary})` : t.tool)).join(" / ")
     : "(无)";
   const utter = digest.lastUtterance ? `「${digest.lastUtterance}」` : "(无)";
-  return `执行器摘要:最后活动 ${ago(digest.lastActivityTs, nowMs)};最近工具 ${tools};最后发言 ${utter}`;
+  return `执行器摘要:最后活动 ${whenIso(digest.lastActivityTs)};最近工具 ${tools};最后发言 ${utter}`;
 }
 
-// ---- IO shell (fail-soft; never throws) ----
+// ---- IO shell (ASYNC + fail-soft; never throws, never blocks the event loop) ----
 
 const TAIL_BYTES = 65536; // read at most the last 64 KiB — a bounded tail (the first partial line is skipped by the parser)
 
-/** The last `maxBytes` of a file as utf8. Pure-ish IO; caller wraps in try/catch. */
-function readTail(file: string, maxBytes: number): string {
-  const fd = openSync(file, "r");
+/** The last `maxBytes` of a file as utf8. ED-3: opens with O_NONBLOCK so a FIFO/device never blocks the open, and reads ONLY after
+ *  confirming a REGULAR file (fstat isFile) — a non-regular entry returns "" instead of a blocking read. Bounded + async. */
+async function readTail(file: string, maxBytes: number): Promise<string> {
+  const fh = await fsOpen(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK); // O_NONBLOCK: opening a FIFO returns at once, never waits
   try {
-    const size = fstatSync(fd).size;
+    const st = await fh.stat();
+    if (!st.isFile()) return ""; // FIFO / device / dir / socket ⇒ not a transcript; never do a blocking read on it
+    const size = st.size;
     const start = Math.max(0, size - maxBytes);
     const len = size - start;
     if (len <= 0) return "";
     const buf = Buffer.alloc(len);
-    readSync(fd, buf, 0, len, start);
+    await fh.read(buf, 0, len, start);
     return buf.toString("utf8");
-  } finally { closeSync(fd); }
+  } finally { await fh.close(); }
 }
 
 /** Locate `<projectsRoot>/<proj>/<sid>.jsonl` for a session id (one readdir of the projects root; file name is `<sid>.jsonl`).
- *  `sid` must be a plain id (no path separators) — guards against traversal. First match or null. Fail-soft. */
-export function findTranscript(sid: string, projectsRoot: string): string | null {
+ *  `sid` must be a plain id (no path separators) — guards against traversal. Only a REGULAR file matches (a dir/FIFO named like the
+ *  transcript is skipped). First match or null. Async + fail-soft. Note: the CALLER resolves a bus handle → native sid first
+ *  (ED-1); this takes a resolved native session id. */
+export async function findTranscript(sid: string, projectsRoot: string): Promise<string | null> {
   if (!sid || !/^[A-Za-z0-9._-]+$/.test(sid)) return null;
   let projs: string[];
-  try { projs = readdirSync(projectsRoot); } catch { return null; }
+  try { projs = await fsReaddir(projectsRoot); } catch { return null; }
   const name = `${sid}.jsonl`;
   for (const proj of projs) {
     const candidate = path.join(projectsRoot, proj, name);
-    if (existsSync(candidate)) return candidate;
+    try { if ((await fsStat(candidate)).isFile()) return candidate; } catch { /* missing/unreadable ⇒ try next */ }
   }
   return null;
 }
 
 /** Load + parse a session's executor digest, or null when there is no transcript (Codex member / not found) OR on ANY IO error
- *  (fail-soft — the sentinel must never break). `projectsRoot` defaults to `~/.claude/projects`. */
-export function loadExecutorDigest(sid: string, projectsRoot: string = path.join(homedir(), ".claude", "projects")): ExecutorDigest | null {
+ *  (fail-soft — the sentinel must never break). Async so the bounded IO never stalls the dispatcher event loop (ED-3). `sid` is a
+ *  resolved NATIVE session id (the caller maps a bus handle via resolveSession first, ED-1). `projectsRoot` defaults to
+ *  `~/.claude/projects`. */
+export async function loadExecutorDigest(sid: string, projectsRoot: string = path.join(homedir(), ".claude", "projects")): Promise<ExecutorDigest | null> {
   try {
-    const file = findTranscript(sid, projectsRoot);
+    const file = await findTranscript(sid, projectsRoot);
     if (!file) return null;
-    return parseExecutorDigest(readTail(file, TAIL_BYTES));
+    return parseExecutorDigest(await readTail(file, TAIL_BYTES));
   } catch { return null; }
 }

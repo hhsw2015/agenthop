@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { execSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -70,42 +71,60 @@ test("tool summary falls back to a representative arg, clipped", () => {
   expect(d.lastThreeToolCalls[0]!.summary.length).toBeLessThanOrEqual(81); // clipped (80 + ellipsis)
 });
 
-// ===== formatExecutorDigest =====
+// ===== formatExecutorDigest (ED-2 stable, ED-4 wording) =====
 
-test("formats the triple; null ⇒ honest no-transcript note", () => {
-  const now = Date.parse("2026-10-11T10:05:00.000Z");
+test("formats the triple with a STABLE absolute activity instant (ED-2); null ⇒ honest unavailable note (ED-4)", () => {
   const d = { lastActivityTs: Date.parse("2026-10-11T10:04:00.000Z"), lastThreeToolCalls: [{ tool: "Bash", summary: "List" }], lastUtterance: "hi" };
-  const s = formatExecutorDigest(d, now);
+  const s = formatExecutorDigest(d);
   expect(s).toMatch(/执行器摘要/);
-  expect(s).toMatch(/最后活动 1m 前/);
+  expect(s).toMatch(/最后活动 2026-10-11T10:04:00\.000Z/); // absolute, not relative
   expect(s).toMatch(/Bash\(List\)/);
   expect(s).toMatch(/「hi」/);
-  expect(formatExecutorDigest(null, now)).toMatch(/无 transcript/);
+  expect(formatExecutorDigest(d)).toBe(formatExecutorDigest(d)); // ED-2: identical state ⇒ identical text (no wall-clock)
+  // ED-4: null does NOT claim "missing" — it is the merged "unavailable (missing or read failure)" wording
+  expect(formatExecutorDigest(null)).toMatch(/不可用/);
+  expect(formatExecutorDigest(null)).toMatch(/缺失或读取失败/);
 });
 
 test("format: unknown ts ⇒ 未知; no tools/utterance ⇒ (无)", () => {
-  const s = formatExecutorDigest({ lastActivityTs: null, lastThreeToolCalls: [], lastUtterance: "" }, Date.now());
+  const s = formatExecutorDigest({ lastActivityTs: null, lastThreeToolCalls: [], lastUtterance: "" });
   expect(s).toMatch(/最后活动 未知/);
   expect(s).toMatch(/最近工具 \(无\)/);
   expect(s).toMatch(/最后发言 \(无\)/);
 });
 
-// ===== IO shell =====
+// ===== IO shell (async) =====
 
-test("findTranscript + loadExecutorDigest: locates <sid>.jsonl under a project dir, parses it", () => {
+test("findTranscript + loadExecutorDigest: locates <sid>.jsonl under a project dir, parses it", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "execdig-")); tmps.push(root);
   const proj = path.join(root, "-Users-x-Work"); mkdirSync(proj, { recursive: true });
   const sid = "11111111-2222-3333-4444-555555555555";
   writeFileSync(path.join(proj, `${sid}.jsonl`), asst("2026-10-11T10:00:09.000Z", [{ type: "text", text: "from disk" }]));
-  expect(findTranscript(sid, root)).toBe(path.join(proj, `${sid}.jsonl`));
-  expect(loadExecutorDigest(sid, root)!.lastUtterance).toBe("from disk");
+  expect(await findTranscript(sid, root)).toBe(path.join(proj, `${sid}.jsonl`));
+  expect((await loadExecutorDigest(sid, root))!.lastUtterance).toBe("from disk");
 });
 
-test("loadExecutorDigest: no transcript ⇒ null (honest default); traversal sid ⇒ null", () => {
+test("loadExecutorDigest: no transcript ⇒ null (honest default); traversal sid ⇒ null", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "execdig-")); tmps.push(root);
-  expect(loadExecutorDigest("no-such-session", root)).toBeNull();     // Codex member / missing
-  expect(findTranscript("../../etc/passwd", root)).toBeNull();        // no path traversal
-  expect(loadExecutorDigest("x", "/no/such/projects/root")).toBeNull(); // IO error ⇒ fail-soft
+  expect(await loadExecutorDigest("no-such-session", root)).toBeNull();   // Codex member / missing
+  expect(await findTranscript("../../etc/passwd", root)).toBeNull();      // no path traversal
+  expect(await loadExecutorDigest("x", "/no/such/projects/root")).toBeNull(); // IO error ⇒ fail-soft
+});
+
+test("ED-3: a non-regular entry named like the transcript (dir / FIFO) is rejected without blocking", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "execdig-")); tmps.push(root);
+  const proj = path.join(root, "p"); mkdirSync(proj, { recursive: true });
+  // a DIRECTORY named <sid>.jsonl ⇒ isFile() false ⇒ skipped
+  const dsid = "dir-1111-2222-3333-4444-555555555555";
+  mkdirSync(path.join(proj, `${dsid}.jsonl`));
+  expect(await findTranscript(dsid, root)).toBeNull();
+  expect(await loadExecutorDigest(dsid, root)).toBeNull();
+  // a FIFO named <sid>.jsonl ⇒ rejected, and the loader returns promptly (never blocks on the open)
+  const fsid = "fifo-1111-2222-3333-4444-555555555555";
+  try { execSync(`mkfifo ${JSON.stringify(path.join(proj, `${fsid}.jsonl`))}`); } catch { return; } // skip if mkfifo unavailable
+  const t0 = Date.now();
+  expect(await loadExecutorDigest(fsid, root)).toBeNull();
+  expect(Date.now() - t0).toBeLessThan(2000); // did not block the event loop on the FIFO
 });
 
 test("executorDigestEnabled: live by default (opt-out)", () => {

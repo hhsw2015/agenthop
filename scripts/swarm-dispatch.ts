@@ -1510,8 +1510,14 @@ async function main(): Promise<void> {
         const failHint = failureHintNote(classifyFailure(`${ev.explain ?? ""}\n${screen}`));
         // mirror-15 ②: a STRUCTURED executor digest from the member's transcript (last activity / tool calls / utterance),
         // appended to the alert text only. The raw 读屏 above is untouched (content-filter detection). fail-soft + gated; a
-        // Codex member (no Claude transcript) ⇒ an honest "no transcript" note. Never changes disposition (R16).
-        const digestNote = executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST) ? formatExecutorDigest(loadExecutorDigest(ev.member), Date.now()) : "";
+        // Codex member (no Claude transcript) ⇒ an honest "unavailable" note. Never changes disposition (R16).
+        // ED-1: resolve the herdr member name → native session id (the transcript filename) before locating the file; an
+        // UNRESOLVABLE identity is reported distinctly from "no transcript" (never conflated). Await — the IO is async (ED-3).
+        let digestNote = "";
+        if (executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST)) {
+          const memberSid = resolveSession(ev.member, listSessions(HOME));
+          digestNote = memberSid ? formatExecutorDigest(await loadExecutorDigest(memberSid)) : "执行器摘要:成员身份未解析,摘要不可用";
+        }
         const summary = [ev.explain ? `定性:${ev.explain}` : "", cfHint, failHint, digestNote, screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
         const doc = buildApprovalDoc({
           from: SELF, fromLabel: "swarm-sentinel", nowSec: nowSec(), member: ev.member, screenSummary: summary,
@@ -1782,9 +1788,13 @@ async function main(): Promise<void> {
           const { rounds, history } = extractTicketRounds(progressLines, ticket, otherTickets, cfg); // header-anchored verdict rounds, bounded window
           const verdict = diagnoseRounds(rounds, history, cfg);
           if (!verdict.concern) continue;
-          // mirror-15 ②: append the ticket AUTHOR's executor digest (if it is a resolvable Claude session) to the suggestion.
+          // mirror-15 ②: append the ticket AUTHOR's executor digest (if its handle resolves to a Claude session) to the
+          // suggestion. ED-1: resolve author handle → native sid first; unresolvable ⇒ no digest line (the suggestion stands).
+          // ED-2: formatExecutorDigest is STABLE (absolute activity instant, no wall-clock), so an unchanged digest does not
+          // bypass notifyCoordinator's taskRef+text dedup. Await — the IO is async (ED-3).
           const author = records.find((r) => r.ticket === ticket)?.author ?? "";
-          const digestNote = executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST) && author ? formatExecutorDigest(loadExecutorDigest(author), Date.now()) : "";
+          const authorSid = executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST) && author ? resolveSession(author, listSessions(HOME)) : null;
+          const digestNote = authorSid ? formatExecutorDigest(await loadExecutorDigest(authorSid)) : "";
           notifyCoordinator([buildRoundDoctorNote(ticket, verdict), digestNote].filter(Boolean).join("\n"), { taskRef: `round-doctor:${ticket}`, title: "round-doctor" });
         }
       } finally {
