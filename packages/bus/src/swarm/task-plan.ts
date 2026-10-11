@@ -18,6 +18,8 @@
 
 import { digestOf } from "./digest.js";
 import { evaluateR4, overlapsAny, type OwnerDomainPolicy, type RiskPolicy, type NodeRisk } from "./task-r4.js";
+import type { AttributionInput } from "./attribution.js";
+import { validateExpectedOutput, type ExpectedOutput } from "./output-contract.js";
 
 // "design" (team-collab §0b R4): an adversarial-review GATE node a planner auto-prepends for a high-stakes change —
 // kind IS task identity (in specDigest), so it is a first-class kind, not a role annotation.
@@ -88,8 +90,15 @@ export type TaskSpec = {
    *  forge), the managed loader IGNORES this field unless the caller supplies matching trusted clarification evidence
    *  (ManagedT3Opts.resolvedRisk, derived from closed waits bound to the payloadRef). Set only by the recompile. */
   resolvedRisk?: NodeRisk;
+  /** OPTIONAL output-contract VERIFICATION tag (output-contract, SWARM_OUTPUT_CONTRACT): the PHYSICAL evidence this
+   *  node's delivery must leave (file / branch / report / inbox-delivery), declared by the plan author (runbook-filled,
+   *  exactly like a task record's expectedOutput). Carried onto the dispatch's intent and PROBED at the delivery receipt
+   *  (met / unmet / unknown) — a VERIFICATION tag, NEVER an authorization input. ANNOTATION class: EXCLUDED from specDigest
+   *  (a receipt-time check, not what the worker does — changing it must not V5-invalidate a running attempt, same family as
+   *  modelTier/roleProfile), kept in planDigest. Additive (FC-7): legacy plans lack it; loadPlan drops a malformed one. */
+  expectedOutput?: ExpectedOutput;
   /** canonical-JSON SHA-256 of the TASK IDENTITY fields — everything EXCEPT specDigest and the role annotations
-   *  required/runtime/visibility/modelTier/roleProfile/criticalPath/resolvedRisk (coveredSpecDigests stays IN: identity). */
+   *  required/runtime/visibility/modelTier/roleProfile/criticalPath/resolvedRisk/expectedOutput (coveredSpecDigests stays IN: identity). */
   specDigest: string;
 };
 
@@ -123,6 +132,12 @@ export type TaskPlan = {
   /** Explicitly phased capabilities (T3 P2-7): e.g. ["r4-threshold"] when R4 condition 3 isn't implemented yet. An
    *  honest marker (not a silent gap); round-trips through loadPlan, in planDigest. */
   notImplemented?: string[];
+  /** OPTIONAL attribution provenance (attribution-chain, SWARM_ATTRIBUTION) — the SIGNAL SOURCE for the accountable-human
+   *  tag, declared by the PLAN AUTHOR (派单方). SOURCE-only: a TRACEABILITY candidate set, NEVER an authorization input
+   *  (attribution.ts invariant ②); the dispatch layer CLASSIFIES it via resolveAccountable when attributionEnabled(). The
+   *  FILL-END is the runbook — manual/runbook-filled, exactly like a task record's expectedOutput. Round-trips through
+   *  loadPlan (tolerated per FC-7), in planDigest. Additive (FC-7): legacy plans lack it. */
+  provenance?: AttributionInput;
   /** canonical-JSON SHA-256 of the plan (excluding planDigest). Set by loadPlan. */
   planDigest: string;
 };
@@ -156,7 +171,7 @@ const VISIBILITIES: ReadonlySet<string> = new Set(["visible", "headless"]);
  *  retagged required/durable/visible/retiered/restaffed (§4.2 V5; fe0376cd review #2; T3 F-T3-2). coveredSpecDigests
  *  is NOT excluded — a design node's coverage set is part of its identity. */
 export function computeSpecDigest(spec: TaskSpec): string {
-  const { specDigest: _d, required: _r, runtime: _rt, visibility: _v, modelTier: _mt, roleProfile: _rp, criticalPath: _cp, resolvedRisk: _rr, ...identity } = spec;
+  const { specDigest: _d, required: _r, runtime: _rt, visibility: _v, modelTier: _mt, roleProfile: _rp, criticalPath: _cp, resolvedRisk: _rr, expectedOutput: _eo, ...identity } = spec;
   return digestOf(identity);
 }
 
@@ -222,6 +237,10 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
   if (o.criticalPath !== undefined && typeof o.criticalPath !== "boolean") return { reason: `${where}.criticalPath must be a boolean` };
   if (o.resolvedRisk !== undefined && o.resolvedRisk !== "reversible" && o.resolvedRisk !== "irreversible") return { reason: `${where}.resolvedRisk must be "reversible" or "irreversible"` };
 
+  // output-contract VERIFICATION tag (SWARM_OUTPUT_CONTRACT): tolerate per FC-7 — a malformed expectedOutput is DROPPED
+  // (sanitized copy kept, extra fields stripped), NEVER a reason to reject the node. Author/runbook-declared; the receipt
+  // seam probes it. Reuses the already-signed validateExpectedOutput (output-contract.ts pure core).
+  const expectedOutput = validateExpectedOutput(o.expectedOutput);
   const spec: TaskSpec = {
     nodeId: o.nodeId,
     kind: o.kind as TaskKind,
@@ -251,6 +270,7 @@ function validateSpecShape(raw: unknown, index: number): { reason: string } | { 
     ...(o.coveredSpecDigests !== undefined ? { coveredSpecDigests: [...(o.coveredSpecDigests as string[])] } : {}),
     ...(o.criticalPath !== undefined ? { criticalPath: o.criticalPath as boolean } : {}),
     ...(o.resolvedRisk !== undefined ? { resolvedRisk: o.resolvedRisk as NodeRisk } : {}),
+    ...(expectedOutput ? { expectedOutput } : {}),
     specDigest: "",
   };
   return { spec };
@@ -291,6 +311,19 @@ function validateFrozenRefs(v: unknown): { reason: string } | { refs: FrozenRefs
       ...(o.planningRequestId !== undefined ? { planningRequestId: o.planningRequestId as string } : {}),
     },
   };
+}
+
+/** Read-side FC-7 tolerance for the OPTIONAL plan `provenance` (attribution SOURCE signal, runbook-filled by the plan
+ *  author). Keep ONLY the KNOWN optional string fields that are strings; drop any other / garbage key. If the value is not
+ *  an object, or carries no usable string field, DROP the whole provenance — NEVER reject the plan. SOURCE tag only:
+ *  nothing here is an authz input, and the dispatch layer classifies it only when attributionEnabled(). */
+function tolerateProvenance(v: unknown): AttributionInput | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const o = v as Record<string, unknown>;
+  const keys = ["directHuman", "delegationOriginHuman", "commentSourceHuman", "automationOwnerHuman", "fallbackHuman"] as const;
+  const out: AttributionInput = {};
+  for (const k of keys) if (typeof o[k] === "string") out[k] = o[k] as string;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** R4 structural coverage validation (T3 P1-2; policy-free — the four-condition OR re-run needs frozenContext and so
@@ -386,6 +419,9 @@ export function loadPlan(raw: unknown, opts?: ManagedT3Opts): LoadResult {
   const fr = validateFrozenRefs(o.frozenRefs);
   if ("reason" in fr) return { ok: false, reason: fr.reason };
   if (o.notImplemented !== undefined && !isStringArray(o.notImplemented)) return { ok: false, reason: "notImplemented must be a string[]" };
+  // attribution SOURCE signal (SWARM_ATTRIBUTION): tolerate per FC-7 — drop a malformed/empty provenance, NEVER reject the
+  // plan. SOURCE-only; the FILL-END is the runbook (the plan author declares it, the dispatch layer classifies it).
+  const provenance = tolerateProvenance(o.provenance);
 
   const specs: TaskSpec[] = [];
   for (let i = 0; i < o.nodes.length; i++) {
@@ -420,6 +456,7 @@ export function loadPlan(raw: unknown, opts?: ManagedT3Opts): LoadResult {
     },
     ...(fr.refs !== undefined ? { frozenRefs: fr.refs } : {}),
     ...(o.notImplemented !== undefined ? { notImplemented: [...(o.notImplemented as string[])] } : {}),
+    ...(provenance !== undefined ? { provenance } : {}),
     planDigest: "",
   };
   // Digests canonicalize the whole spec (including arbitrary acceptance.args), so a non-finite number smuggled in via

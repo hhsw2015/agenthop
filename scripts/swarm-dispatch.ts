@@ -37,6 +37,8 @@ import { taskPass, buildSched, physicalSlotsOccupied, type TaskOps, type GitFact
 import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
 import { boardAdmitEnabled, planBoardWrites, planBoardSupervision, parsePolicyNum, postedFileName, reclaimedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, repostTmpAction, suppressPendingReposts, boardFileIdentityVerified, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
+import { outputContractEnabled, probeExpectedOutput, verifyExpectedOutput } from "../packages/bus/src/swarm/output-contract.js";
+import { ocReceiptDischarged, ocReceiptMark, shouldDischargeReceipt, presentUnmetOnce } from "../packages/bus/src/swarm/output-contract-receipt.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
 import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
@@ -148,6 +150,9 @@ const OBSERVER_SNAPSHOT_FILE = path.join(HOME, ".agenthop", "swarm", "observer-s
 const BOARD_DIR = path.join(HOME, ".agenthop", "swarm", "board");
 const PROGRESS_FILE = path.join(HOME, ".agenthop", "swarm", "PROGRESS.md");
 const COORDINATOR = process.env.SWARM_COORDINATOR || "";
+// A VERIFIED full stable SID (UUID) — never a routable display handle, which no identity drains (mirrors the function-scoped
+// isStableSid used by the observer→coordinator notify; module-level so the output-contract receipt can reuse it).
+const isStableSidStr = (s: string): boolean => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 const CONSUMPTION_WINDOW_SEC = Number(process.env.SWARM_CONSUMPTION_WINDOW_SEC || "600");
 // Local artifact root for RELATIVE completion-slot locators (review f0a999f-P2-4): WORK_REPO is a Git remote id (may be an
 // HTTPS URL) — NEVER a filesystem base. A relative locator with no ARTIFACT_ROOT is skipped (not joined under a URL).
@@ -548,6 +553,39 @@ function buildTaskOps(stateRef: { s: LogState }, planCommittedAtSec: number): Ta
     commit: (state, bodies) => { const r = commitTask(state, bodies); stateRef.s = r.state; return r; },
     observeGit: observeGitFor,
     startTask: startTaskIO,
+    // output-contract RECEIPT probe (SWARM_OUTPUT_CONTRACT): taskPass offers every accepted dispatch that declared an
+    // expectedOutput EVERY pass; this verifies the declared physical evidence (fs / git / inbox) and, ONLY on `unmet`, writes
+    // ONE S19 card to the coordinator. Tier A ADVISORY — never blocks acceptance (task-pass already committed). `unknown` (a read
+    // fault / ambiguous absence / a remote work branch we can't locally resolve) is NEVER presented (FC-2 r3: absence is not a
+    // verdict). IDEMPOTENT + RECOVERABLE (OW-2): a durable `.done` marker (ocReceipt*) makes a discharged item a no-op, and an
+    // item we could NOT complete (transient present fault, crash, or an unresolved coordinator) is left UNDISCHARGED ⇒ re-offered
+    // next pass / after a restart. Fully fail-soft: every fault is isolated. repoDir = the work repo (branch kind; a remote slug
+    // makes git fail ⇒ unknown, never a false unmet); HOME + taskRef scope the file/report/inbox-delivery probes.
+    verifyOutputContract: ({ intent, attempt }) => {
+      const eo = intent.expectedOutput;
+      if (!eo || !outputContractEnabled()) return;                  // kill-switch silent
+      if (ocReceiptDischarged(HOME, attempt.attemptId)) return;     // OW-2: already durably discharged ⇒ idempotent no-op
+      const taskRef = `${attempt.jobId}/${attempt.nodeId}/${attempt.attemptId}`;
+      try {
+        const verdict = verifyExpectedOutput(eo, probeExpectedOutput(eo, { repoDir: WORK_REPO || undefined, home: HOME, taskRef }));
+        let presented = false;
+        if (verdict === "unmet") {
+          // OW-1: deliver to the RESOLVED native coordinator SID — never the raw SWARM_COORDINATOR ref, which writeInbox would
+          // clean into a WRONG inbox for a short-id/member-name config. Fall back to the config only when it is already a full
+          // stable SID (the offline S19 route the observer notify uses).
+          const sid = resolveSession(COORDINATOR, listSessions(HOME)) || (isStableSidStr(COORDINATOR) ? COORDINATOR : "");
+          if (sid) {
+            // OW-2: EXACTLY-ONCE present — the idempotency key dedups the card at the inbox layer, so a re-present (marker fault /
+            // crash between present and mark) makes NO duplicate. `presented` is true ONLY when the card is CONFIRMED durable.
+            presented = presentUnmetOnce(HOME, sid, taskRef, eo, attempt.attemptId);
+            log(`output-contract ${taskRef}: UNMET (kind=${eo.kind}) — S19 ${presented ? "presented (idempotent)" : "present deferred/unknown, retry next pass"}`);
+          } else log(`output-contract ${taskRef}: UNMET (kind=${eo.kind}) — coordinator "${COORDINATOR || "(unset)"}" unresolved, NOT presenting (retry next pass)`);
+        } else log(`output-contract ${taskRef}: ${verdict} (kind=${eo.kind})`);
+        // OW-2: discharge ONLY once the obligation is truly complete (met/unknown, or unmet+CONFIRMED-presented). An unmet we could
+        // not durably present stays UNDISCHARGED ⇒ re-offered next pass (retried once the coordinator resolves / the inbox settles).
+        if (shouldDischargeReceipt(verdict, presented)) ocReceiptMark(HOME, attempt.attemptId, { verdict, atSec: nowSec() });
+      } catch (e) { log(`output-contract ${taskRef} probe/present error (isolated) — retry next pass: ${e instanceof Error ? e.message : e}`); } // no marker ⇒ retried
+    },
     log,
   };
 }
@@ -683,7 +721,7 @@ async function main(): Promise<void> {
   log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
   // flags-default-flip batch-2 (user ruling 2026-10-11): the dormant flags flipped to default-on. "(unwired)" = the flag is
   // flipped but its behavior is not yet wired (an honest no-op until a later wiring round) — the flip only sets the DEFAULT.
-  log(`flags(batch-2 default-on): OPS_RECEIPT=${onoff(OPS_RECEIPT_ENABLED)} SUCCESSION_HEARTBEAT=${onoff(SUCCESSION_HEARTBEAT_ENABLED)} POISON_DLQ=${onoff(flagDefaultOn(process.env.SWARM_POISON_DLQ))} APPROVAL_DELEGATE=${onoff(flagDefaultOn(process.env.SWARM_APPROVAL_DELEGATE))} SANITIZED_READ=${onoff(flagDefaultOn(process.env.SWARM_SANITIZED_READ))} ATTRIBUTION=${onoff(flagDefaultOn(process.env.SWARM_ATTRIBUTION))}(unwired) OUTPUT_CONTRACT=${onoff(flagDefaultOn(process.env.SWARM_OUTPUT_CONTRACT))}(unwired) SPEND_BREAKER=${onoff(flagDefaultOn(process.env.SWARM_SPEND_BREAKER))}(unwired) CONDITIONAL_ROUTING=${onoff(flagDefaultOn(process.env.SWARM_CONDITIONAL_ROUTING))}(unwired) (opt-out default-on; kill SWARM_<X>=0; APPROVAL_DELEGATE+SANITIZED_READ change member popup behavior)`);
+  log(`flags(batch-2 default-on): OPS_RECEIPT=${onoff(OPS_RECEIPT_ENABLED)} SUCCESSION_HEARTBEAT=${onoff(SUCCESSION_HEARTBEAT_ENABLED)} POISON_DLQ=${onoff(flagDefaultOn(process.env.SWARM_POISON_DLQ))} APPROVAL_DELEGATE=${onoff(flagDefaultOn(process.env.SWARM_APPROVAL_DELEGATE))} SANITIZED_READ=${onoff(flagDefaultOn(process.env.SWARM_SANITIZED_READ))} ATTRIBUTION=${onoff(flagDefaultOn(process.env.SWARM_ATTRIBUTION))} OUTPUT_CONTRACT=${onoff(flagDefaultOn(process.env.SWARM_OUTPUT_CONTRACT))} SPEND_BREAKER=${onoff(flagDefaultOn(process.env.SWARM_SPEND_BREAKER))}(unwired) CONDITIONAL_ROUTING=${onoff(flagDefaultOn(process.env.SWARM_CONDITIONAL_ROUTING))}(unwired) (opt-out default-on; kill SWARM_<X>=0; APPROVAL_DELEGATE+SANITIZED_READ change member popup behavior)`);
   // SWARM_INBOX_WAKE: bake a real-time ping into the delivery primitive — writeInbox pings the target's herdr pane on every new
   // message (any caller, zero discipline). No-op + hook left unset when the flag is off (byte-for-byte v0 delivery).
   installInboxWake(log);

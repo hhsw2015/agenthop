@@ -31,6 +31,8 @@
  */
 
 import { digestOf } from "./digest.js";
+import { isResolutionLevel, type ResolutionLevel } from "./attribution.js";
+import { validateExpectedOutput, type ExpectedOutput } from "./output-contract.js";
 import type { TaskPlan } from "./task-plan.js";
 import type { TaskAttempt } from "./task-state.js";
 import type { AcceptedResult } from "./task-result.js";
@@ -53,6 +55,17 @@ export type DispatchIntent = {
   physicalEvidence?: "provider-expiry" | "creation-bound" | null;
   allocOutcome: "pending" | "created" | "clean-fail" | "unknown";
   status: "pending" | "confirmed" | "abandoned";
+  /** OPTIONAL accountable SOURCE tag (attribution-chain, SWARM_ATTRIBUTION): the one accountable human + the waterfall
+   *  level it resolved at, computed by the DISPATCH layer from plan.provenance when attributionEnabled() (never here —
+   *  this type is pure). TRACEABILITY ONLY — NO permission/authz/cap path may ever read intent.accountable (attribution.ts
+   *  invariant ②). Additive (FC-7): legacy intents lack it; the read side (replayLog) drops a malformed one. */
+  accountable?: { accountableHuman: string; resolutionLevel: ResolutionLevel };
+  /** OPTIONAL output-contract VERIFICATION tag (output-contract, SWARM_OUTPUT_CONTRACT): the PHYSICAL evidence this
+   *  dispatch's delivery claim must leave (file / branch / report / inbox-delivery), carried from the plan node's
+   *  expectedOutput by the DISPATCH layer when outputContractEnabled() (never here — this type is pure), and PROBED at the
+   *  delivery receipt (met / unmet / unknown). VERIFICATION tag — NO permission/authz/cap path reads it. Additive (FC-7):
+   *  legacy intents lack it; the read side (replayLog) drops/sanitizes a malformed one. */
+  expectedOutput?: ExpectedOutput;
 };
 
 /** A result observed on a WORK branch by O1 (§4.2), before validation. Carries bindingId + workCommit so V3's binding
@@ -255,6 +268,17 @@ function applyChanges(state: LogState, changes: Change[]): LogState {
       const existing = entities[key];
       if (existing === undefined || existing.put !== "accepted") throw new Error(`supersede target ${key} missing or not an accepted`);
       entities[key] = { put: "accepted", accepted: { ...existing.accepted, superseded: true } };
+    } else if (c.put === "intent" && (c.intent.accountable !== undefined || c.intent.expectedOutput !== undefined)) {
+      // AW-1 / FC-7: the stored ENTITY VIEW trims/drops a malformed-or-extra optional tag (`accountable` SOURCE tag and/or
+      // `expectedOutput` VERIFICATION tag) to its canonical form, but the OPERATION digest (operations[c.operationId] above)
+      // is computed from the ORIGINAL change — so a historical record's byte-identical retry still matches its committed
+      // payload (idempotent replay, never a spurious op-conflict), while liveEntities only ever sees canonical tags. A
+      // genuinely DIFFERENT payload still conflicts (digest differs). Both tags are TRACEABILITY/VERIFICATION only — no
+      // authz/permission/cap path reads either. Reuses the already-signed tolerateAccountable + validateExpectedOutput.
+      const { accountable: _da, expectedOutput: _de, ...rest } = c.intent;
+      const kept = tolerateAccountable(c.intent.accountable);
+      const eo = validateExpectedOutput(c.intent.expectedOutput);
+      entities[key] = { put: "intent", intent: { ...rest, ...(kept !== undefined ? { accountable: kept } : {}), ...(eo ? { expectedOutput: eo } : {}) } };
     } else {
       entities[key] = bodyOf(c);
     }
@@ -316,8 +340,23 @@ export function commit(state: LogState, expectedSeq: number, changes: Change[]):
   return { result: { ok: true, newSeq: state.seq + 1, replay: false }, state: applyChanges(state, changes) };
 }
 
+/** Read-side FC-7 tolerance for the optional `accountable` SOURCE tag on a DispatchIntent (attribution-chain wiring). Keep
+ *  the pair ONLY when accountableHuman is a non-empty string AND resolutionLevel is a canonical level; otherwise return
+ *  undefined so the field is DROPPED — never a reason to reject the whole intent. A SOURCE tag only: no authz path reads it. */
+export function tolerateAccountable(v: unknown): { accountableHuman: string; resolutionLevel: ResolutionLevel } | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const o = v as Record<string, unknown>;
+  if (typeof o.accountableHuman !== "string" || o.accountableHuman.trim().length === 0) return undefined;
+  if (!isResolutionLevel(o.resolutionLevel)) return undefined;
+  return { accountableHuman: o.accountableHuman, resolutionLevel: o.resolutionLevel }; // keep ONLY the two known fields (strip extras)
+}
+
 /** Rebuild LogState by folding the ordered, already-committed log — crash recovery + projection (§4.3). The log is
- *  authoritative, so this APPLIES each batch without re-deciding; it only asserts contiguous seq to catch a gap. */
+ *  authoritative, so this APPLIES each batch without re-deciding; it only asserts contiguous seq to catch a gap. The FC-7
+ *  tolerance for the optional intent tags (attribution `accountable` SOURCE tag + output-contract `expectedOutput`
+ *  VERIFICATION tag) lives INSIDE applyChanges (AW-1): it trims/drops a malformed/forged value in the stored ENTITY view
+ *  ONLY, never touching the operation digest — so a historical record's byte-identical retry stays idempotent (no spurious
+ *  op-conflict), and a genuinely different payload still conflicts. */
 export function replayLog(batches: CommittedBatch[]): LogState {
   let state = initialLogState();
   for (const b of batches) {
