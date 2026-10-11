@@ -7,7 +7,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync, existsSync 
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveAndReadGit } from "./sanitized-read-git.js";
+import { resolveAndReadGit, type GitRunner } from "./sanitized-read-git.js";
 import { planSanitize, SANITIZED_READ_MAX_BYTES, type SanitizeSpec } from "./sanitized-read.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
@@ -113,6 +113,41 @@ try {
     git(Big, "commit", "-qF", msgFile);
     const r = await resolveAndReadGit(spec("git log"), Big, HOME);
     t("git output > cap ⇒ truncated=true (not silently false)", r.ok === true && r.truncated === true && r.bytes.length === SANITIZED_READ_MAX_BYTES);
+  }
+
+  // 12. SR2-R2-P2-1: a branch and a TAG with the same name ⇒ HEAD must bind via the FULL ref (not the ambiguous `--short` "heads/main")
+  {
+    const C = join(root, "collide"); mkdirSync(C, { recursive: true });
+    git(C, "init", "-q"); git(C, "config", "user.email", "t@t"); git(C, "config", "user.name", "t");
+    writeFileSync(join(C, "f"), "1\n"); git(C, "add", "f"); git(C, "commit", "-qm", "c1-collide");
+    try { git(C, "branch", "-M", "main"); } catch { /* already main */ }
+    git(C, "tag", "main"); // branch main + tag main now collide
+    const rb = await resolveAndReadGit(spec("git branch"), C, HOME);
+    t("branch+tag same name ⇒ current '* main' preserved (full ref, not heads/main)", rb.ok === true && /\*\s+main\b/.test(rb.bytes.toString()));
+    const rl = await resolveAndReadGit(spec("git log --oneline"), C, HOME);
+    t("branch+tag same name ⇒ log works (HEAD not broken)", rl.ok === true && /c1-collide/.test(rl.bytes.toString()));
+  }
+  // 13. SR2-R2-P2-1: a HEAD probe exit code that is NEITHER 0 nor 1 (a real error, e.g. 128) ⇒ escalate, NOT a guessed detached
+  {
+    const faultProbe: GitRunner = async (args) => {
+      if (args.includes("--absolute-git-dir")) return { code: 0, stdout: Buffer.from("/tmp/ignored\n"), truncated: false };
+      if (args.includes("symbolic-ref")) return { code: 2, stdout: Buffer.alloc(0), truncated: false }; // probe ERROR (not detached)
+      return { code: 0, stdout: Buffer.alloc(0), truncated: false };
+    };
+    const r = await resolveAndReadGit(spec("git log --oneline"), repo, HOME, faultProbe);
+    t("HEAD probe exit!=0/!=1 ⇒ escalate head-probe-failed", r.ok === false && r.reason === "head-probe-failed");
+  }
+  // 14. SR2-R2-P2-1: a HEAD WRITEBACK failure ⇒ escalate (the clone HEAD would be wrong), never a silent wrong marker
+  {
+    const faultWriteback: GitRunner = async (args) => {
+      if (args.includes("--absolute-git-dir")) return { code: 0, stdout: Buffer.from("/tmp/ignored\n"), truncated: false };
+      if (args.includes("symbolic-ref") && args.includes("-q")) return { code: 0, stdout: Buffer.from("refs/heads/main\n"), truncated: false }; // probe: on a branch
+      if (args[0] === "clone") return { code: 0, stdout: Buffer.alloc(0), truncated: false }; // fake clone ok
+      if (args.includes("symbolic-ref")) return { code: 2, stdout: Buffer.alloc(0), truncated: false }; // writeback FAILS
+      return { code: 0, stdout: Buffer.alloc(0), truncated: false };
+    };
+    const r = await resolveAndReadGit(spec("git log --oneline"), repo, HOME, faultWriteback);
+    t("HEAD writeback failure ⇒ escalate head-writeback-failed", r.ok === false && r.reason === "head-writeback-failed");
   }
 
   // 8. scratch self-cleanup (pins ①②): after all of the above, NO throwaway clone dir is left behind

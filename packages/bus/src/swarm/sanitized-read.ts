@@ -55,7 +55,7 @@ const GIT_FLAGS: Record<GitSubcmd, Set<string>> = {
   log: new Set(["--oneline", "--stat", "--graph", "--decorate", "--no-color", "--numstat", "--shortstat", "--name-only", "--name-status", "--all"]),
   show: new Set(["--stat", "--numstat", "--name-only", "--name-status"]),
   diff: new Set(["--stat", "--name-only", "--name-status", "--numstat", "--shortstat", "--summary"]),
-  branch: new Set(["-a", "--all", "-v", "-r", "--list", "-l"]), // SR2-P2-2: NO `-vv` — upstream tracking ([origin/main]) is NOT faithful from a throwaway clone ⇒ escalate
+  branch: new Set(["-a", "--all", "-r", "--list", "-l"]), // SR2-P2-2: NO verbosity at all — `-v` (and `-v -v` == `-vv` by count) prints `[ahead/behind]`/`[origin/main]` upstream state that a throwaway clone can't reproduce ⇒ any verbose branch escalates
 };
 /** show/diff default to CONTENT (a patch); a bare `git show`/`git diff` ⇒ escalate — require ≥1 non-content stat/name flag. */
 const GIT_REQUIRE_FLAG = new Set<GitSubcmd>(["show", "diff"]);

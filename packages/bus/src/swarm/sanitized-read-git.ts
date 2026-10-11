@@ -2,8 +2,10 @@
  * sanitized-read-git — the COORDINATOR-side HARDENED git committed-history read (Phase 2: log/show/diff/branch, NON-content). The
  * coordinator runs git in a THROWAWAY `--mirror` clone of the member's repo, in a SCRUBBED env, and injects the captured output;
  * the member's rewrite (`builtin command /bin/cat <result>`) reads THAT — identical to every other sanitize form. It NEVER runs the
- * member's git command, never runs git in the member's repo (except one side-effect-free `rev-parse --show-toplevel` to find the
- * clone source), and never checks out a working tree.
+ * member's git command and never checks out a working tree. The ONLY git touches of the member's repo are three side-effect-free,
+ * hardened probes to find the clone source + faithfully replicate HEAD: `rev-parse --absolute-git-dir` (the real git-dir, not the
+ * `core.worktree`-redirectable toplevel), `symbolic-ref -q HEAD` (the full current-branch ref, or detached), and — only when
+ * detached — `rev-parse --verify HEAD` (the sha). Everything else runs in the throwaway clone.
  *
  * Soundness (the git-recall threat list is the audit input; empirically verified against planted exec vectors):
  *   - ENV (git-recall Hole 2): the child env is MINIMAL — only PATH (the coordinator's own, trusted) + GIT_CONFIG_GLOBAL/SYSTEM
@@ -32,6 +34,8 @@ function minimalEnv(): NodeJS.ProcessEnv {
 }
 
 type GitOut = { code: number; stdout: Buffer; truncated: boolean };
+/** The git runner shape — injectable so tests can simulate probe/writeback FAILURES (exit codes) that real git won't easily produce. */
+export type GitRunner = (args: string[], maxBytes: number) => Promise<GitOut>;
 
 /** Run `git <args>` in the scrubbed env, capturing stdout up to `maxBytes` (then mark truncated + kill — bounded memory). stderr is
  *  drained + discarded (never injected). No shell (execFile-style arg vector) ⇒ no shell metachar interpretation. Never rejects. */
@@ -79,38 +83,53 @@ async function ledgerScratchError(home: string, scratch: string, err: unknown): 
  * is ALWAYS removed in a finally (pin ①: even on a dispatcher budget-timeout the op settles here + cleans up; a cleanup failure ⇒
  * ledger alert, pin ②). `cwd` is the member's verified absolute cwd (S11). ALL FS async (SR2-P2-5: never blocks the sweep).
  */
-export async function resolveAndReadGit(spec: SanitizeSpec, cwd: string, home: string): Promise<ReadResult> {
+export async function resolveAndReadGit(spec: SanitizeSpec, cwd: string, home: string, run: GitRunner = runGit): Promise<ReadResult> {
   if (spec.readKind !== "git") return { ok: false, reason: `not-a-git-spec:${spec.readKind}` };
   // SR2-P2-1: bind the clone source to the real GIT METADATA DIR, not the worktree toplevel. `core.worktree` can point the
   // worktree (`--show-toplevel`) at a DIFFERENT repo, but committed history lives in the git-dir, which `core.worktree` cannot
   // redirect. Strip only the trailing NEWLINE (NOT `.trim()`), so a path with a legitimate trailing space is preserved. Hardened.
-  const gd = await runGit(["-C", cwd, "--no-pager", "-c", "core.fsmonitor=", "-c", "diff.external=", "rev-parse", "--absolute-git-dir"], 4096);
+  const gd = await run(["-C", cwd, "--no-pager", "-c", "core.fsmonitor=", "-c", "diff.external=", "rev-parse", "--absolute-git-dir"], 4096);
   if (gd.code !== 0) return { ok: false, reason: "not-a-git-repo" };
   const gitdir = stripTrailingNewline(gd.stdout.toString("utf8"));
   if (!gitdir) return { ok: false, reason: "no-git-dir" };
-  // SR2-P2-2: read the SOURCE HEAD state (a branch, or detached) so the clone's current-branch marker is faithful — a `--mirror`
-  // clone does NOT preserve a detached HEAD (it points HEAD at a branch). Side-effect-free, hardened, in the member's cwd.
-  const symref = await runGit(["-C", cwd, "--no-pager", "symbolic-ref", "-q", "--short", "HEAD"], 4096);
-  const headBranch = symref.code === 0 ? stripTrailingNewline(symref.stdout.toString("utf8")) : "";  // "" ⇒ detached
-  const headSha = headBranch ? "" : stripTrailingNewline((await runGit(["-C", cwd, "--no-pager", "rev-parse", "HEAD"], 256)).stdout.toString("utf8"));
+  // SR2-R2-P2-1: read the SOURCE HEAD state so the clone's current-branch marker is faithful (a `--mirror` clone does NOT preserve a
+  // detached HEAD). Use the FULL symbolic ref (NOT `--short`, which returns an ambiguous `heads/<x>` when a tag shares the name), and
+  // distinguish by EXIT CODE: 0 = on a branch (full ref in stdout), 1 = normal detached, anything else = a probe ERROR ⇒ escalate
+  // (never guess detached from an error). Each probe/writeback code is checked; "can't confirm" ⇒ fail-to-user.
+  const symref = await run(["-C", cwd, "--no-pager", "symbolic-ref", "-q", "HEAD"], 4096);
+  let headFullRef = "";  // the full refs/heads/<branch> when on a branch
+  let headSha = "";      // the sha when detached
+  if (symref.code === 0) {
+    headFullRef = stripTrailingNewline(symref.stdout.toString("utf8"));
+    if (!headFullRef) return { ok: false, reason: "head-probe-empty" };          // code 0 but no ref ⇒ can't confirm
+  } else if (symref.code === 1) {
+    const rp = await run(["-C", cwd, "--no-pager", "rev-parse", "--verify", "--quiet", "HEAD"], 256); // normal detached ⇒ the sha
+    if (rp.code !== 0) return { ok: false, reason: "head-sha-probe-failed" };
+    headSha = stripTrailingNewline(rp.stdout.toString("utf8"));
+    if (!headSha) return { ok: false, reason: "head-sha-empty" };
+  } else {
+    return { ok: false, reason: "head-probe-failed" };                           // code >= 2 (e.g. 128 not-a-repo) ⇒ escalate, NOT detached
+  }
 
   const root = gitScratchRoot(home);
   await fsp.mkdir(root, { recursive: true, mode: 0o700 });            // SR2-P2-5: async so a slow FS never blocks the sweep
   const scratch = await fsp.mkdtemp(join(root, "r-"));
   try {
     // `--mirror` (bare, no checkout, no upload-pack for a local source) ⇒ no exec vector; copies ALL refs so `branch -a/-r` is faithful.
-    const cl = await runGit(["clone", "--mirror", "--quiet", gitdir, scratch], 4096);
+    const cl = await run(["clone", "--mirror", "--quiet", gitdir, scratch], 4096);
     if (cl.code !== 0) return { ok: false, reason: "clone-failed" };
 
-    // SR2-P2-2: replicate the source HEAD into the clone (branch ⇒ symbolic-ref; detached ⇒ detach HEAD at the sha). Both args are
-    // git-validated refs/shas passed via the arg vector (no shell), and the branch value is prefixed `refs/heads/` so it can't be a flag.
-    if (headBranch) await runGit(["-C", scratch, "symbolic-ref", "HEAD", `refs/heads/${headBranch}`], 256);
-    else if (headSha) await runGit(["-C", scratch, "update-ref", "--no-deref", "HEAD", headSha], 256);
+    // SR2-R2-P2-1: replicate the source HEAD into the clone using the FULL ref (branch ⇒ symbolic-ref, detached ⇒ detach at the sha),
+    // and CHECK the writeback exit code — a failed writeback leaves the clone HEAD wrong, so escalate rather than return a wrong marker.
+    const wb = headFullRef
+      ? await run(["-C", scratch, "symbolic-ref", "HEAD", headFullRef], 256)     // headFullRef = "refs/heads/..." ⇒ not a flag
+      : await run(["-C", scratch, "update-ref", "--no-deref", "HEAD", headSha], 256);
+    if (wb.code !== 0) return { ok: false, reason: "head-writeback-failed" };
 
     // Operand soundness: each must peel to a COMMIT in the clone (a rev, not a pathspec/path/`rev:path` blob). A range endpoint too.
     for (const operand of spec.operands) {
       for (const rev of operand.split(/\.\.\.?/).filter((r) => r.length > 0)) {
-        const v = await runGit(["-C", scratch, "rev-parse", "--verify", "--quiet", `${rev}^{commit}`], 256);
+        const v = await run(["-C", scratch, "rev-parse", "--verify", "--quiet", `${rev}^{commit}`], 256);
         if (v.code !== 0) return { ok: false, reason: "bad-rev" };   // not a committed rev ⇒ escalate (never a pathspec/content read)
       }
     }
@@ -118,7 +137,7 @@ export async function resolveAndReadGit(spec: SanitizeSpec, cwd: string, home: s
     // The hardened non-content read. Global opts BEFORE the subcommand; `--no-ext-diff` (diff-family) AFTER it for diff/log/show.
     const noExtDiff = spec.subcmd === "diff" || spec.subcmd === "log" || spec.subcmd === "show" ? ["--no-ext-diff"] : [];
     const args = ["-C", scratch, "--no-pager", "-c", "diff.external=", "-c", "core.fsmonitor=", spec.subcmd, ...noExtDiff, ...spec.flags, ...spec.operands];
-    const rr = await runGit(args, SANITIZED_READ_MAX_BYTES);
+    const rr = await run(args, SANITIZED_READ_MAX_BYTES);
     // A non-zero exit is a FAILURE only when NOT truncated: hitting the cap SIGKILLs git (close code != 0 by design), which must
     // still return the capped output + truncated=true (SR2-P2-3 — the marker is applied downstream), not be misread as an error.
     if (!rr.truncated && rr.code !== 0) return { ok: false, reason: `git-${spec.subcmd}-failed` };
