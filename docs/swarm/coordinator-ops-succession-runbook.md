@@ -4,20 +4,23 @@ owner 90b58f9c · reviewer codex:Work (01a1208e). This is the prose half of the 
 `packages/bus/src/swarm/coordinator-ops-receipt.ts` + the three dormant seams). The reflexive north star: the coordinator's OWN
 operations are "done" only when DURABLE evidence proves it — never because an API returned ok instantly.
 
-## ① Succession shell-swap bus-join — the new shell's first action is `agenthop install`
+## ① Succession shell-swap bus-join — the new shell's first action is `agenthop install --mcp <kind>`
 
-When a member's shell is swapped (restart / replacement), the NEW shell must (re)install the swarm status/presence hooks before
-it is trusted on the bus. `agenthop install` is idempotent (a no-op when the hook config is already current — `agents.ts`), so it
-is always safe to run.
+When a member's shell is swapped (restart / replacement), the NEW shell must (re)install the swarm status/presence hooks before it
+is trusted on the bus. **The `--mcp <kind>` argument is REQUIRED: a bare `agenthop install` only PRINTS setup hints and registers
+nothing — `registerMcp` (the real hook writer) runs only under `--mcp` (`install.ts`).** `agenthop install --mcp <kind>` is
+idempotent (a no-op when the hook config is already current — `agents.ts`), so it is always safe to run.
 
-- **Spawned/remote shells (code):** `buildBootPlan` (`packages/bus/src/swarm/vm-ctl.ts`) now emits `agenthop install` right after
-  the herdr-install step, so a freshly booted remote shell installs the hooks as part of its boot plan. This rides the existing
-  `SWARM_VM_CTL` gate (default OFF) — the whole boot path is dormant until a live run enables it.
+- **Spawned/remote shells (code):** `buildBootPlan` (`packages/bus/src/swarm/vm-ctl.ts`) now emits `agenthop install --mcp claude`
+  (the spawned box is a claude agent) right after the herdr-install step, so a freshly booted remote shell actually registers the
+  hooks as part of its boot plan. This rides the existing `SWARM_VM_CTL` gate (default OFF) — the whole boot path is dormant until
+  a live run enables it.
 - **Local restart/adopt (runbook — human/coordinator step):** after swapping or restarting a member shell locally, its FIRST
-  action is `agenthop install`. This is a runbook step, NOT a presence-daemon action: `node presence.mjs` is not the agent and
-  must not rewrite the agent's hook config (it does not reliably know the agent kind/bin). Bus-join itself is already automatic —
-  `reportCheckIn` (`checkin.ts`, called from `core.ts`) writes a `[checkin]` to the coordinator inbox on every bus start — so
-  `agenthop install` only matters when the hook config itself has drifted.
+  action is `agenthop install --mcp <agent-kind>` — name the member's kind (`claude`/`codex`/…); a bare `agenthop install` only
+  prints hints and registers nothing. This is a runbook step, NOT a presence-daemon action: `node presence.mjs` is not the agent
+  and must not rewrite the agent's hook config (it does not reliably know the agent kind/bin). Bus-join itself is already automatic
+  — `reportCheckIn` (`checkin.ts`, called from `core.ts`) writes a `[checkin]` to the coordinator inbox on every bus start — so
+  `agenthop install --mcp <agent-kind>` only matters when the hook config itself has drifted.
 
 ## ② Ops-receipt — verify the coordinator's own spawn/inject by durable evidence
 
@@ -41,14 +44,17 @@ change (FC-6).
 
 On adopt, `presence.ts` writes `~/.agenthop/swarm/succession/<sid>.json {swappedAtSec}` (under the existing **SWARM_SUCCESSION**
 gate, so a swap is always recorded even if the heartbeat sentinel is off). The dispatcher sub-step `runSuccessionHeartbeat` (sweep,
-gated on **SWARM_SUCCESSION_HEARTBEAT**, default OFF, independent of SWARM_SENTINEL) builds `SuccessionLiveness{member, swappedAtSec,
-lastBusSec (presence pid mtime), lastCheckinSec (coordinator-inbox [checkin])}` and calls `successionHeartbeatDue(m, now,
-successionHeartbeatSec())` (window `SWARM_SUCCESSION_HEARTBEAT_SEC`, default 600). On a due member — swapped, past the window, and
-NO bus heartbeat NOR check-in since the swap — it raises S19 via `notifyCoordinator` (`taskRef: succession:heartbeat:<member>`),
-one-shot per episode, re-armed on recovery. A member with no swap record is never checked (the pure core fail-closes on a
-non-finite `swappedAtSec`).
+gated on **SWARM_SUCCESSION_HEARTBEAT**, default OFF, independent of SWARM_SENTINEL) takes its candidate set from the **swap records
+themselves** (`listSuccessionSwaps` — NOT `listSessions`/roster, whose `resolveSession` needs a live PID file and would wrongly
+drop a dead successor that never came up) and builds `SuccessionLiveness{member, swappedAtSec, lastBusSec (presence pid mtime)}`,
+then calls `successionHeartbeatDue(m, now, successionHeartbeatSec())` (window `SWARM_SUCCESSION_HEARTBEAT_SEC`, default 600).
+Proof-of-life is the **durable presence pid mtime ONLY** — check-in evidence was withdrawn (coordinator ruling): a consumable
+`[checkin]` can be drained by the coordinator between ticks and misread as silence (a false alert), so it is not consulted. On a
+due member — swapped, past the window, with NO bus heartbeat since the swap — it raises S19 via `notifyCoordinator`
+(`taskRef: succession:heartbeat:<member>`), one-shot per episode (latched only on a real **delivery**), re-armed on recovery. A
+member with no swap record is never checked (the pure core fail-closes on a non-finite `swappedAtSec`).
 
-## Flags (all default OFF; opt-in, plain-boolean idiom — NOT flagDefaultOn)
+## Flags (the two NEW consumers default OFF, plain-boolean idiom — NOT flagDefaultOn; existing gates as noted)
 
 | flag | gates |
 |---|---|
