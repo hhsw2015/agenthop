@@ -56664,6 +56664,37 @@ function isSubmitIntent(v) {
   return v === "submit" || v === "report" || v === "fyi";
 }
 
+// packages/bus/src/swarm/approval-delegation.ts
+var PINNED = new Map([
+  ["pwd", "/bin/pwd"],
+  ["echo", "/bin/echo"],
+  ["which", "/usr/bin/which"],
+  ["basename", "/usr/bin/basename"],
+  ["dirname", "/usr/bin/dirname"]
+]);
+function validApprovalRequest(raw) {
+  if (typeof raw !== "object" || raw === null)
+    return null;
+  const r = raw;
+  if (typeof r.requestId !== "string" || !r.requestId)
+    return null;
+  if (typeof r.member !== "string" || !r.member)
+    return null;
+  if (typeof r.tool !== "string" || !r.tool)
+    return null;
+  if (typeof r.command !== "string")
+    return null;
+  if (typeof r.toolInputDigest !== "string" || !r.toolInputDigest)
+    return null;
+  if (typeof r.cwd !== "string" || !r.cwd.startsWith("/"))
+    return null;
+  if (typeof r.promptId !== "string" || !r.promptId)
+    return null;
+  if (typeof r.nowSec !== "number" || !Number.isFinite(r.nowSec))
+    return null;
+  return { requestId: r.requestId, member: r.member, tool: r.tool, command: r.command, toolInputDigest: r.toolInputDigest, cwd: r.cwd, promptId: r.promptId, nowSec: r.nowSec };
+}
+
 // packages/bus/src/redact.ts
 var RULES = [
   { label: "PEM_PRIVATE_KEY", re: /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/g },
@@ -56703,6 +56734,9 @@ function validInboxMsg(raw) {
     return null;
   if (r.intent !== undefined && !isSubmitIntent(r.intent))
     return null;
+  const approval = r.approval === undefined ? undefined : validApprovalRequest(r.approval);
+  if (r.approval !== undefined && approval === null)
+    return null;
   return {
     from: r.from,
     fromLabel: r.fromLabel,
@@ -56713,7 +56747,8 @@ function validInboxMsg(raw) {
     ...typeof r.actionId === "string" ? { actionId: r.actionId } : {},
     ...typeof r.taskRef === "string" ? { taskRef: r.taskRef } : {},
     ...typeof r.title === "string" ? { title: r.title } : {},
-    ...isSubmitIntent(r.intent) ? { intent: r.intent } : {}
+    ...isSubmitIntent(r.intent) ? { intent: r.intent } : {},
+    ...approval ? { approval } : {}
   };
 }
 function quarantineInbox(home, claimedFile, reason, raw) {
@@ -57032,11 +57067,11 @@ function recoverStaleClaims(home, keys) {
       continue;
     }
     for (const n of names) {
-      const m = n.match(/\.claim-(\d+)$/);
+      const m = n.match(/\.claim-(?:disp-)?(\d+)$/);
       if (!m || alive(Number(m[1])))
         continue;
       try {
-        renameSync3(path14.join(dir, n), path14.join(dir, n.replace(/\.claim-\d+$/, "")));
+        renameSync3(path14.join(dir, n), path14.join(dir, n.replace(/\.claim-(?:disp-)?\d+$/, "")));
       } catch {}
     }
   }
@@ -57500,8 +57535,13 @@ function defaultWakeDeps(log) {
   };
 }
 function installInboxWake(log, env2 = process.env) {
-  if (!inboxWakeEnabled(env2) || !herdrSpawnable(env2)) {
+  if (!inboxWakeEnabled(env2)) {
     setInboxWakeHook(null);
+    return false;
+  }
+  if (!herdrSpawnable(env2)) {
+    setInboxWakeHook(null);
+    log?.("inbox-wake: SWARM_INBOX_WAKE on but herdr is NOT reachable from this process (HERDR_ENV/HERDR_PANE_ID unset) — real-time wake INERT; writeInbox still delivers DURABLY and the target's own inbox poll still applies. NOTE: this process's dispatcher backstop shares the SAME herdr gate, so it is ALSO inert here — re-pings need a herdr-reachable dispatcher");
     return false;
   }
   const deps = defaultWakeDeps(log);
@@ -58155,7 +58195,7 @@ function delay2(ms) {
 }
 
 // packages/bus/src/swarm/shell-succession.ts
-import { readFileSync as readFileSync9, writeFileSync as writeFileSync8, unlinkSync as unlinkSync5, mkdirSync as mkdirSync11 } from "node:fs";
+import { readFileSync as readFileSync9, writeFileSync as writeFileSync8, unlinkSync as unlinkSync5, mkdirSync as mkdirSync11, readdirSync as readdirSync9 } from "node:fs";
 import os2 from "node:os";
 import path18 from "node:path";
 
@@ -58514,6 +58554,17 @@ async function runSuccessionAtStartup(home, selfTool, selfNativeSid, hostPid, pu
     releaseHolderLock(site, token);
   }
 }
+function successionSwapPath(home, sid) {
+  const safe = sid.replace(/[^A-Za-z0-9._-]/g, "_");
+  return path18.join(home, ".agenthop", "swarm", "succession", `${safe}.json`);
+}
+function writeSuccessionSwap(home, sid, swappedAtSec) {
+  try {
+    const p = successionSwapPath(home, sid);
+    mkdirSync11(path18.dirname(p), { recursive: true });
+    writeFileSync8(p, JSON.stringify({ sid, swappedAtSec }), { mode: 384 });
+  } catch {}
+}
 
 // packages/bus/src/presence.ts
 function runPresence(opts = {}) {
@@ -58613,6 +58664,7 @@ function runPresence(opts = {}) {
           if (!bound)
             return false;
           core2.adoptStableId(sid);
+          writeSuccessionSwap(home, sid, Math.floor(Date.now() / 1000));
           return true;
         }, dbg);
       } catch (e) {
