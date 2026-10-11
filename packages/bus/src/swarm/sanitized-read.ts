@@ -55,6 +55,6 @@ export function planSanitize(command: string): SanitizeSpec | null {
   const [cmd, arg] = tokens;
   if (!SANITIZE_FORMS.has(cmd)) return null; // case-SENSITIVE; only the exact lowercase form (head/tail/ls/… are later phases)
   if (arg.startsWith("-")) return null;      // an option, not a path — Phase 1 forbids options
-  if (SECRET_RE.test(arg)) return null;      // ④ credential-path red-line ⇒ escalate, never sanitize (reuse SECRET_RE)
+  if (SECRET_RE.test(arg.toLowerCase())) return null; // ④ credential-path red-line (SR-P1-2: case-INSENSITIVE, matches approval's isBlacklisted — `.ENV`/`ID_RSA` must also escalate, never sanitize)
   return { readKind: cmd as "cat", targetArg: arg };
 }

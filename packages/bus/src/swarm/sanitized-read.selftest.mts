@@ -43,7 +43,8 @@ for (const c of [
 }
 
 // ── ④ credential red-line: a credential-PATH target ⇒ null (escalate, never sanitize) ─────────────────────────
-for (const c of ["cat .env", "cat sub/.env.local", "cat id_rsa", "cat deploy/id_ed25519", "cat x.pem", "cat secrets.txt", "cat ../credentials", "cat .ssh/config", "cat .npmrc", "cat app.key", "cat mytoken.json", "cat passwd.bak"]) {
+for (const c of ["cat .env", "cat sub/.env.local", "cat id_rsa", "cat deploy/id_ed25519", "cat x.pem", "cat secrets.txt", "cat ../credentials", "cat .ssh/config", "cat .npmrc", "cat app.key", "cat mytoken.json", "cat passwd.bak",
+                 "cat .ENV", "cat ID_RSA", "cat Secrets.TXT", "cat sub/.SSH/config"]) { // SR-P1-2: credential check is CASE-INSENSITIVE
   t(`credential path ⇒ null (escalate): ${c}`, planSanitize(c) === null);
 }
 

@@ -192,6 +192,7 @@ describe("plugging into agents as an MCP server", () => {
     const dir = await home();
     const file = path.join(dir, ".claude", "settings.json");
     const prev = process.env.SWARM_APPROVAL_DELEGATE; delete process.env.SWARM_APPROVAL_DELEGATE;
+    const prevSR = process.env.SWARM_SANITIZED_READ; delete process.env.SWARM_SANITIZED_READ; // SR-P2-2: BOTH flags off ⇒ no gate
     try {
       installClaudeStatusHooks(BIN, dir);
       const cfg = JSON.parse(await readFile(file, "utf8"));
@@ -199,7 +200,27 @@ describe("plugging into agents as an MCP server", () => {
       const flat = pr.flatMap((g) => g.hooks);
       expect(flat.some((h) => h.command.includes("report-status blocked") && h.async === true)).toBe(true);
       expect(flat.some((h) => h.command.includes("permission-gate"))).toBe(false); // dormant: no gate hook
-    } finally { if (prev === undefined) delete process.env.SWARM_APPROVAL_DELEGATE; else process.env.SWARM_APPROVAL_DELEGATE = prev; }
+    } finally {
+      if (prev === undefined) delete process.env.SWARM_APPROVAL_DELEGATE; else process.env.SWARM_APPROVAL_DELEGATE = prev;
+      if (prevSR === undefined) delete process.env.SWARM_SANITIZED_READ; else process.env.SWARM_SANITIZED_READ = prevSR;
+    }
+  });
+
+  it("SR-P2-2: SANITIZED_READ ON alone (APPROVAL_DELEGATE off) ALSO installs the SYNC permission-gate hook", async () => {
+    const dir = await home();
+    const file = path.join(dir, ".claude", "settings.json");
+    const prevA = process.env.SWARM_APPROVAL_DELEGATE; delete process.env.SWARM_APPROVAL_DELEGATE;
+    const prevS = process.env.SWARM_SANITIZED_READ; process.env.SWARM_SANITIZED_READ = "1";
+    try {
+      installClaudeStatusHooks(BIN, dir);
+      const cfg = JSON.parse(await readFile(file, "utf8"));
+      const flat = (cfg.hooks.PermissionRequest as { hooks: { command: string; async?: boolean }[] }[]).flatMap((g) => g.hooks);
+      expect(flat.some((h) => h.command.includes("permission-gate") && h.async === false)).toBe(true); // sanitize needs the sync gate too
+      expect(flat.some((h) => h.command.includes("report-status blocked"))).toBe(false);
+    } finally {
+      if (prevA === undefined) delete process.env.SWARM_APPROVAL_DELEGATE; else process.env.SWARM_APPROVAL_DELEGATE = prevA;
+      if (prevS === undefined) delete process.env.SWARM_SANITIZED_READ; else process.env.SWARM_SANITIZED_READ = prevS;
+    }
   });
 
   it("approval-delegation ON: PermissionRequest becomes the SYNC permission-gate hook (async:false), no blocked hook", async () => {

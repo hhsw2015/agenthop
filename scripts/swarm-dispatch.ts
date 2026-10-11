@@ -1847,8 +1847,11 @@ async function main(): Promise<void> {
     if (state === "absent") { approvalPendingRelease.delete(file); return; } // truly gone ⇒ nothing stranded
     approvalPendingRelease.add(file);                                        // present OR unknown ⇒ retry next sweep
   };
-  const runApprovalDelegation = (): void => {
+  let approvalDelegationInFlight = false; // SR-P2-1: single-flight — a slow async sanitize read must not let the next sweep overlap this drain
+  const runApprovalDelegation = async (): Promise<void> => {
     if (!approvalDelegateEnabled() && !sanitizedReadEnabled()) return; // drain the approvals key if EITHER feature is on
+    if (approvalDelegationInFlight) return;
+    approvalDelegationInFlight = true;
     try {
       for (const f of [...approvalPendingRelease]) releaseOrDefer(f); // ADIO-P2-1: first retry any release deferred last sweep
       if (sanitizedReadEnabled()) gcSanitizedResults(HOME, 300); // sanitized-read: best-effort GC of stale one-shot result files (never throws)
@@ -1876,12 +1879,18 @@ async function main(): Promise<void> {
           if (action.act === "delegate") {
             if (approvalDelegateEnabled()) decision = action.decision; // delegate only when SWARM_APPROVAL_DELEGATE is on
           } else if (action.act === "sanitize") {
-            const startedMs = Date.now();
-            const rr = resolveAndRead(action.spec, req.cwd); // coordinator-side hardened read (O_NOFOLLOW + realpath + cwd-confined); no subprocess
-            if (rr.ok && Date.now() - startedMs <= SANITIZED_READ_BUDGET_SEC * 1000) {
+            // SR-P2-1: ONE budget over the WHOLE op (async read + write + build) — a slow read never blocks the sweep (the await
+            // yields the event loop) and the write phase is covered too; over-budget ⇒ null ⇒ NO decision ⇒ fail-to-user.
+            const budgetMs = SANITIZED_READ_BUDGET_SEC * 1000;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const op = (async (): Promise<PermissionDecision | null> => {
+              const rr = await resolveAndRead(action.spec, req.cwd); // coordinator-side hardened ASYNC read; no subprocess/shell/env
+              if (!rr.ok) return null;
               const resultPath = writeSanitizedResult(HOME, rr.bytes, rr.truncated);
-              decision = buildSanitizeDecision(req, resultPath, coordSid, nowSec());
-            } // else: resolve failure OR over-budget ⇒ no decision ⇒ fail-to-user
+              return buildSanitizeDecision(req, resultPath, coordSid, nowSec());
+            })();
+            decision = await Promise.race([op, new Promise<null>((res) => { timer = setTimeout(() => res(null), budgetMs); })]);
+            if (timer) clearTimeout(timer);
           }
           if (decision) {
             const { state, result } = commitTask(st, [{ put: "permissionDecision", permissionDecision: decision }]);
@@ -1896,6 +1905,7 @@ async function main(): Promise<void> {
         }
       }
     } catch (e) { log(`approval delegation failed (isolated): ${e instanceof Error ? e.message : e}`); }
+    finally { approvalDelegationInFlight = false; }
   };
 
   // Morning digest (TG v1 CORE composeDigest had no trigger ⇒ never produced). At/after the local target hour, once per calendar
@@ -2024,7 +2034,7 @@ async function main(): Promise<void> {
       // approval-delegation (IO round): classify members' PermissionRequests from the dedicated approval key and delegate the
       // safe reads (commit a control-log permissionDecision the member hook polls back). Gated on SWARM_APPROVAL_DELEGATE
       // (default OFF); fully fail-soft; never auto-grants (an escalate falls to the user).
-      runApprovalDelegation();
+      await runApprovalDelegation();
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
       // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
       runGaugeSampling();

@@ -26,12 +26,14 @@ t("allow-only: no delegate carries deny", ["pwd", "cat x", "rm x"].every(c => { 
 t("sanitize: cat ⇒ act sanitize when flag on", planCoordinatorAction(reqOf("cat notes.txt"), "c", 1, { SWARM_SANITIZED_READ: "1" }).act === "sanitize");
 t("sanitize: cat ⇒ escalate when flag off", planCoordinatorAction(reqOf("cat notes.txt"), "c", 1, {}).act === "escalate");
 t("sanitize: credential cat ⇒ escalate even with flag on", planCoordinatorAction(reqOf("cat .env"), "c", 1, { SWARM_SANITIZED_READ: "1" }).act === "escalate");
+t("sanitize: .ENV (uppercase credential) ⇒ escalate, never sanitize (SR-P1-2 case-insensitive)", planCoordinatorAction(reqOf("cat .ENV"), "c", 1, { SWARM_SANITIZED_READ: "1" }).act === "escalate");
+t("sanitize: substitution cat ⇒ escalate privilege, never downgraded to sanitize (SR-P1-2)", planCoordinatorAction(reqOf("cat $(id)"), "c", 1, { SWARM_SANITIZED_READ: "1" }).act === "escalate");
 t("sanitize: scope-free still delegates (flag on doesn't change pwd)", planCoordinatorAction(reqOf("pwd"), "c", 1, { SWARM_SANITIZED_READ: "1" }).act === "delegate");
 t("sanitize: spec carries the target", (() => { const a = planCoordinatorAction(reqOf("cat notes.txt"), "c", 1, { SWARM_SANITIZED_READ: "1" }); return a.act === "sanitize" && a.spec.readKind === "cat" && a.spec.targetArg === "notes.txt"; })());
 {
   const req = reqOf("cat notes.txt");
   const d = buildSanitizeDecision(req, "/results/abc.out", "coord", 77);
-  t("buildSanitizeDecision: sanitized + cat-result rewrite + binds the call", d.sanitized === true && d.rewrite === "builtin command /bin/cat /results/abc.out" && d.command === "cat notes.txt" && d.toolInputDigest === req.toolInputDigest && d.behavior === "allow" && d.by === "coord" && d.atSec === 77);
+  t("buildSanitizeDecision: sanitized + cat-result rewrite + binds the call", d.sanitized === true && d.rewrite === "builtin command /bin/cat '/results/abc.out'" && d.command === "cat notes.txt" && d.toolInputDigest === req.toolInputDigest && d.behavior === "allow" && d.by === "coord" && d.atSec === 77);
 }
 
 // ── parsePermissionHook + toolInputDigest ─────────────────────────────────────────────────────────────────────
@@ -109,11 +111,15 @@ await (async () => { const { deps, out } = mkDeps({ rid: "nonce-2", decisions: {
 
 // ── runPermissionGate: the SANITIZE branch (trust the coordinator's rewrite, but validate shape + result-dir + lstat) ──
 const catPayload = { session_id: "mem1", tool_name: "Bash", tool_input: { command: "cat notes.txt" }, cwd: "/w", prompt_id: "pr1" };
-const sanDec = (rid: string, over: Partial<PermissionDecision> = {}): PermissionDecision => ({ requestId: rid, member: "mem1", tool: "Bash", command: "cat notes.txt", toolInputDigest: toolInputDigest({ command: "cat notes.txt" }), behavior: "allow", sanitized: true, rewrite: "builtin command /bin/cat /results/abc.out", by: "c", reason: "x", atSec: 1, promptId: "pr1", ...over });
-await (async () => { const { deps, out } = mkDeps({ readStdin: async () => catPayload, decisions: { "nonce-1": sanDec("nonce-1") }, sanitizedResultDir: "/results" }); await runPermissionGate(deps); t("gate sanitize: valid ⇒ emits allow + cat-result updatedInput", out.length === 1 && out[0] === allowDecisionOutput({ command: "builtin command /bin/cat /results/abc.out" })); })();
-await (async () => { const { deps, out } = mkDeps({ readStdin: async () => catPayload, decisions: { "nonce-1": sanDec("nonce-1", { rewrite: "builtin command /bin/cat /etc/passwd" }) }, sanitizedResultDir: "/results" }); await runPermissionGate(deps); t("gate sanitize: result path OUTSIDE result dir ⇒ nothing (user)", out.length === 0); })();
+const sanDec = (rid: string, over: Partial<PermissionDecision> = {}): PermissionDecision => ({ requestId: rid, member: "mem1", tool: "Bash", command: "cat notes.txt", toolInputDigest: toolInputDigest({ command: "cat notes.txt" }), behavior: "allow", sanitized: true, rewrite: "builtin command /bin/cat '/results/abc.out'", by: "c", reason: "x", atSec: 1, promptId: "pr1", ...over });
+await (async () => { const { deps, out } = mkDeps({ readStdin: async () => catPayload, decisions: { "nonce-1": sanDec("nonce-1") }, sanitizedResultDir: "/results" }); await runPermissionGate(deps); t("gate sanitize: valid ⇒ emits allow + cat-result updatedInput", out.length === 1 && out[0] === allowDecisionOutput({ command: "builtin command /bin/cat '/results/abc.out'" })); })();
+await (async () => { const { deps, out } = mkDeps({ readStdin: async () => catPayload, decisions: { "nonce-1": sanDec("nonce-1", { rewrite: "builtin command /bin/cat '/etc/passwd'" }) }, sanitizedResultDir: "/results" }); await runPermissionGate(deps); t("gate sanitize: result path OUTSIDE result dir ⇒ nothing (user)", out.length === 0); })();
 await (async () => { const { deps, out } = mkDeps({ readStdin: async () => catPayload, decisions: { "nonce-1": sanDec("nonce-1") }, sanitizedResultDir: "/results", pinnedPathOk: () => false }); await runPermissionGate(deps); t("gate sanitize: result not a regular file (lstat fail) ⇒ nothing (user)", out.length === 0); })();
 await (async () => { const { deps, out } = mkDeps({ readStdin: async () => catPayload, decisions: { "nonce-1": sanDec("nonce-1", { rewrite: "cat /results/abc.out" }) }, sanitizedResultDir: "/results" }); await runPermissionGate(deps); t("gate sanitize: non-pinned rewrite shape ⇒ nothing (user)", out.length === 0); })();
 await (async () => { const { deps, out } = mkDeps({ readStdin: async () => catPayload, decisions: { "nonce-1": sanDec("nonce-1") } }); await runPermissionGate(deps); t("gate sanitize: no result dir configured ⇒ nothing (user)", out.length === 0); })();
+// SR-P1-3: strict result-path validation (single-quoted + exact <hex>.out under the dir) — ../ escape, glob, non-.out all reject.
+await (async () => { const { deps, out } = mkDeps({ readStdin: async () => catPayload, decisions: { "nonce-1": sanDec("nonce-1", { rewrite: "builtin command /bin/cat '/results/../etc/passwd'" }) }, sanitizedResultDir: "/results" }); await runPermissionGate(deps); t("gate sanitize: ../ escape in result path ⇒ nothing (SR-P1-3)", out.length === 0); })();
+await (async () => { const { deps, out } = mkDeps({ readStdin: async () => catPayload, decisions: { "nonce-1": sanDec("nonce-1", { rewrite: "builtin command /bin/cat '/results/ab*.out'" }) }, sanitizedResultDir: "/results" }); await runPermissionGate(deps); t("gate sanitize: glob in result name ⇒ nothing (SR-P1-3)", out.length === 0); })();
+await (async () => { const { deps, out } = mkDeps({ readStdin: async () => catPayload, decisions: { "nonce-1": sanDec("nonce-1", { rewrite: "builtin command /bin/cat '/results/abc.txt'" }) }, sanitizedResultDir: "/results" }); await runPermissionGate(deps); t("gate sanitize: non-.out result name ⇒ nothing (SR-P1-3)", out.length === 0); })();
 
 console.log("all approval-gate selftests passed");

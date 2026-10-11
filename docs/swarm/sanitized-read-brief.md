@@ -1,4 +1,4 @@
-# sanitized-read — design brief (DRAFT for coordinator freeze)
+# sanitized-read — design brief (FROZEN 2026-10-11; Phase 1 = `cat`, shipped & reviewed)
 
 owner 90b58f9c · reviewer happycapy (01a127b6) · branch `feat/sanitized-read` off main `@20b662d` · the follow-up to the
 approval architecture ruling **B** (coordinator runs a hardened read, injects the output; never allows the member's command).
@@ -78,7 +78,9 @@ The member issued a read (e.g. Bash `cat foo`) and expects the content on stdout
 Reuse the ENTIRE approval pipeline (S11 request → dispatcher drains the dedicated key → classify → control-log decision → hook
 polls back by requestId → emits). Add a FOURTH verdict class:
 
-- `ApprovalVerdict`: `delegate | escalate | **sanitize**`. `sanitize` = a path/git read matching the enumerated sanitizable forms
+- **SHIPPED as a 4th `CoordinatorAction` act `sanitize`** (NOT a 4th `ApprovalVerdict` class — coordinator-accepted: `sanitize`
+  requires IO = a coordinator action, and it avoids a `sanitized-read`↔`approval-delegation` import cycle; `classifyApproval` stays
+  v1-pure, the sanitize fork lives in `planCoordinatorAction`). Conceptually: `sanitize` = a path/git read matching the enumerated forms
   AND passing the structural guards (the same control-char/metachar/glob/quote/`$`/blacklist guards as v1). privilege/unknown stay
   `escalate`; scope-free stays `delegate`.
 - `classifyApproval`: the path/git forms that today → `escalate("needs-user")` move to → `sanitize` (gated on the new flag).
@@ -101,10 +103,18 @@ The coordinator's hardened read has COST (esp. a git worktree) + LATENCY (the me
 
 ## ⑤ Threat-model residual (explicit)
 
+**Same-uid attacker model (coordinator ruling — ONE unified non-differential class).** The coordinator and the member run as the
+SAME uid (the user's machine). A member that wants a file the user has not approved can read it DIRECTLY (`cat /etc/foo` itself —
+the popup only asks the user to *look*). So the residuals below — the shell-init startup code, the macOS lstat-walk race window,
+and the result-tmpfile swap — are ONE class: a member that ACTIVELY races the coordinator can bypass the user's look, but NEVER
+gains privilege or new reachability. Per the coordinator ruling (the approval shell-init precedent) this class is a **scope
+exclusion** — documented here, excluded from the review gate, NOT a claim of verified equivalence with manual approval, and no
+per-item user sign-off (differential ≈ zero). Each bullet records its specific mechanism.
+
 - **Same-machine only:** the coordinator needs filesystem access to the member's cwd/repo. REMOTE members (vm-ctl/placement boxes)
   ⇒ the coordinator cannot read their files ⇒ those reads fall to the user (ship-the-file is out of scope). Stated loudly.
-- **Shell-init residual (inherited from v1):** the member runs `builtin command /bin/cat <result>` in its OWN shell ⇒ the
-  BASH_ENV/startup residual (the same coordinator-ruled NON-DIFFERENTIAL residual as v1 — it defeats a user approval equally).
+- **Shell-init residual (inherited from v1):** the member runs the rewrite in its OWN shell ⇒ a BASH_ENV/startup-file residual —
+  part of the same-uid non-differential class above (a scope exclusion, not asserted equivalent to manual approval).
 - **Result-tmpfile TOCTOU:** the member could swap the result tmpfile before reading — but the content is the already-sanitized
   output (the member's own data), so a swap leaks nothing new. (0600, coordinator-owned dir.)
 - **Returned content is entitled:** sanitized-read returns content the member may already read (its own cwd files / committed
@@ -118,7 +128,8 @@ The coordinator's hardened read has COST (esp. a git worktree) + LATENCY (the me
 
 ## Scope / phasing (recommendation)
 
-- **Phase 1 — PATH reads** (cat/head/tail/wc/ls/file/stat): cleanest, no git complexity, the biggest popup bulk. Delivers the
+- **Phase 1 — `cat <file>` ONLY (SHIPPED)**: the canonical path read (byte-exact via an O_NOFOLLOW fd), proving the whole pipeline;
+  head/tail/wc/ls/stat/file are a `readKind`→producer table extension (Phase 1b). Cleanest, no git complexity. Delivers the
   `sanitize` verdict + the output-injection channel + the budget/fail-to-user + the dormant flag.
 - **Phase 2 — git committed-history** (log/show/diff/branch/remote, incl. content) via throwaway-worktree hardening.
 - **Phase 3 (open) — git working-tree-dependent** (status, unstaged diff): pending open-Q 3.
@@ -133,7 +144,7 @@ Each phase is a separate reviewable unit; Phase 1 is the pipeline proof (mirrors
   latest-wins. **FC-7:** the `sanitize` verdict + `sanitizedResultRef` are additive; legacy decisions unaffected.
 - cli must NOT import bus (the hook CLI duplicates helpers, as in v1).
 
-## Open questions for the coordinator to freeze
+## Open questions — ALL FROZEN 2026-10-11 (coordinator ruled; recorded here for history)
 
 1. **② injection:** PRIMARY = `updatedInput` rewrite to `builtin command /bin/cat <result-tmpfile>` (recommended) vs the
    deny+message fallback. (Re-verify the hook contract at ship.)
@@ -147,4 +158,8 @@ Each phase is a separate reviewable unit; Phase 1 is the pipeline proof (mirrors
 6. **budget:** `SANITIZED_READ_BUDGET_SEC` default (propose 10s) + output-size cap (propose 1 MiB → truncate-with-marker) +
    fail-to-user confirmed.
 
-**On freeze → Phase 1 code (owner 90b58f9c), reviewer happycapy. STOP until frozen.**
+Freeze answers (coordinator 2026-10-11): ① updatedInput rewrite + lstat the result path; ② the `sanitize` verdict (shipped as a
+`CoordinatorAction` act, above); ③ git working-tree → Phase 3; ④ keep `SECRET_RE` (case-insensitive; reuse, no new regex); ⑤
+tmpfile 0600 coordinator-owned; ⑥ budget 10s / cap 1 MiB / explicit `[truncated at 1MiB]` marker / fail-to-user. The two TOCTOU
+walls (SR-P1-1 fd-binding, SR-P1-3 result-swap) → /proc-on-Linux + lstat-walk-on-macOS + strict validation + the unified same-uid
+non-differential residual class (⑤). **Phase 1 (`cat`) shipped & reviewed; Phase 1b (head/tail/wc/ls/stat/file) + Phase 2 (git) next.**

@@ -55,7 +55,9 @@ export function planCoordinatorAction(req: ApprovalRequest, by: string, nowSec: 
   // and injects the output. Gated on SWARM_SANITIZED_READ. planSanitize applies the same structural guards + the credential
   // red-line; the DECISION is built LATER (buildSanitizeDecision) by the dispatcher AFTER it runs the read (the result path is an
   // IO output). classifyApproval stays v1-pure — the sanitize fork lives here (the coordinator's action), avoiding an import cycle.
-  if (req.tool === "Bash" && sanitizedReadEnabled(env)) {
+  // SR-P1-2: ONLY a `needs-user` verdict may be sanitized — a `privilege` verdict (blacklist / credential / substitution) is NEVER
+  // downgraded to a sanitize approval. (verdict is narrowed to `escalate` here — the delegate branch returned above.)
+  if (req.tool === "Bash" && sanitizedReadEnabled(env) && verdict.kind === "escalate" && verdict.reason === "needs-user") {
     const spec = planSanitize(req.command);
     if (spec) return { act: "sanitize", spec };
   }
@@ -66,7 +68,7 @@ export function planCoordinatorAction(req: ApprovalRequest, by: string, nowSec: 
  *  member/tool/command/toolInputDigest as a delegate (so decisionBindsTo holds), sets `sanitized:true`, and the rewrite reads the
  *  coordinator-produced result via the v1 impl-pin (`builtin command /bin/cat <resultPath>`). Pure. */
 export function buildSanitizeDecision(req: ApprovalRequest, resultPath: string, by: string, nowSec: number): PermissionDecision {
-  return { requestId: req.requestId, member: req.member, tool: req.tool, command: req.command, toolInputDigest: req.toolInputDigest, behavior: "allow", rewrite: `builtin command /bin/cat ${resultPath}`, sanitized: true, by, reason: `sanitized-read:${req.tool}`, atSec: nowSec, promptId: req.promptId };
+  return { requestId: req.requestId, member: req.member, tool: req.tool, command: req.command, toolInputDigest: req.toolInputDigest, behavior: "allow", rewrite: `builtin command /bin/cat '${resultPath}'`, sanitized: true, by, reason: `sanitized-read:${req.tool}`, atSec: nowSec, promptId: req.promptId }; // SR-P1-3: SINGLE-QUOTE the result path so the member shell does NO glob/word-split (fixes glob-expansion + spaced HOME)
 }
 
 /** The subset of a Claude `PermissionRequest` hook's stdin JSON this feature needs. */
@@ -158,13 +160,18 @@ export async function runPermissionGate(deps: PermissionGateDeps): Promise<void>
       if (dec.sanitized === true) {
         // SANITIZE (ruling B): the result is a COORDINATOR-produced file — the member CANNOT recompute it, so it TRUSTS the
         // decision's rewrite but VALIDATES it before emitting (the ONE trust-model difference from a delegate): (a) the rewrite is
-        // EXACTLY `builtin command /bin/cat <path>` (no spaces in <path>); (b) <path> is under the coordinator's sanitized-read
+        // EXACTLY `builtin command /bin/cat '<path>'` (single-quoted — SR-P1-3); (b) <path> is under the coordinator's sanitized-read
         // result dir; (c) /bin/cat AND <path> are real regular files (PIN ①, lstat — anti result-swap-to-dir/symlink). Any fail ⇒ user.
-        const m = /^builtin command \/bin\/cat (\/[^\s]+)$/.exec(dec.rewrite);
+        // SR-P1-3: the rewrite is SINGLE-QUOTED (`'<path>'`) so the member shell does NO glob/word-split/expansion. Validate the
+        // EXACT shape, then a STRICT result filename (<hex>.out — no `..`, no `/`, no glob metachar, no space) under the result dir.
+        const m = /^builtin command \/bin\/cat '(\/[^']+)'$/.exec(dec.rewrite);
         if (!m) return;
         const resultPath = m[1]!;
         const dir = deps.sanitizedResultDir;
-        if (!dir || !(resultPath === dir || resultPath.startsWith(dir.endsWith("/") ? dir : dir + "/"))) return; // not under the result dir ⇒ user
+        if (!dir) return;
+        const prefix = dir.endsWith("/") ? dir : dir + "/";
+        if (!resultPath.startsWith(prefix)) return;                                   // must be UNDER the coordinator result dir
+        if (!/^[0-9a-f]{1,64}\.out$/.test(resultPath.slice(prefix.length))) return;   // exact <hex>.out — rejects ../, subdirs, globs, spaces
         if (!deps.pinnedPathOk("/bin/cat") || !deps.pinnedPathOk(resultPath)) return; // both must be real regular files in THIS env
         const updatedInput = { ...(parsed.toolInput as Record<string, unknown>), command: dec.rewrite };
         deps.emit(allowDecisionOutput(updatedInput));
