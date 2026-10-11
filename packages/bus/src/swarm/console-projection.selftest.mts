@@ -9,7 +9,7 @@
  *
  * Run: packages/bus/node_modules/.bin/tsx packages/bus/src/swarm/console-projection.selftest.mts
  */
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync, chmodSync, symlinkSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -38,6 +38,10 @@ const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); 
 const tmpHome = () => mkdtempSync(path.join(os.tmpdir(), "console-proj-"));
 const consoleDecisionsDir = (home: string) => path.join(home, ".agenthop", "swarm", "console", "decisions");
 const rosterFile = (home: string) => path.join(home, ".agenthop", "swarm", "console", "roster.json");
+const rosterSnap = (home: string) => path.join(home, ".agenthop", "swarm", "roster-snapshot.json");
+const batchesStoreDir = (home: string) => path.join(home, ".agenthop", "console", "decision-batches");
+// chmod-based fault injection is meaningless under root (root bypasses the permission bits) — skip those cases there.
+const canTestPerms = (process.getuid?.() ?? 0) !== 0;
 
 // =====================================================================================================================
 // Flag: default-ON + kill-switch
@@ -190,7 +194,7 @@ t("seatAliveOf unexpected ⇒ unknown", seatAliveOf("garbage" as unknown as Live
   t("IO②: fields present", onDisk.seats[0].tool === "claude" && onDisk.seats[0].pane === "Work-1" && typeof onDisk.seats[0].inflight === "number");
   t("IO②: no presence pid ⇒ alive UNKNOWN (never false dead)", onDisk.seats.every((s: { alive: string }) => s.alive === "unknown"));
   t("IO②: inflight 0 with no control-log", onDisk.seats.every((s: { inflight: number }) => s.inflight === 0));
-  t("IO②: proj return matches disk", proj.seats.length === onDisk.seats.length);
+  t("IO②: proj return matches disk", proj !== null && proj.seats.length === onDisk.seats.length);
 }
 
 // =====================================================================================================================
@@ -203,7 +207,7 @@ t("seatAliveOf unexpected ⇒ unknown", seatAliveOf("garbage" as unknown as Live
     members: [{ member: "sid-x", tool: "claude", cwd: "/w", role: null, title: "px" }],
     livenessOf: () => { throw new Error("probe exploded"); },
   });
-  t("fail-soft: throwing probe ⇒ seat unknown, no crash", proj.seats.length === 1 && proj.seats[0]!.alive === "unknown");
+  t("fail-soft: throwing probe ⇒ seat unknown, no crash", proj !== null && proj.seats.length === 1 && proj.seats[0]!.alive === "unknown");
 }
 
 // =====================================================================================================================
@@ -216,6 +220,93 @@ t("seatAliveOf unexpected ⇒ unknown", seatAliveOf("garbage" as unknown as Live
   t("fail-soft: combined writer on empty home does not throw", threw === false);
   t("fail-soft: empty home roster.json still written (0 seats)", existsSync(rosterFile(home)) && JSON.parse(readFileSync(rosterFile(home), "utf8")).seats.length === 0);
   t("fail-soft: empty home decisions dir created", existsSync(consoleDecisionsDir(home)) && readdirSync(consoleDecisionsDir(home)).filter((f) => f.endsWith(".json")).length === 0);
+}
+
+// =====================================================================================================================
+// CP-1 (FC-2 r3) — read/enumerate UNCERTAINTY keeps old mirrors; only CONFIRMED terminal/vanished is pruned
+// =====================================================================================================================
+{
+  const home = tmpHome();
+  const b1 = openBatch(home, { owner: "coord", items: [{ id: "x1", kind: "merge", summary: "s", suggestedAction: "approve" }], nowSec: 100 });
+  const b2 = openBatch(home, { owner: "coord", items: [{ id: "y1", kind: "merge", summary: "s", suggestedAction: "approve" }], nowSec: 101 });
+  writeDecisionMirrors(home, 500);
+  const f1 = path.join(consoleDecisionsDir(home), `${b1.batchId}.json`);
+  const f2 = path.join(consoleDecisionsDir(home), `${b2.batchId}.json`);
+  t("CP-1 setup: both mirrors written", existsSync(f1) && existsSync(f2));
+  // CONFIRMED-vanished: remove b2's store dir ⇒ absent from a SUCCESSFUL enumeration ⇒ its mirror is pruned; b1 kept.
+  rmSync(path.join(batchesStoreDir(home), b2.batchId), { recursive: true, force: true });
+  const rv = writeDecisionMirrors(home, 510);
+  t("CP-1: a CONFIRMED-vanished batch ⇒ mirror pruned", !existsSync(f2));
+  t("CP-1: the still-awaiting batch ⇒ mirror kept + re-written", existsSync(f1) && rv.written.includes(b1.batchId));
+  if (canTestPerms) {
+    // GLOBAL enumerate fault: make the store batches dir unreadable ⇒ listBatchesStrict throws ⇒ SKIP (keep ALL mirrors).
+    chmodSync(batchesStoreDir(home), 0o000);
+    const rs = writeDecisionMirrors(home, 520);
+    chmodSync(batchesStoreDir(home), 0o755); // restore so the batch stays readable (cleanup)
+    t("CP-1: a GLOBAL enumerate fault ⇒ skipped, old mirror NOT pruned (never a false prune)", rs.skipped === true && existsSync(f1));
+  }
+}
+
+// =====================================================================================================================
+// CP-2 (FC-2 r3) — an UNREADABLE roster/control source SKIPS the publish (keeps last), never a fresh false-empty
+// =====================================================================================================================
+{
+  // CONFIRMED-empty (swarm dir exists, snapshot ENOENT) ⇒ still publishes an empty roster — NOT a skip.
+  const home = tmpHome();
+  mkdirSync(path.join(home, ".agenthop", "swarm"), { recursive: true });
+  const p = writeRosterProjection(home, 1);
+  t("CP-2: CONFIRMED-empty roster (ENOENT) ⇒ still publishes an empty roster (not a skip)", p !== null && p.seats.length === 0);
+}
+if (canTestPerms) {
+  // (2a) roster snapshot readable ⇒ 1 seat; then UNREADABLE ⇒ skip (null), prior roster.json untouched.
+  const home = tmpHome();
+  mkdirSync(path.join(home, ".agenthop", "swarm"), { recursive: true });
+  writeFileSync(rosterSnap(home), JSON.stringify({ version: 2, members: [{ member: "sid-1", tool: "claude", cwd: "/w", role: null, title: "W1" }] }));
+  const first = writeRosterProjection(home, 100);
+  t("CP-2 setup: readable roster ⇒ 1 seat", first !== null && first.seats.length === 1);
+  const before = readFileSync(rosterFile(home), "utf8");
+  chmodSync(rosterSnap(home), 0o000);
+  const skipped = writeRosterProjection(home, 200);
+  chmodSync(rosterSnap(home), 0o644);
+  t("CP-2: UNREADABLE roster snapshot ⇒ publish SKIPPED (null)", skipped === null);
+  t("CP-2: the last roster.json is untouched on skip (no false-empty overwrite)", readFileSync(rosterFile(home), "utf8") === before);
+
+  // (2b) control-log present but UNREADABLE ⇒ skip (not a false zero-inflight).
+  const home2 = tmpHome();
+  mkdirSync(path.join(home2, ".agenthop", "swarm"), { recursive: true });
+  writeFileSync(rosterSnap(home2), JSON.stringify({ version: 2, members: [{ member: "sid-1", tool: "claude", cwd: "/w", role: null }] }));
+  const cdir = path.join(home2, ".agenthop", "swarm", "control-log");
+  mkdirSync(cdir, { recursive: true });
+  writeFileSync(path.join(cdir, "1.json"), JSON.stringify({ seq: 1, changes: [] }));
+  t("CP-2 setup: readable control-log ⇒ written", writeRosterProjection(home2, 100) !== null);
+  chmodSync(cdir, 0o000);
+  const skipped2 = writeRosterProjection(home2, 200);
+  chmodSync(cdir, 0o755);
+  t("CP-2: UNREADABLE control-log ⇒ publish SKIPPED (null)", skipped2 === null);
+}
+
+// =====================================================================================================================
+// CP-3 — a pre-existing symlink on the output dir chain is REFUSED (no write/prune outside the console boundary)
+// =====================================================================================================================
+{
+  // decisions/ is a symlink into a private dir with a victim file ⇒ writeDecisionMirrors refuses; the victim is untouched.
+  const home = tmpHome();
+  const evil = path.join(home, "evil"); mkdirSync(evil, { recursive: true });
+  const victim = path.join(evil, "victim.json"); writeFileSync(victim, JSON.stringify({ sensitive: true }));
+  mkdirSync(path.join(home, ".agenthop", "swarm", "console"), { recursive: true });
+  symlinkSync(evil, path.join(home, ".agenthop", "swarm", "console", "decisions"));
+  const rs = writeDecisionMirrors(home, 100);
+  t("CP-3: decisions/ symlink ⇒ writeDecisionMirrors SKIPPED", rs.skipped === true);
+  t("CP-3: the victim file OUTSIDE the boundary is untouched", existsSync(victim));
+
+  // console/ itself is a symlink ⇒ writeRosterProjection refuses; nothing lands in the redirected dir.
+  const home2 = tmpHome();
+  const evil2 = path.join(home2, "evil2"); mkdirSync(evil2, { recursive: true });
+  mkdirSync(path.join(home2, ".agenthop", "swarm"), { recursive: true });
+  symlinkSync(evil2, path.join(home2, ".agenthop", "swarm", "console"));
+  const rp = writeRosterProjection(home2, 100);
+  t("CP-3: console/ symlink ⇒ writeRosterProjection SKIPPED (null)", rp === null);
+  t("CP-3: nothing written into the redirected console dir", !existsSync(path.join(evil2, "roster.json")));
 }
 
 console.log("all console-projection selftests passed");
