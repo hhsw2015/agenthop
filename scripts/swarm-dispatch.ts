@@ -2038,7 +2038,7 @@ async function main(): Promise<void> {
       // an unverified op. Gated on SWARM_OPS_RECEIPT (LIVE BY DEFAULT, batch-2; =0 to disable); fully fail-soft.
       runOpsReceipt();
       // F53 ③: succession-heartbeat — a swapped member silent past the window ⇒ S19. Gated on SWARM_SUCCESSION_HEARTBEAT
-      // (default OFF), independent of SWARM_SENTINEL; fully fail-soft.
+      // (LIVE BY DEFAULT, batch-2; =0 to disable), independent of SWARM_SENTINEL; fully fail-soft.
       runSuccessionHeartbeat();
       // T5-5: review-seat autoscale SUGGESTION (never acts) — read the review-queue ledger, advise the coordinator on seat
       // scaling. Gated on SWARM_REVIEW_AUTOSCALE (live by default; kill with =0); fully fail-soft.
@@ -2049,9 +2049,10 @@ async function main(): Promise<void> {
       // placement suggestion (reconcile → selectBackends → coordinator advisory). Gated on SWARM_PLACEMENT (default OFF); never
       // spawns/spends (R16); fully fail-soft.
       runPlacementSuggest();
-      // approval-delegation (IO round): classify members' PermissionRequests from the dedicated approval key and delegate the
-      // safe reads (commit a control-log permissionDecision the member hook polls back). Gated on SWARM_APPROVAL_DELEGATE
-      // (default OFF); fully fail-soft; never auto-grants (an escalate falls to the user).
+      // approval-delegation (IO round): classify members' PermissionRequests from the dedicated approval key — delegate the safe
+      // scope-free reads AND run the sanitize fork (commit a control-log permissionDecision the member hook polls back). Gated on
+      // SWARM_APPROVAL_DELEGATE OR SWARM_SANITIZED_READ (both LIVE BY DEFAULT, batch-2; =0 each to disable — the drain runs if
+      // EITHER is on); fully fail-soft; never auto-grants (an escalate falls to the user).
       await runApprovalDelegation();
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
       // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
