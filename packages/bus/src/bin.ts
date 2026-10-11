@@ -69,6 +69,19 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (cmd === "permission-gate") {
+    // The SYNC Claude PermissionRequest hook (approval-delegation). Dormant unless SWARM_APPROVAL_DELEGATE: otherwise it keeps
+    // only the `blocked` status signal and emits nothing, so the call falls to the user exactly as the async report-status hook
+    // did. When on, it writes the S11 approval request to the coordinator and polls the control-log for a delegated decision,
+    // emitting an allow to auto-approve with no user dialog. Lazy import so its deps load only for this subcommand; it reuses
+    // bin.ts's TTY-safe readStdinJson as the hook-stdin channel. Never throws (a hook must not break the agent).
+    try {
+      const { runPermissionGateCli } = await import("./permission-gate-cli.js");
+      await runPermissionGateCli(startedAt, readStdinJson);
+    } catch { /* fail-soft: any fault ⇒ no decision emitted ⇒ user dialog */ }
+    return;
+  }
+
   if (cmd === "bus-bridge") {
     // The per-machine cross-machine gateway for plugin-based tools (OpenCode). A plugin spawns this
     // when a team is set; it exits on its own once the last session has been gone for a grace period,

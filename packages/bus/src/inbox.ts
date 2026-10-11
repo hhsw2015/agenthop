@@ -13,9 +13,13 @@ import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSyn
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
 import { isSubmitIntent, type SubmitIntent } from "./submit-intent.js";
+import { validApprovalRequest, type ApprovalRequest } from "./swarm/approval-delegation.js";
 import { redactSecrets } from "./redact.js";
 
-export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: string; ts: number; actionId?: string; taskRef?: string; title?: string; intent?: SubmitIntent };
+// `approval` (S11, approval-delegation): a member's PermissionRequest payload the sync permission-gate hook writes to the
+// coordinator's inbox. Optional + validated via validApprovalRequest (same additive, backward-compatible precedent as `intent`);
+// an old record lacks it, a malformed one quarantines the message (never derefs undefined, never auto-grants).
+export type InboxMsg = { from: string; fromLabel: string; fromMode?: string; text: string; via: string; ts: number; actionId?: string; taskRef?: string; title?: string; intent?: SubmitIntent; approval?: ApprovalRequest };
 export type Claimed = { file: string; msg: InboxMsg };
 
 /** Validate a parsed inbox record against the transport schema (F28 poison-pill defense). from/fromLabel/text are REQUIRED
@@ -38,6 +42,8 @@ export function validInboxMsg(raw: unknown): InboxMsg | null {
   if (r.taskRef !== undefined && typeof r.taskRef !== "string") return null;
   if (r.title !== undefined && typeof r.title !== "string") return null;
   if (r.intent !== undefined && !isSubmitIntent(r.intent)) return null; // submit-tag: a present intent must be a known value
+  const approval = r.approval === undefined ? undefined : validApprovalRequest(r.approval);
+  if (r.approval !== undefined && approval === null) return null;       // a present-but-malformed approval payload quarantines
   return {
     from: r.from, fromLabel: r.fromLabel, text: r.text, via: r.via, ts: r.ts,
     ...(typeof r.fromMode === "string" ? { fromMode: r.fromMode } : {}),
@@ -45,6 +51,7 @@ export function validInboxMsg(raw: unknown): InboxMsg | null {
     ...(typeof r.taskRef === "string" ? { taskRef: r.taskRef } : {}),
     ...(typeof r.title === "string" ? { title: r.title } : {}),
     ...(isSubmitIntent(r.intent) ? { intent: r.intent } : {}),
+    ...(approval ? { approval } : {}),
   };
 }
 
@@ -53,7 +60,7 @@ export function validInboxMsg(raw: unknown): InboxMsg | null {
  *  via label ("durable-inbox") when omitted, keeps only known fields, and re-validates — throwing on anything the receiver
  *  would quarantine. S11 docs point here instead of hand-writing JSON. */
 export function composeInboxMsg(i: {
-  from: string; fromLabel: string; text: string; via?: string; ts?: number; fromMode?: string; actionId?: string; taskRef?: string; title?: string; intent?: SubmitIntent;
+  from: string; fromLabel: string; text: string; via?: string; ts?: number; fromMode?: string; actionId?: string; taskRef?: string; title?: string; intent?: SubmitIntent; approval?: ApprovalRequest;
 }): InboxMsg {
   const msg: InboxMsg = {
     from: i.from, fromLabel: i.fromLabel, text: i.text,
@@ -64,6 +71,7 @@ export function composeInboxMsg(i: {
     ...(i.taskRef !== undefined ? { taskRef: i.taskRef } : {}),
     ...(i.title !== undefined ? { title: i.title } : {}),
     ...(i.intent !== undefined ? { intent: i.intent } : {}),
+    ...(i.approval !== undefined ? { approval: i.approval } : {}),
   };
   const valid = validInboxMsg(msg);
   if (valid === null) throw new Error("composeInboxMsg: produced an invalid inbox message (from/fromLabel/text must be strings, via a non-empty string, ts finite)");
@@ -413,9 +421,11 @@ export function recoverStaleClaims(home: string, keys: string[]): void {
     let names: string[];
     try { names = readdirSync(dir); } catch { continue; }
     for (const n of names) {
-      const m = n.match(/\.claim-(\d+)$/);
+      // Recognise both claim forms (ADIO-P2-1, FC-7 old-form收编): the bare numeric `.claim-<pid>` AND the dispatcher's
+      // `.claim-disp-<pid>` (SELF = `disp-<pid>`). Extract the numeric pid for the liveness check; a dead pid ⇒ reclaim.
+      const m = n.match(/\.claim-(?:disp-)?(\d+)$/);
       if (!m || alive(Number(m[1]))) continue;
-      try { renameSync(path.join(dir, n), path.join(dir, n.replace(/\.claim-\d+$/, ""))); } catch { /* best-effort */ }
+      try { renameSync(path.join(dir, n), path.join(dir, n.replace(/\.claim-(?:disp-)?\d+$/, ""))); } catch { /* best-effort */ }
     }
   }
 }

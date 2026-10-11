@@ -35,6 +35,7 @@ import type { TaskPlan } from "./task-plan.js";
 import type { TaskAttempt } from "./task-state.js";
 import type { AcceptedResult } from "./task-result.js";
 import type { ControlRecord } from "./control.js";
+import type { PermissionDecision } from "./approval-delegation.js";
 
 /** Dispatch intent (§4.3). Type lives HERE (co-located with Change); the dispatch side imports it and owns the
  *  CONSTRUCTION logic (allocOutcome / physicalEvidence / physicalExpiresAtSec CAS-then-IO semantics). */
@@ -172,7 +173,13 @@ export type ChangeBody =
   | { put: "validationRun"; validationRun: ValidationRun }
   | { put: "lifecycle"; record: ControlRecord }
   | { put: "scan"; branch: string; cursor: string | null }
-  | { put: "tombstone"; launchId: string };
+  | { put: "tombstone"; launchId: string }
+  // approval-delegation ② 留痕: a coordinator's delegated permission decision, keyed by the hook's per-invocation requestId
+  // (ADIO-P1-1 — NOT the user prompt_id, which is shared across a turn's tool calls). One write serves BOTH the audit trail AND
+  // the hook's flowback (the sync permission-gate hook polls this entity by requestId, re-checks the member/tool/command binding,
+  // and applies `behavior`). v1 writes it only for a DELEGATE (behavior "allow"); an escalation writes none (the hook times out
+  // to the user). Additive (FC-7): old records lack it; the projection stores it last-write-wins by `permissionDecision:<requestId>`.
+  | { put: "permissionDecision"; permissionDecision: PermissionDecision };
 
 /** Each Change carries its operation identity (§2.6): a globally-unique operationId and the entityRevision the caller
  *  believed the target entity was at. */
@@ -213,6 +220,10 @@ export function entityKeyOf(c: ChangeBody): string {
     case "lifecycle": return `lifecycle:${c.record.launchId}`;
     case "scan": return `scan:${c.branch}`;
     case "tombstone": return `tombstone:${c.launchId}`;
+    // ADIO-P1-1: per-invocation requestId key (NOT the shared promptId). ADIO-R2-P2-2 (FC-7): a legacy record written before
+    // requestId existed carries only promptId — fall back to it so old records keep DISTINCT identities on replay (never collapse
+    // to `permissionDecision:undefined`).
+    case "permissionDecision": return `permissionDecision:${c.permissionDecision.requestId ?? c.permissionDecision.promptId}`;
   }
 }
 
