@@ -8,16 +8,20 @@
  * marked SETTLED with its estimate RETAINED as a conservative charge — SB3: never refunded). This is the
  * spend-AMOUNT dimension, distinct from the existing spawn-COUNT cap a runaway ticket would otherwise slip.
  *
- * DORMANT: gated behind SWARM_SPEND_BREAKER (default OFF). OFF ⇒ every request is allowed and NO pool is
- * touched (a true no-op); nothing here is wired into the real dispatcher — FC-4 is a filing, not a switch.
+ * Flag SWARM_SPEND_BREAKER is LIVE BY DEFAULT (opt-out, flags-default-flip batch-2; =0 to disable), BUT nothing here is wired
+ * into the real dispatcher — FC-4 is a filing, not a switch — so the flip is a no-op until wired (default only; was "dormant
+ * default OFF" before batch-2). OFF (=0) ⇒ every request is allowed and NO pool is touched (a true no-op).
  * This module only CONSUMES the shared-budget API; it never changes signed shared-budget behavior.
  */
 import { isValidPoolName, type PoolAdmission, type PoolCeiling } from "./shared-budget.js";
+import { flagDefaultOn } from "./flag-default.js";
 
-/** Is the breaker armed? Default OFF — only an explicit truthy SWARM_SPEND_BREAKER arms it (dormant filing). */
+/** Is the breaker armed? LIVE BY DEFAULT (opt-out via [[flagDefaultOn]], flags-default-flip batch-2, user ruling 2026-10-11): on
+ *  unless SWARM_SPEND_BREAKER=0. Tier A (safe direction — the breaker only PREVENTS spend, never authorizes it).
+ *  NOTE: nothing wires spend-breaker-store into the real dispatcher yet (a filing, per the module header), so this flip is an
+ *  honest no-op until it is wired — it only changes the DEFAULT the day it is. */
 export function breakerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = (env.SWARM_SPEND_BREAKER ?? "").trim().toLowerCase();
-  return v === "1" || v === "true" || v === "on" || v === "yes";
+  return flagDefaultOn(env.SWARM_SPEND_BREAKER);
 }
 
 // A ticketId maps to the pool name `task-<ticketId>`; 57 + "task-".length(5) = 62 ≤ the 64-char pool ceiling.

@@ -179,9 +179,11 @@ function entry(bin: string) {
 
 /**
  * Install Claude Code hooks that auto-report this session's work state to the bus (Phase 3 slice B):
- * SessionStart→idle (seed), UserPromptSubmit→working, Stop→idle, PermissionRequest→blocked (the instant
- * approval signal). All are async fire-and-forget and side-effect-only (output suppressed, `|| true`), so
- * they can never block a turn, inject context, or fail. `agenthop report-status` reads
+ * SessionStart→idle (seed), UserPromptSubmit→working, Stop→idle, and PermissionRequest. The status hooks
+ * (idle/working) are async fire-and-forget and side-effect-only (output suppressed, `|| true`), so they can never
+ * block a turn, inject context, or fail. PermissionRequest is the SYNC permission-gate by default (both
+ * SWARM_APPROVAL_DELEGATE and SWARM_SANITIZED_READ are LIVE BY DEFAULT since flags-default-flip batch-2); it falls
+ * back to the async `report-status blocked` signal only when BOTH flags are =0. `agenthop report-status` reads
  * CLAUDE_CODE_SESSION_ID from the hook env.
  * Idempotent: skips any event that already has an agenthop status hook; preserves the user's other hooks
  * and the rest of settings.json (parse → merge → atomic write). ~/.claude/settings.json is JSON, so this
@@ -422,16 +424,23 @@ function statusHookCommand(bin: string, state: string): string {
 }
 
 // --- approval-delegation (IO round ①): the SYNC PermissionRequest hook. Installed for CLAUDE members ONLY (constraint ④ — Codex
-// has no decision-returning permission hook), and ONLY when SWARM_APPROVAL_DELEGATE is on; otherwise PermissionRequest stays the
-// async `report-status blocked` hook exactly as today. The flag read is DUPLICATED here on purpose: cli must not import bus
+// has no decision-returning permission hook), and when EITHER SWARM_APPROVAL_DELEGATE or SWARM_SANITIZED_READ is on (see syncGate
+// below) — BOTH are LIVE BY DEFAULT (batch-2), so the gate installs by default; PermissionRequest stays the async
+// `report-status blocked` hook only when BOTH are =0. The flag read is DUPLICATED here on purpose: cli must not import bus
 // (bus→cli already; a cli→bus import would cycle), and the hook is just a command string, so no bus import is needed. ---
+// flags-default-flip batch-2 TIER B (user ruling 2026-10-11): SWARM_APPROVAL_DELEGATE + SWARM_SANITIZED_READ are LIVE BY DEFAULT
+// (opt-out). `flagDefaultOn` is DUPLICATED here, byte-equivalent to bus packages/bus/src/swarm/flag-default.ts (cli must not import
+// bus): unset/empty/non-negation ⇒ ON; explicit 0|false|no|off ⇒ OFF. Keep in lockstep with the bus copy.
+function flagDefaultOn(envVal: string | undefined): boolean {
+  return !/^(0|false|no|off)$/i.test((envVal ?? "").trim());
+}
 function approvalDelegateOn(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env.SWARM_APPROVAL_DELEGATE ?? "");
+  return flagDefaultOn(env.SWARM_APPROVAL_DELEGATE);
 }
 // SR-P2-2: sanitized-read ALSO needs the sync permission-gate (its sanitize decisions flow back through the same hook). The flag
 // read is DUPLICATED here on purpose: cli must NOT import bus (a cli→bus import would cycle), and the hook is just a command string.
 function sanitizedReadOn(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env.SWARM_SANITIZED_READ ?? "");
+  return flagDefaultOn(env.SWARM_SANITIZED_READ);
 }
 const APPROVAL_GATE_SENTINEL = "# agenthop-approval-gate";
 // ≥ APPROVAL_POLL_SEC (15, approval-delegation.ts) so the member's bounded poll completes before the sync hook times out.

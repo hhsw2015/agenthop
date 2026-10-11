@@ -16,12 +16,13 @@ const countCards = (home: string): number => {
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error('FAILED: ' + n); console.log('ok  ' + n); };
 
-// ---------------- flag (dormant default OFF) ----------------
-t('outputContractEnabled: default OFF, armed only by explicit truthy',
-  !outputContractEnabled({} as NodeJS.ProcessEnv)
+// ---------------- flag (LIVE BY DEFAULT, opt-out — flags-default-flip batch-2) ----------------
+t('outputContractEnabled: default ON, off only by explicit negation',
+  outputContractEnabled({} as NodeJS.ProcessEnv)
   && outputContractEnabled({ SWARM_OUTPUT_CONTRACT: '1' } as unknown as NodeJS.ProcessEnv)
-  && outputContractEnabled({ SWARM_OUTPUT_CONTRACT: 'on' } as unknown as NodeJS.ProcessEnv)
-  && !outputContractEnabled({ SWARM_OUTPUT_CONTRACT: '0' } as unknown as NodeJS.ProcessEnv));
+  && outputContractEnabled({ SWARM_OUTPUT_CONTRACT: 'anything' } as unknown as NodeJS.ProcessEnv)
+  && !outputContractEnabled({ SWARM_OUTPUT_CONTRACT: '0' } as unknown as NodeJS.ProcessEnv)
+  && !outputContractEnabled({ SWARM_OUTPUT_CONTRACT: 'off' } as unknown as NodeJS.ProcessEnv));
 
 // ---------------- kinds + shape validation ----------------
 t('EXPECTED_OUTPUT_KINDS are the four', EXPECTED_OUTPUT_KINDS.join(",") === "file,branch,report,inbox-delivery");

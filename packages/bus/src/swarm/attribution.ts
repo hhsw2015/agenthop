@@ -11,10 +11,12 @@
  *   ③ delegation NEVER escalates privilege (R16): naming an accountable human grants nothing and issues no
  *      credential; it only records whom the chain represents.
  *
- * DORMANT: gated behind SWARM_ATTRIBUTION (default OFF). OFF ⇒ nothing computes or stores it, and it is wired
- * into no live dispatcher. Pure classification only; it reuses existing identity (seat ids / cap originator) and
+ * Flag SWARM_ATTRIBUTION is LIVE BY DEFAULT (opt-out, flags-default-flip batch-2; =0 to disable), BUT the enabler has no live
+ * caller yet — nothing computes or stores it, wired into no live dispatcher — so the flip is a no-op until it is wired (default
+ * only; was "dormant default OFF" before batch-2). Pure classification only; it reuses existing identity (seat ids / cap originator) and
  * builds no new identity or cap system.
  */
+import { flagDefaultOn } from "./flag-default.js";
 
 /** The explainable waterfall, highest priority first. The FIRST level that resolves exactly one human wins.
  *  Mirrors multica's resolution ladder. */
@@ -40,10 +42,11 @@ export type AttributionInput = {
   fallbackHuman?: string;
 };
 
-/** Is the attribution seam armed? Default OFF — only an explicit truthy SWARM_ATTRIBUTION arms it (dormant). */
+/** Is the attribution seam armed? LIVE BY DEFAULT (opt-out via [[flagDefaultOn]], flags-default-flip batch-2, user ruling
+ *  2026-10-11): on unless SWARM_ATTRIBUTION=0. Tier A (invariant ② — a pure SOURCE tag, NEVER an authorization input).
+ *  NOTE: the enabler has NO live caller yet (wired into no dispatcher), so this flip is an honest no-op until it is wired. */
 export function attributionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = (env.SWARM_ATTRIBUTION ?? "").trim().toLowerCase();
-  return v === "1" || v === "true" || v === "on" || v === "yes";
+  return flagDefaultOn(env.SWARM_ATTRIBUTION);
 }
 
 const nonEmpty = (s: string | undefined): s is string => typeof s === "string" && s.trim().length > 0;

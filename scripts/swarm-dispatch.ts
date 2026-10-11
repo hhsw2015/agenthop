@@ -60,6 +60,7 @@ import { writeInbox, inboxDirName, claimInbox, ackInbox, releaseInbox, recoverSt
 import { approvalDelegateEnabled, type PermissionDecision } from "../packages/bus/src/swarm/approval-delegation.js";
 import { planCoordinatorAction, buildSanitizeDecision, approvalInboxKey } from "../packages/bus/src/swarm/approval-gate.js";
 import { sanitizedReadEnabled, SANITIZED_READ_BUDGET_SEC } from "../packages/bus/src/swarm/sanitized-read.js";
+import { flagDefaultOn } from "../packages/bus/src/swarm/flag-default.js";
 import { resolveAndReadGit } from "../packages/bus/src/swarm/sanitized-read-git.js";
 import { resolveAndRead, writeSanitizedResult, gcSanitizedResults } from "../packages/bus/src/swarm/sanitized-read-io.js";
 import { verifyOpsAction, applyOpsVerdict, opsReceiptOpen, pendingOpsReceipt, successionHeartbeatDue, successionHeartbeatSec, type OpsEvidence, type SuccessionLiveness } from "../packages/bus/src/swarm/coordinator-ops-receipt.js";
@@ -103,13 +104,15 @@ const SWARM_TEAM = process.env.SWARM_TEAM || "";
 // Only explicit enabling values count — `!!"0"`/`!!"false"` are truthy, so SWARM_EXEC=0 must NOT enable (Codex P1).
 const EXEC_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_EXEC ?? "");
 // F53 ② (SWARM_OPS_RECEIPT): verify the coordinator's OWN spawn/inject ops by DURABLE evidence (not an API's instant return);
-// on an unverified op ACCOUNT (notify the coordinator), NEVER auto-redo (re-fire idempotency is not dispatcher-provable). Opt-in,
-// default OFF (new feature, observation period) — same idiom/posture as SWARM_PLACEMENT / SWARM_VM_CTL, NOT flagDefaultOn.
-const OPS_RECEIPT_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_OPS_RECEIPT ?? "");
-// F53 ③ (SWARM_SUCCESSION_HEARTBEAT): a swapped member with no proof of life past the window ⇒ S19. Opt-in, default OFF. The
-// window is SWARM_SUCCESSION_HEARTBEAT_SEC (pure core, default 600). The swap-record WRITE rides SWARM_SUCCESSION (always recorded);
-// only this CONSUMPTION is gated here, so enabling the heartbeat later still sees swaps that happened while it was off.
-const SUCCESSION_HEARTBEAT_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SWARM_SUCCESSION_HEARTBEAT ?? "");
+// on an unverified op ACCOUNT (notify the coordinator), NEVER auto-redo (re-fire idempotency is not dispatcher-provable).
+// flags-default-flip batch-2 TIER A (user ruling 2026-10-11): LIVE BY DEFAULT (opt-out) — only VERIFIES + ACCOUNTS, fail-soft, no
+// risk surface. Kill-switch SWARM_OPS_RECEIPT=0.
+const OPS_RECEIPT_ENABLED = flagDefaultOn(process.env.SWARM_OPS_RECEIPT);
+// F53 ③ (SWARM_SUCCESSION_HEARTBEAT): a swapped member with no proof of life past the window ⇒ S19. LIVE BY DEFAULT (opt-out,
+// batch-2 TIER A — only ALERTS, no risk surface; kill-switch SWARM_SUCCESSION_HEARTBEAT=0). The window is
+// SWARM_SUCCESSION_HEARTBEAT_SEC (pure core, default 600). The swap-record WRITE rides SWARM_SUCCESSION (always recorded); only
+// this CONSUMPTION is gated here, so it still sees swaps that happened while it was off.
+const SUCCESSION_HEARTBEAT_ENABLED = flagDefaultOn(process.env.SWARM_SUCCESSION_HEARTBEAT);
 // F53 ②: a freshly-spawned box that simply has not checkpointed yet reads "unknown" — hold it for this grace window before
 // recording/accounting, so a young box never spams the coordinator. Default 600s; SWARM_OPS_RECEIPT_GRACE_SEC overrides (>0).
 const OPS_RECEIPT_GRACE_SEC = (() => { const n = Number(process.env.SWARM_OPS_RECEIPT_GRACE_SEC); return Number.isFinite(n) && n > 0 ? n : 600; })();
@@ -678,6 +681,9 @@ async function main(): Promise<void> {
   // deliberate exception (opt-in — the bridge needs a user-seeded token), read with its own opt-in form.
   const onoff = (b: boolean): string => (b ? "on" : "off");
   log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
+  // flags-default-flip batch-2 (user ruling 2026-10-11): the dormant flags flipped to default-on. "(unwired)" = the flag is
+  // flipped but its behavior is not yet wired (an honest no-op until a later wiring round) — the flip only sets the DEFAULT.
+  log(`flags(batch-2 default-on): OPS_RECEIPT=${onoff(OPS_RECEIPT_ENABLED)} SUCCESSION_HEARTBEAT=${onoff(SUCCESSION_HEARTBEAT_ENABLED)} POISON_DLQ=${onoff(flagDefaultOn(process.env.SWARM_POISON_DLQ))} APPROVAL_DELEGATE=${onoff(flagDefaultOn(process.env.SWARM_APPROVAL_DELEGATE))} SANITIZED_READ=${onoff(flagDefaultOn(process.env.SWARM_SANITIZED_READ))} ATTRIBUTION=${onoff(flagDefaultOn(process.env.SWARM_ATTRIBUTION))}(unwired) OUTPUT_CONTRACT=${onoff(flagDefaultOn(process.env.SWARM_OUTPUT_CONTRACT))}(unwired) SPEND_BREAKER=${onoff(flagDefaultOn(process.env.SWARM_SPEND_BREAKER))}(unwired) CONDITIONAL_ROUTING=${onoff(flagDefaultOn(process.env.SWARM_CONDITIONAL_ROUTING))}(unwired) (opt-out default-on; kill SWARM_<X>=0; APPROVAL_DELEGATE+SANITIZED_READ change member popup behavior)`);
   // SWARM_INBOX_WAKE: bake a real-time ping into the delivery primitive — writeInbox pings the target's herdr pane on every new
   // message (any caller, zero discipline). No-op + hook left unset when the flag is off (byte-for-byte v0 delivery).
   installInboxWake(log);
@@ -1546,7 +1552,7 @@ async function main(): Promise<void> {
   // commit — the newCommit/inject evidence family, which is STRONGER than bus-presence — so every box is verified as kind:"inject".
   // confirmed ⇒ discharged; unknown ⇒ ACCOUNT via notifyCoordinator, NEVER auto-redo (②b: re-fire idempotency is not dispatcher-
   // provable). Commit ONLY on a status change (FC-6), which also dedups the notice to once per transition. Gated on
-  // SWARM_OPS_RECEIPT (default OFF); sync; fully fail-soft; spawns/acts on nothing.
+  // SWARM_OPS_RECEIPT (LIVE BY DEFAULT, batch-2; =0 to disable); sync; fully fail-soft; spawns/acts on nothing.
   const opsNotified = new Set<string>(); // F53-N1: opIds whose UNCONFIRMED notice is DELIVERED (or deduped) — a logged/failed notify retries each tick
   const runOpsReceipt = (): void => {
     if (!OPS_RECEIPT_ENABLED) return;
@@ -1591,7 +1597,7 @@ async function main(): Promise<void> {
 
   // F53 ③: succession-heartbeat — a swapped member (swap record present) with NO bus heartbeat AND no [checkin] since the swap,
   // past the window, ⇒ S19. A SIBLING of runLiveSentinel so it is gated INDEPENDENTLY of SWARM_SENTINEL (SWARM_SUCCESSION_HEARTBEAT,
-  // default OFF). Reuses notifyCoordinator (built-in dedup) + a per-episode one-shot re-armed on recovery. Consumes the swap record
+  // LIVE BY DEFAULT, batch-2; =0 to disable). Reuses notifyCoordinator (built-in dedup) + a per-episode one-shot re-armed on recovery. Consumes the swap record
   // written on adopt under SWARM_SUCCESSION. Sync; fully fail-soft.
   const succHeartbeatFired = new Set<string>();
   const runSuccessionHeartbeat = (): void => {
@@ -1830,7 +1836,7 @@ async function main(): Promise<void> {
   // DELEGATE the safe ones by committing a permissionDecision to the control-log (the member hook polls it back by promptId and
   // auto-allows — no user dialog). An escalate writes NO decision: the member hook times out to the user dialog, and that blocked
   // member is surfaced + supervised by the existing live-sentinel (S14 blocked⇒S19), so ③ needs no new wait here. Gated on
-  // SWARM_APPROVAL_DELEGATE (default OFF); fully fail-soft — never breaks the sweep, never auto-grants.
+  // SWARM_APPROVAL_DELEGATE (LIVE BY DEFAULT, batch-2 TIER B; =0 to disable); fully fail-soft — never breaks the sweep, never auto-grants.
   // ADIO-P2-1: releaseInbox returns false when the unclaim rename fails; while THIS process is alive recoverStaleClaims skips our
   // own .claim-disp-<pid>, so a failed release would strand the claim with no auto-retry. Mirror claimInbox's `stuck` pattern — a
   // failed release is an OBLIGATION kept in this in-process set and retried on the next sweep (a claim that has since vanished is
@@ -2029,10 +2035,10 @@ async function main(): Promise<void> {
       // on SWARM_SENTINEL + herdr reachability; dormant otherwise.
       await runLiveSentinel();
       // F53 ②: ops-receipt — verify the coordinator's own fired spawn/inject ops by durable evidence; account (never auto-redo) on
-      // an unverified op. Gated on SWARM_OPS_RECEIPT (default OFF); fully fail-soft.
+      // an unverified op. Gated on SWARM_OPS_RECEIPT (LIVE BY DEFAULT, batch-2; =0 to disable); fully fail-soft.
       runOpsReceipt();
       // F53 ③: succession-heartbeat — a swapped member silent past the window ⇒ S19. Gated on SWARM_SUCCESSION_HEARTBEAT
-      // (default OFF), independent of SWARM_SENTINEL; fully fail-soft.
+      // (LIVE BY DEFAULT, batch-2; =0 to disable), independent of SWARM_SENTINEL; fully fail-soft.
       runSuccessionHeartbeat();
       // T5-5: review-seat autoscale SUGGESTION (never acts) — read the review-queue ledger, advise the coordinator on seat
       // scaling. Gated on SWARM_REVIEW_AUTOSCALE (live by default; kill with =0); fully fail-soft.
@@ -2043,9 +2049,10 @@ async function main(): Promise<void> {
       // placement suggestion (reconcile → selectBackends → coordinator advisory). Gated on SWARM_PLACEMENT (default OFF); never
       // spawns/spends (R16); fully fail-soft.
       runPlacementSuggest();
-      // approval-delegation (IO round): classify members' PermissionRequests from the dedicated approval key and delegate the
-      // safe reads (commit a control-log permissionDecision the member hook polls back). Gated on SWARM_APPROVAL_DELEGATE
-      // (default OFF); fully fail-soft; never auto-grants (an escalate falls to the user).
+      // approval-delegation (IO round): classify members' PermissionRequests from the dedicated approval key — delegate the safe
+      // scope-free reads AND run the sanitize fork (commit a control-log permissionDecision the member hook polls back). Gated on
+      // SWARM_APPROVAL_DELEGATE OR SWARM_SANITIZED_READ (both LIVE BY DEFAULT, batch-2; =0 each to disable — the drain runs if
+      // EITHER is on); fully fail-soft; never auto-grants (an escalate falls to the user).
       await runApprovalDelegation();
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
       // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).

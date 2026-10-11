@@ -17,14 +17,14 @@ const reqOf = (command: string, over: Partial<ApprovalRequest> = {}): ApprovalRe
   const a = planCoordinatorAction(reqOf("pwd"), "coord", 1234);
   t("scope-free delegate: binds requestId/member/tool/command/digest + behavior/rewrite/by/atSec", a.act === "delegate" && a.decision.requestId === "rid" && a.decision.member === "mem1" && a.decision.tool === "Bash" && a.decision.command === "pwd" && a.decision.toolInputDigest === toolInputDigest({ command: "pwd" }) && a.decision.behavior === "allow" && a.decision.rewrite === "builtin command /bin/pwd" && a.decision.by === "coord" && a.decision.atSec === 1234);
 }
-t("path read -> escalate (v1 dropped)", planCoordinatorAction(reqOf("cat a.txt"), "c", 1).act === "escalate");
+t("path read -> escalate (v1 delegate dropped; sanitize OFF)", planCoordinatorAction(reqOf("cat a.txt"), "c", 1, { SWARM_SANITIZED_READ: "0" }).act === "escalate");
 t("git -> escalate (v1 dropped)", planCoordinatorAction(reqOf("git status"), "c", 1).act === "escalate");
 t("privilege -> escalate", (() => { const a = planCoordinatorAction(reqOf("rm -rf /"), "c", 1); return a.act === "escalate" && a.reason === "privilege"; })());
 t("allow-only: no delegate carries deny", ["pwd", "cat x", "rm x"].every(c => { const a = planCoordinatorAction(reqOf(c), "c", 1); return a.act !== "delegate" || a.decision.behavior === "allow"; }));
 
 // ── sanitized-read: planCoordinatorAction sanitize fork (gated on SWARM_SANITIZED_READ) + buildSanitizeDecision ──
 t("sanitize: cat ⇒ act sanitize when flag on", planCoordinatorAction(reqOf("cat notes.txt"), "c", 1, { SWARM_SANITIZED_READ: "1" }).act === "sanitize");
-t("sanitize: cat ⇒ escalate when flag off", planCoordinatorAction(reqOf("cat notes.txt"), "c", 1, {}).act === "escalate");
+t("sanitize: cat ⇒ escalate when flag off (kill-switch =0; batch-2 default is now ON)", planCoordinatorAction(reqOf("cat notes.txt"), "c", 1, { SWARM_SANITIZED_READ: "0" }).act === "escalate");
 t("sanitize: credential cat ⇒ escalate even with flag on", planCoordinatorAction(reqOf("cat .env"), "c", 1, { SWARM_SANITIZED_READ: "1" }).act === "escalate");
 t("sanitize: .ENV (uppercase credential) ⇒ escalate, never sanitize (SR-P1-2 case-insensitive)", planCoordinatorAction(reqOf("cat .ENV"), "c", 1, { SWARM_SANITIZED_READ: "1" }).act === "escalate");
 t("sanitize: substitution cat ⇒ escalate privilege, never downgraded to sanitize (SR-P1-2)", planCoordinatorAction(reqOf("cat $(id)"), "c", 1, { SWARM_SANITIZED_READ: "1" }).act === "escalate");
