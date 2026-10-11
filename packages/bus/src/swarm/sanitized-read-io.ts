@@ -1,19 +1,23 @@
 /**
  * sanitized-read-io — the COORDINATOR-side hardened read + result-tmpfile IO (Phase 1: path reads, `cat`). The coordinator runs
  * the read in ITS OWN controlled process — no subprocess, no shell, no member env — and writes the bytes to a 0600 result file;
- * the member's rewrite (`builtin command /bin/cat <result>`) reads THAT, not the original path. Hardening (TOCTOU-closing):
- *   - realpath the PARENT dir (resolves parent symlinks ⇒ a symlinked parent escaping cwd is revealed and rejected),
- *   - open the FINAL component with O_NOFOLLOW (a symlinked final component ⇒ ELOOP ⇒ reject),
- *   - fstat the OPENED fd (reject a non-regular file),
- *   - confirm the resolved path is WITHIN the member's realpath'd cwd subtree (reject escapes),
- *   - reject a credential path (SECRET_RE, defense-in-depth beyond planSanitize's arg check),
- *   - read up to MAX_BYTES from that same fd (truncated marker if more).
- * Uses the REAL fs directly (the security IS the real O_NOFOLLOW/realpath behavior; selftests exercise real temp fixtures).
- * Residual (brief ⑤): the realpath(parent)→open window is not openat-atomic; a parent-dir swap race is lower-order (the
- * coordinator reads once, within its own cwd scope) and noted — Phase 1 accepts it.
+ * the member's rewrite (`builtin command /bin/cat <result>`) reads THAT, not the original path. Hardening (TOCTOU-closing) —
+ * OPEN-THEN-VERIFY: Node has no openat, so a resolve-THEN-open order leaves a parent/intermediate symlink-swap race between the
+ * resolve and the open. Instead OPEN FIRST, then verify the fd's identity:
+ *   - open the final with O_NOFOLLOW | O_NONBLOCK (a symlinked FINAL ⇒ ELOOP ⇒ reject; O_NONBLOCK so a FIFO/device target can
+ *     never BLOCK the coordinator on open),
+ *   - fstat the OPENED fd (reject a non-regular file: dir / fifo / device / socket),
+ *   - canonicalize the target (realpath resolves intermediate symlinks; the final is already known non-symlink) and reject if it
+ *     escapes the member's realpath'd cwd subtree, or is a credential path (SECRET_RE, defense-in-depth beyond planSanitize),
+ *   - confirm the OPEN fd IS that canonical file by dev+ino (any parent/intermediate swap between open and canonicalize changes
+ *     the inode ⇒ mismatch ⇒ reject) — this closes the resolve↔open race WITHOUT openat,
+ *   - read up to MAX_BYTES from that SAME fd (truncated marker if more).
+ * Uses the REAL fs directly (the security IS the real O_NOFOLLOW/realpath/inode behavior; selftests exercise real temp fixtures).
+ * Residual: inode REUSE inside the sub-ms open→verify window (the freed inode reassigned to a swapped-in path) — not closeable
+ * without openat; astronomically unlikely, noted.
  */
 import { openSync, fstatSync, readSync, closeSync, realpathSync, mkdirSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, constants as FS } from "node:fs";
-import { join, dirname, basename, isAbsolute, sep } from "node:path";
+import { join, isAbsolute, sep } from "node:path";
 import { randomBytes } from "node:crypto";
 import { SECRET_RE } from "./approval-delegation.js";
 import { type SanitizeSpec, SANITIZED_READ_MAX_BYTES, SANITIZED_READ_TRUNCATION_MARKER, SANITIZED_READ_DIRNAME } from "./sanitized-read.js";
@@ -43,17 +47,22 @@ export function resolveAndRead(spec: SanitizeSpec, cwd: string): ReadResult {
   let realCwd: string;
   try { realCwd = realpathSync(cwd); } catch { return { ok: false, reason: "cwd-unresolvable" }; }
   const abs = isAbsolute(spec.targetArg) ? spec.targetArg : join(realCwd, spec.targetArg);
-  let parent: string;
-  try { parent = realpathSync(dirname(abs)); } catch { return { ok: false, reason: "parent-unresolvable" }; } // missing/escaping parent
-  const finalPath = join(parent, basename(abs));
-  if (!withinCwd(finalPath, realCwd)) return { ok: false, reason: "escape-cwd" };   // resolved target is outside the member's cwd
-  if (SECRET_RE.test(finalPath)) return { ok: false, reason: "credential-path" };   // ④ defense-in-depth on the RESOLVED path
+  // OPEN FIRST (O_NOFOLLOW rejects a symlinked FINAL; O_NONBLOCK so a FIFO/device can't block), THEN verify — see module header.
   let fd: number;
-  try { fd = openSync(finalPath, FS.O_RDONLY | FS.O_NOFOLLOW); }                     // a symlinked FINAL component ⇒ ELOOP ⇒ throw
+  try { fd = openSync(abs, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK); }
   catch (e) { return { ok: false, reason: `open-failed:${(e as NodeJS.ErrnoException)?.code ?? "?"}` }; } // ELOOP / ENOENT / EACCES …
   try {
-    const st = fstatSync(fd);
-    if (!st.isFile()) return { ok: false, reason: "not-regular-file" };              // dir / fifo / device / socket
+    const fst = fstatSync(fd);
+    if (!fst.isFile()) return { ok: false, reason: "not-regular-file" };             // dir / fifo / device / socket
+    // Canonicalize (resolves intermediate symlinks; final is already non-symlink via O_NOFOLLOW) + confine to cwd, THEN confirm
+    // the fd we hold IS that canonical file (dev+ino) — a parent/intermediate swap between open and here changes the inode.
+    let canonical: string;
+    try { canonical = realpathSync(abs); } catch { return { ok: false, reason: "canonical-unresolvable" }; }
+    if (!withinCwd(canonical, realCwd)) return { ok: false, reason: "escape-cwd" };  // resolved target outside the member's cwd
+    if (SECRET_RE.test(canonical)) return { ok: false, reason: "credential-path" };  // ④ defense-in-depth on the RESOLVED path
+    let cst: ReturnType<typeof statSync>;
+    try { cst = statSync(canonical); } catch { return { ok: false, reason: "canonical-stat-failed" }; }
+    if (cst.dev !== fst.dev || cst.ino !== fst.ino) return { ok: false, reason: "toctou-inode-mismatch" }; // swapped between open+resolve
     const buf = Buffer.alloc(SANITIZED_READ_MAX_BYTES);
     let total = 0;
     while (total < SANITIZED_READ_MAX_BYTES) {
@@ -61,7 +70,7 @@ export function resolveAndRead(spec: SanitizeSpec, cwd: string): ReadResult {
       if (n === 0) break;
       total += n;
     }
-    // truncated iff there is MORE than the cap: the file is larger than what we read, OR a byte remains past the cap.
+    // truncated iff there is MORE than the cap: the file is larger than what we read.
     let truncated = false;
     if (total >= SANITIZED_READ_MAX_BYTES) { try { truncated = fstatSync(fd).size > SANITIZED_READ_MAX_BYTES; } catch { truncated = true; } }
     return { ok: true, bytes: buf.subarray(0, total), truncated };

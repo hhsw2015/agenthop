@@ -3,6 +3,7 @@
 // resolveAndRead (regular⇒bytes; symlink-final⇒reject; escape-cwd⇒reject; dir⇒reject; >1MiB⇒truncated; credential⇒reject) +
 // writeSanitizedResult (0600, marker on truncate) + gcSanitizedResults.
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, readFileSync, statSync, utimesSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveAndRead, writeSanitizedResult, gcSanitizedResults, sanitizedReadDir } from "./sanitized-read-io.js";
@@ -72,6 +73,16 @@ try {
 
   // 7. missing file ⇒ reject (not a crash)
   t("missing file ⇒ reject", resolveAndRead(cat("nope.txt"), CWD).ok === false);
+
+  // 8. a FIFO target ⇒ reject not-regular-file AND does NOT hang (O_NONBLOCK — a blocking open would wedge the coordinator).
+  // The test COMPLETING is itself the proof; without O_NONBLOCK openSync(fifo) blocks until a writer appears.
+  try {
+    execFileSync("mkfifo", [join(CWD, "pipe")], { timeout: 2000 });
+    const r = resolveAndRead(cat("pipe"), CWD);
+    t("FIFO ⇒ reject not-regular-file (no block, O_NONBLOCK)", r.ok === false && r.reason === "not-regular-file");
+  } catch (e) {
+    console.log("skip FIFO case (mkfifo unavailable): " + ((e as Error)?.message ?? e));
+  }
 
   // ── writeSanitizedResult ──────────────────────────────────────────────────────────────────────────────────
   const home = join(root, "home");
