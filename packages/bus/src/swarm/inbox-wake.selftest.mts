@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, readdirSync, writeFileSync, mkdirSync, chmodSync }
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { shouldInjectWake, wakeSession, runWakeBackstop, inboxWakeEnabled, installInboxWake, claimWakeSlot, wakeText, type WakeDeps, type PaneInfo } from "./inbox-wake.js";
+import { shouldInjectWake, wakeSession, runWakeBackstop, inboxWakeEnabled, inboxWakeStatus, installInboxWake, claimWakeSlot, wakeText, type WakeDeps, type PaneInfo } from "./inbox-wake.js";
 import { writeInbox, setInboxWakeHook, scanUnclaimedInbox } from "../inbox.js";
 
 let pass = 0;
@@ -198,8 +198,15 @@ await (async () => {
 ok(inboxWakeEnabled({}) === true, "SWARM_INBOX_WAKE live by default");
 ok(inboxWakeEnabled({ SWARM_INBOX_WAKE: "0" }) === false, "SWARM_INBOX_WAKE=0 ⇒ off");
 ok(installInboxWake(undefined, { SWARM_INBOX_WAKE: "0", HERDR_ENV: "1", HERDR_PANE_ID: "p1" }) === false, "install: flag off ⇒ not installed");
-ok(installInboxWake(undefined, { HERDR_ENV: "", HERDR_PANE_ID: "" }) === false, "install: no herdr in this process ⇒ silently skip (fail-soft, no cost off-pane)");
+ok(installInboxWake(undefined, { HERDR_ENV: "", HERDR_PANE_ID: "" }) === false, "install: no herdr in this process ⇒ not installed (fail-soft, no cost off-pane)");
 ok(installInboxWake(undefined, { HERDR_ENV: "1", HERDR_PANE_ID: "p1" }) === true, "install: flag on + herdr reachable ⇒ installed (library-init path)");
+
+// F54: honest tri-state status + inert-reason log (no more silent "on" while the hook is unset)
+ok(inboxWakeStatus({ SWARM_INBOX_WAKE: "0" }) === "off", "status: flag off ⇒ off");
+ok(inboxWakeStatus({ HERDR_ENV: "1", HERDR_PANE_ID: "p1" }) === "on", "status: flag on + herdr ⇒ on");
+ok(inboxWakeStatus({ HERDR_ENV: "", HERDR_PANE_ID: "" }) === "on(inert:no-herdr)", "status: flag on but no herdr ⇒ on(inert:no-herdr), not a bare on");
+{ const lines: string[] = []; installInboxWake((s) => lines.push(s), { HERDR_ENV: "", HERDR_PANE_ID: "" }); ok(lines.some((l) => /INERT/.test(l)), "install: on + no-herdr LOGS the inert reason (no longer silent)"); }
+{ const lines: string[] = []; installInboxWake((s) => lines.push(s), { SWARM_INBOX_WAKE: "0" }); ok(lines.length === 0, "install: flag off ⇒ no log (off is intentional, shown by the flags line)"); }
 setInboxWakeHook(null);
 
 // FC-7 — the delivery primitive with the hook UNSET is byte-for-byte v0; a throwing hook never breaks delivery; only "published" fires.

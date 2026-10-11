@@ -142,7 +142,7 @@ export function successionEnabled(env: NodeJS.ProcessEnv = process.env): boolean
   return flagDefaultOn(env.SWARM_SUCCESSION);
 }
 
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
@@ -343,4 +343,43 @@ export async function runSuccessionAtStartup(home: string, selfTool: string, sel
     try { if (pidFileIs(pidPath, att.newPid)) unlinkSync(pidPath); } catch { /* best effort */ }
     log(`succession: adopt commit failed (coming up fresh): ${e instanceof Error ? e.message : e}`); return null;
   } finally { releaseHolderLock(site, token); }
+}
+
+// ============================================================================================================
+// F53 ③ — succession swap-record side file (written on adopt under SWARM_SUCCESSION; read by the sentinel's
+// succession-heartbeat under SWARM_SUCCESSION_HEARTBEAT). Additive + FC-7: a member with no file is never
+// heartbeat-checked (the pure successionHeartbeatDue fail-closes on a non-finite swappedAtSec).
+// ============================================================================================================
+
+function successionSwapPath(home: string, sid: string): string {
+  const safe = sid.replace(/[^A-Za-z0-9._-]/g, "_"); // sid is a stable UUID in practice; stay confined to the dir regardless
+  return path.join(home, ".agenthop", "swarm", "succession", `${safe}.json`);
+}
+
+/** Record that `sid`'s shell was swapped at `swappedAtSec` (adopt completion). Best-effort + fail-soft — a missed write only
+ *  means this swap is not heartbeat-watched, never a startup failure. */
+export function writeSuccessionSwap(home: string, sid: string, swappedAtSec: number): void {
+  try {
+    const p = successionSwapPath(home, sid);
+    mkdirSync(path.dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify({ sid, swappedAtSec }), { mode: 0o600 });
+  } catch { /* fail-soft: a missed swap record only loses heartbeat coverage for this swap */ }
+}
+
+/** Read `sid`'s last swap time (seconds), or undefined when there is no (valid) swap record. Fail-soft. */
+export function readSuccessionSwapSec(home: string, sid: string): number | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(successionSwapPath(home, sid), "utf8")) as { swappedAtSec?: unknown };
+    return typeof raw.swappedAtSec === "number" && Number.isFinite(raw.swappedAtSec) ? raw.swappedAtSec : undefined;
+  } catch { return undefined; }
+}
+
+/** F53-H1: the sids that currently have a swap record — the heartbeat sentinel's candidate set. It MUST come from the records,
+ *  NOT from live sessions: a dead successor that never came up has a swap record but no presence PID file, so resolving via live
+ *  sessions would wrongly drop exactly the member to alert on. (sids are stable UUIDs ⇒ the sanitized filename IS the sid.) Fail-soft ⇒ []. */
+export function listSuccessionSwaps(home: string): string[] {
+  try {
+    const dir = path.join(home, ".agenthop", "swarm", "succession");
+    return readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5));
+  } catch { return []; }
 }

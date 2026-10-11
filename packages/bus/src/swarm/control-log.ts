@@ -36,6 +36,7 @@ import type { TaskAttempt } from "./task-state.js";
 import type { AcceptedResult } from "./task-result.js";
 import type { ControlRecord } from "./control.js";
 import type { PermissionDecision } from "./approval-delegation.js";
+import type { OpsReceiptRecord } from "./coordinator-ops-receipt.js";
 
 /** Dispatch intent (§4.3). Type lives HERE (co-located with Change); the dispatch side imports it and owns the
  *  CONSTRUCTION logic (allocOutcome / physicalEvidence / physicalExpiresAtSec CAS-then-IO semantics). */
@@ -179,7 +180,8 @@ export type ChangeBody =
   // the hook's flowback (the sync permission-gate hook polls this entity by requestId, re-checks the member/tool/command binding,
   // and applies `behavior`). v1 writes it only for a DELEGATE (behavior "allow"); an escalation writes none (the hook times out
   // to the user). Additive (FC-7): old records lack it; the projection stores it last-write-wins by `permissionDecision:<requestId>`.
-  | { put: "permissionDecision"; permissionDecision: PermissionDecision };
+  | { put: "permissionDecision"; permissionDecision: PermissionDecision }
+  | { put: "opsReceipt"; ops: OpsReceiptRecord }; // F53: a coordinator spawn/inject fired, awaiting durable proof (additive, FC-7)
 
 /** Each Change carries its operation identity (§2.6): a globally-unique operationId and the entityRevision the caller
  *  believed the target entity was at. */
@@ -224,6 +226,7 @@ export function entityKeyOf(c: ChangeBody): string {
     // requestId existed carries only promptId — fall back to it so old records keep DISTINCT identities on replay (never collapse
     // to `permissionDecision:undefined`).
     case "permissionDecision": return `permissionDecision:${c.permissionDecision.requestId ?? c.permissionDecision.promptId}`;
+    case "opsReceipt": return `opsReceipt:${c.ops.opId}`;
   }
 }
 
