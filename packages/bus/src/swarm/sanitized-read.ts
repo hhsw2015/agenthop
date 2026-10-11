@@ -6,8 +6,11 @@
  * null ⇒ the caller escalates to the user). The hardened read + result-tmpfile IO is sanitized-read-io.ts; the verdict seam is
  * approval-delegation.ts (classifyApproval's 4th `sanitize` class, gated on SWARM_SANITIZED_READ).
  *
- * PHASE 1 (coordinator-frozen phasing 1→2→3): ONE read form — `cat <file>`. The form table (SANITIZE_FORMS) grows in Phase 2/3
- * (git is NOT here). A readKind→producer table on the IO side keys off `readKind`.
+ * PHASE 1b (coordinator-frozen phasing 1→2→3): SIX path-read forms — `cat` / `head` / `tail` / `wc` / `ls` / `stat`, each a bare
+ * `<form> <oneArg>` through the SAME signed `cat` hardening (fdWithinCwd / O_NOFOLLOW / budget / 0600 result / single-quoted
+ * rewrite) — a pure producer-table expansion (sanitized-read-io.ts keys the producer off `readKind`). `file` is DEFERRED
+ * (coordinator ruling 2026-10-11: the fd-read model can't reproduce libmagic, and a hardened `/usr/bin/file` subprocess would
+ * open a new exec surface beyond the sound cat path — not worth it for one low-frequency form). git is NOT here (Phase 2/3).
  */
 import { SECRET_RE } from "./approval-delegation.js";
 
@@ -27,11 +30,13 @@ export const SANITIZED_READ_TRUNCATION_MARKER = "\n[truncated at 1MiB]\n"; // ap
  *  this dir (anti decision-tampering — a tampered decision can't point the member's cat at an arbitrary file). */
 export const SANITIZED_READ_DIRNAME = "sanitized-read";
 
-/** A parsed sanitizable read. Phase 1: only `cat <oneArg>`. */
-export type SanitizeSpec = { readKind: "cat"; targetArg: string };
+/** A parsed sanitizable read. Phase 1b: `cat`/`head`/`tail`/`wc` (content of a regular file), `ls` (a DIRECTORY's entries), `stat`
+ *  (a regular file's metadata). Every form is `<form> <oneArg>`; the IO side keys its producer off `readKind`. */
+export type SanitizeSpec = { readKind: "cat" | "head" | "tail" | "wc" | "ls" | "stat"; targetArg: string };
 
-/** Phase-1 sanitizable command forms (the table that GROWS in Phase 2/3; keep `cat` the first entry so later forms are additions). */
-const SANITIZE_FORMS = new Set<string>(["cat"]);
+/** Phase-1b sanitizable command forms (the table that GROWS in Phase 2/3; `cat` stays first so the later forms read as additions).
+ *  `file` is deferred (see the module header). ls targets a dir; the rest target a regular file — enforced on the IO side. */
+const SANITIZE_FORMS = new Set<string>(["cat", "head", "tail", "wc", "ls", "stat"]);
 
 /**
  * PURE: parse a Bash command into a SanitizeSpec, or null (⇒ not sanitizable ⇒ the caller escalates to the user). Applies the
@@ -56,5 +61,5 @@ export function planSanitize(command: string): SanitizeSpec | null {
   if (!SANITIZE_FORMS.has(cmd)) return null; // case-SENSITIVE; only the exact lowercase form (head/tail/ls/… are later phases)
   if (arg.startsWith("-")) return null;      // an option, not a path — Phase 1 forbids options
   if (SECRET_RE.test(arg.toLowerCase())) return null; // ④ credential-path red-line (SR-P1-2: case-INSENSITIVE, matches approval's isBlacklisted — `.ENV`/`ID_RSA` must also escalate, never sanitize)
-  return { readKind: cmd as "cat", targetArg: arg };
+  return { readKind: cmd as SanitizeSpec["readKind"], targetArg: arg };
 }

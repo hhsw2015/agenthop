@@ -130,7 +130,9 @@ per-item user sign-off (differential ≈ zero). Each bullet records its specific
 ## Scope / phasing (recommendation)
 
 - **Phase 1 — `cat <file>` ONLY (SHIPPED)**: the canonical path read (byte-exact via an O_NOFOLLOW fd), proving the whole pipeline;
-  head/tail/wc/ls/stat/file are a `readKind`→producer table extension (Phase 1b). Cleanest, no git complexity. Delivers the
+  head/tail/wc/ls/stat are a `readKind`→producer table extension (Phase 1b — SHIPPED); `file` is DEFERRED (coordinator 2026-10-11:
+  the fd-read model can't reproduce libmagic, and a hardened `/usr/bin/file` subprocess would open a new exec surface beyond the
+  sound cat path — not worth it for one low-frequency form). Cleanest, no git complexity. Delivers the
   `sanitize` verdict + the output-injection channel + the budget/fail-to-user + the dormant flag.
 - **Phase 2 — git committed-history** (log/show/diff/branch/remote, incl. content) via throwaway-worktree hardening.
 - **Phase 3 (open) — git working-tree-dependent** (status, unstaged diff): pending open-Q 3.
@@ -163,4 +165,4 @@ Freeze answers (coordinator 2026-10-11): ① updatedInput rewrite + lstat the re
 `CoordinatorAction` act, above); ③ git working-tree → Phase 3; ④ keep `SECRET_RE` (case-insensitive; reuse, no new regex); ⑤
 tmpfile 0600 coordinator-owned; ⑥ budget 10s / cap 1 MiB / explicit `[truncated at 1MiB]` marker / fail-to-user. The two TOCTOU
 walls (SR-P1-1 fd-binding, SR-P1-3 result-swap) → /proc-on-Linux + lstat-walk-on-macOS + strict validation + the unified same-uid
-non-differential residual class (⑤). **Phase 1 (`cat`) shipped & reviewed; Phase 1b (head/tail/wc/ls/stat/file) + Phase 2 (git) next.**
+non-differential residual class (⑤). **Phase 1 (`cat`) + Phase 1b (head/tail/wc/ls/stat; `file` deferred) shipped; Phase 2 (git) next.**

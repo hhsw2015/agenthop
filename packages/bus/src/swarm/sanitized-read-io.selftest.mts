@@ -7,10 +7,11 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveAndRead, writeSanitizedResult, gcSanitizedResults, sanitizedReadDir } from "./sanitized-read-io.js";
-import { SANITIZED_READ_MAX_BYTES } from "./sanitized-read.js";
+import { SANITIZED_READ_MAX_BYTES, type SanitizeSpec } from "./sanitized-read.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 const cat = (targetArg: string) => ({ readKind: "cat" as const, targetArg });
+const spec = (readKind: SanitizeSpec["readKind"], targetArg: string): SanitizeSpec => ({ readKind, targetArg });
 
 const root = mkdtempSync(join(tmpdir(), "sr-io-"));
 const CWD = join(root, "cwd");
@@ -89,6 +90,71 @@ try {
     t("FIFO ⇒ reject not-regular-file (no block, O_NONBLOCK)", r.ok === false && r.reason === "not-regular-file");
   } catch (e) {
     console.log("skip FIFO case (mkfifo unavailable): " + ((e as Error)?.message ?? e));
+  }
+
+  // ── Phase 1b forms (head/tail/wc/ls/stat) — all through the SAME bound-fd hardening ───────────────────────────
+  const lines20 = Array.from({ length: 20 }, (_, i) => `l${i + 1}`).join("\n") + "\n";
+  writeFileSync(join(CWD, "lines.txt"), lines20);
+
+  // 9. head ⇒ first 10 lines
+  {
+    const r = await resolveAndRead(spec("head", "lines.txt"), CWD);
+    const want = Array.from({ length: 10 }, (_, i) => `l${i + 1}`).join("\n") + "\n";
+    t("head ⇒ first 10 lines", r.ok === true && r.bytes.toString() === want && r.truncated === false);
+  }
+  // 10. tail ⇒ last 10 lines
+  {
+    const r = await resolveAndRead(spec("tail", "lines.txt"), CWD);
+    const want = Array.from({ length: 10 }, (_, i) => `l${i + 11}`).join("\n") + "\n";
+    t("tail ⇒ last 10 lines", r.ok === true && r.bytes.toString() === want && r.truncated === false);
+  }
+  // 11. wc ⇒ `lines words bytes <arg>` (echoes the ORIGINAL arg, counts the WHOLE file)
+  {
+    const r = await resolveAndRead(spec("wc", "lines.txt"), CWD);
+    t("wc ⇒ lines words bytes arg", r.ok === true && r.bytes.toString() === `20 20 ${Buffer.byteLength(lines20)} lines.txt\n`);
+  }
+  // 12. stat ⇒ the sanitized header + faithful fields (fstat of the bound fd, not byte-exact native format)
+  {
+    const r = await resolveAndRead(spec("stat", "lines.txt"), CWD);
+    const s = r.ok ? r.bytes.toString() : "";
+    t("stat ⇒ sanitized header + size + type + arg", r.ok === true && s.startsWith("sanitized stat format\n") &&
+      s.includes(`size: ${Buffer.byteLength(lines20)}`) && s.includes("type: regular file") && s.includes("file: lines.txt"));
+  }
+  // 13. ls ⇒ sorted entries, one per line
+  mkdirSync(join(CWD, "listme"));
+  for (const n of ["b.txt", "a.txt", "c.txt"]) writeFileSync(join(CWD, "listme", n), "");
+  {
+    const r = await resolveAndRead(spec("ls", "listme"), CWD);
+    t("ls ⇒ sorted entries one per line", r.ok === true && r.bytes.toString() === "a.txt\nb.txt\nc.txt\n" && r.truncated === false);
+  }
+  // 14. ls of a NON-credential dir that CONTAINS a credential-named entry ⇒ reject credential-entry (the output-filename guard;
+  //     the dir name itself must NOT match SECRET_RE, else it would reject at the bind step as credential-path instead).
+  mkdirSync(join(CWD, "proj"));
+  writeFileSync(join(CWD, "proj", "ok.txt"), "");
+  writeFileSync(join(CWD, "proj", ".env"), "TOKEN=1");
+  {
+    const r = await resolveAndRead(spec("ls", "proj"), CWD);
+    t("ls over a dir with a credential-named entry ⇒ reject credential-entry", r.ok === false && r.reason === "credential-entry");
+  }
+  // 15. ls on a regular file ⇒ reject (O_DIRECTORY ⇒ ENOTDIR at open, or the defensive not-directory check where O_DIRECTORY is absent)
+  {
+    const r = await resolveAndRead(spec("ls", "lines.txt"), CWD);
+    t("ls on a regular file ⇒ reject", r.ok === false && (r.reason === "not-directory" || /ENOTDIR/.test(r.reason)));
+  }
+  // 16. a content form on a directory ⇒ reject not-regular-file
+  {
+    const r = await resolveAndRead(spec("head", "listme"), CWD);
+    t("head on a directory ⇒ reject not-regular-file", r.ok === false && r.reason === "not-regular-file");
+  }
+  // 17. the SHARED hardening still applies to the new forms: a symlinked final component ⇒ reject
+  {
+    const r = await resolveAndRead(spec("head", "link.txt"), CWD);
+    t("head on a symlink final component ⇒ reject", r.ok === false);
+  }
+  // 18. ls escaping cwd ⇒ reject escape-cwd (the shared fdWithinCwd, for a dir fd)
+  {
+    const r = await resolveAndRead(spec("ls", "../"), CWD);
+    t("ls ../ ⇒ reject escape-cwd", r.ok === false && r.reason === "escape-cwd");
   }
 
   // ── writeSanitizedResult ──────────────────────────────────────────────────────────────────────────────────

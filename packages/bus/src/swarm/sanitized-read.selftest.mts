@@ -1,14 +1,18 @@
 // Run: packages/bus/node_modules/.bin/tsx packages/bus/src/swarm/sanitized-read.selftest.mts
-// Pins the PURE sanitized-read classifier: planSanitize (cat<file>⇒spec; options/2-args/metachar/glob/$/quote/credential ⇒ null),
-// the consts, and the dormant flag.
+// Pins the PURE sanitized-read classifier: planSanitize (cat/head/tail/wc/ls/stat <file> ⇒ spec; file(deferred)/options/2-args/
+// metachar/glob/$/quote/credential ⇒ null), the consts, and the dormant flag.
 import { planSanitize, sanitizedReadEnabled, SANITIZED_READ_BUDGET_SEC, SANITIZED_READ_MAX_BYTES, SANITIZED_READ_TRUNCATION_MARKER, SANITIZED_READ_DIRNAME } from "./sanitized-read.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
-// ── planSanitize: the one Phase-1 form `cat <oneArg>` ─────────────────────────────────────────────────────────
+// ── planSanitize: the Phase-1b forms `<form> <oneArg>` for form ∈ {cat,head,tail,wc,ls,stat} ──────────────────
 t("cat <relpath> ⇒ spec", (() => { const s = planSanitize("cat notes.txt"); return s !== null && s.readKind === "cat" && s.targetArg === "notes.txt"; })());
 t("cat <abspath> ⇒ spec", (() => { const s = planSanitize("cat /w/sub/file"); return s !== null && s.targetArg === "/w/sub/file"; })());
 t("cat with inner tabs still one arg ⇒ spec", (() => { const s = planSanitize("cat\tnotes.txt"); return s !== null && s.targetArg === "notes.txt"; })());
+for (const k of ["head", "tail", "wc", "ls", "stat"] as const) {
+  t(`${k} <arg> ⇒ spec (readKind=${k})`, (() => { const s = planSanitize(`${k} notes.txt`); return s !== null && s.readKind === k && s.targetArg === "notes.txt"; })());
+}
+t("ls <dir> ⇒ spec (dir target)", (() => { const s = planSanitize("ls src/sub"); return s !== null && s.readKind === "ls" && s.targetArg === "src/sub"; })());
 
 // ── not sanitizable ⇒ null (⇒ escalate to the user) ───────────────────────────────────────────────────────────
 for (const c of [
@@ -16,11 +20,14 @@ for (const c of [
   "cat a b",             // two args
   "cat -n notes.txt",    // option
   "cat --number f",      // long option
-  "head notes.txt",      // not cat (Phase 2/3)
-  "tail -f log",         // not cat
-  "ls",                  // not cat
-  "stat f",              // not cat
-  "git show HEAD",       // git ⇒ not Phase 1
+  "file notes.txt",      // `file` is DEFERRED (coordinator ruling — not in the form table)
+  "head -n 5 f",         // option (+ 3 tokens) — BARE forms only
+  "tail -f log",         // option (+ 3 tokens)
+  "wc -l f",             // option
+  "ls -la dir",          // option (+ 3 tokens)
+  "ls",                  // no arg
+  "stat",                // no arg
+  "git show HEAD",       // git ⇒ not Phase 1b (Phase 2/3)
   "cat a; rm b",         // chain
   "cat a | wc",          // pipe
   "cat a && b",          // chain
@@ -44,7 +51,8 @@ for (const c of [
 
 // ── ④ credential red-line: a credential-PATH target ⇒ null (escalate, never sanitize) ─────────────────────────
 for (const c of ["cat .env", "cat sub/.env.local", "cat id_rsa", "cat deploy/id_ed25519", "cat x.pem", "cat secrets.txt", "cat ../credentials", "cat .ssh/config", "cat .npmrc", "cat app.key", "cat mytoken.json", "cat passwd.bak",
-                 "cat .ENV", "cat ID_RSA", "cat Secrets.TXT", "cat sub/.SSH/config"]) { // SR-P1-2: credential check is CASE-INSENSITIVE
+                 "cat .ENV", "cat ID_RSA", "cat Secrets.TXT", "cat sub/.SSH/config", // SR-P1-2: credential check is CASE-INSENSITIVE
+                 "head .env", "tail secrets.log", "wc app.key", "stat id_rsa", "ls .ssh", "ls .aws", "ls deploy/.SSH"]) { // the guard applies to EVERY form's target (incl. the ls dir)
   t(`credential path ⇒ null (escalate): ${c}`, planSanitize(c) === null);
 }
 
