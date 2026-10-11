@@ -261,6 +261,14 @@ function applyChanges(state: LogState, changes: Change[]): LogState {
       const existing = entities[key];
       if (existing === undefined || existing.put !== "accepted") throw new Error(`supersede target ${key} missing or not an accepted`);
       entities[key] = { put: "accepted", accepted: { ...existing.accepted, superseded: true } };
+    } else if (c.put === "intent" && c.intent.accountable !== undefined) {
+      // AW-1 / FC-7: the stored ENTITY VIEW trims/drops a malformed-or-extra `accountable` SOURCE tag to canonical form, but the
+      // OPERATION digest (operations[c.operationId] above) is computed from the ORIGINAL change — so a historical record's
+      // byte-identical retry still matches its committed payload (idempotent replay, never a spurious op-conflict), while
+      // liveEntities only ever sees a canonical accountable. A genuinely DIFFERENT payload still conflicts (digest differs).
+      const kept = tolerateAccountable(c.intent.accountable);
+      const { accountable: _drop, ...rest } = c.intent;
+      entities[key] = { put: "intent", intent: kept !== undefined ? { ...rest, accountable: kept } : rest };
     } else {
       entities[key] = bodyOf(c);
     }
@@ -333,24 +341,16 @@ export function tolerateAccountable(v: unknown): { accountableHuman: string; res
   return { accountableHuman: o.accountableHuman, resolutionLevel: o.resolutionLevel }; // keep ONLY the two known fields (strip extras)
 }
 
-/** Apply the read-side accountable tolerance to one change on the read path (only a {put:"intent"} body carries it). A valid
- *  pair is normalized to just its two known fields; a malformed one is dropped; anything else is returned unchanged. FC-7. */
-function tolerantChangeOnRead(c: Change): Change {
-  if (c.put !== "intent" || c.intent.accountable === undefined) return c;
-  const kept = tolerateAccountable(c.intent.accountable);
-  const { accountable: _drop, ...rest } = c.intent;
-  return { ...c, intent: kept !== undefined ? { ...rest, accountable: kept } : rest };
-}
-
 /** Rebuild LogState by folding the ordered, already-committed log — crash recovery + projection (§4.3). The log is
- *  authoritative, so this APPLIES each batch without re-deciding; it only asserts contiguous seq to catch a gap. The ONE
- *  read-side tolerance is FC-7 on the optional attribution SOURCE tag (a malformed/forged `intent.accountable` is dropped,
- *  never a reason to fail replay). */
+ *  authoritative, so this APPLIES each batch without re-deciding; it only asserts contiguous seq to catch a gap. The FC-7
+ *  tolerance for the optional attribution `accountable` SOURCE tag lives INSIDE applyChanges (AW-1): it trims/drops a
+ *  malformed/forged value in the stored ENTITY view ONLY, never touching the operation digest — so a historical record's
+ *  byte-identical retry stays idempotent (no spurious op-conflict), and a genuinely different payload still conflicts. */
 export function replayLog(batches: CommittedBatch[]): LogState {
   let state = initialLogState();
   for (const b of batches) {
     if (b.seq !== state.seq + 1) throw new Error(`replayLog: seq gap, expected ${state.seq + 1} got ${b.seq}`);
-    state = applyChanges(state, b.changes.map(tolerantChangeOnRead));
+    state = applyChanges(state, b.changes);
   }
   return state;
 }

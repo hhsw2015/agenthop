@@ -145,6 +145,31 @@ try {
     })());
   }
 
+  // (d3) AW-1: the read-side tolerance trims the ENTITY VIEW ONLY — the OPERATION digest stays on the committed payload. So a
+  // historical record with a malformed/extra accountable still accepts a BYTE-IDENTICAL retry (idempotent replay, NOT a spurious
+  // op-conflict), while a genuinely DIFFERENT payload for the same operationId still conflicts. (Regression for the op-identity
+  // corruption: trimming the change BEFORE applyChanges recomputed operations[opId] off the cleaned payload.)
+  {
+    const b9: DispatchIntent = {
+      intentId: "i9", attemptId: "a9", nodeId: "build", launchId: "rw-9", bindingId: "b9", assignmentDigest: "d",
+      allocRequestStartSec: 0, workDeadlineSec: 100, allocOutcome: "created", status: "confirmed",
+    };
+    const mkChange = (acc: unknown): Change => ({ put: "intent", intent: { ...b9, accountable: acc as DispatchIntent["accountable"] }, operationId: "intent:i9#1", expectedEntityRevision: 0 });
+    for (const [label, acc] of ([["valid+extra", { accountableHuman: "u", resolutionLevel: "direct", extra: "junk" }], ["unknown-level", { accountableHuman: "u", resolutionLevel: "blame" }], ["non-object", "nope"]] as const)) {
+      const orig = mkChange(acc);
+      const state = replayLog([{ seq: 1, changes: [orig] }]); // the "new reader" folds the historical (tolerated) record
+      const retry = commit(state, state.seq, [orig]);          // a byte-identical retry of the ORIGINAL committed payload
+      t(`(d3) AW-1: historical ${label} accountable ⇒ byte-identical retry is idempotent (no op-conflict)`, retry.result.ok === true && (retry.result as { replay?: boolean }).replay === true);
+    }
+    // the entity VIEW is still canonicalized (an extra key dropped) even though the op digest kept the original payload
+    const trimmed = theIntent(replayLog([{ seq: 1, changes: [mkChange({ accountableHuman: "u", resolutionLevel: "direct", extra: "junk" })] }]));
+    t("(d3) AW-1: entity view trimmed to the canonical pair (extra dropped)", !!trimmed && !!trimmed.accountable && (trimmed.accountable as Record<string, unknown>).extra === undefined);
+    // a genuinely DIFFERENT payload for the SAME operationId ⇒ op-conflict STILL enforced (the fix must not weaken this)
+    const base9 = replayLog([{ seq: 1, changes: [mkChange({ accountableHuman: "u", resolutionLevel: "direct" })] }]);
+    const conflict = commit(base9, base9.seq, [mkChange({ accountableHuman: "SOMEONE-ELSE", resolutionLevel: "direct" })]);
+    t("(d3) AW-1: a genuinely different payload for the same op ⇒ op-conflict preserved", conflict.result.ok === false && (conflict.result as { reason?: string }).reason === "op-conflict");
+  }
+
   // (d2) a plan with malformed provenance ⇒ loadPlan OK, provenance dropped; a plan with a valid-but-partial provenance keeps it.
   {
     const withProv = (p: unknown) => loadPlan({
