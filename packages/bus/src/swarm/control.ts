@@ -65,6 +65,12 @@ export type ControlRecord = {
   /** The expected resume SHA, PINNED at claim/reclaim for THIS handoff attempt. A later checkpoint advances `sha`
    *  but must NOT move the target a successor is being verified against (Codex). Undefined => no prior work. */
   handoffSha?: string;
+  /** F53 (O1): the IMMUTABLE sha this record was BORN with (its inherited starting point) — set ONCE at creation (= the initial
+   *  `sha`, or "" for a box born with no anchor), NEVER re-pinned by any transition (`base = {...record}` carries it; no advance
+   *  patches it). UNLIKE `handoffSha`, which `allocating` re-pins to this box's OWN sha — so ops-receipt must NOT use handoffSha
+   *  to tell "produced own output". own output = `sha !== incomingSha`. Absent on legacy pre-field records ⇒ ops-receipt skips
+   *  them conservatively (no verdict / no notice; FC-7 migration). */
+  incomingSha?: string;
   /** The generation the SUCCESSOR publishes at, PINNED at `allocating` (= the owner generation then). A later reclaim
    *  bumps `generation` (owner), but the already-allocated successor still publishes to swarm/<successor>-g<successorGen>,
    *  so reconcile / await-resume must observe THAT branch, not the bumped owner generation (Codex). */

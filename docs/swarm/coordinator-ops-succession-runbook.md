@@ -28,10 +28,13 @@ idempotent (a no-op when the hook config is already current — `agents.ts`), so
 a **verifier, not a recorder** (coordinator ruling C): the dispatcher sub-step `runOpsReceipt` (sweep, gated on **SWARM_OPS_RECEIPT**,
 default OFF) DERIVES its verify-set from the **live box mirror** (`loadMirror()` — the dispatcher's own durable fire record), so
 there is no fire-site recording. A mirror `ControlRecord` carries no bus session id, so each box is verified as `kind:"inject"`:
-its durable NEW output is a confirmed checkpoint `sha` that has **advanced beyond the inherited `handoffSha` anchor** (the child
-placeholder is born with `sha === handoffSha`), or a fresh box's first `sha` (`handoffSha` undefined) — a `newCommit`, stronger
-than bus-presence. `runOpsReceipt` writes ONLY the verdict to the control-log `opsReceipt` kind (audit), committing on a status
-change (FC-6).
+its durable NEW output is a confirmed checkpoint `sha` that has **advanced beyond the IMMUTABLE birth anchor `incomingSha`** (set
+once at creation = the record's initial sha; a fresh box's is `""`). Crucially it is NOT compared against `handoffSha`:
+`allocating` re-pins `handoffSha` to this box's OWN sha for its outgoing handoff, so a box that produced output and is handing off
+would read `sha === handoffSha` and be wrongly judged unproven — `incomingSha` never moves, so `sha !== incomingSha` cleanly means
+"this box checkpointed past its birth point". A **legacy pre-field** record (no `incomingSha`) is skipped conservatively — no
+verdict, no notice — so enabling the feature never false-alarms on an existing mirror (a one-time migration window, FC-7).
+`runOpsReceipt` writes ONLY the verdict to the control-log `opsReceipt` kind (audit), committing on a status change (FC-6).
 
 - **confirmed** ⇒ discharged (terminal).
 - **unknown** ⇒ ACCOUNT: `notifyCoordinator` surfaces it; the dispatcher does **not** auto-redo (re-firing is only safe if

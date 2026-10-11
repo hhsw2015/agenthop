@@ -205,6 +205,7 @@ async function allocate(r: ControlRecord, records: Map<string, ControlRecord>, o
     state: "RUNNING",
     generation: gen,
     handoffSha,
+    incomingSha: handoffSha, // F53-O1: immutable birth anchor (= initial sha); ops-receipt own-output = sha advanced past this
     sha: handoffSha, // confirmed anchor from the start (handoffSha IS a confirmed checkpoint) so recovery of the child
     // never faces an empty sha and skips allocate forever; its own observe advances it as it publishes (Codex P2-5).
     allocStart: reqStart,
@@ -306,7 +307,7 @@ async function awaitResume(r: ControlRecord, records: Map<string, ControlRecord>
   if (!child0) {
     const base = r.attemptStartSec ?? ops.nowSec();
     const rebuilt: ControlRecord = {
-      launchId: r.successor, state: "RUNNING", generation: sgen, handoffSha: r.handoffSha, sha: tip.sha,
+      launchId: r.successor, state: "RUNNING", generation: sgen, handoffSha: r.handoffSha, sha: tip.sha, incomingSha: tip.sha, // F53-O1: born carrying the dead child's recovery point ⇒ birth anchor = tip.sha (own output = advance past it)
       allocStart: base, budgetSec: ops.budgetSec, physicalLifetimeSec: r.attemptPhysicalSec ?? ops.physicalLifetimeSec,
       deadlineEpoch: base + ops.budgetSec, updatedAt: ops.nowSec(),
     };

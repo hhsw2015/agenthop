@@ -68,7 +68,7 @@ import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, 
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
-import { inboxWakeEnabled, installInboxWake, backstopWake } from "../packages/bus/src/swarm/inbox-wake.js";
+import { inboxWakeEnabled, inboxWakeStatus, installInboxWake, backstopWake } from "../packages/bus/src/swarm/inbox-wake.js";
 import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources, archiveLegacyMigration } from "../packages/bus/src/swarm/morning-digest-store.js";
 import { successionEnabled } from "../packages/bus/src/swarm/shell-succession.js";
 import { readStatusFile } from "../packages/bus/src/statusfile.js";
@@ -379,7 +379,7 @@ async function scrubBox(launchId: string): Promise<boolean> {
 async function observeOnce(argv: string[]): Promise<void> {
   const [workRepo, branch, launchId, genStr, lastSha] = argv;
   if (!workRepo || !branch || !launchId || !genStr) { console.error("usage: --observe-once <workRepo> <branch> <launchId> <generation> [lastSha]"); process.exit(2); }
-  const record: ControlRecord = { launchId: launchId!, state: "RUNNING", generation: Number(genStr), allocStart: nowSec(), budgetSec: BUDGET_SEC, physicalLifetimeSec: VM_LIFETIME_SEC, updatedAt: nowSec(), sha: lastSha };
+  const record: ControlRecord = { launchId: launchId!, state: "RUNNING", generation: Number(genStr), allocStart: nowSec(), budgetSec: BUDGET_SEC, physicalLifetimeSec: VM_LIFETIME_SEC, updatedAt: nowSec(), sha: lastSha, incomingSha: lastSha ?? "" }; // F53-O1: birth anchor = initial sha (dev --observe-once)
   const tip = await observeTip(workRepo!, branch!, lastSha, path.join(HOME, ".agenthop", "swarm", "scratch", launchId!));
   console.log(JSON.stringify({ tip, decision: tip ? tipToEvent(record, tip) : null }, null, 2));
 }
@@ -398,7 +398,7 @@ async function pass(records: Map<string, ControlRecord>, ops: HandoffOps): Promi
     if (!r) {
       if (!box) continue;
       if (isTombstoned(launchId)) continue; // deliberately removed (dead/never-created) — do NOT resurrect it (Codex P2-3)
-      r = { launchId, state: "RUNNING", generation: 0, allocStart: box.allocTs, budgetSec: BUDGET_SEC, physicalLifetimeSec: VM_LIFETIME_SEC, updatedAt: nowSec(), deadlineEpoch: box.allocTs + BUDGET_SEC };
+      r = { launchId, state: "RUNNING", generation: 0, allocStart: box.allocTs, budgetSec: BUDGET_SEC, physicalLifetimeSec: VM_LIFETIME_SEC, updatedAt: nowSec(), deadlineEpoch: box.allocTs + BUDGET_SEC, incomingSha: "" }; // F53-O1: discovered box, no inherited anchor ⇒ born-fresh sentinel (own output = its first sha)
       records.set(launchId, r);
       saveRecord(r);
     }
@@ -671,7 +671,7 @@ async function main(): Promise<void> {
   // kill with SWARM_<X>=0). Calls the SAME readers the features use, so the line reflects the real decision. SWARM_TG_ENTRY is the
   // deliberate exception (opt-in — the bridge needs a user-seeded token), read with its own opt-in form.
   const onoff = (b: boolean): string => (b ? "on" : "off");
-  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${onoff(inboxWakeEnabled())} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
+  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
   // SWARM_INBOX_WAKE: bake a real-time ping into the delivery primitive — writeInbox pings the target's herdr pane on every new
   // message (any caller, zero discipline). No-op + hook left unset when the flag is off (byte-for-byte v0 delivery).
   installInboxWake(log);
@@ -1552,10 +1552,13 @@ async function main(): Promise<void> {
         const pb = liveEntities(st)[`opsReceipt:${opId}`];
         const prev = pb?.put === "opsReceipt" ? pb.ops : undefined;
         if (prev && !opsReceiptOpen(prev)) continue; // terminal (confirmed discharged / failed accounted) ⇒ done
-        // F53-O1: the box's durable NEW output is a sha ADVANCED BEYOND the inherited handoffSha anchor (the child placeholder
-        // sets sha === handoffSha at birth), OR a fresh box's first sha (handoffSha undefined). Bare report-file existence is NOT
-        // evidence here — it is ambiguous AND the `<launchId>.report.json` suffix is reused by the S19 unclaimed-task alert.
-        const evidence: OpsEvidence = { newCommit: r.sha !== undefined && r.sha !== r.handoffSha };
+        // F53-O1: own NEW output = `sha` advanced BEYOND the IMMUTABLE birth anchor `incomingSha` (set once at creation; NEVER
+        // re-pinned). Do NOT use `handoffSha` — `allocating` re-pins it to this box's OWN sha, so a box that produced output and
+        // is now handing off would read sha===handoffSha and false-negative. A legacy pre-field record (no incomingSha) is skipped
+        // CONSERVATIVELY (no verdict, no notice) so enabling the feature never false-alarms on an existing mirror (FC-7 migration).
+        // Bare report-file existence is NOT evidence (ambiguous + the `<launchId>.report.json` suffix is reused by the S19 alert).
+        if (r.incomingSha === undefined) continue;
+        const evidence: OpsEvidence = { newCommit: r.sha !== undefined && r.sha !== r.incomingSha };
         const verdict = verifyOpsAction(action, evidence);
         // GRACE: a young box that hasn't advanced past its anchor yet reads "unknown" — hold (no record/notice) until the window
         // passes (avoid accounting-spam on fresh spawns). Only "unknown" is held; a "confirmed" is recorded immediately.

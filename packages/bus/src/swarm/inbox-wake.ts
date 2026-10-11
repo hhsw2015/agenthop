@@ -197,10 +197,25 @@ function defaultWakeDeps(log?: (s: string) => void): WakeDeps {
  *  reachable from this process (herdrSpawnable): herdr-not-detected ⇒ leave the hook unset (silently skip, fail-soft) so a non-herdr
  *  process adds no cost and the unit suite is byte-for-byte v0. Idempotent (overwrites). Returns whether the hook was installed. */
 export function installInboxWake(log?: (s: string) => void, env: NodeJS.ProcessEnv = process.env): boolean {
-  if (!inboxWakeEnabled(env) || !herdrSpawnable(env)) { setInboxWakeHook(null); return false; }
+  if (!inboxWakeEnabled(env)) { setInboxWakeHook(null); return false; } // OFF: intentional + honestly shown by the flags line
+  // F54: SWARM_INBOX_WAKE is ON but this process cannot reach herdr (HERDR_ENV/HERDR_PANE_ID unset) ⇒ the real-time hook stays
+  // UNSET. This used to be a SILENT skip while the flags line still said "on" — a bare-env dispatcher restart left wake dead for
+  // 20 min with no trace. Log the reason so the inert state is never silent (the flags line also reports it as on(inert:no-herdr)).
+  if (!herdrSpawnable(env)) {
+    setInboxWakeHook(null);
+    log?.("inbox-wake: SWARM_INBOX_WAKE on but herdr is NOT reachable from this process (HERDR_ENV/HERDR_PANE_ID unset) — real-time wake INERT; writeInbox still delivers and the dispatcher backstop + the target's own poll still apply");
+    return false;
+  }
   const deps = defaultWakeDeps(log);
   setInboxWakeHook((home, sid) => { void wakeSession(home, sid, deps).catch(() => undefined); }); // fire-and-forget, fully fail-soft
   return true;
+}
+
+/** F54: the honest tri-state for the dispatcher flags line. `inboxWakeEnabled` alone reports only the FLAG; the real-time hook is
+ *  additionally gated on herdr being reachable from THIS process, so "flag on + no herdr" is live-but-INERT, not "on". Pure. */
+export function inboxWakeStatus(env: NodeJS.ProcessEnv = process.env): "off" | "on" | "on(inert:no-herdr)" {
+  if (!inboxWakeEnabled(env)) return "off";
+  return herdrSpawnable(env) ? "on" : "on(inert:no-herdr)";
 }
 
 /** Dispatcher-sweep backstop entry: re-ping a session's box if an item has lain unclaimed past the window. No-op when off / no herdr. */
