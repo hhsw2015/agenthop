@@ -11,6 +11,7 @@
  */
 import { createHash } from "node:crypto";
 import { classifyApproval, planDelegation, APPROVAL_POLL_SEC, type ApprovalRequest, type PermissionDecision } from "./approval-delegation.js";
+import { planSanitize, sanitizedReadEnabled, type SanitizeSpec } from "./sanitized-read.js";
 
 /** The dedicated durable-inbox key the member hook writes an approval request to and the dispatcher drains — `approvals:<coordSid>`
  *  (coordinator ruling): in the coordinator's authority domain but a RESERVED key, not the coordinator SESSION's own sid, so
@@ -37,11 +38,12 @@ export function toolInputDigest(toolInput: unknown): string {
  *  escalate writes NO control-log decision (the hook polls, finds none, times out to the user dialog). */
 export type CoordinatorAction =
   | { act: "delegate"; decision: PermissionDecision }
+  | { act: "sanitize"; spec: SanitizeSpec }   // sanitized-read: the dispatcher runs the hardened read (sanitized-read-io), writes the result, THEN commits a sanitize decision via buildSanitizeDecision
   | { act: "escalate"; reason: "privilege" | "needs-user" };
 
 /** Pure: classify + shape the coordinator's action. `by` = the deciding coordinator sid (audit); `nowSec` = the decision time.
  *  The decision is keyed by req.requestId (per-invocation) and BINDS member/tool/command/toolInputDigest. */
-export function planCoordinatorAction(req: ApprovalRequest, by: string, nowSec: number): CoordinatorAction {
+export function planCoordinatorAction(req: ApprovalRequest, by: string, nowSec: number, env: NodeJS.ProcessEnv = process.env): CoordinatorAction {
   const verdict = classifyApproval(req);
   if (verdict.kind === "delegate") {
     return {
@@ -49,7 +51,24 @@ export function planCoordinatorAction(req: ApprovalRequest, by: string, nowSec: 
       decision: { requestId: req.requestId, member: req.member, tool: req.tool, command: req.command, toolInputDigest: req.toolInputDigest, behavior: verdict.behavior, rewrite: verdict.rewrite, by, reason: `auto-allow:${req.tool}:scope-free`, atSec: nowSec, promptId: req.promptId },
     };
   }
+  // sanitized-read (ruling B): a path read that v1 would escalate can instead be SANITIZED — the coordinator runs a hardened read
+  // and injects the output. Gated on SWARM_SANITIZED_READ. planSanitize applies the same structural guards + the credential
+  // red-line; the DECISION is built LATER (buildSanitizeDecision) by the dispatcher AFTER it runs the read (the result path is an
+  // IO output). classifyApproval stays v1-pure — the sanitize fork lives here (the coordinator's action), avoiding an import cycle.
+  // SR-P1-2: ONLY a `needs-user` verdict may be sanitized — a `privilege` verdict (blacklist / credential / substitution) is NEVER
+  // downgraded to a sanitize approval. (verdict is narrowed to `escalate` here — the delegate branch returned above.)
+  if (req.tool === "Bash" && sanitizedReadEnabled(env) && verdict.kind === "escalate" && verdict.reason === "needs-user") {
+    const spec = planSanitize(req.command);
+    if (spec) return { act: "sanitize", spec };
+  }
   return { act: "escalate", reason: verdict.reason };
+}
+
+/** Build the SANITIZE PermissionDecision AFTER the dispatcher has run the hardened read + written the result file. Binds the same
+ *  member/tool/command/toolInputDigest as a delegate (so decisionBindsTo holds), sets `sanitized:true`, and the rewrite reads the
+ *  coordinator-produced result via the v1 impl-pin (`builtin command /bin/cat <resultPath>`). Pure. */
+export function buildSanitizeDecision(req: ApprovalRequest, resultPath: string, by: string, nowSec: number): PermissionDecision {
+  return { requestId: req.requestId, member: req.member, tool: req.tool, command: req.command, toolInputDigest: req.toolInputDigest, behavior: "allow", rewrite: `builtin command /bin/cat '${resultPath}'`, sanitized: true, by, reason: `sanitized-read:${req.tool}`, atSec: nowSec, promptId: req.promptId }; // SR-P1-3: SINGLE-QUOTE the result path so the member shell does NO glob/word-split (fixes glob-expansion + spaced HOME)
 }
 
 /** The subset of a Claude `PermissionRequest` hook's stdin JSON this feature needs. */
@@ -109,6 +128,7 @@ export interface PermissionGateDeps {
   writeApprovalRequest: (req: ApprovalRequest) => boolean;          // writeInbox S11 to coordinator; false ⇒ undeliverable
   readDecision: (requestId: string) => PermissionDecision | null;   // loadControlLog ⇒ permissionDecision:<requestId>
   pinnedPathOk: (absPath: string) => boolean;                       // lstat in the MEMBER's env: pinned binary is a real regular file (AD-V1-P1-1)
+  sanitizedResultDir?: string;                                      // sanitized-read: the coordinator-owned result dir; a sanitize rewrite's path MUST be under it (anti decision-tampering)
   emit: (json: string) => void;                                     // stdout (the decision)
   nowMs: () => number;
   sleep: (ms: number) => Promise<void>;
@@ -137,7 +157,27 @@ export async function runPermissionGate(deps: PermissionGateDeps): Promise<void>
     const dec = deps.readDecision(requestId);
     // The decision must bind to THIS invocation and be an allow (v1 never records a delegated deny; a deny stays a user decision).
     if (dec && decisionBindsTo(dec, requestId, parsed) && dec.behavior === "allow") {
-      // AD-V1-P1-1: the hook RECOMPUTES the execution-pinned rewrite from the (bound) original command — it NEVER executes the
+      if (dec.sanitized === true) {
+        // SANITIZE (ruling B): the result is a COORDINATOR-produced file — the member CANNOT recompute it, so it TRUSTS the
+        // decision's rewrite but VALIDATES it before emitting (the ONE trust-model difference from a delegate): (a) the rewrite is
+        // EXACTLY `builtin command /bin/cat '<path>'` (single-quoted — SR-P1-3); (b) <path> is under the coordinator's sanitized-read
+        // result dir; (c) /bin/cat AND <path> are real regular files (PIN ①, lstat — anti result-swap-to-dir/symlink). Any fail ⇒ user.
+        // SR-P1-3: the rewrite is SINGLE-QUOTED (`'<path>'`) so the member shell does NO glob/word-split/expansion. Validate the
+        // EXACT shape, then a STRICT result filename (<hex>.out — no `..`, no `/`, no glob metachar, no space) under the result dir.
+        const m = /^builtin command \/bin\/cat '(\/[^']+)'$/.exec(dec.rewrite);
+        if (!m) return;
+        const resultPath = m[1]!;
+        const dir = deps.sanitizedResultDir;
+        if (!dir) return;
+        const prefix = dir.endsWith("/") ? dir : dir + "/";
+        if (!resultPath.startsWith(prefix)) return;                                   // must be UNDER the coordinator result dir
+        if (!/^[0-9a-f]{1,64}\.out$/.test(resultPath.slice(prefix.length))) return;   // exact <hex>.out — rejects ../, subdirs, globs, spaces
+        if (!deps.pinnedPathOk("/bin/cat") || !deps.pinnedPathOk(resultPath)) return; // both must be real regular files in THIS env
+        const updatedInput = { ...(parsed.toolInput as Record<string, unknown>), command: dec.rewrite };
+        deps.emit(allowDecisionOutput(updatedInput));
+        return;
+      }
+      // AD-V1-P1-1 (DELEGATE): the hook RECOMPUTES the execution-pinned rewrite from the (bound) original command — it NEVER executes the
       // rewrite string carried in the control-log decision (the log authorizes WHETHER to allow; the member binds WHAT runs).
       const plan = planDelegation(parsed.command);
       if (plan.gate !== "scope-free") return;                 // a bound decision for a non-scope-free command ⇒ user dialog (defensive)

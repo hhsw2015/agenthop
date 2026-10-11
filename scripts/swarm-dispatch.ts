@@ -57,8 +57,11 @@ import { resolveSession, listSessions, makeFileLiveness, pidFileMtimeSec } from 
 import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
 import { writeInbox, inboxDirName, claimInbox, ackInbox, releaseInbox, recoverStaleClaims } from "../packages/bus/src/inbox.js";
-import { approvalDelegateEnabled } from "../packages/bus/src/swarm/approval-delegation.js";
-import { planCoordinatorAction, approvalInboxKey } from "../packages/bus/src/swarm/approval-gate.js";
+import { approvalDelegateEnabled, type PermissionDecision } from "../packages/bus/src/swarm/approval-delegation.js";
+import { planCoordinatorAction, buildSanitizeDecision, approvalInboxKey } from "../packages/bus/src/swarm/approval-gate.js";
+import { sanitizedReadEnabled, SANITIZED_READ_BUDGET_SEC } from "../packages/bus/src/swarm/sanitized-read.js";
+import { resolveAndReadGit } from "../packages/bus/src/swarm/sanitized-read-git.js";
+import { resolveAndRead, writeSanitizedResult, gcSanitizedResults } from "../packages/bus/src/swarm/sanitized-read-io.js";
 import { verifyOpsAction, applyOpsVerdict, opsReceiptOpen, pendingOpsReceipt, successionHeartbeatDue, successionHeartbeatSec, type OpsEvidence, type SuccessionLiveness } from "../packages/bus/src/swarm/coordinator-ops-receipt.js";
 import { readSuccessionSwapSec, listSuccessionSwaps } from "../packages/bus/src/swarm/shell-succession.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
@@ -1845,10 +1848,15 @@ async function main(): Promise<void> {
     if (state === "absent") { approvalPendingRelease.delete(file); return; } // truly gone ⇒ nothing stranded
     approvalPendingRelease.add(file);                                        // present OR unknown ⇒ retry next sweep
   };
-  const runApprovalDelegation = (): void => {
-    if (!approvalDelegateEnabled()) return;
+  let approvalDelegationInFlight = false; // SR-P2-1: single-flight guard for the drain pass itself
+  let sanitizeInFlight: Promise<void> | null = null; // SR-P2-1: a sanitize op PAST its decision-budget is still reading/writing — hold single-flight until it SETTLES (no 2nd concurrent read on a re-submit), WITHOUT awaiting it in the sweep path (a hung fs stalls sanitize, never the sweep)
+  const runApprovalDelegation = async (): Promise<void> => {
+    if (!approvalDelegateEnabled() && !sanitizedReadEnabled()) return; // drain the approvals key if EITHER feature is on
+    if (approvalDelegationInFlight || sanitizeInFlight) return; // a prior drain OR a still-running timed-out sanitize op is active
+    approvalDelegationInFlight = true;
     try {
       for (const f of [...approvalPendingRelease]) releaseOrDefer(f); // ADIO-P2-1: first retry any release deferred last sweep
+      if (sanitizedReadEnabled()) gcSanitizedResults(HOME, 300); // sanitized-read: best-effort GC of stale one-shot result files (never throws)
       const coordSid = resolveSession(COORDINATOR, listSessions(HOME));
       if (!coordSid || !isStableSid(coordSid)) return; // no stable coordinator identity ⇒ can't key the dedicated approval box
       const key = approvalInboxKey(coordSid);
@@ -1866,12 +1874,42 @@ async function main(): Promise<void> {
           const req = msg.approval;
           if (!req) { ackInbox(file); continue; } // a stray non-approval on the dedicated key ⇒ drop (key is ours)
           const action = planCoordinatorAction(req, coordSid, nowSec());
+          // Resolve the action into an optional decision to commit: delegate = ready (only when ITS flag is on); sanitize = run
+          // the hardened read first (sanitized-read-io) under the budget, then build the decision; escalate / flag-off / a
+          // read-failure ⇒ NO decision ⇒ ack ⇒ the member hook times out to the user (fail-to-user).
+          let decision: PermissionDecision | null = null;
           if (action.act === "delegate") {
-            const { state, result } = commitTask(st, [{ put: "permissionDecision", permissionDecision: action.decision }]);
+            if (approvalDelegateEnabled()) decision = action.decision; // delegate only when SWARM_APPROVAL_DELEGATE is on
+          } else if (action.act === "sanitize") {
+            if (sanitizeInFlight) { releaseOrDefer(file); continue; } // SR-P2-1: a prior timed-out sanitize op still runs ⇒ no concurrent read; retry next drain
+            // SR-P2-1: ONE budget over the WHOLE op (async read + ASYNC write + build) — all IO async, so a slow op never blocks the
+            // sweep (the budget timer fires) and the write phase is covered. On timeout: no commit, and the still-running op is held
+            // in sanitizeInFlight so the next drain skips until it settles (no 2nd concurrent read), WITHOUT awaiting it here.
+            const budgetMs = SANITIZED_READ_BUDGET_SEC * 1000;
+            const started = Date.now();
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const op = (async (): Promise<PermissionDecision | null> => {
+              const rr = action.spec.readKind === "git"
+                ? await resolveAndReadGit(action.spec, req.cwd, HOME) // Phase 2: hardened git read in a throwaway --mirror clone (self-cleans its scratch)
+                : await resolveAndRead(action.spec, req.cwd);         // path forms: coordinator-side fd-read; no subprocess/shell/env
+              if (!rr.ok) return null;
+              const resultPath = await writeSanitizedResult(HOME, rr.bytes, rr.truncated); // ASYNC write (SR-P2-1)
+              return buildSanitizeDecision(req, resultPath, coordSid, nowSec());
+            })();
+            const raced = await Promise.race([op.then((d) => ({ timedOut: false as const, d })), new Promise<{ timedOut: true }>((res) => { timer = setTimeout(() => res({ timedOut: true }), budgetMs); })]);
+            if (timer) clearTimeout(timer);
+            if (raced.timedOut) {
+              sanitizeInFlight = op.then(() => {}, () => {}).finally(() => { sanitizeInFlight = null; }); // hold single-flight until the bg op settles
+              ackInbox(file); continue; // over decision-budget ⇒ no decision ⇒ member hook times out to the user (fail-to-user)
+            }
+            if (raced.d !== null && Date.now() - started <= budgetMs) decision = raced.d; // commit ONLY if the whole op finished within budget
+          }
+          if (decision) {
+            const { state, result } = commitTask(st, [{ put: "permissionDecision", permissionDecision: decision }]);
             if (result.ok) { st = state; ackInbox(file); } // ok covers a fresh commit AND an idempotent replay
             else { st = loadControlLog(CONTROL_LOG_DIR); releaseOrDefer(file); } // seq conflict ⇒ reload + release (or defer) for retry
           } else {
-            ackInbox(file); // escalate: no decision ⇒ member hook times out to the user; live-sentinel supervises
+            ackInbox(file); // escalate / flag-off / sanitize-read-failed ⇒ no decision ⇒ member hook times out to the user; live-sentinel supervises
           }
         } catch (e) {
           releaseOrDefer(file); // release, or keep the obligation for a later sweep; never claim "released" on a failed unclaim
@@ -1879,6 +1917,7 @@ async function main(): Promise<void> {
         }
       }
     } catch (e) { log(`approval delegation failed (isolated): ${e instanceof Error ? e.message : e}`); }
+    finally { approvalDelegationInFlight = false; }
   };
 
   // Morning digest (TG v1 CORE composeDigest had no trigger ⇒ never produced). At/after the local target hour, once per calendar
@@ -2007,7 +2046,7 @@ async function main(): Promise<void> {
       // approval-delegation (IO round): classify members' PermissionRequests from the dedicated approval key and delegate the
       // safe reads (commit a control-log permissionDecision the member hook polls back). Gated on SWARM_APPROVAL_DELEGATE
       // (default OFF); fully fail-soft; never auto-grants (an escalate falls to the user).
-      runApprovalDelegation();
+      await runApprovalDelegation();
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
       // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
       runGaugeSampling();
