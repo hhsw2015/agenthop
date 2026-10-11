@@ -24,6 +24,13 @@ export interface ExecutorDigest {
 /** SWARM_EXECUTOR_DIGEST — live by default (opt-out; kill with =0). A pure advisory enrichment, so it follows the flag-default rule. */
 export function executorDigestEnabled(env: string | undefined): boolean { return flagDefaultOn(env); }
 
+/** Coerce an UNTRUSTED identity value (a review-queue `author` from JSON metadata, a herdr member name) to a usable session ref,
+ *  or null. ED-5: a number/object/empty must NEVER reach resolveSession (whose `.trim()` throws on a non-string, which would abort
+ *  the caller's whole pass). Returns the trimmed string, or null for any non-string / blank. Pure. */
+export function coerceSessionRef(x: unknown): string | null {
+  return typeof x === "string" && x.trim() ? x.trim() : null;
+}
+
 function clip(s: string, n: number): string { const t = s.replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n)}…` : t; }
 
 /** A one-line brief of a tool call from its input: prefer a human description, else a representative string arg, clipped. Pure. */

@@ -72,7 +72,7 @@ import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/
 import { AlertDedup, alertKey, classifyMemberHealth, isOnRoster, classifyBlockedEscalation, screenIndicatesContentFilter, contentFilterHintNote, classifyFailure, failureHintNote, resolveSnapshotMembers, parsePsOutput, isDispatcherAlreadyRunning, shouldEmitWatchNotice } from "../packages/bus/src/swarm/sentinel-denoise.js";
 import { autoscaleEnabled, readReviewLedger, reviewQueueDir, filterLiveRecords, queueDepth, instantaneousWant, buildSeatStatesFromLedger, canonicalizeLiveRecords, planAutoscaleSuggestion, type ScaleConfig } from "../packages/bus/src/swarm/review-seat-autoscale.js";
 import { roundDoctorEnabled, roundAlertN, diagnoseRounds, buildRoundDoctorNote, extractTicketRounds, DEFAULT_ROUND_DOCTOR_CONFIG } from "../packages/bus/src/swarm/round-doctor.js";
-import { executorDigestEnabled, loadExecutorDigest, formatExecutorDigest } from "../packages/bus/src/swarm/executor-digest.js";
+import { executorDigestEnabled, loadExecutorDigest, formatExecutorDigest, coerceSessionRef } from "../packages/bus/src/swarm/executor-digest.js";
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
@@ -1515,8 +1515,11 @@ async function main(): Promise<void> {
         // UNRESOLVABLE identity is reported distinctly from "no transcript" (never conflated). Await — the IO is async (ED-3).
         let digestNote = "";
         if (executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST)) {
-          const memberSid = resolveSession(ev.member, listSessions(HOME));
-          digestNote = memberSid ? formatExecutorDigest(await loadExecutorDigest(memberSid)) : "执行器摘要:成员身份未解析,摘要不可用";
+          try { // ED-5: the supplement must never abort the alert — guard the untrusted ref + isolate any failure
+            const ref = coerceSessionRef(ev.member);
+            const memberSid = ref ? resolveSession(ref, listSessions(HOME)) : null;
+            digestNote = memberSid ? formatExecutorDigest(await loadExecutorDigest(memberSid)) : "执行器摘要:成员身份未解析,摘要不可用";
+          } catch { digestNote = ""; }
         }
         const summary = [ev.explain ? `定性:${ev.explain}` : "", cfHint, failHint, digestNote, screen ? `读屏:\n${screen}` : ""].filter(Boolean).join("\n\n") || "(screen/explain unavailable)";
         const doc = buildApprovalDoc({
@@ -1792,9 +1795,14 @@ async function main(): Promise<void> {
           // suggestion. ED-1: resolve author handle → native sid first; unresolvable ⇒ no digest line (the suggestion stands).
           // ED-2: formatExecutorDigest is STABLE (absolute activity instant, no wall-clock), so an unchanged digest does not
           // bypass notifyCoordinator's taskRef+text dedup. Await — the IO is async (ED-3).
-          const author = records.find((r) => r.ticket === ticket)?.author ?? "";
-          const authorSid = executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST) && author ? resolveSession(author, listSessions(HOME)) : null;
-          const digestNote = authorSid ? formatExecutorDigest(await loadExecutorDigest(authorSid)) : "";
+          let digestNote = "";
+          if (executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST)) {
+            try { // ED-5: a non-string / malformed ledger author must NOT throw out of the loop and drop this suggestion
+              const ref = coerceSessionRef(records.find((r) => r.ticket === ticket)?.author);
+              const authorSid = ref ? resolveSession(ref, listSessions(HOME)) : null;
+              digestNote = authorSid ? formatExecutorDigest(await loadExecutorDigest(authorSid)) : "";
+            } catch { digestNote = ""; }
+          }
           notifyCoordinator([buildRoundDoctorNote(ticket, verdict), digestNote].filter(Boolean).join("\n"), { taskRef: `round-doctor:${ticket}`, title: "round-doctor" });
         }
       } finally {

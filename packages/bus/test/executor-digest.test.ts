@@ -4,7 +4,7 @@ import { execSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import {
-  parseExecutorDigest, formatExecutorDigest, findTranscript, loadExecutorDigest, executorDigestEnabled,
+  parseExecutorDigest, formatExecutorDigest, findTranscript, loadExecutorDigest, executorDigestEnabled, coerceSessionRef,
 } from "../src/swarm/executor-digest.js";
 
 /**
@@ -131,4 +131,15 @@ test("executorDigestEnabled: live by default (opt-out)", () => {
   expect(executorDigestEnabled(undefined)).toBe(true);
   expect(executorDigestEnabled("0")).toBe(false);
   expect(executorDigestEnabled("off")).toBe(false);
+});
+
+test("ED-5: coerceSessionRef accepts only a non-blank string — untrusted author metadata can't reach resolveSession", () => {
+  expect(coerceSessionRef("claude:Work-d7f6c917")).toBe("claude:Work-d7f6c917");
+  expect(coerceSessionRef("  x  ")).toBe("x");
+  expect(coerceSessionRef(7 as unknown)).toBeNull();                 // a numeric author (ledger JSON) ⇒ null, never resolveSession
+  expect(coerceSessionRef({ sid: "a" } as unknown)).toBeNull();      // an object author ⇒ null
+  expect(coerceSessionRef("")).toBeNull();
+  expect(coerceSessionRef("   ")).toBeNull();
+  expect(coerceSessionRef(null)).toBeNull();
+  expect(coerceSessionRef(undefined)).toBeNull();
 });
