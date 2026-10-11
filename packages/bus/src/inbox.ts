@@ -447,7 +447,7 @@ function alive(pid: number): boolean {
 }
 
 // ============================================================================================================
-// FC-2 — poison dead-letter quarantine (SWARM_POISON_DLQ, default OFF). Under at-least-once delivery, a message whose
+// FC-2 — poison dead-letter quarantine (SWARM_POISON_DLQ, LIVE BY DEFAULT since flags-default-flip batch-2; =0 to disable). Under at-least-once delivery, a message whose
 // delivery reliably THROWS (the host erring on THIS content) head-of-line-blocks the queue, re-claimed + retried forever.
 // After a strike threshold it is moved to quarantine/ (bytes preserved, never deleted) and the coordinator is told. A push
 // that merely RETURNS FALSE is channel-not-ready (transient) and NEVER strikes — so a channel outage cannot false-quarantine

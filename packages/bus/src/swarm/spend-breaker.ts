@@ -8,8 +8,9 @@
  * marked SETTLED with its estimate RETAINED as a conservative charge — SB3: never refunded). This is the
  * spend-AMOUNT dimension, distinct from the existing spawn-COUNT cap a runaway ticket would otherwise slip.
  *
- * DORMANT: gated behind SWARM_SPEND_BREAKER (default OFF). OFF ⇒ every request is allowed and NO pool is
- * touched (a true no-op); nothing here is wired into the real dispatcher — FC-4 is a filing, not a switch.
+ * Flag SWARM_SPEND_BREAKER is LIVE BY DEFAULT (opt-out, flags-default-flip batch-2; =0 to disable), BUT nothing here is wired
+ * into the real dispatcher — FC-4 is a filing, not a switch — so the flip is a no-op until wired (default only; was "dormant
+ * default OFF" before batch-2). OFF (=0) ⇒ every request is allowed and NO pool is touched (a true no-op).
  * This module only CONSUMES the shared-budget API; it never changes signed shared-budget behavior.
  */
 import { isValidPoolName, type PoolAdmission, type PoolCeiling } from "./shared-budget.js";

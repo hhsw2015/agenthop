@@ -11,8 +11,9 @@
  *   ③ delegation NEVER escalates privilege (R16): naming an accountable human grants nothing and issues no
  *      credential; it only records whom the chain represents.
  *
- * DORMANT: gated behind SWARM_ATTRIBUTION (default OFF). OFF ⇒ nothing computes or stores it, and it is wired
- * into no live dispatcher. Pure classification only; it reuses existing identity (seat ids / cap originator) and
+ * Flag SWARM_ATTRIBUTION is LIVE BY DEFAULT (opt-out, flags-default-flip batch-2; =0 to disable), BUT the enabler has no live
+ * caller yet — nothing computes or stores it, wired into no live dispatcher — so the flip is a no-op until it is wired (default
+ * only; was "dormant default OFF" before batch-2). Pure classification only; it reuses existing identity (seat ids / cap originator) and
  * builds no new identity or cap system.
  */
 import { flagDefaultOn } from "./flag-default.js";

@@ -200,8 +200,12 @@ export function validApprovalRequest(raw: unknown): ApprovalRequest | null {
  *  SWARM_APPROVAL_DELEGATE=0. **This CHANGES member permission-popup behavior** — the sync PermissionRequest hook + coordinator
  *  delegation run by default (a safe scope-free command the coordinator can serve no longer reaches the user = the north star).
  *  scope-free delegation passed adversarial review; still, flipping it on by default warrants the member "popup behavior change"
- *  broadcast. Kill-switch: SWARM_APPROVAL_DELEGATE=0 ⇒ the hook stays `report-status blocked` and every prompt reaches the user.
- *  NOTE: the CLI duplicates this read (cli must not import bus) — keep agents.ts `approvalDelegateOn` in lockstep. */
+ *  broadcast. EXECUTION: a scope-free command is APPROVED here, then run BY THE MEMBER via the impl-pinned rewrite (`builtin
+ *  command /bin/pwd`) — the coordinator does NOT run it (that is sanitize's model). Kill-switch SWARM_APPROVAL_DELEGATE=0 disables
+ *  ONLY scope-free delegation; it does NOT by itself restore the async `report-status blocked` hook or send every prompt to the
+ *  user, because SWARM_SANITIZED_READ (also default-on) still arms the SYNC gate and still serves path/git reads. Reverting to the
+ *  async blocked hook needs BOTH flags =0. NOTE: the CLI duplicates this read (cli must not import bus) — keep agents.ts
+ *  `approvalDelegateOn` in lockstep. */
 export function approvalDelegateEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return flagDefaultOn(env.SWARM_APPROVAL_DELEGATE);
 }

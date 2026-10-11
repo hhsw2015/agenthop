@@ -1552,7 +1552,7 @@ async function main(): Promise<void> {
   // commit — the newCommit/inject evidence family, which is STRONGER than bus-presence — so every box is verified as kind:"inject".
   // confirmed ⇒ discharged; unknown ⇒ ACCOUNT via notifyCoordinator, NEVER auto-redo (②b: re-fire idempotency is not dispatcher-
   // provable). Commit ONLY on a status change (FC-6), which also dedups the notice to once per transition. Gated on
-  // SWARM_OPS_RECEIPT (default OFF); sync; fully fail-soft; spawns/acts on nothing.
+  // SWARM_OPS_RECEIPT (LIVE BY DEFAULT, batch-2; =0 to disable); sync; fully fail-soft; spawns/acts on nothing.
   const opsNotified = new Set<string>(); // F53-N1: opIds whose UNCONFIRMED notice is DELIVERED (or deduped) — a logged/failed notify retries each tick
   const runOpsReceipt = (): void => {
     if (!OPS_RECEIPT_ENABLED) return;
@@ -1597,7 +1597,7 @@ async function main(): Promise<void> {
 
   // F53 ③: succession-heartbeat — a swapped member (swap record present) with NO bus heartbeat AND no [checkin] since the swap,
   // past the window, ⇒ S19. A SIBLING of runLiveSentinel so it is gated INDEPENDENTLY of SWARM_SENTINEL (SWARM_SUCCESSION_HEARTBEAT,
-  // default OFF). Reuses notifyCoordinator (built-in dedup) + a per-episode one-shot re-armed on recovery. Consumes the swap record
+  // LIVE BY DEFAULT, batch-2; =0 to disable). Reuses notifyCoordinator (built-in dedup) + a per-episode one-shot re-armed on recovery. Consumes the swap record
   // written on adopt under SWARM_SUCCESSION. Sync; fully fail-soft.
   const succHeartbeatFired = new Set<string>();
   const runSuccessionHeartbeat = (): void => {
@@ -1836,7 +1836,7 @@ async function main(): Promise<void> {
   // DELEGATE the safe ones by committing a permissionDecision to the control-log (the member hook polls it back by promptId and
   // auto-allows — no user dialog). An escalate writes NO decision: the member hook times out to the user dialog, and that blocked
   // member is surfaced + supervised by the existing live-sentinel (S14 blocked⇒S19), so ③ needs no new wait here. Gated on
-  // SWARM_APPROVAL_DELEGATE (default OFF); fully fail-soft — never breaks the sweep, never auto-grants.
+  // SWARM_APPROVAL_DELEGATE (LIVE BY DEFAULT, batch-2 TIER B; =0 to disable); fully fail-soft — never breaks the sweep, never auto-grants.
   // ADIO-P2-1: releaseInbox returns false when the unclaim rename fails; while THIS process is alive recoverStaleClaims skips our
   // own .claim-disp-<pid>, so a failed release would strand the claim with no auto-retry. Mirror claimInbox's `stuck` pattern — a
   // failed release is an OBLIGATION kept in this in-process set and retried on the next sweep (a claim that has since vanished is
@@ -2035,7 +2035,7 @@ async function main(): Promise<void> {
       // on SWARM_SENTINEL + herdr reachability; dormant otherwise.
       await runLiveSentinel();
       // F53 ②: ops-receipt — verify the coordinator's own fired spawn/inject ops by durable evidence; account (never auto-redo) on
-      // an unverified op. Gated on SWARM_OPS_RECEIPT (default OFF); fully fail-soft.
+      // an unverified op. Gated on SWARM_OPS_RECEIPT (LIVE BY DEFAULT, batch-2; =0 to disable); fully fail-soft.
       runOpsReceipt();
       // F53 ③: succession-heartbeat — a swapped member silent past the window ⇒ S19. Gated on SWARM_SUCCESSION_HEARTBEAT
       // (default OFF), independent of SWARM_SENTINEL; fully fail-soft.

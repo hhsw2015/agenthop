@@ -183,6 +183,9 @@ export async function runPermissionGate(deps: PermissionGateDeps): Promise<void>
       if (plan.gate !== "scope-free") return;                 // a bound decision for a non-scope-free command ⇒ user dialog (defensive)
       if (!deps.pinnedPathOk(plan.pinnedPath)) return;        // the pinned binary missing / symlink / dir in THIS env ⇒ escalate to the user
       const updatedInput = { ...(parsed.toolInput as Record<string, unknown>), command: plan.rewrite };
+      // EXECUTION RESPONSIBILITY: scope-free DELEGATE ⇒ the MEMBER runs this approved rewrite (`builtin command <abspath>`) in its
+      // own env. Contrast the sanitize branch below, where the COORDINATOR reads hardened + injects the result (the member only cats
+      // it). The member "popup behavior change" broadcast must describe each class correctly — they are NOT both coordinator-run.
       deps.emit(allowDecisionOutput(updatedInput));           // full original input, command swapped to `builtin command <abspath>`
       return;
     }

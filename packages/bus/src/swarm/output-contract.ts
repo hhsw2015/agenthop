@@ -5,8 +5,9 @@
  * and classifies met / unmet / unknown. A VERIFICATION tag — never an authorization input.
  *
  * Split: a PURE core (types, flag, shape validation, verdict) + a thin best-effort IO shell (probe the fs/git/
- * inbox, present an unmet to the coordinator). DORMANT: gated behind SWARM_OUTPUT_CONTRACT (default OFF) — nothing
- * probes or stores a verdict, and it is wired into no live delivery path.
+ * inbox, present an unmet to the coordinator). Flag SWARM_OUTPUT_CONTRACT is LIVE BY DEFAULT (opt-out, flags-default-flip
+ * batch-2; =0 to disable), BUT the enabler has no live caller yet — nothing probes or stores a verdict, wired into no live
+ * delivery path — so the flip is a no-op until the check is wired (default only; was "dormant default OFF" before batch-2).
  */
 import { readFileSync, readdirSync, statSync, type Stats } from "node:fs";
 import { flagDefaultOn } from "./flag-default.js";

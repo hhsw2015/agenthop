@@ -4,9 +4,10 @@
  * (swarm/approval-gate.ts); all logic lives there. Lazy-imported by bin.ts so its control-log / inbox / task-liveness imports
  * load only when this subcommand runs, not on every agenthop invocation.
  *
- * Dormant unless SWARM_APPROVAL_DELEGATE: when off (or no coordinator resolvable), it keeps ONLY the `blocked` status signal and
- * emits nothing — identical observable behavior to the async `report-status blocked` hook it replaces. The decision JSON (allow)
- * is the ONLY thing it ever writes to stdout, so it cannot corrupt a non-protocol channel.
+ * The gate runs when EITHER SWARM_APPROVAL_DELEGATE or SWARM_SANITIZED_READ is on — BOTH are LIVE BY DEFAULT (opt-out) since
+ * flags-default-flip batch-2, so it runs by default. Only when BOTH are =0 (or no coordinator resolvable) does it keep ONLY the
+ * `blocked` status signal and emit nothing — identical observable behavior to the async `report-status blocked` hook it replaces.
+ * The decision JSON (allow) is the ONLY thing it ever writes to stdout, so it cannot corrupt a non-protocol channel.
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
