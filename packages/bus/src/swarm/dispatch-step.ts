@@ -307,7 +307,7 @@ async function awaitResume(r: ControlRecord, records: Map<string, ControlRecord>
   if (!child0) {
     const base = r.attemptStartSec ?? ops.nowSec();
     const rebuilt: ControlRecord = {
-      launchId: r.successor, state: "RUNNING", generation: sgen, handoffSha: r.handoffSha, sha: tip.sha, incomingSha: tip.sha, // F53-O1: born carrying the dead child's recovery point ⇒ birth anchor = tip.sha (own output = advance past it)
+      launchId: r.successor, state: "RUNNING", generation: sgen, handoffSha: r.handoffSha, sha: tip.sha, incomingSha: r.handoffSha ?? "", // F53-O1: the child's INCOMING anchor is the parent's handoffSha (where it resumed FROM); tip.sha is its awaitResume-VERIFIED OWN output ⇒ sha!==incomingSha ⇒ confirmed (not re-judged unknown). "" if no prior anchor (fresh)
       allocStart: base, budgetSec: ops.budgetSec, physicalLifetimeSec: r.attemptPhysicalSec ?? ops.physicalLifetimeSec,
       deadlineEpoch: base + ops.budgetSec, updatedAt: ops.nowSec(),
     };

@@ -203,7 +203,7 @@ export function installInboxWake(log?: (s: string) => void, env: NodeJS.ProcessE
   // 20 min with no trace. Log the reason so the inert state is never silent (the flags line also reports it as on(inert:no-herdr)).
   if (!herdrSpawnable(env)) {
     setInboxWakeHook(null);
-    log?.("inbox-wake: SWARM_INBOX_WAKE on but herdr is NOT reachable from this process (HERDR_ENV/HERDR_PANE_ID unset) — real-time wake INERT; writeInbox still delivers and the dispatcher backstop + the target's own poll still apply");
+    log?.("inbox-wake: SWARM_INBOX_WAKE on but herdr is NOT reachable from this process (HERDR_ENV/HERDR_PANE_ID unset) — real-time wake INERT; writeInbox still delivers DURABLY and the target's own inbox poll still applies. NOTE: this process's dispatcher backstop shares the SAME herdr gate, so it is ALSO inert here — re-pings need a herdr-reachable dispatcher");
     return false;
   }
   const deps = defaultWakeDeps(log);
