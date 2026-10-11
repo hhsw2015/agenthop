@@ -12,15 +12,15 @@
 //  (e) RECEIPT seam: an accepted result whose intent carries expectedOutput is OFFERED to ops.verifyOutputContract (gated on the
 //      flag — kill-switch silences it); a node with no expectedOutput is never offered. OW-2 RECOVERABLE: task-pass OFFERS every
 //      pass (no at-most-once in-memory flag), so a later pass re-offers an already-accepted item.
-//  (f) the DURABLE discharge seam (output-contract-receipt): the pure discharge rule + the marker round-trip (an idempotent no-op
-//      once discharged; an un-presented unmet is NOT discharged ⇒ retried).
+//  (f) the DURABLE discharge seam (output-contract-receipt): the pure discharge rule + the marker round-trip; OW-3 collision-free
+//      digest keys (distinct legal ids never share a marker); OW-2 EXACTLY-ONCE present (a re-present makes no duplicate card).
 //  (g) verifyExpectedOutput / probeExpectedOutput / validateExpectedOutput are BYTE-UNCHANGED — covered by
 //      output-contract.selftest.mts (run separately).
 //
 // The contract math (validate/probe/verify) lives in the pure core; this selftest only proves the SEAM: stamp-at-dispatch
 // (gated on outputContractEnabled), read-side tolerance, and the recoverable verify-at-receipt (offered every pass + durable discharge).
 
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readdirSync } from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
 import {
@@ -30,7 +30,7 @@ import {
 import { loadPlan, type TaskPlan } from "./task-plan.js";
 import { taskPass, type TaskOps, type GitFacts } from "./task-pass.js";
 import type { TaskAttempt } from "./task-state.js";
-import { ocReceiptMarkerPath, ocReceiptDischarged, ocReceiptMark, shouldDischargeReceipt } from "./output-contract-receipt.js";
+import { ocReceiptMarkerPath, ocReceiptDischarged, ocReceiptMark, shouldDischargeReceipt, presentUnmetOnce } from "./output-contract-receipt.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
@@ -268,10 +268,32 @@ try {
     ocReceiptMark(home, "att-1", { verdict: "met", atSec: 1 });
     t("(f) discharged after mark (the dispatcher's idempotent no-op signal)", ocReceiptDischarged(home, "att-1") === true);
     t("(f) a DIFFERENT accepted item is independent (not discharged)", ocReceiptDischarged(home, "att-2") === false);
-    // path safety: a crafted attemptId can never escape the receipt dir (it becomes a filename).
+    // path safety: a crafted attemptId can never escape the receipt dir (the digest is a safe single segment).
     const p = ocReceiptMarkerPath(home, "../../etc/evil");
-    t("(f) marker path stays inside the receipt dir (traversal sanitized)",
+    t("(f) marker path stays inside the receipt dir (digest key is a safe filename)",
       p.startsWith(nodePath.join(home, ".agenthop", "swarm", "output-contract") + nodePath.sep) && !p.includes(`${nodePath.sep}etc${nodePath.sep}evil`));
+
+    // OW-3: two DISTINCT legal attemptIds that COLLIDE under a naive replace/truncate scheme map to DISTINCT digest markers, and
+    // discharging one never discharges the other (no inherited completion via a shared filename).
+    const idA = "job_a/build/a0", idB = "job/a_build/a0";
+    t("(f) OW-3: the two ids collide under a naive replace scheme", idA.replace(/[^A-Za-z0-9._-]/g, "_") === idB.replace(/[^A-Za-z0-9._-]/g, "_"));
+    t("(f) OW-3: but map to DISTINCT digest markers", ocReceiptMarkerPath(home, idA) !== ocReceiptMarkerPath(home, idB));
+    ocReceiptMark(home, idA, { verdict: "unmet", atSec: 1 });
+    t("(f) OW-3: discharging A does NOT discharge B (no inherited completion)", ocReceiptDischarged(home, idA) === true && ocReceiptDischarged(home, idB) === false);
+    // OW-3 belt-and-suspenders: a marker whose recorded id mismatches is NOT a discharge (never inherit another id's completion).
+    t("(f) OW-3: an id with NO marker of its own is not discharged", ocReceiptDischarged(home, "job/build/zzz") === false);
+
+    // OW-2: the durable present is EXACTLY-ONCE — a re-present (lost marker / crash recovery) makes NO duplicate card.
+    const ph = mkdtempSync(nodePath.join(os.tmpdir(), "oc-present-"));
+    const eo = { kind: "file", ref: "out/x" } as const;
+    const pr1 = presentUnmetOnce(ph, "coord-sid-xyz", "job/build/a0", eo, "a0");
+    const pr2 = presentUnmetOnce(ph, "coord-sid-xyz", "job/build/a0", eo, "a0"); // a re-present (marker fault / recovery)
+    t("(f) OW-2: presentUnmetOnce confirmed durable on both calls (published, then already)", pr1 === true && pr2 === true);
+    const inbox = nodePath.join(ph, ".agenthop", "inbox", "coord-sid-xyz");
+    t("(f) OW-2: a re-present creates NO duplicate card (exactly ONE S19 at the coordinator)", readdirSync(inbox).filter((f) => f.endsWith(".json")).length === 1);
+    // a DIFFERENT accepted item ⇒ its OWN card (the idempotency key is per-attempt).
+    presentUnmetOnce(ph, "coord-sid-xyz", "job/build/a1", eo, "a1");
+    t("(f) OW-2: a different accepted item ⇒ a separate card (2 total)", readdirSync(inbox).filter((f) => f.endsWith(".json")).length === 2);
   }
 
   console.log("\noutput-contract-wiring self-check OK");

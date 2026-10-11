@@ -37,8 +37,8 @@ import { taskPass, buildSched, physicalSlotsOccupied, type TaskOps, type GitFact
 import { readyTasks } from "../packages/bus/src/swarm/task-ready.js";
 import { boardAdmitEnabled, planBoardWrites, planBoardSupervision, parsePolicyNum, postedFileName, reclaimedFileName, planClaimAdmission, parseClaimApplication, grantWaitId, boardItemId, claimedFileName, grantedFileName, rejectedFileName, parseBoardItemName, repostTmpAction, suppressPendingReposts, boardFileIdentityVerified, type ClaimApplication, type ExistingBoardFile } from "../packages/bus/src/swarm/task-board.js";
 import { observeResultOnBranch } from "../packages/bus/src/swarm/task-observe.js";
-import { outputContractEnabled, probeExpectedOutput, verifyExpectedOutput, presentUnmetToCoordinator } from "../packages/bus/src/swarm/output-contract.js";
-import { ocReceiptDischarged, ocReceiptMark, shouldDischargeReceipt } from "../packages/bus/src/swarm/output-contract-receipt.js";
+import { outputContractEnabled, probeExpectedOutput, verifyExpectedOutput } from "../packages/bus/src/swarm/output-contract.js";
+import { ocReceiptDischarged, ocReceiptMark, shouldDischargeReceipt, presentUnmetOnce } from "../packages/bus/src/swarm/output-contract-receipt.js";
 import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
 import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
@@ -574,11 +574,15 @@ function buildTaskOps(stateRef: { s: LogState }, planCommittedAtSec: number): Ta
           // clean into a WRONG inbox for a short-id/member-name config. Fall back to the config only when it is already a full
           // stable SID (the offline S19 route the observer notify uses).
           const sid = resolveSession(COORDINATOR, listSessions(HOME)) || (isStableSidStr(COORDINATOR) ? COORDINATOR : "");
-          if (sid) { presentUnmetToCoordinator(HOME, sid, taskRef, eo); presented = true; log(`output-contract ${taskRef}: UNMET (kind=${eo.kind}) — S19 presented to coordinator`); }
-          else log(`output-contract ${taskRef}: UNMET (kind=${eo.kind}) — coordinator "${COORDINATOR || "(unset)"}" unresolved, NOT presenting (retry next pass)`);
+          if (sid) {
+            // OW-2: EXACTLY-ONCE present — the idempotency key dedups the card at the inbox layer, so a re-present (marker fault /
+            // crash between present and mark) makes NO duplicate. `presented` is true ONLY when the card is CONFIRMED durable.
+            presented = presentUnmetOnce(HOME, sid, taskRef, eo, attempt.attemptId);
+            log(`output-contract ${taskRef}: UNMET (kind=${eo.kind}) — S19 ${presented ? "presented (idempotent)" : "present deferred/unknown, retry next pass"}`);
+          } else log(`output-contract ${taskRef}: UNMET (kind=${eo.kind}) — coordinator "${COORDINATOR || "(unset)"}" unresolved, NOT presenting (retry next pass)`);
         } else log(`output-contract ${taskRef}: ${verdict} (kind=${eo.kind})`);
-        // OW-2: discharge ONLY once the obligation is truly complete (met/unknown, or unmet+presented). An unmet we could not
-        // present stays UNDISCHARGED ⇒ re-offered next pass (retried once the coordinator resolves / the inbox becomes writable).
+        // OW-2: discharge ONLY once the obligation is truly complete (met/unknown, or unmet+CONFIRMED-presented). An unmet we could
+        // not durably present stays UNDISCHARGED ⇒ re-offered next pass (retried once the coordinator resolves / the inbox settles).
         if (shouldDischargeReceipt(verdict, presented)) ocReceiptMark(HOME, attempt.attemptId, { verdict, atSec: nowSec() });
       } catch (e) { log(`output-contract ${taskRef} probe/present error (isolated) — retry next pass: ${e instanceof Error ? e.message : e}`); } // no marker ⇒ retried
     },
