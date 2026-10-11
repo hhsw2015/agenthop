@@ -80,6 +80,7 @@ async function fdWithinCwd(handle: fsp.FileHandle, abs: string, realCwd: string)
  * is the member's verified ABSOLUTE cwd (from the S11 request).
  */
 export async function resolveAndRead(spec: SanitizeSpec, cwd: string): Promise<ReadResult> {
+  if (spec.readKind === "git") return { ok: false, reason: "git-spec-not-a-path-form" }; // git ⇒ resolveAndReadGit (narrows spec to a path form)
   let realCwd: string;
   try { realCwd = await fsp.realpath(cwd); } catch { return { ok: false, reason: "cwd-unresolvable" }; }
   const abs = isAbsolute(spec.targetArg) ? spec.targetArg : join(realCwd, spec.targetArg);
@@ -147,6 +148,7 @@ async function produce(spec: SanitizeSpec, handle: fsp.FileHandle, fst: Stats, a
     }
     case "stat": return { ok: true, bytes: Buffer.from(formatStat(fst, spec.targetArg)), truncated: false };
     case "ls": return await listDir(handle, abs, cap);
+    case "git": return { ok: false, reason: "git-spec-not-a-path-form" }; // unreachable (resolveAndRead guards it) — exhaustiveness
   }
 }
 

@@ -6,13 +6,13 @@ import { planSanitize, sanitizedReadEnabled, SANITIZED_READ_BUDGET_SEC, SANITIZE
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
 // ── planSanitize: the Phase-1b forms `<form> <oneArg>` for form ∈ {cat,head,tail,wc,ls,stat} ──────────────────
-t("cat <relpath> ⇒ spec", (() => { const s = planSanitize("cat notes.txt"); return s !== null && s.readKind === "cat" && s.targetArg === "notes.txt"; })());
-t("cat <abspath> ⇒ spec", (() => { const s = planSanitize("cat /w/sub/file"); return s !== null && s.targetArg === "/w/sub/file"; })());
-t("cat with inner tabs still one arg ⇒ spec", (() => { const s = planSanitize("cat\tnotes.txt"); return s !== null && s.targetArg === "notes.txt"; })());
+t("cat <relpath> ⇒ spec", (() => { const s = planSanitize("cat notes.txt"); return s !== null && "targetArg" in s && s.readKind === "cat" && s.targetArg === "notes.txt"; })());
+t("cat <abspath> ⇒ spec", (() => { const s = planSanitize("cat /w/sub/file"); return s !== null && "targetArg" in s && s.targetArg === "/w/sub/file"; })());
+t("cat with inner tabs still one arg ⇒ spec", (() => { const s = planSanitize("cat\tnotes.txt"); return s !== null && "targetArg" in s && s.targetArg === "notes.txt"; })());
 for (const k of ["head", "tail", "wc", "ls", "stat"] as const) {
-  t(`${k} <arg> ⇒ spec (readKind=${k})`, (() => { const s = planSanitize(`${k} notes.txt`); return s !== null && s.readKind === k && s.targetArg === "notes.txt"; })());
+  t(`${k} <arg> ⇒ spec (readKind=${k})`, (() => { const s = planSanitize(`${k} notes.txt`); return s !== null && "targetArg" in s && s.readKind === k && s.targetArg === "notes.txt"; })());
 }
-t("ls <dir> ⇒ spec (dir target)", (() => { const s = planSanitize("ls src/sub"); return s !== null && s.readKind === "ls" && s.targetArg === "src/sub"; })());
+t("ls <dir> ⇒ spec (dir target)", (() => { const s = planSanitize("ls src/sub"); return s !== null && "targetArg" in s && s.readKind === "ls" && s.targetArg === "src/sub"; })());
 
 // ── not sanitizable ⇒ null (⇒ escalate to the user) ───────────────────────────────────────────────────────────
 for (const c of [
@@ -54,6 +54,47 @@ for (const c of ["cat .env", "cat sub/.env.local", "cat id_rsa", "cat deploy/id_
                  "cat .ENV", "cat ID_RSA", "cat Secrets.TXT", "cat sub/.SSH/config", // SR-P1-2: credential check is CASE-INSENSITIVE
                  "head .env", "tail secrets.log", "wc app.key", "stat id_rsa", "ls .ssh", "ls .aws", "ls deploy/.SSH"]) { // the guard applies to EVERY form's target (incl. the ls dir)
   t(`credential path ⇒ null (escalate): ${c}`, planSanitize(c) === null);
+}
+
+// ── Phase 2: git committed-history planner (log/show/diff/branch, NON-content) ────────────────────────────────
+const g = (cmd: string) => planSanitize(cmd);
+t("git log ⇒ spec", (() => { const s = g("git log"); return s !== null && s.readKind === "git" && s.subcmd === "log" && s.flags.length === 0 && s.operands.length === 0; })());
+t("git log --oneline --stat ⇒ flags", (() => { const s = g("git log --oneline --stat"); return s !== null && s.readKind === "git" && s.flags.join(",") === "--oneline,--stat"; })());
+t("git log -5 ⇒ numeric flag", (() => { const s = g("git log -5"); return s !== null && s.readKind === "git" && s.flags[0] === "-5"; })());
+t("git log main ⇒ rev operand", (() => { const s = g("git log main"); return s !== null && s.readKind === "git" && s.operands[0] === "main"; })());
+t("git log HEAD~3 ⇒ rev operand (tilde/caret ok)", (() => { const s = g("git log HEAD~3"); return s !== null && s.readKind === "git" && s.operands[0] === "HEAD~3"; })());
+t("git show --stat HEAD ⇒ spec", (() => { const s = g("git show --stat HEAD"); return s !== null && s.readKind === "git" && s.subcmd === "show" && s.operands[0] === "HEAD"; })());
+t("git diff --stat HEAD~1 HEAD ⇒ 2 revs", (() => { const s = g("git diff --stat HEAD~1 HEAD"); return s !== null && s.readKind === "git" && s.operands.length === 2; })());
+t("git diff --name-only a..b ⇒ range operand", (() => { const s = g("git diff --name-only a..b"); return s !== null && s.readKind === "git" && s.operands[0] === "a..b"; })());
+t("git branch -a ⇒ spec", (() => { const s = g("git branch -a"); return s !== null && s.readKind === "git" && s.subcmd === "branch"; })());
+
+for (const c of [
+  "git",                       // no subcommand
+  "git status -s",             // status = working-tree (Phase 3), not in the table
+  "git remote -v",             // remote DEFERRED (coordinator 2026-10-11)
+  "git log -p",                // content (patch)
+  "git log --patch",           // content
+  "git log -U3",               // content (unified)
+  "git show",                  // bare show = content ⇒ require a stat flag
+  "git show HEAD",             // show with a rev but NO stat flag = content
+  "git diff",                  // bare diff = content
+  "git diff HEAD~1 HEAD",      // diff with revs but NO stat flag = content
+  "git log --format=%H",       // flag not in the closed table
+  "git log --pretty=oneline",  // flag not in the table
+  "git show --stat HEAD:secret.txt", // rev:path CONTENT form (has `:`)
+  "git log --stat -- file",    // `--` pathspec separator
+  "git diff --stat ../etc",    // operand not rev-ish (leading `.`/path)
+  "git log --stat /etc/passwd",// absolute-path operand (not a rev)
+  "git log *.c",               // glob
+  "git branch -d x",           // -d not in table (and a branch operand) = mutation-adjacent
+  "git branch main",           // a branch operand = create/rename-adjacent
+  "git show --stat $(id)",     // command substitution
+  "git log --stat; rm x",      // chain
+  "git log --stat | cat",      // pipe
+  "git push",                  // not a read subcommand
+  "git diff --stat HEAD a b",  // > 2 operands for diff
+]) {
+  t(`git not sanitizable ⇒ null: ${JSON.stringify(c)}`, planSanitize(c) === null);
 }
 
 // ── consts (coordinator-frozen) ───────────────────────────────────────────────────────────────────────────────

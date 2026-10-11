@@ -60,6 +60,7 @@ import { writeInbox, inboxDirName, claimInbox, ackInbox, releaseInbox, recoverSt
 import { approvalDelegateEnabled, type PermissionDecision } from "../packages/bus/src/swarm/approval-delegation.js";
 import { planCoordinatorAction, buildSanitizeDecision, approvalInboxKey } from "../packages/bus/src/swarm/approval-gate.js";
 import { sanitizedReadEnabled, SANITIZED_READ_BUDGET_SEC } from "../packages/bus/src/swarm/sanitized-read.js";
+import { resolveAndReadGit } from "../packages/bus/src/swarm/sanitized-read-git.js";
 import { resolveAndRead, writeSanitizedResult, gcSanitizedResults } from "../packages/bus/src/swarm/sanitized-read-io.js";
 import { verifyOpsAction, applyOpsVerdict, opsReceiptOpen, pendingOpsReceipt, successionHeartbeatDue, successionHeartbeatSec, type OpsEvidence, type SuccessionLiveness } from "../packages/bus/src/swarm/coordinator-ops-receipt.js";
 import { readSuccessionSwapSec, listSuccessionSwaps } from "../packages/bus/src/swarm/shell-succession.js";
@@ -1888,7 +1889,9 @@ async function main(): Promise<void> {
             const started = Date.now();
             let timer: ReturnType<typeof setTimeout> | undefined;
             const op = (async (): Promise<PermissionDecision | null> => {
-              const rr = await resolveAndRead(action.spec, req.cwd); // coordinator-side hardened ASYNC read; no subprocess/shell/env
+              const rr = action.spec.readKind === "git"
+                ? await resolveAndReadGit(action.spec, req.cwd, HOME) // Phase 2: hardened git read in a throwaway --mirror clone (self-cleans its scratch)
+                : await resolveAndRead(action.spec, req.cwd);         // path forms: coordinator-side fd-read; no subprocess/shell/env
               if (!rr.ok) return null;
               const resultPath = await writeSanitizedResult(HOME, rr.bytes, rr.truncated); // ASYNC write (SR-P2-1)
               return buildSanitizeDecision(req, resultPath, coordSid, nowSec());

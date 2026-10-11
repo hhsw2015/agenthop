@@ -7,11 +7,11 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveAndRead, writeSanitizedResult, gcSanitizedResults, sanitizedReadDir } from "./sanitized-read-io.js";
-import { SANITIZED_READ_MAX_BYTES, type SanitizeSpec } from "./sanitized-read.js";
+import { SANITIZED_READ_MAX_BYTES, type SanitizeSpec, type PathReadKind } from "./sanitized-read.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 const cat = (targetArg: string) => ({ readKind: "cat" as const, targetArg });
-const spec = (readKind: SanitizeSpec["readKind"], targetArg: string): SanitizeSpec => ({ readKind, targetArg });
+const spec = (readKind: PathReadKind, targetArg: string): SanitizeSpec => ({ readKind, targetArg });
 const NL = 0x0a;
 
 const root = mkdtempSync(join(tmpdir(), "sr-io-"));

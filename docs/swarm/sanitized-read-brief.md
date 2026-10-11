@@ -50,9 +50,12 @@ The hardened invocation base: `env -i PATH=<trusted>` (scrub BASH_ENV/GIT_*/all 
 GIT_CONFIG_SYSTEM=/dev/null` + the `-c` full-family (`diff.external=` `core.fsmonitor=` …) + `--no-pager`, with NO
 `filter.<x>.clean|process` drivers defined. Split by working-tree dependence:
 
-- **Working-tree-INDEPENDENT** (log/show/branch/remote + committed history): run in a THROWAWAY worktree/clone of the member's
-  repo. A clean config means a `.gitattributes` filter names an UNDEFINED driver ⇒ git runs no filter program. Reuse the existing
-  scratch-dir git-read pattern (`observeResultOnBranch`/`scratchPath`, `task-observe.ts`) as the building block.
+- **Working-tree-INDEPENDENT** (log/show/branch + committed history): run in a THROWAWAY `--mirror` clone of the member's
+  repo. A clean config means a `.gitattributes` filter names an UNDEFINED driver ⇒ git runs no filter program. (Phase-2
+  implementation note: `remote` was INTENDED here but is DEFERRED — a throwaway clone's `remote -v` shows the clone's origin, not
+  the member's configured remotes, so a clone cannot answer it faithfully; see the phasing section.) The implementation is
+  `sanitized-read-git.ts` (a `--mirror` clone, not the `task-observe.ts` bare `init+fetch` pattern — `--mirror` preserves HEAD + all
+  refs so `branch -a/-r` is faithful).
 - **Working-tree-DEPENDENT** (status, unstaged diff): needs the member's ACTUAL working tree (a throwaway clone loses uncommitted
   state) — see **open-Q 3** (in-place-hardened-with-residual vs copy-the-tree vs defer).
 - **Content forms** (show/diff WITH content): SAFE under sanitized-read — the exec surface is closed by the hardened env, and the
@@ -138,7 +141,14 @@ per-item user sign-off (differential ≈ zero). Each bullet records its specific
   the fd-read model can't reproduce libmagic, and a hardened `/usr/bin/file` subprocess would open a new exec surface beyond the
   sound cat path — not worth it for one low-frequency form). Cleanest, no git complexity. Delivers the
   `sanitize` verdict + the output-injection channel + the budget/fail-to-user + the dormant flag.
-- **Phase 2 — git committed-history** (log/show/diff/branch/remote, incl. content) via throwaway-worktree hardening.
+- **Phase 2 — git committed-history (SHIPPED): `log`/`show`/`diff`/`branch`, NON-content**, via a throwaway `--mirror` clone +
+  scrubbed env (`env -i`-equivalent) + `-c diff.external=`/`-c core.fsmonitor=` + `--no-pager`/`--no-ext-diff`. A `--mirror` clone
+  does NO checkout and uses git's LOCAL transport (no upload-pack) ⇒ no filter/fsmonitor/packObjectsHook exec (verified against four
+  planted vectors). Closed flag table REUSED from the frozen git-recall brief; rev operands validated by a clone-side
+  `rev-parse --verify ^{commit}` (no pathspec/content). `remote` DEFERRED (coordinator 2026-10-11: a throwaway clone's `remote -v`
+  shows the clone's origin, not the member's real remotes; parsing `.git/config` diverges on includes; running in the member repo
+  breaks the categorical boundary — not worth it for one low-frequency form, same family as the `file` deferral). Content forms
+  (`show`/`diff` -p) stay escalated for now.
 - **Phase 3 (open) — git working-tree-dependent** (status, unstaged diff): pending open-Q 3.
 
 Each phase is a separate reviewable unit; Phase 1 is the pipeline proof (mirrors how v1 shipped scope-free first).
@@ -169,4 +179,4 @@ Freeze answers (coordinator 2026-10-11): ① updatedInput rewrite + lstat the re
 `CoordinatorAction` act, above); ③ git working-tree → Phase 3; ④ keep `SECRET_RE` (case-insensitive; reuse, no new regex); ⑤
 tmpfile 0600 coordinator-owned; ⑥ budget 10s / cap 1 MiB / explicit `[truncated at 1MiB]` marker / fail-to-user. The two TOCTOU
 walls (SR-P1-1 fd-binding, SR-P1-3 result-swap) → /proc-on-Linux + lstat-walk-on-macOS + strict validation + the unified same-uid
-non-differential residual class (⑤). **Phase 1 (`cat`) + Phase 1b (head/tail/wc/ls/stat; `file` deferred) shipped; Phase 2 (git) next.**
+non-differential residual class (⑤). **Phase 1 (`cat`) + Phase 1b (head/tail/wc/ls/stat; `file` deferred) + Phase 2 (git log/show/diff/branch via `--mirror` clone; `remote` deferred) shipped; Phase 3 (git working-tree) next.**
