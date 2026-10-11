@@ -21,6 +21,7 @@
 
 import { createHash } from "node:crypto";
 import { validateForcePipeline, type ForceStage } from "./force-pipeline.js";
+import { flagDefaultOn } from "./flag-default.js";
 
 type Res<T> = { ok: true; value: T } | { ok: false; reason: string };
 
@@ -202,8 +203,10 @@ export function planFanout(template: { templateId: string }, items: readonly str
 
 // ── ③ dormant flag ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
-/** Dormant wiring flip, default OFF (dormant-ahead-of-use, like SWARM_FORCE_PIPELINE). The dispatcher consults conditional
- *  edges / fan-out only when on; off ⇒ zero runtime change. */
+/** LIVE BY DEFAULT (opt-out via [[flagDefaultOn]], flags-default-flip batch-2, user ruling 2026-10-11): on unless
+ *  SWARM_CONDITIONAL_ROUTING=0. **HONEST NO-OP for now:** the dispatcher does NOT yet consult conditional edges / fan-out (the IO
+ *  wiring round is a separate ticket), so this flip changes NO runtime behavior today — it only sets the DEFAULT the day it is
+ *  wired. Flipped now (per the batch-2 ruling) so the wiring round inherits default-on, not to activate anything. */
 export function conditionalRoutingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env.SWARM_CONDITIONAL_ROUTING ?? "");
+  return flagDefaultOn(env.SWARM_CONDITIONAL_ROUTING);
 }

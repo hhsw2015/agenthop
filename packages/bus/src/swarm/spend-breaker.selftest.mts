@@ -28,11 +28,11 @@ const cardForTicket = (home: string, ticketId: string): { text: string; title: s
 };
 
 // ---------------- pure core ----------------
-t('breakerEnabled: default OFF, armed only by explicit truthy', !breakerEnabled({} as NodeJS.ProcessEnv)
+t('breakerEnabled: default ON, off only by explicit negation (flags-default-flip batch-2)', breakerEnabled({} as NodeJS.ProcessEnv)
   && breakerEnabled({ SWARM_SPEND_BREAKER: '1' } as unknown as NodeJS.ProcessEnv)
-  && breakerEnabled({ SWARM_SPEND_BREAKER: 'true' } as unknown as NodeJS.ProcessEnv)
-  && breakerEnabled({ SWARM_SPEND_BREAKER: 'on' } as unknown as NodeJS.ProcessEnv)
+  && breakerEnabled({ SWARM_SPEND_BREAKER: 'anything' } as unknown as NodeJS.ProcessEnv)
   && !breakerEnabled({ SWARM_SPEND_BREAKER: '0' } as unknown as NodeJS.ProcessEnv)
+  && !breakerEnabled({ SWARM_SPEND_BREAKER: 'false' } as unknown as NodeJS.ProcessEnv)
   && !breakerEnabled({ SWARM_SPEND_BREAKER: 'off' } as unknown as NodeJS.ProcessEnv));
 t('budgetRefFor: safe id -> task-<id>', budgetRefFor('job-7_A') === 'task-job-7_A');
 t('budgetRefFor: rejects traversal / space / empty / too-long', threw(() => budgetRefFor('../x')) && threw(() => budgetRefFor('a b')) && threw(() => budgetRefFor('')) && threw(() => budgetRefFor('x'.repeat(58))));
@@ -45,9 +45,9 @@ t('ticketCeiling shape', (() => { const c = ticketCeiling(10); return c.maxUsd =
 {
   const home = mkdtempSync(join(tmpdir(), 'fc4-off-'));
   try {
-    delete process.env.SWARM_SPEND_BREAKER; // default OFF
+    process.env.SWARM_SPEND_BREAKER = '0'; // flags-default-flip batch-2: default is now ON ⇒ the OFF path needs the explicit kill-switch (=0)
     const v = requestSpawn(home, 'tk', sp());
-    t('OFF: requestSpawn always allowed + dormant', v.allowed === true && (v as { dormant?: true }).dormant === true);
+    t('OFF (=0): requestSpawn always allowed + dormant', v.allowed === true && (v as { dormant?: true }).dormant === true);
     t('OFF: NO pool touched (ledger absent)', taskBudget(home, 'tk') === null);
     t('OFF: recordSpend is a no-op (null)', recordSpend(home, 'tk', draw()) === null);
   } finally { rmSync(home, { recursive: true, force: true }); }

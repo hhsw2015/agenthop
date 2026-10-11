@@ -16,14 +16,22 @@ async function home() {
 // codexHome() prefers it, so without clearing it the codex tests would write into the real Codex dir.
 const ORIGINAL_XDG = process.env.XDG_CONFIG_HOME;
 const ORIGINAL_CODEX_HOME = process.env.CODEX_HOME;
+const ORIGINAL_APPROVAL = process.env.SWARM_APPROVAL_DELEGATE;
+const ORIGINAL_SANITIZED = process.env.SWARM_SANITIZED_READ;
 beforeEach(() => {
   delete process.env.CODEX_HOME; // tests target the passed-in temp home, not a machine-level CODEX_HOME
+  // flags-default-flip batch-2: SWARM_APPROVAL_DELEGATE + SWARM_SANITIZED_READ are now LIVE BY DEFAULT, so the sync permission-gate
+  // would install on an UNSET env. Pin a deterministic gate-OFF baseline here (=0); the gate-ON tests set the flag(s) to "1".
+  process.env.SWARM_APPROVAL_DELEGATE = "0";
+  process.env.SWARM_SANITIZED_READ = "0";
 });
 afterEach(() => {
   if (ORIGINAL_XDG === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = ORIGINAL_XDG;
   if (ORIGINAL_CODEX_HOME === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = ORIGINAL_CODEX_HOME;
+  if (ORIGINAL_APPROVAL === undefined) delete process.env.SWARM_APPROVAL_DELEGATE; else process.env.SWARM_APPROVAL_DELEGATE = ORIGINAL_APPROVAL;
+  if (ORIGINAL_SANITIZED === undefined) delete process.env.SWARM_SANITIZED_READ; else process.env.SWARM_SANITIZED_READ = ORIGINAL_SANITIZED;
 });
 
 describe("plugging into agents as an MCP server", () => {
@@ -188,11 +196,13 @@ describe("plugging into agents as an MCP server", () => {
     expect((cfg2.hooks.Stop as unknown[]).length).toBe(2); // user's + ours, no duplicate
   });
 
-  it("approval-delegation OFF (default): PermissionRequest stays the async report-status blocked hook", async () => {
+  it("approval-delegation OFF (kill-switch =0): PermissionRequest stays the async report-status blocked hook", async () => {
     const dir = await home();
     const file = path.join(dir, ".claude", "settings.json");
-    const prev = process.env.SWARM_APPROVAL_DELEGATE; delete process.env.SWARM_APPROVAL_DELEGATE;
-    const prevSR = process.env.SWARM_SANITIZED_READ; delete process.env.SWARM_SANITIZED_READ; // SR-P2-2: BOTH flags off ⇒ no gate
+    // flags-default-flip batch-2: both flags are now LIVE BY DEFAULT, so the no-gate path requires the EXPLICIT kill-switch (=0),
+    // not an unset env (unset ⇒ ON). SR-P2-2: BOTH must be killed ⇒ no gate.
+    const prev = process.env.SWARM_APPROVAL_DELEGATE; process.env.SWARM_APPROVAL_DELEGATE = "0";
+    const prevSR = process.env.SWARM_SANITIZED_READ; process.env.SWARM_SANITIZED_READ = "0";
     try {
       installClaudeStatusHooks(BIN, dir);
       const cfg = JSON.parse(await readFile(file, "utf8"));
@@ -209,7 +219,7 @@ describe("plugging into agents as an MCP server", () => {
   it("SR-P2-2: SANITIZED_READ ON alone (APPROVAL_DELEGATE off) ALSO installs the SYNC permission-gate hook", async () => {
     const dir = await home();
     const file = path.join(dir, ".claude", "settings.json");
-    const prevA = process.env.SWARM_APPROVAL_DELEGATE; delete process.env.SWARM_APPROVAL_DELEGATE;
+    const prevA = process.env.SWARM_APPROVAL_DELEGATE; process.env.SWARM_APPROVAL_DELEGATE = "0"; // batch-2: kill (default-ON) to isolate SANITIZED_READ
     const prevS = process.env.SWARM_SANITIZED_READ; process.env.SWARM_SANITIZED_READ = "1";
     try {
       installClaudeStatusHooks(BIN, dir);
@@ -243,18 +253,23 @@ describe("plugging into agents as an MCP server", () => {
     } finally { if (prev === undefined) delete process.env.SWARM_APPROVAL_DELEGATE; else process.env.SWARM_APPROVAL_DELEGATE = prev; }
   });
 
-  it("approval-delegation toggle ON then OFF restores the async blocked hook (no stale gate left)", async () => {
+  it("approval-delegation toggle ON then OFF (=0) restores the async blocked hook (no stale gate left)", async () => {
     const dir = await home();
     const file = path.join(dir, ".claude", "settings.json");
     const prev = process.env.SWARM_APPROVAL_DELEGATE;
+    const prevSR = process.env.SWARM_SANITIZED_READ;
     try {
+      process.env.SWARM_SANITIZED_READ = "0"; // flags-default-flip batch-2: keep sanitize killed so ONLY APPROVAL_DELEGATE toggles the gate
       process.env.SWARM_APPROVAL_DELEGATE = "1"; installClaudeStatusHooks(BIN, dir);
-      delete process.env.SWARM_APPROVAL_DELEGATE; installClaudeStatusHooks(BIN, dir);
+      process.env.SWARM_APPROVAL_DELEGATE = "0"; installClaudeStatusHooks(BIN, dir); // kill-switch (not unset — unset is now ON)
       const cfg = JSON.parse(await readFile(file, "utf8"));
       const flat = (cfg.hooks.PermissionRequest as { hooks: { command: string; async?: boolean }[] }[]).flatMap((g) => g.hooks);
       expect(flat.some((h) => h.command.includes("permission-gate"))).toBe(false); // stale gate stripped
       expect(flat.some((h) => h.command.includes("report-status blocked") && h.async === true)).toBe(true); // async blocked restored
-    } finally { if (prev === undefined) delete process.env.SWARM_APPROVAL_DELEGATE; else process.env.SWARM_APPROVAL_DELEGATE = prev; }
+    } finally {
+      if (prev === undefined) delete process.env.SWARM_APPROVAL_DELEGATE; else process.env.SWARM_APPROVAL_DELEGATE = prev;
+      if (prevSR === undefined) delete process.env.SWARM_SANITIZED_READ; else process.env.SWARM_SANITIZED_READ = prevSR;
+    }
   });
 
   it("does not clobber a user hook that merely mentions report-status (ownership via sentinel)", async () => {

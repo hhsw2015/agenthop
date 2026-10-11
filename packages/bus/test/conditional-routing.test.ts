@@ -210,9 +210,9 @@ describe("conditional-routing — flags", () => {
     expect(fanoutMax({ SWARM_FANOUT_MAX: "x" })).toBe(8);
     expect(fanoutMax({ SWARM_FANOUT_MAX: "2.5" })).toBe(8);
   });
-  test("conditionalRoutingEnabled: dormant, default OFF; truthy words ON", () => {
-    expect(conditionalRoutingEnabled({})).toBe(false);
-    expect(conditionalRoutingEnabled({ SWARM_CONDITIONAL_ROUTING: "0" })).toBe(false);
-    for (const on of ["1", "true", "yes", "on", "ON"]) expect(conditionalRoutingEnabled({ SWARM_CONDITIONAL_ROUTING: on })).toBe(true);
+  test("conditionalRoutingEnabled: LIVE BY DEFAULT (opt-out, flags-default-flip batch-2 — flip only; still unwired); negation words OFF", () => {
+    expect(conditionalRoutingEnabled({})).toBe(true);
+    for (const on of ["1", "true", "yes", "on", "ON", "garbage"]) expect(conditionalRoutingEnabled({ SWARM_CONDITIONAL_ROUTING: on })).toBe(true);
+    for (const off of ["0", "false", "no", "off", "OFF"]) expect(conditionalRoutingEnabled({ SWARM_CONDITIONAL_ROUTING: off })).toBe(false);
   });
 });

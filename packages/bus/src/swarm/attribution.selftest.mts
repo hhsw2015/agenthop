@@ -6,13 +6,13 @@ import { createTask, readTask, parseTask, applyResult, taskLogDir } from '../tas
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error('FAILED: ' + n); console.log('ok  ' + n); };
 
-// ---------------- flag (dormant default OFF) ----------------
-t('attributionEnabled: default OFF, armed only by explicit truthy',
-  !attributionEnabled({} as NodeJS.ProcessEnv)
+// ---------------- flag (LIVE BY DEFAULT, opt-out — flags-default-flip batch-2) ----------------
+t('attributionEnabled: default ON, off only by explicit negation',
+  attributionEnabled({} as NodeJS.ProcessEnv)
   && attributionEnabled({ SWARM_ATTRIBUTION: '1' } as unknown as NodeJS.ProcessEnv)
-  && attributionEnabled({ SWARM_ATTRIBUTION: 'true' } as unknown as NodeJS.ProcessEnv)
-  && attributionEnabled({ SWARM_ATTRIBUTION: 'on' } as unknown as NodeJS.ProcessEnv)
+  && attributionEnabled({ SWARM_ATTRIBUTION: 'anything' } as unknown as NodeJS.ProcessEnv)
   && !attributionEnabled({ SWARM_ATTRIBUTION: '0' } as unknown as NodeJS.ProcessEnv)
+  && !attributionEnabled({ SWARM_ATTRIBUTION: 'false' } as unknown as NodeJS.ProcessEnv)
   && !attributionEnabled({ SWARM_ATTRIBUTION: 'off' } as unknown as NodeJS.ProcessEnv));
 
 // ---------------- the 5-level waterfall ----------------

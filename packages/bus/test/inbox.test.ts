@@ -204,10 +204,10 @@ describe("F28 poison-pill defense", () => {
 describe("FC-2 poison dead-letter quarantine (SWARM_POISON_DLQ)", () => {
   const dirOf = (key: string) => path.join(HOME, ".agenthop", "inbox", key);
 
-  test("poisonDlqEnabled default OFF; truthy words ON", () => {
-    expect(poisonDlqEnabled({})).toBe(false);
-    expect(poisonDlqEnabled({ SWARM_POISON_DLQ: "0" })).toBe(false);
-    for (const on of ["1", "true", "yes", "on", "YES"]) expect(poisonDlqEnabled({ SWARM_POISON_DLQ: on })).toBe(true);
+  test("poisonDlqEnabled LIVE BY DEFAULT (opt-out, flags-default-flip batch-2); negation words OFF", () => {
+    expect(poisonDlqEnabled({})).toBe(true);
+    for (const on of ["1", "true", "yes", "on", "YES", "garbage"]) expect(poisonDlqEnabled({ SWARM_POISON_DLQ: on })).toBe(true);
+    for (const off of ["0", "false", "no", "off", "OFF"]) expect(poisonDlqEnabled({ SWARM_POISON_DLQ: off })).toBe(false);
   });
 
   test("poisonDlqThreshold default 3; valid int >= 1 honored; junk/0/negative ⇒ 3", () => {

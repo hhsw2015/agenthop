@@ -9,6 +9,7 @@
  * probes or stores a verdict, and it is wired into no live delivery path.
  */
 import { readFileSync, readdirSync, statSync, type Stats } from "node:fs";
+import { flagDefaultOn } from "./flag-default.js";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { writeInbox, composeInboxMsg } from "../inbox.js";
@@ -36,9 +37,12 @@ export type OutputFacts = {
   inboxDelivered?: boolean | null;        // kind=inbox-delivery
 };
 
+/** LIVE BY DEFAULT (opt-out via [[flagDefaultOn]], flags-default-flip batch-2, user ruling 2026-10-11): on unless
+ *  SWARM_OUTPUT_CONTRACT=0 (or false/no/off). Tier A (advisory/fail-soft — an unmet contract only raises an S19 reminder).
+ *  NOTE: the enabler has NO live caller yet (the contract check is an unwired filing), so this flip is an honest no-op for now —
+ *  it only changes the DEFAULT the day the check is wired. */
 export function outputContractEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = (env.SWARM_OUTPUT_CONTRACT ?? "").trim().toLowerCase();
-  return v === "1" || v === "true" || v === "on" || v === "yes";
+  return flagDefaultOn(env.SWARM_OUTPUT_CONTRACT);
 }
 
 export function isExpectedOutputKind(v: unknown): v is ExpectedOutputKind {

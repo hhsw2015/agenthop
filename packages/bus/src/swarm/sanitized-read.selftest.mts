@@ -105,9 +105,9 @@ t("max bytes = 1 MiB", SANITIZED_READ_MAX_BYTES === 1048576);
 t("truncation marker is explicit (never silent)", /truncated at 1MiB/.test(SANITIZED_READ_TRUNCATION_MARKER));
 t("result dirname", SANITIZED_READ_DIRNAME === "sanitized-read");
 
-// ── dormant flag: default OFF, opt-in ─────────────────────────────────────────────────────────────────────────
-t("flag default OFF", sanitizedReadEnabled({}) === false);
-t("flag ON (1/true/yes/on)", ["1", "true", "yes", "on"].every(v => sanitizedReadEnabled({ SWARM_SANITIZED_READ: v }) === true));
-t("flag OFF (garbage)", sanitizedReadEnabled({ SWARM_SANITIZED_READ: "garbage" }) === false);
+// ── flag: LIVE BY DEFAULT, opt-out (flags-default-flip batch-2 TIER B) ─────────────────────────────────────────
+t("flag default ON", sanitizedReadEnabled({}) === true);
+t("flag ON (non-negation incl 'garbage')", ["1", "true", "yes", "on", "garbage"].every(v => sanitizedReadEnabled({ SWARM_SANITIZED_READ: v }) === true));
+t("flag OFF (kill-switch 0/false/no/off)", ["0", "false", "no", "off"].every(v => sanitizedReadEnabled({ SWARM_SANITIZED_READ: v }) === false));
 
 console.log("all sanitized-read selftests passed");

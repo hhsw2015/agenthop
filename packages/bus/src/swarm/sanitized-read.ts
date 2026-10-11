@@ -17,11 +17,16 @@
  * reduces to the member cat-ing the coordinator's result, so the verdict seam (approval-gate) is form-agnostic.
  */
 import { SECRET_RE } from "./approval-delegation.js";
+import { flagDefaultOn } from "./flag-default.js";
 
-/** Dormant flip, default OFF (opt-in; NOT flagDefaultOn — a new feature in its observation window, same family as
- *  SWARM_APPROVAL_DELEGATE / SWARM_OPS_RECEIPT). Independent of SWARM_APPROVAL_DELEGATE (scope-free) — enable separately. */
+/** LIVE BY DEFAULT (opt-out via [[flagDefaultOn]], flags-default-flip batch-2 TIER B, user ruling 2026-10-11): on unless
+ *  SWARM_SANITIZED_READ=0. **This CHANGES member permission-popup behavior** — a path/git read the coordinator can serve hardened
+ *  (cat/head/tail/wc/ls/stat + git log/show/diff) is injected instead of reaching the user (the north star). All forms passed
+ *  adversarial review; flipping on by default warrants the member "popup behavior change" broadcast. Independent of
+ *  SWARM_APPROVAL_DELEGATE (disable separately). Kill-switch: SWARM_SANITIZED_READ=0. NOTE: the CLI duplicates this read (cli must
+ *  not import bus) — keep agents.ts `sanitizedReadOn` in lockstep. */
 export function sanitizedReadEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env.SWARM_SANITIZED_READ ?? "");
+  return flagDefaultOn(env.SWARM_SANITIZED_READ);
 }
 
 /** ④ budget + size bounds (coordinator-frozen). Over-budget ⇒ the coordinator records NO decision ⇒ the hook times out ⇒

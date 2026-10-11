@@ -94,9 +94,9 @@ t("invalid: nowSec NaN", vr({ nowSec: NaN }) === null);
 t("invalid: not an object", validApprovalRequest("x") === null);
 t("valid: command '' (structured tool)", vr({ command: "" }) !== null);
 
-// ── dormant flag: default OFF, opt-in ─────────────────────────────────────────────────────────────────────────
-t("flag default OFF", approvalDelegateEnabled({}) === false);
-t("flag ON (1/true/yes/on)", ["1", "true", "yes", "on"].every(v => approvalDelegateEnabled({ SWARM_APPROVAL_DELEGATE: v }) === true));
-t("flag OFF (garbage)", approvalDelegateEnabled({ SWARM_APPROVAL_DELEGATE: "garbage" }) === false);
+// ── flag: LIVE BY DEFAULT, opt-out (flags-default-flip batch-2 TIER B) ─────────────────────────────────────────
+t("flag default ON", approvalDelegateEnabled({}) === true);
+t("flag ON (non-negation incl 'garbage')", ["1", "true", "yes", "on", "garbage"].every(v => approvalDelegateEnabled({ SWARM_APPROVAL_DELEGATE: v }) === true));
+t("flag OFF (kill-switch 0/false/no/off)", ["0", "false", "no", "off"].every(v => approvalDelegateEnabled({ SWARM_APPROVAL_DELEGATE: v }) === false));
 
 console.log("all approval-delegation selftests passed");

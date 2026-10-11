@@ -10,6 +10,7 @@
  * RELEASES (renames back) on failure — so the retry timer and an explicit recv never deliver the same message twice.
  */
 import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { flagDefaultOn } from "./swarm/flag-default.js";
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
 import { isSubmitIntent, type SubmitIntent } from "./submit-intent.js";
@@ -453,9 +454,12 @@ function alive(pid: number): boolean {
 // a healthy message. The strike count lives in a sidecar keyed by the message's STABLE base, invisible to claimInbox.
 // ============================================================================================================
 
-/** FC-2 dormant gate: OFF ⇒ the drainer's failure path is byte-for-byte v0 (release + retry, no strike counting). */
+/** FC-2 poison dead-letter quarantine — LIVE BY DEFAULT (opt-out via [[flagDefaultOn]], flags-default-flip batch-2, user ruling
+ *  2026-10-11): on unless SWARM_POISON_DLQ=0. Tier A (bounded quarantine with byte retention; the observation period logged zero
+ *  poison strikes and the d7f6c917 canary concern is covered by FC-2's seven review rounds). OFF ⇒ the drainer's failure path is
+ *  byte-for-byte v0 (release + retry, no strike counting) — the kill-switch. */
 export function poisonDlqEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(1|true|yes|on)$/i.test(env.SWARM_POISON_DLQ ?? "");
+  return flagDefaultOn(env.SWARM_POISON_DLQ);
 }
 
 /** FC-2 strike threshold (default 3; SWARM_POISON_DLQ_THRESHOLD). A non-integer or < 1 value falls back to 3 (a 0/negative

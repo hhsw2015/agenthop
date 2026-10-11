@@ -124,8 +124,8 @@ const edge = (over: Partial<ConditionalEdge> = {}): ConditionalEdge => ({ from: 
   ok(fanoutMax({}) === DEFAULT_FANOUT_MAX, "fanoutMax default 8");
   ok(fanoutMax({ SWARM_FANOUT_MAX: "16" }) === 16, "fanoutMax honors a valid integer");
   ok(fanoutMax({ SWARM_FANOUT_MAX: "0" }) === 8 && fanoutMax({ SWARM_FANOUT_MAX: "99999" }) === 8 && fanoutMax({ SWARM_FANOUT_MAX: "x" }) === 8, "fanoutMax falls back on a bad value");
-  ok(conditionalRoutingEnabled({}) === false && conditionalRoutingEnabled({ SWARM_CONDITIONAL_ROUTING: "0" }) === false, "conditionalRoutingEnabled dormant default OFF");
-  ok(["1", "true", "yes", "on", "ON"].every((w) => conditionalRoutingEnabled({ SWARM_CONDITIONAL_ROUTING: w })), "conditionalRoutingEnabled truthy words ON");
+  ok(conditionalRoutingEnabled({}) === true && conditionalRoutingEnabled({ SWARM_CONDITIONAL_ROUTING: "anything" }) === true, "conditionalRoutingEnabled LIVE BY DEFAULT (opt-out, flags-default-flip batch-2)");
+  ok(["0", "false", "no", "off", "OFF"].every((w) => conditionalRoutingEnabled({ SWARM_CONDITIONAL_ROUTING: w }) === false), "conditionalRoutingEnabled kill-switch words OFF");
 }
 
 console.log(`\nall conditional-routing selftests passed (${pass})`);
