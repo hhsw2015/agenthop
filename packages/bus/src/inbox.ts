@@ -177,6 +177,35 @@ export function watchInbox(home: string, keys: string[], onChange: () => void): 
 let inboxWakeHook: ((home: string, sid: string) => void) | null = null;
 export function setInboxWakeHook(hook: ((home: string, sid: string) => void) | null): void { inboxWakeHook = hook; }
 
+/**
+ * INBOX-2 (infra audit): publish a NON-keyed message to `dir` under a unique random name, CLOBBER-PROOF. The historical code
+ * used `renameSync(tmp, file)`, which SILENTLY OVERWRITES an existing `file` — so two independent writers that drew the same
+ * name in the same millisecond would destroy the first message with no error or trace. `linkSync` is atomic AND NO-OVERWRITE
+ * (EEXIST if the name is taken), exactly as the signed quarantineInbox move; on the (now astronomically rare, 64-bit) collision
+ * the loop retries a fresh name, so a clash degrades to a retry, never a lost message. The temp is removed in `finally` (no
+ * `.tmp-*` orphan on the happy path, cf INBOX-12); a `.wtmp-*` name is neither `.json` nor `.claim-`, so every reader ignores it.
+ * `randHex` is injectable ONLY so the concurrency-race test can force a collision; production always uses 64-bit randomBytes.
+ */
+export function publishUniqueAtomic(dir: string, data: string, ts: number, randHex: () => string = () => randomBytes(8).toString("hex")): string {
+  // IB2-1: EXCLUSIVELY create our temp (flag "wx"). A plain write TRUNCATES an existing file, and because linkSync shares the
+  // INODE, truncating a temp name that is still hardlinked to an ALREADY-PUBLISHED message (a concurrent writer's temp, or a
+  // crash-leftover `.wtmp-*` whose unlink never ran) would overwrite that published message's bytes. `wx` makes a temp-name
+  // collision an EEXIST we retry past — so we only ever write into an inode WE own, and never corrupt another message's bytes.
+  let tmp = "";
+  for (let t = 0; ; t++) {
+    tmp = path.join(dir, `.wtmp-${randHex()}`);
+    try { writeFileSync(tmp, data, { flag: "wx", mode: 0o600 }); break; }     // exclusive create ⇒ our own fresh inode
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && t < 8) continue; throw e; } // temp name taken ⇒ fresh temp
+  }
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const file = path.join(dir, `${ts.toString().padStart(16, "0")}-${randHex()}.json`);
+      try { linkSync(tmp, file); return file; }                               // atomic no-overwrite publish
+      catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && attempt < 8) continue; throw e; } // name taken ⇒ fresh name
+    }
+  } finally { try { unlinkSync(tmp); } catch { /* only OUR own temp; the linked copy holds the bytes; a leftover .wtmp-* is ignored by readers */ } }
+}
+
 export function writeInbox(home: string, key: string, msg: InboxMsg, idempotencyKey?: string): WriteResult {
   const valid = validInboxMsg(msg);
   if (valid === null) throw new Error("writeInbox: refusing to publish an invalid inbox message (from/fromLabel/text must be strings, via a non-empty string, ts a finite number)");
@@ -190,12 +219,9 @@ export function writeInbox(home: string, key: string, msg: InboxMsg, idempotency
   if (idempotencyKey !== undefined && /^[A-Za-z0-9._-]{1,120}$/.test(idempotencyKey)) {
     result = publishOnce(dir, idempotencyKey, valid);
   } else {
-    // No key (or an unsafe key) ⇒ the historical unique random name (every write is a new, independent message, confined to `dir`).
-    const base = `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
-    const file = path.join(dir, base);
-    const tmp = `${file}.tmp-${Math.random().toString(36).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
-    renameSync(tmp, file);
+    // No key (or an unsafe key) ⇒ a unique, confined random name (every write is a new, independent message). INBOX-2: see
+    // publishUniqueAtomic — linkSync is atomic AND NO-OVERWRITE, so two independent writers never clobber via a same-name collision.
+    publishUniqueAtomic(dir, JSON.stringify(valid), valid.ts);
     result = "published";
   }
   // A genuinely NEW unclaimed message just landed ⇒ fire the (optional, injected) wake hook so the target is pinged in real time.
