@@ -217,6 +217,49 @@ describe("morning-digest-store — gatherDigestSources (验收简报化: authori
   });
 });
 
+describe("morning-digest — infra crash-recovery / restart-idempotency (zero-bug ruling)", () => {
+  let HOME: string;
+  beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-digest-")); });
+  afterEach(() => { try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ } });
+  const seedBatch = (id: string): void => {
+    const d = path.join(HOME, ".agenthop", "console", "decision-batches", id); mkdirSync(d, { recursive: true });
+    writeFileSync(path.join(d, "batch.json"), JSON.stringify({ batchId: id, owner: "c", createdAtSec: 0, items: [{ id: "i1", kind: "k", summary: "rule me", suggestedAction: "approve" }] }));
+  };
+  const seedProgress = (body: string): void => { const d = path.join(HOME, ".agenthop", "swarm"); mkdirSync(d, { recursive: true }); writeFileSync(path.join(d, "PROGRESS.md"), body); };
+
+  test("determinism: a RESTART re-gathers the SAME sources from unchanged stores (no clock/order drift)", () => {
+    seedBatch("b1"); seedProgress("- \u2705 \u5df2\u5e76 @abc1234\n- \u26a0 \u5361\u6b7b");
+    expect(gatherDigestSources(HOME)).toEqual(gatherDigestSources(HOME));
+  });
+
+  test("gather\u2192write\u2192RESTART(re-read) yields a VALID projection; regeneration from unchanged stores is byte-identical (idempotent)", () => {
+    seedBatch("b1"); seedProgress("- \u2705 \u5df2\u5e76 @abc1234");
+    const sources = gatherDigestSources(HOME)!;
+    expect(writeDigestProjection(HOME, sources, "2026-10-12", 100)).toBe(true);
+    const st = readDigestProjection(HOME); // a restart reads the on-disk frozen body
+    expect(st.kind).toBe("valid");
+    expect(digestProjection(gatherDigestSources(HOME)!, "2026-10-12", 100)).toEqual(st.kind === "valid" ? st.projection : null);
+  });
+
+  test("crash BETWEEN publish and notify: a RESTART continues the pending delivery, and once sent never re-sends (exactly-once)", () => {
+    seedBatch("b1");
+    const body = digestProjection(gatherDigestSources(HOME)!, "2026-10-12", 0);
+    expect(markNotified(HOME, "2026-10-12", "pending", body)).toBe(true); // claimed before send, then crash
+    expect(digestActions("2026-10-12", 9, 7, readDigestProjection(HOME), readNotifiedState(HOME)).notify).toBe(true);  // restart CONTINUES
+    expect(markNotified(HOME, "2026-10-12", "sent", body)).toBe(true);
+    expect(digestActions("2026-10-12", 9, 7, readDigestProjection(HOME), readNotifiedState(HOME)).notify).toBe(false); // restart never re-sends
+  });
+
+  test("crash mid-read of a runtime source \u21d2 unknown/retry (null), never a false quiet publish; recovers when the fault clears", () => {
+    seedBatch("b1");
+    const bd = path.join(HOME, ".agenthop", "console", "decision-batches");
+    chmodSync(bd, 0o000);
+    if (typeof process.getuid === "function" && process.getuid() !== 0) expect(gatherDigestSources(HOME)).toBeNull();
+    chmodSync(bd, 0o700);
+    expect(gatherDigestSources(HOME)!.awaitingRuling!.length).toBe(1);
+  });
+});
+
 describe("morning-digest-store — archiveLegacyMigration (MD-R7-P2-2, per-date append-only)", () => {
   let HOME: string;
   beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-digest-")); });
