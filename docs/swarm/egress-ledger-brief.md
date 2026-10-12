@@ -4,14 +4,15 @@ owner=f32a0507;协调者立项(gstack 深评借点②,[[gstack-eval]] §A 条 1�
 
 ## 诚实边界(本件第一节,不可退)
 
-这是一本**问责/透明账本**,给**协作的自家代码**用,**不是外泄控制(not an exfiltration control)**。四条自认局限,文案、CLI 输出、代码注释三处都要写明:
+这是一本**问责/透明账本**,给**协作的自家代码**用,**不是外泄控制(not an exfiltration control)**。五条自认局限,文案、CLI 输出、代码注释三处都要写明:
 
 1. **只记已登记的调用点(registered-call-sites only)。** 账本靠调用点自己调 `recordEgress` 落账;不调的调用点**不可见**。一个敌意二进制、一个未登记的 fetch、一条绕过封装的 socket,账本**照不到**。v1 **零调用点接线**(纯核 + CLI + 接缝就位,生产者后补)。
 2. **tamper-evident,非 tamper-proof。** `verify` 能查出**篡改/删除/乱序**(哈希链断裂),但有盘写权的人可以**整链重算**——v1 不签名,无密码学不可抵赖。每条 HMAC/签名属**后续**范围(见非目标)。
 3. **只记 dest-HOST + byte-MAGNITUDE。** 目的地只记**主机名**(无 scheme/path/query/port),字节只记**数量级桶**(非精确值)。故意粗粒度,使账本自身**不成为 payload 侧信道**。
 4. **绝不记内容。** 不记 payload、密钥、消息正文、host 以外的收件人身份。`write()` 等价物拿到的永远是这五个结构化字段,不是原始请求。
+5. **record 失败 = fail-OPEN(口径预先声明,吸收 [[gstack-eval]] GSE-P2-5)。** `recordEgress` 落账失败(盘满/EACCES/锁争用超时)**绝不阻断那次外发**——record-only 账本按构造就是 fail-open:调用点该发还发,账本只是漏记这一笔。gstack 自己的 egress 默认也是 fail-open(egress-receipt.ts:8),**统一 fail-closed-for-外发 是「阻断」语义、属拦截**,v1 不做。但 fail-open **不等于静默**:落账失败要留一条**本地可见的 GAP 痕迹**(如 stderr 一行 `egress: record failed (<why>) — call proceeded, ledger has a gap`),诚实报「这里漏记了一笔」而非假装记全。`verify` 看不到未登记/漏记的发送——这正是局限①②的下界。
 
-**不做** fail-closed-for-外发(深评曾浮出,协调者冻结为 record-only):阻断外发需要拦截,v1 明确不拦截。
+**不做** fail-closed-for-外发(深评曾浮出,协调者冻结为 record-only):阻断外发需要拦截,v1 明确不拦截。record 失败按上第 5 条 fail-open 处理。
 
 ## 范围与边界
 
