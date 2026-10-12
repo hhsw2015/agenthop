@@ -115,17 +115,25 @@ export function acquireHolderLock(site: LockSite, opts: AcquireOpts = {}): strin
   if (take()) return token; // won; identity published
   // Lock dir exists.
   let entries: string[]; try { entries = readdirSync(dir); } catch { dropIntent(); return null; } // vanished mid-check ⇒ contended
-  if (entries.length === 1) {
-    // A PUBLISHED holder. Reclaim by its EXACT name iff it is OUR OWN residue (same pid — a faulted release of ours) or the holder
-    // is DEFINITELY dead (ESRCH only). An invalid/out-of-range pid, EPERM, or any unknown probe error is NOT reclaimable (SB1).
-    const holder = entries[0]!;
-    const hpid = Number(holder.split(".")[0]);
-    if (Number.isInteger(hpid) && hpid > 0 && (hpid === process.pid || pidDefinitelyDead(hpid))) {
-      let removed = false; try { rmSync(path.join(dir, holder)); removed = true; } catch { /* a peer reclaimed it first */ }
-      if (removed) { try { rmdirSync(dir); strandedLockDirs.delete(dir); } catch { strandedLockDirs.add(dir); } } // dropped it ⇒ any stale own record is void (DB-R7 B); could not drop ⇒ ours to recover (retry adopts)
-      try { if (take()) return token; } catch (e) { throw e; }
+  if (entries.length >= 1) {
+    // One or more PUBLISHED identities. Reclaim by EXACT name iff EVERY token is OUR OWN residue (same pid -- a faulted
+    // release/backout of ours) or DEFINITELY dead (ESRCH only). A LIVE holder, an UNKNOWN pid (EPERM/EIO), or an invalid/garbage
+    // pid is PROTECTED -- a holder or an in-flight publisher may own the dir -- so we delete nothing and contend (SB1 preserved,
+    // no P1 reopen). SUCC1-3 (codex:Work): classifying ALL entries (not just a single one) lets a dead MULTI-token residue --
+    // left when two rejected publishSole backouts both failed their exact-name cleanup on a transient dir fault -- be recovered
+    // instead of being permanently un-adoptable; still single-winner (precise removes + non-recursive rmdir + a fresh mkdir).
+    let protectedEntry = false;
+    const removable: string[] = [];
+    for (const name of entries) {
+      const pid = Number(name.split(".")[0]);
+      if (Number.isInteger(pid) && pid > 0 && (pid === process.pid || pidDefinitelyDead(pid))) removable.push(name);
+      else protectedEntry = true; // live / unknown (EPERM/EIO) / invalid pid => protected, never deleted
     }
-    dropIntent(); return null; // live published holder, or reclaim lost ⇒ contended
+    if (protectedEntry || removable.length === 0) { dropIntent(); return null; } // a live/unknown identity may own the dir => contend
+    for (const name of removable) { try { rmSync(path.join(dir, name)); } catch { /* a peer reclaimed it first */ } } // remove each own/dead token by EXACT name
+    try { rmdirSync(dir); strandedLockDirs.delete(dir); } catch { strandedLockDirs.add(dir); } // dropped => stale own record void (DB-R7 B); could not drop => ours to recover (retry)
+    try { if (take()) return token; } catch (e) { throw e; }
+    dropIntent(); return null; // reclaim lost the re-acquire race => contended
   }
   if (entries.length === 0) {
     // EMPTY lock dir. We recover it ONLY to continue OUR OWN unfinished occupancy, by ADOPTION (publish our identity straight INTO
@@ -150,9 +158,9 @@ export function acquireHolderLock(site: LockSite, opts: AcquireOpts = {}): strin
       // release + fresh acquire can swap the lock dir's generation between our scan and our write, so a blind adopt-into would
       // seat us on someone ELSE's new dir (two holders). Reclaim is therefore single-winner + generation-atomic: rmdir removes
       // the dir ONLY while it is still EMPTY (a published holder ⇒ ENOTEMPTY ⇒ contend; already gone ⇒ ENOENT ⇒ contend),
-      // CONSUMING this exact empty generation; a fresh take() then re-mkdirs (single-winner CAS) and publishes under the genKey
-      // guard. A dir released+recreated meanwhile is caught by rmdir (non-empty / vanished) or by the publish guard — never
-      // adopted blind. Two concurrent reclaimers cannot both win: the rmdir source is consumed once, and the re-mkdir is single.
+      // CONSUMING this exact empty dir; a fresh take() then re-mkdirs (single-winner CAS) and publishes under the SOLE-OCCUPANCY
+      // guard (publishSole). A dir released+recreated meanwhile is caught by rmdir (non-empty / vanished) or by the sole-occupancy
+      // read-back — never adopted blind. Two concurrent reclaimers cannot both win: the rmdir source is consumed once, re-mkdir is single.
       try { rmdirSync(dir); } catch { dropIntent(); return null; }
       let held = false; try { held = take(); } catch { dropIntent(); return null; } // write IO fault ⇒ contend (own-recovery recorded)
       if (!held) { dropIntent(); return null; } // lost the re-acquire mkdir race / swapped under us ⇒ contend
@@ -167,7 +175,7 @@ export function acquireHolderLock(site: LockSite, opts: AcquireOpts = {}): strin
     for (const i of others) { if (i.pid === process.pid) { try { unlinkSync(path.join(site.intentDir, i.name)); } catch { /* best-effort */ } } }
     return token;
   }
-  dropIntent(); return null; // >1 identity (ambiguous) ⇒ contended
+  dropIntent(); return null; // defensive: entries is >=1 or ===0 above, both handled — unreachable, kept for the return type
 }
 
 /** Release: remove our identity file, drop the (now-empty) lock dir, then remove our hold-intent. NEVER throws. If the rmdir

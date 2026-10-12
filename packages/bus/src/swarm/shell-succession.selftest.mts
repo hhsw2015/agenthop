@@ -198,6 +198,32 @@ rmSync(sockHome, { recursive: true, force: true });
     rmSync(home, { recursive: true, force: true });
   }
 
+  // SUCC1-3 (codex:Work): a dead MULTI-token residue — left when two rejected publishSole backouts both failed their exact-name
+  // cleanup on a transient dir fault — must be RECOVERABLE, not permanently un-adoptable. Every token CONFIRMED-DEAD (ESRCH) and
+  // none live ⇒ reclaimed by exact name (default: published identities prove death, like the single-holder reclaim).
+  {
+    const home = mkHome(); const site = adoptLockSite(home, SID);
+    mkdirSync(site.lockDir, { recursive: true });
+    writeFileSync(path.join(site.lockDir, "999998.aaaaaa"), ""); // dead pid A
+    writeFileSync(path.join(site.lockDir, "999999.bbbbbb"), ""); // dead pid B
+    const token = acquireHolderLock(site);
+    t("SUCC1-3: a dead multi-token residue is reclaimed (not permanently un-adoptable) ⇒ token", token !== null);
+    t("SUCC1-3: after recovery EXACTLY our identity remains (both dead residues removed)", token !== null && readdirSync(site.lockDir).length === 1 && existsSync(path.join(site.lockDir, String(token))));
+    if (token) releaseHolderLock(site, token);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // SUCC1-3 protection: a >1 residue where ANY token is a LIVE/unknown pid ⇒ contend — never delete a live/unknown identity (no P1 reopen).
+  {
+    const home = mkHome(); const site = adoptLockSite(home, SID);
+    mkdirSync(site.lockDir, { recursive: true });
+    writeFileSync(path.join(site.lockDir, "999999.dead"), ""); // confirmed dead
+    writeFileSync(path.join(site.lockDir, "1.live"), "");      // pid 1 ⇒ EPERM ⇒ alive/unknown ⇒ protected
+    t("SUCC1-3: a multi-token dir with a LIVE/unknown identity ⇒ contend (residue not touched)", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    t("SUCC1-3: both tokens untouched when one is live/unknown", readdirSync(site.lockDir).length === 2);
+    rmSync(home, { recursive: true, force: true });
+  }
+
   // opt-in gating: the SAME stranded state WITHOUT the opt ⇒ contends (decision-batch / shared-budget are byte-identical).
   {
     const home = mkHome(); const site = strand(home, 999999);
