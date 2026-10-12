@@ -187,15 +187,23 @@ export function setInboxWakeHook(hook: ((home: string, sid: string) => void) | n
  * `randHex` is injectable ONLY so the concurrency-race test can force a collision; production always uses 64-bit randomBytes.
  */
 export function publishUniqueAtomic(dir: string, data: string, ts: number, randHex: () => string = () => randomBytes(8).toString("hex")): string {
-  const tmp = path.join(dir, `.wtmp-${randHex()}`);
-  writeFileSync(tmp, data, { mode: 0o600 });
+  // IB2-1: EXCLUSIVELY create our temp (flag "wx"). A plain write TRUNCATES an existing file, and because linkSync shares the
+  // INODE, truncating a temp name that is still hardlinked to an ALREADY-PUBLISHED message (a concurrent writer's temp, or a
+  // crash-leftover `.wtmp-*` whose unlink never ran) would overwrite that published message's bytes. `wx` makes a temp-name
+  // collision an EEXIST we retry past — so we only ever write into an inode WE own, and never corrupt another message's bytes.
+  let tmp = "";
+  for (let t = 0; ; t++) {
+    tmp = path.join(dir, `.wtmp-${randHex()}`);
+    try { writeFileSync(tmp, data, { flag: "wx", mode: 0o600 }); break; }     // exclusive create ⇒ our own fresh inode
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && t < 8) continue; throw e; } // temp name taken ⇒ fresh temp
+  }
   try {
     for (let attempt = 0; ; attempt++) {
       const file = path.join(dir, `${ts.toString().padStart(16, "0")}-${randHex()}.json`);
       try { linkSync(tmp, file); return file; }                               // atomic no-overwrite publish
       catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && attempt < 8) continue; throw e; } // name taken ⇒ fresh name
     }
-  } finally { try { unlinkSync(tmp); } catch { /* the linked copy holds the bytes; a leftover .wtmp-* is ignored by readers */ } }
+  } finally { try { unlinkSync(tmp); } catch { /* only OUR own temp; the linked copy holds the bytes; a leftover .wtmp-* is ignored by readers */ } }
 }
 
 export function writeInbox(home: string, key: string, msg: InboxMsg, idempotencyKey?: string): WriteResult {

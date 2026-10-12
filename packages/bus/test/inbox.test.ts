@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync, linkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -593,5 +593,33 @@ describe("INBOX-2: non-keyed writeInbox is clobber-proof (concurrency-race, infr
     const got = claimInbox(HOME, ["s4"], "p");
     expect(got.length).toBe(1);                    // only the real message, the .wtmp- is not claimed
     expect(got[0]!.msg.text).toBe("real");
+  });
+
+  // IB2-1 (codex:Work): the temp is EXCLUSIVELY created (wx). A crash-leftover temp still hardlinked to an already-published
+  // message (its unlink never ran) must NOT be truncated by a later writer that reuses the temp name — the published BYTES survive.
+  test("IB2-1: a crash-leftover temp hardlinked to a published message is NOT corrupted when a new writer reuses its name", () => {
+    const d = inboxDirOf("ib1"); mkdirSync(d, { recursive: true });
+    // A publishes FIRST; simulate a crash that left `.wtmp-LEFT` still hardlinked to A's published inode (the finally-unlink never ran).
+    const finalA = publishUniqueAtomic(d, "FIRST", 1000, seq("tA", "NA"));
+    const leftover = path.join(d, ".wtmp-LEFT");
+    linkSync(finalA, leftover);                                      // crash residue: temp name + published name share ONE inode
+    // B publishes SECOND; its FIRST temp draw collides with the leftover name — exclusive-create must refuse (EEXIST) + retry a fresh temp.
+    const finalB = publishUniqueAtomic(d, "SECOND", 1000, seq("LEFT", "tB", "NB"));
+    expect(readFileSync(finalA, "utf8")).toBe("FIRST");             // A's BYTES intact (the old truncating temp made this "SECOND")
+    expect(readFileSync(leftover, "utf8")).toBe("FIRST");           // the leftover alias too (same inode) — never truncated
+    expect(readFileSync(finalB, "utf8")).toBe("SECOND");
+    expect(finalA).not.toBe(finalB);
+  });
+
+  // IB2-1b (codex:Work): the same ownership guarantee holds for an already-CLAIMED message — a temp-name reuse never rewrites it.
+  test("IB2-1b: an already-CLAIMED message's bytes survive a temp-name reuse (crash-residue ownership)", () => {
+    writeInbox(HOME, "ib2", msg("CLAIMED-FIRST", 1000));            // publish via the real non-keyed path
+    const claimed = claimInbox(HOME, ["ib2"], "pid1");             // claim it (renamed to .claim-pid1, SAME inode)
+    expect(claimed.length).toBe(1); expect(claimed[0]!.msg.text).toBe("CLAIMED-FIRST");
+    const d = inboxDirOf("ib2");
+    const claimFile = readdirSync(d).find((n) => n.includes(".claim-"))!;
+    linkSync(path.join(d, claimFile), path.join(d, ".wtmp-LEFT2")); // crash-leftover temp aliasing the claimed inode
+    publishUniqueAtomic(d, "INTRUDER", 2000, seq("LEFT2", "tX", "NX")); // a new writer reuses the leftover temp name
+    expect(readFileSync(path.join(d, claimFile), "utf8")).toContain("CLAIMED-FIRST"); // the claimed bytes are NOT overwritten
   });
 });
