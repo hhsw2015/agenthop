@@ -67,6 +67,32 @@ describe("tg-queue FIFO by seq (DO-P2-3)", () => {
     await drainQueue(DIR, (rec) => { sent.push((rec as { seq: number }).seq); return "sent"; }, { cap: 100 });
     expect(sent).toEqual([1, 2, 3]);
   });
+
+  test("a STUCK earlier-seq claim (release-failed, not stale) blocks later pending items (DO-P2-3 head ownership)", async () => {
+    enqueueQueue(DIR, { seq: 1 }, 1);
+    // simulate seq 1 stuck in a claim that recovery won't reclaim (OUR live pid, fresh claim-time) and that no stuck-set releases.
+    const [n1] = pendingFiles(DIR);
+    renameSync(path.join(DIR, n1!), path.join(DIR, `${n1}.sending-${process.pid}-${Date.now()}.5718c0`));
+    enqueueQueue(DIR, { seq: 2 }, 2); // a LATER pending item
+    const sent: number[] = [];
+    const r = await drainQueue(DIR, (rec) => { sent.push((rec as { seq: number }).seq); return "sent"; }, { cap: 100 });
+    expect(sent).toEqual([]);           // seq 2 must NOT be delivered ahead of the stuck seq-1 head
+    expect(r.claimed).toBe(0);
+    expect(pendingFiles(DIR)).toContain("00000000000000000002.json"); // seq 2 still waiting
+  });
+
+  test("a DONE'd (terminal) earlier claim does NOT block later items — only a non-terminal in-flight head blocks (TGP-11)", async () => {
+    enqueueQueue(DIR, { seq: 1 }, 1);
+    const [n1] = pendingFiles(DIR);
+    // seq 1 was handled AND its DONE marker written, but the ack (unlink) failed ⇒ a lingering claim remains WITH a DONE.
+    mkdirSync(path.join(DIR, "done"), { recursive: true });
+    writeFileSync(path.join(DIR, "done", "00000000000000000001"), "");
+    renameSync(path.join(DIR, n1!), path.join(DIR, `${n1}.sending-${process.pid}-${Date.now()}.5718c0`));
+    enqueueQueue(DIR, { seq: 2 }, 2);
+    const sent: number[] = [];
+    await drainQueue(DIR, (rec) => { sent.push((rec as { seq: number }).seq); return "sent"; }, { cap: 100 });
+    expect(sent).toEqual([2]); // seq 1 is DONE (business complete) ⇒ its ack-residue must NOT permanently block seq 2
+  });
 });
 
 // ── DO-P1-1: read error KEEPS the record; corrupt goes to OBSERVABLE quarantine (never silent delete) ─────────────────
@@ -288,14 +314,29 @@ describe("tg-queue atomic identity credential (TGP-10)", () => {
     expect(readFileSync(credPath(7), "utf8")).toBe(hash({ v: 1 }));
   });
 
-  test("an UNREADABLE existing cred ⇒ failed (preserve + retry, NEVER overwrite)", () => {
+  test("a different payload for an existing record ⇒ conflict, original preserved (FC-7 record-binding)", () => {
     enqueueQueue(DIR, { v: 1 }, 7);
-    chmodSync(credPath(7), 0o000);
+    expect(enqueueQueue(DIR, { v: 2 }, 7)).toBe("conflict"); // the pending record binds {v:1} ⇒ never overwritten
+    const [n] = pendingFiles(DIR);
+    expect(JSON.parse(readFileSync(path.join(DIR, n!), "utf8"))).toEqual({ v: 1 }); // original intact
+  });
+
+  test("a LEGACY record with NO credential (pre-cred format) still binds its payload (FC-7 / DO-P1-2)", () => {
+    mkdirSync(DIR, { recursive: true });
+    writeFileSync(path.join(DIR, "00000000000000000007.json"), JSON.stringify({ v: "legacy" })); // an r7-era record: no cred/ entry
+    expect(enqueueQueue(DIR, { v: "new" }, 7)).toBe("conflict");    // different body ⇒ keep the legacy record (never overwrite)
+    expect(enqueueQueue(DIR, { v: "legacy" }, 7)).toBe("already");  // identical body ⇒ idempotent
+    expect(JSON.parse(readFileSync(path.join(DIR, "00000000000000000007.json"), "utf8"))).toEqual({ v: "legacy" });
+  });
+
+  test("an UNREADABLE existing record ⇒ failed (preserve + retry, NEVER overwrite)", () => {
+    enqueueQueue(DIR, { v: 1 }, 7);
+    const [n] = pendingFiles(DIR);
+    chmodSync(path.join(DIR, n!), 0o000); // the record itself is unreadable
     try {
-      expect(enqueueQueue(DIR, { v: 2 }, 7)).toBe("failed"); // can't read the identity ⇒ hold, don't overwrite
-      const [n] = pendingFiles(DIR);
-      expect(JSON.parse(readFileSync(path.join(DIR, n!), "utf8"))).toEqual({ v: 1 }); // original intact
-    } finally { chmodSync(credPath(7), 0o600); }
+      expect(enqueueQueue(DIR, { v: 2 }, 7)).toBe("failed"); // can't verify the bound payload ⇒ HOLD, never overwrite
+    } finally { chmodSync(path.join(DIR, n!), 0o600); }
+    expect(JSON.parse(readFileSync(path.join(DIR, n!), "utf8"))).toEqual({ v: 1 }); // original intact
   });
 
   test("cred present but record MISSING (crash after cred, before record) ⇒ re-enqueue recovers the record", () => {
@@ -316,27 +357,18 @@ describe("tg-queue atomic identity credential (TGP-10)", () => {
 });
 
 // ── TGP-11: the drain lock serializes drainers (FIFO across drainers/instances) ───────────────────────────────────────
-describe("tg-queue drain lock (TGP-11)", () => {
-  const lockPath = () => path.join(DIR, "drain.lock");
-
-  test("a drain SKIPS while a live, fresh drainer holds the lock (no concurrent reorder)", async () => {
+describe("tg-queue drain lock (TGP-11, proven holder-lock)", () => {
+  test("a drain SKIPS while a LIVE FOREIGN drainer holds the lock (never stolen ⇒ no concurrent reorder), resumes after release", async () => {
     enqueueQueue(DIR, { v: 1 }, 1);
-    mkdirSync(DIR, { recursive: true });
-    writeFileSync(lockPath(), `${process.pid}-${Date.now()}-deadbee`); // a live (our pid), fresh holder
+    const lockDir = path.join(DIR, "drain.lockd");
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(path.join(lockDir, "1.aaaaaa"), ""); // a published holder owned by pid 1 (init): alive + FOREIGN ⇒ never reclaimable
     let ran = 0;
     const r = await drainQueue(DIR, () => { ran++; return "sent"; });
-    expect(ran).toBe(0); // skipped — never processed behind another drainer
+    expect(ran).toBe(0);                      // holder-lock refuses to steal a live foreign holder ⇒ this drain skips (no reorder)
     expect(r).toMatchObject({ claimed: 0, sent: 0 });
     expect(pendingFiles(DIR).length).toBe(1); // record untouched
-    unlinkSync(lockPath());
-    expect((await drainQueue(DIR, () => "sent")).sent).toBe(1); // lock gone ⇒ drains
-  });
-
-  test("a STALE drain lock (dead pid or old) is stolen and the drain proceeds", async () => {
-    enqueueQueue(DIR, { v: 1 }, 1);
-    mkdirSync(DIR, { recursive: true });
-    writeFileSync(lockPath(), `999999-${Date.now() - 120_000}-deadbee`); // dead pid + 2 min old
-    const r = await drainQueue(DIR, () => "sent");
-    expect(r.sent).toBe(1); // stale lock stolen ⇒ delivered
+    rmSync(lockDir, { recursive: true, force: true }); // the foreign drainer releases
+    expect((await drainQueue(DIR, () => "sent")).sent).toBe(1); // lock free ⇒ drains
   });
 });

@@ -8,13 +8,13 @@
 // Credential discipline (§creds, vm-ctl gate): the bot token travels on STDIN into a 0600 file, NEVER argv/env.
 //   seed:   printf %s '<token>' | tsx scripts/swarm-tg-entry.ts --seed-token
 //   run:    SWARM_TG_ENTRY=1 tsx scripts/swarm-tg-entry.ts
-import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, renameSync, appendFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, renameSync, openSync, fstatSync, writeSync, closeSync, constants as FS } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import https from "node:https";
 import http from "node:http";
 import tls from "node:tls";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { renderProjection, parseUpdate, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, obligationReceiptValue, tgReceiptObligationDir, srcTag, tgIdempotencyKey, TG_ACK_TEXT, type RenderSpec, type TgUpdate, type ReceiptObligation } from "../packages/bus/src/swarm/tg-entry.js";
 import { listBatchesStrict, readBatch, readConsumedResult, recordDecision } from "../packages/bus/src/swarm/decision-batch-store.js";
 import { enqueueQueue, drainQueue } from "../packages/bus/src/swarm/tg-queue.js";
@@ -54,9 +54,14 @@ function readAllow(): Set<number> | null {
   // empty set that would silently drop legitimate taps. Only an explicit empty array ([] or { chatIds: [] }) or ENOENT is empty.
   const src: unknown = Array.isArray(a) ? a : (a !== null && typeof a === "object" && Array.isArray((a as { chatIds?: unknown }).chatIds)) ? (a as { chatIds: unknown[] }).chatIds : undefined;
   if (!Array.isArray(src)) { console.error(`swarm-tg-entry: allowlist MALFORMED shape (${allowFile()}) — HOLDING (not empty)`); return null; }
-  const nums = src.filter((n: unknown): n is number => typeof n === "number" && Number.isFinite(n));
-  if (src.length > 0 && nums.length === 0) { console.error(`swarm-tg-entry: allowlist has entries but NO valid numeric chat_id (${allowFile()}) — HOLDING (not empty)`); return null; }
-  return new Set(nums); // [] ⇒ confirmed-empty (no chat allowlisted yet); [1,2,…] ⇒ the allowlist
+  // DO-R2-P1-1: validate EVERY member. A bad member (non-number) is NOT silently filtered out (that would turn [8,"7"] into {8} and
+  // permanently drop replies to 7); it makes the WHOLE config UNKNOWN ⇒ HOLD. Only an all-valid list is accepted ([] ⇒ confirmed-empty).
+  const nums: number[] = [];
+  for (const n of src as unknown[]) {
+    if (typeof n !== "number" || !Number.isFinite(n)) { console.error(`swarm-tg-entry: allowlist has a NON-NUMERIC member (${allowFile()}) — HOLDING (not empty, not a filtered subset)`); return null; }
+    nums.push(n);
+  }
+  return new Set(nums); // every member valid ⇒ the allowlist; [] ⇒ confirmed-empty (no chat allowlisted yet)
 }
 const readOffset = (): number => { try { return Number(readFileSync(offsetFile(), "utf8").trim()) || 0; } catch { return 0; } };
 const writeOffset = (n: number): void => { try { writeFileSync(offsetFile(), String(n), { mode: 0o600 }); } catch { /* best-effort; a replayed update is deduped by consume-once */ } };
@@ -124,24 +129,35 @@ function proxyAgentFor(host: string): https.Agent | undefined {
   return agent;
 }
 
-// Send-attempt audit (coordinator ask): one durable line per OUTBOUND TG send attempt + its outcome, so the at-least-once contract's
-// "auditable" claim actually holds — the number of send ATTEMPTS (and thus possible remote duplicates) is recoverable from this log.
-// It records attempts, NOT confirmed remote deliveries (TG gives no delivery proof). Best-effort append; never throws, never blocks.
+// Send-attempt audit (TGP-4, TWO-LINE protocol): an INTENT line is written BEFORE the request leaves, a RESULT line after. The count
+// of INTENT lines is the recoverable UPPER BOUND on possible remote duplicates — it survives a crash between the send and the result
+// (unlike a single after-the-fact line, which under-counts). It bounds ATTEMPTS, NOT confirmed remote deliveries (TG gives no proof).
+// NON-BLOCKING + best-effort: if the audit path is not a regular file (a FIFO/dir — which could BLOCK appendFileSync and stall the
+// send) it is SKIPPED; a skipped/lost line only weakens the audit, it never blocks or crashes a send. See docs delivery contract.
 const sendAuditFile = (): string => path.join(tgDir(), "send-audit.log");
-function auditSend(method: string, body: unknown, outcome: "ok" | "error", detail?: string): void {
+function auditSend(phase: "attempt" | "ok" | "error", method: string, body: unknown, id: string, detail?: string): void {
+  let fd: number | undefined;
   try {
-    const chatId = (body as { chat_id?: unknown } | null)?.chat_id;
     mkdirSync(tgDir(), { recursive: true });
-    appendFileSync(sendAuditFile(), JSON.stringify({ ts: Date.now(), method, ...(typeof chatId === "number" ? { chat_id: chatId } : {}), outcome, ...(detail ? { detail: String(detail).slice(0, 200) } : {}) }) + "\n", { mode: 0o600 });
-  } catch { /* best-effort: a lost audit line never blocks or crashes a send */ }
+    // TGP-4 (same shape as fleet FR-9): verify + write on the OPENED fd, not a pre-checked pathname (closing the lstat→append
+    // check/use gap where a FIFO is swapped in after the check). O_NONBLOCK ⇒ a FIFO with no reader fails fast (ENXIO), never blocks
+    // the send; O_NOFOLLOW ⇒ a symlink-swap is refused (ELOOP); fstat on the fd ⇒ only a REGULAR file is written, anything else skipped.
+    fd = openSync(sendAuditFile(), FS.O_WRONLY | FS.O_APPEND | FS.O_CREAT | (FS.O_NONBLOCK ?? 0) | (FS.O_NOFOLLOW ?? 0), 0o600);
+    if (!fstatSync(fd).isFile()) return; // the opened fd is not a regular file (FIFO/dir/device) ⇒ skip (never block/crash the send)
+    const chatId = (body as { chat_id?: unknown } | null)?.chat_id;
+    writeSync(fd, JSON.stringify({ ts: Date.now(), phase, id, method, ...(typeof chatId === "number" ? { chat_id: chatId } : {}), ...(detail ? { detail: String(detail).slice(0, 200) } : {}) }) + "\n");
+  } catch { /* best-effort: ENXIO (FIFO no reader) / ELOOP (symlink) / EISDIR / EAGAIN / any fault ⇒ skip, never block or crash a send */ }
+  finally { if (fd !== undefined) { try { closeSync(fd); } catch { /* */ } } }
 }
 
 function tg(token: string, method: string, body: unknown, timeoutMs = 65000): Promise<any> {
   const data = Buffer.from(JSON.stringify(body));
   const agent = proxyAgentFor("api.telegram.org"); // undefined ⇒ direct (no proxy env)
   const isSend = method === "sendMessage" || method === "pinChatMessage"; // the outbound deliveries worth auditing
+  const id = isSend ? randomBytes(6).toString("hex") : "";
+  if (isSend) auditSend("attempt", method, body, id); // INTENT line BEFORE the request ⇒ the recoverable upper bound (survives a post-send crash)
   return new Promise((resolve, reject) => {
-    const audit = (ok: boolean, detail?: string): void => { if (isSend) auditSend(method, body, ok ? "ok" : "error", detail); };
+    const audit = (ok: boolean, detail?: string): void => { if (isSend) auditSend(ok ? "ok" : "error", method, body, id, detail); };
     const req = https.request(
       { host: "api.telegram.org", path: `/bot${token}/${method}`, method: "POST", headers: { "content-type": "application/json", "content-length": data.length }, timeout: timeoutMs, ...(agent ? { agent } : {}) },
       (res) => { let buf = ""; res.on("data", (c) => (buf += c)); res.on("end", () => { try { const j = JSON.parse(buf); if (j.ok) { audit(true); resolve(j.result); } else { audit(false, j.description); reject(new Error(j.description || "tg error")); } } catch (e) { audit(false, e instanceof Error ? e.message : String(e)); reject(e); } }); },
@@ -288,7 +304,7 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
         mine = enforceScope(item, decision);
       } catch { return; } // transient batch read ⇒ retry
       const ob: ReceiptObligation = { updateId: u.update_id, batchId: resolved.batchId, itemId: resolved.itemId, recordedValue: { verdict: mine.verdict, ...(mine.scope ? { scope: mine.scope } : {}) } };
-      if (enqueueQueue(tgReceiptObligationDir(HOME), ob, u.update_id) === "failed") return; // can't persist the obligation ⇒ hold offset, retry
+      { const q = enqueueQueue(tgReceiptObligationDir(HOME), ob, u.update_id); if (q !== "enqueued" && q !== "already") return; } // DO-R4-P1-1: only a confirmed enqueue/already is a handoff; failed/conflict ⇒ HOLD the offset, never advance on an unlanded record
     } else if (outcome === "consumed") {
       // TGP-4 (TG-r6) EVENT-BOUND RECOVERY: the obligation may have been LOST before it was durable — an enqueue IO-failure above, or
       // a crash between recordDecision and the enqueue. The batch is now sealed, but THIS event's identity is in the sealed ledger
@@ -303,7 +319,7 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
         const d = cr.doc.decisions.find((x) => x.id === resolved.itemId);
         if (d && d.reason === srcTag(u.update_id)) {
           const ob: ReceiptObligation = { updateId: u.update_id, batchId: resolved.batchId, itemId: resolved.itemId, recordedValue: { verdict: d.verdict, ...(d.scope ? { scope: d.scope } : {}) } };
-          if (enqueueQueue(tgReceiptObligationDir(HOME), ob, u.update_id) === "failed") return; // can't persist ⇒ retry (DONE marker makes it idempotent)
+          { const q = enqueueQueue(tgReceiptObligationDir(HOME), ob, u.update_id); if (q !== "enqueued" && q !== "already") return; } // DO-R4-P1-1: failed/conflict ⇒ HOLD, never advance with no landed record
         }
       }
     }

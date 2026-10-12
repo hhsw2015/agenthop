@@ -24,24 +24,27 @@
  *     re-attempted each drain (retryStuckQueue), so a live-pid claim is never permanently skipped waiting for the process to exit.
  * Never throws (fail-soft): every entry point swallows IO faults into a return value or a logged no-op.
  */
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, linkSync, lstatSync, statSync, appendFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, linkSync, lstatSync, statSync, appendFileSync, rmdirSync } from "node:fs";
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
+import { acquireHolderLock, releaseHolderLock, type LockSite } from "./holder-lock.js";
 
 export type DrainResult = "sent" | "retry";
 export type EnqueueResult = "enqueued" | "already" | "conflict" | "failed";
 const SEQ_PAD = 20;                        // zero-pad width: a lexical sort of <pad>.json is numeric (arrival) order
 const STALE_CLAIM_MS = 5 * 60_000;         // a claim older than this is reclaimed even if its pid looks alive (a drain that broke out)
-const STALE_DRAINLOCK_MS = 60_000;         // a drain lock held longer than this (dead or wedged owner) is stealable
 const DONE_TTL_MS = 24 * 60 * 60_000;      // DONE/cred older than this are pruned (bounded disk) — well past any live retry window
 const CLAIM_SUFFIX = /\.sending-\d+-\d+\.[0-9a-f]+$/; // <pad>.json.sending-<pid>-<claimMs>.<nonce>
 const CLAIM_RE = /^(.*\.json)\.sending-(\d+)-(\d+)\.[0-9a-f]+$/; // 1=base .json, 2=pid, 3=claimMs
 const PENDING_RE = new RegExp(`^\\d{${SEQ_PAD}}\\.json$`);
 
 const doneDir = (dir: string): string => path.join(dir, "done");
-const credDir = (dir: string): string => path.join(dir, "cred");       // TGP-10: per-seq atomic identity credential (O_EXCL)
+const credDir = (dir: string): string => path.join(dir, "cred");       // TGP-10: per-seq atomic identity credential
 const quarantineDir = (dir: string): string => path.join(dir, "quarantine");
-const drainLockPath = (dir: string): string => path.join(dir, "drain.lock"); // TGP-11: one drainer at a time ⇒ FIFO across drainers
+// TGP-11: the drain lock is the PROVEN holder-lock primitive (atomic mkdir dir + identity-in-filename, race-free reclaim; it never
+// steals a LIVE foreign holder, so a slow-but-alive drainer is contended — not stolen+reordered — and the create/steal/release
+// TOCTOU windows of a hand-rolled lock don't exist). One drainer at a time ⇒ FIFO across drainers/instances.
+const drainLockSite = (dir: string): LockSite => ({ lockDir: path.join(dir, "drain.lockd"), intentDir: dir, intentPrefix: "drain.lock.hold." });
 const bodyHash = (body: string): string => createHash("sha256").update(body).digest("hex");
 
 /** A pid is alive unless process.kill(pid,0) raises ESRCH. EPERM ⇒ exists (not ours) ⇒ alive. */
@@ -103,6 +106,26 @@ function livePendingStems(dir: string): Set<string> | null {
   return out;
 }
 const sourceGone = (p: string): boolean => { try { lstatSync(p); return false; } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT"; } };
+
+/** Reclaim an ORPHAN incomplete credential — a partial/corrupt (length ≠ 64) cred with NO live pending/claim/DONE for its stem.
+ *  r10's linkSync never publishes a partial cred, so this only clears a LEGACY (pre-r10) or planted artifact; run under the drain
+ *  lock (the sole exclusive context) so it can never race a live producer. A cred whose stem still has an entry is left alone.
+ *  Best-effort; never throws. */
+function pruneBadCreds(dir: string): void {
+  let names: string[];
+  try { names = readdirSync(credDir(dir)); } catch { return; }
+  const live = livePendingStems(dir);
+  if (live === null) return; // can't confirm liveness ⇒ touch nothing
+  for (const n of names) {
+    if (!/^\d{20}$/.test(n)) continue;
+    if (live.has(n)) continue;                                   // a pending/claim exists for this stem ⇒ leave the cred
+    if (markerState(path.join(doneDir(dir), n)) !== "absent") continue; // a DONE (or unknown) exists ⇒ leave it
+    let content: string;
+    try { content = readFileSync(path.join(credDir(dir), n), "utf8"); } catch { continue; } // unreadable ⇒ leave (never force)
+    if (content.length === 64) continue;                         // a COMPLETE orphan cred is not ours to judge here ⇒ leave
+    try { unlinkSync(path.join(credDir(dir), n)); } catch { /* raced/gone */ } // an orphan PARTIAL cred ⇒ reclaim so its seq can enqueue again
+  }
+}
 const baseOfClaim = (claimPath: string): string => claimPath.replace(CLAIM_SUFFIX, "");
 
 /** Enqueue a record under a monotonic numeric event id, binding the event IDENTITY to its PAYLOAD via an ATOMIC credential
@@ -126,31 +149,71 @@ export function enqueueQueue(dir: string, record: unknown, seq: number): Enqueue
     if (markerState(path.join(doneDir(dir), stem)) === "present") return "already"; // already completed ⇒ never re-queue
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     mkdirSync(credDir(dir), { recursive: true, mode: 0o700 });
+    // FC-7 (DO-P1-2): a PRE-EXISTING record binds its payload — INCLUDING a legacy entry written before credentials existed (no cred).
+    // Never overwrite it: identical body ⇒ "already", different ⇒ "conflict" (keep the original), unreadable ⇒ "failed" (retry).
+    const ex = readRecordBody(dir, stem);
+    if (ex.found === "unknown") return "failed";
+    if (ex.found) return ex.body === body ? "already" : "conflict";
     const cred = path.join(credDir(dir), stem);
-    try { writeFileSync(cred, h, { flag: "wx", mode: 0o600 }); } // O_EXCL: the atomic identity claim
-    catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") return "failed";
-      let prior: string;
-      try { prior = readFileSync(cred, "utf8").trim(); } catch { return "failed"; } // unreadable identity ⇒ preserve + retry, never overwrite
-      if (prior !== h) return "conflict";          // different payload for the same id ⇒ keep the original
-      if (recordPresent(dir, stem)) return "already"; // same id+payload, record live ⇒ idempotent (no second record)
-      // same id+payload but the record is gone (a crash after cred, before the record) ⇒ fall through and (re)write it.
-    }
+    // TGP-14: the credential must be ATOMIC AND COMPLETE. An O_EXCL `wx` create guarantees a unique NAME but NOT a complete body (a
+    // crash/EIO between create and the hash write leaves a 0/partial cred a later replay would misread as a different-payload
+    // conflict). So publish the FULL hash to a temp, then linkSync it into place — the cred appears only as a hard link to a
+    // fully-written inode (atomic + no-overwrite: EEXIST if already claimed). On EEXIST, COMPARE the (complete) prior hash.
+    // The temp is O_EXCL (`wx`, unique random name) so it is EXCLUSIVELY ours — a leftover temp (a prior unlink that faulted) is
+    // never silently truncated/reused (TGP-10), and we only ever clean OUR OWN temp. The FULL hash lands in the temp BEFORE the
+    // atomic linkSync into `cred`, so `cred` only ever appears as a link to a complete inode (never partial).
+    const credTmp = `${cred}.tmp-${randomBytes(8).toString("hex")}`;
+    try { writeFileSync(credTmp, h, { flag: "wx", mode: 0o600 }); } catch { return "failed"; } // name collision (astronomically rare) ⇒ retry fresh
+    let credLinkedByUs = false;
+    try {
+      try { linkSync(credTmp, cred); credLinkedByUs = true; } // ATOMIC exclusive publish of a COMPLETE credential (EEXIST ⇒ already claimed)
+      catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") return "failed";
+        const prior = readFileSync(cred, "utf8"); // EACCES/… ⇒ throw ⇒ caught by the outer try ⇒ "failed" (preserve, never overwrite)
+        if (prior !== h) {
+          // A COMPLETE different hash ⇒ a genuine different-payload conflict (keep the original). A length mismatch ⇒ an INCOMPLETE /
+          // corrupt prior cred (legacy only — r10's linkSync never publishes a partial): retry WITHOUT touching it, so a concurrent
+          // writer that just completed the same id is never clobbered (TGP-10). A true orphan partial is reclaimed under the drain lock.
+          return prior.length === h.length ? "conflict" : "failed";
+        }
+        const rs = recordState(dir, stem); // same id+payload: idempotent IF a record exists; MISSING ⇒ (re)write; UNKNOWN ⇒ retry
+        if (rs === "present") return "already";
+        if (rs === "unknown") return "failed"; // TGP-15: can't prove the record exists ⇒ retry, NEVER advance on a guess
+        // rs === "absent" ⇒ fall through and (re)write the record.
+      }
+    } finally { try { unlinkSync(credTmp); } catch { /* always clean OUR temp; if we linked, `cred` keeps the inode */ } }
+    // Write the record. DO-R4-P1-1 ("cred ⟹ record"): if the write faults, ROLL BACK the cred WE created this call — never leave a
+    // cred advertising a record that never landed (a pre-existing cred we are merely recovering is left; the retry rewrites the record).
     const file = path.join(dir, `${stem}.json`);
     const tmp = `${file}.tmp-${randomBytes(6).toString("hex")}`;
-    writeFileSync(tmp, body, { mode: 0o600 });
-    renameSync(tmp, file); // the cred has already serialized identity, so this name never races a different-payload writer
+    try { writeFileSync(tmp, body, { mode: 0o600 }); renameSync(tmp, file); }
+    catch { try { unlinkSync(tmp); } catch { /* */ } if (credLinkedByUs) { try { unlinkSync(cred); } catch { /* */ } } return "failed"; }
     return "enqueued";
   } catch { return "failed"; }
 }
 
-/** Does a record for `stem` exist in a non-terminal state — the pending <stem>.json (present OR unreadable) or an in-flight claim?
- *  An unreadable/unenumerable state counts as PRESENT (conservative: never risk a duplicate write on an uncertain read). */
-function recordPresent(dir: string, stem: string): boolean {
-  if (markerState(path.join(dir, `${stem}.json`)) !== "absent") return true; // present or unknown ⇒ exists
+/** The body of a PRE-EXISTING record for `stem` (FC-7 / DO-P1-2): the pending <stem>.json, else an in-flight claim — INCLUDING a
+ *  legacy entry written before credentials existed. { found:true, body } when readable; { found:false } when definitively none;
+ *  { found:"unknown" } on a read/enumerate fault (the caller must retry, never overwrite). */
+function readRecordBody(dir: string, stem: string): { found: true; body: string } | { found: false } | { found: "unknown" } {
+  try { return { found: true, body: readFileSync(path.join(dir, `${stem}.json`), "utf8") }; }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return { found: "unknown" }; }
   let names: string[];
-  try { names = readdirSync(dir); } catch { return true; } // can't enumerate ⇒ assume present (don't risk a double-write)
-  return names.some((n) => n.startsWith(`${stem}.json.sending-`));
+  try { names = readdirSync(dir); } catch { return { found: "unknown" }; }
+  const claim = names.find((n) => n.startsWith(`${stem}.json.sending-`));
+  if (!claim) return { found: false };
+  try { return { found: true, body: readFileSync(path.join(dir, claim), "utf8") }; } catch { return { found: "unknown" }; }
+}
+
+/** The existence state of a record for `stem` — THREE-state (TGP-15): "present" (pending <stem>.json or an in-flight claim),
+ *  "absent" (neither), or "unknown" (a read/enumerate fault — the caller must RETRY, never treat as present or absent). */
+function recordState(dir: string, stem: string): "present" | "absent" | "unknown" {
+  const m = markerState(path.join(dir, `${stem}.json`));
+  if (m === "present") return "present";
+  if (m === "unknown") return "unknown"; // pending lstat fault ⇒ unknown (TGP-15)
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return "unknown"; } // enumerate fault ⇒ unknown, NOT "already"
+  return names.some((n) => n.startsWith(`${stem}.json.sending-`)) ? "present" : "absent";
 }
 
 /** Reclaim claims whose holder is gone (dead pid) OR that are older than STALE_CLAIM_MS (a drain that broke out mid-flight on a LIVE
@@ -213,25 +276,49 @@ export async function drainQueue(
   const stuck = opts.stuck;
   const isAlive = opts.isAlive ?? pidAlive;
   const zero = { claimed: 0, sent: 0, retried: 0, skipped: 0 };
-  // TGP-11: ONE drainer at a time (an exclusive, stale-recoverable drain lock) ⇒ FIFO is preserved ACROSS drainers/instances, not
-  // just within a single pass. A second drainer finds the lock held by a live, fresh owner and SKIPS — it can never process a later
-  // item while another drainer's head item is mid-flight. Exactly-once is unaffected (DONE+cred); this only serializes order.
-  const lockTok = acquireDrainLock(dir, isAlive);
-  if (lockTok === null) return zero; // another drainer holds the queue ⇒ skip (no concurrent reorder)
+  // TGP-11 exclusion is TWO layers: (1) an IN-PROCESS guard — the drain is async, and holder-lock treats a same-pid holder as
+  // reclaimable own-residue, so it CANNOT exclude a second in-process call while the first's handler is still awaiting; a concurrent
+  // drain of THIS dir in THIS process therefore skips here. (2) the cross-process holder-lock below. Together: one drainer at a time ⇒
+  // FIFO across drainers/instances; exactly-once is unaffected (DONE+cred).
+  if (drainingDirs.has(dir)) return zero; // (1) in-process: another live drain of this dir is mid-flight ⇒ skip
+  drainingDirs.add(dir);
+  try {
+  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return zero; } // the lock's intentDir must exist; no dir ⇒ nothing to drain
+  recoverDeadDrainLock(dir); // reclaim a lock a drainer crashed BEFORE publishing its identity (empty lockdir + dead intents) — holder-lock leaves this caller-side recovery (R26) to us
+  const lockTok = acquireHolderLock(drainLockSite(dir));
+  if (lockTok === null) return zero; // another LIVE drainer holds the queue ⇒ skip (holder-lock never steals a live holder ⇒ no reorder)
   try {
   recoverStaleQueueClaims(dir, isAlive);
   if (stuck) retryStuckQueue(dir, stuck);
   pruneDone(dir);
-  let names: string[];
-  try { names = readdirSync(dir).filter((n) => PENDING_RE.test(n)).sort(); } catch { return zero; }
+  pruneBadCreds(dir); // TGP-10: reclaim any orphan partial/legacy credential (safe: under the drain lock)
+  // DO-P2-3 / TGP-11 HEAD OWNERSHIP across ALL states, from a SINGLE directory snapshot (so there is no "pending read ok, claim read
+  // fails" window where an unknown slips through): one readdir yields BOTH the pending list AND the claim set. A read fault ⇒ return
+  // zero (process NOTHING — an un-enumerable queue can't prove no earlier head is stuck; unknown NEVER authorizes jumping the head).
+  let entries: string[];
+  try { entries = readdirSync(dir); } catch { return zero; }
+  const names = entries.filter((n) => PENDING_RE.test(n)).sort();
+  // blockSeq = the lowest seq of an UNRESOLVED claim. A claim whose stem has a CONFIRMED DONE is TERMINAL (business complete, only its
+  // cleanup is pending) ⇒ NOT a blocker. A claim whose DONE state is absent OR UNKNOWN ⇒ treated as unresolved ⇒ blocks (TGP-11:
+  // confirmed-unresolved and unknown both hold the head; only a confirmed-terminal claim is let past).
+  let blockSeq = Number.POSITIVE_INFINITY;
+  for (const nm of entries) {
+    const m = CLAIM_RE.exec(nm);
+    if (!m) continue;
+    const s = Number(m[1]!.slice(0, SEQ_PAD));
+    if (s >= blockSeq) continue;
+    if (markerState(path.join(doneDir(dir), m[1]!.slice(0, SEQ_PAD))) === "present") continue; // DONE ⇒ terminal ⇒ not a blocker
+    blockSeq = s;
+  }
   let claimed = 0, sent = 0, retried = 0, skipped = 0;
   const release = (c: string): void => { try { renameSync(c, baseOfClaim(c)); } catch { stuck?.add(c); } }; // DO-P2-2: keep the obligation
   const ack = (c: string): void => { try { unlinkSync(c); } catch { stuck?.add(c); } };
   for (const n of names) {
     if (claimed >= cap) break;
+    if (Number(n.slice(0, SEQ_PAD)) > blockSeq) break; // DO-P2-3: an earlier-seq item is stuck in a claim ⇒ never deliver past it
     const jsonPath = path.join(dir, n);
     const claimPath = `${jsonPath}.sending-${process.pid}-${Date.now()}.${randomBytes(6).toString("hex")}`; // pid + claim-time + nonce (DO-P2-1b unique; TGP-8 age=claim-time)
-    try { renameSync(jsonPath, claimPath); } catch { continue; } // ENOENT ⇒ another drainer took it ⇒ skip
+    try { renameSync(jsonPath, claimPath); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; break; } // ENOENT ⇒ gone ⇒ skip; a real IO error on the head ⇒ STOP (DO-P2-3 hold FIFO, never jump it)
     claimed += 1;
     const stem = n.slice(0, SEQ_PAD);
     const done = markerState(path.join(doneDir(dir), stem));
@@ -254,28 +341,25 @@ export async function drainQueue(
     } else { release(claimPath); retried += 1; break; } // DO-P2-3: a handler "retry" holds the head of the queue (conversation order preserved)
   }
   return { claimed, sent, retried, skipped };
-  } finally { releaseDrainLock(dir, lockTok); }
+  } finally { releaseHolderLock(drainLockSite(dir), lockTok); }
+  } finally { drainingDirs.delete(dir); }
 }
 
-/** Acquire the exclusive per-queue drain lock (TGP-11). Returns a token on success, or null if a LIVE, FRESH drainer holds it. A lock
- *  held by a dead pid OR older than STALE_DRAINLOCK_MS is stolen (O_EXCL re-create; a lost steal race ⇒ null ⇒ skip). Never throws. */
-function acquireDrainLock(dir: string, isAlive: (pid: number) => boolean): string | null {
-  const lock = drainLockPath(dir);
-  const tok = `${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
-  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); writeFileSync(lock, tok, { flag: "wx", mode: 0o600 }); return tok; } // O_EXCL
-  catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "EEXIST") return null;
-    let cur: string;
-    try { cur = readFileSync(lock, "utf8"); } catch { return null; } // unreadable holder ⇒ don't steal (conservative)
-    const m = /^(\d+)-(\d+)-/.exec(cur);
-    const stealable = !m || !isAlive(Number(m[1])) || Date.now() - Number(m[2]) > STALE_DRAINLOCK_MS;
-    if (!stealable) return null; // a live, fresh drainer owns it ⇒ skip this drain
-    try { if (readFileSync(lock, "utf8") === cur) unlinkSync(lock); } catch { /* raced */ } // remove only the stale holder we saw
-    try { writeFileSync(lock, tok, { flag: "wx", mode: 0o600 }); return tok; } catch { return null; } // lost the steal race ⇒ skip
-  }
-}
-/** Release the drain lock iff we still own it (never unlink a lock a stealer re-took). Never throws. */
-function releaseDrainLock(dir: string, tok: string): void {
-  const lock = drainLockPath(dir);
-  try { if (readFileSync(lock, "utf8") === tok) unlinkSync(lock); } catch { /* not ours / gone */ }
+/** In-process set of queue dirs currently being drained (TGP-11 layer 1: same-process async reentrancy guard). */
+const drainingDirs = new Set<string>();
+
+/** Reclaim a drain lock a drainer crashed BEFORE publishing its identity: an EMPTY `drain.lockd` whose hold-intents are ALL dead
+ *  (or absent). holder-lock refuses to adopt an external empty dir (it can't tell a crash from a live mid-publish) and leaves this
+ *  to the caller; without it the queue would be permanently un-drainable after such a crash. SAFETY: a LIVE hold-intent (an acquirer
+ *  mid-publish) ⇒ leave it (never steal); an unreadable intent dir ⇒ leave (never fold to "none"). Best-effort; never throws. */
+function recoverDeadDrainLock(dir: string): void {
+  const site = drainLockSite(dir);
+  let entries: string[];
+  try { entries = readdirSync(site.lockDir); } catch { return; } // no lockdir / unreadable ⇒ nothing to reclaim
+  if (entries.length !== 0) return; // a PUBLISHED holder ⇒ holder-lock's own dead-pid reclaim handles it, not us
+  let intents: string[];
+  try { intents = readdirSync(site.intentDir).filter((n) => n.startsWith(site.intentPrefix)); } catch { return; } // can't read intents ⇒ leave
+  for (const n of intents) { const pid = Number(n.slice(site.intentPrefix.length).split(".")[0]); if (Number.isInteger(pid) && pidAlive(pid)) return; } // a LIVE intent ⇒ an acquirer is mid-publish ⇒ never steal
+  try { rmdirSync(site.lockDir); } catch { return; } // raced (someone published/removed) ⇒ abort; a live acquirer re-mkdirs cleanly
+  for (const n of intents) { try { unlinkSync(path.join(site.intentDir, n)); } catch { /* best-effort: dead intents */ } }
 }
