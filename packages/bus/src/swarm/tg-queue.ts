@@ -24,7 +24,7 @@
  *     re-attempted each drain (retryStuckQueue), so a live-pid claim is never permanently skipped waiting for the process to exit.
  * Never throws (fail-soft): every entry point swallows IO faults into a return value or a logged no-op.
  */
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, linkSync, lstatSync, statSync, appendFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, linkSync, lstatSync, statSync, appendFileSync, openSync, writeSync, closeSync } from "node:fs";
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
 import { acquireHolderLock, releaseHolderLock, type LockSite } from "./holder-lock.js";
@@ -139,7 +139,7 @@ const baseOfClaim = (claimPath: string): string => claimPath.replace(CLAIM_SUFFI
  *       • hash SAME but the record is MISSING ⇒ a prior enqueue crashed after the cred, before the record ⇒ (re)write it ⇒ "enqueued".
  *   - winner ⇒ write <seq>.json ⇒ "enqueued".
  *  An illegal id ⇒ "failed". Never throws. */
-export function enqueueQueue(dir: string, record: unknown, seq: number): EnqueueResult {
+export function enqueueQueue(dir: string, record: unknown, seq: number, recordTempSuffix: () => string = () => randomBytes(8).toString("hex")): EnqueueResult {
   const stem = seqName(seq);
   if (stem === null) return "failed"; // reject an illegal id rather than fold it into a colliding name
   let body: string;
@@ -190,10 +190,21 @@ export function enqueueQueue(dir: string, record: unknown, seq: number): Enqueue
     // it. A different-payload producer always hits EEXIST+hash-mismatch ⇒ "conflict" ⇒ never overwrites. A crash that strands a COMPLETE
     // cred with no record is a narrow, self-healing orphan (the same-payload retry rebuilds the record; for seq=update_id the payload is
     // invariant) — not a lost delivery.
+    // TGP-10 (record temp OWNERSHIP, layer 2): the record temp must be EXCLUSIVELY ours (O_EXCL via "wx"), not a plain "w" (O_TRUNC).
+    // A plain-"w" temp lets a SECOND same-payload recovery producer that generates a colliding temp name TRUNCATE our in-progress temp,
+    // so our rename then publishes HIS (possibly half-written / killed) bytes — a torn record. "wx" gives each writer its OWN inode; on
+    // a name collision (EEXIST) retry a FRESH name — NEVER truncate or unlink the colliding temp (it is another writer's, and random
+    // digits are not ownership). We clean ONLY the temp we created. (Mirrors 件② r5 @81f8894 / DOS-CORE-P1-1.)
     const file = path.join(dir, `${stem}.json`);
-    const tmp = `${file}.tmp-${randomBytes(6).toString("hex")}`;
-    try { writeFileSync(tmp, body, { mode: 0o600 }); renameSync(tmp, file); }
-    catch { try { unlinkSync(tmp); } catch { /* */ } return "failed"; }
+    let tmp = "";
+    let fd: number | undefined;
+    for (let attempt = 0; ; attempt++) {
+      tmp = `${file}.tmp-${process.pid}-${recordTempSuffix()}`;
+      try { fd = openSync(tmp, "wx", 0o600); break; }                                  // own the inode, or EEXIST ⇒ a colliding name
+      catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && attempt < 8) continue; return "failed"; } // never clobber a foreign temp ⇒ retry fresh; exhausted/other ⇒ retry later
+    }
+    try { writeSync(fd, body); closeSync(fd); fd = undefined; renameSync(tmp, file); } // atomic publish of OUR complete inode (same-payload last-writer-wins is byte-identical; never torn)
+    catch { if (fd !== undefined) { try { closeSync(fd); } catch { /* */ } } try { unlinkSync(tmp); } catch { /* */ } return "failed"; } // clean ONLY our own temp
     return "enqueued";
   } catch { return "failed"; }
 }

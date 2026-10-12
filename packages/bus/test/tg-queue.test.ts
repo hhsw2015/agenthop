@@ -371,6 +371,23 @@ describe("tg-queue atomic identity credential (TGP-10)", () => {
     expect(enqueueQueue(DIR, { v: 1 }, 7)).toBe("enqueued");          // SAME-payload retry heals cred⟹record (the record is rebuilt)
     expect(JSON.parse(readFileSync(path.join(DIR, pendingFiles(DIR)[0]!), "utf8"))).toEqual({ v: 1 });
   });
+
+  test("record temp is O_EXCL (TGP-10 layer 2): a colliding foreign temp is NEVER truncated or unlinked — the writer retries a fresh inode", () => {
+    // TGP-10 layer 2 (codex:Work bridge r12): the RECORD temp must be exclusively ours (wx/O_EXCL), not a plain "w" (O_TRUNC). A
+    // plain-"w" temp lets a second same-payload recovery producer that generates a colliding temp name TRUNCATE our in-progress temp,
+    // so our rename publishes HIS (possibly killed/partial) bytes. Here we pre-create a FOREIGN temp at the exact name our FIRST attempt
+    // will try, then prove the write (a) never clobbers it and (b) still succeeds via a fresh inode. Fails if "wx" reverts to "w".
+    const FORCED = "deadbeefdeadbeef";
+    mkdirSync(DIR, { recursive: true });
+    const foreignTmp = path.join(DIR, `00000000000000000007.json.tmp-${process.pid}-${FORCED}`);
+    writeFileSync(foreignTmp, "FOREIGN-IN-PROGRESS"); // another writer's in-progress temp occupying our first candidate name
+    const before = readFileSync(foreignTmp, "utf8");
+    let n = 0; const gen = () => (n++ === 0 ? FORCED : `fresh${n}`); // first attempt collides, retry picks a fresh name
+    expect(enqueueQueue(DIR, { v: 1 }, 7, gen)).toBe("enqueued");    // O_EXCL EEXIST on the forced name ⇒ retry fresh ⇒ succeed
+    expect(readFileSync(foreignTmp, "utf8")).toBe(before);          // the FOREIGN temp was NOT truncated (plain "w" would have clobbered it)
+    expect(existsSync(foreignTmp)).toBe(true);                      // and NOT unlinked (never delete another writer's temp)
+    expect(JSON.parse(readFileSync(path.join(DIR, pendingFiles(DIR)[0]!), "utf8"))).toEqual({ v: 1 }); // OUR record is complete + correct
+  });
 });
 
 // ── TGP-11: the drain lock serializes drainers (FIFO across drainers/instances) ───────────────────────────────────────
