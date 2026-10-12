@@ -8,15 +8,17 @@ import { flagDefaultOn } from "./flag-default.js";
 /** Already-gathered, already-user-facing source lines (pointers/summaries, never inlined artifacts — S18). The four buckets are
  *  the ACCEPTANCE-BRIEFING form of the north star "晚上交代、早上验收" (hand off at night, accept in the morning): each bucket is
  *  what the user DOES in the morning, not a running-log excerpt. All optional; an empty digest is a valid "quiet night".
- *    awaitingRuling 待你拍板 — decision-batch items awaiting the user's ruling (authoritative: the console decisions mirror).
- *    anomalies      异常     — anything that needs the user's eye (blocked / stuck / sentinel S19 / a corrupt source).
- *    awaitingTest   待你验收 — landed work awaiting the user's own real-test (e.g. a mod / swarm keypress).
- *    doneOvernight  昨夜完成 — signed-off / landed deliverables (a SHA + one plain sentence). */
+ *    awaitingRuling 待你拍板     — decision-batch items awaiting the user's ruling (authoritative: the decision-batches store).
+ *    anomalies      异常         — anything that needs the user's eye (blocked / stuck / a corrupt source).
+ *    awaitingTest   待你验收     — landed work awaiting the user's own real-test (e.g. a mod / swarm keypress).
+ *    recentDone     完成(签收/落地) — signed-off / landed deliverables, each carrying a verifiable SHA (the acceptance evidence).
+ *  NOTE the title is "完成(签收/落地)" not "昨夜完成": the gather source (PROGRESS tail) cannot prove an overnight window, so the
+ *  title does not claim one (MDV2-5). A true time-windowed "昨夜完成" would read the control-log accepted entities (decidedAtSeq). */
 export type DigestSources = {
   awaitingRuling?: readonly string[];
   anomalies?: readonly string[];
   awaitingTest?: readonly string[];
-  doneOvernight?: readonly string[];
+  recentDone?: readonly string[];
 };
 
 const section = (title: string, lines: readonly string[] | undefined): string[] =>
@@ -30,7 +32,7 @@ export function composeDigest(sources: DigestSources, dateStr: string): string {
     ...section("待你拍板", sources.awaitingRuling),
     ...section("异常", sources.anomalies),
     ...section("待你验收", sources.awaitingTest),
-    ...section("昨夜完成", sources.doneOvernight),
+    ...section("完成(签收/落地)", sources.recentDone),
   ];
   const head = `morning brief — ${dateStr}`;
   return body.length === 0 ? `${head}\n(quiet night — nothing to report)` : [head, ...body].join("\n");
@@ -49,7 +51,7 @@ export function digestProjection(sources: DigestSources, dateStr: string, genera
     ["待你拍板", sources.awaitingRuling],
     ["异常", sources.anomalies],
     ["待你验收", sources.awaitingTest],
-    ["昨夜完成", sources.doneOvernight],
+    ["完成(签收/落地)", sources.recentDone],
   ];
   const sections: DigestSection[] = [];
   for (const [title, lines] of groups) if (lines && lines.length > 0) sections.push({ title, lines: [...lines] });

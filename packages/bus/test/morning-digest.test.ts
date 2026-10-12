@@ -10,7 +10,7 @@ const validProj = (date: string): ProjState => ({ kind: "valid", date, projectio
 describe("morning-digest — composeDigest + digestTextFromProjection (frozen body parity)", () => {
   test("action-needed leads; empty ⇒ quiet line; projection renders the SAME text as composeDigest (MD-R2-P2-1)", () => {
     expect(composeDigest({}, "2026-10-10")).toBe("morning brief — 2026-10-10\n(quiet night — nothing to report)");
-    const sources = { awaitingRuling: ["r1"], doneOvernight: ["d1", "d2"], awaitingTest: ["t1"] };
+    const sources = { awaitingRuling: ["r1"], recentDone: ["d1", "d2"], awaitingTest: ["t1"] };
     expect(digestTextFromProjection(digestProjection(sources, "d", 0))).toBe(composeDigest(sources, "d"));
     expect(digestTextFromProjection(digestProjection({}, "d", 0))).toBe(composeDigest({}, "d"));
   });
@@ -18,8 +18,8 @@ describe("morning-digest — composeDigest + digestTextFromProjection (frozen bo
 
 describe("morning-digest — digestProjection (schema morning-digest/v1, acceptance buckets)", () => {
   test("sections in action-first order; all-empty ⇒ quiet-night; non-finite generatedAtSec ⇒ 0", () => {
-    const p = digestProjection({ awaitingRuling: ["r1"], anomalies: ["x1"], awaitingTest: ["t1"], doneOvernight: ["d1"] }, "2026-10-10", 1700.9);
-    expect(p.sections.map((s) => s.title)).toEqual(["待你拍板", "异常", "待你验收", "昨夜完成"]);
+    const p = digestProjection({ awaitingRuling: ["r1"], anomalies: ["x1"], awaitingTest: ["t1"], recentDone: ["d1"] }, "2026-10-10", 1700.9);
+    expect(p.sections.map((s) => s.title)).toEqual(["待你拍板", "异常", "待你验收", "完成(签收/落地)"]);
     expect(p.generatedAtSec).toBe(1700);
     expect(digestProjection({}, "d", NaN)).toEqual({ schema: "morning-digest/v1", date: "d", generatedAtSec: 0, sections: [{ title: "quiet night", lines: ["nothing to report"] }] });
   });
@@ -76,16 +76,16 @@ describe("morning-digest-store — projection + two-phase notify marker (durable
 
   test("write ⇒ valid (carries frozen projection body); absent ⇒ absent; corrupt ⇒ corrupt", () => {
     expect(readDigestProjection(HOME)).toEqual({ kind: "absent" });
-    writeDigestProjection(HOME, { doneOvernight: ["m1"] }, "2026-10-10", 123);
+    writeDigestProjection(HOME, { recentDone: ["m1"] }, "2026-10-10", 123);
     const st = readDigestProjection(HOME);
     expect(st.kind === "valid" && st.date).toBe("2026-10-10");
-    expect(st.kind === "valid" && st.projection.sections[0]!.title).toBe("昨夜完成");
+    expect(st.kind === "valid" && st.projection.sections[0]!.title).toBe("完成(签收/落地)");
     rawWrite("digest.json", JSON.stringify({ schema: "morning-digest/v1", date: "d", generatedAtSec: 1, sections: "oops" }));
     expect(readDigestProjection(HOME).kind).toBe("corrupt");
   });
 
   test("MD-P2-1: two-phase marker carries the frozen body; legacy date-only ⇒ pending (FC-7, never 'sent'); corrupt ⇒ unknown", () => {
-    const body = digestProjection({ doneOvernight: ["x"] }, "2026-10-10", 0);
+    const body = digestProjection({ recentDone: ["x"] }, "2026-10-10", 0);
     expect(readNotifiedState(HOME)).toEqual({ kind: "none" });
     expect(markNotified(HOME, "2026-10-10", "pending", body)).toBe(true);
     expect(readNotifiedState(HOME)).toEqual({ kind: "pending", date: "2026-10-10", body });
@@ -107,69 +107,91 @@ describe("morning-digest-store — projection + two-phase notify marker (durable
   });
 });
 
-describe("morning-digest-store — gatherDigestSources (验收简报化: acceptance buckets, noise-dropped, unknown-safe)", () => {
+describe("morning-digest-store — gatherDigestSources (验收简报化: authoritative store + state/evidence buckets)", () => {
   let HOME: string;
   beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-digest-")); });
   afterEach(() => { try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ } });
   const progress = (body: string): string => { const d = path.join(HOME, ".agenthop", "swarm"); mkdirSync(d, { recursive: true }); const f = path.join(d, "PROGRESS.md"); writeFileSync(f, body); return f; };
-  const decDir = (): string => path.join(HOME, ".agenthop", "swarm", "console", "decisions");
-  const writeDecision = (batchId: string, obj: unknown): void => { mkdirSync(decDir(), { recursive: true }); writeFileSync(path.join(decDir(), `${batchId}.json`), typeof obj === "string" ? obj : JSON.stringify(obj)); };
-  const mirror = (batchId: string, items: unknown[]): unknown => ({ schema: "console-decisions/v1", generatedAtSec: 0, batch: { batchId, owner: "coord", createdAtSec: 0, items } });
+  const bDir = (id: string): string => path.join(HOME, ".agenthop", "console", "decision-batches", id);
+  const item = (id: string, over: Record<string, unknown> = {}): unknown => ({ id, kind: "k", summary: `s-${id}`, suggestedAction: "approve", ...over });
+  const writeBatch = (id: string, items: unknown[], opts: { consumed?: boolean; raw?: string } = {}): void => {
+    mkdirSync(bDir(id), { recursive: true });
+    writeFileSync(path.join(bDir(id), "batch.json"), opts.raw ?? JSON.stringify({ batchId: id, owner: "coord", createdAtSec: 0, items }));
+    if (opts.consumed) writeFileSync(path.join(bDir(id), "consumed.json"), JSON.stringify({ digest: "d" }));
+  };
 
-  test("③ 待你拍板 comes from the console decisions mirror (structured), with hard-gate + suggestedAction annotated", () => {
-    writeDecision("b1", mirror("b1", [
-      { id: "i1", kind: "merge", summary: "merge feat/x", suggestedAction: "approve", hardGate: true },
-      { id: "i2", kind: "spend", summary: "approve $5 VM" },
-    ]));
-    const s = gatherDigestSources(HOME)!;
-    expect(s.awaitingRuling).toEqual(["merge feat/x [hard-gate] → approve", "approve $5 VM"]);
+  test("MDV2-1: 待你拍板 reads the AUTHORITATIVE decision-batches store (no derived mirror); a consumed batch is skipped", () => {
+    writeBatch("b1", [item("i1", { summary: "merge feat/x", suggestedAction: "approve", hardGate: true }), item("i2", { summary: "approve $5 VM", suggestedAction: "ok" })]);
+    writeBatch("b2", [item("x1", { summary: "already ruled" })], { consumed: true });
+    expect(gatherDigestSources(HOME)!.awaitingRuling).toEqual([
+      "merge feat/x [hard-gate] → approve (b:b1 i:i1)",
+      "approve $5 VM → ok (b:b1 i:i2)",
+    ]);
   });
 
-  test("① 昨夜完成 / ② 待你验收 / ④ 异常 bucket the PROGRESS tail; ⑤ pure noise + in-flight review is DROPPED", () => {
+  test("MDV2-1: a CONFIRMED-empty store (ENOENT) ⇒ genuine quiet, never a false quiet from a missing derived mirror", () => {
+    expect(gatherDigestSources(HOME)).toEqual({ awaitingRuling: [], anomalies: [], awaitingTest: [], recentDone: [] });
+  });
+
+  test("MDV2-2: the display cap limits OUTPUT only — the scan continues and the overflow count is visible", () => {
+    writeBatch("big", Array.from({ length: 11 }, (_, i) => item(`i${i}`)));
+    const ar = gatherDigestSources(HOME, 80, 8)!.awaitingRuling!;
+    expect(ar.filter((l) => l.startsWith("s-i")).length).toBe(8);
+    expect(ar.some((l) => /\+3 更多待你拍板/.test(l))).toBe(true);
+  });
+
+  test("MDV2-3: a malformed batch (bad JSON / empty summary / non-boolean hardGate) is a VISIBLE anomaly, never a silent empty", () => {
+    writeBatch("good", [item("i1", { summary: "ok item" })]);
+    writeBatch("bad1", [], { raw: "not json{" });
+    writeBatch("bad2", [{ id: "x", kind: "k", summary: "", suggestedAction: "a" }]);
+    writeBatch("bad3", [{ id: "y", kind: "k", summary: "s", suggestedAction: "a", hardGate: "yes" }]);
+    const s = gatherDigestSources(HOME)!;
+    expect(s.awaitingRuling).toEqual(["ok item → approve (b:good i:i1)"]);
+    expect(s.anomalies).toEqual(expect.arrayContaining([
+      expect.stringContaining("决策批 bad1"), expect.stringContaining("决策批 bad2"), expect.stringContaining("决策批 bad3"),
+    ]));
+  });
+
+  test("MDV2-4: a long summary is clipped but hard-gate + suggested action + (batch,item) ref are RETAINED", () => {
+    writeBatch("b", [item("i1", { summary: "x".repeat(300), suggestedAction: "merge now", hardGate: true })]);
+    const line = gatherDigestSources(HOME)!.awaitingRuling![0]!;
+    expect(line).toContain("[hard-gate]");
+    expect(line).toContain("→ merge now");
+    expect(line).toContain("(b:b i:i1)");
+    expect(line).toContain("…");
+  });
+
+  test("MDV2-5: PROGRESS buckets by STATE + EVIDENCE — SHA-required 完成, negation/conditional + 哨兵-keyword + in-flight handled", () => {
     progress([
-      "- ✅ output-contract 签收 @bc6eda1 0 REMAIN",   // ① 昨夜完成 (sign-off + sha)
-      "- 已并 feat/foo merged 3feed44",                 // ① 昨夜完成 (landed + sha)
-      "- 待签收：feature-D，2 REMAIN",                   // ⑤ in-flight review (待 + nonzero REMAIN) ⇒ DROP, never 昨夜完成
-      "- 待复审：feature-E 送审 codex:Work",            // ⑤ inter-agent in-flight ⇒ DROP
-      "- 待验收：mod /swarm 按键需你实测",               // ② 待你验收
-      "- feature-G 待实测",                              // ② 待你验收
-      "- ⚠ dispatcher 卡死 pid 123",                    // ④ 异常
-      "- 哨兵 S19 升级：seat 失联",                       // ④ 异常
-      "- 普通进度随手记一笔",                             // ⑤ pure noise ⇒ DROP
+      "- ✅ output-contract 签收 @bc6eda1 0 REMAIN",
+      "- 已并 feat/foo merged 3feed44",
+      "- ✅ 哨兵修复已并 @8c8555a 0 REMAIN",
+      "- not merged @deadbee",
+      "- 未装机 @deadbee",
+      "- 0 REMAIN 即合并 @deadbee",
+      "- ✅ 检查结束",
+      "- 待复审：sentinel 优化 @deadbee",
+      "- ⚠ dispatcher 卡死 pid 123",
+      "- 待验收：mod /swarm 按键需你实测",
+      "- 普通进度随手记一笔",
     ].join("\n"));
     const s = gatherDigestSources(HOME)!;
-    expect(s.doneOvernight).toEqual(["✅ output-contract 签收 @bc6eda1 0 REMAIN", "已并 feat/foo merged 3feed44"]);
-    expect(s.awaitingTest).toEqual(["待验收：mod /swarm 按键需你实测", "feature-G 待实测"]);
-    expect(s.anomalies).toEqual(["⚠ dispatcher 卡死 pid 123", "哨兵 S19 升级：seat 失联"]);
-    expect(s.awaitingRuling).toEqual([]); // no decisions dir ⇒ empty (not from a PROGRESS 待裁 grep)
+    expect(s.recentDone).toEqual(["✅ output-contract 签收 @bc6eda1 0 REMAIN", "已并 feat/foo merged 3feed44", "✅ 哨兵修复已并 @8c8555a 0 REMAIN"]);
+    expect(s.anomalies).toEqual(["⚠ dispatcher 卡死 pid 123"]);
+    expect(s.awaitingTest).toEqual(["待验收：mod /swarm 按键需你实测"]);
+    expect(s.awaitingRuling).toEqual([]);
   });
 
-  test("a corrupt / malformed decision batch is surfaced as an ANOMALY (visible, non-blocking), never silently dropped", () => {
-    writeDecision("good", mirror("good", [{ id: "i1", kind: "k", summary: "ok item" }]));
-    writeDecision("bad1", "not json{");
-    writeDecision("bad2", { schema: "console-decisions/v1", batch: { items: [{ id: "x", kind: "k" }] } }); // item missing summary
-    const s = gatherDigestSources(HOME)!;
-    expect(s.awaitingRuling).toEqual(["ok item"]);
-    expect(s.anomalies).toEqual(expect.arrayContaining([
-      expect.stringContaining("决策批 bad1"),
-      expect.stringContaining("决策批 bad2"),
-    ]));
-  });
-
-  test("ENOENT (no PROGRESS, no decisions) ⇒ empty gather (quiet night); PROGRESS UNREADABLE ⇒ null (MD-P2-2)", () => {
-    expect(gatherDigestSources(HOME)).toEqual({ awaitingRuling: [], anomalies: [], awaitingTest: [], doneOvernight: [] });
-    const f = progress("- 待验收 and unread");
+  test("PROGRESS unreadable ⇒ null (MD-P2-2); an unreadable decision store ⇒ null (MDV2-1), never a false quiet night", () => {
+    const f = progress("- ✅ done @abc123f");
     chmodSync(f, 0o000);
     if (typeof process.getuid === "function" && process.getuid() !== 0) expect(gatherDigestSources(HOME)).toBeNull();
     chmodSync(f, 0o600);
-  });
-
-  test("MD-P2-2: an UNREADABLE decisions dir ⇒ null (cannot assert no ruling pending), never a false quiet night", () => {
-    writeDecision("b1", mirror("b1", [{ id: "i1", kind: "k", summary: "s" }]));
-    progress("- ✅ done @abc1234");
-    chmodSync(decDir(), 0o000);
+    writeBatch("b1", [item("i1")]);
+    const bd = path.join(HOME, ".agenthop", "console", "decision-batches");
+    chmodSync(bd, 0o000);
     if (typeof process.getuid === "function" && process.getuid() !== 0) expect(gatherDigestSources(HOME)).toBeNull();
-    chmodSync(decDir(), 0o700);
+    chmodSync(bd, 0o700);
   });
 });
 
