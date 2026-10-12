@@ -1,0 +1,22 @@
+{
+  "schema": "model-market-map/v1",
+  "source": "model-staffing Q1 (coordinator freeze): model-market base id (before the ::<effort> suffix) -> CPA catalog id. The CPA ids mirror the alias spellings in roles/model-tiers.json (the benchmarked families). This repo seed is the DEFAULT; the shared override at ~/.agenthop/swarm/roles/model-market-map.json takes precedence. A model-market model with no entry here (and none in the override) is SKIPPED by pickModel and COUNTED (unmappableCount, Q1 visible).",
+  "note": "Keys are model-market BASE ids (e.g. claude-opus-5.5, not claude-opus-5.5::max) — all reasoning-effort variants of a family resolve through one entry. Values are CPA catalog ids. Updating this is a ruling, not a code change; extend via the shared override file without a redeploy.",
+  "map": {
+    "claude-opus-5.5": "claude-opus-5-5",
+    "claude-sonnet-5.5": "claude-sonnet-5-5",
+    "claude-fable-5.1": "claude-fable-5-1",
+    "claude-fable-5": "claude-fable-5",
+    "claude-opus-5": "claude-opus-5",
+    "gpt-6-astra": "gpt-6-astra",
+    "gpt-6.1-sol": "gpt-6-1-sol",
+    "gpt-6-sol": "gpt-6-sol",
+    "gpt-5.6-sol": "gpt-5-6-sol",
+    "gpt-5.6-terra": "gpt-5-6-terra",
+    "grok-4.7": "grok-4-7",
+    "grok-4.6": "grok-4-6",
+    "qwen3.8-max": "qwen3-8-max",
+    "glm-5.3": "glm-5-3",
+    "kimi-k3": "kimi-k3"
+  }
+}
