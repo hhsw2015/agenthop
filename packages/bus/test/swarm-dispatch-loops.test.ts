@@ -87,7 +87,7 @@ describe("loadControlOrEscalate (DISP-1: control-load fail-soft)", () => {
   });
 });
 
-import { runSweepTick } from "../src/swarm/dispatch-loops.js";
+import { runSweepTick, runRenewThenSweep } from "../src/swarm/dispatch-loops.js";
 
 describe("runSweepTick (DISP1-2/DISP1-3: group by control-dependency, isolate each step)", () => {
   const rec = () => { const log: string[] = []; const mk = (n: string) => () => { log.push(n); }; return { log, mk }; };
@@ -146,10 +146,10 @@ describe("runSweepTick (DISP1-2/DISP1-3: group by control-dependency, isolate ea
     const seq: boolean[] = [false, true]; let tick = 0;
     const runs: string[] = [];
     const once = () => runSweepTick({
-      independent: [() => runs.push("indep")],
+      independent: [() => { runs.push("indep"); }],
       loadControl: () => seq[tick++]!,
-      dependent: [() => runs.push("dep")],
-      tail: [() => runs.push("tail")],
+      dependent: [() => { runs.push("dep"); }],
+      tail: [() => { runs.push("tail"); }],
       onError: () => {},
     });
     await once(); // control unreadable ⇒ no dep
@@ -163,9 +163,35 @@ describe("runSweepTick (DISP1-2/DISP1-3: group by control-dependency, isolate ea
       independent: [],
       loadControl: () => true,
       dependent: [async () => { await new Promise((r) => setTimeout(r, 20)); log.push("slow-dep"); }],
-      tail: [() => log.push("tail")],
+      tail: [() => { log.push("tail"); }],
       onError: () => {},
     });
     expect(log).toEqual(["slow-dep", "tail"]);
+  });
+});
+
+describe("runRenewThenSweep (DISP1-1: a half-read renewal fault SKIPS the expiry sweep)", () => {
+  test("renew completes + control reloads ⇒ sweep runs", async () => {
+    const seen: string[] = [];
+    await runRenewThenSweep({ renew: () => { seen.push("renew"); return true; }, reload: () => { seen.push("reload"); return true; }, sweep: () => { seen.push("sweep"); } });
+    expect(seen).toEqual(["renew", "reload", "sweep"]);
+  });
+
+  test("renew returns false (a control read faulted) ⇒ NO reload, NO sweep — never escalate a wait we failed to renew", async () => {
+    const seen: string[] = [];
+    await runRenewThenSweep({ renew: () => { seen.push("renew"); return false; }, reload: () => { seen.push("reload"); return true; }, sweep: () => { seen.push("sweep"); } });
+    expect(seen).toEqual(["renew"]); // a clean reload is NOT a substitute for the missed renewal phase
+  });
+
+  test("renew completes but control reload is unreadable ⇒ sweep skipped this tick", async () => {
+    const seen: string[] = [];
+    await runRenewThenSweep({ renew: () => { seen.push("renew"); return true; }, reload: () => { seen.push("reload"); return false; }, sweep: () => { seen.push("sweep"); } });
+    expect(seen).toEqual(["renew", "reload"]);
+  });
+
+  test("an async sweep is awaited", async () => {
+    const seen: string[] = [];
+    await runRenewThenSweep({ renew: () => true, reload: () => true, sweep: async () => { await new Promise((r) => setTimeout(r, 10)); seen.push("sweep-done"); } });
+    expect(seen).toEqual(["sweep-done"]);
   });
 });

@@ -47,6 +47,23 @@ export async function runSweepTick(p: {
   for (let i = 0; i < p.tail.length; i++) await step(`sweep.tail[${i}]`, p.tail[i]!);
 }
 
+/**
+ * DISP1-1 (codex:Work): gate the expiry sweep on a COMPLETE renewal pass. `renew` returns false iff one of the renewal's two
+ * control reads faulted (a HALF-read is unknown, already escalated by the loader) — then the expiry sweep MUST NOT run, else it
+ * would escalate an expired-but-renewable wait whose renewal we failed to apply (the r2 defect: a transient renew-read fault
+ * that then reloaded clean still escalated a wait that should have renewed). `reload` re-reads control for the sweep (false ⇒
+ * unreadable ⇒ skip this tick). The sweep runs ONLY when BOTH the renewal pass completed AND control reloaded. Pure gate —
+ * renew/reload/sweep all injected, so the renew-fault-skips-sweep property is offline-testable. */
+export async function runRenewThenSweep(p: {
+  renew: () => boolean;
+  reload: () => boolean;
+  sweep: () => void | Promise<void>;
+}): Promise<void> {
+  if (!p.renew()) return;   // renewal incomplete (a control read faulted) ⇒ never escalate a wait we failed to renew
+  if (!p.reload()) return;  // control unreadable after renew ⇒ skip the expiry sweep this tick
+  await p.sweep();
+}
+
 export type LoopName = "pass" | "sweep";
 
 export type LoopFns = {

@@ -43,7 +43,7 @@ import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
 import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
 import { validSeedWait } from "../packages/bus/src/swarm/wait-seed.js";
-import { runDispatchLoops, loadControlOrEscalate, runSweepTick } from "../packages/bus/src/swarm/dispatch-loops.js";
+import { runDispatchLoops, loadControlOrEscalate, runSweepTick, runRenewThenSweep } from "../packages/bus/src/swarm/dispatch-loops.js";
 import { writeProjection } from "../packages/bus/src/swarm/projection.js";
 import { beatStart, beatEnd } from "../packages/bus/src/swarm/heartbeat.js";
 import { buildControlCut, heartbeatObservations, currentPlan } from "../packages/bus/src/swarm/liveness-review.js";
@@ -54,7 +54,7 @@ import { observeCandidate, openDelegation, readDelegations, writeDelegations, ty
 import { planGrantEnvelope } from "../packages/bus/src/swarm/board-envelope.js";
 import { scanCompletionSlots, detectWatchEvents, parseCompletionArtifact, readWatchSnapshot, writeWatchSnapshot, ingestLedgerChunk, pruneDeadLetterWindow, consolidatePending, readDeadLetterWatch, writeDeadLetterWatch, routeKeyOf, routingGroupKey, routeKeyOfGroup, routingActiveSignal, type ReadArtifact, type WatchSnapshot, type DeadLetterWatch } from "../packages/bus/src/swarm/delegation-observer.js";
 import { advanceWait, isRenewable } from "../packages/bus/src/swarm/task-wait.js";
-import { subjectProgressSeq, hasFreshSubjectEvidence, renewOperationId, renewalCount } from "../packages/bus/src/swarm/evidence-renewal.js";
+import { renewExpiredLivenessWaits } from "../packages/bus/src/swarm/evidence-renewal.js";
 import { resolveSession, listSessions, makeFileLiveness, pidFileMtimeSec } from "../packages/bus/src/swarm/task-liveness.js";
 import { whois, buildProjection, readIdentityLog, probeTargets, legacyInboxKeys, liveness as busLiveness, type ProbeFact, type ProbeResultKind } from "../packages/bus/src/bus-identity.js";
 import { liveEntities, type WaitRecord } from "../packages/bus/src/swarm/control-log.js";
@@ -1200,7 +1200,7 @@ async function main(): Promise<void> {
 
   // The durable-state observer (L2-struct 2/n, §2b-c/§2c + F25). Two INDEPENDENT fail-soft halves (a failure in one must not
   // block the other — review P2-1): completion-slot discovery + the board/PROGRESS watch. Runs on the sweep loop.
-  const runObserver = (): void => {
+  const runObserverCompletion = (): void => {
     try { // --- completion-slot scan: discover → verify → close production + open consumption ---
       let dreg: DelegationRegistry | null = null;
       try { dreg = readDelegations(DELEGATIONS_FILE); } catch (e) { log(`delegations read failed — skip completion-slot scan: ${e instanceof Error ? e.message : e}`); }
@@ -1230,8 +1230,14 @@ async function main(): Promise<void> {
         }
       }
     } catch (e) { log(`observer completion-slot scan failed: ${e instanceof Error ? e.message : e}`); }
+  };
 
-    try { // --- board/PROGRESS watch (independent half) ---
+  // DISP1-2 (codex:Work): the board/PROGRESS watch is CONTROL-INDEPENDENT (reads its own snapshot + samples board/PROGRESS,
+  // NOT the control log), so it is a SEPARATE function run in the sweep's `independent` group EVERY tick -- a corrupt control
+  // log must never silence it. The completion-slot scan above IS control-dependent (reads/commits the control log) and stays
+  // in the `dependent` group. (Before: both halves in one closure placed wholly in `dependent`, which gated the watch too.)
+  const runObserverWatch = (): void => {
+    try { // --- board/PROGRESS watch (control-INDEPENDENT half) ---
       let snap: WatchSnapshot | null = null;
       try { snap = readWatchSnapshot(OBSERVER_SNAPSHOT_FILE); } catch (e) { log(`watch snapshot read failed — skip watch: ${e instanceof Error ? e.message : e}`); }
       if (snap !== null) {
@@ -1432,45 +1438,20 @@ async function main(): Promise<void> {
   };
 
   // §2c-b evidence renewal (two-clocks). BEFORE the sweep escalates an EXPIRED liveness wait, renew it IF the subject made
-  // progress since it was armed — the owner is alive, so push the PROBE deadline out instead of convicting. Only renewable
-  // (liveness/reminder) waits qualify (isRenewable — f32a0507's single predicate; also guarded inside advanceWait so a
-  // misclassification here can't illegally renew a semantic-deadline wait). Evidence is derived LIVE from the control-log (no
-  // cached counter to drift — F13). Finite FREE renewals (MAX_FREE_RENEWALS) so a forever-progressing job can't re-arm without
-  // bound (§2c-b acceptance ③: "不许无限 re-arm"); past the cap, or with no fresh evidence, the wait stays expired and the
-  // sweep escalates it as before. Fail-soft + per-wait isolated. Runs just before sweepPass so a renewed wait is no longer
-  // expired by the time the sweep evaluates it.
-  const renewLivenessWaits = (): void => {
-    const now = nowSec();
-    // DISP1-1 (codex:Work): these two reads were OUTSIDE the per-wait try/catch, so a read-gap fault (the control log going
-    // corrupt/EACCES AFTER the tick's head load succeeded) threw out of the whole tick — skipping the control-INDEPENDENT tail
-    // with zero escalation. Make BOTH reads fail-soft: on a fault, escalate (deduped) + skip the renew this tick; the caller's
-    // independent run* + tail still run, and a repaired log resumes next tick.
-    let st = loadControlFailSoft("sweep(renew-load)");
-    if (st === null) return;
-    let batches;
-    try { batches = readControlBatches(CONTROL_LOG_DIR); }
-    catch (e) { escalateControlFault("sweep(renew-batches)", e); return; }
-    for (const b of Object.values(liveEntities(st))) {
-      if (b.put !== "wait") continue;
-      const w = (b as Extract<ChangeBody, { put: "wait" }>).wait;
-      if (w.state !== "open" || !isRenewable(w) || w.deadlineSec > now) continue;    // only an EXPIRED open renewable wait (the probe moment)
-      if (renewalCount(batches, w.waitId) >= MAX_FREE_RENEWALS) continue;            // §2c-b ③: finite free renewals ⇒ let the sweep escalate
-      // §2c-b evidence is anchored to the wait's FULL subject, most-specific field first: a binding-anchored wait renews only
-      // on THAT binding's progress (a sibling binding of the same attempt must not, and a bindingId-only subject must not
-      // degrade to job scope — review 4c617fa-E1); an attempt-anchored one only on that attempt's (review ab1bf81-P1#1).
-      const progressSubject = { jobId: w.subject.jobId, attemptId: w.subject.attemptId, bindingId: w.subject.bindingId };
-      if (!hasFreshSubjectEvidence(batches, progressSubject, w.waitId)) continue;    // no subject progress since the arm ⇒ let the sweep escalate
-      const adv = advanceWait(w, { type: "renew", newDeadlineSec: now + RENEW_WINDOW_SEC, nowSec: now });
-      if (!adv.ok) { log(`renew ${w.waitId} rejected by reducer: ${adv.error}`); continue; } // the reducer guard is the authority
-      const progressSeq = subjectProgressSeq(batches, progressSubject);             // idempotent id by the triggering progress (countable, §2c-b ③)
-      const rev = st.revisions[`wait:${w.waitId}`] ?? 0;
-      try {
-        const res = commitChanges(st, [{ put: "wait", wait: adv.wait, operationId: renewOperationId(w.waitId, progressSeq), expectedEntityRevision: rev }]);
-        if (res.result.ok) { st = res.state; log(`renewed liveness wait ${w.waitId} (subject ${w.subject.jobId} progressed @${progressSeq}) +${RENEW_WINDOW_SEC}s`); }
-        else log(`renew ${w.waitId} deferred (${JSON.stringify(res.result)}) — retry next tick`);
-      } catch (e) { log(`renew ${w.waitId} failed (isolated): ${e instanceof Error ? e.message : e}`); }
-    }
-  };
+  // progress since it was armed. The pass itself (eligibility + reducer + commit) and its ATOMIC two-read fail-soft live in the
+  // tested pure core renewExpiredLivenessWaits (evidence-renewal.ts, DISP1-1); this closure only binds the dispatcher's IO.
+  // Returns false iff one of the two control reads faulted (a HALF-read is unknown) so the caller skips the expiry sweep.
+  const renewLivenessWaits = (): boolean =>
+    renewExpiredLivenessWaits({
+      loadState: () => loadControlFailSoft("sweep(renew-load)"),
+      readBatches: () => readControlBatches(CONTROL_LOG_DIR),
+      onBatchesFault: (e) => escalateControlFault("sweep(renew-batches)", e),
+      now: nowSec(),
+      maxFreeRenewals: MAX_FREE_RENEWALS,
+      renewWindowSec: RENEW_WINDOW_SEC,
+      commit: commitChanges,
+      log,
+    }).ok;
 
   // F40 unclaimed-mail sentinel (silent-stall detection). Scan durable inbox dirs (incl. dead-pid orphan claims, F40-3); a box
   // with stranded mail past INBOX_STALL_SEC AND no live session draining it is escalated to the coordinator. The ownership set
@@ -2120,22 +2101,22 @@ async function main(): Promise<void> {
     sweepTick: async () => runSweepTick({
       // control-INDEPENDENT supervision (DISP1-2): these read their OWN sources (inbox dirs, swap/PID records, review/round/
       // placement ledgers), NOT the control log, so they run EVERY tick — a corrupt control log must never silence them.
-      independent: [runInboxSentinel, runSuccessionHeartbeat, runReviewAutoscaleSuggest, runRoundDoctor, runPlacementSuggest],
+      independent: [runInboxSentinel, runSuccessionHeartbeat, runReviewAutoscaleSuggest, runRoundDoctor, runPlacementSuggest, runObserverWatch],
       // fail-soft control load: true iff readable; sets the shared ref; escalates (deduped) on a fault (DISP-1 / DISP1-1).
       loadControl: () => { const s = loadControlFailSoft("sweep"); if (s === null) return false; sweepStateRef.s = s; return true; },
-      // control-DEPENDENT work — runs ONLY when the control log loaded (sweepPass + projection/verdict + observer + dead-letter
-      // + live-sentinel + ops-receipt + approval all read the control log). renewLivenessWaits is itself fail-soft now (DISP1-1).
+      // control-DEPENDENT work — runs ONLY when the control log loaded (sweepPass + projection/verdict + observer completion +
+      // dead-letter + live-sentinel + ops-receipt + approval all read the control log).
       dependent: [
-        async () => {
-          if (SWEEP_ENABLED) {
-            // §2c-b: renew eligible EXPIRED liveness waits BEFORE escalating, then reload so sweepPass sees the fresh deadlines.
-            renewLivenessWaits();
-            const renewed = loadControlFailSoft("sweep(renew)");
-            if (renewed !== null) { sweepStateRef.s = renewed; await sweepPass(sweepOps); }
-          }
-        },
+        // §2c-b: renew eligible EXPIRED liveness waits BEFORE escalating, then reload so sweepPass sees the fresh deadlines. The
+        // renew→sweep GATE is the tested runRenewThenSweep (DISP1-1): a HALF-read fault (renewLivenessWaits ⇒ false) SKIPS the
+        // expiry sweep, so a wait we failed to renew is never escalated; a clean reload after a renew is NOT a substitute.
+        async () => { if (SWEEP_ENABLED) await runRenewThenSweep({
+          renew: renewLivenessWaits,
+          reload: () => { const s = loadControlFailSoft("sweep(renew)"); if (s === null) return false; sweepStateRef.s = s; return true; },
+          sweep: () => sweepPass(sweepOps),
+        }); },
         refreshProjectionAndVerdict, // now-dependent projection + INV-1 verdict refresh (review P2-1)
-        runObserver,                 // L2-struct observer (F22/F25): completion-slot artifacts + board/PROGRESS push
+        runObserverCompletion,       // L2-struct observer (F22/F25) CONTROL-DEPENDENT half: completion-slot artifacts (the board/PROGRESS watch is independent, above)
         runDeadLetterWatch,          // L2-struct 3b (F26): dead-letter bursts ⇒ routing incidents
         runLiveSentinel,             // S14 live member sentinel (blocked ⇒ S19); herdr-gated
         runOpsReceipt,               // F53 ②: ops-receipt verification

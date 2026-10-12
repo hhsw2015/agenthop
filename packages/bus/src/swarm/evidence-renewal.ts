@@ -5,7 +5,8 @@
  * control-log alone (fe0376cd's ruling: derive, never a second durable account that could drift — F13 "state is evidence,
  * not belief"), the two facts the sweep compares: how far the subject has progressed, and when the wait was last armed.
  */
-import type { CommittedBatch } from "./control-log.js";
+import { liveEntities, type Change, type ChangeBody, type CommitResult, type CommittedBatch, type LogState } from "./control-log.js";
+import { advanceWait, isRenewable } from "./task-wait.js";
 
 /** What a wait's renewal is anchored to — the MOST SPECIFIC field present wins (review 4c617fa-E1). A wait that supervises one
  *  BINDING (bindingId set) renews ONLY on THAT binding's progress; one that supervises an ATTEMPT (attemptId, no bindingId)
@@ -100,4 +101,51 @@ export function renewalCount(batches: readonly CommittedBatch[], waitId: string)
     if (c.operationId.startsWith(prefix)) seen.add(c.operationId);     // ...stamped as one of its renewals
   }
   return seen.size;
+}
+
+/**
+ * DISP1-1 (codex:Work): the §2c-b renewal pass itself, extracted from the dispatcher's main() closure so the REAL fault paths
+ * are offline-testable against a real control-store (not just an orchestration stub). Renew every EXPIRED open renewable
+ * liveness wait that has FRESH subject evidence, BEFORE the expiry sweep escalates it. The two control reads are ATOMIC and
+ * fail-soft: a fault in EITHER (`loadState` returns null, or `readBatches` throws) aborts the WHOLE pass and returns
+ * `{ ok: false }` — a HALF-read is UNKNOWN, never a partial renewal. The caller skips the expiry sweep on `ok:false`, so an
+ * expired-but-renewable wait is never escalated on the back of a renewal we failed to apply (the r2 defect: a transient
+ * renew-read fault that then reloaded clean still ran the sweep and escalated a wait that should have renewed). On both reads
+ * good, each eligible wait is renewed via the real reducer (`advanceWait`) + the injected `commit` (persisted), and
+ * `{ ok: true }` is returned. Per-wait isolated; deterministic given (state, batches, now, config). All IO + commit injected. */
+export function renewExpiredLivenessWaits(deps: {
+  loadState: () => LogState | null;                 // fail-soft control load; null ⇒ read#1 fault (already escalated by the loader)
+  readBatches: () => readonly CommittedBatch[];     // may throw ⇒ read#2 fault
+  onBatchesFault: (e: unknown) => void;             // escalate a read#2 fault (deduped by the caller)
+  now: number;
+  maxFreeRenewals: number;
+  renewWindowSec: number;
+  commit: (state: LogState, changes: Change[]) => { state: LogState; result: CommitResult };
+  log: (s: string) => void;
+}): { ok: boolean } {
+  const st0 = deps.loadState();
+  if (st0 === null) return { ok: false };                              // read#1 fault ⇒ atomic abort (unknown) ⇒ caller skips sweep
+  let batches: readonly CommittedBatch[];
+  try { batches = deps.readBatches(); }
+  catch (e) { deps.onBatchesFault(e); return { ok: false }; }          // read#2 fault ⇒ atomic abort (unknown) ⇒ caller skips sweep
+  let st = st0;
+  for (const b of Object.values(liveEntities(st))) {
+    if (b.put !== "wait") continue;
+    const w = (b as Extract<ChangeBody, { put: "wait" }>).wait;
+    if (w.state !== "open" || !isRenewable(w) || w.deadlineSec > deps.now) continue; // only an EXPIRED open renewable wait (the probe moment)
+    if (renewalCount(batches, w.waitId) >= deps.maxFreeRenewals) continue;           // §2c-b ③: finite free renewals ⇒ let the sweep escalate
+    // §2c-b evidence anchored to the wait's FULL subject, most-specific field first (binding > attempt > job — review 4c617fa-E1).
+    const progressSubject = { jobId: w.subject.jobId, attemptId: w.subject.attemptId, bindingId: w.subject.bindingId };
+    if (!hasFreshSubjectEvidence(batches, progressSubject, w.waitId)) continue;      // no subject progress since the arm ⇒ let the sweep escalate
+    const adv = advanceWait(w, { type: "renew", newDeadlineSec: deps.now + deps.renewWindowSec, nowSec: deps.now });
+    if (!adv.ok) { deps.log(`renew ${w.waitId} rejected by reducer: ${adv.error}`); continue; } // the reducer guard is the authority
+    const progressSeq = subjectProgressSeq(batches, progressSubject);               // idempotent id by the triggering progress (countable, §2c-b ③)
+    const rev = st.revisions[`wait:${w.waitId}`] ?? 0;
+    try {
+      const res = deps.commit(st, [{ put: "wait", wait: adv.wait, operationId: renewOperationId(w.waitId, progressSeq), expectedEntityRevision: rev }]);
+      if (res.result.ok) { st = res.state; deps.log(`renewed liveness wait ${w.waitId} (subject ${w.subject.jobId} progressed @${progressSeq}) +${deps.renewWindowSec}s`); }
+      else deps.log(`renew ${w.waitId} deferred (${JSON.stringify(res.result)}) — retry next tick`);
+    } catch (e) { deps.log(`renew ${w.waitId} failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  }
+  return { ok: true };
 }
