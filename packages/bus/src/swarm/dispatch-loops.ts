@@ -48,12 +48,13 @@ export async function runSweepTick(p: {
 }
 
 /**
- * DISP1-1 (codex:Work): gate the expiry sweep on a COMPLETE renewal pass. `renew` returns false iff one of the renewal's two
- * control reads faulted (a HALF-read is unknown, already escalated by the loader) — then the expiry sweep MUST NOT run, else it
- * would escalate an expired-but-renewable wait whose renewal we failed to apply (the r2 defect: a transient renew-read fault
- * that then reloaded clean still escalated a wait that should have renewed). `reload` re-reads control for the sweep (false ⇒
- * unreadable ⇒ skip this tick). The sweep runs ONLY when BOTH the renewal pass completed AND control reloaded. Pure gate —
- * renew/reload/sweep all injected, so the renew-fault-skips-sweep property is offline-testable. */
+ * DISP1-1 (codex:Work): gate the expiry sweep on a COMPLETE renewal pass. `renew` returns false when the renewal pass did NOT
+ * complete — EITHER one of its two control reads faulted (a HALF-read is unknown, already escalated by the loader), OR an
+ * eligible wait we decided to renew did not PERSIST (its commit returned not-ok / was CAS-rejected / threw; DISP1-1 r4). In any
+ * of these the expiry sweep MUST NOT run, else it would escalate an expired-but-renewable wait whose renewal we failed to apply
+ * (the r2 defect: a transient renew-read fault that then reloaded clean still escalated a wait that should have renewed).
+ * `reload` re-reads control for the sweep (false ⇒ unreadable ⇒ skip this tick). The sweep runs ONLY when BOTH the renewal pass
+ * completed AND control reloaded. Pure gate — renew/reload/sweep all injected, so the skip-sweep property is offline-testable. */
 export async function runRenewThenSweep(p: {
   renew: () => boolean;
   reload: () => boolean;
