@@ -311,6 +311,15 @@ export type DeliveryStatus = "published" | "already" | "failed" | "skipped";
 /** FR-8 (r4): a launch attempt's outcome — three states, never conflated. "unknown" (e.g. a timeout) is NOT "failed" (never auto-retried). */
 export type LaunchOutcome = "launched" | "failed" | "unknown";
 
+/** FR-8 (r5): classify a launcher error into a LaunchOutcome. ONLY an EXPLICIT not-started error — the launcher binary could not be
+ *  spawned (ENOENT/EACCES) — is a retryable "failed". A timeout, OR any other post-dispatch error, is indeterminate ⇒ "unknown" (the
+ *  window may have opened; never a blind auto-retry). "sent-but-indeterminate" must never be classed as "definitely not started". Pure. */
+export function classifyLaunchError(err: { code?: string; killed?: boolean; message?: string }): LaunchOutcome {
+  if (err.code === "ETIMEDOUT" || err.killed === true || /time(d)?\s*out/i.test(err.message ?? "")) return "unknown";
+  if (err.code === "ENOENT" || err.code === "EACCES") return "failed"; // the launcher itself could not be spawned ⇒ definitely never dispatched
+  return "unknown";
+}
+
 /** The result of one member's recovery leg. `resolution` is the FR-5 binding; `verdict` the F53 spawn verdict; `breakpoint` the
  *  FR-8 delivery outcome (an unresolved member is never delivered to). */
 export interface MemberRecoveryResult {
@@ -451,12 +460,16 @@ export async function orchestrateRecover(snap: FleetSnapshot, roster: readonly R
   const folded = summarizeOutstanding(withReport);
   let result: RecoveryResult = { ...withReport, outstanding: folded.outstanding, notConfirmed: folded.notConfirmed };
 
-  // 5) FR-8: the durable RECEIPT is part of the completion criteria — a refused write is an outstanding obligation, not a silent exit0.
-  if (!deps.writeReceipt(result)) result = { ...result, outstanding: [...result.outstanding, "receipt:unwritten"] };
-
-  // 6) mark the episode COMPLETE only when NOTHING is outstanding. FR-8 (r4): the FINAL marker write's result is NOT ignored — a
-  //    refused write (CP-3) is itself an outstanding obligation (exit≠0), and the marker stays incomplete so a re-run finishes it.
+  // 5) FR-8 (r5): SETTLE the outstanding set FIRST — mark the episode COMPLETE only when nothing is outstanding. The FINAL marker
+  //    write's result is NOT ignored: a refused write (CP-3) is itself an outstanding obligation (exit≠0), and the marker stays
+  //    incomplete so a re-run finishes it.
   const episodeWritten = deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: result.outstanding.length === 0 });
   if (!episodeWritten) result = { ...result, outstanding: [...result.outstanding, "episode-final:unwritten"] };
+
+  // 6) FR-8 (r5): the durable RECEIPT is written LAST — AFTER the outstanding set is settled (the coordinator ruling: "receipt 写入要在
+  //    outstanding 结清之后"). It therefore reflects the FINAL outstanding (incl. episode-final:unwritten) and can NEVER present
+  //    outstanding:[] while the episode marker is still incomplete. A refused receipt write is itself an outstanding obligation; being
+  //    the last write, a failure leaves NO on-disk receipt falsely claiming completion.
+  if (!deps.writeReceipt(result)) result = { ...result, outstanding: [...result.outstanding, "receipt:unwritten"] };
   return result;
 }

@@ -9,7 +9,7 @@
  * Secret discipline (Q1/FR-2): the env subset is name-allowlisted AND value-credential-scrubbed by the pure filterCaptureEnv; at
  * relaunch the shell merges it OVER the live shell env so profile secrets come from the canonical shell.
  */
-import { mkdirSync, writeFileSync, renameSync, readFileSync, readdirSync, lstatSync, existsSync, readlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readFileSync, readdirSync, lstatSync, existsSync, readlinkSync, openSync, closeSync, writeSync, unlinkSync, fstatSync, constants as fsConstants } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
@@ -321,47 +321,97 @@ function claimLaunchFile(home: string, episodeId: string, memberKey: string): st
 /**
  * FR-8 two-phase launch ownership + FR-9 CP-3. Decide whether to LAUNCH this member now, by the claim file's STATE:
  *   - no claim        ⇒ create it "pending", return true  (launch now; markLaunchOutcome records the result)
- *   - "failed"        ⇒ reset to "pending", return true   (a prior EXPLICIT ok:false ⇒ safe to retry — it definitely didn't start)
- *   - "pending"       ⇒ false  (a claim with no recorded outcome = crash-before-launch-outcome ⇒ UNKNOWN, never a blind double)
+ *   - "failed"        ⇒ reset to "pending", return true   (a prior EXPLICIT not-started ⇒ safe to retry — it definitely didn't start)
+ *   - "pending:<ts>"  ⇒ retry only when STALE (older than grace = a prior run crashed BEFORE attempting the launch); else false
+ *   - "unknown:<ts>"  ⇒ false ALWAYS (launch was SENT, outcome indeterminate ⇒ may be running; FR-8 r5: never a time-based blind retry)
  *   - "launched"      ⇒ false  (launchMember returned ok but not yet bus-visible ⇒ awaiting, never a double)
  *   - unreadable/CP-3 ⇒ false  (fail-closed toward NOT launching)
- * FR-9: the CP-3 guard checks the ACTUAL write leaf (recover-launch/<episode>/), so a symlinked recover-launch ancestor is refused.
+ * FR-9: the CP-3 guard checks the ACTUAL write leaf (recover-launch/<episode>/); the leaf itself is opened O_NOFOLLOW (no symlink).
  */
+// FR-9 (r5): bind IO to the ACTUAL opened object, not a path re-checked then re-opened. A lstat-then-readFileSync/writeFileSync pair is
+// a TOCTOU — the leaf can be swapped to a symlink between the check and the IO, and the subsequent path write follows it out of bounds.
+// O_NOFOLLOW makes the OPEN itself refuse a symlink leaf and returns an fd bound to that inode; every read/write then targets the fd,
+// never the path a second time.
+type ClaimRead = { ok: true; state: string } | { ok: false; reason: "absent" | "refuse" };
+function readClaimNoFollow(file: string): ClaimRead {
+  let fd: number;
+  try { fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { ok: false, reason: "absent" } : { ok: false, reason: "refuse" }; } // ELOOP(symlink)/EACCES ⇒ refuse
+  try { if (!fstatSync(fd).isFile()) return { ok: false, reason: "refuse" }; return { ok: true, state: readFileSync(fd, "utf8").trim() }; }
+  catch { return { ok: false, reason: "refuse" }; }
+  finally { try { closeSync(fd); } catch { /* ignore */ } }
+}
+/** Overwrite an EXISTING claim via an O_NOFOLLOW fd (no O_CREAT ⇒ nothing to overwrite if absent/symlinked). true on success. */
+function overwriteClaimNoFollow(file: string, content: string): boolean {
+  let fd: number;
+  try { fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW, 0o600); } catch { return false; } // ELOOP/absent/EACCES ⇒ refuse
+  try { writeFileSync(fd, content); return true; } catch { return false; }
+  finally { try { closeSync(fd); } catch { /* ignore */ } }
+}
+
 export function claimRecoverLaunch(home: string, memberKey: string, episodeId: string, nowSec: number, graceSec: number): boolean {
   const dir = claimLaunchDir(home, episodeId);
   if (!boundaryOk(home, dir)) return false; // FR-9: guard the real dir chain
   try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return false; }
   const file = claimLaunchFile(home, episodeId, memberKey);
-  // FR-9 (r4): never follow a symlinked claim-file LEAF. lstat (no-follow): a symlink / non-file ⇒ REFUSE (don't read or write through it).
-  let st: ReturnType<typeof lstatSync> | undefined;
-  try { st = lstatSync(file); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return false; }
-  if (st && !st.isFile()) return false;
-  let state: string | null;
-  if (!st) state = null;
-  else { try { state = readFileSync(file, "utf8").trim(); } catch { return false; } } // present-but-unreadable claim ⇒ don't launch
-  if (state === null) { try { writeFileSync(file, `pending:${Math.floor(nowSec)}`, { flag: "wx", mode: 0o600 }); return true; } catch { return false; } } // O_EXCL birth
-  if (state === "failed") { try { writeFileSync(file, `pending:${Math.floor(nowSec)}`, { mode: 0o600 }); return true; } catch { return false; } } // explicit failure ⇒ safe retry
+  const read = readClaimNoFollow(file); // FR-9 (r5): O_NOFOLLOW — a symlinked / unreadable leaf ⇒ refuse (never read or write through it)
+  if (!read.ok && read.reason === "refuse") return false;
+  if (!read.ok) { try { writeFileSync(file, `pending:${Math.floor(nowSec)}`, { flag: "wx", mode: 0o600 }); return true; } catch { return false; } } // O_EXCL birth (also won't follow a symlink)
+  const state = read.state;
+  if (state === "failed") return overwriteClaimNoFollow(file, `pending:${Math.floor(nowSec)}`); // explicit not-started ⇒ safe retry
   if (state.startsWith("pending:")) {
-    // FR-8 (r4) safe recovery for a STALE pending: under the single-flight recover lock there is no concurrent holder, and this member
-    // is ABSENT (the caller only claims absent members), so a pending older than the grace = a prior run that crashed before the launch
-    // outcome AND the member never came up ⇒ safe to retry. A RECENT pending (incl. this run's own) ⇒ unknown, never a blind double.
+    // STALE pending (claim acquired, launch not yet ATTEMPTED): under the single-flight recover lock there is no concurrent holder, and
+    // this member is ABSENT (caller only claims absent members), so a pending older than grace = a prior run that crashed BEFORE the
+    // launch ⇒ safe to retry. A RECENT pending (incl. this run's own) ⇒ never a blind double.
     const ts = Number(state.slice("pending:".length));
-    if (Number.isFinite(ts) && Number.isFinite(nowSec) && nowSec - ts >= graceSec) { try { writeFileSync(file, `pending:${Math.floor(nowSec)}`, { mode: 0o600 }); return true; } catch { return false; } }
+    if (Number.isFinite(ts) && Number.isFinite(nowSec) && nowSec - ts >= graceSec) return overwriteClaimNoFollow(file, `pending:${Math.floor(nowSec)}`);
     return false;
   }
-  return false; // "launched" (awaiting visibility) / anything else ⇒ never double-launch
+  // FR-8 (r5): "unknown:<ts>" (launch SENT, outcome indeterminate) ⇒ NEVER auto-retry — a sent launch may be running; absence + elapsed
+  //   time is NOT proof it did not start (that needs ESRCH evidence of the launched process, which we do not hold). The member stays
+  //   outstanding and is reported to the coordinator for a human decision. "launched" ⇒ never a double; anything else ⇒ refuse.
+  //   (ponytail: safe auto-retry of an unknown needs a verifiable launch identity / idempotent accept token — not age.)
+  return false;
 }
 
-/** FR-8: record the launch outcome so the claim's state reflects reality — ok ⇒ "launched", ok:false ⇒ "failed" (retryable next run).
- *  Fail-soft (a write fault leaves the claim "pending" ⇒ next run treats it as unknown, never a double). */
+/** FR-8 (r5): record the launch outcome so the claim's state reflects reality — "launched" ⇒ done; "failed" (EXPLICIT not-started) ⇒
+ *  retryable; "unknown" (SENT, indeterminate) ⇒ a DISTINCT `unknown:<ts>` marker that claimRecoverLaunch NEVER auto-retries (vs a
+ *  `pending:` pre-launch crash, which it retries after grace). FR-9: the write is through an O_NOFOLLOW fd — never a path re-write that
+ *  could follow a swapped symlink leaf. No O_CREAT ⇒ nothing to mark if the claim is absent/symlinked (fail-soft: prior state stands). */
 export function markLaunchOutcome(home: string, memberKey: string, episodeId: string, outcome: "launched" | "failed" | "unknown"): void {
   if (!boundaryOk(home, claimLaunchDir(home, episodeId))) return;
   const file = claimLaunchFile(home, episodeId, memberKey);
-  try { if (!lstatSync(file).isFile()) return; } catch { return; } // FR-9: don't follow a symlinked leaf; nothing to mark if absent
-  // FR-8 (r4): "launched" ⇒ done; "failed" ⇒ retryable; "unknown" (sent, result indeterminate) ⇒ keep "pending:<now>" (a fresh grace
-  // window so the maybe-started launch can appear; never a blind double).
-  const content = outcome === "launched" ? "launched" : outcome === "failed" ? "failed" : `pending:${Math.floor(Date.now() / 1000)}`;
-  try { writeFileSync(file, content, { mode: 0o600 }); } catch { /* fail-soft: stays pending */ }
+  const content = outcome === "launched" ? "launched" : outcome === "failed" ? "failed" : `unknown:${Math.floor(Date.now() / 1000)}`;
+  overwriteClaimNoFollow(file, content);
+}
+
+/**
+ * FR-6 (r5): a recover-LOCAL single-flight whose lock read is EACCES=HOLD at the ACQUISITION point itself — not a one-shot pre-probe
+ * followed by the shared acquireSingleFlight (which treats a read error as an empty holder and would STEAL a live, unverifiable lock —
+ * the reviewer's TOCTOU: a pre-check succeeds, then the lock becomes unreadable before the shared helper reads it). Here the SAME
+ * O_NOFOLLOW read that gates acquisition HOLDs on ANY unreadable/symlinked lock; only a CONFIRMED-dead (ESRCH) holder is reclaimed; a
+ * live or unverifiable holder ⇒ null (back off). The shared single-flight.ts three-state root-fix is a SEPARATE DISP-3 ticket
+ * (f32a0507); this tightens the recover path now, cross-referenced in review.
+ * (ponytail: the residual 2-racer dead-holder reclaim race is the shared primitive's concern; here single-active is what we establish.)
+ * Returns a release fn (removes the lock only while it still holds OUR pid), or null to HOLD.
+ */
+export function acquireRecoverLock(lockPath: string): (() => void) | null {
+  const release = (): void => { try { const fd = openSync(lockPath, fsConstants.O_RDONLY); try { if (Number(readFileSync(fd, "utf8").trim()) === process.pid) unlinkSync(lockPath); } finally { closeSync(fd); } } catch { /* gone/unreadable ⇒ nothing of ours to remove */ } };
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try { const fd = openSync(lockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600); try { writeSync(fd, String(process.pid)); } finally { closeSync(fd); } return release; } // atomic O_EXCL birth
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") return null; } // a real fs error ⇒ HOLD (don't guess)
+    // the lock EXISTS — read the holder via O_NOFOLLOW; an unreadable/symlinked lock is UNKNOWN ⇒ HOLD (never steal an unverifiable holder)
+    let holderRaw: string;
+    try { const fd = openSync(lockPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); try { holderRaw = readFileSync(fd, "utf8").trim(); } finally { closeSync(fd); } }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; return null; } // vanished ⇒ retry birth; EACCES/ELOOP ⇒ HOLD
+    const pid = Number(holderRaw);
+    if (!Number.isInteger(pid) || pid <= 0) return null; // garbled holder ⇒ don't guess ⇒ HOLD
+    let alive: boolean;
+    try { process.kill(pid, 0); alive = true; } catch (e) { alive = (e as NodeJS.ErrnoException).code === "EPERM"; } // EPERM ⇒ exists; ESRCH ⇒ dead
+    if (alive) return null; // a live (or present-but-unsignalable) holder ⇒ HOLD
+    try { if (readFileSync(lockPath, "utf8").trim() === holderRaw) unlinkSync(lockPath); } catch { /* changed/gone ⇒ retry birth */ } // reclaim ONLY the exact CONFIRMED-dead lock
+  }
+  return null; // lost the reclaim race repeatedly ⇒ HOLD rather than risk two recovers
 }
 
 // --- recovery receipt projection ------------------------------------------------------------------------------------

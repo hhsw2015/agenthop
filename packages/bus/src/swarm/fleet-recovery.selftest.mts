@@ -4,19 +4,20 @@
 //  FR-1a execArgv captured · FR-1b scrub keeps the SSH user · FR-5 identity triple (title alone ≠ identity) · FR-7 reuse-incomplete
 //  (any age) + unreadable-abort · FR-8 claim≠launch two-phase + report-with-real-results + receipt-in-completion · FR-9 claim leaf
 //  CP-3 · FR-10 boardItemId join + inbox three-state. Plus the 3 zero-bug fixture classes over the write faces.
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, existsSync, rmSync, chmodSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   FLEET_SNAPSHOT_SCHEMA, scrubValueSecrets, parseDispatcherRecipe, parseFleetSnapshot, snapshotStaleSec,
   dispatcherNeedsRelaunch, dispatcherVerdict, memberVerdict, resolveMemberSid, resolveEpisode, buildBreakpointText,
-  grantedItemsForMember, deliveryDischarged, summarizeOutstanding, orchestrateRecover,
+  grantedItemsForMember, deliveryDischarged, summarizeOutstanding, orchestrateRecover, classifyLaunchError,
   type FleetSnapshot, type DispatcherRecipe, type RecoverDeps, type RecoveryEpisode, type EpisodeRead, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus, type DispatcherLiveness, type RecoveryResult, type LaunchOutcome,
 } from "./fleet-recovery.js";
 import {
   writeFleetSnapshot, readFleetSnapshot, recordDispatcherRecipe, readDispatcherRecipe, writeEpisode, readEpisode,
   claimRecoverLaunch, markLaunchOutcome, liveAttemptsForItems, breakpointFactsFor, writeRecoveryReceipt, readRecoveryReceipt, FLEET_RECEIPT_SCHEMA,
+  acquireRecoverLock,
 } from "./fleet-recovery-store.js";
 import { boardItemId } from "./task-board.js";
 import { attemptIdOf, type TaskAttempt } from "./task-state.js";
@@ -95,18 +96,22 @@ try {
     t("FR-8: deliverReport got the REAL result (notConfirmed>0), not a zeroed placeholder", h.state.reportArg !== null && h.state.reportArg.notConfirmed >= 2 && h.state.reportArg.outstanding.length >= 2);
     t("FR-8: final result not falsely 'all confirmed'", r.notConfirmed >= 2 && r.outstanding.some((o) => o.startsWith("dispatcher:")));
   }
-  // FR-8 receipt-in-completion: writeReceipt false ⇒ outstanding gains receipt:unwritten + episode NOT completed
+  // FR-8 receipt-in-completion: writeReceipt false ⇒ outstanding gains receipt:unwritten
   {
     const h = makeHarness({ peersAfter: [{ stableId: "m1", title: "Work-m1", tool: "claude", cwd: "/r1" }], writeReceiptOk: false });
     const r = await orchestrateRecover(goodSnap, roster, h.deps);
     t("FR-8: receipt write refused ⇒ 'receipt:unwritten' outstanding", r.outstanding.includes("receipt:unwritten"));
-    t("FR-8: episode NOT marked completed when receipt unwritten", h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === false);
+    // FR-8 (r5): the receipt is written LAST (after the episode marker settles outstanding). A confirmed member + a written episode ⇒
+    // the marker IS completed; only the diagnostic receipt write failed (surfaced via the outstanding obligation / exit≠0).
+    t("FR-8 r5: episode marker written (completed) before the receipt; a receipt-write failure never falsifies the marker", h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === true);
   }
-  // FR-8 r4 seam3: the FINAL writeEpisode failing (start ok) ⇒ 'episode-final:unwritten' outstanding (return value NOT ignored)
+  // FR-8 r5 seam3 + facet-3: the FINAL writeEpisode failing ⇒ 'episode-final:unwritten' outstanding AND the durable receipt (written
+  // AFTER the episode marker) reflects that settled outstanding — it can NEVER claim outstanding:[] while the marker is incomplete.
   {
     const h = makeHarness({ peersAfter: [{ stableId: "m1", title: "Work-m1", tool: "claude", cwd: "/r1" }], failWriteEpisodeAfter: 1 });
     const r = await orchestrateRecover(goodSnap, roster, h.deps);
     t("FR-8 seam3: final writeEpisode false ⇒ 'episode-final:unwritten' outstanding (exit≠0)", r.outstanding.includes("episode-final:unwritten"));
+    t("FR-8 r5 facet-3: the receipt reflects the final outstanding (episode-final:unwritten), never a false zero", h.state.receiptArg !== null && h.state.receiptArg.outstanding.includes("episode-final:unwritten"));
   }
   // FR-8 r4: an 'unknown' launch outcome is recorded as unknown (not failed) ⇒ never a blind retry
   {
@@ -151,6 +156,11 @@ try {
     t("happy: all confirmed ⇒ 0 outstanding + episode completed", r.outstanding.length === 0 && h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === true);
   }
 
+  // FR-8 (r5) facet-2: classifyLaunchError — only an EXPLICIT not-started (ENOENT/EACCES) ⇒ "failed"; timeout OR any other error ⇒ "unknown"
+  t("FR-8 r5: classifyLaunchError timeout/killed/text ⇒ unknown", classifyLaunchError({ code: "ETIMEDOUT" }) === "unknown" && classifyLaunchError({ killed: true }) === "unknown" && classifyLaunchError({ message: "timed out" }) === "unknown");
+  t("FR-8 r5: classifyLaunchError ENOENT/EACCES ⇒ failed (explicit not-started)", classifyLaunchError({ code: "ENOENT" }) === "failed" && classifyLaunchError({ code: "EACCES" }) === "failed");
+  t("FR-8 r5: classifyLaunchError other non-timeout reply error ⇒ unknown (sent, indeterminate)", classifyLaunchError({ code: "1", message: "Connection is invalid. (-609)" }) === "unknown" && classifyLaunchError({ message: "boom" }) === "unknown");
+
   // ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
   // STORE (real FS): FR-1a execArgv · FR-7 readEpisode three-state · FR-8 claim two-phase · FR-9 claim leaf CP-3 · FR-10
   // ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -178,11 +188,14 @@ try {
     t("FR-8 claim: launched ⇒ false (awaiting visibility, no double)", claimRecoverLaunch(h, "m", "ep", 1000, 300) === false);
     claimRecoverLaunch(h, "m2", "ep", 1000, 300); markLaunchOutcome(h, "m2", "ep", "failed");
     t("FR-8 claim: failed ⇒ true (explicit not-started ⇒ safe retry)", claimRecoverLaunch(h, "m2", "ep", 1000, 300) === true);
-    // FR-8 r4: a STALE pending (older than grace) ⇒ safe retry; an UNKNOWN outcome keeps it pending (fresh grace) ⇒ no immediate double
+    // FR-8: a STALE pending (claim acquired, launch not attempted, older than grace) ⇒ safe retry.
     claimRecoverLaunch(h, "m3", "ep", 1000, 300); // pending:1000
     t("FR-8 claim: stale pending (> grace) ⇒ true (safe retry)", claimRecoverLaunch(h, "m3", "ep", 1000 + 301, 300) === true);
-    claimRecoverLaunch(h, "m4", "ep", 2000, 300); markLaunchOutcome(h, "m4", "ep", "unknown"); // unknown ⇒ pending:<now>
-    t("FR-8 claim: unknown outcome ⇒ recent pending ⇒ false (no double)", claimRecoverLaunch(h, "m4", "ep", 2000, 300) === false);
+    // FR-8 (r5) facet-1: an UNKNOWN outcome (launch SENT, indeterminate) is a DISTINCT `unknown:<ts>` marker — NEVER auto-retried, even
+    // long after grace (that would need ESRCH proof of the launched process, not elapsed time). This is the r4 regression.
+    claimRecoverLaunch(h, "m4", "ep", 2000, 300); markLaunchOutcome(h, "m4", "ep", "unknown"); // unknown:<now>
+    t("FR-8 r5: unknown outcome ⇒ false immediately (no double)", claimRecoverLaunch(h, "m4", "ep", 2000, 300) === false);
+    t("FR-8 r5: unknown outcome ⇒ NEVER auto-retried, even far past grace", claimRecoverLaunch(h, "m4", "ep", 2000 + 100000, 300) === false);
   }
   {
     // FR-9: a symlinked recover-launch DIR ⇒ claim refused + no escape
@@ -203,6 +216,35 @@ try {
     symlinkSync(target, leaf);
     t("FR-9 r4: symlinked claim-file leaf ⇒ claimRecoverLaunch refused (no follow)", claimRecoverLaunch(h, "mX", ep, 1000, 300) === false);
     t("FR-9 r4: the symlink target is NOT overwritten through the leaf", readFileSync(target, "utf8") === "failed");
+    // FR-9 (r5): markLaunchOutcome writes through an O_NOFOLLOW fd too ⇒ it must not overwrite the target through the symlinked leaf.
+    markLaunchOutcome(h, "mX", ep, "launched");
+    t("FR-9 r5: markLaunchOutcome does NOT overwrite the symlink target through the leaf", readFileSync(target, "utf8") === "failed");
+  }
+  // FR-6 (r5): recover-LOCAL single-flight — EACCES=HOLD at the acquisition read; reclaim ONLY a confirmed-dead holder; no symlink follow
+  {
+    const h = freshHome(); mkdirSync(swarm(h), { recursive: true });
+    const lock = path.join(swarm(h), "recover.lock");
+    const rel = acquireRecoverLock(lock);
+    t("FR-6: birth on empty ⇒ acquired, holds our pid", rel !== null && readFileSync(lock, "utf8").trim() === String(process.pid));
+    t("FR-6: a LIVE holder (our own pid) ⇒ second acquire HOLDs (null)", acquireRecoverLock(lock) === null);
+    rel!();
+    t("FR-6: release removes our lock ⇒ re-acquire succeeds", !existsSync(lock) && (() => { const r2 = acquireRecoverLock(lock); const ok = r2 !== null; if (r2) r2(); return ok; })());
+    writeFileSync(lock, "999999", { mode: 0o600 }); chmodSync(lock, 0o000);
+    t("FR-6: an UNREADABLE (EACCES) lock ⇒ HOLD (null), never stolen", acquireRecoverLock(lock) === null);
+    chmodSync(lock, 0o600);
+    writeFileSync(lock, "999999", { mode: 0o600 }); // a pid out of range ⇒ not a live holder
+    const rel2 = acquireRecoverLock(lock);
+    t("FR-6: a CONFIRMED-dead holder ⇒ reclaimed ⇒ acquired (holds our pid)", rel2 !== null && readFileSync(lock, "utf8").trim() === String(process.pid));
+    if (rel2) rel2();
+    writeFileSync(lock, "not-a-pid", { mode: 0o600 });
+    t("FR-6: a garbled holder ⇒ HOLD (null)", acquireRecoverLock(lock) === null);
+  }
+  {
+    const h = freshHome(); mkdirSync(swarm(h), { recursive: true });
+    const lock = path.join(swarm(h), "recover.lock");
+    const ext = mkdtempSync(path.join(scratch, "ext-lock-")); const tgt = path.join(ext, "outside"); writeFileSync(tgt, "999999");
+    symlinkSync(tgt, lock);
+    t("FR-6: a symlinked lock leaf ⇒ HOLD (null, O_NOFOLLOW refuses)", acquireRecoverLock(lock) === null);
   }
   // FR-10: boardItemId join (granted itemId = boardItemId(jobId,nodeId), attempt has raw nodeId)
   {

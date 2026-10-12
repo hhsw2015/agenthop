@@ -26,15 +26,14 @@ import { buildAppleScript } from "../packages/bus/src/spawn.js";
 import { herdrAgentName, herdrAgentStates, herdrLaunch, herdrServerReachable, herdrSpawnable, splitCommand } from "../packages/bus/src/swarm/herdr.js";
 import { parseSnapshot, planResume, resumeCommandForMember, type RosterMember, type PeerLike } from "../packages/bus/src/swarm/resume.js";
 import {
-  orchestrateRecover, snapshotStaleSec, breakpointInjectionEnabled, dispatcherNeedsRelaunch,
+  orchestrateRecover, snapshotStaleSec, breakpointInjectionEnabled, dispatcherNeedsRelaunch, classifyLaunchError,
   type RecoverDeps, type RecoveryResult, type DispatcherRecipe, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus, type LaunchOutcome,
 } from "../packages/bus/src/swarm/fleet-recovery.js";
 import {
   captureDispatcherRecipe, dispatcherLive, dispatcherPid, heartbeatFreshSec, captureEnvForPid,
   writeFleetSnapshot, readFleetSnapshot, readEpisode, writeEpisode, claimRecoverLaunch, markLaunchOutcome, breakpointFactsFor,
-  writeRecoveryReceipt,
+  writeRecoveryReceipt, acquireRecoverLock,
 } from "../packages/bus/src/swarm/fleet-recovery-store.js";
-import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
 
 const pexec = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -64,12 +63,12 @@ async function launchOneMember(full: RosterMember, useHerdr: boolean, taken: Set
     log(`  launched ${full.title ?? full.member} ${full.cwd}`);
     return { outcome: "launched" };
   } catch (e) {
-    // FR-8 (r4): distinguish a TIMEOUT (the launch may have STARTED ⇒ "unknown", never a retry-double) from a definite spawn failure
-    // (ENOENT/command-not-found ⇒ "failed", safe to retry). osascript/pexec timeout surfaces as ETIMEDOUT / killed.
+    // FR-8 (r5): classifyLaunchError (pure core) — only an EXPLICIT not-started error (ENOENT/EACCES: the launcher binary could not be
+    // spawned) is a retryable "failed"; a timeout or any other post-dispatch error is indeterminate ⇒ "unknown" (never a blind retry).
     const err = e as NodeJS.ErrnoException & { killed?: boolean };
-    const timedOut = err.code === "ETIMEDOUT" || err.killed === true || /time(d)?\s*out/i.test(err.message ?? "");
-    log(`  launch ${timedOut ? "UNKNOWN (timeout, may have started)" : "FAILED"} ${full.title ?? full.member}: ${err.message}`);
-    return { outcome: timedOut ? "unknown" : "failed", error: err.message };
+    const outcome = classifyLaunchError(err);
+    log(`  launch ${outcome === "failed" ? "FAILED (not started)" : "UNKNOWN (sent, result indeterminate)"} ${full.title ?? full.member}: ${err.message}`);
+    return { outcome, error: err.message };
   }
 }
 
@@ -136,15 +135,12 @@ async function main(): Promise<void> {
   }
 
   // --- wire real deps + run the orchestration -----------------------------------------------------------------------
-  // FR-6: serialize recover with a single-flight lock — a SECOND concurrent recover exits cleanly, so two processes can never mint
-  // rival episodes and double-launch the same member (episode identity is established single-threaded under this lock).
+  // FR-6: serialize recover with a recover-LOCAL single-flight lock — a SECOND concurrent recover exits cleanly, so two processes can
+  // never mint rival episodes and double-launch the same member (episode identity is established single-threaded under this lock).
   const lockPath = path.join(H, ".agenthop", "swarm", "recover.lock");
-  // FR-6 (r4): an EXISTING lock that is UNREADABLE (EACCES) is UNKNOWN, not a free slot — HOLD. (single-flight treats a read error as
-  // an empty holder and would steal from a live, unverifiable holder; only a CONFIRMED-dead holder may be reclaimed.) ENOENT/readable ⇒ proceed.
-  try { readFileSync(lockPath, "utf8"); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") { log(`recover: lock ${lockPath} is unreadable (${(e as Error).message}) — HOLDING (cannot verify the holder is dead).`); return; } }
-  const releaseLock = acquireSingleFlight(lockPath);
-  if (!releaseLock) { log(`recover: another recover is already running (single-flight) — exiting.`); return; }
+  mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  const releaseLock = acquireRecoverLock(lockPath);
+  if (!releaseLock) { log(`recover: another recover holds the lock, or the lock is unreadable/unverifiable — HOLDING (exiting).`); return; }
 
   const core = startBusCore({ home: H });
   await sleep(1200); // let the broker/relay announce before the first peer read
