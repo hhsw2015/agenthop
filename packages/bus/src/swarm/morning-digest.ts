@@ -5,26 +5,32 @@
 
 import { flagDefaultOn } from "./flag-default.js";
 
-/** Already-gathered, already-user-facing source lines (pointers/summaries, never inlined artifacts — S18). All optional; an
- *  empty digest is a valid "quiet night". */
+/** Already-gathered, already-user-facing source lines (pointers/summaries, never inlined artifacts — S18). The four buckets are
+ *  the ACCEPTANCE-BRIEFING form of the north star "晚上交代、早上验收" (hand off at night, accept in the morning): each bucket is
+ *  what the user DOES in the morning, not a running-log excerpt. All optional; an empty digest is a valid "quiet night".
+ *    awaitingRuling 待你拍板 — decision-batch items awaiting the user's ruling (authoritative: the console decisions mirror).
+ *    anomalies      异常     — anything that needs the user's eye (blocked / stuck / sentinel S19 / a corrupt source).
+ *    awaitingTest   待你验收 — landed work awaiting the user's own real-test (e.g. a mod / swarm keypress).
+ *    doneOvernight  昨夜完成 — signed-off / landed deliverables (a SHA + one plain sentence). */
 export type DigestSources = {
-  clearedReviews?: readonly string[];   // reviews that reached 0-remain overnight
-  shipped?: readonly string[];          // deliverables sent / merged
-  pending?: readonly string[];          // still awaiting a verdict / a user decision
-  alerts?: readonly string[];           // anything that needs the user's eye (blocked, deadlines)
+  awaitingRuling?: readonly string[];
+  anomalies?: readonly string[];
+  awaitingTest?: readonly string[];
+  doneOvernight?: readonly string[];
 };
 
 const section = (title: string, lines: readonly string[] | undefined): string[] =>
   lines && lines.length > 0 ? [`${title}:`, ...lines.map((l) => `  - ${l}`)] : [];
 
 /** Compose the morning brief. `dateStr` is the caller's already-formatted local date (pure: no clock/locale here). A night
- *  with nothing to report yields an explicit "quiet night" line, never an empty message. Alerts lead (they need the eye). */
+ *  with nothing to report yields an explicit "quiet night" line, never an empty message. ACTION-NEEDED leads (待你拍板 then 异常
+ *  — the two the user must act on), then 待你验收, then 昨夜完成 (completed, FYI). */
 export function composeDigest(sources: DigestSources, dateStr: string): string {
   const body = [
-    ...section("needs you", sources.alerts),
-    ...section("cleared", sources.clearedReviews),
-    ...section("shipped", sources.shipped),
-    ...section("still pending", sources.pending),
+    ...section("待你拍板", sources.awaitingRuling),
+    ...section("异常", sources.anomalies),
+    ...section("待你验收", sources.awaitingTest),
+    ...section("昨夜完成", sources.doneOvernight),
   ];
   const head = `morning brief — ${dateStr}`;
   return body.length === 0 ? `${head}\n(quiet night — nothing to report)` : [head, ...body].join("\n");
@@ -40,10 +46,10 @@ export type DigestProjection = { schema: "morning-digest/v1"; date: string; gene
  *  (floored; non-finite ⇒ 0). Pure. */
 export function digestProjection(sources: DigestSources, dateStr: string, generatedAtSec: number): DigestProjection {
   const groups: readonly [string, readonly string[] | undefined][] = [
-    ["needs you", sources.alerts],
-    ["cleared", sources.clearedReviews],
-    ["shipped", sources.shipped],
-    ["still pending", sources.pending],
+    ["待你拍板", sources.awaitingRuling],
+    ["异常", sources.anomalies],
+    ["待你验收", sources.awaitingTest],
+    ["昨夜完成", sources.doneOvernight],
   ];
   const sections: DigestSection[] = [];
   for (const [title, lines] of groups) if (lines && lines.length > 0) sections.push({ title, lines: [...lines] });

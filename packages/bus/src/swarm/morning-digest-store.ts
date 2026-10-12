@@ -3,7 +3,7 @@
 // marker (separate obligation from the projection, MD-P2-1), and classifies the four projection read states (MD-P2-4). Fail-soft:
 // a source READ ERROR is reported as "unknown" (never a false quiet night, MD-P2-2); the pure composition lives in morning-digest.ts.
 
-import { mkdirSync, writeFileSync, renameSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readFileSync, readdirSync, existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { digestProjection, type DigestSources, type ProjState, type NotifyState, type DigestProjection } from "./morning-digest.js";
@@ -99,32 +99,79 @@ export function archiveLegacyMigration(home: string, dateStr: string): boolean {
   return atomicWriteJson(file, { schema: "morning-digest-migration/v1", date: dateStr, archivedAtSec: Math.floor(Date.now() / 1000), reason: "legacy date-only notify marker superseded by a newer day; pre-credential delivery is unconfirmable — migrate manually, never auto-resend" });
 }
 
-/** Gather the digest sources, fail-soft. PROGRESS.md is the coordinator's narrative projection of the control log + reviews (the
- *  three dispatch-named sources converge there), so one BOUNDED tail read classifies the night's bullet lines by marker. Returns
- *  null on a READ ERROR other than ENOENT (MD-P2-2: an unreadable source is UNKNOWN — the caller must not publish a false quiet
- *  night); ENOENT (no PROGRESS yet) ⇒ a genuinely empty gather (a valid quiet night). Classification is NEGATION-AWARE
- *  (MD-P2-3): pending/awaiting markers (待签 / 尚未 / 未签 / 送审 / 待复审 / 待审 / a NON-zero REMAIN) are matched BEFORE the
- *  cleared markers, so "待签收 … 2 REMAIN" and "尚未签收 … 待复审" stay pending. Only bullet lines (pointers, S18), each clipped. */
+const clip = (s: string): string => (s.length > 160 ? `${s.slice(0, 160)}…` : s);
+
+// --- ③ 待你拍板: the authoritative console decisions mirror (console-decisions/v1) — a STRUCTURED source, not a PROGRESS grep. ----
+const DECISIONS_SCHEMA = "console-decisions/v1";
+
+/** Minimal fail-soft guard: pull the awaiting-ruling item lines from one console-decisions/v1 mirror (schema + batch.items[] with a
+ *  non-empty summary). Returns null if the file is not a well-formed mirror — the caller surfaces that as an ANOMALY (a corrupt
+ *  ruling batch must be VISIBLE, never silently dropped: a missed ruling is the worst failure for an acceptance brief). Pure. */
+function mirrorItemLines(parsed: unknown): string[] | null {
+  if (!isObj(parsed) || parsed.schema !== DECISIONS_SCHEMA || !isObj(parsed.batch)) return null;
+  const items = (parsed.batch as Record<string, unknown>).items;
+  if (!Array.isArray(items)) return null;
+  const out: string[] = [];
+  for (const it of items) {
+    if (!isObj(it) || typeof it.summary !== "string" || it.summary.length === 0) return null;
+    const action = typeof it.suggestedAction === "string" && it.suggestedAction.length > 0 ? ` → ${it.suggestedAction}` : "";
+    const gate = it.hardGate === true ? " [hard-gate]" : "";
+    out.push(`${it.summary}${gate}${action}`);
+  }
+  return out;
+}
+
+/** Gather 待你拍板 + any corrupt-batch anomalies from the console decisions dir. Returns null ONLY when the dir EXISTS but cannot be
+ *  enumerated (a read fault ⇒ unknown, MD-P2-2 — cannot assert "no rulings pending"). ENOENT ⇒ the line is not producing yet ⇒
+ *  empty. A single unreadable/corrupt batch FILE is surfaced as an anomaly (visible, non-blocking), never silently dropped. */
+function gatherDecisions(home: string, perGroup: number): { rulings: string[]; anomalies: string[] } | null {
+  const dir = path.join(home, ".agenthop", "swarm", "console", "decisions");
+  let names: string[];
+  try { names = readdirSync(dir).filter((n) => n.endsWith(".json")).sort(); }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { rulings: [], anomalies: [] } : null; }
+  const rulings: string[] = [], anomalies: string[] = [];
+  for (const n of names) {
+    if (rulings.length >= perGroup) break;
+    let lines: string[] | null;
+    try { lines = mirrorItemLines(JSON.parse(readFileSync(path.join(dir, n), "utf8"))); }
+    catch { lines = null; } // a read/parse fault on one batch
+    if (lines === null) { if (anomalies.length < perGroup) anomalies.push(clip(`决策批 ${n.replace(/\.json$/, "")} 不可读/损坏 — 待你拍板可能漏项`)); continue; }
+    for (const l of lines) { if (rulings.length >= perGroup) break; rulings.push(clip(l)); }
+  }
+  return { rulings, anomalies };
+}
+
+/** Gather the digest sources as an ACCEPTANCE BRIEFING (验收简报化), fail-soft. Two source classes:
+ *  ③ 待你拍板 — the AUTHORITATIVE console decisions mirror (structured read, not a grep).
+ *  ①④② — the PROGRESS.md narrative tail (the control-log + reviews converge there; the idle-explainer schema is not frozen yet, so
+ *        its anomalies ride the ⚠/卡/哨兵 markers for now — 先接可得源). Each tail bullet is bucketed into exactly ONE acceptance
+ *        category; a line matching NONE is DROPPED (⑤ pure running-log noise — incl. inter-agent in-flight review like 待复审/送审,
+ *        which is not a USER acceptance item). 待你拍板 comes ONLY from the structured mirror, never from a PROGRESS 待裁 grep.
+ *  Returns null on a READ ERROR other than ENOENT (MD-P2-2: an unreadable source is UNKNOWN — never a false quiet night): a
+ *  decisions-dir enumerate fault, or a PROGRESS read fault. ENOENT of either ⇒ that source simply contributes nothing. */
 export function gatherDigestSources(home: string, tailLines = 80, perGroup = 8): DigestSources | null {
+  const dec = gatherDecisions(home, perGroup);
+  if (dec === null) return null; // MD-P2-2: cannot enumerate the authoritative rulings source ⇒ unknown
   let raw: string;
   try { raw = readFileSync(path.join(home, ".agenthop", "swarm", "PROGRESS.md"), "utf8"); }
-  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { alerts: [], clearedReviews: [], shipped: [], pending: [] } : null; }
-  const alerts: string[] = [], clearedReviews: string[] = [], shipped: string[] = [], pending: string[] = [];
-  const all = raw.split("\n");
-  // MD-P2-3: match ALL awaiting forms (待办 / 待裁 / 待处理 / 待签 / 待复审 / 待审 …, i.e. any 待X) + 尚未 / 未签 / 送审 / a NON-zero
-  // REMAIN. Checked BEFORE the cleared markers so "待签收 … 2 REMAIN" / "尚未签收 … 待复审" stay pending — while a positive sign-off
-  // (✅ / 0 REMAIN / 已签收, none of which carry 待/尚未) still clears.
-  const pendingRe = /待|尚未|未签|送审|候审|候签|\bpending\b|[1-9]\d*\s*remain/i;
-  for (const line of all.slice(Math.max(0, all.length - tailLines))) {
+  catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { awaitingRuling: dec.rulings, anomalies: dec.anomalies, awaitingTest: [], doneOvernight: [] };
+    return null; // PROGRESS read fault ⇒ unknown
+  }
+  const anomalies: string[] = [...dec.anomalies], awaitingTest: string[] = [], doneOvernight: string[] = [];
+  // In-flight markers (待X / 尚未 / 未签 / 送审 / a NON-zero REMAIN): a line carrying one is NOT "done" — keeps "待签收 … 2 REMAIN"
+  // out of 昨夜完成 (MD-P2-3 negation-awareness). Such inter-agent in-flight review is not a user acceptance item ⇒ it DROPS (⑤).
+  const inflightRe = /待|尚未|未签|送审|候审|候签|\bpending\b|[1-9]\d*\s*remain/i;
+  for (const line of raw.split("\n").slice(-tailLines)) {
     const t = line.trim();
-    if (!t.startsWith("- ") && !t.startsWith("* ")) continue; // bullet lines only
+    if (!t.startsWith("- ") && !t.startsWith("* ")) continue; // bullet lines only (pointers, S18)
     const body = t.slice(2).trim();
     if (body.length === 0) continue;
-    const brief = body.length > 160 ? `${body.slice(0, 160)}…` : body;
-    if (/⚠|blocked|卡点|卡死|deadline|超时/i.test(body)) { if (alerts.length < perGroup) alerts.push(brief); }
-    else if (pendingRe.test(body)) { if (pending.length < perGroup) pending.push(brief); } // PENDING before cleared (MD-P2-3)
-    else if (/✅|cleared|已签收|签收|\b0\s*remain\b/i.test(body)) { if (clearedReviews.length < perGroup) clearedReviews.push(brief); }
-    else if (/已并|merged|交付|装机|\bdone\b/i.test(body)) { if (shipped.length < perGroup) shipped.push(brief); }
+    const brief = clip(body);
+    if (/⚠|blocked|卡点|卡死|卡住|deadline|超时|哨兵|sentinel|异常/i.test(body)) { if (anomalies.length < perGroup) anomalies.push(brief); }                       // ④ 异常
+    else if (/待验收|待实测|待你测|待实机|待自测|待体验|needs?-?test/i.test(body)) { if (awaitingTest.length < perGroup) awaitingTest.push(brief); }                // ② 待你验收 (user real-test)
+    else if (/✅|已签收|已并|merged|装机|landed|\b0\s*remain\b/i.test(body) && !inflightRe.test(body)) { if (doneOvernight.length < perGroup) doneOvernight.push(brief); } // ① 昨夜完成 (sign-off/landed; the SHA rides the line)
+    // ⑤ else: pure running-log noise ⇒ DROPPED.
   }
-  return { alerts, clearedReviews, shipped, pending };
+  return { awaitingRuling: dec.rulings, anomalies, awaitingTest, doneOvernight };
 }
