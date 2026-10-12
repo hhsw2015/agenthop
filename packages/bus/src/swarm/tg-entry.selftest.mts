@@ -83,9 +83,9 @@ const hard: DecisionItem = { id: "n2", kind: "spend", summary: "pay $40 invoice"
 // --- composeDigest ---
 {
   t("quiet night -> explicit", composeDigest({}, "2026-10-09").includes("quiet night"));
-  const dg = composeDigest({ alerts: ["x blocked"], clearedReviews: ["BA9"], shipped: ["fanout r12"] }, "2026-10-09");
-  t("alerts lead", dg.indexOf("needs you") < dg.indexOf("cleared"));
-  t("includes a cleared review", dg.includes("BA9"));
+  const dg = composeDigest({ awaitingRuling: ["BA9"], anomalies: ["x blocked"], recentDone: ["fanout r12"] }, "2026-10-09");
+  t("待你拍板 leads 异常 (action-first order)", dg.indexOf("待你拍板") < dg.indexOf("异常"));
+  t("includes an awaiting-ruling item", dg.includes("BA9"));
 }
 
 // --- the enforced decision still validates at the ledger boundary ---

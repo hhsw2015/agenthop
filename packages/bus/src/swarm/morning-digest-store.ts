@@ -3,10 +3,12 @@
 // marker (separate obligation from the projection, MD-P2-1), and classifies the four projection read states (MD-P2-4). Fail-soft:
 // a source READ ERROR is reported as "unknown" (never a false quiet night, MD-P2-2); the pure composition lives in morning-digest.ts.
 
-import { mkdirSync, writeFileSync, renameSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readFileSync, lstatSync, existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { digestProjection, type DigestSources, type ProjState, type NotifyState, type DigestProjection } from "./morning-digest.js";
+import { listBatchesStrict, readBatch } from "./decision-batch-store.js";
+import type { DecisionItem } from "./decision-batch.js";
 
 function digestDir(home: string): string { return path.join(home, ".agenthop", "console", "morning-digest"); }
 function digestPath(home: string): string { return path.join(digestDir(home), "digest.json"); }
@@ -99,32 +101,124 @@ export function archiveLegacyMigration(home: string, dateStr: string): boolean {
   return atomicWriteJson(file, { schema: "morning-digest-migration/v1", date: dateStr, archivedAtSec: Math.floor(Date.now() / 1000), reason: "legacy date-only notify marker superseded by a newer day; pre-credential delivery is unconfirmable — migrate manually, never auto-resend" });
 }
 
-/** Gather the digest sources, fail-soft. PROGRESS.md is the coordinator's narrative projection of the control log + reviews (the
- *  three dispatch-named sources converge there), so one BOUNDED tail read classifies the night's bullet lines by marker. Returns
- *  null on a READ ERROR other than ENOENT (MD-P2-2: an unreadable source is UNKNOWN — the caller must not publish a false quiet
- *  night); ENOENT (no PROGRESS yet) ⇒ a genuinely empty gather (a valid quiet night). Classification is NEGATION-AWARE
- *  (MD-P2-3): pending/awaiting markers (待签 / 尚未 / 未签 / 送审 / 待复审 / 待审 / a NON-zero REMAIN) are matched BEFORE the
- *  cleared markers, so "待签收 … 2 REMAIN" and "尚未签收 … 待复审" stay pending. Only bullet lines (pointers, S18), each clipped. */
+const clip = (s: string, max = 160): string => (s.length > max ? `${s.slice(0, max)}…` : s);
+
+// --- ③ 待你拍板: the AUTHORITATIVE decision-batches store (~/.agenthop/console/decision-batches/<id>/) — NOT the derived console
+//     mirror. A missing/closed/failed mirror is not proof of "no pending rulings" (MDV2-1); the store is the source of truth. ----
+
+/** Errno-aware consumed-marker probe: a batch is RULED once its terminal `consumed.json` exists; absent (ENOENT) ⇒ still awaiting;
+ *  any other fault ⇒ "unknown" (never read as awaiting-or-ruled — surfaced as an anomaly so a possibly-pending batch is visible). */
+function batchConsumed(home: string, batchId: string): "consumed" | "pending" | "unknown" {
+  try { lstatSync(path.join(home, ".agenthop", "console", "decision-batches", batchId, "consumed.json")); return "consumed"; }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "pending" : "unknown"; }
+}
+
+/** One awaiting-ruling item line. MDV2-4: clip ONLY the summary text; the hard-gate flag, the suggested action, and a (batch,item)
+ *  locating ref are RESERVED and never truncated away — they are exactly what the brief committed to surface. */
+function itemLine(batchId: string, it: DecisionItem): string {
+  const gate = it.hardGate ? " [hard-gate]" : "";
+  const action = it.suggestedAction && it.suggestedAction.length > 0 ? ` → ${it.suggestedAction}` : "";
+  const ref = ` (b:${batchId} i:${it.id})`;
+  const budget = Math.max(24, 140 - gate.length - action.length - ref.length);
+  return `${clip(it.summary, budget)}${gate}${action}${ref}`;
+}
+
+/** Gather 待你拍板 from the AUTHORITATIVE decision-batches store (MDV2-1: a missing derived mirror is NOT quiet). A batch awaits a
+ *  ruling when batch.json is present (listBatchesStrict) AND consumed.json is absent. Scans EVERY batch — the `perGroup` cap limits
+ *  OUTPUT only, never the scan (MDV2-2): a later corrupt batch stays visible and the overflow count is reported. Each batch is read
+ *  through the canonical `readBatch` (full schema validation); a malformed batch or an unreadable consumed-state is surfaced as a
+ *  VISIBLE anomaly (MDV2-3), never silently dropped or mis-rendered as a normal item. Returns null ONLY when the store dir cannot be
+ *  enumerated (listBatchesStrict throws ⇒ unknown, never a false quiet night). ENOENT ⇒ [] = a CONFIRMED-empty store (authoritative,
+ *  so a genuine quiet). */
+function gatherDecisions(home: string, perGroup: number): { rulings: string[]; anomalies: string[]; overflow: number } | null {
+  let ids: string[];
+  try { ids = listBatchesStrict(home); } // ENOENT ⇒ []; a read fault PROPAGATES (throws)
+  catch { return null; }                 // MDV2-1: cannot enumerate the authoritative store ⇒ unknown
+  const rulings: string[] = [], anomalies: string[] = [];
+  let pending = 0;
+  for (const id of [...ids].sort()) {
+    const state = batchConsumed(home, id);
+    if (state === "consumed") continue;
+    if (state === "unknown") { anomalies.push(clip(`决策批 ${id} 消费状态不可读 — 可能待你拍板`)); continue; }
+    let batch;
+    try { batch = readBatch(home, id); } // canonical validation (MDV2-3); unsafe id / read fault ⇒ throw/null below
+    catch { batch = null; }
+    if (batch === null) { anomalies.push(clip(`决策批 ${id} 不可读/损坏 — 待你拍板可能漏项`)); continue; }
+    for (const it of batch.items) { pending++; if (rulings.length < perGroup) rulings.push(itemLine(id, it)); } // MDV2-2: scan never stops at the cap
+  }
+  return { rulings, anomalies, overflow: Math.max(0, pending - perGroup) };
+}
+
+// --- ①④② from the PROGRESS narrative tail: STATE + EVIDENCE based, not bare keywords (MDV2-5). -------------------------------------
+const COMPLETION_RE = /✅|已签收|已并|已合并|\bmerged\b|装机|\blanded\b/i; // an explicit sign-off / landing marker (NOT bare "0 remain")
+const NEGATION_RE   = /\bnot\b|未|尚未|即[将合并装]|即可|若|回滚|\brevert\b|撤销|放弃/i; // negation / conditional ⇒ NOT a completion fact
+const INFLIGHT_RE   = /待复审|待审|送审|候审|候签|待签|\bpending\b|[1-9]\d*\s*remain/i;   // inter-agent in-flight review ⇒ DROP (⑤)
+// An ACTIVE anomaly STATE (not a bare topic word): the ⚠ symbol, or a current/still qualifier (当前/目前/仍/依然/still/未恢复)
+// right before an anomaly word. "超时修复已并" / "待复审：超时报告优化" (超时 as a fix-topic / noun phrase) is NOT active — so a
+// current problem surfaces as 异常 while a topic word does not mis-fire (MDV2-5 subject scope). An anomaly word merely OPENING
+// the subject is handled below via OPENING_ANOMALY, AFTER the completion branch, so a landed fix ("超时修复已并") stays 完成.
+const ACTIVE_ANOMALY = /⚠|(?:当前|目前|仍|依然|still|未恢复|尚未恢复|未消)[^。；;]{0,8}(?:\bblocked\b|\bstuck\b|卡死|卡住|卡点|超时|deadline|失联|中断)/i;
+// A bare anomaly-word subject ("卡死 pid 123") is a current problem, but only when the subject is NOT a landed
+// fix (MDV2-5 r7): "超时修复已并 @sha" opens with 超时 yet is a completion subject (超时 = fix object, not state),
+// so this is checked AFTER the completion branch — completion wins, the opening word surfaces only otherwise.
+const OPENING_ANOMALY = /^(?:\bblocked\b|\bstuck\b|卡死|卡住|卡点|超时|deadline|失联|中断)/i;
+const AWAITTEST_RE  = /待验收|待实测|待你测|待实机|待自测|待体验|needs?-?test/i;            // landed, awaiting the user's own real-test
+/** A context-anchored, whole-token COMMIT REFERENCE (the output-contract OC-4 recipe): a label (固定 / sha / commit / a landing verb
+ *  / @) immediately before a 7-64 hex token that stands alone — trailing `(?!-)` rejects a UUID segment ("deadbeef-1234-…"), and an
+ *  ALL-DECIMAL short sha ("@1431247") is accepted (a bare-date / UUID / unanchored hex is NOT a commit ref). Captures the hex. */
+const COMMIT_REF = /(?:固定\s*)?(?:\bsha(?:[-\s]?256)?\b|\bcommit\b|\bmerged?\b|\blanded\b|已并|已合并|装机|@)[:\s]*\b([0-9a-f]{7,64})\b(?!-)/i;
+/** Emit a completion line that PRESERVES the commit ref even when the prose is clipped (MDV2-5: classification saw the SHA in the
+ *  full body, so the output must keep it). The "still present?" test checks the REAL ref's POSITION in the full body — NOT a
+ *  re-match of the clipped text (re-matching was fooled when the clip TRUNCATES a longer invalid id into a valid-looking one, e.g.
+ *  "@deadbeef_owner" → "@deadbeef…", hiding that the real ref later in the line was cut off). Append the extracted sha only when
+ *  the real ref ends past the clip boundary. */
+function completionLine(body: string): string {
+  const brief = clip(body);
+  const m = COMMIT_REF.exec(body);
+  if (!m) return brief;
+  const end = m.index + m[0].length; // the real ref's end position in the FULL body
+  return body.length <= 160 || end <= 160 ? brief : `${brief} […${m[1]}]`; // append only if the real ref was clipped off
+}
+
+/** Gather the digest sources as an ACCEPTANCE BRIEFING (验收简报化), fail-soft.
+ *  ③ 待你拍板 — the AUTHORITATIVE decision-batches store (gatherDecisions), not a grep.
+ *  ①④② — the PROGRESS.md narrative tail, bucketed by the line's SUBJECT (MDV2-5 subject scope): a CURRENT problem (an anomaly word
+ *        with a state signal — ⚠ / 当前 / 仍 / opening the line) surfaces as 异常 from anywhere; otherwise the SUBJECT CLAUSE (before
+ *        the first ；/。) decides by fixed priority user-test > in-flight > completion. So "✅ 已并 … 待验收" surfaces the test action,
+ *        "待复审：超时报告优化" drops as in-flight (its topic word ignored), "✅ 超时修复已并 @sha" is a completion, and "✅ 已并 … 但仍
+ *        超时" is 异常. 待你拍板 NEVER comes from a PROGRESS 待裁 grep; a no-commit-ref completion and bare chatter are DROPPED.
+ *  Returns null on a READ ERROR (MD-P2-2 / MDV2-1: UNKNOWN, never a false quiet night): the decisions store cannot be enumerated, or
+ *  PROGRESS is unreadable. ENOENT of either ⇒ that source contributes nothing (a CONFIRMED-empty authoritative store is a real quiet). */
 export function gatherDigestSources(home: string, tailLines = 80, perGroup = 8): DigestSources | null {
+  const dec = gatherDecisions(home, perGroup);
+  if (dec === null) return null; // MDV2-1: cannot enumerate the authoritative rulings store ⇒ unknown
+  const awaitingRuling = [...dec.rulings];
+  if (dec.overflow > 0) awaitingRuling.push(`+${dec.overflow} 更多待你拍板未显示 — 见 ~/.agenthop/console/decision-batches/`); // MDV2-2: overflow is visible
   let raw: string;
   try { raw = readFileSync(path.join(home, ".agenthop", "swarm", "PROGRESS.md"), "utf8"); }
-  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { alerts: [], clearedReviews: [], shipped: [], pending: [] } : null; }
-  const alerts: string[] = [], clearedReviews: string[] = [], shipped: string[] = [], pending: string[] = [];
-  const all = raw.split("\n");
-  // MD-P2-3: match ALL awaiting forms (待办 / 待裁 / 待处理 / 待签 / 待复审 / 待审 …, i.e. any 待X) + 尚未 / 未签 / 送审 / a NON-zero
-  // REMAIN. Checked BEFORE the cleared markers so "待签收 … 2 REMAIN" / "尚未签收 … 待复审" stay pending — while a positive sign-off
-  // (✅ / 0 REMAIN / 已签收, none of which carry 待/尚未) still clears.
-  const pendingRe = /待|尚未|未签|送审|候审|候签|\bpending\b|[1-9]\d*\s*remain/i;
-  for (const line of all.slice(Math.max(0, all.length - tailLines))) {
+  catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { awaitingRuling, anomalies: dec.anomalies, awaitingTest: [], recentDone: [] };
+    return null; // PROGRESS read fault ⇒ unknown
+  }
+  const anomalies: string[] = [...dec.anomalies], awaitingTest: string[] = [], recentDone: string[] = [];
+  for (const line of raw.split("\n").slice(-tailLines)) {
     const t = line.trim();
-    if (!t.startsWith("- ") && !t.startsWith("* ")) continue; // bullet lines only
+    if (!t.startsWith("- ") && !t.startsWith("* ")) continue; // bullet lines only (pointers, S18)
     const body = t.slice(2).trim();
     if (body.length === 0) continue;
-    const brief = body.length > 160 ? `${body.slice(0, 160)}…` : body;
-    if (/⚠|blocked|卡点|卡死|deadline|超时/i.test(body)) { if (alerts.length < perGroup) alerts.push(brief); }
-    else if (pendingRe.test(body)) { if (pending.length < perGroup) pending.push(brief); } // PENDING before cleared (MD-P2-3)
-    else if (/✅|cleared|已签收|签收|\b0\s*remain\b/i.test(body)) { if (clearedReviews.length < perGroup) clearedReviews.push(brief); }
-    else if (/已并|merged|交付|装机|\bdone\b/i.test(body)) { if (shipped.length < perGroup) shipped.push(brief); }
+    // Bucket by the line's SUBJECT (MDV2-5 subject scope). (1) A current PROBLEM anywhere surfaces first — an anomaly word is only
+    // "current" with a state signal (⚠ / 当前 / 仍 / opening the line); a bare topic word ("超时修复已并", "待复审：超时报告优化") is
+    // not, so it never mis-fires. Otherwise the SUBJECT CLAUSE (before the first ；/。) decides by fixed priority: (2) user-test >
+    // (3) in-flight > (4) completion — so "✅ 已并 … 待验收" surfaces the test action, "待复审：超时报告优化" drops as in-flight (its
+    // topic word ignored), and "✅ 超时修复已并 @sha" is a completion. A follow-up clause after ；(e.g. "；补丁已并") is not the subject.
+    const brief = clip(body);
+    const subject = body.split(/[；;。]/)[0]!;
+    if (ACTIVE_ANOMALY.test(body)) { if (anomalies.length < perGroup) anomalies.push(brief); }                                  // (1) current problem (anywhere) ⇒ 异常
+    else if (AWAITTEST_RE.test(subject) && !NEGATION_RE.test(subject)) { if (awaitingTest.length < perGroup) awaitingTest.push(brief); } // (2) user-test subject ⇒ 待你验收
+    else if (INFLIGHT_RE.test(subject)) { /* (3) in-flight review subject ⇒ DROP (topic words ignored) */ }
+    else if (COMPLETION_RE.test(subject) && COMMIT_REF.test(body) && !NEGATION_RE.test(subject)) { if (recentDone.length < perGroup) recentDone.push(completionLine(body)); } // (4) 完成
+    else if (OPENING_ANOMALY.test(subject)) { if (anomalies.length < perGroup) anomalies.push(brief); }                           // (5) bare anomaly-word subject (not a landed fix) ⇒ 异常
+    // (6) else (a no-commit-ref completion, bare chatter) ⇒ DROPPED.
   }
-  return { alerts, clearedReviews, shipped, pending };
+  return { awaitingRuling, anomalies, awaitingTest, recentDone };
 }
