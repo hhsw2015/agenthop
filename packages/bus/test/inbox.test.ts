@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSyn
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, publishUniqueAtomic, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
 import { deliverToCoordinator } from "../src/checkin.js";
 import type { SelfInfo } from "../src/label.js";
 
@@ -547,5 +547,51 @@ describe("writeInbox — idempotency key (durable-first credential, exactly-once
     expect(writeInbox(HOME, "s1", digest("brief", 1), "evt-k")).toBe("published");
     expect(writeInbox(HOME, "s1", digest("brief", 2), "evt-k")).toBe("already"); // credential published ⇒ confirmed, no 2nd copy
     expect(writeInbox(HOME, "s1", msg("nokey", 3))).toBe("published");           // no key ⇒ always a fresh publish
+  });
+});
+
+describe("INBOX-2: non-keyed writeInbox is clobber-proof (concurrency-race, infra audit)", () => {
+  const inboxDirOf = (key: string) => path.join(HOME, ".agenthop", "inbox", key);
+  // A name source that hands out a fixed sequence, so a collision is deterministic. Each publishUniqueAtomic call draws:
+  // [tmp-suffix, name-attempt0, name-attempt1, ...]. Default production uses 64-bit randomBytes; this seam is test-only.
+  const seq = (...xs: string[]) => { let i = 0; return () => xs[Math.min(i++, xs.length - 1)]; };
+
+  test("a same-name collision RETRIES a fresh name — both messages survive (no clobber)", () => {
+    const d = inboxDirOf("s1"); mkdirSync(d, { recursive: true });
+    // publish #1 draws tmp="t1", name="N" -> <ts>-N.json. publish #2 draws tmp="t2", name="N" (COLLIDES) then "M" -> <ts>-M.json.
+    const rand = seq("t1", "N", "t2", "N", "M");
+    expect(publishUniqueAtomic(d, "A", 1000, rand)).toBe(path.join(d, "0000000000001000-N.json"));
+    expect(publishUniqueAtomic(d, "B", 1000, rand)).toBe(path.join(d, "0000000000001000-M.json")); // retried past the collision
+    const jsons = readdirSync(d).filter((n) => n.endsWith(".json")).sort();
+    expect(jsons).toEqual(["0000000000001000-M.json", "0000000000001000-N.json"]);
+    expect(readFileSync(path.join(d, "0000000000001000-N.json"), "utf8")).toBe("A"); // first NOT overwritten
+    expect(readFileSync(path.join(d, "0000000000001000-M.json"), "utf8")).toBe("B");
+    expect(readdirSync(d).some((n) => n.startsWith(".wtmp-"))).toBe(false);          // temp cleaned (no orphan)
+  });
+
+  test("an exhausted retry THROWS rather than clobbering — the first message is preserved", () => {
+    const d = inboxDirOf("s2"); mkdirSync(d, { recursive: true });
+    const constName = () => "C"; // every draw identical ⇒ the 2nd publish can never find a free name
+    expect(publishUniqueAtomic(d, "FIRST", 1000, constName)).toBe(path.join(d, "0000000000001000-C.json"));
+    expect(() => publishUniqueAtomic(d, "SECOND", 1000, constName)).toThrow(/EEXIST/); // no-overwrite guard refuses to clobber
+    expect(readFileSync(path.join(d, "0000000000001000-C.json"), "utf8")).toBe("FIRST"); // old bytes intact
+    expect(readdirSync(d).some((n) => n.startsWith(".wtmp-"))).toBe(false);               // temp cleaned even on throw (finally)
+  });
+
+  test("end-to-end: a burst of same-ts non-keyed writes all survive and are all claimable (real random path)", () => {
+    const N = 200;
+    for (let i = 0; i < N; i++) writeInbox(HOME, "s3", msg(`m${i}`, 1000)); // same ts bucket, no key ⇒ the collision-prone path
+    const got = claimInbox(HOME, ["s3"], "p");
+    expect(got.length).toBe(N);                                             // none clobbered
+    expect(new Set(got.map((c) => c.msg.text)).size).toBe(N);              // all distinct payloads present
+  });
+
+  test("the .wtmp- scratch name is never a deliverable message (ignored by claim)", () => {
+    const d = inboxDirOf("s4"); mkdirSync(d, { recursive: true });
+    writeFileSync(path.join(d, ".wtmp-deadbeef"), "not a message"); // a leftover temp (e.g. a crash before link)
+    writeInbox(HOME, "s4", msg("real", 1000));
+    const got = claimInbox(HOME, ["s4"], "p");
+    expect(got.length).toBe(1);                    // only the real message, the .wtmp- is not claimed
+    expect(got[0]!.msg.text).toBe("real");
   });
 });
