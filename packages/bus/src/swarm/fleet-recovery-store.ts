@@ -29,7 +29,7 @@ import {
 import { parseBoardItemName, boardItemId } from "./task-board.js";
 import { loadControlLog } from "./control-store.js";
 import { liveEntities } from "./control-log.js";
-import { scanUnclaimedInbox, inboxDirName } from "../inbox.js";
+import { inboxDirName } from "../inbox.js";
 
 // --- paths -----------------------------------------------------------------------------------------------------------
 function agenthopDir(home: string): string { return path.join(home, ".agenthop"); }
@@ -276,10 +276,11 @@ export function breakpointFactsFor(home: string, sid: string): MemberBreakpointF
   const boardNames = readBoardFileNames(home);
   const grantedItems = boardNames === null ? null : grantedItemsForMember(sid, boardNames, parseBoardItemName);
   const liveAttempts = grantedItems === null ? null : liveAttemptsForItems(home, grantedItems);
-  // FR-10: scanUnclaimedInbox swallows an EACCES to {count:0}, so it cannot report "unreadable" — probe the box dir directly first.
-  // ENOENT (no box) ⇒ 0 (a genuine zero); a non-ENOENT fault ⇒ null (unknown, never a false 0).
+  // FR-10 (r4): derive unread from a SINGLE strict readdir — scanUnclaimedInbox swallows an EACCES to {count:0}, and a probe-then-scan
+  // leaves a race (EACCES between the two reads ⇒ a false 0, the exact r3 gap). ENOENT ⇒ 0 (genuine empty); any other fault ⇒ null
+  // (unknown). The `.json` filter matches scanUnclaimedInbox's own count (claim/sidecar names don't end in .json).
   let unreadInbox: number | null;
-  try { readdirSync(path.join(home, ".agenthop", "inbox", inboxDirName(sid))); unreadInbox = scanUnclaimedInbox(home, sid).count; }
+  try { unreadInbox = readdirSync(path.join(home, ".agenthop", "inbox", inboxDirName(sid))).filter((n) => n.endsWith(".json")).length; }
   catch (e) { unreadInbox = (e as NodeJS.ErrnoException).code === "ENOENT" ? 0 : null; }
   return { member: sid, grantedItems, liveAttempts, unreadInbox };
 }
@@ -326,24 +327,41 @@ function claimLaunchFile(home: string, episodeId: string, memberKey: string): st
  *   - unreadable/CP-3 ⇒ false  (fail-closed toward NOT launching)
  * FR-9: the CP-3 guard checks the ACTUAL write leaf (recover-launch/<episode>/), so a symlinked recover-launch ancestor is refused.
  */
-export function claimRecoverLaunch(home: string, memberKey: string, episodeId: string): boolean {
+export function claimRecoverLaunch(home: string, memberKey: string, episodeId: string, nowSec: number, graceSec: number): boolean {
   const dir = claimLaunchDir(home, episodeId);
-  if (!boundaryOk(home, dir)) return false; // FR-9: guard the real leaf, not just swarmDir
+  if (!boundaryOk(home, dir)) return false; // FR-9: guard the real dir chain
   try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return false; }
   const file = claimLaunchFile(home, episodeId, memberKey);
+  // FR-9 (r4): never follow a symlinked claim-file LEAF. lstat (no-follow): a symlink / non-file ⇒ REFUSE (don't read or write through it).
+  let st: ReturnType<typeof lstatSync> | undefined;
+  try { st = lstatSync(file); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+  if (st && !st.isFile()) return false;
   let state: string | null;
-  try { state = readFileSync(file, "utf8").trim(); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") state = null; else return false; } // unreadable claim ⇒ don't launch
-  if (state === null) { try { writeFileSync(file, "pending", { flag: "wx", mode: 0o600 }); return true; } catch { return false; } } // O_EXCL birth
-  if (state === "failed") { try { writeFileSync(file, "pending", { mode: 0o600 }); return true; } catch { return false; } } // retry an explicit failure
-  return false; // "pending" (outcome unknown) / "launched" (awaiting visibility) ⇒ never double-launch
+  if (!st) state = null;
+  else { try { state = readFileSync(file, "utf8").trim(); } catch { return false; } } // present-but-unreadable claim ⇒ don't launch
+  if (state === null) { try { writeFileSync(file, `pending:${Math.floor(nowSec)}`, { flag: "wx", mode: 0o600 }); return true; } catch { return false; } } // O_EXCL birth
+  if (state === "failed") { try { writeFileSync(file, `pending:${Math.floor(nowSec)}`, { mode: 0o600 }); return true; } catch { return false; } } // explicit failure ⇒ safe retry
+  if (state.startsWith("pending:")) {
+    // FR-8 (r4) safe recovery for a STALE pending: under the single-flight recover lock there is no concurrent holder, and this member
+    // is ABSENT (the caller only claims absent members), so a pending older than the grace = a prior run that crashed before the launch
+    // outcome AND the member never came up ⇒ safe to retry. A RECENT pending (incl. this run's own) ⇒ unknown, never a blind double.
+    const ts = Number(state.slice("pending:".length));
+    if (Number.isFinite(ts) && Number.isFinite(nowSec) && nowSec - ts >= graceSec) { try { writeFileSync(file, `pending:${Math.floor(nowSec)}`, { mode: 0o600 }); return true; } catch { return false; } }
+    return false;
+  }
+  return false; // "launched" (awaiting visibility) / anything else ⇒ never double-launch
 }
 
 /** FR-8: record the launch outcome so the claim's state reflects reality — ok ⇒ "launched", ok:false ⇒ "failed" (retryable next run).
  *  Fail-soft (a write fault leaves the claim "pending" ⇒ next run treats it as unknown, never a double). */
-export function markLaunchOutcome(home: string, memberKey: string, episodeId: string, ok: boolean): void {
+export function markLaunchOutcome(home: string, memberKey: string, episodeId: string, outcome: "launched" | "failed" | "unknown"): void {
   if (!boundaryOk(home, claimLaunchDir(home, episodeId))) return;
-  try { writeFileSync(claimLaunchFile(home, episodeId, memberKey), ok ? "launched" : "failed", { mode: 0o600 }); } catch { /* fail-soft: stays pending */ }
+  const file = claimLaunchFile(home, episodeId, memberKey);
+  try { if (!lstatSync(file).isFile()) return; } catch { return; } // FR-9: don't follow a symlinked leaf; nothing to mark if absent
+  // FR-8 (r4): "launched" ⇒ done; "failed" ⇒ retryable; "unknown" (sent, result indeterminate) ⇒ keep "pending:<now>" (a fresh grace
+  // window so the maybe-started launch can appear; never a blind double).
+  const content = outcome === "launched" ? "launched" : outcome === "failed" ? "failed" : `pending:${Math.floor(Date.now() / 1000)}`;
+  try { writeFileSync(file, content, { mode: 0o600 }); } catch { /* fail-soft: stays pending */ }
 }
 
 // --- recovery receipt projection ------------------------------------------------------------------------------------

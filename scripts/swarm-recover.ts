@@ -27,7 +27,7 @@ import { herdrAgentName, herdrAgentStates, herdrLaunch, herdrServerReachable, he
 import { parseSnapshot, planResume, resumeCommandForMember, type RosterMember, type PeerLike } from "../packages/bus/src/swarm/resume.js";
 import {
   orchestrateRecover, snapshotStaleSec, breakpointInjectionEnabled, dispatcherNeedsRelaunch,
-  type RecoverDeps, type RecoveryResult, type DispatcherRecipe, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus,
+  type RecoverDeps, type RecoveryResult, type DispatcherRecipe, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus, type LaunchOutcome,
 } from "../packages/bus/src/swarm/fleet-recovery.js";
 import {
   captureDispatcherRecipe, dispatcherLive, dispatcherPid, heartbeatFreshSec, captureEnvForPid,
@@ -49,20 +49,28 @@ const toMin = (p: PeerLike): PeerLikeMin => ({ ...(p.id ? { id: p.id } : {}), ..
 
 /** Launch ONE member via the F36 resume core (herdr when reachable + the command tokenizes cleanly, else Ghostty). Async; returns
  *  {ok}. Mirrors swarm-resume's launch branch, driven per-member so the caller can claim ownership first (FR-6). */
-async function launchOneMember(full: RosterMember, useHerdr: boolean, taken: Set<string>): Promise<{ ok: boolean; error?: string }> {
+async function launchOneMember(full: RosterMember, useHerdr: boolean, taken: Set<string>): Promise<{ outcome: LaunchOutcome; error?: string }> {
   const cmd = resumeCommandForMember(full);
   try {
     const sc = splitCommand(cmd);
     if (useHerdr && sc.balanced) {
       const name = herdrAgentName(full.title ?? full.member, taken); taken.add(name);
       const r = await herdrLaunch({ name, kind: sc.kind, cwd: full.cwd, args: sc.args });
-      if (r.state === "started" || r.state === "unconfirmed") { log(`  launched[herdr] ${full.title ?? full.member} (${r.state})`); return { ok: true }; }
+      if (r.state === "started") { log(`  launched[herdr] ${full.title ?? full.member}`); return { outcome: "launched" }; }
+      if (r.state === "unconfirmed") { log(`  herdr UNCONFIRMED ${full.title ?? full.member} (${r.note}) — outcome unknown, not retried`); return { outcome: "unknown" }; } // FR-8: sent, result indeterminate
       log(`  herdr not-started (${r.note}); Ghostty fallback for ${full.title ?? full.member}`);
     }
     await pexec("osascript", ["-e", buildAppleScript({ command: cmd, cwd: full.cwd, env: [] })], { timeout: 15000 });
     log(`  launched ${full.title ?? full.member} ${full.cwd}`);
-    return { ok: true };
-  } catch (e) { const msg = (e as Error).message; log(`  FAILED to launch ${full.title ?? full.member}: ${msg}`); return { ok: false, error: msg }; }
+    return { outcome: "launched" };
+  } catch (e) {
+    // FR-8 (r4): distinguish a TIMEOUT (the launch may have STARTED ⇒ "unknown", never a retry-double) from a definite spawn failure
+    // (ENOENT/command-not-found ⇒ "failed", safe to retry). osascript/pexec timeout surfaces as ETIMEDOUT / killed.
+    const err = e as NodeJS.ErrnoException & { killed?: boolean };
+    const timedOut = err.code === "ETIMEDOUT" || err.killed === true || /time(d)?\s*out/i.test(err.message ?? "");
+    log(`  launch ${timedOut ? "UNKNOWN (timeout, may have started)" : "FAILED"} ${full.title ?? full.member}: ${err.message}`);
+    return { outcome: timedOut ? "unknown" : "failed", error: err.message };
+  }
 }
 
 /** Relaunch the dispatcher from its recipe — spawn argv[0] with argv.slice(1) DIRECTLY (FR-1: no shell re-split, spaces safe), env
@@ -130,7 +138,12 @@ async function main(): Promise<void> {
   // --- wire real deps + run the orchestration -----------------------------------------------------------------------
   // FR-6: serialize recover with a single-flight lock — a SECOND concurrent recover exits cleanly, so two processes can never mint
   // rival episodes and double-launch the same member (episode identity is established single-threaded under this lock).
-  const releaseLock = acquireSingleFlight(path.join(H, ".agenthop", "swarm", "recover.lock"));
+  const lockPath = path.join(H, ".agenthop", "swarm", "recover.lock");
+  // FR-6 (r4): an EXISTING lock that is UNREADABLE (EACCES) is UNKNOWN, not a free slot — HOLD. (single-flight treats a read error as
+  // an empty holder and would steal from a live, unverifiable holder; only a CONFIRMED-dead holder may be reclaimed.) ENOENT/readable ⇒ proceed.
+  try { readFileSync(lockPath, "utf8"); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") { log(`recover: lock ${lockPath} is unreadable (${(e as Error).message}) — HOLDING (cannot verify the holder is dead).`); return; } }
+  const releaseLock = acquireSingleFlight(lockPath);
   if (!releaseLock) { log(`recover: another recover is already running (single-flight) — exiting.`); return; }
 
   const core = startBusCore({ home: H });
@@ -158,9 +171,9 @@ async function main(): Promise<void> {
     },
     peers: () => core.peers().map(toMin),
     settle: () => sleep(5000),
-    claimLaunch: (memberKey, episodeId) => claimRecoverLaunch(H, memberKey, episodeId),
-    launchMember: async (m) => { const full = fullByMember.get(m.member); if (!full) return { ok: false, error: "no roster entry" }; return launchOneMember(full, useHerdr, taken); },
-    markLaunchOutcome: (memberKey, episodeId, ok) => markLaunchOutcome(H, memberKey, episodeId, ok), // FR-8: record outcome (pending→launched|failed)
+    claimLaunch: (memberKey, episodeId) => claimRecoverLaunch(H, memberKey, episodeId, nowSec(), 300), // FR-8: 300s grace for a stale-pending safe retry
+    launchMember: async (m) => { const full = fullByMember.get(m.member); if (!full) return { outcome: "failed" as LaunchOutcome, error: "no roster entry" }; return launchOneMember(full, useHerdr, taken); },
+    markLaunchOutcome: (memberKey, episodeId, outcome) => markLaunchOutcome(H, memberKey, episodeId, outcome), // FR-8: launched|failed|unknown
     breakpointFacts: (sid) => breakpointFactsFor(H, sid),
     deliverBreakpoint: (sid, text, episodeId) => {
       try { const msg = composeInboxMsg({ from: "fleet-recovery", fromLabel: "swarm-recover", text, via: "fleet-recovery", intent: "fyi" }); return writeInbox(H, sid, msg, `fr-bp-${episodeId}-${shortHash(sid)}`) as DeliveryStatus; }

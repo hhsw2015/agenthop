@@ -1,17 +1,18 @@
 // Run: packages/bus/node_modules/.bin/tsx packages/bus/src/swarm/fleet-recovery.selftest.mts
-// full-fleet-recovery r3 (codex:Work r2 @040f550: FR-2/3/4 CLOSED, 8 REMAIN on evidence/identity/atomicity). Pins the rebuilt core +
+// full-fleet-recovery r4 (codex:Work r3 @040f550: FR-2/3/4 CLOSED, 8 REMAIN on evidence/identity/atomicity). Pins the rebuilt core +
 // store + runs the REAL orchestrateRecover with fakes, each test reproducing a reviewer finding:
 //  FR-1a execArgv captured · FR-1b scrub keeps the SSH user · FR-5 identity triple (title alone ≠ identity) · FR-7 reuse-incomplete
 //  (any age) + unreadable-abort · FR-8 claim≠launch two-phase + report-with-real-results + receipt-in-completion · FR-9 claim leaf
 //  CP-3 · FR-10 boardItemId join + inbox three-state. Plus the 3 zero-bug fixture classes over the write faces.
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, existsSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   FLEET_SNAPSHOT_SCHEMA, scrubValueSecrets, parseDispatcherRecipe, parseFleetSnapshot, snapshotStaleSec,
   dispatcherNeedsRelaunch, dispatcherVerdict, memberVerdict, resolveMemberSid, resolveEpisode, buildBreakpointText,
   grantedItemsForMember, deliveryDischarged, summarizeOutstanding, orchestrateRecover,
-  type FleetSnapshot, type DispatcherRecipe, type RecoverDeps, type RecoveryEpisode, type EpisodeRead, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus, type DispatcherLiveness, type RecoveryResult,
+  type FleetSnapshot, type DispatcherRecipe, type RecoverDeps, type RecoveryEpisode, type EpisodeRead, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus, type DispatcherLiveness, type RecoveryResult, type LaunchOutcome,
 } from "./fleet-recovery.js";
 import {
   writeFleetSnapshot, readFleetSnapshot, recordDispatcherRecipe, readDispatcherRecipe, writeEpisode, readEpisode,
@@ -23,26 +24,27 @@ import { initialLogState } from "./control-log.js";
 import { commitControl } from "./control-store.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
-const scratch = mkdtempSync(path.join(tmpdir(), "fleet-recovery-r3-"));
+const scratch = mkdtempSync(path.join(tmpdir(), "fleet-recovery-r4-"));
 const freshHome = () => mkdtempSync(path.join(scratch, "home-"));
 const swarm = (h: string) => path.join(h, ".agenthop", "swarm");
 const goodRecipe: DispatcherRecipe = { argv: ["/usr/bin/node", "scripts/swarm-dispatch.ts"], cwd: "/repo", env: { SWARM_SELF: "d1", HERDR_ENV: "1" }, source: "self-recorded" };
 const goodSnap: FleetSnapshot = { schema: FLEET_SNAPSHOT_SCHEMA, capturedAtSec: 1000, dispatcher: goodRecipe, rosterFile: "/h/roster.json" };
 
 try {
-  // ── FR-1b: scrub keeps the SSH user, strips only the password ────────────────────────────────────────────────────
-  t("FR-1b: ssh://git@host UNCHANGED (user is a non-secret address part)", scrubValueSecrets("ssh://git@host/repo.git") === "ssh://git@host/repo.git");
-  t("FR-1b: https://user:{{PASSWORD_mcu5s9ca}}@host ⇒ https://user@host (keep user, drop password)", scrubValueSecrets("https://user:{{PASSWORD_mcu5s9ca}}@git.example/o/r.git") === "https://user@git.example/o/r.git");
-  t("FR-1b: clean URL untouched", scrubValueSecrets("https://git.example/o/r.git") === "https://git.example/o/r.git");
+  // ── FR-2 (r4): per-scheme scrub — ssh keeps the user; http(s) strips the WHOLE userinfo (username may be a token) ────
+  t("FR-2: ssh://git@host UNCHANGED (user is a non-secret address part)", scrubValueSecrets("ssh://git@host/repo.git") === "ssh://git@host/repo.git");
+  t("FR-2: ssh://git:{{PASSWORD_4hw6k5rz}}@host ⇒ ssh://git@host (keep user, drop password)", scrubValueSecrets("ssh://git:{{PASSWORD_4hw6k5rz}}@host/r.git") === "ssh://git@host/r.git");
+  t("FR-2: https://TOKEN@host ⇒ https://host (whole userinfo stripped — username may be a credential)", scrubValueSecrets("https://ghp_tok@git.example/o/r.git") === "https://git.example/o/r.git");
+  t("FR-2: https://user:{{PASSWORD_mcu5s9ca}}@host ⇒ https://host (whole userinfo stripped)", scrubValueSecrets("https://user:{{PASSWORD_mcu5s9ca}}@git.example/o/r.git") === "https://git.example/o/r.git");
+  t("FR-2: clean URL untouched", scrubValueSecrets("https://git.example/o/r.git") === "https://git.example/o/r.git");
 
-  // ── FR-5: identity triple (SID exact, else title+tool+cwd); a reused title alone is NOT identity ──────────────────
+  // ── FR-5 (r4): identity is the SID ALONE; tool/cwd/title are NOT identity ─────────────────────────────────────────
   {
     const member: RosterMemberLike = { member: "SID-A", title: "seat", tool: "claude", cwd: "/repo-A" };
-    const peerReusedTitle: PeerLikeMin[] = [{ stableId: "SID-B", title: "seat", tool: "codex", cwd: "/repo-B" }]; // reuses the title, different everything else
-    t("FR-5: reused title + different tool/cwd ⇒ ABSENT (not confirmed to the wrong peer)", resolveMemberSid(member, peerReusedTitle).kind === "absent");
     t("FR-5: exact SID match ⇒ resolved", resolveMemberSid({ member: "SID-A" }, [{ stableId: "SID-A", title: "x" }]).kind === "resolved");
-    t("FR-5: title+tool+cwd all match ⇒ resolved", (() => { const r = resolveMemberSid(member, [{ stableId: "SID-Z", title: "seat", tool: "claude", cwd: "/repo-A" }]); return r.kind === "resolved" && r.sid === "SID-Z"; })());
-    t("FR-5: two peers with matching triple ⇒ ambiguous", resolveMemberSid(member, [{ stableId: "S1", title: "seat", tool: "claude", cwd: "/repo-A" }, { stableId: "S2", title: "seat", tool: "claude", cwd: "/repo-A" }]).kind === "ambiguous");
+    t("FR-5: SAME tool+cwd+title but DIFFERENT SID ⇒ ABSENT (not the same member, no guess)", resolveMemberSid(member, [{ stableId: "SID-B", title: "seat", tool: "claude", cwd: "/repo-A" }]).kind === "absent");
+    t("FR-5: no SID match at all ⇒ absent", resolveMemberSid(member, [{ stableId: "SID-OTHER", title: "other", tool: "codex", cwd: "/x" }]).kind === "absent");
+    t("FR-5: >1 peer with the SAME sid ⇒ ambiguous", resolveMemberSid({ member: "SID-A" }, [{ stableId: "SID-A", title: "a" }, { id: "SID-A", title: "b" }]).kind === "ambiguous");
   }
 
   // ── FR-7: episode — reuse incomplete ANY age; unreadable ⇒ abort; complete/absent ⇒ new ─────────────────────────
@@ -62,21 +64,21 @@ try {
   // ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
   // FR-8 via REAL orchestrateRecover (fakes): claim≠launch, report-with-real-results, receipt-in-completion
   // ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-  type HOpts = Partial<{ episode: EpisodeRead; peersAfter: PeerLikeMin[]; claimReturns: boolean; disp: DispatcherLiveness; writeReceiptOk: boolean; writeEpisodeOk: boolean }>;
+  type HOpts = Partial<{ episode: EpisodeRead; peersAfter: PeerLikeMin[]; claimReturns: boolean; launchOutcome: LaunchOutcome; disp: DispatcherLiveness; writeReceiptOk: boolean; writeEpisodeOk: boolean; failWriteEpisodeAfter: number }>;
   function makeHarness(o: HOpts) {
-    const state = { episodeWrites: [] as RecoveryEpisode[], launches: [] as string[], outcomes: [] as { m: string; ok: boolean }[], reportArg: null as RecoveryResult | null, receiptArg: null as RecoveryResult | null };
+    const state = { episodeWrites: [] as RecoveryEpisode[], launches: [] as string[], outcomes: [] as { m: string; outcome: LaunchOutcome }[], reportArg: null as RecoveryResult | null, receiptArg: null as RecoveryResult | null };
     const deps: RecoverDeps = {
       now: () => 1000, mintEpisodeId: () => "ep-NEW", heartbeatThresholdSec: 120, breakpointsEnabled: true, recoveredAtIso: "T",
       readEpisode: () => o.episode ?? { kind: "absent" },
-      writeEpisode: (ep) => { state.episodeWrites.push(ep); return o.writeEpisodeOk ?? true; },
+      writeEpisode: (ep) => { state.episodeWrites.push(ep); if (o.failWriteEpisodeAfter !== undefined && state.episodeWrites.length > o.failWriteEpisodeAfter) return false; return o.writeEpisodeOk ?? true; },
       dispatcherLive: () => false,
       relaunchDispatcher: () => true,
       verifyDispatcher: () => o.disp ?? { pidAlive: true, heartbeatFreshSec: 10, wakeStatus: "on" },
       peers: () => o.peersAfter ?? [],
       settle: async () => {},
       claimLaunch: () => o.claimReturns ?? true,
-      launchMember: async (m) => { state.launches.push(m.member); return { ok: true }; },
-      markLaunchOutcome: (m, _ep, ok) => { state.outcomes.push({ m, ok }); },
+      launchMember: async (m) => { state.launches.push(m.member); return { outcome: o.launchOutcome ?? "launched" }; },
+      markLaunchOutcome: (m, _ep, outcome) => { state.outcomes.push({ m, outcome }); },
       breakpointFacts: (sid) => ({ member: sid, grantedItems: [], liveAttempts: [], unreadInbox: 0 }),
       deliverBreakpoint: () => "published",
       deliverReport: (r) => { state.reportArg = r; return "published"; },
@@ -100,6 +102,18 @@ try {
     t("FR-8: receipt write refused ⇒ 'receipt:unwritten' outstanding", r.outstanding.includes("receipt:unwritten"));
     t("FR-8: episode NOT marked completed when receipt unwritten", h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === false);
   }
+  // FR-8 r4 seam3: the FINAL writeEpisode failing (start ok) ⇒ 'episode-final:unwritten' outstanding (return value NOT ignored)
+  {
+    const h = makeHarness({ peersAfter: [{ stableId: "m1", title: "Work-m1", tool: "claude", cwd: "/r1" }], failWriteEpisodeAfter: 1 });
+    const r = await orchestrateRecover(goodSnap, roster, h.deps);
+    t("FR-8 seam3: final writeEpisode false ⇒ 'episode-final:unwritten' outstanding (exit≠0)", r.outstanding.includes("episode-final:unwritten"));
+  }
+  // FR-8 r4: an 'unknown' launch outcome is recorded as unknown (not failed) ⇒ never a blind retry
+  {
+    const h = makeHarness({ peersAfter: [], claimReturns: true, launchOutcome: "unknown" });
+    await orchestrateRecover(goodSnap, roster, h.deps);
+    t("FR-8 seam2: a launch 'unknown' outcome is recorded unknown (not failed)", h.state.outcomes.length === 1 && h.state.outcomes[0]!.outcome === "unknown");
+  }
   // FR-8 claim≠launch: claimLaunch false (pending/launched) ⇒ member NOT launched
   {
     const h = makeHarness({ peersAfter: [], claimReturns: false });
@@ -110,7 +124,7 @@ try {
   {
     const h = makeHarness({ peersAfter: [], claimReturns: true });
     await orchestrateRecover(goodSnap, roster, h.deps);
-    t("FR-8: a launched member records its outcome", h.state.launches.length === 1 && h.state.outcomes.length === 1 && h.state.outcomes[0]!.ok === true);
+    t("FR-8: a launched member records its outcome", h.state.launches.length === 1 && h.state.outcomes.length === 1 && h.state.outcomes[0]!.outcome === "launched");
   }
   // FR-7 reuse in orchestrate: an incomplete episode marker ⇒ reuse its id
   {
@@ -156,22 +170,39 @@ try {
     writeFileSync(path.join(swarm(h), "recovery-episode.json"), "{corrupt");
     t("store: readEpisode corrupt ⇒ unreadable", readEpisode(h).kind === "unreadable");
   }
-  // FR-8 claim two-phase + FR-9 leaf CP-3
+  // FR-8 claim two-phase (now + grace) + FR-9 leaf CP-3
   {
     const h = freshHome();
-    t("FR-8 claim: none ⇒ true (launch); pending ⇒ false (no double)", claimRecoverLaunch(h, "m", "ep") === true && claimRecoverLaunch(h, "m", "ep") === false);
-    markLaunchOutcome(h, "m", "ep", true);
-    t("FR-8 claim: launched ⇒ false (awaiting visibility, no double)", claimRecoverLaunch(h, "m", "ep") === false);
-    claimRecoverLaunch(h, "m2", "ep"); markLaunchOutcome(h, "m2", "ep", false);
-    t("FR-8 claim: failed ⇒ true (explicit not-started ⇒ safe retry)", claimRecoverLaunch(h, "m2", "ep") === true);
+    t("FR-8 claim: none ⇒ true (launch); recent pending ⇒ false (no double)", claimRecoverLaunch(h, "m", "ep", 1000, 300) === true && claimRecoverLaunch(h, "m", "ep", 1000, 300) === false);
+    markLaunchOutcome(h, "m", "ep", "launched");
+    t("FR-8 claim: launched ⇒ false (awaiting visibility, no double)", claimRecoverLaunch(h, "m", "ep", 1000, 300) === false);
+    claimRecoverLaunch(h, "m2", "ep", 1000, 300); markLaunchOutcome(h, "m2", "ep", "failed");
+    t("FR-8 claim: failed ⇒ true (explicit not-started ⇒ safe retry)", claimRecoverLaunch(h, "m2", "ep", 1000, 300) === true);
+    // FR-8 r4: a STALE pending (older than grace) ⇒ safe retry; an UNKNOWN outcome keeps it pending (fresh grace) ⇒ no immediate double
+    claimRecoverLaunch(h, "m3", "ep", 1000, 300); // pending:1000
+    t("FR-8 claim: stale pending (> grace) ⇒ true (safe retry)", claimRecoverLaunch(h, "m3", "ep", 1000 + 301, 300) === true);
+    claimRecoverLaunch(h, "m4", "ep", 2000, 300); markLaunchOutcome(h, "m4", "ep", "unknown"); // unknown ⇒ pending:<now>
+    t("FR-8 claim: unknown outcome ⇒ recent pending ⇒ false (no double)", claimRecoverLaunch(h, "m4", "ep", 2000, 300) === false);
   }
   {
-    // FR-9: a symlinked recover-launch leaf (swarm itself fine) ⇒ claim refused + no escape
+    // FR-9: a symlinked recover-launch DIR ⇒ claim refused + no escape
     const h = freshHome(); mkdirSync(swarm(h), { recursive: true });
     const ext = mkdtempSync(path.join(scratch, "ext-rl-"));
     symlinkSync(ext, path.join(swarm(h), "recover-launch"));
-    t("FR-9: symlinked recover-launch leaf ⇒ claimRecoverLaunch false", claimRecoverLaunch(h, "m", "ep") === false);
+    t("FR-9: symlinked recover-launch dir ⇒ claimRecoverLaunch false", claimRecoverLaunch(h, "m", "ep", 1000, 300) === false);
     t("FR-9: no escape claim at the redirect target", !existsSync(path.join(ext, "ep")));
+  }
+  {
+    // FR-9 r4: a symlinked claim-FILE leaf (dir chain fine) ⇒ the failed→pending / markLaunchOutcome rewrite must NOT follow it.
+    const h = freshHome(); const ep = "ep"; const dir = path.join(swarm(h), "recover-launch", ep);
+    mkdirSync(dir, { recursive: true });
+    const ext = mkdtempSync(path.join(scratch, "ext-leaf-"));
+    const target = path.join(ext, "outside.txt"); writeFileSync(target, "failed"); // pretend a prior failed claim, but the leaf is a symlink
+    // the claim filename is sha256(memberKey).slice(0,32)+".claim"; compute it to plant the symlink
+    const leaf = path.join(dir, `${createHash("sha256").update("mX").digest("hex").slice(0, 32)}.claim`);
+    symlinkSync(target, leaf);
+    t("FR-9 r4: symlinked claim-file leaf ⇒ claimRecoverLaunch refused (no follow)", claimRecoverLaunch(h, "mX", ep, 1000, 300) === false);
+    t("FR-9 r4: the symlink target is NOT overwritten through the leaf", readFileSync(target, "utf8") === "failed");
   }
   // FR-10: boardItemId join (granted itemId = boardItemId(jobId,nodeId), attempt has raw nodeId)
   {
@@ -227,7 +258,7 @@ try {
     t("fixture[race]: NO escape at the redirect target", !existsSync(path.join(ext, "fleet-snapshot.json")) && !existsSync(path.join(ext, "recovery-episode.json")) && !existsSync(path.join(ext, "console", "fleet-recovery.json")));
   }
 
-  console.log("\nfleet-recovery r3 selftest: ALL PASS");
+  console.log("\nfleet-recovery r4 selftest: ALL PASS");
 } finally {
   try { rmSync(scratch, { recursive: true, force: true }); } catch { /* best-effort */ }
 }
