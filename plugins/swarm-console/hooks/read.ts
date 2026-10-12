@@ -151,8 +151,9 @@ export function parseRoster(text: string): RosterSeat[] | null {
 }
 
 // ── band summary (one line above the prompt): seats · pending decisions · bandwidth zone. Fail-soft placeholders for unproduced/unknown sources. ──
-/** Pending-decisions view: `null` = the whole dir is UNKNOWN (absent/unreadable). Otherwise `known` = items in fully-read batches,
- *  `unknown` = files/batches we could not fully read (unreadable, corrupt, wrong-schema, or incomplete). SCM-P2-1. */
+/** Pending-decisions view: `null` = the whole dir is UNKNOWN (absent/unreadable). Otherwise `known` = every item we COULD read
+ *  (across all parsed batches, INCLUDING the readable items of an incomplete batch), `unknown` = files/batches we could not fully
+ *  read (unreadable, corrupt, wrong-schema, or incomplete). SCM-P2-1. */
 export type PendingView = { known: number; unknown: number } | null;
 /** Format the pending segment: `待裁:?` (dir unknown) · `待裁:N` (all read, exact) · `待裁:N+U?` (N confirmed, U unread/corrupt). */
 export function pendingLabel(p: PendingView): string {
@@ -186,7 +187,8 @@ export function cardOptions(item: DecisionItemView): DecisionOption[] {
  * SCM-P2-2: a FINGERPRINT of the decision content the user actually SAW. The keycapture round-trips (batchId,itemId,fp) through
  * the Client; on the way back the host re-reads the batches and refuses to prefill unless the SAME (batchId,itemId) still exists
  * with the SAME fingerprint — so a list that changed between render and keystroke forces a re-selection instead of silently
- * prefilling a different item that happens to sit at the same index. Deterministic, pure. NUL-separated so fields can't collide.
+ * prefilling a different item that happens to sit at the same index. Deterministic, pure. JSON-encoded (fixed-order array) so no
+ * field value can collide with another across the boundary.
  */
 export function decisionFingerprint(item: DecisionItemView): string {
   // SCM-P2-2: bind EVERY field the card shows / that shapes the decision — summary, suggestedAction, evidenceRef, hardGate.
