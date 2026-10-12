@@ -67,6 +67,9 @@ function parseProjection(parsed: unknown): DigestProjection | null {
  *  (and carries the frozen body); ENOENT ⇒ "absent"; a parse/shape failure ⇒ "corrupt" (carrier damaged); any other read error ⇒
  *  "unknown" (can't tell — must not be treated as "never generated"). Never throws. */
 export function readDigestProjection(home: string): ProjState {
+  // IP2-1: a redirected dir chain ⇒ do NOT trust a FOREIGN projection read through the symlink as this home's generation proof.
+  // "unknown" (not "valid") ⇒ the caller regenerates rather than being suppressed by someone else's file. (Write is already refused.)
+  if (!digestBoundaryOk(home)) return { kind: "unknown" };
   let raw: string;
   try { raw = readFileSync(digestPath(home), "utf8"); }
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "unknown" }; }
@@ -87,6 +90,9 @@ export function writeDigestProjectionRaw(home: string, projection: DigestProject
  *  r3 claim); the inbox idempotency key makes continuing it safe (a re-send overwrites, never duplicates). A read error / corrupt
  *  JSON / missing date ⇒ "unknown" (must not prove not-sent). Never throws. */
 export function readNotifiedState(home: string): NotifyState {
+  // IP2-1: a redirected dir chain ⇒ a FOREIGN notified marker is NOT proof this home delivered. "unknown" ⇒ must not prove sent
+  // (the caller treats it as not-yet-delivered and re-notifies), never a false "sent" from someone else's file.
+  if (!digestBoundaryOk(home)) return { kind: "unknown" };
   let raw: string;
   try { raw = readFileSync(notifiedPath(home), "utf8"); }
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "none" } : { kind: "unknown" }; }

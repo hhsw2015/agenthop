@@ -7,7 +7,7 @@
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { readAllow, readOffset, writeOffset } from "./swarm-tg-entry.js";
+import { readAllow, readOffset, writeOffset, pollOnce, type TgCall } from "./swarm-tg-entry.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 const scratch = mkdtempSync(path.join(tmpdir(), "tg-entry-selftest-"));
@@ -70,7 +70,46 @@ try {
     t("fixture[race]: corrupt allow mid-run -> null (loop refuses, no silent black hole)", readAllow(ap) === null);
   }
 
-  console.log("\nTG-1/TG-2/TG-5 swarm-tg-entry selftest: ALL PASS");
+  // ── IP2-3: a non-empty array with ZERO valid numeric ids ⇒ null (not a silent empty allowlist) ───────────────────
+  t("IP2-3: ['12345'] (string-id array) ⇒ null (not empty set)", (() => { const p = f("strarr"); writeFileSync(p, '["12345"]'); return readAllow(p) === null; })());
+  t("IP2-3: {chatIds:['12345']} ⇒ null", (() => { const p = f("strobj"); writeFileSync(p, '{"chatIds":["12345"]}'); return readAllow(p) === null; })());
+  t("IP2-3: [] stays confirmed-empty (not null)", (() => { const p = f("emptyarr"); writeFileSync(p, "[]"); const s = readAllow(p); return s !== null && s.size === 0; })());
+  t("IP2-3: [1,'x',2] ⇒ {1,2} (partial numeric still valid)", (() => { const p = f("mixed2"); writeFileSync(p, '[1,"x",2]'); const s = readAllow(p); return s !== null && s.size === 2 && s.has(1) && s.has(2); })());
+
+  // ── IP2-4: REAL driver (pollOnce) control flow with Telegram isolated — offset advance / calls / backoff signal ───
+  const fakeTg = () => { const calls: { method: string; body: any }[] = []; const q: Record<string, any[]> = {}; const call: TgCall = async (method, body) => { calls.push({ method, body }); const r = q[method]; return r && r.length ? r.shift() : (method === "getUpdates" ? [] : {}); }; return { call, calls, q }; };
+  // offset UNREADABLE ⇒ pollOnce returns false (⇒ main backs off) AND makes NO getUpdates call (no hot network), AND does not advance.
+  {
+    const p = f("off-dir"); mkdirSync(p); // dir ⇒ readOffset null
+    const { call, calls } = fakeTg();
+    const polled = await pollOnce("tok", new Set([1]), call, p);
+    t("IP2-4[null-branch]: offset unreadable ⇒ pollOnce false (bounded-wait signal to main)", polled === false);
+    t("IP2-4[null-branch]: refused poll makes ZERO getUpdates (no hot loop/network)", calls.length === 0);
+  }
+  // offset VALID + empty updates ⇒ returns true, exactly one long-poll, offset NOT advanced on an empty batch.
+  {
+    const p = f("off-ok"); writeFileSync(p, "5");
+    const { call, calls } = fakeTg();
+    const polled = await pollOnce("tok", new Set([1]), call, p);
+    t("IP2-4[normal]: valid offset ⇒ true + exactly 1 getUpdates", polled === true && calls.filter((c) => c.method === "getUpdates").length === 1);
+    t("IP2-4[normal]: empty batch ⇒ offset unchanged (5)", readFileSync(p, "utf8") === "5");
+  }
+  // an OFF-ALLOWLIST tap ⇒ offset ADVANCES past it + answerCallbackQuery acked, NO decision resolved (driver effect of IP2-3/TG-5).
+  {
+    const p = f("off-list"); writeFileSync(p, "0");
+    const h = fakeTg(); h.q.getUpdates = [[{ update_id: 42, callback_query: { id: "c1", data: "d|abc.0|approve", message: { chat: { id: 999 } } } }]];
+    const polled = await pollOnce("tok", new Set([1]), h.call, p); // 999 ∉ allow{1}
+    t("IP2-4[off-list]: offset ADVANCED past an off-allowlist tap (43)", polled === true && readFileSync(p, "utf8") === "43");
+    t("IP2-4[off-list]: answerCallbackQuery acked; no decision path entered", h.calls.some((c) => c.method === "answerCallbackQuery"));
+  }
+  // crash/restart: a torn offset left by an interrupted write ⇒ readOffset 0 (replay once); after a good write it recovers.
+  {
+    const p = f("off-crash"); writeFileSync(p, "\x00torn");
+    t("IP2-4[crash]: torn offset ⇒ readOffset 0 (replay once, self-heals)", readOffset(p) === 0);
+    t("IP2-4[restart]: a good writeOffset then recovers the value", writeOffset(p, 77) === true && readOffset(p) === 77);
+  }
+
+  console.log("\nTG-1/TG-2/TG-5 + IP2-2/3/4 swarm-tg-entry selftest: ALL PASS");
 } finally {
   try { rmSync(scratch, { recursive: true, force: true }); } catch { /* best-effort */ }
 }
