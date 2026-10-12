@@ -65,23 +65,25 @@ const ok = (cond: boolean, msg: string): void => { if (!cond) { console.error(`F
   ok(clean.ok && !("evidenceRef" in clean.batch.items[0]!) && !("hardGate" in clean.batch.items[0]!), "parse: optional item fields omitted when absent");
 }
 
-// ── retryHint (DEC-P2-1): the recovery command preserves the ORIGINAL flags + appends --batch-id ──
+// ── retryHint (DEC-P2-1): the recovery command preserves the ORIGINAL flags, PINS the resolved home, appends --batch-id ──
 {
-  // example 1: bare items + --owner flag ⇒ hint keeps --owner (without it the retry exits 2).
+  // example 1: bare items + --owner flag ⇒ hint keeps --owner (without it the retry exits 2); home pinned to the resolved root.
   const q1 = classifyArgs(["submit", "items.json", "--owner", "coord", "--notify", "box"]);
-  const h1 = q1.mode === "submit" ? retryHint(q1, "batch-1") : "";
-  ok(h1.includes("items.json") && h1.includes("--owner 'coord'") && h1.includes("--notify 'box'") && h1.includes("--batch-id batch-1"), "retryHint: keeps --owner/--notify + appends id (example 1)");
-  // example 2: custom --home + JSON owner (no --owner flag) ⇒ hint keeps --home, omits --owner (re-read from the source).
-  const q2 = classifyArgs(["submit", "items.json", "--home", "/tmp/h"]);
-  const h2 = q2.mode === "submit" ? retryHint(q2, "batch-2") : "";
-  ok(h2.includes("--home '/tmp/h'") && !h2.includes("--owner") && h2.includes("--batch-id batch-2"), "retryHint: keeps --home, omits a JSON-only owner (example 2)");
-  // stdin source cannot be replayed ⇒ called out.
+  const h1 = q1.mode === "submit" ? retryHint(q1, "batch-1", "/resolved/home") : "";
+  ok(h1.includes("items.json") && h1.includes("--owner 'coord'") && h1.includes("--notify 'box'") && h1.includes("--home '/resolved/home'") && h1.includes("--batch-id batch-1"), "retryHint: keeps --owner/--notify, pins resolved --home, appends id");
+  // DEC-P2-1 (this round): the home comes from an ENV entry (no --home flag) ⇒ the hint MUST still pin --home to the resolved root.
+  const q2 = classifyArgs(["submit", "items.json"]); // no --home flag; owner from JSON
+  const h2 = q2.mode === "submit" ? retryHint(q2, "batch-2", "/env/root") : "";
+  ok(h2.includes("--home '/env/root'") && !h2.includes("--owner") && h2.includes("--batch-id batch-2"), "retryHint: pins the ENV-resolved home even with no --home flag (omits a JSON-only owner)");
+  // DEC-P2-1 (this round): a stdin source note is its OWN line (a # comment); the command's first line stays executable.
   const q3 = classifyArgs(["submit", "-", "--owner", "coord"]);
-  const h3 = q3.mode === "submit" ? retryHint(q3, "batch-3") : "";
-  ok(h3.includes("submit '-'") && h3.includes("stdin"), "retryHint: stdin source ⇒ note that input must be re-provided");
+  const h3 = q3.mode === "submit" ? retryHint(q3, "batch-3", "/h") : "";
+  const lines = h3.split("\n");
+  ok(lines[0]!.includes("submit '-'") && lines[0]!.includes("--batch-id batch-3") && !lines[0]!.includes("#") && !lines[0]!.includes("stdin"), "retryHint: stdin ⇒ command first line stays clean/executable");
+  ok(lines.length === 2 && lines[1]!.trim().startsWith("#") && lines[1]!.includes("stdin"), "retryHint: stdin note is a separate # comment line (pasteable, not inline)");
   // a value with a quote is shell-escaped.
   const q4 = classifyArgs(["submit", "f.json", "--owner", "a'b"]);
-  const h4 = q4.mode === "submit" ? retryHint(q4, "b4") : "";
+  const h4 = q4.mode === "submit" ? retryHint(q4, "b4", "/h") : "";
   ok(h4.includes("--owner 'a'\\''b'"), "retryHint: single-quote in a value is escaped for copy-paste");
 }
 

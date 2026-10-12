@@ -139,14 +139,17 @@ function shq(v: string): string { return `'${v.replace(/'/g, "'\\''")}'`; }
  *  notify, home) — and only APPENDS the resolved --batch-id. Dropping a flag breaks the retry: without --owner it exits 2
  *  (owner missing); without the original --home it idempotently rebuilds the SAME id in the DEFAULT dir and notifies there,
  *  never finishing the original dir's notify. A stdin source cannot be replayed, so it is called out. */
-export function retryHint(q: Extract<Query, { mode: "submit" }>, batchId: string): string {
+export function retryHint(q: Extract<Query, { mode: "submit" }>, batchId: string, resolvedHome: string): string {
   const parts = ["decide submit", shq(q.src)];
   if (q.owner) parts.push("--owner", shq(q.owner));     // only if it was a FLAG; a JSON owner is re-read from the same source
   if (q.notifyTo) parts.push("--notify", shq(q.notifyTo));
-  if (q.home) parts.push("--home", shq(q.home));         // the original data root — the id is only idempotent WITH it
+  // ALWAYS pin the ACTUAL resolved data root (flag OR AGENTHOP_HOME/AH_HOME env OR default) — the id is only idempotent WITH it.
+  // Emitting --home explicitly OVERRIDES the env entry, so the retry hits the same store even if pasted into a different shell.
+  parts.push("--home", shq(resolvedHome));
   parts.push("--batch-id", batchId);
   const base = parts.join(" ");
-  return q.src === "-" ? `${base}   (re-provide the original input on stdin — it cannot be replayed)` : base;
+  // The stdin note must be its OWN line (a shell comment): appended inline it turns the whole pasted line into a syntax error.
+  return q.src === "-" ? `${base}\n  # stdin source: re-provide the SAME input on stdin (it cannot be replayed)` : base;
 }
 
 /** DEC-P2-2: read the store's OWN notify credential (`notified.sent`, written AFTER a confirmed send) read-only, so the CLI
@@ -199,7 +202,7 @@ function run(argv: readonly string[]): number {
     // batchId — never a duplicate), and reconstruct the ORIGINAL command + --batch-id so the retry hits the same dir/owner/notify.
     const saved = (() => { try { return readBatch(home, batchId) !== null; } catch { return false; } })();
     process.stderr.write(`decide: openBatch failed for ${batchId}: ${e instanceof Error ? e.message : String(e)}\n` +
-      (saved ? `decide: the batch WAS saved; the notify phase failed. Retry to finish the notify (idempotent):\n  ${retryHint(q, batchId)}\n` : "") );
+      (saved ? `decide: the batch WAS saved; the notify phase failed. Retry to finish the notify (idempotent):\n  ${retryHint(q, batchId, home)}\n` : "") );
     return 1;
   }
   // DEC-P2-2: report the ACTUAL notify credential, not the requested target.
