@@ -21,7 +21,7 @@ owner=f32a0507;协调者立项(gstack 深评借点②,[[gstack-eval]] §A 条 1�
 - 读 CLI:`egress list`、`egress verify`(ASCII,`AGENTHOP_EGRESS_DIR` 可覆盖目录供测试,同 rulings CLI)。
 - **不接线**:无任何生产者调用 `recordEgress`;dispatcher/relay/update/vm-ctl 等调用点的接线是**后续分轮**(每点 opt-in)。
 - 旗 `SWARM_EGRESS_LEDGER` 门控 `recordEgress` 接缝(`flagDefaultOn`)。v1 **dormant 默认 OFF**(opt-in):无生产者时翻不翻无运行时差;默认翻转留到接线落地并审过后由协调者+user 裁。
-- 复用已签 `holder-lock`(追加锁)——用其**稳定默认 API**(`acquireHolderLock(site)`,**不**传 `reclaimExternalStranded`),故 SUCC-1 对 holder-lock 的 opt-in 改动与本件无交集。
+- 追加锁复用已签 `single-flight`(`acquireSingleFlight(lockPath)`)。**[EL-4 订正,原冻结稿写 holder-lock 默认 API]**:审查席 codex:Work 指出 holder-lock 的**稳定默认 API**(不传 `reclaimExternalStranded`)**无死持有者回收**——crash 中途留下的锁会**永久禁用**账本(fail-open 账本按构造不该被一次崩溃永久关停)。`single-flight` 已具两条本件需要的保证:①死持有者 pid 回收 ②无 `mkdir->publish` 空窗(hard-link 原子发布)。审查席硬性要求:**绑定当下已具恢复保证的锁,不得依据另分支对 holder-lock 的改写(d7f6c917 @51a9fde)推导本件已获恢复**——故本件绑 `single-flight`,不等 holder-lock 重写。该窗口留作回归(selftest 中 stale `.append.lock` 死 pid ⇒ 下次记录回收并成功)。**遗留**:egress 依赖面出现 single-flight(文件锁)与 holder-lock(目录锁)两套,「两锁收敛为一」是协调者既有议题,非本件范围。
 
 ## ① 记录模型(**两行审计**:intent 先记 / result 后补,桥 r8 判例 / 协调者)
 
@@ -62,9 +62,9 @@ EgressEntry  = EgressBody & { seq; prevHash; hash }   // hash = sha256Hex(canoni
 落盘沿用仓库已证原子样板(projection/decision-batch/inbox 同款),**每条一文件**而非单 append-log——避免单日志中途写出半行、并发读者读到残行:
 
 - 目录 `~/.agenthop/swarm/egress/`,每条 `<零填充 seq>.json` 存一条 `EgressEntry`。
-- `appendEgress(site, record, tsSec)`:**先过 symlink 边界门**(见下)→ 取 `holder-lock`(默认 opts)→ 读最高 seq 文件为 tail → `chainEntry` → `<seq+1>.json` 经 tmp+rename 原子写 → 释放锁。
+- `appendEgress(site, record, tsSec)`:**先过 symlink 边界门**(见下)→ 取 `single-flight` 追加锁(见 §范围 EL-4)→ 读**最高文件名 seq**的文件为 tail → `chainEntry` → `<seq+1>.json` 经 tmp+rename 原子写 → 释放锁。**[EL-1]**:下一 seq 恒取**最高文件名 seq +1**(绝不用过滤后幸存计数),瞬时不可读的中间条目不会让 append 复用/覆盖 seq;权威 tail(最高 seq 文件)不可读/损坏、或内部 seq 与文件名不符 ⇒ **拒绝本次记录**(绝不改写历史),发送仍可继续(fail-open)。
 - **崩溃恢复**:rename 前崩 ⇒ 孤儿 `.tmp-*`(被 parse 忽略,纯盘泄漏,与 PROJ-4 同类,留 GC 后话);rename 后崩 ⇒ 完整文件,链完好。**无半条进链**。
-- **并发竞态(concurrency-race)**:两会话同机共家目录并发 `appendEgress` ⇒ holder-lock 单赢串行化,各自在锁内读 tail 取下一 seq ⇒ **不分叉、不撞同一 seq 文件**;两条按某顺序入链,verify 过。复用已证 CAS,不自造锁。
+- **并发竞态(concurrency-race)**:两会话同机共家目录并发 `appendEgress` ⇒ `single-flight` 单赢串行化,各自在锁内读 tail 取下一 seq ⇒ **不分叉、不撞同一 seq 文件**;两条按某顺序入链,verify 过。复用已证锁,不自造。(selftest 的并发夹具为两子进程**真并行**启动——早期 `spawnSync`+`spawnSync` 实为串行,已按审查席指正更正。)
 - **重启幂等(restart-idempotency)**:verify 确定;重启后 `appendEgress` 重读持久化 tail 续链;事件即事件,不去重(两次外发是两条真事件,非重复投递)。
 
 **symlink 边界门(吸收 PROJ-1/2 教训)**:egress 写前校验 `~/.agenthop/swarm/egress/`(及父 `swarm`)为真实目录、非 symlink(lstat,门法对齐 `consoleBoundaryOk`);被植 symlink 重定向 ⇒ 拒写 fail-closed。gauge/digest 当年缺这道门(PROJ-1/2),本件一开始就补。
