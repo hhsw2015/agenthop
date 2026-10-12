@@ -1,0 +1,36 @@
+{
+  "_comment": "DRAFT — the first real decision batch (north-star gap ③, 闭环首跑). The 5 items are the currently-pending user gates the coordinator named (TG bridge token / voice Phase2 / T5-1 / isolation code-change timing / skill landing A·B). The WORDING is f32a0507's draft and must be reviewed/edited by the coordinator before submit — these cards surface verbatim to the user. Submit: npx tsx scripts/decide.ts submit docs/swarm/decision-batch-first-draft.json --owner <coord-sid>. owner is supplied on the command line (do not hardcode a sid here).",
+  "items": [
+    {
+      "id": "gate-tg-bridge-token",
+      "kind": "呈批",
+      "summary": "TG 桥接 bot token 配置(启用外部 Telegram 桥)",
+      "suggestedAction": "approve = 配置 token 并启用 TG 桥;reject = 暂不启用",
+      "hardGate": true
+    },
+    {
+      "id": "gate-voice-phase2",
+      "kind": "呈批",
+      "summary": "语音 Phase2 立项",
+      "suggestedAction": "approve = 排期并启动语音 Phase2;defer = 本周期不排"
+    },
+    {
+      "id": "gate-t5-1",
+      "kind": "呈批",
+      "summary": "T5-1 立项裁点",
+      "suggestedAction": "approve = 启动 T5-1;defer = 待前序件落地后再议"
+    },
+    {
+      "id": "gate-isolation-code-timing",
+      "kind": "呈批",
+      "summary": "隔离动码放行时机(审中不动码 → 何时解冻)",
+      "suggestedAction": "approve = 当前批次合并后即解冻;defer = 维持冻结直至另行裁定"
+    },
+    {
+      "id": "gate-skill-landing-ab",
+      "kind": "呈批",
+      "summary": "skill 落点:A(方案 A)vs B(方案 B)",
+      "suggestedAction": "approve = 取落点 A(推荐);reject + reason=B = 改取落点 B"
+    }
+  ]
+}
