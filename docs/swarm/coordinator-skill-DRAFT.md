@@ -134,7 +134,7 @@ CLI 读 `AGENTHOP_RULINGS_DIR` 否则脚本所在仓(`rulings.ts:108`)——**�
 3. **招募 / 恢复成员(区分出生与恢复,CS8-P2-2)**:
    - **新成员出生 = fresh spawn**(取得**真实新身份**),**不是** resumeCmd——`resumeCmd`(`--resume <旧 sid>`)恢复的是一个**既有**会话;原样复用会把新成员错绑到旧 SID/cwd。出生后再把它纳入恢复快照。
    - **恢复既有成员 = 用其 resumeCmd**(F36 出生证:完整 resumeCmd 非裸 `--resume`;`swarm-resume`,保留该成员真实旗)。
-   - **快照入口**:`swarm-resume --snapshot` 从 live peers 捕获、**排除采集者自身**(`scripts/swarm-resume.ts`),**保留既有成员数据**——它是恢复快照,不是注册入口。
+   - **快照入口 + 旧快照保护(CS8-P2-2)**:`swarm-resume --snapshot` 从**当前 live peers** 重建快照(排除采集者自身,`scripts/swarm-resume.ts:60/66/71/73`;恢复命令 `resume.ts:121`),并**覆盖**目标文件——它**不读取/不合并旧快照**,故一个**离线旧成员**(不在 live peers 中)会从新文件消失。**默认覆盖不自动保全离线成员**。保护步骤:先用 `--out <另一未占用文件>` 把新快照写到别处,**保留原 `roster-snapshot.json` 作旧恢复依据**;**先处置未恢复的离线成员**(用其旧 resumeCmd 恢复,或确认可弃),**再**决定是否替换旧快照。它是恢复快照,不是注册入口。
    每个成员带角色说明(roleProfile)+ 契约 + CORE,spawn 即带全部规章;需要哪些角色/几个由协调者定(角色设计权,§9)。
 
 ### ④ 与既有 agenthop 协调者的关系
@@ -163,4 +163,4 @@ user 裁:**角色不固定,协调者自决**。本技能**不规定编制**—�
 
 ---
 
-_DRAFT r7 说明:落点待 user 裁(brief §③,首批 DecisionBatch)。取案 A 按英文 SKILL.md + zh-CN 双语拆分(build-release.mjs 契约)。五参由加载点注入,正文不硬编码具体工作区;v1 范围=单根单协调者,多根隔离/数据面改造为前置依赖(brief「支持的运行模式」)。§8 新项目开张流程 + §9 角色设计权为 user 完整图景补充(设计主体已签 @ade8be9)。r7 修 §8 CS8-P2-1/2+N1。r8 对齐 happycapy §8+§9 合判(判 b472ef6)增量:CS8-P2-1 加「未隔离不得报独立项目就绪」(§8③②如实报分支)、CS8-P2-2 **§9 招募工具引用同步**(出生=fresh spawn,恢复才 resumeCmd,roster-snapshot 非注册)、CS8-N1 **§9 的项目内 R18 限定注明新约定出处**、§9 加 user 原则句「无固定编制不等于免审;重要产出仍须作者以外的独立审者」(§9 原则本身已通过)。_
+_DRAFT r7 说明:落点待 user 裁(brief §③,首批 DecisionBatch)。取案 A 按英文 SKILL.md + zh-CN 双语拆分(build-release.mjs 契约)。五参由加载点注入,正文不硬编码具体工作区;v1 范围=单根单协调者,多根隔离/数据面改造为前置依赖(brief「支持的运行模式」)。§8 新项目开张流程 + §9 角色设计权为 user 完整图景补充(设计主体已签 @ade8be9)。r7 修 §8 CS8-P2-1/2+N1。r8 对齐 happycapy §8+§9 合判(判 b472ef6)增量:CS8-P2-1 加「未隔离不得报独立项目就绪」(§8③②如实报分支)、CS8-P2-2 **§9 招募工具引用同步**(出生=fresh spawn,恢复才 resumeCmd,roster-snapshot 非注册)、CS8-N1 **§9 的项目内 R18 限定注明新约定出处**、§9 加 user 原则句「无固定编制不等于免审;重要产出仍须作者以外的独立审者」。r9 修 happycapy @dbbe046 唯一残留 CS8-P2-2:**旧快照保护**——`swarm-resume --snapshot` 从 live peers 重建并覆盖、不合并旧快照,离线旧成员会消失;补保护步骤(`--out` 写别处、保留原 roster-snapshot、先处置离线成员再替换)。至此 happycapy §8/§9 全项 CLOSED(CS8-P2-1/2 + N1 + §9 原则)。_

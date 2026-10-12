@@ -1,6 +1,6 @@
 # coordinator-skill 简报 — 协调者技能化(设计·冻结候选 r3)
 
-owner aad02248 · 协调者 fe0376cd 派单(user 亲令,方向性大件)· 审查席 happycapy · base main @a1a933d · 状态:**设计全签 @ade8be9;§9 原则通过;r8 对齐 happycapy §8+§9 合判增量(CS8-P2-1 未隔离不报独立就绪 / CS8-P2-2 §9 招募引用同步 / CS8-N1 §9 R18 项目内限定出处 / §9 加免审不免原则);待 user 裁 A/B 落点后制作技能产物**
+owner aad02248 · 协调者 fe0376cd 派单(user 亲令,方向性大件)· 审查席 happycapy · base main @a1a933d · 状态:**设计全签 @ade8be9;§9 原则通过;r9 补 CS8-P2-2 旧快照保护(唯一残留);happycapy §8/§9 全项 CLOSED;待 user 裁 A/B 落点后制作技能产物**
 
 ## 缘起(user 原话)
 
