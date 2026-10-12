@@ -119,6 +119,25 @@ export function buildTgVerdictReceipt(batchId: string, itemId: string, verdict: 
   return { text: `[tg-verdict] 批 ${batchId} 项 ${itemId}: ${verdict}${scope ? ` (scope=${scope})` : ""}`, taskRef: "tg-verdict", title: "TG 决策回执" };
 }
 
+/** A clamped decision (the enforceScope output the ledger actually stores): a verdict, plus an approve scope. */
+export type ClampedDecision = { verdict: Verdict; scope?: ApprovalScope };
+
+/** TGP-4 — what verdict receipt (if any) THIS tap owes the coordinator, derived from the DURABLE LEDGER, not the volatile
+ *  recordDecision outcome. The receipt obligation must survive consume AND crash and must never be a false/stale audit:
+ *   - "recorded": this tap just wrote the ledger ⇒ owes its own clamped decision (`mine`).
+ *   - "consumed": the batch is SEALED ⇒ EITHER a genuinely-late/losing tap (owes nothing) OR the recovery of a tap that WAS
+ *     recorded earlier but whose receipt never completed (forward retry held the offset, or a crash before advance) and the batch
+ *     was consumed in between. We distinguish them by MATCHING `mine` against the ledger's FINAL decision for the item
+ *     (`ledgerFinal`, read post-seal from the stable ledger): a match ⇒ owe the REAL (ledger) receipt; a mismatch/absent ledger ⇒
+ *     a late/losing tap whose verdict is NOT the final truth ⇒ owe nothing (never report a stale/wrong verdict).
+ *  Returns the clamped decision to report, or null. Pure — the driver supplies `mine` (enforceScope of the item) and `ledgerFinal`
+ *  (readDecisions → the item's folded decision). On a match `mine` equals `ledgerFinal`, so returning `mine` is the real receipt. */
+export function receiptOwed(outcome: "recorded" | "consumed", mine: ClampedDecision, ledgerFinal: ClampedDecision | null): ClampedDecision | null {
+  if (outcome === "recorded") return mine; // this tap wrote the ledger ⇒ report what it recorded
+  // consumed: a recovery iff this tap IS the item's final decision; otherwise a late/losing tap that owes nothing.
+  return ledgerFinal && ledgerFinal.verdict === mine.verdict && ledgerFinal.scope === mine.scope ? mine : null;
+}
+
 /** The S11 receipt for a NON-verdict allowlisted TG message — forwarded to the coordinator inbox (notify + inbox-wake) so the
  *  user's free text is seen promptly. Notify only, never executed; the text is bounded. Pure. */
 export function buildTgMessageReceipt(chatId: number, text: string): { text: string; taskRef: string; title: string } {

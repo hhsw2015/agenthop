@@ -15,8 +15,8 @@ import https from "node:https";
 import http from "node:http";
 import tls from "node:tls";
 import { createHash } from "node:crypto";
-import { renderProjection, parseUpdate, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, tgIdempotencyKey, TG_ACK_TEXT, type RenderSpec, type TgUpdate } from "../packages/bus/src/swarm/tg-entry.js";
-import { listBatchesStrict, readBatch, recordDecision } from "../packages/bus/src/swarm/decision-batch-store.js";
+import { renderProjection, parseUpdate, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, receiptOwed, tgIdempotencyKey, TG_ACK_TEXT, type RenderSpec, type TgUpdate } from "../packages/bus/src/swarm/tg-entry.js";
+import { listBatchesStrict, readBatch, readDecisions, recordDecision } from "../packages/bus/src/swarm/decision-batch-store.js";
 import { enforceScope, type Verdict, type ApprovalScope } from "../packages/bus/src/swarm/decision-batch.js";
 import { writeInbox } from "../packages/bus/src/inbox.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
@@ -214,18 +214,28 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
     try { outcome = recordDecision(HOME, resolved.batchId, decision, Math.floor(Date.now() / 1000)); }
     catch (e) { console.error(`swarm-tg-entry: recordDecision transient error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return; } // transient IO -> retry this update next poll
     if (outcome === "contended") return; // a concurrent holder — retry this update next poll (do NOT advance)
-    // ① inbound immediacy: the verdict is in the ledger (recorded OR consumed) ⇒ wake the coordinator via a durable, idempotent
-    // receipt. TGP-4: report the ACTUALLY-recorded (enforceScope-clamped) scope, not the requested one. TGP-3: release the update
-    // (advance) ONLY after a durable handoff; a retry keeps it (next poll ⇒ "consumed", forward dedups on the same key — no dup).
-    // TGP-4: forward a verdict receipt ONLY on "recorded" — the tap that was actually WRITTEN to the ledger. A "consumed" outcome
-    // means the batch was already SEALED, so THIS tap did NOT change the ledger (a late tap on a decided item); reporting its
-    // verdict as "recorded" would be a false audit. consumed ⇒ no forward, just ack the user "already decided". TGP-3: key the
-    // receipt by the TG EVENT identity (update_id) — lossless + unique per update; a re-poll of the SAME update dedups, two
-    // distinct taps (approve then reject on one item) stay distinct. Release the offset only after a confirmed handoff.
-    if (outcome === "recorded") {
-      let enforcedScope: ApprovalScope | undefined;
-      try { const item = readBatch(HOME, resolved.batchId)?.items.find((it) => it.id === resolved.itemId); if (item) enforcedScope = enforceScope(item, decision).scope; } catch { enforcedScope = undefined; }
-      if (forwardToCoordinator(buildTgVerdictReceipt(resolved.batchId, resolved.itemId, decision.verdict, enforcedScope), tgIdempotencyKey("tg-verdict", u.update_id)) === "retry") return;
+    // ① inbound immediacy + TGP-4 DURABLE receipt obligation: the receipt owed for THIS update is derived from the LEDGER (the
+    // durable source of truth), not the volatile recordDecision outcome. "recorded" ⇒ this tap wrote the ledger ⇒ owes its own
+    // clamped decision. "consumed" ⇒ the batch is SEALED, which is EITHER a genuinely-late/losing tap (owes nothing) OR the
+    // recovery of a tap that WAS recorded earlier but whose receipt never completed (a forward retry held the offset, or a crash
+    // before advance) and the batch was consumed in between — distinguished by MATCHING this tap's clamped decision against the
+    // ledger's FINAL decision for the item (readDecisions folds a ledger that is identical before and after seal). receiptOwed
+    // (pure) returns the REAL receipt to forward, or null (a late/stale tap ⇒ no false audit). The forward is keyed by update_id
+    // (idempotent: a re-poll/restart dedups via writeInbox publishOnce). TGP-3: release the offset ONLY after a confirmed handoff.
+    if (outcome === "recorded" || outcome === "consumed") {
+      let mine: { verdict: Verdict; scope?: ApprovalScope };
+      try {
+        const item = readBatch(HOME, resolved.batchId)?.items.find((it) => it.id === resolved.itemId);
+        if (!item) return; // can't clamp without the item ⇒ transient (the batch should exist) ⇒ retry, do NOT advance
+        mine = enforceScope(item, decision);
+      } catch { return; } // transient batch read ⇒ retry
+      let ledgerFinal: { verdict: Verdict; scope?: ApprovalScope } | null = null;
+      if (outcome === "consumed") {
+        try { ledgerFinal = readDecisions(HOME, resolved.batchId)?.decisions.find((d) => d.id === resolved.itemId) ?? null; }
+        catch { return; } // transient ledger read ⇒ retry (never a false "late tap" from an unreadable ledger)
+      }
+      const owed = receiptOwed(outcome, mine, ledgerFinal);
+      if (owed && forwardToCoordinator(buildTgVerdictReceipt(resolved.batchId, resolved.itemId, owed.verdict, owed.scope), tgIdempotencyKey("tg-verdict", u.update_id)) === "retry") return;
     }
     writeOffset(u.update_id + 1); // terminal
     await ack(outcome === "recorded" ? "recorded" : outcome === "consumed" ? "already decided" : "unknown");

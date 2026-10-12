@@ -1,6 +1,6 @@
 // Selftest for the TG entry pure core (render/parse, ref-based) + the shared CORE decision rules (allowedScopes /
 // enforceScope / upsertDecision) + the digest. Run: node --import tsx packages/bus/src/swarm/tg-entry.selftest.mts
-import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, tgIdempotencyKey, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
+import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, receiptOwed, tgIdempotencyKey, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
 import { allowedScopes, enforceScope, upsertDecision, validDecision, type DecisionItem, type DecisionsDoc } from "./decision-batch.js";
 import { composeDigest } from "./morning-digest.js";
 import type { DualBandwidthReading } from "./dual-bandwidth.js";
@@ -128,6 +128,24 @@ const hard: DecisionItem = { id: "n2", kind: "spend", summary: "pay $40 invoice"
   t("TGP-3b lossless: ids differing only past 120 chars do NOT collide", tgIdempotencyKey("tg-v", "x".repeat(130) + "A") !== tgIdempotencyKey("tg-v", "x".repeat(130) + "B"));
   t("key is writeInbox-contract compliant", /^[A-Za-z0-9._-]{1,120}$/.test(tgIdempotencyKey("tg-msg", "x".repeat(400))));
   t("readable prefix retained", tgIdempotencyKey("tg-verdict", 1).startsWith("tg-verdict."));
+}
+
+// --- TGP-4: receiptOwed derives the receipt from the LEDGER, not the volatile outcome (pure; recovery vs late-tap) ---
+{
+  const appOnce = { verdict: "approve" as const, scope: "once" as const };
+  const appAlways = { verdict: "approve" as const, scope: "always" as const };
+  const rej = { verdict: "reject" as const };
+  // recorded ⇒ always report this tap's clamped decision (the ledger argument is irrelevant).
+  t("recorded -> owes mine (approve/once)", JSON.stringify(receiptOwed("recorded", appOnce, null)) === JSON.stringify(appOnce));
+  t("recorded -> owes mine even if ledger differs", JSON.stringify(receiptOwed("recorded", rej, appOnce)) === JSON.stringify(rej));
+  // consumed + MATCH ⇒ recovery of a recorded-but-undelivered receipt ⇒ owe the real (ledger) receipt.
+  t("consumed+match -> owes the real receipt (recovery)", JSON.stringify(receiptOwed("consumed", appOnce, appOnce)) === JSON.stringify(appOnce));
+  // consumed + MISMATCH ⇒ a late/losing tap whose verdict is NOT the final truth ⇒ owe nothing (no false/stale audit).
+  t("consumed+scope-mismatch -> null (late tap)", receiptOwed("consumed", appOnce, appAlways) === null);
+  t("consumed+verdict-mismatch -> null (late reject on sealed approve)", receiptOwed("consumed", rej, appOnce) === null);
+  t("consumed+absent-ledger -> null", receiptOwed("consumed", appOnce, null) === null);
+  // determinism (restart-idempotency at the decision level): same inputs ⇒ same output.
+  t("receiptOwed is deterministic", JSON.stringify(receiptOwed("consumed", appOnce, appOnce)) === JSON.stringify(receiptOwed("consumed", appOnce, appOnce)));
 }
 
 console.log("all tg-entry selftests passed");
