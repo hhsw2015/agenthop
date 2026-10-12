@@ -3,6 +3,7 @@
 // decision ledger (decision-batch). ZERO business logic: the allowed approval scopes come from the CORE (allowedScopes),
 // enforced there on the real item (NOT by the buttons); the digest comes from the CORE (morning-digest). No IO.
 import { createHash } from "node:crypto";
+import path from "node:path";
 import { allowedScopes, type DecisionItem, type Verdict, type ApprovalScope } from "./decision-batch.js";
 import type { DualBandwidthReading } from "./dual-bandwidth.js";
 import type { RoomPost } from "./chat-room.js";
@@ -122,21 +123,36 @@ export function buildTgVerdictReceipt(batchId: string, itemId: string, verdict: 
 /** A clamped decision (the enforceScope output the ledger actually stores): a verdict, plus an approve scope. */
 export type ClampedDecision = { verdict: Verdict; scope?: ApprovalScope };
 
-/** TGP-4 — what verdict receipt (if any) THIS tap owes the coordinator, derived from the DURABLE LEDGER, not the volatile
- *  recordDecision outcome. The receipt obligation must survive consume AND crash and must never be a false/stale audit:
- *   - "recorded": this tap just wrote the ledger ⇒ owes its own clamped decision (`mine`).
- *   - "consumed": the batch is SEALED ⇒ EITHER a genuinely-late/losing tap (owes nothing) OR the recovery of a tap that WAS
- *     recorded earlier but whose receipt never completed (forward retry held the offset, or a crash before advance) and the batch
- *     was consumed in between. We distinguish them by MATCHING `mine` against the ledger's FINAL decision for the item
- *     (`ledgerFinal`, read post-seal from the stable ledger): a match ⇒ owe the REAL (ledger) receipt; a mismatch/absent ledger ⇒
- *     a late/losing tap whose verdict is NOT the final truth ⇒ owe nothing (never report a stale/wrong verdict).
- *  Returns the clamped decision to report, or null. Pure — the driver supplies `mine` (enforceScope of the item) and `ledgerFinal`
- *  (readDecisions → the item's folded decision). On a match `mine` equals `ledgerFinal`, so returning `mine` is the real receipt. */
-export function receiptOwed(outcome: "recorded" | "consumed", mine: ClampedDecision, ledgerFinal: ClampedDecision | null): ClampedDecision | null {
-  if (outcome === "recorded") return mine; // this tap wrote the ledger ⇒ report what it recorded
-  // consumed: a recovery iff this tap IS the item's final decision; otherwise a late/losing tap that owes nothing.
-  return ledgerFinal && ledgerFinal.verdict === mine.verdict && ledgerFinal.scope === mine.scope ? mine : null;
+/** A durable receipt OBLIGATION — captured the instant recordDecision returns "recorded", keyed by the TG update_id. Its very
+ *  EXISTENCE is the proof that THIS event recorded a decision (fact b: event identity/responsibility, TG-r5 TGP-4). The driver
+ *  enqueues it (tg-queue, seq=update_id) and drains it to the coordinator; a consumed/late/never-recorded tap gets NO obligation. */
+export type ReceiptObligation = { updateId: number; batchId: string; itemId: string; recordedValue: ClampedDecision };
+
+/** The action a drained obligation yields. */
+export type ReceiptAction = { action: "forward"; value: ClampedDecision } | { action: "retry" } | { action: "drop" };
+
+/** TGP-4 (TG-r5) — decide the receipt for a durable obligation, from TWO INDEPENDENT fact sources (never one read standing for
+ *  both): the obligation (event identity/responsibility — it exists ⇒ the event truly recorded) and the AUTHORITATIVE consumed
+ *  result of its batch (NOT the live orphan-inclusive fold). The obligation's own `recordedValue` is only the value for the
+ *  not-yet-sealed case; once sealed, the FINAL value comes from the consumed authority:
+ *   - authority unknown (sealed-but-unreadable) ⇒ RETRY (keep the obligation; never guess a value, never drop).
+ *   - not sealed ⇒ FORWARD the recorded value (what the coordinator will consume).
+ *   - sealed, the item is present in the authority ⇒ FORWARD that authoritative final value (orphan-fold is irrelevant).
+ *   - sealed, the item is ABSENT from the authority ⇒ this recorded tap was ORPHANED (superseded / published after the seal); the
+ *     store emits its own orphan re-batch signal, so DROP the receipt (no stale value, no duplicate of the store's signal).
+ *  Pure. `itemValue` is the obligation item's decision in the digest-verified consumed projection, or null if absent. */
+export function obligationReceiptValue(
+  authority: { consumed: true; itemValue: ClampedDecision | null } | { consumed: false } | { consumed: "unknown" },
+  recordedValue: ClampedDecision,
+): ReceiptAction {
+  if (authority.consumed === "unknown") return { action: "retry" };
+  if (authority.consumed === false) return { action: "forward", value: recordedValue };
+  return authority.itemValue ? { action: "forward", value: authority.itemValue } : { action: "drop" };
 }
+
+/** The bridge's durable RECEIPT-OBLIGATION queue dir: a receipt owed to the coordinator for a recorded TG verdict, captured at
+ *  record time (keyed by update_id) and drained with the authoritative final value. Local to the bridge; survives restart. Pure. */
+export function tgReceiptObligationDir(home: string): string { return path.join(home, ".agenthop", "tg", "receipt-obligations"); }
 
 /** The S11 receipt for a NON-verdict allowlisted TG message — forwarded to the coordinator inbox (notify + inbox-wake) so the
  *  user's free text is seen promptly. Notify only, never executed; the text is bounded. Pure. */

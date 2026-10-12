@@ -15,8 +15,9 @@ import https from "node:https";
 import http from "node:http";
 import tls from "node:tls";
 import { createHash } from "node:crypto";
-import { renderProjection, parseUpdate, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, receiptOwed, tgIdempotencyKey, TG_ACK_TEXT, type RenderSpec, type TgUpdate } from "../packages/bus/src/swarm/tg-entry.js";
-import { listBatchesStrict, readBatch, readDecisions, recordDecision } from "../packages/bus/src/swarm/decision-batch-store.js";
+import { renderProjection, parseUpdate, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, obligationReceiptValue, tgReceiptObligationDir, tgIdempotencyKey, TG_ACK_TEXT, type RenderSpec, type TgUpdate, type ReceiptObligation } from "../packages/bus/src/swarm/tg-entry.js";
+import { listBatchesStrict, readBatch, readConsumedResult, recordDecision } from "../packages/bus/src/swarm/decision-batch-store.js";
+import { enqueueQueue, drainQueue } from "../packages/bus/src/swarm/tg-queue.js";
 import { enforceScope, type Verdict, type ApprovalScope } from "../packages/bus/src/swarm/decision-batch.js";
 import { writeInbox } from "../packages/bus/src/inbox.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
@@ -146,6 +147,31 @@ function forwardToCoordinator(fields: { text: string; taskRef: string; title: st
 // retry, so an update can re-poll — don't re-ack each time). Pruned below the committed offset each poll.
 const ackedUpdates = new Set<number>();
 
+// TGP-4 (TG-r5): the durable receipt-obligation drain. For each obligation (captured at record time, keyed by update_id), the
+// receipt VALUE is resolved from the AUTHORITATIVE consumed result (readConsumedResult — the digest-verified consumed projection,
+// NOT the orphan-inclusive live fold): not-sealed ⇒ the recorded value; sealed+present ⇒ the authoritative final; sealed+absent ⇒
+// the tap was orphaned (the store signals its own re-batch) ⇒ DROP; unknown ⇒ retry. The forward is keyed by update_id so a
+// re-poll/restart/dual-instance dedups (writeInbox publishOnce). A release/ack fault is tracked in receiptStuck (DO-P2-2).
+const receiptStuck = new Set<string>();
+async function drainReceiptObligations(): Promise<void> {
+  try {
+    await drainQueue(tgReceiptObligationDir(HOME), (rec) => {
+      const ob = rec as Partial<ReceiptObligation>;
+      if (!ob || typeof ob !== "object" || typeof ob.updateId !== "number" || typeof ob.batchId !== "string" || typeof ob.itemId !== "string" || !ob.recordedValue) return "sent"; // shape-invalid ⇒ discharge
+      let authority: { consumed: true; itemValue: { verdict: Verdict; scope?: ApprovalScope } | null } | { consumed: false } | { consumed: "unknown" };
+      try {
+        const cr = readConsumedResult(HOME, ob.batchId);
+        if (cr.consumed === true) { const d = cr.doc.decisions.find((x) => x.id === ob.itemId); authority = { consumed: true, itemValue: d ? { verdict: d.verdict, ...(d.scope ? { scope: d.scope } : {}) } : null }; }
+        else authority = cr; // { consumed: false } | { consumed: "unknown" }
+      } catch { return "retry"; } // transient consumed-authority read ⇒ keep the obligation
+      const act = obligationReceiptValue(authority, ob.recordedValue);
+      if (act.action === "retry") return "retry";
+      if (act.action === "drop") return "sent"; // orphaned tap — the store's own orphan signal covers re-batching; no receipt
+      return forwardToCoordinator(buildTgVerdictReceipt(ob.batchId, ob.itemId, act.value.verdict, act.value.scope), tgIdempotencyKey("tg-verdict", ob.updateId)) === "retry" ? "retry" : "sent";
+    }, { stuck: receiptStuck });
+  } catch { /* fail-soft: a drain fault never kills the poll loop */ }
+}
+
 /** Send a RenderSpec (throws on API failure so the caller can keep a retry obligation). v1: message + inline keyboard; a
  *  photo/card falls back to its caption (no rasterizer yet); a document rides as a pointer in text. */
 async function send(token: string, chatId: number, spec: RenderSpec): Promise<void> {
@@ -180,6 +206,7 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
   // getUpdates timeout=25 bounds only the SERVER long-poll wait (TGP-6): it is NOT an end-to-end SLA. The loop is serial
   // (notifyNewBatches + pollOnce + per-item sends), so outbound new-batch latency ≈ one loop iteration (long-poll + that tick's
   // work), not a hard ≤25s. Inbound verdict→coordinator latency is independent — it rides the durable receipt + inbox-wake below.
+  await drainReceiptObligations(); // recover any obligation a prior poll/process held (crash-recovery + coordinator-was-down retry) BEFORE the long-poll blocks
   const committed = readOffset();
   for (const id of ackedUpdates) if (id < committed) ackedUpdates.delete(id); // bound the ack-dedup set to the live window
   const updates = await tg(token, "getUpdates", { offset: committed, timeout: 25, allowed_updates: ["callback_query", "message"] });
@@ -214,32 +241,26 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
     try { outcome = recordDecision(HOME, resolved.batchId, decision, Math.floor(Date.now() / 1000)); }
     catch (e) { console.error(`swarm-tg-entry: recordDecision transient error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return; } // transient IO -> retry this update next poll
     if (outcome === "contended") return; // a concurrent holder — retry this update next poll (do NOT advance)
-    // ① inbound immediacy + TGP-4 DURABLE receipt obligation: the receipt owed for THIS update is derived from the LEDGER (the
-    // durable source of truth), not the volatile recordDecision outcome. "recorded" ⇒ this tap wrote the ledger ⇒ owes its own
-    // clamped decision. "consumed" ⇒ the batch is SEALED, which is EITHER a genuinely-late/losing tap (owes nothing) OR the
-    // recovery of a tap that WAS recorded earlier but whose receipt never completed (a forward retry held the offset, or a crash
-    // before advance) and the batch was consumed in between — distinguished by MATCHING this tap's clamped decision against the
-    // ledger's FINAL decision for the item (readDecisions folds a ledger that is identical before and after seal). receiptOwed
-    // (pure) returns the REAL receipt to forward, or null (a late/stale tap ⇒ no false audit). The forward is keyed by update_id
-    // (idempotent: a re-poll/restart dedups via writeInbox publishOnce). TGP-3: release the offset ONLY after a confirmed handoff.
-    if (outcome === "recorded" || outcome === "consumed") {
+    // ① inbound immediacy + TGP-4 (TG-r5) DURABLE, EVENT-BOUND receipt obligation. A receipt is owed ONLY for a tap THIS call
+    // actually RECORDED — the obligation's existence IS the proof that this update (identity = update_id) recorded a decision (fact
+    // b). A "consumed"/"unknown-item" tap did NOT record (a late/losing tap, or one the coordinator already decided via console) ⇒
+    // NO obligation ⇒ never a false/stale receipt. The obligation is captured DURABLY (keyed by update_id) BEFORE the offset
+    // advances, so recovery delivers it from the obligation — never by re-deriving from the volatile ledger fold. The FINAL value is
+    // resolved at delivery from the AUTHORITATIVE consumed result (fact a), not here. A persist fault ⇒ hold the offset and retry.
+    if (outcome === "recorded") {
       let mine: { verdict: Verdict; scope?: ApprovalScope };
       try {
         const item = readBatch(HOME, resolved.batchId)?.items.find((it) => it.id === resolved.itemId);
         if (!item) return; // can't clamp without the item ⇒ transient (the batch should exist) ⇒ retry, do NOT advance
         mine = enforceScope(item, decision);
       } catch { return; } // transient batch read ⇒ retry
-      let ledgerFinal: { verdict: Verdict; scope?: ApprovalScope } | null = null;
-      if (outcome === "consumed") {
-        try { ledgerFinal = readDecisions(HOME, resolved.batchId)?.decisions.find((d) => d.id === resolved.itemId) ?? null; }
-        catch { return; } // transient ledger read ⇒ retry (never a false "late tap" from an unreadable ledger)
-      }
-      const owed = receiptOwed(outcome, mine, ledgerFinal);
-      if (owed && forwardToCoordinator(buildTgVerdictReceipt(resolved.batchId, resolved.itemId, owed.verdict, owed.scope), tgIdempotencyKey("tg-verdict", u.update_id)) === "retry") return;
+      const ob: ReceiptObligation = { updateId: u.update_id, batchId: resolved.batchId, itemId: resolved.itemId, recordedValue: { verdict: mine.verdict, ...(mine.scope ? { scope: mine.scope } : {}) } };
+      if (enqueueQueue(tgReceiptObligationDir(HOME), ob, u.update_id) === "failed") return; // can't persist the obligation ⇒ hold offset, retry
     }
-    writeOffset(u.update_id + 1); // terminal
+    writeOffset(u.update_id + 1); // terminal (the obligation, if any, is durable)
     await ack(outcome === "recorded" ? "recorded" : outcome === "consumed" ? "already decided" : "unknown");
   }
+  await drainReceiptObligations(); // deliver this cycle's recorded receipts (fast path) + anything a prior poll held
 }
 
 async function main(): Promise<void> {

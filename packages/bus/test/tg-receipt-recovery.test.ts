@@ -1,113 +1,133 @@
-// TG bridge receipt-recovery fixtures (TGP-4 fix + TGP-7 three-class gate). These exercise the bridge's RECEIPT/OFFSET path — the
-// exact path the reviewer's crash fixture failed on in r3. The obligation is derived from the DURABLE LEDGER (receiptOwed) instead
-// of the volatile recordDecision outcome, so a recorded-but-undelivered receipt survives consume AND a hard crash. Per the infra
-// law, three classes: crash-recovery (real SIGKILL subprocess), restart-idempotency (re-poll/restart dedup), concurrency-race
-// (dual-instance record + forward). Fixtures use the SAME store entry points the driver calls.
+// TG bridge receipt-recovery fixtures (TGP-4 TG-r5 + TGP-7 delivery-layer gate). The receipt obligation is derived from TWO
+// independent fact sources: a DURABLE per-event obligation (captured only on "recorded", keyed by update_id — event identity) and
+// the AUTHORITATIVE consumed result (readConsumedResult — the digest-verified consumed projection, NOT the orphan-inclusive fold).
+// These fixtures assert the DELIVERY layer: the coordinator's received receipt COUNT + VALUE + the offset, a real two-process race,
+// and the orphan-interleave regression the r4 review exposed. The in-process `deliver` mirrors the driver's drainReceiptObligations
+// (same tg-queue claim, readConsumedResult, obligationReceiptValue, writeInbox); one subprocess variant proves real concurrency.
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
-import { spawnSync, spawn } from "node:child_process";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { openBatch, consumeDecisions, recordDecision, readDecisions, readBatch } from "../src/swarm/decision-batch-store.js";
-import { enforceScope } from "../src/swarm/decision-batch.js";
-import { receiptOwed } from "../src/swarm/tg-entry.js";
+import { openBatch, consumeDecisions, recordDecision, readDecisions, readConsumedResult } from "../src/swarm/decision-batch-store.js";
+import { enforceScope, type DecisionItem } from "../src/swarm/decision-batch.js";
+import { obligationReceiptValue, tgReceiptObligationDir, tgIdempotencyKey, type ReceiptObligation } from "../src/swarm/tg-entry.js";
+import { enqueueQueue, drainQueue } from "../src/swarm/tg-queue.js";
 import { writeInbox, claimInbox } from "../src/inbox.js";
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const CHILD = path.join(PKG_ROOT, "test", "fixtures", "tg-crash-child.mts");
-const offsetPath = (home: string) => path.join(home, ".agenthop", "tg", "offset");
+const DELIVER_CHILD = path.join(PKG_ROOT, "test", "fixtures", "tg-deliver-child.mts");
+const COORD = "coord-sid";
 
 let HOME: string;
-beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-tgrr-")); });
+beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-tgr5-")); });
 afterEach(() => { try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ } });
 
 const soft = (id: string) => ({ id, kind: "merge", summary: `merge ${id}`, suggestedAction: "approve" as const });
-const inboxMsg = (text: string, ts: number) => ({ from: "swarm-tg-entry", fromLabel: "tg-entry", text, taskRef: "tg-verdict", title: "TG 决策回执", via: "local" as const, ts });
-const runChild = (args: string[]) => new Promise<{ code: number | null; signal: NodeJS.Signals | null; out: string }>((resolve) => {
-  const c = spawn(process.execPath, ["--import", "tsx", CHILD, ...args], { cwd: PKG_ROOT });
-  let out = ""; c.stdout.on("data", (d) => { out += String(d); }); c.stderr.on("data", () => {});
-  c.on("close", (code, signal) => resolve({ code, signal, out: out.trim() }));
+const seqSlotPath = (batchId: string, n: number) => path.join(HOME, ".agenthop", "console", "decision-batches", batchId, "seq", `${n}.json`);
+const coordReceipts = () => claimInbox(HOME, [COORD], "p").map((c) => c.msg.text);
+
+// the driver's record→obligation step: record the tap, then durably capture the obligation keyed by update_id (fact b).
+function recordAndCapture(batchId: string, itemId: string, updateId: number, dec: { id: string; verdict: "approve" | "reject" | "defer"; scope?: "once" | "this-chat" | "always" }, item: DecisionItem): string {
+  const outcome = recordDecision(HOME, batchId, dec, 1);
+  if (outcome === "recorded") {
+    const mine = enforceScope(item, dec);
+    enqueueQueue(tgReceiptObligationDir(HOME), { updateId, batchId, itemId, recordedValue: { verdict: mine.verdict, ...(mine.scope ? { scope: mine.scope } : {}) } } satisfies ReceiptObligation, updateId);
+  }
+  return outcome;
+}
+
+// the driver's drainReceiptObligations (in-process; same functions the driver uses).
+async function deliver(): Promise<{ sent: number; retried: number; skipped: number }> {
+  const r = await drainQueue(tgReceiptObligationDir(HOME), (rec) => {
+    const ob = rec as Partial<ReceiptObligation>;
+    if (!ob || typeof ob.updateId !== "number" || typeof ob.batchId !== "string" || typeof ob.itemId !== "string" || !ob.recordedValue) return "sent";
+    let authority: { consumed: true; itemValue: { verdict: "approve" | "reject" | "defer"; scope?: "once" | "this-chat" | "always" } | null } | { consumed: false } | { consumed: "unknown" };
+    try {
+      const cr = readConsumedResult(HOME, ob.batchId);
+      if (cr.consumed === true) { const d = cr.doc.decisions.find((x) => x.id === ob.itemId); authority = { consumed: true, itemValue: d ? { verdict: d.verdict, ...(d.scope ? { scope: d.scope } : {}) } : null }; }
+      else authority = cr;
+    } catch { return "retry"; }
+    const act = obligationReceiptValue(authority, ob.recordedValue);
+    if (act.action === "retry") return "retry";
+    if (act.action === "drop") return "sent";
+    const res = writeInbox(HOME, COORD, { from: "tg", fromLabel: "tg", text: `${ob.itemId}:${act.value.verdict}:${act.value.scope ?? "-"}`, taskRef: "tg-verdict", title: "t", via: "local", ts: Date.now() }, tgIdempotencyKey("tg-verdict", ob.updateId));
+    return (res === "published" || res === "already") ? "sent" : "retry";
+  });
+  return { sent: r.sent, retried: r.retried, skipped: r.skipped };
+}
+const runDeliverChild = (): Promise<number> => new Promise((resolve) => {
+  const c = spawn(process.execPath, ["--import", "tsx", DELIVER_CHILD, HOME, tgReceiptObligationDir(HOME), COORD], { cwd: PKG_ROOT });
+  c.on("close", (code) => resolve(code ?? -1));
 });
 
-// ── FIXTURE CLASS 1: CRASH RECOVERY ──────────────────────────────────────────────────────────────────────────────────
-describe("tg receipt-recovery crash-recovery", () => {
-  test("REAL SIGKILL after record, batch then consumed → the real receipt is STILL recoverable from the sealed ledger (r3 lost it)", () => {
+// ── crash-recovery (delivery layer, event-bound) ─────────────────────────────────────────────────────────────────────
+describe("tg receipt-recovery crash-recovery (delivery layer)", () => {
+  test("recorded→obligation durable→(crash: not delivered)→consume→restart delivers EXACTLY ONE real receipt; offset final", async () => {
     const b = openBatch(HOME, { owner: "o", items: [soft("n1")], nowSec: 1 });
-    // a REAL bridge process records the verdict, then hard-crashes before writing the offset or forwarding the receipt.
-    const r = spawnSync(process.execPath, ["--import", "tsx", CHILD, HOME, b.batchId, "n1", "approve", "always", "crash"], { cwd: PKG_ROOT, encoding: "utf8" });
-    expect(r.signal).toBe("SIGKILL"); // a true hard crash, not a graceful exit
-    // on-disk after the crash: the decision is durable; the offset was never advanced.
-    const led0 = readDecisions(HOME, b.batchId)?.decisions.find((d) => d.id === "n1");
-    expect(led0).toMatchObject({ id: "n1", verdict: "approve", scope: "always" });
-    expect(existsSync(offsetPath(HOME))).toBe(false); // crash before advance
-    // another consumer seals the batch before the bridge restarts (the exact interleave that broke r3).
+    expect(recordAndCapture(b.batchId, "n1", 42, { id: "n1", verdict: "approve", scope: "always" }, b.items[0]!)).toBe("recorded");
+    // the driver advances the offset once the obligation is durable:
+    const offset = path.join(HOME, ".agenthop", "tg", "offset"); mkdirSync(path.dirname(offset), { recursive: true }); writeFileSync(offset, "43");
+    // "crash": we never delivered. Another consumer seals the batch before the bridge restarts.
     expect(consumeDecisions(HOME, b.batchId).consumed).toBe(true);
-    // RESTART: the bridge re-polls the same update → recordDecision now returns "consumed".
-    const dec = { id: "n1", verdict: "approve" as const, scope: "always" as const };
-    expect(recordDecision(HOME, b.batchId, dec, 2)).toBe("consumed");
-    // r4 recovery: derive the obligation from the sealed ledger → the REAL receipt (coordinator gets 1, NOT 0-stuck).
-    const item = readBatch(HOME, b.batchId)!.items.find((it) => it.id === "n1")!;
-    const ledgerFinal = readDecisions(HOME, b.batchId)?.decisions.find((d) => d.id === "n1") ?? null;
-    const owed = receiptOwed("consumed", enforceScope(item, dec), ledgerFinal);
-    expect(owed).toMatchObject({ verdict: "approve", scope: "always" });
+    // restart: the durable obligation (keyed by update_id 42) drives delivery — no re-derivation from the ledger fold.
+    const d = await deliver();
+    expect(d.sent).toBe(1);
+    expect(coordReceipts()).toEqual(["n1:approve:always"]); // the REAL authoritative receipt, exactly one
+    expect(readFileSync(offset, "utf8")).toBe("43"); // offset reached update_id+1 and stayed
   });
 
-  test("a late/losing tap after seal owes NO receipt (never a false/stale audit)", () => {
+  test("a consumed/never-recorded tap captures NO obligation ⇒ coordinator receives nothing (no false receipt)", async () => {
     const b = openBatch(HOME, { owner: "o", items: [soft("n1")], nowSec: 1 });
-    recordDecision(HOME, b.batchId, { id: "n1", verdict: "approve", scope: "always" }, 1);
-    expect(consumeDecisions(HOME, b.batchId).consumed).toBe(true);
-    const item = readBatch(HOME, b.batchId)!.items.find((it) => it.id === "n1")!;
-    const lateReject = { id: "n1", verdict: "reject" as const };
-    expect(recordDecision(HOME, b.batchId, lateReject, 2)).toBe("consumed");
-    const ledgerFinal = readDecisions(HOME, b.batchId)?.decisions.find((d) => d.id === "n1") ?? null;
-    expect(receiptOwed("consumed", enforceScope(item, lateReject), ledgerFinal)).toBeNull(); // approve stays the truth; reject owes nothing
+    recordDecision(HOME, b.batchId, { id: "n1", verdict: "approve", scope: "once" }, 1); // the console decides
+    consumeDecisions(HOME, b.batchId);                                                     // and seals
+    // two late TG taps with the SAME value arrive after the seal — recordDecision returns "consumed" ⇒ NO obligation captured.
+    expect(recordAndCapture(b.batchId, "n1", 42, { id: "n1", verdict: "approve", scope: "once" }, b.items[0]!)).toBe("consumed");
+    expect(recordAndCapture(b.batchId, "n1", 43, { id: "n1", verdict: "approve", scope: "once" }, b.items[0]!)).toBe("consumed");
+    const d = await deliver();
+    expect(d.sent).toBe(0);
+    expect(coordReceipts()).toEqual([]); // value-equality is NOT event identity ⇒ zero spurious recovery receipts
   });
 });
 
-// ── FIXTURE CLASS 2: RESTART IDEMPOTENCY ─────────────────────────────────────────────────────────────────────────────
-describe("tg receipt-recovery restart-idempotency", () => {
-  test("re-forwarding the same receipt (same update_id key) after a restart lands EXACTLY ONE coordinator message", () => {
-    const key = "tg-verdict.deadbeefcafe"; // = tgIdempotencyKey("tg-verdict", update_id) in the driver
-    expect(writeInbox(HOME, "coord", inboxMsg("[tg-verdict] 批 b1 项 n1: approve (scope=always)", 1), key)).toBe("published");
-    expect(writeInbox(HOME, "coord", inboxMsg("[tg-verdict] 批 b1 项 n1: approve (scope=always)", 2), key)).toBe("already"); // a restart re-forward dedups
-    expect(claimInbox(HOME, ["coord"], "pidX").length).toBe(1); // exactly one receipt, never a duplicate
-  });
-
-  test("re-deriving the obligation after a restart is deterministic (same real receipt)", () => {
+// ── orphan-interleave regression (the r4-review counterexample) ───────────────────────────────────────────────────────
+describe("tg receipt-recovery orphan-interleave (TGP-4 authority)", () => {
+  test("a late ORPHAN reject slot does NOT change the receipt: the authoritative consumed value (approve) is delivered", async () => {
     const b = openBatch(HOME, { owner: "o", items: [soft("n1")], nowSec: 1 });
-    recordDecision(HOME, b.batchId, { id: "n1", verdict: "approve", scope: "always" }, 1);
-    consumeDecisions(HOME, b.batchId);
-    const item = readBatch(HOME, b.batchId)!.items.find((it) => it.id === "n1")!;
-    const mine = enforceScope(item, { id: "n1", verdict: "approve", scope: "always" });
-    const derive = () => receiptOwed("consumed", mine, readDecisions(HOME, b.batchId)?.decisions.find((d) => d.id === "n1") ?? null);
-    expect(derive()).toEqual(derive());
-    expect(derive()).toMatchObject({ verdict: "approve", scope: "always" });
+    expect(recordAndCapture(b.batchId, "n1", 42, { id: "n1", verdict: "approve", scope: "once" }, b.items[0]!)).toBe("recorded"); // slot 0 = approve
+    expect(consumeDecisions(HOME, b.batchId).consumed).toBe(true); // claim + marker digest bind APPROVE
+    // simulate the legal late orphan: a higher reject slot published after the seal (the store folds it; the claim does NOT).
+    writeFileSync(seqSlotPath(b.batchId, 1), JSON.stringify({ batchId: b.batchId, decidedAtSec: 2, decisions: [{ id: "n1", verdict: "reject" }], kind: "tap" }));
+    expect(readDecisions(HOME, b.batchId)!.decisions.find((d) => d.id === "n1")!.verdict).toBe("reject"); // the orphan-inclusive fold
+    const auth = readConsumedResult(HOME, b.batchId); expect(auth.consumed).toBe(true);
+    if (auth.consumed === true) expect(auth.doc.decisions.find((d) => d.id === "n1")!.verdict).toBe("approve"); // the AUTHORITY stays approve
+    const d = await deliver();
+    expect(d.sent).toBe(1);
+    expect(coordReceipts()).toEqual(["n1:approve:once"]); // NOT the orphan reject — the authoritative consumed value
   });
 });
 
-// ── FIXTURE CLASS 3: CONCURRENCY RACE (dual-instance) ─────────────────────────────────────────────────────────────────
-describe("tg receipt-recovery concurrency-race", () => {
-  test("two REAL bridge instances record the same item concurrently → the ledger holds exactly ONE final decision (no corruption)", async () => {
+// ── restart-idempotency: a re-poll / replay never double-delivers ─────────────────────────────────────────────────────
+describe("tg receipt-recovery restart-idempotency (delivery layer)", () => {
+  test("delivering, then re-capturing the same update_id, yields exactly ONE coordinator receipt", async () => {
     const b = openBatch(HOME, { owner: "o", items: [soft("n1")], nowSec: 1 });
-    const [a, c] = await Promise.all([
-      runChild([HOME, b.batchId, "n1", "approve", "always", "exit"]),
-      runChild([HOME, b.batchId, "n1", "approve", "once", "exit"]),
-    ]);
-    // neither instance crashed/threw; each reported a terminal outcome.
-    for (const r of [a, c]) { expect(r.signal).toBeNull(); expect(["recorded", "consumed", "contended"]).toContain(r.out); }
-    expect([a.out, c.out].includes("recorded")).toBe(true); // at least one won the consume lock and recorded
-    const finals = readDecisions(HOME, b.batchId)!.decisions.filter((d) => d.id === "n1");
-    expect(finals.length).toBe(1); // exactly one final decision — no double-entry, no corruption
-    expect(finals[0]!.verdict).toBe("approve");
-    expect(["once", "always"]).toContain(finals[0]!.scope); // a legal clamped scope (whichever instance won)
+    recordAndCapture(b.batchId, "n1", 42, { id: "n1", verdict: "approve", scope: "once" }, b.items[0]!);
+    expect((await deliver()).sent).toBe(1); // delivered + DONE marker written
+    // a re-poll of the same update after a restart re-captures ⇒ the queue DONE marker makes it a no-op ("already").
+    expect(enqueueQueue(tgReceiptObligationDir(HOME), { updateId: 42, batchId: b.batchId, itemId: "n1", recordedValue: { verdict: "approve", scope: "once" } }, 42)).toBe("already");
+    await deliver();
+    expect(coordReceipts().length).toBe(1); // exactly one, never a duplicate across the restart
   });
+});
 
-  test("two concurrent forwards of the same receipt key → exactly one coordinator message (publishOnce atomic claim)", () => {
-    const key = "tg-verdict.racekey";
-    const results = [writeInbox(HOME, "coord", inboxMsg("x", 1), key), writeInbox(HOME, "coord", inboxMsg("x", 2), key)];
-    expect(results.filter((r) => r === "published").length).toBe(1);
-    expect(results.filter((r) => r === "already").length).toBe(1);
-    expect(claimInbox(HOME, ["coord"], "p").length).toBe(1); // exactly-once at the coordinator even under a dual-instance forward
+// ── concurrency: a REAL two-process dual-instance drain ⇒ exactly one coordinator receipt ─────────────────────────────
+describe("tg receipt-recovery dual-instance (real two processes)", () => {
+  test("two bridge instances draining the SAME obligation queue deliver the receipt exactly once", async () => {
+    const b = openBatch(HOME, { owner: "o", items: [soft("n1")], nowSec: 1 });
+    recordAndCapture(b.batchId, "n1", 42, { id: "n1", verdict: "approve", scope: "always" }, b.items[0]!); // not sealed ⇒ forward recorded value
+    const [a, c] = await Promise.all([runDeliverChild(), runDeliverChild()]);
+    expect(a).toBe(0); expect(c).toBe(0); // neither crashed
+    expect(coordReceipts().length).toBe(1); // publishOnce + tg-queue atomic claim ⇒ exactly once at the coordinator
   });
 });

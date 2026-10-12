@@ -1,6 +1,6 @@
 // Selftest for the TG entry pure core (render/parse, ref-based) + the shared CORE decision rules (allowedScopes /
 // enforceScope / upsertDecision) + the digest. Run: node --import tsx packages/bus/src/swarm/tg-entry.selftest.mts
-import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, receiptOwed, tgIdempotencyKey, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
+import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, obligationReceiptValue, tgReceiptObligationDir, tgIdempotencyKey, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
 import { allowedScopes, enforceScope, upsertDecision, validDecision, type DecisionItem, type DecisionsDoc } from "./decision-batch.js";
 import { composeDigest } from "./morning-digest.js";
 import type { DualBandwidthReading } from "./dual-bandwidth.js";
@@ -130,22 +130,24 @@ const hard: DecisionItem = { id: "n2", kind: "spend", summary: "pay $40 invoice"
   t("readable prefix retained", tgIdempotencyKey("tg-verdict", 1).startsWith("tg-verdict."));
 }
 
-// --- TGP-4: receiptOwed derives the receipt from the LEDGER, not the volatile outcome (pure; recovery vs late-tap) ---
+// --- TGP-4 (TG-r5): obligationReceiptValue uses TWO fact sources — the obligation (event identity) + the AUTHORITATIVE consumed
+//     result (value). Pure; the orphan-fold is never consulted here (the driver passes the digest-verified authority). ---
 {
   const appOnce = { verdict: "approve" as const, scope: "once" as const };
   const appAlways = { verdict: "approve" as const, scope: "always" as const };
   const rej = { verdict: "reject" as const };
-  // recorded ⇒ always report this tap's clamped decision (the ledger argument is irrelevant).
-  t("recorded -> owes mine (approve/once)", JSON.stringify(receiptOwed("recorded", appOnce, null)) === JSON.stringify(appOnce));
-  t("recorded -> owes mine even if ledger differs", JSON.stringify(receiptOwed("recorded", rej, appOnce)) === JSON.stringify(rej));
-  // consumed + MATCH ⇒ recovery of a recorded-but-undelivered receipt ⇒ owe the real (ledger) receipt.
-  t("consumed+match -> owes the real receipt (recovery)", JSON.stringify(receiptOwed("consumed", appOnce, appOnce)) === JSON.stringify(appOnce));
-  // consumed + MISMATCH ⇒ a late/losing tap whose verdict is NOT the final truth ⇒ owe nothing (no false/stale audit).
-  t("consumed+scope-mismatch -> null (late tap)", receiptOwed("consumed", appOnce, appAlways) === null);
-  t("consumed+verdict-mismatch -> null (late reject on sealed approve)", receiptOwed("consumed", rej, appOnce) === null);
-  t("consumed+absent-ledger -> null", receiptOwed("consumed", appOnce, null) === null);
+  // not sealed ⇒ forward the RECORDED value (what the coordinator will consume).
+  t("not-sealed -> forward recorded value", JSON.stringify(obligationReceiptValue({ consumed: false }, appOnce)) === JSON.stringify({ action: "forward", value: appOnce }));
+  // sealed + item present ⇒ forward the AUTHORITATIVE final value (even if it differs from the recorded value, e.g. overwritten).
+  t("sealed+present -> forward authoritative value", JSON.stringify(obligationReceiptValue({ consumed: true, itemValue: rej }, appOnce)) === JSON.stringify({ action: "forward", value: rej }));
+  t("sealed+present(same) -> forward authoritative", JSON.stringify(obligationReceiptValue({ consumed: true, itemValue: appAlways }, appAlways)) === JSON.stringify({ action: "forward", value: appAlways }));
+  // sealed + item ABSENT ⇒ the recorded tap was orphaned (store signals re-batch) ⇒ DROP (no stale value).
+  t("sealed+absent -> drop (orphaned tap)", obligationReceiptValue({ consumed: true, itemValue: null }, appOnce).action === "drop");
+  // sealed-but-unreadable ⇒ RETRY (never guess a value).
+  t("unknown-authority -> retry", obligationReceiptValue({ consumed: "unknown" }, appOnce).action === "retry");
   // determinism (restart-idempotency at the decision level): same inputs ⇒ same output.
-  t("receiptOwed is deterministic", JSON.stringify(receiptOwed("consumed", appOnce, appOnce)) === JSON.stringify(receiptOwed("consumed", appOnce, appOnce)));
+  t("obligationReceiptValue is deterministic", JSON.stringify(obligationReceiptValue({ consumed: true, itemValue: rej }, appOnce)) === JSON.stringify(obligationReceiptValue({ consumed: true, itemValue: rej }, appOnce)));
+  t("receipt-obligation dir under ~/.agenthop/tg/receipt-obligations", tgReceiptObligationDir("/home/u").endsWith("/.agenthop/tg/receipt-obligations") && tgReceiptObligationDir("/home/u").startsWith("/home/u"));
 }
 
 console.log("all tg-entry selftests passed");
