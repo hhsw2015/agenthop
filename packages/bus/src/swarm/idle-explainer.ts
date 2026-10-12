@@ -2,48 +2,56 @@
  * idle-explainer PURE core (北极星差距审计件① — idle-root-cause auto-triage). The user's most frequent activation is "why is it
  * idle again?" — every time, the swarm only LOOKS idle (herdr all idle) but the real cause is a ruling in a box no one swept, an
  * author awaiting a verdict, or an empty review seat. This produces a data-driven one-line explanation so the mod status band can
- * render "idle = waiting for X" instead of a bare all-idle view, and raises an S19 only on a GENUINE stall.
+ * render "idle = waiting for X" instead of a bare all-idle view, and raises an S19 only on an UNEXPLAINED idle.
  *
- * This module owns the frozen schema + the pure composition (reason text, anomaly rule, alert-onset dedup). The IO (read the four
- * signals, detect idle, atomically write the projection) lives in idle-explainer-store.ts, mirroring the console-projection split.
+ * Owns the frozen schema + the pure composition (reason text, anomaly rule, alert-onset). The IO (detect idle, read the signals,
+ * atomically write the projection) lives in idle-explainer-store.ts, mirroring the console-projection split.
+ *
+ * Activity model (codex IE-1): "idle" is measured from the LEDGER — the control-log's live RUNNING/RESULT_PENDING_VALIDATION
+ * ATTEMPTS (a member actively executing a dispatched task). It is NOT measured from waits: a `kind:"wait"` query-wait or a
+ * `kind:"approval"` wait means the member is BLOCKED awaiting input/a ruling (herdr shows idle) — those are REASONS, not activity.
+ * `idleSource` labels this honestly as a ledger view; an UNREADABLE control-log ⇒ idleSource "unknown" ⇒ NOT idle and NOT active
+ * (an unknown activity is never written as "active"). A member working with no control-log attempt (e.g. a private sub-agent) is a
+ * known ledger-proxy limitation — hence the anomaly is framed as "unexplained idle, verify", never "proven stall".
  *
  * Invariants:
- *  - FC-2 r3 THREE-STATE: every signal is `number | null` (null = the source was UNREADABLE this tick). A genuine-stall anomaly
- *    fires ONLY when idle AND every signal is a CONFIRMED zero — never on a null, because an unreadable source cannot prove a
- *    stall (an unknown is not an emptiness).
- *  - FC-6 DETERMINISTIC: `generatedAtSec` is sidecar freshness metadata, never an ordering/identity/latest-wins key.
+ *  - FC-2 r3 THREE-STATE: every signal is number|null (null = UNREADABLE this tick). An anomaly fires ONLY when idle AND every
+ *    signal is a CONFIRMED zero — never on a null (an unknown is not an emptiness).
+ *  - FC-6 DETERMINISTIC: generatedAtSec is sidecar freshness, never an ordering/identity/latest-wins key.
  *  - FC-7 ADDITIVE: the console/idle-explainer.json projection + this schema are NEW; nothing migrates.
  * Pure: no fs, no clock beyond an injected nowSec, no top-level side effects.
  */
 import { flagDefaultOn } from "./flag-default.js";
 
-/** SWARM_IDLE_EXPLAINER gates the producer — LIVE BY DEFAULT (opt-out via [[flagDefaultOn]]): on unless explicitly OFF
- *  (SWARM_IDLE_EXPLAINER=0). Read at the call site (never a module-level constant) so a later env change is seen. Pure. */
+/** SWARM_IDLE_EXPLAINER gates the producer — LIVE BY DEFAULT (opt-out via [[flagDefaultOn]]); on unless explicitly OFF
+ *  (SWARM_IDLE_EXPLAINER=0). Read at the call site (never a module-level constant). Pure. */
 export function idleExplainerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return flagDefaultOn(env.SWARM_IDLE_EXPLAINER);
 }
 
 export const IDLE_EXPLAINER_SCHEMA = "console-idle-explainer/v1" as const;
 
-/** How "idle" was determined this tick. `wait-ledger` = the control-log's in-flight `kind:"wait"` waits were readable (the
- *  authoritative dispatcher view of active work); `none` = the control-log was UNREADABLE, so idle could NOT be determined
- *  (FC-2 r3 — we never claim idle on an unknown). */
-export type IdleSource = "wait-ledger" | "none";
+/** How "idle" was determined this tick. `ledger` = the control-log's RUNNING-attempt view was readable (idle = zero running
+ *  attempts); `unknown` = the control-log was UNREADABLE, so idle could NOT be determined (we never claim idle — nor "active" —
+ *  on an unknown). */
+export type IdleSource = "ledger" | "unknown";
 
-/** The four "why idle" signals. Each is `number | null`: a count, or null when that source was UNREADABLE this tick (FC-2 r3 —
- *  never conflated with a confirmed zero). unclaimedInboxes = pending messages across boxes; reviewQueueDepth = open review-seat
- *  queue items; awaitingRuling = decision batches awaiting a coordinator ruling (not consumed); userGates = hardGate items (needs
- *  the user) inside those awaiting batches. */
+/** The "why idle" signals, each number|null (null = UNREADABLE this tick, FC-2 r3 — never conflated with a confirmed zero):
+ *  unclaimedInboxes = pending work queued in MEMBER boxes (EXCLUDES the coordinator notice box, so the explainer's own S19 can
+ *  never feed back in); reviewQueueDepth = open review-seat queue; awaitingRuling = decision batches awaiting a ruling PLUS live
+ *  control-log approval-waits; awaitingInput = live control-log query/input waits (a member blocked awaiting an answer);
+ *  userGates = hardGate items (needs the user) inside the awaiting batches. */
 export type IdleSignals = {
   unclaimedInboxes: number | null;
   reviewQueueDepth: number | null;
   awaitingRuling: number | null;
+  awaitingInput: number | null;
   userGates: number | null;
 };
 
-/** The frozen projection the mod status band reads. `idle` = all members idle for >= N consecutive ticks (no active dispatched
- *  work). `reason` = the one-line human explanation. `anomaly` = idle AND every signal a CONFIRMED zero ⇒ a genuine stall worth an
- *  S19 (nobody is waiting on anything, yet nothing is happening). */
+/** The frozen projection the mod status band reads. `idle` = no running work for >= N consecutive ticks (ledger). `reason` = the
+ *  one-line human explanation. `anomaly` = idle AND the swarm is established (>=1 member) AND every signal a CONFIRMED zero ⇒ an
+ *  UNEXPLAINED idle worth one S19 to verify (honest: a ledger view cannot PROVE a stall, so this is "verify", not "proven"). */
 export type IdleExplainer = {
   schema: typeof IDLE_EXPLAINER_SCHEMA;
   generatedAtSec: number;
@@ -54,47 +62,53 @@ export type IdleExplainer = {
   anomaly: boolean;
 };
 
-/** A genuine-stall anomaly: idle AND every one of the four signals is a CONFIRMED zero. A single null (unreadable) signal ⇒ NOT an
- *  anomaly — an unknown cannot prove "nothing is pending" (FC-2 r3). Not idle ⇒ never an anomaly. Pure. */
-export function isIdleAnomaly(idle: boolean, s: IdleSignals): boolean {
-  if (!idle) return false;
-  const vals = [s.unclaimedInboxes, s.reviewQueueDepth, s.awaitingRuling, s.userGates];
-  if (vals.some((v) => v === null)) return false; // an unreadable source ⇒ cannot assert a stall
+/** An UNEXPLAINED-idle anomaly: idle AND the swarm is established (>=1 roster member — an empty/unstarted swarm is not a stall)
+ *  AND every signal a CONFIRMED zero. A single null (unreadable) signal ⇒ NOT an anomaly (an unknown cannot prove "nothing is
+ *  pending", FC-2 r3). Not idle / not established ⇒ never an anomaly. Pure. */
+export function isIdleAnomaly(idle: boolean, swarmEstablished: boolean, s: IdleSignals): boolean {
+  if (!idle || !swarmEstablished) return false;
+  const vals = [s.unclaimedInboxes, s.reviewQueueDepth, s.awaitingRuling, s.awaitingInput, s.userGates];
+  if (vals.some((v) => v === null)) return false;
   return vals.every((v) => v === 0);
 }
 
-/** Compose the one-line status-band reason. Not idle ⇒ "active". Idle ⇒ the actionable waits, most-decision-relevant first
- *  (awaiting-ruling → review → unclaimed boxes → user gate); then, if nothing is pending, either a genuine-stall line (all
- *  confirmed zero) or a degraded line naming the unreadable sources (never a false "genuine stall" on an unknown). Pure. */
-export function idleReason(idle: boolean, s: IdleSignals): string {
-  if (!idle) return "active";
+/** Compose the one-line status-band reason. Unknown activity (control-log unreadable) ⇒ an explicit "unknown", NEVER "active".
+ *  Not idle ⇒ "active (work running)". Idle ⇒ the actionable waits most-decision-relevant first; else, if nothing is pending,
+ *  either a degraded line naming the unreadable sources OR an honest "unexplained idle — verify" (never a false "proven stall"
+ *  on an unknown). Pure. */
+export function idleReason(idle: boolean, idleSource: IdleSource, s: IdleSignals): string {
+  if (idleSource === "unknown") return "activity unknown (control-log unreadable) — cannot determine idle";
+  if (!idle) return "active (work running)";
   const parts: string[] = [];
   if ((s.awaitingRuling ?? 0) > 0) parts.push(`${s.awaitingRuling} awaiting ruling`);
   if ((s.reviewQueueDepth ?? 0) > 0) parts.push(`${s.reviewQueueDepth} in review`);
-  if ((s.unclaimedInboxes ?? 0) > 0) parts.push(`${s.unclaimedInboxes} unclaimed in boxes`);
+  if ((s.unclaimedInboxes ?? 0) > 0) parts.push(`${s.unclaimedInboxes} unclaimed in member boxes`);
+  if ((s.awaitingInput ?? 0) > 0) parts.push(`${s.awaitingInput} awaiting input`);
   if ((s.userGates ?? 0) > 0) parts.push(`${s.userGates} awaiting user`);
-  if (parts.length > 0) return `idle — waiting: ${parts.join("; ")}`;
+  if (parts.length > 0) return `idle (no running work) — waiting: ${parts.join("; ")}`;
   const unreadable = ([
-    ["inbox", s.unclaimedInboxes], ["review", s.reviewQueueDepth], ["ruling", s.awaitingRuling], ["user-gate", s.userGates],
+    ["inbox", s.unclaimedInboxes], ["review", s.reviewQueueDepth], ["ruling", s.awaitingRuling],
+    ["input", s.awaitingInput], ["user-gate", s.userGates],
   ] as const).filter(([, v]) => v === null).map(([k]) => k);
-  if (unreadable.length > 0) return `idle — some signals unreadable (${unreadable.join(", ")}); cannot confirm a stall`;
-  return "idle — nothing in-flight, pending, in review, or gated (genuine stall — check the swarm)";
+  if (unreadable.length > 0) return `idle (no running work) — some signals unreadable (${unreadable.join(", ")}); cannot confirm a stall`;
+  return "idle (no running work) and no detected reason — verify the swarm is not stalled (vs idle between tasks)";
 }
 
 /** Build the projection from the detected idle state + already-read signals. Pure + deterministic in its inputs. */
-export function buildIdleExplainer(i: { idle: boolean; idleSource: IdleSource; signals: IdleSignals; nowSec: number }): IdleExplainer {
+export function buildIdleExplainer(i: { idle: boolean; idleSource: IdleSource; swarmEstablished: boolean; signals: IdleSignals; nowSec: number }): IdleExplainer {
   return {
     schema: IDLE_EXPLAINER_SCHEMA,
     generatedAtSec: i.nowSec,
     idle: i.idle,
     idleSource: i.idleSource,
-    reason: idleReason(i.idle, i.signals),
+    reason: idleReason(i.idle, i.idleSource, i.signals),
     signals: i.signals,
-    anomaly: isIdleAnomaly(i.idle, i.signals),
+    anomaly: isIdleAnomaly(i.idle, i.swarmEstablished, i.signals),
   };
 }
 
-/** S19 dedup: alert ONLY on the anomaly ONSET (a non-anomaly → anomaly transition), never every tick a stall persists. Pure. */
+/** S19 dedup helper: alert ONLY on the anomaly ONSET (a non-anomaly → anomaly transition). The dispatcher additionally gates on
+ *  CONFIRMED delivery (deliver-then-mark), so an undelivered onset is retried, not lost. Pure. */
 export function shouldAlertOnset(prevAnomaly: boolean, currAnomaly: boolean): boolean {
   return currAnomaly && !prevAnomaly;
 }

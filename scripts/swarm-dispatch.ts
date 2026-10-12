@@ -78,8 +78,8 @@ import { executorDigestEnabled, loadExecutorDigest, formatExecutorDigest, coerce
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { consoleProjectionEnabled, shouldWriteConsole } from "../packages/bus/src/swarm/console-projection.js";
 import { writeConsoleProjection } from "../packages/bus/src/swarm/console-projection-store.js";
-import { idleExplainerEnabled, shouldAlertOnset } from "../packages/bus/src/swarm/idle-explainer.js";
-import { countWorkingWaits, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
+import { idleExplainerEnabled } from "../packages/bus/src/swarm/idle-explainer.js";
+import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
 import { inboxWakeEnabled, inboxWakeStatus, installInboxWake, backstopWake } from "../packages/bus/src/swarm/inbox-wake.js";
@@ -1894,25 +1894,40 @@ async function main(): Promise<void> {
   // unreadable read ⇒ not-idle (never a false idle). Fully fail-soft (never breaks the sweep).
   let lastIdleWriteSec = 0;
   let idleTickCount = 0;
-  let prevIdleAnomaly = false;
+  let anomalyOnsetSec: number | null = null; // the current anomaly episode's onset sec (idempotency-key base); null = no episode
+  let anomalyAlerted = false;                 // true once THIS episode's S19 is CONFIRMED durable (IE-3 deliver-then-mark)
   const runIdleExplainer = (): void => {
     if (!idleExplainerEnabled()) return; // SWARM_IDLE_EXPLAINER live by default (opt-out; kill with =0)
     const now = nowSec();
     if (!shouldWriteConsole(now, lastIdleWriteSec, IDLE_EXPLAINER_SEC)) return; // throttle (reuse the generic console throttle)
     lastIdleWriteSec = now; // advance BEFORE the write ⇒ one attempt per interval even on throw
     try {
-      const working = countWorkingWaits(HOME);              // number | null (null = control-log UNREADABLE this tick)
-      idleTickCount = working === 0 ? idleTickCount + 1 : 0; // a working OR a null (unreadable) tick resets the streak
-      const idle = idleTickCount >= IDLE_TICKS_N;
-      const explainer = writeIdleExplainer(HOME, now, idle, working === null ? "none" : "wait-ledger");
-      if (explainer && shouldAlertOnset(prevIdleAnomaly, explainer.anomaly)) {
-        const sid = resolveSession(COORDINATOR, listSessions(HOME)) || (isStableSidStr(COORDINATOR) ? COORDINATOR : "");
-        if (sid) {
-          writeInbox(HOME, sid, { from: SELF, fromLabel: "idle-explainer", taskRef: "idle-anomaly", title: "swarm idle — possible stall", text: `swarm idle-anomaly: ${explainer.reason}`, via: "local", ts: Date.now() });
-          log(`idle-explainer: S19 genuine-stall anomaly onset presented to coordinator — ${explainer.reason}`);
-        } else log(`idle-explainer: anomaly onset but coordinator "${COORDINATOR || "(unset)"}" unresolved — projection written, not presenting`);
-      }
-      prevIdleAnomaly = explainer?.anomaly ?? false;
+      // IE-1: idle = CONFIRMED zero RUNNING attempts (active execution), from ONE control-log read that also yields the
+      // approval/input wait reason-signals. null (control-log unreadable) ⇒ idleSource "unknown" ⇒ NOT idle, reset streak, never "active".
+      const cl = readControlLogSignals(HOME);
+      const idleSource = cl.running === null ? "unknown" as const : "ledger" as const;
+      idleTickCount = cl.running === 0 ? idleTickCount + 1 : 0; // a running OR an unreadable (null) tick resets the streak
+      const idle = idleSource === "ledger" && idleTickCount >= IDLE_TICKS_N;
+      const swarmEstablished = (countRosterMembers(HOME) ?? 0) >= 1; // null (unreadable roster) ⇒ not established ⇒ no anomaly
+      // IE-4: exclude the coordinator notice box + our own box from the unclaimed-work signal, so our own S19 never feeds back in.
+      const coordSid = resolveSession(COORDINATOR, listSessions(HOME)) || (isStableSidStr(COORDINATOR) ? COORDINATOR : "");
+      const exclude = new Set<string>([SELF, ...(coordSid ? [coordSid] : [])].map(inboxDirName));
+      const signals = readIdleSignals(HOME, exclude, cl);
+      const explainer = writeIdleExplainer(HOME, now, idle, idleSource, swarmEstablished, signals);
+      if (!explainer) return; // CP-3 boundary skip — nothing to alert on
+      if (explainer.anomaly) {
+        if (anomalyOnsetSec === null) { anomalyOnsetSec = now; anomalyAlerted = false; } // episode onset
+        if (!anomalyAlerted) {
+          // IE-3 recoverable: deliver, and mark alerted ONLY on a CONFIRMED durable landing (published|already); an unresolved
+          // coordinator or a deferred/unknown write leaves the obligation ⇒ retried next tick (the per-episode idempotency key
+          // dedups the retries so the coordinator sees ONE card per episode).
+          if (coordSid) {
+            const r = writeInbox(HOME, coordSid, { from: SELF, fromLabel: "idle-explainer", taskRef: "idle-anomaly", title: "swarm idle — unexplained, verify", text: `swarm idle-anomaly: ${explainer.reason}`, via: "local", ts: Date.now() }, `idle-anomaly-${anomalyOnsetSec}`);
+            if (r === "published" || r === "already") { anomalyAlerted = true; log(`idle-explainer: S19 unexplained-idle onset presented to coordinator — ${explainer.reason}`); }
+            else log(`idle-explainer: S19 deferred (${r}) — retry next tick`);
+          } else log(`idle-explainer: anomaly onset but coordinator "${COORDINATOR || "(unset)"}" unresolved — projection written, retry when resolvable`);
+        }
+      } else { anomalyOnsetSec = null; anomalyAlerted = false; } // episode cleared ⇒ reset for the next one
     } catch (e) { log(`idle-explainer failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
