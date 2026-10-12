@@ -120,13 +120,14 @@ const hard: DecisionItem = { id: "n2", kind: "spend", summary: "pay $40 invoice"
   t("ack text is a short read-receipt", typeof TG_ACK_TEXT === "string" && TG_ACK_TEXT.length > 0 && TG_ACK_TEXT.length < 40);
 }
 
-// --- idempotency key for forwarded TG events (pure; TGP-3) ---
+// --- idempotency key for forwarded TG events (pure; TGP-3, hash-based lossless identity) ---
 {
-  t("verdict key stable per batch+item", tgIdempotencyKey("tg-verdict", "b1", "n2") === "tg-verdict.b1.n2");
   t("same event -> same key (replay dedups)", tgIdempotencyKey("tg-msg", 42) === tgIdempotencyKey("tg-msg", 42));
-  t("distinct events -> distinct keys", tgIdempotencyKey("tg-verdict", "b1", "n2") !== tgIdempotencyKey("tg-verdict", "b1", "n3"));
-  t("unsafe chars folded to _", tgIdempotencyKey("tg-verdict", "b/1", "n:2").replace(/[A-Za-z0-9._-]/g, "") === "");
-  t("key is writeInbox-contract compliant (<=120, charset)", /^[A-Za-z0-9._-]{1,120}$/.test(tgIdempotencyKey("tg-msg", "x".repeat(400))));
+  t("distinct events -> distinct keys", tgIdempotencyKey("tg-verdict", 42) !== tgIdempotencyKey("tg-verdict", 43));
+  t("TGP-3b lossless: a/b vs a_b do NOT collide", tgIdempotencyKey("tg-verdict", "a/b") !== tgIdempotencyKey("tg-verdict", "a_b"));
+  t("TGP-3b lossless: ids differing only past 120 chars do NOT collide", tgIdempotencyKey("tg-v", "x".repeat(130) + "A") !== tgIdempotencyKey("tg-v", "x".repeat(130) + "B"));
+  t("key is writeInbox-contract compliant", /^[A-Za-z0-9._-]{1,120}$/.test(tgIdempotencyKey("tg-msg", "x".repeat(400))));
+  t("readable prefix retained", tgIdempotencyKey("tg-verdict", 1).startsWith("tg-verdict."));
 }
 
 console.log("all tg-entry selftests passed");

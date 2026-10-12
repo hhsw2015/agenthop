@@ -84,8 +84,10 @@ function proxyAgentFor(host: string): https.Agent | undefined {
   (agent as unknown as { createConnection: (opts: { host: string; port?: number }, cb: (e: Error | null, s?: tls.TLSSocket) => void) => void }).createConnection = (opts, cb) => {
     // Validate the proxy INSIDE createConnection so a bad config SURFACES as a connect error (never a silent direct downgrade, TGP-1).
     let pu: URL;
-    try { pu = new URL(url); } catch { cb(new Error(`invalid proxy URL: ${url}`)); return; }
-    if (pu.protocol !== "http:") { cb(new Error(`unsupported proxy scheme ${pu.protocol} — only http:// is supported (set HTTPS_PROXY=http://host:port)`)); return; } // reject, don't downgrade (TGP-1)
+    // TGP-1: NEVER echo the raw proxy URL in an error — it may carry user:password (the loop catch logs the message). Report the
+    // config shape / a credential-STRIPPED host:port only.
+    try { pu = new URL(url); } catch { cb(new Error("invalid proxy URL (unparseable; check HTTPS_PROXY/HTTP_PROXY — value not echoed)")); return; }
+    if (pu.protocol !== "http:") { cb(new Error(`unsupported proxy scheme ${pu.protocol} for ${pu.hostname}:${pu.port || "(default)"} — only http:// is supported (credentials omitted)`)); return; } // reject, don't downgrade (TGP-1)
     const targetAuthority = `${opts.host}:${opts.port ?? 443}`;
     const headers: Record<string, string> = { host: targetAuthority }; // CONNECT request-target AND Host = the TARGET authority (TGP-1)
     if (pu.username) headers["proxy-authorization"] = `Basic ${Buffer.from(`${decodeURIComponent(pu.username)}:${decodeURIComponent(pu.password)}`).toString("base64")}`;
@@ -132,8 +134,11 @@ function forwardToCoordinator(fields: { text: string; taskRef: string; title: st
     if (!coord || !coord.trim()) return "skip";
     const coordSid = resolveSession(coord, listSessions(HOME));
     if (!coordSid) return "retry"; // transient: coordinator not resolvable on this machine yet
-    writeInbox(HOME, coordSid, { from: "swarm-tg-entry", fromLabel: "tg-entry", text: fields.text, taskRef: fields.taskRef, title: fields.title, via: "local", ts: Date.now() }, idempotencyKey);
-    return "sent"; // published | already (replay dedup) | deferred/pending ⇒ durably handled
+    const res = writeInbox(HOME, coordSid, { from: "swarm-tg-entry", fromLabel: "tg-entry", text: fields.text, taskRef: fields.taskRef, title: fields.title, via: "local", ts: Date.now() }, idempotencyKey);
+    // TGP-3a: ONLY a CONFIRMED publication discharges. "published" = this message landed; "already" = the same event was already
+    // published (replay dedup). "deferred"/"pending"/"unknown" are NOT confirmed (a pending credential has no message body yet) ⇒
+    // keep the retry responsibility (offset NOT advanced), re-poll (idempotent on the same key).
+    return (res === "published" || res === "already") ? "sent" : "retry";
   } catch (e) { console.error(`swarm-tg-entry: coordinator forward failed (will retry, offset NOT advanced): ${e instanceof Error ? e.message : e}`); return "retry"; }
 }
 
@@ -212,10 +217,15 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
     // ① inbound immediacy: the verdict is in the ledger (recorded OR consumed) ⇒ wake the coordinator via a durable, idempotent
     // receipt. TGP-4: report the ACTUALLY-recorded (enforceScope-clamped) scope, not the requested one. TGP-3: release the update
     // (advance) ONLY after a durable handoff; a retry keeps it (next poll ⇒ "consumed", forward dedups on the same key — no dup).
-    if (outcome === "recorded" || outcome === "consumed") {
+    // TGP-4: forward a verdict receipt ONLY on "recorded" — the tap that was actually WRITTEN to the ledger. A "consumed" outcome
+    // means the batch was already SEALED, so THIS tap did NOT change the ledger (a late tap on a decided item); reporting its
+    // verdict as "recorded" would be a false audit. consumed ⇒ no forward, just ack the user "already decided". TGP-3: key the
+    // receipt by the TG EVENT identity (update_id) — lossless + unique per update; a re-poll of the SAME update dedups, two
+    // distinct taps (approve then reject on one item) stay distinct. Release the offset only after a confirmed handoff.
+    if (outcome === "recorded") {
       let enforcedScope: ApprovalScope | undefined;
       try { const item = readBatch(HOME, resolved.batchId)?.items.find((it) => it.id === resolved.itemId); if (item) enforcedScope = enforceScope(item, decision).scope; } catch { enforcedScope = undefined; }
-      if (forwardToCoordinator(buildTgVerdictReceipt(resolved.batchId, resolved.itemId, decision.verdict, enforcedScope), tgIdempotencyKey("tg-verdict", resolved.batchId, resolved.itemId)) === "retry") return;
+      if (forwardToCoordinator(buildTgVerdictReceipt(resolved.batchId, resolved.itemId, decision.verdict, enforcedScope), tgIdempotencyKey("tg-verdict", u.update_id)) === "retry") return;
     }
     writeOffset(u.update_id + 1); // terminal
     await ack(outcome === "recorded" ? "recorded" : outcome === "consumed" ? "already decided" : "unknown");

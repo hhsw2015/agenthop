@@ -2,6 +2,7 @@
 // projections and renders them for its medium, and parses the user's tap into a verdict the driver writes to the SINGLE
 // decision ledger (decision-batch). ZERO business logic: the allowed approval scopes come from the CORE (allowedScopes),
 // enforced there on the real item (NOT by the buttons); the digest comes from the CORE (morning-digest). No IO.
+import { createHash } from "node:crypto";
 import { allowedScopes, type DecisionItem, type Verdict, type ApprovalScope } from "./decision-batch.js";
 import type { DualBandwidthReading } from "./dual-bandwidth.js";
 import type { RoomPost } from "./chat-room.js";
@@ -130,5 +131,10 @@ export function buildTgMessageReceipt(chatId: number, text: string): { text: str
  *  TGP-3), so any unsafe char in a part is folded to `_` and the whole is clipped to 120. Same event ⇒ same key (replay dedups);
  *  distinct events ⇒ distinct keys. Pure. */
 export function tgIdempotencyKey(prefix: string, ...parts: Array<string | number>): string {
-  return [prefix, ...parts].join(".").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+  // LOSSLESS identity (TGP-3b): the parts are sha256-hashed (NUL-joined), so distinct identities never collide and a long/`/`-bearing
+  // id is never lost to truncation or char-folding — unlike a raw replace/slice. A readable prefix aids debugging. Contract-safe
+  // (`^[A-Za-z0-9._-]{1,120}$`): prefix(≤24) + "." + 40 hex.
+  const p = prefix.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 24);
+  const hash = createHash("sha256").update(parts.map(String).join("\u0000")).digest("hex").slice(0, 40);
+  return `${p}.${hash}`;
 }
