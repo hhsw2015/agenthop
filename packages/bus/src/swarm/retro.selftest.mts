@@ -157,10 +157,10 @@ try {
   t("isAlreadyCovered: a SUPERSEDED ruling does not cover (only active)", !isAlreadyCovered({ identity: "failureClass:z", series: "F", title: "t", statement: "z", sources: ["s1"] }, [{ statement: "x", sources: ["s1"], status: "superseded" }]));
   t("RL-P2-5 r3: coveringRulingId returns the covering ruling ID (traceability)", coveringRulingId({ identity: "failureClass:timeout", series: "F", title: "t", statement: "x", sources: ["control-log:attempt:a1"] }, [{ id: "F7", statement: "unrelated", sources: ["control-log:attempt:a1"], status: "active" }]) === "F7");
   t("RL-P2-5 r3: coveringRulingId null when novel", coveringRulingId({ identity: "failureClass:novel", series: "F", title: "t", statement: "x", sources: ["PROGRESS.md:1"] }, [{ id: "F7", statement: "unrelated", sources: ["control-log:attempt:a1"], status: "active" }]) === null);
-  t("RL-P2-4 r3: reportVersionTag ignores generatedAtSec, differs on signals", (() => {
+  t("RL-P2-4 r4: reportVersionTag is a 128-bit SHA (not 8-hex FNV); ignores generatedAtSec; differs on signals", (() => {
     const mk = (nowSec: number, recs: Parameters<typeof reworkRoundDist>[0]) => bj({ nowSec, rework: reworkRoundDist(recs) });
     const a1 = mk(1, []), a2 = mk(9999, []), b = mk(1, [{ ticket: "t", sha: "1111111", dir: "" }]);
-    return reportVersionTag(a1) === reportVersionTag(a2) && reportVersionTag(a1) !== reportVersionTag(b);
+    return reportVersionTag(a1) === reportVersionTag(a2) && reportVersionTag(a1) !== reportVersionTag(b) && /^[0-9a-f]{32}$/.test(reportVersionTag(a1));
   })());
   // RL-P2-5 REGRESSION: same window, DIFFERENT ailments, DIFFERENT sources — the ledger covers only ONE; the other must still draft.
   t("RL-P2-5: same-window different-ailment are NOT both swallowed by a shared window template", (() => {
@@ -205,6 +205,7 @@ try {
     const r = readReviewRoundRecords(dir);
     t("store: readReviewRoundRecords reads + parses (ignores non-review) + complete", r.status === "read" && r.records.length === 2 && r.complete === true);
     t("store: readReviewRoundRecords absent ⇒ absent (complete)", (() => { const a = readReviewRoundRecords(path.join(scratch, "nope-reviews")); return a.status === "absent" && a.complete === true; })());
+    t("store[RL-P2-3 r4]: whole-dir read fault (ENOTDIR) ⇒ unreadable + complete=false (incomplete scan)", (() => { const f = path.join(scratch, "not-a-dir-reviews"); writeFileSync(f, "x"); const a = readReviewRoundRecords(f); return a.status === "unreadable" && a.complete === false; })());
     const future = Math.floor(Date.now() / 1000) + 3600; // a future floor ⇒ nothing in window
     t("store: readReviewRoundRecords mtime window excludes older dirs", readReviewRoundRecords(dir, future).records.length === 0);
   }
@@ -343,6 +344,17 @@ try {
     const h = freshHome();
     const rc = await runCli(["retro", "--days", "nonsense", "--coordinator", COORD], childEnv(h));
     t("fixture[bad-args]: exit 2, ZERO writes (no report dir, no water-mark)", rc.code === 2 && reportFiles(h).length === 0 && readLastRunSec(h) === null);
+  }
+
+  // FIXTURE 6 — RL-P2-3 r4: a WHOLE reviews-dir read failure (source unreadable) ⇒ incomplete scan ⇒ exit 1 + water-mark NOT advanced.
+  {
+    const h = freshHome();
+    const notADir = path.join(h, "reviews-is-a-file"); writeFileSync(notADir, "x"); // readdir ⇒ ENOTDIR ⇒ unreadable
+    const rc = await runCli(["retro", "--days", "7"], childEnv(h, { RETRO_REVIEW_REPORTS_DIR: notADir }));
+    t("fixture[reviews-unreadable] RL-P2-3 r4: whole-dir unreadable ⇒ exit 1 + water-mark NOT advanced", rc.code === 1 && readLastRunSec(h) === null);
+    const files = reportFiles(h);
+    const rep0 = files.length === 1 ? readRetroReport(path.join(reportsDirP(h), files[0]!)) : null;
+    t("fixture[reviews-unreadable]: source labeled unreadable + axis incomplete (not a false windowed 0)", rep0?.sources.reviewReports === "unreadable" && rep0?.axisScopes.reviews === "incomplete");
   }
 
   console.log("\nretro-learn selftest: ALL PASS");

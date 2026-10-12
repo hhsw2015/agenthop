@@ -13,6 +13,7 @@
  * IO is retro-store.ts; the CLI is scripts/retro.ts. Selftests + the 3 zero-bug fixtures (crash/restart/concurrency over the draft +
  * inbox write faces) live in retro.selftest.mts.
  */
+import { createHash } from "node:crypto";
 import { flagDefaultOn } from "./flag-default.js";
 
 export const RETRO_REPORT_SCHEMA = "retro-report/v1" as const;
@@ -35,8 +36,9 @@ export function shouldRunRetro(lastRunSec: number | null, nowSec: number, period
 // RL-P3-1 — argument validation (pure). An invalid window value NEVER produces a NaN-d report or advances the water-mark.
 // ============================================================================================================
 
-/** The resolved window: `days` (last N days by review mtime + PROGRESS date-slice), `batch` (a PROGRESS 批-N section), or
- *  `since-last` (incremental from the water-mark). control-log has no timestamp ⇒ it is always whole-corpus (labeled, RL-P2-1). */
+/** The resolved window: `days` (reviews filtered by mtime to the last N days), `batch` (a labeled run), or `since-last` (reviews since
+ *  the water-mark). Only reviews are mtime-scopeable; control-log has no timestamp and PROGRESS has no reliable batch-section structure,
+ *  so BOTH are whole-corpus — every axis's actual scope is reported honestly via axisScopes (RL-P2-1), never claimed windowed. */
 export type WindowSpec = { kind: "days"; days: number } | { kind: "batch"; batch: number } | { kind: "since-last" };
 export type RetroArgs =
   | { mode: "usage"; error?: string }
@@ -249,16 +251,15 @@ export function buildRetroReportJson(a: {
   return { schema: RETRO_REPORT_SCHEMA, window: a.window, generatedAtSec: Math.floor(a.nowSec), rework: a.rework, ailments: a.ailments, gaps: a.gaps, sources: a.sources, axisScopes: a.axisScopes };
 }
 
-/** RL-P2-4 (r3): a stable version tag over the report SIGNALS (everything EXCEPT generatedAtSec), so the delivery key binds to the
- *  report VERSION: identical signals ⇒ same key (idempotent "already"); changed signals ⇒ a NEW key ⇒ a new delivery, so disk + inbox
- *  carry the SAME version and can never diverge (a re-run with new data publishes a new version; a re-run with the same data does not
- *  re-deliver). Excludes the timestamp so unchanged re-runs stay idempotent. Pure (FNV-1a 32-bit, no deps). */
+/** RL-P2-4 (r4): a stable version tag over the report SIGNALS (everything EXCEPT generatedAtSec), so the delivery key binds to the
+ *  report VERSION: identical signals ⇒ same key (idempotent "already"); changed signals ⇒ a NEW key ⇒ a new delivery, so a re-run with
+ *  new data publishes a new version and one with the same data does not re-deliver. Excludes the timestamp so unchanged re-runs stay
+ *  idempotent. SHA-256 (128-bit prefix) — collision-resistant, so "already" can never confirm a DIFFERENT report (the r3 32-bit FNV tag
+ *  collided under a bounded search). Pure (crypto hashing is a deterministic transform; no fs/bus/clock). */
 export function reportVersionTag(r: RetroReportJson): string {
   const { generatedAtSec: _omit, ...signals } = r;
   const s = JSON.stringify(signals); // field order is fixed by RetroReportJson construction ⇒ deterministic
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i += 1) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
-  return h.toString(16).padStart(8, "0");
+  return createHash("sha256").update(s).digest("hex").slice(0, 32);
 }
 
 /** Render the human-readable DRAFT. Every item carries its source refs; structured vs heuristic is labeled; a truly empty signal is

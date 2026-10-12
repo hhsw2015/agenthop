@@ -7,7 +7,7 @@
  *
  * Three disciplines the review bounced (happycapy @5e7a97f):
  *   RL-P3-1  args are VALIDATED (classifyRetroArgs) BEFORE any read/write — a bad window ⇒ usage + exit 2, ZERO writes.
- *   RL-P2-1  each axis is window-scoped where it CAN be (reviews by mtime, PROGRESS by its 批-N section) and labeled honestly
+ *   RL-P2-1  each axis is window-scoped where it CAN be (only reviews, by mtime; control-log + PROGRESS are whole-corpus) and labeled honestly
  *            (axisScopes: windowed / whole / incomplete) — whole-corpus data is never printed as a windowed conclusion.
  *   RL-P2-3  the obligation model (账随实走): the water-mark advances ONLY when nothing is outstanding. A refused report write, an
  *            unresolved/failed delivery ⇒ exit 1 + the window stays un-watermarked so a later --since-last RE-covers it.

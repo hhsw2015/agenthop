@@ -66,7 +66,10 @@ function writeJsonAtomic(file: string, data: unknown): void {
 export function readReviewRoundRecords(dir: string, sinceSec: number | null = null): { records: ReviewRoundRecord[]; status: SourceStatus; complete: boolean } {
   let names: string[];
   try { names = readdirSync(dir); }
-  catch (e) { return { records: [], status: (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable", complete: true }; }
+  // RL-P2-3 (r4): ENOENT ⇒ absent + complete (the dir genuinely has nothing to scan). ANY other readdir fault ⇒ unreadable + NOT
+  // complete — the whole-dir scan attributed nothing, so it is an INCOMPLETE scan (the caller must hold the water-mark, never advance it
+  // past a window it could not read).
+  catch (e) { const enoent = (e as NodeJS.ErrnoException).code === "ENOENT"; return { records: [], status: enoent ? "absent" : "unreadable", complete: enoent }; }
   const records: ReviewRoundRecord[] = [];
   let complete = true; // RL-P2-2: a per-dir stat fault during window-filtering ⇒ incomplete (not a silent drop that looks like 0)
   for (const name of names) {
@@ -135,10 +138,12 @@ const slugify = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|
 
 /** Write the retro report (markdown + JSON side-car) under console/retro-reports/. CP-3 guarded. Returns the written .md path, or
  *  null when the boundary refuses. */
-/** RL-P2-4: write ONE atomic JSON — the single source of truth. The markdown is DERIVED from it (renderRetroMarkdown) on demand, so
- *  there is no second on-disk artifact that can drift / interleave with the JSON on a crash or concurrent write. The JSON's
- *  generatedAtSec is the report VERSION; the inbox body (rendered from the SAME json) + the dedup key tie to that version. Returns the
- *  json path, or null when the CP-3 boundary refuses. */
+/** RL-P2-4: write ONE atomic JSON — the single source of truth. No separate Markdown side-car: the body is DERIVED on demand
+ *  (renderRetroMarkdown), so there is no second on-disk artifact to drift. The report VERSION is reportVersionTag(json) — a SHA-256 over
+ *  the SIGNALS EXCLUDING generatedAtSec — and the coordinator delivery key binds to it (same signals ⇒ idempotent "already"; changed
+ *  signals ⇒ a new key ⇒ a new delivery). NB: the rendered body still prints generatedAtSec, so two renders of the same signals at
+ *  different times differ by that timestamp — the version tag (not byte-identity) is what ties disk and inbox. Returns the json path, or
+ *  null when the CP-3 boundary refuses. */
 export function writeRetroReport(home: string, json: RetroReportJson): string | null {
   if (!consoleBoundaryOk(home, reportsDir(home))) return null;
   const file = path.join(reportsDir(home), `${slugify(json.window)}.json`);
