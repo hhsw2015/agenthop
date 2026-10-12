@@ -391,31 +391,52 @@ const peer = (over: Partial<PeerLike> = {}): PeerLike => ({ id: "run-1", stableI
       rmSync(home, { recursive: true, force: true });
     }
   }
-  // (C) DOS-CORE-P1-1: two real writers FORCED to collide on the same temp suffix every round; a reader samples and one
-  //     is killed — the committed snapshot is NEVER torn (O_EXCL gives each writer its own inode; no shared-inode truncation).
+  // (C) DOS-CORE-P2-1: a PROVEN forced collision with an interrupted real writer. A holder runs writeRosterSnapshot and
+  //     is paused at the exact pre-rename stage (owns the forced temp); a competitor's writeRosterSnapshot forced to the SAME
+  //     suffix PROVABLY hits EEXIST (its suffixGen is called a 2nd time ⇒ attempt-0 failed) and retries a fresh inode. The
+  //     committed file must become the COMPETITOR's snapshot (NOT the seed) and never be torn. A child that never writes, or
+  //     exits 9 without writing, CANNOT pass: committed would stay the seed and no EEXIST-retry marker would appear.
   {
     const home = mkdtempSync(join(tmpdir(), "roster-collide-"));
-    const kids: ReturnType<typeof spawn>[] = [];
+    const procs: ReturnType<typeof spawn>[] = [];
     try {
       const out = join(home, ".agenthop", "swarm", "roster-snapshot.json");
-      writeRosterSnapshot(out, assembleRoster([peer({ stableId: "seed" })], 1)); // committed baseline (the never-torn anchor)
-      // each iteration's FIRST temp name is the SAME forced suffix for BOTH writers ⇒ a real O_EXCL collision every round
-      // (on the OLD plain-`w` code this test would publish torn 8-byte files; with O_EXCL the loser retries a fresh inode).
-      const writer = (sid: string) => `import { writeRosterSnapshot } from ${JSON.stringify(mod)}; import { randomBytes } from "node:crypto"; const F = process.env.FORCE; let first = true; const gen = () => { if (first) { first = false; return F; } return randomBytes(8).toString("hex"); }; for (let i = 0; i < 4000; i++) { first = true; writeRosterSnapshot(process.env.OUT, { version: 2, capturedAtSec: i, members: [{ member: ${JSON.stringify(sid)}, tool: "claude", cwd: "/x", role: null, resumeCmd: "c", resumeCmdSource: "template" }] }, gen); }`;
-      const exits = ["aaa", "bbb"].map((sid) => { const cp = spawnChild(writer(sid), { OUT: out, FORCE: "cafecafecafecafe" }); kids.push(cp); return onClose(cp); });
-      let settled = 0; let torn = false; let present = 0;
-      exits.forEach((pr) => pr.then(() => { settled += 1; }).catch(() => { settled += 1; }));
-      await sleep(150); killGroup(kids[0]!); // interrupt one colliding writer mid-run
-      while (settled < 2) { const txt = read(out); if (txt !== null) { present += 1; if (!sampleOk(txt)) torn = true; } await new Promise((r) => setImmediate(r)); }
-      await Promise.all(exits.map((pr) => pr.catch(() => ({ code: null, signal: null }))));
-      t("CORE-P1-1(C): forced same-suffix collision + a killed writer never produced a torn committed file", !torn && present > 0);
-      t("CORE-P1-1(C): the final committed file is one complete snapshot", committedOk(out));
+      writeRosterSnapshot(out, assembleRoster([peer({ stableId: "seed" })], 1)); // seed — a no-write child would leave THIS
+      const forced = "f0f0f0f0f0f0f0f0";
+      const forcedTmp = `${out}.tmp-${forced}`;
+      const createdMarker = join(home, "holder-created.marker");
+      const retryMarker = join(home, "competitor-eexist-retry.marker");
+      // HOLDER: a REAL writeRosterSnapshot writer that owns the forced temp and BLOCKS at the pre-rename stage (test seam),
+      // so it is provably interrupted mid-write (temp owned + complete, not yet published).
+      const holderSrc = `import { writeRosterSnapshot } from ${JSON.stringify(mod)}; import { writeFileSync as wf } from "node:fs"; const snap = { version: 2, capturedAtSec: 1, members: [{ member: "holder", tool: "claude", cwd: "/x", role: null, resumeCmd: "c", resumeCmdSource: "template" }] }; writeRosterSnapshot(process.env.OUT, snap, () => process.env.FORCED, () => { wf(process.env.CREATED, "held"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0); });`;
+      const holder = spawnChild(holderSrc, { OUT: out, FORCED: forced, CREATED: createdMarker }); procs.push(holder);
+      const holderExit = onClose(holder);
+      await new Promise<void>((r) => holder.once("spawn", () => r()));
+      let heldOk = false;
+      for (let i = 0; i < 240 && !heldOk; i++) { if (existsSync(createdMarker)) heldOk = true; else await sleep(25); } // up to ~6s
+      t("CORE-P2-1(C): the holder (real writer) PROVABLY owns the forced temp at the pre-rename stage (sync point)", heldOk && existsSync(forcedTmp));
+      // COMPETITOR: a REAL writeRosterSnapshot forced to the SAME suffix first ⇒ MUST hit EEXIST (holder holds it) and retry.
+      // suffixGen's 2nd call proves attempt-0 (forced) failed with EEXIST; it drops the retry marker as that proof.
+      const compSrc = `import { writeRosterSnapshot } from ${JSON.stringify(mod)}; import { randomBytes } from "node:crypto"; import { writeFileSync as wf } from "node:fs"; let n = 0; const gen = () => { n += 1; if (n === 1) return process.env.FORCED; if (n === 2) wf(process.env.RETRY, "eexist-retried"); return randomBytes(8).toString("hex"); }; const snap = { version: 2, capturedAtSec: 9, members: [{ member: "competitor", tool: "claude", cwd: "/x", role: null, resumeCmd: "c", resumeCmdSource: "template" }] }; writeRosterSnapshot(process.env.OUT, snap, gen); process.exit(0);`;
+      const comp = spawnChild(compSrc, { OUT: out, FORCED: forced, RETRY: retryMarker }); procs.push(comp);
+      const compExit = onClose(comp);
+      let settled = false; let torn = false; let present = 0;
+      compExit.then(() => { settled = true; }).catch(() => { settled = true; });
+      while (!settled) { const txt = read(out); if (txt !== null) { present += 1; if (!sampleOk(txt)) torn = true; } await new Promise((r) => setImmediate(r)); }
+      const compEnd = await compExit;
+      killGroup(holder); // interrupt the holder (it entered the write path: owns the temp pre-rename) and verify SIGKILL
+      const holderEnd = await holderExit;
+      const committed = parseSnapshot(read(out) ?? "");
+      t("CORE-P2-1(C): the competitor PROVABLY hit EEXIST on the held temp and retried a fresh inode (sync point)", existsSync(retryMarker));
+      t("CORE-P2-1(C): the surviving writer (competitor) exited 0", compEnd.code === 0);
+      t("CORE-P2-1(C): the interrupted holder was SIGKILLed mid-write (not a clean exit)", holderEnd.code !== 0);
+      t("CORE-P2-1(C): a reader sampling throughout never saw a torn file", !torn && present > 0);
+      t("CORE-P2-1(C): committed is the SURVIVING WRITER's snapshot, not the seed (a no-write/exit-9 child cannot pass)", committed !== null && committed.members[0]!.member === "competitor");
     } finally {
-      for (const cp of kids) killGroup(cp);
+      for (const cp of procs) killGroup(cp);
       rmSync(home, { recursive: true, force: true });
     }
   }
-
 }
 
 console.log("all resume selftests passed");

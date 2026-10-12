@@ -161,9 +161,11 @@ export function serializeSnapshot(snap: RosterSnapshot): string { return `${JSON
 
 /** Write the roster snapshot ATOMICALLY (temp + rename). The roster is a core-primitive write (infra zero-bug ruling): a crash
  *  mid-write leaves the PREVIOUS roster intact (never a torn file), and a concurrent capture always observes one COMPLETE snapshot
- *  (rename is atomic; the last writer wins, neither sees a half-file). The temp carries a random suffix so two concurrent writers
- *  never collide on the same temp path. IO runs only when called — no top-level side effect. */
-export function writeRosterSnapshot(out: string, snap: RosterSnapshot, suffixGen: () => string = () => randomBytes(8).toString("hex")): void {
+ *  (rename is atomic; the last writer wins, neither sees a half-file). Each writer EXCLUSIVELY creates its temp (O_EXCL) and
+ *  OWNS that inode — the exclusive create (NOT the random suffix) guarantees ownership; the suffix only lowers retry
+ *  probability, and a name collision retries a fresh name, never truncating or deleting another writer's temp. IO runs only
+ *  when called — no top-level side effect. */
+export function writeRosterSnapshot(out: string, snap: RosterSnapshot, suffixGen: () => string = () => randomBytes(8).toString("hex"), beforeRename?: () => void): void {
   // DOS-P2-2 (r3, FC-2): decide the mode BEFORE touching the fs. Only a CONFIRMED absence (ENOENT) takes the 0600 new-file
   // default. Any OTHER stat error (EACCES/EIO/ENOTDIR…) means an existing target MAY carry a mode we cannot read — defaulting
   // to 0600 would silently relax it, so FAIL (defer) rather than guess the safe side. Throwing here is before any temp exists.
@@ -179,8 +181,8 @@ export function writeRosterSnapshot(out: string, snap: RosterSnapshot, suffixGen
   // each other's inode, publishing a torn snapshot that rename's atomicity cannot undo. So EXCLUSIVELY create the temp
   // ("wx" = O_CREAT|O_EXCL): this writer OWNS that inode. On EEXIST, retry a FRESH name — NEVER unlink the existing temp
   // (it may be another writer's). All writes/chmod go through the OWNED fd (not the path), so no other writer and no later
-  // path-chmod can touch this inode before rename. (suffixGen defaults to random; it is a test seam for forced-collision
-  // coverage — production passes nothing.)
+  // path-chmod can touch this inode before rename. (suffixGen + beforeRename are test seams for deterministic forced-collision
+  // / pre-rename-interruption coverage — production passes neither.)
   let fd: number | undefined;
   let tmp = "";
   for (let attempt = 0; ; attempt += 1) {
@@ -191,6 +193,8 @@ export function writeRosterSnapshot(out: string, snap: RosterSnapshot, suffixGen
   try {
     writeFileSync(fd, data);   // write THROUGH the owned fd (not the path) — no re-open, no truncation by another writer
     fchmodSync(fd, mode);      // chmod the fd (not the path): deterministic under umask + no path race before rename
+    if (beforeRename) beforeRename(); // TEST SEAM (undefined in production): lets a fixture interrupt a writer at the exact
+                                      // pre-rename stage (temp owned + complete, not yet published) — the DOS-CORE-P1-1 window.
     closeSync(fd); fd = undefined;
     renameSync(tmp, out);      // atomic publish of THIS writer's complete inode (last writer wins; never a torn file)
   } catch (e) {
