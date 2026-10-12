@@ -78,6 +78,11 @@ import { executorDigestEnabled, loadExecutorDigest, formatExecutorDigest, coerce
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { consoleProjectionEnabled, shouldWriteConsole } from "../packages/bus/src/swarm/console-projection.js";
 import { writeConsoleProjection } from "../packages/bus/src/swarm/console-projection-store.js";
+import { modelMarketEnabled } from "../packages/bus/src/swarm/model-market.js";
+import { pullModelMarket } from "../packages/bus/src/swarm/model-market-store.js";
+import { modelStaffingEnabled, taskFromNode, type StaffingTaskInput } from "../packages/bus/src/swarm/model-staffing.js";
+import { writeStaffingProjection } from "../packages/bus/src/swarm/model-staffing-store.js";
+import { pullCpaCatalog, readCatalog } from "../packages/bus/src/swarm/model-catalog-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
 import { inboxWakeEnabled, inboxWakeStatus, installInboxWake, backstopWake } from "../packages/bus/src/swarm/inbox-wake.js";
@@ -210,6 +215,8 @@ const SENTINEL_IDLE_SEC = envInt(process.env.SWARM_SENTINEL_IDLE_SEC, 1800);
 const SENTINEL_SAMPLE_SEC = envInt(process.env.SWARM_SENTINEL_SAMPLE_SEC, 60);
 const GAUGE_SAMPLE_SEC = envInt(process.env.SWARM_GAUGE_SAMPLE_SEC, 60); // T5-2 seam: gauge sampling interval (sweep ticks faster, every 5s)
 const CONSOLE_WRITE_SEC = envInt(process.env.SWARM_CONSOLE_SEC, 60); // swarm-console projection write interval (sweep ticks faster, every 5s)
+const MODEL_MARKET_SEC = envInt(process.env.SWARM_MODEL_MARKET_SEC, 43200); // model-market snapshot pull interval (brief §2①: ≈ the upstream 12h self-refresh)
+const MODEL_STAFFING_SEC = envInt(process.env.SWARM_MODEL_STAFFING_SEC, 3600); // model-staffing suggestion projection write interval (refreshes the CPA catalog + re-picks)
 const DIGEST_HOUR = Math.min(23, envInt(process.env.SWARM_DIGEST_HOUR, 7, 0)); // morning-digest local target hour (clamped 0..23)
 
 // T5-5 review-seat autoscale — SUGGESTION MODE ONLY (user ruling 2026-10-08: the flag is half-flipped). When
@@ -722,7 +729,7 @@ async function main(): Promise<void> {
   // kill with SWARM_<X>=0). Calls the SAME readers the features use, so the line reflects the real decision. SWARM_TG_ENTRY is the
   // deliberate exception (opt-in — the bridge needs a user-seeded token), read with its own opt-in form.
   const onoff = (b: boolean): string => (b ? "on" : "off");
-  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} CONSOLE=${onoff(consoleProjectionEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} EXECUTOR_DIGEST=${onoff(executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
+  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} CONSOLE=${onoff(consoleProjectionEnabled())} MODEL_MARKET=${onoff(modelMarketEnabled())} MODEL_STAFFING=${onoff(modelStaffingEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} EXECUTOR_DIGEST=${onoff(executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
   // flags-default-flip batch-2 (user ruling 2026-10-11): the dormant flags flipped to default-on. "(unwired)" = the flag is
   // flipped but its behavior is not yet wired (an honest no-op until a later wiring round) — the flip only sets the DEFAULT.
   log(`flags(batch-2 default-on): OPS_RECEIPT=${onoff(OPS_RECEIPT_ENABLED)} SUCCESSION_HEARTBEAT=${onoff(SUCCESSION_HEARTBEAT_ENABLED)} POISON_DLQ=${onoff(flagDefaultOn(process.env.SWARM_POISON_DLQ))} APPROVAL_DELEGATE=${onoff(flagDefaultOn(process.env.SWARM_APPROVAL_DELEGATE))} SANITIZED_READ=${onoff(flagDefaultOn(process.env.SWARM_SANITIZED_READ))} ATTRIBUTION=${onoff(flagDefaultOn(process.env.SWARM_ATTRIBUTION))} OUTPUT_CONTRACT=${onoff(flagDefaultOn(process.env.SWARM_OUTPUT_CONTRACT))} SPEND_BREAKER=${onoff(flagDefaultOn(process.env.SWARM_SPEND_BREAKER))}(unwired) CONDITIONAL_ROUTING=${onoff(flagDefaultOn(process.env.SWARM_CONDITIONAL_ROUTING))}(unwired) (opt-out default-on; kill SWARM_<X>=0; APPROVAL_DELEGATE+SANITIZED_READ change member popup behavior)`);
@@ -1913,6 +1920,61 @@ async function main(): Promise<void> {
     })().catch((e) => log(`placement suggest failed (isolated): ${e instanceof Error ? e.message : e}`));
   };
 
+  // model-market capability-profile pull (model-staffing piece ①). Each sweep, if SWARM_MODEL_MARKET is on and the pull interval
+  // has elapsed (default 12h ≈ the upstream self-refresh; the sweep ticks far faster), fetch model-market-full.json and atomically
+  // replace the ONE SHARED snapshot (freeze Q4). Fetch is async ⇒ a single-flight in-flight guard (mirrors runPlacementSuggest),
+  // never the sync console pattern — so a slow fetch cannot overlap itself. The interval advances BEFORE the fetch starts, so a
+  // persistent failure logs once per interval (not every tick). FC-2 three-state lives in pullModelMarket (source unreachable /
+  // parse-fail ⇒ KEEP the last snapshot); nothing is written on failure. Fully fail-soft: never breaks the sweep.
+  let lastModelMarketSec = 0;
+  let modelMarketInFlight = false;
+  const runModelMarketPull = (): void => {
+    if (!modelMarketEnabled()) return; // SWARM_MODEL_MARKET live by default (opt-out; kill with =0)
+    if (modelMarketInFlight) return; // single-flight: never overlap fetches
+    const now = nowSec();
+    if (!shouldWriteConsole(now, lastModelMarketSec, MODEL_MARKET_SEC)) return; // reuse the pure throttle (same semantics)
+    lastModelMarketSec = now; // advance BEFORE the fetch ⇒ one attempt per interval even if it throws (no tight retry loop)
+    modelMarketInFlight = true;
+    void (async () => {
+      try {
+        const res = await pullModelMarket(HOME, now);
+        if (!res.written) log(`model-market pull kept last snapshot (${res.reason ?? "no-op"})`); // FC-2: expected on a transient source outage
+      } finally { modelMarketInFlight = false; }
+    })().catch((e) => log(`model-market pull failed (isolated): ${e instanceof Error ? e.message : e}`));
+  };
+
+  // model-staffing suggestion projection (model-staffing piece ③a). SUGGESTION MODE ONLY (freeze Q2; same discipline as
+  // runPlacementSuggest): pure read-only producer — it NEVER spawns, NEVER changes a live model, NEVER spends. Each run refreshes
+  // the per-endpoint CPA catalog (async fetch, FC-2), reads the shared capability snapshot + the cached catalog, derives a staffing
+  // task per live plan node (Q3: kind + the planner's modelTier / difficulty → taskFromNode, ZERO plan-schema change), and
+  // atomically writes `console/model-staffing.json` for the console. The catalog fetch is async ⇒ a single-flight in-flight guard
+  // (mirrors runModelMarketPull); the interval advances BEFORE the work so a persistent failure logs once per interval. Fully
+  // fail-soft: never breaks the sweep. HONEST three-state throughout: no plan ⇒ empty tasks; no snapshot / no catalog ⇒
+  // writeStaffingProjection yields a no-staffable "unknown" per task, never a fabricated suggestion.
+  let lastModelStaffingSec = 0;
+  let modelStaffingInFlight = false;
+  const runModelStaffing = (): void => {
+    if (!modelStaffingEnabled()) return; // SWARM_MODEL_STAFFING live by default (opt-out; kill with =0)
+    if (modelStaffingInFlight) return; // single-flight: never overlap the async catalog fetch
+    const now = nowSec();
+    if (!shouldWriteConsole(now, lastModelStaffingSec, MODEL_STAFFING_SEC)) return; // reuse the pure throttle (same semantics)
+    lastModelStaffingSec = now; // advance BEFORE the work ⇒ one attempt per interval even if it throws (no tight retry loop)
+    modelStaffingInFlight = true;
+    void (async () => {
+      try {
+        const cat = await pullCpaCatalog(HOME, now); // refresh the per-endpoint catalog cache (FC-2 three-state)
+        if (!cat.written) log(`model-staffing: catalog kept last (${cat.reason ?? "no-op"})`); // expected on a transient CPA outage
+        const cached = readCatalog(HOME, now);
+        const ids = cached ? cached.ids : []; // no catalog ⇒ [] ⇒ pickModel is no-staffable per task (honest, never fabricated)
+        // Live plan nodes → staffing tasks. authorModel is OMITTED: the per-node author model is not recorded in the current
+        // (hardcoded) spawn, so review heterogeneity degrades to "different id, author provider unknown" — the designed degrade
+        // path (per-node author-model wiring is a future enhancement, candidate for the roleProfile v2 承接 landing).
+        const tasks: StaffingTaskInput[] = plan ? plan.nodes.map((n) => taskFromNode(n)) : []; // no plan ⇒ empty projection (honest)
+        writeStaffingProjection(HOME, now, { tasks, catalog: ids });
+      } finally { modelStaffingInFlight = false; }
+    })().catch((e) => log(`model-staffing suggest failed (isolated): ${e instanceof Error ? e.message : e}`));
+  };
+
   // approval-delegation (IO round): drain the coordinator's dedicated approval key, classify each member PermissionRequest, and
   // DELEGATE the safe ones by committing a permissionDecision to the control-log (the member hook polls it back by promptId and
   // auto-allows — no user dialog). An escalate writes NO decision: the member hook times out to the user dialog, and that blocked
@@ -2142,6 +2204,14 @@ async function main(): Promise<void> {
       // producers (never mutate live state). Gated on SWARM_CONSOLE (live by default; kill with =0), throttled to
       // SWARM_CONSOLE_SEC; fully fail-soft (never breaks the sweep).
       runConsoleProjection();
+      // model-market capability-profile pull (model-staffing piece ①) — fetch + atomically refresh the shared snapshot the
+      // staffing suggester reads. Gated on SWARM_MODEL_MARKET (live by default; kill with =0), throttled to SWARM_MODEL_MARKET_SEC
+      // (≈12h); async single-flight; FC-2 keeps the last snapshot on a transient source outage; fully fail-soft.
+      runModelMarketPull();
+      // model-staffing suggestion projection (model-staffing piece ③a) — refresh the CPA catalog, pick a model per live plan node,
+      // write console/model-staffing.json. SUGGESTION MODE ONLY: never spawns/changes a live model/spends (R16). Gated on
+      // SWARM_MODEL_STAFFING (live by default; kill with =0), throttled to SWARM_MODEL_STAFFING_SEC; async single-flight; fail-soft.
+      runModelStaffing();
       // Morning digest — generate the daily brief projection + coordinator fyi once per day at/after SWARM_DIGEST_HOUR. Gated on
       // SWARM_DIGEST (live by default; kill with =0); fully fail-soft.
       runDigest();
