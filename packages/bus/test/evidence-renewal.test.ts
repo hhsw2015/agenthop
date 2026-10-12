@@ -1,6 +1,10 @@
 import { describe, expect, test } from "vitest";
-import { subjectProgressSeq, waitArmSeq, hasFreshSubjectEvidence, renewOperationId, renewalCount } from "../src/swarm/evidence-renewal.js";
-import type { Change, CommittedBatch } from "../src/swarm/control-log.js";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { subjectProgressSeq, waitArmSeq, hasFreshSubjectEvidence, renewOperationId, renewalCount, renewExpiredLivenessWaits } from "../src/swarm/evidence-renewal.js";
+import { entityKeyOf, liveEntities, type Change, type ChangeBody, type CommitResult, type CommittedBatch, type LogState } from "../src/swarm/control-log.js";
+import { loadControlLog, commitControl, readControlBatches } from "../src/swarm/control-store.js";
 
 // Minimal change fixtures: the derivations read only a few fields per change type, so build those and cast.
 const ch = (body: Record<string, unknown>): Change => ({ ...body, operationId: "op", expectedEntityRevision: 0 } as unknown as Change);
@@ -140,5 +144,123 @@ describe("hasFreshSubjectEvidence (the sweep's renew-vs-escalate test)", () => {
     expect(hasFreshSubjectEvidence([batch(1, accepted("J")), batch(4, waitAt("W", "open"))], { jobId: "J" }, "W")).toBe(false);
     // after a renew the arm advances PAST the triggering progress ⇒ the same evidence does not renew again
     expect(hasFreshSubjectEvidence([batch(2, waitAt("W", "open")), batch(5, accepted("J")), batch(6, waitAt("W", "open"))], { jobId: "J" }, "W")).toBe(false);
+  });
+});
+
+// DISP1-3 (codex:Work): exercise the REAL renewal pass (renewExpiredLivenessWaits) against a REAL on-disk control-store, so
+// the new fault paths + process-restart recovery are gated, not just the orchestration stub. The store IS the only durable
+// state, so a "restart" is simply a fresh loadControlLog from the same dir. No real agent/terminal IO.
+describe("renewExpiredLivenessWaits — real control-store (DISP1-1/DISP1-3)", () => {
+  const mkDir = (): string => path.join(mkdtempSync(path.join(tmpdir(), "ah-renew-")), "control-log");
+  // A minimal-but-real control body: the commit engine stores it by entityKey and the derivations read the few fields set here.
+  const seed = (dir: string, state: LogState, body: ChangeBody): LogState => {
+    const key = entityKeyOf(body); const rev = state.revisions[key] ?? 0;
+    const r = commitControl(dir, state, [{ ...body, operationId: `${key}#${rev + 1}`, expectedEntityRevision: rev } as Change]);
+    if (!r.result.ok) throw new Error(`seed ${key} failed: ${JSON.stringify(r.result)}`);
+    return r.state;
+  };
+  const expiredWait = (waitId: string, jobId: string, deadlineSec: number): ChangeBody =>
+    ({ put: "wait", wait: { waitId, kind: "wait", subject: { jobId }, state: "open", deadlineSec, owner: "o1", timeoutPolicy: "escalate" } } as unknown as ChangeBody);
+  const attemptBody = (jobId: string, attemptId: string): ChangeBody => ({ put: "attempt", attempt: { jobId, attemptId } } as unknown as ChangeBody);
+  const deadlineOf = (state: LogState, waitId: string): number => {
+    const e = liveEntities(state)[`wait:${waitId}`]; if (e === undefined || e.put !== "wait") throw new Error(`no live wait ${waitId}`);
+    return (e as Extract<ChangeBody, { put: "wait" }>).wait.deadlineSec;
+  };
+  // Build deps bound to a dir, counting commits; `over` overrides a read to inject a fault.
+  const mkDeps = (dir: string, over: Partial<Parameters<typeof renewExpiredLivenessWaits>[0]> = {}) => {
+    const faults: unknown[] = []; let commitCount = 0;
+    const base = {
+      loadState: () => loadControlLog(dir),
+      readBatches: () => readControlBatches(dir),
+      onBatchesFault: (e: unknown) => { faults.push(e); },
+      now: 1000, maxFreeRenewals: 20, renewWindowSec: 1800,
+      commit: (st: LogState, ch: Change[]) => { commitCount++; const r = commitControl(dir, st, ch); return { state: r.state, result: r.result }; },
+      log: () => {},
+    };
+    return { deps: { ...base, ...over }, faults, commits: () => commitCount };
+  };
+
+  test("fresh subject evidence + expired renewable wait ⇒ renews (persisted); then a RESTART sees it and does NOT double-renew", () => {
+    const dir = mkDir();
+    let s = loadControlLog(dir);
+    s = seed(dir, s, expiredWait("W", "J", 100));   // armed @seq1, deadline 100 (expired at now=1000)
+    s = seed(dir, s, attemptBody("J", "a1"));       // subject progress @seq2 > arm ⇒ fresh evidence
+    const a = mkDeps(dir);
+    const r1 = renewExpiredLivenessWaits(a.deps);
+    expect(r1.ok).toBe(true);
+    expect(a.commits()).toBe(1);
+    expect(deadlineOf(loadControlLog(dir), "W")).toBe(2800); // 1000 + 1800, persisted to disk
+
+    // RESTART: a brand-new load from the same dir sees the renewed deadline; the wait is no longer expired ⇒ no second renew.
+    const b = mkDeps(dir);
+    const r2 = renewExpiredLivenessWaits(b.deps);
+    expect(r2.ok).toBe(true);
+    expect(b.commits()).toBe(0);                               // deadline 2800 > now 1000 ⇒ skipped
+    expect(deadlineOf(loadControlLog(dir), "W")).toBe(2800);
+    expect(renewalCount(readControlBatches(dir), "W")).toBe(1); // exactly one renewal in the durable log
+  });
+
+  test("NO fresh evidence ⇒ no renewal (the sweep will escalate) — ok:true, 0 commits, deadline unchanged", () => {
+    const dir = mkDir();
+    let s = loadControlLog(dir);
+    s = seed(dir, s, expiredWait("W", "J", 100)); // armed, expired, but no subject progress after the arm
+    const a = mkDeps(dir);
+    const r = renewExpiredLivenessWaits(a.deps);
+    expect(r.ok).toBe(true);
+    expect(a.commits()).toBe(0);
+    expect(deadlineOf(loadControlLog(dir), "W")).toBe(100);
+  });
+
+  test("read#1 fault (loadState null) ⇒ ok:false, 0 commits (atomic abort — caller skips the sweep)", () => {
+    const dir = mkDir();
+    let s = loadControlLog(dir); s = seed(dir, s, expiredWait("W", "J", 100)); s = seed(dir, s, attemptBody("J", "a1"));
+    const a = mkDeps(dir, { loadState: () => null });
+    const r = renewExpiredLivenessWaits(a.deps);
+    expect(r.ok).toBe(false);
+    expect(a.commits()).toBe(0);
+    expect(deadlineOf(loadControlLog(dir), "W")).toBe(100); // untouched
+  });
+
+  test("read#2 fault (readBatches throws) ⇒ ok:false, escalated once, 0 commits (half-read = unknown)", () => {
+    const dir = mkDir();
+    let s = loadControlLog(dir); s = seed(dir, s, expiredWait("W", "J", 100)); s = seed(dir, s, attemptBody("J", "a1"));
+    const a = mkDeps(dir, { readBatches: () => { throw new Error("EACCES"); } });
+    const r = renewExpiredLivenessWaits(a.deps);
+    expect(r.ok).toBe(false);
+    expect(a.faults.length).toBe(1);
+    expect(a.commits()).toBe(0);
+    expect(deadlineOf(loadControlLog(dir), "W")).toBe(100); // untouched
+  });
+
+  // DISP1-1 r4 (codex:Work): a wait we DECIDED to renew whose COMMIT does not persist ⇒ the pass is INCOMPLETE ⇒ ok:false, so
+  // the caller skips the expiry sweep rather than escalating a wait that should have renewed (the chmod-EACCES / CAS counterexample).
+  test("eligible wait whose commit THROWS (e.g. EACCES on the commit write) ⇒ ok:false (pass incomplete, caller skips sweep)", () => {
+    const dir = mkDir();
+    let s = loadControlLog(dir); s = seed(dir, s, expiredWait("W", "J", 100)); s = seed(dir, s, attemptBody("J", "a1"));
+    const a = mkDeps(dir, { commit: () => { throw new Error("EACCES"); } });
+    const r = renewExpiredLivenessWaits(a.deps);
+    expect(r.ok).toBe(false);
+    expect(deadlineOf(loadControlLog(dir), "W")).toBe(100); // not renewed
+  });
+
+  test("eligible wait whose commit is CAS-REJECTED (not-ok result) ⇒ ok:false (pass incomplete)", () => {
+    const dir = mkDir();
+    let s = loadControlLog(dir); s = seed(dir, s, expiredWait("W", "J", 100)); s = seed(dir, s, attemptBody("J", "a1"));
+    const rejecting = (st: LogState) => ({ state: st, result: { ok: false, reason: "stale-entity", entityKey: "wait:W", currentRevision: 9 } as CommitResult });
+    const a = mkDeps(dir, { commit: rejecting });
+    const r = renewExpiredLivenessWaits(a.deps);
+    expect(r.ok).toBe(false);
+    expect(deadlineOf(loadControlLog(dir), "W")).toBe(100); // not renewed
+  });
+
+  // a reducer REFUSAL (not a commit failure) is NOT incomplete — that wait legitimately cannot renew, so the sweep should still
+  // run to escalate it. We prove the complementary direction: a non-eligible expired wait leaves ok:true (sweep proceeds).
+  test("no eligible renewal (expired but no fresh evidence) ⇒ ok:true even though the wait stays expired (sweep will escalate)", () => {
+    const dir = mkDir();
+    let s = loadControlLog(dir); s = seed(dir, s, expiredWait("W", "J", 100)); // no subject progress after the arm ⇒ not eligible
+    const a = mkDeps(dir);
+    const r = renewExpiredLivenessWaits(a.deps);
+    expect(r.ok).toBe(true);        // nothing to renew ⇒ complete ⇒ sweep proceeds and escalates W
+    expect(a.commits()).toBe(0);
   });
 });

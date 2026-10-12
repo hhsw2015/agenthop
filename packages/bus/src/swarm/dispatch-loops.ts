@@ -11,6 +11,60 @@
  * non-starvation property is offline-testable without real timers-in-production.
  */
 
+/**
+ * DISP-1 (infra audit): load the control log FAIL-SOFT. `loadControlLog` THROWS on a corrupt / EACCES / gapped `<seq>.json`,
+ * and the dispatcher ticks called it UNGUARDED at the head — so ONE bad batch made every tick throw at line 1, wedging ALL
+ * supervision AND the control-INDEPENDENT run* after it, forever, with only a 5s error log and no escalation. This wraps the
+ * load: on a fault it calls `onFault` (the caller escalates to the coordinator + logs) and returns null, so the tick SKIPS
+ * control-dependent work this round but still runs the independent observability (gauge/console/digest/wake); a later tick
+ * that reads a repaired log resumes normally. Pure + injectable (generic over the state type, so no control-store coupling). */
+export function loadControlOrEscalate<T>(load: () => T, onFault: (e: unknown) => void): T | null {
+  try { return load(); }
+  catch (e) { onFault(e); return null; }
+}
+
+/**
+ * DISP1-2/DISP1-3 (codex:Work): the sweep tick, grouped by ACTUAL control-log dependency rather than by position. `independent`
+ * run* read their OWN sources (inbox dirs, swap/PID records, review/round/placement ledgers), NOT the control log, so they run
+ * EVERY tick — a corrupt control log must never silence them. `loadControl` is the fail-soft load (returns true iff the control
+ * log is readable; it sets the shared state as a side effect and has already escalated on a fault). `dependent` run* (sweepPass,
+ * projection/verdict, observer, dead-letter, live-sentinel, ops-receipt, approval) run ONLY when the control log loaded. `tail`
+ * is the control-INDEPENDENT observability (gauge/console/digest/wake), also every tick. Each step is isolated (its throw is
+ * reported via onError and never skips the remaining steps or the tail), so one faulty duty can't starve the others. Pure
+ * scheduling — all work is injected, so the grouping + fail-soft behavior is offline-testable. */
+export async function runSweepTick(p: {
+  independent: Array<() => void | Promise<void>>;
+  loadControl: () => boolean;
+  dependent: Array<() => void | Promise<void>>;
+  tail: Array<() => void | Promise<void>>;
+  onError: (where: string, e: unknown) => void;
+}): Promise<void> {
+  const step = async (where: string, f: () => void | Promise<void>): Promise<void> => { try { await f(); } catch (e) { p.onError(where, e); } };
+  for (let i = 0; i < p.independent.length; i++) await step(`sweep.independent[${i}]`, p.independent[i]!);
+  let loaded = false;
+  try { loaded = p.loadControl(); } catch (e) { p.onError("sweep.loadControl", e); loaded = false; } // loadControl is already fail-soft; this is belt-and-suspenders
+  if (loaded) for (let i = 0; i < p.dependent.length; i++) await step(`sweep.dependent[${i}]`, p.dependent[i]!);
+  for (let i = 0; i < p.tail.length; i++) await step(`sweep.tail[${i}]`, p.tail[i]!);
+}
+
+/**
+ * DISP1-1 (codex:Work): gate the expiry sweep on a COMPLETE renewal pass. `renew` returns false when the renewal pass did NOT
+ * complete — EITHER one of its two control reads faulted (a HALF-read is unknown, already escalated by the loader), OR an
+ * eligible wait we decided to renew did not PERSIST (its commit returned not-ok / was CAS-rejected / threw; DISP1-1 r4). In any
+ * of these the expiry sweep MUST NOT run, else it would escalate an expired-but-renewable wait whose renewal we failed to apply
+ * (the r2 defect: a transient renew-read fault that then reloaded clean still escalated a wait that should have renewed).
+ * `reload` re-reads control for the sweep (false ⇒ unreadable ⇒ skip this tick). The sweep runs ONLY when BOTH the renewal pass
+ * completed AND control reloaded. Pure gate — renew/reload/sweep all injected, so the skip-sweep property is offline-testable. */
+export async function runRenewThenSweep(p: {
+  renew: () => boolean;
+  reload: () => boolean;
+  sweep: () => void | Promise<void>;
+}): Promise<void> {
+  if (!p.renew()) return;   // renewal incomplete (a control read faulted) ⇒ never escalate a wait we failed to renew
+  if (!p.reload()) return;  // control unreadable after renew ⇒ skip the expiry sweep this tick
+  await p.sweep();
+}
+
 export type LoopName = "pass" | "sweep";
 
 export type LoopFns = {
