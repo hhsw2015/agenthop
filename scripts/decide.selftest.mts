@@ -17,6 +17,13 @@ const ok = (cond: boolean, msg: string): void => { if (!cond) { console.error(`F
   const miss = classifyArgs(["submit", "f.json", "--owner"]);
   ok(miss.mode === "usage" && miss.error?.includes("--owner") === true, "classify: dangling --owner ⇒ usage error");
   ok(classifyArgs(["submit", "f.json", "--bogus"]).mode === "usage", "classify: unknown submit option ⇒ usage");
+  // DEC-P2-4: a flag must not swallow the NEXT flag as its value.
+  const sw = classifyArgs(["submit", "f.json", "--owner", "--notify", "box"]);
+  ok(sw.mode === "usage" && sw.error?.includes("--owner") === true, "classify: --owner swallowing --notify ⇒ usage (DEC-P2-4)");
+  ok(classifyArgs(["submit", "f.json", "--notify", "--batch-id", "b"]).mode === "usage", "classify: --notify swallowing --batch-id ⇒ usage");
+  ok(classifyArgs(["list", "--home", "--x"]).mode === "usage", "classify: list --home swallowing a flag ⇒ usage");
+  const stdinOwner = classifyArgs(["submit", "f.json", "--owner", "-"]);
+  ok(stdinOwner.mode === "submit" && stdinOwner.owner === "-", "classify: a lone '-' is still a legal flag value");
   const l = classifyArgs(["list", "--home", "/tmp/h"]);
   ok(l.mode === "list" && l.home === "/tmp/h", "classify: list with --home");
   ok(classifyArgs(["list"]).mode === "list", "classify: bare list");
@@ -45,6 +52,14 @@ const ok = (cond: boolean, msg: string): void => { if (!cond) { console.error(`F
   ok(!dup.ok && dup.error!.includes("duplicate"), "parse: duplicate id ⇒ error");
   ok(!parseSubmitInput('"a string"', { owner: "c" }).ok, "parse: non-array/object JSON ⇒ error");
   ok(!parseSubmitInput('{"owner":"c"}', {}).ok, "parse: object without items ⇒ error");
+  // DEC-P2-4: a DECLARED field of the wrong type is an error, never silently defaulted.
+  const numId = parseSubmitInput('{"batchId":123,"items":[{"id":"a","kind":"k","summary":"s","suggestedAction":"g"}]}', { owner: "c" });
+  ok(!numId.ok && numId.error!.includes("batchId"), "parse: numeric batchId ⇒ error (not a silent random id)");
+  ok(!parseSubmitInput('{"notifyTo":5,"items":[{"id":"a","kind":"k","summary":"s","suggestedAction":"g"}]}', { owner: "c" }).ok, "parse: non-string notifyTo ⇒ error");
+  ok(!parseSubmitInput('{"owner":9,"items":[{"id":"a","kind":"k","summary":"s","suggestedAction":"g"}]}', {}).ok, "parse: non-string owner ⇒ error");
+  // an unknown key (e.g. the draft artifact's _comment) is still ignored.
+  const wc = parseSubmitInput('{"_comment":"draft","owner":"c","items":[{"id":"a","kind":"k","summary":"s","suggestedAction":"g"}]}', {});
+  ok(wc.ok && wc.batch.owner === "c", "parse: unknown _comment key ignored");
   // a valid item keeps optional fields clean
   const clean = parseSubmitInput('[{"id":"a","kind":"k","summary":"s","suggestedAction":"g"}]', { owner: "c" });
   ok(clean.ok && !("evidenceRef" in clean.batch.items[0]!) && !("hardGate" in clean.batch.items[0]!), "parse: optional item fields omitted when absent");
