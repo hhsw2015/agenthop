@@ -1,6 +1,6 @@
 # coordinator-skill 简报 — 协调者技能化(设计·冻结候选 r3)
 
-owner aad02248 · 协调者 fe0376cd 派单(user 亲令,方向性大件)· 审查席 happycapy · base main @a1a933d · 状态:**设计全签 @ade8be9(CS-P2-1/2/3/4 + N1 全 CLOSED);r6 并入 §8 新项目开张流程 + §9 角色设计权(user 完整图景:原则固定编制自由);待 user 裁 A/B 落点后制作技能产物**
+owner aad02248 · 协调者 fe0376cd 派单(user 亲令,方向性大件)· 审查席 happycapy · base main @a1a933d · 状态:**设计全签 @ade8be9;r7 并入 §8 新项目开张流程(含 happycapy 轻复审 CS8-P2-1/2+N1 修齐)+ §9 角色设计权(原则固定编制自由);待 user 裁 A/B 落点后制作技能产物**
 
 ## 缘起(user 原话)
 
@@ -111,7 +111,7 @@ rulings grep <word>
 
 ### H. 新项目开张流程(spawn-coordinator — 出生即胜任)
 
-user 完整图景补充(设计已签 @ade8be9,本节并入 DRAFT 定稿,详见 DRAFT §8):① spawn-coordinator runbook(新 session → 加载技能 → 注入五参 → **自检状态文件地图**:PROGRESS 播种 / roster 注册 / board·control-log·inbox·decision-batches·投影 惰性建 + 加载检查);② 项目键 = 状态树根 `$AH_HOME/.agenthop`(与 state-isolation 对齐;多根隔离=前置依赖,诚实边界同 CS-P2-1);③ 第一轮例程(自唤醒 cron / 报到对话官或 user / 招募成员引用 roster resumeCmd 模板 F36);④ 与既有 agenthop 协调者(fe0376cd)= **对等同僚**:互不干预、各拥状态树、共用律典+基础设施、单一人类权威 user、跨项目对等不命令。
+user 完整图景补充(设计已签 @ade8be9,本节并入 DRAFT 定稿,详见 DRAFT §8;happycapy §8 轻复审 CS8-P2-1/2+N1 已修):① spawn-coordinator runbook(新 session → 加载技能 → 注入五参 → **判根归属三分支**〔首次空根/同根继任/隔离前置未满足→停〕→ **自检状态文件地图** + 完整 §0 加载检查;六类共享状态挂根下、换 PROJECT_ROOT 不隔离);② 项目键 = 状态树根 `$AH_HOME/.agenthop`(多根隔离=前置依赖,诚实边界同 CS-P2-1);③ 第一轮例程(自唤醒 cron / 报到对话官或 user / **招募区分:新成员=fresh spawn 新身份,恢复既有成员=resumeCmd;roster-snapshot 是恢复快照非注册入口,从 live peers 捕获排除自身**);④ 与既有 agenthop 协调者(fe0376cd)= **对等同僚**(互不干预、各拥状态树、共用律典+基础设施、单一人类权威 user);跨项目对等=**本派单新约定**(非 R18 原文;R18=按机器二级调度)。
 
 ### I. 组织:角色设计权(原则固定,编制自由)
 

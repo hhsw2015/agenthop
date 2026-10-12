@@ -104,20 +104,24 @@ CLI 读 `AGENTHOP_RULINGS_DIR` 否则脚本所在仓(`rulings.ts:108`)——**�
 
 1. **起新 session**:herdr 新 pane/tab(或 `agenthop_spawn`),cwd = 新项目根。新壳首动 `agenthop install --mcp <kind>`(F45,裸 install 只打印不注册)。
 2. **加载 coordinator 技能**(本技能)。
-3. **注入五参**:`COORD_SID`=**新铸**(本 session 稳定总线身份)/ `AH_HOME`=本机家目录(数据面 `$AH_HOME/.agenthop`)/ `PROJECT_ROOT`=**新项目根**(仓+契约集+产物域)/ `REVIEW_SEAT`=本项目指定审查席 / `RULINGS`=共享律典(`AGENTHOP_RULINGS_DIR`)。
-4. **自检清单(状态文件地图)**——「他知道他的状态文件是哪些」。逐一确认/初始化(多数由写入方惰性创建,协调者只需**播种 PROGRESS.md + 注册 roster + 确认 `$AH_HOME/.agenthop/` 可写**):
+3. **注入五参**:`COORD_SID`=**新铸**(本 session 稳定总线身份)/ `AH_HOME`=数据面家目录(数据面 `$AH_HOME/.agenthop`)/ `PROJECT_ROOT`=**新项目根**(仓+契约集+产物域)/ `REVIEW_SEAT`=按需审查席(§9)/ `RULINGS`=共享律典(`AGENTHOP_RULINGS_DIR`)。
+4. **判定根归属 + 运行模式分支(初始化前必须,CS8-P2-1)**。关键事实:**六类共享状态(进度/roster/board/control-log/决策批/投影)挂在根 `$AH_HOME/.agenthop` 下、不随 PROJECT_ROOT 变**——仅换 `PROJECT_ROOT`+`COORD_SID`、复用旧根**不构成隔离**(只有自箱 `inbox/<COORD_SID>` 不同)。先探根 `$AH_HOME/.agenthop/swarm/`,三分支:
+   - **(a) 首次空根**:无既有 PROGRESS/control-log/他人协调者态 ⇒ **首次初始化**(播种,步骤 5)。
+   - **(b) 同根继任**:根已被一个既有协调者占用、你来**接任该席**(非独立新项目)⇒ **沿用既有状态**(不重置、不覆盖 PROGRESS/board/control-log;继任 F45)。
+   - **(c) 隔离前置未满足**:既有项目仍在此根上跑、你又要**独立新项目** ⇒ **停**。独立新项目需一个**新的未占用根**;单一确认根(`homedir()/.agenthop`)上**无法并立第二个独立项目**——那是多根隔离**前置依赖**(§②,各入口〔总线 options.home/presence/dispatcher〕同读一根),非 v1。
+5. **自检清单(状态文件地图)**——「他知道他的状态文件是哪些」。走**完整 §0 加载检查**(不止「`$AH_HOME/.agenthop/` 可写 + `rulings S29` 可解析」):(a) 空根**播种** PROGRESS.md,其余由写入方惰性建;(b) 继任**沿用**不重置:
 
-| 状态文件 | 路径(`$AH_HOME/.agenthop/…`) | 初始化 |
+| 状态文件 | 路径(`$AH_HOME/.agenthop/…`) | 初始化 / 归属 |
 |---|---|---|
-| 进度叙事 | `swarm/PROGRESS.md` | 协调者**播种**(首行标题 + 空节);本技能的组稿/晨报读它 |
-| 名册册 | `swarm/roster-snapshot.json`(+ `swarm/console/roster.json`) | 注册本 session + 后续成员(roster resumeCmd 模板,③) |
+| 进度叙事 | `swarm/PROGRESS.md` | (a) 协调者**播种**(首行标题 + 空节)/(b) 沿用;组稿/晨报读它 |
+| 名册册 | `swarm/roster-snapshot.json`(恢复快照)+ `swarm/console/roster.json` | **恢复快照,非注册入口**:本 session **加入总线**(check-in 入 live peers)即"在册";快照由 `swarm-resume --snapshot` 从 live peers 捕获(**排除采集者自身**),见 ③ |
 | 板 | `swarm/board/` | 空目录(拉式领活;写入方惰性建) |
 | 控制日志 | `swarm/control-log/` | 空(commit 惰性建;单调 seq 源,§1/§6) |
 | 自箱 | `inbox/<COORD_SID>/` | 空(writeInbox 惰性建;§1 扫箱) |
 | 决策批 | `console/decision-batches/` | 空(待你拍板权威源) |
 | 投影 | `swarm/console/`、`console/morning-digest/` | 空(验收简报/看板投影惰性建) |
 
-自检失败(`$AH_HOME/.agenthop/` 不可写 / `rulings S29` 不解析)⇒ **不启动**(§0 加载检查)。
+自检失败,或分支落 **(c)** ⇒ **不启动**。
 
 ### ② 与 state-isolation 键对齐
 
@@ -127,7 +131,11 @@ CLI 读 `AGENTHOP_RULINGS_DIR` 否则脚本所在仓(`rulings.ts:108`)——**�
 
 1. **建立自唤醒**:装 sweep/唤醒 cron(§1 the loop 的触发),使扫箱-派下一棒循环自驱(自驱动柱)。
 2. **报到**:向**对话官**(R20 日常事务官,user 的单一接口链路)或直接向 user 报「新项目协调者已就位 + 五参 + 状态文件地图确认」。
-3. **招募成员**:按需 spawn(容量规则),引用 **roster resumeCmd 模板**(F36 出生证:完整 resumeCmd 非裸 `--resume`;swarm-resume)——每个成员带角色说明(roleProfile)+ 契约 + CORE,spawn 即带全部规章。
+3. **招募 / 恢复成员(区分出生与恢复,CS8-P2-2)**:
+   - **新成员出生 = fresh spawn**(取得**真实新身份**),**不是** resumeCmd——`resumeCmd`(`--resume <旧 sid>`)恢复的是一个**既有**会话;原样复用会把新成员错绑到旧 SID/cwd。出生后再把它纳入恢复快照。
+   - **恢复既有成员 = 用其 resumeCmd**(F36 出生证:完整 resumeCmd 非裸 `--resume`;`swarm-resume`,保留该成员真实旗)。
+   - **快照入口**:`swarm-resume --snapshot` 从 live peers 捕获、**排除采集者自身**(`scripts/swarm-resume.ts`),**保留既有成员数据**——它是恢复快照,不是注册入口。
+   每个成员带角色说明(roleProfile)+ 契约 + CORE,spawn 即带全部规章;需要哪些角色/几个由协调者定(角色设计权,§9)。
 
 ### ④ 与既有 agenthop 协调者的关系
 
@@ -135,7 +143,7 @@ CLI 读 `AGENTHOP_RULINGS_DIR` 否则脚本所在仓(`rulings.ts:108`)——**�
 - **互不干预**:各自拥有自己的状态树(各自 `$AH_HOME/.agenthop` / 项目键);谁都不向对方项目派单或改其状态。
 - **共用律典 + 基础设施**:同一 `RULINGS`(FC 族 + S/R/F 判例=可移植法)+ agenthop 二进制/总线/herdr/旗默认 + 本技能本体。
 - **单一人类权威**:两协调者之上仍是 **user**(R16 授权链);跨项目的三类裁决归 user,不由任一协调者代行到另一项目。
-- 需要时可**平级咨询**(peer,总线),但不互相命令(R18 分层仅在一个项目树内成立,跨项目是对等)。
+- 需要时可**平级咨询**(peer,总线),但不互相命令。**出处(CS8-N1)**:此**跨项目对等**约定是本次收尾派单的**新约定**(user 完整图景),**非** R18 原文——**R18**(分层调度宪章)定的是**按机器的二级协调者**(总调 fe0376cd + 本机 L2 调度),其分层在一个 fleet 内成立;跨**项目**的对等关系为本次新增适用域,出处=本派单/user 裁。
 
 ## 9. 组织:角色设计权(原则固定,编制自由)
 
@@ -155,4 +163,4 @@ user 裁:**角色不固定,协调者自决**。本技能**不规定编制**—�
 
 ---
 
-_DRAFT r6 说明:落点待 user 裁(brief §③,首批 DecisionBatch)。取案 A 按英文 SKILL.md + zh-CN 双语拆分(build-release.mjs 契约)。五参由加载点注入,正文不硬编码具体工作区;v1 范围=单根单协调者,多根隔离/数据面改造为前置依赖(brief「支持的运行模式」)。§8 新项目开张流程 + §9 角色设计权为 user 完整图景补充(设计主体已签 @ade8be9;本两节并入 DRAFT 定稿,技能产物在 A/B 落点裁后制作)。_
+_DRAFT r7 说明:落点待 user 裁(brief §③,首批 DecisionBatch)。取案 A 按英文 SKILL.md + zh-CN 双语拆分(build-release.mjs 契约)。五参由加载点注入,正文不硬编码具体工作区;v1 范围=单根单协调者,多根隔离/数据面改造为前置依赖(brief「支持的运行模式」)。§8 新项目开张流程 + §9 角色设计权为 user 完整图景补充(设计主体已签 @ade8be9)。r7 修 happycapy §8 轻复审 2P2+nit:CS8-P2-1(开张前判根归属三分支:首次空根/同根继任/隔离前置未满足)、CS8-P2-2(roster 恢复快照≠注册入口;新出生=fresh spawn 非旧 SID resumeCmd)、CS8-N1(跨项目对等=本派单新约定,非 R18 原文)。_
