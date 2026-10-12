@@ -101,27 +101,35 @@ export function sortBoard(rows: readonly BoardRow[]): BoardRow[] {
 }
 
 // ── (4) decisions mirror (swarm/console/decisions/<batchId>.json · ENVELOPE console-decisions/v1) ──
+/**
+ * SCM-P2-1: a parsed batch carries a COMPLETENESS flag. `complete:false` means some of the batch could not be represented (the
+ * `items` field was not an array, or an entry was a non-object / had no id, so it was dropped). The caller keeps the items it
+ * COULD read but must surface that the count is not fully known — a dropped item must never silently shrink a confident total.
+ */
+export type BatchParse = { view: DecisionBatchView; complete: boolean };
 /** Parse one decisions file: the console-decisions/v1 ENVELOPE, extract `.batch`, then validate the inner decision-batch-v1.
- *  A wrong/missing envelope schema ⇒ null (whole file rejected = fail-soft placeholder), never a throw. */
-export function parseDecisionMirror(text: string): DecisionBatchView | null {
+ *  A wrong/missing envelope schema ⇒ null (whole file is UNKNOWN = the caller counts it as unread, never as 0), never a throw. */
+export function parseDecisionMirror(text: string): BatchParse | null {
   const o = safeJson(text);
   if (!isObj(o) || o.schema !== "console-decisions/v1") return null; // SCM-N1: validate the envelope before trusting .batch
   if (!isObj(o.batch)) return null;
   return parseBatch(o.batch);
 }
 /** Validate an already-parsed decision-batch-v1 object (the envelope's `.batch`). Exported for the selftest. */
-export function parseBatch(o: Record<string, unknown>): DecisionBatchView | null {
+export function parseBatch(o: Record<string, unknown>): BatchParse | null {
   const batchId = str(o.batchId);
   if (batchId === "") return null;
+  // SCM-P2-1: a missing/non-array `items`, or any entry we cannot represent, makes the batch INCOMPLETE (we keep what we read).
+  let complete = Array.isArray(o.items);
   const itemsRaw = Array.isArray(o.items) ? o.items : [];
   const items: DecisionItemView[] = [];
   for (const it of itemsRaw) {
-    if (!isObj(it)) continue;
+    if (!isObj(it)) { complete = false; continue; }
     const id = str(it.id);
-    if (id === "") continue;
+    if (id === "") { complete = false; continue; }
     items.push({ id, kind: str(it.kind), summary: str(it.summary), suggestedAction: str(it.suggestedAction), evidenceRef: typeof it.evidenceRef === "string" ? it.evidenceRef : undefined, hardGate: it.hardGate === true });
   }
-  return { batchId, owner: str(o.owner), items };
+  return { view: { batchId, owner: str(o.owner), items }, complete };
 }
 
 // ── (5) roster (swarm/console/roster.json · ENVELOPE console-roster/v1) ──
@@ -143,15 +151,21 @@ export function parseRoster(text: string): RosterSeat[] | null {
 }
 
 // ── band summary (one line above the prompt): seats · pending decisions · bandwidth zone. Fail-soft placeholders for unproduced/unknown sources. ──
+/** Pending-decisions view: `null` = the whole dir is UNKNOWN (absent/unreadable). Otherwise `known` = items in fully-read batches,
+ *  `unknown` = files/batches we could not fully read (unreadable, corrupt, wrong-schema, or incomplete). SCM-P2-1. */
+export type PendingView = { known: number; unknown: number } | null;
+/** Format the pending segment: `待裁:?` (dir unknown) · `待裁:N` (all read, exact) · `待裁:N+U?` (N confirmed, U unread/corrupt). */
+export function pendingLabel(p: PendingView): string {
+  if (p === null) return "待裁:?";
+  return p.unknown > 0 ? `待裁:${p.known}+${p.unknown}?` : `待裁:${p.known}`;
+}
 const ZONE_GLYPH: Record<GaugeZone, string> = { green: "●", amber: "◆", red: "✕", unknown: "?" };
-export function bandSummary(input: { roster: RosterSeat[] | null; pendingDecisions: number | null; gauge: GaugeView | null }): string {
+export function bandSummary(input: { roster: RosterSeat[] | null; pending: PendingView; gauge: GaugeView | null }): string {
   const seats = input.roster === null
     ? "席:源未产"
     : `席:${input.roster.filter((s) => s.alive === "alive").length}/${input.roster.length}`;
-  // SCM-P2-1: an unreadable/absent decisions dir is UNKNOWN ("待裁:?"), NOT a false "待裁:0" (nothing awaiting ruling).
-  const pend = input.pendingDecisions === null ? "待裁:?" : `待裁:${input.pendingDecisions}`;
   const band = input.gauge === null ? "带宽:源未产" : `带宽:${ZONE_GLYPH[input.gauge.zone]}${input.gauge.zone}${input.gauge.ratio !== null ? `(${input.gauge.ratio.toFixed(2)})` : ""}`;
-  return `蜂群 ${seats} · ${pend} · ${band}`;
+  return `蜂群 ${seats} · ${pendingLabel(input.pending)} · ${band}`;
 }
 
 // ── decision cards + answer prefill (keycapture → $.prompt.fill). Carries the FROZEN decisions.json fields as an agent-actionable
@@ -175,7 +189,10 @@ export function cardOptions(item: DecisionItemView): DecisionOption[] {
  * prefilling a different item that happens to sit at the same index. Deterministic, pure. NUL-separated so fields can't collide.
  */
 export function decisionFingerprint(item: DecisionItemView): string {
-  return `${item.summary}\u0000${item.suggestedAction}\u0000${item.hardGate ? "1" : "0"}`;
+  // SCM-P2-2: bind EVERY field the card shows / that shapes the decision — summary, suggestedAction, evidenceRef, hardGate.
+  // JSON.stringify of a fixed-order array is UNAMBIGUOUS: each string is quoted + escaped, so no value (even one containing the
+  // old U+0000 separator) can collide across fields. `evidenceRef ?? null` distinguishes "absent" from an empty string.
+  return JSON.stringify([item.summary, item.suggestedAction, item.evidenceRef ?? null, item.hardGate]);
 }
 
 /** One card as the Client renders + keys it: the SEEN identity + fingerprint + the resolved options. Pushed to rows.tsx via props. */

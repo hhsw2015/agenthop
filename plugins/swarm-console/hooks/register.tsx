@@ -16,7 +16,7 @@ import type { Register } from "claude-code";
 import {
   parseGauge, parseDigest, parseBoardFile, sortBoard, parseDecisionMirror, parseRoster,
   bandSummary, decisionCards, decisionFingerprint, cardOptions, decisionPrefill,
-  type BoardRow, type DecisionBatchView, type DecisionCard,
+  type BoardRow, type DecisionBatchView, type DecisionCard, type PendingView,
 } from "./read.js";
 
 const PANE_ID = "swarm-console";
@@ -59,24 +59,30 @@ async function loadRoster($: any) { const t = await readText($, `${await root($)
 
 /**
  * Dependency projection (90b58f9c): `~/.agenthop/swarm/console/decisions/<batchId>.json` — each a console-decisions/v1 ENVELOPE.
- * Returns null when the dir is ABSENT/UNREADABLE (⇒ band shows "待裁:?" UNKNOWN, SCM-P2-1), [] when the dir is confirmed-empty
- * (⇒ "待裁:0"). A per-file parse fault just drops that file (fail-soft).
+ * SCM-P2-1: tracks per-file certainty, so a count is exact ONLY when every file read + validated. `dirUnknown` = the dir itself is
+ * absent/unreadable (whole count unknown). `unknown` = files that were unreadable / corrupt / wrong-schema / incomplete (parsed
+ * but had a dropped item). `batches` keeps every batch we COULD read (so known items still render), incomplete ones included.
  */
-async function loadDecisions($: any): Promise<DecisionBatchView[] | null> {
+type DecisionsLoad = { batches: DecisionBatchView[]; unknown: number; dirUnknown: boolean };
+async function loadDecisions($: any): Promise<DecisionsLoad> {
   const dir = `${await root($)}/swarm/console/decisions`;
   const names = await listDirStrict($, dir);
-  if (names === null) return null; // UNKNOWN (dir absent/unreadable) — never a false "0 awaiting"
-  const out: DecisionBatchView[] = [];
+  if (names === null) return { batches: [], unknown: 0, dirUnknown: true }; // dir UNKNOWN — never a false "0 awaiting"
+  const batches: DecisionBatchView[] = [];
+  let unknown = 0;
   for (const name of names) {
     if (!name.endsWith(".json")) continue;
     const t = await readText($, `${dir}/${name}`);
-    if (t === null) continue;
-    const b = parseDecisionMirror(t);
-    if (b !== null) out.push(b);
+    if (t === null) { unknown++; continue; }           // unreadable file ⇒ UNKNOWN (not a silent skip)
+    const p = parseDecisionMirror(t);
+    if (p === null) { unknown++; continue; }            // corrupt / wrong-schema ⇒ UNKNOWN
+    batches.push(p.view);
+    if (!p.complete) unknown++;                          // parsed but a dropped/missing item ⇒ count is INCOMPLETE
   }
-  return out;
+  return { batches, unknown, dirUnknown: false };
 }
-const pendingCount = (batches: DecisionBatchView[] | null): number | null => (batches === null ? null : batches.reduce((n, b) => n + b.items.length, 0));
+/** Project the load to the band's pending view: null (dir unknown) ⇒ "待裁:?"; else {known items, unknown files/batches}. */
+const pendingView = (l: DecisionsLoad): PendingView => (l.dirUnknown ? null : { known: l.batches.reduce((n, b) => n + b.items.length, 0), unknown: l.unknown });
 
 export const register: Register = (on) => {
   // register /swarm + start the 60s refresh clock. If any API is unavailable we simply skip it (fail-soft, no throw).
@@ -93,7 +99,7 @@ export const register: Register = (on) => {
     try {
       const { Box, Text } = $.ui.resolve(e);
       const [gauge, roster, decisions] = await Promise.all([loadGauge($), loadRoster($), loadDecisions($)]);
-      const line = bandSummary({ roster, pendingDecisions: pendingCount(decisions), gauge });
+      const line = bandSummary({ roster, pending: pendingView(decisions), gauge });
       const mine = <Box><Text>{line}</Text></Box>;
       return isEmptyTree(below) ? mine : <Box flexDirection="column">{mine}{below}</Box>;
     } catch { return below; } // band render must never break the prompt
@@ -126,8 +132,11 @@ export const register: Register = (on) => {
       const digestRows = digest === null
         ? [<Text key="d0">晨报:源未产</Text>]
         : digest.sections.slice(0, 6).map((s, i) => <Text key={`d${i}`}>{`· ${s.title}: ${s.lines.slice(0, 2).join(" / ")}`}</Text>);
-      const cards: DecisionCard[] = decisionCards(decisions ?? []);
-      const decHeader = decisions === null ? "— 待裁呈批(源未产/未读) —" : `— 待裁呈批(${cards.length}) —`;
+      const cards: DecisionCard[] = decisionCards(decisions.batches);
+      // SCM-P2-1: the header states certainty — "源未产/未读" (dir unknown), "N+U?" (N confirmed, U unread/corrupt), or exact N.
+      const decHeader = decisions.dirUnknown
+        ? "— 待裁呈批(源未产/未读) —"
+        : decisions.unknown > 0 ? `— 待裁呈批(${cards.length} 确定 · ${decisions.unknown} 未读/损坏,数量不完整) —` : `— 待裁呈批(${cards.length}) —`;
       // 呈批 cards are the only INTERACTIVE, time-sensitive part — put them at the top so they need no scroll; board + digest follow.
       return (
         <Box flexDirection="column">
@@ -158,7 +167,7 @@ export const register: Register = (on) => {
       if (batchId === "" || itemId === "" || verdict === "") return next(e);
 
       const decisions = await loadDecisions($);
-      const batch = (decisions ?? []).find((b) => b.batchId === batchId);
+      const batch = decisions.batches.find((b) => b.batchId === batchId);
       const item = batch?.items.find((it) => it.id === itemId);
       if (!item) { toast($, "该呈批条目已不在(可能已裁/已变),请重开 /swarm 重选。"); return next(e); }
       // SCM-P2-2: the list may have changed between render and keystroke — refuse unless the SEEN content still matches.
