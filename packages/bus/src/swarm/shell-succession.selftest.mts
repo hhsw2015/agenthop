@@ -1,8 +1,8 @@
-import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, argvFromCmdline, presencePidRelPath, planSuccession, adoptLockSite, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
+import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, argvFromCmdline, presencePidRelPath, planSuccession, adoptLockSite, reapStrandedAdoptLock, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
 import { acquireHolderLock, releaseHolderLock } from "./holder-lock.js";
 import { probeCandidateLiveness, probeSessionLiveness, sidSockPrefix } from "./task-liveness.js";
 import type { RosterMember } from "./resume.js";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import net from "node:net";
@@ -158,5 +158,61 @@ const slowSock = await mkServer(path.join(presDir, `${pref}.s.sock`), () => { /*
 t("probeSessionLiveness: only a connected-but-silent candidate -> unknown (NOT no-socket; forbids adoption)", (await probeSessionLiveness(sockHome, SID, 150)) === "unknown");
 for (const s of servers) { try { s.close(); } catch { /* noop */ } }
 rmSync(sockHome, { recursive: true, force: true });
+
+// ── SUCC-1 (infra audit): reapStrandedAdoptLock — a crash-stranded EMPTY adopt lock must not make a sid un-adoptable forever ──
+{
+  const mkHome = () => mkdtempSync(path.join(tmpdir(), "succ1-"));
+  const SID = "succ-sid-1";
+  const strand = (home: string, intentPid: number) => {
+    const site = adoptLockSite(home, SID);
+    mkdirSync(site.lockDir, { recursive: true });                                             // empty lock dir = the mkdir→publish crash window
+    writeFileSync(path.join(site.intentDir, `${site.intentPrefix}${intentPid}.abcdef`), "");  // the crashed holder's hold-intent
+    return site;
+  };
+
+  // crash-recovery: an empty lock dir + a DEAD foreign hold-intent ⇒ reaped ⇒ the sid is adoptable again.
+  {
+    const home = mkHome(); const site = strand(home, 999999);          // 999999 ⇒ ESRCH ⇒ dead
+    reapStrandedAdoptLock(home, SID);
+    t("SUCC-1 crash-recovery: stranded empty lock + dead intent is REAPED", !existsSync(site.lockDir));
+    const token = acquireHolderLock(site);
+    t("SUCC-1 crash-recovery: the sid is acquirable again after reap (not deaf forever)", token !== null);
+    if (token) releaseHolderLock(site, token);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // concurrency-race: an empty lock dir whose hold-intent is a LIVE foreign holder (mid-acquire) ⇒ NEVER reaped.
+  {
+    const home = mkHome(); const site = strand(home, 424242);
+    reapStrandedAdoptLock(home, SID, () => true);                      // inject "alive" for the foreign pid
+    t("SUCC-1 race: a live foreign hold-intent ⇒ lock is NOT reaped (never steal a mid-acquire holder)", existsSync(site.lockDir));
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // published holder untouched: a NON-empty lock dir (identity published) is never considered by the reaper.
+  {
+    const home = mkHome(); const site = adoptLockSite(home, SID);
+    mkdirSync(site.lockDir, { recursive: true });
+    writeFileSync(path.join(site.lockDir, "100.deadbeef"), "");        // a published identity
+    reapStrandedAdoptLock(home, SID);
+    t("SUCC-1: a PUBLISHED (non-empty) lock dir is left untouched", existsSync(path.join(site.lockDir, "100.deadbeef")));
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // restart-idempotency: no lock ⇒ no-op; reaping twice ⇒ still a no-op, never throws.
+  {
+    const home = mkHome();
+    reapStrandedAdoptLock(home, SID);                                   // no lock dir at all ⇒ ENOENT ⇒ no-op
+    t("SUCC-1 idempotent: reaping with no lock is a safe no-op", true);
+    strand(home, 999999);
+    reapStrandedAdoptLock(home, SID);
+    reapStrandedAdoptLock(home, SID);                                   // second reap: the dir is already gone ⇒ no-op, no throw
+    t("SUCC-1 idempotent: reaping an already-reaped lock twice is a safe no-op", !existsSync(adoptLockSite(home, SID).lockDir));
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // (A) intent read fault is not simulated here (the intent dir is the writable presence dir); the no-live-foreign + rmdir-on-empty
+  // guards are the two that make a false reclaim impossible, both exercised above.
+}
 
 console.log("all shell-succession selftests passed");

@@ -142,7 +142,7 @@ export function successionEnabled(env: NodeJS.ProcessEnv = process.env): boolean
   return flagDefaultOn(env.SWARM_SUCCESSION);
 }
 
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, rmdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
@@ -281,6 +281,42 @@ export function adoptLockSite(home: string, sid: string): LockSite {
   return { lockDir: path.join(presence, `${sid}.adopt.lockd`), intentDir: presence, intentPrefix: `${sid}.adopt.hold.` };
 }
 
+/** signal-0 liveness: a process that probes OK or EPERM is alive; ESRCH / invalid / any other errno is "not alive" HERE (used only
+ *  to detect a LIVE foreign hold-intent, where a false "not alive" is caught by the rmdir-fails-on-nonempty guard, never a theft). */
+function livePid(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+/**
+ * SUCC-1 (infra audit): reap a STRANDED adopt lock for `sid` BEFORE acquiring. holder-lock leaves the lock dir momentarily EMPTY
+ * between its `mkdir` and the identity write; a crash/IO-fault there leaves an empty `<sid>.adopt.lockd` that holder-lock's own
+ * recovery (in-process `strandedLockDirs` only) never reclaims and succession — unlike decision-batch (R26) — has NO out-of-band
+ * reaper for. Combined with runSuccessionAtStartup's single no-retry acquire, that stable sid becomes UN-ADOPTABLE forever: a
+ * permanently DEAF coordinator, the exact incident this feature exists to prevent.
+ *
+ * This reclaims it SAFELY. A live acquirer ALWAYS writes its hold-intent BEFORE its mkdir, so an EMPTY lock dir with NO live
+ * foreign hold-intent provably has no live holder. Two independent guards make a false reclaim impossible:
+ *   (A) the intents MUST be readable — a read fault cannot prove unoccupancy ⇒ leave the lock (never fold to "empty");
+ *   (B) a LIVE foreign hold-intent ⇒ a holder is mid-acquire ⇒ leave it (never steal);
+ *   (C) `rmdirSync` removes ONLY an empty dir — if a racer PUBLISHED into it between our readdir and the rmdir, rmdir fails
+ *       ENOTEMPTY and we leave the now-occupied lock untouched.
+ * Only a PUBLISHED-identity (non-empty) or ambiguous dir is never considered here. Idempotent (no lock ⇒ ENOENT ⇒ no-op); fully
+ * fail-soft. `isAlive` is injectable ONLY for the concurrency-race test; production uses signal-0.
+ */
+export function reapStrandedAdoptLock(home: string, sid: string, isAlive: (pid: number) => boolean = livePid): void {
+  const site = adoptLockSite(home, sid);
+  let entries: string[];
+  try { entries = readdirSync(site.lockDir); } catch { return; }           // no lock (ENOENT) or unreadable ⇒ nothing to reap
+  if (entries.length !== 0) return;                                        // a PUBLISHED/ambiguous holder ⇒ never touched here
+  let intents: { name: string; pid: number }[];
+  try { intents = readdirSync(site.intentDir).filter((n) => n.startsWith(site.intentPrefix)).map((n) => ({ name: n, pid: Number(n.slice(site.intentPrefix.length).split(".")[0]) })); }
+  catch { return; }                                                       // (A) intent read fault ⇒ cannot prove unoccupied ⇒ leave it
+  if (intents.some((i) => Number.isInteger(i.pid) && i.pid > 0 && i.pid !== process.pid && isAlive(i.pid))) return; // (B) live foreign ⇒ never steal
+  try { rmdirSync(site.lockDir); } catch { return; }                       // (C) drop the stranded EMPTY lock; ENOTEMPTY (a racer published) ⇒ leave it
+  for (const i of intents) { try { unlinkSync(path.join(site.intentDir, i.name)); } catch { /* best-effort: clear the dead/own intents for this sid */ } }
+}
+
 /**
  * Bus-core-init / presence-startup consumption point (LIVE BY DEFAULT; kill with SWARM_SUCCESSION=0). Gather this shell's attestation — the
  * binding credential (resume target) comes from the AGENT's OWN argv via ps on `hostPid` (coordinator ruling a: argv is the
@@ -318,6 +354,7 @@ export async function runSuccessionAtStartup(home: string, selfTool: string, sel
   // released in finally.
   try { mkdirSync(path.join(home, ".agenthop", "presence"), { recursive: true }); } catch { /* best effort — must exist for hold-intents */ }
   const site = adoptLockSite(home, sid);
+  reapStrandedAdoptLock(home, sid); // SUCC-1: clear a crash-stranded EMPTY adopt lock so this sid is not un-adoptable forever (safe: see reaper)
   const token = acquireHolderLock(site);
   if (!token) { log(`succession: adopt lock for ${sid} is held by another shell — coming up fresh`); return null; }
   const pidPath = path.join(home, ".agenthop", presencePidRelPath(sid));
