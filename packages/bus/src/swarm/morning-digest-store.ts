@@ -3,7 +3,7 @@
 // marker (separate obligation from the projection, MD-P2-1), and classifies the four projection read states (MD-P2-4). Fail-soft:
 // a source READ ERROR is reported as "unknown" (never a false quiet night, MD-P2-2); the pure composition lives in morning-digest.ts.
 
-import { mkdirSync, writeFileSync, renameSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readFileSync, existsSync, lstatSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { digestProjection, type DigestSources, type ProjState, type NotifyState, type DigestProjection } from "./morning-digest.js";
@@ -13,7 +13,26 @@ function digestPath(home: string): string { return path.join(digestDir(home), "d
 function notifiedPath(home: string): string { return path.join(digestDir(home), "notified.json"); }
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
-function atomicWriteJson(file: string, value: unknown): boolean {
+/** PROJ-2 / CP-3 — the digest output dir chain must be REAL owned dirs, never redirected by a pre-existing symlink. A symlinked
+ *  `console/` or `console/morning-digest/` would land the atomic write (digest.json / notified.json / needs-migration) OUTSIDE the
+ *  0o700 boundary — and worse for notified.json, a redirected read-back could surface a FOREIGN stale delivery marker ⇒ a false
+ *  sent/pending. console-projection-store guards this with consoleBoundaryOk; digest did not (the audit's family inconsistency).
+ *  Same lstat (NO-follow) each component: a symlink / non-dir ⇒ REFUSE; ENOENT ⇒ safe (our mkdir makes real dirs); other stat
+ *  fault ⇒ refuse. Pure check. */
+export function digestBoundaryOk(home: string): boolean {
+  for (const d of [path.join(home, ".agenthop", "console"), digestDir(home)]) {
+    let st;
+    try { st = lstatSync(d); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; return false; }
+    if (!st.isDirectory()) return false; // a symlink (even to a dir) or a plain file ⇒ not a real owned dir ⇒ refuse
+  }
+  return true;
+}
+
+/** Atomic write under the digest dir. PROJ-2/CP-3: a redirected dir chain ⇒ REFUSE (return false, the caller leaves the obligation
+ *  unmet and retries) — never write/read-back through a symlink. Any write fault also ⇒ false (never throws). */
+function atomicWriteJson(home: string, file: string, value: unknown): boolean {
+  if (!digestBoundaryOk(home)) return false; // CP-3
   try {
     mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     const tmp = `${file}.tmp-${randomBytes(4).toString("hex")}`;
@@ -26,7 +45,7 @@ function atomicWriteJson(file: string, value: unknown): boolean {
 /** Atomically write the morning-digest projection (schema morning-digest/v1). Returns true on success, false on any write fault
  *  (the caller leaves the obligation unmet and retries). Never throws. */
 export function writeDigestProjection(home: string, sources: DigestSources, dateStr: string, generatedAtSec: number): boolean {
-  return atomicWriteJson(digestPath(home), digestProjection(sources, dateStr, generatedAtSec));
+  return atomicWriteJson(home, digestPath(home), digestProjection(sources, dateStr, generatedAtSec));
 }
 
 /** Validate a parsed value as a COMPLETE morning-digest/v1 projection (schema + non-empty date + finite generatedAtSec + a
@@ -60,7 +79,7 @@ export function readDigestProjection(home: string): ProjState {
 /** MD-R2-P2-1 — atomically (over)write a READY projection. Used to RESTORE a corrupt carrier from the frozen body kept in the
  *  notify marker — the SAME published content, never a re-gather. Returns true on success. Never throws. */
 export function writeDigestProjectionRaw(home: string, projection: DigestProjection): boolean {
-  return atomicWriteJson(digestPath(home), projection);
+  return atomicWriteJson(home, digestPath(home), projection);
 }
 
 /** MD-P2-1 — read the two-phase coordinator-brief marker. "sent" / "pending" carry today's FROZEN body (the MD-R2-P2-1 restore
@@ -84,7 +103,7 @@ export function readNotifiedState(home: string): NotifyState {
  *  before the send; "sent" is written only AFTER a confirmed delivery. Returns false on a write fault — the caller must NOT send
  *  on a failed "pending" claim (retry next tick). Never throws. */
 export function markNotified(home: string, dateStr: string, state: "pending" | "sent", body: DigestProjection): boolean {
-  return atomicWriteJson(notifiedPath(home), { date: dateStr, state, body });
+  return atomicWriteJson(home, notifiedPath(home), { date: dateStr, state, body });
 }
 
 /** MD-R7-P2-2 — durably ARCHIVE a legacy (pre-credential, date-only) notify marker before the daily `notified.json` is overwritten
@@ -96,7 +115,7 @@ export function archiveLegacyMigration(home: string, dateStr: string): boolean {
   const safe = dateStr.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "unknown-date";
   const file = path.join(digestDir(home), "needs-migration", `${safe}.json`);
   if (existsSync(file)) return true; // append-only: an archived migration record is never modified
-  return atomicWriteJson(file, { schema: "morning-digest-migration/v1", date: dateStr, archivedAtSec: Math.floor(Date.now() / 1000), reason: "legacy date-only notify marker superseded by a newer day; pre-credential delivery is unconfirmable — migrate manually, never auto-resend" });
+  return atomicWriteJson(home, file, { schema: "morning-digest-migration/v1", date: dateStr, archivedAtSec: Math.floor(Date.now() / 1000), reason: "legacy date-only notify marker superseded by a newer day; pre-credential delivery is unconfirmable — migrate manually, never auto-resend" });
 }
 
 /** Gather the digest sources, fail-soft. PROGRESS.md is the coordinator's narrative projection of the control log + reviews (the
