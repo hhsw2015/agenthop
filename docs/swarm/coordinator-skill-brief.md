@@ -1,6 +1,6 @@
 # coordinator-skill 简报 — 协调者技能化(设计·冻结候选 r3)
 
-owner aad02248 · 协调者 fe0376cd 派单(user 亲令,方向性大件)· 审查席 happycapy · base main @a1a933d · 状态:**设计全签 @ade8be9(CS-P2-1/2/3/4 + N1 全 CLOSED);r5 并入 §8 新项目开张流程(user 完整图景);待 user 裁 A/B 落点后制作技能产物**
+owner aad02248 · 协调者 fe0376cd 派单(user 亲令,方向性大件)· 审查席 happycapy · base main @a1a933d · 状态:**设计全签 @ade8be9(CS-P2-1/2/3/4 + N1 全 CLOSED);r6 并入 §8 新项目开张流程 + §9 角色设计权(user 完整图景:原则固定编制自由);待 user 裁 A/B 落点后制作技能产物**
 
 ## 缘起(user 原话)
 
@@ -112,6 +112,10 @@ rulings grep <word>
 ### H. 新项目开张流程(spawn-coordinator — 出生即胜任)
 
 user 完整图景补充(设计已签 @ade8be9,本节并入 DRAFT 定稿,详见 DRAFT §8):① spawn-coordinator runbook(新 session → 加载技能 → 注入五参 → **自检状态文件地图**:PROGRESS 播种 / roster 注册 / board·control-log·inbox·decision-batches·投影 惰性建 + 加载检查);② 项目键 = 状态树根 `$AH_HOME/.agenthop`(与 state-isolation 对齐;多根隔离=前置依赖,诚实边界同 CS-P2-1);③ 第一轮例程(自唤醒 cron / 报到对话官或 user / 招募成员引用 roster resumeCmd 模板 F36);④ 与既有 agenthop 协调者(fe0376cd)= **对等同僚**:互不干预、各拥状态树、共用律典+基础设施、单一人类权威 user、跨项目对等不命令。
+
+### I. 组织:角色设计权(原则固定,编制自由)
+
+user 裁:**角色不固定,协调者自决**(详见 DRAFT §9)。技能**不规定编制**(无「必须有审查席/必须 N 工人」硬编码),给的是**角色设计权**:协调者按任务自定需要哪些角色(研究镜/审查席/测试手/文档员/子协调者…)、几个、何时增减。原料=roleProfile v2(片段库+flavor patch),工具=招募 runbook(F36)。**编制从「标准配置」改为「决策框架」**(任务形状→角色需求;常见配置仅作参考示例非规定)。**保留的只有不变量**:对抗审查(重要产出独立审,不规定审查席数)、R16 钱门、S29 纪律、§6 常设门/CORE 铁律。公司类比:总经理自组团队,总部只管制度不管编制。
 
 ---
 
