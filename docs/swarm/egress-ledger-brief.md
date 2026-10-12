@@ -23,24 +23,18 @@ owner=f32a0507;协调者立项(gstack 深评借点②,[[gstack-eval]] §A 条 1�
 - 旗 `SWARM_EGRESS_LEDGER` 门控 `recordEgress` 接缝(`flagDefaultOn`)。v1 **dormant 默认 OFF**(opt-in):无生产者时翻不翻无运行时差;默认翻转留到接线落地并审过后由协调者+user 裁。
 - 复用已签 `holder-lock`(追加锁)——用其**稳定默认 API**(`acquireHolderLock(site)`,**不**传 `reclaimExternalStranded`),故 SUCC-1 对 holder-lock 的 opt-in 改动与本件无交集。
 
-## ① 记录模型
+## ① 记录模型(**两行审计**:intent 先记 / result 后补,桥 r8 判例 / 协调者)
+
+一个 egress **事件** = 一条 INTENT(调用前/围绕调用记)+ 一条 RESULT(调用后补),共享 `eventId`;崩溃夹在两者间⇒悬空 intent 诚实报 `pending`(非链断);响应后记可接受,绝不声称为上界。两行都进哈希链。
 
 ```
-EgressRecord = {                   // 调用点交来的事件(trust-boundary 校验)
-  tsSec: number;                   // 事件时刻(epoch 秒);展示经 house stamp()(本机时间带偏移)
-  destHost: string;               // 仅主机名,无 scheme/path/query
-  callFace: string;               // 已登记调用点 id(串键,如 "relay.post"/"update.download"/"vm-ssh.exec")
-  byteMagnitude: string;          // 数量级桶标签(非精确字节)
-  initiatorSid: string;           // 发起的 swarm 会话 sid
-}
-EgressEntry = EgressRecord & {     // 落盘的一条(= 记录 + 链)
-  seq: number;                     // 0 起连续位置
-  prevHash: string;               // 前一条 hash 的 sha256 hex(genesis = GENESIS_PREV = 64 个 0)
-  hash: string;                   // sha256Hex(canonicalJson({seq, prevHash, ...五字段}))
-}
+EgressIntent = { kind: "intent"; eventId; tsSec; destHost; callFace; initiatorSid } // dest-HOST only,无 scheme/path/query
+EgressResult = { kind: "result"; eventId; tsSec; byteMagnitude; outcome }           // 数量级桶(非精确)+ ok|failed
+EgressBody   = EgressIntent | EgressResult
+EgressEntry  = EgressBody & { seq; prevHash; hash }   // hash = sha256Hex(canonicalJson({seq, prevHash, body}))
 ```
 
-`parseEgressRecord(input) → Res<EgressRecord>`(trust-boundary,全走自有数据读取 ownVal,getter 陷阱整体拒):五字段齐、类型对、`destHost` 非空且不含 `/`:`@` 空白(仅主机名)、`callFace`/`initiatorSid` 非空串、`byteMagnitude` 属枚举桶集、`tsSec` 有限非负数,否则整条拒(绝不塞半条进链)。
+`parseEgressEntry(input) → EgressEntry | null`(trust-boundary,全走自有数据读取,任一字段缺/类型错⇒整条拒,绝不塞半条进链):`seq` 非负整数、`prevHash`/`hash`/`eventId` 串、`tsSec` 有限非负;intent 还要 `destHost` 匹配仅主机名正则(拒 scheme/path/query/`@`/空白)+ `callFace`/`initiatorSid` 非空串;result 还要 `byteMagnitude` 属枚举桶集 + `outcome∈{ok,failed}`。
 
 ## ② 哈希链(纯)
 
