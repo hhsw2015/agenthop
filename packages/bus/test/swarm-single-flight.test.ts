@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { mkdtempSync, existsSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { acquireSingleFlight } from "../src/swarm/single-flight.js";
@@ -37,11 +37,49 @@ describe("acquireSingleFlight", () => {
     release!();
   });
 
-  test("an unreadable/garbage holder is treated as reclaimable (dead)", () => {
+  test("a READABLE garbage holder (not a pid) is reclaimable (NaN, not a live pid)", () => {
     const p = lockPath();
-    writeFileSync(p, "not-a-pid");
-    const release = acquireSingleFlight(p, { pidAlive: () => true }); // holder NaN (not > 0) ⇒ reclaim
+    writeFileSync(p, "not-a-pid"); // readable, just not a pid ⇒ NaN ⇒ reclaim (distinct from an UNREADABLE lock, below)
+    const release = acquireSingleFlight(p, { pidAlive: () => true });
     expect(release).not.toBeNull();
+    release!();
+  });
+
+  // DISP-3 three-state (lock-readability root fix): a lock we CANNOT READ is UNKNOWN, not reclaimable — HOLD, never steal a
+  // live-but-unreadable holder's lock. Injected readLock throws so the path is deterministic (no flaky chmod).
+  const throwing = (code: string) => () => { const e = new Error(code) as NodeJS.ErrnoException; e.code = code; throw e; };
+
+  test("DISP-3: an UNREADABLE lock (EACCES) is HELD, not reclaimed (never steal a live-but-unreadable holder)", () => {
+    const p = lockPath();
+    writeFileSync(p, "999999"); // a holder on disk; even if readable+probed it would look dead — but we cannot read it
+    const got = acquireSingleFlight(p, { pidAlive: () => false, readLock: throwing("EACCES") });
+    expect(got).toBeNull();                                 // UNKNOWN holder ⇒ HOLD (old code folded unreadable⇒NaN⇒reclaim)
+    expect(existsSync(p)).toBe(true);                       // untouched — not renamed-aside / reclaimed
+    expect(readFileSync(p, "utf8").trim()).toBe("999999");
+  });
+
+  test("DISP-3: an EIO lock read is also HELD, not reclaimed (same family as fleet FR6's EIO-steals-live residual)", () => {
+    const p = lockPath();
+    writeFileSync(p, "999999");
+    expect(acquireSingleFlight(p, { pidAlive: () => false, readLock: throwing("EIO") })).toBeNull();
+    expect(readFileSync(p, "utf8").trim()).toBe("999999"); // untouched
+  });
+
+  test("DISP-3: ENOENT on the holder read ⇒ the lock vanished mid-check ⇒ retry, then acquire", () => {
+    const p = lockPath();
+    writeFileSync(p, "999999"); // present ⇒ first linkSync EEXISTs
+    let reads = 0;
+    const io = {
+      pidAlive: () => true,
+      readLock: (lp: string): string => {
+        reads += 1;
+        if (reads === 1) { unlinkSync(lp); const e = new Error("gone") as NodeJS.ErrnoException; e.code = "ENOENT"; throw e; } // vanished
+        return readFileSync(lp, "utf8");
+      },
+    };
+    const release = acquireSingleFlight(p, io);
+    expect(release).not.toBeNull();                          // the retry links cleanly onto the now-absent path
+    expect(Number(readFileSync(p, "utf8").trim())).toBe(process.pid);
     release!();
   });
 
