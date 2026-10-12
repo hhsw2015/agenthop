@@ -30,6 +30,11 @@ jobs:
       # The tests hold real servers, a real relay and real child processes, so they run one
       # package at a time. The relay-cf live test starts `wrangler dev` and sits this one out
       # unless AGENTHOP_LIVE is set; `pnpm test` runs it locally.
-      - run: pnpm test
+      - run: pnpm test:packages
         env:
           AGENTHOP_LIVE: ""
+
+      # Zero-bug project #0: the *.selftest.mts standalone cores (crash/symlink/tri-state/CAS safety
+      # fixtures for the most critical primitives) were never run by vitest's default glob. Gate them here
+      # as their own step so a selftest regression is its own red X. Shard with SELFTEST_SHARD=i/n if it grows.
+      - run: pnpm test:selftest

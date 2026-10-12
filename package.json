@@ -27,7 +27,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "pnpm -r --if-present --workspace-concurrency=1 test",
+    "test": "pnpm test:packages && pnpm test:selftest",
+    "test:packages": "pnpm -r --if-present --workspace-concurrency=1 test",
+    "test:selftest": "node scripts/run-selftests.mjs",
     "typecheck": "pnpm -r --if-present typecheck"
   },
   "devDependencies": {
