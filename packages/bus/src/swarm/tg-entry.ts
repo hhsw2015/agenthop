@@ -124,3 +124,11 @@ export function buildTgMessageReceipt(chatId: number, text: string): { text: str
   const clipped = text.length > 500 ? `${text.slice(0, 500)}…` : text;
   return { text: `[tg-message] chat ${chatId}: ${clipped}`, taskRef: "tg-message", title: "TG 消息" };
 }
+
+/** A stable, writeInbox-contract-compliant idempotency key for a forwarded TG event (a verdict per batch+item, a message per
+ *  update_id). writeInbox's dedup key must match `^[A-Za-z0-9._-]{1,120}$` (else it falls to the non-deduped random-name path —
+ *  TGP-3), so any unsafe char in a part is folded to `_` and the whole is clipped to 120. Same event ⇒ same key (replay dedups);
+ *  distinct events ⇒ distinct keys. Pure. */
+export function tgIdempotencyKey(prefix: string, ...parts: Array<string | number>): string {
+  return [prefix, ...parts].join(".").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+}

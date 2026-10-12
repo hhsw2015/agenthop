@@ -1,6 +1,6 @@
 // Selftest for the TG entry pure core (render/parse, ref-based) + the shared CORE decision rules (allowedScopes /
 // enforceScope / upsertDecision) + the digest. Run: node --import tsx packages/bus/src/swarm/tg-entry.selftest.mts
-import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
+import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, tgIdempotencyKey, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
 import { allowedScopes, enforceScope, upsertDecision, validDecision, type DecisionItem, type DecisionsDoc } from "./decision-batch.js";
 import { composeDigest } from "./morning-digest.js";
 import type { DualBandwidthReading } from "./dual-bandwidth.js";
@@ -118,6 +118,15 @@ const hard: DecisionItem = { id: "n2", kind: "spend", summary: "pay $40 invoice"
   t("message receipt text has chat+body", mr.text.includes("123") && mr.text.includes("hello there"));
   t("message receipt clips long text", buildTgMessageReceipt(1, "x".repeat(600)).text.length < 560);
   t("ack text is a short read-receipt", typeof TG_ACK_TEXT === "string" && TG_ACK_TEXT.length > 0 && TG_ACK_TEXT.length < 40);
+}
+
+// --- idempotency key for forwarded TG events (pure; TGP-3) ---
+{
+  t("verdict key stable per batch+item", tgIdempotencyKey("tg-verdict", "b1", "n2") === "tg-verdict.b1.n2");
+  t("same event -> same key (replay dedups)", tgIdempotencyKey("tg-msg", 42) === tgIdempotencyKey("tg-msg", 42));
+  t("distinct events -> distinct keys", tgIdempotencyKey("tg-verdict", "b1", "n2") !== tgIdempotencyKey("tg-verdict", "b1", "n3"));
+  t("unsafe chars folded to _", tgIdempotencyKey("tg-verdict", "b/1", "n:2").replace(/[A-Za-z0-9._-]/g, "") === "");
+  t("key is writeInbox-contract compliant (<=120, charset)", /^[A-Za-z0-9._-]{1,120}$/.test(tgIdempotencyKey("tg-msg", "x".repeat(400))));
 }
 
 console.log("all tg-entry selftests passed");
