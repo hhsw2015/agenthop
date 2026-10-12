@@ -387,10 +387,11 @@ export interface RecoverDeps {
   /** FR-8 (r4): THREE outcomes — "launched" (confirmed started), "failed" (an EXPLICIT not-started, e.g. command-not-found ⇒ safe to
    *  retry), "unknown" (sent but result indeterminate, e.g. a launch timeout that may have started ⇒ never auto-retry = no double). */
   launchMember: (member: RosterMemberLike) => Promise<{ outcome: LaunchOutcome; error?: string }>;
-  /** FR-8 (r6): record the DURABLE "launch sink entered" state (claim ⇒ `launching:<ts>`) BEFORE launchMember's side effect — so a crash
-   *  between a SUCCESSFUL launch and markLaunchOutcome leaves `launching:` (NEVER auto-retried), not a retryable `pending:`. A crash
-   *  BEFORE this call leaves `pending:` (sink not entered ⇒ launch never dispatched ⇒ the genuine retryable pre-launch crash). */
-  markLaunching: (memberKey: string, episodeId: string) => void;
+  /** FR-8 (r6/r7): durably record the "launch sink entered" state (claim ⇒ `launching:<ts>`) BEFORE launchMember's side effect — so a
+   *  crash between a SUCCESSFUL launch and markLaunchOutcome leaves `launching:` (NEVER auto-retried), not a retryable `pending:`. Returns
+   *  true IFF the write durably succeeded; the orchestrator MUST NOT launch on false (a failed mark leaves `pending:`, so launching anyway
+   *  would re-create the crash-window double). A crash BEFORE this call also leaves `pending:` (the genuine retryable pre-launch crash). */
+  markLaunching: (memberKey: string, episodeId: string) => boolean;
   /** FR-8: record the launch outcome — "launched"/"failed"/"unknown" drive the claim state (launched & unknown both block a blind
    *  re-launch; only "failed" is retryable). */
   markLaunchOutcome: (memberKey: string, episodeId: string, outcome: LaunchOutcome) => void;
@@ -436,7 +437,12 @@ export async function orchestrateRecover(snap: FleetSnapshot, roster: readonly R
   const peersBefore = deps.peers();
   for (const m of roster) {
     if (resolveMemberSid(m, peersBefore).kind !== "absent") continue;
-    if (deps.claimLaunch(m.member, episodeId)) { deps.markLaunching(m.member, episodeId); const r = await deps.launchMember(m); deps.markLaunchOutcome(m.member, episodeId, r.outcome); }
+    // FR-8 (r7): only cross into the launch side effect once the durable "launching:" marker is CONFIRMED written. If markLaunching
+    // fails (e.g. EACCES), DO NOT launch — the claim stays "pending:" (no launch happened ⇒ a later recover retries safely); the member
+    // is left unconfirmed ⇒ reported outstanding. Launching on a failed mark would re-open the crash-window double (the r6 gap).
+    if (deps.claimLaunch(m.member, episodeId) && deps.markLaunching(m.member, episodeId)) {
+      const r = await deps.launchMember(m); deps.markLaunchOutcome(m.member, episodeId, r.outcome);
+    }
   }
 
   // 3) settle, then VERIFY against the unique live SID (FR-5) + the TARGET-only dispatcher wake (FR-3)
@@ -464,26 +470,19 @@ export async function orchestrateRecover(snap: FleetSnapshot, roster: readonly R
   const folded = summarizeOutstanding(withReport);
   let result: RecoveryResult = { ...withReport, outstanding: folded.outstanding, notConfirmed: folded.notConfirmed };
 
-  // 5) FR-8: mark the episode COMPLETE only when nothing is outstanding BEFORE this write. The FINAL marker write's result is NOT ignored
-  //    — a refused write (CP-3) is an outstanding obligation (exit≠0), and the marker stays incomplete so a re-run finishes it.
-  const wantComplete = result.outstanding.length === 0;
-  const episodeWritten = deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: wantComplete });
-  if (!episodeWritten) result = { ...result, outstanding: [...result.outstanding, "episode-final:unwritten"] };
-
-  // 6) FR-8 (r5): the durable RECEIPT is written AFTER the episode marker, so it reflects the FINAL outstanding (incl.
-  //    episode-final:unwritten) and can NEVER present outstanding:[] while the marker is incomplete ("marker failure enters the receipt").
+  // 5) FR-8 (r7): the RECEIPT is written FIRST, so the episode's completed marker (step 6) can gate on its result. A completed marker
+  //    therefore NEVER exists while the receipt is unsettled — closing the r6 windows where a crash BETWEEN the completed marker and the
+  //    receipt, or a failed compensation, left a completed episode with an unwritten receipt (⇒ a re-run minted a new episode + dup
+  //    breakpoints). The receipt reflects the recovery obligations known now (members/report); a refused write is itself outstanding.
   const receiptWritten = deps.writeReceipt(result);
   if (!receiptWritten) result = { ...result, outstanding: [...result.outstanding, "receipt:unwritten"] };
 
-  // 7) FR-8 (r6) window-2: a receipt failure must NOT leave the episode COMPLETED — else resolveEpisode mints a NEW episode on re-run and
-  //    re-delivers breakpoints under a new idempotency domain (duplicate sends). If we had marked it completed but the receipt then
-  //    failed, REVERT the marker to incomplete so the re-run REUSES this episode (same breakpoint keys). This keeps BOTH guarantees:
-  //    "marker failure enters the receipt" (step 6) AND "receipt failure does not complete the episode". Best-effort — a failed revert
-  //    is itself surfaced as outstanding (never force an unwritable fs).
-  if (!receiptWritten && episodeWritten && wantComplete) {
-    if (!deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: false })) {
-      result = { ...result, outstanding: [...result.outstanding, "episode-final:revert-unwritten"] };
-    }
+  // 6) FR-8 (r7): mark the episode COMPLETE only when NOTHING is outstanding — now INCLUDING the receipt result. So completed=true ⟺ the
+  //    receipt durably succeeded (+ members/report/report-delivery all clean). A receipt failure ⇒ outstanding ⇒ completed=false ⇒ a
+  //    re-run REUSES this episode (same breakpoint idempotency domain, no dup). The final marker write's result is NOT ignored: a refused
+  //    write (CP-3) is itself outstanding (exit≠0) and leaves the marker incomplete, so a re-run finishes it. No compensation window.
+  if (!deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: result.outstanding.length === 0 })) {
+    result = { ...result, outstanding: [...result.outstanding, "episode-final:unwritten"] };
   }
   return result;
 }

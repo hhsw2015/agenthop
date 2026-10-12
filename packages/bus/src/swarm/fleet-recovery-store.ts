@@ -397,10 +397,12 @@ export function markLaunchOutcome(home: string, memberKey: string, episodeId: st
 
 /** FR-8 (r6): record the DURABLE "launch sink entered" state BEFORE the launch side effect, so a crash between it and markLaunchOutcome
  *  leaves `launching:<ts>` — which claimRecoverLaunch NEVER auto-retries (the launch MAY have dispatched; absence + time is not proof it
- *  did not). Only a `pending:` (claim acquired, sink NOT yet entered) remains a retryable pre-launch crash. FR-9: O_NOFOLLOW fd write. */
-export function markLaunching(home: string, memberKey: string, episodeId: string): void {
-  if (!boundaryOk(home, claimLaunchDir(home, episodeId))) return;
-  overwriteClaimNoFollow(claimLaunchFile(home, episodeId, memberKey), `launching:${Math.floor(Date.now() / 1000)}`);
+ *  did not). Only a `pending:` (claim acquired, sink NOT yet entered) remains a retryable pre-launch crash. FR-9: O_NOFOLLOW fd write.
+ *  FR-8 (r7): returns true IFF the write durably succeeded — the caller MUST NOT launch when it returns false (a failed mark leaves a
+ *  retryable `pending:`, so launching anyway would re-create the crash-window double on a later recover). */
+export function markLaunching(home: string, memberKey: string, episodeId: string): boolean {
+  if (!boundaryOk(home, claimLaunchDir(home, episodeId))) return false;
+  return overwriteClaimNoFollow(claimLaunchFile(home, episodeId, memberKey), `launching:${Math.floor(Date.now() / 1000)}`); // FR-8 (r7): the caller must NOT launch unless this durably succeeded
 }
 
 /**

@@ -67,13 +67,13 @@ try {
   // ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
   // FR-8 via REAL orchestrateRecover (fakes): claim≠launch, report-with-real-results, receipt-in-completion
   // ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-  type HOpts = Partial<{ episode: EpisodeRead; peersAfter: PeerLikeMin[]; claimReturns: boolean; launchOutcome: LaunchOutcome; disp: DispatcherLiveness; writeReceiptOk: boolean; writeEpisodeOk: boolean; failWriteEpisodeAfter: number }>;
+  type HOpts = Partial<{ episode: EpisodeRead; peersAfter: PeerLikeMin[]; claimReturns: boolean; launchOutcome: LaunchOutcome; disp: DispatcherLiveness; writeReceiptOk: boolean; writeEpisodeOk: boolean; failWriteEpisodeAfter: number; markLaunchingOk: boolean }>;
   function makeHarness(o: HOpts) {
-    const state = { episodeWrites: [] as RecoveryEpisode[], launches: [] as string[], launchings: [] as string[], outcomes: [] as { m: string; outcome: LaunchOutcome }[], reportArg: null as RecoveryResult | null, receiptArg: null as RecoveryResult | null };
+    const state = { episodeWrites: [] as RecoveryEpisode[], writeOrder: [] as string[], launches: [] as string[], launchings: [] as string[], outcomes: [] as { m: string; outcome: LaunchOutcome }[], reportArg: null as RecoveryResult | null, receiptArg: null as RecoveryResult | null };
     const deps: RecoverDeps = {
       now: () => 1000, mintEpisodeId: () => "ep-NEW", heartbeatThresholdSec: 120, breakpointsEnabled: true, recoveredAtIso: "T",
       readEpisode: () => o.episode ?? { kind: "absent" },
-      writeEpisode: (ep) => { state.episodeWrites.push(ep); if (o.failWriteEpisodeAfter !== undefined && state.episodeWrites.length > o.failWriteEpisodeAfter) return false; return o.writeEpisodeOk ?? true; },
+      writeEpisode: (ep) => { state.episodeWrites.push(ep); state.writeOrder.push("episode"); if (o.failWriteEpisodeAfter !== undefined && state.episodeWrites.length > o.failWriteEpisodeAfter) return false; return o.writeEpisodeOk ?? true; },
       dispatcherLive: () => false,
       relaunchDispatcher: () => true,
       verifyDispatcher: () => o.disp ?? { pidAlive: true, heartbeatFreshSec: 10, wakeStatus: "on" },
@@ -81,12 +81,12 @@ try {
       settle: async () => {},
       claimLaunch: () => o.claimReturns ?? true,
       launchMember: async (m) => { state.launches.push(m.member); return { outcome: o.launchOutcome ?? "launched" }; },
-      markLaunching: (m) => { state.launchings.push(m); },
+      markLaunching: (m) => { state.launchings.push(m); return o.markLaunchingOk ?? true; },
       markLaunchOutcome: (m, _ep, outcome) => { state.outcomes.push({ m, outcome }); },
       breakpointFacts: (sid) => ({ member: sid, grantedItems: [], liveAttempts: [], unreadInbox: 0 }),
       deliverBreakpoint: () => "published",
       deliverReport: (r) => { state.reportArg = r; return "published"; },
-      writeReceipt: (r) => { state.receiptArg = r; return o.writeReceiptOk ?? true; },
+      writeReceipt: (r) => { state.receiptArg = r; state.writeOrder.push("receipt"); return o.writeReceiptOk ?? true; },
     };
     return { deps, state };
   }
@@ -104,9 +104,10 @@ try {
     const h = makeHarness({ peersAfter: [{ stableId: "m1", title: "Work-m1", tool: "claude", cwd: "/r1" }], writeReceiptOk: false });
     const r = await orchestrateRecover(goodSnap, roster, h.deps);
     t("FR-8: receipt write refused ⇒ 'receipt:unwritten' outstanding", r.outstanding.includes("receipt:unwritten"));
-    // FR-8 (r6) window-2: a receipt-write failure must REVERT the episode marker to incomplete — else resolveEpisode mints a NEW
-    // episode on re-run and re-delivers breakpoints (dup). The LAST episode write is the compensating completed=false revert.
-    t("FR-8 r6 window2: receipt fail ⇒ episode marker REVERTED to completed=false (re-run reuses, no dup breakpoint)", h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === false);
+    // FR-8 (r7): receipt先行 — the receipt is written BEFORE the final episode marker, which gates completion on the receipt result. A
+    // receipt failure ⇒ the final episode write is completed=false ⇒ re-run REUSES this episode (no dup breakpoint). No compensation window.
+    t("FR-8 r7: receipt fail ⇒ final episode marker completed=false (re-run reuses, no dup breakpoint)", h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === false);
+    t("FR-8 r7: the receipt is written BEFORE the final episode marker (receipt先行)", (() => { const o = h.state.writeOrder; return o[o.length - 2] === "receipt" && o[o.length - 1] === "episode"; })());
   }
   // FR-8 r5 seam3 + facet-3: the FINAL writeEpisode failing ⇒ 'episode-final:unwritten' outstanding AND the durable receipt (written
   // AFTER the episode marker) reflects that settled outstanding — it can NEVER claim outstanding:[] while the marker is incomplete.
@@ -114,7 +115,9 @@ try {
     const h = makeHarness({ peersAfter: [{ stableId: "m1", title: "Work-m1", tool: "claude", cwd: "/r1" }], failWriteEpisodeAfter: 1 });
     const r = await orchestrateRecover(goodSnap, roster, h.deps);
     t("FR-8 seam3: final writeEpisode false ⇒ 'episode-final:unwritten' outstanding (exit≠0)", r.outstanding.includes("episode-final:unwritten"));
-    t("FR-8 r5 facet-3: the receipt reflects the final outstanding (episode-final:unwritten), never a false zero", h.state.receiptArg !== null && h.state.receiptArg.outstanding.includes("episode-final:unwritten"));
+    // FR-8 (r7): under receipt先行 the completed marker gates on the receipt; a FINAL marker write failure leaves the episode NOT completed
+    // (the write never committed completed=true) ⇒ a re-run reuses it. The receipt (written first) is not required to carry the marker fault.
+    t("FR-8 r7: receipt is written before the failing final episode marker (completion gates on receipt, not vice-versa)", (() => { const o = h.state.writeOrder; return o[o.length - 2] === "receipt" && o[o.length - 1] === "episode"; })());
   }
   // FR-8 r4: an 'unknown' launch outcome is recorded as unknown (not failed) ⇒ never a blind retry
   {
@@ -134,6 +137,12 @@ try {
     await orchestrateRecover(goodSnap, roster, h.deps);
     t("FR-8: a launched member records its outcome", h.state.launches.length === 1 && h.state.outcomes.length === 1 && h.state.outcomes[0]!.outcome === "launched");
     t("FR-8 r6: markLaunching ran BEFORE launchMember (durable launch-sink state precedes the side effect)", h.state.launchings.length === 1 && h.state.launchings[0] === "m1");
+  }
+  // FR-8 (r7): markLaunching write failure (e.g. EACCES) MUST block the launch — launching on a failed mark re-opens the crash-window double.
+  {
+    const h = makeHarness({ peersAfter: [], claimReturns: true, markLaunchingOk: false });
+    await orchestrateRecover(goodSnap, roster, h.deps);
+    t("FR-8 r7: markLaunching fails ⇒ launchMember NOT called (no launch on an unconfirmed launch-sink marker)", h.state.launches.length === 0 && h.state.launchings.length === 1);
   }
   // FR-7 reuse in orchestrate: an incomplete episode marker ⇒ reuse its id
   {
@@ -239,6 +248,20 @@ try {
     if (tok2) releaseHolderLock(site, tok2);
     // NB: cross-process sole-occupancy (a FOREIGN live pid ⇒ contend; ESRCH-only reclaim; no double-hold; EIO=contend) is holder-lock's
     // own contract + selftest — a same-PID second acquire here intentionally reclaims our own residue (SB1), so it is NOT retested here.
+  }
+  {
+    // FR-6 (r7, rebased onto batch-20 converged holder-lock): the r6 finding — an EXTERNAL prepublish-dead empty lock dir (a recover
+    // child SIGKILLed after mkdir but before publishing its identity, leaving an empty lockDir + a DEAD hold-intent) left 3 fresh PIDs at
+    // 0 progress on the OLD holder-lock. The converged holder-lock reclaims an empty dir (rmdir-if-empty + fresh mkdir; it contends ONLY
+    // on a LIVE foreign intent), so the recover path (reusing acquireHolderLock) now RECOVERS it. This verifies FR-6 auto-closes post-rebase.
+    const h = freshHome();
+    const site = recoverLockSite(h);
+    mkdirSync(site.intentDir, { recursive: true, mode: 0o700 });
+    mkdirSync(site.lockDir, { recursive: true, mode: 0o700 });               // prepublish death: empty lock dir, no identity published
+    writeFileSync(path.join(site.intentDir, `${site.intentPrefix}999999.deadnonce`), ""); // the dead child's stranded hold-intent (dead pid)
+    const tok = acquireHolderLock(site);
+    t("FR-6 r7: external prepublish-dead empty lock ⇒ RECOVERED via converged holder-lock (not 0 progress)", typeof tok === "string");
+    if (tok) releaseHolderLock(site, tok);
   }
   // FR-8 (r6) window-1: markLaunching writes the durable "launching:" state; claimRecoverLaunch NEVER auto-retries it (a crash after a
   // successful launch but before markLaunchOutcome leaves "launching:" — the launch MAY have dispatched, never a blind double).
