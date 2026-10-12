@@ -7,7 +7,7 @@ import {
   type PeerLike, type RosterSnapshot,
 } from "./resume.js";
 import { resolveSession } from "./task-liveness.js"; // DOS-P2-1: the coordinator's handle→sid resolver, mirrored by the entry
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, chmodSync, mkdirSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, chmodSync, mkdirSync, readdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { spawn } from "node:child_process";
@@ -233,6 +233,27 @@ const peer = (over: Partial<PeerLike> = {}): PeerLike => ({ id: "run-1", stableI
     t("P2-2: re-write preserves an existing 0600 (never widened to 0644)", (statSync(out).mode & 0o777) === 0o600);
     chmodSync(out, 0o400); writeRosterSnapshot(out, snap);
     t("P2-2: re-write preserves an existing 0400 (never widened)", (statSync(out).mode & 0o777) === 0o400);
+    // P2-2 r3 (FC-2): a NON-ENOENT stat error = an existing mode we CANNOT read ⇒ fail, never widen to the 0600 default.
+    // (a) EACCES: an existing 0400 file whose parent loses search permission ⇒ stat(out) → EACCES.
+    const sub = join(home, "locked"); mkdirSync(sub, { recursive: true });
+    const lockedOut = join(sub, "roster.json");
+    writeRosterSnapshot(lockedOut, snap); chmodSync(lockedOut, 0o400);
+    chmodSync(sub, 0o000); // owner loses search on the dir ⇒ stat(lockedOut) → EACCES
+    let eaccesCode = ""; let threwEacces = false;
+    try { statSync(lockedOut); } catch (e) { eaccesCode = (e as NodeJS.ErrnoException).code ?? ""; } // confirm the setup really yields a non-ENOENT stat error
+    try { writeRosterSnapshot(lockedOut, snap); } catch { threwEacces = true; }
+    chmodSync(sub, 0o700); // restore to inspect
+    if (eaccesCode && eaccesCode !== "ENOENT") {
+      t("P2-2 r3: an unreadable existing mode (EACCES) makes the write FAIL, never widen (FC-2)", threwEacces);
+      t("P2-2 r3: the EACCES target keeps its old 0400 (not relaxed to 0600)", (statSync(lockedOut).mode & 0o777) === 0o400);
+    } else {
+      t("P2-2 r3: EACCES setup produced a non-ENOENT stat error (env precondition)", false); // if this fires, the perms trick didn't take (e.g. running as root)
+    }
+    // (b) ENOTDIR: a non-ENOENT stat error of another kind (parent is a file) must also fail — only ENOENT takes the default.
+    const fileBlocker = join(home, "blocker"); writeFileSync(fileBlocker, "x");
+    let threwNotdir = false;
+    try { writeRosterSnapshot(join(fileBlocker, "roster.json"), snap); } catch { threwNotdir = true; }
+    t("P2-2 r3: a non-ENOENT stat error (ENOTDIR) also fails (only ENOENT takes the 0600 default)", threwNotdir);
   } finally { rmSync(home, { recursive: true, force: true }); }
 }
 
@@ -250,54 +271,73 @@ const peer = (over: Partial<PeerLike> = {}): PeerLike => ({ id: "run-1", stableI
 }
 
 // --- DOS-P2-3: REAL-process fixtures (write interruption + new-process recovery + controlled concurrency) ---
-// Each child runs the ACTUAL writeRosterSnapshot in a separate process; we verify exit status and read DURING the interleaving.
+// Each child runs the ACTUAL writeRosterSnapshot in a separate process; we verify exit status, prove the writer ENTERED
+// the write path (sync marker, not a timer), and read DURING the interleaving.
 {
   const mod = new URL("./resume.ts", import.meta.url).pathname;
   const tsxBin = join(dirname(new URL(import.meta.url).pathname), "..", "..", "node_modules", ".bin", "tsx");
   const snapLit = (sid: string) => `{ version: 2, capturedAtSec: 1, members: [{ member: ${JSON.stringify(sid)}, tool: "claude", cwd: "/x", role: null, resumeCmd: "claude --resume " + ${JSON.stringify(sid)}, resumeCmdSource: "template" }] }`;
-  const complete = (txt: string | null): boolean => { if (txt === null) return true; const p = parseSnapshot(txt); return p !== null && p.members.length === 1; };
   const read = (out: string): string | null => { try { return readFileSync(out, "utf8"); } catch { return null; } };
+  // DURING-sampling tolerance: a not-yet-created file (null) is acceptable mid-run (the first write may not have landed).
+  const sampleOk = (txt: string | null): boolean => { if (txt === null) return true; const p = parseSnapshot(txt); return p !== null && p.members.length === 1; };
+  // STRICT post-crash check (DOS-P2-3 r3): a committed snapshot MUST exist AND parse — missing/unreadable is NOT complete.
+  const committedOk = (out: string): boolean => { let txt: string; try { txt = readFileSync(out, "utf8"); } catch { return false; } const p = parseSnapshot(txt); return p !== null && p.members.length === 1; };
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   // The tsx shim execs node, but tsx's CLI FORKS the script-runner — so spawn each child DETACHED (its own process group)
   // and kill the whole group, else a plain kill hits only the shim/CLI and orphans the forked runner.
-  const spawnChild = (code: string, out: string) => spawn(tsxBin, ["-e", code], { env: { ...process.env, OUT: out }, detached: true });
+  const spawnChild = (code: string, extraEnv: Record<string, string>) => spawn(tsxBin, ["-e", code], { env: { ...process.env, ...extraEnv }, detached: true });
   const onClose = (cp: ReturnType<typeof spawn>) => new Promise<{ code: number | null; signal: string | null }>((res, rej) => { cp.on("error", rej); cp.on("close", (code, signal) => res({ code, signal })); });
 
-  // (A) a real writer is killed mid-run; the committed roster stays a complete snapshot; a NEW process then recovers (restart-replay).
+  // META: the strict checker has teeth — the exact gap happycapy injected (missing/unreadable must NOT count as complete).
+  {
+    const absent = join(tmpdir(), `roster-absent-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    t("P2-3 meta: strict committed-check REJECTS a missing file (null != complete)", committedOk(absent) === false);
+    const garbageHome = mkdtempSync(join(tmpdir(), "roster-garbage-"));
+    try { const g = join(garbageHome, "g.json"); writeFileSync(g, "TORN{"); t("P2-3 meta: strict committed-check REJECTS an unparseable file", committedOk(g) === false); }
+    finally { rmSync(garbageHome, { recursive: true, force: true }); }
+  }
+
+  // (A) a real writer killed mid-run; it PROVABLY entered the write path (marker after its first commit); the committed
+  //     roster must still EXIST + parse (strict); a NEW process then recovers (restart-replay).
   {
     const home = mkdtempSync(join(tmpdir(), "roster-kill-"));
     try {
       const out = join(home, ".agenthop", "swarm", "roster-snapshot.json");
       writeRosterSnapshot(out, assembleRoster([peer({ stableId: "seed" })], 1)); // a committed baseline
-      // a BOUNDED-but-long loop (reliably mid-run at kill time, yet self-terminates if a kill is ever missed — no runaway).
-      const loop = `import { writeRosterSnapshot } from ${JSON.stringify(mod)}; for(let i=0;i<200000;i++){ writeRosterSnapshot(process.env.OUT, ${snapLit("child")}); }`;
-      const cp = spawnChild(loop, out);
+      const marker = join(home, "entered-write.marker");
+      // a BOUNDED-but-long loop; after the FIRST successful write it drops a marker — proof it entered the write path and
+      // committed at least once (self-terminates if a kill is ever missed — no runaway).
+      const loop = `import { writeRosterSnapshot } from ${JSON.stringify(mod)}; import { writeFileSync as wf } from "node:fs"; let first = true; for (let i = 0; i < 200000; i++) { writeRosterSnapshot(process.env.OUT, ${snapLit("child")}); if (first) { wf(process.env.MARKER, "in-write"); first = false; } }`;
+      const cp = spawnChild(loop, { OUT: out, MARKER: marker });
       await new Promise<void>((r) => cp.once("spawn", () => r()));
-      await new Promise((r) => setTimeout(r, 400)); // let it rewrite the roster many times
+      // SYNC POINT (not a timer): wait for the marker ⇒ the writer entered the write path and committed >=1 snapshot.
+      let entered = false;
+      for (let i = 0; i < 240 && !entered; i++) { if (existsSync(marker)) entered = true; else await sleep(25); } // up to ~6s
+      t("P2-3(A): the writer PROVABLY entered the write path before kill (sync marker, not a timer)", entered);
       try { process.kill(-cp.pid!, "SIGKILL"); } catch { cp.kill("SIGKILL"); } // kill the whole group (tsx CLI + forked runner)
       const end = await onClose(cp);
       t("P2-3(A): the mid-write writer was killed, not a clean exit", end.code !== 0);
-      t("P2-3(A): committed roster is a COMPLETE snapshot after a mid-write kill (never torn)", complete(read(out)));
+      t("P2-3(A): committed roster EXISTS + is complete after a mid-write kill (strict; missing != complete)", committedOk(out));
       // (recovery / restart-replay) a fresh process writes a valid roster over whatever the crash left
-      const rec = await onClose(spawnChild(`import { writeRosterSnapshot } from ${JSON.stringify(mod)}; writeRosterSnapshot(process.env.OUT, ${snapLit("recovered")});`, out));
-      const parsed = parseSnapshot(read(out) ?? "");
-      t("P2-3(A): a new process recovers and writes a valid roster (exit 0)", rec.code === 0 && parsed !== null && parsed.members[0]!.member === "recovered");
+      const rec = await onClose(spawnChild(`import { writeRosterSnapshot } from ${JSON.stringify(mod)}; writeRosterSnapshot(process.env.OUT, ${snapLit("recovered")});`, { OUT: out }));
+      t("P2-3(A): a new process recovers and writes a valid roster (exit 0)", rec.code === 0 && committedOk(out) && parseSnapshot(read(out) ?? "")!.members[0]!.member === "recovered");
     } finally { rmSync(home, { recursive: true, force: true }); }
   }
 
-  // (B) two real processes each write N times; a reader samples DURING the run and must never see a torn file; both exit 0.
+  // (B) two real processes each write N times; a reader samples DURING the run (never torn); both exit 0.
   {
     const home = mkdtempSync(join(tmpdir(), "roster-cc-"));
     try {
       const out = join(home, ".agenthop", "swarm", "roster-snapshot.json");
       const writer = (sid: string) => `import { writeRosterSnapshot } from ${JSON.stringify(mod)}; for(let i=0;i<40;i++){ writeRosterSnapshot(process.env.OUT, ${snapLit(sid)}); }`;
-      const exits = ["aaa", "bbb"].map((sid) => onClose(spawnChild(writer(sid), out)));
+      const exits = ["aaa", "bbb"].map((sid) => onClose(spawnChild(writer(sid), { OUT: out })));
       let settled = 0; let torn = false; let present = 0;
-      exits.forEach((p) => p.then(() => { settled += 1; }).catch(() => { settled += 1; }));
-      while (settled < 2) { const txt = read(out); if (txt !== null) { present += 1; if (!complete(txt)) torn = true; } await new Promise((r) => setImmediate(r)); }
+      exits.forEach((pr) => pr.then(() => { settled += 1; }).catch(() => { settled += 1; }));
+      while (settled < 2) { const txt = read(out); if (txt !== null) { present += 1; if (!sampleOk(txt)) torn = true; } await new Promise((r) => setImmediate(r)); }
       const results = await Promise.all(exits);
       t("P2-3(B): both concurrent writers exited 0 (no crash, no non-zero)", results.every((r) => r.code === 0 && r.signal === null));
       t("P2-3(B): a reader sampling DURING the run never saw a torn/partial file", !torn && present > 0);
-      t("P2-3(B): the final file is one complete snapshot", complete(read(out)));
+      t("P2-3(B): the final file is one complete snapshot", committedOk(out));
     } finally { rmSync(home, { recursive: true, force: true }); }
   }
 }
