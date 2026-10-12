@@ -1,0 +1,5 @@
+{
+  "name": "swarm-console",
+  "version": "0.1.0",
+  "description": "Read-only Claude Code mod: renders the agenthop swarm projections (board/gauge/digest/decisions) as an above-prompt band + /swarm pane, with keycapture that PREFILLS a decision answer (never sends). Zero backend, zero write-surface."
+}
