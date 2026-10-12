@@ -354,6 +354,23 @@ describe("tg-queue atomic identity credential (TGP-10)", () => {
     expect(enqueueQueue(DIR, { v: 2 }, 7)).toBe("conflict"); // cred still bound to {v:1} ⇒ no second record
     expect(pendingFiles(DIR)).toEqual([]);
   });
+
+  test("a record-write FAILURE does NOT unlink the cred (TGP-10): the shared binding survives ⇒ a different-payload producer still conflicts and can't overwrite", () => {
+    // TGP-10 interleaving distilled: A links the cred, B publishes the record on A's cred and returns enqueued, A's OWN record write
+    // then faults. The OLD rollback unlinked A's cred — freeing the slot for a DIFFERENT-payload C to re-create it and CLOBBER B's
+    // accepted record. The fix keeps the cred (it is the shared commit token, not A's private byte): here we force A's record write to
+    // fault (DIR read-only, cred/ still writable) and assert the cred SURVIVES, so the downstream binding still protects the slot.
+    const credDir = path.join(DIR, "cred");
+    mkdirSync(credDir, { recursive: true, mode: 0o700 });
+    chmodSync(DIR, 0o500); // search+read on DIR, but NO write ⇒ the record file (DIR/<stem>.json) faults; the cred (DIR/cred/, 0o700) still links
+    try {
+      expect(enqueueQueue(DIR, { v: 1 }, 7)).toBe("failed");          // record write faulted ⇒ failed (driver HOLDs its offset)
+      expect(readFileSync(credPath(7), "utf8")).toBe(hash({ v: 1 })); // THE FIX: the cred was NOT rolled back (old code deleted it here)
+    } finally { chmodSync(DIR, 0o700); }
+    expect(enqueueQueue(DIR, { v: 2 }, 7)).toBe("conflict");          // surviving cred binds {v:1} ⇒ a DIFFERENT payload can't seize the slot
+    expect(enqueueQueue(DIR, { v: 1 }, 7)).toBe("enqueued");          // SAME-payload retry heals cred⟹record (the record is rebuilt)
+    expect(JSON.parse(readFileSync(path.join(DIR, pendingFiles(DIR)[0]!), "utf8"))).toEqual({ v: 1 });
+  });
 });
 
 // ── TGP-11: the drain lock serializes drainers (FIFO across drainers/instances) ───────────────────────────────────────

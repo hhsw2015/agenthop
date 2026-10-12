@@ -24,7 +24,7 @@
  *     re-attempted each drain (retryStuckQueue), so a live-pid claim is never permanently skipped waiting for the process to exit.
  * Never throws (fail-soft): every entry point swallows IO faults into a return value or a logged no-op.
  */
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, linkSync, lstatSync, statSync, appendFileSync, rmdirSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, linkSync, lstatSync, statSync, appendFileSync } from "node:fs";
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
 import { acquireHolderLock, releaseHolderLock, type LockSite } from "./holder-lock.js";
@@ -164,9 +164,8 @@ export function enqueueQueue(dir: string, record: unknown, seq: number): Enqueue
     // atomic linkSync into `cred`, so `cred` only ever appears as a link to a complete inode (never partial).
     const credTmp = `${cred}.tmp-${randomBytes(8).toString("hex")}`;
     try { writeFileSync(credTmp, h, { flag: "wx", mode: 0o600 }); } catch { return "failed"; } // name collision (astronomically rare) ⇒ retry fresh
-    let credLinkedByUs = false;
     try {
-      try { linkSync(credTmp, cred); credLinkedByUs = true; } // ATOMIC exclusive publish of a COMPLETE credential (EEXIST ⇒ already claimed)
+      try { linkSync(credTmp, cred); } // ATOMIC exclusive publish of a COMPLETE credential (EEXIST ⇒ already claimed)
       catch (e) {
         if ((e as NodeJS.ErrnoException).code !== "EEXIST") return "failed";
         const prior = readFileSync(cred, "utf8"); // EACCES/… ⇒ throw ⇒ caught by the outer try ⇒ "failed" (preserve, never overwrite)
@@ -182,12 +181,19 @@ export function enqueueQueue(dir: string, record: unknown, seq: number): Enqueue
         // rs === "absent" ⇒ fall through and (re)write the record.
       }
     } finally { try { unlinkSync(credTmp); } catch { /* always clean OUR temp; if we linked, `cred` keeps the inode */ } }
-    // Write the record. DO-R4-P1-1 ("cred ⟹ record"): if the write faults, ROLL BACK the cred WE created this call — never leave a
-    // cred advertising a record that never landed (a pre-existing cred we are merely recovering is left; the retry rewrites the record).
+    // Write the record. TGP-10 ("cred ⟹ record" by RETRY, never by ROLLBACK): on a write fault return "failed" but NEVER unlink the
+    // cred. The cred is the AUTHORITATIVE, SHARED seq→payload binding — a CONCURRENT producer with the SAME payload may ALREADY have
+    // published the record against THIS very cred and returned "enqueued"; unlinking it would let a DIFFERENT-payload producer re-create
+    // the cred and OVERWRITE that accepted record (the TGP-10 interleaving: A creates cred → B publishes the record on it → A's record
+    // write faults → A's old rollback deleted the cred → C re-creates it with a new payload and clobbers B). cred⟹record is instead
+    // restored by RETRY: the driver HOLDS its offset on "failed", and a same-payload retry finds cred==h + record-absent and (re)writes
+    // it. A different-payload producer always hits EEXIST+hash-mismatch ⇒ "conflict" ⇒ never overwrites. A crash that strands a COMPLETE
+    // cred with no record is a narrow, self-healing orphan (the same-payload retry rebuilds the record; for seq=update_id the payload is
+    // invariant) — not a lost delivery.
     const file = path.join(dir, `${stem}.json`);
     const tmp = `${file}.tmp-${randomBytes(6).toString("hex")}`;
     try { writeFileSync(tmp, body, { mode: 0o600 }); renameSync(tmp, file); }
-    catch { try { unlinkSync(tmp); } catch { /* */ } if (credLinkedByUs) { try { unlinkSync(cred); } catch { /* */ } } return "failed"; }
+    catch { try { unlinkSync(tmp); } catch { /* */ } return "failed"; }
     return "enqueued";
   } catch { return "failed"; }
 }
@@ -284,8 +290,7 @@ export async function drainQueue(
   drainingDirs.add(dir);
   try {
   try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return zero; } // the lock's intentDir must exist; no dir ⇒ nothing to drain
-  recoverDeadDrainLock(dir); // reclaim a lock a drainer crashed BEFORE publishing its identity (empty lockdir + dead intents) — holder-lock leaves this caller-side recovery (R26) to us
-  const lockTok = acquireHolderLock(drainLockSite(dir));
+  const lockTok = acquireHolderLock(drainLockSite(dir)); // empty-lockdir crash recovery (a drainer SIGKILLed between mkdir and identity-publish) is now IN the shared primitive (rmdir-if-empty + ② sole-verify); no caller-side reaper
   if (lockTok === null) return zero; // another LIVE drainer holds the queue ⇒ skip (holder-lock never steals a live holder ⇒ no reorder)
   try {
   recoverStaleQueueClaims(dir, isAlive);
@@ -347,19 +352,3 @@ export async function drainQueue(
 
 /** In-process set of queue dirs currently being drained (TGP-11 layer 1: same-process async reentrancy guard). */
 const drainingDirs = new Set<string>();
-
-/** Reclaim a drain lock a drainer crashed BEFORE publishing its identity: an EMPTY `drain.lockd` whose hold-intents are ALL dead
- *  (or absent). holder-lock refuses to adopt an external empty dir (it can't tell a crash from a live mid-publish) and leaves this
- *  to the caller; without it the queue would be permanently un-drainable after such a crash. SAFETY: a LIVE hold-intent (an acquirer
- *  mid-publish) ⇒ leave it (never steal); an unreadable intent dir ⇒ leave (never fold to "none"). Best-effort; never throws. */
-function recoverDeadDrainLock(dir: string): void {
-  const site = drainLockSite(dir);
-  let entries: string[];
-  try { entries = readdirSync(site.lockDir); } catch { return; } // no lockdir / unreadable ⇒ nothing to reclaim
-  if (entries.length !== 0) return; // a PUBLISHED holder ⇒ holder-lock's own dead-pid reclaim handles it, not us
-  let intents: string[];
-  try { intents = readdirSync(site.intentDir).filter((n) => n.startsWith(site.intentPrefix)); } catch { return; } // can't read intents ⇒ leave
-  for (const n of intents) { const pid = Number(n.slice(site.intentPrefix.length).split(".")[0]); if (Number.isInteger(pid) && pidAlive(pid)) return; } // a LIVE intent ⇒ an acquirer is mid-publish ⇒ never steal
-  try { rmdirSync(site.lockDir); } catch { return; } // raced (someone published/removed) ⇒ abort; a live acquirer re-mkdirs cleanly
-  for (const n of intents) { try { unlinkSync(path.join(site.intentDir, n)); } catch { /* best-effort: dead intents */ } }
-}
