@@ -77,6 +77,7 @@ export type TgUpdate = { chatId?: unknown; callbackData?: unknown; text?: unknow
 /** Parse result: a verdict tied to the driver's `ref` (the driver resolves ref -> batchId/itemId and merges), or ignore. */
 export type ParseResult =
   | { kind: "decision"; ref: string; verdict: Verdict; scope?: ApprovalScope }
+  | { kind: "dialog"; chatId: number; text: string }
   | { kind: "ignore"; reason: string };
 
 /** Allowlist-gate the chat_id FIRST, then shape-validate a callback into a (ref, verdict, scope). Untrusted input: a
@@ -85,7 +86,12 @@ export type ParseResult =
 export function parseUpdate(update: TgUpdate, allowlist: ReadonlySet<number>): ParseResult {
   if (update === null || typeof update !== "object") return { kind: "ignore", reason: "no update" };
   if (typeof update.chatId !== "number" || !allowlist.has(update.chatId)) return { kind: "ignore", reason: "chat_id not allowlisted" };
-  if (update.callbackData === undefined) return { kind: "ignore", reason: "not a decision callback (typed reply ignored in v1)" };
+  if (update.callbackData === undefined) {
+    // dialog-officer (R10): an allowlisted FREE-TEXT message is now a DIALOG (v1 dropped it as "ignore"). A message carrying no
+    // usable text stays ignore. The decision branch below is BYTE-UNCHANGED (only this not-a-callback branch gained the dialog case).
+    if (typeof update.text === "string" && update.text.trim()) return { kind: "dialog", chatId: update.chatId, text: update.text };
+    return { kind: "ignore", reason: "not a decision callback and no text" };
+  }
   const cb = parseCallback(update.callbackData);
   if (!cb) return { kind: "ignore", reason: "malformed callback" };
   return { kind: "decision", ref: cb.ref, verdict: cb.verdict, ...(cb.scope ? { scope: cb.scope } : {}) };
@@ -176,6 +182,21 @@ export function buildTgMessageReceipt(chatId: number, text: string): { text: str
  *  update_id). writeInbox's dedup key must match `^[A-Za-z0-9._-]{1,120}$` (else it falls to the non-deduped random-name path —
  *  TGP-3), so any unsafe char in a part is folded to `_` and the whole is clipped to 120. Same event ⇒ same key (replay dedups);
  *  distinct events ⇒ distinct keys. Pure. */
+/** The dialog message the bridge writes to the DIALOG-OFFICER box (R10): an allowlisted free-text turn the officer handles in its
+ *  own context. Notify only (the officer, not the coordinator, owns the conversation). DO-P2-4: the user's text is carried in FULL —
+ *  truncating it would hand the officer a corrupted conversation (the lost tail is unrecoverable). A Telegram message is itself
+ *  bounded (≤4096 chars), so the full body stays small; any text that reaches this came through that bound. Pure. */
+export function buildDialogOfficerMsg(chatId: number, text: string): { text: string; taskRef: string; title: string } {
+  return { text: `[tg-dialog] chat ${chatId}: ${text}`, taskRef: "tg-dialog", title: "TG 对话" };
+}
+
+/** The bridge's durable OUTBOUND queue dir: the token-less dialog-officer drops reply records here; the token-holding driver drains
+ *  + sends them to TG. Shared path so officer and driver agree. Pure. */
+export function tgOutboxDir(home: string): string { return path.join(home, ".agenthop", "tg", "outbox"); }
+/** The driver's local durable PENDING dir for inbound dialog when SWARM_DIALOG_OFFICER is unset/unresolvable — never lost, never
+ *  the coordinator box; drained to the officer once it resolves. Pure. */
+export function tgDialogPendingDir(home: string): string { return path.join(home, ".agenthop", "tg", "dialog-pending"); }
+
 export function tgIdempotencyKey(prefix: string, ...parts: Array<string | number>): string {
   // LOSSLESS identity (TGP-3b): the parts are sha256-hashed (NUL-joined), so distinct identities never collide and a long/`/`-bearing
   // id is never lost to truncation or char-folding — unlike a raw replace/slice. A readable prefix aids debugging. Contract-safe
