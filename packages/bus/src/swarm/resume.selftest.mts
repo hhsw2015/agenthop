@@ -3,8 +3,13 @@
 //   packages/bus/node_modules/.bin/tsx packages/bus/src/swarm/resume.selftest.mts
 import {
   ROSTER_FILE, SCHEMA_VERSION, assembleRoster, memberKey, parseSnapshot, planResume, resumeCmdFor, resumeCommandForMember,
+  serializeSnapshot, writeRosterSnapshot,
   type PeerLike, type RosterSnapshot,
 } from "./resume.js";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { spawn } from "node:child_process";
 
 const t = (name: string, cond: boolean) => {
   if (!cond) throw new Error("FAILED: " + name);
@@ -150,6 +155,71 @@ const peer = (over: Partial<PeerLike> = {}): PeerLike => ({ id: "run-1", stableI
   const s2 = parseSnapshot(v2)!;
   t("v2 snapshot preserves version + resumeCmd + source", s2.version === 2 && s2.members[0]!.resumeCmd === "codex resume x" && s2.members[0]!.resumeCmdSource === "argv");
   t("resumeCommandForMember uses the captured resumeCmd when present", resumeCommandForMember(s2.members[0]!) === "codex resume x");
+}
+
+
+// --- dialog-officer brief §9-2: the FIRST structured role source (SWARM_DIALOG_OFFICER → role="dialog-officer") ---
+{
+  const snap = assembleRoster([
+    peer({ stableId: "do-sid", tool: "claude", cwd: "/Work/do", title: "DialogOfficer" }),
+    peer({ stableId: "w1", tool: "codex", cwd: "/Work/w1", title: "worker" }),
+  ], 1000, { dialogOfficer: "do-sid" });
+  t("dialog-officer stableId gets role=dialog-officer", snap.members.find((m) => m.member === "do-sid")?.role === "dialog-officer");
+  t("other members stay role=null", snap.members.find((m) => m.member === "w1")?.role === null);
+  t("no dialogOfficer opt ⇒ every role null (byte-identical v1)", assembleRoster([peer({ stableId: "do-sid" })], 1000).members.every((m) => m.role === null));
+  t("a blank handle names no one", assembleRoster([peer({ stableId: "do-sid" })], 1000, { dialogOfficer: "  " }).members.every((m) => m.role === null));
+}
+
+// --- project: FC-7 forward-reserve (stamped only when set; round-trips; absent on legacy) ---
+{
+  t("project stamped when set", assembleRoster([peer({ stableId: "a" })], 1000, { project: "proj-x" }).members[0]!.project === "proj-x");
+  t("project absent when unset (legacy)", assembleRoster([peer({ stableId: "a" })], 1000).members[0]!.project === undefined);
+  const rt = parseSnapshot(serializeSnapshot(assembleRoster([peer({ stableId: "a", title: "A" })], 1000, { dialogOfficer: "a", project: "proj-x" })))!;
+  t("role + project round-trip through serialize→parse", rt.members[0]!.role === "dialog-officer" && rt.members[0]!.project === "proj-x");
+  const legacy = parseSnapshot(JSON.stringify({ version: 2, capturedAtSec: 1, members: [{ member: "m", tool: "claude", cwd: "/x", role: "dialog-officer" }] }))!;
+  t("FC-7: legacy member (no project) parses, project undefined, role kept", legacy.members[0]!.project === undefined && legacy.members[0]!.role === "dialog-officer");
+}
+
+// --- restart-idempotency: assembleRoster is deterministic (a restart re-captures the same roster) ---
+{
+  const mk = () => assembleRoster([peer({ stableId: "a", title: "A" }), peer({ stableId: "b", title: "B" })], 1000, { dialogOfficer: "a", project: "p" });
+  t("restart: identical peers ⇒ identical roster (deterministic)", JSON.stringify(mk()) === JSON.stringify(mk()));
+}
+
+// --- roster WRITE primitive: atomic (crash-recovery / idempotency) — infra zero-bug ruling ---
+{
+  const home = mkdtempSync(join(tmpdir(), "roster-"));
+  try {
+    const out = join(home, ".agenthop", "swarm", "roster-snapshot.json");
+    const snap1 = assembleRoster([peer({ stableId: "a", title: "A" })], 1000);
+    writeRosterSnapshot(out, snap1);
+    t("write ⇒ readback parses to the same snapshot", readFileSync(out, "utf8") === serializeSnapshot(snap1));
+    const before = readFileSync(out, "utf8"); writeRosterSnapshot(out, snap1);
+    t("idempotent re-write ⇒ byte-identical file", readFileSync(out, "utf8") === before);
+    writeFileSync(`${out}.tmp-deadbeef`, "TORN GARBAGE{"); // a crashed writer's leftover temp (crash BEFORE rename)
+    t("a leftover crash temp never corrupts the committed roster", readFileSync(out, "utf8") === before);
+    const snap2 = assembleRoster([peer({ stableId: "b", title: "B" })], 2000, { dialogOfficer: "b" });
+    writeRosterSnapshot(out, snap2);
+    const after = parseSnapshot(readFileSync(out, "utf8"))!;
+    t("last write wins, file is a COMPLETE snapshot (never torn)", after.members.length === 1 && after.members[0]!.role === "dialog-officer");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+// --- concurrency: two real processes write the roster at once ⇒ the file is always ONE complete snapshot (any interleaving) ---
+{
+  const home = mkdtempSync(join(tmpdir(), "roster-cc-"));
+  try {
+    const out = join(home, ".agenthop", "swarm", "roster-snapshot.json");
+    const mod = new URL("./resume.ts", import.meta.url).pathname;
+    const tsxBin = join(dirname(new URL(import.meta.url).pathname), "..", "..", "node_modules", ".bin", "tsx");
+    const child = (sid: string) => `import { writeRosterSnapshot } from "${mod}"; writeRosterSnapshot(process.env.OUT, { version: 2, capturedAtSec: 1, members: [{ member: "${sid}", tool: "claude", cwd: "/x", role: null, resumeCmd: "claude --resume ${sid}", resumeCmdSource: "template" }] });`;
+    await Promise.all(["aaa", "bbb"].map((sid) => new Promise<void>((res, rej) => {
+      const cp = spawn(tsxBin, ["-e", child(sid)], { env: { ...process.env, OUT: out } });
+      cp.on("error", rej); cp.on("close", () => res());
+    })));
+    const parsed = parseSnapshot(readFileSync(out, "utf8"));
+    t("concurrency: the roster file is ONE complete snapshot (parses), never torn", parsed !== null && parsed.members.length === 1);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 }
 
 console.log("all resume selftests passed");

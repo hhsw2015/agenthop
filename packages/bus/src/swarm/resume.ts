@@ -13,14 +13,20 @@
  * one-key resume works today. The at-closeout auto-snapshot is the SAME writer hung at the closeout seam
  * (a diff handed to that owner) — it depends on the closeout flow (board dep L2-struct), this module does not.
  */
+import { writeFileSync, renameSync, mkdirSync } from "node:fs"; // used ONLY inside writeRosterSnapshot() — no top-level side effect
+import { randomBytes } from "node:crypto";
+import path from "node:path";
 
-/** A member's workstation: enough to relaunch its window exactly. role is best-effort (no structured
- *  member->role source exists yet; left null until one does). */
+/** A member's workstation: enough to relaunch its window exactly. `role` is best-effort: null when no structured source
+ *  identifies one; the FIRST such source is the dialog-officer handle (SWARM_DIALOG_OFFICER → role="dialog-officer",
+ *  dialog-officer brief §9-2). `project` is a forward-reserved FC-7 optional field (SSI project ownership) — only landed
+ *  when a project key is set; unset ⇒ legacy, no cross-project execution is implied here. */
 export interface RosterMember {
   member: string; // the durable session id (stableId) if known, else the short handle — a human label
   tool: string; // the CLI to relaunch: claude | codex | opencode | ...
   cwd: string; // the working directory the window opened in
-  role: string | null; // best-effort; null when unknown
+  role: string | null; // best-effort; null when no structured source names one (first source: the dialog-officer handle)
+  project?: string; // FC-7 forward-reserve (SSI project key); absent ⇒ legacy / unknown project
   title?: string; // short handle (e.g. "Work-20cab0a5"), for display
   // F36: the FULL resume command, not a bare `claude --resume`. A bare relaunch loses permission mode / model /
   // effort and starts a wrong session (user caught this by hand). Captured from the live process args when
@@ -121,9 +127,13 @@ export function memberKey(tool: string, cwd: string): string {
 export function assembleRoster(
   peers: readonly PeerLike[],
   nowSec: number,
-  opts: { selfId?: string; exclude?: readonly string[] } = {},
+  opts: { selfId?: string; exclude?: readonly string[]; dialogOfficer?: string; project?: string } = {},
 ): RosterSnapshot {
   const excluded = new Set((opts.exclude ?? []).map((s) => s));
+  // The FIRST structured member->role source (dialog-officer brief §9-2): the resolved dialog-officer stableId gets
+  // role="dialog-officer". A blank/whitespace handle names no one (additive: unset ⇒ every role stays null, byte-identical v1).
+  const dialogOfficer = (opts.dialogOfficer ?? "").trim();
+  const project = (opts.project ?? "").trim(); // FC-7 forward-reserve: stamped only when a project key is set
   const seen = new Set<string>();
   const members: RosterMember[] = [];
   for (const p of peers ?? []) {
@@ -137,10 +147,26 @@ export function assembleRoster(
     seen.add(identity);
     const sid = p.stableId ?? p.id ?? identity; // the id to resume (durable session id, not the display title)
     const { cmd, source } = resumeCmdFor(tool, sid, p.argv);
-    members.push({ member: identity, tool, cwd, role: null, ...(p.title ? { title: p.title } : {}), resumeCmd: cmd, resumeCmdSource: source });
+    // role: the dialog-officer handle matches a member by its durable identity (stableId / resume sid / display identity).
+    const role: string | null = dialogOfficer !== "" && (p.stableId === dialogOfficer || sid === dialogOfficer || identity === dialogOfficer) ? "dialog-officer" : null;
+    members.push({ member: identity, tool, cwd, role, ...(project ? { project } : {}), ...(p.title ? { title: p.title } : {}), resumeCmd: cmd, resumeCmdSource: source });
   }
   members.sort((a, b) => (a.title ?? a.member).localeCompare(b.title ?? b.member));
   return { version: SCHEMA_VERSION, capturedAtSec: Math.floor(nowSec), members };
+}
+
+/** Serialize a roster snapshot to its on-disk JSON form (pure; the exact bytes writeRosterSnapshot persists). */
+export function serializeSnapshot(snap: RosterSnapshot): string { return `${JSON.stringify(snap, null, 2)}\n`; }
+
+/** Write the roster snapshot ATOMICALLY (temp + rename). The roster is a core-primitive write (infra zero-bug ruling): a crash
+ *  mid-write leaves the PREVIOUS roster intact (never a torn file), and a concurrent capture always observes one COMPLETE snapshot
+ *  (rename is atomic; the last writer wins, neither sees a half-file). The temp carries a random suffix so two concurrent writers
+ *  never collide on the same temp path. IO runs only when called — no top-level side effect. */
+export function writeRosterSnapshot(out: string, snap: RosterSnapshot): void {
+  mkdirSync(path.dirname(out), { recursive: true });
+  const tmp = `${out}.tmp-${randomBytes(4).toString("hex")}`;
+  writeFileSync(tmp, serializeSnapshot(snap));
+  renameSync(tmp, out);
 }
 
 /** Tolerant parse of a snapshot file. Returns null on anything malformed (a resume should degrade, not throw). */
@@ -164,6 +190,7 @@ export function parseSnapshot(text: string): RosterSnapshot | null {
       tool: mm.tool,
       cwd: mm.cwd,
       role: typeof mm.role === "string" ? mm.role : null,
+      ...(typeof mm.project === "string" && mm.project ? { project: mm.project } : {}), // FC-7: absent on legacy snapshots ⇒ undefined
       ...(typeof mm.title === "string" ? { title: mm.title } : {}),
       // v2 field; a v1 snapshot lacks it -> left undefined, launch recomputes canon (resumeCommandForMember).
       ...(typeof mm.resumeCmd === "string" ? { resumeCmd: mm.resumeCmd } : {}),
