@@ -25,6 +25,7 @@ import { promisify } from "node:util";
 import { startBusCore } from "../packages/bus/src/core.js";
 import { buildAppleScript } from "../packages/bus/src/spawn.js";
 import { herdrAgentName, herdrAgentStates, herdrLaunch, herdrServerReachable, herdrSpawnable, splitCommand } from "../packages/bus/src/swarm/herdr.js";
+import { resolveSession } from "../packages/bus/src/swarm/task-liveness.js";
 import { ROSTER_FILE, assembleRoster, writeRosterSnapshot, parseSnapshot, planResume, resumeCommandForMember, type PeerLike } from "../packages/bus/src/swarm/resume.js";
 
 const pexec = promisify(execFile);
@@ -70,7 +71,14 @@ async function main(): Promise<void> {
       );
       // dialog-officer brief §9-2: the SWARM_DIALOG_OFFICER handle is the first structured role source (mirrors SWARM_COORDINATOR);
       // SWARM_PROJECT is the FC-7 forward-reserve project key. Both additive: unset ⇒ role stays null / project absent.
-      const dialogOfficer = (process.env.SWARM_DIALOG_OFFICER ?? "").trim();
+      // DOS-P2-1: a coordinator-style handle can arrive in THREE forms — a full session id, a bus handle (tool:dir-<short>),
+      // or a bare short id. The ENTRY resolves it to a UNIQUE stable SID with the SAME resolver the coordinator uses
+      // (task-liveness.resolveSession, brief §2 mirror) BEFORE the pure core, which then matches by exact SID. Unresolved or
+      // ambiguous ⇒ stamp no role (never guess, F16) and say so, rather than silently dropping it inside the core.
+      const dialogOfficerRaw = (process.env.SWARM_DIALOG_OFFICER ?? "").trim();
+      const sidPool = peers.map((p) => p.stableId ?? p.id).filter((x): x is string => typeof x === "string" && x.length > 0);
+      const dialogOfficer = dialogOfficerRaw ? (resolveSession(dialogOfficerRaw, sidPool) ?? "") : "";
+      if (dialogOfficerRaw && !dialogOfficer) console.error(`SWARM_DIALOG_OFFICER="${dialogOfficerRaw}" did not uniquely resolve to a live session (unknown or ambiguous); no dialog-officer role stamped.`);
       const project = (process.env.SWARM_PROJECT ?? "").trim();
       const snap = assembleRoster(peers, Math.floor(Date.now() / 1000), { selfId: core.self.id, dialogOfficer, project });
       writeRosterSnapshot(out, snap); // atomic temp+rename (roster = core-primitive write, infra zero-bug ruling)

@@ -4,16 +4,17 @@
  * snapshot (member x directory x CLI x role) and, on the next boot, one command relaunches each window
  * (reusing spawn.ts's Ghostty launcher), each session self-reports, and the sweep takes over.
  *
- * PURE module (msglog P1 lesson): no fs, no bus, no top-level side effects — selftests in resume.selftest.mts.
- * The two pieces of real logic live here and are tested directly: assembleRoster (who to capture) and
- * planResume (idempotency — skip windows that are already up). The IO shell (scripts/swarm-resume.ts) reads
- * the bus roster, writes/reads the snapshot file, and calls spawnAgent per member.
+ * Almost-pure module (msglog P1 lesson): no bus, no clock, NO TOP-LEVEL side effects. The decision logic is pure and
+ * tested directly — assembleRoster (who to capture), planResume (idempotency — skip windows already up). The ONE IO
+ * function, writeRosterSnapshot, does fs ONLY when called (an atomic temp+rename, the roster being a core-primitive
+ * write per the infra zero-bug ruling); its node:fs imports are used nowhere else. The rest of the IO shell
+ * (scripts/swarm-resume.ts) reads the bus roster, reads the snapshot file, resolves handles, and spawns each member.
  *
  * Decoupled from closeout ON PURPOSE: the snapshot can be written on demand from the live bus roster, so
  * one-key resume works today. The at-closeout auto-snapshot is the SAME writer hung at the closeout seam
  * (a diff handed to that owner) — it depends on the closeout flow (board dep L2-struct), this module does not.
  */
-import { writeFileSync, renameSync, mkdirSync } from "node:fs"; // used ONLY inside writeRosterSnapshot() — no top-level side effect
+import { writeFileSync, renameSync, mkdirSync, statSync, chmodSync, unlinkSync } from "node:fs"; // used ONLY inside writeRosterSnapshot() — no top-level side effect
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 
@@ -165,8 +166,21 @@ export function serializeSnapshot(snap: RosterSnapshot): string { return `${JSON
 export function writeRosterSnapshot(out: string, snap: RosterSnapshot): void {
   mkdirSync(path.dirname(out), { recursive: true });
   const tmp = `${out}.tmp-${randomBytes(4).toString("hex")}`;
-  writeFileSync(tmp, serializeSnapshot(snap));
-  renameSync(tmp, out);
+  // DOS-P2-2: the roster records member dirs, session ids and resume params — the temp is RESTRICTED from creation (0600),
+  // and an atomic replace must NOT WIDEN the target's existing mode. A plain temp+rename would hand the target the temp's
+  // umask-derived mode (e.g. 0644), silently relaxing a pre-existing 0600/0400 snapshot. So mirror the target's mode when it
+  // exists, else default to 0600; writeFileSync honors `mode` only on CREATE, so chmod makes it deterministic under any umask.
+  let mode = 0o600;
+  try { mode = statSync(out).mode & 0o777; } catch { /* no existing target ⇒ the restrictive 0600 default holds */ }
+  try {
+    writeFileSync(tmp, serializeSnapshot(snap), { mode });
+    chmodSync(tmp, mode);
+    renameSync(tmp, out);
+  } catch (e) {
+    // DOS-P3-1: a failed write (e.g. rename EISDIR when out is a directory) must not leave an orphan temp to accumulate.
+    try { unlinkSync(tmp); } catch (e2) { console.error(`roster temp cleanup failed after a write error (${tmp}): ${(e2 as Error).message}`); }
+    throw e;
+  }
 }
 
 /** Tolerant parse of a snapshot file. Returns null on anything malformed (a resume should degrade, not throw). */

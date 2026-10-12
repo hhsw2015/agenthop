@@ -6,7 +6,8 @@ import {
   serializeSnapshot, writeRosterSnapshot,
   type PeerLike, type RosterSnapshot,
 } from "./resume.js";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { resolveSession } from "./task-liveness.js"; // DOS-P2-1: the coordinator's handle→sid resolver, mirrored by the entry
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, chmodSync, mkdirSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { spawn } from "node:child_process";
@@ -205,21 +206,100 @@ const peer = (over: Partial<PeerLike> = {}): PeerLike => ({ id: "run-1", stableI
   } finally { rmSync(home, { recursive: true, force: true }); }
 }
 
-// --- concurrency: two real processes write the roster at once ⇒ the file is always ONE complete snapshot (any interleaving) ---
+// --- DOS-P2-1: handle resolution mirrors the coordinator (task-liveness.resolveSession); ambiguous/unknown ⇒ no guess ---
 {
-  const home = mkdtempSync(join(tmpdir(), "roster-cc-"));
+  const sid = "aad02248-c76b-4a1a-b191-95da3f0bfb5a";
+  const pool = [sid, "bf1199aa-0000-1111-2222-333344445555"];
+  t("P2-1: a FULL session id resolves to itself", resolveSession(sid, pool) === sid);
+  t("P2-1: a tool-prefixed bus handle resolves by its short-id tail", resolveSession("claude:OpenDots-aad02248", pool) === sid);
+  t("P2-1: a bare short id resolves by prefix", resolveSession("aad02248", pool) === sid);
+  t("P2-1: an unknown handle resolves to null (never guess)", resolveSession("claude:X-deadbeef", pool) === null);
+  t("P2-1: an AMBIGUOUS short prefix resolves to null (F16)", resolveSession("claude:Y-aaa11111", ["aaa11111-0000-a", "aaa11111-9999-b"]) === null);
+  // the entry resolves first, then the pure core stamps the role on the RESOLVED sid (not the raw handle)
+  const resolved = resolveSession("claude:OpenDots-aad02248", pool)!;
+  const snap = assembleRoster([peer({ stableId: sid, title: "DO" }), peer({ stableId: "other", title: "X" })], 1, { dialogOfficer: resolved });
+  t("P2-1: core stamps dialog-officer on the resolved sid only", snap.members.find((m) => m.member === sid)?.role === "dialog-officer" && snap.members.find((m) => m.member === "other")?.role === null);
+}
+
+// --- DOS-P2-2: an atomic replace must NOT widen the target's existing mode; a new file is restrictive 0600 ---
+{
+  const home = mkdtempSync(join(tmpdir(), "roster-mode-"));
   try {
-    const out = join(home, ".agenthop", "swarm", "roster-snapshot.json");
-    const mod = new URL("./resume.ts", import.meta.url).pathname;
-    const tsxBin = join(dirname(new URL(import.meta.url).pathname), "..", "..", "node_modules", ".bin", "tsx");
-    const child = (sid: string) => `import { writeRosterSnapshot } from "${mod}"; writeRosterSnapshot(process.env.OUT, { version: 2, capturedAtSec: 1, members: [{ member: "${sid}", tool: "claude", cwd: "/x", role: null, resumeCmd: "claude --resume ${sid}", resumeCmdSource: "template" }] });`;
-    await Promise.all(["aaa", "bbb"].map((sid) => new Promise<void>((res, rej) => {
-      const cp = spawn(tsxBin, ["-e", child(sid)], { env: { ...process.env, OUT: out } });
-      cp.on("error", rej); cp.on("close", () => res());
-    })));
-    const parsed = parseSnapshot(readFileSync(out, "utf8"));
-    t("concurrency: the roster file is ONE complete snapshot (parses), never torn", parsed !== null && parsed.members.length === 1);
+    const out = join(home, "roster.json");
+    const snap = assembleRoster([peer({ stableId: "a" })], 1);
+    writeRosterSnapshot(out, snap);
+    t("P2-2: a brand-new snapshot is created 0600 (restrictive default)", (statSync(out).mode & 0o777) === 0o600);
+    chmodSync(out, 0o600); writeRosterSnapshot(out, snap);
+    t("P2-2: re-write preserves an existing 0600 (never widened to 0644)", (statSync(out).mode & 0o777) === 0o600);
+    chmodSync(out, 0o400); writeRosterSnapshot(out, snap);
+    t("P2-2: re-write preserves an existing 0400 (never widened)", (statSync(out).mode & 0o777) === 0o400);
   } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+// --- DOS-P3-1: a failed write (rename can't replace the target) cleans up its temp — no orphan accumulation ---
+{
+  const home = mkdtempSync(join(tmpdir(), "roster-fail-"));
+  try {
+    const out = join(home, "as-a-dir");
+    mkdirSync(out); // make the target a DIRECTORY ⇒ renameSync(tmp, out) throws (EISDIR/ENOTDIR)
+    let threw = false;
+    try { writeRosterSnapshot(out, assembleRoster([peer({ stableId: "a" })], 1)); } catch { threw = true; }
+    t("P3-1: writeRosterSnapshot throws when the target cannot be replaced", threw);
+    t("P3-1: the failed write leaves NO orphan temp behind (cleaned up)", readdirSync(home).filter((f) => f.startsWith("as-a-dir.tmp-")).length === 0);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+// --- DOS-P2-3: REAL-process fixtures (write interruption + new-process recovery + controlled concurrency) ---
+// Each child runs the ACTUAL writeRosterSnapshot in a separate process; we verify exit status and read DURING the interleaving.
+{
+  const mod = new URL("./resume.ts", import.meta.url).pathname;
+  const tsxBin = join(dirname(new URL(import.meta.url).pathname), "..", "..", "node_modules", ".bin", "tsx");
+  const snapLit = (sid: string) => `{ version: 2, capturedAtSec: 1, members: [{ member: ${JSON.stringify(sid)}, tool: "claude", cwd: "/x", role: null, resumeCmd: "claude --resume " + ${JSON.stringify(sid)}, resumeCmdSource: "template" }] }`;
+  const complete = (txt: string | null): boolean => { if (txt === null) return true; const p = parseSnapshot(txt); return p !== null && p.members.length === 1; };
+  const read = (out: string): string | null => { try { return readFileSync(out, "utf8"); } catch { return null; } };
+  // The tsx shim execs node, but tsx's CLI FORKS the script-runner — so spawn each child DETACHED (its own process group)
+  // and kill the whole group, else a plain kill hits only the shim/CLI and orphans the forked runner.
+  const spawnChild = (code: string, out: string) => spawn(tsxBin, ["-e", code], { env: { ...process.env, OUT: out }, detached: true });
+  const onClose = (cp: ReturnType<typeof spawn>) => new Promise<{ code: number | null; signal: string | null }>((res, rej) => { cp.on("error", rej); cp.on("close", (code, signal) => res({ code, signal })); });
+
+  // (A) a real writer is killed mid-run; the committed roster stays a complete snapshot; a NEW process then recovers (restart-replay).
+  {
+    const home = mkdtempSync(join(tmpdir(), "roster-kill-"));
+    try {
+      const out = join(home, ".agenthop", "swarm", "roster-snapshot.json");
+      writeRosterSnapshot(out, assembleRoster([peer({ stableId: "seed" })], 1)); // a committed baseline
+      // a BOUNDED-but-long loop (reliably mid-run at kill time, yet self-terminates if a kill is ever missed — no runaway).
+      const loop = `import { writeRosterSnapshot } from ${JSON.stringify(mod)}; for(let i=0;i<200000;i++){ writeRosterSnapshot(process.env.OUT, ${snapLit("child")}); }`;
+      const cp = spawnChild(loop, out);
+      await new Promise<void>((r) => cp.once("spawn", () => r()));
+      await new Promise((r) => setTimeout(r, 400)); // let it rewrite the roster many times
+      try { process.kill(-cp.pid!, "SIGKILL"); } catch { cp.kill("SIGKILL"); } // kill the whole group (tsx CLI + forked runner)
+      const end = await onClose(cp);
+      t("P2-3(A): the mid-write writer was killed, not a clean exit", end.code !== 0);
+      t("P2-3(A): committed roster is a COMPLETE snapshot after a mid-write kill (never torn)", complete(read(out)));
+      // (recovery / restart-replay) a fresh process writes a valid roster over whatever the crash left
+      const rec = await onClose(spawnChild(`import { writeRosterSnapshot } from ${JSON.stringify(mod)}; writeRosterSnapshot(process.env.OUT, ${snapLit("recovered")});`, out));
+      const parsed = parseSnapshot(read(out) ?? "");
+      t("P2-3(A): a new process recovers and writes a valid roster (exit 0)", rec.code === 0 && parsed !== null && parsed.members[0]!.member === "recovered");
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
+
+  // (B) two real processes each write N times; a reader samples DURING the run and must never see a torn file; both exit 0.
+  {
+    const home = mkdtempSync(join(tmpdir(), "roster-cc-"));
+    try {
+      const out = join(home, ".agenthop", "swarm", "roster-snapshot.json");
+      const writer = (sid: string) => `import { writeRosterSnapshot } from ${JSON.stringify(mod)}; for(let i=0;i<40;i++){ writeRosterSnapshot(process.env.OUT, ${snapLit(sid)}); }`;
+      const exits = ["aaa", "bbb"].map((sid) => onClose(spawnChild(writer(sid), out)));
+      let settled = 0; let torn = false; let present = 0;
+      exits.forEach((p) => p.then(() => { settled += 1; }).catch(() => { settled += 1; }));
+      while (settled < 2) { const txt = read(out); if (txt !== null) { present += 1; if (!complete(txt)) torn = true; } await new Promise((r) => setImmediate(r)); }
+      const results = await Promise.all(exits);
+      t("P2-3(B): both concurrent writers exited 0 (no crash, no non-zero)", results.every((r) => r.code === 0 && r.signal === null));
+      t("P2-3(B): a reader sampling DURING the run never saw a torn/partial file", !torn && present > 0);
+      t("P2-3(B): the final file is one complete snapshot", complete(read(out)));
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
 }
 
 console.log("all resume selftests passed");
