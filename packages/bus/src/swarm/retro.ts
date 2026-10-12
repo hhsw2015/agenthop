@@ -32,6 +32,48 @@ export function shouldRunRetro(lastRunSec: number | null, nowSec: number, period
 }
 
 // ============================================================================================================
+// RL-P3-1 — argument validation (pure). An invalid window value NEVER produces a NaN-d report or advances the water-mark.
+// ============================================================================================================
+
+/** The resolved window: `days` (last N days by review mtime + PROGRESS date-slice), `batch` (a PROGRESS 批-N section), or
+ *  `since-last` (incremental from the water-mark). control-log has no timestamp ⇒ it is always whole-corpus (labeled, RL-P2-1). */
+export type WindowSpec = { kind: "days"; days: number } | { kind: "batch"; batch: number } | { kind: "since-last" };
+export type RetroArgs =
+  | { mode: "usage"; error?: string }
+  | { mode: "retro"; window: WindowSpec; ifDue: boolean; periodDays: number; coordinator?: string }
+  | { mode: "learn"; from: string };
+
+const flagVal = (argv: readonly string[], n: string): string | undefined => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : undefined; };
+/** A finite positive INTEGER, else null (RL-P3-1: "nonsense"/"0"/"-1"/"3.5"/"" ⇒ null ⇒ usage, never a NaN window). */
+const posInt = (s: string | undefined): number | null => { if (s === undefined) return null; const n = Number(s); return Number.isInteger(n) && n > 0 ? n : null; };
+const VALUE_FLAGS = new Set(["--days", "--batch", "--period-days", "--coordinator", "--from"]);
+const BOOL_FLAGS = new Set(["--since-last", "--if-due"]);
+
+/** Classify + VALIDATE argv (RL-P3-1). Unknown options, a non-positive-integer --days/--batch/--period-days, or >1 window mode ⇒
+ *  usage (the CLI then exits 2 with ZERO writes). Pure. */
+export function classifyRetroArgs(argv: readonly string[]): RetroArgs {
+  const cmd = argv[0];
+  if (cmd === "learn") { const from = flagVal(argv, "--from"); return from ? { mode: "learn", from } : { mode: "usage", error: "learn requires --from <report.json>" }; }
+  if (cmd !== "retro") return { mode: "usage", ...(cmd ? { error: `unknown command '${cmd}'` } : {}) };
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (!a.startsWith("--")) continue;
+    if (!VALUE_FLAGS.has(a) && !BOOL_FLAGS.has(a)) return { mode: "usage", error: `unknown option '${a}'` };
+    if (VALUE_FLAGS.has(a)) i++; // consume the value so it is not mistaken for a flag
+  }
+  const hasDays = argv.includes("--days"), hasBatch = argv.includes("--batch"), hasSince = argv.includes("--since-last");
+  if ([hasDays, hasBatch, hasSince].filter(Boolean).length > 1) return { mode: "usage", error: "--days / --batch / --since-last are mutually exclusive" };
+  let window: WindowSpec;
+  if (hasBatch) { const n = posInt(flagVal(argv, "--batch")); if (n === null) return { mode: "usage", error: "--batch requires a positive integer" }; window = { kind: "batch", batch: n }; }
+  else if (hasSince) window = { kind: "since-last" };
+  else { const raw = flagVal(argv, "--days"); const n = raw === undefined ? 7 : posInt(raw); if (n === null) return { mode: "usage", error: "--days requires a positive integer" }; window = { kind: "days", days: n }; }
+  let periodDays = 7;
+  if (argv.includes("--period-days")) { const n = posInt(flagVal(argv, "--period-days")); if (n === null) return { mode: "usage", error: "--period-days requires a positive integer" }; periodDays = n; }
+  const coordinator = flagVal(argv, "--coordinator");
+  return { mode: "retro", window, ifDue: argv.includes("--if-due"), periodDays, ...(coordinator ? { coordinator } : {}) };
+}
+
+// ============================================================================================================
 // AXIS 1 — rework-round distribution (STRUCTURED: review-reports dir names `<ticket>-<sha>-review...`)
 // ============================================================================================================
 
@@ -163,6 +205,10 @@ export function extractProcessGaps(textLines: readonly TextLine[]): ProcessGap[]
 /** Three-state note per source so the report is honest about what it could read (brief §3: EACCES ⇒ unknown, never "no ailments"). */
 export type SourceStatus = "read" | "unreadable" | "absent";
 
+/** RL-P2-1: the ACTUAL scope each axis covered, so a reader never mistakes whole-corpus data for a windowed conclusion. "windowed"
+ *  = filtered to the window; "whole" = NOT window-scoped (e.g. control-log has no timestamp to filter by — reported in full, honestly
+ *  labeled); "incomplete" = a windowed scan hit a per-item read error so some items could not be attributed. */
+export type AxisScope = "windowed" | "whole" | "incomplete";
 export type RetroReportJson = {
   schema: typeof RETRO_REPORT_SCHEMA;
   window: string;
@@ -171,6 +217,7 @@ export type RetroReportJson = {
   ailments: AilmentCluster;
   gaps: ProcessGap[];
   sources: { reviewReports: SourceStatus; controlLog: SourceStatus; progress: SourceStatus; rulings: SourceStatus };
+  axisScopes: { reviews: AxisScope; controlLog: AxisScope; progress: AxisScope };
 };
 
 export function buildRetroReportJson(a: {
@@ -180,8 +227,9 @@ export function buildRetroReportJson(a: {
   ailments: AilmentCluster;
   gaps: ProcessGap[];
   sources: RetroReportJson["sources"];
+  axisScopes: RetroReportJson["axisScopes"];
 }): RetroReportJson {
-  return { schema: RETRO_REPORT_SCHEMA, window: a.window, generatedAtSec: Math.floor(a.nowSec), rework: a.rework, ailments: a.ailments, gaps: a.gaps, sources: a.sources };
+  return { schema: RETRO_REPORT_SCHEMA, window: a.window, generatedAtSec: Math.floor(a.nowSec), rework: a.rework, ailments: a.ailments, gaps: a.gaps, sources: a.sources, axisScopes: a.axisScopes };
 }
 
 /** Render the human-readable DRAFT. Every item carries its source refs; structured vs heuristic is labeled; a truly empty signal is
@@ -190,8 +238,10 @@ export function renderRetroMarkdown(r: RetroReportJson): string {
   const L: string[] = [];
   L.push(`# retro — ${r.window}`, ``, `_草稿 (draft)。生成于 ${new Date(r.generatedAtSec * 1000).toISOString()}。本报告只读分析,待人审;不自动入 PROGRESS。_`, ``);
   L.push(`源可读性: review-reports=${r.sources.reviewReports} · control-log=${r.sources.controlLog} · PROGRESS=${r.sources.progress} · rulings=${r.sources.rulings}`, ``);
+  // RL-P2-1: state each axis's ACTUAL scope so whole-corpus data is never read as a windowed conclusion.
+  L.push(`轴覆盖: reviews=${r.axisScopes.reviews} · control-log=${r.axisScopes.controlLog} · PROGRESS=${r.axisScopes.progress}  (whole=非窗口限定/全量; incomplete=部分不可读)`, ``);
   // axis 1
-  L.push(`## 返修轮数分布 (结构化)`, ``);
+  L.push(`## 返修轮数分布 (结构化, ${r.axisScopes.reviews})`, ``);
   if (r.sources.reviewReports !== "read") L.push(`- (源 ${r.sources.reviewReports} — 无结论)`, ``);
   else {
     L.push(`- ${r.rework.totalTickets} ticket · 一次过 ${r.rework.singlePass} · 多轮 ${r.rework.multiRound} · 中位 ${r.rework.medianRounds} · 最大 ${r.rework.maxRounds}`, ``);
@@ -204,7 +254,10 @@ export function renderRetroMarkdown(r: RetroReportJson): string {
   else if (r.ailments.structured.length === 0) L.push(`- (窗口内无复发 failureClass)`);
   else for (const c of r.ailments.structured) L.push(`- **${c.failureClass}** ×${c.count} (${c.attempts.slice(0, 5).join(", ")}${c.attempts.length > 5 ? "…" : ""})`);
   L.push(``, `### 启发式 (关键词词频 — 待人核,非定论)`);
-  if (r.ailments.heuristic.length === 0) L.push(`- (无复发关键词命中)`);
+  // RL-P2-2: the heuristic tally is derived from the PROGRESS corpus — if that source is not readable, an empty tally is UNKNOWN,
+  // never a confident "no hits".
+  if (r.sources.progress !== "read") L.push(`- (源 ${r.sources.progress} — 无结论,非「无命中」)`);
+  else if (r.ailments.heuristic.length === 0) L.push(`- (无复发关键词命中)`);
   else for (const c of r.ailments.heuristic) L.push(`- **${c.slug}** ×${c.count}  来源: ${c.hits.slice(0, 6).map((h) => `${h.source}:${h.line}`).join(", ")}${c.hits.length > 6 ? "…" : ""}`);
   L.push(``);
   // axis 3
@@ -221,7 +274,9 @@ export function renderRetroMarkdown(r: RetroReportJson): string {
 // ============================================================================================================
 
 export type RulingSeries = "R" | "S" | "F";
-export type Lesson = { title: string; statement: string; rationale?: string; sources: string[]; series: RulingSeries };
+/** `identity` (RL-P2-5) = the stable ailment identity (a failureClass or `gap:<slug>`), the dedup key — NOT the statement (whose
+ *  shared window-template prefix made different ailments look identical). */
+export type Lesson = { identity: string; title: string; statement: string; rationale?: string; sources: string[]; series: RulingSeries };
 
 /** A DRAFT ruling (生坯). Deliberately NOT a valid ledger record: `draft:true`, a `suggestedId` (NOT the `id` field loadLedger
  *  validates), no signed `status`. Written only to console/retro-drafts/; loadLedger (which scans rulings/) never sees it, and even
@@ -253,12 +308,13 @@ export function nextSeriesId(series: RulingSeries, existingIds: readonly string[
  *  overlap ⇒ covered). */
 export function isAlreadyCovered(lesson: Lesson, existing: readonly { statement: string; sources?: string[]; status: string }[]): boolean {
   const ls = new Set((lesson.sources ?? []).map((s) => s.trim()).filter(Boolean));
+  const idTok = lesson.identity.trim().toLowerCase();
   const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
-  const lstmt = norm(lesson.statement);
   for (const r of existing) {
     if (r.status !== "active") continue;
-    if ((r.sources ?? []).some((s) => ls.has(s.trim()))) return true;          // shares a cited source
-    if (lstmt.length > 0 && norm(r.statement).includes(lstmt.slice(0, 24))) return true; // strong statement-prefix overlap
+    if ((r.sources ?? []).some((s) => ls.has(s.trim()))) return true; // shares a cited source
+    // RL-P2-5: match the ailment IDENTITY token (not a window-template statement prefix) in the ruling's statement or sources.
+    if (idTok.length > 0 && (norm(r.statement).includes(idTok) || (r.sources ?? []).some((s) => norm(s).includes(idTok)))) return true;
   }
   return false;
 }
@@ -285,9 +341,12 @@ export function lessonsFromReport(r: RetroReportJson): Lesson[] {
   const out: Lesson[] = [];
   for (const c of r.ailments.structured) {
     out.push({
+      identity: `failureClass:${c.failureClass}`, // RL-P2-5: the dedup key (stable ailment identity, not the window-template statement)
       series: "F",
       title: `复发失败类 ${c.failureClass}`,
-      statement: `窗口 ${r.window} 内 failureClass=${c.failureClass} 复发 ${c.count} 次 — 候判例化为针对该失败类的根治/门禁规矩。`,
+      // RL-P2-5: lead with the identity (NOT the window template) so (a) two ailments in the same window no longer share a prefix, and
+      // (b) the identity travels INTO the ledger on promotion, enabling precise future dedup without relying on shared sources.
+      statement: `[failureClass:${c.failureClass}] 复发 ${c.count} 次 (窗口 ${r.window}) — 候判例化为针对该失败类的根治/门禁规矩。`,
       sources: c.attempts.slice(0, 8).map((a) => `control-log:attempt:${a}`),
     });
   }
@@ -295,9 +354,10 @@ export function lessonsFromReport(r: RetroReportJson): Lesson[] {
   for (const g of r.gaps) { if (!bySlug.has(g.slug)) bySlug.set(g.slug, []); bySlug.get(g.slug)!.push(g); }
   for (const [slug, gaps] of bySlug) {
     out.push({
+      identity: `gap:${slug}`,
       series: "S",
       title: `流程缺口 ${slug}`,
-      statement: `窗口 ${r.window} 内流程缺口「${slug}」命中 ${gaps.length} 次 — 候判例化为新门/流程规矩。`,
+      statement: `[gap:${slug}] 流程缺口「${slug}」命中 ${gaps.length} 次 (窗口 ${r.window}) — 候判例化为新门/流程规矩。`,
       sources: gaps.slice(0, 8).map((g) => `${g.source}:${g.line}`),
     });
   }

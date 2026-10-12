@@ -8,7 +8,7 @@
  * helper. The rulings dir is opened READ-ONLY (readExistingRulings, for dedup + id suggestion). A seed's only home is
  * console/retro-drafts/; the coordinator's manual `mv` + index rebuild is the sole path into the signed ledger.
  */
-import { mkdirSync, writeFileSync, renameSync, readFileSync, readdirSync, lstatSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readFileSync, readdirSync, lstatSync, statSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { loadControlLog } from "./control-store.js";
@@ -63,19 +63,31 @@ function writeJsonAtomic(file: string, data: unknown): void {
 // --- READ sources (FC-2 three-state) --------------------------------------------------------------------------------
 
 /** review-reports → {records, status}. ENOENT ⇒ absent; EACCES/other readdir fault ⇒ unreadable (never silently "no reworks"). */
-export function readReviewRoundRecords(dir: string): { records: ReviewRoundRecord[]; status: SourceStatus } {
+export function readReviewRoundRecords(dir: string, sinceSec: number | null = null): { records: ReviewRoundRecord[]; status: SourceStatus; complete: boolean } {
   let names: string[];
   try { names = readdirSync(dir); }
-  catch (e) { return { records: [], status: (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable" }; }
+  catch (e) { return { records: [], status: (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable", complete: true }; }
   const records: ReviewRoundRecord[] = [];
-  for (const name of names) { const p = parseReviewDirName(name); if (p) records.push({ ticket: p.ticket, sha: p.sha, dir: name }); }
-  return { records, status: "read" };
+  let complete = true; // RL-P2-2: a per-dir stat fault during window-filtering ⇒ incomplete (not a silent drop that looks like 0)
+  for (const name of names) {
+    const p = parseReviewDirName(name); if (!p) continue;
+    if (sinceSec !== null) {
+      let mtime: number;
+      try { mtime = statSync(path.join(dir, name)).mtimeMs / 1000; }
+      catch { complete = false; continue; } // EACCES/EIO on one dir ⇒ can't attribute it to the window ⇒ flag incomplete
+      if (mtime < sinceSec) continue;
+    }
+    records.push({ ticket: p.ticket, sha: p.sha, dir: name });
+  }
+  return { records, status: "read", complete };
 }
 
 /** control-log → {attempts, status}. absent dir ⇒ absent; a corrupt/unreadable log (loadControlLog throws) ⇒ unreadable (NOT an
  *  empty ailment set). Collects every attempt entity's latest {attemptId,nodeId,status,failureClass}. */
 export function readAttempts(home: string): { attempts: AttemptRecord[]; status: SourceStatus } {
-  if (!existsSync(controlLogDir(home))) return { attempts: [], status: "absent" };
+  // RL-P2-2: a readdir three-state (ENOENT⇒absent, EACCES⇒unreadable) — NOT existsSync (which is a TOCTOU + treats EACCES as "gone").
+  try { readdirSync(controlLogDir(home)); }
+  catch (e) { return { attempts: [], status: (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable" }; }
   let state;
   try { state = loadControlLog(controlLogDir(home)); }
   catch { return { attempts: [], status: "unreadable" }; }
@@ -123,13 +135,15 @@ const slugify = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|
 
 /** Write the retro report (markdown + JSON side-car) under console/retro-reports/. CP-3 guarded. Returns the written .md path, or
  *  null when the boundary refuses. */
-export function writeRetroReport(home: string, json: RetroReportJson, markdown: string): string | null {
+/** RL-P2-4: write ONE atomic JSON — the single source of truth. The markdown is DERIVED from it (renderRetroMarkdown) on demand, so
+ *  there is no second on-disk artifact that can drift / interleave with the JSON on a crash or concurrent write. The JSON's
+ *  generatedAtSec is the report VERSION; the inbox body (rendered from the SAME json) + the dedup key tie to that version. Returns the
+ *  json path, or null when the CP-3 boundary refuses. */
+export function writeRetroReport(home: string, json: RetroReportJson): string | null {
   if (!consoleBoundaryOk(home, reportsDir(home))) return null;
-  const base = slugify(json.window);
-  writeJsonAtomic(path.join(reportsDir(home), `${base}.json`), json);
-  const md = path.join(reportsDir(home), `${base}.md`);
-  writeJsonAtomic(md, markdown);
-  return md;
+  const file = path.join(reportsDir(home), `${slugify(json.window)}.json`);
+  writeJsonAtomic(file, json);
+  return file;
 }
 
 /**
