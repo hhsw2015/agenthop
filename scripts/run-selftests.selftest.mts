@@ -113,4 +113,25 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
   rmSync(root, { recursive: true, force: true });
 }
 
+// ── STCI-R2-P3-1 (r4): a LATE stdout marker after a burst of EARLY stderr must survive — the tail is ARRIVAL-ordered, not a
+// fixed stdout+stderr concat that would bury the marker under the earlier stderr. (Reverse direction too, as a non-regression.) ──
+{
+  const root = mkRoot();
+  // 20 stderr lines first, THEN (100ms later) the real stdout failure marker. A fixed out+err concat drops the marker from the
+  // last-12-lines tail; arrival order keeps it. exitCode (not exit) so the late line drains before the child exits.
+  writeFileSync(path.join(root, "late-stdout.selftest.mts"),
+    `for (let i = 0; i < 20; i++) console.error("early stderr warning " + i);\nsetTimeout(() => { console.log("LATE_STDOUT_MARKER"); process.exitCode = 1; }, 100);\n`);
+  const r = runRunner(root);
+  ok(r.code === 1 && /LATE_STDOUT_MARKER/.test(r.out), "STCI-R2-P3-1: a LATE stdout marker survives a burst of EARLY stderr (arrival-order tail)");
+  rmSync(root, { recursive: true, force: true });
+}
+{
+  const root = mkRoot();
+  writeFileSync(path.join(root, "late-stderr.selftest.mts"),
+    `for (let i = 0; i < 20; i++) console.log("early stdout line " + i);\nsetTimeout(() => { console.error("LATE_STDERR_MARKER"); process.exitCode = 1; }, 100);\n`);
+  const r = runRunner(root);
+  ok(r.code === 1 && /LATE_STDERR_MARKER/.test(r.out), "STCI-R2-P3-1: a LATE stderr marker survives early stdout (arrival-order tail, reverse)");
+  rmSync(root, { recursive: true, force: true });
+}
+
 console.log(`\nall run-selftests runner selftests passed (${pass})`);

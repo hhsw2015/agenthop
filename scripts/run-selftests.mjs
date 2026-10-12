@@ -75,12 +75,13 @@ function runOne(bin, absPath, cwd, timeoutMs, graceMs) {
   return new Promise((resolve) => {
     const t0 = Date.now();
     const child = spawn(bin, [absPath], { cwd, detached: true }); // own process group ⇒ we can kill the whole tree (tsx + its node grandchild)
-    let out = "", err = "", timedOut = false, settled = false, truncated = false;
-    // STCI-R2-P3-1: keep a sliding TAIL (the LAST MAX_OUT bytes), not the prefix — so the failure marker on the last lines
-    // survives a large run; mark that we truncated so the report can say so.
-    const cap = (buf, s) => { const n = s + buf; if (n.length <= MAX_OUT) return n; truncated = true; return n.slice(n.length - MAX_OUT); };
-    child.stdout.on("data", (d) => { out = cap(d.toString(), out); });
-    child.stderr.on("data", (d) => { err = cap(d.toString(), err); });
+    let combined = "", timedOut = false, settled = false, truncated = false;
+    // STCI-R2-P3-1: keep ONE bounded tail in ARRIVAL order — interleave stdout+stderr as they actually arrive, NOT two separate
+    // buffers concatenated in a fixed order (out+err), which would let a burst of EARLY stderr bury a LATER stdout failure
+    // marker. Sliding TAIL (the LAST MAX_OUT bytes) so the final lines survive a large run; mark truncation so the report says so.
+    const cap = (s) => { const n = combined + s; if (n.length <= MAX_OUT) { combined = n; return; } truncated = true; combined = n.slice(n.length - MAX_OUT); };
+    child.stdout.on("data", (d) => cap(d.toString()));
+    child.stderr.on("data", (d) => cap(d.toString()));
     const killGroup = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch { /* already gone */ } } };
     let killTimer, hardTimer;
     const termTimer = setTimeout(() => {
@@ -98,7 +99,7 @@ function runOne(bin, absPath, cwd, timeoutMs, graceMs) {
       // background member that ignored SIGTERM and held no pipe would otherwise survive. Once we have timed out, sweep the WHOLE
       // group with SIGKILL at finish time (synchronous, idempotent — ESRCH if already reaped), so no group member outlives the run.
       if (timedOut) killGroup("SIGKILL");
-      resolve({ ...res, out, err, ms: Date.now() - t0, timedOut, truncated });
+      resolve({ ...res, combined, ms: Date.now() - t0, timedOut, truncated });
     };
     child.on("error", (e) => finish({ spawnError: e }));
     child.on("close", (code, signal) => finish({ code, signal }));
@@ -126,8 +127,9 @@ async function main() {
     const ok = !r.timedOut && !r.spawnError && r.code === 0;
     if (ok) { passed++; console.log(`  ok   ${rel}  (${r.ms}ms)`); continue; }
     const why = r.timedOut ? `TIMEOUT >${timeoutMs}ms (SIGKILL after ${graceMs}ms grace)` : r.spawnError ? `spawn error: ${r.spawnError.message}` : r.signal ? `killed by ${r.signal}` : `exit ${r.code}`;
-    // STCI-R2-P3-1: show the REAL tail (last lines of the sliding-tail capture, where the failure marker lives), and say so when capped.
-    const tail = `${r.truncated ? "(output truncated — showing tail)\n" : ""}${`${r.out}${r.err}`.trim().split("\n").slice(-12).join("\n")}`;
+    // STCI-R2-P3-1: show the REAL tail — the last lines of the ARRIVAL-order sliding-tail capture (stdout+stderr interleaved as
+    // they arrived), where the failure marker lives — and say so when capped.
+    const tail = `${r.truncated ? "(output truncated — showing tail)\n" : ""}${r.combined.trim().split("\n").slice(-12).join("\n")}`;
     failures.push({ rel, why, tail });
     console.log(`  FAIL ${rel}  (${r.ms}ms) — ${why}`);
   }
