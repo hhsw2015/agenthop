@@ -74,9 +74,10 @@ try {
   {
     const h = freshHome(); mkdirSync(consoleDir(h), { recursive: true });
     const ext = mkdtempSync(path.join(scratch, "ext-read-"));
-    mkdirSync(path.join(ext, "morning-digest"), { recursive: true });
-    writeFileSync(path.join(ext, "morning-digest", "digest.json"), JSON.stringify(proj("2026-10-12"))); // a FOREIGN valid projection
-    writeFileSync(path.join(ext, "morning-digest", "notified.json"), JSON.stringify({ date: "2026-10-12", state: "sent", body: proj("2026-10-12") })); // a FOREIGN sent marker
+    // digestDir(home) = console/morning-digest is symlinked to ext, so the getters read ext/digest.json + ext/notified.json directly
+    // (place the FOREIGN files AT ext/, not ext/morning-digest/, so the layout genuinely puts them in the getter's read path).
+    writeFileSync(path.join(ext, "digest.json"), JSON.stringify(proj("2026-10-12"))); // a FOREIGN valid projection
+    writeFileSync(path.join(ext, "notified.json"), JSON.stringify({ date: "2026-10-12", state: "sent", body: proj("2026-10-12") })); // a FOREIGN sent marker
     symlinkSync(ext, digestDir(h)); // console/morning-digest -> ext (redirect)
     t("IP2-1: readDigestProjection through a redirect ⇒ unknown (not foreign 'valid')", readDigestProjection(h).kind === "unknown");
     t("IP2-1: readNotifiedState through a redirect ⇒ unknown (not foreign 'sent' — never suppresses this home's digest)", readNotifiedState(h).kind === "unknown");

@@ -67,8 +67,9 @@ function parseProjection(parsed: unknown): DigestProjection | null {
  *  (and carries the frozen body); ENOENT ⇒ "absent"; a parse/shape failure ⇒ "corrupt" (carrier damaged); any other read error ⇒
  *  "unknown" (can't tell — must not be treated as "never generated"). Never throws. */
 export function readDigestProjection(home: string): ProjState {
-  // IP2-1: a redirected dir chain ⇒ do NOT trust a FOREIGN projection read through the symlink as this home's generation proof.
-  // "unknown" (not "valid") ⇒ the caller regenerates rather than being suppressed by someone else's file. (Write is already refused.)
+  // IP2-1: a redirected dir chain ⇒ a FOREIGN projection read through the symlink can NOT prove this home generated today. "unknown"
+  // (not "valid") ⇒ digestActions HOLDS (writeProjection=false) and waits for the path to be fixed; a later TRUSTED read then drives
+  // the state machine. The point is that a foreign file never counts as this home's completion — it does not regenerate off unknown.
   if (!digestBoundaryOk(home)) return { kind: "unknown" };
   let raw: string;
   try { raw = readFileSync(digestPath(home), "utf8"); }
@@ -90,8 +91,9 @@ export function writeDigestProjectionRaw(home: string, projection: DigestProject
  *  r3 claim); the inbox idempotency key makes continuing it safe (a re-send overwrites, never duplicates). A read error / corrupt
  *  JSON / missing date ⇒ "unknown" (must not prove not-sent). Never throws. */
 export function readNotifiedState(home: string): NotifyState {
-  // IP2-1: a redirected dir chain ⇒ a FOREIGN notified marker is NOT proof this home delivered. "unknown" ⇒ must not prove sent
-  // (the caller treats it as not-yet-delivered and re-notifies), never a false "sent" from someone else's file.
+  // IP2-1: a redirected dir chain ⇒ a FOREIGN notified marker can NOT prove this home delivered. "unknown" ⇒ digestActions HOLDS
+  // (notify=false) and waits for the path to be fixed; a later TRUSTED read then drives the state machine. A foreign "sent" never
+  // counts as this home's completion (the suppression bug), and unknown does not itself authorize a re-notify.
   if (!digestBoundaryOk(home)) return { kind: "unknown" };
   let raw: string;
   try { raw = readFileSync(notifiedPath(home), "utf8"); }
