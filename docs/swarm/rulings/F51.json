@@ -1,0 +1,1 @@
+{"id":"F51","series":"F","title":"状态报告以耐久证据为准,非 herdr 瞬时快照","status":"active","since":"2026-10-10","statement":"协调者自认(user 指「状态不准确」):报「两单在干」依据点名瞬间 herdr agent_status 双 working,但 agent_status 是屏幕活动快照、不是任务态(成员实际在写交付信也被算「在干」)。教训:状态报告以耐久证据为准(箱内交付/分支 SHA/板项),herdr 状态仅辅助;报「在干」前对长任务核屏尾或工件,不拿瞬时快照当事实对 user 报账。","relates":["F53"],"sources":["PROGRESS.md:1611 (2026-10-10)"]}

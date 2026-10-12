@@ -1,11 +1,11 @@
 {
   "version": 1,
-  "generatedAtSec": 1791606277,
-  "count": 64,
+  "generatedAtSec": 1791777815,
+  "count": 71,
   "bySeriesCount": {
     "R": 26,
     "S": 18,
-    "F": 20
+    "F": 27
   },
   "entries": [
     {
@@ -393,6 +393,48 @@
       "id": "F47",
       "series": "F",
       "title": "codex CLI 升级后总线身份失联",
+      "status": "active"
+    },
+    {
+      "id": "F48",
+      "series": "F",
+      "title": "换壳继任:会话内不可修损坏的处置手顺",
+      "status": "active"
+    },
+    {
+      "id": "F49",
+      "series": "F",
+      "title": "协调者巡检:箱空+闲席必查在册池(池检)",
+      "status": "active"
+    },
+    {
+      "id": "F50",
+      "series": "F",
+      "title": "投审签收后审查席 idle 必补唤醒 ping",
+      "status": "active"
+    },
+    {
+      "id": "F51",
+      "series": "F",
+      "title": "状态报告以耐久证据为准,非 herdr 瞬时快照",
+      "status": "active"
+    },
+    {
+      "id": "F52",
+      "series": "F",
+      "title": "协调者收信不实时:耐久箱+唤醒 ping 对称(止血)",
+      "status": "active"
+    },
+    {
+      "id": "F53",
+      "series": "F",
+      "title": "ops-receipt:协调者操作以耐久证据判成,非 API 瞬时返回",
+      "status": "active"
+    },
+    {
+      "id": "F54",
+      "series": "F",
+      "title": "inbox-wake 生产哑火:门静默跳过=不可观测",
       "status": "active"
     }
   ]
