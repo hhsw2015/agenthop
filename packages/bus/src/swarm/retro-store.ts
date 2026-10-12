@@ -136,8 +136,6 @@ export function readExistingRulings(repoDir: string): { rulings: { id: string; s
 
 const slugify = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "retro";
 
-/** Write the retro report (markdown + JSON side-car) under console/retro-reports/. CP-3 guarded. Returns the written .md path, or
- *  null when the boundary refuses. */
 /** RL-P2-4: write ONE atomic JSON — the single source of truth. No separate Markdown side-car: the body is DERIVED on demand
  *  (renderRetroMarkdown), so there is no second on-disk artifact to drift. The report VERSION is reportVersionTag(json) — a SHA-256 over
  *  the SIGNALS EXCLUDING generatedAtSec — and the coordinator delivery key binds to it (same signals ⇒ idempotent "already"; changed
