@@ -8,14 +8,14 @@
 // (crash), to pause there for a deterministic two-writer interleave (concurrency), or fs.statSync to inject a per-dir EIO. We assert
 // subprocess exit codes / signals, the report version, the delivery credential (dedup ⇒ exactly one message), and the outstanding
 // obligation (a crash before the water-mark leaves it un-advanced so --since-last re-covers).
-import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, symlinkSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, symlinkSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
   retroEnabled, shouldRunRetro, classifyRetroArgs, parseReviewDirName, reworkRoundDist, clusterAilments, extractProcessGaps,
-  buildRetroReportJson, renderRetroMarkdown, nextSeriesId, isAlreadyCovered, draftRulingSeed, lessonsFromReport,
+  buildRetroReportJson, renderRetroMarkdown, reportVersionTag, nextSeriesId, isAlreadyCovered, coveringRulingId, draftRulingSeed, lessonsFromReport,
   RULING_SEED_SCHEMA, type ReviewRoundRecord, type AttemptRecord, type TextLine, type RetroReportJson, type Lesson,
 } from "./retro.js";
 import {
@@ -106,6 +106,10 @@ try {
   t("args: learn requires --from", classifyRetroArgs(["learn"]).mode === "usage" && classifyRetroArgs(["learn", "--from", "x.json"]).mode === "learn");
   t("args: --period-days validated", classifyRetroArgs(["retro", "--period-days", "nope"]).mode === "usage");
   t("args: a value is not mistaken for a flag (--coordinator sid then --batch)", (() => { const a = classifyRetroArgs(["retro", "--coordinator", "sid-123", "--batch", "2"]); return a.mode === "retro" && a.coordinator === "sid-123" && a.window.kind === "batch"; })());
+  t("args[RL-P3-1 r3]: a bare value flag (missing value) ⇒ usage", classifyRetroArgs(["retro", "--days"]).mode === "usage" && classifyRetroArgs(["retro", "--coordinator"]).mode === "usage" && classifyRetroArgs(["retro", "--period-days"]).mode === "usage");
+  t("args[RL-P3-1 r3]: a value flag swallowing the next flag ⇒ usage", classifyRetroArgs(["retro", "--coordinator", "--days", "7"]).mode === "usage");
+  t("args[RL-P3-1 r3]: learn rejects foreign/unknown options ⇒ usage", classifyRetroArgs(["learn", "--from", "x.json", "--bogus"]).mode === "usage" && classifyRetroArgs(["learn", "--days", "7"]).mode === "usage");
+  t("args[RL-P3-1 r3]: a positional arg ⇒ usage", classifyRetroArgs(["retro", "stray"]).mode === "usage" && classifyRetroArgs(["learn", "--from"]).mode === "usage");
 
   // ── AXIS 1: rework-round distribution ───────────────────────────────────────────────────────────────────────────
   t("parseReviewDirName: ticket+sha (ticket may have hyphens)", (() => { const p = parseReviewDirName("approval-delegation-io-e5a40c2-review-evidence"); return p?.ticket === "approval-delegation-io" && p.sha === "e5a40c2"; })());
@@ -151,6 +155,13 @@ try {
     { identity: "failureClass:timeout", series: "F", title: "t", statement: "x", sources: ["PROGRESS.md:1"] },
     [{ statement: "[failureClass:timeout] 复发 3 次 (窗口 w) — 根治", sources: [], status: "active" }]));
   t("isAlreadyCovered: a SUPERSEDED ruling does not cover (only active)", !isAlreadyCovered({ identity: "failureClass:z", series: "F", title: "t", statement: "z", sources: ["s1"] }, [{ statement: "x", sources: ["s1"], status: "superseded" }]));
+  t("RL-P2-5 r3: coveringRulingId returns the covering ruling ID (traceability)", coveringRulingId({ identity: "failureClass:timeout", series: "F", title: "t", statement: "x", sources: ["control-log:attempt:a1"] }, [{ id: "F7", statement: "unrelated", sources: ["control-log:attempt:a1"], status: "active" }]) === "F7");
+  t("RL-P2-5 r3: coveringRulingId null when novel", coveringRulingId({ identity: "failureClass:novel", series: "F", title: "t", statement: "x", sources: ["PROGRESS.md:1"] }, [{ id: "F7", statement: "unrelated", sources: ["control-log:attempt:a1"], status: "active" }]) === null);
+  t("RL-P2-4 r3: reportVersionTag ignores generatedAtSec, differs on signals", (() => {
+    const mk = (nowSec: number, recs: Parameters<typeof reworkRoundDist>[0]) => bj({ nowSec, rework: reworkRoundDist(recs) });
+    const a1 = mk(1, []), a2 = mk(9999, []), b = mk(1, [{ ticket: "t", sha: "1111111", dir: "" }]);
+    return reportVersionTag(a1) === reportVersionTag(a2) && reportVersionTag(a1) !== reportVersionTag(b);
+  })());
   // RL-P2-5 REGRESSION: same window, DIFFERENT ailments, DIFFERENT sources — the ledger covers only ONE; the other must still draft.
   t("RL-P2-5: same-window different-ailment are NOT both swallowed by a shared window template", (() => {
     const r = bj({ window: "7d-ending-2026-10-12", ailments: { structured: [{ failureClass: "business-fail", count: 2, attempts: ["a1"] }, { failureClass: "permanent", count: 3, attempts: ["a2"] }], heuristic: [] } });
@@ -292,21 +303,27 @@ try {
     t("fixture[restart]: single valid report; water-mark advanced", readRetroReport(path.join(reportsDirP(h), "batch-7.json"))?.window === "batch-7" && reportFiles(h).length === 1 && readLastRunSec(h) !== null);
   }
 
-  // FIXTURE 3 — concurrency-race: writer A pauses right after committing the report; writer B runs fully; then A resumes. The
-  // atomic temp+rename ⇒ one coherent report (never torn); the dedup key ⇒ exactly one delivery under the race.
+  // FIXTURE 3 — concurrency-race with DIFFERENT data per writer (RL-P2-4 / P2-6): writer A (1-ticket) pauses right after committing its
+  // report; writer B (2-ticket) runs fully; then A resumes. Each distinct report VERSION publishes under its own content-tagged key, so
+  // disk + inbox can never carry mismatched versions — the on-disk report's rendered body MUST equal one delivered inbox message.
   {
     const h = freshHome(); seedCoord(h);
+    const revA = mkdtempSync(path.join(scratch, "revA-")); mkdirSync(path.join(revA, "tktA-1111111-review-x"), { recursive: true });
+    const revB = mkdtempSync(path.join(scratch, "revB-")); mkdirSync(path.join(revB, "tktA-1111111-review-x"), { recursive: true }); mkdirSync(path.join(revB, "tktB-2222222-review-y"), { recursive: true });
     const pauseMark = path.join(scratch, "race-stage.json"), release = path.join(scratch, "race-release");
-    const A = runCli(["retro", "--batch", "9", "--coordinator", COORD], childEnv(h, { RETRO_TEST_PAUSE_AFTER: "batch-9.json", RETRO_TEST_PAUSE_MARK: pauseMark, RETRO_TEST_RELEASE: release }));
+    const A = runCli(["retro", "--batch", "9", "--coordinator", COORD], childEnv(h, { RETRO_REVIEW_REPORTS_DIR: revA, RETRO_TEST_PAUSE_AFTER: "batch-9.json", RETRO_TEST_PAUSE_MARK: pauseMark, RETRO_TEST_RELEASE: release }));
     { const deadline = Date.now() + 8000; while (!existsSync(pauseMark)) { if (Date.now() > deadline) throw new Error("FAILED: fixture[race] writer A never reached the barrier"); await sleep(10); } }
-    const B = await runCli(["retro", "--batch", "9", "--coordinator", COORD], childEnv(h));
+    const B = await runCli(["retro", "--batch", "9", "--coordinator", COORD], childEnv(h, { RETRO_REVIEW_REPORTS_DIR: revB }));
     writeFileSync(release, "go");
     const ra = await A;
     t("fixture[race]: both concurrent writers exit 0", ra.code === 0 && B.code === 0);
-    t("fixture[race]: ONE coherent report (atomic rename ⇒ never torn), valid", readRetroReport(path.join(reportsDirP(h), "batch-9.json"))?.window === "batch-9");
+    const disk = readRetroReport(path.join(reportsDirP(h), "batch-9.json"));
+    t("fixture[race]: ONE coherent report (atomic rename ⇒ never torn), valid", disk?.window === "batch-9");
     t("fixture[race]: no leftover .tmp in retro-reports", readdirSync(reportsDirP(h)).every((f) => !f.includes(".tmp-")));
-    t("fixture[race]: idempotent delivery under the race — exactly ONE message", inboxCount(h) === 1);
-    t("fixture[race]: water-mark advanced", readLastRunSec(h) !== null);
+    const inboxP = path.join(h, ".agenthop", "inbox", inboxDirName(COORD));
+    const bodies = readdirSync(inboxP).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(readFileSync(path.join(inboxP, f), "utf8")).text as string);
+    t("fixture[race] RL-P2-4: two DISTINCT versions ⇒ delivered once each (2 messages)", bodies.length === 2);
+    t("fixture[race] RL-P2-6: the on-disk report VERSION was delivered (a matching inbox body exists)", disk !== null && bodies.includes(renderRetroMarkdown(disk)));
   }
 
   // FIXTURE 4 — RL-P2-1/P2-2 via subprocess: a per-dir stat EIO during windowing ⇒ axisScopes.reviews="incomplete" (not a false 0).
@@ -315,7 +332,7 @@ try {
     const rev = path.join(h, "reviews"); const faultDir = path.join(rev, "tkt-aaaaaaa-review-x");
     mkdirSync(faultDir, { recursive: true });
     const rc = await runCli(["retro", "--days", "3650"], childEnv(h, { RETRO_REVIEW_REPORTS_DIR: rev, RETRO_TEST_STAT_FAULT: faultDir }));
-    t("fixture[stat-fault]: run exits 0 (on-disk only)", rc.code === 0);
+    t("fixture[stat-fault] RL-P2-3 r3: incomplete scan ⇒ exit 1 + water-mark NOT advanced", rc.code === 1 && readLastRunSec(h) === null);
     const files = reportFiles(h);
     const rep = files.length === 1 ? readRetroReport(path.join(reportsDirP(h), files[0]!)) : null;
     t("fixture[stat-fault]: review axis labeled 'incomplete' (per-dir stat fault ⇒ unattributable)", rep?.axisScopes.reviews === "incomplete");

@@ -43,34 +43,51 @@ export type RetroArgs =
   | { mode: "retro"; window: WindowSpec; ifDue: boolean; periodDays: number; coordinator?: string }
   | { mode: "learn"; from: string };
 
-const flagVal = (argv: readonly string[], n: string): string | undefined => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : undefined; };
 /** A finite positive INTEGER, else null (RL-P3-1: "nonsense"/"0"/"-1"/"3.5"/"" ⇒ null ⇒ usage, never a NaN window). */
 const posInt = (s: string | undefined): number | null => { if (s === undefined) return null; const n = Number(s); return Number.isInteger(n) && n > 0 ? n : null; };
-const VALUE_FLAGS = new Set(["--days", "--batch", "--period-days", "--coordinator", "--from"]);
-const BOOL_FLAGS = new Set(["--since-last", "--if-due"]);
+const RETRO_VALUE_FLAGS = new Set(["--days", "--batch", "--period-days", "--coordinator"]);
+const RETRO_BOOL_FLAGS = new Set(["--since-last", "--if-due"]);
+const LEARN_VALUE_FLAGS = new Set(["--from"]);
 
-/** Classify + VALIDATE argv (RL-P3-1). Unknown options, a non-positive-integer --days/--batch/--period-days, or >1 window mode ⇒
- *  usage (the CLI then exits 2 with ZERO writes). Pure. */
-export function classifyRetroArgs(argv: readonly string[]): RetroArgs {
-  const cmd = argv[0];
-  if (cmd === "learn") { const from = flagVal(argv, "--from"); return from ? { mode: "learn", from } : { mode: "usage", error: "learn requires --from <report.json>" }; }
-  if (cmd !== "retro") return { mode: "usage", ...(cmd ? { error: `unknown command '${cmd}'` } : {}) };
+/** RL-P3-1 (r3): scan options against THIS subcommand's allowed set. An unknown option, a positional arg, OR a value flag whose value
+ *  is missing (end of argv, or the next token is itself a flag) ⇒ an error (the CLI then exits 2 with ZERO writes). A present bool flag
+ *  maps to "". Distinguishes "flag absent" (not in the map) from "flag present with a value". Pure. */
+function scanOptions(argv: readonly string[], valueFlags: ReadonlySet<string>, boolFlags: ReadonlySet<string>): { error?: string; values: Map<string, string> } {
+  const values = new Map<string, string>();
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i]!;
-    if (!a.startsWith("--")) continue;
-    if (!VALUE_FLAGS.has(a) && !BOOL_FLAGS.has(a)) return { mode: "usage", error: `unknown option '${a}'` };
-    if (VALUE_FLAGS.has(a)) i++; // consume the value so it is not mistaken for a flag
+    if (!a.startsWith("--")) return { error: `unexpected argument '${a}'`, values };
+    if (boolFlags.has(a)) { values.set(a, ""); continue; }
+    if (valueFlags.has(a)) { const v = argv[i + 1]; if (v === undefined || v.startsWith("--")) return { error: `option '${a}' requires a value`, values }; values.set(a, v); i += 1; continue; }
+    return { error: `unknown option '${a}'`, values };
   }
-  const hasDays = argv.includes("--days"), hasBatch = argv.includes("--batch"), hasSince = argv.includes("--since-last");
-  if ([hasDays, hasBatch, hasSince].filter(Boolean).length > 1) return { mode: "usage", error: "--days / --batch / --since-last are mutually exclusive" };
+  return { values };
+}
+
+/** Classify + VALIDATE argv (RL-P3-1). Validates BOTH subcommands fully: unknown/foreign options, a value flag missing its value, a
+ *  non-positive-integer --days/--batch/--period-days, or >1 window mode ⇒ usage (the CLI then exits 2 with ZERO writes). Pure. */
+export function classifyRetroArgs(argv: readonly string[]): RetroArgs {
+  const cmd = argv[0];
+  if (cmd === "learn") {
+    const s = scanOptions(argv, LEARN_VALUE_FLAGS, new Set()); // learn accepts ONLY --from (a retro-only flag here is "unknown")
+    if (s.error) return { mode: "usage", error: s.error };
+    const from = s.values.get("--from");
+    return from ? { mode: "learn", from } : { mode: "usage", error: "learn requires --from <report.json>" };
+  }
+  if (cmd !== "retro") return { mode: "usage", ...(cmd ? { error: `unknown command '${cmd}'` } : {}) };
+  const s = scanOptions(argv, RETRO_VALUE_FLAGS, RETRO_BOOL_FLAGS);
+  if (s.error) return { mode: "usage", error: s.error };
+  const has = (f: string) => s.values.has(f);
+  if ([has("--days"), has("--batch"), has("--since-last")].filter(Boolean).length > 1) return { mode: "usage", error: "--days / --batch / --since-last are mutually exclusive" };
   let window: WindowSpec;
-  if (hasBatch) { const n = posInt(flagVal(argv, "--batch")); if (n === null) return { mode: "usage", error: "--batch requires a positive integer" }; window = { kind: "batch", batch: n }; }
-  else if (hasSince) window = { kind: "since-last" };
-  else { const raw = flagVal(argv, "--days"); const n = raw === undefined ? 7 : posInt(raw); if (n === null) return { mode: "usage", error: "--days requires a positive integer" }; window = { kind: "days", days: n }; }
+  if (has("--batch")) { const n = posInt(s.values.get("--batch")); if (n === null) return { mode: "usage", error: "--batch requires a positive integer" }; window = { kind: "batch", batch: n }; }
+  else if (has("--since-last")) window = { kind: "since-last" };
+  else if (has("--days")) { const n = posInt(s.values.get("--days")); if (n === null) return { mode: "usage", error: "--days requires a positive integer" }; window = { kind: "days", days: n }; }
+  else window = { kind: "days", days: 7 }; // the default 7 applies ONLY when --days is entirely absent (a bare --days is a missing value above)
   let periodDays = 7;
-  if (argv.includes("--period-days")) { const n = posInt(flagVal(argv, "--period-days")); if (n === null) return { mode: "usage", error: "--period-days requires a positive integer" }; periodDays = n; }
-  const coordinator = flagVal(argv, "--coordinator");
-  return { mode: "retro", window, ifDue: argv.includes("--if-due"), periodDays, ...(coordinator ? { coordinator } : {}) };
+  if (has("--period-days")) { const n = posInt(s.values.get("--period-days")); if (n === null) return { mode: "usage", error: "--period-days requires a positive integer" }; periodDays = n; }
+  const coordinator = s.values.get("--coordinator");
+  return { mode: "retro", window, ifDue: has("--if-due"), periodDays, ...(coordinator ? { coordinator } : {}) };
 }
 
 // ============================================================================================================
@@ -232,6 +249,18 @@ export function buildRetroReportJson(a: {
   return { schema: RETRO_REPORT_SCHEMA, window: a.window, generatedAtSec: Math.floor(a.nowSec), rework: a.rework, ailments: a.ailments, gaps: a.gaps, sources: a.sources, axisScopes: a.axisScopes };
 }
 
+/** RL-P2-4 (r3): a stable version tag over the report SIGNALS (everything EXCEPT generatedAtSec), so the delivery key binds to the
+ *  report VERSION: identical signals ⇒ same key (idempotent "already"); changed signals ⇒ a NEW key ⇒ a new delivery, so disk + inbox
+ *  carry the SAME version and can never diverge (a re-run with new data publishes a new version; a re-run with the same data does not
+ *  re-deliver). Excludes the timestamp so unchanged re-runs stay idempotent. Pure (FNV-1a 32-bit, no deps). */
+export function reportVersionTag(r: RetroReportJson): string {
+  const { generatedAtSec: _omit, ...signals } = r;
+  const s = JSON.stringify(signals); // field order is fixed by RetroReportJson construction ⇒ deterministic
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i += 1) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, "0");
+}
+
 /** Render the human-readable DRAFT. Every item carries its source refs; structured vs heuristic is labeled; a truly empty signal is
  *  distinguished from an unreadable source. Pure. */
 export function renderRetroMarkdown(r: RetroReportJson): string {
@@ -306,17 +335,25 @@ export function nextSeriesId(series: RulingSeries, existingIds: readonly string[
 /** Dedup (brief §2②): a lesson is already covered when an ACTIVE ruling shares a source ref OR a near-identical statement. Avoids
  *  re-drafting a seed for a病灶 the ledger already rules on. Pure (conservative: any shared source OR a strong statement-token
  *  overlap ⇒ covered). */
-export function isAlreadyCovered(lesson: Lesson, existing: readonly { statement: string; sources?: string[]; status: string }[]): boolean {
+/** The ACTIVE ruling that already covers this lesson — a shared cited source OR the ailment IDENTITY token (failureClass:/gap:, NOT a
+ *  window-template prefix) in the ruling's statement/sources — or null. RL-P2-5 (r3): returning the covering id lets `learn` show WHICH
+ *  ruling covers a skipped lesson (the frozen brief §2② + prior close gate require naming it). Pure. */
+export function coveringRulingId(lesson: Lesson, existing: readonly { id?: string; statement: string; sources?: string[]; status: string }[]): string | null {
   const ls = new Set((lesson.sources ?? []).map((s) => s.trim()).filter(Boolean));
   const idTok = lesson.identity.trim().toLowerCase();
   const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
   for (const r of existing) {
     if (r.status !== "active") continue;
-    if ((r.sources ?? []).some((s) => ls.has(s.trim()))) return true; // shares a cited source
-    // RL-P2-5: match the ailment IDENTITY token (not a window-template statement prefix) in the ruling's statement or sources.
-    if (idTok.length > 0 && (norm(r.statement).includes(idTok) || (r.sources ?? []).some((s) => norm(s).includes(idTok)))) return true;
+    const sharesSource = (r.sources ?? []).some((s) => ls.has(s.trim()));
+    const idMatch = idTok.length > 0 && (norm(r.statement).includes(idTok) || (r.sources ?? []).some((s) => norm(s).includes(idTok)));
+    if (sharesSource || idMatch) return r.id ?? "(unnamed ruling)";
   }
-  return false;
+  return null;
+}
+
+/** Boolean form of [[coveringRulingId]] (covered ⇔ some active ruling covers it). Pure. */
+export function isAlreadyCovered(lesson: Lesson, existing: readonly { id?: string; statement: string; sources?: string[]; status: string }[]): boolean {
+  return coveringRulingId(lesson, existing) !== null;
 }
 
 /** Draft a ruling seed from a lesson (Q5 suggested id). Pure. */

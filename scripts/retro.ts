@@ -24,8 +24,8 @@ import { writeInbox, composeInboxMsg } from "../packages/bus/src/inbox.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import {
   retroEnabled, shouldRunRetro, classifyRetroArgs, reworkRoundDist, clusterAilments, extractProcessGaps, buildRetroReportJson,
-  renderRetroMarkdown, lessonsFromReport, isAlreadyCovered, draftRulingSeed,
-  type RetroArgs, type AxisScope, type TextLine,
+  renderRetroMarkdown, lessonsFromReport, coveringRulingId, draftRulingSeed, reportVersionTag,
+  type RetroArgs, type AxisScope,
 } from "../packages/bus/src/swarm/retro.js";
 import {
   reviewReportsDir, readReviewRoundRecords, readAttempts, readProgressLines, readExistingRulings,
@@ -39,21 +39,6 @@ function home(): string { return process.env.AH_HOME ?? homedir(); }
 const USAGE = `usage: retro retro [--days N | --batch N | --since-last] [--coordinator <sid>] [--if-due] [--period-days N]
        retro learn --from <console/retro-reports/<w>.json>`;
 
-/** Keep only PROGRESS lines in the `批-N` / `batch-N` section (from the marker to the next batch/`## ` header). Best-effort; the scope
- *  is reported (axisScopes.progress="windowed") so an empty slice reads as "scoped, nothing here", never "whole corpus, nothing". */
-function sliceBatchSection(lines: readonly TextLine[], batch: number): TextLine[] {
-  const startRe = new RegExp(`(批-${batch}\\b|batch-${batch}\\b)`);
-  let start = -1;
-  for (let i = 0; i < lines.length; i++) if (startRe.test(lines[i]!.text)) { start = i; break; }
-  if (start < 0) return [];
-  const out: TextLine[] = [];
-  for (let i = start; i < lines.length; i++) {
-    const t = lines[i]!.text;
-    if (i > start && (/批-\d+\b|batch-\d+\b/.test(t) || /^## /.test(t))) break;
-    out.push(lines[i]!);
-  }
-  return out;
-}
 
 async function runRetro(a: Extract<RetroArgs, { mode: "retro" }>): Promise<number> {
   const H = home();
@@ -67,17 +52,15 @@ async function runRetro(a: Extract<RetroArgs, { mode: "retro" }>): Promise<numbe
   let windowLabel: string;
   let reviewsSince: number | null;      // mtime floor for review dirs; null = whole corpus
   let intendedReviewScope: AxisScope;
-  let progressBatch: number | null = null;
 
   if (a.window.kind === "batch") {
     windowLabel = `batch-${a.window.batch}`;
-    reviewsSince = null; intendedReviewScope = "whole";   // review dirs carry no batch tag ⇒ not scopeable by batch (labeled whole)
-    progressBatch = a.window.batch;                        // PROGRESS *is* scopeable (its 批-N section)
+    reviewsSince = null; intendedReviewScope = "whole";   // RL-P2-1 (r3): neither reviews NOR PROGRESS is reliably scopeable to a batch number ⇒ both labeled whole
   } else if (a.window.kind === "since-last") {
     const last = readLastRunSec(H);
     reviewsSince = last;                                   // null on the very first run ⇒ whole corpus
     intendedReviewScope = last === null ? "whole" : "windowed";
-    windowLabel = last === null ? "since-last-first-run-whole" : `since-${new Date(last * 1000).toISOString().slice(0, 10)}`;
+    windowLabel = last === null ? "since-last-first-run-whole" : `since-${last}`; // RL-P2-4 (r3): PRECISE seconds (not a date) ⇒ two same-day incrementals get distinct window identities
   } else {
     reviewsSince = startSec - a.window.days * 86400;
     intendedReviewScope = "windowed";
@@ -88,14 +71,13 @@ async function runRetro(a: Extract<RetroArgs, { mode: "retro" }>): Promise<numbe
   const reviews = readReviewRoundRecords(reviewReportsDir(H), reviewsSince);
   const attempts = readAttempts(H);                        // control-log has NO timestamp ⇒ ALWAYS whole corpus (labeled)
   const progress = readProgressLines(H);
-  const progressScoped = progressBatch !== null && progress.status === "read";
-  const progressLines: TextLine[] = progressScoped ? sliceBatchSection(progress.lines, progressBatch!) : progress.lines;
+  const progressLines = progress.lines; // RL-P2-1 (r3): PROGRESS has no reliable batch-section structure (prose mentions, not headers) ⇒ never windowed by batch; labeled whole
   const rulings = readExistingRulings(REPO);
 
   const axisScopes: { reviews: AxisScope; controlLog: AxisScope; progress: AxisScope } = {
     reviews: reviews.complete ? intendedReviewScope : "incomplete", // a per-dir stat fault during windowing ⇒ some items unattributable
     controlLog: "whole",
-    progress: progressScoped ? "windowed" : "whole",
+    progress: "whole", // RL-P2-1 (r3): never claimed windowed (PROGRESS batch-slicing is unreliable)
   };
 
   const json = buildRetroReportJson({
@@ -109,6 +91,7 @@ async function runRetro(a: Extract<RetroArgs, { mode: "retro" }>): Promise<numbe
 
   // --- RL-P2-3 obligation model: collect every unmet obligation; the water-mark advances ONLY when none remain. ------------------
   const outstanding: string[] = [];
+  if (!reviews.complete) outstanding.push("reviews:incomplete-scan"); // RL-P2-3 (r3): a per-dir stat fault ⇒ window not fully scanned ⇒ hold the water-mark so --since-last re-covers it
   const reportPath = writeRetroReport(H, json); // RL-P2-4: ONE atomic JSON (source of truth); null ⇒ CP-3 refused
   if (reportPath) console.log(`retro report -> ${reportPath}`);
   else { console.error(`retro report NOT saved (CP-3 boundary refused the write).`); outstanding.push("report:unwritten"); }
@@ -122,7 +105,7 @@ async function runRetro(a: Extract<RetroArgs, { mode: "retro" }>): Promise<numbe
     else {
       try {
         const md = renderRetroMarkdown(json); // RL-P2-4: rendered from the SAME json ⇒ body + disk cannot diverge
-        const r = writeInbox(H, coordSid, composeInboxMsg({ from: "retro", fromLabel: "swarm-retro", text: md, via: "retro", intent: "report" }), `retro-${windowLabel}`);
+        const r = writeInbox(H, coordSid, composeInboxMsg({ from: "retro", fromLabel: "swarm-retro", text: md, via: "retro", intent: "report" }), `retro-${windowLabel}-${reportVersionTag(json)}`);
         console.log(`retro draft -> coordinator ${coordSid}: ${r}`);
         if (r !== "published" && r !== "already") outstanding.push(`coordinator-delivery:${r}`); // deferred/pending/unknown ⇒ not confirmed
       } catch (e) { console.error(`retro: coordinator delivery FAILED: ${(e as Error).message}`); outstanding.push("coordinator-delivery:failed"); }
@@ -146,7 +129,8 @@ function runLearn(from: string): number {
   const lessons = lessonsFromReport(report);
   let drafted = 0, skipped = 0, refused = 0;
   for (const lesson of lessons) {
-    if (isAlreadyCovered(lesson, existing.rulings)) { skipped++; console.log(`  skip (already covered): ${lesson.title}`); continue; }
+    const coveredBy = coveringRulingId(lesson, existing.rulings);
+    if (coveredBy !== null) { skipped++; console.log(`  skip (already covered by ${coveredBy}): ${lesson.title}`); continue; } // RL-P2-5 (r3): name the covering ruling id
     const seed = draftRulingSeed(lesson, existing.ids, nowSec());
     const p = writeRulingSeed(H, seed);
     if (p) { drafted++; console.log(`  seed ${seed.suggestedId} -> ${p}`); } else { refused++; console.error(`  seed SKIPPED (CP-3 boundary): ${lesson.title}`); }
