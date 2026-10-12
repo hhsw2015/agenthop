@@ -138,8 +138,10 @@ export type ReceiptAction = { action: "forward"; value: ClampedDecision } | { ac
  *   - authority unknown (sealed-but-unreadable) ⇒ RETRY (keep the obligation; never guess a value, never drop).
  *   - not sealed ⇒ FORWARD the recorded value (what the coordinator will consume).
  *   - sealed, the item is present in the authority ⇒ FORWARD that authoritative final value (orphan-fold is irrelevant).
- *   - sealed, the item is ABSENT from the authority ⇒ this recorded tap was ORPHANED (superseded / published after the seal); the
- *     store emits its own orphan re-batch signal, so DROP the receipt (no stale value, no duplicate of the store's signal).
+ *   - sealed, the item is ABSENT from the authority ⇒ this recorded tap is NOT in the consumed result (it was superseded — either
+ *     overwritten pre-seal by a full-snapshot write, which the consume surfaces as an UNDECIDED item, or published post-seal as an
+ *     ORPHAN, which the store re-batches via its own orphan signal). Either way THIS bridge owes no receipt for it ⇒ DROP (no stale
+ *     value; this is NOT a claim that an orphan notification was emitted — only that the bridge does not add one).
  *  Pure. `itemValue` is the obligation item's decision in the digest-verified consumed projection, or null if absent. */
 export function obligationReceiptValue(
   authority: { consumed: true; itemValue: ClampedDecision | null } | { consumed: false } | { consumed: "unknown" },
@@ -153,6 +155,15 @@ export function obligationReceiptValue(
 /** The bridge's durable RECEIPT-OBLIGATION queue dir: a receipt owed to the coordinator for a recorded TG verdict, captured at
  *  record time (keyed by update_id) and drained with the authoritative final value. Local to the bridge; survives restart. Pure. */
 export function tgReceiptObligationDir(home: string): string { return path.join(home, ".agenthop", "tg", "receipt-obligations"); }
+
+/** TGP-4 (TG-r6) EVENT IDENTITY stamped INTO the durable business commit: the bridge records a verdict with its decision `reason`
+ *  set to this tag, so the SAME atomic ledger write that commits the decision also carries which TG event (update_id) made it. On
+ *  recovery after an interruption (the obligation was lost to an enqueue IO-failure or a crash BEFORE it was captured), the driver
+ *  reads the AUTHORITATIVE consumed decision for the item and, iff its `reason` equals this tag, knows THIS event recorded the
+ *  final value — so it re-captures the obligation and the receipt is still delivered, EVENT-BOUND (not by value-equality, which
+ *  cannot prove identity). A verdict superseded by a later writer carries that writer's reason ⇒ no match ⇒ correctly no receipt.
+ *  Pure; globally unique per bot (a TG update_id is monotonic + unique per bot). */
+export function srcTag(updateId: number): string { return `tg:${updateId}`; }
 
 /** The S11 receipt for a NON-verdict allowlisted TG message — forwarded to the coordinator inbox (notify + inbox-wake) so the
  *  user's free text is seen promptly. Notify only, never executed; the text is bounded. Pure. */

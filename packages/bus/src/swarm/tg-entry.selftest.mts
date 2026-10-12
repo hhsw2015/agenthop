@@ -1,6 +1,6 @@
 // Selftest for the TG entry pure core (render/parse, ref-based) + the shared CORE decision rules (allowedScopes /
 // enforceScope / upsertDecision) + the digest. Run: node --import tsx packages/bus/src/swarm/tg-entry.selftest.mts
-import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, obligationReceiptValue, tgReceiptObligationDir, tgIdempotencyKey, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
+import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, obligationReceiptValue, tgReceiptObligationDir, srcTag, tgIdempotencyKey, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
 import { allowedScopes, enforceScope, upsertDecision, validDecision, type DecisionItem, type DecisionsDoc } from "./decision-batch.js";
 import { composeDigest } from "./morning-digest.js";
 import type { DualBandwidthReading } from "./dual-bandwidth.js";
@@ -148,6 +148,7 @@ const hard: DecisionItem = { id: "n2", kind: "spend", summary: "pay $40 invoice"
   // determinism (restart-idempotency at the decision level): same inputs ⇒ same output.
   t("obligationReceiptValue is deterministic", JSON.stringify(obligationReceiptValue({ consumed: true, itemValue: rej }, appOnce)) === JSON.stringify(obligationReceiptValue({ consumed: true, itemValue: rej }, appOnce)));
   t("receipt-obligation dir under ~/.agenthop/tg/receipt-obligations", tgReceiptObligationDir("/home/u").endsWith("/.agenthop/tg/receipt-obligations") && tgReceiptObligationDir("/home/u").startsWith("/home/u"));
+  t("srcTag encodes the update_id (event identity in the durable commit)", srcTag(42) === "tg:42" && srcTag(1000) === "tg:1000");
 }
 
 console.log("all tg-entry selftests passed");

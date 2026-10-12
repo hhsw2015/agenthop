@@ -12,7 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { openBatch, consumeDecisions, recordDecision, readDecisions, readConsumedResult } from "../src/swarm/decision-batch-store.js";
 import { enforceScope, type DecisionItem } from "../src/swarm/decision-batch.js";
-import { obligationReceiptValue, tgReceiptObligationDir, tgIdempotencyKey, type ReceiptObligation } from "../src/swarm/tg-entry.js";
+import { obligationReceiptValue, tgReceiptObligationDir, srcTag, tgIdempotencyKey, type ReceiptObligation } from "../src/swarm/tg-entry.js";
 import { enqueueQueue, drainQueue } from "../src/swarm/tg-queue.js";
 import { writeInbox, claimInbox } from "../src/inbox.js";
 
@@ -28,12 +28,20 @@ const soft = (id: string) => ({ id, kind: "merge", summary: `merge ${id}`, sugge
 const seqSlotPath = (batchId: string, n: number) => path.join(HOME, ".agenthop", "console", "decision-batches", batchId, "seq", `${n}.json`);
 const coordReceipts = () => claimInbox(HOME, [COORD], "p").map((c) => c.msg.text);
 
-// the driver's record→obligation step: record the tap, then durably capture the obligation keyed by update_id (fact b).
+// the driver's full record→obligation step (mirrors scripts/swarm-tg-entry.ts): stamp the decision `reason` with the event id,
+// record, then capture the obligation on "recorded"; on "consumed" recover EVENT-BOUND via the sealed ledger's reason (TGP-4 r6).
 function recordAndCapture(batchId: string, itemId: string, updateId: number, dec: { id: string; verdict: "approve" | "reject" | "defer"; scope?: "once" | "this-chat" | "always" }, item: DecisionItem): string {
-  const outcome = recordDecision(HOME, batchId, dec, 1);
+  const d = { ...dec, reason: srcTag(updateId) };
+  const outcome = recordDecision(HOME, batchId, d, 1);
   if (outcome === "recorded") {
-    const mine = enforceScope(item, dec);
+    const mine = enforceScope(item, d);
     enqueueQueue(tgReceiptObligationDir(HOME), { updateId, batchId, itemId, recordedValue: { verdict: mine.verdict, ...(mine.scope ? { scope: mine.scope } : {}) } } satisfies ReceiptObligation, updateId);
+  } else if (outcome === "consumed") {
+    const cr = readConsumedResult(HOME, batchId);
+    if (cr.consumed === true) {
+      const fd = cr.doc.decisions.find((x) => x.id === itemId);
+      if (fd && fd.reason === srcTag(updateId)) enqueueQueue(tgReceiptObligationDir(HOME), { updateId, batchId, itemId, recordedValue: { verdict: fd.verdict, ...(fd.scope ? { scope: fd.scope } : {}) } } satisfies ReceiptObligation, updateId);
+    }
   }
   return outcome;
 }
@@ -129,5 +137,42 @@ describe("tg receipt-recovery dual-instance (real two processes)", () => {
     const [a, c] = await Promise.all([runDeliverChild(), runDeliverChild()]);
     expect(a).toBe(0); expect(c).toBe(0); // neither crashed
     expect(coordReceipts().length).toBe(1); // publishOnce + tg-queue atomic claim ⇒ exactly once at the coordinator
+  });
+});
+
+// ── TGP-4 r6: EVENT-BOUND recovery of a LOST obligation via the reason stamped into the durable commit ────────────────────
+describe("tg receipt-recovery event-identity (TGP-4 r6, lost obligation)", () => {
+  test("obligation lost (enqueue IO-fail/crash before capture) → consume → re-poll recovers via reason, delivers 1", async () => {
+    const b = openBatch(HOME, { owner: "o", items: [soft("n1")], nowSec: 1 });
+    // first poll: recorded, but the obligation is LOST (enqueue EACCES / crash before capture) — we DON'T enqueue here.
+    expect(recordDecision(HOME, b.batchId, { id: "n1", verdict: "approve", scope: "always", reason: srcTag(42) }, 1)).toBe("recorded");
+    // another consumer seals the batch before the retry (the reviewer's ordinary-IO window — no crash needed).
+    expect(consumeDecisions(HOME, b.batchId).consumed).toBe(true);
+    // re-poll update 42 → "consumed" → EVENT-BOUND recovery (sealed reason === srcTag(42)) re-captures the obligation.
+    expect(recordAndCapture(b.batchId, "n1", 42, { id: "n1", verdict: "approve", scope: "always" }, b.items[0]!)).toBe("consumed");
+    const d = await deliver();
+    expect(d.sent).toBe(1);
+    expect(coordReceipts()).toEqual(["n1:approve:always"]); // the window the reviewer reproduced is now closed, event-bound
+  });
+
+  test("a DIFFERENT update's late tap after seal does NOT recover (reason mismatch) → 0 receipts", async () => {
+    const b = openBatch(HOME, { owner: "o", items: [soft("n1")], nowSec: 1 });
+    recordDecision(HOME, b.batchId, { id: "n1", verdict: "approve", scope: "once", reason: srcTag(42) }, 1); // update 42 recorded
+    consumeDecisions(HOME, b.batchId);
+    expect(recordAndCapture(b.batchId, "n1", 99, { id: "n1", verdict: "approve", scope: "once" }, b.items[0]!)).toBe("consumed"); // update 99: reason tg:99 ≠ sealed tg:42
+    const d = await deliver();
+    expect(d.sent).toBe(0);
+    expect(coordReceipts()).toEqual([]); // value-equality is not identity: a different event never steals the recovery
+  });
+
+  test("a recorded tap OVERWRITTEN before seal: only the FINAL owner recovers (reason superseded)", async () => {
+    const b = openBatch(HOME, { owner: "o", items: [soft("n1")], nowSec: 1 });
+    recordDecision(HOME, b.batchId, { id: "n1", verdict: "approve", scope: "once", reason: srcTag(42) }, 1); // 42: approve
+    recordDecision(HOME, b.batchId, { id: "n1", verdict: "reject", reason: srcTag(43) }, 2);                 // 43 overwrites: reject (final)
+    expect(consumeDecisions(HOME, b.batchId).consumed).toBe(true);
+    expect(recordAndCapture(b.batchId, "n1", 42, { id: "n1", verdict: "approve", scope: "once" }, b.items[0]!)).toBe("consumed"); // 42 superseded ⇒ no recovery
+    expect(recordAndCapture(b.batchId, "n1", 43, { id: "n1", verdict: "reject" }, b.items[0]!)).toBe("consumed");                 // 43 is the final ⇒ recovers
+    await deliver();
+    expect(coordReceipts()).toEqual(["n1:reject:-"]); // exactly the final owner's receipt, once
   });
 });

@@ -9,13 +9,16 @@
  *   - crash-recovery (DO-P1-1 / DO-P2-1c): a READ error KEEPS the record (release + retry — a transient fault is NEVER a proof the
  *     record is undeliverable); a parse-CORRUPT record is moved to an observable quarantine/ (FC-2), never silently deleted; a claim
  *     left by a dead pid (or a claim older than STALE_CLAIM_MS) is reclaimed.
- *   - exactly-once modulo a sub-ms window (DO-P2-1a/c): a completed `seq` has a durable DONE marker, checked on BOTH enqueue and
- *     claim, so a replay or a crash-after-done never re-runs the handler. The marker is written BEFORE the claim is deleted, so the
- *     ONLY residual re-run is a crash in the gap between the handler returning "sent" and that marker landing (a single fs write) —
- *     inherent to a NON-idempotent sink (e.g. TG sendMessage, which offers no idempotency key); for an idempotent sink (writeInbox
- *     publishOnce) even that gap dedups downstream.
- *   - concurrency (DO-P2-1b): the claim name carries the pid AND a per-drain nonce, so two concurrent drains (even in ONE process)
- *     never share a claim; the loser of the atomic rename gets ENOENT and skips.
+ *   - at-most-once in the common case, at-LEAST-once end-to-end (DO-P2-1a/c): a completed `seq` gets a durable DONE marker (written
+ *     ATOMICALLY — temp+rename, never torn), checked on BOTH enqueue and claim, so a replay or a crash-after-DONE does not re-run the
+ *     handler. But the DONE write is BEST-EFFORT: if it faults (disk full, EIO) the claim is still ack'd (the handler already ran —
+ *     re-running is no safer), so WITHOUT a crash the same `seq`, re-enqueued, CAN re-run the handler. End-to-end exactly-once
+ *     therefore relies on the SINK being idempotent (writeInbox publishOnce dedups). For a NON-idempotent sink (TG sendMessage,
+ *     which has no idempotency key) this queue is at-least-once — the caller must not treat it as exactly-once.
+ *   - concurrency (DO-P2-1b): the claim name carries the pid, the CLAIM TIME, and a per-drain nonce, so two concurrent drains (even
+ *     in ONE process) never share a claim; the loser of the atomic rename gets ENOENT and skips. The claim time (not the file mtime,
+ *     which is the ENQUEUE time) is the claim-age basis for stale recovery (TGP-8), so a long-queued-then-freshly-claimed item is
+ *     never mistaken for an abandoned claim.
  *   - stuck-recovery (DO-P2-2): a release/ack that fails on a transient FS fault is recorded in the caller's `stuck` set and
  *     re-attempted each drain (retryStuckQueue), so a live-pid claim is never permanently skipped waiting for the process to exit.
  * Never throws (fail-soft): every entry point swallows IO faults into a return value or a logged no-op.
@@ -29,8 +32,8 @@ export type EnqueueResult = "enqueued" | "already" | "failed";
 const SEQ_PAD = 20;                        // zero-pad width: a lexical sort of <pad>.json is numeric (arrival) order
 const STALE_CLAIM_MS = 5 * 60_000;         // a claim older than this is reclaimed even if its pid looks alive (a drain that broke out)
 const DONE_TTL_MS = 24 * 60 * 60_000;      // DONE markers older than this are pruned (bounded disk) — well past any live retry window
-const CLAIM_SUFFIX = /\.sending-\d+\.[0-9a-f]+$/; // <pad>.json.sending-<pid>.<nonce>
-const CLAIM_RE = /^(.*\.json)\.sending-(\d+)\.[0-9a-f]+$/;
+const CLAIM_SUFFIX = /\.sending-\d+-\d+\.[0-9a-f]+$/; // <pad>.json.sending-<pid>-<claimMs>.<nonce>
+const CLAIM_RE = /^(.*\.json)\.sending-(\d+)-(\d+)\.[0-9a-f]+$/; // 1=base .json, 2=pid, 3=claimMs
 const PENDING_RE = new RegExp(`^\\d{${SEQ_PAD}}\\.json$`);
 
 const doneDir = (dir: string): string => path.join(dir, "done");
@@ -55,7 +58,15 @@ function markerState(p: string): "present" | "absent" | "unknown" {
   try { lstatSync(p); return "present"; } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
 }
 function writeDone(dir: string, stem: string): void {
-  try { mkdirSync(doneDir(dir), { recursive: true, mode: 0o700 }); writeFileSync(path.join(doneDir(dir), stem), "", { flag: "a", mode: 0o600 }); } catch { /* best-effort: a missed marker only risks a re-run, never a loss */ }
+  // ATOMIC (temp+rename) so the DONE marker is all-or-nothing — never a torn/partial file a later probe would misread. Still
+  // BEST-EFFORT on fault (see the module header): a missed marker only risks a re-run (dedup falls to the sink), never a loss.
+  try {
+    mkdirSync(doneDir(dir), { recursive: true, mode: 0o700 });
+    const p = path.join(doneDir(dir), stem);
+    const tmp = `${p}.tmp-${randomBytes(4).toString("hex")}`;
+    writeFileSync(tmp, "", { mode: 0o600 });
+    renameSync(tmp, p);
+  } catch { /* best-effort */ }
 }
 function pruneDone(dir: string): void {
   let names: string[];
@@ -92,11 +103,11 @@ export function recoverStaleQueueClaims(dir: string, isAlive: (pid: number) => b
   for (const n of names) {
     const m = CLAIM_RE.exec(n);
     if (!m) continue;
-    const full = path.join(dir, n);
-    let stale = !isAlive(Number(m[2]));
-    if (!stale) { try { stale = now - statSync(full).mtimeMs > STALE_CLAIM_MS; } catch { stale = false; } } // live pid, but abandoned long enough
+    // TGP-8: the claim AGE is the CLAIM TIME encoded in the name (m[3], set atomically at claim), NOT the file mtime (which is the
+    // ENQUEUE time — a long-queued item freshly claimed would otherwise look instantly stale). Reclaim iff owner dead OR held too long.
+    const stale = !isAlive(Number(m[2])) || (now - Number(m[3]) > STALE_CLAIM_MS);
     if (!stale) continue;
-    try { renameSync(full, path.join(dir, m[1]!)); } catch { /* raced / gone ⇒ skip */ }
+    try { renameSync(path.join(dir, n), path.join(dir, m[1]!)); } catch { /* raced / gone ⇒ skip */ }
   }
 }
 
@@ -152,7 +163,7 @@ export async function drainQueue(
   for (const n of names) {
     if (claimed >= cap) break;
     const jsonPath = path.join(dir, n);
-    const claimPath = `${jsonPath}.sending-${process.pid}.${randomBytes(6).toString("hex")}`; // DO-P2-1b: unique per drain call
+    const claimPath = `${jsonPath}.sending-${process.pid}-${Date.now()}.${randomBytes(6).toString("hex")}`; // pid + claim-time + nonce (DO-P2-1b unique; TGP-8 age=claim-time)
     try { renameSync(jsonPath, claimPath); } catch { continue; } // ENOENT ⇒ another drainer took it ⇒ skip
     claimed += 1;
     const stem = n.slice(0, SEQ_PAD);

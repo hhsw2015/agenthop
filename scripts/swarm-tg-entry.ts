@@ -15,7 +15,7 @@ import https from "node:https";
 import http from "node:http";
 import tls from "node:tls";
 import { createHash } from "node:crypto";
-import { renderProjection, parseUpdate, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, obligationReceiptValue, tgReceiptObligationDir, tgIdempotencyKey, TG_ACK_TEXT, type RenderSpec, type TgUpdate, type ReceiptObligation } from "../packages/bus/src/swarm/tg-entry.js";
+import { renderProjection, parseUpdate, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, obligationReceiptValue, tgReceiptObligationDir, srcTag, tgIdempotencyKey, TG_ACK_TEXT, type RenderSpec, type TgUpdate, type ReceiptObligation } from "../packages/bus/src/swarm/tg-entry.js";
 import { listBatchesStrict, readBatch, readConsumedResult, recordDecision } from "../packages/bus/src/swarm/decision-batch-store.js";
 import { enqueueQueue, drainQueue } from "../packages/bus/src/swarm/tg-queue.js";
 import { enforceScope, type Verdict, type ApprovalScope } from "../packages/bus/src/swarm/decision-batch.js";
@@ -236,7 +236,9 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
     try { resolved = resolveRef(r.ref); }
     catch (e) { console.error(`swarm-tg-entry: ref lookup read error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return; }
     if (!resolved) { writeOffset(u.update_id + 1); await ack("expired"); continue; } // CONFIRMED gone/ambiguous -> terminal
-    const decision = { id: resolved.itemId, verdict: r.verdict as Verdict, ...(r.scope ? { scope: r.scope as ApprovalScope } : {}) };
+    // TGP-4 (TG-r6): stamp the decision's `reason` with this event's identity tag, so the SAME atomic ledger commit that records the
+    // verdict also carries which TG update made it — enabling EVENT-BOUND receipt recovery after a lost obligation (see below).
+    const decision = { id: resolved.itemId, verdict: r.verdict as Verdict, reason: srcTag(u.update_id), ...(r.scope ? { scope: r.scope as ApprovalScope } : {}) };
     let outcome: "recorded" | "consumed" | "unknown-item" | "contended";
     try { outcome = recordDecision(HOME, resolved.batchId, decision, Math.floor(Date.now() / 1000)); }
     catch (e) { console.error(`swarm-tg-entry: recordDecision transient error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return; } // transient IO -> retry this update next poll
@@ -256,6 +258,23 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
       } catch { return; } // transient batch read ⇒ retry
       const ob: ReceiptObligation = { updateId: u.update_id, batchId: resolved.batchId, itemId: resolved.itemId, recordedValue: { verdict: mine.verdict, ...(mine.scope ? { scope: mine.scope } : {}) } };
       if (enqueueQueue(tgReceiptObligationDir(HOME), ob, u.update_id) === "failed") return; // can't persist the obligation ⇒ hold offset, retry
+    } else if (outcome === "consumed") {
+      // TGP-4 (TG-r6) EVENT-BOUND RECOVERY: the obligation may have been LOST before it was durable — an enqueue IO-failure above, or
+      // a crash between recordDecision and the enqueue. The batch is now sealed, but THIS event's identity is in the sealed ledger
+      // (we stamped `reason` into the recorded decision). Read the AUTHORITATIVE consumed result (digest-verified claim, not the fold):
+      // iff the item's final decision was written by THIS update (reason === srcTag), re-capture its obligation so the receipt is
+      // STILL delivered — provably this event's, never by value-equality. A mismatch/absent ⇒ this tap was superseded or never the
+      // final ⇒ owe nothing. "unknown" (sealed-but-unreadable) ⇒ retry. A read fault ⇒ retry (never a false "not ours").
+      let cr: ReturnType<typeof readConsumedResult>;
+      try { cr = readConsumedResult(HOME, resolved.batchId); } catch { return; }
+      if (cr.consumed === "unknown") return; // can't verify the authority yet ⇒ hold offset, retry
+      if (cr.consumed === true) {
+        const d = cr.doc.decisions.find((x) => x.id === resolved.itemId);
+        if (d && d.reason === srcTag(u.update_id)) {
+          const ob: ReceiptObligation = { updateId: u.update_id, batchId: resolved.batchId, itemId: resolved.itemId, recordedValue: { verdict: d.verdict, ...(d.scope ? { scope: d.scope } : {}) } };
+          if (enqueueQueue(tgReceiptObligationDir(HOME), ob, u.update_id) === "failed") return; // can't persist ⇒ retry (DONE marker makes it idempotent)
+        }
+      }
     }
     writeOffset(u.update_id + 1); // terminal (the obligation, if any, is durable)
     await ack(outcome === "recorded" ? "recorded" : outcome === "consumed" ? "already decided" : "unknown");

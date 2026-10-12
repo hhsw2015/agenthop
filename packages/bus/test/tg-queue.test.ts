@@ -3,7 +3,7 @@
 // seq-keyed (a monotonic numeric event id — the TG update_id for pending): FIFO by seq, lossless identity, a durable DONE ledger,
 // unique per-drain claims, read-error-release / corrupt-quarantine, and stuck-release retry.
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, renameSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, renameSync, existsSync, utimesSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { enqueueQueue, drainQueue, recoverStaleQueueClaims, retryStuckQueue, pidAlive } from "../src/swarm/tg-queue.js";
@@ -87,7 +87,7 @@ describe("tg-queue crash-recovery (DO-P1-1)", () => {
   test("a claim left by a crashed (dead) drainer is reclaimed and re-delivered", async () => {
     enqueueQueue(DIR, { chatId: 1, text: "survive" }, 7);
     const [name] = pendingFiles(DIR);
-    renameSync(path.join(DIR, name!), path.join(DIR, `${name}.sending-999999.abcdef`)); // crash mid-handle
+    renameSync(path.join(DIR, name!), path.join(DIR, `${name}.sending-999999-1000.abcdef`)); // crash mid-handle (dead pid, claim-time 1000)
     expect(pendingFiles(DIR).length).toBe(0);
     const seen: unknown[] = [];
     const r = await drainQueue(DIR, (rec) => { seen.push(rec); return "sent"; }, { isAlive: DEAD });
@@ -97,12 +97,12 @@ describe("tg-queue crash-recovery (DO-P1-1)", () => {
 
   test("recoverStaleQueueClaims restores a dead-pid claim, leaves a fresh live-pid claim", () => {
     enqueueQueue(DIR, { a: 1 }, 1); const [n1] = pendingFiles(DIR);
-    renameSync(path.join(DIR, n1!), path.join(DIR, `${n1}.sending-111.aaaaaa`));
+    renameSync(path.join(DIR, n1!), path.join(DIR, `${n1}.sending-111-1000.aaaaaa`)); // dead pid, old claim-time
     enqueueQueue(DIR, { a: 2 }, 2); const n2 = pendingFiles(DIR).find((n) => n.startsWith("0000"))!;
-    renameSync(path.join(DIR, n2), path.join(DIR, `${n2}.sending-222.bbbbbb`));
-    recoverStaleQueueClaims(DIR, (pid) => pid === 222); // 111 dead, 222 alive (and fresh)
+    renameSync(path.join(DIR, n2), path.join(DIR, `${n2}.sending-222-${Date.now()}.bbbbbb`)); // alive pid, FRESH claim-time
+    recoverStaleQueueClaims(DIR, (pid) => pid === 222); // 111 dead → reclaimed; 222 alive + fresh → left alone
     expect(pendingFiles(DIR)).toContain(n1);
-    expect(allFiles(DIR)).toContain(`${n2}.sending-222.bbbbbb`);
+    expect(allFiles(DIR).some((n) => n.startsWith(`${n2}.sending-222-`))).toBe(true);
   });
 });
 
@@ -157,7 +157,7 @@ describe("tg-queue stuck-release retry (DO-P2-2)", () => {
   test("retryStuckQueue re-releases a claim whose rename-back faulted earlier", () => {
     enqueueQueue(DIR, { x: 1 }, 1);
     const [n] = pendingFiles(DIR);
-    const claim = path.join(DIR, `${n}.sending-${process.pid}.cccccc`);
+    const claim = path.join(DIR, `${n}.sending-${process.pid}-${Date.now()}.cccccc`);
     renameSync(path.join(DIR, n!), claim); // a live-pid claim whose release "failed"
     const stuck = new Set<string>([claim]);
     retryStuckQueue(DIR, stuck); // the fault has cleared ⇒ it releases now
@@ -166,9 +166,36 @@ describe("tg-queue stuck-release retry (DO-P2-2)", () => {
   });
 
   test("a vanished stuck claim is cleared from the set (no infinite retry)", () => {
-    const stuck = new Set<string>([path.join(DIR, "00000000000000000009.json.sending-1.zzzzzz")]);
+    const stuck = new Set<string>([path.join(DIR, "00000000000000000009.json.sending-1-1000.zzzzzz")]);
     retryStuckQueue(DIR, stuck);
     expect(stuck.size).toBe(0);
+  });
+});
+
+// ── TGP-8: a long-QUEUED item freshly CLAIMED is not mistaken for a stale claim (claim age = claim time, not enqueue mtime) ──────
+describe("tg-queue claim-age is claim-time not enqueue-mtime (TGP-8)", () => {
+  test("a backlogged pending, freshly claimed by a live pid, is NOT reclaimed by a concurrent recovery", () => {
+    enqueueQueue(DIR, { x: 1 }, 1);
+    const [n] = pendingFiles(DIR);
+    // backdate the pending file's mtime to 10 minutes ago (a long-queued backlog item).
+    const old = Date.now() - 10 * 60_000;
+    utimesSync(path.join(DIR, n!), old / 1000, old / 1000);
+    // a live-pid drain claims it NOW (fresh claim-time in the name).
+    const claim = `${n}.sending-${process.pid}-${Date.now()}.abc123`;
+    renameSync(path.join(DIR, n!), path.join(DIR, claim));
+    // a concurrent recovery (pid alive) must NOT reclaim it: the claim was taken seconds ago, not 5+ min ago.
+    recoverStaleQueueClaims(DIR, () => true);
+    expect(allFiles(DIR)).toContain(claim); // still held, not wrongly reclaimed
+    expect(pendingFiles(DIR)).toEqual([]);
+  });
+
+  test("a genuinely old claim (claim-time 6 min ago) on a live pid IS reclaimed", () => {
+    enqueueQueue(DIR, { x: 1 }, 2);
+    const [n] = pendingFiles(DIR);
+    const oldClaimMs = Date.now() - 6 * 60_000;
+    renameSync(path.join(DIR, n!), path.join(DIR, `${n}.sending-${process.pid}-${oldClaimMs}.def456`));
+    recoverStaleQueueClaims(DIR, () => true); // pid alive, but held > STALE_CLAIM_MS ⇒ reclaim
+    expect(pendingFiles(DIR)).toContain(n);
   });
 });
 
