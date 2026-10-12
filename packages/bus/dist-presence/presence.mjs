@@ -56835,6 +56835,37 @@ var inboxWakeHook = null;
 function setInboxWakeHook(hook) {
   inboxWakeHook = hook;
 }
+function publishUniqueAtomic(dir, data, ts, randHex = () => randomBytes6(8).toString("hex")) {
+  let tmp = "";
+  for (let t2 = 0;; t2++) {
+    tmp = path14.join(dir, `.wtmp-${randHex()}`);
+    try {
+      writeFileSync5(tmp, data, { flag: "wx", mode: 384 });
+      break;
+    } catch (e) {
+      if (e.code === "EEXIST" && t2 < 8)
+        continue;
+      throw e;
+    }
+  }
+  try {
+    for (let attempt = 0;; attempt++) {
+      const file = path14.join(dir, `${ts.toString().padStart(16, "0")}-${randHex()}.json`);
+      try {
+        linkSync(tmp, file);
+        return file;
+      } catch (e) {
+        if (e.code === "EEXIST" && attempt < 8)
+          continue;
+        throw e;
+      }
+    }
+  } finally {
+    try {
+      unlinkSync3(tmp);
+    } catch {}
+  }
+}
 function writeInbox(home, key, msg, idempotencyKey) {
   const valid = validInboxMsg(msg);
   if (valid === null)
@@ -56845,11 +56876,7 @@ function writeInbox(home, key, msg, idempotencyKey) {
   if (idempotencyKey !== undefined && /^[A-Za-z0-9._-]{1,120}$/.test(idempotencyKey)) {
     result = publishOnce(dir, idempotencyKey, valid);
   } else {
-    const base = `${valid.ts.toString().padStart(16, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
-    const file = path14.join(dir, base);
-    const tmp = `${file}.tmp-${Math.random().toString(36).slice(2, 8)}`;
-    writeFileSync5(tmp, JSON.stringify(valid), { mode: 384 });
-    renameSync3(tmp, file);
+    publishUniqueAtomic(dir, JSON.stringify(valid), valid.ts);
     result = "published";
   }
   if (result === "published" && inboxWakeHook !== null) {
