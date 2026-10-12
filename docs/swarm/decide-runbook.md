@@ -1,8 +1,10 @@
 # decide — 决策批生产 runbook(协调者侧)
 
-北极星差距③:decision-batch 后端 + `console/decisions` 投影 + swarm-console mod 呈批卡**全链已 live**,但生产端缺一个口子——协调者凡向 user 呈批的事项(启用旗、立项裁点、风险签字)应**落 decision-batch**,而不是只写进 PROGRESS 散文。`scripts/decide.ts` 补上这个生产口:它是 `openBatch`(已签 store 写面)的薄前端,**零新 store 写面**。
+北极星差距③:decision-batch 后端 + `console/decisions` 投影 + swarm-console mod 呈批卡**各组件均已落地**,但生产端缺一个口子——协调者凡向 user 呈批的事项(启用旗、立项裁点、风险签字)应**落 decision-batch**,而不是只写进 PROGRESS 散文。`scripts/decide.ts` 补上这个生产口:它是 `openBatch`(已签 store 写面)的薄前端,**零新 store 写面**。
 
-三个分开的角色:**生产(decide)/ 消费(consumeDecisions 读回 user 裁决并返回 resolved)/ 业务执行(协调者据 resolved 动手)**。`decide` 只做第一个。
+**已实证到的链段**:`decide submit → openBatch → writeConsoleProjection → console-decisions/v1 信封 → decide list / mod 卡片渲染`(隔离库 + 真会话 tmux)。**尚待真会话验收**:数字键→面板原生焦点→user 发送→入库,以及协调者的业务执行——"组件已在"不等于"整条原生交互链已验收"。
+
+三个分开的角色:**生产(decide)/ 消费(consumeDecisions 读回 user 裁决并返回 `{resolved, undecided, unknownIds}`)/ 业务执行(协调者据 `actionable(resolved)` 动手)**。`decide` 只做第一个。
 
 ## 全链
 
@@ -11,11 +13,13 @@ decide submit  →  openBatch(已签)写 ~/.agenthop/console/decision-batches/<i
                →  sweep 的 writeConsoleProjection 镜像到 ~/.agenthop/swarm/console/decisions/<id>.json(信封 console-decisions/v1)
                →  swarm-console mod 渲呈批卡(/swarm 面板)
                →  user 数字键预填答复、自己发送
-               →  consumeDecisions(已签)恰好一次读回裁决,返回 resolved(approve/reject)+ undecided + deferred
-               →  协调者据 resolved 执行业务动作(启用旗/立项/签字),把 undecided+deferred 重新组批
+               →  consumeDecisions(已签)恰好一次读回裁决,返回 {resolved, undecided, unknownIds}
+                  (resolved 含 approve/reject/**defer**——defer 是显式"稍后再问"也算已决,留在 resolved;**无独立 deferred 字段**)
+               →  协调者对 actionable(resolved)(= resolved 滤掉 defer)执行业务动作(启用旗/立项/签字),
+                  把 undecided + resolved 里的 defer 重新组批
 ```
 
-`decide` 只做**第一步(生产)**。消费(consumeDecisions:读回裁决、返回 resolved,**不替协调者执行业务**)与投影(writeConsoleProjection,在 dispatcher sweep 内,SWARM_CONSOLE 默认开)都已在,不归 `decide`;业务执行归协调者。
+`decide` 只做**第一步(生产)**。消费(consumeDecisions:读回裁决、返回 `{resolved, undecided, unknownIds}`;`actionable(resolved)` 选当前要执行的 approve/reject,**不替协调者执行业务**)与投影(writeConsoleProjection,在 dispatcher sweep 内,SWARM_CONSOLE 默认开)都已在,不归 `decide`;业务执行归协调者。
 
 ## 用法
 

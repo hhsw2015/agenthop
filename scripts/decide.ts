@@ -132,6 +132,23 @@ function readSource(src: string): string {
 }
 const nowSec = (): number => Math.floor(Date.now() / 1000);
 
+/** Single-quote a value for a copy-paste shell hint (wraps and escapes embedded quotes). */
+function shq(v: string): string { return `'${v.replace(/'/g, "'\\''")}'`; }
+
+/** DEC-P2-1: the recovery hint reconstructs the user's ORIGINAL command — the same source and EVERY flag they passed (owner,
+ *  notify, home) — and only APPENDS the resolved --batch-id. Dropping a flag breaks the retry: without --owner it exits 2
+ *  (owner missing); without the original --home it idempotently rebuilds the SAME id in the DEFAULT dir and notifies there,
+ *  never finishing the original dir's notify. A stdin source cannot be replayed, so it is called out. */
+export function retryHint(q: Extract<Query, { mode: "submit" }>, batchId: string): string {
+  const parts = ["decide submit", shq(q.src)];
+  if (q.owner) parts.push("--owner", shq(q.owner));     // only if it was a FLAG; a JSON owner is re-read from the same source
+  if (q.notifyTo) parts.push("--notify", shq(q.notifyTo));
+  if (q.home) parts.push("--home", shq(q.home));         // the original data root — the id is only idempotent WITH it
+  parts.push("--batch-id", batchId);
+  const base = parts.join(" ");
+  return q.src === "-" ? `${base}   (re-provide the original input on stdin — it cannot be replayed)` : base;
+}
+
 /** DEC-P2-2: read the store's OWN notify credential (`notified.sent`, written AFTER a confirmed send) read-only, so the CLI
  *  reports the ACTUAL delivered target — not the requested one. A re-notify to a different target on an existing batch is an
  *  at-most-once no-op, so the credential still names the FIRST target; we must report that fact, never the request. Fail-soft:
@@ -179,10 +196,10 @@ function run(argv: readonly string[]): number {
     batch = openBatch(home, { batchId, owner: parsed.batch.owner, items: parsed.batch.items, nowSec: nowSec(), ...(notifyTo ? { notifyTo } : {}) });
   } catch (e) {
     // The batch may already be SAVED (openBatch writes before it notifies). Hand back the id so the retry reuses it (idempotent on
-    // batchId — never a duplicate), and name the phase that failed.
+    // batchId — never a duplicate), and reconstruct the ORIGINAL command + --batch-id so the retry hits the same dir/owner/notify.
     const saved = (() => { try { return readBatch(home, batchId) !== null; } catch { return false; } })();
     process.stderr.write(`decide: openBatch failed for ${batchId}: ${e instanceof Error ? e.message : String(e)}\n` +
-      (saved ? `decide: the batch WAS saved; the notify phase failed. Retry to finish the notify (idempotent): decide submit <same input> --batch-id ${batchId}${notifyTo ? ` --notify ${notifyTo}` : ""}\n` : "") );
+      (saved ? `decide: the batch WAS saved; the notify phase failed. Retry to finish the notify (idempotent):\n  ${retryHint(q, batchId)}\n` : "") );
     return 1;
   }
   // DEC-P2-2: report the ACTUAL notify credential, not the requested target.

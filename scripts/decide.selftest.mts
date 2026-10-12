@@ -1,6 +1,6 @@
 // Selftest for decide.ts PURE core (classifyArgs + parseSubmitInput). Run: tsx scripts/decide.selftest.mts
 // The IO (openBatch/listBatches) is the SIGNED store — exercised by the sandbox loop proof, not here.
-import { classifyArgs, parseSubmitInput } from "./decide.js";
+import { classifyArgs, parseSubmitInput, retryHint } from "./decide.js";
 
 let pass = 0;
 const ok = (cond: boolean, msg: string): void => { if (!cond) { console.error(`FAIL ${msg}`); process.exit(1); } pass++; console.log(`ok  ${msg}`); };
@@ -63,6 +63,26 @@ const ok = (cond: boolean, msg: string): void => { if (!cond) { console.error(`F
   // a valid item keeps optional fields clean
   const clean = parseSubmitInput('[{"id":"a","kind":"k","summary":"s","suggestedAction":"g"}]', { owner: "c" });
   ok(clean.ok && !("evidenceRef" in clean.batch.items[0]!) && !("hardGate" in clean.batch.items[0]!), "parse: optional item fields omitted when absent");
+}
+
+// ── retryHint (DEC-P2-1): the recovery command preserves the ORIGINAL flags + appends --batch-id ──
+{
+  // example 1: bare items + --owner flag ⇒ hint keeps --owner (without it the retry exits 2).
+  const q1 = classifyArgs(["submit", "items.json", "--owner", "coord", "--notify", "box"]);
+  const h1 = q1.mode === "submit" ? retryHint(q1, "batch-1") : "";
+  ok(h1.includes("items.json") && h1.includes("--owner 'coord'") && h1.includes("--notify 'box'") && h1.includes("--batch-id batch-1"), "retryHint: keeps --owner/--notify + appends id (example 1)");
+  // example 2: custom --home + JSON owner (no --owner flag) ⇒ hint keeps --home, omits --owner (re-read from the source).
+  const q2 = classifyArgs(["submit", "items.json", "--home", "/tmp/h"]);
+  const h2 = q2.mode === "submit" ? retryHint(q2, "batch-2") : "";
+  ok(h2.includes("--home '/tmp/h'") && !h2.includes("--owner") && h2.includes("--batch-id batch-2"), "retryHint: keeps --home, omits a JSON-only owner (example 2)");
+  // stdin source cannot be replayed ⇒ called out.
+  const q3 = classifyArgs(["submit", "-", "--owner", "coord"]);
+  const h3 = q3.mode === "submit" ? retryHint(q3, "batch-3") : "";
+  ok(h3.includes("submit '-'") && h3.includes("stdin"), "retryHint: stdin source ⇒ note that input must be re-provided");
+  // a value with a quote is shell-escaped.
+  const q4 = classifyArgs(["submit", "f.json", "--owner", "a'b"]);
+  const h4 = q4.mode === "submit" ? retryHint(q4, "b4") : "";
+  ok(h4.includes("--owner 'a'\\''b'"), "retryHint: single-quote in a value is escaped for copy-paste");
 }
 
 console.log(`\nall decide selftests passed (${pass})`);
