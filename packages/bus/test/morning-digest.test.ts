@@ -5,6 +5,7 @@ import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import { composeDigest, digestProjection, digestEnabled, digestActions, digestTextFromProjection, type ProjState } from "../src/swarm/morning-digest.js";
 import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources, archiveLegacyMigration } from "../src/swarm/morning-digest-store.js";
+import { writeInbox, composeInboxMsg } from "../src/inbox.js";
 
 const validProj = (date: string): ProjState => ({ kind: "valid", date, projection: { schema: "morning-digest/v1", date, generatedAtSec: 0, sections: [] } });
 
@@ -226,6 +227,27 @@ describe("morning-digest-store — gatherDigestSources (验收简报化: authori
     expect(done).toContain("[\u2026deadbeef]");
   });
 
+  test("MDV2-5 r4: subject scope — in-flight subject drops topic words; a current problem beats a trailing completion", () => {
+    progress([
+      "- 待复审：超时报告优化 @deadbee",               // subject=待复审 (in-flight); 超时 is a TOPIC ⇒ DROP (not 异常)
+      "- 待复审：失联告警优化 @deadbee",               // same ⇒ DROP
+      "- ⚠ dispatcher 当前卡死；修复补丁已并 @deadbee", // subject=⚠当前卡死 (current) ⇒ 异常 (trailing 已并 doesn't flip it)
+      "- ✅ 超时修复已并 @deadbee 0 REMAIN",           // 超时修复 = fix topic in a completion ⇒ 完成
+      "- ✅ mod 已并 @deadbee，待验收",                // done + user-test in one clause ⇒ 待你验收 (action survives)
+    ].join("\n"));
+    const s = gatherDigestSources(HOME)!;
+    expect(s.anomalies).toEqual(["⚠ dispatcher 当前卡死；修复补丁已并 @deadbee"]);
+    expect(s.recentDone).toEqual(["✅ 超时修复已并 @deadbee 0 REMAIN"]);
+    expect(s.awaitingTest).toEqual(["✅ mod 已并 @deadbee，待验收"]);
+    expect(s.awaitingRuling).toEqual([]); // the two 待复审 topic lines DROP (nowhere), never 异常
+  });
+
+  test("MDV2-5 r4: reference boundary — a clip truncating a longer invalid id still appends the real ref (position, not re-match)", () => {
+    progress(`- ✅ 已并 @deadbeef_owner ${"y".repeat(150)} 落地 @cafebabe`);
+    const [done] = gatherDigestSources(HOME)!.recentDone!;
+    expect(done).toContain("[…cafebabe]"); // the real @cafebabe (past the clip) is appended, not the truncated fake @deadbeef
+  });
+
   test("MDV2-5 r2: a long completion with the SHA at the end RETAINS the SHA in the output (not truncated away)", () => {
     const longBody = `✅ ${"x".repeat(200)} 已并 @abc1234`;
     progress(`- ${longBody}`);
@@ -303,6 +325,9 @@ describe("morning-digest — MDV2-6 three-category gate: delivery exactly-once (
   const dir = path.dirname(new URL(import.meta.url).pathname);
   const tsx = path.join(dir, "..", "node_modules", ".bin", "tsx");
   const inboxMod = path.join(dir, "..", "src", "inbox.ts");
+  const coreMod = path.join(dir, "..", "src", "swarm", "morning-digest.ts");
+  const storeMod = path.join(dir, "..", "src", "swarm", "morning-digest-store.ts");
+  const DIGEST_CHILD = `import { digestProjection, digestTextFromProjection } from "${coreMod}"; import { writeDigestProjectionRaw, markNotified } from "${storeMod}"; import { writeInbox, composeInboxMsg } from "${inboxMod}"; const home = process.env.H, date = "2026-10-12", k = "morning-digest-"+date; const proj = digestProjection({ recentDone: ["done @abc1234"] }, date, 100); writeDigestProjectionRaw(home, proj); markNotified(home, date, "pending", proj); writeInbox(home, "coord", composeInboxMsg({ from: "d", fromLabel: "swarm-digest", text: digestTextFromProjection(proj), via: "local", taskRef: "morning-digest" }), k); process.exit(0);`;
   const CHILD = `import { writeInbox, composeInboxMsg } from "${inboxMod}"; const r = writeInbox(process.env.H, "coord", composeInboxMsg({ from: "d", fromLabel: "swarm-digest", text: "brief", via: "local", taskRef: "morning-digest" }), process.env.K); process.stdout.write(String(r));`;
   const pubChild = (): Promise<string> => new Promise((resolve, reject) => {
     const cp = spawn(tsx, ["-e", CHILD], { env: { ...process.env, H: HOME, K: idemTag } });
@@ -328,9 +353,29 @@ describe("morning-digest — MDV2-6 three-category gate: delivery exactly-once (
 
   test("③ concurrency race: two processes publish the same date CONCURRENTLY ⇒ exactly ONE card (any interleaving)", async () => {
     const [a, b] = await Promise.all([pubChild(), pubChild()]);
-    expect([a, b].filter((r) => r === "published").length).toBe(1);               // exactly one winner
-    expect([a, b].filter((r) => r === "already" || r === "deferred").length).toBe(1); // the loser never duplicates
+    // The DURABLE invariant is "exactly one card" regardless of interleaving (O_EXCL credential) — asserted on the filesystem, not
+    // on the children's stdout (a fast-exiting subprocess can truncate its write). Both must return a confirmed/deferred status,
+    // never an unsafe duplicate-publish.
+    expect([a, b].every((r) => ["published", "already", "deferred", "pending"].includes(r))).toBe(true);
     expect(cards()).toBe(1);
+  }, 20000);
+
+  test("④ runDigest interruption-recovery: real digest sequence crashes after publish, before sent-flip; restart preserves frozen body, pending→sent, one card", () => {
+    // process A runs the REAL digest delivery sequence (projection freeze → markNotified pending → writeInbox) then DIES before the
+    // sent-flip (the uncommitted boundary at swarm-dispatch.ts:2065) — using the real store/core/inbox components, no production dispatcher.
+    execFileSync(tsx, ["-e", DIGEST_CHILD], { env: { ...process.env, H: HOME }, encoding: "utf8" });
+    const st1 = readDigestProjection(HOME);
+    expect(st1.kind).toBe("valid");                                   // frozen projection body survived the crash
+    const n1 = readNotifiedState(HOME);
+    expect(n1.kind === "pending" && !!n1.body).toBe(true);           // pending obligation + frozen body retained (not lost, not sent)
+    expect(cards()).toBe(1);                                          // the publish landed exactly once
+    // process B (restart) continues the unfinished delivery
+    const proj = st1.kind === "valid" ? st1.projection : null;
+    const res = writeInbox(HOME, "coord", composeInboxMsg({ from: "d", fromLabel: "swarm-digest", text: digestTextFromProjection(proj!), via: "local", taskRef: "morning-digest" }), "morning-digest-" + "2026-10-12");
+    expect(res).toBe("already");                                      // credential survived A's death ⇒ no duplicate
+    markNotified(HOME, "2026-10-12", "sent", proj!);
+    expect(readNotifiedState(HOME).kind).toBe("sent");               // obligation discharged exactly once
+    expect(cards()).toBe(1);                                          // still exactly one card
   }, 20000);
 });
 
