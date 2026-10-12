@@ -31,9 +31,10 @@ import {
 } from "../packages/bus/src/swarm/fleet-recovery.js";
 import {
   captureDispatcherRecipe, dispatcherLive, dispatcherPid, heartbeatFreshSec, captureEnvForPid,
-  writeFleetSnapshot, readFleetSnapshot, readEpisode, writeEpisode, claimRecoverLaunch, breakpointFactsFor,
+  writeFleetSnapshot, readFleetSnapshot, readEpisode, writeEpisode, claimRecoverLaunch, markLaunchOutcome, breakpointFactsFor,
   writeRecoveryReceipt,
 } from "../packages/bus/src/swarm/fleet-recovery-store.js";
+import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
 
 const pexec = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -44,7 +45,7 @@ const shortHash = (s: string) => createHash("sha256").update(s).digest("hex").sl
 const log = (s: string) => console.log(s);
 function home(): string { return process.env.AH_HOME ?? homedir(); }
 function rosterFilePath(h: string): string { return path.join(h, ".agenthop", "swarm", "roster-snapshot.json"); }
-const toMin = (p: PeerLike): PeerLikeMin => ({ ...(p.id ? { id: p.id } : {}), ...(p.stableId ? { stableId: p.stableId } : {}), ...(p.title ? { title: p.title } : {}) });
+const toMin = (p: PeerLike): PeerLikeMin => ({ ...(p.id ? { id: p.id } : {}), ...(p.stableId ? { stableId: p.stableId } : {}), ...(p.title ? { title: p.title } : {}), ...(p.tool ? { tool: p.tool } : {}), ...(p.cwd ? { cwd: p.cwd } : {}) }); // FR-5: carry tool/cwd for the identity triple
 
 /** Launch ONE member via the F36 resume core (herdr when reachable + the command tokenizes cleanly, else Ghostty). Async; returns
  *  {ok}. Mirrors swarm-resume's launch branch, driven per-member so the caller can claim ownership first (FR-6). */
@@ -127,6 +128,11 @@ async function main(): Promise<void> {
   }
 
   // --- wire real deps + run the orchestration -----------------------------------------------------------------------
+  // FR-6: serialize recover with a single-flight lock — a SECOND concurrent recover exits cleanly, so two processes can never mint
+  // rival episodes and double-launch the same member (episode identity is established single-threaded under this lock).
+  const releaseLock = acquireSingleFlight(path.join(H, ".agenthop", "swarm", "recover.lock"));
+  if (!releaseLock) { log(`recover: another recover is already running (single-flight) — exiting.`); return; }
+
   const core = startBusCore({ home: H });
   await sleep(1200); // let the broker/relay announce before the first peer read
   const useHerdr = herdrSpawnable(process.env) && (await herdrServerReachable());
@@ -137,12 +143,11 @@ async function main(): Promise<void> {
   const deps: RecoverDeps = {
     now: nowSec,
     mintEpisodeId: () => `ep-${nowSec()}-${randomBytes(3).toString("hex")}`,
-    episodeStaleWindowSec: 1800,
     heartbeatThresholdSec: 120,
     breakpointsEnabled: breakpointInjectionEnabled(),
     recoveredAtIso: recoveredIso,
     readEpisode: () => readEpisode(H),
-    writeEpisode: (ep) => { writeEpisode(H, ep); },
+    writeEpisode: (ep) => writeEpisode(H, ep), // FR-8: returns success (not swallowed)
     dispatcherLive: () => dispatcherLive(H),
     relaunchDispatcher,
     verifyDispatcher: () => {
@@ -155,6 +160,7 @@ async function main(): Promise<void> {
     settle: () => sleep(5000),
     claimLaunch: (memberKey, episodeId) => claimRecoverLaunch(H, memberKey, episodeId),
     launchMember: async (m) => { const full = fullByMember.get(m.member); if (!full) return { ok: false, error: "no roster entry" }; return launchOneMember(full, useHerdr, taken); },
+    markLaunchOutcome: (memberKey, episodeId, ok) => markLaunchOutcome(H, memberKey, episodeId, ok), // FR-8: record outcome (pending→launched|failed)
     breakpointFacts: (sid) => breakpointFactsFor(H, sid),
     deliverBreakpoint: (sid, text, episodeId) => {
       try { const msg = composeInboxMsg({ from: "fleet-recovery", fromLabel: "swarm-recover", text, via: "fleet-recovery", intent: "fyi" }); return writeInbox(H, sid, msg, `fr-bp-${episodeId}-${shortHash(sid)}`) as DeliveryStatus; }
@@ -164,23 +170,25 @@ async function main(): Promise<void> {
       if (!coordRef) { log(`  SWARM_COORDINATOR unset — report to disk only.`); return "skipped"; }
       const coordSid = resolveSession(coordRef, listSessions(H));
       if (!coordSid) { log(`  FR-5: coordinator '${coordRef}' did not resolve to a live SID — NOT writing to a bare handle box; report on disk only.`); return "failed"; }
-      const text = reportText(result, stale, recoveredIso);
+      const text = reportText(result, stale, recoveredIso); // FR-8: the REAL result (real outstanding/notConfirmed), never a zeroed placeholder
       try { const msg = composeInboxMsg({ from: "fleet-recovery", fromLabel: "swarm-recover", text, via: "fleet-recovery", intent: result.notConfirmed > 0 ? "report" : "fyi" }); return writeInbox(H, coordSid, msg, `fr-report-${episodeId}`) as DeliveryStatus; }
       catch { return "failed"; }
     },
+    // FR-8: the durable receipt is part of the completion criteria — a refused write ⇒ orchestrateRecover adds it to outstanding (exit≠0).
+    writeReceipt: (result) => writeRecoveryReceipt(H, {
+      episodeId: result.episodeId, recoveredAtSec: nowSec(), snapshotCapturedAtSec: snap.capturedAtSec, staleSec: stale,
+      dispatcher: result.dispatcher, members: result.members, reportDelivery: result.reportDelivery,
+      outstanding: result.outstanding, notConfirmed: result.notConfirmed,
+    }),
   };
 
   let result: RecoveryResult;
   try { result = await orchestrateRecover(snap, rosterLike, deps); }
-  finally { await core.close(); }
+  finally { await core.close(); releaseLock(); } // FR-6: always release the single-flight lock
 
-  // --- durable receipt (records every obligation, FR-8) + exit code reflecting outstanding ---------------------------
-  const wrote = writeRecoveryReceipt(H, {
-    episodeId: result.episodeId, recoveredAtSec: nowSec(), snapshotCapturedAtSec: snap.capturedAtSec, staleSec: stale,
-    dispatcher: result.dispatcher, members: result.members, reportDelivery: result.reportDelivery,
-    outstanding: result.outstanding, notConfirmed: result.notConfirmed,
-  });
-  log(`receipt ${wrote ? "-> console/fleet-recovery.json" : "SKIPPED (CP-3)"}`);
+  // --- outcome (FR-8: the durable receipt is written INSIDE orchestrateRecover via the writeReceipt dep, as part of the completion
+  //     criteria; a refused write shows up as the "receipt:unwritten" outstanding obligation below, never a silent exit0) ----------
+  log(`receipt: ${result.outstanding.includes("receipt:unwritten") ? "UNWRITTEN (CP-3) — outstanding" : "written -> console/fleet-recovery.json"}`);
   const confirmed = result.members.filter((m) => m.verdict === "confirmed").length;
   log(`done: episode ${result.episodeId}; dispatcher ${result.dispatcher.verdict} (wake=${result.dispatcher.wakeStatus ?? "unknown"}); members ${confirmed}/${result.members.length} confirmed; report ${result.reportDelivery}; ${result.outstanding.length} outstanding.`);
   if (result.outstanding.length > 0) { log(`OUTSTANDING (re-run to retry): ${result.outstanding.join("; ")}`); process.exitCode = 1; }

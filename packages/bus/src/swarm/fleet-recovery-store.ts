@@ -23,12 +23,13 @@ import {
   type FleetSnapshot,
   type DispatcherRecipe,
   type RecoveryEpisode,
+  type EpisodeRead,
   type MemberBreakpointFacts,
 } from "./fleet-recovery.js";
-import { parseBoardItemName } from "./task-board.js";
+import { parseBoardItemName, boardItemId } from "./task-board.js";
 import { loadControlLog } from "./control-store.js";
 import { liveEntities } from "./control-log.js";
-import { scanUnclaimedInbox } from "../inbox.js";
+import { scanUnclaimedInbox, inboxDirName } from "../inbox.js";
 
 // --- paths -----------------------------------------------------------------------------------------------------------
 function agenthopDir(home: string): string { return path.join(home, ".agenthop"); }
@@ -151,7 +152,9 @@ export function recordDispatcherRecipe(home: string, nowSec: number): boolean {
   const recipe: DispatcherRecipe & { schema: typeof DISPATCHER_RECIPE_SCHEMA; recordedAtSec: number } = {
     schema: DISPATCHER_RECIPE_SCHEMA,
     recordedAtSec: Number.isFinite(nowSec) ? Math.floor(nowSec) : 0,
-    argv: [...process.argv],
+    // FR-1a: include process.execArgv (the node flags Node strips out of argv — e.g. tsx's --require/--import loader). Without them a
+    // normally-tsx-launched `.ts` dispatcher relaunches as `node script.ts` ⇒ ERR_UNKNOWN_FILE_EXTENSION. Full argv = node + execArgv + script+args.
+    argv: [process.argv[0]!, ...process.execArgv, ...process.argv.slice(1)],
     cwd: process.cwd(),
     env: filterCaptureEnv(process.env),
     source: "self-recorded",
@@ -252,15 +255,17 @@ export function liveAttemptsForItems(home: string, itemIds: readonly string[]): 
   let state;
   try { state = loadControlLog(controlLogDir(home)); }
   catch { return null; } // corrupt/unreadable control-log ⇒ unknown
-  const want = new Set(itemIds);
+  const want = new Set(itemIds); // these are board item ids = boardItemId(jobId, nodeId) = SHA256, NOT raw node names
   const out: string[] = [];
   for (const [key, cb] of Object.entries(liveEntities(state))) {
     if (!key.startsWith("attempt:")) continue;
     const c = cb as { put?: string; attempt?: { attemptId?: string; nodeId?: string; status?: string } };
     const a = c.attempt;
-    if (c.put === "attempt" && a && (a.status === "RUNNING" || a.status === "RESULT_PENDING_VALIDATION") && typeof a.nodeId === "string" && want.has(a.nodeId) && typeof a.attemptId === "string") {
-      out.push(a.attemptId);
-    }
+    if (!(c.put === "attempt" && a && (a.status === "RUNNING" || a.status === "RESULT_PENDING_VALIDATION") && typeof a.nodeId === "string" && typeof a.attemptId === "string")) continue;
+    // FR-10: an attemptId is `${jobId}/${nodeId}/a${n}`; a granted board item is boardItemId(jobId, nodeId). Join via the CANONICAL
+    // board id, NOT the raw nodeId (the r2 bug compared the hashed itemId against a raw node name and found nothing).
+    const jobId = a.attemptId.split("/")[0];
+    if (jobId && want.has(boardItemId(jobId, a.nodeId))) out.push(a.attemptId);
   }
   return out;
 }
@@ -271,28 +276,27 @@ export function breakpointFactsFor(home: string, sid: string): MemberBreakpointF
   const boardNames = readBoardFileNames(home);
   const grantedItems = boardNames === null ? null : grantedItemsForMember(sid, boardNames, parseBoardItemName);
   const liveAttempts = grantedItems === null ? null : liveAttemptsForItems(home, grantedItems);
+  // FR-10: scanUnclaimedInbox swallows an EACCES to {count:0}, so it cannot report "unreadable" — probe the box dir directly first.
+  // ENOENT (no box) ⇒ 0 (a genuine zero); a non-ENOENT fault ⇒ null (unknown, never a false 0).
   let unreadInbox: number | null;
-  try { unreadInbox = scanUnclaimedInbox(home, sid).count; } catch { unreadInbox = null; }
+  try { readdirSync(path.join(home, ".agenthop", "inbox", inboxDirName(sid))); unreadInbox = scanUnclaimedInbox(home, sid).count; }
+  catch (e) { unreadInbox = (e as NodeJS.ErrnoException).code === "ENOENT" ? 0 : null; }
   return { member: sid, grantedItems, liveAttempts, unreadInbox };
 }
 
 // --- FR-7: recovery episode marker ----------------------------------------------------------------------------------
 
-export function readEpisode(home: string): RecoveryEpisode | null {
+export function readEpisode(home: string): EpisodeRead {
   let raw: string;
+  // FR-7: ENOENT ⇒ absent (genuinely no episode); a NON-ENOENT read fault (EACCES) ⇒ unreadable (NOT absent — never re-mint over it).
   try { raw = readFileSync(episodePath(home), "utf8"); }
-  catch { return null; }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" }; }
   let o: unknown;
-  try { o = JSON.parse(raw); } catch { return null; }
-  if (!o || typeof o !== "object") return null;
+  try { o = JSON.parse(raw); } catch { return { kind: "unreadable" }; } // a present-but-corrupt marker is unreadable, not absent
+  if (!o || typeof o !== "object") return { kind: "unreadable" };
   const r = o as Record<string, unknown>;
-  if (typeof r.episodeId !== "string" || typeof r.startedAtSec !== "number" || !Number.isFinite(r.startedAtSec)) return null;
-  return {
-    episodeId: r.episodeId,
-    startedAtSec: r.startedAtSec,
-    snapshotCapturedAtSec: typeof r.snapshotCapturedAtSec === "number" ? r.snapshotCapturedAtSec : 0,
-    completed: r.completed === true,
-  };
+  if (typeof r.episodeId !== "string" || typeof r.startedAtSec !== "number" || !Number.isFinite(r.startedAtSec)) return { kind: "unreadable" };
+  return { kind: "present", ep: { episodeId: r.episodeId, startedAtSec: r.startedAtSec, snapshotCapturedAtSec: typeof r.snapshotCapturedAtSec === "number" ? r.snapshotCapturedAtSec : 0, completed: r.completed === true } };
 }
 
 export function writeEpisode(home: string, ep: RecoveryEpisode): boolean {
@@ -306,13 +310,40 @@ export function writeEpisode(home: string, ep: RecoveryEpisode): boolean {
  *  launched it ⇒ don't double-launch while it is not yet bus-visible) or on any store fault (fail-closed toward NOT launching — a
  *  spurious extra window is worse than a missed re-try, which the next verify+re-run covers). The marker is scoped by episode so a
  *  NEW recovery event (new episodeId) re-claims cleanly. */
+function claimLaunchDir(home: string, episodeId: string): string {
+  return path.join(swarmDir(home), "recover-launch", episodeId.replace(/[^A-Za-z0-9._-]/g, "").slice(0, 64));
+}
+function claimLaunchFile(home: string, episodeId: string, memberKey: string): string {
+  return path.join(claimLaunchDir(home, episodeId), `${createHash("sha256").update(memberKey).digest("hex").slice(0, 32)}.claim`);
+}
+
+/**
+ * FR-8 two-phase launch ownership + FR-9 CP-3. Decide whether to LAUNCH this member now, by the claim file's STATE:
+ *   - no claim        ⇒ create it "pending", return true  (launch now; markLaunchOutcome records the result)
+ *   - "failed"        ⇒ reset to "pending", return true   (a prior EXPLICIT ok:false ⇒ safe to retry — it definitely didn't start)
+ *   - "pending"       ⇒ false  (a claim with no recorded outcome = crash-before-launch-outcome ⇒ UNKNOWN, never a blind double)
+ *   - "launched"      ⇒ false  (launchMember returned ok but not yet bus-visible ⇒ awaiting, never a double)
+ *   - unreadable/CP-3 ⇒ false  (fail-closed toward NOT launching)
+ * FR-9: the CP-3 guard checks the ACTUAL write leaf (recover-launch/<episode>/), so a symlinked recover-launch ancestor is refused.
+ */
 export function claimRecoverLaunch(home: string, memberKey: string, episodeId: string): boolean {
-  if (!boundaryOk(home, swarmDir(home))) return false; // CP-3
-  const dir = path.join(swarmDir(home), "recover-launch", episodeId.replace(/[^A-Za-z0-9._-]/g, "").slice(0, 64));
-  const name = `${createHash("sha256").update(memberKey).digest("hex").slice(0, 32)}.claim`; // safe single path segment
+  const dir = claimLaunchDir(home, episodeId);
+  if (!boundaryOk(home, dir)) return false; // FR-9: guard the real leaf, not just swarmDir
   try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return false; }
-  try { writeFileSync(path.join(dir, name), memberKey, { flag: "wx", mode: 0o600 }); return true; } // wx = O_EXCL single-winner
-  catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") return false; return false; } // already claimed this episode / store fault ⇒ don't launch
+  const file = claimLaunchFile(home, episodeId, memberKey);
+  let state: string | null;
+  try { state = readFileSync(file, "utf8").trim(); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") state = null; else return false; } // unreadable claim ⇒ don't launch
+  if (state === null) { try { writeFileSync(file, "pending", { flag: "wx", mode: 0o600 }); return true; } catch { return false; } } // O_EXCL birth
+  if (state === "failed") { try { writeFileSync(file, "pending", { mode: 0o600 }); return true; } catch { return false; } } // retry an explicit failure
+  return false; // "pending" (outcome unknown) / "launched" (awaiting visibility) ⇒ never double-launch
+}
+
+/** FR-8: record the launch outcome so the claim's state reflects reality — ok ⇒ "launched", ok:false ⇒ "failed" (retryable next run).
+ *  Fail-soft (a write fault leaves the claim "pending" ⇒ next run treats it as unknown, never a double). */
+export function markLaunchOutcome(home: string, memberKey: string, episodeId: string, ok: boolean): void {
+  if (!boundaryOk(home, claimLaunchDir(home, episodeId))) return;
+  try { writeFileSync(claimLaunchFile(home, episodeId, memberKey), ok ? "launched" : "failed", { mode: 0o600 }); } catch { /* fail-soft: stays pending */ }
 }
 
 // --- recovery receipt projection ------------------------------------------------------------------------------------

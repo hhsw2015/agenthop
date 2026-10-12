@@ -63,7 +63,10 @@ export function envAllowed(name: string): boolean {
  *  ⇒ `scheme://host`. SWARM_WORK_REPO is a supported Git URL that the name-denylist cannot protect (the secret is in the value, not
  *  the name). Idempotent, conservative (only touches the userinfo segment of a URL authority). Pure. */
 export function scrubValueSecrets(v: string): string {
-  return v.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/@\s]+)@/g, "$1");
+  // FR-1b (r3): strip ONLY the `:password` part of a URL authority — keep the USER, which is a non-secret ADDRESS component.
+  // `https://user:{{PASSWORD_mcu5s9ca}}@host` ⇒ `https://user@host` (password gone, user kept); `ssh://git@host` has NO password ⇒ UNCHANGED (the
+  // r2 bug stripped `git@`, silently changing the SSH login identity). A `user:pass` match keeps `scheme://user`, drops `:pass`.
+  return v.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/@\s:]*):[^/@\s]+@/g, "$1@");
 }
 
 /** Filter a raw environ into the captured subset: allowlisted by name, credential-scrubbed by value (FR-2), string values only.
@@ -191,17 +194,19 @@ export function memberVerdict(busVisible: boolean, checkinInInbox: boolean, fail
 /** The minimal roster-member shape resolution needs. `member` = the captured id (stableId or handle); `title` = the short handle. */
 export interface RosterMemberLike { member: string; title?: string; tool?: string; cwd?: string }
 /** The minimal live-peer shape. */
-export interface PeerLikeMin { id?: string; stableId?: string; title?: string }
+export interface PeerLikeMin { id?: string; stableId?: string; title?: string; tool?: string; cwd?: string }
 
 export type MemberResolution =
   | { kind: "resolved"; sid: string }   // bound to a unique live peer's native SID
-  | { kind: "ambiguous" }                // >1 live peer matches (e.g. a reused title) ⇒ cannot confirm this member
+  | { kind: "ambiguous" }                // >1 live peer matches ⇒ cannot confirm this member
   | { kind: "absent" };                  // no live peer matches ⇒ not (yet) recovered
 
 /**
- * Resolve a roster member to the UNIQUE live SID actually running it (FR-5). An EXACT id match (the peer's stableId or id equals the
- * captured member id) wins and yields that peer's native SID. Otherwise fall back to the TITLE but ONLY when EXACTLY ONE live peer
- * carries it — a reused title (>1 peer) is AMBIGUOUS (never a false confirm), and zero matches is ABSENT. Pure.
+ * Resolve a roster member to the UNIQUE live SID actually running it (FR-5, r3). An EXACT id match (the peer's stableId or id equals
+ * the captured member id) wins — that is identity continuity, yield that peer's native SID. A TITLE is only a DISPLAY name, so a
+ * title match ALONE is NOT identity: a title-based resolution additionally requires the peer's (tool, cwd) WORKSTATION signature to
+ * match the member's (the r2 bug confirmed a different SID/tool/cwd peer that merely reused the title, delivering the breakpoint to
+ * the wrong box). Exactly one such (title+tool+cwd) peer ⇒ resolved; >1 ⇒ ambiguous; none ⇒ absent. Pure.
  */
 export function resolveMemberSid(member: RosterMemberLike, peers: readonly PeerLikeMin[]): MemberResolution {
   for (const p of peers) {
@@ -209,10 +214,10 @@ export function resolveMemberSid(member: RosterMemberLike, peers: readonly PeerL
       return { kind: "resolved", sid: p.stableId ?? p.id! };
     }
   }
-  if (member.title) {
-    const byTitle = peers.filter((p) => p.title && p.title === member.title);
-    if (byTitle.length === 1) { const p = byTitle[0]!; return { kind: "resolved", sid: p.stableId ?? p.id ?? member.member }; }
-    if (byTitle.length > 1) return { kind: "ambiguous" };
+  if (member.title && member.tool && member.cwd) { // a title match is identity ONLY with the matching workstation signature
+    const sig = peers.filter((p) => p.title === member.title && p.tool === member.tool && p.cwd === member.cwd);
+    if (sig.length === 1) { const p = sig[0]!; return { kind: "resolved", sid: p.stableId ?? p.id ?? member.member }; }
+    if (sig.length > 1) return { kind: "ambiguous" };
   }
   return { kind: "absent" };
 }
@@ -229,16 +234,23 @@ export interface RecoveryEpisode { episodeId: string; startedAtSec: number; snap
  * Reuse iff the existing marker is INCOMPLETE and recent (within staleWindowSec); else mint a fresh id. Pure (the id minter + clock
  * are injected).
  */
-export function resolveEpisodeId(
-  existing: RecoveryEpisode | null,
-  nowSec: number,
-  mint: () => string,
-  staleWindowSec: number,
-): { episodeId: string; reused: boolean } {
-  if (existing && existing.completed === false && Number.isFinite(existing.startedAtSec) && Number.isFinite(nowSec) && nowSec - existing.startedAtSec <= staleWindowSec) {
-    return { episodeId: existing.episodeId, reused: true };
-  }
-  return { episodeId: mint(), reused: false };
+export type EpisodeRead = { kind: "present"; ep: RecoveryEpisode } | { kind: "absent" } | { kind: "unreadable" };
+export type EpisodeDecision = { action: "reuse"; episodeId: string } | { action: "new"; episodeId: string } | { action: "abort"; reason: string };
+
+/**
+ * Decide the recovery episode (FR-7, r3). Three-state read:
+ *   - unreadable (EACCES/corrupt marker) ⇒ ABORT — minting a new id would rename an outstanding recovery's obligation away; a read
+ *     error is NOT "no episode" (FC-2).
+ *   - present + INCOMPLETE ⇒ REUSE, regardless of age — time passing is NOT evidence the prior launch disappeared; the episode's
+ *     obligations persist until it is COMPLETED (so a re-run continues it, never re-mints + double-launches).
+ *   - absent OR present+completed ⇒ NEW (a genuinely new recovery event).
+ * Atomicity across concurrent recover processes (FR-6) is provided by the caller's single-flight lock, so this read-then-decide runs
+ * single-threaded. Pure.
+ */
+export function resolveEpisode(read: EpisodeRead, mint: () => string): EpisodeDecision {
+  if (read.kind === "unreadable") return { action: "abort", reason: "episode marker unreadable — refusing to mint a new episode (would abandon an outstanding recovery)" };
+  if (read.kind === "present" && read.ep.completed === false) return { action: "reuse", episodeId: read.ep.episodeId };
+  return { action: "new", episodeId: mint() };
 }
 
 // ============================================================================================================
@@ -347,12 +359,11 @@ export function summarizeOutstanding(r: Omit<RecoveryResult, "outstanding" | "no
 export interface RecoverDeps {
   now: () => number;
   mintEpisodeId: () => string;
-  episodeStaleWindowSec: number;
   heartbeatThresholdSec: number;
   breakpointsEnabled: boolean;
   recoveredAtIso: string;
-  readEpisode: () => RecoveryEpisode | null;
-  writeEpisode: (ep: RecoveryEpisode) => void;
+  readEpisode: () => EpisodeRead;                    // FR-7: three-state (present/absent/unreadable)
+  writeEpisode: (ep: RecoveryEpisode) => boolean;    // FR-8: returns success — a failed marker write is NEVER swallowed
   dispatcherLive: () => boolean;
   /** Relaunch the dispatcher; MUST be fail-soft (its own async spawn 'error' handled by the shell, FR-8). Return false on a sync fault. */
   relaunchDispatcher: (recipe: DispatcherRecipe) => boolean;
@@ -360,14 +371,20 @@ export interface RecoverDeps {
   verifyDispatcher: () => DispatcherLiveness;
   peers: () => readonly PeerLikeMin[];
   settle: () => Promise<void>;
-  /** FR-6 launch ownership: true iff THIS call won the launch for (member, episode); false ⇒ already attempted this episode ⇒ don't re-launch. */
+  /** FR-8 launch ownership (two-phase): true ⇒ LAUNCH now (no prior claim, or a prior claim that explicitly FAILED ⇒ safe retry);
+   *  false ⇒ SKIP (a claim is pending/launched this episode — never double-launch over an unconfirmed outcome). */
   claimLaunch: (memberKey: string, episodeId: string) => boolean;
   launchMember: (member: RosterMemberLike) => Promise<{ ok: boolean; error?: string }>;
+  /** FR-8: record the launch OUTCOME so a crash between claim and launch stays "pending" (skip, don't double) while an explicit
+   *  ok:false becomes "failed" (safe to retry next run). */
+  markLaunchOutcome: (memberKey: string, episodeId: string, ok: boolean) => void;
   breakpointFacts: (sid: string) => MemberBreakpointFacts;
   /** Deliver the breakpoint; the shell builds the durable idempotency key from (episodeId, sid). */
   deliverBreakpoint: (sid: string, text: string, episodeId: string) => DeliveryStatus;
-  /** Deliver the coordinator report; "skipped" when no coordinator is configured. Shell builds the key from episodeId. */
+  /** Deliver the coordinator report with the REAL result (FR-8: never a zeroed placeholder). "skipped" when no coordinator. */
   deliverReport: (result: RecoveryResult, episodeId: string) => DeliveryStatus;
+  /** FR-8: persist the durable receipt; its success is part of the completion criteria (a refused write ⇒ not completed, exit≠0). */
+  writeReceipt: (result: RecoveryResult) => boolean;
 }
 
 /**
@@ -380,22 +397,30 @@ export interface RecoverDeps {
  */
 export async function orchestrateRecover(snap: FleetSnapshot, roster: readonly RosterMemberLike[], deps: RecoverDeps): Promise<RecoveryResult> {
   const nowSec = deps.now();
-  const existing = deps.readEpisode();
-  const { episodeId, reused } = resolveEpisodeId(existing, nowSec, deps.mintEpisodeId, deps.episodeStaleWindowSec);
-  const startedAtSec = reused && existing ? existing.startedAtSec : nowSec;
-  deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: false });
+  const emptyDisp = { relaunched: false, verdict: "unknown" as OpsVerdict, wakeStatus: null };
 
-  // 1) dispatcher first
-  let relaunched = false;
-  if (dispatcherNeedsRelaunch(snap, deps.dispatcherLive()) && snap.dispatcher) {
-    relaunched = deps.relaunchDispatcher(snap.dispatcher); // fail-soft; the verdict below reflects whether it actually came up
+  // FR-7: episode identity (three-state). unreadable ⇒ ABORT (never re-mint over an outstanding recovery). The caller's single-flight
+  // lock (FR-6) serializes recover, so this read-then-write is race-free.
+  const read = deps.readEpisode();
+  const decision = resolveEpisode(read, deps.mintEpisodeId);
+  if (decision.action === "abort") return { episodeId: "", dispatcher: emptyDisp, members: [], reportDelivery: "skipped", outstanding: [`episode:${decision.reason}`], notConfirmed: 1 };
+  const episodeId = decision.episodeId;
+  const startedAtSec = decision.action === "reuse" && read.kind === "present" ? read.ep.startedAtSec : nowSec;
+  // FR-8: a failed episode-marker write is NOT swallowed — without the marker the claim namespace cannot be established, so abort.
+  if (!deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: false })) {
+    return { episodeId, dispatcher: emptyDisp, members: [], reportDelivery: "skipped", outstanding: ["episode-marker:unwritten"], notConfirmed: 1 };
   }
 
-  // 2) members: launch each ABSENT one under a per-episode ownership claim (FR-6: never double-launch on re-run/concurrency)
+  // 1) dispatcher first (fail-soft; the verdict below reflects whether it actually came up)
+  let relaunched = false;
+  if (dispatcherNeedsRelaunch(snap, deps.dispatcherLive()) && snap.dispatcher) relaunched = deps.relaunchDispatcher(snap.dispatcher);
+
+  // 2) members: launch each ABSENT one under the FR-8 two-phase claim (claim pending → launch → record outcome). claimLaunch returns
+  //    false for a pending/launched claim (crash-before-outcome / launched-not-yet-visible) ⇒ NEVER a blind double-launch.
   const peersBefore = deps.peers();
   for (const m of roster) {
-    if (resolveMemberSid(m, peersBefore).kind !== "absent") continue; // already up (resolved) or ambiguous ⇒ don't launch
-    if (deps.claimLaunch(m.member, episodeId)) await deps.launchMember(m); // won the claim ⇒ launch; else already attempted this episode ⇒ skip
+    if (resolveMemberSid(m, peersBefore).kind !== "absent") continue;
+    if (deps.claimLaunch(m.member, episodeId)) { const r = await deps.launchMember(m); deps.markLaunchOutcome(m.member, episodeId, r.ok); }
   }
 
   // 3) settle, then VERIFY against the unique live SID (FR-5) + the TARGET-only dispatcher wake (FR-3)
@@ -408,20 +433,25 @@ export async function orchestrateRecover(snap: FleetSnapshot, roster: readonly R
     const verdict: OpsVerdict = res.kind === "resolved" ? memberVerdict(true, false, false) : memberVerdict(false, false, false); // ambiguous/absent ⇒ unknown
     let breakpoint: DeliveryStatus = "skipped";
     if (res.kind === "resolved" && shouldInjectBreakpoint(verdict, deps.breakpointsEnabled)) {
-      const text = buildBreakpointText(deps.breakpointFacts(res.sid), deps.recoveredAtIso);
-      breakpoint = deps.deliverBreakpoint(res.sid, text, episodeId);
+      breakpoint = deps.deliverBreakpoint(res.sid, buildBreakpointText(deps.breakpointFacts(res.sid), deps.recoveredAtIso), episodeId);
     }
     return { member: m.member, ...(m.title ? { title: m.title } : {}), resolution: res.kind, ...(res.kind === "resolved" ? { sid: res.sid } : {}), verdict, breakpoint };
   });
 
-  // 4) coordinator report + outstanding obligations (FR-8)
-  const partial: RecoveryResult = { episodeId, dispatcher: { relaunched, verdict: dispV, wakeStatus: liveness.wakeStatus }, members, reportDelivery: "skipped", outstanding: [], notConfirmed: 0 };
-  const reportDelivery = deps.deliverReport(partial, episodeId);
-  const withReport = { ...partial, reportDelivery };
-  const { outstanding, notConfirmed } = summarizeOutstanding(withReport);
-  const result: RecoveryResult = { ...withReport, outstanding, notConfirmed };
+  // 4) FR-8 账随实走: compute the REAL outstanding/notConfirmed FIRST, deliver the report WITH that real result (never a zeroed
+  //    placeholder), then re-fold including the report's own delivery status.
+  const base: RecoveryResult = { episodeId, dispatcher: { relaunched, verdict: dispV, wakeStatus: liveness.wakeStatus }, members, reportDelivery: "skipped", outstanding: [], notConfirmed: 0 };
+  const pre = summarizeOutstanding(base);
+  const real: RecoveryResult = { ...base, outstanding: pre.outstanding, notConfirmed: pre.notConfirmed };
+  const reportDelivery = deps.deliverReport(real, episodeId); // REAL result in hand
+  const withReport: RecoveryResult = { ...real, reportDelivery };
+  const folded = summarizeOutstanding(withReport);
+  let result: RecoveryResult = { ...withReport, outstanding: folded.outstanding, notConfirmed: folded.notConfirmed };
 
-  // 5) mark the episode COMPLETE only when nothing is outstanding (FR-8: an interrupted/failed run stays open for a retry to finish)
-  deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: outstanding.length === 0 });
+  // 5) FR-8: the durable RECEIPT is part of the completion criteria — a refused write is an outstanding obligation, not a silent exit0.
+  if (!deps.writeReceipt(result)) result = { ...result, outstanding: [...result.outstanding, "receipt:unwritten"] };
+
+  // 6) mark the episode COMPLETE only when NOTHING is outstanding (an interrupted/failed run stays open for a retry to finish).
+  deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: result.outstanding.length === 0 });
   return result;
 }

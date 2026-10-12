@@ -51,10 +51,13 @@ Boot-recovery only helps if a recent `fleet-snapshot.json` + `roster-snapshot.js
 over-claim):
 
 - **Dispatcher recipe + fleet-snapshot: WIRED, at dispatcher STARTUP** (not at closeout). When `SWARM_FLEET_RECOVERY` is on
-  (flagDefaultOn, default ON), the dispatcher — on every startup — self-records its EXACT launch recipe (`process.argv` array +
-  allowlisted/scrubbed env + cwd; lossless, unlike a ps capture) to `dispatcher-recipe.json` and writes a fresh `fleet-snapshot.json`
+  (flagDefaultOn, default ON), the dispatcher — on every startup — self-records its EXACT launch recipe (the full argv =
+  `process.argv[0]` + `process.execArgv` (the node/tsx loader flags) + the script + args, plus the allowlisted/scrubbed env + cwd;
+  lossless — it preserves the loader flags and spaces a ps display string cannot) to `dispatcher-recipe.json` and a fresh `fleet-snapshot.json`
   carrying it. So the dispatcher half is always current as of its last start (zero-risk: it only writes two files, fail-soft).
-- **Roster snapshot: captured by `swarm-recover --snapshot`** (manual, cron, or the boot plist's own pre-reboot hook) — the dispatcher
+- **Roster snapshot: captured by `swarm-recover --snapshot`** (manual, or a cron / logout hook you configure yourself — the LaunchAgent
+  plist below only has `RunAtLoad`, which runs RECOVERY *at boot*; it has NO pre-reboot snapshot hook, so it does not refresh the roster
+  before a shutdown) — the dispatcher
   records only ITSELF, not the live window roster. Run `--snapshot` before a planned reboot, or on a cron, to keep the roster fresh.
 - There is NO closeout-seam auto-capture (an earlier draft of this doc claimed one; it was never wired). The two mechanisms above are
   the whole story.
