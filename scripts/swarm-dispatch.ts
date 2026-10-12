@@ -78,7 +78,7 @@ import { executorDigestEnabled, loadExecutorDigest, formatExecutorDigest, coerce
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { consoleProjectionEnabled, shouldWriteConsole } from "../packages/bus/src/swarm/console-projection.js";
 import { writeConsoleProjection } from "../packages/bus/src/swarm/console-projection-store.js";
-import { idleExplainerEnabled } from "../packages/bus/src/swarm/idle-explainer.js";
+import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swarm/idle-explainer.js";
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
@@ -1927,7 +1927,10 @@ async function main(): Promise<void> {
             else log(`idle-explainer: S19 deferred (${r}) — retry next tick`);
           } else log(`idle-explainer: anomaly onset but coordinator "${COORDINATOR || "(unset)"}" unresolved — projection written, retry when resolvable`);
         }
-      } else { anomalyOnsetSec = null; anomalyAlerted = false; } // episode cleared ⇒ reset for the next one
+      } else if (recoveryConfirmed({ idle, idleSource, swarmEstablished, signals, running: cl.running, coordResolvable: coordSid !== "" })) {
+        anomalyOnsetSec = null; anomalyAlerted = false; // IE-4: a CONFIRMED recovery (work resumed, or a confirmed reason) ⇒ re-arm
+      } // IE-4: else ⇒ this tick could NOT confirm the anomaly ended (unknown activity / a null signal / unresolvable coordinator)
+        // ⇒ RETAIN the episode + delivered state — never a fake recovery that re-publishes under a fresh key.
     } catch (e) { log(`idle-explainer failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 

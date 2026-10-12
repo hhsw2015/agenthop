@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlin
 import os from "node:os";
 import path from "node:path";
 import {
-  idleExplainerEnabled, idleReason, isIdleAnomaly, shouldAlertOnset, buildIdleExplainer,
+  idleExplainerEnabled, idleReason, isIdleAnomaly, shouldAlertOnset, recoveryConfirmed, buildIdleExplainer,
   IDLE_EXPLAINER_SCHEMA, type IdleSignals,
 } from "./idle-explainer.js";
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "./idle-explainer-store.js";
@@ -111,8 +111,36 @@ if (canTestPerms) {
   const home = tmpHome();
   t("roster ENOENT ⇒ 0", countRosterMembers(home) === 0);
   mkdirSync(path.join(home, ".agenthop", "swarm"), { recursive: true });
-  writeFileSync(rosterSnap(home), JSON.stringify({ members: [{ member: "m1" }, { member: "m2" }] }));
-  t("roster with 2 members ⇒ 2", countRosterMembers(home) === 2);
+  // IE-1: a valid member needs tool+cwd (member is optional via the legacy fallback identity).
+  writeFileSync(rosterSnap(home), JSON.stringify({ members: [{ member: "m1", tool: "claude", cwd: "/a" }, { tool: "codex", cwd: "/b" }] }));
+  t("roster: 2 valid members (1 explicit + 1 legacy tool/cwd fallback) ⇒ 2", countRosterMembers(home) === 2);
+  // IE-1: malformed entries are NOT valid members ⇒ 0 (not an established swarm) — the exact S19-false-positive repros.
+  for (const [label, body] of [
+    ["members:[null]", JSON.stringify({ members: [null] })],
+    ["members:[42]", JSON.stringify({ members: [42] })],
+    ["members:[{}]", JSON.stringify({ members: [{}] })],
+    ["members:[{member only, no tool/cwd}]", JSON.stringify({ members: [{ member: "m1" }] })],
+    ["members:[]", JSON.stringify({ members: [] })],
+  ] as const) {
+    writeFileSync(rosterSnap(home), body);
+    t(`IE-1: ${label} ⇒ 0 valid members (not established)`, countRosterMembers(home) === 0);
+  }
+  writeFileSync(rosterSnap(home), "{not json");
+  t("roster corrupt JSON ⇒ null (unreadable)", countRosterMembers(home) === null);
+}
+
+// =====================================================================================================================
+// IE-4 — recoveryConfirmed: separate a CONFIRMED recovery (re-arm) from an UNCERTAIN tick (retain episode)
+// =====================================================================================================================
+{
+  const base = { idle: false, idleSource: "ledger" as const, swarmEstablished: true, signals: S0, running: 0 as number | null, coordResolvable: true };
+  t("recovery: work resumed (running>0, ledger) ⇒ confirmed", recoveryConfirmed({ ...base, running: 2 }) === true);
+  t("recovery: idle + a confirmed reason (established, no null, coord resolvable) ⇒ confirmed", recoveryConfirmed({ ...base, idle: true, signals: { ...S0, awaitingRuling: 1 } }) === true);
+  t("recovery: idle + reason but coordinator UNRESOLVABLE ⇒ NOT confirmed (inbox signal untrusted)", recoveryConfirmed({ ...base, idle: true, signals: { ...S0, awaitingRuling: 1 }, coordResolvable: false }) === false);
+  t("recovery: idle + reason but a NULL signal ⇒ NOT confirmed (uncertain)", recoveryConfirmed({ ...base, idle: true, signals: { ...S0, awaitingRuling: 1, unclaimedInboxes: null } }) === false);
+  t("recovery: unknown activity (idleSource unknown, running null) ⇒ NOT confirmed (retain)", recoveryConfirmed({ ...base, idleSource: "unknown", running: null }) === false);
+  t("recovery: not established + reason ⇒ NOT confirmed", recoveryConfirmed({ ...base, idle: true, swarmEstablished: false, signals: { ...S0, awaitingRuling: 1 } }) === false);
+  t("recovery: idle + all zero (that is an anomaly, not a recovery) ⇒ NOT confirmed", recoveryConfirmed({ ...base, idle: true }) === false);
 }
 
 // =====================================================================================================================

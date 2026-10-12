@@ -112,3 +112,21 @@ export function buildIdleExplainer(i: { idle: boolean; idleSource: IdleSource; s
 export function shouldAlertOnset(prevAnomaly: boolean, currAnomaly: boolean): boolean {
   return currAnomaly && !prevAnomaly;
 }
+
+/**
+ * IE-4 — when NOT in the anomaly state, decide whether the anomaly EPISODE is CONFIRMED over (⇒ the dispatcher re-arms for the
+ * next episode) vs this tick merely could not confirm the anomaly (⇒ RETAIN the episode + its delivered state). `anomaly === false`
+ * is ambiguous: it is BOTH "a real recovery / a reason appeared" AND "an unreadable signal / unknown activity / an unresolvable
+ * coordinator made the check inconclusive" — those must NOT share the recovery branch, or a transient read fault fakes a recovery
+ * and re-publishes the same card under a fresh onset key. A recovery is CONFIRMED only when:
+ *   - work RESUMED: running > 0 on a readable ledger (idleSource "ledger") — a definitive, coordinator-independent recovery; OR
+ *   - a reason APPEARED: idle + established + EVERY signal readable (no null) + at least one positive, AND the coordinator is
+ *     resolvable (so the unclaimed-inbox signal is free of the producer's own notice — IE-4's self-notice exclusion holds).
+ * Anything else (unknown activity, any null signal, unresolvable coordinator) ⇒ NOT confirmed ⇒ the caller retains the episode.
+ * Pure. */
+export function recoveryConfirmed(i: { idle: boolean; idleSource: IdleSource; swarmEstablished: boolean; signals: IdleSignals; running: number | null; coordResolvable: boolean }): boolean {
+  const vals = [i.signals.unclaimedInboxes, i.signals.reviewQueueDepth, i.signals.awaitingRuling, i.signals.awaitingInput, i.signals.userGates];
+  const workActive = i.idleSource === "ledger" && (i.running ?? 0) > 0;
+  const explainedIdle = i.idle && i.swarmEstablished && vals.every((v) => v !== null) && vals.some((v) => (v ?? 0) > 0) && i.coordResolvable;
+  return workActive || explainedIdle;
+}

@@ -12,7 +12,7 @@ import { loadControlLog } from "./control-store.js";
 import { liveEntities } from "./control-log.js";
 import { reviewQueueDir, parseReviewFileName } from "./review-seat-autoscale.js";
 import { listBatchesStrict, readBatch } from "./decision-batch-store.js";
-import { ROSTER_FILE } from "./resume.js";
+import { ROSTER_FILE, parseSnapshot } from "./resume.js";
 import { buildIdleExplainer, type IdleSignals, type IdleSource, type IdleExplainer } from "./idle-explainer.js";
 
 // --- paths ------------------------------------------------------------------------------------------------------------
@@ -131,15 +131,16 @@ function decisionBatchAwaitingAndGates(home: string): { awaiting: number | null;
   return { awaiting, userGates: gates };
 }
 
-/** Member roster size (for the anomaly's "established swarm" gate). ENOENT ⇒ 0; unreadable/corrupt/unrecognized shape ⇒ null. */
+/** Count VALID roster members (for the anomaly's "established swarm" gate). IE-1: uses the existing roster parser (parseSnapshot),
+ *  which FILTERS malformed entries (null / number / {} / member-only — none are valid members) and applies the legacy tool/cwd
+ *  fallback identity, so a non-empty array of junk never counts as an established swarm. ENOENT ⇒ 0; unparseable / non-object /
+ *  members-not-array ⇒ null (unreadable/unrecognized). */
 export function countRosterMembers(home: string): number | null {
   let raw: string;
   try { raw = readFileSync(rosterSnapshotPath(home), "utf8"); }
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? 0 : null; }
-  try {
-    const snap = JSON.parse(raw) as { members?: unknown };
-    return Array.isArray(snap?.members) ? (snap.members as unknown[]).length : null;
-  } catch { return null; }
+  const snap = parseSnapshot(raw);
+  return snap ? snap.members.length : null;
 }
 
 /** Read all "why idle" signals. awaitingRuling = decision-batch-awaiting + control-log approval-waits (null-safe). awaitingInput
