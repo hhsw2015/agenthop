@@ -60,9 +60,23 @@ function listHoldIntents(site: LockSite): { name: string; pid: number }[] {
  *  we stranded stays ours alone to recover. Keyed by absolute lockDir path, so distinct sites never collide. */
 const strandedLockDirs = new Set<string>();
 
+/** Options for a single acquire. */
+export interface AcquireOpts {
+  /**
+   * SUCC-1 (opt-in; default OFF ⇒ existing callers byte-identical). Also reclaim an EXTERNAL empty lock dir that is PROVABLY
+   * stranded — EVERY foreign hold-intent is a CONFIRMED-DEAD (ESRCH) pid, at least one exists, and NONE is alive-or-unknown — by
+   * ADOPTING INTO it (publish our identity straight in; NO rmdir, so no remove→recreate gap, no out-of-band deletion that could
+   * race a live acquirer's new dir). It is single-winner: a live acquirer always stages its hold-intent BEFORE its mkdir, so two
+   * concurrent reclaimers each see the OTHER's live (not-all-dead) intent and BOTH contend — the stranded dir is reclaimed only
+   * by a SOLO acquirer, never two. A non-ESRCH probe (EPERM/EIO/unknown) never authorizes (SUCC1-2). Succession passes this so a
+   * crash-stranded `<sid>.adopt.lockd` is not un-adoptable forever; decision-batch (R26 out-of-band) + shared-budget do NOT.
+   */
+  reclaimExternalStranded?: boolean;
+}
+
 /** Acquire the lock for `site` in ONE attempt. Returns our identity token (`<pid>.<nonce>`) if held by us, else null (contended).
  *  A caller that needs to wait wraps this in a bounded retry loop. */
-export function acquireHolderLock(site: LockSite): string | null {
+export function acquireHolderLock(site: LockSite, opts: AcquireOpts = {}): string | null {
   const dir = site.lockDir;
   const token = `${process.pid}.${randomBytes(6).toString("hex")}`;
   const mine = path.join(dir, token);
@@ -100,16 +114,22 @@ export function acquireHolderLock(site: LockSite): string | null {
     //  (A) reading the hold-intents MUST succeed — a read fault cannot prove recoverability ⇒ contend (never fold to empty);
     //  (B) a LIVE FOREIGN hold-intent ⇒ a holder is mid-publish/arriving ⇒ contend (never steal — DB-R7 occupancy protection);
     //  (C) OUR OWN unfinished occupancy (this process stranded THIS dir, tracked in-process) ⇒ adopt.
-    // An EXTERNAL empty dir — including a DEAD holder's stranded one — is NEVER adopted here: a stale on-disk credential cannot
-    // prove the CURRENT dir is unoccupied (DB-R7 A/B — a dead intent may outlive the dir it named), and a crashed external holder's
-    // recovery is handled out of band (R26). So external empty dirs are simply contended.
+    // An EXTERNAL empty dir is adopted ONLY under the opt-in reclaimExternalStranded (SUCC-1, (D) below); otherwise a stale on-disk
+    // credential cannot prove the CURRENT dir is unoccupied (DB-R7 A/B — a dead intent may outlive the dir it named), so by default
+    // a crashed external holder's recovery is left out of band (R26) and external empty dirs are contended.
     let others: { name: string; pid: number }[];
     try { others = listHoldIntents(site).filter((i) => i.name !== intentName); } catch { dropIntent(); return null; }
     if (others.some((i) => i.pid !== process.pid && pidAlive(i.pid))) { dropIntent(); return null; } // (B) live foreign ⇒ contend
-    if (!strandedLockDirs.has(dir)) { dropIntent(); return null; } // (C-neg) not our own unfinished occupancy ⇒ contend
-    try { writeFileSync(mine, "", { mode: 0o600 }); } catch { dropIntent(); return null; } // (C) adopt; dir not writable/vanished ⇒ contend (a later retry re-adopts or wins fresh)
+    const ownStranded = strandedLockDirs.has(dir);
+    // (D) SUCC-1 external-stranded reclaim: PROVABLY stranded = at least one foreign hold-intent AND every foreign intent is a
+    // CONFIRMED-DEAD (ESRCH) pid. A non-ESRCH probe (EPERM/EIO/unknown) leaves it NOT-all-dead ⇒ contend (SUCC1-2: unknown never
+    // authorizes). A concurrent live acquirer has a LIVE intent here ⇒ not-all-dead ⇒ both contend (single-winner, no ABA).
+    const externalStranded = !!opts.reclaimExternalStranded && others.length > 0 && others.every((i) => pidDefinitelyDead(i.pid));
+    if (!ownStranded && !externalStranded) { dropIntent(); return null; } // (C-neg) not our own, not provably-stranded ⇒ contend
+    try { writeFileSync(mine, "", { mode: 0o600 }); } catch { dropIntent(); return null; } // adopt INTO the dir (own or (D)); not writable/vanished ⇒ contend
     strandedLockDirs.delete(dir);
-    for (const i of others) { if (i.pid === process.pid) { try { unlinkSync(path.join(site.intentDir, i.name)); } catch { /* best-effort cleanup of our OWN stale intents (a dead foreign intent is left for R26) */ } } }
+    // Clean the intents we no longer need: our OWN stale intents always; a CONFIRMED-DEAD foreign intent only when we (D)-reclaimed.
+    for (const i of others) { if (i.pid === process.pid || (externalStranded && pidDefinitelyDead(i.pid))) { try { unlinkSync(path.join(site.intentDir, i.name)); } catch { /* best-effort */ } } }
     return token;
   }
   dropIntent(); return null; // >1 identity (ambiguous) ⇒ contended

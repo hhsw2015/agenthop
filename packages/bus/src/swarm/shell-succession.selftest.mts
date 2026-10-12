@@ -1,4 +1,4 @@
-import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, argvFromCmdline, presencePidRelPath, planSuccession, adoptLockSite, reapStrandedAdoptLock, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
+import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, argvFromCmdline, presencePidRelPath, planSuccession, adoptLockSite, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
 import { acquireHolderLock, releaseHolderLock } from "./holder-lock.js";
 import { probeCandidateLiveness, probeSessionLiveness, sidSockPrefix } from "./task-liveness.js";
 import type { RosterMember } from "./resume.js";
@@ -159,60 +159,70 @@ t("probeSessionLiveness: only a connected-but-silent candidate -> unknown (NOT n
 for (const s of servers) { try { s.close(); } catch { /* noop */ } }
 rmSync(sockHome, { recursive: true, force: true });
 
-// ── SUCC-1 (infra audit): reapStrandedAdoptLock — a crash-stranded EMPTY adopt lock must not make a sid un-adoptable forever ──
+// ── SUCC-1 r2 (codex:Work): the crash-stranded EMPTY adopt lock is reclaimed INSIDE acquireHolderLock via the opt-in
+//    reclaimExternalStranded — no out-of-band rmdir (so no ABA), single-winner, confirmed-dead-only (SUCC1-2). ──
 {
   const mkHome = () => mkdtempSync(path.join(tmpdir(), "succ1-"));
   const SID = "succ-sid-1";
+  // Lay down the on-disk state of a crash between holder-lock's mkdir and its identity write: an EMPTY lock dir + a hold-intent
+  // naming `intentPid` (the crashed owner). This is exactly what runSuccessionAtStartup's acquire then meets.
   const strand = (home: string, intentPid: number) => {
     const site = adoptLockSite(home, SID);
-    mkdirSync(site.lockDir, { recursive: true });                                             // empty lock dir = the mkdir→publish crash window
-    writeFileSync(path.join(site.intentDir, `${site.intentPrefix}${intentPid}.abcdef`), "");  // the crashed holder's hold-intent
+    mkdirSync(site.lockDir, { recursive: true });
+    writeFileSync(path.join(site.intentDir, `${site.intentPrefix}${intentPid}.abcdef`), "");
     return site;
   };
 
-  // crash-recovery: an empty lock dir + a DEAD foreign hold-intent ⇒ reaped ⇒ the sid is adoptable again.
+  // crash-recovery: stranded empty lock + a CONFIRMED-DEAD intent + the opt-in ⇒ reclaimed (adopt INTO the dir) ⇒ sid acquirable.
   {
-    const home = mkHome(); const site = strand(home, 999999);          // 999999 ⇒ ESRCH ⇒ dead
-    reapStrandedAdoptLock(home, SID);
-    t("SUCC-1 crash-recovery: stranded empty lock + dead intent is REAPED", !existsSync(site.lockDir));
-    const token = acquireHolderLock(site);
-    t("SUCC-1 crash-recovery: the sid is acquirable again after reap (not deaf forever)", token !== null);
+    const home = mkHome(); const site = strand(home, 999999);          // 999999 ⇒ ESRCH ⇒ confirmed dead
+    const token = acquireHolderLock(site, { reclaimExternalStranded: true });
+    t("SUCC-1 crash-recovery: a stranded empty lock + dead intent is reclaimed ⇒ token (not deaf forever)", token !== null);
+    t("SUCC-1 crash-recovery: our identity is now published IN the dir", existsSync(path.join(site.lockDir, String(token))));
     if (token) releaseHolderLock(site, token);
     rmSync(home, { recursive: true, force: true });
   }
 
-  // concurrency-race: an empty lock dir whose hold-intent is a LIVE foreign holder (mid-acquire) ⇒ NEVER reaped.
+  // opt-in gating: the SAME stranded state WITHOUT the opt ⇒ contends (decision-batch / shared-budget are byte-identical).
   {
-    const home = mkHome(); const site = strand(home, 424242);
-    reapStrandedAdoptLock(home, SID, () => true);                      // inject "alive" for the foreign pid
-    t("SUCC-1 race: a live foreign hold-intent ⇒ lock is NOT reaped (never steal a mid-acquire holder)", existsSync(site.lockDir));
+    const home = mkHome(); const site = strand(home, 999999);
+    t("SUCC-1 opt-in: default acquire (no reclaim) still CONTENDS an external stranded dir", acquireHolderLock(site) === null);
     rmSync(home, { recursive: true, force: true });
   }
 
-  // published holder untouched: a NON-empty lock dir (identity published) is never considered by the reaper.
+  // SUCC1-2 three-state: a NON-ESRCH (alive/unknown) foreign intent must NOT authorize reclaim, even with the opt-in. pid 1 (init)
+  // probes EPERM ⇒ alive ⇒ not-all-dead ⇒ contend. This is also the ABA single-winner proxy: a concurrent acquirer's LIVE intent
+  // blocks reclaim, so two racing reclaimers each see the other and both contend (only a SOLO acquirer reclaims).
   {
-    const home = mkHome(); const site = adoptLockSite(home, SID);
-    mkdirSync(site.lockDir, { recursive: true });
-    writeFileSync(path.join(site.lockDir, "100.deadbeef"), "");        // a published identity
-    reapStrandedAdoptLock(home, SID);
-    t("SUCC-1: a PUBLISHED (non-empty) lock dir is left untouched", existsSync(path.join(site.lockDir, "100.deadbeef")));
+    const home = mkHome(); const site = strand(home, 1);              // pid 1 ⇒ EPERM ⇒ alive/unknown, NOT ESRCH
+    t("SUCC1-2: an alive/unknown foreign intent ⇒ reclaim CONTENDS (non-ESRCH never authorizes; single-winner)", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
     rmSync(home, { recursive: true, force: true });
   }
 
-  // restart-idempotency: no lock ⇒ no-op; reaping twice ⇒ still a no-op, never throws.
+  // a stranded dir with a DEAD intent AND a concurrent LIVE intent (pid 1) ⇒ not all-dead ⇒ contend (two racers both contend).
   {
-    const home = mkHome();
-    reapStrandedAdoptLock(home, SID);                                   // no lock dir at all ⇒ ENOENT ⇒ no-op
-    t("SUCC-1 idempotent: reaping with no lock is a safe no-op", true);
-    strand(home, 999999);
-    reapStrandedAdoptLock(home, SID);
-    reapStrandedAdoptLock(home, SID);                                   // second reap: the dir is already gone ⇒ no-op, no throw
-    t("SUCC-1 idempotent: reaping an already-reaped lock twice is a safe no-op", !existsSync(adoptLockSite(home, SID).lockDir));
+    const home = mkHome(); const site = strand(home, 999999);
+    writeFileSync(path.join(site.intentDir, `${site.intentPrefix}1.beef`), ""); // a concurrent acquirer's live intent
+    t("SUCC-1 ABA: a dead intent + a concurrent live intent ⇒ CONTEND (no double-holder)", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
     rmSync(home, { recursive: true, force: true });
   }
 
-  // (A) intent read fault is not simulated here (the intent dir is the writable presence dir); the no-live-foreign + rmdir-on-empty
-  // guards are the two that make a false reclaim impossible, both exercised above.
+  // no intents at all (empty dir, nothing proving a crash) ⇒ NOT reclaimed even with the opt (requires >=1 confirmed-dead intent).
+  {
+    const home = mkHome(); const site = adoptLockSite(home, SID); mkdirSync(site.lockDir, { recursive: true });
+    t("SUCC-1: an empty dir with NO hold-intent is not provably stranded ⇒ contend", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // restart-idempotency: after a reclaim+release the sid acquires cleanly again (no residue strands it).
+  {
+    const home = mkHome(); const site = strand(home, 999999);
+    const t1 = acquireHolderLock(site, { reclaimExternalStranded: true }); if (t1) releaseHolderLock(site, t1);
+    const t2 = acquireHolderLock(site, { reclaimExternalStranded: true });
+    t("SUCC-1 idempotent: reclaim → release → re-acquire succeeds (no stranded residue)", t2 !== null);
+    if (t2) releaseHolderLock(site, t2);
+    rmSync(home, { recursive: true, force: true });
+  }
 }
 
 console.log("all shell-succession selftests passed");
