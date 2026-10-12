@@ -1,0 +1,1 @@
+{"id":"F50","series":"F","title":"投审签收后审查席 idle 必补唤醒 ping","status":"active","since":"2026-10-10","statement":"协调者自认(user 问「怎么又空闲了」):投审两信签收后审查席已空、只记账未催审,r10 在 happycapy 队列里等但没发唤醒 ping,空转一轮。教训并入唤醒例程:投审消息签收后,若审查席 idle,必须补一发唤醒 ping(S31「队列只作唤醒 ping」正为此)。","relates":["S31","F52"],"sources":["PROGRESS.md:1593 (2026-10-10)"]}
