@@ -38,14 +38,14 @@ maturity 列:✅prime(批1已交)· ⬜candidate(批2)· 🔁候选但我方已�
 | 8 | `staff-reviewer` | review | 找过 CI 但炸生产的 bug,门完整性(具名被削弱测试) | 工程审查门(生产 bug + 简化透镜) | 🔁我方已有:对抗审查席,本片段供补充(「每门强制双声」纪律借此) | ⬜candidate |
 | 9 | `devex-lead` | plan-devex-review | DX 计划审:persona/TTHW/magical moment/摩擦点 | DX 计划门(20-45 逼问) | GAP | ⬜candidate |
 | 10 | `devex-tester` | devex-review | 实测 onboarding/getting-started/TTHW 计时截图 | DX 现场门(对照计划分=回旋镖) | GAP | ⬜candidate |
-| 11 | `qa-lead` | qa | 探 browser/API/CLI/job/webhook,复现 bug 写回归再修 | QA 门(先失败回归再修再验) | PARTIAL(tests/selftest-CI,无驱真产品 QA 席;可接 herdr) | ⬜candidate |
+| 11 | `qa-lead` | qa | 探 browser/API/CLI/job/webhook,复现 bug 写回归再修 | QA 门(先失败回归再修再验) | PARTIAL(vitest package tests[CI];selftest 手动未接 CI;无驱真产品 QA 席;可接 herdr) | ⬜candidate |
 | 12 | `qa-reporter` | qa-only | 只探只报,可重放证据,建议回归不改码 | QA 报告门(报告-only) | PARTIAL | ⬜candidate |
 | 13 | `debugger` | investigate | 系统化根因(铁律:无调查不修;3 次失败即停) | 调试门(数据流追踪 + 假设验证) | GAP(debugger 是全局 agent,非蜂群席) | ⬜candidate |
 | 14 | `sre-canary` | canary | 部署后监控环:console 错误/性能回归/页面失败 | 发布后健康门 | PARTIAL(dual-bandwidth 是吞吐非页面健康) | ⬜candidate |
 | 15 | `perf-engineer` | benchmark | 基线页面加载/Core Web Vitals/资源大小,PR 前后对比 | 性能回归门 | PARTIAL(round-doctor 是审查健康,非 web 性能) | ⬜candidate |
-| 16 | `eval-planner` | eval-plan | 付费 eval 预注册:bars/arms/decoys/stop-rules + $0 dry run + 三项试点 | eval 支出门(试点外推 gate 批准) | 🔁我方已有:mirror-13 orchestration eval 引擎,本片段供补充 | ⬜candidate |
+| 16 | `eval-planner` | eval-plan | 付费 eval 预注册:bars/arms/decoys/stop-rules + $0 dry run + 三项试点 | eval 支出门(试点外推 gate 批准) | 🔁研究参考/在途:mirror-13 编排研究评 @3facb67(纯研究非引擎);无已落地等价,本片段补此席 | ⬜candidate |
 | 17 | `spec-author` | spec | 模糊意图→可执行 spec(五相位 why/scope/technical/draft/file) | spec 质量门(外审 ≥7/10 才归档) | 🔁我方已有:task brief/TaskPlan,本片段供补充(五相位结构可借) | ⬜candidate |
-| 18 | `test-auditor` | test-audit | 扫低价值/重复/无断言/test-only-export 测试 | 测试卫生门(证据卡,批准才删) | PARTIAL(selftest-CI/coverage) | ⬜candidate |
+| 18 | `test-auditor` | test-audit | 扫低价值/重复/无断言/test-only-export 测试 | 测试卫生门(证据卡,批准才删) | PARTIAL(vitest package tests/coverage[CI];selftest 手动未接 CI) | ⬜candidate |
 | 19 | `shared-code-reviewer` | deslop-shared-libs | 找共享代码抽取机会,比至多 5 推 3(带证据) | 抽取建议门(仅建议) | GAP | ⬜candidate |
 | 20 | `design-partner` | design-consultation | 从零建设计系统,研究 landscape + 产 mockup,写 DESIGN.md | 设计系统门 | GAP(可折入 designer,独列为备选) | ⬜candidate |
 | 21 | `design-explorer` | design-shotgun | 产 4-6 mockup 变体,浏览器比较板,taste 学习迭代 | 设计探索门(taste memory) | GAP | ⬜candidate |

@@ -102,11 +102,11 @@
     "staff-reviewer": {
       "maturity": "candidate",
       "title": "资深工程师代码审 Staff Engineer(生产 bug 门)",
-      "responsibilities": "找过 CI 但炸生产的 bug,自动修显见的;标完整性缺口 + 门完整性:每处被削弱的测试/超时/快照/suppression 具名送人;附建议性简化透镜(不阻断、不自动改)。",
+      "responsibilities": "找过 CI 但炸生产的 bug(**审而不自动改**);标完整性缺口 + 门完整性:每处被削弱的测试/超时/快照/suppression 具名送人;附建议性简化透镜(不阻断、不自动改)。**修复建议 ≠ 实际修改**——修改交实现方/负责人。",
       "gate": "工程审查门:生产级 bug 发现 + 门完整性(削弱点具名)。",
       "reviewArtifact": "bug finding(行号+失败场景)+ 门完整性清单(具名被削弱测试)+ 简化透镜建议。",
       "source": "gstack review/SKILL.md(README specialist 表 + §2.6)",
-      "adaptation": "去:单会话 + 自动修。留:生产 bug 透镜 + 门完整性具名 + 简化透镜。落我方=对抗审查席(已有);『每门强制双声 native+跨模型』纪律可借此升为默认。",
+      "adaptation": "去:单会话 + gstack 的自动修(README:291 确有自动修;本席采**只审不改**=审者建议不动手,我方铁律)。留:生产 bug 透镜 + 门完整性具名 + 简化透镜。落我方=对抗审查席(已有);『每门强制双声 native+跨模型』纪律可借此升默认。",
       "ourEquivalent": "我方已有对应物:对抗审查席;本片段供补充(门完整性具名 + 双声纪律)。"
     },
     "devex-lead": {
@@ -136,8 +136,8 @@
       "gate": "QA 门:先写失败回归再修再验;探索式而非乱跑命令。",
       "reviewArtifact": "探索证据笔记 + 复现步骤 + 失败回归(修前失败/修后通过)+ 未测覆盖缺口。",
       "source": "gstack qa/SKILL.md(README specialist 表 + §2.6)",
-      "adaptation": "去:Aside 浏览器 + preamble + 外部副作用默认许可。留:先失败回归再修 + 探索纪律 + 未测缺口诚实。落我方=QA 席(可接 herdr 驱真会话)。",
-      "ourEquivalent": "PARTIAL:tests/selftest-CI 门 + review 已有,无驱真产品的 QA 席。本片段补此席。"
+      "adaptation": "去:Aside 浏览器 + preamble(**上游 /qa 并非默认许可外部副作用**:README:329 把副作用限在夹具内、:332 先声明所用写权限)。本席采**我方权限边界**:外部副作用/写权限按 C8/R16 门,不默认许可。留:先失败回归再修 + 探索纪律 + 未测缺口诚实。落我方=QA 席(可接 herdr 驱真会话)。",
+      "ourEquivalent": "PARTIAL:vitest package tests(CI,package.json:30/CI:33)+ review 已有;**selftest 为手动 tsx,未接 CI test runner(在途)**;无驱真产品的 QA 席。本片段补此席。"
     },
     "qa-reporter": {
       "maturity": "candidate",
@@ -187,7 +187,7 @@
       "reviewArtifact": "预注册卡 {bars, arms, decoys, stop-rules} + $0 干跑结果 + 三项试点外推 + 支出表(呈批)。",
       "source": "gstack eval-plan/SKILL.md(README specialist 表 + §2.6)",
       "adaptation": "去:preamble。留:预注册 + 干跑 + 试点外推 gate(S23 花钱线同族)。落我方=eval 规划席,支出表接 decision-batch 呈批。",
-      "ourEquivalent": "我方已有对应物:mirror-13 orchestration eval 引擎 @3facb67;本片段供补充(预注册/支出闸)。"
+      "ourEquivalent": "**研究参考/在途(非已落地)**:我方有 mirror-13 LangChain/CrewAI 编排研究评 @3facb67(**纯研究、不改码**:docs/research/langchain-crewai-eval.md:3;研究 LangGraph/CrewAI 编排引擎,**非我方已落地的付费 eval 执行器**)。无已落地等价物,本片段补此席(预注册/支出闸)。"
     },
     "spec-author": {
       "maturity": "candidate",
@@ -207,7 +207,7 @@
       "reviewArtifact": "每候选证据卡 {类型, 证据, 建议} + 批量删待批。",
       "source": "gstack test-audit/SKILL.md(README specialist 表 + §2.6)",
       "adaptation": "去:preamble。留:证据卡 + 报告-only + 批准才删。落我方=测试审计席(删=批准门)。",
-      "ourEquivalent": "PARTIAL:selftest-CI/coverage 已有。本片段补此席。"
+      "ourEquivalent": "PARTIAL:vitest package tests/coverage(CI);**selftest 手动 tsx,未接 CI(在途)**。本片段补此席。"
     },
     "shared-code-reviewer": {
       "maturity": "candidate",
@@ -242,7 +242,7 @@
     "design-engineer": {
       "maturity": "candidate",
       "title": "设计工程师 Design Engineer(设计落地门)",
-      "responsibilities": "mockup→生产 HTML:动态布局(文本回流/高度自适应)、30KB 零依赖、检测 React/Svelte/Vue、智能 API 路由;一遍 slop-gate。",
+      "responsibilities": "mockup→生产 HTML:动态布局(文本回流/高度自适应)、零依赖、检测 React/Svelte/Vue、智能 API 路由;一遍 slop-gate。",
       "gate": "设计落地门:产可发 HTML(非 demo)+ slop-gate 过。",
       "reviewArtifact": "生产 HTML + slop-gate 结果 + 框架检测。",
       "source": "gstack design-html/SKILL.md(README specialist 表 + §2.6)",
