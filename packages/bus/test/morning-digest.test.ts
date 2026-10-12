@@ -182,6 +182,28 @@ describe("morning-digest-store — gatherDigestSources (验收简报化: authori
     expect(s.awaitingRuling).toEqual([]);
   });
 
+  test("MDV2-5 r2: multi-signal lines keep the user action / active problem; COMMIT_REF syntax (UUID out, decimal short sha in); SHA retained", () => {
+    progress([
+      "- ✅ mod 已并 @deadbee，待验收",                              // done + user-test ⇒ 待你验收 (action survives), NOT only 完成
+      "- ✅ patch 已并 @deadbee，但仍超时",                          // done + active problem ⇒ 异常, NOT only 完成
+      "- 待复审：异常报告优化 @deadbee",                            // in-flight (待复审); 异常 here is a TOPIC ⇒ DROP (not 异常)
+      "- ✅ 已并 item，session=deadbeef-1234-5678-9abc-def012345678", // a UUID, no commit ref ⇒ DROP (not 完成)
+      "- ✅ 已并 @1431247 0 REMAIN",                                 // an all-DECIMAL real short sha ⇒ 完成 (accepted)
+    ].join("\n"));
+    const s = gatherDigestSources(HOME)!;
+    expect(s.awaitingTest).toEqual(["✅ mod 已并 @deadbee，待验收"]);
+    expect(s.anomalies).toEqual(["✅ patch 已并 @deadbee，但仍超时"]);
+    expect(s.recentDone).toEqual(["✅ 已并 @1431247 0 REMAIN"]);
+  });
+
+  test("MDV2-5 r2: a long completion with the SHA at the end RETAINS the SHA in the output (not truncated away)", () => {
+    const longBody = `✅ ${"x".repeat(200)} 已并 @abc1234`;
+    progress(`- ${longBody}`);
+    const [done] = gatherDigestSources(HOME)!.recentDone!;
+    expect(done).toContain("abc1234"); // evidence preserved even though the prose was clipped
+    expect(done.length).toBeLessThan(longBody.length);
+  });
+
   test("PROGRESS unreadable ⇒ null (MD-P2-2); an unreadable decision store ⇒ null (MDV2-1), never a false quiet night", () => {
     const f = progress("- ✅ done @abc123f");
     chmodSync(f, 0o000);

@@ -153,17 +153,27 @@ function gatherDecisions(home: string, perGroup: number): { rulings: string[]; a
 const COMPLETION_RE = /✅|已签收|已并|已合并|\bmerged\b|装机|\blanded\b/i; // an explicit sign-off / landing marker (NOT bare "0 remain")
 const NEGATION_RE   = /\bnot\b|未|尚未|即[将合并装]|即可|若|回滚|\brevert\b|撤销|放弃/i; // negation / conditional ⇒ NOT a completion fact
 const INFLIGHT_RE   = /待复审|待审|送审|候审|候签|待签|\bpending\b|[1-9]\d*\s*remain/i;   // inter-agent in-flight review ⇒ DROP (⑤)
-const ANOMALY_RE    = /⚠|\bblocked\b|卡点|卡死|卡住|超时|deadline|失联|中断|异常|\bstuck\b/i; // a real anomaly STATE (NOT the word 哨兵/sentinel)
+const ANOMALY_RE    = /⚠|\bblocked\b|\bstuck\b|卡死|卡住|卡点|超时|deadline|失联|中断/i; // an ACTIVE-problem word only (NOT the topic word 异常, NOT bare 哨兵/sentinel)
 const AWAITTEST_RE  = /待验收|待实测|待你测|待实机|待自测|待体验|needs?-?test/i;            // landed, awaiting the user's own real-test
-/** A VERIFIABLE commit token: a 7-40 hex run containing a hex LETTER (so a bare decimal date like "20261011" is not mistaken for a sha). */
-const hasSha = (s: string): boolean => (s.match(/\b[0-9a-f]{7,40}\b/gi) ?? []).some((t) => /[a-f]/i.test(t));
+/** A context-anchored, whole-token COMMIT REFERENCE (the output-contract OC-4 recipe): a label (固定 / sha / commit / a landing verb
+ *  / @) immediately before a 7-64 hex token that stands alone — trailing `(?!-)` rejects a UUID segment ("deadbeef-1234-…"), and an
+ *  ALL-DECIMAL short sha ("@1431247") is accepted (a bare-date / UUID / unanchored hex is NOT a commit ref). Captures the hex. */
+const COMMIT_REF = /(?:固定\s*)?(?:\bsha(?:[-\s]?256)?\b|\bcommit\b|\bmerged?\b|\blanded\b|已并|已合并|装机|@)[:\s]*\b([0-9a-f]{7,64})\b(?!-)/i;
+/** Emit a completion line that PRESERVES the commit ref even when the prose is clipped (MDV2-5: classification saw the SHA in the
+ *  full body, so the output must keep it — never truncate away the evidence). */
+function completionLine(body: string): string {
+  const brief = clip(body);
+  const sha = body.match(COMMIT_REF)?.[1];
+  return sha && !brief.includes(sha) ? `${brief} […${sha}]` : brief;
+}
 
 /** Gather the digest sources as an ACCEPTANCE BRIEFING (验收简报化), fail-soft.
  *  ③ 待你拍板 — the AUTHORITATIVE decision-batches store (gatherDecisions), not a grep.
- *  ①④② — the PROGRESS.md narrative tail, bucketed by STATE + EVIDENCE (MDV2-5): 完成 needs a completion marker AND a verifiable SHA
- *        AND no negation/conditional AND is not in-flight; 异常 needs a real anomaly STATE word (not the bare word 哨兵/sentinel, which
- *        mis-bucketed a completion); 待你验收 is an explicit user-test marker. 待你拍板 NEVER comes from a PROGRESS 待裁 grep. A line
- *        matching none — including inter-agent in-flight review (待复审/送审) and bare chatter — is DROPPED (⑤).
+ *  ①④② — the PROGRESS.md narrative tail, bucketed by STATE + EVIDENCE with a PRIORITY that preserves the user-action/active-problem
+ *        signal over the completion FYI (MDV2-5): in-flight review drops first (gates all branches); an active anomaly, then an
+ *        explicit user-test, are peeled off before a clean completion (completion marker + an anchored COMMIT_REF + no negation). So
+ *        "已并 … 待验收" surfaces in 待你验收 and "已并 但仍超时" in 异常, not swallowed by 完成. 待你拍板 NEVER comes from a PROGRESS 待裁
+ *        grep. A no-commit-ref "completion", inter-agent in-flight review (待复审/送审), and bare chatter are DROPPED (⑤).
  *  Returns null on a READ ERROR (MD-P2-2 / MDV2-1: UNKNOWN, never a false quiet night): the decisions store cannot be enumerated, or
  *  PROGRESS is unreadable. ENOENT of either ⇒ that source contributes nothing (a CONFIRMED-empty authoritative store is a real quiet). */
 export function gatherDigestSources(home: string, tailLines = 80, perGroup = 8): DigestSources | null {
@@ -183,13 +193,17 @@ export function gatherDigestSources(home: string, tailLines = 80, perGroup = 8):
     if (!t.startsWith("- ") && !t.startsWith("* ")) continue; // bullet lines only (pointers, S18)
     const body = t.slice(2).trim();
     if (body.length === 0) continue;
+    // Priority peels the USER-ACTION / ACTIVE-PROBLEM signal off a line BEFORE the completion FYI, so a line that is both done AND
+    // still-actionable is not swallowed by 完成 (MDV2-5): ① INFLIGHT review drops FIRST and gates every branch (so "待复审：异常报告"
+    // drops, never 异常); ② an ACTIVE anomaly ("已并 但仍超时") surfaces in 异常; ③ an explicit user-test ("已并 … 待验收") surfaces in
+    // 待你验收 — the action survives even when the line also notes 已并; ④ only then a clean completion (marker + anchored COMMIT_REF +
+    // no negation). A no-commit-ref "completion" (a UUID, no sha) and bare chatter DROP.
+    if (INFLIGHT_RE.test(body)) continue;                                                                        // ⑤ in-flight review ⇒ DROP (gates all)
     const brief = clip(body);
-    // ① 完成(签收/落地) FIRST: a completion marker + a verifiable SHA + no negation/conditional + not in-flight. Checked before 异常
-    //    so "✅ 哨兵修复已并 @<sha> 0 REMAIN" reads as a completion, not an anomaly (the 哨兵 word no longer mis-buckets it).
-    if (COMPLETION_RE.test(body) && hasSha(body) && !NEGATION_RE.test(body) && !INFLIGHT_RE.test(body)) { if (recentDone.length < perGroup) recentDone.push(brief); }
-    else if (ANOMALY_RE.test(body)) { if (anomalies.length < perGroup) anomalies.push(brief); }                 // ④ 异常 (real state)
-    else if (AWAITTEST_RE.test(body) && !NEGATION_RE.test(body)) { if (awaitingTest.length < perGroup) awaitingTest.push(brief); } // ② 待你验收
-    // ⑤ else (incl. in-flight review 待复审/送审, a no-SHA completion, bare chatter) ⇒ DROPPED.
+    if (ANOMALY_RE.test(body)) { if (anomalies.length < perGroup) anomalies.push(brief); }                       // ④ 异常 (active problem, incl. a still-broken completion)
+    else if (AWAITTEST_RE.test(body) && !NEGATION_RE.test(body)) { if (awaitingTest.length < perGroup) awaitingTest.push(brief); } // ② 待你验收 (user action preserved)
+    else if (COMPLETION_RE.test(body) && COMMIT_REF.test(body) && !NEGATION_RE.test(body)) { if (recentDone.length < perGroup) recentDone.push(completionLine(body)); } // ① 完成(签收/落地)
+    // ⑤ else (a no-commit-ref completion, bare chatter) ⇒ DROPPED.
   }
   return { awaitingRuling, anomalies, awaitingTest, recentDone };
 }
