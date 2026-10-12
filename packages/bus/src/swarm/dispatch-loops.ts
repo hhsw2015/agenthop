@@ -11,6 +11,18 @@
  * non-starvation property is offline-testable without real timers-in-production.
  */
 
+/**
+ * DISP-1 (infra audit): load the control log FAIL-SOFT. `loadControlLog` THROWS on a corrupt / EACCES / gapped `<seq>.json`,
+ * and the dispatcher ticks called it UNGUARDED at the head — so ONE bad batch made every tick throw at line 1, wedging ALL
+ * supervision AND the control-INDEPENDENT run* after it, forever, with only a 5s error log and no escalation. This wraps the
+ * load: on a fault it calls `onFault` (the caller escalates to the coordinator + logs) and returns null, so the tick SKIPS
+ * control-dependent work this round but still runs the independent observability (gauge/console/digest/wake); a later tick
+ * that reads a repaired log resumes normally. Pure + injectable (generic over the state type, so no control-store coupling). */
+export function loadControlOrEscalate<T>(load: () => T, onFault: (e: unknown) => void): T | null {
+  try { return load(); }
+  catch (e) { onFault(e); return null; }
+}
+
 export type LoopName = "pass" | "sweep";
 
 export type LoopFns = {

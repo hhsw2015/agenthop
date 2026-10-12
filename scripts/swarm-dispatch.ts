@@ -43,7 +43,7 @@ import { mintEphToken, readEphSecret } from "../packages/bus/src/swarm/mint.js";
 import { sweepPass, type SweepOps } from "../packages/bus/src/swarm/task-sweep.js";
 import { acquireSingleFlight } from "../packages/bus/src/swarm/single-flight.js";
 import { validSeedWait } from "../packages/bus/src/swarm/wait-seed.js";
-import { runDispatchLoops } from "../packages/bus/src/swarm/dispatch-loops.js";
+import { runDispatchLoops, loadControlOrEscalate } from "../packages/bus/src/swarm/dispatch-loops.js";
 import { writeProjection } from "../packages/bus/src/swarm/projection.js";
 import { beatStart, beatEnd } from "../packages/bus/src/swarm/heartbeat.js";
 import { buildControlCut, heartbeatObservations, currentPlan } from "../packages/bus/src/swarm/liveness-review.js";
@@ -923,6 +923,23 @@ async function main(): Promise<void> {
     log(`[observer→coordinator] UNHEARD/logged (coordinator unresolved${s19Sid ? "" : ", no verified stable SID"}): ${text}`); // plan=log (info severity, or no verified SID) — isReport=false
     return "logged";
   };
+
+  // DISP-1 (infra audit): the control-store load, FAIL-SOFT. A corrupt / EACCES / gapped <seq>.json makes loadControlLog throw;
+  // this escalates to the coordinator (notifyCoordinator dedups the STABLE text so it is not re-sent every 5s tick) + logs the
+  // detail, and returns null so the tick SKIPS control-dependent work this round — the caller still runs the control-INDEPENDENT
+  // observability (gauge/console/digest/wake), so a corrupt control log never ALSO blacks those out. A later tick resumes once
+  // the log is readable. (The startup load at main() init is a separate symptom — a corrupt log there crashes boot; out of scope
+  // for this per-tick wedge fix, noted for a follow-up.)
+  const loadControlFailSoft = (where: string) => loadControlOrEscalate(
+    () => loadControlLog(CONTROL_LOG_DIR),
+    (e) => {
+      log(`${where}: control-log load FAILED — supervision PAUSED until it is readable: ${e instanceof Error ? e.message : e}`);
+      notifyCoordinator(
+        `[infra] dispatcher ${SELF}: control-log unreadable/corrupt — supervision is PAUSED (expired waits not escalated, members not supervised) until it loads. Inspect ${CONTROL_LOG_DIR} for a corrupt / permission-denied / missing <seq>.json.`,
+        { title: "control-log load failed", severity: "critical" },
+      );
+    },
+  );
 
   // §2d-a board producer (board admission 5/n, the PULL path): post the current READY nodes as claimable board items so an
   // idle member can apply, and reap stale UNCLAIMED posts whose node is no longer ready. DORMANT-AHEAD-OF-USE: runs ONLY when
@@ -2081,7 +2098,9 @@ async function main(): Promise<void> {
     // lifecycle→commitControl migration land — a handoff's resume half is not yet wired to continue the business task.
     passTick: async () => {
       await pass(records, ops);
-      if (plan && taskOn && taskOps) { taskStateRef.s = loadControlLog(CONTROL_LOG_DIR); await taskPass(plan, taskOps); }
+      // DISP-1: the task-pass control load is also fail-soft — a corrupt log skips taskPass this tick (escalated in the helper)
+      // but never wedges the pass loop; runBoardProducer/runBoardConsumer below run regardless (each is independently wrapped).
+      if (plan && taskOn && taskOps) { const taskState = loadControlFailSoft("pass(task)"); if (taskState !== null) { taskStateRef.s = taskState; await taskPass(plan, taskOps); } }
       // §2d board admission (PULL path) — both self-gated on SWARM_BOARD_ADMIT (live by default; =0 ⇒ no-op), independent of
       // SWARM_TASK_EXEC push. Producer posts ready nodes as claimable items; consumer admits claims (prepareDispatch on current
       // CONTROL → grant intent+binding+supervision wait+receipt / reject), NO execution (A2). Dormant-ahead-of-use.
@@ -2094,47 +2113,53 @@ async function main(): Promise<void> {
     // The liveness sweep (§0b R2) — scan durable waits + member liveness, auto-handle expired waits (ping/escalate/re-arm)
     // + dead owners (reassign) + stuck validators (move). The coordinator-replacement step; gated on SWARM_SWEEP.
     sweepTick: async () => {
-      sweepStateRef.s = loadControlLog(CONTROL_LOG_DIR);
-      if (SWEEP_ENABLED) {
-        // §2c-b: renew eligible EXPIRED liveness waits (subject progressed since the arm) BEFORE escalating, then reload so
-        // sweepPass sees the fresh deadlines and does not escalate a just-renewed wait.
-        renewLivenessWaits();
-        sweepStateRef.s = loadControlLog(CONTROL_LOG_DIR);
-        await sweepPass(sweepOps);
-      }
-      // Now-dependent projection + INV-1 verdict refresh on the INDEPENDENT sweep loop + its own ref (review P2-1): when the
-      // pass loop wedges, this keeps re-sampling observations and a stale pass heartbeat flips the verdict to UNVERIFIABLE.
-      // Runs even with sweep rules off — it is observability, not a sweep action; bounded, fail-soft inside the helper.
-      refreshProjectionAndVerdict();
-      // L2-struct observer (F22/F25): discover completion-slot artifacts + push board/PROGRESS durable changes to the coordinator.
-      runObserver();
-      // L2-struct 3b (F26): dead-letter bursts ⇒ routing incidents. Dormant until the ledger exists.
-      runDeadLetterWatch();
-      // F40: unclaimed-mail sentinel — a box with stale unread mail and no live drainer ⇒ escalate (silent-stall backstop).
-      runInboxSentinel();
-      // S14: live member sentinel — herdr-identified blocked/fake-death/idle-timeout ⇒ escalate (blocked ⇒ S19 approval). Gated
-      // on SWARM_SENTINEL + herdr reachability; dormant otherwise.
-      await runLiveSentinel();
-      // F53 ②: ops-receipt — verify the coordinator's own fired spawn/inject ops by durable evidence; account (never auto-redo) on
-      // an unverified op. Gated on SWARM_OPS_RECEIPT (LIVE BY DEFAULT, batch-2; =0 to disable); fully fail-soft.
-      runOpsReceipt();
-      // F53 ③: succession-heartbeat — a swapped member silent past the window ⇒ S19. Gated on SWARM_SUCCESSION_HEARTBEAT
-      // (LIVE BY DEFAULT, batch-2; =0 to disable), independent of SWARM_SENTINEL; fully fail-soft.
-      runSuccessionHeartbeat();
-      // T5-5: review-seat autoscale SUGGESTION (never acts) — read the review-queue ledger, advise the coordinator on seat
-      // scaling. Gated on SWARM_REVIEW_AUTOSCALE (live by default; kill with =0); fully fail-soft.
-      runReviewAutoscaleSuggest();
-      // round-doctor SUGGESTION (never acts) — diagnose over-long / degrading review loops from the existing round records and
-      // advise the coordinator. Gated on SWARM_ROUND_DOCTOR (live by default; kill with =0); fully fail-soft.
-      runRoundDoctor();
-      // placement suggestion (reconcile → selectBackends → coordinator advisory). Gated on SWARM_PLACEMENT (default OFF); never
-      // spawns/spends (R16); fully fail-soft.
-      runPlacementSuggest();
-      // approval-delegation (IO round): classify members' PermissionRequests from the dedicated approval key — delegate the safe
-      // scope-free reads AND run the sanitize fork (commit a control-log permissionDecision the member hook polls back). Gated on
-      // SWARM_APPROVAL_DELEGATE OR SWARM_SANITIZED_READ (both LIVE BY DEFAULT, batch-2; =0 each to disable — the drain runs if
-      // EITHER is on); fully fail-soft; never auto-grants (an escalate falls to the user).
-      await runApprovalDelegation();
+      // DISP-1 (infra audit): load the control log FAIL-SOFT. On a corrupt/unreadable/gapped <seq>.json, SKIP control-dependent
+      // work this tick (escalated inside loadControlFailSoft) but STILL run the control-INDEPENDENT tail below — a bad batch must
+      // never ALSO black out gauge/console/digest/wake. A later tick resumes once the log is readable.
+      const sweepState = loadControlFailSoft("sweep");
+      if (sweepState !== null) {
+        sweepStateRef.s = sweepState;
+        if (SWEEP_ENABLED) {
+          // §2c-b: renew eligible EXPIRED liveness waits (subject progressed since the arm) BEFORE escalating, then reload so
+          // sweepPass sees the fresh deadlines and does not escalate a just-renewed wait.
+          renewLivenessWaits();
+          const renewed = loadControlFailSoft("sweep(renew)");
+          if (renewed !== null) { sweepStateRef.s = renewed; await sweepPass(sweepOps); }
+        }
+        // Now-dependent projection + INV-1 verdict refresh on the INDEPENDENT sweep loop + its own ref (review P2-1): when the
+        // pass loop wedges, this keeps re-sampling observations and a stale pass heartbeat flips the verdict to UNVERIFIABLE.
+        // Runs even with sweep rules off — it is observability, not a sweep action; bounded, fail-soft inside the helper.
+        refreshProjectionAndVerdict();
+        // L2-struct observer (F22/F25): discover completion-slot artifacts + push board/PROGRESS durable changes to the coordinator.
+        runObserver();
+        // L2-struct 3b (F26): dead-letter bursts ⇒ routing incidents. Dormant until the ledger exists.
+        runDeadLetterWatch();
+        // F40: unclaimed-mail sentinel — a box with stale unread mail and no live drainer ⇒ escalate (silent-stall backstop).
+        runInboxSentinel();
+        // S14: live member sentinel — herdr-identified blocked/fake-death/idle-timeout ⇒ escalate (blocked ⇒ S19 approval). Gated
+        // on SWARM_SENTINEL + herdr reachability; dormant otherwise.
+        await runLiveSentinel();
+        // F53 ②: ops-receipt — verify the coordinator's own fired spawn/inject ops by durable evidence; account (never auto-redo) on
+        // an unverified op. Gated on SWARM_OPS_RECEIPT (LIVE BY DEFAULT, batch-2; =0 to disable); fully fail-soft.
+        runOpsReceipt();
+        // F53 ③: succession-heartbeat — a swapped member silent past the window ⇒ S19. Gated on SWARM_SUCCESSION_HEARTBEAT
+        // (LIVE BY DEFAULT, batch-2; =0 to disable), independent of SWARM_SENTINEL; fully fail-soft.
+        runSuccessionHeartbeat();
+        // T5-5: review-seat autoscale SUGGESTION (never acts) — read the review-queue ledger, advise the coordinator on seat
+        // scaling. Gated on SWARM_REVIEW_AUTOSCALE (live by default; kill with =0); fully fail-soft.
+        runReviewAutoscaleSuggest();
+        // round-doctor SUGGESTION (never acts) — diagnose over-long / degrading review loops from the existing round records and
+        // advise the coordinator. Gated on SWARM_ROUND_DOCTOR (live by default; kill with =0); fully fail-soft.
+        runRoundDoctor();
+        // placement suggestion (reconcile → selectBackends → coordinator advisory). Gated on SWARM_PLACEMENT (default OFF); never
+        // spawns/spends (R16); fully fail-soft.
+        runPlacementSuggest();
+        // approval-delegation (IO round): classify members' PermissionRequests from the dedicated approval key — delegate the safe
+        // scope-free reads AND run the sanitize fork (commit a control-log permissionDecision the member hook polls back). Gated on
+        // SWARM_APPROVAL_DELEGATE OR SWARM_SANITIZED_READ (both LIVE BY DEFAULT, batch-2; =0 each to disable — the drain runs if
+        // EITHER is on); fully fail-soft; never auto-grants (an escalate falls to the user).
+        await runApprovalDelegation();
+      }  // end control-dependent sweep (DISP-1 guard) — the control-INDEPENDENT tail below runs regardless
       // T5-2: gauge timed sampling — refresh gauge.json so the console gauge is not stale. Gated on SWARM_GAUGE_SAMPLING
       // (live by default; kill with =0), throttled to SWARM_GAUGE_SAMPLE_SEC; fully fail-soft (never breaks the sweep).
       runGaugeSampling();

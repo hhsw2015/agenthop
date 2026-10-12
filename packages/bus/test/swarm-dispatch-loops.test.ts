@@ -59,3 +59,30 @@ describe("runDispatchLoops", () => {
     expect(errors.some((s) => s.startsWith("pass:boom"))).toBe(true); // the error was surfaced, not swallowed
   });
 });
+
+import { loadControlOrEscalate } from "../src/swarm/dispatch-loops.js";
+
+describe("loadControlOrEscalate (DISP-1: control-load fail-soft)", () => {
+  test("a throwing load ⇒ returns null and escalates ONCE (tick skips control work, never wedges)", () => {
+    let faults = 0; let seen: unknown;
+    const r = loadControlOrEscalate<{ seq: number }>(() => { throw new Error("EACCES: open '5.json'"); }, (e) => { faults++; seen = e; });
+    expect(r).toBe(null);
+    expect(faults).toBe(1);                                  // escalated exactly once (caller dedups the coordinator notice)
+    expect(seen).toBeInstanceOf(Error);                     // the fault is handed to the escalator for logging
+  });
+
+  test("a successful load ⇒ returns the state, never escalates", () => {
+    let faults = 0;
+    const r = loadControlOrEscalate(() => ({ seq: 7 }), () => { faults++; });
+    expect(r).toEqual({ seq: 7 });
+    expect(faults).toBe(0);
+  });
+
+  test("the escalator is NOT called on success and the state is passed through by reference", () => {
+    const state = { seq: 1, records: new Map() };
+    let faults = 0;
+    const r = loadControlOrEscalate(() => state, () => { faults++; });
+    expect(r).toBe(state);                                  // same reference (no copy): sweepStateRef.s = it
+    expect(faults).toBe(0);
+  });
+});
