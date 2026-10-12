@@ -47,13 +47,21 @@ launchctl unload ~/Library/LaunchAgents/tech.imatrix.agenthop.fleet-recovery.pli
 
 ## Keeping the snapshot fresh (Q6)
 
-Boot-recovery only helps if a recent `fleet-snapshot.json` exists. Two sources keep it fresh:
-- `SWARM_FLEET_RECOVERY` (flagDefaultOn, default ON) — the dispatcher writes a snapshot at the closeout seam, so the last clean state
-  is always captured (zero-risk: it only writes a file).
-- Manual `tsx scripts/swarm-recover.ts --snapshot` as a fallback / before a planned reboot.
+Boot-recovery only helps if a recent `fleet-snapshot.json` + `roster-snapshot.json` exist. What is wired TODAY (be precise — do not
+over-claim):
 
-`swarm-recover` warns when the snapshot it is recovering from is older than 24h (it relaunches from a possibly outdated roster rather
-than refuse — a stale recovery beats none, honestly flagged).
+- **Dispatcher recipe + fleet-snapshot: WIRED, at dispatcher STARTUP** (not at closeout). When `SWARM_FLEET_RECOVERY` is on
+  (flagDefaultOn, default ON), the dispatcher — on every startup — self-records its EXACT launch recipe (`process.argv` array +
+  allowlisted/scrubbed env + cwd; lossless, unlike a ps capture) to `dispatcher-recipe.json` and writes a fresh `fleet-snapshot.json`
+  carrying it. So the dispatcher half is always current as of its last start (zero-risk: it only writes two files, fail-soft).
+- **Roster snapshot: captured by `swarm-recover --snapshot`** (manual, cron, or the boot plist's own pre-reboot hook) — the dispatcher
+  records only ITSELF, not the live window roster. Run `--snapshot` before a planned reboot, or on a cron, to keep the roster fresh.
+- There is NO closeout-seam auto-capture (an earlier draft of this doc claimed one; it was never wired). The two mechanisms above are
+  the whole story.
+
+`swarm-recover` REFUSES when the fleet-snapshot OR the roster is absent/corrupt (it never recovers an empty fleet), and warns when the
+snapshot it is recovering from is older than 24h (it then relaunches from a possibly outdated roster rather than refuse — a stale
+recovery beats none, honestly flagged).
 
 ## Follow-on
 

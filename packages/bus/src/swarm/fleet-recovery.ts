@@ -1,104 +1,131 @@
 /**
  * fleet-recovery — the PURE decision core for full-fleet-recovery (全舰队状态恢复, brief docs/swarm/full-fleet-recovery-brief.md,
- * FROZEN @cf7a6e2 with 6 rulings; author 90b58f9c). North star (user 原话): after the machine reboots, ONE command brings the whole
- * swarm back to what it was running — not just the windows (F36 resume already does those), but the DISPATCHER, its env, each member's
- * in-flight work, and a DURABLE receipt proving what actually came back.
+ * FROZEN @cf7a6e2; author 90b58f9c). North star (user 原话): after the machine reboots, ONE command brings the whole swarm back to
+ * what it was running — not just the windows (F36 resume already does those), but the DISPATCHER, its env, each member's in-flight
+ * work, and a DURABLE receipt proving what actually came back.
  *
- * This module is the delicate, pure half: the snapshot schema + tolerant parse, the env-capture ALLOWLIST (fail-closed toward secrets
- * and unknown families, Q1), the dispatcher-relaunch decision (Q2), the breakpoint re-pointer builder (Q3), and the recovery verdicts.
- * It reuses the F53 receipt primitives (verifyOpsAction / OpsReceiptRecord) verbatim rather than re-inventing verification, and the
- * F54 wake-health gate (inboxWakeStatus's tri-state) so a recovered dispatcher that comes up wake-INERT is flagged, never assumed OK.
+ * r2 (codex:Work @29bd0e1 first review, 11 P2 + 1 P3): this core was rebuilt around the review's findings —
+ *  - FR-1 the launch recipe is a LOSSLESS argv array + env object (the dispatcher self-records its own process.argv/env; a ps
+ *    display string cannot round-trip spaces), with a clearly-marked lossy ps fallback.
+ *  - FR-2 captured VALUES are credential-scrubbed (a userinfo `scheme://user:pass@host` in SWARM_WORK_REPO's Git URL is stripped;
+ *    the name denylist cannot catch a secret that rides inside a value).
+ *  - FR-5 a roster member is resolved to the UNIQUE live SID before it is confirmed / delivered to (title reuse ⇒ ambiguous).
+ *  - FR-7 the recovery EPISODE id (dedup key root) is distinct per reboot but reused by a retry of an interrupted run.
+ *  - FR-8 each recovery step yields an outstanding/ done obligation; a spawn/deliver fault is recorded, never masked by a 0 exit.
+ *  - FR-10 breakpoint facts come from the canonical board parser (full-SID GRANTED = accepted work) + control-log live attempts;
+ *    an unreadable source stays UNKNOWN, never conflated with "none".
  *
  * PURE (msglog P1 / resume.ts discipline): no fs, no bus, no top-level side effects. The IO shell is fleet-recovery-store.ts + the
- * thin scripts/swarm-recover.ts orchestrator. Selftests + the 3 zero-bug fixture classes (crash-recovery / restart-idempotency /
- * concurrency-race) live in fleet-recovery.selftest.mts.
+ * thin scripts/swarm-recover.ts orchestrator (whose orchestration is itself a dep-injected pure-ish function here: orchestrateRecover).
  */
 import { flagDefaultOn } from "./flag-default.js";
 import { verifyOpsAction, type OpsVerdict, type OpsReceiptRecord } from "./coordinator-ops-receipt.js";
 
-// re-export the receipt verdict/record types so the IO shell + selftests need only this module's surface
 export { verifyOpsAction };
 export type { OpsVerdict, OpsReceiptRecord };
 
 export const FLEET_SNAPSHOT_SCHEMA = "fleet-recovery-snapshot/v1" as const;
+export const DISPATCHER_RECIPE_SCHEMA = "dispatcher-recipe/v1" as const;
 
-/** SWARM_FLEET_RECOVERY — the closeout auto-snapshot hook (Q4: flagDefaultOn, default ON; writing a snapshot to disk is zero-risk,
- *  the user's "开发出来就是拿来用" precedent). recover itself is a manual/triggered action, NOT gated by this flag. Pure. */
+/** SWARM_FLEET_RECOVERY — the dispatcher's self-record + fleet-snapshot auto-capture hook (Q4: flagDefaultOn, default ON; writing a
+ *  snapshot/recipe to disk is zero-risk). recover itself is a manual/triggered action, NOT gated by this flag. Pure. */
 export function fleetRecoveryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return flagDefaultOn(env.SWARM_FLEET_RECOVERY);
 }
 
+/** SWARM_FLEET_BREAKPOINT — Q3 default ON (opt-out). Pure. */
+export function breakpointInjectionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagDefaultOn(env.SWARM_FLEET_BREAKPOINT);
+}
+
 // ============================================================================================================
-// Q1 — env capture allowlist (fail-closed). Lives in the PURE core as an EXPLICIT policy; a credential is NEVER
-// captured (re-sourced from its canonical file at recover time), and a var outside the allowed families is dropped.
+// Q1 / FR-2 — env capture allowlist (fail-closed) + value-level credential scrub
 // ============================================================================================================
 
-/** Non-family env names recovery explicitly needs: AH_HOME (the swarm home) + the endpoint base URLs (keep the dispatcher pointed at
- *  the same CPA/Anthropic endpoints). */
+/** Non-family env names recovery explicitly needs: AH_HOME + the endpoint base URLs. */
 export const ENV_NAME_ALLOW: readonly string[] = ["AH_HOME", "ANTHROPIC_BASE_URL", "CPA_BASE_URL"];
 
-/** Allowed NAME PREFIXES — two families:
- *  - SWARM_ : the identity + behavior-flag family (the "flag 集" of Q1). A NEW SWARM_ flag is captured on purpose (losing a flag on
- *    restart is the whole problem this fixes).
- *  - HERDR_ : the herdr-reachability family (Q2 / F54 regression pin). HERDR_ENV + HERDR_PANE_ID gate inbox-wake; HERDR_BIN /
- *    HERDR_SOCKET_PATH / HERDR_WORKSPACE_ID let the relaunched dispatcher ACTUALLY reach the herdr server to inject wakes. Without
- *    this family a bare restart loses herdr reach ⇒ inbox-wake INERT (the exact F54 bug the receipt must catch). None are secrets.
- *  A brand-new NON-family var is dropped (fail-closed). */
+/** Allowed NAME PREFIXES — the SWARM_ identity+flag family + the HERDR_ reachability family (Q2/F54: HERDR_ENV/HERDR_PANE_ID gate
+ *  inbox-wake, HERDR_BIN/HERDR_SOCKET_PATH let the relaunched dispatcher actually reach herdr). A new non-family var is dropped. */
 export const ENV_PREFIX_ALLOW: readonly string[] = ["SWARM_", "HERDR_"];
 
-/** The SECRET denylist — OVERRIDES every allow rule above. Any name that looks like a credential is NEVER captured, even if it is in
- *  the SWARM_ family or the explicit name list (e.g. a hypothetical SWARM_*_TOKEN, or CPA_API_KEY). Credentials are re-sourced from
- *  their canonical files (~/.agenthop/cpa.json etc.) at recover time, so a leaked fleet-snapshot can never leak a key. */
+/** The SECRET name denylist — overrides every allow rule (a credential NAME is never captured). */
 export const ENV_SECRET_RE = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|_PAT(?![A-Z]))/i;
 
-/** Is this env var captured into the snapshot? Secret denylist first (fail-closed), then the explicit name set, then the family
- *  prefixes. Anything else ⇒ dropped. Pure. */
+/** Is this env var captured by NAME? Secret denylist first (fail-closed), then the explicit name set, then the family prefixes. */
 export function envAllowed(name: string): boolean {
-  if (!name || ENV_SECRET_RE.test(name)) return false;        // fail-closed: never capture a credential
+  if (!name || ENV_SECRET_RE.test(name)) return false;
   if (ENV_NAME_ALLOW.includes(name)) return true;
   return ENV_PREFIX_ALLOW.some((p) => name.startsWith(p));
 }
 
-/** Filter a raw environ into the captured subset: allowlisted, secret-stripped, string values only. Pure (no process.env read). */
+/** FR-2 — strip inline credentials from a VALUE before it is persisted: a URL userinfo `scheme://user:pass@host` (or `user@host`)
+ *  ⇒ `scheme://host`. SWARM_WORK_REPO is a supported Git URL that the name-denylist cannot protect (the secret is in the value, not
+ *  the name). Idempotent, conservative (only touches the userinfo segment of a URL authority). Pure. */
+export function scrubValueSecrets(v: string): string {
+  return v.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/@\s]+)@/g, "$1");
+}
+
+/** Filter a raw environ into the captured subset: allowlisted by name, credential-scrubbed by value (FR-2), string values only.
+ *  Pure (no process.env read). */
 export function filterCaptureEnv(raw: Record<string, string | undefined>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(raw)) {
-    if (typeof v === "string" && envAllowed(k)) out[k] = v;
+    if (typeof v === "string" && envAllowed(k)) out[k] = scrubValueSecrets(v);
   }
   return out;
 }
 
 // ============================================================================================================
-// snapshot schema + tolerant parse
+// FR-1 — the LOSSLESS dispatcher recipe (argv array + env object) + snapshot schema + tolerant parse
 // ============================================================================================================
 
-export type EnvCaptureSource = "captured" | "unavailable";
+/** How the recipe was obtained: `self-recorded` = the dispatcher wrote its OWN process.argv/env (lossless, handles spaces);
+ *  `ps-fallback` = reconstructed from a ps display string (LOSSY — a space in a path/value is not recoverable; relaunch warns and
+ *  will NOT shell-split). */
+export type RecipeSource = "self-recorded" | "ps-fallback";
 
-/** Everything needed to relaunch the dispatcher exactly. `env` is the ALREADY-FILTERED subset (filterCaptureEnv); `envSource` is
- *  "unavailable" when the live environ could not be read — in which case `env` is {} and recover must warn + run with the current
- *  shell env (NEVER fabricate flag values, FC-2 r3 honest-degrade). */
+/** Everything needed to relaunch the dispatcher. `argv` is the EXACT argv array (lossless when self-recorded) — relaunch spawns
+ *  argv[0] with argv.slice(1) directly (never a shell re-split). `env` is the captured, allowlisted, scrubbed subset. */
 export interface DispatcherRecipe {
-  command: string;              // the dispatcher command line (ps -o args=), run verbatim
-  cwd: string;                  // the dispatcher's working directory
-  env: Record<string, string>;  // the captured, allowlisted, secret-stripped env subset
-  envSource: EnvCaptureSource;
+  argv: string[];
+  cwd: string;
+  env: Record<string, string>;
+  source: RecipeSource;
 }
 
 export interface FleetSnapshot {
   schema: typeof FLEET_SNAPSHOT_SCHEMA;
   capturedAtSec: number;
-  dispatcher: DispatcherRecipe | null; // null when no dispatcher was live at capture time
-  rosterFile: string;                    // pointer to the roster-snapshot.json F36 resume owns (members live there)
+  dispatcher: DispatcherRecipe | null;
+  rosterFile: string;
 }
 
-/** Age of a snapshot in seconds (never negative; non-finite inputs ⇒ 0 so a bad clock never looks "fresh"). Pure. */
+/** Age of a snapshot in seconds (never negative; non-finite ⇒ 0 so a bad clock never looks "fresh"). Pure. */
 export function snapshotStaleSec(snap: { capturedAtSec: number }, nowSec: number): number {
   if (!Number.isFinite(snap.capturedAtSec) || !Number.isFinite(nowSec)) return 0;
   return Math.max(0, Math.floor(nowSec - snap.capturedAtSec));
 }
 
-/** Tolerant parse of a fleet-snapshot file — returns null on ANYTHING malformed (a recovery must refuse to act on garbage, never
- *  guess a fleet). Validates the schema tag, capturedAtSec, the dispatcher sub-object (or null), and rosterFile. Pure. */
+/** Tolerant parse of a dispatcher-recipe record (self-recorded file or the dispatcher sub-object of a snapshot). Re-applies the
+ *  allowlist + scrub on READ (an edited/old file can never smuggle a non-allowed or credential-bearing value back in). null when
+ *  malformed (no argv array, no cwd). Pure. */
+export function parseDispatcherRecipe(raw: unknown): DispatcherRecipe | null {
+  if (!raw || typeof raw !== "object") return null;
+  const d = raw as Record<string, unknown>;
+  if (!Array.isArray(d.argv) || d.argv.length === 0 || !d.argv.every((a) => typeof a === "string")) return null;
+  if (typeof d.cwd !== "string" || d.cwd.length === 0) return null;
+  const source: RecipeSource = d.source === "self-recorded" ? "self-recorded" : "ps-fallback";
+  const env: Record<string, string> = {};
+  if (d.env && typeof d.env === "object") {
+    for (const [k, v] of Object.entries(d.env as Record<string, unknown>)) {
+      if (typeof v === "string" && envAllowed(k)) env[k] = scrubValueSecrets(v); // FR-2: re-scrub on read
+    }
+  }
+  return { argv: d.argv as string[], cwd: d.cwd, env, source };
+}
+
+/** Tolerant parse of a fleet-snapshot file — null on ANYTHING malformed (a recovery must refuse to act on garbage). Pure. */
 export function parseFleetSnapshot(text: string): FleetSnapshot | null {
   let o: unknown;
   try { o = JSON.parse(text); } catch { return null; }
@@ -109,19 +136,8 @@ export function parseFleetSnapshot(text: string): FleetSnapshot | null {
   if (typeof r.rosterFile !== "string" || r.rosterFile.length === 0) return null;
   let dispatcher: DispatcherRecipe | null = null;
   if (r.dispatcher !== null && r.dispatcher !== undefined) {
-    if (typeof r.dispatcher !== "object") return null;
-    const d = r.dispatcher as Record<string, unknown>;
-    if (typeof d.command !== "string" || d.command.length === 0) return null;
-    if (typeof d.cwd !== "string" || d.cwd.length === 0) return null;
-    const envSource: EnvCaptureSource = d.envSource === "captured" ? "captured" : "unavailable";
-    const env: Record<string, string> = {};
-    if (d.env && typeof d.env === "object") {
-      for (const [k, v] of Object.entries(d.env as Record<string, unknown>)) {
-        // re-apply the allowlist on READ too: an edited/old snapshot can never smuggle a non-allowed (e.g. secret) var back in.
-        if (typeof v === "string" && envAllowed(k)) env[k] = v;
-      }
-    }
-    dispatcher = { command: d.command, cwd: d.cwd, env, envSource };
+    dispatcher = parseDispatcherRecipe(r.dispatcher);
+    if (dispatcher === null) return null; // a present-but-malformed dispatcher ⇒ refuse (never act on a half-parsed recipe)
   }
   return { schema: FLEET_SNAPSHOT_SCHEMA, capturedAtSec: r.capturedAtSec, dispatcher, rosterFile: r.rosterFile };
 }
@@ -130,106 +146,282 @@ export function parseFleetSnapshot(text: string): FleetSnapshot | null {
 // Q2 — dispatcher relaunch decision + verdict (the F54 wake-health pin)
 // ============================================================================================================
 
-/** Should recover relaunch the dispatcher? Idempotent: a dispatcher already live ⇒ NO (skip). Otherwise YES iff we hold a recipe to
- *  relaunch it with (no recipe ⇒ nothing to do but report). Pure. */
+/** Should recover relaunch the dispatcher? Idempotent: live ⇒ NO. Otherwise YES iff we hold a recipe. Pure. */
 export function dispatcherNeedsRelaunch(snap: FleetSnapshot, dispatcherLiveNow: boolean): boolean {
   if (dispatcherLiveNow) return false;
   return snap.dispatcher !== null;
 }
 
-/** The F54 wake-health gate (Q2): the recovered dispatcher must be wake-ACTIVE. inboxWakeStatus() "on" ⇒ healthy; "on(inert:no-herdr)"
- *  (HERDR_ENV/HERDR_PANE_ID lost — the exact bare-restart trap) or "off" ⇒ the wake capability did NOT come back. Pure. */
+/** The F54 wake-health gate (Q2): "on" ⇒ healthy; "on(inert:no-herdr)" / "off" ⇒ the wake capability did NOT come back. Pure. */
 export function wakeHealthy(status: "off" | "on" | "on(inert:no-herdr)"): boolean {
   return status === "on";
 }
 
-/** Durable facts the recover orchestrator gathers for the relaunched dispatcher. `heartbeatFreshSec` = age of heartbeat.json's last
- *  tick (null = unreadable/absent ⇒ not proven ticking). `wakeStatus` = inboxWakeStatus() of the recovered process's env. */
+/** Durable facts for the relaunched dispatcher. `wakeStatus` is null when the TARGET's env could not be read (FR-3: never borrow
+ *  the caller's env to fill the gap). */
 export interface DispatcherLiveness {
   pidAlive: boolean;
   heartbeatFreshSec: number | null;
-  wakeStatus: "off" | "on" | "on(inert:no-herdr)";
+  wakeStatus: "off" | "on" | "on(inert:no-herdr)" | null;
 }
 
 /**
  * The dispatcher recovery verdict, PURELY from durable facts (F53 shape):
- *   - failed:    the process is provably gone (pid dead) ⇒ durable negative ⇒ redo + account.
- *   - confirmed: pid alive AND heartbeat fresh AND wake ACTIVE ("on") — the dispatcher is really ticking and its inbox-wake works.
- *   - unknown:   pid alive but NOT proven ticking, OR wake is INERT (the F54 trap) ⇒ redo + account, NEVER "assume up"
- *                (coordinator ruling: "inert 即 unknown 级呈报").
- * Pure. The orchestrator owns WHEN to gather facts; this only reads them.
+ *   - failed:    pid provably gone ⇒ durable negative.
+ *   - confirmed: pid alive AND heartbeat fresh AND wake ACTIVE ("on").
+ *   - unknown:   pid alive but not proven ticking, OR wake INERT, OR wake UNKNOWN (FR-3: target env unreadable) ⇒ redo + account.
+ * Pure.
  */
 export function dispatcherVerdict(f: DispatcherLiveness, heartbeatFreshThresholdSec: number): OpsVerdict {
   if (!f.pidAlive) return "failed";
   const heartbeatOk = f.heartbeatFreshSec !== null && Number.isFinite(f.heartbeatFreshSec) && f.heartbeatFreshSec <= heartbeatFreshThresholdSec;
-  if (heartbeatOk && wakeHealthy(f.wakeStatus)) return "confirmed";
-  return "unknown"; // alive but unproven, or wake inert ⇒ the F54 escalation
+  if (heartbeatOk && f.wakeStatus !== null && wakeHealthy(f.wakeStatus)) return "confirmed";
+  return "unknown";
 }
 
-/** Member spawn evidence ⇒ verdict, delegating to the F53 verifyOpsAction (spawn kind). A relaunched member is confirmed when it is
- *  bus-visible OR has checked in; provably gone ⇒ failed; neither ⇒ unknown (redo + account). Pure wrapper so the shell has one call. */
+/** Member spawn evidence ⇒ verdict (F53 verifyOpsAction, spawn kind). Pure. */
 export function memberVerdict(busVisible: boolean, checkinInInbox: boolean, failureSignal: boolean): OpsVerdict {
   return verifyOpsAction({ kind: "spawn", target: "member" }, { busVisible, checkinInInbox, failureSignal });
 }
 
 // ============================================================================================================
-// Q3 — breakpoint re-pointer (default ON). A recovered session resumes its transcript but does NOT know a reboot happened; this one
-// durable message re-points it at its OWN in-flight work so it continues instead of idling (the user's four "怎么又空闲了"). It NEVER
-// assigns new work and NEVER spends — every fact is READ from durable state, honest-or-omitted.
+// FR-5 — resolve a roster member to the UNIQUE live SID (never a reused title / a bare handle)
 // ============================================================================================================
 
-export interface MemberBreakpointFacts {
-  member: string;                 // display id (for the message)
-  boardClaims: readonly string[]; // item ids this member still has CLAIMED on the board (its in-flight work), [] when none found
-  unreadInbox: number;            // scanUnclaimedInbox count for this member's box
+/** The minimal roster-member shape resolution needs. `member` = the captured id (stableId or handle); `title` = the short handle. */
+export interface RosterMemberLike { member: string; title?: string; tool?: string; cwd?: string }
+/** The minimal live-peer shape. */
+export interface PeerLikeMin { id?: string; stableId?: string; title?: string }
+
+export type MemberResolution =
+  | { kind: "resolved"; sid: string }   // bound to a unique live peer's native SID
+  | { kind: "ambiguous" }                // >1 live peer matches (e.g. a reused title) ⇒ cannot confirm this member
+  | { kind: "absent" };                  // no live peer matches ⇒ not (yet) recovered
+
+/**
+ * Resolve a roster member to the UNIQUE live SID actually running it (FR-5). An EXACT id match (the peer's stableId or id equals the
+ * captured member id) wins and yields that peer's native SID. Otherwise fall back to the TITLE but ONLY when EXACTLY ONE live peer
+ * carries it — a reused title (>1 peer) is AMBIGUOUS (never a false confirm), and zero matches is ABSENT. Pure.
+ */
+export function resolveMemberSid(member: RosterMemberLike, peers: readonly PeerLikeMin[]): MemberResolution {
+  for (const p of peers) {
+    if ((p.stableId && p.stableId === member.member) || (p.id && p.id === member.member)) {
+      return { kind: "resolved", sid: p.stableId ?? p.id! };
+    }
+  }
+  if (member.title) {
+    const byTitle = peers.filter((p) => p.title && p.title === member.title);
+    if (byTitle.length === 1) { const p = byTitle[0]!; return { kind: "resolved", sid: p.stableId ?? p.id ?? member.member }; }
+    if (byTitle.length > 1) return { kind: "ambiguous" };
+  }
+  return { kind: "absent" };
 }
 
-/** Build the one-line-ish breakpoint message. Only states facts that are present (no "claim: none" noise beyond a short hint); the
- *  ask is always the same honest re-pointer: you were recovered, resume your in-flight work. Pure (the recoveredAt stamp is passed in).
- *  NEVER contains a new task. */
+// ============================================================================================================
+// FR-7 — recovery EPISODE identity (dedup key root): distinct per reboot, reused by a retry of an interrupted run
+// ============================================================================================================
+
+export interface RecoveryEpisode { episodeId: string; startedAtSec: number; snapshotCapturedAtSec: number; completed: boolean }
+
+/**
+ * Decide the recovery episode id (FR-7). A recovery EVENT is distinct per run so a NEW reboot (even reusing the same snapshot)
+ * delivers a fresh report/breakpoint; but a RETRY of an INTERRUPTED run reuses its id so durable dedup still collapses the retry.
+ * Reuse iff the existing marker is INCOMPLETE and recent (within staleWindowSec); else mint a fresh id. Pure (the id minter + clock
+ * are injected).
+ */
+export function resolveEpisodeId(
+  existing: RecoveryEpisode | null,
+  nowSec: number,
+  mint: () => string,
+  staleWindowSec: number,
+): { episodeId: string; reused: boolean } {
+  if (existing && existing.completed === false && Number.isFinite(existing.startedAtSec) && Number.isFinite(nowSec) && nowSec - existing.startedAtSec <= staleWindowSec) {
+    return { episodeId: existing.episodeId, reused: true };
+  }
+  return { episodeId: mint(), reused: false };
+}
+
+// ============================================================================================================
+// FR-10 — breakpoint re-pointer from AUTHORITATIVE in-flight work (granted board items + live control-log attempts)
+// ============================================================================================================
+
+/** Breakpoint facts. Each source is a `string[]` when READ, or `null` when UNREADABLE (FR-10: an unreadable board/control-log is
+ *  "unknown", NEVER conflated with "none"). `grantedItems` = board items ACCEPTED (granted) by this member (its real in-flight work,
+ *  not a pending `claimed` application); `liveAttempts` = control-log attempt ids RUNNING/RPV for those items; `unreadInbox` null
+ *  when the box could not be scanned. */
+export interface MemberBreakpointFacts {
+  member: string;
+  grantedItems: readonly string[] | null;
+  liveAttempts: readonly string[] | null;
+  unreadInbox: number | null;
+}
+
+/** Build the breakpoint message (FR-10). States only what is KNOWN; an unreadable source becomes an explicit "could not read"
+ *  rather than a false "none". The ask is always the honest re-pointer: you were recovered, resume your ACCEPTED in-flight work.
+ *  NEVER a new task. Pure. */
 export function buildBreakpointText(f: MemberBreakpointFacts, recoveredAtIso: string): string {
   const parts: string[] = [`[fleet-recovery] 已随舰队恢复 @ ${recoveredAtIso}。`];
-  if (f.boardClaims.length > 0) {
-    parts.push(`你仍认领着 ${f.boardClaims.length} 件在途工作:${f.boardClaims.join(", ")}。`);
-  } else {
-    parts.push(`未发现你名下的在途 board 认领。`);
-  }
-  if (f.unreadInbox > 0) parts.push(`收件箱有 ${f.unreadInbox} 件未认领。`);
-  parts.push(`请核对你的 board/收件箱并继续你倒下前的工作;本条只重指既有工作,未派新活。`);
+  if (f.grantedItems === null) parts.push(`无法读取你的 board 认领状态(来源不可读)。`);
+  else if (f.grantedItems.length > 0) parts.push(`你有 ${f.grantedItems.length} 件已准入(granted)的在途工作:${f.grantedItems.join(", ")}。`);
+  else parts.push(`未发现你名下已准入的在途 board 工作。`);
+  if (f.liveAttempts === null) parts.push(`无法读取在途 attempt(来源不可读)。`);
+  else if (f.liveAttempts.length > 0) parts.push(`control-log 在途 attempt:${f.liveAttempts.join(", ")}。`);
+  if (f.unreadInbox === null) parts.push(`无法读取收件箱。`);
+  else if (f.unreadInbox > 0) parts.push(`收件箱有 ${f.unreadInbox} 件未认领。`);
+  parts.push(`请核对并继续你倒下前已接受的工作;本条只重指既有工作,未派新活。`);
   return parts.join(" ");
 }
 
-/** Should a breakpoint be injected for this member (Q3: default ON)? Only for a member whose recovery was CONFIRMED (injecting into a
- *  session we are not sure came back is noise) and only when the feature is on. Pure. */
+/** Should a breakpoint be injected for this member (Q3 default ON)? Only for a CONFIRMED member and only when the feature is on. */
 export function shouldInjectBreakpoint(memberVerdictV: OpsVerdict, breakpointsEnabled: boolean): boolean {
   return breakpointsEnabled && memberVerdictV === "confirmed";
 }
 
-/** SWARM_FLEET_BREAKPOINT — Q3 default ON (opt-out). Pure. */
-export function breakpointInjectionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return flagDefaultOn(env.SWARM_FLEET_BREAKPOINT);
-}
-
-/** Extract a member's 8-hex short id (the board filename `who` token) from its session id / handle, for matching board claims. Returns
- *  null when no unambiguous 8-hex token is present (⇒ don't guess a claim owner; report []). Pure. */
-export function memberShortId(member: string): string | null {
-  const m = (member ?? "").match(/[0-9a-f]{8}/i);
-  return m ? m[0].toLowerCase() : null;
-}
-
-/** From the board dir's file names, the item ids this member (by short id) still has CLAIMED (`<item>.claimed.<who>.json`). Pure (the
- *  shell supplies the readdir result). A member with no resolvable short id ⇒ [] (never guess ownership). */
-export function claimedItemsForMember(member: string, boardFileNames: readonly string[]): string[] {
-  const who = memberShortId(member);
-  if (!who) return [];
+/** Filter the board file NAMES to the items this member has GRANTED (accepted work) using the canonical parser result (FR-10). The
+ *  caller supplies the parse fn (task-board.parseBoardItemName) so this stays pure + the full-SID `who` is honored. Pure. */
+export function grantedItemsForMember(
+  memberSid: string,
+  boardFileNames: readonly string[],
+  parse: (name: string) => { itemId: string; state: string; who: string } | null,
+): string[] {
   const out: string[] = [];
   for (const name of boardFileNames) {
-    if (!name.endsWith(".json")) continue;
-    const parts = name.slice(0, -5).split("."); // strip .json, split
-    // `<item>.claimed.<who>` — item may itself contain dots, so match the LAST two segments as state + who
-    if (parts.length >= 3 && parts[parts.length - 2] === "claimed" && (parts[parts.length - 1] ?? "").toLowerCase() === who) {
-      out.push(parts.slice(0, parts.length - 2).join("."));
-    }
+    const p = parse(name);
+    if (p && p.state === "granted" && p.who === memberSid) out.push(p.itemId);
   }
   return out;
+}
+
+// ============================================================================================================
+// FR-8 — recovery obligations + orchestration (dep-injected so the real recover is testable, FR-11)
+// ============================================================================================================
+
+export type DeliveryStatus = "published" | "already" | "failed" | "skipped";
+
+/** The result of one member's recovery leg. `resolution` is the FR-5 binding; `verdict` the F53 spawn verdict; `breakpoint` the
+ *  FR-8 delivery outcome (an unresolved member is never delivered to). */
+export interface MemberRecoveryResult {
+  member: string;
+  title?: string;
+  resolution: MemberResolution["kind"];
+  sid?: string;
+  verdict: OpsVerdict;
+  breakpoint: DeliveryStatus;
+}
+
+/** The whole recovery outcome. `outstanding` lists steps NOT confirmed-done (FR-8) — a non-empty list ⇒ a non-zero exit + a durable
+ *  record, never masked by "0/0 confirmed". `reportDelivery` is the coordinator-report outcome (also an obligation). */
+export interface RecoveryResult {
+  episodeId: string;
+  dispatcher: { relaunched: boolean; verdict: OpsVerdict; wakeStatus: "off" | "on" | "on(inert:no-herdr)" | null };
+  members: MemberRecoveryResult[];
+  reportDelivery: DeliveryStatus;
+  outstanding: string[];
+  notConfirmed: number;
+}
+
+/** True iff a delivery outcome discharges the obligation (FR-8: a pending/deferred/unknown/failed inbox write is NOT delivered). */
+export function deliveryDischarged(s: DeliveryStatus): boolean {
+  return s === "published" || s === "already";
+}
+
+/** Fold the per-step results into the outstanding list + notConfirmed count (FR-8). Pure. */
+export function summarizeOutstanding(r: Omit<RecoveryResult, "outstanding" | "notConfirmed">): { outstanding: string[]; notConfirmed: number } {
+  const outstanding: string[] = [];
+  if (r.dispatcher.verdict !== "confirmed") outstanding.push(`dispatcher:${r.dispatcher.verdict}${r.dispatcher.wakeStatus && r.dispatcher.wakeStatus !== "on" ? `(wake:${r.dispatcher.wakeStatus})` : ""}`);
+  let notConfirmed = r.dispatcher.verdict !== "confirmed" ? 1 : 0;
+  for (const m of r.members) {
+    if (m.verdict !== "confirmed") { outstanding.push(`member:${m.title ?? m.member}:${m.verdict}`); notConfirmed += 1; }
+    else if (m.breakpoint !== "skipped" && !deliveryDischarged(m.breakpoint)) outstanding.push(`breakpoint:${m.title ?? m.member}:${m.breakpoint}`);
+  }
+  if (!deliveryDischarged(r.reportDelivery) && r.reportDelivery !== "skipped") outstanding.push(`coordinator-report:${r.reportDelivery}`);
+  return { outstanding, notConfirmed };
+}
+
+// ============================================================================================================
+// FR-11 — orchestrateRecover: the real recovery flow as a DEP-INJECTED function, so the actual orchestration (episode identity,
+// launch ownership, verification, breakpoint/report obligations) runs under test with fakes for launch/peers/inbox/clock.
+// ============================================================================================================
+
+/** Every IO/launch seam the orchestration needs, injected (the shell wires real; the selftest wires fakes). */
+export interface RecoverDeps {
+  now: () => number;
+  mintEpisodeId: () => string;
+  episodeStaleWindowSec: number;
+  heartbeatThresholdSec: number;
+  breakpointsEnabled: boolean;
+  recoveredAtIso: string;
+  readEpisode: () => RecoveryEpisode | null;
+  writeEpisode: (ep: RecoveryEpisode) => void;
+  dispatcherLive: () => boolean;
+  /** Relaunch the dispatcher; MUST be fail-soft (its own async spawn 'error' handled by the shell, FR-8). Return false on a sync fault. */
+  relaunchDispatcher: (recipe: DispatcherRecipe) => boolean;
+  /** Durable dispatcher liveness AFTER settle — the TARGET's own wake status (FR-3), never the caller's env. */
+  verifyDispatcher: () => DispatcherLiveness;
+  peers: () => readonly PeerLikeMin[];
+  settle: () => Promise<void>;
+  /** FR-6 launch ownership: true iff THIS call won the launch for (member, episode); false ⇒ already attempted this episode ⇒ don't re-launch. */
+  claimLaunch: (memberKey: string, episodeId: string) => boolean;
+  launchMember: (member: RosterMemberLike) => Promise<{ ok: boolean; error?: string }>;
+  breakpointFacts: (sid: string) => MemberBreakpointFacts;
+  /** Deliver the breakpoint; the shell builds the durable idempotency key from (episodeId, sid). */
+  deliverBreakpoint: (sid: string, text: string, episodeId: string) => DeliveryStatus;
+  /** Deliver the coordinator report; "skipped" when no coordinator is configured. Shell builds the key from episodeId. */
+  deliverReport: (result: RecoveryResult, episodeId: string) => DeliveryStatus;
+}
+
+/**
+ * Run the recovery orchestration (FR-5/6/7/8). The caller (shell) has ALREADY validated the fleet-snapshot AND the roster are
+ * present+parseable (FR-4 refuse-on-absent happens before this). Steps: resolve the episode id (retry-reuse vs new) → relaunch the
+ * dispatcher if needed → launch each ABSENT member under a per-episode ownership claim (never double-launch) → settle → verify each
+ * member against the UNIQUE live SID (ambiguous/absent ⇒ unknown, never a false confirm) → inject a breakpoint to each CONFIRMED
+ * member → deliver the coordinator report → fold outstanding obligations → mark the episode completed ONLY when nothing is
+ * outstanding (so a re-run of an interrupted recovery retries the rest). Pure given its deps.
+ */
+export async function orchestrateRecover(snap: FleetSnapshot, roster: readonly RosterMemberLike[], deps: RecoverDeps): Promise<RecoveryResult> {
+  const nowSec = deps.now();
+  const existing = deps.readEpisode();
+  const { episodeId, reused } = resolveEpisodeId(existing, nowSec, deps.mintEpisodeId, deps.episodeStaleWindowSec);
+  const startedAtSec = reused && existing ? existing.startedAtSec : nowSec;
+  deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: false });
+
+  // 1) dispatcher first
+  let relaunched = false;
+  if (dispatcherNeedsRelaunch(snap, deps.dispatcherLive()) && snap.dispatcher) {
+    relaunched = deps.relaunchDispatcher(snap.dispatcher); // fail-soft; the verdict below reflects whether it actually came up
+  }
+
+  // 2) members: launch each ABSENT one under a per-episode ownership claim (FR-6: never double-launch on re-run/concurrency)
+  const peersBefore = deps.peers();
+  for (const m of roster) {
+    if (resolveMemberSid(m, peersBefore).kind !== "absent") continue; // already up (resolved) or ambiguous ⇒ don't launch
+    if (deps.claimLaunch(m.member, episodeId)) await deps.launchMember(m); // won the claim ⇒ launch; else already attempted this episode ⇒ skip
+  }
+
+  // 3) settle, then VERIFY against the unique live SID (FR-5) + the TARGET-only dispatcher wake (FR-3)
+  await deps.settle();
+  const liveness = deps.verifyDispatcher();
+  const dispV = dispatcherVerdict(liveness, deps.heartbeatThresholdSec);
+  const peersAfter = deps.peers();
+  const members: MemberRecoveryResult[] = roster.map((m) => {
+    const res = resolveMemberSid(m, peersAfter);
+    const verdict: OpsVerdict = res.kind === "resolved" ? memberVerdict(true, false, false) : memberVerdict(false, false, false); // ambiguous/absent ⇒ unknown
+    let breakpoint: DeliveryStatus = "skipped";
+    if (res.kind === "resolved" && shouldInjectBreakpoint(verdict, deps.breakpointsEnabled)) {
+      const text = buildBreakpointText(deps.breakpointFacts(res.sid), deps.recoveredAtIso);
+      breakpoint = deps.deliverBreakpoint(res.sid, text, episodeId);
+    }
+    return { member: m.member, ...(m.title ? { title: m.title } : {}), resolution: res.kind, ...(res.kind === "resolved" ? { sid: res.sid } : {}), verdict, breakpoint };
+  });
+
+  // 4) coordinator report + outstanding obligations (FR-8)
+  const partial: RecoveryResult = { episodeId, dispatcher: { relaunched, verdict: dispV, wakeStatus: liveness.wakeStatus }, members, reportDelivery: "skipped", outstanding: [], notConfirmed: 0 };
+  const reportDelivery = deps.deliverReport(partial, episodeId);
+  const withReport = { ...partial, reportDelivery };
+  const { outstanding, notConfirmed } = summarizeOutstanding(withReport);
+  const result: RecoveryResult = { ...withReport, outstanding, notConfirmed };
+
+  // 5) mark the episode COMPLETE only when nothing is outstanding (FR-8: an interrupted/failed run stays open for a retry to finish)
+  deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: outstanding.length === 0 });
+  return result;
 }
