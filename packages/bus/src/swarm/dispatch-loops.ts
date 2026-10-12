@@ -23,6 +23,30 @@ export function loadControlOrEscalate<T>(load: () => T, onFault: (e: unknown) =>
   catch (e) { onFault(e); return null; }
 }
 
+/**
+ * DISP1-2/DISP1-3 (codex:Work): the sweep tick, grouped by ACTUAL control-log dependency rather than by position. `independent`
+ * run* read their OWN sources (inbox dirs, swap/PID records, review/round/placement ledgers), NOT the control log, so they run
+ * EVERY tick — a corrupt control log must never silence them. `loadControl` is the fail-soft load (returns true iff the control
+ * log is readable; it sets the shared state as a side effect and has already escalated on a fault). `dependent` run* (sweepPass,
+ * projection/verdict, observer, dead-letter, live-sentinel, ops-receipt, approval) run ONLY when the control log loaded. `tail`
+ * is the control-INDEPENDENT observability (gauge/console/digest/wake), also every tick. Each step is isolated (its throw is
+ * reported via onError and never skips the remaining steps or the tail), so one faulty duty can't starve the others. Pure
+ * scheduling — all work is injected, so the grouping + fail-soft behavior is offline-testable. */
+export async function runSweepTick(p: {
+  independent: Array<() => void | Promise<void>>;
+  loadControl: () => boolean;
+  dependent: Array<() => void | Promise<void>>;
+  tail: Array<() => void | Promise<void>>;
+  onError: (where: string, e: unknown) => void;
+}): Promise<void> {
+  const step = async (where: string, f: () => void | Promise<void>): Promise<void> => { try { await f(); } catch (e) { p.onError(where, e); } };
+  for (let i = 0; i < p.independent.length; i++) await step(`sweep.independent[${i}]`, p.independent[i]!);
+  let loaded = false;
+  try { loaded = p.loadControl(); } catch (e) { p.onError("sweep.loadControl", e); loaded = false; } // loadControl is already fail-soft; this is belt-and-suspenders
+  if (loaded) for (let i = 0; i < p.dependent.length; i++) await step(`sweep.dependent[${i}]`, p.dependent[i]!);
+  for (let i = 0; i < p.tail.length; i++) await step(`sweep.tail[${i}]`, p.tail[i]!);
+}
+
 export type LoopName = "pass" | "sweep";
 
 export type LoopFns = {

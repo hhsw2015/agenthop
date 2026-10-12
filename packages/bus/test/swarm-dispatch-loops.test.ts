@@ -86,3 +86,86 @@ describe("loadControlOrEscalate (DISP-1: control-load fail-soft)", () => {
     expect(faults).toBe(0);
   });
 });
+
+import { runSweepTick } from "../src/swarm/dispatch-loops.js";
+
+describe("runSweepTick (DISP1-2/DISP1-3: group by control-dependency, isolate each step)", () => {
+  const rec = () => { const log: string[] = []; const mk = (n: string) => () => { log.push(n); }; return { log, mk }; };
+
+  test("control loads ⇒ independent + dependent + tail ALL run", async () => {
+    const { log, mk } = rec();
+    await runSweepTick({
+      independent: [mk("i1"), mk("i2")],
+      loadControl: () => { log.push("load:ok"); return true; },
+      dependent: [mk("d1"), mk("d2")],
+      tail: [mk("t1")],
+      onError: () => { throw new Error("no error expected"); },
+    });
+    expect(log).toEqual(["i1", "i2", "load:ok", "d1", "d2", "t1"]); // independent BEFORE load, dependent only after, tail last
+  });
+
+  test("control FAILS ⇒ independent + tail still run, dependent SKIPPED (DISP1-2: a corrupt log never silences independent duties)", async () => {
+    const { log, mk } = rec();
+    await runSweepTick({
+      independent: [mk("inboxSentinel"), mk("successionHeartbeat")],
+      loadControl: () => { log.push("load:FAIL"); return false; },
+      dependent: [mk("sweepPass"), mk("approval")],
+      tail: [mk("gauge"), mk("digest")],
+      onError: () => {},
+    });
+    expect(log).toEqual(["inboxSentinel", "successionHeartbeat", "load:FAIL", "gauge", "digest"]); // NO sweepPass/approval
+  });
+
+  test("a DEPENDENT step throwing is isolated — later dependents AND the tail still run (tail never starved, DISP1-1 promise)", async () => {
+    const { log, mk } = rec(); const errs: string[] = [];
+    await runSweepTick({
+      independent: [mk("i1")],
+      loadControl: () => true,
+      dependent: [() => { throw new Error("deadletter boom"); }, mk("afterThrow")],
+      tail: [mk("gauge")],
+      onError: (where) => errs.push(where),
+    });
+    expect(log).toEqual(["i1", "afterThrow", "gauge"]);        // the throw did NOT skip the next dependent or the tail
+    expect(errs).toEqual(["sweep.dependent[0]"]);              // reported, named
+  });
+
+  test("an INDEPENDENT step throwing is isolated — the rest of the tick still runs", async () => {
+    const { log, mk } = rec(); const errs: string[] = [];
+    await runSweepTick({
+      independent: [() => { throw new Error("sentinel boom"); }, mk("i2")],
+      loadControl: () => true,
+      dependent: [mk("d1")],
+      tail: [mk("t1")],
+      onError: (where) => errs.push(where),
+    });
+    expect(log).toEqual(["i2", "d1", "t1"]);
+    expect(errs).toEqual(["sweep.independent[0]"]);
+  });
+
+  test("recovery: a failed-load tick skips dependents; the NEXT tick with a readable log resumes them", async () => {
+    const seq: boolean[] = [false, true]; let tick = 0;
+    const runs: string[] = [];
+    const once = () => runSweepTick({
+      independent: [() => runs.push("indep")],
+      loadControl: () => seq[tick++]!,
+      dependent: [() => runs.push("dep")],
+      tail: [() => runs.push("tail")],
+      onError: () => {},
+    });
+    await once(); // control unreadable ⇒ no dep
+    await once(); // control repaired ⇒ dep resumes
+    expect(runs).toEqual(["indep", "tail", "indep", "dep", "tail"]);
+  });
+
+  test("async steps are awaited in order (a slow dependent completes before the tail)", async () => {
+    const log: string[] = [];
+    await runSweepTick({
+      independent: [],
+      loadControl: () => true,
+      dependent: [async () => { await new Promise((r) => setTimeout(r, 20)); log.push("slow-dep"); }],
+      tail: [() => log.push("tail")],
+      onError: () => {},
+    });
+    expect(log).toEqual(["slow-dep", "tail"]);
+  });
+});
