@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { subjectProgressSeq, waitArmSeq, hasFreshSubjectEvidence, renewOperationId, renewalCount, renewExpiredLivenessWaits } from "../src/swarm/evidence-renewal.js";
-import { entityKeyOf, liveEntities, type Change, type ChangeBody, type CommittedBatch, type LogState } from "../src/swarm/control-log.js";
+import { entityKeyOf, liveEntities, type Change, type ChangeBody, type CommitResult, type CommittedBatch, type LogState } from "../src/swarm/control-log.js";
 import { loadControlLog, commitControl, readControlBatches } from "../src/swarm/control-store.js";
 
 // Minimal change fixtures: the derivations read only a few fields per change type, so build those and cast.
@@ -230,5 +230,37 @@ describe("renewExpiredLivenessWaits — real control-store (DISP1-1/DISP1-3)", (
     expect(a.faults.length).toBe(1);
     expect(a.commits()).toBe(0);
     expect(deadlineOf(loadControlLog(dir), "W")).toBe(100); // untouched
+  });
+
+  // DISP1-1 r4 (codex:Work): a wait we DECIDED to renew whose COMMIT does not persist ⇒ the pass is INCOMPLETE ⇒ ok:false, so
+  // the caller skips the expiry sweep rather than escalating a wait that should have renewed (the chmod-EACCES / CAS counterexample).
+  test("eligible wait whose commit THROWS (e.g. EACCES on the commit write) ⇒ ok:false (pass incomplete, caller skips sweep)", () => {
+    const dir = mkDir();
+    let s = loadControlLog(dir); s = seed(dir, s, expiredWait("W", "J", 100)); s = seed(dir, s, attemptBody("J", "a1"));
+    const a = mkDeps(dir, { commit: () => { throw new Error("EACCES"); } });
+    const r = renewExpiredLivenessWaits(a.deps);
+    expect(r.ok).toBe(false);
+    expect(deadlineOf(loadControlLog(dir), "W")).toBe(100); // not renewed
+  });
+
+  test("eligible wait whose commit is CAS-REJECTED (not-ok result) ⇒ ok:false (pass incomplete)", () => {
+    const dir = mkDir();
+    let s = loadControlLog(dir); s = seed(dir, s, expiredWait("W", "J", 100)); s = seed(dir, s, attemptBody("J", "a1"));
+    const rejecting = (st: LogState) => ({ state: st, result: { ok: false, reason: "stale-entity", entityKey: "wait:W", currentRevision: 9 } as CommitResult });
+    const a = mkDeps(dir, { commit: rejecting });
+    const r = renewExpiredLivenessWaits(a.deps);
+    expect(r.ok).toBe(false);
+    expect(deadlineOf(loadControlLog(dir), "W")).toBe(100); // not renewed
+  });
+
+  // a reducer REFUSAL (not a commit failure) is NOT incomplete — that wait legitimately cannot renew, so the sweep should still
+  // run to escalate it. We prove the complementary direction: a non-eligible expired wait leaves ok:true (sweep proceeds).
+  test("no eligible renewal (expired but no fresh evidence) ⇒ ok:true even though the wait stays expired (sweep will escalate)", () => {
+    const dir = mkDir();
+    let s = loadControlLog(dir); s = seed(dir, s, expiredWait("W", "J", 100)); // no subject progress after the arm ⇒ not eligible
+    const a = mkDeps(dir);
+    const r = renewExpiredLivenessWaits(a.deps);
+    expect(r.ok).toBe(true);        // nothing to renew ⇒ complete ⇒ sweep proceeds and escalates W
+    expect(a.commits()).toBe(0);
   });
 });
