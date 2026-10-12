@@ -242,6 +242,20 @@ describe("morning-digest-store — gatherDigestSources (验收简报化: authori
     expect(s.awaitingRuling).toEqual([]); // the two 待复审 topic lines DROP (nowhere), never 异常
   });
 
+  test("MDV2-5 r7: opening anomaly word goes through subject scope — a landed fix is 完成 (✅ not required); a bare anomaly report is 异常", () => {
+    progress([
+      "- 超时修复已并 @deadbee 0 REMAIN",       // opens 超时 but IS a completion subject (超时=fix object) ⇒ 完成 (no ✅ needed)
+      "- 失联告警修复已并 @deadbee 0 REMAIN",   // opens 失联 but a completion subject ⇒ 完成
+      "- 卡死 pid 123 待排查",                  // opens 卡死, NOT a completion (no commit ref) ⇒ 异常 (bare report still surfaces)
+    ].join("\n"));
+    const s = gatherDigestSources(HOME)!;
+    expect(s.recentDone).toEqual([
+      "超时修复已并 @deadbee 0 REMAIN",
+      "失联告警修复已并 @deadbee 0 REMAIN",
+    ]);
+    expect(s.anomalies).toEqual(["卡死 pid 123 待排查"]);
+  });
+
   test("MDV2-5 r4: reference boundary — a clip truncating a longer invalid id still appends the real ref (position, not re-match)", () => {
     progress(`- ✅ 已并 @deadbeef_owner ${"y".repeat(150)} 落地 @cafebabe`);
     const [done] = gatherDigestSources(HOME)!.recentDone!;

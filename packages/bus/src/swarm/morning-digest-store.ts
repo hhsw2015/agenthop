@@ -153,10 +153,15 @@ function gatherDecisions(home: string, perGroup: number): { rulings: string[]; a
 const COMPLETION_RE = /✅|已签收|已并|已合并|\bmerged\b|装机|\blanded\b/i; // an explicit sign-off / landing marker (NOT bare "0 remain")
 const NEGATION_RE   = /\bnot\b|未|尚未|即[将合并装]|即可|若|回滚|\brevert\b|撤销|放弃/i; // negation / conditional ⇒ NOT a completion fact
 const INFLIGHT_RE   = /待复审|待审|送审|候审|候签|待签|\bpending\b|[1-9]\d*\s*remain/i;   // inter-agent in-flight review ⇒ DROP (⑤)
-// An ACTIVE anomaly STATE (not a bare topic word): the ⚠ symbol; a current/still qualifier (当前/目前/仍/依然/still/未恢复) right
-// before an anomaly word; or the body OPENING with an anomaly word. "超时修复已并" / "待复审：超时报告优化" (超时 as a fix-topic /
-// noun phrase) is NOT active — so a current problem surfaces as 异常 while a topic word does not mis-fire (MDV2-5 subject scope).
-const ACTIVE_ANOMALY = /⚠|(?:当前|目前|仍|依然|still|未恢复|尚未恢复|未消)[^。；;]{0,8}(?:\bblocked\b|\bstuck\b|卡死|卡住|卡点|超时|deadline|失联|中断)|^(?:\bblocked\b|\bstuck\b|卡死|卡住|卡点|超时|deadline|失联|中断)/i;
+// An ACTIVE anomaly STATE (not a bare topic word): the ⚠ symbol, or a current/still qualifier (当前/目前/仍/依然/still/未恢复)
+// right before an anomaly word. "超时修复已并" / "待复审：超时报告优化" (超时 as a fix-topic / noun phrase) is NOT active — so a
+// current problem surfaces as 异常 while a topic word does not mis-fire (MDV2-5 subject scope). An anomaly word merely OPENING
+// the subject is handled below via OPENING_ANOMALY, AFTER the completion branch, so a landed fix ("超时修复已并") stays 完成.
+const ACTIVE_ANOMALY = /⚠|(?:当前|目前|仍|依然|still|未恢复|尚未恢复|未消)[^。；;]{0,8}(?:\bblocked\b|\bstuck\b|卡死|卡住|卡点|超时|deadline|失联|中断)/i;
+// A bare anomaly-word subject ("卡死 pid 123") is a current problem, but only when the subject is NOT a landed
+// fix (MDV2-5 r7): "超时修复已并 @sha" opens with 超时 yet is a completion subject (超时 = fix object, not state),
+// so this is checked AFTER the completion branch — completion wins, the opening word surfaces only otherwise.
+const OPENING_ANOMALY = /^(?:\bblocked\b|\bstuck\b|卡死|卡住|卡点|超时|deadline|失联|中断)/i;
 const AWAITTEST_RE  = /待验收|待实测|待你测|待实机|待自测|待体验|needs?-?test/i;            // landed, awaiting the user's own real-test
 /** A context-anchored, whole-token COMMIT REFERENCE (the output-contract OC-4 recipe): a label (固定 / sha / commit / a landing verb
  *  / @) immediately before a 7-64 hex token that stands alone — trailing `(?!-)` rejects a UUID segment ("deadbeef-1234-…"), and an
@@ -212,7 +217,8 @@ export function gatherDigestSources(home: string, tailLines = 80, perGroup = 8):
     else if (AWAITTEST_RE.test(subject) && !NEGATION_RE.test(subject)) { if (awaitingTest.length < perGroup) awaitingTest.push(brief); } // (2) user-test subject ⇒ 待你验收
     else if (INFLIGHT_RE.test(subject)) { /* (3) in-flight review subject ⇒ DROP (topic words ignored) */ }
     else if (COMPLETION_RE.test(subject) && COMMIT_REF.test(body) && !NEGATION_RE.test(subject)) { if (recentDone.length < perGroup) recentDone.push(completionLine(body)); } // (4) 完成
-    // (5) else (a no-commit-ref completion, bare chatter) ⇒ DROPPED.
+    else if (OPENING_ANOMALY.test(subject)) { if (anomalies.length < perGroup) anomalies.push(brief); }                           // (5) bare anomaly-word subject (not a landed fix) ⇒ 异常
+    // (6) else (a no-commit-ref completion, bare chatter) ⇒ DROPPED.
   }
   return { awaitingRuling, anomalies, awaitingTest, recentDone };
 }
