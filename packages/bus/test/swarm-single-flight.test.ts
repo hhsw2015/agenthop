@@ -65,6 +65,23 @@ describe("acquireSingleFlight", () => {
     expect(readFileSync(p, "utf8").trim()).toBe("999999"); // untouched
   });
 
+  test("DISP3-1: a moved-aside read error must NOT let the restore CLOBBER a racer that acquired in the gap", () => {
+    const p = lockPath();
+    writeFileSync(p, ""); // a readable EMPTY old lock (holder NaN ⇒ enters the stale-reclaim path)
+    const io = {
+      pidAlive: (pid: number) => pid === 88888, // the racer's pid is alive; the empty holder (NaN) is not
+      readLock: (lp: string): string => {
+        if (lp === p) return readFileSync(lp, "utf8"); // reading the live lock path ⇒ real
+        // reading the moved-aside copy: simulate a transient EACCES AND a racer publishing its pid at lockPath in the gap
+        writeFileSync(p, "88888"); // racer B acquires lockPath while we are mid-reclaim
+        const e = new Error("EACCES") as NodeJS.ErrnoException; e.code = "EACCES"; throw e;
+      },
+    };
+    const got = acquireSingleFlight(p, io);
+    expect(got).toBeNull();                                 // we must NOT acquire — B holds; our restore must not clobber B
+    expect(readFileSync(p, "utf8").trim()).toBe("88888");   // B's lock intact (not overwritten by our aside restore, not reclaimed)
+  });
+
   test("DISP-3: ENOENT on the holder read ⇒ the lock vanished mid-check ⇒ retry, then acquire", () => {
     const p = lockPath();
     writeFileSync(p, "999999"); // present ⇒ first linkSync EEXISTs

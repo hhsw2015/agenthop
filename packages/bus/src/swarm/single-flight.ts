@@ -80,7 +80,14 @@ export function acquireSingleFlight(lockPath: string, io: LockIO = realLockIO): 
       let moved: string | null = null;
       try { moved = readLock(aside).trim(); } catch { moved = null; }
       if (moved !== null && moved === holderRaw) safeUnlink(aside); // exactly the stale lock we judged — reclaimed
-      else { try { renameSync(aside, lockPath); } catch { safeUnlink(aside); } } // changed or unreadable — restore it
+      else {
+        // DISP3-1 (codex:Work): restore the moved-aside lock ATOMICALLY. A plain rename would CLOBBER a lock a racer PUBLISHED at
+        // lockPath in the judge→reclaim gap (double-hold: we overwrite the racer's live lock with our empty/old copy, then reclaim
+        // it). linkSync fails EEXIST when lockPath is now occupied ⇒ we ABANDON the restore (the racer owns it) instead of
+        // overwriting, and contend. This is the file-lock analog of the lock-semantics "write-then-verify-exclusive" rule.
+        try { linkSync(aside, lockPath); } catch { /* occupied by a racer (EEXIST) or gone — never clobber a published holder */ }
+        safeUnlink(aside); // drop our aside copy either way (restored ⇒ remove the dup hardlink; not ⇒ clean up)
+      }
     }
   }
   return null; // lost the reclaim race repeatedly — back off rather than risk two writers
