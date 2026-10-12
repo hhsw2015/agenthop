@@ -28,7 +28,7 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 
 export type DrainResult = "sent" | "retry";
-export type EnqueueResult = "enqueued" | "already" | "failed";
+export type EnqueueResult = "enqueued" | "already" | "conflict" | "failed";
 const SEQ_PAD = 20;                        // zero-pad width: a lexical sort of <pad>.json is numeric (arrival) order
 const STALE_CLAIM_MS = 5 * 60_000;         // a claim older than this is reclaimed even if its pid looks alive (a drain that broke out)
 const DONE_TTL_MS = 24 * 60 * 60_000;      // DONE markers older than this are pruned (bounded disk) — well past any live retry window
@@ -57,41 +57,81 @@ function seqName(seq: number): string | null {
 function markerState(p: string): "present" | "absent" | "unknown" {
   try { lstatSync(p); return "present"; } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
 }
-function writeDone(dir: string, stem: string): void {
-  // ATOMIC (temp+rename) so the DONE marker is all-or-nothing — never a torn/partial file a later probe would misread. Still
-  // BEST-EFFORT on fault (see the module header): a missed marker only risks a re-run (dedup falls to the sink), never a loss.
+function writeDone(dir: string, stem: string): boolean {
+  // ATOMIC (temp+rename) so the DONE marker is all-or-nothing — never a torn/partial file a later probe would misread. Returns
+  // whether it LANDED: a failure must NOT be swallowed-then-ack'd (that drops the completion record) — the caller RELEASES instead,
+  // so the completion is re-attempted (DO-P2-1c). End-to-end dedup of that re-run then rides the sink's idempotency.
   try {
     mkdirSync(doneDir(dir), { recursive: true, mode: 0o700 });
     const p = path.join(doneDir(dir), stem);
     const tmp = `${p}.tmp-${randomBytes(4).toString("hex")}`;
     writeFileSync(tmp, "", { mode: 0o600 });
     renameSync(tmp, p);
-  } catch { /* best-effort */ }
+    return true;
+  } catch { return false; }
 }
 function pruneDone(dir: string): void {
   let names: string[];
   try { names = readdirSync(doneDir(dir)); } catch { return; }
   const cutoff = Date.now() - DONE_TTL_MS;
-  for (const n of names) { try { if (statSync(path.join(doneDir(dir), n)).mtimeMs < cutoff) unlinkSync(path.join(doneDir(dir), n)); } catch { /* raced/gone */ } }
+  let live: Set<string> | null = null; // stems that still have a pending/claim entry (computed lazily, once)
+  for (const n of names) {
+    try {
+      if (statSync(path.join(doneDir(dir), n)).mtimeMs >= cutoff) continue; // fresh ⇒ keep
+      // DO-P2-1d: NEVER prune a DONE whose stem still has a pending/claim entry — pruning it would let stale-recovery re-run that
+      // (ack-failed / stuck) entry and re-send. The DONE must outlive the entry it dedups.
+      if (live === null) live = livePendingStems(dir);
+      if (live.has(n)) continue;
+      unlinkSync(path.join(doneDir(dir), n));
+    } catch { /* raced/gone */ }
+  }
+}
+
+/** Stems (pad20) that currently have a pending <stem>.json OR an in-flight <stem>.json.sending-* claim. */
+function livePendingStems(dir: string): Set<string> {
+  const out = new Set<string>();
+  try { for (const n of readdirSync(dir)) { const m = /^(\d{20})\.json(?:\.sending-.*)?$/.exec(n); if (m) out.add(m[1]!); } } catch { /* none */ }
+  return out;
 }
 const sourceGone = (p: string): boolean => { try { lstatSync(p); return false; } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT"; } };
 const baseOfClaim = (claimPath: string): string => claimPath.replace(CLAIM_SUFFIX, "");
 
-/** Enqueue a record under a monotonic numeric event id. A completed id (DONE present) is NOT re-queued ("already", DO-P2-1a). An
- *  illegal id ⇒ "failed" (never a char-folded/truncated name that could collide, DO-P1-2). Atomic temp+rename; the deterministic
- *  <seq>.json name makes a replay collapse to one file. Never throws. */
+/** Enqueue a record under a monotonic numeric event id. The event id BINDS its payload (DO-P1-2):
+ *   - DONE already present ⇒ "already" (completed; never re-queue).
+ *   - an entry for this seq already present — the pending <seq>.json OR an IN-FLIGHT claim (DO-P2-1a: never a second claim while the
+ *     handler runs) — with the IDENTICAL payload ⇒ "already" (idempotent); with a DIFFERENT payload ⇒ "conflict" (the original is
+ *     KEPT, never silently overwritten — an id must not rewrite a different payload).
+ *   - otherwise ⇒ atomic temp+rename write ⇒ "enqueued".
+ *  An illegal id ⇒ "failed" (never a char-folded/truncated name that could collide). Never throws. */
 export function enqueueQueue(dir: string, record: unknown, seq: number): EnqueueResult {
   const stem = seqName(seq);
   if (stem === null) return "failed"; // reject an illegal id rather than fold it into a colliding name
+  let body: string;
+  try { body = JSON.stringify(record); } catch { return "failed"; }
   try {
     if (markerState(path.join(doneDir(dir), stem)) === "present") return "already"; // already completed ⇒ never re-queue
     mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const existing = readExistingBody(dir, stem); // pending <seq>.json OR an in-flight claim of this seq
+    if (existing !== null) return existing === body ? "already" : "conflict"; // bind payload: identical=idempotent, different=keep original
     const file = path.join(dir, `${stem}.json`);
     const tmp = `${file}.tmp-${randomBytes(6).toString("hex")}`;
-    writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 });
-    renameSync(tmp, file); // deterministic name ⇒ a re-enqueue of the same event overwrites (one file, never a pile)
+    writeFileSync(tmp, body, { mode: 0o600 });
+    renameSync(tmp, file);
     return "enqueued";
   } catch { return "failed"; }
+}
+
+/** The stored body of an existing entry for `stem` — the pending <stem>.json, else any in-flight <stem>.json.sending-* claim; null if
+ *  none. An UNREADABLE existing entry also returns null so the caller falls through to a write (the deterministic name collapses onto
+ *  it); payload-binding is a best-effort guard, never a hard fault. */
+function readExistingBody(dir: string, stem: string): string | null {
+  try { return readFileSync(path.join(dir, `${stem}.json`), "utf8"); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return null; } // unreadable pending ⇒ null (fall through)
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return null; }
+  const claimPrefix = `${stem}.json.sending-`;
+  for (const n of names) if (n.startsWith(claimPrefix)) { try { return readFileSync(path.join(dir, n), "utf8"); } catch { return null; } }
+  return null;
 }
 
 /** Reclaim claims whose holder is gone (dead pid) OR that are older than STALE_CLAIM_MS (a drain that broke out mid-flight on a LIVE
@@ -169,17 +209,22 @@ export async function drainQueue(
     const stem = n.slice(0, SEQ_PAD);
     const done = markerState(path.join(doneDir(dir), stem));
     if (done === "present") { ack(claimPath); skipped += 1; continue; }       // DO-P2-1a/c: completed ⇒ discharge, never re-run
-    if (done === "unknown") { release(claimPath); retried += 1; continue; }   // can't tell ⇒ keep, re-check next drain (no loss, no dup)
+    if (done === "unknown") { release(claimPath); retried += 1; break; }       // can't tell ⇒ keep + re-check; DO-P2-3: stop to hold FIFO
     let raw: string;
     try { raw = readFileSync(claimPath, "utf8"); }
-    catch { release(claimPath); retried += 1; continue; }                     // DO-P1-1: a READ error KEEPS the record (never delete)
+    catch { release(claimPath); retried += 1; break; }                         // DO-P1-1: a READ error KEEPS the record; DO-P2-3: stop to hold FIFO
     let record: unknown;
     try { record = JSON.parse(raw); }
-    catch { if (quarantineClaim(dir, claimPath, raw) === "failed") release(claimPath); skipped += 1; continue; } // DO-P1-1: corrupt ⇒ observable isolation
+    catch { if (quarantineClaim(dir, claimPath, raw) === "failed") { release(claimPath); break; } skipped += 1; continue; } // corrupt ⇒ isolate (a quarantined item leaves the queue ⇒ continue; a failed isolate holds FIFO)
     let r: DrainResult;
     try { r = await handle(record); } catch { r = "retry"; }
-    if (r === "sent") { writeDone(dir, stem); ack(claimPath); sent += 1; }     // DO-P2-1c: DONE before delete ⇒ a crash-after-delete never re-sends
-    else { release(claimPath); retried += 1; }
+    if (r === "sent") {
+      // DO-P2-1c: the DONE marker must LAND before the claim is deleted. If it does not, RELEASE (retry) — never ack without the
+      // completion record. The re-run's end-to-end dedup rides the sink's idempotency (writeInbox publishOnce). DO-P2-3: a release
+      // stops the drain to keep FIFO.
+      if (writeDone(dir, stem)) { ack(claimPath); sent += 1; }
+      else { release(claimPath); retried += 1; break; }
+    } else { release(claimPath); retried += 1; break; } // DO-P2-3: a handler "retry" holds the head of the queue (conversation order preserved)
   }
   return { claimed, sent, retried, skipped };
 }

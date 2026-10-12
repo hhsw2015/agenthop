@@ -40,9 +40,15 @@ function readToken(): string {
   if (!existsSync(f)) throw new Error(`no bot token at ${f} — seed it: printf %s '<token>' | ${process.argv[1]} --seed-token`);
   return readFileSync(f, "utf8").trim();
 }
-function readAllow(): Set<number> {
-  try { const a = JSON.parse(readFileSync(allowFile(), "utf8")); return new Set((Array.isArray(a) ? a : a?.chatIds ?? []).filter((n: unknown): n is number => typeof n === "number")); }
-  catch { return new Set(); }
+// DO-R2-P1-1 (FC-2, same shape as TG-5/IP2-3): a read FAULT (EACCES/EIO) or a CORRUPT file is UNKNOWN (returns null), NOT an empty
+// allowlist. A confirmed-absent file (ENOENT) is a real empty set (no chat_id configured yet). Callers must HOLD on null (never
+// treat an unverifiable allowlist as "deny all", which would drop legitimate inbound taps and permanently refuse officer replies).
+function readAllow(): Set<number> | null {
+  let raw: string;
+  try { raw = readFileSync(allowFile(), "utf8"); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return new Set(); console.error(`swarm-tg-entry: allowlist UNREADABLE (${allowFile()}) — HOLDING (not treating as empty): ${e instanceof Error ? e.message : e}`); return null; }
+  try { const a = JSON.parse(raw); return new Set((Array.isArray(a) ? a : a?.chatIds ?? []).filter((n: unknown): n is number => typeof n === "number")); }
+  catch (e) { console.error(`swarm-tg-entry: allowlist CORRUPT (${allowFile()}) — HOLDING (not treating as empty): ${e instanceof Error ? e.message : e}`); return null; }
 }
 const readOffset = (): number => { try { return Number(readFileSync(offsetFile(), "utf8").trim()) || 0; } catch { return 0; } };
 const writeOffset = (n: number): void => { try { writeFileSync(offsetFile(), String(n), { mode: 0o600 }); } catch { /* best-effort; a replayed update is deduped by consume-once */ } };
@@ -308,6 +314,7 @@ async function main(): Promise<void> {
   console.error("swarm-tg-entry: up (notify + collect-approvals; never executes).");
   while (!stop) {
     const allow = readAllow(); // re-read each loop so the user can add a chat_id without a restart
+    if (allow === null) { await new Promise((r) => setTimeout(r, 3000)); continue; } // DO-R2-P1-1: allowlist unverifiable ⇒ HOLD (never process with a deny-all guess)
     try { await notifyNewBatches(token, allow); await pollOnce(token, allow); }
     catch (e) { console.error(`swarm-tg-entry loop error (continuing): ${e instanceof Error ? e.message : e}`); await new Promise((r) => setTimeout(r, 3000)); }
   }

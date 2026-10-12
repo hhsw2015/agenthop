@@ -3,7 +3,7 @@
 // seq-keyed (a monotonic numeric event id — the TG update_id for pending): FIFO by seq, lossless identity, a durable DONE ledger,
 // unique per-drain claims, read-error-release / corrupt-quarantine, and stuck-release retry.
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, renameSync, existsSync, utimesSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, renameSync, existsSync, utimesSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { enqueueQueue, drainQueue, recoverStaleQueueClaims, retryStuckQueue, pidAlive } from "../src/swarm/tg-queue.js";
@@ -53,6 +53,18 @@ describe("tg-queue FIFO by seq (DO-P2-3)", () => {
     const order: number[] = [];
     await drainQueue(DIR, (rec) => { order.push((rec as { seq: number }).seq); return "sent"; }, { cap: 100 });
     expect(order).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]); // arrival order preserved (a conversation stays in sequence)
+  });
+
+  test("a handler retry HOLDS the head: later items are not sent ahead of it (DO-P2-3)", async () => {
+    for (const seq of [1, 2, 3]) enqueueQueue(DIR, { seq }, seq);
+    const sent: number[] = [];
+    // first drain: item 1 retries ⇒ the drain STOPS (2 and 3 are not sent ahead of 1).
+    const r1 = await drainQueue(DIR, (rec) => { const s = (rec as { seq: number }).seq; if (s === 1) return "retry"; sent.push(s); return "sent"; }, { cap: 100 });
+    expect(r1).toMatchObject({ claimed: 1, retried: 1 }); // only item 1 was claimed before the break
+    expect(sent).toEqual([]);                             // nothing jumped ahead of the retried head
+    // second drain: everything sends, strictly in order.
+    await drainQueue(DIR, (rec) => { sent.push((rec as { seq: number }).seq); return "sent"; }, { cap: 100 });
+    expect(sent).toEqual([1, 2, 3]);
   });
 });
 
@@ -108,12 +120,24 @@ describe("tg-queue crash-recovery (DO-P1-1)", () => {
 
 // ── DO-P1-2: lossless identity (no char-fold/truncate collision) ──────────────────────────────────────────────────────
 describe("tg-queue lossless identity (DO-P1-2)", () => {
-  test("distinct seqs ⇒ distinct files; same seq ⇒ one file (dedup, never a pile)", () => {
+  test("event id BINDS payload: identical replay = already; DIFFERENT payload = conflict (original kept, never overwritten)", async () => {
     expect(enqueueQueue(DIR, { v: 1 }, 42)).toBe("enqueued");
-    expect(enqueueQueue(DIR, { v: 2 }, 42)).toBe("enqueued"); // a replay of the SAME event overwrites
+    expect(enqueueQueue(DIR, { v: 1 }, 42)).toBe("already");  // identical replay ⇒ idempotent, one file
+    expect(enqueueQueue(DIR, { v: 2 }, 42)).toBe("conflict"); // DIFFERENT payload for the same id ⇒ rejected
     expect(pendingFiles(DIR).length).toBe(1);
-    enqueueQueue(DIR, { v: 1 }, 43);
-    expect(pendingFiles(DIR).length).toBe(2); // distinct event ⇒ distinct file
+    let got: unknown; await drainQueue(DIR, (rec) => { got = rec; return "sent"; });
+    expect(got).toEqual({ v: 1 }); // the ORIGINAL payload survived — not silently overwritten by {v:2}
+    enqueueQueue(DIR, { v: 9 }, 43);
+    expect(pendingFiles(DIR).length).toBe(1); // distinct event ⇒ its own file (42 already drained)
+  });
+
+  test("a re-enqueue DURING an in-flight claim does not create a second copy (DO-P2-1a active-claim)", () => {
+    enqueueQueue(DIR, { v: 1 }, 42);
+    const [n] = pendingFiles(DIR);
+    renameSync(path.join(DIR, n!), path.join(DIR, `${n}.sending-${process.pid}-${Date.now()}.abc123`)); // simulate an in-flight claim
+    expect(enqueueQueue(DIR, { v: 1 }, 42)).toBe("already");  // same payload, claimed ⇒ no duplicate
+    expect(enqueueQueue(DIR, { v: 2 }, 42)).toBe("conflict"); // different payload, claimed ⇒ rejected (no second claim)
+    expect(pendingFiles(DIR)).toEqual([]); // no new <seq>.json spawned beside the claim
   });
 
   test("seqs that a char-fold would collide stay distinct (the DO-P1-2 class)", () => {
@@ -149,6 +173,30 @@ describe("tg-queue exactly-once via DONE ledger (DO-P2-1)", () => {
     await drainQueue(DIR, () => { sends++; return "sent"; }); // recovery drain sees DONE ⇒ discharges, no re-send
     expect(sends).toBe(1); // delivered exactly once across the crash-recovery
     expect(pendingFiles(DIR)).toEqual([]);
+  });
+
+  test("a DONE-write failure RELEASES the record (preserves the completion obligation), never acks without recording it (DO-P2-1c)", async () => {
+    enqueueQueue(DIR, { v: 1 }, 1);
+    mkdirSync(path.join(DIR, "done"), { recursive: true, mode: 0o500 }); // read-only done/ ⇒ the DONE marker write faults
+    try {
+      let ran = 0;
+      const r = await drainQueue(DIR, () => { ran++; return "sent"; });
+      expect(ran).toBe(1); // the handler ran (the sink was hit)
+      expect(r).toMatchObject({ sent: 0, retried: 1 }); // but DONE did not land ⇒ released, NOT acked-without-record
+      expect(pendingFiles(DIR).length).toBe(1); // obligation preserved for a re-attempt (dedup of the re-run rides the sink)
+    } finally { chmodSync(path.join(DIR, "done"), 0o700); }
+  });
+
+  test("pruneDone KEEPS a DONE whose stem still has a pending entry (DO-P2-1d: DONE outlives the entry it dedups)", async () => {
+    enqueueQueue(DIR, { v: 1 }, 5); // a leftover pending entry for stem 5 (e.g. an ack-failed claim released back)
+    mkdirSync(path.join(DIR, "done"), { recursive: true });
+    writeFileSync(path.join(DIR, "done", "00000000000000000005"), "");
+    const old = (Date.now() - 48 * 3600 * 1000) / 1000; // 48h ago — well past the 24h TTL
+    utimesSync(path.join(DIR, "done", "00000000000000000005"), old, old);
+    let ran = 0;
+    const r = await drainQueue(DIR, () => { ran++; return "sent"; }); // pruneDone runs first, THEN the claim
+    expect(ran).toBe(0);        // the DONE survived pruning ⇒ the entry was discharged (not re-run); had it been pruned, ran would be 1
+    expect(r.skipped).toBe(1);
   });
 });
 
