@@ -78,6 +78,8 @@ import { executorDigestEnabled, loadExecutorDigest, formatExecutorDigest, coerce
 import { gaugeSamplingEnabled, shouldSampleGauge, writeBandwidthProjection } from "../packages/bus/src/swarm/dual-bandwidth-store.js";
 import { consoleProjectionEnabled, shouldWriteConsole } from "../packages/bus/src/swarm/console-projection.js";
 import { writeConsoleProjection } from "../packages/bus/src/swarm/console-projection-store.js";
+import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swarm/idle-explainer.js";
+import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { placementEnabled, readPlacementSpec, readLedgerMachines, planPlacementSuggest, shouldSuggestPlacement } from "../packages/bus/src/swarm/placement-engine.js";
 import { digestEnabled, digestActions, digestTextFromProjection } from "../packages/bus/src/swarm/morning-digest.js";
 import { inboxWakeEnabled, inboxWakeStatus, installInboxWake, backstopWake } from "../packages/bus/src/swarm/inbox-wake.js";
@@ -210,6 +212,8 @@ const SENTINEL_IDLE_SEC = envInt(process.env.SWARM_SENTINEL_IDLE_SEC, 1800);
 const SENTINEL_SAMPLE_SEC = envInt(process.env.SWARM_SENTINEL_SAMPLE_SEC, 60);
 const GAUGE_SAMPLE_SEC = envInt(process.env.SWARM_GAUGE_SAMPLE_SEC, 60); // T5-2 seam: gauge sampling interval (sweep ticks faster, every 5s)
 const CONSOLE_WRITE_SEC = envInt(process.env.SWARM_CONSOLE_SEC, 60); // swarm-console projection write interval (sweep ticks faster, every 5s)
+const IDLE_EXPLAINER_SEC = envInt(process.env.SWARM_IDLE_EXPLAINER_SEC, 60); // idle-explainer projection write interval (= the idle-tick unit)
+const IDLE_TICKS_N = envInt(process.env.SWARM_IDLE_TICKS, 2, 1); // consecutive idle write-intervals before "idle" (default 2 ⇒ ~2 intervals)
 const DIGEST_HOUR = Math.min(23, envInt(process.env.SWARM_DIGEST_HOUR, 7, 0)); // morning-digest local target hour (clamped 0..23)
 
 // T5-5 review-seat autoscale — SUGGESTION MODE ONLY (user ruling 2026-10-08: the flag is half-flipped). When
@@ -722,7 +726,7 @@ async function main(): Promise<void> {
   // kill with SWARM_<X>=0). Calls the SAME readers the features use, so the line reflects the real decision. SWARM_TG_ENTRY is the
   // deliberate exception (opt-in — the bridge needs a user-seeded token), read with its own opt-in form.
   const onoff = (b: boolean): string => (b ? "on" : "off");
-  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} CONSOLE=${onoff(consoleProjectionEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} EXECUTOR_DIGEST=${onoff(executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
+  log(`flags: BOARD_ADMIT=${onoff(boardAdmitEnabled())} REVIEW_AUTOSCALE=${onoff(autoscaleEnabled())} SUCCESSION=${onoff(successionEnabled())} COORD_ESCALATE=${onoff(coordEscalateEnabled())} GAUGE_SAMPLING=${onoff(gaugeSamplingEnabled())} CONSOLE=${onoff(consoleProjectionEnabled())} IDLE_EXPLAINER=${onoff(idleExplainerEnabled())} DIGEST=${onoff(digestEnabled())} INBOX_WAKE=${inboxWakeStatus()} ROUND_DOCTOR=${onoff(roundDoctorEnabled(process.env.SWARM_ROUND_DOCTOR))} EXECUTOR_DIGEST=${onoff(executorDigestEnabled(process.env.SWARM_EXECUTOR_DIGEST))} TG_ENTRY=${onoff(/^(1|true|yes|on)$/i.test(process.env.SWARM_TG_ENTRY ?? ""))} (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)`);
   // flags-default-flip batch-2 (user ruling 2026-10-11): the dormant flags flipped to default-on. "(unwired)" = the flag is
   // flipped but its behavior is not yet wired (an honest no-op until a later wiring round) — the flip only sets the DEFAULT.
   log(`flags(batch-2 default-on): OPS_RECEIPT=${onoff(OPS_RECEIPT_ENABLED)} SUCCESSION_HEARTBEAT=${onoff(SUCCESSION_HEARTBEAT_ENABLED)} POISON_DLQ=${onoff(flagDefaultOn(process.env.SWARM_POISON_DLQ))} APPROVAL_DELEGATE=${onoff(flagDefaultOn(process.env.SWARM_APPROVAL_DELEGATE))} SANITIZED_READ=${onoff(flagDefaultOn(process.env.SWARM_SANITIZED_READ))} ATTRIBUTION=${onoff(flagDefaultOn(process.env.SWARM_ATTRIBUTION))} OUTPUT_CONTRACT=${onoff(flagDefaultOn(process.env.SWARM_OUTPUT_CONTRACT))} SPEND_BREAKER=${onoff(flagDefaultOn(process.env.SWARM_SPEND_BREAKER))}(unwired) CONDITIONAL_ROUTING=${onoff(flagDefaultOn(process.env.SWARM_CONDITIONAL_ROUTING))}(unwired) (opt-out default-on; kill SWARM_<X>=0; APPROVAL_DELEGATE+SANITIZED_READ change member popup behavior)`);
@@ -1881,6 +1885,55 @@ async function main(): Promise<void> {
     catch (e) { log(`console projection failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
+  // idle-root-cause explainer (北极星差距审计件① — the user's #1 activation is "why idle again?"). When the swarm has NO live
+  // dispatched work (control-log kind:"wait" waits = 0) for N consecutive write-intervals, write a data-driven "why idle" one-line
+  // projection (console/idle-explainer.json) the mod status band renders ("idle = waiting for X"), and — ONLY on a GENUINE-STALL
+  // anomaly ONSET (idle + every signal a CONFIRMED zero: no unclaimed box, no review, no awaiting-ruling, no user gate) — raise one
+  // S19 to the coordinator. Gated on SWARM_IDLE_EXPLAINER (live by default; kill with =0), throttled to SWARM_IDLE_EXPLAINER_SEC.
+  // The idle N-tick streak + the anomaly-onset dedup live here (nothing persists them). idle is the control-log WORK view, so an
+  // unreadable read ⇒ not-idle (never a false idle). Fully fail-soft (never breaks the sweep).
+  let lastIdleWriteSec = 0;
+  let idleTickCount = 0;
+  let anomalyOnsetSec: number | null = null; // the current anomaly episode's onset sec (idempotency-key base); null = no episode
+  let anomalyAlerted = false;                 // true once THIS episode's S19 is CONFIRMED durable (IE-3 deliver-then-mark)
+  const runIdleExplainer = (): void => {
+    if (!idleExplainerEnabled()) return; // SWARM_IDLE_EXPLAINER live by default (opt-out; kill with =0)
+    const now = nowSec();
+    if (!shouldWriteConsole(now, lastIdleWriteSec, IDLE_EXPLAINER_SEC)) return; // throttle (reuse the generic console throttle)
+    lastIdleWriteSec = now; // advance BEFORE the write ⇒ one attempt per interval even on throw
+    try {
+      // IE-1: idle = CONFIRMED zero RUNNING attempts (active execution), from ONE control-log read that also yields the
+      // approval/input wait reason-signals. null (control-log unreadable) ⇒ idleSource "unknown" ⇒ NOT idle, reset streak, never "active".
+      const cl = readControlLogSignals(HOME);
+      const idleSource = cl.running === null ? "unknown" as const : "ledger" as const;
+      idleTickCount = cl.running === 0 ? idleTickCount + 1 : 0; // a running OR an unreadable (null) tick resets the streak
+      const idle = idleSource === "ledger" && idleTickCount >= IDLE_TICKS_N;
+      const swarmEstablished = (countRosterMembers(HOME) ?? 0) >= 1; // null (unreadable roster) ⇒ not established ⇒ no anomaly
+      // IE-4: exclude the coordinator notice box + our own box from the unclaimed-work signal, so our own S19 never feeds back in.
+      const coordSid = resolveSession(COORDINATOR, listSessions(HOME)) || (isStableSidStr(COORDINATOR) ? COORDINATOR : "");
+      const exclude = new Set<string>([SELF, ...(coordSid ? [coordSid] : [])].map(inboxDirName));
+      const signals = readIdleSignals(HOME, exclude, cl);
+      const explainer = writeIdleExplainer(HOME, now, idle, idleSource, swarmEstablished, signals);
+      if (!explainer) return; // CP-3 boundary skip — nothing to alert on
+      if (explainer.anomaly) {
+        if (anomalyOnsetSec === null) { anomalyOnsetSec = now; anomalyAlerted = false; } // episode onset
+        if (!anomalyAlerted) {
+          // IE-3 recoverable: deliver, and mark alerted ONLY on a CONFIRMED durable landing (published|already); an unresolved
+          // coordinator or a deferred/unknown write leaves the obligation ⇒ retried next tick (the per-episode idempotency key
+          // dedups the retries so the coordinator sees ONE card per episode).
+          if (coordSid) {
+            const r = writeInbox(HOME, coordSid, { from: SELF, fromLabel: "idle-explainer", taskRef: "idle-anomaly", title: "swarm idle — unexplained, verify", text: `swarm idle-anomaly: ${explainer.reason}`, via: "local", ts: Date.now() }, `idle-anomaly-${anomalyOnsetSec}`);
+            if (r === "published" || r === "already") { anomalyAlerted = true; log(`idle-explainer: S19 unexplained-idle onset presented to coordinator — ${explainer.reason}`); }
+            else log(`idle-explainer: S19 deferred (${r}) — retry next tick`);
+          } else log(`idle-explainer: anomaly onset but coordinator "${COORDINATOR || "(unset)"}" unresolved — projection written, retry when resolvable`);
+        }
+      } else if (recoveryConfirmed({ idle, idleSource, swarmEstablished, signals, running: cl.running, coordResolvable: coordSid !== "" })) {
+        anomalyOnsetSec = null; anomalyAlerted = false; // IE-4: a CONFIRMED recovery (work resumed, or a confirmed reason) ⇒ re-arm
+      } // IE-4: else ⇒ this tick could NOT confirm the anomaly ended (unknown activity / a null signal / unresolvable coordinator)
+        // ⇒ RETAIN the episode + delivered state — never a fake recovery that re-publishes under a fresh key.
+    } catch (e) { log(`idle-explainer failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   // placement wiring — SUGGESTION MODE ONLY (coordinator ruling, same discipline as review-seat autoscale). Each sweep, if
   // SWARM_PLACEMENT is on, read the declarative spec, run the pure chain (reconcile → selectBackends on the shortfall), and
   // ADVISE the coordinator (a durable S19 suggestion, taskRef=placement-suggest) — it NEVER spawns/reclaims and never spends
@@ -2142,6 +2195,9 @@ async function main(): Promise<void> {
       // producers (never mutate live state). Gated on SWARM_CONSOLE (live by default; kill with =0), throttled to
       // SWARM_CONSOLE_SEC; fully fail-soft (never breaks the sweep).
       runConsoleProjection();
+      // idle-root-cause explainer — "why idle" projection for the mod status band + an S19 on a genuine-stall onset. Gated on
+      // SWARM_IDLE_EXPLAINER (live by default; kill with =0), throttled; fully fail-soft (never breaks the sweep).
+      runIdleExplainer();
       // Morning digest — generate the daily brief projection + coordinator fyi once per day at/after SWARM_DIGEST_HOUR. Gated on
       // SWARM_DIGEST (live by default; kill with =0); fully fail-soft.
       runDigest();
