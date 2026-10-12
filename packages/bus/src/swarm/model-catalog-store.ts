@@ -39,8 +39,15 @@ export function cpaBaseUrl(home: string): string | null {
   // MS-P2-6: ENOENT (no config file) ⇒ the local default is correct; a NON-ENOENT read fault (EACCES) ⇒ null = UNREADABLE (a real
   // config exists but we can't read it ⇒ the endpoint identity is UNKNOWN ⇒ the caller must refuse, never silently use the default).
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? LOCAL_DEFAULT_CPA : null; }
-  try { const cfg = JSON.parse(raw) as { baseUrl?: string }; return typeof cfg.baseUrl === "string" && cfg.baseUrl.length > 0 ? cfg.baseUrl : LOCAL_DEFAULT_CPA; }
-  catch { return null; } // corrupt config JSON ⇒ unreadable, refuse (never silently fall to the default endpoint)
+  let cfg: unknown;
+  try { cfg = JSON.parse(raw); } catch { return null; } // corrupt JSON ⇒ unreadable, refuse
+  // MS-P2-6 (r2): a parsed-but-MALFORMED config is NOT "no config" — it is unreadable. Only a plain object may override; a non-object
+  // doc (array/number/string/null) ⇒ null. A valid object with NO baseUrl key ⇒ the default (a real config that just doesn't
+  // override). A baseUrl key PRESENT but not a non-empty string (17 / "" / [] / {}) ⇒ null (declared-but-malformed, never the default).
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) return null;
+  if (!("baseUrl" in (cfg as Record<string, unknown>))) return LOCAL_DEFAULT_CPA;
+  const b = (cfg as { baseUrl?: unknown }).baseUrl;
+  return typeof b === "string" && b.length > 0 ? b : null;
 }
 
 /** CP-3 — the market output dir must be a REAL owned directory, never redirected by a pre-existing symlink. lstat (NO-follow):

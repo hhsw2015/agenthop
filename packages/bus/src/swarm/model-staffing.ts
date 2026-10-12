@@ -13,13 +13,13 @@
  *    a model with NO map entry is SKIPPED and COUNTED (unmappableCount) — the count is carried on every suggestion so it is
  *    VISIBLE (never silently dropped).
  *  - Q5 cost tier is PRIMARY (the model-tiering floor): heavy ⇒ top capability (宁贵勿返); standard ⇒ the 0.95-band, cheapest;
- *    light ⇒ the 0.85-band, Pareto-frontier-preferred then cheapest (够用且性价比). An OPTIONAL budgetUsdCeiling refines within
- *    the band (and flags overBudget rather than returning a weaker default).
+ *    light ⇒ the 0.85-band, Pareto-frontier-preferred then cheapest (够用且性价比). An OPTIONAL budgetUsdCeiling is HARD when
+ *    present: no in-band model within it ⇒ NO-STAFFABLE (MS-P2-2 — never an over-budget "ok", never a weaker default).
  *  - Q6 review heterogeneity is HARD: the suggested reviewer model id MUST differ from the author's; a CROSS-provider same-tier
  *    option MUST be preferred, and a same-provider-different-id pick is allowed ONLY when no cross-provider option exists (the
  *    reason is recorded in `why`).
- *  - CPA availability degrade: when the ideal (highest-capability) pick is not in the catalog, degrade to the nearest available
- *    model and record `degradedFrom` (resolveToCatalogId nearest-available precedent).
+ *  - CPA availability degrade: when the ideal in-band pick is not served by this endpoint but ANOTHER in-band available model is,
+ *    pick that one and record `degradedFrom` (the ideal's marketId). If NO available model clears the floor ⇒ no-staffable (not a degrade).
  *
  * Pure: no fs, no clock beyond the injected `nowSec`. Reuses `stripDateSuffix` from model-tier.ts for catalog/author id
  * tolerance (a catalog that serves only a dated snapshot still matches the mapped base id).
@@ -95,8 +95,9 @@ export type Board = BoardDimension | "composite";
 export type DegradedFrom = { marketId: string; score: number; reason: string };
 
 /** The board evidence a reviewer / the coordinator eyeballs: which board, the chosen model's score on it, its price, and the
- *  price delta vs the cheapest acceptable model in-band (0 ⇒ already the cheapest acceptable). `overBudget` flags that a given
- *  budget ceiling could not be met without dropping below the tier floor (Q5 — flagged, never silently weakened). */
+ *  price delta vs the cheapest acceptable model in-band (0 ⇒ already the cheapest acceptable). `rank` = the pick's board rank over
+ *  the universe; `cheapestOffer` = the upstream cheapest cross-provider offer. (A budget ceiling that cannot be met is NO-STAFFABLE,
+ *  MS-P2-2 — it is never represented as an over-budget success here.) */
 export type StaffingEvidence = {
   board: Board;
   score: number;
@@ -225,10 +226,11 @@ function providerOfAuthor(snapshot: ModelMarketSnapshot, map: Readonly<Record<st
  *     `available` set. For review, the author's own id is excluded from `available` (Q6 HARD) up-front.
  *  2. Fail-closed: no `available` candidate ⇒ a no-staffable result (never a weak default).
  *  3. The capability floor is a FRACTION of the ideal top score (so the band is measured against true top capability). The
- *     AVAILABLE band = available models clearing that floor; empty ⇒ DEGRADE to the best available (recorded).
- *  4. Q6 review: within the band, PREFER cross-provider models; keep same-provider (different-id) only when none exist (recorded).
- *  5. Q5 budget: prefer the sub-band within the ceiling; none fit ⇒ keep the band + flag overBudget (never weaken below floor).
- *  6. Pick by the tier rule; compute degradedFrom vs the ideal pick over the whole universe; assemble the evidence + why.
+ *     AVAILABLE band = available models clearing that floor; EMPTY ⇒ NO-STAFFABLE (MS-P2-2: 无同档, never widen to all available).
+ *  4. Q6 review: within the band, PREFER cross-provider models (a KNOWN different provider; "" is not cross, MS-P3-1); keep
+ *     same-provider (different-id) only when none cross (recorded).
+ *  5. Q5 budget: a given ceiling is HARD — prefer the sub-band within it; none fit ⇒ NO-STAFFABLE (MS-P2-2, never an over-budget ok).
+ *  6. Pick by the tier rule; degradedFrom ONLY when the ideal in-band model (by marketId) is not served by this endpoint; evidence + why.
  */
 export function pickModel(input: PickInput): StaffingSuggestion {
   const board = boardOf(input.taskShape);

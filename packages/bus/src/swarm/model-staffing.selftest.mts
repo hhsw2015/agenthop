@@ -144,6 +144,16 @@ try {
     t("MS-P2-6: corrupt override ⇒ null (never silently falls to seed)", readModelMarketMap(home) === null);
     rmSync(mapOverrideFile(home), { force: true }); mkdirSync(mapOverrideFile(home), { recursive: true }); // dir at the path ⇒ EISDIR read
     t("MS-P2-6: unreadable (EISDIR) override ⇒ null", readModelMarketMap(home) === null);
+    rmSync(mapOverrideFile(home), { recursive: true, force: true });
+    // MS-P2-6 r2: a parsed-but-MALFORMED map (array) is unreadable, NOT a valid/empty/index-keyed map.
+    writeFileSync(mapOverrideFile(home), JSON.stringify({ map: [] }));
+    t("MS-P2-6 r2: map:[] (array) ⇒ null (not a silent empty map)", readModelMarketMap(home) === null);
+    writeFileSync(mapOverrideFile(home), JSON.stringify({ map: ["fixture-model"] }));
+    t("MS-P2-6 r2: map:['x'] (array) ⇒ null (not an index-keyed {0:'x'})", readModelMarketMap(home) === null);
+    writeFileSync(mapOverrideFile(home), JSON.stringify([{ map: {} }]));
+    t("MS-P2-6 r2: bare-array doc ⇒ null", readModelMarketMap(home) === null);
+    writeFileSync(mapOverrideFile(home), JSON.stringify({ map: {} }));
+    t("MS-P2-6 r2: map:{} (object) stays a valid EMPTY map (not null) — contrast", (() => { const m = readModelMarketMap(home); return m !== null && Object.keys(m).length === 0; })());
     rmSync(home, { recursive: true, force: true });
   }
 
@@ -155,6 +165,15 @@ try {
     mkdirSync(path.dirname(cpaConfigFile(home)), { recursive: true });
     writeFileSync(cpaConfigFile(home), "{not json");
     t("MS-P2-6: corrupt cpa.json ⇒ null (never silent default)", cpaBaseUrl(home) === null);
+    // MS-P2-6 r2: a parsed-but-MALFORMED config (wrong baseUrl type / array doc) is UNREADABLE, never the local default.
+    writeFileSync(cpaConfigFile(home), JSON.stringify({ baseUrl: 17 }));
+    t("MS-P2-6 r2: numeric baseUrl ⇒ null (declared-but-malformed, not default)", cpaBaseUrl(home) === null);
+    writeFileSync(cpaConfigFile(home), JSON.stringify([]));
+    t("MS-P2-6 r2: array config doc ⇒ null (not default)", cpaBaseUrl(home) === null);
+    writeFileSync(cpaConfigFile(home), JSON.stringify({ baseUrl: "" }));
+    t("MS-P2-6 r2: empty-string baseUrl ⇒ null", cpaBaseUrl(home) === null);
+    writeFileSync(cpaConfigFile(home), JSON.stringify({ someOther: 1 }));
+    t("MS-P2-6 r2: valid object with NO baseUrl ⇒ local default (a real config, no override) — contrast", cpaBaseUrl(home) === "http://127.0.0.1:8787/v1");
     writeFileSync(cpaConfigFile(home), JSON.stringify({ baseUrl: "http://custom:9/v1" }));
     t("cpaBaseUrl: valid config baseUrl", cpaBaseUrl(home) === "http://custom:9/v1");
     process.env.CPA_BASE_URL = "http://env-wins/v1";

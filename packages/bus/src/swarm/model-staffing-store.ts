@@ -65,9 +65,11 @@ function readMapFile(file: string): MapRead {
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" }; } // EACCES ⇒ unreadable, NOT absent
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { return { kind: "unreadable" }; } // corrupt JSON ⇒ unreadable (never a silent empty map)
-  if (!parsed || typeof parsed !== "object") return { kind: "unreadable" };
+  // MS-P2-6 (r2): an ARRAY is not a map object — a bare-array doc, or `map: []` / `map: ["x"]`, is MALFORMED (unreadable), never a
+  // valid/empty/index-keyed map. A plain object with `map: {}` stays a legitimately-empty map.
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "unreadable" };
   const mapRaw = (parsed as { map?: unknown }).map;
-  if (!mapRaw || typeof mapRaw !== "object") return { kind: "unreadable" };
+  if (!mapRaw || typeof mapRaw !== "object" || Array.isArray(mapRaw)) return { kind: "unreadable" };
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(mapRaw as Record<string, unknown>)) {
     if (typeof k === "string" && k.length > 0 && typeof v === "string" && v.length > 0) out[k] = v;
