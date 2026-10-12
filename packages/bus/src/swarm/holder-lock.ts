@@ -17,7 +17,7 @@
  * A `LockSite` names where the three artifacts live. The intentPrefix isolates one lock's hold-intents from any other lock that
  * shares the same intentDir (e.g. every budget pool's intents live together in the budgets dir).
  */
-import { mkdirSync, writeFileSync, readdirSync, unlinkSync, rmSync, rmdirSync } from "node:fs";
+import { mkdirSync, writeFileSync, readdirSync, unlinkSync, rmSync, rmdirSync, statSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 
@@ -64,12 +64,15 @@ const strandedLockDirs = new Set<string>();
 export interface AcquireOpts {
   /**
    * SUCC-1 (opt-in; default OFF ⇒ existing callers byte-identical). Also reclaim an EXTERNAL empty lock dir that is PROVABLY
-   * stranded — EVERY foreign hold-intent is a CONFIRMED-DEAD (ESRCH) pid, at least one exists, and NONE is alive-or-unknown — by
-   * ADOPTING INTO it (publish our identity straight in; NO rmdir, so no remove→recreate gap, no out-of-band deletion that could
-   * race a live acquirer's new dir). It is single-winner: a live acquirer always stages its hold-intent BEFORE its mkdir, so two
-   * concurrent reclaimers each see the OTHER's live (not-all-dead) intent and BOTH contend — the stranded dir is reclaimed only
-   * by a SOLO acquirer, never two. A non-ESRCH probe (EPERM/EIO/unknown) never authorizes (SUCC1-2). Succession passes this so a
-   * crash-stranded `<sid>.adopt.lockd` is not un-adoptable forever; decision-batch (R26 out-of-band) + shared-budget do NOT.
+   * stranded — EVERY foreign hold-intent is a CONFIRMED-DEAD (ESRCH) pid, at least one exists, and NONE is alive-or-unknown.
+   * Reclaim is single-winner + generation-atomic (SUCC1-1): the all-dead SCAN alone is NOT proof the dir is still the one we
+   * probed — a NORMAL release + fresh acquire can swap the generation between scan and write — so the reclaimer rmdirs the dir
+   * ONLY while it is still EMPTY (atomic empty-check that CONSUMES this exact generation; a published holder ⇒ ENOTEMPTY, an
+   * already-removed dir ⇒ ENOENT, both ⇒ contend), then re-acquires via a fresh mkdir (single-winner CAS) and publishes under
+   * the genKey guard (publish into a swapped generation is detected and voided). Two concurrent reclaimers cannot both win (the
+   * rmdir source is consumed once; the re-mkdir is single). A non-ESRCH probe (EPERM/EIO/unknown) never authorizes (SUCC1-2).
+   * Succession passes this so a crash-stranded `<sid>.adopt.lockd` is not un-adoptable forever; decision-batch (R26 out-of-band)
+   * + shared-budget do NOT.
    */
   reclaimExternalStranded?: boolean;
 }
@@ -86,12 +89,25 @@ export function acquireHolderLock(site: LockSite, opts: AcquireOpts = {}): strin
   // window (⇒ they contend, never steal), and if we DIE mid-window it is the DEAD credential another process recovers us by.
   try { writeFileSync(intent, "", { flag: "wx", mode: 0o600 }); } catch { return null; } // cannot even stage ⇒ contended (rare)
   const dropIntent = () => { try { unlinkSync(intent); } catch { /* best-effort */ } };
-  // Win the atomic mkdir, then publish our identity INSIDE the lock. If the publish faults, the empty dir we just made is OUR OWN
-  // unfinished occupancy ⇒ record it so a same-process retry recovers it (never leave an identity-less dir to a stale-intent guess).
+  // SUCC1-1 (codex:Work): publish our identity into `dir` as a GENERATION-CAS. Capture the dir's generation key (dev+ino+birth)
+  // BEFORE the write and verify it is UNCHANGED after — so if a concurrent opt-in reclaimer rmdir'd this empty dir and a fresh
+  // mkdir took its place between our two steps, our identity landed in a FOREIGN generation (or the dir vanished); we then remove
+  // our misplaced file and report failure (contend), never hold. A probe-then-publish can thus never seat two holders on a dir
+  // that was released+recreated under us. (dev+ino alone could false-match if the FS recycled an inode number — APFS/ext4 do not
+  // within this window — so birthtime makes a recreated dir distinguishable even then.) On a write IO fault it still records the
+  // empty dir as our own unfinished occupancy and THROWS (a same-process retry recovers it), matching the prior publish contract.
+  const genKey = (): string | null => { try { const s = statSync(dir); return `${s.dev}:${s.ino}:${s.birthtimeMs}`; } catch { return null; } };
+  const publishInto = (): boolean => {
+    const g0 = genKey(); if (g0 === null) { strandedLockDirs.add(dir); return false; } // dir vanished before we could stamp it ⇒ contend
+    try { writeFileSync(mine, "", { mode: 0o600 }); } catch (e) { strandedLockDirs.add(dir); throw e; }
+    if (genKey() !== g0) { try { rmSync(mine, { force: true }); } catch { /* best-effort */ } strandedLockDirs.add(dir); return false; } // swapped under us ⇒ void our publish ⇒ contend
+    strandedLockDirs.delete(dir); return true;
+  };
+  // Win the atomic mkdir, then publish our identity INSIDE the lock under the generation guard. If the publish faults, the empty
+  // dir we just made is OUR OWN unfinished occupancy ⇒ record it so a same-process retry recovers it.
   const take = (): boolean => {
     try { mkdirSync(dir); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; return false; } // held by someone
-    try { writeFileSync(mine, "", { mode: 0o600 }); } catch (e) { strandedLockDirs.add(dir); throw e; }
-    strandedLockDirs.delete(dir); return true;
+    return publishInto();
   };
   if (take()) return token; // won; identity published
   // Lock dir exists.
@@ -126,10 +142,26 @@ export function acquireHolderLock(site: LockSite, opts: AcquireOpts = {}): strin
     // authorizes). A concurrent live acquirer has a LIVE intent here ⇒ not-all-dead ⇒ both contend (single-winner, no ABA).
     const externalStranded = !!opts.reclaimExternalStranded && others.length > 0 && others.every((i) => pidDefinitelyDead(i.pid));
     if (!ownStranded && !externalStranded) { dropIntent(); return null; } // (C-neg) not our own, not provably-stranded ⇒ contend
-    try { writeFileSync(mine, "", { mode: 0o600 }); } catch { dropIntent(); return null; } // adopt INTO the dir (own or (D)); not writable/vanished ⇒ contend
-    strandedLockDirs.delete(dir);
-    // Clean the intents we no longer need: our OWN stale intents always; a CONFIRMED-DEAD foreign intent only when we (D)-reclaimed.
-    for (const i of others) { if (i.pid === process.pid || (externalStranded && pidDefinitelyDead(i.pid))) { try { unlinkSync(path.join(site.intentDir, i.name)); } catch { /* best-effort */ } } }
+    if (externalStranded) {
+      // (D) SUCC1-1 (codex:Work): a stale all-dead scan is NOT proof the CURRENT dir is still the one we probed — a NORMAL
+      // release + fresh acquire can swap the lock dir's generation between our scan and our write, so a blind adopt-into would
+      // seat us on someone ELSE's new dir (two holders). Reclaim is therefore single-winner + generation-atomic: rmdir removes
+      // the dir ONLY while it is still EMPTY (a published holder ⇒ ENOTEMPTY ⇒ contend; already gone ⇒ ENOENT ⇒ contend),
+      // CONSUMING this exact empty generation; a fresh take() then re-mkdirs (single-winner CAS) and publishes under the genKey
+      // guard. A dir released+recreated meanwhile is caught by rmdir (non-empty / vanished) or by the publish guard — never
+      // adopted blind. Two concurrent reclaimers cannot both win: the rmdir source is consumed once, and the re-mkdir is single.
+      try { rmdirSync(dir); } catch { dropIntent(); return null; }
+      let held = false; try { held = take(); } catch { dropIntent(); return null; } // write IO fault ⇒ contend (own-recovery recorded)
+      if (!held) { dropIntent(); return null; } // lost the re-acquire mkdir race / swapped under us ⇒ contend
+      for (const i of others) { if (i.pid === process.pid || pidDefinitelyDead(i.pid)) { try { unlinkSync(path.join(site.intentDir, i.name)); } catch { /* best-effort */ } } } // the dead/own intents we superseded
+      return token;
+    }
+    // (C) OUR OWN unfinished occupancy: adopt INTO our own empty dir, generation-guarded (publishInto). No rmdir — this dir is
+    // ours alone (tracked in-process; no default-path peer reclaims a foreign empty dir), and the guard still catches a concurrent
+    // opt-in reclaimer that rmdir'd it under us.
+    let held = false; try { held = publishInto(); } catch { dropIntent(); return null; }
+    if (!held) { dropIntent(); return null; }
+    for (const i of others) { if (i.pid === process.pid) { try { unlinkSync(path.join(site.intentDir, i.name)); } catch { /* best-effort */ } } }
     return token;
   }
   dropIntent(); return null; // >1 identity (ambiguous) ⇒ contended

@@ -2,7 +2,7 @@ import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, argvFro
 import { acquireHolderLock, releaseHolderLock } from "./holder-lock.js";
 import { probeCandidateLiveness, probeSessionLiveness, sidSockPrefix } from "./task-liveness.js";
 import type { RosterMember } from "./resume.js";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import net from "node:net";
@@ -173,13 +173,28 @@ rmSync(sockHome, { recursive: true, force: true });
     return site;
   };
 
-  // crash-recovery: stranded empty lock + a CONFIRMED-DEAD intent + the opt-in ⇒ reclaimed (adopt INTO the dir) ⇒ sid acquirable.
+  // crash-recovery: stranded empty lock + a CONFIRMED-DEAD intent + the opt-in ⇒ reclaimed (rmdir-if-empty + fresh take) ⇒ sid
+  // acquirable, with EXACTLY our identity in the dir (no double-identity residue).
   {
     const home = mkHome(); const site = strand(home, 999999);          // 999999 ⇒ ESRCH ⇒ confirmed dead
     const token = acquireHolderLock(site, { reclaimExternalStranded: true });
     t("SUCC-1 crash-recovery: a stranded empty lock + dead intent is reclaimed ⇒ token (not deaf forever)", token !== null);
     t("SUCC-1 crash-recovery: our identity is now published IN the dir", existsSync(path.join(site.lockDir, String(token))));
+    t("SUCC-1 crash-recovery: EXACTLY one identity in the dir after reclaim (no double-identity)", readdirSync(site.lockDir).length === 1);
     if (token) releaseHolderLock(site, token);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // SUCC1-1 (codex:Work): a stale CONFIRMED-DEAD intent must NEVER authorize taking a dir that is ACTUALLY HELD. If a holder has
+  // published into the dir (non-empty) and is a LIVE foreign pid, the reclaimer must go to the published-holder branch and
+  // CONTEND — the all-dead intent scan is not proof the CURRENT dir is unoccupied (the TOCTOU the r3 fix closes).
+  {
+    const home = mkHome(); const site = adoptLockSite(home, SID);
+    mkdirSync(site.lockDir, { recursive: true });
+    writeFileSync(path.join(site.lockDir, "1.deadbeef"), "");                         // a LIVE foreign holder (pid 1 ⇒ EPERM ⇒ alive) published here
+    writeFileSync(path.join(site.intentDir, `${site.intentPrefix}999999.aa`), "");    // + a STALE confirmed-dead intent on disk
+    t("SUCC1-1: a stale dead intent does NOT authorize stealing a LIVE published holder ⇒ contend", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    t("SUCC1-1: the live holder's identity is untouched", existsSync(path.join(site.lockDir, "1.deadbeef")) && readdirSync(site.lockDir).length === 1);
     rmSync(home, { recursive: true, force: true });
   }
 
