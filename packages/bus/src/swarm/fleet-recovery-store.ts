@@ -9,7 +9,7 @@
  * Secret discipline (Q1/FR-2): the env subset is name-allowlisted AND value-credential-scrubbed by the pure filterCaptureEnv; at
  * relaunch the shell merges it OVER the live shell env so profile secrets come from the canonical shell.
  */
-import { mkdirSync, writeFileSync, renameSync, readFileSync, readdirSync, lstatSync, existsSync, readlinkSync, openSync, closeSync, writeSync, unlinkSync, fstatSync, constants as fsConstants } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readFileSync, readdirSync, lstatSync, existsSync, readlinkSync, openSync, closeSync, fstatSync, ftruncateSync, constants as fsConstants } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
@@ -27,6 +27,7 @@ import {
   type MemberBreakpointFacts,
 } from "./fleet-recovery.js";
 import { parseBoardItemName, boardItemId } from "./task-board.js";
+import { type LockSite } from "./holder-lock.js"; // FR-6 (r6): the recover lock reuses the shared sole-occupancy primitive
 import { loadControlLog } from "./control-store.js";
 import { liveEntities } from "./control-log.js";
 import { inboxDirName } from "../inbox.js";
@@ -335,17 +336,26 @@ function claimLaunchFile(home: string, episodeId: string, memberKey: string): st
 type ClaimRead = { ok: true; state: string } | { ok: false; reason: "absent" | "refuse" };
 function readClaimNoFollow(file: string): ClaimRead {
   let fd: number;
-  try { fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); }
-  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { ok: false, reason: "absent" } : { ok: false, reason: "refuse" }; } // ELOOP(symlink)/EACCES ⇒ refuse
+  // FR-9 (r6): O_NONBLOCK so a FIFO/device leaf does NOT block the open (O_RDONLY on a FIFO otherwise waits for a writer); O_NOFOLLOW so
+  // a symlink leaf is refused. The fstat then REQUIRES a regular file — a FIFO opens non-blocking but is not a claim ⇒ refuse.
+  try { fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { ok: false, reason: "absent" } : { ok: false, reason: "refuse" }; } // ELOOP(symlink)/EACCES/ENXIO ⇒ refuse
   try { if (!fstatSync(fd).isFile()) return { ok: false, reason: "refuse" }; return { ok: true, state: readFileSync(fd, "utf8").trim() }; }
   catch { return { ok: false, reason: "refuse" }; }
   finally { try { closeSync(fd); } catch { /* ignore */ } }
 }
-/** Overwrite an EXISTING claim via an O_NOFOLLOW fd (no O_CREAT ⇒ nothing to overwrite if absent/symlinked). true on success. */
+/** Overwrite an EXISTING claim, bound to the opened fd. FR-9 (r6): O_NONBLOCK (a FIFO O_WRONLY would block for a reader, or we'd write
+ *  the outcome INTO a pipe) + O_NOFOLLOW (no symlink) + NO O_TRUNC at open — we fstat-verify a REGULAR file FIRST, then ftruncate+write
+ *  to the bound fd. No O_CREAT ⇒ nothing to overwrite if absent. Returns true on success. */
 function overwriteClaimNoFollow(file: string, content: string): boolean {
   let fd: number;
-  try { fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW, 0o600); } catch { return false; } // ELOOP/absent/EACCES ⇒ refuse
-  try { writeFileSync(fd, content); return true; } catch { return false; }
+  try { fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK, 0o600); } catch { return false; } // ELOOP/absent/EACCES/ENXIO(FIFO no-reader) ⇒ refuse
+  try {
+    if (!fstatSync(fd).isFile()) return false; // a FIFO/device/non-regular leaf ⇒ refuse (never truncate or write through it)
+    ftruncateSync(fd, 0);
+    writeFileSync(fd, content);
+    return true;
+  } catch { return false; }
   finally { try { closeSync(fd); } catch { /* ignore */ } }
 }
 
@@ -385,35 +395,26 @@ export function markLaunchOutcome(home: string, memberKey: string, episodeId: st
   overwriteClaimNoFollow(file, content);
 }
 
-/**
- * FR-6 (r5): a recover-LOCAL single-flight whose lock read is EACCES=HOLD at the ACQUISITION point itself — not a one-shot pre-probe
- * followed by the shared acquireSingleFlight (which treats a read error as an empty holder and would STEAL a live, unverifiable lock —
- * the reviewer's TOCTOU: a pre-check succeeds, then the lock becomes unreadable before the shared helper reads it). Here the SAME
- * O_NOFOLLOW read that gates acquisition HOLDs on ANY unreadable/symlinked lock; only a CONFIRMED-dead (ESRCH) holder is reclaimed; a
- * live or unverifiable holder ⇒ null (back off). The shared single-flight.ts three-state root-fix is a SEPARATE DISP-3 ticket
- * (f32a0507); this tightens the recover path now, cross-referenced in review.
- * (ponytail: the residual 2-racer dead-holder reclaim race is the shared primitive's concern; here single-active is what we establish.)
- * Returns a release fn (removes the lock only while it still holds OUR pid), or null to HOLD.
- */
-export function acquireRecoverLock(lockPath: string): (() => void) | null {
-  const release = (): void => { try { const fd = openSync(lockPath, fsConstants.O_RDONLY); try { if (Number(readFileSync(fd, "utf8").trim()) === process.pid) unlinkSync(lockPath); } finally { closeSync(fd); } } catch { /* gone/unreadable ⇒ nothing of ours to remove */ } };
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try { const fd = openSync(lockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600); try { writeSync(fd, String(process.pid)); } finally { closeSync(fd); } return release; } // atomic O_EXCL birth
-    catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") return null; } // a real fs error ⇒ HOLD (don't guess)
-    // the lock EXISTS — read the holder via O_NOFOLLOW; an unreadable/symlinked lock is UNKNOWN ⇒ HOLD (never steal an unverifiable holder)
-    let holderRaw: string;
-    try { const fd = openSync(lockPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); try { holderRaw = readFileSync(fd, "utf8").trim(); } finally { closeSync(fd); } }
-    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; return null; } // vanished ⇒ retry birth; EACCES/ELOOP ⇒ HOLD
-    const pid = Number(holderRaw);
-    if (!Number.isInteger(pid) || pid <= 0) return null; // garbled holder ⇒ don't guess ⇒ HOLD
-    let alive: boolean;
-    try { process.kill(pid, 0); alive = true; } catch (e) { alive = (e as NodeJS.ErrnoException).code === "EPERM"; } // EPERM ⇒ exists; ESRCH ⇒ dead
-    if (alive) return null; // a live (or present-but-unsignalable) holder ⇒ HOLD
-    try { if (readFileSync(lockPath, "utf8").trim() === holderRaw) unlinkSync(lockPath); } catch { /* changed/gone ⇒ retry birth */ } // reclaim ONLY the exact CONFIRMED-dead lock
-  }
-  return null; // lost the reclaim race repeatedly ⇒ HOLD rather than risk two recovers
+/** FR-8 (r6): record the DURABLE "launch sink entered" state BEFORE the launch side effect, so a crash between it and markLaunchOutcome
+ *  leaves `launching:<ts>` — which claimRecoverLaunch NEVER auto-retries (the launch MAY have dispatched; absence + time is not proof it
+ *  did not). Only a `pending:` (claim acquired, sink NOT yet entered) remains a retryable pre-launch crash. FR-9: O_NOFOLLOW fd write. */
+export function markLaunching(home: string, memberKey: string, episodeId: string): void {
+  if (!boundaryOk(home, claimLaunchDir(home, episodeId))) return;
+  overwriteClaimNoFollow(claimLaunchFile(home, episodeId, memberKey), `launching:${Math.floor(Date.now() / 1000)}`);
 }
 
+/**
+ * FR-6 (r6): the recover single-flight REUSES the shared sole-occupancy primitive acquireHolderLock (holder-lock.ts) — the coordinator
+ * ruling "two tickets, one lock semantic". That primitive is the proven DA2-R6/DB-R7/SB1 lock: ownership is established INSIDE an atomic
+ * mkdir, holder identity is the `<pid>.<nonce>` FILENAME (reclaim is structurally race-free — no compare-then-unlink double-hold), only a
+ * DEFINITELY-dead (ESRCH) holder is reclaimed (EIO/EPERM/unknown => contend, never steal), and a pre-mkdir hold-intent protects the empty
+ * mkdir->publish window. This closes the r5 recover-local races (two-racer double-hold + EIO-as-dead) by NOT hand-rolling a second lock.
+ * single-flight.ts and holder-lock.ts are BOTH left byte-unchanged here (f32a0507 owns single-flight; SUCC-1 owns any holder-lock change).
+ */
+export function recoverLockSite(home: string): LockSite {
+  const d = path.join(swarmDir(home), "recover-lock.d");
+  return { lockDir: path.join(d, "lock"), intentDir: d, intentPrefix: "hold." };
+}
 // --- recovery receipt projection ------------------------------------------------------------------------------------
 
 export const FLEET_RECEIPT_SCHEMA = "console-fleet-recovery/v1" as const;

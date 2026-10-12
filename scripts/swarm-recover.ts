@@ -31,9 +31,10 @@ import {
 } from "../packages/bus/src/swarm/fleet-recovery.js";
 import {
   captureDispatcherRecipe, dispatcherLive, dispatcherPid, heartbeatFreshSec, captureEnvForPid,
-  writeFleetSnapshot, readFleetSnapshot, readEpisode, writeEpisode, claimRecoverLaunch, markLaunchOutcome, breakpointFactsFor,
-  writeRecoveryReceipt, acquireRecoverLock,
+  writeFleetSnapshot, readFleetSnapshot, readEpisode, writeEpisode, claimRecoverLaunch, markLaunching, markLaunchOutcome, breakpointFactsFor,
+  writeRecoveryReceipt, recoverLockSite,
 } from "../packages/bus/src/swarm/fleet-recovery-store.js";
+import { acquireHolderLock, releaseHolderLock } from "../packages/bus/src/swarm/holder-lock.js";
 
 const pexec = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -135,12 +136,15 @@ async function main(): Promise<void> {
   }
 
   // --- wire real deps + run the orchestration -----------------------------------------------------------------------
-  // FR-6: serialize recover with a recover-LOCAL single-flight lock — a SECOND concurrent recover exits cleanly, so two processes can
-  // never mint rival episodes and double-launch the same member (episode identity is established single-threaded under this lock).
-  const lockPath = path.join(H, ".agenthop", "swarm", "recover.lock");
-  mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
-  const releaseLock = acquireRecoverLock(lockPath);
-  if (!releaseLock) { log(`recover: another recover holds the lock, or the lock is unreadable/unverifiable — HOLDING (exiting).`); return; }
+  // FR-6 (r6): serialize recover with the SHARED sole-occupancy primitive acquireHolderLock (holder-lock.ts) — one lock semantic across
+  // SUCC-1/FR-6/TGP-11 (coordinator ruling). A SECOND concurrent recover gets null and exits cleanly, so two processes can never mint
+  // rival episodes and double-launch the same member. ESRCH-only reclaim + identity-in-filename ⇒ no stale/double-hold; a hold-intent
+  // protects the empty mkdir→publish window; any read fault ⇒ contend (never steal).
+  const lockSite = recoverLockSite(H);
+  mkdirSync(lockSite.intentDir, { recursive: true, mode: 0o700 }); // holder-lock requires the intent dir to exist before acquiring
+  const lockToken = acquireHolderLock(lockSite);
+  if (lockToken === null) { log(`recover: another recover holds the single-flight lock (or it is unverifiable) — HOLDING (exiting).`); return; }
+  const releaseLock = () => releaseHolderLock(lockSite, lockToken);
 
   const core = startBusCore({ home: H });
   await sleep(1200); // let the broker/relay announce before the first peer read
@@ -169,6 +173,7 @@ async function main(): Promise<void> {
     settle: () => sleep(5000),
     claimLaunch: (memberKey, episodeId) => claimRecoverLaunch(H, memberKey, episodeId, nowSec(), 300), // FR-8: 300s grace for a stale-pending safe retry
     launchMember: async (m) => { const full = fullByMember.get(m.member); if (!full) return { outcome: "failed" as LaunchOutcome, error: "no roster entry" }; return launchOneMember(full, useHerdr, taken); },
+    markLaunching: (memberKey, episodeId) => markLaunching(H, memberKey, episodeId), // FR-8 (r6): durable "launch sink entered" BEFORE the side effect
     markLaunchOutcome: (memberKey, episodeId, outcome) => markLaunchOutcome(H, memberKey, episodeId, outcome), // FR-8: launched|failed|unknown
     breakpointFacts: (sid) => breakpointFactsFor(H, sid),
     deliverBreakpoint: (sid, text, episodeId) => {

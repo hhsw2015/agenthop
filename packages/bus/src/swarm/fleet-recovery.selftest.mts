@@ -4,8 +4,9 @@
 //  FR-1a execArgv captured · FR-1b scrub keeps the SSH user · FR-5 identity triple (title alone ≠ identity) · FR-7 reuse-incomplete
 //  (any age) + unreadable-abort · FR-8 claim≠launch two-phase + report-with-real-results + receipt-in-completion · FR-9 claim leaf
 //  CP-3 · FR-10 boardItemId join + inbox three-state. Plus the 3 zero-bug fixture classes over the write faces.
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, existsSync, rmSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, symlinkSync, existsSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -17,8 +18,9 @@ import {
 import {
   writeFleetSnapshot, readFleetSnapshot, recordDispatcherRecipe, readDispatcherRecipe, writeEpisode, readEpisode,
   claimRecoverLaunch, markLaunchOutcome, liveAttemptsForItems, breakpointFactsFor, writeRecoveryReceipt, readRecoveryReceipt, FLEET_RECEIPT_SCHEMA,
-  acquireRecoverLock,
+  recoverLockSite, markLaunching,
 } from "./fleet-recovery-store.js";
+import { acquireHolderLock, releaseHolderLock } from "./holder-lock.js";
 import { boardItemId } from "./task-board.js";
 import { attemptIdOf, type TaskAttempt } from "./task-state.js";
 import { initialLogState } from "./control-log.js";
@@ -67,7 +69,7 @@ try {
   // ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
   type HOpts = Partial<{ episode: EpisodeRead; peersAfter: PeerLikeMin[]; claimReturns: boolean; launchOutcome: LaunchOutcome; disp: DispatcherLiveness; writeReceiptOk: boolean; writeEpisodeOk: boolean; failWriteEpisodeAfter: number }>;
   function makeHarness(o: HOpts) {
-    const state = { episodeWrites: [] as RecoveryEpisode[], launches: [] as string[], outcomes: [] as { m: string; outcome: LaunchOutcome }[], reportArg: null as RecoveryResult | null, receiptArg: null as RecoveryResult | null };
+    const state = { episodeWrites: [] as RecoveryEpisode[], launches: [] as string[], launchings: [] as string[], outcomes: [] as { m: string; outcome: LaunchOutcome }[], reportArg: null as RecoveryResult | null, receiptArg: null as RecoveryResult | null };
     const deps: RecoverDeps = {
       now: () => 1000, mintEpisodeId: () => "ep-NEW", heartbeatThresholdSec: 120, breakpointsEnabled: true, recoveredAtIso: "T",
       readEpisode: () => o.episode ?? { kind: "absent" },
@@ -79,6 +81,7 @@ try {
       settle: async () => {},
       claimLaunch: () => o.claimReturns ?? true,
       launchMember: async (m) => { state.launches.push(m.member); return { outcome: o.launchOutcome ?? "launched" }; },
+      markLaunching: (m) => { state.launchings.push(m); },
       markLaunchOutcome: (m, _ep, outcome) => { state.outcomes.push({ m, outcome }); },
       breakpointFacts: (sid) => ({ member: sid, grantedItems: [], liveAttempts: [], unreadInbox: 0 }),
       deliverBreakpoint: () => "published",
@@ -101,9 +104,9 @@ try {
     const h = makeHarness({ peersAfter: [{ stableId: "m1", title: "Work-m1", tool: "claude", cwd: "/r1" }], writeReceiptOk: false });
     const r = await orchestrateRecover(goodSnap, roster, h.deps);
     t("FR-8: receipt write refused ⇒ 'receipt:unwritten' outstanding", r.outstanding.includes("receipt:unwritten"));
-    // FR-8 (r5): the receipt is written LAST (after the episode marker settles outstanding). A confirmed member + a written episode ⇒
-    // the marker IS completed; only the diagnostic receipt write failed (surfaced via the outstanding obligation / exit≠0).
-    t("FR-8 r5: episode marker written (completed) before the receipt; a receipt-write failure never falsifies the marker", h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === true);
+    // FR-8 (r6) window-2: a receipt-write failure must REVERT the episode marker to incomplete — else resolveEpisode mints a NEW
+    // episode on re-run and re-delivers breakpoints (dup). The LAST episode write is the compensating completed=false revert.
+    t("FR-8 r6 window2: receipt fail ⇒ episode marker REVERTED to completed=false (re-run reuses, no dup breakpoint)", h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === false);
   }
   // FR-8 r5 seam3 + facet-3: the FINAL writeEpisode failing ⇒ 'episode-final:unwritten' outstanding AND the durable receipt (written
   // AFTER the episode marker) reflects that settled outstanding — it can NEVER claim outstanding:[] while the marker is incomplete.
@@ -130,6 +133,7 @@ try {
     const h = makeHarness({ peersAfter: [], claimReturns: true });
     await orchestrateRecover(goodSnap, roster, h.deps);
     t("FR-8: a launched member records its outcome", h.state.launches.length === 1 && h.state.outcomes.length === 1 && h.state.outcomes[0]!.outcome === "launched");
+    t("FR-8 r6: markLaunching ran BEFORE launchMember (durable launch-sink state precedes the side effect)", h.state.launchings.length === 1 && h.state.launchings[0] === "m1");
   }
   // FR-7 reuse in orchestrate: an incomplete episode marker ⇒ reuse its id
   {
@@ -220,31 +224,42 @@ try {
     markLaunchOutcome(h, "mX", ep, "launched");
     t("FR-9 r5: markLaunchOutcome does NOT overwrite the symlink target through the leaf", readFileSync(target, "utf8") === "failed");
   }
-  // FR-6 (r5): recover-LOCAL single-flight — EACCES=HOLD at the acquisition read; reclaim ONLY a confirmed-dead holder; no symlink follow
+  // FR-6 (r6): the recover lock REUSES the shared acquireHolderLock (holder-lock.ts) — "one lock semantic" (coordinator ruling). Its
+  // internals (ESRCH-only reclaim, identity-in-filename no-double-hold, EIO=contend, hold-intent window) are covered by holder-lock's
+  // own selftest; here we verify the recover SITE wiring gives sole-occupancy.
   {
-    const h = freshHome(); mkdirSync(swarm(h), { recursive: true });
-    const lock = path.join(swarm(h), "recover.lock");
-    const rel = acquireRecoverLock(lock);
-    t("FR-6: birth on empty ⇒ acquired, holds our pid", rel !== null && readFileSync(lock, "utf8").trim() === String(process.pid));
-    t("FR-6: a LIVE holder (our own pid) ⇒ second acquire HOLDs (null)", acquireRecoverLock(lock) === null);
-    rel!();
-    t("FR-6: release removes our lock ⇒ re-acquire succeeds", !existsSync(lock) && (() => { const r2 = acquireRecoverLock(lock); const ok = r2 !== null; if (r2) r2(); return ok; })());
-    writeFileSync(lock, "999999", { mode: 0o600 }); chmodSync(lock, 0o000);
-    t("FR-6: an UNREADABLE (EACCES) lock ⇒ HOLD (null), never stolen", acquireRecoverLock(lock) === null);
-    chmodSync(lock, 0o600);
-    writeFileSync(lock, "999999", { mode: 0o600 }); // a pid out of range ⇒ not a live holder
-    const rel2 = acquireRecoverLock(lock);
-    t("FR-6: a CONFIRMED-dead holder ⇒ reclaimed ⇒ acquired (holds our pid)", rel2 !== null && readFileSync(lock, "utf8").trim() === String(process.pid));
-    if (rel2) rel2();
-    writeFileSync(lock, "not-a-pid", { mode: 0o600 });
-    t("FR-6: a garbled holder ⇒ HOLD (null)", acquireRecoverLock(lock) === null);
+    const h = freshHome();
+    const site = recoverLockSite(h);
+    mkdirSync(site.intentDir, { recursive: true, mode: 0o700 });
+    const tok = acquireHolderLock(site);
+    t("FR-6 r6: recover lock acquires via recoverLockSite (holder-lock reuse) ⇒ token", typeof tok === "string");
+    releaseHolderLock(site, tok!);
+    const tok2 = acquireHolderLock(site);
+    t("FR-6 r6: recover lock re-acquires after release", typeof tok2 === "string");
+    if (tok2) releaseHolderLock(site, tok2);
+    // NB: cross-process sole-occupancy (a FOREIGN live pid ⇒ contend; ESRCH-only reclaim; no double-hold; EIO=contend) is holder-lock's
+    // own contract + selftest — a same-PID second acquire here intentionally reclaims our own residue (SB1), so it is NOT retested here.
   }
+  // FR-8 (r6) window-1: markLaunching writes the durable "launching:" state; claimRecoverLaunch NEVER auto-retries it (a crash after a
+  // successful launch but before markLaunchOutcome leaves "launching:" — the launch MAY have dispatched, never a blind double).
   {
-    const h = freshHome(); mkdirSync(swarm(h), { recursive: true });
-    const lock = path.join(swarm(h), "recover.lock");
-    const ext = mkdtempSync(path.join(scratch, "ext-lock-")); const tgt = path.join(ext, "outside"); writeFileSync(tgt, "999999");
-    symlinkSync(tgt, lock);
-    t("FR-6: a symlinked lock leaf ⇒ HOLD (null, O_NOFOLLOW refuses)", acquireRecoverLock(lock) === null);
+    const h = freshHome();
+    claimRecoverLaunch(h, "mL", "ep", 1000, 300); // pending:1000
+    markLaunching(h, "mL", "ep");                  // launching:<now>
+    t("FR-8 r6 window1: after markLaunching ⇒ immediate re-claim false", claimRecoverLaunch(h, "mL", "ep", 1000, 300) === false);
+    t("FR-8 r6 window1: launching ⇒ NEVER auto-retried, even far past grace", claimRecoverLaunch(h, "mL", "ep", 1000 + 100000, 300) === false);
+  }
+  // FR-9 (r6): a FIFO claim leaf must NOT block the open NOR be written through — O_NONBLOCK + fstat-regular refuses it.
+  {
+    const h = freshHome(); const ep = "ep"; const dir = path.join(swarm(h), "recover-launch", ep);
+    mkdirSync(dir, { recursive: true });
+    const leaf = path.join(dir, `${createHash("sha256").update("mF").digest("hex").slice(0, 32)}.claim`);
+    execFileSync("mkfifo", [leaf]);
+    const start = Date.now();
+    const claimed = claimRecoverLaunch(h, "mF", ep, 1000, 300);
+    t("FR-9 r6: FIFO claim leaf ⇒ claimRecoverLaunch refused + non-blocking", claimed === false && Date.now() - start < 2000);
+    markLaunchOutcome(h, "mF", ep, "launched"); // must also not block nor write the outcome INTO the pipe
+    t("FR-9 r6: markLaunchOutcome on a FIFO leaf ⇒ no-op, non-blocking", Date.now() - start < 2000);
   }
   // FR-10: boardItemId join (granted itemId = boardItemId(jobId,nodeId), attempt has raw nodeId)
   {

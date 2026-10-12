@@ -387,8 +387,12 @@ export interface RecoverDeps {
   /** FR-8 (r4): THREE outcomes — "launched" (confirmed started), "failed" (an EXPLICIT not-started, e.g. command-not-found ⇒ safe to
    *  retry), "unknown" (sent but result indeterminate, e.g. a launch timeout that may have started ⇒ never auto-retry = no double). */
   launchMember: (member: RosterMemberLike) => Promise<{ outcome: LaunchOutcome; error?: string }>;
+  /** FR-8 (r6): record the DURABLE "launch sink entered" state (claim ⇒ `launching:<ts>`) BEFORE launchMember's side effect — so a crash
+   *  between a SUCCESSFUL launch and markLaunchOutcome leaves `launching:` (NEVER auto-retried), not a retryable `pending:`. A crash
+   *  BEFORE this call leaves `pending:` (sink not entered ⇒ launch never dispatched ⇒ the genuine retryable pre-launch crash). */
+  markLaunching: (memberKey: string, episodeId: string) => void;
   /** FR-8: record the launch outcome — "launched"/"failed"/"unknown" drive the claim state (launched & unknown both block a blind
-   *  re-launch; only "failed" is retryable). A crash before this call leaves the claim "pending" ⇒ treated as unknown. */
+   *  re-launch; only "failed" is retryable). */
   markLaunchOutcome: (memberKey: string, episodeId: string, outcome: LaunchOutcome) => void;
   breakpointFacts: (sid: string) => MemberBreakpointFacts;
   /** Deliver the breakpoint; the shell builds the durable idempotency key from (episodeId, sid). */
@@ -432,7 +436,7 @@ export async function orchestrateRecover(snap: FleetSnapshot, roster: readonly R
   const peersBefore = deps.peers();
   for (const m of roster) {
     if (resolveMemberSid(m, peersBefore).kind !== "absent") continue;
-    if (deps.claimLaunch(m.member, episodeId)) { const r = await deps.launchMember(m); deps.markLaunchOutcome(m.member, episodeId, r.outcome); }
+    if (deps.claimLaunch(m.member, episodeId)) { deps.markLaunching(m.member, episodeId); const r = await deps.launchMember(m); deps.markLaunchOutcome(m.member, episodeId, r.outcome); }
   }
 
   // 3) settle, then VERIFY against the unique live SID (FR-5) + the TARGET-only dispatcher wake (FR-3)
@@ -460,16 +464,26 @@ export async function orchestrateRecover(snap: FleetSnapshot, roster: readonly R
   const folded = summarizeOutstanding(withReport);
   let result: RecoveryResult = { ...withReport, outstanding: folded.outstanding, notConfirmed: folded.notConfirmed };
 
-  // 5) FR-8 (r5): SETTLE the outstanding set FIRST — mark the episode COMPLETE only when nothing is outstanding. The FINAL marker
-  //    write's result is NOT ignored: a refused write (CP-3) is itself an outstanding obligation (exit≠0), and the marker stays
-  //    incomplete so a re-run finishes it.
-  const episodeWritten = deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: result.outstanding.length === 0 });
+  // 5) FR-8: mark the episode COMPLETE only when nothing is outstanding BEFORE this write. The FINAL marker write's result is NOT ignored
+  //    — a refused write (CP-3) is an outstanding obligation (exit≠0), and the marker stays incomplete so a re-run finishes it.
+  const wantComplete = result.outstanding.length === 0;
+  const episodeWritten = deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: wantComplete });
   if (!episodeWritten) result = { ...result, outstanding: [...result.outstanding, "episode-final:unwritten"] };
 
-  // 6) FR-8 (r5): the durable RECEIPT is written LAST — AFTER the outstanding set is settled (the coordinator ruling: "receipt 写入要在
-  //    outstanding 结清之后"). It therefore reflects the FINAL outstanding (incl. episode-final:unwritten) and can NEVER present
-  //    outstanding:[] while the episode marker is still incomplete. A refused receipt write is itself an outstanding obligation; being
-  //    the last write, a failure leaves NO on-disk receipt falsely claiming completion.
-  if (!deps.writeReceipt(result)) result = { ...result, outstanding: [...result.outstanding, "receipt:unwritten"] };
+  // 6) FR-8 (r5): the durable RECEIPT is written AFTER the episode marker, so it reflects the FINAL outstanding (incl.
+  //    episode-final:unwritten) and can NEVER present outstanding:[] while the marker is incomplete ("marker failure enters the receipt").
+  const receiptWritten = deps.writeReceipt(result);
+  if (!receiptWritten) result = { ...result, outstanding: [...result.outstanding, "receipt:unwritten"] };
+
+  // 7) FR-8 (r6) window-2: a receipt failure must NOT leave the episode COMPLETED — else resolveEpisode mints a NEW episode on re-run and
+  //    re-delivers breakpoints under a new idempotency domain (duplicate sends). If we had marked it completed but the receipt then
+  //    failed, REVERT the marker to incomplete so the re-run REUSES this episode (same breakpoint keys). This keeps BOTH guarantees:
+  //    "marker failure enters the receipt" (step 6) AND "receipt failure does not complete the episode". Best-effort — a failed revert
+  //    is itself surfaced as outstanding (never force an unwritable fs).
+  if (!receiptWritten && episodeWritten && wantComplete) {
+    if (!deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: false })) {
+      result = { ...result, outstanding: [...result.outstanding, "episode-final:revert-unwritten"] };
+    }
+  }
   return result;
 }
