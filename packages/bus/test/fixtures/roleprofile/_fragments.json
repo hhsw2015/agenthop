@@ -78,6 +78,186 @@
       "source": "gstack retro/SKILL.md v2.0.0 + learn/SKILL.md v1.0.0",
       "adaptation": "去:gbrain context_queries + gstack-skill-start + .context/retros 单机路径。留:『从记录生成教训』+ 趋势跟踪 + 跨会话复利 learnings。落我方=复盘席,喂我方 PROGRESS/rulings/round-doctor;与 polydao 周期 meta-review(eval §4.2 借②)合流。",
       "ourEquivalent": "GAP(借②):PROGRESS/rulings/round-doctor 有记录,无『生成教训』席/命令。本片段补此席。"
+    },
+    "ceo-founder": {
+      "maturity": "candidate",
+      "title": "CEO/创始人审 CEO / Founder(产品战略门)",
+      "responsibilities": "重想问题,找请求里藏着的 10 星产品;六个逼问(office-hours)重构产品框架再动代码;四模式:扩张/选择性扩张/守界/缩减。",
+      "gate": "产品/战略门:『值不值得做、该做多大』在写码前拍板;挑战前提而非顺着做。",
+      "reviewArtifact": "重构后的问题陈述 + 选定模式(扩张/选扩/守界/缩减)+ 实现备选 + 设计文档(喂下游)。",
+      "source": "gstack plan-ceo-review/SKILL.md + office-hours/SKILL.md(README specialist 表 + §2.6;candidate=依 persona 描述忠实改编,非深读)",
+      "adaptation": "去:AskUserQuestion 交互逼问 + gstack-skill-start preamble。留:四模式 + 六逼问的产品/战略拷问。落我方=产品审查席(独立进程),逼问作送审清单。",
+      "ourEquivalent": "GAP:grill-gate 是通用对抗决策树,无专产品/战略席。本片段补此席。"
+    },
+    "eng-manager": {
+      "maturity": "candidate",
+      "title": "工程经理 Eng Manager(架构门)",
+      "responsibilities": "锁定架构、数据流、图、边界情形、测试;把隐藏假设逼到明面。",
+      "gate": "架构/工程合理性门:实现前锁架构 + 边界 + 测试计划;隐藏假设显式化。",
+      "reviewArtifact": "架构决定 + 数据流/图 + 边界清单 + 测试计划(喂 QA)。",
+      "source": "gstack plan-eng-review/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:单会话顺序相位 + preamble。留:架构锁 + 逼出假设。落我方=工程审席。",
+      "ourEquivalent": "我方已有对应物:对抗审查席(codex:happycapy 真独立进程)+round-doctor 更深;本片段供补充参考(备选库不怕冗余)。"
+    },
+    "staff-reviewer": {
+      "maturity": "candidate",
+      "title": "资深工程师代码审 Staff Engineer(生产 bug 门)",
+      "responsibilities": "找过 CI 但炸生产的 bug,自动修显见的;标完整性缺口 + 门完整性:每处被削弱的测试/超时/快照/suppression 具名送人;附建议性简化透镜(不阻断、不自动改)。",
+      "gate": "工程审查门:生产级 bug 发现 + 门完整性(削弱点具名)。",
+      "reviewArtifact": "bug finding(行号+失败场景)+ 门完整性清单(具名被削弱测试)+ 简化透镜建议。",
+      "source": "gstack review/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:单会话 + 自动修。留:生产 bug 透镜 + 门完整性具名 + 简化透镜。落我方=对抗审查席(已有);『每门强制双声 native+跨模型』纪律可借此升为默认。",
+      "ourEquivalent": "我方已有对应物:对抗审查席;本片段供补充(门完整性具名 + 双声纪律)。"
+    },
+    "devex-lead": {
+      "maturity": "candidate",
+      "title": "开发者体验主管 DX Lead(DX 计划门)",
+      "responsibilities": "交互式 DX 计划审:探开发者 persona、对标竞品 TTHW、设计『魔法时刻』、逐步追摩擦点;三模式 DX 扩张/打磨/分诊;20-45 逼问。",
+      "gate": "DX 计划门:onboarding/TTHW/摩擦点在实现前审定。",
+      "reviewArtifact": "persona + TTHW 对标 + 魔法时刻 + 摩擦点清单 + 选定模式。",
+      "source": "gstack plan-devex-review/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:AskUserQuestion 逼问 + preamble。留:TTHW/摩擦点/魔法时刻 DX 拷问。落我方=DX 审席。",
+      "ourEquivalent": "GAP:无 DX 审席。本片段补此席。"
+    },
+    "devex-tester": {
+      "maturity": "candidate",
+      "title": "DX 实测员 DX Tester(DX 现场门)",
+      "responsibilities": "实测开发者体验:走文档、试 getting-started、计时 TTHW、截图报错;对照 plan-devex-review 分(回旋镖)。",
+      "gate": "DX 现场门:实测分对照计划分,暴露计划与现实差。",
+      "reviewArtifact": "onboarding 实测记录 + TTHW 计时 + 报错截图 + 对照计划分差。",
+      "source": "gstack devex-review/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:浏览器驱动 + preamble。留:实测 TTHW + 对照回旋镖。落我方=DX 实测席(经 herdr 驱真会话可得时)。",
+      "ourEquivalent": "GAP:无 DX 实测席。本片段补此席。"
+    },
+    "qa-lead": {
+      "maturity": "candidate",
+      "title": "QA 主管 QA Lead(功能门)",
+      "responsibilities": "探 browser/API/CLI/job/webhook 真面功能;复现 bug、写失败回归、修根因、提交前再验。",
+      "gate": "QA 门:先写失败回归再修再验;探索式而非乱跑命令。",
+      "reviewArtifact": "探索证据笔记 + 复现步骤 + 失败回归(修前失败/修后通过)+ 未测覆盖缺口。",
+      "source": "gstack qa/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:Aside 浏览器 + preamble + 外部副作用默认许可。留:先失败回归再修 + 探索纪律 + 未测缺口诚实。落我方=QA 席(可接 herdr 驱真会话)。",
+      "ourEquivalent": "PARTIAL:tests/selftest-CI 门 + review 已有,无驱真产品的 QA 席。本片段补此席。"
+    },
+    "qa-reporter": {
+      "maturity": "candidate",
+      "title": "QA 报告员 QA Reporter(只报门)",
+      "responsibilities": "只探只报,带可重放证据;建议回归用例,不改产品码/测试。",
+      "gate": "QA 报告门:报告-only,不写码;每 finding 带命令/预期/实际/未测项。",
+      "reviewArtifact": "可重放 finding 卡(命令+预期+实际+未测)+ 建议回归(不实现)。",
+      "source": "gstack qa-only/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:浏览器 + preamble。留:只报不改 + 可重放证据。落我方=QA 报告席。",
+      "ourEquivalent": "PARTIAL:同 qa-lead,报告-only 变体。本片段供补充。"
+    },
+    "debugger": {
+      "maturity": "candidate",
+      "title": "调试员 Debugger(根因门)",
+      "responsibilities": "系统化根因调试;铁律:无调查不修;追数据流、验假设;3 次失败即停。",
+      "gate": "调试门:修改前必有调查证据;3 次失败修复即停(不乱试)。",
+      "reviewArtifact": "数据流追踪 + 假设-验证记录 + 根因 + 最小修复(或 3 次失败后停的报告)。",
+      "source": "gstack investigate/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:preamble。留:无调查不修铁律 + 3-strikes 停。落我方=调试席(独立进程)。",
+      "ourEquivalent": "GAP:debugger 是全局 agent,非蜂群席。本片段补此席。"
+    },
+    "sre-canary": {
+      "maturity": "candidate",
+      "title": "SRE 金丝雀 SRE / Canary(发布后门)",
+      "responsibilities": "部署后监控环:盯 console 错误、性能回归、页面失败。",
+      "gate": "发布后健康门:部署后持续观测,异常即报。",
+      "reviewArtifact": "监控环报告 {console 错误, 性能回归, 页面失败} + 健康判定。",
+      "source": "gstack canary/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:浏览器驱动 + preamble。留:部署后监控环 + 异常检出。落我方=发布后健康席(接 release-manager 的部署后验)。",
+      "ourEquivalent": "PARTIAL:dual-bandwidth 是吞吐非页面健康。本片段补此席。"
+    },
+    "perf-engineer": {
+      "maturity": "candidate",
+      "title": "性能工程师 Performance Engineer(性能门)",
+      "responsibilities": "基线页面加载/Core Web Vitals/资源大小;每 PR 前后对比。",
+      "gate": "性能回归门:PR 前后对比,回归即报。",
+      "reviewArtifact": "性能基线 {加载时间, CWV, 资源大小} + 前后对比 + 回归判定。",
+      "source": "gstack benchmark/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:浏览器 + preamble。留:CWV 基线 + PR 对比。落我方=性能席(可选)。",
+      "ourEquivalent": "PARTIAL:round-doctor 是审查健康,dual-bandwidth 是吞吐,无 web 代码性能席。本片段补此席。"
+    },
+    "eval-planner": {
+      "maturity": "candidate",
+      "title": "Eval 规划官 Eval Planner(付费 eval 门)",
+      "responsibilities": "首次计费调用前预注册付费 eval:bars/arms/decoys/stop-rules + $0 stub 模型对真实输入干跑 + 三项计费试点,其外推与支出表作批准闸。",
+      "gate": "eval 支出门:预注册 + 干跑 + 试点外推 gate,批准方可计费跑。",
+      "reviewArtifact": "预注册卡 {bars, arms, decoys, stop-rules} + $0 干跑结果 + 三项试点外推 + 支出表(呈批)。",
+      "source": "gstack eval-plan/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:preamble。留:预注册 + 干跑 + 试点外推 gate(S23 花钱线同族)。落我方=eval 规划席,支出表接 decision-batch 呈批。",
+      "ourEquivalent": "我方已有对应物:mirror-13 orchestration eval 引擎 @3facb67;本片段供补充(预注册/支出闸)。"
+    },
+    "spec-author": {
+      "maturity": "candidate",
+      "title": "Spec 作者 Spec Author(spec 门)",
+      "responsibilities": "模糊意图→精确可执行 spec,五相位:why/scope/technical(强制读码)/draft/file;外审质量闸、fail-closed 密钥脱敏、去重。",
+      "gate": "spec 质量门:外审 ≥7/10 才归档;密钥脱敏 fail-closed;去重已有 issue。",
+      "reviewArtifact": "五相位 spec(why/scope/technical/draft/file)+ 外审分 + 脱敏确认。",
+      "source": "gstack spec/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:--execute 起 worktree + preamble + gbrain 语料召回。留:五相位 + 强制读码 + 外审 ≥7 闸 + 脱敏 fail-closed(与我方 output-contract/sanitized-read 同族)。落我方=spec 席。",
+      "ourEquivalent": "我方已有对应物(近似):task brief/TaskPlan brief 纪律;本片段供补充(五相位结构 + 外审闸可借)。"
+    },
+    "test-auditor": {
+      "maturity": "candidate",
+      "title": "测试审计员 Test Auditor(测试卫生门)",
+      "responsibilities": "扫价值低于维护成本的测试:source grep、重复、无断言探针、test-only export;每候选带证据卡;报告-only,批准才批量删。",
+      "gate": "测试卫生门:证据卡支撑,批准方删(不自行删测试)。",
+      "reviewArtifact": "每候选证据卡 {类型, 证据, 建议} + 批量删待批。",
+      "source": "gstack test-audit/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:preamble。留:证据卡 + 报告-only + 批准才删。落我方=测试审计席(删=批准门)。",
+      "ourEquivalent": "PARTIAL:selftest-CI/coverage 已有。本片段补此席。"
+    },
+    "shared-code-reviewer": {
+      "maturity": "candidate",
+      "title": "共享代码审查员 Shared Code Reviewer(抽取门)",
+      "responsibilities": "在近期工作里找值得的共享代码抽取;比至多 5 个机会、推最佳 3,带源证据、可靠性收益、总代码节省;仅建议。",
+      "gate": "抽取建议门:带证据,仅建议不自动改。",
+      "reviewArtifact": "抽取机会对比(≤5)+ 推荐 3 {源证据, 可靠性收益, 代码节省}。",
+      "source": "gstack deslop-shared-libs/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:preamble。留:机会对比 + 证据 + 仅建议。落我方=共享代码审席。",
+      "ourEquivalent": "GAP:无共享代码抽取审席。本片段补此席。"
+    },
+    "design-partner": {
+      "maturity": "candidate",
+      "title": "设计伙伴 Design Partner(设计系统门)",
+      "responsibilities": "从零建完整设计系统:研究 landscape、提创意冒险、产真实产品 mockup;写 DESIGN.md(开放格式)。",
+      "gate": "设计系统门:系统性设计方案 + DESIGN.md 落盘。",
+      "reviewArtifact": "设计系统 {landscape 研究, 创意方向, mockup} + DESIGN.md。",
+      "source": "gstack design-consultation/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:浏览器 + impeccable/Stitch 互通 + preamble。留:从零建系统 + DESIGN.md。落我方=设计伙伴席(可折入 designer,独列为备选)。",
+      "ourEquivalent": "GAP:无设计系统席(可折入 designer)。本片段补此席。"
+    },
+    "design-explorer": {
+      "maturity": "candidate",
+      "title": "设计探索者 Design Explorer(设计探索门)",
+      "responsibilities": "产 4-6 个 AI mockup 变体,开浏览器比较板,收反馈迭代;taste memory 学偏好。",
+      "gate": "设计探索门:多变体 + 反馈迭代至满意再交 design-engineer。",
+      "reviewArtifact": "4-6 mockup 变体 + 比较板 + taste 反馈记录。",
+      "source": "gstack design-shotgun/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:浏览器比较板 + taste 二进制 + preamble。留:多变体探索 + 偏好学习。落我方=设计探索席(比较板经 canvas 可得时)。",
+      "ourEquivalent": "GAP:无设计探索席。本片段补此席。"
+    },
+    "design-engineer": {
+      "maturity": "candidate",
+      "title": "设计工程师 Design Engineer(设计落地门)",
+      "responsibilities": "mockup→生产 HTML:动态布局(文本回流/高度自适应)、30KB 零依赖、检测 React/Svelte/Vue、智能 API 路由;一遍 slop-gate。",
+      "gate": "设计落地门:产可发 HTML(非 demo)+ slop-gate 过。",
+      "reviewArtifact": "生产 HTML + slop-gate 结果 + 框架检测。",
+      "source": "gstack design-html/SKILL.md(README specialist 表 + §2.6)",
+      "adaptation": "去:impeccable 引擎 + preamble。留:mockup→可发 HTML + slop-gate。落我方=设计落地席。",
+      "ourEquivalent": "GAP:无设计落地席。本片段补此席。"
+    },
+    "change-control": {
+      "maturity": "candidate",
+      "title": "变更控制 Change Control(careful/freeze/guard)",
+      "responsibilities": "破坏性命令前告警(rm -rf/DROP TABLE/force-push),root/home 递归删 + 默认分支 force-push 硬拒(careful);编辑锁到一个目录(freeze);两者合一(guard)。",
+      "gate": "变更控制门:MEDIUM 告警可 override;HIGH 两形硬拒;目录外编辑 hard-deny,unparseable 载荷 fail-closed。",
+      "reviewArtifact": "拦截决定 {命令, 级别 ask/deny, 理由} + 目录锁范围。",
+      "source": "gstack careful/SKILL.md + freeze/SKILL.md + guard/SKILL.md(README power-tools + §2.6)",
+      "adaptation": "去:CC PreToolUse 钩子实现形态。留:破坏性命令 ask/deny 分级 + fail-closed + 『advisory 非策略边界』自知。落我方=与 approval-delegation+sanitized-read+FC-2 收敛。",
+      "ourEquivalent": "我方已有对应物(独立收敛):approval-delegation + sanitized-read + FC-2;本片段供补充参考。careful 的『advisory 非策略边界』自知 = 我方『cap≠user 授权』诚实;freeze fail-closed = FC-2。"
     }
   }
 }

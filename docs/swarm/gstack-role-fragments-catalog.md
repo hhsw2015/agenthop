@@ -58,7 +58,7 @@ maturity 列:✅prime(批1已交)· ⬜candidate(批2)· 🔁候选但我方已�
 
 ## 交付批次
 
-- **批1(本次)**:schema(`roleFragments` 段)+ maturity 字段 + 5 prime 片段(精修)+ 本对照表(全 23)+ `role-fragments.test.ts`(shape + 引擎惰性)。
-- **批2(次次)**:#6-23 candidate 片段(忠实改编,去单会话假设),含我方已有对应物注记。
+- **批1 @0b3051a**:schema(`roleFragments` 段)+ maturity 字段 + 5 prime 片段(精修)+ 本对照表(全 23)+ `role-fragments.test.ts`(shape + 引擎惰性)。
+- **批2(本次)**:#6-23 共 18 个 candidate 片段(依 README specialist 表 + §2.6 忠实改编,去单会话假设,未精修),含我方已有对应物注记。`roleFragments` 现满 23。candidate 来源诚实:依 persona 描述改编,非逐一深读各 SKILL.md(maturity=candidate 即此义)。
 
 证据诚实:gstack 自称「23 specialists + 8 power tools」,其 specialist 表实为 ~30 条 persona 化 skill(含若干其实是工具)。本表按**公司职能**合并同族(designer=5 skill 合 1、release=2、doc=2、retro=2),得 23 个**角色**席 + 一组工具,与 §2.6 一致。来源版本号见各片段 `source` 字段。
