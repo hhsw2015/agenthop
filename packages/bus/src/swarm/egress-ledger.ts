@@ -28,8 +28,15 @@ export type EgressResult = { kind: "result"; eventId: string; tsSec: number; byt
 export type EgressBody = EgressIntent | EgressResult;
 export type EgressEntry = EgressBody & { seq: number; prevHash: string; hash: string };
 
-const HOST_RE = /^[^/\s@?#]+$/; // hostname (+optional :port) only — reject scheme/path/query/fragment/whitespace/userinfo
+const HOST_RE = /^[a-zA-Z0-9._-]+$/; // BARE host only (EL-2): letters/digits/dot/dash/underscore — NO port(:)/scheme/path/query/userinfo/whitespace
 const MAG: ReadonlySet<string> = new Set<ByteMagnitude>(["0", "<1K", "<64K", "<1M", "<16M", ">=16M", "unknown"]);
+
+/** The SINGLE dest-host rule (EL-2), enforced identically at WRITE (recordEgressIntent) and READ (parseEgressEntry) so the
+ *  persistence contract is never written one way and parsed another. A bare host only — no port, scheme, path, query, or
+ *  userinfo (the brief's narrow "仅主机名" contract; not a payload side-channel). */
+export function validHost(h: unknown): h is string {
+  return typeof h === "string" && h.length > 0 && h.length <= 253 && HOST_RE.test(h);
+}
 
 /** Is the ledger seam armed? DORMANT opt-in in v1 (OFF unless explicitly enabled) — no call sites are wired yet, so the default
  *  must be no-op; `SWARM_EGRESS_LEDGER=1|true|yes|on`. */
@@ -77,7 +84,7 @@ export function parseEgressEntry(input: unknown): EgressEntry | null {
   if (typeof tsSec !== "number" || !Number.isFinite(tsSec) || tsSec < 0) return null;
   if (kind === "intent") {
     const { destHost, callFace, initiatorSid } = o;
-    if (typeof destHost !== "string" || !HOST_RE.test(destHost)) return null;
+    if (!validHost(destHost)) return null;
     if (typeof callFace !== "string" || callFace === "") return null;
     if (typeof initiatorSid !== "string" || initiatorSid === "") return null;
     return { kind, eventId, tsSec, destHost, callFace, initiatorSid, seq: seq as number, prevHash, hash };

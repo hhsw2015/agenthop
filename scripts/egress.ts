@@ -9,7 +9,7 @@
 // AGENTHOP_EGRESS_DIR overrides the ledger dir (tests). Exit: 0 ok, 1 tamper/unexpected, 2 usage. ASCII only.
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { egressDir, readEgressLedger } from "../packages/bus/src/swarm/egress-ledger-store.js";
+import { egressDir, readEgressLedger, readEgressRaw } from "../packages/bus/src/swarm/egress-ledger-store.js";
 import { verifyEgressChain, type EgressEntry, type EgressIntent, type EgressResult } from "../packages/bus/src/swarm/egress-ledger.js";
 
 export type Query = { mode: "list" } | { mode: "verify" } | { mode: "usage"; error?: string };
@@ -54,17 +54,21 @@ function main(): void {
     process.exitCode = 2; return;
   }
   const dir = egressDir(homedir());
-  let entries: EgressEntry[];
-  try { entries = readEgressLedger(dir); }
-  catch (e) { console.error(`egress: cannot read ledger ${dir}: ${e instanceof Error ? e.message : e}`); process.exitCode = 1; return; }
 
   if (q.mode === "list") {
+    let entries: EgressEntry[];
+    try { entries = readEgressLedger(dir); } // propagates an unreadable fault (never a false-complete list — EL-1)
+    catch (e) { console.error(`egress: cannot read ledger ${dir}: ${e instanceof Error ? e.message : e}`); process.exitCode = 1; return; }
     const rows = foldEvents(entries);
     console.log(rows.length === 0 ? "(no egress recorded)" : `time  initiator-sid  call-face  dest-host  bytes/outcome\n${rows.join("\n")}`);
     return;
   }
-  // verify
-  const v = verifyEgressChain(entries);
+  // verify walks the RAW entries (corrupt ⇒ null ⇒ flagged; an unreadable/non-regular entry THROWS ⇒ reported, never a clean
+  // "OK" over a shorter survivor set — EL-1). An unreadable ledger is UNKNOWN, which for an integrity check is exit 1, not 0.
+  let raw: unknown[];
+  try { raw = readEgressRaw(dir); }
+  catch (e) { console.error(`egress: cannot verify ledger ${dir} (unreadable entry): ${e instanceof Error ? e.message : e}`); process.exitCode = 1; return; }
+  const v = verifyEgressChain(raw);
   if (v.ok) {
     console.log(`OK ${v.count} entries${v.pending.length ? `, ${v.pending.length} pending (intent without result)` : ""}`);
     return;

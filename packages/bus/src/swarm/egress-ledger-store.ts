@@ -1,15 +1,23 @@
 /**
- * egress-ledger IO seam (brief §④). Persists the hash chain as ONE FILE PER ENTRY (`<seq>.json`, atomic tmp+rename) under a
- * holder-lock APPEND lock, so concurrent appends from two sessions on one home dir serialize and never fork the chain. The pure
- * chain math + verify live in egress-ledger.ts; this file only does the locked read-tail → chainEntry → atomic write, plus the
- * two-phase record API (intent first / result after, bridge r8). Everything is fail-OPEN: a recording fault NEVER blocks the
- * caller's send — it returns null/false and leaves a visible gap, it does not throw into the egress path.
+ * egress-ledger IO seam (brief §④). Persists the hash chain as ONE FILE PER ENTRY (`<seq>.json`, atomic tmp+rename). Everything
+ * here is fail-OPEN: a recording fault NEVER blocks or throws into the caller's send — it returns null/false and emits a visible
+ * GAP line (brief §5). The pure chain math + verify live in egress-ledger.ts.
+ *
+ * EL-1 (codex:Work): the next seq is taken from the MAX FILENAME seq (never from a filtered survivor count), so a transiently
+ *   unreadable interior file can never make an append reuse/overwrite an existing entry; and if the authoritative tail
+ *   (max-seq file) is unreadable/corrupt, the record is REFUSED (we never rewrite history). readEgressRaw SURFACES an unreadable
+ *   entry (throws) rather than folding to a shorter clean "OK".
+ * EL-3: the whole append (incl. lock acquire) is wrapped so a fault returns null, never throws into egress; every entry read is
+ *   lstat-gated to a regular file (a planted FIFO can never block readFileSync); a failed record emits a stderr GAP line.
+ * EL-4: the append lock is the single-flight FILE lock (acquireSingleFlight), which reclaims a DEAD holder and has NO
+ *   mkdir->publish empty window — so a crash while recording cannot permanently disable the ledger (unlike the pre-reclaim
+ *   holder-lock dir default).
  */
 import { mkdirSync, writeFileSync, renameSync, readdirSync, readFileSync, lstatSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
-import { acquireHolderLock, releaseHolderLock, type LockSite } from "./holder-lock.js";
-import { chainEntry, parseEgressEntry, type EgressBody, type EgressEntry, type ByteMagnitude, type EgressOutcome } from "./egress-ledger.js";
+import { acquireSingleFlight } from "./single-flight.js";
+import { chainEntry, parseEgressEntry, validHost, type EgressBody, type EgressEntry, type ByteMagnitude, type EgressOutcome } from "./egress-ledger.js";
 
 /** The ledger dir. Default `<home>/.agenthop/swarm/egress/`; `AGENTHOP_EGRESS_DIR` overrides (tests). */
 export function egressDir(home: string, env: NodeJS.ProcessEnv = process.env): string {
@@ -17,7 +25,7 @@ export function egressDir(home: string, env: NodeJS.ProcessEnv = process.env): s
 }
 
 /** PROJ-1/2 lesson: refuse to write if the egress dir (or its `swarm` parent) is a SYMLINK — a planted link would redirect our
- *  writes outside the 0o700 boundary. lstat does not follow; a missing dir is fine (we create it). Returns false ⇒ skip write. */
+ *  writes outside the 0o700 boundary. lstat does not follow; a missing dir is fine (we create it). */
 function boundaryOk(dir: string): boolean {
   for (const d of [dir, path.dirname(dir)]) {
     try { if (lstatSync(d).isSymbolicLink()) return false; } catch { /* ENOENT (not yet created) is fine */ }
@@ -27,55 +35,77 @@ function boundaryOk(dir: string): boolean {
 
 const seqRe = /^(\d+)\.json$/;
 function entryFile(dir: string, seq: number): string { return path.join(dir, `${String(seq).padStart(12, "0")}.json`); }
-function lockSite(dir: string): LockSite { return { lockDir: path.join(dir, ".append.lockd"), intentDir: dir, intentPrefix: "egress.append.hold." }; }
+function gap(why: string): void { try { process.stderr.write(`egress: record failed (${why}) - call proceeded, ledger has a gap\n`); } catch { /* best-effort */ } }
 
-/** Read the whole ledger in seq order. A corrupt/partial entry file parses to null and is DROPPED here (verifyEgressChain is the
- *  integrity authority — it classifies a trailing null as incomplete-tail, an interior one as tampering). Read faults PROPAGATE
- *  via the readdir throw so the caller (verify/list CLI) never folds an unreadable dir to an empty ledger. */
-export function readEgressLedger(dir: string): EgressEntry[] {
+/** Seq numbers present as `<seq>.json`, sorted ascending. Throws on a readdir fault (an unreadable dir is UNKNOWN, never folded
+ *  to empty — EL-1). An absent dir ⇒ []. */
+function listSeqs(dir: string): number[] {
   let names: string[];
-  try { names = readdirSync(dir); } catch { return []; } // dir absent ⇒ empty ledger (list/verify both treat as 0 entries)
-  const seqs = names.map((n) => seqRe.exec(n)).filter((m): m is RegExpExecArray => m !== null).map((m) => Number(m[1])).sort((a, b) => a - b);
-  const out: EgressEntry[] = [];
-  for (const seq of seqs) {
-    let raw: unknown;
-    try { raw = JSON.parse(readFileSync(entryFile(dir, seq), "utf8")); } catch { continue; } // orphan .tmp never matches seqRe; a half-written file ⇒ skip (verify flags the gap)
-    const e = parseEgressEntry(raw);
-    if (e !== null) out.push(e);
-  }
-  return out;
+  try { names = readdirSync(dir); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
+  return names.map((n) => seqRe.exec(n)).filter((m): m is RegExpExecArray => m !== null).map((m) => Number(m[1])).sort((a, b) => a - b);
 }
 
-/** The highest persisted entry (the chain tail), or null when empty. */
-function readTail(dir: string): EgressEntry | null {
-  const all = readEgressLedger(dir);
-  return all.length > 0 ? all[all.length - 1]! : null;
+/** Read one `<seq>.json` as raw JSON. THROWS on an unreadable/non-regular file (EL-1/EL-3: unknown, never silently dropped; a
+ *  FIFO/dir is rejected by the lstat gate BEFORE any blocking read). Returns null for a readable-but-corrupt (bad JSON) file so
+ *  the verifier flags that position. */
+function readRawAt(dir: string, seq: number): unknown {
+  const fp = entryFile(dir, seq);
+  const st = lstatSync(fp); // throws ENOENT (a gap — caller/verify handles) ; rejects non-regular below
+  if (!st.isFile()) throw Object.assign(new Error(`egress entry ${seq} is not a regular file`), { code: "ENOTREG" });
+  const text = readFileSync(fp, "utf8"); // throws on EACCES/EIO ⇒ unreadable ⇒ propagates (unknown)
+  try { return JSON.parse(text); } catch { return null; } // corrupt JSON ⇒ null ⇒ verify flags this position
+}
+
+/** Raw entries in seq order, for the VERIFIER. Throws on readdir OR a per-entry unreadable/non-regular file (EL-1: an unreadable
+ *  ledger is UNKNOWN — the CLI must report it, never a shorter clean "OK"). A corrupt entry is included as null (verify flags it). */
+export function readEgressRaw(dir: string): unknown[] {
+  return listSeqs(dir).map((seq) => readRawAt(dir, seq));
+}
+
+/** The VALID entries, for display/list (corrupt/dropped entries are skipped — list is not the integrity authority, verify is).
+ *  Still propagates an unreadable fault (never a false-complete list). */
+export function readEgressLedger(dir: string): EgressEntry[] {
+  return readEgressRaw(dir).map((r) => parseEgressEntry(r)).filter((e): e is EgressEntry => e !== null);
 }
 
 /**
- * Append one body under the append lock: ensure the dir, take the lock (bounded retry), read the tail, chainEntry, write the next
- * `<seq>.json` atomically (tmp+rename — a crash before rename leaves an ignored `.tmp-*` orphan, after rename a complete entry; no
- * half entry ever enters the chain), release. Returns the entry, or null on ANY fault (fail-OPEN — the caller's send proceeds).
+ * Append one body under the single-flight append lock. Fail-OPEN + never-throws: ANY fault ⇒ a stderr GAP line + null. EL-1: the
+ * next seq is MAX FILENAME seq + 1 (never a survivor count), and if the authoritative tail (max-seq file) is unreadable/corrupt
+ * or its internal seq disagrees with its filename, the record is REFUSED (history is never rewritten).
  */
 function appendBody(dir: string, body: EgressBody): EgressEntry | null {
-  if (!boundaryOk(dir)) return null;
-  try { mkdirSync(dir, { recursive: true }); } catch { return null; }
-  let token: string | null = null;
-  for (let i = 0; i < 50 && token === null; i += 1) token = acquireHolderLock(lockSite(dir)); // bounded spin (single-machine, infrequent)
-  if (token === null) return null; // could not serialize ⇒ fail-open (skip the record, not the send)
   try {
-    const entry = chainEntry(readTail(dir), body);
-    const tmp = path.join(dir, `.tmp-${process.pid}-${randomBytes(6).toString("hex")}`);
-    writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 });
-    try { renameSync(tmp, entryFile(dir, entry.seq)); } catch (e) { try { rmSync(tmp, { force: true }); } catch { /* best-effort */ } throw e; }
-    return entry;
-  } catch { return null; } // fail-open
-  finally { releaseHolderLock(lockSite(dir), token); }
+    if (!boundaryOk(dir)) { gap("symlinked ledger dir"); return null; }
+    mkdirSync(dir, { recursive: true });
+    const lockFile = path.join(dir, ".append.lock");
+    let release: (() => void) | null = null;
+    for (let i = 0; i < 50 && release === null; i += 1) release = acquireSingleFlight(lockFile); // dead-holder-reclaiming file lock (EL-4)
+    if (release === null) { gap("could not acquire append lock"); return null; }
+    try {
+      const seqs = listSeqs(dir).filter((s) => entryFile(dir, s) !== lockFile); // .append.lock is not a <seq>.json, but be explicit
+      let tail: EgressEntry | null = null;
+      if (seqs.length > 0) {
+        const maxSeq = seqs[seqs.length - 1]!;
+        const t = parseEgressEntry(readRawAt(dir, maxSeq)); // throws if the tail is unreadable/non-regular ⇒ refuse below
+        if (t === null || t.seq !== maxSeq) { gap(`authoritative tail (seq ${maxSeq}) unreadable/corrupt`); return null; } // never rewrite history (EL-1)
+        tail = t;
+      }
+      const entry = chainEntry(tail, body); // seq = tail.seq+1 = maxSeq+1 ⇒ a brand-new filename, never an overwrite
+      const tmp = path.join(dir, `.tmp-${process.pid}-${randomBytes(6).toString("hex")}`);
+      writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 });
+      try { renameSync(tmp, entryFile(dir, entry.seq)); } catch (e) { try { rmSync(tmp, { force: true }); } catch { /* best-effort */ } throw e; }
+      return entry;
+    } finally { release(); }
+  } catch (e) { gap(e instanceof Error ? e.message : String(e)); return null; } // fail-open: NEVER throw into the egress path (EL-3)
 }
 
 /** Record an egress INTENT (before/around the call). Returns the eventId (to pair the later result), or null on a recording fault
- *  (fail-open — the caller's send is NOT blocked). dest-HOST only (the caller must pass a bare host, never a URL). */
+ *  (fail-open — the caller's send is NOT blocked). EL-2: the dest-host is validated at WRITE with the SAME rule as the parser; an
+ *  invalid value fails the record (no raw value echoed into the diagnostic). */
 export function recordEgressIntent(dir: string, e: { destHost: string; callFace: string; initiatorSid: string }, nowSec: number): string | null {
+  if (!validHost(e.destHost)) { gap("destHost is not a bare host"); return null; } // EL-2: enforce the narrow contract at write; do NOT echo the raw value
+  if (typeof e.callFace !== "string" || e.callFace === "" || typeof e.initiatorSid !== "string" || e.initiatorSid === "") { gap("empty callFace/initiatorSid"); return null; }
   const eventId = `eg_${randomBytes(8).toString("hex")}`;
   const entry = appendBody(dir, { kind: "intent", eventId, tsSec: nowSec, destHost: e.destHost, callFace: e.callFace, initiatorSid: e.initiatorSid });
   return entry === null ? null : eventId;

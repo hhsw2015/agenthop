@@ -5,9 +5,9 @@ import { mkdtempSync, writeFileSync, readdirSync, rmSync, readFileSync, symlinkS
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chainEntry, verifyEgressChain, parseEgressEntry, byteMagnitude, egressLedgerEnabled, type EgressEntry, type EgressBody } from "./egress-ledger.js";
-import { egressDir, readEgressLedger, recordEgressIntent, recordEgressResult } from "./egress-ledger-store.js";
+import { egressDir, readEgressLedger, readEgressRaw, recordEgressIntent, recordEgressResult } from "./egress-ledger-store.js";
 
 let pass = 0;
 const t = (n: string, c: boolean): void => { if (!c) { console.error(`FAIL ${n}`); process.exit(1); } pass++; console.log(`ok  ${n}`); };
@@ -76,10 +76,9 @@ t("flag: ON only when explicitly enabled", egressLedgerEnabled({ SWARM_EGRESS_LE
   // truncate the last entry file to simulate a crash mid-append
   const last = readdirSync(dir).filter((n) => /^\d+\.json$/.test(n)).sort().pop()!;
   writeFileSync(path.join(dir, last), "{ \"seq\": 0, \"pre"); // half a JSON object
-  const vt = verifyEgressChain(readEgressLedger(dir));
-  // the truncated file parses to null and is dropped by the reader; with only the (now-unreadable) seq-0 dropped the ledger reads
-  // empty ⇒ ok 0 — the key property: a mid-append crash is NEVER a tamper verdict.
-  t("crash-recovery: a truncated last entry is not a TAMPER verdict", vt.ok === true || (!vt.ok && vt.kind === "incomplete-tail"));
+  // verify walks the RAW entries (EL-1): the truncated file is a null at the LAST position ⇒ incomplete-tail, NOT dropped-to-OK.
+  const vt = verifyEgressChain(readEgressRaw(dir));
+  t("crash-recovery: a truncated last entry ⇒ incomplete-tail (crash mid-append), never a TAMPER verdict", !vt.ok && vt.kind === "incomplete-tail");
   rmSync(path.dirname(dir), { recursive: true, force: true });
 }
 
@@ -99,27 +98,81 @@ t("flag: ON only when explicitly enabled", egressLedgerEnabled({ SWARM_EGRESS_LE
   rmSync(path.dirname(dir), { recursive: true, force: true });
 }
 
-// ── fixture CONCURRENCY-RACE: two real child processes append concurrently through the shared append lock ⇒ the final chain is
-//    contiguous + verifies + has ALL events (no forked chain, no seq collision) ──
+// ── EL-1: the next seq comes from the MAX FILENAME, never a filtered survivor count. A deleted/transiently-missing interior
+//    entry can NOT make an append reuse that seq (that would overwrite the next-written file); the append always extends past
+//    the max filename. ──
 {
   const dir = mkDir();
-  const child = path.join(path.dirname(dir), "child.mts");
-  const storeUrl = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "egress-ledger-store.ts")).href;
-  writeFileSync(child,
-    `import { recordEgressIntent, recordEgressResult } from ${JSON.stringify(storeUrl)};\n` +
-    `const dir = process.argv[2], sid = process.argv[3];\n` +
-    `for (let i = 0; i < 10; i++) { const id = recordEgressIntent(dir, { destHost: "h" + i, callFace: "relay.post", initiatorSid: sid }, 1000 + i); if (id) recordEgressResult(dir, { eventId: id, byteMagnitude: "<1K", outcome: "ok" }, 2000 + i); }\n`);
-  const tsx = path.join(repoRoot(), "node_modules/.bin/tsx");
-  const c1 = spawnSync(tsx, [child, dir, "sidX"], { encoding: "utf8", timeout: 30000 });
-  const c2 = spawnSync(tsx, [child, dir, "sidY"], { encoding: "utf8", timeout: 30000 });
-  t("concurrency-race: both child appenders exited 0", c1.status === 0 && c2.status === 0);
-  const entries = readEgressLedger(dir);
-  const v = verifyEgressChain(entries);
-  const seqs = entries.map((e) => e.seq);
-  const contiguous = seqs.every((s, i) => s === i);
-  t("concurrency-race: the merged chain is contiguous (no forked chain / seq collision)", contiguous);
-  t("concurrency-race: the merged chain verifies (serialized by the append lock)", v.ok === true);
-  t("concurrency-race: all 40 entries present (2 children x 10 events x 2 lines)", entries.length === 40);
+  const a = recordEgressIntent(dir, { destHost: "h0", callFace: "relay.post", initiatorSid: "s" }, 1000)!;
+  recordEgressResult(dir, { eventId: a, byteMagnitude: "<1K", outcome: "ok" }, 1001); // seq 0,1
+  const b = recordEgressIntent(dir, { destHost: "h2", callFace: "relay.post", initiatorSid: "s" }, 1002)!; // seq 2
+  rmSync(path.join(dir, "000000000001.json")); // a seq-1 interior entry goes missing (deletion / transient)
+  const next = recordEgressIntent(dir, { destHost: "h3", callFace: "relay.post", initiatorSid: "s" }, 1003)!; // must become seq 3, never reuse 1
+  t("EL-1: append extends past the MAX filename (seq 3), never reuses a missing interior seq", readdirSync(dir).filter((n) => /^\d+\.json$/.test(n)).sort().join(",") === "000000000000.json,000000000002.json,000000000003.json");
+  t("EL-1: the surviving max-seq entries still point to distinct events", a !== b && b !== next);
+  rmSync(path.dirname(dir), { recursive: true, force: true });
+}
+
+// ── EL-1: if the AUTHORITATIVE tail (max-seq file) is unreadable/corrupt or its internal seq disagrees with its filename, the
+//    record is REFUSED — history is never rewritten and the corrupt tail is never overwritten. ──
+{
+  const dir = mkDir();
+  recordEgressIntent(dir, { destHost: "h0", callFace: "relay.post", initiatorSid: "s" }, 1000); // seq 0 (the tail)
+  writeFileSync(path.join(dir, "000000000000.json"), "{ corrupt json"); // the authoritative tail is now corrupt
+  const refused = recordEgressIntent(dir, { destHost: "h1", callFace: "relay.post", initiatorSid: "s" }, 1001);
+  t("EL-1: a corrupt authoritative tail ⇒ record refused (null)", refused === null);
+  t("EL-1: the corrupt tail is NOT overwritten and no new entry is written (history untouched)", readFileSync(path.join(dir, "000000000000.json"), "utf8") === "{ corrupt json" && readdirSync(dir).filter((n) => /^\d+\.json$/.test(n)).length === 1);
+  // a tail whose internal seq disagrees with its filename is also refused (never rewrite)
+  const dir2 = mkDir();
+  recordEgressIntent(dir2, { destHost: "h0", callFace: "relay.post", initiatorSid: "s" }, 1000);
+  const tailFp = path.join(dir2, "000000000000.json");
+  writeFileSync(tailFp, JSON.stringify({ ...JSON.parse(readFileSync(tailFp, "utf8")), seq: 9 })); // filename seq 0, internal seq 9
+  t("EL-1: a tail whose internal seq disagrees with its filename ⇒ refused", recordEgressIntent(dir2, { destHost: "h1", callFace: "relay.post", initiatorSid: "s" }, 1001) === null);
+  rmSync(path.dirname(dir), { recursive: true, force: true });
+  rmSync(path.dirname(dir2), { recursive: true, force: true });
+}
+
+// ── EL-2: the dest-host contract is enforced at WRITE with the SAME rule as the parser (bare host only). A port/scheme/path/
+//    query/empty field ⇒ the record fails and NOTHING is written (no raw value echoed). ──
+{
+  const dir = mkDir();
+  mkdirSync(dir, { recursive: true }); // a refused-at-write record never reaches appendBody's mkdir ⇒ pre-create so "nothing written" is observable
+  t("EL-2 (write): a destHost with a path/query ⇒ refused", recordEgressIntent(dir, { destHost: "h/secret?token=x", callFace: "relay.post", initiatorSid: "s" }, 1000) === null);
+  t("EL-2 (write): a destHost with a port ⇒ refused", recordEgressIntent(dir, { destHost: "host:8080", callFace: "relay.post", initiatorSid: "s" }, 1000) === null);
+  t("EL-2 (write): a destHost with a scheme ⇒ refused", recordEgressIntent(dir, { destHost: "https://host", callFace: "relay.post", initiatorSid: "s" }, 1000) === null);
+  t("EL-2 (write): an empty callFace ⇒ refused", recordEgressIntent(dir, { destHost: "host", callFace: "", initiatorSid: "s" }, 1000) === null);
+  t("EL-2 (write): a refused record writes NOTHING (no half entry, no leak)", readdirSync(dir).filter((n) => /^\d+\.json$/.test(n)).length === 0);
+  rmSync(path.dirname(dir), { recursive: true, force: true });
+}
+
+// ── EL-3: fail-OPEN never throws into the caller, and the lstat gate means a non-regular tail entry (a planted FIFO/dir) is
+//    rejected WITHOUT a blocking read; a failed record emits a visible GAP line (not silent). ──
+{
+  const dir = mkDir();
+  recordEgressIntent(dir, { destHost: "h0", callFace: "relay.post", initiatorSid: "s" }, 1000); // seq 0 (the tail)
+  rmSync(path.join(dir, "000000000000.json")); mkdirSync(path.join(dir, "000000000000.json")); // the tail is now a DIRECTORY (non-regular)
+  let threw = false, refused: string | null = "x";
+  try { refused = recordEgressIntent(dir, { destHost: "h1", callFace: "relay.post", initiatorSid: "s" }, 1001); } catch { threw = true; }
+  t("EL-3: a non-regular (directory) tail ⇒ refused via the lstat gate, NEVER throws into the caller", threw === false && refused === null);
+  // GAP trace: a failed record writes a visible stderr line (fail-open is not silent)
+  const origWrite = process.stderr.write.bind(process.stderr);
+  let gapLine = "";
+  (process.stderr as unknown as { write: (s: string) => boolean }).write = (s: string) => { gapLine += s; return true; };
+  try { recordEgressIntent(dir, { destHost: "bad host", callFace: "relay.post", initiatorSid: "s" }, 1002); }
+  finally { (process.stderr as unknown as { write: typeof origWrite }).write = origWrite; }
+  t("EL-3: a failed record emits a visible GAP line on stderr (not silent)", /record failed/.test(gapLine));
+  rmSync(path.dirname(dir), { recursive: true, force: true });
+}
+
+// ── EL-4: the append lock is the single-flight FILE lock, which RECLAIMS a dead holder (no permanent disable). A stale
+//    .append.lock left by a crashed writer (dead pid) does not wedge the ledger — the next record reclaims it and succeeds. ──
+{
+  const dir = mkDir();
+  mkdirSync(dir, { recursive: true });
+  const deadPid = spawnSync(process.execPath, ["-e", ""]).pid!; // a child that has already exited ⇒ a reliably-dead pid
+  writeFileSync(path.join(dir, ".append.lock"), String(deadPid)); // a stale lock from a crashed writer
+  const id = recordEgressIntent(dir, { destHost: "h0", callFace: "relay.post", initiatorSid: "s" }, 1000);
+  t("EL-4: a stale append lock (dead holder) is reclaimed ⇒ the record still succeeds (no permanent disable)", id !== null && readdirSync(dir).filter((n) => /^\d+\.json$/.test(n)).length === 1);
   rmSync(path.dirname(dir), { recursive: true, force: true });
 }
 
@@ -136,6 +189,34 @@ t("flag: ON only when explicitly enabled", egressLedgerEnabled({ SWARM_EGRESS_LE
 // egressDir resolves AGENTHOP_EGRESS_DIR
 t("egressDir: AGENTHOP_EGRESS_DIR overrides", egressDir("/home/x", { AGENTHOP_EGRESS_DIR: "/tmp/eg" } as unknown as NodeJS.ProcessEnv) === "/tmp/eg");
 
-console.log(`\nall egress-ledger selftests passed (${pass})`);
+// ── fixture CONCURRENCY-RACE: two real child processes append GENUINELY in parallel (both spawned before either exits — the
+//    earlier spawnSync+spawnSync was serial) through the shared append lock ⇒ the merged chain is contiguous + verifies + has
+//    ALL events (no forked chain, no seq collision). ──
+async function concurrencyRace(): Promise<void> {
+  const dir = mkDir();
+  const child = path.join(path.dirname(dir), "child.mts");
+  const storeUrl = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "egress-ledger-store.ts")).href;
+  writeFileSync(child,
+    `import { recordEgressIntent, recordEgressResult } from ${JSON.stringify(storeUrl)};\n` +
+    `const dir = process.argv[2], sid = process.argv[3];\n` +
+    `for (let i = 0; i < 10; i++) { const id = recordEgressIntent(dir, { destHost: "h" + i, callFace: "relay.post", initiatorSid: sid }, 1000 + i); if (id) recordEgressResult(dir, { eventId: id, byteMagnitude: "<1K", outcome: "ok" }, 2000 + i); }\n`);
+  const tsx = path.join(repoRoot(), "node_modules/.bin/tsx");
+  const run = (sid: string): Promise<number> => new Promise((resolve) => {
+    const c = spawn(tsx, [child, dir, sid], { stdio: "inherit", timeout: 30000 });
+    c.on("exit", (code) => resolve(code ?? 1));
+    c.on("error", () => resolve(1));
+  });
+  const [s1, s2] = await Promise.all([run("sidX"), run("sidY")]); // BOTH launched before either finishes ⇒ truly concurrent
+  t("concurrency-race: both child appenders exited 0", s1 === 0 && s2 === 0);
+  const entries = readEgressLedger(dir);
+  const v = verifyEgressChain(entries);
+  const contiguous = entries.map((e) => e.seq).every((s, i) => s === i);
+  t("concurrency-race: the merged chain is contiguous (no forked chain / seq collision)", contiguous);
+  t("concurrency-race: the merged chain verifies (serialized by the append lock)", v.ok === true);
+  t("concurrency-race: all 40 entries present (2 children x 10 events x 2 lines)", entries.length === 40);
+  rmSync(path.dirname(dir), { recursive: true, force: true });
+}
+
+concurrencyRace().then(() => { console.log(`\nall egress-ledger selftests passed (${pass})`); }).catch((e) => { console.error(e); process.exit(1); });
 
 function repoRoot(): string { return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", ".."); }
