@@ -1967,8 +1967,9 @@ async function main(): Promise<void> {
         const cached = readCatalog(HOME, now);
         const ids = cached ? cached.ids : []; // no catalog ⇒ [] ⇒ pickModel is no-staffable per task (honest, never fabricated)
         // Live plan nodes → staffing tasks. authorModel is OMITTED: the per-node author model is not recorded in the current
-        // (hardcoded) spawn, so review heterogeneity degrades to "different id, author provider unknown" — the designed degrade
-        // path (per-node author-model wiring is a future enhancement, candidate for the roleProfile v2 承接 landing).
+        // (hardcoded) spawn. MS-P2-4: because Q6 heterogeneity is HARD, pickModel now returns NO-STAFFABLE for a review task with no
+        // author (it never claims heterogeneity it cannot prove). So review nodes surface as honest "wire author identity" no-staffables
+        // until per-node author-model wiring lands (candidate for the roleProfile v2 承接) — never a false "different id" suggestion.
         const tasks: StaffingTaskInput[] = plan ? plan.nodes.map((n) => taskFromNode(n)) : []; // no plan ⇒ empty projection (honest)
         writeStaffingProjection(HOME, now, { tasks, catalog: ids });
       } finally { modelStaffingInFlight = false; }

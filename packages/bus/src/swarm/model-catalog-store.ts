@@ -20,8 +20,11 @@ import { staleSec } from "./model-market.js";
 
 export const MODEL_CATALOG_SCHEMA = "model-market-catalog/v1" as const;
 
-/** The cached per-endpoint catalog: the CPA-available model ids + when we fetched them (for staleness). */
-export type ModelCatalogSnapshot = { schema: typeof MODEL_CATALOG_SCHEMA; fetchedAtSec: number; ids: string[] };
+/** The cached per-endpoint catalog: the CPA-available model ids, the ENDPOINT they were fetched from (MS-P2-1 — so a read can refuse
+ *  a cache minted for a DIFFERENT endpoint), + when we fetched them (for staleness). */
+export type ModelCatalogSnapshot = { schema: typeof MODEL_CATALOG_SCHEMA; fetchedAtSec: number; endpoint: string; ids: string[] };
+
+const LOCAL_DEFAULT_CPA = "http://127.0.0.1:8787/v1";
 
 function marketDir(home: string): string { return path.join(home, ".agenthop", "swarm", "model-market"); }
 function catalogPath(home: string): string { return path.join(marketDir(home), "catalog.json"); }
@@ -29,22 +32,29 @@ function cpaConfigPath(home: string): string { return path.join(home, ".agenthop
 
 /** The CPA API base, resolved like `t3-draft-live.ts::cpaBaseUrl`: CPA_BASE_URL env first, then the home's `cpa.json` baseUrl,
  *  then the local default. Change the endpoint via env or that config — never a code edit. */
-export function cpaBaseUrl(home: string): string {
+export function cpaBaseUrl(home: string): string | null {
   if (process.env.CPA_BASE_URL) return process.env.CPA_BASE_URL;
-  try {
-    const cfg = JSON.parse(readFileSync(cpaConfigPath(home), "utf8")) as { baseUrl?: string };
-    if (typeof cfg.baseUrl === "string" && cfg.baseUrl.length > 0) return cfg.baseUrl;
-  } catch { /* no config file ⇒ the local default */ }
-  return "http://127.0.0.1:8787/v1";
+  let raw: string;
+  try { raw = readFileSync(cpaConfigPath(home), "utf8"); }
+  // MS-P2-6: ENOENT (no config file) ⇒ the local default is correct; a NON-ENOENT read fault (EACCES) ⇒ null = UNREADABLE (a real
+  // config exists but we can't read it ⇒ the endpoint identity is UNKNOWN ⇒ the caller must refuse, never silently use the default).
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? LOCAL_DEFAULT_CPA : null; }
+  try { const cfg = JSON.parse(raw) as { baseUrl?: string }; return typeof cfg.baseUrl === "string" && cfg.baseUrl.length > 0 ? cfg.baseUrl : LOCAL_DEFAULT_CPA; }
+  catch { return null; } // corrupt config JSON ⇒ unreadable, refuse (never silently fall to the default endpoint)
 }
 
 /** CP-3 — the market output dir must be a REAL owned directory, never redirected by a pre-existing symlink. lstat (NO-follow):
  *  a symlink / non-directory ⇒ REFUSE; ENOENT ⇒ safe (our mkdir makes a real dir); any other stat fault ⇒ refuse. */
 function catalogBoundaryOk(home: string): boolean {
-  let st;
-  try { st = lstatSync(marketDir(home)); }
-  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT"; }
-  return st.isDirectory();
+  let p = home; // MS-P2-7: check the WHOLE chain from .agenthop down, not just the leaf — a symlinked ancestor also escapes the boundary.
+  for (const seg of [".agenthop", "swarm", "model-market"]) {
+    p = path.join(p, seg);
+    let st;
+    try { st = lstatSync(p); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return true; return false; }
+    if (!st.isDirectory()) return false;
+  }
+  return true;
 }
 
 /** Atomic JSON write (temp + rename) so a reader never sees a half-written catalog (and two concurrent writers both land a
@@ -95,13 +105,15 @@ export type CatalogPullResult = { written: boolean; reason?: string };
 export async function pullCpaCatalog(home: string, nowSec: number, fetcher: CatalogFetcher = realCatalogFetcher): Promise<CatalogPullResult> {
   if (!catalogBoundaryOk(home)) return { written: false, reason: "boundary" }; // CP-3
   const base = cpaBaseUrl(home);
+  if (base === null) return { written: false, reason: "config-unreadable" }; // MS-P2-6: never pull from a guessed default endpoint
   const key = process.env.CPA_API_KEY || undefined; // OPTIONAL — no header when absent
   let raw: unknown;
   try { raw = await fetcher(base, key); }
   catch (e) { return { written: false, reason: `unreachable: ${e instanceof Error ? e.message : String(e)}` }; } // CP-2: keep last
   const ids = parseCatalogIds(raw);
   if (ids.length === 0) return { written: false, reason: "parse-fail/empty" }; // CP-2: never overwrite a real catalog with []
-  writeJsonAtomic(catalogPath(home), { schema: MODEL_CATALOG_SCHEMA, fetchedAtSec: Number.isFinite(nowSec) ? nowSec : 0, ids });
+  // MS-P2-1: stamp the ENDPOINT so a later read can refuse a cache minted for a different endpoint.
+  writeJsonAtomic(catalogPath(home), { schema: MODEL_CATALOG_SCHEMA, fetchedAtSec: Number.isFinite(nowSec) ? nowSec : 0, endpoint: base, ids });
   return { written: true };
 }
 
@@ -110,6 +122,8 @@ export async function pullCpaCatalog(home: string, nowSec: number, fetcher: Cata
  * half-written file never masquerades as a catalog). Any OTHER read fault PROPAGATES (house style). Returns {ids, staleSec}.
  */
 export function readCatalog(home: string, nowSec: number): { ids: string[]; staleSec: number } | null {
+  const base = cpaBaseUrl(home);
+  if (base === null) return null; // MS-P2-6: the current endpoint is unknown (config unreadable) ⇒ cannot trust ANY cache for it
   let raw: string;
   try { raw = readFileSync(catalogPath(home), "utf8"); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
@@ -118,6 +132,7 @@ export function readCatalog(home: string, nowSec: number): { ids: string[]; stal
   if (!parsed || typeof parsed !== "object") return null;
   const p = parsed as Record<string, unknown>;
   if (p.schema !== MODEL_CATALOG_SCHEMA || typeof p.fetchedAtSec !== "number" || !Number.isFinite(p.fetchedAtSec) || !Array.isArray(p.ids)) return null;
+  if (typeof p.endpoint !== "string" || p.endpoint !== base) return null; // MS-P2-1: cache minted for a DIFFERENT (or no) endpoint ⇒ not valid here
   const ids = p.ids.filter((x): x is string => typeof x === "string");
   return { ids, staleSec: staleSec({ fetchedAtSec: p.fetchedAtSec }, nowSec) };
 }

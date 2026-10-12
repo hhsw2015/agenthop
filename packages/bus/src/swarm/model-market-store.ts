@@ -32,10 +32,15 @@ function snapshotPath(home: string): string { return path.join(marketDir(home), 
  *  the snapshot write outside the boundary). lstat (NO-follow): a symlink or any non-directory ⇒ REFUSE; ENOENT ⇒ not created
  *  yet ⇒ safe (our mkdir makes a real dir); any other stat fault ⇒ refuse (never risk an unvetted write). */
 function marketBoundaryOk(home: string): boolean {
-  let st;
-  try { st = lstatSync(marketDir(home)); }
-  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT"; } // ENOENT ⇒ safe; any other fault ⇒ refuse
-  return st.isDirectory();
+  let p = home; // MS-P2-7: check the WHOLE chain from .agenthop down, not just the leaf — a symlinked ancestor also escapes the boundary.
+  for (const seg of [".agenthop", "swarm", "model-market"]) {
+    p = path.join(p, seg);
+    let st;
+    try { st = lstatSync(p); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return true; return false; } // ENOENT ⇒ safe; any other fault ⇒ refuse
+    if (!st.isDirectory()) return false;
+  }
+  return true;
 }
 
 /** Atomic JSON write (temp + rename) so a reader never sees a half-written snapshot — the same temp+rename the console store

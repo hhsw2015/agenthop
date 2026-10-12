@@ -35,10 +35,15 @@ function defaultMapPath(): string { return path.join(path.dirname(fileURLToPath(
  *  write outside the boundary). lstat (NO-follow): a symlink / non-directory ⇒ REFUSE; ENOENT ⇒ safe (our mkdir makes a real
  *  dir); any other stat fault ⇒ refuse. */
 function consoleBoundaryOk(home: string): boolean {
-  let st;
-  try { st = lstatSync(consoleDir(home)); }
-  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT"; }
-  return st.isDirectory();
+  let p = home; // MS-P2-7: check the WHOLE chain from .agenthop down, not just the leaf — a symlinked ancestor also escapes the boundary.
+  for (const seg of [".agenthop", "swarm", "console"]) {
+    p = path.join(p, seg);
+    let st;
+    try { st = lstatSync(p); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return true; return false; }
+    if (!st.isDirectory()) return false;
+  }
+  return true;
 }
 
 /** Atomic JSON write (temp + rename) so the console never reads a half-written projection. 0o700 dir / 0o600 file. */
@@ -51,26 +56,35 @@ function writeJsonAtomic(file: string, data: unknown): void {
 
 /** Parse a map file into a validated `{ marketBaseId: cpaId }` record (both strings, non-empty value), else null (absent / torn
  *  / wrong shape). The file shape is `{ schema, map: {...} }`; only the `map` object is consumed. */
-function readMapFile(file: string): Record<string, string> | null {
+/** MS-P2-6: a map file read is THREE-STATE — ENOENT (absent ⇒ try the next source), a valid `{map:{...}}` (ok, even if empty), or
+ *  UNREADABLE (EACCES / corrupt JSON / wrong shape ⇒ the caller must NOT silently fall back to a different source). */
+type MapRead = { kind: "ok"; map: Record<string, string> } | { kind: "absent" } | { kind: "unreadable" };
+function readMapFile(file: string): MapRead {
   let raw: string;
   try { raw = readFileSync(file, "utf8"); }
-  catch { return null; } // absent / unreadable ⇒ fall through to the next source
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" }; } // EACCES ⇒ unreadable, NOT absent
   let parsed: unknown;
-  try { parsed = JSON.parse(raw); } catch { return null; }
-  if (!parsed || typeof parsed !== "object") return null;
+  try { parsed = JSON.parse(raw); } catch { return { kind: "unreadable" }; } // corrupt JSON ⇒ unreadable (never a silent empty map)
+  if (!parsed || typeof parsed !== "object") return { kind: "unreadable" };
   const mapRaw = (parsed as { map?: unknown }).map;
-  if (!mapRaw || typeof mapRaw !== "object") return null;
+  if (!mapRaw || typeof mapRaw !== "object") return { kind: "unreadable" };
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(mapRaw as Record<string, unknown>)) {
     if (typeof k === "string" && k.length > 0 && typeof v === "string" && v.length > 0) out[k] = v;
   }
-  return out;
+  return { kind: "ok", map: out };
 }
 
 /** Read the model-market↔CPA map (Q1): the SHARED home override first, else the repo-shipped seed, else an empty map (every
  *  model then counts unmappable). Fully fail-soft — never throws. */
-export function readModelMarketMap(home: string): Record<string, string> {
-  return readMapFile(mapOverridePath(home)) ?? readMapFile(defaultMapPath()) ?? {};
+export function readModelMarketMap(home: string): Record<string, string> | null {
+  const override = readMapFile(mapOverridePath(home));
+  if (override.kind === "ok") return override.map;        // a valid override (incl. an intentional empty map) wins
+  if (override.kind === "unreadable") return null;         // MS-P2-6: EACCES/corrupt override ⇒ UNREADABLE ⇒ skip (never fall to the seed)
+  const seed = readMapFile(defaultMapPath());             // override absent ⇒ the repo-shipped seed
+  if (seed.kind === "ok") return seed.map;
+  if (seed.kind === "unreadable") return null;             // MS-P2-6: seed unreadable ⇒ skip
+  return {};                                               // both ABSENT ⇒ empty map (every model unmappable — honest, not unreadable)
 }
 
 /**
@@ -86,6 +100,7 @@ export function writeStaffingProjection(
   if (!consoleBoundaryOk(home)) return null; // CP-3: never write through a redirected console dir chain
   const cached = readModelMarketSnapshot(home, nowSec); // ENOENT/torn ⇒ null ⇒ "unknown" per task
   const mapTable = readModelMarketMap(home);
+  if (mapTable === null) return null; // MS-P2-6: the map config is UNREADABLE ⇒ skip (never produce a projection on a guessed map)
   const projection = buildStaffingProjection({
     tasks: input.tasks,
     snapshot: cached ? cached.snapshot : null,

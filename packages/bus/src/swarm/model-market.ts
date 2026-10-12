@@ -38,10 +38,12 @@ export type MarketModel = {
   provider: string;
   /** Derived board dimensions (coding / agentic / science / long_context); a dimension is absent when no source value existed. */
   categoryScores: CategoryScores;
-  /** The board's 0..100 composite `score` (the review / general dimension). 0 when absent. */
-  composite: number;
-  /** 10:1 blended $/1M (price evidence + the light/standard cost-optimization key). 0 when absent. */
-  blendedUsdPer1M: number;
+  /** The board's 0..100 composite `score` (the review / general dimension). ABSENT when no source value existed — MS-P2-5: never
+   *  fabricated as 0 (a fabricated 0 would make a scoreless model a valid general/review candidate). */
+  composite?: number;
+  /** 10:1 blended $/1M (price evidence + the light/standard cost-optimization key). ABSENT when no source value existed — MS-P2-5:
+   *  never fabricated as 0 (a fabricated 0 would pass any budget ceiling and win every cheapest tiebreak). */
+  blendedUsdPer1M?: number;
   /** Top cross-provider cheapest offer (trimmed), when upstream listed one. */
   cheapestOffer?: CheapestOffer;
   /** On the cost-performance frontier (upstream `pareto`) — the light tier's "够用且性价比最优" preference. */
@@ -129,9 +131,9 @@ export function parseModelMarket(raw: unknown, fetchedAtSec: number): ModelMarke
       id: m.id,
       provider: typeof m.org === "string" ? m.org : "",
       categoryScores: deriveCategoryScores(cats, bench),
-      composite: num(m.score) ?? 0,
-      blendedUsdPer1M: num(m.blended) ?? 0,
     };
+    const comp = num(m.score); if (comp !== undefined) model.composite = comp;       // MS-P2-5: set only when a finite source value exists
+    const blended = num(m.blended); if (blended !== undefined) model.blendedUsdPer1M = blended; // MS-P2-5: never fabricate 0
     const offer = Array.isArray(m.cheapest) ? m.cheapest[0] : undefined;
     if (offer && typeof offer === "object") {
       const o = offer as Record<string, unknown>;
@@ -145,16 +147,39 @@ export function parseModelMarket(raw: unknown, fetchedAtSec: number): ModelMarke
   return { schema: MODEL_MARKET_SCHEMA, fetchedAtSec: Number.isFinite(fetchedAtSec) ? fetchedAtSec : 0, models };
 }
 
+/** Sanitize ONE raw model record read back from disk (MS-P2-5): require a string id; keep ONLY finite numeric evidence (a dimension
+ *  score / composite / price that is a string or NaN is DROPPED, never trusted as a value). A record with no usable id ⇒ null (skip).
+ *  So a corrupt / foreign on-disk record can never inject a fabricated or string "score" into a suggestion. Pure. */
+function sanitizeModel(raw: unknown): MarketModel | null {
+  if (!raw || typeof raw !== "object") return null;
+  const m = raw as Record<string, unknown>;
+  if (typeof m.id !== "string" || m.id.length === 0) return null;
+  const cs = m.categoryScores && typeof m.categoryScores === "object" ? (m.categoryScores as Record<string, unknown>) : {};
+  const categoryScores: CategoryScores = {};
+  for (const dim of ["coding", "agentic", "science", "long_context"] as const) { const v = num(cs[dim]); if (v !== undefined) categoryScores[dim] = v; }
+  const out: MarketModel = { id: m.id, provider: typeof m.provider === "string" ? m.provider : "", categoryScores };
+  const comp = num(m.composite); if (comp !== undefined) out.composite = comp;
+  const blended = num(m.blendedUsdPer1M); if (blended !== undefined) out.blendedUsdPer1M = blended;
+  if (m.cheapestOffer && typeof m.cheapestOffer === "object") { const o = m.cheapestOffer as Record<string, unknown>; const ob = num(o.blendedUsdPer1M); if (ob !== undefined) out.cheapestOffer = { provider: typeof o.provider === "string" ? o.provider : "", blendedUsdPer1M: ob }; }
+  if (m.pareto === true) out.pareto = true;
+  if (m.deprecated === true) out.deprecated = true;
+  return out;
+}
+
 /**
  * Validate a snapshot read back from disk (the read side of CP-2): the schema string must match, `fetchedAtSec` must be finite,
  * and `models` must be an array. A structurally-INVALID file ⇒ null (the caller treats it as "no usable cache", never trusts a
- * half-written / foreign file). Returns the SAME object (not a copy) on success. Pure.
+ * half-written / foreign file). MS-P2-5: each model record is SANITIZED (string id required, only finite numeric evidence kept) so
+ * a corrupt on-disk record can never produce a fabricated/NaN suggestion. Returns a CLEANED snapshot (a new object). Pure.
  */
 export function validSnapshot(raw: unknown): ModelMarketSnapshot | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
   if (r.schema !== MODEL_MARKET_SCHEMA) return null;
-  if (!num(r.fetchedAtSec)) return null;
+  const fetchedAtSec = num(r.fetchedAtSec);
+  if (fetchedAtSec === undefined) return null;
   if (!Array.isArray(r.models)) return null;
-  return raw as ModelMarketSnapshot;
+  const models: MarketModel[] = [];
+  for (const mRaw of r.models) { const m = sanitizeModel(mRaw); if (m !== null) models.push(m); }
+  return { schema: MODEL_MARKET_SCHEMA, fetchedAtSec, models };
 }

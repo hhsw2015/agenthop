@@ -26,7 +26,7 @@
  */
 import { stripDateSuffix } from "./model-tier.js";
 import { flagDefaultOn } from "./flag-default.js";
-import { marketBaseId, staleSec, type BoardDimension, type MarketModel, type ModelMarketSnapshot } from "./model-market.js";
+import { marketBaseId, staleSec, type BoardDimension, type CheapestOffer, type MarketModel, type ModelMarketSnapshot } from "./model-market.js";
 import type { TaskKind } from "./task-plan.js";
 
 /** SWARM_MODEL_STAFFING gates the staffing suggestion producer — LIVE BY DEFAULT (opt-out via [[flagDefaultOn]], freeze Q2:
@@ -102,7 +102,10 @@ export type StaffingEvidence = {
   score: number;
   blendedUsdPer1M: number;
   priceDeltaVsFloor: number;
-  overBudget?: boolean;
+  /** The pick's 1-based rank by board score among the whole (mapped+scored) universe — brief:41 榜据. */
+  rank?: number;
+  /** The upstream single cheapest cross-provider offer for the picked model (brief:41), when the snapshot carried one. */
+  cheapestOffer?: CheapestOffer;
 };
 
 /** A staffing suggestion, OR a fail-closed no-staffable result. `unmappableCount` (Q1) rides on BOTH so it is always visible. */
@@ -137,8 +140,9 @@ const HEAVY_FLOOR_FRACTION = 1.0;
 const STANDARD_FLOOR_FRACTION = 0.95;
 const LIGHT_FLOOR_FRACTION = 0.85;
 
-/** A resolved candidate: a mapped, scored model with its CPA id, board score, price, provider, and pareto flag. */
-type Candidate = { cpaId: string; marketId: string; provider: string; board: number; price: number; pareto: boolean };
+/** A resolved candidate. `catalogId` = the ACTUAL callable CPA id this endpoint serves (MS-P2-3), or null when NOT in the catalog
+ *  (a universe-only ideal). `mappedId` = the map's CPA value (the Q1 alias, used as the stable tiebreak key). */
+type Candidate = { catalogId: string | null; mappedId: string; marketId: string; provider: string; board: number; price: number; pareto: boolean; cheapestOffer?: CheapestOffer };
 
 /** The board dimension a task shape scores on (review / general ⇒ the composite). Pure. */
 export function boardOf(shape: TaskShape): Board {
@@ -151,17 +155,21 @@ export function boardOf(shape: TaskShape): Board {
   }
 }
 
-/** The model's score on a board; undefined when absent (not a candidate for that shape). Pure. */
+/** The model's score on a board; undefined when absent OR non-finite (MS-P2-5: a string / NaN score from a corrupt disk snapshot
+ *  is treated as "no value", never trusted). Pure. */
 function boardScoreOf(m: MarketModel, board: Board): number | undefined {
-  if (board === "composite") return Number.isFinite(m.composite) ? m.composite : undefined;
-  return m.categoryScores[board];
+  const v = board === "composite" ? m.composite : m.categoryScores[board];
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
-/** Catalog membership with date-suffix tolerance (reuses model-tier.stripDateSuffix): a catalog serving only a dated snapshot
- *  (`claude-opus-5-5-20261001`) still matches the mapped base id (`claude-opus-5-5`). */
-function catalogHas(catalog: readonly string[], cpaId: string): boolean {
-  if (catalog.includes(cpaId)) return true;
-  return catalog.some((c) => stripDateSuffix(c) === cpaId);
+/** Resolve a mapped CPA id to the ACTUAL catalog entry that serves it (exact first, else a date-suffixed variant), with date-suffix
+ *  tolerance (reuses model-tier.stripDateSuffix): a catalog serving only `claude-opus-5-5-20261001` resolves the mapped base id
+ *  `claude-opus-5-5` to that REAL, callable id. Returns null when the catalog does not serve it. MS-P2-3: the suggestion returns
+ *  the resolved actual id, never the mapped alias that may not itself be invocable. Pure. */
+function catalogResolve(catalog: readonly string[], cpaId: string): string | null {
+  if (catalog.includes(cpaId)) return cpaId;
+  const dated = catalog.find((c) => stripDateSuffix(c) === cpaId);
+  return dated ?? null;
 }
 
 /** Count the non-deprecated snapshot models with NO map entry (Q1). Dimension-INDEPENDENT (it is about map coverage, not a
@@ -177,8 +185,7 @@ export function countUnmappable(snapshot: ModelMarketSnapshot, map: Readonly<Rec
 }
 
 const round2 = (x: number): number => Math.round(x * 100) / 100;
-const finite = (n: number): number => (Number.isFinite(n) ? n : 0);
-const cmpId = (a: Candidate, b: Candidate): number => (a.cpaId < b.cpaId ? -1 : a.cpaId > b.cpaId ? 1 : 0);
+const cmpId = (a: Candidate, b: Candidate): number => (a.mappedId < b.mappedId ? -1 : a.mappedId > b.mappedId ? 1 : 0);
 
 /** Select ONE candidate by the cost-tier rule. heavy ⇒ highest board, cheaper breaks ties. light ⇒ prefer the Pareto frontier,
  *  then cheapest, best-board breaks ties. standard ⇒ cheapest in the band (the band already clears the 0.95 floor), best-board
@@ -226,109 +233,117 @@ function providerOfAuthor(snapshot: ModelMarketSnapshot, map: Readonly<Record<st
 export function pickModel(input: PickInput): StaffingSuggestion {
   const board = boardOf(input.taskShape);
   const isReview = input.taskShape === "review";
+  const unmappableCount = countUnmappable(input.snapshot, input.mapTable);
+
+  // MS-P2-4: a review task REQUIRES the author model to prove the HARD Q6 heterogeneity. Without it we cannot guarantee a different
+  // model ⇒ fail-closed no-staffable (NEVER claim heterogeneity satisfied while deferring it; wiring author identity is the enabler).
+  if (isReview && !input.authorModel) {
+    return { ok: false, reason: "review heterogeneity is HARD (Q6) but no author model was provided — cannot guarantee a different model (wire author identity to staff reviews)", unmappableCount };
+  }
   const author = input.authorModel ? stripDateSuffix(input.authorModel) : undefined;
   const authorProvider = input.authorModel ? providerOfAuthor(input.snapshot, input.mapTable, input.authorModel) : undefined;
 
-  let unmappableCount = 0;
-  const universe: Candidate[] = []; // ideal: all mapped+scored non-deprecated models (may be catalog-unavailable)
-  const available: Candidate[] = []; // the above restricted to the catalog (+ review: author id excluded)
+  const universe: Candidate[] = []; // ideal: all mapped + scored + PRICED non-deprecated models (may be catalog-unavailable)
+  const available: Candidate[] = []; // the above restricted to the catalog (actual callable id resolved; review: author id excluded)
   for (const m of input.snapshot.models) {
     if (m.deprecated) continue; // never suggest a deprecated model
-    const cpaId = input.mapTable[marketBaseId(m.id)];
-    if (cpaId === undefined || cpaId === "") { unmappableCount += 1; continue; } // Q1: no map entry ⇒ SKIP + COUNT (visible)
+    const mappedId = input.mapTable[marketBaseId(m.id)];
+    if (mappedId === undefined || mappedId === "") continue; // Q1 unmappable — counted by countUnmappable (visible)
     const score = boardScoreOf(m, board);
-    if (score === undefined) continue; // mapped but no score on THIS board ⇒ not a candidate for this shape
-    const cand: Candidate = { cpaId, marketId: m.id, provider: m.provider, board: score, price: finite(m.blendedUsdPer1M), pareto: m.pareto === true };
+    if (score === undefined) continue; // MS-P2-5: no finite score on THIS board ⇒ not a candidate
+    const price = typeof m.blendedUsdPer1M === "number" && Number.isFinite(m.blendedUsdPer1M) ? m.blendedUsdPer1M : undefined;
+    if (price === undefined) continue; // MS-P2-5: no finite price ⇒ cannot rank/budget honestly ⇒ not a candidate (never fabricate 0)
+    const catalogId = catalogResolve(input.catalog, mappedId); // MS-P2-3: the REAL callable id, or null (not served here)
+    const cand: Candidate = { catalogId, mappedId, marketId: m.id, provider: m.provider, board: score, price, pareto: m.pareto === true, ...(m.cheapestOffer ? { cheapestOffer: m.cheapestOffer } : {}) };
     universe.push(cand);
-    if (!catalogHas(input.catalog, cpaId)) continue; // mapped but this CPA endpoint does not serve it ⇒ not available (NOT unmappable)
-    if (isReview && author && stripDateSuffix(cpaId) === author) continue; // Q6 HARD: the reviewer model must differ from the author
+    if (catalogId === null) continue; // mapped but this CPA endpoint does not serve it ⇒ not available (NOT unmappable)
+    if (isReview && author && stripDateSuffix(mappedId) === author) continue; // Q6 HARD: the reviewer model must differ from the author
     available.push(cand);
   }
 
   if (available.length === 0) {
-    const why = isReview
-      ? "no catalog model (other than the author's) carries a board score for this review — fail-closed (no weak default)"
-      : "no same-tier catalog model carries a board score for this shape — fail-closed (no weak default)";
-    return { ok: false, reason: why, unmappableCount };
+    return { ok: false, reason: isReview
+      ? "no catalog model (other than the author's) has a finite board score + price for this review — fail-closed"
+      : "no same-shape catalog model has a finite board score + price — fail-closed", unmappableCount };
   }
 
   const topScore = Math.max(...universe.map((c) => c.board)); // the IDEAL ceiling (incl. catalog-unavailable models)
   const frac = input.costTier === "heavy" ? HEAVY_FLOOR_FRACTION : input.costTier === "standard" ? STANDARD_FLOOR_FRACTION : LIGHT_FLOOR_FRACTION;
   const floorScore = topScore * frac;
 
-  // the available band that clears the capability floor; empty ⇒ degrade to the best available overall (recorded below).
+  // MS-P2-2: the AVAILABLE band must CLEAR the capability floor. Empty ⇒ NO-STAFFABLE (无同档, brief:42) — NEVER widen to all available.
   let band = available.filter((c) => c.board >= floorScore);
-  let degradedByFloor = false;
-  if (band.length === 0) { band = available.slice(); degradedByFloor = true; }
+  if (band.length === 0) {
+    return { ok: false, reason: `no catalog model clears the ${input.costTier}-tier capability floor (~${round2(floorScore)} on ${board}) — fail-closed (no weak default)`, unmappableCount };
+  }
 
-  // Q6 review heterogeneity: PREFER cross-provider within the band; same-provider (different-id) kept only when none cross.
+  // Q6 review heterogeneity: PREFER cross-provider within the band — MS-P3-1: a cross-provider option must have a KNOWN provider that
+  // differs (an unknown "" provider is NOT evidence of cross-provider). Same-provider (author-id-excluded) kept only when none cross.
   let sameProviderFallback = false;
   if (isReview && authorProvider) {
-    const cross = band.filter((c) => c.provider !== authorProvider);
+    const cross = band.filter((c) => c.provider !== "" && c.provider !== authorProvider);
     if (cross.length > 0) band = cross;
-    else sameProviderFallback = true; // no cross-provider option in-band — the (already author-id-excluded) same-provider band stands
+    else sameProviderFallback = true;
   }
 
-  // Q5 optional $ ceiling: prefer the sub-band within budget; none fit ⇒ keep the band + flag overBudget (never weaken below floor).
-  let overBudget = false;
-  let budgetBand = band;
+  // MS-P2-2: a given $ ceiling is HARD when present — no in-band model within it ⇒ NO-STAFFABLE (never return an over-budget "ok").
   if (typeof input.budgetUsdCeiling === "number" && Number.isFinite(input.budgetUsdCeiling)) {
     const underBudget = band.filter((c) => c.price <= input.budgetUsdCeiling!);
-    if (underBudget.length > 0) budgetBand = underBudget;
-    else overBudget = true;
+    if (underBudget.length === 0) {
+      return { ok: false, reason: `no ${input.costTier}-tier model is within the $${input.budgetUsdCeiling}/1M ceiling — fail-closed (raise the budget or lower the tier)`, unmappableCount };
+    }
+    band = underBudget;
   }
 
-  const pick = selectByTier(budgetBand, input.costTier);
+  const pick = selectByTier(band, input.costTier);
 
-  // degradedFrom (brief: "选了不可用 ⇒ degradedFrom 记明最近似"): the ideal pick over the WHOLE universe by the same tier rule.
-  const idealFloorBand = universe.filter((c) => c.board >= floorScore);
-  const ideal = selectByTier(idealFloorBand.length > 0 ? idealFloorBand : universe, input.costTier);
+  // degradedFrom (MS-P3-1 honest): recorded ONLY when the ideal in-band pick is a DIFFERENT MODEL this endpoint does NOT serve —
+  // i.e. a genuine CPA-availability degrade. Never for a heterogeneity/budget choice (those are not "unavailable").
+  const idealBand = universe.filter((c) => c.board >= floorScore);
+  const ideal = selectByTier(idealBand, input.costTier);
   let degradedFrom: DegradedFrom | undefined;
-  if (ideal.cpaId !== pick.cpaId || degradedByFloor) {
-    degradedFrom = {
-      marketId: ideal.marketId,
-      score: round2(ideal.board),
-      reason: degradedByFloor ? "no catalog model cleared the tier capability floor; best available" : "preferred model not in the CPA catalog; nearest available",
-    };
+  if (ideal.marketId !== pick.marketId && ideal.catalogId === null) {
+    degradedFrom = { marketId: ideal.marketId, score: round2(ideal.board), reason: "preferred model not served by this CPA endpoint; nearest available in-band" };
   }
 
-  const cheapestInBand = Math.min(...budgetBand.map((c) => c.price));
+  const cheapestInBand = Math.min(...band.map((c) => c.price));
+  const rank = universe.filter((c) => c.board > pick.board).length + 1; // 1-based board rank over the universe (brief:41)
   const evidence: StaffingEvidence = {
     board,
     score: round2(pick.board),
     blendedUsdPer1M: round2(pick.price),
     priceDeltaVsFloor: round2(pick.price - cheapestInBand),
+    rank,
+    ...(pick.cheapestOffer ? { cheapestOffer: pick.cheapestOffer } : {}),
   };
-  if (overBudget) evidence.overBudget = true;
 
-  const why = buildWhy({ input, pick, board, degradedByFloor, sameProviderFallback, authorProvider, overBudget });
-  const out: StaffingSuggestion = { ok: true, suggestedModel: pick.cpaId, tier: input.costTier, shape: input.taskShape, why, evidence, unmappableCount };
+  const why = buildWhy({ input, pick, board, sameProviderFallback, authorProvider, degradedFrom });
+  // pick is from `available` (catalogId resolved non-null); the actual callable id is always present here.
+  const out: StaffingSuggestion = { ok: true, suggestedModel: pick.catalogId!, tier: input.costTier, shape: input.taskShape, why, evidence, unmappableCount };
   if (degradedFrom) out.degradedFrom = degradedFrom;
   return out;
 }
 
-/** Compose the human-readable `why` (協調者/user 一眼可核). Concise, one line. */
+/** Compose the human-readable `why` (協調者/user 一眼可核). Concise, one line. MS-P3-1: distinguishes catalog-availability degrade,
+ *  heterogeneity exclusion, and an UNVERIFIED cross-provider (unknown author provider) — never an unknown fact asserted as true. */
 function buildWhy(a: {
   input: PickInput;
   pick: Candidate;
   board: Board;
-  degradedByFloor: boolean;
   sameProviderFallback: boolean;
   authorProvider: string | undefined;
-  overBudget: boolean;
+  degradedFrom: DegradedFrom | undefined;
 }): string {
-  const parts: string[] = [`${a.input.taskShape} via ${a.board} board`, `${a.input.costTier} tier`, `${a.pick.provider || "?"} ${a.pick.marketId}`, `$${round2(a.pick.price)}/1M`];
+  const parts: string[] = [`${a.input.taskShape} via ${a.board} board`, `${a.input.costTier} tier`, `${a.pick.provider || "provider?"} ${a.pick.marketId}`, `catalog:${a.pick.catalogId}`, `$${round2(a.pick.price)}/1M`];
   if (a.input.taskShape === "review") {
-    parts.push(
-      a.sameProviderFallback
-        ? "heterogeneous: no cross-provider same-tier option, same-provider different-id fallback"
-        : a.authorProvider
-          ? `heterogeneous: cross-provider vs author (${a.authorProvider})`
-          : "heterogeneous: different id (author provider unknown)",
-    );
+    // MS-P3-1: never assert an unknown fact. cross-provider is claimed ONLY with a known author provider AND a known-different pick;
+    // an unknown ("") author OR pick provider is reported as id-differs-but-cross-provider-UNVERIFIED, not as same/cross-provider.
+    if (a.authorProvider === undefined) parts.push("heterogeneous: id differs; cross-provider UNVERIFIED (author provider unknown)");
+    else if (!a.sameProviderFallback) parts.push(`heterogeneous: cross-provider vs author (${a.authorProvider})`);
+    else if (a.pick.provider === "") parts.push("heterogeneous: id differs; cross-provider UNVERIFIED (pick provider unknown)");
+    else parts.push(`heterogeneous: id differs; same-provider (${a.pick.provider}), no cross-provider option`);
   }
-  if (a.degradedByFloor) parts.push("degraded: no catalog model cleared the tier floor");
-  if (a.overBudget) parts.push("over the budget ceiling (never weakened below floor)");
+  if (a.degradedFrom) parts.push(`degraded: ${a.degradedFrom.reason} (ideal ${a.degradedFrom.marketId})`);
   return parts.join("; ");
 }
 
