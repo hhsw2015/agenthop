@@ -34,12 +34,50 @@ function readToken(): string {
   if (!existsSync(f)) throw new Error(`no bot token at ${f} — seed it: printf %s '<token>' | ${process.argv[1]} --seed-token`);
   return readFileSync(f, "utf8").trim();
 }
-function readAllow(): Set<number> {
-  try { const a = JSON.parse(readFileSync(allowFile(), "utf8")); return new Set((Array.isArray(a) ? a : a?.chatIds ?? []).filter((n: unknown): n is number => typeof n === "number")); }
-  catch { return new Set(); }
+/** TG-5 — FC-2 THREE-STATE allowlist read (exported + path-param for test). ENOENT ⇒ EMPTY set (legitimately not configured yet:
+ *  notify no-ops, poll surfaces a first-contact hint). A VALID array / {chatIds:[...]} ⇒ the numeric set. A corrupt-JSON /
+ *  wrong-shape (e.g. a bare string id) / EACCES read ⇒ null = UNREADABLE: the caller MUST refuse to proceed — treating it as empty
+ *  silently acks + skips every real tap (the approval BLACK HOLE the audit flagged, triggered by one config typo) — and alert.
+ *  Never silently empties. */
+export function readAllow(file: string): Set<number> | null {
+  let raw: string;
+  try { raw = readFileSync(file, "utf8"); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return new Set(); return null; } // ENOENT = not configured; else unreadable
+  let a: unknown;
+  try { a = JSON.parse(raw); } catch { return null; } // corrupt JSON ⇒ unreadable, never a silent empty
+  const arr = Array.isArray(a) ? a
+    : (a && typeof a === "object" && Array.isArray((a as { chatIds?: unknown }).chatIds)) ? (a as { chatIds: unknown[] }).chatIds
+    : null;
+  if (arr === null) return null; // wrong shape (bare string/number/bool/...) ⇒ unreadable config, never a silent empty
+  const nums = arr.filter((n: unknown): n is number => typeof n === "number");
+  // IP2-3: a NON-EMPTY array that yields ZERO valid numeric ids (e.g. ["12345"] / {chatIds:["12345"]}) is a MALFORMED config, not an
+  // intentional empty allowlist — fold it to null (refuse + alert) so a string-id typo never silently black-holes every approval. A
+  // legitimately empty array ([]) stays a confirmed empty set.
+  if (arr.length > 0 && nums.length === 0) return null;
+  return new Set(nums);
 }
-const readOffset = (): number => { try { return Number(readFileSync(offsetFile(), "utf8").trim()) || 0; } catch { return 0; } };
-const writeOffset = (n: number): void => { try { writeFileSync(offsetFile(), String(n), { mode: 0o600 }); } catch { /* best-effort; a replayed update is deduped by consume-once */ } };
+
+/** TG-2 — FC-2 THREE-STATE offset read. ENOENT ⇒ 0 (legitimate first run / Telegram default). A finite >=0 number ⇒ it. Corrupt
+ *  CONTENT (readable but non-numeric) ⇒ 0 + warn: replay the backlog ONCE, self-heals on the next successful writeOffset. A
+ *  non-ENOENT READ error (EACCES) ⇒ null: the caller refuses this poll — replaying ~24h of backlog on every loop while writeOffset
+ *  is ALSO blocked is a permanent silent reprocess storm. Never silently 0-on-EACCES. */
+export function readOffset(file: string): number | null {
+  let raw: string;
+  try { raw = readFileSync(file, "utf8"); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return 0; console.error(`swarm-tg-entry: offset UNREADABLE (${(e as Error).message}) — refusing to poll (would replay the whole backlog every loop); fix ${file}`); return null; }
+  const n = Number(raw.trim());
+  if (Number.isFinite(n) && n >= 0) return n;
+  console.error(`swarm-tg-entry: offset file corrupt ('${raw.trim().slice(0, 40)}') — restarting from backlog once (self-heals on next offset write)`);
+  return 0;
+}
+
+/** TG-1 — persist the offset, SURFACING a write fault instead of swallowing it. Returns success. A silent swallow turned a
+ *  persistent write fault (ENOSPC / EACCES / the offset path being a directory) into an INVISIBLE infinite re-fetch+re-ack storm;
+ *  now the operator sees it. The thrash cannot be removed while the persisting write itself fails — but it is no longer silent. */
+export function writeOffset(file: string, n: number): boolean {
+  try { writeFileSync(file, String(n), { mode: 0o600 }); return true; }
+  catch (e) { console.error(`swarm-tg-entry: FAILED to persist offset to ${file} (${(e as Error).message}) — updates will be re-fetched until this resolves`); return false; }
+}
 const readNotified = (): Set<string> => { try { return new Set(JSON.parse(readFileSync(notifiedFile(), "utf8"))); } catch { return new Set(); } };
 const writeNotified = (s: Set<string>): void => { try { writeFileSync(notifiedFile(), JSON.stringify([...s]), { mode: 0o600 }); } catch { /* best-effort */ } };
 
@@ -78,16 +116,20 @@ function tg(token: string, method: string, body: unknown): Promise<any> {
 
 /** Send a RenderSpec (throws on API failure so the caller can keep a retry obligation). v1: message + inline keyboard; a
  *  photo/card falls back to its caption (no rasterizer yet); a document rides as a pointer in text. */
-async function send(token: string, chatId: number, spec: RenderSpec): Promise<void> {
+/** A Telegram API call, INJECTABLE (IP2-4) so the driver's control flow — offset advance, which methods fire, ledger effects — is
+ *  testable without real HTTP. Production binds it to `tg(token, ...)`. */
+export type TgCall = (method: string, body: unknown) => Promise<any>;
+
+async function send(call: TgCall, chatId: number, spec: RenderSpec): Promise<void> {
   const reply_markup = spec.keyboard ? { inline_keyboard: spec.keyboard.map((row) => row.map((b) => ({ text: b.label, callback_data: b.data }))) } : undefined;
   const text = spec.attachment?.kind === "document" ? `${spec.text}\n(doc: ${spec.attachment.ref})` : spec.text;
-  const msg = await tg(token, "sendMessage", { chat_id: chatId, text, ...(reply_markup ? { reply_markup } : {}) });
-  if (spec.primitive === "pin" && msg?.message_id) await tg(token, "pinChatMessage", { chat_id: chatId, message_id: msg.message_id }).catch(() => {});
+  const msg = await call("sendMessage", { chat_id: chatId, text, ...(reply_markup ? { reply_markup } : {}) });
+  if (spec.primitive === "pin" && msg?.message_id) await call("pinChatMessage", { chat_id: chatId, message_id: msg.message_id }).catch(() => {});
 }
 
 /** OUTBOUND: push each not-yet-notified decision batch. TG-P2-2: a batch is marked notified ONLY after FULL successful
  *  delivery to every allowlisted recipient; a zero-recipient run or any send failure leaves it un-notified to retry. */
-async function notifyNewBatches(token: string, allow: Set<number>): Promise<void> {
+export async function notifyNewBatches(token: string, allow: Set<number>, call: TgCall = (m, b) => tg(token, m, b)): Promise<void> {
   if (allow.size === 0) return; // no recipient => no delivery => never a completion proof
   const notified = readNotified();
   for (const batchId of listBatchesStrict(HOME)) { // strict: a read glitch throws -> the loop retries; never a silently-skipped notify
@@ -96,7 +138,7 @@ async function notifyNewBatches(token: string, allow: Set<number>): Promise<void
     if (!batch) continue;
     let allOk = true;
     for (const chatId of allow) for (let i = 0; i < batch.items.length; i++) {
-      try { await send(token, chatId, renderProjection({ kind: "decision", item: batch.items[i]!, ref: encodeRef(batchId, i) })); }
+      try { await send(call, chatId, renderProjection({ kind: "decision", item: batch.items[i]!, ref: encodeRef(batchId, i) })); }
       catch (e) { allOk = false; console.error(`swarm-tg-entry: notify send failed (will retry): ${e instanceof Error ? e.message : e}`); }
     }
     if (allOk) { notified.add(batchId); writeNotified(notified); } // only a fully-delivered batch is done
@@ -106,31 +148,34 @@ async function notifyNewBatches(token: string, allow: Set<number>): Promise<void
 /** INBOUND: long-poll getUpdates; a tap -> parseUpdate -> resolve ref -> recordDecision (merge). TG-P2-1: the offset is
  *  committed ONLY after a TERMINAL outcome (recorded / consumed / unknown-item / ignored / expired-ref); a transient IO error
  *  or a contended lock STOPS this poll WITHOUT advancing, so the same update is retried — never a silent "already decided". */
-async function pollOnce(token: string, allow: Set<number>): Promise<void> {
-  const updates = await tg(token, "getUpdates", { offset: readOffset(), timeout: 50, allowed_updates: ["callback_query", "message"] });
+export async function pollOnce(token: string, allow: Set<number>, call: TgCall = (m, b) => tg(token, m, b), offPath: string = offsetFile()): Promise<boolean> {
+  const off = readOffset(offPath);
+  if (off === null) return false; // IP2-2/TG-2: offset unreadable ⇒ refuse WITHOUT a long-poll; return false so the caller backs off (no hot loop, no ~24h replay)
+  const updates = await call("getUpdates", { offset: off, timeout: 50, allowed_updates: ["callback_query", "message"] });
   for (const u of updates ?? []) {
     const cq = u.callback_query;
     const chatId: unknown = cq ? cq.message?.chat?.id : u.message?.chat?.id;
-    const ack = async (text?: string): Promise<void> => { if (cq) await tg(token, "answerCallbackQuery", { callback_query_id: cq.id, ...(text ? { text } : {}) }).catch(() => {}); };
+    const ack = async (text?: string): Promise<void> => { if (cq) await call("answerCallbackQuery", { callback_query_id: cq.id, ...(text ? { text } : {}) }).catch(() => {}); };
     // first-contact: surface an un-allowlisted chat_id so the user can add it (design detail); terminal -> advance.
-    if (typeof chatId === "number" && !allow.has(chatId)) { console.error(`swarm-tg-entry: message from un-allowlisted chat_id ${chatId} — add it to ${allowFile()} to enable`); writeOffset(u.update_id + 1); await ack(); continue; }
+    if (typeof chatId === "number" && !allow.has(chatId)) { console.error(`swarm-tg-entry: message from un-allowlisted chat_id ${chatId} — add it to ${allowFile()} to enable`); writeOffset(offPath, u.update_id + 1); await ack(); continue; }
     const upd: TgUpdate = cq ? { chatId, callbackData: cq.data } : { chatId, text: u.message?.text };
     const r = parseUpdate(upd, allow);
-    if (r.kind === "ignore") { writeOffset(u.update_id + 1); await ack(); continue; }
+    if (r.kind === "ignore") { writeOffset(offPath, u.update_id + 1); await ack(); continue; }
     // TG-P2-1: resolveRef throws on a STORE READ ERROR (unreadable batches dir/batch.json) — that is TRANSIENT, so STOP the poll
     // WITHOUT advancing the offset; the same tap is retried next loop (never a false "expired" that permanently skips an approval).
     let resolved: { batchId: string; itemId: string } | null;
     try { resolved = resolveRef(r.ref); }
-    catch (e) { console.error(`swarm-tg-entry: ref lookup read error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return; }
-    if (!resolved) { writeOffset(u.update_id + 1); await ack("expired"); continue; } // CONFIRMED gone/ambiguous -> terminal
+    catch (e) { console.error(`swarm-tg-entry: ref lookup read error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return true; } // a long-poll DID occur (waited) ⇒ no backoff needed
+    if (!resolved) { writeOffset(offPath, u.update_id + 1); await ack("expired"); continue; } // CONFIRMED gone/ambiguous -> terminal
     const decision = { id: resolved.itemId, verdict: r.verdict as Verdict, ...(r.scope ? { scope: r.scope as ApprovalScope } : {}) };
     let outcome: "recorded" | "consumed" | "unknown-item" | "contended";
     try { outcome = recordDecision(HOME, resolved.batchId, decision, Math.floor(Date.now() / 1000)); }
-    catch (e) { console.error(`swarm-tg-entry: recordDecision transient error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return; } // transient IO -> retry this update next poll
-    if (outcome === "contended") return; // a concurrent holder — retry this update next poll (do NOT advance)
-    writeOffset(u.update_id + 1); // terminal
+    catch (e) { console.error(`swarm-tg-entry: recordDecision transient error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return true; } // transient IO -> retry next poll (long-poll already waited)
+    if (outcome === "contended") return true; // a concurrent holder — retry this update next poll (do NOT advance); long-poll waited
+    writeOffset(offPath, u.update_id + 1); // terminal
     await ack(outcome === "recorded" ? "recorded" : outcome === "consumed" ? "already decided" : "unknown");
   }
+  return true; // a getUpdates long-poll completed (the loop's natural pacing)
 }
 
 async function main(): Promise<void> {
@@ -153,8 +198,17 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => { stop = true; });
   console.error("swarm-tg-entry: up (notify + collect-approvals; never executes).");
   while (!stop) {
-    const allow = readAllow(); // re-read each loop so the user can add a chat_id without a restart
-    try { await notifyNewBatches(token, allow); await pollOnce(token, allow); }
+    const allow = readAllow(allowFile()); // re-read each loop so the user can add a chat_id without a restart
+    // TG-5: a corrupt/unreadable allow.json is NOT an empty allowlist — proceeding would silently ack+skip every real approval
+    // (the black hole). Refuse to notify/poll this round and alert; the user fixes allow.json, no restart needed.
+    if (allow === null) { console.error(`swarm-tg-entry: allow.json UNREADABLE (corrupt/EACCES) — refusing to notify/poll this round to avoid silently dropping approvals; fix ${allowFile()}`); await new Promise((r) => setTimeout(r, 3000)); continue; }
+    try {
+      await notifyNewBatches(token, allow);
+      const polled = await pollOnce(token, allow);
+      // IP2-2: when pollOnce REFUSED (offset unreadable) it did NOT long-poll ⇒ back off so a persistent fault is a bounded retry,
+      // not a 0-wait hot loop (100 reads/7ms spamming the log). A normal poll long-polls getUpdates, which paces the loop itself.
+      if (!polled) await new Promise((r) => setTimeout(r, 3000));
+    }
     catch (e) { console.error(`swarm-tg-entry loop error (continuing): ${e instanceof Error ? e.message : e}`); await new Promise((r) => setTimeout(r, 3000)); }
   }
   console.error("swarm-tg-entry: stopped.");

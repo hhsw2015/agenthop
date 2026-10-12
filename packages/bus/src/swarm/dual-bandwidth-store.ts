@@ -19,7 +19,7 @@
  * ENOENT = absent (skip); any other read error (EACCES/…) PROPAGATES — a read fault is never silently treated as "no events".
  */
 
-import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, statSync, lstatSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
@@ -229,10 +229,27 @@ function projectionOf(reading: DualBandwidthReading, nowSec: number, config?: Du
   };
 }
 
+/** PROJ-1 / CP-3 — the gauge output dir chain must be REAL owned dirs, never redirected by a pre-existing symlink. A symlinked
+ *  `console/` or `console/bandwidth-gauge/` would land the atomic write OUTSIDE the 0o700 boundary — mkdirSync(recursive) sees the
+ *  symlink's target exists (no-op), then tmp-write+rename overwrite an external file. console-projection-store guards this with
+ *  consoleBoundaryOk; gauge did not (the audit's family inconsistency). Same lstat (NO-follow) each component: a symlink / non-dir
+ *  ⇒ REFUSE; ENOENT ⇒ safe (our own mkdir makes real dirs); any other stat fault ⇒ refuse. Pure check. */
+export function gaugeBoundaryOk(home: string): boolean {
+  for (const d of [path.join(home, ".agenthop", "console"), gaugeDir(home)]) {
+    let st;
+    try { st = lstatSync(d); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; return false; }
+    if (!st.isDirectory()) return false; // a symlink (even to a dir) or a plain file ⇒ not a real owned dir ⇒ refuse
+  }
+  return true;
+}
+
 /** Compute the gauge and write the projection atomically (temp + rename) so the console never reads a half-written file.
- *  Returns the reading. */
+ *  Returns the reading. PROJ-1/CP-3: a redirected gauge dir chain ⇒ SKIP the write (the reading is still returned so the caller's
+ *  logic is unaffected; the console keeps the last good gauge rather than one written through a symlink). */
 export function writeBandwidthProjection(home: string, nowSec: number, config?: DualBandwidthConfig): DualBandwidthReading {
   const reading = computeGauge(home, nowSec, config);
+  if (!gaugeBoundaryOk(home)) return reading; // CP-3: never write through a redirected dir chain
   const projection = projectionOf(reading, nowSec, config);
   mkdirSync(gaugeDir(home), { recursive: true, mode: 0o700 });
   const file = gaugePath(home);
