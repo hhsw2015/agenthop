@@ -14,7 +14,7 @@
  * one-key resume works today. The at-closeout auto-snapshot is the SAME writer hung at the closeout seam
  * (a diff handed to that owner) — it depends on the closeout flow (board dep L2-struct), this module does not.
  */
-import { writeFileSync, renameSync, mkdirSync, statSync, chmodSync, unlinkSync } from "node:fs"; // used ONLY inside writeRosterSnapshot() — no top-level side effect
+import { writeFileSync, renameSync, mkdirSync, statSync, unlinkSync, openSync, closeSync, fchmodSync } from "node:fs"; // used ONLY inside writeRosterSnapshot() — no top-level side effect
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 
@@ -163,11 +163,7 @@ export function serializeSnapshot(snap: RosterSnapshot): string { return `${JSON
  *  mid-write leaves the PREVIOUS roster intact (never a torn file), and a concurrent capture always observes one COMPLETE snapshot
  *  (rename is atomic; the last writer wins, neither sees a half-file). The temp carries a random suffix so two concurrent writers
  *  never collide on the same temp path. IO runs only when called — no top-level side effect. */
-export function writeRosterSnapshot(out: string, snap: RosterSnapshot): void {
-  // DOS-P2-2: the roster records member dirs, session ids and resume params — the temp is RESTRICTED from creation (0600),
-  // and an atomic replace must NOT WIDEN the target's existing mode. A plain temp+rename would hand the target the temp's
-  // umask-derived mode (e.g. 0644), silently relaxing a pre-existing 0600/0400 snapshot. So mirror the target's mode when it
-  // exists, else default to 0600; writeFileSync honors `mode` only on CREATE, so chmod makes it deterministic under any umask.
+export function writeRosterSnapshot(out: string, snap: RosterSnapshot, suffixGen: () => string = () => randomBytes(8).toString("hex")): void {
   // DOS-P2-2 (r3, FC-2): decide the mode BEFORE touching the fs. Only a CONFIRMED absence (ENOENT) takes the 0600 new-file
   // default. Any OTHER stat error (EACCES/EIO/ENOTDIR…) means an existing target MAY carry a mode we cannot read — defaulting
   // to 0600 would silently relax it, so FAIL (defer) rather than guess the safe side. Throwing here is before any temp exists.
@@ -178,13 +174,28 @@ export function writeRosterSnapshot(out: string, snap: RosterSnapshot): void {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; // unknown existing mode ⇒ never widen (FC-2)
   }
   mkdirSync(path.dirname(out), { recursive: true });
-  const tmp = `${out}.tmp-${randomBytes(4).toString("hex")}`;
+  const data = serializeSnapshot(snap);
+  // DOS-CORE-P1-1: a random temp SUFFIX is not OWNERSHIP — two writers colliding on the same name would `w` (O_TRUNC)
+  // each other's inode, publishing a torn snapshot that rename's atomicity cannot undo. So EXCLUSIVELY create the temp
+  // ("wx" = O_CREAT|O_EXCL): this writer OWNS that inode. On EEXIST, retry a FRESH name — NEVER unlink the existing temp
+  // (it may be another writer's). All writes/chmod go through the OWNED fd (not the path), so no other writer and no later
+  // path-chmod can touch this inode before rename. (suffixGen defaults to random; it is a test seam for forced-collision
+  // coverage — production passes nothing.)
+  let fd: number | undefined;
+  let tmp = "";
+  for (let attempt = 0; ; attempt += 1) {
+    tmp = `${out}.tmp-${suffixGen()}`;
+    try { fd = openSync(tmp, "wx", mode); break; } // own the inode or fail; EEXIST ⇒ a colliding name, retry a new one
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && attempt < 32) continue; throw e; }
+  }
   try {
-    writeFileSync(tmp, serializeSnapshot(snap), { mode });
-    chmodSync(tmp, mode);
-    renameSync(tmp, out);
+    writeFileSync(fd, data);   // write THROUGH the owned fd (not the path) — no re-open, no truncation by another writer
+    fchmodSync(fd, mode);      // chmod the fd (not the path): deterministic under umask + no path race before rename
+    closeSync(fd); fd = undefined;
+    renameSync(tmp, out);      // atomic publish of THIS writer's complete inode (last writer wins; never a torn file)
   } catch (e) {
-    // DOS-P3-1: a failed write (e.g. rename EISDIR when out is a directory) must not leave an orphan temp to accumulate.
+    // DOS-P3-1 + DOS-CORE-P1-1: clean up ONLY the temp THIS call exclusively created (reached only after a successful open).
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* best-effort */ } }
     try { unlinkSync(tmp); } catch (e2) { console.error(`roster temp cleanup failed after a write error (${tmp}): ${(e2 as Error).message}`); }
     throw e;
   }

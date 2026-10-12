@@ -270,6 +270,26 @@ const peer = (over: Partial<PeerLike> = {}): PeerLike => ({ id: "run-1", stableI
   } finally { rmSync(home, { recursive: true, force: true }); }
 }
 
+// --- DOS-CORE-P1-1: temp is EXCLUSIVELY created (O_EXCL) — a colliding name is neither truncated nor unlinked ---
+{
+  const home = mkdtempSync(join(tmpdir(), "roster-excl-"));
+  try {
+    const out = join(home, "roster.json");
+    writeRosterSnapshot(out, assembleRoster([peer({ stableId: "seed" })], 1)); // a committed seed
+    const forced = "deadbeefdeadbeef";
+    const foreignTmp = `${out}.tmp-${forced}`;
+    writeFileSync(foreignTmp, "FOREIGN-INPROGRESS{"); // another writer's in-progress temp, SAME name our next write tries first
+    const foreignBefore = readFileSync(foreignTmp, "utf8");
+    let n = 0;
+    const gen = () => (n++ < 2 ? forced : `beefcafe0${n}`); // collide TWICE on the foreign name, then yield a fresh one
+    writeRosterSnapshot(out, assembleRoster([peer({ stableId: "mine" })], 2), gen);
+    const committed = parseSnapshot(readFileSync(out, "utf8"));
+    t("CORE-P1-1: write succeeds via a FRESH name after EEXIST retries (owns its inode)", committed !== null && committed.members[0]!.member === "mine");
+    t("CORE-P1-1: a colliding foreign temp is NOT truncated (O_EXCL, not O_TRUNC)", readFileSync(foreignTmp, "utf8") === foreignBefore);
+    t("CORE-P1-1: a colliding foreign temp is NOT unlinked (never delete another writer's temp)", existsSync(foreignTmp));
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
 // --- DOS-P2-3: REAL-process fixtures (write interruption + new-process recovery + controlled concurrency) ---
 // Each child runs the ACTUAL writeRosterSnapshot in a separate process; we verify exit status, prove the writer ENTERED
 // the write path (sync marker, not a timer), read DURING the interleaving, and OWN the detached child's cleanup on EVERY
@@ -371,6 +391,31 @@ const peer = (over: Partial<PeerLike> = {}): PeerLike => ({ id: "run-1", stableI
       rmSync(home, { recursive: true, force: true });
     }
   }
+  // (C) DOS-CORE-P1-1: two real writers FORCED to collide on the same temp suffix every round; a reader samples and one
+  //     is killed — the committed snapshot is NEVER torn (O_EXCL gives each writer its own inode; no shared-inode truncation).
+  {
+    const home = mkdtempSync(join(tmpdir(), "roster-collide-"));
+    const kids: ReturnType<typeof spawn>[] = [];
+    try {
+      const out = join(home, ".agenthop", "swarm", "roster-snapshot.json");
+      writeRosterSnapshot(out, assembleRoster([peer({ stableId: "seed" })], 1)); // committed baseline (the never-torn anchor)
+      // each iteration's FIRST temp name is the SAME forced suffix for BOTH writers ⇒ a real O_EXCL collision every round
+      // (on the OLD plain-`w` code this test would publish torn 8-byte files; with O_EXCL the loser retries a fresh inode).
+      const writer = (sid: string) => `import { writeRosterSnapshot } from ${JSON.stringify(mod)}; import { randomBytes } from "node:crypto"; const F = process.env.FORCE; let first = true; const gen = () => { if (first) { first = false; return F; } return randomBytes(8).toString("hex"); }; for (let i = 0; i < 4000; i++) { first = true; writeRosterSnapshot(process.env.OUT, { version: 2, capturedAtSec: i, members: [{ member: ${JSON.stringify(sid)}, tool: "claude", cwd: "/x", role: null, resumeCmd: "c", resumeCmdSource: "template" }] }, gen); }`;
+      const exits = ["aaa", "bbb"].map((sid) => { const cp = spawnChild(writer(sid), { OUT: out, FORCE: "cafecafecafecafe" }); kids.push(cp); return onClose(cp); });
+      let settled = 0; let torn = false; let present = 0;
+      exits.forEach((pr) => pr.then(() => { settled += 1; }).catch(() => { settled += 1; }));
+      await sleep(150); killGroup(kids[0]!); // interrupt one colliding writer mid-run
+      while (settled < 2) { const txt = read(out); if (txt !== null) { present += 1; if (!sampleOk(txt)) torn = true; } await new Promise((r) => setImmediate(r)); }
+      await Promise.all(exits.map((pr) => pr.catch(() => ({ code: null, signal: null }))));
+      t("CORE-P1-1(C): forced same-suffix collision + a killed writer never produced a torn committed file", !torn && present > 0);
+      t("CORE-P1-1(C): the final committed file is one complete snapshot", committedOk(out));
+    } finally {
+      for (const cp of kids) killGroup(cp);
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+
 }
 
 console.log("all resume selftests passed");
