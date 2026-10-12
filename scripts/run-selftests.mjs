@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const root = process.env.SELFTEST_ROOT ? path.resolve(process.env.SELFTEST_ROOT) : repoRoot;
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "dist-plugin", "dist-swarm", "dist-presence", ".claude"]);
-const MAX_OUT = 16 * 1024 * 1024;
+const MAX_OUT = Number(process.env.SELFTEST_MAXCAP) || 16 * 1024 * 1024; // per-file capture cap (overridable for the runner's own tail test)
 
 /**
  * Recursively collect every `*.selftest.mts` path (root-relative, POSIX), skipping build/vendor dirs. STCI-P2-1: a readdir or
@@ -75,8 +75,10 @@ function runOne(bin, absPath, cwd, timeoutMs, graceMs) {
   return new Promise((resolve) => {
     const t0 = Date.now();
     const child = spawn(bin, [absPath], { cwd, detached: true }); // own process group ⇒ we can kill the whole tree (tsx + its node grandchild)
-    let out = "", err = "", timedOut = false, settled = false;
-    const cap = (buf, s) => (s.length + buf.length <= MAX_OUT ? s + buf : s); // bounded capture (replaces spawnSync maxBuffer)
+    let out = "", err = "", timedOut = false, settled = false, truncated = false;
+    // STCI-R2-P3-1: keep a sliding TAIL (the LAST MAX_OUT bytes), not the prefix — so the failure marker on the last lines
+    // survives a large run; mark that we truncated so the report can say so.
+    const cap = (buf, s) => { const n = s + buf; if (n.length <= MAX_OUT) return n; truncated = true; return n.slice(n.length - MAX_OUT); };
     child.stdout.on("data", (d) => { out = cap(d.toString(), out); });
     child.stderr.on("data", (d) => { err = cap(d.toString(), err); });
     const killGroup = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch { /* already gone */ } } };
@@ -89,7 +91,15 @@ function runOne(bin, absPath, cwd, timeoutMs, graceMs) {
         hardTimer = setTimeout(() => finish({ code: null, signal: "SIGKILL" }), 3000); // never hang even if 'close' is withheld
       }, Math.max(0, graceMs));
     }, timeoutMs);
-    const finish = (res) => { if (settled) return; settled = true; clearTimeout(termTimer); clearTimeout(killTimer); clearTimeout(hardTimer); resolve({ ...res, out, err, ms: Date.now() - t0, timedOut }); };
+    const finish = (res) => {
+      if (settled) return; settled = true;
+      clearTimeout(termTimer); clearTimeout(killTimer); clearTimeout(hardTimer);
+      // STCI-P2-2: a 'close' (even the MAIN exiting early on SIGTERM) must NOT release the group-kill obligation — a same-group
+      // background member that ignored SIGTERM and held no pipe would otherwise survive. Once we have timed out, sweep the WHOLE
+      // group with SIGKILL at finish time (synchronous, idempotent — ESRCH if already reaped), so no group member outlives the run.
+      if (timedOut) killGroup("SIGKILL");
+      resolve({ ...res, out, err, ms: Date.now() - t0, timedOut, truncated });
+    };
     child.on("error", (e) => finish({ spawnError: e }));
     child.on("close", (code, signal) => finish({ code, signal }));
   });
@@ -116,7 +126,8 @@ async function main() {
     const ok = !r.timedOut && !r.spawnError && r.code === 0;
     if (ok) { passed++; console.log(`  ok   ${rel}  (${r.ms}ms)`); continue; }
     const why = r.timedOut ? `TIMEOUT >${timeoutMs}ms (SIGKILL after ${graceMs}ms grace)` : r.spawnError ? `spawn error: ${r.spawnError.message}` : r.signal ? `killed by ${r.signal}` : `exit ${r.code}`;
-    const tail = `${r.out}${r.err}`.trim().split("\n").slice(-12).join("\n");
+    // STCI-R2-P3-1: show the REAL tail (last lines of the sliding-tail capture, where the failure marker lives), and say so when capped.
+    const tail = `${r.truncated ? "(output truncated — showing tail)\n" : ""}${`${r.out}${r.err}`.trim().split("\n").slice(-12).join("\n")}`;
     failures.push({ rel, why, tail });
     console.log(`  FAIL ${rel}  (${r.ms}ms) — ${why}`);
   }
@@ -131,7 +142,8 @@ async function main() {
     console.log("\n=== failures (last lines each) ===");
     for (const f of failures) console.log(`\n--- ${f.rel} (${f.why}) ---\n${f.tail}`);
   }
-  if (failures.length || discoveryErrors.length) process.exit(1);
+  // STCI-R2-P3-1: set exitCode and RETURN (do not process.exit) so the full failure report above is flushed to stdout before exit.
+  if (failures.length || discoveryErrors.length) process.exitCode = 1;
 }
 
-main().catch((e) => { console.error(`run-selftests: unexpected: ${e instanceof Error ? e.stack : e}`); process.exit(1); });
+main().catch((e) => { console.error(`run-selftests: unexpected: ${e instanceof Error ? e.stack : e}`); process.exitCode = 1; });

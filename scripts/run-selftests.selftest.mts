@@ -14,9 +14,14 @@ const RUNNER = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "run-s
 let pass = 0;
 const ok = (c: boolean, m: string): void => { if (!c) { console.error(`FAIL ${m}`); process.exit(1); } pass++; console.log(`ok  ${m}`); };
 
-/** Run the runner against a fixture root; returns { code, out }. */
+/** Run the runner against a fixture root; returns { code, out }. STCI-R2-P2-1: this meta-test is ITSELF a *.selftest.mts, so
+ *  when the whole suite runs sharded it inherits SELFTEST_SHARD (and may inherit SELFTEST_TIMEOUT/KILL_GRACE/MAXCAP). Those knobs
+ *  would then leak into the INNER fixture runs and make e.g. "2/2 passed" shrink to "1/2" on shard 2/3 — a spurious meta failure.
+ *  Scrub every SELFTEST_* control from the inherited env; each test re-supplies exactly the knobs it wants via `env`. */
 function runRunner(root: string, env: Record<string, string> = {}): { code: number; out: string } {
-  const r = spawnSync("node", [RUNNER], { encoding: "utf8", env: { ...process.env, SELFTEST_ROOT: root, ...env }, timeout: 30000 });
+  const base: Record<string, string | undefined> = { ...process.env };
+  for (const k of ["SELFTEST_SHARD", "SELFTEST_TIMEOUT", "SELFTEST_KILL_GRACE", "SELFTEST_MAXCAP", "SELFTEST_ROOT"]) delete base[k];
+  const r = spawnSync("node", [RUNNER], { encoding: "utf8", env: { ...base, SELFTEST_ROOT: root, ...env }, timeout: 30000 });
   return { code: r.status ?? -1, out: `${r.stdout || ""}${r.stderr || ""}` };
 }
 const mkRoot = (): string => mkdtempSync(path.join(tmpdir(), "stci-"));
@@ -81,6 +86,30 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
   goodSelftest(root, "z-after.selftest.mts");
   const r = runRunner(root);
   ok(r.code === 1 && /a-fail\.selftest\.mts/.test(r.out) && /ok {3}z-after\.selftest\.mts/.test(r.out), "a failing selftest ⇒ exit 1, later files STILL run");
+  rmSync(root, { recursive: true, force: true });
+}
+
+// ── STCI-R2-P2-1: an OUTER SELFTEST_SHARD must NOT leak into the inner fixture run (meta env scrubs it) ⇒ still 2/2 ──
+{
+  const root = mkRoot(); goodSelftest(root, "a.selftest.mts"); goodSelftest(root, "b.selftest.mts");
+  const prev = process.env.SELFTEST_SHARD;
+  process.env.SELFTEST_SHARD = "2/3"; // simulate the suite being run sharded while THIS meta-test executes
+  try {
+    const r = runRunner(root); // runRunner must scrub the inherited SHARD
+    ok(r.code === 0 && /2\/2 passed/.test(r.out) && !/shard/.test(r.out), "STCI-R2-P2-1: outer SELFTEST_SHARD does NOT shrink the inner run (2/2, no shard)");
+  } finally { if (prev === undefined) delete process.env.SELFTEST_SHARD; else process.env.SELFTEST_SHARD = prev; rmSync(root, { recursive: true, force: true }); }
+}
+
+// ── STCI-R2-P3-1: when capture is capped, the failure report keeps the REAL tail (last line = the marker), not the prefix ──
+{
+  const root = mkRoot();
+  // Emit > MAXCAP bytes of filler, THEN the real failure marker on the LAST line, then exit 1. A prefix-cap would drop the marker.
+  // exitCode (not exit) so the LAST console.log drains to the pipe before the child exits — otherwise the marker races and is lost.
+  writeFileSync(path.join(root, "noisy-fail.selftest.mts"),
+    `for (let i = 0; i < 5000; i++) console.log("filler line " + i);\nconsole.log("REAL_FAILURE_MARKER_AT_TAIL");\nprocess.exitCode = 1;\n`);
+  const r = runRunner(root, { SELFTEST_MAXCAP: "2048" }); // tiny cap ⇒ capture must truncate
+  ok(r.code === 1 && /REAL_FAILURE_MARKER_AT_TAIL/.test(r.out), "STCI-R2-P3-1: the real failure tail survives a capped capture");
+  ok(/output truncated/.test(r.out), "STCI-R2-P3-1: the report says the output was truncated");
   rmSync(root, { recursive: true, force: true });
 }
 
