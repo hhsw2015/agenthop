@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import os from "node:os";
+import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import { composeDigest, digestProjection, digestEnabled, digestActions, digestTextFromProjection, type ProjState } from "../src/swarm/morning-digest.js";
 import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources, archiveLegacyMigration } from "../src/swarm/morning-digest-store.js";
@@ -196,6 +197,35 @@ describe("morning-digest-store — gatherDigestSources (验收简报化: authori
     expect(s.recentDone).toEqual(["✅ 已并 @1431247 0 REMAIN"]);
   });
 
+  test("MDV2-5 r3: subject-state — fix-topic vs current problem vs follow-up action (no opposite-direction regression)", () => {
+    progress([
+      "- \u2705 \u8d85\u65f6\u4fee\u590d\u5df2\u5e76 @deadbee 0 REMAIN",          // "超时修复已并" fix TOPIC in a clean completion ⇒ 完成 (not 异常)
+      "- \u2705 \u5931\u8054\u544a\u8b66\u4fee\u590d\u5df2\u5e76 @deadbee 0 REMAIN", // "失联告警修复已并" fix topic ⇒ 完成
+      "- \u2705 patch \u5df2\u5e76 @deadbee\uff0c\u4f46\u4ecd\u8d85\u65f6",       // "但仍超时" STILL-broken ⇒ 异常
+      "- \u26a0 dispatcher \u5361\u6b7b\uff1b\u4fee\u590d\u8865\u4e01\u5df2\u9001\u5ba1 @deadbee", // current ⚠卡死, follow-up 送审 ⇒ 异常 (not dropped)
+      "- \u5f85\u9a8c\u6536\uff1amod \u5b9e\u6d4b\u540e\u518d\u9001\u5ba1 @deadbee", // 待验收 subject, follow-up 送审 ⇒ 待你验收 (not dropped)
+      "- \u5f85\u590d\u5ba1\uff1a\u5f02\u5e38\u62a5\u544a\u4f18\u5316 @deadbee",  // pure in-flight; 异常 is a TOPIC ⇒ DROP
+    ].join("\n"));
+    const s = gatherDigestSources(HOME)!;
+    expect(s.recentDone).toEqual([
+      "\u2705 \u8d85\u65f6\u4fee\u590d\u5df2\u5e76 @deadbee 0 REMAIN",
+      "\u2705 \u5931\u8054\u544a\u8b66\u4fee\u590d\u5df2\u5e76 @deadbee 0 REMAIN",
+    ]);
+    expect(s.anomalies).toEqual([
+      "\u2705 patch \u5df2\u5e76 @deadbee\uff0c\u4f46\u4ecd\u8d85\u65f6",
+      "\u26a0 dispatcher \u5361\u6b7b\uff1b\u4fee\u590d\u8865\u4e01\u5df2\u9001\u5ba1 @deadbee",
+    ]);
+    expect(s.awaitingTest).toEqual(["\u5f85\u9a8c\u6536\uff1amod \u5b9e\u6d4b\u540e\u518d\u9001\u5ba1 @deadbee"]);
+  });
+
+  test("MDV2-5 r3: SHA retention checks a STANDALONE ref (not a substring of another id)", () => {
+    const longBody = `\u2705 trace=deadbeef_owner ${"x".repeat(200)} \u5df2\u5e76 @deadbeef`;
+    progress(`- ${longBody}`);
+    const [done] = gatherDigestSources(HOME)!.recentDone!;
+    // the real @deadbeef was truncated; the surviving substring "deadbeef_owner" must NOT count as the ref ⇒ append […deadbeef]
+    expect(done).toContain("[\u2026deadbeef]");
+  });
+
   test("MDV2-5 r2: a long completion with the SHA at the end RETAINS the SHA in the output (not truncated away)", () => {
     const longBody = `✅ ${"x".repeat(200)} 已并 @abc1234`;
     progress(`- ${longBody}`);
@@ -258,6 +288,50 @@ describe("morning-digest — infra crash-recovery / restart-idempotency (zero-bu
     chmodSync(bd, 0o700);
     expect(gatherDigestSources(HOME)!.awaitingRuling!.length).toBe(1);
   });
+});
+
+describe("morning-digest — MDV2-6 three-category gate: delivery exactly-once (writeInbox morning-digest-<date> key)", () => {
+  // The digest DELIVERY primitive is writeInbox(home, coord, msg, `morning-digest-<date>`): its exactly-once across process
+  // death / dual instance / concurrency is the publishOnce O_EXCL credential — authoritatively covered by
+  // test/inbox.test.ts:476 ("writeInbox — idempotency key … exactly-once across claim/ack/restart"). These fixtures prove the
+  // digest key path inherits it across a REAL process boundary.
+  let HOME: string;
+  beforeEach(() => { HOME = mkdtempSync(path.join(os.tmpdir(), "ah-digest-")); });
+  afterEach(() => { try { rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ } });
+  const idemTag = "morning-digest-2026-10-12";
+  const cards = (): number => { try { return readdirSync(path.join(HOME, ".agenthop", "inbox", "coord")).filter((n) => n.endsWith(".json")).length; } catch { return 0; } };
+  const dir = path.dirname(new URL(import.meta.url).pathname);
+  const tsx = path.join(dir, "..", "node_modules", ".bin", "tsx");
+  const inboxMod = path.join(dir, "..", "src", "inbox.ts");
+  const CHILD = `import { writeInbox, composeInboxMsg } from "${inboxMod}"; const r = writeInbox(process.env.H, "coord", composeInboxMsg({ from: "d", fromLabel: "swarm-digest", text: "brief", via: "local", taskRef: "morning-digest" }), process.env.K); process.stdout.write(String(r));`;
+  const pubChild = (): Promise<string> => new Promise((resolve, reject) => {
+    const cp = spawn(tsx, ["-e", CHILD], { env: { ...process.env, H: HOME, K: idemTag } });
+    let out = ""; cp.stdout.on("data", (d) => { out += d; }); cp.on("error", reject); cp.on("close", () => resolve(out.trim()));
+  });
+
+  test("① dual-instance mutex / idempotency: two deliveries of the same date ⇒ exactly ONE card (O_EXCL credential)", () => {
+    const r1 = execFileSync(tsx, ["-e", CHILD], { env: { ...process.env, H: HOME, K: idemTag }, encoding: "utf8" }).trim();
+    const r2 = execFileSync(tsx, ["-e", CHILD], { env: { ...process.env, H: HOME, K: idemTag }, encoding: "utf8" }).trim();
+    expect(r1).toBe("published");
+    expect(r2).toBe("already");   // second instance sees the durable credential ⇒ no duplicate
+    expect(cards()).toBe(1);
+  });
+
+  test("② process-recovery: a child publishes then DIES before the sent-flip; a restart re-delivers ⇒ still exactly ONE card", () => {
+    const r1 = execFileSync(tsx, ["-e", CHILD], { env: { ...process.env, H: HOME, K: idemTag }, encoding: "utf8" }).trim(); // process A publishes, then exits (crash before marking sent)
+    expect(r1).toBe("published");
+    expect(cards()).toBe(1);
+    const r2 = execFileSync(tsx, ["-e", CHILD], { env: { ...process.env, H: HOME, K: idemTag }, encoding: "utf8" }).trim(); // process B (restart) re-runs the delivery
+    expect(r2).toBe("already");   // credential survived A's death ⇒ no loss, no duplicate
+    expect(cards()).toBe(1);
+  }, 20000);
+
+  test("③ concurrency race: two processes publish the same date CONCURRENTLY ⇒ exactly ONE card (any interleaving)", async () => {
+    const [a, b] = await Promise.all([pubChild(), pubChild()]);
+    expect([a, b].filter((r) => r === "published").length).toBe(1);               // exactly one winner
+    expect([a, b].filter((r) => r === "already" || r === "deferred").length).toBe(1); // the loser never duplicates
+    expect(cards()).toBe(1);
+  }, 20000);
 });
 
 describe("morning-digest-store — archiveLegacyMigration (MD-R7-P2-2, per-date append-only)", () => {

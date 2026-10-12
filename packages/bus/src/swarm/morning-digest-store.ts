@@ -153,27 +153,32 @@ function gatherDecisions(home: string, perGroup: number): { rulings: string[]; a
 const COMPLETION_RE = /✅|已签收|已并|已合并|\bmerged\b|装机|\blanded\b/i; // an explicit sign-off / landing marker (NOT bare "0 remain")
 const NEGATION_RE   = /\bnot\b|未|尚未|即[将合并装]|即可|若|回滚|\brevert\b|撤销|放弃/i; // negation / conditional ⇒ NOT a completion fact
 const INFLIGHT_RE   = /待复审|待审|送审|候审|候签|待签|\bpending\b|[1-9]\d*\s*remain/i;   // inter-agent in-flight review ⇒ DROP (⑤)
-const ANOMALY_RE    = /⚠|\bblocked\b|\bstuck\b|卡死|卡住|卡点|超时|deadline|失联|中断/i; // an ACTIVE-problem word only (NOT the topic word 异常, NOT bare 哨兵/sentinel)
+const ANOMALY_RE    = /⚠|\bblocked\b|\bstuck\b|卡死|卡住|卡点|超时|deadline|失联|中断/i; // an anomaly WORD (may be a current problem OR a fix topic, disambiguated below)
+const ACTIVE_RE     = /仍|依然|\bstill\b|未恢复|尚未恢复|未消/i; // a STILL-broken qualifier: an anomaly + this = done-but-still-broken ⇒ 异常
 const AWAITTEST_RE  = /待验收|待实测|待你测|待实机|待自测|待体验|needs?-?test/i;            // landed, awaiting the user's own real-test
 /** A context-anchored, whole-token COMMIT REFERENCE (the output-contract OC-4 recipe): a label (固定 / sha / commit / a landing verb
  *  / @) immediately before a 7-64 hex token that stands alone — trailing `(?!-)` rejects a UUID segment ("deadbeef-1234-…"), and an
  *  ALL-DECIMAL short sha ("@1431247") is accepted (a bare-date / UUID / unanchored hex is NOT a commit ref). Captures the hex. */
 const COMMIT_REF = /(?:固定\s*)?(?:\bsha(?:[-\s]?256)?\b|\bcommit\b|\bmerged?\b|\blanded\b|已并|已合并|装机|@)[:\s]*\b([0-9a-f]{7,64})\b(?!-)/i;
 /** Emit a completion line that PRESERVES the commit ref even when the prose is clipped (MDV2-5: classification saw the SHA in the
- *  full body, so the output must keep it — never truncate away the evidence). */
+ *  full body, so the output must keep it). The "still present?" test re-runs COMMIT_REF on the CLIPPED brief — NOT a bare substring
+ *  (`brief.includes(sha)` was fooled when the sha is a substring of another id, e.g. a surviving `trace=deadbeef_owner` while the
+ *  real `@deadbeef` was truncated). If the clip no longer carries an anchored commit ref, append the extracted sha. */
 function completionLine(body: string): string {
   const brief = clip(body);
+  if (COMMIT_REF.test(brief)) return brief; // the clip still carries a valid anchored ref
   const sha = body.match(COMMIT_REF)?.[1];
-  return sha && !brief.includes(sha) ? `${brief} […${sha}]` : brief;
+  return sha ? `${brief} […${sha}]` : brief;
 }
 
 /** Gather the digest sources as an ACCEPTANCE BRIEFING (验收简报化), fail-soft.
  *  ③ 待你拍板 — the AUTHORITATIVE decision-batches store (gatherDecisions), not a grep.
- *  ①④② — the PROGRESS.md narrative tail, bucketed by STATE + EVIDENCE with a PRIORITY that preserves the user-action/active-problem
- *        signal over the completion FYI (MDV2-5): in-flight review drops first (gates all branches); an active anomaly, then an
- *        explicit user-test, are peeled off before a clean completion (completion marker + an anchored COMMIT_REF + no negation). So
- *        "已并 … 待验收" surfaces in 待你验收 and "已并 但仍超时" in 异常, not swallowed by 完成. 待你拍板 NEVER comes from a PROGRESS 待裁
- *        grep. A no-commit-ref "completion", inter-agent in-flight review (待复审/送审), and bare chatter are DROPPED (⑤).
+ *  ①④② — the PROGRESS.md narrative tail, bucketed by the line's SUBJECT state (MDV2-5). The discriminator is a CLEAN completion
+ *        (landing marker + anchored COMMIT_REF + no negation + not in-flight): inside one, an anomaly word is a FIX TOPIC
+ *        ("超时修复已并" = fixed), not a current problem — unless a STILL-qualifier (仍/依然/still) marks it still broken. Priority:
+ *        done-but-still-broken ⇒ 异常; a user-test subject ⇒ 待你验收 (survives an incidental follow-up "送审"); an anomaly that is
+ *        NOT a clean completion ⇒ 异常; a clean completion ⇒ 完成; a genuinely in-flight line ⇒ DROP. 待你拍板 NEVER comes from a
+ *        PROGRESS 待裁 grep; a no-commit-ref "completion", in-flight review (待复审/送审), and bare chatter are DROPPED.
  *  Returns null on a READ ERROR (MD-P2-2 / MDV2-1: UNKNOWN, never a false quiet night): the decisions store cannot be enumerated, or
  *  PROGRESS is unreadable. ENOENT of either ⇒ that source contributes nothing (a CONFIRMED-empty authoritative store is a real quiet). */
 export function gatherDigestSources(home: string, tailLines = 80, perGroup = 8): DigestSources | null {
@@ -193,17 +198,20 @@ export function gatherDigestSources(home: string, tailLines = 80, perGroup = 8):
     if (!t.startsWith("- ") && !t.startsWith("* ")) continue; // bullet lines only (pointers, S18)
     const body = t.slice(2).trim();
     if (body.length === 0) continue;
-    // Priority peels the USER-ACTION / ACTIVE-PROBLEM signal off a line BEFORE the completion FYI, so a line that is both done AND
-    // still-actionable is not swallowed by 完成 (MDV2-5): ① INFLIGHT review drops FIRST and gates every branch (so "待复审：异常报告"
-    // drops, never 异常); ② an ACTIVE anomaly ("已并 但仍超时") surfaces in 异常; ③ an explicit user-test ("已并 … 待验收") surfaces in
-    // 待你验收 — the action survives even when the line also notes 已并; ④ only then a clean completion (marker + anchored COMMIT_REF +
-    // no negation). A no-commit-ref "completion" (a UUID, no sha) and bare chatter DROP.
-    if (INFLIGHT_RE.test(body)) continue;                                                                        // ⑤ in-flight review ⇒ DROP (gates all)
+    // Bucket by the line's SUBJECT state, distinguishing a current problem / a fix TOPIC / a follow-up action (MDV2-5). A CLEAN
+    // completion (landing marker + anchored COMMIT_REF + no negation + not in-flight) is the key: inside it, an anomaly word is a
+    // FIX TOPIC ("超时修复已并" = fixed the timeout), NOT a current problem — unless a STILL-qualifier (仍/依然/still) says it is
+    // still broken. Priority: (1) done-but-STILL-broken ⇒ 异常; (2) a user-test subject ⇒ 待你验收 (survives an incidental follow-up
+    // "送审"); (3) an anomaly that is NOT a clean completion ⇒ 异常 (a real current problem, e.g. "⚠ 卡死；补丁已送审"); (4) a clean
+    // completion ⇒ 完成; (5) a genuinely in-flight line (no subject above) ⇒ DROP; (6) else DROP.
     const brief = clip(body);
-    if (ANOMALY_RE.test(body)) { if (anomalies.length < perGroup) anomalies.push(brief); }                       // ④ 异常 (active problem, incl. a still-broken completion)
-    else if (AWAITTEST_RE.test(body) && !NEGATION_RE.test(body)) { if (awaitingTest.length < perGroup) awaitingTest.push(brief); } // ② 待你验收 (user action preserved)
-    else if (COMPLETION_RE.test(body) && COMMIT_REF.test(body) && !NEGATION_RE.test(body)) { if (recentDone.length < perGroup) recentDone.push(completionLine(body)); } // ① 完成(签收/落地)
-    // ⑤ else (a no-commit-ref completion, bare chatter) ⇒ DROPPED.
+    const cleanCompletion = COMPLETION_RE.test(body) && COMMIT_REF.test(body) && !NEGATION_RE.test(body) && !INFLIGHT_RE.test(body);
+    if (ACTIVE_RE.test(body) && ANOMALY_RE.test(body)) { if (anomalies.length < perGroup) anomalies.push(brief); }      // (1) done but STILL broken
+    else if (AWAITTEST_RE.test(body) && !NEGATION_RE.test(body)) { if (awaitingTest.length < perGroup) awaitingTest.push(brief); } // (2) user-test subject
+    else if (ANOMALY_RE.test(body) && !cleanCompletion) { if (anomalies.length < perGroup) anomalies.push(brief); }    // (3) current problem (non-completion)
+    else if (cleanCompletion) { if (recentDone.length < perGroup) recentDone.push(completionLine(body)); }             // (4) clean completion (anomaly words = fix topics)
+    else if (INFLIGHT_RE.test(body)) { /* (5) genuine in-flight review ⇒ DROP */ }
+    // (6) else (a no-commit-ref completion, bare chatter) ⇒ DROPPED.
   }
   return { awaitingRuling, anomalies, awaitingTest, recentDone };
 }
