@@ -3,7 +3,8 @@
 // seq-keyed (a monotonic numeric event id — the TG update_id for pending): FIFO by seq, lossless identity, a durable DONE ledger,
 // unique per-drain claims, read-error-release / corrupt-quarantine, and stuck-release retry.
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, renameSync, existsSync, utimesSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync, renameSync, existsSync, unlinkSync, utimesSync, chmodSync } from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { enqueueQueue, drainQueue, recoverStaleQueueClaims, retryStuckQueue, pidAlive } from "../src/swarm/tg-queue.js";
@@ -274,5 +275,68 @@ describe("tg-queue concurrency-race (DO-P2-1b)", () => {
     expect(pidAlive(process.pid)).toBe(true);
     expect(pidAlive(2147480000)).toBe(false);
     expect(pidAlive(0)).toBe(false);
+  });
+});
+
+// ── TGP-10: ATOMIC event-identity credential (O_EXCL), no check-then-act race ─────────────────────────────────────────
+describe("tg-queue atomic identity credential (TGP-10)", () => {
+  const credPath = (seq: number) => path.join(DIR, "cred", String(seq).padStart(20, "0"));
+  const hash = (rec: unknown) => createHash("sha256").update(JSON.stringify(rec)).digest("hex");
+
+  test("enqueue writes a cred bound to the payload hash", () => {
+    expect(enqueueQueue(DIR, { v: 1 }, 7)).toBe("enqueued");
+    expect(readFileSync(credPath(7), "utf8")).toBe(hash({ v: 1 }));
+  });
+
+  test("an UNREADABLE existing cred ⇒ failed (preserve + retry, NEVER overwrite)", () => {
+    enqueueQueue(DIR, { v: 1 }, 7);
+    chmodSync(credPath(7), 0o000);
+    try {
+      expect(enqueueQueue(DIR, { v: 2 }, 7)).toBe("failed"); // can't read the identity ⇒ hold, don't overwrite
+      const [n] = pendingFiles(DIR);
+      expect(JSON.parse(readFileSync(path.join(DIR, n!), "utf8"))).toEqual({ v: 1 }); // original intact
+    } finally { chmodSync(credPath(7), 0o600); }
+  });
+
+  test("cred present but record MISSING (crash after cred, before record) ⇒ re-enqueue recovers the record", () => {
+    enqueueQueue(DIR, { v: 1 }, 7);
+    unlinkSync(path.join(DIR, pendingFiles(DIR)[0]!)); // simulate: cred landed, record lost to a crash
+    expect(pendingFiles(DIR)).toEqual([]);
+    expect(enqueueQueue(DIR, { v: 1 }, 7)).toBe("enqueued"); // same id+payload, record gone ⇒ recover
+    expect(JSON.parse(readFileSync(path.join(DIR, pendingFiles(DIR)[0]!), "utf8"))).toEqual({ v: 1 });
+  });
+
+  test("different payload for a claimed-in-flight seq ⇒ conflict (cred guards across the claim)", () => {
+    enqueueQueue(DIR, { v: 1 }, 7);
+    const [n] = pendingFiles(DIR);
+    renameSync(path.join(DIR, n!), path.join(DIR, `${n}.sending-${process.pid}-${Date.now()}.abc123`)); // in flight
+    expect(enqueueQueue(DIR, { v: 2 }, 7)).toBe("conflict"); // cred still bound to {v:1} ⇒ no second record
+    expect(pendingFiles(DIR)).toEqual([]);
+  });
+});
+
+// ── TGP-11: the drain lock serializes drainers (FIFO across drainers/instances) ───────────────────────────────────────
+describe("tg-queue drain lock (TGP-11)", () => {
+  const lockPath = () => path.join(DIR, "drain.lock");
+
+  test("a drain SKIPS while a live, fresh drainer holds the lock (no concurrent reorder)", async () => {
+    enqueueQueue(DIR, { v: 1 }, 1);
+    mkdirSync(DIR, { recursive: true });
+    writeFileSync(lockPath(), `${process.pid}-${Date.now()}-deadbee`); // a live (our pid), fresh holder
+    let ran = 0;
+    const r = await drainQueue(DIR, () => { ran++; return "sent"; });
+    expect(ran).toBe(0); // skipped — never processed behind another drainer
+    expect(r).toMatchObject({ claimed: 0, sent: 0 });
+    expect(pendingFiles(DIR).length).toBe(1); // record untouched
+    unlinkSync(lockPath());
+    expect((await drainQueue(DIR, () => "sent")).sent).toBe(1); // lock gone ⇒ drains
+  });
+
+  test("a STALE drain lock (dead pid or old) is stolen and the drain proceeds", async () => {
+    enqueueQueue(DIR, { v: 1 }, 1);
+    mkdirSync(DIR, { recursive: true });
+    writeFileSync(lockPath(), `999999-${Date.now() - 120_000}-deadbee`); // dead pid + 2 min old
+    const r = await drainQueue(DIR, () => "sent");
+    expect(r.sent).toBe(1); // stale lock stolen ⇒ delivered
   });
 });

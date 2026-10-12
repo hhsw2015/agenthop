@@ -8,7 +8,7 @@
 // Credential discipline (§creds, vm-ctl gate): the bot token travels on STDIN into a 0600 file, NEVER argv/env.
 //   seed:   printf %s '<token>' | tsx scripts/swarm-tg-entry.ts --seed-token
 //   run:    SWARM_TG_ENTRY=1 tsx scripts/swarm-tg-entry.ts
-import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, renameSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import https from "node:https";
@@ -47,8 +47,16 @@ function readAllow(): Set<number> | null {
   let raw: string;
   try { raw = readFileSync(allowFile(), "utf8"); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return new Set(); console.error(`swarm-tg-entry: allowlist UNREADABLE (${allowFile()}) — HOLDING (not treating as empty): ${e instanceof Error ? e.message : e}`); return null; }
-  try { const a = JSON.parse(raw); return new Set((Array.isArray(a) ? a : a?.chatIds ?? []).filter((n: unknown): n is number => typeof n === "number")); }
-  catch (e) { console.error(`swarm-tg-entry: allowlist CORRUPT (${allowFile()}) — HOLDING (not treating as empty): ${e instanceof Error ? e.message : e}`); return null; }
+  let a: unknown;
+  try { a = JSON.parse(raw); } catch (e) { console.error(`swarm-tg-entry: allowlist CORRUPT JSON (${allowFile()}) — HOLDING (not empty): ${e instanceof Error ? e.message : e}`); return null; }
+  // TGP-13: only ACCEPT a recognized shape — a top-level number[] or { chatIds: number[] }. Anything else (null / number / {} /
+  // { chatIds: null } / a non-empty array with NO valid numeric id, e.g. ["12345"]) is MALFORMED ⇒ UNKNOWN (null), never a confirmed
+  // empty set that would silently drop legitimate taps. Only an explicit empty array ([] or { chatIds: [] }) or ENOENT is empty.
+  const src: unknown = Array.isArray(a) ? a : (a !== null && typeof a === "object" && Array.isArray((a as { chatIds?: unknown }).chatIds)) ? (a as { chatIds: unknown[] }).chatIds : undefined;
+  if (!Array.isArray(src)) { console.error(`swarm-tg-entry: allowlist MALFORMED shape (${allowFile()}) — HOLDING (not empty)`); return null; }
+  const nums = src.filter((n: unknown): n is number => typeof n === "number" && Number.isFinite(n));
+  if (src.length > 0 && nums.length === 0) { console.error(`swarm-tg-entry: allowlist has entries but NO valid numeric chat_id (${allowFile()}) — HOLDING (not empty)`); return null; }
+  return new Set(nums); // [] ⇒ confirmed-empty (no chat allowlisted yet); [1,2,…] ⇒ the allowlist
 }
 const readOffset = (): number => { try { return Number(readFileSync(offsetFile(), "utf8").trim()) || 0; } catch { return 0; } };
 const writeOffset = (n: number): void => { try { writeFileSync(offsetFile(), String(n), { mode: 0o600 }); } catch { /* best-effort; a replayed update is deduped by consume-once */ } };
@@ -116,15 +124,30 @@ function proxyAgentFor(host: string): https.Agent | undefined {
   return agent;
 }
 
+// Send-attempt audit (coordinator ask): one durable line per OUTBOUND TG send attempt + its outcome, so the at-least-once contract's
+// "auditable" claim actually holds — the number of send ATTEMPTS (and thus possible remote duplicates) is recoverable from this log.
+// It records attempts, NOT confirmed remote deliveries (TG gives no delivery proof). Best-effort append; never throws, never blocks.
+const sendAuditFile = (): string => path.join(tgDir(), "send-audit.log");
+function auditSend(method: string, body: unknown, outcome: "ok" | "error", detail?: string): void {
+  try {
+    const chatId = (body as { chat_id?: unknown } | null)?.chat_id;
+    mkdirSync(tgDir(), { recursive: true });
+    appendFileSync(sendAuditFile(), JSON.stringify({ ts: Date.now(), method, ...(typeof chatId === "number" ? { chat_id: chatId } : {}), outcome, ...(detail ? { detail: String(detail).slice(0, 200) } : {}) }) + "\n", { mode: 0o600 });
+  } catch { /* best-effort: a lost audit line never blocks or crashes a send */ }
+}
+
 function tg(token: string, method: string, body: unknown, timeoutMs = 65000): Promise<any> {
   const data = Buffer.from(JSON.stringify(body));
   const agent = proxyAgentFor("api.telegram.org"); // undefined ⇒ direct (no proxy env)
+  const isSend = method === "sendMessage" || method === "pinChatMessage"; // the outbound deliveries worth auditing
   return new Promise((resolve, reject) => {
+    const audit = (ok: boolean, detail?: string): void => { if (isSend) auditSend(method, body, ok ? "ok" : "error", detail); };
     const req = https.request(
       { host: "api.telegram.org", path: `/bot${token}/${method}`, method: "POST", headers: { "content-type": "application/json", "content-length": data.length }, timeout: timeoutMs, ...(agent ? { agent } : {}) },
-      (res) => { let buf = ""; res.on("data", (c) => (buf += c)); res.on("end", () => { try { const j = JSON.parse(buf); j.ok ? resolve(j.result) : reject(new Error(j.description || "tg error")); } catch (e) { reject(e); } }); },
+      (res) => { let buf = ""; res.on("data", (c) => (buf += c)); res.on("end", () => { try { const j = JSON.parse(buf); if (j.ok) { audit(true); resolve(j.result); } else { audit(false, j.description); reject(new Error(j.description || "tg error")); } } catch (e) { audit(false, e instanceof Error ? e.message : String(e)); reject(e); } }); },
     );
-    req.on("error", reject); req.on("timeout", () => req.destroy(new Error("tg timeout")));
+    req.on("error", (e) => { audit(false, e instanceof Error ? e.message : String(e)); reject(e); });
+    req.on("timeout", () => req.destroy(new Error("tg timeout")));
     req.write(data); req.end();
   });
 }
@@ -156,8 +179,10 @@ const ackedUpdates = new Set<number>();
 // TGP-4 (TG-r5): the durable receipt-obligation drain. For each obligation (captured at record time, keyed by update_id), the
 // receipt VALUE is resolved from the AUTHORITATIVE consumed result (readConsumedResult — the digest-verified consumed projection,
 // NOT the orphan-inclusive live fold): not-sealed ⇒ the recorded value; sealed+present ⇒ the authoritative final; sealed+absent ⇒
-// the tap was orphaned (the store signals its own re-batch) ⇒ DROP; unknown ⇒ retry. The forward is keyed by update_id so a
-// re-poll/restart/dual-instance dedups (writeInbox publishOnce). A release/ack fault is tracked in receiptStuck (DO-P2-2).
+// this tap is NOT in the consumed result (superseded pre-seal via a full-snapshot overwrite — surfaced as consume's UNDECIDED — or
+// published post-seal as an orphan the store re-batches); either way THIS bridge owes no receipt ⇒ DROP (not a claim that any orphan
+// signal was emitted). unknown ⇒ retry. The forward is keyed by update_id so a re-poll/restart/dual-instance dedups (writeInbox
+// publishOnce). A release/ack fault is tracked in receiptStuck (DO-P2-2).
 const receiptStuck = new Set<string>();
 async function drainReceiptObligations(): Promise<void> {
   try {
@@ -172,7 +197,7 @@ async function drainReceiptObligations(): Promise<void> {
       } catch { return "retry"; } // transient consumed-authority read ⇒ keep the obligation
       const act = obligationReceiptValue(authority, ob.recordedValue);
       if (act.action === "retry") return "retry";
-      if (act.action === "drop") return "sent"; // orphaned tap — the store's own orphan signal covers re-batching; no receipt
+      if (act.action === "drop") return "sent"; // not in the consumed result (superseded/orphaned) — this bridge owes no receipt
       return forwardToCoordinator(buildTgVerdictReceipt(ob.batchId, ob.itemId, act.value.verdict, act.value.scope), tgIdempotencyKey("tg-verdict", ob.updateId)) === "retry" ? "retry" : "sent";
     }, { stuck: receiptStuck });
   } catch { /* fail-soft: a drain fault never kills the poll loop */ }
