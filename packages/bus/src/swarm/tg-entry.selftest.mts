@@ -1,6 +1,6 @@
 // Selftest for the TG entry pure core (render/parse, ref-based) + the shared CORE decision rules (allowedScopes /
 // enforceScope / upsertDecision) + the digest. Run: node --import tsx packages/bus/src/swarm/tg-entry.selftest.mts
-import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, type TgUpdate } from "./tg-entry.js";
+import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
 import { allowedScopes, enforceScope, upsertDecision, validDecision, type DecisionItem, type DecisionsDoc } from "./decision-batch.js";
 import { composeDigest } from "./morning-digest.js";
 import type { DualBandwidthReading } from "./dual-bandwidth.js";
@@ -91,6 +91,33 @@ const hard: DecisionItem = { id: "n2", kind: "spend", summary: "pay $40 invoice"
 // --- the enforced decision still validates at the ledger boundary ---
 {
   t("enforced hard-gate decision is a legal ledger Decision", validDecision(enforceScope(hard, { id: "n2", verdict: "approve", scope: "always" })) !== null);
+}
+
+// --- proxy selection (pure; TG bridge bring-up) ---
+{
+  t("no env -> direct (null)", selectProxyUrl({}, "api.telegram.org") === null);
+  t("HTTPS_PROXY picked", selectProxyUrl({ HTTPS_PROXY: "http://127.0.0.1:10808" }, "api.telegram.org") === "http://127.0.0.1:10808");
+  t("lowercase https_proxy picked", selectProxyUrl({ https_proxy: "http://p:1" }, "x.y") === "http://p:1");
+  t("HTTP_PROXY fallback", selectProxyUrl({ HTTP_PROXY: "http://p:2" }, "x.y") === "http://p:2");
+  t("HTTPS_PROXY wins over HTTP_PROXY", selectProxyUrl({ HTTPS_PROXY: "http://a:1", HTTP_PROXY: "http://b:2" }, "x.y") === "http://a:1");
+  t("NO_PROXY exact host -> direct", selectProxyUrl({ HTTPS_PROXY: "http://p:1", NO_PROXY: "api.telegram.org" }, "api.telegram.org") === null);
+  t("NO_PROXY .suffix -> direct", selectProxyUrl({ HTTPS_PROXY: "http://p:1", NO_PROXY: ".telegram.org" }, "api.telegram.org") === null);
+  t("NO_PROXY bare suffix -> direct", selectProxyUrl({ HTTPS_PROXY: "http://p:1", NO_PROXY: "telegram.org" }, "api.telegram.org") === null);
+  t("NO_PROXY * -> direct", selectProxyUrl({ HTTPS_PROXY: "http://p:1", NO_PROXY: "*" }, "x.y") === null);
+  t("NO_PROXY non-match -> proxied", selectProxyUrl({ HTTPS_PROXY: "http://p:1", NO_PROXY: "other.com" }, "api.telegram.org") === "http://p:1");
+}
+
+// --- inbound immediacy receipts (pure) ---
+{
+  const vr = buildTgVerdictReceipt("b1", "n2", "approve", "once");
+  t("verdict receipt taskRef=tg-verdict", vr.taskRef === "tg-verdict");
+  t("verdict receipt text has batch/item/verdict/scope", vr.text.includes("b1") && vr.text.includes("n2") && vr.text.includes("approve") && vr.text.includes("once"));
+  t("verdict receipt no scope omits scope=", !buildTgVerdictReceipt("b1", "n2", "reject").text.includes("scope="));
+  const mr = buildTgMessageReceipt(123, "hello there");
+  t("message receipt taskRef=tg-message", mr.taskRef === "tg-message");
+  t("message receipt text has chat+body", mr.text.includes("123") && mr.text.includes("hello there"));
+  t("message receipt clips long text", buildTgMessageReceipt(1, "x".repeat(600)).text.length < 560);
+  t("ack text is a short read-receipt", typeof TG_ACK_TEXT === "string" && TG_ACK_TEXT.length > 0 && TG_ACK_TEXT.length < 40);
 }
 
 console.log("all tg-entry selftests passed");

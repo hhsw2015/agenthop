@@ -12,9 +12,13 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, renameSyn
 import { homedir } from "node:os";
 import path from "node:path";
 import https from "node:https";
+import http from "node:http";
+import tls from "node:tls";
 import { createHash } from "node:crypto";
-import { renderProjection, parseUpdate, type RenderSpec, type TgUpdate } from "../packages/bus/src/swarm/tg-entry.js";
+import { renderProjection, parseUpdate, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, TG_ACK_TEXT, type RenderSpec, type TgUpdate } from "../packages/bus/src/swarm/tg-entry.js";
 import { listBatchesStrict, readBatch, recordDecision } from "../packages/bus/src/swarm/decision-batch-store.js";
+import { deliverToCoordinator } from "../packages/bus/src/checkin.js";
+import type { SelfInfo } from "../packages/bus/src/label.js";
 import type { Verdict, ApprovalScope } from "../packages/bus/src/swarm/decision-batch.js";
 
 const HOME = homedir();
@@ -64,16 +68,56 @@ function resolveRef(ref: string): { batchId: string; itemId: string } | null {
   return item ? { batchId: matches[0]!, itemId: item.id } : null;
 }
 
+// Proxy support (bring-up: this host's direct api.telegram.org is firewalled; a system HTTP proxy tunnels it). A zero-dependency
+// CONNECT-tunnel agent: HTTP CONNECT to the proxy, then TLS over the tunnel — so https.request keeps doing response parsing. No
+// proxy env ⇒ undefined agent ⇒ https.request connects DIRECTLY (byte-for-byte the old behavior). One agent per proxy URL. Token
+// discipline untouched (the token only rides in the request PATH, as before, never the proxy).
+const proxyAgents = new Map<string, https.Agent>();
+function proxyAgentFor(host: string): https.Agent | undefined {
+  const url = selectProxyUrl(process.env, host);
+  if (!url) return undefined; // direct connect, zero behavior change
+  const cached = proxyAgents.get(url);
+  if (cached) return cached;
+  let pu: URL;
+  try { pu = new URL(url); } catch { return undefined; } // malformed proxy ⇒ fall back to direct (fail-soft)
+  const agent = new https.Agent({ keepAlive: false });
+  const auth = pu.username ? { "proxy-authorization": `Basic ${Buffer.from(`${decodeURIComponent(pu.username)}:${decodeURIComponent(pu.password)}`).toString("base64")}` } : {};
+  (agent as unknown as { createConnection: (opts: { host: string; port?: number }, cb: (e: Error | null, s?: tls.TLSSocket) => void) => void }).createConnection = (opts, cb) => {
+    const creq = http.request({ host: pu.hostname, port: Number(pu.port) || 80, method: "CONNECT", path: `${opts.host}:${opts.port ?? 443}`, headers: auth, timeout: 20000 });
+    creq.once("connect", (res, socket) => {
+      if (res.statusCode !== 200) { socket.destroy(); cb(new Error(`proxy CONNECT -> ${res.statusCode}`)); return; }
+      const ts = tls.connect({ socket, servername: opts.host, host: opts.host, port: opts.port ?? 443 });
+      ts.once("secureConnect", () => cb(null, ts));
+      ts.once("error", (e) => cb(e));
+    });
+    creq.once("error", (e) => cb(e));
+    creq.once("timeout", () => creq.destroy(new Error("proxy CONNECT timeout")));
+    creq.end();
+  };
+  proxyAgents.set(url, agent);
+  return agent;
+}
+
 function tg(token: string, method: string, body: unknown): Promise<any> {
   const data = Buffer.from(JSON.stringify(body));
+  const agent = proxyAgentFor("api.telegram.org"); // undefined ⇒ direct (no proxy env)
   return new Promise((resolve, reject) => {
     const req = https.request(
-      { host: "api.telegram.org", path: `/bot${token}/${method}`, method: "POST", headers: { "content-type": "application/json", "content-length": data.length }, timeout: 65000 },
+      { host: "api.telegram.org", path: `/bot${token}/${method}`, method: "POST", headers: { "content-type": "application/json", "content-length": data.length }, timeout: 65000, ...(agent ? { agent } : {}) },
       (res) => { let buf = ""; res.on("data", (c) => (buf += c)); res.on("end", () => { try { const j = JSON.parse(buf); j.ok ? resolve(j.result) : reject(new Error(j.description || "tg error")); } catch (e) { reject(e); } }); },
     );
     req.on("error", reject); req.on("timeout", () => req.destroy(new Error("tg timeout")));
     req.write(data); req.end();
   });
+}
+
+// Inbound immediacy: forward a receipt to the coordinator inbox (writeInbox carries inbox-wake ⇒ sub-second wake, not an 8-min
+// cron) + a durable audit trace. deliverToCoordinator is fail-soft (resolve → writeInbox; sent/retry/skip, never throws). NOTIFY
+// ONLY — the verdict is already in the ledger; the coordinator's re-injection chain still does the execution (never here).
+const tgSelf: SelfInfo = { id: "swarm-tg-entry", stableId: "swarm-tg-entry", tool: "claude", cwd: HOME, pid: process.pid, title: "tg-entry", startedAt: Date.now() };
+function forwardToCoordinator(fields: { text: string; taskRef: string; title: string }): void {
+  try { deliverToCoordinator(HOME, tgSelf, process.env.SWARM_COORDINATOR, { from: "swarm-tg-entry", fromLabel: "tg-entry", text: fields.text, taskRef: fields.taskRef, title: fields.title, via: "local", ts: Date.now() }); }
+  catch (e) { console.error(`swarm-tg-entry: coordinator receipt failed (best-effort, verdict already recorded): ${e instanceof Error ? e.message : e}`); }
 }
 
 /** Send a RenderSpec (throws on API failure so the caller can keep a retry obligation). v1: message + inline keyboard; a
@@ -107,16 +151,26 @@ async function notifyNewBatches(token: string, allow: Set<number>): Promise<void
  *  committed ONLY after a TERMINAL outcome (recorded / consumed / unknown-item / ignored / expired-ref); a transient IO error
  *  or a contended lock STOPS this poll WITHOUT advancing, so the same update is retried — never a silent "already decided". */
 async function pollOnce(token: string, allow: Set<number>): Promise<void> {
-  const updates = await tg(token, "getUpdates", { offset: readOffset(), timeout: 50, allowed_updates: ["callback_query", "message"] });
+  // 25s standard long-poll (≤30s): getUpdates blocks up to 25s for an update, so the loop also runs notifyNewBatches at least every
+  // ~25s ⇒ outbound new-batch latency ≤ ~25s. Inbound latency is independent now (an update returns immediately + the coordinator
+  // is woken via the receipt below, not on this interval).
+  const updates = await tg(token, "getUpdates", { offset: readOffset(), timeout: 25, allowed_updates: ["callback_query", "message"] });
   for (const u of updates ?? []) {
     const cq = u.callback_query;
     const chatId: unknown = cq ? cq.message?.chat?.id : u.message?.chat?.id;
     const ack = async (text?: string): Promise<void> => { if (cq) await tg(token, "answerCallbackQuery", { callback_query_id: cq.id, ...(text ? { text } : {}) }).catch(() => {}); };
     // first-contact: surface an un-allowlisted chat_id so the user can add it (design detail); terminal -> advance.
     if (typeof chatId === "number" && !allow.has(chatId)) { console.error(`swarm-tg-entry: message from un-allowlisted chat_id ${chatId} — add it to ${allowFile()} to enable`); writeOffset(u.update_id + 1); await ack(); continue; }
+    // conversation SLA (②): an IMMEDIATE TG-side read-receipt to the allowlisted chat BEFORE processing — the final result rides
+    // the outbound path later. Best-effort (never blocks processing); un-allowlisted chats were already handled above.
+    if (typeof chatId === "number") await tg(token, "sendMessage", { chat_id: chatId, text: TG_ACK_TEXT }).catch(() => {});
     const upd: TgUpdate = cq ? { chatId, callbackData: cq.data } : { chatId, text: u.message?.text };
     const r = parseUpdate(upd, allow);
-    if (r.kind === "ignore") { writeOffset(u.update_id + 1); await ack(); continue; }
+    if (r.kind === "ignore") {
+      // ① a non-verdict allowlisted message still reaches the coordinator inbox (notify + inbox-wake); NEVER executed
+      if (typeof chatId === "number" && typeof u.message?.text === "string" && u.message.text.trim()) forwardToCoordinator(buildTgMessageReceipt(chatId, u.message.text));
+      writeOffset(u.update_id + 1); await ack(); continue;
+    }
     // TG-P2-1: resolveRef throws on a STORE READ ERROR (unreadable batches dir/batch.json) — that is TRANSIENT, so STOP the poll
     // WITHOUT advancing the offset; the same tap is retried next loop (never a false "expired" that permanently skips an approval).
     let resolved: { batchId: string; itemId: string } | null;
@@ -128,6 +182,8 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
     try { outcome = recordDecision(HOME, resolved.batchId, decision, Math.floor(Date.now() / 1000)); }
     catch (e) { console.error(`swarm-tg-entry: recordDecision transient error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return; } // transient IO -> retry this update next poll
     if (outcome === "contended") return; // a concurrent holder — retry this update next poll (do NOT advance)
+    // ① inbound immediacy: a NEW verdict wakes the coordinator NOW via a durable receipt (writeInbox inbox-wake), not on a cron.
+    if (outcome === "recorded") forwardToCoordinator(buildTgVerdictReceipt(resolved.batchId, resolved.itemId, decision.verdict, decision.scope));
     writeOffset(u.update_id + 1); // terminal
     await ack(outcome === "recorded" ? "recorded" : outcome === "consumed" ? "already decided" : "unknown");
   }

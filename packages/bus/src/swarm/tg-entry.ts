@@ -88,3 +88,39 @@ export function parseUpdate(update: TgUpdate, allowlist: ReadonlySet<number>): P
   if (!cb) return { kind: "ignore", reason: "malformed callback" };
   return { kind: "decision", ref: cb.ref, verdict: cb.verdict, ...(cb.scope ? { scope: cb.scope } : {}) };
 }
+
+// ------------------------------------------------------------------------------------------------------------------------
+// Outbound-request proxy selection + inbound immediacy receipts (TG bridge bring-up). Pure; the thin driver does the IO.
+// ------------------------------------------------------------------------------------------------------------------------
+
+/** Pick the proxy URL for an HTTPS request to `host` from standard env, or null for a DIRECT connection. `HTTPS_PROXY` (then
+ *  `HTTP_PROXY`) wins; `NO_PROXY` (an exact host, a `.suffix`/`suffix`, or `*`) forces direct; lowercase variants honored. No env
+ *  ⇒ null ⇒ the caller connects directly (ZERO behavior change vs today). Pure. */
+export function selectProxyUrl(env: Record<string, string | undefined>, host: string): string | null {
+  const h = host.toLowerCase();
+  for (const p of (env.NO_PROXY ?? env.no_proxy ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)) {
+    if (p === "*") return null;
+    const bare = p.replace(/^\./, "");
+    if (h === bare || h.endsWith(`.${bare}`)) return null;
+  }
+  const url = (env.HTTPS_PROXY ?? env.https_proxy ?? env.HTTP_PROXY ?? env.http_proxy ?? "").trim();
+  return url || null;
+}
+
+/** The immediate TG-side ACK text — a sub-second "read receipt" the bridge sends back to the user's chat ON RECEIVING an update,
+ *  before the coordinator processes it (conversation-level SLA). The final result rides the outbound path later. */
+export const TG_ACK_TEXT = "✅ 收到,正在处理…";
+
+/** The S11 decision receipt the bridge writes to the COORDINATOR inbox after a verdict is RECORDED, so the coordinator wakes
+ *  (writeInbox carries inbox-wake) in seconds instead of waiting for a cron, and the receipt is a durable audit trace. NOTIFY
+ *  ONLY — it never executes; the coordinator's re-injection chain still does the work. Pure (returns the message fields). */
+export function buildTgVerdictReceipt(batchId: string, itemId: string, verdict: Verdict, scope?: ApprovalScope): { text: string; taskRef: string; title: string } {
+  return { text: `[tg-verdict] 批 ${batchId} 项 ${itemId}: ${verdict}${scope ? ` (scope=${scope})` : ""}`, taskRef: "tg-verdict", title: "TG 决策回执" };
+}
+
+/** The S11 receipt for a NON-verdict allowlisted TG message — forwarded to the coordinator inbox (notify + inbox-wake) so the
+ *  user's free text is seen promptly. Notify only, never executed; the text is bounded. Pure. */
+export function buildTgMessageReceipt(chatId: number, text: string): { text: string; taskRef: string; title: string } {
+  const clipped = text.length > 500 ? `${text.slice(0, 500)}…` : text;
+  return { text: `[tg-message] chat ${chatId}: ${clipped}`, taskRef: "tg-message", title: "TG 消息" };
+}
