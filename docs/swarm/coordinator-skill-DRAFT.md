@@ -94,6 +94,47 @@ CLI 读 `AGENTHOP_RULINGS_DIR` 否则脚本所在仓(`rulings.ts:108`)——**�
 - **F49/F50 = 无来源,功能描述**(§5),不作可解析引用。
 - **同号碰撞(实测)**:账本 **R3 = 凭证收窄**;CORE 代理权「R3 判据」= **可撤性**——同号不同义,可撤代行引 CORE 代理权节,不引账本 R3。按「存在且含义相符」核验。
 
+## 8. 新项目开张流程(spawn-coordinator — 出生即胜任)
+
+一个新项目 = 一个新协调者 session 从零到胜任。本节是「出生包」:加载本技能 + 走完下面四步,新 session 即成为该项目的协调者。(下文 `AH_HOME` = §0 的家目录参数;dispatch 所称 `DATA_ROOT` 即此,数据面 = `$AH_HOME/.agenthop`。)
+
+### ① spawn-coordinator runbook
+
+1. **起新 session**:herdr 新 pane/tab(或 `agenthop_spawn`),cwd = 新项目根。新壳首动 `agenthop install --mcp <kind>`(F45,裸 install 只打印不注册)。
+2. **加载 coordinator 技能**(本技能)。
+3. **注入五参**:`COORD_SID`=**新铸**(本 session 稳定总线身份)/ `AH_HOME`=本机家目录(数据面 `$AH_HOME/.agenthop`)/ `PROJECT_ROOT`=**新项目根**(仓+契约集+产物域)/ `REVIEW_SEAT`=本项目指定审查席 / `RULINGS`=共享律典(`AGENTHOP_RULINGS_DIR`)。
+4. **自检清单(状态文件地图)**——「他知道他的状态文件是哪些」。逐一确认/初始化(多数由写入方惰性创建,协调者只需**播种 PROGRESS.md + 注册 roster + 确认 `$AH_HOME/.agenthop/` 可写**):
+
+| 状态文件 | 路径(`$AH_HOME/.agenthop/…`) | 初始化 |
+|---|---|---|
+| 进度叙事 | `swarm/PROGRESS.md` | 协调者**播种**(首行标题 + 空节);本技能的组稿/晨报读它 |
+| 名册册 | `swarm/roster-snapshot.json`(+ `swarm/console/roster.json`) | 注册本 session + 后续成员(roster resumeCmd 模板,③) |
+| 板 | `swarm/board/` | 空目录(拉式领活;写入方惰性建) |
+| 控制日志 | `swarm/control-log/` | 空(commit 惰性建;单调 seq 源,§1/§6) |
+| 自箱 | `inbox/<COORD_SID>/` | 空(writeInbox 惰性建;§1 扫箱) |
+| 决策批 | `console/decision-batches/` | 空(待你拍板权威源) |
+| 投影 | `swarm/console/`、`console/morning-digest/` | 空(验收简报/看板投影惰性建) |
+
+自检失败(`$AH_HOME/.agenthop/` 不可写 / `rulings S29` 不解析)⇒ **不启动**(§0 加载检查)。
+
+### ② 与 state-isolation 键对齐
+
+**项目键 = 其状态树根** = `$AH_HOME/.agenthop`(§② 隔离设计)。一个项目 = 一棵状态树;上表全部状态文件挂在该根下。**诚实边界(CS-P2-1)**:今日总线 `core.ts:84` 取 `options.home ?? homedir()`、不读 AH_HOME,故**仅换 AH_HOME 不足以隔离总线**——真正的多项目并行隔离需各入口(总线 `options.home` + presence + dispatcher)**同读这一个根**,属**前置依赖**(brief「支持的运行模式」)。v1 诚实范围:**单根单协调者**;多项目=各自独立根 + 前置依赖满足后。
+
+### ③ 新协调者第一轮例程
+
+1. **建立自唤醒**:装 sweep/唤醒 cron(§1 the loop 的触发),使扫箱-派下一棒循环自驱(自驱动柱)。
+2. **报到**:向**对话官**(R20 日常事务官,user 的单一接口链路)或直接向 user 报「新项目协调者已就位 + 五参 + 状态文件地图确认」。
+3. **招募成员**:按需 spawn(容量规则),引用 **roster resumeCmd 模板**(F36 出生证:完整 resumeCmd 非裸 `--resume`;swarm-resume)——每个成员带角色说明(roleProfile)+ 契约 + CORE,spawn 即带全部规章。
+
+### ④ 与既有 agenthop 协调者的关系
+
+既有 agenthop 协调者(fe0376cd)与新项目协调者 = **对等同僚**,不是上下级:
+- **互不干预**:各自拥有自己的状态树(各自 `$AH_HOME/.agenthop` / 项目键);谁都不向对方项目派单或改其状态。
+- **共用律典 + 基础设施**:同一 `RULINGS`(FC 族 + S/R/F 判例=可移植法)+ agenthop 二进制/总线/herdr/旗默认 + 本技能本体。
+- **单一人类权威**:两协调者之上仍是 **user**(R16 授权链);跨项目的三类裁决归 user,不由任一协调者代行到另一项目。
+- 需要时可**平级咨询**(peer,总线),但不互相命令(R18 分层仅在一个项目树内成立,跨项目是对等)。
+
 ---
 
-_DRAFT r3 说明:落点待 user 裁(brief §③)。取案 A 按英文 SKILL.md + zh-CN 双语拆分(build-release.mjs 契约)。五参由加载点注入,正文不硬编码具体工作区;v1 范围=单根单协调者,多根隔离/数据面改造为前置依赖(brief「支持的运行模式」)。_
+_DRAFT r4 说明:落点待 user 裁(brief §③,首批 DecisionBatch)。取案 A 按英文 SKILL.md + zh-CN 双语拆分(build-release.mjs 契约)。五参由加载点注入,正文不硬编码具体工作区;v1 范围=单根单协调者,多根隔离/数据面改造为前置依赖(brief「支持的运行模式」)。§8 新项目开张流程为 user 完整图景补充(设计已签 @ade8be9;本节并入 DRAFT 定稿,技能产物在 A/B 落点裁后制作)。_

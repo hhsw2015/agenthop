@@ -1,6 +1,6 @@
 # coordinator-skill 简报 — 协调者技能化(设计·冻结候选 r3)
 
-owner aad02248 · 协调者 fe0376cd 派单(user 亲令,方向性大件)· 审查席 happycapy · base main @a1a933d · 状态:**纯文档设计件,r4 补齐每转换 operationId 契约后待复审(CS-P2-1/2/4 + N1 已 CLOSED;仅 CS-P2-3 身份规则残留本轮修)**
+owner aad02248 · 协调者 fe0376cd 派单(user 亲令,方向性大件)· 审查席 happycapy · base main @a1a933d · 状态:**设计全签 @ade8be9(CS-P2-1/2/3/4 + N1 全 CLOSED);r5 并入 §8 新项目开张流程(user 完整图景);待 user 裁 A/B 落点后制作技能产物**
 
 ## 缘起(user 原话)
 
@@ -108,6 +108,10 @@ rulings grep <word>
 ```
 
 命名空间四分、同号碰撞、FC 内嵌、F49/F50 功能化见上「律典解析契约」。
+
+### H. 新项目开张流程(spawn-coordinator — 出生即胜任)
+
+user 完整图景补充(设计已签 @ade8be9,本节并入 DRAFT 定稿,详见 DRAFT §8):① spawn-coordinator runbook(新 session → 加载技能 → 注入五参 → **自检状态文件地图**:PROGRESS 播种 / roster 注册 / board·control-log·inbox·decision-batches·投影 惰性建 + 加载检查);② 项目键 = 状态树根 `$AH_HOME/.agenthop`(与 state-isolation 对齐;多根隔离=前置依赖,诚实边界同 CS-P2-1);③ 第一轮例程(自唤醒 cron / 报到对话官或 user / 招募成员引用 roster resumeCmd 模板 F36);④ 与既有 agenthop 协调者(fe0376cd)= **对等同僚**:互不干预、各拥状态树、共用律典+基础设施、单一人类权威 user、跨项目对等不命令。
 
 ---
 
