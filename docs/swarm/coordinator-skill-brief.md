@@ -1,6 +1,6 @@
 # coordinator-skill 简报 — 协调者技能化(设计·冻结候选 r3)
 
-owner aad02248 · 协调者 fe0376cd 派单(user 亲令,方向性大件)· 审查席 happycapy · base main @a1a933d · 状态:**纯文档设计件,r3 修齐 happycapy 复审 3P2 后待复审(CS-P2-4/N1 已 CLOSED)**
+owner aad02248 · 协调者 fe0376cd 派单(user 亲令,方向性大件)· 审查席 happycapy · base main @a1a933d · 状态:**纯文档设计件,r4 补齐每转换 operationId 契约后待复审(CS-P2-1/2/4 + N1 已 CLOSED;仅 CS-P2-3 身份规则残留本轮修)**
 
 ## 缘起(user 原话)
 
@@ -61,8 +61,9 @@ owner aad02248 · 协调者 fe0376cd 派单(user 亲令,方向性大件)· 审�
 
 触发 = 唤醒 ping / sweep / boot。关键契约(CS-P2-3 修订):
 1. 扫 `$AH_HOME/.agenthop/inbox/<COORD_SID>/`,逐封按序处理(claim→处理)。
-2. **先形成可恢复的交棒义务,再签收**(durable-first;铁律 2)。交棒耐久记录 = **三件分离**:
-   - **稳定操作 ID**(身份:taskId / launchId);
+2. **先形成可恢复的交棒义务,再签收**(durable-first;铁律 2)。交棒耐久记录 = **四件分离**:
+   - **业务关联标识**(taskId / launchId):关联业务对象;**不可直接当作 `Change.operationId`**。
+   - **每转换操作 ID**(`Change.operationId`,`control-log.ts:25-28`):每个**逻辑转换**独立铸一次、**commit 前持久化**;崩溃重提**原样复用**(幂等重放);**同实体的新转换另取新 ID**(实体 seq 1→2);**不按扫描/pass 重铸**,**不拿一个业务 ID 当所有转换的去重键**(同 operationId 不同 payload digest ⇒ op-conflict 冻结实体,`control-log.ts:14`)。例:「待回执」转换 opId-A → 同实体「已确认」须 opId-B(非复用);opId-A 崩溃重放仍幂等。
    - **单调提交序 = control-log `seq` / `decidedAtSeq`**(`control-log.ts:22-24`,追加序 = `currentState.seq + 1`,跨任务全序)——**非 tasklog `updatedAt`/`Date.now`**(墙钟:两 taskId 可同为 1000、同任务后续可变 900,作键会重号、作序违 FC-6);
    - **投递证据**(OC-5:由凭据证,**非由任务态/缺失推**)。
 3. **ack 仅删认领文件**(`inbox.ts:385`,**无 processed 归档**);不可「ack 后再派」。
@@ -144,7 +145,7 @@ rulings grep <word>
 |---|---|---|---|
 | CS-P2-1 | 填参≠隔离;DATA_ROOT 双追加 `.agenthop`;总线不读 AH_HOME | 参数改 `AH_HOME`(数据面=`$AH_HOME/.agenthop`,追加一次);标总线 core.ts:84 不读 AH_HOME;v1 收窄单根;**撤回双 AH_HOME 隔离 claim**;多根隔离=各入口根统一 前置依赖 | r3 修 |
 | CS-P2-2 | FC-2/F49/F50 指向的文件无该号 | 安装清单逐号给源;**FC 族内嵌自足**(源 output-contract §Self-check);**F49/F50 降为功能描述**、不入加载检查;加载检查验实际引用号非仅 S29 | r3 修 |
-| CS-P2-3 | updatedAt 墙钟作序/键;PENDING≠未投递 | 交棒记录三件分离(op-ID / **control-log seq 单调序** / 投递证据);删 updatedAt 序用途;恢复重验证据、**不从 PENDING 重发**;认领=互斥+可恢复非 exactly-once | r3 修 |
+| CS-P2-3 | updatedAt 墙钟作序/键;PENDING≠未投递;**业务 ID 混用为 operationId** | 交棒记录**四件分离**(业务关联标识 vs **每转换 operationId**〔control-log.ts:25-28:逐转换铸一次、commit 前持久化、崩溃原样复用、新转换另取新 ID,同 ID 异 digest ⇒ op-conflict〕vs control-log seq 单调序 vs 投递证据);删 updatedAt 序用途;恢复重验证据、不从 PENDING 重发;认领=互斥+可恢复非 exactly-once | r3+r4 修 |
 | CS-P2-4 | S29↔S26 混;删真实门控;FC-7 漏迁移 | S29/S26 分清;复原真实门控;FC-7 补兼容导入 | **CLOSED** |
 | CS-N1 | 默认 OFF 举例过期 | 改按部署+接线核对,旧 OFF 标历史 | **CLOSED** |
 

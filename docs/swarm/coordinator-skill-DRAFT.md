@@ -32,9 +32,10 @@ user 离场期你**代行其可撤决策**(可撤判据见 CORE 代理权节);�
 触发:唤醒 ping / sweep / boot。每次:
 
 1. 扫 `$AH_HOME/.agenthop/inbox/<COORD_SID>/`,逐封按序处理(claim → 处理)。分类:成员成果 / 审查裁决 / 升级件 / user 裁定转达 / check-in。
-2. **先形成可恢复的交棒义务,再签收**(durable-first;铁律 2)。交棒耐久记录 = **三件分离**:
-   - **稳定操作 ID**(身份:taskId / launchId);
-   - **单调提交序 = control-log `seq` / `decidedAtSeq`**(control-log.ts:22-24,追加序 = `currentState.seq+1`,跨任务全序)——**非 tasklog `updatedAt`/`Date.now`**(墙钟:会重号、作序违 FC-6);
+2. **先形成可恢复的交棒义务,再签收**(durable-first;铁律 2)。交棒耐久记录 = **四件分离**:
+   - **业务关联标识**(taskId / launchId):关联业务对象;**不可直接当作 `Change.operationId`**。
+   - **每转换操作 ID**(`Change.operationId`,control-log.ts:25-28):每个**逻辑转换**独立铸一次、**commit 前持久化**;崩溃重提**原样复用**(幂等重放);**同实体的新转换另取新 ID**(实体 seq 1→2);**不按扫描/pass 重铸**,**不拿一个业务 ID 当所有转换的去重键**(同 operationId 不同 payload digest ⇒ op-conflict 冻结实体,control-log.ts:14)。例:先提交「待回执」转换(opId-A)→ 同实体更新为「已确认」须用 opId-B(非复用 opId-A);而 opId-A 的崩溃重放仍幂等。
+   - **单调提交序 = control-log `seq` / `decidedAtSeq`**(control-log.ts:22-24,追加序 = `currentState.seq+1`,跨任务全序)——**非 tasklog `updatedAt`/`Date.now`**(墙钟:会重号、作序违 FC-6)。
    - **投递证据**(OC-5:由凭据证,**非由任务态/缺失推**)。
 3. **ack 仅删认领文件**(inbox.ts:385,**无 processed 归档**);**不可「ack 后再派」**。
 4. **恢复入口**:扫投递证据为 **unknown** 的 baton,**重验证据**(FC-2 r3:绝不由 PENDING/缺失推未投递);**不从 PENDING 重发**(PENDING = 已派、尚无成员结果,非未投递)。
