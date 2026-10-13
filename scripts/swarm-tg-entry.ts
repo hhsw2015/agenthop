@@ -15,11 +15,11 @@ import https from "node:https";
 import http from "node:http";
 import tls from "node:tls";
 import { createHash, randomBytes } from "node:crypto";
-import { renderProjection, parseUpdate, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, obligationReceiptValue, tgReceiptObligationDir, srcTag, tgIdempotencyKey, TG_ACK_TEXT, type RenderSpec, type TgUpdate, type ReceiptObligation } from "../packages/bus/src/swarm/tg-entry.js";
+import { renderProjection, parseUpdate, selectProxyUrl, buildTgVerdictReceipt, obligationReceiptValue, tgReceiptObligationDir, srcTag, buildDialogOfficerMsg, tgOutboxDir, tgDialogPendingDir, tgIdempotencyKey, TG_ACK_TEXT, type RenderSpec, type TgUpdate, type ReceiptObligation } from "../packages/bus/src/swarm/tg-entry.js";
 import { listBatchesStrict, readBatch, readConsumedResult, recordDecision } from "../packages/bus/src/swarm/decision-batch-store.js";
 import { enqueueQueue, drainQueue } from "../packages/bus/src/swarm/tg-queue.js";
 import { enforceScope, type Verdict, type ApprovalScope } from "../packages/bus/src/swarm/decision-batch.js";
-import { writeInbox } from "../packages/bus/src/inbox.js";
+import { writeInbox, type InboxMsg } from "../packages/bus/src/inbox.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { installInboxWake } from "../packages/bus/src/swarm/inbox-wake.js";
 
@@ -269,14 +269,23 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
     if (typeof chatId === "number" && !ackedUpdates.has(u.update_id)) { ackedUpdates.add(u.update_id); void tg(token, "sendMessage", { chat_id: chatId, text: TG_ACK_TEXT }, 15000).catch(() => {}); }
     const upd: TgUpdate = cq ? { chatId, callbackData: cq.data } : { chatId, text: u.message?.text };
     const r = parseUpdate(upd, allow);
-    if (r.kind === "ignore") {
-      // ① a non-verdict allowlisted message reaches the coordinator inbox (notify + inbox-wake); NEVER executed. TGP-3: it has no
-      // ledger copy, so release the update (advance) ONLY after a durable handoff — a retry keeps the update (idempotent on replay).
-      if (typeof chatId === "number" && typeof u.message?.text === "string" && u.message.text.trim()) {
-        if (forwardToCoordinator(buildTgMessageReceipt(chatId, u.message.text), tgIdempotencyKey("tg-msg", u.update_id)) === "retry") return;
-      }
+    if (r.kind === "dialog") {
+      // dialog-officer (R10): an allowlisted FREE-TEXT turn goes to the DIALOG-OFFICER box — NEVER the coordinator (§3 hard bound).
+      // DO-P2-3: ALWAYS enqueue to the LOCAL durable pending queue (keyed by the numeric update_id) — NEVER a direct writeInbox
+      // bypass, which could jump a new turn AHEAD of queued backlog. The per-loop pending drain delivers to the officer in strict
+      // update_id FIFO (writeInbox publishOnce dedups per `key`; the queue is payload-bound, so a re-poll never duplicates). Release
+      // the offset ONLY after the durable enqueue. NOTIFY ONLY — the officer, not this driver, runs the conversation; the token stays
+      // with the driver. DO-P2-4: the FULL user text is carried (no truncation).
+      const key = tgIdempotencyKey("tg-dialog", u.update_id);
+      // DO-R4-P1-1: the enqueued body MUST be DETERMINISTIC per update_id — a volatile Date.now() ts would give each retry a different
+      // body, and the payload-bound queue would then reject the retry as a "conflict". Use the TG message's own timestamp (stable per
+      // event); absent ⇒ 0. So a re-poll produces the identical body ⇒ idempotent ("already"), never a false conflict.
+      const eventTs = typeof u.message?.date === "number" ? u.message.date * 1000 : 0;
+      const officerMsg: InboxMsg = { from: "swarm-tg-entry", fromLabel: "tg-entry", text: buildDialogOfficerMsg(r.chatId, r.text).text, taskRef: "tg-dialog", title: "TG 对话", via: "local", ts: eventTs };
+      { const q = enqueueQueue(tgDialogPendingDir(HOME), { officerMsg, key }, u.update_id); if (q !== "enqueued" && q !== "already") return; } // DO-R4-P1-1: only enqueued/already is a handoff; failed/conflict ⇒ HOLD, re-poll
       writeOffset(u.update_id + 1); await ack(); continue;
     }
+    if (r.kind === "ignore") { writeOffset(u.update_id + 1); await ack(); continue; }
     // TG-P2-1: resolveRef throws on a STORE READ ERROR (unreadable batches dir/batch.json) — that is TRANSIENT, so STOP the poll
     // WITHOUT advancing the offset; the same tap is retried next loop (never a false "expired" that permanently skips an approval).
     let resolved: { batchId: string; itemId: string } | null;
@@ -353,12 +362,38 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => { stop = true; });
   process.on("SIGINT", () => { stop = true; });
   console.error("swarm-tg-entry: up (notify + collect-approvals; never executes).");
+  // Q7 (§4 SLA): a CONCURRENT outbound drain so a dialog-officer reply reaches TG in ~1s — the getUpdates long-poll (25s) can't
+  // drive outbound fast. Claim-safe (atomic), single-flight-guarded, fail-soft; an empty outbox is a cheap readdir (no TG/proxy
+  // call), so this only sends when the officer actually queued a reply.
+  let draining = false;
+  const outboxStuck = new Set<string>(); // DO-P2-2: claims whose release/ack faulted, re-attempted each drain
+  const outboxTimer = setInterval(() => {
+    if (draining || stop) return; draining = true;
+    const allow = readAllow(); // DO-P2-5: re-read so the send-boundary allowlist is fresh
+    if (allow === null) { draining = false; return; } // DO-R2-P1-1: allowlist unverifiable ⇒ HOLD the outbox (never refuse+drop a reply on a deny-all guess)
+    void drainQueue(tgOutboxDir(HOME), async (rec) => {
+      const m = rec as { chatId?: unknown; text?: unknown };
+      if (!m || typeof m !== "object" || typeof m.chatId !== "number" || typeof m.text !== "string" || !m.text) return "sent"; // shape-invalid ⇒ discharge
+      // DO-P2-5: the SEND boundary enforces the recipient allowlist (the inbound gate does not cover this new outbound exit). A
+      // non-allowlisted target is REFUSED with an explainable log and discharged (a permanent reject, not a retry loop) — the
+      // officer must only reply to the chat that messaged in. NEVER sends to an un-allowlisted chat.
+      if (!allow.has(m.chatId)) { console.error(`swarm-tg-entry: outbox REFUSED — chat_id ${m.chatId} not allowlisted (${allowFile()}); dropping reply`); return "sent"; }
+      try { await tg(token, "sendMessage", { chat_id: m.chatId, text: m.text }); return "sent"; } catch { return "retry"; }
+    }, { stuck: outboxStuck }).catch(() => undefined).finally(() => { draining = false; });
+  }, 1000);
+  outboxTimer.unref?.();
+  const pendingStuck = new Set<string>(); // DO-P2-2: pending claims whose release/ack faulted, re-attempted each drain
   while (!stop) {
     const allow = readAllow(); // re-read each loop so the user can add a chat_id without a restart
     if (allow === null) { await new Promise((r) => setTimeout(r, 3000)); continue; } // DO-R2-P1-1: allowlist unverifiable ⇒ HOLD (never process with a deny-all guess)
+    // Recover any dialog that waited for the officer to resolve (local pending → officer box, FIFO by update_id); idempotent per its
+    // key (writeInbox publishOnce) AND per the queue DONE marker; fail-soft.
+    const officerSid = resolveSession(process.env.SWARM_DIALOG_OFFICER ?? "", listSessions(HOME));
+    if (officerSid) { try { await drainQueue(tgDialogPendingDir(HOME), (rec) => { const r = rec as { officerMsg?: InboxMsg; key?: string }; if (!r || typeof r !== "object" || !r.officerMsg) return "sent"; try { const res = writeInbox(HOME, officerSid, r.officerMsg, r.key); return (res === "published" || res === "already") ? "sent" : "retry"; } catch { return "retry"; } }, { stuck: pendingStuck }); } catch { /* fail-soft */ } }
     try { await notifyNewBatches(token, allow); await pollOnce(token, allow); }
     catch (e) { console.error(`swarm-tg-entry loop error (continuing): ${e instanceof Error ? e.message : e}`); await new Promise((r) => setTimeout(r, 3000)); }
   }
+  clearInterval(outboxTimer);
   console.error("swarm-tg-entry: stopped.");
 }
 

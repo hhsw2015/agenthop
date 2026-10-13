@@ -1,6 +1,6 @@
 // Selftest for the TG entry pure core (render/parse, ref-based) + the shared CORE decision rules (allowedScopes /
 // enforceScope / upsertDecision) + the digest. Run: node --import tsx packages/bus/src/swarm/tg-entry.selftest.mts
-import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, obligationReceiptValue, tgReceiptObligationDir, srcTag, tgIdempotencyKey, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
+import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, obligationReceiptValue, tgReceiptObligationDir, srcTag, buildDialogOfficerMsg, tgOutboxDir, tgDialogPendingDir, tgIdempotencyKey, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
 import { allowedScopes, enforceScope, upsertDecision, validDecision, type DecisionItem, type DecisionsDoc } from "./decision-batch.js";
 import { composeDigest } from "./morning-digest.js";
 import type { DualBandwidthReading } from "./dual-bandwidth.js";
@@ -61,7 +61,25 @@ const hard: DecisionItem = { id: "n2", kind: "spend", summary: "pay $40 invoice"
   t("non-number chatId -> ignore", parseUpdate({ chatId: "42", callbackData: "d|h.0|approve" }, allow).kind === "ignore");
   const ok = parseUpdate({ chatId: 42, callbackData: encodeDecisionCb("h.0", "approve", "once") }, allow);
   t("valid tap -> decision with ref (driver resolves)", ok.kind === "decision" && ok.ref === "h.0" && ok.verdict === "approve" && ok.scope === "once");
-  t("typed reply -> ignore in v1", parseUpdate({ chatId: 42, text: "hi" }, allow).kind === "ignore");
+  // R10 dialog-officer: an allowlisted FREE-TEXT turn is now a DIALOG (v1 dropped it as "ignore"); the decision path is unchanged.
+  const dlg = parseUpdate({ chatId: 42, text: "hi there" }, allow);
+  t("allowlisted free text -> dialog (not ignore)", dlg.kind === "dialog" && (dlg as { chatId: number }).chatId === 42 && (dlg as { text: string }).text === "hi there");
+  t("off-allowlist free text -> ignore (gate still first)", parseUpdate({ chatId: 99, text: "hi" }, allow).kind === "ignore");
+  t("allowlisted empty/whitespace text -> ignore", parseUpdate({ chatId: 42, text: "   " }, allow).kind === "ignore");
+  t("allowlisted no text, no callback -> ignore", parseUpdate({ chatId: 42 }, allow).kind === "ignore");
+  // decision path BYTE-UNCHANGED: a tap with text present still classifies as a decision (callback wins over text).
+  t("callback+text -> still decision (path unchanged)", parseUpdate({ chatId: 42, callbackData: encodeDecisionCb("h.0", "reject"), text: "ignored" }, allow).kind === "decision");
+}
+
+// --- dialog-officer: buildDialogOfficerMsg + queue dir shapes (R10 §3/§9-1) ---
+{
+  const m = buildDialogOfficerMsg(42, "please merge PR 7");
+  t("dialog msg taskRef=tg-dialog", m.taskRef === "tg-dialog");
+  t("dialog msg carries chat + body", m.text.includes("42") && m.text.includes("please merge PR 7"));
+  t("dialog msg preserves FULL text (DO-P2-4: no truncation, TG already bounds ≤4096)", buildDialogOfficerMsg(1, "x".repeat(3000)).text.includes("x".repeat(3000)));
+  t("outbox dir under ~/.agenthop/tg/outbox", tgOutboxDir("/home/u").endsWith("/.agenthop/tg/outbox") && tgOutboxDir("/home/u").startsWith("/home/u"));
+  t("dialog-pending dir under ~/.agenthop/tg/dialog-pending", tgDialogPendingDir("/home/u").endsWith("/.agenthop/tg/dialog-pending"));
+  t("outbox and pending dirs are distinct", tgOutboxDir("/home/u") !== tgDialogPendingDir("/home/u"));
 }
 
 // --- renderProjection ---
