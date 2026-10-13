@@ -280,11 +280,32 @@ export function publicRecoveryStatus(
  *  NOT promise "a re-run finalizes" (if the marker is actually complete, resolveEpisode correctly starts a NEW episode). Pure. */
 export function recoveryStatusLine(status: PublicRecoveryStatus): string {
   switch (status) {
+    // r11: pending lines do NOT promise "the same episode" — when this run's initial marker was refused while a prior episode is
+    //  completed, resolveEpisode correctly MINTS a NEW id next time; "re-run recovery" is the honest, non-over-promising phrasing.
     case "completed": return "completed — THIS episode is committed in the authoritative marker";
-    case "pending-commit": return "pending-commit — THIS episode NOT yet committed (work finalized; a re-run finalizes the same episode)";
-    case "pending-work": return "pending-work — THIS episode NOT yet committed (recovery work not finalized; a re-run continues the same episode)";
+    case "pending-commit": return "pending-commit — THIS episode NOT yet committed (work finalized; re-run recovery to finalize)";
+    case "pending-work": return "pending-work — THIS episode NOT yet committed (recovery work not finalized; re-run recovery)";
     case "unknown": return "unknown — the episode marker is unreadable; commit status CANNOT be confirmed (do not assume committed or not; a re-run resolves it)";
   }
+}
+
+/**
+ * The ACTUAL public-display adapter (FR-8-GATE, r11b). This is the ONE path the shell uses to render recovery status, so the caller
+ * cannot pass a mismatched identity: it takes the RUN'S `result` and derives the status against `result.episodeId` internally (a caller
+ * cannot substitute the on-disk marker's id — the r10/caller-regression the submission gate must catch). The marker + receipt are read
+ * through injected closures (no fs here — the shell wires the real readers, the selftest wires fakes), so the exact binding the shell
+ * uses is unit-testable. Returns the status, its display line, and the id of a stale on-disk marker belonging to a DIFFERENT episode
+ * (for the "not established here" note), or null when the on-disk marker is this run's own / absent / unreadable.
+ */
+export function deriveRecoveryDisplay(
+  result: { episodeId: string },
+  readEpisode: () => EpisodeRead,
+  readReceipt: () => { episodeId: string; final: boolean } | null,
+): { status: PublicRecoveryStatus; line: string; staleMarkerEpisodeId: string | null } {
+  const markerRead = readEpisode();
+  const status = publicRecoveryStatus(markerRead, readReceipt(), result.episodeId);
+  const staleMarkerEpisodeId = markerRead.kind === "present" && markerRead.ep.episodeId !== result.episodeId ? markerRead.ep.episodeId : null;
+  return { status, line: recoveryStatusLine(status), staleMarkerEpisodeId };
 }
 
 // ============================================================================================================

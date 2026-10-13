@@ -12,7 +12,7 @@ import path from "node:path";
 import {
   FLEET_SNAPSHOT_SCHEMA, scrubValueSecrets, parseDispatcherRecipe, parseFleetSnapshot, snapshotStaleSec,
   dispatcherNeedsRelaunch, dispatcherVerdict, memberVerdict, resolveMemberSid, resolveEpisode, buildBreakpointText,
-  grantedItemsForMember, deliveryDischarged, summarizeOutstanding, orchestrateRecover, classifyLaunchError, publicRecoveryStatus, recoveryStatusLine,
+  grantedItemsForMember, deliveryDischarged, summarizeOutstanding, orchestrateRecover, classifyLaunchError, publicRecoveryStatus, recoveryStatusLine, deriveRecoveryDisplay,
   type FleetSnapshot, type DispatcherRecipe, type RecoverDeps, type RecoveryEpisode, type EpisodeRead, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus, type DispatcherLiveness, type RecoveryResult, type LaunchOutcome,
 } from "./fleet-recovery.js";
 import {
@@ -163,6 +163,24 @@ try {
     // r11 wording: unknown must NOT be suffixed "not committed / re-run finalizes"; pending lines must say "NOT yet committed".
     t("FR-8 r11 wording: unknown says CANNOT be confirmed, NOT 'not committed'/'finalizes the same episode'", (() => { const l = recoveryStatusLine("unknown"); return /CANNOT be confirmed/i.test(l) && !/NOT yet committed/i.test(l) && !/finalizes the same episode/i.test(l); })());
     t("FR-8 r11 wording: pending-commit/pending-work DO say 'NOT yet committed'", /NOT yet committed/i.test(recoveryStatusLine("pending-commit")) && /NOT yet committed/i.test(recoveryStatusLine("pending-work")));
+  }
+  // FR-8-GATE (r12) — the LINK gate: pins that the CALLER binds to result.episodeId, not the on-disk marker's id (a pure-helper test with
+  // matching params would NOT catch the r10 caller-variant). A prior episode's COMPLETED marker + receipt sit on disk; THIS run's result
+  // carries a NEW id (its own initial marker write was refused ⇒ not on disk). deriveRecoveryDisplay — the ONE adapter the shell calls —
+  // is run over the SAME real store readers (readEpisode / readRecoveryReceipt). If the binding regressed to the marker's id, this FAILS.
+  {
+    const rcptReader = (hh: string) => () => { const rc = readRecoveryReceipt(hh); return rc && typeof rc.final === "boolean" && typeof rc.episodeId === "string" ? { episodeId: rc.episodeId as string, final: rc.final as boolean } : null; };
+    const h = freshHome();
+    writeEpisode(h, { episodeId: "ep-OLD", startedAtSec: 1, snapshotCapturedAtSec: 1, completed: true });            // a PRIOR episode committed
+    writeRecoveryReceipt(h, { episodeId: "ep-OLD", final: true, outstanding: [], members: [], reportDelivery: "skipped", notConfirmed: 0 });
+    const disp = deriveRecoveryDisplay({ episodeId: "ep-NEW" }, () => readEpisode(h), rcptReader(h));                 // THIS run's new episode, marker not on disk
+    t("FR-8-GATE: over the REAL read path, a stale OLD completed marker ⇒ pending-work (NOT completed) — caller bound to result.episodeId", disp.status === "pending-work" && disp.line.startsWith("pending-work"));
+    t("FR-8-GATE: the stale marker's foreign episode id is surfaced, not adopted as this run's", disp.staleMarkerEpisodeId === "ep-OLD");
+    const h2 = freshHome(); // positive control — this run's OWN completed marker ⇒ completed (the gate is not vacuously true)
+    writeEpisode(h2, { episodeId: "ep-NEW", startedAtSec: 1, snapshotCapturedAtSec: 1, completed: true });
+    writeRecoveryReceipt(h2, { episodeId: "ep-NEW", final: true, outstanding: [], members: [], reportDelivery: "skipped", notConfirmed: 0 });
+    const ok = deriveRecoveryDisplay({ episodeId: "ep-NEW" }, () => readEpisode(h2), rcptReader(h2));
+    t("FR-8-GATE: positive control — THIS run's own completed marker ⇒ completed", ok.status === "completed" && ok.staleMarkerEpisodeId === null);
   }
   // FR-8 r4: an 'unknown' launch outcome is recorded as unknown (not failed) ⇒ never a blind retry
   {

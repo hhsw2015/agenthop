@@ -27,7 +27,7 @@ import { herdrAgentName, herdrAgentStates, herdrLaunch, herdrServerReachable, he
 import { parseSnapshot, planResume, resumeCommandForMember, type RosterMember, type PeerLike } from "../packages/bus/src/swarm/resume.js";
 import {
   orchestrateRecover, snapshotStaleSec, breakpointInjectionEnabled, dispatcherNeedsRelaunch, classifyLaunchError,
-  publicRecoveryStatus, recoveryStatusLine,
+  deriveRecoveryDisplay,
   type RecoverDeps, type RecoveryResult, type DispatcherRecipe, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus, type LaunchOutcome,
 } from "../packages/bus/src/swarm/fleet-recovery.js";
 import {
@@ -211,12 +211,16 @@ async function main(): Promise<void> {
   //     this run). We re-read the marker + the receipt off disk and bind BOTH to result.episodeId, so the exact path a later reader/rerun
   //     would take is the one that produces the displayed verdict. ------------------------------------------------------------------------
   log(`receipt: ${result.outstanding.includes("receipt:unwritten") ? "UNWRITTEN (CP-3) — outstanding" : "written (work snapshot) -> console/fleet-recovery.json"}`);
-  const rc = readRecoveryReceipt(H);
-  const receiptBound = rc && typeof rc.final === "boolean" && typeof rc.episodeId === "string" ? { episodeId: rc.episodeId as string, final: rc.final as boolean } : null;
-  const markerRead = readEpisode(H);
-  const status = publicRecoveryStatus(markerRead, receiptBound, result.episodeId);
-  const staleMarkerNote = markerRead.kind === "present" && markerRead.ep.episodeId !== result.episodeId ? ` (on-disk marker belongs to a DIFFERENT episode ${markerRead.ep.episodeId}; this run's episode is not established there)` : "";
-  log(`status (authoritative = this episode's marker): ${recoveryStatusLine(status)}${staleMarkerNote}`);
+  // r11b (FR-8-GATE): the display adapter takes THIS run's `result` and binds the status to result.episodeId INTERNALLY — the caller
+  //   cannot pass a mismatched identity (the r10/caller-regression surface is gone), and the binding is covered by a submission gate that
+  //   runs this exact read path. The marker + receipt are read through the real store readers here.
+  const disp = deriveRecoveryDisplay(
+    result,
+    () => readEpisode(H),
+    () => { const rc = readRecoveryReceipt(H); return rc && typeof rc.final === "boolean" && typeof rc.episodeId === "string" ? { episodeId: rc.episodeId as string, final: rc.final as boolean } : null; },
+  );
+  const staleMarkerNote = disp.staleMarkerEpisodeId ? ` (on-disk marker belongs to a DIFFERENT episode ${disp.staleMarkerEpisodeId}; this run's episode is not established there)` : "";
+  log(`status (authoritative = this episode's marker): ${disp.line}${staleMarkerNote}`);
   const confirmed = result.members.filter((m) => m.verdict === "confirmed").length;
   log(`done: episode ${result.episodeId}; dispatcher ${result.dispatcher.verdict} (wake=${result.dispatcher.wakeStatus ?? "unknown"}); members ${confirmed}/${result.members.length} confirmed; report ${result.reportDelivery}; ${result.outstanding.length} outstanding.`);
   if (result.outstanding.length > 0) { log(`OUTSTANDING (re-run to retry): ${result.outstanding.join("; ")}`); process.exitCode = 1; }
