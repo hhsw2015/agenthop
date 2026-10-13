@@ -3,15 +3,16 @@
  * verification-ledger — the read-only cost-per-accepted-change projection (econ-mirror-21 candidate ③; coordinator-greenlit after
  * the eval 闭卷 @648aea8). Thin IO shell over the pure core (verification-ledger.ts) + the store (verification-ledger-store.ts).
  *
- * It reads the in-repo review RECORD (control-log accepted/rework) + the SEPARATE review-report-rounds view, renders a COST (not
- * ROI) report, and DRAFTS it to the coordinator inbox. It NEVER spends, acts, or writes to control-log / rulings — the only side
+ * It reads the in-repo review RECORD (control-log accepted/attempt/rejected) + the SEPARATE review-report-rounds view, renders a COST
+ * (not ROI) report, and DRAFTS it to the coordinator inbox. It NEVER spends, acts, or writes to control-log / rulings — the only side
  * effect is the durable coordinator draft (publishOnce-keyed by the report's content tag ⇒ a re-run dedups). SWARM_VERIFICATION_LEDGER
  * gates the auto/live path (opt-in OFF, dormant); a manual run works regardless and says so.
  *
  * Obligation model (账随实走): the exit code reflects UNMET obligations. A control-log that is unreadable, or a coordinator delivery
- * that is not confirmed, ⇒ exit 1 (nothing is silently dropped); --dry prints the report and never delivers (exit 0).
+ * that is not confirmed, ⇒ exit 1. --dry prints the report and never delivers (exit 0). VL-5: --days filters ONLY the review-report
+ * mtime window; the control-log is always the full current projection, and the report labels both ranges.
  *
- *   tsx scripts/verification-ledger.ts [--threshold N] [--since-last | --days N] [--coordinator <sid>] [--dry]
+ *   tsx scripts/verification-ledger.ts [--threshold N] [--days N] [--coordinator <sid>] [--dry]
  */
 import { homedir } from "node:os";
 import { writeInbox, composeInboxMsg } from "../packages/bus/src/inbox.js";
@@ -19,26 +20,32 @@ import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liv
 import {
   verificationLedgerEnabled, parseLedgerArgs, costPerAcceptedChange, summarizeLedger, renderLedgerReport, ledgerReportTag,
 } from "../packages/bus/src/swarm/verification-ledger.js";
-import { readAcceptedAndRework, readReviewRoundsDist } from "../packages/bus/src/swarm/verification-ledger-store.js";
+import { readLedgerInputs, readReviewRoundsDist } from "../packages/bus/src/swarm/verification-ledger-store.js";
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 function home(): string { return process.env.AH_HOME ?? homedir(); }
 
-const USAGE = `usage: verification-ledger [--threshold N] [--since-last | --days N] [--coordinator <sid>] [--dry]`;
+const USAGE = `usage: verification-ledger [--threshold N] [--days N] [--coordinator <sid>] [--dry]`;
 
 async function main(): Promise<number> {
-  const args = parseLedgerArgs(process.argv.slice(2), nowSec());
+  const ns = nowSec();
+  const args = parseLedgerArgs(process.argv.slice(2), ns);
   if (!args) { console.error(USAGE); return 2; }
   const H = home();
   if (!verificationLedgerEnabled()) console.log(`verification-ledger: SWARM_VERIFICATION_LEDGER off (dormant) — manual run, no auto path.`);
 
   // READ (FC-2 three-state, no writes).
-  const cl = readAcceptedAndRework(H);
+  const cl = readLedgerInputs(H);
   const rr = readReviewRoundsDist(H, args.sinceSec);
+  const reviewWindowDays = args.sinceSec != null ? Math.round((ns - args.sinceSec) / 86400) : null;
 
-  const rows = costPerAcceptedChange(cl.accepted, cl.rework);
-  const summary = summarizeLedger(rows, args.threshold);
-  const report = renderLedgerReport({ rows, summary, reviewRounds: rr.dist, sources: { controlLog: cl.status, reviewReports: rr.status }, threshold: args.threshold });
+  const cpac = costPerAcceptedChange(cl.inputs);
+  const summary = summarizeLedger(cpac, args.threshold);
+  const report = renderLedgerReport({
+    summary, reviewRounds: rr.dist,
+    sources: { controlLog: cl.status, reviewReports: rr.status, reviewReportsComplete: rr.complete },
+    reviewWindowDays, threshold: args.threshold,
+  });
   console.log(report);
 
   const outstanding: string[] = [];

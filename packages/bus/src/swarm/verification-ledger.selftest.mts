@@ -1,11 +1,14 @@
 #!/usr/bin/env tsx
 /**
- * verification-ledger selftest (econ-mirror-21 candidate ③). Covers the PURE core (arg parse, extraction, join, summary, flag,
- * render honesty, content tag), the STORE's FC-2 three-state over a REAL on-disk control-log, and the zero-bug 3-fixture law on
- * the PROJECTION WRITE-FACE (the only durable write is the content-tag-keyed coordinator draft):
- *   - crash-recovery        : a torn/corrupt control-log ⇒ unreadable ⇒ the report says so, never a fabricated "0 accepted".
- *   - restart-idempotency   : identical inputs ⇒ identical report ⇒ identical publishOnce tag ⇒ a re-run DEDUPS (no dup draft).
- *   - concurrency-race      : two reads of the same log are identical; distinct inputs ⇒ distinct tags (no cross-collision).
+ * verification-ledger selftest (econ-mirror-21 candidate ③, r2). Covers the PURE core (arg parse, extraction, the job-keyed +
+ * sequence-windowed join, summary, render honesty, content tag), the STORE's FC-2 three-state over a REAL on-disk control-log, and
+ * the zero-bug 3-fixture law on the PROJECTION WRITE-FACE. The r2 regressions target the five review findings:
+ *   VL-1 compound (jobId,nodeId) key — same nodeId in two jobs never merges; a "constructor" nodeId never pollutes; an unlinked
+ *        rejection is counted unresolved, never folded.
+ *   VL-2 sequence window — a rejection AFTER an acceptance belongs to a later revision's window, never the already-accepted change.
+ *   VL-3 unknown ≠ zero — a countersMissing change is excluded from the mean + first-try count; coverage is reported.
+ *   VL-4 partial review-rounds — complete:false renders as a LOWER BOUND, never a complete zero.
+ *   VL-5 --since-last retired — the parser rejects it; the report labels each source's range.
  */
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import os from "node:os";
@@ -17,14 +20,14 @@ import {
   verificationLedgerEnabled, parseLedgerArgs, extractLedgerInputs, costPerAcceptedChange, disproportionateRework,
   summarizeLedger, renderLedgerReport, ledgerReportTag,
 } from "./verification-ledger.js";
-import { readAcceptedAndRework, readReviewRoundsDist } from "./verification-ledger-store.js";
+import { readLedgerInputs, readReviewRoundsDist } from "./verification-ledger-store.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 const tmpHome = () => mkdtempSync(path.join(os.tmpdir(), "verif-ledger-"));
 const controlLogDir = (home: string) => path.join(home, ".agenthop", "swarm", "control-log");
 
-function mkAttempt(attemptId: string, nodeId: string): Change {
-  const attempt = { attemptId, nodeId, status: "running" } as unknown as TaskAttempt;
+function mkAttempt(attemptId: string, jobId: string, nodeId: string, createdAtSeq: number): Change {
+  const attempt = { attemptId, jobId, nodeId, createdAtSeq, status: "running" } as unknown as TaskAttempt;
   const key = entityKeyOf({ put: "attempt", attempt });
   return { put: "attempt", attempt, operationId: `${key}#1`, expectedEntityRevision: 0 };
 }
@@ -32,14 +35,16 @@ function seed(home: string, changes: Change[]): void {
   const r = commitControl(controlLogDir(home), initialLogState(), changes);
   if (!r.result.ok) throw new Error("seed commit rejected: " + JSON.stringify(r.result));
 }
-// Hand-made control-log entity BODIES (what liveEntities yields) — lets us cover the accepted/rejected paths without the strict
-// commit V2-V6 sequence (those paths are identical duck-typing to the attempt path the store fixture exercises on a REAL log).
-const acc = (acceptedResultId: string, nodeId: string, superseded = false) => ({ put: "accepted", accepted: { acceptedResultId, nodeId, jobId: "job-" + nodeId, attemptId: "att-" + nodeId, superseded } });
-const att = (nodeId: string) => ({ put: "attempt", attempt: { nodeId } });
-const rej = (nodeId: string) => ({ put: "rejected", rejected: { nodeId } });
+// Hand-made control-log entity BODIES (what liveEntities yields) — unit-tests the pure join/attribution (where the bugs were)
+// deterministically, without the strict commit V2-V6 accepted/rejected sequence. Fields mirror the real AcceptedResult/TaskAttempt/
+// RejectedResult shapes (jobId/nodeId/planRevision/decidedAtSeq/attemptId/createdAtSeq/atSeq).
+const acc = (acceptedResultId: string, jobId: string, nodeId: string, decidedAtSeq: number, o: { rev?: number; attemptId?: string; superseded?: boolean } = {}) =>
+  ({ put: "accepted", accepted: { acceptedResultId, jobId, nodeId, planRevision: o.rev ?? 1, decidedAtSeq, attemptId: o.attemptId ?? ("att-" + acceptedResultId), superseded: o.superseded ?? false } });
+const att = (attemptId: string, jobId: string, nodeId: string, createdAtSeq: number) => ({ put: "attempt", attempt: { attemptId, jobId, nodeId, createdAtSeq } });
+const rej = (attemptId: string, atSeq: number) => ({ put: "rejected", rejected: { attemptId, atSeq } });
 
 // =====================================================================================================================
-// PURE — flag + args
+// PURE — flag + args (VL-5)
 // =====================================================================================================================
 t("flag: default OFF (unset), OFF on 0/empty, ON on 1/true/yes/on", (() => {
   const off = !verificationLedgerEnabled({} as NodeJS.ProcessEnv) && !verificationLedgerEnabled({ SWARM_VERIFICATION_LEDGER: "0" } as NodeJS.ProcessEnv) && !verificationLedgerEnabled({ SWARM_VERIFICATION_LEDGER: "" } as NodeJS.ProcessEnv);
@@ -47,97 +52,142 @@ t("flag: default OFF (unset), OFF on 0/empty, ON on 1/true/yes/on", (() => {
   return off && on;
 })());
 t("args: defaults (threshold 3, sinceSec null, not dry)", (() => { const a = parseLedgerArgs([], 1000); return a !== null && a.threshold === 3 && a.sinceSec === null && a.dry === false; })());
-t("args: --threshold valid / invalid(0)⇒null / non-int⇒null", parseLedgerArgs(["--threshold", "5"], 1000)?.threshold === 5 && parseLedgerArgs(["--threshold", "0"], 1000) === null && parseLedgerArgs(["--threshold", "x"], 1000) === null);
+t("args: --threshold valid / 0⇒null / non-int⇒null", parseLedgerArgs(["--threshold", "5"], 1000)?.threshold === 5 && parseLedgerArgs(["--threshold", "0"], 1000) === null && parseLedgerArgs(["--threshold", "x"], 1000) === null);
 t("args: --days sets sinceSec from injected now (pure)", parseLedgerArgs(["--days", "1"], 100000)?.sinceSec === 100000 - 86400);
-t("args: --since-last ⇒ sinceSec null; --dry; --coordinator", (() => { const a = parseLedgerArgs(["--since-last", "--dry", "--coordinator", "sid-1"], 1000); return a !== null && a.sinceSec === null && a.dry === true && a.coordinator === "sid-1"; })());
+t("args VL-5: --since-last is RETIRED ⇒ rejected (null), not a silent full scan", parseLedgerArgs(["--since-last"], 1000) === null);
 t("args: unknown flag ⇒ null; --coordinator without value ⇒ null", parseLedgerArgs(["--nope"], 1000) === null && parseLedgerArgs(["--coordinator"], 1000) === null);
 
 // =====================================================================================================================
-// PURE — extraction / join / summary
+// PURE — extraction
 // =====================================================================================================================
 {
-  const bodies = [acc("a1", "n1"), att("n1"), rej("n1"), att("n1"), acc("a2", "n2"), att("n2"), acc("a3", "n3", true), att(""), rej(""), { put: "plan", plan: {} }];
-  const { accepted, rework } = extractLedgerInputs(bodies);
-  t("extract: 3 accepted (incl superseded), keyed", accepted.length === 3 && accepted.find((a) => a.nodeId === "n1")?.jobId === "job-n1");
-  t("extract: supersede flag read", accepted.find((a) => a.nodeId === "n3")?.superseded === true);
-  t("extract: rework counts by nodeId (n1: 2 att / 1 rej; n2: 1 att / 0 rej)", rework["n1"]!.attempts === 2 && rework["n1"]!.rejections === 1 && rework["n2"]!.attempts === 1 && rework["n2"]!.rejections === 0);
-  t("extract: empty-nodeId attempt/rejected skipped (never guessed)", rework[""] === undefined);
-
-  const rows = costPerAcceptedChange(accepted, rework);
-  t("join: reworkRounds = rejections (n1 ⇒ 1); attempts carried", rows.find((r) => r.nodeId === "n1")?.reworkRounds === 1 && rows.find((r) => r.nodeId === "n1")?.attempts === 2);
-  t("join: n3 has no counters ⇒ countersMissing TRUE, 0/0 (not 'cheap')", (() => { const r = rows.find((x) => x.nodeId === "n3")!; return r.countersMissing === true && r.reworkRounds === 0; })());
-
-  const sum = summarizeLedger(rows, 1);
-  t("summary: superseded (n3) EXCLUDED from live count (2, not 3)", sum.acceptedCount === 2);
-  t("summary: zeroReworkCount (n2) + countersMissingCount (0 live; n3 excluded)", sum.zeroReworkCount === 1 && sum.countersMissingCount === 0);
-  t("summary: flagged at threshold 1 = n1 (rework 1 ≥ 1); sorted desc", sum.flagged.length === 1 && sum.flagged[0]!.nodeId === "n1");
+  const inputs = extractLedgerInputs([acc("a1", "j", "n", 2), att("t1", "j", "n", 1), rej("t1", 5), { put: "plan", plan: {} }, acc("bad", "j", "", 3), att("bad", "j", "n", NaN)]);
+  t("extract: accepted/attempt/rejected pulled; required-field-missing skipped (empty nodeId, NaN seq)", inputs.accepted.length === 1 && inputs.attempts.length === 1 && inputs.rejections.length === 1 && inputs.accepted[0]!.jobId === "j" && inputs.accepted[0]!.decidedAtSeq === 2);
 }
-t("disproportionate: boundary is >= threshold", disproportionateRework({ nodeId: "x", jobId: "", acceptedResultId: "", attempts: 3, rejections: 3, reworkRounds: 3, superseded: false, countersMissing: false }, 3) === true && disproportionateRework({ nodeId: "x", jobId: "", acceptedResultId: "", attempts: 2, rejections: 2, reworkRounds: 2, superseded: false, countersMissing: false }, 3) === false);
 
 // =====================================================================================================================
-// PURE — render honesty (the discipline the eval itself passed)
+// VL-1 — compound (jobId,nodeId) key: same nodeId in two jobs must NOT merge
 // =====================================================================================================================
 {
-  const rows = costPerAcceptedChange([{ acceptedResultId: "a1", nodeId: "n1", jobId: "j1", attemptId: "t1", superseded: false }], { n1: { attempts: 4, rejections: 3 } });
-  const rpt = renderLedgerReport({ rows, summary: summarizeLedger(rows, 3), reviewRounds: { perTicket: [], totalTickets: 2, singlePass: 1, multiRound: 1, maxRounds: 4, medianRounds: 2 }, sources: { controlLog: "read", reviewReports: "read" }, threshold: 3 });
-  t("render: states it is a COST metric, NOT an ROI", /COST metric, NOT an ROI/i.test(rpt));
-  t("render: review-rounds labelled NOT keyed to acceptance (separate view)", /NOT keyed to acceptance/i.test(rpt));
-  t("render: $ omitted with an honest note (no fabricated join)", /\$ cost omitted/i.test(rpt) && /no nodeId link/i.test(rpt));
-  t("render: a flagged disproportionate change is listed", /disproportionate/i.test(rpt) && /node n1/.test(rpt));
-
-  const rptAbsent = renderLedgerReport({ rows: [], summary: summarizeLedger([], 3), reviewRounds: null, sources: { controlLog: "unreadable", reviewReports: "absent" }, threshold: 3 });
-  t("render: unreadable control-log ⇒ 'NOT reported as zero' (never a fabricated 0 accepted)", /control-log: unreadable/i.test(rptAbsent) && /NOT reported as zero/i.test(rptAbsent) && !/accepted changes: 0/.test(rptAbsent));
-  t("render: absent review-rounds ⇒ view unavailable, NOT zero", /review-report rounds: absent/i.test(rptAbsent) && /NOT reported as zero/i.test(rptAbsent));
+  const bodies = [
+    att("aA", "job-a", "build", 1), acc("accA", "job-a", "build", 2, { attemptId: "aA" }),                 // A: first-try, 0 rework
+    att("aB1", "job-b", "build", 3), rej("aB1", 4), att("aB2", "job-b", "build", 5), rej("aB2", 6),        // B: 3 rejects
+    att("aB3", "job-b", "build", 7), rej("aB3", 8), att("aB4", "job-b", "build", 9), acc("accB", "job-b", "build", 10, { attemptId: "aB4" }),
+  ];
+  const cpac = costPerAcceptedChange(extractLedgerInputs(bodies));
+  const A = cpac.rows.find((r) => r.jobId === "job-a")!; const B = cpac.rows.find((r) => r.jobId === "job-b")!;
+  t("VL-1: same nodeId 'build' in two jobs does NOT merge — A rework 0 / B rework 3 (not both 3)", A.reworkRounds === 0 && B.reworkRounds === 3);
+  t("VL-1: A stays first-try (1 attempt), not inflated by job-b's attempts", A.attempts === 1 && B.attempts === 4);
+  const sum = summarizeLedger(cpac, 1);
+  t("VL-1: total rework (known) = 3, not 6 (no cross-job double count)", sum.totalReworkKnown === 3);
+  t("VL-1: only B is disproportionate at threshold 1 (A not falsely flagged)", sum.flagged.length === 1 && sum.flagged[0]!.jobId === "job-b");
 }
-// content tag — the publishOnce key stem
-t("tag: 32 hex chars; stable for identical input; distinct for changed input", (() => { const a = ledgerReportTag("report-X"); const b = ledgerReportTag("report-X"); const c = ledgerReportTag("report-Y"); return /^[0-9a-f]{32}$/.test(a) && a === b && a !== c; })());
+// VL-1 prototype pollution: a nodeId named "constructor" must not hit Object.prototype (would make attempts NaN via a bare object).
+{
+  const cpac = costPerAcceptedChange(extractLedgerInputs([att("c1", "jx", "constructor", 1), acc("accC", "jx", "constructor", 2, { attemptId: "c1" })]));
+  const row = cpac.rows.find((r) => r.nodeId === "constructor")!;
+  t("VL-1: nodeId 'constructor' is Map-keyed ⇒ attempts is a finite number (not NaN from a prototype key)", Number.isFinite(row.attempts) && row.attempts === 1 && row.reworkRounds === 0);
+}
+// VL-1 unresolved rejection: a rejection whose attemptId has no attempt is counted unresolved, NEVER folded into a node.
+{
+  const cpac = costPerAcceptedChange(extractLedgerInputs([att("t1", "j", "n", 1), acc("a1", "j", "n", 2, { attemptId: "t1" }), rej("ghost", 5)]));
+  t("VL-1: a rejection with no linkable attempt ⇒ unresolvedRejections 1, not folded into node n", cpac.unresolvedRejections === 1 && cpac.rows.find((r) => r.nodeId === "n")!.reworkRounds === 0);
+}
+
+// =====================================================================================================================
+// VL-2 — sequence window: a rejection AFTER an acceptance belongs to a later revision, never the accepted change
+// =====================================================================================================================
+{
+  const base = [att("p1", "jp", "n", 1), acc("accP1", "jp", "n", 2, { attemptId: "p1", rev: 1 }),
+    att("p2", "jp", "n", 3), rej("p2", 4), att("p3", "jp", "n", 5), rej("p3", 6), att("p4", "jp", "n", 7), rej("p4", 8)];
+  const cpac1 = costPerAcceptedChange(extractLedgerInputs(base));
+  t("VL-2: rev1 accepted (seq2) ⇒ rework 0 — the 3 rejections at seq 4/6/8 are AFTER its acceptance, NOT its cost", cpac1.rows.find((r) => r.acceptedResultId === "accP1")!.reworkRounds === 0);
+  // add a rev2 acceptance at seq9 — NOW those 3 post-rev1 rejections fall in rev2's window (2,9)
+  const cpac2 = costPerAcceptedChange(extractLedgerInputs([...base, acc("accP2", "jp", "n", 9, { attemptId: "p4", rev: 2 })]));
+  t("VL-2: a later rev2 accept (seq9) carries the (2,9) window rework = 3; rev1 still 0 (no retro-rewrite)", cpac2.rows.find((r) => r.acceptedResultId === "accP2")!.reworkRounds === 3 && cpac2.rows.find((r) => r.acceptedResultId === "accP1")!.reworkRounds === 0);
+}
+
+// =====================================================================================================================
+// VL-3 — unknown ≠ zero: a countersMissing change is excluded from the mean + first-try count
+// =====================================================================================================================
+{
+  const known = [att("k1", "jk", "n", 1), rej("k1", 2), att("k2", "jk", "n", 3), rej("k2", 4), att("k3", "jk", "n", 5), rej("k3", 6), att("k4", "jk", "n", 7), acc("accK", "jk", "n", 8, { attemptId: "k4" })]; // rework 3
+  const missing = [acc("accM", "jm", "n", 2)]; // NO attempt for jm/n ⇒ countersMissing
+  const cpac = costPerAcceptedChange(extractLedgerInputs([...known, ...missing]));
+  const sum = summarizeLedger(cpac, 3);
+  t("VL-3: countersMissing flagged on the attempt-less accept", cpac.rows.find((r) => r.acceptedResultId === "accM")!.countersMissing === true && cpac.rows.find((r) => r.acceptedResultId === "accK")!.countersMissing === false);
+  t("VL-3: mean/first-try over KNOWN only (mean 3, not diluted to 1.5; first-try 0; coverage 1/2)", sum.meanReworkKnown === 3 && sum.zeroReworkKnown === 0 && sum.knownCount === 1 && sum.acceptedCount === 2 && sum.countersMissingCount === 1);
+  const allMissing = summarizeLedger(costPerAcceptedChange(extractLedgerInputs([acc("accM", "jm", "n", 2)])), 3);
+  t("VL-3: all-unknown ⇒ knownCount 0 + meanReworkKnown 0 (coverage shows 0 sample, not a false 'first-try')", allMissing.knownCount === 0 && allMissing.meanReworkKnown === 0 && allMissing.zeroReworkKnown === 0 && allMissing.acceptedCount === 1);
+}
+t("disproportionate: boundary is >= threshold", disproportionateRework({ jobId: "j", nodeId: "n", acceptedResultId: "", planRevision: 1, decidedAtSeq: 1, attempts: 3, reworkRounds: 3, superseded: false, countersMissing: false }, 3) === true && disproportionateRework({ jobId: "j", nodeId: "n", acceptedResultId: "", planRevision: 1, decidedAtSeq: 1, attempts: 2, reworkRounds: 2, superseded: false, countersMissing: false }, 3) === false);
+// superseded excluded from the live summary
+{
+  const cpac = costPerAcceptedChange(extractLedgerInputs([att("s1", "js", "n", 1), acc("accS", "js", "n", 2, { attemptId: "s1", superseded: true })]));
+  t("summary: superseded accept EXCLUDED from live count", summarizeLedger(cpac, 3).acceptedCount === 0);
+}
+
+// =====================================================================================================================
+// PURE — render honesty (incl VL-3 coverage, VL-4 partial, VL-5 ranges)
+// =====================================================================================================================
+{
+  const cpac = costPerAcceptedChange(extractLedgerInputs([att("k1", "jk", "n", 1), rej("k1", 2), att("k2", "jk", "n", 3), rej("k2", 4), att("k3", "jk", "n", 5), rej("k3", 6), att("k4", "jk", "n", 7), acc("accK", "jk", "n", 8, { attemptId: "k4" }), rej("ghost", 9)]));
+  const rpt = renderLedgerReport({ summary: summarizeLedger(cpac, 3), reviewRounds: { perTicket: [], totalTickets: 2, singlePass: 1, multiRound: 1, maxRounds: 4, medianRounds: 2 }, sources: { controlLog: "read", reviewReports: "read", reviewReportsComplete: true }, reviewWindowDays: 7, threshold: 3 });
+  t("render: COST not ROI; $ omitted (no (job,node) link); review NOT keyed to acceptance", /COST metric, NOT an ROI/i.test(rpt) && /\$ cost omitted/i.test(rpt) && /NOT keyed to acceptance/i.test(rpt));
+  t("render: mean is over the KNOWN sample with coverage; unresolved rejections surfaced", /known-cost sample: 1\/1/.test(rpt) && /mean rework \(known\)/.test(rpt) && /could not be linked to an attempt/i.test(rpt));
+  t("render VL-5: control-log labelled FULL current projection; review range labelled (last 7d)", /FULL current projection/i.test(rpt) && /last 7d/i.test(rpt));
+  t("render: a flagged disproportionate change lists job/node", /disproportionate/i.test(rpt) && /jk\/n/.test(rpt));
+
+  const partial = renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([])), 3), reviewRounds: { perTicket: [], totalTickets: 1, singlePass: 1, multiRound: 0, maxRounds: 1, medianRounds: 1 }, sources: { controlLog: "read", reviewReports: "read", reviewReportsComplete: false }, reviewWindowDays: null, threshold: 3 });
+  t("render VL-4: partial review-rounds (complete:false) ⇒ 'PARTIAL' / 'LOWER BOUND', never a complete zero", /PARTIAL/i.test(partial) && /LOWER BOUND/i.test(partial));
+
+  const absent = renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([])), 3), reviewRounds: null, sources: { controlLog: "unreadable", reviewReports: "absent", reviewReportsComplete: true }, reviewWindowDays: null, threshold: 3 });
+  t("render: unreadable control-log ⇒ 'NOT reported as zero'; absent review ⇒ unavailable", /control-log: unreadable/i.test(absent) && /NOT reported as zero/i.test(absent) && /review-report rounds: absent/i.test(absent));
+}
+t("tag: 32 hex; stable for identical TEXT; distinct for different TEXT", (() => { const a = ledgerReportTag("X"); return /^[0-9a-f]{32}$/.test(a) && a === ledgerReportTag("X") && a !== ledgerReportTag("Y"); })());
 
 // =====================================================================================================================
 // STORE — FC-2 three-state over a REAL on-disk control-log
 // =====================================================================================================================
 {
-  const h = tmpHome(); // no control-log dir yet
-  t("store: absent control-log dir ⇒ status 'absent', empty (not fabricated)", (() => { const r = readAcceptedAndRework(h); return r.status === "absent" && r.accepted.length === 0; })());
+  const h = tmpHome();
+  t("store: absent control-log dir ⇒ status 'absent', empty inputs (not fabricated)", (() => { const r = readLedgerInputs(h); return r.status === "absent" && r.inputs.accepted.length === 0 && r.inputs.attempts.length === 0; })());
 }
 {
   const h = tmpHome(); mkdirSync(controlLogDir(h), { recursive: true });
   writeFileSync(path.join(controlLogDir(h), "1.json"), "{ this is not json");
-  t("store[crash-recovery]: corrupt/torn log ⇒ status 'unreadable', empty (NEVER a fabricated empty)", (() => { const r = readAcceptedAndRework(h); return r.status === "unreadable" && r.accepted.length === 0 && Object.keys(r.rework).length === 0; })());
-  // the report over that unreadable source states it honestly — the projection write-face never claims a clean "0 accepted"
-  const rows = costPerAcceptedChange([], {});
-  const rpt = renderLedgerReport({ rows, summary: summarizeLedger(rows, 3), reviewRounds: null, sources: { controlLog: readAcceptedAndRework(h).status, reviewReports: "absent" }, threshold: 3 });
+  t("store[crash-recovery]: corrupt/torn log ⇒ status 'unreadable', empty (NEVER a fabricated empty)", (() => { const r = readLedgerInputs(h); return r.status === "unreadable" && r.inputs.attempts.length === 0; })());
+  const rpt = renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(readLedgerInputs(h).inputs), 3), reviewRounds: null, sources: { controlLog: readLedgerInputs(h).status, reviewReports: "absent", reviewReportsComplete: true }, reviewWindowDays: null, threshold: 3 });
   t("store[crash-recovery]: report over the unreadable log says 'cannot compute' (not zero)", /control-log: unreadable/i.test(rpt) && /cannot compute/i.test(rpt));
 }
 {
   const h = tmpHome();
-  seed(h, [mkAttempt("att-A", "nodeA"), mkAttempt("att-B", "nodeB"), mkAttempt("att-A2", "nodeA")]);
-  const r = readAcceptedAndRework(h);
-  t("store: real log ⇒ status 'read'; rework attempts tallied by nodeId (nodeA:2, nodeB:1)", r.status === "read" && r.rework["nodeA"]!.attempts === 2 && r.rework["nodeB"]!.attempts === 1);
+  seed(h, [mkAttempt("att-A", "job-a", "nodeA", 1), mkAttempt("att-B", "job-b", "nodeB", 2), mkAttempt("att-A2", "job-a", "nodeA", 3)]);
+  const r = readLedgerInputs(h);
+  t("store: real log ⇒ status 'read'; attempts extracted with job/node from a REAL commitControl replay", r.status === "read" && r.inputs.attempts.length === 3 && r.inputs.attempts.filter((a) => a.jobId === "job-a").length === 2);
 }
 {
-  const h = tmpHome(); // no ~/Work/review-reports under this temp home
+  const h = tmpHome();
   const rr = readReviewRoundsDist(h);
-  t("store: absent review-reports ⇒ dist null + status absent (NOT a zero-round dist)", rr.dist === null && rr.status === "absent");
+  t("store: absent review-reports ⇒ dist null + status absent + complete forwarded (NOT a zero-round dist)", rr.dist === null && rr.status === "absent" && typeof rr.complete === "boolean");
 }
 
 // =====================================================================================================================
-// 3-FIXTURE — restart-idempotency + concurrency-race (projection write-face)
+// 3-FIXTURE — projection write-face (titles narrowed to what they actually prove, per review)
 // =====================================================================================================================
 {
-  // restart-idempotency: identical inputs ⇒ identical report ⇒ identical publishOnce tag ⇒ a re-run DEDUPS.
-  const mk = () => { const rows = costPerAcceptedChange([{ acceptedResultId: "a1", nodeId: "n1", jobId: "j1", attemptId: "t1", superseded: false }], { n1: { attempts: 1, rejections: 0 } }); return renderLedgerReport({ rows, summary: summarizeLedger(rows, 3), reviewRounds: null, sources: { controlLog: "read", reviewReports: "absent" }, threshold: 3 }); };
-  t("fixture[restart-idempotency]: identical inputs ⇒ identical tag (re-run ⇒ publishOnce 'already', no dup draft)", ledgerReportTag(mk()) === ledgerReportTag(mk()));
+  // restart-idempotency: identical report TEXT ⇒ identical tag. (The REAL restart/publish safety is publishOnce in inbox.ts; this only
+  // proves the tag is a deterministic content hash so a re-run produces the SAME key ⇒ publishOnce dedups — not re-proven here.)
+  const mk = () => renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([att("t1", "j", "n", 1), acc("a1", "j", "n", 2, { attemptId: "t1" })])), 3), reviewRounds: null, sources: { controlLog: "read", reviewReports: "absent", reviewReportsComplete: true }, reviewWindowDays: null, threshold: 3 });
+  t("fixture[restart-idempotency]: identical inputs ⇒ identical report TEXT ⇒ identical tag (deterministic; dedup is publishOnce's job)", ledgerReportTag(mk()) === ledgerReportTag(mk()));
 }
 {
-  // concurrency-race: two independent reads of the SAME seeded log are identical (read is pure/idempotent); a changed input ⇒ a
-  // distinct tag (no cross-collision would make two different reports share a publishOnce key).
+  // concurrency-race: two independent reads of the SAME log are identical (read is pure/idempotent) ⇒ identical tag. (Not a real
+  // parallel-publish test — that safety is publishOnce's.)
   const h = tmpHome();
-  seed(h, [mkAttempt("att-C", "nodeC"), mkAttempt("att-D", "nodeD")]);
-  const r1 = readAcceptedAndRework(h); const r2 = readAcceptedAndRework(h);
-  const tag = (r: ReturnType<typeof readAcceptedAndRework>) => { const rows = costPerAcceptedChange(r.accepted, r.rework); return ledgerReportTag(renderLedgerReport({ rows, summary: summarizeLedger(rows, 3), reviewRounds: null, sources: { controlLog: r.status, reviewReports: "absent" }, threshold: 3 })); };
-  t("fixture[concurrency-race]: two reads of one log ⇒ identical rework + identical tag", JSON.stringify(r1.rework) === JSON.stringify(r2.rework) && tag(r1) === tag(r2));
-  const other = costPerAcceptedChange([{ acceptedResultId: "zz", nodeId: "nodeZ", jobId: "jZ", attemptId: "tZ", superseded: false }], {});
-  t("fixture[concurrency-race]: a DIFFERENT report ⇒ a DIFFERENT tag (no key collision)", tag(r1) !== ledgerReportTag(renderLedgerReport({ rows: other, summary: summarizeLedger(other, 3), reviewRounds: null, sources: { controlLog: "read", reviewReports: "absent" }, threshold: 3 })));
+  seed(h, [mkAttempt("att-C", "job-c", "nodeC", 1), mkAttempt("att-D", "job-d", "nodeD", 2)]);
+  const r1 = readLedgerInputs(h); const r2 = readLedgerInputs(h);
+  t("fixture[concurrency-race]: two reads of one log ⇒ identical inputs (deterministic read)", JSON.stringify(r1.inputs) === JSON.stringify(r2.inputs));
 }
 
 console.log("\nverification-ledger selftest: ALL PASS");
