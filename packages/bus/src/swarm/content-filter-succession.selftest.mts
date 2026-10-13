@@ -37,6 +37,7 @@ try {
 
   // ── reviewerIdOf (checklist attribution) ────────────────────────────────────────────────────────────────────────
   t("reviewerIdOf: title/member hex suffix extracted", reviewerIdOf(member) === "01a127b6" && reviewerIdOf({ member: "codex:Work-01a1208e", tool: "codex", cwd: "/x" }) === "01a1208e");
+  t("reviewerIdOf[F57-1 r2]: a BARE full UUID (no title) ⇒ FIRST 8 hex (repo short id), not the UUID's last group", reviewerIdOf({ member: "01a1208e-1234-4567-89ab-0123456789ab", tool: "codex", cwd: "/x" }) === "01a1208e");
   t("reviewerIdOf: no hex suffix ⇒ '' (⇒ absent checklist, never a false attribution)", reviewerIdOf({ member: "plain-name", tool: "claude", cwd: "/x", title: "coordinator" }) === "");
 
   // ── ④ handoff-letter generator (pure) ───────────────────────────────────────────────────────────────────────────
@@ -48,12 +49,19 @@ try {
     const s = buildHandoffLetter({ member, checklist: { items: [], status: "unreadable" }, stuckReason: "x", recoveredAtIso: "T" });
     return s.includes("不可自动获取") && s.includes("unreadable") && s.includes("手动核对") && !s.includes("无在判项");
   })());
-  t("buildHandoffLetter: genuinely empty (read, 0 items) ⇒ '无在判项' (distinct from unreadable)", buildHandoffLetter({ member, checklist: { items: [], status: "read" }, stuckReason: "x", recoveredAtIso: "T" }).includes("无在判项"));
+  t("buildHandoffLetter[F57-1 r2]: read + 0 matches ⇒ 'no attribution evidence, verify' — NEVER a confident 'no items'", (() => {
+    const s0 = buildHandoffLetter({ member, checklist: { items: [], status: "read" }, stuckReason: "x", recoveredAtIso: "T" });
+    return s0.includes("按归属未找到匹配项") && s0.includes("不证明无任务") && s0.includes("前任") && !s0.includes("无在判项");
+  })());
+  t("buildHandoffLetter[F57-2 r2]: content-filter framed as a HINT (疑似/线索,非确诊), NOT a confident 'cannot proceed' fact", (() => {
+    const s0 = buildHandoffLetter({ member, checklist: readCl, stuckReason: "pane %42", recoveredAtIso: "T" });
+    return s0.includes("疑似") && s0.includes("非确诊") && s0.includes("先核对") && !s0.includes("无法自行推进");
+  })());
 
   // ── ② succession-plan composer (suggestion text; readiness-probe injection) ──────────────────────────────────────
   t("buildSuccessionPlan: lists close/agent-start/inject/verify + readiness probe + suggestion-mode + R16", (() => {
     const p = buildSuccessionPlan({ member, paneRef: "%42", agentStartCmd: "codex resume 01a127b6", handoffLetter: "LETTER", severity: "normal", hits: 1, recoveredAtIso: "T" });
-    return p.text.includes("关旧 pane %42") && p.text.includes("codex resume 01a127b6") && p.text.includes("就绪探测") && p.text.includes("wait-output") && p.text.includes("建议模式") && p.text.includes("R16") && p.text.includes("LETTER") && p.taskRef === "f57-cf-succession:%42";
+    return p.text.includes("关旧 pane %42") && p.text.includes("codex resume 01a127b6") && p.text.includes("就绪探测") && p.text.includes("wait-output") && p.text.includes("建议模式") && p.text.includes("R16") && p.text.includes("LETTER") && p.taskRef === "f57-cf-succession:%42" && p.text.includes("0. 先核实") && p.text.includes("线索,非确诊") && p.text.includes("误判继任=杀活席");
   })());
   t("buildSuccessionPlan: urgent ⇒ ⚠URGENT prefix + urgent title", (() => {
     const p = buildSuccessionPlan({ member, paneRef: "%42", agentStartCmd: "c", handoffLetter: "L", severity: "urgent", hits: 2, recoveredAtIso: "T" });
@@ -67,6 +75,16 @@ try {
     const u = planContentFilterSuccession({ member, paneRef: "%1", agentStartCmd: "codex resume x", checklist: readCl, hitCount: 2, stuckReason: "x", recoveredAtIso: "T" });
     return n?.severity === "normal" && u?.severity === "urgent" && n.text.includes("codex resume x") && n.text.includes("fleet-recovery-8d091f3-review-01a127b6");
   })());
+
+  // ── F57-2 regression: a HINT-only screen (quote/history/mixed-with-approval) must NOT yield a confident "stuck" conclusion ──
+  {
+    // the detector is a HINT and fires on these (that is its F44-⑩ boundary); the PLAN must frame it as suspected + verify-first, and
+    // the letter must not state "cannot proceed" as fact — a false-positive succession kills a live seat.
+    const hintScreens = ["> quoting: This content can't be shown (from an old log)", "history: earlier 'content can't be shown' then recovered", "Approve? [y/N]  … content can't be shown …"];
+    t("F57-2 regression: hint-only screens still fire the HINT detector (its F44-⑩ boundary)", hintScreens.every((sc) => screenIndicatesContentFilter(sc)));
+    const p = planContentFilterSuccession({ member, paneRef: "%9", agentStartCmd: "codex resume 01a127b6", checklist: readCl, hitCount: 2, stuckReason: "pane %9", recoveredAtIso: "T" });
+    t("F57-2 regression: even at URGENT (2 hits) the plan says 线索非确诊 + verify-first, NEVER a confident 卡死 fact", p !== null && p.text.includes("线索,非确诊") && p.text.includes("0. 先核实") && !p.text.includes("检出平台内容过滤卡死"));
+  }
 
   // ── STORE: readInReviewChecklist FC-2 three-state ───────────────────────────────────────────────────────────────
   {

@@ -46,13 +46,17 @@ export type ReviewChecklist = { items: readonly string[]; status: "read" | "unre
 /** The roster fields the plan + letter need (subset of resume.ts RosterMember). */
 export type RosterLike = { member: string; tool: string; cwd: string; role?: string | null; title?: string };
 
-/** Best-effort reviewer short-id for a seat (to attribute review-report dirs, whose names end in `-<reviewerShortId>`): the last
- *  `-`/`:`-separated segment of the title or member handle that looks like a short hex id (≥4 hex chars). "" when none — the store
- *  then returns an ABSENT checklist (never a false empty). Pure. */
+/** Best-effort reviewer short-id for a seat (review-report dir names carry it, e.g. `…-review-<reviewerShortId>`). F57-1 (r2): a BARE
+ *  full UUID member (assembleRoster emits one when there is no stableId/title — resume.ts supports it) maps to the repo-consistent short
+ *  id = its FIRST 8 hex, NOT the UUID's last group. Otherwise the last `-`/`:` segment of the title/handle that looks like a short hex
+ *  id (≥4 hex). "" when none ⇒ the store returns an ABSENT checklist (never a false attribution). Pure. */
 export function reviewerIdOf(member: RosterLike): string {
-  const cand = (member.title ?? member.member ?? "").trim();
+  const m = (member.member ?? "").trim();
+  const uuid = /^([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.exec(m);
+  if (uuid) return uuid[1]!.toLowerCase();
+  const cand = (member.title ?? m).trim();
   const seg = cand.split(/[-:]/).filter(Boolean).pop() ?? "";
-  return /^[0-9a-f]{4,}$/i.test(seg) ? seg : "";
+  return /^[0-9a-f]{4,}$/i.test(seg) ? seg.toLowerCase() : "";
 }
 
 const indentBlock = (s: string, pad = "     "): string => s.split("\n").map((l) => pad + l).join("\n");
@@ -66,18 +70,21 @@ export function buildHandoffLetter(a: { member: RosterLike; checklist: ReviewChe
   const who = a.member.title ?? a.member.member;
   const L: string[] = [];
   L.push(`[交接信] 你是 ${who}(${a.member.tool})的继任壳,接管于 ${a.recoveredAtIso}。`);
-  L.push(`原因:前任在 ${a.stuckReason} 卡死(平台内容过滤),无法自行推进。`);
+  // F57-2 (r2): the screen anchor is a HINT, not a verdict (F44-⑩) — frame it as SUSPECTED + to-verify, never "cannot proceed" as fact.
+  L.push(`原因:前任屏上命中平台内容过滤锚点(线索,非确诊),疑似在 ${a.stuckReason} 卡死——接管前请先核对前任实际界面/当前任务/审批状态确认确为卡死。`);
   L.push(`角色:${a.member.role ?? "(未记)"};工作目录:${a.member.cwd}。`);
   if (a.checklist.status !== "read") {
-    L.push(`在判清单:不可自动获取(源 ${a.checklist.status})——请手动核对该席的审查队列后接续,勿假定为空。`);
-  } else if (a.checklist.items.length === 0) {
-    L.push(`在判清单:无在判项(或已清空)——按角色接续新来件。`);
-  } else {
+    L.push(`在判清单:不可自动获取(源 ${a.checklist.status})——请手动核对该席与前任的审查队列,勿假定为空。`);
+  } else if (a.checklist.items.length > 0) {
     L.push(`在判清单(${a.checklist.items.length} 项;逐项核对当前判卷状态,勿重判已签项):`);
     for (const it of a.checklist.items.slice(0, 20)) L.push(`  - ${it}`);
     if (a.checklist.items.length > 20) L.push(`  …(余 ${a.checklist.items.length - 20} 项见审查目录)`);
+  } else {
+    // F57-1 (r2): read + 0 matches does NOT prove an empty queue — best-effort name matching can miss (wrong short id, or the work is
+    // under the PREDECESSOR's id). Preserve uncertainty (the coordinator's hand-written letter did the same); never assert "no items".
+    L.push(`在判清单:按归属未找到匹配项——这不证明无任务(短 ID 可能不匹配,或在判项挂在前任目录下)。请手动核对该席与前任的审查队列后接续,勿假定为空。`);
   }
-  L.push(`第一步:核对上面每项的当前判卷状态,继续未完成的审查;恢复后向协调者 F53 证据式报到(bus-visible / inbox check-in,非 API 返回)。`);
+  L.push(`第一步:先核对前任是否确为内容过滤卡死(读实际界面,命中锚点仅线索),确认后再逐项核对上面的判卷状态、继续未完成的审查;恢复后向协调者 F53 证据式报到(bus-visible / inbox check-in,非 API 返回)。`);
   return L.join("\n");
 }
 
@@ -95,15 +102,19 @@ export function buildSuccessionPlan(a: {
   const who = a.member.title ?? a.member.member;
   const urgent = a.severity === "urgent";
   const L: string[] = [];
-  L.push(`${urgent ? "⚠URGENT " : ""}[F57 继任建议] ${who}(${a.member.tool})pane ${a.paneRef} 检出平台内容过滤卡死(连续 ${a.hits} 次命中${urgent ? ",已达升级阈" : ""})。建议模式:批准后一键执行;spawn 属 R16 邻域,绝不自动。`);
-  L.push(`继任预案(协调者批准后执行,本建议不自动执行任何一步):`);
-  L.push(`  1. 关旧 pane ${a.paneRef}:先确认前任确无在途未落盘写,再关。`);
+  // F57-2 (r2): the screen anchor is a HINT (F44-⑩ can't tell a live filter from a quote / scrollback / a filter string beside a live
+  // approval), so frame it as SUSPECTED and require a UI check BEFORE any close — a false-positive succession KILLS a live seat, which
+  // is costlier than a miss.
+  L.push(`${urgent ? "⚠URGENT " : ""}[F57 继任建议] ${who}(${a.member.tool})pane ${a.paneRef} 屏上命中平台内容过滤锚点(连续 ${a.hits} 次${urgent ? ",已达升级阈" : ""};线索,非确诊)。建议模式:批准后一键执行;spawn 属 R16 邻域,绝不自动。`);
+  L.push(`继任预案(协调者核实+批准后执行,本建议不自动执行任何一步):`);
+  L.push(`  0. 先核实:读前任实际界面 + 当前任务/审批状态,确认确为内容过滤卡死(屏上命中仅线索,可能是引用/历史/与当前审批同屏);未确认不要关 pane。误判继任=杀活席,比漏报贵。`);
+  L.push(`  1. 关旧 pane ${a.paneRef}:确认确为卡死且前任确无在途未落盘写,再关。`);
   L.push(`  2. 新 tab 起壳(agent start):${a.agentStartCmd}`);
   L.push(`  3. 注入交接信——先就绪探测再注入:读屏见输入框特征(或 herdr pane wait-output)确认 TUI 就绪后才 send-text;否则首注会被未就绪 TUI 静默吞掉(今晚第 5 例实证,同 F53「返回非证据」)。交接信:`);
   L.push(indentBlock(a.handoffLetter));
   L.push(`  4. 验证:继任壳重上总线 + F53 证据式报到(bus-visible / inbox check-in);unknown/failed ⇒ 重注或重做,不以 agent start 的返回为据。`);
-  L.push(`裁决:批准即按上执行;驳回则维持观察。`);
-  return { severity: a.severity, taskRef: `f57-cf-succession:${a.paneRef}`, title: urgent ? "content-filter stuck (URGENT)" : "content-filter stuck", text: L.join("\n") };
+  L.push(`裁决:核实确为卡死则批准执行;若命中实为引用/历史/仍可推进,则驳回维持观察。`);
+  return { severity: a.severity, taskRef: `f57-cf-succession:${a.paneRef}`, title: urgent ? "suspected content-filter (URGENT, verify)" : "suspected content-filter (verify)", text: L.join("\n") };
 }
 
 /** Compose a per-pane suggestion from a detection outcome. null ⇒ no hit (count 0 ⇒ none) ⇒ the sweep delivers nothing. The
