@@ -585,17 +585,19 @@ describe("writeInbox — idempotency key (durable-first credential, exactly-once
     expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("published");
   });
 
-  test("DWS-1-ADOPT r2: the live EEXIST->claim window — a losing claim renames the bad top-level into `.claim-*`, still NOT adopted", () => {
+  test("DWS-R3-1 (r6): a losing claim renames the bad top into `.claim-*` (top now ABSENT) ⇒ HOLD (pending), never adopted — a bad sibling does not prove the vanished top was garbage", () => {
     mkdirSync(dirOf("s1"), { recursive: true });
     mkdirSync(path.join(dirOf("s1"), "evt-k.json"), { recursive: true });  // top-level is a dir ⇒ linkSync EEXIST
-    // in the EEXIST->check window a real claimInbox runs: it renames the dir `evt-k.json` -> `evt-k.json.claim-<pid>` and returns 0
+    // in the EEXIST->check window a real claimInbox runs: it renames the dir `evt-k.json` -> `evt-k.json.claim-<pid>` ⇒ top now ABSENT
     __setPublishEexistHookForTest(() => { claimInbox(HOME, ["s1"], "pidX"); });
-    try { expect(() => writeInbox(HOME, "s1", digest("brief", 1), "evt-k")).toThrow(); } // claim name now present, content invalid ⇒ refuse
+    let threw = false; let res: string | undefined;
+    try { res = writeInbox(HOME, "s1", digest("brief", 1), "evt-k"); } catch { threw = true; }
     finally { __setPublishEexistHookForTest(undefined); }
-    expect(existsSync(cred("s1", "evt-k"))).toBe(false);                   // no false "published"
-    for (const n of readdirSync(dirOf("s1"))) if (n.startsWith("evt-k.json.claim-")) rmSync(path.join(dirOf("s1"), n), { recursive: true, force: true });
-    writeInbox(HOME, "s1", digest("brief", 2), "evt-k");                   // obstacle cleared ⇒ a retry recovers
-    expect(claimInbox(HOME, ["s1"], "p2").length).toBe(1);
+    // r6: the top is now ABSENT. A proven-invalid SIBLING claim does NOT prove the VANISHED top was garbage (it may have been a
+    // valid message that was normally processed) ⇒ UNKNOWN ⇒ HOLD, NOT refuse. Still never ADOPTED (result is "pending", not "already").
+    expect(threw).toBe(false);
+    expect(res).toBe("pending");
+    expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("pending");     // dedup obligation HELD; credential never adopted/published
   });
 
   test("DWS-R3-1: an UNKNOWN (unreadable) claim HOLDS the dedup obligation — pending credential kept, not rolled back to republishable", () => {
