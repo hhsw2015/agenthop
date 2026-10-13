@@ -300,43 +300,59 @@ function eventMessagePresent(dir: string, idempotencyKey: string): boolean {
   if (existsSync(path.join(dir, base))) return true;
   try { return readdirSync(dir).some((n) => n === base || n.startsWith(`${base}.claim-`)); } catch { return false; }
 }
-/** DWS-1-ADOPT: read a file ONLY if it is a readable REGULAR file, no-follow + FIFO-safe (never follow a symlink, never block on a
- *  FIFO). openSync O_RDONLY|O_NONBLOCK|O_NOFOLLOW + fstat-regular on the SAME fd + read. Returns the text, or null for ENOENT / a
- *  symlink / dir / fifo / unreadable file. */
-function readRegularFileNoFollow(fp: string): string | null {
+/** DWS-R3-1: THREE-state probe of one candidate path (no-follow + FIFO-safe). CRITICAL distinction for the dedup obligation:
+ *   "valid"   — a readable REGULAR file whose bytes parse as a valid InboxMsg.
+ *   "invalid" — PROVEN not a deliverable: a symlink (ELOOP), a dir/fifo/socket, bad JSON, or a failing-schema message.
+ *   "absent"  — ENOENT (not there / vanished between a readdir snapshot and this read).
+ *   "unknown" — a read fault (EACCES/EIO/...) we cannot resolve either way.
+ *  Proven-invalid may be refused + recovered; absent/unknown must NOT release a dedup obligation. */
+function probeCandidate(fp: string): "valid" | "invalid" | "absent" | "unknown" {
   let fd: number;
-  try { fd = openSync(fp, fsc.O_RDONLY | fsc.O_NONBLOCK | fsc.O_NOFOLLOW); } catch { return null; } // ENOENT / ELOOP (symlink) / EACCES
+  try { fd = openSync(fp, fsc.O_RDONLY | fsc.O_NONBLOCK | fsc.O_NOFOLLOW); }
+  catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return "absent";
+    if (code === "ELOOP") return "invalid"; // a symlink is PROVEN not a deliverable message
+    return "unknown";                        // EACCES / EIO / other ⇒ cannot verify
+  }
   try {
     const st = fstatSync(fd);
-    if (!st.isFile()) return null; // a dir / fifo / socket is not a deliverable message
+    if (!st.isFile()) return "invalid"; // dir / fifo / socket ⇒ PROVEN not a deliverable message
     const buf = Buffer.allocUnsafe(Number(st.size));
     let off = 0;
-    while (off < st.size) { const r = readSync(fd, buf, off, Number(st.size) - off, null); if (r === 0) break; off += r; }
-    return buf.toString("utf8", 0, off);
-  } catch { return null; } finally { closeSync(fd); }
+    try { while (off < st.size) { const r = readSync(fd, buf, off, Number(st.size) - off, null); if (r === 0) break; off += r; } }
+    catch { return "unknown"; } // a read fault mid-file ⇒ cannot verify
+    try { return validInboxMsg(JSON.parse(buf.toString("utf8", 0, off))) !== null ? "valid" : "invalid"; } // bad schema ⇒ PROVEN invalid
+    catch { return "invalid"; } // bad JSON ⇒ PROVEN not a valid message
+  } finally { closeSync(fd); }
 }
 
-/** DWS-1-ADOPT: is there a VALID deliverable message for this key — an unclaimed `<key>.json` that is a REGULAR file parsing as a
- *  valid InboxMsg, OR an in-flight `<key>.json.claim-*`? A bare NAME collision is NOT sufficient evidence of a delivered message
- *  (a dir / dangling symlink / bad-JSON / missing-field target is not deliverable, and must never be confirmed published). */
-function deliverableMessagePresent(dir: string, idempotencyKey: string): boolean {
+/** DWS-1-ADOPT + DWS-R3-1: three-state answer to "is there a deliverable message for this key?" over the unclaimed `<key>.json`
+ *  and any in-flight `<key>.json.claim-*` — each validated by CONTENT (a NAME is not proof). Returns:
+ *   "valid"   — adopt (a real deliverable / in-flight message is present).
+ *   "invalid" — every candidate is PROVEN non-deliverable (dir / dangling link / bad JSON / missing fields) ⇒ refuse + recover
+ *               after the obstacle clears.
+ *   "unknown" — a candidate was OBSERVED but then vanished (ENOENT after the readdir snapshot — e.g. claimed+acked in the window)
+ *               or was unreadable (read fault) ⇒ we CANNOT prove the event undelivered ⇒ the caller must HOLD the dedup
+ *               obligation (never release it to an auto-republishable state). */
+export function deliverableProbe(dir: string, idempotencyKey: string): "valid" | "invalid" | "unknown" {
   const base = `${idempotencyKey}.json`;
-  // An in-flight `<key>.json.claim-*` counts ONLY if the CLAIMED FILE itself is a readable regular file whose bytes parse as a valid
-  // InboxMsg (DWS-1-ADOPT r2): a claim NAME is NOT proof of a deliverable — a non-deliverable top-level target (dir / dangling
-  // symlink / bad-JSON / missing-field) that a LOSING claim renamed into `.claim-*` must NOT be adopted. Validate the claim's
-  // CONTENT with the SAME no-follow/FIFO-safe reader + schema check as the unclaimed path.
   let names: string[];
-  try { names = readdirSync(dir); } catch { return false; } // unreadable dir ⇒ cannot confirm a deliverable (keep the obligation)
+  try { names = readdirSync(dir); } catch { return "unknown"; } // unreadable dir ⇒ cannot confirm ⇒ HOLD
+  if (deliverableProbeHookForTest) { const h = deliverableProbeHookForTest; deliverableProbeHookForTest = undefined; try { h(); } catch { /* test seam */ } } // one-shot: lets a test vanish a just-listed claim BEFORE it is validated (DWS-R3-1 observed-then-consumed)
+  let unknown = false; // a listed claim that vanished/was unreadable before we could validate it ⇒ cannot prove un-delivered
   for (const n of names) {
     if (!n.startsWith(`${base}.claim-`)) continue;
-    const ct = readRegularFileNoFollow(path.join(dir, n));
-    if (ct === null) continue; // the claimed path is a dir / symlink / fifo / unreadable ⇒ not a deliverable claim
-    try { if (validInboxMsg(JSON.parse(ct)) !== null) return true; } catch { /* bad JSON ⇒ not a deliverable claim */ }
+    const s = probeCandidate(path.join(dir, n));
+    if (s === "valid") return "valid";
+    if (s === "absent" || s === "unknown") unknown = true; // observed-then-gone / unreadable ⇒ UNKNOWN, do not release the obligation
+    // s === "invalid" ⇒ a proven-bad claim ⇒ skip, keep scanning for a valid one
   }
-  // the unclaimed `<key>.json` must itself be a regular file parsing as a valid InboxMsg
-  const text = readRegularFileNoFollow(path.join(dir, base));
-  if (text === null) return false;
-  try { return validInboxMsg(JSON.parse(text)) !== null; } catch { return false; }
+  const top = probeCandidate(path.join(dir, base));
+  if (top === "valid") return "valid";
+  if (top === "unknown") unknown = true; // the unclaimed path is unreadable ⇒ cannot verify
+  // top === "absent" (gone, e.g. renamed into a claim) or "invalid" (proven bad) is not itself UNKNOWN
+  return unknown ? "unknown" : "invalid";
 }
 
 /** Test seam (one-shot): fires inside publishOnce AFTER a linkSync-EEXIST and BEFORE the deliverable check, so a regression can run
@@ -344,6 +360,11 @@ function deliverableMessagePresent(dir: string, idempotencyKey: string): boolean
  *  production. */
 let publishEexistHookForTest: (() => void) | undefined;
 export function __setPublishEexistHookForTest(fn: (() => void) | undefined): void { publishEexistHookForTest = fn; }
+
+/** Test seam (one-shot): fires inside deliverableProbe AFTER readdir and BEFORE the candidates are validated, so a regression can
+ *  vanish a just-listed claim (the DWS-R3-1 "observed then consumed/acked in the window" case). Unset in production. */
+let deliverableProbeHookForTest: (() => void) | undefined;
+export function __setDeliverableProbeHookForTest(fn: (() => void) | undefined): void { deliverableProbeHookForTest = fn; }
 
 /** `randHex` is injectable ONLY so a test can force a temp-name collision (ownership-boundary regression); production uses 64-bit
  *  randomBytes. */
@@ -409,8 +430,10 @@ export function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg
         // dir / dangling symlink / bad-JSON / missing-field target must NOT be confirmed published (a false credential would
         // permanently block retry).
         if (publishEexistHookForTest) { const h = publishEexistHookForTest; publishEexistHookForTest = undefined; try { h(); } catch { /* test seam */ } } // one-shot: lets a test run claimInbox in the EEXIST->check window (DWS-1-ADOPT regression)
-        if (deliverableMessagePresent(dir, idempotencyKey)) { writeCredState(cred, "published"); return "already"; }
-        try { unlinkSync(cred); } catch { /* best-effort rollback */ } // undecidable/invalid target ⇒ NO false "published"; recover after it clears
+        const probe = deliverableProbe(dir, idempotencyKey);
+        if (probe === "valid") { writeCredState(cred, "published"); return "already"; } // a real deliverable / in-flight message ⇒ adopt
+        if (probe === "unknown") return "pending"; // DWS-R3-1: a claim was OBSERVED then vanished/unreadable ⇒ cannot prove un-delivered ⇒ HOLD the dedup obligation (keep the pending credential, DO NOT roll back ⇒ no auto-republish); the existing pending-recovery resolves it on a later pass
+        try { unlinkSync(cred); } catch { /* best-effort rollback */ } // PROVEN-invalid target ⇒ NO false "published"; recover after it clears
         throw new Error(`publishOnce: ${msgFile} exists but is not a valid deliverable message — not adopting (retry after it clears)`);
       }
       try { unlinkSync(cred); } catch { /* best-effort rollback */ } // link fault ⇒ roll back the fresh claim + rethrow (caller retries)

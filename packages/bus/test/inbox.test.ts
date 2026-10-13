@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSyn
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, publishUniqueAtomic, publishOnce, __setPublishEexistHookForTest, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, publishUniqueAtomic, publishOnce, __setPublishEexistHookForTest, deliverableProbe, __setDeliverableProbeHookForTest, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
 import { deliverToCoordinator } from "../src/checkin.js";
 import type { SelfInfo } from "../src/label.js";
 
@@ -596,6 +596,31 @@ describe("writeInbox — idempotency key (durable-first credential, exactly-once
     for (const n of readdirSync(dirOf("s1"))) if (n.startsWith("evt-k.json.claim-")) rmSync(path.join(dirOf("s1"), n), { recursive: true, force: true });
     writeInbox(HOME, "s1", digest("brief", 2), "evt-k");                   // obstacle cleared ⇒ a retry recovers
     expect(claimInbox(HOME, ["s1"], "p2").length).toBe(1);
+  });
+
+  test("DWS-R3-1: an UNKNOWN (unreadable) claim HOLDS the dedup obligation — pending credential kept, not rolled back to republishable", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    mkdirSync(path.join(dirOf("s1"), "evt-k.json"), { recursive: true });  // top-level dir ⇒ EEXIST ⇒ the probe runs
+    const badClaim = path.join(dirOf("s1"), "evt-k.json.claim-1");
+    writeFileSync(badClaim, JSON.stringify(validInboxMsg(digest("x", 1))));
+    chmodSync(badClaim, 0o000);                                            // ...but UNREADABLE ⇒ probe is UNKNOWN (not proven invalid)
+    let readable = true; try { readFileSync(badClaim); } catch { readable = false; }
+    if (!readable) {
+      let threw = false;
+      try { writeInbox(HOME, "s1", digest("brief", 1), "evt-k"); } catch { threw = true; }
+      expect(threw).toBe(false);                                          // UNKNOWN ⇒ no throw (old r3 threw after rolling the credential back)
+      expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("pending");  // dedup obligation HELD — credential NOT rolled back to absent
+    }
+    chmodSync(badClaim, 0o600);                                           // restore for cleanup
+  });
+
+  test("DWS-R3-1: a claim OBSERVED in readdir then consumed before validation ⇒ deliverableProbe is UNKNOWN (not invalid)", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    const claim = path.join(dirOf("s1"), "evt-k.json.claim-7");
+    writeFileSync(claim, JSON.stringify(validInboxMsg(digest("inflight", 1)))); // a valid in-flight claim, listed by readdir
+    __setDeliverableProbeHookForTest(() => { rmSync(claim, { force: true }); });  // acked/removed in the window AFTER readdir, BEFORE validation
+    try { expect(deliverableProbe(dirOf("s1"), "evt-k")).toBe("unknown"); }       // observed-then-gone ⇒ UNKNOWN, never folded to "invalid"
+    finally { __setDeliverableProbeHookForTest(undefined); }
   });
 
   test("FC-7: a legacy keyless publication of the SAME notice is adopted, not duplicated by the new key", () => {
