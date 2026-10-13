@@ -5,7 +5,7 @@ import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import { composeDigest, digestProjection, digestEnabled, digestActions, digestTextFromProjection, type ProjState } from "../src/swarm/morning-digest.js";
 import { writeDigestProjection, writeDigestProjectionRaw, readDigestProjection, readNotifiedState, markNotified, gatherDigestSources, archiveLegacyMigration } from "../src/swarm/morning-digest-store.js";
-import { writeInbox, composeInboxMsg } from "../src/inbox.js";
+import { writeInbox, composeInboxMsg, validInboxMsg } from "../src/inbox.js";
 
 const validProj = (date: string): ProjState => ({ kind: "valid", date, projection: { schema: "morning-digest/v1", date, generatedAtSec: 0, sections: [] } });
 
@@ -345,7 +345,14 @@ describe("morning-digest — MDV2-6 three-category gate: delivery exactly-once (
   const CHILD = `import { writeInbox, composeInboxMsg } from "${inboxMod}"; const r = writeInbox(process.env.H, "coord", composeInboxMsg({ from: "d", fromLabel: "swarm-digest", text: "brief", via: "local", taskRef: "morning-digest" }), process.env.K); process.stdout.write(String(r));`;
   const pubChild = (): Promise<string> => new Promise((resolve, reject) => {
     const cp = spawn(tsx, ["-e", CHILD], { env: { ...process.env, H: HOME, K: idemTag } });
-    let out = ""; cp.stdout.on("data", (d) => { out += d; }); cp.on("error", reject); cp.on("close", () => resolve(out.trim()));
+    let out = "", err = "";
+    cp.stdout.on("data", (d) => { out += d; });
+    cp.stderr.on("data", (d) => { err += d; });
+    cp.on("error", reject);
+    cp.on("close", (code, signal) => {
+      if (code !== 0 || signal !== null) reject(new Error(`digest child failed: code=${code} signal=${signal} stdout=${JSON.stringify(out)} stderr=${JSON.stringify(err)}`));
+      else resolve(out.trim());
+    });
   });
 
   test("① dual-instance mutex / idempotency: two deliveries of the same date ⇒ exactly ONE card (O_EXCL credential)", () => {
@@ -366,12 +373,19 @@ describe("morning-digest — MDV2-6 three-category gate: delivery exactly-once (
   }, 20000);
 
   test("③ concurrency race: two processes publish the same date CONCURRENTLY ⇒ exactly ONE card (any interleaving)", async () => {
-    const [a, b] = await Promise.all([pubChild(), pubChild()]);
-    // The DURABLE invariant is "exactly one card" regardless of interleaving (O_EXCL credential) — asserted on the filesystem, not
-    // on the children's stdout (a fast-exiting subprocess can truncate its write). Both must return a confirmed/deferred status,
-    // never an unsafe duplicate-publish.
-    expect([a, b].every((r) => ["published", "already", "deferred", "pending"].includes(r))).toBe(true);
+    // Wait for BOTH children before propagating a failure, so afterEach cannot remove their home while a companion still writes.
+    const settled = await Promise.allSettled([pubChild(), pubChild()]);
+    const [a, b] = settled.map((result) => {
+      if (result.status === "rejected") throw result.reason;
+      return result.value;
+    });
+    // The durable invariant is exactly one card. A loser may read the winner's newly created credential before its pending bytes
+    // are written; WriteResult then returns "unknown" and retains the obligation. This is an allowed, unconfirmed outcome.
+    expect([a, b], "a fresh pair must contain a successful publisher").toEqual(expect.arrayContaining(["published"]));
+    for (const result of [a, b]) expect(["published", "already", "deferred", "pending", "unknown"]).toContain(result);
     expect(cards()).toBe(1);
+    const card = JSON.parse(readFileSync(path.join(HOME, ".agenthop", "inbox", "coord", `${idemTag}.json`), "utf8"));
+    expect(validInboxMsg(card)).toMatchObject({ from: "d", fromLabel: "swarm-digest", text: "brief", via: "local", taskRef: "morning-digest" });
   }, 20000);
 
   test("④ runDigest interruption-recovery: real digest sequence crashes after publish, before sent-flip; restart preserves frozen body, pending→sent, one card", () => {

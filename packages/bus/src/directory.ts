@@ -263,6 +263,9 @@ export function startDirectory(options: DirectoryOptions): Directory {
   // peers merge by (epoch, rev) — see mergePresence.
   const instanceEpoch = nextInstanceEpoch();
   let announceRev = 0;
+  // Only the latest failed announcement needs retry. Normal announcements keep
+  // their original concurrency; a stalled send must not block later updates.
+  let failedAnnounceRev: number | undefined;
 
   const remember = (peer: RemotePeer): void => {
     // Reading back ANY of our own announces at/after the grace-clock start confirms the keeper sees our
@@ -325,7 +328,9 @@ export function startDirectory(options: DirectoryOptions): Directory {
 
   async function announce(): Promise<void> {
     if (closed) return;
-    const entry: RemotePeer = { ...self, ts: Date.now(), epoch: instanceEpoch, rev: ++announceRev, statusText: capStatusText(self.statusText) };
+    const rev = ++announceRev;
+    failedAnnounceRev = undefined; // this newer request supersedes an older retry obligation
+    const entry: RemotePeer = { ...self, ts: Date.now(), epoch: instanceEpoch, rev, statusText: capStatusText(self.statusText) };
     // Register the watch BEFORE sending. The room stores the log entry and only then acks the POST, so
     // an independent GET can read our announce back before sendMessage resolves; setting the marker only
     // after the await would let that read miss it, and the marker would then time out on a healthy log.
@@ -340,6 +345,7 @@ export function startDirectory(options: DirectoryOptions): Directory {
     try {
       await sendMessage({ code: address, text: PRESENCE_PREFIX + sealEntry(team.nsKey, JSON.stringify(entry)), relay: options.relay, pass: options.pass });
     } catch (error) {
+      if (rev === announceRev) failedAnnounceRev = rev; // ignore obsolete failures
       if (pendingSelfTs === entry.ts) {
         pendingSelfTs = undefined; // send failed: nothing to watch for
         pendingSince = 0;
@@ -407,7 +413,15 @@ export function startDirectory(options: DirectoryOptions): Directory {
   }, ANNOUNCE_MS);
   beat.unref();
   // Read more often than we announce, so a new peer shows up within a few seconds, not a minute.
-  const poll = setInterval(() => void pull(), 5_000);
+  const poll = setInterval(() => {
+    if (failedAnnounceRev !== undefined) {
+      // Consume before starting: a slow retry cannot spawn another retry until
+      // a relevant failure restores the obligation. Success needs no mutation.
+      failedAnnounceRev = undefined;
+      void announce();
+    }
+    void pull();
+  }, 5_000);
   poll.unref();
 
   return {
