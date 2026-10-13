@@ -14,8 +14,8 @@ import { pathToFileURL } from "node:url";
 import path from "node:path";
 import { parseUnifiedDiff, scanFile, sameFamily, teethPrompt, renderChecklist, renderSubmissionSummary, type CallSite } from "../packages/bus/src/swarm/submit-precheck.js";
 
-function git(args: string[]): string {
-  try { return execFileSync("git", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }); }
+function git(args: string[], cwd?: string): string {
+  try { return execFileSync("git", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, cwd }); }
   catch (e) { throw new Error(`git ${args.join(" ")} failed: ${e instanceof Error ? e.message : e}`); }
 }
 
@@ -38,7 +38,9 @@ function main(): void {
   const abs = (f: string): string => path.join(repoRoot, f);
 
   let diff: string;
-  try { diff = git(["diff", mergeBase]); } // merge-base vs working tree: committed + uncommitted changes to TRACKED files
+  // SP-1: run git FROM THE REPO ROOT so diff + ls-files enumerate the WHOLE repo and emit repo-root-relative paths (run from a
+  // subdirectory, ls-files would otherwise emit cwd-relative names and only the subtree).
+  try { diff = git(["diff", mergeBase], repoRoot); } // merge-base vs working tree: committed + uncommitted changes to TRACKED files
   catch (e) { console.error(`submit-precheck: ${e instanceof Error ? e.message : e}`); process.exitCode = 2; return; }
 
   const files = parseUnifiedDiff(diff);
@@ -46,7 +48,7 @@ function main(): void {
   // Treat each untracked file as all-added (every line is new) so a fresh file's call sites are scanned too.
   let untracked: string[] = [];
   // -z ⇒ NUL-separated, RAW (unquoted) names: no trim (which would corrupt a leading-space name) and no C-quoting to decode (SP-1).
-  try { untracked = git(["ls-files", "--others", "--exclude-standard", "-z"]).split("\0").filter(Boolean); }
+  try { untracked = git(["ls-files", "--others", "--exclude-standard", "-z"], repoRoot).split("\0").filter(Boolean); }
   catch { /* best-effort: if this fails, we still have the tracked diff */ }
   for (const f of untracked) {
     if (files.some((d) => d.file === f)) continue;

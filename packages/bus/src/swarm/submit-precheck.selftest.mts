@@ -40,10 +40,18 @@ t("unquoteGitPath: C-quoted UTF-8 octal (中文)", unquoteGitPath('"\\344\\270\\
 t("unquoteGitPath: escaped double-quote", unquoteGitPath('"with\\"quote.ts"') === 'with"quote.ts');
 t("unquoteGitPath: escaped backslash", unquoteGitPath('"back\\\\slash.ts"') === "back\\slash.ts");
 t("unquoteGitPath: unquoted passes through (incl. a leading space)", unquoteGitPath("plain.ts") === "plain.ts" && unquoteGitPath(" leading.ts") === " leading.ts");
+t("unquoteGitPath: LITERAL Unicode + escaped quote (quotePath=false form) — no low-byte truncation", unquoteGitPath('"中文\\"note.ts"') === '中文"note.ts');
+t("unquoteGitPath: LITERAL Unicode + escaped backslash", unquoteGitPath('"文\\\\note.ts"') === "文\\note.ts");
+t("unquoteGitPath: LITERAL Unicode + escaped TAB", unquoteGitPath('"文\\tname.ts"') === "文\tname.ts");
 {
   const diff = ['+++ "b/\\344\\270\\255\\346\\226\\207.ts"', "@@ -0,0 +1,1 @@", "+writeFileSync(x, d)"].join("\n");
   const r = parseUnifiedDiff(diff);
   t("parseUnifiedDiff: decodes a C-quoted non-ASCII path (SP-1, else silently missed)", r.length === 1 && r[0]!.file === "中文.ts" && r[0]!.addedLines[0] === 1);
+}
+{
+  const diff = ["+++ b/with space.ts\t", "@@ -0,0 +1,1 @@", "+writeFileSync(x, d)"].join("\n"); // Git appends a TAB delimiter to an unquoted spaced path
+  const r = parseUnifiedDiff(diff);
+  t("parseUnifiedDiff: strips the Git header TAB on an unquoted spaced path (SP-1), preserving the space", r.length === 1 && r[0]!.file === "with space.ts");
 }
 
 // ── SP-2: the append REVIEW hint asks the real questions, not PIPE_BUF / temp+rename as regular-file append guarantees ──

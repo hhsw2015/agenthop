@@ -53,13 +53,20 @@ export function unquoteGitPath(p: string): string {
   const inner = p.slice(1, -1);
   const bytes: number[] = [];
   const simple: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
-  for (let i = 0; i < inner.length; i++) {
+  for (let i = 0; i < inner.length; ) {
     const c = inner[i]!;
-    if (c !== "\\") { bytes.push(c.charCodeAt(0) & 0xff); continue; }
-    const n = inner[i + 1];
-    if (n === undefined) { bytes.push(0x5c); break; }
-    if (n >= "0" && n <= "7") { const oct = (inner.slice(i + 1, i + 4).match(/^[0-7]{1,3}/) ?? [""])[0]; bytes.push(parseInt(oct, 8) & 0xff); i += oct.length; continue; }
-    bytes.push(simple[n] ?? (n.charCodeAt(0) & 0xff)); i += 1;
+    if (c === "\\") {
+      const n = inner[i + 1];
+      if (n === undefined) { bytes.push(0x5c); i += 1; break; }
+      if (n >= "0" && n <= "7") { const oct = (inner.slice(i + 1, i + 4).match(/^[0-7]{1,3}/) ?? [""])[0]; bytes.push(parseInt(oct, 8) & 0xff); i += 1 + oct.length; continue; }
+      bytes.push(simple[n] ?? (n.charCodeAt(0) & 0xff)); i += 2; continue;
+    }
+    // a LITERAL char (quotePath=false keeps literal Unicode even inside a C-quoted name): push its UTF-8 BYTES, not the low 8 bits
+    // of the UTF-16 unit (SP-1) — and consume a full code point so astral chars / surrogate pairs survive.
+    const cp = inner.codePointAt(i)!;
+    const ch = String.fromCodePoint(cp);
+    for (const b of Buffer.from(ch, "utf8")) bytes.push(b);
+    i += ch.length;
   }
   return Buffer.from(bytes).toString("utf8");
 }
@@ -72,7 +79,9 @@ export function parseUnifiedDiff(diff: string): DiffFile[] {
   let newLine = 0;
   for (const raw of diff.split("\n")) {
     if (raw.startsWith("+++ ")) {
-      const decoded = unquoteGitPath(raw.slice(4).replace(/\r$/, "")); // Git C-quotes non-ASCII/special names ⇒ decode losslessly (SP-1)
+      let tok = raw.slice(4).replace(/\r$/, "");
+      if (!tok.startsWith('"')) tok = tok.replace(/\t$/, ""); // Git appends a TAB delimiter to an UNQUOTED header path containing a space (SP-1); a name needing a literal TAB would be quoted
+      const decoded = unquoteGitPath(tok); // Git C-quotes non-ASCII/special names ⇒ decode losslessly (SP-1)
       file = decoded === "/dev/null" ? null : decoded.replace(/^b\//, "");
       if (file && !byFile.has(file)) byFile.set(file, []);
       continue;
