@@ -32,8 +32,11 @@ function child(mod: string, h: string, id: string, gates: string[] = [], action 
 }
 async function stage(h: string, id: string, n: string): Promise<Record<string, unknown>> {
   const file = path.join(h, `${id}.${n}.json`), end = Date.now() + 40000; // generous under a saturated parallel pool; the normal path resolves in ms
-  while (!existsSync(file)) { if (Date.now() > end) throw new Error(`stage timeout ${id}.${n}`); await new Promise((r) => setTimeout(r, 5)); }
-  return JSON.parse(readFileSync(file, "utf8"));
+  for (;;) {
+    if (existsSync(file)) { try { return JSON.parse(readFileSync(file, "utf8")); } catch { /* a mark mid-write (belt-and-suspenders; the child publishes atomically) ⇒ keep polling */ } }
+    if (Date.now() > end) throw new Error(`stage timeout ${id}.${n}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
 }
 const go = (h: string, id: string, n: string): void => writeFileSync(path.join(h, `${id}.${n}.go`), "");
 async function killHard(k: Kid): Promise<void> {

@@ -203,8 +203,19 @@ export function enqueueQueue(dir: string, record: unknown, seq: number, recordTe
       try { fd = openSync(tmp, "wx", 0o600); break; }                                  // own the inode, or EEXIST ⇒ a colliding name
       catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && attempt < 8) continue; return "failed"; } // never clobber a foreign temp ⇒ retry fresh; exhausted/other ⇒ retry later
     }
-    try { writeSync(fd, body); closeSync(fd); fd = undefined; renameSync(tmp, file); } // atomic publish of OUR complete inode (same-payload last-writer-wins is byte-identical; never torn)
-    catch { if (fd !== undefined) { try { closeSync(fd); } catch { /* */ } } try { unlinkSync(tmp); } catch { /* */ } return "failed"; } // clean ONLY our own temp
+    try {
+      // DO-R8-P1-1: writeSync may SHORT-write (store FEWER bytes than requested — a legal syscall outcome); a single call can publish a
+      // TRUNCATED record. Loop until every byte lands. Zero progress ⇒ fail (never spin a stuck fd). A mid-write throw propagates to the
+      // outer catch, which cleans OUR temp. (writeFileSync loops internally; the raw fd write we chose for O_EXCL must loop explicitly.)
+      const buf = Buffer.from(body, "utf8");
+      for (let off = 0; off < buf.length; ) {
+        const n = writeSync(fd, buf, off, buf.length - off);
+        if (n <= 0) throw new Error("zero-progress write"); // never advance on a 0-byte write
+        off += n;
+      }
+      closeSync(fd); fd = undefined; renameSync(tmp, file); // atomic publish of OUR complete inode (same-payload last-writer-wins is byte-identical; never torn)
+    }
+    catch { if (fd !== undefined) { try { closeSync(fd); } catch { /* */ } } try { unlinkSync(tmp); } catch { /* */ } return "failed"; } // clean ONLY our own temp; cred stays ⇒ retry obligation preserved
     return "enqueued";
   } catch { return "failed"; }
 }

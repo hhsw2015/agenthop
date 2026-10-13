@@ -15,13 +15,20 @@ import { syncBuiltinESMExports as syncESM } from "node:module";
 
 const [modulePath, root, role, gateList, action] = process.argv.slice(2) as [string, string, string, string, string];
 const site = { lockDir: path.join(root, "lock"), intentDir: path.join(root, "intents"), intentPrefix: "hold." };
-const realWrite = fs.writeFileSync, realReaddir = fs.readdirSync, realMkdir = fs.mkdirSync, realRm = fs.rmSync;
+const realWrite = fs.writeFileSync, realReaddir = fs.readdirSync, realMkdir = fs.mkdirSync, realRm = fs.rmSync, realRename = fs.renameSync;
 const gates = new Set((gateList ?? "").split(",").filter(Boolean));
 const seen = new Set<string>();
 const errors: { op: string; code?: string }[] = [];
 let reads = 0;
 
-const mark = (n: string, data: Record<string, unknown> = {}): void => { realWrite(path.join(root, `${role}.${n}.json`), JSON.stringify({ pid: process.pid, ...data })); };
+// Publish a mark ATOMICALLY (temp + rename) so the orchestrator's polling read sees either nothing or the COMPLETE JSON — never a
+// partial write (a non-atomic mark races the reader under a saturated parallel pool ⇒ "Unexpected end of JSON input").
+const mark = (n: string, data: Record<string, unknown> = {}): void => {
+  const f = path.join(root, `${role}.${n}.json`);
+  const t = `${f}.w-${Math.random().toString(36).slice(2)}`;
+  realWrite(t, JSON.stringify({ pid: process.pid, ...data }));
+  realRename(t, f);
+};
 function gate(n: string, data: Record<string, unknown> = {}): void {
   mark(n, data);
   if (!gates.has(n) || seen.has(n)) return;
