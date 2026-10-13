@@ -188,11 +188,16 @@ async function main(): Promise<void> {
       try { const msg = composeInboxMsg({ from: "fleet-recovery", fromLabel: "swarm-recover", text, via: "fleet-recovery", intent: result.notConfirmed > 0 ? "report" : "fyi" }); return writeInbox(H, coordSid, msg, `fr-report-${episodeId}`) as DeliveryStatus; }
       catch { return "failed"; }
     },
-    // FR-8: the durable receipt is part of the completion criteria — a refused write ⇒ orchestrateRecover adds it to outstanding (exit≠0).
-    writeReceipt: (result) => writeRecoveryReceipt(H, {
+    // FR-8 (r9): the durable receipt is part of the completion criteria — a refused write ⇒ orchestrateRecover adds it to outstanding
+    //   (exit≠0). TWO-PHASE: a "provisional" receipt lands final:false + an explicit finalization:pending obligation so a receipt-only read
+    //   can never mistake an unfinalized recovery for a clean completion; the "final" phase rewrites it final:true with the settled
+    //   outstanding. The episode marker (written last) remains the AUTHORITATIVE completion/rerun criterion.
+    writeReceipt: (result, phase) => writeRecoveryReceipt(H, {
       episodeId: result.episodeId, recoveredAtSec: nowSec(), snapshotCapturedAtSec: snap.capturedAtSec, staleSec: stale,
       dispatcher: result.dispatcher, members: result.members, reportDelivery: result.reportDelivery,
-      outstanding: result.outstanding, notConfirmed: result.notConfirmed,
+      final: phase === "final",
+      outstanding: phase === "final" ? result.outstanding : [...result.outstanding, "finalization:pending"],
+      notConfirmed: result.notConfirmed,
     }),
   };
 

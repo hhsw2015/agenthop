@@ -67,9 +67,9 @@ try {
   // ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
   // FR-8 via REAL orchestrateRecover (fakes): claim≠launch, report-with-real-results, receipt-in-completion
   // ════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-  type HOpts = Partial<{ episode: EpisodeRead; peersAfter: PeerLikeMin[]; claimReturns: boolean; launchOutcome: LaunchOutcome; disp: DispatcherLiveness; writeReceiptOk: boolean; writeEpisodeOk: boolean; failWriteEpisodeAfter: number; markLaunchingOk: boolean }>;
+  type HOpts = Partial<{ episode: EpisodeRead; peersAfter: PeerLikeMin[]; claimReturns: boolean; launchOutcome: LaunchOutcome; disp: DispatcherLiveness; writeReceiptOk: boolean; writeReceiptFailPhases: ("provisional" | "final")[]; writeEpisodeOk: boolean; failWriteEpisodeAfter: number; markLaunchingOk: boolean }>;
   function makeHarness(o: HOpts) {
-    const state = { episodeWrites: [] as RecoveryEpisode[], writeOrder: [] as string[], launches: [] as string[], launchings: [] as string[], outcomes: [] as { m: string; outcome: LaunchOutcome }[], reportArg: null as RecoveryResult | null, receiptArg: null as RecoveryResult | null };
+    const state = { episodeWrites: [] as RecoveryEpisode[], writeOrder: [] as string[], launches: [] as string[], launchings: [] as string[], outcomes: [] as { m: string; outcome: LaunchOutcome }[], reportArg: null as RecoveryResult | null, receiptArg: null as RecoveryResult | null, receipts: [] as { phase: "provisional" | "final"; result: RecoveryResult }[] };
     const deps: RecoverDeps = {
       now: () => 1000, mintEpisodeId: () => "ep-NEW", heartbeatThresholdSec: 120, breakpointsEnabled: true, recoveredAtIso: "T",
       readEpisode: () => o.episode ?? { kind: "absent" },
@@ -86,7 +86,7 @@ try {
       breakpointFacts: (sid) => ({ member: sid, grantedItems: [], liveAttempts: [], unreadInbox: 0 }),
       deliverBreakpoint: () => "published",
       deliverReport: (r) => { state.reportArg = r; return "published"; },
-      writeReceipt: (r) => { state.receiptArg = r; state.writeOrder.push("receipt"); return o.writeReceiptOk ?? true; },
+      writeReceipt: (r, phase) => { state.receiptArg = r; state.receipts.push({ phase, result: r }); state.writeOrder.push(`receipt:${phase}`); if (o.writeReceiptFailPhases?.includes(phase)) return false; return o.writeReceiptOk ?? true; },
     };
     return { deps, state };
   }
@@ -99,28 +99,47 @@ try {
     t("FR-8: deliverReport got the REAL result (notConfirmed>0), not a zeroed placeholder", h.state.reportArg !== null && h.state.reportArg.notConfirmed >= 2 && h.state.reportArg.outstanding.length >= 2);
     t("FR-8: final result not falsely 'all confirmed'", r.notConfirmed >= 2 && r.outstanding.some((o) => o.startsWith("dispatcher:")));
   }
-  // FR-8 receipt-in-completion: writeReceipt false ⇒ outstanding gains receipt:unwritten
+  // FR-8 (r9): TWO-PHASE receipt + marker-LAST. A refused receipt (both phases) ⇒ receipt:unwritten + receipt-final:unwritten; the final
+  // episode marker is completed=false (a re-run REUSES this episode, publishOnce-deduped ⇒ no dup breakpoint). The marker is the LAST write,
+  // AFTER both receipt phases — so a completed marker can never coexist with a provisional receipt.
   {
     const h = makeHarness({ peersAfter: [{ stableId: "m1", title: "Work-m1", tool: "claude", cwd: "/r1" }], writeReceiptOk: false });
     const r = await orchestrateRecover(goodSnap, roster, h.deps);
-    t("FR-8: receipt write refused ⇒ 'receipt:unwritten' outstanding", r.outstanding.includes("receipt:unwritten"));
-    // FR-8 (r7): receipt先行 — the receipt is written BEFORE the final episode marker, which gates completion on the receipt result. A
-    // receipt failure ⇒ the final episode write is completed=false ⇒ re-run REUSES this episode (no dup breakpoint). No compensation window.
-    t("FR-8 r7: receipt fail ⇒ final episode marker completed=false (re-run reuses, no dup breakpoint)", h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === false);
-    t("FR-8 r7: the receipt is written BEFORE the final episode marker (receipt先行)", (() => { const o = h.state.writeOrder; return o[o.length - 2] === "receipt" && o[o.length - 1] === "episode"; })());
+    t("FR-8 r9: provisional receipt refused ⇒ 'receipt:unwritten' outstanding", r.outstanding.includes("receipt:unwritten"));
+    t("FR-8 r9: final receipt refused ⇒ 'receipt-final:unwritten' outstanding", r.outstanding.includes("receipt-final:unwritten"));
+    t("FR-8 r9: receipt fail ⇒ final episode marker completed=false (re-run reuses, no dup breakpoint)", h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === false);
+    t("FR-8 r9: episode marker written LAST, after BOTH receipt phases (no completed-marker beside a provisional receipt)", (() => { const o = h.state.writeOrder; const le = o.lastIndexOf("episode"); const ip = o.indexOf("receipt:provisional"); const iff = o.indexOf("receipt:final"); return ip >= 0 && iff > ip && iff < le && le === o.length - 1; })());
   }
-  // FR-8 r5 seam3 + facet-3: the FINAL writeEpisode failing ⇒ 'episode-final:unwritten' outstanding AND the durable receipt (written
-  // AFTER the episode marker) reflects that settled outstanding — it can NEVER claim outstanding:[] while the marker is incomplete.
+  // FR-8 (r9) marker-LAST, seam3: the final episode marker write is refused ⇒ 'episode-final:unwritten' outstanding (exit≠0) and the marker
+  // on disk stays INCOMPLETE ⇒ resolveEpisode REUSES this episode on a re-run (publishOnce-deduped, no dup). The recovery WORK is honestly
+  // clean, so the FINAL receipt (written BEFORE the marker) is final:true — the authoritative "not committed" record is the incomplete
+  // marker, NOT a doctored receipt (the "equivalent authoritative-commit" the review allows). A receipt-only reader still never sees a false
+  // all-clear during an INTERRUPTED finalize because the PROVISIONAL phase carries final:false + finalization:pending (durable block below).
   {
     const h = makeHarness({ peersAfter: [{ stableId: "m1", title: "Work-m1", tool: "claude", cwd: "/r1" }], failWriteEpisodeAfter: 1 });
     const r = await orchestrateRecover(goodSnap, roster, h.deps);
-    t("FR-8 seam3: final writeEpisode false ⇒ 'episode-final:unwritten' outstanding (exit≠0)", r.outstanding.includes("episode-final:unwritten"));
-    // FR-8 (r8, RESTORED regression): the DURABLE receipt must carry the later obligation. receipt先行 writes a PROVISIONAL receipt first
-    // (so the marker gates on it ⇒ no dup-episode), then RE-WRITES the receipt with the settled outstanding on a marker refusal. r7 had
-    // dropped this — it left the published receipt at outstanding:[] (a false "all clear"); r4/r5 require "recoverable commit + unfinished
-    // semantics" to BOTH hold.
-    t("FR-8 r8: the DURABLE receipt carries episode-final:unwritten (not a false outstanding:[])", h.state.receiptArg !== null && h.state.receiptArg.outstanding.includes("episode-final:unwritten"));
-    t("FR-8 r8: the PROVISIONAL receipt was written BEFORE the final episode marker (gates completion ⇒ no dup-episode)", (() => { const o = h.state.writeOrder; const fe = o.lastIndexOf("episode"); return o.indexOf("receipt") >= 0 && o.indexOf("receipt") < fe; })());
+    t("FR-8 r9 seam3: final writeEpisode false ⇒ 'episode-final:unwritten' outstanding (exit≠0)", r.outstanding.includes("episode-final:unwritten"));
+    t("FR-8 r9: both receipt phases written BEFORE the (failed) final marker", (() => { const o = h.state.writeOrder; const le = o.lastIndexOf("episode"); return o.indexOf("receipt:provisional") < le && o.indexOf("receipt:final") < le && le === o.length - 1; })());
+    t("FR-8 r9: authoritative criterion = incomplete marker ⇒ resolveEpisode REUSES (no dup)", resolveEpisode({ kind: "present", ep: { episodeId: r.episodeId, startedAtSec: 1, snapshotCapturedAtSec: 1, completed: false } }, () => "ep-NEW").action === "reuse");
+  }
+  // FR-8 (r9) INTERRUPT-before-finalize: the provisional landed but the final write never committed (SIGKILL / refused final phase). The
+  // orchestrator must mark BOTH the final-receipt and the marker obligations outstanding, and the marker stays INCOMPLETE ⇒ safe re-run.
+  {
+    const h = makeHarness({ peersAfter: [{ stableId: "m1", title: "Work-m1", tool: "claude", cwd: "/r1" }], writeReceiptFailPhases: ["final"] });
+    const r = await orchestrateRecover(goodSnap, roster, h.deps);
+    t("FR-8 r9 interrupt: provisional OK + final refused ⇒ 'receipt-final:unwritten' outstanding, NOT 'receipt:unwritten'", r.outstanding.includes("receipt-final:unwritten") && !r.outstanding.includes("receipt:unwritten"));
+    t("FR-8 r9 interrupt: a provisional receipt WAS written (final:false phase) before the refused final", h.state.receipts.some((x) => x.phase === "provisional") && h.state.receipts.some((x) => x.phase === "final"));
+    t("FR-8 r9 interrupt: final episode marker completed=false (re-run reuses)", h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === false);
+  }
+  // FR-8 (r9) DURABLE phase semantics — the on-disk BYTES, not a comment, distinguish provisional from final (reviewer: 字节才是语义).
+  {
+    const dh = freshHome();
+    writeRecoveryReceipt(dh, { episodeId: "ep-x", final: false, outstanding: ["finalization:pending"], members: [], reportDelivery: "skipped", notConfirmed: 0 });
+    const prov = readRecoveryReceipt(dh)!;
+    t("FR-8 r9 durable: PROVISIONAL receipt is identifiable (final===false + finalization:pending ⇒ never a clean all-clear)", prov.final === false && (prov.outstanding as string[]).includes("finalization:pending"));
+    writeRecoveryReceipt(dh, { episodeId: "ep-x", final: true, outstanding: [], members: [], reportDelivery: "skipped", notConfirmed: 0 });
+    const fin = readRecoveryReceipt(dh)!;
+    t("FR-8 r9 durable: FINAL receipt clears to final===true + outstanding:[] (completion criterion = final && empty)", fin.final === true && (fin.outstanding as string[]).length === 0);
   }
   // FR-8 r4: an 'unknown' launch outcome is recorded as unknown (not failed) ⇒ never a blind retry
   {

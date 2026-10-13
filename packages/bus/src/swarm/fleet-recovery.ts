@@ -400,8 +400,11 @@ export interface RecoverDeps {
   deliverBreakpoint: (sid: string, text: string, episodeId: string) => DeliveryStatus;
   /** Deliver the coordinator report with the REAL result (FR-8: never a zeroed placeholder). "skipped" when no coordinator. */
   deliverReport: (result: RecoveryResult, episodeId: string) => DeliveryStatus;
-  /** FR-8: persist the durable receipt; its success is part of the completion criteria (a refused write ⇒ not completed, exit≠0). */
-  writeReceipt: (result: RecoveryResult) => boolean;
+  /** FR-8 (r9): persist the durable receipt in ONE of two phases. "provisional" MUST land a receipt that no reader can mistake for a
+   *  clean completion (the shell stamps `final:false` + an explicit `finalization:pending` obligation); "final" rewrites it clean/settled.
+   *  A refused write ⇒ outstanding (exit≠0). The receipt is a projection — the AUTHORITATIVE completion+rerun criterion is the episode
+   *  marker (resolveEpisode), written LAST; a receipt-only reader uses `final===true && outstanding===[]`. */
+  writeReceipt: (result: RecoveryResult, phase: "provisional" | "final") => boolean;
 }
 
 /**
@@ -470,22 +473,26 @@ export async function orchestrateRecover(snap: FleetSnapshot, roster: readonly R
   const folded = summarizeOutstanding(withReport);
   let result: RecoveryResult = { ...withReport, outstanding: folded.outstanding, notConfirmed: folded.notConfirmed };
 
-  // 5) FR-8 (r8): receipt先行 — write the receipt PROVISIONALLY first (with the recovery obligations known now), so the episode marker
-  //    (step 6) gates on its result ⇒ a completed marker never exists while the receipt is unsettled (closes the r6 dup-episode windows).
-  //    A refused provisional write is itself outstanding.
-  if (!deps.writeReceipt(result)) result = { ...result, outstanding: [...result.outstanding, "receipt:unwritten"] };
+  // 5) FR-8 (r9): TWO-PHASE durable receipt. PROVISIONAL first — the shell persists it with `final:false` + an explicit
+  //    `finalization:pending` obligation, so a receipt-only read can NEVER mistake an unfinalized recovery for a clean completion. (r8's
+  //    "PROVISIONALLY" lived only in a comment: the bytes on disk were outstanding:[] with no phase — a false all-clear if the run died
+  //    before finalizing. Comments are not semantics; bytes are.) A refused provisional write is itself outstanding.
+  if (!deps.writeReceipt(result, "provisional")) result = { ...result, outstanding: [...result.outstanding, "receipt:unwritten"] };
 
-  // 6) mark the episode COMPLETE only when NOTHING is outstanding (now INCLUDING the receipt result): completed=true ⟺ the receipt
-  //    durably succeeded + members/report clean. A refused final marker write (CP-3) is itself outstanding (exit≠0) and leaves the marker
-  //    incomplete so a re-run finishes it (same episode ⇒ no dup breakpoints).
+  // 6) FR-8 (r9): FINAL receipt — persisted with `final:true` + the settled outstanding. This is the receipt's COMMIT (provisional→final),
+  //    written UNCONDITIONALLY, not a best-effort compensation (another best-effort re-write would leave the same crash window). A refused
+  //    final write leaves the `final:false` provisional receipt on disk — identifiable as unfinished — and is itself outstanding.
+  if (!deps.writeReceipt(result, "final")) result = { ...result, outstanding: [...result.outstanding, "receipt-final:unwritten"] };
+
+  // 7) FR-8 (r9): the episode marker is the AUTHORITATIVE completion + rerun criterion, written LAST. completed=true ⟺ BOTH receipt phases
+  //    durably succeeded + members/report clean ⇒ a completed marker can never coexist with a provisional receipt. That ordering is load-
+  //    bearing: a rerun mints a NEW episode (fresh publishOnce key ⇒ a re-fired breakpoint) ONLY when completed===true, which now implies a
+  //    durable final receipt already on disk — so no dup. A refused/interrupted marker write leaves it incomplete ⇒ resolveEpisode REUSES
+  //    this episode (publishOnce-deduped, no dup) and the obligation is outstanding (exit≠0). After a marker failure the recovery WORK is
+  //    truly clean (the final receipt says so honestly); the authoritative "not committed" record is the incomplete marker, not a doctored
+  //    receipt — this is the "equivalent authoritative-commit" the review allows.
   if (!deps.writeEpisode({ episodeId, startedAtSec, snapshotCapturedAtSec: snap.capturedAtSec, completed: result.outstanding.length === 0 })) {
     result = { ...result, outstanding: [...result.outstanding, "episode-final:unwritten"] };
-    // 7) FR-8 (r8): receipt先行 does NOT mean dropping the LATER obligation. The final-marker refusal must enter the DURABLE receipt, not
-    //    only the return value — r7 left the published receipt at outstanding:[] (a false "all clear"), breaking the r4/r5 "recoverable
-    //    commit + unfinished-semantics" contract. Best-effort RE-WRITE the receipt with the settled outstanding (incl.
-    //    episode-final:unwritten). A refused re-write leaves the provisional receipt in place — the coordinator bars forcing an unwritable
-    //    path — and the return value / episode marker still carry the obligation, so a re-run finishes the same episode.
-    deps.writeReceipt(result);
   }
   return result;
 }
