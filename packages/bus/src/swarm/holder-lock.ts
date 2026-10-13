@@ -1,20 +1,32 @@
 /**
- * Holder-identity lock (shared primitive, DA2-R6). Extracted VERBATIM from the proven decision-batch consume lock
- * (R26 / DB-R7) so both the decision-batch store and the shared-budget pool hold one identity-in-the-filename lock instead of
- * two hand-rolled copies. A lock is a DIRECTORY (atomic mkdir) whose HOLDER IDENTITY is the NAME of the single file inside it
- * (`<pid>.<nonce>`). Identity-in-the-FILENAME makes reclaim structurally race-free (DB-R7): a dead — or this process's OWN
- * stranded — holder is reclaimed by removing its EXACT-named file, never a successor's. It also recovers OUR OWN leftover
- * credential after a faulted release (SB1): the retry finds a holder whose pid is ours and reclaims it, instead of mistaking
- * our still-alive pid for a live EXTERNAL holder and contending to timeout.
+ * Holder-identity lock (shared primitive, DA2-R6). Extracted from the proven decision-batch consume lock (R26 / DB-R7) so every
+ * consumer (decision-batch store, shared-budget pool, shell-succession, tg-queue drain) holds ONE identity-in-the-filename lock
+ * instead of hand-rolled copies. A lock is a DIRECTORY (atomic mkdir) whose HOLDER IDENTITY is the NAME of the single file inside
+ * it (`<pid>.<nonce>`). Identity-in-the-FILENAME makes reclaim structurally race-free (DB-R7): a dead — or this process's OWN
+ * stranded — holder is reclaimed by removing its EXACT-named file, never a successor's.
  *
- * The mkdir→publish step leaves the dir momentarily EMPTY, and an empty dir ALONE is indistinguishable from a LIVE in-flight
- * acquisition (which must NEVER be stolen). So every acquirer first writes a pre-mkdir HOLD-INTENT credential in the writable
- * parent while it is still writable — it SURVIVES even a compensation that itself faults (the parent/lock dir turning
- * unwritable mid-cleanup) and names the faulter's pid. An empty lock dir is then recoverable iff NO hold-intent of a LIVE
- * FOREIGN pid exists (a faulted holder's intent is dead/own ⇒ reclaim; a live holder's intent is alive ⇒ contend) — so a
- * faulted empty dir recovers on retry while a live in-flight one is never reclaimed.
+ * SHARED LOCK SEMANTICS (TGP-11 / SUCC-1 / FR6 convergence, coordinator-finalized 2026-10-12 — this is the single implementation
+ * all four consumers inherit; if this reclaim logic changes it must be FULLY re-reviewed, it does not ride an older CLEARED SHA):
  *
- * A `LockSite` names where the three artifacts live. The intentPrefix isolates one lock's hold-intents from any other lock that
+ *   The mkdir→publish step leaves the dir momentarily EMPTY, and an empty dir ALONE is indistinguishable from a LIVE in-flight
+ *   acquisition. So every acquirer first writes a pre-mkdir HOLD-INTENT credential in the writable parent — it names the acquirer's
+ *   pid and SURVIVES a compensation that itself faults. Because the intent is written BEFORE the mkdir, an empty dir with NO live
+ *   foreign intent provably has NO live acquirer on it.
+ *
+ *   (1) SOLE-OWNERSHIP VERIFY (②): a successful mkdir+publish is NOT proof of exclusivity — a concurrent reclaimer may have written
+ *       its token into our fresh dir during the mkdir→publish window. So `take()` re-reads and holds the lock ONLY if the dir holds
+ *       EXACTLY our token; otherwise it BACKS OFF (removes our token) and reports not-taken. No double-hold.
+ *   (2) EMPTY-DIR RECLAIM = rmdir-if-empty + fresh mkdir (NOT a pure adopt-into). The mkdir is ATOMIC, so several competing
+ *       acquirers resolve to EXACTLY ONE winner — a pure adopt-into with a hard live-intent gate would instead let two live adopters
+ *       mutually block forever (livelock). ② closes the ABA window the rmdir opens: if we rmdir a dir a live holder was mid-publishing,
+ *       our fresh mkdir + its late token-write land in the SAME dir and its OWN ② backs it off. Gated by the hold-intents: a read
+ *       fault ⇒ contend (EIO=unknown); a LIVE FOREIGN intent (anything not ESRCH-definitely-dead) ⇒ contend, never churn it (DB-R7 B).
+ *   (3) PUBLISHED-TOKEN RECLAIM (entries>=1, SUCC1-3): reclaim iff EVERY token is OUR OWN (same pid) or DEFINITELY DEAD (ESRCH only);
+ *       ANY live/unknown token ⇒ contend (never steal a live holder, never PARTIALLY delete). This keeps a DEAD MULTI-token residual
+ *       (two reclaimers whose ② back-off cleanup both faulted) INHERITABLE instead of permanently wedged.
+ *   (4) PROBES are ESRCH-only (`pidDefinitelyDead`): EPERM/invalid-pid/any-other error is NOT proof of death ⇒ contend, never steal.
+ *
+ * A `LockSite` names where the two artifacts live. The intentPrefix isolates one lock's hold-intents from any other lock that
  * shares the same intentDir (e.g. every budget pool's intents live together in the budgets dir).
  */
 import { mkdirSync, writeFileSync, readdirSync, unlinkSync, rmSync, rmdirSync } from "node:fs";
@@ -30,17 +42,10 @@ export interface LockSite {
   readonly intentPrefix: string;
 }
 
-/** MIGHT the process be alive? A successful probe or EPERM (exists, not ours) is alive. Used only to detect a LIVE foreign
- *  hold-intent in the empty-dir branch (where returning false just falls through to the own-stranded gate, which contends for any
- *  non-own dir) — it NEVER authorizes removing an external credential. An invalid pid is "not alive" here. */
-function pidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
-}
-/** DEFINITELY dead? Reclaiming an EXTERNAL published credential is authorized ONLY by a definite ESRCH (SB1 / DA2-R6). An
- *  invalid/out-of-range pid (process.kill throws ERR_OUT_OF_RANGE / ERR_INVALID_ARG_TYPE), EPERM (alive), or ANY other/unknown
- *  probe error is NOT proof of death ⇒ contend, never steal. A non-EPERM exception must not be read as "dead": that over-broad
- *  read would delete a live holder's credential whose pid merely probes to an unknown error (the unknown-external-holder boundary). */
+/** DEFINITELY dead? Reclaiming a published credential (own-pid aside) or adopting an empty dir is authorized ONLY by a definite
+ *  ESRCH (SB1 / DA2-R6). An invalid/out-of-range pid, EPERM (alive, not ours), or ANY other/unknown probe error is NOT proof of
+ *  death ⇒ contend, never steal. Treating an unknown probe as "dead" would delete a live holder whose pid merely probes to an
+ *  unknown error (the unknown-external-holder boundary; EIO=unknown=HOLD, per SUCC-1 / FR6). */
 function pidDefinitelyDead(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return false; } catch (e) { return (e as NodeJS.ErrnoException).code === "ESRCH"; }
@@ -54,33 +59,9 @@ function listHoldIntents(site: LockSite): { name: string; pid: number }[] {
   return readdirSync(site.intentDir).filter((n) => n.startsWith(site.intentPrefix)).map((n) => ({ name: n, pid: Number(n.slice(site.intentPrefix.length).split(".")[0]) }));
 }
 
-/** Lock DIRECTORIES THIS PROCESS created but could not publish into or drop on release — its OWN unfinished occupancy. Own-recovery
- *  is bound to THIS in-process fact, NOT to a same-pid hold-intent on disk: a prior COMPLETED call whose cleanup merely faulted
- *  leaves a stale own intent that is NOT current occupancy (DB-R7). No other process ever touches a foreign empty lock dir, so a dir
- *  we stranded stays ours alone to recover. Keyed by absolute lockDir path, so distinct sites never collide. */
-const strandedLockDirs = new Set<string>();
-
-/** Options for a single acquire. */
-export interface AcquireOpts {
-  /**
-   * SUCC-1 (opt-in; default OFF ⇒ existing callers byte-identical). Also reclaim an EXTERNAL empty lock dir that is PROVABLY
-   * stranded — EVERY foreign hold-intent is a CONFIRMED-DEAD (ESRCH) pid, at least one exists, and NONE is alive-or-unknown.
-   * Reclaim is single-winner + generation-atomic (SUCC1-1): the all-dead SCAN alone is NOT proof the dir is still the one we
-   * probed — a NORMAL release + fresh acquire can swap the generation between scan and write — so the reclaimer rmdirs the dir
-   * ONLY while it is still EMPTY (atomic empty-check; a published holder ⇒ ENOTEMPTY, an already-removed dir ⇒ ENOENT, both ⇒
-   * contend), then re-acquires via a fresh mkdir (single-winner CAS) and publishes under the SOLE-OCCUPANCY guard (publishSole:
-   * after the identity write it reads the dir back and holds ONLY if its token is the single entry — an interloper from a dir
-   * swapped in the mkdir→publish window shows up as a second entry and we back out). Two concurrent reclaimers cannot both win
-   * (the rmdir source is consumed once; the re-mkdir is single). A non-ESRCH probe (EPERM/EIO/unknown) never authorizes (SUCC1-2).
-   * Succession passes this so a crash-stranded `<sid>.adopt.lockd` is not un-adoptable forever; decision-batch (R26 out-of-band)
-   * + shared-budget do NOT.
-   */
-  reclaimExternalStranded?: boolean;
-}
-
-/** Acquire the lock for `site` in ONE attempt. Returns our identity token (`<pid>.<nonce>`) if held by us, else null (contended).
- *  A caller that needs to wait wraps this in a bounded retry loop. */
-export function acquireHolderLock(site: LockSite, opts: AcquireOpts = {}): string | null {
+/** Acquire the lock for `site` in ONE attempt. Returns our identity token (`<pid>.<nonce>`) if held by us (verified sole owner),
+ *  else null (contended). A caller that needs to wait wraps this in a bounded retry loop. */
+export function acquireHolderLock(site: LockSite): string | null {
   const dir = site.lockDir;
   const token = `${process.pid}.${randomBytes(6).toString("hex")}`;
   const mine = path.join(dir, token);
@@ -90,99 +71,59 @@ export function acquireHolderLock(site: LockSite, opts: AcquireOpts = {}): strin
   // window (⇒ they contend, never steal), and if we DIE mid-window it is the DEAD credential another process recovers us by.
   try { writeFileSync(intent, "", { flag: "wx", mode: 0o600 }); } catch { return null; } // cannot even stage ⇒ contended (rare)
   const dropIntent = () => { try { unlinkSync(intent); } catch { /* best-effort */ } };
-  // SUCC1-1 r4 (codex:Work): publish our identity, then prove SOLE OCCUPANCY (not a generation SAMPLE — r3's dev+ino+birth
-  // baseline was read AFTER mkdir, so a swap in the mkdir→firstStat window was already baked into the baseline; codex broke it).
-  // A NON-EMPTY lock dir can NEVER be rmdir'd (ENOTEMPTY is the exact OS guarantee the reclaim path relies on), so once our token
-  // is the dir's ONLY entry we hold it STABLY — no reclaimer can touch it thereafter. The read-back AFTER the write closes the
-  // whole mkdir→publish window with an INVARIANT, not a sample: if a reclaimer rmdir'd our empty dir and recreated+published into
-  // a new generation, our write lands in THAT dir alongside its token ⇒ readdir shows >1 entry (or not our token) ⇒ we remove our
-  // misplaced file and CONTEND; if the dir vanished entirely, the write already threw. Two LIVE sole-occupants of one dir are
-  // impossible: the dir can only transition {P1}→{P2} after P1's token is removed (P1 released or is dead), never while P1 holds.
-  // On a write IO fault it still records the dir as our own unfinished occupancy and THROWS (a same-process retry recovers it).
-  const publishSole = (): boolean => {
-    try { writeFileSync(mine, "", { mode: 0o600 }); } catch (e) { strandedLockDirs.add(dir); throw e; }
-    let sole = false;
-    try { const es = readdirSync(dir); sole = es.length === 1 && es[0] === token; } catch { sole = false; } // dir swapped/vanished ⇒ not sole
-    if (!sole) { try { rmSync(mine, { force: true }); } catch { /* best-effort */ } strandedLockDirs.add(dir); return false; } // an interloper shares the dir (or it is gone) ⇒ void our publish ⇒ contend
-    strandedLockDirs.delete(dir); return true;
-  };
-  // Win the atomic mkdir, then publish our identity INSIDE the lock and prove sole occupancy. If the publish faults, the empty
-  // dir we just made is OUR OWN unfinished occupancy ⇒ record it so a same-process retry recovers it.
+
+  // Win the atomic mkdir, publish our identity INSIDE the lock, then VERIFY SOLE OWNERSHIP (②). A successful mkdir+write is NOT
+  // proof of exclusivity: a concurrent reclaimer may have written its token into our fresh dir during the mkdir→publish window.
+  // Re-read — we hold it ONLY if the dir contains EXACTLY our token; otherwise BACK OFF (remove ours; a faulted remove becomes a
+  // residual the entries>=1 SUCC1-3 path clears later) and report not-taken. A publish/verify FS fault ⇒ back off (never claim held).
   const take = (): boolean => {
-    try { mkdirSync(dir); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; return false; } // held by someone
-    return publishSole();
+    try { mkdirSync(dir); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e; return false; } // dir already exists ⇒ not a fresh win
+    try { writeFileSync(mine, "", { mode: 0o600 }); } catch { try { rmSync(mine, { force: true }); } catch { /* */ } return false; } // publish faulted ⇒ back off (dir left empty ⇒ a retry's rmdir-if-empty reclaims)
+    let after: string[];
+    try { after = readdirSync(dir); } catch { try { rmSync(mine, { force: true }); } catch { /* residual ⇒ SUCC1-3 reclaims */ } return false; } // can't verify ⇒ back off
+    if (after.length !== 1 || after[0] !== token) { try { rmSync(mine, { force: true }); } catch { /* ditto */ } return false; } // ② not sole owner ⇒ back off (no double-hold)
+    return true;
   };
-  if (take()) return token; // won; identity published
+
+  if (take()) return token; // won the fresh mkdir + verified sole
   // Lock dir exists.
   let entries: string[]; try { entries = readdirSync(dir); } catch { dropIntent(); return null; } // vanished mid-check ⇒ contended
+
   if (entries.length >= 1) {
-    // One or more PUBLISHED identities. Reclaim by EXACT name iff EVERY token is OUR OWN residue (same pid -- a faulted
-    // release/backout of ours) or DEFINITELY dead (ESRCH only). A LIVE holder, an UNKNOWN pid (EPERM/EIO), or an invalid/garbage
-    // pid is PROTECTED -- a holder or an in-flight publisher may own the dir -- so we delete nothing and contend (SB1 preserved,
-    // no P1 reopen). SUCC1-3 (codex:Work): classifying ALL entries (not just a single one) lets a dead MULTI-token residue --
-    // left when two rejected publishSole backouts both failed their exact-name cleanup on a transient dir fault -- be recovered
-    // instead of being permanently un-adoptable; still single-winner (precise removes + non-recursive rmdir + a fresh mkdir).
-    let protectedEntry = false;
-    const removable: string[] = [];
-    for (const name of entries) {
-      const pid = Number(name.split(".")[0]);
-      if (Number.isInteger(pid) && pid > 0 && (pid === process.pid || pidDefinitelyDead(pid))) removable.push(name);
-      else protectedEntry = true; // live / unknown (EPERM/EIO) / invalid pid => protected, never deleted
-    }
-    if (protectedEntry || removable.length === 0) { dropIntent(); return null; } // a live/unknown identity may own the dir => contend
-    for (const name of removable) { try { rmSync(path.join(dir, name)); } catch { /* a peer reclaimed it first */ } } // remove each own/dead token by EXACT name
-    try { rmdirSync(dir); strandedLockDirs.delete(dir); } catch { strandedLockDirs.add(dir); } // dropped => stale own record void (DB-R7 B); could not drop => ours to recover (retry)
+    // Published token(s). SUCC1-3 reclaim: reclaim iff EVERY token is OUR OWN (same pid — a faulted release/② back-off of ours) or
+    // DEFINITELY DEAD (ESRCH). ANY live/unknown token ⇒ contend — never steal a live holder (DB-R7), never PARTIALLY delete (could
+    // drop a live holder or reopen double-hold). All-dead ⇒ clear every token by EXACT name, then take() fresh. (entries===1
+    // own/dead-reclaim is this same rule at n=1; the old entries>1 ⇒ unconditional-contend was the permanent-wedge gap.)
+    const toks = entries.map((h) => ({ name: h, pid: Number(h.split(".")[0]) }));
+    const allReclaimable = toks.every((e) => Number.isInteger(e.pid) && e.pid > 0 && (e.pid === process.pid || pidDefinitelyDead(e.pid)));
+    if (!allReclaimable) { dropIntent(); return null; } // a live/unknown holder ⇒ contend
+    for (const e of toks) { try { rmSync(path.join(dir, e.name)); } catch { /* a peer reclaimed it first; any leftover ⇒ take()'s mkdir EEXIST ⇒ retry next pass */ } }
+    try { rmdirSync(dir); } catch { /* not empty (a peer re-published) / raced ⇒ take() below contends cleanly */ }
     try { if (take()) return token; } catch (e) { throw e; }
-    dropIntent(); return null; // reclaim lost the re-acquire race => contended
+    dropIntent(); return null; // reclaim lost a race ⇒ contended
   }
-  if (entries.length === 0) {
-    // EMPTY lock dir. We recover it ONLY to continue OUR OWN unfinished occupancy, by ADOPTION (publish our identity straight INTO
-    // it — NO rmdir, so no remove→recreate gap a live holder could fall into). Any other empty dir ⇒ CONTEND:
-    //  (A) reading the hold-intents MUST succeed — a read fault cannot prove recoverability ⇒ contend (never fold to empty);
-    //  (B) a LIVE FOREIGN hold-intent ⇒ a holder is mid-publish/arriving ⇒ contend (never steal — DB-R7 occupancy protection);
-    //  (C) OUR OWN unfinished occupancy (this process stranded THIS dir, tracked in-process) ⇒ adopt.
-    // An EXTERNAL empty dir is adopted ONLY under the opt-in reclaimExternalStranded (SUCC-1, (D) below); otherwise a stale on-disk
-    // credential cannot prove the CURRENT dir is unoccupied (DB-R7 A/B — a dead intent may outlive the dir it named), so by default
-    // a crashed external holder's recovery is left out of band (R26) and external empty dirs are contended.
-    let others: { name: string; pid: number }[];
-    try { others = listHoldIntents(site).filter((i) => i.name !== intentName); } catch { dropIntent(); return null; }
-    if (others.some((i) => i.pid !== process.pid && pidAlive(i.pid))) { dropIntent(); return null; } // (B) live foreign ⇒ contend
-    const ownStranded = strandedLockDirs.has(dir);
-    // (D) SUCC-1 external-stranded reclaim: PROVABLY stranded = at least one foreign hold-intent AND every foreign intent is a
-    // CONFIRMED-DEAD (ESRCH) pid. A non-ESRCH probe (EPERM/EIO/unknown) leaves it NOT-all-dead ⇒ contend (SUCC1-2: unknown never
-    // authorizes). A concurrent live acquirer has a LIVE intent here ⇒ not-all-dead ⇒ both contend (single-winner, no ABA).
-    const externalStranded = !!opts.reclaimExternalStranded && others.length > 0 && others.every((i) => pidDefinitelyDead(i.pid));
-    if (!ownStranded && !externalStranded) { dropIntent(); return null; } // (C-neg) not our own, not provably-stranded ⇒ contend
-    if (externalStranded) {
-      // (D) SUCC1-1 (codex:Work): a stale all-dead scan is NOT proof the CURRENT dir is still the one we probed — a NORMAL
-      // release + fresh acquire can swap the lock dir's generation between our scan and our write, so a blind adopt-into would
-      // seat us on someone ELSE's new dir (two holders). Reclaim is therefore single-winner + generation-atomic: rmdir removes
-      // the dir ONLY while it is still EMPTY (a published holder ⇒ ENOTEMPTY ⇒ contend; already gone ⇒ ENOENT ⇒ contend),
-      // CONSUMING this exact empty dir; a fresh take() then re-mkdirs (single-winner CAS) and publishes under the SOLE-OCCUPANCY
-      // guard (publishSole). A dir released+recreated meanwhile is caught by rmdir (non-empty / vanished) or by the sole-occupancy
-      // read-back — never adopted blind. Two concurrent reclaimers cannot both win: the rmdir source is consumed once, re-mkdir is single.
-      try { rmdirSync(dir); } catch { dropIntent(); return null; }
-      let held = false; try { held = take(); } catch { dropIntent(); return null; } // write IO fault ⇒ contend (own-recovery recorded)
-      if (!held) { dropIntent(); return null; } // lost the re-acquire mkdir race / swapped under us ⇒ contend
-      for (const i of others) { if (i.pid === process.pid || pidDefinitelyDead(i.pid)) { try { unlinkSync(path.join(site.intentDir, i.name)); } catch { /* best-effort */ } } } // the dead/own intents we superseded
-      return token;
-    }
-    // (C) OUR OWN unfinished occupancy: adopt INTO our own empty dir, sole-occupancy-guarded (publishSole). No rmdir — this dir is
-    // ours alone (tracked in-process; no default-path peer reclaims a foreign empty dir), and the guard still catches a concurrent
-    // opt-in reclaimer that rmdir'd it under us (our write would then not be the sole entry).
-    let held = false; try { held = publishSole(); } catch { dropIntent(); return null; }
-    if (!held) { dropIntent(); return null; }
-    for (const i of others) { if (i.pid === process.pid) { try { unlinkSync(path.join(site.intentDir, i.name)); } catch { /* best-effort */ } } }
-    return token;
-  }
-  dropIntent(); return null; // defensive: entries is >=1 or ===0 above, both handled — unreachable, kept for the return type
+
+  // EMPTY lock dir: a holder crashed between mkdir and publish, OR a prior adopter backed off. Reclaim = rmdir-if-empty + fresh
+  // mkdir (take()), gated by the hold-intents:
+  //  (1) reading intents MUST succeed — a read fault cannot prove recoverability ⇒ contend (EIO=unknown, never fold to "none");
+  //  (2) a LIVE FOREIGN hold-intent (anything not ESRCH-definitely-dead) ⇒ a holder is arriving/mid-publish ⇒ contend (DB-R7 B);
+  //  (3) rmdir the empty dir — ENOTEMPTY (a token appeared since) or a race/vanish ⇒ contend — then take() fresh (atomic mkdir + ②).
+  let others: { name: string; pid: number }[];
+  try { others = listHoldIntents(site).filter((i) => i.name !== intentName); } catch { dropIntent(); return null; } // (1)
+  if (others.some((i) => i.pid !== process.pid && !(Number.isInteger(i.pid) && i.pid > 0 && pidDefinitelyDead(i.pid)))) { dropIntent(); return null; } // (2) any not-definitely-dead FOREIGN intent ⇒ contend
+  try { rmdirSync(dir); } catch { dropIntent(); return null; } // (3) non-empty / vanished / raced ⇒ contend
+  // gate (2) proved every FOREIGN intent ESRCH-dead ⇒ safe to clear our OWN + the dead-foreign intents (prevents an intent-dir leak),
+  // by EXACT name so a pid-reused live newcomer's DIFFERENT-named intent is never touched.
+  for (const i of others) { try { unlinkSync(path.join(site.intentDir, i.name)); } catch { /* best-effort */ } }
+  try { if (take()) return token; } catch (e) { throw e; } // fresh mkdir race + ② sole-verify
+  dropIntent(); return null;
 }
 
 /** Release: remove our identity file, drop the (now-empty) lock dir, then remove our hold-intent. NEVER throws. If the rmdir
- *  faults, the empty dir is OUR OWN unfinished occupancy ⇒ record it so a same-process retry recovers it (adopts it). */
+ *  faults (not empty — a reclaimer already re-published — or raced), a later acquire's rmdir-if-empty / SUCC1-3 reclaim handles it. */
 export function releaseHolderLock(site: LockSite, token: string): void {
   const dir = site.lockDir;
   try { rmSync(path.join(dir, token), { force: true }); } catch { /* best-effort */ }
-  try { rmdirSync(dir); strandedLockDirs.delete(dir); } catch { strandedLockDirs.add(dir); } // could not drop the empty dir ⇒ ours to recover
+  try { rmdirSync(dir); } catch { /* not empty / raced ⇒ a later acquire reclaims it */ }
   try { unlinkSync(holdIntentPath(site, token)); } catch { /* best-effort */ }
 }

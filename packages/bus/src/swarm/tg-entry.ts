@@ -2,6 +2,8 @@
 // projections and renders them for its medium, and parses the user's tap into a verdict the driver writes to the SINGLE
 // decision ledger (decision-batch). ZERO business logic: the allowed approval scopes come from the CORE (allowedScopes),
 // enforced there on the real item (NOT by the buttons); the digest comes from the CORE (morning-digest). No IO.
+import { createHash } from "node:crypto";
+import path from "node:path";
 import { allowedScopes, type DecisionItem, type Verdict, type ApprovalScope } from "./decision-batch.js";
 import type { DualBandwidthReading } from "./dual-bandwidth.js";
 import type { RoomPost } from "./chat-room.js";
@@ -87,4 +89,98 @@ export function parseUpdate(update: TgUpdate, allowlist: ReadonlySet<number>): P
   const cb = parseCallback(update.callbackData);
   if (!cb) return { kind: "ignore", reason: "malformed callback" };
   return { kind: "decision", ref: cb.ref, verdict: cb.verdict, ...(cb.scope ? { scope: cb.scope } : {}) };
+}
+
+// ------------------------------------------------------------------------------------------------------------------------
+// Outbound-request proxy selection + inbound immediacy receipts (TG bridge bring-up). Pure; the thin driver does the IO.
+// ------------------------------------------------------------------------------------------------------------------------
+
+/** Pick the proxy URL for an HTTPS request to `host` from standard env, or null for a DIRECT connection. `HTTPS_PROXY` (then
+ *  `HTTP_PROXY`) wins; `NO_PROXY` (an exact host, a `.suffix`/`suffix`, or `*`) forces direct; lowercase variants honored. No env
+ *  ⇒ null ⇒ the caller connects directly (ZERO behavior change vs today). Pure. */
+export function selectProxyUrl(env: Record<string, string | undefined>, host: string): string | null {
+  const h = host.toLowerCase();
+  for (const p of (env.NO_PROXY ?? env.no_proxy ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)) {
+    if (p === "*") return null;
+    const bare = p.replace(/^\./, "");
+    if (h === bare || h.endsWith(`.${bare}`)) return null;
+  }
+  const url = (env.HTTPS_PROXY ?? env.https_proxy ?? env.HTTP_PROXY ?? env.http_proxy ?? "").trim();
+  return url || null;
+}
+
+/** The immediate TG-side ACK text — a sub-second "read receipt" the bridge sends back to the user's chat ON RECEIVING an update,
+ *  before the coordinator processes it (conversation-level SLA). The final result rides the outbound path later. */
+export const TG_ACK_TEXT = "✅ 收到,正在处理…";
+
+/** The S11 decision receipt the bridge writes to the COORDINATOR inbox after a verdict is RECORDED, so the coordinator wakes
+ *  (writeInbox carries inbox-wake) in seconds instead of waiting for a cron, and the receipt is a durable audit trace. NOTIFY
+ *  ONLY — it never executes; the coordinator's re-injection chain still does the work. Pure (returns the message fields). */
+export function buildTgVerdictReceipt(batchId: string, itemId: string, verdict: Verdict, scope?: ApprovalScope): { text: string; taskRef: string; title: string } {
+  return { text: `[tg-verdict] 批 ${batchId} 项 ${itemId}: ${verdict}${scope ? ` (scope=${scope})` : ""}`, taskRef: "tg-verdict", title: "TG 决策回执" };
+}
+
+/** A clamped decision (the enforceScope output the ledger actually stores): a verdict, plus an approve scope. */
+export type ClampedDecision = { verdict: Verdict; scope?: ApprovalScope };
+
+/** A durable receipt OBLIGATION — captured the instant recordDecision returns "recorded", keyed by the TG update_id. Its very
+ *  EXISTENCE is the proof that THIS event recorded a decision (fact b: event identity/responsibility, TG-r5 TGP-4). The driver
+ *  enqueues it (tg-queue, seq=update_id) and drains it to the coordinator; a consumed/late/never-recorded tap gets NO obligation. */
+export type ReceiptObligation = { updateId: number; batchId: string; itemId: string; recordedValue: ClampedDecision };
+
+/** The action a drained obligation yields. */
+export type ReceiptAction = { action: "forward"; value: ClampedDecision } | { action: "retry" } | { action: "drop" };
+
+/** TGP-4 (TG-r5) — decide the receipt for a durable obligation, from TWO INDEPENDENT fact sources (never one read standing for
+ *  both): the obligation (event identity/responsibility — it exists ⇒ the event truly recorded) and the AUTHORITATIVE consumed
+ *  result of its batch (NOT the live orphan-inclusive fold). The obligation's own `recordedValue` is only the value for the
+ *  not-yet-sealed case; once sealed, the FINAL value comes from the consumed authority:
+ *   - authority unknown (sealed-but-unreadable) ⇒ RETRY (keep the obligation; never guess a value, never drop).
+ *   - not sealed ⇒ FORWARD the recorded value (what the coordinator will consume).
+ *   - sealed, the item is present in the authority ⇒ FORWARD that authoritative final value (orphan-fold is irrelevant).
+ *   - sealed, the item is ABSENT from the authority ⇒ this recorded tap is NOT in the consumed result (it was superseded — either
+ *     overwritten pre-seal by a full-snapshot write, which the consume surfaces as an UNDECIDED item, or published post-seal as an
+ *     ORPHAN, which the store re-batches via its own orphan signal). Either way THIS bridge owes no receipt for it ⇒ DROP (no stale
+ *     value; this is NOT a claim that an orphan notification was emitted — only that the bridge does not add one).
+ *  Pure. `itemValue` is the obligation item's decision in the digest-verified consumed projection, or null if absent. */
+export function obligationReceiptValue(
+  authority: { consumed: true; itemValue: ClampedDecision | null } | { consumed: false } | { consumed: "unknown" },
+  recordedValue: ClampedDecision,
+): ReceiptAction {
+  if (authority.consumed === "unknown") return { action: "retry" };
+  if (authority.consumed === false) return { action: "forward", value: recordedValue };
+  return authority.itemValue ? { action: "forward", value: authority.itemValue } : { action: "drop" };
+}
+
+/** The bridge's durable RECEIPT-OBLIGATION queue dir: a receipt owed to the coordinator for a recorded TG verdict, captured at
+ *  record time (keyed by update_id) and drained with the authoritative final value. Local to the bridge; survives restart. Pure. */
+export function tgReceiptObligationDir(home: string): string { return path.join(home, ".agenthop", "tg", "receipt-obligations"); }
+
+/** TGP-4 (TG-r6) EVENT IDENTITY stamped INTO the durable business commit: the bridge records a verdict with its decision `reason`
+ *  set to this tag, so the SAME atomic ledger write that commits the decision also carries which TG event (update_id) made it. On
+ *  recovery after an interruption (the obligation was lost to an enqueue IO-failure or a crash BEFORE it was captured), the driver
+ *  reads the AUTHORITATIVE consumed decision for the item and, iff its `reason` equals this tag, knows THIS event recorded the
+ *  final value — so it re-captures the obligation and the receipt is still delivered, EVENT-BOUND (not by value-equality, which
+ *  cannot prove identity). A verdict superseded by a later writer carries that writer's reason ⇒ no match ⇒ correctly no receipt.
+ *  Pure; globally unique per bot (a TG update_id is monotonic + unique per bot). */
+export function srcTag(updateId: number): string { return `tg:${updateId}`; }
+
+/** The S11 receipt for a NON-verdict allowlisted TG message — forwarded to the coordinator inbox (notify + inbox-wake) so the
+ *  user's free text is seen promptly. Notify only, never executed; the text is bounded. Pure. */
+export function buildTgMessageReceipt(chatId: number, text: string): { text: string; taskRef: string; title: string } {
+  const clipped = text.length > 500 ? `${text.slice(0, 500)}…` : text;
+  return { text: `[tg-message] chat ${chatId}: ${clipped}`, taskRef: "tg-message", title: "TG 消息" };
+}
+
+/** A stable, writeInbox-contract-compliant idempotency key for a forwarded TG event (a verdict per batch+item, a message per
+ *  update_id). writeInbox's dedup key must match `^[A-Za-z0-9._-]{1,120}$` (else it falls to the non-deduped random-name path —
+ *  TGP-3), so any unsafe char in a part is folded to `_` and the whole is clipped to 120. Same event ⇒ same key (replay dedups);
+ *  distinct events ⇒ distinct keys. Pure. */
+export function tgIdempotencyKey(prefix: string, ...parts: Array<string | number>): string {
+  // LOSSLESS identity (TGP-3b): the parts are sha256-hashed (NUL-joined), so distinct identities never collide and a long/`/`-bearing
+  // id is never lost to truncation or char-folding — unlike a raw replace/slice. A readable prefix aids debugging. Contract-safe
+  // (`^[A-Za-z0-9._-]{1,120}$`): prefix(≤24) + "." + 40 hex.
+  const p = prefix.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 24);
+  const hash = createHash("sha256").update(parts.map(String).join("\u0000")).digest("hex").slice(0, 40);
+  return `${p}.${hash}`;
 }

@@ -1,6 +1,6 @@
 // Selftest for the TG entry pure core (render/parse, ref-based) + the shared CORE decision rules (allowedScopes /
 // enforceScope / upsertDecision) + the digest. Run: node --import tsx packages/bus/src/swarm/tg-entry.selftest.mts
-import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, type TgUpdate } from "./tg-entry.js";
+import { renderProjection, parseUpdate, encodeDecisionCb, parseCallback, selectProxyUrl, buildTgVerdictReceipt, buildTgMessageReceipt, obligationReceiptValue, tgReceiptObligationDir, srcTag, tgIdempotencyKey, TG_ACK_TEXT, type TgUpdate } from "./tg-entry.js";
 import { allowedScopes, enforceScope, upsertDecision, validDecision, type DecisionItem, type DecisionsDoc } from "./decision-batch.js";
 import { composeDigest } from "./morning-digest.js";
 import type { DualBandwidthReading } from "./dual-bandwidth.js";
@@ -91,6 +91,64 @@ const hard: DecisionItem = { id: "n2", kind: "spend", summary: "pay $40 invoice"
 // --- the enforced decision still validates at the ledger boundary ---
 {
   t("enforced hard-gate decision is a legal ledger Decision", validDecision(enforceScope(hard, { id: "n2", verdict: "approve", scope: "always" })) !== null);
+}
+
+// --- proxy selection (pure; TG bridge bring-up) ---
+{
+  t("no env -> direct (null)", selectProxyUrl({}, "api.telegram.org") === null);
+  t("HTTPS_PROXY picked", selectProxyUrl({ HTTPS_PROXY: "http://127.0.0.1:10808" }, "api.telegram.org") === "http://127.0.0.1:10808");
+  t("lowercase https_proxy picked", selectProxyUrl({ https_proxy: "http://p:1" }, "x.y") === "http://p:1");
+  t("HTTP_PROXY fallback", selectProxyUrl({ HTTP_PROXY: "http://p:2" }, "x.y") === "http://p:2");
+  t("HTTPS_PROXY wins over HTTP_PROXY", selectProxyUrl({ HTTPS_PROXY: "http://a:1", HTTP_PROXY: "http://b:2" }, "x.y") === "http://a:1");
+  t("NO_PROXY exact host -> direct", selectProxyUrl({ HTTPS_PROXY: "http://p:1", NO_PROXY: "api.telegram.org" }, "api.telegram.org") === null);
+  t("NO_PROXY .suffix -> direct", selectProxyUrl({ HTTPS_PROXY: "http://p:1", NO_PROXY: ".telegram.org" }, "api.telegram.org") === null);
+  t("NO_PROXY bare suffix -> direct", selectProxyUrl({ HTTPS_PROXY: "http://p:1", NO_PROXY: "telegram.org" }, "api.telegram.org") === null);
+  t("NO_PROXY * -> direct", selectProxyUrl({ HTTPS_PROXY: "http://p:1", NO_PROXY: "*" }, "x.y") === null);
+  t("NO_PROXY non-match -> proxied", selectProxyUrl({ HTTPS_PROXY: "http://p:1", NO_PROXY: "other.com" }, "api.telegram.org") === "http://p:1");
+}
+
+// --- inbound immediacy receipts (pure) ---
+{
+  const vr = buildTgVerdictReceipt("b1", "n2", "approve", "once");
+  t("verdict receipt taskRef=tg-verdict", vr.taskRef === "tg-verdict");
+  t("verdict receipt text has batch/item/verdict/scope", vr.text.includes("b1") && vr.text.includes("n2") && vr.text.includes("approve") && vr.text.includes("once"));
+  t("verdict receipt no scope omits scope=", !buildTgVerdictReceipt("b1", "n2", "reject").text.includes("scope="));
+  const mr = buildTgMessageReceipt(123, "hello there");
+  t("message receipt taskRef=tg-message", mr.taskRef === "tg-message");
+  t("message receipt text has chat+body", mr.text.includes("123") && mr.text.includes("hello there"));
+  t("message receipt clips long text", buildTgMessageReceipt(1, "x".repeat(600)).text.length < 560);
+  t("ack text is a short read-receipt", typeof TG_ACK_TEXT === "string" && TG_ACK_TEXT.length > 0 && TG_ACK_TEXT.length < 40);
+}
+
+// --- idempotency key for forwarded TG events (pure; TGP-3, hash-based lossless identity) ---
+{
+  t("same event -> same key (replay dedups)", tgIdempotencyKey("tg-msg", 42) === tgIdempotencyKey("tg-msg", 42));
+  t("distinct events -> distinct keys", tgIdempotencyKey("tg-verdict", 42) !== tgIdempotencyKey("tg-verdict", 43));
+  t("TGP-3b lossless: a/b vs a_b do NOT collide", tgIdempotencyKey("tg-verdict", "a/b") !== tgIdempotencyKey("tg-verdict", "a_b"));
+  t("TGP-3b lossless: ids differing only past 120 chars do NOT collide", tgIdempotencyKey("tg-v", "x".repeat(130) + "A") !== tgIdempotencyKey("tg-v", "x".repeat(130) + "B"));
+  t("key is writeInbox-contract compliant", /^[A-Za-z0-9._-]{1,120}$/.test(tgIdempotencyKey("tg-msg", "x".repeat(400))));
+  t("readable prefix retained", tgIdempotencyKey("tg-verdict", 1).startsWith("tg-verdict."));
+}
+
+// --- TGP-4 (TG-r5): obligationReceiptValue uses TWO fact sources — the obligation (event identity) + the AUTHORITATIVE consumed
+//     result (value). Pure; the orphan-fold is never consulted here (the driver passes the digest-verified authority). ---
+{
+  const appOnce = { verdict: "approve" as const, scope: "once" as const };
+  const appAlways = { verdict: "approve" as const, scope: "always" as const };
+  const rej = { verdict: "reject" as const };
+  // not sealed ⇒ forward the RECORDED value (what the coordinator will consume).
+  t("not-sealed -> forward recorded value", JSON.stringify(obligationReceiptValue({ consumed: false }, appOnce)) === JSON.stringify({ action: "forward", value: appOnce }));
+  // sealed + item present ⇒ forward the AUTHORITATIVE final value (even if it differs from the recorded value, e.g. overwritten).
+  t("sealed+present -> forward authoritative value", JSON.stringify(obligationReceiptValue({ consumed: true, itemValue: rej }, appOnce)) === JSON.stringify({ action: "forward", value: rej }));
+  t("sealed+present(same) -> forward authoritative", JSON.stringify(obligationReceiptValue({ consumed: true, itemValue: appAlways }, appAlways)) === JSON.stringify({ action: "forward", value: appAlways }));
+  // sealed + item ABSENT ⇒ the recorded tap was orphaned (store signals re-batch) ⇒ DROP (no stale value).
+  t("sealed+absent -> drop (orphaned tap)", obligationReceiptValue({ consumed: true, itemValue: null }, appOnce).action === "drop");
+  // sealed-but-unreadable ⇒ RETRY (never guess a value).
+  t("unknown-authority -> retry", obligationReceiptValue({ consumed: "unknown" }, appOnce).action === "retry");
+  // determinism (restart-idempotency at the decision level): same inputs ⇒ same output.
+  t("obligationReceiptValue is deterministic", JSON.stringify(obligationReceiptValue({ consumed: true, itemValue: rej }, appOnce)) === JSON.stringify(obligationReceiptValue({ consumed: true, itemValue: rej }, appOnce)));
+  t("receipt-obligation dir under ~/.agenthop/tg/receipt-obligations", tgReceiptObligationDir("/home/u").endsWith("/.agenthop/tg/receipt-obligations") && tgReceiptObligationDir("/home/u").startsWith("/home/u"));
+  t("srcTag encodes the update_id (event identity in the durable commit)", srcTag(42) === "tg:42" && srcTag(1000) === "tg:1000");
 }
 
 console.log("all tg-entry selftests passed");

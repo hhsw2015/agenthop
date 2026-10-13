@@ -171,6 +171,25 @@ export function readDecisions(home: string, batchId: string): DecisionsDoc | nul
   return foldDecisionDocs(readLedgerEntries(home, batchId), batchId);
 }
 
+/** The AUTHORITY on what a batch CONSUMED: either `true` + the canonical consumed PROJECTION (decisions-consumed-claim.json)
+ *  VERIFIED against the terminal marker's digest (consumed.json); `false` when not yet sealed; or `"unknown"` when sealed but the
+ *  projection is unreadable/digest-mismatched (a transient/partial state — the caller keeps its obligation and re-checks, never
+ *  reads a wrong value). This is DISTINCT from readDecisions (TG-r5): readDecisions folds the LIVE slot ledger, which can legally
+ *  include a late ORPHAN slot published AFTER the consume sealed — that orphan is NOT part of the consumed result and is signaled
+ *  separately (emitOrphanSignal). A new caller that must know "what the coordinator actually acts on" MUST use this, not the fold.
+ *  A marker read fault (EACCES) PROPAGATES (≠ absent). */
+export function readConsumedResult(home: string, batchId: string):
+  | { consumed: true; doc: DecisionsDoc }
+  | { consumed: false }
+  | { consumed: "unknown" } {
+  if (!existsStrict(consumedMarkerPath(home, batchId))) return { consumed: false }; // throws on EACCES ⇒ caller retries (transient)
+  const marker = readJsonOrNull(consumedMarkerPath(home, batchId), (raw) => (raw !== null && typeof raw === "object" && typeof (raw as Record<string, unknown>).digest === "string" ? (raw as { digest: string }) : null));
+  if (!marker) return { consumed: "unknown" }; // marker present but corrupt ⇒ can't verify ⇒ retry
+  const claim = readJsonOrNull(claimPath(home, batchId), validDecisionsDoc);
+  if (!claim || claim.batchId !== batchId || digestDoc(claim) !== marker.digest) return { consumed: "unknown" }; // claim missing/stale/mismatched
+  return { consumed: true, doc: claim }; // the digest-verified canonical consumed result
+}
+
 /** The full fold input: legacy baseline data (imported for compat, TG-R6-P2-1) folded in BEFORE every slot, THEN the slot ledger.
  *  A read error PROPAGATES. The legacy files are console FULL SNAPSHOTS in baseline PRECEDENCE: the mis-archived rejected-claim
  *  (oldest, order -3), the recoverable consumed-claim (-2), then decisions.json (freshest, -1, supersedes the others). These are
