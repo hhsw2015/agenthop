@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { mkdtempSync, existsSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { acquireSingleFlight } from "../src/swarm/single-flight.js";
@@ -37,11 +37,66 @@ describe("acquireSingleFlight", () => {
     release!();
   });
 
-  test("an unreadable/garbage holder is treated as reclaimable (dead)", () => {
+  test("a READABLE garbage holder (not a pid) is reclaimable (NaN, not a live pid)", () => {
     const p = lockPath();
-    writeFileSync(p, "not-a-pid");
-    const release = acquireSingleFlight(p, { pidAlive: () => true }); // holder NaN (not > 0) ⇒ reclaim
+    writeFileSync(p, "not-a-pid"); // readable, just not a pid ⇒ NaN ⇒ reclaim (distinct from an UNREADABLE lock, below)
+    const release = acquireSingleFlight(p, { pidAlive: () => true });
     expect(release).not.toBeNull();
+    release!();
+  });
+
+  // DISP-3 three-state (lock-readability root fix): a lock we CANNOT READ is UNKNOWN, not reclaimable — HOLD, never steal a
+  // live-but-unreadable holder's lock. Injected readLock throws so the path is deterministic (no flaky chmod).
+  const throwing = (code: string) => () => { const e = new Error(code) as NodeJS.ErrnoException; e.code = code; throw e; };
+
+  test("DISP-3: an UNREADABLE lock (EACCES) is HELD, not reclaimed (never steal a live-but-unreadable holder)", () => {
+    const p = lockPath();
+    writeFileSync(p, "999999"); // a holder on disk; even if readable+probed it would look dead — but we cannot read it
+    const got = acquireSingleFlight(p, { pidAlive: () => false, readLock: throwing("EACCES") });
+    expect(got).toBeNull();                                 // UNKNOWN holder ⇒ HOLD (old code folded unreadable⇒NaN⇒reclaim)
+    expect(existsSync(p)).toBe(true);                       // untouched — not renamed-aside / reclaimed
+    expect(readFileSync(p, "utf8").trim()).toBe("999999");
+  });
+
+  test("DISP-3: an EIO lock read is also HELD, not reclaimed (same family as fleet FR6's EIO-steals-live residual)", () => {
+    const p = lockPath();
+    writeFileSync(p, "999999");
+    expect(acquireSingleFlight(p, { pidAlive: () => false, readLock: throwing("EIO") })).toBeNull();
+    expect(readFileSync(p, "utf8").trim()).toBe("999999"); // untouched
+  });
+
+  test("DISP3-1: a moved-aside read error must NOT let the restore CLOBBER a racer that acquired in the gap", () => {
+    const p = lockPath();
+    writeFileSync(p, ""); // a readable EMPTY old lock (holder NaN ⇒ enters the stale-reclaim path)
+    const io = {
+      pidAlive: (pid: number) => pid === 88888, // the racer's pid is alive; the empty holder (NaN) is not
+      readLock: (lp: string): string => {
+        if (lp === p) return readFileSync(lp, "utf8"); // reading the live lock path ⇒ real
+        // reading the moved-aside copy: simulate a transient EACCES AND a racer publishing its pid at lockPath in the gap
+        writeFileSync(p, "88888"); // racer B acquires lockPath while we are mid-reclaim
+        const e = new Error("EACCES") as NodeJS.ErrnoException; e.code = "EACCES"; throw e;
+      },
+    };
+    const got = acquireSingleFlight(p, io);
+    expect(got).toBeNull();                                 // we must NOT acquire — B holds; our restore must not clobber B
+    expect(readFileSync(p, "utf8").trim()).toBe("88888");   // B's lock intact (not overwritten by our aside restore, not reclaimed)
+  });
+
+  test("DISP-3: ENOENT on the holder read ⇒ the lock vanished mid-check ⇒ retry, then acquire", () => {
+    const p = lockPath();
+    writeFileSync(p, "999999"); // present ⇒ first linkSync EEXISTs
+    let reads = 0;
+    const io = {
+      pidAlive: () => true,
+      readLock: (lp: string): string => {
+        reads += 1;
+        if (reads === 1) { unlinkSync(lp); const e = new Error("gone") as NodeJS.ErrnoException; e.code = "ENOENT"; throw e; } // vanished
+        return readFileSync(lp, "utf8");
+      },
+    };
+    const release = acquireSingleFlight(p, io);
+    expect(release).not.toBeNull();                          // the retry links cleanly onto the now-absent path
+    expect(Number(readFileSync(p, "utf8").trim())).toBe(process.pid);
     release!();
   });
 
