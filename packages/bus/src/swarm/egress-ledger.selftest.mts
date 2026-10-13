@@ -1,7 +1,7 @@
 // Selftest for the egress ledger (gstack borrow ②). Pure core (chain/verify/parse/magnitude) + the IO store against a real temp
 // dir, with the three review-gate fixture classes: crash-recovery, restart-idempotency, concurrency-race.
 //   npx tsx packages/bus/src/swarm/egress-ledger.selftest.mts
-import { mkdtempSync, writeFileSync, readdirSync, rmSync, readFileSync, symlinkSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readdirSync, rmSync, readFileSync, symlinkSync, mkdirSync, chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -173,6 +173,49 @@ t("flag: ON only when explicitly enabled", egressLedgerEnabled({ SWARM_EGRESS_LE
   writeFileSync(path.join(dir, ".append.lock"), String(deadPid)); // a stale lock from a crashed writer
   const id = recordEgressIntent(dir, { destHost: "h0", callFace: "relay.post", initiatorSid: "s" }, 1000);
   t("EL-4: a stale append lock (dead holder) is reclaimed ⇒ the record still succeeds (no permanent disable)", id !== null && readdirSync(dir).filter((n) => /^\d+\.json$/.test(n)).length === 1);
+  rmSync(path.dirname(dir), { recursive: true, force: true });
+}
+
+// ── EL-R2-1 (codex:Work r2): a LIVE but UNREADABLE append lock must NOT be reclaimed — the old file lock folded an unreadable
+//    read to "" ⇒ reclaimable, so a competitor STOLE a live holder's lock ⇒ two writers ⇒ an already-confirmed record was
+//    overwritten (verify still "OK"). FIX: three-state read ⇒ unreadable=UNKNOWN=HOLD. Gate: a competitor cannot succeed while
+//    the live lock is unreadable; once the holder releases, appends continue. ──
+{
+  const dir = mkDir();
+  mkdirSync(dir, { recursive: true });
+  const lock = path.join(dir, ".append.lock");
+  writeFileSync(lock, String(process.pid), { mode: 0o600 }); // a LIVE holder (this very process) owns the lock
+  chmodSync(lock, 0o000); // ...and it is now UNREADABLE (codex:Work's exact chmod000 reproduction)
+  let readable = true; try { readFileSync(lock); } catch { readable = false; }
+  if (!readable) { // skip only if this environment can still read a 0o000 file it owns (e.g. running as root)
+    const refused = recordEgressIntent(dir, { destHost: "h", callFace: "relay.post", initiatorSid: "s" }, 1000);
+    t("EL-R2-1: a competitor CANNOT reclaim a live-but-unreadable lock (record refused, not a silent overwrite)", refused === null && readdirSync(dir).filter((n) => /^\d+\.json$/.test(n)).length === 0);
+    unlinkSync(lock); // the original holder releases
+    const after = recordEgressIntent(dir, { destHost: "h", callFace: "relay.post", initiatorSid: "s" }, 1001);
+    t("EL-R2-1: once the holder releases, appends continue (no permanent disable)", after !== null && readdirSync(dir).filter((n) => /^\d+\.json$/.test(n)).length === 1);
+  } else { chmodSync(lock, 0o600); t("EL-R2-1: SKIPPED (0o000 still readable here — root?)", true); }
+  try { chmodSync(lock, 0o600); } catch { /* already unlinked */ }
+  rmSync(path.dirname(dir), { recursive: true, force: true });
+}
+
+// ── EL-3 (codex:Work r2): a FIFO planted as the append lock must NOT block the record inside a plain readFileSync (which would
+//    hang the caller's send forever). FIX: the lock read is O_NONBLOCK|O_NOFOLLOW + fstat-regular-gated. Gate: the record returns
+//    TIMELY with a GAP (never hangs), and once the FIFO is removed the next record succeeds. ──
+{
+  const dir = mkDir();
+  mkdirSync(dir, { recursive: true });
+  const lock = path.join(dir, ".append.lock");
+  const mk = spawnSync("mkfifo", [lock], { encoding: "utf8" });
+  const isFifo = mk.status === 0 && (() => { try { return lstatSync(lock).isFIFO(); } catch { return false; } })();
+  if (isFifo) {
+    const started = Date.now();
+    const refused = recordEgressIntent(dir, { destHost: "h", callFace: "relay.post", initiatorSid: "s" }, 1000); // must NOT hang
+    const elapsed = Date.now() - started;
+    t("EL-3: a FIFO append lock ⇒ record returns TIMELY (no readFileSync hang) + refused", refused === null && elapsed < 2000);
+    unlinkSync(lock); // remove the FIFO (the planted obstruction is gone)
+    const after = recordEgressIntent(dir, { destHost: "h", callFace: "relay.post", initiatorSid: "s" }, 1001);
+    t("EL-3: after the FIFO is removed, the next record succeeds (subsequent sends still work)", after !== null && readdirSync(dir).filter((n) => /^\d+\.json$/.test(n)).length === 1);
+  } else { t("EL-3: SKIPPED (mkfifo unavailable on this host)", true); }
   rmSync(path.dirname(dir), { recursive: true, force: true });
 }
 

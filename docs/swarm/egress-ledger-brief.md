@@ -21,7 +21,9 @@ owner=f32a0507;协调者立项(gstack 深评借点②,[[gstack-eval]] §A 条 1�
 - 读 CLI:`egress list`、`egress verify`(ASCII,`AGENTHOP_EGRESS_DIR` 可覆盖目录供测试,同 rulings CLI)。
 - **不接线**:无任何生产者调用 `recordEgress`;dispatcher/relay/update/vm-ctl 等调用点的接线是**后续分轮**(每点 opt-in)。
 - 旗 `SWARM_EGRESS_LEDGER` 门控 `recordEgress` 接缝(`flagDefaultOn`)。v1 **dormant 默认 OFF**(opt-in):无生产者时翻不翻无运行时差;默认翻转留到接线落地并审过后由协调者+user 裁。
-- 追加锁复用已签 `single-flight`(`acquireSingleFlight(lockPath)`)。**[EL-4 订正,原冻结稿写 holder-lock 默认 API]**:审查席 codex:Work 指出 holder-lock 的**稳定默认 API**(不传 `reclaimExternalStranded`)**无死持有者回收**——crash 中途留下的锁会**永久禁用**账本(fail-open 账本按构造不该被一次崩溃永久关停)。`single-flight` 已具两条本件需要的保证:①死持有者 pid 回收 ②无 `mkdir->publish` 空窗(hard-link 原子发布)。审查席硬性要求:**绑定当下已具恢复保证的锁,不得依据另分支对 holder-lock 的改写(d7f6c917 @51a9fde)推导本件已获恢复**——故本件绑 `single-flight`,不等 holder-lock 重写。该窗口留作回归(selftest 中 stale `.append.lock` 死 pid ⇒ 下次记录回收并成功)。**遗留**:egress 依赖面出现 single-flight(文件锁)与 holder-lock(目录锁)两套,「两锁收敛为一」是协调者既有议题,非本件范围。
+- 追加锁复用已签 `single-flight`(`acquireSingleFlight(lockPath)`)。**[EL-4 订正,原冻结稿写 holder-lock 默认 API]**:审查席 codex:Work 指出 holder-lock 的**稳定默认 API**(不传 `reclaimExternalStranded`)**无死持有者回收**——crash 中途留下的锁会**永久禁用**账本(fail-open 账本按构造不该被一次崩溃永久关停)。`single-flight` 的 ①死持有者 pid 回收 ②无 `mkdir->publish` 空窗(hard-link 原子发布)两条满足。审查席硬性要求:**绑定当下已具恢复保证的锁,不得依据另分支对 holder-lock 的改写(d7f6c917 @51a9fde)推导本件已获恢复**——故本件绑 `single-flight`,不等 holder-lock 重写。
+  **[EL-R2-1 / EL-3 r3,接线 single-flight 后暴露的两残]**:绑入的 base `single-flight` 尚缺两条,r3 在 `single-flight.ts` 直接补齐(与 DISP-3 的三态修同判语,本件版为其**超集**):**EL-R2-1** 读锁三态——不可读/非常规 ⇒ `UNKNOWN=HOLD`(**绝不**把读错折成 `""`⇒可回收,否则竞争者会偷走「活但不可读」的持有者锁 ⇒ 双写 ⇒ 已确认的记录被覆写、verify 仍 OK);**EL-3** 读锁 FIFO-安全——`O_RDONLY|O_NONBLOCK|O_NOFOLLOW` + 对同一 fd `fstat` 验常规文件 + 从该 fd 读(关 `lstat->read` TOCTOU),植入的 FIFO/目录/符号链接锁**及时失败**(记录失败+GAP)而非 `readFileSync` 永久阻塞调用方。回归门:活锁 chmod000 ⇒ 竞争者记录拒(不偷锁),持有者释放后续追;FIFO 锁 ⇒ 记录**及时**返回失败+GAP、移除后续追。
+  **遗留**:egress 依赖面出现 single-flight(文件锁)与 holder-lock(目录锁)两套,且本件的 single-flight.ts 现为 DISP-3(入批-20)版之超集(多 EL-3 FIFO-安全读),「两锁收敛为一 + single-flight 超集归并」是协调者既有议题,非本件范围。
 
 ## ① 记录模型(**两行审计**:intent 先记 / result 后补,桥 r8 判例 / 协调者)
 
