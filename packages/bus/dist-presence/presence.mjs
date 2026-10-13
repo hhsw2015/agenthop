@@ -58235,16 +58235,6 @@ var ROSTER_FILE = "roster-snapshot.json";
 import { mkdirSync as mkdirSync10, writeFileSync as writeFileSync7, readdirSync as readdirSync8, unlinkSync as unlinkSync4, rmSync as rmSync3, rmdirSync } from "node:fs";
 import { randomBytes as randomBytes9 } from "node:crypto";
 import path17 from "node:path";
-function pidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0)
-    return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return e.code === "EPERM";
-  }
-}
 function pidDefinitelyDead(pid) {
   if (!Number.isInteger(pid) || pid <= 0)
     return false;
@@ -58261,7 +58251,6 @@ function holdIntentPath(site, token) {
 function listHoldIntents(site) {
   return readdirSync8(site.intentDir).filter((n) => n.startsWith(site.intentPrefix)).map((n) => ({ name: n, pid: Number(n.slice(site.intentPrefix.length).split(".")[0]) }));
 }
-var strandedLockDirs = new Set;
 function acquireHolderLock(site) {
   const dir = site.lockDir;
   const token = `${process.pid}.${randomBytes9(6).toString("hex")}`;
@@ -58288,11 +58277,27 @@ function acquireHolderLock(site) {
     }
     try {
       writeFileSync7(mine, "", { mode: 384 });
-    } catch (e) {
-      strandedLockDirs.add(dir);
-      throw e;
+    } catch {
+      try {
+        rmSync3(mine, { force: true });
+      } catch {}
+      return false;
     }
-    strandedLockDirs.delete(dir);
+    let after;
+    try {
+      after = readdirSync8(dir);
+    } catch {
+      try {
+        rmSync3(mine, { force: true });
+      } catch {}
+      return false;
+    }
+    if (after.length !== 1 || after[0] !== token) {
+      try {
+        rmSync3(mine, { force: true });
+      } catch {}
+      return false;
+    }
     return true;
   };
   if (take())
@@ -58304,64 +58309,57 @@ function acquireHolderLock(site) {
     dropIntent();
     return null;
   }
-  if (entries.length === 1) {
-    const holder = entries[0];
-    const hpid = Number(holder.split(".")[0]);
-    if (Number.isInteger(hpid) && hpid > 0 && (hpid === process.pid || pidDefinitelyDead(hpid))) {
-      let removed = false;
+  if (entries.length >= 1) {
+    const toks = entries.map((h) => ({ name: h, pid: Number(h.split(".")[0]) }));
+    const allReclaimable = toks.every((e) => Number.isInteger(e.pid) && e.pid > 0 && (e.pid === process.pid || pidDefinitelyDead(e.pid)));
+    if (!allReclaimable) {
+      dropIntent();
+      return null;
+    }
+    for (const e of toks) {
       try {
-        rmSync3(path17.join(dir, holder));
-        removed = true;
+        rmSync3(path17.join(dir, e.name));
       } catch {}
-      if (removed) {
-        try {
-          rmdirSync(dir);
-          strandedLockDirs.delete(dir);
-        } catch {
-          strandedLockDirs.add(dir);
-        }
-      }
-      try {
-        if (take())
-          return token;
-      } catch (e) {
-        throw e;
-      }
+    }
+    try {
+      rmdirSync(dir);
+    } catch {}
+    try {
+      if (take())
+        return token;
+    } catch (e) {
+      throw e;
     }
     dropIntent();
     return null;
   }
-  if (entries.length === 0) {
-    let others;
+  let others;
+  try {
+    others = listHoldIntents(site).filter((i) => i.name !== intentName);
+  } catch {
+    dropIntent();
+    return null;
+  }
+  if (others.some((i) => i.pid !== process.pid && !(Number.isInteger(i.pid) && i.pid > 0 && pidDefinitelyDead(i.pid)))) {
+    dropIntent();
+    return null;
+  }
+  try {
+    rmdirSync(dir);
+  } catch {
+    dropIntent();
+    return null;
+  }
+  for (const i of others) {
     try {
-      others = listHoldIntents(site).filter((i) => i.name !== intentName);
-    } catch {
-      dropIntent();
-      return null;
-    }
-    if (others.some((i) => i.pid !== process.pid && pidAlive(i.pid))) {
-      dropIntent();
-      return null;
-    }
-    if (!strandedLockDirs.has(dir)) {
-      dropIntent();
-      return null;
-    }
-    try {
-      writeFileSync7(mine, "", { mode: 384 });
-    } catch {
-      dropIntent();
-      return null;
-    }
-    strandedLockDirs.delete(dir);
-    for (const i of others) {
-      if (i.pid === process.pid) {
-        try {
-          unlinkSync4(path17.join(site.intentDir, i.name));
-        } catch {}
-      }
-    }
-    return token;
+      unlinkSync4(path17.join(site.intentDir, i.name));
+    } catch {}
+  }
+  try {
+    if (take())
+      return token;
+  } catch (e) {
+    throw e;
   }
   dropIntent();
   return null;
@@ -58373,10 +58371,7 @@ function releaseHolderLock(site, token) {
   } catch {}
   try {
     rmdirSync(dir);
-    strandedLockDirs.delete(dir);
-  } catch {
-    strandedLockDirs.add(dir);
-  }
+  } catch {}
   try {
     unlinkSync4(holdIntentPath(site, token));
   } catch {}
