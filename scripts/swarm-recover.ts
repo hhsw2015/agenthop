@@ -27,7 +27,7 @@ import { herdrAgentName, herdrAgentStates, herdrLaunch, herdrServerReachable, he
 import { parseSnapshot, planResume, resumeCommandForMember, type RosterMember, type PeerLike } from "../packages/bus/src/swarm/resume.js";
 import {
   orchestrateRecover, snapshotStaleSec, breakpointInjectionEnabled, dispatcherNeedsRelaunch, classifyLaunchError,
-  publicRecoveryStatus,
+  publicRecoveryStatus, recoveryStatusLine,
   type RecoverDeps, type RecoveryResult, type DispatcherRecipe, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus, type LaunchOutcome,
 } from "../packages/bus/src/swarm/fleet-recovery.js";
 import {
@@ -206,15 +206,17 @@ async function main(): Promise<void> {
   try { result = await orchestrateRecover(snap, rosterLike, deps); }
   finally { await core.close(); releaseLock(); } // FR-6: always release the single-flight lock
 
-  // --- outcome. The receipt is a WORK SNAPSHOT (r10); the AUTHORITATIVE status is derived through the READ PATH from the same-episode
-  //     marker via publicRecoveryStatus (NOT from the receipt's final flag) — so the displayed/reported status cannot diverge from the
-  //     marker the way an r9 receipt-only predicate could. We re-read the marker + the receipt's final flag back off disk here, so the
-  //     exact path a later reader/rerun would take is the one that produces the displayed verdict. ----------------------------------------
+  // --- outcome. The receipt is a WORK SNAPSHOT (r10); the AUTHORITATIVE status is derived through the READ PATH from the marker FOR
+  //     THIS run's episode (r11: bound to result.episodeId — a STALE marker from a prior completed episode must NOT read "completed" for
+  //     this run). We re-read the marker + the receipt off disk and bind BOTH to result.episodeId, so the exact path a later reader/rerun
+  //     would take is the one that produces the displayed verdict. ------------------------------------------------------------------------
   log(`receipt: ${result.outstanding.includes("receipt:unwritten") ? "UNWRITTEN (CP-3) — outstanding" : "written (work snapshot) -> console/fleet-recovery.json"}`);
   const rc = readRecoveryReceipt(H);
-  const receiptFinal = rc && typeof rc.final === "boolean" ? (rc.final as boolean) : null;
-  const status = publicRecoveryStatus(readEpisode(H), receiptFinal);
-  log(`status (authoritative = episode marker): ${status}${status !== "completed" ? " — NOT committed (re-run finalizes; the receipt is a work snapshot, final:true≠committed)" : ""}`);
+  const receiptBound = rc && typeof rc.final === "boolean" && typeof rc.episodeId === "string" ? { episodeId: rc.episodeId as string, final: rc.final as boolean } : null;
+  const markerRead = readEpisode(H);
+  const status = publicRecoveryStatus(markerRead, receiptBound, result.episodeId);
+  const staleMarkerNote = markerRead.kind === "present" && markerRead.ep.episodeId !== result.episodeId ? ` (on-disk marker belongs to a DIFFERENT episode ${markerRead.ep.episodeId}; this run's episode is not established there)` : "";
+  log(`status (authoritative = this episode's marker): ${recoveryStatusLine(status)}${staleMarkerNote}`);
   const confirmed = result.members.filter((m) => m.verdict === "confirmed").length;
   log(`done: episode ${result.episodeId}; dispatcher ${result.dispatcher.verdict} (wake=${result.dispatcher.wakeStatus ?? "unknown"}); members ${confirmed}/${result.members.length} confirmed; report ${result.reportDelivery}; ${result.outstanding.length} outstanding.`);
   if (result.outstanding.length > 0) { log(`OUTSTANDING (re-run to retry): ${result.outstanding.join("; ")}`); process.exitCode = 1; }

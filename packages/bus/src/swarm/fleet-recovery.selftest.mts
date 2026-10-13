@@ -12,7 +12,7 @@ import path from "node:path";
 import {
   FLEET_SNAPSHOT_SCHEMA, scrubValueSecrets, parseDispatcherRecipe, parseFleetSnapshot, snapshotStaleSec,
   dispatcherNeedsRelaunch, dispatcherVerdict, memberVerdict, resolveMemberSid, resolveEpisode, buildBreakpointText,
-  grantedItemsForMember, deliveryDischarged, summarizeOutstanding, orchestrateRecover, classifyLaunchError, publicRecoveryStatus,
+  grantedItemsForMember, deliveryDischarged, summarizeOutstanding, orchestrateRecover, classifyLaunchError, publicRecoveryStatus, recoveryStatusLine,
   type FleetSnapshot, type DispatcherRecipe, type RecoverDeps, type RecoveryEpisode, type EpisodeRead, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus, type DispatcherLiveness, type RecoveryResult, type LaunchOutcome,
 } from "./fleet-recovery.js";
 import {
@@ -144,18 +144,25 @@ try {
     t("FR-8 r10 durable: the receipt self-identifies as a WORK SNAPSHOT (scope + completionAuthority stamped at the write primitive)", fin.scope === FLEET_RECEIPT_SCOPE && typeof fin.completionAuthority === "string" && /episode-marker/.test(fin.completionAuthority as string));
     t("FR-8 r10 durable: final===true = work finalized; it is NOT an independent completion claim (scope says so)", fin.final === true && fin.scope === "work-snapshot");
   }
-  // FR-8 (r10) PUBLIC completion criterion — the ONE criterion, derived from the authoritative episode MARKER (never the receipt's
-  // final flag). This closes the r9 split where a receipt-only predicate (final:true && outstanding:[]) diverged from the marker.
+  // FR-8 (r10/r11) PUBLIC completion criterion — the ONE criterion, derived from the authoritative episode MARKER bound to THIS run's
+  // episodeId. Closes the r9 receipt-only split AND the r10 cross-episode display bug (a stale prior-episode marker reading "completed").
   {
-    const ep = (completed: boolean): EpisodeRead => ({ kind: "present", ep: { episodeId: "e", startedAtSec: 1, snapshotCapturedAtSec: 1, completed } });
-    t("FR-8 r10 public: normal full commit (marker completed=true) ⇒ 'completed'", publicRecoveryStatus(ep(true), true) === "completed");
-    // the two r9-divergence windows: the receipt reads final:true, but the AUTHORITATIVE marker is incomplete ⇒ NOT 'completed'
-    t("FR-8 r10 public: final-marker-refusal (marker incomplete, receipt final:true) ⇒ 'pending-commit' (NOT completed — reader not fooled)", publicRecoveryStatus(ep(false), true) === "pending-commit");
-    t("FR-8 r10 public: SIGKILL-before-marker (marker absent, receipt final:true) ⇒ 'pending-commit' (NOT completed)", publicRecoveryStatus({ kind: "absent" }, true) === "pending-commit");
-    t("FR-8 r10 public: interrupt-before-finalize (marker incomplete, receipt final:false) ⇒ 'pending-work'", publicRecoveryStatus(ep(false), false) === "pending-work");
-    t("FR-8 r10 public: final-receipt-refused ⇒ provisional (final:false) ⇒ explicit 'pending-work'", publicRecoveryStatus(ep(false), false) === "pending-work");
-    t("FR-8 r10 public: marker unreadable ⇒ 'unknown' (FC-2, never guess completed)", publicRecoveryStatus({ kind: "unreadable" }, true) === "unknown");
-    t("FR-8 r10 public: final:true ALONE never reads completed when the marker disagrees", publicRecoveryStatus(ep(false), true) !== "completed" && publicRecoveryStatus({ kind: "absent" }, true) !== "completed");
+    const ep = (episodeId: string, completed: boolean): EpisodeRead => ({ kind: "present", ep: { episodeId, startedAtSec: 1, snapshotCapturedAtSec: 1, completed } });
+    const rcpt = (episodeId: string, final: boolean) => ({ episodeId, final });
+    const THIS = "ep-this";
+    t("FR-8 r10 public: normal full commit (marker completed=true, SAME episode) ⇒ 'completed'", publicRecoveryStatus(ep(THIS, true), rcpt(THIS, true), THIS) === "completed");
+    t("FR-8 r10 public: final-marker-refusal (marker incomplete, receipt final:true) ⇒ 'pending-commit'", publicRecoveryStatus(ep(THIS, false), rcpt(THIS, true), THIS) === "pending-commit");
+    t("FR-8 r10 public: SIGKILL-before-marker (marker absent, receipt final:true) ⇒ 'pending-commit'", publicRecoveryStatus({ kind: "absent" }, rcpt(THIS, true), THIS) === "pending-commit");
+    t("FR-8 r10 public: interrupt-before-finalize (marker incomplete, receipt final:false) ⇒ 'pending-work'", publicRecoveryStatus(ep(THIS, false), rcpt(THIS, false), THIS) === "pending-work");
+    t("FR-8 r10 public: final-receipt-refused ⇒ no final receipt for THIS run ⇒ 'pending-work'", publicRecoveryStatus(ep(THIS, false), null, THIS) === "pending-work");
+    t("FR-8 r10 public: marker unreadable ⇒ 'unknown' (FC-2, never guess)", publicRecoveryStatus({ kind: "unreadable" }, rcpt(THIS, true), THIS) === "unknown");
+    // r11 OWNERSHIP — the actual r10 bug: a STALE prior-episode marker (completed=true) must NOT read 'completed' for THIS run.
+    t("FR-8 r11 OWNERSHIP: stale PRIOR-episode marker completed=true ⇒ THIS run NOT 'completed' (bound to thisEpisodeId)", publicRecoveryStatus(ep("ep-OLD", true), rcpt("ep-OLD", true), THIS) === "pending-work");
+    t("FR-8 r11 OWNERSHIP: stale marker + THIS run's final receipt ⇒ 'pending-commit' (this run's work, not the old marker's completed)", publicRecoveryStatus(ep("ep-OLD", true), rcpt(THIS, true), THIS) === "pending-commit");
+    t("FR-8 r11 OWNERSHIP: a receipt from a DIFFERENT episode does not refine THIS run to pending-commit", publicRecoveryStatus(ep(THIS, false), rcpt("ep-OLD", true), THIS) === "pending-work");
+    // r11 wording: unknown must NOT be suffixed "not committed / re-run finalizes"; pending lines must say "NOT yet committed".
+    t("FR-8 r11 wording: unknown says CANNOT be confirmed, NOT 'not committed'/'finalizes the same episode'", (() => { const l = recoveryStatusLine("unknown"); return /CANNOT be confirmed/i.test(l) && !/NOT yet committed/i.test(l) && !/finalizes the same episode/i.test(l); })());
+    t("FR-8 r11 wording: pending-commit/pending-work DO say 'NOT yet committed'", /NOT yet committed/i.test(recoveryStatusLine("pending-commit")) && /NOT yet committed/i.test(recoveryStatusLine("pending-work")));
   }
   // FR-8 r4: an 'unknown' launch outcome is recorded as unknown (not failed) ⇒ never a blind retry
   {

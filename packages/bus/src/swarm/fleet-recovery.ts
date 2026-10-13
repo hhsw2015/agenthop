@@ -255,20 +255,36 @@ export function resolveEpisode(read: EpisodeRead, mint: () => string): EpisodeDe
 export type PublicRecoveryStatus = "completed" | "pending-commit" | "pending-work" | "unknown";
 
 /**
- * The PUBLIC recovery status for any reader/display (FR-8 r10 — the ONE completion criterion). The episode MARKER is the sole
- * authority: a reader consults it, NEVER the receipt's `final` flag. The receipt only REFINES the not-yet-committed case.
- *   - marker unreadable          ⇒ "unknown"      (FC-2 — never guess completed from a read fault);
- *   - marker present + completed  ⇒ "completed"    (authoritative; the receipt is irrelevant to this verdict);
- *   - marker incomplete / absent  ⇒ NOT committed — refine by the receipt's WORK-finalization flag:
- *       receiptFinal === true     ⇒ "pending-commit" (work finalized, the commit marker did not land — a rerun finalizes it);
- *       otherwise (false / null)  ⇒ "pending-work"   (final:false, or no receipt — recovery work itself is not finalized).
- * `final:true` ALONE never reads as "completed" — this closes the r9 split where a receipt-only criterion diverged from the marker.
- * Pure.
+ * The PUBLIC recovery status FOR A SPECIFIC RUN (FR-8 r11 — the ONE completion criterion, bound to THIS run's episode). The episode
+ * MARKER is the sole authority, but it must be the marker FOR `thisEpisodeId`: a STALE marker left by a PRIOR episode (completed=true)
+ * must NEVER make THIS run read "completed" (the r10 bug — the display read the global marker without binding it to result.episodeId).
+ *   - marker unreadable                                   ⇒ "unknown"  (FC-2 — cannot confirm anything; NOT "not committed");
+ *   - marker present, episodeId === thisEpisodeId, completed ⇒ "completed" (authoritative for THIS run);
+ *   - otherwise (absent / a DIFFERENT episode's marker / incomplete) ⇒ THIS run is NOT committed — refine by THIS run's receipt:
+ *       receipt belongs to thisEpisodeId AND final === true ⇒ "pending-commit" (work finalized, commit marker not landed);
+ *       otherwise                                           ⇒ "pending-work"   (no final receipt for THIS run).
+ * `final:true` alone never reads "completed"; a mismatched marker/receipt never证 THIS run. Pure.
  */
-export function publicRecoveryStatus(episode: EpisodeRead, receiptFinal: boolean | null): PublicRecoveryStatus {
+export function publicRecoveryStatus(
+  episode: EpisodeRead,
+  receipt: { episodeId: string; final: boolean } | null,
+  thisEpisodeId: string,
+): PublicRecoveryStatus {
   if (episode.kind === "unreadable") return "unknown";
-  if (episode.kind === "present" && episode.ep.completed === true) return "completed";
-  return receiptFinal === true ? "pending-commit" : "pending-work";
+  if (episode.kind === "present" && episode.ep.episodeId === thisEpisodeId && episode.ep.completed === true) return "completed";
+  const thisRunReceiptFinal = receipt !== null && receipt.episodeId === thisEpisodeId && receipt.final === true;
+  return thisRunReceiptFinal ? "pending-commit" : "pending-work";
+}
+
+/** The human/display line for a status (FR-8 r11). `unknown` gets its OWN wording: a read fault CANNOT confirm commit state, and must
+ *  NOT promise "a re-run finalizes" (if the marker is actually complete, resolveEpisode correctly starts a NEW episode). Pure. */
+export function recoveryStatusLine(status: PublicRecoveryStatus): string {
+  switch (status) {
+    case "completed": return "completed — THIS episode is committed in the authoritative marker";
+    case "pending-commit": return "pending-commit — THIS episode NOT yet committed (work finalized; a re-run finalizes the same episode)";
+    case "pending-work": return "pending-work — THIS episode NOT yet committed (recovery work not finalized; a re-run continues the same episode)";
+    case "unknown": return "unknown — the episode marker is unreadable; commit status CANNOT be confirmed (do not assume committed or not; a re-run resolves it)";
+  }
 }
 
 // ============================================================================================================
