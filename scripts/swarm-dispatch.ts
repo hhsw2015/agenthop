@@ -29,6 +29,8 @@ import { parseManifest } from "../packages/bus/src/swarm/manifest.js";
 import { type ObservedTip, tipToEvent } from "../packages/bus/src/swarm/acceptance.js";
 import { type HandoffOps, handoffStep } from "../packages/bus/src/swarm/dispatch-step.js";
 import { loadControlLog, commitControl, readControlBatches } from "../packages/bus/src/swarm/control-store.js";
+import { fleetRecoveryEnabled } from "../packages/bus/src/swarm/fleet-recovery.js";
+import { recordDispatcherRecipe, readDispatcherRecipe, writeFleetSnapshot } from "../packages/bus/src/swarm/fleet-recovery-store.js";
 import { entityKeyOf, type Change, type ChangeBody, type CommitResult, type LogState } from "../packages/bus/src/swarm/control-log.js";
 import { loadPlan, type TaskPlan, type TaskSpec } from "../packages/bus/src/swarm/task-plan.js";
 import type { TaskAttempt, ExecutionBinding } from "../packages/bus/src/swarm/task-state.js";
@@ -744,6 +746,17 @@ async function main(): Promise<void> {
   // SWARM_INBOX_WAKE: bake a real-time ping into the delivery primitive — writeInbox pings the target's herdr pane on every new
   // message (any caller, zero discipline). No-op + hook left unset when the flag is off (byte-for-byte v0 delivery).
   installInboxWake(log);
+  // FR-1/FR-12 (fleet-recovery): the dispatcher self-records its EXACT launch recipe (process.argv + allowlisted/scrubbed env + cwd,
+  // LOSSLESS — a ps display string cannot round-trip spaces) AND a fresh fleet-snapshot carrying it, so swarm-recover can bring the
+  // dispatcher back after a reboot without a lossy capture. Fail-soft (a record fault never blocks the dispatcher) + flag-gated
+  // (SWARM_FLEET_RECOVERY, default on). The ROSTER half is captured by `swarm-recover --snapshot` (the dispatcher records only itself).
+  try {
+    if (fleetRecoveryEnabled()) {
+      recordDispatcherRecipe(HOME, nowSec());
+      writeFleetSnapshot(HOME, readDispatcherRecipe(HOME), nowSec());
+      log(`fleet-recovery: dispatcher recipe + fleet-snapshot recorded (SWARM_FLEET_RECOVERY on)`);
+    }
+  } catch (e) { log(`fleet-recovery self-record failed (isolated): ${e instanceof Error ? e.message : e}`); }
   const records = loadMirror();
   const ops = buildOps();
   const taskStateRef = { s: loadControlLog(CONTROL_LOG_DIR) };
