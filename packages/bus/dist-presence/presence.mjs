@@ -55496,6 +55496,7 @@ function startDirectory(options) {
   let epoch = 0;
   const instanceEpoch = nextInstanceEpoch();
   let announceRev = 0;
+  let failedAnnounceRev;
   const remember = (peer) => {
     if (peer.id === self.id && pendingSelfTs !== undefined && peer.ts >= pendingSince) {
       pendingSelfTs = undefined;
@@ -55546,13 +55547,17 @@ function startDirectory(options) {
   async function announce() {
     if (closed)
       return;
-    const entry = { ...self, ts: Date.now(), epoch: instanceEpoch, rev: ++announceRev, statusText: capStatusText(self.statusText) };
+    const rev = ++announceRev;
+    failedAnnounceRev = undefined;
+    const entry = { ...self, ts: Date.now(), epoch: instanceEpoch, rev, statusText: capStatusText(self.statusText) };
     pendingSelfTs = entry.ts;
     if (pendingSince === 0)
       pendingSince = entry.ts;
     try {
       await sendMessage({ code: address, text: PRESENCE_PREFIX + sealEntry(team.nsKey, JSON.stringify(entry)), relay: options.relay, pass: options.pass });
     } catch (error2) {
+      if (rev === announceRev)
+        failedAnnounceRev = rev;
       if (pendingSelfTs === entry.ts) {
         pendingSelfTs = undefined;
         pendingSince = 0;
@@ -55610,7 +55615,13 @@ function startDirectory(options) {
     pull();
   }, ANNOUNCE_MS);
   beat.unref();
-  const poll = setInterval(() => void pull(), 5000);
+  const poll = setInterval(() => {
+    if (failedAnnounceRev !== undefined) {
+      failedAnnounceRev = undefined;
+      announce();
+    }
+    pull();
+  }, 5000);
   poll.unref();
   return {
     roster() {
