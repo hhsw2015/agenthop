@@ -2,7 +2,7 @@ import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, argvFro
 import { acquireHolderLock, releaseHolderLock } from "./holder-lock.js";
 import { probeCandidateLiveness, probeSessionLiveness, sidSockPrefix } from "./task-liveness.js";
 import type { RosterMember } from "./resume.js";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import net from "node:net";
@@ -158,5 +158,112 @@ const slowSock = await mkServer(path.join(presDir, `${pref}.s.sock`), () => { /*
 t("probeSessionLiveness: only a connected-but-silent candidate -> unknown (NOT no-socket; forbids adoption)", (await probeSessionLiveness(sockHome, SID, 150)) === "unknown");
 for (const s of servers) { try { s.close(); } catch { /* noop */ } }
 rmSync(sockHome, { recursive: true, force: true });
+
+// ── SUCC-1 r2 (codex:Work): the crash-stranded EMPTY adopt lock is reclaimed INSIDE acquireHolderLock via the opt-in
+//    reclaimExternalStranded — no out-of-band rmdir (so no ABA), single-winner, confirmed-dead-only (SUCC1-2). ──
+{
+  const mkHome = () => mkdtempSync(path.join(tmpdir(), "succ1-"));
+  const SID = "succ-sid-1";
+  // Lay down the on-disk state of a crash between holder-lock's mkdir and its identity write: an EMPTY lock dir + a hold-intent
+  // naming `intentPid` (the crashed owner). This is exactly what runSuccessionAtStartup's acquire then meets.
+  const strand = (home: string, intentPid: number) => {
+    const site = adoptLockSite(home, SID);
+    mkdirSync(site.lockDir, { recursive: true });
+    writeFileSync(path.join(site.intentDir, `${site.intentPrefix}${intentPid}.abcdef`), "");
+    return site;
+  };
+
+  // crash-recovery: stranded empty lock + a CONFIRMED-DEAD intent + the opt-in ⇒ reclaimed (rmdir-if-empty + fresh take) ⇒ sid
+  // acquirable, with EXACTLY our identity in the dir (no double-identity residue).
+  {
+    const home = mkHome(); const site = strand(home, 999999);          // 999999 ⇒ ESRCH ⇒ confirmed dead
+    const token = acquireHolderLock(site, { reclaimExternalStranded: true });
+    t("SUCC-1 crash-recovery: a stranded empty lock + dead intent is reclaimed ⇒ token (not deaf forever)", token !== null);
+    t("SUCC-1 crash-recovery: our identity is now published IN the dir", existsSync(path.join(site.lockDir, String(token))));
+    t("SUCC-1 crash-recovery: EXACTLY one identity in the dir after reclaim (no double-identity)", readdirSync(site.lockDir).length === 1);
+    if (token) releaseHolderLock(site, token);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // SUCC1-1 (codex:Work): a stale CONFIRMED-DEAD intent must NEVER authorize taking a dir that is ACTUALLY HELD. If a holder has
+  // published into the dir (non-empty) and is a LIVE foreign pid, the reclaimer must go to the published-holder branch and
+  // CONTEND — the all-dead intent scan is not proof the CURRENT dir is unoccupied (the TOCTOU the r3 fix closes).
+  {
+    const home = mkHome(); const site = adoptLockSite(home, SID);
+    mkdirSync(site.lockDir, { recursive: true });
+    writeFileSync(path.join(site.lockDir, "1.deadbeef"), "");                         // a LIVE foreign holder (pid 1 ⇒ EPERM ⇒ alive) published here
+    writeFileSync(path.join(site.intentDir, `${site.intentPrefix}999999.aa`), "");    // + a STALE confirmed-dead intent on disk
+    t("SUCC1-1: a stale dead intent does NOT authorize stealing a LIVE published holder ⇒ contend", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    t("SUCC1-1: the live holder's identity is untouched", existsSync(path.join(site.lockDir, "1.deadbeef")) && readdirSync(site.lockDir).length === 1);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // SUCC1-3 (codex:Work): a dead MULTI-token residue — left when two rejected publishSole backouts both failed their exact-name
+  // cleanup on a transient dir fault — must be RECOVERABLE, not permanently un-adoptable. Every token CONFIRMED-DEAD (ESRCH) and
+  // none live ⇒ reclaimed by exact name (default: published identities prove death, like the single-holder reclaim).
+  {
+    const home = mkHome(); const site = adoptLockSite(home, SID);
+    mkdirSync(site.lockDir, { recursive: true });
+    writeFileSync(path.join(site.lockDir, "999998.aaaaaa"), ""); // dead pid A
+    writeFileSync(path.join(site.lockDir, "999999.bbbbbb"), ""); // dead pid B
+    const token = acquireHolderLock(site);
+    t("SUCC1-3: a dead multi-token residue is reclaimed (not permanently un-adoptable) ⇒ token", token !== null);
+    t("SUCC1-3: after recovery EXACTLY our identity remains (both dead residues removed)", token !== null && readdirSync(site.lockDir).length === 1 && existsSync(path.join(site.lockDir, String(token))));
+    if (token) releaseHolderLock(site, token);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // SUCC1-3 protection: a >1 residue where ANY token is a LIVE/unknown pid ⇒ contend — never delete a live/unknown identity (no P1 reopen).
+  {
+    const home = mkHome(); const site = adoptLockSite(home, SID);
+    mkdirSync(site.lockDir, { recursive: true });
+    writeFileSync(path.join(site.lockDir, "999999.dead"), ""); // confirmed dead
+    writeFileSync(path.join(site.lockDir, "1.live"), "");      // pid 1 ⇒ EPERM ⇒ alive/unknown ⇒ protected
+    t("SUCC1-3: a multi-token dir with a LIVE/unknown identity ⇒ contend (residue not touched)", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    t("SUCC1-3: both tokens untouched when one is live/unknown", readdirSync(site.lockDir).length === 2);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // opt-in gating: the SAME stranded state WITHOUT the opt ⇒ contends (decision-batch / shared-budget are byte-identical).
+  {
+    const home = mkHome(); const site = strand(home, 999999);
+    t("SUCC-1 opt-in: default acquire (no reclaim) still CONTENDS an external stranded dir", acquireHolderLock(site) === null);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // SUCC1-2 three-state: a NON-ESRCH (alive/unknown) foreign intent must NOT authorize reclaim, even with the opt-in. pid 1 (init)
+  // probes EPERM ⇒ alive ⇒ not-all-dead ⇒ contend. This is also the ABA single-winner proxy: a concurrent acquirer's LIVE intent
+  // blocks reclaim, so two racing reclaimers each see the other and both contend (only a SOLO acquirer reclaims).
+  {
+    const home = mkHome(); const site = strand(home, 1);              // pid 1 ⇒ EPERM ⇒ alive/unknown, NOT ESRCH
+    t("SUCC1-2: an alive/unknown foreign intent ⇒ reclaim CONTENDS (non-ESRCH never authorizes; single-winner)", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // a stranded dir with a DEAD intent AND a concurrent LIVE intent (pid 1) ⇒ not all-dead ⇒ contend (two racers both contend).
+  {
+    const home = mkHome(); const site = strand(home, 999999);
+    writeFileSync(path.join(site.intentDir, `${site.intentPrefix}1.beef`), ""); // a concurrent acquirer's live intent
+    t("SUCC-1 ABA: a dead intent + a concurrent live intent ⇒ CONTEND (no double-holder)", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // no intents at all (empty dir, nothing proving a crash) ⇒ NOT reclaimed even with the opt (requires >=1 confirmed-dead intent).
+  {
+    const home = mkHome(); const site = adoptLockSite(home, SID); mkdirSync(site.lockDir, { recursive: true });
+    t("SUCC-1: an empty dir with NO hold-intent is not provably stranded ⇒ contend", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    rmSync(home, { recursive: true, force: true });
+  }
+
+  // restart-idempotency: after a reclaim+release the sid acquires cleanly again (no residue strands it).
+  {
+    const home = mkHome(); const site = strand(home, 999999);
+    const t1 = acquireHolderLock(site, { reclaimExternalStranded: true }); if (t1) releaseHolderLock(site, t1);
+    const t2 = acquireHolderLock(site, { reclaimExternalStranded: true });
+    t("SUCC-1 idempotent: reclaim → release → re-acquire succeeds (no stranded residue)", t2 !== null);
+    if (t2) releaseHolderLock(site, t2);
+    rmSync(home, { recursive: true, force: true });
+  }
+}
 
 console.log("all shell-succession selftests passed");

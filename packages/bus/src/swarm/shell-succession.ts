@@ -318,7 +318,9 @@ export async function runSuccessionAtStartup(home: string, selfTool: string, sel
   // released in finally.
   try { mkdirSync(path.join(home, ".agenthop", "presence"), { recursive: true }); } catch { /* best effort — must exist for hold-intents */ }
   const site = adoptLockSite(home, sid);
-  const token = acquireHolderLock(site);
+  // SUCC-1: reclaim a crash-stranded EMPTY adopt lock (an owner that died between mkdir and the identity write) IN the single
+  // acquire — the shared exclusive protocol, single-winner, no out-of-band rmdir ABA — so this sid is not un-adoptable forever.
+  const token = acquireHolderLock(site, { reclaimExternalStranded: true });
   if (!token) { log(`succession: adopt lock for ${sid} is held by another shell — coming up fresh`); return null; }
   const pidPath = path.join(home, ".agenthop", presencePidRelPath(sid));
   try {
