@@ -261,23 +261,33 @@ t("flag: ON only when explicitly enabled", egressLedgerEnabled({ SWARM_EGRESS_LE
     const got = readRegularFileFifoSafe(entry, swap);
     t("EL-3-GATE: the production reader is TOCTOU-immune — an in-window swap to a FIFO still yields the ORIGINAL bytes from the fd", got === content && lstatSync(entry).isFIFO());
     unlinkSync(entry); // remove the FIFO the swap planted
-    // (B) negative control: the OLD lstat-then-readFileSync reader with the SAME in-window swap must HANG (go red if it returns)
-    const entry2 = path.join(dir, "entry2.json"); writeFileSync(entry2, content);
-    const oldChild = path.join(dir, "old-reader-child.mts");
-    writeFileSync(oldChild,
-      `import { lstatSync, readFileSync, unlinkSync, writeSync } from "node:fs";\n` +
+    // (B) the REAL public path: recordEgressIntent → appendBody → readRawAt MUST use the FIFO-safe reader. A child drives the
+    //     in-window swap THROUGH the public API via the module hook readRawAt threads, parent-timeout-protected. With the current
+    //     code: the swap lands after readRawAt's fstat ⇒ the tail is read from the fd ⇒ the record completes AND the tail is now a
+    //     FIFO (window provably traversed). Reverting readRawAt to an unsafe read drops the hook thread (⇒ hookFired=false, no
+    //     swap ⇒ assertion red) OR keeps the hook but blocks on readFileSync (⇒ child hangs ⇒ timeout red). Either revert ⇒ RED.
+    const pubChild = path.join(dir, "gate-public-child.mts");
+    const storeUrl = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "egress-ledger-store.ts")).href;
+    writeFileSync(pubChild,
+      `import { recordEgressIntent, __setEntryReadHookForTest } from ${JSON.stringify(storeUrl)};\n` +
+      `import { unlinkSync, lstatSync, writeSync } from "node:fs";\n` +
       `import { spawnSync } from "node:child_process";\n` +
-      `const E = process.argv[2];\n` +
-      `const st = lstatSync(E); if (!st.isFile()) process.exit(3);\n` +                    // phase 1: stat sees a regular file
-      `unlinkSync(E); if (spawnSync("mkfifo", [E]).status !== 0) process.exit(4);\n` +     // SYNC POINT: swap to a FIFO in the window
-      `writeSync(1, "about-to-read\\n");\n` +                                              // unbuffered phase marker (window reached)
-      `const text = readFileSync(E, "utf8");\n` +                                          // OLD reader: BLOCKS forever on the FIFO
-      `writeSync(1, "READ:" + text.length + "\\n");\n`);                                   // never reached under the bug
+      `import path from "node:path";\n` +
+      `const d = process.argv[2];\n` +
+      `const id0 = recordEgressIntent(d, { destHost: "h0", callFace: "relay.post", initiatorSid: "s" }, 1000);\n` + // seed a valid tail (seq 0)
+      `if (!id0) { writeSync(1, "SEED-FAIL\\n"); process.exit(2); }\n` +
+      `const tail = path.join(d, "000000000000.json");\n` +
+      `let fired = false;\n` +
+      `__setEntryReadHookForTest(() => { if (fired) return; fired = true; unlinkSync(tail); if (spawnSync("mkfifo", [tail]).status !== 0) throw new Error("mkfifo"); });\n` + // swap the tail AFTER readRawAt's fstat
+      `writeSync(1, "about-to-record\\n");\n` +
+      `const id1 = recordEgressIntent(d, { destHost: "h1", callFace: "relay.post", initiatorSid: "s" }, 1001);\n` + // reads the tail via readRawAt ⇒ fires the hook
+      `__setEntryReadHookForTest(undefined);\n` +
+      `let isFifo = false; try { isFifo = lstatSync(tail).isFIFO(); } catch {}\n` +
+      `writeSync(1, "DONE hookFired=" + fired + " isFifo=" + isFifo + " recorded=" + (id1 !== null) + "\\n");\n`);
     const tsx = path.join(repoRoot(), "node_modules/.bin/tsx");
-    const started = Date.now();
-    const old = spawnSync(tsx, [oldChild, entry2], { encoding: "utf8", timeout: 4000 });
-    const elapsed = Date.now() - started;
-    t("EL-3-GATE: the OLD lstat-then-readFileSync reader HANGS on an in-window swap (negative control killed by timeout, never completed the read)", /about-to-read/.test(old.stdout ?? "") && !/READ:/.test(old.stdout ?? "") && old.status !== 0 && elapsed >= 3000);
+    const pdir = path.join(dir, "pub-ledger");
+    const pub = spawnSync(tsx, [pubChild, pdir], { encoding: "utf8", timeout: 6000 });
+    t("EL-3-GATE (public path): recordEgressIntent → readRawAt uses the FIFO-safe reader — an in-window swap is survived (record ok, window traversed) and completes timely", pub.status === 0 && /about-to-record/.test(pub.stdout ?? "") && /DONE hookFired=true isFifo=true recorded=true/.test(pub.stdout ?? ""));
   } else { t("EL-3-GATE: SKIPPED (mkfifo unavailable on this host)", true); }
   rmSync(path.dirname(dir), { recursive: true, force: true });
 }

@@ -65,11 +65,18 @@ export function readRegularFileFifoSafe(fp: string, onAfterStat?: () => void): s
   } finally { closeSync(fd); }
 }
 
+/** TEST SEAM (EL-3-GATE): a module-level one-purpose hook `readRawAt` threads into the FIFO-safe reader's `onAfterStat`, so a
+ *  regression gate can drive the lstat-then-read TOCTOU swap FROM THE REAL PUBLIC PATH (the record/read APIs into readRawAt). It
+ *  is the connection point the gate must cover: reverting `readRawAt` to an unsafe read drops this thread, so the gate goes red.
+ *  Production never sets it (undefined means no-op). */
+let entryReadSwapHookForTest: (() => void) | undefined;
+export function __setEntryReadHookForTest(fn: (() => void) | undefined): void { entryReadSwapHookForTest = fn; }
+
 /** Read one `<seq>.json` as raw JSON. THROWS on an unreadable/non-regular file (EL-1/EL-3: unknown, never silently dropped; a
  *  planted FIFO/dir/symlink is rejected via the FIFO-safe fd read BEFORE any blocking read — no lstat->read TOCTOU). Returns null
  *  for a readable-but-corrupt (bad JSON) file so the verifier flags that position. */
 function readRawAt(dir: string, seq: number): unknown {
-  const text = readRegularFileFifoSafe(entryFile(dir, seq)); // throws ENOENT (gap) / ENOTREG (non-regular) / EACCES (unreadable) ⇒ propagates (unknown)
+  const text = readRegularFileFifoSafe(entryFile(dir, seq), entryReadSwapHookForTest); // real path MUST use the FIFO-safe reader (EL-3-GATE threads the test hook here)
   try { return JSON.parse(text); } catch { return null; } // corrupt JSON ⇒ null ⇒ verify flags this position
 }
 
