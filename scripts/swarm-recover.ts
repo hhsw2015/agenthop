@@ -27,12 +27,13 @@ import { herdrAgentName, herdrAgentStates, herdrLaunch, herdrServerReachable, he
 import { parseSnapshot, planResume, resumeCommandForMember, type RosterMember, type PeerLike } from "../packages/bus/src/swarm/resume.js";
 import {
   orchestrateRecover, snapshotStaleSec, breakpointInjectionEnabled, dispatcherNeedsRelaunch, classifyLaunchError,
+  publicRecoveryStatus,
   type RecoverDeps, type RecoveryResult, type DispatcherRecipe, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus, type LaunchOutcome,
 } from "../packages/bus/src/swarm/fleet-recovery.js";
 import {
   captureDispatcherRecipe, dispatcherLive, dispatcherPid, heartbeatFreshSec, captureEnvForPid,
   writeFleetSnapshot, readFleetSnapshot, readEpisode, writeEpisode, claimRecoverLaunch, markLaunching, markLaunchOutcome, breakpointFactsFor,
-  writeRecoveryReceipt, recoverLockSite,
+  writeRecoveryReceipt, readRecoveryReceipt, recoverLockSite,
 } from "../packages/bus/src/swarm/fleet-recovery-store.js";
 import { acquireHolderLock, releaseHolderLock } from "../packages/bus/src/swarm/holder-lock.js";
 
@@ -205,15 +206,23 @@ async function main(): Promise<void> {
   try { result = await orchestrateRecover(snap, rosterLike, deps); }
   finally { await core.close(); releaseLock(); } // FR-6: always release the single-flight lock
 
-  // --- outcome (FR-8: the durable receipt is written INSIDE orchestrateRecover via the writeReceipt dep, as part of the completion
-  //     criteria; a refused write shows up as the "receipt:unwritten" outstanding obligation below, never a silent exit0) ----------
-  log(`receipt: ${result.outstanding.includes("receipt:unwritten") ? "UNWRITTEN (CP-3) — outstanding" : "written -> console/fleet-recovery.json"}`);
+  // --- outcome. The receipt is a WORK SNAPSHOT (r10); the AUTHORITATIVE status is derived through the READ PATH from the same-episode
+  //     marker via publicRecoveryStatus (NOT from the receipt's final flag) — so the displayed/reported status cannot diverge from the
+  //     marker the way an r9 receipt-only predicate could. We re-read the marker + the receipt's final flag back off disk here, so the
+  //     exact path a later reader/rerun would take is the one that produces the displayed verdict. ----------------------------------------
+  log(`receipt: ${result.outstanding.includes("receipt:unwritten") ? "UNWRITTEN (CP-3) — outstanding" : "written (work snapshot) -> console/fleet-recovery.json"}`);
+  const rc = readRecoveryReceipt(H);
+  const receiptFinal = rc && typeof rc.final === "boolean" ? (rc.final as boolean) : null;
+  const status = publicRecoveryStatus(readEpisode(H), receiptFinal);
+  log(`status (authoritative = episode marker): ${status}${status !== "completed" ? " — NOT committed (re-run finalizes; the receipt is a work snapshot, final:true≠committed)" : ""}`);
   const confirmed = result.members.filter((m) => m.verdict === "confirmed").length;
   log(`done: episode ${result.episodeId}; dispatcher ${result.dispatcher.verdict} (wake=${result.dispatcher.wakeStatus ?? "unknown"}); members ${confirmed}/${result.members.length} confirmed; report ${result.reportDelivery}; ${result.outstanding.length} outstanding.`);
   if (result.outstanding.length > 0) { log(`OUTSTANDING (re-run to retry): ${result.outstanding.join("; ")}`); process.exitCode = 1; }
 }
 
-/** The coordinator report text — honest about dispatcher wake + outstanding obligations (FR-8). */
+/** The coordinator report text — honest about dispatcher wake + outstanding obligations (FR-8). It is delivered MID-FLIGHT (before the
+ *  episode marker is written), so it deliberately makes NO completion claim: the AUTHORITATIVE committed status is the episode marker
+ *  (recovery-episode.json), finalized after this report, and the receipt is only a WORK snapshot (r10 — final:true ≠ committed). */
 function reportText(r: RecoveryResult, stale: number, iso: string): string {
   const confirmed = r.members.filter((m) => m.verdict === "confirmed").length;
   return [
@@ -221,7 +230,8 @@ function reportText(r: RecoveryResult, stale: number, iso: string): string {
     `调度器=${r.dispatcher.verdict}(wake=${r.dispatcher.wakeStatus ?? "unknown"}${r.dispatcher.relaunched ? ",已重启" : ""})。`,
     `成员:${confirmed}/${r.members.length} confirmed。`,
     r.outstanding.length > 0 ? `⚠ 未完成(需重做/重跑):${r.outstanding.join("; ")}。` : `全部 confirmed,无未完成项。`,
-    `快照龄 ${(stale / 3600).toFixed(1)}h;详见 console/fleet-recovery.json。`,
+    `提交态=权威 episode marker(recovery-episode.json);收据 console/fleet-recovery.json 仅工作快照(final:true≠已提交)。`,
+    `快照龄 ${(stale / 3600).toFixed(1)}h。`,
   ].join(" ");
 }
 

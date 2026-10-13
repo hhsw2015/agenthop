@@ -419,11 +419,16 @@ export function recoverLockSite(home: string): LockSite {
 }
 // --- recovery receipt projection ------------------------------------------------------------------------------------
 
-export const FLEET_RECEIPT_SCHEMA = "console-fleet-recovery/v1" as const;
+// v2 (FR-8 r10): the receipt is a WORK SNAPSHOT, not a completion record. Every receipt self-identifies its scope + names the
+// authoritative completion source, so a human reading the raw JSON can never mistake `final:true` for "episode committed".
+export const FLEET_RECEIPT_SCHEMA = "console-fleet-recovery/v2" as const;
+export const FLEET_RECEIPT_SCOPE = "work-snapshot" as const;
+export const FLEET_RECEIPT_COMPLETION_AUTHORITY = "episode-marker (recovery-episode.json): `final:true` means recovery WORK finalized, NOT that the episode is committed — read the episode marker for commit status" as const;
 
 export function writeRecoveryReceipt(home: string, receipt: Record<string, unknown>): boolean {
   if (!boundaryOk(home, consoleDir(home))) return false; // FR-9 CP-3 (ancestor chain: .agenthop/swarm/console)
-  writeJsonAtomic(receiptPath(home), { schema: FLEET_RECEIPT_SCHEMA, ...receipt });
+  // scope + completionAuthority stamped at the write PRIMITIVE (not the caller) so EVERY receipt carries the contract (r10).
+  writeJsonAtomic(receiptPath(home), { schema: FLEET_RECEIPT_SCHEMA, scope: FLEET_RECEIPT_SCOPE, completionAuthority: FLEET_RECEIPT_COMPLETION_AUTHORITY, ...receipt });
   return true;
 }
 

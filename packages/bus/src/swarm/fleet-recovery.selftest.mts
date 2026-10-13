@@ -12,12 +12,12 @@ import path from "node:path";
 import {
   FLEET_SNAPSHOT_SCHEMA, scrubValueSecrets, parseDispatcherRecipe, parseFleetSnapshot, snapshotStaleSec,
   dispatcherNeedsRelaunch, dispatcherVerdict, memberVerdict, resolveMemberSid, resolveEpisode, buildBreakpointText,
-  grantedItemsForMember, deliveryDischarged, summarizeOutstanding, orchestrateRecover, classifyLaunchError,
+  grantedItemsForMember, deliveryDischarged, summarizeOutstanding, orchestrateRecover, classifyLaunchError, publicRecoveryStatus,
   type FleetSnapshot, type DispatcherRecipe, type RecoverDeps, type RecoveryEpisode, type EpisodeRead, type PeerLikeMin, type RosterMemberLike, type DeliveryStatus, type DispatcherLiveness, type RecoveryResult, type LaunchOutcome,
 } from "./fleet-recovery.js";
 import {
   writeFleetSnapshot, readFleetSnapshot, recordDispatcherRecipe, readDispatcherRecipe, writeEpisode, readEpisode,
-  claimRecoverLaunch, markLaunchOutcome, liveAttemptsForItems, breakpointFactsFor, writeRecoveryReceipt, readRecoveryReceipt, FLEET_RECEIPT_SCHEMA,
+  claimRecoverLaunch, markLaunchOutcome, liveAttemptsForItems, breakpointFactsFor, writeRecoveryReceipt, readRecoveryReceipt, FLEET_RECEIPT_SCHEMA, FLEET_RECEIPT_SCOPE,
   recoverLockSite, markLaunching,
 } from "./fleet-recovery-store.js";
 import { acquireHolderLock, releaseHolderLock } from "./holder-lock.js";
@@ -131,7 +131,8 @@ try {
     t("FR-8 r9 interrupt: a provisional receipt WAS written (final:false phase) before the refused final", h.state.receipts.some((x) => x.phase === "provisional") && h.state.receipts.some((x) => x.phase === "final"));
     t("FR-8 r9 interrupt: final episode marker completed=false (re-run reuses)", h.state.episodeWrites[h.state.episodeWrites.length - 1]!.completed === false);
   }
-  // FR-8 (r9) DURABLE phase semantics — the on-disk BYTES, not a comment, distinguish provisional from final (reviewer: 字节才是语义).
+  // FR-8 (r9/r10) DURABLE phase semantics — the on-disk BYTES, not a comment, distinguish provisional from final; and (r10) the receipt
+  // SELF-IDENTIFIES as a WORK SNAPSHOT so `final:true` can never be read as "episode committed".
   {
     const dh = freshHome();
     writeRecoveryReceipt(dh, { episodeId: "ep-x", final: false, outstanding: ["finalization:pending"], members: [], reportDelivery: "skipped", notConfirmed: 0 });
@@ -139,7 +140,22 @@ try {
     t("FR-8 r9 durable: PROVISIONAL receipt is identifiable (final===false + finalization:pending ⇒ never a clean all-clear)", prov.final === false && (prov.outstanding as string[]).includes("finalization:pending"));
     writeRecoveryReceipt(dh, { episodeId: "ep-x", final: true, outstanding: [], members: [], reportDelivery: "skipped", notConfirmed: 0 });
     const fin = readRecoveryReceipt(dh)!;
-    t("FR-8 r9 durable: FINAL receipt clears to final===true + outstanding:[] (completion criterion = final && empty)", fin.final === true && (fin.outstanding as string[]).length === 0);
+    // r10: `final:true` means WORK finalized, NOT episode committed — the receipt self-identifies its scope + names the authoritative source.
+    t("FR-8 r10 durable: the receipt self-identifies as a WORK SNAPSHOT (scope + completionAuthority stamped at the write primitive)", fin.scope === FLEET_RECEIPT_SCOPE && typeof fin.completionAuthority === "string" && /episode-marker/.test(fin.completionAuthority as string));
+    t("FR-8 r10 durable: final===true = work finalized; it is NOT an independent completion claim (scope says so)", fin.final === true && fin.scope === "work-snapshot");
+  }
+  // FR-8 (r10) PUBLIC completion criterion — the ONE criterion, derived from the authoritative episode MARKER (never the receipt's
+  // final flag). This closes the r9 split where a receipt-only predicate (final:true && outstanding:[]) diverged from the marker.
+  {
+    const ep = (completed: boolean): EpisodeRead => ({ kind: "present", ep: { episodeId: "e", startedAtSec: 1, snapshotCapturedAtSec: 1, completed } });
+    t("FR-8 r10 public: normal full commit (marker completed=true) ⇒ 'completed'", publicRecoveryStatus(ep(true), true) === "completed");
+    // the two r9-divergence windows: the receipt reads final:true, but the AUTHORITATIVE marker is incomplete ⇒ NOT 'completed'
+    t("FR-8 r10 public: final-marker-refusal (marker incomplete, receipt final:true) ⇒ 'pending-commit' (NOT completed — reader not fooled)", publicRecoveryStatus(ep(false), true) === "pending-commit");
+    t("FR-8 r10 public: SIGKILL-before-marker (marker absent, receipt final:true) ⇒ 'pending-commit' (NOT completed)", publicRecoveryStatus({ kind: "absent" }, true) === "pending-commit");
+    t("FR-8 r10 public: interrupt-before-finalize (marker incomplete, receipt final:false) ⇒ 'pending-work'", publicRecoveryStatus(ep(false), false) === "pending-work");
+    t("FR-8 r10 public: final-receipt-refused ⇒ provisional (final:false) ⇒ explicit 'pending-work'", publicRecoveryStatus(ep(false), false) === "pending-work");
+    t("FR-8 r10 public: marker unreadable ⇒ 'unknown' (FC-2, never guess completed)", publicRecoveryStatus({ kind: "unreadable" }, true) === "unknown");
+    t("FR-8 r10 public: final:true ALONE never reads completed when the marker disagrees", publicRecoveryStatus(ep(false), true) !== "completed" && publicRecoveryStatus({ kind: "absent" }, true) !== "completed");
   }
   // FR-8 r4: an 'unknown' launch outcome is recorded as unknown (not failed) ⇒ never a blind retry
   {

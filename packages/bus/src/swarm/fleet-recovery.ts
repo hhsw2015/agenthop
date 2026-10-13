@@ -252,6 +252,25 @@ export function resolveEpisode(read: EpisodeRead, mint: () => string): EpisodeDe
   return { action: "new", episodeId: mint() };
 }
 
+export type PublicRecoveryStatus = "completed" | "pending-commit" | "pending-work" | "unknown";
+
+/**
+ * The PUBLIC recovery status for any reader/display (FR-8 r10 — the ONE completion criterion). The episode MARKER is the sole
+ * authority: a reader consults it, NEVER the receipt's `final` flag. The receipt only REFINES the not-yet-committed case.
+ *   - marker unreadable          ⇒ "unknown"      (FC-2 — never guess completed from a read fault);
+ *   - marker present + completed  ⇒ "completed"    (authoritative; the receipt is irrelevant to this verdict);
+ *   - marker incomplete / absent  ⇒ NOT committed — refine by the receipt's WORK-finalization flag:
+ *       receiptFinal === true     ⇒ "pending-commit" (work finalized, the commit marker did not land — a rerun finalizes it);
+ *       otherwise (false / null)  ⇒ "pending-work"   (final:false, or no receipt — recovery work itself is not finalized).
+ * `final:true` ALONE never reads as "completed" — this closes the r9 split where a receipt-only criterion diverged from the marker.
+ * Pure.
+ */
+export function publicRecoveryStatus(episode: EpisodeRead, receiptFinal: boolean | null): PublicRecoveryStatus {
+  if (episode.kind === "unreadable") return "unknown";
+  if (episode.kind === "present" && episode.ep.completed === true) return "completed";
+  return receiptFinal === true ? "pending-commit" : "pending-work";
+}
+
 // ============================================================================================================
 // FR-10 — breakpoint re-pointer from AUTHORITATIVE in-flight work (granted board items + live control-log attempts)
 // ============================================================================================================
@@ -400,10 +419,12 @@ export interface RecoverDeps {
   deliverBreakpoint: (sid: string, text: string, episodeId: string) => DeliveryStatus;
   /** Deliver the coordinator report with the REAL result (FR-8: never a zeroed placeholder). "skipped" when no coordinator. */
   deliverReport: (result: RecoveryResult, episodeId: string) => DeliveryStatus;
-  /** FR-8 (r9): persist the durable receipt in ONE of two phases. "provisional" MUST land a receipt that no reader can mistake for a
-   *  clean completion (the shell stamps `final:false` + an explicit `finalization:pending` obligation); "final" rewrites it clean/settled.
-   *  A refused write ⇒ outstanding (exit≠0). The receipt is a projection — the AUTHORITATIVE completion+rerun criterion is the episode
-   *  marker (resolveEpisode), written LAST; a receipt-only reader uses `final===true && outstanding===[]`. */
+  /** FR-8 (r10): persist the durable receipt in ONE of two phases. The receipt is a **WORK SNAPSHOT**, never a completion authority:
+   *  `provisional` stamps `final:false` + an explicit `finalization:pending` obligation (recovery work NOT finalized — a reader must
+   *  not mistake it for done); `final` rewrites it `final:true` once the work (members/report/receipt) is finalized. `final:true` means
+   *  "recovery WORK finalized", it does NOT mean "episode committed" — the receipt is written BEFORE the marker, so it cannot and must
+   *  not claim commit. The SOLE authoritative completion/rerun criterion is the episode marker (resolveEpisode/readEpisode); the public
+   *  status is derived by `publicRecoveryStatus(episode, receiptFinal)`, which reads the marker first. A refused write ⇒ outstanding (exit≠0). */
   writeReceipt: (result: RecoveryResult, phase: "provisional" | "final") => boolean;
 }
 
@@ -479,9 +500,10 @@ export async function orchestrateRecover(snap: FleetSnapshot, roster: readonly R
   //    before finalizing. Comments are not semantics; bytes are.) A refused provisional write is itself outstanding.
   if (!deps.writeReceipt(result, "provisional")) result = { ...result, outstanding: [...result.outstanding, "receipt:unwritten"] };
 
-  // 6) FR-8 (r9): FINAL receipt — persisted with `final:true` + the settled outstanding. This is the receipt's COMMIT (provisional→final),
-  //    written UNCONDITIONALLY, not a best-effort compensation (another best-effort re-write would leave the same crash window). A refused
-  //    final write leaves the `final:false` provisional receipt on disk — identifiable as unfinished — and is itself outstanding.
+  // 6) FR-8 (r9): FINAL receipt — persisted with `final:true` + the settled outstanding. This finalizes the WORK SNAPSHOT (provisional→
+  //    final), written UNCONDITIONALLY, not a best-effort compensation (another best-effort re-write would leave the same crash window). It
+  //    does NOT claim the episode is committed (r10: that is the marker's job alone). A refused final write leaves the `final:false`
+  //    provisional receipt on disk — identifiable as unfinished work — and is itself outstanding.
   if (!deps.writeReceipt(result, "final")) result = { ...result, outstanding: [...result.outstanding, "receipt-final:unwritten"] };
 
   // 7) FR-8 (r9): the episode marker is the AUTHORITATIVE completion + rerun criterion, written LAST. completed=true ⟺ BOTH receipt phases
