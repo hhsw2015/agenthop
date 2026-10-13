@@ -623,6 +623,26 @@ describe("writeInbox — idempotency key (durable-first credential, exactly-once
     finally { __setDeliverableProbeHookForTest(undefined); }
   });
 
+  test("DWS-R3-1 top: an OBSERVED top-level that vanishes before validation ⇒ deliverableProbe is UNKNOWN (not invalid)", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    const top = path.join(dirOf("s1"), "evt-k.json");
+    writeFileSync(top, JSON.stringify(validInboxMsg(digest("m", 1))));          // a valid top-level, listed by readdir
+    __setDeliverableProbeHookForTest(() => { rmSync(top, { force: true }); });  // consumed/removed after readdir, before validation
+    try { expect(deliverableProbe(dirOf("s1"), "evt-k")).toBe("unknown"); }     // observed-then-gone ⇒ UNKNOWN (old r4 folded it to invalid)
+    finally { __setDeliverableProbeHookForTest(undefined); }
+  });
+
+  test("DWS-R3-1 top (public path): a top-level consumed in the EEXIST window ⇒ pending HOLD, credential not released", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    writeFileSync(path.join(dirOf("s1"), "evt-k.json"), JSON.stringify(validInboxMsg(digest("m", 1)))); // valid top ⇒ linkSync EEXIST
+    __setPublishEexistHookForTest(() => { for (const c of claimInbox(HOME, ["s1"], "pidY")) ackInbox(c.file); }); // claimed+acked in the window ⇒ vanishes entirely
+    let threw = false;
+    try { writeInbox(HOME, "s1", digest("brief", 2), "evt-k"); } catch { threw = true; }
+    __setPublishEexistHookForTest(undefined);
+    expect(threw).toBe(false);                                                 // UNKNOWN ⇒ no throw (old r4: top absent ⇒ invalid ⇒ threw after rollback)
+    expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("pending");         // dedup obligation HELD — credential NOT rolled back to absent
+  });
+
   test("FC-7: a legacy keyless publication of the SAME notice is adopted, not duplicated by the new key", () => {
     writeInbox(HOME, "s1", digest("morning brief", 1));                   // legacy random name, no key
     writeInbox(HOME, "s1", digest("morning brief", 2), "evt-k");          // keyed re-publish of the SAME notice

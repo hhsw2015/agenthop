@@ -340,18 +340,24 @@ export function deliverableProbe(dir: string, idempotencyKey: string): "valid" |
   let names: string[];
   try { names = readdirSync(dir); } catch { return "unknown"; } // unreadable dir ⇒ cannot confirm ⇒ HOLD
   if (deliverableProbeHookForTest) { const h = deliverableProbeHookForTest; deliverableProbeHookForTest = undefined; try { h(); } catch { /* test seam */ } } // one-shot: lets a test vanish a just-listed claim BEFORE it is validated (DWS-R3-1 observed-then-consumed)
-  let unknown = false; // a listed claim that vanished/was unreadable before we could validate it ⇒ cannot prove un-delivered
+  let unknown = false;     // a candidate that vanished/was unreadable before we could validate it ⇒ cannot prove un-delivered
+  let sawInvalid = false;  // a candidate PROVEN non-deliverable (dir/symlink/fifo/bad-JSON/bad-schema) ⇒ evidence of what the key became
   for (const n of names) {
     if (!n.startsWith(`${base}.claim-`)) continue;
     const s = probeCandidate(path.join(dir, n));
     if (s === "valid") return "valid";
     if (s === "absent" || s === "unknown") unknown = true; // observed-then-gone / unreadable ⇒ UNKNOWN, do not release the obligation
-    // s === "invalid" ⇒ a proven-bad claim ⇒ skip, keep scanning for a valid one
+    else sawInvalid = true; // "invalid": a proven-bad claim — evidence the key's object is garbage (keep scanning for a valid one)
   }
   const top = probeCandidate(path.join(dir, base));
   if (top === "valid") return "valid";
   if (top === "unknown") unknown = true; // the unclaimed path is unreadable ⇒ cannot verify
-  // top === "absent" (gone, e.g. renamed into a claim) or "invalid" (proven bad) is not itself UNKNOWN
+  else if (top === "invalid") sawInvalid = true;
+  // DWS-R3-1 (top sub-facet): publishOnce probes ONLY after a confirmed linkSync EEXIST on `<key>.json`, so the top-level WAS
+  // observed. A top that is now ABSENT (vanished after that observation — e.g. normally claimed + processed) cannot be proven
+  // un-delivered ⇒ UNKNOWN (HOLD), symmetric with the claim branch. The ONE exception: a proven-invalid object (a claim, or the
+  // top itself) accounts for what the key became ⇒ it is garbage, safe to refuse + recover (that is the DWS-1-ADOPT case).
+  else if (top === "absent" && !sawInvalid) unknown = true;
   return unknown ? "unknown" : "invalid";
 }
 
