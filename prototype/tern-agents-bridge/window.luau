@@ -49,15 +49,23 @@ end
 -- POSIX unlink is atomic, so when two window VMs both read the same request only one remove succeeds; the loser gets ENOENT and
 -- skips. A read failure leaves the request in place (never delete what we could not read) and it is retried next tick. This is
 -- AT-MOST-ONCE per claim, NOT crash-safe exactly-once: tern.fs exposes no rename/O_EXCL (see tern.d.luau), and a crash between the
--- claim and the results write loses that result. Recovery obligation is on the bash side — a missing results/<id>.json after a
--- bounded wait means UNKNOWN (re-issue with a fresh id), never "it ran". A remove failing with EACCES leaves the request
--- stuck-but-unexecuted (the safe direction: no double-run). The bridge does not, and cannot here, provide exactly-once.
+-- claim and the results write loses that result. A remove failing with EACCES leaves the request stuck-but-unexecuted (safe
+-- direction: no double-run). The bridge does not, and cannot here, provide exactly-once.
 --
--- FINDING (start, re-scoped per review TERN-3): a non-empty-prompt default-OMP start issued from this poll loop left the mirror tick
--- frozen with no result; the reviewer reproduced the same budget failure from an ISOLATED palette action (log: "command start
--- exceeded 50 ms, disabled until reload"). A tick/record freeze alone therefore cannot distinguish 50ms-budget-exit, plugin-disable,
--- exception, or sustained sync blocking — "start blocks the VM" is NOT an established cause. What IS observed: start is unsafe to
--- call from this status poll (it stops the mirror). list() (read-only) in the loop is safe, and is the one path proven here.
+-- UNKNOWN RECOVERY (review TERN-1-R2): a missing results/<id>.json after a bounded wait means UNKNOWN, and UNKNOWN DOES NOT release
+-- the dedup obligation (swarm ruling). "Cannot confirm it ran" is NOT "may assume it did not". So recovery is OP-CLASS-SPECIFIC:
+--   * read-only (list/transcript): re-issue freely with a new id — a repeat is just another observation, no side effect.
+--   * non-idempotent (start/ask): DO NOT auto-reissue. The op may have run and only the receipt was lost; a blind re-issue
+--     double-executes. The caller must either verify the original op's effect, carry an independent business idempotency key, or
+--     explicitly accept the duplicate risk / HOLD for a human. The bridge never promises generic new-id reissue as safe recovery.
+--
+-- FINDING (start, design risk — review TERN-3): in the ONE observed run, a non-empty-prompt default-OMP start issued from this poll
+-- loop left the mirror tick frozen with no result. Separately, the reviewer saw an ISOLATED palette action hit "command start
+-- exceeded 50 ms, disabled until reload". These are DIFFERENT observations, not proven to share a cause; a tick/record freeze
+-- cannot by itself distinguish budget-exit, plugin-disable, exception, or sustained blocking — "start blocks the VM" is NOT
+-- established. Treat calling start (or any potentially long op) from this status poll as a DESIGN RISK to avoid, not a proven
+-- property; moving such ops to an action context / dedicated window is a SUGGESTION, not a validated landing. list() is read-only
+-- and is the only path exercised here without a stall — an observation, not a safety proof.
 local function drain(cx)
   local names = {}
   pcall(function() names = tern.fs.list(REQ) end)
