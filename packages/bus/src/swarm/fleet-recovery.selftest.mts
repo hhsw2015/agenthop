@@ -115,9 +115,12 @@ try {
     const h = makeHarness({ peersAfter: [{ stableId: "m1", title: "Work-m1", tool: "claude", cwd: "/r1" }], failWriteEpisodeAfter: 1 });
     const r = await orchestrateRecover(goodSnap, roster, h.deps);
     t("FR-8 seam3: final writeEpisode false ⇒ 'episode-final:unwritten' outstanding (exit≠0)", r.outstanding.includes("episode-final:unwritten"));
-    // FR-8 (r7): under receipt先行 the completed marker gates on the receipt; a FINAL marker write failure leaves the episode NOT completed
-    // (the write never committed completed=true) ⇒ a re-run reuses it. The receipt (written first) is not required to carry the marker fault.
-    t("FR-8 r7: receipt is written before the failing final episode marker (completion gates on receipt, not vice-versa)", (() => { const o = h.state.writeOrder; return o[o.length - 2] === "receipt" && o[o.length - 1] === "episode"; })());
+    // FR-8 (r8, RESTORED regression): the DURABLE receipt must carry the later obligation. receipt先行 writes a PROVISIONAL receipt first
+    // (so the marker gates on it ⇒ no dup-episode), then RE-WRITES the receipt with the settled outstanding on a marker refusal. r7 had
+    // dropped this — it left the published receipt at outstanding:[] (a false "all clear"); r4/r5 require "recoverable commit + unfinished
+    // semantics" to BOTH hold.
+    t("FR-8 r8: the DURABLE receipt carries episode-final:unwritten (not a false outstanding:[])", h.state.receiptArg !== null && h.state.receiptArg.outstanding.includes("episode-final:unwritten"));
+    t("FR-8 r8: the PROVISIONAL receipt was written BEFORE the final episode marker (gates completion ⇒ no dup-episode)", (() => { const o = h.state.writeOrder; const fe = o.lastIndexOf("episode"); return o.indexOf("receipt") >= 0 && o.indexOf("receipt") < fe; })());
   }
   // FR-8 r4: an 'unknown' launch outcome is recorded as unknown (not failed) ⇒ never a blind retry
   {
