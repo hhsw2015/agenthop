@@ -56655,7 +56655,7 @@ function legacyInboxKeys(proj, self) {
 }
 
 // packages/bus/src/inbox.ts
-import { appendFileSync as appendFileSync4, existsSync as existsSync5, linkSync, lstatSync, mkdirSync as mkdirSync7, readFileSync as readFileSync6, readdirSync as readdirSync5, renameSync as renameSync3, unlinkSync as unlinkSync3, watch as watch2, writeFileSync as writeFileSync5 } from "node:fs";
+import { appendFileSync as appendFileSync4, existsSync as existsSync5, linkSync, lstatSync, mkdirSync as mkdirSync7, readFileSync as readFileSync6, readdirSync as readdirSync5, renameSync as renameSync3, unlinkSync as unlinkSync3, watch as watch2, writeFileSync as writeFileSync5, openSync, fstatSync, readSync, closeSync, constants as fsc } from "node:fs";
 
 // packages/bus/src/swarm/flag-default.ts
 function flagDefaultOn(envVal) {
@@ -56946,7 +56946,78 @@ function eventMessagePresent(dir, idempotencyKey) {
     return false;
   }
 }
-function publishOnce(dir, idempotencyKey, valid) {
+function probeCandidate(fp) {
+  let fd;
+  try {
+    fd = openSync(fp, fsc.O_RDONLY | fsc.O_NONBLOCK | fsc.O_NOFOLLOW);
+  } catch (e) {
+    const code2 = e.code;
+    if (code2 === "ENOENT")
+      return "absent";
+    if (code2 === "ELOOP")
+      return "invalid";
+    return "unknown";
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile())
+      return "invalid";
+    const buf = Buffer.allocUnsafe(Number(st.size));
+    let off = 0;
+    try {
+      while (off < st.size) {
+        const r = readSync(fd, buf, off, Number(st.size) - off, null);
+        if (r === 0)
+          break;
+        off += r;
+      }
+    } catch {
+      return "unknown";
+    }
+    try {
+      return validInboxMsg(JSON.parse(buf.toString("utf8", 0, off))) !== null ? "valid" : "invalid";
+    } catch {
+      return "invalid";
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+function deliverableProbe(dir, idempotencyKey) {
+  const base = `${idempotencyKey}.json`;
+  let names;
+  try {
+    names = readdirSync5(dir);
+  } catch {
+    return "unknown";
+  }
+  if (deliverableProbeHookForTest) {
+    const h = deliverableProbeHookForTest;
+    deliverableProbeHookForTest = undefined;
+    try {
+      h();
+    } catch {}
+  }
+  let unknown3 = false;
+  for (const n of names) {
+    if (!n.startsWith(`${base}.claim-`))
+      continue;
+    const s = probeCandidate(path14.join(dir, n));
+    if (s === "valid")
+      return "valid";
+    if (s === "absent" || s === "unknown")
+      unknown3 = true;
+  }
+  const top = probeCandidate(path14.join(dir, base));
+  if (top === "valid")
+    return "valid";
+  if (top === "unknown" || top === "absent")
+    unknown3 = true;
+  return unknown3 ? "unknown" : "invalid";
+}
+var publishEexistHookForTest;
+var deliverableProbeHookForTest;
+function publishOnce(dir, idempotencyKey, valid, randHex = () => randomBytes6(8).toString("hex")) {
   const cred = credPathOf(dir, idempotencyKey);
   const msgFile = path14.join(dir, `${idempotencyKey}.json`);
   if (idempotencyKey !== "." && idempotencyKey !== "..") {
@@ -56980,15 +57051,54 @@ function publishOnce(dir, idempotencyKey, valid) {
     writeCredState(cred, "published");
     return "already";
   }
-  try {
-    const tmp = `${msgFile}.tmp-${Math.random().toString(36).slice(2, 8)}`;
-    writeFileSync5(tmp, JSON.stringify(valid), { mode: 384 });
-    renameSync3(tmp, msgFile);
-  } catch (e) {
+  let tmp = "";
+  for (let t2 = 0;; t2++) {
+    tmp = `${msgFile}.tmp-${randHex()}`;
     try {
-      unlinkSync3(cred);
+      writeFileSync5(tmp, JSON.stringify(valid), { flag: "wx", mode: 384 });
+      break;
+    } catch (e) {
+      if (e.code === "EEXIST" && t2 < 8)
+        continue;
+      try {
+        unlinkSync3(cred);
+      } catch {}
+      throw e;
+    }
+  }
+  try {
+    try {
+      linkSync(tmp, msgFile);
+    } catch (e) {
+      if (e.code === "EEXIST") {
+        if (publishEexistHookForTest) {
+          const h = publishEexistHookForTest;
+          publishEexistHookForTest = undefined;
+          try {
+            h();
+          } catch {}
+        }
+        const probe = deliverableProbe(dir, idempotencyKey);
+        if (probe === "valid") {
+          writeCredState(cred, "published");
+          return "already";
+        }
+        if (probe === "unknown")
+          return "pending";
+        try {
+          unlinkSync3(cred);
+        } catch {}
+        throw new Error(`publishOnce: ${msgFile} exists but is not a valid deliverable message — not adopting (retry after it clears)`);
+      }
+      try {
+        unlinkSync3(cred);
+      } catch {}
+      throw e;
+    }
+  } finally {
+    try {
+      unlinkSync3(tmp);
     } catch {}
-    throw e;
   }
   writeCredState(cred, "published");
   return "published";
@@ -58224,7 +58334,8 @@ function delay2(ms) {
 }
 
 // packages/bus/src/swarm/shell-succession.ts
-import { readFileSync as readFileSync9, writeFileSync as writeFileSync8, unlinkSync as unlinkSync5, mkdirSync as mkdirSync11, readdirSync as readdirSync9 } from "node:fs";
+import { readFileSync as readFileSync9, writeFileSync as writeFileSync8, unlinkSync as unlinkSync5, mkdirSync as mkdirSync11, readdirSync as readdirSync9, renameSync as renameSync5, openSync as openSync2, closeSync as closeSync2, constants as FS } from "node:fs";
+import { randomBytes as randomBytes10 } from "node:crypto";
 import os2 from "node:os";
 import path18 from "node:path";
 
@@ -58582,11 +58693,35 @@ function successionSwapPath(home, sid) {
   const safe = sid.replace(/[^A-Za-z0-9._-]/g, "_");
   return path18.join(home, ".agenthop", "swarm", "succession", `${safe}.json`);
 }
-function writeSuccessionSwap(home, sid, swappedAtSec) {
+function writeSuccessionSwap(home, sid, swappedAtSec, randHex = () => randomBytes10(6).toString("hex")) {
   try {
     const p = successionSwapPath(home, sid);
     mkdirSync11(path18.dirname(p), { recursive: true });
-    writeFileSync8(p, JSON.stringify({ sid, swappedAtSec }), { mode: 384 });
+    let fd = -1;
+    let tmp = "";
+    for (let t2 = 0;; t2++) {
+      tmp = `${p}.tmp-${randHex()}`;
+      try {
+        fd = openSync2(tmp, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL, 384);
+        break;
+      } catch (e) {
+        if (e.code === "EEXIST" && t2 < 8)
+          continue;
+        return;
+      }
+    }
+    try {
+      writeFileSync8(fd, JSON.stringify({ sid, swappedAtSec }));
+    } finally {
+      closeSync2(fd);
+    }
+    try {
+      renameSync5(tmp, p);
+    } catch {
+      try {
+        unlinkSync5(tmp);
+      } catch {}
+    }
   } catch {}
 }
 
