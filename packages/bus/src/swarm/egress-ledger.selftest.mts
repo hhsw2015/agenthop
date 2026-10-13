@@ -153,7 +153,7 @@ t("flag: ON only when explicitly enabled", egressLedgerEnabled({ SWARM_EGRESS_LE
   rmSync(path.join(dir, "000000000000.json")); mkdirSync(path.join(dir, "000000000000.json")); // the tail is now a DIRECTORY (non-regular)
   let threw = false, refused: string | null = "x";
   try { refused = recordEgressIntent(dir, { destHost: "h1", callFace: "relay.post", initiatorSid: "s" }, 1001); } catch { threw = true; }
-  t("EL-3: a non-regular (directory) tail ⇒ refused via the lstat gate, NEVER throws into the caller", threw === false && refused === null);
+  t("EL-3: a non-regular (directory) tail ⇒ refused via the fd fstat gate, NEVER throws into the caller", threw === false && refused === null);
   // GAP trace: a failed record writes a visible stderr line (fail-open is not silent)
   const origWrite = process.stderr.write.bind(process.stderr);
   let gapLine = "";
@@ -216,6 +216,30 @@ t("flag: ON only when explicitly enabled", egressLedgerEnabled({ SWARM_EGRESS_LE
     const after = recordEgressIntent(dir, { destHost: "h", callFace: "relay.post", initiatorSid: "s" }, 1001);
     t("EL-3: after the FIFO is removed, the next record succeeds (subsequent sends still work)", after !== null && readdirSync(dir).filter((n) => /^\d+\.json$/.test(n)).length === 1);
   } else { t("EL-3: SKIPPED (mkfifo unavailable on this host)", true); }
+  rmSync(path.dirname(dir), { recursive: true, force: true });
+}
+
+// ── EL-3 (codex:Work r3): the ENTRY read (the authoritative tail in appendBody) must ALSO be FIFO-safe — the prior lstat-then-
+//    readFileSync had a TOCTOU and blocked on a FIFO. FIX: readRawAt uses the same O_NONBLOCK|O_NOFOLLOW + fstat-on-fd read.
+//    Gate (reviewer): a FIFO authoritative tail ⇒ the next record returns TIMELY + GAP (never hangs); a complete legal entry
+//    positive control still reads; once the FIFO is gone, records continue. ──
+{
+  const dir = mkDir();
+  const a = recordEgressIntent(dir, { destHost: "h0", callFace: "relay.post", initiatorSid: "s" }, 1000); // a real seq-0 tail
+  t("EL-3 (entry): positive control — a complete legal entry reads/records fine", a !== null && readEgressLedger(dir).length === 1);
+  const tail = path.join(dir, "000000000000.json");
+  unlinkSync(tail); // remove the real tail...
+  const mk = spawnSync("mkfifo", [tail], { encoding: "utf8" }); // ...and plant a FIFO as the authoritative-tail read target
+  const isFifo = mk.status === 0 && (() => { try { return lstatSync(tail).isFIFO(); } catch { return false; } })();
+  if (isFifo) {
+    const started = Date.now();
+    const refused = recordEgressIntent(dir, { destHost: "h1", callFace: "relay.post", initiatorSid: "s" }, 1001); // appendBody reads the FIFO tail
+    const elapsed = Date.now() - started;
+    t("EL-3 (entry): a FIFO authoritative tail ⇒ record returns TIMELY (no readFileSync hang) + refused", refused === null && elapsed < 2000);
+    unlinkSync(tail); // the planted FIFO is gone
+    const b = recordEgressIntent(dir, { destHost: "h2", callFace: "relay.post", initiatorSid: "s" }, 1002);
+    t("EL-3 (entry): after the FIFO tail is removed, records continue", b !== null && readEgressLedger(dir).length === 1);
+  } else { t("EL-3 (entry): SKIPPED (mkfifo unavailable on this host)", true); }
   rmSync(path.dirname(dir), { recursive: true, force: true });
 }
 

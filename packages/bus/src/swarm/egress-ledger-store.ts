@@ -13,7 +13,7 @@
  *   mkdir->publish empty window — so a crash while recording cannot permanently disable the ledger (unlike the pre-reclaim
  *   holder-lock dir default).
  */
-import { mkdirSync, writeFileSync, renameSync, readdirSync, readFileSync, lstatSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readdirSync, readFileSync, lstatSync, rmSync, openSync, fstatSync, readSync, closeSync, constants as FS } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { acquireSingleFlight } from "./single-flight.js";
@@ -46,14 +46,28 @@ function listSeqs(dir: string): number[] {
   return names.map((n) => seqRe.exec(n)).filter((m): m is RegExpExecArray => m !== null).map((m) => Number(m[1])).sort((a, b) => a - b);
 }
 
+/** FIFO-SAFE read of a regular file's full contents (EL-3, entry path). A plain `readFileSync` on a FIFO BLOCKS until a writer
+ *  appears, and a prior `lstat` gate has a TOCTOU window (the path can be swapped to a FIFO between the lstat and the read). This
+ *  opens O_RDONLY|O_NONBLOCK|O_NOFOLLOW (a FIFO opens immediately, a symlink ⇒ ELOOP), fstats the SAME fd to confirm a regular
+ *  file (closing the lstat->read TOCTOU), then reads the whole file sized from that fstat (an entry is not a fixed-size pid
+ *  record). ENOENT propagates (a gap); a non-regular/symlink/would-block path throws and NEVER blocks the caller. */
+function readRegularFileFifoSafe(fp: string): string {
+  const fd = openSync(fp, FS.O_RDONLY | FS.O_NONBLOCK | FS.O_NOFOLLOW); // ENOENT (gap) / ELOOP (symlink) / EACCES propagate with .code
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw Object.assign(new Error(`${fp} is not a regular file`), { code: "ENOTREG" }); // FIFO/dir/socket ⇒ reject, no blocking read
+    const buf = Buffer.allocUnsafe(Number(st.size));
+    let off = 0;
+    while (off < st.size) { const r = readSync(fd, buf, off, Number(st.size) - off, null); if (r === 0) break; off += r; } // entries are rename-atomic ⇒ size is stable
+    return buf.toString("utf8", 0, off);
+  } finally { closeSync(fd); }
+}
+
 /** Read one `<seq>.json` as raw JSON. THROWS on an unreadable/non-regular file (EL-1/EL-3: unknown, never silently dropped; a
- *  FIFO/dir is rejected by the lstat gate BEFORE any blocking read). Returns null for a readable-but-corrupt (bad JSON) file so
- *  the verifier flags that position. */
+ *  planted FIFO/dir/symlink is rejected via the FIFO-safe fd read BEFORE any blocking read — no lstat->read TOCTOU). Returns null
+ *  for a readable-but-corrupt (bad JSON) file so the verifier flags that position. */
 function readRawAt(dir: string, seq: number): unknown {
-  const fp = entryFile(dir, seq);
-  const st = lstatSync(fp); // throws ENOENT (a gap — caller/verify handles) ; rejects non-regular below
-  if (!st.isFile()) throw Object.assign(new Error(`egress entry ${seq} is not a regular file`), { code: "ENOTREG" });
-  const text = readFileSync(fp, "utf8"); // throws on EACCES/EIO ⇒ unreadable ⇒ propagates (unknown)
+  const text = readRegularFileFifoSafe(entryFile(dir, seq)); // throws ENOENT (gap) / ENOTREG (non-regular) / EACCES (unreadable) ⇒ propagates (unknown)
   try { return JSON.parse(text); } catch { return null; } // corrupt JSON ⇒ null ⇒ verify flags this position
 }
 
