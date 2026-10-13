@@ -44,6 +44,26 @@ export type DiffFile = { file: string; addedLines: number[] };
 
 const HUNK_RE = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
 
+/** Losslessly decode a Git-quoted path (SP-1). With the default core.quotePath, Git wraps a name containing non-ASCII bytes, a
+ *  double-quote, a backslash, or a control char in `"..."` with C-style escapes (`\a \b \t \n \v \f \r \" \\` and octal `\nnn`
+ *  for raw bytes); the octal bytes are UTF-8. An unquoted token is returned unchanged (its bytes are already literal). Disabling
+ *  quotePath does NOT cover a literal quote/control char, so we DECODE rather than suppress. */
+export function unquoteGitPath(p: string): string {
+  if (!(p.length >= 2 && p.startsWith('"') && p.endsWith('"'))) return p;
+  const inner = p.slice(1, -1);
+  const bytes: number[] = [];
+  const simple: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i]!;
+    if (c !== "\\") { bytes.push(c.charCodeAt(0) & 0xff); continue; }
+    const n = inner[i + 1];
+    if (n === undefined) { bytes.push(0x5c); break; }
+    if (n >= "0" && n <= "7") { const oct = (inner.slice(i + 1, i + 4).match(/^[0-7]{1,3}/) ?? [""])[0]; bytes.push(parseInt(oct, 8) & 0xff); i += oct.length; continue; }
+    bytes.push(simple[n] ?? (n.charCodeAt(0) & 0xff)); i += 1;
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
 /** Parse `git diff` unified output. Returns, per file (new path), the sorted new-file line numbers of added (`+`) lines. A
  *  deleted file (new path `/dev/null`) contributes nothing. Pure + deterministic. */
 export function parseUnifiedDiff(diff: string): DiffFile[] {
@@ -52,8 +72,8 @@ export function parseUnifiedDiff(diff: string): DiffFile[] {
   let newLine = 0;
   for (const raw of diff.split("\n")) {
     if (raw.startsWith("+++ ")) {
-      const p = raw.slice(4).trim();
-      file = p === "/dev/null" ? null : p.replace(/^b\//, "");
+      const decoded = unquoteGitPath(raw.slice(4).replace(/\r$/, "")); // Git C-quotes non-ASCII/special names ⇒ decode losslessly (SP-1)
+      file = decoded === "/dev/null" ? null : decoded.replace(/^b\//, "");
       if (file && !byFile.has(file)) byFile.set(file, []);
       continue;
     }
@@ -93,6 +113,12 @@ const windowText = (lines: string[], from1: number, to1: number): string =>
 /** Classify a READ call: OK if a catch distinguishing ENOENT is in view; MISS if a catch clearly FOLDS the fault (empty/returns a
  *  default, no ENOENT, no rethrow); REVIEW otherwise (no local catch ⇒ may intentionally propagate — the author's call). */
 export function classifyRead(lines: string[], n: number, fn: string): { verdict: Verdict; note: string } {
+  const callLine = lines[n - 1] ?? "";
+  // 以名定态 (name-implies-state — DWS-1-ADOPT material, coordinator): a readdir scan that decides a boolean from entry NAMES
+  // (.some/.filter/.find + startsWith/endsWith/includes) can conflate "a name like X exists" with "a valid/complete file X is
+  // present" — the exact shape of the claim-name-only adopt bug. High-signal + narrow, so flag it for review regardless of catch.
+  if (fn === "readdirSync" && /\.(some|filter|find)\s*\(/.test(callLine) && /startsWith|endsWith|includes/.test(callLine))
+    return { verdict: "REVIEW", note: `readdirSync: decides state from entry NAMES (以名定态) — a matching NAME is not proof of a valid/complete file; if this gates a success/delivery/"already" decision, read + VALIDATE the file's content (DWS-1-ADOPT), do not trust the name` };
   const below = windowText(lines, n, n + 10);
   const hasCatch = /\bcatch\b/.test(below);
   if (!hasCatch) return { verdict: "REVIEW", note: `${fn}: no local catch in view — does it intentionally propagate (throw = unknown), or should it distinguish ENOENT vs other?` };
@@ -122,8 +148,10 @@ export function classifyWrite(lines: string[], n: number, fn: string): { verdict
 export function classifyAppend(lines: string[], n: number, fn: string): { verdict: Verdict; note: string } {
   const around = windowText(lines, n - 8, n + 2);
   if (/O_APPEND|single[-\s]?writer|single[-\s]?active|atomic append|atomic-append/i.test(around))
-    return { verdict: "OK", note: `${fn}: an explicit append-atomicity judgment is recorded nearby (single-writer / O_APPEND)` };
-  return { verdict: "REVIEW", note: `${fn}: append atomicity not evidently judged — confirm a SINGLE writer and line < PIPE_BUF (O_APPEND atomic), or switch to an atomic temp+rename` };
+    return { verdict: "OK", note: `${fn}: an explicit append judgment is recorded nearby (single-writer / O_APPEND)` };
+  // SP-2: do NOT present PIPE_BUF (a PIPE/FIFO atomicity bound, not a regular-file guarantee) or temp+rename (replacement
+  // visibility, not append serialization) as universal append guarantees — point at the real questions instead.
+  return { verdict: "REVIEW", note: `${fn}: append atomicity not evidently judged — confirm who writes this file (a SINGLE writer, or serialized writers?), that each append is ONE write of a complete record, and the crash-torn-tail recovery (a reader must skip a partial last line). O_APPEND only positions each write at the end; it does not serialize concurrent read-modify-write appenders` };
 }
 
 export function classifyOpen(lines: string[], n: number): { verdict: Verdict; note: string } {

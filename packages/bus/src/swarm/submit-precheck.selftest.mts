@@ -1,6 +1,6 @@
 // Selftest for submit-precheck (pure core): diff parse, per-call-site classification, same-family, teeth prompt, render.
 //   npx tsx packages/bus/src/swarm/submit-precheck.selftest.mts
-import { parseUnifiedDiff, scanFile, sameFamily, summarize, isTestFile, teethPrompt, renderChecklist, renderSubmissionSummary, classifyRead, classifyWrite, classifyAppend, classifyOpen, kindOf, inStringLiteral, type CallSite } from "./submit-precheck.js";
+import { parseUnifiedDiff, scanFile, sameFamily, summarize, isTestFile, teethPrompt, renderChecklist, renderSubmissionSummary, classifyRead, classifyWrite, classifyAppend, classifyOpen, kindOf, inStringLiteral, unquoteGitPath, type CallSite } from "./submit-precheck.js";
 
 let pass = 0;
 const t = (n: string, c: boolean): void => { if (!c) { console.error(`FAIL ${n}`); process.exit(1); } pass++; console.log(`ok  ${n}`); };
@@ -35,6 +35,23 @@ const L = (s: string): string[] => s.split("\n"); // build a "file" from a templ
   t("parseUnifiedDiff: two files, each with its own added lines", r.length === 2 && r[0]!.file === "a.ts" && r[1]!.file === "b.ts" && r[0]!.addedLines[0] === 1 && r[1]!.addedLines[0] === 1);
 }
 
+// ── SP-1: unquoteGitPath decodes Git C-quoted names losslessly (octal UTF-8, escaped quote/backslash); unquoted passes through ──
+t("unquoteGitPath: C-quoted UTF-8 octal (中文)", unquoteGitPath('"\\344\\270\\255\\346\\226\\207.ts"') === "中文.ts");
+t("unquoteGitPath: escaped double-quote", unquoteGitPath('"with\\"quote.ts"') === 'with"quote.ts');
+t("unquoteGitPath: escaped backslash", unquoteGitPath('"back\\\\slash.ts"') === "back\\slash.ts");
+t("unquoteGitPath: unquoted passes through (incl. a leading space)", unquoteGitPath("plain.ts") === "plain.ts" && unquoteGitPath(" leading.ts") === " leading.ts");
+{
+  const diff = ['+++ "b/\\344\\270\\255\\346\\226\\207.ts"', "@@ -0,0 +1,1 @@", "+writeFileSync(x, d)"].join("\n");
+  const r = parseUnifiedDiff(diff);
+  t("parseUnifiedDiff: decodes a C-quoted non-ASCII path (SP-1, else silently missed)", r.length === 1 && r[0]!.file === "中文.ts" && r[0]!.addedLines[0] === 1);
+}
+
+// ── SP-2: the append REVIEW hint asks the real questions, not PIPE_BUF / temp+rename as regular-file append guarantees ──
+{
+  const note = classifyAppend(["appendFileSync(log, line);"], 1, "appendFileSync").note;
+  t("SP-2: append REVIEW hint names single-writer + complete record, NOT PIPE_BUF/temp+rename as guarantees", /SINGLE writer/.test(note) && /complete record/.test(note) && !/PIPE_BUF/.test(note) && !/temp\+rename/.test(note));
+}
+
 // ── kindOf ──
 t("kindOf: write/append/open/read", kindOf("writeFileSync") === "write" && kindOf("appendFileSync") === "append" && kindOf("openSync") === "open" && kindOf("readFileSync") === "read" && kindOf("lstatSync") === "read");
 
@@ -43,6 +60,10 @@ t("read OK: a catch distinguishes ENOENT", classifyRead(L(`const x = readFileSyn
 t("read MISS: a catch folds the fault (return default, no ENOENT, no throw)", classifyRead(L(`const x = readFileSync(p);\n} catch { return []; }`), 1, "readFileSync").verdict === "MISS");
 t("read REVIEW: no local catch (may propagate)", classifyRead(L(`const x = readFileSync(p);\nconst y = 1;`), 1, "readFileSync").verdict === "REVIEW");
 t("read REVIEW: caught + rethrows but ENOENT not named", classifyRead(L(`const x = readFileSync(p);\n} catch (e) { log(e); throw e; }`), 1, "readFileSync").verdict === "REVIEW");
+{
+  const r = classifyRead([`if (readdirSync(dir).some((n) => n.startsWith(base))) return true;`], 1, "readdirSync");
+  t("read REVIEW 以名定态: readdirSync deciding state from entry names (DWS-1-ADOPT shape)", r.verdict === "REVIEW" && /以名定态/.test(r.note));
+}
 
 // ── classifyWrite: wx/O_EXCL ⇒ OK; temp+rename ⇒ OK; temp w/o commit ⇒ REVIEW; bare final-path ⇒ MISS ──
 t("write OK: wx exclusive create", classifyWrite(L(`writeFileSync(tmp, d, { flag: "wx", mode: 0o600 });`), 1, "writeFileSync").verdict === "OK");
