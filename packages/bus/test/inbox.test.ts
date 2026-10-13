@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSyn
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, publishUniqueAtomic, publishOnce, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, publishUniqueAtomic, publishOnce, __setPublishEexistHookForTest, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
 import { deliverToCoordinator } from "../src/checkin.js";
 import type { SelfInfo } from "../src/label.js";
 
@@ -559,6 +559,42 @@ describe("writeInbox — idempotency key (durable-first credential, exactly-once
     rmSync(dirOf("s1"), { recursive: true, force: true });
     writeInbox(HOME, "s1", digest("brief", 2), "evt-k");
     expect(jsonFiles("s1")).toEqual(["evt-k.json"]);
+    expect(claimInbox(HOME, ["s1"], "p2").length).toBe(1);
+  });
+
+  test("DWS-1-ADOPT r2: a `.claim-*` whose CONTENT is not a valid message is NOT adopted by name (dir / dangling link / bad JSON / missing fields)", () => {
+    for (const plantClaim of [
+      (d: string) => mkdirSync(path.join(d, "evt-k.json.claim-1"), { recursive: true }),
+      (d: string) => symlinkSync(path.join(d, "nowhere"), path.join(d, "evt-k.json.claim-1")),
+      (d: string) => writeFileSync(path.join(d, "evt-k.json.claim-1"), "{ not json"),
+      (d: string) => writeFileSync(path.join(d, "evt-k.json.claim-1"), JSON.stringify({ from: "a" })), // missing required fields
+    ]) {
+      rmSync(dirOf("s1"), { recursive: true, force: true }); mkdirSync(dirOf("s1"), { recursive: true });
+      mkdirSync(path.join(dirOf("s1"), "evt-k.json"), { recursive: true }); // top-level dir ⇒ linkSync EEXIST reaches the claim probe
+      plantClaim(dirOf("s1"));                                              // + a `.claim-*` NAME whose content is NOT deliverable
+      expect(() => writeInbox(HOME, "s1", digest("brief", 1), "evt-k")).toThrow(); // name present but not deliverable ⇒ refuse (old code adopted)
+      expect(existsSync(cred("s1", "evt-k"))).toBe(false);                 // no false "published" credential
+    }
+  });
+
+  test("DWS-1-ADOPT r2: a VALID in-flight `.claim-*` IS still adopted (the content check does not regress valid in-flight adoption)", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    mkdirSync(path.join(dirOf("s1"), "evt-k.json"), { recursive: true });  // top-level dir ⇒ EEXIST
+    writeFileSync(path.join(dirOf("s1"), "evt-k.json.claim-99"), JSON.stringify(validInboxMsg(digest("inflight", 1)))); // a VALID in-flight claim
+    writeInbox(HOME, "s1", digest("brief", 2), "evt-k");                   // adopts the valid in-flight message (no throw, no 2nd copy)
+    expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("published");
+  });
+
+  test("DWS-1-ADOPT r2: the live EEXIST->claim window — a losing claim renames the bad top-level into `.claim-*`, still NOT adopted", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    mkdirSync(path.join(dirOf("s1"), "evt-k.json"), { recursive: true });  // top-level is a dir ⇒ linkSync EEXIST
+    // in the EEXIST->check window a real claimInbox runs: it renames the dir `evt-k.json` -> `evt-k.json.claim-<pid>` and returns 0
+    __setPublishEexistHookForTest(() => { claimInbox(HOME, ["s1"], "pidX"); });
+    try { expect(() => writeInbox(HOME, "s1", digest("brief", 1), "evt-k")).toThrow(); } // claim name now present, content invalid ⇒ refuse
+    finally { __setPublishEexistHookForTest(undefined); }
+    expect(existsSync(cred("s1", "evt-k"))).toBe(false);                   // no false "published"
+    for (const n of readdirSync(dirOf("s1"))) if (n.startsWith("evt-k.json.claim-")) rmSync(path.join(dirOf("s1"), n), { recursive: true, force: true });
+    writeInbox(HOME, "s1", digest("brief", 2), "evt-k");                   // obstacle cleared ⇒ a retry recovers
     expect(claimInbox(HOME, ["s1"], "p2").length).toBe(1);
   });
 

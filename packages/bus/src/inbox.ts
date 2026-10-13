@@ -321,11 +321,29 @@ function readRegularFileNoFollow(fp: string): string | null {
  *  (a dir / dangling symlink / bad-JSON / missing-field target is not deliverable, and must never be confirmed published). */
 function deliverableMessagePresent(dir: string, idempotencyKey: string): boolean {
   const base = `${idempotencyKey}.json`;
-  try { if (readdirSync(dir).some((n) => n.startsWith(`${base}.claim-`))) return true; } catch { /* unreadable dir ⇒ fall through to the file probe */ }
+  // An in-flight `<key>.json.claim-*` counts ONLY if the CLAIMED FILE itself is a readable regular file whose bytes parse as a valid
+  // InboxMsg (DWS-1-ADOPT r2): a claim NAME is NOT proof of a deliverable — a non-deliverable top-level target (dir / dangling
+  // symlink / bad-JSON / missing-field) that a LOSING claim renamed into `.claim-*` must NOT be adopted. Validate the claim's
+  // CONTENT with the SAME no-follow/FIFO-safe reader + schema check as the unclaimed path.
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return false; } // unreadable dir ⇒ cannot confirm a deliverable (keep the obligation)
+  for (const n of names) {
+    if (!n.startsWith(`${base}.claim-`)) continue;
+    const ct = readRegularFileNoFollow(path.join(dir, n));
+    if (ct === null) continue; // the claimed path is a dir / symlink / fifo / unreadable ⇒ not a deliverable claim
+    try { if (validInboxMsg(JSON.parse(ct)) !== null) return true; } catch { /* bad JSON ⇒ not a deliverable claim */ }
+  }
+  // the unclaimed `<key>.json` must itself be a regular file parsing as a valid InboxMsg
   const text = readRegularFileNoFollow(path.join(dir, base));
   if (text === null) return false;
   try { return validInboxMsg(JSON.parse(text)) !== null; } catch { return false; }
 }
+
+/** Test seam (one-shot): fires inside publishOnce AFTER a linkSync-EEXIST and BEFORE the deliverable check, so a regression can run
+ *  claimInbox in the exact EEXIST->check window (the losing claim renames the bad top-level target into `.claim-*`). Unset in
+ *  production. */
+let publishEexistHookForTest: (() => void) | undefined;
+export function __setPublishEexistHookForTest(fn: (() => void) | undefined): void { publishEexistHookForTest = fn; }
 
 /** `randHex` is injectable ONLY so a test can force a temp-name collision (ownership-boundary regression); production uses 64-bit
  *  randomBytes. */
@@ -390,6 +408,7 @@ export function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg
         // (no-follow + FIFO-safe), OR an in-flight `.claim-*` of it (DWS-1-ADOPT). A name being taken is NOT proof of delivery: a
         // dir / dangling symlink / bad-JSON / missing-field target must NOT be confirmed published (a false credential would
         // permanently block retry).
+        if (publishEexistHookForTest) { const h = publishEexistHookForTest; publishEexistHookForTest = undefined; try { h(); } catch { /* test seam */ } } // one-shot: lets a test run claimInbox in the EEXIST->check window (DWS-1-ADOPT regression)
         if (deliverableMessagePresent(dir, idempotencyKey)) { writeCredState(cred, "published"); return "already"; }
         try { unlinkSync(cred); } catch { /* best-effort rollback */ } // undecidable/invalid target ⇒ NO false "published"; recover after it clears
         throw new Error(`publishOnce: ${msgFile} exists but is not a valid deliverable message — not adopting (retry after it clears)`);
