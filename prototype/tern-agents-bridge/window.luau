@@ -45,10 +45,19 @@ end
 
 -- REQUESTS: drain each request file exactly once (remove = claim), decode, dispatch to cx.agents, write the result. One op/file;
 -- the file name (minus .json) is the request id the bash side polls results/<id>.json for.
--- FINDING (spike ①): cx.agents:start is synchronous and blocks the single-threaded window VM while the agent opens — called from
--- this poll loop it froze the mirror (tick stopped advancing). list/ask/interrupt/stop are fast; wait is async via :next. So start is
--- processed here too but flagged: in production, long-blocking ops belong in a user/palette action context (tern.command) or a
--- dedicated non-mirroring window, not the status poll. list() (the mirror) is read-only and safe in the loop — that is proven.
+-- CLAIM MODEL (review TERN-1 fix): execution is gated on a SUCCESSFUL remove, NOT on a successful read. remove() is the claim —
+-- POSIX unlink is atomic, so when two window VMs both read the same request only one remove succeeds; the loser gets ENOENT and
+-- skips. A read failure leaves the request in place (never delete what we could not read) and it is retried next tick. This is
+-- AT-MOST-ONCE per claim, NOT crash-safe exactly-once: tern.fs exposes no rename/O_EXCL (see tern.d.luau), and a crash between the
+-- claim and the results write loses that result. Recovery obligation is on the bash side — a missing results/<id>.json after a
+-- bounded wait means UNKNOWN (re-issue with a fresh id), never "it ran". A remove failing with EACCES leaves the request
+-- stuck-but-unexecuted (the safe direction: no double-run). The bridge does not, and cannot here, provide exactly-once.
+--
+-- FINDING (start, re-scoped per review TERN-3): a non-empty-prompt default-OMP start issued from this poll loop left the mirror tick
+-- frozen with no result; the reviewer reproduced the same budget failure from an ISOLATED palette action (log: "command start
+-- exceeded 50 ms, disabled until reload"). A tick/record freeze alone therefore cannot distinguish 50ms-budget-exit, plugin-disable,
+-- exception, or sustained sync blocking — "start blocks the VM" is NOT an established cause. What IS observed: start is unsafe to
+-- call from this status poll (it stops the mirror). list() (read-only) in the loop is safe, and is the one path proven here.
 local function drain(cx)
   local names = {}
   pcall(function() names = tern.fs.list(REQ) end)
@@ -57,8 +66,8 @@ local function drain(cx)
       local id = (name:gsub("%.json$", ""))
       local text = ""
       local okRead = pcall(function() text = tern.fs.read(REQ .. "/" .. name) end)
-      pcall(function() tern.fs.remove(REQ .. "/" .. name) end) -- consume once: a re-list won't re-run a claimed request
-      if okRead then
+      local okClaim = okRead and pcall(function() tern.fs.remove(REQ .. "/" .. name) end) -- claim = atomic unlink; read-fail => no delete
+      if okClaim then -- we hold the claim: exactly this VM owns the request now (loser VMs / read failures fall through and skip)
         local okDec, req = pcall(function() return tern.json.decode(text) end)
         if okDec and type(req) == "table" then
           local op = req.op

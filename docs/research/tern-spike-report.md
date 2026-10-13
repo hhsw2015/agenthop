@@ -1,141 +1,198 @@
-# Tern+OMP 蜂群席位宿主 — spike 报告(5 件交付)
+# Tern+OMP 蜂群席位宿主 — spike 报告(5 件交付,r2)
 
 - 对象: 用 Tern+OMP 的原生 agent 层 `cx.agents` 替代/并行 Herdr 作蜂群席位宿主
-- 性质: **纯评估 + 原型,不动产线**。herdr 代码路径一行未改,保留为回退。
-- owner: `claude:agenthop-f32a0507`;审查席: codex:Work 主审;派单依据 user 亲令「开工」(镜 24 终判后)
-- worktree: `~/Dev/agenthop-wt/tern-spike` branch `spike/tern-migration`(基线 main 57c13ea)
-- 前置: [tern-omp-eval.md](tern-omp-eval.md)(镜 24,cx.agents 原子图谱)
-- 日期: 2026-10-13;Tern.app 实机(daemon 运行中,2 window:Default/work),omp v18.10.3
+- 性质: **纯评估 + 原型,不动产线**。herdr 代码路径一行未改,保留为回退(主审复核:七文件全新增、基线 782 blob 全留、herdr/产线改动 0)。
+- owner: `claude:agenthop-f32a0507`;主审: `codex:Work-01a13284`(r1 判回 0P1/4P2/4REMAIN,本稿 r2 应修)
+- worktree: `~/Dev/agenthop-wt/tern-spike` branch `spike/tern-migration`
+- 可核来源(定点提交外,均在同仓对象库可 `git show`):
+  - 图谱 `docs/research/tern-omp-eval.md` **@08351a3**(main,镜 24)
+  - **user 亲测 QA** `docs/research/tern-carly-qa-2026-10-13.txt` **@2a5ca5f**(Carly 本机 Tern+omp18.10.3 实测;解了三绿门里两门)
+- 日期: 2026-10-13 起;Tern.app 实机 + 主审另在隔离 Tern 0.8.3 headless 复核
+
+## 证据分级(全文标注)
+
+- **【实测】** 本席本会话在实机亲测
+- **【user实测】** user/Carly 亲测,入库 @2a5ca5f
+- **【文档】** tern.d.luau 类型声明 / `tern ... --help`
+- **【推断】** 由 API 形状推断,未跑
+- **【未测】** 无人实测
+
+> r1 的教训(已改):别把「omp 证到的」扩张成「所有席成立」,别把「tick 冻结」当成「VM 被阻塞」的因果,别把「环境变量=CLI block id」当成「三方 agent join」。下文逐条按实际证据重写。
 
 ---
 
-## 0. 一句话结论
+## 0. 一句话结论(r2 修正)
 
-**核心机制实测可用、原型已跑通、五命脉全部可映射;两条诚实边界(`waiting_input` 态 + claude/codex 裸 TUI 作 agent)未证,是切换前的验收门。** 文件-JSON 控制面(tern.fs)是 bash 蜂群对接运行中 Tern.app 的正确路径(不依赖 `tern serve`)。
+**omp 席位的 list/状态机制实机可用;但蜂群真正要托管的 claude/codex 裸 TUI,原生 cx.agents 检测【不工作】——不发 OSC 的裸 TUI state 恒卡 "working",无屏幕兜底(user实测)。** 两条可行路径(均【未测】,列入下一步):① Tern 自带 ACP 聊天块(内部通道,能识别权限请求),② 让 agent 自己发 OSC 9;4;4 / 7501。文件-JSON 控制面是**本配置下**我用的 bash 路径(非平台唯一路径——文档另有 window control endpoint)。
 
 ---
 
-## 1. ① OSC 9;4 覆盖实测(硬前提)
+## 1. ① 状态检测实测(硬前提)
 
-### 已证(实机数据,证据 `prototype/evidence-agents-list.json`)
+### 1a. omp 席位 —【实测】通过
 
-`cx.agents:list()` 对**真 omp agent**的状态判定正确,状态源 = pane 的 `busy`(OSC 9;4 进度):
+`cx.agents:list()` 对真 omp agent 的 working/idle 判定正确(证据 `prototype/evidence-agents-list.json`):
 
 ```
 pane5  [omp/claude-opus-5] state=idle    busy=False at_prompt=True
-pane18 [omp/claude-opus-5] state=working busy=True  at_prompt=True   (持续 40s+ 稳定)
+pane18 [omp/claude-opus-5] state=working busy=True  at_prompt=True   (持续 40s+ 稳定样本)
 ```
 
-- `busy=True`(OSC 9;4 进度活跃)→ `state=working` ✅
-- `busy=False` → `state=idle` ✅
-- `cx.agents:list()` 返回的字段比 `tern.d.luau` 的最小 `AgentBlock` 类型**更富**(合入了 PaneInfo:`busy/at_prompt/kind/focused/tab/alert/alive/model/program/session/last/running`),对检测是利好。
+- `busy=True`(OSC 9;4 进度)→ `working`;`busy=False` → `idle`。【实测】
+- 这是 omp 的 **TSP 自报**驱动的,不是通用屏幕检测(user实测确认)。
+- `at_prompt=True` 在 working 态也成立 ⇒ **不能单用 at_prompt 判等输入**。【实测】+【user实测】
+- 边界诚实:这只证了 omp 一类 `program=omp`;**不是** OSC/TSP 来源的隔离因果实验。
 
-### 诚实边界(未证,= 验收门)
+### 1b. waiting_input —【user实测】已解(我自己没测到,原因见下)
 
-1. **`waiting_input` 态未观测到**。镜 24 说它来自「paused progress(OSC 9;4;4)或 ask overlay」。本 spike 想用脚本合成 OSC 9;4;4 来证,但 `cx.agents:start` 对非 agent 命令(裸 bash)阻塞了 window VM(见 §2 finding),合成路径没走通。注意:`at_prompt=True` 在 working 态也成立 ⇒ **`at_prompt` 单独不是 waiting_input 的触发器**,不能拿它当「等输入」判据。
-2. **两例都是 `program=omp`**。omp 是 TSP-native,状态检测有 TSP + OSC 双保险,稳。镜 24 真正担心的是 **claude/codex 裸 TUI(经 agent-command 配置)是否发 OSC 9;4、其权限弹窗是否 → waiting_input** —— 本 spike **未测**(需配 agent-command 并让 claude/codex 在 Tern 上下文内认证,是闭测期依赖最重的一环)。这条仍是镜 24 §3 点名的头号未知。
+本席想用脚本合成 OSC 9;4;4 证 waiting_input,但 `start` 请求停住了镜射(见 §2),合成路径没走通,故 r1 只能记「未观测」。**user QA @2a5ca5f 直接给了答案**:
 
-**结论**: omp 席位的 working/idle 机制实测通过;`waiting_input` + 裸 TUI 两项是切换前必过的验收门,不验不切(与镜 24 判决一致)。
+- omp 自调 ask 工具 → `waiting_input`(~16s,`alert=true`,progress indeterminate)。【user实测】
+- **任何程序**发 `OSC 9;4;4`(paused)→ `waiting_input`;清 `9;4;0` → 回 working。复现:`printf '\033]9;4;4;50\007'` / `printf '\033]9;4;0\007'`。【user实测】
+- **第三方 TUI 画的权限弹窗,若不发 OSC 9;4;4 / 7501,则不触发**——纯文本 "Allow this tool? [y/n]" 实测 state 恒 working,**无任何屏幕内容兜底**。【user实测】
+- 即文档 "paused progress or an ask overlay" = (a) OSC 9;4;4,(b) omp 的 ask 覆盖层(经 TSP)。
 
----
+### 1c. claude/codex 裸 TUI —【user实测】= 负面结论
 
-## 2. ② agents-bridge 原型(已跑通)
-
-代码: `prototype/tern-agents-bridge/{plugin.toml, window.luau}`(window.luau 121 行含注释,逻辑 ~65 行)。
-
-形态: **薄 shim,零自有检测逻辑** —— 只把 `cx.agents` 镜射到文件-JSON 控制面,风格仿 herdr。
-
-- STATUS 镜: `<CTL>/agents.json` ← `cx.agents:list()` 每 750ms(poll-loop,`tern.sleep():next` 自重排)
-- REQUEST 面: bash 写 `<CTL>/requests/<id>.json {op,...}` → bridge remove 认领(原子)→ 写 `<CTL>/results/<id>.json`
-- `CTL = $HOME/.agenthop/tern-panes`
-
-### 已证
-
-- 插件 link/reload 干净(`status:ready, problems:[]`),window-half 装载即起循环。✅
-- 镜射实测:agents.json 持续更新(`tick` 字段证活),真 omp agent 状态正确(见 §1)。✅
-- 请求往返实测:`{"op":"list"}` → `{"ok":true,"agents":[...]}`,请求被 remove 认领一次。✅
-
-### 关键 finding(影响生产设计)
-
-1. **`cx.agents:start` 是同步阻塞,会冻住单线程 window VM**。从 poll-loop 调它,镜射直接停摆(`tick` 不再前进)。`list`/`ask`/`interrupt`/`stop` 快;`wait` 经 `:next` 异步不阻塞。**生产设计**:长阻塞的 mutating op(尤其 start)应走 user/palette 的 action 上下文(`tern.command`)或一个独立的「非镜射」window,不能塞进状态 poll。`list`(镜射)只读、放 poll 里安全 —— 已证。
-2. **start 参数校验**:prompt/cwd/command 三者不得为空(实测报错 `agent command, cwd and prompt must not be blank`)。
-3. **多 window 各跑一份 window-half** ⇒ 多个 mirror 抢写同一 agents.json(stomp)。对状态镜无害(同一全局视图,幂等);对 request 安全(remove 原子认领,只有一个赢)。生产可选:选一个 window 主导,或按 window key 分文件。
-4. **`tern ctl`/`tern carly` 需 `tern serve`**(app daemon 不暴露)⇒ 文件-JSON 面(tern.fs)是对接运行中 app 的唯一 bash 路径,选对了。
+- 非 omp agent 的 state 只有粗粒度:**进程在跑 = "working",从不变 idle**(busy/at_prompt 恒 false);不发 OSC 的裸 claude/codex **卡死 "working"** 直到进程退出(退出后行从 list() 消失,无 "exited" 行)。【user实测】
+- 非 omp:`wait()` 恒超时("agent_wait timed out"),`transcript()` 返 {},`model`/`last_message` 字段缺(其余 pane/state/busy/at_prompt/... 都有)。【user实测】+【文档】
+- **结论**:omp 的 parity **不外延到裸 TUI**。要给 claude/codex 做状态/权限检测,原生 cx.agents 不够,须走 §6 的两条路径。
 
 ---
 
-## 3. ③ sid→pane 映射 hook(已测)
+## 2. ② agents-bridge 原型
 
-代码: `prototype/sid-hook.sh` + `prototype/sid-hook.settings.json`。
+代码 `prototype/tern-agents-bridge/{plugin.toml,window.luau}`。薄 shim:把 `cx.agents` 镜射到文件-JSON 控制面(tern.fs,CTL=`~/.agenthop/tern-panes`)。
 
-- Claude Code SessionStart hook,读 stdin JSON 的 `session_id`/`cwd` + 环境 `$TERN_PANE`,原子写(temp+rename)`<CTL>/sid/<sid>.json`。
-- **机制已实测钉死**:`$TERN_PANE`(如 `103079215106`)=== `cx.agents:list()` 的 `pane` 字段 === `tern ls --json` 的 block `id`,**同一 id-空间**(早期 pane 是小数 5/18,新建的是大数,仅数值大小之别)。所以 swarm 读 `sid/<sid>.json` 的 pane,直接在 bridge 的 agents.json 里查到同一条,join 成立。
-- 实测两路:带 `$TERN_PANE` → `{"sid":...,"pane":"103079215106",...}`;不带(herdr/他宿主)→ `pane:""` 优雅降级。
-- 自报式:会话自己宣告 sid→pane,比外部探测好 —— 终端解耦、跨重启、不刮屏。
+- STATUS 镜:`agents.json` ← `cx.agents:list()`,poll-loop(`tern.sleep():next` 自重排——裸 `tern.timer` re-arm 会拿 nil cx 害死循环,这条是【实测】踩过的)。
+- REQUEST 面:`requests/<id>.json` → `results/<id>.json`。
+
+### 2a. 实测通过
+
+- link/reload 干净(ready,problems 空);镜射持续更新(tick 前进);真 omp 状态正确(§1a)。【实测】
+- `{"op":"list"}` 往返:请求被认领删除 + 写回 `{"ok":true,...}`。【实测】
+
+### 2b. 认领模型(review TERN-1 修复)
+
+r1 的桥**在被忽略的 pcall 里 remove、只凭读成功就执行**,主审五组复现:remove 失败双执行、read EIO 零执行、answer 写失败无从确认。**已改**(`window.luau` drain):
+
+- **执行只在 remove 成功后**(remove=认领;POSIX unlink 原子,两 VM 同读只有一个删成功,输者 ENOENT 跳过)。
+- **读失败绝不删**,留给下一 tick。
+- **这是 at-most-once/认领,不是崩溃安全的 exactly-once**:tern.fs 无 rename/O_EXCL(类型声明里没有),claim 与写结果之间崩溃会丢该结果。**恢复义务在 bash 侧**:等够时限仍无 `results/<id>.json` = UNKNOWN(换新 id 重发),绝不当「已执行」。remove 遇 EACCES = 卡住但不执行(安全方向,不双跑)。
+- **不再声明 exactly-once。**
+
+### 2c. start 停摆 —(review TERN-3 重新定界,撤回因果)
+
+r1 写「cx.agents:start 同步阻塞冻住 VM」= **超证据,已撤**。实际证据链:
+
+- 我的记录:**空 prompt 的 bash start 是参数报错**(tick 从 53 推进到 78);**tick 80 两次不变无结果的是另一条非空 prompt、默认 OMP 的 start**;且该记录里还留着旧草稿 go.json,不能当最终 drain 执行证据。
+- 主审在**隔离原生 Tern 0.8.3 headless** 注册了同 start API 的 palette action(本地 /bin/sh,不调模型):action 的 before 写了、agent 块建了,但 after 缺失,日志明说 **`command start exceeded 50 ms` / `disabled until reload`**;三个独立 stats 请求都成功。
+- 故:**action 上下文也会超 50ms 预算**;「tick/记录不动」**无法单独区分**预算退出 / 插件禁用 / 异常 / 持续同步阻塞。
+- **可保留的只有观测**:从状态 poll 调 start 会停住镜射(start 不该放进状态 poll);`list()`(只读)在 loop 里安全——这是唯一在此证到的路径。主审也没拿到有效的原生 poll-start 复现。
+
+### 2d. 控制路径定界(review TERN-3)
+
+- `tern ctl`/`tern carly` 在我这台需 `tern serve`(app daemon 没暴露)——所以我用了文件-JSON 面。但**文档明确支持带 control endpoint 的 window**,故「必须 serve / 文件面是唯一 bash 路径」**限定为本测试配置的选择**,不是平台能力结论。【实测】+【文档修正】
+- 多 window 各跑一份 window-half ⇒ 多 mirror 抢写同一 agents.json(对状态镜幂等无害;对 request 因 remove 认领安全)。生产可选单 window 主导或按 window key 分文件。【实测】
+
+---
+
+## 3. ③ sid→pane 映射 hook
+
+代码 `prototype/sid-hook.sh` + `.settings.json`。SessionStart hook 读 stdin JSON + `$TERN_PANE`,JSON 编码器序列化 + 往返相等校验后原子落盘。
+
+### 3a. JSON 编码(review TERN-2 修复)
+
+r1 用 printf 拼 JSON,cwd 含引号/反斜杠/换行即写坏且 exit 0。**已改**:用 json 编码器 + 往返相等检查,校验不过就不写(宁缺毋错)。四类输入实测:普通 / 引号+反斜杠 / 真换行 / 字面反斜杠-n 全部正确往返;缺 TERN_PANE → pane=null。【实测】
+
+### 3b. id 关联 —(review TERN-4 重新定界,agent-join 留待验)
+
+- **两路观测(【实测】)**:同一普通 shell pane 的 `$TERN_PANE`(如 103079215106)=== `tern ls --json` 的 block id。这只证**该 shell 环境值与 CLI 一致**。
+- **【推断】**:类型声明把 `AgentBlock.pane` 与 agent 参数都叫 pane id,支持「同一命名空间」的接口推断。
+- **【未测,待验】**:定点提交的 agents-list 只有 pane 5/18,**没有**那个大编号;hook 测试是宿主侧手设 TERN_PANE + 合成 SessionStart JSON。**同一个真 agent 的「环境值 + cx.agents 条目 + CLI block」三方同期 join 没做**,生命周期/重启稳定性也没测。r1 的「join 钉死/跨重启」**已撤**。
+- 类型规整:hook 原输出 pane 为字符串、list 为数字——**已在 TERN-2 修复里把 pane 规整为数字/ null**,消除 join 的类型错配。
 
 ---
 
 ## 4. ④ 五命脉 → tern 等价映射表
 
+验证列严格分级。
+
 | 命脉 | herdr 机制 | tern 等价 | bridge/CLI | 验证 |
 |---|---|---|---|---|
-| **巡检点名** | agent list / 读屏判状态 | `cx.agents:list()` → agents.json 的 `state/busy/at_prompt` | **bridge**(poll 镜) | ✅ 实测(omp idle/working) |
-| **inbox-wake ping** | writeInbox 成功 → ping herdr pane 唤醒 | `tern run <pane> '<nudge>'` 键入唤醒;或 `cx.agents:ask(pane,text)` 注入 | CLI(`tern run`)轻量;bridge(ask)结构化 | ◐ run 实测可键入;ask 有阻塞风险(§2) |
-| **F48/F45 继任** | 检测 holder 死 → 新席领养 | 检测死:`cx.agents:list()` `state="exited"`/`alive=false`;起新席:`cx.agents:start()` 或 `tern new tab` | 检测=**bridge**;起席=bridge(start,阻塞)或 **CLI**(`tern new`) | ◐ 检测路径就绪;start 阻塞 finding |
-| **F44 读屏** | 读 pane 屏 → 识别内容过滤/审批卡点 → HINT | `tern capture <pane> --scrollback [--surfaces]` | **CLI**(`tern capture`) | ✅ 实测(捕获 marker) |
-| **fleet-recovery** | 一命令带回 dispatcher+成员+在途+断点 | daemon 侧 pane 跨窗口关闭存活;`cx.agents:list()` 重发现;③hook 重建 sid→pane | bridge(list 重发现)+ CLI(daemon 重连)+ ③hook | ◐ 单机重发现就绪;多机 fleet 未验 |
+| **巡检点名** | agent list / 读屏 | `cx.agents:list()` → agents.json `state/busy/at_prompt` | **bridge** | 【实测】omp idle/working |
+| **inbox-wake ping** | writeInbox 成功 → ping pane | `tern run <pane> '<nudge>'` 键入;或 `cx.agents:ask` | CLI / bridge | `tern run` 基本可键入【实测弱】;`--pane` 旗实测报错;ask 执行结果【未测】 |
+| **F48/F45 继任** | 检测死 → 新席领养 | 检死:list `alive=false`(非 omp 是行消失,无 exited);起席:`start` 或 `tern new tab` | bridge+CLI | 检死【user实测:行消失】;`tern new tab`【实测】;start【见 2c 不定】 |
+| **F44 读屏** | 读 pane 屏 → 识别卡点 → HINT | `tern capture <pane> --scrollback [--surfaces]` | **CLI** | 【实测】但仅捕获**普通 shell marker**,非 omp/非 alt-screen TUI |
+| **fleet-recovery** | 一命令带回全员+在途+断点 | daemon 侧 pane 存活;list 重发现;③hook 重建 sid→pane | bridge+CLI+hook | 单机 list 重发现【推断】;多机 fleet【未测】 |
 
-读屏补注:镜 24 说 lenses 看不了 alt-screen TUI —— 那是 **lenses** 的限制,**不是 `tern capture`**。capture 抓的是终端 surface,alt-screen TUI 能抓到当前屏(但 alt-screen 无 scrollback 历史)。`--surfaces` 额外带 TSP surface 文本。
+读屏补注:lenses 看不了 alt-screen 是 **lenses** 的限制;`tern capture` 抓终端 surface,但我只在**普通 shell** 上验过,OMP/alt-screen TUI 的 capture **未测**。
 
 ---
 
 ## 5. ⑤ seat-driver 接口草案
 
-四函数接口,herdr/tern 双驱动,按席位 config 选 —— 双栈并行 + 回退地基。全部基于已验证原语。
+四函数,herdr/tern 双驱动,按席位 config `host` 选 —— 回退地基。各函数标 tern 侧证据强度。
 
 ```ts
 type SeatState = { state: "idle"|"working"|"waiting_input"|"exited"; busy?: boolean;
                    cwd?: string; model?: string; lastMessage?: string };
 
 interface SeatDriver {
-  // 巡检点名。herdr: agent list / 读屏;tern: 读 agents.json 里该席 pane 的那条
+  // 巡检。tern: 读 agents.json 该席 pane 条目。【实测:omp】【未测:裸 TUI 恒 working】
   status(seat: Seat): Promise<SeatState>;
-  // inbox-wake / 派话。herdr: pane 注入;tern: cx.agents:ask(bridge request) 或 `tern run <pane>`
+  // 派话/唤醒。tern: cx.agents:ask(bridge) 或 `tern run <pane>`。【实测弱:run 键入】【未测:ask 执行】
   send(seat: Seat, text: string): Promise<void>;
-  // F44 读屏。herdr: pane screen-read;tern: `tern capture <pane> --scrollback --surfaces`
+  // 读屏。tern: `tern capture <pane> --scrollback --surfaces`。【实测:普通 shell】【未测:TUI/omp】
   read(seat: Seat, opts?: { lines?: number }): Promise<string>;
-  // 等到 idle。herdr: 轮询到 idle;tern: cx.agents:wait(bridge,:next 异步) 或 `tern wait --until idle=MS`
+  // 等 idle。tern: cx.agents:wait(bridge,:next) 或 `tern wait --until idle=MS`。【文档】【未测:非omp 恒超时(user实测)】
   wait(seat: Seat, opts?: { timeoutMs?: number }): Promise<string | null>;
 }
 ```
 
-- 席位 config 加 `host: "herdr" | "tern"`,工厂按此选 driver 实例。
-- **双栈并行**:迁移期部分席 herdr、部分 tern,同一 dispatcher 透明调度。
-- **回退**:tern 席异常(闭测期不稳)→ 降级回 herdr,席位 config 一翻即可。这就是「herdr 不删」的工程兑现点。
-- 生产注意:tern driver 的 `send`(若用 ask)与继任的 `start` 受 §2 阻塞 finding 约束 —— 这两个走 action 上下文或独立 window,不走状态 poll。
+- 席位 config `host:"herdr"|"tern"` 选驱动;异常降级回 herdr = 闭测期风险闸(「herdr 不删」的兑现点)。
+- tern driver 的 `send`(若用 ask)与继任的 `start` 受 §2c 约束:走 action 上下文或独立 window,不进状态 poll。
+- **裸 claude/codex 席的 status 目前拿不到 idle/waiting_input**(§1c),此接口在裸 TUI 上只有 herdr 驱动可用,tern 驱动须等 §6 两路之一落地。
 
 ---
 
-## 6. 替代判决(更新镜 24)
+## 6. 替代判决(r2 重写)
 
-- **能力**: omp 席位的 list/state/screen-read/wait 全部实机可用,sid→pane join 钉死,五命脉全可映射。与镜 24「herdr 同级」判决一致,且本轮**把图谱落成了跑得起来的原型**。
-- **门槛(验收门,三绿才切)**:
-  1. `waiting_input` 态实证(含 claude 权限弹窗 → waiting_input)。
-  2. claude/codex 裸 TUI 作 agent-command 发不发 OSC 9;4 的实证。
-  3. 多机 fleet-recovery 实证。
-- **风险**: Tern = 闭测(TERN_AUTH_URL),稳定性/版本节奏未知 = 基础设施押注 ⇒ herdr 代码路径保留为回退(本 spike 一行未动 herdr),seat-driver 的 `host` 开关是回退闸。
-- **路线**: ①日常终端可立即并行试用;②蜂群切换走此 spike → 三绿验收门 → 切,期间 herdr 在位。
-
----
-
-## 7. 交付物清单
-
-| 件 | 路径 | 状态 |
+| 维度 | omp 席 | claude/codex 裸 TUI 席(蜂群实际需要) |
 |---|---|---|
-| ① OSC 实测 + 证据 | 本报告 §1 + `prototype/evidence-agents-list.json` | ✅ 核心证,2 边界待验 |
-| ② agents-bridge 原型 | `prototype/tern-agents-bridge/{plugin.toml,window.luau}` | ✅ 跑通 + finding |
-| ③ sid→pane hook | `prototype/sid-hook.sh` + `.settings.json` | ✅ 测通 |
-| ④ 五命脉映射表 | 本报告 §4 | ✅ 原语全验 |
-| ⑤ seat-driver 接口 | 本报告 §5 | ✅ 草案 |
+| working/idle | ✅【实测】+ TSP 自报 | ❌ 恒 "working",无兜底【user实测】 |
+| waiting_input | ✅ ask/OSC 9;4;4【user实测】 | ❌ 弹窗不发 OSC 不触发【user实测】 |
+| wait/transcript | ✅ | ❌ 超时 / {}【user实测】 |
 
-实测用过的 tern 原语(全部实机验证): `tern plugin link/reload/list --json`、`tern ls --json`、`tern new tab [--keep-open] [--cwd] [-- CMD]`、`tern run BLOCK CMD`、`tern capture BLOCK --scrollback [--surfaces]`、`tern close BLOCK`;Lua: `cx.agents:list`、`tern.fs.{read,write,list,exists,mkdir,remove}`、`tern.sleep():next`、`tern.json.{encode,decode}`、`tern.getenv`、`tern.now`。
+- **omp 席**:能力 herdr 同级,原型跑通。可立即并行试用。
+- **裸 TUI 席**:原生 cx.agents **不够**。两条路径(均【未测】,=下一步):
+  1. **ACP 聊天块**(`agents.auto_acp` / 调色板 "New Claude Code block"):claude/codex 状态走 Tern 内部通道,二进制含 "has a question / wants plan approval / needs your permission" 横幅文案 ⇒ **权限请求会被识别为「需要你」**。**最值得先试的一条。**(user QA 明说未实测)
+  2. **OSC 7501 / 9;4;4 自发**:让 agent wrapper 主动发状态(changelog 称 omp/agent chats/会说 7501 的工具显示 working/waiting/finished/failed,"locally or over SSH")。7501 完整字段语法无文档(只确认过 `state=clear`)。
+
+### 三绿验收门(r2 更新)
+
+1. **waiting_input**:✅已解(user实测)——但结论是「裸 TUI 弹窗不触发」,故门①的真正通过条件 = ACP 块或 OSC 自发之一落地。
+2. **裸 TUI OSC**:✅已解(user实测)——负面(恒 working)。同上。
+3. **多机 fleet**:❌仍【未测】。user 只有本机单 host;线索:list 行有 `host` 字段(本机=0),OSC 7501 "over SSH" 可用,start 的 `~` 按 launch host home 展开(但 opts 无 host 字段,无指定远端办法)。待有远端环境实跑 `cx.agents:list()` 看 host 字段。
+
+### 其它押注因素
+
+- **CLI 无 agents 命令**(【user实测】`tern: agents: No such file`);桥插件是现状唯一 bash 路径之一,官方是否出 CLI 未知 ⇒ 桥寿命有不确定性。
+- **headless/CI**:`cx.agents` 是 Window-only;headless(`tern serve`)无启 omp/agent 入口,settings 只在内存。**CI 无法用 cx.agents**,自动化只能 `tern new/run/send/wait` 或直接跑 omp CLI。【user实测】
+- **API 稳定性**:无 cx.agents/插件 API 稳定性承诺;changelog 多条 "Plugins: ..." 行为变更(如 cx.canvas 对未知字段改报错)⇒ 建议桥对字段 nil 容错 + 钉版本 + 升级回归测 ①②③。【user实测】
+- Tern=闭测(TERN_AUTH_URL)=基础设施押注 ⇒ herdr 回退保留(本 spike 0 改 herdr)。
+
+---
+
+## 7. 交付物 + r2 修复对照
+
+| 件 | 路径 | r1→r2 |
+|---|---|---|
+| ① 状态实测 + 证据 | §1 + `prototype/evidence-agents-list.json` | omp 证据保留;waiting_input/裸TUI 由 user QA 补实(负面);分级标注 |
+| ② agents-bridge | `prototype/tern-agents-bridge/` | **TERN-1** 认领改 at-most-once(remove 门控+读失败不删+撤 exactly-once);**TERN-3** start 因果撤回、控制路径定界 |
+| ③ sid hook | `prototype/sid-hook.sh`+`.settings.json` | **TERN-2** JSON 编码+往返校验;**TERN-4** pane 规整为数字、三方 join 降为待验 |
+| ④ 映射表 | §4 | 验证列严格分级;capture 仅普通 shell;`run --pane` 报错如实 |
+| ⑤ seat-driver | §5 | 每函数标证据强度;裸 TUI 席仅 herdr 可用 |
+
+**实测确认的 tern 原语**:`tern plugin link/unlink/reload/list --json`、`tern ls --json`、`tern new tab [--keep-open --cwd -- CMD]`、`tern run BLOCK CMD`(键入;`--pane` 旗不存在)、`tern capture BLOCK --scrollback --surfaces`(普通 shell)、`tern close BLOCK`;Lua:`cx.agents:list`、`tern.fs.{read,write,list,exists,mkdir,remove}`、`tern.sleep():next`、`tern.json.*`、`tern.getenv`、`tern.now`。
+**未由我执行**:`cx.agents:{ask,wait,start,transcript,interrupt,stop}` 的成功执行(start 见 2c;ask/wait 结果未取到);capture 对 omp/alt-screen;多机 fleet。这些有的在 user QA 里有答案(wait/transcript 非 omp 的负面),其余列【未测】。
