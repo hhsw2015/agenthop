@@ -37,7 +37,7 @@ async function main(): Promise<number> {
   // READ (FC-2 three-state, no writes).
   const cl = readLedgerInputs(H);
   const rr = readReviewRoundsDist(H, args.sinceSec);
-  const reviewWindowDays = args.sinceSec != null ? Math.round((ns - args.sinceSec) / 86400) : null;
+  const reviewWindowDays = args.sinceSec != null ? (ns - args.sinceSec) / 86400 : null; // exact (VL-5: no Math.round distortion)
 
   const cpac = costPerAcceptedChange(cl.inputs);
   const summary = summarizeLedger(cpac, args.threshold);

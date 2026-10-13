@@ -7,7 +7,7 @@
  *        rejection is counted unresolved, never folded.
  *   VL-2 sequence window — a rejection AFTER an acceptance belongs to a later revision's window, never the already-accepted change.
  *   VL-3 unknown ≠ zero — a countersMissing change is excluded from the mean + first-try count; coverage is reported.
- *   VL-4 partial review-rounds — complete:false renders as a LOWER BOUND, never a complete zero.
+ *   VL-4 partial review-rounds — complete:false renders as OBSERVED over the read subset (no blanket "lower bound"), never a complete zero.
  *   VL-5 --since-last retired — the parser rejects it; the report labels each source's range.
  */
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
@@ -93,6 +93,21 @@ t("args: unknown flag ⇒ null; --coordinator without value ⇒ null", parseLedg
   const cpac = costPerAcceptedChange(extractLedgerInputs([att("t1", "j", "n", 1), acc("a1", "j", "n", 2, { attemptId: "t1" }), rej("ghost", 5)]));
   t("VL-1: a rejection with no linkable attempt ⇒ unresolvedRejections 1, not folded into node n", cpac.unresolvedRejections === 1 && cpac.rows.find((r) => r.nodeId === "n")!.reworkRounds === 0);
 }
+// VL-1 (r3) key COLLISION: a separator-join would collide these two distinct tuples; the JSON-tuple key must keep them apart.
+//   A = (jobId="left\u0000middle", nodeId="right")  — first-try (0 rework)
+//   B = (jobId="left", nodeId="middle\u0000right")  — 3 rejects then accept (3 rework)
+// A NUL-joined key "left\u0000middle\u0000right" is identical for both ⇒ costs would swap. Per-CHANGE assertion (total is 3 either way).
+{
+  const A_job = "left\u0000middle", A_node = "right", B_job = "left", B_node = "middle\u0000right";
+  const bodies = [
+    att("aA", A_job, A_node, 1), acc("accA", A_job, A_node, 2, { attemptId: "aA" }),
+    att("aB1", B_job, B_node, 3), rej("aB1", 4), att("aB2", B_job, B_node, 5), rej("aB2", 6),
+    att("aB3", B_job, B_node, 7), rej("aB3", 8), att("aB4", B_job, B_node, 9), acc("accB", B_job, B_node, 10, { attemptId: "aB4" }),
+  ];
+  const cpac = costPerAcceptedChange(extractLedgerInputs(bodies));
+  const A = cpac.rows.find((r) => r.acceptedResultId === "accA")!; const B = cpac.rows.find((r) => r.acceptedResultId === "accB")!;
+  t("VL-1 r3: NUL-in-id tuples do NOT collide — A (first-try) rework 0, B rework 3 (not swapped)", A.reworkRounds === 0 && A.attempts === 1 && B.reworkRounds === 3 && B.attempts === 4);
+}
 
 // =====================================================================================================================
 // VL-2 — sequence window: a rejection AFTER an acceptance belongs to a later revision, never the accepted change
@@ -136,10 +151,15 @@ t("disproportionate: boundary is >= threshold", disproportionateRework({ jobId: 
   t("render: COST not ROI; $ omitted (no (job,node) link); review NOT keyed to acceptance", /COST metric, NOT an ROI/i.test(rpt) && /\$ cost omitted/i.test(rpt) && /NOT keyed to acceptance/i.test(rpt));
   t("render: mean is over the KNOWN sample with coverage; unresolved rejections surfaced", /known-cost sample: 1\/1/.test(rpt) && /mean rework \(known\)/.test(rpt) && /could not be linked to an attempt/i.test(rpt));
   t("render VL-5: control-log labelled FULL current projection; review range labelled (last 7d)", /FULL current projection/i.test(rpt) && /last 7d/i.test(rpt));
+  // VL-5 (r3): a fractional-day window is shown ACCURATELY (no Math.round: 0.25 must not print "0d"; 1 prints "1d"; 1.49 stays).
+  {
+    const mkRange = (d: number | null) => renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([])), 3), reviewRounds: { perTicket: [], totalTickets: 0, singlePass: 0, multiRound: 0, maxRounds: 0, medianRounds: 0 }, sources: { controlLog: "read", reviewReports: "read", reviewReportsComplete: true }, reviewWindowDays: d, threshold: 3 });
+    t("render VL-5: fractional day window accurate (0.25⇒'last 0.25d', not '0d'; 1⇒'1d'; 1.49⇒'1.49d')", /last 0\.25d/.test(mkRange(0.25)) && /last 1d/.test(mkRange(1)) && /last 1\.49d/.test(mkRange(1.49)) && !/last 0d/.test(mkRange(0.25)));
+  }
   t("render: a flagged disproportionate change lists job/node", /disproportionate/i.test(rpt) && /jk\/n/.test(rpt));
 
   const partial = renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([])), 3), reviewRounds: { perTicket: [], totalTickets: 1, singlePass: 1, multiRound: 0, maxRounds: 1, medianRounds: 1 }, sources: { controlLog: "read", reviewReports: "read", reviewReportsComplete: false }, reviewWindowDays: null, threshold: 3 });
-  t("render VL-4: partial review-rounds (complete:false) ⇒ 'PARTIAL' / 'LOWER BOUND', never a complete zero", /PARTIAL/i.test(partial) && /LOWER BOUND/i.test(partial));
+  t("render VL-4 r3: partial (complete:false) ⇒ 'PARTIAL' + 'OBSERVED over the read subset' + 'NOT guaranteed bounds'; NO blanket 'LOWER BOUND'", /PARTIAL/i.test(partial) && /OBSERVED over the read subset/i.test(partial) && /NOT guaranteed bounds/i.test(partial) && !/LOWER BOUND/i.test(partial));
 
   const absent = renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([])), 3), reviewRounds: null, sources: { controlLog: "unreadable", reviewReports: "absent", reviewReportsComplete: true }, reviewWindowDays: null, threshold: 3 });
   t("render: unreadable control-log ⇒ 'NOT reported as zero'; absent review ⇒ unavailable", /control-log: unreadable/i.test(absent) && /NOT reported as zero/i.test(absent) && /review-report rounds: absent/i.test(absent));

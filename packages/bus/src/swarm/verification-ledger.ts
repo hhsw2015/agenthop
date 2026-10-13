@@ -61,8 +61,10 @@ export type AttemptRec = { attemptId: string; jobId: string; nodeId: string; cre
 export type RejectionRec = { attemptId: string; atSeq: number };
 export type LedgerInputs = { accepted: AcceptedChange[]; attempts: AttemptRec[]; rejections: RejectionRec[] };
 
-const COMPOUND_SEP = "\u0000"; // NUL cannot appear in a jobId/nodeId ⇒ an unambiguous compound key
-const nodeKey = (jobId: string, nodeId: string) => `${jobId}${COMPOUND_SEP}${nodeId}`;
+// VL-1 (r3): an INJECTIVE compound key. A separator-join (even NUL) can collide — the plan input validator does NOT ban any char in
+// an id, so jobId="a\u0000b"+nodeId="c" and jobId="a"+nodeId="b\u0000c" would share a NUL-joined key. JSON.stringify of the
+// [jobId,nodeId] tuple is a bijection for string pairs (quoting + escaping disambiguate) ⇒ no two distinct tuples collide.
+const nodeKey = (jobId: string, nodeId: string) => JSON.stringify([jobId, nodeId]);
 function pushTo<T>(m: Map<string, T[]>, k: string, v: T): void { const a = m.get(k); if (a) a.push(v); else m.set(k, [v]); }
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const str = (v: unknown): string | null => (typeof v === "string" && v !== "" ? v : null);
@@ -207,8 +209,12 @@ export function renderLedgerReport(input: {
   if (reviewRounds === null) {
     lines.push(`review-report rounds: ${sources.reviewReports} — view unavailable (NOT reported as zero).`);
   } else {
-    const range = input.reviewWindowDays != null ? `last ${input.reviewWindowDays}d (mtime)` : `all`;
-    const partial = sources.reviewReportsComplete ? "" : ` ⚠ PARTIAL (some ticket dirs unreadable — counts are a LOWER BOUND, not complete)`;
+    // VL-5 (r3): show the ACCURATE window (no Math.round — `--days 0.25` must not print "last 0d"); trim trailing zeros.
+    const range = input.reviewWindowDays != null ? `last ${Number(input.reviewWindowDays.toFixed(2))}d (mtime)` : `all`;
+    // VL-4 (r3): a PARTIAL read is NOT a uniform "lower bound" — a ticket with an unreadable ROUND is under-counted, which can make a
+    //  multi-round ticket look single-pass (single-pass OVER-counts), and the median is not monotone. State these as OBSERVED over the
+    //  read subset, guaranteeing no total/direction — never a blanket "lower bound".
+    const partial = sources.reviewReportsComplete ? "" : ` ⚠ PARTIAL — numbers below are OBSERVED over the read subset only (NOT complete; a ticket with an unreadable round is under-counted, so single-pass/median/totals are NOT guaranteed bounds)`;
     lines.push(`review-report rounds (by ticket-NAME, NOT keyed to acceptance — a separate cost view; range: ${range}; do not join to the above)${partial}:`);
     lines.push(`  tickets ${reviewRounds.totalTickets}; single-pass ${reviewRounds.singlePass}; multi-round ${reviewRounds.multiRound}; median rounds ${reviewRounds.medianRounds}; max ${reviewRounds.maxRounds}.`);
   }
