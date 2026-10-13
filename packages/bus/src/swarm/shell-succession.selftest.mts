@@ -1,4 +1,4 @@
-import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, argvFromCmdline, presencePidRelPath, planSuccession, adoptLockSite, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
+import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, argvFromCmdline, presencePidRelPath, planSuccession, adoptLockSite, writeSuccessionSwap, readSuccessionSwapSec, type Attestation, type IncumbentBinding, type IncumbentLiveness } from "./shell-succession.js";
 import { acquireHolderLock, releaseHolderLock } from "./holder-lock.js";
 import { probeCandidateLiveness, probeSessionLiveness, sidSockPrefix } from "./task-liveness.js";
 import type { RosterMember } from "./resume.js";
@@ -275,6 +275,26 @@ rmSync(sockHome, { recursive: true, force: true });
     if (t2) releaseHolderLock(site, t2);
     rmSync(home, { recursive: true, force: true });
   }
+}
+
+// --- DWS ③: writeSuccessionSwap is an ATOMIC temp+rename, not a bare in-place overwrite. The bare writeFileSync it replaced
+//     TRUNCATES <sid>.json to 0 bytes before writing, so the heartbeat sentinel's concurrent readSuccessionSwapSec could catch an
+//     empty/torn file and mis-read "no swap"; temp+rename flips the published file old->new atomically. (A deterministic torn-read
+//     negative would need a cross-process race window that is microseconds for this tiny record; these cover round-trip, clean
+//     replace/restart-idempotency, no temp orphan, and that every published read is a COMPLETE record.) ---
+{
+  const home = mkdtempSync(path.join(tmpdir(), "dws3-"));
+  const sid = "fe0376cd";
+  writeSuccessionSwap(home, sid, 1234);
+  t("DWS ③ round-trip: write then read returns the swappedAtSec", readSuccessionSwapSec(home, sid) === 1234);
+  writeSuccessionSwap(home, sid, 5678);
+  t("DWS ③ restart-idempotency: a second write cleanly REPLACES the record (reader sees the new value)", readSuccessionSwapSec(home, sid) === 5678);
+  const dir = path.join(home, ".agenthop", "swarm", "succession");
+  const names = readdirSync(dir);
+  t("DWS ③ no orphan: only the final <sid>.json remains (temp is renamed/cleaned, never a .tmp-* left behind)", names.length === 1 && names[0] === `${sid}.json` && names.every((n) => !n.includes(".tmp-")));
+  writeSuccessionSwap(home, sid, 9012);
+  t("DWS ③ every published read is a COMPLETE record (atomic replace, never a truncated/torn file)", readSuccessionSwapSec(home, sid) === 9012);
+  rmSync(home, { recursive: true, force: true });
 }
 
 console.log("all shell-succession selftests passed");

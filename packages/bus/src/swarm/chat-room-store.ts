@@ -132,6 +132,12 @@ export function appendPost(home: string, roomId: string, draft: RoomPostDraft, n
   // CR-P1-2: never concatenate onto an unterminated tail. If the file does not end in LF, write a separating LF first, so a
   // torn/complete-unterminated last line stays its own line and THIS post is always re-readable on its own line.
   const prefix = raw.length > 0 && !raw.endsWith("\n") ? "\n" : "";
+  // DWS ② (direct-write-sweep): a bare appendFileSync is left AS-IS by design judgment. The room log has a SINGLE writer — the
+  // room owner's process (members POST to the owner, which appends; the owner's own posts also go here) — which is single-active
+  // via its own lock, and appendPost is fully SYNCHRONOUS (read-seq -> stamp -> append, no await), so in-process appends are
+  // serialized and never interleave. O_APPEND additionally makes each append land at the true end, and a crash mid-append is
+  // already handled (CR-P1-2 above writes a separating LF so a torn/unterminated tail stays its own line + the reader skips any
+  // invalid JSON line). There is no cross-process concurrent writer to tear a line, so temp+rename would add nothing here.
   appendFileSync(logPath(home, roomId), `${prefix}${JSON.stringify(valid)}\n`, { mode: 0o600 });
   return valid;
 }

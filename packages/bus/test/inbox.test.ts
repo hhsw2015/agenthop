@@ -518,6 +518,21 @@ describe("writeInbox — idempotency key (durable-first credential, exactly-once
     expect(readdirSync(path.join(HOME, ".agenthop", "inbox"))).toEqual(["s1"]); // only s1 — no sibling dir created by a `..` escape
   });
 
+  test("DWS ①: a keyed publish NEVER clobbers an existing <key>.json (linkSync no-overwrite; the old renameSync silently overwrote it)", () => {
+    // Anomaly: the message for evt-k is on disk but its credential is ABSENT (e.g. the credential was lost while the message
+    // survived), so publishOnce falls through to the write. The OLD bare writeFileSync+renameSync would CLOBBER the existing
+    // message; the DWS ① linkSync-no-overwrite form ADOPTS it (never destroys a delivered message).
+    mkdirSync(dirOf("s1"), { recursive: true });
+    const existing = path.join(dirOf("s1"), "evt-k.json");
+    writeFileSync(existing, JSON.stringify(validInboxMsg(digest("ORIGINAL", 1))));
+    const originalBytes = readFileSync(existing, "utf8");
+    writeInbox(HOME, "s1", digest("REPLACEMENT", 2), "evt-k");            // fresh keyed publish of a DIFFERENT body, cred absent
+    expect(readFileSync(existing, "utf8")).toBe(originalBytes);           // NOT clobbered (old code would be "REPLACEMENT")
+    expect(jsonFiles("s1")).toEqual(["evt-k.json"]);                      // exactly one message (adopted, no 2nd copy, no .tmp-* orphan)
+    expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("published");  // adopted ⇒ credential confirmed
+    expect(claimInbox(HOME, ["s1"], "p").length).toBe(1);                 // the preserved message is still deliverable
+  });
+
   test("FC-7: a legacy keyless publication of the SAME notice is adopted, not duplicated by the new key", () => {
     writeInbox(HOME, "s1", digest("morning brief", 1));                   // legacy random name, no key
     writeInbox(HOME, "s1", digest("morning brief", 2), "evt-k");          // keyed re-publish of the SAME notice

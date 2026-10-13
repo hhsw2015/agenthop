@@ -339,16 +339,36 @@ function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg): Writ
     writeCredState(cred, "published");
     return "already";
   }
+  // DWS ① (direct-write-sweep): publish the message the INBOX-2 way (the keyed sibling of publishUniqueAtomic that the INBOX-2
+  // fix left on the bare path). A wx-EXCLUSIVE temp (we only ever write our OWN fresh inode — a plain write would TRUNCATE a
+  // stale same-key `.tmp-*` leftover) + a crypto-random name + linkSync NO-OVERWRITE (the old renameSync SILENTLY CLOBBERED an
+  // existing `<key>.json`) + clean our OWN temp in finally ("只清 own").
+  let tmp = "";
   try {
-    const tmp = `${msgFile}.tmp-${Math.random().toString(36).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
-    renameSync(tmp, msgFile);      // publish (claim renames this, ack deletes it)
+    for (let t = 0; ; t++) {
+      tmp = `${msgFile}.tmp-${randomBytes(8).toString("hex")}`;
+      try { writeFileSync(tmp, JSON.stringify(valid), { flag: "wx", mode: 0o600 }); break; } // exclusive create ⇒ our own fresh inode
+      catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && t < 8) continue; throw e; } // temp name taken ⇒ fresh temp
+    }
+    try {
+      linkSync(tmp, msgFile); // atomic NO-OVERWRITE publish (claim renames this, ack deletes it)
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+        // The message for this key is ALREADY on disk (an anomaly vs the "absent" credential — e.g. the credential was lost while
+        // the message survived). It is delivered: ADOPT it (confirm the credential, return already) instead of clobbering it.
+        writeCredState(cred, "published");
+        return "already";
+      }
+      throw e;
+    }
   } catch (e) {
     // The message write FAILED in-process ⇒ we KNOW it did not land ("confirmed absent"). Roll back the pending claim so the next
     // retry re-publishes from "absent" — never leave it stuck pending, which recovery would retain as unknown (a silent drop). Re-throw
     // so the caller leaves ITS obligation open and retries (matching the historical throw-on-write-fault contract).
     try { unlinkSync(cred); } catch { /* best-effort rollback */ }
     throw e;
+  } finally {
+    if (tmp) { try { unlinkSync(tmp); } catch { /* only OUR own temp; the linked copy holds the bytes, a leftover is ignored by readers */ } }
   }
   writeCredState(cred, "published"); // confirm
   return "published";

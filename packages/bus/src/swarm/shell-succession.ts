@@ -142,7 +142,8 @@ export function successionEnabled(env: NodeJS.ProcessEnv = process.env): boolean
   return flagDefaultOn(env.SWARM_SUCCESSION);
 }
 
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, renameSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
@@ -364,7 +365,15 @@ export function writeSuccessionSwap(home: string, sid: string, swappedAtSec: num
   try {
     const p = successionSwapPath(home, sid);
     mkdirSync(path.dirname(p), { recursive: true });
-    writeFileSync(p, JSON.stringify({ sid, swappedAtSec }), { mode: 0o600 });
+    // DWS ③ (direct-write-sweep): write ATOMICALLY (temp + rename) so a concurrent reader (the succession-heartbeat sentinel's
+    // readSuccessionSwapSec) never sees a TORN/partial JSON from a bare in-place overwrite. renameSync is the correct primitive:
+    // there is exactly ONE record per sid and each swap REPLACES it; a reader always sees either the whole old or the whole new
+    // record. The temp is our OWN fresh (crypto-random) name, cleaned on a write/rename fault.
+    const tmp = `${p}.tmp-${randomBytes(6).toString("hex")}`;
+    try {
+      writeFileSync(tmp, JSON.stringify({ sid, swappedAtSec }), { mode: 0o600 });
+      renameSync(tmp, p); // atomic replace
+    } catch (e) { try { unlinkSync(tmp); } catch { /* best-effort */ } throw e; }
   } catch { /* fail-soft: a missed swap record only loses heartbeat coverage for this swap */ }
 }
 
