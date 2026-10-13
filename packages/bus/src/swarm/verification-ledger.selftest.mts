@@ -18,7 +18,7 @@ import type { TaskAttempt } from "./task-state.js";
 import { commitControl } from "./control-store.js";
 import {
   verificationLedgerEnabled, parseLedgerArgs, extractLedgerInputs, costPerAcceptedChange, disproportionateRework,
-  summarizeLedger, renderLedgerReport, ledgerReportTag,
+  summarizeLedger, renderLedgerReport, ledgerReportTag, fmtWindow,
 } from "./verification-ledger.js";
 import { readLedgerInputs, readReviewRoundsDist } from "./verification-ledger-store.js";
 
@@ -96,17 +96,20 @@ t("args: unknown flag ⇒ null; --coordinator without value ⇒ null", parseLedg
 // VL-1 (r3) key COLLISION: a separator-join would collide these two distinct tuples; the JSON-tuple key must keep them apart.
 //   A = (jobId="left\u0000middle", nodeId="right")  — first-try (0 rework)
 //   B = (jobId="left", nodeId="middle\u0000right")  — 3 rejects then accept (3 rework)
-// A NUL-joined key "left\u0000middle\u0000right" is identical for both ⇒ costs would swap. Per-CHANGE assertion (total is 3 either way).
+// A NUL-joined key "left\u0000middle\u0000right" is identical for both. r4 ORDERING (the r3 fixture missed the merge): B's three
+// rejections land at seq 2/4/6 — BEFORE A's acceptance at seq 8 — so a merged key puts those rejections in A's (-inf,8) window and
+// MISATTRIBUTES B's rework to A (merged ⇒ A=4/3, B=1/0). The r3 order (A accepted first at seq 2) coincidentally survived the merge via
+// the sequence window, so a reverted NUL key still passed. With this order, a reverted nodeKey makes the per-change assertion FAIL.
 {
   const A_job = "left\u0000middle", A_node = "right", B_job = "left", B_node = "middle\u0000right";
   const bodies = [
-    att("aA", A_job, A_node, 1), acc("accA", A_job, A_node, 2, { attemptId: "aA" }),
-    att("aB1", B_job, B_node, 3), rej("aB1", 4), att("aB2", B_job, B_node, 5), rej("aB2", 6),
-    att("aB3", B_job, B_node, 7), rej("aB3", 8), att("aB4", B_job, B_node, 9), acc("accB", B_job, B_node, 10, { attemptId: "aB4" }),
+    att("bB1", B_job, B_node, 1), rej("bB1", 2), att("bB2", B_job, B_node, 3), rej("bB2", 4), att("bB3", B_job, B_node, 5), rej("bB3", 6), // B: 3 rejections FIRST
+    att("aA", A_job, A_node, 7), acc("accA", A_job, A_node, 8, { attemptId: "aA" }),                                                         // A: first-try accept, AFTER B's rejections
+    att("bB4", B_job, B_node, 9), acc("accB", B_job, B_node, 10, { attemptId: "bB4" }),                                                       // B: fourth attempt accepted
   ];
   const cpac = costPerAcceptedChange(extractLedgerInputs(bodies));
   const A = cpac.rows.find((r) => r.acceptedResultId === "accA")!; const B = cpac.rows.find((r) => r.acceptedResultId === "accB")!;
-  t("VL-1 r3: NUL-in-id tuples do NOT collide — A (first-try) rework 0, B rework 3 (not swapped)", A.reworkRounds === 0 && A.attempts === 1 && B.reworkRounds === 3 && B.attempts === 4);
+  t("VL-1-GATE r4: NUL-in-id tuples do NOT collide — A first-try 0/1, B 3/4 (a merged key would misattribute B's rework to A ⇒ 4/3,1/0)", A.reworkRounds === 0 && A.attempts === 1 && B.reworkRounds === 3 && B.attempts === 4);
 }
 
 // =====================================================================================================================
@@ -147,21 +150,24 @@ t("disproportionate: boundary is >= threshold", disproportionateRework({ jobId: 
 // =====================================================================================================================
 {
   const cpac = costPerAcceptedChange(extractLedgerInputs([att("k1", "jk", "n", 1), rej("k1", 2), att("k2", "jk", "n", 3), rej("k2", 4), att("k3", "jk", "n", 5), rej("k3", 6), att("k4", "jk", "n", 7), acc("accK", "jk", "n", 8, { attemptId: "k4" }), rej("ghost", 9)]));
-  const rpt = renderLedgerReport({ summary: summarizeLedger(cpac, 3), reviewRounds: { perTicket: [], totalTickets: 2, singlePass: 1, multiRound: 1, maxRounds: 4, medianRounds: 2 }, sources: { controlLog: "read", reviewReports: "read", reviewReportsComplete: true }, reviewWindowDays: 7, threshold: 3 });
+  const rpt = renderLedgerReport({ summary: summarizeLedger(cpac, 3), reviewRounds: { perTicket: [], totalTickets: 2, singlePass: 1, multiRound: 1, maxRounds: 4, medianRounds: 2 }, sources: { controlLog: "read", reviewReports: "read", reviewReportsComplete: true }, reviewWindowSec: 604800, threshold: 3 });
   t("render: COST not ROI; $ omitted (no (job,node) link); review NOT keyed to acceptance", /COST metric, NOT an ROI/i.test(rpt) && /\$ cost omitted/i.test(rpt) && /NOT keyed to acceptance/i.test(rpt));
   t("render: mean is over the KNOWN sample with coverage; unresolved rejections surfaced", /known-cost sample: 1\/1/.test(rpt) && /mean rework \(known\)/.test(rpt) && /could not be linked to an attempt/i.test(rpt));
   t("render VL-5: control-log labelled FULL current projection; review range labelled (last 7d)", /FULL current projection/i.test(rpt) && /last 7d/i.test(rpt));
-  // VL-5 (r3): a fractional-day window is shown ACCURATELY (no Math.round: 0.25 must not print "0d"; 1 prints "1d"; 1.49 stays).
+  // VL-5 (r4): the window is shown in its COARSEST EXACT unit — NO lossy rounding. The review's sub-day cases (86s/432s) must not collapse
+  // to "0d"/"0.01d"; 6h/1d/1.49d render exactly. fmtWindow is unit-tested directly too.
   {
-    const mkRange = (d: number | null) => renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([])), 3), reviewRounds: { perTicket: [], totalTickets: 0, singlePass: 0, multiRound: 0, maxRounds: 0, medianRounds: 0 }, sources: { controlLog: "read", reviewReports: "read", reviewReportsComplete: true }, reviewWindowDays: d, threshold: 3 });
-    t("render VL-5: fractional day window accurate (0.25⇒'last 0.25d', not '0d'; 1⇒'1d'; 1.49⇒'1.49d')", /last 0\.25d/.test(mkRange(0.25)) && /last 1d/.test(mkRange(1)) && /last 1\.49d/.test(mkRange(1.49)) && !/last 0d/.test(mkRange(0.25)));
+    const mkRange = (sec: number | null) => renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([])), 3), reviewRounds: { perTicket: [], totalTickets: 0, singlePass: 0, multiRound: 0, maxRounds: 0, medianRounds: 0 }, sources: { controlLog: "read", reviewReports: "read", reviewReportsComplete: true }, reviewWindowSec: sec, threshold: 3 });
+    t("render VL-5: 86s⇒'last 86s' (NOT '0d'); 432s⇒'last 432s' (NOT '0.01d')", /last 86s/.test(mkRange(86)) && !/last 0d/.test(mkRange(86)) && /last 432s/.test(mkRange(432)) && !/0\.01d/.test(mkRange(432)));
+    t("render VL-5: 21600s⇒'last 6h'; 86400s⇒'last 1d'; 128736s⇒'last 1.49d' (exact)", /last 6h/.test(mkRange(21600)) && /last 1d/.test(mkRange(86400)) && /last 1\.49d/.test(mkRange(128736)));
+    t("fmtWindow: exact coarsest unit (86s/345s/432s raw; 21600⇒6h; 86400⇒1d; 129600⇒1.5d)", fmtWindow(86) === "86s" && fmtWindow(345) === "345s" && fmtWindow(432) === "432s" && fmtWindow(21600) === "6h" && fmtWindow(86400) === "1d" && fmtWindow(129600) === "1.5d");
   }
   t("render: a flagged disproportionate change lists job/node", /disproportionate/i.test(rpt) && /jk\/n/.test(rpt));
 
-  const partial = renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([])), 3), reviewRounds: { perTicket: [], totalTickets: 1, singlePass: 1, multiRound: 0, maxRounds: 1, medianRounds: 1 }, sources: { controlLog: "read", reviewReports: "read", reviewReportsComplete: false }, reviewWindowDays: null, threshold: 3 });
+  const partial = renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([])), 3), reviewRounds: { perTicket: [], totalTickets: 1, singlePass: 1, multiRound: 0, maxRounds: 1, medianRounds: 1 }, sources: { controlLog: "read", reviewReports: "read", reviewReportsComplete: false }, reviewWindowSec: null, threshold: 3 });
   t("render VL-4 r3: partial (complete:false) ⇒ 'PARTIAL' + 'OBSERVED over the read subset' + 'NOT guaranteed bounds'; NO blanket 'LOWER BOUND'", /PARTIAL/i.test(partial) && /OBSERVED over the read subset/i.test(partial) && /NOT guaranteed bounds/i.test(partial) && !/LOWER BOUND/i.test(partial));
 
-  const absent = renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([])), 3), reviewRounds: null, sources: { controlLog: "unreadable", reviewReports: "absent", reviewReportsComplete: true }, reviewWindowDays: null, threshold: 3 });
+  const absent = renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([])), 3), reviewRounds: null, sources: { controlLog: "unreadable", reviewReports: "absent", reviewReportsComplete: true }, reviewWindowSec: null, threshold: 3 });
   t("render: unreadable control-log ⇒ 'NOT reported as zero'; absent review ⇒ unavailable", /control-log: unreadable/i.test(absent) && /NOT reported as zero/i.test(absent) && /review-report rounds: absent/i.test(absent));
 }
 t("tag: 32 hex; stable for identical TEXT; distinct for different TEXT", (() => { const a = ledgerReportTag("X"); return /^[0-9a-f]{32}$/.test(a) && a === ledgerReportTag("X") && a !== ledgerReportTag("Y"); })());
@@ -177,7 +183,7 @@ t("tag: 32 hex; stable for identical TEXT; distinct for different TEXT", (() => 
   const h = tmpHome(); mkdirSync(controlLogDir(h), { recursive: true });
   writeFileSync(path.join(controlLogDir(h), "1.json"), "{ this is not json");
   t("store[crash-recovery]: corrupt/torn log ⇒ status 'unreadable', empty (NEVER a fabricated empty)", (() => { const r = readLedgerInputs(h); return r.status === "unreadable" && r.inputs.attempts.length === 0; })());
-  const rpt = renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(readLedgerInputs(h).inputs), 3), reviewRounds: null, sources: { controlLog: readLedgerInputs(h).status, reviewReports: "absent", reviewReportsComplete: true }, reviewWindowDays: null, threshold: 3 });
+  const rpt = renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(readLedgerInputs(h).inputs), 3), reviewRounds: null, sources: { controlLog: readLedgerInputs(h).status, reviewReports: "absent", reviewReportsComplete: true }, reviewWindowSec: null, threshold: 3 });
   t("store[crash-recovery]: report over the unreadable log says 'cannot compute' (not zero)", /control-log: unreadable/i.test(rpt) && /cannot compute/i.test(rpt));
 }
 {
@@ -198,7 +204,7 @@ t("tag: 32 hex; stable for identical TEXT; distinct for different TEXT", (() => 
 {
   // restart-idempotency: identical report TEXT ⇒ identical tag. (The REAL restart/publish safety is publishOnce in inbox.ts; this only
   // proves the tag is a deterministic content hash so a re-run produces the SAME key ⇒ publishOnce dedups — not re-proven here.)
-  const mk = () => renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([att("t1", "j", "n", 1), acc("a1", "j", "n", 2, { attemptId: "t1" })])), 3), reviewRounds: null, sources: { controlLog: "read", reviewReports: "absent", reviewReportsComplete: true }, reviewWindowDays: null, threshold: 3 });
+  const mk = () => renderLedgerReport({ summary: summarizeLedger(costPerAcceptedChange(extractLedgerInputs([att("t1", "j", "n", 1), acc("a1", "j", "n", 2, { attemptId: "t1" })])), 3), reviewRounds: null, sources: { controlLog: "read", reviewReports: "absent", reviewReportsComplete: true }, reviewWindowSec: null, threshold: 3 });
   t("fixture[restart-idempotency]: identical inputs ⇒ identical report TEXT ⇒ identical tag (deterministic; dedup is publishOnce's job)", ledgerReportTag(mk()) === ledgerReportTag(mk()));
 }
 {

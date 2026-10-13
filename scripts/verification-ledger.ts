@@ -37,14 +37,14 @@ async function main(): Promise<number> {
   // READ (FC-2 three-state, no writes).
   const cl = readLedgerInputs(H);
   const rr = readReviewRoundsDist(H, args.sinceSec);
-  const reviewWindowDays = args.sinceSec != null ? (ns - args.sinceSec) / 86400 : null; // exact (VL-5: no Math.round distortion)
+  const reviewWindowSec = args.sinceSec != null ? (ns - args.sinceSec) : null; // exact seconds (VL-5: render picks the coarsest exact unit)
 
   const cpac = costPerAcceptedChange(cl.inputs);
   const summary = summarizeLedger(cpac, args.threshold);
   const report = renderLedgerReport({
     summary, reviewRounds: rr.dist,
     sources: { controlLog: cl.status, reviewReports: rr.status, reviewReportsComplete: rr.complete },
-    reviewWindowDays, threshold: args.threshold,
+    reviewWindowSec, threshold: args.threshold,
   });
   console.log(report);
 

@@ -177,12 +177,24 @@ export function summarizeLedger(cpac: CostPerAcceptedChange, threshold = 3): Led
  *  bound, VL-4), or the raw unreadable/absent status. */
 export type LedgerSources = { controlLog: SourceStatus; reviewReports: SourceStatus; reviewReportsComplete: boolean };
 
+/** Format a window of whole seconds in its COARSEST EXACT unit — never lossy (VL-5): d only for whole days, h/m only when they divide
+ *  evenly, else raw seconds; a ≥1-day non-round window shows native days (e.g. 1.49d). So 86s⇒"86s" (not "0d"), 21600s⇒"6h", 86400s⇒"1d". */
+export function fmtWindow(sec: number): string {
+  if (sec > 0 && sec % 86400 === 0) return `${sec / 86400}d`;
+  if (sec < 86400) {
+    if (sec % 3600 === 0) return `${sec / 3600}h`;
+    if (sec % 60 === 0) return `${sec / 60}m`;
+    return `${sec}s`;
+  }
+  return `${sec / 86400}d`; // > 1 day, non-whole: native day precision (exact for values like 1.49)
+}
+
 /** Render the coordinator report (pure). Honest throughout: a COST metric (not ROI); control-log is the reliable join; the mean is
  *  over the KNOWN sample with coverage shown (VL-3); unresolved rejections are surfaced (VL-1); a PARTIAL review-rounds view is a lower
  *  bound (VL-4); the two surfaces' RANGES differ (VL-5: control-log = full current projection; review-rounds = --days mtime or all). An
  *  unreadable/absent source is stated, never rendered as zero. `$` omitted (no (job,node) link — a fabricated join would overclaim). */
 export function renderLedgerReport(input: {
-  summary: LedgerSummary; reviewRounds: ReworkDist | null; sources: LedgerSources; reviewWindowDays?: number | null; threshold?: number;
+  summary: LedgerSummary; reviewRounds: ReworkDist | null; sources: LedgerSources; reviewWindowSec?: number | null; threshold?: number;
 }): string {
   const { summary, reviewRounds, sources } = input;
   const th = input.threshold ?? 3;
@@ -209,8 +221,9 @@ export function renderLedgerReport(input: {
   if (reviewRounds === null) {
     lines.push(`review-report rounds: ${sources.reviewReports} — view unavailable (NOT reported as zero).`);
   } else {
-    // VL-5 (r3): show the ACCURATE window (no Math.round — `--days 0.25` must not print "last 0d"); trim trailing zeros.
-    const range = input.reviewWindowDays != null ? `last ${Number(input.reviewWindowDays.toFixed(2))}d (mtime)` : `all`;
+    // VL-5 (r4): show the window in its COARSEST EXACT unit (no lossy rounding — `--days 0.001` = 86s must not print "0d" or "0.01d";
+    //  0.25d = 6h exactly). s/m/h only when they divide evenly; sub-day non-round falls to seconds; ≥1 day non-round shows native days.
+    const range = input.reviewWindowSec != null ? `last ${fmtWindow(input.reviewWindowSec)} (mtime)` : `all`;
     // VL-4 (r3): a PARTIAL read is NOT a uniform "lower bound" — a ticket with an unreadable ROUND is under-counted, which can make a
     //  multi-round ticket look single-pass (single-pass OVER-counts), and the median is not monotone. State these as OBSERVED over the
     //  read subset, guaranteeing no total/direction — never a blanket "lower bound".
