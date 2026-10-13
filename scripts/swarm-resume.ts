@@ -18,14 +18,15 @@
  * failures are reported and do NOT stop the rest.
  */
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { startBusCore } from "../packages/bus/src/core.js";
 import { buildAppleScript } from "../packages/bus/src/spawn.js";
 import { herdrAgentName, herdrAgentStates, herdrLaunch, herdrServerReachable, herdrSpawnable, splitCommand } from "../packages/bus/src/swarm/herdr.js";
-import { ROSTER_FILE, assembleRoster, parseSnapshot, planResume, resumeCommandForMember, type PeerLike } from "../packages/bus/src/swarm/resume.js";
+import { resolveSession } from "../packages/bus/src/swarm/task-liveness.js";
+import { ROSTER_FILE, assembleRoster, writeRosterSnapshot, parseSnapshot, planResume, resumeCommandForMember, type PeerLike } from "../packages/bus/src/swarm/resume.js";
 
 const pexec = promisify(execFile);
 
@@ -68,9 +69,19 @@ async function main(): Promise<void> {
       const peers: PeerLike[] = await Promise.all(
         core.peers().map(async (p) => ({ ...p, argv: typeof p.pid === "number" ? await psArgs(p.pid) : undefined })),
       );
-      const snap = assembleRoster(peers, Math.floor(Date.now() / 1000), { selfId: core.self.id });
-      mkdirSync(path.dirname(out), { recursive: true });
-      writeFileSync(out, `${JSON.stringify(snap, null, 2)}\n`);
+      // dialog-officer brief §9-2: the SWARM_DIALOG_OFFICER handle is the first structured role source (mirrors SWARM_COORDINATOR);
+      // SWARM_PROJECT is the FC-7 forward-reserve project key. Both additive: unset ⇒ role stays null / project absent.
+      // DOS-P2-1: a coordinator-style handle can arrive in THREE forms — a full session id, a bus handle (tool:dir-<short>),
+      // or a bare short id. The ENTRY resolves it to a UNIQUE stable SID with the SAME resolver the coordinator uses
+      // (task-liveness.resolveSession, brief §2 mirror) BEFORE the pure core, which then matches by exact SID. Unresolved or
+      // ambiguous ⇒ stamp no role (never guess, F16) and say so, rather than silently dropping it inside the core.
+      const dialogOfficerRaw = (process.env.SWARM_DIALOG_OFFICER ?? "").trim();
+      const sidPool = peers.map((p) => p.stableId ?? p.id).filter((x): x is string => typeof x === "string" && x.length > 0);
+      const dialogOfficer = dialogOfficerRaw ? (resolveSession(dialogOfficerRaw, sidPool) ?? "") : "";
+      if (dialogOfficerRaw && !dialogOfficer) console.error(`SWARM_DIALOG_OFFICER="${dialogOfficerRaw}" did not uniquely resolve to a live session (unknown or ambiguous); no dialog-officer role stamped.`);
+      const project = (process.env.SWARM_PROJECT ?? "").trim();
+      const snap = assembleRoster(peers, Math.floor(Date.now() / 1000), { selfId: core.self.id, dialogOfficer, project });
+      writeRosterSnapshot(out, snap); // atomic temp+rename (roster = core-primitive write, infra zero-bug ruling)
       console.log(`captured ${snap.members.length} window(s) (schema v${snap.version}) -> ${out}`);
       for (const m of snap.members) console.log(`  ${m.title ?? m.member}  [${m.resumeCmdSource}]  ${m.resumeCmd}`);
       return;

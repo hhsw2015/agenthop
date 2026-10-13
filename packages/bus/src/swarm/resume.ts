@@ -4,23 +4,30 @@
  * snapshot (member x directory x CLI x role) and, on the next boot, one command relaunches each window
  * (reusing spawn.ts's Ghostty launcher), each session self-reports, and the sweep takes over.
  *
- * PURE module (msglog P1 lesson): no fs, no bus, no top-level side effects — selftests in resume.selftest.mts.
- * The two pieces of real logic live here and are tested directly: assembleRoster (who to capture) and
- * planResume (idempotency — skip windows that are already up). The IO shell (scripts/swarm-resume.ts) reads
- * the bus roster, writes/reads the snapshot file, and calls spawnAgent per member.
+ * Almost-pure module (msglog P1 lesson): no bus, no clock, NO TOP-LEVEL side effects. The decision logic is pure and
+ * tested directly — assembleRoster (who to capture), planResume (idempotency — skip windows already up). The ONE IO
+ * function, writeRosterSnapshot, does fs ONLY when called (an atomic temp+rename, the roster being a core-primitive
+ * write per the infra zero-bug ruling); its node:fs imports are used nowhere else. The rest of the IO shell
+ * (scripts/swarm-resume.ts) reads the bus roster, reads the snapshot file, resolves handles, and spawns each member.
  *
  * Decoupled from closeout ON PURPOSE: the snapshot can be written on demand from the live bus roster, so
  * one-key resume works today. The at-closeout auto-snapshot is the SAME writer hung at the closeout seam
  * (a diff handed to that owner) — it depends on the closeout flow (board dep L2-struct), this module does not.
  */
+import { writeFileSync, renameSync, mkdirSync, statSync, unlinkSync, openSync, closeSync, fchmodSync } from "node:fs"; // used ONLY inside writeRosterSnapshot() — no top-level side effect
+import { randomBytes } from "node:crypto";
+import path from "node:path";
 
-/** A member's workstation: enough to relaunch its window exactly. role is best-effort (no structured
- *  member->role source exists yet; left null until one does). */
+/** A member's workstation: enough to relaunch its window exactly. `role` is best-effort: null when no structured source
+ *  identifies one; the FIRST such source is the dialog-officer handle (SWARM_DIALOG_OFFICER → role="dialog-officer",
+ *  dialog-officer brief §9-2). `project` is a forward-reserved FC-7 optional field (SSI project ownership) — only landed
+ *  when a project key is set; unset ⇒ legacy, no cross-project execution is implied here. */
 export interface RosterMember {
   member: string; // the durable session id (stableId) if known, else the short handle — a human label
   tool: string; // the CLI to relaunch: claude | codex | opencode | ...
   cwd: string; // the working directory the window opened in
-  role: string | null; // best-effort; null when unknown
+  role: string | null; // best-effort; null when no structured source names one (first source: the dialog-officer handle)
+  project?: string; // FC-7 forward-reserve (SSI project key); absent ⇒ legacy / unknown project
   title?: string; // short handle (e.g. "Work-20cab0a5"), for display
   // F36: the FULL resume command, not a bare `claude --resume`. A bare relaunch loses permission mode / model /
   // effort and starts a wrong session (user caught this by hand). Captured from the live process args when
@@ -121,9 +128,13 @@ export function memberKey(tool: string, cwd: string): string {
 export function assembleRoster(
   peers: readonly PeerLike[],
   nowSec: number,
-  opts: { selfId?: string; exclude?: readonly string[] } = {},
+  opts: { selfId?: string; exclude?: readonly string[]; dialogOfficer?: string; project?: string } = {},
 ): RosterSnapshot {
   const excluded = new Set((opts.exclude ?? []).map((s) => s));
+  // The FIRST structured member->role source (dialog-officer brief §9-2): the resolved dialog-officer stableId gets
+  // role="dialog-officer". A blank/whitespace handle names no one (additive: unset ⇒ every role stays null, byte-identical v1).
+  const dialogOfficer = (opts.dialogOfficer ?? "").trim();
+  const project = (opts.project ?? "").trim(); // FC-7 forward-reserve: stamped only when a project key is set
   const seen = new Set<string>();
   const members: RosterMember[] = [];
   for (const p of peers ?? []) {
@@ -137,10 +148,61 @@ export function assembleRoster(
     seen.add(identity);
     const sid = p.stableId ?? p.id ?? identity; // the id to resume (durable session id, not the display title)
     const { cmd, source } = resumeCmdFor(tool, sid, p.argv);
-    members.push({ member: identity, tool, cwd, role: null, ...(p.title ? { title: p.title } : {}), resumeCmd: cmd, resumeCmdSource: source });
+    // role: the dialog-officer handle matches a member by its durable identity (stableId / resume sid / display identity).
+    const role: string | null = dialogOfficer !== "" && (p.stableId === dialogOfficer || sid === dialogOfficer || identity === dialogOfficer) ? "dialog-officer" : null;
+    members.push({ member: identity, tool, cwd, role, ...(project ? { project } : {}), ...(p.title ? { title: p.title } : {}), resumeCmd: cmd, resumeCmdSource: source });
   }
   members.sort((a, b) => (a.title ?? a.member).localeCompare(b.title ?? b.member));
   return { version: SCHEMA_VERSION, capturedAtSec: Math.floor(nowSec), members };
+}
+
+/** Serialize a roster snapshot to its on-disk JSON form (pure; the exact bytes writeRosterSnapshot persists). */
+export function serializeSnapshot(snap: RosterSnapshot): string { return `${JSON.stringify(snap, null, 2)}\n`; }
+
+/** Write the roster snapshot ATOMICALLY (temp + rename). The roster is a core-primitive write (infra zero-bug ruling): a crash
+ *  mid-write leaves the PREVIOUS roster intact (never a torn file), and a concurrent capture always observes one COMPLETE snapshot
+ *  (rename is atomic; the last writer wins, neither sees a half-file). Each writer EXCLUSIVELY creates its temp (O_EXCL) and
+ *  OWNS that inode — the exclusive create (NOT the random suffix) guarantees ownership; the suffix only lowers retry
+ *  probability, and a name collision retries a fresh name, never truncating or deleting another writer's temp. IO runs only
+ *  when called — no top-level side effect. */
+export function writeRosterSnapshot(out: string, snap: RosterSnapshot, suffixGen: () => string = () => randomBytes(8).toString("hex"), beforeRename?: () => void): void {
+  // DOS-P2-2 (r3, FC-2): decide the mode BEFORE touching the fs. Only a CONFIRMED absence (ENOENT) takes the 0600 new-file
+  // default. Any OTHER stat error (EACCES/EIO/ENOTDIR…) means an existing target MAY carry a mode we cannot read — defaulting
+  // to 0600 would silently relax it, so FAIL (defer) rather than guess the safe side. Throwing here is before any temp exists.
+  let mode = 0o600;
+  try {
+    mode = statSync(out).mode & 0o777;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; // unknown existing mode ⇒ never widen (FC-2)
+  }
+  mkdirSync(path.dirname(out), { recursive: true });
+  const data = serializeSnapshot(snap);
+  // DOS-CORE-P1-1: a random temp SUFFIX is not OWNERSHIP — two writers colliding on the same name would `w` (O_TRUNC)
+  // each other's inode, publishing a torn snapshot that rename's atomicity cannot undo. So EXCLUSIVELY create the temp
+  // ("wx" = O_CREAT|O_EXCL): this writer OWNS that inode. On EEXIST, retry a FRESH name — NEVER unlink the existing temp
+  // (it may be another writer's). All writes/chmod go through the OWNED fd (not the path), so no other writer and no later
+  // path-chmod can touch this inode before rename. (suffixGen + beforeRename are test seams for deterministic forced-collision
+  // / pre-rename-interruption coverage — production passes neither.)
+  let fd: number | undefined;
+  let tmp = "";
+  for (let attempt = 0; ; attempt += 1) {
+    tmp = `${out}.tmp-${suffixGen()}`;
+    try { fd = openSync(tmp, "wx", mode); break; } // own the inode or fail; EEXIST ⇒ a colliding name, retry a new one
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && attempt < 32) continue; throw e; }
+  }
+  try {
+    writeFileSync(fd, data);   // write THROUGH the owned fd (not the path) — no re-open, no truncation by another writer
+    fchmodSync(fd, mode);      // chmod the fd (not the path): deterministic under umask + no path race before rename
+    if (beforeRename) beforeRename(); // TEST SEAM (undefined in production): lets a fixture interrupt a writer at the exact
+                                      // pre-rename stage (temp owned + complete, not yet published) — the DOS-CORE-P1-1 window.
+    closeSync(fd); fd = undefined;
+    renameSync(tmp, out);      // atomic publish of THIS writer's complete inode (last writer wins; never a torn file)
+  } catch (e) {
+    // DOS-P3-1 + DOS-CORE-P1-1: clean up ONLY the temp THIS call exclusively created (reached only after a successful open).
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* best-effort */ } }
+    try { unlinkSync(tmp); } catch (e2) { console.error(`roster temp cleanup failed after a write error (${tmp}): ${(e2 as Error).message}`); }
+    throw e;
+  }
 }
 
 /** Tolerant parse of a snapshot file. Returns null on anything malformed (a resume should degrade, not throw). */
@@ -164,6 +226,7 @@ export function parseSnapshot(text: string): RosterSnapshot | null {
       tool: mm.tool,
       cwd: mm.cwd,
       role: typeof mm.role === "string" ? mm.role : null,
+      ...(typeof mm.project === "string" && mm.project ? { project: mm.project } : {}), // FC-7: absent on legacy snapshots ⇒ undefined
       ...(typeof mm.title === "string" ? { title: mm.title } : {}),
       // v2 field; a v1 snapshot lacks it -> left undefined, launch recomputes canon (resumeCommandForMember).
       ...(typeof mm.resumeCmd === "string" ? { resumeCmd: mm.resumeCmd } : {}),
