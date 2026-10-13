@@ -43,28 +43,39 @@ function readToken(): string {
 // DO-R2-P1-1 (FC-2, same shape as TG-5/IP2-3): a read FAULT (EACCES/EIO) or a CORRUPT file is UNKNOWN (returns null), NOT an empty
 // allowlist. A confirmed-absent file (ENOENT) is a real empty set (no chat_id configured yet). Callers must HOLD on null (never
 // treat an unverifiable allowlist as "deny all", which would drop legitimate inbound taps and permanently refuse officer replies).
-function readAllow(): Set<number> | null {
+export function readAllow(file: string): Set<number> | null {
   let raw: string;
-  try { raw = readFileSync(allowFile(), "utf8"); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return new Set(); console.error(`swarm-tg-entry: allowlist UNREADABLE (${allowFile()}) — HOLDING (not treating as empty): ${e instanceof Error ? e.message : e}`); return null; }
+  try { raw = readFileSync(file, "utf8"); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return new Set(); console.error(`swarm-tg-entry: allowlist UNREADABLE (${file}) — HOLDING (not treating as empty): ${e instanceof Error ? e.message : e}`); return null; }
   let a: unknown;
-  try { a = JSON.parse(raw); } catch (e) { console.error(`swarm-tg-entry: allowlist CORRUPT JSON (${allowFile()}) — HOLDING (not empty): ${e instanceof Error ? e.message : e}`); return null; }
+  try { a = JSON.parse(raw); } catch (e) { console.error(`swarm-tg-entry: allowlist CORRUPT JSON (${file}) — HOLDING (not empty): ${e instanceof Error ? e.message : e}`); return null; }
   // TGP-13: only ACCEPT a recognized shape — a top-level number[] or { chatIds: number[] }. Anything else (null / number / {} /
   // { chatIds: null } / a non-empty array with NO valid numeric id, e.g. ["12345"]) is MALFORMED ⇒ UNKNOWN (null), never a confirmed
   // empty set that would silently drop legitimate taps. Only an explicit empty array ([] or { chatIds: [] }) or ENOENT is empty.
   const src: unknown = Array.isArray(a) ? a : (a !== null && typeof a === "object" && Array.isArray((a as { chatIds?: unknown }).chatIds)) ? (a as { chatIds: unknown[] }).chatIds : undefined;
-  if (!Array.isArray(src)) { console.error(`swarm-tg-entry: allowlist MALFORMED shape (${allowFile()}) — HOLDING (not empty)`); return null; }
+  if (!Array.isArray(src)) { console.error(`swarm-tg-entry: allowlist MALFORMED shape (${file}) — HOLDING (not empty)`); return null; }
   // DO-R2-P1-1: validate EVERY member. A bad member (non-number) is NOT silently filtered out (that would turn [8,"7"] into {8} and
   // permanently drop replies to 7); it makes the WHOLE config UNKNOWN ⇒ HOLD. Only an all-valid list is accepted ([] ⇒ confirmed-empty).
   const nums: number[] = [];
   for (const n of src as unknown[]) {
-    if (typeof n !== "number" || !Number.isFinite(n)) { console.error(`swarm-tg-entry: allowlist has a NON-NUMERIC member (${allowFile()}) — HOLDING (not empty, not a filtered subset)`); return null; }
+    if (typeof n !== "number" || !Number.isFinite(n)) { console.error(`swarm-tg-entry: allowlist has a NON-NUMERIC member (${file}) — HOLDING (not empty, not a filtered subset)`); return null; }
     nums.push(n);
   }
   return new Set(nums); // every member valid ⇒ the allowlist; [] ⇒ confirmed-empty (no chat allowlisted yet)
 }
-const readOffset = (): number => { try { return Number(readFileSync(offsetFile(), "utf8").trim()) || 0; } catch { return 0; } };
-const writeOffset = (n: number): void => { try { writeFileSync(offsetFile(), String(n), { mode: 0o600 }); } catch { /* best-effort; a replayed update is deduped by consume-once */ } };
+export function readOffset(file: string): number | null {
+  let raw: string;
+  try { raw = readFileSync(file, "utf8"); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return 0; console.error(`swarm-tg-entry: offset UNREADABLE (${(e as Error).message}) — refusing to poll (would replay the whole backlog every loop); fix ${file}`); return null; }
+  const n = Number(raw.trim());
+  if (Number.isFinite(n) && n >= 0) return n;
+  console.error(`swarm-tg-entry: offset file corrupt ('${raw.trim().slice(0, 40)}') — restarting from backlog once (self-heals on next offset write)`);
+  return 0;
+}
+export function writeOffset(file: string, n: number): boolean {
+  try { writeFileSync(file, String(n), { mode: 0o600 }); return true; }
+  catch (e) { console.error(`swarm-tg-entry: FAILED to persist offset to ${file} (${(e as Error).message}) — updates will be re-fetched until this resolves`); return false; }
+}
 const readNotified = (): Set<string> => { try { return new Set(JSON.parse(readFileSync(notifiedFile(), "utf8"))); } catch { return new Set(); } };
 const writeNotified = (s: Set<string>): void => { try { writeFileSync(notifiedFile(), JSON.stringify([...s]), { mode: 0o600 }); } catch { /* best-effort */ } };
 
@@ -150,6 +161,8 @@ function auditSend(phase: "attempt" | "ok" | "error", method: string, body: unkn
   finally { if (fd !== undefined) { try { closeSync(fd); } catch { /* */ } } }
 }
 
+/** TG API call seam (testability): production binds it to tg(token, ...); a test injects a fake, keeping pollOnce HTTP-free. */
+export type TgCall = (method: string, body: unknown, timeoutMs?: number) => Promise<any>;
 function tg(token: string, method: string, body: unknown, timeoutMs = 65000): Promise<any> {
   const data = Buffer.from(JSON.stringify(body));
   const agent = proxyAgentFor("api.telegram.org"); // undefined ⇒ direct (no proxy env)
@@ -249,24 +262,25 @@ async function notifyNewBatches(token: string, allow: Set<number>): Promise<void
 /** INBOUND: long-poll getUpdates; a tap -> parseUpdate -> resolve ref -> recordDecision (merge). TG-P2-1: the offset is
  *  committed ONLY after a TERMINAL outcome (recorded / consumed / unknown-item / ignored / expired-ref); a transient IO error
  *  or a contended lock STOPS this poll WITHOUT advancing, so the same update is retried — never a silent "already decided". */
-async function pollOnce(token: string, allow: Set<number>): Promise<void> {
+export async function pollOnce(token: string, allow: Set<number>, call: TgCall = (m, b, t) => tg(token, m, b, t), offPath: string = offsetFile()): Promise<boolean> {
   // getUpdates timeout=25 bounds only the SERVER long-poll wait (TGP-6): it is NOT an end-to-end SLA. The loop is serial
   // (notifyNewBatches + pollOnce + per-item sends), so outbound new-batch latency ≈ one loop iteration (long-poll + that tick's
   // work), not a hard ≤25s. Inbound verdict→coordinator latency is independent — it rides the durable receipt + inbox-wake below.
   await drainReceiptObligations(); // recover any obligation a prior poll/process held (crash-recovery + coordinator-was-down retry) BEFORE the long-poll blocks
-  const committed = readOffset();
+  const committed = readOffset(offPath);
+  if (committed === null) return false; // IP2-2/TG-2: offset unreadable ⇒ refuse WITHOUT a long-poll; return false so the caller backs off (no hot loop, no ~24h replay)
   for (const id of ackedUpdates) if (id < committed) ackedUpdates.delete(id); // bound the ack-dedup set to the live window
-  const updates = await tg(token, "getUpdates", { offset: committed, timeout: 25, allowed_updates: ["callback_query", "message"] });
+  const updates = await call("getUpdates", { offset: committed, timeout: 25, allowed_updates: ["callback_query", "message"] });
   for (const u of updates ?? []) {
     const cq = u.callback_query;
     const chatId: unknown = cq ? cq.message?.chat?.id : u.message?.chat?.id;
-    const ack = async (text?: string): Promise<void> => { if (cq) await tg(token, "answerCallbackQuery", { callback_query_id: cq.id, ...(text ? { text } : {}) }, 15000).catch(() => {}); };
+    const ack = async (text?: string): Promise<void> => { if (cq) await call("answerCallbackQuery", { callback_query_id: cq.id, ...(text ? { text } : {}) }, 15000).catch(() => {}); };
     // first-contact: surface an un-allowlisted chat_id so the user can add it (design detail); terminal -> advance.
-    if (typeof chatId === "number" && !allow.has(chatId)) { console.error(`swarm-tg-entry: message from un-allowlisted chat_id ${chatId} — add it to ${allowFile()} to enable`); writeOffset(u.update_id + 1); await ack(); continue; }
+    if (typeof chatId === "number" && !allow.has(chatId)) { console.error(`swarm-tg-entry: message from un-allowlisted chat_id ${chatId} — add it to ${allowFile()} to enable`); writeOffset(offPath, u.update_id + 1); await ack(); continue; }
     // conversation SLA ② (TGP-6): an IMMEDIATE TG-side read-receipt — FIRE-AND-FORGET (never awaited, never blocks processing),
     // ONCE per update_id (an update can re-poll when a forward retry holds the offset), with a short deadline. Final result rides
     // the outbound path later.
-    if (typeof chatId === "number" && !ackedUpdates.has(u.update_id)) { ackedUpdates.add(u.update_id); void tg(token, "sendMessage", { chat_id: chatId, text: TG_ACK_TEXT }, 15000).catch(() => {}); }
+    if (typeof chatId === "number" && !ackedUpdates.has(u.update_id)) { ackedUpdates.add(u.update_id); void call("sendMessage", { chat_id: chatId, text: TG_ACK_TEXT }, 15000).catch(() => {}); }
     const upd: TgUpdate = cq ? { chatId, callbackData: cq.data } : { chatId, text: u.message?.text };
     const r = parseUpdate(upd, allow);
     if (r.kind === "dialog") {
@@ -282,23 +296,23 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
       // event); absent ⇒ 0. So a re-poll produces the identical body ⇒ idempotent ("already"), never a false conflict.
       const eventTs = typeof u.message?.date === "number" ? u.message.date * 1000 : 0;
       const officerMsg: InboxMsg = { from: "swarm-tg-entry", fromLabel: "tg-entry", text: buildDialogOfficerMsg(r.chatId, r.text).text, taskRef: "tg-dialog", title: "TG 对话", via: "local", ts: eventTs };
-      { const q = enqueueQueue(tgDialogPendingDir(HOME), { officerMsg, key }, u.update_id); if (q !== "enqueued" && q !== "already") return; } // DO-R4-P1-1: only enqueued/already is a handoff; failed/conflict ⇒ HOLD, re-poll
-      writeOffset(u.update_id + 1); await ack(); continue;
+      { const q = enqueueQueue(tgDialogPendingDir(HOME), { officerMsg, key }, u.update_id); if (q !== "enqueued" && q !== "already") return true; } // DO-R4-P1-1: only enqueued/already is a handoff; failed/conflict ⇒ HOLD, re-poll
+      writeOffset(offPath, u.update_id + 1); await ack(); continue;
     }
-    if (r.kind === "ignore") { writeOffset(u.update_id + 1); await ack(); continue; }
+    if (r.kind === "ignore") { writeOffset(offPath, u.update_id + 1); await ack(); continue; }
     // TG-P2-1: resolveRef throws on a STORE READ ERROR (unreadable batches dir/batch.json) — that is TRANSIENT, so STOP the poll
     // WITHOUT advancing the offset; the same tap is retried next loop (never a false "expired" that permanently skips an approval).
     let resolved: { batchId: string; itemId: string } | null;
     try { resolved = resolveRef(r.ref); }
-    catch (e) { console.error(`swarm-tg-entry: ref lookup read error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return; }
-    if (!resolved) { writeOffset(u.update_id + 1); await ack("expired"); continue; } // CONFIRMED gone/ambiguous -> terminal
+    catch (e) { console.error(`swarm-tg-entry: ref lookup read error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return true; }
+    if (!resolved) { writeOffset(offPath, u.update_id + 1); await ack("expired"); continue; } // CONFIRMED gone/ambiguous -> terminal
     // TGP-4 (TG-r6): stamp the decision's `reason` with this event's identity tag, so the SAME atomic ledger commit that records the
     // verdict also carries which TG update made it — enabling EVENT-BOUND receipt recovery after a lost obligation (see below).
     const decision = { id: resolved.itemId, verdict: r.verdict as Verdict, reason: srcTag(u.update_id), ...(r.scope ? { scope: r.scope as ApprovalScope } : {}) };
     let outcome: "recorded" | "consumed" | "unknown-item" | "contended";
     try { outcome = recordDecision(HOME, resolved.batchId, decision, Math.floor(Date.now() / 1000)); }
-    catch (e) { console.error(`swarm-tg-entry: recordDecision transient error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return; } // transient IO -> retry this update next poll
-    if (outcome === "contended") return; // a concurrent holder — retry this update next poll (do NOT advance)
+    catch (e) { console.error(`swarm-tg-entry: recordDecision transient error (NOT advancing offset, will retry): ${e instanceof Error ? e.message : e}`); return true; } // transient IO -> retry this update next poll
+    if (outcome === "contended") return true; // a concurrent holder — retry this update next poll (do NOT advance)
     // ① inbound immediacy + TGP-4 (TG-r5) DURABLE, EVENT-BOUND receipt obligation. A receipt is owed ONLY for a tap THIS call
     // actually RECORDED — the obligation's existence IS the proof that this update (identity = update_id) recorded a decision (fact
     // b). A "consumed"/"unknown-item" tap did NOT record (a late/losing tap, or one the coordinator already decided via console) ⇒
@@ -309,11 +323,11 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
       let mine: { verdict: Verdict; scope?: ApprovalScope };
       try {
         const item = readBatch(HOME, resolved.batchId)?.items.find((it) => it.id === resolved.itemId);
-        if (!item) return; // can't clamp without the item ⇒ transient (the batch should exist) ⇒ retry, do NOT advance
+        if (!item) return true; // can't clamp without the item ⇒ transient (the batch should exist) ⇒ retry, do NOT advance
         mine = enforceScope(item, decision);
-      } catch { return; } // transient batch read ⇒ retry
+      } catch { return true; } // transient batch read ⇒ retry
       const ob: ReceiptObligation = { updateId: u.update_id, batchId: resolved.batchId, itemId: resolved.itemId, recordedValue: { verdict: mine.verdict, ...(mine.scope ? { scope: mine.scope } : {}) } };
-      { const q = enqueueQueue(tgReceiptObligationDir(HOME), ob, u.update_id); if (q !== "enqueued" && q !== "already") return; } // DO-R4-P1-1: only a confirmed enqueue/already is a handoff; failed/conflict ⇒ HOLD the offset, never advance on an unlanded record
+      { const q = enqueueQueue(tgReceiptObligationDir(HOME), ob, u.update_id); if (q !== "enqueued" && q !== "already") return true; } // DO-R4-P1-1: only a confirmed enqueue/already is a handoff; failed/conflict ⇒ HOLD the offset, never advance on an unlanded record
     } else if (outcome === "consumed") {
       // TGP-4 (TG-r6) EVENT-BOUND RECOVERY: the obligation may have been LOST before it was durable — an enqueue IO-failure above, or
       // a crash between recordDecision and the enqueue. The batch is now sealed, but THIS event's identity is in the sealed ledger
@@ -322,20 +336,21 @@ async function pollOnce(token: string, allow: Set<number>): Promise<void> {
       // STILL delivered — provably this event's, never by value-equality. A mismatch/absent ⇒ this tap was superseded or never the
       // final ⇒ owe nothing. "unknown" (sealed-but-unreadable) ⇒ retry. A read fault ⇒ retry (never a false "not ours").
       let cr: ReturnType<typeof readConsumedResult>;
-      try { cr = readConsumedResult(HOME, resolved.batchId); } catch { return; }
-      if (cr.consumed === "unknown") return; // can't verify the authority yet ⇒ hold offset, retry
+      try { cr = readConsumedResult(HOME, resolved.batchId); } catch { return true; }
+      if (cr.consumed === "unknown") return true; // can't verify the authority yet ⇒ hold offset, retry
       if (cr.consumed === true) {
         const d = cr.doc.decisions.find((x) => x.id === resolved.itemId);
         if (d && d.reason === srcTag(u.update_id)) {
           const ob: ReceiptObligation = { updateId: u.update_id, batchId: resolved.batchId, itemId: resolved.itemId, recordedValue: { verdict: d.verdict, ...(d.scope ? { scope: d.scope } : {}) } };
-          { const q = enqueueQueue(tgReceiptObligationDir(HOME), ob, u.update_id); if (q !== "enqueued" && q !== "already") return; } // DO-R4-P1-1: failed/conflict ⇒ HOLD, never advance with no landed record
+          { const q = enqueueQueue(tgReceiptObligationDir(HOME), ob, u.update_id); if (q !== "enqueued" && q !== "already") return true; } // DO-R4-P1-1: failed/conflict ⇒ HOLD, never advance with no landed record
         }
       }
     }
-    writeOffset(u.update_id + 1); // terminal (the obligation, if any, is durable)
+    writeOffset(offPath, u.update_id + 1); // terminal (the obligation, if any, is durable)
     await ack(outcome === "recorded" ? "recorded" : outcome === "consumed" ? "already decided" : "unknown");
   }
   await drainReceiptObligations(); // deliver this cycle's recorded receipts (fast path) + anything a prior poll held
+  return true; // a getUpdates long-poll completed (the loop's natural pacing)
 }
 
 async function main(): Promise<void> {
@@ -369,7 +384,7 @@ async function main(): Promise<void> {
   const outboxStuck = new Set<string>(); // DO-P2-2: claims whose release/ack faulted, re-attempted each drain
   const outboxTimer = setInterval(() => {
     if (draining || stop) return; draining = true;
-    const allow = readAllow(); // DO-P2-5: re-read so the send-boundary allowlist is fresh
+    const allow = readAllow(allowFile()); // DO-P2-5: re-read so the send-boundary allowlist is fresh
     if (allow === null) { draining = false; return; } // DO-R2-P1-1: allowlist unverifiable ⇒ HOLD the outbox (never refuse+drop a reply on a deny-all guess)
     void drainQueue(tgOutboxDir(HOME), async (rec) => {
       const m = rec as { chatId?: unknown; text?: unknown };
@@ -384,13 +399,13 @@ async function main(): Promise<void> {
   outboxTimer.unref?.();
   const pendingStuck = new Set<string>(); // DO-P2-2: pending claims whose release/ack faulted, re-attempted each drain
   while (!stop) {
-    const allow = readAllow(); // re-read each loop so the user can add a chat_id without a restart
+    const allow = readAllow(allowFile()); // re-read each loop so the user can add a chat_id without a restart
     if (allow === null) { await new Promise((r) => setTimeout(r, 3000)); continue; } // DO-R2-P1-1: allowlist unverifiable ⇒ HOLD (never process with a deny-all guess)
     // Recover any dialog that waited for the officer to resolve (local pending → officer box, FIFO by update_id); idempotent per its
     // key (writeInbox publishOnce) AND per the queue DONE marker; fail-soft.
     const officerSid = resolveSession(process.env.SWARM_DIALOG_OFFICER ?? "", listSessions(HOME));
     if (officerSid) { try { await drainQueue(tgDialogPendingDir(HOME), (rec) => { const r = rec as { officerMsg?: InboxMsg; key?: string }; if (!r || typeof r !== "object" || !r.officerMsg) return "sent"; try { const res = writeInbox(HOME, officerSid, r.officerMsg, r.key); return (res === "published" || res === "already") ? "sent" : "retry"; } catch { return "retry"; } }, { stuck: pendingStuck }); } catch { /* fail-soft */ } }
-    try { await notifyNewBatches(token, allow); await pollOnce(token, allow); }
+    try { await notifyNewBatches(token, allow); const polled = await pollOnce(token, allow); if (!polled) await new Promise((r) => setTimeout(r, 3000)); } // IP2-2: a refused poll (offset unreadable) did NOT long-poll ⇒ back off, not a hot loop
     catch (e) { console.error(`swarm-tg-entry loop error (continuing): ${e instanceof Error ? e.message : e}`); await new Promise((r) => setTimeout(r, 3000)); }
   }
   clearInterval(outboxTimer);

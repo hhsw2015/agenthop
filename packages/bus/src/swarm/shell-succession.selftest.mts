@@ -224,10 +224,15 @@ rmSync(sockHome, { recursive: true, force: true });
     rmSync(home, { recursive: true, force: true });
   }
 
-  // opt-in gating: the SAME stranded state WITHOUT the opt ⇒ contends (decision-batch / shared-budget are byte-identical).
+  // batch-20 convergence: reclaim is now FOLDED INTO the default acquire — there is no opt-in flag. The SAME stranded all-dead state
+  // the old API only reclaimed under an opt is now reclaimed by the plain acquire via the three gates (intents readable + NO live
+  // foreign intent + rmdir-if-empty then sole-ownership verify). decision-batch / shared-budget inherit the identical converged acquire.
   {
     const home = mkHome(); const site = strand(home, 999999);
-    t("SUCC-1 opt-in: default acquire (no reclaim) still CONTENDS an external stranded dir", acquireHolderLock(site) === null);
+    const token = acquireHolderLock(site);
+    t("SUCC-1 convergence: the default acquire RECLAIMS an external stranded all-dead dir (reclaim folded in, no opt-in)", token !== null);
+    t("SUCC-1 convergence: EXACTLY our single identity after the folded reclaim (sole-ownership gate held)", token !== null && readdirSync(site.lockDir).length === 1 && existsSync(path.join(site.lockDir, String(token))));
+    if (token) releaseHolderLock(site, token);
     rmSync(home, { recursive: true, force: true });
   }
 
@@ -248,10 +253,16 @@ rmSync(sockHome, { recursive: true, force: true });
     rmSync(home, { recursive: true, force: true });
   }
 
-  // no intents at all (empty dir, nothing proving a crash) ⇒ NOT reclaimed even with the opt (requires >=1 confirmed-dead intent).
+  // batch-20 convergence (three-gate behavior): an empty dir with NO intents at all is reclaimed by the default acquire. It is
+  // provably un-held — a live holder/acquirer ALWAYS has a hold-intent while the dir exists (intents are written BEFORE mkdir and
+  // unlinked AFTER rmdir), so "no intent" ⇒ no live holder ⇒ gate-2 passes ⇒ rmdir-if-empty + sole-ownership ② adopts it. This drops
+  // the old ">=1 confirmed-dead intent" precondition (which permanently wedged such a dir); the reclaim stays single-winner + safe.
   {
     const home = mkHome(); const site = adoptLockSite(home, SID); mkdirSync(site.lockDir, { recursive: true });
-    t("SUCC-1: an empty dir with NO hold-intent is not provably stranded ⇒ contend", acquireHolderLock(site) === null);
+    const noIntentTok = acquireHolderLock(site);
+    t("SUCC-1 convergence: an empty dir with NO intents is reclaimed (provably un-held; no dead-intent precondition, no wedge)", noIntentTok !== null);
+    t("SUCC-1 convergence: exactly our single identity after reclaiming a no-intent empty dir (② sole-ownership held)", noIntentTok !== null && readdirSync(site.lockDir).length === 1 && existsSync(path.join(site.lockDir, String(noIntentTok))));
+    if (noIntentTok) releaseHolderLock(site, noIntentTok);
     rmSync(home, { recursive: true, force: true });
   }
 
