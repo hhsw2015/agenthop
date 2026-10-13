@@ -1,0 +1,76 @@
+好,这正好把三绿门的疑点直接打到源头。下面是问题清单,按对我们迁移决策的重要性排序,英文可直接粘贴(Carly 读英文文档,英文问命中率高),每条附中文说明你看意图:
+
+① waiting_input 到底何时触发?(头号,权限弹窗检测的命根)
+When does cx.agents:list() report state "waiting_input"? The docs say "paused progress or an ask overlay" — what exactly counts as an ask overlay? Does it only work for omp's own ask tool, or would a permission prompt drawn by a third-party TUI (like Claude Code's approval dialog) also trigger it? How can I reproduce waiting_input reliably?
+中文:我们实测 omp busy 时 working/idle 都对,但 waiting_input 从没亮过。它只认 omp 自家的 ask,还是任何 TUI 的提问界面?
+
+② 第三方 agent(非 omp)的状态检测(三绿门之二)
+If I set agent-command to a third-party agent TUI like Claude Code or Codex CLI, how is working/idle detected? Does it rely on the program emitting progress OSC 9;4 itself? If the TUI never emits OSC 9;4, what state does cx.agents:list() report, and is there any fallback detection?
+中文:裸 claude/codex TUI 不发 OSC 的话,state 会卡在什么值?有无兜底?
+
+③ 非 omp agent 能拿到哪些字段
+For non-omp agents, which fields of cx.agents:list() entries are populated — state, model, last_message? And cx.agents:wait() — does it work for non-omp agents or only omp?
+
+④ CLI 暴露计划
+Is there a plan to expose cx.agents through the tern CLI (like `tern agents list/ask/wait`)? Today the only bash path seems to be a plugin bridge or tern serve + ctl.
+中文:有官方 CLI 的话我们的桥插件就能扔了。
+
+⑤ 跨 host 的 agent 可见性(多机 fleet 门)
+With a remote host connected, does cx.agents:list() in my local window include agent blocks running on the remote host? Can start/ask/wait target remote panes?
+
+⑥ headless 跑 agent(蜂群 CI 用)                                                                                            Headless windows never start omp — is there a way locks under tern serve headless, for CI-styleautomation?                                                                                                                
+⑦ 稳定性承诺                                                                                                               How stable is the plugin API (cx.agents specifical? Will breaking changes be announced, and is therea changelog for plugin-facing APIs?                                                                                        
+①②⑤ 的答案直接决定三绿门怎么过;④⑥ 决定桥插件的寿命;⑦ 决定押注深度。问到任何一条的答案都请原样带回来,特别是①——如果 Carly 说 waiting_input 只认 omp 自家 ask,那权限弹窗检测就得 的 tern 驱动要按此设计。
+
+
+==================================================================
+Carly 解答（2026-10-13 23:5x，本机 Tern + omp 18.10.3 实测；"未验证"处我会明说）
+==================================================================
+
+① waiting_input 何时触发？—— 实测，结论明确
+- omp 自己调用 ask 工具 → state = waiting_input（实测约 16s 内变为 waiting_input，同时 alert=true、progress={state=indeterminate}）。
+- 任何程序（不限 omp）发出 OSC 9;4;4（paused 进度）→ state = waiting_input（实测：progress={state=paused,percent=50} 时即 waiting_input；清除 9;4;0 后回到 working）。
+- 第三方 TUI 画的权限弹窗，如果程序没有发 OSC 9;4;4 / 7501 状态，则【不会】触发。实测：纯文本 "Allow this tool? [y/n]" 提示，state 一直是 working，不会变 waiting_input。没有任何屏幕内容识别兜底。
+- 所以文档里 "paused progress or an ask overlay" = (a) OSC 9;4;4 暂停进度，(b) omp 的 ask 覆盖层（omp 经 TSP 上报）。
+- 稳定复现方法：
+    printf '\033]9;4;4;50\007'      # 进入 waiting_input
+    printf '\033]9;4;0\007'         # 清除
+  或让 omp 用 ask 工具提问。
+- 另：Tern 自己的 ACP 聊天块（设置 agents.auto_acp，或调色板 "New Claude Code block"）里 claude/codex 的状态走 Tern 内部通道，二进制里有 "has a question / wants plan approval / needs your permission" 这类横幅文案，说明权限请求会被识别为"需要你"。这条路径我【没有实测】；若要给 claude/codex 做权限弹窗检测，这是最值得试的一条。
+- 本机另有 OSC 7501 协议（`]7501;state=...`），changelog 称 "omp, agent chats and other tools that speak OSC 7501 (locally or over SSH)" 会显示 working/waiting/finished/failed。第三方程序可以自己发。完整字段语法我没找到文档，只确认过 `state=clear` 这一种写法。未验证。
+
+② 第三方 agent（非 omp）状态检测
+- 不依赖 OSC 9;4 也能得到 state，但只有粗粒度：进程在跑 = "working"，实测 cat、普通 shell 脚本都是 working，从不会变 idle（busy 也是 false，at_prompt 也是 false）。
+- 即：裸 claude/codex TUI 不发 OSC → state 卡在 "working"，直到进程退出（退出后该行从 list() 里消失，我没见到 "exited" 行留下来）。
+- 兜底：没有屏幕解析兜底。要得到 idle/waiting，要么程序自己发 OSC 9;4（indeterminate=工作中，paused=等输入，0=清除），要么用 ACP 聊天块 / OSC 7501。
+- 注意：cx.agents:list() 里 omp 的 idle 来自 omp 自己的 TSP 上报，不是通用检测。
+
+③ 非 omp agent 能拿到的字段（实测一行 `cat` 的结果）
+- 有：pane、command、agent_command、program、cwd、state、busy、at_prompt、alive、kind、host、session、tab、title、focused、floating、parked、alert、（若发了 OSC 9;4 则有）progress、running。
+- 没有：model、last_message（omp 行才有）。
+- cx.agents:wait()：只在 idle 时返回；对非 omp（state 恒为 working）实测超时，报 "agent_wait timed out"，所以实际只对 omp 有用。
+- cx.agents:transcript()：非 omp 返回 {}（文档也这么写，实测 n=0）。
+- cx.agents:ask() 对非 omp：start 的 prompt 会被当作输入敲进终端（实测脚本读到了），其余细节未验证。
+
+④ CLI 暴露计划
+- 当前版本没有 `tern agents ...`（实测 "tern: agents: No such file or directory"）。路线图/计划我查不到，不能保证。
+- 现有 CLI：tern ls|inspect|new|split|run|move|send|capture|wait|events|process|... 。
+    · tern wait BLOCK --until exit|prompt|idle=MS --timeout S （退出码=程序状态，124=超时）
+    · tern events [--filter KIND,...] 输出 JSON lines
+    · tern inspect --json 的 block 信息里【没有】agent state/progress 字段（实测）
+  所以 working/waiting_input 目前只能走 Lua 的 cx.agents:list()（插件桥）。events 的具体 KIND 列表我没完整拿到，二进制里能看到 agent_finished、command_finished 等字样，没验证过能否替代桥插件。
+
+⑤ 跨 host 可见性
+- list() 文档写 "across all sessions"，行里有 host 字段（本机=0）。我这台只有本机一个 host，没有远端可测，所以 "list() 是否包含远端 agent 块、start/ask/wait 能否指向远端 pane" 【未验证】。
+- 线索：start 文档写 "cwd '~' expands using the launch host's home"，暗示 start 可在远端 host 上启动，但 opts 里没有 host 字段，没看到指定 host 的办法；OSC 7501 changelog 明说 "locally or over SSH" 可用。建议你在有远端 host 的环境直接跑一遍 cx.agents:list() 看 host 字段。
+
+⑥ headless 跑 agent（CI）
+- 有 `tern serve`（headless 开发会话，配 `tern ctl` 控制，serve 默认 /tmp/tern.sock），但它是 dev 工具，文档只提截图/录制/场景命令。没有找到任何 "headless 下启动 omp / agent" 的入口或文档；`cx.agents` 是窗口 Lua API（"Window only"），headless 的 settings 只在内存。
+- 结论：按现有文档，CI 无法用 cx.agents；要自动化只能自己用 `tern new/run/send/wait` 或直接在 CI 里跑 omp CLI。官方有无计划：不知道。
+
+⑦ 稳定性承诺
+- 没有找到任何关于 cx.agents / 插件 API 稳定性、废弃周期的承诺文字。
+- 实际迹象：changelog 里有大量 "Plugins: ..." 条目（含行为变更，例如 cx.canvas:open/set 对不认识的字段改为报错），说明 API 在演进、行为会变；类型声明会随版本更新，`tern plugin types DIR` 可生成 tern.d.luau 供 luau-lsp 对照。
+- 建议：桥插件里对 cx.agents 的字段做 nil 容错（list 字段随 agent 类型不同，文档写 unknown optional fields are tern.json.null），并把 Tern 版本钉住/升级时回归测试 ①②③。
+
+测试说明：为实测我临时开了 7 个 agent 块（omp ask、cat、OSC 脚本、几次假权限提示），都已用 cx.agents:stop 关闭，现仅剩原来的 pane 5 和 20。
