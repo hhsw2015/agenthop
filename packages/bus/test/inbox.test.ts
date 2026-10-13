@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync, linkSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync, linkSync, symlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, publishUniqueAtomic, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, publishUniqueAtomic, publishOnce, __setPublishEexistHookForTest, deliverableProbe, __setDeliverableProbeHookForTest, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
 import { deliverToCoordinator } from "../src/checkin.js";
 import type { SelfInfo } from "../src/label.js";
 
@@ -516,6 +516,133 @@ describe("writeInbox — idempotency key (durable-first credential, exactly-once
     writeInbox(HOME, "s1", msg("dot", 2), ".");
     expect(claimInbox(HOME, ["s1"], "p").length).toBe(2);                 // both delivered
     expect(readdirSync(path.join(HOME, ".agenthop", "inbox"))).toEqual(["s1"]); // only s1 — no sibling dir created by a `..` escape
+  });
+
+  test("DWS ①: a keyed publish NEVER clobbers an existing <key>.json (linkSync no-overwrite; the old renameSync silently overwrote it)", () => {
+    // Anomaly: the message for evt-k is on disk but its credential is ABSENT (e.g. the credential was lost while the message
+    // survived), so publishOnce falls through to the write. The OLD bare writeFileSync+renameSync would CLOBBER the existing
+    // message; the DWS ① linkSync-no-overwrite form ADOPTS it (never destroys a delivered message).
+    mkdirSync(dirOf("s1"), { recursive: true });
+    const existing = path.join(dirOf("s1"), "evt-k.json");
+    writeFileSync(existing, JSON.stringify(validInboxMsg(digest("ORIGINAL", 1))));
+    const originalBytes = readFileSync(existing, "utf8");
+    writeInbox(HOME, "s1", digest("REPLACEMENT", 2), "evt-k");            // fresh keyed publish of a DIFFERENT body, cred absent
+    expect(readFileSync(existing, "utf8")).toBe(originalBytes);           // NOT clobbered (old code would be "REPLACEMENT")
+    expect(jsonFiles("s1")).toEqual(["evt-k.json"]);                      // exactly one message (adopted, no 2nd copy, no .tmp-* orphan)
+    expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("published");  // adopted ⇒ credential confirmed
+    expect(claimInbox(HOME, ["s1"], "p").length).toBe(1);                 // the preserved message is still deliverable
+  });
+
+  test("DWS-1-OWN: an exhausted wx-create (a FOREIGN temp holds the name) NEVER unlinks the foreign temp + rolls back the credential", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    const foreignTmp = path.join(dirOf("s1"), "evt-k.json.tmp-deadbeef");
+    writeFileSync(foreignTmp, "FOREIGN");                                 // a foreign temp holding the (forced) name
+    // force every temp-name attempt onto the foreign name ⇒ wx EEXIST exhausts ⇒ throw (the old r1 finally would unlink it)
+    expect(() => publishOnce(dirOf("s1"), "evt-k", validInboxMsg(digest("x", 1))!, () => "deadbeef")).toThrow();
+    expect(readFileSync(foreignTmp, "utf8")).toBe("FOREIGN");             // foreign temp PRESERVED (we never owned it)
+    expect(existsSync(cred("s1", "evt-k"))).toBe(false);                  // the fresh credential was rolled back (no stuck pending)
+  });
+
+  test("DWS-1-ADOPT: a non-deliverable <key>.json (dir / dangling symlink / bad JSON) is NOT confirmed published — throws, no false credential, recovers after it clears", () => {
+    for (const plant of [
+      () => mkdirSync(path.join(dirOf("s1"), "evt-k.json"), { recursive: true }),                 // a directory
+      () => symlinkSync(path.join(dirOf("s1"), "nowhere"), path.join(dirOf("s1"), "evt-k.json")),  // a dangling symlink
+      () => writeFileSync(path.join(dirOf("s1"), "evt-k.json"), "{ not json"),                     // a bad-JSON regular file
+    ]) {
+      rmSync(dirOf("s1"), { recursive: true, force: true }); mkdirSync(dirOf("s1"), { recursive: true });
+      plant();
+      expect(() => writeInbox(HOME, "s1", digest("brief", 1), "evt-k")).toThrow(); // name taken but NOT a deliverable ⇒ refuse
+      expect(existsSync(cred("s1", "evt-k"))).toBe(false);                          // no false "published" credential
+      expect(claimInbox(HOME, ["s1"], "p").length).toBe(0);                         // nothing delivered
+    }
+    // clear the obstacle ⇒ a retry recovers (the false credential did not permanently block it)
+    rmSync(dirOf("s1"), { recursive: true, force: true });
+    writeInbox(HOME, "s1", digest("brief", 2), "evt-k");
+    expect(jsonFiles("s1")).toEqual(["evt-k.json"]);
+    expect(claimInbox(HOME, ["s1"], "p2").length).toBe(1);
+  });
+
+  test("DWS-1-ADOPT r2: a `.claim-*` whose CONTENT is not a valid message is NOT adopted by name (dir / dangling link / bad JSON / missing fields)", () => {
+    for (const plantClaim of [
+      (d: string) => mkdirSync(path.join(d, "evt-k.json.claim-1"), { recursive: true }),
+      (d: string) => symlinkSync(path.join(d, "nowhere"), path.join(d, "evt-k.json.claim-1")),
+      (d: string) => writeFileSync(path.join(d, "evt-k.json.claim-1"), "{ not json"),
+      (d: string) => writeFileSync(path.join(d, "evt-k.json.claim-1"), JSON.stringify({ from: "a" })), // missing required fields
+    ]) {
+      rmSync(dirOf("s1"), { recursive: true, force: true }); mkdirSync(dirOf("s1"), { recursive: true });
+      mkdirSync(path.join(dirOf("s1"), "evt-k.json"), { recursive: true }); // top-level dir ⇒ linkSync EEXIST reaches the claim probe
+      plantClaim(dirOf("s1"));                                              // + a `.claim-*` NAME whose content is NOT deliverable
+      expect(() => writeInbox(HOME, "s1", digest("brief", 1), "evt-k")).toThrow(); // name present but not deliverable ⇒ refuse (old code adopted)
+      expect(existsSync(cred("s1", "evt-k"))).toBe(false);                 // no false "published" credential
+    }
+  });
+
+  test("DWS-1-ADOPT r2: a VALID in-flight `.claim-*` IS still adopted (the content check does not regress valid in-flight adoption)", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    mkdirSync(path.join(dirOf("s1"), "evt-k.json"), { recursive: true });  // top-level dir ⇒ EEXIST
+    writeFileSync(path.join(dirOf("s1"), "evt-k.json.claim-99"), JSON.stringify(validInboxMsg(digest("inflight", 1)))); // a VALID in-flight claim
+    writeInbox(HOME, "s1", digest("brief", 2), "evt-k");                   // adopts the valid in-flight message (no throw, no 2nd copy)
+    expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("published");
+  });
+
+  test("DWS-R3-1 (r6): a losing claim renames the bad top into `.claim-*` (top now ABSENT) ⇒ HOLD (pending), never adopted — a bad sibling does not prove the vanished top was garbage", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    mkdirSync(path.join(dirOf("s1"), "evt-k.json"), { recursive: true });  // top-level is a dir ⇒ linkSync EEXIST
+    // in the EEXIST->check window a real claimInbox runs: it renames the dir `evt-k.json` -> `evt-k.json.claim-<pid>` ⇒ top now ABSENT
+    __setPublishEexistHookForTest(() => { claimInbox(HOME, ["s1"], "pidX"); });
+    let threw = false; let res: string | undefined;
+    try { res = writeInbox(HOME, "s1", digest("brief", 1), "evt-k"); } catch { threw = true; }
+    finally { __setPublishEexistHookForTest(undefined); }
+    // r6: the top is now ABSENT. A proven-invalid SIBLING claim does NOT prove the VANISHED top was garbage (it may have been a
+    // valid message that was normally processed) ⇒ UNKNOWN ⇒ HOLD, NOT refuse. Still never ADOPTED (result is "pending", not "already").
+    expect(threw).toBe(false);
+    expect(res).toBe("pending");
+    expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("pending");     // dedup obligation HELD; credential never adopted/published
+  });
+
+  test("DWS-R3-1: an UNKNOWN (unreadable) claim HOLDS the dedup obligation — pending credential kept, not rolled back to republishable", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    mkdirSync(path.join(dirOf("s1"), "evt-k.json"), { recursive: true });  // top-level dir ⇒ EEXIST ⇒ the probe runs
+    const badClaim = path.join(dirOf("s1"), "evt-k.json.claim-1");
+    writeFileSync(badClaim, JSON.stringify(validInboxMsg(digest("x", 1))));
+    chmodSync(badClaim, 0o000);                                            // ...but UNREADABLE ⇒ probe is UNKNOWN (not proven invalid)
+    let readable = true; try { readFileSync(badClaim); } catch { readable = false; }
+    if (!readable) {
+      let threw = false;
+      try { writeInbox(HOME, "s1", digest("brief", 1), "evt-k"); } catch { threw = true; }
+      expect(threw).toBe(false);                                          // UNKNOWN ⇒ no throw (old r3 threw after rolling the credential back)
+      expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("pending");  // dedup obligation HELD — credential NOT rolled back to absent
+    }
+    chmodSync(badClaim, 0o600);                                           // restore for cleanup
+  });
+
+  test("DWS-R3-1: a claim OBSERVED in readdir then consumed before validation ⇒ deliverableProbe is UNKNOWN (not invalid)", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    const claim = path.join(dirOf("s1"), "evt-k.json.claim-7");
+    writeFileSync(claim, JSON.stringify(validInboxMsg(digest("inflight", 1)))); // a valid in-flight claim, listed by readdir
+    __setDeliverableProbeHookForTest(() => { rmSync(claim, { force: true }); });  // acked/removed in the window AFTER readdir, BEFORE validation
+    try { expect(deliverableProbe(dirOf("s1"), "evt-k")).toBe("unknown"); }       // observed-then-gone ⇒ UNKNOWN, never folded to "invalid"
+    finally { __setDeliverableProbeHookForTest(undefined); }
+  });
+
+  test("DWS-R3-1 top: an OBSERVED top-level that vanishes before validation ⇒ deliverableProbe is UNKNOWN (not invalid)", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    const top = path.join(dirOf("s1"), "evt-k.json");
+    writeFileSync(top, JSON.stringify(validInboxMsg(digest("m", 1))));          // a valid top-level, listed by readdir
+    __setDeliverableProbeHookForTest(() => { rmSync(top, { force: true }); });  // consumed/removed after readdir, before validation
+    try { expect(deliverableProbe(dirOf("s1"), "evt-k")).toBe("unknown"); }     // observed-then-gone ⇒ UNKNOWN (old r4 folded it to invalid)
+    finally { __setDeliverableProbeHookForTest(undefined); }
+  });
+
+  test("DWS-R3-1 top (public path): a top-level consumed in the EEXIST window ⇒ pending HOLD, credential not released", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    writeFileSync(path.join(dirOf("s1"), "evt-k.json"), JSON.stringify(validInboxMsg(digest("m", 1)))); // valid top ⇒ linkSync EEXIST
+    __setPublishEexistHookForTest(() => { for (const c of claimInbox(HOME, ["s1"], "pidY")) ackInbox(c.file); }); // claimed+acked in the window ⇒ vanishes entirely
+    let threw = false;
+    try { writeInbox(HOME, "s1", digest("brief", 2), "evt-k"); } catch { threw = true; }
+    __setPublishEexistHookForTest(undefined);
+    expect(threw).toBe(false);                                                 // UNKNOWN ⇒ no throw (old r4: top absent ⇒ invalid ⇒ threw after rollback)
+    expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("pending");         // dedup obligation HELD — credential NOT rolled back to absent
   });
 
   test("FC-7: a legacy keyless publication of the SAME notice is adopted, not duplicated by the new key", () => {

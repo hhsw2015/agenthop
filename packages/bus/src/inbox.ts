@@ -9,7 +9,7 @@
  * Concurrency: a drainer CLAIMS a message by atomically renaming its file, delivers, then ACKs (removes) on success or
  * RELEASES (renames back) on failure — so the retry timer and an explicit recv never deliver the same message twice.
  */
-import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, watch, writeFileSync, openSync, fstatSync, readSync, closeSync, constants as fsc, type FSWatcher } from "node:fs";
 import { flagDefaultOn } from "./swarm/flag-default.js";
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
@@ -300,7 +300,80 @@ function eventMessagePresent(dir: string, idempotencyKey: string): boolean {
   if (existsSync(path.join(dir, base))) return true;
   try { return readdirSync(dir).some((n) => n === base || n.startsWith(`${base}.claim-`)); } catch { return false; }
 }
-function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg): WriteResult {
+/** DWS-R3-1: THREE-state probe of one candidate path (no-follow + FIFO-safe). CRITICAL distinction for the dedup obligation:
+ *   "valid"   — a readable REGULAR file whose bytes parse as a valid InboxMsg.
+ *   "invalid" — PROVEN not a deliverable: a symlink (ELOOP), a dir/fifo/socket, bad JSON, or a failing-schema message.
+ *   "absent"  — ENOENT (not there / vanished between a readdir snapshot and this read).
+ *   "unknown" — a read fault (EACCES/EIO/...) we cannot resolve either way.
+ *  Proven-invalid may be refused + recovered; absent/unknown must NOT release a dedup obligation. */
+function probeCandidate(fp: string): "valid" | "invalid" | "absent" | "unknown" {
+  let fd: number;
+  try { fd = openSync(fp, fsc.O_RDONLY | fsc.O_NONBLOCK | fsc.O_NOFOLLOW); }
+  catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return "absent";
+    if (code === "ELOOP") return "invalid"; // a symlink is PROVEN not a deliverable message
+    return "unknown";                        // EACCES / EIO / other ⇒ cannot verify
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) return "invalid"; // dir / fifo / socket ⇒ PROVEN not a deliverable message
+    const buf = Buffer.allocUnsafe(Number(st.size));
+    let off = 0;
+    try { while (off < st.size) { const r = readSync(fd, buf, off, Number(st.size) - off, null); if (r === 0) break; off += r; } }
+    catch { return "unknown"; } // a read fault mid-file ⇒ cannot verify
+    try { return validInboxMsg(JSON.parse(buf.toString("utf8", 0, off))) !== null ? "valid" : "invalid"; } // bad schema ⇒ PROVEN invalid
+    catch { return "invalid"; } // bad JSON ⇒ PROVEN not a valid message
+  } finally { closeSync(fd); }
+}
+
+/** DWS-1-ADOPT + DWS-R3-1: three-state answer to "is there a deliverable message for this key?" over the unclaimed `<key>.json`
+ *  and any in-flight `<key>.json.claim-*` — each validated by CONTENT (a NAME is not proof). Returns:
+ *   "valid"   — adopt (a real deliverable / in-flight message is present).
+ *   "invalid" — every candidate is PROVEN non-deliverable (dir / dangling link / bad JSON / missing fields) ⇒ refuse + recover
+ *               after the obstacle clears.
+ *   "unknown" — a candidate was OBSERVED but then vanished (ENOENT after the readdir snapshot — e.g. claimed+acked in the window)
+ *               or was unreadable (read fault) ⇒ we CANNOT prove the event undelivered ⇒ the caller must HOLD the dedup
+ *               obligation (never release it to an auto-republishable state). */
+export function deliverableProbe(dir: string, idempotencyKey: string): "valid" | "invalid" | "unknown" {
+  const base = `${idempotencyKey}.json`;
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return "unknown"; } // unreadable dir ⇒ cannot confirm ⇒ HOLD
+  if (deliverableProbeHookForTest) { const h = deliverableProbeHookForTest; deliverableProbeHookForTest = undefined; try { h(); } catch { /* test seam */ } } // one-shot: lets a test vanish a just-listed claim BEFORE it is validated (DWS-R3-1 observed-then-consumed)
+  let unknown = false; // a candidate that vanished/was unreadable before we could validate it ⇒ cannot prove un-delivered
+  for (const n of names) {
+    if (!n.startsWith(`${base}.claim-`)) continue;
+    const s = probeCandidate(path.join(dir, n));
+    if (s === "valid") return "valid";
+    if (s === "absent" || s === "unknown") unknown = true; // observed-then-gone / unreadable ⇒ UNKNOWN, do not release the obligation
+    // s === "invalid" ⇒ a proven-bad claim is NOT a deliverable here — and is NOT evidence about the (possibly different) VANISHED
+    //   top-level (probeCandidate has no identity link; an old unrelated bad claim looks identical to a renamed-garbage top). Skip.
+  }
+  const top = probeCandidate(path.join(dir, base));
+  if (top === "valid") return "valid";
+  // DWS-R3-1 (r6): publishOnce probes ONLY after a confirmed linkSync EEXIST on `<key>.json`, so the top WAS observed. If it is now
+  // ABSENT (vanished — possibly normally claimed + processed) OR unreadable, we CANNOT prove it un-delivered ⇒ UNKNOWN (HOLD). We
+  // do NOT carve an exception for "some bad sibling exists": that proves a bad object is present, NOT that the lost top was it
+  // (identical end-state to "an old bad claim lingered while a valid top was processed"). Only a top that is PRESENT and PROVEN
+  // invalid (dir/symlink/fifo/bad-JSON/bad-schema) releases the obligation ⇒ refuse + recover.
+  if (top === "unknown" || top === "absent") unknown = true;
+  return unknown ? "unknown" : "invalid";
+}
+
+/** Test seam (one-shot): fires inside publishOnce AFTER a linkSync-EEXIST and BEFORE the deliverable check, so a regression can run
+ *  claimInbox in the exact EEXIST->check window (the losing claim renames the bad top-level target into `.claim-*`). Unset in
+ *  production. */
+let publishEexistHookForTest: (() => void) | undefined;
+export function __setPublishEexistHookForTest(fn: (() => void) | undefined): void { publishEexistHookForTest = fn; }
+
+/** Test seam (one-shot): fires inside deliverableProbe AFTER readdir and BEFORE the candidates are validated, so a regression can
+ *  vanish a just-listed claim (the DWS-R3-1 "observed then consumed/acked in the window" case). Unset in production. */
+let deliverableProbeHookForTest: (() => void) | undefined;
+export function __setDeliverableProbeHookForTest(fn: (() => void) | undefined): void { deliverableProbeHookForTest = fn; }
+
+/** `randHex` is injectable ONLY so a test can force a temp-name collision (ownership-boundary regression); production uses 64-bit
+ *  randomBytes. */
+export function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg, randHex: () => string = () => randomBytes(8).toString("hex")): WriteResult {
   const cred = credPathOf(dir, idempotencyKey);
   const msgFile = path.join(dir, `${idempotencyKey}.json`);
   // Prior-version (r6) credential compat import: r6 recorded publication as a `.published/<key>` marker (raw-key filename). The probe
@@ -339,16 +412,40 @@ function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg): Writ
     writeCredState(cred, "published");
     return "already";
   }
+  // DWS ① r2 (direct-write-sweep): publish the message with the INBOX-2 OWNERSHIP boundary. The wx-create loop is OUTSIDE the
+  // cleanup `finally`, so an EEXIST-EXHAUST (a foreign temp holding every name we try) throws WITHOUT ever unlinking a path we do
+  // NOT own (DWS-1-OWN). Cleanup rights are acquired ONLY after our own exclusive create succeeds.
+  let tmp = "";
+  for (let t = 0; ; t++) {
+    tmp = `${msgFile}.tmp-${randHex()}`;
+    try { writeFileSync(tmp, JSON.stringify(valid), { flag: "wx", mode: 0o600 }); break; } // exclusive create ⇒ OUR fresh inode (ownership acquired HERE)
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST" && t < 8) continue; // a FOREIGN temp holds this name ⇒ try a fresh one; NEVER unlink it
+      try { unlinkSync(cred); } catch { /* best-effort rollback */ } // never acquired a temp ⇒ roll back the fresh credential + rethrow (clean nothing foreign)
+      throw e;
+    }
+  }
   try {
-    const tmp = `${msgFile}.tmp-${Math.random().toString(36).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(valid), { mode: 0o600 });
-    renameSync(tmp, msgFile);      // publish (claim renames this, ack deletes it)
-  } catch (e) {
-    // The message write FAILED in-process ⇒ we KNOW it did not land ("confirmed absent"). Roll back the pending claim so the next
-    // retry re-publishes from "absent" — never leave it stuck pending, which recovery would retain as unknown (a silent drop). Re-throw
-    // so the caller leaves ITS obligation open and retries (matching the historical throw-on-write-fault contract).
-    try { unlinkSync(cred); } catch { /* best-effort rollback */ }
-    throw e;
+    try {
+      linkSync(tmp, msgFile); // atomic NO-OVERWRITE publish (claim renames this, ack deletes it)
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+        // msgFile exists. ADOPT it ONLY if it is a VALID deliverable message — a regular file whose bytes parse as a valid InboxMsg
+        // (no-follow + FIFO-safe), OR an in-flight `.claim-*` of it (DWS-1-ADOPT). A name being taken is NOT proof of delivery: a
+        // dir / dangling symlink / bad-JSON / missing-field target must NOT be confirmed published (a false credential would
+        // permanently block retry).
+        if (publishEexistHookForTest) { const h = publishEexistHookForTest; publishEexistHookForTest = undefined; try { h(); } catch { /* test seam */ } } // one-shot: lets a test run claimInbox in the EEXIST->check window (DWS-1-ADOPT regression)
+        const probe = deliverableProbe(dir, idempotencyKey);
+        if (probe === "valid") { writeCredState(cred, "published"); return "already"; } // a real deliverable / in-flight message ⇒ adopt
+        if (probe === "unknown") return "pending"; // DWS-R3-1: a claim was OBSERVED then vanished/unreadable ⇒ cannot prove un-delivered ⇒ HOLD the dedup obligation (keep the pending credential, DO NOT roll back ⇒ no auto-republish); the existing pending-recovery resolves it on a later pass
+        try { unlinkSync(cred); } catch { /* best-effort rollback */ } // PROVEN-invalid target ⇒ NO false "published"; recover after it clears
+        throw new Error(`publishOnce: ${msgFile} exists but is not a valid deliverable message — not adopting (retry after it clears)`);
+      }
+      try { unlinkSync(cred); } catch { /* best-effort rollback */ } // link fault ⇒ roll back the fresh claim + rethrow (caller retries)
+      throw e;
+    }
+  } finally {
+    try { unlinkSync(tmp); } catch { /* only OUR own temp; the linked copy holds the bytes, a leftover is ignored by readers */ }
   }
   writeCredState(cred, "published"); // confirm
   return "published";
