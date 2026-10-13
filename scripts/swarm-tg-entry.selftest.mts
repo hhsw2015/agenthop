@@ -21,7 +21,9 @@ try {
   t("readAllow: valid array -> set", (() => { const p = f("arr"); writeFileSync(p, "[1,2,3]"); return setEq(readAllow(p), [1, 2, 3]); })());
   t("readAllow: {chatIds:[...]} -> set", (() => { const p = f("obj"); writeFileSync(p, JSON.stringify({ chatIds: [4, 5] })); return setEq(readAllow(p), [4, 5]); })());
   t("readAllow: empty array -> EMPTY set (configured empty, NOT null)", (() => { const p = f("empty"); writeFileSync(p, "[]"); const s = readAllow(p); return s !== null && s.size === 0; })());
-  t("readAllow: array filters non-numbers", (() => { const p = f("mixed"); writeFileSync(p, '[1,"x",2,null,3]'); return setEq(readAllow(p), [1, 2, 3]); })());
+  // CONTRACT UPGRADE (batch-20): the bridge lineage's STRICTER per-member check supersedes batch-19's silent-subset filter — a single
+  // non-numeric member makes the WHOLE allowlist UNKNOWN (null/HOLD), never a filtered subset that silently drops the bad member's chat.
+  t("readAllow: a NON-NUMERIC member ⇒ null (stricter per-member; never a silent filtered subset)", (() => { const p = f("mixed"); writeFileSync(p, '[1,"x",2,null,3]'); return readAllow(p) === null; })());
   // the BLACK-HOLE-prevention terminal states: unreadable ⇒ null (NOT a silent empty set)
   t("readAllow: corrupt JSON -> null (black-hole prevented)", (() => { const p = f("corrupt"); writeFileSync(p, "{not json"); return readAllow(p) === null; })());
   t("readAllow: bare string id -> null (wrong shape, not silent empty)", (() => { const p = f("str"); writeFileSync(p, '"12345"'); return readAllow(p) === null; })());
@@ -74,7 +76,7 @@ try {
   t("IP2-3: ['12345'] (string-id array) ⇒ null (not empty set)", (() => { const p = f("strarr"); writeFileSync(p, '["12345"]'); return readAllow(p) === null; })());
   t("IP2-3: {chatIds:['12345']} ⇒ null", (() => { const p = f("strobj"); writeFileSync(p, '{"chatIds":["12345"]}'); return readAllow(p) === null; })());
   t("IP2-3: [] stays confirmed-empty (not null)", (() => { const p = f("emptyarr"); writeFileSync(p, "[]"); const s = readAllow(p); return s !== null && s.size === 0; })());
-  t("IP2-3: [1,'x',2] ⇒ {1,2} (partial numeric still valid)", (() => { const p = f("mixed2"); writeFileSync(p, '[1,"x",2]'); const s = readAllow(p); return s !== null && s.size === 2 && s.has(1) && s.has(2); })());
+  t("IP2-3: [1,'x',2] ⇒ null (stricter per-member supersedes the filtered subset)", (() => { const p = f("mixed2"); writeFileSync(p, '[1,"x",2]'); return readAllow(p) === null; })());
 
   // ── IP2-4: REAL driver (pollOnce) control flow with Telegram isolated — offset advance / calls / backoff signal ───
   const fakeTg = () => { const calls: { method: string; body: any }[] = []; const q: Record<string, any[]> = {}; const call: TgCall = async (method, body) => { calls.push({ method, body }); const r = q[method]; return r && r.length ? r.shift() : (method === "getUpdates" ? [] : {}); }; return { call, calls, q }; };
