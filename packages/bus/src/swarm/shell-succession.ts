@@ -142,7 +142,7 @@ export function successionEnabled(env: NodeJS.ProcessEnv = process.env): boolean
   return flagDefaultOn(env.SWARM_SUCCESSION);
 }
 
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, renameSync, openSync, closeSync, constants as FS } from "node:fs";
 import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -361,19 +361,23 @@ function successionSwapPath(home: string, sid: string): string {
 
 /** Record that `sid`'s shell was swapped at `swappedAtSec` (adopt completion). Best-effort + fail-soft — a missed write only
  *  means this swap is not heartbeat-watched, never a startup failure. */
-export function writeSuccessionSwap(home: string, sid: string, swappedAtSec: number): void {
+export function writeSuccessionSwap(home: string, sid: string, swappedAtSec: number, randHex: () => string = () => randomBytes(6).toString("hex")): void {
   try {
     const p = successionSwapPath(home, sid);
     mkdirSync(path.dirname(p), { recursive: true });
-    // DWS ③ (direct-write-sweep): write ATOMICALLY (temp + rename) so a concurrent reader (the succession-heartbeat sentinel's
-    // readSuccessionSwapSec) never sees a TORN/partial JSON from a bare in-place overwrite. renameSync is the correct primitive:
-    // there is exactly ONE record per sid and each swap REPLACES it; a reader always sees either the whole old or the whole new
-    // record. The temp is our OWN fresh (crypto-random) name, cleaned on a write/rename fault.
-    const tmp = `${p}.tmp-${randomBytes(6).toString("hex")}`;
-    try {
-      writeFileSync(tmp, JSON.stringify({ sid, swappedAtSec }), { mode: 0o600 });
-      renameSync(tmp, p); // atomic replace
-    } catch (e) { try { unlinkSync(tmp); } catch { /* best-effort */ } throw e; }
+    // DWS ③ r2 (direct-write-sweep): take OWNERSHIP via a wx-EXCLUSIVE create, write via the fd, close, then atomic rename —
+    // so a concurrent reader (the succession-heartbeat's readSuccessionSwapSec) never sees a torn/empty file, AND we never touch a
+    // path we do not own. A plain `w` open would TRUNCATE/overwrite/follow a foreign temp, a hardlink to the published record, or a
+    // symlink to another file (DWS-3-OWN). On a collision we ABANDON this best-effort write (or try a fresh name) and clean NOTHING
+    // foreign; we clean ONLY our own temp, and only on a rename fault.
+    let fd = -1; let tmp = "";
+    for (let t = 0; ; t++) {
+      tmp = `${p}.tmp-${randHex()}`;
+      try { fd = openSync(tmp, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL, 0o600); break; } // exclusive create ⇒ OUR fresh inode (ownership acquired HERE)
+      catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && t < 8) continue; return; } // collision/fault ⇒ abandon (best-effort); never clean a path we do not own
+    }
+    try { writeFileSync(fd, JSON.stringify({ sid, swappedAtSec })); } finally { closeSync(fd); }
+    try { renameSync(tmp, p); } catch { try { unlinkSync(tmp); } catch { /* best-effort */ } } // we OWN tmp ⇒ safe to clean on a rename fault
   } catch { /* fail-soft: a missed swap record only loses heartbeat coverage for this swap */ }
 }
 

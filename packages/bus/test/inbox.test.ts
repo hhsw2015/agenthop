@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync, linkSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, chmodSync, linkSync, symlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, publishUniqueAtomic, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
+import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, writeInbox, publishUniqueAtomic, publishOnce, watchInbox, validInboxMsg, composeInboxMsg, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, type InboxMsg } from "../src/inbox.js";
 import { deliverToCoordinator } from "../src/checkin.js";
 import type { SelfInfo } from "../src/label.js";
 
@@ -531,6 +531,35 @@ describe("writeInbox — idempotency key (durable-first credential, exactly-once
     expect(jsonFiles("s1")).toEqual(["evt-k.json"]);                      // exactly one message (adopted, no 2nd copy, no .tmp-* orphan)
     expect(readFileSync(cred("s1", "evt-k"), "utf8")).toBe("published");  // adopted ⇒ credential confirmed
     expect(claimInbox(HOME, ["s1"], "p").length).toBe(1);                 // the preserved message is still deliverable
+  });
+
+  test("DWS-1-OWN: an exhausted wx-create (a FOREIGN temp holds the name) NEVER unlinks the foreign temp + rolls back the credential", () => {
+    mkdirSync(dirOf("s1"), { recursive: true });
+    const foreignTmp = path.join(dirOf("s1"), "evt-k.json.tmp-deadbeef");
+    writeFileSync(foreignTmp, "FOREIGN");                                 // a foreign temp holding the (forced) name
+    // force every temp-name attempt onto the foreign name ⇒ wx EEXIST exhausts ⇒ throw (the old r1 finally would unlink it)
+    expect(() => publishOnce(dirOf("s1"), "evt-k", validInboxMsg(digest("x", 1))!, () => "deadbeef")).toThrow();
+    expect(readFileSync(foreignTmp, "utf8")).toBe("FOREIGN");             // foreign temp PRESERVED (we never owned it)
+    expect(existsSync(cred("s1", "evt-k"))).toBe(false);                  // the fresh credential was rolled back (no stuck pending)
+  });
+
+  test("DWS-1-ADOPT: a non-deliverable <key>.json (dir / dangling symlink / bad JSON) is NOT confirmed published — throws, no false credential, recovers after it clears", () => {
+    for (const plant of [
+      () => mkdirSync(path.join(dirOf("s1"), "evt-k.json"), { recursive: true }),                 // a directory
+      () => symlinkSync(path.join(dirOf("s1"), "nowhere"), path.join(dirOf("s1"), "evt-k.json")),  // a dangling symlink
+      () => writeFileSync(path.join(dirOf("s1"), "evt-k.json"), "{ not json"),                     // a bad-JSON regular file
+    ]) {
+      rmSync(dirOf("s1"), { recursive: true, force: true }); mkdirSync(dirOf("s1"), { recursive: true });
+      plant();
+      expect(() => writeInbox(HOME, "s1", digest("brief", 1), "evt-k")).toThrow(); // name taken but NOT a deliverable ⇒ refuse
+      expect(existsSync(cred("s1", "evt-k"))).toBe(false);                          // no false "published" credential
+      expect(claimInbox(HOME, ["s1"], "p").length).toBe(0);                         // nothing delivered
+    }
+    // clear the obstacle ⇒ a retry recovers (the false credential did not permanently block it)
+    rmSync(dirOf("s1"), { recursive: true, force: true });
+    writeInbox(HOME, "s1", digest("brief", 2), "evt-k");
+    expect(jsonFiles("s1")).toEqual(["evt-k.json"]);
+    expect(claimInbox(HOME, ["s1"], "p2").length).toBe(1);
   });
 
   test("FC-7: a legacy keyless publication of the SAME notice is adopted, not duplicated by the new key", () => {

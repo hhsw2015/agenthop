@@ -2,7 +2,7 @@ import { provesContinuity, successionVerdict, parseResumeTargetFromArgv, argvFro
 import { acquireHolderLock, releaseHolderLock } from "./holder-lock.js";
 import { probeCandidateLiveness, probeSessionLiveness, sidSockPrefix } from "./task-liveness.js";
 import type { RosterMember } from "./resume.js";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readdirSync, chmodSync, symlinkSync, linkSync, unlinkSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import net from "node:net";
@@ -294,6 +294,39 @@ rmSync(sockHome, { recursive: true, force: true });
   t("DWS ③ no orphan: only the final <sid>.json remains (temp is renamed/cleaned, never a .tmp-* left behind)", names.length === 1 && names[0] === `${sid}.json` && names.every((n) => !n.includes(".tmp-")));
   writeSuccessionSwap(home, sid, 9012);
   t("DWS ③ every published read is a COMPLETE record (atomic replace, never a truncated/torn file)", readSuccessionSwapSec(home, sid) === 9012);
+  rmSync(home, { recursive: true, force: true });
+}
+
+// --- DWS-3-OWN (codex:Work r1): writeSuccessionSwap takes OWNERSHIP via a wx-EXCLUSIVE create; a forced temp-name collision must
+//     ABANDON this best-effort write and touch NOTHING foreign — not a foreign temp, not a hardlink to the published record, not a
+//     symlink to another file. (Forced via the injectable randHex; the old default-`w` write would EACCES-then-unlink the foreign
+//     temp, truncate the shared inode, or follow the symlink and overwrite its target.) ---
+{
+  const home = mkdtempSync(path.join(tmpdir(), "dws3own-"));
+  const sid = "sid-own";
+  const p = path.join(home, ".agenthop", "swarm", "succession", `${sid}.json`);
+  mkdirSync(path.dirname(p), { recursive: true });
+  const HEX = "cafef00d"; const tmpName = `${p}.tmp-${HEX}`; const force = () => HEX;
+
+  // (a) a foreign temp (mode 000): wx EEXIST ⇒ abandon ⇒ foreign PRESERVED (old default-w ⇒ EACCES ⇒ unlinks the foreign temp)
+  writeFileSync(tmpName, "FOREIGN"); chmodSync(tmpName, 0o000);
+  writeSuccessionSwap(home, sid, 1234, force);
+  chmodSync(tmpName, 0o600);
+  t("DWS-3-OWN (foreign temp): a mode-000 foreign temp is PRESERVED (abandon on wx collision, never unlink)", readFileSync(tmpName, "utf8") === "FOREIGN");
+  unlinkSync(tmpName);
+
+  // (b) a SYMLINK to another private file: wx EEXIST ⇒ abandon ⇒ the link target is NOT followed/overwritten
+  const victim = path.join(home, "victim.txt"); writeFileSync(victim, "VICTIM");
+  symlinkSync(victim, tmpName);
+  writeSuccessionSwap(home, sid, 5678, force);
+  t("DWS-3-OWN (symlink temp): the symlink target is NOT followed/overwritten", readFileSync(victim, "utf8") === "VICTIM");
+  unlinkSync(tmpName);
+
+  // (c) a HARDLINK to a pre-existing published record: wx EEXIST ⇒ abandon ⇒ the published record's inode is NOT truncated/replaced
+  writeFileSync(p, JSON.stringify({ sid, swappedAtSec: 999 }));
+  linkSync(p, tmpName); // tmpName shares p's inode
+  writeSuccessionSwap(home, sid, 4321, force);
+  t("DWS-3-OWN (hardlink temp): the published record is NOT truncated/overwritten via the shared inode", readSuccessionSwapSec(home, sid) === 999);
   rmSync(home, { recursive: true, force: true });
 }
 

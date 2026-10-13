@@ -9,7 +9,7 @@
  * Concurrency: a drainer CLAIMS a message by atomically renaming its file, delivers, then ACKs (removes) on success or
  * RELEASES (renames back) on failure — so the retry timer and an explicit recv never deliver the same message twice.
  */
-import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, watch, writeFileSync, openSync, fstatSync, readSync, closeSync, constants as fsc, type FSWatcher } from "node:fs";
 import { flagDefaultOn } from "./swarm/flag-default.js";
 import { randomBytes, createHash } from "node:crypto";
 import path from "node:path";
@@ -300,7 +300,36 @@ function eventMessagePresent(dir: string, idempotencyKey: string): boolean {
   if (existsSync(path.join(dir, base))) return true;
   try { return readdirSync(dir).some((n) => n === base || n.startsWith(`${base}.claim-`)); } catch { return false; }
 }
-function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg): WriteResult {
+/** DWS-1-ADOPT: read a file ONLY if it is a readable REGULAR file, no-follow + FIFO-safe (never follow a symlink, never block on a
+ *  FIFO). openSync O_RDONLY|O_NONBLOCK|O_NOFOLLOW + fstat-regular on the SAME fd + read. Returns the text, or null for ENOENT / a
+ *  symlink / dir / fifo / unreadable file. */
+function readRegularFileNoFollow(fp: string): string | null {
+  let fd: number;
+  try { fd = openSync(fp, fsc.O_RDONLY | fsc.O_NONBLOCK | fsc.O_NOFOLLOW); } catch { return null; } // ENOENT / ELOOP (symlink) / EACCES
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) return null; // a dir / fifo / socket is not a deliverable message
+    const buf = Buffer.allocUnsafe(Number(st.size));
+    let off = 0;
+    while (off < st.size) { const r = readSync(fd, buf, off, Number(st.size) - off, null); if (r === 0) break; off += r; }
+    return buf.toString("utf8", 0, off);
+  } catch { return null; } finally { closeSync(fd); }
+}
+
+/** DWS-1-ADOPT: is there a VALID deliverable message for this key — an unclaimed `<key>.json` that is a REGULAR file parsing as a
+ *  valid InboxMsg, OR an in-flight `<key>.json.claim-*`? A bare NAME collision is NOT sufficient evidence of a delivered message
+ *  (a dir / dangling symlink / bad-JSON / missing-field target is not deliverable, and must never be confirmed published). */
+function deliverableMessagePresent(dir: string, idempotencyKey: string): boolean {
+  const base = `${idempotencyKey}.json`;
+  try { if (readdirSync(dir).some((n) => n.startsWith(`${base}.claim-`))) return true; } catch { /* unreadable dir ⇒ fall through to the file probe */ }
+  const text = readRegularFileNoFollow(path.join(dir, base));
+  if (text === null) return false;
+  try { return validInboxMsg(JSON.parse(text)) !== null; } catch { return false; }
+}
+
+/** `randHex` is injectable ONLY so a test can force a temp-name collision (ownership-boundary regression); production uses 64-bit
+ *  randomBytes. */
+export function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg, randHex: () => string = () => randomBytes(8).toString("hex")): WriteResult {
   const cred = credPathOf(dir, idempotencyKey);
   const msgFile = path.join(dir, `${idempotencyKey}.json`);
   // Prior-version (r6) credential compat import: r6 recorded publication as a `.published/<key>` marker (raw-key filename). The probe
@@ -339,36 +368,37 @@ function publishOnce(dir: string, idempotencyKey: string, valid: InboxMsg): Writ
     writeCredState(cred, "published");
     return "already";
   }
-  // DWS ① (direct-write-sweep): publish the message the INBOX-2 way (the keyed sibling of publishUniqueAtomic that the INBOX-2
-  // fix left on the bare path). A wx-EXCLUSIVE temp (we only ever write our OWN fresh inode — a plain write would TRUNCATE a
-  // stale same-key `.tmp-*` leftover) + a crypto-random name + linkSync NO-OVERWRITE (the old renameSync SILENTLY CLOBBERED an
-  // existing `<key>.json`) + clean our OWN temp in finally ("只清 own").
+  // DWS ① r2 (direct-write-sweep): publish the message with the INBOX-2 OWNERSHIP boundary. The wx-create loop is OUTSIDE the
+  // cleanup `finally`, so an EEXIST-EXHAUST (a foreign temp holding every name we try) throws WITHOUT ever unlinking a path we do
+  // NOT own (DWS-1-OWN). Cleanup rights are acquired ONLY after our own exclusive create succeeds.
   let tmp = "";
-  try {
-    for (let t = 0; ; t++) {
-      tmp = `${msgFile}.tmp-${randomBytes(8).toString("hex")}`;
-      try { writeFileSync(tmp, JSON.stringify(valid), { flag: "wx", mode: 0o600 }); break; } // exclusive create ⇒ our own fresh inode
-      catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && t < 8) continue; throw e; } // temp name taken ⇒ fresh temp
+  for (let t = 0; ; t++) {
+    tmp = `${msgFile}.tmp-${randHex()}`;
+    try { writeFileSync(tmp, JSON.stringify(valid), { flag: "wx", mode: 0o600 }); break; } // exclusive create ⇒ OUR fresh inode (ownership acquired HERE)
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST" && t < 8) continue; // a FOREIGN temp holds this name ⇒ try a fresh one; NEVER unlink it
+      try { unlinkSync(cred); } catch { /* best-effort rollback */ } // never acquired a temp ⇒ roll back the fresh credential + rethrow (clean nothing foreign)
+      throw e;
     }
+  }
+  try {
     try {
       linkSync(tmp, msgFile); // atomic NO-OVERWRITE publish (claim renames this, ack deletes it)
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === "EEXIST") {
-        // The message for this key is ALREADY on disk (an anomaly vs the "absent" credential — e.g. the credential was lost while
-        // the message survived). It is delivered: ADOPT it (confirm the credential, return already) instead of clobbering it.
-        writeCredState(cred, "published");
-        return "already";
+        // msgFile exists. ADOPT it ONLY if it is a VALID deliverable message — a regular file whose bytes parse as a valid InboxMsg
+        // (no-follow + FIFO-safe), OR an in-flight `.claim-*` of it (DWS-1-ADOPT). A name being taken is NOT proof of delivery: a
+        // dir / dangling symlink / bad-JSON / missing-field target must NOT be confirmed published (a false credential would
+        // permanently block retry).
+        if (deliverableMessagePresent(dir, idempotencyKey)) { writeCredState(cred, "published"); return "already"; }
+        try { unlinkSync(cred); } catch { /* best-effort rollback */ } // undecidable/invalid target ⇒ NO false "published"; recover after it clears
+        throw new Error(`publishOnce: ${msgFile} exists but is not a valid deliverable message — not adopting (retry after it clears)`);
       }
+      try { unlinkSync(cred); } catch { /* best-effort rollback */ } // link fault ⇒ roll back the fresh claim + rethrow (caller retries)
       throw e;
     }
-  } catch (e) {
-    // The message write FAILED in-process ⇒ we KNOW it did not land ("confirmed absent"). Roll back the pending claim so the next
-    // retry re-publishes from "absent" — never leave it stuck pending, which recovery would retain as unknown (a silent drop). Re-throw
-    // so the caller leaves ITS obligation open and retries (matching the historical throw-on-write-fault contract).
-    try { unlinkSync(cred); } catch { /* best-effort rollback */ }
-    throw e;
   } finally {
-    if (tmp) { try { unlinkSync(tmp); } catch { /* only OUR own temp; the linked copy holds the bytes, a leftover is ignored by readers */ } }
+    try { unlinkSync(tmp); } catch { /* only OUR own temp; the linked copy holds the bytes, a leftover is ignored by readers */ }
   }
   writeCredState(cred, "published"); // confirm
   return "published";
