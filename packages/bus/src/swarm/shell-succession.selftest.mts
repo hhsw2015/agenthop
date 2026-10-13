@@ -177,7 +177,7 @@ rmSync(sockHome, { recursive: true, force: true });
   // acquirable, with EXACTLY our identity in the dir (no double-identity residue).
   {
     const home = mkHome(); const site = strand(home, 999999);          // 999999 ⇒ ESRCH ⇒ confirmed dead
-    const token = acquireHolderLock(site, { reclaimExternalStranded: true });
+    const token = acquireHolderLock(site);
     t("SUCC-1 crash-recovery: a stranded empty lock + dead intent is reclaimed ⇒ token (not deaf forever)", token !== null);
     t("SUCC-1 crash-recovery: our identity is now published IN the dir", existsSync(path.join(site.lockDir, String(token))));
     t("SUCC-1 crash-recovery: EXACTLY one identity in the dir after reclaim (no double-identity)", readdirSync(site.lockDir).length === 1);
@@ -193,7 +193,7 @@ rmSync(sockHome, { recursive: true, force: true });
     mkdirSync(site.lockDir, { recursive: true });
     writeFileSync(path.join(site.lockDir, "1.deadbeef"), "");                         // a LIVE foreign holder (pid 1 ⇒ EPERM ⇒ alive) published here
     writeFileSync(path.join(site.intentDir, `${site.intentPrefix}999999.aa`), "");    // + a STALE confirmed-dead intent on disk
-    t("SUCC1-1: a stale dead intent does NOT authorize stealing a LIVE published holder ⇒ contend", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    t("SUCC1-1: a stale dead intent does NOT authorize stealing a LIVE published holder ⇒ contend", acquireHolderLock(site) === null);
     t("SUCC1-1: the live holder's identity is untouched", existsSync(path.join(site.lockDir, "1.deadbeef")) && readdirSync(site.lockDir).length === 1);
     rmSync(home, { recursive: true, force: true });
   }
@@ -219,7 +219,7 @@ rmSync(sockHome, { recursive: true, force: true });
     mkdirSync(site.lockDir, { recursive: true });
     writeFileSync(path.join(site.lockDir, "999999.dead"), ""); // confirmed dead
     writeFileSync(path.join(site.lockDir, "1.live"), "");      // pid 1 ⇒ EPERM ⇒ alive/unknown ⇒ protected
-    t("SUCC1-3: a multi-token dir with a LIVE/unknown identity ⇒ contend (residue not touched)", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    t("SUCC1-3: a multi-token dir with a LIVE/unknown identity ⇒ contend (residue not touched)", acquireHolderLock(site) === null);
     t("SUCC1-3: both tokens untouched when one is live/unknown", readdirSync(site.lockDir).length === 2);
     rmSync(home, { recursive: true, force: true });
   }
@@ -236,7 +236,7 @@ rmSync(sockHome, { recursive: true, force: true });
   // blocks reclaim, so two racing reclaimers each see the other and both contend (only a SOLO acquirer reclaims).
   {
     const home = mkHome(); const site = strand(home, 1);              // pid 1 ⇒ EPERM ⇒ alive/unknown, NOT ESRCH
-    t("SUCC1-2: an alive/unknown foreign intent ⇒ reclaim CONTENDS (non-ESRCH never authorizes; single-winner)", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    t("SUCC1-2: an alive/unknown foreign intent ⇒ reclaim CONTENDS (non-ESRCH never authorizes; single-winner)", acquireHolderLock(site) === null);
     rmSync(home, { recursive: true, force: true });
   }
 
@@ -244,22 +244,22 @@ rmSync(sockHome, { recursive: true, force: true });
   {
     const home = mkHome(); const site = strand(home, 999999);
     writeFileSync(path.join(site.intentDir, `${site.intentPrefix}1.beef`), ""); // a concurrent acquirer's live intent
-    t("SUCC-1 ABA: a dead intent + a concurrent live intent ⇒ CONTEND (no double-holder)", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    t("SUCC-1 ABA: a dead intent + a concurrent live intent ⇒ CONTEND (no double-holder)", acquireHolderLock(site) === null);
     rmSync(home, { recursive: true, force: true });
   }
 
   // no intents at all (empty dir, nothing proving a crash) ⇒ NOT reclaimed even with the opt (requires >=1 confirmed-dead intent).
   {
     const home = mkHome(); const site = adoptLockSite(home, SID); mkdirSync(site.lockDir, { recursive: true });
-    t("SUCC-1: an empty dir with NO hold-intent is not provably stranded ⇒ contend", acquireHolderLock(site, { reclaimExternalStranded: true }) === null);
+    t("SUCC-1: an empty dir with NO hold-intent is not provably stranded ⇒ contend", acquireHolderLock(site) === null);
     rmSync(home, { recursive: true, force: true });
   }
 
   // restart-idempotency: after a reclaim+release the sid acquires cleanly again (no residue strands it).
   {
     const home = mkHome(); const site = strand(home, 999999);
-    const t1 = acquireHolderLock(site, { reclaimExternalStranded: true }); if (t1) releaseHolderLock(site, t1);
-    const t2 = acquireHolderLock(site, { reclaimExternalStranded: true });
+    const t1 = acquireHolderLock(site); if (t1) releaseHolderLock(site, t1);
+    const t2 = acquireHolderLock(site);
     t("SUCC-1 idempotent: reclaim → release → re-acquire succeeds (no stranded residue)", t2 !== null);
     if (t2) releaseHolderLock(site, t2);
     rmSync(home, { recursive: true, force: true });
