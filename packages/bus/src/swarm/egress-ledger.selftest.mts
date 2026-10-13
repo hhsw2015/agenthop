@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { chainEntry, verifyEgressChain, parseEgressEntry, byteMagnitude, egressLedgerEnabled, type EgressEntry, type EgressBody } from "./egress-ledger.js";
-import { egressDir, readEgressLedger, readEgressRaw, recordEgressIntent, recordEgressResult } from "./egress-ledger-store.js";
+import { egressDir, readEgressLedger, readEgressRaw, recordEgressIntent, recordEgressResult, readRegularFileFifoSafe } from "./egress-ledger-store.js";
 
 let pass = 0;
 const t = (n: string, c: boolean): void => { if (!c) { console.error(`FAIL ${n}`); process.exit(1); } pass++; console.log(`ok  ${n}`); };
@@ -240,6 +240,45 @@ t("flag: ON only when explicitly enabled", egressLedgerEnabled({ SWARM_EGRESS_LE
     const b = recordEgressIntent(dir, { destHost: "h2", callFace: "relay.post", initiatorSid: "s" }, 1002);
     t("EL-3 (entry): after the FIFO tail is removed, records continue", b !== null && readEgressLedger(dir).length === 1);
   } else { t("EL-3 (entry): SKIPPED (mkfifo unavailable on this host)", true); }
+  rmSync(path.dirname(dir), { recursive: true, force: true });
+}
+
+// ── EL-3-GATE (codex:Work r4): a gate with TEETH — it must traverse the lstat->read TOCTOU window (the static-FIFO tests above
+//    are caught by the OLD reader's lstat check too, so reverting the fix still passed them). (A) the PRODUCTION reader is driven
+//    with a seam that swaps the path to a FIFO AFTER the fd+fstat phase — it must still return the ORIGINAL bytes FROM THE FD
+//    (window provably hit: the path is a FIFO afterward). (B) a parent-timeout-protected child running the OLD lstat-then-
+//    readFileSync sequence with the SAME in-window swap HANGS — the negative control that goes RED if the old reader ever
+//    returns. "Delete the production fix ⇒ the gate fails" (digest/unwired②/idle① lesson: a negative case MUST be able to fail). ──
+{
+  const dir = mkDir(); mkdirSync(dir, { recursive: true });
+  const canFifo = (() => { try { const p = path.join(dir, "fifoprobe"); const r = spawnSync("mkfifo", [p]); const ok = r.status === 0 && lstatSync(p).isFIFO(); if (ok) unlinkSync(p); return ok; } catch { return false; } })();
+  if (canFifo) {
+    const entry = path.join(dir, "entry.json");
+    const content = JSON.stringify({ seq: 0, note: "multi-byte \u00e9\u00e8 \u4e2d\u6587 payload", pad: "x".repeat(1024) }); // >1KB + multibyte
+    writeFileSync(entry, content);
+    const swap = () => { unlinkSync(entry); if (spawnSync("mkfifo", [entry]).status !== 0) throw new Error("mkfifo swap failed"); }; // the in-window swap
+    // (A) production reader: swap-to-FIFO lands AFTER fstat, yet the read comes from the fd ⇒ original bytes; path is now a FIFO
+    const got = readRegularFileFifoSafe(entry, swap);
+    t("EL-3-GATE: the production reader is TOCTOU-immune — an in-window swap to a FIFO still yields the ORIGINAL bytes from the fd", got === content && lstatSync(entry).isFIFO());
+    unlinkSync(entry); // remove the FIFO the swap planted
+    // (B) negative control: the OLD lstat-then-readFileSync reader with the SAME in-window swap must HANG (go red if it returns)
+    const entry2 = path.join(dir, "entry2.json"); writeFileSync(entry2, content);
+    const oldChild = path.join(dir, "old-reader-child.mts");
+    writeFileSync(oldChild,
+      `import { lstatSync, readFileSync, unlinkSync, writeSync } from "node:fs";\n` +
+      `import { spawnSync } from "node:child_process";\n` +
+      `const E = process.argv[2];\n` +
+      `const st = lstatSync(E); if (!st.isFile()) process.exit(3);\n` +                    // phase 1: stat sees a regular file
+      `unlinkSync(E); if (spawnSync("mkfifo", [E]).status !== 0) process.exit(4);\n` +     // SYNC POINT: swap to a FIFO in the window
+      `writeSync(1, "about-to-read\\n");\n` +                                              // unbuffered phase marker (window reached)
+      `const text = readFileSync(E, "utf8");\n` +                                          // OLD reader: BLOCKS forever on the FIFO
+      `writeSync(1, "READ:" + text.length + "\\n");\n`);                                   // never reached under the bug
+    const tsx = path.join(repoRoot(), "node_modules/.bin/tsx");
+    const started = Date.now();
+    const old = spawnSync(tsx, [oldChild, entry2], { encoding: "utf8", timeout: 4000 });
+    const elapsed = Date.now() - started;
+    t("EL-3-GATE: the OLD lstat-then-readFileSync reader HANGS on an in-window swap (negative control killed by timeout, never completed the read)", /about-to-read/.test(old.stdout ?? "") && !/READ:/.test(old.stdout ?? "") && old.status !== 0 && elapsed >= 3000);
+  } else { t("EL-3-GATE: SKIPPED (mkfifo unavailable on this host)", true); }
   rmSync(path.dirname(dir), { recursive: true, force: true });
 }
 

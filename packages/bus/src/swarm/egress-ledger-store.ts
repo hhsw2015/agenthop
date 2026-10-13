@@ -51,11 +51,13 @@ function listSeqs(dir: string): number[] {
  *  opens O_RDONLY|O_NONBLOCK|O_NOFOLLOW (a FIFO opens immediately, a symlink ⇒ ELOOP), fstats the SAME fd to confirm a regular
  *  file (closing the lstat->read TOCTOU), then reads the whole file sized from that fstat (an entry is not a fixed-size pid
  *  record). ENOENT propagates (a gap); a non-regular/symlink/would-block path throws and NEVER blocks the caller. */
-function readRegularFileFifoSafe(fp: string): string {
+export function readRegularFileFifoSafe(fp: string, onAfterStat?: () => void): string {
   const fd = openSync(fp, FS.O_RDONLY | FS.O_NONBLOCK | FS.O_NOFOLLOW); // ENOENT (gap) / ELOOP (symlink) / EACCES propagate with .code
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) throw Object.assign(new Error(`${fp} is not a regular file`), { code: "ENOTREG" }); // FIFO/dir/socket ⇒ reject, no blocking read
+    if (onAfterStat) onAfterStat(); // TEST SEAM (EL-3-GATE): fire a path swap AFTER the fd+fstat phase ⇒ prove the read is immune to
+    //                                 a lstat->read TOCTOU (we read from the fd, not the path). Production never passes it (no-op).
     const buf = Buffer.allocUnsafe(Number(st.size));
     let off = 0;
     while (off < st.size) { const r = readSync(fd, buf, off, Number(st.size) - off, null); if (r === 0) break; off += r; } // entries are rename-atomic ⇒ size is stable
