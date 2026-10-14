@@ -69,7 +69,7 @@ function withManagedLock<T>(file: string, fn: () => T): T | { busy: true } {
 
 /** EXCLUSIVELY create the temp (wx ⇒ our own fresh inode — never truncate/follow a pre-existing temp or a planted symlink), then
  *  rename over the target; a fault removes only OUR temp (DS-TEMP-OWN). */
-function atomicReplace(file: string, data: string): void {
+export function atomicReplace(file: string, data: string): void {
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   let tmp = "";
   for (let t = 0; ; t++) {

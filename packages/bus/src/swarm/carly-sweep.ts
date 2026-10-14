@@ -8,8 +8,9 @@
  *   1. generateRegistry  — refresh ~/.agenthop/projects.json (Carly's switchboard view).
  *   2. projection write   — HEARTBEAT/MEMORY managed region into Carly's WORKSPACE files (her actual auto-read, per her r1 review:
  *      ~/Library/Application Support/Tern/carly/), PLUS a swarm-side AUDIT copy under ~/.agenthop/carly/ (the pack marks it on-demand).
- *   3. outbox drain       — deliver swarm-carly-send's durable fallback outbox (~/.agenthop/carly/outbox/) to the resolved role box,
- *      EXACTLY ONCE (each file's stable basename is the publishOnce idempotency key; clear the source only on a confirmed durable landing).
+ *   3. outbox drain       — deliver swarm-carly-send's durable fallback outbox (~/.agenthop/carly/outbox/) to a DURABLE BOUND target,
+ *      exactly once per bound target (the target sid is bound into the record on first attempt; stable basename = publishOnce key;
+ *      clear the source only on a confirmed durable landing). See drainOutbox for the precise guarantee + the role-switch boundary.
  *
  * The coordinator.beat is DELIBERATELY NOT written here (CS-BEAT-SOURCE): a live dispatcher is NOT proof the coordinator's scan loop
  * is alive, so the sweep must not forge that liveness. The coordinator writes its own beat each scan; this module only carries the
@@ -25,7 +26,7 @@ import { isValidSessionId } from "../send-fallback.js";
 import { resolveSession, listSessions } from "./task-liveness.js";
 import { installInboxWake } from "./inbox-wake.js";
 import { generateRegistry } from "./projects-registry-store.js";
-import { readCarlyStatus, writeManagedFile, CARLY_USAGE_NOTE, type CarlyStatus } from "./carly-projection-store.js";
+import { readCarlyStatus, writeManagedFile, atomicReplace, CARLY_USAGE_NOTE, type CarlyStatus } from "./carly-projection-store.js";
 import { buildHeartbeatBody, buildMemoryBody } from "./carly-projection.js";
 
 /** SWARM_CARLY_PROJECTION — DEFAULT OFF (opt-in; mirrors placementEnabled). Read at the call site. Pure. */
@@ -81,10 +82,19 @@ function writeManagedPair(dir: string, status: CarlyStatus): boolean {
 }
 
 /**
- * Deliver swarm-carly-send's durable fallback outbox. Each `<ts>-<hex>.json` holds `{to:<role>, msg:<InboxMsg>}`.
- *  - CS-OUTBOX-ONCE: deliver with the file's STABLE basename as the publishOnce idempotency key, so a re-drain after a failed unlink
- *    (or a restart) returns "already" — the message lands EXACTLY ONCE even though the credential persists after the receiver takes
- *    it. The source is cleared ONLY on a confirmed durable result ("published" | "already"); any other result keeps the obligation.
+ * Deliver swarm-carly-send's durable fallback outbox. Each `<ts>-<hex>.json` holds `{to:<role>, msg:<InboxMsg>, target?:<sid>}`.
+ *
+ * GUARANTEE (precise): exactly-once delivery to a DURABLE BOUND TARGET. The publishOnce credential (.pubcred) lives inside ONE
+ * recipient inbox, so the idempotency key dedups only within THAT box — a role whose SID later changes would re-publish into a
+ * DIFFERENT box (CS-OUTBOX-ONCE role-switch face). So the obligation BINDS its target sid into the source record on the first
+ * attempt and ALWAYS re-delivers to that bound sid thereafter (F40 stable-addressing family: durable obligations carry a stable
+ * target, not a live-resolved one). This does NOT promise once-execution across an arbitrary shell swap of the target itself —
+ * only: same bound target ⇒ persistent dedup; a never-attempted obligation ⇒ a first delivery; an unresolvable role ⇒ HOLD.
+ *
+ *  - BIND-BEFORE-PUBLISH: an un-targeted record resolves its role to a sid, PERSISTS `target:<sid>` into the file (atomic rewrite,
+ *    same basename ⇒ same key) BEFORE the first publish, so a crash / failed unlink / role switch cannot re-target it. A re-drain
+ *    uses the RECORDED target, never a fresh role resolution.
+ *  - clear the source ONLY on a confirmed durable result ("published" | "already"); any other result keeps the obligation.
  *  - CS-OUTBOX-SHAPE: the ROOT shape is validated before any field access, and EACH file is handled in its own try/catch — one
  *    malformed file (null/array/scalar JSON, or a write fault) is isolated and LEFT; the rest of the drain continues.
  * Returns the count confirmed delivered. */
@@ -100,15 +110,21 @@ export function drainOutbox(home: string, env: NodeJS.ProcessEnv = process.env):
       let rec: unknown;
       try { rec = JSON.parse(readFileSync(file, "utf8")); } catch { continue; } // corrupt JSON ⇒ leave for inspection
       if (rec === null || typeof rec !== "object" || Array.isArray(rec)) continue; // CS-OUTBOX-SHAPE: bad root ⇒ isolate + leave
-      const r = rec as { to?: unknown; msg?: unknown };
+      const r = rec as { to?: unknown; msg?: unknown; target?: unknown };
       if (typeof r.to !== "string" || !r.msg || typeof r.msg !== "object") continue; // bad fields ⇒ leave
-      const sid = resolveRoleSid(r.to, home, env);
-      if (!sid || !isValidSessionId(sid)) continue; // role not reachable now ⇒ leave, retry next tick
+      // Determine the BOUND target: an already-recorded valid target wins (never re-resolve the role); else resolve + PERSIST it.
+      let target: string | null = typeof r.target === "string" && isValidSessionId(r.target) ? r.target : null;
+      if (!target) {
+        const sid = resolveRoleSid(r.to, home, env);
+        if (!sid || !isValidSessionId(sid)) continue; // role not resolvable yet ⇒ leave (no target bound, a first delivery is still allowed later)
+        target = sid;
+        atomicReplace(file, JSON.stringify({ to: r.to, msg: r.msg, target }, null, 2) + "\n"); // bind durably BEFORE the publish
+      }
       const key = name.replace(/\.json$/, ""); // stable per-file idempotency key (`<ts>-<hex>`, publishOnce-safe)
-      const res = writeInbox(home, sid, r.msg as Parameters<typeof writeInbox>[2], key);
+      const res = writeInbox(home, target, r.msg as Parameters<typeof writeInbox>[2], key);
       if (res === "published" || res === "already") { unlinkSync(file); delivered++; } // confirmed durable ⇒ clear source
-      // deferred/pending/unknown ⇒ keep the file (retry next tick); "already" after a prior landing prevents a duplicate
-    } catch { /* this one file faulted (parse/resolve/write/unlink) ⇒ isolate + leave; the rest of the drain continues */ }
+      // deferred/pending/unknown ⇒ keep the file (retry next tick, to the SAME bound target)
+    } catch { /* this one file faulted (parse/resolve/rewrite/write/unlink) ⇒ isolate + leave; the rest of the drain continues */ }
   }
   return delivered;
 }

@@ -73,23 +73,43 @@ function putOutbox(home: string, name: string, body: unknown): void {
   t("projection idempotent (workspace HEARTBEAT byte-identical on rerun)", read(path.join(ws, "HEARTBEAT.md")) === before);
 }
 
-// ---- CS-OUTBOX-ONCE: exactly-once even on re-drain / after the receiver took it ----
+// ---- CS-OUTBOX-ONCE: exactly-once to a BOUND target (incl. the role-switch face) ----
 {
   const home = tmp();
-  const coordSid = seedCoord(home);
+  const coordSid = seedCoord(home); // "coord-sweep-1"
   const env = { AH_HOME: home, SWARM_COORDINATOR: coordSid } as unknown as NodeJS.ProcessEnv;
   const box = path.join(home, ".agenthop", "inbox", coordSid);
   putOutbox(home, "0001-aaaa.json", { to: "coordinator", msg: msg("once") });
   t("drain: first delivery (1) + source cleared", drainOutbox(home, env) === 1 && jsonCount(outboxDir(home)) === 0 && jsonCount(box) === 1);
-  // simulate an unlink that FAILED: the same-named file reappears (or was never cleared) ⇒ re-drain must NOT duplicate
+  // same basename reappears (failed unlink) ⇒ re-drain re-binds same target ⇒ 'already' ⇒ no duplicate
   putOutbox(home, "0001-aaaa.json", { to: "coordinator", msg: msg("once") });
   drainOutbox(home, env);
-  t("CS-OUTBOX-ONCE: re-drain of same file ⇒ 'already' ⇒ no duplicate (box still 1) + source cleared", jsonCount(box) === 1 && jsonCount(outboxDir(home)) === 0);
-  // receiver TAKES the message, then the same file reappears ⇒ still no re-delivery (pubcred persists)
-  for (const f of readdirSync(box).filter((x) => x.endsWith(".json"))) rmSync(path.join(box, f)); // receiver takes the MESSAGE; .pubcred stays
+  t("CS-OUTBOX-ONCE: re-drain ⇒ 'already' ⇒ no duplicate (box still 1)", jsonCount(box) === 1 && jsonCount(outboxDir(home)) === 0);
+  // receiver TAKES the message, same file reappears ⇒ still no re-delivery (pubcred persists in the bound box)
+  for (const f of readdirSync(box).filter((x) => x.endsWith(".json"))) rmSync(path.join(box, f)); // .pubcred stays
   putOutbox(home, "0001-aaaa.json", { to: "coordinator", msg: msg("once") });
   drainOutbox(home, env);
-  t("CS-OUTBOX-ONCE: after receiver took it, re-drain does NOT re-deliver (box 0) + source cleared", jsonCount(box) === 0 && jsonCount(outboxDir(home)) === 0);
+  t("CS-OUTBOX-ONCE: after receiver took it, no re-delivery (box 0) + source cleared", jsonCount(box) === 0 && jsonCount(outboxDir(home)) === 0);
+}
+// CS-OUTBOX-ONCE role-switch face: a BOUND target is honored even when the role now resolves to a DIFFERENT sid ⇒ no second copy.
+{
+  const home = tmp();
+  const aSid = "coord-A", bSid = "coord-B";
+  mkdirSync(path.join(home, ".agenthop", "presence"), { recursive: true });
+  writeFileSync(path.join(home, ".agenthop", "presence", `${aSid}.pid`), String(process.pid));
+  writeFileSync(path.join(home, ".agenthop", "presence", `${bSid}.pid`), String(process.pid));
+  const boxA = path.join(home, ".agenthop", "inbox", aSid), boxB = path.join(home, ".agenthop", "inbox", bSid);
+  // a record ALREADY BOUND to A, but the role now points to B
+  putOutbox(home, "0009-switch.json", { to: "coordinator", msg: msg("bound"), target: aSid });
+  const n = drainOutbox(home, { AH_HOME: home, SWARM_COORDINATOR: bSid } as unknown as NodeJS.ProcessEnv);
+  t("CS-OUTBOX-ONCE role-switch: delivered to BOUND A, not the new role B", n === 1 && jsonCount(boxA) === 1 && jsonCount(boxB) === 0 && jsonCount(outboxDir(home)) === 0);
+  // a bound record delivers even when the role is now UNRESOLVABLE (no SWARM_COORDINATOR) — binding, not live resolution
+  putOutbox(home, "0010-bound.json", { to: "coordinator", msg: msg("bound2"), target: aSid });
+  t("CS-OUTBOX-ONCE: bound target honored with no resolvable role", drainOutbox(home, { AH_HOME: home } as unknown as NodeJS.ProcessEnv) === 1 && jsonCount(boxA) === 2);
+  // first-attempt binding is PERSISTED: an un-targeted file, drained once with the role resolvable, records target in the file if kept.
+  // (Observed indirectly above: the role-switch file was pre-bound; here assert a fresh un-targeted file still delivers a FIRST time.)
+  putOutbox(home, "0011-fresh.json", { to: "coordinator", msg: msg("fresh") });
+  t("CS-OUTBOX-ONCE: never-attempted obligation still allows a first delivery", drainOutbox(home, { AH_HOME: home, SWARM_COORDINATOR: aSid } as unknown as NodeJS.ProcessEnv) === 1 && jsonCount(boxA) === 3);
 }
 
 // ---- CS-OUTBOX-SHAPE: null-first does not break the loop; later valid file still delivers once ----

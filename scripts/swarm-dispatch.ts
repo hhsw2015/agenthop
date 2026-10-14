@@ -1915,9 +1915,10 @@ async function main(): Promise<void> {
   };
 
   // Carly sweep (dialog-officer M2-a follow-up): refresh projects.json + write her HEARTBEAT/MEMORY managed region into her
-  // WORKSPACE files (+ audit copy) + drain the swarm-carly-send outbox + write coordinator.beat. DEFAULT OFF via
-  // SWARM_CARLY_PROJECTION (dormant merge discipline). Throttled to CARLY_SWEEP_SEC; interval advances before the work so one
-  // attempt per interval even on a throw. Fully fail-soft (runCarlySweep isolates each of its four steps internally too).
+  // WORKSPACE files (+ audit copy) + drain the swarm-carly-send outbox. DEFAULT OFF via SWARM_CARLY_PROJECTION (dormant merge
+  // discipline). Does NOT write coordinator.beat — the coordinator writes its own beat (a live dispatcher is not proof the
+  // coordinator loop is alive). Throttled to CARLY_SWEEP_SEC; interval advances before the work so one attempt per interval even
+  // on a throw. Fully fail-soft (runCarlySweep isolates each of its three steps internally too).
   let lastCarlySweepSec = 0;
   const runCarlySweepStep = (): void => {
     if (!carlyProjectionEnabled()) return; // SWARM_CARLY_PROJECTION default OFF (opt-in)
@@ -2279,7 +2280,7 @@ async function main(): Promise<void> {
         runModelMarketPull,          // model-market capability-profile pull (staffing ①); external fetch, FC-2 keeps last snapshot
         runModelStaffing,            // model-staffing suggestion projection (staffing ③a); SUGGESTION ONLY, never spawns/spends (R16)
         runDigest,                   // morning digest
-        runCarlySweepStep,           // dialog-officer M2-a: Carly projection(workspace)+registry+outbox drain+coordinator.beat (default OFF)
+        runCarlySweepStep,           // dialog-officer M2-a: Carly projection(workspace)+registry+outbox drain (default OFF; no beat write)
         async () => { const wakeCoordSid = resolveSession(COORDINATOR, listSessions(HOME)); if (wakeCoordSid && isStableSid(wakeCoordSid)) await backstopWake(HOME, wakeCoordSid, log); }, // SWARM_INBOX_WAKE backstop
       ],
       onError: (where, e) => log(`${where} error (isolated): ${e instanceof Error ? e.message : e}`),
