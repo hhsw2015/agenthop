@@ -148,6 +148,7 @@ def main() -> None:
         fail(f"no source docs in {SRC_DIR}")
     defaults = {}  # domain -> model, for cpa-defaults.env
     voices = {}    # domain -> default voice (tts), optional
+    sizes = {}     # domain -> default size (image), from frontier-aliases media[key].size when present
     for src in srcs:
         spec, prose = parse_src(src)
         domain = spec["domain"]
@@ -155,6 +156,9 @@ def main() -> None:
         defaults[domain] = model
         if isinstance(spec.get("defaults"), dict) and "voice" in spec["defaults"]:
             voices[domain] = spec["defaults"]["voice"]
+        media_entry = aliases.get("media", {}).get(spec["default_model_key"], {})
+        if isinstance(media_entry, dict) and media_entry.get("size"):
+            sizes[domain] = str(media_entry["size"])  # model-specific default size (e.g. doubao-seedream-5.0 ⇒ 2048x2048)
         # SKILL.md
         skill_dir = SKILLS_DIR / spec["cli"]
         skill_dir.mkdir(parents=True, exist_ok=True)
@@ -171,6 +175,8 @@ def main() -> None:
     ]
     for domain in sorted(defaults):
         lines.append(f"CPA_DEFAULT_MODEL_{domain.upper()}={defaults[domain]}")
+    for domain in sorted(sizes):
+        lines.append(f"CPA_DEFAULT_SIZE_{domain.upper()}={sizes[domain]}")
     for domain in sorted(voices):
         lines.append(f"CPA_DEFAULT_VOICE_{domain.upper()}={voices[domain]}")
     (CLI_DIR / "cpa-defaults.env").write_text("\n".join(lines) + "\n", encoding="utf-8")

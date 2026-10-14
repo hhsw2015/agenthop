@@ -11,7 +11,7 @@ allowed-tools: [Bash, Read]
 
 Swarm-seat skin for CPA **stt**. It invokes the hand-written CLI wrapper, which calls CPA's `POST {CPA}/v1/audio/transcriptions` (sync).
 
-- **Default model**: `elevenlabs-speech-to-text-scribe-v2` (resolved from frontier-aliases.json, generated 2026-10-14; override with `--model`).
+- **Default model**: `whisper` (resolved from frontier-aliases.json, generated 2026-10-14; override with `--model`).
 - **Key**: the CLI reads `CPA_KEY_CLI` + `CPA_BASE_URL` from `~/.agenthop/cpa/keys.env` (0600). The key NEVER appears here.
 
 ## Invoke

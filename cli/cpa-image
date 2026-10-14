@@ -5,7 +5,7 @@ set -euo pipefail
 . "$(cd "$(dirname "$0")" && pwd)/cpa-common.sh"
 cpa_load
 
-prompt=""; size="1024x1024"; n="1"; model="${CPA_DEFAULT_MODEL_IMAGE:-}"; out=""; dry=0
+prompt=""; size="${CPA_DEFAULT_SIZE_IMAGE:-1024x1024}"; n="1"; model="${CPA_DEFAULT_MODEL_IMAGE:-}"; out=""; dry=0
 add_word() { if [ -z "$prompt" ]; then prompt="$1"; else prompt="$prompt $1"; fi; }
 while [ $# -gt 0 ]; do
   case "$1" in

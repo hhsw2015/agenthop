@@ -1,6 +1,6 @@
 -- cpa-stt — Carly snippet (GENERATED from skills-src/stt.md; DO NOT EDIT HERE).
 -- Returns a function that runs the hand-written cli/cpa-stt wrapper via tern.process.run and awaits the result.
--- Default model: elevenlabs-speech-to-text-scribe-v2 (resolved from frontier-aliases.json, generated 2026-10-14; pass opts.model to override).
+-- Default model: whisper (resolved from frontier-aliases.json, generated 2026-10-14; pass opts.model to override).
 -- CARLY SNIPPET CACHE: Carly caches snippet modules per VM — an edit here is picked up only on a VM RESET
 -- (reload). After re-running the generator (e.g. a new strongest model), RESET the VM to refresh this snippet.
 -- The CPA key never appears here; the CLI reads CPA_KEY_CLI from ~/.agenthop/cpa/keys.env.

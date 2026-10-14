@@ -30,17 +30,19 @@ fi
 [ -f "$file" ] || cpa_die "audio file not found: $file"
 cpa_require_creds
 
-# CPA-STT-PATH: curl's `-F name=@filename` RE-PARSES the value (',' / ';' split parts; '\' and '"' are escapes), so a path
-# like `audio,part.wav` or `audio\"x.wav` either errors or uploads a DIFFERENT file. Instead of trying to escape every
-# curl grammar case, copy the file to a clean temp path (mktemp dir + a plain name) and upload THAT — curl never sees a
-# special char, and the server receives the correct bytes. The original extension is preserved for format detection.
-tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/cpa-stt.XXXXXX")
+# CPA-STT-PATH: curl's `-F name=@filename` RE-PARSES the value (',' / ';' split parts; '\' and '"' are escapes). It is not
+# enough to copy to a temp path — the path handed to curl must itself contain ONLY controlled chars, and TWO entrances can
+# sneak a grammar char back in: (a) the inherited TMPDIR (e.g. `/tmp/cache;semi`) and (b) an arbitrary reattached
+# extension (e.g. `.wav,part`). So: copy into a 0700 mktemp dir under a plain name with a SANITIZED extension, then `cd`
+# into that dir and give curl a pure RELATIVE name — curl never sees the TMPDIR path at all. model goes via --form-string
+# (literal, no @/;/< interpretation).
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/cpa-stt.XXXXXX"); chmod 700 "$tmpdir"
 trap 'rm -rf "$tmpdir"' EXIT
-base=$(basename -- "$file"); ext=""; case "$base" in *.*) ext=".${base##*.}";; esac
-safe="$tmpdir/upload$ext"
-cp -- "$file" "$safe"
-
-resp=$(curl -fsS "$(cpa_base)/v1/audio/transcriptions" -H "Authorization: Bearer $CPA_KEY_CLI" -F "file=@$safe" -F "model=$model")
+base=$(basename -- "$file"); rawext=""; case "$base" in *.*) rawext="${base##*.}";; esac
+ext=$(printf '%s' "$rawext" | LC_ALL=C tr -cd 'A-Za-z0-9' | cut -c1-12)   # extension restricted to safe chars (or dropped)
+cname="audio"; [ -n "$ext" ] && cname="audio.$ext"
+cp -- "$file" "$tmpdir/$cname"
+resp=$(cd "$tmpdir" && curl -fsS "$(cpa_base)/v1/audio/transcriptions" -H "Authorization: Bearer $CPA_KEY_CLI" -F "file=@$cname" --form-string "model=$model")
 # CPA-STT-SCHEMA: require {text: <string>}. A missing/wrong-typed text (or non-object) is NOT a successful empty
 # transcript — fail non-zero and do NOT overwrite the prior transcript. `{"text":""}` is a legit empty result.
 text=$(printf '%s' "$resp" | python3 -c '

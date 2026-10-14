@@ -135,6 +135,21 @@ def main() -> int:
     check("stt: second file after -- rejected (one file only)", r.returncode != 0)
     r = run(["cpa-stt", os.path.join(tmp, "a.wav"), weird])
     check("stt: two positional files rejected", r.returncode != 0)
+    # the TWO entrances the r3 residual leaked through: the inherited TMPDIR path, and the reattached extension.
+    # (a) a ';' in TMPDIR must not let curl read a decoy — the server must get the REQUESTED bytes.
+    semidir = os.path.join(tmp, "cache;semi"); os.makedirs(semidir, exist_ok=True)
+    open(os.path.join(tmp, "cache"), "wb").write(b"DECOY-TMPDIR-BYTES")   # where a ';' split could resolve
+    src = os.path.join(tmp, "req.wav"); open(src, "wb").write(b"REQUESTED-TMPDIR-BYTES")
+    REQS.clear()
+    r = subprocess.run([str(CLI / "cpa-stt"), src, "--model", "good"], env={**env, "TMPDIR": semidir}, capture_output=True, text=True, cwd=tmp)
+    got_req = any(b"REQUESTED-TMPDIR-BYTES" in body for (p, body) in REQS if p == "/v1/audio/transcriptions")
+    got_decoy = any(b"DECOY-TMPDIR-BYTES" in body for (p, body) in REQS)
+    check("stt: ';'-in-TMPDIR uploads REQUESTED bytes (not decoy)", r.returncode == 0 and got_req and not got_decoy)
+    # (b) a comma in the source extension must not leak into curl's form grammar.
+    commaext = os.path.join(tmp, "take.wav,part"); open(commaext, "wb").write(b"COMMAEXT-BYTES")
+    REQS.clear()
+    r = run(["cpa-stt", commaext, "--model", "good"])
+    check("stt: comma-in-extension source uploads correct bytes", r.returncode == 0 and any(b"COMMAEXT-BYTES" in body for (p, body) in REQS if p == "/v1/audio/transcriptions"))
 
     # ── CPA-ARGS: an option value with a trailing newline is kept verbatim (not stripped by a $() capture) ───────────
     weird_out = "o\n"  # cpa-tts writes to --out; the value must survive the validator unchanged
@@ -148,6 +163,11 @@ def main() -> int:
     check("image: 302 redirect followed → non-empty file", r.returncode == 0 and os.path.exists(out_png) and os.path.getsize(out_png) == len(PNG))
     r = run(["cpa-image", "a cat", "--model", "emptyimg", "--out", os.path.join(tmp, "empty.png")])
     check("image: empty download is an ERROR (not 0-byte success)", r.returncode != 0 and not os.path.exists(os.path.join(tmp, "empty.png")))
+    # image default size comes from the alias (media[Image generation].size) via cpa-defaults.env
+    REQS.clear()
+    r = run(["cpa-image", "a cat", "--out", os.path.join(tmp, "i2.png")])
+    sized = any(b'"size": "2048x2048"' in body for (p, body) in REQS if p == "/v1/images/generations")
+    check("image: default size from alias (2048x2048)", r.returncode == 0 and sized)
 
     srv.shutdown()
     print(f"\nPASS={passed} FAIL={failed}")
