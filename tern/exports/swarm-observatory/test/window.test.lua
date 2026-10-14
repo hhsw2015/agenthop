@@ -305,6 +305,7 @@ local function newHost(override)
     snapshotFile = function() return files[P.snapshot] end,
     setResponseStdout = function(s) response.stdout = s end,
     putJson = putJson,
+    putFile = putFile,
     setFailFocus = function(v) failFocus = v end,
     toasts = toasts,
     focuses = focuses,
@@ -370,6 +371,43 @@ do
 
   h.refreshCmd() -- updateCountsKv must SKIP on unknown -> context keeps the last-good value, no false zeros
   ck("source-unknown: context KEEPS last-good (no flip to 在审0|候裁0|告警0)", h.context() == "在审1|候裁1|告警1")
+end
+
+-- ================================================================================================================
+-- TE-SOURCE-UNKNOWN face 1 (r3): a per-batch batch.json EXISTS-probe fault is UNKNOWN -> keep the last-good 候裁,
+-- never fold the probe fault to a false count (which hid an awaiting-ruling batch: 候裁 1 -> 0).
+-- ================================================================================================================
+do
+  local h = newHost(false)
+  h.refreshCmd() -- good cache: batch-one has batch.json + no consumed.json => 候裁 1
+  local before = h.context()
+  ck("ruling-probe-fault: good cache = 在审1|候裁1|告警1", before == "在审1|候裁1|告警1")
+  h.err.exists[h.paths.batchJson] = true -- the batch-one batch.json existence probe now throws
+  h.refreshCmd() -- countRulingBatches -> unknown -> updateCountsKv SKIPS -> last-good kept (NOT 候裁 0)
+  ck("ruling-probe-fault: 候裁 kept (NOT folded to a false 0) when batch.json probe faults", h.context() == before)
+end
+
+-- ================================================================================================================
+-- TE-SOURCE-UNKNOWN face 2 (r3): a corrupt review-report (decode error / non-table root / wrong-type known field) is
+-- UNKNOWN, not a legal empty queue -> swarm_queue FAILS + context keeps last-good (never 在审 1 -> 0).
+-- ================================================================================================================
+do
+  local cases = {
+    { name = "decode-error {broken", apply = function(h, p) h.putFile(p, "{broken") end },       -- unregistered text => decode errors
+    { name = "non-table root 123", apply = function(h, p) h.putJson(p, 123) end },               -- decodes to a number
+    { name = "wrong-type active", apply = function(h, p) h.putJson(p, { active = "not-a-record" }) end },
+  }
+  for _, c in ipairs(cases) do
+    local h = newHost(false)
+    local reportPath = h.paths.reports .. "/seat-active-review-queue.json"
+    h.refreshCmd()
+    local before = h.context()
+    c.apply(h, reportPath) -- replace the valid report with a corrupt payload
+    local q, eq = h.invoke("swarm_queue")
+    ck("corrupt-queue [" .. c.name .. "]: swarm_queue FAILS (not reviews=[])", q == nil and type(eq) == "string")
+    h.refreshCmd()
+    ck("corrupt-queue [" .. c.name .. "]: context keeps last-good (not 在审 0)", h.context() == before)
+  end
 end
 
 -- ================================================================================================================

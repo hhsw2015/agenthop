@@ -130,10 +130,15 @@ local function collectReviews()
         local okd, obj = pcall(function()
           return tern.json.decode(txt)
         end)
-        if okd and type(obj) == "table" then
-          for _, r in ipairs(parse.parseReviewQueue(obj, seat)) do
-            reviews[#reviews + 1] = r
-          end
+        if not okd then
+          return reviews, REVIEW_REPORTS .. "/" .. nm -- present file, decode error ⇒ corrupt ⇒ UNKNOWN (never a silent skip)
+        end
+        local rows, malformed = parse.parseReviewQueue(obj, seat)
+        if malformed then
+          return reviews, REVIEW_REPORTS .. "/" .. nm -- root non-table or a known field wrong-type ⇒ corrupt ⇒ UNKNOWN
+        end
+        for _, r in ipairs(rows) do
+          reviews[#reviews + 1] = r
         end
       end
     end
@@ -152,7 +157,13 @@ local function collectReviews()
         local okd, obj = pcall(function()
           return tern.json.decode(txt)
         end)
-        if okd and type(obj) == "table" and obj.item then
+        if not okd then
+          return reviews, REVIEW_QUEUE_DIR .. "/" .. nm -- present file, decode error ⇒ corrupt ⇒ UNKNOWN
+        end
+        if type(obj) ~= "table" then
+          return reviews, REVIEW_QUEUE_DIR .. "/" .. nm -- decoded non-table ⇒ corrupt ⇒ UNKNOWN
+        end
+        if obj.item then
           local item, round = parse.splitRoundSuffix(tostring(obj.item))
           reviews[#reviews + 1] = {
             item = obj.item or item,
@@ -205,11 +216,13 @@ end
 -- source (coordinator ruling: NOT a total−reviewing proxy — different dimensions, "numbers must not lie"). consumed.json
 -- is the terminal sealed marker (decision-batch-store); its absence = still awaiting the user's ruling. `names` is the
 -- already-listed dir contents (the caller tracks the listing's unknown status for the context-kv honesty gate).
+-- Returns (count, unknown). existsSafe is THREE-STATE (true/false/nil=probe-fault) and is passed through UNFOLDED, so a
+-- per-batch probe fault propagates as unknown (never `== true`, which would fold a fault to false and hide/invent a batch).
 local function countRulingBatches(names)
   return parse.countUnresolvedBatches(names, function(nm)
-    return existsSafe(DECISION_BATCHES .. "/" .. nm .. "/batch.json") == true
+    return existsSafe(DECISION_BATCHES .. "/" .. nm .. "/batch.json")
   end, function(nm)
-    return existsSafe(DECISION_BATCHES .. "/" .. nm .. "/consumed.json") == true
+    return existsSafe(DECISION_BATCHES .. "/" .. nm .. "/consumed.json")
   end)
 end
 
@@ -221,11 +234,11 @@ end
 local function updateCountsKv(reviews, reviewsUnknown)
   local reviewing = parse.countReviewStates(reviews) -- 在审N
   local dbStatus, dbNames = listDirState(DECISION_BATCHES)
-  local ruling = countRulingBatches(dbNames)         -- 候裁M (unresolved DecisionBatch cards)
+  local ruling, rulingUnknown = countRulingBatches(dbNames) -- 候裁M; rulingUnknown if a per-batch batch.json/consumed.json probe faulted
   local alStatus, alNames = listDirState(ALERTS_DIR)
   local alerts = parse.countJsonFiles(alNames)       -- 告警K
-  if reviewsUnknown or dbStatus == "unknown" or alStatus == "unknown" then
-    return -- a source is unreadable: keep the last-good kv (never flip the context line to false zeros)
+  if reviewsUnknown or dbStatus == "unknown" or rulingUnknown or alStatus == "unknown" then
+    return -- a source is unreadable (list, per-batch probe, or reviews): keep the last-good kv, never flip the context line to false zeros
   end
   pcall(function()
     tern.kv.set("counts", { review = reviewing, ruling = ruling, alerts = alerts, ts = nowTs() })

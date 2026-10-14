@@ -59,6 +59,21 @@ do
   ck("parseReviewQueue parsed round off task name", found)
 end
 
+-- parseReviewQueue MALFORMED (r3 TE-SOURCE-UNKNOWN): a non-table root or a PRESENT-but-wrong-type known field is corrupt
+-- (2nd return true), NOT a legal empty queue; a simply-absent field or an empty table is fine (false).
+do
+  local _, m1 = parse.parseReviewQueue(123, "s")
+  ck("parseReviewQueue: non-table root (123) => malformed", m1 == true)
+  local _, m2 = parse.parseReviewQueue({ active = "not-a-record" }, "s")
+  ck("parseReviewQueue: wrong-type active field => malformed", m2 == true)
+  local _, m3 = parse.parseReviewQueue({ pending = "nope" }, "s")
+  ck("parseReviewQueue: wrong-type pending field => malformed", m3 == true)
+  local rows, m4 = parse.parseReviewQueue({ active = { task = "x-r1", sha = "s" } }, "s")
+  ck("parseReviewQueue: valid => not malformed, 1 row", m4 == false and #rows == 1)
+  local _, m5 = parse.parseReviewQueue({}, "s")
+  ck("parseReviewQueue: empty table => not malformed (legal empty)", m5 == false)
+end
+
 -- parseProgressCycles over a synthetic PROGRESS body
 do
   local text = table.concat({
@@ -239,6 +254,19 @@ do
     parse.countUnresolvedBatches(nil, nil, nil) == 0
       and parse.countUnresolvedBatches({ "batch-z" }, nil, nil) == 0
       and parse.countUnresolvedBatches({ "batch-z" }, function() return true end, nil) == 0)
+end
+
+-- countUnresolvedBatches THREE-STATE (r3 TE-SOURCE-UNKNOWN): a probe returning nil (the existence check faulted) makes
+-- the whole count UNKNOWN (2nd return true) — never folded to false (which would hide/invent a batch).
+do
+  local _, u1 = parse.countUnresolvedBatches({ "batch-a" }, function() return nil end, function() return false end)
+  ck("countUnresolvedBatches: batch.json probe nil => unknown", u1 == true)
+  local _, u2 = parse.countUnresolvedBatches({ "batch-a" }, function() return true end, function() return nil end)
+  ck("countUnresolvedBatches: consumed.json probe nil => unknown", u2 == true)
+  local c3, u3 = parse.countUnresolvedBatches({ "batch-a", "batch-b" }, function() return true end, function() return false end)
+  ck("countUnresolvedBatches: all probes resolved => count=2, unknown=false", c3 == 2 and u3 == false)
+  local _, u4 = parse.countUnresolvedBatches({ "x" }, function() return false end, function() return nil end)
+  ck("countUnresolvedBatches: a non-batch dir never reaches the consumed probe (not unknown)", u4 == false)
 end
 
 -- parseSwarmUrl (A6+route)

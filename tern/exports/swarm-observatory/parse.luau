@@ -59,27 +59,40 @@ end
 
 -- Flatten one reviewer's active-review-queue JSON object (e.g. happycapy-active-review-queue.json) into review rows
 -- {item, sha, seat, round, state}. `seat` is the reviewer seat (derived from the file name by the caller).
+-- Returns (rows, malformed). FC-2: a PRESENT-but-wrong-type known field (pending/active/seat2/completedCurrent), or a
+-- root that is not a table, is a CORRUPT payload — malformed=true — NOT a legal empty queue. The caller must treat
+-- malformed as UNKNOWN (fail / keep last-good), never silently emit an empty list. A simply-absent field is fine.
 function M.parseReviewQueue(obj, seat)
   local out = {}
   if type(obj) ~= "table" then
-    return out
+    return out, true -- root is not a table (e.g. decoded `123`) ⇒ corrupt ⇒ unknown
   end
   seat = seat or ""
+  local malformed = false
+  local function badField(v)
+    return v ~= nil and type(v) ~= "table" -- PRESENT but not a table ⇒ corrupt known field
+  end
   local function add(task, sha, state)
     local item, round = M.splitRoundSuffix(task or "")
     out[#out + 1] = { item = item, sha = sha or "", seat = seat, round = round, state = state }
   end
-  if type(obj.pending) == "table" then
+  if badField(obj.pending) then
+    malformed = true
+  elseif type(obj.pending) == "table" then
     for _, e in ipairs(obj.pending) do
       if type(e) == "table" then
         add(e.task, e.sha, "queued")
       end
     end
   end
-  if type(obj.active) == "table" then
+  if badField(obj.active) then
+    malformed = true
+  elseif type(obj.active) == "table" then
     add(obj.active.task, obj.active.sha, "reviewing")
   end
-  if type(obj.seat2) == "table" then
+  if badField(obj.seat2) then
+    malformed = true
+  elseif type(obj.seat2) == "table" then
     -- seat2 carries sha + status + remain but no task name
     out[#out + 1] = {
       item = "seat2",
@@ -89,10 +102,12 @@ function M.parseReviewQueue(obj, seat)
       state = obj.seat2.status or "in-review",
     }
   end
-  if type(obj.completedCurrent) == "table" then
+  if badField(obj.completedCurrent) then
+    malformed = true
+  elseif type(obj.completedCurrent) == "table" then
     add(obj.completedCurrent.task, obj.completedCurrent.sha, "done")
   end
-  return out
+  return out, malformed
 end
 
 -- Map a herdr `api snapshot` agents[] array into seats {id, title, herdrState, inboxDepth, task}.
@@ -281,17 +296,31 @@ end
 -- consumed.json (the terminal sealed marker); unresolved = has batch.json AND no consumed.json.
 -- Both predicates are INJECTED (real fs.exists in window.luau; fakes in fixtures) so this stays pure+testable. Per the
 -- coordinator ruling this counts REAL awaiting-ruling batches (not a total−reviewing proxy — different dimensions).
+-- Returns (count, unknown). The predicates are THREE-STATE: hasBatchJson(nm)/consumedExists(nm) return true | false |
+-- nil (= the existence probe itself faulted). FC-2: any necessary probe returning nil ⇒ the whole count is UNKNOWN
+-- (unknown=true) — never fold a probe fault to false, which would hide an awaiting-ruling batch (undercount) or invent a
+-- resolved one (overcount). The caller must keep the last-good count when unknown, never overwrite with this value.
 function M.countUnresolvedBatches(names, hasBatchJson, consumedExists)
   if type(names) ~= "table" or type(hasBatchJson) ~= "function" or type(consumedExists) ~= "function" then
-    return 0
+    return 0, false
   end
   local n = 0
   for _, nm in ipairs(names) do
-    if type(nm) == "string" and not nm:find("^%.") and hasBatchJson(nm) and not consumedExists(nm) then
-      n = n + 1
+    if type(nm) == "string" and not nm:find("^%.") then
+      local hb = hasBatchJson(nm)
+      if hb == nil then
+        return 0, true -- cannot tell whether this dir is a batch ⇒ unknown
+      elseif hb then
+        local cj = consumedExists(nm)
+        if cj == nil then
+          return 0, true -- cannot tell whether this batch is resolved ⇒ unknown
+        elseif not cj then
+          n = n + 1
+        end
+      end
     end
   end
-  return n
+  return n, false
 end
 
 -- Parse a swarm:// link (A6+route). Returns:
