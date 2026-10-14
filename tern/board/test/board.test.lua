@@ -230,6 +230,54 @@ do
   ok("TB-FC2: absent sources ⇒ run PROCEEDS (empty is legitimate)", res2.wrote_review == true and res2.counts.Reviewing == 0)
 end
 
+-- ============================ TB-FC2-GATE: the two sealed production mutants must DIE (r7, pure test strengthening) ============================
+-- r6 proved production behaviour correct but left two variants alive at 56/56 (no test drove the REAL caller). These drive the real
+-- callers end-to-end so a revert to EITHER sealed variant flips a check RED — the commit gate the review required.
+do
+  -- GATE a (mutant: default_deps.batches ignores the resolver fault — board-run.luau `if mok == false` → `if false`): a throwaway repo
+  -- with an UNMERGED rehearse-batch-7 + a review-reports signoff whose batch MATCHES but whose SHA field names NO commit (rev-parse exits
+  -- 128 ⇒ the resolver FAULTS). The REAL batches() must return (nil,false) ⇒ run ABORTS ⇒ zero writes + the last good board byte-identical.
+  -- Verified teeth: with the mutant, batches returns a table ⇒ run proceeds ⇒ wrote_review=true ⇒ the board is overwritten.
+  local home = mktemp_dir()
+  assert(os.execute("mkdir -p " .. R.shq(home .. "/Work/review-reports/batch7-dual-signoff-fffffff-seat")))
+  assert(os.execute("mkdir -p " .. R.shq(home .. "/.agenthop/carly")))
+  assert(os.execute("mkdir -p " .. R.shq(home .. "/.agenthop/swarm/board")))
+  local repo = mktemp_dir()
+  local function g(a) assert(os.execute("git -C " .. R.shq(repo) .. " " .. a .. " >/dev/null 2>&1")) end
+  assert(os.execute("git init -q " .. R.shq(repo) .. " >/dev/null 2>&1"))
+  g("symbolic-ref HEAD refs/heads/main"); g("config user.email t@t"); g("config user.name t")
+  g("commit -q --allow-empty -m base")
+  g("checkout -q -b rehearse-batch-7"); g("commit -q --allow-empty -m tip"); g("checkout -q main")
+  local deps = R.default_deps(home, repo)
+  write_file(deps.review_path, "SENTINEL-OLD-BOARD")
+  local res = R.run(deps)
+  ok("TB-FC2-GATE a: REAL batches resolver FAULT (rev-parse 128) ⇒ run aborts + board byte-identical (kills caller-ignore-mok)",
+     res.wrote_review == false and res.error ~= nil and read_file(deps.review_path) == "SENTINEL-OLD-BOARD")
+end
+if NOTROOT then
+  -- GATE b (mutant: list_dir reverts to the r4 stderr-substring classifier): a REAL EACCES path whose TEXT contains "No such file or
+  -- directory". ls's stderr carries that path, so a substring classifier returns 'absent' (⇒ a legitimate source wrongly emptied, Queued
+  -- cards deleted); the open() errno is EACCES(13) ⇒ 'unreadable'. Verified teeth: substring ⇒ 'absent', open()-errno ⇒ 'unreadable'.
+  local base = mktemp_dir()
+  local trap = base .. "/No such file or directory"
+  assert(os.execute("mkdir -p " .. R.shq(trap .. "/inner")))
+  os.execute("chmod 000 " .. R.shq(trap))
+  local _, st = R.list_dir(trap .. "/inner", false)
+  ok("TB-FC2-GATE b1: list_dir on an EACCES path whose text says 'No such file' ⇒ 'unreadable' (kills r4 substring)", st == "unreadable")
+  -- end-to-end: that EACCES source through run() must ABORT and PRESERVE the existing board's Queued cards (never overwrite with empty).
+  local tmp = mktemp_dir()
+  write_file(tmp .. "/review-board.md", "## Queued\n- [ ] deadbeef00000000 · alpha [s1] #review\n")
+  local good = read_file(tmp .. "/review-board.md")
+  local d = fakeDeps(tmp, {}, {}, {}, {})
+  d.list_reviews = function() return R.list_dir(trap .. "/inner", false) end
+  local res = R.run(d)
+  os.execute("chmod 755 " .. R.shq(trap)) -- restore for cleanup
+  ok("TB-FC2-GATE b2: EACCES 'No such file' review source ⇒ run aborts + Queued-card board byte-identical (recovery)",
+     res.wrote_review == false and res.error ~= nil and read_file(tmp .. "/review-board.md") == good)
+else
+  print("skip - TB-FC2-GATE b (root)")
+end
+
 -- ============================ acceptance: real ~/Work/review-reports ============================
 do
   local review_reports = os.getenv("RETRO_REVIEW_REPORTS_DIR") or ((os.getenv("HOME") or "") .. "/Work/review-reports")
