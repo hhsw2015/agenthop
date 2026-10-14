@@ -87,10 +87,14 @@ export function wrapManagedBlock(body: string): string {
  * Our block body neutralizes any marker tokens in data, so a real block can never contain an inner BEGIN/END. Pure.
  */
 export function spliceManagedBlock(existing: string, block: string): string {
-  for (let begin = existing.lastIndexOf(SWARM_BEGIN); begin !== -1; begin = existing.lastIndexOf(SWARM_BEGIN, begin - 1)) {
+  let begin = existing.lastIndexOf(SWARM_BEGIN);
+  while (begin !== -1) {
     const end = existing.indexOf(SWARM_END, begin + SWARM_BEGIN.length);
     if (end !== -1) return existing.slice(0, begin) + block + existing.slice(end + SWARM_END.length);
-    // this BEGIN has no END after it (an orphan / stray BEGIN) ⇒ try an earlier BEGIN
+    // this BEGIN has no END after it (orphan / stray) ⇒ scan to an EARLIER BEGIN. A BEGIN at byte 0 has none earlier — and
+    // lastIndexOf(x, -1) CLAMPS to 0 and would re-find it forever, so stop explicitly (byte-0 orphan BEGIN ⇒ no pairable block).
+    if (begin === 0) break;
+    begin = existing.lastIndexOf(SWARM_BEGIN, begin - 1);
   }
   if (existing === "") return block + "\n";
   const sep = existing.endsWith("\n") ? "\n" : "\n\n";

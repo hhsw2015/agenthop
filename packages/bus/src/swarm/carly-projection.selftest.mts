@@ -206,6 +206,24 @@ const EMPTY: CarlyStatus = { heartbeat: [], alerts: [], digest: null };
   const after3 = read(heartbeatFile(home));
   t("DS-PROJ-MARKER: body update REPLACES old managed content (not appended)", after3.includes("NEW-ASK") && !after3.includes("OLD-ASK") && after3.startsWith("her text <!-- swarm end -->"));
 }
+// ---- DS-PROJ-MARKER r4: a BYTE-0 orphan BEGIN (no END) must RETURN (no infinite loop), preserve her bytes, stay idempotent ----
+{
+  // pure: the minimal reproducer — must return, not hang (lastIndexOf(BEGIN,-1) clamps to 0 ⇒ old loop spun forever).
+  const minimal = SWARM_BEGIN + "\npartial"; // first byte is an orphan BEGIN, whole file has no END
+  const out = spliceManagedBlock(minimal, wrapManagedBlock("X"));
+  t("DS-PROJ-MARKER r4: byte-0 orphan BEGIN ⇒ splice returns (append) + 'partial' kept", out.includes("partial") && out.includes(wrapManagedBlock("X")));
+  // store path: write twice (idempotent) then update body (replace) — all must terminate.
+  const home = tmpHome();
+  mkdirSync(path.dirname(heartbeatFile(home)), { recursive: true });
+  writeFileSync(heartbeatFile(home), minimal);
+  writeManagedFile(heartbeatFile(home), "B1");
+  const a1 = read(heartbeatFile(home));
+  writeManagedFile(heartbeatFile(home), "B1");
+  t("DS-PROJ-MARKER r4: byte-0 orphan BEGIN ⇒ idempotent + her 'partial' preserved", read(heartbeatFile(home)) === a1 && a1.includes("partial") && a1.startsWith(SWARM_BEGIN + "\npartial"));
+  writeManagedFile(heartbeatFile(home), "B2");
+  const a2 = read(heartbeatFile(home));
+  t("DS-PROJ-MARKER r4: byte-0 orphan BEGIN ⇒ body update REPLACES (B2 in, B1 out)", a2.includes("B2") && !a2.includes("B1") && a2.includes("partial"));
+}
 // ---- DS-PROJ-CONFLICT: holder-identity lock — a LIVE/unknown holder HOLDs (never stolen); a DEAD (ESRCH) holder is reclaimed ----
 {
   const home = tmpHome();
