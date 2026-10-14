@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# cpa-stt — speech-to-text via CPA (M2-b, sync /v1/audio/transcriptions, multipart). Prints the transcript text.
+# Usage: cpa-stt <audio-file> [--model id] [--out transcript.txt] [--dry]
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/cpa-common.sh"
+cpa_load
+
+file=""; model="${CPA_DEFAULT_MODEL_STT:-}"; out=""; dry=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) model="${2:-}"; shift 2;;
+    --out) out="${2:-}"; shift 2;;
+    --dry) dry=1; shift;;
+    --) shift;;
+    -*) cpa_die "unknown flag: $1";;
+    *) if [ -z "$file" ]; then file="$1"; else cpa_die "unexpected extra argument: $1"; fi; shift;;
+  esac
+done
+[ -n "$file" ] || cpa_die "usage: cpa-stt <audio-file> [--model id] [--out transcript.txt] [--dry]"
+[ -n "$model" ] || cpa_die "no default model — regenerate cli/cpa-defaults.env or pass --model"
+
+if [ "$dry" = 1 ]; then
+  cpa_dry_header POST /v1/audio/transcriptions
+  echo "[dry-run] Content-Type: multipart/form-data"
+  echo "[dry-run] -F file=@$file -F model=$model"
+  exit 0
+fi
+
+[ -f "$file" ] || cpa_die "audio file not found: $file"
+cpa_require_creds
+resp=$(curl -fsS "$(cpa_base)/v1/audio/transcriptions" -H "Authorization: Bearer $CPA_KEY_CLI" -F "file=@$file" -F "model=$model")
+text=$(printf '%s' "$resp" | cpa_json 'd.get("text","")') || cpa_die "no text in response: $resp"
+if [ -n "$out" ]; then printf '%s\n' "$text" > "$out"; echo "$out"; else printf '%s\n' "$text"; fi

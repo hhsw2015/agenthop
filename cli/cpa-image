@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# cpa-image — text-to-image via CPA (M2-b, sync /v1/images/generations). Downloads the first returned URL to a file.
+# Usage: cpa-image <prompt> [--size 1024x1024] [--n 1] [--model id] [--out path] [--dry]
+set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/cpa-common.sh"
+cpa_load
+
+prompt=""; size="1024x1024"; n="1"; model="${CPA_DEFAULT_MODEL_IMAGE:-}"; out=""; dry=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --size) size="${2:-}"; shift 2;;
+    --n) n="${2:-}"; shift 2;;
+    --model) model="${2:-}"; shift 2;;
+    --out) out="${2:-}"; shift 2;;
+    --dry) dry=1; shift;;
+    --) shift;;
+    -*) cpa_die "unknown flag: $1";;
+    *) if [ -z "$prompt" ]; then prompt="$1"; else prompt="$prompt $1"; fi; shift;;
+  esac
+done
+[ -n "$prompt" ] || cpa_die "usage: cpa-image <prompt> [--size WxH] [--n N] [--model id] [--out path] [--dry]"
+[ -n "$model" ] || cpa_die "no default model — regenerate cli/cpa-defaults.env or pass --model"
+
+body=$(python3 -c 'import json,sys; print(json.dumps({"model":sys.argv[1],"prompt":sys.argv[2],"size":sys.argv[3],"n":int(sys.argv[4])}))' "$model" "$prompt" "$size" "$n")
+
+if [ "$dry" = 1 ]; then
+  cpa_dry_header POST /v1/images/generations
+  echo "[dry-run] Content-Type: application/json"
+  echo "[dry-run] body: $body"
+  exit 0
+fi
+
+cpa_require_creds
+resp=$(curl -fsS "$(cpa_base)/v1/images/generations" -H "Authorization: Bearer $CPA_KEY_CLI" -H "Content-Type: application/json" -d "$body")
+url=$(printf '%s' "$resp" | cpa_json 'd["data"][0]["url"]') || cpa_die "no data[].url in response: $resp"
+[ -n "$out" ] || out="cpa-image-$(date +%Y%m%d-%H%M%S).png"
+curl -fsS "$url" -o "$out"
+echo "$out"
