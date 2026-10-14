@@ -28,14 +28,19 @@ local RUNBOOK_STEPS = { "merge-pool", "regen-presence", "gates", "arch-review", 
 -- ---------------------------------------------------------------------------------------------------------------------------------
 function M.card_id(item, sha, seat)
   item, sha, seat = tostring(item), tostring(sha), tostring(seat)
-  -- LENGTH-PREFIXED encoding (not a separator join): injective even if a field CONTAINS the separator — the length fixes each field's
-  -- boundary, so no two distinct (item,sha,seat) tuples share an encoding. (The VL-1/NUL-join collision lesson, applied here.)
+  -- LENGTH-PREFIXED encoding (not a separator join): the ENCODING is injective even if a field contains the separator (the length fixes
+  -- each field boundary — the VL-1/NUL-join lesson). The id is a 64-bit digest of that encoding — TWO independent lanes (djb2 + FNV-1a),
+  -- so a single-lane collision like 32-bit djb2's "Ab"/"BA" does NOT collide here (TB-ID). It is collision-RESILIENT, not claimed
+  -- provably-injective; the renderer additionally tie-breaks on full identity so output stays byte-stable even under a hypothetical clash.
   local s = string.format("%d:%s%d:%s%d:%s", #item, item, #sha, sha, #seat, seat)
-  local h = 5381
+  local h1 = 5381          -- djb2
+  local h2 = 2166136261    -- FNV-1a offset basis
   for i = 1, #s do
-    h = (h * 33 + string.byte(s, i)) % 4294967296
+    local b = string.byte(s, i)
+    h1 = (h1 * 33 + b) % 4294967296
+    h2 = ((h2 ~ b) * 16777619) % 4294967296
   end
-  return string.format("%08x", h)
+  return string.format("%08x%08x", h1, h2)
 end
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
@@ -57,54 +62,50 @@ local function sha7(s) return string.sub(tostring(s), 1, 7) end
 
 function M.classify(facts, is_ancestor)
   local lanes = { Queued = {}, Reviewing = {}, ["Needs-human"] = {}, Merged = {} }
-  local reviewing_items = {} -- item -> true, so Queued excludes anything already in review
-  local signoff_items = {}   -- item -> true, so Reviewing excludes anything already dual-signed
 
-  -- review-reports/ is an APPEND-ONLY archive (one dir per round per item), so BOTH signoffs and reviews are collapsed to ONE card
-  -- per item = the LATEST round. The caller passes facts.reviews / facts.signoffs newest-first (ls -t), so we keep the FIRST seen per
-  -- item and drop the older rounds — otherwise the board shows every historical round (hundreds), not the current work.
-  local seen_signoff = {}
-  for _, s in ipairs(facts.signoffs or {}) do
-    signoff_items[s.item] = true -- mark for Reviewing-exclusion on EVERY round (even dropped ones), so a re-signed item never also shows Reviewing
-    if not seen_signoff[s.item] then
-      seen_signoff[s.item] = true
-      local merged = is_ancestor(s.sha) == true
-      local card = { id = M.card_id(s.item, s.sha, s.seat), item = s.item, sha = s.sha, seat = s.seat, tag = "review" }
-      if merged then
-        lanes.Merged[#lanes.Merged + 1] = card
-      else
-        lanes["Needs-human"][#lanes["Needs-human"] + 1] = card
+  -- facts.rounds: a UNIFIED newest-first stream of EVERY review-reports dir for the fleet, each tagged kind="review"|"signoff" and
+  -- carrying recent (dir mtime < 7d). review-reports is an append-only archive, so per item the NEWEST round decides the lane — this is
+  -- the correct current-round attribution (TB-ROUND): a NEW review round (new SHA) of an item that was dual-signed on an OLD SHA shows
+  -- as Reviewing again; an old signoff can never swallow a newer round, and a newer round can never be hidden by older history.
+  local decided = {} -- item -> true once its newest round has set its lane (and marks it out of Queued)
+  for _, r in ipairs(facts.rounds or {}) do
+    if not decided[r.item] then
+      decided[r.item] = true
+      local card = { id = M.card_id(r.item, r.sha, r.seat), item = r.item, sha = r.sha, seat = r.seat, tag = "review" }
+      if r.kind == "signoff" then
+        -- NO recency: a dual-signed-but-unmerged item is DEBT, shown however old (coordinator v2). Merged iff its SHA is on main.
+        if is_ancestor(r.sha) == true then
+          lanes.Merged[#lanes.Merged + 1] = card
+        else
+          lanes["Needs-human"][#lanes["Needs-human"] + 1] = card
+        end
+      else -- review: v2 RECENCY — only a recent (<7d) latest round is "reviewing NOW"; a stale latest round drops from the board (the
+        -- item is still `decided`, so it won't fall back to Queued either — it's archived, not pending).
+        if r.recent then
+          lanes.Reviewing[#lanes.Reviewing + 1] = card
+        end
       end
     end
   end
 
-  -- Reviewing from review-report dirs (latest round per item; skip items already dual-signed — they've moved on to NH/Merged). v2
-  -- RECENCY (coordinator ruling): the latest round must be recent (r.recent, = dir mtime < 7d) — review-reports is an append-only
-  -- archive, and a board full of stale rounds loses its "who is reviewing NOW" answer. The LATEST round decides per item (newest-first
-  -- input): if it isn't recent, the item drops from Reviewing entirely (older rounds are even staler). Needs-human gets NO recency
-  -- filter above — a dual-signed-but-unmerged item is DEBT, shown however old.
-  local seen_review = {}
-  for _, r in ipairs(facts.reviews or {}) do
-    reviewing_items[r.item] = true
-    if not signoff_items[r.item] and not seen_review[r.item] then
-      seen_review[r.item] = true -- the latest round for this item is decided here; older rounds are skipped regardless
-      if r.recent then
-        lanes.Reviewing[#lanes.Reviewing + 1] = { id = M.card_id(r.item, r.sha, r.seat), item = r.item, sha = r.sha, seat = r.seat, tag = "review" }
-      end
-    end
-  end
-
-  -- Queued from board granted/claimed with no review dir yet (claimed, not submitted); 'done' items are not queued work
+  -- Queued from board granted/claimed with NO review-reports presence at all (claimed, not yet submitted); 'done' is not queued work.
   for _, b in ipairs(facts.board or {}) do
     local active = (b.state == "granted" or b.state == "claimed")
-    if active and not reviewing_items[b.item] and not signoff_items[b.item] then
+    if active and not decided[b.item] then
       lanes.Queued[#lanes.Queued + 1] = { id = M.card_id(b.item, b.state, b.seat), item = b.item, sha = nil, seat = b.seat, tag = "review" }
     end
   end
 
-  -- deterministic order within a lane (by id) so a full-rewrite is byte-stable regardless of fs listing order
+  -- Deterministic order: by id, then a FULL-IDENTITY tie-break (TB-ID — the id is collision-resilient, not provably unique, so two cards
+  -- that hypothetically share an id still sort stably by (item,sha,seat), keeping the full-rewrite byte-stable regardless of fs order).
+  local function keyf(a, c)
+    if a.id ~= c.id then return a.id < c.id end
+    local ai = (a.item or "") .. "\30" .. (a.sha or "") .. "\30" .. (a.seat or "")
+    local ci = (c.item or "") .. "\30" .. (c.sha or "") .. "\30" .. (c.seat or "")
+    return ai < ci
+  end
   for _, lane in pairs(lanes) do
-    table.sort(lane, function(a, c) return a.id < c.id end)
+    table.sort(lane, keyf)
   end
   return lanes
 end
