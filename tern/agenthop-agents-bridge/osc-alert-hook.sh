@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # agenthop agents-bridge — A3 emitter. A Claude Code hook that signals "needs a human" to the Tern pane via OSC 9;4, so a BARE (non-ACP)
-# claude/codex seat produces the same waiting_input / pane.alert signal an ACP block would. The A2 sentinel reads pane.alert and
+# Claude Code seat produces the same waiting_input / pane.alert signal an ACP block would. The A2 sentinel reads pane.alert and
 # cx.agents reports waiting_input (Carly V6: OSC 9;4;4 -> waiting_input + alert=true; clear with 9;4;0; focus clears it; no OSC leaves
 # it unchanged).
+#
+# SCOPE (review TA-A3-SCOPE): this emitter is delivered for CLAUDE CODE only (events below, config ~/.claude/settings.json). Codex is
+# NOT wired yet — it uses a different event (PermissionRequest; see docs/research/codex-opencode-hooks.md) and config path, and the
+# current hook emits nothing on it. Codex/opencode emitters are TO-VERIFY, not delivered in this batch.
 #
 # Register for Claude Code events (see osc-alert-hook.settings.json):
 #   Notification                      -> OSC 9;4;4 (paused -> needs human)

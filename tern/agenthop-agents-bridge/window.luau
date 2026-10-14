@@ -1,27 +1,20 @@
---!strict
--- agenthop agents-bridge v1 — A1 (production). A THIN window-half shim: it adds NO detection logic of its own; it mirrors Tern's
--- native cx.agents layer to a file-JSON control plane the bash swarm reads/writes, herdr-style. Authoritative wire contract and the
--- claim/recovery semantics live in PROTOCOL.md. A2 (promptless patrol sentinel, registered below via tern.carly.schedule) ships in
--- this same plugin; A3 (OSC 9;4 alert) reader is folded into the A2 sentinel; the emitter is osc-alert-hook.sh.
+-- agenthop agents-bridge v1 — A1 (production). A THIN window-half shim: it mirrors Tern's native cx.agents layer to a file-JSON control
+-- plane the bash swarm reads/writes, herdr-style. Authoritative wire contract + claim/recovery semantics: PROTOCOL.md. A2 (promptless
+-- patrol sentinel, registered via tern.carly.schedule) ships in this same plugin; A3 (OSC 9;4 alert) reader is in the sentinel, emitter
+-- is osc-alert-hook.sh.
 --
--- Claim model (spike r1-r5, PROTOCOL.md §3): execute ONLY after a successful remove-claim; a read failure never deletes the request;
--- this is AT-MOST-ONCE per claim, NOT crash-safe exactly-once (tern.fs exposes no rename/O_EXCL). Recovery is the swarm's job and is
--- op-class-specific: read-only ops may re-issue with a new id; non-idempotent ops HOLD on UNKNOWN (never auto-reissue). Each result
--- echoes its op `class` so the swarm's recovery is self-describing.
---
--- The pure request dispatch (classify + execute + the claim decision) is mirrored by test/claim.test.lua — KEEP THE TWO IN SYNC.
+-- The claim GATE + op classification + sync dispatch live in claim.luau and are REQUIRED here (and loaded by test/claim.test.lua) — ONE
+-- shared source, so a single-line change to the gate changes production and turns the test RED together (review TA-A1-GATE). Claim model:
+-- execute ONLY after a successful remove-claim; a read failure or an empty/partial read never deletes; at-most-once per claim, NOT
+-- crash-safe exactly-once (tern.fs has no rename/O_EXCL). Recovery is the swarm's job, op-class-specific (PROTOCOL.md §3).
+
+local claim = require("./claim")
 
 local HOME = tern.getenv("HOME") or ""
 local CTL = HOME .. "/.agenthop/tern-panes" -- control-plane dir shared with the bash swarm
 local REQ = CTL .. "/requests"
 local RES = CTL .. "/results"
 local POLL_MS = 750 -- status-mirror cadence. POLL_MS only sets the scheduling interval; it does NOT bound a tick's duration.
-
--- op classes (PROTOCOL.md §2.1). Drives the swarm's UNKNOWN-recovery; echoed in each result.
-local READ_ONLY: { [string]: boolean } = { list = true, transcript = true, wait = true }
-local function classOf(op: string): string
-  return READ_ONLY[op] and "read-only" or "non-idempotent"
-end
 
 local function ensure()
   for _, d in { CTL, REQ, RES } do
@@ -31,7 +24,7 @@ local function ensure()
   end
 end
 
--- STATUS mirror: snapshot cx.agents:list() to agents.json. Advisory/overwrite; a torn read self-heals next poll (PROTOCOL.md §1).
+-- STATUS mirror (PROTOCOL.md §1): snapshot cx.agents:list() to agents.json. Advisory/overwrite; a torn read self-heals next poll.
 local ticks = 0
 local function mirror(cx)
   ticks += 1
@@ -45,56 +38,30 @@ local function mirror(cx)
   pcall(function() tern.fs.write(CTL .. "/agents.json", tern.json.encode(payload)) end)
 end
 
-local function answer(id: string, result)
+local function answer(id, result)
   pcall(function() tern.fs.write(RES .. "/" .. id .. ".json", tern.json.encode(result)) end)
 end
 
--- Execute one claimed, decoded request synchronously. `wait` is async (see drain) and never reaches here. Pure over cx.agents;
--- mirrored by test/claim.test.lua. Every op is pcall-guarded so a single failing op cannot throw out of the drain loop.
-local function execute(cx, req): { [string]: any }
-  local op = req.op
-  if op == "list" then
-    return { ok = true, agents = cx.agents:list() }
-  elseif op == "transcript" then
-    local o, t = pcall(function() return cx.agents:transcript(req.agent, { last = req.last }) end)
-    return { ok = o, transcript = o and t or nil, error = (not o) and tostring(t) or nil }
-  elseif op == "ask" then
-    local o, e = pcall(function() cx.agents:ask(req.agent, req.text) end)
-    return { ok = o, error = (not o) and tostring(e) or nil }
-  elseif op == "start" then
-    -- WARNING (PROTOCOL.md §4): start is synchronous and may be long; calling it from this status poll is a known design risk.
-    local o, p = pcall(function()
-      return cx.agents:start({ prompt = req.prompt, cwd = req.cwd, command = req.command, how = req.how })
-    end)
-    return { ok = o, pane = o and p or nil, error = (not o) and tostring(p) or nil }
-  elseif op == "interrupt" then
-    local o, e = pcall(function() cx.agents:interrupt(req.agent) end)
-    return { ok = o, error = (not o) and tostring(e) or nil }
-  elseif op == "stop" then
-    local o, e = pcall(function() cx.agents:stop(req.agent) end)
-    return { ok = o, error = (not o) and tostring(e) or nil }
-  else
-    return { ok = false, error = "unknown op: " .. tostring(op) }
-  end
-end
-
--- CLAIM + DISPATCH. Execution is gated on a SUCCESSFUL remove (the claim), not on a successful read. read-fail => no delete, retried
--- next tick. ENOENT on remove => another VM claimed it; skip. (PROTOCOL.md §3.) Mirrored by test/claim.test.lua.
+-- CLAIM + DISPATCH via the shared claim.luau. The gate (read -> empty-skip -> remove-claim) is claim.claim; op class is claim.classOf;
+-- sync dispatch is claim.execute. `wait` is async and handled here via :next (PROTOCOL.md §2.1).
 local function drain(cx)
   local names = {}
   pcall(function() names = tern.fs.list(REQ) end)
   for _, name in names do
     if name:match("%.json$") then
       local id = (name:gsub("%.json$", ""))
-      local text = ""
-      local okRead = pcall(function() text = tern.fs.read(REQ .. "/" .. name) end)
-      local okClaim = okRead and pcall(function() tern.fs.remove(REQ .. "/" .. name) end)
-      if okClaim then -- we hold the claim: exactly this VM owns the request now
+      local path = REQ .. "/" .. name
+      local claimed, text = claim.claim(
+        function(p) return tern.fs.read(p) end,
+        function(p) tern.fs.remove(p) end,
+        path
+      )
+      if claimed then -- we hold the claim: exactly this VM owns the request now
         local okDec, req = pcall(function() return tern.json.decode(text) end)
         if okDec and type(req) == "table" and type(req.op) == "string" then
-          local class = classOf(req.op)
+          local class = claim.classOf(req.op)
           if req.op == "wait" then
-            -- async: hand to :next so a long idle-wait never stalls the poll (PROTOCOL.md §2.1)
+            -- async: hand to :next so a long idle-wait never stalls the poll
             local okW, aw = pcall(function() return cx.agents:wait(req.agent, { timeout = req.timeout }) end)
             if okW then
               aw:next(function(message, err)
@@ -104,25 +71,22 @@ local function drain(cx)
               answer(id, { ok = false, class = class, error = tostring(aw) })
             end
           else
-            local result = execute(cx, req)
+            local result = claim.execute(cx, req)
             result.class = class
             answer(id, result)
           end
         else
-          answer(id, { ok = false, error = "bad request json" })
+          answer(id, { ok = false, error = "bad request json" }) -- claimed but undecodable: report, do not silently drop
         end
       end
     end
   end
 end
 
--- Poll loop: reschedules via tern.sleep():next() (the documented way a continuation gets a fresh WindowCx). Reschedule is
--- UNCONDITIONAL — a tick with no cx just skips the work. drain is pcall-wrapped so an unexpected throw skips one tick (the request
--- stays for the next) rather than killing the loop. Reload tears down this VM, so no explicit stop flag is needed.
--- A2: register the promptless patrol sentinel (tern.carly.schedule, every 1m, no model turn). The check source lives in sentinel.luau
--- (loaded relative to the plugin dir). Dedup by title across reloads/windows: cancel any prior task with our title, then schedule one
--- fresh (last loader wins — a window-half runs per window, so without this a reload/second window would stack duplicate checks).
--- tern.carly.* needs a SCOPED window callback, so this runs from inside the poll loop (not at top-level load), once.
+-- A2: register the promptless patrol sentinel (tern.carly.schedule, every 1m, no model turn). Check source is sentinel.luau (loaded
+-- relative to the plugin dir). Dedup by title across reloads/windows: cancel any prior task with our title, then schedule one fresh.
+-- tern.carly.* needs a SCOPED window callback, so this runs from inside the poll loop. Returns true only when the arming status was
+-- durably recorded, so a transient failure (e.g. control dir missing) is retried next tick (dedup keeps the retry idempotent) — TA-A2-ARM.
 local PATROL_TITLE = "agenthop tern patrol"
 local function registerSentinel()
   local status = { ts = tern.now(), scheduled = false }
@@ -141,19 +105,25 @@ local function registerSentinel()
       return tern.carly.schedule({ title = PATROL_TITLE, when = "every 1m", check = src })
     end)
     status.scheduled = okSched
-    if okSched then status.id = idOrErr else status.error = tostring(idOrErr) end
+    if okSched then
+      status.id = idOrErr
+    else
+      status.error = tostring(idOrErr)
+    end
   end
-  pcall(function() tern.fs.write(CTL .. "/sentinel.json", tern.json.encode(status)) end)
+  local okWrite = pcall(function() tern.fs.write(CTL .. "/sentinel.json", tern.json.encode(status)) end)
+  return okWrite -- only "armed" once the status is durably recorded (dir now ensured first)
 end
 
 local sentinelArmed = false
 local function step(cx)
   if cx ~= nil then
+    ensure() -- TA-A2-ARM: control dirs exist BEFORE arming, so the sentinel.json write cannot ENOENT on first boot
     if not sentinelArmed then -- A2: arm once, from inside a scoped window callback (tern.carly needs one)
-      sentinelArmed = true
-      pcall(registerSentinel)
+      if registerSentinel() then
+        sentinelArmed = true -- else leave false: retry next tick (dedup-by-title makes the retry safe)
+      end
     end
-    ensure()
     mirror(cx)
     pcall(function() drain(cx) end)
   end

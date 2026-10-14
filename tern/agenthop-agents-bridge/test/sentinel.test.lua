@@ -157,5 +157,68 @@ do
   check_("osc_alert: absent when alert=false", out == nil)
 end
 
+-- a cx whose session:read always throws (body unreadable), but panes metadata is still available
+local function mockCxReadThrows(panes)
+  local session = {}
+  function session:panes() return panes end
+  function session:read(_, _) error("read failed") end
+  return { session = session }
+end
+
+-- TA-A2-READ: a known OSC alert must survive an unreadable body (not be swallowed by the read failure)
+do
+  local check = load_check()
+  resetWrites()
+  local cx = mockCxReadThrows({ { pane = 9, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = true } })
+  local out = check({}, cx, {})
+  check_("TA-A2-READ: osc_alert still fires when body unreadable", type(out) == "string" and out:find("osc_alert@pane9", 1, true) ~= nil)
+  check_("TA-A2-READ: unreadable alert still written", countAlertFiles() == 1)
+end
+
+-- TA-A2-READ: read failure with no alert => quiet (no false alert)
+do
+  local check = load_check()
+  resetWrites()
+  local cx = mockCxReadThrows({ { pane = 10, kind = "agent", program = "omp", cwd = "/w", busy = true, alert = false } })
+  local out = check({}, cx, {})
+  check_("TA-A2-READ: unreadable + no alert => quiet", out == nil and countAlertFiles() == 0)
+end
+
+-- TA-A2-STALL: idle time must NOT count toward the busy stall clock. Idle+unchanged for a long time, then FIRST busy observation must
+-- not immediately report a 3-minute stall; only continuous busy from that point counts.
+do
+  local check = load_check()
+  resetWrites()
+  local state = {}
+  local idlePanes = { { pane = 11, kind = "agent", program = "omp", cwd = "/w", busy = false } }
+  local busyPanes = { { pane = 11, kind = "agent", program = "omp", cwd = "/w", busy = true } }
+  local reads = { [11] = { kind = "agent", lines = { "unchanged tail" } } }
+  NOW = 5000000
+  check({}, mockCx(idlePanes, reads), state) -- idle, unchanged
+  NOW = 5000000 + 10 * 60 * 1000 -- 10 minutes idle pass
+  local out = check({}, mockCx(busyPanes, reads), state) -- first busy observation
+  check_("TA-A2-STALL: idle time does NOT count (no instant stall on first busy)", out == nil)
+  NOW = NOW + 3 * 60 * 1000 + 1 -- now 3 min of CONTINUOUS busy
+  local out2 = check({}, mockCx(busyPanes, reads), state)
+  check_("TA-A2-STALL: stalls after 3 min of continuous busy", type(out2) == "string" and out2:find("stall@pane11", 1, true) ~= nil)
+end
+
+-- TA-A2-STALL: busy -> idle -> busy resets the clock
+do
+  local check = load_check()
+  resetWrites()
+  local state = {}
+  local busyPanes = { { pane = 12, kind = "agent", program = "omp", cwd = "/w", busy = true } }
+  local idlePanes = { { pane = 12, kind = "agent", program = "omp", cwd = "/w", busy = false } }
+  local reads = { [12] = { kind = "agent", lines = { "same tail" } } }
+  NOW = 6000000
+  check({}, mockCx(busyPanes, reads), state) -- busy starts
+  NOW = NOW + 2 * 60 * 1000 -- 2 min busy (not yet stalled)
+  check({}, mockCx(idlePanes, reads), state) -- goes idle => reset
+  NOW = NOW + 2 * 60 * 1000 -- 2 min idle
+  local out = check({}, mockCx(busyPanes, reads), state) -- busy again: clock restarts, not stalled
+  check_("TA-A2-STALL: busy->idle->busy resets the clock", out == nil)
+end
+
 print(string.format("\n%s (%d failure(s))", failures == 0 and "PASS" or "FAIL", failures))
 os.exit(failures == 0 and 0 or 1)

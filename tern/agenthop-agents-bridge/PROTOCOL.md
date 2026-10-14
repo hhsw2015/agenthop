@@ -30,7 +30,22 @@ $HOME/.agenthop/tern-panes/
 
 ## 2. REQUEST / RESPONSE
 
-蜂群写 `requests/<id>.json`:
+### 2.0 发布必须原子(TA-A1-PUBLISH,硬要求)
+
+蜂群**不得**直接 `echo … > requests/<id>.json`:shell 重定向先创建/打开最终路径再写正文,桥在中间窗口会读到空串/半截——旧实现会据此当坏 JSON 认领删除,**合法请求被毁**。发送方必须**原子发布**:先写一个不被桥列举的临时名,写完 `mv` 成最终 `.json`(同目录 rename,POSIX 原子)。Bash 的 `mv` 可用,**不受 tern.fs 无 rename 限制**(限制只在插件 Lua 侧)。
+
+```bash
+D=~/.agenthop/tern-panes; id="q-$$-$(date +%s%N)"   # 唯一 id
+tmp="$D/requests/.$id.tmp"                            # 临时名:点开头,不以 .json 结尾 => 桥不列举
+printf '%s' '{"op":"list"}' > "$tmp"
+mv -f "$tmp" "$D/requests/$id.json"                  # 原子发布;桥只看完成的 .json
+```
+
+桥侧另有兜底:读到空串**不认领**(claim.luau 的门,留待下一轮);但权威修法是发送方原子发布。桥只列举 `*.json`,临时名(`.`开头或非 `.json` 后缀)天然被跳过。
+
+### 2.1 请求 / 应答
+
+蜂群(原子)写 `requests/<id>.json`:
 
 ```json
 {"op":"<name>", ...args}
@@ -43,7 +58,7 @@ $HOME/.agenthop/tern-panes/
 {"ok":false,"error":"<string>"}  // 失败
 ```
 
-### 2.1 Op 表
+### 2.2 Op 表
 
 | op | 类别 | args | 成功 payload | 说明 |
 |---|---|---|---|---|
@@ -115,10 +130,15 @@ tern plugin link <repo>/tern/agenthop-agents-bridge     # 原地用(开发/本�
 - **状态**:`~/.agenthop/tern-panes/sentinel.json` = `{scheduled, id, ts, error?}`(武装信号,可核)。
 - **实证**:真机 schedule id=4,1m check 真跑,对探针 pane("Allow this tool? [y/n]")写出 `permission` 告警(check_ms 2.8ms)。夹具 `test/sentinel.test.lua`(三告警型+stall+reset+not-busy,teeth:清空 perm_pats→RED)。
 - **边界**:`stall` 依赖 `state` 跨 run 持久(TaskSpec 的 state);若调度器不持久 state,stall 退化(其余两型仍在)——生产可改为把 seen 哈希落盘。
+- **读屏故障不吞元数据告警(TA-A2-READ)**:`p.alert`(OSC 来的"需要人")来自 panes 元数据,**不依赖**屏幕正文;正文读失败时仍写 `osc_alert`(带 `unreadable`),其余两型(需正文)该轮跳过。
+- **停滞按连续 busy 计(TA-A2-STALL)**:`stall` 计时起点 = "连续 busy 且尾 hash 未变"的起点;非 busy 即重置,重入 busy 从当次重新计——**idle 时间不计入**。
+- **非计级(明示)**:① 耐久写是**尽力而为**——`alerts/` 写失败不阻塞,返回的 Carly 字符串仍显示(活信号优先于耐久副本);② 哨兵每轮报**当前态**,对持续的 filter/permission/osc_alert **不自去重**(边沿检测留作后续)——**去重/节流契约归蜂群扫描方**,按 `(pane,kind,marker)` 折叠。哨兵 = 传感器,蜂群 = 策略。
 
 ## 8. A3 — OSC 9;4 alert 通道
 
-同插件第三件。给**裸(非 ACP)claude/codex 席**一条"需要人"信号:席位在需要人时发 OSC 9;4,Tern 置 `PaneInfo.alert`(并/或 `state=waiting_input`),A2 哨兵读 `pane.alert` 并入告警流。实证基础 = Carly V6 对照(OSC 9;4;4→alert=true、聚焦即清、无 OSC 不变)。
+同插件第三件。给**裸(非 ACP)席**一条"需要人"信号:席位在需要人时发 OSC 9;4,Tern 置 `PaneInfo.alert`(并/或 `state=waiting_input`),A2 哨兵读 `pane.alert` 并入告警流。实证基础 = Carly V6 对照(OSC 9;4;4→alert=true、聚焦即清、无 OSC 不变)。
+
+> **范围(TA-A3-SCOPE)**:本批**只交付 Claude Code 发端**(下列事件,配置 `~/.claude/settings.json`)。**Codex 未接线**——它用不同事件(`PermissionRequest`,见 `docs/research/codex-opencode-hooks.md`)与配置路径,当前 hook 对它零输出。Codex/opencode 发端**待验**,留后续批次。读端(哨兵读 `pane.alert`)与席位类型无关,任何发 OSC 的程序都通。
 
 - **发端(emitter)**:`osc-alert-hook.sh` = Claude Code hook。
   - `Notification` → `printf '\033]9;4;4;50\007'`(paused→需要人)。

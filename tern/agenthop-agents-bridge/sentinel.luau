@@ -58,10 +58,21 @@ end
 
 -- Pure scan of one pane's tail text into zero or more alert records. Exposed on the returned function (fn.scan) so the fixture can
 -- unit-test detection without a cx; the live path calls it from inside the returned function.
+-- scan one pane. `tail` is the tail text, or nil when the body could not be read this run. Returns (alerts, newSeen). newSeen carries
+-- { hash, busy_since } for stall tracking across runs.
 local function scan_pane(p, tail, now, prev)
+  local alerts = {}
+  -- A3 (metadata, no screen read needed): the OSC 9;4-driven alert flag. Emitted even when the body is UNREADABLE (TA-A2-READ) — a
+  -- known "needs attention" signal must not be swallowed by an unrelated read failure. (Carly V6: OSC 9;4;4 -> alert=true.)
+  if p.alert == true then
+    alerts[#alerts + 1] = { pane = p.pane, kind = "osc_alert", program = p.program, cwd = p.cwd,
+      text = tail and excerpt(tail) or nil, unreadable = (tail == nil) or nil, ts = now }
+  end
+  if tail == nil then
+    return alerts, prev -- body unreadable: keep prior stall state untouched, skip text-based detection this run
+  end
   local low = string.lower(tail)
   local h = hash(tail)
-  local alerts = {}
   local filt = match_any(low, CONFIG.filter_pats)
   if filt then
     alerts[#alerts + 1] = { pane = p.pane, kind = "content_filter", marker = filt, program = p.program, cwd = p.cwd, text = excerpt(tail), ts = now }
@@ -70,21 +81,20 @@ local function scan_pane(p, tail, now, prev)
   if perm then
     alerts[#alerts + 1] = { pane = p.pane, kind = "permission", marker = perm, program = p.program, cwd = p.cwd, text = excerpt(tail), ts = now }
   end
-  -- A3: the OSC 9;4-driven alert flag. A seat wrapper / CC hook emits OSC 9;4;4 when it "needs a human"; Tern sets PaneInfo.alert,
-  -- which we fold into this same stream (Carly V6: OSC -> alert=true, focus clears, no OSC leaves it unchanged). This gives non-ACP
-  -- seats a "needs attention" signal without the model and without screen-text heuristics.
-  if p.alert == true then
-    alerts[#alerts + 1] = { pane = p.pane, kind = "osc_alert", program = p.program, cwd = p.cwd, text = excerpt(tail), ts = now }
-  end
-  -- stall: hash unchanged since a prior run AND still busy for >= stall_ms
-  local since = now
-  if prev ~= nil and prev.hash == h then
-    since = prev.since
-    if p.busy == true and (now - since) >= CONFIG.stall_ms then
-      alerts[#alerts + 1] = { pane = p.pane, kind = "stall", program = p.program, cwd = p.cwd, text = excerpt(tail), ts = now, stalled_ms = now - since }
+  -- stall: CONTINUOUS busy AND unchanged tail-hash for >= stall_ms. busy_since marks when the current unbroken busy+unchanged run
+  -- began; idle time never counts (TA-A2-STALL). Not busy, or content changed, (re)starts the clock.
+  local busy_since = nil
+  if p.busy == true then
+    if prev ~= nil and prev.hash == h and prev.busy_since ~= nil then
+      busy_since = prev.busy_since
+    else
+      busy_since = now
+    end
+    if (now - busy_since) >= CONFIG.stall_ms then
+      alerts[#alerts + 1] = { pane = p.pane, kind = "stall", program = p.program, cwd = p.cwd, text = excerpt(tail), ts = now, stalled_ms = now - busy_since }
     end
   end
-  return alerts, { hash = h, since = since }
+  return alerts, { hash = h, busy_since = busy_since }
 end
 
 local check = function(ev, cx, state)
@@ -92,7 +102,7 @@ local check = function(ev, cx, state)
   local now = t0
   local home = tern.getenv("HOME") or ""
   local alerts_dir = home .. "/.agenthop/carly/alerts"
-  state.seen = state.seen or {} -- pane -> { hash, since } ; persists across runs for stall tracking
+  state.seen = state.seen or {} -- pane -> { hash, busy_since } ; persists across runs for stall tracking
 
   local okP, panes = pcall(function() return cx.session:panes() end)
   if not okP or type(panes) ~= "table" then
@@ -102,16 +112,18 @@ local check = function(ev, cx, state)
   local all = {}
   for _, p in ipairs(panes) do
     if is_agent_pane(p) then
+      -- read the body for text-based detection; on failure tail stays nil and scan_pane still handles the metadata alert (TA-A2-READ)
+      local tail = nil
       local okR, read = pcall(function()
         return cx.session:read(p.pane, { as = "table", lines = CONFIG.tail_lines, scrollback = true })
       end)
       if okR and type(read) == "table" and type(read.lines) == "table" then
-        local tail = tail_join(read.lines, CONFIG.tail_lines)
-        local alerts, seen = scan_pane(p, tail, now, state.seen[p.pane])
-        state.seen[p.pane] = seen
-        for _, a in ipairs(alerts) do
-          all[#all + 1] = a
-        end
+        tail = tail_join(read.lines, CONFIG.tail_lines)
+      end
+      local alerts, seen = scan_pane(p, tail, now, state.seen[p.pane])
+      state.seen[p.pane] = seen
+      for _, a in ipairs(alerts) do
+        all[#all + 1] = a
       end
     end
   end

@@ -29,11 +29,15 @@ Full wire contract + claim/recovery semantics: **[PROTOCOL.md](PROTOCOL.md)** (a
 
 ```bash
 D=~/.agenthop/tern-panes
-echo '{"op":"list"}' > "$D/requests/q1.json"
+id="q-$$-$(date +%s%N)"                       # unique id
+# ATOMIC publish: write a temp name the bridge does not list, then mv it into place (see PROTOCOL.md §2.0).
+# Do NOT `echo > requests/$id.json` directly — the bridge can read the half-written file and destroy the request.
+printf '%s' '{"op":"list"}' > "$D/requests/.$id.tmp"
+mv -f "$D/requests/.$id.tmp" "$D/requests/$id.json"
 # poll for the reply, then consume it
-until [ -f "$D/results/q1.json" ]; do sleep 0.2; done
-jq . "$D/results/q1.json"        # {"ok":true,"class":"read-only","agents":[...]}
-rm -f "$D/results/q1.json"
+until [ -f "$D/results/$id.json" ]; do sleep 0.2; done
+jq . "$D/results/$id.json"        # {"ok":true,"class":"read-only","agents":[...]}
+rm -f "$D/results/$id.json"
 ```
 
 ### Ops
@@ -57,10 +61,13 @@ string shown directly by Carly. Each run self-times (`check_ms`). Arming status:
 
 ## A3 — OSC 9;4 alert channel
 
-Gives a **bare (non-ACP) claude/codex seat** a "needs-human" signal. `osc-alert-hook.sh` (a Claude Code hook) emits OSC 9;4;4 on
+Gives a **bare (non-ACP) Claude Code seat** a "needs-human" signal. `osc-alert-hook.sh` (a Claude Code hook) emits OSC 9;4;4 on
 `Notification` (and clears on `Stop`/`UserPromptSubmit`) to the pane's PTY (`/dev/tty`); Tern sets `pane.alert`, which the A2 sentinel
 folds in as an `osc_alert`. Only emits inside a Tern pane (no-op elsewhere, so it's safe on every seat). Register via
 `osc-alert-hook.settings.json`. Empirical basis: Carly V6 (OSC 9;4;4 → alert=true, focus clears). See [PROTOCOL.md §8](PROTOCOL.md).
+
+**Scope:** this emitter is delivered for **Claude Code only**. Codex is not wired yet (different event `PermissionRequest` + config
+path; see `docs/research/codex-opencode-hooks.md`) — the Codex/opencode emitter is **to-verify**, tracked for a later batch.
 
 For ACP-block seats (the migration main path) `waiting_input` + the permission surface come for free; the OSC channel is the
 second-best signal for bare TUI seats.
