@@ -69,9 +69,15 @@ remove_alert() {
 cur="$(read_state)"
 
 if [ "$probe" -eq 0 ]; then
+  # An unreadable state carrier on the recovery path cannot be confirmed reset — reporting "up + clean" (exit 0) while the streak is an
+  # unknown stale value is exactly the bug (next failure would re-alert at one strike). Preserve everything, report incomplete. "0 =
+  # up+clean" and "NA, not-reset, still exit 0" must not both hold.
+  if [ "$cur" = "NA" ]; then
+    exit 3
+  fi
   ok=0
   remove_alert || ok=1                                   # idempotent cleanup, NOT gated on the count (fix a)
-  if [ "$cur" != "NA" ] && [ "$cur" != "0" ]; then       # reset only a readable non-zero streak; NA carrier stays untouched (fix b)
+  if [ "$cur" != "0" ]; then                             # reset a readable non-zero streak
     write_state 0 || ok=1
   fi
   [ "$ok" -eq 0 ] && exit 0 || exit 3                     # a failed removal/reset => recovery incomplete, not a silent success

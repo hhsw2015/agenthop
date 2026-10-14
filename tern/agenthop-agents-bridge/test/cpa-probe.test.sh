@@ -85,5 +85,32 @@ ck "temp-own: no leftover temp files" "0" "$(find "$L0" -maxdepth 1 -name '.cpa-
 ck "temp-own: write succeeded (alert at 3-strike)" "1" "$(alert "$L0")"
 rm -rf "$L0"
 
+# --- A2-CPA-STATE close-out: NA state on the RECOVERY path must NOT report up+clean; it preserves everything and reports incomplete ---
+L0="$(newL0)"; mkdir -p "$L0/alerts"; printf '3' >"$L0/cpa-probe.state"; printf '{"kind":"cpa_down"}' >"$L0/alerts/cpa_down.json"
+chmod 000 "$L0/cpa-probe.state"
+rc=$(up "$L0")
+ck "NA-recovery: exit 3 (not a silent up+clean)" "3" "$rc"
+ck "NA-recovery: alert NOT removed (recovery unconfirmed)" "1" "$(alert "$L0")"
+chmod 600 "$L0/cpa-probe.state"
+ck "NA-recovery: count preserved (still 3, not laundered)" "3" "$(streak "$L0")"
+# once readable, a real recovery completes: reset + clear + exit 0
+rc=$(up "$L0"); ck "post-NA recovery (readable): exit 0" "0" "$rc"; ck "post-NA recovery: alert cleared" "0" "$(alert "$L0")"; ck "post-NA recovery: streak 0" "0" "$(streak "$L0")"
+# and the 3-strike is intact afterward (no re-alert at one strike)
+down "$L0" >/dev/null; ck "post-NA recovery: single fail does NOT re-alert" "0" "$(alert "$L0")"
+rm -rf "$L0"
+
+# --- A2-CPA-TEMP-OWN-GATE: deterministic same-PID collision. A wrapper plants a symlink at the r3 fixed-name temp ($state.$PID.tmp),
+# then EXECs cpa-probe (same PID). A fixed-name + bare-redirect writer would follow it and clobber the victim; mktemp (r4) ignores it. ---
+L0="$(newL0)"; mkdir -p "$L0/alerts"; printf 'SAFE' >"$L0/victim"
+cat >"$L0/wrap.sh" <<WRAP
+#!/usr/bin/env bash
+ln -s "$L0/victim" "$L0/cpa-probe.state.\$\$.tmp" 2>/dev/null
+exec env AGENTHOP_CPA_PROBE=false bash "$PROBE" "$L0"
+WRAP
+chmod +x "$L0/wrap.sh"
+bash "$L0/wrap.sh" >/dev/null 2>&1
+ck "temp-own GATE: victim not clobbered via same-PID fixed-name temp" "SAFE" "$(cat "$L0/victim")"
+rm -rf "$L0"
+
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
