@@ -12,8 +12,19 @@ id="q-$$-$(date +%s%N)"
 tmp="$dir/requests/.$id.tmp"   # dot-prefixed, not *.json => the bridge never lists it
 final="$dir/requests/$id.json"
 
-# The write is the precondition: only on a fully successful write do we rename. On failure, remove the temp and fail without a final.
-if printf '%s' "$json" >"$tmp"; then
+# The write. A test may set AGENTHOP_PUBLISH_WRITE to a command run as `$cmd <tmp> <json>` to inject a failure — including the nasty
+# one where the temp already holds a partial prefix and the write THEN fails — so the gate below is proven to reject it. Defaults to the
+# real write. The write's exit status is the precondition for the rename.
+write_json() {
+  if [ -n "${AGENTHOP_PUBLISH_WRITE:-}" ]; then
+    "$AGENTHOP_PUBLISH_WRITE" "$tmp" "$json"
+  else
+    printf '%s' "$json" >"$tmp"
+  fi
+}
+
+# Only on a fully successful write do we rename. On any write failure (even with a partial temp) remove the temp and fail — no final.
+if write_json; then
   if mv -f "$tmp" "$final"; then
     printf '%s\n' "$id"
   else

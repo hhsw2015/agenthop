@@ -26,6 +26,19 @@ ck "write-fail: nonzero exit" "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)"
 ck "write-fail: NO final .json published" "0" "$(count_json)"
 ck "write-fail: no leftover temp" "0" "$(count_tmp)"
 
+# 3) partial-then-fail (TA-A1-PUBLISH-GATE): the temp IS created with a partial prefix, THEN the write returns nonzero. The rename must
+# still NOT run. This kills the `write || true` mutant (chmod000 alone can't, because there the temp is never created). Writable dir.
+cat > "$root/badwriter.sh" <<'W'
+#!/usr/bin/env bash
+printf '%s' '{"op":' > "$1"   # temp now holds a partial prefix
+exit 1                         # ...and the write "fails"
+W
+chmod +x "$root/badwriter.sh"
+AGENTHOP_PUBLISH_WRITE="$root/badwriter.sh" bash "$PUB" "$root" '{"op":"ask"}' >/dev/null 2>&1; rc=$?
+ck "partial-then-fail: nonzero exit" "1" "$([ "$rc" -ne 0 ] && echo 1 || echo 0)"
+ck "partial-then-fail: NO final .json (partial temp not renamed)" "0" "$(count_json)"
+ck "partial-then-fail: no leftover temp" "0" "$(count_tmp)"
+
 rm -rf "$root"
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
