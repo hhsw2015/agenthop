@@ -112,5 +112,44 @@ bash "$L0/wrap.sh" >/dev/null 2>&1
 ck "temp-own GATE: victim not clobbered via same-PID fixed-name temp" "SAFE" "$(cat "$L0/victim")"
 rm -rf "$L0"
 
+# --- A2-CPA-STATE ① ancestor EACCES: L0 dir itself unreadable => NA (not laundered to 0 by a boolean -e); recovery reports incomplete ---
+L0="$(newL0)"; mkdir -p "$L0/alerts"; printf '3' >"$L0/cpa-probe.state"; printf '{"kind":"cpa_down"}' >"$L0/alerts/cpa_down.json"
+chmod 000 "$L0"
+rc=$(up "$L0")
+chmod 700 "$L0"
+ck "L0-000 recovery: exit 3 (ancestor EACCES not laundered to up+clean)" "3" "$rc"
+ck "L0-000 recovery: alert preserved" "1" "$(alert "$L0")"
+ck "L0-000 recovery: count untouched" "3" "$(streak "$L0")"
+rm -rf "$L0"
+
+# --- A2-CPA-STATE ① ancestor EACCES on the DOWN path: L0 dir 000 => read_cur must be NA (exit 2), not laundered to 0 and advanced ---
+# (isolates read_cur's ancestor classification; the recovery case above is also caught by remove_alert, this one is not)
+L0="$(newL0)"; mkdir -p "$L0/alerts"; printf '2' >"$L0/cpa-probe.state"
+chmod 000 "$L0"
+rc=$(down "$L0")
+chmod 700 "$L0"
+ck "L0-000 down: exit 2 (ancestor EACCES => NA, not advanced)" "2" "$rc"
+ck "L0-000 down: count not advanced (still 2)" "2" "$(streak "$L0")"
+rm -rf "$L0"
+
+# --- A2-CPA-STATE ② ancestor EACCES: alerts parent dir unreadable => remove_alert reports incomplete, not a silent clean ---
+L0="$(newL0)"; mkdir -p "$L0/alerts"; printf '0' >"$L0/cpa-probe.state"; printf '{"kind":"cpa_down"}' >"$L0/alerts/cpa_down.json"
+chmod 000 "$L0/alerts"
+rc=$(up "$L0")
+chmod 700 "$L0/alerts"
+ck "alerts-000 recovery: exit 3 (cleanup incomplete, not silent)" "3" "$rc"
+ck "alerts-000 recovery: alert NOT silently cleared" "1" "$(alert "$L0")"
+rm -rf "$L0"
+
+# --- A2-CPA-STATE ③ order: persist ZERO before clearing the alert — a failed persist must leave the alert (not clear-then-fail) ---
+L0="$(newL0)"; mkdir -p "$L0/alerts"; printf '3' >"$L0/cpa-probe.state"; printf '{"kind":"cpa_down"}' >"$L0/alerts/cpa_down.json"
+chmod 500 "$L0"
+rc=$(up "$L0")
+chmod 700 "$L0"
+ck "persist-first order: exit 3 (write-zero failed)" "3" "$rc"
+ck "persist-first order: alert NOT cleared before a confirmed zero" "1" "$(alert "$L0")"
+ck "persist-first order: count still 3 (not reset)" "3" "$(streak "$L0")"
+rm -rf "$L0"
+
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
