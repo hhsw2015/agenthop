@@ -45,9 +45,13 @@ t "cpa-image with no prompt errors" "! cli/cpa-image"
 t "cpa-image unknown flag errors" "! cli/cpa-image x --bogus"
 t "cpa-stt real call on missing creds fails closed (no --dry)" "! CPA_KEYS_ENV=/dev/null cli/cpa-stt /tmp/a.wav"
 
+# ── CPA-IMAGE-DEFAULT-DOC gate (r5): generated default-size doc == defaults.env, and follows an alias change ──────────
+echo "--- size-doc gate (scripts/check-size-doc.py) ---"
+if python3 scripts/check-size-doc.py; then echo "ok  size-doc gate"; pass=$((pass+1)); else echo "FAIL size-doc gate"; fail=$((fail+1)); fi
+
 # ── real CLI behavior (loopback HTTP) — the r2 review fixes (args/stt-schema/stt-path/image-redirect) ─────────────────
 echo "--- loopback integration (scripts/cli-loopback.test.py) ---"
-if python3 scripts/cli-loopback.test.py; then echo "ok  loopback integration suite"; pass=$((pass+1)); else echo "FAIL loopback integration suite"; fail=$((fail+1)); fi
+if python3 scripts/cli-loopback.test.py; then echo "ok  loopback integration suite"; pass=$((pass+1)); else echo "FAIL loopback integration suite"; fi
 
 echo
 echo "PASS=$pass FAIL=$fail"

@@ -78,16 +78,25 @@ def resolve_model(aliases: dict, spec: dict) -> str:
     return str(media[key]["id"])
 
 
-def md_params_table(params: list) -> str:
+# Param defaults that are RESOLVED from the single source (frontier-aliases) rather than the static spec: the flag name →
+# the resolved-value key. The generator overrides the spec's static default with the resolved value so the rendered doc can
+# never drift from what the CLI actually uses (CPA-IMAGE-DEFAULT-DOC fix).
+RESOLVED_PARAM = {"--size": "size", "--voice": "voice"}
+
+
+def md_params_table(params: list, resolved: dict) -> str:
     rows = ["| param | required | default | description |", "|---|---|---|---|"]
     for p in params:
-        rows.append(f"| `{p['name']}` | {'yes' if p.get('required') else 'no'} | {p.get('default', '—')} | {p.get('desc', '')} |")
+        key = RESOLVED_PARAM.get(p["name"])
+        default = resolved[key] if key and resolved.get(key) else p.get("default", "—")
+        rows.append(f"| `{p['name']}` | {'yes' if p.get('required') else 'no'} | {default} | {p.get('desc', '')} |")
     return "\n".join(rows)
 
 
-def gen_skill_md(spec: dict, prose: str, model: str, generated: str) -> str:
+def gen_skill_md(spec: dict, prose: str, model: str, generated: str, resolved: dict) -> str:
     cli = spec["cli"]
     gotchas = "".join(f"- {g}\n" for g in spec.get("gotchas", []))
+    size_line = f"- **Default size**: `{resolved['size']}` (resolved from frontier-aliases.json, generated {generated}; override with `--size`).\n" if resolved.get("size") else ""
     fm = (
         "---\n"
         f"name: {spec['skill_name']}\n"
@@ -102,19 +111,20 @@ def gen_skill_md(spec: dict, prose: str, model: str, generated: str) -> str:
         f"Swarm-seat skin for CPA **{spec['domain']}**. It invokes the hand-written CLI wrapper, which calls CPA's "
         f"`{spec['method']} {{CPA}}{spec['endpoint']}` ({spec['mode']}).\n\n"
         f"- **Default model**: `{model}` (resolved from frontier-aliases.json, generated {generated}; override with `--model`).\n"
+        f"{size_line}"
         f"- **Key**: the CLI reads `CPA_KEY_CLI` + `CPA_BASE_URL` from `~/.agenthop/cpa/keys.env` (0600). The key NEVER appears here.\n\n"
         f"## Invoke\n\n"
         f"```sh\n"
         f"cli/{cli} {spec.get('argument_hint', '')}\n"
         f"```\n\n"
-        f"## Parameters\n\n{md_params_table(spec['params'])}\n\n"
+        f"## Parameters\n\n{md_params_table(spec['params'], resolved)}\n\n"
         f"## Gotchas\n\n{gotchas}\n"
         f"{prose}\n"
     )
     return fm + body
 
 
-def gen_luau(spec: dict, model: str, generated: str) -> str:
+def gen_luau(spec: dict, model: str, generated: str, resolved: dict) -> str:
     cli = spec["cli"]
     # the positional (required param with no leading --) and the --flag params
     positional = next((p["name"] for p in spec["params"] if not p["name"].startswith("--")), "arg")
@@ -123,10 +133,12 @@ def gen_luau(spec: dict, model: str, generated: str) -> str:
         f'  if opts.{f} ~= nil then argv[#argv + 1] = "--{f}"; argv[#argv + 1] = tostring(opts.{f}) end\n'
         for f in flags
     )
+    size_line = f"-- Default size: {resolved['size']} (resolved from frontier-aliases.json; pass opts.size to override).\n" if resolved.get("size") else ""
     return (
         f"-- cpa-{spec['domain']} — Carly snippet (GENERATED from skills-src/{spec['domain']}.md; DO NOT EDIT HERE).\n"
         f"-- Returns a function that runs the hand-written cli/{cli} wrapper via tern.process.run and awaits the result.\n"
         f"-- Default model: {model} (resolved from frontier-aliases.json, generated {generated}; pass opts.model to override).\n"
+        f"{size_line}"
         f"-- CARLY SNIPPET CACHE: Carly caches snippet modules per VM — an edit here is picked up only on a VM RESET\n"
         f"-- (reload). After re-running the generator (e.g. a new strongest model), RESET the VM to refresh this snippet.\n"
         f"-- The CPA key never appears here; the CLI reads CPA_KEY_CLI from ~/.agenthop/cpa/keys.env.\n"
@@ -159,13 +171,15 @@ def main() -> None:
         media_entry = aliases.get("media", {}).get(spec["default_model_key"], {})
         if isinstance(media_entry, dict) and media_entry.get("size"):
             sizes[domain] = str(media_entry["size"])  # model-specific default size (e.g. doubao-seedream-5.0 ⇒ 2048x2048)
+        # resolved defaults that drive BOTH skins' docs (so the rendered default can never drift from the CLI/defaults.env)
+        resolved = {"size": sizes.get(domain), "voice": voices.get(domain)}
         # SKILL.md
         skill_dir = SKILLS_DIR / spec["cli"]
         skill_dir.mkdir(parents=True, exist_ok=True)
-        (skill_dir / "SKILL.md").write_text(gen_skill_md(spec, prose, model, generated), encoding="utf-8")
+        (skill_dir / "SKILL.md").write_text(gen_skill_md(spec, prose, model, generated, resolved), encoding="utf-8")
         # luau snippet
         SNIPPETS_DIR.mkdir(parents=True, exist_ok=True)
-        (SNIPPETS_DIR / f"{spec['cli']}.luau").write_text(gen_luau(spec, model, generated), encoding="utf-8")
+        (SNIPPETS_DIR / f"{spec['cli']}.luau").write_text(gen_luau(spec, model, generated, resolved), encoding="utf-8")
 
     # cli/cpa-defaults.env — generated bridge from frontier-aliases to the hand-written CLIs (deterministic, sorted).
     CLI_DIR.mkdir(parents=True, exist_ok=True)

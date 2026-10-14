@@ -18,7 +18,7 @@ at generation time, so each `cpa regen` + re-gen refreshes the strongest id. Edi
   "default_model_key": "Image generation",
   "params": [
     {"name": "prompt", "required": true, "desc": "the image description (positional)"},
-    {"name": "--size", "required": false, "default": "1024x1024", "desc": "WxH, e.g. 1024x1024"},
+    {"name": "--size", "required": false, "default": "(model config)", "desc": "WxH, e.g. 1024x1024; default is the model-config size from frontier-aliases"},
     {"name": "--n", "required": false, "default": "1", "desc": "number of images"},
     {"name": "--model", "required": false, "desc": "override the default model id"},
     {"name": "--out", "required": false, "desc": "output file path (default: cwd timestamped .png)"}
@@ -41,7 +41,7 @@ the response carries `data[].url`). The CLI downloads the first returned URL to 
 ```
 POST {CPA}/v1/images/generations
 Authorization: Bearer <CPA_KEY_CLI>
-{ "model": "<default from frontier-aliases>", "prompt": "<prompt>", "size": "1024x1024", "n": 1 }
+{ "model": "<default from frontier-aliases>", "prompt": "<prompt>", "size": "<model-config default>", "n": 1 }
 → { "data": [ { "url": "https://…" } ] }
 ```
 

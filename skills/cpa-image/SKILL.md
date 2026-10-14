@@ -12,6 +12,7 @@ allowed-tools: [Bash, Read]
 Swarm-seat skin for CPA **image**. It invokes the hand-written CLI wrapper, which calls CPA's `POST {CPA}/v1/images/generations` (sync).
 
 - **Default model**: `doubao-seedream-5.0` (resolved from frontier-aliases.json, generated 2026-10-14; override with `--model`).
+- **Default size**: `2048x2048` (resolved from frontier-aliases.json, generated 2026-10-14; override with `--size`).
 - **Key**: the CLI reads `CPA_KEY_CLI` + `CPA_BASE_URL` from `~/.agenthop/cpa/keys.env` (0600). The key NEVER appears here.
 
 ## Invoke
@@ -25,7 +26,7 @@ cli/cpa-image <image prompt> [--size 1024x1024] [--n 1] [--model <id>] [--out <p
 | param | required | default | description |
 |---|---|---|---|
 | `prompt` | yes | — | the image description (positional) |
-| `--size` | no | 1024x1024 | WxH, e.g. 1024x1024 |
+| `--size` | no | 2048x2048 | WxH, e.g. 1024x1024; default is the model-config size from frontier-aliases |
 | `--n` | no | 1 | number of images |
 | `--model` | no | — | override the default model id |
 | `--out` | no | — | output file path (default: cwd timestamped .png) |
@@ -46,7 +47,7 @@ the response carries `data[].url`). The CLI downloads the first returned URL to 
 ```
 POST {CPA}/v1/images/generations
 Authorization: Bearer <CPA_KEY_CLI>
-{ "model": "<default from frontier-aliases>", "prompt": "<prompt>", "size": "1024x1024", "n": 1 }
+{ "model": "<default from frontier-aliases>", "prompt": "<prompt>", "size": "<model-config default>", "n": 1 }
 → { "data": [ { "url": "https://…" } ] }
 ```
 
