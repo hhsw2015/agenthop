@@ -56,3 +56,21 @@
 3. 席位状态走 Tern 语义层(cx.agents/alert/OSC),读屏仅兜底;
 4. 蜂群动作可从 Tern 侧发起且全部走正门(swarm_send/呈批,R16 编进函数签名)。
 每批交付以此四条自检;全四条达成=tern 线完工。
+
+## F. 四层架构(user 定形 2026-10-14)
+
+```
+第四层  user(唯一授权源)
+第三层  Carly = 对话官(答/传/提醒/递签 + 项目总机)
+第二层  Tern 原语层 = 共享手脚(board/canvas/db/agents/alert/schedule),无自有状态
+第一层  蜂群 = 脑子+账本(durable 真理源)
+```
+底线标尺: 每层可独立死掉(Tern 挂→herdr 续;Carly 挂→user 直说;蜂群挂→fleet-recovery)。接缝全部单向、可断、可替。
+
+## G. 对话官项目总机(user 新增职责 2026-10-14)
+
+对话官第五职责=**项目总机(switchboard)**: user 说「继续做 X 项目」→她查项目注册表→发现该项目协调者不在→**唤起协调者**(仅此一个动作)→协调者自己跑 fleet-recovery 带回全体成员→持续推进。
+- 注册表: ~/.agenthop/projects.json(项目名→{repo,coordinator-sid,resumeCmd,fleet-snapshot 路径});蜂群维护,她只读。
+- 她的动作边界: **只唤协调者,绝不直接唤成员/派活**——恢复编制是协调者职权(fleet-recovery 双声件),她碰成员=越层。
+- 唤起方式: herdr/tern 开一个 pane 跑注册表里的 resumeCmd(她有 process/run 能力),或经 swarm-carly-send 给已活协调者投「user 令继续 X」。
+- 多项目并行: 每项目一个协调者 sid+独立 durable 根;她的注册表是唯一跨项目视图——对话官是跨项目的,协调者是单项目的。
