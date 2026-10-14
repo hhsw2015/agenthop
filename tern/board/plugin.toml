@@ -1,0 +1,5 @@
+schema = 1
+id = "agenthop-board"
+name = "Agenthop Review/Runbook Board"
+version = "1.0.0"
+description = "Line ① A4/A5: a one-way PROJECTION generator (durable swarm facts -> two Carly Markdown boards). NOT a tern.carly plugin — it runs under standalone lua (needs git merge-base + mtime, which sandboxed tern.fs lacks); Tern/Carly only VIEWS the produced md. Board is never a source of truth; no reverse sync (v1). See README.md + docs/swarm/tern-batch2-contracts.md §1."
