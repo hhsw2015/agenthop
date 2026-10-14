@@ -6,16 +6,17 @@ set -euo pipefail
 cpa_load
 
 prompt=""; size="1024x1024"; n="1"; model="${CPA_DEFAULT_MODEL_IMAGE:-}"; out=""; dry=0
+add_word() { if [ -z "$prompt" ]; then prompt="$1"; else prompt="$prompt $1"; fi; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --size) size="${2:-}"; shift 2;;
-    --n) n="${2:-}"; shift 2;;
-    --model) model="${2:-}"; shift 2;;
-    --out) out="${2:-}"; shift 2;;
-    --dry) dry=1; shift;;
-    --) shift;;
-    -*) cpa_die "unknown flag: $1";;
-    *) if [ -z "$prompt" ]; then prompt="$1"; else prompt="$prompt $1"; fi; shift;;
+    --size)  size="$(opt_val "${2:-}")"  || cpa_die "--size needs a value";  shift 2;;
+    --n)     n="$(opt_val "${2:-}")"     || cpa_die "--n needs a value";     shift 2;;
+    --model) model="$(opt_val "${2:-}")" || cpa_die "--model needs a value"; shift 2;;
+    --out)   out="$(opt_val "${2:-}")"   || cpa_die "--out needs a value";   shift 2;;
+    --dry)   dry=1; shift;;
+    --)      shift; while [ $# -gt 0 ]; do add_word "$1"; shift; done; break;;
+    -*)      cpa_die "unknown flag: $1";;
+    *)       add_word "$1"; shift;;
   esac
 done
 [ -n "$prompt" ] || cpa_die "usage: cpa-image <prompt> [--size WxH] [--n N] [--model id] [--out path] [--dry]"
@@ -34,5 +35,8 @@ cpa_require_creds
 resp=$(curl -fsS "$(cpa_base)/v1/images/generations" -H "Authorization: Bearer $CPA_KEY_CLI" -H "Content-Type: application/json" -d "$body")
 url=$(printf '%s' "$resp" | cpa_json 'd["data"][0]["url"]') || cpa_die "no data[].url in response: $resp"
 [ -n "$out" ] || out="cpa-image-$(date +%Y%m%d-%H%M%S).png"
-curl -fsS "$url" -o "$out"
+# -L: follow redirects (a 302 to the real asset must be fetched, not saved as 0 bytes); then require a non-empty file so a
+# redirect/empty body is an ERROR, never a reported "success" (CPA-IMAGE-REDIRECT fix).
+curl -fsSL "$url" -o "$out"
+[ -s "$out" ] || { rm -f "$out"; cpa_die "download produced an empty file (redirect or empty body): $url"; }
 echo "$out"

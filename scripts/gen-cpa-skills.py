@@ -142,7 +142,8 @@ def gen_luau(spec: dict, model: str, generated: str) -> str:
 def main() -> None:
     aliases = load_aliases()
     generated = str(aliases.get("generated", "unknown"))
-    srcs = sorted(SRC_DIR.glob("*.md"))
+    # Domain sources only: skip README.md and _*.md (reserved for docs that live alongside the sources).
+    srcs = [p for p in sorted(SRC_DIR.glob("*.md")) if p.name.lower() != "readme.md" and not p.name.startswith("_")]
     if not srcs:
         fail(f"no source docs in {SRC_DIR}")
     defaults = {}  # domain -> model, for cpa-defaults.env

@@ -45,6 +45,10 @@ t "cpa-image with no prompt errors" "! cli/cpa-image"
 t "cpa-image unknown flag errors" "! cli/cpa-image x --bogus"
 t "cpa-stt real call on missing creds fails closed (no --dry)" "! CPA_KEYS_ENV=/dev/null cli/cpa-stt /tmp/a.wav"
 
+# ── real CLI behavior (loopback HTTP) — the r2 review fixes (args/stt-schema/stt-path/image-redirect) ─────────────────
+echo "--- loopback integration (scripts/cli-loopback.test.py) ---"
+if python3 scripts/cli-loopback.test.py; then echo "ok  loopback integration suite"; pass=$((pass+1)); else echo "FAIL loopback integration suite"; fail=$((fail+1)); fi
+
 echo
 echo "PASS=$pass FAIL=$fail"
 [ "$fail" = 0 ] && echo "ALL PASS" || exit 1

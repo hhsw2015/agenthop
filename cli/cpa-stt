@@ -8,12 +8,12 @@ cpa_load
 file=""; model="${CPA_DEFAULT_MODEL_STT:-}"; out=""; dry=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --model) model="${2:-}"; shift 2;;
-    --out) out="${2:-}"; shift 2;;
-    --dry) dry=1; shift;;
-    --) shift;;
-    -*) cpa_die "unknown flag: $1";;
-    *) if [ -z "$file" ]; then file="$1"; else cpa_die "unexpected extra argument: $1"; fi; shift;;
+    --model) model="$(opt_val "${2:-}")" || cpa_die "--model needs a value"; shift 2;;
+    --out)   out="$(opt_val "${2:-}")"   || cpa_die "--out needs a value";   shift 2;;
+    --dry)   dry=1; shift;;
+    --)      shift; [ $# -gt 0 ] && { file="$1"; shift; }; [ $# -eq 0 ] || cpa_die "unexpected extra argument: $1"; break;;
+    -*)      cpa_die "unknown flag: $1";;
+    *)       if [ -z "$file" ]; then file="$1"; shift; else cpa_die "unexpected extra argument: $1"; fi;;
   esac
 done
 [ -n "$file" ] || cpa_die "usage: cpa-stt <audio-file> [--model id] [--out transcript.txt] [--dry]"
@@ -28,6 +28,19 @@ fi
 
 [ -f "$file" ] || cpa_die "audio file not found: $file"
 cpa_require_creds
-resp=$(curl -fsS "$(cpa_base)/v1/audio/transcriptions" -H "Authorization: Bearer $CPA_KEY_CLI" -F "file=@$file" -F "model=$model")
-text=$(printf '%s' "$resp" | cpa_json 'd.get("text","")') || cpa_die "no text in response: $resp"
+# CPA-STT-PATH: wrap the filename in double-quotes INSIDE the -F value so curl's second-level parsing does not split on
+# ',' or ';' in the path. (shell quoting alone is not enough; curl re-parses the @value.)
+resp=$(curl -fsS "$(cpa_base)/v1/audio/transcriptions" -H "Authorization: Bearer $CPA_KEY_CLI" -F "file=@\"$file\"" -F "model=$model")
+# CPA-STT-SCHEMA: require the response to be {text: <string>}. A missing/wrong-typed text (or non-object) is NOT a
+# successful empty transcript — fail non-zero and do NOT overwrite the prior transcript. `{"text":""}` is a legit empty result.
+text=$(printf '%s' "$resp" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(5)
+if not isinstance(d, dict) or not isinstance(d.get("text"), str):
+    sys.exit(6)
+sys.stdout.write(d["text"])
+') || cpa_die "stt response is not {\"text\": <string>} (not overwriting): $resp"
 if [ -n "$out" ]; then printf '%s\n' "$text" > "$out"; echo "$out"; else printf '%s\n' "$text"; fi
