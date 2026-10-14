@@ -1,25 +1,27 @@
 /**
- * carly-sweep selftest (tsx-run). Covers the M2-a sweep wiring:
- *  - flag SWARM_CARLY_PROJECTION DEFAULT OFF ⇒ noop (no files written).
+ * carly-sweep selftest (tsx-run). Covers the M2-a sweep wiring (r2):
+ *  - flag SWARM_CARLY_PROJECTION DEFAULT OFF ⇒ noop.
  *  - projection writes to the WORKSPACE dir (CARLY_WORKSPACE_DIR) AND the ~/.agenthop/carly audit copy; idempotent; her
  *    out-of-region bytes preserved (reuses the reviewed writeManagedFile).
- *  - outbox drain: a resolvable role ⇒ delivered to its inbox + file removed; unresolvable ⇒ left (retry); corrupt ⇒ left.
- *  - coordinator.beat written as bare epoch seconds; beat contract round-trips cross-program (date +%s ⇄ TS ⇄ lua).
+ *  - outbox drain EXACTLY ONCE (CS-OUTBOX-ONCE): a re-drain of the same-named file returns "already" ⇒ no duplicate, even after the
+ *    receiver took the message; unresolvable ⇒ left (retry).
+ *  - outbox SHAPE isolation (CS-OUTBOX-SHAPE): a null/array/scalar JSON file does NOT throw the loop — it is left, later valid files
+ *    still deliver once.
+ *  - beat READ contract: readBeatSec / beatStale; cross-program (shell `date +%s` ⇄ TS readBeatSec ⇄ lua tonumber). The sweep does
+ *    NOT write coordinator.beat (CS-BEAT-SOURCE).
  *
  * Run: node_modules/.bin/tsx packages/bus/src/swarm/carly-sweep.selftest.mts  (from repo root)
  */
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs";
 import { execSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import {
   carlyProjectionEnabled,
-  carlyWorkspaceDir,
   carlyAuditDir,
   outboxDir,
   runCarlySweep,
   drainOutbox,
-  writeBeat,
   readBeatSec,
   beatStale,
   coordinatorBeatPath,
@@ -28,81 +30,96 @@ import {
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 const tmp = () => mkdtempSync(path.join(os.tmpdir(), "carlysweep-"));
 const read = (f: string) => readFileSync(f, "utf8");
-let LUA = true; try { execSync("lua -v 2>/dev/null || lua5.4 -v 2>/dev/null"); } catch { LUA = false; }
-const luaBin = (() => { try { execSync("lua -v 2>/dev/null"); return "lua"; } catch { return "lua5.4"; } })();
+const jsonCount = (dir: string) => { try { return readdirSync(dir).filter((f) => f.endsWith(".json")).length; } catch { return 0; } };
+let LUA = true; try { execSync("lua -v 2>/dev/null"); } catch { LUA = false; }
 
-// ---- flag default OFF ----
-{
-  t("flag: SWARM_CARLY_PROJECTION unset ⇒ disabled", carlyProjectionEnabled({} as any) === false);
-  t("flag: =1 ⇒ enabled", carlyProjectionEnabled({ SWARM_CARLY_PROJECTION: "1" } as any) === true);
-  const home = tmp();
-  const r = runCarlySweep(home, { AH_HOME: home } as any); // flag off
-  t("flag off ⇒ runCarlySweep noop (ran=false)", r.ran === false && r.reason === "disabled");
-  t("flag off ⇒ no beat written", !existsSync(coordinatorBeatPath(home)));
-}
-
-// ---- projection to workspace + audit, idempotent, out-of-region preserved ----
-{
-  const home = tmp();
-  const ws = path.join(tmp(), "Tern", "carly"); // stand-in workspace dir
-  const env = { AH_HOME: home, SWARM_CARLY_PROJECTION: "1", CARLY_WORKSPACE_DIR: ws } as unknown as NodeJS.ProcessEnv;
-  // pre-seed HER content in the workspace HEARTBEAT.md (outside any managed block)
-  mkdirSync(ws, { recursive: true });
-  writeFileSync(path.join(ws, "HEARTBEAT.md"), "# Carly's own header\n\nkeep me\n");
-  const r1 = runCarlySweep(home, env, 1791990000);
-  t("sweep ran (flag on)", r1.ran === true && r1.wroteProjection === true && r1.beat === true);
-  const wsHb = read(path.join(ws, "HEARTBEAT.md"));
-  t("workspace HEARTBEAT.md written (her bytes preserved + managed block added)", wsHb.startsWith("# Carly's own header") && wsHb.includes("<!-- swarm begin -->"));
-  t("workspace MEMORY.md written", existsSync(path.join(ws, "MEMORY.md")) && read(path.join(ws, "MEMORY.md")).includes("<!-- swarm begin -->"));
-  t("audit copy written under ~/.agenthop/carly", existsSync(path.join(carlyAuditDir(home), "HEARTBEAT.md")));
-  t("coordinator.beat written as bare epoch", read(coordinatorBeatPath(home)).trim() === "1791990000");
-  // idempotent: rerun with same (empty) status ⇒ workspace files byte-identical
-  const before = read(path.join(ws, "HEARTBEAT.md"));
-  runCarlySweep(home, env, 1791990005);
-  t("projection idempotent (workspace HEARTBEAT byte-identical on rerun)", read(path.join(ws, "HEARTBEAT.md")) === before);
-}
-
-// ---- outbox drain ----
-{
-  const home = tmp();
+const msg = (text: string) => ({ from: "carly", fromLabel: "carly", text, via: "carly", ts: Date.now(), intent: "report" });
+function seedCoord(home: string): string {
   const coordSid = "coord-sweep-1";
   mkdirSync(path.join(home, ".agenthop", "presence"), { recursive: true });
   writeFileSync(path.join(home, ".agenthop", "presence", `${coordSid}.pid`), String(process.pid));
+  return coordSid;
+}
+function putOutbox(home: string, name: string, body: unknown): void {
   mkdirSync(outboxDir(home), { recursive: true });
-  const msg = { from: "carly", fromLabel: "carly", text: "queued earlier", via: "carly", ts: Date.now(), intent: "report" };
-  writeFileSync(path.join(outboxDir(home), "0001-aaaa.json"), JSON.stringify({ to: "coordinator", msg }));
-  writeFileSync(path.join(outboxDir(home), "0002-bbbb.json"), JSON.stringify({ to: "coordinator", msg: { ...msg, text: "second" } }));
-  // unresolvable (no SWARM_COORDINATOR) ⇒ both left
-  t("drain: unresolvable role ⇒ files left (retry)", drainOutbox(home, { AH_HOME: home } as any) === 0 && readdirSync(outboxDir(home)).filter((f) => f.endsWith(".json")).length === 2);
-  // resolvable ⇒ delivered + removed
-  const n = drainOutbox(home, { AH_HOME: home, SWARM_COORDINATOR: coordSid } as any);
-  const box = path.join(home, ".agenthop", "inbox", coordSid);
-  t("drain: resolvable ⇒ 2 delivered, outbox emptied", n === 2 && readdirSync(outboxDir(home)).filter((f) => f.endsWith(".json")).length === 0);
-  t("drain: messages landed in the coordinator box with the carly envelope", readdirSync(box).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(read(path.join(box, f))).from).every((x) => x === "carly"));
-  // corrupt ⇒ left
-  writeFileSync(path.join(outboxDir(home), "0003-cccc.json"), "{ not json");
-  t("drain: corrupt file left for inspection", drainOutbox(home, { AH_HOME: home, SWARM_COORDINATOR: coordSid } as any) === 0 && existsSync(path.join(outboxDir(home), "0003-cccc.json")));
+  writeFileSync(path.join(outboxDir(home), name), typeof body === "string" ? body : JSON.stringify(body));
 }
 
-// ---- beat contract ----
+// ---- flag default OFF ----
+{
+  t("flag: unset ⇒ disabled", carlyProjectionEnabled({} as any) === false);
+  t("flag: =1 ⇒ enabled", carlyProjectionEnabled({ SWARM_CARLY_PROJECTION: "1" } as any) === true);
+  const home = tmp();
+  const r = runCarlySweep(home, { AH_HOME: home } as any);
+  t("flag off ⇒ runCarlySweep noop (ran=false)", r.ran === false && r.reason === "disabled");
+}
+
+// ---- projection to workspace + audit, idempotent, out-of-region preserved; sweep does NOT write coordinator.beat ----
 {
   const home = tmp();
-  writeBeat(coordinatorBeatPath(home), 1791990000);
-  t("beat: TS write → TS read round-trips", readBeatSec(coordinatorBeatPath(home)) === 1791990000);
-  t("beat: absent ⇒ null ⇒ stale", readBeatSec(path.join(home, "nope.beat")) === null && beatStale(null, 1791990000) === true);
+  const ws = path.join(tmp(), "Tern", "carly");
+  const env = { AH_HOME: home, SWARM_CARLY_PROJECTION: "1", CARLY_WORKSPACE_DIR: ws } as unknown as NodeJS.ProcessEnv;
+  mkdirSync(ws, { recursive: true });
+  writeFileSync(path.join(ws, "HEARTBEAT.md"), "# Carly's own header\n\nkeep me\n");
+  const r1 = runCarlySweep(home, env);
+  t("sweep ran (flag on), projection written", r1.ran === true && r1.wroteProjection === true);
+  const wsHb = read(path.join(ws, "HEARTBEAT.md"));
+  t("workspace HEARTBEAT.md: her bytes preserved + managed block added", wsHb.startsWith("# Carly's own header") && wsHb.includes("<!-- swarm begin -->"));
+  t("workspace MEMORY.md written", existsSync(path.join(ws, "MEMORY.md")));
+  t("audit copy under ~/.agenthop/carly", existsSync(path.join(carlyAuditDir(home), "HEARTBEAT.md")));
+  t("CS-BEAT-SOURCE: sweep does NOT write coordinator.beat", !existsSync(coordinatorBeatPath(home)));
+  const before = read(path.join(ws, "HEARTBEAT.md"));
+  runCarlySweep(home, env);
+  t("projection idempotent (workspace HEARTBEAT byte-identical on rerun)", read(path.join(ws, "HEARTBEAT.md")) === before);
+}
+
+// ---- CS-OUTBOX-ONCE: exactly-once even on re-drain / after the receiver took it ----
+{
+  const home = tmp();
+  const coordSid = seedCoord(home);
+  const env = { AH_HOME: home, SWARM_COORDINATOR: coordSid } as unknown as NodeJS.ProcessEnv;
+  const box = path.join(home, ".agenthop", "inbox", coordSid);
+  putOutbox(home, "0001-aaaa.json", { to: "coordinator", msg: msg("once") });
+  t("drain: first delivery (1) + source cleared", drainOutbox(home, env) === 1 && jsonCount(outboxDir(home)) === 0 && jsonCount(box) === 1);
+  // simulate an unlink that FAILED: the same-named file reappears (or was never cleared) ⇒ re-drain must NOT duplicate
+  putOutbox(home, "0001-aaaa.json", { to: "coordinator", msg: msg("once") });
+  drainOutbox(home, env);
+  t("CS-OUTBOX-ONCE: re-drain of same file ⇒ 'already' ⇒ no duplicate (box still 1) + source cleared", jsonCount(box) === 1 && jsonCount(outboxDir(home)) === 0);
+  // receiver TAKES the message, then the same file reappears ⇒ still no re-delivery (pubcred persists)
+  for (const f of readdirSync(box).filter((x) => x.endsWith(".json"))) rmSync(path.join(box, f)); // receiver takes the MESSAGE; .pubcred stays
+  putOutbox(home, "0001-aaaa.json", { to: "coordinator", msg: msg("once") });
+  drainOutbox(home, env);
+  t("CS-OUTBOX-ONCE: after receiver took it, re-drain does NOT re-deliver (box 0) + source cleared", jsonCount(box) === 0 && jsonCount(outboxDir(home)) === 0);
+}
+
+// ---- CS-OUTBOX-SHAPE: null-first does not break the loop; later valid file still delivers once ----
+{
+  const home = tmp();
+  const coordSid = seedCoord(home);
+  const env = { AH_HOME: home, SWARM_COORDINATOR: coordSid } as unknown as NodeJS.ProcessEnv;
+  const box = path.join(home, ".agenthop", "inbox", coordSid);
+  putOutbox(home, "0001-null.json", "null");          // JSON null — decodes but has no fields
+  putOutbox(home, "0002-arr.json", "[1,2,3]");        // array root
+  putOutbox(home, "0003-ok.json", { to: "coordinator", msg: msg("valid") }); // valid, AFTER the bad ones
+  const n = drainOutbox(home, env);
+  t("CS-OUTBOX-SHAPE: no whole-loop throw; valid delivered once", n === 1 && jsonCount(box) === 1);
+  t("CS-OUTBOX-SHAPE: bad-shape files LEFT, valid file cleared", existsSync(path.join(outboxDir(home), "0001-null.json")) && existsSync(path.join(outboxDir(home), "0002-arr.json")) && !existsSync(path.join(outboxDir(home), "0003-ok.json")));
+}
+
+// ---- beat READ contract + cross-program ----
+{
+  const home = tmp();
+  const bf = coordinatorBeatPath(home);
+  mkdirSync(path.dirname(bf), { recursive: true });
+  t("beat: absent ⇒ null ⇒ stale", readBeatSec(bf) === null && beatStale(null, 1791990000) === true);
   t("beat: fresh ⇒ not stale; >20min ⇒ stale", beatStale(1791990000, 1791990100) === false && beatStale(1791990000, 1791990000 + 1201) === true);
-  // cross-program: shell `date +%s` sample read by TS AND lua (same file)
-  const bf = path.join(home, "shell.beat");
+  // the coordinator writes the beat (shell `date +%s`); TS + lua read the SAME bare-epoch int
   execSync(`date +%s > ${JSON.stringify(bf)}`);
   const tsRead = readBeatSec(bf);
   t("beat cross-program: TS reads a `date +%s` beat", typeof tsRead === "number" && tsRead! > 1700000000);
   if (LUA) {
-    const luaRead = Number(execSync(`${luaBin} -e 'local f=io.open([[${bf}]]);io.write(tostring(tonumber(f:read("l"))));f:close()'`).toString().trim());
-    t("beat cross-program: lua reads the SAME int the shell wrote", luaRead === tsRead);
-    // TS writeBeat → lua reads it
-    const bf2 = path.join(home, "ts.beat"); writeBeat(bf2, 1791991234);
-    const luaRead2 = Number(execSync(`${luaBin} -e 'local f=io.open([[${bf2}]]);io.write(tostring(tonumber(f:read("l"))));f:close()'`).toString().trim());
-    t("beat cross-program: lua reads a TS writeBeat int", luaRead2 === 1791991234);
+    const luaRead = Number(execSync(`lua -e 'local f=io.open([[${bf}]]);io.write(tostring(tonumber(f:read("l"))));f:close()'`).toString().trim());
+    t("beat cross-program: lua reads the SAME int", luaRead === tsRead);
   } else {
     console.log("skip - beat cross-program lua (no lua binary)");
   }

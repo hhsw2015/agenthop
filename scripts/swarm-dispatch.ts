@@ -1924,7 +1924,7 @@ async function main(): Promise<void> {
     const now = nowSec();
     if (!shouldWriteConsole(now, lastCarlySweepSec, CARLY_SWEEP_SEC)) return; // throttle (reuse the generic interval check)
     lastCarlySweepSec = now;
-    try { const r = runCarlySweep(HOME, process.env, now); log(`carly sweep: registry=${r.registry} projection=${r.wroteProjection} drained=${r.drained} beat=${r.beat}`); }
+    try { const r = runCarlySweep(HOME, process.env); log(`carly sweep: registry=${r.registry} projection=${r.wroteProjection} drained=${r.drained}`); }
     catch (e) { log(`carly sweep failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
