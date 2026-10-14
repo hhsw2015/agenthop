@@ -36,6 +36,11 @@ swarm_flags() -> {flags:{name:on|off|dormant},ts}
 - 签名冻结:改签名=回协调者。tern.carly.export 注册,sig/doc 齐全
 **验收**: 导出经 Carly 真调一次(人话问答截图/transcript 留证)+16KiB 边界夹具。
 
+**§2 增补(#869 缺口审计,协调者修约)**:
+- **A8+context**: `tern.carly.context(fn)` 注册一行蜂群状态(「在审N|候裁M|告警K」,≤400 字符,4ms 预算,读 kv 缓存不现算——由巡检/导出写 kv,context 只读);
+- **A6+route**: `tern.route.link` 接管 `swarm://` 链接:v1 只做两型 `swarm://pane/<herdr-pane-id>`(cx.layout:focus 跳席)与 `swarm://file/<path>`(cx:open 打开 durable 文件);board/canvas 产出的引用一律写成 swarm:// 链接。未知型显 toast 不吞错。
+两项签名即此,实现偏离=返修。
+
 ## 3. 线③契约:账本投影+notebook 晨报(B3+B4)
 
 **B3**: 方向=verification-ledger(已上线 dormant)JSON→SQLite **单向导出**;表 schema:
