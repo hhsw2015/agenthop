@@ -78,13 +78,19 @@ function M.classify(facts, is_ancestor)
     end
   end
 
-  -- Reviewing from review-report dirs (latest round per item; skip items already dual-signed — they've moved on to NH/Merged)
+  -- Reviewing from review-report dirs (latest round per item; skip items already dual-signed — they've moved on to NH/Merged). v2
+  -- RECENCY (coordinator ruling): the latest round must be recent (r.recent, = dir mtime < 7d) — review-reports is an append-only
+  -- archive, and a board full of stale rounds loses its "who is reviewing NOW" answer. The LATEST round decides per item (newest-first
+  -- input): if it isn't recent, the item drops from Reviewing entirely (older rounds are even staler). Needs-human gets NO recency
+  -- filter above — a dual-signed-but-unmerged item is DEBT, shown however old.
   local seen_review = {}
   for _, r in ipairs(facts.reviews or {}) do
     reviewing_items[r.item] = true
     if not signoff_items[r.item] and not seen_review[r.item] then
-      seen_review[r.item] = true
-      lanes.Reviewing[#lanes.Reviewing + 1] = { id = M.card_id(r.item, r.sha, r.seat), item = r.item, sha = r.sha, seat = r.seat, tag = "review" }
+      seen_review[r.item] = true -- the latest round for this item is decided here; older rounds are skipped regardless
+      if r.recent then
+        lanes.Reviewing[#lanes.Reviewing + 1] = { id = M.card_id(r.item, r.sha, r.seat), item = r.item, sha = r.sha, seat = r.seat, tag = "review" }
+      end
     end
   end
 

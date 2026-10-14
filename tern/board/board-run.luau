@@ -39,13 +39,14 @@ end
 -- ---------------------------------------------------------------------------------------------------------------------------------
 function R.gather(deps)
   local reviews, signoffs, brd = {}, {}, {}
+  local recent = (deps.recent_set and deps.recent_set()) or {} -- { [dirname]=true } for dirs with mtime < 7d (Reviewing recency, v2)
   for _, name in ipairs(deps.list_reviews() or {}) do
     local s = R.parse_signoff_dir(name)
     if s then
-      signoffs[#signoffs + 1] = s
+      signoffs[#signoffs + 1] = s -- NO recency on signoffs (Needs-human/Merged show regardless of age — debt, not noise)
     else
       local rv = R.parse_review_dir(name)
-      if rv then reviews[#reviews + 1] = rv end
+      if rv then rv.recent = (recent[name] == true); reviews[#reviews + 1] = rv end
     end
   end
   for _, name in ipairs(deps.list_board() or {}) do
@@ -140,6 +141,15 @@ function R.default_deps(home, repo)
     -- newest-first (`ls -1t`): classify keeps the FIRST round seen per item ⇒ the LATEST round (review-reports is an append-only archive).
     list_reviews = function() return popen_lines("ls -1t " .. string.format("%q", review_reports) .. " 2>/dev/null") end,
     list_board = function() return popen_lines("ls -1 " .. string.format("%q", board_dir) .. " 2>/dev/null") end,
+    -- v2 recency: dirs modified within 7 days (one `find` call) → the set classify uses to keep only fresh Reviewing rounds.
+    recent_set = function()
+      local set = {}
+      for _, p in ipairs(popen_lines("find " .. string.format("%q", review_reports) .. " -maxdepth 1 -type d -mtime -7 2>/dev/null")) do
+        local base = p:match("([^/]+)/?$")
+        if base then set[base] = true end
+      end
+      return set
+    end,
     is_ancestor = function(sha) return git_is_ancestor(repo, sha) end,
     batches = function()
       -- discover the latest rehearse-batch-* branch; build the five-step artifact facts (coordinator-locked paths)

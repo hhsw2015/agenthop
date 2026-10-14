@@ -44,7 +44,7 @@ end
 do
   local facts = {
     board = { { item = "alpha", state = "claimed", seat = "s1" }, { item = "beta", state = "done", seat = "s2" } },
-    reviews = { { item = "gamma", sha = "aaaaaaa", seat = "rev" } },
+    reviews = { { item = "gamma", sha = "aaaaaaa", seat = "rev", recent = true } },
     signoffs = { { item = "delta", sha = "bbbbbbb", seat = "rev" }, { item = "eps", sha = "ccccccc", seat = "rev" } },
   }
   local is_anc = function(sha) return sha == "bbbbbbb" end -- delta merged; eps dual-signed but not merged
@@ -60,12 +60,26 @@ do
   ok("classify teeth: is_ancestor=false ⇒ nothing Merged, both signoffs Needs-human", #flipped.Merged == 0 and #flipped["Needs-human"] == 2)
 
   -- an item under review is NOT also Queued; an item dual-signed is NOT also Reviewing
-  local f2 = { board = { { item = "gamma", state = "claimed", seat = "s" } }, reviews = { { item = "gamma", sha = "a123456", seat = "r" } }, signoffs = {} }
+  local f2 = { board = { { item = "gamma", state = "claimed", seat = "s" } }, reviews = { { item = "gamma", sha = "a123456", seat = "r", recent = true } }, signoffs = {} }
   local l2 = board.classify(f2, function() return false end)
   ok("classify: an item in review is not double-listed in Queued", #l2.Queued == 0 and #l2.Reviewing == 1)
-  local f3 = { board = {}, reviews = { { item = "zed", sha = "d123456", seat = "r" } }, signoffs = { { item = "zed", sha = "d123456", seat = "r" } } }
+  local f3 = { board = {}, reviews = { { item = "zed", sha = "d123456", seat = "r", recent = true } }, signoffs = { { item = "zed", sha = "d123456", seat = "r" } } }
   local l3 = board.classify(f3, function() return false end)
   ok("classify: a dual-signed item is not also in Reviewing", #l3.Reviewing == 0 and #l3["Needs-human"] == 1)
+end
+
+-- v2 recency (coordinator ruling): Reviewing keeps a round only if its latest dir mtime is recent (<7d, r.recent); Needs-human ignores it.
+do
+  local facts = {
+    board = {},
+    reviews = { { item = "fresh", sha = "1111111", seat = "s", recent = true }, { item = "stale", sha = "2222222", seat = "s", recent = false } },
+    signoffs = { { item = "olddebt", sha = "3333333", seat = "s" } }, -- dual-signed long ago, still unmerged
+  }
+  local lanes = board.classify(facts, function() return false end)
+  local has = function(lane, it) for _, c in ipairs(lane) do if c.item == it then return true end end return false end
+  ok("recency: a RECENT latest round ⇒ in Reviewing", has(lanes.Reviewing, "fresh"))
+  ok("recency teeth: a STALE latest round ⇒ dropped from Reviewing", not has(lanes.Reviewing, "stale") and #lanes.Reviewing == 1)
+  ok("recency: Needs-human ignores recency (old unmerged debt still shown)", has(lanes["Needs-human"], "olddebt"))
 end
 
 -- ============================ PURE: runbook mtime chain ============================
@@ -89,7 +103,7 @@ end
 
 -- ============================ PURE: render determinism + shape ============================
 do
-  local lanes = board.classify({ board = {}, reviews = { { item = "x", sha = "1234567", seat = "s" } }, signoffs = {} }, function() return false end)
+  local lanes = board.classify({ board = {}, reviews = { { item = "x", sha = "1234567", seat = "s", recent = true } }, signoffs = {} }, function() return false end)
   local md = board.render_review_board(lanes)
   ok("render_review_board: four '## ' lanes", select(2, md:gsub("## ", "")) == 4)
   ok("render_review_board: lane order Queued<Reviewing<Needs-human<Merged", md:find("## Queued", 1, true) < md:find("## Reviewing", 1, true) and md:find("## Reviewing", 1, true) < md:find("## Needs%-human") and md:find("## Needs%-human") < md:find("## Merged", 1, true))
@@ -106,6 +120,8 @@ local function fakeDeps(tmp, review_names, board_names, anc_set, batches)
     review_path = tmp .. "/review-board.md", runbook_path = tmp .. "/runbook-board.md",
     list_reviews = function() return review_names end,
     list_board = function() return board_names end,
+    recent_set = function() local set = {}; for _, n in ipairs(review_names) do set[n] = true end; return set end, -- fixtures treat injected review dirs as recent unless a test overrides
+
     is_ancestor = function(sha) return anc_set[sha] == true end,
     batches = function() return batches end,
     write_atomic = R.write_atomic, -- the REAL atomic write (temp + os.rename)
