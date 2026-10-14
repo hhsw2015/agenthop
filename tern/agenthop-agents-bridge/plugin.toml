@@ -1,0 +1,6 @@
+schema = 1
+id = "agenthop-agents-bridge"
+name = "Agenthop Agents Bridge"
+version = "1.0.0"
+description = "Production v1: mirrors Tern's cx.agents to a file-JSON control plane for the bash-driven agenthop swarm (A1 bridge; A2 patrol sentinel + A3 OSC alert extend the same plugin). Wire contract and claim/recovery semantics in PROTOCOL.md. Opt-in bypass, herdr untouched."
+window = "window.luau"
