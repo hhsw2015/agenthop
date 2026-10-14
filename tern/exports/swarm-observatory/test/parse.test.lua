@@ -94,6 +94,25 @@ do
   ck("parseFlagsLine did NOT leak the trailing '(...)' into a flag", f["opt"] == nil)
 end
 
+-- parseFlagsLine: an inert qualifier must NOT truncate the line (TE-FLAGS-INERT) — the old code cut at the first
+-- '(', mis-parsing on(inert:...) AND dropping every flag after it.
+do
+  local line = "[dispatch disp-1] flags: BOARD_ADMIT=on INBOX_WAKE=on(inert:no-herdr) ROUND_DOCTOR=on EXECUTOR_DIGEST=on TG_ENTRY=off (opt-out default-on; kill with SWARM_<X>=0; TG_ENTRY is opt-in)"
+  local f = parse.parseFlagsLine(line)
+  ck("parseFlagsLine flag BEFORE the inert token still on (BOARD_ADMIT)", f.BOARD_ADMIT == "on")
+  ck("parseFlagsLine on(inert:...) -> dormant (enabled-but-inert)", f.INBOX_WAKE == "dormant")
+  ck("parseFlagsLine keeps a flag AFTER the inert token (ROUND_DOCTOR)", f.ROUND_DOCTOR == "on")
+  ck("parseFlagsLine keeps another flag AFTER the inert token (EXECUTOR_DIGEST)", f.EXECUTOR_DIGEST == "on")
+  ck("parseFlagsLine keeps the opt-in TG_ENTRY after inert (off->dormant)", f.TG_ENTRY == "dormant")
+  ck("parseFlagsLine did NOT leak the inert qualifier as a flag", f["inert"] == nil)
+  -- a plain line with no inert still yields all its flags (no regression)
+  local plain = parse.parseFlagsLine("flags: A_FLAG=on B_FLAG=off C_FLAG=on")
+  ck("parseFlagsLine plain line yields all flags", plain.A_FLAG == "on" and plain.B_FLAG == "off" and plain.C_FLAG == "on")
+  -- an inert flag as the LAST token (no trailing explanation) is still parsed as dormant
+  local tail = parse.parseFlagsLine("flags: FANOUT=on(inert:x)")
+  ck("parseFlagsLine inert as last token (no trailing paren) -> dormant", tail.FANOUT == "dormant")
+end
+
 -- lastFlagsLine picks the LAST flags line
 do
   local body = table.concat({
@@ -177,15 +196,49 @@ do
   ck("countReviewStates empty -> 0/0/0", r0 == 0 and a0 == 0 and t0 == 0)
 end
 
--- countUnresolvedBatches (A8+context 候裁M): one dir per batch-<id>; RESOLVED iff consumed.json exists (injected)
+-- countActiveReviews (TE-ACTIVE-LABEL): ACTIVE = state not terminal/done (distinct from 在审 = reviewing).
 do
-  local names = { "batch-aaa", "batch-bbb", "batch-ccc", "notabatch", ".DS_Store" }
-  local sealed = { ["batch-bbb"] = true } -- bbb is sealed (has consumed.json)
-  local consumedExists = function(nm) return sealed[nm] == true end
-  ck("countUnresolvedBatches counts only UNSEALED batch- dirs (aaa,ccc) = 2", parse.countUnresolvedBatches(names, consumedExists) == 2)
-  ck("countUnresolvedBatches ignores non-batch- entries", parse.countUnresolvedBatches({ "notabatch", "boardcard", "x.json" }, function() return false end) == 0)
-  ck("countUnresolvedBatches all sealed -> 0", parse.countUnresolvedBatches({ "batch-x", "batch-y" }, function() return true end) == 0)
-  ck("countUnresolvedBatches bad args -> 0", parse.countUnresolvedBatches(nil, nil) == 0 and parse.countUnresolvedBatches({ "batch-z" }, nil) == 0)
+  local reviews = {
+    { state = "reviewing" }, { state = "queued" }, { state = "changes-requested" }, { state = "done" },
+  }
+  ck("countActiveReviews excludes done rows (3 of 4)", parse.countActiveReviews(reviews) == 3)
+  ck("countActiveReviews on a done-ONLY queue = 0 (the bug: #rows said 1)", parse.countActiveReviews({ { state = "done" } }) == 0)
+  ck("countActiveReviews empty = 0", parse.countActiveReviews({}) == 0)
+  ck("countActiveReviews bad arg = 0", parse.countActiveReviews(nil) == 0)
+end
+
+-- countUnresolvedBatches (A8+context 候裁M): a batch dir = any dir CONTAINING batch.json (store reality, NOT a
+-- `batch-` name prefix); RESOLVED iff consumed.json exists. Both predicates injected (TE-RULING-ID).
+do
+  -- store reality: {batch=has batch.json, consumed=has consumed.json}
+  local store = {
+    ["batch-aaa"] = { batch = true, consumed = false },        -- prefixed, unresolved
+    ["release_20261014"] = { batch = true, consumed = false },  -- CUSTOM --batch-id (no prefix), unresolved
+    ["batch-bbb"] = { batch = true, consumed = true },          -- sealed (consumed.json)
+    ["batch-empty"] = { batch = false, consumed = false },      -- NOT a batch (no batch.json) despite the name
+    ["stray-dir"] = { batch = false, consumed = false },
+  }
+  local names = { "batch-aaa", "release_20261014", "batch-bbb", "batch-empty", "stray-dir", ".DS_Store" }
+  local hasBatchJson = function(nm)
+    return store[nm] ~= nil and store[nm].batch == true
+  end
+  local consumedExists = function(nm)
+    return store[nm] ~= nil and store[nm].consumed == true
+  end
+  ck("countUnresolvedBatches: unresolved-by-batch.json incl CUSTOM id (batch-aaa, release_20261014) = 2",
+    parse.countUnresolvedBatches(names, hasBatchJson, consumedExists) == 2)
+  ck("countUnresolvedBatches: a non-prefixed custom id with batch.json counts (release_20261014)",
+    parse.countUnresolvedBatches({ "release_20261014" }, hasBatchJson, consumedExists) == 1)
+  ck("countUnresolvedBatches: a dir WITHOUT batch.json is ignored even if named batch-*",
+    parse.countUnresolvedBatches({ "batch-empty" }, hasBatchJson, consumedExists) == 0)
+  ck("countUnresolvedBatches: a sealed batch (consumed.json) is not counted",
+    parse.countUnresolvedBatches({ "batch-bbb" }, hasBatchJson, consumedExists) == 0)
+  ck("countUnresolvedBatches: skips dotfiles",
+    parse.countUnresolvedBatches({ ".DS_Store" }, function() return true end, function() return false end) == 0)
+  ck("countUnresolvedBatches bad args -> 0",
+    parse.countUnresolvedBatches(nil, nil, nil) == 0
+      and parse.countUnresolvedBatches({ "batch-z" }, nil, nil) == 0
+      and parse.countUnresolvedBatches({ "batch-z" }, function() return true end, nil) == 0)
 end
 
 -- parseSwarmUrl (A6+route)
@@ -208,16 +261,18 @@ end
 -- snapshot.luau emits swarm:// links (A6+route: canvas/snapshot references must be swarm:// links)
 do
   local snapshot = assert(loadfile(here .. "../snapshot.luau"))()
+  -- home-derived fallback (no sources): the swarm:// link invariants still hold
   local md = snapshot.buildMarkdown({
     ts = 123,
     home = "/Users/wowdd1",
     lastCycle = { num = 877, title = "demo" },
-    reviewCount = 6,
+    activeReviewCount = 5,
+    reviewRowCount = 6,
     boardOpen = 4,
     boardDone = 17,
     flagsSummary = "13 on",
   })
-  ck("snapshot emits a swarm://file link for PROGRESS.md",
+  ck("snapshot emits a swarm://file link for PROGRESS.md (home fallback)",
     md:find("swarm://file/Users/wowdd1/.agenthop/swarm/PROGRESS.md", 1, true) ~= nil)
   ck("snapshot keeps the plain path visible as the link label",
     md:find("[/Users/wowdd1/.agenthop/swarm/PROGRESS.md]", 1, true) ~= nil)
@@ -225,6 +280,33 @@ do
     md:find("`herdr api snapshot`", 1, true) ~= nil)
   ck("snapshot does NOT linkify the <session-id> path template",
     md:find("swarm://file/Users/wowdd1/.agenthop/inbox/<session-id>", 1, true) == nil)
+  -- TE-ACTIVE-LABEL: "active reviews" = ACTIVE count; raw rows shown separately
+  ck("snapshot labels ACTIVE reviews (5) with raw rows (6)",
+    md:find("active reviews: **5** (rows: 6)", 1, true) ~= nil)
+
+  -- TE-SOURCE-PATH: wayfinding points at the REAL source read (e.g. SWARM_REVIEW_REPORTS override),
+  -- not the hardcoded ~/Work/review-reports default; the nonexistent ACTIVE-REVIEW-QUEUE.md default is gone.
+  local over = snapshot.buildMarkdown({
+    ts = 1,
+    home = "/Users/wowdd1",
+    sources = {
+      progress = "/Users/wowdd1/.agenthop/swarm/PROGRESS.md",
+      reviewReports = "/Users/wowdd1/custom-reports",
+    },
+    activeReviewCount = 1,
+    reviewRowCount = 1,
+  })
+  ck("snapshot points at the REAL reviewReports source (override)",
+    over:find("swarm://file/Users/wowdd1/custom-reports", 1, true) ~= nil)
+  ck("snapshot drops the nonexistent ACTIVE-REVIEW-QUEUE.md default",
+    over:find("ACTIVE-REVIEW-QUEUE.md", 1, true) == nil)
+
+  -- FC-2: an unknown source renders as (unavailable), never a false 0
+  local unk = snapshot.buildMarkdown({ ts = 1, home = "/Users/wowdd1" })
+  ck("snapshot renders unknown active reviews as (unavailable)",
+    unk:find("active reviews: (unavailable) (rows: (unavailable))", 1, true) ~= nil)
+  ck("snapshot renders unknown board as (unavailable)",
+    unk:find("board: (unavailable) claimed / (unavailable) done", 1, true) ~= nil)
 end
 
 print("")

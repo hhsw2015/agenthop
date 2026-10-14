@@ -21,7 +21,7 @@ fi
 echo "using interpreter: $LUA ($($LUA -v 2>&1 | head -1))"
 
 fails=0
-for t in budget.test.lua parse.test.lua; do
+for t in budget.test.lua parse.test.lua window.test.lua; do
   echo "=== $t ==="
   if ! "$LUA" "$DIR/$t"; then fails=$((fails + 1)); fi
   echo

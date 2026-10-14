@@ -19,52 +19,79 @@ end
 -- data = {
 --   ts = <epoch seconds>, home = "/Users/...",
 --   lastCycle = { num, title } | nil,
---   reviewCount = <number>, boardOpen = <number>, boardDone = <number>,
+--   activeReviewCount = <number> | nil,   -- ACTIVE reviews (state not terminal/done); nil => source unknown
+--   reviewRowCount    = <number> | nil,   -- raw review rows (incl. done); nil => source unknown
+--   boardOpen = <number> | nil, boardDone = <number> | nil,   -- nil => source unknown
 --   flagsSummary = "<string>" | nil,
+--   sources = {                           -- ACTUAL durable paths read (env overrides win); home-derived if absent
+--     snapshot, progress, reviewReports, board, dispatcherLog, deadLetters, inboxTemplate, alerts,
+--     carlyReviewBoard, herdrCli,
+--   },
 -- }
+-- An unknown source MUST render as "(unavailable)", never a false 0 (FC-2): the count fields above are nil for an
+-- unreadable source, and `num()` maps nil -> "(unavailable)".
 function M.buildMarkdown(data)
   data = data or {}
   local home = data.home or "~"
+  local src = data.sources or {}
+  -- Every wayfinding link points at the REAL source actually read. Fall back to the canonical home-derived default
+  -- only when the caller did not supply a path (keeps the builder usable standalone / in unit tests).
+  local pSnapshot = src.snapshot or (home .. "/.agenthop/carly/canvas-snapshot.md")
+  local pProgress = src.progress or (home .. "/.agenthop/swarm/PROGRESS.md")
+  local pReports = src.reviewReports or (home .. "/Work/review-reports")
+  local pBoard = src.board or (home .. "/.agenthop/swarm/board/")
+  local pLog = src.dispatcherLog or (home .. "/.agenthop/swarm/dispatcher.log")
+  local pDead = src.deadLetters or (home .. "/.agenthop/swarm/dead-letters.jsonl")
+  local pInboxTpl = src.inboxTemplate or (home .. "/.agenthop/inbox/<session-id>/")
+  local pAlerts = src.alerts or (home .. "/.agenthop/carly/alerts/")
+  local pReviewBoard = src.carlyReviewBoard or (home .. "/.agenthop/carly/review-board.md")
+  local pHerdr = src.herdrCli or "herdr api snapshot"
+
   local L = {}
   local function w(s)
     L[#L + 1] = s
   end
+  -- a count or "(unavailable)" when nil (an unknown source must never render as a false 0)
+  local function num(v)
+    if v == nil then
+      return "(unavailable)"
+    end
+    return "**" .. tostring(v) .. "**"
+  end
 
   w("# Swarm cold-start canvas")
   w("")
-  w("_Wayfinding only - the fact is always in the file. Authoritative snapshot:_ "
-    .. flink(home .. "/.agenthop/carly/canvas-snapshot.md"))
+  w("_Wayfinding only - the fact is always in the file. Authoritative snapshot:_ " .. flink(pSnapshot))
   w("")
   w("## Summary")
   w("")
   w("- generated_ts: `" .. tostring(data.ts or 0) .. "` (epoch seconds)")
   if data.lastCycle then
     w("- latest cycle: **#" .. tostring(data.lastCycle.num) .. "** " .. tostring(data.lastCycle.title)
-      .. " -> " .. flink(home .. "/.agenthop/swarm/PROGRESS.md"))
+      .. " -> " .. flink(pProgress))
   else
-    w("- latest cycle: (unavailable) -> " .. flink(home .. "/.agenthop/swarm/PROGRESS.md"))
+    w("- latest cycle: (unavailable) -> " .. flink(pProgress))
   end
-  w("- active reviews: **" .. tostring(data.reviewCount or 0) .. "** -> "
-    .. flink(home .. "/Work/review-reports/ACTIVE-REVIEW-QUEUE.md"))
-  w("- board: **" .. tostring(data.boardOpen or 0) .. "** claimed / **" .. tostring(data.boardDone or 0)
-    .. "** done -> " .. flink(home .. "/.agenthop/swarm/board/"))
-  w("- flags: " .. (data.flagsSummary or "(unavailable)") .. " -> "
-    .. flink(home .. "/.agenthop/swarm/dispatcher.log"))
+  -- active reviews = ACTIVE rows only (state not terminal/done); raw row count shown separately (TE-ACTIVE-LABEL).
+  local rowStr = (data.reviewRowCount == nil) and "(unavailable)" or tostring(data.reviewRowCount)
+  w("- active reviews: " .. num(data.activeReviewCount) .. " (rows: " .. rowStr .. ") -> " .. flink(pReports))
+  w("- board: " .. num(data.boardOpen) .. " claimed / " .. num(data.boardDone) .. " done -> " .. flink(pBoard))
+  w("- flags: " .. (data.flagsSummary or "(unavailable)") .. " -> " .. flink(pLog))
   w("")
   w("## Wayfinding (durable sources)")
   w("")
   -- { label, target, linkable } ; linkable=false stays plain (a path template or a CLI, not an openable file)
   local rows = {
-    { "Cycle log / progress", home .. "/.agenthop/swarm/PROGRESS.md", true },
-    { "Active review queue", home .. "/Work/review-reports/ACTIVE-REVIEW-QUEUE.md", true },
-    { "Review evidence", home .. "/Work/review-reports/", true },
-    { "Work-item board (claimed/done)", home .. "/.agenthop/swarm/board/", true },
-    { "Dispatcher log + flag states", home .. "/.agenthop/swarm/dispatcher.log", true },
-    { "Dead letters", home .. "/.agenthop/swarm/dead-letters.jsonl", true },
-    { "Agent inboxes (depth)", home .. "/.agenthop/inbox/<session-id>/", false },
-    { "Carly alerts (A2 sentinel)", home .. "/.agenthop/carly/alerts/", true },
-    { "Carly review/runbook boards (line 1)", home .. "/.agenthop/carly/review-board.md", true },
-    { "Live seats (herdr)", "herdr api snapshot", false },
+    { "Cycle log / progress", pProgress, true },
+    { "Active review queue", pReports, true },
+    { "Review evidence", pReports, true },
+    { "Work-item board (claimed/done)", pBoard, true },
+    { "Dispatcher log + flag states", pLog, true },
+    { "Dead letters", pDead, true },
+    { "Agent inboxes (depth)", pInboxTpl, false },
+    { "Carly alerts (A2 sentinel)", pAlerts, true },
+    { "Carly review/runbook boards (line 1)", pReviewBoard, true },
+    { "Live seats (herdr)", pHerdr, false },
   }
   for _, r in ipairs(rows) do
     if r[3] then

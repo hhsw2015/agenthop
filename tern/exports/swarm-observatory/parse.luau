@@ -172,16 +172,27 @@ function M.lastFlagsLine(text)
   return last
 end
 
--- Parse a dispatcher "flags: NAME=on NAME=off ... (...)" line into { NAME = "on"|"off"|"dormant" }. on/off come
--- straight from the log; an opt-in flag (TG_ENTRY/FANOUT) logged as off is reported "dormant".
+-- Parse a dispatcher "flags: NAME=on NAME=off NAME=on(inert:...) ... (trailing explanation)" line into
+-- { NAME = "on"|"off"|"dormant" }. We parse the FULL runtime tokens: the old code cut the line at the first "(",
+-- which both mis-parsed an inert-qualified value (e.g. INBOX_WAKE=on(inert:no-herdr)) AND dropped every flag after
+-- it. A flag value may carry an ATTACHED "(inert:...)" qualifier (no space before the paren), whereas the trailing
+-- human explanation is a SPACE-separated parenthetical at the end of the line (stripped below).
+--   on/off come straight from the log.
+--   an opt-in flag (TG_ENTRY/FANOUT) logged as off -> "dormant".
+--   an explicitly inert flag ("on(inert:...)") -> "dormant": enabled-but-not-functioning is not-active, which is
+--     distinct from a live "on" (this satisfies "distinguish actual-inert from on" within the FROZEN 3-state map).
+--     NOTE: a dedicated "inert" state would be a contract change (the on|off|dormant triplet is frozen).
 function M.parseFlagsLine(line)
   local flags = {}
   if type(line) ~= "string" then
     return flags
   end
-  local seg = line:match("flags:%s*(.-)%s*%(") or line:match("flags:%s*(.*)$") or line
-  for name, val in seg:gmatch("(%u[%u%d_]*)=([%a%d]+)") do
-    local lv = val:lower()
+  local seg = line:match("flags:%s*(.*)$") or line
+  seg = seg:gsub("%s+%b()%s*$", "") -- drop the trailing " (explanation)" group; keeps attached (inert:...) qualifiers
+  for name, rawval in seg:gmatch("(%u[%u%d_]*)=(%S+)") do
+    local base = rawval:match("^(%a+)") or rawval -- "on" from "on(inert:no-herdr)"; the bare word otherwise
+    local qual = rawval:match("%((.-)%)")         -- "inert:no-herdr" (attached qualifier) or nil
+    local lv = base:lower()
     local state
     if lv == "on" then
       state = "on"
@@ -189,6 +200,9 @@ function M.parseFlagsLine(line)
       state = "off"
     else
       state = lv
+    end
+    if state == "on" and qual and qual:lower():find("inert", 1, true) then
+      state = "dormant" -- enabled-but-inert => not-active
     end
     if M.OPT_IN[name] and state == "off" then
       state = "dormant"
@@ -242,17 +256,38 @@ function M.countReviewStates(reviews)
   return reviewing, total - reviewing, total
 end
 
--- 候裁M (A8+context): count UNRESOLVED DecisionBatch cards. `names` = entries of ~/.agenthop/console/decision-batches; each
--- `batch-<id>` dir is one 呈批 card, RESOLVED iff it has a committed consumed.json (decision-batch-v1 terminal marker).
--- `consumedExists(name) -> boolean` is INJECTED (real fs in window.luau; a fake in fixtures) so this stays pure+testable. Per the
--- coordinator ruling this counts REAL awaiting-ruling batches (not a total−reviewing proxy — the two are different dimensions).
-function M.countUnresolvedBatches(names, consumedExists)
-  if type(names) ~= "table" or type(consumedExists) ~= "function" then
+-- Terminal review states: a review row that has reached a sealed/done end. Everything else is "active".
+M.TERMINAL_REVIEW_STATES = { done = true }
+
+-- Count ACTIVE reviews (state not a terminal/done state) for the A6 snapshot's "active reviews" label
+-- (TE-ACTIVE-LABEL: #rows included done rows, so a done-only queue falsely read as 1 active). This is DISTINCT from
+-- countReviewStates' 在审 (specifically state=="reviewing"); the raw row count is reported separately by the caller.
+function M.countActiveReviews(reviews)
+  local n = 0
+  if type(reviews) == "table" then
+    for _, r in ipairs(reviews) do
+      if type(r) == "table" and not M.TERMINAL_REVIEW_STATES[r.state] then
+        n = n + 1
+      end
+    end
+  end
+  return n
+end
+
+-- 候裁M (A8+context): count UNRESOLVED DecisionBatch cards. `names` = entries of ~/.agenthop/console/decision-batches.
+-- A batch dir is enumerated by the STORE's reality, NOT a name prefix: any dir that CONTAINS a `batch.json`
+-- (decision-batch-v1). Valid custom IDs created via `decide --batch-id` (e.g. release_20261014) have no `batch-`
+-- prefix, so the old `^batch-` match dropped them (TE-RULING-ID). A batch is RESOLVED iff it has a committed
+-- consumed.json (the terminal sealed marker); unresolved = has batch.json AND no consumed.json.
+-- Both predicates are INJECTED (real fs.exists in window.luau; fakes in fixtures) so this stays pure+testable. Per the
+-- coordinator ruling this counts REAL awaiting-ruling batches (not a total−reviewing proxy — different dimensions).
+function M.countUnresolvedBatches(names, hasBatchJson, consumedExists)
+  if type(names) ~= "table" or type(hasBatchJson) ~= "function" or type(consumedExists) ~= "function" then
     return 0
   end
   local n = 0
   for _, nm in ipairs(names) do
-    if type(nm) == "string" and nm:find("^batch%-") and not consumedExists(nm) then
+    if type(nm) == "string" and not nm:find("^%.") and hasBatchJson(nm) and not consumedExists(nm) then
       n = n + 1
     end
   end
