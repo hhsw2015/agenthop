@@ -39,8 +39,8 @@ cpa_json() { python3 -c 'import sys,json
 d=json.load(sys.stdin)
 print(eval(sys.argv[1]))' "$1"; }
 
-# Validate an option value: it must be PRESENT and not itself a flag (CPA-ARGS fix). Echoes the value; returns 1 when the
-# value is missing or looks like a flag (starts with "-") so the caller can die — this stops `--model --dry` from
-# swallowing `--dry` as the model and sending a real POST. Our option values (model/voice/size/n/out) never start with
-# "-"; pass such a value after `--` or inline if ever needed.
-opt_val() { case "${1-}" in ""|-*) return 1;; *) printf '%s' "$1";; esac; }
+# Validate an option value by STATUS ONLY — returns 0 when present and not itself a flag, else 1 (CPA-ARGS fix). It does
+# NOT echo the value: the caller assigns the RAW "$2" so the exact bytes are kept (a `$(opt_ok …)` capture would strip a
+# trailing newline — e.g. `--out $'x.mp3\n'` would silently write to `x.mp3`). This also stops `--model --dry` from
+# swallowing `--dry` as the model. Our option values never legitimately start with "-"; pass such a value after `--`.
+opt_ok() { case "${1-}" in ""|-*) return 1;; *) return 0;; esac; }

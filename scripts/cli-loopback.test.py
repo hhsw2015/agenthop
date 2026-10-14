@@ -116,12 +116,31 @@ def main() -> int:
     r = run(["cpa-stt", aud, "--model", "good"])
     check("stt: normal transcript printed", r.returncode == 0 and "hello world" in r.stdout)
 
-    # ── CPA-STT-PATH: a filename with ',' uploads real bytes ────────────────────────────────────────────────────────
+    # ── CPA-STT-PATH: special filenames upload the CORRECT bytes (not another file / not an error) ───────────────────
     weird = os.path.join(tmp, "audio,part.wav"); open(weird, "wb").write(b"COMMA-FILE-BYTES")
     REQS.clear()
     r = run(["cpa-stt", weird, "--model", "good"])
     got = any(b"COMMA-FILE-BYTES" in body for (p, body) in REQS if p == "/v1/audio/transcriptions")
     check("stt: comma-filename uploads its real bytes", r.returncode == 0 and got)
+    # backslash+quote in the name: must upload ITS bytes, not a decoy resolved by curl's escape parsing
+    bsl = os.path.join(tmp, 'audio"x.wav'); open(bsl, "wb").write(b"BACKSLASH-TARGET-BYTES")
+    open(os.path.join(tmp, "audiox.wav"), "wb").write(b"DECOY-BYTES")  # a file curl escaping might resolve to instead
+    REQS.clear()
+    r = run(["cpa-stt", bsl, "--model", "good"])
+    got_t = any(b"BACKSLASH-TARGET-BYTES" in body for (p, body) in REQS if p == "/v1/audio/transcriptions")
+    got_decoy = any(b"DECOY-BYTES" in body for (p, body) in REQS if p == "/v1/audio/transcriptions")
+    check("stt: quote-in-name uploads TARGET bytes (not a decoy)", r.returncode == 0 and got_t and not got_decoy)
+    # single-file guard: a second file (positional or after --) must be rejected, never silently replace the first
+    r = run(["cpa-stt", weird, "--", os.path.join(tmp, "a.wav")])
+    check("stt: second file after -- rejected (one file only)", r.returncode != 0)
+    r = run(["cpa-stt", os.path.join(tmp, "a.wav"), weird])
+    check("stt: two positional files rejected", r.returncode != 0)
+
+    # ── CPA-ARGS: an option value with a trailing newline is kept verbatim (not stripped by a $() capture) ───────────
+    weird_out = "o\n"  # cpa-tts writes to --out; the value must survive the validator unchanged
+    r = run(["cpa-tts", "hi", "--out", weird_out])
+    check("args: --out trailing-LF value preserved (writes to 'o\\n', not 'o')",
+          r.returncode == 0 and os.path.exists(os.path.join(tmp, "o\n")) and not os.path.exists(os.path.join(tmp, "o")))
 
     # ── CPA-IMAGE-REDIRECT: 302 followed to the real asset (non-empty); empty body = error ──────────────────────────
     r = run(["cpa-image", "a cat", "--out", os.path.join(tmp, "img.png")])

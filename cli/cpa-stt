@@ -6,14 +6,15 @@ set -euo pipefail
 cpa_load
 
 file=""; model="${CPA_DEFAULT_MODEL_STT:-}"; out=""; dry=0
+set_file() { [ -z "$file" ] || cpa_die "only one audio file allowed (extra: $1)"; file="$1"; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --model) model="$(opt_val "${2:-}")" || cpa_die "--model needs a value"; shift 2;;
-    --out)   out="$(opt_val "${2:-}")"   || cpa_die "--out needs a value";   shift 2;;
+    --model) opt_ok "${2:-}" || cpa_die "--model needs a value"; model="$2"; shift 2;;
+    --out)   opt_ok "${2:-}" || cpa_die "--out needs a value";   out="$2";   shift 2;;
     --dry)   dry=1; shift;;
-    --)      shift; [ $# -gt 0 ] && { file="$1"; shift; }; [ $# -eq 0 ] || cpa_die "unexpected extra argument: $1"; break;;
+    --)      shift; while [ $# -gt 0 ]; do set_file "$1"; shift; done; break;;
     -*)      cpa_die "unknown flag: $1";;
-    *)       if [ -z "$file" ]; then file="$1"; shift; else cpa_die "unexpected extra argument: $1"; fi;;
+    *)       set_file "$1"; shift;;
   esac
 done
 [ -n "$file" ] || cpa_die "usage: cpa-stt <audio-file> [--model id] [--out transcript.txt] [--dry]"
@@ -28,11 +29,20 @@ fi
 
 [ -f "$file" ] || cpa_die "audio file not found: $file"
 cpa_require_creds
-# CPA-STT-PATH: wrap the filename in double-quotes INSIDE the -F value so curl's second-level parsing does not split on
-# ',' or ';' in the path. (shell quoting alone is not enough; curl re-parses the @value.)
-resp=$(curl -fsS "$(cpa_base)/v1/audio/transcriptions" -H "Authorization: Bearer $CPA_KEY_CLI" -F "file=@\"$file\"" -F "model=$model")
-# CPA-STT-SCHEMA: require the response to be {text: <string>}. A missing/wrong-typed text (or non-object) is NOT a
-# successful empty transcript — fail non-zero and do NOT overwrite the prior transcript. `{"text":""}` is a legit empty result.
+
+# CPA-STT-PATH: curl's `-F name=@filename` RE-PARSES the value (',' / ';' split parts; '\' and '"' are escapes), so a path
+# like `audio,part.wav` or `audio\"x.wav` either errors or uploads a DIFFERENT file. Instead of trying to escape every
+# curl grammar case, copy the file to a clean temp path (mktemp dir + a plain name) and upload THAT — curl never sees a
+# special char, and the server receives the correct bytes. The original extension is preserved for format detection.
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/cpa-stt.XXXXXX")
+trap 'rm -rf "$tmpdir"' EXIT
+base=$(basename -- "$file"); ext=""; case "$base" in *.*) ext=".${base##*.}";; esac
+safe="$tmpdir/upload$ext"
+cp -- "$file" "$safe"
+
+resp=$(curl -fsS "$(cpa_base)/v1/audio/transcriptions" -H "Authorization: Bearer $CPA_KEY_CLI" -F "file=@$safe" -F "model=$model")
+# CPA-STT-SCHEMA: require {text: <string>}. A missing/wrong-typed text (or non-object) is NOT a successful empty
+# transcript — fail non-zero and do NOT overwrite the prior transcript. `{"text":""}` is a legit empty result.
 text=$(printf '%s' "$resp" | python3 -c '
 import sys, json
 try:
