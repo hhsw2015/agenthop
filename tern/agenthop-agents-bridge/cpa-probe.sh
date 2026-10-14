@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # agenthop agents-bridge — A2 r2 ④ W3 CPA probe (SWARM-SIDE, independent of Carly/the sentinel). A down CPA housekeeper cannot post to
-# the inbox, so the swarm probes it directly: curl /v1/models (HTTP 200 only, 2s, content not checked). THREE consecutive failures =>
-# write a CPA-DOWN L0 alert; a success resets the streak then clears the alert. Model-free.
+# the inbox, so the swarm probes it directly: curl the UNAUTH health route /healthz (2s). THREE-STATE (F1): HTTP 200 => UP; a connection
+# failure (curl fails / code 000 / empty) => DOWN; ANY other HTTP (401/404/5xx) => UNKNOWN — never a false DOWN. Rationale: a listening-
+# but-non-200 CPA is NOT "down"; the old probe hit the auth-gated /v1/models, got 401, and raised a FALSE alarm (the pilot caught this).
+# THREE consecutive DOWNs => write a CPA-DOWN L0 alert; an UP resets the streak then clears the alert; UNKNOWN is a pure no-op (no advance,
+# no clear, no touch). Model-free.
 #
 # State discipline (reviews A2-CPA-STATE / A2-CPA-TEMP-OWN — the FC-2 errno lineage). The root lesson: `test -e` / `-L` are EXISTENCE
 # BOOLEANS that return false for BOTH "truly absent (ENOENT)" AND "ancestor/file inaccessible (EACCES)" — they launder access failures
@@ -10,23 +13,44 @@
 # confirmable ZERO count first, then idempotently clear the alert, only then report up+clean. State advances only through an
 # EXCLUSIVELY-created temp (mktemp) atomically renamed. Alert JSON uses a real encoder (quoted URL stays parseable).
 #
-# Usage: cpa-probe.sh [L0-dir]   Env: AGENTHOP_CPA_URL, AGENTHOP_CPA_PROBE (test hook: 0=up/nonzero=down)
-# Exit:  0 up+clean  1 down+advanced  2 down+state-unavailable  3 persist/cleanup incomplete
+# Usage: cpa-probe.sh [L0-dir]   Env: AGENTHOP_CPA_URL, AGENTHOP_CPA_PROBE (test hook: 0=up/2=unknown/other-nonzero=down),
+#        AGENTHOP_CPA_HTTP (test: inject an HTTP code string; 000 = no connect) + AGENTHOP_CPA_RC (test: inject curl exit code; default 0)
+# Exit:  0 up+clean  1 down+advanced  2 down+state-unavailable  3 persist/cleanup incomplete  4 probe UNKNOWN (inconclusive; no state change)
 set -u
 
 L0="${1:-$HOME/.agenthop/carly}"
 alerts="$L0/alerts"
 state="$L0/cpa-probe.state"
 alert_file="$alerts/cpa_down.json"
-url="${AGENTHOP_CPA_URL:-http://127.0.0.1:8318/v1/models}"
+url="${AGENTHOP_CPA_URL:-http://127.0.0.1:8318/healthz}"
 mkdir -p "$alerts" 2>/dev/null || true
 
+# THREE-STATE probe (F1): 0=UP (complete 200), 1=DOWN (transfer failure: curl nonzero exit / no connect / 000), 2=UNKNOWN (complete non-200:
+# auth-gated 401, 404, 5xx — never a false DOWN). Seams: AGENTHOP_CPA_PROBE exit code (0=up / 2=unknown / any other nonzero=down), or
+# AGENTHOP_CPA_HTTP (inject the HTTP code string) + AGENTHOP_CPA_RC (inject the curl exit code; default 0) so the status-code x exit-code
+# matrix is testable without a live server.
 if [ -n "${AGENTHOP_CPA_PROBE:-}" ]; then
-  "$AGENTHOP_CPA_PROBE"; probe=$?
+  "$AGENTHOP_CPA_PROBE"; hrc=$?
+  case "$hrc" in 0) probe=0 ;; 2) probe=2 ;; *) probe=1 ;; esac
 else
-  http="$(curl -s -m 2 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)"
-  if [ "$http" = "200" ]; then probe=0; else probe=1; fi
+  if [ -n "${AGENTHOP_CPA_HTTP:-}" ]; then
+    http="$AGENTHOP_CPA_HTTP"; rc="${AGENTHOP_CPA_RC:-0}"   # test: inject HTTP code + optional curl exit code (rc); default rc=0
+  else
+    http="$(curl -s -m 2 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)"; rc=$?
+  fi
+  # ORDER MATTERS (F1 r2 / F1-CURL-RESULT): 200 is only the HEADER; the TRANSFER can still fail (truncated body=rc18, read timeout=rc28)
+  # with %{http_code} still "200". Per the contract "curl fail => DOWN", test transfer-level failure FIRST, confirm UP only on a COMPLETE
+  # 200. A 200 header with a nonzero curl exit must NEVER read UP / clear the alert. (same lesson as CS-OUTBOX-ONCE: one OK signal != the
+  # whole chain OK — 200 is about the header, rc is about the whole transfer.)
+  if [ "$rc" -ne 0 ] || [ -z "$http" ] || [ "$http" = "000" ]; then probe=1       # curl failed / incomplete transfer / no connect => DOWN
+  elif [ "$http" = "200" ]; then probe=0                                           # COMPLETE 200 => UP
+  else probe=2                                                                     # complete non-200 (401/404/5xx) => UNKNOWN
+  fi
 fi
+
+# UNKNOWN: CPA is listening but did not return 200 (the auth-gated 401 behind F1's false alarm, or a 404/5xx). Neither UP nor DOWN: do
+# not read/advance the streak, do not clear a standing alert, touch nothing. Exit 4 (inconclusive). (F1)
+if [ "$probe" -eq 2 ]; then exit 4; fi
 
 # errno-classified read: prints ENOENT (only when truly absent) / NA (any access failure, incl. ancestor EACCES, protected symlink,
 # unreadable file) / <digits>. No boolean existence test — access failures are NOT laundered to 0.
