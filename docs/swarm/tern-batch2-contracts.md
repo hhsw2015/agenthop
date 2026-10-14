@@ -41,7 +41,9 @@ swarm_flags() -> {flags:{name:on|off|dormant},ts}
 **B3**: 方向=verification-ledger(已上线 dormant)JSON→SQLite **单向导出**;表 schema:
 ```sql
 reviews(sha TEXT, item TEXT, seat TEXT, rounds INT, outcome TEXT, usd REAL, ts INT);
+-- v1: outcome/usd 恒 NULL(无结构化源,不伪造 join;候 review-current 索引/tasklog 账接入)
 batches(batch TEXT, shas TEXT, merged_ts INT);
+-- v1: batches 源=git 派生(批次 merge 提交+工件提交)或空表,实现者择一并声明
 ```
 - **并发写未验(Carly 警告 WAL/锁)⇒v1 规避而非解决**: 唯一写者=导出脚本(cron/手动),Tern 的 sqlite 块只读打开;文件写完 rename 原子换
 **B4**: notebook 单元=读 db+morning-digest 产物,输出表格;**不引入新事实计算**,晨报数字以 morning-digest 为准,notebook 只呈现
