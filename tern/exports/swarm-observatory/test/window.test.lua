@@ -439,6 +439,43 @@ do
 end
 
 -- ================================================================================================================
+-- TE-SOURCE-UNKNOWN backup loop (r5): leaf validation must NOT depend on `item` being present. A file whose OTHER
+-- known leaf is the wrong type while item is ABSENT is a corrupt carrier -> UNKNOWN, not a file silently skipped
+-- (which produced a false empty queue). r4 trapped the guard inside `if obj.item ~= nil`; these FAIL on r4 code.
+-- ================================================================================================================
+do
+  local qname = "happycapy-active-review-queue.json"
+  local badNoItem = {
+    { name = "no item, state a table", obj = { state = { bad = true } } },
+    { name = "no item, sha a table", obj = { sha = { bad = true } } },
+    { name = "no item, seat a number", obj = { seat = 123 } },
+    { name = "no item, round a string", obj = { round = "wrong" } },
+  }
+  for _, c in ipairs(badNoItem) do
+    local h = newHost(false)
+    h.refreshCmd()
+    local before = h.context() -- 在审1|候裁1|告警1
+    h.putDir(h.paths.reviewQueue, { qname })
+    h.putJson(h.paths.reviewQueue .. "/" .. qname, c.obj)
+    local q, eq = h.invoke("swarm_queue")
+    ck("backup-queue [" .. c.name .. "]: swarm_queue FAILS (not reviews=[])", q == nil and type(eq) == "string")
+    h.refreshCmd()
+    ck("backup-queue [" .. c.name .. "]: context keeps last-good (not 在审 0)", h.context() == before)
+  end
+  -- positive controls: a no-item object with legal leaves (or an unknown extension field) is accepted (no row, no error)
+  local hp = newHost(false)
+  hp.putDir(hp.paths.reviewQueue, { qname })
+  hp.putJson(hp.paths.reviewQueue .. "/" .. qname, { seat = "happycapy", state = "reviewing", note = "extra" })
+  local qp, eqp = hp.invoke("swarm_queue")
+  ck("backup-queue no-item legal leaves: swarm_queue ok, no phantom row (1 review)", eqp == nil and qp and #qp.reviews == 1)
+  local he = newHost(false)
+  he.putDir(he.paths.reviewQueue, { qname })
+  he.putJson(he.paths.reviewQueue .. "/" .. qname, {}) -- legal empty object
+  local qe, eqe = he.invoke("swarm_queue")
+  ck("backup-queue empty object: swarm_queue ok (1 review, legal empty)", eqe == nil and qe and #qe.reviews == 1)
+end
+
+-- ================================================================================================================
 -- TE-SOURCE-UNKNOWN (swarm_status shape): a snapshot lacking .result.snapshot.agents is UNKNOWN, not zero seats.
 -- ================================================================================================================
 do

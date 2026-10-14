@@ -163,18 +163,19 @@ local function collectReviews()
         if type(obj) ~= "table" then
           return reviews, REVIEW_QUEUE_DIR .. "/" .. nm -- decoded non-table ⇒ corrupt ⇒ UNKNOWN
         end
-        if obj.item ~= nil then
-          -- FC-2: validate the row's known leaves (item/sha/seat/state strings, round a number) before building it.
-          -- A present-but-wrong-type leaf is corrupt ⇒ UNKNOWN (keep last-good); never tostring/default over it.
-          if
-            type(obj.item) ~= "string"
-            or (obj.sha ~= nil and type(obj.sha) ~= "string")
-            or (obj.seat ~= nil and type(obj.seat) ~= "string")
-            or (obj.state ~= nil and type(obj.state) ~= "string")
-            or (obj.round ~= nil and type(obj.round) ~= "number")
-          then
-            return reviews, REVIEW_QUEUE_DIR .. "/" .. nm -- present file, bad row field ⇒ corrupt ⇒ UNKNOWN
-          end
+        -- FC-2: validate the row's known leaves (item/sha/seat/state strings, round a number) INDEPENDENTLY of whether
+        -- `item` is present. A present-but-wrong-type leaf is corrupt ⇒ UNKNOWN (keep last-good); never tostring/default
+        -- over it, and never silently skip a file whose present fields are the wrong type just because item is absent.
+        if
+          (obj.item ~= nil and type(obj.item) ~= "string")
+          or (obj.sha ~= nil and type(obj.sha) ~= "string")
+          or (obj.seat ~= nil and type(obj.seat) ~= "string")
+          or (obj.state ~= nil and type(obj.state) ~= "string")
+          or (obj.round ~= nil and type(obj.round) ~= "number")
+        then
+          return reviews, REVIEW_QUEUE_DIR .. "/" .. nm -- present file, bad row field ⇒ corrupt ⇒ UNKNOWN
+        end
+        if obj.item ~= nil then -- leaves verified above; a no-item object (with legal leaves) simply builds no row
           local _, round = parse.splitRoundSuffix(obj.item)
           reviews[#reviews + 1] = {
             item = obj.item,
