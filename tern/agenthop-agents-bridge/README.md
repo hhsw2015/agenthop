@@ -29,11 +29,9 @@ Full wire contract + claim/recovery semantics: **[PROTOCOL.md](PROTOCOL.md)** (a
 
 ```bash
 D=~/.agenthop/tern-panes
-id="q-$$-$(date +%s%N)"                       # unique id
-# ATOMIC publish: write a temp name the bridge does not list, then mv it into place (see PROTOCOL.md §2.0).
+# ATOMIC publish via the helper (write-success gates the rename; see PROTOCOL.md §2.0).
 # Do NOT `echo > requests/$id.json` directly — the bridge can read the half-written file and destroy the request.
-printf '%s' '{"op":"list"}' > "$D/requests/.$id.tmp"
-mv -f "$D/requests/.$id.tmp" "$D/requests/$id.json"
+id="$(./publish.sh "$D" '{"op":"list"}')"    # or inline: printf > "$D/requests/.$id.tmp" && mv -f ... || { rm -f ...; exit 1; }
 # poll for the reply, then consume it
 until [ -f "$D/results/$id.json" ]; do sleep 0.2; done
 jq . "$D/results/$id.json"        # {"ok":true,"class":"read-only","agents":[...]}
@@ -75,9 +73,10 @@ second-best signal for bare TUI seats.
 ## Test
 
 ```bash
-lua  test/claim.test.lua       # A1 claim-model: crash-recovery / concurrency / idempotency (Lua 5.5)
-lua  test/sentinel.test.lua    # A2 sentinel + A3 reader: content-filter / permission / stall / osc_alert (Lua 5.5)
+lua  test/claim.test.lua       # A1 claim-model: crash-recovery / concurrency / idempotency (loads the real claim.luau)
+lua  test/sentinel.test.lua    # A2 sentinel + A3 reader: content-filter / permission / stall / osc_alert / read-failure (Lua 5.5)
 bash test/osc-hook.test.sh     # A3 emitter: per-event OSC bytes + no-op-outside-Tern guard
+bash test/publish.test.sh      # A1 atomic publisher: write-success gates the rename (sender write-fail gate)
 ```
 
 All fixtures have teeth. `claim.test.lua` mirrors `window.luau`'s drain decision (kept in sync by comment); `sentinel.test.lua` loads

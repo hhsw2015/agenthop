@@ -34,14 +34,23 @@ $HOME/.agenthop/tern-panes/
 
 蜂群**不得**直接 `echo … > requests/<id>.json`:shell 重定向先创建/打开最终路径再写正文,桥在中间窗口会读到空串/半截——旧实现会据此当坏 JSON 认领删除,**合法请求被毁**。发送方必须**原子发布**:先写一个不被桥列举的临时名,写完 `mv` 成最终 `.json`(同目录 rename,POSIX 原子)。Bash 的 `mv` 可用,**不受 tern.fs 无 rename 限制**(限制只在插件 Lua 侧)。
 
+用现成的 `publish.sh`(推荐,已把下面的门封好):
+
 ```bash
-D=~/.agenthop/tern-panes; id="q-$$-$(date +%s%N)"   # 唯一 id
-tmp="$D/requests/.$id.tmp"                            # 临时名:点开头,不以 .json 结尾 => 桥不列举
-printf '%s' '{"op":"list"}' > "$tmp"
-mv -f "$tmp" "$D/requests/$id.json"                  # 原子发布;桥只看完成的 .json
+publish.sh ~/.agenthop/tern-panes '{"op":"list"}'   # 打印 request id;写失败则 exit!=0 且不产生最终 .json
 ```
 
-桥侧另有兜底:读到空串**不认领**(claim.luau 的门,留待下一轮);但权威修法是发送方原子发布。桥只列举 `*.json`,临时名(`.`开头或非 `.json` 后缀)天然被跳过。
+或内联——**rename 必须以写成功为前置**(`&&`),否则 printf 半途失败后无条件 `mv` 仍会把半截正文发布成最终 `.json`(TA-A1-PUBLISH):
+
+```bash
+D=~/.agenthop/tern-panes; id="q-$$-$(date +%s%N)"    # 唯一 id
+tmp="$D/requests/.$id.tmp"                            # 临时名:点开头、不以 .json 结尾 => 桥不列举
+printf '%s' '{"op":"list"}' > "$tmp" \
+  && mv -f "$tmp" "$D/requests/$id.json" \
+  || { rm -f "$tmp"; exit 1; }                        # 写成功才 rename;失败清理且不发布
+```
+
+桥侧另有兜底:读到空串**不认领**(claim.luau 的门,留待下一轮);但权威修法是**发送方写成功门 + 原子 rename**。桥只列举 `*.json`,临时名(`.`开头或非 `.json` 后缀)天然被跳过。
 
 ### 2.1 请求 / 应答
 

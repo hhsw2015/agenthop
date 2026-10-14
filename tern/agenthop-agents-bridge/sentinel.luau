@@ -56,8 +56,6 @@ local function is_agent_pane(p)
   return p.pane ~= nil and (p.kind == "agent" or p.program == "omp" or p.kind == "terminal")
 end
 
--- Pure scan of one pane's tail text into zero or more alert records. Exposed on the returned function (fn.scan) so the fixture can
--- unit-test detection without a cx; the live path calls it from inside the returned function.
 -- scan one pane. `tail` is the tail text, or nil when the body could not be read this run. Returns (alerts, newSeen). newSeen carries
 -- { hash, busy_since } for stall tracking across runs.
 local function scan_pane(p, tail, now, prev)
@@ -68,8 +66,16 @@ local function scan_pane(p, tail, now, prev)
     alerts[#alerts + 1] = { pane = p.pane, kind = "osc_alert", program = p.program, cwd = p.cwd,
       text = tail and excerpt(tail) or nil, unreadable = (tail == nil) or nil, ts = now }
   end
+  -- The stall clock is metadata-authoritative: p.busy is known even when the body is unreadable. A PROVEN-idle pane (busy ~= true)
+  -- resets the clock NOW, before any early return — so an idle observed during a read failure is not cancelled and cannot later
+  -- false-stall (TA-A2-STALL). Only a busy pane carries the prior clock forward.
+  local carried = nil
+  if p.busy == true and prev ~= nil then
+    carried = prev.busy_since
+  end
   if tail == nil then
-    return alerts, prev -- body unreadable: keep prior stall state untouched, skip text-based detection this run
+    -- body unreadable: no text detection and no hash update, but honor the metadata-driven reset above
+    return alerts, { hash = prev ~= nil and prev.hash or nil, busy_since = carried }
   end
   local low = string.lower(tail)
   local h = hash(tail)

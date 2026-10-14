@@ -220,5 +220,26 @@ do
   check_("TA-A2-STALL: busy->idle->busy resets the clock", out == nil)
 end
 
+-- TA-A2-STALL (combination): a PROVEN idle observed during a read failure must still reset the clock — a later busy must not inherit
+-- the pre-idle clock and false-stall. This is the r2 combination boundary.
+do
+  local check = load_check()
+  resetWrites()
+  local state = {}
+  local busyP = { { pane = 20, kind = "agent", program = "omp", cwd = "/w", busy = true } }
+  local idleP = { { pane = 20, kind = "agent", program = "omp", cwd = "/w", busy = false } }
+  local reads = { [20] = { kind = "agent", lines = { "same tail A" } } }
+  NOW = 7000000
+  check({}, mockCx(busyP, reads), state) -- busy starts; busy_since = 7000000
+  NOW = NOW + 120 * 1000
+  check({}, mockCxReadThrows(idleP), state) -- busy=false BUT body unreadable -> metadata-authoritative reset
+  NOW = NOW + 120 * 1000
+  local out = check({}, mockCx(busyP, reads), state) -- busy again, same tail -> clock restarts, must NOT stall
+  check_("TA-A2-STALL: idle-during-read-error still resets clock (no false stall)", out == nil)
+  NOW = NOW + 3 * 60 * 1000 + 1 -- 3 min of genuine continuous busy from the restart
+  local out2 = check({}, mockCx(busyP, reads), state)
+  check_("TA-A2-STALL: real continuous busy after the reset does stall", type(out2) == "string" and out2:find("stall@pane20", 1, true) ~= nil)
+end
+
 print(string.format("\n%s (%d failure(s))", failures == 0 and "PASS" or "FAIL", failures))
 os.exit(failures == 0 and 0 or 1)
