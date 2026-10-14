@@ -1,0 +1,12 @@
+{
+  "_comment": "spike ③: register sid-hook.sh as a Claude Code SessionStart hook. Merge this into ~/.claude/settings.json. No matcher = runs for every SessionStart source (startup, resume, clear, compact). Copy sid-hook.sh to a stable path first (e.g. ~/.agenthop/tern-panes/sid-hook.sh) and chmod +x.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$HOME/.agenthop/tern-panes/sid-hook.sh" }
+        ]
+      }
+    ]
+  }
+}

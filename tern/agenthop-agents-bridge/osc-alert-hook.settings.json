@@ -1,0 +1,17 @@
+{
+  "_comment": "A3 (Claude Code only): register osc-alert-hook.sh so a bare Tern-hosted CLAUDE CODE seat signals 'needs human' via OSC 9;4 (read by the A2 sentinel's pane.alert and by cx.agents waiting_input). Merge into ~/.claude/settings.json. Copy osc-alert-hook.sh to a stable path (e.g. ~/.agenthop/tern-panes/osc-alert-hook.sh) and chmod +x first. Outside a Tern pane the hook is a no-op, so it is safe on every seat. Codex is NOT covered here — it uses PermissionRequest + a different config path (see docs/research/codex-opencode-hooks.md); Codex emitter is to-verify for a later batch.",
+  "hooks": {
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.agenthop/tern-panes/osc-alert-hook.sh" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.agenthop/tern-panes/osc-alert-hook.sh" } ] }
+    ],
+    "SubagentStop": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.agenthop/tern-panes/osc-alert-hook.sh" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "$HOME/.agenthop/tern-panes/osc-alert-hook.sh" } ] }
+    ]
+  }
+}

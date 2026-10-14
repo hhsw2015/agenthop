@@ -1,0 +1,6 @@
+schema = 1
+id = "agenthop-agents-bridge"
+name = "Agenthop Agents Bridge"
+version = "0.1.0"
+description = "Mirrors Tern's native cx.agents layer (list/ask/wait/start/transcript/interrupt/stop) to a file-JSON control plane for the bash-driven agenthop swarm — the herdr-equivalent seat-host shim (tern-migration spike ②)."
+window = "window.luau"
