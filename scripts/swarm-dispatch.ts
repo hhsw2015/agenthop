@@ -82,6 +82,7 @@ import { consoleProjectionEnabled, shouldWriteConsole } from "../packages/bus/sr
 import { writeConsoleProjection } from "../packages/bus/src/swarm/console-projection-store.js";
 import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swarm/idle-explainer.js";
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
+import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { modelMarketEnabled } from "../packages/bus/src/swarm/model-market.js";
 import { pullModelMarket } from "../packages/bus/src/swarm/model-market-store.js";
 import { modelStaffingEnabled, taskFromNode, type StaffingTaskInput } from "../packages/bus/src/swarm/model-staffing.js";
@@ -224,6 +225,7 @@ const SENTINEL_SAMPLE_SEC = envInt(process.env.SWARM_SENTINEL_SAMPLE_SEC, 60);
 const GAUGE_SAMPLE_SEC = envInt(process.env.SWARM_GAUGE_SAMPLE_SEC, 60); // T5-2 seam: gauge sampling interval (sweep ticks faster, every 5s)
 const CONSOLE_WRITE_SEC = envInt(process.env.SWARM_CONSOLE_SEC, 60); // swarm-console projection write interval (sweep ticks faster, every 5s)
 const IDLE_EXPLAINER_SEC = envInt(process.env.SWARM_IDLE_EXPLAINER_SEC, 60); // idle-explainer projection write interval (= the idle-tick unit)
+const CARLY_SWEEP_SEC = envInt(process.env.SWARM_CARLY_SWEEP_SEC, 30); // Carly projection/registry/outbox/beat sweep interval (default OFF via SWARM_CARLY_PROJECTION)
 const IDLE_TICKS_N = envInt(process.env.SWARM_IDLE_TICKS, 2, 1); // consecutive idle write-intervals before "idle" (default 2 ⇒ ~2 intervals)
 const MODEL_MARKET_SEC = envInt(process.env.SWARM_MODEL_MARKET_SEC, 43200); // model-market snapshot pull interval (brief §2①: ≈ the upstream 12h self-refresh)
 const MODEL_STAFFING_SEC = envInt(process.env.SWARM_MODEL_STAFFING_SEC, 3600); // model-staffing suggestion projection write interval (refreshes the CPA catalog + re-picks)
@@ -1912,6 +1914,21 @@ async function main(): Promise<void> {
     catch (e) { log(`console projection failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
+  // Carly sweep (dialog-officer M2-a follow-up): refresh projects.json + write her HEARTBEAT/MEMORY managed region into her
+  // WORKSPACE files (+ audit copy) + drain the swarm-carly-send outbox. DEFAULT OFF via SWARM_CARLY_PROJECTION (dormant merge
+  // discipline). Does NOT write coordinator.beat — the coordinator writes its own beat (a live dispatcher is not proof the
+  // coordinator loop is alive). Throttled to CARLY_SWEEP_SEC; interval advances before the work so one attempt per interval even
+  // on a throw. Fully fail-soft (runCarlySweep isolates each of its three steps internally too).
+  let lastCarlySweepSec = 0;
+  const runCarlySweepStep = (): void => {
+    if (!carlyProjectionEnabled()) return; // SWARM_CARLY_PROJECTION default OFF (opt-in)
+    const now = nowSec();
+    if (!shouldWriteConsole(now, lastCarlySweepSec, CARLY_SWEEP_SEC)) return; // throttle (reuse the generic interval check)
+    lastCarlySweepSec = now;
+    try { const r = runCarlySweep(HOME, process.env); log(`carly sweep: registry=${r.registry} projection=${r.wroteProjection} drained=${r.drained}`); }
+    catch (e) { log(`carly sweep failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   // idle-root-cause explainer (北极星差距审计件① — the user's #1 activation is "why idle again?"). When the swarm has NO live
   // dispatched work (control-log kind:"wait" waits = 0) for N consecutive write-intervals, write a data-driven "why idle" one-line
   // projection (console/idle-explainer.json) the mod status band renders ("idle = waiting for X"), and — ONLY on a GENUINE-STALL
@@ -2263,6 +2280,7 @@ async function main(): Promise<void> {
         runModelMarketPull,          // model-market capability-profile pull (staffing ①); external fetch, FC-2 keeps last snapshot
         runModelStaffing,            // model-staffing suggestion projection (staffing ③a); SUGGESTION ONLY, never spawns/spends (R16)
         runDigest,                   // morning digest
+        runCarlySweepStep,           // dialog-officer M2-a: Carly projection(workspace)+registry+outbox drain (default OFF; no beat write)
         async () => { const wakeCoordSid = resolveSession(COORDINATOR, listSessions(HOME)); if (wakeCoordSid && isStableSid(wakeCoordSid)) await backstopWake(HOME, wakeCoordSid, log); }, // SWARM_INBOX_WAKE backstop
       ],
       onError: (where, e) => log(`${where} error (isolated): ${e instanceof Error ? e.message : e}`),
