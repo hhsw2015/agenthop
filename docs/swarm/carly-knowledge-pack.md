@@ -108,15 +108,15 @@
 
 | beat | 字面路径(目标) | 谁写 | 谁读 | 判死 |
 |---|---|---|---|---|
-| `carly-patrol.beat` | `~/.agenthop/carly/carly-patrol.beat` | 我(巡检任务) | 协调者 / 哨兵(A2) | >20min 无更新 ⇒ 我停摆,协调者 S19 |
-| `coordinator.beat` | `~/.agenthop/swarm/coordinator.beat` | 协调者(每轮扫箱亲写) | 我(§1.3) | >20min 无更新 ⇒ 蜂群停,我提醒用户恢复 |
+| `carly-patrol.beat` | `~/.agenthop/carly/carly-patrol.beat` | 我 / A2 巡检 | 协调者 | >20min 无更新 ⇒ 我停摆,协调者 S19 |
+| `coordinator.beat` | `~/.agenthop/swarm/coordinator.beat` | 协调者(每轮扫箱亲写) | 我 / A2(§1.3) | >20min 无更新 ⇒ 蜂群停,我提醒用户恢复 |
 
 - 格式:单行裸 epoch 秒(非 JSON),便于免模型 check 扫。
 - **coordinator.beat 由协调者的扫箱循环亲写,不由 dispatcher sweep 写**(CS-BEAT-SOURCE:dispatcher 活着 ≠ 协调者循环活着,sweep 代写=假存活证明)。
+- 我(A2 侧)**写** `carly-patrol.beat`、**读** `coordinator.beat`;协调者反之。
 
 **当前状态(尚未全接通,勿当已连)**:
-- `coordinator.beat` 读端:我(§1.3)按目标路径 `~/.agenthop/swarm/coordinator.beat` 读 [doc,读端常量已定]。
-- `carly-patrol.beat` 哨兵(A2)读端:**[pending 接线]** A2 源码当前 TODO 根仍在 `~/.agenthop/carly/`,与目标一致但接线未完(A2 后续单对齐,本包不接 A2)。
+- `coordinator.beat` 读端:我 / A2(§1.3)按目标路径 `~/.agenthop/swarm/coordinator.beat` 读。**[pending 接线]** A2 源码当前 `coordinator.beat` 读端 TODO 根仍在 `~/.agenthop/carly/`,**待对齐到目标 `~/.agenthop/swarm/`**(A2 后续单,本包不接 A2)。
 - 现状过渡:`coordinator.beat` 全接通前,我用 `heartbeat.json` 的 `pass.lastTickSec`([tested])做蜂群死活判据。
 - TG 兜底 beat=L0 告警文件路径(A2 占位常量,随 A2 落地,[pending])。
 

@@ -112,11 +112,18 @@ export function drainOutbox(home: string, env: NodeJS.ProcessEnv = process.env):
       if (rec === null || typeof rec !== "object" || Array.isArray(rec)) continue; // CS-OUTBOX-SHAPE: bad root ⇒ isolate + leave
       const r = rec as { to?: unknown; msg?: unknown; target?: unknown };
       if (typeof r.to !== "string" || !r.msg || typeof r.msg !== "object") continue; // bad fields ⇒ leave
-      // Determine the BOUND target: an already-recorded valid target wins (never re-resolve the role); else resolve + PERSIST it.
-      let target: string | null = typeof r.target === "string" && isValidSessionId(r.target) ? r.target : null;
-      if (!target) {
+      // Determine the BOUND target. CRITICAL (bad-binding carrier): ONLY an ABSENT target field triggers a first resolution+bind. A
+      // target field that is PRESENT but invalid (null/number/object/array/""/unsafe sid) is a CORRUPT binding carrier — NOT a
+      // "never attempted" — so preserve the file + skip it (never re-resolve to a fresh box, never delete the source). Same lesson as
+      // REG-READ: a bad carrier is HELD, not washed. `undefined` (key omitted) is the only "absent".
+      const hasTargetField = Object.prototype.hasOwnProperty.call(r, "target") && r.target !== undefined;
+      let target: string;
+      if (hasTargetField) {
+        if (typeof r.target !== "string" || !isValidSessionId(r.target)) continue; // PRESENT but invalid ⇒ corrupt binding ⇒ preserve + skip
+        target = r.target;
+      } else {
         const sid = resolveRoleSid(r.to, home, env);
-        if (!sid || !isValidSessionId(sid)) continue; // role not resolvable yet ⇒ leave (no target bound, a first delivery is still allowed later)
+        if (!sid || !isValidSessionId(sid)) continue; // role not resolvable yet ⇒ leave (absent target ⇒ a first delivery is still allowed later)
         target = sid;
         atomicReplace(file, JSON.stringify({ to: r.to, msg: r.msg, target }, null, 2) + "\n"); // bind durably BEFORE the publish
       }

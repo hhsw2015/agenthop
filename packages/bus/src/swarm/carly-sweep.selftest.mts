@@ -112,6 +112,57 @@ function putOutbox(home: string, name: string, body: unknown): void {
   t("CS-OUTBOX-ONCE: never-attempted obligation still allows a first delivery", drainOutbox(home, { AH_HOME: home, SWARM_COORDINATOR: aSid } as unknown as NodeJS.ProcessEnv) === 1 && jsonCount(boxA) === 3);
 }
 
+// ---- CS-OUTBOX-ONCE bad-binding carrier: a PRESENT-but-invalid target is preserved + skipped, NOT re-resolved ----
+{
+  const home = tmp();
+  const aSid = seedCoord(home);
+  const env = { AH_HOME: home, SWARM_COORDINATOR: aSid } as unknown as NodeJS.ProcessEnv;
+  const box = path.join(home, ".agenthop", "inbox", aSid);
+  const bads: Array<[string, unknown]> = [["b0", null], ["b1", 5], ["b2", {}], ["b3", []], ["b4", ""], ["b5", "../evil"]];
+  for (const [n, target] of bads) putOutbox(home, `bad-${n}.json`, { to: "coordinator", msg: msg("bad"), target });
+  const bytesBefore = bads.map(([n]) => read(path.join(outboxDir(home), `bad-${n}.json`)));
+  const nBad = drainOutbox(home, env);
+  t("bad-carrier: NO new publish for any invalid target field", nBad === 0 && jsonCount(box) === 0);
+  t("bad-carrier: all 6 source files preserved BYTE-UNCHANGED (never re-resolved / rewritten / deleted)",
+    bads.every(([n], i) => existsSync(path.join(outboxDir(home), `bad-${n}.json`)) && read(path.join(outboxDir(home), `bad-${n}.json`)) === bytesBefore[i]));
+  // positive controls preserved: a truly-ABSENT target first-delivers; a VALID bound target delivers even with no resolvable role
+  putOutbox(home, "absent.json", { to: "coordinator", msg: msg("absent") });
+  putOutbox(home, "valid.json", { to: "coordinator", msg: msg("valid"), target: aSid });
+  t("bad-carrier positive controls: absent ⇒ first delivery; valid bound ⇒ delivered", drainOutbox(home, { AH_HOME: home } as any) >= 0 && drainOutbox(home, env) >= 0 && jsonCount(box) === 2);
+}
+// ---- CS-OUTBOX-ONCE-GATE: the COMPLETE chain exercises the real first-time atomicReplace bind (a no-op variant must go RED) ----
+{
+  const NOTROOT = (process.getuid?.() ?? 1) !== 0;
+  if (NOTROOT) {
+    const home = tmp();
+    const aSid = "coord-chainA", bSid = "coord-chainB";
+    mkdirSync(path.join(home, ".agenthop", "presence"), { recursive: true });
+    writeFileSync(path.join(home, ".agenthop", "presence", `${aSid}.pid`), String(process.pid));
+    writeFileSync(path.join(home, ".agenthop", "presence", `${bSid}.pid`), String(process.pid));
+    const boxA = path.join(home, ".agenthop", "inbox", aSid), boxB = path.join(home, ".agenthop", "inbox", bSid);
+    // make A's box UNWRITABLE so the first publish FAILS after the bind (the outbox dir stays writable ⇒ atomicReplace succeeds)
+    mkdirSync(boxA, { recursive: true }); execSync(`chmod 000 ${JSON.stringify(boxA)}`);
+    putOutbox(home, "chain.json", { to: "coordinator", msg: msg("chain") }); // NO target
+    const n1 = drainOutbox(home, { AH_HOME: home, SWARM_COORDINATOR: aSid } as any);
+    execSync(`chmod 755 ${JSON.stringify(boxA)}`); // restore
+    const chainFile = path.join(outboxDir(home), "chain.json");
+    const rec = (() => { try { return JSON.parse(read(chainFile)); } catch { return {}; } })();
+    t("CS-ONCE-GATE: first-bind PERSISTED target to disk before a failed publish (no-op variant RED)", n1 === 0 && existsSync(chainFile) && rec.target === aSid);
+    // role switches to B ⇒ the persisted, A-bound file must deliver to A, never B
+    const n2 = drainOutbox(home, { AH_HOME: home, SWARM_COORDINATOR: bSid } as any);
+    t("CS-ONCE-GATE: after role switch, re-drain delivers to BOUND A (not B) + source cleared", n2 === 1 && jsonCount(boxA) === 1 && jsonCount(boxB) === 0 && jsonCount(outboxDir(home)) === 0);
+    // adjacent control: first-bind WRITE failure (outbox dir read-only) ⇒ no publish, file preserved UNBOUND
+    const home2 = tmp(); const a2 = seedCoord(home2); const box2 = path.join(home2, ".agenthop", "inbox", a2);
+    putOutbox(home2, "wf.json", { to: "coordinator", msg: msg("wf") });
+    execSync(`chmod 500 ${JSON.stringify(outboxDir(home2))}`);
+    const nwf = drainOutbox(home2, { AH_HOME: home2, SWARM_COORDINATOR: a2 } as any);
+    execSync(`chmod 755 ${JSON.stringify(outboxDir(home2))}`);
+    const wfRec = JSON.parse(read(path.join(outboxDir(home2), "wf.json")));
+    t("CS-ONCE-GATE: first-bind write-fail ⇒ no publish + file preserved unbound", nwf === 0 && jsonCount(box2) === 0 && wfRec.target === undefined);
+  } else {
+    console.log("skip - CS-ONCE-GATE complete chain (root)");
+  }
+}
 // ---- CS-OUTBOX-SHAPE: null-first does not break the loop; later valid file still delivers once ----
 {
   const home = tmp();
