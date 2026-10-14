@@ -74,3 +74,15 @@
 - 她的动作边界: **只唤协调者,绝不直接唤成员/派活**——恢复编制是协调者职权(fleet-recovery 双声件),她碰成员=越层。
 - 唤起方式: herdr/tern 开一个 pane 跑注册表里的 resumeCmd(她有 process/run 能力),或经 swarm-carly-send 给已活协调者投「user 令继续 X」。
 - 多项目并行: 每项目一个协调者 sid+独立 durable 根;她的注册表是唯一跨项目视图——对话官是跨项目的,协调者是单项目的。
+
+## H. 迁移门清单(Carly 作为 Tern 侧验收权威,2026-10-14 五门判定)
+
+| 门 | 判定 | 放行条件 |
+|---|---|---|
+| G1 席位可观测 | READY-COND | 每次 Tern 更新后跑冒烟套件(ACP 块→权限→surface→deny)再放席位;盯 release_notes+help() 类型 diff |
+| G2 程序化批拒 | READY-COND | 首选 cx.session:event 对 layer.permission 节点发 action-click(Carly 指路,M3 在验);send_input 兜底 |
+| G3 插件跨更新 | NOT-READY | 关 auto_update 改受控 restart_to_update;更新后验插件再放行 |
+| G4 重启恢复 | READY-COND | 幂等复活脚本(席位清单=我方文件为事实源,不靠 Tern 布局);=swarm-recover tern 驱动版 |
+| G5 Carly 可用性 | NOT-READY(作唯一 SLA) | 关键截止 Tern 外后备(协调者 cron/TG);她=有人值守第一道提醒 |
+横切: 发信人无身份(呈批一次性码)/check 悄停用需监控/迁移期自动化与她的窗口分离。
+验收三方: Tern 侧=Carly;蜂群侧=审查链;整体放行=user。
