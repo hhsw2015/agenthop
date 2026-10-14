@@ -36,13 +36,12 @@ ck "bad-text: not laundered to a count" "garbage" "$(cat "$L0/cpa-probe.state")"
 ck "bad-text: no alert" "0" "$(alert "$L0")"
 rm -rf "$L0"
 
-# --- A2-CPA-STATE: write-fail on recovery must NOT false-clear the alert ---
-L0="$(newL0)"; mkdir -p "$L0/alerts"; printf '3' >"$L0/cpa-probe.state"; printf '{"kind":"cpa_down"}' >"$L0/alerts/cpa_down.json"
-chmod 500 "$L0"                                  # dir read-exec only => temp write (atomic persist) fails
-rc=$(up "$L0"); ck "write-fail recovery: exit 3" "3" "$rc"
-chmod 700 "$L0"
-ck "write-fail recovery: alert NOT false-cleared" "1" "$(alert "$L0")"
-ck "write-fail recovery: streak NOT reset" "3" "$(streak "$L0")"
+# --- A2-CPA-STATE: state-write fail on recovery => exit 3 (incomplete) + streak NOT reset (alert cleanup is a separate concern below) ---
+L0="$(newL0)"; mkdir -p "$L0/alerts"; printf '3' >"$L0/cpa-probe.state"
+chmod 500 "$L0"                                  # L0 read-exec only => temp (mktemp in L0) + atomic persist fail
+rc=$(up "$L0"); chmod 700 "$L0"
+ck "state-write-fail recovery: exit 3 (incomplete)" "3" "$rc"
+ck "state-write-fail recovery: streak NOT reset" "3" "$(streak "$L0")"
 rm -rf "$L0"
 
 # --- A2-CPA-JSON: a quoted URL stays parseable; fields round-trip ---
@@ -53,6 +52,37 @@ AGENTHOP_CPA_URL="$qurl" AGENTHOP_CPA_PROBE=false bash "$PROBE" "$L0" >/dev/null
 AGENTHOP_CPA_URL="$qurl" AGENTHOP_CPA_PROBE=false bash "$PROBE" "$L0" >/dev/null 2>&1
 parsed="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["kind"], d["consecutive_fails"], d["url"]==sys.argv[2])' "$L0/alerts/cpa_down.json" "$qurl" 2>&1)"
 ck "quoted-url: alert JSON parses + fields round-trip" "cpa_down 3 True" "$parsed"
+rm -rf "$L0"
+
+# --- A2-CPA-STATE fix a: a success idempotently clears a standing alert even when the streak is already 0 (no fast-path skip) ---
+L0="$(newL0)"; mkdir -p "$L0/alerts"; printf '0' >"$L0/cpa-probe.state"; printf '{"kind":"cpa_down"}' >"$L0/alerts/cpa_down.json"
+rc=$(up "$L0"); ck "zero-count recovery: standing alert cleared" "0" "$(alert "$L0")"; ck "zero-count recovery: exit 0" "0" "$rc"
+rm -rf "$L0"
+
+# --- A2-CPA-STATE fix a: a failed alert removal reports incomplete, never a silent success ---
+L0="$(newL0)"; mkdir -p "$L0/alerts"; printf '0' >"$L0/cpa-probe.state"; printf '{"kind":"cpa_down"}' >"$L0/alerts/cpa_down.json"
+chmod 500 "$L0/alerts"
+rc=$(up "$L0"); chmod 700 "$L0/alerts"
+ck "recovery removal-fail: exit 3 (incomplete)" "3" "$rc"
+ck "recovery removal-fail: alert NOT silently cleared" "1" "$(alert "$L0")"
+rm -rf "$L0"
+
+# --- A2-CPA-STATE fix b: a present-but-unreadable symlink carrier is NA and PRESERVED (not clobbered to a fake count) ---
+L0="$(newL0)"; mkdir -p "$L0/alerts" "$L0/prot"; printf '2' >"$L0/prot/real"; ln -s "$L0/prot/real" "$L0/cpa-probe.state"; chmod 000 "$L0/prot"
+rc=$(down "$L0"); chmod 700 "$L0/prot"
+ck "symlink-EACCES carrier: exit 2 (unavailable)" "2" "$rc"
+ck "symlink-EACCES carrier: still a symlink (not clobbered)" "1" "$([ -L "$L0/cpa-probe.state" ] && echo 1 || echo 0)"
+ck "symlink-EACCES carrier: underlying count untouched" "2" "$(cat "$L0/prot/real")"
+rm -rf "$L0"
+
+# --- A2-CPA-TEMP-OWN: foreign objects in the state dir are never written/moved/removed; no leftover temp (mktemp exclusive) ---
+L0="$(newL0)"; mkdir -p "$L0/alerts"; printf 'VICTIM' >"$L0/victim"; printf 'DECOY' >"$L0/decoy"; ln -s "$L0/victim" "$L0/decoy-link"
+down "$L0" >/dev/null; down "$L0" >/dev/null; down "$L0" >/dev/null
+ck "temp-own: foreign regular file untouched" "DECOY" "$(cat "$L0/decoy")"
+ck "temp-own: symlink victim untouched" "VICTIM" "$(cat "$L0/victim")"
+ck "temp-own: foreign symlink preserved" "1" "$([ -L "$L0/decoy-link" ] && echo 1 || echo 0)"
+ck "temp-own: no leftover temp files" "0" "$(find "$L0" -maxdepth 1 -name '.cpa-probe.*' 2>/dev/null | wc -l | tr -d ' ')"
+ck "temp-own: write succeeded (alert at 3-strike)" "1" "$(alert "$L0")"
 rm -rf "$L0"
 
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
