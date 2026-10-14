@@ -1,0 +1,6 @@
+schema = 1
+id = "swarm-observatory"
+name = "Swarm Observatory"
+version = "1.0.0"
+description = "Line② A6+A8 v1. A6: a cold-start canvas plus an authoritative Markdown snapshot (~/.agenthop/carly/canvas-snapshot.md), wayfinding whose every line is a swarm:// link to a durable file, refreshed by a 1-minute promptless check; a tern.route.link handler opens swarm://file/<path> and focuses swarm://pane/<id>. A8 v1 (observation group): four read-only Carly exports — swarm_status / swarm_queue / swarm_progress / swarm_flags — plus a tern.carly.context one-liner (在审N|候裁M|告警K) read from the plugin KV cache. Read-only over herdr and the durable swarm files, each export capped at 16 KiB JSON with a truncated flag. The only write is the snapshot it owns. Contract: docs/swarm/tern-batch2-contracts.md section 2 (+§2 addendum)."
+window = "window.luau"
