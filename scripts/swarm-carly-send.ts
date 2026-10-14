@@ -19,10 +19,9 @@
  */
 import { homedir } from "node:os";
 import path from "node:path";
-import { mkdirSync, writeFileSync, renameSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { mkdirSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { writeInbox, composeInboxMsg, type InboxMsg } from "../packages/bus/src/inbox.js";
+import { writeInbox, composeInboxMsg, publishUniqueAtomic, type InboxMsg } from "../packages/bus/src/inbox.js";
 import { resolveSession, listSessions } from "../packages/bus/src/swarm/task-liveness.js";
 import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { installInboxWake } from "../packages/bus/src/swarm/inbox-wake.js";
@@ -37,8 +36,10 @@ export function classifyArgs(argv: readonly string[]): Query {
   if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") return { kind: "usage" };
   const role = argv[0];
   if (role.startsWith("-")) return { kind: "usage", error: `unexpected flag "${role}"` };
-  const text = argv.slice(1).join(" ").trim();
-  if (text === "") return { kind: "usage", error: "empty message text" };
+  // DS-SEND-VERBATIM: join the (shell-split) args with a single space but do NOT mutate the result — the text is relayed byte-for
+  // -byte, so leading/trailing whitespace and newlines inside a single argument are preserved. Only a COPY is trimmed to test emptiness.
+  const text = argv.slice(1).join(" ");
+  if (text.trim() === "") return { kind: "usage", error: "empty message text" };
   return { kind: "send", role, text };
 }
 
@@ -59,15 +60,12 @@ function resolveHome(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /** FC-2 durable fallback: persist the (undeliverable-right-now) message to ~/.agenthop/carly/outbox/ for the dispatcher to drain.
- *  Atomic temp+rename; unique name so two sends never collide. Returns the file path. */
+ *  DS-OUTBOX-PUBLISH: reuse the inbox's publishUniqueAtomic — an EXCLUSIVE temp (wx) linked to a UNIQUE no-overwrite name — so two
+ *  fallbacks that collide on a name degrade to a fresh name, never one silently overwriting the other. Returns the published path. */
 function writeOutbox(home: string, role: string, msg: InboxMsg): string {
   const dir = path.join(home, ".agenthop", "carly", "outbox");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const file = path.join(dir, `${Date.now().toString().padStart(16, "0")}-${randomBytes(6).toString("hex")}.json`);
-  const tmp = `${file}.tmp-${randomBytes(4).toString("hex")}`;
-  writeFileSync(tmp, JSON.stringify({ to: role, msg }, null, 2) + "\n", { mode: 0o600 });
-  renameSync(tmp, file); // atomic within the filesystem
-  return file;
+  return publishUniqueAtomic(dir, JSON.stringify({ to: role, msg }, null, 2) + "\n", msg.ts);
 }
 
 export function run(argv: readonly string[], env: NodeJS.ProcessEnv = process.env): number {

@@ -78,16 +78,20 @@ export function wrapManagedBlock(body: string): string {
 
 /**
  * DUAL-WRITE splice: return `existing` with its managed block replaced by `block` (already marker-wrapped).
- *  - Both markers present (BEGIN before END) ⇒ replace from BEGIN through END inclusive; bytes before/after are exact.
- *  - No complete marker pair ⇒ APPEND the block (blank-line separated iff `existing` is non-empty), her content byte-for-byte. A
- *    lone BEGIN or END (corrupt half-marker) counts as "no pair" ⇒ append, never destroy her bytes.
- * Pure. Idempotent: re-splicing an already-current file with the same block yields the identical string.
+ *  - A complete pair ⇒ replace from BEGIN through END inclusive; bytes before/after are exact.
+ *  - No complete pair ⇒ APPEND the block (blank-line separated iff `existing` is non-empty), her content byte-for-byte.
+ * PAIRING (DS-PROJ-MARKER fix): take the FIRST END, then the LAST BEGIN strictly before it — so a stale ORPHAN BEGIN earlier in
+ * her content is NOT paired with a later block's END (which would delete everything between them, destroy her text, and break
+ * idempotency). The orphan stays as her bytes; only the real `BEGIN…END` block (whose BEGIN is the last one before its END) is
+ * replaced. A lone END (no BEGIN before it) ⇒ no pair ⇒ append. Pure. Idempotent on an already-current file.
  */
 export function spliceManagedBlock(existing: string, block: string): string {
-  const begin = existing.indexOf(SWARM_BEGIN);
-  const end = existing.indexOf(SWARM_END, begin + SWARM_BEGIN.length);
-  if (begin !== -1 && end !== -1) {
-    return existing.slice(0, begin) + block + existing.slice(end + SWARM_END.length);
+  const end = existing.indexOf(SWARM_END);
+  if (end !== -1) {
+    const begin = existing.lastIndexOf(SWARM_BEGIN, end);
+    if (begin !== -1 && begin + SWARM_BEGIN.length <= end) {
+      return existing.slice(0, begin) + block + existing.slice(end + SWARM_END.length);
+    }
   }
   if (existing === "") return block + "\n";
   const sep = existing.endsWith("\n") ? "\n" : "\n\n";

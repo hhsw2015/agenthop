@@ -57,10 +57,12 @@ export function isAdmissible(name: string, e: ProjectEntry): boolean {
  */
 export function buildProjectsRegistry(
   generated: ReadonlyArray<{ name: string; entry: Partial<ProjectEntry> }>,
-  existing: ProjectsRegistry = { projects: {} },
+  existing: ProjectsRegistry = { projects: emptyDict() },
 ): ProjectsRegistry {
-  const out: Record<string, ProjectEntry> = {};
-  const existingProjects = existing && existing.projects && typeof existing.projects === "object" ? existing.projects : {};
+  // DS-REG-KEY: a null-prototype dict so a legitimate project NAMED "__proto__" (or "constructor") is a normal OWN key, never a
+  // prototype write that would silently drop the entry or pollute. All three stages (build/serialize/parse) use this.
+  const out = emptyDict();
+  const existingProjects = existing && existing.projects && typeof existing.projects === "object" ? existing.projects : emptyDict();
   for (const [name, raw] of Object.entries(existingProjects)) {
     const e = normalizeEntry(raw as Partial<ProjectEntry>);
     if (isAdmissible(name, e)) out[name] = e;
@@ -72,11 +74,16 @@ export function buildProjectsRegistry(
   return { projects: out };
 }
 
+/** A prototype-less string→ProjectEntry dict (DS-REG-KEY): assigning reserved keys like "__proto__" writes an OWN property. */
+function emptyDict(): Record<string, ProjectEntry> {
+  return Object.create(null) as Record<string, ProjectEntry>;
+}
+
 /** Deterministic JSON: projects sorted by name, each entry's keys in a fixed order. Trailing newline so the file is a clean line.
  *  Equal inputs ⇒ byte-identical output (idempotent write). Pure. */
 export function serializeRegistry(reg: ProjectsRegistry): string {
   const names = Object.keys(reg.projects).sort();
-  const projects: Record<string, ProjectEntry> = {};
+  const projects = emptyDict(); // DS-REG-KEY: null-proto so a "__proto__" project name serializes as an own key
   for (const n of names) {
     const e = reg.projects[n];
     projects[n] = {
@@ -94,11 +101,11 @@ export function serializeRegistry(reg: ProjectsRegistry): string {
  *  Never throws (a corrupt file degrades to empty, so a regen rebuilds it). Pure. */
 export function parseRegistry(text: string): ProjectsRegistry {
   let raw: unknown;
-  try { raw = JSON.parse(text); } catch { return { projects: {} }; }
-  if (!raw || typeof raw !== "object") return { projects: {} };
+  try { raw = JSON.parse(text); } catch { return { projects: emptyDict() }; }
+  if (!raw || typeof raw !== "object") return { projects: emptyDict() };
   const projectsRaw = (raw as { projects?: unknown }).projects;
-  if (!projectsRaw || typeof projectsRaw !== "object") return { projects: {} };
-  const out: Record<string, ProjectEntry> = {};
+  if (!projectsRaw || typeof projectsRaw !== "object") return { projects: emptyDict() };
+  const out = emptyDict(); // DS-REG-KEY: null-proto so a parsed OWN "__proto__" entry assigns safely (no prototype write)
   for (const [name, e] of Object.entries(projectsRaw as Record<string, unknown>)) {
     out[name] = normalizeEntry((e ?? {}) as Partial<ProjectEntry>);
   }

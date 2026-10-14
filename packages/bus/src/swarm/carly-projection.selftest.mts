@@ -10,7 +10,7 @@
  *
  * Run: node_modules/.bin/tsx packages/bus/src/swarm/carly-projection.selftest.mts  (from repo root)
  */
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, utimesSync, unlinkSync } from "node:fs";
 import { execSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -165,6 +165,49 @@ const EMPTY: CarlyStatus = { heartbeat: [], alerts: [], digest: null };
   } else {
     console.log("skip - live FC-2 unreadable dir (root)");
   }
+}
+
+// ---- DS-PROJ-SOURCE: a CORRUPT (undecodable) non-consumed batch ⇒ uncertain ⇒ keep the good queue, never clear to (none) ----
+{
+  const home = tmpHome();
+  const b = openBatch(home, { owner: "coord", nowSec: 1, items: [{ id: "keep1", kind: "k", summary: "keep this ruling", suggestedAction: "approve" }] });
+  runCarlyProjection(home);
+  const good = read(heartbeatFile(home));
+  t("DS-PROJ-SOURCE: good queue established", good.includes("keep1"));
+  // corrupt the still-enumerated batch.json (bad JSON ⇒ readBatch null, not consumed)
+  writeFileSync(path.join(home, ".agenthop", "console", "decision-batches", b.batchId, "batch.json"), "{ corrupt not json");
+  const st = readCarlyStatus(home);
+  t("DS-PROJ-SOURCE: corrupt non-consumed batch ⇒ certain=false", st.certain === false);
+  const r = runCarlyProjection(home);
+  t("DS-PROJ-SOURCE: sweep SKIPS + good queue preserved (not cleared to none)", r.wrote === false && read(heartbeatFile(home)) === good);
+}
+// ---- DS-PROJ-MARKER: an orphan BEGIN in her content must not be eaten on the SECOND write ----
+{
+  const home = tmpHome();
+  mkdirSync(path.dirname(heartbeatFile(home)), { recursive: true });
+  const her = "# her notes\n\n<!-- swarm begin -->\nstale dangling line (no end)\n\nmore of her text\n";
+  writeFileSync(heartbeatFile(home), her);
+  writeManagedFile(heartbeatFile(home), "BODY1"); // first: appends a real block after her orphan
+  const after1 = read(heartbeatFile(home));
+  writeManagedFile(heartbeatFile(home), "BODY1"); // second with SAME body: must be byte-idempotent, must NOT eat her text
+  const after2 = read(heartbeatFile(home));
+  t("DS-PROJ-MARKER: her orphan BEGIN + text preserved across writes", after1.includes("stale dangling line") && after1.includes("more of her text"));
+  t("DS-PROJ-MARKER: second write byte-idempotent (orphan not paired with the new END)", after2 === after1 && after2.includes("more of her text"));
+}
+// ---- DS-PROJ-CONFLICT: the serialization lock is honored (busy ⇒ skip, keep file) + a stale lock is reclaimed ----
+{
+  const home = tmpHome();
+  writeCarlyProjection(home, FULL);
+  const good = read(heartbeatFile(home));
+  const lock = heartbeatFile(home) + ".lock";
+  writeFileSync(lock, String(process.pid)); // simulate another live writer holding the lock
+  const skipped = writeManagedFile(heartbeatFile(home), "SHOULD-NOT-LAND"); // bounded spin ⇒ busy
+  t("DS-PROJ-CONFLICT: lock held ⇒ write skipped (false) + file untouched", skipped === false && read(heartbeatFile(home)) === good);
+  // make the lock STALE (old mtime) ⇒ the next write reclaims it and proceeds
+  utimesSync(lock, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
+  const wrote = writeManagedFile(heartbeatFile(home), "NOWLANDS");
+  t("DS-PROJ-CONFLICT: stale lock reclaimed ⇒ write proceeds", wrote === true && read(heartbeatFile(home)).includes("NOWLANDS"));
+  try { unlinkSync(lock); } catch { /* released by the successful write */ }
 }
 
 console.log("all carly-projection selftests passed");

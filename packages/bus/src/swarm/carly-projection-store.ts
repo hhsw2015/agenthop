@@ -7,7 +7,7 @@
  * `writeCarlyProjection(home, status)` takes an already-normalized CarlyStatus so the write path is unit-tested with no real
  * sources; `readCarlyStatus(home)` is the thin adapter that reads the live durable sources into that shape.
  */
-import { mkdirSync, writeFileSync, renameSync, readFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readFileSync, unlinkSync, openSync, closeSync, statSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { homedir } from "node:os";
@@ -35,34 +35,72 @@ function readExisting(file: string): string {
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return ""; throw e; }
 }
 
-/** Atomic splice-write of ONE managed file: read her current bytes, replace only the managed block, write via temp+rename. The
- *  temp is same-dir (rename is atomic within a filesystem) with a random suffix (two concurrent sweeps never collide on the temp
- *  name and each rename lands a COMPLETE file). Returns true on write, false if skipped (no change ⇒ still rewrites identical
- *  bytes, which is harmless and keeps the path simple). */
-export function writeManagedFile(file: string, body: string): boolean {
-  const existing = readExisting(file);
-  const next = spliceManagedBlock(existing, wrapManagedBlock(body));
-  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = `${file}.tmp-${randomBytes(6).toString("hex")}`;
-  try {
-    writeFileSync(tmp, next, { mode: 0o600 });
-    renameSync(tmp, file);
-  } catch (e) {
-    try { unlinkSync(tmp); } catch { /* temp may not exist; best-effort */ }
-    throw e;
+/** Bounded synchronous sleep (no dep) for the lock spin. */
+function sleepMs(ms: number): void { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* best-effort */ } }
+
+/**
+ * DS-PROJ-CONFLICT — serialize the read-modify-write of a SHARED managed file behind an advisory lock (`<file>.lock`, O_EXCL).
+ * The managed region is swarm-owned, the rest is Carly's; because the whole file is a shared surface, a read-then-rename can
+ * clobber a concurrent writer's out-of-region edit. This lock makes the RMW a critical section: it is the "explicit + enforced
+ * serialization constraint" — EVERY writer of these files (every swarm sweep here) acquires it, so two writers can never
+ * interleave a lost update. A stale lock (holder crashed) older than STALE_MS is reclaimed so a crash can't wedge the projection;
+ * if the lock stays held (another live writer), we return busy and the caller HOLDs (next tick retries) rather than clobber.
+ * (A co-writer outside this module must honor the same lock — that is the documented contract; nothing else can protect a shared
+ * file against an uncooperative editor.)
+ */
+function withManagedLock<T>(file: string, fn: () => T): T | { busy: true } {
+  const lock = `${file}.lock`;
+  mkdirSync(path.dirname(lock), { recursive: true, mode: 0o700 });
+  const STALE_MS = 10000;
+  let fd = -1;
+  for (let t = 0; t < 100 && fd < 0; t++) {
+    try { fd = openSync(lock, "wx", 0o600); }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      try { if (Date.now() - statSync(lock).mtimeMs > STALE_MS) { unlinkSync(lock); continue; } } catch { /* vanished ⇒ retry */ }
+      sleepMs(20);
+    }
   }
-  return true;
+  if (fd < 0) return { busy: true };
+  try { return fn(); }
+  finally { try { closeSync(fd); } catch { /* */ } try { unlinkSync(lock); } catch { /* */ } }
+}
+
+/** EXCLUSIVELY create the temp (wx ⇒ our own fresh inode — never truncate/follow a pre-existing temp or a planted symlink), then
+ *  rename over the target; a fault removes only OUR temp (DS-TEMP-OWN). */
+function atomicReplace(file: string, data: string): void {
+  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  let tmp = "";
+  for (let t = 0; ; t++) {
+    tmp = `${file}.wtmp-${randomBytes(8).toString("hex")}`;
+    try { writeFileSync(tmp, data, { flag: "wx", mode: 0o600 }); break; }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && t < 8) continue; throw e; }
+  }
+  try { renameSync(tmp, file); }
+  catch (e) { try { unlinkSync(tmp); } catch { /* only our own temp */ } throw e; }
+}
+
+/** Splice-write of ONE managed file under the serialization lock: read her current bytes, replace only the managed block, write via
+ *  an exclusive temp + rename. Returns true on write, false if the lock is BUSY (another writer active ⇒ HOLD, retry next tick —
+ *  never clobber). The read-splice-rename all happen INSIDE the lock so a co-writer honoring the lock cannot interleave. */
+export function writeManagedFile(file: string, body: string): boolean {
+  const r = withManagedLock(file, () => {
+    const existing = readExisting(file);
+    atomicReplace(file, spliceManagedBlock(existing, wrapManagedBlock(body)));
+    return true;
+  });
+  return r === true;
 }
 
 /** Write BOTH managed files from a normalized status. HEARTBEAT.md carries the FROZEN 4-field awaiting-ruling queue (Carly scans
  *  it model-free); MEMORY.md carries alerts + the one-line digest + the usage note (deliverable ④) — all INSIDE the managed
  *  region so they are swarm-owned and regenerated, never hand-edited. Idempotent: equal status ⇒ byte-identical files. */
-export function writeCarlyProjection(home: string | undefined, status: CarlyStatus): { heartbeat: string; memory: string } {
+export function writeCarlyProjection(home: string | undefined, status: CarlyStatus): { heartbeat: string; memory: string; wroteHeartbeat: boolean; wroteMemory: boolean } {
   const hb = heartbeatFile(home);
   const mem = memoryFile(home);
-  writeManagedFile(hb, buildHeartbeatBody(status.heartbeat));
-  writeManagedFile(mem, buildMemoryBody(status) + "\n\n" + CARLY_USAGE_NOTE);
-  return { heartbeat: hb, memory: mem };
+  const wroteHeartbeat = writeManagedFile(hb, buildHeartbeatBody(status.heartbeat));
+  const wroteMemory = writeManagedFile(mem, buildMemoryBody(status) + "\n\n" + CARLY_USAGE_NOTE);
+  return { heartbeat: hb, memory: mem, wroteHeartbeat, wroteMemory };
 }
 
 /** Deliverable ④: the usage note written into Carly's MEMORY managed region. Addresses are ROLES (resolved via the F40 layer),
@@ -100,7 +138,9 @@ export function readCarlyStatus(home: string): { status: CarlyStatus; certain: b
       const c = readConsumedResult(home, id);
       if (c.consumed === true) continue;            // terminal ⇒ not awaiting
       const b = readBatch(home, id);
-      if (!b) continue;                              // foreign/corrupt/unprovable ⇒ skip (can't render its items)
+      if (!b) { certain = false; continue; }         // DS-PROJ-SOURCE: an enumerated, not-consumed batch we CANNOT decode is
+                                                     // UNCERTAIN — it may be a pending ruling; mark uncertain so the caller HOLDs
+                                                     // (keeps the last-good queue) instead of silently clearing it to "(none)".
       for (const it of b.items) heartbeat.push({ id: it.id, deadlineISO: "", waitingFor: "user", ask: it.summary });
     }
   } catch { certain = false; }                       // enumerate/consumed stat fault ⇒ uncertain ⇒ caller keeps last good
@@ -126,8 +166,9 @@ export function readCarlyStatus(home: string): { status: CarlyStatus; certain: b
 export function runCarlyProjection(home?: string): { wrote: boolean; reason?: string } {
   const h = carlyHome(home);
   const { status, certain } = readCarlyStatus(h);
-  if (!certain) return { wrote: false, reason: "source-uncertain" };
-  writeCarlyProjection(h, status);
+  if (!certain) return { wrote: false, reason: "source-uncertain" }; // keep her last-good files (never clear the queue on a fault)
+  const w = writeCarlyProjection(h, status);
+  if (!w.wroteHeartbeat || !w.wroteMemory) return { wrote: false, reason: "write-lock-busy" }; // another writer holds the lock ⇒ retry next tick
   return { wrote: true };
 }
 

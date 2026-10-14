@@ -67,4 +67,29 @@ const readJsonDir = (dir: string) => readdirSync(dir).filter((f) => f.endsWith("
   t("--help ⇒ exit 0", run(["--help"], { AH_HOME: tmpHome() } as any) === 0);
 }
 
+// ---- DS-SEND-VERBATIM: a single text arg's own leading/trailing whitespace + newlines are NOT trimmed ----
+{
+  const raw = " \tFirst line\n  second line  \n";
+  const q = classifyArgs(["coordinator", raw]);
+  t("DS-SEND-VERBATIM: classifyArgs preserves the arg's own whitespace/newlines", q.kind === "send" && q.text === raw);
+  // e2e: the preserved text is what lands in the box
+  const home = tmpHome();
+  const coordSid = "coord-verbatim-1";
+  mkdirSync(path.join(home, ".agenthop", "presence"), { recursive: true });
+  writeFileSync(path.join(home, ".agenthop", "presence", `${coordSid}.pid`), String(process.pid));
+  run(["coordinator", raw], { AH_HOME: home, SWARM_COORDINATOR: coordSid } as any);
+  const m = readJsonDir(path.join(home, ".agenthop", "inbox", coordSid))[0];
+  t("DS-SEND-VERBATIM: the verbatim text is delivered byte-for-byte", m.text === raw);
+}
+// ---- DS-OUTBOX-PUBLISH: two unresolvable sends ⇒ TWO outbox files (no silent overwrite) ----
+{
+  const home = tmpHome();
+  const env = { AH_HOME: home } as unknown as NodeJS.ProcessEnv; // unresolvable
+  run(["coordinator", "first"], env);
+  run(["coordinator", "second"], env);
+  const queued = readJsonDir(path.join(home, ".agenthop", "carly", "outbox"));
+  const texts = queued.map((q) => q.msg.text).sort();
+  t("DS-OUTBOX-PUBLISH: two sends ⇒ two distinct files, both survive (no overwrite)", queued.length === 2 && texts[0] === "first" && texts[1] === "second");
+}
+
 console.log("all swarm-carly-send selftests passed");

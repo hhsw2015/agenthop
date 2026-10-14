@@ -22,6 +22,7 @@ import {
   assembleProjectEntries,
   generateRegistry,
   readRegistry,
+  readRegistryResult,
   registryFile,
   lookupProjectOnDisk,
   type RegistryFacts,
@@ -68,8 +69,9 @@ const full = (e: Partial<ProjectEntry>): ProjectEntry => ({ repo: "", coordinato
   const [g] = assembleProjectEntries(facts);
   t("assemble: name defaults to agenthop", g.name === "agenthop");
   t("assemble: repo = coordinator cwd, resumeCmd carried, sid set", g.entry.repo === "/Users/x/Dev/agenthop" && g.entry.resumeCmd === "herdr resume coord" && g.entry.coordinatorSid === "coord-sid");
-  const none = assembleProjectEntries({ ...facts, coordinatorSid: null })[0];
-  t("assemble: no coordinator ⇒ blank-routed entry (dropped on build)", none.entry.coordinatorSid === "" && none.entry.repo === "");
+  t("assemble: no coordinator sid (offline) ⇒ emit nothing (preserve old)", assembleProjectEntries({ ...facts, coordinatorSid: null }).length === 0);
+  // DS-REG-ROSTER: sid RESOLVES but no matching roster member ⇒ emit nothing (presence resolvable != roster complete; never blank-overwrite)
+  t("assemble[DS-REG-ROSTER]: sid resolves but member missing ⇒ emit nothing", assembleProjectEntries({ ...facts, members: [] }).length === 0);
 }
 
 // ---- store round-trip ----
@@ -83,19 +85,48 @@ const full = (e: Partial<ProjectEntry>): ProjectEntry => ({ repo: "", coordinato
   writeFileSync(path.join(home, ".agenthop", "swarm", "roster-snapshot.json"), JSON.stringify(snap));
   const env = { AH_HOME: home, SWARM_COORDINATOR: coordSid } as unknown as NodeJS.ProcessEnv;
 
-  const reg = generateRegistry(home, env);
-  t("store: generate writes projects.json", readFileSync(registryFile(home), "utf8").includes("agenthop"));
+  const g = generateRegistry(home, env);
+  t("store: generate writes projects.json (written=true)", g.written === true && readFileSync(registryFile(home), "utf8").includes("agenthop"));
   const e = lookupProjectOnDisk(home, "agenthop");
   t("store: agenthop entry has repo + coordinatorSid + resumeCmd + durableRoot + fleetSnapshot", !!e && e.repo === "/Users/x/Dev/agenthop" && e.coordinatorSid === coordSid && e.resumeCmd === "herdr resume coord" && e.durableRoot === path.join(home, ".agenthop") && e.fleetSnapshot.endsWith("fleet-snapshot.json"));
 
   // manually seed another project, regen ⇒ it survives (non-destructive)
-  const withManual = buildProjectsRegistry([{ name: "sideproj", entry: { coordinatorSid: "side-sid", repo: "/side" } }], reg);
+  const withManual = buildProjectsRegistry([{ name: "sideproj", entry: { coordinatorSid: "side-sid", repo: "/side" } }], g.reg!);
   writeFileSync(registryFile(home), serializeRegistry(withManual));
   generateRegistry(home, env);
   t("store: non-destructive regen preserves a manually-seeded project", lookupProjectOnDisk(home, "sideproj")?.coordinatorSid === "side-sid" && lookupProjectOnDisk(home, "agenthop")?.coordinatorSid === coordSid);
 
   // absent file ⇒ empty, no crash
   t("store: readRegistry on a fresh home ⇒ empty", Object.keys(readRegistry(tmpHome()).projects).length === 0);
+}
+
+// ---- DS-REG-READ: an UNKNOWN (corrupt/unreadable) existing registry ⇒ generate HOLDS (preserves the file), never rebuilds empty ----
+{
+  const home = tmpHome();
+  const coordSid = "coord-read-xyz";
+  mkdirSync(path.join(home, ".agenthop", "presence"), { recursive: true });
+  writeFileSync(path.join(home, ".agenthop", "presence", `${coordSid}.pid`), String(process.pid));
+  mkdirSync(path.join(home, ".agenthop", "swarm"), { recursive: true });
+  writeFileSync(path.join(home, ".agenthop", "swarm", "roster-snapshot.json"), JSON.stringify({ version: 2, capturedAtSec: 1, members: [{ member: coordSid, tool: "claude", cwd: "/repo", role: null, resumeCmd: "cmd", title: "t" }] }));
+  const env = { AH_HOME: home, SWARM_COORDINATOR: coordSid } as unknown as NodeJS.ProcessEnv;
+  // corrupt existing projects.json (present but unparseable) — offline wake info the roster can't rebuild
+  mkdirSync(path.dirname(registryFile(home)), { recursive: true });
+  const corrupt = '{"projects": OFFLINE-WAKE-INFO not json';
+  writeFileSync(registryFile(home), corrupt);
+  const res = generateRegistry(home, env);
+  t("DS-REG-READ: corrupt existing ⇒ generate NOT written + file byte-identical (preserved)", res.written === false && (res.reason || "").includes("unreadable") && readFileSync(registryFile(home), "utf8") === corrupt);
+  t("DS-REG-READ: readRegistryResult distinguishes absent vs unknown", readRegistryResult(tmpHome()).kind === "absent" && readRegistryResult(home).kind === "unknown");
+}
+
+// ---- DS-REG-KEY: a project literally named "__proto__" survives build / serialize / parse / lookup ----
+{
+  const reg = buildProjectsRegistry([{ name: "__proto__", entry: { coordinatorSid: "p", repo: "/p" } }], { projects: Object.create(null) });
+  t("DS-REG-KEY: __proto__ project is an own entry after build", lookupProject(reg, "__proto__")?.coordinatorSid === "p");
+  const round = parseRegistry(serializeRegistry(reg));
+  t("DS-REG-KEY: __proto__ survives serialize+parse", lookupProject(round, "__proto__")?.coordinatorSid === "p");
+  // and a hostile JSON with its own __proto__ key does not pollute / is not silently dropped on parse
+  const parsed = parseRegistry('{"projects":{"__proto__":{"coordinatorSid":"x","repo":"/x","resumeCmd":"","fleetSnapshot":"","durableRoot":""}}}');
+  t("DS-REG-KEY: parse of a __proto__ JSON key ⇒ own entry, no pollution", lookupProject(parsed, "__proto__")?.coordinatorSid === "x" && (({}) as any).coordinatorSid === undefined);
 }
 
 console.log("all projects-registry selftests passed");
