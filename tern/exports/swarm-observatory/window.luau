@@ -163,10 +163,21 @@ local function collectReviews()
         if type(obj) ~= "table" then
           return reviews, REVIEW_QUEUE_DIR .. "/" .. nm -- decoded non-table ⇒ corrupt ⇒ UNKNOWN
         end
-        if obj.item then
-          local item, round = parse.splitRoundSuffix(tostring(obj.item))
+        if obj.item ~= nil then
+          -- FC-2: validate the row's known leaves (item/sha/seat/state strings, round a number) before building it.
+          -- A present-but-wrong-type leaf is corrupt ⇒ UNKNOWN (keep last-good); never tostring/default over it.
+          if
+            type(obj.item) ~= "string"
+            or (obj.sha ~= nil and type(obj.sha) ~= "string")
+            or (obj.seat ~= nil and type(obj.seat) ~= "string")
+            or (obj.state ~= nil and type(obj.state) ~= "string")
+            or (obj.round ~= nil and type(obj.round) ~= "number")
+          then
+            return reviews, REVIEW_QUEUE_DIR .. "/" .. nm -- present file, bad row field ⇒ corrupt ⇒ UNKNOWN
+          end
+          local _, round = parse.splitRoundSuffix(obj.item)
           reviews[#reviews + 1] = {
-            item = obj.item or item,
+            item = obj.item,
             sha = obj.sha or "",
             seat = obj.seat or "",
             round = obj.round or round,

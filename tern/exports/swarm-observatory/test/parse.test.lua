@@ -74,6 +74,37 @@ do
   ck("parseReviewQueue: empty table => not malformed (legal empty)", m5 == false)
 end
 
+-- parseReviewQueue RECORD/LEAF validation (r4 TE-SOURCE-UNKNOWN, one layer down): the bucket is a table but the
+-- records inside are bad. Validate to the leaf, not the container. A bad element/leaf ⇒ whole query malformed.
+do
+  -- a non-table element in a present pending bucket (r3 silently skipped this => false-empty)
+  local r1, m1 = parse.parseReviewQueue({ pending = { 123 } }, "s")
+  ck("parseReviewQueue: pending=[123] (non-table element) => malformed", m1 == true)
+  -- a map masquerading as an array (r3's ipairs saw nothing => false-empty)
+  local _, m2 = parse.parseReviewQueue({ pending = { task = "queued-r1", sha = "abc1234" } }, "s")
+  ck("parseReviewQueue: pending as map-not-array => malformed", m2 == true)
+  -- a record whose known leaf is the wrong type (r3 exported sha:{bad=true} as-is)
+  local _, m3 = parse.parseReviewQueue({ active = { task = "thing-r2", sha = { bad = true } } }, "s")
+  ck("parseReviewQueue: active.sha a table (wrong leaf) => malformed", m3 == true)
+  local _, m4 = parse.parseReviewQueue({ pending = { { task = "a-r1", sha = 7 } } }, "s")
+  ck("parseReviewQueue: pending record sha a number => malformed", m4 == true)
+  local _, m5 = parse.parseReviewQueue({ seat2 = { sha = "s", status = { bad = true } } }, "s")
+  ck("parseReviewQueue: seat2.status a table (wrong leaf) => malformed", m5 == true)
+  local _, m6 = parse.parseReviewQueue({ completedCurrent = { task = 5, sha = "s" } }, "s")
+  ck("parseReviewQueue: completedCurrent.task a number => malformed", m6 == true)
+  -- false zeros guard: a bad pending record must NOT yield a success empty list
+  ck("parseReviewQueue: bad pending record does not produce silent rows", #r1 == 0 and m1 == true)
+  -- positives stay legal: clean array of records, legal empty array, missing-optional, unknown-extension field
+  local g1, mg1 = parse.parseReviewQueue({ pending = { { task = "a-r1", sha = "s" }, { task = "b-r2", sha = "t" } } }, "s")
+  ck("parseReviewQueue: clean pending array => not malformed, 2 rows", mg1 == false and #g1 == 2)
+  local _, mg2 = parse.parseReviewQueue({ pending = {} }, "s")
+  ck("parseReviewQueue: empty pending array => not malformed (legal empty)", mg2 == false)
+  local _, mg3 = parse.parseReviewQueue({ active = { task = "a-r1" } }, "s")
+  ck("parseReviewQueue: record missing optional sha => not malformed", mg3 == false)
+  local _, mg4 = parse.parseReviewQueue({ active = { task = "a-r1", sha = "s", note = "extra" } }, "s")
+  ck("parseReviewQueue: unknown extension field => not malformed", mg4 == false)
+end
+
 -- parseProgressCycles over a synthetic PROGRESS body
 do
   local text = table.concat({

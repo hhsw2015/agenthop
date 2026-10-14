@@ -59,9 +59,13 @@ end
 
 -- Flatten one reviewer's active-review-queue JSON object (e.g. happycapy-active-review-queue.json) into review rows
 -- {item, sha, seat, round, state}. `seat` is the reviewer seat (derived from the file name by the caller).
--- Returns (rows, malformed). FC-2: a PRESENT-but-wrong-type known field (pending/active/seat2/completedCurrent), or a
--- root that is not a table, is a CORRUPT payload — malformed=true — NOT a legal empty queue. The caller must treat
--- malformed as UNKNOWN (fail / keep last-good), never silently emit an empty list. A simply-absent field is fine.
+-- Returns (rows, malformed). FC-2 — validate to the leaf, not the container. malformed=true (⇒ the caller treats the
+-- whole query as UNKNOWN: fail / keep last-good, never an empty list) when: the root is not a table; a known field
+-- (pending/active/seat2/completedCurrent) is present-but-not-a-table; a present pending bucket is not a clean array
+-- (a map masquerading as an array), or holds a non-table element; or any record's known leaf (task/sha/status) is
+-- present-but-wrong-type. A simply-absent field, a legal empty object/array, a missing optional field, and unknown
+-- extension fields are all fine. Never tostring/default over a present wrong-type value, nor silently drop a bad
+-- element and claim a complete queue.
 function M.parseReviewQueue(obj, seat)
   local out = {}
   if type(obj) ~= "table" then
@@ -72,6 +76,32 @@ function M.parseReviewQueue(obj, seat)
   local function badField(v)
     return v ~= nil and type(v) ~= "table" -- PRESENT but not a table ⇒ corrupt known field
   end
+  -- A review record: a table whose known string leaves (task/sha/status), when present, are strings.
+  -- FC-2 "validate to the leaf, not the container": a present-but-wrong-leaf-type field is corrupt (never
+  -- tostring/default over it); a non-table element is corrupt. Missing optional and unknown extension fields are fine.
+  local function validRecord(e)
+    if type(e) ~= "table" then
+      return false
+    end
+    if e.task ~= nil and type(e.task) ~= "string" then
+      return false
+    end
+    if e.sha ~= nil and type(e.sha) ~= "string" then
+      return false
+    end
+    if e.status ~= nil and type(e.status) ~= "string" then
+      return false
+    end
+    return true
+  end
+  -- A clean 1..n sequence: a non-empty object with map/holey keys is NOT a legal empty array (it is corrupt).
+  local function isCleanArray(t)
+    local n = 0
+    for _ in pairs(t) do
+      n = n + 1
+    end
+    return n == #t
+  end
   local function add(task, sha, state)
     local item, round = M.splitRoundSuffix(task or "")
     out[#out + 1] = { item = item, sha = sha or "", seat = seat, round = round, state = state }
@@ -79,33 +109,51 @@ function M.parseReviewQueue(obj, seat)
   if badField(obj.pending) then
     malformed = true
   elseif type(obj.pending) == "table" then
-    for _, e in ipairs(obj.pending) do
-      if type(e) == "table" then
-        add(e.task, e.sha, "queued")
+    if not isCleanArray(obj.pending) then
+      malformed = true -- map masquerading as array ⇒ not a legal empty list ⇒ unknown
+    else
+      for _, e in ipairs(obj.pending) do
+        if validRecord(e) then
+          add(e.task, e.sha, "queued")
+        else
+          malformed = true -- a bad record inside a present bucket ⇒ whole query unknown
+        end
       end
     end
   end
   if badField(obj.active) then
     malformed = true
   elseif type(obj.active) == "table" then
-    add(obj.active.task, obj.active.sha, "reviewing")
+    if validRecord(obj.active) then
+      add(obj.active.task, obj.active.sha, "reviewing")
+    else
+      malformed = true
+    end
   end
   if badField(obj.seat2) then
     malformed = true
   elseif type(obj.seat2) == "table" then
-    -- seat2 carries sha + status + remain but no task name
-    out[#out + 1] = {
-      item = "seat2",
-      sha = obj.seat2.sha or "",
-      seat = seat,
-      round = 0,
-      state = obj.seat2.status or "in-review",
-    }
+    if validRecord(obj.seat2) then
+      -- seat2 carries sha + status + remain but no task name
+      out[#out + 1] = {
+        item = "seat2",
+        sha = obj.seat2.sha or "",
+        seat = seat,
+        round = 0,
+        state = obj.seat2.status or "in-review",
+      }
+    else
+      malformed = true
+    end
   end
   if badField(obj.completedCurrent) then
     malformed = true
   elseif type(obj.completedCurrent) == "table" then
-    add(obj.completedCurrent.task, obj.completedCurrent.sha, "done")
+    if validRecord(obj.completedCurrent) then
+      add(obj.completedCurrent.task, obj.completedCurrent.sha, "done")
+    else
+      malformed = true
+    end
   end
   return out, malformed
 end

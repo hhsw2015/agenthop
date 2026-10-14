@@ -306,6 +306,7 @@ local function newHost(override)
     setResponseStdout = function(s) response.stdout = s end,
     putJson = putJson,
     putFile = putFile,
+    putDir = putDir,
     setFailFocus = function(v) failFocus = v end,
     toasts = toasts,
     focuses = focuses,
@@ -396,6 +397,10 @@ do
     { name = "decode-error {broken", apply = function(h, p) h.putFile(p, "{broken") end },       -- unregistered text => decode errors
     { name = "non-table root 123", apply = function(h, p) h.putJson(p, 123) end },               -- decodes to a number
     { name = "wrong-type active", apply = function(h, p) h.putJson(p, { active = "not-a-record" }) end },
+    -- r4: a valid bucket holding bad records (validate to the leaf, not the container)
+    { name = "pending=[123] non-table elem", apply = function(h, p) h.putJson(p, { pending = { 123 } }) end },
+    { name = "pending map-not-array", apply = function(h, p) h.putJson(p, { pending = { task = "queued-r1", sha = "abc1234" } }) end },
+    { name = "active.sha wrong leaf", apply = function(h, p) h.putJson(p, { active = { task = "thing-r2", sha = { bad = true } } }) end },
   }
   for _, c in ipairs(cases) do
     local h = newHost(false)
@@ -408,6 +413,29 @@ do
     h.refreshCmd()
     ck("corrupt-queue [" .. c.name .. "]: context keeps last-good (not 在审 0)", h.context() == before)
   end
+end
+
+-- ================================================================================================================
+-- TE-SOURCE-UNKNOWN backup loop (r4): the backup review-queue dir is the SECOND input ring. A row whose known leaf is
+-- the wrong type (e.g. state a table) must be UNKNOWN too -> swarm_queue FAILS + context keeps last-good (never 在审 0).
+-- ================================================================================================================
+do
+  local h = newHost(false)
+  h.refreshCmd()
+  local before = h.context() -- 在审1|候裁1|告警1 (from the reports loop)
+  local qfile = h.paths.reviewQueue .. "/happycapy-active-review-queue.json"
+  h.putDir(h.paths.reviewQueue, { "happycapy-active-review-queue.json" })
+  h.putJson(qfile, { item = "thing-r1", sha = "abc1234", state = { bad = true } }) -- state wrong leaf type
+  local q, eq = h.invoke("swarm_queue")
+  ck("backup-queue bad row: swarm_queue FAILS (not an exported object-state row)", q == nil and type(eq) == "string")
+  h.refreshCmd()
+  ck("backup-queue bad row: context keeps last-good (not 在审 0)", h.context() == before)
+  -- positive control: a well-typed backup row is accepted and adds a reviewing review
+  local h2 = newHost(false)
+  h2.putDir(h2.paths.reviewQueue, { "happycapy-active-review-queue.json" })
+  h2.putJson(h2.paths.reviewQueue .. "/happycapy-active-review-queue.json", { item = "extra-r1", sha = "def5678", state = "reviewing" })
+  local q2, eq2 = h2.invoke("swarm_queue")
+  ck("backup-queue good row: swarm_queue ok, 2 reviews", eq2 == nil and q2 and #q2.reviews == 2)
 end
 
 -- ================================================================================================================
