@@ -14,7 +14,7 @@
 # EXCLUSIVELY-created temp (mktemp) atomically renamed. Alert JSON uses a real encoder (quoted URL stays parseable).
 #
 # Usage: cpa-probe.sh [L0-dir]   Env: AGENTHOP_CPA_URL, AGENTHOP_CPA_PROBE (test hook: 0=up/2=unknown/other-nonzero=down),
-#        AGENTHOP_CPA_HTTP (test: inject an HTTP code string; 000 = simulate a connection failure)
+#        AGENTHOP_CPA_HTTP (test: inject an HTTP code string; 000 = no connect) + AGENTHOP_CPA_RC (test: inject curl exit code; default 0)
 # Exit:  0 up+clean  1 down+advanced  2 down+state-unavailable  3 persist/cleanup incomplete  4 probe UNKNOWN (inconclusive; no state change)
 set -u
 
@@ -25,21 +25,26 @@ alert_file="$alerts/cpa_down.json"
 url="${AGENTHOP_CPA_URL:-http://127.0.0.1:8318/healthz}"
 mkdir -p "$alerts" 2>/dev/null || true
 
-# THREE-STATE probe (F1): 0=UP, 1=DOWN (connection failure only), 2=UNKNOWN (responded non-200: auth-gated 401, 404, 5xx — never a false
-# DOWN). Seams: AGENTHOP_CPA_PROBE exit code (0=up / 2=unknown / any other nonzero=down), or AGENTHOP_CPA_HTTP to inject the HTTP code
-# string (000 => simulate a connection failure) so the classification is testable without a live server.
+# THREE-STATE probe (F1): 0=UP (complete 200), 1=DOWN (transfer failure: curl nonzero exit / no connect / 000), 2=UNKNOWN (complete non-200:
+# auth-gated 401, 404, 5xx — never a false DOWN). Seams: AGENTHOP_CPA_PROBE exit code (0=up / 2=unknown / any other nonzero=down), or
+# AGENTHOP_CPA_HTTP (inject the HTTP code string) + AGENTHOP_CPA_RC (inject the curl exit code; default 0) so the status-code x exit-code
+# matrix is testable without a live server.
 if [ -n "${AGENTHOP_CPA_PROBE:-}" ]; then
   "$AGENTHOP_CPA_PROBE"; hrc=$?
   case "$hrc" in 0) probe=0 ;; 2) probe=2 ;; *) probe=1 ;; esac
 else
   if [ -n "${AGENTHOP_CPA_HTTP:-}" ]; then
-    http="$AGENTHOP_CPA_HTTP"; rc=0; [ "$http" = "000" ] && rc=7
+    http="$AGENTHOP_CPA_HTTP"; rc="${AGENTHOP_CPA_RC:-0}"   # test: inject HTTP code + optional curl exit code (rc); default rc=0
   else
     http="$(curl -s -m 2 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)"; rc=$?
   fi
-  if [ "$http" = "200" ]; then probe=0                                            # UP
-  elif [ "$rc" -ne 0 ] || [ -z "$http" ] || [ "$http" = "000" ]; then probe=1     # connection failure => DOWN
-  else probe=2                                                                    # responded non-200 => UNKNOWN (not a false DOWN)
+  # ORDER MATTERS (F1 r2 / F1-CURL-RESULT): 200 is only the HEADER; the TRANSFER can still fail (truncated body=rc18, read timeout=rc28)
+  # with %{http_code} still "200". Per the contract "curl fail => DOWN", test transfer-level failure FIRST, confirm UP only on a COMPLETE
+  # 200. A 200 header with a nonzero curl exit must NEVER read UP / clear the alert. (same lesson as CS-OUTBOX-ONCE: one OK signal != the
+  # whole chain OK — 200 is about the header, rc is about the whole transfer.)
+  if [ "$rc" -ne 0 ] || [ -z "$http" ] || [ "$http" = "000" ]; then probe=1       # curl failed / incomplete transfer / no connect => DOWN
+  elif [ "$http" = "200" ]; then probe=0                                           # COMPLETE 200 => UP
+  else probe=2                                                                     # complete non-200 (401/404/5xx) => UNKNOWN
   fi
 fi
 
