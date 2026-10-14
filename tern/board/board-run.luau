@@ -1,27 +1,28 @@
 -- agenthop tern-board — IO shell for the board projection (A4/A5). Pure cores live in board.luau; this file holds the durable-name
--- PARSERS (pure, fixture-tested) + run(deps) orchestration + default_deps() (the only place that touches io/os/git). Everything run()
--- needs is injected, so the 3-fixture law is driven with fake deps + real temp files. Standalone Lua 5.5.
+-- PARSERS + selection helpers (pure, fixture-tested) + run(deps) orchestration + default_deps() (the only place that touches io/os/git).
+-- Standalone Lua 5.5. r4 invariant (TB-FC2): exit status / errno is propagated through the ENTIRE gather chain — a failed read / recency
+-- query / git query ABORTS the publish (keeps the last good board); it is never folded into a "legitimate" empty/false value.
 
 local board = require("board")
 local R = {}
 
--- POSIX single-quote shell escaping (TB-QUOTE): Lua string.format("%q") escapes for LUA, and inside shell DOUBLE quotes `$()`/backticks/
--- `$var` STILL expand — a review-reports name or repo path containing `$(...)` would execute. Single-quoting disables ALL expansion; an
--- embedded single quote is closed, escaped, reopened ('\''). Every value that reaches a shell goes through this.
+-- POSIX single-quote shell escaping (TB-QUOTE): inside shell DOUBLE quotes `$()`/backticks/`$var` still expand; single-quoting disables
+-- ALL expansion (an embedded single quote is closed/escaped/reopened). Every value that reaches a shell goes through this.
 function R.shq(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
 local shq = R.shq
 
+-- popen a command; return (stdout_lines, ok, exit_code). lua 5.4/5.5 p:close() -> ok(bool), "exit", code.
 local function popen_status(cmd)
   local out = {}
   local p = io.popen(cmd, "r")
   if not p then return out, false, -1 end
   for line in p:lines() do out[#out + 1] = line end
-  local ok, _, code = p:close() -- lua 5.4/5.5: ok(bool), "exit", code
+  local ok, _, code = p:close()
   return out, ok == true, code or -1
 end
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
--- PURE parsers for the durable names. Item names contain hyphens/dots; anchor on the KNOWN middle tokens + a 7+ hex sha, non-greedy item.
+-- PURE parsers for the durable names.
 -- ---------------------------------------------------------------------------------------------------------------------------------
 function R.parse_review_dir(name)
   local item, sha, seat = string.match(name, "^(.-)%-([0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]+)%-review%-(.+)$")
@@ -41,9 +42,7 @@ function R.parse_board_file(name)
   return nil
 end
 
--- PURE (TB-BRANCH): pick the highest-NUMBERED batch from a list of IN-FLIGHT branch names. A lexical max would pick "rehearse-batch-9"
--- over "rehearse-batch-23"; numeric parse fixes it. (The caller passes only `--no-merged main` branches, so a merged old batch is already
--- excluded — this helper owns the ordering, the git flag owns the in-flight filter.)
+-- PURE (TB-BRANCH): highest-NUMBERED batch among in-flight names (lexical max would pick batch-9 over batch-23).
 function R.pick_batch(inflight_names)
   local branch, bestnum = nil, -1
   for _, b in ipairs(inflight_names or {}) do
@@ -53,24 +52,30 @@ function R.pick_batch(inflight_names)
   return branch
 end
 
--- PURE (TB-ARCH): the arch-review signoff must reference THIS batch's tip SHA — a `batch*-dual-signoff-*` name CONTAINING tip7. Any other
--- batch's/old tip's signoff does NOT tick arch-review (mtime-late ≠ correct attribution). Returns the matching name or nil.
-function R.match_arch(names, tip7)
-  if not tip7 or tip7 == "" then return nil end
+-- PURE (TB-ARCH): the arch-review signoff must be THIS batch's own. Parse the FIXED name structure `batch<N>-dual-signoff-<sha>-<...>`
+-- and require (a) the batch number equals `batch_num` AND (b) the parsed SHA FIELD is a prefix of the full tip SHA. A tip7 that merely
+-- appears in some other field (e.g. a reviewer suffix) does NOT count. Returns the matching name or nil.
+function R.match_arch(names, batch_num, tip_sha)
+  if not batch_num or not tip_sha or tip_sha == "" then return nil end
   for _, n in ipairs(names or {}) do
-    if n:match("^batch.*dual%-signoff") and n:find(tip7, 1, true) then return n end
+    local bn, shafield = string.match(n, "^batch(%d+)%-dual%-signoff%-([0-9a-f]+)%-")
+    if bn and shafield and tonumber(bn) == tonumber(batch_num) and tip_sha:sub(1, #shafield) == shafield then
+      return n
+    end
   end
   return nil
 end
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
--- PURE gather: build the UNIFIED newest-first `rounds` stream (review|signoff interleaved, as listed) + board + the FC-2 source statuses.
--- deps.list_reviews()/list_board() each return (names, status) where status = "read"|"absent"|"unreadable" (status nil ⇒ "read", for
--- simple fakes). recency is folded per round from deps.recent_set().
+-- PURE gather: UNIFIED newest-first `rounds` stream (review|signoff) + board + FC-2 source statuses + recency ok.
+--   deps.list_reviews()/list_board() -> (names, status: "read"|"absent"|"unreadable")
+--   deps.recent_set()                -> (set, ok)   (ok=false ⇒ recency query failed ⇒ run must abort)
 -- ---------------------------------------------------------------------------------------------------------------------------------
 function R.gather(deps)
   local rounds, brd = {}, {}
-  local recent = (deps.recent_set and deps.recent_set()) or {}
+  local recent, recent_ok = deps.recent_set()
+  recent = recent or {}
+  if recent_ok == nil then recent_ok = true end
   local rnames, rstatus = deps.list_reviews()
   for _, name in ipairs(rnames or {}) do
     local s = R.parse_signoff_dir(name)
@@ -85,24 +90,44 @@ function R.gather(deps)
   for _, name in ipairs(bnames or {}) do
     local b = R.parse_board_file(name); if b then brd[#brd + 1] = b end
   end
-  return { rounds = rounds, board = brd, review_status = rstatus or "read", board_status = bstatus or "read" }
+  return { rounds = rounds, board = brd, review_status = rstatus or "read", board_status = bstatus or "read", recent_ok = recent_ok }
 end
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
--- run(deps): gather -> (FC-2 guard) -> classify/render -> atomic write of BOTH files. TB-FC2: an UNREADABLE critical source must NOT
--- overwrite a good board with a clean-empty projection — abort and keep the last good board. An ABSENT source is legitimately empty.
+-- run(deps): gather -> (FC-2 abort guards) -> resolve ancestry (tri-state, abort on fatal) -> classify/render -> atomic write of BOTH.
+-- ABORT (keep last good board, write nothing) when ANY necessary query fails: a source dir is unreadable, the recency query failed, a
+-- git ancestry check is fatal (exit ≠ 0/1), or the batch discovery git failed. An ABSENT source is legitimately empty (proceed).
 -- ---------------------------------------------------------------------------------------------------------------------------------
+local function abort(reason, extra)
+  local r = { wrote_review = false, wrote_runbook = false, error = reason, counts = {}, batches = 0 }
+  if extra then for k, v in pairs(extra) do r[k] = v end end
+  return r
+end
+
 function R.run(deps)
   local facts = R.gather(deps)
   if facts.review_status == "unreadable" or facts.board_status == "unreadable" then
-    return { wrote_review = false, wrote_runbook = false, error = "unreadable-source",
-             review_status = facts.review_status, board_status = facts.board_status, counts = {}, batches = 0 }
+    return abort("unreadable-source", { review_status = facts.review_status, board_status = facts.board_status })
   end
-  local lanes = board.classify(facts, deps.is_ancestor)
+  if not facts.recent_ok then return abort("recency-query-failed") end
+
+  -- Resolve ancestry for every DISTINCT signoff SHA up front (tri-state). A FATAL (exit 128 / other) aborts the publish — only exit 1
+  -- (legitimate non-ancestor) is a value. This keeps classify pure (it receives a resolved yes/no lookup) AND never mislanes on a fatal.
+  local ancestry = {}
+  for _, r in ipairs(facts.rounds) do
+    if r.kind == "signoff" and ancestry[r.sha] == nil then
+      local st = deps.ancestry(r.sha)
+      if st == "error" then return abort("ancestry-fatal", { sha = r.sha }) end
+      ancestry[r.sha] = st
+    end
+  end
+  local lanes = board.classify(facts, function(sha) return ancestry[sha] == "yes" end)
   local review_md = board.render_review_board(lanes)
 
+  local blist, bok = deps.batches()
+  if bok == false then return abort("batch-query-failed") end
   local batches = {}
-  for _, b in ipairs(deps.batches() or {}) do
+  for _, b in ipairs(blist or {}) do
     batches[#batches + 1] = { branch = b.branch, steps = board.runbook_steps(b.steps_facts), artifacts = b.artifacts }
   end
   local runbook_md = board.render_runbook_board(batches)
@@ -116,10 +141,8 @@ function R.run(deps)
 end
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
--- write_atomic (TB-OWN + TB-WRITE): an EXCLUSIVE same-dir temp via `mktemp` (the host primitive with verified exclusive-create — lua 5.5
--- io.open has no "wx", and a random io.open name could truncate/move a foreign object or follow a planted symlink), then WRITE + CLOSE
--- with their returns CHECKED (a mid-write/flush failure must NOT publish a half board), then os.rename (atomic). Any failure removes our
--- OWN temp and returns false — the live board is left untouched (the caller keeps the last good board).
+-- write_atomic (TB-OWN + TB-WRITE): exclusive same-dir temp via mktemp; CHECK write + close returns; os.rename; any failure removes our
+-- OWN temp and returns false (live board untouched). (lua 5.5 io.open has no "wx".)
 -- ---------------------------------------------------------------------------------------------------------------------------------
 function R.write_atomic(path, text)
   local dir = path:match("^(.*)/[^/]+$") or "."
@@ -137,14 +160,20 @@ function R.write_atomic(path, text)
   return true
 end
 
--- three-state directory listing (TB-FC2): "read" (names, maybe empty), "absent" (dir doesn't exist — legitimately empty), "unreadable"
--- (exists but ls failed, e.g. EACCES — caller must NOT treat as empty). time_sort = newest-first (`ls -1t`).
-local function list_dir(dir, time_sort)
-  local lines, ok = popen_status("ls " .. (time_sort and "-1t " or "-1 ") .. shq(dir) .. " 2>/dev/null")
-  if ok then return lines, "read" end
-  local present = os.execute("test -e " .. shq(dir) .. " >/dev/null 2>&1")
-  if present == true or present == 0 then return {}, "unreadable" end
-  return {}, "absent"
+-- ---------------------------------------------------------------------------------------------------------------------------------
+-- list_dir (TB-FC2): three-state over REAL errno. A trailing slash forces DIRECTORY semantics (a regular file ⇒ ENOTDIR, not a bogus
+-- one-name "read"). On ls failure, stderr is captured and classified: only a clear ENOENT ("No such file") ⇒ "absent"; EACCES
+-- ("Permission denied"), ENOTDIR ("Not a directory") and ANY other error ⇒ "unreadable" (conservative — never clobber on uncertainty).
+-- `test -e` is NOT used (it cannot see past an EACCES ancestor and would mislabel that as absent).
+-- ---------------------------------------------------------------------------------------------------------------------------------
+function R.list_dir(dir, time_sort)
+  local path = dir .. "/" -- force dir semantics: a regular file ⇒ "Not a directory"
+  local names, ok = popen_status("ls -1" .. (time_sort and "t" or "") .. " " .. shq(path) .. " 2>/dev/null")
+  if ok then return names, "read" end
+  local err = popen_status("ls -1 " .. shq(path) .. " 2>&1 1>/dev/null") -- capture stderr to classify the errno
+  local msg = table.concat(err, " ")
+  if msg:find("No such file", 1, true) then return {}, "absent" end
+  return {}, "unreadable"
 end
 
 local function file_mtime(path)
@@ -157,53 +186,57 @@ local function exists(path)
   return file_mtime(path) ~= nil
 end
 
--- git merge-base --is-ancestor <sha> main : true iff sha is on main. NON-ancestor is a legitimate exit 1 (false), NOT a read fault
--- (TB-FC2: the ancestry check never aborts the run — only the dir reads do). os.execute returns true on exit 0, nil on non-zero.
-local function git_is_ancestor(repo, sha)
-  if not sha or sha == "" then return false end
-  local code = os.execute("git -C " .. shq(repo) .. " merge-base --is-ancestor " .. shq(sha) .. " main >/dev/null 2>&1")
-  return code == true or code == 0
+-- git merge-base --is-ancestor <sha> main, TRI-STATE (TB-FC2): "yes" (exit 0), "no" (exit 1 = legitimate non-ancestor), "error" (exit
+-- 128 / any other = fatal, e.g. bad object or broken repo). The caller ABORTS on "error" — a fatal must never silently read as "no".
+function R.git_ancestor_state(repo, sha)
+  if not sha or sha == "" then return "no" end
+  local _, ok, code = popen_status("git -C " .. shq(repo) .. " merge-base --is-ancestor " .. shq(sha) .. " main >/dev/null 2>&1")
+  if ok then return "yes" end
+  if code == 1 then return "no" end
+  return "error"
 end
 
--- default_deps(home, repo): wire the real durable sources. `repo` = the agenthop checkout (git ancestry + presence.mjs + branches).
+-- default_deps(home, repo): wire the real durable sources.
 function R.default_deps(home, repo)
   local review_reports = os.getenv("RETRO_REVIEW_REPORTS_DIR") or (home .. "/Work/review-reports")
   local board_dir = home .. "/.agenthop/swarm/board"
   local carly = home .. "/.agenthop/carly"
-  local function git(args) return (popen_status("git -C " .. shq(repo) .. " " .. args .. " 2>/dev/null")) end
+  -- git wrapper returns (lines, ok): a failed query (exit ≠ 0) is surfaced so the caller can abort rather than publish a false board.
+  local function git(args)
+    local lines, ok = popen_status("git -C " .. shq(repo) .. " " .. args .. " 2>/dev/null")
+    return lines, ok
+  end
   return {
     review_path = carly .. "/review-board.md",
     runbook_path = carly .. "/runbook-board.md",
-    list_reviews = function() return list_dir(review_reports, true) end,  -- newest-first; (names, status)
-    list_board = function() return list_dir(board_dir, false) end,
+    list_reviews = function() return R.list_dir(review_reports, true) end,  -- newest-first; (names, status)
+    list_board = function() return R.list_dir(board_dir, false) end,
     recent_set = function()
+      local lines, ok = popen_status("find " .. shq(review_reports) .. " -maxdepth 1 -type d -mtime -7 2>/dev/null")
+      if not ok then return {}, false end -- propagate find failure ⇒ run aborts (never "everything is stale")
       local set = {}
-      local lines = popen_status("find " .. shq(review_reports) .. " -maxdepth 1 -type d -mtime -7 2>/dev/null")
       for _, p in ipairs(lines) do local base = p:match("([^/]+)/?$"); if base then set[base] = true end end
-      return set
+      return set, true
     end,
-    is_ancestor = function(sha) return git_is_ancestor(repo, sha) end,
+    ancestry = function(sha) return R.git_ancestor_state(repo, sha) end,
     batches = function()
-      -- TB-BRANCH: only IN-FLIGHT branches (`--no-merged main`) + NUMERIC batch sort — a lexical sort would pick a merged "batch-9" over
-      -- the one unmerged "batch-23" (9 > 2 lexically). Pick the highest-numbered in-flight batch.
-      local inflight = git("branch --no-merged main --list 'rehearse-batch-*' --format='%(refname:short)'")
+      local inflight, iok = git("branch --no-merged main --list 'rehearse-batch-*' --format='%(refname:short)'")
+      if not iok then return nil, false end -- git failure ⇒ abort (do NOT publish batches=0 as if nothing is in flight)
       local branch = R.pick_batch(inflight)
-      if not branch then return {} end
+      if not branch then return {}, true end
       local tip_time = tonumber((git("log -1 --format=%ct " .. shq(branch))[1]))
       local tip_sha = git("rev-parse " .. shq(branch))[1]
-      local tip7 = tip_sha and tip_sha:sub(1, 7) or nil
+      local batch_num = tonumber(branch:match("rehearse%-batch%-(%d+)"))
       local presence = repo .. "/packages/bus/dist-presence/presence.mjs"
       local gates = home .. "/.agenthop/swarm/batch-gates/" .. branch .. ".json"
-      -- TB-ARCH: the arch-review signoff must reference THIS batch's TIP SHA (name contains tip7) — not any batch's signoff. mtime-late
-      -- does not prove attribution; a re-rehearse (new tip) correctly un-ticks arch-review until a signoff of the new tip exists.
       local arch = nil
-      if tip7 then
-        local names = list_dir(review_reports, false)
-        local m = R.match_arch(names, tip7)
+      if tip_sha then
+        local names = R.list_dir(review_reports, false)
+        local m = R.match_arch(names, batch_num, tip_sha)
         if m then arch = review_reports .. "/" .. m end
       end
       local agenthop_bin = (os.getenv("HOME") or home) .. "/.local/bin/agenthop"
-      local merged = tip_sha and git_is_ancestor(repo, tip_sha) or false
+      local merged = tip_sha and (R.git_ancestor_state(repo, tip_sha) == "yes") or false
       return { {
         branch = branch,
         artifacts = { ["merge-pool"] = branch, ["regen-presence"] = presence, ["gates"] = gates, ["arch-review"] = (arch or "? (no signoff for this tip)"), ["ff-main-install"] = agenthop_bin },
@@ -214,7 +247,7 @@ function R.default_deps(home, repo)
           { name = "arch-review", exists = (arch ~= nil), mtime = arch and file_mtime(arch) or nil },
           { name = "ff-main-install", exists = (merged and exists(agenthop_bin)), mtime = merged and file_mtime(agenthop_bin) or nil },
         },
-      } }
+      } }, true
     end,
     write_atomic = R.write_atomic,
   }
