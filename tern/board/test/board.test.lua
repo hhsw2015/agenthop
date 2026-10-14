@@ -85,10 +85,20 @@ ok("TB-QUOTE: shq escapes embedded quote", R.shq("it's") == "'it'\\''s'")
 -- ============================ TB-BRANCH / TB-ARCH (structural) ============================
 ok("TB-BRANCH: pick_batch numeric (100>23>9)", R.pick_batch({ "rehearse-batch-9", "rehearse-batch-23", "rehearse-batch-100" }) == "rehearse-batch-100")
 ok("TB-BRANCH: pick_batch nil on empty", R.pick_batch({}) == nil)
--- TB-ARCH r4: tip7 in a NON-SHA field (reviewer suffix) must NOT match; the SHA FIELD + batch number must match.
-ok("TB-ARCH: tip7 in reviewer suffix of a DIFFERENT batch/old-SHA signoff ⇒ no match", R.match_arch({ "batch9-dual-signoff-b9fde15-reviewer-53967f6.md" }, 23, "53967f6abc") == nil)
-ok("TB-ARCH: the batch's OWN signoff (sha field = tip prefix, batch matches) ⇒ match", R.match_arch({ "batch23-dual-signoff-53967f6-seat.md" }, 23, "53967f6abc") == "batch23-dual-signoff-53967f6-seat.md")
-ok("TB-ARCH: right sha field but WRONG batch number ⇒ no match", R.match_arch({ "batch9-dual-signoff-53967f6-seat.md" }, 23, "53967f6abc") == nil)
+-- TB-ARCH r5: match requires batch number AND the signoff's SHA FIELD, RESOLVED to a unique full commit, to equal the full tip commit.
+-- A tip7 in a NON-SHA field (reviewer suffix), a wrong batch, a field resolving to a DIFFERENT commit, a too-short field, or an
+-- unresolvable field all fail. resolver(map) = a fake rev-parse: sha-field -> full commit (nil = ambiguous/invalid).
+local TIPFULL = "53967f6abcabcabcabcabcabcabcabcabcabc123" -- 40 hex (the batch tip, fully resolved)
+local function resolver(map) return function(s) return map[s] end end
+ok("TB-ARCH: tip7 in reviewer suffix of a DIFFERENT batch/old-SHA signoff ⇒ no match", R.match_arch({ "batch9-dual-signoff-b9fde15-reviewer-53967f6.md" }, 23, TIPFULL, resolver({ b9fde15 = "b9fde15eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", ["53967f6"] = TIPFULL })) == nil)
+ok("TB-ARCH: the batch's OWN signoff (sha field resolves to the tip's full commit, batch matches) ⇒ match", R.match_arch({ "batch23-dual-signoff-53967f6-seat.md" }, 23, TIPFULL, resolver({ ["53967f6"] = TIPFULL })) == "batch23-dual-signoff-53967f6-seat.md")
+ok("TB-ARCH: right sha field but WRONG batch number ⇒ no match", R.match_arch({ "batch9-dual-signoff-53967f6-seat.md" }, 23, TIPFULL, resolver({ ["53967f6"] = TIPFULL })) == nil)
+-- r5 teeth: resolution is to a UNIQUE FULL COMMIT, not a prefix string-compare — a field that resolves to a different commit fails.
+ok("TB-ARCH r5: sha field that resolves to a NON-tip commit ⇒ no match", R.match_arch({ "batch23-dual-signoff-53967f6-seat.md" }, 23, TIPFULL, resolver({ ["53967f6"] = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" })) == nil)
+ok("TB-ARCH r5: an UNRESOLVABLE sha field (ambiguous/invalid rev-parse ⇒ nil) ⇒ no match (never guess)", R.match_arch({ "batch23-dual-signoff-53967f6-seat.md" }, 23, TIPFULL, resolver({})) == nil)
+-- r5 teeth: the SHA field is MIN 7 hex, so a 1-char "5" cannot pose as a tip prefix — it does not even parse.
+ok("TB-ARCH r5: a 1-char sha field does NOT parse (min 7 hex)", R.parse_signoff_name("batch23-dual-signoff-5-seat.md") == nil)
+ok("TB-ARCH r5: a 7-char sha field parses (batch+sha)", (function() local p = R.parse_signoff_name("batch23-dual-signoff-53967f6-seat.md"); return p and p.batch == 23 and p.sha == "53967f6" end)())
 
 -- ============================ TB-FC2: list_dir over REAL errno ============================
 do
@@ -110,6 +120,13 @@ do
   else
     print("skip - TB-FC2 EACCES-ancestor (root)")
   end
+  -- r5 teeth (seam ③): errno comes from the FILESYSTEM (traversability), NOT a path-bearing diagnostic. A readable dir whose NAME
+  -- literally contains "No such file or directory" must be 'read' — a substring classifier would have faked it as ENOENT 'absent'.
+  local trap = d .. "/No such file or directory"
+  assert(os.execute("mkdir -p " .. R.shq(trap)))
+  write_file(trap .. "/x.claimed.s.json", "{}")
+  local tn, ts = R.list_dir(trap, false)
+  ok("TB-FC2 r5: a readable dir NAMED 'No such file or directory' ⇒ 'read' (errno from fs, not substring)", ts == "read" and #tn == 1)
 end
 
 -- ============================ TB-FC2: git_ancestor_state TRI-STATE over REAL git ============================
