@@ -1,19 +1,22 @@
-# Tern+OMP 蜂群席位宿主 — spike 报告(5 件交付,r3)
+# Tern+OMP 蜂群席位宿主 — spike 报告(5 件交付,r4)
 
 - 对象: 用 Tern+OMP 的原生 agent 层 `cx.agents` 替代/并行 Herdr 作蜂群席位宿主
 - 性质: **纯评估 + 原型,不动产线**。herdr 代码路径一行未改,保留为回退(主审复核:七文件全新增、基线 782 blob 全留、herdr/产线改动 0)。
-- owner: `claude:agenthop-f32a0507`;主审: `codex:Work-01a13284`(r1 0P1/4P2 全闭 → r2 0P1/3P2/1P3 → 本稿 r3 收口残四面)
+- owner: `claude:agenthop-f32a0507`;主审: `codex:Work-01a13284`(r1 0P1/4P2 全闭 → r2 0P1/3P2/1P3 → r3 0P1/0P2/1P3 → 本稿 **r4** 纯文字收口 TERN-3-DOC 三处 + 并入 Carly 四实验实证)
 - worktree: `~/Dev/agenthop-wt/tern-spike` branch `spike/tern-migration`
 - 可核来源(定点提交外,均在同仓对象库可 `git show`):
   - 图谱 `docs/research/tern-omp-eval.md` **@08351a3**(main,镜 24)
-  - **user 亲测 QA** `docs/research/tern-carly-qa-2026-10-13.txt` **@2a5ca5f**(Carly 本机 Tern+omp18.10.3 实测;解了三绿门里两门)
+  - **user 亲测 QA** `docs/research/tern-carly-qa-2026-10-13.txt` **@2a5ca5f**(Carly 本机 Tern+omp18.10.3 实测:补 omp/合成程序的状态观测;真 TUI 的 OSC/权限行为仍待验)
+  - **Carly 四实验**(协调者记录 PROGRESS #848-#849,**独立来源,非本席实测**):ACP 块路径实证门①②(waiting_input/idle + surface 结构化权限),免模型巡检 8.65ms/3pane;详见 §6
 - 日期: 2026-10-13 起;Tern.app 实机 + 主审另在隔离 Tern 0.8.3 headless 复核
 
 ## 证据分级(全文标注)
 
-- **【实测】** 本席(f32a0507)本会话在实机亲测 —— 仅此;**另一评者(主审 codex:Work)在图谱 @08351a3 里的 CLI run 实测另行注明,不并入本标签**。
+- **【实测】** 本席(f32a0507)本会话在实机亲测 —— 仅此。**协调者 fe0376cd 在图谱 @08351a3 中报告的 CLI run 观察另标【继承图谱】,Carly 四实验另标【Carly实验】,均独立来源,不并入本席【实测】**。
 - **【user实测】** user/Carly 亲测,入库 @2a5ca5f —— **只覆盖 Carly 实际跑过的那几个对象**(omp、cat、普通脚本、OSC 脚本、假权限提示),不含真 claude/codex TUI。
 - **【文档】** tern.d.luau 类型声明 / `tern ... --help` / changelog
+- **【继承图谱】** 协调者 fe0376cd 在图谱 @08351a3 报告,本席未复现
+- **【Carly实验】** Carly 实验(PROGRESS #848-#849),独立来源,非本席亲测
 - **【推断】** 由 API 形状或 Carly 的条件结论推断,未跑
 - **【未测/待验】** 无人实测
 
@@ -21,9 +24,9 @@
 
 ---
 
-## 0. 一句话结论(r3)
+## 0. 一句话结论(r4)
 
-**omp 席位的 list/状态机制实机可用。** 对蜂群真正要托管的 claude/codex 裸 TUI,结论是**条件性 + 待验**:Carly 实测的是 cat/普通脚本这类**非 omp 通用命令**——它们进程在跑即恒 "working"、从不 idle、无屏幕兜底;**真 claude/codex TUI 的 OSC/权限行为没有人用实际版本实测过**,只能推断「**若它不发 OSC 9;4;4/7501,则**同样拿不到 idle/waiting_input」。要让裸 TUI 席可用,两条路径(均【未测/待验】,列入下一步):① Tern 自带 ACP 聊天块(二进制横幅文案显示它**可能**识别权限请求,仅支持方向,未测),② 让 agent 自己发 OSC 9;4;4 / 7501。文件-JSON 控制面是**本配置下**我用的 bash 路径(非平台唯一路径——文档另有 window control endpoint)。
+**omp 席位的 list/状态机制实机可用。** 对蜂群要托管的 claude/codex:**裸 TUI** 形态下原生 cx.agents 不够(非 omp 通用命令 cat/脚本恒 "working"、无兜底 —— user实测;真裸 TUI 同理属推断/待验)。**但以 ACP 块形态跑 claude 时,Carly 实验实测到 `waiting_input`/`idle` + surface 里的结构化权限原文(门①②在 ACP 路径上过)—— 独立来源,非本席,且证的是 ACP 形态,裸 TUI 形态仍待验。** 故迁移主路 = **ACP 块席位**;裸 TUI 作降级面;备路 = agent 自发 OSC 7501/9;4;4(未测)。门③多机 fleet 未动 ⇒ **验收前保留 Herdr**。文件-JSON 控制面是**本配置下**我用的 bash 路径(非平台唯一——文档另有 window control endpoint)。
 
 ---
 
@@ -58,7 +61,7 @@ pane18 [omp/claude-opus-5] state=working busy=True  at_prompt=True   (持续 40s
 - **实测对象是 cat、普通 shell 脚本、OSC 脚本(不是真 claude/codex)**:非 omp 的 state 只有粗粒度——**进程在跑 = "working",从不变 idle**(busy/at_prompt 恒 false);进程退出后行从 list() 消失,无 "exited" 行。【user实测:cat/脚本】
 - 非 omp:`wait()` 恒超时("agent_wait timed out"),`transcript()` 返 {}(文档也这么写),`model`/`last_message` 字段缺(其余 pane/state/busy/at_prompt/... 都有)。【user实测:非omp 负面】+【文档】
 - **推断(非实测)**:真 claude/codex TUI 作 agent-command,**若不自发 OSC**,按上述非 omp 规律**应**卡在 "working";但**真 TUI 用实际版本、实际启动方式的 OSC/权限行为仍【待验】**——cat/脚本的负对照不等于对真 TUI 的负面实测。
-- **结论**:omp 的 parity **不外延到非 omp 命令**;真 claude/codex 的状态/权限检测须走 §6 两条路径之一,且该两路本身也未测。
+- **结论**:omp 的 parity **不外延到非 omp 命令**。真 claude/codex **裸 TUI** 的状态/权限行为仍待验;其中 **ACP 块路径已由 Carly 实验实证门①②**(waiting_input/idle + 结构化权限,独立来源,见 §6),OSC/wrapper 自发路径仍未测。
 
 ---
 
@@ -131,11 +134,11 @@ r1 写「cx.agents:start 同步阻塞冻住 VM」= **超证据,已撤**。实际
 
 | 命脉 | herdr 机制 | tern 等价 | bridge/CLI | 验证 |
 |---|---|---|---|---|
-| **巡检点名** | agent list / 读屏 | `cx.agents:list()` → agents.json `state/busy/at_prompt` | **bridge** | 【实测】omp idle/working |
-| **inbox-wake ping** | writeInbox 成功 → ping pane | `tern run <pane> '<nudge>'` 键入;或 `cx.agents:ask` | CLI / bridge | `tern run` 基本可键入【实测弱】;`--pane` 旗实测报错;ask 执行结果【未测】 |
+| **巡检点名** | agent list / 读屏 | `cx.agents:list()` → agents.json `state/busy/at_prompt`;或 check 内 `cx.session:read` 免模型巡检 | **bridge** | 【实测】omp idle/working;**免模型巡检 3pane×200 行=8.65ms【Carly实验】** |
+| **inbox-wake ping** | writeInbox 成功 → ping pane | `tern run <pane> '<nudge>'` 键入;或 `cx.agents:ask` | CLI / bridge | `tern run` CLI run【继承图谱 @08351a3,fe0376cd 报告;本席未复现】;本席 `--pane` 旗实测报错;ask 执行【未测】;可靠注入=ACP sendable 态(P5) |
 | **F48/F45 继任** | 检测死 → 新席领养 | 检死:list `alive=false`(非 omp 是行消失,无 exited);起席:`start` 或 `tern new tab` | bridge+CLI | 检死【user实测:行消失】;`tern new tab`【实测】;start【见 2c 不定】 |
-| **F44 读屏** | 读 pane 屏 → 识别卡点 → HINT | `tern capture <pane> --scrollback [--surfaces]` | **CLI** | 【实测】但仅捕获**普通 shell marker**,非 omp/非 alt-screen TUI |
-| **fleet-recovery** | 一命令带回全员+在途+断点 | daemon 侧 pane 存活;list 重发现;③hook 重建 sid→pane | bridge+CLI+hook | 单机 list 重发现【推断】;多机 fleet【未测】 |
+| **F44 读屏** | 读 pane 屏 → 识别卡点 → HINT | `tern capture <pane> --scrollback [--surfaces]`;ACP 块下 surface `layer.permission` 读结构化权限 | **CLI / bridge** | capture 仅【实测】普通 shell marker;**ACP surface 读权限原文【Carly实验】**;屏文本可伪造,安全判定须自证+哈希(P3) |
+| **fleet-recovery** | 一命令带回全员+在途+断点 | daemon 侧 pane 存活;list 重发现;③hook 重建 sid→pane | bridge+CLI+hook | 单机 list 重发现【推断】;多机 fleet【未测】;TUI 席读屏偏移在滚走/重绘下失效⇒改**哈希+尾 N 行**比对(合流我方 kv 哈希)【Carly实验自报限制】 |
 
 读屏补注:lenses 看不了 alt-screen 是 **lenses** 的限制;`tern capture` 抓终端 surface,但我只在**普通 shell** 上验过,OMP/alt-screen TUI 的 capture **未测**。
 
@@ -152,7 +155,7 @@ type SeatState = { state: "idle"|"working"|"waiting_input"|"exited"; busy?: bool
 interface SeatDriver {
   // 巡检。tern: 读 agents.json 该席 pane 条目。【实测:omp idle/working】;非omp 恒 working【user实测:cat/脚本】;真 TUI【待验】
   status(seat: Seat): Promise<SeatState>;
-  // 派话/唤醒。tern: cx.agents:ask(bridge) 或 `tern run <pane>`。【实测弱:run 键入】;ask 执行【未测】;可靠注入=ACP sendable 态(P5,待验)
+  // 派话/唤醒。tern: cx.agents:ask(bridge) 或 `tern run <pane>`。tern run=【继承图谱 @08351a3/fe0376cd,本席未复现】;--pane 本席报错;ask 执行【未测】;可靠注入=ACP sendable 态(P5)
   send(seat: Seat, text: string): Promise<void>;
   // 读屏。tern: `tern capture <pane> --scrollback --surfaces`。【实测:普通 shell】【未测:TUI/omp】;屏文本可伪造,安全判定须自证+哈希(P3)
   read(seat: Seat, opts?: { lines?: number }): Promise<string>;
@@ -163,11 +166,11 @@ interface SeatDriver {
 
 - 席位 config `host:"herdr"|"tern"` 选驱动;异常降级回 herdr = 闭测期风险闸(「herdr 不删」的兑现点)。
 - tern driver 的 `send`(若用 ask)与继任的 `start` 受 §2c 约束:**建议**挪出状态 poll(未验证的落法)。
-- **真 claude/codex 席的 status 按现有证据拿不到 idle/waiting_input**(§1c 推断/待验),此接口在真 TUI 上目前只有 herdr 驱动可用,tern 驱动须等 §6 两路之一在真 TUI 上落地。
+- **真 claude/codex 裸 TUI 席的 status 按现有证据拿不到 idle/waiting_input**(§1c 推断/待验),裸 TUI 上保留 herdr 驱动;但 **ACP 块席位已由 Carly 实验实证可拿 waiting_input/idle + 结构化权限**(独立来源,§6),故 tern 驱动**主路 = ACP 块席位**,裸 TUI 为降级面(恒 working,靠 process/capture 合成)。
 
 ---
 
-## 6. 替代判决(r3 重写)
+## 6. 替代判决(r4 重写)
 
 | 维度 | omp 席 | 非 omp / 真 claude/codex 裸 TUI 席(蜂群实际需要) |
 |---|---|---|
@@ -176,19 +179,32 @@ interface SeatDriver {
 | wait/transcript | omp 可用【文档】(**非**由非omp负面反推) | 非 omp:wait 超时 / transcript {}【user实测:非omp】 |
 
 - **omp 席**:working/idle 实测 parity,waiting_input user 实测可用。能力接近 herdr,原型跑通,可立即并行试用。
-- **非 omp / 真 TUI 席**:原生 cx.agents **按现有证据不够**(真 TUI 本身仍待验)。两条路径(均【未测/待验】,=下一步):
-  1. **ACP 聊天块**(`agents.auto_acp` / 调色板 "New Claude Code block"):二进制含 "has a question / wants plan approval / needs your permission" 横幅文案——**只支持「这条路可能识别权限请求」的方向性判断,未实测**。最值得先试。
-  2. **OSC 7501 / 9;4;4 自发**:让 agent wrapper 主动发状态(changelog 称 omp/agent chats/会说 7501 的工具显示 working/waiting/finished/failed,"locally or over SSH")。7501 完整字段语法无文档(只确认过 `state=clear`)。【文档/未测】
+- **裸 TUI 席**:原生 cx.agents **按现有证据不够**,真裸 TUI 行为仍待验(恒 working 的推断见 §1c)。
+- **ACP 块席位 = 迁移主路(【Carly实验】实证,见 §6a)**:把 claude/codex 以 ACP 块(非裸 TUI)方式跑,状态/权限信号走 Tern 内部通道——Carly 实验实测到 `waiting_input`、`idle`、以及 surface 里**结构化的权限请求原文**。这把门①②从「方向性猜测」升级为「ACP 形态已实证」。**但注意:这是 Carly 的实验(独立来源),非本席亲测;且证的是 ACP 块形态,裸 TUI 形态仍待验。**
+- **OSC 7501 / 9;4;4 自发(备路)**:让 agent wrapper 主动发状态(changelog 称 omp/agent chats/会说 7501 的工具显示 working/waiting/finished/failed,"locally or over SSH")。7501 完整字段语法无文档(只确认过 `state=clear`)。【文档/未测】
 
-### 三绿验收门(r3)
+### 6a. Carly 四实验(【Carly实验】,PROGRESS #848-#849,独立来源,非本席实测)
 
-1. **waiting_input 机制**:✅已解(user实测):omp ask / OSC 9;4;4 触发,合成文本提示不触发。但**真 claude/codex 权限对话框是否自发 OSC** 仍待验 ⇒ 门①真正通过 = ACP 块或 OSC 自发之一在真 TUI 上落地。
-2. **真裸 TUI 的 OSC 行为**:❌**待验**(cat/脚本负对照≠真 TUI 实测)。
+- **实验①(ACP 路,决定性)**:Claude Code ACP 块、Manual 模式、真权限请求(`touch` 触发、`echo` 只读不触发),全程未批、deny 收尾零残留:
+  - `state`:提问前 idle → working(3-6s)→ **`waiting_input`(~9s 起恒持至停)** —— 门①②在 **ACP 路径**上一次全过。
+  - `alert` 恒 false(即便未聚焦)⇒ alert 不可用,**轮询 state 为准**。
+  - **surface(pane) 能读到权限请求原文**:`layer.permission.body.question/.detail`=命令原文,`.options`=Yes/No ⇒ approval-delegation 有了**结构化**输入,不靠读屏正则。
+  - idle 态(提问前 idle + at_prompt)亦实测 ⇒ ACP 块下 `wait()` 语义可用。
+  - 边界:此为 **ACP 块**,非裸 TUI 席;裸 TUI 仍恒 working。
+- **实验②(免模型巡检,数字漂亮)**:check 内 `cx.session:read` 可行,3 pane×200 行含滚回=**8.65ms**(热 0.3ms/冷 10ms),50ms 预算富余;pos 偏移只报新增(单次报告后 quiet 不重复);返回字符串即免模型告警;无 prompt 下限 1 分钟。**Carly 自报限制:长度偏移在滚走/TUI 重绘下失效 ⇒ TUI 席应改哈希 + 尾 N 行比对**(与我方 kv 哈希方案合流)。
+- 实验③④(review-board / runbook)与本 spike 无关,略。
+
+### 三绿验收门(r4)
+
+1. **waiting_input 机制**:✅ omp ask / OSC 9;4;4(user实测);**ACP 块下 claude 真权限请求 → waiting_input 实证(【Carly实验】)**。裸 TUI 不发 OSC 则不触发(推断)⇒ 门① = **以 ACP 块席位运行即通过**(Carly 实证);裸 TUI 形态仍待验。
+2. **claude 状态检测**:✅ **ACP 块下 idle/working/waiting_input 全实证(【Carly实验】)**;裸 TUI 恒 working(推断/待验)⇒ 门② = ACP 块通过,裸 TUI 待验。
 3. **多机 fleet**:❌【未测】。user 单机;线索:list 行有 `host` 字段(本机=0),OSC 7501 "over SSH" 可用,start 的 `~` 按 launch host home 展开(但 opts 无 host 字段)。待有远端环境实跑 `cx.agents:list()` 看 host 字段。
+
+> 判决要点(r4):门①② **在 ACP 块形态上已由 Carly 实验实证**(独立来源),故 tern 迁移主路 = **ACP 块席位**;裸 TUI 作降级面。仍须本席/验收方在目标形态上复核(Carly 非本评估席),且门③多机未动 ⇒ **验收前保留 Herdr**。
 
 ### 下一步(含主审转来的 Carly 六问新输入,PROGRESS #836-#842)
 
-- **ACP 块路径**实测:真 claude/codex 经 ACP 块时,权限请求能否被 cx.agents / 内部通道识别为 waiting_input。**P5 判定**:非 omp 的 `send_input` **无就绪保证**,可靠的注入路是 **ACP 块的 sendable 态**——send/派话应据此设计。
+- **ACP 块席位复核**:Carly 已实证 ACP 路径的 waiting_input/idle/结构化权限;下一步由验收方在目标 claude/codex 形态上复跑确认,并把 surface 的 `layer.permission` 结构接进 approval-delegation(替代读屏正则)。**P5 判定**:非 omp 的 `send_input` **无就绪保证**,可靠的注入路是 **ACP 块的 sendable 态**——send/派话据此设计。
 - **读屏可信度**:**P3 判定**:pane 文本**可被伪造**,靠 `tern capture` 认卡点不可信;真证明须**门禁自写输出 + 哈希**(不是解析屏幕)。F44 读屏若用于安全判定,须改走自证路径。
 - **OSC 7501 自发**:确定 7501 完整字段语法,给 claude/codex wrapper 加状态上报。
 - **多机 fleet**:远端 host 环境实跑 list/start/ask。
@@ -202,15 +218,15 @@ interface SeatDriver {
 
 ---
 
-## 7. 交付物 + r1→r3 修复对照
+## 7. 交付物 + r1→r4 修复对照
 
 | 件 | 路径 | 修复轨迹 |
 |---|---|---|
-| ① 状态实测 + 证据 | §1 + `prototype/evidence-agents-list.json` | omp 证据保留;r2 由 user QA 补 waiting_input;**r3**:裸 TUI 结论改为「cat/脚本实测 + 真 TUI 推断/待验」,不再冒称真 claude/codex 负面实测(TERN-3) |
+| ① 状态实测 + 证据 | §1 + `prototype/evidence-agents-list.json` | omp 证据保留;r2 由 user QA 补 waiting_input;**r3** 裸 TUI 改「cat/脚本实测 + 真 TUI 推断/待验」(TERN-3);**r4** 并入 Carly 四实验(§6a):ACP 块门①②实证、免模型巡检 8.65ms,均标【Carly实验】独立来源 |
 | ② agents-bridge | `prototype/tern-agents-bridge/` | r2 **TERN-1** 认领 at-most-once(remove 门控+读失败不删+撤 exactly-once)、**TERN-3** start 因果撤回;**r3 TERN-1-R2** UNKNOWN 按操作类分(只读可重读,非幂等不得自动重发);**r3 TERN-3** start 两次停摆不冒称同因、「挪出 poll」降为未验证建议 |
 | ③ sid hook | `prototype/sid-hook.sh`+`.settings.json` | r2 **TERN-2** JSON 编码+往返、**TERN-4** pane 规整为数字;**r3 TERN-2-R2** 全程单 python 进程(cwd 不经 bash `$(...)`,末尾 LF 保留)、**TERN-4-DOC** 头注降级为 API 推断/待验 |
 | ④ 映射表 | §4 | 验证列严格分级;capture 仅普通 shell;`run --pane` 报错如实 |
-| ⑤ seat-driver | §5 | 每函数标证据强度;**r3** 补 P5(ACP sendable 注入)/P3(读屏可伪造须自证)约束;真 TUI 席仅 herdr 可用 |
+| ⑤ seat-driver | §5 | 每函数标证据强度;**r3** 补 P5(ACP sendable 注入)/P3(读屏可伪造须自证)约束;**r4** 真 TUI 状态/权限待验、验收前保留 Herdr,ACP 块席位(Carly 实证)=tern 主路 |
 
-**实测确认的 tern 原语**:`tern plugin link/unlink/reload/list --json`、`tern ls --json`、`tern new tab [--keep-open --cwd -- CMD]`、`tern run BLOCK CMD`(键入;`--pane` 旗不存在)、`tern capture BLOCK --scrollback --surfaces`(普通 shell)、`tern close BLOCK`;Lua:`cx.agents:list`、`tern.fs.{read,write,list,exists,mkdir,remove}`、`tern.sleep():next`、`tern.json.*`、`tern.getenv`、`tern.now`。
+**本席实测确认的 tern 原语**:`tern plugin link/unlink/reload/list --json`、`tern ls --json`、`tern new tab [--keep-open --cwd -- CMD]`、`tern capture BLOCK --scrollback --surfaces`(普通 shell)、`tern close BLOCK`;Lua:`cx.agents:list`、`tern.fs.{read,write,list,exists,mkdir,remove}`、`tern.sleep():next`、`tern.json.*`、`tern.getenv`、`tern.now`。(另:`tern run BLOCK CMD` 的 CLI run 由图谱 @08351a3 的 fe0376cd 报告已测,本席未复现;本席 `tern run --pane` 实测报错。)
 **未由我执行**:`cx.agents:{ask,wait,start,transcript,interrupt,stop}` 的成功执行(start 见 2c;ask/wait 结果未取到);capture 对 omp/alt-screen;多机 fleet。这些有的在 user QA 里有答案(wait/transcript 非 omp 的负面),其余列【未测】。

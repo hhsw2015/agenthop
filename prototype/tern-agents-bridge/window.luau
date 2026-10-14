@@ -7,14 +7,16 @@
 --   RESULT  outbox : <CTL>/results/<id>.json     ← bridge writes {ok, ...} ; wait() answers later via :next (never blocks the tick)
 --
 -- Why this shape: cx.agents is a Lua window-half API — the swarm is bash. The bridge is the shim mirror-24's eval called for.
--- All IO via tern.fs (sync, plugin-trusted, relative-to-plugin or absolute). The window tick must stay cheap (50ms budget): list()
--- /ask/start/interrupt/stop are sync and bounded; wait() is async and handed to :next so a long idle-wait never stalls the loop.
+-- All IO via tern.fs (sync, plugin-trusted, relative-to-plugin or absolute). GOAL (a design target, not a measured bound): keep each
+-- poll within the window budget. Sync-API durations have NO established upper bound — start in particular (see the FINDING below) was
+-- observed to exceed the budget — so "bounded" is not claimed here. list() is read-only; wait() is async via :next so a long idle-wait
+-- never stalls the loop.
 
 local HOME = tern.getenv("HOME") or ""
 local CTL = HOME .. "/.agenthop/tern-panes" -- control-plane dir shared with the bash swarm (herdr-style location)
 local REQ = CTL .. "/requests"
 local RES = CTL .. "/results"
-local POLL_MS = 750 -- status-mirror cadence; far inside herdr's own poll. Per-tick work stays well under the window budget.
+local POLL_MS = 750 -- status-mirror cadence. POLL_MS only sets the scheduling interval; it does NOT prove a tick completes within budget (see FINDING).
 
 local function ensure()
   for _, d in { CTL, REQ, RES } do
