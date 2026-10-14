@@ -20,6 +20,7 @@ local AGENTHOP = HOME .. "/.agenthop"
 local INBOX_DIR = AGENTHOP .. "/inbox"
 local SWARM_DIR = AGENTHOP .. "/swarm"
 local CARLY_DIR = AGENTHOP .. "/carly"
+local DECISION_BATCHES = AGENTHOP .. "/console/decision-batches" -- 候裁M source: one dir per 呈批 batch, RESOLVED iff it has consumed.json (decision-batch-v1)
 local DISPATCH_LOG = SWARM_DIR .. "/dispatcher.log"
 local PROGRESS = SWARM_DIR .. "/PROGRESS.md"
 local BOARD_DIR = SWARM_DIR .. "/board"
@@ -139,14 +140,24 @@ local function flagsSummary(flags)
   return "**" .. tostring(on) .. "** on / **" .. tostring(off) .. "** off / **" .. tostring(dormant) .. "** dormant"
 end
 
--- A8+context: cache the three counts (在审 reviewing / 候裁 awaiting / 告警 alerts) in the plugin KV so
+-- 候裁M = UNRESOLVED DecisionBatch cards (decision-batch-v1): a `batch-<id>/` dir with NO committed consumed.json. REAL source
+-- (coordinator ruling: NOT a total−reviewing proxy — different dimensions, "numbers must not lie"). consumed.json is the terminal
+-- sealed marker (decision-batch-store); its absence = still awaiting the user's ruling.
+local function countRulingBatches()
+  return parse.countUnresolvedBatches(listDirSafe(DECISION_BATCHES), function(nm)
+    return tern.fs.exists(DECISION_BATCHES .. "/" .. nm .. "/consumed.json")
+  end)
+end
+
+-- A8+context: cache the three counts (在审 reviewing / 候裁 unresolved-decision-batches / 告警 alerts) in the plugin KV so
 -- tern.carly.context can read them within its 4 ms budget without live-computing. kv lives in <data>/kv.json
 -- (the Tern plugin data dir) -- NOT a new file under ~/.agenthop/carly/, honoring the contract section 0 scope.
 local function updateCountsKv(reviews)
-  local reviewing, awaiting = parse.countReviewStates(reviews)
-  local alerts = parse.countJsonFiles(listDirSafe(ALERTS_DIR))
+  local reviewing = parse.countReviewStates(reviews)           -- 在审N
+  local ruling = countRulingBatches()                          -- 候裁M (unresolved DecisionBatch cards)
+  local alerts = parse.countJsonFiles(listDirSafe(ALERTS_DIR)) -- 告警K
   pcall(function()
-    tern.kv.set("counts", { review = reviewing, ruling = awaiting, alerts = alerts, ts = nowTs() })
+    tern.kv.set("counts", { review = reviewing, ruling = ruling, alerts = alerts, ts = nowTs() })
   end)
 end
 

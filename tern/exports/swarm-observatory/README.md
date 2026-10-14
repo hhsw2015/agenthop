@@ -60,9 +60,10 @@ swarm_flags()     -> { flags:{<NAME>:"on"|"off"|"dormant"}, ts, truncated? }
 `在审N|候裁M|告警K` (≤400 chars). The 4 ms budget forbids live computation, so `fn` only **reads a
 KV cache** and formats the line. The cache (`tern.kv` key `counts = {review, ruling, alerts, ts}`) is
 written by every `refresh()` (the 1-minute patrol tick, `window_start`, and the explicit command).
-- `在审` = reviews with `state == "reviewing"`; `候裁` = reviews awaiting a ruling/merge = *total −
-  reviewing* (there is no structured merge-pool source — `review-queue/` is empty and `board/*.json`
-  are work items; documented as an assumption); `告警` = `*.json` count in `~/.agenthop/carly/alerts/`.
+- `在审` = reviews with `state == "reviewing"`; `候裁` = **unresolved DecisionBatch cards** —
+  `batch-<id>/` dirs under `~/.agenthop/console/decision-batches/` with no committed `consumed.json`
+  (the decision-batch-v1 terminal marker); this is the real awaiting-ruling source (coordinator ruling,
+  not a total−reviewing proxy); `告警` = `*.json` count in `~/.agenthop/carly/alerts/`.
 - **KV scope:** `tern.kv` persists to the plugin **data dir** (`<plugin.data>/kv.json`, i.e.
   `~/Library/Application Support/Tern/plugins/…`), **not** a new file under `~/.agenthop/carly/` — this
   honors contract §0 (only `canvas-snapshot.md` is writable there). (`tern.kv` is the data-dir

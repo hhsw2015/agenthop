@@ -161,7 +161,7 @@ do
   ck("buildSeats falls back to terminal_title", seats[2].title == "fallback title")
 end
 
--- countReviewStates (A8+context 在审/候裁)
+-- countReviewStates (A8+context 在审N; its 2nd return is NOT 候裁 anymore — 候裁 is countUnresolvedBatches below)
 do
   local reviews = {
     { state = "reviewing" },
@@ -175,6 +175,17 @@ do
   ck("countReviewStates total = 4", total == 4)
   local r0, a0, t0 = parse.countReviewStates({})
   ck("countReviewStates empty -> 0/0/0", r0 == 0 and a0 == 0 and t0 == 0)
+end
+
+-- countUnresolvedBatches (A8+context 候裁M): one dir per batch-<id>; RESOLVED iff consumed.json exists (injected)
+do
+  local names = { "batch-aaa", "batch-bbb", "batch-ccc", "notabatch", ".DS_Store" }
+  local sealed = { ["batch-bbb"] = true } -- bbb is sealed (has consumed.json)
+  local consumedExists = function(nm) return sealed[nm] == true end
+  ck("countUnresolvedBatches counts only UNSEALED batch- dirs (aaa,ccc) = 2", parse.countUnresolvedBatches(names, consumedExists) == 2)
+  ck("countUnresolvedBatches ignores non-batch- entries", parse.countUnresolvedBatches({ "notabatch", "boardcard", "x.json" }, function() return false end) == 0)
+  ck("countUnresolvedBatches all sealed -> 0", parse.countUnresolvedBatches({ "batch-x", "batch-y" }, function() return true end) == 0)
+  ck("countUnresolvedBatches bad args -> 0", parse.countUnresolvedBatches(nil, nil) == 0 and parse.countUnresolvedBatches({ "batch-z" }, nil) == 0)
 end
 
 -- parseSwarmUrl (A6+route)

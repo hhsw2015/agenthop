@@ -242,6 +242,23 @@ function M.countReviewStates(reviews)
   return reviewing, total - reviewing, total
 end
 
+-- 候裁M (A8+context): count UNRESOLVED DecisionBatch cards. `names` = entries of ~/.agenthop/console/decision-batches; each
+-- `batch-<id>` dir is one 呈批 card, RESOLVED iff it has a committed consumed.json (decision-batch-v1 terminal marker).
+-- `consumedExists(name) -> boolean` is INJECTED (real fs in window.luau; a fake in fixtures) so this stays pure+testable. Per the
+-- coordinator ruling this counts REAL awaiting-ruling batches (not a total−reviewing proxy — the two are different dimensions).
+function M.countUnresolvedBatches(names, consumedExists)
+  if type(names) ~= "table" or type(consumedExists) ~= "function" then
+    return 0
+  end
+  local n = 0
+  for _, nm in ipairs(names) do
+    if type(nm) == "string" and nm:find("^batch%-") and not consumedExists(nm) then
+      n = n + 1
+    end
+  end
+  return n
+end
+
 -- Parse a swarm:// link (A6+route). Returns:
 --   ("pane", "<herdr-pane-id or spec>")  for swarm://pane/<id>
 --   ("file", "/abs/path")                for swarm://file/<abspath>  (leading slash preserved)
