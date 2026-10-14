@@ -96,3 +96,22 @@ tern plugin link <repo>/tern/agenthop-agents-bridge     # 原地用(开发/本�
 ## 6. opt-in / 回退
 
 本桥是**新增旁路**,不碰 herdr 任何调用,不改现有五命脉。seat-driver 按席位 `host:"herdr"|"tern"` 选驱动;tern 侧异常降级回 herdr。Tern 为闭测 beta ⇒ herdr 代码路径全程保留。
+
+## 7. A2 — 免模型巡检哨兵(promptless patrol sentinel)
+
+同插件第二件。零模型成本地每分钟巡检全席位,把三类"需要关注"写成告警。
+
+- **机制**:`tern.carly.schedule({title="agenthop tern patrol", when="every 1m", check=<sentinel.luau 源>})`。`check` 是自包含 Luau 源,返回 `function(ev, cx, state)`;返回 nil=静默(无模型轮次),返回字符串=直接显示(仍无模型)。源在 `sentinel.luau`,window 半在**作用域回调内**(tern.carly 需要)读它并注册一次,按 title 去重(跨 reload/window 末者胜)。
+- **读法**:`cx.session:read(pane, {as="table", lines=N, scrollback=true})` 取每个 agent pane 的尾 N 行。
+- **比对用哈希,不用偏移**:长度/字节偏移在 TUI 重绘/滚动下失效(Carly V 批实证),故哈希**尾 N 行**文本做比较。
+- **告警三型**:
+  1. `content_filter` — 尾文本命中内容过滤短语(可调 `filter_pats`)。
+  2. `permission` — 命中权限弹窗短语(`perm_pats`,如 "allow this"、"[y/n]")。
+  3. `stall` — `busy==true` 且哈希自上次起 `>= stall_ms`(默认 3 分钟)未变。
+- **双路输出**:
+  - 耐久:`~/.agenthop/carly/alerts/<kind>-<pane>-<ts>.json`(单行 JSON,**蜂群扫**)。记录含 `pane kind marker program cwd text(尾部摘要≤400) ts check_ms`。
+  - Carly 面:返回一行字符串(直接显示,无模型),形如 `tern-patrol: permission@pane<id>; ... (<ms>ms, N alert(s))`。
+- **自计时**:每次 check 用 `tern.now()` 前后计 `check_ms`,写进每条告警(实机样本 ~1-3ms/数 pane;Carly 样本 8.65ms/3pane×200 行 = 样本观测,非普适上界)。
+- **状态**:`~/.agenthop/tern-panes/sentinel.json` = `{scheduled, id, ts, error?}`(武装信号,可核)。
+- **实证**:真机 schedule id=4,1m check 真跑,对探针 pane("Allow this tool? [y/n]")写出 `permission` 告警(check_ms 2.8ms)。夹具 `test/sentinel.test.lua`(三告警型+stall+reset+not-busy,teeth:清空 perm_pats→RED)。
+- **边界**:`stall` 依赖 `state` 跨 run 持久(TaskSpec 的 state);若调度器不持久 state,stall 退化(其余两型仍在)——生产可改为把 seen 哈希落盘。

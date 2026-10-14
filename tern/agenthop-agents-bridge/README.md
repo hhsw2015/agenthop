@@ -47,10 +47,20 @@ Execution is claimed by an atomic `remove`; a read failure never deletes the req
 - **read-only** ops: re-issue with a new id (a repeat is just another observation).
 - **non-idempotent** ops: **HOLD — never blind-reissue**. The op may have run and only the receipt was lost. Verify the effect (e.g. `list`), carry a business idempotency key, or escalate to a human.
 
+## A2 — promptless patrol sentinel
+
+A `tern.carly.schedule` task runs every minute with **no model turn**, reads every agent pane, and raises three alert classes —
+`content_filter`, `permission`, `stall` (busy + unchanged **tail-hash** ≥ 3 min; a hash of the tail, because byte offsets fail under
+TUI redraw). Alerts go two ways: a durable `~/.agenthop/carly/alerts/<kind>-<pane>-<ts>.json` (the swarm scans it) and a one-line
+string shown directly by Carly. Each run self-times (`check_ms`). Arming status: `~/.agenthop/tern-panes/sentinel.json`. Logic lives in
+`sentinel.luau`; see [PROTOCOL.md §7](PROTOCOL.md). Tuning (patterns, `stall_ms`, `tail_lines`) is the `CONFIG` table in `sentinel.luau`.
+
 ## Test
 
 ```bash
-lua test/claim.test.lua     # claim-model fixture: crash-recovery / concurrency / idempotency (Lua 5.5)
+lua test/claim.test.lua       # A1 claim-model fixture: crash-recovery / concurrency / idempotency (Lua 5.5)
+lua test/sentinel.test.lua    # A2 sentinel fixture: content-filter / permission / stall / reset (Lua 5.5)
 ```
 
-The fixture mirrors `window.luau`'s drain claim decision (kept in sync by comment). It has teeth: reverting the claim gate (execute on read-success) turns it RED.
+Both fixtures have teeth (reverting the claim gate / blanking the patterns turns them RED). `claim.test.lua` mirrors `window.luau`'s
+drain decision (kept in sync by comment); `sentinel.test.lua` loads the real `sentinel.luau` directly (no drift).

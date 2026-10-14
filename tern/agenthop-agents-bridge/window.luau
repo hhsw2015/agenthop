@@ -1,7 +1,8 @@
 --!strict
 -- agenthop agents-bridge v1 — A1 (production). A THIN window-half shim: it adds NO detection logic of its own; it mirrors Tern's
 -- native cx.agents layer to a file-JSON control plane the bash swarm reads/writes, herdr-style. Authoritative wire contract and the
--- claim/recovery semantics live in PROTOCOL.md. A2 (patrol sentinel) and A3 (OSC alert) extend this same plugin in later commits.
+-- claim/recovery semantics live in PROTOCOL.md. A2 (promptless patrol sentinel, registered below via tern.carly.schedule) ships in
+-- this same plugin; A3 (OSC 9;4 alert) extends it in a later commit.
 --
 -- Claim model (spike r1-r5, PROTOCOL.md §3): execute ONLY after a successful remove-claim; a read failure never deletes the request;
 -- this is AT-MOST-ONCE per claim, NOT crash-safe exactly-once (tern.fs exposes no rename/O_EXCL). Recovery is the swarm's job and is
@@ -118,8 +119,40 @@ end
 -- Poll loop: reschedules via tern.sleep():next() (the documented way a continuation gets a fresh WindowCx). Reschedule is
 -- UNCONDITIONAL — a tick with no cx just skips the work. drain is pcall-wrapped so an unexpected throw skips one tick (the request
 -- stays for the next) rather than killing the loop. Reload tears down this VM, so no explicit stop flag is needed.
+-- A2: register the promptless patrol sentinel (tern.carly.schedule, every 1m, no model turn). The check source lives in sentinel.luau
+-- (loaded relative to the plugin dir). Dedup by title across reloads/windows: cancel any prior task with our title, then schedule one
+-- fresh (last loader wins — a window-half runs per window, so without this a reload/second window would stack duplicate checks).
+-- tern.carly.* needs a SCOPED window callback, so this runs from inside the poll loop (not at top-level load), once.
+local PATROL_TITLE = "agenthop tern patrol"
+local function registerSentinel()
+  local status = { ts = tern.now(), scheduled = false }
+  local okSrc, src = pcall(function() return tern.fs.read("sentinel.luau") end)
+  if not okSrc or type(src) ~= "string" then
+    status.error = "sentinel.luau unreadable" -- the bridge (A1) still runs without the sentinel
+  else
+    pcall(function()
+      for _, t in tern.carly.tasks() do
+        if t.title == PATROL_TITLE then
+          pcall(function() tern.carly.cancel(t.id) end)
+        end
+      end
+    end)
+    local okSched, idOrErr = pcall(function()
+      return tern.carly.schedule({ title = PATROL_TITLE, when = "every 1m", check = src })
+    end)
+    status.scheduled = okSched
+    if okSched then status.id = idOrErr else status.error = tostring(idOrErr) end
+  end
+  pcall(function() tern.fs.write(CTL .. "/sentinel.json", tern.json.encode(status)) end)
+end
+
+local sentinelArmed = false
 local function step(cx)
   if cx ~= nil then
+    if not sentinelArmed then -- A2: arm once, from inside a scoped window callback (tern.carly needs one)
+      sentinelArmed = true
+      pcall(registerSentinel)
+    end
     ensure()
     mirror(cx)
     pcall(function() drain(cx) end)
@@ -127,4 +160,4 @@ local function step(cx)
   tern.sleep(POLL_MS):next(function(_, _, nextCx) step(nextCx) end)
 end
 
-step(nil) -- kick off; the first sleep's :next delivers the window cx
+step(nil) -- kick off; the first sleep's :next delivers the window cx (A1 poll + A2 one-shot arm)
