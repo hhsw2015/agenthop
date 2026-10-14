@@ -77,6 +77,7 @@ lua  test/claim.test.lua       # A1 claim-model: crash-recovery / concurrency / 
 lua  test/sentinel.test.lua    # A2 sentinel + A3 reader: content-filter / permission / stall / osc_alert / read-failure (Lua 5.5)
 bash test/osc-hook.test.sh     # A3 emitter: per-event OSC bytes + no-op-outside-Tern guard
 bash test/publish.test.sh      # A1 atomic publisher: write-success gates the rename (sender write-fail gate)
+bash test/cpa-probe.test.sh    # A2 r2 CPA probe: 3-strike + recovery-clears
 ```
 
 All fixtures have teeth. `claim.test.lua` mirrors `window.luau`'s drain decision (kept in sync by comment); `sentinel.test.lua` loads

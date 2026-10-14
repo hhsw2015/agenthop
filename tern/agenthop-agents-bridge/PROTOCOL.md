@@ -158,3 +158,14 @@ tern plugin link <repo>/tern/agenthop-agents-bridge     # 原地用(开发/本�
 - **读端(reader)**:A2 `sentinel.luau` 的 `scan_pane` 增一型 `osc_alert`:`p.alert == true` 即写入告警流(耐久文件 + Carly 字符串,同 §7 双路)。
 - **夹具**:`test/osc-hook.test.sh`(四事件 → 正确 OSC、未知事件无输出、无 TERN_PANE no-op);`test/sentinel.test.lua` 增 `osc_alert` 两例(alert=true 折入 / alert=false 不发)。
 - **关系**:ACP 块席位(迁移主路)天然有 waiting_input+surface;OSC 9;4 通道是**裸 TUI 席的次优信号路**,让它们也进 A2 的"需要人"流,不必解析屏幕。
+
+## 9. A2 r2 增补(dormant,atop 冻结 tern 批)
+
+四件,免模型纪律照旧,各带牙(夹具 `test/sentinel.test.lua` + `test/cpa-probe.test.sh`):
+
+- **① 互盯 beat(#924:存活证明落 L0 文件,互读文件不互读进程)**:beat 合同 = **裸 epoch 秒、一行文本、宿主 wall-clock**(`os.time()`,非 `tern.now()` monotonic——跨程序相减必须同一 wall 时基)。哨兵每轮写 `<L0>/carly-patrol.beat`(`<epoch 秒>\n`,我的存活;蜂群 8 分钟循环读,>20min 过期=我被停/Tern 关→接管+TG 兜底);同轮读 `<L0>/coordinator.beat`(裸秒,`tonumber` 去空白),过期(wall 秒龄 > `coordinator_stale_sec`=20*60)→ `coordinator_stale` 告警;坏载体(空/非数字/旧 JSON)→ 不报不崩。对称:我盯协调者、蜂群盯我,都靠 L0 文件。(stall/性能的时长计时仍用 `tern.now()` monotonic,不改。)
+- **② 预算拆分**:每轮只 body-scan `batch_size`(4)个 pane,偏移轮转(`state.scan_offset`),防单轮读超时;**但 metadata 清扫覆盖全 pane 每轮**(osc_alert + proven-idle 停滞钟重置不受分批延迟)。牙=分批覆盖完整性(偏移不前进→有 pane 永不覆盖→RED)。
+- **③ L0 告警路径**:`l0_root()` 占位常量 + `TODO(M2-a 投影契约)`;告警文件在 `<L0>/alerts/`,**TG 直接从文件取,不经 Carly**。
+- **④ W3 CPA 探针(`cpa-probe.sh`,蜂群侧 bash,独立于 Carly/哨兵)**:CPA 管家自己挂了投不了箱⇒蜂群直探。`curl /v1/models`(只验 HTTP 200,2s 超时),**连续 3 次失败**→写 `cpa_down` L0 告警;一次成功→清 streak + 删告警(恢复即清)。streak 落 `<L0>/cpa-probe.state` 跨轮持久。牙=3 连击(第 1/2 次不报)+恢复清。注入口 `AGENTHOP_CPA_PROBE`(测试用)/`AGENTHOP_CPA_URL`。
+
+状态/新 L0 产物:`<L0>/carly-patrol.beat`(我写)、`<L0>/coordinator.beat`(我读)、`<L0>/cpa-probe.state`(bash 探针)、`<L0>/alerts/{osc_alert,content_filter,permission,stall,coordinator_stale,cpa_down}-*.json`。

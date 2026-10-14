@@ -1,8 +1,8 @@
 #!/usr/bin/env lua
--- Fixture for the A2 promptless patrol sentinel. Lua 5.5. Loads the REAL sentinel.luau (same file Tern schedules — no drift), mocks
--- the `tern` and `cx` globals, and drives the returned check(ev, cx, state) directly. Run from the plugin dir: `lua test/sentinel.test.lua`.
--- Covers: content-filter / permission / stall detection, quiet path, stall-resets-on-change, and the dual output (durable alert file +
--- returned Carly string). Has teeth: the stall case needs persistent state + time advance; a reset of either turns it RED.
+-- Fixture for the A2 patrol sentinel (r2). Lua 5.5. Loads the REAL sentinel.luau (same file Tern schedules — no drift), mocks `tern`
+-- and `cx`, drives check(ev, cx, state) directly. Run from the plugin dir: `lua test/sentinel.test.lua`.
+-- Covers r1: content-filter / permission / stall / osc_alert / read-failure / stall-reset. Covers r2: ① liveness beat + coordinator_stale
+-- mutual-watch, ② batch coverage (every pane body-scanned over rounds). (④ CPA probe is bash — see cpa-probe.test.sh.)
 
 local here = (arg[0] or ""):match("^(.*/)") or "./"
 local load_check = assert(loadfile(here .. "../sentinel.luau"))
@@ -13,232 +13,186 @@ local function check_(name, cond)
   if not cond then failures = failures + 1 end
 end
 
--- ---- controllable clock + mock tern (sentinel.luau references the global `tern`) ----
-local NOW = 1000000
-local writes = {} -- path -> content (captures durable alert writes)
-local dirs = {}
+local HOME = "/tmp/sentinel-test-home"
+local L0 = HOME .. "/.agenthop/carly"
+local MY_BEAT = L0 .. "/carly-patrol.beat"
+local COORD_BEAT = L0 .. "/coordinator.beat"
+local NOW = 1000000 -- tern.now() monotonic ms (stall timing)
+local NOW_SEC = 1700000000 -- os.time() wall-clock epoch seconds (beats); controllable for deterministic ① tests
+os.time = function() return NOW_SEC end -- override the global the sentinel calls for wall-clock
+local writes, dirs = {}, {}
+local function resetWrites() writes, dirs = {}, {} end
 tern = {
   now = function() return NOW end,
-  getenv = function(k) return k == "HOME" and "/tmp/sentinel-test-home" or nil end,
+  getenv = function(k) return k == "HOME" and HOME or nil end,
   fs = {
-    exists = function(p) return dirs[p] == true end,
+    exists = function(p) return dirs[p] == true or writes[p] ~= nil end,
     mkdir = function(p) dirs[p] = true end,
     write = function(p, t) writes[p] = t end,
     read = function(p) return writes[p] end,
   },
-  json = { encode = function(_) return "{}" end }, -- content not asserted here; A1/sid-hook cover JSON
+  -- minimal json that round-trips the `ts` field (enough for beats; alert bodies are not structurally asserted here)
+  json = {
+    encode = function(v) return '{"ts":' .. tostring((type(v) == "table" and v.ts) or "null") .. '}' end,
+    decode = function(s)
+      local n = type(s) == "string" and s:match('"ts":(%-?%d+)') or nil
+      if n then return { ts = tonumber(n) } end
+      return nil
+    end,
+  },
 }
 
--- ---- mock cx ----
 local function mockCx(panes, reads)
   local session = {}
   function session:panes() return panes end
-  function session:read(pane, _) return reads[pane] end
+  function session:read(pane, _) return reads and reads[pane] end
   return { session = session }
 end
-
-local function countAlertFiles()
-  local n = 0
-  for _ in pairs(writes) do n = n + 1 end
-  return n
-end
-local function resetWrites() writes = {} ; tern.fs.write = function(p, t) writes[p] = t end end
-
--- =========================== scenarios ===========================
-
--- permission detection + dual path (durable file + returned string)
-do
-  local check = load_check()
-  resetWrites()
-  local cx = mockCx(
-    { { pane = 1, kind = "terminal", program = "zsh", cwd = "/w", busy = false } },
-    { [1] = { kind = "terminal", lines = { "running step 3", "Allow this tool? [y/n]" } } }
-  )
-  local out = check({}, cx, {})
-  check_("permission: returns a Carly string", type(out) == "string" and out:find("permission@pane1", 1, true) ~= nil)
-  check_("permission: wrote a durable alert file", countAlertFiles() == 1)
-  check_("permission: self-timed (ms in string)", out:find("ms", 1, true) ~= nil)
-end
-
--- content-filter detection
-do
-  local check = load_check()
-  resetWrites()
-  local cx = mockCx(
-    { { pane = 2, kind = "agent", program = "omp", cwd = "/w", busy = false } },
-    { [2] = { kind = "agent", lines = { "I cannot assist with that request", "..." } } }
-  )
-  local out = check({}, cx, {})
-  check_("content_filter: detected + string", type(out) == "string" and out:find("content_filter@pane2", 1, true) ~= nil)
-  check_("content_filter: durable file written", countAlertFiles() == 1)
-end
-
--- quiet: benign content => nil, no alert file
-do
-  local check = load_check()
-  resetWrites()
-  local cx = mockCx(
-    { { pane = 3, kind = "terminal", program = "zsh", cwd = "/w", busy = false } },
-    { [3] = { kind = "terminal", lines = { "all good", "tests passed" } } }
-  )
-  local out = check({}, cx, {})
-  check_("quiet: returns nil", out == nil)
-  check_("quiet: no alert file", countAlertFiles() == 0)
-end
-
--- stall: busy + unchanged hash across runs with time advance >= stall_ms => stall; needs persistent state
-do
-  local check = load_check()
-  resetWrites()
-  local state = {}
-  local panes = { { pane = 4, kind = "agent", program = "omp", cwd = "/w", busy = true } }
-  local reads = { [4] = { kind = "agent", lines = { "thinking...", "still working" } } }
-  local cx = mockCx(panes, reads)
-  NOW = 2000000
-  local out1 = check({}, cx, state) -- first sight: records since=NOW, no stall yet
-  check_("stall: first sight is quiet", out1 == nil)
-  NOW = 2000000 + 3 * 60 * 1000 + 1 -- advance past stall_ms, same (unchanged) tail
-  local out2 = check({}, cx, state)
-  check_("stall: fires after stall_ms unchanged + busy", type(out2) == "string" and out2:find("stall@pane4", 1, true) ~= nil)
-end
-
--- stall resets when content changes (no false stall)
-do
-  local check = load_check()
-  resetWrites()
-  local state = {}
-  local panes = { { pane = 5, kind = "agent", program = "omp", cwd = "/w", busy = true } }
-  local cx = mockCx(panes, { [5] = { kind = "agent", lines = { "line A" } } })
-  NOW = 3000000
-  check({}, cx, state)
-  NOW = 3000000 + 3 * 60 * 1000 + 1
-  -- content changed => hash differs => since resets => no stall
-  cx = mockCx(panes, { [5] = { kind = "agent", lines = { "line B (progress)" } } })
-  local out = check({}, cx, state)
-  check_("stall: does NOT fire when content changed", out == nil)
-end
-
--- not-busy never stalls even if unchanged
-do
-  local check = load_check()
-  resetWrites()
-  local state = {}
-  local panes = { { pane = 6, kind = "agent", program = "omp", cwd = "/w", busy = false } }
-  local cx = mockCx(panes, { [6] = { kind = "agent", lines = { "idle at prompt" } } })
-  NOW = 4000000
-  check({}, cx, state)
-  NOW = 4000000 + 3 * 60 * 1000 + 1
-  local out = check({}, cx, state)
-  check_("stall: not-busy never stalls", out == nil)
-end
-
--- A3: OSC-driven pane.alert flag folds into the stream as osc_alert (benign text => only the alert flag fires)
-do
-  local check = load_check()
-  resetWrites()
-  local cx = mockCx(
-    { { pane = 7, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = true } },
-    { [7] = { kind = "agent", lines = { "some ordinary output" } } }
-  )
-  local out = check({}, cx, {})
-  check_("osc_alert: pane.alert=true folds into the stream", type(out) == "string" and out:find("osc_alert@pane7", 1, true) ~= nil)
-  check_("osc_alert: durable file written", countAlertFiles() == 1)
-end
-
--- A3: no osc_alert when pane.alert is false/absent (benign text)
-do
-  local check = load_check()
-  resetWrites()
-  local cx = mockCx(
-    { { pane = 8, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = false } },
-    { [8] = { kind = "agent", lines = { "some ordinary output" } } }
-  )
-  local out = check({}, cx, {})
-  check_("osc_alert: absent when alert=false", out == nil)
-end
-
--- a cx whose session:read always throws (body unreadable), but panes metadata is still available
 local function mockCxReadThrows(panes)
   local session = {}
   function session:panes() return panes end
   function session:read(_, _) error("read failed") end
   return { session = session }
 end
-
--- TA-A2-READ: a known OSC alert must survive an unreadable body (not be swallowed by the read failure)
-do
-  local check = load_check()
-  resetWrites()
-  local cx = mockCxReadThrows({ { pane = 9, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = true } })
-  local out = check({}, cx, {})
-  check_("TA-A2-READ: osc_alert still fires when body unreadable", type(out) == "string" and out:find("osc_alert@pane9", 1, true) ~= nil)
-  check_("TA-A2-READ: unreadable alert still written", countAlertFiles() == 1)
+local function countAlertFiles()
+  local n = 0
+  for p in pairs(writes) do if p:find("/alerts/", 1, true) then n = n + 1 end end
+  return n
+end
+local function panesFromString(out) -- collect pane ids named in a returned "kind@paneN" string
+  local set = {}
+  if type(out) == "string" then for id in out:gmatch("@pane(%d+)") do set[tonumber(id)] = true end end
+  return set
 end
 
--- TA-A2-READ: read failure with no alert => quiet (no false alert)
+-- ===== r1: permission / content_filter / quiet =====
 do
-  local check = load_check()
+  local c = load_check()
   resetWrites()
-  local cx = mockCxReadThrows({ { pane = 10, kind = "agent", program = "omp", cwd = "/w", busy = true, alert = false } })
-  local out = check({}, cx, {})
-  check_("TA-A2-READ: unreadable + no alert => quiet", out == nil and countAlertFiles() == 0)
+  local cx = mockCx({ { pane = 1, kind = "terminal", program = "zsh", cwd = "/w", busy = false, alert = false } },
+    { [1] = { kind = "terminal", lines = { "running", "Allow this tool? [y/n]" } } })
+  local out = c({}, cx, {})
+  check_("permission: returns string", type(out) == "string" and out:find("permission@pane1", 1, true) ~= nil)
+  check_("permission: one alert file", countAlertFiles() == 1)
+end
+do
+  local c = load_check()
+  resetWrites()
+  local cx = mockCx({ { pane = 2, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = false } },
+    { [2] = { kind = "agent", lines = { "I cannot assist with that request" } } })
+  local out = c({}, cx, {})
+  check_("content_filter: detected", type(out) == "string" and out:find("content_filter@pane2", 1, true) ~= nil)
+end
+do
+  local c = load_check()
+  resetWrites()
+  local cx = mockCx({ { pane = 3, kind = "terminal", program = "zsh", cwd = "/w", busy = false, alert = false } },
+    { [3] = { kind = "terminal", lines = { "all good" } } })
+  local out = c({}, cx, {})
+  check_("quiet: nil + no alert files", out == nil and countAlertFiles() == 0)
 end
 
--- TA-A2-STALL: idle time must NOT count toward the busy stall clock. Idle+unchanged for a long time, then FIRST busy observation must
--- not immediately report a 3-minute stall; only continuous busy from that point counts.
+-- ===== r1: osc_alert (now metadata-sweep, fires regardless of read) =====
 do
-  local check = load_check()
+  local c = load_check()
   resetWrites()
-  local state = {}
-  local idlePanes = { { pane = 11, kind = "agent", program = "omp", cwd = "/w", busy = false } }
-  local busyPanes = { { pane = 11, kind = "agent", program = "omp", cwd = "/w", busy = true } }
-  local reads = { [11] = { kind = "agent", lines = { "unchanged tail" } } }
-  NOW = 5000000
-  check({}, mockCx(idlePanes, reads), state) -- idle, unchanged
-  NOW = 5000000 + 10 * 60 * 1000 -- 10 minutes idle pass
-  local out = check({}, mockCx(busyPanes, reads), state) -- first busy observation
-  check_("TA-A2-STALL: idle time does NOT count (no instant stall on first busy)", out == nil)
-  NOW = NOW + 3 * 60 * 1000 + 1 -- now 3 min of CONTINUOUS busy
-  local out2 = check({}, mockCx(busyPanes, reads), state)
-  check_("TA-A2-STALL: stalls after 3 min of continuous busy", type(out2) == "string" and out2:find("stall@pane11", 1, true) ~= nil)
+  local cx = mockCx({ { pane = 4, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = true } },
+    { [4] = { kind = "agent", lines = { "ordinary" } } })
+  local out = c({}, cx, {})
+  check_("osc_alert: alert=true fires", type(out) == "string" and out:find("osc_alert@pane4", 1, true) ~= nil)
+end
+do -- TA-A2-READ: osc_alert survives unreadable body (metadata sweep does not read)
+  local c = load_check()
+  resetWrites()
+  local cx = mockCxReadThrows({ { pane = 5, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = true } })
+  local out = c({}, cx, {})
+  check_("TA-A2-READ: osc_alert fires with unreadable body", type(out) == "string" and out:find("osc_alert@pane5", 1, true) ~= nil)
 end
 
--- TA-A2-STALL: busy -> idle -> busy resets the clock
+-- ===== r1: stall + TA-A2-STALL =====
 do
-  local check = load_check()
+  local c = load_check()
   resetWrites()
-  local state = {}
-  local busyPanes = { { pane = 12, kind = "agent", program = "omp", cwd = "/w", busy = true } }
-  local idlePanes = { { pane = 12, kind = "agent", program = "omp", cwd = "/w", busy = false } }
-  local reads = { [12] = { kind = "agent", lines = { "same tail" } } }
-  NOW = 6000000
-  check({}, mockCx(busyPanes, reads), state) -- busy starts
-  NOW = NOW + 2 * 60 * 1000 -- 2 min busy (not yet stalled)
-  check({}, mockCx(idlePanes, reads), state) -- goes idle => reset
-  NOW = NOW + 2 * 60 * 1000 -- 2 min idle
-  local out = check({}, mockCx(busyPanes, reads), state) -- busy again: clock restarts, not stalled
-  check_("TA-A2-STALL: busy->idle->busy resets the clock", out == nil)
+  local st = {}
+  local busy = { { pane = 6, kind = "agent", program = "omp", cwd = "/w", busy = true } }
+  local reads = { [6] = { kind = "agent", lines = { "thinking" } } }
+  NOW = 2000000
+  check_("stall: first sight quiet", c({}, mockCx(busy, reads), st) == nil)
+  NOW = 2000000 + 3 * 60 * 1000 + 1
+  check_("stall: fires after 3min continuous busy", (c({}, mockCx(busy, reads), st) or ""):find("stall@pane6", 1, true) ~= nil)
 end
-
--- TA-A2-STALL (combination): a PROVEN idle observed during a read failure must still reset the clock — a later busy must not inherit
--- the pre-idle clock and false-stall. This is the r2 combination boundary.
-do
-  local check = load_check()
+do -- idle during read-error still resets (TA-A2-STALL combination)
+  local c = load_check()
   resetWrites()
-  local state = {}
-  local busyP = { { pane = 20, kind = "agent", program = "omp", cwd = "/w", busy = true } }
-  local idleP = { { pane = 20, kind = "agent", program = "omp", cwd = "/w", busy = false } }
-  local reads = { [20] = { kind = "agent", lines = { "same tail A" } } }
-  NOW = 7000000
-  check({}, mockCx(busyP, reads), state) -- busy starts; busy_since = 7000000
+  local st = {}
+  local busy = { { pane = 7, kind = "agent", program = "omp", cwd = "/w", busy = true } }
+  local idle = { { pane = 7, kind = "agent", program = "omp", cwd = "/w", busy = false } }
+  local reads = { [7] = { kind = "agent", lines = { "same" } } }
+  NOW = 3000000
+  c({}, mockCx(busy, reads), st)
   NOW = NOW + 120 * 1000
-  check({}, mockCxReadThrows(idleP), state) -- busy=false BUT body unreadable -> metadata-authoritative reset
+  c({}, mockCxReadThrows(idle), st) -- idle + unreadable => metadata reset
   NOW = NOW + 120 * 1000
-  local out = check({}, mockCx(busyP, reads), state) -- busy again, same tail -> clock restarts, must NOT stall
-  check_("TA-A2-STALL: idle-during-read-error still resets clock (no false stall)", out == nil)
-  NOW = NOW + 3 * 60 * 1000 + 1 -- 3 min of genuine continuous busy from the restart
-  local out2 = check({}, mockCx(busyP, reads), state)
-  check_("TA-A2-STALL: real continuous busy after the reset does stall", type(out2) == "string" and out2:find("stall@pane20", 1, true) ~= nil)
+  check_("TA-A2-STALL: idle-during-read-error resets (no false stall)", c({}, mockCx(busy, reads), st) == nil)
+end
+
+-- ===== r2 ①: liveness beat + coordinator_stale mutual-watch (BARE epoch seconds, host wall-clock os.time) =====
+do -- my beat is bare epoch seconds (one line), readable by the swarm's plain reader — NOT JSON, NOT monotonic
+  local c = load_check()
+  resetWrites()
+  NOW_SEC = 1700000000
+  c({}, mockCx({}, {}), {})
+  check_("beat: carly-patrol.beat = bare epoch seconds", writes[MY_BEAT] ~= nil and (writes[MY_BEAT]:gsub("%s+", "")) == tostring(NOW_SEC))
+end
+do -- a real coordinator.beat sample (bare epoch), 25 min old => stale (wall-clock seconds)
+  local c = load_check()
+  resetWrites()
+  NOW_SEC = 1700000000
+  writes[COORD_BEAT] = tostring(NOW_SEC - 25 * 60) .. "\n"
+  local out = c({}, mockCx({}, {}), {})
+  check_("coordinator_stale: stale bare-epoch beat => alert", type(out) == "string" and out:find("coordinator_stale", 1, true) ~= nil)
+end
+do -- fresh (1 min old) => no alert
+  local c = load_check()
+  resetWrites()
+  NOW_SEC = 1700000000
+  writes[COORD_BEAT] = tostring(NOW_SEC - 60)
+  local out = c({}, mockCx({}, {}), {})
+  check_("coordinator_stale: fresh beat => no alert", out == nil)
+end
+do -- bad carriers (empty / non-numeric / legacy JSON) => no crash, no false alert
+  for _, bad in ipairs({ "", "garbage", '{"ts":1700000000}' }) do
+    local c = load_check()
+    resetWrites()
+    NOW_SEC = 1700000000
+    writes[COORD_BEAT] = bad
+    local okCall, out = pcall(c, {}, mockCx({}, {}), {})
+    local label = (bad == "" and "empty") or (bad:sub(1, 1) == "{" and "legacyJSON") or "nonnumeric"
+    check_("coordinator_stale: bad carrier (" .. label .. ") => no-crash no-alert", okCall and out == nil)
+  end
+end
+
+-- ===== r2 ②: batch coverage — every pane body-scanned over ceil(N/batch) rounds =====
+do
+  local c = load_check()
+  resetWrites()
+  local st = {}
+  local panes, reads = {}, {}
+  for i = 1, 6 do -- 6 panes, batch_size 4 => 2 rounds to cover all; alert=false so only body-scan (permission) names a pane
+    panes[i] = { pane = i, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = false }
+    reads[i] = { kind = "agent", lines = { "Allow this tool? [y/n]" } }
+  end
+  NOW = 8000000
+  local o1 = c({}, mockCx(panes, reads), st) -- round 1
+  local o2 = c({}, mockCx(panes, reads), st) -- round 2 (offset advanced)
+  local round1 = panesFromString(o1)
+  local n1 = 0; for _ in pairs(round1) do n1 = n1 + 1 end
+  local covered = {}
+  for id in pairs(round1) do covered[id] = true end
+  for id in pairs(panesFromString(o2)) do covered[id] = true end
+  local nAll = 0; for _ in pairs(covered) do nAll = nAll + 1 end
+  check_("batch: one round body-scans <= batch_size (4) panes", n1 >= 1 and n1 <= 4)
+  check_("batch: all 6 panes covered over 2 rounds (offset advances)", nAll == 6)
 end
 
 print(string.format("\n%s (%d failure(s))", failures == 0 and "PASS" or "FAIL", failures))
