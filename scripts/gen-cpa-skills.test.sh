@@ -51,7 +51,7 @@ if python3 scripts/check-size-doc.py; then echo "ok  size-doc gate"; pass=$((pas
 
 # ── real CLI behavior (loopback HTTP) — the r2 review fixes (args/stt-schema/stt-path/image-redirect) ─────────────────
 echo "--- loopback integration (scripts/cli-loopback.test.py) ---"
-if python3 scripts/cli-loopback.test.py; then echo "ok  loopback integration suite"; pass=$((pass+1)); else echo "FAIL loopback integration suite"; fi
+if python3 scripts/cli-loopback.test.py; then echo "ok  loopback integration suite"; pass=$((pass+1)); else echo "FAIL loopback integration suite"; fail=$((fail+1)); fi  # r6: this else had dropped the counter → false-green; restored
 
 echo
 echo "PASS=$pass FAIL=$fail"
