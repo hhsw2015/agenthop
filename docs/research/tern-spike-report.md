@@ -1,8 +1,8 @@
-# Tern+OMP 蜂群席位宿主 — spike 报告(5 件交付,r4)
+# Tern+OMP 蜂群席位宿主 — spike 报告(5 件交付,r5)
 
 - 对象: 用 Tern+OMP 的原生 agent 层 `cx.agents` 替代/并行 Herdr 作蜂群席位宿主
 - 性质: **纯评估 + 原型,不动产线**。herdr 代码路径一行未改,保留为回退(主审复核:七文件全新增、基线 782 blob 全留、herdr/产线改动 0)。
-- owner: `claude:agenthop-f32a0507`;主审: `codex:Work-01a13284`(r1 0P1/4P2 全闭 → r2 0P1/3P2/1P3 → r3 0P1/0P2/1P3 → 本稿 **r4** 纯文字收口 TERN-3-DOC 三处 + 并入 Carly 四实验实证)
+- owner: `claude:agenthop-f32a0507`;主审: `codex:Work-01a13284`(r1 0P1/4P2 全闭 → r2 0P1/3P2/1P3 → r3 0P1/0P2/1P3 → r4 0P1/0P2/1P3 → 本稿 **r5** 纯文字终收:实证范围朝小写收窄 TERN-3-DOC 三处〔Claude≠Codex、idle≠wait、裸 TUI 补条件〕)
 - worktree: `~/Dev/agenthop-wt/tern-spike` branch `spike/tern-migration`
 - 可核来源(定点提交外,均在同仓对象库可 `git show`):
   - 图谱 `docs/research/tern-omp-eval.md` **@08351a3**(main,镜 24)
@@ -24,9 +24,9 @@
 
 ---
 
-## 0. 一句话结论(r4)
+## 0. 一句话结论(r5)
 
-**omp 席位的 list/状态机制实机可用。** 对蜂群要托管的 claude/codex:**裸 TUI** 形态下原生 cx.agents 不够(非 omp 通用命令 cat/脚本恒 "working"、无兜底 —— user实测;真裸 TUI 同理属推断/待验)。**但以 ACP 块形态跑 claude 时,Carly 实验实测到 `waiting_input`/`idle` + surface 里的结构化权限原文(门①②在 ACP 路径上过)—— 独立来源,非本席,且证的是 ACP 形态,裸 TUI 形态仍待验。** 故迁移主路 = **ACP 块席位**;裸 TUI 作降级面;备路 = agent 自发 OSC 7501/9;4;4(未测)。门③多机 fleet 未动 ⇒ **验收前保留 Herdr**。文件-JSON 控制面是**本配置下**我用的 bash 路径(非平台唯一——文档另有 window control endpoint)。
+**omp 席位的 list/状态机制实机可用。** 对蜂群要托管的 claude/codex:**裸 TUI** 形态下**尚无证据确认目标裸 TUI 信号满足需求**(非 omp 通用命令 cat/脚本恒 "working"、无兜底 —— user实测;真裸 TUI 同理属推断/待验)。**但以 ACP 块形态跑 Claude 时,Carly 实验实测到 `waiting_input`/`idle` + surface 里的结构化权限原文(门①② 在 Claude Code ACP 样本上过;Codex ACP 待验)—— 独立来源,非本席,且证的是 ACP 形态,裸 TUI 形态仍待验。** 故迁移主路 = **ACP 块席位**;裸 TUI 作降级面;备路 = agent 自发 OSC 7501/9;4;4(未测)。门③多机 fleet 未动 ⇒ **验收前保留 Herdr**。文件-JSON 控制面是**本配置下**我用的 bash 路径(非平台唯一——文档另有 window control endpoint)。
 
 ---
 
@@ -166,11 +166,11 @@ interface SeatDriver {
 
 - 席位 config `host:"herdr"|"tern"` 选驱动;异常降级回 herdr = 闭测期风险闸(「herdr 不删」的兑现点)。
 - tern driver 的 `send`(若用 ask)与继任的 `start` 受 §2c 约束:**建议**挪出状态 poll(未验证的落法)。
-- **真 claude/codex 裸 TUI 席的 status 按现有证据拿不到 idle/waiting_input**(§1c 推断/待验),裸 TUI 上保留 herdr 驱动;但 **ACP 块席位已由 Carly 实验实证可拿 waiting_input/idle + 结构化权限**(独立来源,§6),故 tern 驱动**主路 = ACP 块席位**,裸 TUI 为降级面(恒 working,靠 process/capture 合成)。
+- **真 claude/codex 裸 TUI 席:尚无证据确认目标裸 TUI 信号满足 status 需求**(§1c 推断/待验),裸 TUI 上保留 herdr 驱动;但 **ACP 块席位已由 Carly 实验实证(Claude Code 样本)可拿 waiting_input/idle + 结构化权限**(独立来源,§6;Codex ACP 待验),故 tern 驱动**主路 = ACP 块席位**,裸 TUI 为降级面(若目标实际信号不足,再评估 process/capture 合成;待验)。
 
 ---
 
-## 6. 替代判决(r4 重写)
+## 6. 替代判决(r5 重写)
 
 | 维度 | omp 席 | 非 omp / 真 claude/codex 裸 TUI 席(蜂群实际需要) |
 |---|---|---|
@@ -179,28 +179,30 @@ interface SeatDriver {
 | wait/transcript | omp 可用【文档】(**非**由非omp负面反推) | 非 omp:wait 超时 / transcript {}【user实测:非omp】 |
 
 - **omp 席**:working/idle 实测 parity,waiting_input user 实测可用。能力接近 herdr,原型跑通,可立即并行试用。
-- **裸 TUI 席**:原生 cx.agents **按现有证据不够**,真裸 TUI 行为仍待验(恒 working 的推断见 §1c)。
+- **裸 TUI 席**:**尚无证据确认目标裸 TUI 信号满足需求**,真裸 TUI 行为仍待验(恒 working 的推断见 §1c)。
 - **ACP 块席位 = 迁移主路(【Carly实验】实证,见 §6a)**:把 claude/codex 以 ACP 块(非裸 TUI)方式跑,状态/权限信号走 Tern 内部通道——Carly 实验实测到 `waiting_input`、`idle`、以及 surface 里**结构化的权限请求原文**。这把门①②从「方向性猜测」升级为「ACP 形态已实证」。**但注意:这是 Carly 的实验(独立来源),非本席亲测;且证的是 ACP 块形态,裸 TUI 形态仍待验。**
 - **OSC 7501 / 9;4;4 自发(备路)**:让 agent wrapper 主动发状态(changelog 称 omp/agent chats/会说 7501 的工具显示 working/waiting/finished/failed,"locally or over SSH")。7501 完整字段语法无文档(只确认过 `state=clear`)。【文档/未测】
 
 ### 6a. Carly 四实验(【Carly实验】,PROGRESS #848-#849,独立来源,非本席实测)
 
+> 范围:Carly 实验证的是 **Claude Code ACP 块(Manual 模式)**的 idle/working/waiting_input 与权限原文;**Codex ACP 为迁移候选,尚未实测**。拟优先验证 ACP 路径。
+
 - **实验①(ACP 路,决定性)**:Claude Code ACP 块、Manual 模式、真权限请求(`touch` 触发、`echo` 只读不触发),全程未批、deny 收尾零残留:
-  - `state`:提问前 idle → working(3-6s)→ **`waiting_input`(~9s 起恒持至停)** —— 门①②在 **ACP 路径**上一次全过。
+  - `state`:提问前 idle → working(3-6s)→ **`waiting_input`(~9s 起恒持至停)** —— 门①② 在 **Claude Code ACP 样本**上一次全过;**Codex ACP 和目标配置仍待验**。
   - `alert` 恒 false(即便未聚焦)⇒ alert 不可用,**轮询 state 为准**。
   - **surface(pane) 能读到权限请求原文**:`layer.permission.body.question/.detail`=命令原文,`.options`=Yes/No ⇒ approval-delegation 有了**结构化**输入,不靠读屏正则。
-  - idle 态(提问前 idle + at_prompt)亦实测 ⇒ ACP 块下 `wait()` 语义可用。
-  - 边界:此为 **ACP 块**,非裸 TUI 席;裸 TUI 仍恒 working。
-- **实验②(免模型巡检,数字漂亮)**:check 内 `cx.session:read` 可行,3 pane×200 行含滚回=**8.65ms**(热 0.3ms/冷 10ms),50ms 预算富余;pos 偏移只报新增(单次报告后 quiet 不重复);返回字符串即免模型告警;无 prompt 下限 1 分钟。**Carly 自报限制:长度偏移在滚走/TUI 重绘下失效 ⇒ TUI 席应改哈希 + 尾 N 行比对**(与我方 kv 哈希方案合流)。
+  - 提问前 idle + at_prompt 已观测【Carly实验】;由此推断 ACP 下 `wait()` **可能**可用,但**实际 wait 调用及返回尚未验证**【推断/待验】。
+  - 边界:本次为 **Claude Code ACP 样本**,不是真裸 TUI;cat/普通脚本曾实测恒 working,真 Claude/Codex 裸 TUI 若不发相关状态信号则**可能**同理,实际版本仍待验。
+- **实验②(免模型巡检)**:check 内 `cx.session:read` 可行,3 pane×200 行含滚回=**8.65ms**(热 0.3ms/冷 10ms)——**这是该一次 3pane×200 行的样本观测,不是普适时间上界/预算保证**;pos 偏移只报新增(单次报告后 quiet 不重复);返回字符串即免模型告警;无 prompt 下限 1 分钟。**Carly 自报限制:长度偏移在滚走/TUI 重绘下失效 ⇒ TUI 席应改哈希 + 尾 N 行比对**(与我方 kv 哈希方案合流)。
 - 实验③④(review-board / runbook)与本 spike 无关,略。
 
-### 三绿验收门(r4)
+### 三绿验收门(r5)
 
-1. **waiting_input 机制**:✅ omp ask / OSC 9;4;4(user实测);**ACP 块下 claude 真权限请求 → waiting_input 实证(【Carly实验】)**。裸 TUI 不发 OSC 则不触发(推断)⇒ 门① = **以 ACP 块席位运行即通过**(Carly 实证);裸 TUI 形态仍待验。
-2. **claude 状态检测**:✅ **ACP 块下 idle/working/waiting_input 全实证(【Carly实验】)**;裸 TUI 恒 working(推断/待验)⇒ 门② = ACP 块通过,裸 TUI 待验。
+1. **waiting_input 机制**:✅ omp ask / OSC 9;4;4(user实测);**Claude Code ACP 样本的真权限请求 → waiting_input 实证(【Carly实验】)**。裸 TUI 不发 OSC 则不触发(推断)⇒ 门① = **以 Claude Code ACP 块运行即通过**(Carly 实证);**Codex ACP 和目标配置、裸 TUI 形态仍待验**。
+2. **状态检测**:✅ **Claude Code ACP 样本的 idle/working/waiting_input 状态经 list() 观测(【Carly实验】)**;裸 TUI 恒 working(推断/待验)⇒ 门② = **Claude Code ACP 样本已通过;Codex ACP 和目标配置、裸 TUI 待验**。(注:`wait()` 的实际调用/返回未验,见 §6a)
 3. **多机 fleet**:❌【未测】。user 单机;线索:list 行有 `host` 字段(本机=0),OSC 7501 "over SSH" 可用,start 的 `~` 按 launch host home 展开(但 opts 无 host 字段)。待有远端环境实跑 `cx.agents:list()` 看 host 字段。
 
-> 判决要点(r4):门①② **在 ACP 块形态上已由 Carly 实验实证**(独立来源),故 tern 迁移主路 = **ACP 块席位**;裸 TUI 作降级面。仍须本席/验收方在目标形态上复核(Carly 非本评估席),且门③多机未动 ⇒ **验收前保留 Herdr**。
+> 判决要点(r5):门①② **在 Claude Code ACP 样本上已由 Carly 实验实证**(独立来源),故 tern 迁移主路 = **ACP 块席位**;裸 TUI 作降级面。**Codex ACP 和目标配置仍须验收方在目标形态上复核**(Carly 非本评估席),且门③多机未动 ⇒ **验收前保留 Herdr**。
 
 ### 下一步(含主审转来的 Carly 六问新输入,PROGRESS #836-#842)
 
@@ -218,11 +220,11 @@ interface SeatDriver {
 
 ---
 
-## 7. 交付物 + r1→r4 修复对照
+## 7. 交付物 + r1→r5 修复对照
 
 | 件 | 路径 | 修复轨迹 |
 |---|---|---|
-| ① 状态实测 + 证据 | §1 + `prototype/evidence-agents-list.json` | omp 证据保留;r2 由 user QA 补 waiting_input;**r3** 裸 TUI 改「cat/脚本实测 + 真 TUI 推断/待验」(TERN-3);**r4** 并入 Carly 四实验(§6a):ACP 块门①②实证、免模型巡检 8.65ms,均标【Carly实验】独立来源 |
+| ① 状态实测 + 证据 | §1 + `prototype/evidence-agents-list.json` | omp 证据保留;r2 由 user QA 补 waiting_input;**r3** 裸 TUI 改「cat/脚本实测 + 真 TUI 推断/待验」(TERN-3);**r4** 并入 Carly 四实验(§6a);**r5** 范围收窄:Claude Code ACP 样本已证≠Codex ACP(待验)、idle 观测≠wait 实证、裸 TUI 确定句补条件、8.65ms 标样本观测非预算保证 |
 | ② agents-bridge | `prototype/tern-agents-bridge/` | r2 **TERN-1** 认领 at-most-once(remove 门控+读失败不删+撤 exactly-once)、**TERN-3** start 因果撤回;**r3 TERN-1-R2** UNKNOWN 按操作类分(只读可重读,非幂等不得自动重发);**r3 TERN-3** start 两次停摆不冒称同因、「挪出 poll」降为未验证建议 |
 | ③ sid hook | `prototype/sid-hook.sh`+`.settings.json` | r2 **TERN-2** JSON 编码+往返、**TERN-4** pane 规整为数字;**r3 TERN-2-R2** 全程单 python 进程(cwd 不经 bash `$(...)`,末尾 LF 保留)、**TERN-4-DOC** 头注降级为 API 推断/待验 |
 | ④ 映射表 | §4 | 验证列严格分级;capture 仅普通 shell;`run --pane` 报错如实 |
