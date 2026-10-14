@@ -18,7 +18,7 @@ local CONFIG = {
   stall_ms = 3 * 60 * 1000, -- busy + unchanged hash this long => stall alert
   excerpt_chars = 400, -- alert text excerpt cap
   batch_size = 4, -- ② panes body-scanned per round (metadata is swept for all panes every round)
-  coordinator_stale_ms = 20 * 60 * 1000, -- ① coordinator.beat older than this => coordinator_stale alert
+  coordinator_stale_sec = 20 * 60, -- ① coordinator.beat older than this (WALL-CLOCK SECONDS) => coordinator_stale alert
   filter_pats = { "content filter", "usage policy", "can't help with that", "cannot assist with", "flagged for" },
   perm_pats = { "allow this", "[y/n]", "do you want to proceed", "needs your permission", "wants to run", "grant access", "approve?" },
 }
@@ -126,24 +126,36 @@ local check = function(ev, cx, state)
   state.seen = state.seen or {} -- pane -> { hash, busy_since }
   state.scan_offset = state.scan_offset or 0
 
-  -- ① write my liveness beat every round (the swarm's 8-min loop reads carly-patrol.beat; >20min stale => I'm stopped/Tern closed)
+  -- ① Beat contract (coordinator ruling): BARE epoch SECONDS, one-line text, HOST WALL-CLOCK (os.time). NOT JSON, NOT tern.now() —
+  -- tern.now() is a monotonic ms clock with a different origin, so cross-program subtraction against it is meaningless. os.time() is
+  -- verified available in the Tern Luau VM. Defensive: if os.time fails, wall=0 makes every beat look future => no false stale alert.
+  local okW, wall = pcall(os.time)
+  if not okW or type(wall) ~= "number" then
+    wall = 0
+  end
+
+  -- write my liveness beat every round (swarm's 8-min loop reads carly-patrol.beat; >20min stale => I'm stopped / Tern closed)
   pcall(function()
     local dir = l0_root(home)
     if not tern.fs.exists(dir) then
       tern.fs.mkdir(dir)
     end
-    tern.fs.write(my_beat_path(home), tern.json.encode({ ts = now, by = "tern-a2-sentinel" }))
+    tern.fs.write(my_beat_path(home), tostring(wall) .. "\n") -- bare epoch seconds, one line
   end)
 
   local all = {}
 
-  -- ① mutual-watch: read coordinator.beat; a stale beat => coordinator_stale (I watch it; it watches me via my beat). Files, not processes.
+  -- mutual-watch: read coordinator.beat (bare epoch seconds); stale => coordinator_stale. Bad carrier (empty / non-numeric / old JSON
+  -- {ts:...}) => tonumber nil => no alert, no crash. I watch it; the swarm watches me via my beat — files, not processes (#924).
   do
     local okB, txt = pcall(function() return tern.fs.read(coordinator_beat_path(home)) end)
-    if okB and type(txt) == "string" and txt ~= "" then
-      local okD, bt = pcall(function() return tern.json.decode(txt) end)
-      if okD and type(bt) == "table" and type(bt.ts) == "number" and (now - bt.ts) > CONFIG.coordinator_stale_ms then
-        all[#all + 1] = { kind = "coordinator_stale", beat_age_ms = now - bt.ts, ts = now }
+    if okB and type(txt) == "string" and wall > 0 then
+      local epoch = tonumber((txt:gsub("%s+", "")))
+      if epoch ~= nil and epoch > 0 then
+        local age = wall - epoch
+        if age > CONFIG.coordinator_stale_sec then
+          all[#all + 1] = { kind = "coordinator_stale", beat_age_sec = age, ts = wall }
+        end
       end
     end
   end

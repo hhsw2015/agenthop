@@ -17,7 +17,9 @@ local HOME = "/tmp/sentinel-test-home"
 local L0 = HOME .. "/.agenthop/carly"
 local MY_BEAT = L0 .. "/carly-patrol.beat"
 local COORD_BEAT = L0 .. "/coordinator.beat"
-local NOW = 1000000
+local NOW = 1000000 -- tern.now() monotonic ms (stall timing)
+local NOW_SEC = 1700000000 -- os.time() wall-clock epoch seconds (beats); controllable for deterministic ① tests
+os.time = function() return NOW_SEC end -- override the global the sentinel calls for wall-clock
 local writes, dirs = {}, {}
 local function resetWrites() writes, dirs = {}, {} end
 tern = {
@@ -134,29 +136,40 @@ do -- idle during read-error still resets (TA-A2-STALL combination)
   check_("TA-A2-STALL: idle-during-read-error resets (no false stall)", c({}, mockCx(busy, reads), st) == nil)
 end
 
--- ===== r2 ①: liveness beat + coordinator_stale mutual-watch =====
-do
+-- ===== r2 ①: liveness beat + coordinator_stale mutual-watch (BARE epoch seconds, host wall-clock os.time) =====
+do -- my beat is bare epoch seconds (one line), readable by the swarm's plain reader — NOT JSON, NOT monotonic
   local c = load_check()
   resetWrites()
-  NOW = 5000000
+  NOW_SEC = 1700000000
   c({}, mockCx({}, {}), {})
-  check_("beat: carly-patrol.beat written each run", writes[MY_BEAT] ~= nil and writes[MY_BEAT]:find("5000000", 1, true) ~= nil)
+  check_("beat: carly-patrol.beat = bare epoch seconds", writes[MY_BEAT] ~= nil and (writes[MY_BEAT]:gsub("%s+", "")) == tostring(NOW_SEC))
 end
-do
+do -- a real coordinator.beat sample (bare epoch), 25 min old => stale (wall-clock seconds)
   local c = load_check()
   resetWrites()
-  NOW = 6000000
-  writes[COORD_BEAT] = '{"ts":' .. (NOW - 25 * 60 * 1000) .. '}' -- 25 min old => stale (> 20 min)
+  NOW_SEC = 1700000000
+  writes[COORD_BEAT] = tostring(NOW_SEC - 25 * 60) .. "\n"
   local out = c({}, mockCx({}, {}), {})
-  check_("coordinator_stale: stale coordinator.beat => alert", type(out) == "string" and out:find("coordinator_stale", 1, true) ~= nil)
+  check_("coordinator_stale: stale bare-epoch beat => alert", type(out) == "string" and out:find("coordinator_stale", 1, true) ~= nil)
 end
-do
+do -- fresh (1 min old) => no alert
   local c = load_check()
   resetWrites()
-  NOW = 7000000
-  writes[COORD_BEAT] = '{"ts":' .. (NOW - 60 * 1000) .. '}' -- 1 min old => fresh
+  NOW_SEC = 1700000000
+  writes[COORD_BEAT] = tostring(NOW_SEC - 60)
   local out = c({}, mockCx({}, {}), {})
   check_("coordinator_stale: fresh beat => no alert", out == nil)
+end
+do -- bad carriers (empty / non-numeric / legacy JSON) => no crash, no false alert
+  for _, bad in ipairs({ "", "garbage", '{"ts":1700000000}' }) do
+    local c = load_check()
+    resetWrites()
+    NOW_SEC = 1700000000
+    writes[COORD_BEAT] = bad
+    local okCall, out = pcall(c, {}, mockCx({}, {}), {})
+    local label = (bad == "" and "empty") or (bad:sub(1, 1) == "{" and "legacyJSON") or "nonnumeric"
+    check_("coordinator_stale: bad carrier (" .. label .. ") => no-crash no-alert", okCall and out == nil)
+  end
 end
 
 -- ===== r2 ②: batch coverage — every pane body-scanned over ceil(N/batch) rounds =====
