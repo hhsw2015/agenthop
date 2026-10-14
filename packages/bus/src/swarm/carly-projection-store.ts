@@ -7,10 +7,11 @@
  * `writeCarlyProjection(home, status)` takes an already-normalized CarlyStatus so the write path is unit-tested with no real
  * sources; `readCarlyStatus(home)` is the thin adapter that reads the live durable sources into that shape.
  */
-import { mkdirSync, writeFileSync, renameSync, readFileSync, unlinkSync, openSync, closeSync, statSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync, readFileSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { homedir } from "node:os";
+import { acquireHolderLock, releaseHolderLock, type LockSite } from "./holder-lock.js";
 import {
   type CarlyStatus,
   type HeartbeatEntry,
@@ -38,32 +39,32 @@ function readExisting(file: string): string {
 /** Bounded synchronous sleep (no dep) for the lock spin. */
 function sleepMs(ms: number): void { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* best-effort */ } }
 
+/** The holder-identity LockSite for a managed file (dotfile artifacts beside it so they stay out of Carly's view). */
+function managedLockSite(file: string): LockSite {
+  return {
+    lockDir: `${file}.lockd`,
+    intentDir: path.dirname(file),
+    intentPrefix: `.${path.basename(file)}.lock.hold.`,
+  };
+}
+
 /**
- * DS-PROJ-CONFLICT — serialize the read-modify-write of a SHARED managed file behind an advisory lock (`<file>.lock`, O_EXCL).
- * The managed region is swarm-owned, the rest is Carly's; because the whole file is a shared surface, a read-then-rename can
- * clobber a concurrent writer's out-of-region edit. This lock makes the RMW a critical section: it is the "explicit + enforced
- * serialization constraint" — EVERY writer of these files (every swarm sweep here) acquires it, so two writers can never
- * interleave a lost update. A stale lock (holder crashed) older than STALE_MS is reclaimed so a crash can't wedge the projection;
- * if the lock stays held (another live writer), we return busy and the caller HOLDs (next tick retries) rather than clobber.
- * (A co-writer outside this module must honor the same lock — that is the documented contract; nothing else can protect a shared
- * file against an uncooperative editor.)
+ * DS-PROJ-CONFLICT — serialize the read-modify-write of a SHARED managed file behind the proven holder-identity lock (the SAME
+ * primitive the decision-batch / succession / budget consumers use), NOT a hand-rolled timeout lock. Death is proven by ESRCH
+ * (process liveness), never by mtime age — a LIVE or UNKNOWN holder is NEVER reclaimed, so B cannot steal A's live lock; the lock
+ * identity is in the filename, so release removes only OUR OWN token by exact name and can never delete a new holder's lock (the
+ * A/B/C interleave). The RMW (read→splice→rename) runs INSIDE the lock, so a co-writer honoring the same lock cannot interleave a
+ * lost update; a dead holder is reclaimed on a later acquire (recovery). Returns busy when a live/unknown holder keeps the lock ⇒
+ * the caller HOLDs (retry next tick) rather than clobber. (Co-writers of a shared file must honor the same lock — the contract.)
  */
 function withManagedLock<T>(file: string, fn: () => T): T | { busy: true } {
-  const lock = `${file}.lock`;
-  mkdirSync(path.dirname(lock), { recursive: true, mode: 0o700 });
-  const STALE_MS = 10000;
-  let fd = -1;
-  for (let t = 0; t < 100 && fd < 0; t++) {
-    try { fd = openSync(lock, "wx", 0o600); }
-    catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      try { if (Date.now() - statSync(lock).mtimeMs > STALE_MS) { unlinkSync(lock); continue; } } catch { /* vanished ⇒ retry */ }
-      sleepMs(20);
-    }
-  }
-  if (fd < 0) return { busy: true };
+  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); // intentDir must exist before acquiring
+  const site = managedLockSite(file);
+  let token: string | null = null;
+  for (let t = 0; t < 100 && token === null; t++) { token = acquireHolderLock(site); if (token === null) sleepMs(20); }
+  if (token === null) return { busy: true }; // a live/unknown holder keeps it ⇒ HOLD
   try { return fn(); }
-  finally { try { closeSync(fd); } catch { /* */ } try { unlinkSync(lock); } catch { /* */ } }
+  finally { releaseHolderLock(site, token); } // ownership-safe: removes only our exact token, never a successor's
 }
 
 /** EXCLUSIVELY create the temp (wx ⇒ our own fresh inode — never truncate/follow a pre-existing temp or a planted symlink), then

@@ -117,6 +117,29 @@ const full = (e: Partial<ProjectEntry>): ProjectEntry => ({ repo: "", coordinato
   t("DS-REG-READ: corrupt existing ⇒ generate NOT written + file byte-identical (preserved)", res.written === false && (res.reason || "").includes("unreadable") && readFileSync(registryFile(home), "utf8") === corrupt);
   t("DS-REG-READ: readRegistryResult distinguishes absent vs unknown", readRegistryResult(tmpHome()).kind === "absent" && readRegistryResult(home).kind === "unknown");
 }
+// ---- DS-REG-READ r3: entry-shape + leaf-type validation ⇒ a bad CARRIER is UNKNOWN (HOLD), not washed to empty + rewritten ----
+{
+  const mk = (json: string) => { const h = tmpHome(); mkdirSync(path.dirname(registryFile(h)), { recursive: true }); writeFileSync(registryFile(h), json); return h; };
+  const kind = (json: string) => readRegistryResult(mk(json)).kind;
+  t("DS-REG-READ r3: projects as ARRAY ⇒ unknown", kind('{"projects":[{"resumeCmd":"x"}]}') === "unknown");
+  t("DS-REG-READ r3: entry null ⇒ unknown", kind('{"projects":{"p":null}}') === "unknown");
+  t("DS-REG-READ r3: entry string ⇒ unknown", kind('{"projects":{"p":"str"}}') === "unknown");
+  t("DS-REG-READ r3: entry array ⇒ unknown", kind('{"projects":{"p":[]}}') === "unknown");
+  t("DS-REG-READ r3: known field wrong leaf type (object resumeCmd) ⇒ unknown", kind('{"projects":{"p":{"coordinatorSid":"s","resumeCmd":{}}}}') === "unknown");
+  t("DS-REG-READ r3: empty entry {} ⇒ ok (legit)", kind('{"projects":{"p":{}}}') === "ok");
+  t("DS-REG-READ r3: empty-string field + unknown extra key ⇒ ok", kind('{"projects":{"p":{"coordinatorSid":"s","resumeCmd":"","extra":"x"}}}') === "ok");
+  t("DS-REG-READ r3: valid empty registry ⇒ ok", kind('{"projects":{}}') === "ok");
+  // full generate chain: a bad-entry existing file ⇒ generate HOLDs (does not wash + rewrite)
+  const coordSid = "coord-badentry";
+  const h = mk('{"projects":{"p":{"coordinatorSid":"s","resumeCmd":{"obj":1}}}}');
+  mkdirSync(path.join(h, ".agenthop", "presence"), { recursive: true });
+  writeFileSync(path.join(h, ".agenthop", "presence", `${coordSid}.pid`), String(process.pid));
+  mkdirSync(path.join(h, ".agenthop", "swarm"), { recursive: true });
+  writeFileSync(path.join(h, ".agenthop", "swarm", "roster-snapshot.json"), JSON.stringify({ version: 2, capturedAtSec: 1, members: [{ member: coordSid, tool: "claude", cwd: "/r", role: null, resumeCmd: "cmd", title: "t" }] }));
+  const before = readFileSync(registryFile(h), "utf8");
+  const gr = generateRegistry(h, { AH_HOME: h, SWARM_COORDINATOR: coordSid } as any);
+  t("DS-REG-READ r3: bad-entry carrier ⇒ generate HOLDs + file byte-identical", gr.written === false && readFileSync(registryFile(h), "utf8") === before);
+}
 
 // ---- DS-REG-KEY: a project literally named "__proto__" survives build / serialize / parse / lookup ----
 {

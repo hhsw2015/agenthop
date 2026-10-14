@@ -80,18 +80,17 @@ export function wrapManagedBlock(body: string): string {
  * DUAL-WRITE splice: return `existing` with its managed block replaced by `block` (already marker-wrapped).
  *  - A complete pair ⇒ replace from BEGIN through END inclusive; bytes before/after are exact.
  *  - No complete pair ⇒ APPEND the block (blank-line separated iff `existing` is non-empty), her content byte-for-byte.
- * PAIRING (DS-PROJ-MARKER fix): take the FIRST END, then the LAST BEGIN strictly before it — so a stale ORPHAN BEGIN earlier in
- * her content is NOT paired with a later block's END (which would delete everything between them, destroy her text, and break
- * idempotency). The orphan stays as her bytes; only the real `BEGIN…END` block (whose BEGIN is the last one before its END) is
- * replaced. A lone END (no BEGIN before it) ⇒ no pair ⇒ append. Pure. Idempotent on an already-current file.
+ * PAIRING (DS-PROJ-MARKER fix): find the LAST `BEGIN` that HAS an `END` after it, and replace that `BEGIN…END` span. Scanning from
+ * the last BEGIN backward past any that lack a following END means NEITHER a stale orphan BEGIN NOR an orphan END (nor a stray
+ * BEGIN after the real block) breaks the match: the real block is always found and REPLACED, so a second generation never appends a
+ * duplicate (the accumulation bug) and stays byte-idempotent, while orphan markers + her bytes outside the block are preserved.
+ * Our block body neutralizes any marker tokens in data, so a real block can never contain an inner BEGIN/END. Pure.
  */
 export function spliceManagedBlock(existing: string, block: string): string {
-  const end = existing.indexOf(SWARM_END);
-  if (end !== -1) {
-    const begin = existing.lastIndexOf(SWARM_BEGIN, end);
-    if (begin !== -1 && begin + SWARM_BEGIN.length <= end) {
-      return existing.slice(0, begin) + block + existing.slice(end + SWARM_END.length);
-    }
+  for (let begin = existing.lastIndexOf(SWARM_BEGIN); begin !== -1; begin = existing.lastIndexOf(SWARM_BEGIN, begin - 1)) {
+    const end = existing.indexOf(SWARM_END, begin + SWARM_BEGIN.length);
+    if (end !== -1) return existing.slice(0, begin) + block + existing.slice(end + SWARM_END.length);
+    // this BEGIN has no END after it (an orphan / stray BEGIN) ⇒ try an earlier BEGIN
   }
   if (existing === "") return block + "\n";
   const sep = existing.endsWith("\n") ? "\n" : "\n\n";

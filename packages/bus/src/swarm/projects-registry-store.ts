@@ -42,10 +42,29 @@ export function readRegistryResult(home?: string): RegistryRead {
   }
   let raw: unknown;
   try { raw = JSON.parse(text); } catch { return { kind: "unknown", reason: "corrupt JSON" }; }
-  if (!raw || typeof raw !== "object" || typeof (raw as { projects?: unknown }).projects !== "object" || (raw as { projects?: unknown }).projects === null) {
-    return { kind: "unknown", reason: "not a registry object" };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { kind: "unknown", reason: "not a registry object" };
+  const projects = (raw as { projects?: unknown }).projects;
+  // DS-REG-READ: `projects` must be a NON-ARRAY object (a JSON array would make numeric-index "project names"), and EVERY entry must
+  // be a non-null non-array object whose ALREADY-PRESENT known fields are strings. A bad carrier is UNKNOWN (HOLD/preserve) — NOT
+  // tolerantly washed into empty strings and rewritten as if legitimate. A legit empty entry {}, a missing optional, an empty
+  // string, and unknown extension keys all stay VALID (no repo-non-empty / required-field demand is added).
+  if (!projects || typeof projects !== "object" || Array.isArray(projects)) return { kind: "unknown", reason: "projects not an object" };
+  for (const [name, entry] of Object.entries(projects as Record<string, unknown>)) {
+    if (!entryShapeOk(entry)) return { kind: "unknown", reason: `malformed entry for "${name}"` };
   }
   return { kind: "ok", reg: parseRegistry(text) };
+}
+
+/** A registry entry is shape-OK iff it is a non-null, non-array object and every KNOWN field it ACTUALLY has is a string. Missing
+ *  optionals, empty strings, and unknown extra keys are fine; a null/array/scalar entry, or a known field of the wrong leaf type,
+ *  is not (it would be washed to "" and written as fake-legitimate). Pure. */
+const KNOWN_ENTRY_FIELDS = ["repo", "coordinatorSid", "resumeCmd", "fleetSnapshot", "durableRoot"] as const;
+function entryShapeOk(entry: unknown): boolean {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  for (const k of KNOWN_ENTRY_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(entry, k) && typeof (entry as Record<string, unknown>)[k] !== "string") return false;
+  }
+  return true;
 }
 
 /** Carly's READ-ONLY load (advisory): the parsed registry, or an empty one when absent/unknown. For a hard switchboard decision,

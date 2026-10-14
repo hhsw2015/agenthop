@@ -10,7 +10,7 @@
  *
  * Run: node_modules/.bin/tsx packages/bus/src/swarm/carly-projection.selftest.mts  (from repo root)
  */
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, utimesSync, unlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -181,33 +181,58 @@ const EMPTY: CarlyStatus = { heartbeat: [], alerts: [], digest: null };
   const r = runCarlyProjection(home);
   t("DS-PROJ-SOURCE: sweep SKIPS + good queue preserved (not cleared to none)", r.wrote === false && read(heartbeatFile(home)) === good);
 }
-// ---- DS-PROJ-MARKER: an orphan BEGIN in her content must not be eaten on the SECOND write ----
+// ---- DS-PROJ-MARKER: orphan BEGIN AND orphan END must not break the match / accumulate / break idempotency ----
 {
   const home = tmpHome();
   mkdirSync(path.dirname(heartbeatFile(home)), { recursive: true });
   const her = "# her notes\n\n<!-- swarm begin -->\nstale dangling line (no end)\n\nmore of her text\n";
   writeFileSync(heartbeatFile(home), her);
-  writeManagedFile(heartbeatFile(home), "BODY1"); // first: appends a real block after her orphan
+  writeManagedFile(heartbeatFile(home), "BODY1");
   const after1 = read(heartbeatFile(home));
-  writeManagedFile(heartbeatFile(home), "BODY1"); // second with SAME body: must be byte-idempotent, must NOT eat her text
-  const after2 = read(heartbeatFile(home));
-  t("DS-PROJ-MARKER: her orphan BEGIN + text preserved across writes", after1.includes("stale dangling line") && after1.includes("more of her text"));
-  t("DS-PROJ-MARKER: second write byte-idempotent (orphan not paired with the new END)", after2 === after1 && after2.includes("more of her text"));
+  writeManagedFile(heartbeatFile(home), "BODY1"); // same body ⇒ byte-idempotent, must not eat her text
+  t("DS-PROJ-MARKER: orphan BEGIN + her text preserved + 2nd write idempotent", read(heartbeatFile(home)) === after1 && after1.includes("stale dangling line") && after1.includes("more of her text"));
 }
-// ---- DS-PROJ-CONFLICT: the serialization lock is honored (busy ⇒ skip, keep file) + a stale lock is reclaimed ----
+{
+  // orphan END leading the file: three generations must NOT accumulate three blocks, and a body update must REPLACE the old content.
+  const home = tmpHome();
+  mkdirSync(path.dirname(heartbeatFile(home)), { recursive: true });
+  const her = "her text <!-- swarm end --> a stray end, no begin\n";
+  writeFileSync(heartbeatFile(home), her);
+  writeManagedFile(heartbeatFile(home), "OLD-ASK");
+  writeManagedFile(heartbeatFile(home), "OLD-ASK"); // same ⇒ idempotent, not a 2nd block
+  const after2 = read(heartbeatFile(home));
+  t("DS-PROJ-MARKER: orphan END ⇒ exactly ONE block, idempotent (no accumulation)", (after2.split(SWARM_BEGIN).length - 1) === 1 && (after2.match(/OLD-ASK/g) || []).length === 1);
+  writeManagedFile(heartbeatFile(home), "NEW-ASK"); // body update
+  const after3 = read(heartbeatFile(home));
+  t("DS-PROJ-MARKER: body update REPLACES old managed content (not appended)", after3.includes("NEW-ASK") && !after3.includes("OLD-ASK") && after3.startsWith("her text <!-- swarm end -->"));
+}
+// ---- DS-PROJ-CONFLICT: holder-identity lock — a LIVE/unknown holder HOLDs (never stolen); a DEAD (ESRCH) holder is reclaimed ----
 {
   const home = tmpHome();
   writeCarlyProjection(home, FULL);
   const good = read(heartbeatFile(home));
-  const lock = heartbeatFile(home) + ".lock";
-  writeFileSync(lock, String(process.pid)); // simulate another live writer holding the lock
-  const skipped = writeManagedFile(heartbeatFile(home), "SHOULD-NOT-LAND"); // bounded spin ⇒ busy
-  t("DS-PROJ-CONFLICT: lock held ⇒ write skipped (false) + file untouched", skipped === false && read(heartbeatFile(home)) === good);
-  // make the lock STALE (old mtime) ⇒ the next write reclaims it and proceeds
-  utimesSync(lock, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
-  const wrote = writeManagedFile(heartbeatFile(home), "NOWLANDS");
-  t("DS-PROJ-CONFLICT: stale lock reclaimed ⇒ write proceeds", wrote === true && read(heartbeatFile(home)).includes("NOWLANDS"));
-  try { unlinkSync(lock); } catch { /* released by the successful write */ }
+  const lockDir = heartbeatFile(home) + ".lockd";
+  // a LIVE/unknown holder: pid 1 (init) probes EPERM, not ESRCH ⇒ not reclaimable ⇒ contend ⇒ HOLD
+  mkdirSync(lockDir, { recursive: true });
+  writeFileSync(path.join(lockDir, "1.deadbeef"), "");
+  const skipped = writeManagedFile(heartbeatFile(home), "SHOULD-NOT-LAND");
+  t("DS-PROJ-CONFLICT: a live/unknown holder ⇒ write HOLDs (false) + file untouched (never stolen)", skipped === false && read(heartbeatFile(home)) === good);
+  try { execSync(`rm -rf ${JSON.stringify(lockDir)}`); } catch { /* */ }
+  // a DEAD holder (ESRCH pid) ⇒ reclaimed ⇒ write proceeds. Guard: only if the chosen pid really is ESRCH on this host.
+  let deadPid = 999999; let isDead = false;
+  try { process.kill(deadPid, 0); } catch (e) { isDead = (e as NodeJS.ErrnoException).code === "ESRCH"; }
+  if (isDead) {
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(path.join(lockDir, `${deadPid}.deadbeef`), "");
+    const wrote = writeManagedFile(heartbeatFile(home), "NOWLANDS");
+    t("DS-PROJ-CONFLICT: a DEAD (ESRCH) holder ⇒ reclaimed ⇒ write proceeds", wrote === true && read(heartbeatFile(home)).includes("NOWLANDS"));
+  } else {
+    console.log("skip - DS-PROJ-CONFLICT dead-reclaim (pid 999999 not ESRCH here)");
+  }
+  // a clean write leaves no lock residue (ownership-safe release)
+  const w = writeManagedFile(heartbeatFile(home), "CLEAN");
+  let residue = true; try { execSync(`test -e ${JSON.stringify(lockDir)}`); } catch { residue = false; }
+  t("DS-PROJ-CONFLICT: clean write releases the lock (no lockdir residue)", w === true && residue === false);
 }
 
 console.log("all carly-projection selftests passed");
