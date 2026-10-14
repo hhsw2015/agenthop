@@ -4,12 +4,13 @@
 // zero-bug fixture classes (crash-recovery / restart-idempotency / concurrency-ownership), each asserting an OBSERVABLE
 // TERMINAL STATE. No bus dependency — ledger-core/ledger-io are decoupled on purpose.
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { assembleReviewRows, parseGitBatches, buildLedgerSql, type ReviewInput, type GitLogEntry } from "./ledger-core.js";
 import { buildAndPublish } from "./ledger-io.js";
+import { readReviewQueueStrict } from "./ledger-sources.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 const scratch = mkdtempSync(path.join(tmpdir(), "tern-ledger-selftest-"));
@@ -74,6 +75,35 @@ try {
     t("sql: both tables created", sql1.includes("CREATE TABLE reviews(") && sql1.includes("CREATE TABLE batches("));
   }
 
+  // ── B3-FC2: readReviewQueueStrict (P2-1) — unreadable NEVER degrades to empty ────────────────────────────────────
+  {
+    const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+    const qdir = () => mkdtempSync(path.join(scratch, "queue-"));
+    t("queue: ENOENT dir ⇒ [] (absent, no reviews yet)", readReviewQueueStrict(path.join(scratch, "nope-does-not-exist")).length === 0);
+    {
+      const d = qdir();
+      writeFileSync(path.join(d, "feat-a.seatX.json"), JSON.stringify({ author: "au", sha: "sha1", sentSec: 111 }));
+      writeFileSync(path.join(d, "feat-b.seatY.done.json"), JSON.stringify({ author: "au", sha: "sha2", sentSec: 222 }));
+      writeFileSync(path.join(d, "notes.txt"), "not a review file"); // skipped
+      const rows = readReviewQueueStrict(d);
+      t("queue: valid records parsed (item=ticket, seat, sha, ts), non-review skipped", rows.length === 2 && rows[0]!.item === "feat-a" && rows[0]!.seat === "seatX" && rows[0]!.sha === "sha1" && rows[0]!.ts === 111);
+    }
+    {
+      const d = qdir();
+      writeFileSync(path.join(d, "feat-c.seatZ.json"), "{ not json");
+      let threw = false; try { readReviewQueueStrict(d); } catch { threw = true; }
+      t("queue: malformed record JSON ⇒ throws (never silent empty)", threw);
+    }
+    if (!isRoot) {
+      // EACCES dir ⇒ throw (not treated as absent/empty)
+      const d = qdir(); chmodSync(d, 0o000);
+      let readable = true; try { readdirSync(d); } catch { readable = false; }
+      if (!readable) { let threw = false; try { readReviewQueueStrict(d); } catch { threw = true; } t("queue: EACCES dir ⇒ throws (not empty)", threw); }
+      else console.log("skip  queue EACCES-dir test (chmod 000 still listable here)");
+      try { chmodSync(d, 0o700); } catch { /* restore */ }
+    } else { console.log("skip  queue EACCES-dir test (root bypasses perms)"); }
+  }
+
   if (!haveSqlite) {
     console.log("SKIP sqlite3-backed fixtures (no sqlite3 on PATH)");
   } else {
@@ -106,6 +136,27 @@ try {
       try { buildAndPublish(dest, sqlA, "sqlite3-does-not-exist-xyz"); } catch { threw2 = true; }
       t("fixture[crash]: missing binary throws, db intact", threw2 && sha(dest) === good);
       t("fixture[crash]: no leftover temp after failures", !readdirSync(d).some((f) => f.includes(".tmp-")));
+    }
+
+    // ── FIXTURE 2b (B3-FC2, P2-1): an UNREADABLE review-queue preserves the last good db ────────────────────────────
+    // main() reads readReviewQueueStrict BEFORE buildAndPublish, so an unreadable source throws and the good db is never
+    // touched — the observable terminal state is the PREVIOUS db, not an empty one.
+    {
+      const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+      const d = mkdtempSync(path.join(scratch, "preserve-"));
+      const dest = path.join(d, "ledger.db");
+      buildAndPublish(dest, sqlA); const good = sha(dest);
+      const qdir = path.join(d, "review-queue"); mkdirSync(qdir); writeFileSync(path.join(qdir, "x.y.json"), "{}");
+      if (!isRoot) {
+        chmodSync(qdir, 0o000);
+        let listable = true; try { readdirSync(qdir); } catch { listable = false; }
+        if (!listable) {
+          let threw = false; try { readReviewQueueStrict(qdir); } catch { threw = true; }
+          // the publish step is never reached when the source throws, so the good db stays byte-for-byte
+          t("fixture[preserve]: unreadable queue throws ⇒ good db untouched", threw && sha(dest) === good && q(dest, "SELECT count(*) FROM reviews;") === "1");
+        } else { console.log("skip  preserve-good-db test (chmod 000 still listable here)"); }
+        try { chmodSync(qdir, 0o700); } catch { /* restore */ }
+      } else { console.log("skip  preserve-good-db test (root bypasses perms)"); }
     }
 
     // ── FIXTURE 3: concurrency-ownership (atomic replace never torn; O_EXCL temp never truncates a foreign temp) ─────

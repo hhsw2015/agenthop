@@ -9,7 +9,9 @@ export script; atomic temp+rename (a reader never sees a torn db).
 
 - `ledger-core.ts` — pure: `parseGitBatches`, `assembleReviewRows`, `buildLedgerSql` (deterministic SQL).
 - `ledger-io.ts` — `buildAndPublish`: O_EXCL-owned fresh temp → `sqlite3` fills it → atomic rename.
-- `export.mts` — CLI: FC-2 reads of the sources, runs git, builds, publishes.
+- `ledger-sources.ts` — the read-only source readers: `readReviewQueueStrict` (strict FC-2 — an unreadable
+  queue THROWS rather than degrade to an empty export that clobbers the good db) + `readGitLog`.
+- `export.mts` — CLI: reads the sources (strict FC-2, before any publish), runs git, builds, publishes.
 
 Schema (contract-frozen):
 ```sql
