@@ -55,12 +55,23 @@ TUI redraw). Alerts go two ways: a durable `~/.agenthop/carly/alerts/<kind>-<pan
 string shown directly by Carly. Each run self-times (`check_ms`). Arming status: `~/.agenthop/tern-panes/sentinel.json`. Logic lives in
 `sentinel.luau`; see [PROTOCOL.md §7](PROTOCOL.md). Tuning (patterns, `stall_ms`, `tail_lines`) is the `CONFIG` table in `sentinel.luau`.
 
+## A3 — OSC 9;4 alert channel
+
+Gives a **bare (non-ACP) claude/codex seat** a "needs-human" signal. `osc-alert-hook.sh` (a Claude Code hook) emits OSC 9;4;4 on
+`Notification` (and clears on `Stop`/`UserPromptSubmit`) to the pane's PTY (`/dev/tty`); Tern sets `pane.alert`, which the A2 sentinel
+folds in as an `osc_alert`. Only emits inside a Tern pane (no-op elsewhere, so it's safe on every seat). Register via
+`osc-alert-hook.settings.json`. Empirical basis: Carly V6 (OSC 9;4;4 → alert=true, focus clears). See [PROTOCOL.md §8](PROTOCOL.md).
+
+For ACP-block seats (the migration main path) `waiting_input` + the permission surface come for free; the OSC channel is the
+second-best signal for bare TUI seats.
+
 ## Test
 
 ```bash
-lua test/claim.test.lua       # A1 claim-model fixture: crash-recovery / concurrency / idempotency (Lua 5.5)
-lua test/sentinel.test.lua    # A2 sentinel fixture: content-filter / permission / stall / reset (Lua 5.5)
+lua  test/claim.test.lua       # A1 claim-model: crash-recovery / concurrency / idempotency (Lua 5.5)
+lua  test/sentinel.test.lua    # A2 sentinel + A3 reader: content-filter / permission / stall / osc_alert (Lua 5.5)
+bash test/osc-hook.test.sh     # A3 emitter: per-event OSC bytes + no-op-outside-Tern guard
 ```
 
-Both fixtures have teeth (reverting the claim gate / blanking the patterns turns them RED). `claim.test.lua` mirrors `window.luau`'s
-drain decision (kept in sync by comment); `sentinel.test.lua` loads the real `sentinel.luau` directly (no drift).
+All fixtures have teeth. `claim.test.lua` mirrors `window.luau`'s drain decision (kept in sync by comment); `sentinel.test.lua` loads
+the real `sentinel.luau` directly (no drift); `osc-hook.test.sh` captures the emitted OSC via `AGENTHOP_OSC_TTY`.

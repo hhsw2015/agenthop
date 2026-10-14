@@ -70,6 +70,12 @@ local function scan_pane(p, tail, now, prev)
   if perm then
     alerts[#alerts + 1] = { pane = p.pane, kind = "permission", marker = perm, program = p.program, cwd = p.cwd, text = excerpt(tail), ts = now }
   end
+  -- A3: the OSC 9;4-driven alert flag. A seat wrapper / CC hook emits OSC 9;4;4 when it "needs a human"; Tern sets PaneInfo.alert,
+  -- which we fold into this same stream (Carly V6: OSC -> alert=true, focus clears, no OSC leaves it unchanged). This gives non-ACP
+  -- seats a "needs attention" signal without the model and without screen-text heuristics.
+  if p.alert == true then
+    alerts[#alerts + 1] = { pane = p.pane, kind = "osc_alert", program = p.program, cwd = p.cwd, text = excerpt(tail), ts = now }
+  end
   -- stall: hash unchanged since a prior run AND still busy for >= stall_ms
   local since = now
   if prev ~= nil and prev.hash == h then

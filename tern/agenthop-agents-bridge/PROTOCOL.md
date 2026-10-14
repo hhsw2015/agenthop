@@ -115,3 +115,17 @@ tern plugin link <repo>/tern/agenthop-agents-bridge     # 原地用(开发/本�
 - **状态**:`~/.agenthop/tern-panes/sentinel.json` = `{scheduled, id, ts, error?}`(武装信号,可核)。
 - **实证**:真机 schedule id=4,1m check 真跑,对探针 pane("Allow this tool? [y/n]")写出 `permission` 告警(check_ms 2.8ms)。夹具 `test/sentinel.test.lua`(三告警型+stall+reset+not-busy,teeth:清空 perm_pats→RED)。
 - **边界**:`stall` 依赖 `state` 跨 run 持久(TaskSpec 的 state);若调度器不持久 state,stall 退化(其余两型仍在)——生产可改为把 seen 哈希落盘。
+
+## 8. A3 — OSC 9;4 alert 通道
+
+同插件第三件。给**裸(非 ACP)claude/codex 席**一条"需要人"信号:席位在需要人时发 OSC 9;4,Tern 置 `PaneInfo.alert`(并/或 `state=waiting_input`),A2 哨兵读 `pane.alert` 并入告警流。实证基础 = Carly V6 对照(OSC 9;4;4→alert=true、聚焦即清、无 OSC 不变)。
+
+- **发端(emitter)**:`osc-alert-hook.sh` = Claude Code hook。
+  - `Notification` → `printf '\033]9;4;4;50\007'`(paused→需要人)。
+  - `Stop` / `SubagentStop` / `UserPromptSubmit` → `printf '\033]9;4;0\007'`(清除)。
+  - OSC 必须到 pane 的 PTY:hook 的 stdout 被 Claude Code 截获,故写 `/dev/tty`(可用 `AGENTHOP_OSC_TTY` 覆盖,夹具据此捕获)。
+  - **仅在 Tern pane 内发**(`$TERN_PANE` 有值);herdr/其它终端席位是 no-op ⇒ 全席可挂,安全。
+  - 注册见 `osc-alert-hook.settings.json`(Notification/Stop/SubagentStop/UserPromptSubmit 四事件)。
+- **读端(reader)**:A2 `sentinel.luau` 的 `scan_pane` 增一型 `osc_alert`:`p.alert == true` 即写入告警流(耐久文件 + Carly 字符串,同 §7 双路)。
+- **夹具**:`test/osc-hook.test.sh`(四事件 → 正确 OSC、未知事件无输出、无 TERN_PANE no-op);`test/sentinel.test.lua` 增 `osc_alert` 两例(alert=true 折入 / alert=false 不发)。
+- **关系**:ACP 块席位(迁移主路)天然有 waiting_input+surface;OSC 9;4 通道是**裸 TUI 席的次优信号路**,让它们也进 A2 的"需要人"流,不必解析屏幕。

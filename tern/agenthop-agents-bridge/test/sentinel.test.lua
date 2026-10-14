@@ -132,5 +132,30 @@ do
   check_("stall: not-busy never stalls", out == nil)
 end
 
+-- A3: OSC-driven pane.alert flag folds into the stream as osc_alert (benign text => only the alert flag fires)
+do
+  local check = load_check()
+  resetWrites()
+  local cx = mockCx(
+    { { pane = 7, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = true } },
+    { [7] = { kind = "agent", lines = { "some ordinary output" } } }
+  )
+  local out = check({}, cx, {})
+  check_("osc_alert: pane.alert=true folds into the stream", type(out) == "string" and out:find("osc_alert@pane7", 1, true) ~= nil)
+  check_("osc_alert: durable file written", countAlertFiles() == 1)
+end
+
+-- A3: no osc_alert when pane.alert is false/absent (benign text)
+do
+  local check = load_check()
+  resetWrites()
+  local cx = mockCx(
+    { { pane = 8, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = false } },
+    { [8] = { kind = "agent", lines = { "some ordinary output" } } }
+  )
+  local out = check({}, cx, {})
+  check_("osc_alert: absent when alert=false", out == nil)
+end
+
 print(string.format("\n%s (%d failure(s))", failures == 0 and "PASS" or "FAIL", failures))
 os.exit(failures == 0 and 0 or 1)

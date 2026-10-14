@@ -2,7 +2,7 @@
 -- agenthop agents-bridge v1 — A1 (production). A THIN window-half shim: it adds NO detection logic of its own; it mirrors Tern's
 -- native cx.agents layer to a file-JSON control plane the bash swarm reads/writes, herdr-style. Authoritative wire contract and the
 -- claim/recovery semantics live in PROTOCOL.md. A2 (promptless patrol sentinel, registered below via tern.carly.schedule) ships in
--- this same plugin; A3 (OSC 9;4 alert) extends it in a later commit.
+-- this same plugin; A3 (OSC 9;4 alert) reader is folded into the A2 sentinel; the emitter is osc-alert-hook.sh.
 --
 -- Claim model (spike r1-r5, PROTOCOL.md §3): execute ONLY after a successful remove-claim; a read failure never deletes the request;
 -- this is AT-MOST-ONCE per claim, NOT crash-safe exactly-once (tern.fs exposes no rename/O_EXCL). Recovery is the swarm's job and is
