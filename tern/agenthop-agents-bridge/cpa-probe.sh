@@ -40,7 +40,9 @@ except FileNotFoundError:
 except OSError:
     print("NA"); sys.exit(0)
 s = data.strip()
-print(s if s.isdigit() else "NA")
+# ASCII decimal ONLY: str.isdigit()/isdecimal() also accept Unicode digits (fullwidth ３, Arabic ٣, superscripts) which would flow
+# into Bash $((cur+1)) as non-ASCII and neither advance nor report unavailable. isascii() pins it to the [0-9]+ counting contract.
+print(s if (s.isascii() and s.isdigit()) else "NA")
 PY
 }
 

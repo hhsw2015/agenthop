@@ -151,5 +151,18 @@ ck "persist-first order: alert NOT cleared before a confirmed zero" "1" "$(alert
 ck "persist-first order: count still 3 (not reset)" "3" "$(streak "$L0")"
 rm -rf "$L0"
 
+# --- A2-CPA-STATE Unicode digits: a carrier of Unicode digits (fullwidth/Arabic — str.isdigit() accepts them) must be NA, never passed
+# to Bash arithmetic. Assert: unavailable exit 2 + count unchanged + no arithmetic breakage (clean exit 2, not a stray code). ---
+for u in 'ff13:fullwidth' '0663:arabic'; do
+  cp="${u%%:*}"; name="${u##*:}"
+  L0="$(newL0)"; mkdir -p "$L0/alerts"
+  python3 -c 'import sys; open(sys.argv[1],"w").write(chr(int(sys.argv[2],16)))' "$L0/cpa-probe.state" "$cp"
+  before="$(cat "$L0/cpa-probe.state")"
+  rc=$(down "$L0")
+  ck "unicode-digit ($name): exit 2 (NA, not advanced, no arithmetic)" "2" "$rc"
+  ck "unicode-digit ($name): carrier unchanged" "$before" "$(cat "$L0/cpa-probe.state")"
+  rm -rf "$L0"
+done
+
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
