@@ -19,8 +19,6 @@ local function popen_status(cmd)
   local ok, _, code = p:close()
   return out, ok == true, code or -1
 end
--- os-level boolean test (no output). Returns true/false only.
-local function texec(args) local c = os.execute("test " .. args .. " >/dev/null 2>&1"); return c == true or c == 0 end
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
 -- PURE parsers.
@@ -62,17 +60,21 @@ end
 
 -- PURE (TB-ARCH): match the arch-review signoff to THIS batch. Requires the batch NUMBER to equal batch_num AND the signoff's SHA field,
 -- RESOLVED to a full commit via `resolve`, to equal the full tip SHA. A tip7 appearing in another field, a too-short field, or a field
--- that resolves to a different/ambiguous commit does NOT match. `resolve(sha)->full_sha|nil`.
+-- that resolves to a DIFFERENT commit does NOT match.
+--   resolve(sha) -> (full_sha|nil, ok). ok==false is a FAULT (git/rev-parse failed to RUN) — NOT "this sha names no commit". A fault
+--   must ABORT the publish: silently leaving arch-review UNCHECKED because a transient git error returned nil is a lie (r6 seam ①).
+--   So match_arch returns (name|nil, ok) and the caller aborts on ok==false. (Equality tests read only the first return, unaffected.)
 function R.match_arch(names, batch_num, tip_full, resolve)
-  if not batch_num or not tip_full or tip_full == "" or not resolve then return nil end
+  if not batch_num or not tip_full or tip_full == "" or not resolve then return nil, true end
   for _, n in ipairs(names or {}) do
     local p = R.parse_signoff_name(n)
     if p and p.batch == tonumber(batch_num) then
-      local full = resolve(p.sha)
-      if full and full ~= "" and full == tip_full then return n end
+      local full, ok = resolve(p.sha)
+      if ok == false then return nil, false end -- resolver FAULT ⇒ propagate; caller keeps the last good board
+      if full and full ~= "" and full == tip_full then return n, true end
     end
   end
-  return nil
+  return nil, true
 end
 
 -- ---------------------------------------------------------------------------------------------------------------------------------
@@ -164,22 +166,19 @@ function R.write_atomic(path, text)
   return true
 end
 
--- dir_status (TB-FC2, r5): ERRNO-ACCURATE three-state WITHOUT parsing a path-bearing diagnostic. A dir name containing the literal text
--- "No such file" must not be able to fake ENOENT. We classify from the FILESYSTEM: a readable dir is `-d && -r && -x`; otherwise we walk
--- the ancestor chain with boolean `test` — the first component that is MISSING (under an already-traversable parent) ⇒ "absent"
--- (genuine ENOENT); the first component that EXISTS but is NOT traversable ⇒ "unreadable" (EACCES); a fully-present path that is not a
--- readable dir (regular file / no read bit) ⇒ "unreadable". Each `test -e` runs under a parent we already proved traversable, so it is reliable.
+-- dir_status (TB-FC2, r6): the REAL errno of a directory-open is the SOLE classifier — no shell `test` predicates (a `test` boolean is
+-- not an errno: `test -x` passes a 755 regular FILE, `test -e` only follows a symlink and reports false for an EACCES target, and ls's
+-- stderr carries the path). `io.open(dir .. "/", "r")` performs one open() syscall: the TRAILING SLASH forces directory semantics (a
+-- regular file — at the leaf OR anywhere in the ancestor chain — raises ENOTDIR), the open() traverses the whole path (so a non-traversable
+-- ancestor raises EACCES, a symlink target's inaccessible parent raises EACCES), and Lua returns the C errno as the THIRD value (a NUMBER,
+-- never a path-bearing string — a dir NAMED "No such file or directory" cannot fake ENOENT). ENOENT(2) ⇒ genuine absence; EVERYTHING else
+-- (ENOTDIR/EACCES/ELOOP/no-read-bit/…) ⇒ unreadable, never folded to a clean-empty "absent". A successful open needs read permission on
+-- the dir, so "read" guarantees the subsequent ls can list it.
 function R.dir_status(dir)
-  if texec("-d " .. shq(dir)) and texec("-r " .. shq(dir)) and texec("-x " .. shq(dir)) then return "read" end
-  local abs = dir:sub(1, 1) == "/"
-  local cur = abs and "" or "."
-  for seg in dir:gmatch("[^/]+") do
-    local nextp = cur .. "/" .. seg
-    if not texec("-e " .. shq(nextp)) then return "absent" end   -- missing under a traversable parent ⇒ genuine ENOENT
-    if not texec("-x " .. shq(nextp)) then return "unreadable" end -- exists but can't descend ⇒ EACCES
-    cur = nextp
-  end
-  return "unreadable" -- fully present + traversable but not a readable dir (regular file / no -r)
+  local fh, _, errno = io.open(dir .. "/", "r")
+  if fh then fh:close(); return "read" end
+  if errno == 2 then return "absent" end -- ENOENT: the path genuinely does not exist
+  return "unreadable"                     -- ENOTDIR / EACCES / ELOOP / any other fault ⇒ a fault, not a legitimate absence
 end
 
 -- list_dir: dir_status (errno-accurate) then, only for a readable dir, the contents (newest-first optional).
@@ -244,10 +243,11 @@ function R.default_deps(home, repo)
       if nstatus == "unreadable" then return nil, false end -- a readable-then-unreadable review dir ⇒ abort (don't half-compute arch)
       local arch = nil
       if tip_full then
-        local m = R.match_arch(names, batch_num, tip_full, function(s)
+        local m, mok = R.match_arch(names, batch_num, tip_full, function(s)
           local rl, rok = git("rev-parse " .. shq(s) .. "^{commit}")
-          return rok and rl[1] or nil
+          return (rok and rl[1] or nil), rok -- (full|nil, ok): rok==false ⇒ rev-parse FAULTED, a signal to abort (not "no signoff")
         end)
+        if mok == false then return nil, false end -- resolver fault ⇒ abort (don't silently uncheck a real arch-review)
         if m then arch = review_reports .. "/" .. m end
       end
       local agenthop_bin = (os.getenv("HOME") or home) .. "/.local/bin/agenthop"

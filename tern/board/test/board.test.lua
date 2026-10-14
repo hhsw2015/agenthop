@@ -89,13 +89,23 @@ ok("TB-BRANCH: pick_batch nil on empty", R.pick_batch({}) == nil)
 -- A tip7 in a NON-SHA field (reviewer suffix), a wrong batch, a field resolving to a DIFFERENT commit, a too-short field, or an
 -- unresolvable field all fail. resolver(map) = a fake rev-parse: sha-field -> full commit (nil = ambiguous/invalid).
 local TIPFULL = "53967f6abcabcabcabcabcabcabcabcabcabc123" -- 40 hex (the batch tip, fully resolved)
-local function resolver(map) return function(s) return map[s] end end
+local function resolver(map) return function(s) return map[s], true end end -- ok=true: rev-parse RAN; nil result = clean "no commit"
 ok("TB-ARCH: tip7 in reviewer suffix of a DIFFERENT batch/old-SHA signoff ⇒ no match", R.match_arch({ "batch9-dual-signoff-b9fde15-reviewer-53967f6.md" }, 23, TIPFULL, resolver({ b9fde15 = "b9fde15eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", ["53967f6"] = TIPFULL })) == nil)
 ok("TB-ARCH: the batch's OWN signoff (sha field resolves to the tip's full commit, batch matches) ⇒ match", R.match_arch({ "batch23-dual-signoff-53967f6-seat.md" }, 23, TIPFULL, resolver({ ["53967f6"] = TIPFULL })) == "batch23-dual-signoff-53967f6-seat.md")
 ok("TB-ARCH: right sha field but WRONG batch number ⇒ no match", R.match_arch({ "batch9-dual-signoff-53967f6-seat.md" }, 23, TIPFULL, resolver({ ["53967f6"] = TIPFULL })) == nil)
 -- r5 teeth: resolution is to a UNIQUE FULL COMMIT, not a prefix string-compare — a field that resolves to a different commit fails.
 ok("TB-ARCH r5: sha field that resolves to a NON-tip commit ⇒ no match", R.match_arch({ "batch23-dual-signoff-53967f6-seat.md" }, 23, TIPFULL, resolver({ ["53967f6"] = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" })) == nil)
-ok("TB-ARCH r5: an UNRESOLVABLE sha field (ambiguous/invalid rev-parse ⇒ nil) ⇒ no match (never guess)", R.match_arch({ "batch23-dual-signoff-53967f6-seat.md" }, 23, TIPFULL, resolver({})) == nil)
+ok("TB-ARCH r5: a sha field that resolves cleanly to nil (no such commit, ok=true) ⇒ no match (never guess)", R.match_arch({ "batch23-dual-signoff-53967f6-seat.md" }, 23, TIPFULL, resolver({})) == nil)
+-- r6 teeth (seam ①): a resolver FAULT (rev-parse failed to RUN, ok=false) ≠ "no signoff" — match_arch's 2nd return is false so the
+-- caller ABORTS and keeps the last good board, instead of silently flipping a real arch-review to unchecked on a transient git error.
+ok("TB-ARCH r6: resolver FAULT (ok=false) ⇒ match_arch signals abort (2nd return false, not a silent no-match)", (function()
+  local m, mok = R.match_arch({ "batch23-dual-signoff-53967f6-seat.md" }, 23, TIPFULL, function() return nil, false end)
+  return m == nil and mok == false
+end)())
+ok("TB-ARCH r6: a clean resolve still returns ok=true (no false abort)", (function()
+  local m, mok = R.match_arch({ "batch23-dual-signoff-53967f6-seat.md" }, 23, TIPFULL, resolver({ ["53967f6"] = TIPFULL }))
+  return m == "batch23-dual-signoff-53967f6-seat.md" and mok == true
+end)())
 -- r5 teeth: the SHA field is MIN 7 hex, so a 1-char "5" cannot pose as a tip prefix — it does not even parse.
 ok("TB-ARCH r5: a 1-char sha field does NOT parse (min 7 hex)", R.parse_signoff_name("batch23-dual-signoff-5-seat.md") == nil)
 ok("TB-ARCH r5: a 7-char sha field parses (batch+sha)", (function() local p = R.parse_signoff_name("batch23-dual-signoff-53967f6-seat.md"); return p and p.batch == 23 and p.sha == "53967f6" end)())
@@ -120,13 +130,25 @@ do
   else
     print("skip - TB-FC2 EACCES-ancestor (root)")
   end
-  -- r5 teeth (seam ③): errno comes from the FILESYSTEM (traversability), NOT a path-bearing diagnostic. A readable dir whose NAME
+  -- r6 teeth (seam ③a): errno is a NUMBER from the real open() syscall, NOT a path-bearing diagnostic. A readable dir whose NAME
   -- literally contains "No such file or directory" must be 'read' — a substring classifier would have faked it as ENOENT 'absent'.
   local trap = d .. "/No such file or directory"
   assert(os.execute("mkdir -p " .. R.shq(trap)))
   write_file(trap .. "/x.claimed.s.json", "{}")
   local tn, ts = R.list_dir(trap, false)
-  ok("TB-FC2 r5: a readable dir NAMED 'No such file or directory' ⇒ 'read' (errno from fs, not substring)", ts == "read" and #tn == 1)
+  ok("TB-FC2 r6: a readable dir NAMED 'No such file or directory' ⇒ 'read' (errno number, not substring)", ts == "read" and #tn == 1)
+  if NOTROOT then
+    -- r6 teeth (seam ③b): a SYMLINK whose TARGET's ancestor is non-traversable is a real EACCES(13), not ENOENT. `test -e` follows the
+    -- link and reports only false (→ would be 'absent' → delete cards); the open() syscall surfaces the true EACCES ⇒ 'unreadable'.
+    local tparent = d .. "/symtarget_parent"; assert(os.execute("mkdir -p " .. R.shq(tparent .. "/real")))
+    local link = d .. "/thelink"; assert(os.execute("ln -s " .. R.shq(tparent .. "/real") .. " " .. R.shq(link)))
+    os.execute("chmod 000 " .. R.shq(tparent))
+    local _, ssl = R.list_dir(link, false)
+    os.execute("chmod 755 " .. R.shq(tparent)) -- restore for cleanup
+    ok("TB-FC2 r6: a symlink to a dir under an EACCES ancestor ⇒ 'unreadable' (EACCES), NOT 'absent'", ssl == "unreadable")
+  else
+    print("skip - TB-FC2 symlink-EACCES (root)")
+  end
 end
 
 -- ============================ TB-FC2: git_ancestor_state TRI-STATE over REAL git ============================
