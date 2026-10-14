@@ -8,13 +8,26 @@ import path from "node:path";
 import { parseReviewFileName } from "../../packages/bus/src/swarm/review-seat-autoscale.js";
 import type { ReviewInput, GitLogEntry } from "./ledger-core.js";
 
+/** Validate a parsed review-queue record by RUNTIME SHAPE (B3-P2 fix, r3 — JSON.parse + a TS assertion is not
+ *  validation). A record is `{sha:string, sentSec:number}` as markReviewOpen writes it (sha may be "" — a review opened
+ *  without a sha is a legit data state). A non-object (`[]`, a string), a non-string sha (`{"sha":{...}}` ⇒ would render
+ *  "[object Object]"), or a non-finite sentSec ⇒ null (corrupt carrier). Pure. */
+function validReviewMeta(v: unknown): { sha: string; sentSec: number } | null {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return null;
+  const o = v as Record<string, unknown>;
+  if (typeof o.sha !== "string") return null;
+  if (typeof o.sentSec !== "number" || !Number.isFinite(o.sentSec)) return null;
+  return { sha: o.sha, sentSec: o.sentSec };
+}
+
 /**
- * Read the review-queue ledger with STRICT FC-2 three-state (B3-FC2 fix, r2). The reviews table's row existence comes
- * from here, so an UNREADABLE source must NOT degrade to an empty export that clobbers the last good db:
+ * Read the review-queue ledger with STRICT FC-2 three-state (B3-FC2 fix, r2+r3). The reviews table's row existence comes
+ * from here, so an UNREADABLE or CORRUPT source must NOT degrade to an empty/garbage export that clobbers the last good db:
  *  - ENOENT dir ⇒ absent ⇒ [] (legitimately no reviews yet — an empty reviews table is honest).
  *  - any other readdir fault (EACCES/EIO/…) ⇒ THROW ⇒ the shell aborts BEFORE publishing ⇒ the previous good db stays.
- *  - a per-record read fault or malformed JSON ⇒ THROW (never silently default to empty sha / ts=0).
- * A valid record missing an optional field keeps the legacy default ("" / 0) — that is a data state, not a read fault.
+ *  - a per-record read fault, malformed JSON, OR a wrong-shape record ⇒ THROW (never default to empty sha / ts=0, and
+ *    never let a non-string sha reach the db as "[object Object]"). Fail-closed = preserve the good db, same discipline as
+ *    the morning-digest/v1 validator (a corrupt carrier is stated, never silently normalized).
  */
 export function readReviewQueueStrict(dir: string): ReviewInput[] {
   let names: string[];
@@ -25,15 +38,17 @@ export function readReviewQueueStrict(dir: string): ReviewInput[] {
   }
   const out: ReviewInput[] = [];
   for (const name of names.sort()) {
-    const parsed = parseReviewFileName(name);
-    if (!parsed) continue; // not a review file (e.g. a .tmp) — skip, as readReviewLedger does
+    const fn = parseReviewFileName(name);
+    if (!fn) continue; // not a review file (e.g. a .tmp) — skip, as readReviewLedger does
     let raw: string;
     try { raw = readFileSync(path.join(dir, name), "utf8"); }
     catch (e) { throw new Error(`review-queue record unreadable (${name}: ${(e as Error).message}) — refusing to publish`); }
-    let meta: { author?: string; sha?: string; sentSec?: number };
-    try { meta = JSON.parse(raw) as typeof meta; }
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); }
     catch { throw new Error(`review-queue record malformed JSON (${name}) — refusing to publish`); }
-    out.push({ sha: meta.sha ?? "", item: parsed.ticket, seat: parsed.seat, ts: meta.sentSec ?? 0 });
+    const meta = validReviewMeta(parsed);
+    if (!meta) throw new Error(`review-queue record wrong shape (${name}: need {sha:string, sentSec:number}) — refusing to publish`);
+    out.push({ sha: meta.sha, item: fn.ticket, seat: fn.seat, ts: meta.sentSec });
   }
   return out;
 }

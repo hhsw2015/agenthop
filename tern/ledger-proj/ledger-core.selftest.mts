@@ -94,6 +94,22 @@ try {
       let threw = false; try { readReviewQueueStrict(d); } catch { threw = true; }
       t("queue: malformed record JSON ⇒ throws (never silent empty)", threw);
     }
+    // B3-P2 (r3): runtime SHAPE validation — JSON.parse + a TS assertion is not validation.
+    {
+      const throwsOn = (name: string, body: string): boolean => {
+        const d = qdir(); writeFileSync(path.join(d, name), body);
+        try { readReviewQueueStrict(d); return false; } catch { return true; }
+      };
+      t("queue: array record [] ⇒ throws (not empty-sha default)", throwsOn("feat-a.s.json", "[]"));
+      t("queue: string record ⇒ throws (not empty-sha default)", throwsOn("feat-a.s.json", '"not-a-record"'));
+      t("queue: non-string sha {sha:{…}} ⇒ throws (never '[object Object]')", throwsOn("feat-a.s.json", '{"sha":{"bad":true},"sentSec":1}'));
+      t("queue: non-finite sentSec ⇒ throws", throwsOn("feat-a.s.json", '{"sha":"x","sentSec":"nope"}'));
+      t("queue: missing sentSec ⇒ throws", throwsOn("feat-a.s.json", '{"sha":"x"}'));
+      // empty sha is a LEGIT data state (review opened without a sha) — must NOT throw
+      const d = qdir(); writeFileSync(path.join(d, "feat-a.s.json"), '{"sha":"","sentSec":7}');
+      const rows = readReviewQueueStrict(d);
+      t("queue: empty sha is legit (not corrupt)", rows.length === 1 && rows[0]!.sha === "" && rows[0]!.ts === 7);
+    }
     if (!isRoot) {
       // EACCES dir ⇒ throw (not treated as absent/empty)
       const d = qdir(); chmodSync(d, 0o000);
