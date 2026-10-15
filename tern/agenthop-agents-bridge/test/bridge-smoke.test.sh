@@ -78,7 +78,7 @@ KILL2='WARN stencil_tern: plugin handler failed plugin="agenthop-agents-bridge" 
 ( sleep 0.5; printf '%s\n%s\n' "$KILL" "$KILL2" >>"$L" ) &
 run env
 stop_ticker
-check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 4 kills=1 [await x1]  tick after=yes'* ]] && echo true)" "kill + tick alive: 4 FAILs as kills=1, tick after=yes"
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 4 kills=1 [await x1] (since start)  tick after=yes'* ]] && echo true)" "kill + tick alive: 4 FAILs as kills=1, tick after=yes"
 check "$([[ "$OUT" == *'3 passed, 1 failed'* ]] && echo true)" "kill + tick alive: checks 1-3 unaffected"
 check "$([[ "$OUT" == *'sessions: 2 [agenthop, work]'* && "$OUT" == *'window clients: 1'* ]] && echo true)" "diagnostics print tern session and window-client counts"
 
@@ -86,13 +86,13 @@ check "$([[ "$OUT" == *'sessions: 2 [agenthop, work]'* && "$OUT" == *'window cli
 : >"$L"; frozen
 ( sleep 0.3; printf '%s\n%s\n%s\n' "$KILL" "$KILL2" "${KILL/await/drain}" >>"$L" ) &
 run env
-check "$([[ "$OUT" == *'FAIL - 4 kills=2 [await x1, drain x1]  tick after=no'* ]] && echo true)" "kill + tick frozen: kills=2 per hook, tick after=no"
+check "$([[ "$OUT" == *'FAIL - 4 kills=2 [await x1, drain x1] (since start)  tick after=no'* ]] && echo true)" "kill + tick frozen: kills=2 per hook, tick after=no"
 
 # D3. no kill: column form on PASS too.
 : >"$L"; start_ticker
 run env
 stop_ticker
-check "$([[ "$OUT" == *'PASS - 4 kills=0  tick after=n/a'* ]] && echo true)" "no kill: PASS - 4 kills=0  tick after=n/a"
+check "$([[ "$OUT" == *'PASS - 4 kills=0 (since start)  tick after=n/a'* ]] && echo true)" "no kill: PASS - 4 kills=0  tick after=n/a"
 
 # E. an OLD budget line (before start) is not counted.
 echo "$KILL" >"$L"
@@ -134,7 +134,26 @@ run env
 check "$([[ "$OUT" == *'last tick completed: list 28.10ms, slim 30.90ms, encode 36.00ms, write 40.00ms'* ]] && echo true)" "r5 breadcrumb: completed tick shows per-segment ms"
 rm -f "$C/mirror-phase.json"
 run env
-check "$([[ "$OUT" == *'(absent: bridge older than r5)'* ]] && echo true)" "r5 breadcrumb absent: reported, not an error"
+check "$([[ "$OUT" == *'(absent: bridge older than r5, or r6+ with the phase debug switch off'* ]] && echo true)" "r5 breadcrumb absent: reported, not an error"
+
+# K. SINCE: a kill BEFORE this run but inside the soak window is counted; one before SINCE is not.
+: >"$L"
+echo "2026-10-15T09:00:00.000+08:00 1 WARN x: plugin hook exceeded its budget; disabled until reload plugin=\"agenthop-agents-bridge\" hook=\"timer\"" >>"$L"
+echo "2026-10-15T11:30:00.000+08:00 1 WARN x: plugin hook exceeded its budget; disabled until reload plugin=\"agenthop-agents-bridge\" hook=\"command mirror\"" >>"$L"
+start_ticker
+run env SINCE=2026-10-15T11:00:00
+stop_ticker
+check "$([[ "$OUT" == *'FAIL - 4 kills=1 [command x1] (since 2026-10-15T11:00:00)'* ]] && echo true)" "SINCE: kill inside the window counted, kill before it not"
+
+# L. --soak: both runs pass and no kill in the gap => PASS; a kill written DURING the gap => run 2 FAILs => soak FAIL.
+: >"$L"; start_ticker
+OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 SOAK_GAP=2 bash "$SMOKE" --soak 2>&1)"; RC=$?
+check "$([ $RC -eq 0 ] && [[ "$OUT" == *'soak: PASS'* && "$(grep -c 'bridge-smoke: PASS' <<<"$OUT")" -eq 2 ]] && echo true)" "--soak: two clean runs => soak PASS"
+: >"$L"
+( sleep 6; echo "$(date '+%Y-%m-%dT%H:%M:%S').000+08:00 1 WARN x: plugin hook exceeded its budget; disabled until reload plugin=\"agenthop-agents-bridge\" hook=\"timer\"" >>"$L" ) &
+OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 SOAK_GAP=4 bash "$SMOKE" --soak 2>&1)"; RC=$?
+stop_ticker
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'soak: FAIL'* && "$OUT" == *'kills=1 [timer x1] (since'* ]] && echo true)" "--soak: a kill in the gap between runs => soak FAIL"
 
 echo ""
 echo "bridge-smoke gate: $t passed, $f failed"

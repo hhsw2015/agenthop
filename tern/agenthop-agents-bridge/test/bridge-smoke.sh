@@ -15,10 +15,31 @@
 # The only early exit is a missing prerequisite (no timeout/jq, or the plugin not loaded): exit 2.
 # Every tern call is wrapped in `timeout`.
 #
+# Soak (the r6 acceptance gate: kills=0 for >= 5 minutes):
+#   bridge-smoke.sh --soak            runs checks 1-4 at t=0, then again 2.5 min later, then counts kills over the
+#                                     WHOLE window (not just the two runs). Exit 0 only if both runs pass AND no kill
+#                                     in between. SOAK_GAP (seconds, default 150) sets the gap.
+#   SINCE=<ISO time> bridge-smoke.sh  check 4 counts kills since that time instead of since this run's start
+#                                     (tern.log lines start with an ISO timestamp; compared as strings).
+#
 # Interface (confirmed by the coordinator on r2 @5f6294b; override if it changes):
 #   BRIDGE_DRAIN_ACTION  action run via `tern ctl plugins run`   default plugin.agenthop-agents-bridge.drain
 #   BRIDGE_EVAL_FIELD    result field holding the eval value     default value
 set -uo pipefail
+
+if [ "${1:-}" = "--soak" ]; then
+  self="${BASH_SOURCE[0]}"; gap="${SOAK_GAP:-150}"
+  since="$(date '+%Y-%m-%dT%H:%M:%S')"
+  echo "=== soak run 1 of 2 ($since) ==="
+  bash "$self"; r1=$?
+  echo ""; echo "=== waiting ${gap}s ==="; sleep "$gap"
+  echo "=== soak run 2 of 2 ($(date '+%H:%M:%S')), check 4 counts kills since $since ==="
+  SINCE="$since" bash "$self"; r2=$?
+  echo ""
+  echo "soak: run 1 exit $r1, run 2 exit $r2, window $since -> $(date '+%H:%M:%S') (${gap}s gap)"
+  [ "$r1" -eq 0 ] && [ "$r2" -eq 0 ] && { echo "soak: PASS"; exit 0; }
+  echo "soak: FAIL"; exit 1
+fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PUBLISH="$HERE/../publish.sh"
@@ -115,19 +136,26 @@ fi
 #    `... exceeded its budget; disabled until reload plugin="<id>" hook="<hook>"` (the id AFTER `exceeded`), plus a second
 #    `handler failed ... exceeded 50 ms` line for the same kill — only the first form is counted, so one kill = 1.
 if [ -f "$LOG" ]; then
-  now_lines="$(wc -l <"$LOG" | tr -d ' ')"
-  from=$((LOG_START_LINES + 1))
-  [ "$now_lines" -lt "$LOG_START_LINES" ] && from=1
-  kills="$(tail -n +"$from" "$LOG" | grep -F "exceeded its budget" | grep -F "plugin=\"$PLUGIN_ID\"" || true)"
+  if [ -n "${SINCE:-}" ]; then
+    window_lines="$(awk -v t="$SINCE" 'substr($0, 1, 19) >= t' "$LOG")"   # a soak window spans several runs
+    window_desc="since $SINCE"
+  else
+    now_lines="$(wc -l <"$LOG" | tr -d ' ')"
+    from=$((LOG_START_LINES + 1))
+    [ "$now_lines" -lt "$LOG_START_LINES" ] && from=1
+    window_lines="$(tail -n +"$from" "$LOG")"
+    window_desc="since start"
+  fi
+  kills="$(printf '%s\n' "$window_lines" | grep -F "exceeded its budget" | grep -F "plugin=\"$PLUGIN_ID\"" || true)"
   nkills=0; [ -n "$kills" ] && nkills="$(printf '%s\n' "$kills" | grep -c .)"
   hooks="$(printf '%s\n' "$kills" | sed -n 's/.*hook="\([^"]*\)".*/\1/p' | sort | uniq -c | awk '{printf "%s%s x%s", (NR>1?", ":""), $2, $1}')"
   if [ "$nkills" -eq 0 ]; then
-    pass "4 kills=0  tick after=n/a"
+    pass "4 kills=0 ($window_desc)  tick after=n/a"
   else
     # tick after the last kill: sample once, wait TICK_WAIT, sample again
     a="$(tick)"; sleep "$TICK_WAIT"; b="$(tick)"
     if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] && [ "$b" -gt "$a" ]; then after="yes ($a -> $b)"; else after="no ($a -> $b)"; fi
-    fail "4 kills=$nkills [$hooks]  tick after=$after"
+    fail "4 kills=$nkills [$hooks] ($window_desc)  tick after=$after"
   fi
 else
   fail "4 tern log not found at $LOG"
@@ -146,16 +174,16 @@ for f in "${FAILED[@]}"; do echo "  FAIL - $f"; done
   echo "tern sessions / window clients (each window runs its own window-half VM, all writing agents.json):"
   timeout "$TERN_TIMEOUT" "$TERN" ls --json 2>/dev/null | jq -r '"  sessions: \(.sessions | length) [\([.sessions[].name] | join(", "))]"' 2>/dev/null || echo "  sessions: (tern ls failed)"
   timeout "$TERN_TIMEOUT" "$TERN" inspect --json 2>/dev/null | jq -r '"  window clients: \([.clients[] | select(.kind == "window")] | length)"' 2>/dev/null || echo "  window clients: (tern inspect failed)"
-  # r5+: the mirror writes mirror-phase.json BEFORE each segment. phase != done with the same vm/tick as a stalled
+  # r5 (always) / r6+ (only with the debug switch on): the mirror writes mirror-phase.json BEFORE each segment. phase != done with the same vm/tick as a stalled
   # agents.json names the segment that was running when the hook was killed.
-  echo "mirror-phase.json (r5+ breadcrumb):"
+  echo "mirror-phase.json (phase breadcrumb):"
   if [ -f "$CTRL/mirror-phase.json" ]; then
     echo "  $(cat "$CTRL/mirror-phase.json") (written $(date -r "$CTRL/mirror-phase.json" '+%H:%M:%S'))"
     jq -r 'if .phase == "done" then "  last tick completed: list \(.list_ms)ms, slim \(.slim_ms)ms, encode \(.encode_ms)ms, write \(.write_ms)ms (cumulative)"
            else "  STOPPED IN SEGMENT: \(.phase) (vm \(.vm), tick \(.tick), \(.at_ms)ms into the tick)" end' \
       "$CTRL/mirror-phase.json" 2>/dev/null || echo "  (unparseable)"
   else
-    echo "  (absent: bridge older than r5)"
+    echo "  (absent: bridge older than r5, or r6+ with the phase debug switch off — AGENTHOP_BRIDGE_DEBUG_PHASE=1 or kv bridge.debug_phase=true)"
   fi
   echo "unconsumed requests:"
   ls -1 "$CTRL/requests/" 2>/dev/null | grep '\.json$' || echo "  (none)"
