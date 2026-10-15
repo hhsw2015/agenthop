@@ -19,7 +19,7 @@ tern plugin reload
 
 Directory: `~/.agenthop/tern-panes/`
 
-- `agents.json` — status mirror (bridge writes every ~750ms; advisory snapshot, overwrite semantics)
+- `agents.json` — status mirror (advisory snapshot, overwrite). r4: driven by the `mirror` command (swarm sweep runs `tern ctl plugins run plugin.agenthop-agents-bridge.mirror` every ~5s) plus a best-effort ~750ms `tern.timer` chain; carries `vm`/`window` (which VM wrote it) and `tick_ms`/`tick_ms_max` (tick cost). After every load/reload also run `plugin.agenthop-agents-bridge.arm` to arm the A2 sentinel.
 - `requests/<id>.json` — bash writes a one-line-JSON request `{op, ...}`
 - `results/<id>.json` — bridge writes a one-line-JSON reply `{ok, class, ...}`
 

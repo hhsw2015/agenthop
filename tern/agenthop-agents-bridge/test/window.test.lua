@@ -40,6 +40,7 @@ local commands = {}      -- id -> run fn
 local files, dirs, requests = {}, {}, {}
 local opCalls = { list = 0, start = 0, stop = 0 }
 local carlyCalls = 0 -- every tern.carly.* call (tasks/cancel/schedule)
+clock = 1000      -- global so the tern.now mock can advance it
 local timers = {}     -- tern.timer callbacks (the TIMER hook)
 
 local cx = {
@@ -53,8 +54,8 @@ local cx = {
 }
 
 _G.tern = {
-  getenv = function(k) if k == "HOME" then return "/h" end end,
-  now = function() return 1000 end,
+  getenv = function(k) if k == "HOME" then return "/h" elseif k == "TERN_WINDOW_KEY" then return "win-A" end end,
+  now = function() clock = clock + 7; return clock end, -- monotonic ms; each call advances 7ms so tick_ms is measurable
   json = { encode = encode, decode = decode, array = function(t) return t end },
   fs = {
     exists = function(p) return dirs[p] == true end,
@@ -87,32 +88,35 @@ assert(loadfile(here .. "../window.luau"))()
 local AGENTS = "/h/.agenthop/tern-panes/agents.json"
 local RES = "/h/.agenthop/tern-panes/results/"
 local function tickOf() local s = files[AGENTS]; return s and tonumber(s:match('"tick":(%d+)')) or nil end
-local function pumpMirror() local fn = table.remove(sleepPending, 1); fn(nil, nil, cx) end
+local function pumpMirror() local fn = table.remove(timers, 1); fn(cx) end -- r4: the mirror chain lives on the TIMER hook
 
--- ---- 1. registration: one await chain (mirror) + three commands, each its own hook ----
-ck("hooks: exactly ONE sleep continuation queued at load (mirror only on the await hook)", #sleepPending == 1)
+-- ---- 1. registration (r4): NOTHING on the await hook; the mirror chain is on the TIMER hook; four commands, each its own hook ----
+ck("r4: ZERO sleep continuations at load (the await hook is unused)", #sleepPending == 0)
 ck("hooks: commands drain / drain-start / mirror / arm registered (each its own `command <id>` hook)",
   type(commands["drain"]) == "function" and type(commands["drain-start"]) == "function" and type(commands["mirror"]) == "function"
   and type(commands["arm"]) == "function")
-ck("hooks: exactly ONE one-shot timer queued at load (A2 arm on the TIMER hook)", #timers == 1)
+ck("r4: exactly ONE timer queued at load (the mirror chain, on the TIMER hook)", #timers == 1)
 
--- r3 tooth: the await hook (mirror tick) must NEVER call tern.carly.* — three cross-VM calls there crossed 50ms live (11:05:40)
+-- r3/r4 tooth: the timer (mirror) hook must NEVER call tern.carly.* — the arm runs ONLY on its own command hook
 pumpMirror()
-ck("r3: first mirror tick makes NO tern.carly.* call (arm is off the await hook)", carlyCalls == 0 and tickOf() == 1)
-timers[1](cx)
-ck("r3: the timer-hook arm calls tern.carly (tasks + schedule) and records sentinel.json", carlyCalls >= 2 and files["/h/.agenthop/tern-panes/sentinel.json"] ~= nil)
-local afterArm = carlyCalls
+ck("r4: first mirror timer tick makes NO tern.carly.* call and ticks (tick 1)", carlyCalls == 0 and tickOf() == 1)
+ck("r4: the timer chain renews itself (successor timer queued)", #timers == 1)
 pumpMirror()
-ck("r3: later mirror ticks still make NO tern.carly.* call", carlyCalls == afterArm)
+ck("r4: later mirror timer ticks still make NO tern.carly.* call", carlyCalls == 0)
 commands["arm"](cx)
-ck("r3: the `arm` command re-arms (swarm-triggered after reload)", carlyCalls > afterArm)
+ck("r3: the `arm` command arms (tern.carly called, sentinel.json recorded)", carlyCalls >= 2 and files["/h/.agenthop/tern-panes/sentinel.json"] ~= nil)
 
--- ---- 2. the await hook never runs drain work: pumping the mirror chain with pending requests claims nothing ----
+-- r4 ②③: VM identity + per-tick cost published in agents.json
+local js0 = files[AGENTS] or ""
+ck("r4 ②: agents.json carries window (TERN_WINDOW_KEY) and a vm id", js0:find('"window":"win-A"', 1, true) ~= nil and js0:match('"vm":"[%x%-]+"') ~= nil)
+ck("r4 ③: agents.json carries tick_ms (previous tick's cost) and tick_ms_max", tonumber(js0:match('"tick_ms":([%d%.]+)')) ~= nil and tonumber(js0:match('"tick_ms_max":([%d%.]+)')) ~= nil)
+
+-- ---- 2. the mirror chain never runs drain work: pumping it with pending requests claims nothing ----
 requests["s1.json"] = '{"op":"start","prompt":"p"}'
 requests["l1.json"] = '{"op":"stop"}'
 pumpMirror(); pumpMirror()
-ck("await hook: two mirror ticks advance tick (3→4)", tickOf() == 4)
-ck("await hook: mirror ticks claim NO requests and run NO start (drain is off the await hook)",
+ck("mirror chain: two timer ticks advance tick (3→4)", tickOf() == 4)
+ck("mirror chain: timer ticks claim NO requests and run NO start (drain only on its commands)",
   requests["s1.json"] ~= nil and requests["l1.json"] ~= nil and opCalls.start == 0 and opCalls.stop == 0)
 
 -- ---- 3. op-class routing: `drain` takes fast ops only; `drain-start` takes start only ----

@@ -20,12 +20,13 @@ $HOME/.agenthop/tern-panes/
 桥每 `POLL_MS`(默认 750ms)写一次:
 
 ```json
-{"ts":<number>,"tick":<number>,"agents":[<AgentBlock>...],"error":<string?>}
+{"ts":<number>,"tick":<number>,"vm":"<per-load id>","window":"<TERN_WINDOW_KEY?>","tick_ms":<number?>,"tick_ms_max":<number>,"agents":[<AgentBlock>...],"error":<string?>}
 ```
 
 - `agents` = `cx.agents:list()` 的**瘦身投影**(r2):每项仅 `pane session model state busy at_prompt alive cwd tab title`。`command`/`agent_command` 等长串已去掉(二者使负载翻倍、把 tick 推近 50ms hook 预算);需要原始字段走 `list` op。
-- 手动刷新:`tern ctl plugins run plugin.agenthop-agents-bridge.mirror`(独立 hook,不依赖 sleep 链)。
-- `tick` 单调自增 = 存活信号(不前进 = 该窗口 VM 的循环停了)。
+- 手动/主驱动刷新:`tern ctl plugins run plugin.agenthop-agents-bridge.mirror`(独立 hook)。
+- `tick` 单调自增 = 存活信号(不前进 = 该 VM 的 mirror 停了)。r4:`vm` 每次加载/reload 变的随机 id、`window`=`TERN_WINDOW_KEY`——多窗口覆盖写同一文件时可分辨是哪个 VM 在走(一死一活不再看起来「还在走」);`tick_ms`=上一 tick 耗时(ms,本 tick 的写入无法含自身)、`tick_ms_max`=本 VM 迄今最大值——>50ms 尾部在文件里可观测,不必事后翻 tern.log。
+- r4 驱动:**主=`mirror` 命令**(独立 hook,蜂群 sweep 每 ~5s `tern ctl plugins run plugin.agenthop-agents-bridge.mirror`);**辅=`tern.timer` 自续链**(timer hook,非 await;先续后干;若 timer hook 被禁则链停,活性由命令驱动独撑)。await hook 不再使用。
 - **语义 = advisory 快照,覆盖写(at-least-once 读面)**。被 torn-read 到的半截文件,下一轮(≤POLL_MS)自愈。**它不是耐久义务**,蜂群的 durable 账本才是真理源。
 - 多 window 各跑一份 window-half ⇒ 多个 mirror 覆盖同一文件;对状态镜幂等无害(同一全局视图)。
 
@@ -124,7 +125,7 @@ TERN_PANE_SOCKET=… tern ctl plugins run plugin.agenthop-agents-bridge.drain-st
 
 **已落地(tick 冻结根修,r2 订正根因)**:现网实证——`agents.json` tick 冻结、`plugin reload` 前不恢复。**Tern 的禁用单位是 hook**:所有 `tern.sleep():next` 续体同属 hook `await`,任一续体超 ~50ms(`await exceeded 50 ms`)即禁用本 VM **全部** await 续体,已排队的继任也不再投递(Tern docs concepts/runtime.md:one slow timer callback disables all of the plugin's timer callbacks in that VM)。耗时来源不只 start:仅 `list`+编码 41KB+写盘的 mirror 偶发 >50ms 也会触发。故 r1「拆两条 sleep 链+先排队 ⇒ 自愈」**不成立**(两条链同一 hook,协调者 40 分钟现网三次复现)。
 
-r2 修法 = **命令面隔离 + 蜂群侧 reload 恢复**(不是 VM 内自愈):① drain 改为 `tern.command`,由蜂群写完请求后 `tern ctl plugins run` 触发,每个命令是独立 hook `command <id>`;② 按 op 类拆 `drain`(快 op)与 `drain-start`(仅 start),start 撑爆预算只禁 `drain-start`,不连坐快 op 与 mirror;③ mirror 瘦身(§1)远离预算,仍走 sleep 链,另可命令手动触发。④(r3)A2 挂哨移出 mirror tick:`registerSentinel` 的三次跨 VM `tern.carly.*`(tasks/cancel/schedule)在首个 await tick 里实测超 50ms(11:05:40),现改在独立 hook 上——加载时一次 `tern.timer(0,…)`(timer hook)+ `plugin.agenthop-agents-bridge.arm` 命令(蜂群 reload 后可触发)。await hook 只剩廉价 mirror。**恢复剧本(蜂群侧)**:tick 停 >5s,或触发 drain 后 2s 无 result ⇒ `tern plugin reload`(协调者实测 tick 从 1 重计,<2s 恢复);被禁那一刻在途的 op 落 §3 恢复(start = 非幂等 HOLD)。
+r2 修法 = **命令面隔离 + 蜂群侧 reload 恢复**(不是 VM 内自愈):① drain 改为 `tern.command`,由蜂群写完请求后 `tern ctl plugins run` 触发,每个命令是独立 hook `command <id>`;② 按 op 类拆 `drain`(快 op)与 `drain-start`(仅 start),start 撑爆预算只禁 `drain-start`,不连坐快 op 与 mirror;③ mirror 瘦身(§1)远离预算,仍走 sleep 链,另可命令手动触发。④(r3→r4)A2 挂哨只在 `arm` 命令(独立 hook,蜂群每次加载/reload 后触发):其三次跨 VM `tern.carly.*` 在首个 await tick 实测超 50ms(11:05:40),r3 曾放 `tern.timer(0)`,r4 timer hook 承载 mirror 链,故挂哨不再上 timer。⑤(r4)slim mirror 自身仍偶发 >50ms(11:12:17 第二次 await kill,tick 冻 33):mirror 移出 await hook——主驱动改 `mirror` 命令(蜂群 sweep 每 ~5s 触发),辅以 `tern.timer` 自续链;agents.json 加 `vm`/`window`/`tick_ms`/`tick_ms_max`(§1)。**恢复剧本(蜂群侧)**:tick 停 >5s,或触发 drain 后 2s 无 result ⇒ `tern plugin reload`(协调者实测 tick 从 1 重计,<2s 恢复);被禁那一刻在途的 op 落 §3 恢复(start = 非幂等 HOLD)。
 
 门 `test/window.test.lua`:**结构证据,不是宿主行为复现**——夹具按 hook 记录回调归属、以「不再调用」模型化禁用,验证 start 只在自己的 hook、mirror 与快 op 在别的 hook;不模拟也不声称模拟 Tern 的预算终止。live 门 = `bridge-smoke.sh`(#1032-D)。start 异步化仍是更深的后续。
 

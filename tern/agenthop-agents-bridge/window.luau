@@ -37,17 +37,30 @@ local function slim(agents)
   end
   return out
 end
+-- r4 ②: identity of THIS VM, so two windows' VMs overwriting one agents.json are distinguishable (one dead, one alive must not look
+-- like "still ticking"). `window` = TERN_WINDOW_KEY when the daemon exposes it; `vm` = a per-load random id (changes on every reload).
+local VM_ID = string.format("%x-%x", math.floor(tern.now() * 1000) % 0x7fffffff, math.random(0, 0x7fffffff))
+local WINDOW_KEY = tern.getenv("TERN_WINDOW_KEY")
 local ticks = 0
+local lastMs = nil -- r4 ③: wall cost (ms) of the PREVIOUS mirror tick, published so a >50ms tail is observable in agents.json itself
+local maxMs = 0
 local function mirror(cx)
+  local t0 = tern.now()
   ticks = ticks + 1
   local ok, agents = pcall(function() return cx.agents:list() end)
   local payload = {
     ts = tern.now(),
-    tick = ticks, -- liveness: must advance every POLL_MS
+    tick = ticks, -- liveness: advances on every mirror call (command-triggered, plus the best-effort timer chain)
+    vm = VM_ID,
+    window = WINDOW_KEY,
+    tick_ms = lastMs, -- cost of the previous tick (this tick's own write cannot include itself)
+    tick_ms_max = maxMs,
     agents = ok and slim(agents) or tern.json.array({}),
     error = (not ok) and tostring(agents) or nil,
   }
   pcall(function() tern.fs.write(CTL .. "/agents.json", tern.json.encode(payload)) end)
+  lastMs = tern.now() - t0
+  if lastMs > maxMs then maxMs = lastMs end
 end
 
 local function answer(id, result)
@@ -146,10 +159,10 @@ end
 -- If a hook IS disabled, recovery is the swarm's: detect (tick stalled >5s, or no result 2s after a drain trigger) ⇒ `tern plugin
 -- reload` (tick restarts from 1, <2s). This is isolation + external reload, NOT in-VM self-healing.
 -- r3: the A2 sentinel arm is OFF the mirror tick. registerSentinel makes three cross-VM tern.carly calls (tasks + cancel + schedule);
--- inside the first await tick that alone crossed the 50ms budget and disabled the whole await hook (live 11:05:40). It now runs on
--- hooks of its own: a one-shot `tern.timer(0, …)` at load (the timer hook, not await) plus an `arm` command the swarm can trigger
--- after a reload (`tern ctl plugins run plugin.agenthop-agents-bridge.arm`). If the timer hook is disabled, only arming is lost; the
--- mirror and the drains keep running. Dedup-by-title keeps a repeat arm idempotent.
+-- inside the first await tick that alone crossed the 50ms budget and disabled the whole await hook (live 11:05:40). It now runs ONLY
+-- on its own `arm` command hook (`tern ctl plugins run plugin.agenthop-agents-bridge.arm`, triggered by the swarm after each
+-- load/reload). If that hook is disabled, only arming is lost; the mirror and the drains keep running. Dedup-by-title keeps a repeat
+-- arm idempotent.
 local sentinelArmed = false
 local function arm(cx)
   if cx == nil or sentinelArmed then return end
@@ -164,8 +177,12 @@ local function mirrorTick(cx)
   mirror(cx) -- no tern.carly.* here: the await hook carries ONLY the cheap mirror
 end
 
-local function mirrorStep(cx)
-  tern.sleep(POLL_MS):next(function(_, _, nextCx) mirrorStep(nextCx) end)
+-- r4 ①: the mirror is OFF the await hook. Primary driver = the `mirror` COMMAND (its own hook `command mirror`) triggered by the swarm
+-- sweep every ~5s (`tern ctl plugins run plugin.agenthop-agents-bridge.mirror`); a slow call there disables only that command until
+-- reload, never drains or arm. Secondary = a best-effort self-renewing `tern.timer` chain on the TIMER hook (not await); if Tern ever
+-- disables the timer hook the chain stops and the command-driven mirror carries liveness alone. Each timer tick renews BEFORE working.
+local function mirrorTimer(cx)
+  tern.timer(POLL_MS, function(nextCx) mirrorTimer(nextCx) end)
   if cx ~= nil then mirrorTick(cx) end
 end
 
@@ -174,5 +191,6 @@ tern.command({ id = "mirror", title = "agenthop bridge: mirror now", run = funct
 tern.command({ id = "drain", title = "agenthop bridge: drain requests", run = function(cx) ensure(); pcall(function() drain(cx, false) end) end })
 tern.command({ id = "drain-start", title = "agenthop bridge: drain start requests", run = function(cx) ensure(); pcall(function() drain(cx, true) end) end })
 
-mirrorStep(nil) -- A1 status mirror (liveness); the first sleep's :next delivers the window cx
-tern.timer(0, function(cx) arm(cx) end) -- A2 one-shot arm on the TIMER hook (never the await hook)
+mirrorTimer(nil) -- A1 best-effort mirror chain on the TIMER hook (the swarm-triggered `mirror` command is the primary driver)
+-- r4: NO arm on the timer hook — that hook now carries the mirror chain, and the arm's three cross-VM tern.carly calls must not be
+-- able to disable it. Arming runs only on the `arm` command (its own hook), which the swarm triggers after every load/reload.
