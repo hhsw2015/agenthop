@@ -1,6 +1,6 @@
 # Runbook:codex 席位改住共享 daemon 的试点(方案 Z)
 
-> **状态:草案,未执行,等 user 裁。** 研究与实测依据见 `docs/research/codex-acp-wake-channel.md` §2a(2026-10-16 一次性块实测:空闲 codex 被总线投递唤醒,零 Tern 直注)。
+> **状态:2026-10-16 00:50 由协调者首次执行(Second Voice),结果见 `docs/research/codex-acp-wake-channel.md` §2b。** 研究与实测依据见 `docs/research/codex-acp-wake-channel.md` §2a(2026-10-16 一次性块实测:空闲 codex 被总线投递唤醒,零 Tern 直注)。
 > 候选席位:**Second Voice**(sid `01a13e9a-ea58-7a30-a8db-35cd3ad3f879`,cwd `~/Dev/happycapy`)。理由:它今天已经 bus 可达,迁移失败的代价最小;要验的新东西是 `--resume` 一条已有长会话到共享 daemon 的行为。
 > 执行人:协调者或其指派的席位。审查席本人不执行自己的迁移。
 
@@ -36,7 +36,7 @@
      env "PATH=$P" INITIAL_AGENT_MODE=agent-full-access tern acp codex --resume 01a13e9a-ea58-7a30-a8db-35cd3ad3f879
    ```
    记下返回的 block id;`tern rename <block> "Second Voice"`。
-3. 开场一句直注(此时它还没读箱):`tern send <block> text '<交接一句:你已迁到共享 daemon,先读箱>' && tern send <block> keys Enter`。
+3. 开场一句走 bus,不走 Tern 直注:`agenthop_send codex:happycapy-01a13e9a "<交接一句>"`。实测(2026-10-16 首次试点)直注进 Tern 块的中文开场被模型侧内容过滤连拦 5 次,同一段话走 bus 正常送达。
 
 ## 3. 核验(逐条,任何一条不过 ⇒ 第 4 节回滚)
 
@@ -48,7 +48,7 @@
 | 4 | 只有一个写者:`lsof <上面那个 rollout>` | 只有共享 daemon 的 pid(36869 一类),没有别的 `codex app-server` |
 | 5 | bus 身份:`agenthop_peers` | 出现 `codex:happycapy-01a13e9a`,其进程的父进程是共享 daemon |
 | 6 | bus 唤醒:在它空闲时 `agenthop_send codex:happycapy-01a13e9a "<一句:回 woke>"` | 一分钟内在块里出现该消息并回复;它的耐久箱随后为空 |
-| 7 | 本次 SessionStart hook 确实触发:读 `~/.agenthop/presence/01a13e9a-ea58-7a30-a8db-35cd3ad3f879.pid` 和 `.origin`,与前置第 5 步的旧值比 | 三条都满足才算过:pid 与旧值不同;该 pid 在**新块**的进程树里(`tern process <新块> --json` 的 child 之下);`.origin` 的 `ts=` 和 mtime 都晚于换壳时刻。任何一条不满足 ⇒ 记「待验」,不算过,也不据此推断 hooks 失效 |
+| 7 | 本次 SessionStart hook 确实执行了 | **证据只能是 hook 自身的执行痕迹**:hook 写的、带本 sid 和本次时刻的记录(如 presence-entry 的日志行,或 hook 专门写的标记文件)。presence 的 pid/ts/进程树变化**不算证据**——普通 `seat-presence set` 写者也能写出同样的值——只作附加的存活检查。没有执行痕迹 ⇒ 记「待验」,不算过 |
 
 ## 4. 回滚(任何时候都可以做;每步是一道门,过不了就停在那里)
 

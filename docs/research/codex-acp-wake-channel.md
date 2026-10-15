@@ -40,6 +40,24 @@
 
 **结论**:Z 在机制上成立,且实测打通「总线投递 → 空闲 codex 席位被唤醒」,不经 Tern。上线前还差三件:① hooks 的配置放到 daemon 侧;② 在隔离环境验证 daemon 重启后的 resume;③ 关块后线程会留在 daemon 的 loaded 里;是否、何时自动卸载未知,回滚必须显式退订并确认释放(见 runbook)。代价:所有 codex 席位共享一个 app-server 进程,它一崩全体受影响(今天的私有 app-server 是每席一个)。
 
+## 2b. 首次试点(2026-10-16 00:50,协调者执行,Second Voice)
+
+日志:`~/.agenthop/swarm/z-pilot-sv-1792083012.log`。按 runbook §3 逐条:
+
+| # | 结果 |
+|---|---|
+| 1 包装生效 | 过:wrapper argv 只有 `app-server`,无参数被丢 |
+| 2 线程进共享 daemon | 过:01a13e9a 出现在 36869 的 loaded 列表 |
+| 3 接上旧上下文 | 候 Second Voice 回答时尚未出结论 |
+| 4 单写者 | 过:rollout 唯一持有者 36869 |
+| 5 bus 身份 | 过:bus 节点 41323,父进程 36869 |
+| 6 bus 唤醒 | 过:bus 投递唤醒线程并得到回话 |
+| 7 SessionStart hook | **无执行痕迹**:presence 记录未变(仍是 pid 36072 / ts=1792051812000,该 pid 已不存活),hook 日志里也没有本 sid 本次的条目。即在共享 daemon 下,这次 `--resume` 没有触发会写 presence 的 SessionStart hook |
+
+另外:直注到 Tern 块的中文开场被模型侧内容过滤连拦 5 次,同一内容走 bus 正常,所以 runbook 的开场一句已改为走 bus。
+
+第 7 条的后果:presence 指向一个已死的 pid,依赖 presence 判活的读者会把 Second Voice 判成不在线,尽管 bus 投递正常。迁移审查席之前要解决:要么查明共享 daemon 下 hook 为何不触发,要么由迁移步骤显式写 presence(走 `scripts/seat-presence.ts set`)。
+
 ## 3. 建议(供裁)
 
 1. 方案 Z(§2a)是候选 4 的具体做法,已实测打通唤醒。建议:先在一个非审查席位试点(带 hooks 配置迁到 daemon 侧),验证 daemon 重启 resume 与关块退订,再决定是否把审查席位迁过去。**A 与 Z 的兼容是待验前提,不是已知结论**:Z 之后 mcp 的父进程是共享 daemon 本身(`codex app-server --listen unix://`,探针里 bus 节点 950 的父进程就是 36869),它也是一个 `codex app-server`。A 必须能区分「共享 daemon(带 --listen)」与「私有 stdio app-server」,否则会把 Z 下的主线程 mcp 判成托管子线程。这条归 A 的审查(CID-HOST-SCOPE),试点前要先确认已修。
