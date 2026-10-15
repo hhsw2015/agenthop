@@ -216,7 +216,7 @@ check "$([ $RC -eq 1 ] && [[ "$OUT" == *'vm changed AGAIN'* ]] && echo true)" "v
 : >"$L"; ( i=1; while :; do echo "{\"tick\":$i,\"vm\":\"z\",\"timer\":\"stopped-late\",\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 1.5; done ) & TICKER=$!
 OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=4 bash "$SMOKE" 2>&1)"; RC=$?
 stop_ticker
-check "$([[ "$OUT" == *'PASS - 1 tick'*'timer=stopped-late (throttled, by design)'* && "$OUT" != *'LOW:'* ]] && echo true)" "timer=stopped-late + sweep-only tick => PASS, reported as by design"
+check "$([[ "$OUT" == *'PASS - 1 tick'*'timer=stopped-late (accelerator stopped, by design)'* && "$OUT" != *'LOW:'* ]] && echo true)" "timer=stopped-late + sweep-only tick => PASS, reported as by design"
 
 # BSM-SV-P2-3: rotation and unreadable logs
 # rotation_regrown: the log is replaced during the run by a LONGER file whose first line is a kill => counted
@@ -263,6 +263,68 @@ run env SWARM_DISPATCHER_RECIPE="$TMP/recipe-off.json"; o_off="$OUT"
 run env SWARM_DISPATCHER_RECIPE="$TMP/recipe-on.json"; o_on="$OUT"
 run env SWARM_DISPATCHER_RECIPE="$TMP/no-such-recipe.json"; o_none="$OUT"
 check "$([[ "$o_off" == *'sweep flag SWARM_TERN_BRIDGE: off (unset): no outside mirror sweep'* && "$o_on" == *'sweep flag SWARM_TERN_BRIDGE: on (1)'* && "$o_none" == *'sweep flag SWARM_TERN_BRIDGE: unknown'* ]] && echo true)" "check 1 FAIL names the sweep flag: off / on / unknown"
+
+# r9 bridge: timer=overdue with a sweep-paced tick => PASS as by design (not "timer chain alive", not LOW)
+: >"$L"; ( i=1; while :; do echo "{\"tick\":$i,\"vm\":\"o\",\"timer\":\"overdue\",\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 1.5; done ) & TICKER=$!
+OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=4 bash "$SMOKE" 2>&1)"
+stop_ticker
+check "$([[ "$OUT" == *'PASS - 1 tick'*'timer=overdue (accelerator stopped, by design)'* && "$OUT" != *'timer chain alive'* ]] && echo true)" "timer=overdue + sweep-paced tick => PASS, labelled accelerator stopped"
+# timer=overdue and frozen => still FAIL, line names the timer state
+: >"$L"; echo '{"tick":9,"vm":"o","timer":"overdue","agents":[]}' >"$C/agents.json"
+run env
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'did not advance'*'timer=overdue; sweep flag'* ]] && echo true)" "timer=overdue + frozen => FAIL naming timer state and sweep flag"
+
+# ---- r9: six findings (main review a05d379 + second voice 024ba34), one full-chain counterexample each ------------
+now_iso(){ python3 -c 'import datetime; print(datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"))'; }
+
+# 1 (BSM-TRUNCATE-REGROW / BSM-SV-P2-3): same inode, truncated then regrown LONGER than before; new first line = kill
+python3 -c 'print("old line " * 50)' >"$L"   # ~450 bytes
+start_ticker
+( sleep 0.4; { printf '%s 1 WARN x: plugin hook exceeded its budget; disabled until reload plugin="agenthop-agents-bridge" hook="timer"\n' "$(now_iso)"; python3 -c 'print("new line " * 150)'; } 1<>"$L" ) &
+run env
+stop_ticker
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'mirror kills=1 [timer x1]'* ]] && echo true)" "r9-1 same inode truncated + regrown past old size: first-line kill counted"
+# 1b helper-level race: the file is renamed in between stat and open in the OLD helper; the new helper reads by fd only
+python3 -c 'print("old " * 150)' >"$L"; M="$(python3 "$HERE/smoke-logwindow.py" mark "$L")"
+{ printf '2026-10-15T11:00:01+08:00 WARN plugin hook exceeded its budget; disabled until reload plugin="agenthop-agents-bridge" hook="timer"\n'; python3 -c 'print("new " * 300)'; } >"$L.new"; mv -f "$L.new" "$L"
+check "$(python3 "$HERE/smoke-logwindow.py" offset "$L" "$M" 2>/dev/null | grep -q 'exceeded its budget' && echo true)" "r9-1b log replaced by rename before open: helper reads the new file whole"
+
+# 2 (BSM-TIME-UNKNOWN / BSM-R8-P2-1): our kill line with a broken timestamp => undecidable => FAIL, not skipped
+for bad in '2026-10-15T11:xx:01+08:00' '2026-10-15T10:00:00+oops' 'BROKEN-TIME'; do
+  : >"$L"; printf '%s 1 WARN x: plugin hook exceeded its budget; disabled until reload plugin="agenthop-agents-bridge" hook="timer"\n' "$bad" >"$L"
+  start_ticker; run env SINCE=2026-10-15T11:00:00+08:00; stop_ticker
+  check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 4 kill window could not be read'*'unparseable timestamp'* ]] && echo true)" "r9-2 kill line with timestamp '$bad' => FAIL (undecidable), not 0 kills"
+done
+# control: a stack-trace continuation (no timestamp, not a kill) and ANOTHER plugin's broken kill line are ignored
+printf 'stack traceback:\n\t[C]: in ?\nBROKEN 1 WARN x: plugin hook exceeded its budget; disabled until reload plugin="other-plugin" hook="timer"\n' >"$L"
+start_ticker; run env SINCE=2026-10-15T11:00:00+08:00; stop_ticker
+check "$([ $RC -eq 0 ] && [[ "$OUT" == *'PASS - 4 mirror kills=0'* ]] && echo true)" "r9-2 control: continuation lines and another plugin's broken line ignored"
+
+# 3 (BSM-TEMP-OWN): a planted symlink / file at the OLD fixed path is never written or removed; mktemp failure FAILs
+: >"$L"; echo victim-bytes >"$TMP/victim"; start_ticker
+OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 bash -c 'ln -sf "$1" "/tmp/smoke-logwin.$$"; exec bash "$2"' _ "$TMP/victim" "$SMOKE" 2>&1)"; RC=$?
+stop_ticker
+check "$([ "$(cat "$TMP/victim")" = victim-bytes ] && echo true)" "r9-3 symlink planted at /tmp/smoke-logwin.<pid>: victim bytes untouched"
+lnk="$(ls -1 /tmp/smoke-logwin.* 2>/dev/null | head -1)"
+check "$([ -n "$lnk" ] && [ -L "$lnk" ] && echo true)" "r9-3 the planted symlink itself is not removed"
+rm -f /tmp/smoke-logwin.*
+: >"$L"; start_ticker; run env TMPDIR="$TMP/no-such-dir"; stop_ticker
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'cannot create a private temp file'* ]] && echo true)" "r9-3 mktemp fails => check 4 FAILs, says why"
+check "$([ -z "$(ls -1 "${TMPDIR:-/tmp}"/bridge-smoke-logwin.* 2>/dev/null)" ] && echo true)" "r9-3 no private temp file left behind"
+
+# 4 (BSM-R8-P2-2): a vm seen, then a snapshot WITHOUT vm (or unreadable) => identity unknown => FAIL
+: >"$L"; echo '{"tick":1,"vm":"old","agents":[]}' >"$C/agents.json"
+( sleep 0.3; echo '{"tick":100,"agents":[]}' >"$C/agents.json" ) & TICKER=$!
+run env; stop_ticker
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 1 tick: identity unknown — vm old was seen, then the next snapshot had no vm field'* ]] && echo true)" "r9-4 vm seen then vanished (vm_identity_missing) => FAIL identity unknown"
+: >"$L"; echo '{"tick":1,"vm":"old","agents":[]}' >"$C/agents.json"
+( sleep 0.3; echo '{not json' >"$C/agents.json" ) & TICKER=$!
+run env; stop_ticker
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'identity unknown'*'no readable file'* ]] && echo true)" "r9-4 vm seen then agents.json unreadable => FAIL identity unknown"
+# control: a legacy bridge (never any vm) is still compared by tick and says so
+: >"$L"; start_ticker
+run env; stop_ticker
+check "$([ $RC -eq 0 ] && [[ "$OUT" == *'legacy bridge (no vm field): tick-only comparison'* ]] && echo true)" "r9-4 control: legacy no-vm bridge => tick-only PASS, labelled legacy"
 
 echo ""
 echo "bridge-smoke gate: $t passed, $f failed"

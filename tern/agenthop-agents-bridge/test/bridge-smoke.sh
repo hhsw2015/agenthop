@@ -71,6 +71,9 @@ if [ -e "$LOG" ]; then
 fi
 
 tick(){ jq -r '.tick // empty' "$CTRL/agents.json" 2>/dev/null; }
+# One read of agents.json -> "tick<TAB>vm<TAB>timer", so the tick and the vm it is compared under come from the SAME
+# snapshot. vm/timer are "-" when the field is absent; the whole line is "ERR" when the file can't be read/parsed.
+snap(){ jq -r '[(.tick // "" | tostring), (.vm // "-"), (.timer // "-")] | @tsv' "$CTRL/agents.json" 2>/dev/null || echo ERR; }
 # r4+ writes `vm` (a per-load id). A different vm means the plugin was reloaded and tick restarted from 1, which is
 # not a stall. Older bridges write no vm: then only the tick is compared.
 vm(){ jq -r '.vm // empty' "$CTRL/agents.json" 2>/dev/null; }
@@ -121,35 +124,50 @@ echo "ok   - plugin $PLUGIN_ID loaded"
 # 1. tick advances (status mirror alive).
 #    r4+: `vm` is a per-load id. A vm change = reload: the tick restarted, so the baseline restarts on the new vm and
 #    PASS still needs that SAME vm to advance afterwards. A reload followed by a freeze, or a vm that keeps changing,
-#    is a FAIL. r8+: `timer=stopped-late` means the timer accelerator stopped itself (background throttling); liveness
-#    is then the outside `mirror` command sweep (~5 s), so the expected rate is the sweep's, not 750 ms — reported.
-t0="$(tick)"; v0="$(vm)"
-if ! [[ "$t0" =~ ^[0-9]+$ ]]; then
-  fail "1 tick: agents.json tick unreadable or not a number: '$t0'"
+#    is a FAIL. r8+ `timer=stopped-late` / r9+ `timer=overdue`: the timer accelerator stopped (late or never-delivered
+#    callbacks); liveness is then the outside `mirror` command sweep (~5 s), so the expected rate is the sweep's, not
+#    750 ms — reported as by design. A frozen tick still FAILs either way; the FAIL line names the timer state and
+#    the sweep flag, so "accelerator stopped and no sweep" reads differently from "bridge dead".
+# Identity rules: a snapshot without a vm is the legacy (pre-r4) mode and is compared by tick alone, but ONLY if no vm
+# was ever seen in this run. Once a vm is known, a later snapshot without one (or an unreadable file) means the
+# identity is unknown: it cannot prove the same vm advanced, so check 1 FAILs with "identity unknown".
+read_snap(){ local l; l="$(snap)"; [ "$l" = ERR ] && { S_T=""; S_V="ERR"; S_TM="-"; return; }
+  IFS=$'\t' read -r S_T S_V S_TM <<<"$l"; }
+read_snap; t0="$S_T"; v0="$S_V"; seen_vm=""; [ "$v0" != "-" ] && [ "$v0" != ERR ] && seen_vm="$v0"
+reload_note=""; identity_err=""
+if [ "$v0" = ERR ] || ! [[ "$t0" =~ ^[0-9]+$ ]]; then
+  fail "1 tick: agents.json unreadable or tick not a number (tick '$t0', vm '$v0')"
 else
   sleep "$TICK_WAIT"
-  t1="$(tick)"; v1="$(vm)"
-  reload_note=""
-  if [ -n "$v0" ] && [ -n "$v1" ] && [ "$v0" != "$v1" ] && [[ "$t1" =~ ^[0-9]+$ ]]; then
+  read_snap; t1="$S_T"; v1="$S_V"; timer_state="$S_TM"
+  if [ -n "$seen_vm" ] && { [ "$v1" = "-" ] || [ "$v1" = ERR ]; }; then
+    identity_err="vm $seen_vm was seen, then the next snapshot had $( [ "$v1" = ERR ] && echo 'no readable file' || echo 'no vm field')"
+  elif [ -n "$seen_vm" ] && [ "$v1" != "$v0" ] && [[ "$t1" =~ ^[0-9]+$ ]]; then
     reload_note="reloaded (vm $v0 -> $v1), re-baselined at $t1; "
     t0="$t1"; v0="$v1"
     sleep "$TICK_WAIT"
-    t1="$(tick)"; v1="$(vm)"
+    read_snap; t1="$S_T"; v1="$S_V"; timer_state="$S_TM"
+    if [ "$v1" = "-" ] || [ "$v1" = ERR ]; then identity_err="vm $v0 was seen after the reload, then the next snapshot had no vm"; fi
   fi
-  timer_state="$(jq -r '.timer // empty' "$CTRL/agents.json" 2>/dev/null)"
-  if [ -n "$v0" ] && [ -n "$v1" ] && [ "$v0" != "$v1" ]; then
+  [ "$timer_state" = "-" ] && timer_state=""
+  vm_label=""; [ "$v1" != "-" ] && [ "$v1" != ERR ] && vm_label="$v1"
+  if [ -n "$identity_err" ]; then
+    fail "1 tick: ${reload_note}identity unknown — $identity_err; cannot show the same vm advanced (tick $t0 -> ${t1:-?})"
+  elif [ -n "$seen_vm" ] && [ "$v0" != "$v1" ]; then
     fail "1 tick: ${reload_note}vm changed AGAIN ($v0 -> $v1): no single vm observed advancing"
   elif [[ "$t1" =~ ^[0-9]+$ ]] && [ "$t1" -gt "$t0" ]; then
     # Rate column: the bridge's timer chain ticks every 750 ms; an outside sweep (`tern ctl ... mirror`) every few
-    # seconds also moves it. With the timer running, a low rate means the chain is dying; with timer=stopped-late,
-    # the sweep alone is expected.
+    # seconds also moves it. With the timer running, a low rate means the chain is dying; with the accelerator
+    # stopped (stopped-late / overdue), the sweep alone is expected.
     steps=$((t1 - t0)); want=$(( TICK_WAIT * 1000 / 750 ))
-    if [ "$timer_state" = "stopped-late" ]; then rate="timer=stopped-late (throttled, by design): liveness from the outside mirror sweep"
+    if [ "$timer_state" = "stopped-late" ] || [ "$timer_state" = "overdue" ]; then
+      rate="timer=$timer_state (accelerator stopped, by design): liveness from the outside mirror sweep"
     elif [ "$steps" -ge $(( want / 2 )) ]; then rate="timer chain alive"
     else rate="LOW: timer chain likely dead, tick kept alive by outside mirror calls"; fi
-    pass "1 tick ${reload_note}advances ($t0 -> $t1 in ${TICK_WAIT}s = $steps steps, ~$want expected; $rate${v1:+; vm $v1})"
+    [ -z "$seen_vm" ] && rate="$rate; legacy bridge (no vm field): tick-only comparison"
+    pass "1 tick ${reload_note}advances ($t0 -> $t1 in ${TICK_WAIT}s = $steps steps, ~$want expected; $rate${vm_label:+; vm $vm_label})"
   else
-    fail "1 tick: ${reload_note}did not advance in ${TICK_WAIT}s ($t0 -> $t1${v1:+, vm $v1}${timer_state:+, timer=$timer_state}; sweep flag SWARM_TERN_BRIDGE: $(sweep_flag))"
+    fail "1 tick: ${reload_note}did not advance in ${TICK_WAIT}s ($t0 -> $t1${vm_label:+, vm $vm_label}${timer_state:+, timer=$timer_state}; sweep flag SWARM_TERN_BRIDGE: $(sweep_flag))"
   fi
 fi
 
@@ -179,19 +197,25 @@ fi
 #    `... exceeded its budget; disabled until reload plugin="<id>" hook="<hook>"` (the id AFTER `exceeded`), plus a second
 #    `handler failed ... exceeded 50 ms` line for the same kill — only the first form is counted, so one kill = 1.
 window_err=""
-if [ -n "${SINCE:-}" ]; then
+# stderr of the helper goes to a file THIS run creates exclusively (mktemp, mode 0600). A fixed name like
+# /tmp/x.$$ could be a symlink planted by someone else: writing to it would truncate the target, and rm would delete
+# their link. Only a path mktemp actually created is ever written or removed; if mktemp fails, check 4 FAILs.
+LOGWIN_ERR="$(mktemp "${TMPDIR:-/tmp}/bridge-smoke-logwin.XXXXXX" 2>/dev/null)" || LOGWIN_ERR=""
+if [ -z "$LOGWIN_ERR" ]; then
+  window_desc="since start"; window_err="cannot create a private temp file (mktemp failed in ${TMPDIR:-/tmp})"
+elif [ -n "${SINCE:-}" ]; then
   window_desc="since $SINCE"
-  window_lines="$(python3 "$LOGWIN" since "$LOG" "$SINCE" 2>/tmp/smoke-logwin.$$)" || window_err="$(cat /tmp/smoke-logwin.$$)"
+  window_lines="$(python3 "$LOGWIN" since "$LOG" "$SINCE" "$PLUGIN_ID" 2>"$LOGWIN_ERR")" || window_err="$(cat "$LOGWIN_ERR")"
 elif [ -n "$LOG_MARK_ERR" ]; then
   window_desc="since start"; window_err="log unreadable at start: $LOG_MARK_ERR"
 elif [ -z "$LOG_MARK" ]; then
   window_desc="since start (log appeared during the run)"
-  [ -e "$LOG" ] && { window_lines="$(python3 "$LOGWIN" offset "$LOG" "0:0:0" 2>/tmp/smoke-logwin.$$)" || window_err="$(cat /tmp/smoke-logwin.$$)"; }
+  [ -e "$LOG" ] && { window_lines="$(python3 "$LOGWIN" offset "$LOG" "0:0:0:-" 2>"$LOGWIN_ERR")" || window_err="$(cat "$LOGWIN_ERR")"; }
 else
   window_desc="since start"
-  window_lines="$(python3 "$LOGWIN" offset "$LOG" "$LOG_MARK" 2>/tmp/smoke-logwin.$$)" || window_err="$(cat /tmp/smoke-logwin.$$)"
+  window_lines="$(python3 "$LOGWIN" offset "$LOG" "$LOG_MARK" 2>"$LOGWIN_ERR")" || window_err="$(cat "$LOGWIN_ERR")"
 fi
-rm -f /tmp/smoke-logwin.$$
+[ -n "$LOGWIN_ERR" ] && rm -f -- "$LOGWIN_ERR"
 if [ ! -e "$LOG" ]; then
   fail "4 tern log not found at $LOG"
 elif [ -n "$window_err" ]; then
