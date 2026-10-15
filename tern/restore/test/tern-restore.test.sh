@@ -21,6 +21,15 @@ if a[:2] == ["ls", "--json"]:
     if os.path.exists(T + "/ls-empty-object"):
         print("{}"); sys.exit(0)
     sess = json.loads(json.dumps(d["sessions"]))
+    if os.path.exists(T + "/swap-identity-after-list") and d.get("listed_once"):
+        for t in sess[0]["tabs"]:
+            for b in t["blocks"]:
+                if b["id"] == d.get("swap_id"): b["command"] = "tern acp claude --resume other9999 --mode bypassPermissions --model m1"
+        for t in d["sessions"][0]["tabs"]:
+            for b in t["blocks"]:
+                if b["id"] == d.get("swap_id"): b["command"] = "tern acp claude --resume other9999 --mode bypassPermissions --model m1"
+    if os.path.exists(T + "/swap-identity-after-list"):
+        d["listed_once"] = True
     hidden = d.get("hidden", {})
     for t in sess[0]["tabs"]:
         t["blocks"] = [b for b in t["blocks"] if hidden.get(str(b["id"]), 0) <= 0]
@@ -34,6 +43,7 @@ if a[:2] == ["ls", "--json"]:
 elif a[:2] == ["new", "tab"]:
     cmd = a[a.index("--") + 1:]
     bid = d["next"]; d["next"] += 1
+    d["swap_id"] = bid
     for n in (3, 99):
         if os.path.exists(T + f"/list-delay-{n}"):
             d.setdefault("hidden", {})[str(bid)] = n
@@ -94,7 +104,7 @@ rc=$(run); ck "cold: exit 0" "0" "$rc"
 ck "cold: 3 seats started" "3" "$(starts)"
 ck "cold: result 3/3" "1" "$(grep -c 'result: 3/3' "$T/out")"
 ck "cold: claude seat gets bypass mode" "1" "$(grep -c 'new tab agenthop --cwd /tmp/x -- tern acp claude --resume aaaa1111 --mode bypassPermissions --model cpa-local/claude-fable-5-1\[1m\]' "$T/log")"
-ck "cold: codex seat has no model/mode flags" "1" "$(grep -c -- '-- tern acp codex --resume cccc3333$' "$T/log")"
+ck "cold: codex seat gets full access via env (no --mode flag)" "1" "$(grep -c -- '-- env INITIAL_AGENT_MODE=agent-full-access tern acp codex --resume cccc3333$' "$T/log")"
 ck "cold: tabs renamed to roles" "3" "$(grep -c '^rename ' "$T/log")"
 
 ck "seat-shell: set called on cold run with tern+pid" "1" "$(grep -c '^set aaaa1111 tern 7100$' "$T/seatshell.log")"
@@ -177,7 +187,7 @@ ck "identity: --resume=/--model= form is the seat" "0" "$(grep -c 'FAIL: Manager
 fresh; touch "$T/rename-fail-once"; rc=$(run1)
 ck "attach: rename retried after transient failure, exit 0" "0" "$rc"
 ck "attach: one start only" "1" "$(grep -c '^new tab' "$T/log")"
-fresh; seed "" "tern acp claude --resume aaaa1111 --model m1"; rc=$(run1)
+fresh; seed "" "tern acp claude --resume aaaa1111 --mode bypassPermissions --model m1"; rc=$(run1)
 ck "attach: half-done block renamed on rerun" "0" "$rc"
 ck "attach: half-done block not started again" "0" "$(grep -c '^new tab' "$T/log")"
 fresh; touch "$T/list-delay-3"; rc=$(run1); rc2=$(run1); ck "attach: delayed listing never starts twice" "1" "$(grep -c '^new tab' "$T/log")"
@@ -218,13 +228,13 @@ rc=$(run1); ck "attach-xproc: unreadable pending entry => exit 3 UNKNOWN" "3" "$
 
 # TR-INVENTORY: consumed leaf types
 for bad in 'live:"true"' 'live:1' 'command:[]'; do
-  fresh; seed Manager "tern acp claude --resume aaaa1111 --model m1"
+  fresh; seed Manager "tern acp claude --resume aaaa1111 --mode bypassPermissions --model m1"
   python3 - "$FAKE_STATE" "$bad" <<'PY2'
 import json,sys; d=json.load(open(sys.argv[1])); k,v=sys.argv[2].split(":",1); d["sessions"][0]["tabs"][0]["blocks"][0][k]=json.loads(v); json.dump(d,open(sys.argv[1],"w"))
 PY2
   rc=$(run1); ck "inventory type: $bad => exit 3" "3" "$rc"; ck "inventory type: $bad => zero starts" "0" "$(grep -c '^new tab' "$T/log")"
 done
-fresh; seed Manager "tern acp claude --resume aaaa1111 --model m1"
+fresh; seed Manager "tern acp claude --resume aaaa1111 --mode bypassPermissions --model m1"
 python3 - "$FAKE_STATE" <<'PY2'
 import json,sys; d=json.load(open(sys.argv[1])); d["sessions"][0]["tabs"][0]["name"]={"x":1}; json.dump(d,open(sys.argv[1],"w"))
 PY2
@@ -323,7 +333,7 @@ ck "unreadable identity: no rename/start, journal kept" "0 0 1" "$(grep -c '^ren
 ck "unreadable identity: HOLD (cannot be proven)" "1" "$(grep -c '^HOLD: Manager.*cannot be proven alive or gone' "$T/out")"
 
 # (i) positive control: the recorded block is this seat, listed under a wrong tab name => renamed, journal cleared, exit 0
-fresh; old_pending 100; seed "" "tern acp claude --resume aaaa1111 --model m1"
+fresh; old_pending 100; seed "" "tern acp claude --resume aaaa1111 --mode bypassPermissions --model m1"
 printf '5100 1 tern acp claude --resume aaaa1111\n6100 5100 node adapter\n7100 6100 claude --output-format stream-json --resume=aaaa1111\n' >"$T/ps-own"
 rc=$(RESTORE_PS="$T/ps-own" python3 "$PY" "$T/one.json" >"$T/out" 2>&1; echo $?)
 ck "own block (wrong tab): renamed once" "1" "$(grep -c '^rename 100 Manager' "$T/log")"
@@ -379,6 +389,47 @@ rc=$(run --check); ck "presence r6: wrong pid labelled origin=agent => FAIL" "1"
 fresh; mkdir -p "$T/presence"; printf '%s' "$$" >"$T/presence/aaaa1111.pid"; chmod 444 "$T/presence/aaaa1111.pid"; chmod 555 "$T/presence"
 run >/dev/null 2>&1; chmod 755 "$T/presence"; chmod 644 "$T/presence/aaaa1111.pid"
 ck "presence r6 order: dir not writable => .pid untouched" "$$" "$(cat "$T/presence/aaaa1111.pid")"
+
+# ===== r8 =====
+# TR-PENDING-IDENTITY: a block we started, whose identity changes to another seat while we wait => never renamed, journal kept
+fresh; touch "$T/swap-identity-after-list"; rc=$(run1); rm -f "$T/swap-identity-after-list"
+ck "pending identity: identity changed during the wait => no rename" "0" "$(grep -c '^rename' "$T/log")"
+ck "pending identity: journal kept" "1" "$(ls "$T/pending" 2>/dev/null | grep -c aaaa1111.json)"
+ck "pending identity: HOLD names another seat" "1" "$(grep -c '^HOLD: Manager pending block .* is another seat' "$T/out")"
+ck "pending identity: exit 1" "1" "$rc"
+# young (in-TTL) pending entry pointing at a block that is another seat's => no rename, journal kept
+fresh; mkdir -p "$T/pending"; printf '{"at": %s, "role": "Manager", "block": 100}' "$(date +%s)" >"$T/pending/aaaa1111.json"
+seed "Other Role" "tern acp claude --resume other9999 --mode bypassPermissions --model m1"; run1 >/dev/null
+ck "young pending, foreign block: no rename" "0" "$(grep -c '^rename' "$T/log")"
+ck "young pending, foreign block: journal kept" "1" "$(ls "$T/pending" 2>/dev/null | grep -c aaaa1111.json)"
+
+# TR-SHELL-NEWLINE: an unquoted newline is a command boundary (checked against the real /bin/sh)
+NL="tern acp claude --resume aaaa1111 --mode bypassPermissions --model m1
+echo --resume TARGET"
+ck "newline: /bin/sh really runs two commands" "2" "$(printf '%s' "$NL" | sed 's/^tern acp claude.*$/echo one/' | /bin/sh | wc -l | tr -d ' ')"
+fresh; seed Manager "$NL"; run1 --check >/dev/null
+ck "newline: compound-by-newline is not the seat" "1" "$(grep -c 'FAIL: Manager: not live' "$T/out")"
+# the reviewer's exact shape: no --resume before the newline, the target sid only AFTER it (shlex alone would glue them)
+NL2="tern acp claude --mode bypassPermissions --model m1
+echo --resume aaaa1111"
+fresh; seed Manager "$NL2"; run1 --check >/dev/null
+ck "newline: sid only after an unquoted newline is not the seat" "1" "$(grep -c 'FAIL: Manager: not live' "$T/out")"
+fresh; seed Manager "tern acp claude --resume aaaa1111 --mode bypassPermissions \\
+ --model m1"; run1 --check >/dev/null
+ck "newline: backslash-continuation is still one command (the seat)" "0" "$(grep -c 'FAIL: Manager: not live' "$T/out")"
+
+# mode: roster pins a mode per seat; a launch without it is a FAIL; codex gets INITIAL_AGENT_MODE env, claude --mode
+fresh; seed Manager "tern acp claude --resume aaaa1111 --model m1"; run1 --check >/dev/null
+ck "mode: claude launch without --mode => FAIL names mode" "1" "$(grep -c "FAIL: Manager: mode None != pinned 'bypassPermissions'" "$T/out")"
+printf '{"session":"agenthop","seats":[{"role":"A","tool":"codex","sid":"zz1","cwd":"/tmp/y","model":null,"mode":"agent-full-access"}]}' >"$T/cxm.json"
+fresh; seed A "env INITIAL_AGENT_MODE=agent-full-access tern acp codex --resume zz1"
+python3 "$PY" "$T/cxm.json" --check >"$T/out" 2>&1
+ck "mode: codex env-prefixed launch is the seat (not 'not live')" "0" "$(grep -c 'FAIL: A: not live' "$T/out")"
+ck "mode: codex env mode matches pin (no mode FAIL)" "0" "$(grep -c 'FAIL: A: mode' "$T/out")"
+fresh; seed A "env INITIAL_AGENT_MODE=\$X tern acp codex --resume zz1"; python3 "$PY" "$T/cxm.json" --check >"$T/out" 2>&1
+ck "mode: env with an expansion is not provable => not the seat" "1" "$(grep -c 'FAIL: A: not live' "$T/out")"
+printf '{"session":"agenthop","seats":[{"role":"A","tool":"codex","sid":"zz1","cwd":"/tmp/y","model":null,"mode":"bypassPermissions"}]}' >"$T/bad.json"
+rc=$(python3 "$PY" "$T/bad.json" >/dev/null 2>&1; echo $?); ck "mode: a claude mode on a codex seat => roster exit 2" "2" "$rc"
 
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)

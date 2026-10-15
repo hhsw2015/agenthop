@@ -28,6 +28,11 @@ WAIT_S = float(os.environ.get("RESTORE_WAIT_S", "10"))
 PENDING_DIR = os.path.expanduser(os.environ.get("RESTORE_PENDING_DIR", "~/.agenthop/swarm/tern-restore-pending"))
 PENDING_TTL_S = float(os.environ.get("RESTORE_PENDING_TTL_S", "120"))
 TOOLS = ("claude", "codex")
+# Seat permission mode (user, 2026-10-15: every agent starts at the highest permission, no approval prompts). claude takes it as
+# `--mode`; codex-acp has no --mode flag and reads INITIAL_AGENT_MODE from the environment (read-only|workspace-write|agent|
+# agent-full-access); the global ~/.codex/config.toml is not read by the ACP entry, so the env must be explicit.
+MODES = {"claude": ("bypassPermissions",), "codex": ("read-only", "workspace-write", "agent", "agent-full-access")}
+DEFAULT_MODE = {"claude": "bypassPermissions", "codex": "agent-full-access"}
 SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -72,6 +77,9 @@ def validate_roster(r):
         m = s["model"]
         if m is not None and (not isinstance(m, str) or not m):
             raise RosterError(f"{where}.model must be null or a non-empty string")
+        md = s.get("mode")
+        if md is not None and md not in MODES[s["tool"]]:
+            raise RosterError(f"{where}.mode {md!r} not valid for {s['tool']} {MODES[s['tool']]}")
         if s["tool"] == "claude" and m is None:
             raise RosterError(f"{where}: claude seat needs a pinned model")
         if s["role"] in roles:
@@ -115,13 +123,37 @@ def inventory(session):
     return out
 
 
+ENV_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=[^$`\\]*")
 SHELL_OPS = {"&&", "||", ";", "|", "&", "(", ")", "<", ">", ">>", "<<", "2>", "2>&1", "&>"}
+
+
+def _has_unquoted_newline(command):
+    quote, i = None, 0
+    while i < len(command):
+        c = command[i]
+        if quote == "'":
+            if c == "'": quote = None
+        elif quote == '"':
+            if c == "\\": i += 1
+            elif c == '"': quote = None
+        else:
+            if c == "\\":
+                i += 1  # backslash-newline is a line continuation in sh, not a boundary; any other escaped char is literal
+            elif c in ("'", '"'): quote = c
+            elif c in ("\n", "\r"): return True
+        i += 1
+    return False
 
 
 def parse_acp(command):
     """(tool, sid, model) if command is exactly ONE simple `tern acp` launch with one resume, else None.
     A compound command (any shell operator token) or a repeated --resume/--model cannot prove which identity runs ⇒ None."""
     if not isinstance(command, str) or not command:
+        return None
+    # TR-SHELL-NEWLINE: an unquoted newline (or CR) ends a shell command — `tern acp claude …\necho --resume X` is TWO commands, and
+    # shlex would glue them into one argv. Any newline/CR outside quotes ⇒ not provably one simple command. Checked by a tiny
+    # quote-aware scan (single quotes literal; double quotes honour backslash), matching how /bin/sh splits.
+    if _has_unquoted_newline(command):
         return None
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars=True)
@@ -131,6 +163,15 @@ def parse_acp(command):
         return None
     if any(a in SHELL_OPS or (a and set(a) <= set("&|;<>()")) for a in argv):
         return None
+    # r8: an optional literal `env K=V ...` prefix (how codex seats get INITIAL_AGENT_MODE). Each assignment must be a plain
+    # NAME=value with no expansion characters; anything else in front of `tern` still makes the identity unprovable.
+    if argv and os.path.basename(argv[0]) == "env":
+        j = 1
+        while j < len(argv) and ENV_ASSIGN.fullmatch(argv[j]):
+            j += 1
+        if j < len(argv) and "=" in argv[j]:
+            return None  # an assignment that is not literal (e.g. a $VAR or a backtick value)
+        argv = argv[j:]
     if len(argv) < 3 or os.path.basename(argv[0]) != "tern" or argv[1] != "acp" or argv[2] not in TOOLS:
         return None
     sids, models = [], []
@@ -151,6 +192,26 @@ def parse_acp(command):
     return (argv[2], sids[0], models[0] if models else None)
 
 
+def launch_mode(command):
+    """The permission mode a launch line gives its agent: claude `--mode X`, codex `env INITIAL_AGENT_MODE=X`. None = not stated
+    (or not a parseable launch). Read from the SAME tokens parse_acp accepts."""
+    if parse_acp(command) is None:
+        return None
+    argv = shlex.split(command)
+    mode = None
+    if os.path.basename(argv[0]) == "env":
+        for a in argv[1:]:
+            if not ENV_ASSIGN.fullmatch(a):
+                break
+            k, v = a.split("=", 1)
+            if k == "INITIAL_AGENT_MODE":
+                mode = v
+    for i, a in enumerate(argv):
+        if a == "--mode" and i + 1 < len(argv):
+            mode = argv[i + 1]
+    return mode
+
+
 def is_live(b):
     return b.get("live") is True and b.get("exited") is None
 
@@ -164,10 +225,16 @@ def seat_blocks(inv, seat):
     return out
 
 
+def seat_mode(seat):
+    return seat.get("mode") or DEFAULT_MODE[seat["tool"]]
+
+
 def launch_cmd(seat):
-    parts = ["tern", "acp", seat["tool"], "--resume", seat["sid"]]
-    if seat["tool"] == "claude":
-        parts += ["--mode", "bypassPermissions"]
+    mode = seat_mode(seat)
+    if seat["tool"] == "codex":
+        parts = ["env", f"INITIAL_AGENT_MODE={mode}", "tern", "acp", "codex", "--resume", seat["sid"]]
+    else:
+        parts = ["tern", "acp", seat["tool"], "--resume", seat["sid"], "--mode", mode]
     if seat.get("model"):
         parts += ["--model", seat["model"]]
     return parts
@@ -417,6 +484,15 @@ def restore(roster):
             report.append(f"pending: {seat['role']} block {bid} not listed yet (rerun renames it; it is not started twice "
                           f"once listed)")
             continue
+        # TR-PENDING-IDENTITY: the SAME identity discipline for every pending block (young or expired, from this run or an earlier
+        # one): before renaming it or discharging the journal, prove it is still THIS seat's live block (tool + full sid). A block
+        # whose identity changed while we waited, or cannot be read, is never renamed and the journal is kept.
+        st = block_status(bid, seat)
+        if st != "live":
+            report.append(f"HOLD: {seat['role']} pending block {bid} is {'another seat' if st == 'other' else st} "
+                          f"(not provably this seat) — not renaming, journal kept ({pending_path(seat['sid'])})")
+            held.append(seat["role"])
+            continue
         err = try_rename(bid, seat["role"], deadline)
         if err:
             report.append(f"pending: {seat['role']} block {bid} rename failed: {err} (rerun renames it)")
@@ -437,6 +513,11 @@ def verify(roster):
         tab, b, (_, _, model) = mine[0]
         if seat.get("model") and model != seat["model"]:
             fails.append((seat["role"], f"model {model!r} != pinned {seat['model']!r}"))
+        got_mode = launch_mode(b.get("command"))
+        if got_mode != seat_mode(seat):
+            # user rule (2026-10-15): seats start at the highest permission. A launch without the pinned mode would sit on
+            # approval prompts (codex ACP defaults to on-request), so it is a FAIL, not a note.
+            fails.append((seat["role"], f"mode {got_mode!r} != pinned {seat_mode(seat)!r}"))
         if tab != seat["role"]:
             fails.append((seat["role"], f"tab name {tab!r}"))
     return fails
