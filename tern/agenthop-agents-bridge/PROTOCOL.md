@@ -88,7 +88,7 @@ TERN_PANE_SOCKET=… tern ctl plugins run plugin.agenthop-agents-bridge.drain-st
 | `transcript` | **只读** | `agent, last?` | `{transcript:[...]}` | 仅 omp(TSP);非 omp 返 `[]` |
 | `wait` | **只读-异步** | `agent, timeout?` | `{message:<string?>}` | idle 时返回末条 assistant 文本;异步经 `:next`,不阻塞轮询;非 omp 恒超时 |
 | `ask` | **非幂等** | `agent, text` | `{}` | 贴+回车;native omp 一次 TSP send |
-| `start` | **非幂等** | `prompt, cwd, command?, how?` | `{pane:<number>}` | **同步,可能长耗**(见 §4);prompt/cwd 非空 |
+| `start` | **非幂等** | `prompt, cwd, command?, how?` | `{pane:<number>}` | **同步,可能长耗**(见 §4);prompt/cwd 非空。**放置模型**(#1034,user 定):session=项目、tab=长期席位(英文角色名)、block=短命 worker。经 `agenthop_tern` 起 worker 时默认在**调用方席位旁 split**(桥收 how=split,随后 `tern move <新> right-of <调用方 pane>`);`how:"tab"`=同 session 新 tab(扇出 >4);不跨 session。worker 名=`<角色> · <任务>`,不含 sid |
 | `interrupt` | **非幂等** | `agent` | `{}` | Ctrl-C,不关块 |
 | `stop` | **非幂等** | `agent` | `{}` | 关闭块 |
 | `eval` | **非幂等** | `code` | `{value:<any>}` | r2(user 亲令「通过插件直接调用 Lua API」):`loadstring` 编译(VM 内 `load` 为 nil)后以 `cx` 为参调用,返回值 JSON 编码;编译/运行错误 → `{ok:false,error}`。走 `drain`(快类) |
