@@ -44,10 +44,14 @@ elif a[0] == "process":
     # mirrors real tern 0.8.3: unreachable daemon / unknown id both exit 1 with distinct messages
     if os.path.exists(T + "/daemon-down"):
         sys.stderr.write("tern process: no Tern is running (no session daemon on /x)\n"); sys.exit(1)
-    known = {str(b["id"]) for t in d["sessions"][0]["tabs"] for b in t["blocks"]} | set(d.get("daemon_only", []))
+    known = {str(b["id"]) for t in d["sessions"][0]["tabs"] for b in t["blocks"]} | set(d.get("daemon_only", {}))
     if a[1] not in known:
         sys.stderr.write(f"tern process: no block is called `{a[1]}`\n"); sys.exit(1)
-    print(json.dumps({"child": {"pid": 5000 + int(a[1])}}))
+    # like real tern: the child's argv is the launch (from the listing, else the daemon-only record)
+    cmd = next((b["command"] for t in d["sessions"][0]["tabs"] for b in t["blocks"] if str(b["id"]) == a[1]), None)
+    if cmd is None: cmd = (d.get("daemon_only") or {}).get(a[1]) if isinstance(d.get("daemon_only"), dict) else None
+    argv = ["/Applications/Tern.app/Contents/MacOS/tern"] + (shlex.split(cmd)[1:] if cmd else [])
+    print(json.dumps({"child": {"pid": 5000 + int(a[1]), "argv": argv}}))
 elif a[0] == "rename":
     if os.path.exists(T + "/rename-fail-once"):
         os.remove(T + "/rename-fail-once"); sys.stderr.write("block in no tab\n"); sys.exit(1)
@@ -262,7 +266,7 @@ old_pending() { mkdir -p "$T/pending"; printf '{"at": 1, "role": "Manager", "blo
 # (a) the reviewer's case: block 100 is alive in the daemon but not listed yet; the entry is >TTL old => attach, never block 101
 fresh; old_pending 100
 python3 - "$FAKE_STATE" <<'PY2'
-import json,sys; json.dump({"next":101,"sessions":[{"name":"agenthop","tabs":[]}],"daemon_only":["100"]},open(sys.argv[1],"w"))
+import json,sys; json.dump({"next":101,"sessions":[{"name":"agenthop","tabs":[]}],"daemon_only":{"100":"tern acp claude --resume aaaa1111 --mode bypassPermissions --model m1"}},open(sys.argv[1],"w"))
 PY2
 run1 >/dev/null
 ck "expired+alive-unlisted: no second start" "0" "$(grep -c '^new tab' "$T/log")"
@@ -291,10 +295,45 @@ fresh; old_pending null; run1 >/dev/null
 ck "expired+no-block-id: HOLD, no start" "0" "$(grep -c '^new tab' "$T/log")"
 ck "expired+no-block-id: HOLD printed" "1" "$(grep -c '^HOLD: Manager' "$T/out")"
 ck "expired+no-block-id: a FAIL line names the HOLD (not only 'not live')" "1" "$(grep -c '^FAIL: Manager: HOLD' "$T/out")"
+# (g) r7 TR-R6-P2-1: the recorded block id now runs ANOTHER seat (recycled) => zero action: no rename, journal kept, no start
+fresh; old_pending 100; seed "Other Role" "tern acp claude --resume other9999 --model m1"
+rc=$(run1)
+ck "foreign block: no rename" "0" "$(grep -c '^rename' "$T/log")"
+ck "foreign block: no start" "0" "$(grep -c '^new tab' "$T/log")"
+ck "foreign block: journal kept" "1" "$(ls "$T/pending" 2>/dev/null | grep -c aaaa1111.json)"
+ck "foreign block: HOLD names another identity" "1" "$(grep -c "^HOLD: Manager earlier start recorded block 100, which now runs ANOTHER" "$T/out")"
+ck "foreign block: exit 1 for a human" "1" "$rc"
+ck "foreign block: other tab name untouched" "Other Role" "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["sessions"][0]["tabs"][0]["name"])' "$FAKE_STATE")"
+# (h) unlisted but the daemon's argv is another identity => same zero action
+fresh; old_pending 100
+python3 - "$FAKE_STATE" <<'PY2'
+import json,sys; json.dump({"next":101,"sessions":[{"name":"agenthop","tabs":[]}],"daemon_only":{"100":"tern acp codex --resume zzz"}},open(sys.argv[1],"w"))
+PY2
+run1 >/dev/null
+ck "foreign unlisted: no start, journal kept" "0 1" "$(grep -c '^new tab' "$T/log") $(ls "$T/pending" 2>/dev/null | grep -c aaaa1111.json)"
+# (h2) same sid but another TOOL (codex vs claude) is another identity
+fresh; old_pending 100; seed "Manager" "tern acp codex --resume aaaa1111"
+run1 >/dev/null
+ck "foreign tool, same sid: no rename/start, journal kept" "0 0 1" "$(grep -c '^rename' "$T/log") $(grep -c '^new tab' "$T/log") $(ls "$T/pending" 2>/dev/null | grep -c aaaa1111.json)"
+ck "foreign tool, same sid: HOLD" "1" "$(grep -c 'which now runs ANOTHER' "$T/out")"
+# (h3) the recorded block exists but its identity cannot be read (compound command) => unknown => HOLD, no rename/start
+fresh; old_pending 100; seed "" "tern acp claude --resume aaaa1111 --model m1 && echo x"
+run1 >/dev/null
+ck "unreadable identity: no rename/start, journal kept" "0 0 1" "$(grep -c '^rename' "$T/log") $(grep -c '^new tab' "$T/log") $(ls "$T/pending" 2>/dev/null | grep -c aaaa1111.json)"
+ck "unreadable identity: HOLD (cannot be proven)" "1" "$(grep -c '^HOLD: Manager.*cannot be proven alive or gone' "$T/out")"
+
+# (i) positive control: the recorded block is this seat, listed under a wrong tab name => renamed, journal cleared, exit 0
+fresh; old_pending 100; seed "" "tern acp claude --resume aaaa1111 --model m1"
+printf '5100 1 tern acp claude --resume aaaa1111\n6100 5100 node adapter\n7100 6100 claude --output-format stream-json --resume=aaaa1111\n' >"$T/ps-own"
+rc=$(RESTORE_PS="$T/ps-own" python3 "$PY" "$T/one.json" >"$T/out" 2>&1; echo $?)
+ck "own block (wrong tab): renamed once" "1" "$(grep -c '^rename 100 Manager' "$T/log")"
+ck "own block: journal cleared" "0" "$(ls "$T/pending" 2>/dev/null | wc -l | tr -d ' ')"
+ck "own block: exit 0" "0" "$rc"
+
 # (f) a bigger TTL is not the fix: with TTL 0 every entry is "expired" and the alive case still never starts twice
 fresh; old_pending 100
 python3 - "$FAKE_STATE" <<'PY2'
-import json,sys; json.dump({"next":101,"sessions":[{"name":"agenthop","tabs":[]}],"daemon_only":["100"]},open(sys.argv[1],"w"))
+import json,sys; json.dump({"next":101,"sessions":[{"name":"agenthop","tabs":[]}],"daemon_only":{"100":"tern acp claude --resume aaaa1111 --mode bypassPermissions --model m1"}},open(sys.argv[1],"w"))
 PY2
 RESTORE_PENDING_TTL_S=0 run1 >/dev/null; RESTORE_PENDING_TTL_S=0 run1 >/dev/null
 ck "TTL=0, two runs, block alive unlisted: still zero starts" "0" "$(grep -c '^new tab' "$T/log")"

@@ -251,11 +251,13 @@ class PendingUnknown(Exception):
     pass
 
 
-def block_status(bid):
-    """'live' | 'gone' | 'unknown' for a recorded block id, from the daemon (never from age).
-    live    = `tern process` resolves it and tern ls lists it live (or does not list it yet: the block exists in the daemon)
+def block_status(bid, seat):
+    """'live' | 'gone' | 'other' | 'unknown' for a recorded block id, from the daemon (never from age), and only for THIS seat.
+    live    = the block exists (listed live, or resolved by `tern process` but not listed yet) AND its launch proves this seat's
+              tool + sid (TR-R6-P2-1: a numeric id existing is not proof the block is still this seat's)
+    other   = the block exists but its launch is provably ANOTHER identity (tool/sid differ)
     gone    = `tern process` says no such block, or tern ls lists it with live false / exited set
-    unknown = the daemon cannot be asked, or any other answer"""
+    unknown = the daemon cannot be asked, the identity cannot be read, or any other answer"""
     if not isinstance(bid, int) or isinstance(bid, bool):
         return "unknown"
     r = subprocess.run([TERN, "process", str(bid), "--json"], capture_output=True, text=True)
@@ -268,16 +270,27 @@ def block_status(bid):
         return "unknown"
     if not isinstance(child, dict) or not isinstance(child.get("pid"), int):
         return "unknown"
+    listed_cmd, listed = None, False
     try:
         d = json.loads(tern("ls", "--json"))
         for s_ in d.get("sessions", []):
             for t in s_.get("tabs", []):
                 for b in t.get("blocks", []):
                     if b.get("id") == bid:
-                        return "gone" if (b.get("live") is False or b.get("exited") is not None) else "live"
+                        if b.get("live") is False or b.get("exited") is not None:
+                            return "gone"
+                        listed, listed_cmd = True, b.get("command")
     except (RuntimeError, ValueError, AttributeError, TypeError):
         return "unknown"
-    return "live"  # the daemon resolves its process; the listing has not caught up yet
+    # identity: the listed launch command if listed, else the process argv the daemon reports for the block's child
+    if listed:
+        ident = parse_acp(listed_cmd)
+    else:
+        argv = child.get("argv")
+        ident = parse_acp(" ".join(shlex.quote(str(a)) for a in argv)) if isinstance(argv, list) and argv else None
+    if ident is None:
+        return "unknown"
+    return "live" if (ident[0] == seat["tool"] and ident[1] == seat["sid"]) else "other"
 
 
 def pending_path(sid):
@@ -367,11 +380,16 @@ def restore(roster):
                     pending.append((seat, bid))
                 continue
             bid = pend.get("block")
-            st = block_status(bid)
+            st = block_status(bid, seat)
             if st == "live":
                 report.append(f"pending: {seat['role']} earlier start (block {bid}, {age:.0f}s ago) is alive in the daemon — "
                               f"attaching, not starting again")
                 pending.append((seat, bid))
+                continue
+            if st == "other":
+                report.append(f"HOLD: {seat['role']} earlier start recorded block {bid}, which now runs ANOTHER seat's identity — "
+                              f"not renaming, attaching or starting. Check {pending_path(seat['sid'])} by hand.")
+                held.append(seat["role"])
                 continue
             if st == "unknown":
                 report.append(f"HOLD: {seat['role']} earlier start (block {bid!r}, {age:.0f}s ago) cannot be proven alive or gone — "
