@@ -16,7 +16,7 @@ end
 local HOME = "/tmp/sentinel-test-home"
 local L0 = HOME .. "/.agenthop/carly"
 local MY_BEAT = L0 .. "/carly-patrol.beat"
-local COORD_BEAT = L0 .. "/coordinator.beat"
+local COORD_BEAT = HOME .. "/.agenthop/swarm/coordinator.beat" -- pinned contract path (NOT the L0 root)
 local NOW = 1000000 -- tern.now() monotonic ms (stall timing)
 local NOW_SEC = 1700000000 -- os.time() wall-clock epoch seconds (beats); controllable for deterministic ① tests
 os.time = function() return NOW_SEC end -- override the global the sentinel calls for wall-clock
@@ -159,6 +159,22 @@ do -- fresh (1 min old) => no alert
   writes[COORD_BEAT] = tostring(NOW_SEC - 60)
   local out = c({}, mockCx({}, {}), {})
   check_("coordinator_stale: fresh beat => no alert", out == nil)
+end
+do -- PATH GATE: the reader watches ~/.agenthop/swarm/coordinator.beat (the coordinator's pinned write path), NOT the L0 carly root.
+  -- A STALE beat at the OLD carly path + a FRESH beat at the swarm path => no alert (reads swarm). Then STALE at swarm => alert.
+  local OLD = L0 .. "/coordinator.beat"
+  local c = load_check()
+  resetWrites()
+  NOW_SEC = 1700000000
+  writes[OLD] = tostring(NOW_SEC - 25 * 60) .. "\n"   -- stale, wrong place
+  writes[COORD_BEAT] = tostring(NOW_SEC - 60) .. "\n" -- fresh, contract place
+  check_("coordinator_stale PATH: fresh at swarm + stale at old carly path => no alert (reads swarm)", c({}, mockCx({}, {}), {}) == nil)
+  c = load_check()
+  resetWrites()
+  writes[OLD] = tostring(NOW_SEC - 60) .. "\n"            -- fresh, wrong place
+  writes[COORD_BEAT] = tostring(NOW_SEC - 25 * 60) .. "\n" -- stale, contract place
+  local out = c({}, mockCx({}, {}), {})
+  check_("coordinator_stale PATH: stale at swarm + fresh at old carly path => alert (reads swarm)", type(out) == "string" and out:find("coordinator_stale", 1, true) ~= nil)
 end
 do -- bad carriers (empty / non-numeric / legacy JSON) => no crash, no false alert
   for _, bad in ipairs({ "", "garbage", '{"ts":1700000000}' }) do

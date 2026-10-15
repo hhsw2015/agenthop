@@ -27,7 +27,9 @@ local CONFIG = {
 local function l0_root(home) return home .. "/.agenthop/carly" end
 local function alerts_dir(home) return l0_root(home) .. "/alerts" end -- TG reads these files directly
 local function my_beat_path(home) return l0_root(home) .. "/carly-patrol.beat" end -- ① my liveness (swarm reads)
-local function coordinator_beat_path(home) return l0_root(home) .. "/coordinator.beat" end -- ① the beat I watch
+-- ① the beat I watch. NOT under the L0 root: the coordinator writes it from its own scan loop at the pinned contract path
+-- ~/.agenthop/swarm/coordinator.beat (knowledge-pack §5 / carly-sweep.ts coordinatorBeatPath — one literal across writer/reader/doc).
+local function coordinator_beat_path(home) return home .. "/.agenthop/swarm/coordinator.beat" end
 
 local function hash(s)
   local h = 5381
