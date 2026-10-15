@@ -299,7 +299,7 @@ PY2
 RESTORE_PENDING_TTL_S=0 run1 >/dev/null; RESTORE_PENDING_TTL_S=0 run1 >/dev/null
 ck "TTL=0, two runs, block alive unlisted: still zero starts" "0" "$(grep -c '^new tab' "$T/log")"
 
-# ===== r5: presence two-line format, origin=agent authority (coordinator ruling) =====
+# ===== r6: presence = ONE-line .pid + .origin sidecar (coordinator re-ruling; every reader parses the whole .pid) =====
 cat >"$T/ps" <<'P'
 5100 1 tern acp claude --resume aaaa1111
 6100 5100 node adapter
@@ -311,26 +311,35 @@ cat >"$T/ps" <<'P'
 6102 5102 /usr/local/bin/node /opt/Tern/agents/codex/node_modules/@agentclientprotocol/codex-acp/dist/index.js
 P
 fresh; run >/dev/null
-ck "presence r5: line 2 says origin=agent" "1" "$(sed -n 2p "$T/presence/aaaa1111.pid" | grep -c '^origin=agent ts=[0-9]*$')"
-ck "presence r5: line 1 is the bare pid (old readers)" "7100" "$(head -1 "$T/presence/aaaa1111.pid")"
-# a live origin=bus writer (the hook's presence.mjs) with a different pid: --check WARNs, does not FAIL; a run replaces it
-printf '%s\norigin=bus ts=1\n' "$$" >"$T/presence/aaaa1111.pid"
-rc=$(run --check); ck "presence r5: live origin=bus mismatch => --check exit 0" "0" "$rc"
-ck "presence r5: ... reported as WARN" "1" "$(grep -c '^WARN: Manager presence pid' "$T/out")"
+ck "presence r6: .pid is exactly one line (what every reader parses)" "1" "$(wc -l <"$T/presence/aaaa1111.pid" | tr -d ' ' | sed 's/^0$/1/')"
+ck "presence r6: .pid content is the bare agent pid" "7100" "$(cat "$T/presence/aaaa1111.pid")"
+ck "presence r6: readers' Number(trim(file)) parses it" "7100" "$(python3 -c 'import sys;print(int(open(sys.argv[1]).read().strip()))' "$T/presence/aaaa1111.pid")"
+ck "presence r6: hook's kill -0 \"\$(cat)\" form works" "0" "$(kill -0 "$(cat "$T/presence/aaaa1111.pid")" 2>/dev/null; [ "$(cat "$T/presence/aaaa1111.pid")" = 7100 ] && echo 0 || echo 1)"
+ck "presence r6: sidecar .origin says origin=agent" "1" "$(grep -c '^origin=agent ts=[0-9]*$' "$T/presence/aaaa1111.origin")"
+ck "presence r6: no temp left" "0" "$(find "$T/presence" -name '*.tmp-*' | wc -l | tr -d ' ')"
+# a live bus record (hook: .pid only, no sidecar) with a different pid: --check WARNs, does not FAIL; a run replaces it
+printf '%s' "$$" >"$T/presence/aaaa1111.pid"; rm -f "$T/presence/aaaa1111.origin"
+rc=$(run --check); ck "presence r6: live bus pid (no sidecar) => --check exit 0" "0" "$rc"
+ck "presence r6: ... reported as WARN" "1" "$(grep -c '^WARN: Manager presence pid' "$T/out")"
+printf 'origin=bus ts=1\n' >"$T/presence/aaaa1111.origin"
+rc=$(run --check); ck "presence r6: live pid with origin=bus sidecar => WARN, exit 0" "0" "$rc"
 run >/dev/null
-ck "presence r5: a run replaces origin=bus with the agent pid" "7100" "$(head -1 "$T/presence/aaaa1111.pid")"
-ck "presence r5: ... and marks origin=agent" "1" "$(sed -n 2p "$T/presence/aaaa1111.pid" | grep -c origin=agent)"
-# a DEAD origin=bus pid is not excused: --check FAILs
-printf '999999\norigin=bus ts=1\n' >"$T/presence/aaaa1111.pid"
-rc=$(run --check); ck "presence r5: dead origin=bus pid => --check exit 1" "1" "$rc"
-# legacy one-line file with the right pid: ok, noted as legacy, then upgraded by a run
-printf '7100' >"$T/presence/aaaa1111.pid"
-rc=$(run --check); ck "presence r5: legacy one-line right pid => --check exit 0" "0" "$rc"
-ck "presence r5: ... noted as legacy" "1" "$(grep -c 'ok pid 7100 (origin legacy)' "$T/out")"
-run >/dev/null; ck "presence r5: legacy upgraded to two lines on a run" "1" "$(sed -n 2p "$T/presence/aaaa1111.pid" | grep -c origin=agent)"
-# an origin=agent line from someone else that is WRONG is still a FAIL (agent authority is about the agent, not the label)
-printf '999998\norigin=agent ts=1\n' >"$T/presence/aaaa1111.pid"
-rc=$(run --check); ck "presence r5: wrong pid labelled origin=agent => FAIL" "1" "$rc"
+ck "presence r6: a run replaces the bus pid with the agent pid" "7100" "$(cat "$T/presence/aaaa1111.pid")"
+ck "presence r6: ... and the sidecar says origin=agent" "1" "$(grep -c origin=agent "$T/presence/aaaa1111.origin")"
+# a DEAD bus pid is not excused
+printf '999999' >"$T/presence/aaaa1111.pid"; printf 'origin=bus ts=1\n' >"$T/presence/aaaa1111.origin"
+rc=$(run --check); ck "presence r6: dead bus pid => --check exit 1" "1" "$rc"
+# right pid but no sidecar (old format): ok, noted
+printf '7100' >"$T/presence/aaaa1111.pid"; rm -f "$T/presence/aaaa1111.origin"
+rc=$(run --check); ck "presence r6: right pid, no sidecar => --check exit 0" "0" "$rc"
+ck "presence r6: ... noted" "1" "$(grep -c 'ok pid 7100 (origin bus/none)' "$T/out")"
+# a wrong pid with an origin=agent sidecar is still a FAIL (the label is not trusted over the pid)
+printf '999998' >"$T/presence/aaaa1111.pid"; printf 'origin=agent ts=1\n' >"$T/presence/aaaa1111.origin"
+rc=$(run --check); ck "presence r6: wrong pid labelled origin=agent => FAIL" "1" "$rc"
+# write order: .origin before .pid (a .pid write failure must leave the new origin, never a new pid without its origin)
+fresh; mkdir -p "$T/presence"; printf '%s' "$$" >"$T/presence/aaaa1111.pid"; chmod 444 "$T/presence/aaaa1111.pid"; chmod 555 "$T/presence"
+run >/dev/null 2>&1; chmod 755 "$T/presence"; chmod 644 "$T/presence/aaaa1111.pid"
+ck "presence r6 order: dir not writable => .pid untouched" "$$" "$(cat "$T/presence/aaaa1111.pid")"
 
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)

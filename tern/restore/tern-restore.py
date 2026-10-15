@@ -466,26 +466,36 @@ def seat_shell_set(sid, pid):
     return None if r.returncode == 0 else (r.stderr.strip() or f"rc={r.returncode}")
 
 
-# presence/<sid>.pid format (coordinator ruling, 2026-10-15): line 1 = pid (old readers read only this), line 2 =
-# `origin=agent|bus ts=<epoch ms>`. Authority = the AGENT (host) pid. tern-restore writes origin=agent. An origin=agent write
-# may replace an origin=bus line; the hook side (presence.mjs, Platform Dev) writes origin=bus and must not replace a live
-# origin=agent pid. A file with no second line is treated as origin unknown (legacy).
+# presence files (coordinator re-ruling, 2026-10-15): presence/<sid>.pid stays ONE line = the pid — every existing reader
+# (task-liveness readPid, shell-succession readPidDetailed, the installed hook's `kill -0 "$(cat …)"`) parses the WHOLE file as
+# one number, so a second line would make the seat unparseable. The writer's origin goes to a SIDECAR presence/<sid>.origin,
+# one line `origin=agent|bus ts=<epoch ms>`. Authority = the AGENT (host) pid. tern-restore writes origin=agent and may replace
+# a bus record; a missing .origin = the hook's bus process (old format). Each file is written by exclusive temp + rename.
 def read_presence(f):
-    """(pid|None, origin|None). Raises OSError (not FileNotFoundError) when the file exists but cannot be read."""
+    """(pid|None, origin|None) for presence/<sid>.pid and its .origin sidecar. Raises OSError (not FileNotFoundError) when a
+    file exists but cannot be read. origin None = no sidecar (the hook's bus writer, old format)."""
     try:
         with open(f) as h:
-            text = h.read()
+            first = h.read().strip()
     except FileNotFoundError:
         return None, None
-    lines_ = text.split("\n")
-    first = lines_[0].strip()
     pid = int(first) if first.isascii() and first.isdigit() and int(first) > 0 else None
     origin = None
-    if len(lines_) > 1:
-        for tok in lines_[1].split():
-            if tok.startswith("origin="):
-                origin = tok.split("=", 1)[1] or None
+    try:
+        with open(f[: -len(".pid")] + ".origin") as h:
+            for tok in h.read().split():
+                if tok.startswith("origin="):
+                    origin = tok.split("=", 1)[1] or None
+    except FileNotFoundError:
+        pass
     return pid, origin
+
+
+def write_atomic(path, text):
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "x") as h:
+        h.write(text)
+    os.replace(tmp, path)
 
 
 def pid_alive(pid):
@@ -518,20 +528,21 @@ def presence(roster, write):
         if have == want and origin == "agent":
             lines.append(f"presence: {seat['role']} ok pid {want}")
         elif not write:
-            if have == want:  # right pid, missing/legacy origin line: correct for readers, worth a note
-                lines.append(f"presence: {seat['role']} ok pid {want} (origin {origin or 'legacy'})")
-            elif origin == "bus" and pid_alive(have):
-                # the hook's bus process wrote it; readers still see a live pid — a WARN, not a FAIL (coordinator ruling)
-                lines.append(f"WARN: {seat['role']} presence pid {have} is the bus process (origin=bus), agent pid is {want}")
+            if have == want:  # right pid, no/other origin sidecar: correct for readers, worth a note
+                lines.append(f"presence: {seat['role']} ok pid {want} (origin {origin or 'bus/none'})")
+            elif origin in (None, "bus") and pid_alive(have):
+                # the hook's bus process (sidecar origin=bus, or no sidecar = old format) holds a LIVE pid: readers still see a
+                # live seat — a WARN, not a FAIL (coordinator ruling). A run replaces it with the agent pid.
+                lines.append(f"WARN: {seat['role']} presence pid {have} is the bus process (origin={origin or 'none'}), agent pid is {want}")
             else:
                 fails.append((seat["role"], f"presence pid {have} != agent pid {want}")); continue
         else:
             try:
                 os.makedirs(PRESENCE_DIR, exist_ok=True)
-                tmp = f"{f}.tmp-{os.getpid()}"
-                with open(tmp, "x") as h:
-                    h.write(f"{want}\norigin=agent ts={int(time.time() * 1000)}\n")
-                os.replace(tmp, f)
+                # ORDER (same as #1053 seat-presence.ts): .origin first, then .pid — a reader that sees the new pid also sees
+                # its origin; a crash between the two leaves the old pid with an agent origin, which --check flags as a FAIL.
+                write_atomic(f[: -len(".pid")] + ".origin", f"origin=agent ts={int(time.time() * 1000)}\n")
+                write_atomic(f, str(want))  # ONE line: what every existing reader parses
                 lines.append(f"presence: {seat['role']} wrote pid {want} (was {have})")
             except OSError as e:
                 fails.append((seat["role"], f"presence write failed: {e}")); continue
