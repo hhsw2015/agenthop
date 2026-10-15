@@ -164,8 +164,8 @@ export function writeBusPresence(home: string, sid: string, self: number, alive:
 /** SessionEnd (SP-SESSIONEND): under the per-sid lock, re-read .pid and .origin; ONLY when the origin is "bus" (strict full-line
  *  parse, the same readOrigin) or absent (legacy) and the pid parses, SIGTERM that pid and remove the .pid (and a bus sidecar).
  *  An agent record, an unreadable/malformed sidecar, a busy lock, or an unparseable pid ⇒ nothing killed, nothing removed.
- *  `kill` is injected (tests). Returns what it did. */
-export function endBusPresence(home: string, sid: string, kill: (pid: number) => void): "killed" | "held" | "absent" {
+ *  A kill that fails with anything but ESRCH ⇒ "kill-failed", both files kept. `kill` is injected (tests). Returns what it did. */
+export function endBusPresence(home: string, sid: string, kill: (pid: number) => void): "killed" | "held" | "absent" | "kill-failed" {
   try { presenceFile(home, sid); } catch { return "held"; }
   return withPresenceLock(home, sid, "held" as const, () => {
     let raw: string;
@@ -175,7 +175,8 @@ export function endBusPresence(home: string, sid: string, kill: (pid: number) =>
     if (o !== "bus" && o !== "absent") return "held" as const;
     const n = Number(raw);
     if (!/^\d+$/.test(raw) || !Number.isSafeInteger(n) || n <= 0) return "held" as const;
-    try { kill(n); } catch { /* already gone */ }
+    // only ESRCH proves the process is gone; EPERM / anything else ⇒ it may still run: keep both files (the obligation) and say so
+    try { kill(n); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") return "kill-failed" as const; }
     try { unlinkSync(presenceFile(home, sid)); } catch { /* gone */ }
     if (o === "bus") { try { unlinkSync(originFile(home, sid)); } catch { /* gone */ } }
     return "killed" as const;

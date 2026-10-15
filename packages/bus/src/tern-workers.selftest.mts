@@ -388,6 +388,45 @@ for (const bad of [`{"sessions":[{"name":"platform-dev-src","running":"true"}]}`
   t("WORKER-OWN stop: the socket is held by another pid ⇒ partial, no signal to anyone, no session delete", r.state === "partial" && f.signals.length === 0 && !f.argv.some((a) => a.join(" ").includes("session delete")))
   t("WORKER-OWN stop: the record stays 'stopping'", ((readSeat(home, SEAT) as any).workers as Worker[])[0]!.state === "stopping")
 }
+// ---- MTB-WORKER-OWN retry (Second Voice ea1e879): the unproven placeholder a failed start keeps must never authorize a by-name stop ----
+{
+  const { home, f, d } = setup();
+  f.foreignFirst.add("platform-dev-retry");
+  await start(d, "retry");
+  const kept = ((readSeat(home, SEAT) as any).workers as Worker[])[0]!;
+  t("OWN-RETRY: the kept placeholder carries ownership=unproven and no server_pid", kept.state === "stopping" && kept.ownership === "unproven" && kept.server_pid === undefined)
+  f.signals.length = 0; f.argv.length = 0;
+  const r = await stopWorker(SEAT, "platform-dev-retry", d);
+  const seq = f.argv.map((a) => a.join(" "));
+  t("OWN-RETRY: stop ⇒ unknown ownership-unproven, ZERO actions (no server stop, no delete, no signal)", r.state === "unknown" && /ownership-unproven/.test(r.reason ?? "") && f.signals.length === 0 && seq.length === 0)
+  t("OWN-RETRY: the foreign server still runs; our entry stays 'stopping'", f.owners.get("platform-dev-retry") === 99999 && ((readSeat(home, SEAT) as any).workers as Worker[])[0]!.state === "stopping")
+}
+{
+  // a proven live start drops the mark (so the server_pid path, not the unproven refusal, governs its stop)
+  const { home, d } = setup();
+  await start(d, "proven");
+  const w = ((readSeat(home, SEAT) as any).workers as Worker[])[0]!;
+  t("OWN-RETRY control: a proven live worker has server_pid and no ownership mark", w.state === "live" && w.server_pid !== undefined && w.ownership === undefined)
+}
+// ---- MTB-SV-STOP-COMMIT: resources cleaned, but the final 'stopped' write fails ⇒ partial, never 'stopped' ----
+{
+  const { home, d } = setup();
+  await start(d, "commit");
+  const run0 = d.run;
+  d.run = async (bin, args, ms) => {
+    const r = await run0(bin, args, ms);
+    if (args[0] === "session" && args[1] === "delete") writeFileSync(path.join(home, ".agenthop", "swarm", "seat-shell", `${SEAT}.json`), `{"workers":"broken"}`);
+    return r;
+  };
+  const r = await stopWorker(SEAT, "platform-dev-commit", d);
+  t("STOP-COMMIT: final record write fails ⇒ partial with a failed 'record stopped' step", r.state === "partial" && r.steps.some((x) => x.step === "record stopped" && !x.ok))
+}
+{
+  const { home, d } = setup();
+  await start(d, "commitok");
+  const r = await stopWorker(SEAT, "platform-dev-commitok", d);
+  t("STOP-COMMIT control: normal owned stop ⇒ stopped and recorded", r.state === "stopped" && ((readSeat(home, SEAT) as any).workers as Worker[])[0]!.state === "stopped")
+}
 // ---- SH-PARENT-WIRING (#1057): the authoritative parent sid is in the spawned server's environment ----
 {
   const { f, d } = setup();

@@ -107,6 +107,11 @@ void mkdirSync;
   writeFileSync(of, "origin=bus ts=1\n");
   t("END: origin=bus ⇒ killed that pid, .pid and sidecar removed", endBusPresence(h, A, k) === "killed" && kills[0] === 321 && !existsSync(pf) && !existsSync(of))
   t("END: absent ⇒ absent, nothing killed", endBusPresence(h, A, k) === "absent" && kills.length === 1)
+  const thrower = (code: string) => () => { throw Object.assign(new Error(code), { code }); };
+  writeFileSync(pf, "322"); writeFileSync(of, "origin=bus ts=1\n");
+  t("END-ERRNO: EPERM ⇒ kill-failed, .pid and sidecar KEPT", endBusPresence(h, A, thrower("EPERM")) === "kill-failed" && readFileSync(pf, "utf8") === "322" && existsSync(of))
+  t("END-ERRNO: unknown error ⇒ kill-failed, kept", endBusPresence(h, A, () => { throw new Error("boom"); }) === "kill-failed" && existsSync(pf) && existsSync(of))
+  t("END-ERRNO: ESRCH ⇒ already gone: killed, both removed", endBusPresence(h, A, thrower("ESRCH")) === "killed" && !existsSync(pf) && !existsSync(of))
 }
 
 // ---- #1053 r2: two writers, agent authoritative, origin in a SIDECAR (the .pid stays one number for every existing reader) ----

@@ -33,7 +33,10 @@ import { updateSeatShell } from "./swarm/seat-shell-record.js";
  */
 
 export type WorkerState = "starting" | "live" | "stopping" | "stopped" | "orphan";
-export type Worker = { name: string; herdr_session: string; pane: number; kind: "tui"; started_at: number; stopped_at: number | null; state: WorkerState; server_pid?: number };
+export type Worker = { name: string; herdr_session: string; pane: number; kind: "tui"; started_at: number; stopped_at: number | null; state: WorkerState; server_pid?: number;
+  /** "unproven" = written by a start that has not (yet) proven it owns the herdr session; such an entry never authorizes a stop or
+   *  delete by NAME. Absent on proven entries (and on legacy pre-r4 records, which have no server_pid either). */
+  ownership?: "unproven" };
 
 export const WORKER_NAME = /^[a-z][a-z0-9-]{0,39}$/;
 const STATES: readonly string[] = ["starting", "live", "stopping", "stopped", "orphan"];
@@ -47,7 +50,8 @@ export function isWorker(v: unknown): v is Worker {
     && Number.isSafeInteger(w.pane) && ((w.pane as number) > 0 || (w.pane === 0 && w.state !== "live")) && w.kind === "tui"
     && Number.isSafeInteger(w.started_at) && (w.stopped_at === null || Number.isSafeInteger(w.stopped_at))
     && typeof w.state === "string" && STATES.includes(w.state)
-    && (w.server_pid === undefined || (Number.isSafeInteger(w.server_pid) && (w.server_pid as number) > 0)); // additive, optional
+    && (w.server_pid === undefined || (Number.isSafeInteger(w.server_pid) && (w.server_pid as number) > 0)) // additive, optional
+    && (w.ownership === undefined || w.ownership === "unproven");
 }
 
 /** `<role short>-<task short>`: lower-case, [a-z0-9-], ≤40 chars. null when nothing usable is left. Pure. */
@@ -304,7 +308,7 @@ export async function startWorker(a: StartArgs, d: WorkerDeps): Promise<StartRes
   try { const j = JSON.parse(ls.stdout) as { sessions?: Array<{ name?: unknown }> }; if (!failed(ls) && Array.isArray(j.sessions)) existing = j.sessions.map((x) => String(x.name)); } catch { /* below */ }
   if (existing === null) return { state: "refused", reason: "invalid", detail: "herdr session list unreadable: cannot prove the worker name is free" };
   if (existing.includes(name)) return { state: "refused", reason: "name-taken", detail: `a herdr session named ${name} already exists; it is not ours, left untouched` };
-  const placeholder: Worker = { name, herdr_session: name, pane: 0, kind: "tui", started_at: d.now(), stopped_at: null, state: "starting" };
+  const placeholder: Worker = { name, herdr_session: name, pane: 0, kind: "tui", started_at: d.now(), stopped_at: null, state: "starting", ownership: "unproven" };
   const slot = reserveSlot(d.home, a.parentSid, placeholder, d);
   if (slot) return { state: "refused", reason: slot.reason, detail: slot.detail };
   return launch(a, d, placeholder, perm);
@@ -350,7 +354,7 @@ async function launch(a: StartArgs, d: WorkerDeps, ph: Worker, perm: string[]): 
   };
   const fail = async (step: string, detail: string): Promise<StartResult> => {
     const proven = await undo();
-    try { settle(d.home, a.parentSid, ph, proven ? { state: "stopped", stopped_at: d.now(), ...(pane !== undefined ? { pane } : {}) } : { state: "stopping", ...(pane !== undefined ? { pane } : {}) }); }
+    try { settle(d.home, a.parentSid, ph, proven ? { state: "stopped", stopped_at: d.now(), ownership: undefined, ...(pane !== undefined ? { pane } : {}) } : { state: "stopping", ...(owned ? { server_pid: ownPid, ownership: undefined } : {}), ...(pane !== undefined ? { pane } : {}) }); }
     catch (e) { undone.push(`record: ${(e as Error).message}`); }
     if (!proven) undone.push("cleanup NOT proven: the entry stays \"stopping\" and keeps its capacity");
     return { state: "failed", step, detail, undone };
@@ -385,7 +389,7 @@ async function launch(a: StartArgs, d: WorkerDeps, ph: Worker, perm: string[]): 
   try { block = (JSON.parse(sb.stdout) as { block?: unknown }).block; } catch { /* below */ }
   if (failed(sb) || !Number.isSafeInteger(block) || (block as number) <= 0) return fail("tern split", failed(sb) ?? "no numeric block id in the reply");
   pane = block as number;
-  try { settle(d.home, a.parentSid, ph, { pane, state: "live", server_pid: ownPid }); }
+  try { settle(d.home, a.parentSid, ph, { pane, state: "live", server_pid: ownPid, ownership: undefined }); }
   catch (e) { return fail("record", (e as Error).message); }
   return { state: "ok", pane, herdr_session: name };
 }
@@ -412,6 +416,9 @@ export async function stopWorkerAfterRead(seatSid: string, w: Worker, d: WorkerD
     try { setWorkerState(d.home, seatSid, w, state, stopped_at); return true; }
     catch (e) { steps.push({ step: `record ${state}`, ok: false, detail: (e as Error).message }); return false; }
   };
+  // MTB-WORKER-OWN (retry): an entry whose start never proved ownership authorizes NOTHING by name — not even the legacy path. It
+  // stays "stopping" (keeps its capacity) and the caller is told; the session it names may be someone else's.
+  if (w.ownership === "unproven") return { state: "unknown", name, steps, reason: `ownership-unproven: ${w.herdr_session} was never proven ours; nothing stopped or deleted, entry kept` };
   // FIRST, and it is also the INSTANCE CHECK (MTB-SV-STOP-INSTANCE): under the lock, the exact instance we read (herdr_session +
   // pane + started_at) must still be recorded. If a newer instance took the name meanwhile, ZERO actions — never stop or delete it.
   if (!record("stopping", null)) return { state: "unknown", name, steps, reason: `instance-mismatch: ${w.herdr_session}:${w.pane}:${w.started_at} is no longer the recorded instance (or the record could not be written); nothing stopped` };
@@ -437,8 +444,8 @@ export async function stopWorkerAfterRead(seatSid: string, w: Worker, d: WorkerD
   if (ownerOk && gone) await step("herdr session delete", d.herdr, ["session", "delete", w.herdr_session]);
   else steps.push({ step: "herdr session delete", ok: false, detail: "skipped: the session is not proven ours / still running" });
   // CLEANUP: "stopped" only when every step is proven; otherwise the entry stays "stopping" (keeps its capacity, re-stoppable)
-  const proven = steps.every((s) => s.ok);
-  if (proven) record("stopped", d.now());
+  // MTB-SV-STOP-COMMIT: "stopped" also needs the registry to say so; a failed final write leaves the entry "stopping" ⇒ partial
+  const proven = steps.every((s) => s.ok) && record("stopped", d.now());
   return { state: proven ? "stopped" : "partial", name, steps };
 }
 
