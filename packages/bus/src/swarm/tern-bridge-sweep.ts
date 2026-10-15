@@ -14,14 +14,13 @@
  *   ⑤ FC-2 three-state: if tern is unavailable (spawn error, timeout, non-zero exit, socket refused) the tick is UNKNOWN: it logs one
  *      line and does NOTHING else. UNKNOWN is never read as "bridge dead" — reload is only ever triggered by a POSITIVE stall signal
  *      read from the bridge's own files while tern itself answered.
- * Arm sequence (bridge r8 @f5b5ada splits arming so each hook makes ONE tern.carly call): `arm` (= arm-scan: lists prior patrols
- *   into kv) → read sentinel.json step/pending_cancel → `arm-cancel` once per pending id until pending_cancel=0 → `arm-schedule` →
- *   assert sentinel.json scheduled=true. Each step has its own tern timeout. Any step failing (tern UNKNOWN, unreadable status,
- *   cancel not making progress, schedule refused) STOPS the sequence there — no half sequence is continued — and is logged to the
- *   reload audit. The same definition is used by #1034's recovery chain.
+ * Arm sequence = bridge r9/r10 protocol (see armSequence): arm-scan (read-only, plugin) → arm-cancel per extra id via kv
+ *   bridge.arm_cancel_id (plugin) → arm-schedule.sh (swarm CLI) → re-scan must say count==1. Any failed step STOPS there (no half
+ *   sequence) and is written to the reload audit. Same definition as #1034 r2's recovery chain.
+ * Orphans + control-plane GC: tern-orphan-sweep.ts, run from this step every 60s (record-driven; never touches unregistered sessions).
  * Pure core + injected IO (tern runner, file reads, clock, log), so the whole call sequence is offline-testable.
  */
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -49,11 +48,15 @@ export type TernRun = (args: string[]) => TernResult;
 export type Mirror = { tick: number; vm: string } | null;
 export type PendingReq = { name: string; ageMs: number };
 
-export type ArmStatus = { step: string | null; pendingCancel: number | null; scheduled: boolean; error: string | null } | null;
+/** sentinel.json as bridge r9 (@613e691) writes it. `count`/`ids` only on step "scanned"; null fields = absent/invalid. */
+export type ArmStatus = { step: string | null; count: number | null; ids: number[] | null; id: number | null; error: string | null } | null;
 
 export type BridgeIO = {
   tern: TernRun;
   readSentinel: () => ArmStatus;         // sentinel.json, or null (absent/torn/unparseable)
+  clearSentinel: () => void;             // delete sentinel.json so only the NEXT write can answer (no stale reads)
+  setCancelId: (id: number) => boolean;  // kv bridge.arm_cancel_id = id (plugin kv.json, atomic); false on failure
+  schedule: () => { code: number; detail: string }; // arm-schedule.sh: 0 scheduled+verified, 2 refused (count>0), else failed
   readMirror: () => Mirror;              // agents.json tick+vm, or null (absent/torn/unparseable)
   pendingRequests: () => PendingReq[];   // requests/*.json with their age
   nowMs: () => number;
@@ -77,31 +80,51 @@ export function initialBridgeState(): BridgeState {
 export type TickOutcome = "disabled" | "throttled" | "unknown" | "ok" | "rearmed" | "arm-failed" | "reloaded" | "reload-debounced"
   | "reload-failed";
 
-/** The r8 arm sequence. ok=false ⇒ stopped at the named step (nothing after it ran). */
+/** Bridge r9 arm protocol (#1036 r9 / coordinator #1033 r3 ruling). Listing + cancelling stay in the plugin (tern 0.8.3's `ctl carly
+ *  task` has add but no list/cancel); scheduling is the swarm's arm-schedule.sh (`ctl carly task add`, # escaped, verified by a re-scan).
+ *    scan: clear sentinel.json → `arm-scan` → require a fresh step "scanned" with integer count (ctl ok proves nothing)
+ *    count>1: for each extra id: kv bridge.arm_cancel_id=id → clear → `arm-cancel` → require step "cancelled" for that id → re-scan;
+ *             cancel-failed / cancel-unknown / cancel-done-kv-stuck / no answer ⇒ STOP (the plugin keeps the obligation)
+ *    count==0: arm-schedule.sh (it re-scans itself and accepts only count==1) → our own re-scan must also say count==1
+ *    count==1: already armed (idempotent)
+ *  Any stop ⇒ ok=false with the step named; nothing after it runs. */
 export function armSequence(io: BridgeIO): { ok: boolean; detail: string } {
   const stop = (where: string, why: string) => ({ ok: false, detail: `${where}: ${why}` });
-  const scan = run(io, "arm");
-  if (!scan.ok) return stop("arm(scan)", `tern ${scan.detail}`);
-  let s = io.readSentinel();
-  if (s === null || s.pendingCancel === null) return stop("arm(scan)", "sentinel.json unreadable or without pending_cancel");
-  if (s.error) return stop("arm(scan)", `bridge error: ${s.error}`);
+  const scan = (): { count: number; ids: number[] } | string => {
+    io.clearSentinel();
+    const r = run(io, "arm-scan");
+    if (!r.ok) return `tern ${r.detail}`;
+    const s = io.readSentinel();
+    if (s === null || s.step !== "scanned" || s.count === null) return `no fresh scan (step=${s?.step ?? "none"}${s?.error ? ` error=${s.error}` : ""})`;
+    return { count: s.count, ids: s.ids ?? [] };
+  };
+  let sc = scan();
+  if (typeof sc === "string") return stop("arm-scan", sc);
   let cancels = 0;
-  while (s.pendingCancel! > 0) {
-    if (cancels >= ARM_CANCEL_MAX) return stop("arm-cancel", `still ${s.pendingCancel} pending after ${cancels} cancels`);
-    const before = s.pendingCancel!;
+  while (sc.count > 1) {
+    if (cancels >= ARM_CANCEL_MAX) return stop("arm-cancel", `still ${sc.count} patrols after ${cancels} cancels`);
+    if (sc.ids.length !== sc.count) return stop("arm-cancel", `scan count ${sc.count} but ${sc.ids.length} ids`);
+    const victim = sc.ids[sc.ids.length - 1]!; // keep the first, cancel extras one at a time
+    if (!io.setCancelId(victim)) return stop("arm-cancel", `could not set kv bridge.arm_cancel_id=${victim}`);
+    io.clearSentinel();
     const c = run(io, "arm-cancel");
     if (!c.ok) return stop("arm-cancel", `tern ${c.detail}`);
+    const s = io.readSentinel();
+    if (s === null || s.step !== "cancelled" || s.id !== victim)
+      return stop("arm-cancel", `id ${victim} not confirmed (step=${s?.step ?? "none"}${s?.error ? ` error=${s.error}` : ""})`);
     cancels++;
-    s = io.readSentinel();
-    if (s === null || s.pendingCancel === null) return stop("arm-cancel", "sentinel.json unreadable or without pending_cancel");
-    if (s.pendingCancel >= before) return stop("arm-cancel", `no progress (pending_cancel ${before} -> ${s.pendingCancel})`);
+    const before = sc.count;
+    sc = scan();
+    if (typeof sc === "string") return stop("arm-scan(after cancel)", sc);
+    if (sc.count >= before) return stop("arm-cancel", `no progress (count ${before} -> ${sc.count})`);
   }
-  const sch = run(io, "arm-schedule");
-  if (!sch.ok) return stop("arm-schedule", `tern ${sch.detail}`);
-  s = io.readSentinel();
-  if (s === null) return stop("arm-schedule", "sentinel.json unreadable");
-  if (!s.scheduled) return stop("arm-schedule", `scheduled=false step=${s.step}${s.error ? ` error=${s.error}` : ""}`);
-  return { ok: true, detail: `cancelled ${cancels}, scheduled` };
+  if (sc.count === 1) return { ok: true, detail: cancels > 0 ? `cancelled ${cancels} extra, 1 patrol` : "already 1 patrol" };
+  const sch = io.schedule();
+  if (sch.code !== 0) return stop("arm-schedule.sh", `exit ${sch.code}: ${sch.detail}`);
+  sc = scan();
+  if (typeof sc === "string") return stop("arm-scan(verify)", sc);
+  if (sc.count !== 1) return stop("arm-scan(verify)", `count ${sc.count} after schedule (want 1)`);
+  return { ok: true, detail: `scheduled, verified 1 patrol${cancels ? `, cancelled ${cancels}` : ""}` };
 }
 
 const run = (io: BridgeIO, action: string): TernResult => io.tern(["ctl", "plugins", "run", `${ACTION}.${action}`]);
@@ -220,15 +243,40 @@ export function realSentinelReader(home: string): () => ArmStatus {
   return () => {
     try {
       const d = JSON.parse(readFileSync(path.join(bridgeDir(home), "sentinel.json"), "utf8")) as Record<string, unknown>;
-      if (typeof d !== "object" || d === null) return null;
-      const pc = d.pending_cancel;
-      return {
-        step: typeof d.step === "string" ? d.step : null,
-        pendingCancel: typeof pc === "number" && Number.isInteger(pc) && pc >= 0 ? pc : null,
-        scheduled: d.scheduled === true,
-        error: typeof d.error === "string" ? d.error : null,
-      };
+      if (typeof d !== "object" || d === null || Array.isArray(d)) return null;
+      const int = (v: unknown) => (typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : null);
+      const ids = Array.isArray(d.ids) && d.ids.every((x) => typeof x === "number" && Number.isInteger(x)) ? (d.ids as number[]) : null;
+      return { step: typeof d.step === "string" ? d.step : null, count: int(d.count), ids, id: int(d.id), error: typeof d.error === "string" ? d.error : null };
     } catch { return null; }
+  };
+}
+export function realClearSentinel(home: string): () => void {
+  return () => { try { unlinkSync(path.join(bridgeDir(home), "sentinel.json")); } catch { /* absent is fine */ } };
+}
+/** Plugin kv store (Tern: `<plugin data>/kv.json`, every VM re-reads it when it changes on disk). Read-modify-write via an exclusive
+ *  temp + rename. A kv.json that exists but cannot be parsed is NOT overwritten (false): we never destroy the plugin's other keys. */
+export function realCancelIdSetter(env: NodeJS.ProcessEnv = process.env): (id: number) => boolean {
+  const file = env.AGENTHOP_BRIDGE_KV
+    || path.join(homedir(), "Library", "Application Support", "Tern", "plugin-data", "agenthop-agents-bridge", "kv.json");
+  return (id) => {
+    let cur: Record<string, unknown> = {};
+    try { cur = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>; }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+    if (typeof cur !== "object" || cur === null || Array.isArray(cur)) return false;
+    const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      writeFileSync(tmp, JSON.stringify({ ...cur, "bridge.arm_cancel_id": id }, null, 2), { flag: "wx", mode: 0o600 });
+      renameSync(tmp, file);
+      return true;
+    } catch { try { unlinkSync(tmp); } catch { /* own temp only */ } return false; }
+  };
+}
+/** arm-schedule.sh runner. `bridgeDir` = the bridge checkout the dispatcher uses (AGENTHOP_BRIDGE_DIR, else repo tern/agenthop-agents-bridge). */
+export function realScheduler(env: NodeJS.ProcessEnv, bridgeDir: string): () => { code: number; detail: string } {
+  return () => {
+    const r = spawnSync("bash", [path.join(bridgeDir, "arm-schedule.sh")], { encoding: "utf8", timeout: 15_000, env });
+    if (r.error) return { code: -1, detail: String(r.error.message ?? r.error) };
+    return { code: r.status ?? -1, detail: ((r.stdout || "") + (r.stderr || "")).trim().slice(0, 200) };
   };
 }
 

@@ -18,7 +18,7 @@
 // env: AGENTHOP_TEAM, AGENTHOP_RELAY, SWARM_WORK_REPO (git URL / path), SWARM_CAP (3), SWARM_BUDGET_SEC (3480),
 //      SWARM_HANDOFF_LEAD_SEC (180), SWARM_LAUNCH (scripts/swarm-launch.sh), AH_HOME, SWARM_SELF.
 
-import { spawn, execSync } from "node:child_process";
+import { spawn, spawnSync, execSync } from "node:child_process";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync, statSync, lstatSync, unlinkSync, openSync, readSync, fstatSync, closeSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -85,7 +85,8 @@ import { writeConsoleProjection } from "../packages/bus/src/swarm/console-projec
 import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swarm/idle-explainer.js";
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
-import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
+import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
+import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realCancelIdSetter, realScheduler, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
 import { modelMarketEnabled } from "../packages/bus/src/swarm/model-market.js";
 import { pullModelMarket } from "../packages/bus/src/swarm/model-market-store.js";
 import { modelStaffingEnabled, taskFromNode, type StaffingTaskInput } from "../packages/bus/src/swarm/model-staffing.js";
@@ -1953,6 +1954,9 @@ async function main(): Promise<void> {
     tern: realTern(process.env),
     readMirror: realMirrorReader(HOME),
     readSentinel: realSentinelReader(HOME),
+    clearSentinel: realClearSentinel(HOME),
+    setCancelId: realCancelIdSetter(process.env),
+    schedule: realScheduler(process.env, process.env.AGENTHOP_BRIDGE_DIR || path.join(SCRIPTS_DIR, "..", "tern", "agenthop-agents-bridge")),
     pendingRequests: realPendingRequests(HOME, () => Date.now()),
     nowMs: () => Date.now(),
     sleep: sleepSync,
@@ -1965,7 +1969,25 @@ async function main(): Promise<void> {
       catch (e) { log(`tern-bridge audit write failed: ${e instanceof Error ? e.message : e}`); }
     },
   };
-  const runTernBridgeStep = (): void => { runTernBridgeTick(ternBridgeState, ternBridgeIO, ternBridgeEnabled()); };
+  // orphan sweep (#1033 r3, user rule "no leaks"): record-driven herdr-session cleanup + bridge gc.sh, every 60s, two-round debounce,
+  // UNKNOWN (herdr/tern/seat-shell unreadable) ⇒ zero actions. Same flag as the bridge sweep.
+  const orphanState = initialOrphanState();
+  const herdr = realHerdr(process.env);
+  const bridgeDirPath = process.env.AGENTHOP_BRIDGE_DIR || path.join(SCRIPTS_DIR, "..", "tern", "agenthop-agents-bridge");
+  const ternLs = (): string | null => {
+    const r = spawnSync(process.env.TERN_BIN || "tern", ["ls", "--json"], { encoding: "utf8", timeout: 3000 });
+    return r.error || r.status !== 0 ? null : r.stdout;
+  };
+  const orphanIO = {
+    seatRecords: realSeatRecords(HOME), herdrSessions: herdr.sessions, ternBlocks: realTernBlocks(ternLs),
+    herdrStop: herdr.stop, herdrDelete: herdr.del, markWorker: realMarkWorker(HOME), gc: realGc(process.env, bridgeDirPath),
+    ...realTmpFiles(HOME, () => Date.now()), nowMs: () => Date.now(), log, audit: ternBridgeIO.controlLog,
+  };
+  const runTernBridgeStep = (): void => {
+    if (!ternBridgeEnabled()) return;
+    runTernBridgeTick(ternBridgeState, ternBridgeIO, true);
+    runOrphanSweep(orphanState, orphanIO);
+  };
 
   // idle-root-cause explainer (北极星差距审计件① — the user's #1 activation is "why idle again?"). When the swarm has NO live
   // dispatched work (control-log kind:"wait" waits = 0) for N consecutive write-intervals, write a data-driven "why idle" one-line
