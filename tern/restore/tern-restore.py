@@ -12,17 +12,19 @@ Order of operations (nothing in Tern changes before steps 1-2 pass):
      `tern new tab`; the returned block id is then an obligation: wait (bounded) until it is listed, then rename (retried).
      A block started but not yet listed is reported pending; the next run finds it by argv and only renames it.
   5. assert from a fresh listing: each seat live exactly once, pinned model, tab = role.
-  6. presence + seat-shell: write ~/.agenthop/presence/<sid>.pid (agent pid under the block) and register the shell via
-     `scripts/seat-shell.ts set <sid> tern <pid>`. --check only asserts, writes nothing.
+  6. presence + seat-shell: `scripts/seat-presence.ts set <sid> <block> <tool>` (the one presence writer: resolves the agent pid,
+     writes under the shared per-sid lock), then `scripts/seat-shell.ts set <sid> tern <that pid>`. --check only asserts (reads
+     presence/<sid>.pid + .origin, no lock), writes nothing.
 Exit: 0 all OK, 1 assertion failed, 2 roster error, 3 inventory UNKNOWN.
-Env (tests): TERN_BIN, CLAUDE_JSON, RESTORE_PS (ps file: 'pid ppid command'), PRESENCE_DIR, SEAT_SHELL_CMD (default: repo tsx
-scripts/seat-shell.ts), RESTORE_WAIT_S (default 10).
+Env (tests): TERN_BIN, CLAUDE_JSON, RESTORE_PS (ps file: 'pid ppid command', --check only), AH_HOME (presence home), SEAT_SHELL_CMD (default:
+repo tsx scripts/seat-shell.ts), SEAT_PRESENCE_CMD (default: repo tsx scripts/seat-presence.ts), RESTORE_WAIT_S (default 10).
 """
 import json, os, re, shlex, subprocess, sys, time
 
 TERN = os.environ.get("TERN_BIN", "tern")
 CLAUDE_JSON = os.path.expanduser(os.environ.get("CLAUDE_JSON", "~/.claude.json"))
-PRESENCE_DIR = os.path.expanduser(os.environ.get("PRESENCE_DIR", "~/.agenthop/presence"))
+AH_HOME = os.path.expanduser(os.environ.get("AH_HOME") or "~")  # the same home seat-presence.ts writes under (it reads AH_HOME too)
+PRESENCE_DIR = os.path.join(AH_HOME, ".agenthop", "presence")
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WAIT_S = float(os.environ.get("RESTORE_WAIT_S", "10"))
 PENDING_DIR = os.path.expanduser(os.environ.get("RESTORE_PENDING_DIR", "~/.agenthop/swarm/tern-restore-pending"))
@@ -621,8 +623,8 @@ def seat_shell_set(sid, pid):
 # presence files (coordinator re-ruling, 2026-10-15): presence/<sid>.pid stays ONE line = the pid — every existing reader
 # (task-liveness readPid, shell-succession readPidDetailed, the installed hook's `kill -0 "$(cat …)"`) parses the WHOLE file as
 # one number, so a second line would make the seat unparseable. The writer's origin goes to a SIDECAR presence/<sid>.origin,
-# one line `origin=agent|bus ts=<epoch ms>`. Authority = the AGENT (host) pid. tern-restore writes origin=agent and may replace
-# a bus record; a missing .origin = the hook's bus process (old format). Each file is written by exclusive temp + rename.
+# one line `origin=agent|bus ts=<epoch ms>`. Authority = the AGENT (host) pid; a missing .origin = the hook's bus process (old
+# format). tern-restore never writes these files itself: seat-presence.ts set does (origin=agent, under the per-sid lock).
 def read_presence(f):
     """(pid|None, origin|None) for presence/<sid>.pid and its .origin sidecar. Raises OSError (not FileNotFoundError) when a
     file exists but cannot be read. origin None = no sidecar (the hook's bus writer, old format)."""
@@ -643,61 +645,6 @@ def read_presence(f):
     return pid, origin
 
 
-class PresenceBusy(Exception):
-    pass
-
-
-def presence_lock(sid, wait_s=2.0):
-    """SP-SV-RESTORE-LOCK: the per-sid presence lock of #1053 seat-presence.ts (holder-lock.ts protocol), so this writer and the TS
-    writers (bus daemon, SessionEnd, agenthop_tern) never interleave. Same artifacts: hold-intent presence/<sid>.lockd.hold.<token>
-    staged BEFORE the mkdir, lock dir presence/<sid>.lockd holding exactly one file named <token> = <pid>.<hex>. Returns the token;
-    raises PresenceBusy when not acquired by the deadline.
-    ponytail: acquire only, no reclaim — a dead holder's residue makes this run report busy (FC-2: write nothing) and the next TS
-    acquirer reclaims it (it reclaims an ESRCH-dead token or intent, ours included). Add reclaim here if busy shows up in practice."""
-    lock_dir = os.path.join(PRESENCE_DIR, f"{sid}.lockd")
-    deadline = time.time() + wait_s
-    while True:
-        token = f"{os.getpid()}.{os.urandom(6).hex()}"
-        intent = os.path.join(PRESENCE_DIR, f"{sid}.lockd.hold.{token}")
-        try:
-            os.close(os.open(intent, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-        except OSError:
-            intent = None
-        if intent:
-            try:
-                os.mkdir(lock_dir)
-                try:
-                    os.close(os.open(os.path.join(lock_dir, token), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-                    if os.listdir(lock_dir) == [token]:
-                        return token
-                except OSError:
-                    pass
-                presence_unlock(sid, token)  # not the sole owner (a reclaimer raced in): back off, like holder-lock ②
-            except OSError:
-                try: os.remove(intent)
-                except OSError: pass
-        if time.time() >= deadline:
-            raise PresenceBusy(f"presence lock {lock_dir} held by another writer")
-        time.sleep(0.02)
-
-
-def presence_unlock(sid, token):
-    lock_dir = os.path.join(PRESENCE_DIR, f"{sid}.lockd")
-    try: os.remove(os.path.join(lock_dir, token))
-    except OSError: pass
-    try: os.rmdir(lock_dir)
-    except OSError: pass
-    try: os.remove(os.path.join(PRESENCE_DIR, f"{sid}.lockd.hold.{token}"))
-    except OSError: pass
-
-
-def write_atomic(path, text):
-    tmp = f"{path}.tmp-{os.getpid()}"
-    with open(tmp, "x") as h:
-        h.write(text)
-    os.replace(tmp, path)
-
-
 def pid_alive(pid):
     if not isinstance(pid, int) or pid <= 0:
         return False
@@ -710,30 +657,45 @@ def pid_alive(pid):
         return True
 
 
-def presence_one(seat, f, want, write):
-    """(line, None) or (None, fail) for one seat. With write=True the caller holds the presence lock."""
+def presence_check(seat, f, want):
+    """--check only (reads take no lock): (line, None) or (None, fail) for one seat."""
     try:
         have, origin = read_presence(f)
     except OSError as e:
         return None, f"presence unreadable: {e}"
     if have == want and origin == "agent":
         return f"presence: {seat['role']} ok pid {want}", None
-    if not write:
-        if have == want:  # right pid, no/other origin sidecar: correct for readers, worth a note
-            return f"presence: {seat['role']} ok pid {want} (origin {origin or 'bus/none'})", None
-        if origin in (None, "bus") and pid_alive(have):
-            # the hook's bus process (sidecar origin=bus, or no sidecar = old format) holds a LIVE pid: readers still see a
-            # live seat — a WARN, not a FAIL (coordinator ruling). A run replaces it with the agent pid.
-            return f"WARN: {seat['role']} presence pid {have} is the bus process (origin={origin or 'none'}), agent pid is {want}", None
-        return None, f"presence pid {have} != agent pid {want}"
+    if have == want:  # right pid, no/other origin sidecar: correct for readers, worth a note
+        return f"presence: {seat['role']} ok pid {want} (origin {origin or 'bus/none'})", None
+    if origin in (None, "bus") and pid_alive(have):
+        # the hook's bus process (sidecar origin=bus, or no sidecar = old format) holds a LIVE pid: readers still see a live
+        # seat — a WARN, not a FAIL (coordinator ruling). A run replaces it with the agent pid.
+        return f"WARN: {seat['role']} presence pid {have} is the bus process (origin={origin or 'none'}), agent pid is {want}", None
+    return None, f"presence pid {have} != agent pid {want}"
+
+
+def seat_presence_set(sid, block_id, tool):
+    """The ONE presence writer (#1053 scripts/seat-presence.ts set): it resolves the agent pid under the block itself (kernel exact
+    argv), then writes under the shared per-sid lock (re-reads .pid/.origin inside it, origin first). Contract: exit 0 = wrote|kept,
+    1 = refused / not exactly one agent, 2 = usage; stdout one JSON line {state, pid, was | reason}.
+    Returns (pid, line, None) on 0, else (None, None, fail)."""
+    cmd = os.environ.get("SEAT_PRESENCE_CMD")
+    argv = shlex.split(cmd) if cmd else [os.path.join(REPO, "node_modules", ".bin", "tsx"), os.path.join(REPO, "scripts", "seat-presence.ts")]
+    env = {**os.environ, "AH_HOME": AH_HOME}
     try:
-        # ORDER (same as #1053 seat-presence.ts): .origin first, then .pid — a reader that sees the new pid also sees
-        # its origin; a crash between the two leaves the old pid with an agent origin, which --check flags as a FAIL.
-        write_atomic(f[: -len(".pid")] + ".origin", f"origin=agent ts={int(time.time() * 1000)}\n")
-        write_atomic(f, str(want))  # ONE line: what every existing reader parses
-        return f"presence: {seat['role']} wrote pid {want} (was {have})", None
-    except OSError as e:
-        return None, f"presence write failed: {e}"
+        r = subprocess.run([*argv, "set", sid, str(block_id), tool], capture_output=True, text=True, timeout=30, env=env)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, None, f"seat-presence set failed to run: {e}"
+    out = (r.stdout or "").strip().splitlines()
+    try:
+        res = json.loads(out[-1]) if out else None
+    except ValueError:
+        res = None
+    if r.returncode == 0 and isinstance(res, dict) and res.get("state") in ("wrote", "kept") \
+            and isinstance(res.get("pid"), int) and not isinstance(res.get("pid"), bool) and res["pid"] > 0:
+        return res["pid"], res, None
+    why = (res or {}).get("reason") if isinstance(res, dict) else None
+    return None, None, f"seat-presence set rc={r.returncode}: {why or (r.stderr or '').strip() or (r.stdout or '').strip() or 'no output'}"
 
 
 def presence(roster, write):
@@ -743,31 +705,25 @@ def presence(roster, write):
         mine = seat_blocks(inv, seat)
         if len(mine) != 1:
             continue  # verify() reports missing/duplicate
-        want = agent_pid(mine[0][1]["id"], seat, table)
-        f = os.path.join(PRESENCE_DIR, seat["sid"] + ".pid")
+        bid = mine[0][1]["id"]
+        if write:
+            # SP-SV-RESTORE-LOCK: every presence write goes through the one TS writer and its lock; its resolved pid is the truth
+            # for the seat-shell registration too (restore's own ps view is only used by --check).
+            pid, res, fail = seat_presence_set(seat["sid"], bid, seat["tool"])
+            if fail:
+                fails.append((seat["role"], fail)); continue
+            lines.append(f"presence: {seat['role']} {res['state']} pid {pid} (was {res.get('was')})")
+            err = seat_shell_set(seat["sid"], pid)
+            if err:
+                fails.append((seat["role"], f"seat-shell set failed: {err}"))
+            continue
+        want = agent_pid(bid, seat, table)
         if want is None:
             fails.append((seat["role"], "presence: agent pid not found under block")); continue
-        token = None
-        if write:
-            # SP-SV-RESTORE-LOCK: decide AND write under the shared per-sid lock, re-reading .pid/.origin inside it — a decision
-            # from a read made outside the lock could publish into a SessionEnd that then deletes it.
-            try:
-                os.makedirs(PRESENCE_DIR, mode=0o700, exist_ok=True)
-                token = presence_lock(seat["sid"])
-            except (OSError, PresenceBusy) as e:
-                fails.append((seat["role"], f"presence lock: {e} — not written")); continue
-        try:
-            line, fail = presence_one(seat, f, want, write)
-        finally:
-            if token:
-                presence_unlock(seat["sid"], token)
+        line, fail = presence_check(seat, os.path.join(PRESENCE_DIR, seat["sid"] + ".pid"), want)
         if fail:
             fails.append((seat["role"], fail)); continue
         lines.append(line)
-        if write:
-            err = seat_shell_set(seat["sid"], want)
-            if err:
-                fails.append((seat["role"], f"seat-shell set failed: {err}"))
     return lines, fails
 
 
