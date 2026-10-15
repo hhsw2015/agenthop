@@ -1,0 +1,335 @@
+/**
+ * Orphan sweep (#1033 r3; user rule "no leaks", coordinator ruling: RECORD-DRIVEN). Runs every ORPHAN_EVERY_MS from the tern-bridge
+ * sweep step. Three classes:
+ *   ① a herdr session REGISTERED in a seat-shell record (workers[].herdr_session) whose worker is state "stopped" (or "orphan")
+ *      but the herdr session still exists ⇒ SIGTERM that record's server_pid — only when server_pid is the sole holder of the
+ *      session's herdr.sock and no newer active record holds the name (r11/r12: names are reused, so nothing is stopped by name).
+ *      The session DIRECTORY is never deleted automatically (r13: herdr has no instance-bound delete); a dir whose socket no process
+ *      holds is reported once per instance (pane + started_at + server_pid) with the manual `herdr session delete <name>`.
+ *   ② a seat-shell worker in state "live" whose Tern block (workers[].pane) is gone from `tern ls --json` ⇒ mark the record
+ *      "orphan" (+stopped_at), then ① applies to its herdr session on the following confirmations. "starting" (no block yet,
+ *      pane 0) is never judged; a persisting "stopping" is reported as a possible leak, never marked or deleted (#1034 r3).
+ *   ③ control-plane files: the bridge's gc.sh (results/requests/tmp/quarantine TTLs; r12 adds requests_held, r15 adds
+ *      mode=<octal> and an exit-1 `unsafe_mode` line). Parsed by key: a nonzero COUNT field is audited; mode is not a count;
+ *      exit 1 (unreadable or unsafe_mode) is UNKNOWN, logged, never success. Plus mirror-phase.json / diag.json older than 1h.
+ * Never touched: the herdr session "default", and ANY herdr session that no seat-shell record ever registered (a name shaped like
+ * `<role>-<task>` is only a second check, never a reason). Seat-shell schema (coordinator, pinned 2026-10-15):
+ *   ~/.agenthop/swarm/seat-shell/<sid>.json  { …, workers: [{ name, herdr_session, pane, kind:"tui", started_at, stopped_at, state }] }
+ *   pane = Tern block id as a NUMBER; started_at / stopped_at = epoch ms numbers (stopped_at null while live). Strict: a pane of any
+ *   other type is a schema violation (logged) and the worker is never judged orphan.
+ * Debounce: an orphan is acted on only when the SAME candidate was seen on two consecutive rounds. FC-2: if herdr or tern cannot be
+ * read this round ⇒ UNKNOWN ⇒ zero actions (and the two-round memory is cleared, so an unknown round can never count as a "yes").
+ * Each action writes one line to the reload audit (same log as the bridge sweep). Pure core + injected IO.
+ */
+import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { isWorker, realWorkerDeps, type Worker as RecordedWorker } from "../tern-workers.js";
+import { updateSeatShell } from "./seat-shell-record.js";
+
+export const ORPHAN_EVERY_MS = 60_000;
+export const TMP_TTL_MS = 3_600_000;
+const NAME_SHAPE = /^[a-z0-9]+-[a-z0-9][a-z0-9-]*$/i; // `<role>-<task>`: a second check only
+
+export type Worker = { name?: unknown; herdr_session?: unknown; pane?: unknown; kind?: unknown; started_at?: unknown; stopped_at?: unknown; state?: unknown; server_pid?: unknown; ownership?: unknown };
+export type SeatRecord = { sid: string; workers: Worker[] };
+
+export type OrphanIO = {
+  seatRecords: () => SeatRecord[] | null;              // null = seat-shell dir unreadable (UNKNOWN); [] = none
+  herdrSessions: () => string[] | null;                // null = herdr unreachable (UNKNOWN)
+  ternBlocks: () => Set<number> | null;                // live block ids from tern ls --json; null = UNKNOWN
+  /** pids holding the herdr session's herdr.sock (lsof); null = cannot observe. TBS-SV-NAME-REUSE: the proof of WHICH server a
+   *  session name currently belongs to — the name alone is not, because a later start may reuse it. */
+  socketOwners: (name: string) => number[] | null;
+  /** SIGTERM exactly this pid (the record's verified server) — never a by-name `herdr server stop`, which hits whoever owns the
+   *  session's socket at that moment (TBS-SV-NAME-REUSE probe/action gap). */
+  signalPid: (pid: number) => boolean;
+  /** Wait (bounded) until `pid` is gone. true = it exited; false = still alive or unknown at the deadline. */
+  waitPidGone: (pid: number) => boolean;
+  /** Mark ONE worker instance orphan. `inst` = the instance seen on both rounds (pane + started_at); the writer re-reads the record
+   *  and changes it only if the same instance is still there (a restarted worker with the same name is a different instance). */
+  markWorker: (sid: string, herdrSession: string, inst: { pane: number; startedAt: unknown }, state: "orphan", stoppedAt: number) => boolean;
+  /** TBS-STATE-COMMIT: run `act` only while the record still holds the same instance (herdr_session + pane + started_at) in one of
+   *  `states`, with that state held for the whole of `act` (real IO: inside the seat-shell lock). false = not run (the instance
+   *  moved to another state, is gone, or cannot be read). A state seen at collection time is never enough by itself. */
+  whileInstance: (sid: string, herdrSession: string, inst: { pane: unknown; startedAt: unknown }, states: readonly string[], act: () => void) => boolean;
+  gc: () => { code: number; line: string };            // bridge gc.sh: exit 1 = control dir unreadable = UNKNOWN
+  tmpFiles: () => Array<{ name: string; ageMs: number }>; // mirror-phase.json / diag.json with age
+  removeTmp: (name: string) => boolean;
+  nowMs: () => number;
+  log: (l: string) => void;
+  audit: (l: string) => void;
+};
+
+export type OrphanState = { lastRunMs: number; seen: Set<string>; reported: Set<string> };
+export function initialOrphanState(): OrphanState { return { lastRunMs: -Infinity, seen: new Set(), reported: new Set() }; }
+
+const str = (v: unknown): string | null => (typeof v === "string" && v !== "" ? v : null);
+/** Tern block id from a worker record. Schema (coordinator, 2026-10-15): pane is a NUMBER. Strict on purpose: accepting a numeric
+ *  string too would let a wrongly-typed writer go unnoticed forever. Anything else ⇒ null ⇒ cannot prove the block is gone ⇒ the
+ *  worker is never marked orphan, and the caller logs a schema-violation line so the bad record is visible. */
+export function paneId(v: unknown): number | null {
+  return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null;
+}
+
+/** One orphan round. Returns the candidate keys acted on (for tests). */
+export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; unknown: boolean; acted: string[] } {
+  const now = io.nowMs();
+  if (now - st.lastRunMs < ORPHAN_EVERY_MS) return { ran: false, unknown: false, acted: [] };
+  st.lastRunMs = now;
+
+  // ③ control-plane files first: independent of herdr/tern reachability.
+  const g = io.gc();
+  // exit 1 = UNKNOWN, nothing done: control dir unreadable, or (r15) `gc: unsafe_mode mode=…` — group/other-writable dir
+  if (g.code !== 0) io.log(`orphan-sweep: gc UNKNOWN${/unsafe_mode/.test(g.line) ? " — anomaly: control dir is group/other-writable" : ""} (${g.line})`);
+  // audit only when a gc COUNT field is nonzero. Parse by key: r15 added mode=<octal> (e.g. mode=0755), which is not a count.
+  else if (/\b(results|requests_quarantined|requests_held|tmp|quarantine_expired)=[1-9]/.test(g.line)) io.audit(`orphan-sweep ${g.line}`);
+  // r13: `skipped=<dir>(why),...` = a managed subdir was a symlink / outside the control dir and was NOT cleaned — an anomaly
+  const skipped = g.code === 0 ? /\bskipped=(\S+)/.exec(g.line) : null;
+  if (skipped) io.log(`orphan-sweep: gc anomaly — not cleaned: ${skipped[1]}`);
+  for (const f of io.tmpFiles()) {
+    if (f.ageMs > TMP_TTL_MS && io.removeTmp(f.name)) io.audit(`orphan-sweep removed stale ${f.name} (${Math.round(f.ageMs / 60000)}min)`);
+  }
+
+  const recs = io.seatRecords();
+  const sessions = io.herdrSessions();
+  const blocks = io.ternBlocks();
+  if (recs === null || sessions === null || blocks === null) {
+    io.log(`orphan-sweep: UNKNOWN (${recs === null ? "seat-shell " : ""}${sessions === null ? "herdr " : ""}${blocks === null ? "tern" : ""}unreadable) — no action`);
+    st.seen.clear();
+    return { ran: true, unknown: true, acted: [] };
+  }
+  const workers = recs.flatMap((r) => r.workers.map((w) => ({ sid: r.sid, w })));
+  if (workers.length === 0) {
+    io.log("orphan-sweep: no registered herdr sessions");
+    st.seen.clear();
+    return { ran: true, unknown: false, acted: [] };
+  }
+
+  const live = new Set(sessions);
+  const candidates: Array<{ key: string; act: () => void }> = [];
+  for (const { sid, w } of workers) {
+    const hs = str(w.herdr_session);
+    const state = str(w.state);
+    if (hs === null || hs === "default" || !NAME_SHAPE.test(hs)) continue; // second check only; never a reason to act
+    // #1034 r3 contract: "starting" = a placeholder written before any herdr/Tern resource exists (pane 0 = no block yet) — never
+    // judged. "stopping" that persists may be a leaked resource whose cleanup could not be proven: REPORT only, never mark it
+    // orphan (an orphan record would be stopped+deleted on later rounds) and never delete it.
+    if (state === "starting") continue;
+    if (state === "stopping") {
+      const key = `stopping:${sid}:${hs}:${JSON.stringify(w.pane ?? null)}:${JSON.stringify(w.started_at ?? null)}`;
+      candidates.push({ key, act: () => io.audit(`orphan-sweep: worker ${hs} (seat ${sid.slice(0, 8)}, pane ${JSON.stringify(w.pane ?? null)}) still "stopping" — possible leak, reported only (not marked, not deleted)`) });
+      continue;
+    }
+    // ② live record whose Tern block vanished ⇒ mark orphan (two rounds)
+    const pane = paneId(w.pane);
+    if (state === "live" && pane === null)
+      io.log(`orphan-sweep: schema-violation seat ${sid.slice(0, 8)} worker ${hs}: pane ${JSON.stringify(w.pane)} is not a number — not judged`);
+    if (state === "live" && pane !== null && !blocks.has(pane)) {
+      // TBS-ORPHAN-GENERATION: the confirmation key names the INSTANCE (pane + started_at), not only the name, so a new
+      // instance under the same session name starts its own two-round count instead of inheriting the old one's.
+      candidates.push({ key: `mark:${sid}:${hs}:${pane}:${JSON.stringify(w.started_at ?? null)}`, act: () => {
+        if (io.markWorker(sid, hs, { pane, startedAt: w.started_at ?? null }, "orphan", now)) io.audit(`orphan-sweep marked ${hs} orphan (seat ${sid.slice(0, 8)}, block ${pane} gone)`);
+        else io.log(`orphan-sweep: could not mark ${hs} orphan`);
+      } });
+      continue;
+    }
+    // ① stopped/orphan record whose herdr session still exists ⇒ stop + delete (two rounds) — but ONLY the server this record
+    // started. TBS-SV-NAME-REUSE: names are reused (A stops, B starts the same role-task), so a historical entry proves nothing about
+    // the server now behind the name. It acts only when it is proven (#1034 r5 server_pid, not "unproven"), that pid is the sole
+    // holder of the session's herdr.sock right now, and no other record holds the name in an active state. Anything else ⇒ zero
+    // herdr actions, record kept (an old stopped entry is history, not a licence).
+    if ((state === "stopped" || state === "orphan") && live.has(hs)) {
+      const spid = typeof w.server_pid === "number" && Number.isSafeInteger(w.server_pid) && w.server_pid > 0 ? w.server_pid : null;
+      const newer = workers.some((o) => o.w !== w && o.w.herdr_session === hs && ["starting", "live", "stopping"].includes(str(o.w.state) ?? ""));
+      if (spid === null || w.ownership !== undefined || newer) {
+        io.log(`orphan-sweep: herdr session ${hs} (seat ${sid.slice(0, 8)}, record ${state}) not proven to be this record's server `
+          + `(${newer ? "a newer active record holds the name" : spid === null ? "no server_pid" : "ownership unproven"}) — no action, record kept`);
+        continue;
+      }
+      candidates.push({ key: `kill:${sid}:${hs}:${JSON.stringify(w.pane ?? null)}:${JSON.stringify(w.started_at ?? null)}:${spid}`, act: () => {
+        let line = "", skipped = "";
+        const ran = io.whileInstance(sid, hs, { pane: w.pane ?? null, startedAt: w.started_at ?? null }, ["stopped", "orphan"], () => {
+          const owners = io.socketOwners(hs); // at the commit point, inside the lock
+          if (owners !== null && owners.length === 0) { skipped = "leftover"; return; } // no process holds the socket: only a dir is left
+          if (owners === null || owners.length !== 1 || owners[0] !== spid) {
+            skipped = owners === null ? "socket owner unobservable" : `socket held by ${owners.join(",")}, not ${spid}`;
+            return;
+          }
+          // terminate the verified INSTANCE (its pid), never "whoever owns the name now". The session DIRECTORY is never deleted
+          // here: herdr's delete is by name and nothing ties it to an instance (a server created between any check and the
+          // removal would lose its socket and metadata). It is reported once below, with the manual command.
+          const signalled = io.signalPid(spid);
+          const exited = signalled && io.waitPidGone(spid);
+          line = `orphan-sweep herdr server ${spid} of session ${hs} (seat ${sid.slice(0, 8)}, record ${state}): signal=${signalled} exited=${exited}`;
+        });
+        if (!ran) io.log(`orphan-sweep: ${hs} (seat ${sid.slice(0, 8)}) is no longer this stopped/orphan instance — candidate dropped, record kept`);
+        else if (skipped === "leftover") {
+          // once per INSTANCE (the full identity sameInstance uses, + server_pid): a new generation under the same seat/name/pid
+          // is a different instance and gets its own reminder
+          const rk = `left:${sid}:${hs}:${JSON.stringify(w.pane ?? null)}:${JSON.stringify(w.started_at ?? null)}:${spid}`;
+          if (!st.reported.has(rk)) {
+            st.reported.add(rk);
+            io.audit(`orphan-sweep: herdr session dir ${hs} left behind (seat ${sid.slice(0, 8)}, server ${spid}: no process holds its socket) — not deleted automatically `
+              + `(a by-name delete could hit a server started under the same name); if nothing should run as ${hs}: herdr session delete ${hs}`);
+          }
+        }
+        else if (skipped) io.log(`orphan-sweep: herdr session ${hs} (seat ${sid.slice(0, 8)}) is not this record's server (${skipped}) — no action, record kept`);
+        else io.audit(line);
+      } });
+    }
+  }
+  const acted: string[] = [];
+  const next = new Set<string>();
+  for (const c of candidates) {
+    if (st.seen.has(c.key)) { c.act(); acted.push(c.key); }
+    else next.add(c.key); // first sighting: remember, act only if it is still an orphan next round
+  }
+  st.seen = next;
+  return { ran: true, unknown: false, acted };
+}
+
+// ---------------- real IO ----------------
+export function realSeatRecords(home: string): () => SeatRecord[] | null {
+  const dir = path.join(home, ".agenthop", "swarm", "seat-shell");
+  return () => {
+    let names: string[];
+    try { names = readdirSync(dir).filter((n) => n.endsWith(".json")); }
+    catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? [] : null; }
+    const out: SeatRecord[] = [];
+    for (const n of names) {
+      try {
+        const d = JSON.parse(readFileSync(path.join(dir, n), "utf8")) as unknown;
+        if (typeof d !== "object" || d === null || Array.isArray(d)) return null;
+        const ws = (d as { workers?: unknown }).workers;
+        if (ws === undefined) { out.push({ sid: n.slice(0, -5), workers: [] }); continue; } // no workers field = none registered
+        // TBS-ORPHAN-SHAPE: a workers field that is not an array, or an entry that is not an object, is a bad carrier ⇒ UNKNOWN
+        if (!Array.isArray(ws) || ws.some((w) => typeof w !== "object" || w === null || Array.isArray(w))) return null;
+        out.push({ sid: n.slice(0, -5), workers: ws as Worker[] });
+      } catch { return null; } // one unreadable record = we cannot prove which sessions are registered ⇒ UNKNOWN
+    }
+    return out;
+  };
+}
+
+/** Under the seat-shell lock (the shared writer updateSeatShell), find exactly the instance (herdr_session + pane + started_at) and
+ *  hand it to `fn` only if its CURRENT state is one of `states`. `fn` returns the replacement entry (written, rest of the record
+ *  untouched) or null (nothing written). Anything else — instance gone, another state, unreadable/bad record, busy lock — ⇒ false. */
+function underInstance(home: string, sid: string, hs: string, inst: { pane: unknown; startedAt: unknown }, states: readonly string[],
+  fn: (w: RecordedWorker) => RecordedWorker | null): boolean {
+  let matched = false;
+  const r = updateSeatShell(home, sid, (rec) => {
+    const ws = rec.workers;
+    if (!Array.isArray(ws) || !ws.every(isWorker)) return null;
+    const i = ws.findIndex((x) => x.herdr_session === hs && x.pane === inst.pane && x.started_at === inst.startedAt);
+    if (i < 0 || !states.includes(ws[i]!.state)) return null;
+    matched = true;
+    const next = fn(ws[i]!);
+    if (next === null) return null;
+    if (!isWorker(next)) throw new Error(`refusing to write a worker that breaks the schema: ${JSON.stringify(next)}`);
+    return { ...rec, workers: ws.map((x, j) => (j === i ? next : x)) };
+  });
+  return matched && r.state === "ok";
+}
+
+/** Mark one worker instance orphan, as a compare-and-set under the seat-shell lock: written only if that instance is STILL "live"
+ *  when the lock is held (TBS-STATE-COMMIT — a concurrent stopWorker that already wrote "stopping" wins, and the stale candidate is
+ *  dropped). Only state + stopped_at change. A re-published instance, a busy lock or an unreadable record ⇒ false (not marked). */
+export function realMarkWorker(home: string): OrphanIO["markWorker"] {
+  return (sid, hs, inst, state, stoppedAt) => {
+    try { return underInstance(home, sid, hs, inst, ["live"], (w) => ({ ...w, state, stopped_at: stoppedAt })); }
+    catch { return false; }
+  };
+}
+
+/** Run `act` (herdr stop + delete) while holding the seat-shell lock, only if the instance is still in `states`; nothing written.
+ *  ponytail: the lock is held across the herdr calls (≤ 2 × HERDR_TIMEOUT_MS); a writer that needs it meanwhile gets "busy" and
+ *  reports it (FC-2), never a torn state. Move to a claim state if that wait ever matters. */
+export function realWhileInstance(home: string): OrphanIO["whileInstance"] {
+  return (sid, hs, inst, states, act) => {
+    try { return underInstance(home, sid, hs, inst, states, () => { act(); return null; }); }
+    catch { return false; }
+  };
+}
+
+const HERDR_TIMEOUT_MS = 5_000;
+export function realSocketOwners(env: NodeJS.ProcessEnv = process.env): OrphanIO["socketOwners"] {
+  return realWorkerDeps(env).socketOwners; // the same lsof probe stopWorker uses (#1034 r5)
+}
+
+const PID_GONE_MS = 5_000;
+/** SIGTERM one pid; ESRCH/EPERM ⇒ false (not signalled). */
+export function realSignalPid(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false;
+  try { process.kill(pid, "SIGTERM"); return true; } catch { return false; }
+}
+/** Poll until `pid` is definitely gone (ESRCH), at most PID_GONE_MS. EPERM / any other probe answer = still there. */
+export function realWaitPidGone(pid: number, sleepMs: (ms: number) => void = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)): boolean {
+  const deadline = Date.now() + PID_GONE_MS;
+  for (;;) {
+    try { process.kill(pid, 0); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ESRCH") return true; }
+    if (Date.now() >= deadline) return false;
+    sleepMs(100);
+  }
+}
+
+export function realHerdr(env: NodeJS.ProcessEnv = process.env) {
+  const bin = env.HERDR_BIN || "herdr";
+  const run = (args: string[]) => spawnSync(bin, args, { encoding: "utf8", timeout: HERDR_TIMEOUT_MS, env });
+  return {
+    sessions: (): string[] | null => {
+      const r = run(["session", "list", "--json"]);
+      if (r.error || r.status !== 0) return null;
+      try {
+        const d = JSON.parse(r.stdout) as { sessions?: Array<{ name?: unknown }> };
+        if (!Array.isArray(d.sessions)) return null;
+        return d.sessions.map((s) => (typeof s.name === "string" ? s.name : "")).filter(Boolean);
+      } catch { return null; }
+    },
+  };
+}
+
+/** Live Tern block ids from `tern ls --json` output (ls returns null when tern did not answer). Any shape it cannot read ⇒ null. */
+export function realTernBlocks(ls: () => string | null): () => Set<number> | null {
+  return () => {
+    const out = ls();
+    if (out === null) return null;
+    try {
+      const d = JSON.parse(out) as { sessions?: unknown };
+      if (!Array.isArray(d.sessions)) return null;
+      const ids = new Set<number>();
+      for (const s of d.sessions as Array<{ tabs?: unknown }>) {
+        if (!Array.isArray(s.tabs)) return null;
+        for (const t of s.tabs as Array<{ blocks?: unknown }>) {
+          if (!Array.isArray(t.blocks)) return null;
+          for (const b of t.blocks as unknown[]) {
+            // TBS-ORPHAN-SHAPE: a block we cannot read (id not a positive integer, live not a bool) is NOT "absent": the whole
+            // listing is UNKNOWN, otherwise a malformed authoritative listing would look like "every block vanished".
+            if (typeof b !== "object" || b === null || Array.isArray(b)) return null;
+            const { id, live } = b as { id?: unknown; live?: unknown };
+            if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0 || typeof live !== "boolean") return null;
+            if (live) ids.add(id);
+          }
+        }
+      }
+      return ids;
+    } catch { return null; }
+  };
+}
+
+export function realTmpFiles(home: string, nowMs: () => number): Pick<OrphanIO, "tmpFiles" | "removeTmp"> {
+  const dir = path.join(home, ".agenthop", "tern-panes");
+  const NAMES = ["mirror-phase.json", "diag.json"];
+  return {
+    tmpFiles: () => NAMES.flatMap((n) => { try { return [{ name: n, ageMs: nowMs() - statSync(path.join(dir, n)).mtimeMs }]; } catch { return []; } }),
+    removeTmp: (n) => { if (!NAMES.includes(n)) return false; try { unlinkSync(path.join(dir, n)); return true; } catch { return false; } },
+  };
+}
+
+export function realGc(env: NodeJS.ProcessEnv, bridgeDir: string): OrphanIO["gc"] {
+  return () => {
+    const r = spawnSync("bash", [path.join(bridgeDir, "gc.sh")], { encoding: "utf8", timeout: 10_000, env });
+    if (r.error) return { code: -1, line: String(r.error.message ?? r.error) };
+    return { code: r.status ?? -1, line: (r.stdout || r.stderr || "").trim().split("\n").pop() ?? "" };
+  };
+}
