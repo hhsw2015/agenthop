@@ -111,11 +111,29 @@ local js0 = files[AGENTS] or ""
 ck("r4 ②: agents.json carries window (TERN_WINDOW_KEY) and a vm id", js0:find('"window":"win-A"', 1, true) ~= nil and js0:match('"vm":"[%x%-]+"') ~= nil)
 ck("r4 ③: agents.json carries tick_ms (previous tick's cost) and tick_ms_max", tonumber(js0:match('"tick_ms":([%d%.]+)')) ~= nil and tonumber(js0:match('"tick_ms_max":([%d%.]+)')) ~= nil)
 
+-- r5: phase breadcrumbs — a crumb is written BEFORE each segment, so a tick killed mid-segment leaves the segment's name behind
+local PHASEF = "/h/.agenthop/tern-panes/mirror-phase.json"
+ck("r5: mirror-phase.json written; last crumb of a completed tick = done with per-segment ms",
+  (files[PHASEF] or ""):find('"phase":"done"', 1, true) ~= nil and (files[PHASEF] or ""):find('"list_ms":', 1, true) ~= nil
+  and (files[PHASEF] or ""):find('"encode_ms":', 1, true) ~= nil and (files[PHASEF] or ""):find('"write_ms":', 1, true) ~= nil)
+do -- simulate a kill INSIDE list: the crumb must already name "list"
+  local realList = cx.agents.list
+  cx.agents.list = function() error("KILLED-IN-LIST") end
+  local okKill = pcall(function() commands["mirror"](cx) end)
+  -- pcall inside mirror swallows a Lua error from list, so emulate a hard stop by checking the crumb sequence instead:
+  cx.agents.list = function() local before = files[PHASEF]; cx._crumbAtList = before; return realList() end
+  commands["mirror"](cx)
+  ck("r5: the crumb names `list` while list is running (written before the segment)", (cx._crumbAtList or ""):find('"phase":"list"', 1, true) ~= nil)
+  cx.agents.list = realList
+  _ = okKill
+end
+ck("r5: agents.json carries phase_ms of the previous completed tick", (files[AGENTS] or ""):find('"phase_ms":', 1, true) ~= nil)
+
 -- ---- 2. the mirror chain never runs drain work: pumping it with pending requests claims nothing ----
 requests["s1.json"] = '{"op":"start","prompt":"p"}'
 requests["l1.json"] = '{"op":"stop"}'
 pumpMirror(); pumpMirror()
-ck("mirror chain: two timer ticks advance tick (3→4)", tickOf() == 4)
+ck("mirror chain: two timer ticks advance tick (5→6)", tickOf() == 6)
 ck("mirror chain: timer ticks claim NO requests and run NO start (drain only on its commands)",
   requests["s1.json"] ~= nil and requests["l1.json"] ~= nil and opCalls.start == 0 and opCalls.stop == 0)
 
@@ -132,7 +150,7 @@ requests["l2.json"] = '{"op":"stop"}'
 commands["drain"](cx)
 pumpMirror()
 ck("isolation: with drain-start disabled, drain still serves fast ops", files[RES .. "l2.json"] ~= nil)
-ck("isolation: with drain-start disabled, the mirror tick still advances (4→5)", tickOf() == 5)
+ck("isolation: with drain-start disabled, the mirror tick still advances (6→7)", tickOf() == 7)
 ck("isolation: the start request stays queued (UNKNOWN recovery is the swarm's: reload)", requests["s2.json"] ~= nil)
 
 -- ---- 5. slim mirror: only the swarm-read fields; the long command strings are dropped ----
@@ -142,7 +160,7 @@ ck("slim: agents.json drops command / agent_command / focused / program", not js
 
 -- ---- 6. manual mirror command advances the tick too ----
 commands["mirror"](cx)
-ck("mirror command: a manual kick advances tick (5→6)", tickOf() == 6)
+ck("mirror command: a manual kick advances tick (7→8)", tickOf() == 8)
 
 -- ---- 7. eval op (fast class): compiled with loadstring/load, called with cx, value returned ----
 requests["e1.json"] = '{"op":"eval","code":"return #cx.agents:list()"}'

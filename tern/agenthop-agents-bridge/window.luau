@@ -44,23 +44,47 @@ local WINDOW_KEY = tern.getenv("TERN_WINDOW_KEY")
 local ticks = 0
 local lastMs = nil -- r4 ③: wall cost (ms) of the PREVIOUS mirror tick, published so a >50ms tail is observable in agents.json itself
 local maxMs = 0
+local lastPhase = nil -- r5: previous completed tick's cumulative ms per segment
+-- r5 MEASURE (Reserve #1032-D): r4 moved the mirror to the timer hook AND the `mirror` command hook, and BOTH were killed within
+-- seconds — the cost is the mirror itself, not the hook. A post-hoc tick_ms can never record the killed tick (the kill lands before
+-- the write). So the mirror leaves a PHASE BREADCRUMB in its own small file BEFORE each segment: after a kill, mirror-phase.json
+-- names the segment that was running (list / slim / encode / write) and the elapsed ms per completed segment. Each breadcrumb write is
+-- tiny (<100 bytes); the segment it precedes is the one under suspicion. This is a diagnostic, not a fix.
+local PHASE = CTL .. "/mirror-phase.json"
+local function crumb(tick, phase, t0, done)
+  pcall(function()
+    tern.fs.write(PHASE, string.format('{"vm":"%s","tick":%d,"phase":"%s","at_ms":%.2f%s}', VM_ID, tick, phase, tern.now() - t0, done or ""))
+  end)
+end
 local function mirror(cx)
   local t0 = tern.now()
   ticks = ticks + 1
+  crumb(ticks, "list", t0)
   local ok, agents = pcall(function() return cx.agents:list() end)
+  local tList = tern.now() - t0
+  crumb(ticks, "slim", t0, string.format(',"list_ms":%.2f', tList))
+  local slimmed = ok and slim(agents) or tern.json.array({})
+  local tSlim = tern.now() - t0
   local payload = {
     ts = tern.now(),
     tick = ticks, -- liveness: advances on every mirror call (command-triggered, plus the best-effort timer chain)
     vm = VM_ID,
     window = WINDOW_KEY,
-    tick_ms = lastMs, -- cost of the previous tick (this tick's own write cannot include itself)
+    tick_ms = lastMs, -- cost of the previous COMPLETED tick (a killed tick never records; see mirror-phase.json)
     tick_ms_max = maxMs,
-    agents = ok and slim(agents) or tern.json.array({}),
+    phase_ms = lastPhase, -- previous completed tick's per-segment cumulative ms
+    agents = slimmed,
     error = (not ok) and tostring(agents) or nil,
   }
-  pcall(function() tern.fs.write(CTL .. "/agents.json", tern.json.encode(payload)) end)
+  crumb(ticks, "encode", t0, string.format(',"list_ms":%.2f,"slim_ms":%.2f', tList, tSlim))
+  local okEnc, text = pcall(function() return tern.json.encode(payload) end)
+  local tEnc = tern.now() - t0
+  crumb(ticks, "write", t0, string.format(',"list_ms":%.2f,"slim_ms":%.2f,"encode_ms":%.2f', tList, tSlim, tEnc))
+  if okEnc then pcall(function() tern.fs.write(CTL .. "/agents.json", text) end) end
   lastMs = tern.now() - t0
   if lastMs > maxMs then maxMs = lastMs end
+  lastPhase = { list = tList, slim = tSlim, encode = tEnc, write = lastMs }
+  crumb(ticks, "done", t0, string.format(',"list_ms":%.2f,"slim_ms":%.2f,"encode_ms":%.2f,"write_ms":%.2f', tList, tSlim, tEnc, lastMs))
 end
 
 local function answer(id, result)
