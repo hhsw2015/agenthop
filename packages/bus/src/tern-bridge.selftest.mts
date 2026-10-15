@@ -12,7 +12,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { realRun, ternCall, ternStatus, opClass, drainActionFor, checkRoleTitle, type TernDeps } from "./tern-bridge.js";
+import { realRun, ternCall, ternStatus, opClass, drainActionFor, checkRoleTitle, resumedSeat, type TernDeps } from "./tern-bridge.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
@@ -29,6 +29,7 @@ if [ "$MODE" = refused ]; then echo "error: connection refused" >&2; exit 1; fi
 case "$1 $2" in
   "plugin reload") echo reloaded > "$D/reloaded"; echo ok; exit 0;;
   "plugin list") echo '{"plugins":[{"id":"agenthop-agents-bridge","status":"ready"}],"problems":[]}'; exit 0;; # never a readiness probe
+  "process 4242") echo '{"pane":4242,"child":{"pid":9100}}'; exit 0;;
   "ls --json") echo '{"sessions":[{"tabs":[{"blocks":[{"id":1},{"id":2}]}]}]}'; exit 0;;
 esac
 if [ "$1 $2 $3" = "ctl plugins run" ]; then
@@ -78,6 +79,7 @@ function setup(mode: string) {
   let n = 0;
   const deps: TernDeps = {
     bin, ctlDir: path.join(dir, "ctl"), bridgeDir: path.join(dir, "bridge"), socket: path.join(dir, "sock"),
+    presenceHome: dir, alive: () => true,
     run: realRun(path.join(dir, "sock")),
     now: () => Date.now(),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -313,6 +315,24 @@ for (const smuggled of ["stop", "start"]) {
   writeFileSync(fake, readFileSync(fake, "utf8").replace(`echo '{"sessions":[{"tabs":[{"blocks":[{"id":1},{"id":2}]}]}]}'`, "echo '{}'"));
   const st2 = await ternStatus(s.deps, undefined);
   t("status with `tern ls` = {} ⇒ unknown, blocks NOT folded to 0", st2.state === "unknown" && st2.blocks === undefined)
+}
+
+// ---- #1053: presence/<sid>.pid for a started ACP seat ----
+{
+  const SID = "c5beaa7c-acbb-4637-a197-2e9014ae42f8";
+  t("resumedSeat: `tern acp claude --resume <sid>` and `--resume=<sid>`", resumedSeat(`/Applications/Tern.app/Contents/MacOS/tern acp claude --resume ${SID} --mode x`)?.sid === SID && resumedSeat(`tern acp codex --resume=${SID}`)?.tool === "codex")
+  t("resumedSeat: a fresh `tern acp claude` (no --resume) or a non-acp command has no sid", resumedSeat("tern acp claude --mode x") === null && resumedSeat(`claude --resume ${SID}`) === null && resumedSeat(undefined) === null)
+  const s = setup("answer");
+  const PS = ` 9100 1 /Applications/Tern.app/Contents/MacOS/tern acp claude --resume ${SID}\n 9101 9100 node /x/Tern/agents/claude/index.js\n 9102 9101 claude --output-format stream-json --resume=${SID}\n`;
+  const run0 = s.deps.run;
+  const deps = { ...s.deps, run: async (bin: string, a: string[], ms: number) => (bin === "ps" ? { code: 0, stdout: PS, stderr: "", timedOut: false } : run0(bin, a, ms)) };
+  const r = await ternCall("start", { prompt: "p", cwd: "/", command: `tern acp claude --resume ${SID}` }, 2000, deps);
+  t("ACP start with --resume <sid>: presence/<sid>.pid = the resolved claude pid (not the tern acp pid)", r.state === "ok" && (r as any).presence?.state === "wrote"
+    && readFileSync(path.join(s.dir, ".agenthop", "presence", `${SID}.pid`), "utf8") === "9102")
+  const r2 = await ternCall("start", { prompt: "p", cwd: "/" }, 2000, deps);
+  t("ACP start without a sid: presence pending with the reason, start still ok", r2.state === "ok" && (r2 as any).presence?.state === "pending")
+  const r3 = await ternCall("list", {}, 2000, deps);
+  t("non-start ops carry no presence field", r3.state === "ok" && (r3 as any).presence === undefined)
 }
 
 // ---- status three-state ----

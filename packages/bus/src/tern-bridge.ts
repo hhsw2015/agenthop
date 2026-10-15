@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import { scrubbedEnv } from "./spawn.js";
+import { parsePs, pidAlive, resolveAgentPid, writePresence, type PresenceResult } from "./swarm/seat-presence.js";
 
 /**
  * Native caller for the Tern A1 agents-bridge (tern/agenthop-agents-bridge, PROTOCOL.md). One call = the three manual steps a
@@ -71,6 +72,8 @@ export type TernDeps = {
   bin: string | undefined;
   ctlDir: string;
   bridgeDir: string; // the installed plugin dir (arm-schedule.sh lives there)
+  presenceHome: string; // where presence/<sid>.pid is written (the OS home, like the bus)
+  alive: (pid: number) => boolean;
   socket: string;
   run: (bin: string, args: string[], timeoutMs: number) => Promise<Run>;
   now: () => number;
@@ -115,6 +118,8 @@ export function defaultDeps(env: NodeJS.ProcessEnv = process.env): TernDeps {
     bin: ternBin(env),
     ctlDir: env.AGENTHOP_TERN_PANES ?? path.join(homedir(), ".agenthop", "tern-panes"),
     bridgeDir: env.AGENTHOP_BRIDGE_DIR ?? path.join(homedir(), "Library", "Application Support", "Tern", "plugins", PLUGIN_ID),
+    presenceHome: env.AH_HOME || homedir(),
+    alive: pidAlive,
     socket,
     run: realRun(socket),
     now: () => Date.now(),
@@ -156,7 +161,7 @@ export function unreachable(r: Run): string | undefined {
 }
 
 export type CallResult =
-  | { state: "ok"; id: string; ms: number; result: unknown; recovered?: boolean; republished?: boolean; pane?: number; placed?: string; placeError?: string; renamed?: string; renameError?: string }
+  | { state: "ok"; id: string; ms: number; result: unknown; recovered?: boolean; republished?: boolean; presence?: PresenceResult | { state: "pending"; reason: string }; pane?: number; placed?: string; placeError?: string; renamed?: string; renameError?: string }
   | { state: "UNKNOWN"; hold: true; id: string; ms: number; reason: string }
   | { state: "timeout"; id: string; ms: number; recovered: boolean; reason: string }
   | { state: "unknown"; id?: string; ms: number; reason: string };
@@ -333,6 +338,35 @@ async function nameStarted(d: TernDeps, op: string, result: unknown, title: stri
   return out;
 }
 
+/** The sid a started ACP block resumes, read from its own `command` (`tern acp <claude|codex> --resume <sid> …`). `tern acp` has no
+ *  --session-id, and a fresh `tern acp claude` carries no sid at all, so a start without --resume has no sid to write. Pure. */
+export function resumedSeat(command: unknown): { sid: string; tool: "claude" | "codex" } | null {
+  if (typeof command !== "string") return null;
+  const m = /(?:^|\s)(?:\S*\/)?tern\s+acp\s+(claude|codex)\b.*?\s--resume(?:=|\s+)([0-9A-Za-z-]{8,128})(?:\s|$)/.exec(command);
+  return m ? { tool: m[1] as "claude" | "codex", sid: m[2]! } : null;
+}
+
+/** #1053: after an ACP `start`, write presence/<sid>.pid for the new seat (the SessionStart hook never fires under ACP). Best-effort
+ *  and REPORTED: the start already happened, so a presence failure never becomes an error or a retry. The agent process appears a
+ *  little after the block, so the resolve is retried for a few seconds. */
+async function startedPresence(d: TernDeps, pane: number, args: Record<string, unknown>): Promise<PresenceResult | { state: "pending"; reason: string }> {
+  const seat = resumedSeat(args.command);
+  if (!seat) return { state: "pending", reason: "no sid known at start (tern acp has no --session-id; pass command \"tern acp <tool> --resume <sid>\" to bind presence now)" };
+  const deadline = d.now() + 8000;
+  for (;;) {
+    const pr = await d.run(d.bin!, ["process", String(pane), "--json"], CTL_TIMEOUT_MS);
+    let root: unknown;
+    try { root = (JSON.parse(pr.stdout) as { child?: { pid?: unknown } }).child?.pid; } catch { /* retry */ }
+    if (Number.isSafeInteger(root)) {
+      const ps = await d.run("ps", ["axo", "pid=,ppid=,command="], CTL_TIMEOUT_MS);
+      const pid = ps.code === 0 ? resolveAgentPid(root as number, seat.sid, seat.tool, parsePs(ps.stdout)) : null;
+      if (pid !== null) return writePresence(d.presenceHome, seat.sid, pid, d.alive);
+    }
+    if (d.now() >= deadline) return { state: "pending", reason: `no unique ${seat.tool} agent for ${seat.sid} under block ${pane} yet` };
+    await d.sleep(500);
+  }
+}
+
 /** "stale" iff agents.json is readable and older than STALE_MS; "fresh" if readable and newer; "unknown" if unreadable. Pure-ish. */
 export function staleness(d: TernDeps): "stale" | "fresh" | "unknown" {
   try {
@@ -378,7 +412,10 @@ export async function ternCall(op: string, args: Record<string, unknown> = {}, t
       : { state: "unknown", id, ms: ms(), reason: bad };
   }
   const first = await poll(d, id, timeoutMs);
-  if (first !== undefined) return { state: "ok", id, ms: ms(), result: first, ...(await nameStarted(d, op, first, title, place)) };
+  if (first !== undefined) {
+    const named = await nameStarted(d, op, first, title, place);
+    return { state: "ok", id, ms: ms(), result: first, ...named, ...(op === "start" && named.pane !== undefined ? { presence: await startedPresence(d, named.pane, args) } : {}) };
+  }
 
   if (opClass(op, args) === "non-idempotent") {
     return { state: "UNKNOWN", hold: true, id, ms: ms(), reason: "no result in time; the op may have run — HOLD, do not re-send (PROTOCOL.md §3.3)" };

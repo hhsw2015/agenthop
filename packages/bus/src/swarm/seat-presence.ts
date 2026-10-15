@@ -1,0 +1,95 @@
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import path from "node:path";
+import { isValidSessionId } from "../send-fallback.js";
+
+/**
+ * #1053 presence for ACP seats. A Tern ACP seat (`tern acp claude|codex --resume <sid>`) never runs Claude Code's SessionStart hook
+ * and Codex never writes one, so nothing writes ~/.agenthop/presence/<sid>.pid for it — F40 addressing then reads the seat as
+ * bus-invisible and the inbox sentinel reports STALL. The seat's LAUNCHER writes it instead: tern-restore after a seat comes up, and
+ * agenthop_tern after a start. ONE implementation shared by both (tern-restore shells out to scripts/seat-presence.ts).
+ *
+ *   resolveAgentPid  walks DOWN from the block's `tern acp` process (tern process <block> --json .child.pid) to the agent process:
+ *                    claude ⇒ the unique descendant whose argv has `stream-json` AND a whole argument `--resume=<sid>` or the pair
+ *                    `--resume <sid>` (live: tern acp → node adapter → claude …--resume=<sid>; argv[0] may be a versioned native
+ *                    path, so its basename is NOT the test); codex ⇒ the unique DIRECT node child whose argv names the
+ *                    /@agentclientprotocol/codex-acp/ adapter. 0 or >1 matches ⇒ null, never a guess.
+ *   writePresence    the caller passes the RESOLVED agent pid (never an arbitrary live pid). It must be alive. An existing file
+ *                    with the same live pid is kept; a different pid is replaced (a wrong pid routes by another seat's liveness);
+ *                    an existing file that cannot be read is refused, never overwritten (FC-2). O_EXCL temp + rename.
+ */
+
+export type PsRow = { pid: number; ppid: number; argv: string[] };
+export type SeatTool = "claude" | "codex";
+
+/** Parse `ps axo pid=,ppid=,command=` output. argv is whitespace-split (ps does not quote) — enough for flag matching. Pure. */
+export function parsePs(text: string): PsRow[] {
+  const out: PsRow[] = [];
+  for (const line of text.split("\n")) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (m) out.push({ pid: Number(m[1]), ppid: Number(m[2]), argv: m[3]!.trim().split(/\s+/) });
+  }
+  return out;
+}
+
+function hasResume(argv: string[], sid: string): boolean {
+  return argv.some((a, i) => a === `--resume=${sid}` || (a === "--resume" && argv[i + 1] === sid));
+}
+
+/** The agent pid under a block's `tern acp` root, or null when not exactly one candidate. Pure. */
+export function resolveAgentPid(rootPid: number, sid: string, tool: SeatTool, rows: PsRow[]): number | null {
+  const kids = new Map<number, PsRow[]>();
+  for (const r of rows) kids.set(r.ppid, [...(kids.get(r.ppid) ?? []), r]);
+  let hits: PsRow[];
+  if (tool === "claude") {
+    const desc: PsRow[] = [];
+    const seen = new Set<number>();
+    const frontier = [rootPid];
+    while (frontier.length > 0) {
+      for (const c of kids.get(frontier.pop()!) ?? []) {
+        if (!seen.has(c.pid)) { seen.add(c.pid); desc.push(c); frontier.push(c.pid); }
+      }
+    }
+    hits = desc.filter((r) => r.argv.includes("stream-json") && hasResume(r.argv, sid));
+  } else {
+    hits = (kids.get(rootPid) ?? []).filter((r) => path.basename(r.argv[0] ?? "") === "node" && r.argv.slice(1).some((a) => a.includes("/@agentclientprotocol/codex-acp/")));
+  }
+  return hits.length === 1 ? hits[0]!.pid : null;
+}
+
+export type PresenceResult = { state: "wrote" | "kept" | "refused"; pid?: number; was?: number | null; reason?: string };
+
+export function presenceFile(home: string, sid: string): string {
+  if (!isValidSessionId(sid) || sid.includes("/") || sid === "." || sid === "..") throw new Error(`invalid sid: ${sid}`);
+  return path.join(home, ".agenthop", "presence", `${sid}.pid`);
+}
+
+export function writePresence(home: string, sid: string, pid: number, alive: (pid: number) => boolean): PresenceResult {
+  let f: string;
+  try { f = presenceFile(home, sid); } catch (e) { return { state: "refused", reason: (e as Error).message }; }
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { state: "refused", reason: `invalid pid: ${pid}` };
+  if (!alive(pid)) return { state: "refused", reason: `pid ${pid} is not alive` };
+  let was: number | null = null;
+  try {
+    const raw = readFileSync(f, "utf8").trim();
+    const n = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(n)) return { state: "refused", reason: `existing ${path.basename(f)} is not a pid; not overwriting` };
+    was = n;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") return { state: "refused", reason: `existing ${path.basename(f)} unreadable (${(e as Error).message}); not overwriting` };
+  }
+  if (was === pid) return { state: "kept", pid, was };
+  try {
+    mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
+    const tmp = `${f}.tmp-${randomBytes(6).toString("hex")}`;
+    const fd = openSync(tmp, "wx", 0o600);
+    try { writeFileSync(fd, String(pid)); closeSync(fd); renameSync(tmp, f); }
+    catch (e) { try { closeSync(fd); } catch { /* closed */ } try { unlinkSync(tmp); } catch { /* own temp */ } throw e; }
+  } catch (e) { return { state: "refused", reason: `write failed: ${(e as Error).message}` }; }
+  return { state: "wrote", pid, was };
+}
+
+/** `kill -0`: alive on success or EPERM. */
+export function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}
