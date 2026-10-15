@@ -17,7 +17,7 @@ type W = {
   tmp: Array<{ name: string; ageMs: number }>; removed: string[]; logs: string[]; audit: string[];
 };
 const world = (): W => ({ clock: 0, recs: [], sessions: ["default"], blocks: new Set(), stopped: [], deleted: [], marked: [],
-  gcCode: 0, gcLine: "gc: results=0 requests_quarantined=0 tmp=0 quarantine_expired=0", tmp: [], removed: [], logs: [], audit: [] });
+  gcCode: 0, gcLine: "gc: results=0 requests_quarantined=0 requests_held=0 tmp=0 quarantine_expired=0", tmp: [], removed: [], logs: [], audit: [] });
 const io = (w: W): OrphanIO => ({
   seatRecords: () => w.recs, herdrSessions: () => w.sessions, ternBlocks: () => w.blocks,
   herdrStop: (n) => { w.stopped.push(n); return true; },
@@ -119,6 +119,10 @@ for (const which of ["recs", "sessions", "blocks"] as const) {
   t("③ gc removed something => one audit line", w.audit.length === 1 && /results=2/.test(w.audit[0]!)); }
 { const w = world(); const st = initialOrphanState(); round(st, w);
   t("③ gc nothing to do => no audit noise", w.audit.length === 0); }
+{ const w = world(); const st = initialOrphanState(); w.gcLine = "gc: results=0 requests_quarantined=0 requests_held=2 tmp=0 quarantine_expired=0"; round(st, w);
+  t("③ gc r12 requests_held>0 => audited (could not quarantine, retried next run)", w.audit.length === 1 && /requests_held=2/.test(w.audit[0]!)); }
+{ const w = world(); const st = initialOrphanState(); w.gcLine = "gc: results=0 requests_quarantined=0 requests_held=0 tmp=0 quarantine_expired=0"; round(st, w);
+  t("③ gc r12 all zero => no audit", w.audit.length === 0); }
 { const w = world(); const st = initialOrphanState();
   w.tmp = [{ name: "diag.json", ageMs: TMP_TTL_MS + 1 }, { name: "mirror-phase.json", ageMs: 1000 }]; round(st, w);
   t("③ tmp: only the >1h file removed", w.removed.join() === "diag.json"); }

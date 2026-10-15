@@ -5,7 +5,8 @@
  *      but the herdr session still exists ⇒ `herdr session stop <name>` then `herdr session delete <name>`.
  *   ② a seat-shell worker in state "live"/"stopping" whose Tern block (workers[].pane) is gone from `tern ls --json` ⇒ mark the
  *      record "orphan" (+stopped_at), then ① applies to its herdr session on the following confirmations.
- *   ③ control-plane files: the bridge's gc.sh (results/requests/tmp/quarantine TTLs) + mirror-phase.json / diag.json older than 1h.
+ *   ③ control-plane files: the bridge's gc.sh (results/requests/tmp/quarantine TTLs; r12 line adds requests_held = could not
+ *      quarantine, left in place, retried next run — any nonzero field is audited) + mirror-phase.json / diag.json older than 1h.
  * Never touched: the herdr session "default", and ANY herdr session that no seat-shell record ever registered (a name shaped like
  * `<role>-<task>` is only a second check, never a reason). Seat-shell schema (coordinator, pinned 2026-10-15):
  *   ~/.agenthop/swarm/seat-shell/<sid>.json  { …, workers: [{ name, herdr_session, pane, kind:"tui", started_at, stopped_at, state }] }
