@@ -37,6 +37,8 @@ chmod +x "$FAKE"
 start_ticker(){ ( i=1; while :; do echo "{\"tick\":$i,\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 0.2; done ) & TICKER=$!; }
 stop_ticker(){ [ -n "$TICKER" ] && kill "$TICKER" 2>/dev/null; wait "$TICKER" 2>/dev/null; TICKER=""; }
 frozen(){ echo '{"tick":2,"agents":[]}' >"$C/agents.json"; }
+# r4-style file with a vm id; reload() swaps vm and restarts tick from 1 (a reload, not a stall)
+start_ticker_vm(){ ( i=1; while :; do echo "{\"tick\":$i,\"vm\":\"$1\",\"tick_ms\":3,\"tick_ms_max\":9,\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 0.2; done ) & TICKER=$!; }
 run(){ OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 "$@" bash "$SMOKE" 2>&1)"; RC=$?; }
 
 bash -n "$SMOKE"; check "$([ $? -eq 0 ] && echo true)" "bash -n parses bridge-smoke.sh"
@@ -103,6 +105,24 @@ check "$([ $RC -eq 0 ] && echo true)" "old budget line before start: not counted
 printf '#!/usr/bin/env bash\necho %s\n' "'{\"plugins\":[],\"problems\":[]}'" >"$TMP/tern-empty"; chmod +x "$TMP/tern-empty"
 OUT="$(TERN_BIN="$TMP/tern-empty" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 bash "$SMOKE" 2>&1)"; RC=$?
 check "$([ $RC -eq 2 ] && [[ "$OUT" != *'PASS - '* && "$OUT" != *'FAIL - '* ]] && echo true)" "plugin not loaded: exit 2, no checks run"
+
+# G. r4 file: a reload during the wait (vm changes, tick restarts lower) is not a stall.
+: >"$L"; echo '{"tick":40,"vm":"aaa","agents":[]}' >"$C/agents.json"
+( sleep 0.4; i=1; while :; do echo "{\"tick\":$i,\"vm\":\"bbb\",\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 0.2; done ) & TICKER=$!
+run env
+stop_ticker
+check "$([[ "$OUT" == *'PASS - 1 tick: plugin reloaded during the wait (vm aaa -> bbb'* ]] && echo true)" "r4 reload: vm change counted as alive, reported"
+
+# H. r4 file, same vm, tick frozen: FAIL and the diagnostics show vm + tick_ms.
+: >"$L"; echo '{"tick":5,"vm":"ccc","tick_ms":61,"tick_ms_max":88,"agents":[]}' >"$C/agents.json"
+run env
+check "$([[ "$OUT" == *'FAIL - 1 tick: did not advance in 1s (5 -> 5, vm ccc)'* && "$OUT" == *'vm: ccc, tick_ms=61 tick_ms_max=88'* ]] && echo true)" "r4 frozen: FAIL with vm, diagnostics show tick_ms"
+
+# I. r4 file, same vm, advancing: normal PASS mentions the vm.
+: >"$L"; start_ticker_vm ddd
+run env
+stop_ticker
+check "$([[ "$OUT" == *'PASS - 1 tick advances ('*'vm ddd)'* ]] && echo true)" "r4 healthy: PASS mentions vm"
 
 echo ""
 echo "bridge-smoke gate: $t passed, $f failed"

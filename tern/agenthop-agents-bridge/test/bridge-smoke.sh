@@ -39,6 +39,10 @@ LOG_START_LINES=0
 [ -f "$LOG" ] && LOG_START_LINES="$(wc -l <"$LOG" | tr -d ' ')"
 
 tick(){ jq -r '.tick // empty' "$CTRL/agents.json" 2>/dev/null; }
+# r4+ writes `vm` (a per-load id). A different vm means the plugin was reloaded and tick restarted from 1, which is
+# not a stall. Older bridges write no vm: then only the tick is compared.
+vm(){ jq -r '.vm // empty' "$CTRL/agents.json" 2>/dev/null; }
+tick_ms(){ jq -r '"tick_ms=\(.tick_ms // "-") tick_ms_max=\(.tick_ms_max // "-")"' "$CTRL/agents.json" 2>/dev/null; }
 
 PASSED=() FAILED=()
 pass(){ echo "PASS - $1"; PASSED+=("$1"); }
@@ -69,17 +73,19 @@ if ! timeout "$TERN_TIMEOUT" "$TERN" plugin list --json 2>/dev/null \
 fi
 echo "ok   - plugin $PLUGIN_ID loaded"
 
-# 1. tick advances (status mirror alive)
-t0="$(tick)"
+# 1. tick advances (status mirror alive). With r4's vm field: a vm change = a reload (counts as alive, reported).
+t0="$(tick)"; v0="$(vm)"
 if ! [[ "$t0" =~ ^[0-9]+$ ]]; then
   fail "1 tick: agents.json tick unreadable or not a number: '$t0'"
 else
   sleep "$TICK_WAIT"
-  t1="$(tick)"
-  if [[ "$t1" =~ ^[0-9]+$ ]] && [ "$t1" -gt "$t0" ]; then
-    pass "1 tick advances ($t0 -> $t1)"
+  t1="$(tick)"; v1="$(vm)"
+  if [ -n "$v0" ] && [ -n "$v1" ] && [ "$v0" != "$v1" ] && [[ "$t1" =~ ^[0-9]+$ ]]; then
+    pass "1 tick: plugin reloaded during the wait (vm $v0 -> $v1, tick restarted at $t1)"
+  elif [[ "$t1" =~ ^[0-9]+$ ]] && [ "$t1" -gt "$t0" ]; then
+    pass "1 tick advances ($t0 -> $t1${v1:+, vm $v1})"
   else
-    fail "1 tick: did not advance in ${TICK_WAIT}s ($t0 -> $t1)"
+    fail "1 tick: did not advance in ${TICK_WAIT}s ($t0 -> $t1${v1:+, vm $v1})"
   fi
 fi
 
@@ -136,7 +142,7 @@ fi
 for f in "${FAILED[@]}"; do echo "  FAIL - $f"; done
 {
   echo "--- diagnostics ---"
-  echo "tick now: $(tick || echo '(unreadable)'), agents.json last written $(date -r "$CTRL/agents.json" '+%H:%M:%S' 2>/dev/null || echo '?')"
+  echo "tick now: $(tick || echo '(unreadable)'), vm: $(vm || true), $(tick_ms || true), agents.json last written $(date -r "$CTRL/agents.json" '+%H:%M:%S' 2>/dev/null || echo '?')"
   echo "tern sessions / window clients (each window runs its own window-half VM, all writing agents.json):"
   timeout "$TERN_TIMEOUT" "$TERN" ls --json 2>/dev/null | jq -r '"  sessions: \(.sessions | length) [\([.sessions[].name] | join(", "))]"' 2>/dev/null || echo "  sessions: (tern ls failed)"
   timeout "$TERN_TIMEOUT" "$TERN" inspect --json 2>/dev/null | jq -r '"  window clients: \([.clients[] | select(.kind == "window")] | length)"' 2>/dev/null || echo "  window clients: (tern inspect failed)"
