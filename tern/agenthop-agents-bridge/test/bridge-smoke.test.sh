@@ -300,31 +300,81 @@ printf 'stack traceback:\n\t[C]: in ?\nBROKEN 1 WARN x: plugin hook exceeded its
 start_ticker; run env SINCE=2026-10-15T11:00:00+08:00; stop_ticker
 check "$([ $RC -eq 0 ] && [[ "$OUT" == *'PASS - 4 mirror kills=0'* ]] && echo true)" "r9-2 control: continuation lines and another plugin's broken line ignored"
 
-# 3 (BSM-TEMP-OWN): a planted symlink / file at the OLD fixed path is never written or removed; mktemp failure FAILs
-: >"$L"; echo victim-bytes >"$TMP/victim"; start_ticker
-OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 bash -c 'ln -sf "$1" "/tmp/smoke-logwin.$$"; exec bash "$2"' _ "$TMP/victim" "$SMOKE" 2>&1)"; RC=$?
-stop_ticker
-check "$([ "$(cat "$TMP/victim")" = victim-bytes ] && echo true)" "r9-3 symlink planted at /tmp/smoke-logwin.<pid>: victim bytes untouched"
-lnk="$(ls -1 /tmp/smoke-logwin.* 2>/dev/null | head -1)"
-check "$([ -n "$lnk" ] && [ -L "$lnk" ] && echo true)" "r9-3 the planted symlink itself is not removed"
-rm -f /tmp/smoke-logwin.*
+# 3 (BSM-TEMP-OWN): a symlink planted at the OLD fixed path /tmp/smoke-logwin.<pid> is never written or removed.
+#    Exact ownership in the gate itself (BSM-GATE-TEMP-OWN): the smoke runs under `exec` in a child whose pid we know,
+#    the link is created with `ln -s` (no -f: an existing entry at that path is never replaced — the case is skipped),
+#    only that exact path is checked, and only that exact path is removed, and only if it is still OUR symlink to OUR
+#    victim. No glob over /tmp, no broad rm.
+: >"$L"; VICTIM="$TMP/victim"; echo victim-bytes >"$VICTIM"; start_ticker
+GO="$TMP/go"; mkfifo "$GO"
+TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 bash -c 'read -r _ <"$1"; exec bash "$2"' _ "$GO" "$SMOKE" >"$TMP/r9-3.out" 2>&1 &
+CHILD=$!; PLANTED="/tmp/smoke-logwin.$CHILD"; planted_ok=0
+if ln -s "$VICTIM" "$PLANTED" 2>/dev/null; then planted_ok=1; fi
+echo go >"$GO"; wait "$CHILD"; stop_ticker; rm -f "$GO"
+if [ "$planted_ok" -eq 1 ]; then
+  check "$([ "$(cat "$VICTIM")" = victim-bytes ] && echo true)" "r9-3 symlink planted at /tmp/smoke-logwin.<pid>: victim bytes untouched"
+  check "$([ -L "$PLANTED" ] && [ "$(readlink "$PLANTED")" = "$VICTIM" ] && echo true)" "r9-3 the planted symlink itself is not removed"
+  # remove only the exact link we created, and only if it is still ours
+  [ -L "$PLANTED" ] && [ "$(readlink "$PLANTED")" = "$VICTIM" ] && rm -f -- "$PLANTED"
+else
+  echo "skip - r9-3 /tmp/smoke-logwin.$CHILD already exists (not ours): symlink case not run, nothing touched"
+fi
+# mktemp failure, with a TMPDIR that is our own private (non-existent) path
 : >"$L"; start_ticker; run env TMPDIR="$TMP/no-such-dir"; stop_ticker
 check "$([ $RC -eq 1 ] && [[ "$OUT" == *'cannot create a private temp file'* ]] && echo true)" "r9-3 mktemp fails => check 4 FAILs, says why"
-check "$([ -z "$(ls -1 "${TMPDIR:-/tmp}"/bridge-smoke-logwin.* 2>/dev/null)" ] && echo true)" "r9-3 no private temp file left behind"
+# leftovers: run the smoke with a private TMPDIR and check that exact dir is empty afterwards (no /tmp glob)
+PRIV="$TMP/privtmp"; mkdir -p "$PRIV"; : >"$L"; start_ticker; run env TMPDIR="$PRIV"; stop_ticker
+check "$([ -z "$(ls -A "$PRIV")" ] && echo true)" "r9-3 no private temp file left behind (checked in our own TMPDIR)"
 
-# 4 (BSM-R8-P2-2): a vm seen, then a snapshot WITHOUT vm (or unreadable) => identity unknown => FAIL
-: >"$L"; echo '{"tick":1,"vm":"old","agents":[]}' >"$C/agents.json"
-( sleep 0.3; echo '{"tick":100,"agents":[]}' >"$C/agents.json" ) & TICKER=$!
-run env; stop_ticker
-check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 1 tick: identity unknown — vm old was seen, then the next snapshot had no vm field'* ]] && echo true)" "r9-4 vm seen then vanished (vm_identity_missing) => FAIL identity unknown"
-: >"$L"; echo '{"tick":1,"vm":"old","agents":[]}' >"$C/agents.json"
-( sleep 0.3; echo '{not json' >"$C/agents.json" ) & TICKER=$!
-run env; stop_ticker
-check "$([ $RC -eq 1 ] && [[ "$OUT" == *'identity unknown'*'no readable file'* ]] && echo true)" "r9-4 vm seen then agents.json unreadable => FAIL identity unknown"
-# control: a legacy bridge (never any vm) is still compared by tick and says so
-: >"$L"; start_ticker
-run env; stop_ticker
-check "$([ $RC -eq 0 ] && [[ "$OUT" == *'legacy bridge (no vm field): tick-only comparison'* ]] && echo true)" "r9-4 control: legacy no-vm bridge => tick-only PASS, labelled legacy"
+# 4 (BSM-R8-P2-2 / BSM-VM-APPEARS): identity transitions. Deterministic: the smoke touches $MARK right after its FIRST
+#    snapshot (SMOKE_SNAP_MARK hook), and the fixture writes the next state only after that. r9's version slept 0.3 s
+#    instead; if the smoke's first read came later than that (slow prerequisite under load), it saw the SECOND state as
+#    the first and reported "did not advance (100 -> 100)" instead of "identity unknown" — the 65/66 the main review saw.
+after_first(){ # $@ = writes, each "JSON" for one later snapshot window; waits for the mark, then writes them 1 s apart
+  local MARK="$TMP/mark.$RANDOM"; rm -f "$MARK"; export SMOKE_SNAP_MARK="$MARK"
+  ( for _ in $(seq 1 100); do [ -e "$MARK" ] && break; sleep 0.05; done; for j in "$@"; do echo "$j" >"$C/agents.json"; sleep 1; done ) &
+  TICKER=$!
+}
+done_identity(){ stop_ticker; unset SMOKE_SNAP_MARK; }
+# known vm, then a snapshot without vm => identity unknown
+: >"$L"; echo '{"tick":1,"vm":"old","agents":[]}' >"$C/agents.json"; after_first '{"tick":100,"agents":[]}'
+run env; done_identity
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 1 tick: identity unknown — vm old was seen, then the next snapshot had no vm field'* ]] && echo true)" "r10-4 vm seen then vanished => FAIL identity unknown (deterministic)"
+# known vm, then unreadable => identity unknown
+: >"$L"; echo '{"tick":1,"vm":"old","agents":[]}' >"$C/agents.json"; after_first '{not json'
+run env; done_identity
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'identity unknown'*'no readable file'* ]] && echo true)" "r10-4 vm seen then agents.json unreadable => FAIL identity unknown"
+# legacy -> vm appears once, then frozen => FAIL (was 4 PASS in r9: BSM-VM-APPEARS / legacy_to_known_frozen)
+: >"$L"; echo '{"tick":1,"agents":[]}' >"$C/agents.json"; after_first '{"tick":2,"vm":"new","agents":[]}'
+run env; done_identity
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 1 tick: vm new appeared (no vm before), re-baselined at 2; did not advance'* ]] && echo true)" "r10-4 legacy then vm appears then frozen => FAIL"
+# legacy -> vm appears, then THAT vm advances => PASS, labelled as appeared + re-baselined
+: >"$L"; echo '{"tick":1,"agents":[]}' >"$C/agents.json"; after_first '{"tick":2,"vm":"new","agents":[]}' '{"tick":3,"vm":"new","agents":[]}' '{"tick":4,"vm":"new","agents":[]}'
+run env; done_identity
+check "$([ $RC -eq 0 ] && [[ "$OUT" == *'PASS - 1 tick vm new appeared (no vm before), re-baselined at 2; advances'*'vm new)'* ]] && echo true)" "r10-4 legacy then vm appears and advances => PASS on that vm"
+# legacy -> vm appears, then vm vanishes again => identity unknown
+: >"$L"; echo '{"tick":1,"agents":[]}' >"$C/agents.json"; after_first '{"tick":2,"vm":"new","agents":[]}' '{"tick":9,"agents":[]}'
+run env; done_identity
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'identity unknown — vm new was seen after the re-baseline'* ]] && echo true)" "r10-4 legacy then vm then no vm => FAIL identity unknown"
+# known vm -> new vm (reload) -> frozen => FAIL (kept from r8)
+: >"$L"; echo '{"tick":40,"vm":"old","agents":[]}' >"$C/agents.json"; after_first '{"tick":1,"vm":"new","agents":[]}'
+run env; done_identity
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'reloaded (vm old -> new), re-baselined at 1; did not advance'* ]] && echo true)" "r10-4 known vm then reload then frozen => FAIL"
+# control: a legacy bridge that never shows a vm is compared by tick and labelled
+: >"$L"; start_ticker; run env; stop_ticker
+check "$([ $RC -eq 0 ] && [[ "$OUT" == *'legacy bridge (no vm field): tick-only comparison'* ]] && echo true)" "r10-4 control: never-vm legacy bridge => tick-only PASS, labelled legacy"
+
+# 5 (BSM-DIAG-P3-1): sweep flag truth table = #1033 reader /^(1|true|yes|on)$/i
+: >"$L"; frozen; ok=1
+for v in 1 true TRUE yes Yes on ON; do
+  printf '{"env":{"SWARM_TERN_BRIDGE":"%s"}}' "$v" >"$TMP/recipe.json"
+  run env SWARM_DISPATCHER_RECIPE="$TMP/recipe.json"; [[ "$OUT" == *"sweep flag SWARM_TERN_BRIDGE: on ($v)"* ]] || ok=0
+done
+for v in 0 false off no "" maybe; do
+  printf '{"env":{"SWARM_TERN_BRIDGE":"%s"}}' "$v" >"$TMP/recipe.json"
+  run env SWARM_DISPATCHER_RECIPE="$TMP/recipe.json"; [[ "$OUT" == *"sweep flag SWARM_TERN_BRIDGE: off ("* ]] || ok=0
+done
+check "$([ $ok -eq 1 ] && echo true)" "r10-5 sweep flag: 1/true/TRUE/yes/Yes/on/ON => on; 0/false/off/no/empty/other => off"
 
 echo ""
 echo "bridge-smoke gate: $t passed, $f failed"

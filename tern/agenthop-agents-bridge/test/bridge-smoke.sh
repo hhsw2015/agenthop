@@ -83,7 +83,12 @@ tick_ms(){ jq -r '"tick_ms=\(.tick_ms // "-") tick_ms_max=\(.tick_ms_max // "-")
 sweep_flag(){
   [ -r "$RECIPE" ] || { echo "unknown (no readable $RECIPE)"; return; }
   local v; v="$(jq -r '.env.SWARM_TERN_BRIDGE // "unset"' "$RECIPE" 2>/dev/null)" || { echo "unknown (recipe unparseable)"; return; }
-  case "$v" in 1|on|true) echo "on ($v)";; *) echo "off ($v): no outside mirror sweep";; esac
+  # same truth table as #1033's reader (tern-bridge-sweep.ts ternBridgeEnabled: /^(1|true|yes|on)$/i, opt-in, DEFAULT OFF).
+  # Not flagDefaultOn (that one is opt-out). Whitespace is not trimmed, as in the reader.
+  case "$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) echo "on ($v)";;
+    *) echo "off ($v): no outside mirror sweep";;
+  esac
 }
 
 PASSED=() FAILED=()
@@ -128,32 +133,41 @@ echo "ok   - plugin $PLUGIN_ID loaded"
 #    callbacks); liveness is then the outside `mirror` command sweep (~5 s), so the expected rate is the sweep's, not
 #    750 ms — reported as by design. A frozen tick still FAILs either way; the FAIL line names the timer state and
 #    the sweep flag, so "accelerator stopped and no sweep" reads differently from "bridge dead".
-# Identity rules: a snapshot without a vm is the legacy (pre-r4) mode and is compared by tick alone, but ONLY if no vm
-# was ever seen in this run. Once a vm is known, a later snapshot without one (or an unreadable file) means the
-# identity is unknown: it cannot prove the same vm advanced, so check 1 FAILs with "identity unknown".
+# Identity rules (one state machine over snapshots taken TICK_WAIT apart; every tick/vm pair comes from ONE read):
+#   - legacy: no snapshot has shown a vm yet -> compare ticks. Only a run that NEVER sees a vm can PASS as legacy.
+#   - the FIRST time a vm appears (from legacy, or after a reload to a new vm), the baseline restarts on that vm and
+#     PASS needs that same vm to advance on a later snapshot.
+#   - once a vm is known, a snapshot without one (or an unreadable file) = identity unknown -> FAIL.
+#   - at most one re-baseline per run: a second vm change is a reload loop -> FAIL.
+# Hook for the offline gate only: when SMOKE_SNAP_MARK is set, the path is touched right after the first snapshot so
+# a fixture can change agents.json strictly AFTER it (no timing race). Unset in real use.
 read_snap(){ local l; l="$(snap)"; [ "$l" = ERR ] && { S_T=""; S_V="ERR"; S_TM="-"; return; }
   IFS=$'\t' read -r S_T S_V S_TM <<<"$l"; }
-read_snap; t0="$S_T"; v0="$S_V"; seen_vm=""; [ "$v0" != "-" ] && [ "$v0" != ERR ] && seen_vm="$v0"
-reload_note=""; identity_err=""
+read_snap; t0="$S_T"; v0="$S_V"
+[ -n "${SMOKE_SNAP_MARK:-}" ] && : >"$SMOKE_SNAP_MARK"
+reload_note=""; identity_err=""; rebased=0
 if [ "$v0" = ERR ] || ! [[ "$t0" =~ ^[0-9]+$ ]]; then
   fail "1 tick: agents.json unreadable or tick not a number (tick '$t0', vm '$v0')"
 else
   sleep "$TICK_WAIT"
   read_snap; t1="$S_T"; v1="$S_V"; timer_state="$S_TM"
-  if [ -n "$seen_vm" ] && { [ "$v1" = "-" ] || [ "$v1" = ERR ]; }; then
-    identity_err="vm $seen_vm was seen, then the next snapshot had $( [ "$v1" = ERR ] && echo 'no readable file' || echo 'no vm field')"
-  elif [ -n "$seen_vm" ] && [ "$v1" != "$v0" ] && [[ "$t1" =~ ^[0-9]+$ ]]; then
-    reload_note="reloaded (vm $v0 -> $v1), re-baselined at $t1; "
-    t0="$t1"; v0="$v1"
+  known() { [ "$1" != "-" ] && [ "$1" != ERR ]; }
+  if known "$v0" && ! known "$v1"; then
+    identity_err="vm $v0 was seen, then the next snapshot had $( [ "$v1" = ERR ] && echo 'no readable file' || echo 'no vm field')"
+  elif known "$v1" && [ "$v1" != "$v0" ] && [[ "$t1" =~ ^[0-9]+$ ]]; then
+    # a vm appears for the first time (legacy -> vm) or changes (reload): restart the baseline on it
+    if known "$v0"; then reload_note="reloaded (vm $v0 -> $v1), re-baselined at $t1; "
+    else reload_note="vm $v1 appeared (no vm before), re-baselined at $t1; "; fi
+    rebased=1; t0="$t1"; v0="$v1"
     sleep "$TICK_WAIT"
     read_snap; t1="$S_T"; v1="$S_V"; timer_state="$S_TM"
-    if [ "$v1" = "-" ] || [ "$v1" = ERR ]; then identity_err="vm $v0 was seen after the reload, then the next snapshot had no vm"; fi
+    if ! known "$v1"; then identity_err="vm $v0 was seen after the re-baseline, then the next snapshot had $( [ "$v1" = ERR ] && echo 'no readable file' || echo 'no vm field')"; fi
   fi
   [ "$timer_state" = "-" ] && timer_state=""
-  vm_label=""; [ "$v1" != "-" ] && [ "$v1" != ERR ] && vm_label="$v1"
+  vm_label=""; known "$v1" && vm_label="$v1"
   if [ -n "$identity_err" ]; then
     fail "1 tick: ${reload_note}identity unknown — $identity_err; cannot show the same vm advanced (tick $t0 -> ${t1:-?})"
-  elif [ -n "$seen_vm" ] && [ "$v0" != "$v1" ]; then
+  elif known "$v1" && [ "$v0" != "$v1" ]; then
     fail "1 tick: ${reload_note}vm changed AGAIN ($v0 -> $v1): no single vm observed advancing"
   elif [[ "$t1" =~ ^[0-9]+$ ]] && [ "$t1" -gt "$t0" ]; then
     # Rate column: the bridge's timer chain ticks every 750 ms; an outside sweep (`tern ctl ... mirror`) every few
@@ -164,7 +178,7 @@ else
       rate="timer=$timer_state (accelerator stopped, by design): liveness from the outside mirror sweep"
     elif [ "$steps" -ge $(( want / 2 )) ]; then rate="timer chain alive"
     else rate="LOW: timer chain likely dead, tick kept alive by outside mirror calls"; fi
-    [ -z "$seen_vm" ] && rate="$rate; legacy bridge (no vm field): tick-only comparison"
+    known "$v1" || rate="$rate; legacy bridge (no vm field): tick-only comparison"
     pass "1 tick ${reload_note}advances ($t0 -> $t1 in ${TICK_WAIT}s = $steps steps, ~$want expected; $rate${vm_label:+; vm $vm_label})"
   else
     fail "1 tick: ${reload_note}did not advance in ${TICK_WAIT}s ($t0 -> $t1${vm_label:+, vm $vm_label}${timer_state:+, timer=$timer_state}; sweep flag SWARM_TERN_BRIDGE: $(sweep_flag))"
