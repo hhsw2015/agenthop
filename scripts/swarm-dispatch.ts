@@ -70,6 +70,8 @@ import { resolveAndRead, writeSanitizedResult, gcSanitizedResults } from "../pac
 import { verifyOpsAction, applyOpsVerdict, opsReceiptOpen, pendingOpsReceipt, successionHeartbeatDue, successionHeartbeatSec, type OpsEvidence, type SuccessionLiveness } from "../packages/bus/src/swarm/coordinator-ops-receipt.js";
 import { readSuccessionSwapSec, listSuccessionSwaps } from "../packages/bus/src/swarm/shell-succession.js";
 import { scanInboxes, detectStalledInboxes } from "../packages/bus/src/swarm/inbox-sentinel.js";
+import { coordinatorLegacyKeys, toolFromCommand } from "../packages/bus/src/swarm/coordinator-keys.js";
+import { procCommand, procCwd } from "../packages/bus/src/swarm/proc-facts.js";
 import { herdrServerReachable, herdrAgentStates, herdrReadClean, herdrReadContent, herdrAgentState, herdrAgentPaneId, herdrPaneIdForSession, herdrWait, herdrWaitOutput, herdrExplain, sentinelDecision, buildApprovalDoc, type AgentState } from "../packages/bus/src/swarm/herdr.js";
 import { coordinatorReportPlan, coordEscalateEnabled, type ReportSeverity } from "../packages/bus/src/swarm/coordinator-report.js";
 import { superviseMember, type WatchOps, type SentinelEvent } from "../packages/bus/src/swarm/live-sentinel.js";
@@ -1498,7 +1500,9 @@ async function main(): Promise<void> {
       const proj = buildProjection(idlog.events, idlog.corruption);
       const io = makeFileLiveness(HOME);
       const owned = new Set<string>();
-      for (const sid of listSessions(HOME)) {
+      const sessionsNow = listSessions(HOME);
+      const coordSidForSentinel = COORDINATOR ? resolveSession(COORDINATOR, sessionsNow) : null;
+      for (const sid of sessionsNow) {
         const pid = io.readPid(sid);
         if (pid === null || io.procAlive(pid) !== "alive") continue; // only a LIVE presence session owns (drains) a box
         owned.add(inboxDirName(sid));
@@ -1506,6 +1510,15 @@ async function main(): Promise<void> {
         // trustworthy tool/cwd; for candidates/pid/not-seen we must NOT fall back to empty (wildcard) metadata — that would
         // over-credit ownership and SUPPRESS a real stall core would actually refuse to drain. When unprovable, credit ONLY
         // the direct sid (under-credit ⇒ a safe false alert the coordinator checks, never a silently-suppressed stall).
+        // #1032-C: the COORDINATOR is special-cased (see coordinator-keys.ts). Its long resume history makes whois() ambiguous, so
+        // the rule below never credited its legacy boxes ⇒ a false STALL on its previous-native box. For it ONLY, the dispatcher
+        // uses facts it knows independently of the alias-log — SWARM_COORDINATOR resolves to this sid, and the live presence
+        // process gives the real tool + cwd — to compute exactly the keys its core drains. Ordinary members keep the
+        // conservative rule (no single entity ⇒ direct sid only).
+        if (coordSidForSentinel && sid === coordSidForSentinel) {
+          for (const k of coordinatorLegacyKeys(proj, sid, { tool: toolFromCommand(procCommand(pid) ?? ""), cwd: procCwd(pid) })) owned.add(inboxDirName(k));
+          continue;
+        }
         const w = whois(proj, sid);
         if (w.kind !== "entity") continue; // ambiguous/unknown identity ⇒ no legacy expansion (direct sid already credited)
         for (const k of legacyInboxKeys(proj, { id: sid, stableId: sid, title: "", tool: w.entity.tool ?? "", cwd: w.entity.cwd ?? "", pid: 0 })) owned.add(inboxDirName(k));
