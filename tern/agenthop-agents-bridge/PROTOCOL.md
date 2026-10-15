@@ -84,16 +84,20 @@ TERN_PANE_SOCKET=… tern ctl plugins run plugin.agenthop-agents-bridge.drain-st
 
 | op | 类别 | args | 成功 payload | 说明 |
 |---|---|---|---|---|
-| `list` | **只读** | — | `{agents:[...]}` | 同 agents.json 的 agents |
+| `list` | **只读** | `full?` | `{agents:[...]}` / `{full:true,agents:[...]}` | r7:默认=mirror 同款瘦身表(`session:panes()` ~0.2ms);`full:true` 才调 `agents:list()`(~28ms+,剔 `command`/`agent_command` 后编码,18KB→<4KB),调用方承担其预算 |
 | `transcript` | **只读** | `agent, last?` | `{transcript:[...]}` | 仅 omp(TSP);非 omp 返 `[]` |
 | `wait` | **只读-异步** | `agent, timeout?` | `{message:<string?>}` | idle 时返回末条 assistant 文本;异步经 `:next`,不阻塞轮询;非 omp 恒超时 |
 | `ask` | **非幂等** | `agent, text` | `{}` | 贴+回车;native omp 一次 TSP send |
 | `start` | **非幂等** | `prompt, cwd, command?, how?` | `{pane:<number>}` | **同步,可能长耗**(见 §4);prompt/cwd 非空 |
 | `interrupt` | **非幂等** | `agent` | `{}` | Ctrl-C,不关块 |
 | `stop` | **非幂等** | `agent` | `{}` | 关闭块 |
-| `eval` | **非幂等** | `code` | `{value:<any>}` | r2(user 亲令「通过插件直接调用 Lua API」):`loadstring` 编译(VM 内 `load` 为 nil)后以 `cx` 为参调用,返回值 JSON 编码;编译/运行错误 → `{ok:false,error}`。走 `drain`(快类),代码须自己保持在预算内 |
+| `eval` | **非幂等** | `code` | `{value:<any>}` | r2(user 亲令「通过插件直接调用 Lua API」):`loadstring` 编译(VM 内 `load` 为 nil)后以 `cx` 为参调用,返回值 JSON 编码;编译/运行错误 → `{ok:false,error}`。走 `drain`(快类) |
 
 **eval 信任边界**:信任边界不变:requests/ 在 0700 家目录,能写该目录者本已可用 `start` 起任意命令,eval 不新增攻击面。
+
+**eval 预算(调用方自负)**:eval 跑在 `drain` 命令 hook 内;单次 >50ms(如 `return #cx.agents:list()`,~28ms 且有方差)会禁用 `drain` 直到 `tern plugin reload`,其后所有请求滞留 `requests/` 不被消费(11:28:45 现网实例)。贵调用请拆分、或改用 `list`(默认瘦身)。
+
+**drain 节流(r7)**:每次 `drain`/`drain-start` 触发**至多处理一条**本类请求(FIFO,按文件名),其余留给下一次 `plugins run`——蜂群本就每 publish 一次 drain;一次触发不会因堆叠多条而撑爆预算。
 
 未知 op → `{"ok":false,"error":"unknown op: <name>"}`。坏 JSON(已认领)→ `{"ok":false,"error":"bad request json"}`。
 
@@ -126,7 +130,7 @@ TERN_PANE_SOCKET=… tern ctl plugins run plugin.agenthop-agents-bridge.drain-st
 
 **已落地(tick 冻结根修,r2 订正根因)**:现网实证——`agents.json` tick 冻结、`plugin reload` 前不恢复。**Tern 的禁用单位是 hook**:所有 `tern.sleep():next` 续体同属 hook `await`,任一续体超 ~50ms(`await exceeded 50 ms`)即禁用本 VM **全部** await 续体,已排队的继任也不再投递(Tern docs concepts/runtime.md:one slow timer callback disables all of the plugin's timer callbacks in that VM)。耗时来源不只 start:仅 `list`+编码 41KB+写盘的 mirror 偶发 >50ms 也会触发。故 r1「拆两条 sleep 链+先排队 ⇒ 自愈」**不成立**(两条链同一 hook,协调者 40 分钟现网三次复现)。
 
-r2 修法 = **命令面隔离 + 蜂群侧 reload 恢复**(不是 VM 内自愈):① drain 改为 `tern.command`,由蜂群写完请求后 `tern ctl plugins run` 触发,每个命令是独立 hook `command <id>`;② 按 op 类拆 `drain`(快 op)与 `drain-start`(仅 start),start 撑爆预算只禁 `drain-start`,不连坐快 op 与 mirror;③ mirror 瘦身(§1)远离预算,仍走 sleep 链,另可命令手动触发。④(r3→r4)A2 挂哨只在 `arm` 命令(独立 hook,蜂群每次加载/reload 后触发):其三次跨 VM `tern.carly.*` 在首个 await tick 实测超 50ms(11:05:40),r3 曾放 `tern.timer(0)`,r4 timer hook 承载 mirror 链,故挂哨不再上 timer。⑤(r4)slim mirror 自身仍偶发 >50ms(11:12:17 第二次 await kill,tick 冻 33):mirror 移出 await hook——主驱动改 `mirror` 命令(蜂群 sweep 每 ~5s 触发),辅以 `tern.timer` 自续链;agents.json 加 `vm`/`window`/`tick_ms`/`tick_ms_max`(§1)。⑥(r6)**真因定位**:换 hook 都会被杀,因为 mirror 本身就 40-50ms——`cx.agents:list()` ~28ms + 全量 encode ~25ms(协调者用 eval op 现网分段计时)。mirror 改由 `cx.session:panes()`(~0.17ms)自建最小表,tick 不再调 `agents:list()`。**恢复剧本(蜂群侧)**:tick 停 >5s,或触发 drain 后 2s 无 result ⇒ `tern plugin reload`(协调者实测 tick 从 1 重计,<2s 恢复);被禁那一刻在途的 op 落 §3 恢复(start = 非幂等 HOLD)。
+r2 修法 = **命令面隔离 + 蜂群侧 reload 恢复**(不是 VM 内自愈):① drain 改为 `tern.command`,由蜂群写完请求后 `tern ctl plugins run` 触发,每个命令是独立 hook `command <id>`;② 按 op 类拆 `drain`(快 op)与 `drain-start`(仅 start),start 撑爆预算只禁 `drain-start`,不连坐快 op 与 mirror;③ mirror 瘦身(§1)远离预算,仍走 sleep 链,另可命令手动触发。④(r3→r4)A2 挂哨只在 `arm` 命令(独立 hook,蜂群每次加载/reload 后触发):其三次跨 VM `tern.carly.*` 在首个 await tick 实测超 50ms(11:05:40),r3 曾放 `tern.timer(0)`,r4 timer hook 承载 mirror 链,故挂哨不再上 timer。⑤(r4)slim mirror 自身仍偶发 >50ms(11:12:17 第二次 await kill,tick 冻 33):mirror 移出 await hook——主驱动改 `mirror` 命令(蜂群 sweep 每 ~5s 触发),辅以 `tern.timer` 自续链;agents.json 加 `vm`/`window`/`tick_ms`/`tick_ms_max`(§1)。⑥(r6)**真因定位**:换 hook 都会被杀,因为 mirror 本身就 40-50ms——`cx.agents:list()` ~28ms + 全量 encode ~25ms(协调者用 eval op 现网分段计时)。mirror 改由 `cx.session:panes()`(~0.17ms)自建最小表,tick 不再调 `agents:list()`。**恢复剧本(蜂群侧,须自动化)**:tick 停 >5s,或触发 drain 后 2s 无 result ⇒ `tern plugin reload`(协调者实测 tick 从 1 重计,<2s 恢复);被禁那一刻在途的 op 落 §3 恢复(start = 非幂等 HOLD)。
 
 门 `test/window.test.lua`:**结构证据,不是宿主行为复现**——夹具按 hook 记录回调归属、以「不再调用」模型化禁用,验证 start 只在自己的 hook、mirror 与快 op 在别的 hook;不模拟也不声称模拟 Tern 的预算终止。live 门 = `bridge-smoke.sh`(#1032-D)。start 异步化仍是更深的后续。
 

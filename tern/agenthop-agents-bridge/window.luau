@@ -39,19 +39,7 @@ local lastPhase = nil -- r5: previous completed tick's cumulative ms per segment
 -- r1-r4. cx.session:panes() costs ~0.17ms and its PaneInfo already carries what the mirror publishes. So the mirror NEVER calls
 -- agents:list(): it filters panes() to kind=="agent" and builds a minimal table (target <2KB, <3ms/tick). model/state/last_message are
 -- not on PaneInfo and are dropped from the tick; the `list` op (request path, not the tick) still returns the full agents:list().
-local MIRROR_PANE_FIELDS = { "pane", "title", "cwd", "tab", "program", "busy", "at_prompt", "exited", "alert", "parked" }
-local function agentPanes(panes)
-  local out = {}
-  for _, p in ipairs(panes) do
-    if p.kind == "agent" then
-      local e = {}
-      for _, k in ipairs(MIRROR_PANE_FIELDS) do e[k] = p[k] end
-      e.alive = (p.exited == nil) -- PaneInfo has no `alive`; a live agent pane has no exit status
-      out[#out + 1] = e
-    end
-  end
-  return out
-end
+local agentPanes = claim.slimAgents -- r7: one shared source with the `list` op (claim.luau)
 
 -- r5 phase breadcrumbs kept as an OPT-IN debug switch (kv `bridge.debug_phase` = true, or env AGENTHOP_BRIDGE_DEBUG_PHASE=1), OFF by
 -- default: each crumb is a file write, which is exactly the cost class the tick must avoid in production.
@@ -132,10 +120,16 @@ local function handle(cx, id, text)
   end
 end
 
+-- r7: a drain trigger handles AT MOST ONE request of its class (the swarm triggers one drain per publish), so one slow op cannot
+-- push a trigger past the 50ms hook budget by stacking several requests; the rest wait for the next `plugins run`.
+local DRAIN_MAX_PER_TRIGGER = 1
 local function drain(cx, wantStart)
   local names = {}
   pcall(function() names = tern.fs.list(REQ) end)
+  table.sort(names) -- deterministic FIFO by publish name
+  local handled = 0
   for _, name in ipairs(names) do
+    if handled >= DRAIN_MAX_PER_TRIGGER then break end
     if name:match("%.json$") then
       local id = (name:gsub("%.json$", ""))
       local path = REQ .. "/" .. name
@@ -147,7 +141,7 @@ local function drain(cx, wantStart)
           function(p) tern.fs.remove(p) end,
           path
         )
-        if claimed then handle(cx, id, text) end -- we hold the claim: exactly this VM owns the request now
+        if claimed then handle(cx, id, text); handled = handled + 1 end -- we hold the claim: exactly this VM owns it now
       end
     end
   end

@@ -34,7 +34,8 @@ D=~/.agenthop/tern-panes
 id="$(./publish.sh "$D" '{"op":"list"}')"    # or inline: printf > "$D/requests/.$id.tmp" && mv -f ... || { rm -f ...; exit 1; }
 # TRIGGER the drain (r2: drains are commands, not a poll). `start` requests use plugin.agenthop-agents-bridge.drain-start instead.
 TERN_PANE_SOCKET="$HOME/Library/Application Support/Tern/daemon.sock" tern ctl plugins run plugin.agenthop-agents-bridge.drain
-# wait for the reply, then consume it (no result within ~2s ⇒ the drain hook may be disabled ⇒ `tern plugin reload`, PROTOCOL.md §4)
+# wait for the reply, then consume it. AUTOMATE: no result within ~2s ⇒ the drain hook is probably disabled ⇒ run `tern plugin reload`,
+# then `tern ctl plugins run plugin.agenthop-agents-bridge.arm`, then re-trigger the drain (PROTOCOL.md §4). One drain handles ONE request.
 until [ -f "$D/results/$id.json" ]; do sleep 0.2; done
 jq . "$D/results/$id.json"        # {"ok":true,"class":"read-only","agents":[...]}
 rm -f "$D/results/$id.json"

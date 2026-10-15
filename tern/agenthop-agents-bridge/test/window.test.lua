@@ -185,5 +185,17 @@ requests["e2.json"] = '{"op":"eval","code":"return ("}'
 commands["drain"](cx)
 ck("eval: a compile error is reported, not thrown", (files[RES .. "e2.json"] or ""):find("eval compile", 1, true) ~= nil)
 
+-- ---- r7: one request per drain trigger (the swarm triggers one drain per publish) ----
+for k in pairs(requests) do requests[k] = nil end
+requests["q1.json"] = '{"op":"stop"}'
+requests["q2.json"] = '{"op":"stop"}'
+requests["q3.json"] = '{"op":"stop"}'
+local stopsBefore = opCalls.stop
+commands["drain"](cx)
+ck("r7: one drain trigger handles AT MOST ONE request (q1), the rest wait", opCalls.stop == stopsBefore + 1
+  and files[RES .. "q1.json"] ~= nil and requests["q2.json"] ~= nil and requests["q3.json"] ~= nil)
+commands["drain"](cx); commands["drain"](cx)
+ck("r7: subsequent triggers drain the rest in FIFO order", opCalls.stop == stopsBefore + 3 and requests["q2.json"] == nil and requests["q3.json"] == nil)
+
 print(string.format("\n%s (%d failure(s))", failures == 0 and "PASS" or "FAIL", failures))
 os.exit(failures == 0 and 0 or 1)
