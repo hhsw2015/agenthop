@@ -510,7 +510,7 @@ ck "lock: after release restore writes the agent pid" "7100" "$(cat "$T/presence
 ck "lock: no lock dir / hold-intent left" "0" "$(ls -a "$T/presence" | grep -c 'lockd')"
 # (c) while restore holds it, the TS acquirer contends (same artifacts, both directions)
 cat >"$T/pyhold.py" <<PY
-import importlib.util, os, subprocess, sys
+import importlib.util, os, subprocess, sys; sys.dont_write_bytecode = True
 os.environ["PRESENCE_DIR"] = sys.argv[1]
 spec = importlib.util.spec_from_file_location("tr", "$PY"); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 tok = m.presence_lock("aaaa1111")
