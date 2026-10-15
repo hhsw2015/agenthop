@@ -1,0 +1,14 @@
+{
+  "session": "agenthop",
+  "note": "Source of truth for tern-restore.sh. One entry per seat. model=null => tool picks its own (codex). Verified against tern ls --json on 2026-10-15.",
+  "seats": [
+    { "role": "Manager",       "tool": "claude", "sid": "c5beaa7c-acbb-4637-a197-2e9014ae42f8", "cwd": "~/Dev/agenthop",        "model": "cpa-local/claude-fable-5-1[1m]" },
+    { "role": "Platform Dev",  "tool": "claude", "sid": "90b58f9c-5bac-4318-a996-2373c179d674", "cwd": "~/Dev/agenthop",        "model": "cpa-local/claude-opus-5-5[1m]" },
+    { "role": "Infra Dev",     "tool": "claude", "sid": "f32a0507-27bd-47d2-adea-9f30b87612ae", "cwd": "~/Dev/agenthop",        "model": "cpa-local/claude-opus-5-5[1m]" },
+    { "role": "OpenDot Dev",   "tool": "claude", "sid": "aad02248-c76b-4a1a-b191-95da3f0bfb5a", "cwd": "~/Dev/OpenDots",        "model": "cpa-local/claude-opus-5-5[1m]" },
+    { "role": "Reserve",       "tool": "claude", "sid": "d7f6c917-4566-48ec-93fa-8feacf43fbd7", "cwd": "~/Work",                "model": "cpa-local/claude-opus-5-5[1m]" },
+    { "role": "Chief Review",  "tool": "codex",  "sid": "01a13284-d361-74a0-a026-ad56f1fdf355", "cwd": "~/Work",                "model": null },
+    { "role": "Second Voice",  "tool": "codex",  "sid": "01a13274-b00a-7df2-9006-71fdb958aedf", "cwd": "~/Dev/happycapy",       "model": null },
+    { "role": "Model Gateway", "tool": "claude", "sid": "ded2cb57-69fb-4deb-a6b6-58d57ae781d4", "cwd": "~/Dev/CLIProxyAPIPlus", "model": "cpa-local/claude-opus-4-8[1m]" }
+  ]
+}
