@@ -2,8 +2,9 @@
  * Orphan sweep (#1033 r3; user rule "no leaks", coordinator ruling: RECORD-DRIVEN). Runs every ORPHAN_EVERY_MS from the tern-bridge
  * sweep step. Three classes:
  *   ① a herdr session REGISTERED in a seat-shell record (workers[].herdr_session) whose worker is state "stopped" (or "orphan")
- *      but the herdr session still exists ⇒ `herdr session stop <name>` then `herdr session delete <name>`, only when that record's
- *      server_pid is the sole holder of the session's herdr.sock and no newer active record holds the name (r11, names are reused).
+ *      but the herdr session still exists ⇒ SIGTERM that record's server_pid, then `herdr session delete <name>` once the pid is gone
+ *      and nothing holds the socket — only when server_pid is the sole holder of the session's herdr.sock and no newer active record
+ *      holds the name (r11/r12: names are reused, so nothing is ever stopped by name).
  *   ② a seat-shell worker in state "live" whose Tern block (workers[].pane) is gone from `tern ls --json` ⇒ mark the record
  *      "orphan" (+stopped_at), then ① applies to its herdr session on the following confirmations. "starting" (no block yet,
  *      pane 0) is never judged; a persisting "stopping" is reported as a possible leak, never marked or deleted (#1034 r3).
@@ -39,7 +40,11 @@ export type OrphanIO = {
   /** pids holding the herdr session's herdr.sock (lsof); null = cannot observe. TBS-SV-NAME-REUSE: the proof of WHICH server a
    *  session name currently belongs to — the name alone is not, because a later start may reuse it. */
   socketOwners: (name: string) => number[] | null;
-  herdrStop: (name: string) => boolean;
+  /** SIGTERM exactly this pid (the record's verified server) — never a by-name `herdr server stop`, which hits whoever owns the
+   *  session's socket at that moment (TBS-SV-NAME-REUSE probe/action gap). */
+  signalPid: (pid: number) => boolean;
+  /** Wait (bounded) until `pid` is gone. true = it exited; false = still alive or unknown at the deadline. */
+  waitPidGone: (pid: number) => boolean;
   herdrDelete: (name: string) => boolean;
   /** Mark ONE worker instance orphan. `inst` = the instance seen on both rounds (pane + started_at); the writer re-reads the record
    *  and changes it only if the same instance is still there (a restarted worker with the same name is a different instance). */
@@ -150,9 +155,15 @@ export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; u
             skipped = owners === null ? "socket owner unobservable" : owners.length === 0 ? "no server holds the socket" : `socket held by ${owners.join(",")}, not ${spid}`;
             return;
           }
-          const stopped = io.herdrStop(hs);
-          const deleted = stopped && io.herdrDelete(hs);
-          line = `orphan-sweep herdr session ${hs} (seat ${sid.slice(0, 8)}, record ${state}, server ${spid}): stop=${stopped} delete=${deleted}`;
+          // terminate the verified INSTANCE (its pid), never "whoever owns the name now"; delete only once that pid is gone AND
+          // nothing holds the socket — a server that took the name in between keeps its session.
+          const signalled = io.signalPid(spid);
+          const exited = signalled && io.waitPidGone(spid);
+          const after = exited ? io.socketOwners(hs) : null;
+          const free = after !== null && after.length === 0;
+          const deleted = free && io.herdrDelete(hs);
+          line = `orphan-sweep herdr session ${hs} (seat ${sid.slice(0, 8)}, record ${state}, server ${spid}): signal=${signalled} exited=${exited} `
+            + `delete=${deleted}${exited && !free ? ` (not deleted: socket ${after === null ? "owner unobservable" : `held by ${after.join(",")}`})` : ""}`;
         });
         if (!ran) io.log(`orphan-sweep: ${hs} (seat ${sid.slice(0, 8)}) is no longer this stopped/orphan instance — candidate dropped, record kept`);
         else if (skipped) io.log(`orphan-sweep: herdr session ${hs} (seat ${sid.slice(0, 8)}) is not this record's server (${skipped}) — no action, record kept`);
@@ -238,6 +249,22 @@ export function realSocketOwners(env: NodeJS.ProcessEnv = process.env): OrphanIO
   return realWorkerDeps(env).socketOwners; // the same lsof probe stopWorker uses (#1034 r5)
 }
 
+const PID_GONE_MS = 5_000;
+/** SIGTERM one pid; ESRCH/EPERM ⇒ false (not signalled). */
+export function realSignalPid(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false;
+  try { process.kill(pid, "SIGTERM"); return true; } catch { return false; }
+}
+/** Poll until `pid` is definitely gone (ESRCH), at most PID_GONE_MS. EPERM / any other probe answer = still there. */
+export function realWaitPidGone(pid: number, sleepMs: (ms: number) => void = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)): boolean {
+  const deadline = Date.now() + PID_GONE_MS;
+  for (;;) {
+    try { process.kill(pid, 0); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ESRCH") return true; }
+    if (Date.now() >= deadline) return false;
+    sleepMs(100);
+  }
+}
+
 export function realHerdr(env: NodeJS.ProcessEnv = process.env) {
   const bin = env.HERDR_BIN || "herdr";
   const run = (args: string[]) => spawnSync(bin, args, { encoding: "utf8", timeout: HERDR_TIMEOUT_MS, env });
@@ -251,7 +278,6 @@ export function realHerdr(env: NodeJS.ProcessEnv = process.env) {
         return d.sessions.map((s) => (typeof s.name === "string" ? s.name : "")).filter(Boolean);
       } catch { return null; }
     },
-    stop: (name: string) => { const r = run(["session", "stop", name]); return !r.error && r.status === 0; },
     del: (name: string) => { const r = run(["session", "delete", name]); return !r.error && r.status === 0; },
   };
 }

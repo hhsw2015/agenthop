@@ -85,7 +85,7 @@ import { writeConsoleProjection } from "../packages/bus/src/swarm/console-projec
 import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swarm/idle-explainer.js";
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
-import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
+import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
 import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, bridgeHome, bridgeScriptEnv, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
 import { modelMarketEnabled } from "../packages/bus/src/swarm/model-market.js";
 import { pullModelMarket } from "../packages/bus/src/swarm/model-market-store.js";
@@ -1986,7 +1986,7 @@ async function main(): Promise<void> {
   };
   const orphanIO = {
     seatRecords: realSeatRecords(HOME), herdrSessions: herdr.sessions, ternBlocks: realTernBlocks(ternLs),
-    herdrStop: herdr.stop, herdrDelete: herdr.del, markWorker: realMarkWorker(HOME), whileInstance: realWhileInstance(HOME), socketOwners: realSocketOwners(process.env), gc: realGc(bridgeScriptEnv(process.env, BRIDGE_HOME), bridgeDirPath),
+    signalPid: realSignalPid, waitPidGone: (pid: number) => realWaitPidGone(pid), herdrDelete: herdr.del, markWorker: realMarkWorker(HOME), whileInstance: realWhileInstance(HOME), socketOwners: realSocketOwners(process.env), gc: realGc(bridgeScriptEnv(process.env, BRIDGE_HOME), bridgeDirPath),
     ...realTmpFiles(BRIDGE_HOME, () => Date.now()), nowMs: () => Date.now(), log, audit: ternBridgeIO.controlLog,
   };
   const runTernBridgeStep = (): void => {

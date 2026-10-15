@@ -18,6 +18,7 @@ type W = {
   stopped: string[]; deleted: string[]; marked: string[]; gcCode: number; gcLine: string;
   tmp: Array<{ name: string; ageMs: number }>; removed: string[]; logs: string[]; audit: string[];
   owners?: Record<string, number[] | null>;
+  dead?: Array<{ name: string; pid: number }>;
 };
 const world = (): W => ({ clock: 0, recs: [], sessions: ["default"], blocks: new Set(), stopped: [], deleted: [], marked: [],
   gcCode: 0, gcLine: "gc: results=0 requests_quarantined=0 requests_held=0 tmp=0 quarantine_expired=0", tmp: [], removed: [], logs: [], audit: [] });
@@ -25,11 +26,17 @@ const io = (w: W): OrphanIO => ({
   seatRecords: () => w.recs, herdrSessions: () => w.sessions, ternBlocks: () => w.blocks,
   socketOwners: (n) => {
     if (w.owners && n in w.owners) return w.owners[n]!;
-    if (!(w.sessions ?? []).includes(n)) return [];
+    if (!(w.sessions ?? []).includes(n) || (w.dead ?? []).some((d) => d.name === n)) return [];
     const own = (w.recs ?? []).flatMap((r) => r.workers).filter((x) => x.herdr_session === n).map((x) => x.server_pid).filter((p): p is number => typeof p === "number");
     return own.length ? [own[own.length - 1]!] : [];
   },
-  herdrStop: (n) => { w.stopped.push(n); return true; },
+  // a signalled server releases its session socket; w.stopped records the SESSION whose server got the signal
+  signalPid: (pid) => {
+    const r = (w.recs ?? []).flatMap((r) => r.workers).find((x) => x.server_pid === pid);
+    const n = typeof r?.herdr_session === "string" ? r.herdr_session : `pid:${pid}`;
+    w.stopped.push(n); (w.dead ??= []).push({ name: n, pid }); return true;
+  },
+  waitPidGone: (pid) => (w.dead ?? []).some((d) => d.pid === pid),
   herdrDelete: (n) => { w.deleted.push(n); w.sessions = (w.sessions ?? []).filter((x) => x !== n); return true; },
   whileInstance: (sid, hs, inst, states, act) => {
     const x = (w.recs ?? []).find((r) => r.sid === sid)?.workers.find((x) => x.herdr_session === hs && x.pane === inst.pane && x.started_at === inst.startedAt);
@@ -241,15 +248,16 @@ for (const which of ["recs", "sessions", "blocks"] as const) {
   const cur = () => { const r = readSeat(home, sid); return r.kind === "ok" ? r.workers[0]!.state : null; };
   const run = (start: RW, flipAt: number | null) => {
     writeWorkers(home, sid, [start]);
-    let clock = 0, rnd = 0, sessions = ["default", inst.herdr_session];
+    let clock = 0, rnd = 0, sessions = ["default", inst.herdr_session], killed = false;
     const ev: string[] = [];
     const io: OrphanIO = {
       seatRecords: realSeatRecords(home), herdrSessions: () => sessions,
       // a legal locked writer (stopWorker) moves the instance to "stopping" AFTER this round's collection read
       ternBlocks: () => { if (rnd === flipAt) setWorkerState(home, sid, start, "stopping", null); return new Set([1]); },
       markWorker: realMarkWorker(home), whileInstance: realWhileInstance(home),
-      socketOwners: (n) => (sessions.includes(n) ? [50001] : []),
-      herdrStop: (n) => { ev.push(`stop ${n} @${cur()}`); return true; },
+      socketOwners: (n) => (sessions.includes(n) && !killed ? [50001] : []),
+      signalPid: (pid) => { ev.push(`stop ${pid === 50001 ? "review-state" : pid} @${cur()}`); killed = true; return true; },
+      waitPidGone: () => killed,
       herdrDelete: (n) => { ev.push(`delete ${n} @${cur()}`); sessions = sessions.filter((x) => x !== n); return true; },
       gc: () => ({ code: 0, line: "gc: results=0 tmp=0" }), tmpFiles: () => [], removeTmp: () => false,
       nowMs: () => clock, log: (l) => ev.push(l), audit: (l) => ev.push(l),
