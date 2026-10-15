@@ -5,15 +5,21 @@
 //   (--to defaults to SWARM_COORDINATOR resolved via resolveCoordinatorInbox; AH_HOME overrides the home dir)
 //
 // Scope (frozen): ONLY top-level `<name>.json` messages in the old box. `processed/`, `.pubcred/`, quarantine and `.wtmp-*` temps are
-// never touched. A `.claim-<pid>` held by a LIVE process is in flight and is left alone; one held by a DEAD pid is first returned to
-// pending — WITHOUT overwriting (r3): if a new message already sits at that name, the claim is kept and reported as a conflict.
+// never touched, and neither is any bus consumer's `.claim-*` (live or dead — the box's own consumer recovers those).
 //
-// Per message (r2, CIA-MIGRATION-CLAIM): (1) CLAIM it — the bus's atomic rename `<name>.json → <name>.json.claim-<our pid>`. If that
+// The migrator's claims use their OWN namespace, `<name>.json.mig-<pid>` (r5, CIA-SHARED-RECOVERY): the bus's recoverStaleClaims
+// renames a dead `.claim-<pid>` back over the pending name, so a shared-format claim the migrator kept on a conflict (A, with a new
+// message B at the pending name) would be overwritten by the next ordinary recovery. recoverStaleClaims does not match `.mig-*`; the
+// migrator recovers only its own dead `.mig-<pid>` claims, WITHOUT overwriting (a taken name ⇒ claim kept, reported as conflict).
+//
+// Per message (r2, CIA-MIGRATION-CLAIM): (1) CLAIM it — an atomic rename `<name>.json → <name>.json.mig-<our pid>`. If that
 // rename fails, another consumer took it first ⇒ `contended`, not moved. Holding the claim, no other consumer can read or publish it.
 // (2) Validate; an invalid message is released back to pending and reported (never dropped, never quarantined). (3) Publish into the
 // new box with an idempotency key that encodes the SOURCE BOX and the FULL source file name without ambiguity (CIA-MIGRATION-KEY):
-// `mig-` + sha256(fromSid + NUL + name)[0..32]. (4) Only after the new box answers published/already, remove our claim. A crash after
-// (1) leaves `.claim-<dead pid>`, which the next run recovers; the key makes the re-publish "already", so no message is duplicated.
+// `mig-` + sha256(fromSid + NUL + name + NUL + body)[0..32]. (4) Only after the new box answers published/already, remove our claim. A crash after
+// (1) leaves `.mig-<dead pid>`, which the next run recovers; the key makes the re-publish "already", so no message is duplicated.
+// Known limit: the inbox sentinel counts only `.claim-*` orphans, so a dead `.mig-*` claim is not reported as stranded there; the
+// CLI reports it (conflict / failed, non-zero exit) and a re-run recovers it.
 import { homedir } from "node:os";
 import { readdirSync, readFileSync, renameSync, unlinkSync, linkSync, lstatSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -21,6 +27,10 @@ import path from "node:path";
 import { writeInbox, validInboxMsg } from "../packages/bus/src/inbox.js";
 import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { resolveCoordinatorInbox } from "../packages/bus/src/swarm/coord-inbox.js";
+
+/** The migrator's claim namespace — distinct from the bus's `.claim-` so the bus's overwriting recoverStaleClaims never touches it. */
+export const MIG_CLAIM_SUFFIX = ".mig-";
+const MIG_CLAIM_RE = /^(.+\.json)\.mig-(\d+)$/;
 
 export type MigrateOutcome = { moved: string[]; skippedInvalid: string[]; skippedNonRegular: { name: string; why: string }[]; contended: string[]; conflict: string[]; failed: { name: string; why: string }[] };
 
@@ -45,15 +55,16 @@ function regularMessageFile(p: string): { kind: "ok" } | { kind: "nonregular"; w
   return { kind: "ok" };
 }
 
-/** Dead-claim recovery for the OLD box, with the same no-overwrite rule (the bus core's recoverStaleClaims uses rename, which can
- *  replace a message a writer has since put at the pending name). A conflict keeps the claim; an IO error is reported as FAILED with
+/** Recovery of the MIGRATOR'S OWN dead claims (`.mig-<pid>`) in the OLD box, with the no-overwrite rule (the bus core's
+ *  recoverStaleClaims uses rename, which can replace a message a writer has since put at the pending name). Bus `.claim-*` entries
+ *  are not ours and are left to the box's consumer. A conflict keeps the claim; an IO error is reported as FAILED with
  *  its errno (CIA-SV-P2-2) — recovery is never silent. Non-regular claim entries are left untouched and reported. Never throws. */
 function recoverDeadClaimsNoOverwrite(dir: string, out: MigrateOutcome): void {
   let names: string[];
   try { names = readdirSync(dir); }
   catch (e) { const code = (e as NodeJS.ErrnoException).code; if (code !== "ENOENT") out.failed.push({ name: "(old box)", why: `cannot list for recovery (${code})` }); return; }
   for (const n of names) {
-    const m = n.match(/^(.+\.json)\.claim-(?:disp-)?(\d+)$/);
+    const m = n.match(MIG_CLAIM_RE);
     if (!m) continue;
     const pid = Number(m[2]);
     let alive = false;
@@ -104,7 +115,7 @@ export function migrateCoordInbox(home: string, fromSid: string, toSid: string, 
       (msg ? out.moved : out.skippedInvalid).push(name);
       continue;
     }
-    const claimed = `${file}.claim-${claimer}`;
+    const claimed = `${file}${MIG_CLAIM_SUFFIX}${claimer}`;
     try { renameSync(file, claimed); }
     catch (e) { // CIA-CLAIM-ERRNO: only a VANISHED source is a lost race; any other errno is a real fault
       const code = (e as NodeJS.ErrnoException).code;
