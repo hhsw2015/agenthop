@@ -149,7 +149,16 @@ _G.tern = {
 }
 
 package.loaded["./claim"] = assert(loadfile(here .. "../claim.luau"))()
-assert(loadfile(here .. "../window.luau"))()
+-- r10 GATE: load window.luau in an env whose globals are READ-ONLY, like Tern's plugin VM. Any global write (e.g. `_G.x = …` or an
+-- undeclared assignment) raises here exactly as it does live — "passes locally, dies in Tern" (r9 @613e691, 10:56 syntax) turns RED.
+local SANDBOX = setmetatable({}, {
+  __index = _G,
+  __newindex = function(_, k) error("attempt to modify a readonly table (global '" .. tostring(k) .. "')", 2) end,
+})
+rawset(SANDBOX, "_G", SANDBOX) -- `_G.x = …` inside the plugin hits the same read-only proxy
+local loadedOk, __bridge_test = pcall(assert(loadfile(here .. "../window.luau", "t", SANDBOX)))
+ck("r10 gate: window.luau loads with a READ-ONLY _G (no global writes, as in Tern's VM)", loadedOk == true)
+if not loadedOk then print("   load error: " .. tostring(__bridge_test)); os.exit(1) end
 
 local AGENTS = "/h/.agenthop/tern-panes/agents.json"
 local RES = "/h/.agenthop/tern-panes/results/"

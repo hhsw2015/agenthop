@@ -5,7 +5,15 @@
 -- mutual-watch, ② batch coverage (every pane body-scanned over rounds). (④ CPA probe is bash — see cpa-probe.test.sh.)
 
 local here = (arg[0] or ""):match("^(.*/)") or "./"
-local load_check = assert(loadfile(here .. "../sentinel.luau"))
+-- r10 GATE: compile sentinel.luau against READ-ONLY globals (Tern compiles `check` inside a plugin VM whose _G is read-only). The
+-- proxy reads through to the real globals (so the fixture's `tern` / `os` mocks are visible) but any WRITE raises — a stray global
+-- assignment in the check would break live while passing a plain loadfile.
+local SENTINEL_ENV = setmetatable({}, {
+  __index = _G,
+  __newindex = function(_, k) error("attempt to modify a readonly table (global '" .. tostring(k) .. "')", 2) end,
+})
+rawset(SENTINEL_ENV, "_G", SENTINEL_ENV)
+local load_check = assert(loadfile(here .. "../sentinel.luau", "t", SENTINEL_ENV))
 
 local failures = 0
 local function check_(name, cond)

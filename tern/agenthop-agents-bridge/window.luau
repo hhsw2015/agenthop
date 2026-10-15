@@ -255,7 +255,6 @@ local function mirrorTimer(cx)
   if cx ~= nil then mirrorTick(cx) end
 end
 
-_G.__bridge_test = { armScan = armScan, armCancel = armCancel } -- test seam: lets the fixture assert return values
 tern.command({ id = "arm-scan", title = "agenthop bridge: list patrol tasks (read-only; also the post-add verifier)", run = function() ensure(); armScan() end })
 tern.command({ id = "arm-cancel", title = "agenthop bridge: cancel the patrol id in kv bridge.arm_cancel_id", run = function() ensure(); armCancel() end })
 -- `arm` (compatibility: #1033's sweep and agenthop_tern's recovery call it) = arm-scan (read-only). One tern.carly call per hook.
@@ -275,3 +274,7 @@ tern.command({ id = "drain-start", title = "agenthop bridge: drain start request
 mirrorTimer(nil) -- A1 best-effort mirror chain on the TIMER hook (the swarm-triggered `mirror` command is the primary driver)
 -- r4: NO arm on the timer hook — that hook now carries the mirror chain, and the arm's three cross-VM tern.carly calls must not be
 -- able to disable it. Arming runs only on the `arm` command (its own hook), which the swarm triggers after every load/reload.
+
+-- r10 test seam: the chunk's RETURN value (Tern ignores a plugin chunk's return; the fixture reads it). NEVER write globals — Tern's
+-- plugin VM _G is READ-ONLY (r9's `_G.__bridge_test = …` raised "attempt to modify a readonly table" at load and muted the plugin live).
+return { armScan = armScan, armCancel = armCancel }
