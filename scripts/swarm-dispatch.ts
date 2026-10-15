@@ -86,7 +86,7 @@ import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swa
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
-import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realCancelIdSetter, realScheduler, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
+import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
 import { modelMarketEnabled } from "../packages/bus/src/swarm/model-market.js";
 import { pullModelMarket } from "../packages/bus/src/swarm/model-market-store.js";
 import { modelStaffingEnabled, taskFromNode, type StaffingTaskInput } from "../packages/bus/src/swarm/model-staffing.js";
@@ -1955,7 +1955,6 @@ async function main(): Promise<void> {
     readMirror: realMirrorReader(HOME),
     readSentinel: realSentinelReader(HOME),
     clearSentinel: realClearSentinel(HOME),
-    setCancelId: realCancelIdSetter(process.env),
     schedule: realScheduler(process.env, process.env.AGENTHOP_BRIDGE_DIR || path.join(SCRIPTS_DIR, "..", "tern", "agenthop-agents-bridge")),
     pendingRequests: realPendingRequests(HOME, () => Date.now()),
     nowMs: () => Date.now(),

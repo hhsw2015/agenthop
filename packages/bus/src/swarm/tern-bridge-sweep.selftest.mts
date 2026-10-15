@@ -8,11 +8,11 @@
  *
  * Run: node_modules/.bin/tsx packages/bus/src/swarm/tern-bridge-sweep.selftest.mts  (from repo root)
  */
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realSentinelReader, realClearSentinel, realCancelIdSetter,
+  ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realSentinelReader, realClearSentinel,
   armSequence, ACTION, RELOAD_MIN_MS,
   type BridgeIO, type Mirror, type PendingReq, type TernResult, type ArmStatus,
 } from "./tern-bridge-sweep.js";
@@ -23,17 +23,17 @@ type World = {
   clock: number; mirror: Mirror; reqs: PendingReq[]; ternUp: boolean;
   calls: string[]; logs: string[]; control: string[];
   onReload?: () => void; mirrorAdvances: boolean;
-  // fake r9 bridge: the live patrol task ids, kv bridge.arm_cancel_id, and the status file it writes
-  patrols: number[]; nextId: number; kvCancel: number | null; sentinel: ArmStatus;
+  // fake r11 bridge: live patrol task ids + the status file (arm-cancel-next reads the ids the last scan recorded)
+  patrols: number[]; nextId: number; sentinel: ArmStatus;
   failStep?: string;            // a tern ctl action that returns not-ok
-  cancelFails?: boolean;        // arm-cancel writes cancel-failed (keeps the obligation)
+  cancelFails?: boolean;        // arm-cancel-next writes cancel-failed (keeps the obligation)
   scheduleCode?: number;        // arm-schedule.sh exit code override
   scheduleNoop?: boolean;       // arm-schedule.sh says 0 but schedules nothing (verify must catch it)
-  kvFail?: boolean; scheduleCalls: number;
+  scheduleCalls: number;
 };
 function world(): World {
   return { clock: 0, mirror: { tick: 1, vm: "vmA" }, reqs: [], ternUp: true, calls: [], logs: [], control: [], mirrorAdvances: true,
-    patrols: [], nextId: 100, kvCancel: null, sentinel: null, scheduleCalls: 0 };
+    patrols: [], nextId: 100, sentinel: null, scheduleCalls: 0 };
 }
 function io(w: World): BridgeIO {
   return {
@@ -46,18 +46,21 @@ function io(w: World): BridgeIO {
       if (act !== null && act === w.failStep) return { ok: false, detail: "exit 1" };
       if (act === "mirror" && w.mirrorAdvances && w.mirror) w.mirror = { ...w.mirror, tick: w.mirror.tick + 1 };
       if (act === "arm-scan" || act === "arm") w.sentinel = { step: "scanned", count: w.patrols.length, ids: [...w.patrols], id: null, error: null };
-      if (act === "arm-cancel") {
-        const id = w.kvCancel;
-        if (id === null) w.sentinel = { step: "cancel-idle", count: null, ids: null, id: null, error: null };
-        else if (w.cancelFails) w.sentinel = { step: "cancel-failed", count: null, ids: null, id, error: "x" };
-        else { w.patrols = w.patrols.filter((x) => x !== id); w.kvCancel = null; w.sentinel = { step: "cancelled", count: null, ids: null, id, error: null }; }
+      if (act === "arm-cancel-next") {
+        const ids = w.sentinel?.ids ?? null;
+        if (ids === null) w.sentinel = { step: "cancel-unknown", count: null, ids: null, id: null, error: "run arm-scan first" };
+        else if (ids.length <= 1) w.sentinel = { step: "cancel-idle", count: ids.length, ids, id: null, error: null };
+        else {
+          const sorted = [...ids].sort((a, b) => a - b); const victim = sorted[0]!;
+          if (w.cancelFails) w.sentinel = { step: "cancel-failed", count: ids.length, ids, id: victim, error: "x" };
+          else { w.patrols = w.patrols.filter((x) => x !== victim); const rest = sorted.slice(1); w.sentinel = { step: "cancelled-one", count: rest.length, ids: rest, id: victim, error: null }; }
+        }
       }
       return { ok: true, detail: "" };
     },
     readMirror: () => w.mirror,
     readSentinel: () => w.sentinel,
     clearSentinel: () => { w.sentinel = null; },
-    setCancelId: (id) => { if (w.kvFail) return false; w.kvCancel = id; return true; },
     schedule: () => {
       w.scheduleCalls++; w.calls.push("arm-schedule.sh");
       if (w.scheduleCode !== undefined) return { code: w.scheduleCode, detail: "fake" };
@@ -150,36 +153,41 @@ t("flag: on with 1", ternBridgeEnabled({ SWARM_TERN_BRIDGE: "1" }) === true);
   t("debounce: reload allowed again after 60s", reloads(w) === 2);
 }
 
-// --- r9 arm sequence ---
+// --- r11 arm sequence ---
 const steps = (w: World) => w.calls.map((c) => c.replace(`ctl plugins run ${ACTION}.`, "")).filter((c) => c.startsWith("arm"));
+const onAct = (b: BridgeIO, act: string, f: () => void) => { const rr = b.tern; b.tern = (x) => { const r = rr(x); if (x.join(" ").endsWith("." + act)) f(); return r; }; };
 { const w = world(); const r = armSequence(io(w));
   t("arm: 0 patrols => scan, schedule.sh, verify scan", r.ok && steps(w).join(",") === "arm-scan,arm-schedule.sh,arm-scan" && w.patrols.length === 1); }
 { const w = world(); w.patrols = [7]; const r = armSequence(io(w));
   t("arm: 1 patrol => scan only (idempotent)", r.ok && steps(w).join(",") === "arm-scan" && w.scheduleCalls === 0); }
 { const w = world(); w.patrols = [7, 8, 9]; const r = armSequence(io(w));
-  t("arm: 3 patrols => cancel 2 extras via kv, re-scan each, no schedule", r.ok && w.patrols.length === 1 && w.scheduleCalls === 0
-    && steps(w).join(",") === "arm-scan,arm-cancel,arm-scan,arm-cancel,arm-scan"); }
+  t("arm: 3 patrols => 2x arm-cancel-next, confirm scan, keeps newest, no schedule", r.ok && w.patrols.join() === "9" && w.scheduleCalls === 0
+    && steps(w).join(",") === "arm-scan,arm-cancel-next,arm-cancel-next,arm-scan"); }
 { const w = world(); w.patrols = [7, 8]; w.cancelFails = true; const r = armSequence(io(w));
-  t("arm: cancel-failed => stop, obligation kept in kv, no schedule", !r.ok && w.kvCancel === 8 && w.scheduleCalls === 0 && /arm-cancel/.test(r.detail)); }
-{ const w = world(); w.patrols = [7, 8]; w.kvFail = true; const r = armSequence(io(w));
-  t("arm: kv write fails => stop before arm-cancel", !r.ok && !steps(w).includes("arm-cancel")); }
+  t("arm: cancel-failed => stop (retry next round), no schedule", !r.ok && /cancel-failed/.test(r.detail) && w.scheduleCalls === 0 && w.patrols.length === 2); }
+{ const w = world(); w.patrols = [7, 8]; const b = io(w);
+  onAct(b, "arm-cancel-next", () => { w.sentinel = { step: "cancel-unknown", count: null, ids: null, id: null, error: "x" }; });
+  const r = armSequence(b); t("arm: cancel-unknown => stop as UNKNOWN", !r.ok && /UNKNOWN/.test(r.detail) && w.scheduleCalls === 0); }
+{ const w = world(); w.patrols = [7, 8]; const b = io(w);
+  onAct(b, "arm-cancel-next", () => { w.sentinel = { step: "cancel-idle", count: 2, ids: [7, 8], id: null, error: null }; });
+  const r = armSequence(b); t("arm: cancel-idle while count>1 => stop as UNKNOWN", !r.ok && /UNKNOWN/.test(r.detail)); }
+{ const w = world(); w.patrols = [7, 8]; const b = io(w);
+  onAct(b, "arm-cancel-next", () => { w.sentinel = { step: "cancelled-one", count: 2, ids: [7, 8], id: 7, error: null }; });
+  const r = armSequence(b); t("arm: stale 'cancelled-one' without a count drop => stop, no progress", !r.ok && /no progress/.test(r.detail)); }
 { const w = world(); w.scheduleCode = 1; const r = armSequence(io(w));
   t("arm: schedule.sh exit 1 => stop", !r.ok && /arm-schedule.sh: exit 1/.test(r.detail)); }
 { const w = world(); w.scheduleNoop = true; const r = armSequence(io(w));
   t("arm: schedule.sh says 0 but nothing scheduled => our verify scan catches it", !r.ok && /verify/.test(r.detail)); }
 { const w = world(); w.failStep = "arm-scan"; const r = armSequence(io(w));
   t("arm: scan not answered => stop, nothing else", !r.ok && steps(w).join(",") === "arm-scan"); }
-{ const w = world(); const b = io(w); const realRun = b.tern; b.tern = (a) => { const r = realRun(a); if (a.join(" ").endsWith(".arm-scan")) w.sentinel = null; return r; };
+{ const w = world(); const b = io(w); onAct(b, "arm-scan", () => { w.sentinel = null; });
   t("arm: ctl ok but no fresh sentinel.json => stop (ctl ok is not proof)", !armSequence(b).ok); }
 { const w = world(); w.sentinel = { step: "scanned", count: 0, ids: [], id: null, error: null };
   const b = io(w); const realRun = b.tern; b.tern = (a) => (a.join(" ").endsWith(".arm-scan") ? { ok: true, detail: "" } : realRun(a));
   t("arm: a stale 'scanned' file is cleared first, never read as this scan", !armSequence(b).ok && w.scheduleCalls === 0); }
-{ // arm-cancel answers "cancelled" for a DIFFERENT id (stale kv / race) => not confirmed => stop
-  const w = world(); w.patrols = [7, 8]; const b = io(w); const realRun = b.tern;
-  b.tern = (x) => { const r = realRun(x); if (x.join(" ").endsWith(".arm-cancel")) w.sentinel = { step: "cancelled", count: null, ids: null, id: 999, error: null }; return r; };
-  const r = armSequence(b);
-  t("arm: cancel confirmed for another id => stop, no schedule", !r.ok && /not confirmed/.test(r.detail) && w.scheduleCalls === 0);
-}
+{ const w = world(); w.patrols = [7, 8]; const b = io(w); let n = 0;
+  onAct(b, "arm-scan", () => { if (++n === 2) { w.patrols.push(50); w.sentinel = { step: "scanned", count: 2, ids: [8, 50], id: null, error: null }; } });
+  const r = armSequence(b); t("arm: confirm scan after cancels sees count != 1 => stop", !r.ok && /after cancel/.test(r.detail)); }
 { // three reruns => exactly one patrol
   const w = world(); for (let k = 0; k < 3; k++) armSequence(io(w));
   t("arm: three reruns => one patrol, one schedule", w.patrols.length === 1 && w.scheduleCalls === 1); }
@@ -202,9 +210,6 @@ const steps = (w: World) => w.calls.map((c) => c.replace(`ctl plugins run ${ACTI
   writeFileSync(path.join(d, "sentinel.json"), JSON.stringify({ step: "scanned", count: "2" }));
   t("sentinel reader: non-integer count => null field", realSentinelReader(home)()?.count === null);
   realClearSentinel(home)(); t("clearSentinel removes the file", realSentinelReader(home)() === null);
-  const kvf = path.join(home, "kv.json"); writeFileSync(kvf, JSON.stringify({ other: 1 }));
-  t("kv setter: writes id, keeps other keys", realCancelIdSetter({ AGENTHOP_BRIDGE_KV: kvf })(9) && (() => { const k = JSON.parse(readFileSync(kvf, "utf8")); return k["bridge.arm_cancel_id"] === 9 && k.other === 1; })());
-  writeFileSync(kvf, "{torn"); t("kv setter: refuses to overwrite an unparseable kv.json", realCancelIdSetter({ AGENTHOP_BRIDGE_KV: kvf })(9) === false && readFileSync(kvf, "utf8") === "{torn");
   writeFileSync(path.join(d, "sentinel.json"), "{torn");
   t("sentinel reader: torn => null", realSentinelReader(home)() === null);
 }

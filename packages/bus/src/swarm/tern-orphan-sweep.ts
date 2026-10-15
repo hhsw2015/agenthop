@@ -9,6 +9,8 @@
  * Never touched: the herdr session "default", and ANY herdr session that no seat-shell record ever registered (a name shaped like
  * `<role>-<task>` is only a second check, never a reason). Seat-shell schema (coordinator, pinned 2026-10-15):
  *   ~/.agenthop/swarm/seat-shell/<sid>.json  { …, workers: [{ name, herdr_session, pane, kind:"tui", started_at, stopped_at, state }] }
+ *   pane = Tern block id as a NUMBER; started_at / stopped_at = epoch ms numbers (stopped_at null while live). Strict: a pane of any
+ *   other type is a schema violation (logged) and the worker is never judged orphan.
  * Debounce: an orphan is acted on only when the SAME candidate was seen on two consecutive rounds. FC-2: if herdr or tern cannot be
  * read this round ⇒ UNKNOWN ⇒ zero actions (and the two-round memory is cleared, so an unknown round can never count as a "yes").
  * Each action writes one line to the reload audit (same log as the bridge sweep). Pure core + injected IO.
@@ -43,6 +45,12 @@ export type OrphanState = { lastRunMs: number; seen: Set<string> };
 export function initialOrphanState(): OrphanState { return { lastRunMs: -Infinity, seen: new Set() }; }
 
 const str = (v: unknown): string | null => (typeof v === "string" && v !== "" ? v : null);
+/** Tern block id from a worker record. Schema (coordinator, 2026-10-15): pane is a NUMBER. Strict on purpose: accepting a numeric
+ *  string too would let a wrongly-typed writer go unnoticed forever. Anything else ⇒ null ⇒ cannot prove the block is gone ⇒ the
+ *  worker is never marked orphan, and the caller logs a schema-violation line so the bad record is visible. */
+export function paneId(v: unknown): number | null {
+  return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null;
+}
 
 /** One orphan round. Returns the candidate keys acted on (for tests). */
 export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; unknown: boolean; acted: string[] } {
@@ -80,9 +88,12 @@ export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; u
     const state = str(w.state);
     if (hs === null || hs === "default" || !NAME_SHAPE.test(hs)) continue; // second check only; never a reason to act
     // ② live record whose Tern block vanished ⇒ mark orphan (two rounds)
-    if ((state === "live" || state === "stopping") && typeof w.pane === "number" && !blocks.has(w.pane)) {
+    const pane = paneId(w.pane);
+    if ((state === "live" || state === "stopping") && pane === null)
+      io.log(`orphan-sweep: schema-violation seat ${sid.slice(0, 8)} worker ${hs}: pane ${JSON.stringify(w.pane)} is not a number — not judged`);
+    if ((state === "live" || state === "stopping") && pane !== null && !blocks.has(pane)) {
       candidates.push({ key: `mark:${sid}:${hs}`, act: () => {
-        if (io.markWorker(sid, hs, "orphan", now)) io.audit(`orphan-sweep marked ${hs} orphan (seat ${sid.slice(0, 8)}, block ${w.pane} gone)`);
+        if (io.markWorker(sid, hs, "orphan", now)) io.audit(`orphan-sweep marked ${hs} orphan (seat ${sid.slice(0, 8)}, block ${pane} gone)`);
         else io.log(`orphan-sweep: could not mark ${hs} orphan`);
       } });
       continue;
@@ -131,7 +142,7 @@ export function realMarkWorker(home: string): OrphanIO["markWorker"] {
       const d = JSON.parse(readFileSync(file, "utf8")) as { workers?: Worker[] };
       if (!Array.isArray(d.workers)) return false;
       let hit = false;
-      d.workers = d.workers.map((w) => (w.herdr_session === hs ? (hit = true, { ...w, state, stopped_at: stoppedAt }) : w));
+      d.workers = d.workers.map((w) => (w.herdr_session === hs ? (hit = true, { ...w, state, stopped_at: stoppedAt }) : w)); // epoch ms
       if (!hit) return false;
       const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
       writeFileSync(tmp, JSON.stringify(d) + "\n", { flag: "wx", mode: 0o600 });

@@ -7,7 +7,7 @@
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { runOrphanSweep, initialOrphanState, ORPHAN_EVERY_MS, TMP_TTL_MS, realSeatRecords, realMarkWorker, realTernBlocks, type OrphanIO, type SeatRecord } from "./tern-orphan-sweep.js";
+import { runOrphanSweep, initialOrphanState, paneId, ORPHAN_EVERY_MS, TMP_TTL_MS, realSeatRecords, realMarkWorker, realTernBlocks, type OrphanIO, type SeatRecord } from "./tern-orphan-sweep.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
@@ -66,6 +66,19 @@ const worker = (hs: string, state: string, pane: number) => ({ name: hs, herdr_s
   round(st, w); t("②→①: orphan session not deleted on its first ① sighting", w.deleted.length === 0);
   round(st, w); t("②→①: deleted on the next round", w.deleted.join() === "dev-tests");
 }
+// --- strict schema: a pane that is not a number is a visible schema violation and is never judged ---
+{
+  const w = world(); const st = initialOrphanState();
+  w.recs = [{ sid: "seatS-5555", workers: [{ ...worker("dev-str", "live", 0), pane: "1056561954852" }] }];
+  w.sessions = ["default", "dev-str"]; w.blocks = new Set([1]);
+  round(st, w); round(st, w); round(st, w);
+  t("string pane: never marked orphan", w.marked.length === 0 && w.deleted.length === 0);
+  t("string pane: schema-violation logged", w.logs.some((l) => /schema-violation/.test(l) && /dev-str/.test(l)));
+}
+t("paneId: number", paneId(42) === 42);
+t("paneId: numeric string rejected (strict)", paneId("1056561954852") === null);
+t("paneId: non-integer / negative / null rejected", paneId(1.5) === null && paneId(-3) === null && paneId(null) === null);
+
 // --- never touched: default, unregistered sessions (even with role-task shape), records without herdr_session ---
 {
   const w = world(); const st = initialOrphanState();
