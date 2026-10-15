@@ -21,7 +21,8 @@
 import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { setWorkerState } from "../tern-workers.js";
+import { isWorker, type Worker as RecordedWorker } from "../tern-workers.js";
+import { updateSeatShell } from "./seat-shell-record.js";
 
 export const ORPHAN_EVERY_MS = 60_000;
 export const TMP_TTL_MS = 3_600_000;
@@ -39,6 +40,10 @@ export type OrphanIO = {
   /** Mark ONE worker instance orphan. `inst` = the instance seen on both rounds (pane + started_at); the writer re-reads the record
    *  and changes it only if the same instance is still there (a restarted worker with the same name is a different instance). */
   markWorker: (sid: string, herdrSession: string, inst: { pane: number; startedAt: unknown }, state: "orphan", stoppedAt: number) => boolean;
+  /** TBS-STATE-COMMIT: run `act` only while the record still holds the same instance (herdr_session + pane + started_at) in one of
+   *  `states`, with that state held for the whole of `act` (real IO: inside the seat-shell lock). false = not run (the instance
+   *  moved to another state, is gone, or cannot be read). A state seen at collection time is never enough by itself. */
+  whileInstance: (sid: string, herdrSession: string, inst: { pane: unknown; startedAt: unknown }, states: readonly string[], act: () => void) => boolean;
   gc: () => { code: number; line: string };            // bridge gc.sh: exit 1 = control dir unreadable = UNKNOWN
   tmpFiles: () => Array<{ name: string; ageMs: number }>; // mirror-phase.json / diag.json with age
   removeTmp: (name: string) => boolean;
@@ -123,9 +128,14 @@ export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; u
     // ① stopped/orphan record whose herdr session still exists ⇒ stop + delete (two rounds)
     if ((state === "stopped" || state === "orphan") && live.has(hs)) {
       candidates.push({ key: `kill:${sid}:${hs}:${JSON.stringify(w.pane ?? null)}:${JSON.stringify(w.started_at ?? null)}`, act: () => {
-        const stopped = io.herdrStop(hs);
-        const deleted = stopped && io.herdrDelete(hs);
-        io.audit(`orphan-sweep herdr session ${hs} (seat ${sid.slice(0, 8)}, record ${state}): stop=${stopped} delete=${deleted}`);
+        let line = "";
+        const ran = io.whileInstance(sid, hs, { pane: w.pane ?? null, startedAt: w.started_at ?? null }, ["stopped", "orphan"], () => {
+          const stopped = io.herdrStop(hs);
+          const deleted = stopped && io.herdrDelete(hs);
+          line = `orphan-sweep herdr session ${hs} (seat ${sid.slice(0, 8)}, record ${state}): stop=${stopped} delete=${deleted}`;
+        });
+        if (ran) io.audit(line);
+        else io.log(`orphan-sweep: ${hs} (seat ${sid.slice(0, 8)}) is no longer this stopped/orphan instance — candidate dropped, record kept`);
       } });
     }
   }
@@ -162,20 +172,43 @@ export function realSeatRecords(home: string): () => SeatRecord[] | null {
   };
 }
 
-/** Mark one worker instance orphan through Platform Dev's setWorkerState (tern-workers.ts, @6016b1d; coordinator ruling A):
- *  it runs inside the shared locked writer updateSeatShell and changes state + stopped_at on exactly the entry matching
- *  herdr_session + pane + started_at, nothing else. An instance that is no longer recorded (re-published with a new pane /
- *  started_at, or removed), a busy lock, or an unreadable record makes it throw and write nothing ⇒ false (FC-2: not marked). */
+/** Under the seat-shell lock (the shared writer updateSeatShell), find exactly the instance (herdr_session + pane + started_at) and
+ *  hand it to `fn` only if its CURRENT state is one of `states`. `fn` returns the replacement entry (written, rest of the record
+ *  untouched) or null (nothing written). Anything else — instance gone, another state, unreadable/bad record, busy lock — ⇒ false. */
+function underInstance(home: string, sid: string, hs: string, inst: { pane: unknown; startedAt: unknown }, states: readonly string[],
+  fn: (w: RecordedWorker) => RecordedWorker | null): boolean {
+  let matched = false;
+  const r = updateSeatShell(home, sid, (rec) => {
+    const ws = rec.workers;
+    if (!Array.isArray(ws) || !ws.every(isWorker)) return null;
+    const i = ws.findIndex((x) => x.herdr_session === hs && x.pane === inst.pane && x.started_at === inst.startedAt);
+    if (i < 0 || !states.includes(ws[i]!.state)) return null;
+    matched = true;
+    const next = fn(ws[i]!);
+    if (next === null) return null;
+    if (!isWorker(next)) throw new Error(`refusing to write a worker that breaks the schema: ${JSON.stringify(next)}`);
+    return { ...rec, workers: ws.map((x, j) => (j === i ? next : x)) };
+  });
+  return matched && r.state === "ok";
+}
+
+/** Mark one worker instance orphan, as a compare-and-set under the seat-shell lock: written only if that instance is STILL "live"
+ *  when the lock is held (TBS-STATE-COMMIT — a concurrent stopWorker that already wrote "stopping" wins, and the stale candidate is
+ *  dropped). Only state + stopped_at change. A re-published instance, a busy lock or an unreadable record ⇒ false (not marked). */
 export function realMarkWorker(home: string): OrphanIO["markWorker"] {
   return (sid, hs, inst, state, stoppedAt) => {
-    if (typeof inst.startedAt !== "number") return false; // the pinned schema has numeric started_at; anything else cannot match
-    try {
-      setWorkerState(home, sid, { name: hs, herdr_session: hs, pane: inst.pane, kind: "tui", started_at: inst.startedAt,
-        stopped_at: null, state: "live" }, state, stoppedAt);
-      return true;
-    } catch {
-      return false;
-    }
+    try { return underInstance(home, sid, hs, inst, ["live"], (w) => ({ ...w, state, stopped_at: stoppedAt })); }
+    catch { return false; }
+  };
+}
+
+/** Run `act` (herdr stop + delete) while holding the seat-shell lock, only if the instance is still in `states`; nothing written.
+ *  ponytail: the lock is held across the herdr calls (≤ 2 × HERDR_TIMEOUT_MS); a writer that needs it meanwhile gets "busy" and
+ *  reports it (FC-2), never a torn state. Move to a claim state if that wait ever matters. */
+export function realWhileInstance(home: string): OrphanIO["whileInstance"] {
+  return (sid, hs, inst, states, act) => {
+    try { return underInstance(home, sid, hs, inst, states, () => { act(); return null; }); }
+    catch { return false; }
   };
 }
 

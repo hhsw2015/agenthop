@@ -5,9 +5,11 @@
  * Run: node_modules/.bin/tsx packages/bus/src/swarm/tern-orphan-sweep.selftest.mts  (from repo root)
  */
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { writeWorkers, setWorkerState, readSeat, type Worker as RW } from "../tern-workers.js";
 import os from "node:os";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
-import { runOrphanSweep, initialOrphanState, paneId, ORPHAN_EVERY_MS, TMP_TTL_MS, realSeatRecords, realMarkWorker, realTernBlocks, type OrphanIO, type SeatRecord } from "./tern-orphan-sweep.js";
+import { runOrphanSweep, initialOrphanState, paneId, ORPHAN_EVERY_MS, TMP_TTL_MS, realSeatRecords, realMarkWorker, realWhileInstance, realTernBlocks, type OrphanIO, type SeatRecord } from "./tern-orphan-sweep.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
@@ -22,6 +24,11 @@ const io = (w: W): OrphanIO => ({
   seatRecords: () => w.recs, herdrSessions: () => w.sessions, ternBlocks: () => w.blocks,
   herdrStop: (n) => { w.stopped.push(n); return true; },
   herdrDelete: (n) => { w.deleted.push(n); w.sessions = (w.sessions ?? []).filter((x) => x !== n); return true; },
+  whileInstance: (sid, hs, inst, states, act) => {
+    const x = (w.recs ?? []).find((r) => r.sid === sid)?.workers.find((x) => x.herdr_session === hs && x.pane === inst.pane && x.started_at === inst.startedAt);
+    if (!x || !states.includes(x.state as string)) return false;
+    act(); return true;
+  },
   markWorker: (sid, hs, inst, state) => { w.marked.push(hs); for (const r of w.recs ?? []) if (r.sid === sid) for (const x of r.workers) if (x.herdr_session === hs && x.pane === inst.pane && x.started_at === inst.startedAt) x.state = state; return true; },
   gc: () => ({ code: w.gcCode, line: w.gcLine }),
   tmpFiles: () => w.tmp, removeTmp: (n) => { w.removed.push(n); return true; },
@@ -216,5 +223,62 @@ for (const which of ["recs", "sessions", "blocks"] as const) {
   t("tern ls parser: missing live => UNKNOWN", lsWith({ id: 777 }) === null);
   t("tern ls parser: null block => UNKNOWN", lsWith(null) === null);
   t("tern ls parser: tern did not answer => null", realTernBlocks(() => null)() === null);
+}
+
+// --- TBS-STATE-COMMIT: the state an action needs is checked at the commit point (real seat-shell files + the shared locked writer) ---
+{
+  const home = mkdtempSync(path.join(os.tmpdir(), "orphan-commit-"));
+  const sid = "00000000-0000-4000-8000-000000000091";
+  const inst: RW = { name: "review-state", herdr_session: "review-state", pane: 555, kind: "tui", started_at: 1000, stopped_at: null, state: "live" };
+  const cur = () => { const r = readSeat(home, sid); return r.kind === "ok" ? r.workers[0]!.state : null; };
+  const run = (start: RW, flipAt: number | null) => {
+    writeWorkers(home, sid, [start]);
+    let clock = 0, rnd = 0, sessions = ["default", inst.herdr_session];
+    const ev: string[] = [];
+    const io: OrphanIO = {
+      seatRecords: realSeatRecords(home), herdrSessions: () => sessions,
+      // a legal locked writer (stopWorker) moves the instance to "stopping" AFTER this round's collection read
+      ternBlocks: () => { if (rnd === flipAt) setWorkerState(home, sid, start, "stopping", null); return new Set([1]); },
+      markWorker: realMarkWorker(home), whileInstance: realWhileInstance(home),
+      herdrStop: (n) => { ev.push(`stop ${n} @${cur()}`); return true; },
+      herdrDelete: (n) => { ev.push(`delete ${n} @${cur()}`); sessions = sessions.filter((x) => x !== n); return true; },
+      gc: () => ({ code: 0, line: "gc: results=0 tmp=0" }), tmpFiles: () => [], removeTmp: () => false,
+      nowMs: () => clock, log: (l) => ev.push(l), audit: (l) => ev.push(l),
+    };
+    const st = initialOrphanState();
+    for (rnd = 0; rnd < 4; rnd++) { runOrphanSweep(st, io); clock += ORPHAN_EVERY_MS; }
+    return ev;
+  };
+  // window 1: live seen twice, but turned "stopping" between round 2's read and its mark ⇒ never marked, never stopped/deleted
+  let ev = run(inst, 1);
+  t("state-commit: live→stopping before the mark ⇒ stays stopping (not overwritten orphan)", cur() === "stopping");
+  t("state-commit: … and zero stop/delete", !ev.some((l) => /^(stop|delete) /.test(l)));
+  t("state-commit: … the dropped mark is logged", ev.some((l) => /could not mark review-state orphan/.test(l)));
+  // positive: stays live ⇒ marked on round 2, stop+delete on round 4 while the record is orphan
+  ev = run(inst, null);
+  t("state-commit positive: live kept ⇒ marked orphan, then stop+delete under orphan", cur() === "orphan"
+    && ev.includes("stop review-state @orphan") && ev.includes("delete review-state @orphan"));
+  // window 2: orphan seen twice, turned "stopping" between round 2's read and the stop/delete ⇒ zero stop/delete, record kept
+  ev = run({ ...inst, state: "orphan", stopped_at: 5 }, 1);
+  t("state-commit: orphan→stopping before stop/delete ⇒ zero stop/delete", !ev.some((l) => /^(stop|delete) /.test(l)));
+  t("state-commit: … record kept as stopping, candidate dropped", cur() === "stopping" && ev.some((l) => /candidate dropped, record kept/.test(l)));
+  // window 2 positive: stays stopped ⇒ stop+delete on round 2, state seen inside the action is still stopped
+  ev = run({ ...inst, state: "stopped", stopped_at: 5 }, null);
+  t("state-commit positive: stopped kept ⇒ stop+delete with the record still stopped", ev.includes("stop review-state @stopped") && ev.includes("delete review-state @stopped"));
+  // the action holds the lock: a writer arriving during stop/delete cannot slip a state change in underneath it
+  writeWorkers(home, sid, [{ ...inst, state: "stopped", stopped_at: 5 }]);
+  // (another PROCESS: holder-lock reclaims tokens carrying its own pid, so an in-process writer is not a concurrent writer)
+  const writer = path.join(home, "writer.mts");
+  writeFileSync(writer, `import { setWorkerState } from ${JSON.stringify(path.resolve("packages/bus/src/tern-workers.ts"))};
+try { setWorkerState(${JSON.stringify(home)}, ${JSON.stringify(sid)}, ${JSON.stringify({ ...inst, state: "stopped", stopped_at: 5 })}, "live", null); console.log("wrote"); }
+catch { console.log("blocked"); }`);
+  let inner = "";
+  realWhileInstance(home)(sid, inst.herdr_session, { pane: 555, startedAt: 1000 }, ["stopped"], () => {
+    inner = spawnSync(process.execPath, [...process.execArgv, writer], { encoding: "utf8", timeout: 20_000 }).stdout.trim();
+  });
+  t("state-commit: a concurrent writer (other process) is blocked while stop/delete runs", inner === "blocked" && cur() === "stopped");
+  t("state-commit: … and writes once the action is done (lock released)", spawnSync(process.execPath, [...process.execArgv, writer], { encoding: "utf8" }).stdout.trim() === "wrote" && cur() === "live");
+  t("state-commit: unreadable record ⇒ action not run", (() => { writeFileSync(path.join(home, ".agenthop", "swarm", "seat-shell", `${sid}.json`), "{torn"); let ran = false;
+    const ok = realWhileInstance(home)(sid, inst.herdr_session, { pane: 555, startedAt: 1000 }, ["stopped"], () => { ran = true; }); return !ok && !ran; })());
 }
 console.log("PASS tern-orphan-sweep");
