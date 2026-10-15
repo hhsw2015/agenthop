@@ -94,6 +94,19 @@ function mutateWorkers(home: string, sid: string, fn: (cur: Worker[]) => Worker[
   if (r.state !== "ok") throw new Error(`seat-shell ${r.state}: ${r.reason}`);
 }
 
+/** One instance = (herdr_session, pane, started_at). Pure. */
+export function sameInstance(a: Worker, b: Worker): boolean {
+  return a.herdr_session === b.herdr_session && a.pane === b.pane && a.started_at === b.started_at;
+}
+/** Change state/stopped_at of exactly the matching instance, under the lock; every other field and entry untouched, no reorder.
+ *  The same shape the #1033 orphan sweep uses to mark an instance "orphan". Throws when the instance is not recorded. */
+export function setWorkerState(home: string, sid: string, inst: Worker, state: WorkerState, stopped_at: number | null): void {
+  mutateWorkers(home, sid, (cur) => {
+    if (!cur.some((x) => sameInstance(x, inst))) throw new Error(`instance ${inst.herdr_session}:${inst.pane}:${inst.started_at} not recorded`);
+    return cur.map((x) => (sameInstance(x, inst) ? { ...x, state, stopped_at } : x));
+  });
+}
+
 function upsert(home: string, sid: string, w: Worker): void {
   mutateWorkers(home, sid, (cur) => [...cur.filter((x) => x.name !== w.name), w]);
 }
@@ -278,8 +291,10 @@ export async function stopWorker(seatSid: string, name: string, d: WorkerDeps): 
   if (seat.kind !== "ok") return { state: "unknown", name, steps, reason: seat.kind === "absent" ? "seat has no record" : seat.reason };
   const w = seat.workers.find((x) => x.name === name);
   if (!w) return { state: "unknown", name, steps, reason: `no worker ${name} recorded on this seat` };
+  // set state/stopped_at on THIS instance only, under the lock, keeping whatever else the entry carries now (never the snapshot
+  // read above — another writer, e.g. the #1033 orphan sweep, may have touched it meanwhile)
   const record = (state: WorkerState, stopped_at: number | null) => {
-    try { upsert(d.home, seatSid, { ...w, state, stopped_at }); return true; }
+    try { setWorkerState(d.home, seatSid, w, state, stopped_at); return true; }
     catch (e) { steps.push({ step: `record ${state}`, ok: false, detail: (e as Error).message }); return false; }
   };
   record("stopping", null); // FIRST: a crash mid-stop leaves "stopping", never "live"

@@ -15,6 +15,12 @@ import { acquireHolderLock, releaseHolderLock, type LockSite } from "./holder-lo
  *   rev is no longer the one read under the lock (a writer that bypassed the lock), nothing is written ⇒ "conflict". A rev read
  *   BEFORE taking the lock is NOT compared: honest locked writers legitimately advance it while we wait (8-process test).
  *
+ * fn CONTRACT (coordinator ruling, binding on every writer): fn changes ONLY the fields its writer owns and returns the WHOLE record;
+ * keys it does not recognise are kept exactly as they are. Ownership: `shell`/`pid` = the seat-shell registrar (tern-restore);
+ * `workers[]` = agenthop_tern start/stop (tern-workers.ts), except that the #1033 orphan sweep may set `state: "orphan"` and
+ * `stopped_at` on the ONE matching instance (herdr_session + pane + started_at), changing nothing else — no add, no delete, no
+ * reorder (setWorkerState). `rev` is managed here; a writer never sets it.
+ *
  * Lock = the shared holder-lock primitive (holder-lock.ts: atomic-mkdir dir, identity in the file NAME, pre-mkdir hold intents),
  * NOT a timestamp lock file: a holder is reclaimed only when its pid is DEFINITELY dead (ESRCH), never after a fixed age — a live
  * but slow writer is never robbed. Contended ⇒ retried for up to ~2s, then "busy" (the caller decides; nothing is written).

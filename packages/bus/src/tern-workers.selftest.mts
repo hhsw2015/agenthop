@@ -6,7 +6,7 @@
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { capGate, freeBytes, readSeat, startWorker, stopWorker, workerName, workersStatus, writeWorkers, type Worker, type WorkerDeps } from "./tern-workers.js";
+import { capGate, freeBytes, readSeat, setWorkerState, startWorker, stopWorker, workerName, workersStatus, writeWorkers, type Worker, type WorkerDeps } from "./tern-workers.js";
 import type { Run } from "./tern-bridge.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
@@ -186,6 +186,41 @@ t("capGate pure: stopped workers do not count", capGate(SEAT, { workers: [{ name
     writeFileSync(path.join(home, ".agenthop", "swarm", "seat-shell", `${SEAT}.json`), JSON.stringify({ workers: [{ name: "x" }] }));
     return readSeat(home, SEAT).kind === "unreadable";
   })())
+}
+
+// ---- shared ownership (#1033 option A): only the matching instance's state/stopped_at change, under the lock ----
+{
+  const { home } = setup();
+  const a: Worker = { name: "p-a", herdr_session: "p-a", pane: 11, kind: "tui", started_at: 1000, stopped_at: null, state: "live" };
+  const b: Worker = { name: "p-b", herdr_session: "p-b", pane: 12, kind: "tui", started_at: 2000, stopped_at: null, state: "live" };
+  writeWorkers(home, SEAT, [a, b]);
+  setWorkerState(home, SEAT, b, "orphan", 5000);
+  const ws = (readSeat(home, SEAT) as any).workers as Worker[];
+  t("setWorkerState: only the matching instance changes; order and the other entry untouched", ws.length === 2 && ws[0]!.state === "live" && ws[1]!.state === "orphan" && ws[1]!.stopped_at === 5000 && ws[0]!.name === "p-a")
+  let threw = false;
+  try { setWorkerState(home, SEAT, { ...a, started_at: 999 }, "orphan", 1); } catch { threw = true; }
+  t("setWorkerState: a different instance (same name, other started_at) is not matched ⇒ throws, nothing written", threw && ((readSeat(home, SEAT) as any).workers as Worker[])[0]!.state === "live")
+}
+{
+  // stop must not resurrect a field another writer set meanwhile: the orphan sweep marks the instance, THEN stop records stopped
+  const { home, f, d } = setup();
+  const s = await start(d, "race");
+  const w0 = ((readSeat(home, SEAT) as any).workers as Worker[])[0]!;
+  const run0 = d.run;
+  let marked = false;
+  d.run = async (bin, args, ms) => {
+    if (!marked && bin === "herdr" && args[2] === "server" && args[3] === "stop") {
+      marked = true;
+      // another writer adds a NEW worker entry while stop is in flight (a concurrent start on the same seat)
+      const other: Worker = { name: "p-other", herdr_session: "p-other", pane: 99, kind: "tui", started_at: 7, stopped_at: null, state: "live" };
+      writeWorkers(home, SEAT, [...((readSeat(home, SEAT) as any).workers as Worker[]), other]);
+    }
+    return run0(bin, args, ms);
+  };
+  await stopWorker(SEAT, "platform-dev-race", d);
+  const ws = (readSeat(home, SEAT) as any).workers as Worker[];
+  t("stop writes under the lock: our instance ends stopped AND the entry another writer added meanwhile survives", ws.length === 2 && ws.find((x) => x.name === "platform-dev-race")?.state === "stopped" && ws.some((x) => x.name === "p-other" && x.state === "live"))
+  void s; void f;
 }
 
 console.log("all tern-workers selftests passed");
