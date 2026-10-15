@@ -46,9 +46,14 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
   if (pidFile) {
     // #1053 r2: origin "bus". Never replace a LIVE agent record written by the seat launcher (seat-presence). When we do not
     // write, the bootstrap's handshake still sees the file exist (it is the agent's), so the entry returns promptly.
-    let wrote = false;
-    try { wrote = pidSid !== null && pidHome !== null && isPresenceSid(pidSid) && writeBusPresence(pidHome, pidSid, process.pid, pidAlive); } catch { /* below */ }
-    if (!wrote && !existsSync(pidFile)) { try { writeFileSync(pidFile, String(process.pid)); } catch { /* best effort */ } }
+    // SP-BOOTSTRAP-FALLBACK: for a valid sid the ONLY write path is writeBusPresence (per-sid lock, re-read under it). Its false —
+    // an agent record, a busy lock, an unreadable sidecar — is a HOLD: no second, unlocked write. (The heartbeat retries it.)
+    // A pid file whose name is not a session id has no other writer (seat-presence refuses such names) and keeps the plain write.
+    if (pidSid !== null && pidHome !== null && isPresenceSid(pidSid)) {
+      try { writeBusPresence(pidHome, pidSid, process.pid, pidAlive); } catch { /* HOLD */ }
+    } else if (!existsSync(pidFile)) {
+      try { writeFileSync(pidFile, String(process.pid)); } catch { /* best effort */ }
+    }
   }
   const home = opts.home ?? homedir();
   let sockServer: net.Server | null = null;

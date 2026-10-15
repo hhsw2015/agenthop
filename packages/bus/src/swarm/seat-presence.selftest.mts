@@ -7,7 +7,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { busMayWrite, parsePs, readOrigin, removeOwnPresence, resolveAgentPid, writeBusPresence, writePresence } from "./seat-presence.js";
+import { busMayWrite, endBusPresence, parsePs, readOrigin, removeOwnPresence, resolveAgentPid, writeBusPresence, writePresence } from "./seat-presence.js";
 import { makeFileLiveness } from "./task-liveness.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
@@ -92,6 +92,23 @@ chmodSync(f, 0o600);
 t("write: an existing UNREADABLE file ⇒ refused (FC-2), not overwritten", ro.state === "refused" && readFileSync(f, "utf8") === "4170")
 t("write: no temp files left behind", readdirSync(path.dirname(f)).every((n) => !n.includes(".tmp-")))
 void mkdirSync;
+// ---- SP-SESSIONEND (TS side): endBusPresence kills only a bus/legacy record, strictly parsed, under the lock ----
+{
+  const h = mkdtempSync(path.join(os.tmpdir(), "sp5-"));
+  const pf = path.join(h, ".agenthop", "presence", `${A}.pid`);
+  const of = pf.replace(/\.pid$/, ".origin");
+  mkdirSync(path.dirname(pf), { recursive: true });
+  const kills: number[] = [];
+  const k = (p: number) => { kills.push(p); };
+  writeFileSync(pf, "321"); writeFileSync(of, "origin=agent ts=1\n");
+  t("END: origin=agent ⇒ held, no kill, kept", endBusPresence(h, A, k) === "held" && kills.length === 0 && existsSync(pf))
+  writeFileSync(of, "origin=bus THIS-IS-NOT-A-TIMESTAMP\n");
+  t("END: 'origin=bus <junk>' is unreadable (strict parse) ⇒ held", endBusPresence(h, A, k) === "held" && kills.length === 0)
+  writeFileSync(of, "origin=bus ts=1\n");
+  t("END: origin=bus ⇒ killed that pid, .pid and sidecar removed", endBusPresence(h, A, k) === "killed" && kills[0] === 321 && !existsSync(pf) && !existsSync(of))
+  t("END: absent ⇒ absent, nothing killed", endBusPresence(h, A, k) === "absent" && kills.length === 1)
+}
+
 // ---- #1053 r2: two writers, agent authoritative, origin in a SIDECAR (the .pid stays one number for every existing reader) ----
 {
   const h = mkdtempSync(path.join(os.tmpdir(), "sp2-"));

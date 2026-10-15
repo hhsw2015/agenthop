@@ -2,7 +2,7 @@ import { existsSync, lstatSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { installClaudePresenceHooks, installCodexPresenceHooks, installClaudeStatusHooks, installCodexStatusHooks, mcpHints, opencodeConfigDir, opencodePluginPath, registerMcp, writeOpencodePlugin } from "../src/agents.js";
 import { parseArgs } from "../src/args.js";
 
@@ -429,14 +429,25 @@ describe("plugging into agents as an MCP server", () => {
   });
 });
 
-// #1053 r3 SP-SESSIONEND: the INSTALLED SessionEnd command must not kill / delete an AGENT presence record (sidecar origin=agent).
-describe("presence SessionEnd hook respects the origin sidecar", () => {
+// #1053 r4 SP-SESSIONEND: the INSTALLED SessionEnd command hands over to the presence bundle (endBusPresence: per-sid lock, strict
+// origin). The bundle is BUILT from the current source for this test (bun), so the gate exercises the real chain.
+describe("presence SessionEnd hook respects the origin sidecar and the presence lock", () => {
   const SID = "11111111-2222-4333-8444-555555555555";
-  async function runEnd(tool: "claude" | "codex", origin: string | null): Promise<{ killed: boolean; pidKept: boolean }> {
+  let bundle = "";
+  beforeAll(async () => {
+    const { spawnSync } = await import("node:child_process");
+    bundle = path.join(await mkdtemp(path.join(tmpdir(), "pmjs-")), "presence.mjs");
+    const r = spawnSync("bun", ["build", path.resolve(__dirname, "../../bus/src/presence-entry.ts"), "--target=node", "--format=esm", `--outfile=${bundle}`], { encoding: "utf8" });
+    expect(r.status, r.stderr).toBe(0);
+  }, 120_000);
+  async function runEnd(tool: "claude" | "codex", origin: string | null, lockedBy?: number, oldBundle = false): Promise<{ killed: boolean; pidKept: boolean; started?: boolean }> {
     const { spawn, spawnSync } = await import("node:child_process");
+    const { copyFileSync } = await import("node:fs");
     const h = await home();
-    const cfg = tool === "claude" ? installClaudePresenceHooks(h) : installCodexPresenceHooks(h);
-    expect(cfg).toBeTruthy();
+    tool === "claude" ? installClaudePresenceHooks(h) : installCodexPresenceHooks(h);
+    await mkdir(path.join(h, ".agenthop"), { recursive: true });
+    if (oldBundle) await writeFile(path.join(h, ".agenthop", "presence.mjs"), `require("fs").writeFileSync(${JSON.stringify(path.join(h, "STARTED"))}, "1");\n`);
+    else copyFileSync(bundle, path.join(h, ".agenthop", "presence.mjs"));
     const file = tool === "claude" ? path.join(h, ".claude", "settings.json") : path.join(h, ".codex", "hooks.json");
     const j = JSON.parse(await readFile(file, "utf8")) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
     const end = j.hooks.SessionEnd!.flatMap((g) => g.hooks).find((x) => x.command.includes("presence"))!.command;
@@ -446,24 +457,35 @@ describe("presence SessionEnd hook respects the origin sidecar", () => {
     let killed = false; victim.on("exit", () => { killed = true; });
     await writeFile(path.join(pd, `${SID}.pid`), String(victim.pid));
     if (origin !== null) await writeFile(path.join(pd, `${SID}.origin`), origin);
-    spawnSync("sh", ["-c", end], { input: JSON.stringify({ session_id: SID }), env: { ...process.env, HOME: h, CLAUDE_CODE_SESSION_ID: SID } });
-    await new Promise((r) => setTimeout(r, 300));
+    if (lockedBy) {
+      await mkdir(path.join(pd, `${SID}.lockd`));
+      await writeFile(path.join(pd, `${SID}.lockd`, `${lockedBy}.feed00000000`), "");
+      await writeFile(path.join(pd, `${SID}.lockd.hold.${lockedBy}.feed00000000`), "");
+    }
+    spawnSync("sh", ["-c", end], { input: JSON.stringify({ session_id: SID }), env: { ...process.env, HOME: h, CLAUDE_CODE_SESSION_ID: SID }, timeout: 20_000 });
+    await new Promise((r) => setTimeout(r, 400));
     const pidKept = existsSync(path.join(pd, `${SID}.pid`));
     if (!killed) victim.kill();
-    return { killed, pidKept };
+    return oldBundle ? { killed, pidKept, started: existsSync(path.join(h, "STARTED")) } : { killed, pidKept };
   }
   for (const tool of ["claude", "codex"] as const) {
     it(`${tool}: origin=agent ⇒ nothing killed, record kept`, async () => {
       expect(await runEnd(tool, "origin=agent ts=1\n")).toEqual({ killed: false, pidKept: true });
-    });
-    it(`${tool}: origin=bus ⇒ old behaviour (kill + remove)`, async () => {
+    }, 30_000);
+    it(`${tool}: origin=bus ⇒ kill + remove`, async () => {
       expect(await runEnd(tool, "origin=bus ts=1\n")).toEqual({ killed: true, pidKept: false });
-    });
-    it(`${tool}: no sidecar (legacy) ⇒ old behaviour`, async () => {
+    }, 30_000);
+    it(`${tool}: no sidecar (legacy) ⇒ kill + remove`, async () => {
       expect(await runEnd(tool, null)).toEqual({ killed: true, pidKept: false });
-    });
-    it(`${tool}: malformed sidecar ⇒ unknown ⇒ nothing killed`, async () => {
-      expect(await runEnd(tool, "origin=agnet ts=1\n")).toEqual({ killed: false, pidKept: true });
-    });
+    }, 30_000);
+    it(`${tool}: "origin=bus THIS-IS-NOT-A-TIMESTAMP" ⇒ unreadable (same strict parse as TS) ⇒ nothing killed`, async () => {
+      expect(await runEnd(tool, "origin=bus THIS-IS-NOT-A-TIMESTAMP\n")).toEqual({ killed: false, pidKept: true });
+    }, 30_000);
+    it(`${tool}: an OLD bundle without the end mode is never run at SessionEnd (it would start a daemon)`, async () => {
+      expect(await runEnd(tool, "origin=bus ts=1\n", undefined, true)).toEqual({ killed: false, pidKept: true, started: false });
+    }, 30_000);
+    it(`${tool}: origin=bus but another writer holds the presence lock ⇒ nothing killed`, async () => {
+      expect(await runEnd(tool, "origin=bus ts=1\n", process.ppid)).toEqual({ killed: false, pidKept: true });
+    }, 30_000);
   }
 });

@@ -254,12 +254,15 @@ function presenceStartCommand(): string {
   return `_in=$(cat 2>/dev/null); ${MODE_FROM_STDIN}; _sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pd="\$HOME/.agenthop/presence"; mkdir -p "\$_pd" 2>/dev/null; _pf="\$_pd/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; if { [ -f "\$_pf" ] && kill -0 "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; }; then :; elif [ -f "\$_mjs" ]; then _rt="\$(command -v bun || command -v node)"; if [ -n "\$_rt" ]; then AGENTHOP_PID_FILE="\$_pf" AGENTHOP_HOST_PID="\$PPID" AGENTHOP_MODE="\$_mode" "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1; fi; fi; fi >/dev/null 2>&1 || true ${PRESENCE_START_MARK}`;
 }
 
-/** The SessionEnd command that stops this session's presence node (by the pid agenthop recorded) and removes the file.
- *  #1053 r3 (SP-SESSIONEND): presence/<sid>.pid may hold the AGENT's pid (written by the seat launcher, sidecar origin=agent).
- *  If a sidecar exists and does not positively say origin=bus (agent, or unreadable/unknown), the hook kills nothing and deletes
- *  nothing; with origin=bus or no sidecar (legacy) it behaves as before. */
+/** The SessionEnd command that stops this session's presence node and removes its record. #1053 r4 (SP-SESSIONEND): the record
+ *  may be the AGENT's (seat launcher, origin=agent), and the check + kill + remove must happen under the SAME per-sid lock with
+ *  the SAME strict origin parse as the TS writers — a shell one-liner can do neither. So the hook only hands over to the presence
+ *  bundle it already runs at SessionStart (`AGENTHOP_PRESENCE_END=1 <bun|node> ~/.agenthop/presence.mjs`, endBusPresence). No
+ *  bundle or no runtime ⇒ nothing is killed and nothing removed (the bus daemon also self-exits on its host-pid guard). An OLDER
+ *  bundle that has no end mode would treat the call as a daemon START, so the hook runs the bundle only if it names
+ *  AGENTHOP_PRESENCE_END. */
 function presenceEndCommand(): string {
-  return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pf="\$HOME/.agenthop/presence/\$_sid.pid"; _of="\$HOME/.agenthop/presence/\$_sid.origin"; if [ -e "\$_of" ] && ! grep -q '^origin=bus ' "\$_of" 2>/dev/null; then :; else [ -f "\$_pf" ] && kill "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; rm -f "\$_pf" "\$_of"; fi; fi >/dev/null 2>&1 || true ${PRESENCE_END_MARK}`;
+  return `_sid="\${CLAUDE_CODE_SESSION_ID:-}"; if [ -n "\$_sid" ]; then _pf="\$HOME/.agenthop/presence/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; _rt="\$(command -v bun || command -v node)"; if [ -f "\$_mjs" ] && [ -n "\$_rt" ] && grep -q AGENTHOP_PRESENCE_END "\$_mjs" 2>/dev/null; then AGENTHOP_PRESENCE_END=1 AGENTHOP_PID_FILE="\$_pf" "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1; fi; fi >/dev/null 2>&1 || true ${PRESENCE_END_MARK}`;
 }
 
 /**
@@ -311,7 +314,7 @@ function codexPresenceStartCommand(): string {
 
 /** Codex SessionEnd: parse the session id from stdin + stop that presence daemon. */
 function codexPresenceEndCommand(): string {
-  return `${CODEX_SID_FROM_STDIN}; if [ -n "\$_sid" ]; then _pf="\$HOME/.agenthop/presence/\$_sid.pid"; _of="\$HOME/.agenthop/presence/\$_sid.origin"; if [ -e "\$_of" ] && ! grep -q '^origin=bus ' "\$_of" 2>/dev/null; then :; else [ -f "\$_pf" ] && kill "\$(cat "\$_pf" 2>/dev/null)" 2>/dev/null; rm -f "\$_pf" "\$_of"; fi; fi >/dev/null 2>&1 || true ${PRESENCE_END_MARK}`;
+  return `${CODEX_SID_FROM_STDIN}; if [ -n "\$_sid" ]; then _pf="\$HOME/.agenthop/presence/\$_sid.pid"; _mjs="\$HOME/.agenthop/presence.mjs"; _rt="\$(command -v bun || command -v node)"; if [ -f "\$_mjs" ] && [ -n "\$_rt" ] && grep -q AGENTHOP_PRESENCE_END "\$_mjs" 2>/dev/null; then AGENTHOP_PRESENCE_END=1 AGENTHOP_PID_FILE="\$_pf" "\$_rt" "\$_mjs" </dev/null >/dev/null 2>&1; fi; fi >/dev/null 2>&1 || true ${PRESENCE_END_MARK}`;
 }
 
 /**

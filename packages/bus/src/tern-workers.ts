@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { acquireHolderLock, releaseHolderLock, type LockSite } from "./swarm/holder-lock.js";
 import { homedir } from "node:os";
@@ -33,7 +33,7 @@ import { updateSeatShell } from "./swarm/seat-shell-record.js";
  */
 
 export type WorkerState = "starting" | "live" | "stopping" | "stopped" | "orphan";
-export type Worker = { name: string; herdr_session: string; pane: number; kind: "tui"; started_at: number; stopped_at: number | null; state: WorkerState };
+export type Worker = { name: string; herdr_session: string; pane: number; kind: "tui"; started_at: number; stopped_at: number | null; state: WorkerState; server_pid?: number };
 
 export const WORKER_NAME = /^[a-z][a-z0-9-]{0,39}$/;
 const STATES: readonly string[] = ["starting", "live", "stopping", "stopped", "orphan"];
@@ -46,7 +46,8 @@ export function isWorker(v: unknown): v is Worker {
     // pane is the Tern block id; 0 = no block was ever placed (a placeholder, or a start that failed before the split) — never "live"
     && Number.isSafeInteger(w.pane) && ((w.pane as number) > 0 || (w.pane === 0 && w.state !== "live")) && w.kind === "tui"
     && Number.isSafeInteger(w.started_at) && (w.stopped_at === null || Number.isSafeInteger(w.stopped_at))
-    && typeof w.state === "string" && STATES.includes(w.state);
+    && typeof w.state === "string" && STATES.includes(w.state)
+    && (w.server_pid === undefined || (Number.isSafeInteger(w.server_pid) && (w.server_pid as number) > 0)); // additive, optional
 }
 
 /** `<role short>-<task short>`: lower-case, [a-z0-9-], ≤40 chars. null when nothing usable is left. Pure. */
@@ -202,8 +203,13 @@ export type WorkerDeps = {
   tern: string;
   herdr: string;
   run: (bin: string, args: string[], timeoutMs: number) => Promise<Run>;
-  spawnDetached: (bin: string, args: string[]) => { ok: boolean; error?: string };
+  /** spawn a detached daemon with EXTRA env; returns its pid (the instance we created) */
+  spawnDetached: (bin: string, args: string[], extraEnv: Record<string, string>) => { ok: boolean; pid?: number; error?: string };
   socketExists: (session: string) => boolean;
+  /** pids that hold the session's herdr.sock open (lsof); null = could not observe */
+  socketOwners: (session: string) => number[] | null;
+  /** SIGTERM one pid (our own server instance) */
+  signal: (pid: number) => boolean;
   listDir: (d: string) => string[];
   now: () => number;
   sleep: (ms: number) => Promise<void>;
@@ -219,15 +225,22 @@ export function realWorkerDeps(env: NodeJS.ProcessEnv = process.env): WorkerDeps
     tern: ternBin(env) ?? "tern",
     herdr: env.HERDR_BIN ?? "herdr",
     run: realRun(socket),
-    spawnDetached: (bin, args) => {
+    spawnDetached: (bin, args, extraEnv) => {
       try {
-        const c = spawn(bin, args, { detached: true, stdio: "ignore", env: scrubbedEnv(env), cwd: homedir() });
-        c.on("error", () => { /* reported through the socket wait */ });
+        const c = spawn(bin, args, { detached: true, stdio: "ignore", env: { ...scrubbedEnv(env), ...extraEnv }, cwd: homedir() });
+        c.on("error", () => { /* reported through the ownership proof */ });
         c.unref();
-        return { ok: true };
+        return typeof c.pid === "number" ? { ok: true, pid: c.pid } : { ok: false, error: "spawn returned no pid" };
       } catch (e) { return { ok: false, error: (e as Error).message }; }
     },
     socketExists: (name) => existsSync(path.join(homedir(), ".config", "herdr", "sessions", name, "herdr.sock")),
+    socketOwners: (name) => {
+      const r = spawnSync("lsof", ["-t", path.join(homedir(), ".config", "herdr", "sessions", name, "herdr.sock")], { encoding: "utf8", timeout: 5000 });
+      if (r.error) return null;
+      if (r.status !== 0 && r.status !== 1) return null; // lsof: 1 = nothing open
+      return r.stdout.split("\n").map((x) => Number(x.trim())).filter((n) => Number.isSafeInteger(n) && n > 0);
+    },
+    signal: (pid) => { try { process.kill(pid, "SIGTERM"); return true; } catch { return false; } },
     listDir: (d) => readdirSync(d),
     now: () => Date.now(),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -309,19 +322,31 @@ async function launch(a: StartArgs, d: WorkerDeps, ph: Worker, perm: string[]): 
   const name = ph.name;
   const undone: string[] = [];
   let pane: number | undefined;
-  // Undo ONLY what this start created (the name was proven free before the placeholder, so the session is ours). The result is
-  // PROVEN only when every step succeeded and the socket is gone; then the placeholder becomes "stopped", else it stays
-  // "stopping" and keeps counting toward the cap (CLEANUP) — the orphan sweep / a later stop finishes it.
+  // MTB-WORKER-OWN: "the name was free" is not ownership — someone may create the same session after our list. Ownership is
+  // PROVEN only when the process holding the session's herdr.sock is the server pid WE spawned (a second `herdr --session N server`
+  // exits "already running", so if a foreign one won the race, our pid is gone and the socket owner is theirs). Until proven,
+  // nothing that touches the session by NAME may run. Cleanup is bound to that instance: SIGTERM our pid (not `server stop`, which
+  // addresses whoever owns the name), and `session delete` only once our pid is gone and no one else holds the socket.
+  let ownPid: number | undefined;
+  let owned = false;
   const undo = async (): Promise<boolean> => {
     let ok = true;
     if (pane !== undefined) { const c = await d.run(d.tern, ["close", String(pane)], T); undone.push(`tern close: ${failed(c) ?? "ok"}`); ok = ok && !failed(c); }
-    const st = await d.run(d.herdr, ["--session", name, "server", "stop"], T);
-    undone.push(`server stop: ${failed(st) ?? "ok"}`);
+    if (!owned) {
+      // never ours (or unproven): zero stop/delete on the name. If our own server process exists, stop only it.
+      if (ownPid !== undefined) { undone.push(`signal own pid ${ownPid}: ${d.signal(ownPid) ? "sent" : "not running"}`); }
+      undone.push("session NOT owned by this start: left untouched (no server stop, no delete)");
+      return false;
+    }
+    const sent = d.signal(ownPid!);
+    undone.push(`stop own server pid ${ownPid}: ${sent ? "sent" : "already gone"}`);
     const gone = await waitSocket(d, name, false, 3000);
     undone.push(`socket gone: ${gone ? "ok" : "still present"}`);
+    const owners = d.socketOwners(name);
+    if (!gone || owners === null || owners.length > 0) { undone.push("session delete skipped: cannot prove no other instance holds it"); return false; }
     const del = await d.run(d.herdr, ["session", "delete", name], T);
     undone.push(`session delete: ${failed(del) ?? "ok"}`);
-    return ok && !failed(st) && gone && !failed(del);
+    return ok && !failed(del);
   };
   const fail = async (step: string, detail: string): Promise<StartResult> => {
     const proven = await undo();
@@ -331,9 +356,21 @@ async function launch(a: StartArgs, d: WorkerDeps, ph: Worker, perm: string[]): 
     return { state: "failed", step, detail, undone };
   };
 
-  const sp = d.spawnDetached(d.herdr, ["--session", name, "server"]);
-  if (!sp.ok) return fail("herdr server", sp.error ?? "spawn failed");
+  // SH-PARENT-WIRING (#1057): the authoritative parent sid of THIS call goes into the server's environment, which herdr passes to
+  // the panes it creates, so the worker's subagent hook (agenthop hook subagent) can post to the parent inbox (it reads only
+  // SWARM_PARENT_SID; the prompt text is not a channel it can read).
+  const sp = d.spawnDetached(d.herdr, ["--session", name, "server"], { SWARM_PARENT_SID: a.parentSid });
+  if (!sp.ok || sp.pid === undefined) return fail("herdr server", sp.error ?? "spawn failed");
+  ownPid = sp.pid;
   if (!(await waitSocket(d, name, true, 5000))) return fail("herdr server", "socket did not appear in 5s");
+  const deadline = d.now() + 3000;
+  for (;;) {
+    const owners = d.socketOwners(name);
+    if (owners !== null && owners.length === 1 && owners[0] === ownPid) { owned = true; break; }
+    if (owners !== null && owners.length > 0 && !owners.includes(ownPid)) return fail("ownership", `herdr.sock is held by pid ${owners.join(",")}, not by our server ${ownPid}: a foreign instance owns ${name}`);
+    if (d.now() >= deadline) return fail("ownership", owners === null ? "socket owner unobservable (lsof)" : `socket owners ${owners.join(",") || "none"}; cannot prove ${ownPid} owns ${name}`);
+    await d.sleep(100);
+  }
   const ws = await d.run(d.herdr, ["--session", name, "workspace", "create", "--cwd", a.cwd], T);
   let root: string | undefined;
   try { root = (JSON.parse(ws.stdout) as { result?: { root_pane?: { pane_id?: unknown } } }).result?.root_pane?.pane_id as string | undefined; } catch { /* below */ }
@@ -348,7 +385,7 @@ async function launch(a: StartArgs, d: WorkerDeps, ph: Worker, perm: string[]): 
   try { block = (JSON.parse(sb.stdout) as { block?: unknown }).block; } catch { /* below */ }
   if (failed(sb) || !Number.isSafeInteger(block) || (block as number) <= 0) return fail("tern split", failed(sb) ?? "no numeric block id in the reply");
   pane = block as number;
-  try { settle(d.home, a.parentSid, ph, { pane, state: "live" }); }
+  try { settle(d.home, a.parentSid, ph, { pane, state: "live", server_pid: ownPid }); }
   catch (e) { return fail("record", (e as Error).message); }
   return { state: "ok", pane, herdr_session: name };
 }
@@ -383,11 +420,22 @@ export async function stopWorkerAfterRead(seatSid: string, w: Worker, d: WorkerD
     const bad = failed(r);
     steps.push(bad ? { step: label, ok: false, detail: bad } : { step: label, ok: true });
   };
-  await step("herdr server stop", d.herdr, ["--session", w.herdr_session, "server", "stop"]);
-  const gone = await waitSocket(d, w.herdr_session, false, 5000);
-  steps.push(gone ? { step: "socket gone", ok: true } : { step: "socket gone", ok: false, detail: "socket still present after 5s" });
+  // MTB-WORKER-OWN: bound to the instance. With a recorded server_pid, stop only THAT process, and only while it is the one holding
+  // the session's socket; a different owner (the name was taken over) ⇒ that server is not ours: no signal, no delete.
+  let ownerOk = true;
+  if (w.server_pid !== undefined) {
+    const owners = d.socketOwners(w.herdr_session);
+    if (owners === null) { steps.push({ step: "ownership", ok: false, detail: "socket owner unobservable" }); ownerOk = false; }
+    else if (owners.length > 0 && !(owners.length === 1 && owners[0] === w.server_pid)) { steps.push({ step: "ownership", ok: false, detail: `socket held by ${owners.join(",")}, not our server ${w.server_pid}` }); ownerOk = false; }
+    else if (owners.length === 1) steps.push(d.signal(w.server_pid) ? { step: "stop own server", ok: true } : { step: "stop own server", ok: false, detail: "signal failed" });
+  } else {
+    await step("herdr server stop", d.herdr, ["--session", w.herdr_session, "server", "stop"]); // legacy record (no pid)
+  }
+  const gone = ownerOk && await waitSocket(d, w.herdr_session, false, 5000);
+  if (ownerOk) steps.push(gone ? { step: "socket gone", ok: true } : { step: "socket gone", ok: false, detail: "socket still present after 5s" });
   if (w.pane > 0) await step("tern close", d.tern, ["close", String(w.pane)]); // pane 0 = no block was ever placed
-  await step("herdr session delete", d.herdr, ["session", "delete", w.herdr_session]);
+  if (ownerOk && gone) await step("herdr session delete", d.herdr, ["session", "delete", w.herdr_session]);
+  else steps.push({ step: "herdr session delete", ok: false, detail: "skipped: the session is not proven ours / still running" });
   // CLEANUP: "stopped" only when every step is proven; otherwise the entry stays "stopping" (keeps its capacity, re-stoppable)
   const proven = steps.every((s) => s.ok);
   if (proven) record("stopped", d.now());

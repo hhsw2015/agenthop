@@ -161,6 +161,27 @@ export function writeBusPresence(home: string, sid: string, self: number, alive:
   } catch { return false; }
 }
 
+/** SessionEnd (SP-SESSIONEND): under the per-sid lock, re-read .pid and .origin; ONLY when the origin is "bus" (strict full-line
+ *  parse, the same readOrigin) or absent (legacy) and the pid parses, SIGTERM that pid and remove the .pid (and a bus sidecar).
+ *  An agent record, an unreadable/malformed sidecar, a busy lock, or an unparseable pid ⇒ nothing killed, nothing removed.
+ *  `kill` is injected (tests). Returns what it did. */
+export function endBusPresence(home: string, sid: string, kill: (pid: number) => void): "killed" | "held" | "absent" {
+  try { presenceFile(home, sid); } catch { return "held"; }
+  return withPresenceLock(home, sid, "held" as const, () => {
+    let raw: string;
+    try { raw = readFileSync(presenceFile(home, sid), "utf8").trim(); }
+    catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? ("absent" as const) : ("held" as const); }
+    const o = readOrigin(home, sid);
+    if (o !== "bus" && o !== "absent") return "held" as const;
+    const n = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(n) || n <= 0) return "held" as const;
+    try { kill(n); } catch { /* already gone */ }
+    try { unlinkSync(presenceFile(home, sid)); } catch { /* gone */ }
+    if (o === "bus") { try { unlinkSync(originFile(home, sid)); } catch { /* gone */ } }
+    return "killed" as const;
+  });
+}
+
 /** Remove presence/<sid>.pid (and its sidecar) at shutdown — under the lock, and ONLY if it still records `self` AND the sidecar
  *  says bus (or is absent: a legacy record the daemon wrote). An agent record, or an unreadable sidecar, is never deleted. */
 export function removeOwnPresence(home: string, sid: string, self: number): void {

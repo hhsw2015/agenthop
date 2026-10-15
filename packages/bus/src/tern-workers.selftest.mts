@@ -15,10 +15,10 @@ const OTHER = "99999999-2222-4333-8444-555555555555";
 const VM = (freePages: number) => `Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:      ${freePages}.\nPages active:    1.\nPages inactive:  0.\nPages speculative:  0.\n`;
 const GiB = 1024 ** 3;
 
-type Fake = { argv: string[][]; sockets: Set<string>; fail: Set<string>; herdrSessions: Array<{ name: string; running: boolean }>; blocks: number[]; freePages: number; agentStatus: string };
+type Fake = { owners: Map<string, number>; nextPid: number; spawnEnv: Array<Record<string, string>>; signals: number[]; foreignFirst: Set<string>; argv: string[][]; sockets: Set<string>; fail: Set<string>; herdrSessions: Array<{ name: string; running: boolean }>; blocks: number[]; freePages: number; agentStatus: string };
 function setup() {
   const home = mkdtempSync(path.join(os.tmpdir(), "tw-"));
-  const f: Fake = { argv: [], sockets: new Set(), fail: new Set(), herdrSessions: [], blocks: [500], freePages: Math.ceil((4 * GiB) / 16384), agentStatus: "working" };
+  const f: Fake = { owners: new Map(), nextPid: 50000, spawnEnv: [], signals: [], foreignFirst: new Set(), argv: [], sockets: new Set(), fail: new Set(), herdrSessions: [], blocks: [500], freePages: Math.ceil((4 * GiB) / 16384), agentStatus: "working" };
   const ok = (stdout = ""): Run => ({ code: 0, stdout, stderr: "", timedOut: false });
   const bad = (): Run => ({ code: 1, stdout: "", stderr: "boom", timedOut: false });
   const run = async (bin: string, args: string[]): Promise<Run> => {
@@ -30,7 +30,7 @@ function setup() {
       if (args[0] === "session" && args[1] === "list") return ok(JSON.stringify({ sessions: [{ name: "default", running: true }, ...f.herdrSessions] }));
       if (args[0] === "session" && args[1] === "delete") { f.herdrSessions = f.herdrSessions.filter((s) => s.name !== args[2]); return ok(); }
       const name = args[1]!;
-      if (args[2] === "server" && args[3] === "stop") { f.sockets.delete(name); const s = f.herdrSessions.find((x) => x.name === name); if (s) s.running = false; return ok(); }
+      if (args[2] === "server" && args[3] === "stop") { f.sockets.delete(name); f.owners.delete(name); const s = f.herdrSessions.find((x) => x.name === name); if (s) s.running = false; return ok(); }
       if (args[2] === "workspace") return ok(JSON.stringify({ result: { root_pane: { pane_id: "w1:p1" } } }));
       if (args[2] === "agent" && args[3] === "start") return ok("{}");
       if (args[2] === "agent" && args[3] === "list") return ok(JSON.stringify({ result: { agents: [{ agent_status: f.agentStatus }] } }));
@@ -44,8 +44,22 @@ function setup() {
   };
   const d: WorkerDeps = {
     home, tern: "tern", herdr: "herdr", run,
-    spawnDetached: (_b, args) => { f.argv.push(["spawn", ...args]); if (f.fail.has("spawn")) return { ok: false, error: "ENOENT" }; f.sockets.add(args[1]!); f.herdrSessions.push({ name: args[1]!, running: true }); return { ok: true }; },
+    spawnDetached: (_b, args, extraEnv) => {
+      f.argv.push(["spawn", ...args]); f.spawnEnv.push(extraEnv);
+      if (f.fail.has("spawn")) return { ok: false, error: "ENOENT" };
+      const pid = ++f.nextPid; const name = args[1]!;
+      if (f.foreignFirst.has(name)) { // a FOREIGN server created the same session after our list: ours exits "already running"
+        f.sockets.add(name); f.owners.set(name, 99999); f.herdrSessions.push({ name, running: true }); return { ok: true, pid };
+      }
+      f.sockets.add(name); f.owners.set(name, pid); f.herdrSessions.push({ name, running: true }); return { ok: true, pid };
+    },
     socketExists: (n) => f.sockets.has(n),
+    socketOwners: (n) => (f.owners.has(n) ? [f.owners.get(n)!] : []),
+    signal: (pid) => {
+      f.signals.push(pid);
+      for (const [n, p] of f.owners) if (p === pid) { f.owners.delete(n); f.sockets.delete(n); const s = f.herdrSessions.find((x) => x.name === n); if (s) s.running = false; return true; }
+      return false;
+    },
     listDir: (dir) => readdirSync(dir),
     now: () => Date.now(),
     sleep: async () => { /* instant */ },
@@ -134,7 +148,7 @@ t("capGate pure: stopped workers do not count", capGate(SEAT, { workers: [{ name
   const { home, f, d } = setup();
   let seenPlaceholder = false;
   const spawn0 = d.spawnDetached;
-  d.spawnDetached = (b, args) => { const w = ((readSeat(home, SEAT) as any).workers ?? []) as Worker[]; seenPlaceholder = w.some((x) => x.state === "starting" && x.pane === 0); return spawn0(b, args); };
+  d.spawnDetached = (b, args, env) => { const w = ((readSeat(home, SEAT) as any).workers ?? []) as Worker[]; seenPlaceholder = w.some((x) => x.state === "starting" && x.pane === 0); return spawn0(b, args, env); };
   f.fail.add("tern split"); f.fail.add("session delete");
   const r = await start(d, "leak");
   const ws = (readSeat(home, SEAT) as any).workers as Worker[];
@@ -160,22 +174,25 @@ t("capGate pure: stopped workers do not count", capGate(SEAT, { workers: [{ name
   const { home, f, d } = setup();
   const s = await start(d, "stopme");
   const pane = (s as any).pane as number;
-  f.argv.length = 0;
+  const serverPid = ((readSeat(home, SEAT) as any).workers[0] as Worker).server_pid!;
+  f.argv.length = 0; f.signals.length = 0;
   const r = await stopWorker(SEAT, "platform-dev-stopme", d);
   const seq = f.argv.map((a) => a.join(" "));
-  t("GATE stop order: server stop → (socket gone) → tern close <pane> → session delete", r.state === "stopped"
-    && seq.indexOf("herdr --session platform-dev-stopme server stop") === 0 && seq.indexOf(`tern close ${pane}`) === 1 && seq.indexOf("herdr session delete platform-dev-stopme") === 2)
+  t("GATE stop order: OUR server pid signalled (not `server stop` by name) → socket gone → tern close <pane> → session delete", r.state === "stopped"
+    && f.signals[0] === serverPid && !seq.some((x) => x.includes("server stop")) && seq.indexOf(`tern close ${pane}`) === 0 && seq.indexOf("herdr session delete platform-dev-stopme") === 1)
   const w = (readSeat(home, SEAT) as any).workers[0] as Worker;
   t("stop: record ends stopped with stopped_at", w.state === "stopped" && typeof w.stopped_at === "number")
 }
 {
   const { home, f, d } = setup();
   await start(d, "partial");
-  f.fail.add("server stop");
+  const sig0 = d.signal;
+  d.signal = () => false; // our server cannot be signalled (it keeps running)
   const r = await stopWorker(SEAT, "platform-dev-partial", d);
+  d.signal = sig0;
   const seq = f.argv.map((a) => a.join(" "));
-  t("GATE partial: server stop fails ⇒ the REST still run (close + delete), state partial, failed steps named",
-    r.state === "partial" && r.steps.find((x) => x.step === "herdr server stop")?.ok === false && seq.some((x) => x.startsWith("tern close")) && seq.some((x) => x.startsWith("herdr session delete")))
+  t("GATE partial: stopping our server fails ⇒ the block close still runs, the session is NOT deleted (still running), state partial",
+    r.state === "partial" && r.steps.find((x) => x.step === "stop own server")?.ok === false && seq.some((x) => x.startsWith("tern close")) && !seq.some((x) => x.startsWith("herdr session delete")))
   const w = (readSeat(home, SEAT) as any).workers[0] as Worker;
   t("GATE partial: the record is never left live — it stays 'stopping' until a cleanup is proven", w.state === "stopping")
 }
@@ -238,7 +255,7 @@ t("capGate pure: stopped workers do not count", capGate(SEAT, { workers: [{ name
   const run0 = d.run;
   let marked = false;
   d.run = async (bin, args, ms) => {
-    if (!marked && bin === "herdr" && args[2] === "server" && args[3] === "stop") {
+    if (!marked && bin === "tern" && args[0] === "close") {
       marked = true;
       // another writer adds a NEW worker entry while stop is in flight (a concurrent start on the same seat)
       const other: Worker = { name: "p-other", herdr_session: "p-other", pane: 99, kind: "tui", started_at: 7, stopped_at: null, state: "live" };
@@ -347,6 +364,35 @@ for (const bad of [`{"sessions":[{"name":"platform-dev-src","running":"true"}]}`
   const st = await workersStatus(d);
   t("SOURCE: tern ls with a string block id ⇒ unknown, no 'block missing' orphan", !st.orphan.some((o) => /block/.test(o.detail)) && st.unknown.some((u) => /tern ls/.test(u)))
   void f;
+}
+
+// ---- MTB-WORKER-OWN (Chief Review 82be0ff): the list was empty, then a FOREIGN server took the name before ours came up ----
+{
+  const { home, f, d } = setup();
+  f.foreignFirst.add("platform-dev-foreign");
+  const r = await start(d, "foreign");
+  const seq = f.argv.map((a) => a.join(" "));
+  t("WORKER-OWN: a foreign instance won the name ⇒ start fails at 'ownership'", r.state === "failed" && (r as any).step === "ownership")
+  t("WORKER-OWN: ZERO foreign stop/delete — no `server stop`, no `session delete`, no workspace/agent on it", !seq.some((x) => x.includes("platform-dev-foreign") && (x.includes("server stop") || x.includes("session delete") || x.includes("workspace") || x.includes("agent start"))))
+  t("WORKER-OWN: the foreign server is still running and still owns its socket", f.owners.get("platform-dev-foreign") === 99999 && f.herdrSessions.find((x) => x.name === "platform-dev-foreign")?.running === true)
+  const ws = (readSeat(home, SEAT) as any).workers as Worker[];
+  t("WORKER-OWN: our placeholder is kept 'stopping' (unproven), never 'stopped'", ws.length === 1 && ws[0]!.state === "stopping")
+}
+{
+  // stop of a recorded instance whose name was later taken by another server: not ours ⇒ no signal to it, no delete
+  const { home, f, d } = setup();
+  await start(d, "took");
+  f.owners.set("platform-dev-took", 88888); // the session socket is now held by a different server
+  f.signals.length = 0; f.argv.length = 0;
+  const r = await stopWorker(SEAT, "platform-dev-took", d);
+  t("WORKER-OWN stop: the socket is held by another pid ⇒ partial, no signal to anyone, no session delete", r.state === "partial" && f.signals.length === 0 && !f.argv.some((a) => a.join(" ").includes("session delete")))
+  t("WORKER-OWN stop: the record stays 'stopping'", ((readSeat(home, SEAT) as any).workers as Worker[])[0]!.state === "stopping")
+}
+// ---- SH-PARENT-WIRING (#1057): the authoritative parent sid is in the spawned server's environment ----
+{
+  const { f, d } = setup();
+  await start(d, "parent");
+  t("PARENT-WIRING: the herdr server is spawned with SWARM_PARENT_SID = this call's parent sid", f.spawnEnv.length === 1 && f.spawnEnv[0]!.SWARM_PARENT_SID === SEAT)
 }
 
 console.log("all tern-workers selftests passed");

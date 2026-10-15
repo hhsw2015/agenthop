@@ -4,7 +4,9 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { runPresence } from "./presence.js";
+import { endBusPresence } from "./swarm/seat-presence.js";
 
 /** Block the current thread for ~ms (no busy spin). Used only in the short-lived bootstrap, never the daemon. */
 function sleepSync(ms: number): void {
@@ -21,6 +23,17 @@ function sleepSync(ms: number): void {
 // tears the group down) before the child has finished setsid, the child is killed mid-detach. So we HANDSHAKE: the
 // daemon writes its pid file once it is up in its own session (see runPresence), and we poll for that file before
 // exiting. Bounded so a child that never starts cannot hang the hook.
+// SessionEnd mode (#1053 r4 SP-SESSIONEND): the hook runs `<runtime> presence.mjs` with AGENTHOP_PRESENCE_END=1. It stops the
+// recorded presence process ONLY through endBusPresence (per-sid lock, strict origin) and exits — no daemon, no shell-side kill.
+if (process.env.AGENTHOP_PRESENCE_END === "1") {
+  const pf = process.env.AGENTHOP_PID_FILE;
+  if (pf) {
+    const sid = path.basename(pf).replace(/\.pid$/, "");
+    const home = path.dirname(path.dirname(path.dirname(pf)));
+    try { endBusPresence(home, sid, (pid) => { process.kill(pid, "SIGTERM"); }); } catch { /* nothing killed */ }
+  }
+  process.exit(0);
+}
 if (process.env.AGENTHOP_PRESENCE_DAEMONIZED !== "1") {
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
     detached: true,
