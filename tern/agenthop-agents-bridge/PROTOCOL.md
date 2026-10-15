@@ -108,6 +108,8 @@ printf '%s' '{"op":"list"}' > "$tmp" \
 
 **生产建议(非已证属性)**:长耗 op(尤其 start)不要从状态轮询里同步调;放独立窗口/action 上下文,或把 start 做成"下指令+轮询 list 看结果"的异步形态。`list`(只读)在轮询里安全是观测,不是安全证明。
 
+**已落地(tick 冻结根修)**:生产中复现——两次 start 后 `agents.json` tick 冻结、`plugin reload` 不能恢复、start 本身成功。根因:mirror 与 drain 共用一条 `step` 链,且 reschedule 在 drain **之后**;sync start 超 ~50ms 预算被 Tern 外部终止(pcall 捕不到)⇒ 下一 tick 从未排上 ⇒ 整条轮询冻结。修=**拆两条独立 sleep 链**(`mirrorStep` 活性 / `drainStep` 认领分发)+**每条先 reschedule 再干活**:被杀的 tick 已有继任者,链自愈;被杀那一个 op 落入 §3 的至多一次恢复。门 `test/window.test.lua`(拆链 / mirror 在 drain 卡死时照常推进 / 两链 reschedule-before-work / 杀后自愈),三个变体(drain 或 mirror 的 reschedule 挪到末尾、并回单链)均 RED。start 异步化仍是更深的后续。
+
 ## 5. 装机
 
 ```bash

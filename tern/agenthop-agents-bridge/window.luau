@@ -17,7 +17,7 @@ local RES = CTL .. "/results"
 local POLL_MS = 750 -- status-mirror cadence. POLL_MS only sets the scheduling interval; it does NOT bound a tick's duration.
 
 local function ensure()
-  for _, d in { CTL, REQ, RES } do
+  for _, d in ipairs({ CTL, REQ, RES }) do
     if not tern.fs.exists(d) then
       pcall(function() tern.fs.mkdir(d) end)
     end
@@ -27,7 +27,7 @@ end
 -- STATUS mirror (PROTOCOL.md §1): snapshot cx.agents:list() to agents.json. Advisory/overwrite; a torn read self-heals next poll.
 local ticks = 0
 local function mirror(cx)
-  ticks += 1
+  ticks = ticks + 1
   local ok, agents = pcall(function() return cx.agents:list() end)
   local payload = {
     ts = tern.now(),
@@ -47,7 +47,7 @@ end
 local function drain(cx)
   local names = {}
   pcall(function() names = tern.fs.list(REQ) end)
-  for _, name in names do
+  for _, name in ipairs(names) do
     if name:match("%.json$") then
       local id = (name:gsub("%.json$", ""))
       local path = REQ .. "/" .. name
@@ -95,7 +95,7 @@ local function registerSentinel()
     status.error = "sentinel.luau unreadable" -- the bridge (A1) still runs without the sentinel
   else
     pcall(function()
-      for _, t in tern.carly.tasks() do
+      for _, t in ipairs(tern.carly.tasks()) do
         if t.title == PATROL_TITLE then
           pcall(function() tern.carly.cancel(t.id) end)
         end
@@ -115,8 +115,15 @@ local function registerSentinel()
   return okWrite -- only "armed" once the status is durably recorded (dir now ensured first)
 end
 
+-- TWO independent sleep chains, each RESCHEDULING BEFORE IT WORKS (bridge tick-freeze root fix). Tern kills a window callback that
+-- exceeds its ~50ms command budget ("disabled until reload"); pcall cannot catch that external termination. The old single `step` ran
+-- mirror THEN drain and rescheduled LAST, so one sync `start` killed mid-drain left NO pending :next and froze the whole poll (tick
+-- stuck, reload inert). Now: (1) the liveness mirror never shares a callback with drain's slow sync `start`; (2) each chain queues its
+-- next tick FIRST, so a killed tick still has its successor scheduled and the chain self-heals. The one op killed mid-start falls to
+-- the swarm's at-most-once recovery (PROTOCOL.md §3/§4). Making `start` async is the deeper follow-up (PROTOCOL.md §4), not needed here.
 local sentinelArmed = false
-local function step(cx)
+local function mirrorStep(cx)
+  tern.sleep(POLL_MS):next(function(_, _, nextCx) mirrorStep(nextCx) end) -- reschedule FIRST: the liveness tick cannot die
   if cx ~= nil then
     ensure() -- TA-A2-ARM: control dirs exist BEFORE arming, so the sentinel.json write cannot ENOENT on first boot
     if not sentinelArmed then -- A2: arm once, from inside a scoped window callback (tern.carly needs one)
@@ -125,9 +132,16 @@ local function step(cx)
       end
     end
     mirror(cx)
-    pcall(function() drain(cx) end)
   end
-  tern.sleep(POLL_MS):next(function(_, _, nextCx) step(nextCx) end)
 end
 
-step(nil) -- kick off; the first sleep's :next delivers the window cx (A1 poll + A2 one-shot arm)
+local function drainStep(cx)
+  tern.sleep(POLL_MS):next(function(_, _, nextCx) drainStep(nextCx) end) -- reschedule FIRST: a killed slow start cannot freeze it
+  if cx ~= nil then
+    ensure()
+    pcall(function() drain(cx) end)
+  end
+end
+
+mirrorStep(nil) -- A1 status mirror (liveness) + A2 one-shot arm; the first sleep's :next delivers the window cx
+drainStep(nil)  -- A1 claim/dispatch, isolated on its own self-healing chain (the sync `start` lives here)
