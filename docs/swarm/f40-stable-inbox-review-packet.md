@@ -171,3 +171,20 @@ credited (an under-credit = a safe false alert the coordinator checks; never a s
 
 **Guards.** Missing tool or cwd ⇒ no expansion. Wrong tool / wrong cwd / another session's sid ⇒ nothing inherited
 (`coordinator-keys.selftest.mts`, 11 checks). Process facts are read-only (`swarm/proc-facts.ts`) and fail soft to null.
+
+## Addendum 2 (#1032 B, 2026-10-15) — addressing the coordinator from a hand-written script
+
+Product senders already resolve `SWARM_COORDINATOR` through `resolveSession` (checkin, permission gate, tg-entry, retro,
+verification-ledger, swarm-recover, carly-send, the dispatcher). The mail that kept reaching the coordinator's previous box came
+from OUTSIDE product code: an old shell relay and ad-hoc seat scripts that hard-coded the session id.
+
+**Rule: a script that writes to the coordinator must never hard-code its session id.** Use either:
+- `resolveCoordinatorInbox(home, env)` (`packages/bus/src/swarm/coord-inbox.ts`) — returns the current coordinator's inbox key
+  or throws a clear `CoordinatorInboxError` (unset / no live match / ambiguous / unsafe). It never guesses and never falls back
+  to an old box.
+- the CLI: `SWARM_COORDINATOR=<sid|handle> tsx scripts/coord-inbox.ts [--title T] [--task-ref R] [--key K] <text…>` (or
+  `--stdin`). `--key` makes a send idempotent; an unsafe key is rejected rather than silently sent without dedup.
+
+**After a coordinator id change:** `tsx scripts/migrate-coord-inbox.ts --from <old-sid> [--dry]` moves the old box's unread
+top-level messages to the current coordinator (processed/, claims and temps untouched; invalid messages left and reported;
+idempotent, including a crash between publish and source removal).
