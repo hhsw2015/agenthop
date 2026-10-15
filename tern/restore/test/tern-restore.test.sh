@@ -534,7 +534,7 @@ cases = {
   "continued-comment-mode": "tern acp claude --resume aaaa1111 --model m1 " + B + "\n# --mode bypassPermissions",
   "continued-arguments": "tern acp claude --resume aaaa1111 --mode bypassPermissions " + B + "\n --model m1",
   "continued-into-word": "tern acp claude --resume aaaa1111" + B + "\n#x --mode bypassPermissions --model m1",
-  "dq-continuation": 'tern acp claude --resume "aaaa" + B + "\n1111" --mode bypassPermissions --model m1',
+  "dq-continuation": 'tern acp claude --resume "aaaa' + B + '\n1111" --mode bypassPermissions --model m1',
   "plain-comment": "tern acp claude --resume aaaa1111 --model m1 # --mode bypassPermissions",
   "hash-in-word": "tern acp claude --resume aaaa1111#x --mode bypassPermissions --model m1",
 }
