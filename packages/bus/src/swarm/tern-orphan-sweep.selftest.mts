@@ -103,6 +103,32 @@ t("paneId: non-integer / negative / null rejected", paneId(1.5) === null && pane
   t("shape e2e: 5 rounds of a malformed listing => no mark, no stop, no delete", w.marked.length === 0 && w.stopped.length === 0 && w.deleted.length === 0);
 }
 
+// --- #1034 r3: "starting" is never judged; a persisting "stopping" is reported, never marked or deleted ---
+{
+  const w = world(); const st = initialOrphanState();
+  w.recs = [{ sid: "seatP-9999", workers: [{ ...worker("dev-new", "starting", 0), started_at: 5 }] }];
+  w.sessions = ["default", "dev-new"]; w.blocks = new Set([1]);
+  for (let i = 0; i < 4; i++) round(st, w);
+  t("starting (pane 0): never marked, never stopped/deleted", w.marked.length === 0 && w.stopped.length === 0 && w.deleted.length === 0);
+  t("starting: not even a schema-violation line", !w.logs.some((l) => /schema-violation/.test(l)));
+}
+{ // a "starting" entry is skipped by its STATE, not by the pane-0 accident: even with a nonzero pane absent from Tern, nothing
+  const w = world(); const st = initialOrphanState();
+  w.recs = [{ sid: "seatP-9998", workers: [{ ...worker("dev-new2", "starting", 555), started_at: 7 }] }];
+  w.sessions = ["default", "dev-new2"]; w.blocks = new Set([1]);
+  for (let i = 0; i < 4; i++) round(st, w);
+  t("starting (pane 555 not in Tern): never marked, never stopped/deleted", w.marked.length === 0 && w.stopped.length === 0 && w.deleted.length === 0);
+}
+{
+  const w = world(); const st = initialOrphanState();
+  w.recs = [{ sid: "seatS-8888", workers: [{ ...worker("dev-stuck", "stopping", 444), started_at: 6 }] }];
+  w.sessions = ["default", "dev-stuck"]; w.blocks = new Set([1]); // its block is gone and its herdr session is still there
+  for (let i = 0; i < 5; i++) round(st, w);
+  t("stopping (block gone, session alive): never marked orphan", w.marked.length === 0);
+  t("stopping: never stopped/deleted", w.stopped.length === 0 && w.deleted.length === 0);
+  t("stopping: reported as a possible leak (after two rounds)", w.audit.some((l) => /still "stopping" — possible leak/.test(l)));
+}
+
 // --- never touched: default, unregistered sessions (even with role-task shape), records without herdr_session ---
 {
   const w = world(); const st = initialOrphanState();

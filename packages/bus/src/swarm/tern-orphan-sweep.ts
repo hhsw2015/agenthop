@@ -3,8 +3,9 @@
  * sweep step. Three classes:
  *   ① a herdr session REGISTERED in a seat-shell record (workers[].herdr_session) whose worker is state "stopped" (or "orphan")
  *      but the herdr session still exists ⇒ `herdr session stop <name>` then `herdr session delete <name>`.
- *   ② a seat-shell worker in state "live"/"stopping" whose Tern block (workers[].pane) is gone from `tern ls --json` ⇒ mark the
- *      record "orphan" (+stopped_at), then ① applies to its herdr session on the following confirmations.
+ *   ② a seat-shell worker in state "live" whose Tern block (workers[].pane) is gone from `tern ls --json` ⇒ mark the record
+ *      "orphan" (+stopped_at), then ① applies to its herdr session on the following confirmations. "starting" (no block yet,
+ *      pane 0) is never judged; a persisting "stopping" is reported as a possible leak, never marked or deleted (#1034 r3).
  *   ③ control-plane files: the bridge's gc.sh (results/requests/tmp/quarantine TTLs; r12 adds requests_held, r15 adds
  *      mode=<octal> and an exit-1 `unsafe_mode` line). Parsed by key: a nonzero COUNT field is audited; mode is not a count;
  *      exit 1 (unreadable or unsafe_mode) is UNKNOWN, logged, never success. Plus mirror-phase.json / diag.json older than 1h.
@@ -97,11 +98,20 @@ export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; u
     const hs = str(w.herdr_session);
     const state = str(w.state);
     if (hs === null || hs === "default" || !NAME_SHAPE.test(hs)) continue; // second check only; never a reason to act
+    // #1034 r3 contract: "starting" = a placeholder written before any herdr/Tern resource exists (pane 0 = no block yet) — never
+    // judged. "stopping" that persists may be a leaked resource whose cleanup could not be proven: REPORT only, never mark it
+    // orphan (an orphan record would be stopped+deleted on later rounds) and never delete it.
+    if (state === "starting") continue;
+    if (state === "stopping") {
+      const key = `stopping:${sid}:${hs}:${JSON.stringify(w.pane ?? null)}:${JSON.stringify(w.started_at ?? null)}`;
+      candidates.push({ key, act: () => io.audit(`orphan-sweep: worker ${hs} (seat ${sid.slice(0, 8)}, pane ${JSON.stringify(w.pane ?? null)}) still "stopping" — possible leak, reported only (not marked, not deleted)`) });
+      continue;
+    }
     // ② live record whose Tern block vanished ⇒ mark orphan (two rounds)
     const pane = paneId(w.pane);
-    if ((state === "live" || state === "stopping") && pane === null)
+    if (state === "live" && pane === null)
       io.log(`orphan-sweep: schema-violation seat ${sid.slice(0, 8)} worker ${hs}: pane ${JSON.stringify(w.pane)} is not a number — not judged`);
-    if ((state === "live" || state === "stopping") && pane !== null && !blocks.has(pane)) {
+    if (state === "live" && pane !== null && !blocks.has(pane)) {
       // TBS-ORPHAN-GENERATION: the confirmation key names the INSTANCE (pane + started_at), not only the name, so a new
       // instance under the same session name starts its own two-round count instead of inheriting the old one's.
       candidates.push({ key: `mark:${sid}:${hs}:${pane}:${JSON.stringify(w.started_at ?? null)}`, act: () => {
