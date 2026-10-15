@@ -1,12 +1,12 @@
 #!/usr/bin/env lua
--- Fixture for the A1 bridge tick-freeze fix. Lua 5.5. Loads the PRODUCTION window.luau (same file Tern runs) with a mocked `tern` and
--- `cx`. Tern kills a window callback that exceeds its ~50ms budget; standalone Lua cannot reproduce that kill, so it is SIMULATED: the
--- fixture `start` raises a sentinel error that is rethrown past the drain pcall, aborting the callback mid-work exactly like an
--- external termination (no code after the kill point runs). Checks the STRUCTURAL properties the fix guarantees:
---   1. two independent sleep chains are queued at load (mirror split from drain);
---   2. mirror liveness: pumping only the mirror chain advances agents.json `tick` while drain is stuck/never pumped;
---   3. reschedule-before-work: drain's next tick is ALREADY queued when `start` runs;
---   4. self-heal: a drain tick killed mid-start still leaves a successor that processes the next request; the mirror keeps ticking.
+-- Fixture for the A1 bridge r2 (command-triggered drains). Lua 5.5. Loads the PRODUCTION window.luau (same file Tern runs) with a
+-- mocked `tern` and `cx`, plus the PRODUCTION claim.luau.
+--
+-- WHAT THIS PROVES (and what it does not): Tern disables work per HOOK — every tern.sleep():next continuation is one hook (`await`),
+-- each tern.command is its own hook (`command <id>`); a hook over the ~50ms budget is disabled until `tern plugin reload`. That host
+-- behaviour cannot run in standalone Lua, so the fixture MODELS it: the mock records which hook each callback belongs to, and a
+-- "disabled" hook simply stops being invoked. The checks are STRUCTURAL evidence that slow `start` runs only on its own hook and that
+-- the mirror tick and fast ops sit on different hooks — NOT a reproduction of Tern's budget kill. The live gate is bridge-smoke.sh.
 -- Run from the plugin dir: `lua test/window.test.lua`.
 
 local here = (arg[0] or ""):match("^(.*/)") or "./"
@@ -17,8 +17,7 @@ local function ck(name, cond)
   if not cond then failures = failures + 1 end
 end
 
--- ---- mock fs (in-memory) + json ----
-local files, dirs = {}, {}
+-- ---- mock json (only what the bridge needs: encode for files, decode for requests) ----
 local function encode(v)
   local t = type(v)
   if t == "table" then
@@ -29,127 +28,108 @@ local function encode(v)
   elseif t == "string" then return string.format("%q", v)
   else return tostring(v) end
 end
+local function decode(s)
+  local op = s:match('"op":"(%w+)"')
+  if not op then error("bad json") end
+  return { op = op, prompt = s:match('"prompt":"([^"]*)"'), code = s:match('"code":"([^"]*)"'), cwd = "/" }
+end
 
--- ---- capture sleep callbacks: each tern.sleep():next registers one pending callback, tagged by the chain that registered it ----
-local pending = {}   -- list of { fn = <callback>, chain = "mirror"|"drain"|"?" }
-local currentChain = "?"
-local KILL = {}      -- sentinel error object used to simulate Tern's external callback kill
-
-local startCalls, pendingAtStart, pendingAtList = 0, nil, nil
-local requestsQueue = {} -- name -> json text, simulating files in REQ
+-- ---- hook registry: sleep continuations share hook "await"; each command is hook "command <id>" ----
+local sleepPending = {}  -- await-hook continuations
+local commands = {}      -- id -> run fn
+local files, dirs, requests = {}, {}, {}
+local opCalls = { list = 0, start = 0, stop = 0 }
 
 local cx = {
   agents = {
-    list = function() pendingAtList = #pending; return { { id = 1 } } end,
-    start = function(_, opts)
-      startCalls = startCalls + 1
-      pendingAtStart = #pending -- how many callbacks were queued at the moment start ran
-      if opts.prompt == "KILL" then error(KILL) end -- simulate the 50ms kill mid-start
-      return 42
-    end,
+    list = function() opCalls.list = opCalls.list + 1; return {
+      { pane = 1, session = 2, model = "m", state = "idle", busy = false, at_prompt = true, alive = true, cwd = "/c", tab = 3, title = "t",
+        command = string.rep("x", 200), agent_command = string.rep("y", 200), focused = true, program = "tern" } } end,
+    start = function() opCalls.start = opCalls.start + 1; return 42 end,
+    stop = function() opCalls.stop = opCalls.stop + 1 end,
   },
 }
 
 _G.tern = {
   getenv = function(k) if k == "HOME" then return "/h" end end,
   now = function() return 1000 end,
-  json = {
-    encode = encode,
-    decode = function(s)
-      if s:find('"op":"start"', 1, true) then
-        return { op = "start", prompt = s:match('"prompt":"([^"]*)"'), cwd = "/" }
-      end
-      error("bad json")
-    end,
-    array = function(t) return t end,
-  },
+  json = { encode = encode, decode = decode, array = function(t) return t end },
   fs = {
     exists = function(p) return dirs[p] == true end,
     mkdir = function(p) dirs[p] = true end,
     write = function(p, s) files[p] = s end,
     read = function(p)
       local name = p:match("requests/(.+)$")
-      if name and requestsQueue[name] then return requestsQueue[name] end
+      if name then return requests[name] end
       if p == "sentinel.luau" then return "-- check" end
       return files[p]
     end,
-    remove = function(p)
-      local name = p:match("requests/(.+)$")
-      if name then requestsQueue[name] = nil end
-    end,
+    remove = function(p) local name = p:match("requests/(.+)$"); if name then requests[name] = nil end end,
     list = function(p)
       local out = {}
-      if p:match("requests$") then for n in pairs(requestsQueue) do out[#out + 1] = n end table.sort(out) end
+      if p:match("requests$") then for n in pairs(requests) do out[#out + 1] = n end table.sort(out) end
       return out
     end,
   },
   carly = { tasks = function() return {} end, cancel = function() end, schedule = function() return 7 end },
-  sleep = function(_ms)
-    return { next = function(_, fn) pending[#pending + 1] = { fn = fn, chain = currentChain } end }
-  end,
+  sleep = function(_ms) return { next = function(_, fn) sleepPending[#sleepPending + 1] = fn end } end,
+  command = function(def) commands[def.id] = def.run end,
 }
 
--- the production module requires "./claim"; satisfy it with the REAL claim.luau (one source, no drift)
 package.loaded["./claim"] = assert(loadfile(here .. "../claim.luau"))()
-
--- Load window.luau. It auto-kicks both chains with nil cx; tag each kickoff's registration by observing order.
-local chunk = assert(loadfile(here .. "../window.luau"))
-chunk()
-
--- ---- 1. split: two independent pending callbacks at load ----
-ck("split: two independent sleep chains queued at load (mirror + drain)", #pending == 2)
-
--- Identify which pending callback belongs to which chain by pumping each once with cx and seeing what it does.
-local function pumpOne(idx)
-  local p = table.remove(pending, idx)
-  local ok, err = pcall(p.fn, nil, nil, cx) -- pcall here = the "Tern runtime"; a KILL error aborts the callback like a real kill
-  return ok, err
-end
-
--- First callback queued was mirrorStep's (mirrorStep(nil) runs first in window.luau), second is drainStep's.
-local mirrorCb, drainCb = pending[1], pending[2]
-pending = {}
+assert(loadfile(here .. "../window.luau"))()
 
 local AGENTS = "/h/.agenthop/tern-panes/agents.json"
+local RES = "/h/.agenthop/tern-panes/results/"
 local function tickOf() local s = files[AGENTS]; return s and tonumber(s:match('"tick":(%d+)')) or nil end
+local function pumpMirror() local fn = table.remove(sleepPending, 1); fn(nil, nil, cx) end
 
--- ---- 2. mirror liveness while drain is stuck (never pumped) ----
-mirrorCb.fn(nil, nil, cx)          -- mirror tick 1 (its successor is queued first, then it writes agents.json)
-local t1 = tickOf()
-local nextMirror = pending[#pending] -- the successor mirrorStep queued
-ck("mirror: reschedules itself (successor queued)", nextMirror ~= nil and #pending == 1)
-ck("reschedule-before-work: mirror's successor was ALREADY queued when list ran", pendingAtList == 1)
-pending = {}
-nextMirror.fn(nil, nil, cx)        -- mirror tick 2, drain never pumped
-local t2 = tickOf()
-ck("liveness: tick advances on mirror-only pumps while drain is stuck (" .. tostring(t1) .. "→" .. tostring(t2) .. ")",
-  t1 ~= nil and t2 ~= nil and t2 == t1 + 1)
-pending = {}
+-- ---- 1. registration: one await chain (mirror) + three commands, each its own hook ----
+ck("hooks: exactly ONE sleep continuation queued at load (mirror only on the await hook)", #sleepPending == 1)
+ck("hooks: commands drain / drain-start / mirror registered (each its own `command <id>` hook)",
+  type(commands["drain"]) == "function" and type(commands["drain-start"]) == "function" and type(commands["mirror"]) == "function")
 
--- ---- 3. reschedule-before-work + 4. self-heal across a simulated kill mid-start ----
-requestsQueue["r1.json"] = '{"op":"start","prompt":"KILL"}'
-local okKill, errKill = pcall(drainCb.fn, nil, nil, cx)
--- the KILL propagates? drain is pcall-wrapped in production, so a Lua error is caught there; to model an EXTERNAL kill we assert on
--- the queue state observed AT start-time, which is what survives a real kill.
-ck("reschedule-before-work: drain's successor was ALREADY queued when start ran", pendingAtStart == 1)
-local drainSucc = pending[#pending]
-ck("self-heal: a successor drain tick exists after the killed tick", drainSucc ~= nil)
-pending = {}
--- the next request is processed by the successor
-requestsQueue["r2.json"] = '{"op":"start","prompt":"ok"}'
-startCalls = 0
-drainSucc.fn(nil, nil, cx)
-ck("self-heal: successor drain tick processes the next request", startCalls == 1 and files["/h/.agenthop/tern-panes/results/r2.json"] ~= nil)
+-- ---- 2. the await hook never runs drain work: pumping the mirror chain with pending requests claims nothing ----
+requests["s1.json"] = '{"op":"start","prompt":"p"}'
+requests["l1.json"] = '{"op":"stop"}'
+pumpMirror(); pumpMirror()
+ck("await hook: two mirror ticks advance tick (1→2)", tickOf() == 2)
+ck("await hook: mirror ticks claim NO requests and run NO start (drain is off the await hook)",
+  requests["s1.json"] ~= nil and requests["l1.json"] ~= nil and opCalls.start == 0 and opCalls.stop == 0)
 
--- mirror still ticks after the killed drain (independent chain)
-local tBefore = tickOf()
-pending = {}
-mirrorCb.fn(nil, nil, cx)
-ck("liveness: mirror still advances after a drain tick was killed", tickOf() == tBefore + 1)
+-- ---- 3. op-class routing: `drain` takes fast ops only; `drain-start` takes start only ----
+commands["drain"](cx)
+ck("drain: runs the fast op (stop) and writes its result", opCalls.stop == 1 and files[RES .. "l1.json"] ~= nil)
+ck("drain: leaves the start request UNCLAIMED for drain-start", requests["s1.json"] ~= nil and opCalls.start == 0)
+commands["drain-start"](cx)
+ck("drain-start: runs start and writes its result", opCalls.start == 1 and files[RES .. "s1.json"] ~= nil and requests["s1.json"] == nil)
 
--- ---- simulate a TRUE external kill (no Lua-level unwinding past the kill point) on the OLD single-chain shape is covered by the
--- mutant runs (see review notes): moving either reschedule below the work, or merging the chains, flips a check above RED. ----
-_ = okKill; _ = errKill
+-- ---- 4. hook isolation model: drain-start DISABLED (never invoked again) ⇒ drain + mirror still serve ----
+requests["s2.json"] = '{"op":"start","prompt":"p"}' -- would go to the disabled drain-start
+requests["l2.json"] = '{"op":"stop"}'
+commands["drain"](cx)
+pumpMirror()
+ck("isolation: with drain-start disabled, drain still serves fast ops", files[RES .. "l2.json"] ~= nil)
+ck("isolation: with drain-start disabled, the mirror tick still advances (2→3)", tickOf() == 3)
+ck("isolation: the start request stays queued (UNKNOWN recovery is the swarm's: reload)", requests["s2.json"] ~= nil)
+
+-- ---- 5. slim mirror: only the swarm-read fields; the long command strings are dropped ----
+local js = files[AGENTS] or ""
+ck("slim: agents.json keeps pane/state/busy/at_prompt/alive/cwd/title", js:find('"pane":1', 1, true) and js:find('"at_prompt":true', 1, true) and js:find('"title":"t"', 1, true))
+ck("slim: agents.json drops command / agent_command / focused / program", not js:find("xxxx", 1, true) and not js:find("yyyy", 1, true) and not js:find('"focused"', 1, true) and not js:find('"program"', 1, true))
+
+-- ---- 6. manual mirror command advances the tick too ----
+commands["mirror"](cx)
+ck("mirror command: a manual kick advances tick (3→4)", tickOf() == 4)
+
+-- ---- 7. eval op (fast class): compiled with loadstring/load, called with cx, value returned ----
+requests["e1.json"] = '{"op":"eval","code":"local cx = ...; return #cx.agents:list()"}'
+commands["drain"](cx)
+local er = files[RES .. "e1.json"] or ""
+ck("eval: runs via drain and returns the value", er:find('"ok":true', 1, true) ~= nil and er:find('"value":1', 1, true) ~= nil)
+requests["e2.json"] = '{"op":"eval","code":"return ("}'
+commands["drain"](cx)
+ck("eval: a compile error is reported, not thrown", (files[RES .. "e2.json"] or ""):find("eval compile", 1, true) ~= nil)
 
 print(string.format("\n%s (%d failure(s))", failures == 0 and "PASS" or "FAIL", failures))
 os.exit(failures == 0 and 0 or 1)

@@ -23,7 +23,8 @@ $HOME/.agenthop/tern-panes/
 {"ts":<number>,"tick":<number>,"agents":[<AgentBlock>...],"error":<string?>}
 ```
 
-- `agents` = `cx.agents:list()` 原样(字段富于最小 AgentBlock:`pane state busy at_prompt kind program model cwd alert alive host session tab ...`;omp 行另有 `model`/`last_message`,非 omp 无)。
+- `agents` = `cx.agents:list()` 的**瘦身投影**(r2):每项仅 `pane session model state busy at_prompt alive cwd tab title`。`command`/`agent_command` 等长串已去掉(二者使负载翻倍、把 tick 推近 50ms hook 预算);需要原始字段走 `list` op。
+- 手动刷新:`tern ctl plugins run plugin.agenthop-agents-bridge.mirror`(独立 hook,不依赖 sleep 链)。
 - `tick` 单调自增 = 存活信号(不前进 = 该窗口 VM 的循环停了)。
 - **语义 = advisory 快照,覆盖写(at-least-once 读面)**。被 torn-read 到的半截文件,下一轮(≤POLL_MS)自愈。**它不是耐久义务**,蜂群的 durable 账本才是真理源。
 - 多 window 各跑一份 window-half ⇒ 多个 mirror 覆盖同一文件;对状态镜幂等无害(同一全局视图)。
@@ -60,6 +61,16 @@ printf '%s' '{"op":"list"}' > "$tmp" \
 {"op":"<name>", ...args}
 ```
 
+写完后**触发** drain(r2:drain 不再挂 sleep 链,改为命令,每个命令是独立 hook):
+
+```bash
+TERN_PANE_SOCKET="$HOME/Library/Application Support/Tern/daemon.sock" \
+  tern ctl plugins run plugin.agenthop-agents-bridge.drain        # 快 op:list/transcript/wait/ask/interrupt/stop/eval
+TERN_PANE_SOCKET=… tern ctl plugins run plugin.agenthop-agents-bridge.drain-start   # 仅 start
+```
+
+`drain` 只认领非 start 请求,`drain-start` 只认领 start;另一类请求原样留在 `requests/`(peek 不 remove)等它自己的命令。ctl 路径在 Tern 非前台时照常执行(协调者实测);任何进程设 `TERN_PANE_SOCKET` 即可调,不必在 Tern 格内。
+
 桥**认领**(见 §3)后执行,写 `results/<id>.json`:
 
 ```json
@@ -78,6 +89,9 @@ printf '%s' '{"op":"list"}' > "$tmp" \
 | `start` | **非幂等** | `prompt, cwd, command?, how?` | `{pane:<number>}` | **同步,可能长耗**(见 §4);prompt/cwd 非空 |
 | `interrupt` | **非幂等** | `agent` | `{}` | Ctrl-C,不关块 |
 | `stop` | **非幂等** | `agent` | `{}` | 关闭块 |
+| `eval` | **非幂等** | `code` | `{value:<any>}` | r2(user 亲令「通过插件直接调用 Lua API」):`loadstring` 编译(VM 内 `load` 为 nil)后以 `cx` 为参调用,返回值 JSON 编码;编译/运行错误 → `{ok:false,error}`。走 `drain`(快类),代码须自己保持在预算内 |
+
+**eval 信任边界**:信任边界不变:requests/ 在 0700 家目录,能写该目录者本已可用 `start` 起任意命令,eval 不新增攻击面。
 
 未知 op → `{"ok":false,"error":"unknown op: <name>"}`。坏 JSON(已认领)→ `{"ok":false,"error":"bad request json"}`。
 
@@ -108,7 +122,11 @@ printf '%s' '{"op":"list"}' > "$tmp" \
 
 **生产建议(非已证属性)**:长耗 op(尤其 start)不要从状态轮询里同步调;放独立窗口/action 上下文,或把 start 做成"下指令+轮询 list 看结果"的异步形态。`list`(只读)在轮询里安全是观测,不是安全证明。
 
-**已落地(tick 冻结根修)**:生产中复现——两次 start 后 `agents.json` tick 冻结、`plugin reload` 不能恢复、start 本身成功。根因:mirror 与 drain 共用一条 `step` 链,且 reschedule 在 drain **之后**;sync start 超 ~50ms 预算被 Tern 外部终止(pcall 捕不到)⇒ 下一 tick 从未排上 ⇒ 整条轮询冻结。修=**拆两条独立 sleep 链**(`mirrorStep` 活性 / `drainStep` 认领分发)+**每条先 reschedule 再干活**:被杀的 tick 已有继任者,链自愈;被杀那一个 op 落入 §3 的至多一次恢复。门 `test/window.test.lua`(拆链 / mirror 在 drain 卡死时照常推进 / 两链 reschedule-before-work / 杀后自愈),三个变体(drain 或 mirror 的 reschedule 挪到末尾、并回单链)均 RED。start 异步化仍是更深的后续。
+**已落地(tick 冻结根修,r2 订正根因)**:现网实证——`agents.json` tick 冻结、`plugin reload` 前不恢复。**Tern 的禁用单位是 hook**:所有 `tern.sleep():next` 续体同属 hook `await`,任一续体超 ~50ms(`await exceeded 50 ms`)即禁用本 VM **全部** await 续体,已排队的继任也不再投递(Tern docs concepts/runtime.md:one slow timer callback disables all of the plugin's timer callbacks in that VM)。耗时来源不只 start:仅 `list`+编码 41KB+写盘的 mirror 偶发 >50ms 也会触发。故 r1「拆两条 sleep 链+先排队 ⇒ 自愈」**不成立**(两条链同一 hook,协调者 40 分钟现网三次复现)。
+
+r2 修法 = **命令面隔离 + 蜂群侧 reload 恢复**(不是 VM 内自愈):① drain 改为 `tern.command`,由蜂群写完请求后 `tern ctl plugins run` 触发,每个命令是独立 hook `command <id>`;② 按 op 类拆 `drain`(快 op)与 `drain-start`(仅 start),start 撑爆预算只禁 `drain-start`,不连坐快 op 与 mirror;③ mirror 瘦身(§1)远离预算,仍走 sleep 链,另可命令手动触发。**恢复剧本(蜂群侧)**:tick 停 >5s,或触发 drain 后 2s 无 result ⇒ `tern plugin reload`(协调者实测 tick 从 1 重计,<2s 恢复);被禁那一刻在途的 op 落 §3 恢复(start = 非幂等 HOLD)。
+
+门 `test/window.test.lua`:**结构证据,不是宿主行为复现**——夹具按 hook 记录回调归属、以「不再调用」模型化禁用,验证 start 只在自己的 hook、mirror 与快 op 在别的 hook;不模拟也不声称模拟 Tern 的预算终止。live 门 = `bridge-smoke.sh`(#1032-D)。start 异步化仍是更深的后续。
 
 ## 5. 装机
 

@@ -25,6 +25,18 @@ local function ensure()
 end
 
 -- STATUS mirror (PROTOCOL.md §1): snapshot cx.agents:list() to agents.json. Advisory/overwrite; a torn read self-heals next poll.
+-- r2 ③ SLIM: only the fields the swarm reads (the long command/agent_command strings doubled the payload and pushed the tick toward the
+-- 50ms hook budget). Target well under 10ms per tick.
+local MIRROR_FIELDS = { "pane", "session", "model", "state", "busy", "at_prompt", "alive", "cwd", "tab", "title" }
+local function slim(agents)
+  local out = {}
+  for i, a in ipairs(agents) do
+    local e = {}
+    for _, k in ipairs(MIRROR_FIELDS) do e[k] = a[k] end
+    out[i] = e
+  end
+  return out
+end
 local ticks = 0
 local function mirror(cx)
   ticks = ticks + 1
@@ -32,7 +44,7 @@ local function mirror(cx)
   local payload = {
     ts = tern.now(),
     tick = ticks, -- liveness: must advance every POLL_MS
-    agents = ok and agents or tern.json.array({}),
+    agents = ok and slim(agents) or tern.json.array({}),
     error = (not ok) and tostring(agents) or nil,
   }
   pcall(function() tern.fs.write(CTL .. "/agents.json", tern.json.encode(payload)) end)
@@ -43,41 +55,49 @@ local function answer(id, result)
 end
 
 -- CLAIM + DISPATCH via the shared claim.luau. The gate (read -> empty-skip -> remove-claim) is claim.claim; op class is claim.classOf;
--- sync dispatch is claim.execute. `wait` is async and handled here via :next (PROTOCOL.md §2.1).
-local function drain(cx)
+-- sync dispatch is claim.execute. `wait` is async and handled here via :next (PROTOCOL.md §2.1). r2 ②: each drain command handles ONE
+-- op class — `drain-start` only `start`, `drain` everything else — and a request of the other class is left UNCLAIMED (peeked, not
+-- removed) for the other command, so a disabled slow `start` hook cannot strand or block fast ops.
+local function handle(cx, id, text)
+  local okDec, req = pcall(function() return tern.json.decode(text) end)
+  if not (okDec and type(req) == "table" and type(req.op) == "string") then
+    answer(id, { ok = false, error = "bad request json" }) -- claimed but undecodable: report, do not silently drop
+    return
+  end
+  local class = claim.classOf(req.op)
+  if req.op == "wait" then
+    -- async: hand to :next so a long idle-wait never stalls the command
+    local okW, aw = pcall(function() return cx.agents:wait(req.agent, { timeout = req.timeout }) end)
+    if okW then
+      aw:next(function(message, err)
+        answer(id, { ok = (err == nil), class = class, message = message, error = err })
+      end)
+    else
+      answer(id, { ok = false, class = class, error = tostring(aw) })
+    end
+  else
+    local result = claim.execute(cx, req)
+    result.class = class
+    answer(id, result)
+  end
+end
+
+local function drain(cx, wantStart)
   local names = {}
   pcall(function() names = tern.fs.list(REQ) end)
   for _, name in ipairs(names) do
     if name:match("%.json$") then
       local id = (name:gsub("%.json$", ""))
       local path = REQ .. "/" .. name
-      local claimed, text = claim.claim(
-        function(p) return tern.fs.read(p) end,
-        function(p) tern.fs.remove(p) end,
-        path
-      )
-      if claimed then -- we hold the claim: exactly this VM owns the request now
-        local okDec, req = pcall(function() return tern.json.decode(text) end)
-        if okDec and type(req) == "table" and type(req.op) == "string" then
-          local class = claim.classOf(req.op)
-          if req.op == "wait" then
-            -- async: hand to :next so a long idle-wait never stalls the poll
-            local okW, aw = pcall(function() return cx.agents:wait(req.agent, { timeout = req.timeout }) end)
-            if okW then
-              aw:next(function(message, err)
-                answer(id, { ok = (err == nil), class = class, message = message, error = err })
-              end)
-            else
-              answer(id, { ok = false, class = class, error = tostring(aw) })
-            end
-          else
-            local result = claim.execute(cx, req)
-            result.class = class
-            answer(id, result)
-          end
-        else
-          answer(id, { ok = false, error = "bad request json" }) -- claimed but undecodable: report, do not silently drop
-        end
+      local okPeek, peek = pcall(function() return tern.fs.read(path) end)
+      local isStart = okPeek and type(peek) == "string" and peek:find('"op"%s*:%s*"start"') ~= nil
+      if isStart == wantStart then -- this command's op class only; the other class is left for its own command
+        local claimed, text = claim.claim(
+          function(p) return tern.fs.read(p) end,
+          function(p) tern.fs.remove(p) end,
+          path
+        )
+        if claimed then handle(cx, id, text) end -- we hold the claim: exactly this VM owns the request now
       end
     end
   end
@@ -115,33 +135,34 @@ local function registerSentinel()
   return okWrite -- only "armed" once the status is durably recorded (dir now ensured first)
 end
 
--- TWO independent sleep chains, each RESCHEDULING BEFORE IT WORKS (bridge tick-freeze root fix). Tern kills a window callback that
--- exceeds its ~50ms command budget ("disabled until reload"); pcall cannot catch that external termination. The old single `step` ran
--- mirror THEN drain and rescheduled LAST, so one sync `start` killed mid-drain left NO pending :next and froze the whole poll (tick
--- stuck, reload inert). Now: (1) the liveness mirror never shares a callback with drain's slow sync `start`; (2) each chain queues its
--- next tick FIRST, so a killed tick still has its successor scheduled and the chain self-heals. The one op killed mid-start falls to
--- the swarm's at-most-once recovery (PROTOCOL.md §3/§4). Making `start` async is the deeper follow-up (PROTOCOL.md §4), not needed here.
+-- r2 SCHEDULING (bridge tick-freeze, corrected root cause — PROTOCOL.md §4). Tern disables at HOOK granularity: every
+-- tern.sleep():next continuation is the SAME hook (`await`), so ONE continuation over the ~50ms budget disables ALL of this VM's
+-- timer continuations ("await exceeded 50 ms", disabled until reload) — already-queued successors are NOT delivered either. Two sleep
+-- chains therefore cannot isolate each other (r1 premise, refuted live by the coordinator). Each `tern.command` IS its own hook
+-- (`command <id>`), so slow work is moved onto commands the swarm triggers via `tern ctl plugins run plugin.<plugin>.<id>`:
+--   * mirror      — the liveness tick stays on the sleep chain (slimmed to stay far under budget) and is also a command for a manual kick;
+--   * drain       — fast ops (list/transcript/ask/interrupt/stop/eval/wait); its own hook;
+--   * drain-start — ONLY `start` (synchronous, can exceed the budget); a disabled drain-start never disables drain or the mirror.
+-- If a hook IS disabled, recovery is the swarm's: detect (tick stalled >5s, or no result 2s after a drain trigger) ⇒ `tern plugin
+-- reload` (tick restarts from 1, <2s). This is isolation + external reload, NOT in-VM self-healing.
 local sentinelArmed = false
-local function mirrorStep(cx)
-  tern.sleep(POLL_MS):next(function(_, _, nextCx) mirrorStep(nextCx) end) -- reschedule FIRST: the liveness tick cannot die
-  if cx ~= nil then
-    ensure() -- TA-A2-ARM: control dirs exist BEFORE arming, so the sentinel.json write cannot ENOENT on first boot
-    if not sentinelArmed then -- A2: arm once, from inside a scoped window callback (tern.carly needs one)
-      if registerSentinel() then
-        sentinelArmed = true -- else leave false: retry next tick (dedup-by-title makes the retry safe)
-      end
+local function mirrorTick(cx)
+  ensure() -- TA-A2-ARM: control dirs exist BEFORE arming, so the sentinel.json write cannot ENOENT on first boot
+  if not sentinelArmed then -- A2: arm once, from inside a scoped window callback (tern.carly needs one)
+    if registerSentinel() then
+      sentinelArmed = true -- else leave false: retry next tick (dedup-by-title makes the retry safe)
     end
-    mirror(cx)
   end
+  mirror(cx)
 end
 
-local function drainStep(cx)
-  tern.sleep(POLL_MS):next(function(_, _, nextCx) drainStep(nextCx) end) -- reschedule FIRST: a killed slow start cannot freeze it
-  if cx ~= nil then
-    ensure()
-    pcall(function() drain(cx) end)
-  end
+local function mirrorStep(cx)
+  tern.sleep(POLL_MS):next(function(_, _, nextCx) mirrorStep(nextCx) end)
+  if cx ~= nil then mirrorTick(cx) end
 end
+
+tern.command({ id = "mirror", title = "agenthop bridge: mirror now", run = function(cx) mirrorTick(cx) end })
+tern.command({ id = "drain", title = "agenthop bridge: drain requests", run = function(cx) ensure(); pcall(function() drain(cx, false) end) end })
+tern.command({ id = "drain-start", title = "agenthop bridge: drain start requests", run = function(cx) ensure(); pcall(function() drain(cx, true) end) end })
 
 mirrorStep(nil) -- A1 status mirror (liveness) + A2 one-shot arm; the first sleep's :next delivers the window cx
-drainStep(nil)  -- A1 claim/dispatch, isolated on its own self-healing chain (the sync `start` lives here)

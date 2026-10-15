@@ -59,6 +59,18 @@ function M.execute(cx, req)
   elseif op == "stop" then
     local o, e = pcall(function() cx.agents:stop(req.agent) end)
     return { ok = o, error = (not o) and tostring(e) or nil }
+  elseif op == "eval" then
+    -- r2 ④ (user directive: call the plugin's Lua API directly). Compile `req.code` with loadstring (the Tern VM has loadstring; `load`
+    -- is nil there) and call it with `cx`; the returned value is the result. Trust boundary unchanged: requests/ lives in the 0700
+    -- home dir, and anyone able to write it can already `start` an arbitrary command — eval adds no attack surface (PROTOCOL.md §2.2).
+    -- Classified non-idempotent (arbitrary code may have side effects) ⇒ UNKNOWN is HOLD, never auto-reissued (PROTOCOL.md §3.3).
+    local compile = loadstring or load
+    if type(req.code) ~= "string" then return { ok = false, error = "eval: code must be a string" } end
+    if type(compile) ~= "function" then return { ok = false, error = "eval: no loadstring in this VM" } end
+    local fn, cerr = compile(req.code)
+    if not fn then return { ok = false, error = "eval compile: " .. tostring(cerr) } end
+    local o, v = pcall(fn, cx)
+    return { ok = o, value = o and v or nil, error = (not o) and tostring(v) or nil }
   else
     return { ok = false, error = "unknown op: " .. tostring(op) }
   end
