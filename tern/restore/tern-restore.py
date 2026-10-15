@@ -25,6 +25,8 @@ CLAUDE_JSON = os.path.expanduser(os.environ.get("CLAUDE_JSON", "~/.claude.json")
 PRESENCE_DIR = os.path.expanduser(os.environ.get("PRESENCE_DIR", "~/.agenthop/presence"))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WAIT_S = float(os.environ.get("RESTORE_WAIT_S", "10"))
+PENDING_DIR = os.path.expanduser(os.environ.get("RESTORE_PENDING_DIR", "~/.agenthop/swarm/tern-restore-pending"))
+PENDING_TTL_S = float(os.environ.get("RESTORE_PENDING_TTL_S", "120"))
 TOOLS = ("claude", "codex")
 SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -63,7 +65,7 @@ def validate_roster(r):
                 raise RosterError(f"{where}.{k} must be a non-empty string")
         if s["tool"] not in TOOLS:
             raise RosterError(f"{where}.tool {s['tool']!r} not in {TOOLS}")
-        if not SID_RE.match(s["sid"]):
+        if not SID_RE.fullmatch(s["sid"]):
             raise RosterError(f"{where}.sid {s['sid']!r} is not a valid sid")
         if "model" not in s:
             raise RosterError(f"{where}.model missing (use null for codex)")
@@ -99,37 +101,54 @@ def inventory(session):
             if not isinstance(t, dict) or not isinstance(t.get("blocks"), list) or "name" not in t:
                 raise InventoryUnknown("a tab lacks name/blocks")
             for b in t["blocks"]:
-                if not isinstance(b, dict) or not isinstance(b.get("id"), int) or "live" not in b or "exited" not in b \
-                        or "command" not in b:
+                if not isinstance(b, dict) or not isinstance(b.get("id"), int) or isinstance(b.get("id"), bool) \
+                        or "live" not in b or "exited" not in b or "command" not in b:
                     raise InventoryUnknown("a block lacks id/live/exited/command")
+                # the leaf types we actually consume (daemon contract): a wrong type is UNKNOWN, never "not this seat"
+                if not isinstance(b["live"], bool):
+                    raise InventoryUnknown(f"block {b['id']}: live is {type(b['live']).__name__}, not bool")
+                if b["command"] is not None and not isinstance(b["command"], str):
+                    raise InventoryUnknown(f"block {b['id']}: command is {type(b['command']).__name__}, not string/null")
+                if t["name"] is not None and not isinstance(t["name"], str):
+                    raise InventoryUnknown(f"tab of block {b['id']}: name is {type(t['name']).__name__}, not string/null")
                 out.append((t["name"], b))
     return out
 
 
+SHELL_OPS = {"&&", "||", ";", "|", "&", "(", ")", "<", ">", ">>", "<<", "2>", "2>&1", "&>"}
+
+
 def parse_acp(command):
-    """(tool, sid, model) if command is exactly a `tern acp` launch with a resume, else None."""
+    """(tool, sid, model) if command is exactly ONE simple `tern acp` launch with one resume, else None.
+    A compound command (any shell operator token) or a repeated --resume/--model cannot prove which identity runs ⇒ None."""
     if not isinstance(command, str) or not command:
         return None
     try:
-        argv = shlex.split(command)
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        argv = list(lex)
     except ValueError:
+        return None
+    if any(a in SHELL_OPS or (a and set(a) <= set("&|;<>()")) for a in argv):
         return None
     if len(argv) < 3 or os.path.basename(argv[0]) != "tern" or argv[1] != "acp" or argv[2] not in TOOLS:
         return None
-    sid = model = None
+    sids, models = [], []
     i = 3
     while i < len(argv):
         a = argv[i]
         if a == "--resume" and i + 1 < len(argv):
-            sid = argv[i + 1]; i += 2; continue
+            sids.append(argv[i + 1]); i += 2; continue
         if a.startswith("--resume="):
-            sid = a.split("=", 1)[1]; i += 1; continue
+            sids.append(a.split("=", 1)[1]); i += 1; continue
         if a == "--model" and i + 1 < len(argv):
-            model = argv[i + 1]; i += 2; continue
+            models.append(argv[i + 1]); i += 2; continue
         if a.startswith("--model="):
-            model = a.split("=", 1)[1]; i += 1; continue
+            models.append(a.split("=", 1)[1]); i += 1; continue
         i += 1
-    return (argv[2], sid, model) if sid else None
+    if len(sids) != 1 or len(models) > 1:
+        return None  # zero or several identities: cannot prove which one runs
+    return (argv[2], sids[0], models[0] if models else None)
 
 
 def is_live(b):
@@ -190,14 +209,17 @@ def ps_table():
     return t
 
 
-def argv_has_resume(command, sid):
-    """True only if the command carries `--resume <sid>` / `--resume=<sid>` as a whole argument."""
+def argv_has_resume(command, sid, positional=False):
+    """True only if the command carries `--resume <sid>` / `--resume=<sid>` as a whole argument; with positional=True also
+    `resume <sid>` (codex's own CLI form). The sid must be a WHOLE argument (a suffixed sid never matches)."""
     try:
         argv = shlex.split(command)
     except ValueError:
         argv = command.split()
     for i, a in enumerate(argv):
         if a == f"--resume={sid}" or (a == "--resume" and i + 1 < len(argv) and argv[i + 1] == sid):
+            return True
+        if positional and a == "resume" and i + 1 < len(argv) and argv[i + 1] == sid:
             return True
     return False
 
@@ -209,13 +231,60 @@ def codex_conflicts(roster, table):
         if s["tool"] != "codex":
             continue
         for pid, (_, cmd) in sorted(table.items()):
-            if "codex" in cmd and "tern acp" not in cmd and argv_has_resume(cmd, s["sid"]):
+            if "codex" in cmd and "tern acp" not in cmd and argv_has_resume(cmd, s["sid"], positional=True):
                 hits.append(f"codex-hint: {s['role']} sid {s['sid'][:8]} may also be open outside Tern (pid {pid}); "
                             f"codex threads are exclusive, check before relying on the Tern seat")
     return hits
 
 
 # ---------- 4. restore ----------
+# TR-ATTACH-RETRY: a started-but-not-yet-listed block is an obligation that must survive THIS process. Before `tern new tab` we
+# write pending/<sid>.json (exclusive create); after the start it records the block id. A later run that finds a pending
+# entry younger than PENDING_TTL_S does NOT start again: it waits for that block (or reports pending). The entry is removed
+# once the seat is seen live. An entry older than the TTL whose block never appeared is stale: reported, removed, and the
+# seat may start again (a start that never shows up in two minutes did not happen). An unreadable entry is UNKNOWN: no start.
+class PendingUnknown(Exception):
+    pass
+
+
+def pending_path(sid):
+    return os.path.join(PENDING_DIR, sid + ".json")
+
+
+def pending_read(sid):
+    """None = no entry; dict = entry; raises PendingUnknown if it exists but cannot be read/parsed."""
+    try:
+        with open(pending_path(sid)) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise PendingUnknown(f"pending entry for {sid} unreadable: {e}")
+    if not isinstance(d, dict) or not isinstance(d.get("at"), (int, float)) or isinstance(d.get("at"), bool):
+        raise PendingUnknown(f"pending entry for {sid} malformed")
+    return d
+
+
+def pending_write(sid, data, create):
+    os.makedirs(PENDING_DIR, mode=0o700, exist_ok=True)
+    f = pending_path(sid)
+    if create:
+        with open(f, "x") as h:  # exclusive: two concurrent runs cannot both claim the start
+            json.dump(data, h)
+        return
+    tmp = f"{f}.tmp-{os.getpid()}"
+    with open(tmp, "x") as h:
+        json.dump(data, h)
+    os.replace(tmp, f)
+
+
+def pending_clear(sid):
+    try:
+        os.remove(pending_path(sid))
+    except FileNotFoundError:
+        pass
+
+
 def wait_listed(session, bid, deadline):
     while True:
         for tab, b in inventory(session):
@@ -244,7 +313,10 @@ def restore(roster):
     report, pending = [], []
     for seat in roster["seats"]:
         mine = seat_blocks(inv, seat)
+        pend = pending_read(seat["sid"])  # PendingUnknown propagates: no guessing about an earlier start
         if mine:
+            if pend is not None:
+                pending_clear(seat["sid"])  # the earlier start is now visible: obligation discharged
             tab, b, _ = mine[0]
             if tab == seat["role"]:
                 report.append(f"skip: {seat['role']} already live (block {b['id']})")
@@ -252,10 +324,27 @@ def restore(roster):
                 err = try_rename(b["id"], seat["role"], time.time() + WAIT_S)
                 report.append(f"rename: {seat['role']} block {b['id']} (was {tab!r})" + (f" FAILED: {err}" if err else ""))
             continue
+        if pend is not None:
+            age = time.time() - pend["at"]
+            if age < PENDING_TTL_S:
+                bid = pend.get("block")
+                report.append(f"pending: {seat['role']} start from an earlier run (block {bid}, {age:.0f}s ago) not listed yet — "
+                              f"not starting again")
+                if isinstance(bid, int) and not isinstance(bid, bool):
+                    pending.append((seat, bid))
+                continue
+            report.append(f"stale: {seat['role']} earlier start (block {pend.get('block')}) never appeared in {age:.0f}s — starting")
+            pending_clear(seat["sid"])
+        try:
+            pending_write(seat["sid"], {"at": time.time(), "role": seat["role"], "block": None}, create=True)
+        except FileExistsError:
+            report.append(f"pending: {seat['role']} another run is starting it — skipped")
+            continue
         out = tern("new", "tab", session, "--cwd", os.path.expanduser(seat["cwd"]), "--", *launch_cmd(seat))
         bid = out.strip().splitlines()[-1].strip() if out.strip() else ""
         if not bid.isdigit():
             raise RuntimeError(f"tern new tab for {seat['role']} returned no block id: {out!r}")
+        pending_write(seat["sid"], {"at": time.time(), "role": seat["role"], "block": int(bid)}, create=False)
         pending.append((seat, int(bid)))
         report.append(f"start: {seat['role']} block {bid}")
     for seat, bid in pending:  # obligations: list then rename each started block; never restart inside this run
@@ -267,6 +356,8 @@ def restore(roster):
         err = try_rename(bid, seat["role"], deadline)
         if err:
             report.append(f"pending: {seat['role']} block {bid} rename failed: {err} (rerun renames it)")
+        else:
+            pending_clear(seat["sid"])
     return report
 
 
@@ -305,7 +396,16 @@ def agent_pid(block_id, seat, table):
     if seat["tool"] == "claude":
         hits = [p for p in desc if "stream-json" in table[p][1] and argv_has_resume(table[p][1], seat["sid"])]
     else:
-        hits = [p for p in kids.get(root, []) if "node" in table[p][1] or "codex" in table[p][1]]
+        # codex seat (observed live 2026-10-15): tern acp codex → node …/@agentclientprotocol/codex-acp/dist/… → codex app-server.
+        # Identity = a DIRECT child whose argv[0] basename is node AND whose argv names the codex-acp adapter path. A child that
+        # merely mentions "codex" (e.g. `tail -f /tmp/codex.log`) is not proof ⇒ unresolved.
+        def is_codex_adapter(cmd):
+            try:
+                argv = shlex.split(cmd)
+            except ValueError:
+                return False
+            return bool(argv) and os.path.basename(argv[0]) == "node" and any("/@agentclientprotocol/codex-acp/" in a for a in argv[1:])
+        hits = [p for p in kids.get(root, []) if is_codex_adapter(table[p][1])]
     return hits[0] if len(hits) == 1 else None
 
 
@@ -383,6 +483,9 @@ def main(argv):
         plines, pfails = presence(roster, write=not check_only)
     except InventoryUnknown as e:
         print(f"inventory UNKNOWN: {e} — stopped", file=sys.stderr)
+        return 3
+    except PendingUnknown as e:
+        print(f"pending UNKNOWN: {e} — stopped (not starting a seat that may already be starting)", file=sys.stderr)
         return 3
     for l in plines:
         print(l)

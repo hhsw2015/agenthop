@@ -34,9 +34,9 @@ if a[:2] == ["ls", "--json"]:
 elif a[:2] == ["new", "tab"]:
     cmd = a[a.index("--") + 1:]
     bid = d["next"]; d["next"] += 1
-    f = T + "/list-delay-3"
-    if os.path.exists(f):
-        d.setdefault("hidden", {})[str(bid)] = 3
+    for n in (3, 99):
+        if os.path.exists(T + f"/list-delay-{n}"):
+            d.setdefault("hidden", {})[str(bid)] = n
     d["sessions"][0]["tabs"].append({"name": None, "blocks": [{"id": bid, "live": True, "exited": None,
         "cwd": a[a.index("--cwd") + 1], "command": " ".join(shlex.quote(x) for x in cmd)}]})
     print(bid)
@@ -69,9 +69,10 @@ cat >"$T/ps" <<'P'
 6101 5101 node adapter
 7101 6101 claude --output-format stream-json --resume=bbbb2222
 5102 1 tern acp codex --resume cccc3333
-6102 5102 node codex-adapter
+6102 5102 /usr/local/bin/node /opt/Tern/agents/codex/node_modules/@agentclientprotocol/codex-acp/dist/index.js
+6103 6102 /usr/local/bin/codex app-server
 P
-export PRESENCE_DIR="$T/presence" RESTORE_WAIT_S=1 SEAT_SHELL_CMD="$T/seatshell"
+export RESTORE_PENDING_DIR="$T/pending" PRESENCE_DIR="$T/presence" RESTORE_WAIT_S=1 SEAT_SHELL_CMD="$T/seatshell"
 printf '#!/usr/bin/env bash\necho "$@" >>"%s/seatshell.log"\n' "$T" >"$T/seatshell"; chmod +x "$T/seatshell"
 export TERN_BIN="$T/tern" FAKE_STATE="$T/state.json" FAKE_LOG="$T/log" CLAUDE_JSON="$T/claude.json" RESTORE_PS="$T/ps"
 run() { python3 "$PY" "$T/roster.json" "$@" >"$T/out" 2>&1; echo $?; }
@@ -140,7 +141,7 @@ ck "codex: suffixed sid is NOT reported (P3 TR-CONFLICT-DOC)" "1" "$(grep -c 'co
 echo '{}' >"$T/bad.json"; rc=$(python3 "$PY" "$T/bad.json" >/dev/null 2>&1; echo $?); ck "bad roster: exit 2" "2" "$rc"
 
 # ===== r2: review findings =====
-fresh() { rm -f "$FAKE_STATE"; : >"$T/log"; rm -rf "$T/presence"; }
+fresh() { rm -f "$FAKE_STATE"; : >"$T/log"; rm -rf "$T/presence" "$T/pending"; }
 seed() { python3 - "$FAKE_STATE" "$1" "$2" <<'PY2'
 import json,sys
 st,tab,cmd,bid=sys.argv[1],sys.argv[2] or None,sys.argv[3],100
@@ -187,6 +188,68 @@ printf '{"session":"agenthop","seats":[{"role":"A","tool":"gpt","sid":"aaaa1111"
 rc=$(python3 "$PY" "$T/r.json" >/dev/null 2>&1; echo $?); ck "roster: unknown tool exit 2" "2" "$rc"
 printf '{"session":"agenthop","seats":[{"role":"A","tool":"claude","sid":"aaaa1111","cwd":"/tmp/x","model":"m"},{"role":"A","tool":"codex","sid":"bbbb","cwd":"/tmp/x","model":null}]}' >"$T/r.json"
 rc=$(python3 "$PY" "$T/r.json" >/dev/null 2>&1; echo $?); ck "roster: duplicate role exit 2" "2" "$rc"
+
+# ===== r3: review 380e7cf findings =====
+# TR-ATTACH-RETRY: listing lags across THREE separate runs ⇒ started exactly once (obligation persisted across processes)
+fresh; touch "$T/list-delay-99"
+run1 >/dev/null; run1 >/dev/null; run1 >/dev/null
+ck "attach-xproc: three runs while unlisted => one start" "1" "$(grep -c '^new tab' "$T/log")"
+ck "attach-xproc: pending entry persisted" "1" "$(ls "$T/pending" 2>/dev/null | grep -c 'aaaa1111.json')"
+rm -f "$T/list-delay-99"; python3 - "$FAKE_STATE" <<'PY2'
+import json,sys; d=json.load(open(sys.argv[1])); d["hidden"]={}; json.dump(d,open(sys.argv[1],"w"))
+PY2
+rc=$(run1); ck "attach-xproc: once listed, run finishes (exit 0)" "0" "$rc"
+ck "attach-xproc: still exactly one start" "1" "$(grep -c '^new tab' "$T/log")"
+ck "attach-xproc: pending cleared once live" "0" "$(ls "$T/pending" 2>/dev/null | wc -l | tr -d ' ')"
+fresh; mkdir -p "$T/pending"; printf '{"at": 1, "role": "Manager", "block": 4242}' >"$T/pending/aaaa1111.json"
+run1 >/dev/null; ck "attach-xproc: stale (>TTL) pending entry => one fresh start" "1" "$(grep -c '^new tab' "$T/log")"
+fresh; mkdir -p "$T/pending"; printf '{torn' >"$T/pending/aaaa1111.json"
+rc=$(run1); ck "attach-xproc: unreadable pending entry => exit 3 UNKNOWN" "3" "$rc"; ck "attach-xproc: unreadable => zero starts" "0" "$(grep -c '^new tab' "$T/log")"
+
+# TR-INVENTORY: consumed leaf types
+for bad in 'live:"true"' 'live:1' 'command:[]'; do
+  fresh; seed Manager "tern acp claude --resume aaaa1111 --model m1"
+  python3 - "$FAKE_STATE" "$bad" <<'PY2'
+import json,sys; d=json.load(open(sys.argv[1])); k,v=sys.argv[2].split(":",1); d["sessions"][0]["tabs"][0]["blocks"][0][k]=json.loads(v); json.dump(d,open(sys.argv[1],"w"))
+PY2
+  rc=$(run1); ck "inventory type: $bad => exit 3" "3" "$rc"; ck "inventory type: $bad => zero starts" "0" "$(grep -c '^new tab' "$T/log")"
+done
+fresh; seed Manager "tern acp claude --resume aaaa1111 --model m1"
+python3 - "$FAKE_STATE" <<'PY2'
+import json,sys; d=json.load(open(sys.argv[1])); d["sessions"][0]["tabs"][0]["name"]={"x":1}; json.dump(d,open(sys.argv[1],"w"))
+PY2
+rc=$(run1); ck "inventory type: object tab name => exit 3" "3" "$rc"; ck "inventory type: object tab name => no rename" "0" "$(grep -c '^rename' "$T/log")"
+
+# TR-IDENTITY: compound command / duplicate identity flags are not the seat
+fresh; seed Manager "tern acp claude --resume other --model m1 && echo --resume aaaa1111 --model m1"; run1 --check >/dev/null
+ck "identity: compound command smuggling the sid => not live" "1" "$(grep -c 'FAIL: Manager: not live' "$T/out")"
+fresh; seed Manager "tern acp claude --resume aaaa1111 --resume other --model m1"; run1 --check >/dev/null
+ck "identity: two --resume => not live" "1" "$(grep -c 'FAIL: Manager: not live' "$T/out")"
+fresh; seed Manager "tern acp claude --resume aaaa1111 --model m1;echo hi"; run1 --check >/dev/null
+ck "identity: glued ';' separator => not live" "1" "$(grep -c 'FAIL: Manager: not live' "$T/out")"
+
+# TR-ROSTER: trailing LF in the sid
+fresh; python3 -c 'import json;print(json.dumps({"session":"agenthop","seats":[{"role":"A","tool":"claude","sid":"aaaa1111\n","cwd":"/tmp/x","model":"m"}]}))' >"$T/r.json"
+rc=$(python3 "$PY" "$T/r.json" >/dev/null 2>&1; echo $?); ck "roster: sid with trailing LF => exit 2" "2" "$rc"; ck "roster: LF => zero starts" "0" "$(grep -c '^new tab' "$T/log")"
+
+# TR-PRESENCE-PID: a non-adapter child mentioning codex is not the adapter
+fresh
+cat >"$T/ps-codex" <<'P'
+5100 1 tern acp codex --resume cccc3333
+6100 5100 tail -f /tmp/codex.log
+P
+printf '{"session":"agenthop","seats":[{"role":"Chief Review","tool":"codex","sid":"cccc3333","cwd":"/tmp/y","model":null}]}' >"$T/cx.json"
+seed "Chief Review" "tern acp codex --resume cccc3333"
+rc=$(RESTORE_PS="$T/ps-codex" python3 "$PY" "$T/cx.json" >"$T/out" 2>&1; echo $?)
+ck "presence: tail -f codex.log is not the adapter => exit 1" "1" "$rc"
+ck "presence: not found reported" "1" "$(grep -c 'agent pid not found' "$T/out")"
+ck "presence: nothing written" "0" "$(ls "$T/presence" 2>/dev/null | wc -l | tr -d ' ')"
+
+# TR-CODEX-HINT: positional `codex resume SID`
+: >"$T/ps"; echo "200 1 /usr/local/bin/codex resume cccc3333" >>"$T/ps"; fresh; run --check >/dev/null
+ck "codex hint: positional 'codex resume SID' reported" "1" "$(grep -c 'codex-hint: Chief Review' "$T/out")"
+: >"$T/ps"; echo "201 1 /usr/local/bin/codex resume cccc3333-x" >>"$T/ps"; fresh; run --check >/dev/null
+ck "codex hint: positional suffixed sid not reported" "0" "$(grep -c 'codex-hint' "$T/out")"
 
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
