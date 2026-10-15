@@ -23,7 +23,9 @@ import json, os, re, shlex, subprocess, sys, time
 
 TERN = os.environ.get("TERN_BIN", "tern")
 CLAUDE_JSON = os.path.expanduser(os.environ.get("CLAUDE_JSON", "~/.claude.json"))
-AH_HOME = os.path.expanduser(os.environ.get("AH_HOME") or "~")  # the same home seat-presence.ts writes under (it reads AH_HOME too)
+# ONE normalized home for every helper (seat-presence.ts and seat-shell.ts both read AH_HOME): a raw "~/x" would be expanded by us
+# but taken literally (relative to cwd) by node, splitting the two writes across two roots (TR-SV-HOME-REGISTRATION).
+AH_HOME = os.path.abspath(os.path.expanduser(os.environ.get("AH_HOME") or "~"))
 PRESENCE_DIR = os.path.join(AH_HOME, ".agenthop", "presence")
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WAIT_S = float(os.environ.get("RESTORE_WAIT_S", "10"))
@@ -614,7 +616,7 @@ def seat_shell_set(sid, pid):
     argv = shlex.split(cmd) if cmd else [os.path.join(REPO, "node_modules", ".bin", "tsx"),
                                          os.path.join(REPO, "scripts", "seat-shell.ts")]
     try:
-        r = subprocess.run([*argv, "set", sid, "tern", str(pid)], capture_output=True, text=True)
+        r = subprocess.run([*argv, "set", sid, "tern", str(pid)], capture_output=True, text=True, env=helper_env())
     except OSError as e:
         return str(e)
     return None if r.returncode == 0 else (r.stderr.strip() or f"rc={r.returncode}")
@@ -674,6 +676,23 @@ def presence_check(seat, f, want):
     return None, f"presence pid {have} != agent pid {want}"
 
 
+def helper_env():
+    return {**os.environ, "AH_HOME": AH_HOME}
+
+
+def writer_response(stdout):
+    """TR-SV-WRITER-RESPONSE: the writer's answer is exactly ONE non-empty line holding ONE JSON object. Any extra non-empty line
+    (a second record, a log line), a non-object, or no line at all is not an answer ⇒ None."""
+    lines = [l for l in (stdout or "").splitlines() if l.strip()]
+    if len(lines) != 1:
+        return None
+    try:
+        res = json.loads(lines[0])
+    except ValueError:
+        return None
+    return res if isinstance(res, dict) else None
+
+
 def seat_presence_set(sid, block_id, tool):
     """The ONE presence writer (#1053 scripts/seat-presence.ts set): it resolves the agent pid under the block itself (kernel exact
     argv), then writes under the shared per-sid lock (re-reads .pid/.origin inside it, origin first). Contract: exit 0 = wrote|kept,
@@ -681,16 +700,11 @@ def seat_presence_set(sid, block_id, tool):
     Returns (pid, line, None) on 0, else (None, None, fail)."""
     cmd = os.environ.get("SEAT_PRESENCE_CMD")
     argv = shlex.split(cmd) if cmd else [os.path.join(REPO, "node_modules", ".bin", "tsx"), os.path.join(REPO, "scripts", "seat-presence.ts")]
-    env = {**os.environ, "AH_HOME": AH_HOME}
     try:
-        r = subprocess.run([*argv, "set", sid, str(block_id), tool], capture_output=True, text=True, timeout=30, env=env)
+        r = subprocess.run([*argv, "set", sid, str(block_id), tool], capture_output=True, text=True, timeout=30, env=helper_env())
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, None, f"seat-presence set failed to run: {e}"
-    out = (r.stdout or "").strip().splitlines()
-    try:
-        res = json.loads(out[-1]) if out else None
-    except ValueError:
-        res = None
+    res = writer_response(r.stdout)
     if r.returncode == 0 and isinstance(res, dict) and res.get("state") in ("wrote", "kept") \
             and isinstance(res.get("pid"), int) and not isinstance(res.get("pid"), bool) and res["pid"] > 0:
         return res["pid"], res, None

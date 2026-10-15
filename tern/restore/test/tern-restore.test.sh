@@ -388,14 +388,18 @@ ck "presence r6: readers' Number(trim(file)) parses it" "7100" "$(python3 -c 'im
 ck "presence r6: hook's kill -0 \"\$(cat)\" form works" "0" "$(kill -0 "$(cat "$PRES/aaaa1111.pid")" 2>/dev/null; [ "$(cat "$PRES/aaaa1111.pid")" = 7100 ] && echo 0 || echo 1)"
 ck "presence r6: sidecar .origin says origin=agent" "1" "$(grep -c '^origin=agent ts=[0-9]*$' "$PRES/aaaa1111.origin")"
 ck "presence r6: no temp left" "0" "$(find "$PRES" -name '*.tmp-*' | wc -l | tr -d ' ')"
-# a live bus record (hook: .pid only, no sidecar) with a different pid: --check WARNs, does not FAIL; a run replaces it
-printf '%s' "$$" >"$PRES/aaaa1111.pid"; rm -f "$PRES/aaaa1111.origin"
+# a live bus record (hook: .pid only, no sidecar) with a different pid: --check WARNs, does not FAIL; a run replaces it.
+# The "bus" pid is a sleep child this test owns (alive for the whole case, killed after) — not $$, whose liveness the checked
+# process sees through a different parent and whose value can collide with a fixture pid.
+sleep 120 & BUSPID=$!
+printf '%s' "$BUSPID" >"$PRES/aaaa1111.pid"; rm -f "$PRES/aaaa1111.origin"
 rc=$(run --check); ck "presence r6: live bus pid (no sidecar) => --check exit 0" "0" "$rc"
 ck "presence r6: ... reported as WARN" "1" "$(grep -c '^WARN: Manager presence pid' "$T/out")"
 printf 'origin=bus ts=1\n' >"$PRES/aaaa1111.origin"
 rc=$(run --check); ck "presence r6: live pid with origin=bus sidecar => WARN, exit 0" "0" "$rc"
 run >/dev/null
 ck "presence r6: a run replaces the bus pid with the agent pid" "7100" "$(cat "$PRES/aaaa1111.pid")"
+kill "$BUSPID" 2>/dev/null; wait "$BUSPID" 2>/dev/null
 ck "presence r6: ... and the sidecar says origin=agent" "1" "$(grep -c origin=agent "$PRES/aaaa1111.origin")"
 # a DEAD bus pid is not excused
 printf '999999' >"$PRES/aaaa1111.pid"; printf 'origin=bus ts=1\n' >"$PRES/aaaa1111.origin"
@@ -591,6 +595,33 @@ ck "continuation: its tab name is untouched" "Other Role" "$(python3 -c 'import 
 fresh; seed Manager "tern acp claude --resume aaaa1111 --model m1 \\
 # --mode bypassPermissions"; run1 --check >/dev/null
 ck "continuation: comment-only --mode => FAIL mode None" "1" "$(grep -c "FAIL: Manager: mode None" "$T/out")"
+
+# ===== r13 =====
+# TR-SV-WRITER-RESPONSE: the writer's answer is exactly one non-empty line holding one JSON object; anything else is a FAIL, no registration
+mkw() { printf '#!/usr/bin/env bash\n%s\n' "$2" >"$T/$1"; chmod +x "$T/$1"; }
+mkw sp2rec "echo '{\"state\":\"refused\",\"reason\":\"presence lock busy\"}'; echo '{\"state\":\"wrote\",\"pid\":424242,\"was\":null}'"
+mkw splog1 "echo 'note: resolving'; echo '{\"state\":\"wrote\",\"pid\":424242,\"was\":null}'"
+mkw spblank "echo; echo '{\"state\":\"wrote\",\"pid\":424242,\"was\":null}'; echo"
+mkw sparr "echo '[{\"state\":\"wrote\",\"pid\":424242}]'"
+for w in sp2rec splog1 sparr; do
+  fresh; : >"$T/seatshell.log"; rc=$(SEAT_PRESENCE_CMD="$T/$w" run1)
+  ck "writer response $w: exit 1, nothing registered" "1 0" "$rc $(wc -l <"$T/seatshell.log" | tr -d ' ')"
+done
+fresh; : >"$T/seatshell.log"; SEAT_PRESENCE_CMD="$T/spblank" run1 >/dev/null
+ck "writer response: blank lines around one record are fine (positive)" "1" "$(grep -c '^set aaaa1111 tern 424242$' "$T/seatshell.log")"
+# TR-SV-HOME-REGISTRATION: both helpers get the SAME normalized home (absolute, ~ expanded) — checked with the REAL seat-shell.ts
+REAL_SS="$REPO_ROOT/node_modules/.bin/tsx $REPO_ROOT/scripts/seat-shell.ts"
+# the tilde form needs a root under $HOME: a private dir there, removed at the end of this case
+HT="$(mktemp -d "$HOME/.tern-restore-test.XXXXXX")"
+for form in abs tilde; do
+  fresh
+  if [ $form = abs ]; then R="$T/fakehome"; H="$R"; else R="$HT/fakehome"; H="~/${R#$HOME/}"; fi
+  mkdir -p "$R"; rm -rf "$R/.agenthop" "$T/~"
+  rc=$(cd "$T" && AH_HOME="$H" SEAT_SHELL_CMD="$REAL_SS" python3 "$PY" "$T/one.json" >"$T/out" 2>&1; echo $?)
+  ck "home $form: presence and seat-shell under the same root" "1 1" "$(ls "$R/.agenthop/presence/aaaa1111.pid" 2>/dev/null | wc -l | tr -d ' ') $(ls "$R/.agenthop/swarm/seat-shell/aaaa1111.json" 2>/dev/null | wc -l | tr -d ' ')"
+  ck "home $form: nothing written under a literal ./~ in cwd" "0" "$(ls -d "$T/~" 2>/dev/null | wc -l | tr -d ' ')"
+done
+rm -rf "$HT"
 
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
