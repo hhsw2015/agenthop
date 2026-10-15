@@ -38,7 +38,7 @@ MCP server 由各席 harness 拉起;换了二进制后每席要重载 MCP 才用
 
 ```text
 工具列表里应出现:agenthop_tern、agenthop_tern_status(#1034)
-调 agenthop_tern_status → 返回 JSON(schema 见 feat/mcp-tern-bridge @6016b1d:packages/bus/src/tern-bridge.ts:462-501 ternStatus,
+调 agenthop_tern_status → 返回 JSON(schema 见 main @c3fbdde:packages/bus/src/tern-bridge.ts:501-543 ternStatus,
   mcp.ts:270-271 合并 workers):
   state        "healthy" | "degraded" | "unknown"     <- 判据;不是「JSON 且非 error」
   reasons      [string]                               <- degraded/unknown 的原因
@@ -204,19 +204,19 @@ herdr session list --json | python3 -c 'import json,sys;print([s["name"] for s i
 # 期望:含 default 与 <角色>-<任务>
 ```
 
-worker 写回箱后,经 agenthop_tern 发 `stop`(`args.worker:"<名>"`)。返回值是 `{state, name, steps, reason?}`(StopResult,packages/bus/src/tern-workers.ts:393 @ea1e879;stopWorker 395-403,stopWorkerAfterRead 406-443)。
+worker 写回箱后,经 agenthop_tern 发 `stop`(`args.worker:"<名>"`)。返回值是 `{state, name, steps, reason?}`(StopResult,packages/bus/src/tern-workers.ts:397 @c3fbdde;stopWorker 399-407,stopWorkerAfterRead 410-450)。
 
-`steps` 只列**可观测的外部步骤**。内部记录转换(该 worker 记录 stopping → stopped)不在 `steps` 里:记录写成功不产生 step,只有写失败才 push 一项 `record <state>` ok:false(413)。所以正常成功不会出现 record 项,也不要求它。
+`steps` 只列**可观测的外部步骤**。内部记录转换(该 worker 记录 stopping → stopped)不在 `steps` 里:记录写成功不产生 step,只有写失败才 push 一项 `record <state>` ok:false(417)。所以正常成功不会出现 record 项,也不要求它。
 
 ```text
-期望 state = "stopped";steps 每项 ok:true,依序为下面两种之一(按该 worker 记录有无 server_pid,423-432):
+期望 state = "stopped";steps 每项 ok:true,依序为下面两种之一(按该 worker 记录有无 server_pid,430-439):
   有 server_pid(#1034 r4 起新起的 worker):"stop own server" -> "socket gone" -> "tern close" -> "herdr session delete"
   无 server_pid(旧记录):                   "herdr server stop" -> "socket gone" -> "tern close" -> "herdr session delete"
-  pane=0(从未放块)时没有 "tern close"(436)。
-内部记录(不在 steps 里,直接看 seat-shell):先写 stopping(417,同时是实例核验);steps 全 ok 才写 stopped + stopped_at(440-441)。
+  pane=0(从未放块)时没有 "tern close"(443)。
+内部记录(不在 steps 里,直接看 seat-shell):先写 stopping(424,同时是实例核验);steps 全 ok 才写 stopped + stopped_at(448)。
 state="partial" => 至少一步 ok:false(看 detail;"ownership" / "socket gone" 失败时 "herdr session delete" 记为 skipped,ok:false)。
    记录**保持 stopping**(不写 stopped,仍占容量,可重发 stop)——按 detail 手工补那一步,不算冒烟通过。
-state="unknown" => 没有动作:读不到该席记录 / 无此活 worker(397-402),或实例核验失败、记录写不进(417,reason 以 instance-mismatch 开头)。先查记录再判。
+state="unknown" => 没有动作:读不到该席记录 / 无此活 worker(402-405),或实例核验失败、记录写不进(424,reason 以 instance-mismatch 开头)。先查记录再判。
 ```
 
 ```bash
