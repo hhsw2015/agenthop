@@ -94,7 +94,7 @@ TERN_PANE_SOCKET=… tern ctl plugins run plugin.agenthop-agents-bridge.drain-st
 | `stop` | **非幂等** | `agent` | `{}` | 关闭块 |
 | `eval` | **非幂等** | `code` | `{value:<any>}` | r2(user 亲令「通过插件直接调用 Lua API」):`loadstring` 编译(VM 内 `load` 为 nil)后以 `cx` 为参调用,返回值 JSON 编码;编译/运行错误 → `{ok:false,error}`。走 `drain`(快类) |
 
-**eval 信任边界**:信任边界不变:requests/ 在 0700 家目录,能写该目录者本已可用 `start` 起任意命令,eval 不新增攻击面。
+**eval 信任边界**:能写 `requests/` 者本已可用 `start` 起任意命令,eval 不新增攻击面。这一条**以控制目录只有本用户可写为前提**——这是假设,不是本桥保证的:桥用 `tern.fs.mkdir` 建目录,不设权限位(2026-10-15 现网 `~/.agenthop/tern-panes` 与 `requests/` 为 0755,即只有属主可写,组/其他可读);`gc.sh` 摘要行带 `mode=<八进制>` 供巡检核对,组或其他可写时另加 `unsafe_mode` 并 exit 1(UNKNOWN)。
 
 **eval 预算(调用方自负)**:eval 跑在 `drain` 命令 hook 内;单次 >50ms(如 `return #cx.agents:list()`,~28ms 且有方差)会禁用 `drain` 直到 `tern plugin reload`,其后所有请求滞留 `requests/` 不被消费(11:28:45 现网实例)。贵调用请拆分、或改用 `list`(默认瘦身)。
 

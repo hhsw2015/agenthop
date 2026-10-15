@@ -9,7 +9,8 @@
 #                       runs from quarantine, not from the request's birth (BTF-GC-QUARANTINE-AGE); the name is fresh and the move
 #                       never overwrites (BTF-GC-QUARANTINE-OWN). If either step fails the request stays in requests/ (counted as
 #                       requests_held) — never deleted, never clobbering another file.
-#   requests/.*.tmp    older than REQUEST_TTL_S              ⇒ DELETED   (a publish that crashed between write and rename)
+#   requests/.<id>.tmp | .<id>.tmp-<8hex> older than REQUEST_TTL_S ⇒ DELETED (a publish that crashed between write and rename;
+#                       exact shapes only — a .gc-* hold is never a temp, r15)
 #   requests/quarantine/* older than QUARANTINE_TTL_S (default 86400) ⇒ DELETED
 #
 # Prints one summary line: gc: results=N requests_quarantined=N requests_held=N tmp=N quarantine_expired=N [skipped=<dir>(<why>),…]. Exit 0 always unless the control dir is
@@ -29,6 +30,10 @@ NOW="${GC_NOW:-$(date +%s)}"
 # dir, is SKIPPED (reported in skipped=), never followed — gc must not delete or move a byte outside $D. Entries are also skipped when
 # they are symlinks themselves (a link's mtime is not the file's; acting on it would touch whatever it points at).
 ROOT="$(cd "$D" && pwd -P)" || { echo "gc: control dir unreadable: $D (UNKNOWN, nothing done)"; exit 1; }
+# r15: the eval trust boundary (PROTOCOL §2.2) assumes only the owner can WRITE the control dir. Report the mode; group- or
+# other-writable ⇒ UNKNOWN (exit 1), nothing done — a dir others can write is not ours to clean or to trust.
+MODE="$(stat -f %Lp "$ROOT" 2>/dev/null)" || { echo "gc: control dir mode unreadable: $D (UNKNOWN, nothing done)"; exit 1; }
+if [ $(( 8#$MODE & 8#022 )) -ne 0 ]; then echo "gc: unsafe_mode mode=$MODE (group/other-writable control dir: UNKNOWN, nothing done)"; exit 1; fi
 skipped=""
 safe_dir() { # $1 = path, $2 = label; 0 = a real directory inside ROOT
   [ -e "$1" ] || [ -L "$1" ] || return 1
@@ -90,8 +95,19 @@ if safe_dir "$D/requests" requests; then
     b="$(basename "$h")"; b="${b#.gc-}"; b="${b%.*.*}"
     to_quarantine "$h" "$b" && nq=$((nq+1)) || nh=$((nh+1))
   done
-  for f in "$D"/requests/.*.tmp*; do
+  # r15 BTF-R14-P2-1: only a PUBLISH temp is ever deleted, by its exact shapes — publish.sh writes requests/.<id>.tmp, agenthop_tern
+  # (tern-bridge.ts publishRequest) writes requests/.<id>.tmp-<8 hex>. A gc HOLD (.gc-*) is an obligation and never matches here,
+  # even when its <id> contains ".tmp" (an id may: only "/" and a leading "." are forbidden); a hold that cannot be quarantined
+  # stays and is counted held above.
+  for f in "$D"/requests/.*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
+    n="$(basename "$f")"
+    case "$n" in .gc-*) continue;; esac
+    case "$n" in
+      *.tmp) ;;
+      *.tmp-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+      *) continue;;
+    esac
     a="$(age "$f")" || continue
     [ "$a" -gt "$REQUEST_TTL_S" ] && rm -f "$f" && nt=$((nt+1))
   done
@@ -104,5 +120,5 @@ if safe_dir "$D/requests" requests; then
   fi
 fi
 skipped="$(printf '%s\n' $skipped | sort -u | tr '\n' ' ' | sed 's/^ *//;s/ *$//')"
-echo "gc: results=$nr requests_quarantined=$nq requests_held=$nh tmp=$nt quarantine_expired=$ne${skipped:+ skipped=${skipped// /,}}"
+echo "gc: results=$nr requests_quarantined=$nq requests_held=$nh tmp=$nt quarantine_expired=$ne mode=$MODE${skipped:+ skipped=${skipped// /,}}"
 exit 0

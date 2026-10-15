@@ -83,5 +83,5 @@ bash test/publish.test.sh      # A1 atomic publisher: write-success gates the re
 bash test/cpa-probe.test.sh    # A2 r2 CPA probe: 3-strike + recovery-clears
 ```
 
-All fixtures have teeth. `claim.test.lua` loads the real `claim.luau`; `window.test.lua` loads the real `window.luau` (hook model: one await chain for the mirror, drain/drain-start/mirror commands — structural, not a reproduction of Tern's budget kill); `sentinel.test.lua` loads
+All fixtures have teeth. `claim.test.lua` loads the real `claim.luau`; `window.test.lua` loads the real `window.luau` (hook model since r4: no await chain at all — the mirror is the `mirror` command plus a best-effort `tern.timer` chain, and drain/drain-start/arm-scan/arm-cancel-next are commands; structural, not a reproduction of Tern's budget kill); `sentinel.test.lua` loads
 the real `sentinel.luau` directly (no drift); `osc-hook.test.sh` captures the emitted OSC via `AGENTHOP_OSC_TTY`.
