@@ -86,3 +86,25 @@
 | G5 Carly 可用性 | NOT-READY(作唯一 SLA) | 关键截止 Tern 外后备(协调者 cron/TG);她=有人值守第一道提醒 |
 横切: 发信人无身份(呈批一次性码)/check 悄停用需监控/迁移期自动化与她的窗口分离。
 验收三方: Tern 侧=Carly;蜂群侧=审查链;整体放行=user。
+
+## I. 两壳合一的目标形态(user 定向 2026-10-15:「在 Tern 中集成 ACP、TUI、herdr 的优势」)
+
+**原则(#1043)**:ACP/TUI、Tern/herdr 取长不选边。每家强项补一格,不做「替代」讨论。
+
+| 强项 | 来源 | 补哪一格 | 落地件 |
+|---|---|---|---|
+| 控制面:cx.agents ask/wait/start/stop、结构化权限、Lua API、session/tab 组织、remote | Tern | 常驻席位的驱动与审批 | #1034 agenthop_tern 原生工具(真机验过) |
+| 结构化状态(idle/working/waiting_input) | ACP | 状态板、哨兵、sweep 的输入 | 八席位现状 |
+| 子 agent 原生画面、一进程多子省资源 | TUI | 席位扇出 worker 时的观测与成本 | #1040 TUI worker 形态(kind=tui start) |
+| 读屏分类器(17 agent manifest)、PTY 级观测、agent list/wait/prompt socket API | herdr | TUI 块的 idle/working/blocked;herdr 壳内 worker 的控制面 | #1041 分类器翻译进 A2 sentinel;herdr.ts 后端(已有) |
+| 子 agent 起止事件 | Claude hooks | 补 TUI/ACP 都看不见的子 agent 生命周期 | #1042 钩子 → writeInbox 到父席位([tested]) |
+
+**拓扑(实测 2026-10-15 12:50)**:herdr TUI 客户端可作为 Tern 的一个块运行(`tern new tab work -- herdr`),Tern 读屏可见其 agents 面板与 pane 内容;herdr server 常驻,socket API 从任意进程可调。因此:
+- **ACP 席位住 Tern**(控制面走 cx.agents / agenthop_tern)。
+- **TUI worker 可住 herdr**(控制面走 `herdr agent prompt/wait/read`,观测走 herdr 自带分类器),herdr 客户端嵌在 Tern 的一个 tab 里给人看;或住 Tern 裸块(观测走 #1041 移植的分类器)。
+- **两边的真理源都是耐久箱**:派单、回执、子 agent 起止全部 writeInbox;壳只负责「跑」和「看」。
+- seat-shell/<sid>.json 记每席位所在壳,inbox-wake 按壳路由(feat/inbox-wake-tern)。
+
+**Tern 原生没有的(已核 docs + Carly,~/.agenthop/carly/tern-native-capabilities-answer.md)**:TUI 状态检测器;子 agent/父 id 任何字段或事件;pane 状态写入口;窗口后台定时器 opt-out。**Tern 有而需用对的**:`tern.carly.tasks()/cancel()`(Lua 有 CLI 无);`tern.kv` 跨半/跨窗口共享;host half 常驻 2s 预算(但 cx.agents 为 window-only);ACP 块状态由程序自发 OSC 9;4 驱动(文档原话)。
+
+**放置模型(#1039)**:session=集群/项目;tab=长期席位(英文角色名);block=worker。默认 split 到调用席位 tab;扇出 >4 才同 session 新 tab;独立子项目才新 session;绝不按席位开 session。
