@@ -46,16 +46,21 @@ export function drainActionFor(op: string): string {
 }
 
 /**
- * #1035: Tern ACP blocks only show top-level sessions, so `start` is the swarm's front door for VISIBLE work. Its block opens as a
- * sibling TAB by default, and an optional `title` (a fixed English role name, never a session id — user rule) is applied with
- * `tern rename <pane> <title>` once start reports the pane. Returns null when the title is acceptable, else the reason. Pure.
+ * PLACEMENT MODEL (user Q&A via coordinator, #1034 r2): Tern session = cluster/project; tab = a long-lived SEAT (English role name);
+ * block = a short-lived WORKER. `start` is the front door for visible work (#1035: Tern only shows top-level blocks):
+ *   - default how="split": the worker opens BESIDE the caller's own seat pane (args.near, else TERN_PANE) — `cx.agents:start` only
+ *     places relative to focus, so we start it, then `tern move <new> right-of <near>`;
+ *   - how="tab": a new tab in the SAME session (fan-out of more than ~4 workers) — `tern move <new> new-tab`;
+ *   - args.session: NOT supported yet (the CLI has no move-to-session) ⇒ rejected with a reason, never a silently-new session.
+ * Worker title = "<role> · <task>" (rename via `tern rename <pane> <title>`); no session ids in titles (user rule). The tab keeps its
+ * seat name when the worker block closes. Returns null when the title is acceptable, else the reason. Pure.
  */
 const SID_LIKE = /[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}|\b[0-9a-f]{8}\b/i;
 export function checkRoleTitle(title: unknown): string | null {
   if (title === undefined) return null;
   if (typeof title !== "string" || title.trim() === "") return "title must be a non-empty string";
   if (title.length > 60) return "title too long (max 60)";
-  if (!/^[A-Za-z][A-Za-z0-9 ._-]*$/.test(title)) return "title must be an English role name (letters, digits, space . _ -)";
+  if (!/^[A-Za-z][A-Za-z0-9 ._·:-]*$/.test(title)) return "title must be English: \"<role> · <task>\" (letters, digits, space . _ - · :)";
   if (SID_LIKE.test(title)) return "title must not contain a session id (use a fixed role name)";
   return null;
 }
@@ -149,7 +154,7 @@ export function unreachable(r: Run): string | undefined {
 }
 
 export type CallResult =
-  | { state: "ok"; id: string; ms: number; result: unknown; recovered?: boolean; pane?: number; renamed?: string; renameError?: string }
+  | { state: "ok"; id: string; ms: number; result: unknown; recovered?: boolean; pane?: number; placed?: string; placeError?: string; renamed?: string; renameError?: string }
   | { state: "UNKNOWN"; hold: true; id: string; ms: number; reason: string }
   | { state: "timeout"; id: string; ms: number; recovered: boolean; reason: string }
   | { state: "unknown"; id?: string; ms: number; reason: string };
@@ -204,16 +209,38 @@ export async function recover(d: TernDeps): Promise<string | undefined> {
 }
 
 
-/** After a successful start, apply the role title with `tern rename <pane> <title>`. Best-effort: the start already happened, so a
- *  rename failure is reported alongside the ok result, never turned into an error or a retry of the start. */
-async function nameStarted(d: TernDeps, op: string, result: unknown, title: string | undefined): Promise<{ pane?: number; renamed?: string; renameError?: string }> {
+export type Placement = { how: "split" | "tab"; near?: string };
+
+/** Resolve where a started worker goes (placement model above). Pure. */
+export function placementFor(args: Record<string, unknown>, ternPane: string | undefined): Placement | { error: string } {
+  if (args.session !== undefined) return { error: "args.session is not supported yet (no move-to-session in the Tern CLI); start in this session" };
+  const how = args.how === undefined ? "split" : args.how;
+  if (how !== "split" && how !== "tab") return { error: `how must be "split" (default, beside your seat) or "tab" (new tab, same session)` };
+  if (how === "tab") return { how };
+  const near = args.near !== undefined ? String(args.near) : ternPane;
+  return near ? { how, near } : { how }; // no caller pane known ⇒ leave it where start put it (beside focus)
+}
+
+/** After a successful start: place the worker (move beside the caller's seat, or into a new tab), then name it. Best-effort — the start
+ *  already happened, so a move/rename failure is REPORTED alongside the ok result, never turned into an error or a retry of the start. */
+async function nameStarted(d: TernDeps, op: string, result: unknown, title: string | undefined, place: Placement | undefined):
+  Promise<{ pane?: number; placed?: string; placeError?: string; renamed?: string; renameError?: string }> {
   if (op !== "start") return {};
   const pane = (result as { pane?: unknown } | null)?.pane;
   if (typeof pane !== "number") return {};
-  if (!title) return { pane };
-  const r = await d.run(d.bin!, ["rename", String(pane), title], CTL_TIMEOUT_MS);
-  const bad = unreachable(r);
-  return bad ? { pane, renameError: bad } : { pane, renamed: title };
+  const out: { pane: number; placed?: string; placeError?: string; renamed?: string; renameError?: string } = { pane };
+  if (place) {
+    const argv = place.how === "tab" ? ["move", String(pane), "new-tab"] : place.near && place.near !== String(pane) ? ["move", String(pane), "right-of", place.near] : null;
+    if (argv) {
+      const bad = unreachable(await d.run(d.bin!, argv, CTL_TIMEOUT_MS));
+      if (bad) out.placeError = bad; else out.placed = argv.slice(2).join(" ");
+    }
+  }
+  if (title) {
+    const bad = unreachable(await d.run(d.bin!, ["rename", String(pane), title], CTL_TIMEOUT_MS));
+    if (bad) out.renameError = bad; else out.renamed = title;
+  }
+  return out;
 }
 
 /** "stale" iff agents.json is readable and older than STALE_MS; "fresh" if readable and newer; "unknown" if unreadable. Pure-ish. */
@@ -232,14 +259,20 @@ export async function ternCall(op: string, args: Record<string, unknown> = {}, t
   if (!(TERN_OPS as readonly string[]).includes(op)) return { state: "unknown", ms: ms(), reason: `unsupported op "${op}" (allowed: ${TERN_OPS.join(", ")})` };
   if (!d.bin) return { state: "unknown", ms: ms(), reason: "tern binary not found (set TERN_BIN)" }; // zero actions taken
   let title: string | undefined;
+  let place: Placement | undefined;
   if (op === "start") {
     const bad = checkRoleTitle(args.title);
     if (bad) return { state: "unknown", ms: ms(), reason: `start: ${bad}` }; // rejected before any publish: zero actions
     title = args.title as string | undefined;
+    const p = placementFor(args, process.env.TERN_PANE);
+    if ("error" in p) return { state: "unknown", ms: ms(), reason: `start: ${p.error}` };
+    place = p;
   }
   const id = d.newId();
-  const { readonly: _ro, title: _t, ...rest } = args; // `readonly`/`title` are caller-side; the bridge never sees them
-  const wire = op === "start" && rest.how === undefined ? { ...rest, how: "tab" } : rest; // #1035: start opens a sibling tab by default
+  // `readonly`/`title`/`near`/`session` are caller-side; the bridge never sees them. The bridge always gets how="split" (start beside
+  // focus); the final placement is done with `tern move` once the pane is known (placementFor / nameStarted).
+  const { readonly: _ro, title: _t, near: _n, session: _s, how: _h, ...rest } = args;
+  const wire = op === "start" ? { ...rest, how: "split" } : rest;
   try { publishRequest(d.ctlDir, id, { op, ...wire }); }
   catch (e) { return { state: "unknown", id, ms: ms(), reason: `publish failed: ${(e as Error).message}` }; }
 
@@ -251,7 +284,7 @@ export async function ternCall(op: string, args: Record<string, unknown> = {}, t
       : { state: "unknown", id, ms: ms(), reason: bad };
   }
   const first = await poll(d, id, timeoutMs);
-  if (first !== undefined) return { state: "ok", id, ms: ms(), result: first, ...(await nameStarted(d, op, first, title)) };
+  if (first !== undefined) return { state: "ok", id, ms: ms(), result: first, ...(await nameStarted(d, op, first, title, place)) };
 
   if (opClass(op, args) === "non-idempotent") {
     return { state: "UNKNOWN", hold: true, id, ms: ms(), reason: "no result in time; the op may have run — HOLD, do not re-send (PROTOCOL.md §3.3)" };

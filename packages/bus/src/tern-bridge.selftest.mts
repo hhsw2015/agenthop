@@ -108,21 +108,35 @@ t("drainActionFor: start ⇒ drain-start; others ⇒ drain", drainActionFor("sta
   t("eval wire body: has op+code, no readonly", wire.includes('"op":"eval"') && wire.includes('"code"') && !wire.includes("readonly"))
 }
 
-// ---- #1035: start = the front door for visible work: how defaults to "tab", role title applied via `tern rename` ----
-t("checkRoleTitle: English role name ok", checkRoleTitle("Platform Dev") === null && checkRoleTitle(undefined) === null)
+// ---- placement model (#1034 r2): split beside the caller's seat (default) / how:"tab" new tab same session / no session ----
+t("checkRoleTitle: worker title \"<role> · <task>\" ok", checkRoleTitle("Platform Dev · bridge r8") === null && checkRoleTitle(undefined) === null)
 t("checkRoleTitle: sid-like rejected (uuid + 8-hex)", checkRoleTitle("worker 90b58f9c") !== null && checkRoleTitle("x 01a13284-d361-74a0-a026-ad56f1fdf355") !== null)
 t("checkRoleTitle: non-English / empty rejected", checkRoleTitle("审查") !== null && checkRoleTitle("  ") !== null)
 {
   const s = setup("answer");
-  const r = await ternCall("start", { prompt: "p", cwd: "/", title: "Chief Review" }, 2000, s.deps);
+  const r = await ternCall("start", { prompt: "p", cwd: "/", title: "Platform Dev · smoke", near: 777 }, 2000, s.deps);
   const wire = readFileSync(path.join(s.dir, "last-request.json"), "utf8");
-  t("start: how defaults to \"tab\" on the wire; title NOT sent to the bridge", wire.includes('"how":"tab"') && !wire.includes("title"))
-  t("start: returns the pane id and renames it to the role title", r.state === "ok" && (r as any).pane === 4242 && (r as any).renamed === "Chief Review" && s.argv().some((a) => a === "rename 4242 Chief Review"))
-  await ternCall("start", { prompt: "p", cwd: "/", how: "split" }, 2000, s.deps);
-  t("start: an explicit how is kept", readFileSync(path.join(s.dir, "last-request.json"), "utf8").includes('"how":"split"'))
+  t("start default: bridge gets how=\"split\"; title/near never on the wire", wire.includes('"how":"split"') && !wire.includes("title") && !wire.includes("near"))
+  t("start default: worker moved right-of the caller's seat pane, then renamed", r.state === "ok" && (r as any).pane === 4242
+    && s.argv().includes("move 4242 right-of 777") && s.argv().includes("rename 4242 Platform Dev · smoke") && (r as any).placed === "right-of 777")
+  const order = s.argv().filter((x) => x.startsWith("move") || x.startsWith("rename"));
+  t("start default: move happens before rename", order[0]?.startsWith("move") === true && order[1]?.startsWith("rename") === true)
+}
+{
+  const s = setup("answer");
+  const prev = process.env.TERN_PANE; process.env.TERN_PANE = "888";
+  await ternCall("start", { prompt: "p", cwd: "/" }, 2000, s.deps);
+  t("start default: with no args.near, the caller's TERN_PANE is the anchor", s.argv().includes("move 4242 right-of 888"))
+  if (prev === undefined) delete process.env.TERN_PANE; else process.env.TERN_PANE = prev;
+  await ternCall("start", { prompt: "p", cwd: "/", how: "tab" }, 2000, s.deps);
+  t("start how=\"tab\": moved to a new tab in the same session", s.argv().includes("move 4242 new-tab"))
   const before = s.argv().length;
+  const bs = await ternCall("start", { prompt: "p", cwd: "/", session: "other" }, 2000, s.deps);
+  t("start args.session: rejected before any publish (never a silently-new session)", bs.state === "unknown" && /session/.test((bs as any).reason) && s.argv().length === before && s.requests().length === 0)
+  const bh = await ternCall("start", { prompt: "p", cwd: "/", how: "replace_if_alone" }, 2000, s.deps);
+  t("start: an unsupported how is rejected", bh.state === "unknown" && /how must be/.test((bh as any).reason))
   const bad = await ternCall("start", { prompt: "p", cwd: "/", title: "seat 90b58f9c" }, 2000, s.deps);
-  t("start: a sid-like title is rejected BEFORE any publish (zero actions)", bad.state === "unknown" && s.argv().length === before && s.requests().length === 0)
+  t("start: a sid-like title is rejected BEFORE any publish (zero actions)", bad.state === "unknown" && s.requests().length === 0)
 }
 
 // ---- read-only timeout ⇒ ONE recovery then success ----
