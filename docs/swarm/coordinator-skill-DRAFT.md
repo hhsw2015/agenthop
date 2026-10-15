@@ -53,7 +53,7 @@ user 离场期你**代行其可撤决策**(可撤判据见 CORE 代理权节);�
 2. 判卷目录(本工作区 `~/Work/review-reports/`)里比 PROGRESS 新的判卷——判卷走文件,PROGRESS 总滞后,漏读过。
 3. 各席位箱 unclaimed 计数(抓死 sid 积压)。
 4. `tern ls --json` 席位表 + `heartbeat.json` pass/sweep 新鲜度。
-5. 合表:同一 SHA 主审 + 二声都 0 REMAIN ⇒ DUAL-VOICE-CLEARED 入合并池(§4);任一方有 REMAIN ⇒ 派 r(n+1),**两席判卷同根的条目合并成一条**。
+5. 合表:按本工作区的审查票数策略(§3;本仓 agenthop 当前策略 = 主审 + 二声两票)——同一 SHA 所需票都 0 REMAIN ⇒ 入合并池(本仓记作 DUAL-VOICE-CLEARED,§4);任一方有 REMAIN ⇒ 派 r(n+1),**两席判卷同根的条目合并成一条**。
 6. 写 PROGRESS 周期 → 覆写 handoff(§5)→ `date +%s > coordinator.beat`。
 
 ## 1a. 通道矩阵(按对象选通道)
@@ -80,14 +80,14 @@ user 离场期你**代行其可撤决策**(可撤判据见 CORE 代理权节);�
 
 本节是**指派了审查席时**审查如何运作;**不变量**是重要产出须独立对抗审(作者≠审者),**审查席几个/是谁由协调者按任务定**(§9),非固定编制。
 
-一轮回 **P1/P2/P3 计数 + N REMAIN + 固定 SHA**;**门持到 0 REMAIN** 才签收;执行方每轮**换新 SHA** 复提。对抗审查;**R13 失实重于缺陷**;**F46** 送对箱(thread-id 非 run-id)。审查席=`REVIEW_SEAT`;忙/mod 排队。claude 席的耐久箱候空闲浮出(不手动 ping);**codex 主线程席不自读箱,送审后须直注一句**(§1a)。
+**票数策略按工作区写明**(编制自由见 §9;本仓 agenthop 当前 = 主审 + 二声两票,同 SHA 两票 0 REMAIN 才清零)。一轮回 **P1/P2/P3 计数 + N REMAIN + 固定 SHA**;**门持到 0 REMAIN** 才签收;执行方每轮**换新 SHA** 复提。对抗审查;**R13 失实重于缺陷**;**F46** 送对箱(thread-id 非 run-id)。审查席=`REVIEW_SEAT`;忙/mod 排队。claude 席的耐久箱候空闲浮出(不手动 ping);**codex 主线程席不自读箱,送审后须直注一句**(§1a)。
 
 ## 4. 合并门(merge-gate)
 
 **排练 → 测 → 架构审 → 0 CONFIRMED → 落地**(batch-N:rehearse-batch → 装机 → dispatcher 重启 → board=done)。**合入/推送归你**(执行方不并不推)。**休眠接缝的启用 = user 裁决**。
 
 实测流程:
-1. 池内每卷 DUAL-VOICE-CLEARED(同 SHA 两票 0 REMAIN)。
+1. 池内每卷都已按审查票数策略清零(本仓 = DUAL-VOICE-CLEARED,同 SHA 两票 0 REMAIN)。
 2. `git merge-tree --write-tree` 按序 dry-run 全链零冲突;main 工作树里的无主文件先挪开(无主草稿会挡合并)。
 3. 逐卷 `git merge --no-ff <sha> -m "Merge <branch> into main (<item> cleared @<sha>, DUAL-VOICE 0 REMAIN)"`。
 4. 门:`pnpm typecheck` / bus vitest / cli vitest 子集 / `node scripts/run-selftests.mjs` 全绿 → `git push origin main`。
@@ -152,7 +152,7 @@ CLI 读 `AGENTHOP_RULINGS_DIR` 否则脚本所在仓(`rulings.ts:108`)——**�
 
 1. **起新 session**:herdr 新 pane/tab(或 `agenthop_spawn`),cwd = 新项目根。新壳首动 `agenthop install --mcp <kind>`(F45,裸 install 只打印不注册)。
 2. **加载 coordinator 技能**(本技能)。
-3. **注入五参**:`COORD_SID`=**新铸**(本 session 稳定总线身份)/ `AH_HOME`=数据面家目录(数据面 `$AH_HOME/.agenthop`)/ `PROJECT_ROOT`=**新项目根**(仓+契约集+产物域)/ `REVIEW_SEAT`=按需审查席(§9)/ `RULINGS`=共享律典(`AGENTHOP_RULINGS_DIR`)。
+3. **注入五参**:`COORD_SID`=**角色地址**:分支 (a) 空根首次开张时新定;分支 (b) 同根继任时**沿用既有角色地址、不新铸**(会话 sid 换代不改路由,§0 / §5)/ `AH_HOME`=数据面家目录(数据面 `$AH_HOME/.agenthop`)/ `PROJECT_ROOT`=**新项目根**(仓+契约集+产物域)/ `REVIEW_SEAT`=按需审查席(§9)/ `RULINGS`=共享律典(`AGENTHOP_RULINGS_DIR`)。
 4. **判定根归属 + 运行模式分支(初始化前必须,CS8-P2-1)**。关键事实:**六类共享状态(进度/roster/board/control-log/决策批/投影)挂在根 `$AH_HOME/.agenthop` 下、不随 PROJECT_ROOT 变**——仅换 `PROJECT_ROOT`+`COORD_SID`、复用旧根**不构成隔离**(只有自箱 `inbox/<COORD_SID>` 不同)。先探根 `$AH_HOME/.agenthop/swarm/`,三分支:
    - **(a) 首次空根**:无既有 PROGRESS/control-log/他人协调者态 ⇒ **首次初始化**(播种,步骤 5)。
    - **(b) 同根继任**:根已被一个既有协调者占用、你来**接任该席**(非独立新项目)⇒ **沿用既有状态**(不重置、不覆盖 PROGRESS/board/control-log;继任 F45)。
@@ -212,4 +212,4 @@ user 裁:**角色不固定,协调者自决**。本技能**不规定编制**—�
 
 ---
 
-_DRAFT r7 说明:落点待 user 裁(brief §③,首批 DecisionBatch)。取案 A 按英文 SKILL.md + zh-CN 双语拆分(build-release.mjs 契约)。五参由加载点注入,正文不硬编码具体工作区;v1 范围=单根单协调者,多根隔离/数据面改造为前置依赖(brief「支持的运行模式」)。§8 新项目开张流程 + §9 角色设计权为 user 完整图景补充(设计主体已签 @ade8be9)。r7 修 §8 CS8-P2-1/2+N1。r8 对齐 happycapy §8+§9 合判(判 b472ef6)增量:CS8-P2-1 加「未隔离不得报独立项目就绪」(§8③②如实报分支)、CS8-P2-2 **§9 招募工具引用同步**(出生=fresh spawn,恢复才 resumeCmd,roster-snapshot 非注册)、CS8-N1 **§9 的项目内 R18 限定注明新约定出处**、§9 加 user 原则句「无固定编制不等于免审;重要产出仍须作者以外的独立审者」。r9 修 happycapy @dbbe046 唯一残留 CS8-P2-2:**旧快照保护**——`swarm-resume --snapshot` 从 live peers 重建并覆盖、不合并旧快照,离线旧成员会消失;补保护步骤(`--out` 写别处、保留原 roster-snapshot、先处置离线成员再替换)。至此 happycapy §8/§9 全项 CLOSED(CS8-P2-1/2 + N1 + §9 原则)。_ r10 整合 `coordinator-skill-addendum-2026-10-15.md` §A-§F 归位(寻址 §0、扫箱手工 drain + 周期例程 §1、通道矩阵 §1a、codex 直注 §3、合并门实测流程 §4、席位生命周期/轮换 + handoff §5、授权链原话 §6),去掉硬编码 sid;落点按 addendum §H:真相源自本轮起为 `docs/swarm/skills/coordinator/SKILL.md`(= 本文去掉本尾注),安装 `scripts/install-swarm-skills.sh`(由 feat/swarm-member-skill 提供,遍历 docs/swarm/skills/*/,本分支不另带脚本)。_
+_DRAFT r7 说明:落点待 user 裁(brief §③,首批 DecisionBatch)。取案 A 按英文 SKILL.md + zh-CN 双语拆分(build-release.mjs 契约)。五参由加载点注入,正文不硬编码具体工作区;v1 范围=单根单协调者,多根隔离/数据面改造为前置依赖(brief「支持的运行模式」)。§8 新项目开张流程 + §9 角色设计权为 user 完整图景补充(设计主体已签 @ade8be9)。r7 修 §8 CS8-P2-1/2+N1。r8 对齐 happycapy §8+§9 合判(判 b472ef6)增量:CS8-P2-1 加「未隔离不得报独立项目就绪」(§8③②如实报分支)、CS8-P2-2 **§9 招募工具引用同步**(出生=fresh spawn,恢复才 resumeCmd,roster-snapshot 非注册)、CS8-N1 **§9 的项目内 R18 限定注明新约定出处**、§9 加 user 原则句「无固定编制不等于免审;重要产出仍须作者以外的独立审者」。r9 修 happycapy @dbbe046 唯一残留 CS8-P2-2:**旧快照保护**——`swarm-resume --snapshot` 从 live peers 重建并覆盖、不合并旧快照,离线旧成员会消失;补保护步骤(`--out` 写别处、保留原 roster-snapshot、先处置离线成员再替换)。至此 happycapy §8/§9 全项 CLOSED(CS8-P2-1/2 + N1 + §9 原则)。_ r10 整合 `coordinator-skill-addendum-2026-10-15.md` §A-§F 归位(寻址 §0、扫箱手工 drain + 周期例程 §1、通道矩阵 §1a、codex 直注 §3、合并门实测流程 §4、席位生命周期/轮换 + handoff §5、授权链原话 §6),去掉硬编码 sid;落点按 addendum §H:真相源自本轮起为 `docs/swarm/skills/coordinator/SKILL.md`(= 本文去掉本尾注),安装 `scripts/install-swarm-skills.sh`(由 feat/swarm-member-skill 提供,遍历 docs/swarm/skills/*/,本分支不另带脚本)。 r10c 收二声 @c92445f 两 nit:§8③ COORD_SID 继任沿用角色地址不新铸;§1/§3/§4 票数写成按工作区策略,本仓=两票。_
