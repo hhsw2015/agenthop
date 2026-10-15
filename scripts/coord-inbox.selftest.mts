@@ -9,7 +9,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveCoordinatorInbox, CoordinatorInboxError } from "../packages/bus/src/swarm/coord-inbox.js";
 import { writeInbox, claimInbox } from "../packages/bus/src/inbox.js";
-import { migrateCoordInbox, migrationKey } from "./migrate-coord-inbox.js";
+import { migrateCoordInbox, migrationKey, migrationKeyForMessage } from "./migrate-coord-inbox.js";
+import { validInboxMsg } from "../packages/bus/src/inbox.js";
 
 let n = 0;
 const ok = (c: boolean, name: string) => { if (!c) throw new Error("FAILED: " + name); n++; console.log("ok  " + name); };
@@ -89,7 +90,7 @@ try {
     const name = pending(h, OLD)[0]!;
     const { renameSync } = await import("node:fs");
     renameSync(path.join(box(h, OLD), name), path.join(box(h, OLD), `${name}.claim-999999`)); // our crashed run's claim (dead pid)
-    writeInbox(h, NEW, m("crash-me"), migrationKey(OLD, name));                               // …it had already published
+    writeInbox(h, NEW, m("crash-me"), migrationKeyForMessage(OLD, name, validInboxMsg(m("crash-me"))));  // …it had already published
     const r = migrateCoordInbox(h, OLD, NEW);
     ok(r.moved.length === 1 && pending(h, NEW).length === 1 && pending(h, OLD).length === 0 && !readdirSync(box(h, OLD)).some((x) => x.includes(".claim-")), "migrate: crash after publish ⇒ dead claim recovered, re-publish is 'already', ONE copy, source gone");
   }
@@ -154,12 +155,60 @@ try {
       ok(pending(h, OLD).length === 1, "errno: the message is still pending in the old box (not lost, not moved)");
     } else console.log("skip  errno test (root bypasses perms)");
   }
+  { // CIA-RELEASE-OWN r4: the dead-claim A + same-name B conflict must keep BOTH bodies across a RE-RUN (Second Voice counterexample)
+    const h = home();
+    mkdirSync(box(h, OLD), { recursive: true });
+    writeFileSync(path.join(box(h, OLD), "0000000000000001-x.json.claim-999999"), JSON.stringify(m("A-dead-claim")));
+    writeFileSync(path.join(box(h, OLD), "0000000000000001-x.json"), JSON.stringify(m("B-same-name")));
+    migrateCoordInbox(h, OLD, NEW);             // run 1: A kept as conflict, B migrated
+    const r2 = migrateCoordInbox(h, OLD, NEW);  // run 2: A is now recoverable — it must be DELIVERED, not deleted as "already"
+    const texts = pending(h, NEW).map((f) => JSON.parse(readFileSync(path.join(box(h, NEW), f), "utf8")).text).sort();
+    ok(texts.join(",") === "A-dead-claim,B-same-name", `re-run: BOTH bodies end up delivered (got ${texts.join(",")})`);
+    ok(r2.moved.length === 1 && r2.failed.length === 0 && r2.conflict.length === 0, "re-run: run 2 reports A moved, nothing failed");
+    ok(pending(h, OLD).length === 0 && !readdirSync(box(h, OLD)).some((x) => x.includes(".claim-")), "re-run: old box is empty afterwards");
+  }
+  { // CIA-SV-P2-2: dead-claim recovery that hits EACCES is FAILED (with errno), the CLI exits non-zero, and the claim is kept
+    const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+    if (!isRoot) {
+      const h = home();
+      mkdirSync(box(h, OLD), { recursive: true });
+      writeFileSync(path.join(box(h, OLD), "0000000000000002-y.json.claim-999999"), JSON.stringify(m("dead-only")));
+      const { chmodSync } = await import("node:fs");
+      chmodSync(box(h, OLD), 0o500);
+      const r = migrateCoordInbox(h, OLD, NEW);
+      const cli = spawnSync(TSX, [path.join(here, "migrate-coord-inbox.ts"), "--from", OLD, "--to", NEW], { env: { ...process.env, AH_HOME: h }, encoding: "utf8" });
+      chmodSync(box(h, OLD), 0o700);
+      ok(r.failed.some((f) => /EACCES|EPERM/.test(f.why)), `recovery errno: reported as failed (${r.failed.map((f) => f.why).join("; ") || "none"})`);
+      ok(cli.status !== 0, "recovery errno: CLI exits non-zero (not a silent all-zero success)");
+      ok(existsSync(path.join(box(h, OLD), "0000000000000002-y.json.claim-999999")), "recovery errno: the dead claim is kept");
+      const ok2 = migrateCoordInbox(h, OLD, NEW);
+      ok(ok2.moved.length === 1 && pending(h, NEW).length === 1, "recovery errno: once the dir is writable again the same fixture migrates");
+    } else console.log("skip  recovery errno test (root bypasses perms)");
+  }
+  { // CIA-SV-P2-3: a non-regular `*.json` entry (directory / symlink / hard-linked file) is never claimed or renamed
+    const h = home();
+    const ob = box(h, OLD); mkdirSync(path.join(ob, "keep.json"), { recursive: true });
+    writeFileSync(path.join(ob, "keep.json", "child.txt"), "child");
+    writeFileSync(path.join(h, "target.json"), JSON.stringify(m("via-symlink")));
+    const { symlinkSync, linkSync: ln } = await import("node:fs");
+    symlinkSync(path.join(h, "target.json"), path.join(ob, "link.json"));
+    writeFileSync(path.join(ob, "hard.json"), JSON.stringify(m("hardlinked")));
+    ln(path.join(ob, "hard.json"), path.join(h, "hard-other-link"));
+    writeInbox(h, OLD, m("normal"));
+    const r = migrateCoordInbox(h, OLD, NEW);
+    ok(existsSync(path.join(ob, "keep.json", "child.txt")) && readFileSync(path.join(ob, "keep.json", "child.txt"), "utf8") === "child", "non-regular: a directory named keep.json keeps its path and contents");
+    ok(existsSync(path.join(ob, "link.json")) && existsSync(path.join(ob, "hard.json")), "non-regular: symlink and hard-linked entries are left in place");
+    const why = Object.fromEntries(r.skippedNonRegular.map((x) => [x.name, x.why]));
+    ok(why["keep.json"] === "directory" && why["link.json"] === "symlink" && /nlink=2/.test(why["hard.json"] ?? ""), `non-regular: each reported with its type (${JSON.stringify(why)})`);
+    ok(r.moved.length === 1 && pending(h, NEW).length === 1, "non-regular: the normal message alongside still migrates");
+  }
   { // CIA-MIGRATION-KEY: keys are unambiguous over (source box, FULL file name)
     const long = "a".repeat(140);
-    ok(migrationKey(OLD, `${long}x.json`) !== migrationKey(OLD, `${long}y.json`), "key: two long names differing only in the last char ⇒ different keys");
+    ok(migrationKey(OLD, `${long}x.json`, "b") !== migrationKey(OLD, `${long}y.json`, "b"), "key: two long names differing only in the last char ⇒ different keys");
     const OLD2 = "fe0376cd-0000-4000-8000-0000000000aa";
-    ok(migrationKey(OLD, "same.json") !== migrationKey(OLD2, "same.json"), "key: same file name in two different old boxes ⇒ different keys");
-    ok(migrationKey(OLD, "a.json") === migrationKey(OLD, "a.json") && /^mig-[0-9a-f]{32}$/.test(migrationKey(OLD, "a.json")), "key: deterministic + bounded (rerun hits the same key)");
+    ok(migrationKey(OLD, "same.json", "b") !== migrationKey(OLD2, "same.json", "b"), "key: same file name in two different old boxes ⇒ different keys");
+    ok(migrationKey(OLD, "same.json", "A") !== migrationKey(OLD, "same.json", "B"), "key: same box + same name but a DIFFERENT body ⇒ different keys (r4)");
+    ok(migrationKey(OLD, "a.json", "b") === migrationKey(OLD, "a.json", "b") && /^mig-[0-9a-f]{32}$/.test(migrationKey(OLD, "a.json", "b")), "key: deterministic + bounded (rerun hits the same key)");
     // end-to-end: two long-named distinct messages BOTH arrive (the r1 bug kept only one)
     const h = home(); mkdirSync(box(h, OLD), { recursive: true });
     writeFileSync(path.join(box(h, OLD), `${long}1.json`), JSON.stringify(m("first")));
