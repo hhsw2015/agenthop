@@ -100,11 +100,14 @@ export function realRun(socket: string): TernDeps["run"] {
 }
 
 export function defaultDeps(env: NodeJS.ProcessEnv = process.env): TernDeps {
-  const home = env.AH_HOME ?? homedir();
+  // The bridge (window.luau) ALWAYS writes $HOME/.agenthop/tern-panes via tern.getenv("HOME") — it never sees AH_HOME. So the control
+  // dir defaults to the OS home, NOT AH_HOME: a caller with AH_HOME pointing elsewhere would otherwise read an empty dir, judge the
+  // live bridge stale and reload SOMEONE ELSE's production bridge (live incident, coordinator #1034 trial). AGENTHOP_TERN_PANES still
+  // overrides explicitly (tests, alternate installs).
   const socket = env.TERN_PANE_SOCKET ?? path.join(homedir(), "Library", "Application Support", "Tern", "daemon.sock");
   return {
     bin: ternBin(env),
-    ctlDir: env.AGENTHOP_TERN_PANES ?? path.join(home, ".agenthop", "tern-panes"),
+    ctlDir: env.AGENTHOP_TERN_PANES ?? path.join(homedir(), ".agenthop", "tern-panes"),
     socket,
     run: realRun(socket),
     now: () => Date.now(),
@@ -152,6 +155,7 @@ export type CallResult =
   | { state: "unknown"; id?: string; ms: number; reason: string };
 
 const CTL_TIMEOUT_MS = 5000;
+const STALE_MS = 5000; // PROTOCOL.md §4: tick stalled >5s ⇒ recover
 
 async function trigger(d: TernDeps, op: string): Promise<string | undefined> {
   const r = await d.run(d.bin!, ["ctl", "plugins", "run", drainActionFor(op)], CTL_TIMEOUT_MS);
@@ -212,6 +216,15 @@ async function nameStarted(d: TernDeps, op: string, result: unknown, title: stri
   return bad ? { pane, renameError: bad } : { pane, renamed: title };
 }
 
+/** "stale" iff agents.json is readable and older than STALE_MS; "fresh" if readable and newer; "unknown" if unreadable. Pure-ish. */
+export function staleness(d: TernDeps): "stale" | "fresh" | "unknown" {
+  try {
+    const f = path.join(d.ctlDir, "agents.json");
+    JSON.parse(readFileSync(f, "utf8"));
+    return d.now() - statSync(f).mtimeMs > STALE_MS ? "stale" : "fresh";
+  } catch { return "unknown"; }
+}
+
 /** One bridge call: publish → trigger → poll, with PROTOCOL §3.3 timeout semantics. Never throws. */
 export async function ternCall(op: string, args: Record<string, unknown> = {}, timeoutMs = 2000, d: TernDeps = defaultDeps()): Promise<CallResult> {
   const t0 = d.now();
@@ -243,7 +256,15 @@ export async function ternCall(op: string, args: Record<string, unknown> = {}, t
   if (opClass(op, args) === "non-idempotent") {
     return { state: "UNKNOWN", hold: true, id, ms: ms(), reason: "no result in time; the op may have run — HOLD, do not re-send (PROTOCOL.md §3.3)" };
   }
-  // Read-only: ONE recovery, then re-trigger the SAME published request and wait again (still unconsumed ⇒ no duplicate).
+  // FC-2 GATE before any reload: only a mirror we can READ and that is STALE (>5s) proves the bridge is stuck. An unreadable / absent
+  // agents.json is UNKNOWN — maybe a wrong control dir, maybe a fresh install — never grounds to reload a live bridge.
+  const gate = staleness(d);
+  if (gate !== "stale") {
+    return { state: "unknown", id, ms: ms(), reason: gate === "unknown"
+      ? "timed out; agents.json unreadable here (wrong control dir?) — UNKNOWN, NOT reloading"
+      : "timed out but the mirror is fresh — drain may be disabled; not reloading on this evidence (check agenthop_tern_status)" };
+  }
+  // Read-only + proven stale: ONE recovery, then re-trigger the SAME published request and wait again (still unconsumed ⇒ no duplicate).
   const rec = await recover(d);
   if (rec) return { state: "unknown", id, ms: ms(), reason: `timed out; recovery failed: ${rec}` };
   const bad2 = await trigger(d, op);
@@ -262,7 +283,6 @@ export type BridgeStatus = {
   recentKills?: string[];
 };
 
-const STALE_MS = 5000; // PROTOCOL.md §4: tick stalled >5s ⇒ recover
 
 /** Bridge health snapshot. Three-state: unknown when we cannot observe; degraded when observed but unhealthy. Never throws. */
 export async function ternStatus(d: TernDeps = defaultDeps(), logPath: string | undefined = defaultLogPath()): Promise<BridgeStatus> {

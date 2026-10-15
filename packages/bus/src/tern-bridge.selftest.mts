@@ -73,7 +73,13 @@ function setup(mode: string) {
   };
   const argv = () => (existsSync(path.join(dir, "argv.log")) ? readFileSync(path.join(dir, "argv.log"), "utf8").trim().split("\n").filter(Boolean) : []);
   const requests = () => readdirSync(path.join(dir, "ctl", "requests")).filter((f) => f.endsWith(".json"));
-  return { dir, deps, argv, requests };
+  // a STALE mirror (readable, >5s old) is the only ground the call path may reload on (FC-2 gate)
+  const staleMirror = () => {
+    const af = path.join(dir, "ctl", "agents.json");
+    writeFileSync(af, JSON.stringify({ tick: 1, vm: "v-old", agents: [] }));
+    utimesSync(af, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
+  };
+  return { dir, deps, argv, requests, staleMirror };
 }
 
 // ---- pure ----
@@ -121,7 +127,7 @@ t("checkRoleTitle: non-English / empty rejected", checkRoleTitle("审查") !== n
 
 // ---- read-only timeout ⇒ ONE recovery then success ----
 {
-  const s = setup("heal");
+  const s = setup("heal"); s.staleMirror();
   const r = await ternCall("list", {}, 400, s.deps);
   const a = s.argv();
   t("read-only timeout: recovered once, then ok", r.state === "ok" && (r as any).recovered === true)
@@ -135,23 +141,44 @@ t("checkRoleTitle: non-English / empty rejected", checkRoleTitle("审查") !== n
   t("read-only timeout: the SAME request was re-triggered (one id minted, no second publish)", (r as any).id === "t1" && s.requests().length === 0)
 }
 {
-  const s = setup("silent");
+  const s = setup("silent"); s.staleMirror();
   const r = await ternCall("list", {}, 300, s.deps);
   t("read-only: still silent after recovery ⇒ timeout (recovered:true), exactly one reload", r.state === "timeout" && (r as any).recovered === true && s.argv().filter((x) => x.startsWith("plugin reload")).length === 1)
 }
 
 // ---- #1033 fact ①: ctl's {"ok":true} alone is never an answer — only results/<id>.json counts ----
 {
-  const s = setup("silent"); // ctl prints {"ok":true} rc0, bridge never writes a result
+  const s = setup("silent"); s.staleMirror(); // ctl prints {"ok":true} rc0, bridge never writes a result
   const r = await ternCall("list", {}, 300, s.deps);
   t("ctl ok but no result ⇒ NOT ok (timeout after recovery)", r.state !== "ok")
 }
 // ---- #1033 fact ②: reload but the mirror never moves ⇒ NOT ready (no arm, no re-trigger) ----
 {
-  const s = setup("deadmirror");
+  const s = setup("deadmirror"); s.staleMirror();
   const r = await ternCall("list", {}, 300, s.deps);
   const a = s.argv();
   t("reload without mirror movement ⇒ unknown 'not ready', no arm", r.state === "unknown" && /not ready/.test((r as any).reason) && !a.some((x) => x.endsWith(".arm")))
+}
+
+// ---- FC-2 gate (coordinator live incident): agents.json unreadable ⇒ UNKNOWN, ZERO reloads ----
+{
+  const s = setup("silent"); // no agents.json at all (ENOENT) — e.g. a wrong control dir
+  const r = await ternCall("list", {}, 300, s.deps);
+  t("ENOENT agents.json + read-only timeout ⇒ unknown, ZERO reloads (never reload someone else's bridge)",
+    r.state === "unknown" && /NOT reloading/.test((r as any).reason) && !s.argv().some((x) => x.startsWith("plugin reload")))
+}
+{
+  const s = setup("silent");
+  writeFileSync(path.join(s.dir, "ctl", "agents.json"), JSON.stringify({ tick: 5, vm: "v1", agents: [] })); // FRESH
+  const r = await ternCall("list", {}, 300, s.deps);
+  t("FRESH mirror + read-only timeout ⇒ not reloading (drain disabled ≠ bridge stale)", r.state === "unknown" && !s.argv().some((x) => x.startsWith("plugin reload")))
+}
+{
+  const prevHome = process.env.AH_HOME; process.env.AH_HOME = "/tmp/definitely-not-the-bridge-home";
+  const { defaultDeps } = await import("./tern-bridge.js");
+  const dd = defaultDeps({ ...process.env, AGENTHOP_TERN_PANES: undefined } as any);
+  t("ctlDir defaults to the OS home (where window.luau writes), NOT AH_HOME", dd.ctlDir === path.join(os.homedir(), ".agenthop", "tern-panes"))
+  if (prevHome === undefined) delete process.env.AH_HOME; else process.env.AH_HOME = prevHome;
 }
 
 // ---- non-idempotent timeout ⇒ UNKNOWN/HOLD, never re-sent ----
