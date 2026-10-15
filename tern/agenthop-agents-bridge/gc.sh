@@ -51,18 +51,44 @@ if safe_dir "$D/results" results; then
   done
 fi
 if safe_dir "$D/requests" requests; then
+  # r14 BTF-GC-SOURCE-OWN: TAKE the object first, then decide. A stat of requests/<id>.json followed by a touch/mv of the same PATH
+  # can act on a DIFFERENT object: the drain may claim the old file and agenthop_tern re-publish a read-only request under the SAME
+  # id (mtime = now) in between. So an old-looking request is first moved (mv -n, verified by looking — macOS mv -n exits 0 even
+  # when it refuses) to a private name the drain never reads (.gc-<id>.<pid>.<rand>), and only the object we HOLD is aged. Too
+  # young ⇒ put back under its own name; if a newer publish took that name meanwhile, ours is quarantined (kept, never deleted).
+  # A crash while holding leaves .gc-* behind; the next run quarantines those once they are older than the TTL.
+  quarantine_dir_ok() { { [ -e "$D/requests/quarantine" ] || [ -L "$D/requests/quarantine" ] || mkdir "$D/requests/quarantine"; } && safe_dir "$D/requests/quarantine" quarantine; }
+  to_quarantine() { # $1 = held file, $2 = id ⇒ 0 when it is now in quarantine/ (and gone from $1)
+    local q="$D/requests/quarantine/$2.$NOW.$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n').json"
+    quarantine_dir_ok && touch -t "$(stamp)" "$1" && [ ! -e "$q" ] && mv -n "$1" "$q" && [ ! -e "$1" ] && [ -e "$q" ]
+  }
   for f in "$D"/requests/*.json; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     a="$(age "$f")" || continue
-    if [ "$a" -gt "$REQUEST_TTL_S" ]; then
-      b="$(basename "$f" .json)"
-      q="$D/requests/quarantine/$b.$NOW.$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n').json"
-      if { [ -e "$D/requests/quarantine" ] || [ -L "$D/requests/quarantine" ] || mkdir "$D/requests/quarantine"; } && safe_dir "$D/requests/quarantine" quarantine && touch -t "$(stamp)" "$f" && [ ! -e "$q" ] && mv -n "$f" "$q" && [ ! -e "$f" ] && [ -e "$q" ]; then
-        nq=$((nq+1))
-      else
-        nh=$((nh+1)) # left in requests/ untouched by deletion; reported, retried next run
-      fi
+    [ "$a" -gt "$REQUEST_TTL_S" ] || continue # young by its path: never taken, nothing to race
+    b="$(basename "$f" .json)"
+    h="$D/requests/.gc-$b.$$.$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+    mv -n "$f" "$h" 2>/dev/null; [ -e "$h" ] || continue # gone (drain claimed it) or not ours: nothing taken
+    ah="$(age "$h")" || ah=0
+    if [ "$ah" -le "$REQUEST_TTL_S" ]; then
+      # the object we took is a FRESH publish (re-sent under the same id): give it back untouched
+      mv -n "$h" "$f" 2>/dev/null
+      if [ -e "$h" ]; then to_quarantine "$h" "$b" && nq=$((nq+1)) || nh=$((nh+1)); fi
+      continue
     fi
+    if to_quarantine "$h" "$b"; then
+      nq=$((nq+1))
+    else
+      mv -n "$h" "$f" 2>/dev/null # quarantine impossible: back to its own name, held, retried next run
+      nh=$((nh+1))
+    fi
+  done
+  for h in "$D"/requests/.gc-*; do # held by a gc that crashed
+    [ -f "$h" ] && [ ! -L "$h" ] || continue
+    a="$(age "$h")" || continue
+    [ "$a" -gt "$REQUEST_TTL_S" ] || continue
+    b="$(basename "$h")"; b="${b#.gc-}"; b="${b%.*.*}"
+    to_quarantine "$h" "$b" && nq=$((nq+1)) || nh=$((nh+1))
   done
   for f in "$D"/requests/.*.tmp*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue

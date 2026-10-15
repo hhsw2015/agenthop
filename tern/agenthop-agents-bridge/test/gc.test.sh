@@ -79,6 +79,37 @@ AGENTHOP_TERN_PANES="$D5" GC_NOW=$NOW bash "$GC" >/dev/null
 ck "a symlinked request ENTRY is skipped: outside target's mtime unchanged and the link not moved" "$m0:yes" "$(stat -f %m "$X/req/victim.json"):$([ -L "$D5/requests/link.json" ] && echo yes || echo no)"
 rm -rf "$W5"
 
+# r14 BTF-GC-SOURCE-OWN: the drain claims a 400s-old list and agenthop_tern re-publishes it under the SAME id (mtime = now)
+# BETWEEN gc's age check and its move. A fake `stat` (first PATH entry) plays that race: on its first look at requests/race.json it
+# reports the OLD mtime, then swaps in the fresh same-id request. gc must not quarantine the fresh one; the drain must still see it.
+W6="$(mktemp -d)"; D6="$W6/ctl"; mkdir -p "$D6/requests" "$W6/bin"
+printf '{"op":"list","v":"old"}' >"$D6/requests/race.json"; touch -t "$(date -r $((NOW - 400)) +%Y%m%d%H%M.%S)" "$D6/requests/race.json"
+cat >"$W6/bin/stat" <<SH
+#!/bin/sh
+f="\$3"
+case "\$f" in *requests/race.json)
+  if [ ! -e "$W6/raced" ]; then
+    : >"$W6/raced"; echo $((NOW - 400))
+    rm -f "$D6/requests/race.json"; printf '{"op":"list","v":"new"}' >"$D6/requests/race.json"; touch -t "$(date -r $NOW +%Y%m%d%H%M.%S)" "$D6/requests/race.json"
+    exit 0
+  fi;;
+esac
+exec /usr/bin/stat "\$@"
+SH
+chmod +x "$W6/bin/stat"
+o11="$(PATH="$W6/bin:$PATH" AGENTHOP_TERN_PANES="$D6" GC_NOW=$NOW bash "$GC")"
+ck "race: the swap really happened (fixture sanity)" "yes" "$([ -e "$W6/raced" ] && echo yes || echo no)"
+ck "race: the FRESH same-id request is back under its own name, drainable" '{"op":"list","v":"new"}' "$(cat "$D6/requests/race.json" 2>/dev/null)"
+ck "race: nothing quarantined, no held .gc-* left" "gc: results=0 requests_quarantined=0 requests_held=0 tmp=0 quarantine_expired=0:0" "$o11:$(ls -A "$D6/requests" | grep -c '^\.gc-')"
+rm -rf "$W6"
+
+# r14: a gc that crashed while holding leaves requests/.gc-<id>.<pid>.<rand>; once old, the next run quarantines it (kept)
+W7="$(mktemp -d)"; D7="$W7/ctl"; mkdir -p "$D7/requests"
+printf '{"op":"stop"}' >"$D7/requests/.gc-held1.123.abcd"; touch -t "$(date -r $((NOW - 400)) +%Y%m%d%H%M.%S)" "$D7/requests/.gc-held1.123.abcd"
+o12="$(AGENTHOP_TERN_PANES="$D7" GC_NOW=$NOW bash "$GC")"
+ck "crashed hold: quarantined under its id, body kept" '{"op":"stop"}' "$(cat "$D7"/requests/quarantine/held1.*.json 2>/dev/null)"
+rm -rf "$W7"
+
 out3="$(AGENTHOP_TERN_PANES="$W/does-not-exist" GC_NOW=$NOW bash "$GC")"; rc3=$?
 ck "unreadable control dir ⇒ exit 1 (UNKNOWN), not 'nothing to clean'" "1" "$rc3"
 rm -rf "$W"
