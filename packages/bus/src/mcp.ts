@@ -7,6 +7,7 @@ import { formatHandoff } from "./handoff.js";
 import { despawnAgent, readRegistry, spawnAgent, startClaimRetry } from "./spawn.js";
 import { omniwmctl, splitArgs } from "./wm.js";
 import { TERN_OPS, ternCall, ternStatus } from "./tern-bridge.js";
+import { realWorkerDeps, startWorker, stopWorker, workersStatus } from "./tern-workers.js";
 import { version } from "./version.js";
 
 /**
@@ -49,6 +50,7 @@ export function busInstructions(): string {
 - agenthop_wm(args): drive the OmniWM window manager (macOS) to arrange windows — a passthrough to omniwmctl (e.g. "query windows", "window move-to-workspace <id> 2").
 - agenthop_tern(op, args?, timeout_ms?): call Tern's agents API through the A1 bridge in one step (publish → trigger drain → wait for the result). op: list | transcript | wait | ask | start | interrupt | stop | eval. A read-only op that times out is recovered once automatically (plugin reload + arm, then retried); a NON-idempotent op that times out returns {state:"UNKNOWN", hold:true, id} and is never re-sent — check its effect (e.g. list) before acting again. eval runs your Lua with the plugin's cx and its budget is YOURS: over ~50ms disables the bridge's drain until reload (e.g. avoid #cx.agents:list(); #cx.session:panes() is cheap).
   start places workers by the seat model (session = project, tab = seat, block = worker): default = a split beside your own seat; how:"tab" = a new tab in the same session for wide fan-out; title "<role> · <task>" (no session ids).
+  start with args.kind:"tui" (+ role, task, prompt, cwd) runs a TUI claude in its OWN herdr session, shown as a split beside your seat; returns {pane, herdr_session}. Capped (SWARM_WORKER_CAP per seat, default 2; SWARM_WORKER_CAP_GLOBAL, default 6) and refused under 1.5 GiB free memory. It is invisible to cx.agents (no ask/wait/approve); it reports back to you through your durable inbox. stop with args.worker:"<name>" stops it (server stop → socket gone → close block → delete session; partial failures reported).
 - agenthop_tern_status(): bridge health — mirror tick/age/cost, Tern's authoritative block count, requests waiting, recent budget kills; healthy | degraded | unknown (unknown = could not observe, not "dead").
 
 Choosing a channel: agenthop reaches EVERY tool on the bus (Claude Code, Codex, OpenCode). If your host also has its OWN cross-session messaging (e.g. Claude Code's built-in), that only sees other sessions of the SAME tool — it cannot reach Codex or OpenCode. So use the host's native messaging for same-tool peers if you like, but use agenthop for ANY cross-tool peer: it is the only channel that bridges them, and agenthop_peers is where a different-tool session shows up at all.
@@ -237,7 +239,20 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
     },
     async ({ op, args, timeout_ms }, extra) => {
       noteCodex(core, extra);
-      const r = await ternCall(op, args ?? {}, timeout_ms ?? 2000);
+      const a = args ?? {};
+      if ((op === "start" && a.kind === "tui") || (op === "stop" && typeof a.worker === "string")) {
+        const sid = core.self.stableId;
+        if (!sid) return failure(JSON.stringify({ state: "unknown", reason: "this session's own id is not known yet; a tui worker is recorded on the caller's seat" }));
+        const d = realWorkerDeps();
+        const r = op === "start"
+          ? await startWorker({ role: String(a.role ?? ""), task: String(a.task ?? ""), prompt: String(a.prompt ?? ""), cwd: String(a.cwd ?? ""), parentSid: sid, near: a.near === undefined ? undefined : String(a.near) }, d)
+          : await stopWorker(sid, a.worker as string, d);
+        const text = JSON.stringify(r);
+        return r.state === "ok" || r.state === "stopped" ? reply(text) : failure(text);
+      }
+      if (op === "start" && a.kind !== undefined && a.kind !== "acp") return failure(JSON.stringify({ state: "unknown", reason: 'kind must be "acp" (default) or "tui"' }));
+      const { kind: _k, ...wireArgs } = a;
+      const r = await ternCall(op, wireArgs, timeout_ms ?? 2000);
       const text = JSON.stringify(r);
       return r.state === "ok" ? reply(text) : failure(text);
     },
@@ -252,7 +267,8 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
     },
     async (_args, extra) => {
       noteCodex(core, extra);
-      return reply(JSON.stringify(await ternStatus()));
+      const [bridge, workers] = await Promise.all([ternStatus(), workersStatus(realWorkerDeps())]);
+      return reply(JSON.stringify({ ...bridge, workers }));
     },
   );
 
