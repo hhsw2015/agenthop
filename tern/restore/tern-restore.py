@@ -145,19 +145,41 @@ def _has_unquoted_newline(command):
     return False
 
 
-def parse_acp(command):
-    """(tool, sid, model) if command is exactly ONE simple `tern acp` launch with one resume, else None.
-    A compound command (any shell operator token) or a repeated --resume/--model cannot prove which identity runs ⇒ None."""
+def _strip_comment(command):
+    """Cut an sh comment: an unquoted `#` at the START of a word runs to end of line. A `#` inside a word (`X#y`) is literal in sh,
+    so it must stay literal here too — shlex's commenter would cut `--resume X#y` to `X` and prove an identity sh never passes."""
+    quote, i, word_start = None, 0, True
+    while i < len(command):
+        c = command[i]
+        if quote == "'":
+            if c == "'": quote = None
+        elif quote == '"':
+            if c == "\\": i += 1
+            elif c == '"': quote = None
+        elif c == "\\":
+            i += 1
+        elif c in ("'", '"'):
+            quote = c
+        elif c == "#" and word_start:
+            return command[:i]
+        word_start = quote is None and c in (" ", "\t")
+        i += 1
+    return command
+
+
+def _acp_launch(command):
+    """The ONE parse of a launch line that both identity and mode read: {tool, sids, models, modes, env} or None if it is not
+    provably exactly one simple `tern acp <tool>` command. Tokens follow /bin/sh: comments removed, quotes give argument boundaries."""
     if not isinstance(command, str) or not command:
         return None
     # TR-SHELL-NEWLINE: an unquoted newline (or CR) ends a shell command — `tern acp claude …\necho --resume X` is TWO commands, and
-    # shlex would glue them into one argv. Any newline/CR outside quotes ⇒ not provably one simple command. Checked by a tiny
-    # quote-aware scan (single quotes literal; double quotes honour backslash), matching how /bin/sh splits.
+    # shlex would glue them into one argv. Any newline/CR outside quotes ⇒ not provably one simple command.
     if _has_unquoted_newline(command):
         return None
     try:
-        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex = shlex.shlex(_strip_comment(command), posix=True, punctuation_chars=True)
         lex.whitespace_split = True
+        lex.commenters = ""
         argv = list(lex)
     except ValueError:
         return None
@@ -165,51 +187,48 @@ def parse_acp(command):
         return None
     # r8: an optional literal `env K=V ...` prefix (how codex seats get INITIAL_AGENT_MODE). Each assignment must be a plain
     # NAME=value with no expansion characters; anything else in front of `tern` still makes the identity unprovable.
+    env = []
     if argv and os.path.basename(argv[0]) == "env":
         j = 1
         while j < len(argv) and ENV_ASSIGN.fullmatch(argv[j]):
+            env.append(tuple(argv[j].split("=", 1)))
             j += 1
         if j < len(argv) and "=" in argv[j]:
             return None  # an assignment that is not literal (e.g. a $VAR or a backtick value)
         argv = argv[j:]
     if len(argv) < 3 or os.path.basename(argv[0]) != "tern" or argv[1] != "acp" or argv[2] not in TOOLS:
         return None
-    sids, models = [], []
+    flags = {"--resume": [], "--model": [], "--mode": []}
     i = 3
     while i < len(argv):
         a = argv[i]
-        if a == "--resume" and i + 1 < len(argv):
-            sids.append(argv[i + 1]); i += 2; continue
-        if a.startswith("--resume="):
-            sids.append(a.split("=", 1)[1]); i += 1; continue
-        if a == "--model" and i + 1 < len(argv):
-            models.append(argv[i + 1]); i += 2; continue
-        if a.startswith("--model="):
-            models.append(a.split("=", 1)[1]); i += 1; continue
+        if a in flags and i + 1 < len(argv):
+            flags[a].append(argv[i + 1]); i += 2; continue
+        name = a.split("=", 1)[0]
+        if "=" in a and name in flags:
+            flags[name].append(a.split("=", 1)[1])
         i += 1
-    if len(sids) != 1 or len(models) > 1:
+    return {"tool": argv[2], "sids": flags["--resume"], "models": flags["--model"], "modes": flags["--mode"], "env": env}
+
+
+def parse_acp(command):
+    """(tool, sid, model) if command is exactly ONE simple `tern acp` launch with one resume, else None.
+    A compound command (any shell operator token) or a repeated --resume/--model cannot prove which identity runs ⇒ None."""
+    p = _acp_launch(command)
+    if p is None or len(p["sids"]) != 1 or len(p["models"]) > 1:
         return None  # zero or several identities: cannot prove which one runs
-    return (argv[2], sids[0], models[0] if models else None)
+    return (p["tool"], p["sids"][0], p["models"][0] if p["models"] else None)
 
 
+# TR-MODE-SOURCE: each tool's mode is proven only from the input that tool actually reads — claude `--mode`, codex-acp the env
+# INITIAL_AGENT_MODE (it has no --mode flag). A mode word in the other source proves nothing and is ignored.
 def launch_mode(command):
-    """The permission mode a launch line gives its agent: claude `--mode X`, codex `env INITIAL_AGENT_MODE=X`. None = not stated
-    (or not a parseable launch). Read from the SAME tokens parse_acp accepts."""
+    """The permission mode a launch line gives its agent, or None = not stated / stated more than once / not a parseable launch."""
     if parse_acp(command) is None:
         return None
-    argv = shlex.split(command)
-    mode = None
-    if os.path.basename(argv[0]) == "env":
-        for a in argv[1:]:
-            if not ENV_ASSIGN.fullmatch(a):
-                break
-            k, v = a.split("=", 1)
-            if k == "INITIAL_AGENT_MODE":
-                mode = v
-    for i, a in enumerate(argv):
-        if a == "--mode" and i + 1 < len(argv):
-            mode = argv[i + 1]
-    return mode
+    p = _acp_launch(command)
+    vals = p["modes"] if p["tool"] == "claude" else [v for k, v in p["env"] if k == "INITIAL_AGENT_MODE"]
+    return vals[0] if len(vals) == 1 else None
 
 
 def is_live(b):
@@ -408,8 +427,14 @@ def wait_listed(session, bid, deadline):
         time.sleep(0.3)
 
 
-def try_rename(bid, role, deadline):
+def try_rename(bid, role, deadline, still_mine):
+    """None = renamed; str = last rename error at the deadline; ("hold", status) = before an attempt the block was no longer
+    provably this seat's. TR-PENDING-RETRY: identity is re-proven before EVERY attempt — a proof from before a failed rename
+    does not authorise the retry, because the block can change hands in between."""
     while True:
+        st = still_mine()
+        if st != "live":
+            return ("hold", st)
         try:
             tern("rename", str(bid), role)
             return None
@@ -434,8 +459,13 @@ def restore(roster):
             if tab == seat["role"]:
                 report.append(f"skip: {seat['role']} already live (block {b['id']})")
             else:
-                err = try_rename(b["id"], seat["role"], time.time() + WAIT_S)
-                report.append(f"rename: {seat['role']} block {b['id']} (was {tab!r})" + (f" FAILED: {err}" if err else ""))
+                err = try_rename(b["id"], seat["role"], time.time() + WAIT_S, lambda b=b, seat=seat: block_status(b["id"], seat))
+                if isinstance(err, tuple):
+                    report.append(f"HOLD: {seat['role']} block {b['id']} is {'another seat' if err[1] == 'other' else err[1]} "
+                                  f"before rename (not provably this seat) — not renaming")
+                    held.append(seat["role"])
+                else:
+                    report.append(f"rename: {seat['role']} block {b['id']} (was {tab!r})" + (f" FAILED: {err}" if err else ""))
             continue
         if pend is not None:
             age = time.time() - pend["at"]
@@ -484,17 +514,15 @@ def restore(roster):
             report.append(f"pending: {seat['role']} block {bid} not listed yet (rerun renames it; it is not started twice "
                           f"once listed)")
             continue
-        # TR-PENDING-IDENTITY: the SAME identity discipline for every pending block (young or expired, from this run or an earlier
-        # one): before renaming it or discharging the journal, prove it is still THIS seat's live block (tool + full sid). A block
-        # whose identity changed while we waited, or cannot be read, is never renamed and the journal is kept.
-        st = block_status(bid, seat)
-        if st != "live":
-            report.append(f"HOLD: {seat['role']} pending block {bid} is {'another seat' if st == 'other' else st} "
+        # TR-PENDING-IDENTITY / TR-PENDING-RETRY: the SAME identity discipline for every pending block (young or expired, from this
+        # run or an earlier one) and for every rename attempt: prove it is still THIS seat's live block (tool + full sid) right
+        # before each attempt. A block whose identity changed, or cannot be read, is never renamed and the journal is kept.
+        err = try_rename(bid, seat["role"], deadline, lambda bid=bid, seat=seat: block_status(bid, seat))
+        if isinstance(err, tuple):
+            report.append(f"HOLD: {seat['role']} pending block {bid} is {'another seat' if err[1] == 'other' else err[1]} "
                           f"(not provably this seat) — not renaming, journal kept ({pending_path(seat['sid'])})")
             held.append(seat["role"])
-            continue
-        err = try_rename(bid, seat["role"], deadline)
-        if err:
+        elif err:
             report.append(f"pending: {seat['role']} block {bid} rename failed: {err} (rerun renames it)")
         else:
             pending_clear(seat["sid"])

@@ -63,6 +63,13 @@ elif a[0] == "process":
     argv = ["/Applications/Tern.app/Contents/MacOS/tern"] + (shlex.split(cmd)[1:] if cmd else [])
     print(json.dumps({"child": {"pid": 5000 + int(a[1]), "argv": argv}}))
 elif a[0] == "rename":
+    if os.path.exists(T + "/rename-fail-then-swap"):
+        # the first rename fails, and in that window the block changes hands (now runs another seat's identity)
+        os.remove(T + "/rename-fail-then-swap")
+        for t in d["sessions"][0]["tabs"]:
+            for b in t["blocks"]:
+                if str(b["id"]) == a[1]: b["command"] = "tern acp claude --resume other9999 --mode bypassPermissions --model m1"
+        json.dump(d, open(st, "w")); sys.stderr.write("block in no tab\n"); sys.exit(1)
     if os.path.exists(T + "/rename-fail-once"):
         os.remove(T + "/rename-fail-once"); sys.stderr.write("block in no tab\n"); sys.exit(1)
     for t in d["sessions"][0]["tabs"]:
@@ -430,6 +437,49 @@ fresh; seed A "env INITIAL_AGENT_MODE=\$X tern acp codex --resume zz1"; python3 
 ck "mode: env with an expansion is not provable => not the seat" "1" "$(grep -c 'FAIL: A: not live' "$T/out")"
 printf '{"session":"agenthop","seats":[{"role":"A","tool":"codex","sid":"zz1","cwd":"/tmp/y","model":null,"mode":"bypassPermissions"}]}' >"$T/bad.json"
 rc=$(python3 "$PY" "$T/bad.json" >/dev/null 2>&1; echo $?); ck "mode: a claude mode on a codex seat => roster exit 2" "2" "$rc"
+
+# ===== r9 =====
+# TR-PENDING-RETRY: rename fails, block changes hands before the retry => the retry re-proves identity, HOLDs, keeps the journal
+fresh; touch "$T/rename-fail-then-swap"; rc=$(RESTORE_WAIT_S=5 run1); rm -f "$T/rename-fail-then-swap"
+ck "retry: identity changed after a failed rename => one rename attempt only" "1" "$(grep -c '^rename' "$T/log")"
+ck "retry: journal kept" "1" "$(ls "$T/pending" 2>/dev/null | grep -c aaaa1111.json)"
+ck "retry: HOLD names another seat" "1" "$(grep -c '^HOLD: Manager pending block .* is another seat' "$T/out")"
+ck "retry: exit 1" "1" "$rc"
+# same discipline for an already-live block in the wrong tab (the attach path)
+fresh; seed "" "tern acp claude --resume aaaa1111 --mode bypassPermissions --model m1"; touch "$T/rename-fail-then-swap"; rc=$(RESTORE_WAIT_S=5 run1)
+rm -f "$T/rename-fail-then-swap"
+ck "retry attach: one rename attempt only" "1" "$(grep -c '^rename' "$T/log")"
+ck "retry attach: HOLD" "1" "$(grep -c '^HOLD: Manager block 100 is another seat' "$T/out")"
+ck "retry attach: no new start" "0" "$(grep -c '^new tab' "$T/log")"
+# transient failure with an unchanged identity still retries and succeeds (positive control)
+fresh; touch "$T/rename-fail-once"; rc=$(RESTORE_WAIT_S=5 run1); ck "retry: unchanged identity retried, exit 0" "0" "$rc"
+ck "retry: unchanged identity => journal cleared" "0" "$(ls "$T/pending" 2>/dev/null | grep -c aaaa1111.json)"
+
+# TR-MODE-SOURCE: mode is read from the same sh-faithful parse as identity, and only from the source the tool reads
+C='tern acp claude --resume aaaa1111 --model m1 # --mode bypassPermissions'
+ck "mode src: /bin/sh does not pass a commented --mode" "--resume|aaaa1111|--model|m1|" "$(sh -c "printf '%s|' ${C#tern acp claude }")"
+fresh; seed Manager "$C"; rc=$(run1 --check)
+ck "mode src: commented-out claude --mode => FAIL mode None" "1" "$(grep -c "FAIL: Manager: mode None != pinned 'bypassPermissions'" "$T/out")"
+ck "mode src: commented-out --mode => exit 1" "1" "$rc"
+fresh; seed Manager "env INITIAL_AGENT_MODE=bypassPermissions tern acp claude --resume aaaa1111 --model m1"; rc=$(run1 --check)
+ck "mode src: claude with only env INITIAL_AGENT_MODE => FAIL mode None" "1" "$(grep -c "FAIL: Manager: mode None" "$T/out")"
+ck "mode src: claude env-only => exit 1" "1" "$rc"
+fresh; seed A "tern acp codex --resume zz1 --mode agent-full-access"; rc=$(python3 "$PY" "$T/cxm.json" --check >"$T/out" 2>&1; echo $?)
+ck "mode src: codex with only --mode => FAIL mode None" "1" "$(grep -c "FAIL: A: mode None" "$T/out")"
+ck "mode src: codex --mode-only => exit 1" "1" "$rc"
+fresh; seed A "env INITIAL_AGENT_MODE=read-only tern acp codex --resume zz1 --mode agent-full-access"
+rc=$(python3 "$PY" "$T/cxm.json" --check >"$T/out" 2>&1; echo $?)
+ck "mode src: codex env read-only is not overridden by --mode" "1" "$(grep -c "FAIL: A: mode 'read-only'" "$T/out")"
+fresh; seed Manager "tern acp claude --resume aaaa1111 --mode default --mode bypassPermissions --model m1"; run1 --check >/dev/null
+ck "mode src: two claude --mode values => FAIL mode None" "1" "$(grep -c "FAIL: Manager: mode None" "$T/out")"
+fresh; seed Manager "tern acp claude --resume aaaa1111 --mode=bypassPermissions --model m1 # note"; run1 --check >/dev/null
+ck "mode src: --mode= form + trailing comment passes (positive)" "0" "$(grep -c 'FAIL: Manager: not live\|FAIL: Manager: mode\|FAIL: Manager: model' "$T/out")"
+# a mid-word `#` is literal in sh: `--resume aaaa1111#x` resumes a different session, not this seat
+ck "hash: /bin/sh keeps a mid-word #" "aaaa1111#x" "$(sh -c 'printf %s aaaa1111#x')"
+fresh; seed Manager "tern acp claude --resume aaaa1111#x --mode bypassPermissions --model m1"; run1 --check >/dev/null
+ck "hash: --resume aaaa1111#x is not the seat" "1" "$(grep -c 'FAIL: Manager: not live' "$T/out")"
+fresh; seed Manager "tern acp claude --resume aaaa1111 --mode bypass#Permissions --model m1"; run1 --check >/dev/null
+ck "hash: --mode bypass#Permissions is not bypassPermissions" "1" "$(grep -c "FAIL: Manager: mode 'bypass#Permissions'" "$T/out")"
 
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
