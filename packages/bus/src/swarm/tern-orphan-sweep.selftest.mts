@@ -37,7 +37,6 @@ const io = (w: W): OrphanIO => ({
     w.stopped.push(n); (w.dead ??= []).push({ name: n, pid }); return true;
   },
   waitPidGone: (pid) => (w.dead ?? []).some((d) => d.pid === pid),
-  herdrDelete: (n) => { w.deleted.push(n); w.sessions = (w.sessions ?? []).filter((x) => x !== n); return true; },
   whileInstance: (sid, hs, inst, states, act) => {
     const x = (w.recs ?? []).find((r) => r.sid === sid)?.workers.find((x) => x.herdr_session === hs && x.pane === inst.pane && x.started_at === inst.startedAt);
     if (!x || !states.includes(x.state as string)) return false;
@@ -64,10 +63,13 @@ const worker = (hs: string, state: string, pane: number) => ({ name: hs, herdr_s
   round(st, w);
   t("①: first sighting does NOT clean", w.stopped.length === 0 && w.deleted.length === 0);
   round(st, w);
-  t("①: second consecutive sighting stops then deletes", w.stopped.join() === "infra-build" && w.deleted.join() === "infra-build");
-  t("①: one audit line", w.audit.filter((l) => /infra-build/.test(l)).length === 1);
-  round(st, w);
-  t("①: idempotent once gone", w.deleted.length === 1);
+  t("①: second consecutive sighting stops its server (never deletes the session)", w.stopped.join() === "infra-build" && w.deleted.length === 0);
+  t("①: one audit line for the stop", w.audit.filter((l) => /herdr server 50501 of session infra-build/.test(l)).length === 1);
+  round(st, w); round(st, w);
+  t("①: server gone ⇒ never signalled again", w.stopped.length === 1);
+  t("①: leftover session dir reported ONCE with the manual delete", w.audit.filter((l) => /left behind .* herdr session delete infra-build/.test(l)).length === 1);
+  for (let i = 0; i < 6; i++) round(st, w);
+  t("①: … still once after 6 more rounds, and never deleted", w.audit.filter((l) => /left behind/.test(l)).length === 1 && w.deleted.length === 0);
 }
 // --- debounce: an orphan that recovers between rounds is never touched ---
 {
@@ -86,7 +88,7 @@ const worker = (hs: string, state: string, pane: number) => ({ name: hs, herdr_s
   round(st, w); t("②: first sighting does not mark", w.marked.length === 0);
   round(st, w); t("②: second sighting marks the record orphan", w.marked.join() === "dev-tests");
   round(st, w); t("②→①: orphan session not deleted on its first ① sighting", w.deleted.length === 0);
-  round(st, w); t("②→①: deleted on the next round", w.deleted.join() === "dev-tests");
+  round(st, w); t("②→①: its server stopped on the next round (session not deleted)", w.stopped.join() === "dev-tests" && w.deleted.length === 0);
 }
 // --- strict schema: a pane that is not a number is a visible schema violation and is never judged ---
 {
@@ -258,7 +260,6 @@ for (const which of ["recs", "sessions", "blocks"] as const) {
       socketOwners: (n) => (sessions.includes(n) && !killed ? [50001] : []),
       signalPid: (pid) => { ev.push(`stop ${pid === 50001 ? "review-state" : pid} @${cur()}`); killed = true; return true; },
       waitPidGone: () => killed,
-      herdrDelete: (n) => { ev.push(`delete ${n} @${cur()}`); sessions = sessions.filter((x) => x !== n); return true; },
       gc: () => ({ code: 0, line: "gc: results=0 tmp=0" }), tmpFiles: () => [], removeTmp: () => false,
       nowMs: () => clock, log: (l) => ev.push(l), audit: (l) => ev.push(l),
     };
@@ -269,19 +270,19 @@ for (const which of ["recs", "sessions", "blocks"] as const) {
   // window 1: live seen twice, but turned "stopping" between round 2's read and its mark ⇒ never marked, never stopped/deleted
   let ev = run(inst, 1);
   t("state-commit: live→stopping before the mark ⇒ stays stopping (not overwritten orphan)", cur() === "stopping");
-  t("state-commit: … and zero stop/delete", !ev.some((l) => /^(stop|delete) /.test(l)));
+  t("state-commit: … and zero stop", !ev.some((l) => /^stop /.test(l)));
   t("state-commit: … the dropped mark is logged", ev.some((l) => /could not mark review-state orphan/.test(l)));
-  // positive: stays live ⇒ marked on round 2, stop+delete on round 4 while the record is orphan
+  // positive: stays live ⇒ marked on round 2, its server stopped on round 4 while the record is orphan
   ev = run(inst, null);
-  t("state-commit positive: live kept ⇒ marked orphan, then stop+delete under orphan", cur() === "orphan"
-    && ev.includes("stop review-state @orphan") && ev.includes("delete review-state @orphan"));
+  t("state-commit positive: live kept ⇒ marked orphan, then its server stopped under orphan", cur() === "orphan"
+    && ev.includes("stop review-state @orphan"));
   // window 2: orphan seen twice, turned "stopping" between round 2's read and the stop/delete ⇒ zero stop/delete, record kept
   ev = run({ ...inst, state: "orphan", stopped_at: 5 }, 1);
-  t("state-commit: orphan→stopping before stop/delete ⇒ zero stop/delete", !ev.some((l) => /^(stop|delete) /.test(l)));
+  t("state-commit: orphan→stopping before the stop ⇒ zero stop", !ev.some((l) => /^stop /.test(l)));
   t("state-commit: … record kept as stopping, candidate dropped", cur() === "stopping" && ev.some((l) => /candidate dropped, record kept/.test(l)));
-  // window 2 positive: stays stopped ⇒ stop+delete on round 2, state seen inside the action is still stopped
+  // window 2 positive: stays stopped ⇒ its server stopped on round 2, state seen inside the action is still stopped
   ev = run({ ...inst, state: "stopped", stopped_at: 5 }, null);
-  t("state-commit positive: stopped kept ⇒ stop+delete with the record still stopped", ev.includes("stop review-state @stopped") && ev.includes("delete review-state @stopped"));
+  t("state-commit positive: stopped kept ⇒ server stopped with the record still stopped", ev.includes("stop review-state @stopped"));
   // the action holds the lock: a writer arriving during stop/delete cannot slip a state change in underneath it
   writeWorkers(home, sid, [{ ...inst, state: "stopped", stopped_at: 5 }]);
   // (another PROCESS: holder-lock reclaims tokens carrying its own pid, so an in-process writer is not a concurrent writer)

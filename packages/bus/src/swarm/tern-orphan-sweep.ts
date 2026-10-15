@@ -2,9 +2,10 @@
  * Orphan sweep (#1033 r3; user rule "no leaks", coordinator ruling: RECORD-DRIVEN). Runs every ORPHAN_EVERY_MS from the tern-bridge
  * sweep step. Three classes:
  *   ① a herdr session REGISTERED in a seat-shell record (workers[].herdr_session) whose worker is state "stopped" (or "orphan")
- *      but the herdr session still exists ⇒ SIGTERM that record's server_pid, then `herdr session delete <name>` once the pid is gone
- *      and nothing holds the socket — only when server_pid is the sole holder of the session's herdr.sock and no newer active record
- *      holds the name (r11/r12: names are reused, so nothing is ever stopped by name).
+ *      but the herdr session still exists ⇒ SIGTERM that record's server_pid — only when server_pid is the sole holder of the
+ *      session's herdr.sock and no newer active record holds the name (r11/r12: names are reused, so nothing is stopped by name).
+ *      The session DIRECTORY is never deleted automatically (r13: herdr has no instance-bound delete); a dir whose server is gone is
+ *      reported once per instance with the manual `herdr session delete <name>`.
  *   ② a seat-shell worker in state "live" whose Tern block (workers[].pane) is gone from `tern ls --json` ⇒ mark the record
  *      "orphan" (+stopped_at), then ① applies to its herdr session on the following confirmations. "starting" (no block yet,
  *      pane 0) is never judged; a persisting "stopping" is reported as a possible leak, never marked or deleted (#1034 r3).
@@ -45,7 +46,6 @@ export type OrphanIO = {
   signalPid: (pid: number) => boolean;
   /** Wait (bounded) until `pid` is gone. true = it exited; false = still alive or unknown at the deadline. */
   waitPidGone: (pid: number) => boolean;
-  herdrDelete: (name: string) => boolean;
   /** Mark ONE worker instance orphan. `inst` = the instance seen on both rounds (pane + started_at); the writer re-reads the record
    *  and changes it only if the same instance is still there (a restarted worker with the same name is a different instance). */
   markWorker: (sid: string, herdrSession: string, inst: { pane: number; startedAt: unknown }, state: "orphan", stoppedAt: number) => boolean;
@@ -61,8 +61,8 @@ export type OrphanIO = {
   audit: (l: string) => void;
 };
 
-export type OrphanState = { lastRunMs: number; seen: Set<string> };
-export function initialOrphanState(): OrphanState { return { lastRunMs: -Infinity, seen: new Set() }; }
+export type OrphanState = { lastRunMs: number; seen: Set<string>; reported: Set<string> };
+export function initialOrphanState(): OrphanState { return { lastRunMs: -Infinity, seen: new Set(), reported: new Set() }; }
 
 const str = (v: unknown): string | null => (typeof v === "string" && v !== "" ? v : null);
 /** Tern block id from a worker record. Schema (coordinator, 2026-10-15): pane is a NUMBER. Strict on purpose: accepting a numeric
@@ -151,21 +151,27 @@ export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; u
         let line = "", skipped = "";
         const ran = io.whileInstance(sid, hs, { pane: w.pane ?? null, startedAt: w.started_at ?? null }, ["stopped", "orphan"], () => {
           const owners = io.socketOwners(hs); // at the commit point, inside the lock
+          if (owners !== null && owners.length === 0) { skipped = "leftover"; return; } // our server is already gone: only a dir left
           if (owners === null || owners.length !== 1 || owners[0] !== spid) {
-            skipped = owners === null ? "socket owner unobservable" : owners.length === 0 ? "no server holds the socket" : `socket held by ${owners.join(",")}, not ${spid}`;
+            skipped = owners === null ? "socket owner unobservable" : `socket held by ${owners.join(",")}, not ${spid}`;
             return;
           }
-          // terminate the verified INSTANCE (its pid), never "whoever owns the name now"; delete only once that pid is gone AND
-          // nothing holds the socket — a server that took the name in between keeps its session.
+          // terminate the verified INSTANCE (its pid), never "whoever owns the name now". The session DIRECTORY is never deleted
+          // here: herdr's delete is by name and nothing ties it to an instance (a server created between any check and the
+          // removal would lose its socket and metadata). It is reported once below, with the manual command.
           const signalled = io.signalPid(spid);
           const exited = signalled && io.waitPidGone(spid);
-          const after = exited ? io.socketOwners(hs) : null;
-          const free = after !== null && after.length === 0;
-          const deleted = free && io.herdrDelete(hs);
-          line = `orphan-sweep herdr session ${hs} (seat ${sid.slice(0, 8)}, record ${state}, server ${spid}): signal=${signalled} exited=${exited} `
-            + `delete=${deleted}${exited && !free ? ` (not deleted: socket ${after === null ? "owner unobservable" : `held by ${after.join(",")}`})` : ""}`;
+          line = `orphan-sweep herdr server ${spid} of session ${hs} (seat ${sid.slice(0, 8)}, record ${state}): signal=${signalled} exited=${exited}`;
         });
         if (!ran) io.log(`orphan-sweep: ${hs} (seat ${sid.slice(0, 8)}) is no longer this stopped/orphan instance — candidate dropped, record kept`);
+        else if (skipped === "leftover") {
+          const rk = `left:${sid}:${hs}:${spid}`;
+          if (!st.reported.has(rk)) {
+            st.reported.add(rk);
+            io.audit(`orphan-sweep: herdr session dir ${hs} left behind (seat ${sid.slice(0, 8)}, server ${spid} gone) — not deleted automatically `
+              + `(a by-name delete could hit a server started under the same name); if nothing should run as ${hs}: herdr session delete ${hs}`);
+          }
+        }
         else if (skipped) io.log(`orphan-sweep: herdr session ${hs} (seat ${sid.slice(0, 8)}) is not this record's server (${skipped}) — no action, record kept`);
         else io.audit(line);
       } });
@@ -278,7 +284,6 @@ export function realHerdr(env: NodeJS.ProcessEnv = process.env) {
         return d.sessions.map((s) => (typeof s.name === "string" ? s.name : "")).filter(Boolean);
       } catch { return null; }
     },
-    del: (name: string) => { const r = run(["session", "delete", name]); return !r.error && r.status === 0; },
   };
 }
 

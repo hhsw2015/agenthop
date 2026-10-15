@@ -87,7 +87,6 @@ function sweepIO(home: string, f: Fake, ev: Ev, clock: { t: number }, owners?: (
       return true;
     },
     waitPidGone: (pid) => (f as Fake & { gone?: Set<number> }).gone?.has(pid) === true,
-    herdrDelete: (n) => { ev.actions.push({ op: "delete", name: n }); f.herdrSessions = f.herdrSessions.filter((x) => x.name !== n); return true; },
     markWorker: realMarkWorker(home), whileInstance: realWhileInstance(home),
     gc: () => ({ code: 0, line: "gc: results=0 tmp=0" }), tmpFiles: () => [], removeTmp: () => false,
     nowMs: () => clock.t, log: (l) => ev.logs.push(l), audit: (l) => ev.audit.push(l),
@@ -124,7 +123,7 @@ const rounds = (io: OrphanIO, clock: { t: number }, n: number) => { const st = i
   t("reuse, no B record: zero stop/delete (socket held by another pid)", ev.actions.length === 0 && f.owners.get(NAME) === bPid);
   t("reuse, no B record: skip names the socket holder", ev.logs.some((l) => l.includes(`socket held by ${bPid}`)));
 }
-// --- positive control: a stopped record whose OWN server still holds the socket (stop was partial) IS cleaned ---
+// --- positive control: a stopped record whose OWN server still holds the socket (stop was partial): that server is stopped ---
 {
   const { home, f, d } = setup();
   await start(d, "reused-name", SEAT);
@@ -132,8 +131,11 @@ const rounds = (io: OrphanIO, clock: { t: number }, n: number) => { const st = i
   setWorkerState(home, SEAT, w!, "stopped", 5);
   const ev = ev0(), clock = { t: 0 };
   rounds(sweepIO(home, f, ev, clock), clock, 2);
-  t("own server: signal its pid then delete on round 2", ev.actions.map((x) => x.op).join() === "signal,delete" && ev.actions[0]!.pid === w!.server_pid);
-  t("own server: audit names the server pid", ev.audit.some((l) => l.includes(`server ${w!.server_pid}`)));
+  t("own server: its pid signalled on round 2", ev.actions.map((x) => x.op).join() === "signal" && ev.actions[0]!.pid === w!.server_pid);
+  t("own server: audit names the server pid", ev.audit.some((l) => l.includes(`herdr server ${w!.server_pid} of session ${NAME}`)));
+  rounds(sweepIO(home, f, ev, clock), clock, 8);
+  t("own server: later rounds report the leftover dir once, never delete", ev.audit.filter((l) => /left behind/.test(l)).length === 1
+    && f.herdrSessions.some((x) => x.name === NAME) && ev.actions.length === 1);
 }
 // --- FC-2 / ownership controls: unobservable owner, unproven record, no server_pid => no action ---
 {
@@ -154,10 +156,9 @@ const rounds = (io: OrphanIO, clock: { t: number }, n: number) => { const st = i
   rounds(sweepIO(home, f, ev3, clock), clock, 3);
   t("no server_pid (legacy record): no action", ev3.actions.length === 0 && ev3.logs.some((l) => /no server_pid/.test(l)));
 }
-// --- probe/action gap (r12): another server takes the name AFTER the socket probe saw ours ---
-// our record's server = A (pid from the real start); the takeover server = 99999. Each window must leave 99999 running and its
-// session undeleted; only A's pid is ever signalled.
-for (const when of ["after-probe", "after-signal"] as const) {
+// --- probe/action gap (r12) + deletion interval (r13): another server takes the name AFTER the socket probe saw ours, after the
+// signal, or after our pid exited. Each window must leave 99999 running and its session undeleted; only A's pid is signalled.
+for (const when of ["after-probe", "after-signal", "after-exit"] as const) {
   const { home, f, d } = setup();
   await start(d, "reused-name", SEAT);
   const r = readSeat(home, SEAT); const w = r.kind === "ok" ? r.workers[0]! : null;
@@ -170,14 +171,16 @@ for (const when of ["after-probe", "after-signal"] as const) {
     if (++probes === 1 && when === "after-probe") takeover(); // the commit-point probe (the first call, round 2) returns ours, then the name moves
     return now;
   });
-  const sig = io.signalPid;
+  const sig = io.signalPid, gone = io.waitPidGone;
   io.signalPid = (pid) => { const ok = sig(pid); if (when === "after-signal") takeover(); return ok; };
-  rounds(io, clock, 2);
+  io.waitPidGone = (pid) => { const g = gone(pid); if (when === "after-exit") takeover(); return g; };
+  rounds(io, clock, 4);
   t(`takeover ${when}: only our recorded pid was signalled`, ev.actions.filter((x) => x.op === "signal").every((x) => x.pid === w!.server_pid)
     && ev.actions.some((x) => x.op === "signal"));
   t(`takeover ${when}: the new server 99999 still holds the socket`, f.owners.get(NAME) === 99999);
   t(`takeover ${when}: its session is NOT deleted`, !ev.actions.some((x) => x.op === "delete") && f.herdrSessions.some((x) => x.name === NAME));
-  t(`takeover ${when}: audit says not deleted, socket held by 99999`, ev.audit.some((l) => /delete=false \(not deleted: socket held by 99999\)/.test(l)));
+  t(`takeover ${when}: the sweep never deletes; later rounds leave 99999 alone`, ev.actions.filter((x) => x.op === "signal").length === 1
+    && ev.logs.some((l) => /socket held by 99999/.test(l)));
 }
 // --- our pid does not exit within the wait ⇒ no delete ---
 {
@@ -190,7 +193,7 @@ for (const when of ["after-probe", "after-signal"] as const) {
   io.signalPid = (pid) => { ev.actions.push({ op: "signal", name: NAME, pid }); return true; }; // ignores SIGTERM
   io.waitPidGone = () => false;
   rounds(io, clock, 2);
-  t("pid ignores SIGTERM: no delete, audit says exited=false", !ev.actions.some((x) => x.op === "delete") && ev.audit.some((l) => /exited=false delete=false/.test(l)));
+  t("pid ignores SIGTERM: audit says exited=false", ev.audit.some((l) => /signal=true exited=false/.test(l)));
   t("pid ignores SIGTERM: session kept", f.herdrSessions.some((x) => x.name === NAME));
 }
 // --- signal refused (EPERM/ESRCH) ⇒ no wait, no delete ---
@@ -204,7 +207,7 @@ for (const when of ["after-probe", "after-signal"] as const) {
   let waited = false;
   io.signalPid = () => false; io.waitPidGone = () => { waited = true; return true; };
   rounds(io, clock, 2);
-  t("signal refused: no wait, no delete", !waited && !ev.actions.some((x) => x.op === "delete") && ev.audit.some((l) => /signal=false exited=false delete=false/.test(l)));
+  t("signal refused: no wait", !waited && ev.audit.some((l) => /signal=false exited=false/.test(l)));
 }
 // --- the real pid helpers: a real child process is signalled and confirmed gone; a dead pid is "gone"; pid 1 is never signalled ---
 {
@@ -218,5 +221,11 @@ for (const when of ["after-probe", "after-signal"] as const) {
   t("real: child confirmed gone", realWaitPidGone(pid));
   t("real: a live pid is NOT reported gone (bounded wait)", (() => { const t0 = Date.now(); const r = realWaitPidGone(process.pid); return r === false && Date.now() - t0 >= 4000; })());
   t("real: pid 1 is never signalled", realSignalPid(1) === false);
+}
+// --- r13 invariant: the sweep has no path that deletes a herdr session (herdr's delete is by name, never instance-bound) ---
+{
+  const src = readFileSync(new URL("./tern-orphan-sweep.ts", import.meta.url), "utf8").replace(/\/\/.*$|\/\*[\s\S]*?\*\//gm, "");
+  t("invariant: no `session delete` / herdrDelete in the sweep's code", !/["']delete["']|herdrDelete|session\s+delete/.test(src.replace(/`[^`]*`/g, "")));
+  t("invariant: no `server stop` by name in the sweep's code", !/["']stop["']/.test(src.replace(/`[^`]*`/g, "")));
 }
 console.log("PASS tern-orphan-sweep-reuse");

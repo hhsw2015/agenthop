@@ -1986,7 +1986,7 @@ async function main(): Promise<void> {
   };
   const orphanIO = {
     seatRecords: realSeatRecords(HOME), herdrSessions: herdr.sessions, ternBlocks: realTernBlocks(ternLs),
-    signalPid: realSignalPid, waitPidGone: (pid: number) => realWaitPidGone(pid), herdrDelete: herdr.del, markWorker: realMarkWorker(HOME), whileInstance: realWhileInstance(HOME), socketOwners: realSocketOwners(process.env), gc: realGc(bridgeScriptEnv(process.env, BRIDGE_HOME), bridgeDirPath),
+    signalPid: realSignalPid, waitPidGone: (pid: number) => realWaitPidGone(pid), markWorker: realMarkWorker(HOME), whileInstance: realWhileInstance(HOME), socketOwners: realSocketOwners(process.env), gc: realGc(bridgeScriptEnv(process.env, BRIDGE_HOME), bridgeDirPath),
     ...realTmpFiles(BRIDGE_HOME, () => Date.now()), nowMs: () => Date.now(), log, audit: ternBridgeIO.controlLog,
   };
   const runTernBridgeStep = (): void => {
