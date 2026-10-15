@@ -22,8 +22,9 @@
 #   bridge-smoke.sh --soak            runs checks 1-4 at t=0, then again 2.5 min later, then counts kills over the
 #                                     WHOLE window (not just the two runs). Exit 0 only if both runs pass AND no kill
 #                                     in between. SOAK_GAP (seconds, default 150) sets the gap.
-#   SINCE=<ISO time> bridge-smoke.sh  check 4 counts kills since that time instead of since this run's start
-#                                     (tern.log lines start with an ISO timestamp; compared as strings).
+#   SINCE=<ISO time> bridge-smoke.sh  check 4 counts kills since that time instead of since this run's start.
+#                                     Both sides are parsed to epoch (fractional seconds, Z / +HH:MM; no zone = local);
+#                                     an unparseable SINCE or log timestamp FAILs check 4, never reads as an empty window.
 #
 # Interface (confirmed by the coordinator on r2 @5f6294b; override if it changes):
 #   BRIDGE_DRAIN_ACTION  action run via `tern ctl plugins run`   default plugin.agenthop-agents-bridge.drain
@@ -32,7 +33,7 @@ set -uo pipefail
 
 if [ "${1:-}" = "--soak" ]; then
   self="${BASH_SOURCE[0]}"; gap="${SOAK_GAP:-150}"
-  since="$(date '+%Y-%m-%dT%H:%M:%S')"
+  since="$(python3 -c 'import datetime; print(datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"))')"
   echo "=== soak run 1 of 2 ($since) ==="
   bash "$self"; r1=$?
   echo ""; echo "=== waiting ${gap}s ==="; sleep "$gap"
@@ -60,9 +61,13 @@ PLUGIN_ID="agenthop-agents-bridge"
 
 for bin in timeout jq; do command -v "$bin" >/dev/null || { echo "bridge-smoke: missing $bin" >&2; exit 2; }; done
 
-# Log offset at start: only lines appended after this count are checked (a shrunk/rotated log is scanned whole).
-LOG_START_LINES=0
-[ -f "$LOG" ] && LOG_START_LINES="$(wc -l <"$LOG" | tr -d ' ')"
+# Log identity at start (dev:inode:size). Check 4 reads only what was appended after it, or the whole file if the log
+# was replaced (rotation) or truncated meanwhile. A log that cannot be stat'ed now is recorded and makes check 4 FAIL.
+LOGWIN="$HERE/smoke-logwindow.py"
+LOG_MARK=""; LOG_MARK_ERR=""
+if [ -e "$LOG" ]; then
+  LOG_MARK="$(python3 "$LOGWIN" mark "$LOG" 2>&1)" || { LOG_MARK_ERR="$LOG_MARK"; LOG_MARK=""; }
+fi
 
 tick(){ jq -r '.tick // empty' "$CTRL/agents.json" 2>/dev/null; }
 # r4+ writes `vm` (a per-load id). A different vm means the plugin was reloaded and tick restarted from 1, which is
@@ -105,23 +110,38 @@ if ! timeout "$TERN_TIMEOUT" "$TERN" plugin list --json 2>/dev/null \
 fi
 echo "ok   - plugin $PLUGIN_ID loaded"
 
-# 1. tick advances (status mirror alive). With r4's vm field: a vm change = a reload (counts as alive, reported).
+# 1. tick advances (status mirror alive).
+#    r4+: `vm` is a per-load id. A vm change = reload: the tick restarted, so the baseline restarts on the new vm and
+#    PASS still needs that SAME vm to advance afterwards. A reload followed by a freeze, or a vm that keeps changing,
+#    is a FAIL. r8+: `timer=stopped-late` means the timer accelerator stopped itself (background throttling); liveness
+#    is then the outside `mirror` command sweep (~5 s), so the expected rate is the sweep's, not 750 ms — reported.
 t0="$(tick)"; v0="$(vm)"
 if ! [[ "$t0" =~ ^[0-9]+$ ]]; then
   fail "1 tick: agents.json tick unreadable or not a number: '$t0'"
 else
   sleep "$TICK_WAIT"
   t1="$(tick)"; v1="$(vm)"
+  reload_note=""
   if [ -n "$v0" ] && [ -n "$v1" ] && [ "$v0" != "$v1" ] && [[ "$t1" =~ ^[0-9]+$ ]]; then
-    pass "1 tick: plugin reloaded during the wait (vm $v0 -> $v1, tick restarted at $t1)"
+    reload_note="reloaded (vm $v0 -> $v1), re-baselined at $t1; "
+    t0="$t1"; v0="$v1"
+    sleep "$TICK_WAIT"
+    t1="$(tick)"; v1="$(vm)"
+  fi
+  timer_state="$(jq -r '.timer // empty' "$CTRL/agents.json" 2>/dev/null)"
+  if [ -n "$v0" ] && [ -n "$v1" ] && [ "$v0" != "$v1" ]; then
+    fail "1 tick: ${reload_note}vm changed AGAIN ($v0 -> $v1): no single vm observed advancing"
   elif [[ "$t1" =~ ^[0-9]+$ ]] && [ "$t1" -gt "$t0" ]; then
-    # Rate column: the bridge's own timer chain ticks every 750 ms; an outside sweep (`tern ctl ... mirror`) every few
-    # seconds also moves it. A low rate means the timer chain is dead and only the sweep keeps the tick alive.
+    # Rate column: the bridge's timer chain ticks every 750 ms; an outside sweep (`tern ctl ... mirror`) every few
+    # seconds also moves it. With the timer running, a low rate means the chain is dying; with timer=stopped-late,
+    # the sweep alone is expected.
     steps=$((t1 - t0)); want=$(( TICK_WAIT * 1000 / 750 ))
-    if [ "$steps" -ge $(( want / 2 )) ]; then rate="timer chain alive"; else rate="LOW: timer chain likely dead, tick kept alive by outside mirror calls"; fi
-    pass "1 tick advances ($t0 -> $t1 in ${TICK_WAIT}s = $steps steps, ~$want expected; $rate${v1:+; vm $v1})"
+    if [ "$timer_state" = "stopped-late" ]; then rate="timer=stopped-late (throttled, by design): liveness from the outside mirror sweep"
+    elif [ "$steps" -ge $(( want / 2 )) ]; then rate="timer chain alive"
+    else rate="LOW: timer chain likely dead, tick kept alive by outside mirror calls"; fi
+    pass "1 tick ${reload_note}advances ($t0 -> $t1 in ${TICK_WAIT}s = $steps steps, ~$want expected; $rate${v1:+; vm $v1})"
   else
-    fail "1 tick: did not advance in ${TICK_WAIT}s ($t0 -> $t1${v1:+, vm $v1})"
+    fail "1 tick: ${reload_note}did not advance in ${TICK_WAIT}s ($t0 -> $t1${v1:+, vm $v1}${timer_state:+, timer=$timer_state})"
   fi
 fi
 
@@ -150,17 +170,25 @@ fi
 # 4. budget kills since start, two columns. Runs last so it covers checks 1-3. Tern logs
 #    `... exceeded its budget; disabled until reload plugin="<id>" hook="<hook>"` (the id AFTER `exceeded`), plus a second
 #    `handler failed ... exceeded 50 ms` line for the same kill — only the first form is counted, so one kill = 1.
-if [ -f "$LOG" ]; then
-  if [ -n "${SINCE:-}" ]; then
-    window_lines="$(awk -v t="$SINCE" 'substr($0, 1, 19) >= t' "$LOG")"   # a soak window spans several runs
-    window_desc="since $SINCE"
-  else
-    now_lines="$(wc -l <"$LOG" | tr -d ' ')"
-    from=$((LOG_START_LINES + 1))
-    [ "$now_lines" -lt "$LOG_START_LINES" ] && from=1
-    window_lines="$(tail -n +"$from" "$LOG")"
-    window_desc="since start"
-  fi
+window_err=""
+if [ -n "${SINCE:-}" ]; then
+  window_desc="since $SINCE"
+  window_lines="$(python3 "$LOGWIN" since "$LOG" "$SINCE" 2>/tmp/smoke-logwin.$$)" || window_err="$(cat /tmp/smoke-logwin.$$)"
+elif [ -n "$LOG_MARK_ERR" ]; then
+  window_desc="since start"; window_err="log unreadable at start: $LOG_MARK_ERR"
+elif [ -z "$LOG_MARK" ]; then
+  window_desc="since start (log appeared during the run)"
+  [ -e "$LOG" ] && { window_lines="$(python3 "$LOGWIN" offset "$LOG" "0:0:0" 2>/tmp/smoke-logwin.$$)" || window_err="$(cat /tmp/smoke-logwin.$$)"; }
+else
+  window_desc="since start"
+  window_lines="$(python3 "$LOGWIN" offset "$LOG" "$LOG_MARK" 2>/tmp/smoke-logwin.$$)" || window_err="$(cat /tmp/smoke-logwin.$$)"
+fi
+rm -f /tmp/smoke-logwin.$$
+if [ ! -e "$LOG" ]; then
+  fail "4 tern log not found at $LOG"
+elif [ -n "$window_err" ]; then
+  fail "4 kill window could not be read ($window_desc): $window_err"
+else
   kills="$(printf '%s\n' "$window_lines" | grep -F "exceeded its budget" | grep -F "plugin=\"$PLUGIN_ID\"" || true)"
   # Two groups, reported separately: the MIRROR (status liveness: timer / await / command mirror) and the COMMAND
   # path (command drain / drain-start / arm / anything else). One bit would hide which half died.
@@ -181,8 +209,6 @@ if [ -f "$LOG" ]; then
   fi
   line="4 mirror kills=$mk${mh:+ [$mh]}  command kills=$ck${ch:+ [$ch]}  ($window_desc)  tick after=$after"
   if [ $((mk + ck)) -eq 0 ]; then pass "$line"; else fail "$line"; fi
-else
-  fail "4 tern log not found at $LOG"
 fi
 
 echo ""

@@ -111,7 +111,7 @@ check "$([ $RC -eq 2 ] && [[ "$OUT" != *'PASS - '* && "$OUT" != *'FAIL - '* ]] &
 ( sleep 0.4; i=1; while :; do echo "{\"tick\":$i,\"vm\":\"bbb\",\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 0.2; done ) & TICKER=$!
 run env
 stop_ticker
-check "$([[ "$OUT" == *'PASS - 1 tick: plugin reloaded during the wait (vm aaa -> bbb'* ]] && echo true)" "r4 reload: vm change counted as alive, reported"
+check "$([[ "$OUT" == *'PASS - 1 tick reloaded (vm aaa -> bbb), re-baselined at'*'advances ('*'vm bbb)'* ]] && echo true)" "r4 reload: re-baselined on the new vm, which then advances => PASS"
 
 # H. r4 file, same vm, tick frozen: FAIL and the diagnostics show vm + tick_ms.
 : >"$L"; echo '{"tick":5,"vm":"ccc","tick_ms":61,"tick_ms_max":88,"agents":[]}' >"$C/agents.json"
@@ -178,6 +178,83 @@ stop_ticker
 check "$([ $RC -eq 0 ] && [[ "$OUT" == *'PASS - 2 list'* ]] && echo true)" "r7: a request queued ahead of ours does not cause a false FAIL"
 check "$([ -f "$C/results/a-stale-other.json" ] && echo true)" "r7: the other request was answered by the bridge, not deleted by the smoke"
 rm -f "$C"/results/*.json
+
+# ---- r8: second-voice counterexamples (happycapy smoke-audit), ported -----------------------------------------
+kill_at(){ printf '%s 1 WARN x: plugin hook exceeded its budget; disabled until reload plugin="agenthop-agents-bridge" hook="%s"\n' "$1" "${2:-timer}"; }
+since_case(){ # $1 name, $2 SINCE, $3 log timestamp, $4 expected exit
+  : >"$L"; kill_at "$3" >>"$L"; start_ticker
+  OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 SINCE="$2" bash "$SMOKE" 2>&1)"; RC=$?
+  stop_ticker
+  check "$([ $RC -eq "$4" ] && echo true)" "SINCE $1 (SINCE=$2, kill=$3) => exit $4"
+}
+# BSM-SV-P2-1: fractional seconds and zones are compared as instants
+since_case fraction_later_same_second   2026-10-15T11:00:00.100+08:00 2026-10-15T11:00:00.900+08:00 1
+since_case fraction_before_same_second  2026-10-15T11:00:00.900+08:00 2026-10-15T11:00:00.100+08:00 0
+since_case zone_suffix_same_second      2026-10-15T11:00:00+08:00     2026-10-15T11:00:00.900+08:00 1
+since_case zone_cross_day_later         2026-10-15T03:00:00+08:00     2026-10-14T20:00:00.000Z      1
+since_case zone_earlier_but_lex_later   2026-10-15T03:00:00Z          2026-10-15T10:00:00.000+08:00 0
+since_case next_second_full_iso         2026-10-15T11:00:00.100+08:00 2026-10-15T11:00:01.000+08:00 1
+since_case same_timezone_cross_midnight 2026-10-14T23:59:59+08:00     2026-10-15T00:00:00.001+08:00 1
+since_case before_midnight_excluded     2026-10-15T00:00:00+08:00     2026-10-14T23:59:59.999+08:00 0
+# a SINCE that cannot be parsed is a FAIL with a reason, not an empty window
+: >"$L"; start_ticker
+OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 SINCE="yesterday-ish" bash "$SMOKE" 2>&1)"; RC=$?
+stop_ticker
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 4 kill window could not be read'*'SINCE not an ISO time'* ]] && echo true)" "SINCE unparseable => check 4 FAILs with the reason"
+
+# BSM-SV-P2-2: a reload followed by a freeze is NOT alive; a vm that keeps changing is not alive either
+: >"$L"; echo '{"tick":40,"vm":"old","agents":[]}' >"$C/agents.json"
+( sleep 0.3; echo '{"tick":1,"vm":"new","agents":[]}' >"$C/agents.json" ) & TICKER=$!
+run env
+stop_ticker
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 1 tick: reloaded (vm old -> new), re-baselined at 1; did not advance'* ]] && echo true)" "reload once then frozen (reload_once_frozen) => FAIL"
+: >"$L"; ( i=1; while :; do echo "{\"tick\":1,\"vm\":\"v$i\",\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 0.4; done ) & TICKER=$!
+run env
+stop_ticker
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'vm changed AGAIN'* ]] && echo true)" "vm keeps changing (reload loop) => FAIL"
+# r8 bridge: timer=stopped-late with a slow sweep is reported as by-design, not LOW
+: >"$L"; ( i=1; while :; do echo "{\"tick\":$i,\"vm\":\"z\",\"timer\":\"stopped-late\",\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 1.5; done ) & TICKER=$!
+OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=4 bash "$SMOKE" 2>&1)"; RC=$?
+stop_ticker
+check "$([[ "$OUT" == *'PASS - 1 tick'*'timer=stopped-late (throttled, by design)'* && "$OUT" != *'LOW:'* ]] && echo true)" "timer=stopped-late + sweep-only tick => PASS, reported as by design"
+
+# BSM-SV-P2-3: rotation and unreadable logs
+# rotation_regrown: the log is replaced during the run by a LONGER file whose first line is a kill => counted
+: >"$L"; printf 'old 1\nold 2\n' >"$L"
+cat >"$TMP/tern-rotate" <<EOF2
+#!/usr/bin/env bash
+if [ "\$1 \$2" = "plugin list" ] && [ ! -e "$TMP/rotated" ]; then
+  touch "$TMP/rotated"; mv "$L" "$L.old"
+  { printf '%s 1 WARN x: plugin hook exceeded its budget; disabled until reload plugin="agenthop-agents-bridge" hook="timer"\n' "\$(date '+%Y-%m-%dT%H:%M:%S').000+08:00"; echo new 2; echo new 3; } >"$L"
+fi
+exec "$FAKE" "\$@"
+EOF2
+chmod +x "$TMP/tern-rotate"; rm -f "$TMP/rotated"; start_ticker
+OUT="$(TERN_BIN="$TMP/tern-rotate" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 bash "$SMOKE" 2>&1)"; RC=$?
+stop_ticker; rm -f "$L.old"
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'mirror kills=1 [timer x1]'* ]] && echo true)" "rotation_regrown: log replaced by a longer file, its first-line kill is counted"
+# truncated in place, then a kill appended => counted
+printf 'a\nb\nc\nd\n' >"$L"; start_ticker
+( sleep 0.3; : >"$L"; kill_at "$(date '+%Y-%m-%dT%H:%M:%S').000+08:00" >>"$L" ) &
+run env
+stop_ticker
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'mirror kills=1'* ]] && echo true)" "log truncated in place then a kill appended => counted"
+# unreadable log (EACCES), offset path and SINCE path => FAIL, never 0 kills
+if [ "$(id -u)" -ne 0 ]; then
+  kill_at "2026-10-15T11:00:01.000+08:00" >"$L"; chmod 000 "$L"; start_ticker
+  run env
+  r1=$RC; o1="$OUT"
+  run env SINCE=2026-10-15T11:00:00+08:00
+  stop_ticker; chmod 600 "$L"
+  check "$([ $r1 -eq 1 ] && [[ "$o1" == *'FAIL - 4 kill window could not be read'* && "$o1" != *'kills=0'* ]] && echo true)" "EACCES log, offset path => FAIL, not 0 kills"
+  check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 4 kill window could not be read'*'cannot read'* ]] && echo true)" "EACCES log, SINCE path => FAIL, not 0 kills"
+fi
+# command-only kill is a FAIL (a gate that ignored the command column would pass this)
+: >"$L"; start_ticker
+( sleep 0.3; kill_at "$(date '+%Y-%m-%dT%H:%M:%S').000+08:00" "command drain" >>"$L" ) &
+run env
+stop_ticker
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'mirror kills=0  command kills=1 [command drain x1]'* ]] && echo true)" "command-only kill (command_kill_only_control) => FAIL"
 
 echo ""
 echo "bridge-smoke gate: $t passed, $f failed"
