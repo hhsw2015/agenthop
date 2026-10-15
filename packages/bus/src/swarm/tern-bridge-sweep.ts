@@ -48,6 +48,12 @@ export function bridgeHome(env: NodeJS.ProcessEnv, osHome: string): string {
   return env.AGENTHOP_BRIDGE_HOME || osHome;
 }
 
+/** The env every bridge helper SCRIPT (arm-schedule.sh, gc.sh) must run with: the same resolved control dir the TS readers use,
+ *  via AGENTHOP_TERN_PANES (both scripts read it, else fall back to OS home). One function so scan/read/schedule/gc cannot split. */
+export function bridgeScriptEnv(env: NodeJS.ProcessEnv, home: string): NodeJS.ProcessEnv {
+  return { ...env, AGENTHOP_TERN_PANES: bridgeDir(home) };
+}
+
 /** One tern call's outcome. ok=false ⇒ tern itself did not answer (UNKNOWN), not a bridge verdict. */
 export type TernResult = { ok: boolean; detail: string };
 export type TernRun = (args: string[]) => TernResult;
@@ -83,7 +89,7 @@ export type BridgeState = {
   lastReloadMs: number;
   /** TBS-ARM-RETRY: a reload that succeeded but whose arm (and therefore drain) did not complete. The obligation is kept here and
    *  retried EVERY tick — independent of the 60s reload debounce, so finishing a reload never waits for (or causes) another one. */
-  owedAfterReload: { vm: string | null; why: string; startStuck: boolean } | null;
+  owedAfterReload: { vm: string | null; why: string; startStuck: boolean; stage: "ready" | "arm" | "drain"; reason: string } | null;
 };
 export function initialBridgeState(): BridgeState {
   return { lastMirrorMs: -Infinity, armedVm: null, lastTick: null, lastTickChangeMs: -Infinity, lastReloadMs: -Infinity, owedAfterReload: null };
@@ -217,12 +223,15 @@ function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]
     if (ready || io.nowMs() >= deadline) break;
     io.sleep(250);
   }
+  // From here a reload HAPPENED: whatever is left (ready, arm, drain) is an obligation kept across ticks until the WHOLE chain
+  // succeeds, never re-entering the reload debounce (TBS-ARM-RETRY, coordinator ruling).
+  st.owedAfterReload = { vm: null, why, startStuck: stuck.some((q) => q.isStart), stage: "ready", reason: "" };
   if (!ready) {
-    io.controlLog(`tern-bridge reload (${why}): reloaded but not ready within ${READY_WAIT_MS}ms`);
+    st.owedAfterReload.reason = `not ready within ${READY_WAIT_MS}ms`;
+    io.controlLog(`tern-bridge reload (${why}): reloaded but not ready within ${READY_WAIT_MS}ms — owed, retry next tick (no reload)`);
     return "reload-failed";
   }
-  st.owedAfterReload = { vm: io.readMirror()?.vm ?? null, why, startStuck: stuck.some((q) => q.isStart) };
-  const out = finishAfterReload(st, io, st.owedAfterReload.vm);
+  const out = finishAfterReload(st, io, io.readMirror()?.vm ?? null);
   return out === "rearmed" ? "reloaded" : out;
 }
 
@@ -230,16 +239,30 @@ function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]
  *  arm) and is retried on the next tick WITHOUT another reload. Discharged only when arm completed and the drain trigger was sent. */
 function finishAfterReload(st: BridgeState, io: BridgeIO, vm: string | null): TickOutcome {
   const owed = st.owedAfterReload!;
-  const armed = armSequence(io);
-  if (!armed.ok) {
-    io.controlLog(`tern-bridge reload (${owed.why}): ready vm=${vm} arm STOPPED ${armed.detail} — drain not run (retry next tick, no reload)`);
+  const keep = (stage: "ready" | "arm" | "drain", reason: string): TickOutcome => {
+    owed.stage = stage; owed.reason = reason; owed.vm = vm;
+    io.controlLog(`tern-bridge reload (${owed.why}): owed at ${stage} — ${reason} (retry next tick, no reload)`);
     return "reload-failed";
+  };
+  if (owed.stage === "ready") {
+    // a ready-wait that timed out last time: this tick's mirror already ran and moved (we are here), so the bridge answers now
+    if (vm === null) return keep("ready", "mirror still unreadable");
+    owed.stage = "arm";
   }
-  st.armedVm = vm;
-  const drained = run(io, "drain").ok;
-  if (owed.startStuck) run(io, "drain-start");
-  st.owedAfterReload = null;
-  io.controlLog(`tern-bridge reload (${owed.why}): ready vm=${vm} arm=ok(${armed.detail}) drain=${drained}${owed.startStuck ? " drain-start=sent" : ""}`);
+  if (owed.stage === "arm") {
+    const armed = armSequence(io);
+    if (!armed.ok) return keep("arm", `arm stopped: ${armed.detail} — drain not run`);
+    st.armedVm = vm;
+    owed.stage = "drain";
+  }
+  const drained = run(io, "drain");
+  if (!drained.ok) return keep("drain", `drain not confirmed sent: ${drained.detail}`);
+  if (owed.startStuck) {
+    const ds = run(io, "drain-start");
+    if (!ds.ok) return keep("drain", `drain-start not confirmed sent: ${ds.detail}`);
+  }
+  st.owedAfterReload = null; // ONLY here: ready + arm + every drain trigger confirmed
+  io.controlLog(`tern-bridge reload (${owed.why}): complete vm=${vm} drain=sent${owed.startStuck ? " drain-start=sent" : ""}`);
   return "rearmed";
 }
 

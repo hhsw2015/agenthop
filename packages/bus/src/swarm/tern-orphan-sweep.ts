@@ -20,6 +20,7 @@
 import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { casSeatRecord } from "./seat-record.js";
 
 export const ORPHAN_EVERY_MS = 60_000;
 export const TMP_TTL_MS = 3_600_000;
@@ -151,21 +152,19 @@ export function realSeatRecords(home: string): () => SeatRecord[] | null {
   };
 }
 
+/** Mark one worker instance orphan through the shared versioned CAS (seat-record.ts, coordinator ruling #1033 r7): the instance
+ *  check and the write happen against the SAME rev under the record lock, so a record another writer published meanwhile (e.g. a
+ *  restarted worker under the same name) is never overwritten — the CAS returns conflict and this round does nothing. */
 export function realMarkWorker(home: string): OrphanIO["markWorker"] {
   return (sid, hs, inst, state, stoppedAt) => {
-    const file = path.join(home, ".agenthop", "swarm", "seat-shell", `${sid}.json`);
-    try {
-      const d = JSON.parse(readFileSync(file, "utf8")) as { workers?: Worker[] };
-      if (!Array.isArray(d.workers)) return false;
-      let hit = false;
+    let hit = false;
+    const r = casSeatRecord(home, sid, (cur) => {
+      if (cur === null || !Array.isArray(cur.workers)) return null;
       const same = (w: Worker) => w.herdr_session === hs && w.pane === inst.pane && JSON.stringify(w.started_at ?? null) === JSON.stringify(inst.startedAt ?? null);
-      d.workers = d.workers.map((w) => (same(w) ? (hit = true, { ...w, state, stopped_at: stoppedAt }) : w)); // epoch ms
-      if (!hit) return false;
-      const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
-      writeFileSync(tmp, JSON.stringify(d) + "\n", { flag: "wx", mode: 0o600 });
-      renameSync(tmp, file);
-      return true;
-    } catch { return false; }
+      const workers = (cur.workers as Worker[]).map((w) => (same(w) ? (hit = true, { ...w, state, stopped_at: stoppedAt }) : w)); // epoch ms
+      return hit ? { ...cur, workers } : null;
+    });
+    return r === "ok";
   };
 }
 

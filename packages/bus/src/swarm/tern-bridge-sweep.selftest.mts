@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realSentinelReader, realClearSentinel, realPendingRequests, bridgeHome,
+  ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realSentinelReader, realClearSentinel, realPendingRequests, bridgeHome, bridgeScriptEnv, bridgeDir,
   armSequence, ACTION, RELOAD_MIN_MS,
   type BridgeIO, type Mirror, type PendingReq, type TernResult, type ArmStatus,
 } from "./tern-bridge-sweep.js";
@@ -198,7 +198,7 @@ const onAct = (b: BridgeIO, act: string, f: () => void) => { const rr = b.tern; 
   w.patrols = []; w.scheduleCode = 1; w.clock += 11000; w.calls = []; w.control = [];
   t("reload chain: arm stop => reload-failed", tick(st, b) === "reload-failed");
   t("reload chain: arm stop => no drain", !has(w, ".drain"));
-  t("reload chain: arm stop logged to audit", w.control.length === 1 && /arm STOPPED/.test(w.control[0]!));
+  t("reload chain: arm stop logged to audit", w.control.length === 1 && /owed at arm — arm stopped/.test(w.control[0]!));
   w.scheduleCode = undefined; w.clock += 5000; w.calls = [];
   t("next tick retries the full arm sequence", tick(st, b) === "rearmed" && w.patrols.length === 1);
 }
@@ -228,6 +228,31 @@ const onAct = (b: BridgeIO, act: string, f: () => void) => { const rr = b.tern; 
   t("arm-retry: no second reload", reloads(w) === 0);
   w.reqs = []; w.clock += 5000; w.calls = [];
   t("arm-retry: obligation discharged afterwards", tick(st, b) === "ok" && !has(w, ".drain"));
+}
+
+// --- r7: TBS-ARM-RETRY — drain / drain-start not confirmed, or ready timing out, keep the obligation; next tick finishes w/o reload ---
+for (const failing of ["drain", "drain-start"] as const) {
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  w.onReload = () => { w.mirror = { tick: 1, vm: "vmQ" }; };
+  w.reqs = [{ name: "s.json", ageMs: 3000, isStart: true }];
+  w.failStep = failing; w.clock += 5000; w.calls = [];
+  t(`arm-retry r7: ${failing} ok=false => not 'reloaded', obligation kept`, tick(st, b) === "reload-failed" && st.owedAfterReload !== null);
+  t(`arm-retry r7: ${failing} failure is in the audit, never 'sent'`, w.control.some((l) => /owed at drain/.test(l)) && !w.control.some((l) => /complete/.test(l)));
+  w.failStep = undefined; w.clock += 5000; w.calls = [];
+  const out = tick(st, b);
+  t(`arm-retry r7: next tick (request still there) completes with NO reload`, out === "rearmed" && reloads(w) === 0 && has(w, `.${failing}`));
+  t(`arm-retry r7: obligation cleared only after the chain`, st.owedAfterReload === null);
+}
+{ // ready window times out: obligation kept; next tick (bridge answers) finishes without reload
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  w.mirrorAdvances = false; w.onReload = () => { /* bridge does not come back within the ready window */ };
+  w.clock += 6000; w.calls = [];
+  t("arm-retry r7: ready timeout => owed, reload-failed", tick(st, b) === "reload-failed" && st.owedAfterReload?.stage === "ready");
+  w.mirrorAdvances = true; w.mirror = { tick: 50, vm: "vmLate" }; w.clock += 5000; w.calls = [];
+  const out = tick(st, b);
+  t("arm-retry r7: next tick after ready timeout finishes arm+drain, no reload", out === "rearmed" && reloads(w) === 0 && has(w, ".drain") && st.armedVm === "vmLate");
 }
 
 // --- r5: TBS-REQUEST-CLASS — start classification comes from the decoded top-level op ---
@@ -271,6 +296,15 @@ t("control root: explicit AGENTHOP_BRIDGE_HOME wins", bridgeHome({ AH_HOME: "/tm
   writeFileSync(path.join(osHome, ".agenthop", "tern-panes", "sentinel.json"), JSON.stringify({ step: "scanned", count: 1, ids: [3] }));
   const r = realSentinelReader(bridgeHome({ AH_HOME: ahHome }, osHome))();
   t("control root: sentinel read from the bridge root while AH_HOME differs", r?.count === 1);
+}
+
+// --- r7: TBS-SCHEDULER-ROOT — helper scripts get the same resolved control dir as the readers ---
+{
+  const h = bridgeHome({ AGENTHOP_BRIDGE_HOME: "/tmp/override-root" }, "/Users/u");
+  const e = bridgeScriptEnv({ PATH: "/bin" }, h);
+  t("scheduler root: explicit override reaches the helper env", e.AGENTHOP_TERN_PANES === bridgeDir("/tmp/override-root"));
+  t("scheduler root: other env kept", e.PATH === "/bin");
+  t("scheduler root: default = OS home control dir", bridgeScriptEnv({}, bridgeHome({ AH_HOME: "/tmp/ah" }, "/Users/u")).AGENTHOP_TERN_PANES === "/Users/u/.agenthop/tern-panes");
 }
 
 // --- UNKNOWN: tern does not answer ⇒ zero further actions, exactly one log line, never a reload ---
