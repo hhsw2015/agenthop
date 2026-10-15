@@ -99,7 +99,22 @@ cat >"$T/ps" <<'P'
 6102 5102 /usr/local/bin/node /opt/Tern/agents/codex/node_modules/@agentclientprotocol/codex-acp/dist/index.js
 6103 6102 /usr/local/bin/codex app-server
 P
-export RESTORE_PENDING_DIR="$T/pending" PRESENCE_DIR="$T/presence" RESTORE_WAIT_S=1 SEAT_SHELL_CMD="$T/seatshell"
+export AH_HOME="$T/h"; PRES="$T/h/.agenthop/presence"
+export RESTORE_PENDING_DIR="$T/pending" RESTORE_WAIT_S=1 SEAT_SHELL_CMD="$T/seatshell"
+# the REAL presence writer (scripts/seat-presence.ts set), fed the same fake ps table restore's --check reads; exact argv per pid
+# is that row's tokens (exe = argv[0]), which is what the kernel would report for these fixtures
+REPO_ROOT="$HERE/../.."
+cat >"$T/seatpresence" <<SP
+#!/usr/bin/env bash
+python3 -I -c 'import json,sys
+m={}
+for l in open(sys.argv[1]):
+    p=l.split()
+    if len(p)>=3: m[p[0]]={"exe":p[2],"argv":p[2:]}
+print(json.dumps(m))' "\$RESTORE_PS" >"$T/argv.json"
+SEAT_PRESENCE_PS="\$RESTORE_PS" SEAT_PRESENCE_ARGV="$T/argv.json" exec "$REPO_ROOT/node_modules/.bin/tsx" "$REPO_ROOT/scripts/seat-presence.ts" "\$@"
+SP
+chmod +x "$T/seatpresence"; export SEAT_PRESENCE_CMD="$T/seatpresence"
 printf '#!/usr/bin/env bash\necho "$@" >>"%s/seatshell.log"\n' "$T" >"$T/seatshell"; chmod +x "$T/seatshell"
 export TERN_BIN="$T/tern" FAKE_STATE="$T/state.json" FAKE_LOG="$T/log" CLAUDE_JSON="$T/claude.json" RESTORE_PS="$T/ps"
 run() { python3 "$PY" "$T/roster.json" "$@" >"$T/out" 2>&1; echo $?; }
@@ -116,17 +131,17 @@ ck "cold: tabs renamed to roles" "3" "$(grep -c '^rename ' "$T/log")"
 
 ck "seat-shell: set called on cold run with tern+pid" "1" "$(grep -c '^set aaaa1111 tern 7100$' "$T/seatshell.log")"
 ck "seat-shell: one set per seat" "3" "$(wc -l <"$T/seatshell.log" | tr -d ' ')"
-ck "presence: Manager -> its own claude pid" "7100" "$(head -1 "$T/presence/aaaa1111.pid")"
-ck "presence: Infra Dev -> its own claude pid" "7101" "$(head -1 "$T/presence/bbbb2222.pid")"
-ck "presence: codex -> adapter child pid" "6102" "$(head -1 "$T/presence/cccc3333.pid")"
-ck "presence: no leftover temp" "0" "$(find "$T/presence" -name '*.tmp-*' | wc -l | tr -d ' ')"
+ck "presence: Manager -> its own claude pid" "7100" "$(head -1 "$PRES/aaaa1111.pid")"
+ck "presence: Infra Dev -> its own claude pid" "7101" "$(head -1 "$PRES/bbbb2222.pid")"
+ck "presence: codex -> adapter child pid" "6102" "$(head -1 "$PRES/cccc3333.pid")"
+ck "presence: no leftover temp" "0" "$(find "$PRES" -name '*.tmp-*' | wc -l | tr -d ' ')"
 
 # --- presence SWAPPED (live pids, wrong seats) is detected by --check and fixed by a run ---
-printf '7101' >"$T/presence/aaaa1111.pid"; printf '7100' >"$T/presence/bbbb2222.pid"
+printf '7101' >"$PRES/aaaa1111.pid"; printf '7100' >"$PRES/bbbb2222.pid"
 rc=$(run --check); ck "swap: --check exit 1" "1" "$rc"; ck "swap: --check names both" "2" "$(grep -c 'presence pid' "$T/out")"
-ck "swap: --check does not write" "7101" "$(head -1 "$T/presence/aaaa1111.pid")"
+ck "swap: --check does not write" "7101" "$(head -1 "$PRES/aaaa1111.pid")"
 rc=$(run); ck "swap: run fixes, exit 0" "0" "$rc"
-ck "swap: Manager corrected" "7100" "$(head -1 "$T/presence/aaaa1111.pid")"; ck "swap: Infra corrected" "7101" "$(head -1 "$T/presence/bbbb2222.pid")"
+ck "swap: Manager corrected" "7100" "$(head -1 "$PRES/aaaa1111.pid")"; ck "swap: Infra corrected" "7101" "$(head -1 "$PRES/bbbb2222.pid")"
 
 : >"$T/seatshell.log"; run --check >/dev/null
 ck "seat-shell: --check does not register" "0" "$(wc -l <"$T/seatshell.log" | tr -d ' ')"
@@ -168,7 +183,7 @@ ck "codex: suffixed sid is NOT reported (P3 TR-CONFLICT-DOC)" "1" "$(grep -c 'co
 echo '{}' >"$T/bad.json"; rc=$(python3 "$PY" "$T/bad.json" >/dev/null 2>&1; echo $?); ck "bad roster: exit 2" "2" "$rc"
 
 # ===== r2: review findings =====
-fresh() { rm -f "$FAKE_STATE"; : >"$T/log"; rm -rf "$T/presence" "$T/pending"; }
+fresh() { rm -f "$FAKE_STATE"; : >"$T/log"; rm -rf "$PRES" "$T/pending"; }
 seed() { python3 - "$FAKE_STATE" "$1" "$2" <<'PY2'
 import json,sys
 st,tab,cmd,bid=sys.argv[1],sys.argv[2] or None,sys.argv[3],100
@@ -269,8 +284,8 @@ printf '{"session":"agenthop","seats":[{"role":"Chief Review","tool":"codex","si
 seed "Chief Review" "tern acp codex --resume cccc3333"
 rc=$(RESTORE_PS="$T/ps-codex" python3 "$PY" "$T/cx.json" >"$T/out" 2>&1; echo $?)
 ck "presence: tail -f codex.log is not the adapter => exit 1" "1" "$rc"
-ck "presence: not found reported" "1" "$(grep -c 'agent pid not found' "$T/out")"
-ck "presence: nothing written" "0" "$(ls "$T/presence" 2>/dev/null | wc -l | tr -d ' ')"
+ck "presence: not found reported (by the one writer)" "1" "$(grep -c 'seat-presence set rc=1: .*no unique codex agent' "$T/out")"
+ck "presence: nothing written" "0" "$(ls "$PRES" 2>/dev/null | wc -l | tr -d ' ')"
 
 # TR-CODEX-HINT: positional `codex resume SID`
 : >"$T/ps"; echo "200 1 /usr/local/bin/codex resume cccc3333" >>"$T/ps"; fresh; run --check >/dev/null
@@ -367,35 +382,39 @@ cat >"$T/ps" <<'P'
 6102 5102 /usr/local/bin/node /opt/Tern/agents/codex/node_modules/@agentclientprotocol/codex-acp/dist/index.js
 P
 fresh; run >/dev/null
-ck "presence r6: .pid is exactly one line (what every reader parses)" "1" "$(wc -l <"$T/presence/aaaa1111.pid" | tr -d ' ' | sed 's/^0$/1/')"
-ck "presence r6: .pid content is the bare agent pid" "7100" "$(cat "$T/presence/aaaa1111.pid")"
-ck "presence r6: readers' Number(trim(file)) parses it" "7100" "$(python3 -c 'import sys;print(int(open(sys.argv[1]).read().strip()))' "$T/presence/aaaa1111.pid")"
-ck "presence r6: hook's kill -0 \"\$(cat)\" form works" "0" "$(kill -0 "$(cat "$T/presence/aaaa1111.pid")" 2>/dev/null; [ "$(cat "$T/presence/aaaa1111.pid")" = 7100 ] && echo 0 || echo 1)"
-ck "presence r6: sidecar .origin says origin=agent" "1" "$(grep -c '^origin=agent ts=[0-9]*$' "$T/presence/aaaa1111.origin")"
-ck "presence r6: no temp left" "0" "$(find "$T/presence" -name '*.tmp-*' | wc -l | tr -d ' ')"
-# a live bus record (hook: .pid only, no sidecar) with a different pid: --check WARNs, does not FAIL; a run replaces it
-printf '%s' "$$" >"$T/presence/aaaa1111.pid"; rm -f "$T/presence/aaaa1111.origin"
+ck "presence r6: .pid is exactly one line (what every reader parses)" "1" "$(wc -l <"$PRES/aaaa1111.pid" | tr -d ' ' | sed 's/^0$/1/')"
+ck "presence r6: .pid content is the bare agent pid" "7100" "$(cat "$PRES/aaaa1111.pid")"
+ck "presence r6: readers' Number(trim(file)) parses it" "7100" "$(python3 -c 'import sys;print(int(open(sys.argv[1]).read().strip()))' "$PRES/aaaa1111.pid")"
+ck "presence r6: hook's kill -0 \"\$(cat)\" form works" "0" "$(kill -0 "$(cat "$PRES/aaaa1111.pid")" 2>/dev/null; [ "$(cat "$PRES/aaaa1111.pid")" = 7100 ] && echo 0 || echo 1)"
+ck "presence r6: sidecar .origin says origin=agent" "1" "$(grep -c '^origin=agent ts=[0-9]*$' "$PRES/aaaa1111.origin")"
+ck "presence r6: no temp left" "0" "$(find "$PRES" -name '*.tmp-*' | wc -l | tr -d ' ')"
+# a live bus record (hook: .pid only, no sidecar) with a different pid: --check WARNs, does not FAIL; a run replaces it.
+# The "bus" pid is a sleep child this test owns (alive for the whole case, killed after) — not $$, whose liveness the checked
+# process sees through a different parent and whose value can collide with a fixture pid.
+sleep 120 & BUSPID=$!
+printf '%s' "$BUSPID" >"$PRES/aaaa1111.pid"; rm -f "$PRES/aaaa1111.origin"
 rc=$(run --check); ck "presence r6: live bus pid (no sidecar) => --check exit 0" "0" "$rc"
 ck "presence r6: ... reported as WARN" "1" "$(grep -c '^WARN: Manager presence pid' "$T/out")"
-printf 'origin=bus ts=1\n' >"$T/presence/aaaa1111.origin"
+printf 'origin=bus ts=1\n' >"$PRES/aaaa1111.origin"
 rc=$(run --check); ck "presence r6: live pid with origin=bus sidecar => WARN, exit 0" "0" "$rc"
 run >/dev/null
-ck "presence r6: a run replaces the bus pid with the agent pid" "7100" "$(cat "$T/presence/aaaa1111.pid")"
-ck "presence r6: ... and the sidecar says origin=agent" "1" "$(grep -c origin=agent "$T/presence/aaaa1111.origin")"
+ck "presence r6: a run replaces the bus pid with the agent pid" "7100" "$(cat "$PRES/aaaa1111.pid")"
+kill "$BUSPID" 2>/dev/null; wait "$BUSPID" 2>/dev/null
+ck "presence r6: ... and the sidecar says origin=agent" "1" "$(grep -c origin=agent "$PRES/aaaa1111.origin")"
 # a DEAD bus pid is not excused
-printf '999999' >"$T/presence/aaaa1111.pid"; printf 'origin=bus ts=1\n' >"$T/presence/aaaa1111.origin"
+printf '999999' >"$PRES/aaaa1111.pid"; printf 'origin=bus ts=1\n' >"$PRES/aaaa1111.origin"
 rc=$(run --check); ck "presence r6: dead bus pid => --check exit 1" "1" "$rc"
 # right pid but no sidecar (old format): ok, noted
-printf '7100' >"$T/presence/aaaa1111.pid"; rm -f "$T/presence/aaaa1111.origin"
+printf '7100' >"$PRES/aaaa1111.pid"; rm -f "$PRES/aaaa1111.origin"
 rc=$(run --check); ck "presence r6: right pid, no sidecar => --check exit 0" "0" "$rc"
 ck "presence r6: ... noted" "1" "$(grep -c 'ok pid 7100 (origin bus/none)' "$T/out")"
 # a wrong pid with an origin=agent sidecar is still a FAIL (the label is not trusted over the pid)
-printf '999998' >"$T/presence/aaaa1111.pid"; printf 'origin=agent ts=1\n' >"$T/presence/aaaa1111.origin"
+printf '999998' >"$PRES/aaaa1111.pid"; printf 'origin=agent ts=1\n' >"$PRES/aaaa1111.origin"
 rc=$(run --check); ck "presence r6: wrong pid labelled origin=agent => FAIL" "1" "$rc"
 # write order: .origin before .pid (a .pid write failure must leave the new origin, never a new pid without its origin)
-fresh; mkdir -p "$T/presence"; printf '%s' "$$" >"$T/presence/aaaa1111.pid"; chmod 444 "$T/presence/aaaa1111.pid"; chmod 555 "$T/presence"
-run >/dev/null 2>&1; chmod 755 "$T/presence"; chmod 644 "$T/presence/aaaa1111.pid"
-ck "presence r6 order: dir not writable => .pid untouched" "$$" "$(cat "$T/presence/aaaa1111.pid")"
+fresh; mkdir -p "$PRES"; printf '%s' "$$" >"$PRES/aaaa1111.pid"; chmod 444 "$PRES/aaaa1111.pid"; chmod 555 "$PRES"
+run >/dev/null 2>&1; chmod 755 "$PRES"; chmod 644 "$PRES/aaaa1111.pid"
+ck "presence r6 order: dir not writable => .pid untouched" "$$" "$(cat "$PRES/aaaa1111.pid")"
 
 # ===== r8 =====
 # TR-PENDING-IDENTITY: a block we started, whose identity changes to another seat while we wait => never renamed, journal kept
@@ -496,30 +515,46 @@ const t0 = Date.now(); while (!existsSync(dir + "/release") && Date.now() - t0 <
 releaseHolderLock(site, tok);
 TS
 # (a) a TS writer (e.g. SessionEnd) holds the lock => restore publishes nothing, reports it, exit 1
-fresh; mkdir -p "$T/presence"; printf '%s' "$$" >"$T/presence/aaaa1111.pid"; printf 'origin=bus ts=1\n' >"$T/presence/aaaa1111.origin"
-rm -f "$T/presence/held" "$T/presence/release"; "$TSX" "$T/hold.mts" "$T/presence" aaaa1111 hold & HP=$!
-for _ in $(seq 100); do [ -e "$T/presence/held" ] && break; sleep 0.05; done
-rc=$(run1); touch "$T/presence/release"; wait $HP
+fresh; mkdir -p "$PRES"; printf '%s' "$$" >"$PRES/aaaa1111.pid"; printf 'origin=bus ts=1\n' >"$PRES/aaaa1111.origin"
+rm -f "$PRES/held" "$PRES/release"; "$TSX" "$T/hold.mts" "$PRES" aaaa1111 hold & HP=$!
+for _ in $(seq 100); do [ -e "$PRES/held" ] && break; sleep 0.05; done
+rc=$(run1); touch "$PRES/release"; wait $HP
 ck "lock: TS holder present => restore exit 1" "1" "$rc"
-ck "lock: names the lock" "1" "$(grep -c 'presence lock: .* not written' "$T/out")"
-ck "lock: .pid untouched under a foreign holder" "$$" "$(cat "$T/presence/aaaa1111.pid")"
-ck "lock: .origin untouched under a foreign holder" "origin=bus ts=1" "$(cat "$T/presence/aaaa1111.origin")"
+ck "lock: refusal comes from the shared writer" "1" "$(grep -c 'seat-presence set rc=1: .*presence lock busy' "$T/out")"
+ck "lock: .pid untouched under a foreign holder" "$$" "$(cat "$PRES/aaaa1111.pid")"
+ck "lock: .origin untouched under a foreign holder" "origin=bus ts=1" "$(cat "$PRES/aaaa1111.origin")"
 # (b) once released, the same run writes (positive control) and leaves no lock artifacts
-rm -f "$T/presence/held" "$T/presence/release"; rc=$(run1)
-ck "lock: after release restore writes the agent pid" "7100" "$(cat "$T/presence/aaaa1111.pid")"
-ck "lock: no lock dir / hold-intent left" "0" "$(ls -a "$T/presence" | grep -c 'lockd')"
-# (c) while restore holds it, the TS acquirer contends (same artifacts, both directions)
-cat >"$T/pyhold.py" <<PY
-import importlib.util, os, subprocess, sys; sys.dont_write_bytecode = True
-os.environ["PRESENCE_DIR"] = sys.argv[1]
-spec = importlib.util.spec_from_file_location("tr", "$PY"); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-tok = m.presence_lock("aaaa1111")
-r = subprocess.run(["$TSX", "$T/hold.mts", sys.argv[1], "aaaa1111", "try"], capture_output=True, text=True).stdout.strip()
-m.presence_unlock("aaaa1111", tok)
-r2 = subprocess.run(["$TSX", "$T/hold.mts", sys.argv[1], "aaaa1111", "try"], capture_output=True, text=True).stdout.strip()
-print(r, r2)
-PY
-ck "lock: TS contends while restore holds, acquires after" "contended acquired" "$(python3 -I "$T/pyhold.py" "$T/presence")"
+rm -f "$PRES/held" "$PRES/release"; rc=$(run1)
+ck "lock: after release restore writes the agent pid" "7100" "$(cat "$PRES/aaaa1111.pid")"
+ck "lock: no lock dir / hold-intent left" "0" "$(ls -a "$PRES" | grep -c 'lockd')"
+# (c) r12: restore has no presence writer of its own — every write is the TS one (scripts/seat-presence.ts set)
+SRC=$(python3 -c 'import re,sys;s=open(sys.argv[1]).read();print(re.sub(r"#.*","",s))' "$PY")
+# the only file writes left are the start journal (pending_write); none may touch PRESENCE_DIR
+ck "one writer: every file write in restore is the start journal" "3" "$(printf '%s' "$SRC" | grep -cE 'os\.replace|O_CREAT|open\([^)]*,[[:space:]]*\"[wax]')"
+ck "one writer: those writes live only in pending_write" "1" "$(python3 -c 'import ast,sys
+t=ast.parse(open(sys.argv[1]).read()); w=set()
+for f in ast.walk(t):
+    if isinstance(f,ast.FunctionDef):
+        for n in ast.walk(f):
+            if isinstance(n,ast.Call) and ((getattr(n.func,"attr","")=="replace" and getattr(n.func.value,"id","")=="os") or (getattr(n.func,"id","")=="open" and len(n.args)>1)): w.add(f.name)
+print(len(w)) if w=={"pending_write"} else print(sorted(w))' "$PY")"
+ck "one writer: restore code has no lock of its own" "0" "$(printf '%s' "$SRC" | grep -cE 'lockd|presence_lock')"
+fresh; : >"$T/sp.log"; SEAT_PRESENCE_CMD="$T/splog" ; printf '#!/usr/bin/env bash\necho "$*" >>"%s/sp.log"\nexec "%s/seatpresence" "$@"\n' "$T" "$T" >"$T/splog"; chmod +x "$T/splog"
+SEAT_PRESENCE_CMD="$T/splog" run1 >/dev/null
+ck "one writer: a run calls seat-presence set <sid> <block> <tool>" "1" "$(grep -c '^set aaaa1111 100 claude$' "$T/sp.log")"
+: >"$T/sp.log"; SEAT_PRESENCE_CMD="$T/splog" run1 --check >/dev/null
+ck "one writer: --check never calls it" "0" "$(wc -l <"$T/sp.log" | tr -d ' ')"
+# the writer's resolved pid is the truth for the seat-shell registration (not restore's own ps view)
+printf '#!/usr/bin/env bash\necho '"'"'{"state":"wrote","pid":424242,"was":null}'"'"'\n' >"$T/sp424"; chmod +x "$T/sp424"
+fresh; : >"$T/seatshell.log"; SEAT_PRESENCE_CMD="$T/sp424" run1 >/dev/null
+ck "one writer: seat-shell registers the pid the writer resolved" "1" "$(grep -c '^set aaaa1111 tern 424242$' "$T/seatshell.log")"
+# a refusal or an unparseable answer is a FAIL and registers nothing
+printf '#!/usr/bin/env bash\necho '"'"'{"state":"refused","reason":"presence lock busy"}'"'"'\nexit 1\n' >"$T/spno"; chmod +x "$T/spno"
+fresh; : >"$T/seatshell.log"; rc=$(SEAT_PRESENCE_CMD="$T/spno" run1)
+ck "one writer: refused => exit 1, reason shown, no seat-shell set" "1 1 0" "$rc $(grep -c 'seat-presence set rc=1: presence lock busy' "$T/out") $(wc -l <"$T/seatshell.log" | tr -d ' ')"
+printf '#!/usr/bin/env bash\necho garbage\n' >"$T/spjunk"; chmod +x "$T/spjunk"
+fresh; : >"$T/seatshell.log"; rc=$(SEAT_PRESENCE_CMD="$T/spjunk" run1)
+ck "one writer: exit 0 with no JSON is not success" "1 0" "$rc $(wc -l <"$T/seatshell.log" | tr -d ' ')"
 
 # ===== r11 =====
 # TR-SV-CONTINUATION-COMMENT: sh removes backslash-newline BEFORE comments; parse must match real /bin/sh argv on every input
@@ -560,6 +595,33 @@ ck "continuation: its tab name is untouched" "Other Role" "$(python3 -c 'import 
 fresh; seed Manager "tern acp claude --resume aaaa1111 --model m1 \\
 # --mode bypassPermissions"; run1 --check >/dev/null
 ck "continuation: comment-only --mode => FAIL mode None" "1" "$(grep -c "FAIL: Manager: mode None" "$T/out")"
+
+# ===== r13 =====
+# TR-SV-WRITER-RESPONSE: the writer's answer is exactly one non-empty line holding one JSON object; anything else is a FAIL, no registration
+mkw() { printf '#!/usr/bin/env bash\n%s\n' "$2" >"$T/$1"; chmod +x "$T/$1"; }
+mkw sp2rec "echo '{\"state\":\"refused\",\"reason\":\"presence lock busy\"}'; echo '{\"state\":\"wrote\",\"pid\":424242,\"was\":null}'"
+mkw splog1 "echo 'note: resolving'; echo '{\"state\":\"wrote\",\"pid\":424242,\"was\":null}'"
+mkw spblank "echo; echo '{\"state\":\"wrote\",\"pid\":424242,\"was\":null}'; echo"
+mkw sparr "echo '[{\"state\":\"wrote\",\"pid\":424242}]'"
+for w in sp2rec splog1 sparr; do
+  fresh; : >"$T/seatshell.log"; rc=$(SEAT_PRESENCE_CMD="$T/$w" run1)
+  ck "writer response $w: exit 1, nothing registered" "1 0" "$rc $(wc -l <"$T/seatshell.log" | tr -d ' ')"
+done
+fresh; : >"$T/seatshell.log"; SEAT_PRESENCE_CMD="$T/spblank" run1 >/dev/null
+ck "writer response: blank lines around one record are fine (positive)" "1" "$(grep -c '^set aaaa1111 tern 424242$' "$T/seatshell.log")"
+# TR-SV-HOME-REGISTRATION: both helpers get the SAME normalized home (absolute, ~ expanded) — checked with the REAL seat-shell.ts
+REAL_SS="$REPO_ROOT/node_modules/.bin/tsx $REPO_ROOT/scripts/seat-shell.ts"
+# the tilde form needs a root under $HOME: a private dir there, removed at the end of this case
+HT="$(mktemp -d "$HOME/.tern-restore-test.XXXXXX")"
+for form in abs tilde; do
+  fresh
+  if [ $form = abs ]; then R="$T/fakehome"; H="$R"; else R="$HT/fakehome"; H="~/${R#$HOME/}"; fi
+  mkdir -p "$R"; rm -rf "$R/.agenthop" "$T/~"
+  rc=$(cd "$T" && AH_HOME="$H" SEAT_SHELL_CMD="$REAL_SS" python3 "$PY" "$T/one.json" >"$T/out" 2>&1; echo $?)
+  ck "home $form: presence and seat-shell under the same root" "1 1" "$(ls "$R/.agenthop/presence/aaaa1111.pid" 2>/dev/null | wc -l | tr -d ' ') $(ls "$R/.agenthop/swarm/seat-shell/aaaa1111.json" 2>/dev/null | wc -l | tr -d ' ')"
+  ck "home $form: nothing written under a literal ./~ in cwd" "0" "$(ls -d "$T/~" 2>/dev/null | wc -l | tr -d ' ')"
+done
+rm -rf "$HT"
 
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
