@@ -8,7 +8,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, chmodSync } from "n
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  ternPaneInfoForSession, ternInjectCommands, ternSpawnable, selfShell, shellWords, paneProgramArgv, classifyTernInspect,
+  ternPaneInfoForSession, ternInjectCommands, ternSpawnable, selfShell, shellWords, shellTokens, paneProgramArgv, classifyTernInspect,
   seatShellFile, clearSeatShell, validSeatSid,
   readSeatShell, writeSeatShell, seatShellDir, wakeRoute, claimAllowed, type Shell,
 } from "./tern-wake.js";
@@ -170,7 +170,7 @@ await (async () => {
 
 // ── IWT-SV-P2-1: real shell argument boundaries (quotes, comments, prompt text) ─────────────────────────────────────────
 {
-  const sh = (line: string) => ({ pane: 91, exited: null, working: false, args: ["-l", "-c", line] });
+  const sh = (line: string) => ({ pane: 91, exited: null, working: false, program: "/bin/zsh", args: ["-l", "-c", line] });
   ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --resume '${SID}' --mode bypassPermissions`)]), SID)?.paneId === "91", "argv: single-quoted --resume value is matched (sh delivers it as a plain arg)");
   ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --resume "${SID}"`)]), SID)?.paneId === "91", "argv: double-quoted --resume value is matched");
   ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --resume real-sid # --resume ${SID}`)]), SID) === null, "argv: --resume inside a # comment is NOT evidence");
@@ -180,7 +180,7 @@ await (async () => {
   ok(ternPaneInfoForSession(inspect([sh(`true; tern acp claude --resume ${SID}`)]), SID) === null, "argv: a tern acp AFTER a separator is a different command");
   ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --resume '${SID}`)]), SID) === null, "argv: unterminated quote ⇒ unparseable ⇒ not trusted");
   ok(JSON.stringify(shellWords(`a 'b c' "d \\"e\\"" f\\ g # h`)) === JSON.stringify(["a", "b c", 'd "e"', "f g"]), "shellWords: quotes / escapes / comment");
-  ok(JSON.stringify(paneProgramArgv({ args: ["/usr/bin/tern", "acp", "codex", "--resume", SID] })) === JSON.stringify(["/usr/bin/tern", "acp", "codex", "--resume", SID]), "argv: a direct (non -c) argv is used as-is");
+  ok(ternPaneInfoForSession(inspect([{ pane: 93, exited: null, working: false, program: "/usr/bin/tern", args: ["acp", "codex", "--resume", SID] }]), SID)?.paneId === "93", "argv: a direct (non -c) argv is used as-is");
 }
 // ── IWT-SV-P2-2: three-state classification of a tern inspect run ───────────────────────────────────────────────────────
 {
@@ -212,4 +212,33 @@ await (async () => {
   clearSeatShell(h, SID);
   ok(true, "clear: clearing an already-absent seat is a no-op (ENOENT = success)");
 }
+
+// ── IWT-SV-P2-1 r3: token PROVENANCE — quoted separators, newlines, non-shell `-c` (Second Voice r2 counterexamples) ─────────
+{
+  const zsh = (line: string, pane = 9) => ({ pane, exited: null, working: false, program: "/bin/zsh", args: ["-l", "-c", line] });
+  ok(ternPaneInfoForSession(inspect([zsh(`tern acp claude --prompt ';' --resume ${SID}`)]), SID)?.paneId === "9", "r3: a QUOTED ';' is an argument, not a separator — the real --resume after it is found");
+  ok(ternPaneInfoForSession(inspect([zsh(`tern acp claude --prompt safe\nprintf '%s' --resume ${SID}`)]), SID) === null, "r3: a NEWLINE ends the command — --resume on the next line is a different command");
+  const nonShell = { pane: 92, exited: null, working: false, program: "/x/bin/other-program", args: ["-c", `tern acp claude --resume ${SID}`] };
+  ok(ternPaneInfoForSession(inspect([nonShell]), SID) === null, "r3: a NON-shell program's -c argument is NOT unwrapped as a command");
+  ok(ternPaneInfoForSession(inspect([zsh(`tern acp claude --prompt safe # x\n`)]), SID) === null, "r3: comment then newline ⇒ no false match");
+  const t = shellTokens(`a ';' b; c\nd`)!;
+  ok(JSON.stringify(t) === JSON.stringify([{ kind: "word", text: "a" }, { kind: "word", text: ";" }, { kind: "word", text: "b" }, { kind: "sep" }, { kind: "word", text: "c" }, { kind: "sep" }, { kind: "word", text: "d" }]), "r3: tokens keep provenance (quoted ';' = word, unquoted ; and newline = sep)");
+}
+// ── IWT-R2-P2-1: two live blocks for one sid is AMBIGUOUS, not absent — classifier → router end-to-end ────────────────────
+await (async () => {
+  const zsh = (pane: number) => ({ pane, exited: null, working: false, program: "/bin/zsh", args: ["-l", "-c", `tern acp claude --resume ${SID}`] });
+  const two = classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([zsh(9), zsh(10)])) }, SID);
+  ok(two.kind === "unknown" && /ambiguous: 2 live Tern blocks/.test((two as { reason: string }).reason), "ambiguous: two live blocks ⇒ unknown with the block ids (NOT absent)");
+  const calls: string[] = [], notes: string[] = [];
+  const r = await resolveWakePane(["tern", "herdr"], ["tern", "herdr"], {
+    tern: async () => { calls.push("tern"); return two; },
+    herdr: async () => { calls.push("herdr"); return { kind: "found" as const, paneId: "old-herdr", state: "idle" as const }; },
+  }, SID, (n) => notes.push(n));
+  ok(r === null && JSON.stringify(calls) === '["tern"]', "ambiguous: routing STOPS — the herdr twin is never probed or woken");
+  ok(notes.some((n) => /ambiguous/.test(n)), "ambiguous: the reason is logged (not silent)");
+  const one = classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([zsh(9)])) }, SID);
+  ok(one.kind === "found", "control: exactly one Tern block ⇒ found (selected)");
+  const none = classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([])) }, SID);
+  ok(none.kind === "absent", "control: empty panes ⇒ absent (the genuine fallback is kept)");
+})();
 console.log(`\nall tern-wake selftests passed (${n})`);

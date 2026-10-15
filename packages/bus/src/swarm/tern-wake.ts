@@ -30,14 +30,19 @@ export function selfShell(env: NodeJS.ProcessEnv = process.env): Shell | null {
   return null;
 }
 
-/** Split a shell command line into words the way POSIX sh would — WITHOUT executing anything (IWT-SV-P2-1). Honors single quotes
- *  (literal), double quotes (with \\ escapes for \\ " $ ` and newline), backslash escapes outside quotes, and `#` comments (only at a
- *  word start). No expansion: `$X`, globs and command substitution are kept as literal text — we only need word BOUNDARIES. An
- *  unterminated quote ⇒ null (unparseable ⇒ not trusted as evidence). Pure. */
-export function shellWords(line: string): string[] | null {
-  const out: string[] = [];
+/** One token of a shell command line: a WORD (an argument, however it was quoted) or an unquoted command SEPARATOR. Keeping the
+ *  kind is the point (IWT-SV-P2-1 r3): a quoted ";" is an argument, never a separator. */
+export type ShellToken = { kind: "word"; text: string } | { kind: "sep" };
+
+/** Tokenize a shell command line the way POSIX sh would — WITHOUT executing anything. Honors single quotes (literal), double quotes
+ *  (\\ escapes for \\ " $ ` and newline), backslash escapes outside quotes, and `#` comments (only at a word start, to end of line).
+ *  UNQUOTED `;` `&` `|` and NEWLINE end a command (each emits a "sep"); inside quotes they are plain characters. No expansion:
+ *  `$X`, globs and command substitution stay literal — we only need word boundaries. An unterminated quote ⇒ null. Pure. */
+export function shellTokens(line: string): ShellToken[] | null {
+  const out: ShellToken[] = [];
   let cur = "", inWord = false, i = 0;
-  const end = () => { if (inWord) { out.push(cur); cur = ""; inWord = false; } };
+  const end = () => { if (inWord) { out.push({ kind: "word", text: cur }); cur = ""; inWord = false; } };
+  const sep = () => { end(); if (out.length && out[out.length - 1]!.kind !== "sep") out.push({ kind: "sep" }); };
   while (i < line.length) {
     const ch = line[i]!;
     if (ch === "'") { const j = line.indexOf("'", i + 1); if (j < 0) return null; cur += line.slice(i + 1, j); inWord = true; i = j + 1; continue; }
@@ -53,40 +58,55 @@ export function shellWords(line: string): string[] | null {
       continue;
     }
     if (ch === "\\") { if (i + 1 < line.length) { if (line[i + 1] !== "\n") { cur += line[i + 1]; inWord = true; } i += 2; } else i++; continue; }
-    if (ch === " " || ch === "\t" || ch === "\n") { end(); i++; continue; }
-    if (ch === "#" && !inWord) break; // a comment: everything after is not part of the command
-    if (ch === ";" || ch === "&" || ch === "|") { end(); out.push(ch); i++; continue; } // a command separator is its own word
+    if (ch === "\n") { sep(); i++; continue; }                        // an unquoted newline ends the command
+    if (ch === " " || ch === "\t") { end(); i++; continue; }
+    if (ch === "#" && !inWord) { const nl = line.indexOf("\n", i); if (nl < 0) break; i = nl; continue; } // comment runs to end of line
+    if (ch === ";" || ch === "&" || ch === "|") { sep(); i++; continue; } // an UNQUOTED separator
     cur += ch; inWord = true; i++;
   }
   end();
   return out;
 }
 
-/** The argv of the program a pane actually runs. A `sh/zsh/bash … -c '<line>'` wrapper (how Tern launches ACP blocks) is unwrapped
- *  by tokenizing <line>; only the FIRST simple command is returned (words after a ; & | belong to another command). A direct argv is
- *  used as-is. null when the command line cannot be tokenized. Pure. */
-export function paneProgramArgv(rec: { args?: unknown; command?: unknown }): string[] | null {
+/** Words only (back-compat helper for tests / callers that only need the split). null when unparseable. Pure. */
+export function shellWords(line: string): string[] | null {
+  const t = shellTokens(line);
+  return t ? t.flatMap((x) => (x.kind === "word" ? [x.text] : [])) : null;
+}
+
+/** The shells whose `-c <line>` we unwrap (Tern launches ACP blocks as `zsh -l -c '<line>'`). Any OTHER program's `-c` argument is
+ *  just an argument — never re-interpreted as a command (IWT-SV-P2-1 r3). */
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
+
+/** The argv of the program a pane actually runs (pure). A direct argv is used as-is (its elements are already arguments; nothing is
+ *  re-split). Only when the program is a known SHELL with `-c <line>` is <line> tokenized, and only its FIRST command (up to the first
+ *  unquoted separator or newline) is returned. null when the line cannot be tokenized. */
+export function paneProgramArgv(rec: { program?: unknown; args?: unknown; command?: unknown }): string[] | null {
   const args = Array.isArray(rec.args) ? rec.args.map(String) : null;
-  let words: string[] | null;
+  const prog = typeof rec.program === "string" ? rec.program.split("/").pop() ?? "" : "";
+  const firstCommand = (line: string): string[] | null => {
+    const toks = shellTokens(line);
+    if (!toks) return null;
+    const out: string[] = [];
+    for (const t of toks) { if (t.kind === "sep") break; out.push(t.text); }
+    return out;
+  };
   if (args) {
     const c = args.indexOf("-c");
-    words = c >= 0 && c + 1 < args.length ? shellWords(args[c + 1]!) : args;
-  } else {
-    words = shellWords(String(rec.command ?? ""));
+    if (SHELLS.has(prog) && c >= 0 && c + 1 < args.length) return firstCommand(args[c + 1]!);
+    return args.length && prog ? [String(rec.program), ...args] : args; // a real argv: never re-interpret its arguments
   }
-  if (!words) return null;
-  const sep = words.findIndex((w) => w === ";" || w === "&" || w === "|");
-  return sep >= 0 ? words.slice(0, sep) : words;
+  return firstCommand(String(rec.command ?? ""));
 }
 
 /** Resolve sid → {paneId, state} from `tern inspect --json` (pure). A pane matches when it has NOT exited and the program it runs
  *  (shell-tokenized, see paneProgramArgv) is `tern acp …` with `--resume <sid>` as a real argument — text inside a quoted prompt or a
  *  comment is NOT evidence. `working:true` ⇒ "working", `false` ⇒ "idle", absent ⇒ "unknown" (still never interrupted). More than
  *  one live pane for the sid ⇒ ambiguous ⇒ null (don't guess which one to type into; delivery is already durable). */
-export function ternPaneInfoForSession(inspectJson: unknown, sid: string): { paneId: string; state: AgentState } | null {
-  if (!sid) return null;
+export function ternPanesForSession(inspectJson: unknown, sid: string): { paneId: string; state: AgentState }[] {
+  if (!sid) return [];
   const panes = (inspectJson as { panes?: unknown })?.panes;
-  if (!Array.isArray(panes)) return null;
+  if (!Array.isArray(panes)) return [];
   const hits: { paneId: string; state: AgentState }[] = [];
   for (const p of panes) {
     const rec = p as { pane?: unknown; exited?: unknown; args?: unknown; command?: unknown; working?: unknown };
@@ -105,6 +125,13 @@ export function ternPaneInfoForSession(inspectJson: unknown, sid: string): { pan
     const state: AgentState = rec.working === true ? "working" : rec.working === false ? "idle" : "unknown";
     hits.push({ paneId: String(rec.pane), state });
   }
+  return hits;
+}
+
+/** The single live ACP block for the sid, or null when there is none OR more than one (don't guess which one to type into). Callers
+ *  that must tell those two apart use ternPanesForSession / classifyTernInspect. Pure. */
+export function ternPaneInfoForSession(inspectJson: unknown, sid: string): { paneId: string; state: AgentState } | null {
+  const hits = ternPanesForSession(inspectJson, sid);
   return hits.length === 1 ? hits[0]! : null;
 }
 
@@ -138,8 +165,14 @@ export function classifyTernInspect(run: { code: number; stdout: string; error?:
   let json: unknown;
   try { json = JSON.parse(run.stdout); } catch { return { kind: "unknown", reason: "tern inspect returned unparseable JSON" }; }
   if (!Array.isArray((json as { panes?: unknown })?.panes)) return { kind: "unknown", reason: "tern inspect JSON has no panes[]" };
-  const hit = ternPaneInfoForSession(json, sid);
-  return hit ? { kind: "found", ...hit } : { kind: "absent" };
+  const hits = ternPanesForSession(json, sid);
+  if (hits.length === 1) return { kind: "found", ...hits[0]! };
+  if (hits.length > 1) {
+    // IWT-R2-P2-1: several live blocks for one sid (a dual shell / a duplicate start) is NOT "Tern has no such seat". Report it as
+    // unknown so the router STOPS — it must never fall back to the herdr twin — and the reason names the colliding blocks.
+    return { kind: "unknown", reason: `ambiguous: ${hits.length} live Tern blocks for this sid (${hits.map((h) => h.paneId).join(", ")}) — not guessing a target` };
+  }
+  return { kind: "absent" };
 }
 
 export async function ternLookupLive(sid: string): Promise<TernLookup> {
