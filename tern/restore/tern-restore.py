@@ -241,10 +241,43 @@ def codex_conflicts(roster, table):
 # TR-ATTACH-RETRY: a started-but-not-yet-listed block is an obligation that must survive THIS process. Before `tern new tab` we
 # write pending/<sid>.json (exclusive create); after the start it records the block id. A later run that finds a pending
 # entry younger than PENDING_TTL_S does NOT start again: it waits for that block (or reports pending). The entry is removed
-# once the seat is seen live. An entry older than the TTL whose block never appeared is stale: reported, removed, and the
-# seat may start again (a start that never shows up in two minutes did not happen). An unreadable entry is UNKNOWN: no start.
+# once the seat is seen live. An unreadable entry is UNKNOWN: no start.
+# r4 (TR-ATTACH-RETRY): AGE NEVER ERASES A SUCCESSFUL START. Past the TTL the entry is only RE-CHECKED against the daemon by
+# its recorded block id (block_status): present and live ⇒ the obligation is discharged by attaching to it (no start); provably
+# gone (`tern process` answers "no block is called <id>", or the block is listed with live=false / exited set) ⇒ clear and
+# start once; anything unprovable (daemon unreachable, no recorded block id, an unexpected answer) ⇒ HOLD: no start, a line
+# for a human. The TTL only decides WHEN to look again, never what the answer is.
 class PendingUnknown(Exception):
     pass
+
+
+def block_status(bid):
+    """'live' | 'gone' | 'unknown' for a recorded block id, from the daemon (never from age).
+    live    = `tern process` resolves it and tern ls lists it live (or does not list it yet: the block exists in the daemon)
+    gone    = `tern process` says no such block, or tern ls lists it with live false / exited set
+    unknown = the daemon cannot be asked, or any other answer"""
+    if not isinstance(bid, int) or isinstance(bid, bool):
+        return "unknown"
+    r = subprocess.run([TERN, "process", str(bid), "--json"], capture_output=True, text=True)
+    if r.returncode != 0:
+        msg = (r.stderr or "") + (r.stdout or "")
+        return "gone" if f"no block is called `{bid}`" in msg else "unknown"
+    try:
+        child = json.loads(r.stdout).get("child")
+    except (ValueError, AttributeError):
+        return "unknown"
+    if not isinstance(child, dict) or not isinstance(child.get("pid"), int):
+        return "unknown"
+    try:
+        d = json.loads(tern("ls", "--json"))
+        for s_ in d.get("sessions", []):
+            for t in s_.get("tabs", []):
+                for b in t.get("blocks", []):
+                    if b.get("id") == bid:
+                        return "gone" if (b.get("live") is False or b.get("exited") is not None) else "live"
+    except (RuntimeError, ValueError, AttributeError, TypeError):
+        return "unknown"
+    return "live"  # the daemon resolves its process; the listing has not caught up yet
 
 
 def pending_path(sid):
@@ -310,7 +343,7 @@ def try_rename(bid, role, deadline):
 def restore(roster):
     session = roster["session"]
     inv = inventory(session)
-    report, pending = [], []
+    report, pending, held = [], [], []
     for seat in roster["seats"]:
         mine = seat_blocks(inv, seat)
         pend = pending_read(seat["sid"])  # PendingUnknown propagates: no guessing about an earlier start
@@ -333,7 +366,20 @@ def restore(roster):
                 if isinstance(bid, int) and not isinstance(bid, bool):
                     pending.append((seat, bid))
                 continue
-            report.append(f"stale: {seat['role']} earlier start (block {pend.get('block')}) never appeared in {age:.0f}s — starting")
+            bid = pend.get("block")
+            st = block_status(bid)
+            if st == "live":
+                report.append(f"pending: {seat['role']} earlier start (block {bid}, {age:.0f}s ago) is alive in the daemon — "
+                              f"attaching, not starting again")
+                pending.append((seat, bid))
+                continue
+            if st == "unknown":
+                report.append(f"HOLD: {seat['role']} earlier start (block {bid!r}, {age:.0f}s ago) cannot be proven alive or gone — "
+                              f"not starting. Check `tern ls --json` / `tern process {bid} --json`; delete {pending_path(seat['sid'])} "
+                              f"only if you are sure it is gone.")
+                held.append(seat["role"])
+                continue
+            report.append(f"gone: {seat['role']} earlier start (block {bid}) is provably gone — clearing and starting once")
             pending_clear(seat["sid"])
         try:
             pending_write(seat["sid"], {"at": time.time(), "role": seat["role"], "block": None}, create=True)
@@ -358,7 +404,7 @@ def restore(roster):
             report.append(f"pending: {seat['role']} block {bid} rename failed: {err} (rerun renames it)")
         else:
             pending_clear(seat["sid"])
-    return report
+    return report, held
 
 
 def verify(roster):
@@ -469,6 +515,7 @@ def main(argv):
         print(f"roster error: {path}: {e}", file=sys.stderr)
         return 2
     t0 = time.time()
+    held = []
     try:
         inventory(roster["session"])  # shape gate before ANY change
         _, lines = posture_check(roster)
@@ -477,7 +524,8 @@ def main(argv):
         for c in codex_conflicts(roster, ps_table()):
             print(c)
         if not check_only:
-            for l in restore(roster):
+            report, held = restore(roster)
+            for l in report:
                 print(l)
         fails = verify(roster)
         plines, pfails = presence(roster, write=not check_only)
@@ -490,6 +538,8 @@ def main(argv):
     for l in plines:
         print(l)
     fails += pfails
+    for role in held:
+        fails.append((role, "HOLD: an earlier start cannot be proven alive or gone (see HOLD line) — not started"))
     for role, msg in fails:
         print(f"FAIL: {role}: {msg}")
     n = len(roster["seats"])

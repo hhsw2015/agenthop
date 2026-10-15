@@ -41,6 +41,12 @@ elif a[:2] == ["new", "tab"]:
         "cwd": a[a.index("--cwd") + 1], "command": " ".join(shlex.quote(x) for x in cmd)}]})
     print(bid)
 elif a[0] == "process":
+    # mirrors real tern 0.8.3: unreachable daemon / unknown id both exit 1 with distinct messages
+    if os.path.exists(T + "/daemon-down"):
+        sys.stderr.write("tern process: no Tern is running (no session daemon on /x)\n"); sys.exit(1)
+    known = {str(b["id"]) for t in d["sessions"][0]["tabs"] for b in t["blocks"]} | set(d.get("daemon_only", []))
+    if a[1] not in known:
+        sys.stderr.write(f"tern process: no block is called `{a[1]}`\n"); sys.exit(1)
     print(json.dumps({"child": {"pid": 5000 + int(a[1])}}))
 elif a[0] == "rename":
     if os.path.exists(T + "/rename-fail-once"):
@@ -250,6 +256,48 @@ ck "presence: nothing written" "0" "$(ls "$T/presence" 2>/dev/null | wc -l | tr 
 ck "codex hint: positional 'codex resume SID' reported" "1" "$(grep -c 'codex-hint: Chief Review' "$T/out")"
 : >"$T/ps"; echo "201 1 /usr/local/bin/codex resume cccc3333-x" >>"$T/ps"; fresh; run --check >/dev/null
 ck "codex hint: positional suffixed sid not reported" "0" "$(grep -c 'codex-hint' "$T/out")"
+
+# ===== r4: TR-ATTACH-RETRY — age only triggers a RE-CHECK by block id; it never erases a successful start =====
+old_pending() { mkdir -p "$T/pending"; printf '{"at": 1, "role": "Manager", "block": %s}' "$1" >"$T/pending/aaaa1111.json"; }
+# (a) the reviewer's case: block 100 is alive in the daemon but not listed yet; the entry is >TTL old => attach, never block 101
+fresh; old_pending 100
+python3 - "$FAKE_STATE" <<'PY2'
+import json,sys; json.dump({"next":101,"sessions":[{"name":"agenthop","tabs":[]}],"daemon_only":["100"]},open(sys.argv[1],"w"))
+PY2
+run1 >/dev/null
+ck "expired+alive-unlisted: no second start" "0" "$(grep -c '^new tab' "$T/log")"
+ck "expired+alive-unlisted: reported as attaching" "1" "$(grep -c 'alive in the daemon' "$T/out")"
+ck "expired+alive-unlisted: obligation kept" "1" "$(ls "$T/pending" 2>/dev/null | grep -c aaaa1111.json)"
+# (b) expired and provably gone (daemon answers: no such block) => clear and start once
+fresh; old_pending 4242; run1 >/dev/null
+ck "expired+gone: exactly one start" "1" "$(grep -c '^new tab' "$T/log")"
+ck "expired+gone: reported as provably gone" "1" "$(grep -c 'provably gone' "$T/out")"
+# (c) expired and listed exited => gone => one start
+fresh; old_pending 100; seed Manager "tern acp claude --resume other --model m1"
+python3 - "$FAKE_STATE" <<'PY2'
+import json,sys; d=json.load(open(sys.argv[1])); b=d["sessions"][0]["tabs"][0]["blocks"][0]; b["live"]=False; json.dump(d,open(sys.argv[1],"w"))
+PY2
+run1 >/dev/null
+ck "expired+listed-not-live: one start" "1" "$(grep -c '^new tab' "$T/log")"
+# (d) expired and the daemon cannot be asked => HOLD: no start, a FAIL line, exit 1
+fresh; old_pending 100; touch "$T/daemon-down"
+rc=$(run1); rm -f "$T/daemon-down"
+ck "expired+daemon-down: no start" "0" "$(grep -c '^new tab' "$T/log")"
+ck "expired+daemon-down: HOLD printed for a human" "1" "$(grep -c '^HOLD: Manager' "$T/out")"
+ck "expired+daemon-down: FAIL line + exit 1" "1" "$rc"
+ck "expired+daemon-down: obligation kept" "1" "$(ls "$T/pending" 2>/dev/null | grep -c aaaa1111.json)"
+# (e) expired with no recorded block id (crash between claim and start) => unprovable => HOLD, no start
+fresh; old_pending null; run1 >/dev/null
+ck "expired+no-block-id: HOLD, no start" "0" "$(grep -c '^new tab' "$T/log")"
+ck "expired+no-block-id: HOLD printed" "1" "$(grep -c '^HOLD: Manager' "$T/out")"
+ck "expired+no-block-id: a FAIL line names the HOLD (not only 'not live')" "1" "$(grep -c '^FAIL: Manager: HOLD' "$T/out")"
+# (f) a bigger TTL is not the fix: with TTL 0 every entry is "expired" and the alive case still never starts twice
+fresh; old_pending 100
+python3 - "$FAKE_STATE" <<'PY2'
+import json,sys; json.dump({"next":101,"sessions":[{"name":"agenthop","tabs":[]}],"daemon_only":["100"]},open(sys.argv[1],"w"))
+PY2
+RESTORE_PENDING_TTL_S=0 run1 >/dev/null; RESTORE_PENDING_TTL_S=0 run1 >/dev/null
+ck "TTL=0, two runs, block alive unlisted: still zero starts" "0" "$(grep -c '^new tab' "$T/log")"
 
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
