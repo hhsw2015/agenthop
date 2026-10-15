@@ -4,10 +4,11 @@
  *   tern acp codex --resume <sid>   →  node …/@agentclientprotocol/codex-acp/dist/…  →  codex app-server
  * plus the writer's keep / replace / refuse rules.  Run: node_modules/.bin/tsx packages/bus/src/swarm/seat-presence.selftest.mts
  */
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { parsePs, resolveAgentPid, writePresence } from "./seat-presence.js";
+import { busMayWrite, parsePs, readOrigin, removeOwnPresence, resolveAgentPid, writeBusPresence, writePresence } from "./seat-presence.js";
+import { makeFileLiveness } from "./task-liveness.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 const A = "90b58f9c-5bac-4318-a996-2373c179d674";
@@ -63,5 +64,34 @@ chmodSync(f, 0o600);
 t("write: an existing UNREADABLE file ⇒ refused (FC-2), not overwritten", ro.state === "refused" && readFileSync(f, "utf8") === "4170")
 t("write: no temp files left behind", readdirSync(path.dirname(f)).every((n) => !n.includes(".tmp-")))
 void mkdirSync;
+// ---- #1053 r2: two writers, agent authoritative, origin in a SIDECAR (the .pid stays one number for every existing reader) ----
+{
+  const h = mkdtempSync(path.join(os.tmpdir(), "sp2-"));
+  const pf = path.join(h, ".agenthop", "presence", `${A}.pid`);
+  const live = new Set([100, 200, 300]);
+  const isAlive = (p: number) => live.has(p);
+  t("r2 bus: absent ⇒ the bus daemon writes its pid, origin bus", writeBusPresence(h, A, 100, isAlive) && readFileSync(pf, "utf8") === "100" && readOrigin(h, A) === "bus")
+  t("r2 agent over bus: the agent write replaces a live bus record, origin agent", writePresence(h, A, 200, isAlive).state === "wrote" && readFileSync(pf, "utf8") === "200" && readOrigin(h, A) === "agent")
+  t("r2 bus vs LIVE agent: the bus daemon does NOT overwrite", !writeBusPresence(h, A, 100, isAlive) && readFileSync(pf, "utf8") === "200")
+  t("r2 the .pid stays ONE number: task-liveness readPid still parses it", makeFileLiveness(h).readPid(A) === 200)
+  live.delete(200);
+  t("r2 bus vs DEAD agent: the bus daemon replaces it", writeBusPresence(h, A, 100, isAlive) && readFileSync(pf, "utf8") === "100" && readOrigin(h, A) === "bus")
+  live.add(200); writePresence(h, A, 200, isAlive);
+  t("r2 agent, same pid again: kept (origin already agent)", writePresence(h, A, 200, isAlive).state === "kept")
+  live.add(300);
+  t("r2 agent, a DIFFERENT live pid: replaced", writePresence(h, A, 300, isAlive).state === "wrote" && readFileSync(pf, "utf8") === "300")
+  removeOwnPresence(h, A, 100);
+  t("r2 shutdown: a bus daemon never deletes the agent's record", readFileSync(pf, "utf8") === "300")
+  writeFileSync(pf, "garbage");
+  t("r2 bus vs an unparseable record: not overwritten (FC-2)", !busMayWrite(h, A, 100, isAlive) && readFileSync(pf, "utf8") === "garbage")
+  writeFileSync(pf, "200"); writeFileSync(path.join(h, ".agenthop", "presence", `${A}.origin`), "origin=agent ts=1\n");
+  t("r2 a bus daemon whose own pid is recorded may refresh it even if the sidecar says agent", busMayWrite(h, A, 200, isAlive))
+  writeFileSync(pf, "100"); writeFileSync(path.join(h, ".agenthop", "presence", `${A}.origin`), "origin=bus ts=1\n");
+  removeOwnPresence(h, A, 100);
+  t("r2 shutdown: the bus daemon removes ITS record and its sidecar", !existsSync(pf) && readOrigin(h, A) === "unknown")
+  writeFileSync(pf, "200");
+  t("r2 legacy record (no sidecar) with a live foreign pid: bus may write (origin unknown is not agent)", busMayWrite(h, A, 100, isAlive))
+}
+
 
 console.log("all seat-presence selftests passed");

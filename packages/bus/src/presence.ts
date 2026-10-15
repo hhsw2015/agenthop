@@ -1,5 +1,9 @@
 import net from "node:net";
-import { rmSync, writeFileSync, utimesSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, utimesSync } from "node:fs";
+import { isValidSessionId } from "./send-fallback.js";
+import { pidAlive, removeOwnPresence, writeBusPresence } from "./swarm/seat-presence.js";
+
+const isPresenceSid = (sid: string): boolean => isValidSessionId(sid) && !sid.includes("/") && sid !== "." && sid !== "..";
 import { homedir } from "node:os";
 import path from "node:path";
 import { startBusCore, type BusCore, type BusCoreOptions } from "./core.js";
@@ -37,12 +41,14 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
   // this file to confirm the daemon is up in its own session before it exits (see presence-entry.ts). SessionEnd reads
   // it to stop us; we remove it on shutdown. We are already post-setsid here (the child runs after detached spawn).
   const pidFile = process.env.AGENTHOP_PID_FILE;
+  const pidSid = pidFile ? path.basename(pidFile).replace(/\.pid$/, "") : null;
+  const pidHome = pidFile ? path.dirname(path.dirname(path.dirname(pidFile))) : null; // <home>/.agenthop/presence/<sid>.pid
   if (pidFile) {
-    try {
-      writeFileSync(pidFile, String(process.pid));
-    } catch {
-      // best effort — the host-pid guard + SessionEnd are the other stops
-    }
+    // #1053 r2: origin "bus". Never replace a LIVE agent record written by the seat launcher (seat-presence). When we do not
+    // write, the bootstrap's handshake still sees the file exist (it is the agent's), so the entry returns promptly.
+    let wrote = false;
+    try { wrote = pidSid !== null && pidHome !== null && isPresenceSid(pidSid) && writeBusPresence(pidHome, pidSid, process.pid, pidAlive); } catch { /* below */ }
+    if (!wrote && !existsSync(pidFile)) { try { writeFileSync(pidFile, String(process.pid)); } catch { /* best effort */ } }
   }
   const home = opts.home ?? homedir();
   let sockServer: net.Server | null = null;
@@ -152,7 +158,14 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
   // Heartbeat the pid file's mtime (sentinel aux only — NOT ownership, which is the liveness socket), re-sync the sid defensively
   // (belt-and-suspenders should an identity change ever land without the callback), and (re)open the socket when we don't hold it.
   const keepAlive = setInterval(() => {
-    if (pidFile) { try { const t = new Date(); utimesSync(pidFile, t, t); } catch { /* best effort — the pid file may be gone on shutdown */ } }
+    // heartbeat only a record that is OURS (an agent record written by the seat launcher is the agent's, not this daemon's
+    // proof of life); if ours went missing and no live agent holds the slot, write it back (busMayWrite)
+    if (pidFile && pidSid !== null && pidHome !== null && isPresenceSid(pidSid)) {
+      try {
+        if (readFileSync(pidFile, "utf8").trim() === String(process.pid)) { const t = new Date(); utimesSync(pidFile, t, t); }
+        else writeBusPresence(pidHome, pidSid, process.pid, pidAlive);
+      } catch { writeBusPresence(pidHome, pidSid, process.pid, pidAlive); }
+    }
     if (!fixedSid) syncSidFor(core.self.stableId ?? core.self.id);
     openSock();
   }, PRESENCE_HEARTBEAT_SEC * 1000);
@@ -171,8 +184,8 @@ export function runPresence(opts: BusCoreOptions = {}): { core: BusCore; stop: (
     // start's probe-then-skip.
     if (sockServer) { try { sockServer.close(); } catch { /* best effort */ } sockServer = null; }
     // Remove our own pid file (the entry wrote it, the SessionEnd hook also removes it — harmless to do both).
-    const pidFile = process.env.AGENTHOP_PID_FILE;
-    if (pidFile) { try { rmSync(pidFile, { force: true }); } catch { /* best effort */ } }
+    // #1053 r2: only OUR record — a seat launcher's agent record outlives this daemon
+    if (pidFile && pidSid !== null && pidHome !== null && isPresenceSid(pidSid)) removeOwnPresence(pidHome, pidSid, process.pid);
     return core.close();
   };
   const shutdown = (code = 0): void => { void stop().finally(() => process.exit(code)); };

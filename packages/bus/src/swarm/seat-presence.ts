@@ -17,6 +17,13 @@ import { isValidSessionId } from "../send-fallback.js";
  *   writePresence    the caller passes the RESOLVED agent pid (never an arbitrary live pid). It must be alive. An existing file
  *                    with the same live pid is kept; a different pid is replaced (a wrong pid routes by another seat's liveness);
  *                    an existing file that cannot be read is refused, never overwritten (FC-2). O_EXCL temp + rename.
+ *
+ * #1053 r2 TWO WRITERS (coordinator ruling): the SessionStart hook's presence daemon writes ITS pid (origin "bus"); this module
+ * writes the AGENT pid (origin "agent"). Authority = agent. The origin lives in a SIDECAR presence/<sid>.origin
+ * (`origin=agent|bus ts=<epoch ms>`), NOT a second line in the .pid: every existing reader parses the WHOLE .pid as one number
+ * (task-liveness readPid, shell-succession readPidDetailed/pidFileIs, and the already-installed hook shell `kill -0 "$(cat …)"`),
+ * so a second line would turn every live seat into "no pid". Rules: an agent write may replace a bus record; a bus write never
+ * replaces a LIVE agent record (only fills an absent one or replaces a dead one) — busMayWrite.
  */
 
 export type PsRow = { pid: number; ppid: number; argv: string[] };
@@ -64,6 +71,57 @@ export function presenceFile(home: string, sid: string): string {
   return path.join(home, ".agenthop", "presence", `${sid}.pid`);
 }
 
+export type Origin = "agent" | "bus";
+export function originFile(home: string, sid: string): string { return presenceFile(home, sid).replace(/\.pid$/, ".origin"); }
+
+/** The recorded origin; "unknown" when the sidecar is absent (a pre-r2 writer — treated like "bus") or unreadable / malformed. */
+export function readOrigin(home: string, sid: string): Origin | "unknown" {
+  try {
+    const m = /^origin=(agent|bus) ts=\d+\s*$/.exec(readFileSync(originFile(home, sid), "utf8"));
+    return m ? (m[1] as Origin) : "unknown";
+  } catch { return "unknown"; }
+}
+
+function atomicWrite(f: string, body: string): void {
+  mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
+  const tmp = `${f}.tmp-${randomBytes(6).toString("hex")}`;
+  const fd = openSync(tmp, "wx", 0o600);
+  try { writeFileSync(fd, body); closeSync(fd); renameSync(tmp, f); }
+  catch (e) { try { closeSync(fd); } catch { /* closed */ } try { unlinkSync(tmp); } catch { /* own temp */ } throw e; }
+}
+
+/** May the BUS presence daemon (pid `self`) write presence/<sid>.pid? Only when there is no live AGENT record: absent, the recorded
+ *  pid is dead, it is our own pid, or the origin is not "agent". An unreadable .pid ⇒ false (FC-2: never overwrite what we
+ *  cannot read). Pure but for the reads. */
+export function busMayWrite(home: string, sid: string, self: number, alive: (pid: number) => boolean): boolean {
+  let raw: string;
+  try { raw = readFileSync(presenceFile(home, sid), "utf8").trim(); }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT"; }
+  const n = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(n)) return false;
+  if (n === self || !alive(n)) return true;
+  return readOrigin(home, sid) !== "agent";
+}
+
+/** The bus daemon's write (origin "bus"), honoring busMayWrite. Returns whether it wrote. Never throws. */
+export function writeBusPresence(home: string, sid: string, self: number, alive: (pid: number) => boolean): boolean {
+  try {
+    if (!busMayWrite(home, sid, self, alive)) return false;
+    atomicWrite(originFile(home, sid), `origin=bus ts=${Date.now()}\n`); // origin first, then the pid (coordinator ruling)
+    atomicWrite(presenceFile(home, sid), String(self));
+    return true;
+  } catch { return false; }
+}
+
+/** Remove presence/<sid>.pid (and its sidecar) only if it still records `self` — a shutdown must never delete an agent record. */
+export function removeOwnPresence(home: string, sid: string, self: number): void {
+  try {
+    if (readFileSync(presenceFile(home, sid), "utf8").trim() !== String(self)) return;
+    unlinkSync(presenceFile(home, sid));
+    try { if (readOrigin(home, sid) === "bus") unlinkSync(originFile(home, sid)); } catch { /* sidecar optional */ }
+  } catch { /* absent / unreadable: nothing of ours to remove */ }
+}
+
 export function writePresence(home: string, sid: string, pid: number, alive: (pid: number) => boolean): PresenceResult {
   let f: string;
   try { f = presenceFile(home, sid); } catch (e) { return { state: "refused", reason: (e as Error).message }; }
@@ -78,15 +136,13 @@ export function writePresence(home: string, sid: string, pid: number, alive: (pi
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") return { state: "refused", reason: `existing ${path.basename(f)} unreadable (${(e as Error).message}); not overwriting` };
   }
-  if (was === pid) return { state: "kept", pid, was };
+  if (was === pid && readOrigin(home, sid) === "agent") return { state: "kept", pid, was };
   try {
-    mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
-    const tmp = `${f}.tmp-${randomBytes(6).toString("hex")}`;
-    const fd = openSync(tmp, "wx", 0o600);
-    try { writeFileSync(fd, String(pid)); closeSync(fd); renameSync(tmp, f); }
-    catch (e) { try { closeSync(fd); } catch { /* closed */ } try { unlinkSync(tmp); } catch { /* own temp */ } throw e; }
+    // origin FIRST: a bus daemon that reads between the two writes sees "agent" and leaves the record alone
+    atomicWrite(originFile(home, sid), `origin=agent ts=${Date.now()}\n`);
+    if (was !== pid) atomicWrite(f, String(pid));
   } catch (e) { return { state: "refused", reason: `write failed: ${(e as Error).message}` }; }
-  return { state: "wrote", pid, was };
+  return { state: was === pid ? "kept" : "wrote", pid, was };
 }
 
 /** `kill -0`: alive on success or EPERM. */
