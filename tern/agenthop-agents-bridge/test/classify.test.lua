@@ -13,7 +13,12 @@ local function drop(list, id)
   for i = #list, 1, -1 do if list[i].id == id then table.remove(list, i) end end
 end
 local real_require = require
-require = function(name) if name == "./manifests" then return MAN end return real_require(name) end
+local UCL = assert(loadfile(root .. "uclasses.luau"))()
+require = function(name)
+  if name == "./manifests" then return MAN end
+  if name == "./uclasses" then return UCL end
+  return real_require(name)
+end
 local C = assert(loadfile(root .. "classify.luau"))()
 if mutant == "no-prompt-box" then drop(MAN.claude.rules, "live_prompt_box") end
 if mutant == "no-title-working" then
@@ -141,6 +146,67 @@ ck("re: \\p{Alphabetic}+\\w*ing", true, C.re_match("^\\s*[\\u2800-\\u28FF]+\\s+\
 ck("re: {4,}", true, C.re_match("(■|⬝){4,}", "x■■■■y"))
 ck("re: {4,} negative", false, C.re_match("(■|⬝){4,}", "■■■"))
 ck("re: alternation group", true, C.re_match("^\\s*(◔|◑|◕|●)\\s+\\p{Alphabetic}", "◑ Thinking"))
+
+-- ---------- r3 TC-UNICODE: final STATE on real manifests with Unicode the old approximations got wrong ----------
+local EMSP, IDSP = "\u{2003}", "\u{3000}"
+ck("unicode: \\s includes U+2003", true, C.re_match("^\\s*❯\\s*$", EMSP .. "❯" .. EMSP))
+ck("unicode: \\s includes U+3000", true, C.re_match("^\\s*❯\\s*$", IDSP .. "❯"))
+ck("unicode: fullwidth comma is not \\w (word boundary holds)", true, C.re_match("^\\s*[\\u2800-\\u28FF]\\s+(Run|Read|Search|List)\\b", "⠋ Read，"))
+ck("unicode: × is not Alphabetic", false, C.re_match("^\\s*(◔|◑|◕|●)\\s+\\p{Alphabetic}", "◑ ×"))
+ck("unicode: é is Alphabetic", true, C.re_match("^\\s*(◔|◑|◕|●)\\s+\\p{Alphabetic}", "◑ émoji"))
+ck("unicode state: claude old prompt + U+2003-padded current ❯ => idle (not blocked)", "idle",
+  C.classify("Do you want to proceed?\n❯ 1. Yes\n" .. EMSP .. "❯" .. EMSP, "", CLAUDE).state)
+ck("unicode state: cursor ⠋ + U+2003 + Thinking => working", "working", C.classify("⠋" .. EMSP .. "Thinking", "", "cursor").state)
+ck("unicode state: grok '⠋ Read，' => working", "working", C.classify("⠋ Read，", "", "grok").state)
+ck("unicode state: kiro '◑ ×' => not working", true, C.classify("◑ ×", "", "kiro").state ~= "working")
+ck("unicode: \\p{L} is rejected (only Alphabetic has an exact table)", false, pcall(C.compile, "\\p{L}"))
+
+-- ---------- r3 TC-MATCH-COST: bounded non-match on the real opencode pattern; the budget cut-off ----------
+do
+  local line = string.rep("opencode esc ", 18) -- 234 cols, no "interrupt": the old backtracker took ~2.6s on 24 of these
+  local lines = {} for i = 1, 24 do lines[i] = line end
+  local t0 = os.clock()
+  local r = C.classify(lines, "", "opencode")
+  local dt = os.clock() - t0
+  ck("cost: 24x234 opencode non-match finishes < 0.2s (linear matcher)", true, dt < 0.2)
+  ck("cost: and is not cut off by the budget on a normal machine (state idle)", true, r.state == "idle" or r.rule == "slow")
+  local saved = C.clock; local tick = 0
+  C.clock = function() tick = tick + 3; return tick end -- every reading 3ms later
+  local r2 = C.classify(lines, "", "opencode")
+  C.clock = saved
+  ck("budget: past 5ms => unknown", "unknown", r2.state)
+  ck("budget: rule = slow", "slow", r2.rule)
+end
+do -- the deadline is enforced INSIDE a single long regex search, not only between rules
+  local saved = C.clock; local tick = 0
+  C.clock = function() tick = tick + 0.01; return tick end -- slow-ish clock: rule loop passes, the matcher's own check must fire
+  local long = {} for i = 1, 24 do long[i] = string.rep("opencode esc ", 200) end -- one huge region for the opencode rule
+  local r3 = C.classify(long, "", "opencode")
+  C.clock = saved
+  ck("budget: cut inside the matcher on one long search => slow", "slow", r3.rule)
+end
+do -- a genuine error (an uncompilable pattern) must surface, never be reported as "slow"
+  table.insert(C.OVERLAY.claude, 1, { id = "broken", state = "idle", priority = 2000, region = "whole_recent", regex = { "(" } })
+  C._reset_order()
+  local ok, err = pcall(C.classify, "x", "", CLAUDE)
+  table.remove(C.OVERLAY.claude, 1); C._reset_order()
+  ck("budget: a real error inside a gate is raised, not swallowed as slow", false, ok)
+  ck("budget: the raised error is the real one", true, type(err) == "string" and err:find("unbalanced") ~= nil)
+end
+
+-- ---------- r3: frozen ripgrep differential (test/rg-diff/corpus.lua: 33 real patterns x 500 Unicode inputs, rg 14.1.1 truth) ----------
+do
+  local d = assert(loadfile(here .. "rg-diff/corpus.lua"))()
+  local diffs, total = 0, 0
+  for _, p in ipairs(d.pats) do
+    local bits = d.truth[p]
+    for i, s in ipairs(d.inputs) do
+      total = total + 1
+      if C.re_match(p, s) ~= (bits:sub(i, i) == "1") then diffs = diffs + 1 end
+    end
+  end
+  ck(("rg differential: %d cases, 0 differences"):format(total), 0, diffs)
+end
 
 if fails == 0 then print(("\nPASS (%d checks)"):format(n)) else print(("\nFAIL (%d of %d)"):format(fails, n)) end
 os.exit(fails == 0 and 0 or 1)

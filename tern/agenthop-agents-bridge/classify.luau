@@ -60,20 +60,25 @@ local function decode_all(s)
   return out
 end
 
-local function is_space(cp) return cp == 32 or (cp >= 9 and cp <= 13) or cp == 0xA0 end
-local function is_alpha(cp) -- ASCII letters + any non-ASCII codepoint counted as letter-ish except known symbol blocks
-  if (cp >= 65 and cp <= 90) or (cp >= 97 and cp <= 122) then return true end
-  if cp < 0xC0 then return false end
-  -- symbol / box / braille / geometric / dingbat / emoji blocks are NOT alphabetic
-  if (cp >= 0x2000 and cp <= 0x2BFF) or (cp >= 0x2E00 and cp <= 0x2E7F) or (cp >= 0x3000 and cp <= 0x303F)
-    or (cp >= 0x1F000 and cp <= 0x1FFFF) or (cp >= 0xFE00 and cp <= 0xFE0F) then return false end
-  return true
+-- TC-UNICODE: \s \w \d \p{Alphabetic} are the EXACT Rust regex crate classes (uclasses.luau, generated from ripgrep — the engine
+-- herdr uses), not approximations. Lookup = binary search over sorted flat {lo,hi,...} ranges.
+local U = require("./uclasses")
+local function in_ranges(r, cp)
+  local lo, hi = 1, #r // 2
+  while lo <= hi do
+    local mid = (lo + hi) // 2
+    local a, b = r[2 * mid - 1], r[2 * mid]
+    if cp < a then hi = mid - 1 elseif cp > b then lo = mid + 1 else return true end
+  end
+  return false
 end
-local function is_digit(cp) return cp >= 48 and cp <= 57 end
-local function is_word(cp) return is_alpha(cp) or is_digit(cp) or cp == 95 end
+local function is_space(cp) return in_ranges(U.space, cp) end
+local function is_alpha(cp) return in_ranges(U.alpha, cp) end
+local function is_digit(cp) return in_ranges(U.digit, cp) end
+local function is_word(cp) return in_ranges(U.word, cp) end
 local function lower_cp(cp) if cp >= 65 and cp <= 90 then return cp + 32 end return cp end
 
--- ---------------- a tiny backtracking regex (the subset herdr's manifests use) ----------------
+-- ---------------- regex parser (the subset herdr's manifests use) ----------------
 -- Supported: literals, ., ^, $, \s \S \w \d \b, \x{HHHH} \uHHHH, \p{Alphabetic}, escapes, [...] classes with ranges and the
 -- escapes above, groups (...) with | alternation, quantifiers * + ? {n,} {n} {n,m} (greedy), flags (?i) (?m) (?s) at the start.
 -- Unsupported syntax raises (a manifest that does not compile is an error, as in herdr).
@@ -118,7 +123,8 @@ local function parse(pat)
       while peek() ~= 125 do name[#name + 1] = string.char(eat()) end
       eat()
       name = table.concat(name)
-      if name == "Alphabetic" or name == "L" or name == "Letter" then return { t = "pred", f = is_alpha } end
+      -- only Alphabetic is used by the manifests and only Alphabetic has an exact table; \p{L} is a different set ⇒ unsupported
+      if name == "Alphabetic" then return { t = "pred", f = is_alpha } end
       error("unsupported \\p{" .. name .. "}")
     end
     if ch == "n" then return { t = "cp", v = 10 } end
@@ -225,69 +231,113 @@ local function class_match(node, cp, ci)
   return hit
 end
 
--- m(node, s, i, k): match node at index i of codepoint array s, then continuation k(j). Returns true on success.
-local function m(rx, node, s, i, k)
+-- ---------------- linear-time matcher (Pike VM; TC-MATCH-COST) ----------------
+-- The parsed AST is compiled to a small instruction list and run as a Thompson/Pike simulation: every input codepoint is visited
+-- once with a de-duplicated set of threads, so a failing search is O(len(text) x len(program)) — no backtracking, no exponential
+-- or polynomial blow-up on patterns like `(?i).*opencode.*esc (again to )?interrupt`. Unanchored search = a `.*?` prefix thread
+-- added at every position. Counted repetitions {n,m} are expanded at compile time (manifests use {4,} at most).
+local function emit(prog, ins) prog[#prog + 1] = ins; return #prog end
+local compile_node
+local function compile_rep(prog, node, flags)
+  local lo, hi = node.lo, node.hi
+  for _ = 1, lo do compile_node(prog, node.node, flags) end
+  if hi == math.huge then
+    local split = emit(prog, { op = "split" })
+    compile_node(prog, node.node, flags)
+    emit(prog, { op = "jmp", to = split })
+    prog[split].a, prog[split].b = split + 1, #prog + 1
+  else
+    local holes = {}
+    for _ = lo + 1, hi do
+      local split = emit(prog, { op = "split" })
+      prog[split].a = split + 1
+      holes[#holes + 1] = split
+      compile_node(prog, node.node, flags)
+    end
+    for _, h in ipairs(holes) do prog[h].b = #prog + 1 end
+  end
+end
+compile_node = function(prog, node, flags)
   local t = node.t
-  local f = rx.flags
-  if t == "seq" then
-    local items = node.items
-    local function step(idx, j)
-      if idx > #items then return k(j) end
-      return m(rx, items[idx], s, j, function(j2) return step(idx + 1, j2) end)
-    end
-    return step(1, i)
+  if t == "seq" then for _, it in ipairs(node.items) do compile_node(prog, it, flags) end
+  elseif t == "group" then compile_node(prog, node.node, flags)
   elseif t == "alt" then
-    for _, b in ipairs(node.branches) do if m(rx, b, s, i, k) then return true end end
-    return false
-  elseif t == "group" then
-    return m(rx, node.node, s, i, k)
-  elseif t == "rep" then
-    -- greedy: collect positions reachable by 0..hi repetitions, try the longest first
-    local positions = { i }
-    local cur = i
-    local count = 0
-    while count < node.hi do
-      local nextp
-      m(rx, node.node, s, cur, function(j) if j ~= cur then nextp = j; return true end return false end)
-      if nextp == nil then break end
-      count = count + 1
-      positions[#positions + 1] = nextp
-      cur = nextp
+    local jumps, n = {}, #node.branches
+    for i, b in ipairs(node.branches) do
+      if i < n then
+        local split = emit(prog, { op = "split" })
+        prog[split].a = split + 1
+        compile_node(prog, b, flags)
+        jumps[#jumps + 1] = emit(prog, { op = "jmp" })
+        prog[split].b = #prog + 1
+      else
+        compile_node(prog, b, flags)
+      end
     end
-    for idx = #positions, node.lo + 1, -1 do
-      if k(positions[idx]) then return true end
-    end
-    return false
-  elseif t == "cp" then
-    local c = s[i]
-    if c == nil then return false end
-    if c == node.v or (f.i and lower_cp(c) == lower_cp(node.v)) then return k(i + 1) end
-    return false
-  elseif t == "any" then
-    local c = s[i]
-    if c == nil or (c == 10 and not f.s) then return false end
-    return k(i + 1)
-  elseif t == "pred" then
-    local c = s[i]
-    if c == nil or not node.f(c) then return false end
-    return k(i + 1)
-  elseif t == "class" then
-    local c = s[i]
-    if c == nil or not class_match(node, c, f.i) then return false end
-    return k(i + 1)
-  elseif t == "bol" then
-    if i == 1 or (f.m and s[i - 1] == 10) then return k(i) end
-    return false
-  elseif t == "eol" then
-    if s[i] == nil or (f.m and s[i] == 10) then return k(i) end
-    return false
-  elseif t == "wordb" then
+    for _, j in ipairs(jumps) do prog[j].to = #prog + 1 end
+  elseif t == "rep" then compile_rep(prog, node, flags)
+  else emit(prog, { op = "char", node = node }) -- cp / any / pred / class
+    if t == "bol" or t == "eol" or t == "wordb" then prog[#prog].op = t end
+  end
+end
+
+local function char_ok(node, c, f)
+  local t = node.t
+  if t == "cp" then return c == node.v or (f.i and lower_cp(c) == lower_cp(node.v)) end
+  if t == "any" then return c ~= 10 or f.s end
+  if t == "pred" then return node.f(c) end
+  if t == "class" then return class_match(node, c, f.i) end
+  error("bad char node " .. tostring(t))
+end
+
+local function to_prog(rx)
+  if rx.prog then return rx.prog end
+  local prog = {}
+  compile_node(prog, rx.node, rx.flags)
+  emit(prog, { op = "match" })
+  rx.prog = prog
+  return prog
+end
+
+-- add thread pc to list at input index i (s[i] = next char), following splits/jumps/assertions; `seen` dedups per step
+local function addthread(prog, list, seen, pc, s, i, f)
+  if seen[pc] then return end
+  seen[pc] = true
+  local ins = prog[pc]
+  local op = ins.op
+  if op == "jmp" then return addthread(prog, list, seen, ins.to, s, i, f) end
+  if op == "split" then addthread(prog, list, seen, ins.a, s, i, f); return addthread(prog, list, seen, ins.b, s, i, f) end
+  if op == "bol" then if i == 1 or (f.m and s[i - 1] == 10) then return addthread(prog, list, seen, pc + 1, s, i, f) end return end
+  if op == "eol" then if s[i] == nil or (f.m and s[i] == 10) then return addthread(prog, list, seen, pc + 1, s, i, f) end return end
+  if op == "wordb" then
     local a = s[i - 1] ~= nil and is_word(s[i - 1])
     local b = s[i] ~= nil and is_word(s[i])
-    if a ~= b then return k(i) end
-    return false
+    if a ~= b then return addthread(prog, list, seen, pc + 1, s, i, f) end
+    return
   end
-  error("bad node " .. tostring(t))
+  list[#list + 1] = pc -- char or match
+end
+
+-- deadline (ms, M.clock() scale) or nil. Past it the search raises a sentinel the classifier turns into state "unknown"/"slow".
+local SLOW = {}
+local function pike(rx, s, deadline)
+  local prog, f = to_prog(rx), rx.flags
+  local clist, seen = {}, {}
+  addthread(prog, clist, seen, 1, s, 1, f)
+  for i = 1, #s + 1 do
+    if deadline ~= nil and i % 64 == 0 and M.clock() > deadline then error(SLOW) end
+    local c = s[i]
+    local nlist, nseen = {}, {}
+    for _, pc in ipairs(clist) do
+      local ins = prog[pc]
+      if ins.op == "match" then return true end
+      if c ~= nil and char_ok(ins.node, c, f) then addthread(prog, nlist, nseen, pc + 1, s, i + 1, f) end
+    end
+    if c == nil then return false end
+    addthread(prog, nlist, nseen, 1, s, i + 1, f) -- unanchored: a fresh thread at the next position (lowest priority)
+    clist, seen = nlist, nseen
+  end
+  return false
 end
 
 local cache = {}
@@ -296,14 +346,9 @@ function M.compile(pat)
   if rx == nil then rx = parse(pat); cache[pat] = rx end
   return rx
 end
--- unanchored search (like Rust Regex::is_match)
-function M.re_match(pat, text)
-  local rx = M.compile(pat)
-  local s = decode_all(text)
-  for start = 1, #s + 1 do
-    if m(rx, rx.node, s, start, function() return true end) then return true end
-  end
-  return false
+-- unanchored search (like Rust Regex::is_match), linear time
+function M.re_match(pat, text, deadline)
+  return pike(M.compile(pat), decode_all(text), deadline)
 end
 
 -- ---------------- regions (manifest.rs region functions) ----------------
@@ -423,23 +468,23 @@ function M.region(spec, content, title, progress)
 end
 
 -- ---------------- gates ----------------
-local function gate_matches(g, text, lower)
+local function gate_matches(g, text, lower, deadline)
   for _, needle in ipairs(g.contains or {}) do
     if not string.find(lower, string.lower(needle), 1, true) then return false end
   end
-  for _, pat in ipairs(g.regex or {}) do if not M.re_match(pat, text) then return false end end
+  for _, pat in ipairs(g.regex or {}) do if not M.re_match(pat, text, deadline) then return false end end
   for _, pat in ipairs(g.line_regex or {}) do
     local any = false
-    for _, line in ipairs(split_lines(text)) do if M.re_match(pat, line) then any = true; break end end
+    for _, line in ipairs(split_lines(text)) do if M.re_match(pat, line, deadline) then any = true; break end end
     if not any then return false end
   end
-  for _, sub in ipairs(g.all or {}) do if not gate_matches(sub, text, lower) then return false end end
+  for _, sub in ipairs(g.all or {}) do if not gate_matches(sub, text, lower, deadline) then return false end end
   if g.any and #g.any > 0 then
     local hit = false
-    for _, sub in ipairs(g.any) do if gate_matches(sub, text, lower) then hit = true; break end end
+    for _, sub in ipairs(g.any) do if gate_matches(sub, text, lower, deadline) then hit = true; break end end
     if not hit then return false end
   end
-  for _, sub in ipairs(g["not"] or {}) do if gate_matches(sub, text, lower) then return false end end
+  for _, sub in ipairs(g["not"] or {}) do if gate_matches(sub, text, lower, deadline) then return false end end
   return true
 end
 M.gate_matches = function(g, text) return gate_matches(g, text, string.lower(text)) end
@@ -482,17 +527,31 @@ end
 M._reset_order = function() order_cache = {} end -- tests mutate rule lists
 
 -- lines: array of strings (cx.session:read(...).lines) or a single string; title: OSC title; program: command line / program.
+-- Hard budget (coordinator ruling on TC-MATCH-COST): one classify must not eat the hook's 50ms. The matcher is linear now, but a
+-- wide screen x many rules still adds up, so the call checks a clock between rules and gives up past BUDGET_MS: state "unknown",
+-- rule "slow" (the sentinel treats unknown as "no new information", never as idle). Clock = tern.now() in Tern; tests inject one.
+M.BUDGET_MS = 5
+M.clock = (type(tern) == "table" and type(tern.now) == "function") and tern.now or function() return os.clock() * 1000 end
+
 function M.classify(lines, title, program, progress)
   local agent = M.agent_for(program)
   if agent == nil or manifests[agent] == nil then return { state = "unknown", rule = nil, agent = agent } end
   local content = type(lines) == "table" and table.concat(lines, "\n") or (lines or "")
+  local deadline = M.clock() + M.BUDGET_MS
   -- herdr picks the highest-priority match (ties: earlier rule). Same result, cheaper: visit rules in that exact order
   -- (priority desc, then file order with the manifest before the overlay) and stop at the first match, so expensive
   -- low-priority rules (e.g. legacy_no_prompt_blocker's whole-screen regex) never run once a higher rule has matched.
   local best = nil
+  local slow = { state = "unknown", rule = "slow", agent = agent }
   for _, rule in ipairs(ordered(agent)) do
+    if M.clock() > deadline then return slow end
     local text = M.region(rule.region, content, title, progress)
-    if gate_matches(rule, text, string.lower(text)) then best = rule; break end
+    local ok, hit = pcall(gate_matches, rule, text, string.lower(text), deadline)
+    if not ok then
+      if hit == SLOW then return slow end
+      error(hit, 0) -- a real error (bad manifest etc.) is not swallowed
+    end
+    if hit then best = rule; break end
   end
   if best == nil then return { state = "idle", rule = nil, agent = agent } end -- herdr fallback for a known agent
   return { state = best.state or "unknown", rule = best.id, agent = agent, skip_state_update = best.skip_state_update == true }
