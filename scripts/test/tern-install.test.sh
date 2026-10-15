@@ -18,6 +18,8 @@ trap 'rm -rf "$TMP"' EXIT
 #   FAKE_LOAD=fail      reload succeeds but tern.log gets a "failed to load" line and no new vm is written
 #   FAKE_LOAD=silent    reload succeeds, nothing logged, but the plugin never writes agents.json (no proof)
 #   FAKE_LOAD=budget    reload succeeds, the plugin writes once, and tern.log gets an "exceeded its budget" line
+#   FAKE_MIRROR_LOG=budget|fail  the MIRROR call (the probe) writes the new vm AND appends that error to tern.log
+#                                before returning ok (TI-PROBE-LOG: an error inside the probe window)
 FAKE="$TMP/fake-tern"
 cat >"$FAKE" <<'EOF'
 #!/usr/bin/env bash
@@ -50,6 +52,10 @@ PY
   "ctl plugins")
     [ "${FAKE_DAEMON:-up}" = down ] && exit 1
     [ -f "$TERN_CONFIG_DIR/current-vm" ] && echo "{\"tick\":1,\"vm\":\"$(cat "$TERN_CONFIG_DIR/current-vm")\"}" >"$BRIDGE_CTRL_DIR/agents.json"
+    case "${FAKE_MIRROR_LOG:-}" in
+      budget) echo "$(now) WARN x: plugin hook exceeded its budget; disabled until reload plugin=\"agenthop-agents-bridge\" hook=\"command mirror\"" >>"$TERN_LOG" ;;
+      fail)   echo "$(now) WARN x: plugin window entry failed to load plugin=\"agenthop-agents-bridge\" error=late" >>"$TERN_LOG" ;;
+    esac
     echo '{"ok":true}' ;;
   *) echo "fake-tern: unhandled: $*" >&2; exit 99 ;;
 esac
@@ -83,12 +89,12 @@ out="$(bash "$INSTALL" --live 2>&1)"; rc=$?
 assert "$([ $rc -eq 0 ] && [[ "$out" == *'WILL install'*'RELOAD THE LIVE TERN DAEMON'* ]] && echo true)" "--live announces the live reload before acting"
 assert "$([[ "$out" == *'load proven: agents.json written by the reloaded instance (vm vm-before -> vm-'* && "$out" == *'installed and their load proven'* ]] && echo true)" "--live healthy: load proven by a new vm"
 assert "$([ -d "$P/agenthop-agents-bridge" ] && [ ! -f "$P/agenthop-agents-bridge.path" ] && echo true)" "installs a COPY, never a link"
-assert "$([ "$(cat "$P/agenthop-agents-bridge.installed-sha" 2>/dev/null)" = "$SHA" ] && echo true)" "records the installed commit in <id>.installed-sha"
+assert "$([ "$(cat "$P/agenthop-agents-bridge.installed-sha" 2>/dev/null)" = "$SHA" ] && [ "$(cat "$P/agenthop-agents-bridge.proven-sha" 2>/dev/null)" = "$SHA" ] && echo true)" "records the installed commit (<id>.installed-sha) and the proven commit (<id>.proven-sha)"
 assert "$(! calls | grep -q 'plugin link' && echo true)" "never calls tern plugin link"
 
 # 3. idempotent: same commit installed => skip, no reload
 : >"$TERN_CONFIG_DIR/calls"; out="$(bash "$INSTALL" --live 2>&1)"; rc=$?
-assert "$([ $rc -eq 0 ] && [[ "$out" == *"already at $SHA, skipping"* ]] && ! calls | grep -q reload && echo true)" "re-run at the same commit: skip, no reload"
+assert "$([ $rc -eq 0 ] && [[ "$out" == *"installed copy at $SHA, load proven, skipping"* ]] && ! calls | grep -q reload && echo true)" "re-run at the same commit after a proven install: skip, no reload"
 
 # 4. TI-LOAD-PROOF: plugin files present, daemon unreachable. `list` still says ready; install must NOT claim success.
 fresh '{}'; mkdir -p "$P/agenthop-agents-bridge"   # an older copy, no recorded sha
@@ -98,7 +104,7 @@ assert "$([[ "$out" == *"'tern plugin reload' reported a failing plugin"* ]] && 
 
 # 5. daemon up, load fails (tern.log failed to load, no new vm) => FAIL
 fresh '{}'; out="$(FAKE_LOAD=fail bash "$INSTALL" --live 2>&1)"; rc=$?
-assert "$([ $rc -eq 1 ] && [[ "$out" == *'did not load cleanly after reload (tern.log)'*'failed to load'* ]] && echo true)" "load failure in tern.log => exit 1, quoted"
+assert "$([ $rc -eq 1 ] && [[ "$out" == *'did not load cleanly after reload (tern.log, before the probe)'*'failed to load'* ]] && echo true)" "load failure in tern.log => exit 1, quoted"
 
 # 6. daemon up, reload ok, no log line, but the plugin never writes => UNKNOWN exit 2
 fresh '{}'; out="$(FAKE_LOAD=silent bash "$INSTALL" --live 2>&1)"; rc=$?
@@ -121,6 +127,33 @@ assert "$([ $rc -ne 0 ] && [[ "$out" == *'another tern-install'* ]] && [ -d "$P/
 # 10. unknown argument
 out="$(bash "$INSTALL" --bogus 2>&1)"; rc=$?
 assert "$([ $rc -eq 2 ] && echo true)" "unknown argument => exit 2"
+
+# ---- r3: TI-RETRY-PROOF — a failed run leaves the copy, but a re-run must NOT skip without a proof ----------------
+# reload fails, then the daemon comes back: run 1 exit 1, run 2 reloads + proves (not "skipping") and exits 0
+fresh '{}'
+out1="$(FAKE_DAEMON=down bash "$INSTALL" --live 2>&1)"; rc1=$?
+assert "$([ $rc1 -eq 1 ] && [ -f "$P/agenthop-agents-bridge.installed-sha" ] && [ ! -f "$P/agenthop-agents-bridge.proven-sha" ] && echo true)" "retry 1a: reload fails => exit 1, copy recorded, NOT proven"
+: >"$TERN_CONFIG_DIR/calls"; out2="$(bash "$INSTALL" --live 2>&1)"; rc2=$?
+assert "$([ $rc2 -eq 0 ] && [[ "$out2" == *'installed but its load is NOT proven'*'re-proving its load'*'load proven'* ]] && calls | grep -q 'plugin reload' && ! calls | grep -q 'plugin install' && echo true)" "retry 1b: re-run at the same commit re-proves (reload, no reinstall) and exits 0"
+assert "$([ "$(cat "$P/agenthop-agents-bridge.proven-sha" 2>/dev/null)" = "$SHA" ] && echo true)" "retry 1c: proven-sha written only after the proof"
+# no proof twice in a row: both runs exit 2, the second does NOT exit 0
+fresh '{}'
+out1="$(FAKE_LOAD=silent bash "$INSTALL" --live 2>&1)"; rc1=$?
+out2="$(FAKE_LOAD=silent bash "$INSTALL" --live 2>&1)"; rc2=$?
+assert "$([ $rc1 -eq 2 ] && [ $rc2 -eq 2 ] && [[ "$out2" == *'NOT proven'*'UNKNOWN'* ]] && [ ! -f "$P/agenthop-agents-bridge.proven-sha" ] && echo true)" "retry 2: no proof, re-run at the same commit => still UNKNOWN exit 2, never 0"
+# dry run reports the unproven state instead of "skipping"
+out="$(bash "$INSTALL" 2>&1)"
+assert "$([[ "$out" == *'installed but its load is NOT proven'*'WOULD reload'* && "$out" != *'skipping (idempotent)'* ]] && echo true)" "retry 3: dry run shows the copy as installed but not proven"
+# a proven install whose proof is then lost (proven-sha removed) is re-proven, not skipped
+fresh '{}'; bash "$INSTALL" --live >/dev/null 2>&1; rm -f "$P/agenthop-agents-bridge.proven-sha"
+: >"$TERN_CONFIG_DIR/calls"; out="$(bash "$INSTALL" --live 2>&1)"; rc=$?
+assert "$([ $rc -eq 0 ] && calls | grep -q 'plugin reload' && echo true)" "retry 4: proven-sha missing => reload + proof again"
+
+# ---- r3: TI-PROBE-LOG — an error written DURING the probe (inside mirror) fails the run --------------------------
+for kind in budget fail; do
+  fresh '{}'; out="$(FAKE_MIRROR_LOG=$kind bash "$INSTALL" --live 2>&1)"; rc=$?
+  assert "$([ $rc -eq 1 ] && [[ "$out" == *'did not load cleanly after reload (tern.log, during the probe)'* && "$out" != *'load proven'* ]] && [ ! -f "$P/agenthop-agents-bridge.proven-sha" ] && echo true)" "probe-log $kind: error appended inside mirror => exit 1, no 'load proven', no proven-sha"
+done
 
 echo ""
 echo "tern-install gate: $t passed, $f failed"

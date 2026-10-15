@@ -5,9 +5,14 @@
 #   1. agenthop-agents-bridge   (tern/agenthop-agents-bridge)
 # tern/board is NOT a Tern plugin (standalone lua generator; Tern only views its md) and is not installed.
 #
-# PRODUCTION RULE: the live Tern runs only an INSTALLED COPY (`tern plugin install`), never a link, and the copy's
-# source commit is recorded in <plugins dir>/<id>.installed-sha. `tern plugin link` is for development only: this
-# script never links, and it refuses to replace an existing link.
+# PRODUCTION RULE: the live Tern runs only an INSTALLED COPY (`tern plugin install`), never a link. `tern plugin link`
+# is for development only: this script never links, and it refuses to replace an existing link.
+# Two state files per plugin, in <plugins dir>:
+#   <id>.installed-sha  the commit whose copy is in place (written right after `tern plugin install` succeeds)
+#   <id>.proven-sha     the commit whose LOAD was proven (written only after the proof below passes)
+# A re-run skips a plugin only if BOTH equal this checkout's commit. Copy in place but not proven (an earlier run
+# failed at reload or at the proof) => the copy is kept and reload + proof run again; the run never exits 0 without
+# a proof for the current commit.
 #
 # THE TERN DAEMON IS GLOBAL. TERN_CONFIG_DIR does NOT isolate the CLI from the running daemon: `tern plugin install`,
 # `reload` and `ctl plugins run` all act on the live Tern (an accidental live reload happened this way at 13:37:27
@@ -95,6 +100,8 @@ source_sha(){
   if [ -n "$(git -C "$dir" status --porcelain -- . 2>/dev/null)" ]; then echo "$sha-dirty"; else echo "$sha"; fi
 }
 
+proven_sha(){ if [ -f "$PLUGINS_DIR/$1.proven-sha" ]; then cat "$PLUGINS_DIR/$1.proven-sha"; else echo none; fi; }
+
 # State of one plugin in the plugins dir: "link:<src>" | "copy:<sha or unrecorded>" | "absent"
 installed_state(){
   local id="$1"
@@ -108,12 +115,10 @@ json_field(){ # $1 file, $2 jq expr
   jq -r "$2 // empty" "$1" 2>/dev/null || true
 }
 
-# Load proof after reload. $1 = id, $2 = vm before, $3 = ISO time of the reload.
-prove_loaded(){
-  local id="$1" vm_before="$2" since="$3" out vm_after i
-  # tern.log since the reload: any load failure or budget kill for this plugin => FAIL
-  if [ -r "$TERN_LOG" ]; then
-    out="$(python3 - "$TERN_LOG" "$since" "$id" <<'PY'
+# tern.log lines for plugin $1 at or after ISO time $2 that show a load failure or a budget kill (one per line).
+# exit 0 + empty output = none; exit != 0 = the log could not be scanned.
+log_failures(){
+  python3 - "$TERN_LOG" "$2" "$1" <<'PY'
 import datetime, re, sys
 log, since, pid = sys.argv[1:4]
 t0 = datetime.datetime.fromisoformat(since).timestamp()
@@ -132,18 +137,30 @@ for line in open(log, errors="replace"):
         bad.append(line.strip()[:200])
 print("\n".join(bad))
 PY
-)" || unknown "could not scan $TERN_LOG"
-    [ -z "$out" ] || die "$id did not load cleanly after reload (tern.log): $out"
-  else
-    log "  note: $TERN_LOG not readable; load proof rests on agents.json only"
-  fi
+}
+
+# Fail if tern.log shows a failure for $1 since the reload at $2. $3 names the check ("before the probe" / ...).
+check_log(){
+  local out
+  [ -r "$TERN_LOG" ] || { log "  note: $TERN_LOG not readable ($3); load proof rests on agents.json only"; return 0; }
+  out="$(log_failures "$1" "$2")" || unknown "could not scan $TERN_LOG ($3)"
+  [ -z "$out" ] || die "$1 did not load cleanly after reload (tern.log, $3): $out"
+}
+
+# Load proof after reload. $1 = id, $2 = vm before, $3 = ISO time of the reload.
+# The window is the WHOLE reload-to-now span: the log is checked before the probe AND again after the new vm is seen,
+# so an error written while the probe ran (e.g. a budget kill inside the mirror command) is not missed.
+prove_loaded(){
+  local id="$1" vm_before="$2" since="$3" vm_after i
+  check_log "$id" "$since" "before the probe"
   # the reloaded instance must write agents.json: drive one mirror, then require a new vm
   timeout 5 "$TERN" ctl plugins run "plugin.$id.mirror" >/dev/null 2>&1 \
     || unknown "\`tern ctl plugins run plugin.$id.mirror\` failed: the daemon may be unreachable; load not proven"
   for ((i = 0; i < PROOF_WAIT * 10; i++)); do
     vm_after="$(json_field "$CTRL/agents.json" '.vm')"
     if [ -n "$vm_after" ] && [ "$vm_after" != "$vm_before" ]; then
-      log "  load proven: agents.json written by the reloaded instance (vm ${vm_before:-none} -> $vm_after)"
+      check_log "$id" "$since" "during the probe"
+      log "  load proven: agents.json written by the reloaded instance (vm ${vm_before:-none} -> $vm_after), no failure in tern.log since the reload"
       return 0
     fi
     sleep 0.1
@@ -162,7 +179,13 @@ for i in "${!PLUGIN_IDS[@]}"; do
   want="$(source_sha "$dir")"; have="$(installed_state "$id")"
   case "$have" in
     link:*) die "$step $id is LINKED from ${have#link:}. Production runs an installed copy only; not replacing someone's link. Run \`tern plugin unlink $id\` first if that is intended." ;;
-    "copy:$want") log "$step $id — installed copy already at $want, skipping (idempotent)." ;;
+    "copy:$want")
+      if [ "$(proven_sha "$id")" = "$want" ]; then
+        log "$step $id — installed copy at $want, load proven, skipping (idempotent)."
+      else
+        log "$step $id — copy at $want is installed but its load is NOT proven (proven: $(proven_sha "$id")); WOULD reload the live daemon and prove it"
+        plan+=("$i")
+      fi ;;
     *) log "$step $id — WOULD install a copy of $dir at $want (now: $have), then reload the live daemon and prove the load"
        plan+=("$i") ;;
   esac
@@ -186,11 +209,17 @@ for i in "${plan[@]}"; do
   case "$want" in unknown|*-dirty) die "$step $dir has no clean commit ($want); production installs only committed sources" ;; esac
   vm_before="$(json_field "$CTRL/agents.json" '.vm')"
   since="$(python3 -c 'import datetime; print(datetime.datetime.now().astimezone().isoformat())')"
-  log "$step $id — installing a copy at $want"
-  "$TERN" plugin install "$dir" --force >/dev/null 2>&1 || die "$step 'tern plugin install $dir --force' failed"
-  printf '%s\n' "$want" >"$PLUGINS_DIR/$id.installed-sha" || die "$step could not record $PLUGINS_DIR/$id.installed-sha"
+  rm -f "$PLUGINS_DIR/$id.proven-sha"   # from here until the proof passes, nothing is proven
+  if [ "$(installed_state "$id")" = "copy:$want" ]; then
+    log "$step $id — copy at $want already installed; re-proving its load"
+  else
+    log "$step $id — installing a copy at $want"
+    "$TERN" plugin install "$dir" --force >/dev/null 2>&1 || die "$step 'tern plugin install $dir --force' failed"
+    printf '%s\n' "$want" >"$PLUGINS_DIR/$id.installed-sha" || die "$step could not record $PLUGINS_DIR/$id.installed-sha"
+  fi
   "$TERN" plugin reload >/dev/null 2>&1 || die "$step 'tern plugin reload' reported a failing plugin or directory problem"
   prove_loaded "$id" "$vm_before" "$since"
+  printf '%s\n' "$want" >"$PLUGINS_DIR/$id.proven-sha" || die "$step load proven, but could not record $PLUGINS_DIR/$id.proven-sha"
   log "$step $id — installed, reloaded, load proven."
 done
 
