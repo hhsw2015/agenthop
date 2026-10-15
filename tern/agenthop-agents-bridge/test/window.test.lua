@@ -22,6 +22,10 @@ local function encode(v)
   local t = type(v)
   if t == "table" then
     local parts = {}
+    if #v > 0 then -- a sequence encodes as a JSON array (as tern.json does), so a status written then re-read round-trips
+      for _, x in ipairs(v) do parts[#parts + 1] = encode(x) end
+      return "[" .. table.concat(parts, ",") .. "]"
+    end
     for k, x in pairs(v) do parts[#parts + 1] = string.format("%q:%s", tostring(k), encode(x)) end
     table.sort(parts)
     return "{" .. table.concat(parts, ",") .. "}"
@@ -181,39 +185,45 @@ ck("r4: later mirror timer ticks still make NO tern.carly.* call", carlyCalls ==
 -- #1036 ②: arm is three commands, ONE tern.carly call per hook (11:36:16 live: three calls in one hook crossed 50ms)
 local function carlyDelta(fn) local c0 = carlyCalls; fn(); return carlyCalls - c0 end
 local SENT = "/h/.agenthop/tern-panes/sentinel.json"
-ck("#1036: commands arm-scan / arm-cancel registered", type(commands["arm-scan"]) == "function" and type(commands["arm-cancel"]) == "function")
+ck("#1036/r11: commands arm-scan / arm-cancel-next registered; the kv-addressed arm-cancel is GONE", type(commands["arm-scan"]) == "function" and type(commands["arm-cancel-next"]) == "function" and commands["arm-cancel"] == nil)
 ck("r9: NO arm-schedule command in the plugin (even one tern.carly.schedule exceeded 50ms in a hook; the swarm schedules via CLI)", commands["arm-schedule"] == nil)
--- r9 arming protocol: arm-scan READ-ONLY (ids+count, never cancels/schedules); arm-cancel cancels ONLY the kv-requested id and
--- KEEPS the obligation on failure; a kv read failure is UNKNOWN (no advance). (r8 second voice BTF-R8-P2-1/2/3.)
+-- r9/r11 arming protocol: arm-scan READ-ONLY (ids+count); arm-cancel-next takes NO arguments and NO kv — it reads the ids the last
+-- scan recorded, keeps the NEWEST (largest id), cancels one other, and KEEPS the obligation on failure.
 local function sent() return files[SENT] or "" end
+local function kvTouched() local n = 0; for _ in pairs(kvStore) do n = n + 1 end; return n end
+ck("r11: arm-cancel-next before any scan (no sentinel.json) = cancel-unknown, ZERO tern.carly calls", carlyDelta(function() commands["arm-cancel-next"](cx) end) == 0 and sent():find('"step":"cancel-unknown"', 1, true) ~= nil)
+-- the scan fixture returns ours = {32, 31} UNSORTED would be stronger: reorder the mock so the newest is listed FIRST
+tern.carly.tasks = function() carlyCalls = carlyCalls + 1; carlyTasks = carlyTasks + 1
+  return { { id = 33, title = "agenthop tern patrol" }, { id = 31, title = "agenthop tern patrol" }, { id = 99, title = "other" }, { id = 32, title = "agenthop tern patrol" } } end
 ck("r9: arm-scan = exactly ONE tern.carly call (tasks), read-only (no cancel, no schedule)", carlyDelta(function() commands["arm-scan"](cx) end) == 1 and #carlyCancels == 0 and carlySchedules == 0)
-ck("r9: arm-scan records ids + count of OUR patrols (2), scheduled=false when count~=1", sent():find('"step":"scanned"', 1, true) ~= nil and sent():find('"count":2', 1, true) ~= nil and sent():find('"scheduled":false', 1, true) ~= nil)
-ck("r9: arm-cancel with no id requested = idle, ZERO tern.carly calls", carlyDelta(function() commands["arm-cancel"](cx) end) == 0 and sent():find('"step":"cancel-idle"', 1, true) ~= nil)
-kvStore["bridge.arm_cancel_id"] = 31
-ck("r9: arm-cancel cancels ONLY the requested id (31), one tern.carly call, clears the request", carlyDelta(function() commands["arm-cancel"](cx) end) == 1 and carlyCancels[1] == 31 and kvStore["bridge.arm_cancel_id"] == nil and sent():find('"step":"cancelled"', 1, true) ~= nil)
-ck("r9: the unrelated task 99 and the other patrol 32 were never touched", #carlyCancels == 1)
--- BTF-R8-P2-1: a FAILED cancel keeps the obligation
+ck("r9: arm-scan records ids + count of OUR patrols (3), scheduled=false when count~=1", sent():find('"step":"scanned"', 1, true) ~= nil and sent():find('"count":3', 1, true) ~= nil and sent():find('"scheduled":false', 1, true) ~= nil)
+ck("r11: arm-cancel-next #1 cancels the SMALLEST (31), one tern.carly call, step=cancelled-one, count 2", carlyDelta(function() commands["arm-cancel-next"](cx) end) == 1 and carlyCancels[1] == 31 and sent():find('"step":"cancelled-one"', 1, true) ~= nil and sent():find('"count":2', 1, true) ~= nil)
+ck("r11: arm-cancel-next #2 cancels 32 next (works from its OWN rewritten status, no re-scan needed), count 1, scheduled=true", carlyDelta(function() commands["arm-cancel-next"](cx) end) == 1 and carlyCancels[2] == 32 and sent():find('"count":1', 1, true) ~= nil and sent():find('"scheduled":true', 1, true) ~= nil)
+ck("r11: the NEWEST (33) and the unrelated task 99 were never cancelled", #carlyCancels == 2 and carlyCancels[1] ~= 33 and carlyCancels[2] ~= 33)
+ck("r11: count==1 ⇒ arm-cancel-next is idle, ZERO tern.carly calls (never cancels the last patrol)", carlyDelta(function() commands["arm-cancel-next"](cx) end) == 0 and sent():find('"step":"cancel-idle"', 1, true) ~= nil and #carlyCancels == 2)
+ck("r11: zero kv reads/writes across the whole arm-cancel-next path", kvTouched() == 0)
+-- failure keeps the obligation: ids/count unchanged, the same id is retried next time
+commands["arm-scan"](cx)
 local realCancel = tern.carly.cancel
 tern.carly.cancel = function(id) carlyCalls = carlyCalls + 1; error("EIO") end
-kvStore["bridge.arm_cancel_id"] = 32
-commands["arm-cancel"](cx)
-ck("r9 P2-1: cancel FAILED ⇒ obligation KEPT (kv id still 32), step=cancel-failed", kvStore["bridge.arm_cancel_id"] == 32 and sent():find('"step":"cancel-failed"', 1, true) ~= nil)
+commands["arm-cancel-next"](cx)
+ck("r11: cancel FAILED ⇒ step=cancel-failed, obligation KEPT (count still 3, id 31 named)", sent():find('"step":"cancel-failed"', 1, true) ~= nil and sent():find('"count":3', 1, true) ~= nil and sent():find('"id":31', 1, true) ~= nil)
 tern.carly.cancel = function(id) carlyCalls = carlyCalls + 1; return false end
-commands["arm-cancel"](cx)
-ck("r9 P2-1: cancel returned false ⇒ obligation KEPT", kvStore["bridge.arm_cancel_id"] == 32 and sent():find('"step":"cancel-failed"', 1, true) ~= nil)
+commands["arm-cancel-next"](cx)
+ck("r11: cancel returned false ⇒ obligation KEPT (count still 3)", sent():find('"step":"cancel-failed"', 1, true) ~= nil and sent():find('"count":3', 1, true) ~= nil)
 tern.carly.cancel = realCancel
--- BTF-R8-P2-2: a kv READ failure is UNKNOWN, never "empty", and does not advance
-local realGet = tern.kv.get
-tern.kv.get = function() error("kv EIO") end
-local dKv = carlyDelta(function() commands["arm-cancel"](cx) end)
-ck("r9 P2-2: kv read failure ⇒ step=cancel-unknown, ZERO tern.carly calls (not treated as empty)", dKv == 0 and sent():find('"step":"cancel-unknown"', 1, true) ~= nil)
-tern.kv.get = realGet
+local nBefore = #carlyCancels
+commands["arm-cancel-next"](cx)
+ck("r11: after the failures the SAME id (31) is retried", #carlyCancels == nBefore + 1 and carlyCancels[#carlyCancels] == 31)
+-- a corrupt status (non-number id) is UNKNOWN, never treated as "nothing to cancel"
+files[SENT] = '{"step":"scanned","ids":["31"],"count":1}'
+ck("r11: non-number ids in sentinel.json ⇒ cancel-unknown, ZERO tern.carly calls", carlyDelta(function() commands["arm-cancel-next"](cx) end) == 0 and sent():find('"step":"cancel-unknown"', 1, true) ~= nil)
 -- BTF-R8-P2-3: a status WRITE failure is reported as failure (never as progress)
+commands["arm-scan"](cx)
 local realWrite = tern.fs.write
 tern.fs.write = function(p, t) if p:find("sentinel.json", 1, true) then error("ENOSPC") end return realWrite(p, t) end
 ck("r9 P2-3: arm-scan whose sentinel.json write fails returns false (never claimed as progress)", __bridge_test.armScan() == false)
-kvStore["bridge.arm_cancel_id"] = 32
-ck("r9 P2-3: arm-cancel whose status write fails returns false even though the cancel ran", __bridge_test.armCancel() == false)
+ck("r9 P2-3: arm-cancel-next whose status write fails returns false even though the cancel ran", __bridge_test.armCancelNext() == false)
 tern.fs.write = realWrite
 ck("#1036: legacy `arm` = the cheap first step only (ONE tern.carly call)", carlyDelta(function() commands["arm"](cx) end) == 1)
 

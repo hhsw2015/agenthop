@@ -169,24 +169,24 @@ end
 -- tern.carly.* needs a SCOPED window callback, so this runs from inside the poll loop. Returns true only when the arming status was
 -- durably recorded, so a transient failure (e.g. control dir missing) is retried next tick (dedup keeps the retry idempotent) — TA-A2-ARM.
 local PATROL_TITLE = "agenthop tern patrol"
--- #1036 ② / r9 ARMING PROTOCOL. Only `tern.carly.schedule` is expensive (>50ms, unstable — it disabled `arm-schedule` live); tasks()
--- (~2.2ms) and cancel are cheap. tern 0.8.3's `ctl carly task` has add but NO list / cancel, so listing and cancelling must stay
--- here; ONLY the schedule step lives outside the plugin (arm-schedule.sh: `tern ctl carly task add`, '#' escaped). Commands:
---   arm-scan   — READ-ONLY. tern.carly.tasks() ⇒ sentinel.json {step:"scanned", ids:[…], count, scheduled = (count == 1)}.
---                It never cancels and never schedules, so it is also the post-add VERIFIER (only tasks() counts, never ctl's ok).
---   arm-cancel — cancel ONE id the swarm names ({id} from kv bridge.arm_cancel_id). A failed cancel KEEPS the obligation
---                (step:"cancel-failed", id kept) — never cleared on failure (r8 second voice BTF-R8-P2-1).
--- The swarm (#1033 sweep) drives: arm-scan → count>1 ⇒ arm-cancel the extras one by one (re-scan after each) → count==0 ⇒
--- arm-schedule.sh → arm-scan to verify count==1. Idempotent by title: count==1 ⇒ scheduled, add nothing.
--- r8 BTF-R8-P2-2/3: a kv READ failure is UNKNOWN (step does not advance), and a status WRITE failure is reported as such (the
--- command's own result is never claimed as progress when sentinel.json could not record it).
-local function kvRead(k) -- (ok, value): ok=false means UNKNOWN (read failed), never "empty"
-  local ok, v = pcall(function() return tern.kv.get(k) end)
-  return ok, v
-end
+-- #1036 ② / r9 / r11 ARMING PROTOCOL. Only `tern.carly.schedule` is expensive (>50ms, unstable — it disabled `arm-schedule` live);
+-- tasks() (~2.2ms) and cancel are cheap. tern 0.8.3's `ctl carly task` has add but NO list / cancel, so listing and cancelling must
+-- stay here; ONLY the schedule step lives outside the plugin (arm-schedule.sh: `tern ctl carly task add`, '#' escaped). Commands:
+--   arm-scan        — READ-ONLY. tern.carly.tasks() ⇒ sentinel.json {step:"scanned", ids:[…], count, scheduled = (count == 1)}.
+--                     It never cancels and never schedules, so it is also the post-add VERIFIER (only tasks() counts, never ctl's ok).
+--   arm-cancel-next — no arguments, no kv: reads the ids the last arm-scan recorded in sentinel.json, KEEPS the newest (largest id),
+--                     cancels ONE of the others (the smallest), and rewrites sentinel.json {step:"cancelled-one", ids, count}. A failed
+--                     cancel keeps the obligation (step:"cancel-failed", ids/count unchanged). r11: this replaces the kv-addressed
+--                     cancel — the bridge's data dir is written by the bridge only (an outside kv.json write races tern.kv's own).
+-- The swarm (#1033 sweep) drives: arm-scan → while count>1: arm-cancel-next → count==0 ⇒ arm-schedule.sh → arm-scan to verify
+-- count==1. Idempotent by title: count==1 ⇒ scheduled, add nothing.
+-- r8 BTF-R8-P2-3: a status WRITE failure is reported as such (the command's own result is never claimed as progress when
+-- sentinel.json could not record it).
+local SENTINEL_STATUS = CTL .. "/sentinel.json"
 local function writeStatus(status)
-  return pcall(function() tern.fs.write(CTL .. "/sentinel.json", tern.json.encode(status)) end)
+  return pcall(function() tern.fs.write(SENTINEL_STATUS, tern.json.encode(status)) end)
 end
+local function idList(ids) return (#ids > 0) and ids or tern.json.array({}) end
 local function armScan()
   local ids = {}
   local ok, err = pcall(function()
@@ -195,20 +195,41 @@ local function armScan()
     end
   end)
   if not ok then return writeStatus({ ts = tern.now(), scheduled = false, step = "scan-failed", error = tostring(err) }) and false end
-  return writeStatus({ ts = tern.now(), step = "scanned", ids = (#ids > 0) and ids or tern.json.array({}), count = #ids, scheduled = (#ids == 1) })
+  return writeStatus({ ts = tern.now(), step = "scanned", ids = idList(ids), count = #ids, scheduled = (#ids == 1) })
 end
-local function armCancel()
-  local okR, id = kvRead("bridge.arm_cancel_id")
-  if not okR then return writeStatus({ ts = tern.now(), step = "cancel-unknown", error = "kv read failed; obligation unknown, not advancing" }) and false end
-  if type(id) ~= "number" then return writeStatus({ ts = tern.now(), step = "cancel-idle", note = "no id requested (set kv bridge.arm_cancel_id)" }) end
-  local okC, res = pcall(function() return tern.carly.cancel(id) end)
-  if not okC or res == false then
-    -- KEEP the obligation: the id stays in kv, the swarm retries; never cleared on failure
-    return writeStatus({ ts = tern.now(), step = "cancel-failed", id = id, error = okC and "cancel returned false" or tostring(res) }) and false
+-- the ids recorded by the last scan (or by a previous arm-cancel-next), sorted; nil = UNKNOWN (absent / unreadable / not all numbers)
+local function recordedIds()
+  local okR, text = pcall(function() return tern.fs.read(SENTINEL_STATUS) end)
+  if not (okR and type(text) == "string") then return nil end
+  local okD, st = pcall(function() return tern.json.decode(text) end)
+  if not (okD and type(st) == "table" and type(st.ids) == "table") then return nil end
+  local ids = {}
+  for _, v in ipairs(st.ids) do
+    if type(v) ~= "number" then return nil end
+    ids[#ids + 1] = v
   end
-  local okW = pcall(function() tern.kv.set("bridge.arm_cancel_id", nil) end)
-  if not okW then return writeStatus({ ts = tern.now(), step = "cancel-done-kv-stuck", id = id, error = "cancelled, but clearing the request in kv failed" }) and false end
-  return writeStatus({ ts = tern.now(), step = "cancelled", id = id })
+  table.sort(ids)
+  return ids
+end
+local function armCancelNext()
+  local ids = recordedIds()
+  if ids == nil then
+    return writeStatus({ ts = tern.now(), step = "cancel-unknown", error = "no readable ids in sentinel.json; run arm-scan first" }) and false
+  end
+  if #ids <= 1 then
+    return writeStatus({ ts = tern.now(), step = "cancel-idle", ids = idList(ids), count = #ids, scheduled = (#ids == 1) })
+  end
+  local victim = ids[1] -- smallest; the largest (newest) is the one kept
+  local okC, res = pcall(function() return tern.carly.cancel(victim) end)
+  if not okC or res == false then
+    -- KEEP the obligation: ids/count unchanged, so the next arm-cancel-next retries the same id
+    writeStatus({ ts = tern.now(), step = "cancel-failed", id = victim, ids = ids, count = #ids, scheduled = false,
+      error = okC and "cancel returned false" or tostring(res) })
+    return false
+  end
+  local rest = {}
+  for i = 2, #ids do rest[#rest + 1] = ids[i] end
+  return writeStatus({ ts = tern.now(), step = "cancelled-one", id = victim, ids = idList(rest), count = #rest, scheduled = (#rest == 1) })
 end
 
 -- r2 SCHEDULING (bridge tick-freeze, corrected root cause — PROTOCOL.md §4). Tern disables at HOOK granularity: every
@@ -256,9 +277,9 @@ local function mirrorTimer(cx)
 end
 
 tern.command({ id = "arm-scan", title = "agenthop bridge: list patrol tasks (read-only; also the post-add verifier)", run = function() ensure(); armScan() end })
-tern.command({ id = "arm-cancel", title = "agenthop bridge: cancel the patrol id in kv bridge.arm_cancel_id", run = function() ensure(); armCancel() end })
+tern.command({ id = "arm-cancel-next", title = "agenthop bridge: cancel one extra patrol task (keeps the newest)", run = function() ensure(); armCancelNext() end })
 -- `arm` (compatibility: #1033's sweep and agenthop_tern's recovery call it) = arm-scan (read-only). One tern.carly call per hook.
-tern.command({ id = "arm", title = "agenthop bridge: arm step 1 = list patrol tasks (then arm-cancel extras / arm-schedule.sh)", run = function() ensure(); armScan() end })
+tern.command({ id = "arm", title = "agenthop bridge: arm step 1 = list patrol tasks (then arm-cancel-next extras / arm-schedule.sh)", run = function() ensure(); armScan() end })
 tern.command({ id = "mirror", title = "agenthop bridge: mirror now", run = function(cx)
   local rep = timerReport()
   mirrorTick(cx) -- publishes the CURRENT timer state (stopped-late / overdue is reported, then the restart below takes effect)
@@ -277,4 +298,4 @@ mirrorTimer(nil) -- A1 best-effort mirror chain on the TIMER hook (the swarm-tri
 
 -- r10 test seam: the chunk's RETURN value (Tern ignores a plugin chunk's return; the fixture reads it). NEVER write globals — Tern's
 -- plugin VM _G is READ-ONLY (r9's `_G.__bridge_test = …` raised "attempt to modify a readonly table" at load and muted the plugin live).
-return { armScan = armScan, armCancel = armCancel }
+return { armScan = armScan, armCancelNext = armCancelNext }

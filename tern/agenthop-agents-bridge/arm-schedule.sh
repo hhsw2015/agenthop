@@ -4,7 +4,7 @@
 # reload. `tern ctl carly task add <JSON spec>` reaches Carly's scheduler directly from the CLI [tested 2026-10-15: 0.4s, ok].
 #
 # Order (after every bridge load/reload, driven by the #1033 sweep): `…arm-scan` (read-only: sentinel.json {ids,count}) → if count>1,
-# set kv bridge.arm_cancel_id and run `…arm-cancel` for each extra (re-scan after each) → if count==0, THIS script → it re-runs
+# run `…arm-cancel-next` until count==1 (it keeps the newest; no kv, no arguments) → if count==0, THIS script → it re-runs
 # `…arm-scan` and accepts only count==1. Listing/cancelling stay in the plugin (tern 0.8.3's `ctl carly task` has add but no
 # list/cancel); only schedule — the call that exceeded 50ms in a hook — runs here.
 #
@@ -13,7 +13,7 @@
 #     `#` in the JSON is written as the JSON escape \u0023. Whitespace and newlines are fine.
 #   - ctl's {"ok":true} is NOT proof (ctl returns ok even for unknown subcommands). Success = `…arm-scan` afterwards reports count==1.
 #
-# Exit: 0 scheduled-and-verified | 2 refused (count>0: a patrol exists or extras await arm-cancel) | 1 failed (ctl / scan / verify).
+# Exit: 0 scheduled-and-verified | 2 refused (count>0: a patrol exists or extras await arm-cancel-next) | 1 failed (ctl / scan / verify).
 # Env: TERN_BIN, TERN_PANE_SOCKET, AGENTHOP_TERN_PANES, AGENTHOP_SENTINEL_SRC override the defaults.
 set -u
 
@@ -41,7 +41,7 @@ scan_count() {
 
 # 1) refuse unless the scan proves there is NO patrol yet (count==0); an unanswered scan is a failure, never "zero"
 n="$(scan_count)" || { echo "failed: arm-scan did not report (cannot prove there is no patrol); not scheduling blind"; exit 1; }
-if [ "$n" != "0" ]; then echo "refused: $n patrol task(s) already exist (run …arm-cancel for extras, or nothing to do)"; exit 2; fi
+if [ "$n" != "0" ]; then echo "refused: $n patrol task(s) already exist (run …arm-cancel-next for extras, or nothing to do)"; exit 2; fi
 
 # 2) schedule via the CLI; every '#' escaped as # (ctl truncates at '#')
 spec="$(python3 -I -c 'import json,sys
