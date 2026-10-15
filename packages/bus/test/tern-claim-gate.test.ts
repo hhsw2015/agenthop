@@ -38,14 +38,14 @@ function runChild(shellEnv: Record<string, string>): Promise<{ shell: string; cl
 const msg = (text: string) => ({ from: "coord", fromLabel: "coord", text, via: "local" as const, ts: 1000 });
 const pending = () => readdirSync(path.join(HOME, ".agenthop", "inbox", SID)).filter((n) => n.endsWith(".json"));
 
-test("registered tern: the herdr twin refuses + leaves the file; the Tern instance claims it", async () => {
+test("registered tern: the herdr twin refuses the new claim (message stays pending, unconsumed); the Tern instance claims it", async () => {
   writeSeatShell(HOME, SID, "tern", 1000);
   writeInbox(HOME, SID, msg("dispatch-1"));
 
   const herdr = await runChild({ HERDR_ENV: "1", HERDR_PANE_ID: "w1:p4" });
   expect(herdr.claimed).toEqual([]);
   expect(herdr.stderr).toMatch(/stale-shell claim refused/);
-  expect(pending().length).toBe(1); // left in place: not renamed, not deleted, not quarantined
+  expect(pending().length).toBe(1); // the pending message is not claimed, consumed or quarantined by the refused instance
 
   const tern = await runChild({ TERN_PANE: "1056561954854" });
   expect(tern.claimed).toEqual(["dispatch-1"]);
@@ -105,3 +105,24 @@ test("auto-flush: registered tern ⇒ herdr twin pushes ZERO frames and the mail
   expect(tern.frames).toBe(1);
   expect(pending().length).toBe(0);
 }, 90_000);
+
+// IWT-CLAIM-SCOPE (Chief Review P3): the gate blocks NEW CLAIMS, not the directory. A dead pid's stranded claim is still recovered
+// back to a pending `.json` by the refused instance (that only returns mail to the queue) — but the refused instance must not
+// claim, push or consume it; the owning Tern instance then claims it.
+test("scope: refused herdr twin still recovers a DEAD claim to pending, but never consumes it; Tern instance claims it", async () => {
+  writeSeatShell(HOME, SID, "tern", 1000);
+  writeInbox(HOME, SID, msg("stranded-by-crash"));
+  const box = path.join(HOME, ".agenthop", "inbox", SID);
+  const { renameSync } = await import("node:fs");
+  const f = pending()[0]!;
+  renameSync(path.join(box, f), path.join(box, `${f}.claim-999999`)); // a crashed instance's claim (pid 999999 is not alive)
+
+  const herdr = await runChild({ HERDR_ENV: "1", HERDR_PANE_ID: "w1:p4" });
+  expect(herdr.claimed).toEqual([]);                                 // refused: nothing consumed
+  const names = readdirSync(box);
+  expect(names.filter((n) => n.endsWith(".json"))).toHaveLength(1); // recovered back to pending (maintenance, by design)
+  expect(names.some((n) => n.includes(".claim-"))).toBe(false);     // and NOT re-claimed under the herdr pid
+
+  const tern = await runChild({ TERN_PANE: "1056561954854" });
+  expect(tern.claimed).toEqual(["stranded-by-crash"]);
+}, 60_000);

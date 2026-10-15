@@ -132,8 +132,13 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
   };
   // Unique-claimant gate (PROGRESS #1025): during the herdr→Tern migration the same sid can be live in BOTH shells. A seat registered
   // to one shell (~/.agenthop/swarm/seat-shell/<sid>.json, written by tern-restore) must not have its mail claimed by an instance in
-  // the OTHER shell. Refuse ONLY on a positive mismatch; unregistered / unreadable / un-attestable ⇒ allowed (never strand mail). A
-  // refused claim leaves every file in place (no rename, no delete, no quarantine) for the owning instance. Logged once per state.
+  // the OTHER shell. Refuse ONLY on a positive mismatch; unregistered / unreadable / un-attestable ⇒ allowed (never strand mail).
+  // SCOPE (IWT-CLAIM-SCOPE): the gate blocks NEW CLAIMS only — the refused instance never renames a pending `.json` to its own claim,
+  // never pushes, acks, or quarantines it, so no message is consumed or moved out of the box. It does NOT freeze the directory:
+  // the maintenance that runs before the gate in each flush still runs — recoverStaleClaims turns a DEAD pid's `.json.claim-<pid>`
+  // back into a pending `.json` (that only RETURNS mail to the queue, which the owning instance then claims), plus retry of this
+  // process's own stuck poison/release obligations. Those obligations are kept deliberately: blocking them would strand mail a
+  // crashed instance left behind. Not a directory write lock. Logged once per state.
   const myShell = selfShell();
   let lastRefusedSid: string | null = null;
   const claimGateOpen = (): boolean => {
