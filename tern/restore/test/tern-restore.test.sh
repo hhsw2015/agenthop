@@ -24,6 +24,8 @@ elif a[:2] == ["new", "tab"]:
     d["sessions"][0]["tabs"].append({"name": None, "blocks": [{"id": bid, "live": True, "exited": None,
         "cwd": a[a.index("--cwd") + 1], "command": " ".join(shlex.quote(x) for x in cmd)}]})
     print(bid)
+elif a[0] == "process":
+    print(json.dumps({"child": {"pid": 5000 + int(a[1])}}))
 elif a[0] == "rename":
     for t in d["sessions"][0]["tabs"]:
         if any(str(b["id"]) == a[1] for b in t["blocks"]): t["name"] = a[2]
@@ -40,7 +42,18 @@ cat >"$T/roster.json" <<'R'
  {"role":"Chief Review","tool":"codex","sid":"cccc3333","cwd":"/tmp/y","model":null}]}
 R
 printf '{"bypassPermissionsModeAccepted":true,"projects":{"/tmp/x":{"hasTrustDialogAccepted":true}}}' >"$T/claude.json"
-: >"$T/ps"
+# ps table: block 100/101 (claude) -> tern acp child 5100/5101 -> node -> claude stream-json; block 102 (codex) -> node adapter
+cat >"$T/ps" <<'P'
+5100 1 tern acp claude --resume aaaa1111
+6100 5100 node adapter
+7100 6100 claude --output-format stream-json --resume=aaaa1111
+5101 1 tern acp claude --resume bbbb2222
+6101 5101 node adapter
+7101 6101 claude --output-format stream-json --resume=bbbb2222
+5102 1 tern acp codex --resume cccc3333
+6102 5102 node codex-adapter
+P
+export PRESENCE_DIR="$T/presence"
 export TERN_BIN="$T/tern" FAKE_STATE="$T/state.json" FAKE_LOG="$T/log" CLAUDE_JSON="$T/claude.json" RESTORE_PS="$T/ps"
 run() { python3 "$PY" "$T/roster.json" "$@" >"$T/out" 2>&1; echo $?; }
 starts() { grep -c '^new tab' "$T/log" 2>/dev/null || true; }
@@ -52,6 +65,18 @@ ck "cold: result 3/3" "1" "$(grep -c 'result: 3/3' "$T/out")"
 ck "cold: claude seat gets bypass mode" "1" "$(grep -c 'new tab agenthop --cwd /tmp/x -- tern acp claude --resume aaaa1111 --mode bypassPermissions --model cpa-local/claude-fable-5-1\[1m\]' "$T/log")"
 ck "cold: codex seat has no model/mode flags" "1" "$(grep -c -- '-- tern acp codex --resume cccc3333$' "$T/log")"
 ck "cold: tabs renamed to roles" "3" "$(grep -c '^rename ' "$T/log")"
+
+ck "presence: Manager -> its own claude pid" "7100" "$(cat "$T/presence/aaaa1111.pid")"
+ck "presence: Infra Dev -> its own claude pid" "7101" "$(cat "$T/presence/bbbb2222.pid")"
+ck "presence: codex -> adapter child pid" "6102" "$(cat "$T/presence/cccc3333.pid")"
+ck "presence: no leftover temp" "0" "$(find "$T/presence" -name '*.tmp-*' | wc -l | tr -d ' ')"
+
+# --- presence SWAPPED (live pids, wrong seats) is detected by --check and fixed by a run ---
+printf '7101' >"$T/presence/aaaa1111.pid"; printf '7100' >"$T/presence/bbbb2222.pid"
+rc=$(run --check); ck "swap: --check exit 1" "1" "$rc"; ck "swap: --check names both" "2" "$(grep -c 'presence pid' "$T/out")"
+ck "swap: --check does not write" "7101" "$(cat "$T/presence/aaaa1111.pid")"
+rc=$(run); ck "swap: run fixes, exit 0" "0" "$rc"
+ck "swap: Manager corrected" "7100" "$(cat "$T/presence/aaaa1111.pid")"; ck "swap: Infra corrected" "7101" "$(cat "$T/presence/bbbb2222.pid")"
 
 # --- idempotent rerun: starts nothing ---
 : >"$T/log"; rc=$(run); ck "rerun: exit 0" "0" "$rc"; ck "rerun: 0 new starts" "0" "$(starts)"
@@ -79,7 +104,7 @@ ck "posture: trust ABSENT reported" "1" "$(grep -c 'trust /tmp/x ABSENT' "$T/out
 ck "posture: claude.json unchanged (read-only)" "$before" "$(shasum "$T/claude.json")"
 
 # --- codex exclusivity: a non-Tern process holding the codex sid is reported ---
-echo "123 codex resume cccc3333 --foo" >"$T/ps"
+echo "123 1 codex resume cccc3333 --foo" >>"$T/ps"
 run --check >/dev/null
 ck "codex: outside holder reported" "1" "$(grep -c 'codex-exclusive: Chief Review' "$T/out")"
 
