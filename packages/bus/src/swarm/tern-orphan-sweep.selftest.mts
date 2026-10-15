@@ -149,6 +149,14 @@ for (const which of ["recs", "sessions", "blocks"] as const) {
   t("③ gc r12 requests_held>0 => audited (could not quarantine, retried next run)", w.audit.length === 1 && /requests_held=2/.test(w.audit[0]!)); }
 { const w = world(); const st = initialOrphanState(); w.gcLine = "gc: results=0 requests_quarantined=0 requests_held=0 tmp=0 quarantine_expired=0"; round(st, w);
   t("③ gc r12 all zero => no audit", w.audit.length === 0); }
+{ const w = world(); const st = initialOrphanState(); w.gcLine = "gc: results=0 requests_quarantined=0 requests_held=0 tmp=0 quarantine_expired=0 mode=0755"; round(st, w);
+  t("③ gc r15 all-zero counts with mode=0755 => no audit (mode is not a count)", w.audit.length === 0); }
+{ const w = world(); const st = initialOrphanState(); w.gcLine = "gc: results=0 requests_quarantined=0 requests_held=0 tmp=0 quarantine_expired=0 mode=755 skipped=requests(symlink)"; round(st, w);
+  t("③ gc: a non-count field with a nonzero digit (mode=755) is not audited — counts are parsed by key", w.audit.length === 0); }
+{ const w = world(); const st = initialOrphanState(); w.gcLine = "gc: results=0 requests_quarantined=0 requests_held=0 tmp=3 quarantine_expired=0 mode=0700"; round(st, w);
+  t("③ gc r15 tmp=3 with mode => audited", w.audit.length === 1); }
+{ const w = world(); const st = initialOrphanState(); w.gcCode = 1; w.gcLine = "gc: unsafe_mode mode=0777 (group/other-writable control dir: UNKNOWN, nothing done)"; round(st, w);
+  t("③ gc r15 unsafe_mode => UNKNOWN anomaly logged, no audit", w.logs.some((l) => /gc UNKNOWN — anomaly: control dir is group\/other-writable/.test(l)) && w.audit.length === 0); }
 { const w = world(); const st = initialOrphanState();
   w.tmp = [{ name: "diag.json", ageMs: TMP_TTL_MS + 1 }, { name: "mirror-phase.json", ageMs: 1000 }]; round(st, w);
   t("③ tmp: only the >1h file removed", w.removed.join() === "diag.json"); }

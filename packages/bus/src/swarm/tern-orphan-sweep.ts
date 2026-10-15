@@ -5,8 +5,9 @@
  *      but the herdr session still exists ⇒ `herdr session stop <name>` then `herdr session delete <name>`.
  *   ② a seat-shell worker in state "live"/"stopping" whose Tern block (workers[].pane) is gone from `tern ls --json` ⇒ mark the
  *      record "orphan" (+stopped_at), then ① applies to its herdr session on the following confirmations.
- *   ③ control-plane files: the bridge's gc.sh (results/requests/tmp/quarantine TTLs; r12 line adds requests_held = could not
- *      quarantine, left in place, retried next run — any nonzero field is audited) + mirror-phase.json / diag.json older than 1h.
+ *   ③ control-plane files: the bridge's gc.sh (results/requests/tmp/quarantine TTLs; r12 adds requests_held, r15 adds
+ *      mode=<octal> and an exit-1 `unsafe_mode` line). Parsed by key: a nonzero COUNT field is audited; mode is not a count;
+ *      exit 1 (unreadable or unsafe_mode) is UNKNOWN, logged, never success. Plus mirror-phase.json / diag.json older than 1h.
  * Never touched: the herdr session "default", and ANY herdr session that no seat-shell record ever registered (a name shaped like
  * `<role>-<task>` is only a second check, never a reason). Seat-shell schema (coordinator, pinned 2026-10-15):
  *   ~/.agenthop/swarm/seat-shell/<sid>.json  { …, workers: [{ name, herdr_session, pane, kind:"tui", started_at, stopped_at, state }] }
@@ -63,8 +64,10 @@ export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; u
 
   // ③ control-plane files first: independent of herdr/tern reachability.
   const g = io.gc();
-  if (g.code !== 0) io.log(`orphan-sweep: gc UNKNOWN (${g.line})`);
-  else if (/=[1-9]/.test(g.line)) io.audit(`orphan-sweep ${g.line}`); // audit only when gc actually removed/moved something
+  // exit 1 = UNKNOWN, nothing done: control dir unreadable, or (r15) `gc: unsafe_mode mode=…` — group/other-writable dir
+  if (g.code !== 0) io.log(`orphan-sweep: gc UNKNOWN${/unsafe_mode/.test(g.line) ? " — anomaly: control dir is group/other-writable" : ""} (${g.line})`);
+  // audit only when a gc COUNT field is nonzero. Parse by key: r15 added mode=<octal> (e.g. mode=0755), which is not a count.
+  else if (/\b(results|requests_quarantined|requests_held|tmp|quarantine_expired)=[1-9]/.test(g.line)) io.audit(`orphan-sweep ${g.line}`);
   // r13: `skipped=<dir>(why),...` = a managed subdir was a symlink / outside the control dir and was NOT cleaned — an anomaly
   const skipped = g.code === 0 ? /\bskipped=(\S+)/.exec(g.line) : null;
   if (skipped) io.log(`orphan-sweep: gc anomaly — not cleaned: ${skipped[1]}`);
