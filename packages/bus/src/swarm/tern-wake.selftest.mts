@@ -8,7 +8,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, chmodSync } from "n
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  ternPaneInfoForSession, ternInjectCommands, ternSpawnable, selfShell,
+  ternPaneInfoForSession, ternInjectCommands, ternSpawnable, selfShell, shellWords, paneProgramArgv, classifyTernInspect,
+  seatShellFile, clearSeatShell, validSeatSid,
   readSeatShell, writeSeatShell, seatShellDir, wakeRoute, claimAllowed, type Shell,
 } from "./tern-wake.js";
 import { resolveWakePane, reachableTransports, inboxWakeStatus, wakeSession, type WakeDeps } from "./inbox-wake.js";
@@ -59,9 +60,11 @@ const pane = (id: number, sid: string, working: boolean | undefined, exited: unk
 // ── ① routing matrix (registered tern / registered herdr / unregistered) × probes ───────────────────────────────────
 await (async () => {
   const calls: Shell[] = [];
+  const F = (paneId: string) => ({ kind: "found" as const, paneId, state: "idle" as const });
+  const A = { kind: "absent" as const };
   const probes = (ternHit: boolean, herdrHit: boolean) => ({
-    tern: async () => { calls.push("tern"); return ternHit ? { paneId: "T1", state: "idle" as const } : null; },
-    herdr: async () => { calls.push("herdr"); return herdrHit ? { paneId: "w1:p4", state: "idle" as const } : null; },
+    tern: async () => { calls.push("tern"); return ternHit ? F("T1") : A; },
+    herdr: async () => { calls.push("herdr"); return herdrHit ? F("w1:p4") : A; },
   });
   const both: Shell[] = ["tern", "herdr"];
   const reg = (s: Shell) => ({ kind: "registered" as const, shell: s });
@@ -87,6 +90,17 @@ await (async () => {
   calls.length = 0;
   r = await resolveWakePane(wakeRoute(reg("tern")), ["herdr"], probes(true, true), SID);
   ok(r === null && calls.length === 0, "route: registered tern but this process cannot reach Tern ⇒ no probe, no-pane");
+  // IWT-SV-P2-2: an UNKNOWN Tern probe (CLI missing / daemon error / bad JSON) must STOP the walk — never fall back to herdr — and
+  // must be reported (not silent).
+  const notes: string[] = [];
+  calls.length = 0;
+  const brokenTern = { tern: async () => { calls.push("tern"); return { kind: "unknown" as const, reason: "ENOENT: cannot run tern" }; }, herdr: async () => { calls.push("herdr"); return F("w1:p4"); } };
+  r = await resolveWakePane(wakeRoute({ kind: "absent" }), both, brokenTern, SID, (n) => notes.push(n));
+  ok(r === null && JSON.stringify(calls) === '["tern"]', "route: Tern probe UNKNOWN ⇒ stops, does NOT wake the herdr twin");
+  ok(notes.some((n) => /tern probe failed \(ENOENT/.test(n)), "route: the unknown reason is reported (not silent)");
+  notes.length = 0;
+  r = await resolveWakePane(wakeRoute(reg("tern")), ["herdr"], probes(true, true), SID, (n) => notes.push(n));
+  ok(r === null && notes.some((n) => /tern transport not reachable/.test(n)), "route: registered tern but only herdr reachable ⇒ diagnosed (not silent)");
 })();
 // ── wakeSession dispatches inject by transport ──────────────────────────────────────────────────────────────────────
 await (async () => {
@@ -153,4 +167,49 @@ await (async () => {
   ok(claimAllowed({ kind: "absent" }, "herdr") && claimAllowed({ kind: "unreadable" }, "herdr"), "claim: unregistered / unreadable ⇒ allowed (v0 behavior)");
 }
 
+
+// ── IWT-SV-P2-1: real shell argument boundaries (quotes, comments, prompt text) ─────────────────────────────────────────
+{
+  const sh = (line: string) => ({ pane: 91, exited: null, working: false, args: ["-l", "-c", line] });
+  ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --resume '${SID}' --mode bypassPermissions`)]), SID)?.paneId === "91", "argv: single-quoted --resume value is matched (sh delivers it as a plain arg)");
+  ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --resume "${SID}"`)]), SID)?.paneId === "91", "argv: double-quoted --resume value is matched");
+  ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --resume real-sid # --resume ${SID}`)]), SID) === null, "argv: --resume inside a # comment is NOT evidence");
+  ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --prompt 'please --resume ${SID} later' --resume other`)]), SID) === null, "argv: --resume inside a quoted prompt is NOT evidence");
+  ok(ternPaneInfoForSession(inspect([sh(`echo --resume ${SID}`)]), SID) === null, "argv: a non-`tern acp` program is never a wake target");
+  ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --resume ${SID}; echo done`)]), SID)?.paneId === "91", "argv: only the first simple command counts (; separator)");
+  ok(ternPaneInfoForSession(inspect([sh(`true; tern acp claude --resume ${SID}`)]), SID) === null, "argv: a tern acp AFTER a separator is a different command");
+  ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --resume '${SID}`)]), SID) === null, "argv: unterminated quote ⇒ unparseable ⇒ not trusted");
+  ok(JSON.stringify(shellWords(`a 'b c' "d \\"e\\"" f\\ g # h`)) === JSON.stringify(["a", "b c", 'd "e"', "f g"]), "shellWords: quotes / escapes / comment");
+  ok(JSON.stringify(paneProgramArgv({ args: ["/usr/bin/tern", "acp", "codex", "--resume", SID] })) === JSON.stringify(["/usr/bin/tern", "acp", "codex", "--resume", SID]), "argv: a direct (non -c) argv is used as-is");
+}
+// ── IWT-SV-P2-2: three-state classification of a tern inspect run ───────────────────────────────────────────────────────
+{
+  const good = JSON.stringify(inspect([pane(102, SID, false)]));
+  ok(classifyTernInspect({ code: 0, stdout: good }, SID).kind === "found", "lookup: daemon answered + block ⇒ found");
+  ok(classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([])) }, SID).kind === "absent", "lookup: daemon answered, no block ⇒ absent");
+  ok(classifyTernInspect({ code: -1, stdout: "", error: "ENOENT: cannot run tern" }, SID).kind === "unknown", "lookup: CLI missing ⇒ unknown (not absent)");
+  ok(classifyTernInspect({ code: 4, stdout: "" }, SID).kind === "unknown", "lookup: daemon exit 4 ⇒ unknown");
+  ok(classifyTernInspect({ code: 0, stdout: "{not json" }, SID).kind === "unknown", "lookup: bad JSON ⇒ unknown");
+  ok(classifyTernInspect({ code: 0, stdout: JSON.stringify({ sessions: [] }) }, SID).kind === "unknown", "lookup: JSON without panes[] ⇒ unknown");
+}
+// ── IWT-SV-P2-3: no seat-shell path can escape the seat-shell dir ───────────────────────────────────────────────────────
+{
+  const h = mkdtempSync(path.join(scratch, "esc-"));
+  mkdirSync(path.join(h, ".agenthop", "swarm"), { recursive: true });
+  const outside = path.join(h, ".agenthop", "swarm", "review-state.json");
+  writeFileSync(outside, "{}");
+  for (const bad of ["../review-state", "..", "../../x", "a/b", "x.json", "", "a\\b"]) {
+    ok(!validSeatSid(bad), `sid: "${bad}" rejected`);
+    let threw = false; try { clearSeatShell(h, bad); } catch { threw = true; }
+    ok(threw, `clear: "${bad}" refused before any path is built`);
+  }
+  ok(readdirSync(path.join(h, ".agenthop", "swarm")).includes("review-state.json"), "clear: the outside file survives every escape attempt");
+  let threw = false; try { seatShellFile(h, "../x"); } catch { threw = true; }
+  ok(threw, "seatShellFile: the single path builder throws on an invalid sid");
+  writeSeatShell(h, SID, "tern", 1);
+  clearSeatShell(h, SID);
+  ok(readSeatShell(h, SID).kind === "absent", "clear: a valid sid clears normally (positive control)");
+  clearSeatShell(h, SID);
+  ok(true, "clear: clearing an already-absent seat is a no-op (ENOENT = success)");
+}
 console.log(`\nall tern-wake selftests passed (${n})`);

@@ -13,7 +13,7 @@ import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
 import { setInboxWakeHook, scanUnclaimedInbox } from "../inbox.js";
 import { herdrSpawnable, herdrPaneInfoForSession, herdrPrompt, type AgentState } from "./herdr.js";
-import { ternSpawnable, ternPaneInfoLive, ternInject, readSeatShell, wakeRoute, type Shell } from "./tern-wake.js";
+import { ternSpawnable, ternLookupLive, ternInject, readSeatShell, wakeRoute, type Shell, type TernLookup } from "./tern-wake.js";
 
 /** SWARM_INBOX_WAKE — live by default (opt-out; kill with =0), same opt-out family as the other swarm flags. */
 export function inboxWakeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -191,23 +191,38 @@ export function reachableTransports(env: NodeJS.ProcessEnv = process.env): Shell
   return out;
 }
 
-/** Resolve a seat's wake target across transports (pure given its probes): try the route for the seat's registered shell (registered ⇒
- *  only that shell; unregistered/unreadable ⇒ Tern first, then herdr), skipping transports this process cannot reach. The first probe
- *  that finds a pane wins and is tagged with its transport. */
+/** One transport probe's three-state answer (IWT-SV-P2-2). `unknown` ⇒ the probe itself failed (CLI missing, daemon error, bad
+ *  JSON) — never read as "not here". */
+export type ProbeResult = TernLookup;
+
+/** Resolve a seat's wake target across transports (pure given its probes): walk the route for the seat's registered shell
+ *  (registered ⇒ only that shell; unregistered/unreadable ⇒ Tern first, then herdr), skipping transports this process cannot
+ *  reach. `found` wins and is tagged with its transport. `absent` moves on to the next transport. `unknown` STOPS the walk: a
+ *  broken probe must not fall back to the other shell — that is exactly how a stale twin got woken (#1025). The reason is reported
+ *  via `note` so the degradation is never silent; delivery stays durable regardless. */
 export async function resolveWakePane(
-  route: Shell[], reachable: Shell[], probes: Record<Shell, (sid: string) => Promise<{ paneId: string; state: AgentState } | null>>, sid: string,
+  route: Shell[], reachable: Shell[], probes: Record<Shell, (sid: string) => Promise<ProbeResult>>, sid: string,
+  note?: (s: string) => void,
 ): Promise<PaneInfo | null> {
   for (const t of route) {
-    if (!reachable.includes(t)) continue;
-    const info = await probes[t](sid);
-    if (info) return { ...info, transport: t };
+    if (!reachable.includes(t)) { note?.(`${t} transport not reachable from this process — skipped`); continue; }
+    const r = await probes[t](sid);
+    if (r.kind === "found") return { paneId: r.paneId, state: r.state, transport: t };
+    if (r.kind === "unknown") { note?.(`${t} probe failed (${r.reason}) — NOT falling back to another shell; mail stays durable`); return null; }
   }
   return null;
 }
 
+/** Adapt herdr's found-or-null lookup to the three-state probe. herdr's runner already folds a CLI fault into null, so a null from
+ *  herdr is reported as absent (pre-existing herdr behavior, unchanged by this ticket). */
+async function herdrProbe(sid: string): Promise<ProbeResult> {
+  const r = await herdrPaneInfoForSession(sid);
+  return r ? { kind: "found", paneId: r.paneId, state: r.state } : { kind: "absent" };
+}
+
 function defaultWakeDeps(home: string, env: NodeJS.ProcessEnv, log?: (s: string) => void): WakeDeps {
   const reachable = reachableTransports(env);
-  const probes = { tern: ternPaneInfoLive, herdr: herdrPaneInfoForSession };
+  const probes = { tern: ternLookupLive, herdr: herdrProbe };
   return {
     now: () => Date.now(),
     cooldownMs: COOLDOWN_MS,
@@ -215,7 +230,11 @@ function defaultWakeDeps(home: string, env: NodeJS.ProcessEnv, log?: (s: string)
     paneInfo: async (sid) => {
       const reg = readSeatShell(home, sid);
       if (reg.kind === "unreadable") log?.(`[inbox-wake] ${sid}: seat-shell registration unreadable ⇒ routing as unregistered (both shells, Tern first)`);
-      return resolveWakePane(wakeRoute(reg), reachable, probes, sid);
+      const route = wakeRoute(reg);
+      const notes: string[] = [];
+      const info = await resolveWakePane(route, reachable, probes, sid, (n) => notes.push(n));
+      if (!info && notes.length) log?.(`[inbox-wake] ${sid}: no wake target (route ${route.join("→")}; ${notes.join("; ")})`);
+      return info;
     },
     scan: scanUnclaimedInbox,
     inject: async (paneId, text, transport) =>

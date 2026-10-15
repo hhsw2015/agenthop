@@ -8,15 +8,14 @@
 //   node <tsx> scripts/seat-shell.ts clear <sid>              (back to unregistered: both shells probed, Tern first)
 // AH_HOME overrides the home dir.
 import { homedir } from "node:os";
-import { unlinkSync } from "node:fs";
-import path from "node:path";
-import { writeSeatShell, readSeatShell, seatShellDir, type Shell } from "../packages/bus/src/swarm/tern-wake.js";
+import { writeSeatShell, readSeatShell, clearSeatShell, validSeatSid, type Shell } from "../packages/bus/src/swarm/tern-wake.js";
 
 const [mode, sid, shell, pidArg] = process.argv.slice(2);
 const home = process.env.AH_HOME || homedir();
 const fail = (m: string): never => { process.stderr.write(`seat-shell: ${m}\n`); process.exit(2); };
 
 if (!sid) fail("usage: seat-shell <set|get|clear> <sid> [tern|herdr]");
+if (!validSeatSid(sid!)) fail(`invalid sid: ${sid}`); // validated BEFORE any mode builds a path (IWT-SV-P2-3)
 if (mode === "set") {
   if (shell !== "tern" && shell !== "herdr") fail("set needs a shell: tern | herdr");
   const pid = pidArg === undefined ? undefined : Number(pidArg);
@@ -26,8 +25,7 @@ if (mode === "set") {
   const r = readSeatShell(home, sid!);
   process.stdout.write(`${r.kind === "registered" ? r.shell : r.kind}\n`);
 } else if (mode === "clear") {
-  try { unlinkSync(path.join(seatShellDir(home), `${sid}.json`)); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") fail((e as Error).message); }
+  try { clearSeatShell(home, sid!); } catch (e) { fail((e as Error).message); }
   process.stdout.write(`${sid} cleared\n`);
 } else {
   fail("usage: seat-shell <set|get|clear> <sid> [tern|herdr]");
