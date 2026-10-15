@@ -6,7 +6,7 @@
 //
 // Scope (frozen): ONLY top-level `<name>.json` messages in the old box. `processed/`, `.pubcred/`, quarantine and `.wtmp-*` temps are
 // never touched. A `.claim-<pid>` held by a LIVE process is in flight and is left alone; one held by a DEAD pid is first returned to
-// pending by the bus's own stale rule (recoverStaleClaims) and then migrated like any other unread message.
+// pending — WITHOUT overwriting (r3): if a new message already sits at that name, the claim is kept and reported as a conflict.
 //
 // Per message (r2, CIA-MIGRATION-CLAIM): (1) CLAIM it — the bus's atomic rename `<name>.json → <name>.json.claim-<our pid>`. If that
 // rename fails, another consumer took it first ⇒ `contended`, not moved. Holding the claim, no other consumer can read or publish it.
@@ -15,14 +15,42 @@
 // `mig-` + sha256(fromSid + NUL + name)[0..32]. (4) Only after the new box answers published/already, remove our claim. A crash after
 // (1) leaves `.claim-<dead pid>`, which the next run recovers; the key makes the re-publish "already", so no message is duplicated.
 import { homedir } from "node:os";
-import { readdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import { readdirSync, readFileSync, renameSync, unlinkSync, linkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { writeInbox, validInboxMsg, recoverStaleClaims } from "../packages/bus/src/inbox.js";
+import { writeInbox, validInboxMsg } from "../packages/bus/src/inbox.js";
 import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { resolveCoordinatorInbox } from "../packages/bus/src/swarm/coord-inbox.js";
 
-export type MigrateOutcome = { moved: string[]; skippedInvalid: string[]; contended: string[]; failed: { name: string; why: string }[] };
+export type MigrateOutcome = { moved: string[]; skippedInvalid: string[]; contended: string[]; conflict: string[]; failed: { name: string; why: string }[] };
+
+/** Release a claim WITHOUT overwriting (CIA-RELEASE-OWN): hard-link the claim back to its pending name (linkSync fails with EEXIST if
+ *  another writer has meanwhile put a NEW message at that name — rename would silently replace it), then drop the claim name. Returns
+ *  "released", "conflict" (the name is taken — we KEEP our claim so both bodies survive), or "error". Never throws. */
+function releaseNoOverwrite(claimed: string, file: string): "released" | "conflict" | "error" {
+  try { linkSync(claimed, file); } catch (e) { return (e as NodeJS.ErrnoException).code === "EEXIST" ? "conflict" : "error"; }
+  try { unlinkSync(claimed); } catch { /* the pending copy exists; a leftover claim name is reclaimed by the next run */ }
+  return "released";
+}
+
+/** Dead-claim recovery for the OLD box, with the same no-overwrite rule (the bus core's recoverStaleClaims uses rename, which can
+ *  replace a message a writer has since put at the pending name). Returns the names it could not return because the pending name
+ *  was taken (both bodies kept). Never throws. */
+function recoverDeadClaimsNoOverwrite(dir: string): string[] {
+  const conflicts: string[] = [];
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return conflicts; }
+  for (const n of names) {
+    const m = n.match(/^(.+\.json)\.claim-(?:disp-)?(\d+)$/);
+    if (!m) continue;
+    const pid = Number(m[2]);
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; } catch (e) { alive = (e as NodeJS.ErrnoException).code === "EPERM"; }
+    if (alive) continue; // a LIVE holder: in flight, leave it alone
+    if (releaseNoOverwrite(path.join(dir, n), path.join(dir, m[1]!)) === "conflict") conflicts.push(m[1]!);
+  }
+  return conflicts;
+}
 
 /** The migration's idempotency key for one source message: unambiguous over (source box, full file name), bounded length. Pure. */
 export function migrationKey(fromSid: string, name: string): string {
@@ -36,8 +64,8 @@ export function migrateCoordInbox(home: string, fromSid: string, toSid: string, 
   if (!isValidSessionId(fromSid) || !isValidSessionId(toSid)) throw new Error("invalid session id");
   if (fromSid === toSid) throw new Error("--from and --to are the same box");
   const src = path.join(home, ".agenthop", "inbox", fromSid);
-  const out: MigrateOutcome = { moved: [], skippedInvalid: [], contended: [], failed: [] };
-  if (!dry) recoverStaleClaims(home, [fromSid]); // a DEAD pid's claim (incl. our own crashed run) ⇒ back to pending; a live one is left alone
+  const out: MigrateOutcome = { moved: [], skippedInvalid: [], contended: [], conflict: [], failed: [] };
+  if (!dry) out.conflict.push(...recoverDeadClaimsNoOverwrite(src)); // a DEAD pid's claim ⇒ back to pending without overwriting; a live one is left alone
   let names: string[];
   try { names = readdirSync(src); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return out; throw e; }
   for (const name of names.filter((n) => n.endsWith(".json")).sort()) { // top-level `.json` only: never `.claim-*`, dirs, or temps
@@ -48,18 +76,27 @@ export function migrateCoordInbox(home: string, fromSid: string, toSid: string, 
       continue;
     }
     const claimed = `${file}.claim-${claimer}`;
-    try { renameSync(file, claimed); } catch { out.contended.push(name); continue; } // another consumer took it first ⇒ not ours
+    try { renameSync(file, claimed); }
+    catch (e) { // CIA-CLAIM-ERRNO: only a VANISHED source is a lost race; any other errno is a real fault
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") out.contended.push(name);
+      else out.failed.push({ name, why: `claim failed (${code ?? "error"}): ${(e as Error).message}` });
+      continue;
+    }
     afterClaim?.(name); // TEST SEAM (undefined in production): the read→publish window where a competing consumer could act
     let msg;
     try { msg = validInboxMsg(JSON.parse(readFileSync(claimed, "utf8"))); } catch { msg = null; }
     if (!msg) { // invalid ⇒ return it to pending and report (never drop, never quarantine — frozen scope)
-      try { renameSync(claimed, file); out.skippedInvalid.push(name); } catch (e) { out.failed.push({ name, why: `invalid and could not be released: ${(e as Error).message}` }); }
+      const rel = releaseNoOverwrite(claimed, file);
+      if (rel === "released") out.skippedInvalid.push(name);
+      else if (rel === "conflict") out.conflict.push(name);
+      else out.failed.push({ name, why: "invalid and could not be released" });
       continue;
     }
     let res: string;
     try { res = writeInbox(home, toSid, msg, migrationKey(fromSid, name)); }
-    catch (e) { try { renameSync(claimed, file); } catch { /* the stale rule returns it after we exit */ } out.failed.push({ name, why: (e as Error).message }); continue; }
-    if (res !== "published" && res !== "already") { try { renameSync(claimed, file); } catch { /* stale rule */ } out.failed.push({ name, why: `new box answered ${res}` }); continue; }
+    catch (e) { const rel = releaseNoOverwrite(claimed, file); if (rel === "conflict") out.conflict.push(name); out.failed.push({ name, why: (e as Error).message }); continue; }
+    if (res !== "published" && res !== "already") { const rel = releaseNoOverwrite(claimed, file); if (rel === "conflict") out.conflict.push(name); out.failed.push({ name, why: `new box answered ${res}` }); continue; }
     try { unlinkSync(claimed); } catch (e) { out.failed.push({ name, why: `published but our claim not removed: ${(e as Error).message}` }); continue; }
     out.moved.push(name);
   }
@@ -76,11 +113,12 @@ function main(): void {
   if (!toSid) { try { toSid = resolveCoordinatorInbox(home, process.env); } catch (e) { fail((e as Error).message); } }
   const dry = a.includes("--dry");
   const r = migrateCoordInbox(home, fromSid!, toSid!, dry);
-  process.stdout.write(`${dry ? "[dry] would move" : "moved"} ${r.moved.length} → ${toSid}; invalid-left ${r.skippedInvalid.length}; contended ${r.contended.length}; failed ${r.failed.length}\n`);
+  process.stdout.write(`${dry ? "[dry] would move" : "moved"} ${r.moved.length} → ${toSid}; invalid-left ${r.skippedInvalid.length}; contended ${r.contended.length}; conflict ${r.conflict.length}; failed ${r.failed.length}\n`);
   for (const f of r.failed) process.stdout.write(`  failed ${f.name}: ${f.why}\n`);
   for (const n of r.skippedInvalid) process.stdout.write(`  left (invalid) ${n}\n`);
   for (const n of r.contended) process.stdout.write(`  contended (claimed by another consumer) ${n}\n`);
-  if (r.failed.length) process.exitCode = 1;
+  for (const n of r.conflict) process.stdout.write(`  conflict (a new message took the name; our claim kept, both bodies preserved) ${n}\n`);
+  if (r.failed.length || r.conflict.length) process.exitCode = 1;
 }
 
 if (process.argv[1] && /migrate-coord-inbox\.ts$/.test(process.argv[1])) main();

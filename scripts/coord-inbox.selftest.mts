@@ -114,6 +114,46 @@ try {
     migrateCoordInbox(h, OLD, NEW);
     ok(pending(h, NEW).length === before, "migrate: a message a live consumer already claimed is NOT published to the new box");
   }
+  { // CIA-RELEASE-OWN (r3): releasing our claim must NOT overwrite a new message a writer put at the vacated source name
+    const h = home();
+    writeInbox(h, OLD, m("A-claimed"));
+    const name = pending(h, OLD)[0]!;
+    mkdirSync(path.join(h, ".agenthop", "inbox"), { recursive: true });
+    writeFileSync(path.join(h, ".agenthop", "inbox", NEW), "a FILE where the new box dir should be"); // ⇒ publish into NEW fails
+    const r = migrateCoordInbox(h, OLD, NEW, false, "mig-test", () => {
+      writeFileSync(path.join(box(h, OLD), name), JSON.stringify(m("B-new-writer"))); // another writer re-creates the vacated name
+    });
+    const ob = box(h, OLD);
+    const bodies = readdirSync(ob).filter((x) => x.startsWith(name)).map((x) => JSON.parse(readFileSync(path.join(ob, x), "utf8")).text).sort();
+    ok(bodies.join(",") === "A-claimed,B-new-writer", `release: BOTH bodies survive (A in our kept claim, B at the pending name) — got ${bodies.join(",")}`);
+    ok(r.conflict.includes(name) && r.failed.length === 1, "release: reported as conflict (+ the publish failure), not silently resolved");
+    rmSync(path.join(h, ".agenthop", "inbox", NEW));
+  }
+  { // CIA-RELEASE-OWN for dead-claim recovery: a dead claim whose pending name is taken is kept, not overwritten
+    const h = home();
+    mkdirSync(box(h, OLD), { recursive: true });
+    writeFileSync(path.join(box(h, OLD), "0000000000000001-x.json.claim-999999"), JSON.stringify(m("A-dead-claim")));
+    writeFileSync(path.join(box(h, OLD), "0000000000000001-x.json"), JSON.stringify(m("B-same-name")));
+    const r = migrateCoordInbox(h, OLD, NEW);
+    const kept = existsSync(path.join(box(h, OLD), "0000000000000001-x.json.claim-999999"));
+    const texts = pending(h, NEW).map((f) => JSON.parse(readFileSync(path.join(box(h, NEW), f), "utf8")).text);
+    ok(kept && texts.includes("B-same-name") && r.conflict.includes("0000000000000001-x.json"), "recovery: dead claim kept (A) while the new pending message (B) migrates — both survive");
+  }
+  { // CIA-CLAIM-ERRNO (r3): a permission fault is FAILED with its errno, not "contended"; the CLI exits non-zero
+    const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+    if (!isRoot) {
+      const h = home();
+      writeInbox(h, OLD, m("stuck-ro"));
+      const { chmodSync } = await import("node:fs");
+      chmodSync(box(h, OLD), 0o500); // readable, not writable ⇒ the claim rename fails with EACCES
+      const r = migrateCoordInbox(h, OLD, NEW);
+      const cli = spawnSync(TSX, [path.join(here, "migrate-coord-inbox.ts"), "--from", OLD, "--to", NEW], { env: { ...process.env, AH_HOME: h }, encoding: "utf8" });
+      chmodSync(box(h, OLD), 0o700);
+      ok(r.contended.length === 0 && r.failed.length === 1 && /EACCES|EPERM/.test(r.failed[0]!.why), `errno: read-only dir ⇒ failed with the errno, not contended (${r.failed[0]?.why ?? "none"})`);
+      ok(cli.status !== 0 && !/claimed by another consumer/.test(cli.stdout), "errno: CLI exits non-zero and does not claim another consumer took it");
+      ok(pending(h, OLD).length === 1, "errno: the message is still pending in the old box (not lost, not moved)");
+    } else console.log("skip  errno test (root bypasses perms)");
+  }
   { // CIA-MIGRATION-KEY: keys are unambiguous over (source box, FULL file name)
     const long = "a".repeat(140);
     ok(migrationKey(OLD, `${long}x.json`) !== migrationKey(OLD, `${long}y.json`), "key: two long names differing only in the last char ⇒ different keys");
