@@ -147,3 +147,27 @@ same-run A→B theft counterexample (`"F40-1 counterexample"`) pins that B never
   off. It only ever WRITES a coordinator escalation (same surface the observer uses), never a control-log action.
 - **legacyInboxKeys tool/cwd guard skips when either side is falsy** (unknown tool / no cwd) → permissive; a flaky
   tool-detection across runs could miss a legacy key. Safe direction (no theft; ③ catches the residue).
+
+## Addendum (#1032-C, 2026-10-15) — the sentinel's coordinator exception
+
+**Symptom.** After the coordinator's session moved from native `fe0376cd…` to `c5beaa7c…`, the sentinel raised repeated STALL
+alerts on the `fe0376cd…` box while the coordinator was alive and working.
+
+**Two causes, two fixes.**
+1. *No identity link* (data, fixed in the alias-log, not in code): nothing tied the two natives, so even the coordinator's own
+   core never drained the old box. One `observe` event now records `run=fe0376cd…` under `native=c5beaa7c…` (same tool+cwd);
+   `legacyInboxKeys` inherits it, and a test letter to the old box was auto-claimed by the coordinator's presence process.
+2. *Sentinel could not see that link* (code, this addendum): `runInboxSentinel` expands a session's legacy boxes only when
+   `whois(sid)` is a SINGLE entity, because `legacyInboxKeys` needs the session's real tool+cwd and an ambiguous alias-log
+   cannot supply them — guessing would over-credit and suppress a real stall. A long-lived coordinator is resumed under many
+   runs and is always ambiguous (`whois(c5beaa7c)` = 44 candidates), so its legacy boxes were never credited.
+
+**Why the coordinator is special — and only the coordinator.** The dispatcher has facts about the coordinator that do NOT
+come from the alias-log: `SWARM_COORDINATOR` resolves to its sid, and the coordinator's live presence pid gives the real tool
+(the process's executable name) and cwd (the process's working directory). With those, `coordinatorLegacyKeys`
+(`swarm/coordinator-keys.ts`) computes exactly the key set the coordinator's core drains — no guess. For every other member
+the dispatcher has no such independent facts, so the conservative rule stays: no single entity ⇒ only the direct sid is
+credited (an under-credit = a safe false alert the coordinator checks; never a silently suppressed stall).
+
+**Guards.** Missing tool or cwd ⇒ no expansion. Wrong tool / wrong cwd / another session's sid ⇒ nothing inherited
+(`coordinator-keys.selftest.mts`, 11 checks). Process facts are read-only (`swarm/proc-facts.ts`) and fail soft to null.

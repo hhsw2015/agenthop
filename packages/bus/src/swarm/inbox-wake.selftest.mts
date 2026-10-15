@@ -203,8 +203,10 @@ ok(installInboxWake(undefined, { HERDR_ENV: "1", HERDR_PANE_ID: "p1" }) === true
 
 // F54: honest tri-state status + inert-reason log (no more silent "on" while the hook is unset)
 ok(inboxWakeStatus({ SWARM_INBOX_WAKE: "0" }) === "off", "status: flag off ⇒ off");
-ok(inboxWakeStatus({ HERDR_ENV: "1", HERDR_PANE_ID: "p1" }) === "on", "status: flag on + herdr ⇒ on");
-ok(inboxWakeStatus({ HERDR_ENV: "", HERDR_PANE_ID: "" }) === "on(inert:no-herdr)", "status: flag on but no herdr ⇒ on(inert:no-herdr), not a bare on");
+ok(inboxWakeStatus({ HERDR_ENV: "1", HERDR_PANE_ID: "p1" }) === "on(herdr)", "status: flag on + herdr only ⇒ on(herdr)");
+ok(inboxWakeStatus({ TERN_PANE: "105" }) === "on(tern)", "status: flag on + tern only ⇒ on(tern)");
+ok(inboxWakeStatus({ TERN_PANE: "105", HERDR_ENV: "1", HERDR_PANE_ID: "p1" }) === "on(tern+herdr)", "status: both reachable ⇒ on(tern+herdr)");
+ok(inboxWakeStatus({ HERDR_ENV: "", HERDR_PANE_ID: "" }) === "on(inert:no-transport)", "status: flag on but no transport ⇒ on(inert:no-transport), not a bare on");
 { const lines: string[] = []; installInboxWake((s) => lines.push(s), { HERDR_ENV: "", HERDR_PANE_ID: "" }); ok(lines.some((l) => /INERT/.test(l)), "install: on + no-herdr LOGS the inert reason (no longer silent)"); }
 { const lines: string[] = []; installInboxWake((s) => lines.push(s), { SWARM_INBOX_WAKE: "0" }); ok(lines.length === 0, "install: flag off ⇒ no log (off is intentional, shown by the flags line)"); }
 setInboxWakeHook(null);

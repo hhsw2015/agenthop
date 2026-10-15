@@ -13,6 +13,7 @@ import path from "node:path";
 import { flagDefaultOn } from "./flag-default.js";
 import { setInboxWakeHook, scanUnclaimedInbox } from "../inbox.js";
 import { herdrSpawnable, herdrPaneInfoForSession, herdrPrompt, type AgentState } from "./herdr.js";
+import { ternSpawnable, ternLookupLive, ternInject, readSeatShell, wakeRoute, type Shell, type TernLookup } from "./tern-wake.js";
 
 /** SWARM_INBOX_WAKE — live by default (opt-out; kill with =0), same opt-out family as the other swarm flags. */
 export function inboxWakeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -140,7 +141,8 @@ export function claimWakeSlot(home: string, sid: string, now: number, cooldownMs
   return true;
 }
 
-export type PaneInfo = { paneId: string; state: AgentState };
+/** `transport` says which shell the pane lives in, so `inject` types into the right one (absent ⇒ herdr, the v0 behavior). */
+export type PaneInfo = { paneId: string; state: AgentState; transport?: Shell };
 /** Injectable IO surface so wakeSession is unit-testable without spawning herdr subprocesses or touching the real clock/filesystem. */
 export interface WakeDeps {
   now: () => number;
@@ -148,7 +150,7 @@ export interface WakeDeps {
   claim: (home: string, sid: string, now: number, cooldownMs: number) => boolean; // 先占后发: atomic cross-process slot claim
   paneInfo: (sid: string) => Promise<PaneInfo | null>;                            // resolve sid -> {paneId,state}; null = not a herdr pane
   scan: (home: string, sid: string) => { count: number; oldestMtimeMs: number };
-  inject: (paneId: string, text: string) => Promise<boolean>;
+  inject: (paneId: string, text: string, transport?: Shell) => Promise<boolean>;
   log?: (s: string) => void;
 }
 export type WakeOutcome = "injected" | "cooldown" | "state" | "empty" | "no-pane" | "error";
@@ -163,8 +165,8 @@ export async function wakeSession(home: string, sid: string, d: WakeDeps): Promi
     if (!info) return "no-pane"; // not a herdr pane (cloud / codex-queue session) ⇒ by-type seam; nothing to inject on this channel
     const { count } = d.scan(home, sid);
     if (!shouldInjectWake(d.now(), -Infinity, info.state, count, d.cooldownMs)) return count > 0 ? "state" : "empty"; // cooldown already held by the claim
-    const ok = await d.inject(info.paneId, wakeText(count));
-    d.log?.(`[inbox-wake] ${sid}: wake injected (${count} unclaimed, pane ${info.paneId}, state ${info.state}, ok=${ok})`);
+    const ok = await d.inject(info.paneId, wakeText(count), info.transport);
+    d.log?.(`[inbox-wake] ${sid}: wake injected (${count} unclaimed, ${info.transport ?? "herdr"} pane ${info.paneId}, state ${info.state}, ok=${ok})`);
     return "injected";
   } catch (e) { d.log?.(`[inbox-wake] ${sid}: wake failed (isolated): ${e instanceof Error ? e.message : e}`); return "error"; }
 }
@@ -179,47 +181,95 @@ export async function runWakeBackstop(home: string, sid: string, d: WakeDeps, ba
   return wakeSession(home, sid, d);
 }
 
-// --- production wiring (real herdr + filesystem claim) ----------------------------------------------------------------------------
-function defaultWakeDeps(log?: (s: string) => void): WakeDeps {
+// --- production wiring (real herdr/tern + filesystem claim) -----------------------------------------------------------------------
+
+/** Which wake transports THIS process can reach. Pure. */
+export function reachableTransports(env: NodeJS.ProcessEnv = process.env): Shell[] {
+  const out: Shell[] = [];
+  if (ternSpawnable(env)) out.push("tern");
+  if (herdrSpawnable(env)) out.push("herdr");
+  return out;
+}
+
+/** One transport probe's three-state answer (IWT-SV-P2-2). `unknown` ⇒ the probe itself failed (CLI missing, daemon error, bad
+ *  JSON) — never read as "not here". */
+export type ProbeResult = TernLookup;
+
+/** Resolve a seat's wake target across transports (pure given its probes): walk the route for the seat's registered shell
+ *  (registered ⇒ only that shell; unregistered/unreadable ⇒ Tern first, then herdr), skipping transports this process cannot
+ *  reach. `found` wins and is tagged with its transport. `absent` moves on to the next transport. `unknown` STOPS the walk: a
+ *  broken probe must not fall back to the other shell — that is exactly how a stale twin got woken (#1025). The reason is reported
+ *  via `note` so the degradation is never silent; delivery stays durable regardless. */
+export async function resolveWakePane(
+  route: Shell[], reachable: Shell[], probes: Record<Shell, (sid: string) => Promise<ProbeResult>>, sid: string,
+  note?: (s: string) => void,
+): Promise<PaneInfo | null> {
+  for (const t of route) {
+    if (!reachable.includes(t)) { note?.(`${t} transport not reachable from this process — skipped`); continue; }
+    const r = await probes[t](sid);
+    if (r.kind === "found") return { paneId: r.paneId, state: r.state, transport: t };
+    if (r.kind === "unknown") { note?.(`${t} probe failed (${r.reason}) — NOT falling back to another shell; mail stays durable`); return null; }
+  }
+  return null;
+}
+
+/** Adapt herdr's found-or-null lookup to the three-state probe. herdr's runner already folds a CLI fault into null, so a null from
+ *  herdr is reported as absent (pre-existing herdr behavior, unchanged by this ticket). */
+async function herdrProbe(sid: string): Promise<ProbeResult> {
+  const r = await herdrPaneInfoForSession(sid);
+  return r ? { kind: "found", paneId: r.paneId, state: r.state } : { kind: "absent" };
+}
+
+function defaultWakeDeps(home: string, env: NodeJS.ProcessEnv, log?: (s: string) => void): WakeDeps {
+  const reachable = reachableTransports(env);
+  const probes = { tern: ternLookupLive, herdr: herdrProbe };
   return {
     now: () => Date.now(),
     cooldownMs: COOLDOWN_MS,
     claim: claimWakeSlot,
-    paneInfo: async (sid) => herdrPaneInfoForSession(sid),
+    paneInfo: async (sid) => {
+      const reg = readSeatShell(home, sid);
+      if (reg.kind === "unreadable") log?.(`[inbox-wake] ${sid}: seat-shell registration unreadable ⇒ routing as unregistered (both shells, Tern first)`);
+      const route = wakeRoute(reg);
+      const notes: string[] = [];
+      const info = await resolveWakePane(route, reachable, probes, sid, (n) => notes.push(n));
+      if (!info && notes.length) log?.(`[inbox-wake] ${sid}: no wake target (route ${route.join("→")}; ${notes.join("; ")})`);
+      return info;
+    },
     scan: scanUnclaimedInbox,
-    inject: async (paneId, text) => (await herdrPrompt(paneId, text)).submitted === "yes",
+    inject: async (paneId, text, transport) =>
+      transport === "tern" ? ternInject(paneId, text) : (await herdrPrompt(paneId, text)).submitted === "yes",
     log,
   };
 }
 
 /** Install the real-time wake into the delivery primitive (called from the library-init path, startBusCore, + the dispatcher): once
- *  set, writeInbox fires it on every new message in THIS process — any caller, zero discipline. Gated on the flag AND herdr being
- *  reachable from this process (herdrSpawnable): herdr-not-detected ⇒ leave the hook unset (silently skip, fail-soft) so a non-herdr
- *  process adds no cost and the unit suite is byte-for-byte v0. Idempotent (overwrites). Returns whether the hook was installed. */
+ *  set, writeInbox fires it on every new message in THIS process — any caller, zero discipline. Gated on the flag AND at least one wake
+ *  transport (Tern or herdr) being reachable from this process; none ⇒ leave the hook unset (fail-soft) and LOG why (F54: never a
+ *  silent inert). Idempotent (overwrites). Returns whether the hook was installed. */
 export function installInboxWake(log?: (s: string) => void, env: NodeJS.ProcessEnv = process.env): boolean {
   if (!inboxWakeEnabled(env)) { setInboxWakeHook(null); return false; } // OFF: intentional + honestly shown by the flags line
-  // F54: SWARM_INBOX_WAKE is ON but this process cannot reach herdr (HERDR_ENV/HERDR_PANE_ID unset) ⇒ the real-time hook stays
-  // UNSET. This used to be a SILENT skip while the flags line still said "on" — a bare-env dispatcher restart left wake dead for
-  // 20 min with no trace. Log the reason so the inert state is never silent (the flags line also reports it as on(inert:no-herdr)).
-  if (!herdrSpawnable(env)) {
+  if (reachableTransports(env).length === 0) {
     setInboxWakeHook(null);
-    log?.("inbox-wake: SWARM_INBOX_WAKE on but herdr is NOT reachable from this process (HERDR_ENV/HERDR_PANE_ID unset) — real-time wake INERT; writeInbox still delivers DURABLY and the target's own inbox poll still applies. NOTE: this process's dispatcher backstop shares the SAME herdr gate, so it is ALSO inert here — re-pings need a herdr-reachable dispatcher");
+    log?.("inbox-wake: SWARM_INBOX_WAKE on but NO wake transport is reachable from this process (neither Tern: TERN_PANE/TERN_BIN unset, nor herdr: HERDR_ENV/HERDR_PANE_ID unset) — real-time wake INERT; writeInbox still delivers DURABLY and the target's own inbox poll still applies. NOTE: this process's dispatcher backstop shares the SAME gate, so it is ALSO inert here");
     return false;
   }
-  const deps = defaultWakeDeps(log);
-  setInboxWakeHook((home, sid) => { void wakeSession(home, sid, deps).catch(() => undefined); }); // fire-and-forget, fully fail-soft
+  setInboxWakeHook((home, sid) => { void wakeSession(home, sid, defaultWakeDeps(home, env, log)).catch(() => undefined); }); // fire-and-forget, fully fail-soft
   return true;
 }
 
-/** F54: the honest tri-state for the dispatcher flags line. `inboxWakeEnabled` alone reports only the FLAG; the real-time hook is
- *  additionally gated on herdr being reachable from THIS process, so "flag on + no herdr" is live-but-INERT, not "on". Pure. */
-export function inboxWakeStatus(env: NodeJS.ProcessEnv = process.env): "off" | "on" | "on(inert:no-herdr)" {
+export type InboxWakeStatus = "off" | "on(tern)" | "on(herdr)" | "on(tern+herdr)" | "on(inert:no-transport)";
+
+/** F54: the honest status for the dispatcher flags line — which transports the real-time hook can actually use from THIS process. Pure. */
+export function inboxWakeStatus(env: NodeJS.ProcessEnv = process.env): InboxWakeStatus {
   if (!inboxWakeEnabled(env)) return "off";
-  return herdrSpawnable(env) ? "on" : "on(inert:no-herdr)";
+  const r = reachableTransports(env);
+  if (r.length === 0) return "on(inert:no-transport)";
+  return `on(${r.join("+")})` as InboxWakeStatus;
 }
 
-/** Dispatcher-sweep backstop entry: re-ping a session's box if an item has lain unclaimed past the window. No-op when off / no herdr. */
+/** Dispatcher-sweep backstop entry: re-ping a session's box if an item has lain unclaimed past the window. No-op when off / no transport. */
 export async function backstopWake(home: string, sid: string, log?: (s: string) => void, env: NodeJS.ProcessEnv = process.env): Promise<WakeOutcome | "fresh" | "off"> {
-  if (!sid || !inboxWakeEnabled(env) || !herdrSpawnable(env)) return "off";
-  return runWakeBackstop(home, sid, defaultWakeDeps(log));
+  if (!sid || !inboxWakeEnabled(env) || reachableTransports(env).length === 0) return "off";
+  return runWakeBackstop(home, sid, defaultWakeDeps(home, env, log));
 }

@@ -18,6 +18,7 @@
  * PURE (msglog P1 / resume.ts discipline): no fs, no bus, no top-level side effects. The IO shell is fleet-recovery-store.ts + the
  * thin scripts/swarm-recover.ts orchestrator (whose orchestration is itself a dep-injected pure-ish function here: orchestrateRecover).
  */
+import type { InboxWakeStatus } from "./inbox-wake.js";
 import { flagDefaultOn } from "./flag-default.js";
 import { verifyOpsAction, type OpsVerdict, type OpsReceiptRecord } from "./coordinator-ops-receipt.js";
 
@@ -45,9 +46,11 @@ export function breakpointInjectionEnabled(env: NodeJS.ProcessEnv = process.env)
 /** Non-family env names recovery explicitly needs: AH_HOME + the endpoint base URLs. */
 export const ENV_NAME_ALLOW: readonly string[] = ["AH_HOME", "ANTHROPIC_BASE_URL", "CPA_BASE_URL"];
 
-/** Allowed NAME PREFIXES — the SWARM_ identity+flag family + the HERDR_ reachability family (Q2/F54: HERDR_ENV/HERDR_PANE_ID gate
- *  inbox-wake, HERDR_BIN/HERDR_SOCKET_PATH let the relaunched dispatcher actually reach herdr). A new non-family var is dropped. */
-export const ENV_PREFIX_ALLOW: readonly string[] = ["SWARM_", "HERDR_"];
+/** Allowed NAME PREFIXES — the SWARM_ identity+flag family + the HERDR_ and TERN_ reachability families (Q2/F54: HERDR_ENV/HERDR_PANE_ID
+ *  gate herdr inbox-wake, HERDR_BIN/HERDR_SOCKET_PATH let the relaunched dispatcher reach herdr; TERN_BIN lets a dispatcher outside a
+ *  Tern pane reach Tern seats — #1032, without it the self-recorded recipe would silently drop it on every restart). A new
+ *  non-family var is dropped. */
+export const ENV_PREFIX_ALLOW: readonly string[] = ["SWARM_", "HERDR_", "TERN_"];
 
 /** The SECRET name denylist — overrides every allow rule (a credential NAME is never captured). */
 export const ENV_SECRET_RE = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|_PAT(?![A-Z]))/i;
@@ -160,9 +163,10 @@ export function dispatcherNeedsRelaunch(snap: FleetSnapshot, dispatcherLiveNow: 
   return snap.dispatcher !== null;
 }
 
-/** The F54 wake-health gate (Q2): "on" ⇒ healthy; "on(inert:no-herdr)" / "off" ⇒ the wake capability did NOT come back. Pure. */
-export function wakeHealthy(status: "off" | "on" | "on(inert:no-herdr)"): boolean {
-  return status === "on";
+/** The F54 wake-health gate (Q2): any reachable transport ("on(tern)" / "on(herdr)" / "on(tern+herdr)") ⇒ healthy; "off" /
+ *  "on(inert:...)" ⇒ the wake capability did NOT come back. Legacy bare "on" still reads healthy. Pure. */
+export function wakeHealthy(status: InboxWakeStatus | "on" | "on(inert:no-herdr)"): boolean {
+  return status === "on" || status === "on(tern)" || status === "on(herdr)" || status === "on(tern+herdr)";
 }
 
 /** Durable facts for the relaunched dispatcher. `wakeStatus` is null when the TARGET's env could not be read (FR-3: never borrow
@@ -170,7 +174,7 @@ export function wakeHealthy(status: "off" | "on" | "on(inert:no-herdr)"): boolea
 export interface DispatcherLiveness {
   pidAlive: boolean;
   heartbeatFreshSec: number | null;
-  wakeStatus: "off" | "on" | "on(inert:no-herdr)" | null;
+  wakeStatus: InboxWakeStatus | null;
 }
 
 /**
@@ -391,7 +395,7 @@ export interface MemberRecoveryResult {
  *  record, never masked by "0/0 confirmed". `reportDelivery` is the coordinator-report outcome (also an obligation). */
 export interface RecoveryResult {
   episodeId: string;
-  dispatcher: { relaunched: boolean; verdict: OpsVerdict; wakeStatus: "off" | "on" | "on(inert:no-herdr)" | null };
+  dispatcher: { relaunched: boolean; verdict: OpsVerdict; wakeStatus: InboxWakeStatus | null };
   members: MemberRecoveryResult[];
   reportDelivery: DeliveryStatus;
   outstanding: string[];
@@ -406,7 +410,7 @@ export function deliveryDischarged(s: DeliveryStatus): boolean {
 /** Fold the per-step results into the outstanding list + notConfirmed count (FR-8). Pure. */
 export function summarizeOutstanding(r: Omit<RecoveryResult, "outstanding" | "notConfirmed">): { outstanding: string[]; notConfirmed: number } {
   const outstanding: string[] = [];
-  if (r.dispatcher.verdict !== "confirmed") outstanding.push(`dispatcher:${r.dispatcher.verdict}${r.dispatcher.wakeStatus && r.dispatcher.wakeStatus !== "on" ? `(wake:${r.dispatcher.wakeStatus})` : ""}`);
+  if (r.dispatcher.verdict !== "confirmed") outstanding.push(`dispatcher:${r.dispatcher.verdict}${r.dispatcher.wakeStatus && !wakeHealthy(r.dispatcher.wakeStatus) ? `(wake:${r.dispatcher.wakeStatus})` : ""}`);
   let notConfirmed = r.dispatcher.verdict !== "confirmed" ? 1 : 0;
   for (const m of r.members) {
     if (m.verdict !== "confirmed") { outstanding.push(`member:${m.title ?? m.member}:${m.verdict}`); notConfirmed += 1; }
