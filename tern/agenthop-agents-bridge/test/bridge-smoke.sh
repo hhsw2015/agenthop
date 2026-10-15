@@ -3,11 +3,14 @@
 # The structural fixtures prove the code shape; this proves the plugin is actually alive and serving:
 #   1. agents.json `tick` advances within TICK_WAIT seconds (the window VM's poll loop runs)
 #   2. {op:list}  published -> drain action -> results/<id>.json exists within RESULT_WAIT s with ok=true
-#   3. {op:eval, code:"return #cx.agents:list()"} -> same, and the value is a number
-#   4. budget kills of this plugin's hooks during the run, reported in TWO columns, not one bit:
-#        kills       — `exceeded ... plugin="agenthop-agents-bridge"` lines in tern.log since start
-#        tick after  — did agents.json tick still advance after the LAST kill? (yes / no / n/a)
-#      PASS only if kills == 0. kills > 0 with tick after = yes is a half-failure (one VM's hook died, another
+#      (one drain = one request since r7, so the drain is re-triggered every 0.5 s until our own result appears)
+#   3. {op:eval, code:BRIDGE_EVAL_CODE} -> same, and the value is a number (default `return #cx.session:panes()`,
+#      ~0.2 ms; `#cx.agents:list()` costs ~28 ms and can itself push the drain hook over budget)
+#   4. budget kills of this plugin's hooks during the run, reported in columns, not one bit:
+#        mirror kills   — timer / await / `command mirror` (status liveness)
+#        command kills  — `command drain` / drain-start / arm (the request path; a caller's expensive op lands here)
+#        tick after     — did agents.json tick still advance after the LAST kill? (yes / no / n/a)
+#      PASS only if both kill counts are 0. kills > 0 with tick after = yes is a half-failure (one VM's hook died, another
 #      still writes the mirror — several windows each run a window-half) and is reported as such, not as PASS.
 # Every check runs on its own and reports PASS/FAIL; nothing short-circuits, so a half-failure (command
 # path alive while the status mirror is dead, or the reverse) is visible. If any check fails, the summary is
@@ -48,6 +51,8 @@ CTRL="${BRIDGE_CTRL_DIR:-$HOME/.agenthop/tern-panes}"
 LOG="${TERN_LOG:-$HOME/Library/Logs/Tern/tern.log}"
 DRAIN_ACTION="${BRIDGE_DRAIN_ACTION:-plugin.agenthop-agents-bridge.drain}"
 EVAL_FIELD="${BRIDGE_EVAL_FIELD:-value}"
+# r7: cx.agents:list() alone costs ~28 ms of the 50 ms drain budget, so the smoke must not use it as its probe.
+EVAL_CODE="${BRIDGE_EVAL_CODE:-return #cx.session:panes()}"
 TICK_WAIT="${TICK_WAIT:-3}"
 RESULT_WAIT="${RESULT_WAIT:-2}"
 TERN_TIMEOUT="${TERN_TIMEOUT:-5}"
@@ -74,14 +79,20 @@ fail(){ echo "FAIL - $1"; FAILED+=("$1"); }
 roundtrip(){
   local json="$1" id res i
   id="$("$PUBLISH" "$CTRL" "$json")" || { echo "publish.sh could not publish"; return 1; }
-  timeout "$TERN_TIMEOUT" "$TERN" ctl plugins run "$DRAIN_ACTION" >/dev/null 2>&1 \
-    || { echo "\`tern ctl plugins run $DRAIN_ACTION\` failed or timed out (${TERN_TIMEOUT}s), request $id"; return 1; }
   res="$CTRL/results/$id.json"
+  # r7: one drain handles ONE request. Someone else's request may be ahead of ours, so re-trigger the drain every
+  # 0.5 s until our result appears (never touch other requests). Triggers are counted and reported on failure.
+  local triggers=0
   for ((i = 0; i < RESULT_WAIT * 10; i++)); do
+    if (( i % 5 == 0 )); then
+      timeout "$TERN_TIMEOUT" "$TERN" ctl plugins run "$DRAIN_ACTION" >/dev/null 2>&1 \
+        || { echo "\`tern ctl plugins run $DRAIN_ACTION\` failed or timed out (${TERN_TIMEOUT}s), request $id"; return 1; }
+      triggers=$((triggers + 1))
+    fi
     [ -s "$res" ] && break
     sleep 0.1
   done
-  [ -s "$res" ] || { echo "no results/$id.json within ${RESULT_WAIT}s"; return 1; }
+  [ -s "$res" ] || { echo "no results/$id.json within ${RESULT_WAIT}s ($triggers drain triggers)"; return 1; }
   cat "$res"
   rm -f "$res"
 }
@@ -104,7 +115,11 @@ else
   if [ -n "$v0" ] && [ -n "$v1" ] && [ "$v0" != "$v1" ] && [[ "$t1" =~ ^[0-9]+$ ]]; then
     pass "1 tick: plugin reloaded during the wait (vm $v0 -> $v1, tick restarted at $t1)"
   elif [[ "$t1" =~ ^[0-9]+$ ]] && [ "$t1" -gt "$t0" ]; then
-    pass "1 tick advances ($t0 -> $t1${v1:+, vm $v1})"
+    # Rate column: the bridge's own timer chain ticks every 750 ms; an outside sweep (`tern ctl ... mirror`) every few
+    # seconds also moves it. A low rate means the timer chain is dead and only the sweep keeps the tick alive.
+    steps=$((t1 - t0)); want=$(( TICK_WAIT * 1000 / 750 ))
+    if [ "$steps" -ge $(( want / 2 )) ]; then rate="timer chain alive"; else rate="LOW: timer chain likely dead, tick kept alive by outside mirror calls"; fi
+    pass "1 tick advances ($t0 -> $t1 in ${TICK_WAIT}s = $steps steps, ~$want expected; $rate${v1:+; vm $v1})"
   else
     fail "1 tick: did not advance in ${TICK_WAIT}s ($t0 -> $t1${v1:+, vm $v1})"
   fi
@@ -122,9 +137,9 @@ else
 fi
 
 # 3. eval round-trip
-if r="$(roundtrip '{"op":"eval","code":"return #cx.agents:list()"}')"; then
+if r="$(roundtrip "$(jq -cn --arg c "$EVAL_CODE" '{op: "eval", code: $c}')")"; then
   if echo "$r" | jq -e --arg f "$EVAL_FIELD" '.ok == true and (.[$f] | type == "number")' >/dev/null 2>&1; then
-    pass "3 eval round-trip ok (#cx.agents:list() = $(echo "$r" | jq --arg f "$EVAL_FIELD" '.[$f]'))"
+    pass "3 eval round-trip ok ($EVAL_CODE => $(echo "$r" | jq --arg f "$EVAL_FIELD" '.[$f]'))"
   else
     fail "3 eval: result not ok with numeric .$EVAL_FIELD: $r"
   fi
@@ -147,16 +162,25 @@ if [ -f "$LOG" ]; then
     window_desc="since start"
   fi
   kills="$(printf '%s\n' "$window_lines" | grep -F "exceeded its budget" | grep -F "plugin=\"$PLUGIN_ID\"" || true)"
-  nkills=0; [ -n "$kills" ] && nkills="$(printf '%s\n' "$kills" | grep -c .)"
-  hooks="$(printf '%s\n' "$kills" | sed -n 's/.*hook="\([^"]*\)".*/\1/p' | sort | uniq -c | awk '{printf "%s%s x%s", (NR>1?", ":""), $2, $1}')"
-  if [ "$nkills" -eq 0 ]; then
-    pass "4 kills=0 ($window_desc)  tick after=n/a"
-  else
-    # tick after the last kill: sample once, wait TICK_WAIT, sample again
-    a="$(tick)"; sleep "$TICK_WAIT"; b="$(tick)"
+  # Two groups, reported separately: the MIRROR (status liveness: timer / await / command mirror) and the COMMAND
+  # path (command drain / drain-start / arm / anything else). One bit would hide which half died.
+  count_hooks(){ # stdin: kill lines -> "N|hook x a, hook x b"
+    local lines; lines="$(cat)"
+    [ -z "$lines" ] && { echo "0|"; return; }
+    printf '%s\n' "$(printf '%s\n' "$lines" | grep -c .)|$(printf '%s\n' "$lines" | sed -n 's/.*hook="\([^"]*\)".*/\1/p' | sort | uniq -c \
+      | awk '{n=$1; $1=""; sub(/^ /, ""); printf "%s%s x%s", (NR>1?", ":""), $0, n}')"
+  }
+  mirror_re='hook="(timer|await|command mirror)"'
+  m="$(printf '%s\n' "$kills" | grep -E "$mirror_re" | count_hooks)"
+  c="$(printf '%s\n' "$kills" | grep -vE "$mirror_re" | grep . | count_hooks)"
+  mk="${m%%|*}"; mh="${m#*|}"; ck="${c%%|*}"; ch="${c#*|}"
+  after="n/a"
+  if [ $((mk + ck)) -gt 0 ]; then
+    a="$(tick)"; sleep "$TICK_WAIT"; b="$(tick)"   # does the mirror still move after the last kill?
     if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] && [ "$b" -gt "$a" ]; then after="yes ($a -> $b)"; else after="no ($a -> $b)"; fi
-    fail "4 kills=$nkills [$hooks] ($window_desc)  tick after=$after"
   fi
+  line="4 mirror kills=$mk${mh:+ [$mh]}  command kills=$ck${ch:+ [$ch]}  ($window_desc)  tick after=$after"
+  if [ $((mk + ck)) -eq 0 ]; then pass "$line"; else fail "$line"; fi
 else
   fail "4 tern log not found at $LOG"
 fi

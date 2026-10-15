@@ -25,7 +25,7 @@ case "\$1 \$2" in
   "inspect --json") echo '{"clients":[{"kind":"cli"},{"kind":"window"}]}' ;;
   "ctl plugins")
     [ "\${FAKE_DRAIN:-}" = dead ] && exit 0
-    for q in "$C"/requests/*.json; do
+    for q in \$(ls -1 "$C"/requests/*.json 2>/dev/null | head -1); do
       [ -f "\$q" ] || continue
       id="\$(basename "\$q" .json)"; op="\$(jq -r .op "\$q")"; rm -f "\$q"
       if [ "\$op" = list ]; then echo '{"ok":true,"agents":[{"pane":1},{"pane":2}]}'; else echo '{"ok":true,"value":2}'; fi >"$C/results/\$id.json"
@@ -56,8 +56,8 @@ check "$([[ "$OUT" == *'4 passed, 0 failed'* ]] && echo true)" "healthy: summary
 run env
 check "$([ $RC -eq 1 ] && echo true)" "mirror dead: exit 1"
 check "$([[ "$OUT" == *'FAIL - 1 tick'* ]] && echo true)" "mirror dead: check 1 FAIL"
-check "$([[ "$OUT" == *'PASS - 2 list'* && "$OUT" == *'PASS - 3 eval'* ]] && echo true)" "mirror dead: checks 2 and 3 still run and PASS"
-check "$([[ "$OUT" == *'PASS - 4 kills=0'* ]] && echo true)" "mirror dead: check 4 still runs"
+check "$([[ "$OUT" == *'PASS - 2 list'* && "$OUT" == *'PASS - 3 eval round-trip ok (return #cx.session:panes() =>'* ]] && echo true)" "mirror dead: checks 2 and 3 still run and PASS"
+check "$([[ "$OUT" == *'PASS - 4 mirror kills=0'* ]] && echo true)" "mirror dead: check 4 still runs"
 check "$([[ "$OUT" == *'3 passed, 1 failed'* && "$OUT" == *'tick now: 2'* ]] && echo true)" "mirror dead: summary + diagnostics"
 
 # C. the reverse: mirror alive, command path dead. 2 and 3 FAIL, 1 and 4 PASS, request left unconsumed.
@@ -78,7 +78,7 @@ KILL2='WARN stencil_tern: plugin handler failed plugin="agenthop-agents-bridge" 
 ( sleep 0.5; printf '%s\n%s\n' "$KILL" "$KILL2" >>"$L" ) &
 run env
 stop_ticker
-check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 4 kills=1 [await x1] (since start)  tick after=yes'* ]] && echo true)" "kill + tick alive: 4 FAILs as kills=1, tick after=yes"
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 4 mirror kills=1 [await x1]  command kills=0  (since start)  tick after=yes'* ]] && echo true)" "kill + tick alive: 4 FAILs as kills=1, tick after=yes"
 check "$([[ "$OUT" == *'3 passed, 1 failed'* ]] && echo true)" "kill + tick alive: checks 1-3 unaffected"
 check "$([[ "$OUT" == *'sessions: 2 [agenthop, work]'* && "$OUT" == *'window clients: 1'* ]] && echo true)" "diagnostics print tern session and window-client counts"
 
@@ -86,13 +86,13 @@ check "$([[ "$OUT" == *'sessions: 2 [agenthop, work]'* && "$OUT" == *'window cli
 : >"$L"; frozen
 ( sleep 0.3; printf '%s\n%s\n%s\n' "$KILL" "$KILL2" "${KILL/await/drain}" >>"$L" ) &
 run env
-check "$([[ "$OUT" == *'FAIL - 4 kills=2 [await x1, drain x1] (since start)  tick after=no'* ]] && echo true)" "kill + tick frozen: kills=2 per hook, tick after=no"
+check "$([[ "$OUT" == *'FAIL - 4 mirror kills=1 [await x1]  command kills=1 [drain x1]  (since start)  tick after=no'* ]] && echo true)" "kill + tick frozen: one mirror + one command kill, tick after=no"
 
 # D3. no kill: column form on PASS too.
 : >"$L"; start_ticker
 run env
 stop_ticker
-check "$([[ "$OUT" == *'PASS - 4 kills=0 (since start)  tick after=n/a'* ]] && echo true)" "no kill: PASS - 4 kills=0  tick after=n/a"
+check "$([[ "$OUT" == *'PASS - 4 mirror kills=0  command kills=0  (since start)  tick after=n/a'* ]] && echo true)" "no kill: PASS - 4 kills=0  tick after=n/a"
 
 # E. an OLD budget line (before start) is not counted.
 echo "$KILL" >"$L"
@@ -122,7 +122,7 @@ check "$([[ "$OUT" == *'FAIL - 1 tick: did not advance in 1s (5 -> 5, vm ccc)'* 
 : >"$L"; start_ticker_vm ddd
 run env
 stop_ticker
-check "$([[ "$OUT" == *'PASS - 1 tick advances ('*'vm ddd)'* ]] && echo true)" "r4 healthy: PASS mentions vm"
+check "$([[ "$OUT" == *'PASS - 1 tick advances ('*'timer chain alive; vm ddd)'* ]] && echo true)" "r4 healthy: PASS mentions rate + vm"
 
 # J. r5 breadcrumb: killed mid-segment => diagnostics name the segment; completed => per-segment ms; absent => said so.
 : >"$L"; echo '{"tick":5,"vm":"eee","agents":[]}' >"$C/agents.json"
@@ -143,7 +143,7 @@ echo "2026-10-15T11:30:00.000+08:00 1 WARN x: plugin hook exceeded its budget; d
 start_ticker
 run env SINCE=2026-10-15T11:00:00
 stop_ticker
-check "$([[ "$OUT" == *'FAIL - 4 kills=1 [command x1] (since 2026-10-15T11:00:00)'* ]] && echo true)" "SINCE: kill inside the window counted, kill before it not"
+check "$([[ "$OUT" == *'FAIL - 4 mirror kills=1 [command mirror x1]  command kills=0  (since 2026-10-15T11:00:00)'* ]] && echo true)" "SINCE: kill inside the window counted, kill before it not"
 
 # L. --soak: both runs pass and no kill in the gap => PASS; a kill written DURING the gap => run 2 FAILs => soak FAIL.
 : >"$L"; start_ticker
@@ -153,7 +153,31 @@ check "$([ $RC -eq 0 ] && [[ "$OUT" == *'soak: PASS'* && "$(grep -c 'bridge-smok
 ( sleep 6; echo "$(date '+%Y-%m-%dT%H:%M:%S').000+08:00 1 WARN x: plugin hook exceeded its budget; disabled until reload plugin=\"agenthop-agents-bridge\" hook=\"timer\"" >>"$L" ) &
 OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 SOAK_GAP=4 bash "$SMOKE" --soak 2>&1)"; RC=$?
 stop_ticker
-check "$([ $RC -eq 1 ] && [[ "$OUT" == *'soak: FAIL'* && "$OUT" == *'kills=1 [timer x1] (since'* ]] && echo true)" "--soak: a kill in the gap between runs => soak FAIL"
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'soak: FAIL'* && "$OUT" == *'mirror kills=1 [timer x1]  command kills=0  (since'* ]] && echo true)" "--soak: a kill in the gap between runs => soak FAIL"
+
+# M. hook names with spaces are kept whole, per hook.
+: >"$L"; start_ticker
+( sleep 0.4; printf '%s\n' "${KILL/await/command drain}" "${KILL/await/command drain}" "${KILL/await/timer}" >>"$L" ) &
+run env
+stop_ticker
+check "$([[ "$OUT" == *'mirror kills=1 [timer x1]  command kills=2 [command drain x2]'* ]] && echo true)" "mirror and command kills reported in separate columns, hook names with spaces kept whole"
+
+# N. tick only moved by a slow outside sweep (1 step in 1s, 750 ms timer expects ~1): with TICK_WAIT=4, 1 step => LOW.
+: >"$L"; ( i=1; while :; do echo "{\"tick\":$i,\"vm\":\"sss\",\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 3; done ) & TICKER=$!
+OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=4 bash "$SMOKE" 2>&1)"
+stop_ticker
+check "$([[ "$OUT" == *'LOW: timer chain likely dead'* ]] && echo true)" "slow sweep-only tick: rate reported LOW (timer chain dead)"
+
+# O. r7 one-request-per-drain: someone else's request queued AHEAD of ours. Ours still gets answered (drain
+#    re-triggered), and the other request is not deleted by the smoke (the fake bridge answers it, as Tern would).
+: >"$L"; rm -f "$C"/requests/*.json "$C"/results/*.json
+echo '{"op":"list"}' >"$C/requests/a-stale-other.json"
+start_ticker
+run env
+stop_ticker
+check "$([ $RC -eq 0 ] && [[ "$OUT" == *'PASS - 2 list'* ]] && echo true)" "r7: a request queued ahead of ours does not cause a false FAIL"
+check "$([ -f "$C/results/a-stale-other.json" ] && echo true)" "r7: the other request was answered by the bridge, not deleted by the smoke"
+rm -f "$C"/results/*.json
 
 echo ""
 echo "bridge-smoke gate: $t passed, $f failed"
