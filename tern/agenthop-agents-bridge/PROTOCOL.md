@@ -169,3 +169,11 @@ tern plugin link <repo>/tern/agenthop-agents-bridge     # 原地用(开发/本�
 - **④ W3 CPA 探针(`cpa-probe.sh`,蜂群侧 bash,独立于 Carly/哨兵)**:CPA 管家自己挂了投不了箱⇒蜂群直探。探**无鉴权健康路由 `/healthz`**(2s 超时;`/v1/models` 是鉴权门,无 key 恒 401——ACP 试点实测,旧「非 200=DOWN」会把它误报成 CPA 挂=假警报族,F1 根治)。**三态(F1)**:完整 `200`=UP;**传输失败**(curl 非零退出 / 无连接 / `000`)=DOWN;其他完整 HTTP(401/404/5xx)=UNKNOWN。**判序要紧(F1 r2 / F1-CURL-RESULT):先判传输失败,再确认 UP**——`200` 只是头,传输仍可能截断(rc18)或读超时(rc28)而 `%{http_code}` 仍为 `200`;带非零 curl 退出的 200 绝不读作 UP、绝不清警(与 CS-OUTBOX-ONCE 同课:单信号 OK≠全链 OK;200 是头的事,rc 是整条传输的事)。**连续 3 次 DOWN**→写 `cpa_down` L0 告警;一次 **UP**(完整 200)→清 streak + 删告警(恢复即清);**UNKNOWN=纯空操作**(exit 4:不进 streak、不清告警、不碰 state)。streak 落 `<L0>/cpa-probe.state` 跨轮持久。牙=3 连击(第 1/2 次不报)+ 恢复清 + 状态码×退出码矩阵(200+rc0=UP / 200+rc18 / 200+rc28=DOWN / 401=UNKNOWN)。注入口:`AGENTHOP_CPA_PROBE`(hook exit 0=up/2=unknown/其他非零=down)、`AGENTHOP_CPA_HTTP`(注入 HTTP 码)、`AGENTHOP_CPA_RC`(注入 curl 退出码,测矩阵)、`AGENTHOP_CPA_URL`。退出码:`0` up+clean / `1` down+advanced / `2` down+state-unavailable / `3` persist/cleanup incomplete / `4` probe UNKNOWN。
 
 状态/新 L0 产物:`<L0>/carly-patrol.beat`(我写)、`<L0>/coordinator.beat`(我读)、`<L0>/cpa-probe.state`(bash 探针)、`<L0>/alerts/{osc_alert,content_filter,permission,stall,coordinator_stale,cpa_down}-*.json`。
+
+## 10. #1057 — TUI 席子代理可见性钩子(`agenthop hook subagent`)
+
+- 事件:SubagentStart / SubagentStop / PermissionRequest ⇒ 父席耐久箱一条 fyi;PermissionRequest 另经祖先进程 pty 发 OSC 777(仅 `TERN_PANE` 存在时)。注册见 `subagent-hook.settings.json`(并入席级设置,非全局)。
+- 收件人只取 `SWARM_PARENT_SID`;未设 ⇒ SKIPPED 不写。投递走 `writeSessionInbox`:非 session UUID 或本机无 `presence/<sid>.pid` ⇒ 拒收,不建孤箱。**目标来自外部输入(环境变量、钩子负载、命令行)的调用方用 `writeSessionInbox`;`writeInbox` 保持原样,供 `approvals:<sid>` 等合法非会话箱使用。**
+- 去重键:`tui-sub-<start|stop>-<seat8>-<agent_id>`;`tui-perm-<seat8>-<tool_use_id|事件秒>`(Claude Code 2.1.293 不给 tool_use_id ⇒ 每席每秒至多一条权限消息,已知上限)。
+- 永远 exit 0;每次结果一行日志 `~/.agenthop/logs/subagent-hook.log`(`AGENTHOP_SUBAGENT_HOOK_LOG` 可覆盖)。
+- 时延:`bin.ts` 见 `hook subagent` 即只载 `hook-entry.js`(不载完整 CLI 模块图)。目标 **< 200ms / 次**。实测(2026-10-15,macOS arm64,bun --compile 单二进制,21 次中位):本钩子 ~90ms;拆分前 ~117–135ms;空程序编译底 ~18–36ms。余量主要是编译二进制解析整包的固定开销。

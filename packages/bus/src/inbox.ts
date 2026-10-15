@@ -206,6 +206,26 @@ export function publishUniqueAtomic(dir: string, data: string, ts: number, randH
   } finally { try { unlinkSync(tmp); } catch { /* only OUR own temp; the linked copy holds the bytes; a leftover .wtmp-* is ignored by readers */ } }
 }
 
+/** A native session id: lowercase-or-uppercase hex UUID (8-4-4-4-12). Pure. */
+export const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export class SessionInboxError extends Error {}
+
+/**
+ * STRICT delivery to a live SESSION's inbox (#1057 ③). `writeInbox` accepts any safe key on purpose — approval boxes
+ * (`approvals:<sid>`), per-run ids and legacy run keys are all real, drained inboxes — so it must not reject non-UUID keys. But a
+ * caller whose recipient comes from EXTERNAL input (an env var, a hook payload, a CLI argument) must not create a box that nobody
+ * reads: given `SWARM_PARENT_SID=not-a-sid`, `writeInbox` would make `~/.agenthop/inbox/not-a-sid/`. This entry refuses unless the
+ * sid is a native session UUID AND the session is known on this machine (`presence/<sid>.pid` exists); otherwise it throws
+ * SessionInboxError and NOTHING is created. It then delegates to writeInbox unchanged (same dedup, wake hook, results).
+ * Callers whose target comes from external input should use this, not writeInbox.
+ */
+export function writeSessionInbox(home: string, sid: string, msg: InboxMsg, idempotencyKey?: string): WriteResult {
+  if (typeof sid !== "string" || !SESSION_UUID_RE.test(sid)) throw new SessionInboxError(`not a session id: ${JSON.stringify(sid)}`);
+  if (!existsSync(path.join(home, ".agenthop", "presence", `${sid}.pid`))) throw new SessionInboxError(`session ${sid} has no presence on this machine — refusing to create an inbox nobody reads`);
+  return writeInbox(home, sid, msg, idempotencyKey);
+}
+
 export function writeInbox(home: string, key: string, msg: InboxMsg, idempotencyKey?: string): WriteResult {
   const valid = validInboxMsg(msg);
   if (valid === null) throw new Error("writeInbox: refusing to publish an invalid inbox message (from/fromLabel/text must be strings, via a non-empty string, ts a finite number)");
