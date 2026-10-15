@@ -1,0 +1,51 @@
+  30
+  31
+  32
+  33
+  34
+  35
+  36
+  37
+  38
+  39
+  40
+  DONE
+
+✻ Worked for 8s · done 12:32 PM
+
+❯ Without using tools, write a 400-word story about a lighthouse keeper.
+
+  Thought for 9s
+
+⏺ The lighthouse keeper's name was Oona, and she had tended the light at Carrick Point for thirty-one years. She knew the tower the way she knew her own hands: the
+  forty-two iron stairs, the sticky third window latch, the way the lamp room smelled of brass polish and cold salt.
+
+  Her husband had kept the light before her. When he died, the mainland office sent letters suggesting she retire, that the station was due for automation, that a
+  machine could flash the same signal without a pension or a cottage. Oona did not answer the letters. She climbed the stairs each dusk and lit the lamp, and the
+  freighters passing in the dark never knew the difference.
+
+  But she knew the difference. A machine would not have noticed the dory.
+
+  It was a filthy November night, the kind where the wind came sideways and the rain felt like gravel. Oona was trimming the wick when something caught her eye below
+  the beam: a small boat, mastless, turning in the swells like a leaf in a gutter. No engine. No light of its own. A machine would have swept its beam past on
+  schedule and moved on.
+
+  Oona did not move on. She took the big lamp and angled it down, holding the beam on the dory, steady, so the boat sat in a circle of white while the sea heaved
+  black around it. She saw a figure in it, waving one arm. She could not row out; she was too old and the surf too high. But she could hold the light. She could say,
+  with the only voice she had, I see you. You are not alone out here. Stay where you are and I will keep you lit until help comes.
+
+  She rang the mainland on the crank telephone, then went back and held the beam. For two hours she stood, arms aching, turning the lamp by hand each time the boat
+  drifted, refusing to let the dark have it. When the lifeboat finally arrived, their searchlight found the dory instantly, because Oona had never let it go.
+
+  The next spring, the automation crew came after all. They installed their machine and thanked her for her service. Oona moved to a cottage in the village, within
+  sight of the point.
+
+  Every night she watched the light flash, precise and tireless, and every night she thought the same thing: it shines, but it does not see.
+
+✻ Cooked for 23s · done 12:32 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  00000000 | opus5-5 | cwd | ░░░░░░░░░░ 8%
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 2 agents

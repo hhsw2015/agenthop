@@ -198,3 +198,16 @@ tern plugin link <repo>/tern/agenthop-agents-bridge     # 原地用(开发/本�
 - **④ W3 CPA 探针(`cpa-probe.sh`,蜂群侧 bash,独立于 Carly/哨兵)**:CPA 管家自己挂了投不了箱⇒蜂群直探。探**无鉴权健康路由 `/healthz`**(2s 超时;`/v1/models` 是鉴权门,无 key 恒 401——ACP 试点实测,旧「非 200=DOWN」会把它误报成 CPA 挂=假警报族,F1 根治)。**三态(F1)**:完整 `200`=UP;**传输失败**(curl 非零退出 / 无连接 / `000`)=DOWN;其他完整 HTTP(401/404/5xx)=UNKNOWN。**判序要紧(F1 r2 / F1-CURL-RESULT):先判传输失败,再确认 UP**——`200` 只是头,传输仍可能截断(rc18)或读超时(rc28)而 `%{http_code}` 仍为 `200`;带非零 curl 退出的 200 绝不读作 UP、绝不清警(与 CS-OUTBOX-ONCE 同课:单信号 OK≠全链 OK;200 是头的事,rc 是整条传输的事)。**连续 3 次 DOWN**→写 `cpa_down` L0 告警;一次 **UP**(完整 200)→清 streak + 删告警(恢复即清);**UNKNOWN=纯空操作**(exit 4:不进 streak、不清告警、不碰 state)。streak 落 `<L0>/cpa-probe.state` 跨轮持久。牙=3 连击(第 1/2 次不报)+ 恢复清 + 状态码×退出码矩阵(200+rc0=UP / 200+rc18 / 200+rc28=DOWN / 401=UNKNOWN)。注入口:`AGENTHOP_CPA_PROBE`(hook exit 0=up/2=unknown/其他非零=down)、`AGENTHOP_CPA_HTTP`(注入 HTTP 码)、`AGENTHOP_CPA_RC`(注入 curl 退出码,测矩阵)、`AGENTHOP_CPA_URL`。退出码:`0` up+clean / `1` down+advanced / `2` down+state-unavailable / `3` persist/cleanup incomplete / `4` probe UNKNOWN。
 
 状态/新 L0 产物:`<L0>/carly-patrol.beat`(我写)、`~/.agenthop/swarm/coordinator.beat`(我读,协调者写;非 L0)、`<L0>/cpa-probe.state`(bash 探针)、`<L0>/alerts/{osc_alert,content_filter,permission,stall,coordinator_stale,cpa_down}-*.json`。
+
+## 10. 裸 TUI 读屏分类器(#1041)
+
+给 Tern 里的**裸 TUI 块**(非 ACP,如 #1040 的 TUI worker)一个 idle/working/blocked/unknown 状态。ACP 块有真状态,不跑这个。
+
+- **来源(诚实标注)**:`classify.luau` 的规则引擎与区域函数、`manifests.luau` 的 17 份规则数据,**直接翻译自 herdr**(本地克隆 `~/Dev/herdr`,commit `31c77f3`:`src/detect/manifest.rs` + `src/detect/manifests/*.toml`)。herdr 许可 = **AGPL-3.0-or-later**(见其 `LICENSE`)。user 2026-10-15 亲裁「翻译原文,不要管 AGPL 风险」;此处是归属说明,不是风险评估。`manifests.luau` 由 `tools/gen-manifests.py` 从 TOML 生成,不手改。
+- **接口(纯函数,一读两用)**:`classify(lines, title, program[, progress]) → {state, rule, agent, skip_state_update}`。不自己读屏(`cx.session:read` ~23ms/pane);由哨兵每轮读一个 pane 后把 `lines` + PaneInfo `title` 交进来。`program` 选 manifest(herdr `parse_agent_label` 同表 + `…/claude/versions/<semver>` 原生路径);认不出 ⇒ `unknown`。
+- **语义 = herdr**:每条规则在自己的区域上求值,**最高 priority 胜**(同分取文件序先者);无规则命中且 agent 已知 ⇒ `idle`(herdr fallback)。`contains` 不分大小写子串;`regex`/`line_regex` 用内置小匹配器(覆盖全部 17 份 manifest 用到的 33 个模式:类/区间/`\x{}`/`\u`/`\p{Alphabetic}`/`\b`/`(?i)(?m)(?s)`/分组/`{n,}`),与 Python `re` 差分 2442 例零差异。
+- **agenthop 叠加规则(非 herdr,单独列在 `classify.luau` 的 `OVERLAY`)**:Claude Code 2.1.293 在 Tern 里**工作时 OSC 标题转圈是 ◐/◑(U+25D0-25D3),不是 herdr 规则期待的盲文**;没有这条,工作中的屏(❯ 输入框一直画着)会被 `live_prompt_box` 判成 idle。叠加 `agenthop_osc_title_halfcircle_working`(priority 1100,region osc_title)。
+- **实测发现(记录,未改规则)**:2.1.293 的写文件授权框文案是「Do you want to create X?」,不含 herdr `generic_permission_prompt` 要的「do you want to proceed?」⇒ 该 840 分规则不命中,靠 300 分的 `legacy_no_prompt_blocker` 判 blocked。结果正确但置信度低一档;如要提升,另加叠加规则(待裁)。
+- **预算(Tern 真 VM 实测,单 hook 单次)**:24 行 tail,idle ≈ 0.94ms、working ≈ 1.13ms、blocked ≈ 2.0ms(<3ms 门)。一个 hook 里连跑多次会累计撞 50ms——哨兵每轮只分类它读到的那一个 pane。
+- **夹具** `test/classify.test.lua`(53 检):5 份**真实** Claude TUI 截屏(`test/fixtures/tui/`,2026-10-15 Tern pane 采集:idle×2 / working×2 / blocked×1)+ herdr claude 规则各族合成屏 + 两条 `not` 门 + 区域函数 + 正则子集 + 选 agent。mutant:`MUTANT=no-prompt-box`、`MUTANT=no-title-working` 各 RED;生产码 mutant(`\b` 失效、最高分→首命中)各 RED。
+- **接线**:写 `agents.json` 每席 `screen_state` 由哨兵做(Platform Dev r9 的一读两用钩),本件只交纯函数。
