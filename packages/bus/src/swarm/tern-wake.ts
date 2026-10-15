@@ -12,6 +12,7 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 import type { AgentState } from "./herdr.js";
 import { isValidSessionId } from "../send-fallback.js";
+import { updateSeatShell } from "./seat-shell-record.js";
 
 export type Shell = "tern" | "herdr";
 
@@ -230,9 +231,16 @@ export function seatShellFile(home: string, sid: string): string {
   return path.join(seatShellDir(home), `${sid}.json`);
 }
 /** Clear a seat's registration (back to unregistered). Validates the sid BEFORE any path is built; ENOENT is success. */
+/** Clear a seat's SHELL registration (back to unregistered) — only `shell`/`pid`/`registeredAtSec`; every other key of the record
+ *  (workers[], rev, orphan state) is kept (#1034 r3 SEAT-INTEROP: the file is shared, written only through updateSeatShell). */
 export function clearSeatShell(home: string, sid: string): void {
-  const f = seatShellFile(home, sid);
-  try { unlinkSync(f); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+  seatShellFile(home, sid); // validates the sid before any path is built
+  const r = updateSeatShell(home, sid, (rec) => {
+    if (rec.shell === undefined && rec.pid === undefined && rec.registeredAtSec === undefined) return null;
+    const { shell: _s, pid: _p, registeredAtSec: _r, ...rest } = rec;
+    return rest;
+  });
+  if (r.state !== "ok") throw new Error(`seat-shell ${r.state}: ${r.reason}`);
 }
 
 /** `pid` is a RESERVED slot (coordinator, 2026-10-15): tern-restore will record the seat's `tern acp` child pid here in the same step
@@ -247,6 +255,8 @@ export function readSeatShell(home: string, sid: string): SeatShellRead {
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" }; }
   try {
     const v = JSON.parse(raw) as { shell?: unknown; pid?: unknown };
+    // #1034 r3: the record is shared — a record WITHOUT a shell key (cleared, or only workers[] so far) is "not registered"
+    if (v && typeof v === "object" && !Array.isArray(v) && v.shell === undefined) return { kind: "absent" };
     if (v && (v.shell === "tern" || v.shell === "herdr")) {
       const pid = Number.isSafeInteger(v.pid) && (v.pid as number) > 0 ? (v.pid as number) : undefined; // a bad pid is ignored, never fatal
       return pid === undefined ? { kind: "registered", shell: v.shell } : { kind: "registered", shell: v.shell, pid };
@@ -255,30 +265,19 @@ export function readSeatShell(home: string, sid: string): SeatShellRead {
   return { kind: "unreadable" };
 }
 
-/** Register a seat's shell: O_EXCL-owned temp written through its own fd, then an atomic rename. Throws on a bad sid/shell or IO fault. */
+/** Register a seat's shell. #1034 r3 SEAT-INTEROP (coordinator ruling): the record is SHARED (workers[] from agenthop_tern, orphan
+ *  state from the #1033 sweep, rev), so this changes ONLY `shell`, `pid` and `registeredAtSec` through the one locked write path
+ *  (updateSeatShell) — it used to replace the whole file, so one `seat-shell set` erased workers[] and rev. Throws on a bad
+ *  sid/shell/pid or when the record is unreadable / busy (never overwrites what it could not read). */
 export function writeSeatShell(home: string, sid: string, shell: Shell, nowSec: number, pid?: number): void {
   if (!validSeatSid(sid)) throw new Error(`invalid sid: ${sid}`);
   if (shell !== "tern" && shell !== "herdr") throw new Error(`invalid shell: ${String(shell)}`);
   if (pid !== undefined && !(Number.isSafeInteger(pid) && pid > 0)) throw new Error(`invalid pid: ${String(pid)}`);
-  const dir = seatShellDir(home);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const dest = seatShellFile(home, sid);
-  let tmp = "";
-  let fd: number | undefined;
-  for (let attempt = 0; ; attempt += 1) {
-    tmp = `${dest}.tmp-${randomBytes(8).toString("hex")}`;
-    try { fd = openSync(tmp, "wx", 0o600); break; }
-    catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST" && attempt < 32) continue; throw e; }
-  }
-  try {
-    writeFileSync(fd, `${JSON.stringify({ sid, shell, ...(pid !== undefined ? { pid } : {}), registeredAtSec: Math.floor(nowSec) })}\n`);
-    closeSync(fd); fd = undefined;
-    renameSync(tmp, dest);
-  } catch (e) {
-    if (fd !== undefined) { try { closeSync(fd); } catch { /* best-effort */ } }
-    try { unlinkSync(tmp); } catch { /* only our own temp */ }
-    throw e;
-  }
+  const r = updateSeatShell(home, sid, (rec) => {
+    const { pid: _old, ...rest } = rec;
+    return { ...rest, sid, shell, ...(pid !== undefined ? { pid } : {}), registeredAtSec: Math.floor(nowSec) };
+  });
+  if (r.state !== "ok") throw new Error(`seat-shell ${r.state}: ${r.reason}`);
 }
 
 /** Which transports to try for a seat, in order. Registered ⇒ only that shell. Absent/unreadable ⇒ both, Tern first (the migration

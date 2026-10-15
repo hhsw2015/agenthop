@@ -212,6 +212,23 @@ await (async () => {
   ok(readSeatShell(h, SID).kind === "absent", "clear: a valid sid clears normally (positive control)");
   clearSeatShell(h, SID);
   ok(true, "clear: clearing an already-absent seat is a no-op (ENOENT = success)");
+  // #1034 r3 SEAT-INTEROP: the seat file is SHARED; set/clear touch only shell/pid/registeredAtSec, never workers[] or rev
+  {
+    const { updateSeatShell, readSeatRecord } = await import("./seat-shell-record.js");
+    const W = [{ name: "p-a", herdr_session: "p-a", pane: 5, kind: "tui", started_at: 1, stopped_at: null, state: "live" }];
+    updateSeatShell(h, SID, (r) => ({ ...r, workers: W }));
+    writeSeatShell(h, SID, "tern", 2, 4242);
+    const r1 = readSeatRecord(h, SID);
+    ok(r1.kind === "ok" && JSON.stringify((r1.record as any).workers) === JSON.stringify(W) && (r1.record as any).shell === "tern" && (r1.record as any).pid === 4242, "SEAT-INTEROP: set keeps workers[] and adds shell/pid");
+    ok(r1.kind === "ok" && r1.rev >= 2, "SEAT-INTEROP: set goes through updateSeatShell (rev advanced)");
+    writeSeatShell(h, SID, "herdr", 3);
+    const r2 = readSeatRecord(h, SID);
+    ok(r2.kind === "ok" && (r2.record as any).pid === undefined && (r2.record as any).shell === "herdr" && Array.isArray((r2.record as any).workers), "SEAT-INTEROP: set without pid drops the OLD pid only");
+    clearSeatShell(h, SID);
+    const r3 = readSeatRecord(h, SID);
+    ok(r3.kind === "ok" && (r3.record as any).shell === undefined && JSON.stringify((r3.record as any).workers) === JSON.stringify(W), "SEAT-INTEROP: clear removes the shell keys only; workers[] survive");
+    ok(readSeatShell(h, SID).kind === "absent", "SEAT-INTEROP: a record without shell reads as not registered");
+  }
 }
 
 // ── IWT-SV-P2-1 r3: token PROVENANCE — quoted separators, newlines, non-shell `-c` (Second Voice r2 counterexamples) ─────────
