@@ -146,6 +146,17 @@ for f in "${FAILED[@]}"; do echo "  FAIL - $f"; done
   echo "tern sessions / window clients (each window runs its own window-half VM, all writing agents.json):"
   timeout "$TERN_TIMEOUT" "$TERN" ls --json 2>/dev/null | jq -r '"  sessions: \(.sessions | length) [\([.sessions[].name] | join(", "))]"' 2>/dev/null || echo "  sessions: (tern ls failed)"
   timeout "$TERN_TIMEOUT" "$TERN" inspect --json 2>/dev/null | jq -r '"  window clients: \([.clients[] | select(.kind == "window")] | length)"' 2>/dev/null || echo "  window clients: (tern inspect failed)"
+  # r5+: the mirror writes mirror-phase.json BEFORE each segment. phase != done with the same vm/tick as a stalled
+  # agents.json names the segment that was running when the hook was killed.
+  echo "mirror-phase.json (r5+ breadcrumb):"
+  if [ -f "$CTRL/mirror-phase.json" ]; then
+    echo "  $(cat "$CTRL/mirror-phase.json") (written $(date -r "$CTRL/mirror-phase.json" '+%H:%M:%S'))"
+    jq -r 'if .phase == "done" then "  last tick completed: list \(.list_ms)ms, slim \(.slim_ms)ms, encode \(.encode_ms)ms, write \(.write_ms)ms (cumulative)"
+           else "  STOPPED IN SEGMENT: \(.phase) (vm \(.vm), tick \(.tick), \(.at_ms)ms into the tick)" end' \
+      "$CTRL/mirror-phase.json" 2>/dev/null || echo "  (unparseable)"
+  else
+    echo "  (absent: bridge older than r5)"
+  fi
   echo "unconsumed requests:"
   ls -1 "$CTRL/requests/" 2>/dev/null | grep '\.json$' || echo "  (none)"
   echo "last $PLUGIN_ID budget/handler failure in tern.log (any time):"

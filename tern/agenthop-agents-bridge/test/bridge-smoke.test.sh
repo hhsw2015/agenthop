@@ -124,6 +124,18 @@ run env
 stop_ticker
 check "$([[ "$OUT" == *'PASS - 1 tick advances ('*'vm ddd)'* ]] && echo true)" "r4 healthy: PASS mentions vm"
 
+# J. r5 breadcrumb: killed mid-segment => diagnostics name the segment; completed => per-segment ms; absent => said so.
+: >"$L"; echo '{"tick":5,"vm":"eee","agents":[]}' >"$C/agents.json"
+echo '{"vm":"eee","tick":6,"phase":"encode","at_ms":31.20,"list_ms":28.10,"slim_ms":30.90}' >"$C/mirror-phase.json"
+run env
+check "$([[ "$OUT" == *'STOPPED IN SEGMENT: encode (vm eee, tick 6, 31.20ms into the tick)'* ]] && echo true)" "r5 breadcrumb: killed segment named"
+echo '{"vm":"eee","tick":6,"phase":"done","at_ms":40.00,"list_ms":28.10,"slim_ms":30.90,"encode_ms":36.00,"write_ms":40.00}' >"$C/mirror-phase.json"
+run env
+check "$([[ "$OUT" == *'last tick completed: list 28.10ms, slim 30.90ms, encode 36.00ms, write 40.00ms'* ]] && echo true)" "r5 breadcrumb: completed tick shows per-segment ms"
+rm -f "$C/mirror-phase.json"
+run env
+check "$([[ "$OUT" == *'(absent: bridge older than r5)'* ]] && echo true)" "r5 breadcrumb absent: reported, not an error"
+
 echo ""
 echo "bridge-smoke gate: $t passed, $f failed"
 [ "$f" -eq 0 ]
