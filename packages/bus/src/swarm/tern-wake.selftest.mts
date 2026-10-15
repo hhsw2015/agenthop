@@ -179,7 +179,8 @@ await (async () => {
   ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --resume ${SID}; echo done`)]), SID)?.paneId === "91", "argv: only the first simple command counts (; separator)");
   ok(ternPaneInfoForSession(inspect([sh(`true; tern acp claude --resume ${SID}`)]), SID) === null, "argv: a tern acp AFTER a separator is a different command");
   ok(ternPaneInfoForSession(inspect([sh(`tern acp claude --resume '${SID}`)]), SID) === null, "argv: unterminated quote ⇒ unparseable ⇒ not trusted");
-  ok(JSON.stringify(shellWords(`a 'b c' "d \\"e\\"" f\\ g # h`)) === JSON.stringify(["a", "b c", 'd "e"', "f g"]), "shellWords: quotes / escapes / comment");
+  ok(JSON.stringify(shellWords(`a 'b c' "d e" f\\ g # h`)) === JSON.stringify(["a", "b c", "d e", "f g"]), "shellWords: single quotes / literal double quotes / backslash escape / comment");
+  ok(shellWords(`a "d \\"e\\""`) === null, "r6: an escape inside double quotes is outside the supported grammar ⇒ unparseable");
   ok(ternPaneInfoForSession(inspect([{ pane: 93, exited: null, working: false, program: "/usr/bin/tern", args: ["acp", "codex", "--resume", SID] }]), SID)?.paneId === "93", "argv: a direct (non -c) argv is used as-is");
 }
 // ── IWT-SV-P2-2: three-state classification of a tern inspect run ───────────────────────────────────────────────────────
@@ -271,34 +272,40 @@ await (async () => {
   ok(shellTokens(`a $(b) c`) === null && shellTokens(`a \`b\``) === null && shellTokens(`a <(b)`) === null && shellTokens(`a '$(b)'`) !== null, "r4: tokenizer refuses expansions, keeps single-quoted literals");
 }
 
-// ── IWT-SV-P2-1 (r5): REDIRECTIONS — an unquoted redirection operator and its target are not arguments ────────────────────
-// Ground truth: real /bin/sh, with the fake `tern` writing its argv to a separate fd (9) so the line's own redirection can't hide it.
+// ── IWT-ARGV r6: CONSERVATIVE GRAMMAR — only a provably literal argv is accepted; everything else is UNKNOWN, never absent ─────
+// Ground truth: real /bin/sh in a private cwd (so globs/redirects touch only temp files); the fake `tern` writes its argv to fd 9.
 {
   const { execFileSync } = await import("node:child_process");
-  const { mkdtempSync: mk, readFileSync: rf, existsSync: ex } = await import("node:fs");
-  const T = "audit-1234";
-  const delivered = (line: string): boolean => {
-    const cwd = mk(path.join(scratch, "rd-")); const rec = path.join(cwd, "argv.rec");
+  const { mkdtempSync: mk, readFileSync: rf, existsSync: ex, writeFileSync: wf } = await import("node:fs");
+  const T = "00000000-0000-4000-8000-000000000001";
+  const delivered = (line: string, prep?: (cwd: string) => void): boolean => {
+    const cwd = mk(path.join(scratch, "g-")); prep?.(cwd); const rec = path.join(cwd, "argv.rec");
     try { execFileSync("/bin/sh", ["-c", `exec 9>"${rec}"\ntern() { printf '%s\\0' "$@" >&9; exit 0; }\n${line}`], { cwd, stdio: "ignore" }); } catch { /* nothing delivered */ }
     if (!ex(rec)) return false;
-    const a = rf(rec, "utf8").split("\0").slice(0, -1); const i = a.indexOf("--resume");
-    return a[0] === "acp" && (a.includes(`--resume=${T}`) || (i >= 0 && a[i + 1] === T));
+    const a = rf(rec, "utf8").split("\0").slice(0, -1); const k = a.indexOf("--resume");
+    return a[0] === "acp" && ((k >= 0 && a[k + 1] === T) || a.includes(`--resume=${T}`));
   };
   const zsh = (line: string) => ({ pane: 9, exited: null, working: false, program: "/bin/zsh", args: ["-l", "-c", line] });
-  const forms: [string, string][] = [
-    [`tern acp claude > --resume=${T}`, "redirect target is a FILE NAME, not --resume (the reviewer's counterexample)"],
-    [`tern acp claude 2> --resume=${T}`, "fd-prefixed redirect (2>) target is a file name"],
-    [`tern acp claude >> --resume ${T}`, "append redirect consumes --resume as its target"],
-    [`tern acp claude --resume ${T} > out.log`, "control: a redirect AFTER the real args keeps them"],
-    [`tern acp claude --resume ${T} 2>&1`, "control: 2>&1 is not an argument"],
-    [`tern acp claude < /dev/null --resume ${T}`, "control: input redirect then real args"],
-    [`tern acp claude '>' --resume ${T}`, "control: a QUOTED '>' is an argument"],
-  ];
-  for (const [line, what] of forms) {
-    const sh = delivered(line), m = ternPaneInfoForSession(inspect([zsh(line)]), T) !== null;
-    ok(sh === m, `r5 redirect: ${what} — parser agrees with /bin/sh (sh=${sh}, parser=${m})`);
-  }
-  ok(shellTokens(`a 2> f`)!.some((t) => t.kind === "redir" && (t as { op: string }).op === "2>"), "r5 tokenizer: `2>` is one redirection token (fd digits belong to the operator)");
-  ok(shellTokens(`a '2>' f`)!.every((t) => t.kind === "word"), "r5 tokenizer: a quoted '2>' stays a word");
+  const cls = (line: string) => classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([zsh(line)])) }, T).kind;
+  // The reviewer's two counterexamples: real sh DOES deliver T, so "absent" would be wrong — the line is unknown.
+  const glob = `tern acp claude --resume 00000000-0000-4000-8000-00000000000?`;
+  ok(delivered(glob, (c) => wf(path.join(c, T), "")) === true && cls(glob) === "unknown", "r6: a GLOB (?) that sh expands to this sid ⇒ unknown (not absent)");
+  const qfd = `tern acp claude --resume '2'> out.log ${T}`;
+  ok(cls(qfd) === "unknown", "r6: `--resume '2'> out.log <sid>` (quoted digit then redirect) ⇒ unknown — redirections are not modelled");
+  // Every non-literal construct ⇒ unknown; never a target, never absent.
+  for (const [line, what] of [
+    [`tern acp claude > --resume=${T}`, "unquoted >"], [`tern acp claude --resume ${T} 2>&1`, "2>&1"], [`tern acp claude --resume ${T} > out.log`, "redirect after args"],
+    [`tern acp claude --resume $SID`, "$VAR"], [`tern acp claude --resume "$SID"`, "\"$VAR\""], [`tern acp claude --resume ${T}*`, "* glob"],
+    [`tern acp claude --resume [0]${T.slice(1)}`, "[…] glob"], [`tern acp claude --resume ~/x`, "tilde"], [`tern acp claude --resume {a,b}`, "brace"],
+    [`tern acp claude --resume $(echo ${T})`, "$(…)"], [`(tern acp claude --resume ${T})`, "subshell"], [`! tern acp claude --resume ${T}`, "!"],
+  ] as const) ok(cls(line) === "unknown", `r6: ${what} ⇒ unknown`);
+  // Supported literal forms still match (and real sh agrees).
+  for (const [line, what] of [
+    [`tern acp claude --resume ${T}`, "plain"], [`tern acp claude --resume '${T}'`, "single-quoted"], [`tern acp claude --resume "${T}"`, "literal double-quoted"],
+    [`tern acp claude --resume ${T} --model 'cpa-local/claude-opus-5-5[1m]'`, "quoted [ ] inside single quotes"], [`tern acp claude --resume ${T}; echo done`, "; separator"],
+    [`tern acp claude --prompt ';' --resume ${T}`, "quoted ;"], [`tern acp claude --resume=${T}`, "--resume=<sid>"],
+  ] as const) ok(delivered(line) && cls(line) === "found", `r6 control: ${what} ⇒ found (sh agrees)`);
+  ok(cls(`tern acp claude --resume other-sid`) === "absent", "r6 control: a provable seat for ANOTHER sid ⇒ absent (real absence keeps the fallback)");
+  ok(cls(`vim notes.txt`) === "absent", "r6 control: an unrelated literal command ⇒ absent");
 }
 console.log(`\nall tern-wake selftests passed (${n})`);

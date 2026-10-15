@@ -30,15 +30,24 @@ export function selfShell(env: NodeJS.ProcessEnv = process.env): Shell | null {
   return null;
 }
 
-/** One token of a shell command line: a WORD (an argument, however it was quoted) or an unquoted command SEPARATOR. Keeping the
- *  kind is the point (IWT-SV-P2-1 r3): a quoted ";" is an argument, never a separator. */
-export type ShellToken = { kind: "word"; text: string } | { kind: "sep" } | { kind: "redir"; op: string };
+/** One token of a shell command line: a WORD (an argument) or an unquoted command SEPARATOR. */
+export type ShellToken = { kind: "word"; text: string } | { kind: "sep" };
 
-/** Tokenize a shell command line the way POSIX sh would — WITHOUT executing anything. Honors single quotes (literal), double quotes
- *  (\\ escapes for \\ " $ ` and newline), backslash escapes outside quotes, and `#` comments (only at a word start, to end of line).
- *  UNQUOTED `;` `&` `|` and NEWLINE end a command (each emits a "sep"); inside quotes they are plain characters. No expansion:
- *  An unterminated quote ⇒ null. Any expansion outside single quotes (`$…`, `$(…)`, backticks, `<(`/`>(`) ⇒ null: the argv it
- *  produces is only known by running it, which we never do — such a line is unparseable, never a match. Pure. */
+/**
+ * IWT-ARGV r6 — a deliberately SMALL, CONSERVATIVE shell grammar. We only ever need to PROVE a literal argv; we never execute the
+ * line, so anything whose arguments depend on the shell's run-time behavior makes the WHOLE line unparseable (null ⇒ the classifier
+ * reports unknown, never absent). Supported, and nothing else:
+ *   - plain word characters                      a-z A-Z 0-9 and  _ - . / : = @ % + , ^
+ *   - single quotes '…'                           literal, any characters except '
+ *   - double quotes "…" with ONLY literal content  (no $ ` \ inside; those ⇒ unparseable)
+ *   - backslash outside quotes escaping one char   (a literal char; a backslash-newline is a line continuation)
+ *   - spaces/tabs between words; an UNQUOTED ; & | or newline ends a command (a "sep")
+ *   - a # at a word start begins a comment to end of line
+ * Rejected (⇒ null): every other unquoted character, notably  $ ` ( ) { } [ ] * ? ~ ! < >  — expansions, globs, tildes, history,
+ * subshells, grouping and ALL redirections. Rejecting redirections outright (rather than parsing them) removes the quoted-fd ambiguity
+ * (`'2'> f` vs `2> f`) instead of modelling it; a seat command line has no need for any of these. Unterminated quote ⇒ null. Pure.
+ */
+const WORD_CHAR = /[A-Za-z0-9_\-./:=@%+,^]/;
 export function shellTokens(line: string): ShellToken[] | null {
   const out: ShellToken[] = [];
   let cur = "", inWord = false, i = 0;
@@ -48,49 +57,30 @@ export function shellTokens(line: string): ShellToken[] | null {
     const ch = line[i]!;
     if (ch === "'") { const j = line.indexOf("'", i + 1); if (j < 0) return null; cur += line.slice(i + 1, j); inWord = true; i = j + 1; continue; }
     if (ch === '"') {
-      i++; inWord = true;
-      for (;;) {
-        if (i >= line.length) return null;
-        const c = line[i]!;
-        if (c === '"') { i++; break; }
-        if (c === "$" || c === "`") return null; // expansion inside "…" (IWT-ARGV r4): its argv can't be known without running it
-        if (c === "\\" && i + 1 < line.length && '\\"$`\n'.includes(line[i + 1]!)) { if (line[i + 1] !== "\n") cur += line[i + 1]; i += 2; continue; }
-        cur += c; i++;
-      }
-      continue;
+      const j = line.indexOf('"', i + 1); if (j < 0) return null;
+      const body = line.slice(i + 1, j);
+      if (/[$`\\]/.test(body)) return null; // only LITERAL double-quoted content is supported
+      cur += body; inWord = true; i = j + 1; continue;
     }
-    if (ch === "\\") { if (i + 1 < line.length) { if (line[i + 1] !== "\n") { cur += line[i + 1]; inWord = true; } i += 2; } else i++; continue; }
-    // IWT-ARGV r4: an UNQUOTED `$` (parameter / $(…) / $((…)) / ${…}) or backtick is an EXPANSION — the words it produces depend on
-    // running it, so the line's real argv cannot be proven statically. Refuse (⇒ unparseable ⇒ never a wake target) rather than
-    // read text inside the substitution as arguments. Process substitution `<(` `>(` likewise.
-    if (ch === "$" || ch === "`") return null;
-    if ((ch === "<" || ch === ">") && line[i + 1] === "(") return null;
-    // IWT-SV-P2-1 (r5): an UNQUOTED redirection operator — `>`, `>>`, `<`, `<<`, `>&`, `<&`, `<>`, `>|`, and an fd prefix like `2>`
-    // (digits immediately before it, with no space) — is NOT an argument, and the word after it is a FILE NAME, not an argument.
-    // Emit a typed "redir" token; the argv builder drops it and its target. (Real /bin/sh delivers `tern acp claude > --resume=X` as
-    // just [acp, claude].)
-    if (ch === "<" || ch === ">") {
-      let op = ch, k = i + 1;
-      if (/^\d+$/.test(cur) && inWord) { op = cur + op; cur = ""; inWord = false; } // `2>`: the fd digits belong to the operator
-      else end();
-      while (k < line.length && (line[k] === "<" || line[k] === ">" || line[k] === "&" || line[k] === "|")) { op += line[k]; k++; }
-      out.push({ kind: "redir", op });
-      i = k; continue;
+    if (ch === "\\") {
+      if (i + 1 >= line.length) return null;
+      if (line[i + 1] !== "\n") { cur += line[i + 1]; inWord = true; } // backslash-newline = line continuation
+      i += 2; continue;
     }
-    if (ch === "\n") { sep(); i++; continue; }                        // an unquoted newline ends the command
     if (ch === " " || ch === "\t") { end(); i++; continue; }
-    if (ch === "#" && !inWord) { const nl = line.indexOf("\n", i); if (nl < 0) break; i = nl; continue; } // comment runs to end of line
-    if (ch === ";" || ch === "&" || ch === "|") { sep(); i++; continue; } // an UNQUOTED separator
-    cur += ch; inWord = true; i++;
+    if (ch === "\n" || ch === ";" || ch === "&" || ch === "|") { sep(); i++; continue; }
+    if (ch === "#" && !inWord) { const nl = line.indexOf("\n", i); if (nl < 0) break; i = nl; continue; }
+    if (WORD_CHAR.test(ch)) { cur += ch; inWord = true; i++; continue; }
+    return null; // anything else ($ ` ( ) { } [ ] * ? ~ ! < > …) ⇒ not provably literal ⇒ unparseable
   }
   end();
   return out;
 }
 
-/** Words only (back-compat helper for tests / callers that only need the split). null when unparseable. Pure. */
+/** Words only (back-compat helper). null when unparseable. Pure. */
 export function shellWords(line: string): string[] | null {
   const t = shellTokens(line);
-  return t ? t.flatMap((x) => (x.kind === "word" ? [x.text] : [])) : null; // redirection operators and separators are not words
+  return t ? t.flatMap((x) => (x.kind === "word" ? [x.text] : [])) : null;
 }
 
 /** The shells whose `-c <line>` we unwrap (Tern launches ACP blocks as `zsh -l -c '<line>'`). Any OTHER program's `-c` argument is
@@ -107,17 +97,7 @@ export function paneProgramArgv(rec: { program?: unknown; args?: unknown; comman
     const toks = shellTokens(line);
     if (!toks) return null;
     const out: string[] = [];
-    for (let k = 0; k < toks.length; k++) {
-      const t = toks[k]!;
-      if (t.kind === "sep") break;
-      if (t.kind === "redir") { // the operator and its target word are not arguments
-        const nxt = toks[k + 1];
-        if (/&$/.test(t.op) && nxt?.kind === "word" && /^(\d+|-)$/.test(nxt.text)) { k++; continue; } // `2>&1`, `>&-`
-        if (nxt?.kind === "word") { k++; continue; }
-        return null; // a redirection with no target word ⇒ not a valid simple command ⇒ unparseable
-      }
-      out.push(t.text);
-    }
+    for (const t of toks) { if (t.kind === "sep") break; out.push(t.text); }
     return out;
   };
   if (args) {
