@@ -150,7 +150,7 @@ const registrySite = (home: string): LockSite => {
   const dir = path.join(home, ".agenthop", "swarm", "seat-shell");
   return { lockDir: path.join(dir, ".workers.lockd"), intentDir: dir, intentPrefix: ".workers.lockd.hold." };
 };
-function reserveSlot(home: string, seat: string, placeholder: Worker, d: { listDir: (d: string) => string[]; env: NodeJS.ProcessEnv }):
+export function reserveSlot(home: string, seat: string, placeholder: Worker, d: { listDir: (d: string) => string[]; env: NodeJS.ProcessEnv }):
   { reason: "cap" | "invalid"; detail: string } | null {
   const site = registrySite(home);
   try { mkdirSync(site.intentDir, { recursive: true, mode: 0o700 }); } catch (e) { return { reason: "cap", detail: `cannot prepare the worker registry: ${(e as Error).message}` }; }
