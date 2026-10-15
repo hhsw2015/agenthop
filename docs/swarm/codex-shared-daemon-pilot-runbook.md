@@ -36,7 +36,7 @@
      env "PATH=$P" INITIAL_AGENT_MODE=agent-full-access tern acp codex --resume 01a13e9a-ea58-7a30-a8db-35cd3ad3f879
    ```
    记下返回的 block id;`tern rename <block> "Second Voice"`。
-3. 开场一句走 bus,不走 Tern 直注:`agenthop_send codex:happycapy-01a13e9a "<交接一句>"`。实测(2026-10-16 首次试点)直注进 Tern 块的中文开场被模型侧内容过滤连拦 5 次,同一段话走 bus 正常送达。
+3. 开场一句走 bus:`agenthop_send codex:happycapy-01a13e9a "<交接一句>"`,这是常规交接通道。若某段内容被模型侧内容过滤拦下,不要换通道(bus、Tern 直注或其他)重发同一内容;停下来,改写或上报协调者。
 
 ## 3. 核验(逐条,任何一条不过 ⇒ 第 4 节回滚)
 

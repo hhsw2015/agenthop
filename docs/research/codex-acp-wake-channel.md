@@ -52,11 +52,11 @@
 | 4 单写者 | 过:rollout 唯一持有者 36869 |
 | 5 bus 身份 | 过:bus 节点 41323,父进程 36869 |
 | 6 bus 唤醒 | 过:bus 投递唤醒线程并得到回话 |
-| 7 SessionStart hook | **无执行痕迹**:presence 记录未变(仍是 pid 36072 / ts=1792051812000,该 pid 已不存活),hook 日志里也没有本 sid 本次的条目。即在共享 daemon 下,这次 `--resume` 没有触发会写 presence 的 SessionStart hook |
+| 7 SessionStart hook | **待验**:没有找到 hook 自身的执行痕迹。另有一条单独的观察:presence 记录未变(仍是 pid 36072 / ts=1792051812000,该 pid 已不存活)。这两条都**不能**说明 hook 没有触发——hook 也可能执行了,但写者按规则 HOLD 未改记录、写失败,或没有留下可保留的痕迹(hook 命令的输出是被丢弃的)。原因要分三步查:触发是否送达、hook 是否执行、写者做了什么 |
 
-另外:直注到 Tern 块的中文开场被模型侧内容过滤连拦 5 次,同一内容走 bus 正常,所以 runbook 的开场一句已改为走 bus。
+另外:试点中直注到 Tern 块的开场一句被模型侧内容过滤拦下。被过滤拦下的内容不应换通道重发;runbook 的开场一句改为正常的 bus 交接(内容同样受内容规则约束),不是为了绕开过滤。
 
-第 7 条的后果:presence 指向一个已死的 pid,依赖 presence 判活的读者会把 Second Voice 判成不在线,尽管 bus 投递正常。迁移审查席之前要解决:要么查明共享 daemon 下 hook 为何不触发,要么由迁移步骤显式写 presence(走 `scripts/seat-presence.ts set`)。
+第 7 条之外的单独问题:presence 现在指向一个已死的 pid,依赖 presence 判活的读者会把 Second Voice 判成不在线,尽管 bus 投递正常。迁移审查席之前要解决:先查明 hook 在共享 daemon 下的触发、执行与写入各环节,再决定原因与修法;另一条路是由迁移步骤显式写 presence(走 `scripts/seat-presence.ts set`)。
 
 ## 3. 建议(供裁)
 
