@@ -120,9 +120,13 @@ export function ternPanesForSession(inspectJson: unknown, sid: string, unparseab
     if (rec == null || (rec.pane !== 0 && !rec.pane)) continue;
     if (rec.exited !== null && rec.exited !== undefined) continue; // exited block ⇒ not a wake target
     const argv = paneProgramArgv(rec);
-    if (argv === null) { // IWT-ARGV r4: the pane's real argv can't be proven (expansion / bad quoting)
+    if (argv === null) { // IWT-ARGV: the pane's real argv can't be proven (expansion / bad quoting)
+      // IWT-ARGV-UNKNOWN (r5): "can't prove which sid" is NOT "not this sid". `tern acp claude --resume "$SID_VAR"` can resolve to THIS
+      // seat at run time even though the sid never appears in the source text. So any unparseable pane that could be an ACP seat —
+      // its raw text names this sid, or mentions both `acp` and `--resume` — makes the lookup unknown. A pane that shows no sign of
+      // being an ACP seat (e.g. `vim $(ls)`) is unrelated and does not block.
       const raw = Array.isArray(rec.args) ? rec.args.map(String).join(" ") : String(rec.command ?? "");
-      if (raw.includes(sid)) unparseable.push(String(rec.pane)); // it MIGHT be this seat — never guess, report it
+      if (raw.includes(sid) || (/\bacp\b/.test(raw) && raw.includes("--resume"))) unparseable.push(String(rec.pane));
       continue;
     }
     if (argv.length < 2) continue;
@@ -182,7 +186,7 @@ export function classifyTernInspect(run: { code: number; stdout: string; error?:
   if (unparseable.length) {
     // IWT-ARGV r4: a live block mentions this sid but its command line uses a shell expansion, so whether it really runs `--resume
     // <sid>` can't be proven without executing it. Unknown ⇒ the router stops (no herdr fallback) and the reason is logged.
-    return { kind: "unknown", reason: `unparseable: live Tern block(s) ${unparseable.join(", ")} mention this sid but their command line can't be proven (shell expansion) — not guessing a target` };
+    return { kind: "unknown", reason: `unparseable: live Tern block(s) ${unparseable.join(", ")} may be this seat but their command line can't be proven (shell expansion) — not guessing a target` };
   }
   if (hits.length === 1) return { kind: "found", ...hits[0]! };
   if (hits.length > 1) {

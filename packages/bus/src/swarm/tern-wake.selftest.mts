@@ -253,7 +253,21 @@ await (async () => {
   ok(ternPaneInfoForSession(inspect([zsh(`tern acp claude --resume ${O} --prompt \`printf -- --resume ${T}\``)]), T) === null, "r4: backticks ⇒ not matched");
   ok(ternPaneInfoForSession(inspect([zsh(`tern acp claude --resume ${O} --prompt "$(printf -- --resume ${T})"`)]), T) === null, "r4: $(…) inside double quotes ⇒ not matched");
   ok(ternPaneInfoForSession(inspect([zsh(`tern acp claude --resume ${T} --prompt '$(not run)'`)]), T)?.paneId === "9", "r4 control: a literal '$(…)' inside SINGLE quotes is plain text ⇒ still matched");
-  ok(classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([zsh(`tern acp claude --resume $OTHER_VAR`)])) }, T).kind === "absent", "r4 control: an unparseable block that never mentions this sid ⇒ still absent for it");
+  // IWT-ARGV-UNKNOWN (r5): replaces the r4 control that locked the bug in. A variable can expand to THIS sid at run time — checked
+  // against real /bin/sh with the variable set to T (a fake `tern` records the argv it actually receives).
+  {
+    const { execFileSync } = await import("node:child_process");
+    const line = `tern acp claude --resume "$REVIEW_RESUME_SID"`;
+    const delivered = execFileSync("/bin/sh", ["-c", `tern() { printf '%s\\0' "$@"; exit 0; }\n${line}`], { encoding: "utf8", env: { ...process.env, REVIEW_RESUME_SID: T } }).split("\0").slice(0, -1);
+    ok(delivered.includes(T), "r5 oracle: real /bin/sh with the variable set to this sid DOES deliver --resume <this sid>");
+    const c5 = classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([zsh(line)])) }, T);
+    ok(c5.kind === "unknown", "r5: a `--resume $VAR` ACP block whose sid can't be proven ⇒ UNKNOWN (unprovable ≠ absent), never absent→herdr");
+    const calls: string[] = [];
+    const r = await resolveWakePane(["tern", "herdr"], ["tern", "herdr"], { tern: async () => { calls.push("tern"); return c5; }, herdr: async () => { calls.push("herdr"); return { kind: "found" as const, paneId: "old-herdr", state: "idle" as const }; } }, T);
+    ok(r === null && JSON.stringify(calls) === '["tern"]', "r5: the route stops — the herdr twin is never probed");
+  }
+  ok(classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([zsh(`vim $(ls)`)])) }, T).kind === "absent", "r5 control: an unparseable pane that is NOT an ACP seat (no acp/--resume) doesn't block ⇒ absent");
+  ok(classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([zsh(`tern acp claude --resume other-sid-literal`)])) }, T).kind === "absent", "r5 control: a provable ACP seat for ANOTHER sid ⇒ still absent (real absence keeps the fallback)");
   ok(shellTokens(`a $(b) c`) === null && shellTokens(`a \`b\``) === null && shellTokens(`a <(b)`) === null && shellTokens(`a '$(b)'`) !== null, "r4: tokenizer refuses expansions, keeps single-quoted literals");
 }
 console.log(`\nall tern-wake selftests passed (${n})`);
