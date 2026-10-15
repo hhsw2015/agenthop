@@ -4,8 +4,8 @@
  *   ① a herdr session REGISTERED in a seat-shell record (workers[].herdr_session) whose worker is state "stopped" (or "orphan")
  *      but the herdr session still exists ⇒ SIGTERM that record's server_pid — only when server_pid is the sole holder of the
  *      session's herdr.sock and no newer active record holds the name (r11/r12: names are reused, so nothing is stopped by name).
- *      The session DIRECTORY is never deleted automatically (r13: herdr has no instance-bound delete); a dir whose server is gone is
- *      reported once per instance with the manual `herdr session delete <name>`.
+ *      The session DIRECTORY is never deleted automatically (r13: herdr has no instance-bound delete); a dir whose socket no process
+ *      holds is reported once per instance (pane + started_at + server_pid) with the manual `herdr session delete <name>`.
  *   ② a seat-shell worker in state "live" whose Tern block (workers[].pane) is gone from `tern ls --json` ⇒ mark the record
  *      "orphan" (+stopped_at), then ① applies to its herdr session on the following confirmations. "starting" (no block yet,
  *      pane 0) is never judged; a persisting "stopping" is reported as a possible leak, never marked or deleted (#1034 r3).
@@ -151,7 +151,7 @@ export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; u
         let line = "", skipped = "";
         const ran = io.whileInstance(sid, hs, { pane: w.pane ?? null, startedAt: w.started_at ?? null }, ["stopped", "orphan"], () => {
           const owners = io.socketOwners(hs); // at the commit point, inside the lock
-          if (owners !== null && owners.length === 0) { skipped = "leftover"; return; } // our server is already gone: only a dir left
+          if (owners !== null && owners.length === 0) { skipped = "leftover"; return; } // no process holds the socket: only a dir is left
           if (owners === null || owners.length !== 1 || owners[0] !== spid) {
             skipped = owners === null ? "socket owner unobservable" : `socket held by ${owners.join(",")}, not ${spid}`;
             return;
@@ -165,10 +165,12 @@ export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; u
         });
         if (!ran) io.log(`orphan-sweep: ${hs} (seat ${sid.slice(0, 8)}) is no longer this stopped/orphan instance — candidate dropped, record kept`);
         else if (skipped === "leftover") {
-          const rk = `left:${sid}:${hs}:${spid}`;
+          // once per INSTANCE (the full identity sameInstance uses, + server_pid): a new generation under the same seat/name/pid
+          // is a different instance and gets its own reminder
+          const rk = `left:${sid}:${hs}:${JSON.stringify(w.pane ?? null)}:${JSON.stringify(w.started_at ?? null)}:${spid}`;
           if (!st.reported.has(rk)) {
             st.reported.add(rk);
-            io.audit(`orphan-sweep: herdr session dir ${hs} left behind (seat ${sid.slice(0, 8)}, server ${spid} gone) — not deleted automatically `
+            io.audit(`orphan-sweep: herdr session dir ${hs} left behind (seat ${sid.slice(0, 8)}, server ${spid}: no process holds its socket) — not deleted automatically `
               + `(a by-name delete could hit a server started under the same name); if nothing should run as ${hs}: herdr session delete ${hs}`);
           }
         }

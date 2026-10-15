@@ -228,4 +228,21 @@ for (const when of ["after-probe", "after-signal", "after-exit"] as const) {
   t("invariant: no `session delete` / herdrDelete in the sweep's code", !/["']delete["']|herdrDelete|session\s+delete/.test(src.replace(/`[^`]*`/g, "")));
   t("invariant: no `server stop` by name in the sweep's code", !/["']stop["']/.test(src.replace(/`[^`]*`/g, "")));
 }
+// --- r14 TBS-SV-REPORT-INSTANCE: the leftover reminder is once per INSTANCE, not per seat/name/pid ---
+{
+  const { home, f } = setup();
+  const gen = (pane: number, started: number) => ({ name: NAME, herdr_session: NAME, pane, kind: "tui" as const, started_at: started, stopped_at: 5, state: "stopped" as const, server_pid: 50001 });
+  f.herdrSessions = [{ name: NAME, running: false }]; // dir present, no socket holder
+  const ev = ev0(), clock = { t: 0 };
+  const io = sweepIO(home, f, ev, clock, () => []);
+  const st = initialOrphanState();
+  const go = (n: number) => { for (let i = 0; i < n; i++) { runOrphanSweep(st, io); clock.t += ORPHAN_EVERY_MS; } };
+  writeWorkers(home, SEAT, [gen(701, 1000)]); go(8);
+  t("report-instance: generation A reported once", ev.audit.filter((l) => /left behind/.test(l)).length === 1);
+  writeWorkers(home, SEAT, [gen(702, 3000)]); go(8); // same seat, same name, same server_pid, new pane + started_at
+  t("report-instance: generation B (same seat/name/pid) gets its own reminder", ev.audit.filter((l) => /left behind/.test(l)).length === 2);
+  go(8);
+  t("report-instance: … and still only once for B", ev.audit.filter((l) => /left behind/.test(l)).length === 2);
+  t("report-instance: wording says no socket holder, not that the process exited", ev.audit.filter((l) => /left behind/.test(l)).every((l) => /no process holds its socket/.test(l) && !/ gone\)/.test(l)));
+}
 console.log("PASS tern-orphan-sweep-reuse");
