@@ -335,6 +335,24 @@ for i = #timers - 1, 1, -1 do table.remove(timers, i) end -- the stalled callbac
 commands["mirror"](cx)
 ck("r9: after the restart the next sweep reports running again", (files[AGENTS] or ""):find('"timer":"running"', 1, true) ~= nil)
 
+-- ---- r13 BTF-R10-P2-1: after an overdue restart, the OLD chain's callback arriving late must not start a second chain ----
+for i = #timers, 1, -1 do table.remove(timers, i) end -- every pending callback lost
+clock = clock + 5000; commands["mirror"](cx)            -- overdue ⇒ restart: exactly one fresh chain pending
+ck("r13 setup: exactly one pending callback", #timers == 1)
+local stale = timers[1]
+clock = clock + 5000                             -- overdue: the sweep restarts the accelerator
+commands["mirror"](cx)
+ck("r13 setup: the restart queued a new chain (old still queued inside Tern)", #timers == 2)
+table.remove(timers, 1)                          -- Tern now delivers the OLD callback after all
+local tickBeforeStale = tickOf()
+local firedBeforeStale = (files[AGENTS] or ""):match('"timer_fired_at":([%d%.]+)')
+stale(cx)
+ck("r13: the superseded callback re-arms NOTHING (still exactly one chain)", #timers == 1)
+ck("r13: the superseded callback does no tick and does not move timer_fired_at", tickOf() == tickBeforeStale)
+local fresh = table.remove(timers, 1)
+fresh(cx)
+ck("r13: the current chain still renews (one successor) and stamps timer_fired_at", #timers == 1 and (files[AGENTS] or ""):match('"timer_fired_at":([%d%.]+)') ~= firedBeforeStale)
+
 -- ---- r11 (live 13:17, coordinator): a chain whose callbacks stop arriving. agents.json is rewritten ONLY by a tick, so between
 -- sweeps a frozen file keeps whatever it last said; timer_fired_at (the last REAL delivery) is what tells "never/no longer delivered".
 for i = #timers, 1, -1 do table.remove(timers, i) end -- every pending callback is lost (never delivered)

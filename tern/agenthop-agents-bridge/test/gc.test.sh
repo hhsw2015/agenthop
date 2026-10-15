@@ -59,6 +59,26 @@ o8="$(AGENTHOP_TERN_PANES="$D4" GC_NOW=$NOW bash "$GC" 2>/dev/null)"; chmod 0755
 ck "quarantine unwritable ⇒ request held in requests/ and reported" "yes:gc: results=0 requests_quarantined=0 requests_held=1 tmp=0 quarantine_expired=0" "$([ -e "$D4/requests/held.json" ] && echo yes || echo no):$o8"
 rm -rf "$W4"
 
+# r13 BTF-R10-P2-4: managed subdirs that are symlinks (or resolve outside the control dir) are skipped, never followed
+W5="$(mktemp -d)"; D5="$W5/ctl"; X="$W5/outside"; mkdir -p "$D5" "$X/res" "$X/req" "$X/q"
+mk "$X/res/victim.json" 9000; mk "$X/req/victim.json" 9000; mk "$X/q/victim.json" 900000
+ln -s "$X/res" "$D5/results"
+o9="$(AGENTHOP_TERN_PANES="$D5" GC_NOW=$NOW bash "$GC")"
+ck "results -> outside: the outside file is untouched" "yes" "$([ -e "$X/res/victim.json" ] && echo yes || echo no)"
+ck "results -> outside: reported skipped" "gc: results=0 requests_quarantined=0 requests_held=0 tmp=0 quarantine_expired=0 skipped=results(symlink)" "$o9"
+rm "$D5/results"; ln -s "$X/req" "$D5/requests"
+AGENTHOP_TERN_PANES="$D5" GC_NOW=$NOW bash "$GC" >/dev/null
+ck "requests -> outside: the outside request is neither moved nor deleted, no quarantine created there" "yes:no" "$([ -e "$X/req/victim.json" ] && echo yes || echo no):$([ -e "$X/req/quarantine" ] && echo yes || echo no)"
+rm "$D5/requests"; mkdir -p "$D5/requests"; ln -s "$X/q" "$D5/requests/quarantine"; mk "$D5/requests/orph.json" 400
+o10="$(AGENTHOP_TERN_PANES="$D5" GC_NOW=$NOW bash "$GC")"
+ck "quarantine -> outside: the outside entry is not expired, the request is held in place" "yes:yes" "$([ -e "$X/q/victim.json" ] && echo yes || echo no):$([ -e "$D5/requests/orph.json" ] && echo yes || echo no)"
+ck "quarantine -> outside: reported held + skipped" "gc: results=0 requests_quarantined=0 requests_held=1 tmp=0 quarantine_expired=0 skipped=quarantine(symlink)" "$o10"
+rm -f "$D5/requests/quarantine" "$D5/requests/orph.json"; ln -s "$X/req/victim.json" "$D5/requests/link.json"
+m0="$(stat -f %m "$X/req/victim.json")"
+AGENTHOP_TERN_PANES="$D5" GC_NOW=$NOW bash "$GC" >/dev/null
+ck "a symlinked request ENTRY is skipped: outside target's mtime unchanged and the link not moved" "$m0:yes" "$(stat -f %m "$X/req/victim.json"):$([ -L "$D5/requests/link.json" ] && echo yes || echo no)"
+rm -rf "$W5"
+
 out3="$(AGENTHOP_TERN_PANES="$W/does-not-exist" GC_NOW=$NOW bash "$GC")"; rc3=$?
 ck "unreadable control dir ⇒ exit 1 (UNKNOWN), not 'nothing to clean'" "1" "$rc3"
 rm -rf "$W"

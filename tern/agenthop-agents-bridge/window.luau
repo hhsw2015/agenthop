@@ -271,7 +271,11 @@ end
 --     successor is queued, so a late batch can never hit the budget; it reports `timer` = "stopped-late" in agents.json;
 --   * may be disabled by Tern without alarm (the command sweep keeps the mirror alive);
 --   * restarts on the next `mirror` COMMAND run (the sweep), i.e. as soon as we are serviced on time again.
-local function mirrorTimer(cx)
+-- r13 BTF-R10-P2-1: a restart must not leave TWO chains. The overdue callback a restart gives up on is still queued inside Tern; if
+-- it arrives later it would read the NEW timerDue, look on time, and re-arm — a second chain. Each chain carries its generation; a
+-- callback whose generation is not current returns at once (no renew, no timer_fired_at, no tick).
+local timerGen = 0
+local function mirrorTimer(cx, gen)
   local now = tern.now()
   if timerDue ~= nil and now - timerDue > TIMER_LATE_MS then
     timerState = "stopped-late" -- napped/backgrounded: do not re-arm; the command sweep restarts us
@@ -279,7 +283,11 @@ local function mirrorTimer(cx)
     return
   end
   timerDue = now + POLL_MS
-  tern.timer(POLL_MS, function(nextCx) timerFiredAt = tern.now(); mirrorTimer(nextCx) end)
+  tern.timer(POLL_MS, function(nextCx)
+    if gen ~= timerGen then return end -- a superseded chain's callback: dropped (no renew, no timer_fired_at, no tick)
+    timerFiredAt = tern.now()
+    mirrorTimer(nextCx, gen)
+  end)
   if cx ~= nil then mirrorTick(cx) end
 end
 
@@ -291,15 +299,16 @@ tern.command({ id = "mirror", title = "agenthop bridge: mirror now", run = funct
   local rep = timerReport()
   mirrorTick(cx) -- publishes the CURRENT timer state (stopped-late / overdue is reported, then the restart below takes effect)
   if rep ~= "running" then -- the accelerator stopped itself or stalled: restart ONE fresh chain (a stalled one never re-fires)
+    timerGen = timerGen + 1 -- supersede the old chain: its pending callback (if Tern ever delivers it) is dropped
     timerState = "running"
     timerDue = nil
-    mirrorTimer(nil)
+    mirrorTimer(nil, timerGen)
   end
 end })
 tern.command({ id = "drain", title = "agenthop bridge: drain requests", run = function(cx) ensure(); pcall(function() drain(cx, false) end) end })
 tern.command({ id = "drain-start", title = "agenthop bridge: drain start requests", run = function(cx) ensure(); pcall(function() drain(cx, true) end) end })
 
-mirrorTimer(nil) -- A1 best-effort mirror chain on the TIMER hook (the swarm-triggered `mirror` command is the primary driver)
+mirrorTimer(nil, timerGen) -- A1 best-effort mirror chain on the TIMER hook (the swarm-triggered `mirror` command is the primary driver)
 -- r4: NO arm on the timer hook — that hook now carries the mirror chain, and the arm's three cross-VM tern.carly calls must not be
 -- able to disable it. Arming runs only on the `arm` command (its own hook), which the swarm triggers after every load/reload.
 
