@@ -30,6 +30,30 @@ rm -rf "$SWARM_SKILLS_DIR/swarm-member"; mkdir -p "$T/elsewhere"; echo theirs > 
 bash "$S" >/dev/null 2>&1; ck "symlink target: exit 1" 1 $?
 ck "symlink target: not replaced" theirs "$(cat "$T/elsewhere/SKILL.md")"
 ck "symlink target: link itself kept" yes "$( [ -L "$SWARM_SKILLS_DIR/swarm-member" ] && echo yes || echo no)"
+# publication fault: a PATH mv wrapper fails the staged publish (.<name>.new.* -> target); optionally the rollback too
+rm -f "$SWARM_SKILLS_DIR/swarm-member"; bash "$S" >/dev/null
+mkdir -p "$T/fbin"; cat > "$T/fbin/mv" <<'MV'
+#!/bin/bash
+case "$1" in */.swarm-member.new.*) echo "mv: EACCES (fault)" >&2; exit 1;; esac
+if [ -n "${FAIL_ROLLBACK:-}" ]; then case "$1" in */.swarm-member.old.*) echo "mv: EACCES (fault)" >&2; exit 1;; esac; fi
+exec /bin/mv "$@"
+MV
+chmod 755 "$T/fbin/mv"
+echo "old copy" > "$SWARM_SKILLS_DIR/swarm-member/SKILL.md"; ino=$(stat -f %i "$SWARM_SKILLS_DIR/swarm-member"); fino=$(stat -f %i "$SWARM_SKILLS_DIR/swarm-member/SKILL.md")
+out=$(PATH="$T/fbin:$PATH" bash "$S" 2>&1); ck "publish fault: exit 1" 1 $?
+ck "publish fault: says restored" 1 "$(echo "$out" | grep -c 'previous installation restored')"
+ck "publish fault: target present" yes "$( [ -d "$SWARM_SKILLS_DIR/swarm-member" ] && echo yes || echo no)"
+ck "publish fault: previous contents kept" "old copy" "$(cat "$SWARM_SKILLS_DIR/swarm-member/SKILL.md")"
+ck "publish fault: same dir inode" "$ino" "$(stat -f %i "$SWARM_SKILLS_DIR/swarm-member")"
+ck "publish fault: same file inode" "$fino" "$(stat -f %i "$SWARM_SKILLS_DIR/swarm-member/SKILL.md")"
+ck "publish fault: no stage/old leftovers" 0 "$(ls -A "$SWARM_SKILLS_DIR" | grep -c '^\.swarm-member\.')"
+ck "publish fault: other skill untouched" keep "$(cat "$SWARM_SKILLS_DIR/other/SKILL.md")"
+out=$(FAIL_ROLLBACK=1 PATH="$T/fbin:$PATH" bash "$S" 2>&1); ck "publish+rollback fault: exit 1" 1 $?
+ck "publish+rollback fault: names both paths" 1 "$(echo "$out" | grep -c 'previous copy kept at .*\.swarm-member\.old\..* new copy at .*\.swarm-member\.new\.')"
+oldp=$(ls -d "$SWARM_SKILLS_DIR"/.swarm-member.old.* 2>/dev/null | head -1)
+ck "publish+rollback fault: previous copy recoverable" "old copy" "$(cat "$oldp/SKILL.md" 2>/dev/null)"
+ck "publish+rollback fault: new copy kept" 0 "$(cmp -s "$REPO/docs/swarm/skills/swarm-member/SKILL.md" "$(ls -d "$SWARM_SKILLS_DIR"/.swarm-member.new.* | head -1)/SKILL.md"; echo $?)"
+rm -rf "$SWARM_SKILLS_DIR"/.swarm-member.*
 ck "bad arg: exit 2" 2 "$(bash "$S" --bogus >/dev/null 2>&1; echo $?)"
 ck "SKILL.md <= 200 lines" yes "$( [ "$(wc -l < "$REPO/docs/swarm/skills/swarm-member/SKILL.md")" -le 200 ] && echo yes || echo no)"
 ck "SKILL.md hardcodes no session sid" 0 "$(grep -cE '[0-9a-f]{8}-[0-9a-f]{4}-' "$REPO/docs/swarm/skills/swarm-member/SKILL.md")"

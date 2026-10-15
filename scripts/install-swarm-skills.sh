@@ -4,6 +4,8 @@
 # Source of truth: docs/swarm/skills/<name>/ (one dir per skill, each with SKILL.md), versioned with the repo.
 # Target: ${SWARM_SKILLS_DIR:-$HOME/.claude/skills}/<name>/. Idempotent: a skill whose installed copy is already
 # identical is left alone; a changed one is replaced through a staging dir + rename, so a reader never sees half a skill.
+# If the final rename fails, the previous installation is renamed back to its own path; if that also fails, both copies
+# are kept (paths printed) and the exit code is 1.
 # Only <name> dirs that this repo ships are touched; other skills in the target are never read or removed.
 # A target <name> that is a symlink (someone else's install) is refused, not replaced.
 #
@@ -24,9 +26,17 @@ for dir in "$SRC"/*/; do
   if [ -d "$t" ] && diff -r -q "$dir" "$t" >/dev/null 2>&1; then echo "ok $name: up to date"; continue; fi
   if [ "$DRY" = 1 ]; then echo "would install $name -> $t"; continue; fi
   stage="$DST/.$name.new.$$"; old="$DST/.$name.old.$$"
-  rm -rf "$stage"; cp -R "$dir" "$stage"
-  [ -e "$t" ] && mv "$t" "$old"
-  mv "$stage" "$t"; rm -rf "$old"
+  rm -rf "$stage"
+  if ! cp -R "$dir" "$stage"; then rm -rf "$stage"; echo "FAILED $name: cannot stage a copy; $t untouched"; rc=1; continue; fi
+  if [ -e "$t" ] && ! mv "$t" "$old"; then rm -rf "$stage"; echo "FAILED $name: cannot move the old copy aside; $t untouched"; rc=1; continue; fi
+  if ! mv "$stage" "$t"; then
+    # publication failed: put the previous installation back at its own path (same inode), never leave the name absent
+    if [ -e "$old" ] && ! mv "$old" "$t"; then
+      echo "FAILED $name: publish AND rollback failed; previous copy kept at $old, new copy at $stage"; rc=1; continue
+    fi
+    rm -rf "$stage"; echo "FAILED $name: cannot publish; previous installation restored at $t"; rc=1; continue
+  fi
+  rm -rf "$old"
   echo "installed $name -> $t"
 done
 [ "$n" -gt 0 ] || { echo "no skills found under $SRC" >&2; exit 2; }

@@ -53,17 +53,21 @@ user-invocable: true
 ```ts
 import { homedir } from "node:os";
 import { writeInbox, composeInboxMsg } from "./packages/bus/src/inbox.ts";
-writeInbox(homedir(), "<target full sid>", composeInboxMsg({ from: "<$ME>", fromLabel: "<handle> (<role>)", text }), "<idemKey>");
+console.log(writeInbox(homedir(), "<target full sid>", composeInboxMsg({ from: "<$ME>", fromLabel: "<handle> (<role>)", text }), "<idemKey>"));
 ```
 
-送达核验:投后 `ls ~/.agenthop/inbox/<sid>/`。会即时认领的席位(二声等)投后箱里可能已空,`.pubcred/` 下出现新文件 = 已送达,不要重投。
+送达核验看 `writeInbox` 的返回值,不看目录:
+
+- `published` / `already` = 已送达(同 idemKey 重投得 `already`,不会重复)。
+- `deferred` / `pending` / `unknown` = **未确认**。送达义务仍在你身上:用**同一个 idemKey** 重投,直到得到 `published` 或 `already`;仍不行就报协调者。
+- 会即时认领的席位(二声等)投后箱里可能已空。箱空不是失败,`.pubcred/` 里有新文件也不是送达证据(可能是 pending)。以返回值为准。
 
 ## 3. 一单两信(S27/S28/S29)
 
-每一单只发**两封信**:
+每一单只算**两封信**:协调者的派单,和你做完后一次送出的**交付信 / 送审信**。
 
-1. **确认信**:读完派单 / 交接单后,向 `$COORD_BOX` 回一句(含你的 sid、接的单、对象 SHA)。
-2. **交付信 / 送审信**:做完后一次送出。
+- 接到普通派单**不回确认**,直接做。
+- 唯一的确认信:新席开场读完**交接单**后,向 `$COORD_BOX` 回一句(含你的 sid)。见第 6 节。只在新席 / 换代开场发,不是每单都发。
 
 中途**不发回执**、不发进度、不发「收到」。在途静默。只在下面三种情况额外发信:死锁、卡住超 24 小时、终态总结。一个固定 SHA 送一次;不要一边改一边送中间 SHA。
 
@@ -98,7 +102,7 @@ writeInbox(homedir(), "<target full sid>", composeInboxMsg({ from: "<$ME>", from
 3. `~/.agenthop/swarm/PROGRESS.md` 末尾 N 个周期(交接单会写 N 或周期号)。
 4. 交接单点名的协议 / 规范节。
 5. 旧席 memory 只作背景;与文件冲突时**信文件**。
-6. 回 `$COORD_BOX` 一句确认(含 sid)。这是第 3 节的第一封信。
+6. 回 `$COORD_BOX` 一句确认(含 sid)。这是第 3 节说的唯一确认信,只在开场发。
 
 开发席**没有 handoff 文件**:真相 = git + 箱 + 送审信三要素。崩溃后新会话读己箱 + `git status && git log -3`,领回同一单。
 
@@ -120,7 +124,10 @@ git merge-base --is-ancestor <你分支的基> origin/main && echo base-in-main 
 
 - transcript ≥ 60 MiB:**计划轮换**。主动向 `$COORD_BOX` 报「可轮换」+ transcript 大小。
 - ≥ 80 MiB,或 2 小时内第 3 次崩,或 resume 后首个 prompt 就崩:换干净会话。
-- transcript 路径:`~/.claude/projects/<项目目录>/<sid>.jsonl`。
+- transcript 路径因工具而异,按你的工具取:
+  - Claude Code:`~/.claude/projects/<cwd 中 / 换成 - >/<sid>.jsonl`。
+  - Codex:`~/.codex/sessions/<年>/<月>/<日>/rollout-<时间>-<thread id>.jsonl`(`find ~/.codex/sessions -name '*<thread id>*'`)。
+  - 其他工具,或交接单另给了路径:以交接单 / 运行时给出的为准。找不到就报协调者,不要拿别的工具的路径估算大小。
 
 **安全点**(开发席,三者齐才可轮换):
 
