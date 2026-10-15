@@ -32,7 +32,7 @@ export function selfShell(env: NodeJS.ProcessEnv = process.env): Shell | null {
 
 /** One token of a shell command line: a WORD (an argument, however it was quoted) or an unquoted command SEPARATOR. Keeping the
  *  kind is the point (IWT-SV-P2-1 r3): a quoted ";" is an argument, never a separator. */
-export type ShellToken = { kind: "word"; text: string } | { kind: "sep" };
+export type ShellToken = { kind: "word"; text: string } | { kind: "sep" } | { kind: "redir"; op: string };
 
 /** Tokenize a shell command line the way POSIX sh would — WITHOUT executing anything. Honors single quotes (literal), double quotes
  *  (\\ escapes for \\ " $ ` and newline), backslash escapes outside quotes, and `#` comments (only at a word start, to end of line).
@@ -65,6 +65,18 @@ export function shellTokens(line: string): ShellToken[] | null {
     // read text inside the substitution as arguments. Process substitution `<(` `>(` likewise.
     if (ch === "$" || ch === "`") return null;
     if ((ch === "<" || ch === ">") && line[i + 1] === "(") return null;
+    // IWT-SV-P2-1 (r5): an UNQUOTED redirection operator — `>`, `>>`, `<`, `<<`, `>&`, `<&`, `<>`, `>|`, and an fd prefix like `2>`
+    // (digits immediately before it, with no space) — is NOT an argument, and the word after it is a FILE NAME, not an argument.
+    // Emit a typed "redir" token; the argv builder drops it and its target. (Real /bin/sh delivers `tern acp claude > --resume=X` as
+    // just [acp, claude].)
+    if (ch === "<" || ch === ">") {
+      let op = ch, k = i + 1;
+      if (/^\d+$/.test(cur) && inWord) { op = cur + op; cur = ""; inWord = false; } // `2>`: the fd digits belong to the operator
+      else end();
+      while (k < line.length && (line[k] === "<" || line[k] === ">" || line[k] === "&" || line[k] === "|")) { op += line[k]; k++; }
+      out.push({ kind: "redir", op });
+      i = k; continue;
+    }
     if (ch === "\n") { sep(); i++; continue; }                        // an unquoted newline ends the command
     if (ch === " " || ch === "\t") { end(); i++; continue; }
     if (ch === "#" && !inWord) { const nl = line.indexOf("\n", i); if (nl < 0) break; i = nl; continue; } // comment runs to end of line
@@ -78,7 +90,7 @@ export function shellTokens(line: string): ShellToken[] | null {
 /** Words only (back-compat helper for tests / callers that only need the split). null when unparseable. Pure. */
 export function shellWords(line: string): string[] | null {
   const t = shellTokens(line);
-  return t ? t.flatMap((x) => (x.kind === "word" ? [x.text] : [])) : null;
+  return t ? t.flatMap((x) => (x.kind === "word" ? [x.text] : [])) : null; // redirection operators and separators are not words
 }
 
 /** The shells whose `-c <line>` we unwrap (Tern launches ACP blocks as `zsh -l -c '<line>'`). Any OTHER program's `-c` argument is
@@ -95,7 +107,17 @@ export function paneProgramArgv(rec: { program?: unknown; args?: unknown; comman
     const toks = shellTokens(line);
     if (!toks) return null;
     const out: string[] = [];
-    for (const t of toks) { if (t.kind === "sep") break; out.push(t.text); }
+    for (let k = 0; k < toks.length; k++) {
+      const t = toks[k]!;
+      if (t.kind === "sep") break;
+      if (t.kind === "redir") { // the operator and its target word are not arguments
+        const nxt = toks[k + 1];
+        if (/&$/.test(t.op) && nxt?.kind === "word" && /^(\d+|-)$/.test(nxt.text)) { k++; continue; } // `2>&1`, `>&-`
+        if (nxt?.kind === "word") { k++; continue; }
+        return null; // a redirection with no target word ⇒ not a valid simple command ⇒ unparseable
+      }
+      out.push(t.text);
+    }
     return out;
   };
   if (args) {

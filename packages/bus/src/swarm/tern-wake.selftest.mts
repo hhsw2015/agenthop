@@ -270,4 +270,35 @@ await (async () => {
   ok(classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([zsh(`tern acp claude --resume other-sid-literal`)])) }, T).kind === "absent", "r5 control: a provable ACP seat for ANOTHER sid ⇒ still absent (real absence keeps the fallback)");
   ok(shellTokens(`a $(b) c`) === null && shellTokens(`a \`b\``) === null && shellTokens(`a <(b)`) === null && shellTokens(`a '$(b)'`) !== null, "r4: tokenizer refuses expansions, keeps single-quoted literals");
 }
+
+// ── IWT-SV-P2-1 (r5): REDIRECTIONS — an unquoted redirection operator and its target are not arguments ────────────────────
+// Ground truth: real /bin/sh, with the fake `tern` writing its argv to a separate fd (9) so the line's own redirection can't hide it.
+{
+  const { execFileSync } = await import("node:child_process");
+  const { mkdtempSync: mk, readFileSync: rf, existsSync: ex } = await import("node:fs");
+  const T = "audit-1234";
+  const delivered = (line: string): boolean => {
+    const cwd = mk(path.join(scratch, "rd-")); const rec = path.join(cwd, "argv.rec");
+    try { execFileSync("/bin/sh", ["-c", `exec 9>"${rec}"\ntern() { printf '%s\\0' "$@" >&9; exit 0; }\n${line}`], { cwd, stdio: "ignore" }); } catch { /* nothing delivered */ }
+    if (!ex(rec)) return false;
+    const a = rf(rec, "utf8").split("\0").slice(0, -1); const i = a.indexOf("--resume");
+    return a[0] === "acp" && (a.includes(`--resume=${T}`) || (i >= 0 && a[i + 1] === T));
+  };
+  const zsh = (line: string) => ({ pane: 9, exited: null, working: false, program: "/bin/zsh", args: ["-l", "-c", line] });
+  const forms: [string, string][] = [
+    [`tern acp claude > --resume=${T}`, "redirect target is a FILE NAME, not --resume (the reviewer's counterexample)"],
+    [`tern acp claude 2> --resume=${T}`, "fd-prefixed redirect (2>) target is a file name"],
+    [`tern acp claude >> --resume ${T}`, "append redirect consumes --resume as its target"],
+    [`tern acp claude --resume ${T} > out.log`, "control: a redirect AFTER the real args keeps them"],
+    [`tern acp claude --resume ${T} 2>&1`, "control: 2>&1 is not an argument"],
+    [`tern acp claude < /dev/null --resume ${T}`, "control: input redirect then real args"],
+    [`tern acp claude '>' --resume ${T}`, "control: a QUOTED '>' is an argument"],
+  ];
+  for (const [line, what] of forms) {
+    const sh = delivered(line), m = ternPaneInfoForSession(inspect([zsh(line)]), T) !== null;
+    ok(sh === m, `r5 redirect: ${what} — parser agrees with /bin/sh (sh=${sh}, parser=${m})`);
+  }
+  ok(shellTokens(`a 2> f`)!.some((t) => t.kind === "redir" && (t as { op: string }).op === "2>"), "r5 tokenizer: `2>` is one redirection token (fd digits belong to the operator)");
+  ok(shellTokens(`a '2>' f`)!.every((t) => t.kind === "word"), "r5 tokenizer: a quoted '2>' stays a word");
+}
 console.log(`\nall tern-wake selftests passed (${n})`);
