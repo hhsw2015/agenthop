@@ -6,6 +6,7 @@ import { startBusCore, type BusCore, type UnifiedPeer } from "./core.js";
 import { formatHandoff } from "./handoff.js";
 import { despawnAgent, readRegistry, spawnAgent, startClaimRetry } from "./spawn.js";
 import { omniwmctl, splitArgs } from "./wm.js";
+import { TERN_OPS, ternCall, ternStatus } from "./tern-bridge.js";
 import { version } from "./version.js";
 
 /**
@@ -46,6 +47,9 @@ export function busInstructions(): string {
 - agenthop_recv(timeout_seconds): fallback only — see below.
 - agenthop_spawn(tool, cwd?, workspace?, visible?, task?): launch another agent (claude/codex/opencode) on this machine. YOU pick the mode per task: visible (default) = a VISIBLE window the user can watch — it joins the bus on its own, then hand it work with agenthop_handoff; visible:false = HEADLESS, no window — a detached one-shot run of the tool's non-interactive mode with the task argument as the prompt, output to a per-launch log file (the result channel), stoppable with agenthop_despawn. Rule of thumb: important or long-running work the user may want to watch → visible; minor/bulk/fire-and-forget checks, or a desktop already full of windows → headless. Any session can dispatch — a decentralized orchestration center.
 - agenthop_wm(args): drive the OmniWM window manager (macOS) to arrange windows — a passthrough to omniwmctl (e.g. "query windows", "window move-to-workspace <id> 2").
+- agenthop_tern(op, args?, timeout_ms?): call Tern's agents API through the A1 bridge in one step (publish → trigger drain → wait for the result). op: list | transcript | wait | ask | start | interrupt | stop | eval. A read-only op that times out is recovered once automatically (plugin reload + arm, then retried); a NON-idempotent op that times out returns {state:"UNKNOWN", hold:true, id} and is never re-sent — check its effect (e.g. list) before acting again. eval runs your Lua with the plugin's cx and its budget is YOURS: over ~50ms disables the bridge's drain until reload (e.g. avoid #cx.agents:list(); #cx.session:panes() is cheap).
+  start opens visible work as a sibling tab and names it by role: {prompt, cwd, title:"<English role name>"} (no session ids in titles).
+- agenthop_tern_status(): bridge health — mirror tick/age/cost, Tern's authoritative block count, requests waiting, recent budget kills; healthy | degraded | unknown (unknown = could not observe, not "dead").
 
 Choosing a channel: agenthop reaches EVERY tool on the bus (Claude Code, Codex, OpenCode). If your host also has its OWN cross-session messaging (e.g. Claude Code's built-in), that only sees other sessions of the SAME tool — it cannot reach Codex or OpenCode. So use the host's native messaging for same-tool peers if you like, but use agenthop for ANY cross-tool peer: it is the only channel that bridges them, and agenthop_peers is where a different-tool session shows up at all.
 
@@ -216,6 +220,39 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
       noteCodex(core, extra);
       const result = await omniwmctl(splitArgs(args));
       return result.ok ? reply(result.output) : failure(result.output);
+    },
+  );
+
+  server.registerTool(
+    "agenthop_tern",
+    {
+      annotations: MUTATES,
+      description:
+        'Call Tern\'s agents API through the A1 bridge in one step: atomically publish a request, trigger the bridge drain, wait for the result. op: list | transcript | wait | ask | start | interrupt | stop | eval. Read-only ops (list/transcript/wait; eval only with args.readonly=true) that time out are recovered ONCE (tern plugin reload → ready → arm → re-trigger). Non-idempotent ops that time out return {state:"UNKNOWN", hold:true, id} and are NEVER re-sent. eval: args.code is Lua run with the plugin\'s `cx`; its budget is the caller\'s — over ~50ms disables drain until reload. list returns a cheap slim table; args.full=true asks for the full (expensive) agents:list(). start is the front door for VISIBLE work (Tern only shows top-level blocks): it opens a sibling tab by default (args.how overrides) and args.title — a fixed English role name, never a session id — renames the new block; the result carries its pane id.',
+      inputSchema: {
+        op: z.enum(TERN_OPS).describe("bridge op"),
+        args: z.record(z.string(), z.unknown()).optional().describe('op arguments, e.g. {"agent":123,"text":"hi"} for ask, {"code":"return #cx.session:panes()"} for eval, {"full":true} for list'),
+        timeout_ms: z.number().int().min(200).max(120000).optional().describe("how long to wait for the result before the timeout semantics apply (default 2000)"),
+      },
+    },
+    async ({ op, args, timeout_ms }, extra) => {
+      noteCodex(core, extra);
+      const r = await ternCall(op, args ?? {}, timeout_ms ?? 2000);
+      const text = JSON.stringify(r);
+      return r.state === "ok" ? reply(text) : failure(text);
+    },
+  );
+
+  server.registerTool(
+    "agenthop_tern_status",
+    {
+      annotations: SCANS,
+      description: "Health of the Tern A1 bridge: mirror tick, age, per-tick cost and VM id from agents.json; Tern's authoritative block count (tern ls --json); requests waiting in requests/; recent budget kills from tern.log. state: healthy | degraded | unknown (unknown = could not observe, e.g. no tern binary or socket refused — not 'the bridge is dead').",
+      inputSchema: {},
+    },
+    async (_args, extra) => {
+      noteCodex(core, extra);
+      return reply(JSON.stringify(await ternStatus()));
     },
   );
 
