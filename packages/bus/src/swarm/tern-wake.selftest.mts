@@ -241,4 +241,19 @@ await (async () => {
   const none = classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([])) }, SID);
   ok(none.kind === "absent", "control: empty panes ⇒ absent (the genuine fallback is kept)");
 })();
+
+// ── IWT-ARGV r4: shell EXPANSION — text inside $(…) / backticks / "$(…)" / $VAR is not a provable argv ──────────────────────
+{
+  const T = SID, O = "other-sid-0002";
+  const zsh = (line: string) => ({ pane: 9, exited: null, working: false, program: "/bin/zsh", args: ["-l", "-c", line] });
+  const subst = `tern acp claude --resume ${O} --prompt $(printf -- --resume ${T} suffix)`;
+  ok(ternPaneInfoForSession(inspect([zsh(subst)]), T) === null, "r4: --resume inside $(…) is NOT matched (real sh only passes OTHER)");
+  const c = classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([zsh(subst)])) }, T);
+  ok(c.kind === "unknown" && /unparseable/.test((c as { reason: string }).reason), "r4: such a block is UNKNOWN (unparseable), so routing stops — never absent→herdr");
+  ok(ternPaneInfoForSession(inspect([zsh(`tern acp claude --resume ${O} --prompt \`printf -- --resume ${T}\``)]), T) === null, "r4: backticks ⇒ not matched");
+  ok(ternPaneInfoForSession(inspect([zsh(`tern acp claude --resume ${O} --prompt "$(printf -- --resume ${T})"`)]), T) === null, "r4: $(…) inside double quotes ⇒ not matched");
+  ok(ternPaneInfoForSession(inspect([zsh(`tern acp claude --resume ${T} --prompt '$(not run)'`)]), T)?.paneId === "9", "r4 control: a literal '$(…)' inside SINGLE quotes is plain text ⇒ still matched");
+  ok(classifyTernInspect({ code: 0, stdout: JSON.stringify(inspect([zsh(`tern acp claude --resume $OTHER_VAR`)])) }, T).kind === "absent", "r4 control: an unparseable block that never mentions this sid ⇒ still absent for it");
+  ok(shellTokens(`a $(b) c`) === null && shellTokens(`a \`b\``) === null && shellTokens(`a <(b)`) === null && shellTokens(`a '$(b)'`) !== null, "r4: tokenizer refuses expansions, keeps single-quoted literals");
+}
 console.log(`\nall tern-wake selftests passed (${n})`);

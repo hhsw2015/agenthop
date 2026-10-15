@@ -37,7 +37,8 @@ export type ShellToken = { kind: "word"; text: string } | { kind: "sep" };
 /** Tokenize a shell command line the way POSIX sh would — WITHOUT executing anything. Honors single quotes (literal), double quotes
  *  (\\ escapes for \\ " $ ` and newline), backslash escapes outside quotes, and `#` comments (only at a word start, to end of line).
  *  UNQUOTED `;` `&` `|` and NEWLINE end a command (each emits a "sep"); inside quotes they are plain characters. No expansion:
- *  `$X`, globs and command substitution stay literal — we only need word boundaries. An unterminated quote ⇒ null. Pure. */
+ *  An unterminated quote ⇒ null. Any expansion outside single quotes (`$…`, `$(…)`, backticks, `<(`/`>(`) ⇒ null: the argv it
+ *  produces is only known by running it, which we never do — such a line is unparseable, never a match. Pure. */
 export function shellTokens(line: string): ShellToken[] | null {
   const out: ShellToken[] = [];
   let cur = "", inWord = false, i = 0;
@@ -52,12 +53,18 @@ export function shellTokens(line: string): ShellToken[] | null {
         if (i >= line.length) return null;
         const c = line[i]!;
         if (c === '"') { i++; break; }
+        if (c === "$" || c === "`") return null; // expansion inside "…" (IWT-ARGV r4): its argv can't be known without running it
         if (c === "\\" && i + 1 < line.length && '\\"$`\n'.includes(line[i + 1]!)) { if (line[i + 1] !== "\n") cur += line[i + 1]; i += 2; continue; }
         cur += c; i++;
       }
       continue;
     }
     if (ch === "\\") { if (i + 1 < line.length) { if (line[i + 1] !== "\n") { cur += line[i + 1]; inWord = true; } i += 2; } else i++; continue; }
+    // IWT-ARGV r4: an UNQUOTED `$` (parameter / $(…) / $((…)) / ${…}) or backtick is an EXPANSION — the words it produces depend on
+    // running it, so the line's real argv cannot be proven statically. Refuse (⇒ unparseable ⇒ never a wake target) rather than
+    // read text inside the substitution as arguments. Process substitution `<(` `>(` likewise.
+    if (ch === "$" || ch === "`") return null;
+    if ((ch === "<" || ch === ">") && line[i + 1] === "(") return null;
     if (ch === "\n") { sep(); i++; continue; }                        // an unquoted newline ends the command
     if (ch === " " || ch === "\t") { end(); i++; continue; }
     if (ch === "#" && !inWord) { const nl = line.indexOf("\n", i); if (nl < 0) break; i = nl; continue; } // comment runs to end of line
@@ -103,7 +110,7 @@ export function paneProgramArgv(rec: { program?: unknown; args?: unknown; comman
  *  (shell-tokenized, see paneProgramArgv) is `tern acp …` with `--resume <sid>` as a real argument — text inside a quoted prompt or a
  *  comment is NOT evidence. `working:true` ⇒ "working", `false` ⇒ "idle", absent ⇒ "unknown" (still never interrupted). More than
  *  one live pane for the sid ⇒ ambiguous ⇒ null (don't guess which one to type into; delivery is already durable). */
-export function ternPanesForSession(inspectJson: unknown, sid: string): { paneId: string; state: AgentState }[] {
+export function ternPanesForSession(inspectJson: unknown, sid: string, unparseable: string[] = []): { paneId: string; state: AgentState }[] {
   if (!sid) return [];
   const panes = (inspectJson as { panes?: unknown })?.panes;
   if (!Array.isArray(panes)) return [];
@@ -113,7 +120,12 @@ export function ternPanesForSession(inspectJson: unknown, sid: string): { paneId
     if (rec == null || (rec.pane !== 0 && !rec.pane)) continue;
     if (rec.exited !== null && rec.exited !== undefined) continue; // exited block ⇒ not a wake target
     const argv = paneProgramArgv(rec);
-    if (!argv || argv.length < 2) continue;
+    if (argv === null) { // IWT-ARGV r4: the pane's real argv can't be proven (expansion / bad quoting)
+      const raw = Array.isArray(rec.args) ? rec.args.map(String).join(" ") : String(rec.command ?? "");
+      if (raw.includes(sid)) unparseable.push(String(rec.pane)); // it MIGHT be this seat — never guess, report it
+      continue;
+    }
+    if (argv.length < 2) continue;
     const prog = argv[0]!.split("/").pop();
     if (prog !== "tern" || argv[1] !== "acp") continue; // only an ACP seat block can be a wake target
     let found = false;
@@ -165,7 +177,13 @@ export function classifyTernInspect(run: { code: number; stdout: string; error?:
   let json: unknown;
   try { json = JSON.parse(run.stdout); } catch { return { kind: "unknown", reason: "tern inspect returned unparseable JSON" }; }
   if (!Array.isArray((json as { panes?: unknown })?.panes)) return { kind: "unknown", reason: "tern inspect JSON has no panes[]" };
-  const hits = ternPanesForSession(json, sid);
+  const unparseable: string[] = [];
+  const hits = ternPanesForSession(json, sid, unparseable);
+  if (unparseable.length) {
+    // IWT-ARGV r4: a live block mentions this sid but its command line uses a shell expansion, so whether it really runs `--resume
+    // <sid>` can't be proven without executing it. Unknown ⇒ the router stops (no herdr fallback) and the reason is logged.
+    return { kind: "unknown", reason: `unparseable: live Tern block(s) ${unparseable.join(", ")} mention this sid but their command line can't be proven (shell expansion) — not guessing a target` };
+  }
   if (hits.length === 1) return { kind: "found", ...hits[0]! };
   if (hits.length > 1) {
     // IWT-R2-P2-1: several live blocks for one sid (a dual shell / a duplicate start) is NOT "Tern has no such seat". Report it as

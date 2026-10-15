@@ -14,10 +14,11 @@
 
 import { legacyInboxKeys, type Projection } from "../bus-identity.js";
 
-/** The tool name a live process runs, from its executable basename (`claude`, `codex`). Anything else ⇒ null (unknown ⇒ no
- *  expansion). Pure. */
+/** The tool name a live process runs, from its executable basename (`claude`, `codex`). The input is the process NAME (/proc comm or
+ *  `ps -o comm=`), not a command line, so the WHOLE basename is compared — never split on whitespace (IWT-COORD-TOOL: an executable
+ *  named `claude helper` is not `claude`). Anything else ⇒ null (unknown ⇒ no expansion, only the direct sid is credited). Pure. */
 export function toolFromCommand(comm: string): string | null {
-  const base = comm.trim().split("/").pop()?.split(/\s+/)[0]?.toLowerCase() ?? "";
+  const base = (comm.trim().split("/").pop() ?? "").toLowerCase();
   return base === "claude" || base === "codex" ? base : null;
 }
 

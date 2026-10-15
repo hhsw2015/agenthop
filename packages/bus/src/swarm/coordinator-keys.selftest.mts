@@ -38,5 +38,7 @@ ok(!coordinatorLegacyKeys(proj, "aad02248-0000-4000-8000-000000000003", { tool: 
 
 ok(toolFromCommand("claude") === "claude" && toolFromCommand("/opt/bin/codex") === "codex", "tool: executable basename");
 ok(toolFromCommand("node") === null && toolFromCommand("") === null && toolFromCommand("bun") === null, "tool: anything else ⇒ unknown");
+ok(toolFromCommand("claude helper") === null && toolFromCommand("/opt/x/claude helper") === null, "tool: a process named `claude helper` is NOT claude (whole basename compared, IWT-COORD-TOOL)");
+ok(toolFromCommand("/usr/local/bin/codex") === "codex" && toolFromCommand("/Users/me/My Apps/claude") === "claude", "tool: exact basename matches, even under a path with spaces");
 
 console.log(`\nall coordinator-keys selftests passed (${n})`);
