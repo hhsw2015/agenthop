@@ -39,6 +39,8 @@ local sleepPending = {}  -- await-hook continuations
 local commands = {}      -- id -> run fn
 local files, dirs, requests = {}, {}, {}
 local opCalls = { list = 0, start = 0, stop = 0 }
+local carlyCalls = 0 -- every tern.carly.* call (tasks/cancel/schedule)
+local timers = {}     -- tern.timer callbacks (the TIMER hook)
 
 local cx = {
   agents = {
@@ -71,7 +73,10 @@ _G.tern = {
       return out
     end,
   },
-  carly = { tasks = function() return {} end, cancel = function() end, schedule = function() return 7 end },
+  carly = { tasks = function() carlyCalls = carlyCalls + 1; return {} end,
+            cancel = function() carlyCalls = carlyCalls + 1 end,
+            schedule = function() carlyCalls = carlyCalls + 1; return 7 end },
+  timer = function(_ms, fn) timers[#timers + 1] = fn; return { cancel = function() end } end,
   sleep = function(_ms) return { next = function(_, fn) sleepPending[#sleepPending + 1] = fn end } end,
   command = function(def) commands[def.id] = def.run end,
 }
@@ -86,14 +91,27 @@ local function pumpMirror() local fn = table.remove(sleepPending, 1); fn(nil, ni
 
 -- ---- 1. registration: one await chain (mirror) + three commands, each its own hook ----
 ck("hooks: exactly ONE sleep continuation queued at load (mirror only on the await hook)", #sleepPending == 1)
-ck("hooks: commands drain / drain-start / mirror registered (each its own `command <id>` hook)",
-  type(commands["drain"]) == "function" and type(commands["drain-start"]) == "function" and type(commands["mirror"]) == "function")
+ck("hooks: commands drain / drain-start / mirror / arm registered (each its own `command <id>` hook)",
+  type(commands["drain"]) == "function" and type(commands["drain-start"]) == "function" and type(commands["mirror"]) == "function"
+  and type(commands["arm"]) == "function")
+ck("hooks: exactly ONE one-shot timer queued at load (A2 arm on the TIMER hook)", #timers == 1)
+
+-- r3 tooth: the await hook (mirror tick) must NEVER call tern.carly.* — three cross-VM calls there crossed 50ms live (11:05:40)
+pumpMirror()
+ck("r3: first mirror tick makes NO tern.carly.* call (arm is off the await hook)", carlyCalls == 0 and tickOf() == 1)
+timers[1](cx)
+ck("r3: the timer-hook arm calls tern.carly (tasks + schedule) and records sentinel.json", carlyCalls >= 2 and files["/h/.agenthop/tern-panes/sentinel.json"] ~= nil)
+local afterArm = carlyCalls
+pumpMirror()
+ck("r3: later mirror ticks still make NO tern.carly.* call", carlyCalls == afterArm)
+commands["arm"](cx)
+ck("r3: the `arm` command re-arms (swarm-triggered after reload)", carlyCalls > afterArm)
 
 -- ---- 2. the await hook never runs drain work: pumping the mirror chain with pending requests claims nothing ----
 requests["s1.json"] = '{"op":"start","prompt":"p"}'
 requests["l1.json"] = '{"op":"stop"}'
 pumpMirror(); pumpMirror()
-ck("await hook: two mirror ticks advance tick (1→2)", tickOf() == 2)
+ck("await hook: two mirror ticks advance tick (3→4)", tickOf() == 4)
 ck("await hook: mirror ticks claim NO requests and run NO start (drain is off the await hook)",
   requests["s1.json"] ~= nil and requests["l1.json"] ~= nil and opCalls.start == 0 and opCalls.stop == 0)
 
@@ -110,7 +128,7 @@ requests["l2.json"] = '{"op":"stop"}'
 commands["drain"](cx)
 pumpMirror()
 ck("isolation: with drain-start disabled, drain still serves fast ops", files[RES .. "l2.json"] ~= nil)
-ck("isolation: with drain-start disabled, the mirror tick still advances (2→3)", tickOf() == 3)
+ck("isolation: with drain-start disabled, the mirror tick still advances (4→5)", tickOf() == 5)
 ck("isolation: the start request stays queued (UNKNOWN recovery is the swarm's: reload)", requests["s2.json"] ~= nil)
 
 -- ---- 5. slim mirror: only the swarm-read fields; the long command strings are dropped ----
@@ -120,7 +138,7 @@ ck("slim: agents.json drops command / agent_command / focused / program", not js
 
 -- ---- 6. manual mirror command advances the tick too ----
 commands["mirror"](cx)
-ck("mirror command: a manual kick advances tick (3→4)", tickOf() == 4)
+ck("mirror command: a manual kick advances tick (5→6)", tickOf() == 6)
 
 -- ---- 7. eval op (fast class): compiled with loadstring/load, called with cx, value returned ----
 requests["e1.json"] = '{"op":"eval","code":"return #cx.agents:list()"}'

@@ -145,15 +145,23 @@ end
 --   * drain-start — ONLY `start` (synchronous, can exceed the budget); a disabled drain-start never disables drain or the mirror.
 -- If a hook IS disabled, recovery is the swarm's: detect (tick stalled >5s, or no result 2s after a drain trigger) ⇒ `tern plugin
 -- reload` (tick restarts from 1, <2s). This is isolation + external reload, NOT in-VM self-healing.
+-- r3: the A2 sentinel arm is OFF the mirror tick. registerSentinel makes three cross-VM tern.carly calls (tasks + cancel + schedule);
+-- inside the first await tick that alone crossed the 50ms budget and disabled the whole await hook (live 11:05:40). It now runs on
+-- hooks of its own: a one-shot `tern.timer(0, …)` at load (the timer hook, not await) plus an `arm` command the swarm can trigger
+-- after a reload (`tern ctl plugins run plugin.agenthop-agents-bridge.arm`). If the timer hook is disabled, only arming is lost; the
+-- mirror and the drains keep running. Dedup-by-title keeps a repeat arm idempotent.
 local sentinelArmed = false
-local function mirrorTick(cx)
+local function arm(cx)
+  if cx == nil or sentinelArmed then return end
   ensure() -- TA-A2-ARM: control dirs exist BEFORE arming, so the sentinel.json write cannot ENOENT on first boot
-  if not sentinelArmed then -- A2: arm once, from inside a scoped window callback (tern.carly needs one)
-    if registerSentinel() then
-      sentinelArmed = true -- else leave false: retry next tick (dedup-by-title makes the retry safe)
-    end
+  if registerSentinel() then
+    sentinelArmed = true -- else leave false: a later timer/`arm` command retries (dedup-by-title makes the retry safe)
   end
-  mirror(cx)
+end
+
+local function mirrorTick(cx)
+  ensure()
+  mirror(cx) -- no tern.carly.* here: the await hook carries ONLY the cheap mirror
 end
 
 local function mirrorStep(cx)
@@ -161,8 +169,10 @@ local function mirrorStep(cx)
   if cx ~= nil then mirrorTick(cx) end
 end
 
+tern.command({ id = "arm", title = "agenthop bridge: arm patrol sentinel", run = function(cx) sentinelArmed = false; arm(cx) end })
 tern.command({ id = "mirror", title = "agenthop bridge: mirror now", run = function(cx) mirrorTick(cx) end })
 tern.command({ id = "drain", title = "agenthop bridge: drain requests", run = function(cx) ensure(); pcall(function() drain(cx, false) end) end })
 tern.command({ id = "drain-start", title = "agenthop bridge: drain start requests", run = function(cx) ensure(); pcall(function() drain(cx, true) end) end })
 
-mirrorStep(nil) -- A1 status mirror (liveness) + A2 one-shot arm; the first sleep's :next delivers the window cx
+mirrorStep(nil) -- A1 status mirror (liveness); the first sleep's :next delivers the window cx
+tern.timer(0, function(cx) arm(cx) end) -- A2 one-shot arm on the TIMER hook (never the await hook)

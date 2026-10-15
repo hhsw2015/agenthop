@@ -124,7 +124,7 @@ TERN_PANE_SOCKET=… tern ctl plugins run plugin.agenthop-agents-bridge.drain-st
 
 **已落地(tick 冻结根修,r2 订正根因)**:现网实证——`agents.json` tick 冻结、`plugin reload` 前不恢复。**Tern 的禁用单位是 hook**:所有 `tern.sleep():next` 续体同属 hook `await`,任一续体超 ~50ms(`await exceeded 50 ms`)即禁用本 VM **全部** await 续体,已排队的继任也不再投递(Tern docs concepts/runtime.md:one slow timer callback disables all of the plugin's timer callbacks in that VM)。耗时来源不只 start:仅 `list`+编码 41KB+写盘的 mirror 偶发 >50ms 也会触发。故 r1「拆两条 sleep 链+先排队 ⇒ 自愈」**不成立**(两条链同一 hook,协调者 40 分钟现网三次复现)。
 
-r2 修法 = **命令面隔离 + 蜂群侧 reload 恢复**(不是 VM 内自愈):① drain 改为 `tern.command`,由蜂群写完请求后 `tern ctl plugins run` 触发,每个命令是独立 hook `command <id>`;② 按 op 类拆 `drain`(快 op)与 `drain-start`(仅 start),start 撑爆预算只禁 `drain-start`,不连坐快 op 与 mirror;③ mirror 瘦身(§1)远离预算,仍走 sleep 链,另可命令手动触发。**恢复剧本(蜂群侧)**:tick 停 >5s,或触发 drain 后 2s 无 result ⇒ `tern plugin reload`(协调者实测 tick 从 1 重计,<2s 恢复);被禁那一刻在途的 op 落 §3 恢复(start = 非幂等 HOLD)。
+r2 修法 = **命令面隔离 + 蜂群侧 reload 恢复**(不是 VM 内自愈):① drain 改为 `tern.command`,由蜂群写完请求后 `tern ctl plugins run` 触发,每个命令是独立 hook `command <id>`;② 按 op 类拆 `drain`(快 op)与 `drain-start`(仅 start),start 撑爆预算只禁 `drain-start`,不连坐快 op 与 mirror;③ mirror 瘦身(§1)远离预算,仍走 sleep 链,另可命令手动触发。④(r3)A2 挂哨移出 mirror tick:`registerSentinel` 的三次跨 VM `tern.carly.*`(tasks/cancel/schedule)在首个 await tick 里实测超 50ms(11:05:40),现改在独立 hook 上——加载时一次 `tern.timer(0,…)`(timer hook)+ `plugin.agenthop-agents-bridge.arm` 命令(蜂群 reload 后可触发)。await hook 只剩廉价 mirror。**恢复剧本(蜂群侧)**:tick 停 >5s,或触发 drain 后 2s 无 result ⇒ `tern plugin reload`(协调者实测 tick 从 1 重计,<2s 恢复);被禁那一刻在途的 op 落 §3 恢复(start = 非幂等 HOLD)。
 
 门 `test/window.test.lua`:**结构证据,不是宿主行为复现**——夹具按 hook 记录回调归属、以「不再调用」模型化禁用,验证 start 只在自己的 hook、mirror 与快 op 在别的 hook;不模拟也不声称模拟 Tern 的预算终止。live 门 = `bridge-smoke.sh`(#1032-D)。start 异步化仍是更深的后续。
 
