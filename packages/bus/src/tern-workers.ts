@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { isValidSessionId } from "./send-fallback.js";
 import { realRun, ternBin, unreachable, type Run } from "./tern-bridge.js";
 import { scrubbedEnv } from "./spawn.js";
+import { updateSeatShell } from "./swarm/seat-shell-record.js";
 
 /**
  * kind="tui" WORKERS (#1034 r2): a short-lived TUI agent that lives in its OWN herdr session, shown as a Tern split block beside the
@@ -56,10 +56,8 @@ export function workerName(role: string, task: string): string | null {
 
 // ---- registry --------------------------------------------------------------------------------------------------------------------
 
-export function seatFile(home: string, sid: string): string {
-  if (!isValidSessionId(sid) || sid.includes("/") || sid === "." || sid === "..") throw new Error(`invalid seat sid: ${sid}`);
-  return path.join(home, ".agenthop", "swarm", "seat-shell", `${sid}.json`);
-}
+export { seatShellPath as seatFile } from "./swarm/seat-shell-record.js";
+import { seatShellPath as seatFile } from "./swarm/seat-shell-record.js";
 export type SeatRead = { kind: "ok"; seat: Record<string, unknown>; workers: Worker[] } | { kind: "absent" } | { kind: "unreadable"; reason: string };
 
 /** Three-state read (FC-2): ENOENT ⇒ absent; unreadable / malformed / a bad worker record ⇒ unreadable (never "no workers"). */
@@ -76,26 +74,28 @@ export function readSeat(home: string, sid: string): SeatRead {
   return { kind: "ok", seat: seat as Record<string, unknown>, workers: ws };
 }
 
-/** Replace the seat's workers[] (other keys preserved): O_EXCL temp through its own fd, then an atomic rename. Throws on a bad
- *  record (non-number pane etc.) or an unreadable seat file — never overwrites what it could not read. */
+/** Replace the seat's workers[] (other keys preserved) through the shared locked write path (updateSeatShell: lock → re-read →
+ *  rev+1 → O_EXCL temp + rename). Throws on a bad record (non-number pane etc.), an unreadable seat file, or a busy/conflicting
+ *  lock — never overwrites what it could not read, never renames a stale snapshot over another writer's update. */
 export function writeWorkers(home: string, sid: string, workers: Worker[]): void {
   for (const w of workers) if (!isWorker(w)) throw new Error(`refusing to write a worker that breaks the schema: ${JSON.stringify(w)}`);
-  const cur = readSeat(home, sid);
-  if (cur.kind === "unreadable") throw new Error(`seat file unreadable, not overwriting: ${cur.reason}`);
-  const dest = seatFile(home, sid);
-  mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
-  const body = `${JSON.stringify({ ...(cur.kind === "ok" ? cur.seat : { sid }), workers })}\n`;
-  const tmp = `${dest}.tmp-${randomBytes(8).toString("hex")}`;
-  const fd = openSync(tmp, "wx", 0o600);
-  try { writeFileSync(fd, body); closeSync(fd); renameSync(tmp, dest); }
-  catch (e) { try { closeSync(fd); } catch { /* closed */ } try { unlinkSync(tmp); } catch { /* own temp */ } throw e; }
+  mutateWorkers(home, sid, () => workers);
+}
+
+/** Read-modify-write of workers[] UNDER the seat lock: `fn` sees the workers as they are under the lock (never a stale copy). */
+function mutateWorkers(home: string, sid: string, fn: (cur: Worker[]) => Worker[]): void {
+  const r = updateSeatShell(home, sid, (rec) => {
+    const ws = rec.workers;
+    if (ws !== undefined && (!Array.isArray(ws) || !ws.every(isWorker))) throw new Error("workers[] does not match the pinned schema");
+    const next = fn((ws as Worker[] | undefined) ?? []);
+    for (const w of next) if (!isWorker(w)) throw new Error(`refusing to write a worker that breaks the schema: ${JSON.stringify(w)}`);
+    return { ...(Object.keys(rec).length === 0 ? { sid } : rec), workers: next };
+  });
+  if (r.state !== "ok") throw new Error(`seat-shell ${r.state}: ${r.reason}`);
 }
 
 function upsert(home: string, sid: string, w: Worker): void {
-  const cur = readSeat(home, sid);
-  if (cur.kind === "unreadable") throw new Error(`seat file unreadable: ${cur.reason}`);
-  const rest = cur.kind === "ok" ? cur.workers.filter((x) => x.name !== w.name) : [];
-  writeWorkers(home, sid, [...rest, w]);
+  mutateWorkers(home, sid, (cur) => [...cur.filter((x) => x.name !== w.name), w]);
 }
 
 /** Every seat's workers, for the global cap and orphan detection. Unreadable seat files are listed by name, never skipped silently. */

@@ -181,6 +181,7 @@ t("capGate pure: stopped workers do not count", capGate(SEAT, { workers: [{ name
   writeWorkers(home, SEAT, [{ name: "a-b", herdr_session: "a-b", pane: 9, kind: "tui", started_at: 1, stopped_at: null, state: "live" }]);
   const raw = JSON.parse(readFileSync(path.join(home, ".agenthop", "swarm", "seat-shell", `${SEAT}.json`), "utf8"));
   t("schema: writing workers PRESERVES the seat's shell/pid keys", raw.shell === "tern" && raw.pid === 42 && raw.workers.length === 1)
+  t("workers are written through updateSeatShell (the record carries rev)", raw.rev === 1)
   t("readSeat: a bad worker record makes the seat unreadable (never 'no workers')", (() => {
     writeFileSync(path.join(home, ".agenthop", "swarm", "seat-shell", `${SEAT}.json`), JSON.stringify({ workers: [{ name: "x" }] }));
     return readSeat(home, SEAT).kind === "unreadable";
