@@ -1,25 +1,40 @@
 #!/usr/bin/env python3
 """tern-restore: bring every roster seat back up in Tern with one command.
 
-Truth source = `tern ls --json` (daemon side), never the bridge mirror (agents.json can freeze).
-Steps: (1) read roster  (2) READ-ONLY posture check of ~/.claude.json (never written)
-       (3) per seat: skip if a live block already runs `--resume <sid>`, else `tern new tab` + `tern rename`
-       (4) codex exclusivity check (a codex thread can be held by only one client)
-       (5) assert via tern ls --json: every seat live, once, with the pinned model in its command.
-Idempotent: a second run starts nothing. Exit: 0 all seats OK, 1 assertion failed, 2 usage/roster error.
-Presence: ACP seats do not run the SessionStart hook, so nothing writes ~/.agenthop/presence/<sid>.pid for them (F40
-addressing goes blind, inbox sentinel reports STALL). After the assert, write <sid>.pid = the agent pid found by walking
-DOWN from the block's `tern acp` child (tern process BLOCK --json) to its descendant that resumes <sid> (claude stream-json;
-for codex the node adapter child). Bare pid, temp+rename. Keep an existing pid only if it is alive AND is that same
-descendant; a live pid of a DIFFERENT process is replaced (a wrong pid routes by another seat's liveness). --check asserts it.
-Env (tests): TERN_BIN (default tern), CLAUDE_JSON (default ~/.claude.json), RESTORE_PS (ps output file instead of `ps`),
-PRESENCE_DIR (default ~/.agenthop/presence).
+Truth source = `tern ls --json` (daemon side), never the bridge mirror (agents.json is advisory and has frozen).
+Order of operations (nothing in Tern changes before steps 1-2 pass):
+  1. roster: fully validated up front (fields, types, tool in {claude,codex}, unique role / sid) -> exit 2, zero starts.
+  2. inventory: `tern ls --json` must have the expected shape (sessions[].tabs[].blocks[] with the fields we read); a malformed
+     listing is UNKNOWN -> abort before any change (exit 3). A legal empty list is fine.
+  3. posture: READ ONLY check of ~/.claude.json (bypass flag + per-cwd trust). Never written (user ruling).
+  4. per seat: a block is that seat only if its argv parses to `tern acp <tool> --resume <sid>` (or --resume=<sid>) with the
+     exact tool and full sid. Live + named => skip. Live + wrong tab name => rename only (finishes a half-done start). Absent =>
+     `tern new tab`; the returned block id is then an obligation: wait (bounded) until it is listed, then rename (retried).
+     A block started but not yet listed is reported pending; the next run finds it by argv and only renames it.
+  5. assert from a fresh listing: each seat live exactly once, pinned model, tab = role.
+  6. presence + seat-shell: write ~/.agenthop/presence/<sid>.pid (agent pid under the block) and register the shell via
+     `scripts/seat-shell.ts set <sid> tern <pid>`. --check only asserts, writes nothing.
+Exit: 0 all OK, 1 assertion failed, 2 roster error, 3 inventory UNKNOWN.
+Env (tests): TERN_BIN, CLAUDE_JSON, RESTORE_PS (ps file: 'pid ppid command'), PRESENCE_DIR, SEAT_SHELL_CMD (default: repo tsx
+scripts/seat-shell.ts), RESTORE_WAIT_S (default 10).
 """
-import json, os, shlex, subprocess, sys, time
+import json, os, re, shlex, subprocess, sys, time
 
 TERN = os.environ.get("TERN_BIN", "tern")
 CLAUDE_JSON = os.path.expanduser(os.environ.get("CLAUDE_JSON", "~/.claude.json"))
 PRESENCE_DIR = os.path.expanduser(os.environ.get("PRESENCE_DIR", "~/.agenthop/presence"))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+WAIT_S = float(os.environ.get("RESTORE_WAIT_S", "10"))
+TOOLS = ("claude", "codex")
+SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+class RosterError(Exception):
+    pass
+
+
+class InventoryUnknown(Exception):
+    pass
 
 
 def tern(*args):
@@ -29,16 +44,104 @@ def tern(*args):
     return r.stdout
 
 
-def blocks(session):
-    """Every block of `session` as (tab_name, block) from tern ls --json."""
-    d = json.loads(tern("ls", "--json"))
+# ---------- 1. roster ----------
+def validate_roster(r):
+    if not isinstance(r, dict):
+        raise RosterError("top level must be an object")
+    if not isinstance(r.get("session"), str) or not r["session"]:
+        raise RosterError("session must be a non-empty string")
+    seats = r.get("seats")
+    if not isinstance(seats, list) or not seats:
+        raise RosterError("seats must be a non-empty list")
+    roles, sids = set(), set()
+    for i, s in enumerate(seats):
+        where = f"seats[{i}]"
+        if not isinstance(s, dict):
+            raise RosterError(f"{where} must be an object")
+        for k in ("role", "tool", "sid", "cwd"):
+            if not isinstance(s.get(k), str) or not s[k]:
+                raise RosterError(f"{where}.{k} must be a non-empty string")
+        if s["tool"] not in TOOLS:
+            raise RosterError(f"{where}.tool {s['tool']!r} not in {TOOLS}")
+        if not SID_RE.match(s["sid"]):
+            raise RosterError(f"{where}.sid {s['sid']!r} is not a valid sid")
+        if "model" not in s:
+            raise RosterError(f"{where}.model missing (use null for codex)")
+        m = s["model"]
+        if m is not None and (not isinstance(m, str) or not m):
+            raise RosterError(f"{where}.model must be null or a non-empty string")
+        if s["tool"] == "claude" and m is None:
+            raise RosterError(f"{where}: claude seat needs a pinned model")
+        if s["role"] in roles:
+            raise RosterError(f"duplicate role {s['role']!r}")
+        if s["sid"] in sids:
+            raise RosterError(f"duplicate sid {s['sid']}")
+        roles.add(s["role"]); sids.add(s["sid"])
+    return r
+
+
+# ---------- 2. inventory ----------
+def inventory(session):
+    """[(tab_name, block)] of `session`. Raises InventoryUnknown on any shape it cannot interpret."""
+    try:
+        d = json.loads(tern("ls", "--json"))
+    except (RuntimeError, ValueError) as e:
+        raise InventoryUnknown(f"tern ls --json unusable: {e}")
+    if not isinstance(d, dict) or not isinstance(d.get("sessions"), list):
+        raise InventoryUnknown("listing has no sessions list")
     out = []
-    for s in d.get("sessions", []):
-        if s.get("name") != session:
+    for s in d["sessions"]:
+        if not isinstance(s, dict) or not isinstance(s.get("name"), str) or not isinstance(s.get("tabs"), list):
+            raise InventoryUnknown("a session lacks name/tabs")
+        if s["name"] != session:
             continue
-        for t in s.get("tabs", []):
-            for b in t.get("blocks", []):
-                out.append((t.get("name"), b))
+        for t in s["tabs"]:
+            if not isinstance(t, dict) or not isinstance(t.get("blocks"), list) or "name" not in t:
+                raise InventoryUnknown("a tab lacks name/blocks")
+            for b in t["blocks"]:
+                if not isinstance(b, dict) or not isinstance(b.get("id"), int) or "live" not in b or "exited" not in b \
+                        or "command" not in b:
+                    raise InventoryUnknown("a block lacks id/live/exited/command")
+                out.append((t["name"], b))
+    return out
+
+
+def parse_acp(command):
+    """(tool, sid, model) if command is exactly a `tern acp` launch with a resume, else None."""
+    if not isinstance(command, str) or not command:
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if len(argv) < 3 or os.path.basename(argv[0]) != "tern" or argv[1] != "acp" or argv[2] not in TOOLS:
+        return None
+    sid = model = None
+    i = 3
+    while i < len(argv):
+        a = argv[i]
+        if a == "--resume" and i + 1 < len(argv):
+            sid = argv[i + 1]; i += 2; continue
+        if a.startswith("--resume="):
+            sid = a.split("=", 1)[1]; i += 1; continue
+        if a == "--model" and i + 1 < len(argv):
+            model = argv[i + 1]; i += 2; continue
+        if a.startswith("--model="):
+            model = a.split("=", 1)[1]; i += 1; continue
+        i += 1
+    return (argv[2], sid, model) if sid else None
+
+
+def is_live(b):
+    return b.get("live") is True and b.get("exited") is None
+
+
+def seat_blocks(inv, seat):
+    out = []
+    for tab, b in inv:
+        p = parse_acp(b.get("command"))
+        if p and p[0] == seat["tool"] and p[1] == seat["sid"] and is_live(b):
+            out.append((tab, b, p))
     return out
 
 
@@ -51,13 +154,8 @@ def launch_cmd(seat):
     return parts
 
 
-def runs_sid(block, sid):
-    cmd = block.get("command") or ""
-    return block.get("live") and block.get("exited") is None and (f"--resume {sid}" in cmd or f"--resume={sid}" in cmd)
-
-
+# ---------- 3. posture (read only) ----------
 def posture_check(roster):
-    """READ ONLY. Never writes ~/.claude.json: global security posture is a human decision."""
     lines, ok = [], True
     try:
         d = json.load(open(CLAUDE_JSON))
@@ -66,21 +164,20 @@ def posture_check(roster):
     bp = d.get("bypassPermissionsModeAccepted") is True
     ok &= bp
     lines.append(f"posture: bypassPermissionsModeAccepted {'present' if bp else 'ABSENT'}")
-    projects = d.get("projects", {})
+    projects = d.get("projects") if isinstance(d.get("projects"), dict) else {}
     for cwd in sorted({os.path.expanduser(s["cwd"]) for s in roster["seats"] if s["tool"] == "claude"}):
         p = projects.get(cwd)
         tr = isinstance(p, dict) and p.get("hasTrustDialogAccepted") is True
         ok &= tr
         lines.append(f"posture: trust {cwd} {'present' if tr else 'ABSENT'}")
     if not ok:
-        lines.append("posture: ABSENT flags make ACP seats show an approval dialog at first start. "
-                     "This script does not change them. Set them by hand (a human decision), e.g. "
-                     "accept the dialog once in each seat, or edit ~/.claude.json after a backup.")
+        lines.append("posture: ABSENT flags make ACP seats show an approval dialog at first start. This script does not "
+                     "change them; setting them is a human decision.")
     return ok, lines
 
 
+# ---------- process table ----------
 def ps_table():
-    """{pid: (ppid, command)} from ps (or RESTORE_PS file: lines 'pid ppid command')."""
     if os.environ.get("RESTORE_PS"):
         text = open(os.environ["RESTORE_PS"]).read()
     else:
@@ -93,8 +190,105 @@ def ps_table():
     return t
 
 
+def argv_has_resume(command, sid):
+    """True only if the command carries `--resume <sid>` / `--resume=<sid>` as a whole argument."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = command.split()
+    for i, a in enumerate(argv):
+        if a == f"--resume={sid}" or (a == "--resume" and i + 1 < len(argv) and argv[i + 1] == sid):
+            return True
+    return False
+
+
+def codex_conflicts(roster, table):
+    """Hint only: non-Tern processes whose argv resumes a roster codex sid. Not proof the thread is held."""
+    hits = []
+    for s in roster["seats"]:
+        if s["tool"] != "codex":
+            continue
+        for pid, (_, cmd) in sorted(table.items()):
+            if "codex" in cmd and "tern acp" not in cmd and argv_has_resume(cmd, s["sid"]):
+                hits.append(f"codex-hint: {s['role']} sid {s['sid'][:8]} may also be open outside Tern (pid {pid}); "
+                            f"codex threads are exclusive, check before relying on the Tern seat")
+    return hits
+
+
+# ---------- 4. restore ----------
+def wait_listed(session, bid, deadline):
+    while True:
+        for tab, b in inventory(session):
+            if b["id"] == bid:
+                return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.3)
+
+
+def try_rename(bid, role, deadline):
+    while True:
+        try:
+            tern("rename", str(bid), role)
+            return None
+        except RuntimeError as e:
+            last = str(e)
+        if time.time() >= deadline:
+            return last
+        time.sleep(0.3)
+
+
+def restore(roster):
+    session = roster["session"]
+    inv = inventory(session)
+    report, pending = [], []
+    for seat in roster["seats"]:
+        mine = seat_blocks(inv, seat)
+        if mine:
+            tab, b, _ = mine[0]
+            if tab == seat["role"]:
+                report.append(f"skip: {seat['role']} already live (block {b['id']})")
+            else:
+                err = try_rename(b["id"], seat["role"], time.time() + WAIT_S)
+                report.append(f"rename: {seat['role']} block {b['id']} (was {tab!r})" + (f" FAILED: {err}" if err else ""))
+            continue
+        out = tern("new", "tab", session, "--cwd", os.path.expanduser(seat["cwd"]), "--", *launch_cmd(seat))
+        bid = out.strip().splitlines()[-1].strip() if out.strip() else ""
+        if not bid.isdigit():
+            raise RuntimeError(f"tern new tab for {seat['role']} returned no block id: {out!r}")
+        pending.append((seat, int(bid)))
+        report.append(f"start: {seat['role']} block {bid}")
+    for seat, bid in pending:  # obligations: list then rename each started block; never restart inside this run
+        deadline = time.time() + WAIT_S
+        if not wait_listed(session, bid, deadline):
+            report.append(f"pending: {seat['role']} block {bid} not listed yet (rerun renames it; it is not started twice "
+                          f"once listed)")
+            continue
+        err = try_rename(bid, seat["role"], deadline)
+        if err:
+            report.append(f"pending: {seat['role']} block {bid} rename failed: {err} (rerun renames it)")
+    return report
+
+
+def verify(roster):
+    fails = []
+    inv = inventory(roster["session"])
+    for seat in roster["seats"]:
+        mine = seat_blocks(inv, seat)
+        if not mine:
+            fails.append((seat["role"], "not live")); continue
+        if len(mine) > 1:
+            fails.append((seat["role"], f"live {len(mine)}x (duplicate blocks {[b['id'] for _, b, _ in mine]})"))
+        tab, b, (_, _, model) = mine[0]
+        if seat.get("model") and model != seat["model"]:
+            fails.append((seat["role"], f"model {model!r} != pinned {seat['model']!r}"))
+        if tab != seat["role"]:
+            fails.append((seat["role"], f"tab name {tab!r}"))
+    return fails
+
+
+# ---------- 6. presence + seat-shell ----------
 def agent_pid(block_id, seat, table):
-    """Walk down from the block's `tern acp` child to the agent process for this seat. None if not found."""
     try:
         root = json.loads(tern("process", str(block_id), "--json"))["child"]["pid"]
     except (RuntimeError, ValueError, KeyError, TypeError):
@@ -109,24 +303,31 @@ def agent_pid(block_id, seat, table):
             if c not in seen:
                 seen.add(c); desc.append(c); frontier.append(c)
     if seat["tool"] == "claude":
-        hits = [p for p in desc if "stream-json" in table[p][1] and seat["sid"] in table[p][1]]
-    else:  # codex: the adapter (node) child of tern acp; codex app-server below it carries no sid
+        hits = [p for p in desc if "stream-json" in table[p][1] and argv_has_resume(table[p][1], seat["sid"])]
+    else:
         hits = [p for p in kids.get(root, []) if "node" in table[p][1] or "codex" in table[p][1]]
     return hits[0] if len(hits) == 1 else None
 
 
+def seat_shell_set(sid, pid):
+    cmd = os.environ.get("SEAT_SHELL_CMD")
+    argv = shlex.split(cmd) if cmd else [os.path.join(REPO, "node_modules", ".bin", "tsx"),
+                                         os.path.join(REPO, "scripts", "seat-shell.ts")]
+    try:
+        r = subprocess.run([*argv, "set", sid, "tern", str(pid)], capture_output=True, text=True)
+    except OSError as e:
+        return str(e)
+    return None if r.returncode == 0 else (r.stderr.strip() or f"rc={r.returncode}")
+
+
 def presence(roster, write):
-    """Write (or with write=False only check) presence/<sid>.pid for every live seat. Returns (lines, fails)."""
     table, lines, fails = ps_table(), [], []
-    live = {}
-    for _, b in blocks(roster["session"]):
-        for seat in roster["seats"]:
-            if runs_sid(b, seat["sid"]):
-                live.setdefault(seat["sid"], b["id"])
+    inv = inventory(roster["session"])
     for seat in roster["seats"]:
-        if seat["sid"] not in live:
-            continue
-        want = agent_pid(live[seat["sid"]], seat, table)
+        mine = seat_blocks(inv, seat)
+        if len(mine) != 1:
+            continue  # verify() reports missing/duplicate
+        want = agent_pid(mine[0][1]["id"], seat, table)
         f = os.path.join(PRESENCE_DIR, seat["sid"] + ".pid")
         try:
             raw = open(f).read().strip()
@@ -139,106 +340,50 @@ def presence(roster, write):
             fails.append((seat["role"], "presence: agent pid not found under block")); continue
         if have == want:
             lines.append(f"presence: {seat['role']} ok pid {want}")
-            continue
-        if not write:
+        elif not write:
             fails.append((seat["role"], f"presence pid {have} != agent pid {want}")); continue
-        try:
-            os.makedirs(PRESENCE_DIR, exist_ok=True)
-            tmp = f"{f}.tmp-{os.getpid()}"
-            with open(tmp, "x") as h:
-                h.write(str(want))
-            os.replace(tmp, f)
-            lines.append(f"presence: {seat['role']} wrote pid {want} (was {have})")
-        except OSError as e:
-            fails.append((seat["role"], f"presence write failed: {e}"))
+        else:
+            try:
+                os.makedirs(PRESENCE_DIR, exist_ok=True)
+                tmp = f"{f}.tmp-{os.getpid()}"
+                with open(tmp, "x") as h:
+                    h.write(str(want))
+                os.replace(tmp, f)
+                lines.append(f"presence: {seat['role']} wrote pid {want} (was {have})")
+            except OSError as e:
+                fails.append((seat["role"], f"presence write failed: {e}")); continue
+        if write:
+            err = seat_shell_set(seat["sid"], want)
+            if err:
+                fails.append((seat["role"], f"seat-shell set failed: {err}"))
     return lines, fails
 
 
-def codex_conflicts(roster):
-    """A codex thread is exclusive. Report non-Tern processes that hold a roster codex sid."""
-    if os.environ.get("RESTORE_PS"):
-        text = open(os.environ["RESTORE_PS"]).read()
-    else:
-        text = subprocess.run(["ps", "axo", "pid,command"], capture_output=True, text=True).stdout
-    hits = []
-    for s in roster["seats"]:
-        if s["tool"] != "codex":
-            continue
-        for line in text.splitlines():
-            if s["sid"] in line and "tern acp" not in line and "codex" in line:
-                hits.append(f"codex-exclusive: {s['role']} sid {s['sid'][:8]} also held outside Tern: {line.strip()[:120]}")
-    return hits
-
-
-def restore(roster, wait_s=8.0):
-    session = roster["session"]
-    report = []
-    existing = blocks(session)
-    for seat in roster["seats"]:
-        live = [b for _, b in existing if runs_sid(b, seat["sid"])]
-        if live:
-            report.append(f"skip: {seat['role']} already live (block {live[0]['id']})")
-            continue
-        out = tern("new", "tab", session, "--cwd", os.path.expanduser(seat["cwd"]), "--", *launch_cmd(seat))
-        bid = out.strip().splitlines()[-1].strip() if out.strip() else ""
-        if not bid.isdigit():
-            raise RuntimeError(f"tern new tab for {seat['role']} returned no block id: {out!r}")
-        tern("rename", bid, seat["role"])
-        report.append(f"start: {seat['role']} block {bid}")
-    # assertion phase reads tern ls fresh; give new blocks a moment to register as live
-    deadline = time.time() + wait_s
-    while True:
-        fails = verify(roster)
-        if not fails or time.time() >= deadline:
-            break
-        time.sleep(0.5)
-    return report, fails
-
-
-def verify(roster):
-    fails = []
-    now = blocks(roster["session"])
-    for seat in roster["seats"]:
-        live = [(tab, b) for tab, b in now if runs_sid(b, seat["sid"])]
-        if len(live) == 0:
-            fails.append((seat["role"], "not live"))
-            continue
-        if len(live) > 1:
-            fails.append((seat["role"], f"live {len(live)}x (duplicate blocks {[b['id'] for _, b in live]})"))
-        tab, b = live[0]
-        cmd = b.get("command") or ""
-        if seat.get("model"):
-            argv = shlex.split(cmd) if cmd else []
-            got = argv[argv.index("--model") + 1] if "--model" in argv[:-1] else None
-            if got != seat["model"]:
-                fails.append((seat["role"], f"model {got!r} != pinned {seat['model']!r}"))
-        if tab != seat["role"]:
-            fails.append((seat["role"], f"tab name {tab!r}"))
-    return fails
-
-
 def main(argv):
-    path = argv[1] if len(argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "roster.json")
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    path = args[0] if args else os.path.join(os.path.dirname(os.path.abspath(__file__)), "roster.json")
     check_only = "--check" in argv
     try:
-        roster = json.load(open(path))
-        assert roster["session"] and roster["seats"]
-    except (OSError, ValueError, KeyError, AssertionError) as e:
+        roster = validate_roster(json.load(open(path)))
+    except (OSError, ValueError, RosterError) as e:
         print(f"roster error: {path}: {e}", file=sys.stderr)
         return 2
     t0 = time.time()
-    _, lines = posture_check(roster)
-    for l in lines:
-        print(l)
-    for c in codex_conflicts(roster):
-        print(c)
-    if check_only:
-        fails = verify(roster)
-    else:
-        report, fails = restore(roster)
-        for l in report:
+    try:
+        inventory(roster["session"])  # shape gate before ANY change
+        _, lines = posture_check(roster)
+        for l in lines:
             print(l)
-    plines, pfails = presence(roster, write=not check_only)
+        for c in codex_conflicts(roster, ps_table()):
+            print(c)
+        if not check_only:
+            for l in restore(roster):
+                print(l)
+        fails = verify(roster)
+        plines, pfails = presence(roster, write=not check_only)
+    except InventoryUnknown as e:
+        print(f"inventory UNKNOWN: {e} — stopped", file=sys.stderr)
+        return 3
     for l in plines:
         print(l)
     fails += pfails
