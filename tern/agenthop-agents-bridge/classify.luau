@@ -490,15 +490,17 @@ end
 M.gate_matches = function(g, text) return gate_matches(g, text, string.lower(text)) end
 
 -- ---------------- agent selection (detect/mod.rs parse_agent_label, by program basename) ----------------
+-- Values are manifests.luau KEYS (herdr manifest ids), not herdr display names: classify() looks up manifests[label].
 local LABELS = {
   pi = "pi", claude = "claude", ["claude-code"] = "claude", codex = "codex", gemini = "gemini", cursor = "cursor",
-  ["cursor-agent"] = "cursor", agy = "antigravity", antigravity = "antigravity", ["antigravity-cli"] = "antigravity",
-  cline = "cline", opencode = "opencode", ["open-code"] = "opencode", copilot = "github-copilot",
-  ["github-copilot"] = "github-copilot", ghcs = "github-copilot", kimi = "kimi", ["kimi-code"] = "kimi", kiro = "kiro",
+  ["cursor-agent"] = "cursor", agy = "agy", antigravity = "agy", ["antigravity-cli"] = "agy",
+  cline = "cline", opencode = "opencode", ["open-code"] = "opencode", copilot = "copilot",
+  ["github-copilot"] = "copilot", ghcs = "copilot", kimi = "kimi", ["kimi-code"] = "kimi", kiro = "kiro",
   ["kiro-cli"] = "kiro", droid = "droid", amp = "amp", ["amp-local"] = "amp", grok = "grok", ["grok-build"] = "grok",
   hermes = "hermes", ["hermes-agent"] = "hermes", kilo = "kilo", ["kilo-code"] = "kilo", qodercli = "qodercli",
   qoderclicn = "qodercli", qoder = "qodercli", qodercn = "qodercli",
 }
+M.LABELS = LABELS
 function M.agent_for(program)
   if type(program) ~= "string" or program == "" then return nil end
   for word in program:gmatch("[^%s]+") do

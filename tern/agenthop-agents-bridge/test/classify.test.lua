@@ -2,7 +2,7 @@
 -- REAL Claude Code 2.1.293 TUI screens captured from a Tern pane on 2026-10-15 (test/fixtures/tui/*.txt + .title).
 -- Covers: idle / working / blocked / unknown on real screens, the two `not` gates of herdr's claude manifest, region functions,
 -- the regex subset (incl. a differential corpus), agent selection, priority order. Mutant check: run with MUTANT=no-prompt-box or
--- MUTANT=no-title-working or MUTANT=no-write-dialog — the corresponding rule is removed from the loaded manifest (production code untouched) and the
+-- MUTANT=no-title-working or MUTANT=no-write-dialog or MUTANT=wrong-manifest-key — the corresponding rule is removed from the loaded manifest (production code untouched) and the
 -- matching cases must go RED.
 -- Run: lua test/classify.test.lua   (from tern/agenthop-agents-bridge)
 local here = (arg and arg[0] or ""):match("^(.*/)") or "./"
@@ -125,6 +125,72 @@ ck("agent_for: alias claude-code", "claude", C.agent_for("claude-code"))
 ck("agent_for: zsh", nil, C.agent_for("/bin/zsh"))
 ck("codex: Action Required title => blocked", "blocked", C.classify("", "Action Required", "codex").state)
 ck("codex: braille title => working", "working", C.classify("", "⠋ codex", "codex").state)
+
+-- ---------- r5 (TC-SV-MANIFEST-KEY): every label reaches its manifest; each family + alias classifies its own permission screen ----------
+-- MUTANT=wrong-manifest-key puts r4's display-name labels back (agy/aliases -> "antigravity", copilot/aliases -> "github-copilot");
+-- the six agy/copilot names must then go RED here.
+if mutant == "wrong-manifest-key" then
+  for _, k in ipairs({ "agy", "antigravity", "antigravity-cli" }) do C.LABELS[k] = "antigravity" end
+  for _, k in ipairs({ "copilot", "github-copilot", "ghcs" }) do C.LABELS[k] = "github-copilot" end
+end
+do
+  local unrouted = {}
+  for label, key in pairs(C.LABELS) do if MAN[key] == nil then unrouted[#unrouted + 1] = label end end
+  table.sort(unrouted)
+  ck("labels: every LABELS value is a manifests.luau key", "", table.concat(unrouted, ","))
+  local missing = {}
+  for key, m in pairs(MAN) do
+    for _, name in ipairs({ key, table.unpack(m.aliases or {}) }) do
+      if not name:find("[%s:]") and C.LABELS[name] ~= key then missing[#missing + 1] = name end
+    end
+  end
+  table.sort(missing)
+  ck("labels: every manifest id and one-word alias selects its own manifest", "", table.concat(missing, ","))
+end
+-- One matching blocked screen per family (text, title, expected herdr rule). pi has no blocked rule in its manifest.
+local BLOCKED = {
+  agy = { "requesting permission for: file\ndo you want to proceed?\n", "", "permission_prompt" },
+  amp = { "waiting for approval\n", "", "approval_footer" },
+  claude = { "Bash command\n  ls\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n", "", "bash_permission_prompt" },
+  cline = { "let cline use this tool\n", "", "tool_permission" },
+  codex = { "", "Action Required", "osc_title_blocked" },
+  copilot = { "esc to cancel\nenter to select\n", "", "selection_blocker" },
+  cursor = { "waiting for approval\nrun this command?\nrun (once) (y)\n", "", "approval_prompt" },
+  droid = { "enter select · esc cancel · ↑↓ navigate\n", "", "selection_menu_blocker" },
+  gemini = { "│ Apply this change\n", "", "apply_or_allow_change" },
+  grok = { "yes, proceed\nno, reject\n←/→:scope\n", "", "permission_scope_selector" },
+  hermes = { "dangerous command\n❯ allow once\nenter to confirm · ↑/↓ to select\n", "", "dangerous_command_approval" },
+  kilo = { "△ Permission required\n", "", "opencode_permission" },
+  kimi = { "requesting approval\napprove once\nreject\n1/2/3/4 choose\n", "", "legacy_approval_panel" },
+  kiro = { "requires approval\nyes, single permission\n", "", "tool_approval" },
+  opencode = { "△ Permission required\n", "", "permission_required" },
+  qodercli = { "permission required\n", "", "confirmation_or_input_blocker" },
+}
+do
+  -- The expected family comes from manifests.luau (id + one-word aliases), never from C.LABELS, so a mis-keyed label shows here.
+  local names, family = {}, {}
+  for key, m in pairs(MAN) do
+    for _, name in ipairs({ key, table.unpack(m.aliases or {}) }) do
+      if not name:find("[%s:]") then names[#names + 1] = name; family[name] = key end
+    end
+  end
+  table.sort(names)
+  for _, label in ipairs(names) do
+    local key = family[label]
+    local case = BLOCKED[key]
+    if case then
+      local r = C.classify(case[1], case[2], "/usr/local/bin/" .. label .. " --x")
+      ck(("family %s via %s: permission screen => blocked"):format(key, label), "blocked", r.state)
+      ck(("family %s via %s: rule"):format(key, label), case[3], r.rule)
+    else
+      ck(("family %s via %s: routed to its manifest (idle fallback)"):format(key, label), "idle",
+        C.classify("random text", "", label).state)
+    end
+  end
+  local uncovered = {}
+  for key in pairs(MAN) do if BLOCKED[key] == nil and key ~= "pi" then uncovered[#uncovered + 1] = key end end
+  ck("labels: every family except pi has a blocked-screen case", "", table.concat(uncovered, ","))
+end
 
 -- ---------- regions ----------
 ck("region bottom_non_empty_lines(2)", "b\n\nc", C.region("bottom_non_empty_lines(2)", "a\n\nb\n\nc", "", ""))
