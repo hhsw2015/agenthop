@@ -5,7 +5,7 @@
 -- self-times. r2 augmentations (dormant, atop the frozen tern batch):
 --   ① mutual-watch beats: write carly-patrol.beat (my liveness; the swarm's 8-min loop reads it, >20min stale => take over + TG) and
 --      read coordinator.beat (stale => coordinator_stale alert). #924: liveness is L0 FILES, mutual-read files not processes.
---   ② budget split: body-scan only batch_size (3-4) panes per round on a rotating offset; a cheap metadata sweep still covers EVERY
+--   ② budget split: body-scan only batch_size (1, #1036 r9) pane per round on a rotating offset; a cheap metadata sweep still covers EVERY
 --      pane every round (osc_alert + the proven-idle stall reset) so neither is delayed by batching.
 --   ③ L0 alert path: a placeholder L0 constant + TODO(M2-a projection contract); TG reads the files directly, not via Carly.
 --   (④ W3 CPA probe is a swarm-side bash companion, cpa-probe.sh — a down CPA can't post to the inbox, so the probe stays off Carly.)
@@ -14,10 +14,12 @@
 -- Tern (Luau) and in test/sentinel.test.lua (Lua 5.5) — one source, no drift. Tuning lives in CONFIG.
 
 local CONFIG = {
-  tail_lines = 40, -- lines from the bottom of each pane to hash/scan
+  tail_lines = 24, -- lines from the bottom of each pane to hash/scan (#1036 r9: ≤24 — the bottom lines + prompt box is what matters)
   stall_ms = 3 * 60 * 1000, -- busy + unchanged hash this long => stall alert
   excerpt_chars = 400, -- alert text excerpt cap
-  batch_size = 4, -- ② panes body-scanned per round (metadata is swept for all panes every round)
+  batch_size = 1, -- ② #1036 r9: AT MOST ONE cx.session:read per round. A single read costs ~23ms live (even lines=1), so 4 reads put
+                  -- every round past the 50ms schedule budget (task 81 failed twice, 12:28). Metadata (panes(), ~0.17ms) still covers
+                  -- every pane every round; body scans rotate one pane per round.
   coordinator_stale_sec = 20 * 60, -- ① coordinator.beat older than this (WALL-CLOCK SECONDS) => coordinator_stale alert
   filter_pats = { "content filter", "usage policy", "can't help with that", "cannot assist with", "flagged for" },
   perm_pats = { "allow this", "[y/n]", "do you want to proceed", "needs your permission", "wants to run", "grant access", "approve?" },
@@ -27,7 +29,9 @@ local CONFIG = {
 local function l0_root(home) return home .. "/.agenthop/carly" end
 local function alerts_dir(home) return l0_root(home) .. "/alerts" end -- TG reads these files directly
 local function my_beat_path(home) return l0_root(home) .. "/carly-patrol.beat" end -- ① my liveness (swarm reads)
-local function coordinator_beat_path(home) return l0_root(home) .. "/coordinator.beat" end -- ① the beat I watch
+-- ① the beat I watch. NOT under the L0 root: the coordinator writes it from its own scan loop at the pinned contract path
+-- ~/.agenthop/swarm/coordinator.beat (knowledge-pack §5 / carly-sweep.ts coordinatorBeatPath — one literal across writer/reader/doc).
+local function coordinator_beat_path(home) return home .. "/.agenthop/swarm/coordinator.beat" end
 
 local function hash(s)
   local h = 5381
@@ -83,6 +87,12 @@ local function scan_meta(p, now, prev)
 end
 
 -- scan_body: text detection (content_filter / permission) + stall. Needs the tail; called only for the batch slice on a successful read.
+-- #1036 r9 / #1041: ONE read, two uses. The lines this round's single cx.session:read returned are handed to an OPTIONAL pure
+-- classifier `classify(lines, title)` (Infra Dev #1041, interface agreed with f32a0507), so the sentinel and the classifier never each
+-- read the pane (each read is ~23ms of a 50ms budget). Set CLASSIFY to that function when it lands; nil = skip. Its return value is
+-- recorded on the pane's state as `class` (a string), never raised as an alert here. Pure: no IO, no cx.
+local CLASSIFY = nil -- function(lines, title) -> string|nil
+
 local function scan_body(p, tail, now, prev)
   local alerts = {}
   local low = string.lower(tail)
@@ -196,6 +206,13 @@ local check = function(ev, cx, state)
       end)
       if okR and type(read) == "table" and type(read.lines) == "table" then
         tail = tail_join(read.lines, CONFIG.tail_lines)
+        if CLASSIFY ~= nil then -- one read, two uses (#1041)
+          local okC, cls = pcall(CLASSIFY, read.lines, p.title)
+          if okC and type(cls) == "string" then
+            state.class = state.class or {}
+            state.class[p.pane] = cls
+          end
+        end
       end
       if tail ~= nil then
         local a, seen = scan_body(p, tail, now, state.seen[p.pane])

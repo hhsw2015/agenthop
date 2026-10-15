@@ -116,7 +116,7 @@
 - 我(A2 侧)**写** `carly-patrol.beat`、**读** `coordinator.beat`;协调者反之。
 
 **当前状态(尚未全接通,勿当已连)**:
-- `coordinator.beat` 读端:我 / A2(§1.3)按目标路径 `~/.agenthop/swarm/coordinator.beat` 读。**[pending 接线]** A2 源码当前 `coordinator.beat` 读端 TODO 根仍在 `~/.agenthop/carly/`,**待对齐到目标 `~/.agenthop/swarm/`**(A2 后续单,本包不接 A2)。
+- `coordinator.beat` 读端:我 / A2(§1.3)按目标路径 `~/.agenthop/swarm/coordinator.beat` 读。**[doc,A2 读端已对齐]** A2 `sentinel.luau` 的 `coordinator_beat_path` 已改指 `~/.agenthop/swarm/`(分支 `fix/a2-coordinator-beat-path`,dormant,未装机);协调者写端照常。
 - 现状过渡:`coordinator.beat` 全接通前,我用 `heartbeat.json` 的 `pass.lastTickSec`([tested])做蜂群死活判据。
 - TG 兜底 beat=L0 告警文件路径(A2 占位常量,随 A2 落地,[pending])。
 

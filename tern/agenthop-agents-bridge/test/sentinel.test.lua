@@ -5,7 +5,15 @@
 -- mutual-watch, ② batch coverage (every pane body-scanned over rounds). (④ CPA probe is bash — see cpa-probe.test.sh.)
 
 local here = (arg[0] or ""):match("^(.*/)") or "./"
-local load_check = assert(loadfile(here .. "../sentinel.luau"))
+-- r10 GATE: compile sentinel.luau against READ-ONLY globals (Tern compiles `check` inside a plugin VM whose _G is read-only). The
+-- proxy reads through to the real globals (so the fixture's `tern` / `os` mocks are visible) but any WRITE raises — a stray global
+-- assignment in the check would break live while passing a plain loadfile.
+local SENTINEL_ENV = setmetatable({}, {
+  __index = _G,
+  __newindex = function(_, k) error("attempt to modify a readonly table (global '" .. tostring(k) .. "')", 2) end,
+})
+rawset(SENTINEL_ENV, "_G", SENTINEL_ENV)
+local load_check = assert(loadfile(here .. "../sentinel.luau", "t", SENTINEL_ENV))
 
 local failures = 0
 local function check_(name, cond)
@@ -16,7 +24,7 @@ end
 local HOME = "/tmp/sentinel-test-home"
 local L0 = HOME .. "/.agenthop/carly"
 local MY_BEAT = L0 .. "/carly-patrol.beat"
-local COORD_BEAT = L0 .. "/coordinator.beat"
+local COORD_BEAT = HOME .. "/.agenthop/swarm/coordinator.beat" -- pinned contract path (NOT the L0 root)
 local NOW = 1000000 -- tern.now() monotonic ms (stall timing)
 local NOW_SEC = 1700000000 -- os.time() wall-clock epoch seconds (beats); controllable for deterministic ① tests
 os.time = function() return NOW_SEC end -- override the global the sentinel calls for wall-clock
@@ -160,6 +168,22 @@ do -- fresh (1 min old) => no alert
   local out = c({}, mockCx({}, {}), {})
   check_("coordinator_stale: fresh beat => no alert", out == nil)
 end
+do -- PATH GATE: the reader watches ~/.agenthop/swarm/coordinator.beat (the coordinator's pinned write path), NOT the L0 carly root.
+  -- A STALE beat at the OLD carly path + a FRESH beat at the swarm path => no alert (reads swarm). Then STALE at swarm => alert.
+  local OLD = L0 .. "/coordinator.beat"
+  local c = load_check()
+  resetWrites()
+  NOW_SEC = 1700000000
+  writes[OLD] = tostring(NOW_SEC - 25 * 60) .. "\n"   -- stale, wrong place
+  writes[COORD_BEAT] = tostring(NOW_SEC - 60) .. "\n" -- fresh, contract place
+  check_("coordinator_stale PATH: fresh at swarm + stale at old carly path => no alert (reads swarm)", c({}, mockCx({}, {}), {}) == nil)
+  c = load_check()
+  resetWrites()
+  writes[OLD] = tostring(NOW_SEC - 60) .. "\n"            -- fresh, wrong place
+  writes[COORD_BEAT] = tostring(NOW_SEC - 25 * 60) .. "\n" -- stale, contract place
+  local out = c({}, mockCx({}, {}), {})
+  check_("coordinator_stale PATH: stale at swarm + fresh at old carly path => alert (reads swarm)", type(out) == "string" and out:find("coordinator_stale", 1, true) ~= nil)
+end
 do -- bad carriers (empty / non-numeric / legacy JSON) => no crash, no false alert
   for _, bad in ipairs({ "", "garbage", '{"ts":1700000000}' }) do
     local c = load_check()
@@ -172,27 +196,31 @@ do -- bad carriers (empty / non-numeric / legacy JSON) => no crash, no false ale
   end
 end
 
--- ===== r2 ②: batch coverage — every pane body-scanned over ceil(N/batch) rounds =====
+-- ===== r2 ② / #1036 r9: AT MOST ONE body read per round; every pane covered over N rounds =====
 do
   local c = load_check()
   resetWrites()
   local st = {}
   local panes, reads = {}, {}
-  for i = 1, 6 do -- 6 panes, batch_size 4 => 2 rounds to cover all; alert=false so only body-scan (permission) names a pane
-    panes[i] = { pane = i, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = false }
+  for i = 1, 6 do -- 6 panes; one read per round => 6 rounds to cover all; alert=false so only body-scan (permission) names a pane
+    panes[i] = { pane = i, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = false, title = "seat" .. i }
     reads[i] = { kind = "agent", lines = { "Allow this tool? [y/n]" } }
   end
   NOW = 8000000
-  local o1 = c({}, mockCx(panes, reads), st) -- round 1
-  local o2 = c({}, mockCx(panes, reads), st) -- round 2 (offset advanced)
-  local round1 = panesFromString(o1)
-  local n1 = 0; for _ in pairs(round1) do n1 = n1 + 1 end
-  local covered = {}
-  for id in pairs(round1) do covered[id] = true end
-  for id in pairs(panesFromString(o2)) do covered[id] = true end
+  local covered, maxReads = {}, 0
+  for _ = 1, 6 do
+    local readCalls = 0
+    local cx = mockCx(panes, reads)
+    local realRead = cx.session.read
+    cx.session.read = function(self, pane, opts) readCalls = readCalls + 1; LAST_READ_OPTS = opts; return realRead(self, pane, opts) end
+    local o = c({}, cx, st)
+    if readCalls > maxReads then maxReads = readCalls end
+    for id in pairs(panesFromString(o)) do covered[id] = true end
+  end
   local nAll = 0; for _ in pairs(covered) do nAll = nAll + 1 end
-  check_("batch: one round body-scans <= batch_size (4) panes", n1 >= 1 and n1 <= 4)
-  check_("batch: all 6 panes covered over 2 rounds (offset advances)", nAll == 6)
+  check_("r9: every round makes AT MOST ONE cx.session:read (~23ms each live)", maxReads == 1)
+  check_("r9: all 6 panes body-scanned over 6 rounds (offset rotates)", nAll == 6)
+  check_("r9: the read asks for <= 24 lines", type(LAST_READ_OPTS) == "table" and LAST_READ_OPTS.lines ~= nil and LAST_READ_OPTS.lines <= 24)
 end
 
 print(string.format("\n%s (%d failure(s))", failures == 0 and "PASS" or "FAIL", failures))

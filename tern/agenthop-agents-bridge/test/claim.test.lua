@@ -37,15 +37,17 @@ end
 
 -- mock cx: counts side effects
 local function newCx()
-  local calls = { list = 0, ask = 0, start = 0, interrupt = 0, stop = 0, transcript = 0 }
+  local calls = { list = 0, panes = 0, ask = 0, start = 0, interrupt = 0, stop = 0, transcript = 0 }
   local agents = {}
-  function agents:list() calls.list = calls.list + 1 ; return {} end
+  function agents:list() calls.list = calls.list + 1 ; return { { pane = 1, model = "m", command = string.rep("x", 300), agent_command = string.rep("y", 300) } } end
   function agents:ask(_, _) calls.ask = calls.ask + 1 end
   function agents:start(_) calls.start = calls.start + 1 ; return 42 end
   function agents:interrupt(_) calls.interrupt = calls.interrupt + 1 end
   function agents:stop(_) calls.stop = calls.stop + 1 end
   function agents:transcript(_, _) calls.transcript = calls.transcript + 1 ; return {} end
-  return { agents = agents }, calls
+  local session = {}
+  function session:panes() calls.panes = calls.panes + 1; return { { pane = 1, kind = "agent", title = "t" }, { pane = 2, kind = "terminal" } } end
+  return { agents = agents, session = session }, calls
 end
 
 -- ===== op classes =====
@@ -97,10 +99,24 @@ end
 -- ===== dispatch =====
 do
   local cx, calls = newCx()
-  ck("execute: list -> ok, called once", M.execute(cx, { op = "list" }).ok == true and calls.list == 1)
+  local r = M.execute(cx, { op = "list" })
+  ck("r7 list default: slim snapshot from session:panes(), agents:list() NOT called", r.ok == true and calls.panes == 1 and calls.list == 0)
+  ck("r7 list default: only kind==agent panes, alive derived", #r.agents == 1 and r.agents[1].pane == 1 and r.agents[1].alive == true)
+  local f = M.execute(cx, { op = "list", full = true })
+  ck("r7 list full=true: agents:list() called once, full flag set", f.ok == true and f.full == true and calls.list == 1)
+  ck("r7 list full: command/agent_command stripped, other fields kept", f.agents[1].command == nil and f.agents[1].agent_command == nil and f.agents[1].model == "m")
   ck("execute: ask -> ok, called once", M.execute(cx, { op = "ask", agent = 1, text = "hi" }).ok == true and calls.ask == 1)
   ck("execute: start -> ok + pane", (function() local r = M.execute(cx, { op = "start", prompt = "p", cwd = "/" }) ; return r.ok == true and r.pane == 42 end)())
   ck("execute: unknown op -> error", M.execute(cx, { op = "frobnicate" }).ok == false)
+  -- BTF-SV-P2-2: eval keeps falsy returns (was `o and v or nil`, which turned `return false` into ok=true,value=nil)
+  local function ev(code) return M.execute(cx, { op = "eval", code = code }) end
+  local rf, rt, r0, re, rn, rx = ev("return false"), ev("return true"), ev("return 0"), ev('return ""'), ev("return nil"), ev("error('boom')")
+  ck("P2-2 eval false -> ok=true, value=false", rf.ok == true and rf.value == false)
+  ck("P2-2 eval true -> ok=true, value=true", rt.ok == true and rt.value == true)
+  ck("P2-2 eval 0 -> ok=true, value=0", r0.ok == true and r0.value == 0)
+  ck('P2-2 eval "" -> ok=true, value=""', re.ok == true and re.value == "")
+  ck("P2-2 eval nil -> ok=true, value=nil", rn.ok == true and rn.value == nil)
+  ck("P2-2 eval error -> ok=false + error text", rx.ok == false and type(rx.error) == "string" and rx.error:find("boom", 1, true) ~= nil)
 end
 
 -- ===== exactly-once boundary: claim + execute then crash before result => blind reissue double-executes =====

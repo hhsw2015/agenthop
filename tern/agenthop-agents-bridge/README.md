@@ -19,7 +19,7 @@ tern plugin reload
 
 Directory: `~/.agenthop/tern-panes/`
 
-- `agents.json` — status mirror (bridge writes every ~750ms; advisory snapshot, overwrite semantics)
+- `agents.json` — status mirror (advisory snapshot, overwrite). r4: driven by the `mirror` command (swarm sweep runs `tern ctl plugins run plugin.agenthop-agents-bridge.mirror` every ~5s) plus a best-effort ~750ms `tern.timer` chain; carries `vm`/`window` (which VM wrote it) and `tick_ms`/`tick_ms_max` (tick cost). After every load/reload also run `plugin.agenthop-agents-bridge.arm` to arm the A2 sentinel.
 - `requests/<id>.json` — bash writes a one-line-JSON request `{op, ...}`
 - `results/<id>.json` — bridge writes a one-line-JSON reply `{ok, class, ...}`
 
@@ -32,7 +32,10 @@ D=~/.agenthop/tern-panes
 # ATOMIC publish via the helper (write-success gates the rename; see PROTOCOL.md §2.0).
 # Do NOT `echo > requests/$id.json` directly — the bridge can read the half-written file and destroy the request.
 id="$(./publish.sh "$D" '{"op":"list"}')"    # or inline: printf > "$D/requests/.$id.tmp" && mv -f ... || { rm -f ...; exit 1; }
-# poll for the reply, then consume it
+# TRIGGER the drain (r2: drains are commands, not a poll). `start` requests use plugin.agenthop-agents-bridge.drain-start instead.
+TERN_PANE_SOCKET="$HOME/Library/Application Support/Tern/daemon.sock" tern ctl plugins run plugin.agenthop-agents-bridge.drain
+# wait for the reply, then consume it. AUTOMATE: no result within ~2s ⇒ the drain hook is probably disabled ⇒ run `tern plugin reload`,
+# then `tern ctl plugins run plugin.agenthop-agents-bridge.arm`, then re-trigger the drain (PROTOCOL.md §4). One drain handles ONE request.
 until [ -f "$D/results/$id.json" ]; do sleep 0.2; done
 jq . "$D/results/$id.json"        # {"ok":true,"class":"read-only","agents":[...]}
 rm -f "$D/results/$id.json"
@@ -80,5 +83,5 @@ bash test/publish.test.sh      # A1 atomic publisher: write-success gates the re
 bash test/cpa-probe.test.sh    # A2 r2 CPA probe: 3-strike + recovery-clears
 ```
 
-All fixtures have teeth. `claim.test.lua` mirrors `window.luau`'s drain decision (kept in sync by comment); `sentinel.test.lua` loads
+All fixtures have teeth. `claim.test.lua` loads the real `claim.luau`; `window.test.lua` loads the real `window.luau` (hook model since r4: no await chain at all — the mirror is the `mirror` command plus a best-effort `tern.timer` chain, and drain/drain-start/arm-scan/arm-cancel-next are commands; structural, not a reproduction of Tern's budget kill); `sentinel.test.lua` loads
 the real `sentinel.luau` directly (no drift); `osc-hook.test.sh` captures the emitted OSC via `AGENTHOP_OSC_TTY`.

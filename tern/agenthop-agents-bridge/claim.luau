@@ -35,12 +35,46 @@ function M.claim(read, remove, reqPath)
   return true, text
 end
 
+-- SLIM agent snapshot from cx.session:panes() (~0.2ms) — SHARED by window.luau's mirror tick and the default `list` op, one source.
+-- cx.agents:list() costs ~28ms (+~25ms to encode); a request that pays that inside a 50ms command hook disables `drain` until reload.
+M.SLIM_FIELDS = { "pane", "title", "cwd", "tab", "program", "busy", "at_prompt", "exited", "alert", "parked" }
+function M.slimAgents(panes)
+  local out = {}
+  for _, p in ipairs(panes or {}) do
+    if p.kind == "agent" then
+      local e = {}
+      for _, k in ipairs(M.SLIM_FIELDS) do e[k] = p[k] end
+      e.alive = (p.exited == nil) -- PaneInfo has no `alive`; a live agent pane has no exit status
+      out[#out + 1] = e
+    end
+  end
+  return out
+end
+-- Full agents:list() with the long duplicate command strings stripped BEFORE encode (18KB -> <4KB).
+M.FULL_DROP = { command = true, agent_command = true }
+function M.fullAgents(agents)
+  local out = {}
+  for i, a in ipairs(agents or {}) do
+    local e = {}
+    for k, v in pairs(a) do if not M.FULL_DROP[k] then e[k] = v end end
+    out[i] = e
+  end
+  return out
+end
+
 -- Sync op dispatch over cx.agents. `wait` is async and handled by the caller (never reaches here). Every op is pcall-guarded so one
 -- failing op cannot throw out of the drain loop. Returns the result table (without `class`; the caller stamps it).
 function M.execute(cx, req)
   local op = req.op
   if op == "list" then
-    return { ok = true, agents = cx.agents:list() }
+    -- r7: default = the cheap slim snapshot; `{"op":"list","full":true}` opts into the expensive agents:list() (stripped of command
+    -- strings). Callers asking for full pay ~28ms+ of the drain hook's 50ms budget.
+    if req.full == true then
+      local o, a = pcall(function() return cx.agents:list() end)
+      return { ok = o, full = true, agents = o and M.fullAgents(a) or nil, error = (not o) and tostring(a) or nil }
+    end
+    local o, p = pcall(function() return cx.session:panes() end)
+    return { ok = o, agents = o and M.slimAgents(p) or nil, error = (not o) and tostring(p) or nil }
   elseif op == "transcript" then
     local o, t = pcall(function() return cx.agents:transcript(req.agent, { last = req.last }) end)
     return { ok = o, transcript = o and t or nil, error = (not o) and tostring(t) or nil }
@@ -59,6 +93,24 @@ function M.execute(cx, req)
   elseif op == "stop" then
     local o, e = pcall(function() cx.agents:stop(req.agent) end)
     return { ok = o, error = (not o) and tostring(e) or nil }
+  elseif op == "eval" then
+    -- r2 ④ (user directive: call the plugin's Lua API directly). Compile `req.code` with loadstring (the Tern VM has loadstring; `load`
+    -- is nil there) and call it with `cx`; the returned value is the result. Trust boundary unchanged: requests/ lives in the 0700
+    -- home dir, and anyone able to write it can already `start` an arbitrary command — eval adds no attack surface (PROTOCOL.md §2.2).
+    -- Classified non-idempotent (arbitrary code may have side effects) ⇒ UNKNOWN is HOLD, never auto-reissued (PROTOCOL.md §3.3).
+    -- BUDGET IS THE CALLER'S: eval runs inside the `drain` command hook; a snippet over ~50ms (e.g. `#cx.agents:list()`, ~28ms with
+    -- variance) disables `drain` until `tern plugin reload` and strands every later request (PROTOCOL.md §2.2).
+    local compile = loadstring or load
+    if type(req.code) ~= "string" then return { ok = false, error = "eval: code must be a string" } end
+    if type(compile) ~= "function" then return { ok = false, error = "eval: no loadstring in this VM" } end
+    -- `cx` is visible to the snippet both as a named local (`cx.agents:list()`) and as `...` — compile a wrapper that binds it, so
+    -- callers need no boilerplate. The snippet's own `return` is the result.
+    local fn, cerr = compile("local cx = ...\n" .. req.code)
+    if not fn then return { ok = false, error = "eval compile: " .. tostring(cerr) } end
+    local o, v = pcall(fn, cx)
+    -- BTF-SV-P2-2: keep a falsy return as-is (`o and v or nil` turned `return false` into value=nil).
+    if o then return { ok = true, value = v } end
+    return { ok = false, error = tostring(v) }
   else
     return { ok = false, error = "unknown op: " .. tostring(op) }
   end

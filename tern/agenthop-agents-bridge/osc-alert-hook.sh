@@ -12,9 +12,15 @@
 #   Notification                      -> OSC 9;4;4 (paused -> needs human)
 #   Stop / SubagentStop / UserPromptSubmit -> OSC 9;4;0 (clear)
 #
-# The OSC must reach the pane's PTY. A hook's stdout is captured by Claude Code, so it is written to the controlling terminal
-# (/dev/tty), overridable with AGENTHOP_OSC_TTY (the test uses this to capture the bytes). Only emits inside a Tern pane; on a herdr /
-# other-terminal seat $TERN_PANE is unset and the hook is a no-op. Never blocks the session.
+# The OSC must reach the pane's PTY. A hook's stdout is captured by Claude Code, AND Claude Code runs hooks with NO controlling terminal:
+# writing /dev/tty failed 14/14 in spike #1037 (docs/research/tui-osc-hooks-spike.md, raw/ evidence @b01c1f0), so the old /dev/tty
+# default never reached Tern — A3's emitter was mute. Writing the TUI's own pty (found by walking the parent-process chain to the
+# first ancestor with a tty, /dev/ttysNNN) succeeded 12/12. Default = that ancestor pty; /dev/tty only as a last resort;
+# AGENTHOP_OSC_TTY overrides (the test uses it to capture the bytes). Only emits inside a Tern pane; on a herdr / other-terminal seat
+# $TERN_PANE is unset and the hook is a no-op. Never blocks the session.
+#
+# Signal scope (spike #1037 facts): only the ALERT is a trustworthy signal. OSC 2 titles are repainted over by the Claude TUI within ~1s
+# (not persistent), and progress OSC is not relied on; this hook emits the 9;4 alert pair only.
 set -u
 
 [ -n "${TERN_PANE:-}" ] || exit 0 # not inside a Tern pane => nothing to signal
@@ -24,7 +30,18 @@ ev="$(printf '%s' "$payload" | python3 -c 'import sys,json; print(json.load(sys.
 
 esc=$'\033'
 bel=$'\007' # BEL terminator (Carly's proven repro form: printf "\033]9;4;4;50\007")
-tty="${AGENTHOP_OSC_TTY:-/dev/tty}"
+# First ancestor (walking $PPID up) that owns a terminal ⇒ its /dev/ttysNNN; else /dev/tty. Bounded walk (16 hops), never loops.
+ancestor_tty() {
+  local pid="$PPID" i=0 t
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && [ $i -lt 16 ]; do
+    t="$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')"
+    case "$t" in ""|"?"|"??") ;; *) [ -e "/dev/$t" ] && { echo "/dev/$t"; return 0; } ;; esac
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"; i=$((i+1))
+  done
+  echo /dev/tty
+}
+tty="${AGENTHOP_OSC_TTY:-$(ancestor_tty)}"
+[ -n "${AGENTHOP_OSC_TRACE:-}" ] && printf '%s\n' "$tty" >>"$AGENTHOP_OSC_TRACE" 2>/dev/null # test seam: record the chosen target
 
 case "$ev" in
   Notification)
