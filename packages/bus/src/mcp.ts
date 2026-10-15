@@ -50,6 +50,7 @@ export function busInstructions(): string {
 - agenthop_wm(args): drive the OmniWM window manager (macOS) to arrange windows — a passthrough to omniwmctl (e.g. "query windows", "window move-to-workspace <id> 2").
 - agenthop_tern(op, args?, timeout_ms?): call Tern's agents API through the A1 bridge in one step (publish → trigger drain → wait for the result). op: list | transcript | wait | ask | start | interrupt | stop | eval. A read-only op that times out is recovered once automatically (plugin reload + arm, then retried); a NON-idempotent op that times out returns {state:"UNKNOWN", hold:true, id} and is never re-sent — check its effect (e.g. list) before acting again. eval runs your Lua with the plugin's cx and its budget is YOURS: over ~50ms disables the bridge's drain until reload (e.g. avoid #cx.agents:list(); #cx.session:panes() is cheap).
   start places workers by the seat model (session = project, tab = seat, block = worker): default = a split beside your own seat; how:"tab" = a new tab in the same session for wide fan-out; title "<role> · <task>" (no session ids).
+  Agents started here run at the HIGHEST permission by default (claude: bypassPermissions / --dangerously-skip-permissions; codex: INITIAL_AGENT_MODE=agent-full-access). Pass args.mode to lower it explicitly (claude: acceptEdits|auto|manual|dontAsk|plan; codex: a codex-acp mode). For an ACP seat, give args.tool ("claude"|"codex") and optionally args.resume (sid) and the command is built for you.
   start with args.kind:"tui" (+ role, task, prompt, cwd) runs a TUI claude in its OWN herdr session, shown as a split beside your seat; returns {pane, herdr_session}. Capped (SWARM_WORKER_CAP per seat, default 2; SWARM_WORKER_CAP_GLOBAL, default 6) and refused under 1.5 GiB free memory. It is invisible to cx.agents (no ask/wait/approve); it reports back to you through your durable inbox. stop with args.worker:"<name>" stops it (server stop → socket gone → close block → delete session; partial failures reported).
 - agenthop_tern_status(): bridge health — mirror tick/age/cost, Tern's authoritative block count, requests waiting, recent budget kills; healthy | degraded | unknown (unknown = could not observe, not "dead").
 
@@ -245,7 +246,7 @@ export function registerBusTools(server: McpServer, options: BusMcpOptions = {})
         if (!sid) return failure(JSON.stringify({ state: "unknown", reason: "this session's own id is not known yet; a tui worker is recorded on the caller's seat" }));
         const d = realWorkerDeps();
         const r = op === "start"
-          ? await startWorker({ role: String(a.role ?? ""), task: String(a.task ?? ""), prompt: String(a.prompt ?? ""), cwd: String(a.cwd ?? ""), parentSid: sid, near: a.near === undefined ? undefined : String(a.near) }, d)
+          ? await startWorker({ role: String(a.role ?? ""), task: String(a.task ?? ""), prompt: String(a.prompt ?? ""), cwd: String(a.cwd ?? ""), parentSid: sid, near: a.near === undefined ? undefined : String(a.near), mode: a.mode === undefined ? undefined : String(a.mode) }, d)
           : await stopWorker(sid, a.worker as string, d);
         const text = JSON.stringify(r);
         return r.state === "ok" || r.state === "stopped" ? reply(text) : failure(text);

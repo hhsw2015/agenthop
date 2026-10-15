@@ -1,7 +1,9 @@
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { closeSync, mkdirSync, openSync, readFileSync, readlinkSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { isValidSessionId } from "../send-fallback.js";
+import { acquireHolderLock, releaseHolderLock, type LockSite } from "./holder-lock.js";
 
 /**
  * #1053 presence for ACP seats. A Tern ACP seat (`tern acp claude|codex --resume <sid>`) never runs Claude Code's SessionStart hook
@@ -27,9 +29,13 @@ import { isValidSessionId } from "../send-fallback.js";
  */
 
 export type PsRow = { pid: number; ppid: number; argv: string[] };
+/** EXACT argument vector of a process (element boundaries as the kernel holds them) plus its executable path; null = unreadable. */
+export type ExactArgv = (pid: number) => { exe: string; argv: string[] } | null;
 export type SeatTool = "claude" | "codex";
 
-/** Parse `ps axo pid=,ppid=,command=` output. argv is whitespace-split (ps does not quote) — enough for flag matching. Pure. */
+/** Parse `ps axo pid=,ppid=,command=` output. argv here is whitespace-split (ps does not quote), so it is used ONLY to build the
+ *  process tree — never to identify the agent (SP-ARGV: one `node -e "… stream-json --resume=<sid>"` argument would split into
+ *  fake flags). Identification uses ExactArgv. Pure. */
 export function parsePs(text: string): PsRow[] {
   const out: PsRow[] = [];
   for (const line of text.split("\n")) {
@@ -43,8 +49,13 @@ function hasResume(argv: string[], sid: string): boolean {
   return argv.some((a, i) => a === `--resume=${sid}` || (a === "--resume" && argv[i + 1] === sid));
 }
 
-/** The agent pid under a block's `tern acp` root, or null when not exactly one candidate. Pure. */
-export function resolveAgentPid(rootPid: number, sid: string, tool: SeatTool, rows: PsRow[]): number | null {
+/** The agent pid under a block's `tern acp` root, or null when not exactly one candidate. The tree comes from `rows`; every
+ *  candidate is then identified from its EXACT argv and executable (`exact`): claude ⇒ the executable's argv[0] basename is
+ *  "claude" (the native build runs as a versioned file but keeps argv[0] = "claude") AND `stream-json` and `--resume=<sid>` /
+ *  `--resume <sid>` are whole, separate elements; codex ⇒ a direct child whose executable basename is "node" and whose argv[1] is
+ *  a path inside /@agentclientprotocol/codex-acp/. An unreadable exact argv is UNKNOWN: it never matches, and if it might have been
+ *  the agent the answer is null (never a guess). */
+export function resolveAgentPid(rootPid: number, sid: string, tool: SeatTool, rows: PsRow[], exact: ExactArgv): number | null {
   const kids = new Map<number, PsRow[]>();
   for (const r of rows) kids.set(r.ppid, [...(kids.get(r.ppid) ?? []), r]);
   let hits: PsRow[];
@@ -57,9 +68,23 @@ export function resolveAgentPid(rootPid: number, sid: string, tool: SeatTool, ro
         if (!seen.has(c.pid)) { seen.add(c.pid); desc.push(c); frontier.push(c.pid); }
       }
     }
-    hits = desc.filter((r) => r.argv.includes("stream-json") && hasResume(r.argv, sid));
+    let unknown = false;
+    hits = desc.filter((r) => {
+      if (!r.argv.join(" ").includes(sid)) return false; // cheap prefilter only; the decision is on the exact argv
+      const x = exact(r.pid);
+      if (x === null) { unknown = true; return false; }
+      return path.basename(x.argv[0] ?? "") === "claude" && x.argv.includes("stream-json") && hasResume(x.argv, sid);
+    });
+    if (unknown) return null;
   } else {
-    hits = (kids.get(rootPid) ?? []).filter((r) => path.basename(r.argv[0] ?? "") === "node" && r.argv.slice(1).some((a) => a.includes("/@agentclientprotocol/codex-acp/")));
+    let unknown = false;
+    hits = (kids.get(rootPid) ?? []).filter((r) => {
+      if (!r.argv.join(" ").includes("/@agentclientprotocol/codex-acp/")) return false;
+      const x = exact(r.pid);
+      if (x === null) { unknown = true; return false; }
+      return path.basename(x.exe) === "node" && (x.argv[1] ?? "").includes("/@agentclientprotocol/codex-acp/");
+    });
+    if (unknown) return null;
   }
   return hits.length === 1 ? hits[0]!.pid : null;
 }
@@ -74,12 +99,32 @@ export function presenceFile(home: string, sid: string): string {
 export type Origin = "agent" | "bus";
 export function originFile(home: string, sid: string): string { return presenceFile(home, sid).replace(/\.pid$/, ".origin"); }
 
-/** The recorded origin; "unknown" when the sidecar is absent (a pre-r2 writer — treated like "bus") or unreadable / malformed. */
-export function readOrigin(home: string, sid: string): Origin | "unknown" {
-  try {
-    const m = /^origin=(agent|bus) ts=\d+\s*$/.exec(readFileSync(originFile(home, sid), "utf8"));
-    return m ? (m[1] as Origin) : "unknown";
-  } catch { return "unknown"; }
+/** SP-ORIGIN-UNKNOWN: "absent" = no sidecar (a pre-r2 / legacy record — treated like bus); "unreadable" = a sidecar EXISTS but
+ *  cannot be read or does not parse — UNKNOWN, so a bus writer HOLDS (never overwrites what might be an agent record). */
+export function readOrigin(home: string, sid: string): Origin | "absent" | "unreadable" {
+  let raw: string;
+  try { raw = readFileSync(originFile(home, sid), "utf8"); }
+  catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable"; }
+  const m = /^origin=(agent|bus) ts=\d+\s*$/.exec(raw);
+  return m ? (m[1] as Origin) : "unreadable";
+}
+
+// SP-WRITER-RACE: every presence write / delete for a sid happens under ONE per-sid holder-lock (dead-pid reclaim only), with the
+// .pid and .origin re-read UNDER the lock — so an agent publish can never land between a bus writer's check and its overwrite.
+function presenceSite(home: string, sid: string): LockSite {
+  const dir = path.dirname(presenceFile(home, sid));
+  return { lockDir: path.join(dir, `${sid}.lockd`), intentDir: dir, intentPrefix: `${sid}.lockd.hold.` };
+}
+function withPresenceLock<T>(home: string, sid: string, busy: T, fn: () => T): T {
+  const site = presenceSite(home, sid);
+  try { mkdirSync(site.intentDir, { recursive: true, mode: 0o700 }); } catch { return busy; }
+  const deadline = Date.now() + 2000;
+  let token: string | null = null;
+  while (!(token = acquireHolderLock(site))) {
+    if (Date.now() >= deadline) return busy;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+  try { return fn(); } finally { try { releaseHolderLock(site, token); } catch { /* a dead holder is reclaimed */ } }
 }
 
 function atomicWrite(f: string, body: string): void {
@@ -90,9 +135,9 @@ function atomicWrite(f: string, body: string): void {
   catch (e) { try { closeSync(fd); } catch { /* closed */ } try { unlinkSync(tmp); } catch { /* own temp */ } throw e; }
 }
 
-/** May the BUS presence daemon (pid `self`) write presence/<sid>.pid? Only when there is no live AGENT record: absent, the recorded
- *  pid is dead, it is our own pid, or the origin is not "agent". An unreadable .pid ⇒ false (FC-2: never overwrite what we
- *  cannot read). Pure but for the reads. */
+/** May the BUS presence daemon (pid `self`) write presence/<sid>.pid? Only when there is no live AGENT record: the .pid is absent,
+ *  its pid is dead, it is our own pid, or the sidecar positively says "bus" / is absent (legacy). An unreadable .pid or sidecar
+ *  ⇒ false (FC-2 / SP-ORIGIN-UNKNOWN: never overwrite what we cannot read). Call it UNDER the presence lock. */
 export function busMayWrite(home: string, sid: string, self: number, alive: (pid: number) => boolean): boolean {
   let raw: string;
   try { raw = readFileSync(presenceFile(home, sid), "utf8").trim(); }
@@ -100,29 +145,43 @@ export function busMayWrite(home: string, sid: string, self: number, alive: (pid
   const n = Number(raw);
   if (!/^\d+$/.test(raw) || !Number.isSafeInteger(n)) return false;
   if (n === self || !alive(n)) return true;
-  return readOrigin(home, sid) !== "agent";
+  const o = readOrigin(home, sid);
+  return o === "bus" || o === "absent";
 }
 
 /** The bus daemon's write (origin "bus"), honoring busMayWrite. Returns whether it wrote. Never throws. */
 export function writeBusPresence(home: string, sid: string, self: number, alive: (pid: number) => boolean): boolean {
   try {
-    if (!busMayWrite(home, sid, self, alive)) return false;
-    atomicWrite(originFile(home, sid), `origin=bus ts=${Date.now()}\n`); // origin first, then the pid (coordinator ruling)
-    atomicWrite(presenceFile(home, sid), String(self));
-    return true;
+    return withPresenceLock(home, sid, false, () => {
+      if (!busMayWrite(home, sid, self, alive)) return false;
+      atomicWrite(originFile(home, sid), `origin=bus ts=${Date.now()}\n`); // origin first, then the pid (coordinator ruling)
+      atomicWrite(presenceFile(home, sid), String(self));
+      return true;
+    });
   } catch { return false; }
 }
 
-/** Remove presence/<sid>.pid (and its sidecar) only if it still records `self` — a shutdown must never delete an agent record. */
+/** Remove presence/<sid>.pid (and its sidecar) at shutdown — under the lock, and ONLY if it still records `self` AND the sidecar
+ *  says bus (or is absent: a legacy record the daemon wrote). An agent record, or an unreadable sidecar, is never deleted. */
 export function removeOwnPresence(home: string, sid: string, self: number): void {
   try {
-    if (readFileSync(presenceFile(home, sid), "utf8").trim() !== String(self)) return;
-    unlinkSync(presenceFile(home, sid));
-    try { if (readOrigin(home, sid) === "bus") unlinkSync(originFile(home, sid)); } catch { /* sidecar optional */ }
-  } catch { /* absent / unreadable: nothing of ours to remove */ }
+    withPresenceLock(home, sid, undefined, () => {
+      try {
+        if (readFileSync(presenceFile(home, sid), "utf8").trim() !== String(self)) return;
+        const o = readOrigin(home, sid);
+        if (o !== "bus" && o !== "absent") return;
+        unlinkSync(presenceFile(home, sid));
+        if (o === "bus") { try { unlinkSync(originFile(home, sid)); } catch { /* already gone */ } }
+      } catch { /* absent / unreadable: nothing of ours to remove */ }
+    });
+  } catch { /* best effort */ }
 }
 
 export function writePresence(home: string, sid: string, pid: number, alive: (pid: number) => boolean): PresenceResult {
+  try { presenceFile(home, sid); } catch (e) { return { state: "refused", reason: (e as Error).message }; }
+  return withPresenceLock(home, sid, { state: "refused", reason: "presence lock busy" } as PresenceResult, () => writePresenceLocked(home, sid, pid, alive));
+}
+function writePresenceLocked(home: string, sid: string, pid: number, alive: (pid: number) => boolean): PresenceResult {
   let f: string;
   try { f = presenceFile(home, sid); } catch (e) { return { state: "refused", reason: (e as Error).message }; }
   if (!Number.isSafeInteger(pid) || pid <= 0) return { state: "refused", reason: `invalid pid: ${pid}` };
@@ -143,6 +202,40 @@ export function writePresence(home: string, sid: string, pid: number, alive: (pi
     if (was !== pid) atomicWrite(f, String(pid));
   } catch (e) { return { state: "refused", reason: `write failed: ${(e as Error).message}` }; }
   return { state: was === pid ? "kept" : "wrote", pid, was };
+}
+
+/** Exact argv from the kernel: Linux /proc/<pid>/cmdline (NUL-separated) + /proc/<pid>/exe; macOS sysctl KERN_PROCARGS2 via a
+ *  fixed python3 -I helper (node has no binding for it). Any failure ⇒ null. */
+export function realExactArgv(run: (bin: string, args: string[]) => string | null = defaultRunSync): ExactArgv {
+  return (pid) => {
+    if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+    if (process.platform === "linux") {
+      try {
+        const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter((x, i, a) => !(i === a.length - 1 && x === ""));
+        const exe = readlinkSync(`/proc/${pid}/exe`);
+        return argv.length > 0 ? { exe, argv } : null;
+      } catch { return null; }
+    }
+    const out = run("python3", ["-I", "-c", PROCARGS_PY, String(pid)]);
+    if (out === null) return null;
+    try {
+      const j = JSON.parse(out) as { exe?: unknown; argv?: unknown };
+      return typeof j.exe === "string" && Array.isArray(j.argv) && j.argv.every((x) => typeof x === "string") ? { exe: j.exe, argv: j.argv as string[] } : null;
+    } catch { return null; }
+  };
+}
+const PROCARGS_PY = [
+  "import ctypes,struct,sys,json",
+  "l=ctypes.CDLL(None);p=int(sys.argv[1]);m=(ctypes.c_int*3)(1,49,p);n=ctypes.c_size_t(0)",
+  "assert l.sysctl(m,3,None,ctypes.byref(n),None,0)==0",
+  "b=ctypes.create_string_buffer(n.value);assert l.sysctl(m,3,b,ctypes.byref(n),None,0)==0",
+  "r=b.raw[:n.value];c=struct.unpack_from('i',r,0)[0];e,_,t=r[4:].partition(b'\\0');t=t.lstrip(b'\\0');a=t.split(b'\\0')[:c]",
+  "assert len(a)==c",
+  "print(json.dumps({'exe':e.decode(),'argv':[x.decode() for x in a]}))",
+].join("\n");
+function defaultRunSync(bin: string, args: string[]): string | null {
+  const r = spawnSync(bin, args, { encoding: "utf8", timeout: 3000 });
+  return r.status === 0 ? r.stdout : null;
 }
 
 /** `kill -0`: alive on success or EPERM. */

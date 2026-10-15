@@ -12,7 +12,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { realRun, ternCall, ternStatus, opClass, drainActionFor, checkRoleTitle, resumedSeat, type TernDeps } from "./tern-bridge.js";
+import { realRun, ternCall, ternStatus, opClass, drainActionFor, checkRoleTitle, resumedSeat, elevatedCommand, type TernDeps } from "./tern-bridge.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
@@ -80,6 +80,7 @@ function setup(mode: string) {
   const deps: TernDeps = {
     bin, ctlDir: path.join(dir, "ctl"), bridgeDir: path.join(dir, "bridge"), socket: path.join(dir, "sock"),
     presenceHome: dir, alive: () => true,
+    exactArgv: (p: number) => (p === 9102 ? { exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", "--resume=c5beaa7c-acbb-4637-a197-2e9014ae42f8"] } : null),
     run: realRun(path.join(dir, "sock")),
     now: () => Date.now(),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -333,6 +334,27 @@ for (const smuggled of ["stop", "start"]) {
   t("ACP start without a sid: presence pending with the reason, start still ok", r2.state === "ok" && (r2 as any).presence?.state === "pending")
   const r3 = await ternCall("list", {}, 2000, deps);
   t("non-start ops carry no presence field", r3.state === "ok" && (r3 as any).presence === undefined)
+}
+
+// ---- #1034 r3: an agent started here runs at the highest permission by default; args.mode lowers it ----
+{
+  const SID = "c5beaa7c-acbb-4637-a197-2e9014ae42f8";
+  t("perm claude: tool+resume ⇒ tern acp claude --resume <sid> --mode bypassPermissions", elevatedCommand({ tool: "claude", resume: SID }).command === `tern acp claude --resume ${SID} --mode bypassPermissions`)
+  t("perm codex: env INITIAL_AGENT_MODE=agent-full-access (codex-acp has no --mode)", elevatedCommand({ tool: "codex" }).command === "env INITIAL_AGENT_MODE=agent-full-access tern acp codex")
+  t("perm: args.mode lowers it (claude plan)", elevatedCommand({ tool: "claude", mode: "plan" }).command === "tern acp claude --mode plan")
+  t("perm: a caller command `tern acp claude …` without --mode gets the default added", elevatedCommand({ command: `tern acp claude --resume ${SID}` }).command === `tern acp claude --resume ${SID} --mode bypassPermissions`)
+  t("perm: a caller command that already sets --mode is left verbatim", elevatedCommand({ command: "tern acp claude --mode plan" }).command === "tern acp claude --mode plan")
+  t("perm: a caller codex command without the env gets it prefixed", elevatedCommand({ command: "tern acp codex" }).command === "env INITIAL_AGENT_MODE=agent-full-access tern acp codex")
+  t("perm: opencode refused with the reason (no Tern opencode agent here)", /opencode/.test(elevatedCommand({ tool: "opencode" }).error ?? ""))
+  t("perm: a mode that is not a word is refused (no shell injection into the command)", elevatedCommand({ tool: "claude", mode: "x; rm -rf /" }).error !== undefined)
+  t("perm: no tool, no command ⇒ unchanged (Tern's own agent settings)", elevatedCommand({}).command === undefined && elevatedCommand({}).error === undefined)
+  const s = setup("answer");
+  await ternCall("start", { prompt: "p", cwd: "/", tool: "claude", resume: SID }, 2000, s.deps);
+  const wire = JSON.parse(readFileSync(path.join(s.dir, "last-request.json"), "utf8"));
+  t("perm: the bridge receives the elevated command; tool/mode/resume never on the wire", wire.command === `tern acp claude --resume ${SID} --mode bypassPermissions` && wire.tool === undefined && wire.mode === undefined && wire.resume === undefined)
+  const before = s.argv().length;
+  const bad = await ternCall("start", { prompt: "p", cwd: "/", tool: "opencode" }, 2000, s.deps);
+  t("perm: a refused tool ⇒ unknown before any publish", bad.state === "unknown" && s.argv().length === before)
 }
 
 // ---- status three-state ----

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { acquireHolderLock, releaseHolderLock, type LockSite } from "./swarm/holder-lock.js";
 import { homedir } from "node:os";
 import path from "node:path";
 import { isValidSessionId } from "./send-fallback.js";
@@ -31,18 +32,19 @@ import { updateSeatShell } from "./swarm/seat-shell-record.js";
  * feat/inbox-wake-tern) owns `shell`/`pid`; this module owns only `workers`.
  */
 
-export type WorkerState = "live" | "stopping" | "stopped" | "orphan";
+export type WorkerState = "starting" | "live" | "stopping" | "stopped" | "orphan";
 export type Worker = { name: string; herdr_session: string; pane: number; kind: "tui"; started_at: number; stopped_at: number | null; state: WorkerState };
 
 export const WORKER_NAME = /^[a-z][a-z0-9-]{0,39}$/;
-const STATES: readonly string[] = ["live", "stopping", "stopped", "orphan"];
+const STATES: readonly string[] = ["starting", "live", "stopping", "stopped", "orphan"];
 
 /** Schema check for one record (the pinned shape). Pure. */
 export function isWorker(v: unknown): v is Worker {
   const w = v as Record<string, unknown> | null;
   return !!w && typeof w === "object"
     && typeof w.name === "string" && WORKER_NAME.test(w.name) && w.herdr_session === w.name
-    && Number.isSafeInteger(w.pane) && (w.pane as number) > 0 && w.kind === "tui"
+    // pane is the Tern block id; 0 = no block was ever placed (a placeholder, or a start that failed before the split) — never "live"
+    && Number.isSafeInteger(w.pane) && ((w.pane as number) > 0 || (w.pane === 0 && w.state !== "live")) && w.kind === "tui"
     && Number.isSafeInteger(w.started_at) && (w.stopped_at === null || Number.isSafeInteger(w.stopped_at))
     && typeof w.state === "string" && STATES.includes(w.state);
 }
@@ -136,7 +138,39 @@ export const DEFAULT_SEAT_CAP = 2;
 export const DEFAULT_GLOBAL_CAP = 6;
 export const MIN_FREE_BYTES = 1.5 * 1024 ** 3;
 
-const active = (w: Worker) => w.state === "live" || w.state === "stopping";
+const active = (w: Worker) => w.state === "starting" || w.state === "live" || w.state === "stopping";
+
+// MTB-SV-CAP + CLEANUP: the cap is checked and the slot TAKEN in one transaction, and the slot IS the registry entry. The global cap
+// spans every seat file, so the decision runs under a machine-wide holder-lock (dead-pid reclaim only): count active workers
+// (starting / live / stopping) across all seats → decide → write this start's placeholder {state:"starting", pane:0} into the
+// caller's workers[] (updateSeatShell). The placeholder exists BEFORE any herdr / Tern resource can exist, so a crash or a failed
+// cleanup can never leave a live resource that the registry does not know about; it keeps occupying capacity until a cleanup is
+// PROVEN (then "stopped") — an unproven one stays "stopping".
+const registrySite = (home: string): LockSite => {
+  const dir = path.join(home, ".agenthop", "swarm", "seat-shell");
+  return { lockDir: path.join(dir, ".workers.lockd"), intentDir: dir, intentPrefix: ".workers.lockd.hold." };
+};
+function reserveSlot(home: string, seat: string, placeholder: Worker, d: { listDir: (d: string) => string[]; env: NodeJS.ProcessEnv }):
+  { reason: "cap" | "invalid"; detail: string } | null {
+  const site = registrySite(home);
+  try { mkdirSync(site.intentDir, { recursive: true, mode: 0o700 }); } catch (e) { return { reason: "cap", detail: `cannot prepare the worker registry: ${(e as Error).message}` }; }
+  const deadline = Date.now() + 5000;
+  let token: string | null = null;
+  while (!(token = acquireHolderLock(site))) {
+    if (Date.now() >= deadline) return { reason: "cap", detail: "worker registry busy (another start holds the lock); retry" };
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
+  try {
+    const all = allWorkers(home, d.listDir);
+    if (all.workers.some((w) => w.name === placeholder.name && active(w))) return { reason: "invalid", detail: `worker ${placeholder.name} is already starting/live` };
+    const cap = capGate(seat, all, d.env);
+    if (!cap.ok) return { reason: "cap", detail: cap.detail };
+    upsert(home, seat, placeholder);
+    return null;
+  } catch (e) {
+    return { reason: "cap", detail: `could not record the placeholder: ${(e as Error).message}` };
+  } finally { releaseHolderLock(site, token); }
+}
 
 /** Cap gate. SWARM_WORKER_CAP = per seat (default 2), SWARM_WORKER_CAP_GLOBAL = whole machine (default 6). An unreadable seat file
  *  makes the global count UNKNOWN ⇒ refused (we cannot prove we are under the cap). Pure. */
@@ -214,10 +248,18 @@ async function waitSocket(d: WorkerDeps, name: string, present: boolean, ms: num
   }
 }
 
-export type StartArgs = { role: string; task: string; prompt: string; cwd: string; parentSid: string; near?: string };
+export type StartArgs = { role: string; task: string; prompt: string; cwd: string; parentSid: string; near?: string; mode?: string };
+
+/** #1034 r3: a TUI worker's claude runs at the highest permission by default (user order via coordinator); `mode` lowers it.
+ *  The flag goes to the bare claude CLI that herdr starts. Pure. */
+export function claudePermissionArgs(mode: string | undefined): string[] | { error: string } {
+  if (mode === undefined || mode === "full") return ["--dangerously-skip-permissions"];
+  const ok = ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"];
+  return ok.includes(mode) ? ["--permission-mode", mode] : { error: `mode must be full or one of ${ok.join("|")}` };
+}
 export type StartResult =
   | { state: "ok"; pane: number; herdr_session: string }
-  | { state: "refused"; reason: "cap" | "memory" | "invalid"; detail: string }
+  | { state: "refused"; reason: "cap" | "memory" | "invalid" | "name-taken"; detail: string }
   | { state: "failed"; step: string; detail: string; undone: string[] };
 
 /** The prompt tail every TUI worker gets: report through the durable inbox (it is invisible to cx.agents), and a subagent bound
@@ -232,54 +274,83 @@ export function workerPrompt(prompt: string, parentSid: string): string {
 export async function startWorker(a: StartArgs, d: WorkerDeps): Promise<StartResult> {
   const name = workerName(a.role, a.task);
   if (!name) return { state: "refused", reason: "invalid", detail: "role/task leave no usable worker name ([a-z0-9-])" };
+  const perm = claudePermissionArgs(a.mode);
+  if (!Array.isArray(perm)) return { state: "refused", reason: "invalid", detail: perm.error };
   if (!isValidSessionId(a.parentSid)) return { state: "refused", reason: "invalid", detail: "parentSid is not a session id" };
   if (typeof a.prompt !== "string" || a.prompt.trim() === "" || typeof a.cwd !== "string" || !path.isAbsolute(a.cwd)) {
     return { state: "refused", reason: "invalid", detail: "prompt (non-empty) and an absolute cwd are required" };
   }
-  const all = allWorkers(d.home, d.listDir);
-  if (all.workers.some((w) => w.name === name && active(w))) return { state: "refused", reason: "invalid", detail: `worker ${name} is already live` };
-  const cap = capGate(a.parentSid, all, d.env);
-  if (!cap.ok) return { state: "refused", reason: "cap", detail: cap.detail };
   const vm = await d.run("vm_stat", [], 5000);
   const free = vm.code === 0 ? freeBytes(vm.stdout) : null;
   if (free === null) return { state: "refused", reason: "memory", detail: "free memory unknown (vm_stat unreadable)" };
   if (free < MIN_FREE_BYTES) return { state: "refused", reason: "memory", detail: `${(free / 1024 ** 3).toFixed(2)} GiB free < 1.5 GiB` };
+  // MTB-SV-START-OWN: the herdr session name must be FREE before we touch it — an existing session (running or stopped) is someone
+  // else's; refuse and never stop/delete it. Unreadable list ⇒ cannot prove it is free ⇒ refuse.
+  const ls = await d.run(d.herdr, ["session", "list", "--json"], T);
+  let existing: string[] | null = null;
+  try { const j = JSON.parse(ls.stdout) as { sessions?: Array<{ name?: unknown }> }; if (!failed(ls) && Array.isArray(j.sessions)) existing = j.sessions.map((x) => String(x.name)); } catch { /* below */ }
+  if (existing === null) return { state: "refused", reason: "invalid", detail: "herdr session list unreadable: cannot prove the worker name is free" };
+  if (existing.includes(name)) return { state: "refused", reason: "name-taken", detail: `a herdr session named ${name} already exists; it is not ours, left untouched` };
+  const placeholder: Worker = { name, herdr_session: name, pane: 0, kind: "tui", started_at: d.now(), stopped_at: null, state: "starting" };
+  const slot = reserveSlot(d.home, a.parentSid, placeholder, d);
+  if (slot) return { state: "refused", reason: slot.reason, detail: slot.detail };
+  return launch(a, d, placeholder, perm);
+}
 
+/** Replace the placeholder instance (herdr_session + started_at, pane 0) with its final pane/state, under the lock. */
+function settle(home: string, sid: string, ph: Worker, next: Partial<Worker>): void {
+  mutateWorkers(home, sid, (cur) => {
+    if (!cur.some((x) => sameInstance(x, ph))) throw new Error(`placeholder ${ph.herdr_session}:${ph.started_at} not recorded`);
+    return cur.map((x) => (sameInstance(x, ph) ? { ...x, ...next } : x));
+  });
+}
+
+async function launch(a: StartArgs, d: WorkerDeps, ph: Worker, perm: string[]): Promise<StartResult> {
+  const name = ph.name;
   const undone: string[] = [];
-  const undo = async () => {
-    const s = await d.run(d.herdr, ["--session", name, "server", "stop"], T);
-    undone.push(`server stop: ${failed(s) ?? "ok"}`);
-    await waitSocket(d, name, false, 3000);
+  let pane: number | undefined;
+  // Undo ONLY what this start created (the name was proven free before the placeholder, so the session is ours). The result is
+  // PROVEN only when every step succeeded and the socket is gone; then the placeholder becomes "stopped", else it stays
+  // "stopping" and keeps counting toward the cap (CLEANUP) — the orphan sweep / a later stop finishes it.
+  const undo = async (): Promise<boolean> => {
+    let ok = true;
+    if (pane !== undefined) { const c = await d.run(d.tern, ["close", String(pane)], T); undone.push(`tern close: ${failed(c) ?? "ok"}`); ok = ok && !failed(c); }
+    const st = await d.run(d.herdr, ["--session", name, "server", "stop"], T);
+    undone.push(`server stop: ${failed(st) ?? "ok"}`);
+    const gone = await waitSocket(d, name, false, 3000);
+    undone.push(`socket gone: ${gone ? "ok" : "still present"}`);
     const del = await d.run(d.herdr, ["session", "delete", name], T);
     undone.push(`session delete: ${failed(del) ?? "ok"}`);
+    return ok && !failed(st) && gone && !failed(del);
   };
-  const fail = async (step: string, detail: string): Promise<StartResult> => { await undo(); return { state: "failed", step, detail, undone }; };
+  const fail = async (step: string, detail: string): Promise<StartResult> => {
+    const proven = await undo();
+    try { settle(d.home, a.parentSid, ph, proven ? { state: "stopped", stopped_at: d.now(), ...(pane !== undefined ? { pane } : {}) } : { state: "stopping", ...(pane !== undefined ? { pane } : {}) }); }
+    catch (e) { undone.push(`record: ${(e as Error).message}`); }
+    if (!proven) undone.push("cleanup NOT proven: the entry stays \"stopping\" and keeps its capacity");
+    return { state: "failed", step, detail, undone };
+  };
 
   const sp = d.spawnDetached(d.herdr, ["--session", name, "server"]);
-  if (!sp.ok) return { state: "failed", step: "herdr server", detail: sp.error ?? "spawn failed", undone };
+  if (!sp.ok) return fail("herdr server", sp.error ?? "spawn failed");
   if (!(await waitSocket(d, name, true, 5000))) return fail("herdr server", "socket did not appear in 5s");
   const ws = await d.run(d.herdr, ["--session", name, "workspace", "create", "--cwd", a.cwd], T);
   let root: string | undefined;
   try { root = (JSON.parse(ws.stdout) as { result?: { root_pane?: { pane_id?: unknown } } }).result?.root_pane?.pane_id as string | undefined; } catch { /* below */ }
   if (failed(ws) || typeof root !== "string") return fail("workspace create", failed(ws) ?? "no root_pane.pane_id in the reply");
   const ag = await d.run(d.herdr, ["--session", name, "agent", "start", name, "--kind", "claude", "--pane", root, "--",
-    "--permission-mode", "bypassPermissions", workerPrompt(a.prompt, a.parentSid)], AGENT_START_MS);
+    ...perm, workerPrompt(a.prompt, a.parentSid)], AGENT_START_MS);
   if (failed(ag)) return fail("agent start", failed(ag)!);
   const near = a.near ?? d.env.TERN_PANE;
   if (!near) return fail("tern split", "no caller pane (args.near or TERN_PANE) to place the block beside");
   const sb = await d.run(d.tern, ["split", near, "right", "--json", "--", d.herdr, "--session", name], T);
-  let pane: unknown;
-  try { pane = (JSON.parse(sb.stdout) as { block?: unknown }).block; } catch { /* below */ }
-  if (failed(sb) || !Number.isSafeInteger(pane)) return fail("tern split", failed(sb) ?? "no numeric block id in the reply");
-  const w: Worker = { name, herdr_session: name, pane: pane as number, kind: "tui", started_at: d.now(), stopped_at: null, state: "live" };
-  try { upsert(d.home, a.parentSid, w); }
-  catch (e) {
-    // the worker runs but is unrecorded: undo the herdr side and close the block, so nothing lives outside the registry
-    const c = await d.run(d.tern, ["close", String(pane)], T);
-    undone.push(`tern close: ${failed(c) ?? "ok"}`);
-    return fail("record", (e as Error).message);
-  }
-  return { state: "ok", pane: pane as number, herdr_session: name };
+  let block: unknown;
+  try { block = (JSON.parse(sb.stdout) as { block?: unknown }).block; } catch { /* below */ }
+  if (failed(sb) || !Number.isSafeInteger(block) || (block as number) <= 0) return fail("tern split", failed(sb) ?? "no numeric block id in the reply");
+  pane = block as number;
+  try { settle(d.home, a.parentSid, ph, { pane, state: "live" }); }
+  catch (e) { return fail("record", (e as Error).message); }
+  return { state: "ok", pane, herdr_session: name };
 }
 
 export type StopResult = { state: "stopped" | "partial" | "unknown"; name: string; steps: Array<{ step: string; ok: boolean; detail?: string }>; reason?: string };
@@ -289,15 +360,24 @@ export async function stopWorker(seatSid: string, name: string, d: WorkerDeps): 
   let seat: SeatRead;
   try { seat = readSeat(d.home, seatSid); } catch (e) { return { state: "unknown", name, steps, reason: (e as Error).message }; }
   if (seat.kind !== "ok") return { state: "unknown", name, steps, reason: seat.kind === "absent" ? "seat has no record" : seat.reason };
-  const w = seat.workers.find((x) => x.name === name);
-  if (!w) return { state: "unknown", name, steps, reason: `no worker ${name} recorded on this seat` };
+  const w = seat.workers.find((x) => x.name === name && active(x));
+  if (!w) return { state: "unknown", name, steps, reason: `no live worker ${name} recorded on this seat` };
+  return stopWorkerAfterRead(seatSid, w, d);
+}
+
+/** The stop proper, for the instance `w` the caller read. Exported so the instance-check gate can be tested deterministically. */
+export async function stopWorkerAfterRead(seatSid: string, w: Worker, d: WorkerDeps): Promise<StopResult> {
+  const steps: StopResult["steps"] = [];
+  const name = w.name;
   // set state/stopped_at on THIS instance only, under the lock, keeping whatever else the entry carries now (never the snapshot
   // read above — another writer, e.g. the #1033 orphan sweep, may have touched it meanwhile)
   const record = (state: WorkerState, stopped_at: number | null) => {
     try { setWorkerState(d.home, seatSid, w, state, stopped_at); return true; }
     catch (e) { steps.push({ step: `record ${state}`, ok: false, detail: (e as Error).message }); return false; }
   };
-  record("stopping", null); // FIRST: a crash mid-stop leaves "stopping", never "live"
+  // FIRST, and it is also the INSTANCE CHECK (MTB-SV-STOP-INSTANCE): under the lock, the exact instance we read (herdr_session +
+  // pane + started_at) must still be recorded. If a newer instance took the name meanwhile, ZERO actions — never stop or delete it.
+  if (!record("stopping", null)) return { state: "unknown", name, steps, reason: `instance-mismatch: ${w.herdr_session}:${w.pane}:${w.started_at} is no longer the recorded instance (or the record could not be written); nothing stopped` };
   const step = async (label: string, bin: string, args: string[]) => {
     const r = await d.run(bin, args, T);
     const bad = failed(r);
@@ -306,10 +386,41 @@ export async function stopWorker(seatSid: string, name: string, d: WorkerDeps): 
   await step("herdr server stop", d.herdr, ["--session", w.herdr_session, "server", "stop"]);
   const gone = await waitSocket(d, w.herdr_session, false, 5000);
   steps.push(gone ? { step: "socket gone", ok: true } : { step: "socket gone", ok: false, detail: "socket still present after 5s" });
-  await step("tern close", d.tern, ["close", String(w.pane)]);
+  if (w.pane > 0) await step("tern close", d.tern, ["close", String(w.pane)]); // pane 0 = no block was ever placed
   await step("herdr session delete", d.herdr, ["session", "delete", w.herdr_session]);
-  record("stopped", d.now());
-  return { state: steps.every((s) => s.ok) ? "stopped" : "partial", name, steps };
+  // CLEANUP: "stopped" only when every step is proven; otherwise the entry stays "stopping" (keeps its capacity, re-stoppable)
+  const proven = steps.every((s) => s.ok);
+  if (proven) record("stopped", d.now());
+  return { state: proven ? "stopped" : "partial", name, steps };
+}
+
+/** `herdr session list --json` as [{name, running}], or null when ANY part is not that shape. Pure. */
+export function herdrSessions(v: unknown): Array<{ name: string; running: boolean }> | null {
+  const ss = (v as { sessions?: unknown } | null)?.sessions;
+  if (!Array.isArray(ss)) return null;
+  const out: Array<{ name: string; running: boolean }> = [];
+  for (const x of ss) {
+    const e = x as { name?: unknown; running?: unknown } | null;
+    if (!e || typeof e.name !== "string" || typeof e.running !== "boolean") return null;
+    out.push({ name: e.name, running: e.running });
+  }
+  return out;
+}
+/** Every block id in `tern ls --json`, or null when the inventory is not sessions[].tabs[].blocks[].id:number. Pure. */
+export function ternBlockIds(v: unknown): Set<number> | null {
+  const ss = (v as { sessions?: unknown } | null)?.sessions;
+  if (!Array.isArray(ss)) return null;
+  const ids = new Set<number>();
+  for (const s of ss) {
+    const tabs = (s as { tabs?: unknown } | null)?.tabs;
+    if (!Array.isArray(tabs)) return null;
+    for (const t of tabs) {
+      const bs = (t as { blocks?: unknown } | null)?.blocks;
+      if (!Array.isArray(bs)) return null;
+      for (const b of bs) { const id = (b as { id?: unknown } | null)?.id; if (!Number.isSafeInteger(id)) return null; ids.add(id as number); }
+    }
+  }
+  return ids;
 }
 
 export type WorkersStatus = {
@@ -325,23 +436,20 @@ export async function workersStatus(d: WorkerDeps): Promise<WorkersStatus> {
   out.unknown.push(...all.unreadable.map((n) => `seat file unreadable: ${n}`));
   const ls = await d.run(d.herdr, ["session", "list", "--json"], T);
   let sessions: Array<{ name: string; running: boolean }> | null = null;
-  try {
-    const j = JSON.parse(ls.stdout) as { sessions?: unknown };
-    if (!failed(ls) && Array.isArray(j.sessions)) sessions = (j.sessions as Array<{ name?: unknown; running?: unknown }>).filter((s) => typeof s.name === "string").map((s) => ({ name: s.name as string, running: s.running === true }));
-  } catch { /* below */ }
+  // MTB-SOURCE: a session list that is not EXACTLY {sessions:[{name:string, running:boolean}, …]} is UNKNOWN as a whole — a
+  // `running:"true"` or a `{}` entry must never be folded into "stopped" / "missing" and so never produce an orphan.
+  try { if (!failed(ls)) sessions = herdrSessions(JSON.parse(ls.stdout)); } catch { /* below */ }
   if (sessions === null) out.unknown.push("herdr session list unreadable — orphan detection skipped");
   const tl = await d.run(d.tern, ["ls", "--json"], T);
   let blocks: Set<number> | null = null;
-  try {
-    const j = JSON.parse(tl.stdout) as { sessions?: Array<{ tabs?: Array<{ blocks?: Array<{ id?: unknown }> }> }> };
-    if (!failed(tl) && Array.isArray(j.sessions)) blocks = new Set(j.sessions.flatMap((s) => (s.tabs ?? []).flatMap((t) => (t.blocks ?? []).map((b) => b.id as number))));
-  } catch { /* below */ }
+  try { if (!failed(tl)) blocks = ternBlockIds(JSON.parse(tl.stdout)); } catch { /* below */ }
   if (blocks === null) out.unknown.push("tern ls --json unreadable — block check skipped");
 
   for (const w of all.workers.filter(active)) {
+    if (w.state === "starting") { out.unknown.push(`${w.name}: starting (placeholder; no live state yet)`); continue; }
     const hs = sessions?.find((s) => s.name === w.herdr_session);
     if (sessions !== null && (!hs || !hs.running)) { out.orphan.push({ kind: "recorded-but-gone", seat: w.seat, name: w.name, detail: hs ? "herdr session stopped" : "herdr session missing" }); continue; }
-    if (blocks !== null && !blocks.has(w.pane)) { out.orphan.push({ kind: "recorded-but-gone", seat: w.seat, name: w.name, detail: `Tern block ${w.pane} missing` }); continue; }
+    if (blocks !== null && w.pane > 0 && !blocks.has(w.pane)) { out.orphan.push({ kind: "recorded-but-gone", seat: w.seat, name: w.name, detail: `Tern block ${w.pane} missing` }); continue; }
     const al = await d.run(d.herdr, ["--session", w.herdr_session, "agent", "list"], T);
     let st = "unknown";
     try { st = String((JSON.parse(al.stdout) as { result?: { agents?: Array<{ agent_status?: unknown }> } }).result?.agents?.[0]?.agent_status ?? "unknown"); } catch { /* unknown */ }

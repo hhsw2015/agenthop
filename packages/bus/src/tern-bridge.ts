@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import { scrubbedEnv } from "./spawn.js";
-import { parsePs, pidAlive, resolveAgentPid, writePresence, type PresenceResult } from "./swarm/seat-presence.js";
+import { parsePs, pidAlive, realExactArgv, resolveAgentPid, writePresence, type ExactArgv, type PresenceResult } from "./swarm/seat-presence.js";
 
 /**
  * Native caller for the Tern A1 agents-bridge (tern/agenthop-agents-bridge, PROTOCOL.md). One call = the three manual steps a
@@ -74,6 +74,7 @@ export type TernDeps = {
   bridgeDir: string; // the installed plugin dir (arm-schedule.sh lives there)
   presenceHome: string; // where presence/<sid>.pid is written (the OS home, like the bus)
   alive: (pid: number) => boolean;
+  exactArgv: ExactArgv; // kernel argv for identifying the agent process (SP-ARGV)
   socket: string;
   run: (bin: string, args: string[], timeoutMs: number) => Promise<Run>;
   now: () => number;
@@ -120,6 +121,7 @@ export function defaultDeps(env: NodeJS.ProcessEnv = process.env): TernDeps {
     bridgeDir: env.AGENTHOP_BRIDGE_DIR ?? path.join(homedir(), "Library", "Application Support", "Tern", "plugins", PLUGIN_ID),
     presenceHome: env.AH_HOME || homedir(),
     alive: pidAlive,
+    exactArgv: realExactArgv(),
     socket,
     run: realRun(socket),
     now: () => Date.now(),
@@ -359,12 +361,48 @@ async function startedPresence(d: TernDeps, pane: number, args: Record<string, u
     try { root = (JSON.parse(pr.stdout) as { child?: { pid?: unknown } }).child?.pid; } catch { /* retry */ }
     if (Number.isSafeInteger(root)) {
       const ps = await d.run("ps", ["axo", "pid=,ppid=,command="], CTL_TIMEOUT_MS);
-      const pid = ps.code === 0 ? resolveAgentPid(root as number, seat.sid, seat.tool, parsePs(ps.stdout)) : null;
+      const pid = ps.code === 0 ? resolveAgentPid(root as number, seat.sid, seat.tool, parsePs(ps.stdout), d.exactArgv) : null;
       if (pid !== null) return writePresence(d.presenceHome, seat.sid, pid, d.alive);
     }
     if (d.now() >= deadline) return { state: "pending", reason: `no unique ${seat.tool} agent for ${seat.sid} under block ${pane} yet` };
     await d.sleep(500);
   }
+}
+
+/**
+ * #1034 r3 (coordinator, relaying a user order): an agent STARTED through agenthop_tern runs at the highest permission by default;
+ * args.mode lowers it explicitly. Per tool, the only lever each one honours:
+ *   claude (ACP)  `tern acp claude … --mode bypassPermissions`        (tern acp's own flag; probed: usage lists --mode)
+ *   codex  (ACP)  `env INITIAL_AGENT_MODE=agent-full-access tern acp codex …`  (codex-acp reads only this env — no --mode flag, and
+ *                 the ACP entry does not read ~/.codex/config.toml's approval_policy; a new thread defaults to on-request)
+ *   opencode      not offered: Tern has no opencode ACP agent on this machine (`tern acp opencode`: "no agent named opencode"), so
+ *                 there is nothing to elevate — refused with that reason rather than started at an unknown permission.
+ * Builds the command when the caller gives `tool` (and optionally `resume`); a caller-supplied `command` is used verbatim (the
+ * caller chose it) unless it is a recognisable `tern acp <tool>` line without a mode, which gets the default added. Pure.
+ */
+export const DEFAULT_MODE = "full";
+export function elevatedCommand(args: Record<string, unknown>): { command?: string; error?: string } {
+  const mode = args.mode === undefined ? DEFAULT_MODE : String(args.mode);
+  const tool = args.tool === undefined ? undefined : String(args.tool);
+  if (tool !== undefined && tool !== "claude" && tool !== "codex") {
+    return { error: tool === "opencode" ? "tool opencode: Tern has no opencode ACP agent here (tern acp opencode: no agent named opencode)" : `tool must be "claude" or "codex"` };
+  }
+  const claudeMode = mode === DEFAULT_MODE ? "bypassPermissions" : mode;
+  if (!/^[A-Za-z][A-Za-z-]{0,40}$/.test(claudeMode)) return { error: `mode must be a word (claude: acceptEdits|auto|bypassPermissions|manual|dontAsk|plan; codex: full or a codex-acp mode)` };
+  const resume = args.resume === undefined ? undefined : String(args.resume);
+  if (resume !== undefined && !/^[0-9A-Za-z-]{8,128}$/.test(resume)) return { error: "resume must be a session id" };
+  if (tool !== undefined) {
+    if (args.command !== undefined) return { error: "give either tool (and resume/mode) or a full command, not both" };
+    const tail = resume ? ` --resume ${resume}` : "";
+    if (tool === "claude") return { command: `tern acp claude${tail} --mode ${claudeMode}` };
+    const codexMode = mode === DEFAULT_MODE ? "agent-full-access" : mode;
+    return { command: `env INITIAL_AGENT_MODE=${codexMode} tern acp codex${tail}` };
+  }
+  if (typeof args.command !== "string") return {}; // no tool, no command ⇒ Tern's own agent settings decide (unchanged)
+  const c = args.command;
+  if (/(?:^|\s)(?:\S*\/)?tern\s+acp\s+claude\b/.test(c) && !/\s--mode(?:=|\s)/.test(c)) return { command: `${c} --mode ${claudeMode}` };
+  if (/(?:^|\s)(?:\S*\/)?tern\s+acp\s+codex\b/.test(c) && !/INITIAL_AGENT_MODE=/.test(c)) return { command: `env INITIAL_AGENT_MODE=${mode === DEFAULT_MODE ? "agent-full-access" : mode} ${c}` };
+  return { command: c };
 }
 
 /** "stale" iff agents.json is readable and older than STALE_MS; "fresh" if readable and newer; "unknown" if unreadable. Pure-ish. */
@@ -394,11 +432,14 @@ export async function ternCall(op: string, args: Record<string, unknown> = {}, t
     const p = placementFor(args, process.env.TERN_PANE);
     if ("error" in p) return { state: "unknown", ms: ms(), reason: `start: ${p.error}` };
     place = p;
+    const el = elevatedCommand(args);
+    if (el.error) return { state: "unknown", ms: ms(), reason: `start: ${el.error}` }; // rejected before any publish
+    args = { ...args, ...(el.command !== undefined ? { command: el.command } : {}) };
   }
   const id = d.newId();
   // `readonly`/`title`/`near`/`session` are caller-side; the bridge never sees them. The bridge always gets how="split" (start beside
   // focus); the final placement is done with `tern move` once the pane is known (placementFor / nameStarted).
-  const { readonly: _ro, title: _t, near: _n, session: _s, how: _h, ...rest } = args;
+  const { readonly: _ro, title: _t, near: _n, session: _s, how: _h, tool: _tool, mode: _mode, resume: _resume, ...rest } = args;
   const wire = op === "start" ? { ...rest, how: "split" } : rest;
   const body = { ...wire, op }; // op last: nothing in args can replace it
   try { publishRequest(d.ctlDir, id, body); }

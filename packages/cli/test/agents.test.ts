@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { installClaudeStatusHooks, installCodexStatusHooks, mcpHints, opencodeConfigDir, opencodePluginPath, registerMcp, writeOpencodePlugin } from "../src/agents.js";
+import { installClaudePresenceHooks, installCodexPresenceHooks, installClaudeStatusHooks, installCodexStatusHooks, mcpHints, opencodeConfigDir, opencodePluginPath, registerMcp, writeOpencodePlugin } from "../src/agents.js";
 import { parseArgs } from "../src/args.js";
 
 const BIN = "/Users/someone/.local/bin/agenthop";
@@ -427,4 +427,43 @@ describe("plugging into agents as an MCP server", () => {
     expect(parseArgs(["install", "--mcp", "grok", "--mcp", "cursor"]).flags.mcpAgents).toEqual(["grok", "cursor"]);
     expect(() => parseArgs(["install", "--mcp"])).toThrow(/--mcp takes/);
   });
+});
+
+// #1053 r3 SP-SESSIONEND: the INSTALLED SessionEnd command must not kill / delete an AGENT presence record (sidecar origin=agent).
+describe("presence SessionEnd hook respects the origin sidecar", () => {
+  const SID = "11111111-2222-4333-8444-555555555555";
+  async function runEnd(tool: "claude" | "codex", origin: string | null): Promise<{ killed: boolean; pidKept: boolean }> {
+    const { spawn, spawnSync } = await import("node:child_process");
+    const h = await home();
+    const cfg = tool === "claude" ? installClaudePresenceHooks(h) : installCodexPresenceHooks(h);
+    expect(cfg).toBeTruthy();
+    const file = tool === "claude" ? path.join(h, ".claude", "settings.json") : path.join(h, ".codex", "hooks.json");
+    const j = JSON.parse(await readFile(file, "utf8")) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
+    const end = j.hooks.SessionEnd!.flatMap((g) => g.hooks).find((x) => x.command.includes("presence"))!.command;
+    const pd = path.join(h, ".agenthop", "presence");
+    await mkdir(pd, { recursive: true });
+    const victim = spawn("sleep", ["30"], { stdio: "ignore" });
+    let killed = false; victim.on("exit", () => { killed = true; });
+    await writeFile(path.join(pd, `${SID}.pid`), String(victim.pid));
+    if (origin !== null) await writeFile(path.join(pd, `${SID}.origin`), origin);
+    spawnSync("sh", ["-c", end], { input: JSON.stringify({ session_id: SID }), env: { ...process.env, HOME: h, CLAUDE_CODE_SESSION_ID: SID } });
+    await new Promise((r) => setTimeout(r, 300));
+    const pidKept = existsSync(path.join(pd, `${SID}.pid`));
+    if (!killed) victim.kill();
+    return { killed, pidKept };
+  }
+  for (const tool of ["claude", "codex"] as const) {
+    it(`${tool}: origin=agent ⇒ nothing killed, record kept`, async () => {
+      expect(await runEnd(tool, "origin=agent ts=1\n")).toEqual({ killed: false, pidKept: true });
+    });
+    it(`${tool}: origin=bus ⇒ old behaviour (kill + remove)`, async () => {
+      expect(await runEnd(tool, "origin=bus ts=1\n")).toEqual({ killed: true, pidKept: false });
+    });
+    it(`${tool}: no sidecar (legacy) ⇒ old behaviour`, async () => {
+      expect(await runEnd(tool, null)).toEqual({ killed: true, pidKept: false });
+    });
+    it(`${tool}: malformed sidecar ⇒ unknown ⇒ nothing killed`, async () => {
+      expect(await runEnd(tool, "origin=agnet ts=1\n")).toEqual({ killed: false, pidKept: true });
+    });
+  }
 });

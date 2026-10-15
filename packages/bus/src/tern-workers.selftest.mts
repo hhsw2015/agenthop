@@ -6,7 +6,7 @@
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { capGate, freeBytes, readSeat, setWorkerState, startWorker, stopWorker, workerName, workersStatus, writeWorkers, type Worker, type WorkerDeps } from "./tern-workers.js";
+import { capGate, claudePermissionArgs, freeBytes, herdrSessions, ternBlockIds, readSeat, setWorkerState, startWorker, stopWorker, stopWorkerAfterRead, workerName, workersStatus, writeWorkers, type Worker, type WorkerDeps } from "./tern-workers.js";
 import type { Run } from "./tern-bridge.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
@@ -66,9 +66,9 @@ t("freeBytes: free+inactive+speculative pages × page size", freeBytes(VM(100)) 
   const r = await start(d, "smoke");
   t("start tui: ok with {pane, herdr_session}", r.state === "ok" && (r as any).herdr_session === "platform-dev-smoke" && Number.isSafeInteger((r as any).pane))
   const order = f.argv.map((a) => a.join(" "));
-  t("start tui: server spawned, workspace, agent start (claude, bypassPermissions), split beside TERN_PANE running herdr --session",
+  t("start tui: server spawned, workspace, agent start (claude, highest permission by default), split beside TERN_PANE running herdr --session",
     order.some((x) => x === "spawn --session platform-dev-smoke server")
-    && order.some((x) => x.startsWith("herdr --session platform-dev-smoke agent start platform-dev-smoke --kind claude --pane w1:p1 -- --permission-mode bypassPermissions"))
+    && order.some((x) => x.startsWith("herdr --session platform-dev-smoke agent start platform-dev-smoke --kind claude --pane w1:p1 -- --dangerously-skip-permissions"))
     && order.some((x) => x === "tern split 500 right --json -- herdr --session platform-dev-smoke"))
   const agentArgs = f.argv.find((a) => a[3] === "agent" && a[4] === "start")!;
 t("start tui: the prompt tail names the parent sid's durable inbox and a subagent bound", agentArgs[agentArgs.length - 1]!.includes(SEAT) && /durable inbox/.test(agentArgs[agentArgs.length - 1]!) && /subagents/.test(agentArgs[agentArgs.length - 1]!))
@@ -91,7 +91,9 @@ t("start tui: the prompt tail names the parent sid's durable inbox and a subagen
   await start(d, "one"); await start(d, "two");
   const before = f.argv.length;
   const r = await start(d, "three");
-  t("GATE cap: 3rd worker on a seat (default cap 2) ⇒ refused reason cap, ZERO actions", r.state === "refused" && (r as any).reason === "cap" && f.argv.length === before)
+  const after = f.argv.slice(before).map((x) => x.join(" "));
+  t("GATE cap: 3rd worker on a seat (default cap 2) ⇒ refused reason cap, only read-only probes (vm_stat, session list), no spawn",
+    r.state === "refused" && (r as any).reason === "cap" && after.every((x) => x === "vm_stat" || x === "herdr session list --json"))
   d.env = { ...d.env, SWARM_WORKER_CAP: "5", SWARM_WORKER_CAP_GLOBAL: "3" };
   await start(d, "four", OTHER);
   const r2 = await start(d, "five", OTHER);
@@ -122,8 +124,35 @@ t("capGate pure: stopped workers do not count", capGate(SEAT, { workers: [{ name
   const { home, f, d } = setup();
   f.fail.add("tern split");
   const r = await start(d, "undo");
-  t("start: split fails ⇒ failed at 'tern split', herdr server stopped + session deleted, nothing recorded",
-    r.state === "failed" && (r as any).step === "tern split" && !f.sockets.has("platform-dev-undo") && !f.herdrSessions.some((s) => s.name === "platform-dev-undo") && readSeat(home, SEAT).kind === "absent")
+  const ws = (readSeat(home, SEAT) as any).workers as Worker[];
+  t("start: split fails, undo PROVEN ⇒ herdr session gone and the placeholder recorded as stopped (never 'absent')",
+    r.state === "failed" && (r as any).step === "tern split" && !f.sockets.has("platform-dev-undo") && !f.herdrSessions.some((s) => s.name === "platform-dev-undo")
+    && ws.length === 1 && ws[0]!.state === "stopped" && typeof ws[0]!.stopped_at === "number")
+}
+// ---- CLEANUP (Chief Review): the placeholder exists BEFORE any resource; an unproven cleanup keeps "stopping" and its capacity ----
+{
+  const { home, f, d } = setup();
+  let seenPlaceholder = false;
+  const spawn0 = d.spawnDetached;
+  d.spawnDetached = (b, args) => { const w = ((readSeat(home, SEAT) as any).workers ?? []) as Worker[]; seenPlaceholder = w.some((x) => x.state === "starting" && x.pane === 0); return spawn0(b, args); };
+  f.fail.add("tern split"); f.fail.add("session delete");
+  const r = await start(d, "leak");
+  const ws = (readSeat(home, SEAT) as any).workers as Worker[];
+  t("CLEANUP: the 'starting' placeholder is already recorded when the herdr server is spawned", seenPlaceholder)
+  t("CLEANUP: split fails AND session delete fails ⇒ entry stays 'stopping' (not stopped, not absent)", r.state === "failed" && ws.length === 1 && ws[0]!.state === "stopping" && ws[0]!.stopped_at === null)
+  t("CLEANUP: the report says the cleanup was not proven", /NOT proven/.test(((r as any).undone as string[]).join(" ")))
+  f.fail.clear();
+  const r2 = await start(d, "next");
+  const r3 = await start(d, "third");
+  t("CLEANUP: the unproven 'stopping' entry still takes capacity (cap 2: one more ok, then refused)", r2.state === "ok" && r3.state === "refused" && (r3 as any).reason === "cap")
+}
+{
+  const { home, f, d } = setup();
+  await start(d, "stopfail");
+  f.fail.add("session delete");
+  const r = await stopWorker(SEAT, "platform-dev-stopfail", d);
+  const w = ((readSeat(home, SEAT) as any).workers as Worker[])[0]!;
+  t("CLEANUP stop: a failed delete ⇒ partial and the record stays 'stopping' (never 'stopped')", r.state === "partial" && w.state === "stopping" && w.stopped_at === null)
 }
 
 // ---- GATE: stop order + partial ----
@@ -148,7 +177,7 @@ t("capGate pure: stopped workers do not count", capGate(SEAT, { workers: [{ name
   t("GATE partial: server stop fails ⇒ the REST still run (close + delete), state partial, failed steps named",
     r.state === "partial" && r.steps.find((x) => x.step === "herdr server stop")?.ok === false && seq.some((x) => x.startsWith("tern close")) && seq.some((x) => x.startsWith("herdr session delete")))
   const w = (readSeat(home, SEAT) as any).workers[0] as Worker;
-  t("GATE partial: even then the record is written stopped (never left live)", w.state === "stopped")
+  t("GATE partial: the record is never left live — it stays 'stopping' until a cleanup is proven", w.state === "stopping")
 }
 
 // ---- GATE: orphans both ways, report only ----
@@ -221,6 +250,103 @@ t("capGate pure: stopped workers do not count", capGate(SEAT, { workers: [{ name
   const ws = (readSeat(home, SEAT) as any).workers as Worker[];
   t("stop writes under the lock: our instance ends stopped AND the entry another writer added meanwhile survives", ws.length === 2 && ws.find((x) => x.name === "platform-dev-race")?.state === "stopped" && ws.some((x) => x.name === "p-other" && x.state === "live"))
   void s; void f;
+}
+
+// ---- #1034 r3: highest permission by default, args.mode lowers it ----
+t("permission: default = --dangerously-skip-permissions", JSON.stringify(claudePermissionArgs(undefined)) === JSON.stringify(["--dangerously-skip-permissions"]))
+t("permission: mode plan ⇒ --permission-mode plan (explicit downgrade)", JSON.stringify(claudePermissionArgs("plan")) === JSON.stringify(["--permission-mode", "plan"]))
+t("permission: an unknown mode is refused", !Array.isArray(claudePermissionArgs("root")))
+{
+  const { f, d } = setup();
+  await startWorker({ role: "Platform Dev", task: "lowered", prompt: "p", cwd: "/tmp", parentSid: SEAT, mode: "acceptEdits" }, d);
+  const ag = f.argv.find((a) => a[3] === "agent" && a[4] === "start")!;
+  t("permission: args.mode reaches herdr, no skip flag", ag.includes("--permission-mode") && ag.includes("acceptEdits") && !ag.includes("--dangerously-skip-permissions"))
+}
+
+// ---- MTB-SV-CAP: concurrent starts never pass the cap (the slot is taken inside one locked transaction) ----
+{
+  const { home, f, d } = setup();
+  const rs = await Promise.all([start(d, "c1"), start(d, "c2"), start(d, "c3"), start(d, "c4")]);
+  const ok = rs.filter((r) => r.state === "ok").length;
+  const ws = ((readSeat(home, SEAT) as any).workers as Worker[]).filter((w) => w.state === "live").length;
+  t("CAP: 4 concurrent starts on one seat (cap 2) ⇒ exactly 2 ok, 2 refused cap", ok === 2 && rs.filter((r) => r.state === "refused" && (r as any).reason === "cap").length === 2)
+  t("CAP: exactly 2 live workers recorded, no reservation left behind", ws === 2 && (() => { try { return readdirSync(path.join(home, ".agenthop", "swarm", "seat-shell", ".reservations")).length === 0; } catch { return true; } })())
+  void f;
+}
+
+// ---- MTB-SV-START-OWN: an existing herdr session with our name is someone else's — refuse, never stop/delete it ----
+{
+  const { f, d } = setup();
+  f.herdrSessions.push({ name: "platform-dev-taken", running: true });
+  const r = await start(d, "taken");
+  t("START-OWN: name exists ⇒ refused name-taken", r.state === "refused" && (r as any).reason === "name-taken")
+  t("START-OWN: the existing session was never stopped or deleted", !f.argv.some((a) => a.join(" ").includes("platform-dev-taken") && (a.includes("stop") || a.includes("delete"))) && f.herdrSessions.some((s) => s.name === "platform-dev-taken"))
+  f.herdrSessions.push({ name: "platform-dev-taken2", running: false });
+  const r2 = await start(d, "taken2");
+  t("START-OWN: a STOPPED session with our name is not ours either ⇒ refused", r2.state === "refused" && (r2 as any).reason === "name-taken")
+}
+
+// ---- MTB-SV-STOP-INSTANCE: the recorded instance changed ⇒ zero actions ----
+{
+  const { home, f, d } = setup();
+  await start(d, "inst");
+  const w0 = ((readSeat(home, SEAT) as any).workers as Worker[])[0]!;
+  // a newer instance with the same name replaced the record between stop's read and its locked check
+  const readSeat0 = readSeat;
+  const newer: Worker = { ...w0, pane: w0.pane + 1, started_at: w0.started_at + 1 };
+  const before = f.argv.length;
+  const realRun = d.run;
+  let swapped = false;
+  const d2: WorkerDeps = { ...d, run: async (b, a2, ms) => realRun(b, a2, ms) };
+  // swap right after stopWorker's unlocked read: patch via a getter on listDir is not available, so do it by writing first
+  writeWorkers(home, SEAT, [newer]);
+  swapped = true;
+  const r = await stopWorker(SEAT, w0.name, { ...d2 });
+  t("STOP-INSTANCE (record already replaced): stop acts on the CURRENT instance only", r.state === "stopped" && f.argv.slice(before).some((a) => a.join(" ") === `tern close ${newer.pane}`))
+  void readSeat0; void swapped;
+}
+{
+  const { home, f, d } = setup();
+  await start(d, "inst2");
+  const w0 = ((readSeat(home, SEAT) as any).workers as Worker[])[0]!;
+  const newer: Worker = { ...w0, pane: w0.pane + 7, started_at: w0.started_at + 7 };
+  const realReadDir = d.listDir;
+  let first = true;
+  // the swap happens INSIDE stop: between its unlocked read and the locked "stopping" record (hooked on the lock-taking listDir call)
+  const wrap: WorkerDeps = { ...d, listDir: (dir) => realReadDir(dir) };
+  const orig = (globalThis as any).__noop;
+  void orig;
+  const before = f.argv.length;
+  const stopP = (async () => {
+    const r0 = readSeat(home, SEAT); void r0;
+    if (first) { first = false; writeWorkers(home, SEAT, [newer]); }
+    return stopWorkerAfterRead(SEAT, w0, wrap);
+  })();
+  const r = await stopP;
+  t("STOP-INSTANCE: instance changed under us ⇒ instance-mismatch, ZERO herdr/tern actions", r.state === "unknown" && /instance-mismatch/.test(r.reason ?? "") && f.argv.length === before)
+  t("STOP-INSTANCE: the newer instance's record is untouched (still live)", ((readSeat(home, SEAT) as any).workers as Worker[])[0]!.state === "live")
+}
+
+// ---- MTB-SOURCE: a malformed source is UNKNOWN, never folded into stopped/missing (no new orphan) ----
+t("herdrSessions: running must be a boolean; a {} entry or a missing list ⇒ null", herdrSessions({ sessions: [{ name: "a", running: "true" }] }) === null && herdrSessions({ sessions: [{}] }) === null && herdrSessions({}) === null && herdrSessions({ sessions: [{ name: "a", running: true }] })?.length === 1)
+t("ternBlockIds: a non-number id or missing level ⇒ null", ternBlockIds({ sessions: [{ tabs: [{ blocks: [{ id: "1" }] }] }] }) === null && ternBlockIds({ sessions: [{}] }) === null && ternBlockIds({ sessions: [{ tabs: [{ blocks: [{ id: 3 }] }] }] })?.has(3) === true)
+for (const bad of [`{"sessions":[{"name":"platform-dev-src","running":"true"}]}`, `{"sessions":[{}]}`, `{"sessions":{}}`]) {
+  const { f, d } = setup();
+  await start(d, "src");
+  const run0 = d.run;
+  d.run = async (bin, args, ms) => (bin === "herdr" && args[0] === "session" && args[1] === "list" ? { code: 0, stdout: bad, stderr: "", timedOut: false } : run0(bin, args, ms));
+  const st = await workersStatus(d);
+  t(`SOURCE: herdr list ${bad.slice(0, 40)}… ⇒ unknown reported, ZERO orphans`, st.orphan.length === 0 && st.unknown.some((u) => /herdr session list/.test(u)))
+  void f;
+}
+{
+  const { f, d } = setup();
+  await start(d, "src2");
+  const run0 = d.run;
+  d.run = async (bin, args, ms) => (bin === "tern" && args[0] === "ls" ? { code: 0, stdout: `{"sessions":[{"tabs":[{"blocks":[{"id":"7"}]}]}]}`, stderr: "", timedOut: false } : run0(bin, args, ms));
+  const st = await workersStatus(d);
+  t("SOURCE: tern ls with a string block id ⇒ unknown, no 'block missing' orphan", !st.orphan.some((o) => /block/.test(o.detail)) && st.unknown.some((u) => /tern ls/.test(u)))
+  void f;
 }
 
 console.log("all tern-workers selftests passed");

@@ -8,7 +8,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { parsePs, pidAlive, resolveAgentPid, writePresence, type SeatTool } from "../packages/bus/src/swarm/seat-presence.js";
+import { parsePs, pidAlive, realExactArgv, resolveAgentPid, writePresence, type ExactArgv, type SeatTool } from "../packages/bus/src/swarm/seat-presence.js";
 
 const [mode, sid, block, tool] = process.argv.slice(2);
 const fail = (m: string, code = 2): never => { process.stderr.write(`seat-presence: ${m}\n`); process.exit(code); };
@@ -22,7 +22,11 @@ try {
   root = j.child!.pid as number;
 } catch (e) { fail(`tern process ${block}: ${(e as Error).message}`, 1); }
 const ps = process.env.SEAT_PRESENCE_PS ? readFileSync(process.env.SEAT_PRESENCE_PS, "utf8") : execFileSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8" });
-const pid = resolveAgentPid(root!, sid!, tool as SeatTool, parsePs(ps));
+// SEAT_PRESENCE_ARGV (tests): a JSON file {"<pid>": {"exe": "...", "argv": [...]}} standing in for the kernel's exact argv
+const exact: ExactArgv = process.env.SEAT_PRESENCE_ARGV
+  ? ((m: Record<string, { exe: string; argv: string[] }>) => (p: number) => m[String(p)] ?? null)(JSON.parse(readFileSync(process.env.SEAT_PRESENCE_ARGV, "utf8")))
+  : realExactArgv();
+const pid = resolveAgentPid(root!, sid!, tool as SeatTool, parsePs(ps), exact);
 if (pid === null) fail(`no unique ${tool} agent for ${sid} under block ${block} (tern acp pid ${root!})`, 1);
 if (mode === "resolve") { process.stdout.write(`${pid}\n`); process.exit(0); }
 const alive = process.env.SEAT_PRESENCE_PS ? () => true : pidAlive;
