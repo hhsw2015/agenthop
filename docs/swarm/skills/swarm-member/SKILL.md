@@ -14,7 +14,7 @@ user-invocable: true
 
 1. **你箱里的交接单 / 派单**(`~/.agenthop/inbox/<你的 sid>/*.json`):角色、tab、cwd、继承的线、审查席 sid。
 2. **协调者 handoff**:`~/.agenthop/swarm/coordinator-handoff.md` 的「席位路由」节:role → sid → Tern block → bus 句柄。第一行是协调者当前会话。
-3. `~/.agenthop/swarm/roster.json`(席位配方,含 tool/model/mode)。
+3. 席位配方(tool / model / mode / cwd):用 handoff 或交接单**指向的那份**配方文件(例如 tern-restore 的 roster)。不要自己假定固定路径,也不要把 `roster-snapshot.json` 之类的投影快照当配方。找不到就问协调者。
 
 从中取下面四个值,本文其余部分用这些记号:
 
@@ -44,9 +44,9 @@ user-invocable: true
 
 | 发给 | 实时 | 耐久(以此为准) | 备注 |
 |---|---|---|---|
-| 协调者 | `agenthop_send($COORD_BUS)` 一两句 + 指针 | `writeInbox($COORD_BOX)` 全文 | 全文走耐久箱,bus 只给队序与指针(S26) |
+| 协调者 | `agenthop_send($COORD_BUS)` 一两句 + 指针 | `writeInbox($COORD_BOX)`;判卷/交付抄送是 ≤15 行摘要(S26) | 全文以文件为准,bus 只给队序与指针 |
 | claude 审查席 / 开发席 | `agenthop_send(<句柄>)` | `writeInbox(<其 sid>)` | 同上 |
-| **codex 主线程**(如主审) | `tern send <block> text '<一句>' ; keys Enter` | `writeInbox(<其 sid>)` | bus 信对 codex 主线程落裸 sid 箱且**不自读**;不直注 = 不醒 |
+| **codex 主线程**(如主审) | `tern send <block> text '<一句>' && tern send <block> keys Enter`(两条完整命令;第一条成功才按 Enter) | `writeInbox(<其 sid>)` | bus 信对 codex 主线程落裸 sid 箱且**不自读**;不直注 = 不醒 |
 
 `writeInbox` 用法(在 `~/Dev/agenthop` 下用 `npx tsx` 跑;idemKey 只用 `[A-Za-z0-9._-]`,同一封信重投不重复):
 
@@ -79,7 +79,13 @@ console.log(writeInbox(homedir(), "<target full sid>", composeInboxMsg({ from: "
 分支 <branch> · 固定 SHA <40 位完整 SHA> · 工作树 <绝对路径>(clean)· 基 <base SHA>
 ```
 
-再加:修了什么(按条目 ID 逐条)、门(测试命令 + 结果 + mutant/对照)、证据目录。收件人:主审 `$CHIEF` + 二声 `$SV` + `$COORD_BOX` 三个箱(同一 idemKey),然后 `agenthop_send($COORD_BUS)` 一句指针;codex 主线程审查席再加 `tern send` 直注。
+再加:修了什么(按条目 ID 逐条)、门(测试命令 + 结果 + mutant/对照)、证据目录。
+
+收件人与正文按 S26 分工(三箱用**同一个 idemKey**,正文不必相同):
+
+- 主审 `$CHIEF`、二声 `$SV`:完整送审信(上面全部内容)。codex 主线程审查席另加第 2 节的直注。
+- `$COORD_BOX`:≤15 行摘要件:分支 · 固定 SHA · 工作树 / 修了哪些 ID / 门的结果 / 证据或报告路径 / 下一步归谁。细节协调者读文件。
+- 然后 `agenthop_send($COORD_BUS)` 一句指针。
 
 改动只在**你自己的工作树**(`~/Dev/agenthop-wt/<name>`)里提交。不在别人的工作树里改。不 push,不 merge。
 

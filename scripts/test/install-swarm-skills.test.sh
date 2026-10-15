@@ -51,8 +51,15 @@ ck "publish fault: other skill untouched" keep "$(cat "$SWARM_SKILLS_DIR/other/S
 out=$(FAIL_ROLLBACK=1 PATH="$T/fbin:$PATH" bash "$S" 2>&1); ck "publish+rollback fault: exit 1" 1 $?
 ck "publish+rollback fault: names both paths" 1 "$(echo "$out" | grep -c 'previous copy kept at .*\.swarm-member\.old\..* new copy at .*\.swarm-member\.new\.')"
 oldp=$(ls -d "$SWARM_SKILLS_DIR"/.swarm-member.old.* 2>/dev/null | head -1)
-ck "publish+rollback fault: previous copy recoverable" "old copy" "$(cat "$oldp/SKILL.md" 2>/dev/null)"
+ck "publish+rollback fault: previous copy recoverable" "old copy" "$(cat "$oldp/prev/SKILL.md" 2>/dev/null)"
 ck "publish+rollback fault: new copy kept" 0 "$(cmp -s "$REPO/docs/swarm/skills/swarm-member/SKILL.md" "$(ls -d "$SWARM_SKILLS_DIR"/.swarm-member.new.* | head -1)/SKILL.md"; echo $?)"
+rm -rf "$SWARM_SKILLS_DIR"/.swarm-member.*
+# temp-path ownership: look-alike paths that exist before the run (incl. the installer's own pid, via exec) are never removed
+rm -rf "$SWARM_SKILLS_DIR/swarm-member"; bash "$S" >/dev/null; echo changed > "$SWARM_SKILLS_DIR/swarm-member/SKILL.md"
+bash -c 'for m in new old; do for k in keep $$; do mkdir -p "$1/.swarm-member.$m.$k"; echo mine > "$1/.swarm-member.$m.$k/x"; done; done; exec bash "$2" >/dev/null' _ "$SWARM_SKILLS_DIR" "$S"
+ck "temp: pre-existing look-alike markers (same pid too) survive a replace" 4 "$(cat "$SWARM_SKILLS_DIR"/.swarm-member.*.*/x 2>/dev/null | grep -c mine)"
+ck "temp: installed copy still equals repo" 0 "$(cmp -s "$REPO/docs/swarm/skills/swarm-member/SKILL.md" "$SWARM_SKILLS_DIR/swarm-member/SKILL.md"; echo $?)"
+ck "temp: installed dir mode 755" 755 "$(stat -f %Lp "$SWARM_SKILLS_DIR/swarm-member")"
 rm -rf "$SWARM_SKILLS_DIR"/.swarm-member.*
 ck "bad arg: exit 2" 2 "$(bash "$S" --bogus >/dev/null 2>&1; echo $?)"
 ck "SKILL.md <= 200 lines" yes "$( [ "$(wc -l < "$REPO/docs/swarm/skills/swarm-member/SKILL.md")" -le 200 ] && echo yes || echo no)"
