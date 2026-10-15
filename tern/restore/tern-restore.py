@@ -145,6 +145,31 @@ def _has_unquoted_newline(command):
     return False
 
 
+def _join_continuations(command):
+    """Remove backslash-newline the way /bin/sh does BEFORE it splits words or sees comments (outside single quotes; inside double
+    quotes too). TR-SV-CONTINUATION-COMMENT: `claude \\<newline># --mode X` is `claude # --mode X` to sh — the # starts a comment —
+    so continuations must be gone before _strip_comment decides what is a word start. `a\\<newline>#b` joins to the word `a#b`."""
+    out, quote, i = [], None, 0
+    while i < len(command):
+        c = command[i]
+        if quote != "'" and c == "\\" and command[i + 1:i + 2] == "\n":
+            i += 2
+            continue
+        if quote == "'":
+            if c == "'": quote = None
+        elif quote == '"':
+            if c == "\\":
+                out.append(command[i:i + 2]); i += 2; continue
+            if c == '"': quote = None
+        elif c == "\\":
+            out.append(command[i:i + 2]); i += 2; continue
+        elif c in ("'", '"'):
+            quote = c
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _strip_comment(command):
     """Cut an sh comment: an unquoted `#` at the START of a word runs to end of line. A `#` inside a word (`X#y`) is literal in sh,
     so it must stay literal here too — shlex's commenter would cut `--resume X#y` to `X` and prove an identity sh never passes."""
@@ -177,7 +202,7 @@ def _acp_launch(command):
     if _has_unquoted_newline(command):
         return None
     try:
-        lex = shlex.shlex(_strip_comment(command), posix=True, punctuation_chars=True)
+        lex = shlex.shlex(_strip_comment(_join_continuations(command)), posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         lex.commenters = ""
         argv = list(lex)

@@ -521,5 +521,45 @@ print(r, r2)
 PY
 ck "lock: TS contends while restore holds, acquires after" "contended acquired" "$(python3 -I "$T/pyhold.py" "$T/presence")"
 
+# ===== r11 =====
+# TR-SV-CONTINUATION-COMMENT: sh removes backslash-newline BEFORE comments; parse must match real /bin/sh argv on every input
+cat >"$T/shcmp.py" <<PY
+import importlib.util, json, os, subprocess, sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("tr", "$PY"); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+cap = os.path.join("$T", "cap.py"); open(cap, "w").write("import json,sys\nprint(json.dumps(sys.argv[1:]))\n")
+B = chr(92)
+cases = {
+  "continued-comment": "tern acp claude " + B + "\n# note --resume aaaa1111 --mode bypassPermissions --model m1",
+  "continued-comment-mode": "tern acp claude --resume aaaa1111 --model m1 " + B + "\n# --mode bypassPermissions",
+  "continued-arguments": "tern acp claude --resume aaaa1111 --mode bypassPermissions " + B + "\n --model m1",
+  "continued-into-word": "tern acp claude --resume aaaa1111" + B + "\n#x --mode bypassPermissions --model m1",
+  "dq-continuation": 'tern acp claude --resume "aaaa" + B + "\n1111" --mode bypassPermissions --model m1',
+  "plain-comment": "tern acp claude --resume aaaa1111 --model m1 # --mode bypassPermissions",
+  "hash-in-word": "tern acp claude --resume aaaa1111#x --mode bypassPermissions --model m1",
+}
+bad = []
+for name, c in cases.items():
+    out = subprocess.run(["/bin/sh", "-c", 'tern() { python3 "' + cap + '" "\$@"; }; ' + c], capture_output=True, text=True).stdout
+    argv = json.loads(out)
+    def flag(f):
+        v = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == f] + [a.split("=", 1)[1] for a in argv if a.startswith(f + "=")]
+        return v[0] if len(v) == 1 else None
+    want_p = ("claude", flag("--resume"), flag("--model")) if flag("--resume") else None
+    got_p, got_m = m.parse_acp(c), m.launch_mode(c)
+    if got_p != want_p or got_m != flag("--mode"):
+        bad.append(f"{name}: sh argv {argv} => want {want_p}/{flag('--mode')}, parse gave {got_p}/{got_m}")
+print("\n".join(bad) if bad else "ALL MATCH")
+PY
+ck "continuation: parse == real /bin/sh argv on 7 inputs" "ALL MATCH" "$(python3 -I "$T/shcmp.py")"
+# the reviewer's CLI case: a live block whose resume/mode exist only in a comment after a continuation is NOT this seat
+fresh; seed "Other Role" "tern acp claude \\
+# note --resume aaaa1111 --mode bypassPermissions --model m1"; rc=$(run1)
+ck "continuation: comment-only sid => no rename of that block" "0" "$(grep -c '^rename 100' "$T/log")"
+ck "continuation: its tab name is untouched" "Other Role" "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["sessions"][0]["tabs"][0]["name"])' "$FAKE_STATE")"
+fresh; seed Manager "tern acp claude --resume aaaa1111 --model m1 \\
+# --mode bypassPermissions"; run1 --check >/dev/null
+ck "continuation: comment-only --mode => FAIL mode None" "1" "$(grep -c "FAIL: Manager: mode None" "$T/out")"
+
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
