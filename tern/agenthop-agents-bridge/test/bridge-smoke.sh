@@ -5,10 +5,13 @@
 #   2. {op:list}  published -> drain action -> results/<id>.json exists within RESULT_WAIT s with ok=true
 #   3. {op:eval, code:"return #cx.agents:list()"} -> same, and the value is a number
 #   4. tern.log has no `exceeded ... agenthop-agents-bridge` budget line since this script started
-# Any failure prints the tick, the log tail and the unconsumed requests, and exits non-zero.
+# Every check runs on its own and reports PASS/FAIL; nothing short-circuits, so a half-failure (command
+# path alive while the status mirror is dead, or the reverse) is visible. If any check fails, the summary is
+# followed by diagnostics (tick, the plugin's last budget failure, unconsumed requests, log tail) and exit 1.
+# The only early exit is a missing prerequisite (no timeout/jq, or the plugin not loaded): exit 2.
 # Every tern call is wrapped in `timeout`.
 #
-# Interface defaults (#1032-A not landed yet; override if Platform Dev ships different names):
+# Interface (confirmed by the coordinator on r2 @5f6294b; override if it changes):
 #   BRIDGE_DRAIN_ACTION  action run via `tern ctl plugins run`   default plugin.agenthop-agents-bridge.drain
 #   BRIDGE_EVAL_FIELD    result field holding the eval value     default value
 set -uo pipefail
@@ -33,71 +36,103 @@ LOG_START_LINES=0
 
 tick(){ jq -r '.tick // empty' "$CTRL/agents.json" 2>/dev/null; }
 
-diag(){
-  echo "--- diagnostics ---" >&2
-  echo "tick now: $(tick || echo '(unreadable)')" >&2
-  echo "unconsumed requests:" >&2
-  ls -1 "$CTRL/requests/" 2>/dev/null | grep '\.json$' >&2 || echo "  (none)" >&2
-  echo "last $PLUGIN_ID budget/handler failure in tern.log (any time):" >&2
-  { grep -E "exceeded|handler failed" "$LOG" 2>/dev/null | grep -F "$PLUGIN_ID" | tail -n 2 || true; } >&2
-  echo "tern.log tail:" >&2
-  tail -n 15 "$LOG" >&2 2>/dev/null || echo "  (no log at $LOG)" >&2
-}
-fail(){ echo "FAIL - $*" >&2; diag; exit 1; }
-ok(){ echo "ok   - $*"; }
+PASSED=() FAILED=()
+pass(){ echo "PASS - $1"; PASSED+=("$1"); }
+fail(){ echo "FAIL - $1"; FAILED+=("$1"); }
 
-# Publish a request, trigger the drain action, wait for its result. Prints the result JSON on stdout.
+# Publish a request, trigger the drain action, wait for its result. On success prints the result JSON and
+# returns 0; on failure prints the reason and returns 1 (the caller records the FAIL, the script continues).
 roundtrip(){
   local json="$1" id res i
-  id="$("$PUBLISH" "$CTRL" "$json")" || fail "publish.sh could not publish $json"
+  id="$("$PUBLISH" "$CTRL" "$json")" || { echo "publish.sh could not publish"; return 1; }
   timeout "$TERN_TIMEOUT" "$TERN" ctl plugins run "$DRAIN_ACTION" >/dev/null 2>&1 \
-    || fail "\`tern ctl plugins run $DRAIN_ACTION\` failed or timed out (${TERN_TIMEOUT}s) for request $id"
+    || { echo "\`tern ctl plugins run $DRAIN_ACTION\` failed or timed out (${TERN_TIMEOUT}s), request $id"; return 1; }
   res="$CTRL/results/$id.json"
   for ((i = 0; i < RESULT_WAIT * 10; i++)); do
     [ -s "$res" ] && break
     sleep 0.1
   done
-  [ -s "$res" ] || fail "no results/$id.json within ${RESULT_WAIT}s for $json"
+  [ -s "$res" ] || { echo "no results/$id.json within ${RESULT_WAIT}s"; return 1; }
   cat "$res"
   rm -f "$res"
 }
 
-# 0. preflight: tern answers and the plugin is loaded
-timeout "$TERN_TIMEOUT" "$TERN" plugin list --json 2>/dev/null \
-  | jq -e --arg id "$PLUGIN_ID" '.plugins[] | select(.id == $id)' >/dev/null \
-  || fail "plugin $PLUGIN_ID not loaded (or \`tern plugin list\` timed out)"
-ok "plugin $PLUGIN_ID loaded"
+# 0. prerequisite: tern answers and the plugin is loaded. Without it every check below is meaningless.
+if ! timeout "$TERN_TIMEOUT" "$TERN" plugin list --json 2>/dev/null \
+  | jq -e --arg id "$PLUGIN_ID" '.plugins[] | select(.id == $id)' >/dev/null; then
+  echo "bridge-smoke: plugin $PLUGIN_ID not loaded (or \`tern plugin list\` timed out) — cannot run the checks" >&2
+  exit 2
+fi
+echo "ok   - plugin $PLUGIN_ID loaded"
 
-# 1. tick advances
+# 1. tick advances (status mirror alive)
 t0="$(tick)"
-[[ "$t0" =~ ^[0-9]+$ ]] || fail "agents.json tick unreadable or not a number: '$t0'"
-sleep "$TICK_WAIT"
-t1="$(tick)"
-[[ "$t1" =~ ^[0-9]+$ ]] && [ "$t1" -gt "$t0" ] || fail "tick did not advance in ${TICK_WAIT}s ($t0 -> $t1)"
-ok "tick advances ($t0 -> $t1)"
+if ! [[ "$t0" =~ ^[0-9]+$ ]]; then
+  fail "1 tick: agents.json tick unreadable or not a number: '$t0'"
+else
+  sleep "$TICK_WAIT"
+  t1="$(tick)"
+  if [[ "$t1" =~ ^[0-9]+$ ]] && [ "$t1" -gt "$t0" ]; then
+    pass "1 tick advances ($t0 -> $t1)"
+  else
+    fail "1 tick: did not advance in ${TICK_WAIT}s ($t0 -> $t1)"
+  fi
+fi
 
-# 2. list round-trip
-r="$(roundtrip '{"op":"list"}')" || exit 1
-echo "$r" | jq -e '.ok == true and (.agents | type == "array")' >/dev/null || fail "list result not ok/agents[]: $r"
-ok "list round-trip ok ($(echo "$r" | jq '.agents | length') agents)"
+# 2. list round-trip (command path alive)
+if r="$(roundtrip '{"op":"list"}')"; then
+  if echo "$r" | jq -e '.ok == true and (.agents | type == "array")' >/dev/null 2>&1; then
+    pass "2 list round-trip ok ($(echo "$r" | jq '.agents | length') agents)"
+  else
+    fail "2 list: result not ok/agents[]: $r"
+  fi
+else
+  fail "2 list: $r"
+fi
 
 # 3. eval round-trip
-r="$(roundtrip '{"op":"eval","code":"return #cx.agents:list()"}')" || exit 1
-echo "$r" | jq -e --arg f "$EVAL_FIELD" '.ok == true and (.[$f] | type == "number")' >/dev/null \
-  || fail "eval result not ok with numeric .$EVAL_FIELD: $r"
-ok "eval round-trip ok (#cx.agents:list() = $(echo "$r" | jq --arg f "$EVAL_FIELD" '.[$f]'))"
+if r="$(roundtrip '{"op":"eval","code":"return #cx.agents:list()"}')"; then
+  if echo "$r" | jq -e --arg f "$EVAL_FIELD" '.ok == true and (.[$f] | type == "number")' >/dev/null 2>&1; then
+    pass "3 eval round-trip ok (#cx.agents:list() = $(echo "$r" | jq --arg f "$EVAL_FIELD" '.[$f]'))"
+  else
+    fail "3 eval: result not ok with numeric .$EVAL_FIELD: $r"
+  fi
+else
+  fail "3 eval: $r"
+fi
 
 # 4. no budget-exceeded line for this plugin since start. Tern writes `... exceeded its budget ... plugin="<id>" hook=...`,
-#    so the plugin id comes AFTER `exceeded`; match both orders.
+#    so the plugin id comes AFTER `exceeded`; match both orders. Runs last so it also covers checks 1-3.
 if [ -f "$LOG" ]; then
   now_lines="$(wc -l <"$LOG" | tr -d ' ')"
   from=$((LOG_START_LINES + 1))
   [ "$now_lines" -lt "$LOG_START_LINES" ] && from=1
   hit="$(tail -n +"$from" "$LOG" | grep -E "exceeded" | grep -F "$PLUGIN_ID" || true)"
-  [ -z "$hit" ] || fail "budget exceeded since start: $hit"
-  ok "no $PLUGIN_ID budget-exceeded lines since start"
+  if [ -z "$hit" ]; then
+    pass "4 no $PLUGIN_ID budget-exceeded lines since start"
+  else
+    fail "4 budget exceeded since start: $hit"
+  fi
 else
-  fail "tern log not found at $LOG"
+  fail "4 tern log not found at $LOG"
 fi
 
-echo "bridge-smoke: PASS"
+echo ""
+echo "bridge-smoke summary: ${#PASSED[@]} passed, ${#FAILED[@]} failed"
+if [ "${#FAILED[@]}" -eq 0 ]; then
+  echo "bridge-smoke: PASS"
+  exit 0
+fi
+for f in "${FAILED[@]}"; do echo "  FAIL - $f"; done
+{
+  echo "--- diagnostics ---"
+  echo "tick now: $(tick || echo '(unreadable)')"
+  echo "unconsumed requests:"
+  ls -1 "$CTRL/requests/" 2>/dev/null | grep '\.json$' || echo "  (none)"
+  echo "last $PLUGIN_ID budget/handler failure in tern.log (any time):"
+  grep -E "exceeded|handler failed" "$LOG" 2>/dev/null | grep -F "$PLUGIN_ID" | tail -n 2 || true
+  echo "tern.log tail:"
+  tail -n 15 "$LOG" 2>/dev/null || echo "  (no log at $LOG)"
+} >&2
+echo "bridge-smoke: FAIL"
+exit 1
