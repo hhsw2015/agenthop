@@ -85,7 +85,7 @@ import { writeConsoleProjection } from "../packages/bus/src/swarm/console-projec
 import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swarm/idle-explainer.js";
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
-import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
+import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
 import { modelMarketEnabled } from "../packages/bus/src/swarm/model-market.js";
 import { pullModelMarket } from "../packages/bus/src/swarm/model-market-store.js";
 import { modelStaffingEnabled, taskFromNode, type StaffingTaskInput } from "../packages/bus/src/swarm/model-staffing.js";
@@ -1943,14 +1943,16 @@ async function main(): Promise<void> {
     catch (e) { log(`carly sweep failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
-  // Tern bridge sweep (#1033): the swarm-side duties of agenthop-agents-bridge r7 — drive the mirror command every ~5s, re-arm the
-  // sentinel when agents.json's per-load `vm` changes, and on a POSITIVE stall (tick frozen >5s / request unconsumed >2s) run
+  // Tern bridge sweep (#1033): the swarm-side duties of agenthop-agents-bridge r7/r8 — drive the mirror command every ~5s (the ONLY
+  // live liveness guarantee: r8's timer chain stops itself when napped and only this command restarts it), run the r8 arm sequence
+  // (arm → arm-cancel… → arm-schedule, stop on any failed step) when agents.json's per-load `vm` changes, and on a POSITIVE stall (tick frozen >5s / request unconsumed >2s) run
   // reload → ready → arm → drain, debounced to one reload per 60s, one control-log line each. tern not answering ⇒ UNKNOWN ⇒ log only.
   // DEFAULT OFF via SWARM_TERN_BRIDGE. Uses TERN_BIN + per-call timeout. Never edits the bridge.
   const ternBridgeState = initialBridgeState();
   const ternBridgeIO = {
     tern: realTern(process.env),
     readMirror: realMirrorReader(HOME),
+    readSentinel: realSentinelReader(HOME),
     pendingRequests: realPendingRequests(HOME, () => Date.now()),
     nowMs: () => Date.now(),
     sleep: sleepSync,

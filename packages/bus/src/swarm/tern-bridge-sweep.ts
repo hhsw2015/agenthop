@@ -3,16 +3,22 @@
  * dispatcher sweep tail instead of by hand. Flag SWARM_TERN_BRIDGE, DEFAULT OFF. Reads the bridge's files; never edits the bridge.
  *
  * Per sweep tick (the sweep loop already runs every ~5s):
- *   ① drive: `tern ctl plugins run plugin.agenthop-agents-bridge.mirror` (the PRIMARY mirror driver; the bridge's timer chain is
- *      only a helper). Throttled to MIRROR_EVERY_MS.
- *   ② re-arm on reload: agents.json `vm` is a per-load random id. A vm we have not armed yet ⇒ one `…arm`.
+ *   ① drive: `tern ctl plugins run plugin.agenthop-agents-bridge.mirror` every MIRROR_EVERY_MS. This is the ONLY live liveness
+ *      guarantee: bridge r8 makes its timer chain stop itself when a callback is >400ms late (App Nap / background coalescing) and
+ *      report agents.json `timer`="stopped-late"; the next `mirror` COMMAND restarts it. So if this sweep stops, the mirror stops.
+ *   ② re-arm on reload: agents.json `vm` is a per-load random id. A vm we have not armed yet ⇒ the r8 arm SEQUENCE (below).
  *   ③ health: tick not advancing for > TICK_STALL_MS, or a request in requests/ older than REQ_STUCK_MS ⇒ recovery chain
- *      `tern plugin reload` → wait ready (agents.json tick/vm moves after a mirror) → `…arm` → `…drain` (+ `…drain-start` when the
+ *      `tern plugin reload` → wait ready (agents.json tick/vm moves after a mirror) → arm sequence → `…drain` (+ `…drain-start` when the
  *      stuck request is a start). Debounced: at most one reload per RELOAD_MIN_MS. Every reload writes one control-log line.
  *   ④ every tern call has a timeout and uses TERN_BIN.
  *   ⑤ FC-2 three-state: if tern is unavailable (spawn error, timeout, non-zero exit, socket refused) the tick is UNKNOWN: it logs one
  *      line and does NOTHING else. UNKNOWN is never read as "bridge dead" — reload is only ever triggered by a POSITIVE stall signal
  *      read from the bridge's own files while tern itself answered.
+ * Arm sequence (bridge r8 @f5b5ada splits arming so each hook makes ONE tern.carly call): `arm` (= arm-scan: lists prior patrols
+ *   into kv) → read sentinel.json step/pending_cancel → `arm-cancel` once per pending id until pending_cancel=0 → `arm-schedule` →
+ *   assert sentinel.json scheduled=true. Each step has its own tern timeout. Any step failing (tern UNKNOWN, unreadable status,
+ *   cancel not making progress, schedule refused) STOPS the sequence there — no half sequence is continued — and is logged to the
+ *   reload audit. The same definition is used by #1034's recovery chain.
  * Pure core + injected IO (tern runner, file reads, clock, log), so the whole call sequence is offline-testable.
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -27,6 +33,7 @@ export const REQ_STUCK_MS = 2_000;
 export const RELOAD_MIN_MS = 60_000;
 export const READY_WAIT_MS = 4_000;
 export const TERN_TIMEOUT_MS = 3_000;
+export const ARM_CANCEL_MAX = 64; // bound on arm-cancel iterations (a sentinel that never reaches 0 must not loop forever)
 
 /** SWARM_TERN_BRIDGE — DEFAULT OFF (opt-in). */
 export function ternBridgeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -42,8 +49,11 @@ export type TernRun = (args: string[]) => TernResult;
 export type Mirror = { tick: number; vm: string } | null;
 export type PendingReq = { name: string; ageMs: number };
 
+export type ArmStatus = { step: string | null; pendingCancel: number | null; scheduled: boolean; error: string | null } | null;
+
 export type BridgeIO = {
   tern: TernRun;
+  readSentinel: () => ArmStatus;         // sentinel.json, or null (absent/torn/unparseable)
   readMirror: () => Mirror;              // agents.json tick+vm, or null (absent/torn/unparseable)
   pendingRequests: () => PendingReq[];   // requests/*.json with their age
   nowMs: () => number;
@@ -64,7 +74,35 @@ export function initialBridgeState(): BridgeState {
   return { lastMirrorMs: -Infinity, armedVm: null, lastTick: null, lastTickChangeMs: -Infinity, lastReloadMs: -Infinity };
 }
 
-export type TickOutcome = "disabled" | "throttled" | "unknown" | "ok" | "rearmed" | "reloaded" | "reload-debounced" | "reload-failed";
+export type TickOutcome = "disabled" | "throttled" | "unknown" | "ok" | "rearmed" | "arm-failed" | "reloaded" | "reload-debounced"
+  | "reload-failed";
+
+/** The r8 arm sequence. ok=false ⇒ stopped at the named step (nothing after it ran). */
+export function armSequence(io: BridgeIO): { ok: boolean; detail: string } {
+  const stop = (where: string, why: string) => ({ ok: false, detail: `${where}: ${why}` });
+  const scan = run(io, "arm");
+  if (!scan.ok) return stop("arm(scan)", `tern ${scan.detail}`);
+  let s = io.readSentinel();
+  if (s === null || s.pendingCancel === null) return stop("arm(scan)", "sentinel.json unreadable or without pending_cancel");
+  if (s.error) return stop("arm(scan)", `bridge error: ${s.error}`);
+  let cancels = 0;
+  while (s.pendingCancel! > 0) {
+    if (cancels >= ARM_CANCEL_MAX) return stop("arm-cancel", `still ${s.pendingCancel} pending after ${cancels} cancels`);
+    const before = s.pendingCancel!;
+    const c = run(io, "arm-cancel");
+    if (!c.ok) return stop("arm-cancel", `tern ${c.detail}`);
+    cancels++;
+    s = io.readSentinel();
+    if (s === null || s.pendingCancel === null) return stop("arm-cancel", "sentinel.json unreadable or without pending_cancel");
+    if (s.pendingCancel >= before) return stop("arm-cancel", `no progress (pending_cancel ${before} -> ${s.pendingCancel})`);
+  }
+  const sch = run(io, "arm-schedule");
+  if (!sch.ok) return stop("arm-schedule", `tern ${sch.detail}`);
+  s = io.readSentinel();
+  if (s === null) return stop("arm-schedule", "sentinel.json unreadable");
+  if (!s.scheduled) return stop("arm-schedule", `scheduled=false step=${s.step}${s.error ? ` error=${s.error}` : ""}`);
+  return { ok: true, detail: `cancelled ${cancels}, scheduled` };
+}
 
 const run = (io: BridgeIO, action: string): TernResult => io.tern(["ctl", "plugins", "run", `${ACTION}.${action}`]);
 
@@ -100,10 +138,14 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
 
   // ② re-arm after a reload (new vm id) — once per vm.
   if (mirror.vm !== st.armedVm) {
-    const a = run(io, "arm");
-    if (!a.ok) { io.log(`tern-bridge: UNKNOWN on arm (${a.detail}) — will retry`); return "unknown"; }
+    const a = armSequence(io);
+    if (!a.ok) {
+      io.controlLog(`tern-bridge arm (vm ${mirror.vm}) stopped: ${a.detail}`);
+      io.log(`tern-bridge: arm stopped (${a.detail}) — will retry next tick`);
+      return "arm-failed";
+    }
     st.armedVm = mirror.vm;
-    io.log(`tern-bridge: armed sentinel for vm ${mirror.vm}`);
+    io.log(`tern-bridge: armed sentinel for vm ${mirror.vm} (${a.detail})`);
     return "rearmed";
   }
   return "ok";
@@ -136,12 +178,17 @@ function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]
     return "reload-failed";
   }
   const vm = io.readMirror()?.vm ?? null;
-  const armed = run(io, "arm").ok;
-  if (armed) st.armedVm = vm;
+  const armed = armSequence(io);
+  if (!armed.ok) {
+    // stop here: no drain after a half arm. Next tick's re-arm (vm != armedVm) retries the whole sequence.
+    io.controlLog(`tern-bridge reload (${why}): ready vm=${vm} arm STOPPED ${armed.detail} — drain not run`);
+    return "reload-failed";
+  }
+  st.armedVm = vm;
   const drained = run(io, "drain").ok;
   const startStuck = stuck.some((q) => /start/i.test(q.name));
   if (startStuck) run(io, "drain-start");
-  io.controlLog(`tern-bridge reload (${why}): ready vm=${vm} arm=${armed} drain=${drained}${startStuck ? " drain-start=sent" : ""}`);
+  io.controlLog(`tern-bridge reload (${why}): ready vm=${vm} arm=ok(${armed.detail}) drain=${drained}${startStuck ? " drain-start=sent" : ""}`);
   return "reloaded";
 }
 
@@ -165,6 +212,22 @@ export function realMirrorReader(home: string): () => Mirror {
     try {
       const d = JSON.parse(readFileSync(path.join(bridgeDir(home), "agents.json"), "utf8")) as { tick?: unknown; vm?: unknown };
       return typeof d.tick === "number" && typeof d.vm === "string" ? { tick: d.tick, vm: d.vm } : null;
+    } catch { return null; }
+  };
+}
+
+export function realSentinelReader(home: string): () => ArmStatus {
+  return () => {
+    try {
+      const d = JSON.parse(readFileSync(path.join(bridgeDir(home), "sentinel.json"), "utf8")) as Record<string, unknown>;
+      if (typeof d !== "object" || d === null) return null;
+      const pc = d.pending_cancel;
+      return {
+        step: typeof d.step === "string" ? d.step : null,
+        pendingCancel: typeof pc === "number" && Number.isInteger(pc) && pc >= 0 ? pc : null,
+        scheduled: d.scheduled === true,
+        error: typeof d.error === "string" ? d.error : null,
+      };
     } catch { return null; }
   };
 }
