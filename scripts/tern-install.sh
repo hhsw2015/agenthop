@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# tern-install.sh — idempotent installer for the two official swarm Tern plugins.
+# tern-install.sh — idempotent installer for the official swarm Tern plugin(s).
 #
 # Installs, in a FIXED SERIAL ORDER (never concurrently):
 #   1. agenthop-agents-bridge   (tern/agenthop-agents-bridge)
-#   2. agenthop-board           (tern/board)
+# tern/board is NOT a Tern plugin (standalone lua generator; Tern only views its md) and is not linked.
 #
 # Why serial: `tern plugin link` rewrites the shared plugins directory, so two links
 # running at once drop each other's plugin. This script links one plugin at a time and
@@ -30,8 +30,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TERN="${TERN_BIN:-tern}"
 
 # Fixed serial order. Index i pairs PLUGIN_IDS[i] with PLUGIN_DIRS[i].
-PLUGIN_IDS=(agenthop-agents-bridge agenthop-board)
-PLUGIN_DIRS=("$REPO_ROOT/tern/agenthop-agents-bridge" "$REPO_ROOT/tern/board")
+PLUGIN_IDS=(agenthop-agents-bridge)
+PLUGIN_DIRS=("$REPO_ROOT/tern/agenthop-agents-bridge")
 
 DRY=0
 for a in "${@:-}"; do
@@ -115,6 +115,16 @@ sys.exit(0 if (want in ids and not d.get("problems", [])) else 1)
 PY
 }
 
+# --- an existing link of $1 that points somewhere other than $2? prints that source and returns 0 ---
+# ponytail: only `tern plugin link` (<id>.path) is checked; an `install`ed copy has no recorded source and is taken as-is.
+foreign_link(){
+  local src
+  [ -f "$PLUGINS_DIR/$1.path" ] || return 1
+  src="$(cat "$PLUGINS_DIR/$1.path")"
+  [ "$src" = "$2" ] && return 1
+  printf '%s' "$src"
+}
+
 log "tern-install: plugins dir = $PLUGINS_DIR"
 report_auto_update
 
@@ -123,7 +133,9 @@ if [ "$DRY" -eq 1 ]; then
   for i in "${!PLUGIN_IDS[@]}"; do
     id="${PLUGIN_IDS[$i]}"; dir="${PLUGIN_DIRS[$i]}"
     [ -f "$dir/plugin.toml" ] || die "plugin source missing: $dir/plugin.toml"
-    if loaded_clean "$id"; then
+    if other="$(foreign_link "$id" "$dir")"; then
+      log "  [$((i+1))/${#PLUGIN_IDS[@]}] $id — LINKED FROM ANOTHER SOURCE ($other), real run WOULD STOP (unlink it first)"
+    elif loaded_clean "$id"; then
       log "  [$((i+1))/${#PLUGIN_IDS[@]}] $id — already loaded cleanly, WOULD SKIP"
     else
       log "  [$((i+1))/${#PLUGIN_IDS[@]}] $id — WOULD link $dir, then verify"
@@ -144,6 +156,9 @@ for i in "${!PLUGIN_IDS[@]}"; do
   id="${PLUGIN_IDS[$i]}"; dir="${PLUGIN_DIRS[$i]}"
   step="[$((i+1))/${#PLUGIN_IDS[@]}]"
   [ -f "$dir/plugin.toml" ] || die "$step plugin source missing: $dir/plugin.toml"
+  if other="$(foreign_link "$id" "$dir")"; then
+    die "$step $id is linked from $other, not $dir. Not re-pointing someone else's link; run \`tern plugin unlink $id\` first if that is intended."
+  fi
   if loaded_clean "$id"; then
     log "$step $id — already loaded cleanly, skipping (idempotent)."
     continue
@@ -154,4 +169,4 @@ for i in "${!PLUGIN_IDS[@]}"; do
   log "$step $id — linked and verified."
 done
 
-log "tern-install: done. Both plugins loaded and verified."
+log "tern-install: done. All plugins loaded and verified."
