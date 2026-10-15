@@ -40,6 +40,18 @@ frozen(){ echo '{"tick":2,"agents":[]}' >"$C/agents.json"; }
 # r4-style file with a vm id; reload() swaps vm and restarts tick from 1 (a reload, not a stall)
 start_ticker_vm(){ ( i=1; while :; do echo "{\"tick\":$i,\"vm\":\"$1\",\"tick_ms\":3,\"tick_ms_max\":9,\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 0.2; done ) & TICKER=$!; }
 run(){ OUT="$(TERN_BIN="$FAKE" BRIDGE_CTRL_DIR="$C" TERN_LOG="$L" TICK_WAIT=1 "$@" bash "$SMOKE" 2>&1)"; RC=$?; }
+# Deterministic state changes: the smoke (SMOKE_SNAP_MARK hook) creates $MARK.<n> right after its n-th agents.json read;
+# state k is written only after read k. Never a timer: a timer drifts against the smoke's own reads under load.
+after_first(){ # $@ = state k for k = 1..n: written right after the smoke's read k ($MARK.k), never on a timer
+  local MARK="$TMP/mark.$RANDOM"; rm -f "$MARK".*; export SMOKE_SNAP_MARK="$MARK"
+  ( k=0; for j in "$@"; do k=$((k + 1))
+      for _ in $(seq 1 200); do [ -e "$MARK.$k" ] && break; sleep 0.02; done
+      [ -e "$MARK.$k" ] || exit 0          # the smoke stopped reading earlier: later states are never written
+      echo "$j" >"$C/agents.json"
+    done ) &
+  TICKER=$!
+}
+done_identity(){ stop_ticker; unset SMOKE_SNAP_MARK; }
 
 bash -n "$SMOKE"; check "$([ $? -eq 0 ] && echo true)" "bash -n parses bridge-smoke.sh"
 
@@ -204,13 +216,11 @@ check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 4 kill window could not be read'
 
 # BSM-SV-P2-2: a reload followed by a freeze is NOT alive; a vm that keeps changing is not alive either
 : >"$L"; echo '{"tick":40,"vm":"old","agents":[]}' >"$C/agents.json"
-( sleep 0.3; echo '{"tick":1,"vm":"new","agents":[]}' >"$C/agents.json" ) & TICKER=$!
-run env
-stop_ticker
-check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 1 tick: reloaded (vm old -> new), re-baselined at 1; did not advance'* ]] && echo true)" "reload once then frozen (reload_once_frozen) => FAIL"
-: >"$L"; ( i=1; while :; do echo "{\"tick\":1,\"vm\":\"v$i\",\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 0.4; done ) & TICKER=$!
-run env
-stop_ticker
+after_first '{"tick":1,"vm":"new","agents":[]}'
+run env; done_identity
+check "$([ $RC -eq 1 ] && [[ "$OUT" =~ 'FAIL - 1 tick: reloaded (vm old -> new), re-baselined at '[0-9]+'; did not advance' ]] && echo true)" "reload once then frozen (reload_once_frozen) => FAIL"
+: >"$L"; echo '{"tick":1,"vm":"v1","agents":[]}' >"$C/agents.json"; after_first '{"tick":1,"vm":"v2","agents":[]}' '{"tick":1,"vm":"v3","agents":[]}'
+run env; done_identity
 check "$([ $RC -eq 1 ] && [[ "$OUT" == *'vm changed AGAIN'* ]] && echo true)" "vm keeps changing (reload loop) => FAIL"
 # r8 bridge: timer=stopped-late with a slow sweep is reported as by-design, not LOW
 : >"$L"; ( i=1; while :; do echo "{\"tick\":$i,\"vm\":\"z\",\"timer\":\"stopped-late\",\"agents\":[]}" >"$C/agents.json"; i=$((i+1)); sleep 1.5; done ) & TICKER=$!
@@ -327,15 +337,11 @@ PRIV="$TMP/privtmp"; mkdir -p "$PRIV"; : >"$L"; start_ticker; run env TMPDIR="$P
 check "$([ -z "$(ls -A "$PRIV")" ] && echo true)" "r9-3 no private temp file left behind (checked in our own TMPDIR)"
 
 # 4 (BSM-R8-P2-2 / BSM-VM-APPEARS): identity transitions. Deterministic: the smoke touches $MARK right after its FIRST
-#    snapshot (SMOKE_SNAP_MARK hook), and the fixture writes the next state only after that. r9's version slept 0.3 s
+#    snapshot (SMOKE_SNAP_MARK hook), and the fixture writes the next state only after that. r11: every read is
+#    numbered, and state k is written only after read k (r10 waited for the first read only, then wrote on a 1 s timer
+#    that drifted against the smoke's own 1 s reads). r9's version slept 0.3 s
 #    instead; if the smoke's first read came later than that (slow prerequisite under load), it saw the SECOND state as
 #    the first and reported "did not advance (100 -> 100)" instead of "identity unknown" — the 65/66 the main review saw.
-after_first(){ # $@ = writes, each "JSON" for one later snapshot window; waits for the mark, then writes them 1 s apart
-  local MARK="$TMP/mark.$RANDOM"; rm -f "$MARK"; export SMOKE_SNAP_MARK="$MARK"
-  ( for _ in $(seq 1 100); do [ -e "$MARK" ] && break; sleep 0.05; done; for j in "$@"; do echo "$j" >"$C/agents.json"; sleep 1; done ) &
-  TICKER=$!
-}
-done_identity(){ stop_ticker; unset SMOKE_SNAP_MARK; }
 # known vm, then a snapshot without vm => identity unknown
 : >"$L"; echo '{"tick":1,"vm":"old","agents":[]}' >"$C/agents.json"; after_first '{"tick":100,"agents":[]}'
 run env; done_identity
@@ -347,11 +353,11 @@ check "$([ $RC -eq 1 ] && [[ "$OUT" == *'identity unknown'*'no readable file'* ]
 # legacy -> vm appears once, then frozen => FAIL (was 4 PASS in r9: BSM-VM-APPEARS / legacy_to_known_frozen)
 : >"$L"; echo '{"tick":1,"agents":[]}' >"$C/agents.json"; after_first '{"tick":2,"vm":"new","agents":[]}'
 run env; done_identity
-check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 1 tick: vm new appeared (no vm before), re-baselined at 2; did not advance'* ]] && echo true)" "r10-4 legacy then vm appears then frozen => FAIL"
+check "$([ $RC -eq 1 ] && [[ "$OUT" =~ 'FAIL - 1 tick: vm new appeared (no vm before), re-baselined at '[0-9]+'; did not advance' ]] && echo true)" "r10-4 legacy then vm appears then frozen => FAIL"
 # legacy -> vm appears, then THAT vm advances => PASS, labelled as appeared + re-baselined
 : >"$L"; echo '{"tick":1,"agents":[]}' >"$C/agents.json"; after_first '{"tick":2,"vm":"new","agents":[]}' '{"tick":3,"vm":"new","agents":[]}' '{"tick":4,"vm":"new","agents":[]}'
 run env; done_identity
-check "$([ $RC -eq 0 ] && [[ "$OUT" == *'PASS - 1 tick vm new appeared (no vm before), re-baselined at 2; advances'*'vm new)'* ]] && echo true)" "r10-4 legacy then vm appears and advances => PASS on that vm"
+check "$([ $RC -eq 0 ] && [[ "$OUT" =~ 'PASS - 1 tick vm new appeared (no vm before), re-baselined at '([0-9]+)'; advances ('([0-9]+)' -> '([0-9]+) ]] && [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ] && [ "${BASH_REMATCH[3]}" -gt "${BASH_REMATCH[2]}" ] && [[ "$OUT" == *'vm new)'* ]] && echo true)" "r10-4 legacy then vm appears and advances => PASS: same vm moved past its own baseline"
 # legacy -> vm appears, then vm vanishes again => identity unknown
 : >"$L"; echo '{"tick":1,"agents":[]}' >"$C/agents.json"; after_first '{"tick":2,"vm":"new","agents":[]}' '{"tick":9,"agents":[]}'
 run env; done_identity
@@ -359,7 +365,7 @@ check "$([ $RC -eq 1 ] && [[ "$OUT" == *'identity unknown — vm new was seen af
 # known vm -> new vm (reload) -> frozen => FAIL (kept from r8)
 : >"$L"; echo '{"tick":40,"vm":"old","agents":[]}' >"$C/agents.json"; after_first '{"tick":1,"vm":"new","agents":[]}'
 run env; done_identity
-check "$([ $RC -eq 1 ] && [[ "$OUT" == *'reloaded (vm old -> new), re-baselined at 1; did not advance'* ]] && echo true)" "r10-4 known vm then reload then frozen => FAIL"
+check "$([ $RC -eq 1 ] && [[ "$OUT" =~ 'reloaded (vm old -> new), re-baselined at '[0-9]+'; did not advance' ]] && echo true)" "r10-4 known vm then reload then frozen => FAIL"
 # control: a legacy bridge that never shows a vm is compared by tick and labelled
 : >"$L"; start_ticker; run env; stop_ticker
 check "$([ $RC -eq 0 ] && [[ "$OUT" == *'legacy bridge (no vm field): tick-only comparison'* ]] && echo true)" "r10-4 control: never-vm legacy bridge => tick-only PASS, labelled legacy"

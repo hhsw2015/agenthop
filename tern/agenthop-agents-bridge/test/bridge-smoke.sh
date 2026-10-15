@@ -139,12 +139,15 @@ echo "ok   - plugin $PLUGIN_ID loaded"
 #     PASS needs that same vm to advance on a later snapshot.
 #   - once a vm is known, a snapshot without one (or an unreadable file) = identity unknown -> FAIL.
 #   - at most one re-baseline per run: a second vm change is a reload loop -> FAIL.
-# Hook for the offline gate only: when SMOKE_SNAP_MARK is set, the path is touched right after the first snapshot so
-# a fixture can change agents.json strictly AFTER it (no timing race). Unset in real use.
-read_snap(){ local l; l="$(snap)"; [ "$l" = ERR ] && { S_T=""; S_V="ERR"; S_TM="-"; return; }
+# Hook for the offline gate only: when SMOKE_SNAP_MARK is set, EVERY snapshot read creates "$SMOKE_SNAP_MARK.<n>"
+# (n = 1, 2, 3 ...) right after the read, so a fixture can write state n+1 strictly after read n and never race the
+# reads. Unset in real use.
+SNAP_N=0
+read_snap(){ local l; l="$(snap)"
+  SNAP_N=$((SNAP_N + 1)); [ -n "${SMOKE_SNAP_MARK:-}" ] && : >"$SMOKE_SNAP_MARK.$SNAP_N"
+  [ "$l" = ERR ] && { S_T=""; S_V="ERR"; S_TM="-"; return; }
   IFS=$'\t' read -r S_T S_V S_TM <<<"$l"; }
 read_snap; t0="$S_T"; v0="$S_V"
-[ -n "${SMOKE_SNAP_MARK:-}" ] && : >"$SMOKE_SNAP_MARK"
 reload_note=""; identity_err=""; rebased=0
 if [ "$v0" = ERR ] || ! [[ "$t0" =~ ^[0-9]+$ ]]; then
   fail "1 tick: agents.json unreadable or tick not a number (tick '$t0', vm '$v0')"
