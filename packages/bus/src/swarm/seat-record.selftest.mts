@@ -1,62 +1,54 @@
 /**
- * seat-record CAS selftest (#1033 r7, TBS-ORPHAN-GENERATION). Real files in a private home: versioned read-modify-write, a
- * concurrent publish between read and lock ⇒ conflict and the newer record survives, busy / dead lock, unknown carriers.
+ * Orphan marker over the shared seat-shell write path (#1033 r7b, TBS-ORPHAN-GENERATION). The marker writes ONLY through
+ * setWorkerState (tern-workers.ts, which runs inside
+ * updateSeatShell, seat-shell-record.ts — Platform Dev); this checks the marker side of the contract with real files:
+ *  - same instance (herdr_session + pane + started_at) ⇒ only that entry's state/stopped_at change; rev bumps;
+ *  - a re-published instance (the reviewer's case: read pane 111, another writer publishes pane 222) ⇒ nothing written;
+ *  - ruling A field scope: every other field of the entry and every other entry of workers[] is byte-identical;
+ *  - an unreadable record / missing workers ⇒ false, file untouched; a held lock ⇒ false (busy), file untouched.
  * Run: node_modules/.bin/tsx packages/bus/src/swarm/seat-record.selftest.mts  (from repo root)
  */
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, utimesSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { casSeatRecord, readSeatRecord, seatRecordFile, LOCK_STALE_MS } from "./seat-record.js";
 import { realMarkWorker } from "./tern-orphan-sweep.js";
+import { updateSeatShell, seatShellPath } from "./seat-shell-record.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
+const SID = "11111111-2222-4333-8444-555555555555";
 const home = () => { const h = mkdtempSync(path.join(os.tmpdir(), "seatrec-")); mkdirSync(path.join(h, ".agenthop", "swarm", "seat-shell"), { recursive: true }); return h; };
-const put = (h: string, sid: string, rec: unknown) => writeFileSync(seatRecordFile(h, sid), JSON.stringify(rec));
-const get = (h: string, sid: string) => JSON.parse(readFileSync(seatRecordFile(h, sid), "utf8"));
-const w = (pane: number, started: number, state = "live") => ({ name: "dev-x", herdr_session: "dev-x", pane, kind: "tui", started_at: started, stopped_at: null, state });
+const put = (h: string, rec: unknown) => writeFileSync(seatShellPath(h, SID), JSON.stringify(rec));
+const get = (h: string) => JSON.parse(readFileSync(seatShellPath(h, SID), "utf8"));
+const w = (name: string, pane: number, started: number, extra: Record<string, unknown> = {}) =>
+  ({ name, herdr_session: name, pane, kind: "tui", started_at: started, stopped_at: null, state: "live", ...extra });
 
-// --- basic versioned write ---
-{ const h = home(); put(h, "s1", { sid: "s1", shell: "tern" });
-  t("cas: ok on a record without rev", casSeatRecord(h, "s1", (c) => ({ ...c!, note: 1 })) === "ok");
-  t("cas: rev becomes 1", get(h, "s1").rev === 1 && get(h, "s1").note === 1 && get(h, "s1").shell === "tern");
-  t("cas: second write rev 2", casSeatRecord(h, "s1", (c) => ({ ...c!, note: 2 })) === "ok" && get(h, "s1").rev === 2);
-  t("cas: edit null => nochange, nothing written", casSeatRecord(h, "s1", () => null) === "nochange" && get(h, "s1").rev === 2);
-  t("cas: lock released", !existsSync(seatRecordFile(h, "s1") + ".lock"));
-  t("cas: no temp left", readdirSync(path.dirname(seatRecordFile(h, "s1"))).every((n) => !n.includes(".tmp-"))); }
+// same instance ⇒ only state/stopped_at of that one entry change
+{ const h = home();
+  put(h, { sid: SID, shell: "tern", pid: 42, rev: 3, workers: [w("dev-x", 111, 1, { cwd: "/w", note: "keep" }), w("dev-y", 333, 9)] });
+  const before = get(h);
+  t("marker: matching instance => true", realMarkWorker(h)(SID, "dev-x", { pane: 111, startedAt: 1 }, "orphan", 77) === true);
+  const a = get(h);
+  t("marker: that entry is orphan with stopped_at epoch ms", a.workers[0].state === "orphan" && a.workers[0].stopped_at === 77);
+  t("marker: rev bumped by the shared writer", a.rev === 4);
+  const { state: _s, stopped_at: _t, ...restA } = a.workers[0]; const { state: _s2, stopped_at: _t2, ...restB } = before.workers[0];
+  t("ruling A: every other field of the entry unchanged", JSON.stringify(restA) === JSON.stringify(restB));
+  t("ruling A: the other worker entry byte-identical", JSON.stringify(a.workers[1]) === JSON.stringify(before.workers[1]));
+  t("ruling A: top-level shell/pid unchanged, no new keys", a.shell === "tern" && a.pid === 42 && Object.keys(a).sort().join() === Object.keys(before).sort().join()); }
 
-// --- the reviewer's case: marker read pane 111, another writer publishes pane 222 before the marker commits ---
-{ const h = home(); put(h, "s2", { sid: "s2", shell: "tern", rev: 4, workers: [w(111, 1)] });
-  const r = casSeatRecord(h, "s2", (c) => ({ ...c!, workers: [{ ...w(111, 1), state: "orphan", stopped_at: 99 }] }), Date.now,
-    () => put(h, "s2", { sid: "s2", shell: "tern", rev: 5, workers: [w(222, 2)] })); // concurrent atomic publish
-  t("concurrent publish: CAS returns conflict", r === "conflict");
-  const after = get(h, "s2");
-  t("concurrent publish: the NEW live record survives (pane 222)", after.rev === 5 && after.workers.length === 1 && after.workers[0].pane === 222 && after.workers[0].state === "live");
-  t("concurrent publish: old pane 111 did not reappear as orphan", !JSON.stringify(after).includes("111")); }
+// the reviewer's case: another writer re-publishes the worker (pane 222) after the sweep saw pane 111
+{ const h = home();
+  put(h, { sid: SID, shell: "tern", rev: 4, workers: [w("dev-x", 111, 1)] });
+  // the other writer goes through the same locked path (as #1034 does)
+  t("other writer: publish pane 222", updateSeatShell(h, SID, (rec) => ({ ...rec, workers: [w("dev-x", 222, 2)] })).state === "ok");
+  const before = readFileSync(seatShellPath(h, SID), "utf8");
+  t("marker: stale instance (pane 111) => false", realMarkWorker(h)(SID, "dev-x", { pane: 111, startedAt: 1 }, "orphan", 78) === false);
+  t("marker: new live record survives byte-identical", readFileSync(seatShellPath(h, SID), "utf8") === before);
+  t("marker: old pane 111 did not reappear", get(h).workers.every((x: { pane: number }) => x.pane !== 111)); }
 
-// --- the real marker goes through the CAS ---
-{ const h = home(); put(h, "s3", { sid: "s3", shell: "tern", rev: 1, workers: [w(111, 1)] });
-  t("marker: same instance marked orphan", realMarkWorker(h)("s3", "dev-x", { pane: 111, startedAt: 1 }, "orphan", 77) === true);
-  const a = get(h, "s3");
-  t("marker: state orphan, stopped_at epoch ms, rev bumped", a.workers[0].state === "orphan" && a.workers[0].stopped_at === 77 && a.rev === 2);
-  put(h, "s3", { sid: "s3", shell: "tern", rev: 3, workers: [w(222, 2)] });
-  t("marker: a newer instance is not touched (false, record unchanged)", realMarkWorker(h)("s3", "dev-x", { pane: 111, startedAt: 1 }, "orphan", 78) === false && get(h, "s3").workers[0].pane === 222 && get(h, "s3").rev === 3); }
-
-// --- locks ---
-{ const h = home(); put(h, "s4", { sid: "s4", rev: 1 });
-  writeFileSync(seatRecordFile(h, "s4") + ".lock", `${process.pid} ${Date.now()}\n`);
-  t("lock: held by a live writer => conflict, record untouched", casSeatRecord(h, "s4", (c) => ({ ...c!, x: 1 })) === "conflict" && get(h, "s4").x === undefined);
-  const lf = seatRecordFile(h, "s4") + ".lock"; const old = (Date.now() - LOCK_STALE_MS - 5000) / 1000; utimesSync(lf, old, old);
-  t("lock: older than 10s is dead => taken over, write ok", casSeatRecord(h, "s4", (c) => ({ ...c!, x: 1 })) === "ok" && get(h, "s4").x === 1);
-  t("lock: removed after the takeover write", !existsSync(lf)); }
-
-// --- unknown carriers are never overwritten ---
-{ const h = home(); writeFileSync(seatRecordFile(h, "s5"), "{torn");
-  t("unknown: torn record => unknown, untouched", casSeatRecord(h, "s5", () => ({ a: 1 })) === "unknown" && readFileSync(seatRecordFile(h, "s5"), "utf8") === "{torn");
-  put(h, "s6", [1, 2]); t("unknown: array record => unknown", casSeatRecord(h, "s6", () => ({ a: 1 })) === "unknown");
-  put(h, "s7", { rev: "3" }); t("unknown: non-integer rev => unknown", readSeatRecord(seatRecordFile(h, "s7")) === "unknown");
-  t("unknown: bad sid => unknown", casSeatRecord(h, "../x", () => ({ a: 1 })) === "unknown"); }
-
-// --- absent record: create with rev 1 ---
-{ const h = home(); t("absent: create => ok rev 1", casSeatRecord(h, "s8", (c) => (c === null ? { sid: "s8", shell: "tern" } : null)) === "ok" && get(h, "s8").rev === 1); }
+// unreadable / missing workers / held lock ⇒ false, untouched
+{ const h = home(); writeFileSync(seatShellPath(h, SID), "{torn");
+  t("unreadable record => false, untouched", realMarkWorker(h)(SID, "dev-x", { pane: 1, startedAt: 1 }, "orphan", 1) === false && readFileSync(seatShellPath(h, SID), "utf8") === "{torn"); }
+{ const h = home(); put(h, { sid: SID, shell: "tern", rev: 1 });
+  t("no workers field => false, nothing written", realMarkWorker(h)(SID, "dev-x", { pane: 1, startedAt: 1 }, "orphan", 1) === false && get(h).rev === 1); }
 
 console.log("PASS seat-record");

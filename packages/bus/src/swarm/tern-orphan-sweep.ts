@@ -20,7 +20,7 @@
 import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { casSeatRecord } from "./seat-record.js";
+import { setWorkerState } from "../tern-workers.js";
 
 export const ORPHAN_EVERY_MS = 60_000;
 export const TMP_TTL_MS = 3_600_000;
@@ -152,19 +152,20 @@ export function realSeatRecords(home: string): () => SeatRecord[] | null {
   };
 }
 
-/** Mark one worker instance orphan through the shared versioned CAS (seat-record.ts, coordinator ruling #1033 r7): the instance
- *  check and the write happen against the SAME rev under the record lock, so a record another writer published meanwhile (e.g. a
- *  restarted worker under the same name) is never overwritten — the CAS returns conflict and this round does nothing. */
+/** Mark one worker instance orphan through Platform Dev's setWorkerState (tern-workers.ts, @6016b1d; coordinator ruling A):
+ *  it runs inside the shared locked writer updateSeatShell and changes state + stopped_at on exactly the entry matching
+ *  herdr_session + pane + started_at, nothing else. An instance that is no longer recorded (re-published with a new pane /
+ *  started_at, or removed), a busy lock, or an unreadable record makes it throw and write nothing ⇒ false (FC-2: not marked). */
 export function realMarkWorker(home: string): OrphanIO["markWorker"] {
   return (sid, hs, inst, state, stoppedAt) => {
-    let hit = false;
-    const r = casSeatRecord(home, sid, (cur) => {
-      if (cur === null || !Array.isArray(cur.workers)) return null;
-      const same = (w: Worker) => w.herdr_session === hs && w.pane === inst.pane && JSON.stringify(w.started_at ?? null) === JSON.stringify(inst.startedAt ?? null);
-      const workers = (cur.workers as Worker[]).map((w) => (same(w) ? (hit = true, { ...w, state, stopped_at: stoppedAt }) : w)); // epoch ms
-      return hit ? { ...cur, workers } : null;
-    });
-    return r === "ok";
+    if (typeof inst.startedAt !== "number") return false; // the pinned schema has numeric started_at; anything else cannot match
+    try {
+      setWorkerState(home, sid, { name: hs, herdr_session: hs, pane: inst.pane, kind: "tui", started_at: inst.startedAt,
+        stopped_at: null, state: "live" }, state, stoppedAt);
+      return true;
+    } catch {
+      return false;
+    }
   };
 }
 
