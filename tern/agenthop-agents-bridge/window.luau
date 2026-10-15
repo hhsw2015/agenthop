@@ -41,9 +41,15 @@ local timerDue = nil -- monotonic ms the next timer callback is due (nil = no ch
 -- callback is past due by more than TIMER_LATE_MS, the accelerator is "overdue" (stalled or napped); the 5s command sweep is the only
 -- liveness source and keeps ticking regardless.
 local TIMER_LATE_MS = 400
+-- r11: monotonic ms of the last timer callback that REALLY arrived (nil = never since load), published as timer_fired_at so "never
+-- delivered" is readable directly. agents.json is only rewritten by a tick, so once callbacks stop the file freezes with whatever the
+-- last write said (often "running", written by the mirror command that just restarted the chain); timer_fired_at is the field that
+-- does not lie. The timerDue == nil branch is defensive: mirrorTimer always records the due time before arming.
+local timerFiredAt = nil
 local function timerReport()
-  if timerState == "running" and timerDue ~= nil and tern.now() - timerDue > TIMER_LATE_MS then return "overdue" end
-  return timerState
+  if timerState ~= "running" then return timerState end
+  if timerDue == nil or tern.now() - timerDue > TIMER_LATE_MS then return "overdue" end
+  return "running"
 end
 -- r6 CHEAP SOURCE (coordinator's live split timing, clean VM): cx.agents:list() costs ~28ms (8 agents; cross-session aggregation +
 -- last_message text) and tern.json.encode of its result another ~25ms (18 KB) — together the 40-50ms+ tick that killed every hook in
@@ -85,6 +91,7 @@ local function mirror(cx)
     tick_ms = lastMs, -- cost of the previous COMPLETED tick
     tick_ms_max = maxMs,
     timer = timerReport(), -- #1036: "running" | "stopped-late" | "overdue" (see timerReport); the command sweep is the liveness source
+    timer_fired_at = timerFiredAt, -- r11: tern.now() of the last delivered timer callback; absent = never delivered since load
     phase_ms = lastPhase, -- previous completed tick's cumulative ms per segment
     agents = (#agents > 0) and agents or tern.json.array({}),
     error = (not ok) and tostring(panes) or nil,
@@ -272,7 +279,7 @@ local function mirrorTimer(cx)
     return
   end
   timerDue = now + POLL_MS
-  tern.timer(POLL_MS, function(nextCx) mirrorTimer(nextCx) end)
+  tern.timer(POLL_MS, function(nextCx) timerFiredAt = tern.now(); mirrorTimer(nextCx) end)
   if cx ~= nil then mirrorTick(cx) end
 end
 

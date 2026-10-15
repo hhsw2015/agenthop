@@ -182,6 +182,7 @@ ck("r4: first mirror timer tick makes NO tern.carly.* call and ticks (tick 1)", 
 ck("r4: the timer chain renews itself (successor timer queued)", #timers == 1)
 pumpMirror()
 ck("r4: later mirror timer ticks still make NO tern.carly.* call", carlyCalls == 0)
+ck("r11: after delivered callbacks agents.json carries timer_fired_at (a number)", tonumber((files[AGENTS] or ""):match('"timer_fired_at":([%d%.]+)')) ~= nil)
 -- #1036 ②: arm is three commands, ONE tern.carly call per hook (11:36:16 live: three calls in one hook crossed 50ms)
 local function carlyDelta(fn) local c0 = carlyCalls; fn(); return carlyCalls - c0 end
 local SENT = "/h/.agenthop/tern-panes/sentinel.json"
@@ -333,6 +334,15 @@ ck("r9: that sweep restarts the accelerator (a new chain is pending)", #timers =
 for i = #timers - 1, 1, -1 do table.remove(timers, i) end -- the stalled callback never fires; keep only the fresh one
 commands["mirror"](cx)
 ck("r9: after the restart the next sweep reports running again", (files[AGENTS] or ""):find('"timer":"running"', 1, true) ~= nil)
+
+-- ---- r11 (live 13:17, coordinator): a chain whose callbacks stop arriving. agents.json is rewritten ONLY by a tick, so between
+-- sweeps a frozen file keeps whatever it last said; timer_fired_at (the last REAL delivery) is what tells "never/no longer delivered".
+for i = #timers, 1, -1 do table.remove(timers, i) end -- every pending callback is lost (never delivered)
+local firedBefore = (files[AGENTS] or ""):match('"timer_fired_at":([%d%.]+)')
+clock = clock + 5000
+commands["mirror"](cx)
+ck("r11: callbacks lost ⇒ the sweep's mirror reports timer=overdue", (files[AGENTS] or ""):find('"timer":"overdue"', 1, true) ~= nil)
+ck("r11: an undelivered callback never moves timer_fired_at", (files[AGENTS] or ""):match('"timer_fired_at":([%d%.]+)') == firedBefore)
 
 -- ---- BTF-SV-P2-1: classify by DECODED top-level op (escaped key / escaped value / nested field) + plain controls ----
 for k in pairs(requests) do requests[k] = nil end

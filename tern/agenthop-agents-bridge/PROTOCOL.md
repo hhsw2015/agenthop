@@ -20,7 +20,7 @@ $HOME/.agenthop/tern-panes/
 桥每 `POLL_MS`(默认 750ms)写一次:
 
 ```json
-{"ts":<number>,"tick":<number>,"vm":"<per-load id>","window":"<TERN_WINDOW_KEY?>","tick_ms":<number?>,"tick_ms_max":<number>,"agents":[<AgentBlock>...],"error":<string?>}
+{"ts":<number>,"tick":<number>,"vm":"<per-load id>","window":"<TERN_WINDOW_KEY?>","tick_ms":<number?>,"tick_ms_max":<number>,"timer":"running|stopped-late|overdue","timer_fired_at":<number?>,"agents":[<AgentBlock>...],"error":<string?>}
 ```
 
 - `agents` = **r6 起由 `cx.session:panes()` 过滤 `kind=="agent"` 自建**(不再调 `cx.agents:list()`):每项 `pane title cwd tab program busy at_prompt exited alert parked alive`(`alive` = `exited==nil`)。协调者现网分段计时:`agents:list()` ~28ms + 对其 encode ~25ms ⇒ tick 40-50ms+(r1-r4 每个 hook 都被杀的真因);`session:panes()` ~0.17ms。`model`/`state`/`last_message` 不在 PaneInfo 上,tick 里不再有;需要完整字段走 `list` op(请求面,不在 tick 里)。目标 <2KB、<3ms/tick。
@@ -28,6 +28,7 @@ $HOME/.agenthop/tern-panes/
 - 手动/主驱动刷新:`tern ctl plugins run plugin.agenthop-agents-bridge.mirror`(独立 hook)。
 - `tick` 单调自增 = 存活信号(不前进 = 该 VM 的 mirror 停了)。r4:`vm` 每次加载/reload 变的随机 id、`window`=`TERN_WINDOW_KEY`——多窗口覆盖写同一文件时可分辨是哪个 VM 在走(一死一活不再看起来「还在走」);`tick_ms`=上一 tick 耗时(ms,本 tick 的写入无法含自身)、`tick_ms_max`=本 VM 迄今最大值——>50ms 尾部在文件里可观测,不必事后翻 tern.log。
 - r4 驱动:**主=`mirror` 命令**(独立 hook,蜂群 sweep 每 ~5s `tern ctl plugins run plugin.agenthop-agents-bridge.mirror`);**辅=`tern.timer` 自续链**(timer hook,非 await;先续后干;若 timer hook 被禁则链停,活性由命令驱动独撑)。await hook 不再使用。
+- r11 `timer_fired_at` = 最后一次**真实投递**的 timer 回调的 `tern.now()`(缺省 = 本次加载以来从未投递)。**读者规则**:`agents.json` 只在 tick 时重写,timer 回调不再来时文件就停在最后一次写入的样子——那一次常是 `mirror` 命令刚重启链时写的 `"timer":"running"`(协调者 13:17 现网所见:tick 32→32 而 `timer` 恒 running)。所以 `timer` 字只描述**写入那一刻**;判断加速器是否在投递,看 `ts - timer_fired_at`(同一时钟)与文件 mtime,不看一个冻住文件里的 `timer` 字。活性唯一来源仍是 #1033 的 5s `mirror` 命令扫。
 - **语义 = advisory 快照,覆盖写(at-least-once 读面)**。被 torn-read 到的半截文件,下一轮(≤POLL_MS)自愈。**它不是耐久义务**,蜂群的 durable 账本才是真理源。
 - 多 window 各跑一份 window-half ⇒ 多个 mirror 覆盖同一文件;对状态镜幂等无害(同一全局视图)。
 
