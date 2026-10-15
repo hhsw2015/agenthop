@@ -63,6 +63,9 @@ export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; u
   const g = io.gc();
   if (g.code !== 0) io.log(`orphan-sweep: gc UNKNOWN (${g.line})`);
   else if (/=[1-9]/.test(g.line)) io.audit(`orphan-sweep ${g.line}`); // audit only when gc actually removed/moved something
+  // r13: `skipped=<dir>(why),...` = a managed subdir was a symlink / outside the control dir and was NOT cleaned — an anomaly
+  const skipped = g.code === 0 ? /\bskipped=(\S+)/.exec(g.line) : null;
+  if (skipped) io.log(`orphan-sweep: gc anomaly — not cleaned: ${skipped[1]}`);
   for (const f of io.tmpFiles()) {
     if (f.ageMs > TMP_TTL_MS && io.removeTmp(f.name)) io.audit(`orphan-sweep removed stale ${f.name} (${Math.round(f.ageMs / 60000)}min)`);
   }

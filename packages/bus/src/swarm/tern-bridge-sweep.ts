@@ -41,12 +41,22 @@ export function ternBridgeEnabled(env: NodeJS.ProcessEnv = process.env): boolean
 
 export function bridgeDir(home: string): string { return path.join(home, ".agenthop", "tern-panes"); }
 
+/** TBS-CONTROL-ROOT: the home the BRIDGE writes under. window.luau always uses the OS home Tern runs in ($HOME/.agenthop/
+ *  tern-panes) and never reads AH_HOME, so the dispatcher's AH_HOME (swarm state) must NOT be used for bridge files.
+ *  AGENTHOP_BRIDGE_HOME is the one explicit override (tests / a non-default install). */
+export function bridgeHome(env: NodeJS.ProcessEnv, osHome: string): string {
+  return env.AGENTHOP_BRIDGE_HOME || osHome;
+}
+
 /** One tern call's outcome. ok=false ⇒ tern itself did not answer (UNKNOWN), not a bridge verdict. */
 export type TernResult = { ok: boolean; detail: string };
 export type TernRun = (args: string[]) => TernResult;
 
 export type Mirror = { tick: number; vm: string } | null;
-export type PendingReq = { name: string; ageMs: number };
+/** A request file waiting in requests/. `isStart` comes from the DECODED top-level `op` (same rule as the bridge's drain since r8),
+ *  never from the file name or a text peek: `{"op":"st\u0061rt"}` is a start, `{"op":"list","meta":{"op":"start"}}` is not. An
+ *  undecodable file is not a start (the fast drain owns and reports it). */
+export type PendingReq = { name: string; ageMs: number; isStart: boolean };
 
 /** sentinel.json as bridge r9 (@613e691) writes it. `count`/`ids` only on step "scanned"; null fields = absent/invalid. */
 export type ArmStatus = { step: string | null; count: number | null; ids: number[] | null; id: number | null; error: string | null } | null;
@@ -71,9 +81,12 @@ export type BridgeState = {
   lastTick: number | null;
   lastTickChangeMs: number;
   lastReloadMs: number;
+  /** TBS-ARM-RETRY: a reload that succeeded but whose arm (and therefore drain) did not complete. The obligation is kept here and
+   *  retried EVERY tick — independent of the 60s reload debounce, so finishing a reload never waits for (or causes) another one. */
+  owedAfterReload: { vm: string | null; why: string; startStuck: boolean } | null;
 };
 export function initialBridgeState(): BridgeState {
-  return { lastMirrorMs: -Infinity, armedVm: null, lastTick: null, lastTickChangeMs: -Infinity, lastReloadMs: -Infinity };
+  return { lastMirrorMs: -Infinity, armedVm: null, lastTick: null, lastTickChangeMs: -Infinity, lastReloadMs: -Infinity, owedAfterReload: null };
 }
 
 export type TickOutcome = "disabled" | "throttled" | "unknown" | "ok" | "rearmed" | "arm-failed" | "reloaded" | "reload-debounced"
@@ -149,6 +162,9 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
   if (mirror.tick !== st.lastTick) { st.lastTick = mirror.tick; st.lastTickChangeMs = now; }
   if (st.lastTickChangeMs === -Infinity) st.lastTickChangeMs = now; // first observation starts the stall clock
 
+  // owed work from an earlier successful reload (arm → drain) comes first, before any new reload decision
+  if (st.owedAfterReload !== null) return finishAfterReload(st, io, mirror.vm);
+
   // ③ health first: a positive stall signal from the bridge's own files (tern answered, so this is not UNKNOWN).
   const stuck = io.pendingRequests().filter((r) => r.ageMs > REQ_STUCK_MS);
   const tickStalled = now - st.lastTickChangeMs > TICK_STALL_MS;
@@ -203,19 +219,26 @@ function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]
     io.controlLog(`tern-bridge reload (${why}): reloaded but not ready within ${READY_WAIT_MS}ms`);
     return "reload-failed";
   }
-  const vm = io.readMirror()?.vm ?? null;
+  st.owedAfterReload = { vm: io.readMirror()?.vm ?? null, why, startStuck: stuck.some((q) => q.isStart) };
+  const out = finishAfterReload(st, io, st.owedAfterReload.vm);
+  return out === "rearmed" ? "reloaded" : out;
+}
+
+/** The post-reload obligation: arm sequence, then drain (+drain-start). A stopped arm keeps the obligation (no drain after a half
+ *  arm) and is retried on the next tick WITHOUT another reload. Discharged only when arm completed and the drain trigger was sent. */
+function finishAfterReload(st: BridgeState, io: BridgeIO, vm: string | null): TickOutcome {
+  const owed = st.owedAfterReload!;
   const armed = armSequence(io);
   if (!armed.ok) {
-    // stop here: no drain after a half arm. Next tick's re-arm (vm != armedVm) retries the whole sequence.
-    io.controlLog(`tern-bridge reload (${why}): ready vm=${vm} arm STOPPED ${armed.detail} — drain not run`);
+    io.controlLog(`tern-bridge reload (${owed.why}): ready vm=${vm} arm STOPPED ${armed.detail} — drain not run (retry next tick, no reload)`);
     return "reload-failed";
   }
   st.armedVm = vm;
   const drained = run(io, "drain").ok;
-  const startStuck = stuck.some((q) => /start/i.test(q.name));
-  if (startStuck) run(io, "drain-start");
-  io.controlLog(`tern-bridge reload (${why}): ready vm=${vm} arm=ok(${armed.detail}) drain=${drained}${startStuck ? " drain-start=sent" : ""}`);
-  return "reloaded";
+  if (owed.startStuck) run(io, "drain-start");
+  st.owedAfterReload = null;
+  io.controlLog(`tern-bridge reload (${owed.why}): ready vm=${vm} arm=ok(${armed.detail}) drain=${drained}${owed.startStuck ? " drain-start=sent" : ""}`);
+  return "rearmed";
 }
 
 // ---------------- real IO (dispatcher wiring) ----------------
@@ -274,8 +297,12 @@ export function realPendingRequests(home: string, nowMs: () => number): () => Pe
     for (const n of names) {
       try {
         const raw = readFileSync(path.join(dir, n), "utf8");
-        const isStart = /"op"\s*:\s*"start"/.test(raw);
-        out.push({ name: isStart ? `${n}#start` : n, ageMs: nowMs() - statSync(path.join(dir, n)).mtimeMs });
+        let isStart = false;
+        try {
+          const d = JSON.parse(raw) as unknown;
+          isStart = typeof d === "object" && d !== null && !Array.isArray(d) && (d as { op?: unknown }).op === "start";
+        } catch { isStart = false; }
+        out.push({ name: n, ageMs: nowMs() - statSync(path.join(dir, n)).mtimeMs, isStart });
       } catch { /* claimed meanwhile: not pending */ }
     }
     return out;

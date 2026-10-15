@@ -86,7 +86,7 @@ import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swa
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
-import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
+import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, bridgeHome, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
 import { modelMarketEnabled } from "../packages/bus/src/swarm/model-market.js";
 import { pullModelMarket } from "../packages/bus/src/swarm/model-market-store.js";
 import { modelStaffingEnabled, taskFromNode, type StaffingTaskInput } from "../packages/bus/src/swarm/model-staffing.js";
@@ -1950,13 +1950,17 @@ async function main(): Promise<void> {
   // reload → ready → arm → drain, debounced to one reload per 60s, one control-log line each. tern not answering ⇒ UNKNOWN ⇒ log only.
   // DEFAULT OFF via SWARM_TERN_BRIDGE. Uses TERN_BIN + per-call timeout. Never edits the bridge.
   const ternBridgeState = initialBridgeState();
+  // TBS-CONTROL-ROOT: the bridge (window.luau) always writes under the OS home it runs in — $HOME/.agenthop/tern-panes — and never
+  // reads AH_HOME. So the bridge's control files are read from BRIDGE_HOME (OS home; AGENTHOP_BRIDGE_HOME overrides, for tests /
+  // a non-default install), while the swarm's own state (seat-shell records, the reload audit) stays under AH_HOME.
+  const BRIDGE_HOME = bridgeHome(process.env, homedir());
   const ternBridgeIO = {
     tern: realTern(process.env),
-    readMirror: realMirrorReader(HOME),
-    readSentinel: realSentinelReader(HOME),
-    clearSentinel: realClearSentinel(HOME),
+    readMirror: realMirrorReader(BRIDGE_HOME),
+    readSentinel: realSentinelReader(BRIDGE_HOME),
+    clearSentinel: realClearSentinel(BRIDGE_HOME),
     schedule: realScheduler(process.env, process.env.AGENTHOP_BRIDGE_DIR || path.join(SCRIPTS_DIR, "..", "tern", "agenthop-agents-bridge")),
-    pendingRequests: realPendingRequests(HOME, () => Date.now()),
+    pendingRequests: realPendingRequests(BRIDGE_HOME, () => Date.now()),
     nowMs: () => Date.now(),
     sleep: sleepSync,
     log,
@@ -1979,8 +1983,8 @@ async function main(): Promise<void> {
   };
   const orphanIO = {
     seatRecords: realSeatRecords(HOME), herdrSessions: herdr.sessions, ternBlocks: realTernBlocks(ternLs),
-    herdrStop: herdr.stop, herdrDelete: herdr.del, markWorker: realMarkWorker(HOME), gc: realGc(process.env, bridgeDirPath),
-    ...realTmpFiles(HOME, () => Date.now()), nowMs: () => Date.now(), log, audit: ternBridgeIO.controlLog,
+    herdrStop: herdr.stop, herdrDelete: herdr.del, markWorker: realMarkWorker(HOME), gc: realGc({ ...process.env, AGENTHOP_TERN_PANES: path.join(BRIDGE_HOME, ".agenthop", "tern-panes") }, bridgeDirPath),
+    ...realTmpFiles(BRIDGE_HOME, () => Date.now()), nowMs: () => Date.now(), log, audit: ternBridgeIO.controlLog,
   };
   const runTernBridgeStep = (): void => {
     if (!ternBridgeEnabled()) return;

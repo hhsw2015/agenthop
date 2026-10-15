@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realSentinelReader, realClearSentinel,
+  ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realSentinelReader, realClearSentinel, realPendingRequests, bridgeHome,
   armSequence, ACTION, RELOAD_MIN_MS,
   type BridgeIO, type Mirror, type PendingReq, type TernResult, type ArmStatus,
 } from "./tern-bridge-sweep.js";
@@ -130,11 +130,11 @@ t("flag: on with 1", ternBridgeEnabled({ SWARM_TERN_BRIDGE: "1" }) === true);
   const w = world(); const st = initialBridgeState(); const b = io(w);
   tick(st, b);
   w.onReload = () => { w.mirror = { tick: 1, vm: "vmD" }; };
-  w.reqs = [{ name: "r1.json#start", ageMs: 2500 }];
+  w.reqs = [{ name: "r1.json", ageMs: 2500, isStart: true }];
   w.clock += 5000; w.calls = [];
   t("stuck request ⇒ reloaded", tick(st, b) === "reloaded");
   t("stuck start ⇒ drain-start sent", has(w, ".drain-start"));
-  w.reqs = [{ name: "r2.json", ageMs: 1500 }];
+  w.reqs = [{ name: "r2.json", ageMs: 1500, isStart: false }];
   w.clock += RELOAD_MIN_MS + 1; w.calls = [];
   t("young request (<2s) ⇒ no reload", tick(st, b) !== "reloaded" && reloads(w) === 0);
 }
@@ -214,11 +214,59 @@ const onAct = (b: BridgeIO, act: string, f: () => void) => { const rr = b.tern; 
   t("sentinel reader: torn => null", realSentinelReader(home)() === null);
 }
 
+// --- r5: TBS-ARM-RETRY — same stuck request, first arm fails after a good reload, next tick finishes WITHOUT another reload ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b); // armed vmA
+  w.onReload = () => { w.mirror = { tick: 1, vm: "vmR" }; };
+  w.reqs = [{ name: "stuck.json", ageMs: 3000, isStart: false }];
+  w.patrols = []; w.scheduleCode = 1; w.clock += 5000; w.calls = [];
+  t("arm-retry: first tick reloads, arm stops, no drain", tick(st, b) === "reload-failed" && reloads(w) === 1 && !has(w, ".drain"));
+  w.scheduleCode = undefined; w.clock += 5000; w.calls = [];
+  const out = tick(st, b);
+  t("arm-retry: next tick (request still there, inside 60s) finishes arm + drain", out === "rearmed" && has(w, ".drain") && w.patrols.length === 1);
+  t("arm-retry: no second reload", reloads(w) === 0);
+  w.reqs = []; w.clock += 5000; w.calls = [];
+  t("arm-retry: obligation discharged afterwards", tick(st, b) === "ok" && !has(w, ".drain"));
+}
+
+// --- r5: TBS-REQUEST-CLASS — start classification comes from the decoded top-level op ---
+{
+  const home = mkdtempSync(path.join(os.tmpdir(), "ternbridge-req-")); const rq = path.join(home, ".agenthop", "tern-panes", "requests");
+  mkdirSync(rq, { recursive: true });
+  const files: Record<string, string> = {
+    "a.json": '{"op":"st\\u0061rt","prompt":"x"}',
+    "b.json": '{"\\u006fp":"start"}',
+    "c.json": '{"op":"list","meta":{"op":"start"}}',
+    "d.json": '{"op":"list"}',
+    "e.json": '{torn',
+  };
+  for (const [n, body] of Object.entries(files)) writeFileSync(path.join(rq, n), body);
+  const got = Object.fromEntries(realPendingRequests(home, () => Date.now())().map((r) => [r.name, r.isStart]));
+  t("request class: escaped \\u0061 'start' is a start", got["a.json"] === true);
+  t("request class: escaped key \\u006fp is a start", got["b.json"] === true);
+  t("request class: nested op:start is NOT a start", got["c.json"] === false);
+  t("request class: list is not a start", got["d.json"] === false);
+  t("request class: undecodable is not a start", got["e.json"] === false);
+  t("request class: file names unchanged (no #start suffix)", Object.keys(got).sort().join() === "a.json,b.json,c.json,d.json,e.json");
+}
+
+// --- r5: TBS-CONTROL-ROOT — AH_HOME (swarm state) never redirects the bridge's control files ---
+t("control root: AH_HOME set, no override => OS home", bridgeHome({ AH_HOME: "/tmp/swarm-state" }, "/Users/u") === "/Users/u");
+t("control root: explicit AGENTHOP_BRIDGE_HOME wins", bridgeHome({ AH_HOME: "/tmp/swarm-state", AGENTHOP_BRIDGE_HOME: "/tmp/b" }, "/Users/u") === "/tmp/b");
+{ // and the readers actually observe the bridge root, not AH_HOME
+  const osHome = mkdtempSync(path.join(os.tmpdir(), "osh-")); const ahHome = mkdtempSync(path.join(os.tmpdir(), "ah-"));
+  mkdirSync(path.join(osHome, ".agenthop", "tern-panes"), { recursive: true });
+  writeFileSync(path.join(osHome, ".agenthop", "tern-panes", "sentinel.json"), JSON.stringify({ step: "scanned", count: 1, ids: [3] }));
+  const r = realSentinelReader(bridgeHome({ AH_HOME: ahHome }, osHome))();
+  t("control root: sentinel read from the bridge root while AH_HOME differs", r?.count === 1);
+}
+
 // --- UNKNOWN: tern does not answer ⇒ zero further actions, exactly one log line, never a reload ---
 {
   const w = world(); const st = initialBridgeState(); const b = io(w);
   tick(st, b);
-  w.ternUp = false; w.mirrorAdvances = false; w.reqs = [{ name: "r.json", ageMs: 99_000 }];
+  w.ternUp = false; w.mirrorAdvances = false; w.reqs = [{ name: "r.json", ageMs: 99_000, isStart: false }];
   w.calls = []; w.logs = [];
   for (let i = 0; i < 4; i++) { w.clock += 6000; tick(st, b); }
   t("unknown: only the mirror probe was attempted", w.calls.every((c) => c.endsWith(".mirror")));

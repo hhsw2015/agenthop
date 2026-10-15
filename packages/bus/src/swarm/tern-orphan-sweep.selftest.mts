@@ -119,6 +119,8 @@ for (const which of ["recs", "sessions", "blocks"] as const) {
   t("③ gc removed something => one audit line", w.audit.length === 1 && /results=2/.test(w.audit[0]!)); }
 { const w = world(); const st = initialOrphanState(); round(st, w);
   t("③ gc nothing to do => no audit noise", w.audit.length === 0); }
+{ const w = world(); const st = initialOrphanState(); w.gcLine = "gc: results=0 requests_quarantined=0 requests_held=0 tmp=0 quarantine_expired=0 skipped=requests(symlink)"; round(st, w);
+  t("③ gc r13 skipped=... => logged as an anomaly", w.logs.some((l) => /gc anomaly/.test(l) && /requests\(symlink\)/.test(l))); }
 { const w = world(); const st = initialOrphanState(); w.gcLine = "gc: results=0 requests_quarantined=0 requests_held=2 tmp=0 quarantine_expired=0"; round(st, w);
   t("③ gc r12 requests_held>0 => audited (could not quarantine, retried next run)", w.audit.length === 1 && /requests_held=2/.test(w.audit[0]!)); }
 { const w = world(); const st = initialOrphanState(); w.gcLine = "gc: results=0 requests_quarantined=0 requests_held=0 tmp=0 quarantine_expired=0"; round(st, w);
