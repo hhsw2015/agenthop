@@ -3,13 +3,13 @@
 // resolution failure, idempotent --key, unsafe key rejected), and migrate-coord-inbox (top-level unread only; processed/, claims and
 // temps untouched; invalid left in place; idempotent incl. a crash between publish and source removal).
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, existsSync, readFileSync, rmSync, lstatSync, linkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveCoordinatorInbox, CoordinatorInboxError } from "../packages/bus/src/swarm/coord-inbox.js";
 import { writeInbox, claimInbox, recoverStaleClaims } from "../packages/bus/src/inbox.js";
-import { migrateCoordInbox, migrationKey, migrationKeyForMessage } from "./migrate-coord-inbox.js";
+import { migrateCoordInbox, migrationKey, migrationKeyForMessage, setReleaseUnlinkForTest } from "./migrate-coord-inbox.js";
 import { validInboxMsg } from "../packages/bus/src/inbox.js";
 
 let n = 0;
@@ -212,6 +212,30 @@ try {
       const ok2 = migrateCoordInbox(h, OLD, NEW);
       ok(ok2.moved.length === 1 && pending(h, NEW).length === 1, "recovery errno: once the dir is writable again the same fixture migrates");
     } else console.log("skip  recovery errno test (root bypasses perms)");
+  }
+  { // CIA-SV-P2-2 release-unlink (r6): recovery links a dead claim back but the claim-name unlink fails ⇒ reported FAILED (not a
+    // silent release), and a later FAULT-FREE run (the real CLI) finishes the migration — no nlink=2 strand
+    const h = home();
+    mkdirSync(box(h, OLD), { recursive: true });
+    writeFileSync(path.join(box(h, OLD), "0000000000000004-u.json.mig-999999"), JSON.stringify(m("half-released")));
+    setReleaseUnlinkForTest(() => { const e = new Error("EACCES: injected") as NodeJS.ErrnoException; e.code = "EACCES"; throw e; });
+    let r;
+    try { r = migrateCoordInbox(h, OLD, NEW); } finally { setReleaseUnlinkForTest(undefined); }
+    ok(r.failed.some((f) => /unlink EACCES/.test(f.why)) && r.moved.length === 0, `release-unlink: reported as failed with the errno (${r.failed.map((f) => f.why).join("; ") || "none"})`);
+    ok(lstatSync(path.join(box(h, OLD), "0000000000000004-u.json")).nlink === 2, "release-unlink: the fixture really is the half-released state (two names, one inode)");
+    const cli = spawnSync(TSX, [path.join(here, "migrate-coord-inbox.ts"), "--from", OLD, "--to", NEW], { env: { ...process.env, AH_HOME: h }, encoding: "utf8" });
+    const texts = pending(h, NEW).map((f) => JSON.parse(readFileSync(path.join(box(h, NEW), f), "utf8")).text);
+    ok(cli.status === 0 && texts.join(",") === "half-released" && readdirSync(box(h, OLD)).filter((x) => x.startsWith("0000000000000004-u")).length === 0, `release-unlink: a later fault-free CLI run finishes the migration, old box clear (exit ${cli.status}, got ${texts.join(",") || "none"})`);
+  }
+  { // r6 scope: an UNRELATED hard link keeps the single-link protection (finishing a half release needs claim + pending as the ONLY two links)
+    const h = home();
+    mkdirSync(box(h, OLD), { recursive: true });
+    const claimP = path.join(box(h, OLD), "0000000000000005-v.json.mig-999999");
+    writeFileSync(claimP, JSON.stringify(m("three-links")));
+    linkSync(claimP, path.join(box(h, OLD), "0000000000000005-v.json"));
+    linkSync(claimP, path.join(h, "outside-link"));
+    const r = migrateCoordInbox(h, OLD, NEW);
+    ok(existsSync(claimP) && pending(h, NEW).length === 0 && r.skippedNonRegular.length === 2, `scope: claim+pending+an outside link (nlink=3) are left alone and reported (${JSON.stringify(r.skippedNonRegular)})`);
   }
   { // CIA-SV-P2-3: a non-regular `*.json` entry (directory / symlink / hard-linked file) is never claimed or renamed
     const h = home();

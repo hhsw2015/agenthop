@@ -34,14 +34,31 @@ const MIG_CLAIM_RE = /^(.+\.json)\.mig-(\d+)$/;
 
 export type MigrateOutcome = { moved: string[]; skippedInvalid: string[]; skippedNonRegular: { name: string; why: string }[]; contended: string[]; conflict: string[]; failed: { name: string; why: string }[] };
 
+/** TEST SEAM (undefined in production): replaces the claim-name unlink inside a release, to inject a fault at exactly that step. */
+export let releaseUnlinkForTest: ((p: string) => void) | undefined;
+export function setReleaseUnlinkForTest(f: ((p: string) => void) | undefined): void { releaseUnlinkForTest = f; }
+
 /** Release a claim WITHOUT overwriting (CIA-RELEASE-OWN): hard-link the claim back to its pending name (linkSync fails with EEXIST if
  *  another writer has meanwhile put a NEW message at that name — rename would silently replace it), then drop the claim name.
  *  "conflict" ⇒ the name is taken and we KEEP our claim, so both bodies survive. "error" carries the errno. Never throws. */
 function releaseNoOverwrite(claimed: string, file: string): { kind: "released" } | { kind: "conflict" } | { kind: "error"; code: string } {
   try { linkSync(claimed, file); }
   catch (e) { const code = (e as NodeJS.ErrnoException).code ?? "error"; return code === "EEXIST" ? { kind: "conflict" } : { kind: "error", code }; }
-  try { unlinkSync(claimed); } catch { /* the pending copy exists; the leftover claim name is reclaimed by the next run */ }
+  try { (releaseUnlinkForTest ?? unlinkSync)(claimed); }
+  catch (e) { return { kind: "error", code: `unlink ${(e as NodeJS.ErrnoException).code ?? "error"}` }; } // CIA-SV-P2-2: never report a half release as released; finishHalfRelease completes it on a later run
   return { kind: "released" };
+}
+
+/** A release that linked the claim back but could not drop the claim name leaves ONE message under two names (nlink=2), which the
+ *  single-link filter would skip forever (CIA-SV-P2-2). Finish it only when that is PROVEN: the dead claim and its pending name are
+ *  regular files on the same inode and those two names are its ONLY links. Any other link count, a different inode, or a missing
+ *  pending name ⇒ "no" (unrelated hard links stay protected). Never throws. */
+function finishHalfRelease(claimPath: string, file: string): { kind: "no" } | { kind: "finished" } | { kind: "error"; code: string } {
+  let c, f;
+  try { c = lstatSync(claimPath); f = lstatSync(file); } catch { return { kind: "no" }; }
+  if (!c.isFile() || !f.isFile() || c.dev !== f.dev || c.ino !== f.ino || c.nlink !== 2) return { kind: "no" };
+  try { unlinkSync(claimPath); return { kind: "finished" }; }
+  catch (e) { return { kind: "error", code: (e as NodeJS.ErrnoException).code ?? "error" }; }
 }
 
 /** Is `p` a plain regular file with exactly one link (a real message)? Directories, symlinks, other types and multiply-linked files
@@ -71,13 +88,16 @@ function recoverDeadClaimsNoOverwrite(dir: string, out: MigrateOutcome): void {
     try { process.kill(pid, 0); alive = true; } catch (e) { alive = (e as NodeJS.ErrnoException).code === "EPERM"; }
     if (alive) continue; // a LIVE holder: in flight, leave it alone
     const claimPath = path.join(dir, n);
+    const half = finishHalfRelease(claimPath, path.join(dir, m[1]!));
+    if (half.kind === "finished") continue; // the pending name now holds the message alone; the main loop migrates it
+    if (half.kind === "error") { out.failed.push({ name: n, why: `recovery: half-released claim not finished (unlink ${half.code}); claim kept` }); continue; }
     const t = regularMessageFile(claimPath);
     if (t.kind === "nonregular") { out.skippedNonRegular.push({ name: n, why: t.why }); continue; }
     if (t.kind === "error") { out.failed.push({ name: n, why: `recovery: cannot stat dead claim (${t.code})` }); continue; }
     if (t.kind === "gone") continue;
     const rel = releaseNoOverwrite(claimPath, path.join(dir, m[1]!));
     if (rel.kind === "conflict") out.conflict.push(m[1]!);
-    else if (rel.kind === "error") out.failed.push({ name: n, why: `recovery: dead claim not returned (${rel.code}); claim kept` });
+    else if (rel.kind === "error") out.failed.push({ name: n, why: `recovery: dead claim not fully returned (${rel.code}); claim kept, a later run finishes it` });
   }
 }
 
@@ -130,7 +150,7 @@ export function migrateCoordInbox(home: string, fromSid: string, toSid: string, 
       const rel = releaseNoOverwrite(claimed, file);
       if (rel.kind === "released") out.skippedInvalid.push(name);
       else if (rel.kind === "conflict") out.conflict.push(name);
-      else out.failed.push({ name, why: `invalid and could not be released (${rel.code})` });
+      else out.failed.push({ name, why: `invalid and could not be released (${rel.code}); a later run finishes it` });
       continue;
     }
     let res: string;
