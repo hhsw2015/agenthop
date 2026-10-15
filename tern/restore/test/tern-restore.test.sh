@@ -481,5 +481,45 @@ ck "hash: --resume aaaa1111#x is not the seat" "1" "$(grep -c 'FAIL: Manager: no
 fresh; seed Manager "tern acp claude --resume aaaa1111 --mode bypass#Permissions --model m1"; run1 --check >/dev/null
 ck "hash: --mode bypass#Permissions is not bypassPermissions" "1" "$(grep -c "FAIL: Manager: mode 'bypass#Permissions'" "$T/out")"
 
+# SP-SV-RESTORE-LOCK: the presence writer shares #1053's per-sid holder-lock (real packages/bus/src/swarm/holder-lock.ts)
+TSX="$HERE/../../node_modules/.bin/tsx"; HL="$HERE/../../packages/bus/src/swarm/holder-lock.ts"
+cat >"$T/hold.mts" <<TS
+import { acquireHolderLock, releaseHolderLock } from "$HL";
+import { existsSync, writeFileSync } from "node:fs";
+const [dir, sid, mode] = process.argv.slice(2);
+const site = { lockDir: dir + "/" + sid + ".lockd", intentDir: dir, intentPrefix: sid + ".lockd.hold." };
+const tok = acquireHolderLock(site);
+if (mode === "try") { console.log(tok ? "acquired" : "contended"); if (tok) releaseHolderLock(site, tok); process.exit(0); }
+if (!tok) { console.log("contended"); process.exit(1); }
+writeFileSync(dir + "/held", "");
+const t0 = Date.now(); while (!existsSync(dir + "/release") && Date.now() - t0 < 20000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+releaseHolderLock(site, tok);
+TS
+# (a) a TS writer (e.g. SessionEnd) holds the lock => restore publishes nothing, reports it, exit 1
+fresh; mkdir -p "$T/presence"; printf '%s' "$$" >"$T/presence/aaaa1111.pid"; printf 'origin=bus ts=1\n' >"$T/presence/aaaa1111.origin"
+rm -f "$T/presence/held" "$T/presence/release"; "$TSX" "$T/hold.mts" "$T/presence" aaaa1111 hold & HP=$!
+for _ in $(seq 100); do [ -e "$T/presence/held" ] && break; sleep 0.05; done
+rc=$(run1); touch "$T/presence/release"; wait $HP
+ck "lock: TS holder present => restore exit 1" "1" "$rc"
+ck "lock: names the lock" "1" "$(grep -c 'presence lock: .* not written' "$T/out")"
+ck "lock: .pid untouched under a foreign holder" "$$" "$(cat "$T/presence/aaaa1111.pid")"
+ck "lock: .origin untouched under a foreign holder" "origin=bus ts=1" "$(cat "$T/presence/aaaa1111.origin")"
+# (b) once released, the same run writes (positive control) and leaves no lock artifacts
+rm -f "$T/presence/held" "$T/presence/release"; rc=$(run1)
+ck "lock: after release restore writes the agent pid" "7100" "$(cat "$T/presence/aaaa1111.pid")"
+ck "lock: no lock dir / hold-intent left" "0" "$(ls -a "$T/presence" | grep -c 'lockd')"
+# (c) while restore holds it, the TS acquirer contends (same artifacts, both directions)
+cat >"$T/pyhold.py" <<PY
+import importlib.util, os, subprocess, sys
+os.environ["PRESENCE_DIR"] = sys.argv[1]
+spec = importlib.util.spec_from_file_location("tr", "$PY"); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+tok = m.presence_lock("aaaa1111")
+r = subprocess.run(["$TSX", "$T/hold.mts", sys.argv[1], "aaaa1111", "try"], capture_output=True, text=True).stdout.strip()
+m.presence_unlock("aaaa1111", tok)
+r2 = subprocess.run(["$TSX", "$T/hold.mts", sys.argv[1], "aaaa1111", "try"], capture_output=True, text=True).stdout.strip()
+print(r, r2)
+PY
+ck "lock: TS contends while restore holds, acquires after" "contended acquired" "$(python3 -I "$T/pyhold.py" "$T/presence")"
+
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)

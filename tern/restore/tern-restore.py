@@ -618,6 +618,54 @@ def read_presence(f):
     return pid, origin
 
 
+class PresenceBusy(Exception):
+    pass
+
+
+def presence_lock(sid, wait_s=2.0):
+    """SP-SV-RESTORE-LOCK: the per-sid presence lock of #1053 seat-presence.ts (holder-lock.ts protocol), so this writer and the TS
+    writers (bus daemon, SessionEnd, agenthop_tern) never interleave. Same artifacts: hold-intent presence/<sid>.lockd.hold.<token>
+    staged BEFORE the mkdir, lock dir presence/<sid>.lockd holding exactly one file named <token> = <pid>.<hex>. Returns the token;
+    raises PresenceBusy when not acquired by the deadline.
+    ponytail: acquire only, no reclaim — a dead holder's residue makes this run report busy (FC-2: write nothing) and the next TS
+    acquirer reclaims it (it reclaims an ESRCH-dead token or intent, ours included). Add reclaim here if busy shows up in practice."""
+    lock_dir = os.path.join(PRESENCE_DIR, f"{sid}.lockd")
+    deadline = time.time() + wait_s
+    while True:
+        token = f"{os.getpid()}.{os.urandom(6).hex()}"
+        intent = os.path.join(PRESENCE_DIR, f"{sid}.lockd.hold.{token}")
+        try:
+            os.close(os.open(intent, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        except OSError:
+            intent = None
+        if intent:
+            try:
+                os.mkdir(lock_dir)
+                try:
+                    os.close(os.open(os.path.join(lock_dir, token), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+                    if os.listdir(lock_dir) == [token]:
+                        return token
+                except OSError:
+                    pass
+                presence_unlock(sid, token)  # not the sole owner (a reclaimer raced in): back off, like holder-lock ②
+            except OSError:
+                try: os.remove(intent)
+                except OSError: pass
+        if time.time() >= deadline:
+            raise PresenceBusy(f"presence lock {lock_dir} held by another writer")
+        time.sleep(0.02)
+
+
+def presence_unlock(sid, token):
+    lock_dir = os.path.join(PRESENCE_DIR, f"{sid}.lockd")
+    try: os.remove(os.path.join(lock_dir, token))
+    except OSError: pass
+    try: os.rmdir(lock_dir)
+    except OSError: pass
+    try: os.remove(os.path.join(PRESENCE_DIR, f"{sid}.lockd.hold.{token}"))
+    except OSError: pass
+
+
 def write_atomic(path, text):
     tmp = f"{path}.tmp-{os.getpid()}"
     with open(tmp, "x") as h:
@@ -637,6 +685,32 @@ def pid_alive(pid):
         return True
 
 
+def presence_one(seat, f, want, write):
+    """(line, None) or (None, fail) for one seat. With write=True the caller holds the presence lock."""
+    try:
+        have, origin = read_presence(f)
+    except OSError as e:
+        return None, f"presence unreadable: {e}"
+    if have == want and origin == "agent":
+        return f"presence: {seat['role']} ok pid {want}", None
+    if not write:
+        if have == want:  # right pid, no/other origin sidecar: correct for readers, worth a note
+            return f"presence: {seat['role']} ok pid {want} (origin {origin or 'bus/none'})", None
+        if origin in (None, "bus") and pid_alive(have):
+            # the hook's bus process (sidecar origin=bus, or no sidecar = old format) holds a LIVE pid: readers still see a
+            # live seat — a WARN, not a FAIL (coordinator ruling). A run replaces it with the agent pid.
+            return f"WARN: {seat['role']} presence pid {have} is the bus process (origin={origin or 'none'}), agent pid is {want}", None
+        return None, f"presence pid {have} != agent pid {want}"
+    try:
+        # ORDER (same as #1053 seat-presence.ts): .origin first, then .pid — a reader that sees the new pid also sees
+        # its origin; a crash between the two leaves the old pid with an agent origin, which --check flags as a FAIL.
+        write_atomic(f[: -len(".pid")] + ".origin", f"origin=agent ts={int(time.time() * 1000)}\n")
+        write_atomic(f, str(want))  # ONE line: what every existing reader parses
+        return f"presence: {seat['role']} wrote pid {want} (was {have})", None
+    except OSError as e:
+        return None, f"presence write failed: {e}"
+
+
 def presence(roster, write):
     table, lines, fails = ps_table(), [], []
     inv = inventory(roster["session"])
@@ -646,33 +720,25 @@ def presence(roster, write):
             continue  # verify() reports missing/duplicate
         want = agent_pid(mine[0][1]["id"], seat, table)
         f = os.path.join(PRESENCE_DIR, seat["sid"] + ".pid")
-        try:
-            have, origin = read_presence(f)
-        except OSError as e:
-            fails.append((seat["role"], f"presence unreadable: {e}")); continue
         if want is None:
             fails.append((seat["role"], "presence: agent pid not found under block")); continue
-        if have == want and origin == "agent":
-            lines.append(f"presence: {seat['role']} ok pid {want}")
-        elif not write:
-            if have == want:  # right pid, no/other origin sidecar: correct for readers, worth a note
-                lines.append(f"presence: {seat['role']} ok pid {want} (origin {origin or 'bus/none'})")
-            elif origin in (None, "bus") and pid_alive(have):
-                # the hook's bus process (sidecar origin=bus, or no sidecar = old format) holds a LIVE pid: readers still see a
-                # live seat — a WARN, not a FAIL (coordinator ruling). A run replaces it with the agent pid.
-                lines.append(f"WARN: {seat['role']} presence pid {have} is the bus process (origin={origin or 'none'}), agent pid is {want}")
-            else:
-                fails.append((seat["role"], f"presence pid {have} != agent pid {want}")); continue
-        else:
+        token = None
+        if write:
+            # SP-SV-RESTORE-LOCK: decide AND write under the shared per-sid lock, re-reading .pid/.origin inside it — a decision
+            # from a read made outside the lock could publish into a SessionEnd that then deletes it.
             try:
-                os.makedirs(PRESENCE_DIR, exist_ok=True)
-                # ORDER (same as #1053 seat-presence.ts): .origin first, then .pid — a reader that sees the new pid also sees
-                # its origin; a crash between the two leaves the old pid with an agent origin, which --check flags as a FAIL.
-                write_atomic(f[: -len(".pid")] + ".origin", f"origin=agent ts={int(time.time() * 1000)}\n")
-                write_atomic(f, str(want))  # ONE line: what every existing reader parses
-                lines.append(f"presence: {seat['role']} wrote pid {want} (was {have})")
-            except OSError as e:
-                fails.append((seat["role"], f"presence write failed: {e}")); continue
+                os.makedirs(PRESENCE_DIR, mode=0o700, exist_ok=True)
+                token = presence_lock(seat["sid"])
+            except (OSError, PresenceBusy) as e:
+                fails.append((seat["role"], f"presence lock: {e} — not written")); continue
+        try:
+            line, fail = presence_one(seat, f, want, write)
+        finally:
+            if token:
+                presence_unlock(seat["sid"], token)
+        if fail:
+            fails.append((seat["role"], fail)); continue
+        lines.append(line)
         if write:
             err = seat_shell_set(seat["sid"], want)
             if err:

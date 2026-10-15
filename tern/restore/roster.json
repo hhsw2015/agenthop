@@ -2,13 +2,69 @@
   "session": "agenthop",
   "note": "Source of truth for tern-restore.sh. One entry per seat. model=null => tool picks its own (codex). mode = start permission (user 2026-10-15: highest; claude --mode, codex INITIAL_AGENT_MODE env). Verified against tern ls --json on 2026-10-15.",
   "seats": [
-    { "role": "Manager",       "tool": "claude", "sid": "c5beaa7c-acbb-4637-a197-2e9014ae42f8", "cwd": "~/Dev/agenthop",        "model": "cpa-local/claude-fable-5-1[1m]", "mode": "bypassPermissions" },
-    { "role": "Platform Dev",  "tool": "claude", "sid": "90b58f9c-5bac-4318-a996-2373c179d674", "cwd": "~/Dev/agenthop",        "model": "cpa-local/claude-opus-5-5[1m]", "mode": "bypassPermissions" },
-    { "role": "Infra Dev",     "tool": "claude", "sid": "8a53f4e8-c756-4302-a8dd-a9b6427c8fca", "cwd": "~/Dev/agenthop",        "model": "cpa-local/claude-opus-5-5[1m]", "mode": "bypassPermissions" },
-    { "role": "OpenDot Dev",   "tool": "claude", "sid": "aad02248-c76b-4a1a-b191-95da3f0bfb5a", "cwd": "~/Dev/OpenDots",        "model": "cpa-local/claude-opus-5-5[1m]", "mode": "bypassPermissions" },
-    { "role": "Reserve",       "tool": "claude", "sid": "b90ccae9-4adb-4925-b5a2-0b81e1b53dc9", "cwd": "~/Work",                "model": "cpa-local/claude-opus-5-5[1m]", "mode": "bypassPermissions" },
-    { "role": "Chief Review",  "tool": "codex",  "sid": "01a13284-d361-74a0-a026-ad56f1fdf355", "cwd": "~/Work",                "model": null, "mode": "agent-full-access" },
-    { "role": "Second Voice",  "tool": "codex",  "sid": "01a13e9a-ea58-7a30-a8db-35cd3ad3f879", "cwd": "~/Dev/happycapy",       "model": null, "mode": "agent-full-access" },
-    { "role": "Model Gateway", "tool": "claude", "sid": "ded2cb57-69fb-4deb-a6b6-58d57ae781d4", "cwd": "~/Dev/CLIProxyAPIPlus", "model": "cpa-local/claude-opus-4-8[1m]", "mode": "bypassPermissions" }
+    {
+      "role": "Manager",
+      "tool": "claude",
+      "sid": "c5beaa7c-acbb-4637-a197-2e9014ae42f8",
+      "cwd": "~/Dev/agenthop",
+      "model": "cpa-local/claude-fable-5-1[1m]",
+      "mode": "bypassPermissions"
+    },
+    {
+      "role": "Platform Dev",
+      "tool": "claude",
+      "sid": "378177a0-84ea-48a1-8a69-2fadcf750a0d",
+      "cwd": "~/Dev/agenthop",
+      "model": "cpa-local/claude-opus-5-5[1m]",
+      "mode": "bypassPermissions"
+    },
+    {
+      "role": "Infra Dev",
+      "tool": "claude",
+      "sid": "8a53f4e8-c756-4302-a8dd-a9b6427c8fca",
+      "cwd": "~/Dev/agenthop",
+      "model": "cpa-local/claude-opus-5-5[1m]",
+      "mode": "bypassPermissions"
+    },
+    {
+      "role": "OpenDot Dev",
+      "tool": "claude",
+      "sid": "aad02248-c76b-4a1a-b191-95da3f0bfb5a",
+      "cwd": "~/Dev/OpenDots",
+      "model": "cpa-local/claude-opus-5-5[1m]",
+      "mode": "bypassPermissions"
+    },
+    {
+      "role": "Reserve",
+      "tool": "claude",
+      "sid": "b90ccae9-4adb-4925-b5a2-0b81e1b53dc9",
+      "cwd": "~/Work",
+      "model": "cpa-local/claude-opus-5-5[1m]",
+      "mode": "bypassPermissions"
+    },
+    {
+      "role": "Chief Review",
+      "tool": "codex",
+      "sid": "01a13284-d361-74a0-a026-ad56f1fdf355",
+      "cwd": "~/Work",
+      "model": null,
+      "mode": "agent-full-access"
+    },
+    {
+      "role": "Second Voice",
+      "tool": "codex",
+      "sid": "01a13e9a-ea58-7a30-a8db-35cd3ad3f879",
+      "cwd": "~/Dev/happycapy",
+      "model": null,
+      "mode": "agent-full-access"
+    },
+    {
+      "role": "Model Gateway",
+      "tool": "claude",
+      "sid": "ded2cb57-69fb-4deb-a6b6-58d57ae781d4",
+      "cwd": "~/Dev/CLIProxyAPIPlus",
+      "model": "cpa-local/claude-opus-4-8[1m]",
+      "mode": "bypassPermissions"
+    }
   ]
 }
