@@ -116,7 +116,7 @@ check "$([[ "$OUT" == *'PASS - 1 tick reloaded (vm aaa -> bbb), re-baselined at'
 # H. r4 file, same vm, tick frozen: FAIL and the diagnostics show vm + tick_ms.
 : >"$L"; echo '{"tick":5,"vm":"ccc","tick_ms":61,"tick_ms_max":88,"agents":[]}' >"$C/agents.json"
 run env
-check "$([[ "$OUT" == *'FAIL - 1 tick: did not advance in 1s (5 -> 5, vm ccc)'* && "$OUT" == *'vm: ccc, tick_ms=61 tick_ms_max=88'* ]] && echo true)" "r4 frozen: FAIL with vm, diagnostics show tick_ms"
+check "$([[ "$OUT" == *'FAIL - 1 tick: did not advance in 1s (5 -> 5, vm ccc; sweep flag SWARM_TERN_BRIDGE:'* && "$OUT" == *'vm: ccc, tick_ms=61 tick_ms_max=88'* ]] && echo true)" "r4 frozen: FAIL with vm, diagnostics show tick_ms"
 
 # I. r4 file, same vm, advancing: normal PASS mentions the vm.
 : >"$L"; start_ticker_vm ddd
@@ -255,6 +255,14 @@ fi
 run env
 stop_ticker
 check "$([ $RC -eq 1 ] && [[ "$OUT" == *'mirror kills=0  command kills=1 [command drain x1]'* ]] && echo true)" "command-only kill (command_kill_only_control) => FAIL"
+
+# sweep flag in check 1's FAIL line: off vs on vs unreadable recipe
+: >"$L"; frozen
+echo '{"env":{"SWARM_COORDINATOR":"x"}}' >"$TMP/recipe-off.json"; echo '{"env":{"SWARM_TERN_BRIDGE":"1"}}' >"$TMP/recipe-on.json"
+run env SWARM_DISPATCHER_RECIPE="$TMP/recipe-off.json"; o_off="$OUT"
+run env SWARM_DISPATCHER_RECIPE="$TMP/recipe-on.json"; o_on="$OUT"
+run env SWARM_DISPATCHER_RECIPE="$TMP/no-such-recipe.json"; o_none="$OUT"
+check "$([[ "$o_off" == *'sweep flag SWARM_TERN_BRIDGE: off (unset): no outside mirror sweep'* && "$o_on" == *'sweep flag SWARM_TERN_BRIDGE: on (1)'* && "$o_none" == *'sweep flag SWARM_TERN_BRIDGE: unknown'* ]] && echo true)" "check 1 FAIL names the sweep flag: off / on / unknown"
 
 echo ""
 echo "bridge-smoke gate: $t passed, $f failed"

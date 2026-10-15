@@ -57,6 +57,7 @@ EVAL_CODE="${BRIDGE_EVAL_CODE:-return #cx.session:panes()}"
 TICK_WAIT="${TICK_WAIT:-3}"
 RESULT_WAIT="${RESULT_WAIT:-2}"
 TERN_TIMEOUT="${TERN_TIMEOUT:-5}"
+RECIPE="${SWARM_DISPATCHER_RECIPE:-$HOME/.agenthop/swarm/dispatcher-recipe.json}"
 PLUGIN_ID="agenthop-agents-bridge"
 
 for bin in timeout jq; do command -v "$bin" >/dev/null || { echo "bridge-smoke: missing $bin" >&2; exit 2; }; done
@@ -74,6 +75,13 @@ tick(){ jq -r '.tick // empty' "$CTRL/agents.json" 2>/dev/null; }
 # not a stall. Older bridges write no vm: then only the tick is compared.
 vm(){ jq -r '.vm // empty' "$CTRL/agents.json" 2>/dev/null; }
 tick_ms(){ jq -r '"tick_ms=\(.tick_ms // "-") tick_ms_max=\(.tick_ms_max // "-")"' "$CTRL/agents.json" 2>/dev/null; }
+# The outside 5 s `mirror` sweep (#1033) runs only when the dispatcher was started with SWARM_TERN_BRIDGE on.
+# Read from the dispatcher's recorded launch env; "unknown" if the recipe cannot be read.
+sweep_flag(){
+  [ -r "$RECIPE" ] || { echo "unknown (no readable $RECIPE)"; return; }
+  local v; v="$(jq -r '.env.SWARM_TERN_BRIDGE // "unset"' "$RECIPE" 2>/dev/null)" || { echo "unknown (recipe unparseable)"; return; }
+  case "$v" in 1|on|true) echo "on ($v)";; *) echo "off ($v): no outside mirror sweep";; esac
+}
 
 PASSED=() FAILED=()
 pass(){ echo "PASS - $1"; PASSED+=("$1"); }
@@ -141,7 +149,7 @@ else
     else rate="LOW: timer chain likely dead, tick kept alive by outside mirror calls"; fi
     pass "1 tick ${reload_note}advances ($t0 -> $t1 in ${TICK_WAIT}s = $steps steps, ~$want expected; $rate${v1:+; vm $v1})"
   else
-    fail "1 tick: ${reload_note}did not advance in ${TICK_WAIT}s ($t0 -> $t1${v1:+, vm $v1}${timer_state:+, timer=$timer_state})"
+    fail "1 tick: ${reload_note}did not advance in ${TICK_WAIT}s ($t0 -> $t1${v1:+, vm $v1}${timer_state:+, timer=$timer_state}; sweep flag SWARM_TERN_BRIDGE: $(sweep_flag))"
   fi
 fi
 
