@@ -172,13 +172,40 @@ ck("r4: later mirror timer ticks still make NO tern.carly.* call", carlyCalls ==
 -- #1036 ②: arm is three commands, ONE tern.carly call per hook (11:36:16 live: three calls in one hook crossed 50ms)
 local function carlyDelta(fn) local c0 = carlyCalls; fn(); return carlyCalls - c0 end
 local SENT = "/h/.agenthop/tern-panes/sentinel.json"
-ck("#1036: commands arm-scan / arm-cancel / arm-schedule registered", type(commands["arm-scan"]) == "function" and type(commands["arm-cancel"]) == "function" and type(commands["arm-schedule"]) == "function")
-ck("#1036: arm-scan = exactly ONE tern.carly call (tasks), records our 2 prior patrol ids", carlyDelta(function() commands["arm-scan"](cx) end) == 1 and #kvStore["bridge.arm_cancel"] == 2)
-ck("#1036: arm-schedule is BLOCKED while prior patrols remain (no duplicate patrol)", carlyDelta(function() commands["arm-schedule"](cx) end) == 0 and (files[SENT] or ""):find('"step":"blocked"', 1, true) ~= nil)
-ck("#1036: arm-cancel = exactly ONE tern.carly call per run (cancels id 31)", carlyDelta(function() commands["arm-cancel"](cx) end) == 1 and carlyCancels[1] == 31)
-ck("#1036: second arm-cancel cancels id 32; the unrelated task 99 is never touched", carlyDelta(function() commands["arm-cancel"](cx) end) == 1 and carlyCancels[2] == 32 and #carlyCancels == 2)
-ck("#1036: arm-cancel with nothing left makes ZERO tern.carly calls", carlyDelta(function() commands["arm-cancel"](cx) end) == 0)
-ck("#1036: arm-schedule = exactly ONE tern.carly call (schedule) and records scheduled=true", carlyDelta(function() commands["arm-schedule"](cx) end) == 1 and (files[SENT] or ""):find('"scheduled":true', 1, true) ~= nil)
+ck("#1036: commands arm-scan / arm-cancel registered", type(commands["arm-scan"]) == "function" and type(commands["arm-cancel"]) == "function")
+ck("r9: NO arm-schedule command in the plugin (even one tern.carly.schedule exceeded 50ms in a hook; the swarm schedules via CLI)", commands["arm-schedule"] == nil)
+-- r9 arming protocol: arm-scan READ-ONLY (ids+count, never cancels/schedules); arm-cancel cancels ONLY the kv-requested id and
+-- KEEPS the obligation on failure; a kv read failure is UNKNOWN (no advance). (r8 second voice BTF-R8-P2-1/2/3.)
+local function sent() return files[SENT] or "" end
+ck("r9: arm-scan = exactly ONE tern.carly call (tasks), read-only (no cancel, no schedule)", carlyDelta(function() commands["arm-scan"](cx) end) == 1 and #carlyCancels == 0 and carlySchedules == 0)
+ck("r9: arm-scan records ids + count of OUR patrols (2), scheduled=false when count~=1", sent():find('"step":"scanned"', 1, true) ~= nil and sent():find('"count":2', 1, true) ~= nil and sent():find('"scheduled":false', 1, true) ~= nil)
+ck("r9: arm-cancel with no id requested = idle, ZERO tern.carly calls", carlyDelta(function() commands["arm-cancel"](cx) end) == 0 and sent():find('"step":"cancel-idle"', 1, true) ~= nil)
+kvStore["bridge.arm_cancel_id"] = 31
+ck("r9: arm-cancel cancels ONLY the requested id (31), one tern.carly call, clears the request", carlyDelta(function() commands["arm-cancel"](cx) end) == 1 and carlyCancels[1] == 31 and kvStore["bridge.arm_cancel_id"] == nil and sent():find('"step":"cancelled"', 1, true) ~= nil)
+ck("r9: the unrelated task 99 and the other patrol 32 were never touched", #carlyCancels == 1)
+-- BTF-R8-P2-1: a FAILED cancel keeps the obligation
+local realCancel = tern.carly.cancel
+tern.carly.cancel = function(id) carlyCalls = carlyCalls + 1; error("EIO") end
+kvStore["bridge.arm_cancel_id"] = 32
+commands["arm-cancel"](cx)
+ck("r9 P2-1: cancel FAILED ⇒ obligation KEPT (kv id still 32), step=cancel-failed", kvStore["bridge.arm_cancel_id"] == 32 and sent():find('"step":"cancel-failed"', 1, true) ~= nil)
+tern.carly.cancel = function(id) carlyCalls = carlyCalls + 1; return false end
+commands["arm-cancel"](cx)
+ck("r9 P2-1: cancel returned false ⇒ obligation KEPT", kvStore["bridge.arm_cancel_id"] == 32 and sent():find('"step":"cancel-failed"', 1, true) ~= nil)
+tern.carly.cancel = realCancel
+-- BTF-R8-P2-2: a kv READ failure is UNKNOWN, never "empty", and does not advance
+local realGet = tern.kv.get
+tern.kv.get = function() error("kv EIO") end
+local dKv = carlyDelta(function() commands["arm-cancel"](cx) end)
+ck("r9 P2-2: kv read failure ⇒ step=cancel-unknown, ZERO tern.carly calls (not treated as empty)", dKv == 0 and sent():find('"step":"cancel-unknown"', 1, true) ~= nil)
+tern.kv.get = realGet
+-- BTF-R8-P2-3: a status WRITE failure is reported as failure (never as progress)
+local realWrite = tern.fs.write
+tern.fs.write = function(p, t) if p:find("sentinel.json", 1, true) then error("ENOSPC") end return realWrite(p, t) end
+ck("r9 P2-3: arm-scan whose sentinel.json write fails returns false (never claimed as progress)", __bridge_test.armScan() == false)
+kvStore["bridge.arm_cancel_id"] = 32
+ck("r9 P2-3: arm-cancel whose status write fails returns false even though the cancel ran", __bridge_test.armCancel() == false)
+tern.fs.write = realWrite
 ck("#1036: legacy `arm` = the cheap first step only (ONE tern.carly call)", carlyDelta(function() commands["arm"](cx) end) == 1)
 
 -- r4 ②③: VM identity + per-tick cost published in agents.json
@@ -275,6 +302,18 @@ ck("#1036: the next `mirror` COMMAND (the 5s sweep) restarts the accelerator (on
 commands["mirror"](cx)
 ck("#1036: after restart agents.json reports timer=running", (files[AGENTS] or ""):find('"timer":"running"', 1, true) ~= nil)
 ck("#1036: repeated mirror commands while running do NOT stack extra timer chains", #timers == 1)
+
+-- ---- r9: a timer chain that Tern simply STOPS delivering (no kill, live 12:38–12:40) must not be reported "running" ----
+for i = #timers, 1, -1 do table.remove(timers, i) end
+commands["mirror"](cx)                 -- restart: one fresh chain pending
+local pendingNow = #timers
+clock = clock + 5000                   -- 5s pass and the pending callback is NEVER delivered (the stall)
+commands["mirror"](cx)                 -- the 5s command sweep
+ck("r9: a stalled chain (callback never delivered) is reported timer=overdue, not running", (files[AGENTS] or ""):find('"timer":"overdue"', 1, true) ~= nil)
+ck("r9: that sweep restarts the accelerator (a new chain is pending)", #timers == pendingNow + 1)
+for i = #timers - 1, 1, -1 do table.remove(timers, i) end -- the stalled callback never fires; keep only the fresh one
+commands["mirror"](cx)
+ck("r9: after the restart the next sweep reports running again", (files[AGENTS] or ""):find('"timer":"running"', 1, true) ~= nil)
 
 -- ---- BTF-SV-P2-1: classify by DECODED top-level op (escaped key / escaped value / nested field) + plain controls ----
 for k in pairs(requests) do requests[k] = nil end

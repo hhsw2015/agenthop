@@ -151,8 +151,9 @@ tern plugin link <repo>/tern/agenthop-agents-bridge     # 原地用(开发/本�
 
 同插件第二件。零模型成本地每分钟巡检全席位,把三类"需要关注"写成告警。
 
-- **机制**:`tern.carly.schedule({title="agenthop tern patrol", when="every 1m", check=<sentinel.luau 源>})`。`check` 是自包含 Luau 源,返回 `function(ev, cx, state)`;返回 nil=静默(无模型轮次),返回字符串=直接显示(仍无模型)。源在 `sentinel.luau`,window 半在**作用域回调内**(tern.carly 需要)读它并注册一次,按 title 去重(跨 reload/window 末者胜)。
-- **读法**:`cx.session:read(pane, {as="table", lines=N, scrollback=true})` 取每个 agent pane 的尾 N 行。
+- **机制**:title `agenthop tern patrol`、`when="every 1m"`、`check=<sentinel.luau 源>`。`check` 是自包含 Luau 源,返回 `function(ev, cx, state)`;返回 nil=静默(无模型轮次),返回字符串=直接显示(仍无模型)。
+- **挂哨(r9,#1036)**:**插件内不再调 `tern.carly.schedule`**——单次 schedule 在命令 hook 内现网超 50ms(12:21/12:24),禁 hook 至 reload。挂哨由**蜂群侧 CLI** 完成:`arm-schedule.sh` = `tern ctl carly task add <JSON>`(**`#` 必须转义为 `\u0023`**,ctl 把 `#` 当注释截断参数;空白/换行无碍)。tern 0.8.3 的 `ctl carly task` 只有 add,无 list/cancel,所以列举与取消**留在插件**(都便宜:`tasks()` ~2.2ms):`arm-scan`(只读,写 sentinel.json `{step:"scanned", ids, count, scheduled=(count==1)}`,兼作 add 后的核验——**只认 tasks() 不认 ctl 的 ok**)、`arm-cancel`(只取消 kv `bridge.arm_cancel_id` 指定的一个 id;**取消失败保留义务** step=cancel-failed;kv 读失败=unknown 不当空、不推进;状态写失败返回失败不报推进)。序列(蜂群 #1033 扫,每次 load/reload 后):`arm-scan` → count>1 则逐个 `arm-cancel` 多余者(每次后重扫)→ count==0 则 `arm-schedule.sh`(它自己先扫、count≠0 即拒,add 后再扫要求 count==1)。幂等按 title:count==1 即已挂,不再 add。
+- **读法**:`cx.session:read(pane, {as="table", lines=N, scrollback=true})` 取 agent pane 的尾 N 行。**r9:每轮至多一次 read**(单次 ~23ms,lines=1 亦然;原 batch 4 ⇒ 每轮 ≈90ms,自建任务两轮均 `schedule exceeded 50 ms`),N≤24;元数据扫(`panes()` ~0.17ms)每轮仍覆盖全部 pane,正文按 pane 轮转。**一读两用**:读到的 lines 交给可选纯函数 `classify(lines, title)`(#1041,与 f32a0507 对齐的接口),结果记在 state.class,不另读。
 - **比对用哈希,不用偏移**:长度/字节偏移在 TUI 重绘/滚动下失效(Carly V 批实证),故哈希**尾 N 行**文本做比较。
 - **告警三型**:
   1. `content_filter` — 尾文本命中内容过滤短语(可调 `filter_pats`)。
@@ -178,7 +179,8 @@ tern plugin link <repo>/tern/agenthop-agents-bridge     # 原地用(开发/本�
 - **发端(emitter)**:`osc-alert-hook.sh` = Claude Code hook。
   - `Notification` → `printf '\033]9;4;4;50\007'`(paused→需要人)。
   - `Stop` / `SubagentStop` / `UserPromptSubmit` → `printf '\033]9;4;0\007'`(清除)。
-  - OSC 必须到 pane 的 PTY:hook 的 stdout 被 Claude Code 截获,故写 `/dev/tty`(可用 `AGENTHOP_OSC_TTY` 覆盖,夹具据此捕获)。
+  - OSC 必须到 pane 的 PTY。**r9 订正(spike #1037 @b01c1f0,`docs/research/tui-osc-hooks-spike.md` raw/ 证据)**:Claude Code 跑 hook 时**无控制终端**,写 `/dev/tty` 14/14 失败——旧默认从未到达 Tern,A3 发端一直是哑的;沿父进程链找第一个有 tty 的祖先(`ps -o tty= -p`,即 TUI 自己的 `/dev/ttysNNN`)12/12 成功。默认改为该祖先 pty,找不到才退 `/dev/tty`;`AGENTHOP_OSC_TTY` 覆盖保留(夹具据此捕获)。
+  - **可信信号只有 alert**(spike 事实):OSC 2 标题约 1 秒内被 Claude TUI 重绘覆盖,不能作持久信号;进度 OSC 不作承诺。另:OSC 777→`pane.alert` 粘住不清(Stop / 9;4;0 都不清)——读端须按边沿/去重处理,勿把持续 alert 当新事件。
   - **仅在 Tern pane 内发**(`$TERN_PANE` 有值);herdr/其它终端席位是 no-op ⇒ 全席可挂,安全。
   - 注册见 `osc-alert-hook.settings.json`(Notification/Stop/SubagentStop/UserPromptSubmit 四事件)。
 - **读端(reader)**:A2 `sentinel.luau` 的 `scan_pane` 增一型 `osc_alert`:`p.alert == true` 即写入告警流(耐久文件 + Carly 字符串,同 §7 双路)。

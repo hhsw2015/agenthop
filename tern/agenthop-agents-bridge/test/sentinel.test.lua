@@ -188,27 +188,31 @@ do -- bad carriers (empty / non-numeric / legacy JSON) => no crash, no false ale
   end
 end
 
--- ===== r2 ②: batch coverage — every pane body-scanned over ceil(N/batch) rounds =====
+-- ===== r2 ② / #1036 r9: AT MOST ONE body read per round; every pane covered over N rounds =====
 do
   local c = load_check()
   resetWrites()
   local st = {}
   local panes, reads = {}, {}
-  for i = 1, 6 do -- 6 panes, batch_size 4 => 2 rounds to cover all; alert=false so only body-scan (permission) names a pane
-    panes[i] = { pane = i, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = false }
+  for i = 1, 6 do -- 6 panes; one read per round => 6 rounds to cover all; alert=false so only body-scan (permission) names a pane
+    panes[i] = { pane = i, kind = "agent", program = "omp", cwd = "/w", busy = false, alert = false, title = "seat" .. i }
     reads[i] = { kind = "agent", lines = { "Allow this tool? [y/n]" } }
   end
   NOW = 8000000
-  local o1 = c({}, mockCx(panes, reads), st) -- round 1
-  local o2 = c({}, mockCx(panes, reads), st) -- round 2 (offset advanced)
-  local round1 = panesFromString(o1)
-  local n1 = 0; for _ in pairs(round1) do n1 = n1 + 1 end
-  local covered = {}
-  for id in pairs(round1) do covered[id] = true end
-  for id in pairs(panesFromString(o2)) do covered[id] = true end
+  local covered, maxReads = {}, 0
+  for _ = 1, 6 do
+    local readCalls = 0
+    local cx = mockCx(panes, reads)
+    local realRead = cx.session.read
+    cx.session.read = function(self, pane, opts) readCalls = readCalls + 1; LAST_READ_OPTS = opts; return realRead(self, pane, opts) end
+    local o = c({}, cx, st)
+    if readCalls > maxReads then maxReads = readCalls end
+    for id in pairs(panesFromString(o)) do covered[id] = true end
+  end
   local nAll = 0; for _ in pairs(covered) do nAll = nAll + 1 end
-  check_("batch: one round body-scans <= batch_size (4) panes", n1 >= 1 and n1 <= 4)
-  check_("batch: all 6 panes covered over 2 rounds (offset advances)", nAll == 6)
+  check_("r9: every round makes AT MOST ONE cx.session:read (~23ms each live)", maxReads == 1)
+  check_("r9: all 6 panes body-scanned over 6 rounds (offset rotates)", nAll == 6)
+  check_("r9: the read asks for <= 24 lines", type(LAST_READ_OPTS) == "table" and LAST_READ_OPTS.lines ~= nil and LAST_READ_OPTS.lines <= 24)
 end
 
 print(string.format("\n%s (%d failure(s))", failures == 0 and "PASS" or "FAIL", failures))
