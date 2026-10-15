@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realSentinelReader, realClearSentinel, realPendingRequests, bridgeHome, bridgeScriptEnv, bridgeDir,
+  ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realSentinelReader, realClearSentinel, realPendingRequests, bridgeHome, bridgeScriptEnv, bridgeDir, movedSince,
   armSequence, ACTION, RELOAD_MIN_MS,
   type BridgeIO, type Mirror, type PendingReq, type TernResult, type ArmStatus,
 } from "./tern-bridge-sweep.js";
@@ -253,6 +253,30 @@ for (const failing of ["drain", "drain-start"] as const) {
   w.mirrorAdvances = true; w.mirror = { tick: 50, vm: "vmLate" }; w.clock += 5000; w.calls = [];
   const out = tick(st, b);
   t("arm-retry r7: next tick after ready timeout finishes arm+drain, no reload", out === "rearmed" && reloads(w) === 0 && has(w, ".drain") && st.armedVm === "vmLate");
+}
+
+// --- r8: TBS-READY-RETRY — the cross-tick ready stage uses the same rule as the in-reload wait (moved vs the pre-reload baseline) ---
+{ // the reviewer's control: the mirror stays {vm:A, tick:0} — a later tick must NOT arm/drain/complete
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);                                   // armed vmA
+  w.mirrorAdvances = false; w.onReload = () => { /* bridge never comes back: the mirror stays exactly as before the reload */ };
+  w.clock += 5000; tick(st, b);                  // tick frozen: stall clock starts (lastTickChangeMs = this tick)
+  w.clock += 5100; w.calls = [];                 // > 5s frozen and past the 5s mirror throttle => reload; ready never comes
+  t("ready-retry: first wait times out => owed at ready", tick(st, b) === "reload-failed" && st.owedAfterReload?.stage === "ready");
+  w.clock += 5000; w.calls = []; w.control = [];
+  const out = tick(st, b);
+  t("ready-retry: next tick, mirror unchanged => stays at ready", out === "reload-failed" && st.owedAfterReload?.stage === "ready");
+  t("ready-retry: ... no arm-scan, no drain", !has(w, ".arm-scan") && !has(w, ".drain"));
+  t("ready-retry: ... no 'complete' in the audit", !w.control.some((l) => /complete/.test(l)));
+  t("ready-retry: ... and no new reload", reloads(w) === 0);
+  w.mirror = { tick: 99, vm: "vmB" }; w.clock += 5000; w.calls = [];
+  t("ready-retry: once the mirror really moves => arm + drain, rearmed", tick(st, b) === "rearmed" && has(w, ".drain") && st.armedVm === "vmB" && st.owedAfterReload === null);
+}
+{ // same vm, tick moved (bridge kept its vm id but ticks again) counts as ready
+  t("movedSince: tick moved, same vm => ready", movedSince({ vm: "A", tick: 3 }, { vm: "A", tick: 4 }));
+  t("movedSince: unchanged => not ready", !movedSince({ vm: "A", tick: 3 }, { vm: "A", tick: 3 }));
+  t("movedSince: unreadable now => not ready", !movedSince({ vm: "A", tick: 3 }, null));
+  t("movedSince: unreadable baseline, readable now => ready", movedSince(null, { vm: "A", tick: 0 }));
 }
 
 // --- r5: TBS-REQUEST-CLASS — start classification comes from the decoded top-level op ---

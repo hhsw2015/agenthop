@@ -89,7 +89,12 @@ export type BridgeState = {
   lastReloadMs: number;
   /** TBS-ARM-RETRY: a reload that succeeded but whose arm (and therefore drain) did not complete. The obligation is kept here and
    *  retried EVERY tick — independent of the 60s reload debounce, so finishing a reload never waits for (or causes) another one. */
-  owedAfterReload: { vm: string | null; why: string; startStuck: boolean; stage: "ready" | "arm" | "drain"; reason: string } | null;
+  owedAfterReload: {
+    vm: string | null; why: string; startStuck: boolean; stage: "ready" | "arm" | "drain"; reason: string;
+    /** TBS-READY-RETRY: the mirror as it was BEFORE the reload. "ready" (now or on a later tick) = vm or tick moved against
+     *  THIS baseline — the same rule as the in-reload wait, never merely "the mirror is readable". */
+    baseline: Mirror;
+  } | null;
 };
 export function initialBridgeState(): BridgeState {
   return { lastMirrorMs: -Infinity, armedVm: null, lastTick: null, lastTickChangeMs: -Infinity, lastReloadMs: -Infinity, owedAfterReload: null };
@@ -171,7 +176,7 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
   if (st.lastTickChangeMs === -Infinity) st.lastTickChangeMs = now; // first observation starts the stall clock
 
   // owed work from an earlier successful reload (arm → drain) comes first, before any new reload decision
-  if (st.owedAfterReload !== null) return finishAfterReload(st, io, mirror.vm);
+  if (st.owedAfterReload !== null) return finishAfterReload(st, io, mirror);
 
   // ③ health first: a positive stall signal from the bridge's own files (tern answered, so this is not UNKNOWN).
   const stuck = io.pendingRequests().filter((r) => r.ageMs > REQ_STUCK_MS);
@@ -217,7 +222,7 @@ function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]
   while (!ready) {
     if (run(io, "mirror").ok) {
       const after = io.readMirror();
-      ready = after !== null && (before === null || after.vm !== before.vm || after.tick !== before.tick);
+      ready = movedSince(before, after);
       if (ready) { st.lastTick = after!.tick; st.lastTickChangeMs = io.nowMs(); }
     }
     if (ready || io.nowMs() >= deadline) break;
@@ -225,19 +230,26 @@ function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]
   }
   // From here a reload HAPPENED: whatever is left (ready, arm, drain) is an obligation kept across ticks until the WHOLE chain
   // succeeds, never re-entering the reload debounce (TBS-ARM-RETRY, coordinator ruling).
-  st.owedAfterReload = { vm: null, why, startStuck: stuck.some((q) => q.isStart), stage: "ready", reason: "" };
+  st.owedAfterReload = { vm: null, why, startStuck: stuck.some((q) => q.isStart), stage: "ready", reason: "", baseline: before };
   if (!ready) {
     st.owedAfterReload.reason = `not ready within ${READY_WAIT_MS}ms`;
     io.controlLog(`tern-bridge reload (${why}): reloaded but not ready within ${READY_WAIT_MS}ms — owed, retry next tick (no reload)`);
     return "reload-failed";
   }
-  const out = finishAfterReload(st, io, io.readMirror()?.vm ?? null);
+  const out = finishAfterReload(st, io, io.readMirror());
   return out === "rearmed" ? "reloaded" : out;
 }
 
 /** The post-reload obligation: arm sequence, then drain (+drain-start). A stopped arm keeps the obligation (no drain after a half
  *  arm) and is retried on the next tick WITHOUT another reload. Discharged only when arm completed and the drain trigger was sent. */
-function finishAfterReload(st: BridgeState, io: BridgeIO, vm: string | null): TickOutcome {
+/** The one readiness rule: after a reload the bridge is ready iff the mirror is readable and its vm or tick differs from the
+ *  pre-reload baseline (a baseline that was unreadable makes any readable mirror count). */
+export function movedSince(baseline: Mirror, now: Mirror): boolean {
+  return now !== null && (baseline === null || now.vm !== baseline.vm || now.tick !== baseline.tick);
+}
+
+function finishAfterReload(st: BridgeState, io: BridgeIO, now: Mirror): TickOutcome {
+  const vm = now?.vm ?? null;
   const owed = st.owedAfterReload!;
   const keep = (stage: "ready" | "arm" | "drain", reason: string): TickOutcome => {
     owed.stage = stage; owed.reason = reason; owed.vm = vm;
@@ -245,8 +257,9 @@ function finishAfterReload(st: BridgeState, io: BridgeIO, vm: string | null): Ti
     return "reload-failed";
   };
   if (owed.stage === "ready") {
-    // a ready-wait that timed out last time: this tick's mirror already ran and moved (we are here), so the bridge answers now
-    if (vm === null) return keep("ready", "mirror still unreadable");
+    // a ready-wait that timed out last time: same rule as the in-reload wait — moved against the pre-reload baseline
+    if (now === null) return keep("ready", "mirror still unreadable");
+    if (!movedSince(owed.baseline, now)) return keep("ready", `mirror unchanged since the reload (vm ${now.vm}, tick ${now.tick})`);
     owed.stage = "arm";
   }
   if (owed.stage === "arm") {
