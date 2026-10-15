@@ -34,6 +34,7 @@ local ticks = 0
 local lastMs = nil -- r4 ③: wall cost (ms) of the PREVIOUS mirror tick, published so a >50ms tail is observable in agents.json itself
 local maxMs = 0
 local lastPhase = nil -- r5: previous completed tick's cumulative ms per segment
+local timerState = "running" -- #1036: "running" | "stopped-late"; declared BEFORE mirror() so mirror publishes the live value
 -- r6 CHEAP SOURCE (coordinator's live split timing, clean VM): cx.agents:list() costs ~28ms (8 agents; cross-session aggregation +
 -- last_message text) and tern.json.encode of its result another ~25ms (18 KB) — together the 40-50ms+ tick that killed every hook in
 -- r1-r4. cx.session:panes() costs ~0.17ms and its PaneInfo already carries what the mirror publishes. So the mirror NEVER calls
@@ -73,6 +74,7 @@ local function mirror(cx)
     window = WINDOW_KEY,
     tick_ms = lastMs, -- cost of the previous COMPLETED tick
     tick_ms_max = maxMs,
+    timer = timerState, -- #1036: "running" | "stopped-late" (the accelerator stopped itself; the command sweep is liveness)
     phase_ms = lastPhase, -- previous completed tick's cumulative ms per segment
     agents = (#agents > 0) and agents or tern.json.array({}),
     error = (not ok) and tostring(panes) or nil,
@@ -133,8 +135,13 @@ local function drain(cx, wantStart)
     if name:match("%.json$") then
       local id = (name:gsub("%.json$", ""))
       local path = REQ .. "/" .. name
+      -- BTF-SV-P2-1: classify by the DECODED top-level op, never a text regex (an escaped `st\u0061rt` or a nested `"op":"start"`
+      -- inside another field made classification and execution disagree). Undecodable ⇒ the fast `drain` claims it and reports
+      -- "bad request json" (claim.handle), so a malformed request can never strand on drain-start.
       local okPeek, peek = pcall(function() return tern.fs.read(path) end)
-      local isStart = okPeek and type(peek) == "string" and peek:find('"op"%s*:%s*"start"') ~= nil
+      local okDec, req = false, nil
+      if okPeek and type(peek) == "string" then okDec, req = pcall(function() return tern.json.decode(peek) end) end
+      local isStart = okDec and type(req) == "table" and req.op == "start"
       if isStart == wantStart then -- this command's op class only; the other class is left for its own command
         local claimed, text = claim.claim(
           function(p) return tern.fs.read(p) end,
@@ -152,31 +159,55 @@ end
 -- tern.carly.* needs a SCOPED window callback, so this runs from inside the poll loop. Returns true only when the arming status was
 -- durably recorded, so a transient failure (e.g. control dir missing) is retried next tick (dedup keeps the retry idempotent) — TA-A2-ARM.
 local PATROL_TITLE = "agenthop tern patrol"
-local function registerSentinel()
-  local status = { ts = tern.now(), scheduled = false }
+-- #1036 ②: `arm` once ran three cross-VM tern.carly calls (tasks + cancel + schedule) in one hook and crossed 50ms (live 11:36:16).
+-- It is now three commands, ONE tern.carly call each, so no single hook pays for more than one:
+--   arm-scan     — tern.carly.tasks(): record the ids of our prior patrol tasks in kv `bridge.arm_cancel` (cheap)
+--   arm-cancel   — cancel ONE recorded id per run (re-run until the list is empty)
+--   arm-schedule — schedule ONE fresh patrol and record sentinel.json (only when nothing is left to cancel, so no duplicate)
+-- `arm` = arm-scan + (cancel/schedule left to the swarm's follow-up runs): the swarm runs arm-scan, then arm-cancel until it reports
+-- done, then arm-schedule. Each step persists its progress (kv + sentinel.json), so a killed step is simply re-run.
+local function kvGet(k) local ok, v = pcall(function() return tern.kv.get(k) end); return ok and v or nil end
+local function kvSet(k, v) return pcall(function() tern.kv.set(k, v) end) end
+local function writeStatus(status)
+  return pcall(function() tern.fs.write(CTL .. "/sentinel.json", tern.json.encode(status)) end)
+end
+local function armScan()
+  local ids = {}
+  local ok, err = pcall(function()
+    for _, t in ipairs(tern.carly.tasks()) do
+      if t.title == PATROL_TITLE then ids[#ids + 1] = t.id end
+    end
+  end)
+  if not ok then writeStatus({ ts = tern.now(), scheduled = false, step = "scan", error = tostring(err) }); return false end
+  kvSet("bridge.arm_cancel", ids)
+  writeStatus({ ts = tern.now(), scheduled = false, step = "scanned", pending_cancel = #ids })
+  return true
+end
+local function armCancel()
+  local ids = kvGet("bridge.arm_cancel") or {}
+  if #ids == 0 then return "done" end
+  local id = table.remove(ids, 1)
+  pcall(function() tern.carly.cancel(id) end) -- a missing id is fine (already gone)
+  kvSet("bridge.arm_cancel", ids)
+  writeStatus({ ts = tern.now(), scheduled = false, step = "cancelling", pending_cancel = #ids })
+  return (#ids == 0) and "done" or "more"
+end
+local function armSchedule()
+  local pending = kvGet("bridge.arm_cancel")
+  if pending ~= nil and #pending > 0 then
+    writeStatus({ ts = tern.now(), scheduled = false, step = "blocked", pending_cancel = #pending, error = "cancel prior patrols first" })
+    return false
+  end
+  local status = { ts = tern.now(), scheduled = false, step = "schedule" }
   local okSrc, src = pcall(function() return tern.fs.read("sentinel.luau") end)
   if not okSrc or type(src) ~= "string" then
     status.error = "sentinel.luau unreadable" -- the bridge (A1) still runs without the sentinel
   else
-    pcall(function()
-      for _, t in ipairs(tern.carly.tasks()) do
-        if t.title == PATROL_TITLE then
-          pcall(function() tern.carly.cancel(t.id) end)
-        end
-      end
-    end)
-    local okSched, idOrErr = pcall(function()
-      return tern.carly.schedule({ title = PATROL_TITLE, when = "every 1m", check = src })
-    end)
+    local okSched, idOrErr = pcall(function() return tern.carly.schedule({ title = PATROL_TITLE, when = "every 1m", check = src }) end)
     status.scheduled = okSched
-    if okSched then
-      status.id = idOrErr
-    else
-      status.error = tostring(idOrErr)
-    end
+    if okSched then status.id = idOrErr else status.error = tostring(idOrErr) end
   end
-  local okWrite = pcall(function() tern.fs.write(CTL .. "/sentinel.json", tern.json.encode(status)) end)
-  return okWrite -- only "armed" once the status is durably recorded (dir now ensured first)
+  return writeStatus(status) and status.scheduled
 end
 
 -- r2 SCHEDULING (bridge tick-freeze, corrected root cause — PROTOCOL.md §4). Tern disables at HOOK granularity: every
@@ -194,14 +225,6 @@ end
 -- on its own `arm` command hook (`tern ctl plugins run plugin.agenthop-agents-bridge.arm`, triggered by the swarm after each
 -- load/reload). If that hook is disabled, only arming is lost; the mirror and the drains keep running. Dedup-by-title keeps a repeat
 -- arm idempotent.
-local sentinelArmed = false
-local function arm(cx)
-  if cx == nil or sentinelArmed then return end
-  ensure() -- TA-A2-ARM: control dirs exist BEFORE arming, so the sentinel.json write cannot ENOENT on first boot
-  if registerSentinel() then
-    sentinelArmed = true -- else leave false: a later timer/`arm` command retries (dedup-by-title makes the retry safe)
-  end
-end
 
 local function mirrorTick(cx)
   ensure()
@@ -212,13 +235,38 @@ end
 -- sweep every ~5s (`tern ctl plugins run plugin.agenthop-agents-bridge.mirror`); a slow call there disables only that command until
 -- reload, never drains or arm. Secondary = a best-effort self-renewing `tern.timer` chain on the TIMER hook (not await); if Tern ever
 -- disables the timer hook the chain stops and the command-driven mirror carries liveness alone. Each timer tick renews BEFORE working.
+-- #1036: the timer chain is ONLY a foreground accelerator, never a liveness source. Live 12:01:42 the timer hook was killed while
+-- tick_ms was 0.28ms — the work was cheap; the CALLBACK was late (macOS App Nap / background timer coalescing delays it, and the
+-- delayed callback is charged to the 50ms budget). Liveness is the swarm's 5s `mirror` command sweep (#1033). So the chain:
+--   * self-stops when a callback fires far later than scheduled (lateness > TIMER_LATE_MS ⇒ we are napped/backgrounded): no
+--     successor is queued, so a late batch can never hit the budget; it reports `timer` = "stopped-late" in agents.json;
+--   * may be disabled by Tern without alarm (the command sweep keeps the mirror alive);
+--   * restarts on the next `mirror` COMMAND run (the sweep), i.e. as soon as we are serviced on time again.
+local TIMER_LATE_MS = 400
+local timerDue = nil
 local function mirrorTimer(cx)
+  local now = tern.now()
+  if timerDue ~= nil and now - timerDue > TIMER_LATE_MS then
+    timerState = "stopped-late" -- napped/backgrounded: do not re-arm; the command sweep restarts us
+    timerDue = nil
+    return
+  end
+  timerDue = now + POLL_MS
   tern.timer(POLL_MS, function(nextCx) mirrorTimer(nextCx) end)
   if cx ~= nil then mirrorTick(cx) end
 end
 
-tern.command({ id = "arm", title = "agenthop bridge: arm patrol sentinel", run = function(cx) sentinelArmed = false; arm(cx) end })
-tern.command({ id = "mirror", title = "agenthop bridge: mirror now", run = function(cx) mirrorTick(cx) end })
+tern.command({ id = "arm-scan", title = "agenthop bridge: arm 1/3 scan prior patrols", run = function() ensure(); armScan() end })
+tern.command({ id = "arm-cancel", title = "agenthop bridge: arm 2/3 cancel one prior patrol", run = function() ensure(); armCancel() end })
+tern.command({ id = "arm-schedule", title = "agenthop bridge: arm 3/3 schedule patrol", run = function() ensure(); armSchedule() end })
+-- `arm` (compatibility: #1033's sweep and agenthop_tern's recovery call it) = the cheap first step only; the swarm then runs
+-- arm-cancel until sentinel.json says pending_cancel=0, then arm-schedule. One tern.carly call per hook, always.
+tern.command({ id = "arm", title = "agenthop bridge: arm patrol sentinel (step 1; then arm-cancel…, arm-schedule)", run = function() ensure(); armScan() end })
+tern.command({ id = "mirror", title = "agenthop bridge: mirror now", run = function(cx)
+  local wasStopped = timerState == "stopped-late"
+  mirrorTick(cx) -- publishes the CURRENT timer state (stopped-late is reported once, then the restart below takes effect)
+  if wasStopped then timerState = "running"; mirrorTimer(nil) end -- serviced on time again ⇒ restart the accelerator
+end })
 tern.command({ id = "drain", title = "agenthop bridge: drain requests", run = function(cx) ensure(); pcall(function() drain(cx, false) end) end })
 tern.command({ id = "drain-start", title = "agenthop bridge: drain start requests", run = function(cx) ensure(); pcall(function() drain(cx, true) end) end })
 

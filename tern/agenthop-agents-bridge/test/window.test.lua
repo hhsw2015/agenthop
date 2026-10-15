@@ -28,10 +28,60 @@ local function encode(v)
   elseif t == "string" then return string.format("%q", v)
   else return tostring(v) end
 end
+-- A REAL minimal JSON decoder (objects, arrays, strings with \uXXXX/escapes, numbers, true/false/null) so the fixture can prove
+-- classification uses the DECODED top-level op (BTF-SV-P2-1): escaped keys/values and nested "op" fields must decode faithfully.
 local function decode(s)
-  local op = s:match('"op":"(%w+)"')
-  if not op then error("bad json") end
-  return { op = op, prompt = s:match('"prompt":"([^"]*)"'), code = s:match('"code":"([^"]*)"'), cwd = "/" }
+  local i = 1
+  local function ws() i = s:find("[^ \t\r\n]", i) or (#s + 1) end
+  local val
+  local function str()
+    i = i + 1
+    local out = {}
+    while true do
+      local c = s:sub(i, i)
+      if c == "" then error("bad json") end
+      if c == '"' then i = i + 1; return table.concat(out) end
+      if c == "\\" then
+        local e = s:sub(i + 1, i + 1)
+        if e == "u" then out[#out + 1] = utf8.char(tonumber(s:sub(i + 2, i + 5), 16)); i = i + 6
+        else out[#out + 1] = ({ n = "\n", t = "\t", r = "\r", b = "\b", f = "\f" })[e] or e; i = i + 2 end
+      else out[#out + 1] = c; i = i + 1 end
+    end
+  end
+  function val()
+    ws()
+    local c = s:sub(i, i)
+    if c == "{" then
+      i = i + 1; local o = {}; ws()
+      if s:sub(i, i) == "}" then i = i + 1; return o end
+      while true do
+        ws(); local k = str(); ws()
+        if s:sub(i, i) ~= ":" then error("bad json") end
+        i = i + 1; o[k] = val(); ws()
+        local d = s:sub(i, i); i = i + 1
+        if d == "}" then return o elseif d ~= "," then error("bad json") end
+      end
+    elseif c == "[" then
+      i = i + 1; local a = {}; ws()
+      if s:sub(i, i) == "]" then i = i + 1; return a end
+      while true do
+        a[#a + 1] = val(); ws()
+        local d = s:sub(i, i); i = i + 1
+        if d == "]" then return a elseif d ~= "," then error("bad json") end
+      end
+    elseif c == '"' then return str()
+    elseif s:sub(i, i + 3) == "true" then i = i + 4; return true
+    elseif s:sub(i, i + 4) == "false" then i = i + 5; return false
+    elseif s:sub(i, i + 3) == "null" then i = i + 4; return nil
+    else
+      local n = s:match("^-?%d+%.?%d*[eE]?[-+]?%d*", i)
+      if not n or n == "" then error("bad json") end
+      i = i + #n; return tonumber(n)
+    end
+  end
+  local v = val(); ws()
+  if i <= #s then error("bad json") end
+  return v
 end
 
 -- ---- hook registry: sleep continuations share hook "await"; each command is hook "command <id>" ----
@@ -40,6 +90,7 @@ local commands = {}      -- id -> run fn
 local files, dirs, requests = {}, {}, {}
 local opCalls = { list = 0, start = 0, stop = 0 }
 local carlyCalls = 0 -- every tern.carly.* call (tasks/cancel/schedule)
+carlyTasks, carlySchedules, carlyCancels, kvStore = 0, 0, {}, {}
 clock = 1000      -- global so the tern.now mock can advance it
 local timers = {}     -- tern.timer callbacks (the TIMER hook)
 
@@ -87,9 +138,11 @@ _G.tern = {
       return out
     end,
   },
-  carly = { tasks = function() carlyCalls = carlyCalls + 1; return {} end,
-            cancel = function() carlyCalls = carlyCalls + 1 end,
-            schedule = function() carlyCalls = carlyCalls + 1; return 7 end },
+  carly = { tasks = function() carlyCalls = carlyCalls + 1; carlyTasks = carlyTasks + 1
+              return { { id = 31, title = "agenthop tern patrol" }, { id = 32, title = "agenthop tern patrol" }, { id = 99, title = "other" } } end,
+            cancel = function(id) carlyCalls = carlyCalls + 1; carlyCancels[#carlyCancels + 1] = id end,
+            schedule = function() carlyCalls = carlyCalls + 1; carlySchedules = carlySchedules + 1; return 7 end },
+  kv = { get = function(k) return kvStore[k] end, set = function(k, v) kvStore[k] = v end },
   timer = function(_ms, fn) timers[#timers + 1] = fn; return { cancel = function() end } end,
   sleep = function(_ms) return { next = function(_, fn) sleepPending[#sleepPending + 1] = fn end } end,
   command = function(def) commands[def.id] = def.run end,
@@ -116,8 +169,17 @@ ck("r4: first mirror timer tick makes NO tern.carly.* call and ticks (tick 1)", 
 ck("r4: the timer chain renews itself (successor timer queued)", #timers == 1)
 pumpMirror()
 ck("r4: later mirror timer ticks still make NO tern.carly.* call", carlyCalls == 0)
-commands["arm"](cx)
-ck("r3: the `arm` command arms (tern.carly called, sentinel.json recorded)", carlyCalls >= 2 and files["/h/.agenthop/tern-panes/sentinel.json"] ~= nil)
+-- #1036 ②: arm is three commands, ONE tern.carly call per hook (11:36:16 live: three calls in one hook crossed 50ms)
+local function carlyDelta(fn) local c0 = carlyCalls; fn(); return carlyCalls - c0 end
+local SENT = "/h/.agenthop/tern-panes/sentinel.json"
+ck("#1036: commands arm-scan / arm-cancel / arm-schedule registered", type(commands["arm-scan"]) == "function" and type(commands["arm-cancel"]) == "function" and type(commands["arm-schedule"]) == "function")
+ck("#1036: arm-scan = exactly ONE tern.carly call (tasks), records our 2 prior patrol ids", carlyDelta(function() commands["arm-scan"](cx) end) == 1 and #kvStore["bridge.arm_cancel"] == 2)
+ck("#1036: arm-schedule is BLOCKED while prior patrols remain (no duplicate patrol)", carlyDelta(function() commands["arm-schedule"](cx) end) == 0 and (files[SENT] or ""):find('"step":"blocked"', 1, true) ~= nil)
+ck("#1036: arm-cancel = exactly ONE tern.carly call per run (cancels id 31)", carlyDelta(function() commands["arm-cancel"](cx) end) == 1 and carlyCancels[1] == 31)
+ck("#1036: second arm-cancel cancels id 32; the unrelated task 99 is never touched", carlyDelta(function() commands["arm-cancel"](cx) end) == 1 and carlyCancels[2] == 32 and #carlyCancels == 2)
+ck("#1036: arm-cancel with nothing left makes ZERO tern.carly calls", carlyDelta(function() commands["arm-cancel"](cx) end) == 0)
+ck("#1036: arm-schedule = exactly ONE tern.carly call (schedule) and records scheduled=true", carlyDelta(function() commands["arm-schedule"](cx) end) == 1 and (files[SENT] or ""):find('"scheduled":true', 1, true) ~= nil)
+ck("#1036: legacy `arm` = the cheap first step only (ONE tern.carly call)", carlyDelta(function() commands["arm"](cx) end) == 1)
 
 -- r4 ②③: VM identity + per-tick cost published in agents.json
 local js0 = files[AGENTS] or ""
@@ -196,6 +258,48 @@ ck("r7: one drain trigger handles AT MOST ONE request (q1), the rest wait", opCa
   and files[RES .. "q1.json"] ~= nil and requests["q2.json"] ~= nil and requests["q3.json"] ~= nil)
 commands["drain"](cx); commands["drain"](cx)
 ck("r7: subsequent triggers drain the rest in FIFO order", opCalls.stop == stopsBefore + 3 and requests["q2.json"] == nil and requests["q3.json"] == nil)
+
+-- ---- #1036 ①: the timer is a foreground ACCELERATOR — it stops itself when a callback fires late (napped/backgrounded) ----
+-- earlier sections consumed timers by hand; take the live chain's CURRENT pending callback (exactly one exists while running)
+ck("#1036: a running timer chain has exactly one pending callback", #timers == 1)
+local onTime = table.remove(timers, 1)
+onTime(cx) -- fires on time (mock clock advances only ~7ms per tern.now call)
+ck("#1036: an ON-TIME callback renews exactly one successor", #timers == 1)
+local late = table.remove(timers, 1)
+clock = clock + 5000 -- this callback fires ~5s late (App Nap / background coalescing)
+late(cx)
+ck("#1036: a LATE callback re-arms NOTHING (the chain stops itself instead of batching into the budget)", #timers == 0)
+commands["mirror"](cx)
+ck("#1036: agents.json reports timer=stopped-late on the next mirror", (files[AGENTS] or ""):find('"timer":"stopped-late"', 1, true) ~= nil)
+ck("#1036: the next `mirror` COMMAND (the 5s sweep) restarts the accelerator (one pending callback again)", #timers == 1)
+commands["mirror"](cx)
+ck("#1036: after restart agents.json reports timer=running", (files[AGENTS] or ""):find('"timer":"running"', 1, true) ~= nil)
+ck("#1036: repeated mirror commands while running do NOT stack extra timer chains", #timers == 1)
+
+-- ---- BTF-SV-P2-1: classify by DECODED top-level op (escaped key / escaped value / nested field) + plain controls ----
+for k in pairs(requests) do requests[k] = nil end
+local function runOnly(cmd, body)
+  for k in pairs(requests) do requests[k] = nil end
+  requests["z.json"] = body
+  local s0, st0 = opCalls.stop, opCalls.start
+  commands[cmd](cx)
+  return { claimed = requests["z.json"] == nil, stop = opCalls.stop - s0, start = opCalls.start - st0 }
+end
+local esc = runOnly("drain", '{"op":"st\\u0061rt","prompt":"p","cwd":"/"}')
+ck("P2-1 escaped VALUE (st\\u0061rt = start): fast drain does NOT claim/run it", not esc.claimed and esc.start == 0)
+local escS = runOnly("drain-start", '{"op":"st\\u0061rt","prompt":"p","cwd":"/"}')
+ck("P2-1 escaped VALUE: drain-start claims and runs it as start", escS.claimed and escS.start == 1)
+local key = runOnly("drain-start", '{"\\u006fp":"start","prompt":"p","cwd":"/"}')
+ck("P2-1 escaped KEY (\\u006fp = op): drain-start claims and runs start", key.claimed and key.start == 1)
+local nest = runOnly("drain-start", '{"op":"stop","agent":1,"meta":{"op":"start"}}')
+ck("P2-1 NESTED op:start inside a stop: drain-start does NOT claim it", not nest.claimed and nest.stop == 0)
+local nestF = runOnly("drain", '{"op":"stop","agent":1,"meta":{"op":"start"}}')
+ck("P2-1 NESTED: fast drain claims and runs stop (the top-level op)", nestF.claimed and nestF.stop == 1 and nestF.start == 0)
+local pS = runOnly("drain-start", '{"op":"start","prompt":"p","cwd":"/"}')
+local pF = runOnly("drain", '{"op":"stop","agent":1}')
+ck("P2-1 controls: plain start → drain-start, plain stop → drain", pS.claimed and pS.start == 1 and pF.claimed and pF.stop == 1)
+local bad = runOnly("drain", '{ not json')
+ck("P2-1: undecodable request goes to fast drain (reported, never stranded on drain-start)", bad.claimed and (files[RES .. "z.json"] or ""):find("bad request json", 1, true) ~= nil)
 
 print(string.format("\n%s (%d failure(s))", failures == 0 and "PASS" or "FAIL", failures))
 os.exit(failures == 0 and 0 or 1)

@@ -108,7 +108,9 @@ function M.execute(cx, req)
     local fn, cerr = compile("local cx = ...\n" .. req.code)
     if not fn then return { ok = false, error = "eval compile: " .. tostring(cerr) } end
     local o, v = pcall(fn, cx)
-    return { ok = o, value = o and v or nil, error = (not o) and tostring(v) or nil }
+    -- BTF-SV-P2-2: keep a falsy return as-is (`o and v or nil` turned `return false` into value=nil).
+    if o then return { ok = true, value = v } end
+    return { ok = false, error = tostring(v) }
   else
     return { ok = false, error = "unknown op: " .. tostring(op) }
   end

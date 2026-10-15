@@ -108,6 +108,15 @@ do
   ck("execute: ask -> ok, called once", M.execute(cx, { op = "ask", agent = 1, text = "hi" }).ok == true and calls.ask == 1)
   ck("execute: start -> ok + pane", (function() local r = M.execute(cx, { op = "start", prompt = "p", cwd = "/" }) ; return r.ok == true and r.pane == 42 end)())
   ck("execute: unknown op -> error", M.execute(cx, { op = "frobnicate" }).ok == false)
+  -- BTF-SV-P2-2: eval keeps falsy returns (was `o and v or nil`, which turned `return false` into ok=true,value=nil)
+  local function ev(code) return M.execute(cx, { op = "eval", code = code }) end
+  local rf, rt, r0, re, rn, rx = ev("return false"), ev("return true"), ev("return 0"), ev('return ""'), ev("return nil"), ev("error('boom')")
+  ck("P2-2 eval false -> ok=true, value=false", rf.ok == true and rf.value == false)
+  ck("P2-2 eval true -> ok=true, value=true", rt.ok == true and rt.value == true)
+  ck("P2-2 eval 0 -> ok=true, value=0", r0.ok == true and r0.value == 0)
+  ck('P2-2 eval "" -> ok=true, value=""', re.ok == true and re.value == "")
+  ck("P2-2 eval nil -> ok=true, value=nil", rn.ok == true and rn.value == nil)
+  ck("P2-2 eval error -> ok=false + error text", rx.ok == false and type(rx.error) == "string" and rx.error:find("boom", 1, true) ~= nil)
 end
 
 -- ===== exactly-once boundary: claim + execute then crash before result => blind reissue double-executes =====
