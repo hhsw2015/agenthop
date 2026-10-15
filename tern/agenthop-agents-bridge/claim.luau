@@ -67,7 +67,9 @@ function M.execute(cx, req)
     local compile = loadstring or load
     if type(req.code) ~= "string" then return { ok = false, error = "eval: code must be a string" } end
     if type(compile) ~= "function" then return { ok = false, error = "eval: no loadstring in this VM" } end
-    local fn, cerr = compile(req.code)
+    -- `cx` is visible to the snippet both as a named local (`cx.agents:list()`) and as `...` — compile a wrapper that binds it, so
+    -- callers need no boilerplate. The snippet's own `return` is the result.
+    local fn, cerr = compile("local cx = ...\n" .. req.code)
     if not fn then return { ok = false, error = "eval compile: " .. tostring(cerr) } end
     local o, v = pcall(fn, cx)
     return { ok = o, value = o and v or nil, error = (not o) and tostring(v) or nil }

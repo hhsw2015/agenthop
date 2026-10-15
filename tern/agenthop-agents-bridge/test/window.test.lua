@@ -123,7 +123,7 @@ commands["mirror"](cx)
 ck("mirror command: a manual kick advances tick (3→4)", tickOf() == 4)
 
 -- ---- 7. eval op (fast class): compiled with loadstring/load, called with cx, value returned ----
-requests["e1.json"] = '{"op":"eval","code":"local cx = ...; return #cx.agents:list()"}'
+requests["e1.json"] = '{"op":"eval","code":"return #cx.agents:list()"}'
 commands["drain"](cx)
 local er = files[RES .. "e1.json"] or ""
 ck("eval: runs via drain and returns the value", er:find('"ok":true', 1, true) ~= nil and er:find('"value":1', 1, true) ~= nil)
