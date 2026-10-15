@@ -17,11 +17,18 @@ type W = {
   clock: number; recs: SeatRecord[] | null; sessions: string[] | null; blocks: Set<number> | null;
   stopped: string[]; deleted: string[]; marked: string[]; gcCode: number; gcLine: string;
   tmp: Array<{ name: string; ageMs: number }>; removed: string[]; logs: string[]; audit: string[];
+  owners?: Record<string, number[] | null>;
 };
 const world = (): W => ({ clock: 0, recs: [], sessions: ["default"], blocks: new Set(), stopped: [], deleted: [], marked: [],
   gcCode: 0, gcLine: "gc: results=0 requests_quarantined=0 requests_held=0 tmp=0 quarantine_expired=0", tmp: [], removed: [], logs: [], audit: [] });
 const io = (w: W): OrphanIO => ({
   seatRecords: () => w.recs, herdrSessions: () => w.sessions, ternBlocks: () => w.blocks,
+  socketOwners: (n) => {
+    if (w.owners && n in w.owners) return w.owners[n]!;
+    if (!(w.sessions ?? []).includes(n)) return [];
+    const own = (w.recs ?? []).flatMap((r) => r.workers).filter((x) => x.herdr_session === n).map((x) => x.server_pid).filter((p): p is number => typeof p === "number");
+    return own.length ? [own[own.length - 1]!] : [];
+  },
   herdrStop: (n) => { w.stopped.push(n); return true; },
   herdrDelete: (n) => { w.deleted.push(n); w.sessions = (w.sessions ?? []).filter((x) => x !== n); return true; },
   whileInstance: (sid, hs, inst, states, act) => {
@@ -35,7 +42,8 @@ const io = (w: W): OrphanIO => ({
   nowMs: () => w.clock, log: (l) => w.logs.push(l), audit: (l) => w.audit.push(l),
 });
 const round = (st: ReturnType<typeof initialOrphanState>, w: W) => { const r = runOrphanSweep(st, io(w)); w.clock += ORPHAN_EVERY_MS; return r; };
-const worker = (hs: string, state: string, pane: number) => ({ name: hs, herdr_session: hs, pane, kind: "tui", started_at: 1, stopped_at: null, state });
+// server_pid = pane + 50000, and the fake socket owner of a live session is the pid of the (last) record naming it
+const worker = (hs: string, state: string, pane: number) => ({ name: hs, herdr_session: hs, pane, kind: "tui", started_at: 1, stopped_at: null, state, server_pid: pane + 50000 });
 
 // --- throttle ---
 { const w = world(); const st = initialOrphanState(); runOrphanSweep(st, io(w)); w.clock += 1000;
@@ -229,7 +237,7 @@ for (const which of ["recs", "sessions", "blocks"] as const) {
 {
   const home = mkdtempSync(path.join(os.tmpdir(), "orphan-commit-"));
   const sid = "00000000-0000-4000-8000-000000000091";
-  const inst: RW = { name: "review-state", herdr_session: "review-state", pane: 555, kind: "tui", started_at: 1000, stopped_at: null, state: "live" };
+  const inst: RW = { name: "review-state", herdr_session: "review-state", pane: 555, kind: "tui", started_at: 1000, stopped_at: null, state: "live", server_pid: 50001 };
   const cur = () => { const r = readSeat(home, sid); return r.kind === "ok" ? r.workers[0]!.state : null; };
   const run = (start: RW, flipAt: number | null) => {
     writeWorkers(home, sid, [start]);
@@ -240,6 +248,7 @@ for (const which of ["recs", "sessions", "blocks"] as const) {
       // a legal locked writer (stopWorker) moves the instance to "stopping" AFTER this round's collection read
       ternBlocks: () => { if (rnd === flipAt) setWorkerState(home, sid, start, "stopping", null); return new Set([1]); },
       markWorker: realMarkWorker(home), whileInstance: realWhileInstance(home),
+      socketOwners: (n) => (sessions.includes(n) ? [50001] : []),
       herdrStop: (n) => { ev.push(`stop ${n} @${cur()}`); return true; },
       herdrDelete: (n) => { ev.push(`delete ${n} @${cur()}`); sessions = sessions.filter((x) => x !== n); return true; },
       gc: () => ({ code: 0, line: "gc: results=0 tmp=0" }), tmpFiles: () => [], removeTmp: () => false,

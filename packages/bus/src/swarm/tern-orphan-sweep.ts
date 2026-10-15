@@ -2,7 +2,8 @@
  * Orphan sweep (#1033 r3; user rule "no leaks", coordinator ruling: RECORD-DRIVEN). Runs every ORPHAN_EVERY_MS from the tern-bridge
  * sweep step. Three classes:
  *   ① a herdr session REGISTERED in a seat-shell record (workers[].herdr_session) whose worker is state "stopped" (or "orphan")
- *      but the herdr session still exists ⇒ `herdr session stop <name>` then `herdr session delete <name>`.
+ *      but the herdr session still exists ⇒ `herdr session stop <name>` then `herdr session delete <name>`, only when that record's
+ *      server_pid is the sole holder of the session's herdr.sock and no newer active record holds the name (r11, names are reused).
  *   ② a seat-shell worker in state "live" whose Tern block (workers[].pane) is gone from `tern ls --json` ⇒ mark the record
  *      "orphan" (+stopped_at), then ① applies to its herdr session on the following confirmations. "starting" (no block yet,
  *      pane 0) is never judged; a persisting "stopping" is reported as a possible leak, never marked or deleted (#1034 r3).
@@ -21,20 +22,23 @@
 import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { isWorker, type Worker as RecordedWorker } from "../tern-workers.js";
+import { isWorker, realWorkerDeps, type Worker as RecordedWorker } from "../tern-workers.js";
 import { updateSeatShell } from "./seat-shell-record.js";
 
 export const ORPHAN_EVERY_MS = 60_000;
 export const TMP_TTL_MS = 3_600_000;
 const NAME_SHAPE = /^[a-z0-9]+-[a-z0-9][a-z0-9-]*$/i; // `<role>-<task>`: a second check only
 
-export type Worker = { name?: unknown; herdr_session?: unknown; pane?: unknown; kind?: unknown; started_at?: unknown; stopped_at?: unknown; state?: unknown };
+export type Worker = { name?: unknown; herdr_session?: unknown; pane?: unknown; kind?: unknown; started_at?: unknown; stopped_at?: unknown; state?: unknown; server_pid?: unknown; ownership?: unknown };
 export type SeatRecord = { sid: string; workers: Worker[] };
 
 export type OrphanIO = {
   seatRecords: () => SeatRecord[] | null;              // null = seat-shell dir unreadable (UNKNOWN); [] = none
   herdrSessions: () => string[] | null;                // null = herdr unreachable (UNKNOWN)
   ternBlocks: () => Set<number> | null;                // live block ids from tern ls --json; null = UNKNOWN
+  /** pids holding the herdr session's herdr.sock (lsof); null = cannot observe. TBS-SV-NAME-REUSE: the proof of WHICH server a
+   *  session name currently belongs to — the name alone is not, because a later start may reuse it. */
+  socketOwners: (name: string) => number[] | null;
   herdrStop: (name: string) => boolean;
   herdrDelete: (name: string) => boolean;
   /** Mark ONE worker instance orphan. `inst` = the instance seen on both rounds (pane + started_at); the writer re-reads the record
@@ -125,17 +129,34 @@ export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; u
       } });
       continue;
     }
-    // ① stopped/orphan record whose herdr session still exists ⇒ stop + delete (two rounds)
+    // ① stopped/orphan record whose herdr session still exists ⇒ stop + delete (two rounds) — but ONLY the server this record
+    // started. TBS-SV-NAME-REUSE: names are reused (A stops, B starts the same role-task), so a historical entry proves nothing about
+    // the server now behind the name. It acts only when it is proven (#1034 r5 server_pid, not "unproven"), that pid is the sole
+    // holder of the session's herdr.sock right now, and no other record holds the name in an active state. Anything else ⇒ zero
+    // herdr actions, record kept (an old stopped entry is history, not a licence).
     if ((state === "stopped" || state === "orphan") && live.has(hs)) {
-      candidates.push({ key: `kill:${sid}:${hs}:${JSON.stringify(w.pane ?? null)}:${JSON.stringify(w.started_at ?? null)}`, act: () => {
-        let line = "";
+      const spid = typeof w.server_pid === "number" && Number.isSafeInteger(w.server_pid) && w.server_pid > 0 ? w.server_pid : null;
+      const newer = workers.some((o) => o.w !== w && o.w.herdr_session === hs && ["starting", "live", "stopping"].includes(str(o.w.state) ?? ""));
+      if (spid === null || w.ownership !== undefined || newer) {
+        io.log(`orphan-sweep: herdr session ${hs} (seat ${sid.slice(0, 8)}, record ${state}) not proven to be this record's server `
+          + `(${newer ? "a newer active record holds the name" : spid === null ? "no server_pid" : "ownership unproven"}) — no action, record kept`);
+        continue;
+      }
+      candidates.push({ key: `kill:${sid}:${hs}:${JSON.stringify(w.pane ?? null)}:${JSON.stringify(w.started_at ?? null)}:${spid}`, act: () => {
+        let line = "", skipped = "";
         const ran = io.whileInstance(sid, hs, { pane: w.pane ?? null, startedAt: w.started_at ?? null }, ["stopped", "orphan"], () => {
+          const owners = io.socketOwners(hs); // at the commit point, inside the lock
+          if (owners === null || owners.length !== 1 || owners[0] !== spid) {
+            skipped = owners === null ? "socket owner unobservable" : owners.length === 0 ? "no server holds the socket" : `socket held by ${owners.join(",")}, not ${spid}`;
+            return;
+          }
           const stopped = io.herdrStop(hs);
           const deleted = stopped && io.herdrDelete(hs);
-          line = `orphan-sweep herdr session ${hs} (seat ${sid.slice(0, 8)}, record ${state}): stop=${stopped} delete=${deleted}`;
+          line = `orphan-sweep herdr session ${hs} (seat ${sid.slice(0, 8)}, record ${state}, server ${spid}): stop=${stopped} delete=${deleted}`;
         });
-        if (ran) io.audit(line);
-        else io.log(`orphan-sweep: ${hs} (seat ${sid.slice(0, 8)}) is no longer this stopped/orphan instance — candidate dropped, record kept`);
+        if (!ran) io.log(`orphan-sweep: ${hs} (seat ${sid.slice(0, 8)}) is no longer this stopped/orphan instance — candidate dropped, record kept`);
+        else if (skipped) io.log(`orphan-sweep: herdr session ${hs} (seat ${sid.slice(0, 8)}) is not this record's server (${skipped}) — no action, record kept`);
+        else io.audit(line);
       } });
     }
   }
@@ -213,6 +234,10 @@ export function realWhileInstance(home: string): OrphanIO["whileInstance"] {
 }
 
 const HERDR_TIMEOUT_MS = 5_000;
+export function realSocketOwners(env: NodeJS.ProcessEnv = process.env): OrphanIO["socketOwners"] {
+  return realWorkerDeps(env).socketOwners; // the same lsof probe stopWorker uses (#1034 r5)
+}
+
 export function realHerdr(env: NodeJS.ProcessEnv = process.env) {
   const bin = env.HERDR_BIN || "herdr";
   const run = (args: string[]) => spawnSync(bin, args, { encoding: "utf8", timeout: HERDR_TIMEOUT_MS, env });
