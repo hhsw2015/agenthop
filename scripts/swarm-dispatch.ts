@@ -19,7 +19,7 @@
 //      SWARM_HANDOFF_LEAD_SEC (180), SWARM_LAUNCH (scripts/swarm-launch.sh), AH_HOME, SWARM_SELF.
 
 import { spawn, execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync, statSync, lstatSync, unlinkSync, openSync, readSync, fstatSync, closeSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, renameSync, existsSync, statSync, lstatSync, unlinkSync, openSync, readSync, fstatSync, closeSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -85,6 +85,7 @@ import { writeConsoleProjection } from "../packages/bus/src/swarm/console-projec
 import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swarm/idle-explainer.js";
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
+import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
 import { modelMarketEnabled } from "../packages/bus/src/swarm/model-market.js";
 import { pullModelMarket } from "../packages/bus/src/swarm/model-market-store.js";
 import { modelStaffingEnabled, taskFromNode, type StaffingTaskInput } from "../packages/bus/src/swarm/model-staffing.js";
@@ -1942,6 +1943,28 @@ async function main(): Promise<void> {
     catch (e) { log(`carly sweep failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
+  // Tern bridge sweep (#1033): the swarm-side duties of agenthop-agents-bridge r7 — drive the mirror command every ~5s, re-arm the
+  // sentinel when agents.json's per-load `vm` changes, and on a POSITIVE stall (tick frozen >5s / request unconsumed >2s) run
+  // reload → ready → arm → drain, debounced to one reload per 60s, one control-log line each. tern not answering ⇒ UNKNOWN ⇒ log only.
+  // DEFAULT OFF via SWARM_TERN_BRIDGE. Uses TERN_BIN + per-call timeout. Never edits the bridge.
+  const ternBridgeState = initialBridgeState();
+  const ternBridgeIO = {
+    tern: realTern(process.env),
+    readMirror: realMirrorReader(HOME),
+    pendingRequests: realPendingRequests(HOME, () => Date.now()),
+    nowMs: () => Date.now(),
+    sleep: sleepSync,
+    log,
+    // audit line per reload: the control-log proper is a typed CAS store with no free-text kind, so reload events go to an append-only
+    // sibling line file (one line each) + the dispatcher log.
+    controlLog: (l: string) => {
+      log(`[tern-bridge audit] ${l}`);
+      try { appendFileSync(path.join(HOME, ".agenthop", "swarm", "tern-bridge-reloads.log"), `${new Date().toISOString()} ${l}\n`, { mode: 0o600 }); }
+      catch (e) { log(`tern-bridge audit write failed: ${e instanceof Error ? e.message : e}`); }
+    },
+  };
+  const runTernBridgeStep = (): void => { runTernBridgeTick(ternBridgeState, ternBridgeIO, ternBridgeEnabled()); };
+
   // idle-root-cause explainer (北极星差距审计件① — the user's #1 activation is "why idle again?"). When the swarm has NO live
   // dispatched work (control-log kind:"wait" waits = 0) for N consecutive write-intervals, write a data-driven "why idle" one-line
   // projection (console/idle-explainer.json) the mod status band renders ("idle = waiting for X"), and — ONLY on a GENUINE-STALL
@@ -2293,6 +2316,7 @@ async function main(): Promise<void> {
         runModelMarketPull,          // model-market capability-profile pull (staffing ①); external fetch, FC-2 keeps last snapshot
         runModelStaffing,            // model-staffing suggestion projection (staffing ③a); SUGGESTION ONLY, never spawns/spends (R16)
         runDigest,                   // morning digest
+        runTernBridgeStep,           // #1033: tern bridge mirror/arm/reload-recovery (default OFF; UNKNOWN ⇒ log only)
         runCarlySweepStep,           // dialog-officer M2-a: Carly projection(workspace)+registry+outbox drain (default OFF; no beat write)
         async () => { const wakeCoordSid = resolveSession(COORDINATOR, listSessions(HOME)); if (wakeCoordSid && isStableSid(wakeCoordSid)) await backstopWake(HOME, wakeCoordSid, log); }, // SWARM_INBOX_WAKE backstop
       ],
