@@ -33,7 +33,9 @@ export type OrphanIO = {
   ternBlocks: () => Set<number> | null;                // live block ids from tern ls --json; null = UNKNOWN
   herdrStop: (name: string) => boolean;
   herdrDelete: (name: string) => boolean;
-  markWorker: (sid: string, herdrSession: string, state: "orphan", stoppedAt: number) => boolean;
+  /** Mark ONE worker instance orphan. `inst` = the instance seen on both rounds (pane + started_at); the writer re-reads the record
+   *  and changes it only if the same instance is still there (a restarted worker with the same name is a different instance). */
+  markWorker: (sid: string, herdrSession: string, inst: { pane: number; startedAt: unknown }, state: "orphan", stoppedAt: number) => boolean;
   gc: () => { code: number; line: string };            // bridge gc.sh: exit 1 = control dir unreadable = UNKNOWN
   tmpFiles: () => Array<{ name: string; ageMs: number }>; // mirror-phase.json / diag.json with age
   removeTmp: (name: string) => boolean;
@@ -96,15 +98,17 @@ export function runOrphanSweep(st: OrphanState, io: OrphanIO): { ran: boolean; u
     if ((state === "live" || state === "stopping") && pane === null)
       io.log(`orphan-sweep: schema-violation seat ${sid.slice(0, 8)} worker ${hs}: pane ${JSON.stringify(w.pane)} is not a number — not judged`);
     if ((state === "live" || state === "stopping") && pane !== null && !blocks.has(pane)) {
-      candidates.push({ key: `mark:${sid}:${hs}`, act: () => {
-        if (io.markWorker(sid, hs, "orphan", now)) io.audit(`orphan-sweep marked ${hs} orphan (seat ${sid.slice(0, 8)}, block ${pane} gone)`);
+      // TBS-ORPHAN-GENERATION: the confirmation key names the INSTANCE (pane + started_at), not only the name, so a new
+      // instance under the same session name starts its own two-round count instead of inheriting the old one's.
+      candidates.push({ key: `mark:${sid}:${hs}:${pane}:${JSON.stringify(w.started_at ?? null)}`, act: () => {
+        if (io.markWorker(sid, hs, { pane, startedAt: w.started_at ?? null }, "orphan", now)) io.audit(`orphan-sweep marked ${hs} orphan (seat ${sid.slice(0, 8)}, block ${pane} gone)`);
         else io.log(`orphan-sweep: could not mark ${hs} orphan`);
       } });
       continue;
     }
     // ① stopped/orphan record whose herdr session still exists ⇒ stop + delete (two rounds)
     if ((state === "stopped" || state === "orphan") && live.has(hs)) {
-      candidates.push({ key: `kill:${sid}:${hs}`, act: () => {
+      candidates.push({ key: `kill:${sid}:${hs}:${JSON.stringify(w.pane ?? null)}:${JSON.stringify(w.started_at ?? null)}`, act: () => {
         const stopped = io.herdrStop(hs);
         const deleted = stopped && io.herdrDelete(hs);
         io.audit(`orphan-sweep herdr session ${hs} (seat ${sid.slice(0, 8)}, record ${state}): stop=${stopped} delete=${deleted}`);
@@ -131,8 +135,13 @@ export function realSeatRecords(home: string): () => SeatRecord[] | null {
     const out: SeatRecord[] = [];
     for (const n of names) {
       try {
-        const d = JSON.parse(readFileSync(path.join(dir, n), "utf8")) as { workers?: unknown };
-        out.push({ sid: n.slice(0, -5), workers: Array.isArray(d.workers) ? (d.workers as Worker[]) : [] });
+        const d = JSON.parse(readFileSync(path.join(dir, n), "utf8")) as unknown;
+        if (typeof d !== "object" || d === null || Array.isArray(d)) return null;
+        const ws = (d as { workers?: unknown }).workers;
+        if (ws === undefined) { out.push({ sid: n.slice(0, -5), workers: [] }); continue; } // no workers field = none registered
+        // TBS-ORPHAN-SHAPE: a workers field that is not an array, or an entry that is not an object, is a bad carrier ⇒ UNKNOWN
+        if (!Array.isArray(ws) || ws.some((w) => typeof w !== "object" || w === null || Array.isArray(w))) return null;
+        out.push({ sid: n.slice(0, -5), workers: ws as Worker[] });
       } catch { return null; } // one unreadable record = we cannot prove which sessions are registered ⇒ UNKNOWN
     }
     return out;
@@ -140,13 +149,14 @@ export function realSeatRecords(home: string): () => SeatRecord[] | null {
 }
 
 export function realMarkWorker(home: string): OrphanIO["markWorker"] {
-  return (sid, hs, state, stoppedAt) => {
+  return (sid, hs, inst, state, stoppedAt) => {
     const file = path.join(home, ".agenthop", "swarm", "seat-shell", `${sid}.json`);
     try {
       const d = JSON.parse(readFileSync(file, "utf8")) as { workers?: Worker[] };
       if (!Array.isArray(d.workers)) return false;
       let hit = false;
-      d.workers = d.workers.map((w) => (w.herdr_session === hs ? (hit = true, { ...w, state, stopped_at: stoppedAt }) : w)); // epoch ms
+      const same = (w: Worker) => w.herdr_session === hs && w.pane === inst.pane && JSON.stringify(w.started_at ?? null) === JSON.stringify(inst.startedAt ?? null);
+      d.workers = d.workers.map((w) => (same(w) ? (hit = true, { ...w, state, stopped_at: stoppedAt }) : w)); // epoch ms
       if (!hit) return false;
       const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
       writeFileSync(tmp, JSON.stringify(d) + "\n", { flag: "wx", mode: 0o600 });
@@ -188,7 +198,14 @@ export function realTernBlocks(ls: () => string | null): () => Set<number> | nul
         if (!Array.isArray(s.tabs)) return null;
         for (const t of s.tabs as Array<{ blocks?: unknown }>) {
           if (!Array.isArray(t.blocks)) return null;
-          for (const b of t.blocks as Array<{ id?: unknown; live?: unknown }>) if (typeof b.id === "number" && b.live === true) ids.add(b.id);
+          for (const b of t.blocks as unknown[]) {
+            // TBS-ORPHAN-SHAPE: a block we cannot read (id not a positive integer, live not a bool) is NOT "absent": the whole
+            // listing is UNKNOWN, otherwise a malformed authoritative listing would look like "every block vanished".
+            if (typeof b !== "object" || b === null || Array.isArray(b)) return null;
+            const { id, live } = b as { id?: unknown; live?: unknown };
+            if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0 || typeof live !== "boolean") return null;
+            if (live) ids.add(id);
+          }
         }
       }
       return ids;

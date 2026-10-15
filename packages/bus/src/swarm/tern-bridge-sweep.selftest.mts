@@ -29,7 +29,7 @@ type World = {
   cancelFails?: boolean;        // arm-cancel-next writes cancel-failed (keeps the obligation)
   scheduleCode?: number;        // arm-schedule.sh exit code override
   scheduleNoop?: boolean;       // arm-schedule.sh says 0 but schedules nothing (verify must catch it)
-  scheduleCalls: number;
+  scheduleCalls: number; clearFails?: boolean;
 };
 function world(): World {
   return { clock: 0, mirror: { tick: 1, vm: "vmA" }, reqs: [], ternUp: true, calls: [], logs: [], control: [], mirrorAdvances: true,
@@ -60,7 +60,7 @@ function io(w: World): BridgeIO {
     },
     readMirror: () => w.mirror,
     readSentinel: () => w.sentinel,
-    clearSentinel: () => { w.sentinel = null; },
+    clearSentinel: () => { if (w.clearFails) return false; w.sentinel = null; return true; },
     schedule: () => {
       w.scheduleCalls++; w.calls.push("arm-schedule.sh");
       if (w.scheduleCode !== undefined) return { code: w.scheduleCode, detail: "fake" };
@@ -250,6 +250,17 @@ const onAct = (b: BridgeIO, act: string, f: () => void) => { const rr = b.tern; 
   t("request class: undecodable is not a start", got["e.json"] === false);
   t("request class: file names unchanged (no #start suffix)", Object.keys(got).sort().join() === "a.json,b.json,c.json,d.json,e.json");
 }
+
+// --- r5: TBS-SCAN-FRESH — the previous status cannot be removed ⇒ a stale count=1 must not answer for this scan ---
+{ const w = world(); w.patrols = [7]; w.sentinel = { step: "scanned", count: 1, ids: [7], id: null, error: null }; w.clearFails = true;
+  const b = io(w); const rr = b.tern; b.tern = (x) => (x.join(" ").endsWith(".arm-scan") ? { ok: true, detail: "" } : rr(x)); // ack only
+  const r = armSequence(b);
+  t("scan-fresh: unremovable old sentinel => stop, not 'already'", !r.ok && /cannot prove a fresh scan/.test(r.detail)); }
+{ const home = mkdtempSync(path.join(os.tmpdir(), "scanfresh-")); const d = path.join(home, ".agenthop", "tern-panes");
+  mkdirSync(d, { recursive: true }); writeFileSync(path.join(d, "sentinel.json"), "{}");
+  chmodSync(d, 0o555); const ok = realClearSentinel(home)(); chmodSync(d, 0o755);
+  t("scan-fresh: real clear in a 0555 dir => false (EACCES is not 'absent')", ok === false);
+  t("scan-fresh: real clear when absent => true", realClearSentinel(mkdtempSync(path.join(os.tmpdir(), "abs-")))() === true); }
 
 // --- r5: TBS-CONTROL-ROOT — AH_HOME (swarm state) never redirects the bridge's control files ---
 t("control root: AH_HOME set, no override => OS home", bridgeHome({ AH_HOME: "/tmp/swarm-state" }, "/Users/u") === "/Users/u");

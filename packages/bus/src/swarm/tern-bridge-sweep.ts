@@ -64,7 +64,7 @@ export type ArmStatus = { step: string | null; count: number | null; ids: number
 export type BridgeIO = {
   tern: TernRun;
   readSentinel: () => ArmStatus;         // sentinel.json, or null (absent/torn/unparseable)
-  clearSentinel: () => void;             // delete sentinel.json so only the NEXT write can answer (no stale reads)
+  clearSentinel: () => boolean;          // delete sentinel.json so only the NEXT write can answer; false = could not (not ENOENT)
   schedule: () => { code: number; detail: string }; // arm-schedule.sh: 0 scheduled+verified, 2 refused (count>0), else failed
   readMirror: () => Mirror;              // agents.json tick+vm, or null (absent/torn/unparseable)
   pendingRequests: () => PendingReq[];   // requests/*.json with their age
@@ -106,7 +106,9 @@ export type TickOutcome = "disabled" | "throttled" | "unknown" | "ok" | "rearmed
 export function armSequence(io: BridgeIO): { ok: boolean; detail: string } {
   const stop = (where: string, why: string) => ({ ok: false, detail: `${where}: ${why}` });
   const scan = (): number | string => {
-    io.clearSentinel();
+    // TBS-SCAN-FRESH: if the previous status cannot be removed (EACCES/EPERM/…), a stale "scanned" could answer for this scan
+    // (ctl's ack is not proof the command ran) ⇒ stop. Only "removed" or "was absent" (ENOENT) lets the scan proceed.
+    if (!io.clearSentinel()) return "could not remove the previous sentinel.json (cannot prove a fresh scan)";
     const r = run(io, "arm-scan");
     if (!r.ok) return `tern ${r.detail}`;
     const s = io.readSentinel();
@@ -276,8 +278,11 @@ export function realSentinelReader(home: string): () => ArmStatus {
     } catch { return null; }
   };
 }
-export function realClearSentinel(home: string): () => void {
-  return () => { try { unlinkSync(path.join(bridgeDir(home), "sentinel.json")); } catch { /* absent is fine */ } };
+export function realClearSentinel(home: string): () => boolean {
+  return () => {
+    try { unlinkSync(path.join(bridgeDir(home), "sentinel.json")); return true; }
+    catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT"; } // absent = fine; any other failure = cannot clear
+  };
 }
 /** arm-schedule.sh runner. `bridgeDir` = the bridge checkout the dispatcher uses (AGENTHOP_BRIDGE_DIR, else repo tern/agenthop-agents-bridge). */
 export function realScheduler(env: NodeJS.ProcessEnv, bridgeDir: string): () => { code: number; detail: string } {

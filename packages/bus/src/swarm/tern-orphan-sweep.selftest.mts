@@ -22,7 +22,7 @@ const io = (w: W): OrphanIO => ({
   seatRecords: () => w.recs, herdrSessions: () => w.sessions, ternBlocks: () => w.blocks,
   herdrStop: (n) => { w.stopped.push(n); return true; },
   herdrDelete: (n) => { w.deleted.push(n); w.sessions = (w.sessions ?? []).filter((x) => x !== n); return true; },
-  markWorker: (sid, hs, state) => { w.marked.push(hs); for (const r of w.recs ?? []) if (r.sid === sid) for (const x of r.workers) if (x.herdr_session === hs) x.state = state; return true; },
+  markWorker: (sid, hs, inst, state) => { w.marked.push(hs); for (const r of w.recs ?? []) if (r.sid === sid) for (const x of r.workers) if (x.herdr_session === hs && x.pane === inst.pane && x.started_at === inst.startedAt) x.state = state; return true; },
   gc: () => ({ code: w.gcCode, line: w.gcLine }),
   tmpFiles: () => w.tmp, removeTmp: (n) => { w.removed.push(n); return true; },
   nowMs: () => w.clock, log: (l) => w.logs.push(l), audit: (l) => w.audit.push(l),
@@ -78,6 +78,30 @@ const worker = (hs: string, state: string, pane: number) => ({ name: hs, herdr_s
 t("paneId: number", paneId(42) === 42);
 t("paneId: numeric string rejected (strict)", paneId("1056561954852") === null);
 t("paneId: non-integer / negative / null rejected", paneId(1.5) === null && paneId(-3) === null && paneId(null) === null);
+
+// --- r6 TBS-ORPHAN-GENERATION: a new instance under the same name does not inherit the old instance's first sighting ---
+{
+  const w = world(); const st = initialOrphanState();
+  w.recs = [{ sid: "seatG-7777", workers: [{ ...worker("dev-gen", "live", 600), started_at: 1000 }] }];
+  w.sessions = ["default", "dev-gen"]; w.blocks = new Set([1]);
+  round(st, w); // first sighting of instance A (pane 600, started 1000)
+  w.recs = [{ sid: "seatG-7777", workers: [{ ...worker("dev-gen", "live", 601), started_at: 2000 }] }]; // restarted: B
+  round(st, w);
+  t("generation: restarted instance (new pane/started_at) is NOT marked on its first round", w.marked.length === 0);
+  round(st, w);
+  t("generation: B marked only after its own two rounds", w.marked.join() === "dev-gen");
+}
+
+// --- r6 TBS-ORPHAN-SHAPE end-to-end: a live worker + a malformed authoritative listing never reaches mark/stop/delete ---
+{
+  const w = world(); const st = initialOrphanState();
+  w.recs = [{ sid: "seatH-8888", workers: [{ ...worker("dev-shape", "live", 777), started_at: 5 }] }];
+  w.sessions = ["default", "dev-shape"];
+  const bad = realTernBlocks(() => JSON.stringify({ sessions: [{ tabs: [{ blocks: [{ id: 777, live: "true" }] }] }] }));
+  const b = io(w); b.ternBlocks = bad;
+  for (let i = 0; i < 5; i++) { runOrphanSweep(st, b); w.clock += ORPHAN_EVERY_MS; }
+  t("shape e2e: 5 rounds of a malformed listing => no mark, no stop, no delete", w.marked.length === 0 && w.stopped.length === 0 && w.deleted.length === 0);
+}
 
 // --- never touched: default, unregistered sessions (even with role-task shape), records without herdr_session ---
 {
@@ -136,13 +160,27 @@ for (const which of ["recs", "sessions", "blocks"] as const) {
   mkdirSync(d, { recursive: true });
   writeFileSync(path.join(d, "abc.json"), JSON.stringify({ sid: "abc", shell: "tern", workers: [worker("ops-x", "live", 5)] }));
   const recs = realSeatRecords(home)(); t("seat reader: workers read", recs?.[0]?.workers.length === 1);
-  t("marker: sets state+stopped_at, keeps other fields", realMarkWorker(home)("abc", "ops-x", "orphan", 42)
+  t("marker: a different instance (pane) is NOT written", realMarkWorker(home)("abc", "ops-x", { pane: 6, startedAt: 1 }, "orphan", 42) === false
+    && JSON.parse(readFileSync(path.join(d, "abc.json"), "utf8")).workers[0].state === "live");
+  t("marker: sets state+stopped_at, keeps other fields", realMarkWorker(home)("abc", "ops-x", { pane: 5, startedAt: 1 }, "orphan", 42)
     && (() => { const x = JSON.parse(readFileSync(path.join(d, "abc.json"), "utf8")); return x.shell === "tern" && x.workers[0].state === "orphan" && x.workers[0].stopped_at === 42; })());
   writeFileSync(path.join(d, "bad.json"), "{torn");
   t("seat reader: one unreadable record => UNKNOWN (null)", realSeatRecords(home)() === null);
+  for (const [label, body] of [["workers not an array", { workers: { a: 1 } }], ["workers [null]", { workers: [null] }],
+    ["workers [1]", { workers: [1] }], ["record is an array", [1, 2]]] as Array<[string, unknown]>) {
+    writeFileSync(path.join(d, "bad.json"), JSON.stringify(body));
+    t(`seat reader: ${label} => UNKNOWN (null), no throw`, realSeatRecords(home)() === null);
+  }
+  writeFileSync(path.join(d, "bad.json"), JSON.stringify({ sid: "x", shell: "tern" }));
+  t("seat reader: no workers field => none registered (not UNKNOWN)", realSeatRecords(home)()?.length === 2);
   const blocks = realTernBlocks(() => JSON.stringify({ sessions: [{ tabs: [{ blocks: [{ id: 5, live: true }, { id: 6, live: false }] }] }] }))();
   t("tern ls parser: only live block ids", blocks?.has(5) === true && blocks.has(6) === false);
   t("tern ls parser: malformed => null", realTernBlocks(() => JSON.stringify({ sessions: [{}] }))() === null);
+  const lsWith = (blk: unknown) => realTernBlocks(() => JSON.stringify({ sessions: [{ tabs: [{ blocks: [{ id: 5, live: true }, blk] }] }] }))();
+  t("tern ls parser: live:\"true\" => UNKNOWN", lsWith({ id: 777, live: "true" }) === null);
+  t("tern ls parser: id:\"777\" => UNKNOWN", lsWith({ id: "777", live: true }) === null);
+  t("tern ls parser: missing live => UNKNOWN", lsWith({ id: 777 }) === null);
+  t("tern ls parser: null block => UNKNOWN", lsWith(null) === null);
   t("tern ls parser: tern did not answer => null", realTernBlocks(() => null)() === null);
 }
 console.log("PASS tern-orphan-sweep");
