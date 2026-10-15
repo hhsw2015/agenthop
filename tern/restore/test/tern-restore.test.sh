@@ -95,17 +95,17 @@ ck "cold: tabs renamed to roles" "3" "$(grep -c '^rename ' "$T/log")"
 
 ck "seat-shell: set called on cold run with tern+pid" "1" "$(grep -c '^set aaaa1111 tern 7100$' "$T/seatshell.log")"
 ck "seat-shell: one set per seat" "3" "$(wc -l <"$T/seatshell.log" | tr -d ' ')"
-ck "presence: Manager -> its own claude pid" "7100" "$(cat "$T/presence/aaaa1111.pid")"
-ck "presence: Infra Dev -> its own claude pid" "7101" "$(cat "$T/presence/bbbb2222.pid")"
-ck "presence: codex -> adapter child pid" "6102" "$(cat "$T/presence/cccc3333.pid")"
+ck "presence: Manager -> its own claude pid" "7100" "$(head -1 "$T/presence/aaaa1111.pid")"
+ck "presence: Infra Dev -> its own claude pid" "7101" "$(head -1 "$T/presence/bbbb2222.pid")"
+ck "presence: codex -> adapter child pid" "6102" "$(head -1 "$T/presence/cccc3333.pid")"
 ck "presence: no leftover temp" "0" "$(find "$T/presence" -name '*.tmp-*' | wc -l | tr -d ' ')"
 
 # --- presence SWAPPED (live pids, wrong seats) is detected by --check and fixed by a run ---
 printf '7101' >"$T/presence/aaaa1111.pid"; printf '7100' >"$T/presence/bbbb2222.pid"
 rc=$(run --check); ck "swap: --check exit 1" "1" "$rc"; ck "swap: --check names both" "2" "$(grep -c 'presence pid' "$T/out")"
-ck "swap: --check does not write" "7101" "$(cat "$T/presence/aaaa1111.pid")"
+ck "swap: --check does not write" "7101" "$(head -1 "$T/presence/aaaa1111.pid")"
 rc=$(run); ck "swap: run fixes, exit 0" "0" "$rc"
-ck "swap: Manager corrected" "7100" "$(cat "$T/presence/aaaa1111.pid")"; ck "swap: Infra corrected" "7101" "$(cat "$T/presence/bbbb2222.pid")"
+ck "swap: Manager corrected" "7100" "$(head -1 "$T/presence/aaaa1111.pid")"; ck "swap: Infra corrected" "7101" "$(head -1 "$T/presence/bbbb2222.pid")"
 
 : >"$T/seatshell.log"; run --check >/dev/null
 ck "seat-shell: --check does not register" "0" "$(wc -l <"$T/seatshell.log" | tr -d ' ')"
@@ -298,6 +298,39 @@ import json,sys; json.dump({"next":101,"sessions":[{"name":"agenthop","tabs":[]}
 PY2
 RESTORE_PENDING_TTL_S=0 run1 >/dev/null; RESTORE_PENDING_TTL_S=0 run1 >/dev/null
 ck "TTL=0, two runs, block alive unlisted: still zero starts" "0" "$(grep -c '^new tab' "$T/log")"
+
+# ===== r5: presence two-line format, origin=agent authority (coordinator ruling) =====
+cat >"$T/ps" <<'P'
+5100 1 tern acp claude --resume aaaa1111
+6100 5100 node adapter
+7100 6100 claude --output-format stream-json --resume=aaaa1111
+5101 1 tern acp claude --resume bbbb2222
+6101 5101 node adapter
+7101 6101 claude --output-format stream-json --resume=bbbb2222
+5102 1 tern acp codex --resume cccc3333
+6102 5102 /usr/local/bin/node /opt/Tern/agents/codex/node_modules/@agentclientprotocol/codex-acp/dist/index.js
+P
+fresh; run >/dev/null
+ck "presence r5: line 2 says origin=agent" "1" "$(sed -n 2p "$T/presence/aaaa1111.pid" | grep -c '^origin=agent ts=[0-9]*$')"
+ck "presence r5: line 1 is the bare pid (old readers)" "7100" "$(head -1 "$T/presence/aaaa1111.pid")"
+# a live origin=bus writer (the hook's presence.mjs) with a different pid: --check WARNs, does not FAIL; a run replaces it
+printf '%s\norigin=bus ts=1\n' "$$" >"$T/presence/aaaa1111.pid"
+rc=$(run --check); ck "presence r5: live origin=bus mismatch => --check exit 0" "0" "$rc"
+ck "presence r5: ... reported as WARN" "1" "$(grep -c '^WARN: Manager presence pid' "$T/out")"
+run >/dev/null
+ck "presence r5: a run replaces origin=bus with the agent pid" "7100" "$(head -1 "$T/presence/aaaa1111.pid")"
+ck "presence r5: ... and marks origin=agent" "1" "$(sed -n 2p "$T/presence/aaaa1111.pid" | grep -c origin=agent)"
+# a DEAD origin=bus pid is not excused: --check FAILs
+printf '999999\norigin=bus ts=1\n' >"$T/presence/aaaa1111.pid"
+rc=$(run --check); ck "presence r5: dead origin=bus pid => --check exit 1" "1" "$rc"
+# legacy one-line file with the right pid: ok, noted as legacy, then upgraded by a run
+printf '7100' >"$T/presence/aaaa1111.pid"
+rc=$(run --check); ck "presence r5: legacy one-line right pid => --check exit 0" "0" "$rc"
+ck "presence r5: ... noted as legacy" "1" "$(grep -c 'ok pid 7100 (origin legacy)' "$T/out")"
+run >/dev/null; ck "presence r5: legacy upgraded to two lines on a run" "1" "$(sed -n 2p "$T/presence/aaaa1111.pid" | grep -c origin=agent)"
+# an origin=agent line from someone else that is WRONG is still a FAIL (agent authority is about the agent, not the label)
+printf '999998\norigin=agent ts=1\n' >"$T/presence/aaaa1111.pid"
+rc=$(run --check); ck "presence r5: wrong pid labelled origin=agent => FAIL" "1" "$rc"
 
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)

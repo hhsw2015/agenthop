@@ -466,6 +466,40 @@ def seat_shell_set(sid, pid):
     return None if r.returncode == 0 else (r.stderr.strip() or f"rc={r.returncode}")
 
 
+# presence/<sid>.pid format (coordinator ruling, 2026-10-15): line 1 = pid (old readers read only this), line 2 =
+# `origin=agent|bus ts=<epoch ms>`. Authority = the AGENT (host) pid. tern-restore writes origin=agent. An origin=agent write
+# may replace an origin=bus line; the hook side (presence.mjs, Platform Dev) writes origin=bus and must not replace a live
+# origin=agent pid. A file with no second line is treated as origin unknown (legacy).
+def read_presence(f):
+    """(pid|None, origin|None). Raises OSError (not FileNotFoundError) when the file exists but cannot be read."""
+    try:
+        with open(f) as h:
+            text = h.read()
+    except FileNotFoundError:
+        return None, None
+    lines_ = text.split("\n")
+    first = lines_[0].strip()
+    pid = int(first) if first.isascii() and first.isdigit() and int(first) > 0 else None
+    origin = None
+    if len(lines_) > 1:
+        for tok in lines_[1].split():
+            if tok.startswith("origin="):
+                origin = tok.split("=", 1)[1] or None
+    return pid, origin
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def presence(roster, write):
     table, lines, fails = ps_table(), [], []
     inv = inventory(roster["session"])
@@ -476,24 +510,27 @@ def presence(roster, write):
         want = agent_pid(mine[0][1]["id"], seat, table)
         f = os.path.join(PRESENCE_DIR, seat["sid"] + ".pid")
         try:
-            raw = open(f).read().strip()
-            have = int(raw) if raw.isascii() and raw.isdigit() else None
-        except FileNotFoundError:
-            have = None
+            have, origin = read_presence(f)
         except OSError as e:
             fails.append((seat["role"], f"presence unreadable: {e}")); continue
         if want is None:
             fails.append((seat["role"], "presence: agent pid not found under block")); continue
-        if have == want:
+        if have == want and origin == "agent":
             lines.append(f"presence: {seat['role']} ok pid {want}")
         elif not write:
-            fails.append((seat["role"], f"presence pid {have} != agent pid {want}")); continue
+            if have == want:  # right pid, missing/legacy origin line: correct for readers, worth a note
+                lines.append(f"presence: {seat['role']} ok pid {want} (origin {origin or 'legacy'})")
+            elif origin == "bus" and pid_alive(have):
+                # the hook's bus process wrote it; readers still see a live pid — a WARN, not a FAIL (coordinator ruling)
+                lines.append(f"WARN: {seat['role']} presence pid {have} is the bus process (origin=bus), agent pid is {want}")
+            else:
+                fails.append((seat["role"], f"presence pid {have} != agent pid {want}")); continue
         else:
             try:
                 os.makedirs(PRESENCE_DIR, exist_ok=True)
                 tmp = f"{f}.tmp-{os.getpid()}"
                 with open(tmp, "x") as h:
-                    h.write(str(want))
+                    h.write(f"{want}\norigin=agent ts={int(time.time() * 1000)}\n")
                 os.replace(tmp, f)
                 lines.append(f"presence: {seat['role']} wrote pid {want} (was {have})")
             except OSError as e:
