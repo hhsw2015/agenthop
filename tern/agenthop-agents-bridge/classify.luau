@@ -22,6 +22,15 @@ M.OVERLAY = {
   claude = {
     { id = "agenthop_osc_title_halfcircle_working", state = "working", priority = 1100, region = "osc_title", visible_working = true,
       regex = { "^[\\x{25D0}-\\x{25D3}] " } },
+    -- Observed live on 2.1.293: the write/edit permission dialog reads "Do you want to create X?" + numbered "1. Yes … 3. No" +
+    -- "Esc to cancel · Tab to amend", with NO "do you want to proceed?". herdr's generic_permission_prompt (840) misses it and only
+    -- legacy_no_prompt_blocker (300) catches it. Coordinator ruling #1041: this is the sentinel's most important blocked class
+    -- (F44-10/F57), so it gets its own rule at 840, same region as herdr's dialog rules. Exactly 840, not above: on a tie the
+    -- earlier rule wins and overlays come after the manifest, so herdr's generic_permission_prompt keeps its own dialogs. Requires BOTH a numbered yes AND a
+    -- numbered no line, so prose that merely says "do you want to" does not match.
+    { id = "agenthop_file_permission_dialog", state = "blocked", priority = 840, region = "after_last_horizontal_rule",
+      visible_blocker = true, contains = { "do you want to", "esc to cancel" },
+      line_regex = { "(?i)^\\s*❯?\\s*1\\.\\s*yes\\b", "(?i)^\\s*[23]\\.\\s*no\\b" } },
   },
 }
 
@@ -457,20 +466,33 @@ function M.agent_for(program)
 end
 
 -- ---------------- classify ----------------
+local order_cache = {}
+local function ordered(agent)
+  local o = order_cache[agent]
+  if o then return o end
+  o = {}
+  for i, r in ipairs(manifests[agent].rules) do o[#o + 1] = { r = r, k = i } end
+  local n = #o
+  for i, r in ipairs(M.OVERLAY[agent] or {}) do o[#o + 1] = { r = r, k = n + i } end
+  table.sort(o, function(a, b) if a.r.priority ~= b.r.priority then return a.r.priority > b.r.priority end return a.k < b.k end)
+  for i = 1, #o do o[i] = o[i].r end
+  order_cache[agent] = o
+  return o
+end
+M._reset_order = function() order_cache = {} end -- tests mutate rule lists
+
 -- lines: array of strings (cx.session:read(...).lines) or a single string; title: OSC title; program: command line / program.
 function M.classify(lines, title, program, progress)
   local agent = M.agent_for(program)
   if agent == nil or manifests[agent] == nil then return { state = "unknown", rule = nil, agent = agent } end
   local content = type(lines) == "table" and table.concat(lines, "\n") or (lines or "")
+  -- herdr picks the highest-priority match (ties: earlier rule). Same result, cheaper: visit rules in that exact order
+  -- (priority desc, then file order with the manifest before the overlay) and stop at the first match, so expensive
+  -- low-priority rules (e.g. legacy_no_prompt_blocker's whole-screen regex) never run once a higher rule has matched.
   local best = nil
-  local rules = {}
-  for _, r in ipairs(manifests[agent].rules) do rules[#rules + 1] = r end
-  for _, r in ipairs(M.OVERLAY[agent] or {}) do rules[#rules + 1] = r end
-  for _, rule in ipairs(rules) do
+  for _, rule in ipairs(ordered(agent)) do
     local text = M.region(rule.region, content, title, progress)
-    if gate_matches(rule, text, string.lower(text)) then
-      if best == nil or rule.priority > best.priority then best = rule end
-    end
+    if gate_matches(rule, text, string.lower(text)) then best = rule; break end
   end
   if best == nil then return { state = "idle", rule = nil, agent = agent } end -- herdr fallback for a known agent
   return { state = best.state or "unknown", rule = best.id, agent = agent, skip_state_update = best.skip_state_update == true }

@@ -2,7 +2,7 @@
 -- REAL Claude Code 2.1.293 TUI screens captured from a Tern pane on 2026-10-15 (test/fixtures/tui/*.txt + .title).
 -- Covers: idle / working / blocked / unknown on real screens, the two `not` gates of herdr's claude manifest, region functions,
 -- the regex subset (incl. a differential corpus), agent selection, priority order. Mutant check: run with MUTANT=no-prompt-box or
--- MUTANT=no-title-working — the corresponding rule is removed from the loaded manifest (production code untouched) and the
+-- MUTANT=no-title-working or MUTANT=no-write-dialog — the corresponding rule is removed from the loaded manifest (production code untouched) and the
 -- matching cases must go RED.
 -- Run: lua test/classify.test.lua   (from tern/agenthop-agents-bridge)
 local here = (arg and arg[0] or ""):match("^(.*/)") or "./"
@@ -17,8 +17,10 @@ require = function(name) if name == "./manifests" then return MAN end return rea
 local C = assert(loadfile(root .. "classify.luau"))()
 if mutant == "no-prompt-box" then drop(MAN.claude.rules, "live_prompt_box") end
 if mutant == "no-title-working" then
-  drop(MAN.claude.rules, "osc_title_working"); C.OVERLAY.claude = {}
+  drop(MAN.claude.rules, "osc_title_working"); drop(C.OVERLAY.claude, "agenthop_osc_title_halfcircle_working")
 end
+if mutant == "no-write-dialog" then drop(C.OVERLAY.claude, "agenthop_file_permission_dialog") end
+C._reset_order()
 
 local fails, n = 0, 0
 local function ck(name, want, got)
@@ -39,7 +41,7 @@ for _, case in ipairs({
   { "claude-idle-after-turn", "idle", "live_prompt_box" },
   { "claude-working-early", "working", "agenthop_osc_title_halfcircle_working" },
   { "claude-working-mid", "working", "agenthop_osc_title_halfcircle_working" },
-  { "claude-blocked-write", "blocked", "legacy_no_prompt_blocker" },
+  { "claude-blocked-write", "blocked", "agenthop_file_permission_dialog" },
 }) do
   local screen, title = fixture(case[1])
   local r = C.classify(lines_of(screen), title, CLAUDE)
@@ -55,6 +57,24 @@ do
   ck("finding: generic_permission_prompt does not match the 2.1.293 write dialog", false,
     C.gate_matches(gp, C.region(gp.region, screen, "", "")))
 end
+-- the write-dialog rule outranks the 300-point fallback, and needs both a numbered yes and a numbered no
+do
+  local screen = fixture("claude-blocked-write")
+  ck("write dialog: overlay rule is >= 840", true, (function() for _, r in ipairs(C.OVERLAY.claude) do
+    if r.id == "agenthop_file_permission_dialog" then return r.priority >= 840 end end return false end)())
+  ck("write dialog: legacy fallback still matches on its own (defence in depth)", true, (function()
+    for _, r in ipairs(MAN.claude.rules) do if r.id == "legacy_no_prompt_blocker" then
+      return C.gate_matches(r, C.region(r.region, screen, "", "")) end end return false end)())
+end
+local edit = "──────────\n Edit file\n foo.py\n Do you want to make this edit to foo.py?\n ❯ 1. Yes\n   2. Yes, allow all edits\n   3. No\n\n Esc to cancel · Tab to amend\n"
+ck("tie: herdr generic_permission_prompt keeps its own 'proceed?' dialog", "generic_permission_prompt",
+  C.classify("──────────\nEdit file\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel\n", "", CLAUDE).rule)
+ck("write dialog: edit variant => same rule", "agenthop_file_permission_dialog", C.classify(edit, "✳ x", CLAUDE).rule)
+ck("write dialog: prose 'do you want to' without options is not this rule", true,
+  C.classify("──────────\nDo you want to rename it? Esc to cancel\n", "", CLAUDE).rule ~= "agenthop_file_permission_dialog")
+ck("write dialog: yes option but no 'no' option is not this rule", true,
+  C.classify("──────────\nDo you want to go?\n ❯ 1. Yes\nEsc to cancel\n", "", CLAUDE).rule ~= "agenthop_file_permission_dialog")
+
 -- the working screens STILL draw the ❯ prompt box: without the title rule they would read idle
 do
   local screen = fixture("claude-working-mid")
