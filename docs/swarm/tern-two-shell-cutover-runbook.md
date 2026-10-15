@@ -213,10 +213,10 @@ worker 写回箱后,经 agenthop_tern 发 `stop`(`args.worker:"<名>"`)。返回
   有 server_pid(#1034 r4 起新起的 worker):"stop own server" -> "socket gone" -> "tern close" -> "herdr session delete"
   无 server_pid(旧记录):                   "herdr server stop" -> "socket gone" -> "tern close" -> "herdr session delete"
   pane=0(从未放块)时没有 "tern close"(443)。
-内部记录(不在 steps 里,直接看 seat-shell):先写 stopping(424,同时是实例核验);steps 全 ok 才写 stopped + stopped_at(448)。
+内部记录(不在 steps 里,直接看 seat-shell):先写 stopping(424,同时是实例核验);steps 全 ok 才写 stopped + stopped_at(448;这次写失败也算 partial,steps 里多一项 `record stopped` ok:false)。
 state="partial" => 至少一步 ok:false(看 detail;"ownership" / "socket gone" 失败时 "herdr session delete" 记为 skipped,ok:false)。
    记录**保持 stopping**(不写 stopped,仍占容量,可重发 stop)——按 detail 手工补那一步,不算冒烟通过。
-state="unknown" => 没有动作:读不到该席记录 / 无此活 worker(402-405),或实例核验失败、记录写不进(424,reason 以 instance-mismatch 开头)。先查记录再判。
+state="unknown" => 没有动作:读不到该席记录 / 无此活 worker(402-405);该 worker 起时从未证明 session 归属(421,reason 以 ownership-unproven 开头,记录保留不动);或实例核验失败、记录写不进(424,reason 以 instance-mismatch 开头)。先查记录再判。
 ```
 
 ```bash
