@@ -212,3 +212,11 @@ tern plugin link <repo>/tern/agenthop-agents-bridge     # 原地用(开发/本�
 - **预算(Tern 真 VM 实测,单 hook 单次)**:规则按「priority 降序、同分文件序」排好后**首个命中即停**——与 herdr 的全扫取最高分结果相同(随机 16000 例差分零差异),但贵的低分规则(`legacy_no_prompt_blocker` 整屏正则)在高分规则已中时不再跑。24 行 tail:idle ≈ 0.63ms、working ≈ 0.12ms、blocked ≈ 2.4ms(r3 精确码点表+Pike VM)(<3ms 门;blocked 仍最贵,因它排在 840 之下的规则全要先试一遍)。一个 hook 里连跑多次会累计撞 50ms——哨兵每轮只分类它读到的那一个 pane。
 - **夹具** `test/classify.test.lua`(76 检):5 份**真实** Claude TUI 截屏(`test/fixtures/tui/`,2026-10-15 Tern pane 采集:idle×2 / working×2 / blocked×1)+ herdr claude 规则各族合成屏 + 两条 `not` 门 + 区域函数 + 正则子集 + 选 agent。mutant:`MUTANT=no-prompt-box`、`MUTANT=no-title-working`、`MUTANT=no-write-dialog` 各 RED;生产码 mutant(`\b` 失效、最高分→首命中)各 RED。
 - **接线**:写 `agents.json` 每席 `screen_state` 由哨兵做(Platform Dev r9 的一读两用钩),本件只交纯函数。
+
+## 11. #1057 — TUI 席子代理可见性钩子(`agenthop hook subagent`)
+
+- 事件:SubagentStart / SubagentStop / PermissionRequest ⇒ 父席耐久箱一条 fyi;PermissionRequest 另经祖先进程 pty 发 OSC 777(仅 `TERN_PANE` 存在时)。注册见 `subagent-hook.settings.json`(并入席级设置,非全局)。
+- 收件人只取 `SWARM_PARENT_SID`;未设 ⇒ SKIPPED 不写。投递走 `writeSessionInbox`:非 session UUID 或本机无 `presence/<sid>.pid` ⇒ 拒收,不建孤箱。**目标来自外部输入(环境变量、钩子负载、命令行)的调用方用 `writeSessionInbox`;`writeInbox` 保持原样,供 `approvals:<sid>` 等合法非会话箱使用。**
+- 去重键:`tui-sub-<start|stop>-<seat8>-<agent_id>`;`tui-perm-<seat8>-<tool_use_id|事件秒>`(Claude Code 2.1.293 不给 tool_use_id ⇒ 每席每秒至多一条权限消息,已知上限)。
+- 永远 exit 0;每次结果一行日志 `~/.agenthop/logs/subagent-hook.log`(`AGENTHOP_SUBAGENT_HOOK_LOG` 可覆盖)。
+- 时延:`bin.ts` 见 `hook subagent` 即只载 `hook-entry.js`(不载完整 CLI 模块图)。目标 **< 200ms / 次**。实测(2026-10-15,macOS arm64,bun --compile 单二进制,21 次中位):本钩子 ~90ms;拆分前 ~117–135ms;空程序编译底 ~18–36ms。余量主要是编译二进制解析整包的固定开销。

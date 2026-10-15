@@ -1,0 +1,8 @@
+{
+  "_comment": "#1057: merge into a TUI seat's Claude Code settings (project or seat-local), NOT the global ~/.claude/settings.json. The seat must be started with SWARM_PARENT_SID=<parent session id> in its environment (the coordinator's kind=tui start injects it); without it the hook logs SKIPPED and posts nothing. The hook always exits 0. Log: ~/.agenthop/logs/subagent-hook.log (override with AGENTHOP_SUBAGENT_HOOK_LOG).",
+  "hooks": {
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "agenthop hook subagent" }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "agenthop hook subagent" }] }],
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "agenthop hook subagent" }] }]
+  }
+}
