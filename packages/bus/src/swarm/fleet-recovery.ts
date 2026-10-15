@@ -46,9 +46,11 @@ export function breakpointInjectionEnabled(env: NodeJS.ProcessEnv = process.env)
 /** Non-family env names recovery explicitly needs: AH_HOME + the endpoint base URLs. */
 export const ENV_NAME_ALLOW: readonly string[] = ["AH_HOME", "ANTHROPIC_BASE_URL", "CPA_BASE_URL"];
 
-/** Allowed NAME PREFIXES — the SWARM_ identity+flag family + the HERDR_ reachability family (Q2/F54: HERDR_ENV/HERDR_PANE_ID gate
- *  inbox-wake, HERDR_BIN/HERDR_SOCKET_PATH let the relaunched dispatcher actually reach herdr). A new non-family var is dropped. */
-export const ENV_PREFIX_ALLOW: readonly string[] = ["SWARM_", "HERDR_"];
+/** Allowed NAME PREFIXES — the SWARM_ identity+flag family + the HERDR_ and TERN_ reachability families (Q2/F54: HERDR_ENV/HERDR_PANE_ID
+ *  gate herdr inbox-wake, HERDR_BIN/HERDR_SOCKET_PATH let the relaunched dispatcher reach herdr; TERN_BIN lets a dispatcher outside a
+ *  Tern pane reach Tern seats — #1032, without it the self-recorded recipe would silently drop it on every restart). A new
+ *  non-family var is dropped. */
+export const ENV_PREFIX_ALLOW: readonly string[] = ["SWARM_", "HERDR_", "TERN_"];
 
 /** The SECRET name denylist — overrides every allow rule (a credential NAME is never captured). */
 export const ENV_SECRET_RE = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|_PAT(?![A-Z]))/i;

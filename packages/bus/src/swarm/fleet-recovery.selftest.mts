@@ -405,3 +405,12 @@ try {
 } finally {
   try { rmSync(scratch, { recursive: true, force: true }); } catch { /* best-effort */ }
 }
+
+// #1032: TERN_BIN must survive the dispatcher's self-recorded recipe (else a dispatcher outside a Tern pane loses the Tern wake
+// transport on every restart). Secret names stay denied regardless of prefix.
+{
+  const { envAllowed } = await import("./fleet-recovery.js");
+  if (!envAllowed("TERN_BIN")) throw new Error("FAILED: TERN_BIN is captured by the recipe allowlist");
+  if (envAllowed("TERN_TOKEN")) throw new Error("FAILED: a TERN_* secret-named var is still denied");
+  console.log("ok  #1032: TERN_BIN captured, TERN_TOKEN denied");
+}
