@@ -138,12 +138,23 @@ PY
 case "$NEW" in ''|*[!0-9]*) echo "FAIL: launcher printed no pid: '$NEW'"; exit 3;; esac
 i=0; while [ "$(cat "$LOCK" 2>/dev/null)" != "$NEW" ] && kill -0 "$NEW" 2>/dev/null && [ $i -lt 30 ]; do sleep 0.5; i=$((i+1)); done
 [ "$(cat "$LOCK" 2>/dev/null)" = "$NEW" ] || { echo "FAIL: new pid $NEW does not hold $LOCK (exited or refused; see dispatcher.log)"; exit 3; }
-ps -E -ww -o command= -p "$NEW" | tr ' ' '\n' | grep -E '^(SWARM_TERN_BRIDGE|TERN_BIN)='
-echo "OK: dispatcher pid $NEW holds the lock"
+PENV=$(ps -E -ww -o command= -p "$NEW") || { echo "FAIL: ps cannot read the environment of pid $NEW"; exit 3; }
+python3 -c '
+import json,sys
+env=json.load(open(sys.argv[1]))["env"]; words=sys.argv[2].split(" ")
+bad=0
+for k in ("SWARM_TERN_BRIDGE","TERN_BIN"):
+    want=env.get(k); got=[w[len(k)+1:] for w in words if w.startswith(k+"=")]
+    if want is None: print("FAIL: recipe has no "+k); bad=1
+    elif got!=[want]: print("FAIL: pid env "+k+"="+(",".join(got) or "<missing>")+", recipe says "+want); bad=1
+    else: print(k+"="+want)
+sys.exit(bad)' "$RECIPE" "$PENV" || { echo "FAIL: new pid $NEW does not carry the recipe env (see lines above)"; exit 3; }
+echo "OK: dispatcher pid $NEW holds the lock and carries the recipe env"
 SH
 echo "restart rc=$?"
-# 期望:stopped: <旧 pid>;两行 SWARM_TERN_BRIDGE=1 与 TERN_BIN=/Users/<you>/.local/bin/tern(验的是新进程实际环境,不是 recipe 文件);
-#       OK: dispatcher pid <新 pid> holds the lock;restart rc=0。
+# 期望:stopped: <旧 pid>;两行 SWARM_TERN_BRIDGE=1 与 TERN_BIN=/Users/<you>/.local/bin/tern(新进程实际环境逐值等于刚改的 recipe;
+#       回滚时 recipe 写 "0",同一个门就要求进程里是 0);OK: dispatcher pid <新 pid> holds the lock and carries the recipe env;restart rc=0。
+#       环境读不到 / 缺项 / 值与 recipe 不同 => FAIL 行 + rc=3(新进程已起但不对:先按 FAIL 行处理,再用本块停掉重起)。
 # rc=2(ABORT)=没有起新进程:按 ABORT 行原因手工处理(歧义 = 先查清那几个 pid 是谁;旧进程不退 = 人工决定是否 SIGKILL),处理完重跑本块。
 # rc=3(FAIL)=旧的已停,新的没起来:读 dispatcher.log 末尾;修好后以 START_ONLY=1 重跑本块(跳过 1)-3);仍有进程命中 $PAT 则 ABORT 不起)。
 #       不带 START_ONLY 重跑会在第 1 步 ABORT「not running (stale lock)」,不会误起。
