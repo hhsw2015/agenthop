@@ -36,9 +36,9 @@
 | `agenthop_send` 到该块是否唤醒 | **是**。send 返回 "Queued to durable inbox"(同机恒先落箱),随后 bus 用 `codex queue` 推进线程:rollout 里出现 `[bus] claude:agenthop-378177a0 → codex:cwd-01a14052 …` 的 user 消息,并开出一个新 turn,回 "woke",收件箱清空。**空闲席位被总线唤醒,不经 Tern 直注。** |
 | `-c hooks=…` 是否透传 | **不透传,是本方案真正的缺口**。本次 codex-acp 只传了 `app-server`(codex-acp 进程 env 里没有 CODEX_CONFIG),所以没触发;但适配器在有 hooks 时会传 `app-server -c hooks=<toml>`,桥只能连接一个**已经在跑**的 daemon,改不了它的配置——这些 -c 会被丢掉(包装已写日志记录)。需要 hooks 的席位要把 hooks 放进 daemon 自己的 config。 |
 | 共享 daemon 断开 / 重启时块的行为 | **只测了桥断开**(kill 桥进程):codex-acp 立刻重起一次 `app-server`(日志 00:12:04 第二次 argv),块继续工作,下一 turn 正常(回 "after-drop"),线程仍是 01a14052。**没测 `codex app-server daemon restart`**:那会打断所有共享 daemon 上的会话(包括其他人的),一次性实测不该这样做。按适配器的 `[APP-SERVER RECOVERY] resuming a session in the restarted app-server` 路径推断:daemon 回来后它会 resume 同一线程。待隔离环境验证。 |
-| 关块后的残留 | 块关闭后桥进程消失,bus 节点 950 退出;关块后紧接着查,线程 01a14052 仍在 36869 的 loaded 列表里。约 40 分钟后再查,列表已为空,即 daemon 会自己卸载空闲线程(时长未测)。 |
+| 关块后的残留 | 块关闭后桥进程消失,bus 节点 950 退出;关块后紧接着查,线程 01a14052 仍在 36869 的 loaded 列表里。约 40 分钟后复查,列表已为空。**这只是一次观察**:说明复查时线程已不在 loaded 里,不说明 daemon 有自动回收策略、也不说明多久回收。回滚不能依赖它,必须显式退订并确认(见 runbook §4)。 |
 
-**结论**:Z 在机制上成立,且实测打通「总线投递 → 空闲 codex 席位被唤醒」,不经 Tern。上线前还差三件:① hooks 的配置放到 daemon 侧;② 在隔离环境验证 daemon 重启后的 resume;③ 关块后线程会滞留一段时间(daemon 自己会卸载,时长未测;回滚时要先退订,见 runbook)。代价:所有 codex 席位共享一个 app-server 进程,它一崩全体受影响(今天的私有 app-server 是每席一个)。
+**结论**:Z 在机制上成立,且实测打通「总线投递 → 空闲 codex 席位被唤醒」,不经 Tern。上线前还差三件:① hooks 的配置放到 daemon 侧;② 在隔离环境验证 daemon 重启后的 resume;③ 关块后线程会留在 daemon 的 loaded 里;是否、何时自动卸载未知,回滚必须显式退订并确认释放(见 runbook)。代价:所有 codex 席位共享一个 app-server 进程,它一崩全体受影响(今天的私有 app-server 是每席一个)。
 
 ## 3. 建议(供裁)
 
@@ -52,10 +52,10 @@
 - 双写者风险是推断(rollout 是追加写的 JSONL,两个进程各自追加会交错),未实测。
 - codex-acp 没有「连远端 app-server」的选项;Z 靠替换它启动的 codex 程序实现。
 - daemon 重启未实测(见 §2a)。
-- hooks:对现有席位不是阻点。权限靠 env `INITIAL_AGENT_MODE`;生效的 hooks 来自 `~/.codex/hooks.json`,共享 daemon 读同一个 `~/.codex`;本机 codex-acp 不经 `CODEX_CONFIG` 传 hooks(探针 argv 只有 `app-server`)。只有将来经 `CODEX_CONFIG` 传 hooks 的席位才会被桥丢掉。
+- hooks:探针**未见参数丢失**(argv 只有 `app-server`;权限靠 env `INITIAL_AGENT_MODE`,不经 hooks)。hooks 在共享 daemon 下是否真的触发**未验证**——runbook 核验第 7 条要求有可归因于本次的执行证据。只有将来经 `CODEX_CONFIG` 传 hooks 的席位才会被桥丢掉参数。
 
 ## 5. 清理(2026-10-16)
 
 - 探针块 tab 11441792876545 已 `tern close`;桥进程、bus 节点 950/2474 均已退出。
-- 探针线程 01a14052:`thread/unsubscribe {"threadId":"01a14052-959c-75d3-ab99-c577eb48294c"}` 返回 `{"status":"notLoaded"}`,前后两次 `thread/loaded/list` 均为 `[]`——daemon 此前已自行卸载。rollout 文件 `~/.codex/sessions/2026/10/16/rollout-2026-10-16T00-08-36-01a14052-….jsonl` 保留(只是记录,不在任何席位名下)。
+- 探针线程 01a14052:`thread/unsubscribe {"threadId":"01a14052-959c-75d3-ab99-c577eb48294c"}` 返回 `{"status":"notLoaded"}`,前后两次 `thread/loaded/list` 均为 `[]`——即复查时它已不在 loaded 里(是谁、何时卸载的未知)。rollout 文件 `~/.codex/sessions/2026/10/16/rollout-2026-10-16T00-08-36-01a14052-….jsonl` 保留(只是记录,不在任何席位名下)。
 - 试点 runbook:`docs/swarm/codex-shared-daemon-pilot-runbook.md`(未执行)。

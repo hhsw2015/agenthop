@@ -18,12 +18,13 @@
    ```
    `chmod +x ~/.agenthop/codex-z/bin/codex`。包装按自己所在位置找桥,日志写 `~/.agenthop/codex-z/wrapper.log`。
 4. 记下回滚所需的现状:`tern ls --json` 里 Second Voice 的 block id 与启动命令(期望 `env INITIAL_AGENT_MODE=agent-full-access tern acp codex --resume 01a13e9a…`)。
+5. 记下 presence 旧值(核验第 7 条要和它比):`cat ~/.agenthop/presence/01a13e9a-ea58-7a30-a8db-35cd3ad3f879.{pid,origin}`,以及两者的 mtime(`stat -f '%m %N' …`)。再记下换壳时刻 `date +%s`。
 
 ## 1. hooks 与权限(研究稿列的缺口,这里核清)
 
 - 权限不靠 hooks:codex-acp 只读 env `INITIAL_AGENT_MODE`(PROGRESS #1066 实证),桥不影响 env,照旧生效。
-- hooks:codex-acp 只在 `CODEX_CONFIG` 里带 hooks 时才给 app-server 加 `-c hooks=…`(dist/index.js:45591)。本机这条为空(探针块日志:argv 只有 `app-server`)。席位真正生效的 hooks 来自 `~/.codex/hooks.json`(`[features] hooks = true`,config.toml),共享 daemon 读的是同一个 `~/.codex`。⇒ **对现有席位不是阻点**。若将来某席靠 `CODEX_CONFIG` 传 hooks,桥会丢掉它们(包装写日志),那时要改放进 `~/.codex/hooks.json`。
-- 待验(本试点的第 3 步):迁移后 SessionStart 等 hook 在共享 daemon 下是否照常触发——看 `~/.agenthop/presence/01a13e9a….pid` 是否被写。
+- hooks 参数:codex-acp 只在 `CODEX_CONFIG` 里带 hooks 时才给 app-server 加 `-c hooks=…`(dist/index.js:45591)。探针块的包装日志里 argv 只有 `app-server`,**未见参数丢失**。这只说明桥没有丢参数,**不证明** hooks 在共享 daemon 下会触发。
+- hooks 是否触发:**待验**,由核验第 7 条决定。席位的 hooks 写在 `~/.codex/hooks.json`,共享 daemon 读同一个 `~/.codex`,这只是前提,不是证据。若将来某席靠 `CODEX_CONFIG` 传 hooks,桥会丢掉它们(包装写日志),那时要改放进 `~/.codex/hooks.json`。
 
 ## 2. 换壳
 
@@ -47,15 +48,16 @@
 | 4 | 只有一个写者:`lsof <上面那个 rollout>` | 只有共享 daemon 的 pid(36869 一类),没有别的 `codex app-server` |
 | 5 | bus 身份:`agenthop_peers` | 出现 `codex:happycapy-01a13e9a`,其进程的父进程是共享 daemon |
 | 6 | bus 唤醒:在它空闲时 `agenthop_send codex:happycapy-01a13e9a "<一句:回 woke>"` | 一分钟内在块里出现该消息并回复;它的耐久箱随后为空 |
-| 7 | presence:`cat ~/.agenthop/presence/01a13e9a-ea58-7a30-a8db-35cd3ad3f879.pid` 及 `.origin` | 有值,且 pid 活着(SessionStart hook 照常) |
+| 7 | 本次 SessionStart hook 确实触发:读 `~/.agenthop/presence/01a13e9a-ea58-7a30-a8db-35cd3ad3f879.pid` 和 `.origin`,与前置第 5 步的旧值比 | 三条都满足才算过:pid 与旧值不同;该 pid 在**新块**的进程树里(`tern process <新块> --json` 的 child 之下);`.origin` 的 `ts=` 和 mtime 都晚于换壳时刻。任何一条不满足 ⇒ 记「待验」,不算过,也不据此推断 hooks 失效 |
 
-## 4. 回滚(任何时候都可以做)
+## 4. 回滚(任何时候都可以做;每步是一道门,过不了就停在那里)
 
-1. `tern close <新 block>`。
-2. 按第 0 步记下的原命令重起:
+1. `tern close <新 block>`。确认 `tern ls --json` 里它消失。
+2. 让共享 daemon 放掉这个线程:对 `app-server-control.sock` 发 `thread/unsubscribe {"threadId":"01a13e9a-ea58-7a30-a8db-35cd3ad3f879"}`。返回 `unsubscribed` 或 `notLoaded` 都可以继续;返回错误或无回应 ⇒ **停**,不进第 3 步。
+3. 确认已释放(两条都要):`thread/loaded/list` 不含 01a13e9a;`lsof ~/.codex/sessions/2026/10/15/*01a13e9a*.jsonl` **没有任何持有者**。任一条不满足 ⇒ **停**,不恢复私有块,上报协调者。这一门就是为了避免同一 rollout 出现两个写者。
+4. 按前置第 4 步记下的原命令恢复私有块:
    `tern new tab agenthop --cwd ~/Dev/happycapy -- env INITIAL_AGENT_MODE=agent-full-access tern acp codex --resume 01a13e9a-ea58-7a30-a8db-35cd3ad3f879`,`tern rename <block> "Second Voice"`。
-3. 线程若还挂在共享 daemon:对 `app-server-control.sock` 发 `thread/unsubscribe {threadId: 01a13e9a…}`(探针实测:已卸载的返回 `{"status":"notLoaded"}`,无害)。**先退订再让私有 app-server 恢复,避免同一 rollout 两个写者。**
-4. 包装目录 `~/.agenthop/codex-z/` 留着不删(下次试点复用),它不在任何 PATH 默认值里,不影响其他席位。
+5. 包装目录 `~/.agenthop/codex-z/` 留着不删(下次试点复用),它不在任何 PATH 默认值里,不影响其他席位。
 
 ## 5. 不在本试点范围
 
