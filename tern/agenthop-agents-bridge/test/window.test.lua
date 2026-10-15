@@ -44,6 +44,16 @@ clock = 1000      -- global so the tern.now mock can advance it
 local timers = {}     -- tern.timer callbacks (the TIMER hook)
 
 local cx = {
+  session = {
+    panes = function()
+      opCalls.panes = (opCalls.panes or 0) + 1
+      return {
+        { pane = 1, kind = "agent", title = "t", cwd = "/c", tab = 3, program = "tern", busy = false, at_prompt = true, alert = false,
+          parked = false, focused = true, running = { line = string.rep("z", 200), ms = 5 } },
+        { pane = 9, kind = "terminal", title = "shell", cwd = "/c", tab = 3, program = "/bin/zsh", busy = false },
+      }
+    end,
+  },
   agents = {
     list = function() opCalls.list = opCalls.list + 1; return {
       { pane = 1, session = 2, model = "m", state = "idle", busy = false, at_prompt = true, alive = true, cwd = "/c", tab = 3, title = "t",
@@ -54,7 +64,10 @@ local cx = {
 }
 
 _G.tern = {
-  getenv = function(k) if k == "HOME" then return "/h" elseif k == "TERN_WINDOW_KEY" then return "win-A" end end,
+  getenv = function(k)
+    if k == "HOME" then return "/h" elseif k == "TERN_WINDOW_KEY" then return "win-A"
+    elseif k == "AGENTHOP_BRIDGE_DEBUG_PHASE" then return DEBUG_PHASE end
+  end,
   now = function() clock = clock + 7; return clock end, -- monotonic ms; each call advances 7ms so tick_ms is measurable
   json = { encode = encode, decode = decode, array = function(t) return t end },
   fs = {
@@ -111,29 +124,30 @@ local js0 = files[AGENTS] or ""
 ck("r4 ②: agents.json carries window (TERN_WINDOW_KEY) and a vm id", js0:find('"window":"win-A"', 1, true) ~= nil and js0:match('"vm":"[%x%-]+"') ~= nil)
 ck("r4 ③: agents.json carries tick_ms (previous tick's cost) and tick_ms_max", tonumber(js0:match('"tick_ms":([%d%.]+)')) ~= nil and tonumber(js0:match('"tick_ms_max":([%d%.]+)')) ~= nil)
 
--- r5: phase breadcrumbs — a crumb is written BEFORE each segment, so a tick killed mid-segment leaves the segment's name behind
+-- r6: the TICK never calls cx.agents:list() (~28ms + ~25ms encode live); it reads cx.session:panes() (~0.17ms)
+ck("r6: mirror ticks so far called agents:list() ZERO times", opCalls.list == 0)
+ck("r6: mirror ticks read cx.session:panes()", (opCalls.panes or 0) >= 1)
+local js6 = files[AGENTS] or ""
+ck("r6: only kind==agent panes are mirrored (terminal pane 9 dropped)", js6:find('"pane":1', 1, true) ~= nil and js6:find('"pane":9', 1, true) == nil)
+ck("r6: agents.json is small (<2KB) and drops the long `running` line", #js6 < 2048 and not js6:find("zzzz", 1, true))
+ck("r6: alive derived from exited==nil", js6:find('"alive":true', 1, true) ~= nil)
+
+-- r6: phase breadcrumbs are OFF by default (each is a file write — the cost class the tick avoids) and ON via the debug switch
 local PHASEF = "/h/.agenthop/tern-panes/mirror-phase.json"
-ck("r5: mirror-phase.json written; last crumb of a completed tick = done with per-segment ms",
-  (files[PHASEF] or ""):find('"phase":"done"', 1, true) ~= nil and (files[PHASEF] or ""):find('"list_ms":', 1, true) ~= nil
-  and (files[PHASEF] or ""):find('"encode_ms":', 1, true) ~= nil and (files[PHASEF] or ""):find('"write_ms":', 1, true) ~= nil)
-do -- simulate a kill INSIDE list: the crumb must already name "list"
-  local realList = cx.agents.list
-  cx.agents.list = function() error("KILLED-IN-LIST") end
-  local okKill = pcall(function() commands["mirror"](cx) end)
-  -- pcall inside mirror swallows a Lua error from list, so emulate a hard stop by checking the crumb sequence instead:
-  cx.agents.list = function() local before = files[PHASEF]; cx._crumbAtList = before; return realList() end
-  commands["mirror"](cx)
-  ck("r5: the crumb names `list` while list is running (written before the segment)", (cx._crumbAtList or ""):find('"phase":"list"', 1, true) ~= nil)
-  cx.agents.list = realList
-  _ = okKill
-end
-ck("r5: agents.json carries phase_ms of the previous completed tick", (files[AGENTS] or ""):find('"phase_ms":', 1, true) ~= nil)
+ck("r6: no mirror-phase.json by default (debug switch off)", files[PHASEF] == nil)
+DEBUG_PHASE = "1"
+commands["mirror"](cx)
+ck("r6: with AGENTHOP_BRIDGE_DEBUG_PHASE=1 the crumb file is written, last crumb = done with per-segment ms",
+  (files[PHASEF] or ""):find('"phase":"done"', 1, true) ~= nil and (files[PHASEF] or ""):find('"panes_ms":', 1, true) ~= nil
+  and (files[PHASEF] or ""):find('"encode_ms":', 1, true) ~= nil)
+DEBUG_PHASE = nil
+ck("r6: agents.json carries phase_ms of the previous completed tick", (files[AGENTS] or ""):find('"phase_ms":', 1, true) ~= nil)
 
 -- ---- 2. the mirror chain never runs drain work: pumping it with pending requests claims nothing ----
 requests["s1.json"] = '{"op":"start","prompt":"p"}'
 requests["l1.json"] = '{"op":"stop"}'
 pumpMirror(); pumpMirror()
-ck("mirror chain: two timer ticks advance tick (5→6)", tickOf() == 6)
+ck("mirror chain: two timer ticks advance tick (4→5)", tickOf() == 5)
 ck("mirror chain: timer ticks claim NO requests and run NO start (drain only on its commands)",
   requests["s1.json"] ~= nil and requests["l1.json"] ~= nil and opCalls.start == 0 and opCalls.stop == 0)
 
@@ -150,17 +164,17 @@ requests["l2.json"] = '{"op":"stop"}'
 commands["drain"](cx)
 pumpMirror()
 ck("isolation: with drain-start disabled, drain still serves fast ops", files[RES .. "l2.json"] ~= nil)
-ck("isolation: with drain-start disabled, the mirror tick still advances (6→7)", tickOf() == 7)
+ck("isolation: with drain-start disabled, the mirror tick still advances (5→6)", tickOf() == 6)
 ck("isolation: the start request stays queued (UNKNOWN recovery is the swarm's: reload)", requests["s2.json"] ~= nil)
 
 -- ---- 5. slim mirror: only the swarm-read fields; the long command strings are dropped ----
 local js = files[AGENTS] or ""
-ck("slim: agents.json keeps pane/state/busy/at_prompt/alive/cwd/title", js:find('"pane":1', 1, true) and js:find('"at_prompt":true', 1, true) and js:find('"title":"t"', 1, true))
-ck("slim: agents.json drops command / agent_command / focused / program", not js:find("xxxx", 1, true) and not js:find("yyyy", 1, true) and not js:find('"focused"', 1, true) and not js:find('"program"', 1, true))
+ck("slim: agents.json keeps pane/busy/at_prompt/alive/cwd/title/program", js:find('"pane":1', 1, true) and js:find('"at_prompt":true', 1, true) and js:find('"title":"t"', 1, true) and js:find('"program":"tern"', 1, true))
+ck("slim: agents.json drops command / agent_command / focused / running", not js:find("xxxx", 1, true) and not js:find("yyyy", 1, true) and not js:find('"focused"', 1, true) and not js:find("zzzz", 1, true))
 
 -- ---- 6. manual mirror command advances the tick too ----
 commands["mirror"](cx)
-ck("mirror command: a manual kick advances tick (7→8)", tickOf() == 8)
+ck("mirror command: a manual kick advances tick (6→7)", tickOf() == 7)
 
 -- ---- 7. eval op (fast class): compiled with loadstring/load, called with cx, value returned ----
 requests["e1.json"] = '{"op":"eval","code":"return #cx.agents:list()"}'
