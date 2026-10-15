@@ -70,6 +70,7 @@ export type Run = { code: number; stdout: string; stderr: string; timedOut: bool
 export type TernDeps = {
   bin: string | undefined;
   ctlDir: string;
+  bridgeDir: string; // the installed plugin dir (arm-schedule.sh lives there)
   socket: string;
   run: (bin: string, args: string[], timeoutMs: number) => Promise<Run>;
   now: () => number;
@@ -113,6 +114,7 @@ export function defaultDeps(env: NodeJS.ProcessEnv = process.env): TernDeps {
   return {
     bin: ternBin(env),
     ctlDir: env.AGENTHOP_TERN_PANES ?? path.join(homedir(), ".agenthop", "tern-panes"),
+    bridgeDir: env.AGENTHOP_BRIDGE_DIR ?? path.join(homedir(), "Library", "Application Support", "Tern", "plugins", PLUGIN_ID),
     socket,
     run: realRun(socket),
     now: () => Date.now(),
@@ -154,7 +156,7 @@ export function unreachable(r: Run): string | undefined {
 }
 
 export type CallResult =
-  | { state: "ok"; id: string; ms: number; result: unknown; recovered?: boolean; pane?: number; placed?: string; placeError?: string; renamed?: string; renameError?: string }
+  | { state: "ok"; id: string; ms: number; result: unknown; recovered?: boolean; republished?: boolean; pane?: number; placed?: string; placeError?: string; renamed?: string; renameError?: string }
   | { state: "UNKNOWN"; hold: true; id: string; ms: number; reason: string }
   | { state: "timeout"; id: string; ms: number; recovered: boolean; reason: string }
   | { state: "unknown"; id?: string; ms: number; reason: string };
@@ -177,12 +179,34 @@ async function poll(d: TernDeps, id: string, waitMs: number): Promise<unknown | 
   }
 }
 
-/** agents.json tick + vm, or null when absent/torn/unparseable. */
-export function readMirror(ctlDir: string): { tick: number; vm: string } | null {
-  try {
-    const j = JSON.parse(readFileSync(path.join(ctlDir, "agents.json"), "utf8")) as { tick?: unknown; vm?: unknown };
-    return typeof j.tick === "number" && typeof j.vm === "string" ? { tick: j.tick, vm: j.vm } : null;
-  } catch { return null; }
+export type Mirror = { tick: number; vm: string; agents: unknown[]; tick_ms?: number; tick_ms_max?: number };
+/** A LEGAL mirror (MTB-SOURCE-SHAPE): decodable JSON is not enough — tick:number, vm:string, agents:array. Anything else = null. Pure. */
+export function asMirror(v: unknown): Mirror | null {
+  const j = v as Record<string, unknown> | null;
+  if (!j || typeof j !== "object" || !Number.isFinite(j.tick) || typeof j.vm !== "string" || !Array.isArray(j.agents)) return null;
+  const num = (x: unknown) => (typeof x === "number" && Number.isFinite(x) ? x : undefined);
+  return { tick: j.tick as number, vm: j.vm, agents: j.agents, tick_ms: num(j.tick_ms), tick_ms_max: num(j.tick_ms_max) };
+}
+/** Total block count from `tern ls --json`, or null when the inventory is not the expected shape (sessions[].tabs[].blocks[]). Pure. */
+export function blockCount(v: unknown): number | null {
+  const sessions = (v as { sessions?: unknown } | null)?.sessions;
+  if (!Array.isArray(sessions)) return null;
+  let n = 0;
+  for (const s of sessions) {
+    const tabs = (s as { tabs?: unknown } | null)?.tabs;
+    if (!Array.isArray(tabs)) return null;
+    for (const t of tabs) {
+      const blocks = (t as { blocks?: unknown } | null)?.blocks;
+      if (!Array.isArray(blocks)) return null;
+      n += blocks.length;
+    }
+  }
+  return n;
+}
+
+/** agents.json as a legal mirror, or null when absent/torn/unparseable/malformed. */
+export function readMirror(ctlDir: string): Mirror | null {
+  try { return asMirror(JSON.parse(readFileSync(path.join(ctlDir, "agents.json"), "utf8"))); } catch { return null; }
 }
 
 /**
@@ -203,9 +227,75 @@ export async function recover(d: TernDeps): Promise<string | undefined> {
     if (d.now() >= deadline) return "bridge not ready after reload (agents.json vm/tick did not move on a mirror trigger)";
     await d.sleep(200);
   }
-  const a = await d.run(d.bin!, ["ctl", "plugins", "run", `plugin.${PLUGIN_ID}.arm`], CTL_TIMEOUT_MS);
-  const armBad = unreachable(a);
-  return armBad ? `arm failed: ${armBad}` : undefined;
+  const arm = await armSequence(d);
+  return arm.ok ? undefined : `arm failed: ${arm.detail}`;
+}
+
+const ARM_CANCEL_MAX = 64;
+type ArmStatus = { step: string | null; count: number | null; id: number | null; error: string | null } | null;
+function readSentinel(ctlDir: string): ArmStatus {
+  try {
+    const v = JSON.parse(readFileSync(path.join(ctlDir, "sentinel.json"), "utf8")) as Record<string, unknown>;
+    if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+    const int = (x: unknown) => (typeof x === "number" && Number.isInteger(x) && x >= 0 ? x : null);
+    return { step: typeof v.step === "string" ? v.step : null, count: int(v.count), id: int(v.id), error: typeof v.error === "string" ? v.error : null };
+  } catch { return null; }
+}
+/** Wait (bounded) for sentinel.json to say one of `steps`; null = no such answer in time. */
+async function awaitSentinel(d: TernDeps, steps: string[]): Promise<ArmStatus> {
+  const deadline = d.now() + 2000;
+  for (;;) {
+    const s = readSentinel(d.ctlDir);
+    if (s !== null && s.step !== null && steps.includes(s.step)) return s;
+    if (d.now() >= deadline) return s;
+    await d.sleep(100);
+  }
+}
+
+/**
+ * MTB-ARM-CONTRACT: the bridge r12 arming protocol — the SAME sequence #1033's sweep runs (armSequence there). Zero kv, zero args.
+ *   arm-scan (sentinel.json cleared first, so only a fresh write answers; integer count required — ctl ok proves nothing)
+ *   count>1 ⇒ loop arm-cancel-next: require step "cancelled-one" with count strictly lower; cancel-failed / anything else ⇒ stop
+ *            then a fresh arm-scan must say count==1
+ *   count==0 ⇒ arm-schedule.sh (exit 0 = scheduled + verified by its own re-scan) ⇒ our own fresh arm-scan must say count==1
+ *   count==1 ⇒ armed
+ * Any stop ⇒ ok:false naming the step; nothing after it runs (the caller then does NOT drain).
+ */
+export async function armSequence(d: TernDeps): Promise<{ ok: boolean; detail: string }> {
+  const stop = (where: string, why: string) => ({ ok: false, detail: `${where}: ${why}` });
+  const action = async (a: string) => unreachable(await d.run(d.bin!, ["ctl", "plugins", "run", `plugin.${PLUGIN_ID}.${a}`], CTL_TIMEOUT_MS));
+  const scan = async (): Promise<number | string> => {
+    try { unlinkSync(path.join(d.ctlDir, "sentinel.json")); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return `cannot clear the previous sentinel.json (${(e as Error).message})`; }
+    const bad = await action("arm-scan");
+    if (bad) return bad;
+    const s = await awaitSentinel(d, ["scanned", "scan-failed"]);
+    if (s === null || s.step !== "scanned" || s.count === null) return `no fresh scan (step=${s?.step ?? "none"}${s?.error ? ` error=${s.error}` : ""})`;
+    return s.count;
+  };
+  let count = await scan();
+  if (typeof count === "string") return stop("arm-scan", count);
+  let cancels = 0;
+  while (count > 1) {
+    if (cancels >= ARM_CANCEL_MAX) return stop("arm-cancel-next", `still ${count} patrols after ${cancels} cancels`);
+    const bad = await action("arm-cancel-next");
+    if (bad) return stop("arm-cancel-next", bad);
+    const s = await awaitSentinel(d, ["cancelled-one", "cancel-failed", "cancel-unknown", "cancel-idle"]);
+    if (s === null) return stop("arm-cancel-next", "UNKNOWN: sentinel.json unreadable");
+    if (s.step === "cancel-failed") return stop("arm-cancel-next", `cancel-failed id ${s.id} (obligation kept)`);
+    if (s.step !== "cancelled-one") return stop("arm-cancel-next", `UNKNOWN: step=${s.step}${s.error ? ` error=${s.error}` : ""}`);
+    if (s.count === null || s.count >= count) return stop("arm-cancel-next", `no progress (count ${count} -> ${s.count})`);
+    count = s.count;
+    cancels += 1;
+  }
+  if (count === 0) {
+    const r = await d.run("bash", [path.join(d.bridgeDir, "arm-schedule.sh")], 15000);
+    if (r.code !== 0 || r.timedOut || r.spawnError) return stop("arm-schedule.sh", `exit ${r.code}${r.timedOut ? " (timed out)" : ""}: ${(r.stdout + r.stderr).trim().slice(0, 200)}`);
+  } else if (cancels === 0) return { ok: true, detail: "already 1 patrol" };
+  const v = await scan();
+  if (typeof v === "string") return stop("arm-scan(verify)", v);
+  if (v !== 1) return stop("arm-scan(verify)", `count ${v} (want 1)`);
+  return { ok: true, detail: cancels > 0 ? `cancelled ${cancels} extra, 1 patrol` : "scheduled, verified 1 patrol" };
 }
 
 
@@ -247,7 +337,7 @@ async function nameStarted(d: TernDeps, op: string, result: unknown, title: stri
 export function staleness(d: TernDeps): "stale" | "fresh" | "unknown" {
   try {
     const f = path.join(d.ctlDir, "agents.json");
-    JSON.parse(readFileSync(f, "utf8"));
+    if (readMirror(d.ctlDir) === null) return "unknown"; // a malformed mirror is no evidence of anything
     return d.now() - statSync(f).mtimeMs > STALE_MS ? "stale" : "fresh";
   } catch { return "unknown"; }
 }
@@ -258,6 +348,9 @@ export async function ternCall(op: string, args: Record<string, unknown> = {}, t
   const ms = () => d.now() - t0;
   if (!(TERN_OPS as readonly string[]).includes(op)) return { state: "unknown", ms: ms(), reason: `unsupported op "${op}" (allowed: ${TERN_OPS.join(", ")})` };
   if (!d.bin) return { state: "unknown", ms: ms(), reason: "tern binary not found (set TERN_BIN)" }; // zero actions taken
+  // MTB-OP-AUTHORITY: the top-level op is the ONLY op. An args.op would be spread into the wire body after validation and
+  // classification, so a "list" could publish a "stop" while being recovered as read-only — rejected before any action.
+  if (Object.prototype.hasOwnProperty.call(args, "op")) return { state: "unknown", ms: ms(), reason: "args.op is reserved: pass the op only as the top-level op" };
   let title: string | undefined;
   let place: Placement | undefined;
   if (op === "start") {
@@ -273,7 +366,8 @@ export async function ternCall(op: string, args: Record<string, unknown> = {}, t
   // focus); the final placement is done with `tern move` once the pane is known (placementFor / nameStarted).
   const { readonly: _ro, title: _t, near: _n, session: _s, how: _h, ...rest } = args;
   const wire = op === "start" ? { ...rest, how: "split" } : rest;
-  try { publishRequest(d.ctlDir, id, { op, ...wire }); }
+  const body = { ...wire, op }; // op last: nothing in args can replace it
+  try { publishRequest(d.ctlDir, id, body); }
   catch (e) { return { state: "unknown", id, ms: ms(), reason: `publish failed: ${(e as Error).message}` }; }
 
   const bad = await trigger(d, op);
@@ -300,11 +394,19 @@ export async function ternCall(op: string, args: Record<string, unknown> = {}, t
   // Read-only + proven stale: ONE recovery, then re-trigger the SAME published request and wait again (still unconsumed ⇒ no duplicate).
   const rec = await recover(d);
   if (rec) return { state: "unknown", id, ms: ms(), reason: `timed out; recovery failed: ${rec}` };
+  // MTB-READONLY-REPLAY: the bridge claims by REMOVING the request before running it, so a read-only request that was claimed and
+  // then lost its answer (hook killed mid-op, result write failed) is gone from requests/. Read-only ⇒ safe to publish it again
+  // under the SAME id; a still-unclaimed one is just re-triggered.
+  let republished = false;
+  if (!existsSync(path.join(d.ctlDir, "requests", `${id}.json`)) && !existsSync(path.join(d.ctlDir, "results", `${id}.json`))) {
+    try { publishRequest(d.ctlDir, id, body); republished = true; }
+    catch (e) { return { state: "unknown", id, ms: ms(), reason: `timed out; re-publish after recovery failed: ${(e as Error).message}` }; }
+  }
   const bad2 = await trigger(d, op);
   if (bad2) return { state: "unknown", id, ms: ms(), reason: `timed out; re-trigger after reload failed: ${bad2}` };
   const second = await poll(d, id, timeoutMs);
-  if (second !== undefined) return { state: "ok", id, ms: ms(), result: second, recovered: true };
-  return { state: "timeout", id, ms: ms(), recovered: true, reason: "no result even after one reload/arm recovery" };
+  if (second !== undefined) return { state: "ok", id, ms: ms(), result: second, recovered: true, ...(republished ? { republished } : {}) };
+  return { state: "timeout", id, ms: ms(), recovered: true, reason: `no result even after one reload/arm recovery${republished ? " (the claimed request was re-published)" : ""}` };
 }
 
 export type BridgeStatus = {
@@ -324,9 +426,10 @@ export async function ternStatus(d: TernDeps = defaultDeps(), logPath: string | 
   // mirror (agents.json)
   const af = path.join(d.ctlDir, "agents.json");
   try {
-    const j = JSON.parse(readFileSync(af, "utf8")) as { tick?: number; vm?: string; tick_ms?: number; tick_ms_max?: number; agents?: unknown[] };
+    const j = asMirror(JSON.parse(readFileSync(af, "utf8")));
+    if (j === null) throw new Error("not a legal mirror (want tick:number, vm:string, agents:array)");
     const age = d.now() - statSync(af).mtimeMs;
-    out.mirror = { tick: j.tick, vm: j.vm, tick_ms: j.tick_ms, tick_ms_max: j.tick_ms_max, age_ms: Math.round(age), agents: Array.isArray(j.agents) ? j.agents.length : undefined };
+    out.mirror = { tick: j.tick, vm: j.vm, tick_ms: j.tick_ms, tick_ms_max: j.tick_ms_max, age_ms: Math.round(age), agents: j.agents.length };
     if (age > STALE_MS) reasons.push(`mirror stale: agents.json ${Math.round(age / 1000)}s old (>5s)`);
     if (typeof j.tick_ms_max === "number" && j.tick_ms_max > 50) reasons.push(`mirror tick_ms_max ${j.tick_ms_max}ms exceeded the 50ms budget`);
   } catch (e) {
@@ -344,10 +447,10 @@ export async function ternStatus(d: TernDeps = defaultDeps(), logPath: string | 
     const bad = unreachable(r);
     if (bad) { reasons.push(bad); out.state = "unknown"; }
     else {
-      try {
-        const j = JSON.parse(r.stdout) as { sessions?: Array<{ tabs?: Array<{ blocks?: unknown[] }> }> };
-        out.blocks = (j.sessions ?? []).reduce((n, s) => n + (s.tabs ?? []).reduce((m, t) => m + (t.blocks?.length ?? 0), 0), 0);
-      } catch { reasons.push("tern ls --json unparseable"); }
+      let n: number | null = null;
+      try { n = blockCount(JSON.parse(r.stdout)); } catch { /* unparseable ⇒ null */ }
+      if (n === null) { reasons.push("tern ls --json is not a sessions[].tabs[].blocks[] inventory"); out.state = "unknown"; }
+      else out.blocks = n;
     }
   }
   // recent budget kills (optional)

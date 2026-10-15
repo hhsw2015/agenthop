@@ -33,7 +33,15 @@ case "$1 $2" in
 esac
 if [ "$1 $2 $3" = "ctl plugins run" ]; then
   echo '{"ok":true}' # tern ctl answers ok even for actions that do not exist — never proof of execution
-  case "$4" in *arm) exit 0;; esac
+  case "$4" in *.arm-scan)
+    [ -f "$D/noscan" ] && exit 0
+    printf '{"step":"scanned","count":%s}' "$(cat "$D/patrols" 2>/dev/null || echo 1)" > "$D/ctl/sentinel.json"; exit 0;;
+  esac
+  case "$4" in *.arm-cancel-next)
+    N=$(cat "$D/patrols" 2>/dev/null || echo 1)
+    if [ -f "$D/cancelfail" ]; then printf '{"step":"cancel-failed","id":31,"count":%s}' "$N" > "$D/ctl/sentinel.json"; exit 0; fi
+    N=$((N-1)); echo $N > "$D/patrols"; printf '{"step":"cancelled-one","count":%s}' "$N" > "$D/ctl/sentinel.json"; exit 0;;
+  esac
   case "$4" in *mirror)
     [ "$MODE" = deadmirror ] && exit 0
     T=$(cat "$D/tick" 2>/dev/null || echo 0); T=$((T+1)); echo $T > "$D/tick"
@@ -44,6 +52,8 @@ if [ "$1 $2 $3" = "ctl plugins run" ]; then
   if [ "$MODE" = heal ] && [ ! -f "$D/reloaded" ]; then exit 0; fi
   REQ=$(ls "$D/ctl/requests" 2>/dev/null | grep '\\.json$' | sort | head -1)
   [ -z "$REQ" ] && exit 0
+  # mode lostclaim: the bridge CLAIMS (removes) the request but its answer is lost — until a reload happened
+  if [ "$MODE" = lostclaim ] && [ ! -f "$D/reloaded" ]; then rm -f "$D/ctl/requests/$REQ"; exit 0; fi
   OP=$(sed -n 's/.*"op":"\\([a-z]*\\)".*/\\1/p' "$D/ctl/requests/$REQ")
   mkdir -p "$D/ctl/results"
   cp "$D/ctl/requests/$REQ" "$D/last-request.json"
@@ -60,12 +70,14 @@ function setup(mode: string) {
   const bin = path.join(dir, "tern");
   writeFileSync(bin, FAKE); chmodSync(bin, 0o755);
   writeFileSync(path.join(dir, "mode"), mode);
+  mkdirSync(path.join(dir, "bridge"));
+  writeFileSync(path.join(dir, "bridge", "arm-schedule.sh"), `#!/bin/sh\necho "$*" >> "${dir}/schedule.log"\n[ -f "${dir}/schedfail" ] && { echo "failed: x"; exit 1; }\necho 1 > "${dir}/patrols"\necho "scheduled: verified 1 patrol"\n`);
   mkdirSync(path.join(dir, "ctl", "requests"), { recursive: true });
   mkdirSync(path.join(dir, "ctl", "results"), { recursive: true });
   process.env.FAKE_DIR = dir; // inherited by the fake tern via realRun's env
   let n = 0;
   const deps: TernDeps = {
-    bin, ctlDir: path.join(dir, "ctl"), socket: path.join(dir, "sock"),
+    bin, ctlDir: path.join(dir, "ctl"), bridgeDir: path.join(dir, "bridge"), socket: path.join(dir, "sock"),
     run: realRun(path.join(dir, "sock")),
     now: () => Date.now(),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -146,7 +158,7 @@ t("checkRoleTitle: non-English / empty rejected", checkRoleTitle("审查") !== n
   const a = s.argv();
   t("read-only timeout: recovered once, then ok", r.state === "ok" && (r as any).recovered === true)
   t("read-only timeout: chain order = drain, reload, mirror(ready probe), arm, drain", (() => {
-    const seq = a.map((x) => (x.startsWith("plugin reload") ? "reload" : x.endsWith(".mirror") ? "mirror" : x.endsWith(".arm") ? "arm" : x.endsWith(".drain") ? "drain" : "?"));
+    const seq = a.map((x) => (x.startsWith("plugin reload") ? "reload" : x.endsWith(".mirror") ? "mirror" : x.endsWith(".arm-scan") ? "arm" : x.endsWith(".drain") ? "drain" : "?"));
     const i = seq.indexOf("reload");
     return seq[0] === "drain" && i > 0 && seq.indexOf("mirror", i) > i && seq.indexOf("arm", i) > seq.indexOf("mirror", i) && seq.lastIndexOf("drain") > seq.indexOf("arm", i);
   })())
@@ -171,7 +183,7 @@ t("checkRoleTitle: non-English / empty rejected", checkRoleTitle("审查") !== n
   const s = setup("deadmirror"); s.staleMirror();
   const r = await ternCall("list", {}, 300, s.deps);
   const a = s.argv();
-  t("reload without mirror movement ⇒ unknown 'not ready', no arm", r.state === "unknown" && /not ready/.test((r as any).reason) && !a.some((x) => x.endsWith(".arm")))
+  t("reload without mirror movement ⇒ unknown 'not ready', no arm", r.state === "unknown" && /not ready/.test((r as any).reason) && !a.some((x) => x.includes(".arm")))
 }
 
 // ---- FC-2 gate (coordinator live incident): agents.json unreadable ⇒ UNKNOWN, ZERO reloads ----
@@ -201,7 +213,7 @@ for (const [op, args] of [["stop", { agent: 1 }], ["start", { prompt: "p", cwd: 
   const r = await ternCall(op, args as Record<string, unknown>, 300, s.deps);
   const a = s.argv();
   t(`non-idempotent ${op} timeout: state UNKNOWN + hold:true + id`, r.state === "UNKNOWN" && (r as any).hold === true && typeof r.id === "string")
-  t(`non-idempotent ${op} timeout: ONE trigger, NO reload, NO re-trigger`, a.filter((x) => x.includes("plugins run") && !x.endsWith(".arm")).length === 1 && !a.some((x) => x.startsWith("plugin reload")))
+  t(`non-idempotent ${op} timeout: ONE trigger, NO reload, NO re-trigger`, a.filter((x) => x.includes("plugins run") && !x.includes(".arm")).length === 1 && !a.some((x) => x.startsWith("plugin reload")))
   t(`non-idempotent ${op} timeout: request left as published (one file, not re-published)`, s.requests().length === 1)
 }
 
@@ -218,6 +230,89 @@ for (const [op, args] of [["stop", { agent: 1 }], ["start", { prompt: "p", cwd: 
   t("socket refused (read-only): state unknown with a socket reason", r.state === "unknown" && /socket unreachable|refused/i.test((r as any).reason))
   const r2 = await ternCall("ask", { agent: 1, text: "hi" }, 500, s.deps);
   t("socket refused (non-idempotent): UNKNOWN/hold — the published request is an open obligation", r2.state === "UNKNOWN" && (r2 as any).hold === true)
+}
+
+// ---- review 4f3afdc: MTB-OP-AUTHORITY — args.op can never replace the validated top-level op ----
+for (const smuggled of ["stop", "start"]) {
+  const s = setup("answer");
+  const r = await ternCall("list", { op: smuggled, agent: 7 }, 500, s.deps);
+  t(`list + args.op=${smuggled}: rejected before any publish/trigger`, r.state === "unknown" && /args\.op is reserved/.test((r as any).reason) && s.requests().length === 0 && s.argv().length === 0)
+}
+{
+  const s = setup("answer");
+  await ternCall("stop", { agent: 1 }, 2000, s.deps);
+  const wire = JSON.parse(readFileSync(path.join(s.dir, "last-request.json"), "utf8"));
+  t("published body's op is exactly the top-level op", wire.op === "stop")
+}
+
+// ---- MTB-READONLY-REPLAY: a read-only request that was CLAIMED (removed) and lost its answer is re-published, same id ----
+{
+  const s = setup("lostclaim"); s.staleMirror();
+  const r = await ternCall("list", {}, 400, s.deps);
+  t("claimed-but-unanswered read-only: recovered by re-publishing the same id ⇒ ok", r.state === "ok" && (r as any).recovered === true && (r as any).republished === true && r.id === "t1")
+}
+{
+  const s = setup("heal"); s.staleMirror();
+  const r = await ternCall("list", {}, 400, s.deps);
+  t("never-claimed read-only: re-triggered, NOT re-published (no duplicate)", r.state === "ok" && (r as any).republished === undefined)
+}
+{
+  const s = setup("lostclaim");
+  const r = await ternCall("stop", { agent: 1 }, 300, s.deps);
+  t("claimed-but-unanswered NON-idempotent: still UNKNOWN/hold, never re-published", r.state === "UNKNOWN" && s.requests().length === 0 && !s.argv().some((x) => x.startsWith("plugin reload")))
+}
+
+// ---- MTB-ARM-CONTRACT: recovery runs the full r12 arm sequence; any failed step stops before the drain ----
+{
+  const s = setup("heal"); s.staleMirror(); writeFileSync(path.join(s.dir, "patrols"), "0");
+  const r = await ternCall("list", {}, 400, s.deps);
+  const a = s.argv();
+  t("count==0: arm-schedule.sh runs, then a fresh arm-scan verifies, then drain ⇒ ok", r.state === "ok" && existsSync(path.join(s.dir, "schedule.log"))
+    && a.filter((x) => x.endsWith(".arm-scan")).length === 2)
+}
+{
+  const s = setup("heal"); s.staleMirror(); writeFileSync(path.join(s.dir, "patrols"), "3");
+  const r = await ternCall("list", {}, 400, s.deps);
+  const a = s.argv();
+  t("count==3: arm-cancel-next twice, verify scan, NO schedule ⇒ ok", r.state === "ok" && a.filter((x) => x.endsWith(".arm-cancel-next")).length === 2 && !existsSync(path.join(s.dir, "schedule.log")))
+}
+{
+  const s = setup("heal"); s.staleMirror(); writeFileSync(path.join(s.dir, "patrols"), "0"); writeFileSync(path.join(s.dir, "schedfail"), "");
+  const r = await ternCall("list", {}, 400, s.deps);
+  const a = s.argv();
+  const reload = a.findIndex((x) => x.startsWith("plugin reload"));
+  t("arm-schedule.sh fails ⇒ unknown naming the step, NO drain after the reload", r.state === "unknown" && /arm-schedule\.sh/.test((r as any).reason) && !a.slice(reload).some((x) => x.endsWith(".drain")))
+}
+{
+  const s = setup("heal"); s.staleMirror(); writeFileSync(path.join(s.dir, "patrols"), "2"); writeFileSync(path.join(s.dir, "cancelfail"), "");
+  const r = await ternCall("list", {}, 400, s.deps);
+  t("arm-cancel-next fails ⇒ unknown (cancel-failed), no drain", r.state === "unknown" && /cancel-failed/.test((r as any).reason))
+}
+{
+  const s = setup("heal"); s.staleMirror(); writeFileSync(path.join(s.dir, "noscan"), "");
+  writeFileSync(path.join(s.dir, "ctl", "sentinel.json"), '{"step":"scanned","count":1}'); // a STALE answer must not count
+  const r = await ternCall("list", {}, 400, s.deps);
+  t("arm-scan does not answer (stale scanned present) ⇒ unknown 'no fresh scan', no drain", r.state === "unknown" && /no fresh scan/.test((r as any).reason))
+}
+
+// ---- MTB-SOURCE-SHAPE: decodable JSON is not a legal mirror / inventory ----
+{
+  const s = setup("silent");
+  const af = path.join(s.dir, "ctl", "agents.json");
+  writeFileSync(af, "{}"); utimesSync(af, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
+  const r = await ternCall("list", {}, 300, s.deps);
+  t("stale `{}` mirror ⇒ unknown, ZERO reloads (not a legal mirror)", r.state === "unknown" && !s.argv().some((x) => x.startsWith("plugin reload")))
+}
+{
+  const s = setup("answer");
+  writeFileSync(path.join(s.dir, "ctl", "agents.json"), "{}");
+  const st = await ternStatus(s.deps, undefined);
+  t("status with `{}` mirror ⇒ unknown, never healthy", st.state === "unknown")
+  writeFileSync(path.join(s.dir, "ctl", "agents.json"), JSON.stringify({ tick: 1, vm: "v", agents: [] }));
+  const fake = path.join(s.dir, "tern");
+  writeFileSync(fake, readFileSync(fake, "utf8").replace(`echo '{"sessions":[{"tabs":[{"blocks":[{"id":1},{"id":2}]}]}]}'`, "echo '{}'"));
+  const st2 = await ternStatus(s.deps, undefined);
+  t("status with `tern ls` = {} ⇒ unknown, blocks NOT folded to 0", st2.state === "unknown" && st2.blocks === undefined)
 }
 
 // ---- status three-state ----
