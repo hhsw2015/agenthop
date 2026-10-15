@@ -28,12 +28,20 @@ STATUS="$D/sentinel.json"
 # run …arm-scan and print sentinel.json's count (rc 1 if the scan did not record a fresh "scanned" status)
 scan_count() {
   # remove the previous status FIRST so only THIS scan's write can satisfy the read (a stale "scanned" would be a false answer;
-  # ctl's ok is not proof the command ran)
+  # ctl's ok is not proof the command ran). r12 BTF-ARM-FRESH: a removal that fails (anything but "was not there") is a failure —
+  # reading on would let the OLD count answer for this scan and schedule a duplicate.
   rm -f "$STATUS" 2>/dev/null
+  if [ -e "$STATUS" ] || [ -L "$STATUS" ]; then echo "cannot clear the previous $STATUS (a stale count must not answer)" >&2; return 1; fi
   "$TERN" ctl plugins run plugin.agenthop-agents-bridge.arm-scan >/dev/null 2>&1
   local i=0
   while [ $i -lt 20 ]; do
-    python3 -I -c 'import json,sys;d=json.load(open(sys.argv[1]));assert d.get("step")=="scanned";print(int(d["count"]))' "$STATUS" 2>/dev/null && return 0
+    # r12 BTF-ARM-COUNT: count must be a JSON non-negative INTEGER as written (not a bool, not 0.9, not "0"); anything else is
+    # UNKNOWN, never coerced to 0
+    python3 -I -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+c=d.get("count")
+assert d.get("step")=="scanned" and type(c) is int and c>=0
+print(c)' "$STATUS" 2>/dev/null && return 0
     sleep 0.1; i=$((i+1))
   done
   return 1

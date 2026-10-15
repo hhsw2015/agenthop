@@ -24,6 +24,8 @@ if [ "$1 $2 $3 $4" = "ctl carly task add" ]; then
 fi
 if [ "$1 $2 $3 $4" = "ctl plugins run plugin.agenthop-agents-bridge.arm-scan" ]; then
   [ "$MODE" = deadscan ] && { echo '{"ok":true}'; exit 0; }
+  case "$MODE" in badcount:*) printf '{"step":"scanned","count":%s}' "${MODE#badcount:}" >"$W/ctl/sentinel.json" 2>/dev/null; echo '{"ok":true}'; exit 0;; esac
+  [ "$MODE" = rofresh ] && { echo '{"ok":true}'; exit 0; } # the dir is read-only: the scan cannot write either
   printf '{"step":"scanned","count":%s}' "$(cat "$W/count")" >"$W/ctl/sentinel.json"
   echo '{"ok":true}'; exit 0
 fi
@@ -60,6 +62,17 @@ ck "count==2 ⇒ exit 2, no add" "2:0" "$rc:$(adds)"
 setup deadscan 0; printf '{"step":"scanned","count":0}' >"$W/ctl/sentinel.json"; rc=$(run)
 ck "scan unanswered (stale status present) ⇒ exit 1" "1" "$rc"
 ck "scan unanswered ⇒ NO add" "0" "$(adds)"
+
+# 6) r12 BTF-ARM-FRESH: the previous status cannot be removed (read-only control dir) ⇒ the stale count=0 must NOT answer
+setup rofresh 1; printf '{"step":"scanned","count":0}' >"$W/ctl/sentinel.json"; chmod 0555 "$W/ctl"; rc=$(run); chmod 0755 "$W/ctl"
+ck "stale status undeletable ⇒ exit 1 (a stale count=0 never answers)" "1" "$rc"
+ck "stale status undeletable ⇒ ZERO adds (live: tasks went 1→2 here)" "0" "$(adds)"
+
+# 7) r12 BTF-ARM-COUNT: a count that is not a non-negative integer as written is UNKNOWN, never coerced to 0
+for bad in false 0.9 '"0"' -1 null; do
+  setup "badcount:$bad" 0; rc=$(run)
+  ck "count=$bad ⇒ exit 1 and ZERO adds" "1:0" "$rc:$(adds)"
+done
 
 if [ "$fails" -eq 0 ]; then echo; echo "PASS (0 failures)"; else echo; echo "FAIL ($fails failure(s))"; fi
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)
