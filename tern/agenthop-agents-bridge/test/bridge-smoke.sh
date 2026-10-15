@@ -4,7 +4,11 @@
 #   1. agents.json `tick` advances within TICK_WAIT seconds (the window VM's poll loop runs)
 #   2. {op:list}  published -> drain action -> results/<id>.json exists within RESULT_WAIT s with ok=true
 #   3. {op:eval, code:"return #cx.agents:list()"} -> same, and the value is a number
-#   4. tern.log has no `exceeded ... agenthop-agents-bridge` budget line since this script started
+#   4. budget kills of this plugin's hooks during the run, reported in TWO columns, not one bit:
+#        kills       — `exceeded ... plugin="agenthop-agents-bridge"` lines in tern.log since start
+#        tick after  — did agents.json tick still advance after the LAST kill? (yes / no / n/a)
+#      PASS only if kills == 0. kills > 0 with tick after = yes is a half-failure (one VM's hook died, another
+#      still writes the mirror — several windows each run a window-half) and is reported as such, not as PASS.
 # Every check runs on its own and reports PASS/FAIL; nothing short-circuits, so a half-failure (command
 # path alive while the status mirror is dead, or the reverse) is visible. If any check fails, the summary is
 # followed by diagnostics (tick, the plugin's last budget failure, unconsumed requests, log tail) and exit 1.
@@ -101,17 +105,23 @@ else
   fail "3 eval: $r"
 fi
 
-# 4. no budget-exceeded line for this plugin since start. Tern writes `... exceeded its budget ... plugin="<id>" hook=...`,
-#    so the plugin id comes AFTER `exceeded`; match both orders. Runs last so it also covers checks 1-3.
+# 4. budget kills since start, two columns. Runs last so it covers checks 1-3. Tern logs
+#    `... exceeded its budget; disabled until reload plugin="<id>" hook="<hook>"` (the id AFTER `exceeded`), plus a second
+#    `handler failed ... exceeded 50 ms` line for the same kill — only the first form is counted, so one kill = 1.
 if [ -f "$LOG" ]; then
   now_lines="$(wc -l <"$LOG" | tr -d ' ')"
   from=$((LOG_START_LINES + 1))
   [ "$now_lines" -lt "$LOG_START_LINES" ] && from=1
-  hit="$(tail -n +"$from" "$LOG" | grep -E "exceeded" | grep -F "$PLUGIN_ID" || true)"
-  if [ -z "$hit" ]; then
-    pass "4 no $PLUGIN_ID budget-exceeded lines since start"
+  kills="$(tail -n +"$from" "$LOG" | grep -F "exceeded its budget" | grep -F "plugin=\"$PLUGIN_ID\"" || true)"
+  nkills=0; [ -n "$kills" ] && nkills="$(printf '%s\n' "$kills" | grep -c .)"
+  hooks="$(printf '%s\n' "$kills" | sed -n 's/.*hook="\([^"]*\)".*/\1/p' | sort | uniq -c | awk '{printf "%s%s x%s", (NR>1?", ":""), $2, $1}')"
+  if [ "$nkills" -eq 0 ]; then
+    pass "4 kills=0  tick after=n/a"
   else
-    fail "4 budget exceeded since start: $hit"
+    # tick after the last kill: sample once, wait TICK_WAIT, sample again
+    a="$(tick)"; sleep "$TICK_WAIT"; b="$(tick)"
+    if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] && [ "$b" -gt "$a" ]; then after="yes ($a -> $b)"; else after="no ($a -> $b)"; fi
+    fail "4 kills=$nkills [$hooks]  tick after=$after"
   fi
 else
   fail "4 tern log not found at $LOG"
@@ -126,7 +136,10 @@ fi
 for f in "${FAILED[@]}"; do echo "  FAIL - $f"; done
 {
   echo "--- diagnostics ---"
-  echo "tick now: $(tick || echo '(unreadable)')"
+  echo "tick now: $(tick || echo '(unreadable)'), agents.json last written $(date -r "$CTRL/agents.json" '+%H:%M:%S' 2>/dev/null || echo '?')"
+  echo "tern sessions / window clients (each window runs its own window-half VM, all writing agents.json):"
+  timeout "$TERN_TIMEOUT" "$TERN" ls --json 2>/dev/null | jq -r '"  sessions: \(.sessions | length) [\([.sessions[].name] | join(", "))]"' 2>/dev/null || echo "  sessions: (tern ls failed)"
+  timeout "$TERN_TIMEOUT" "$TERN" inspect --json 2>/dev/null | jq -r '"  window clients: \([.clients[] | select(.kind == "window")] | length)"' 2>/dev/null || echo "  window clients: (tern inspect failed)"
   echo "unconsumed requests:"
   ls -1 "$CTRL/requests/" 2>/dev/null | grep '\.json$' || echo "  (none)"
   echo "last $PLUGIN_ID budget/handler failure in tern.log (any time):"

@@ -21,6 +21,8 @@ cat >"$FAKE" <<EOF
 #!/usr/bin/env bash
 case "\$1 \$2" in
   "plugin list") echo '{"plugins":[{"id":"agenthop-agents-bridge"}],"problems":[]}' ;;
+  "ls --json") echo '{"sessions":[{"name":"agenthop"},{"name":"work"}]}' ;;
+  "inspect --json") echo '{"clients":[{"kind":"cli"},{"kind":"window"}]}' ;;
   "ctl plugins")
     [ "\${FAKE_DRAIN:-}" = dead ] && exit 0
     for q in "$C"/requests/*.json; do
@@ -53,7 +55,7 @@ run env
 check "$([ $RC -eq 1 ] && echo true)" "mirror dead: exit 1"
 check "$([[ "$OUT" == *'FAIL - 1 tick'* ]] && echo true)" "mirror dead: check 1 FAIL"
 check "$([[ "$OUT" == *'PASS - 2 list'* && "$OUT" == *'PASS - 3 eval'* ]] && echo true)" "mirror dead: checks 2 and 3 still run and PASS"
-check "$([[ "$OUT" == *'PASS - 4 no'* ]] && echo true)" "mirror dead: check 4 still runs"
+check "$([[ "$OUT" == *'PASS - 4 kills=0'* ]] && echo true)" "mirror dead: check 4 still runs"
 check "$([[ "$OUT" == *'3 passed, 1 failed'* && "$OUT" == *'tick now: 2'* ]] && echo true)" "mirror dead: summary + diagnostics"
 
 # C. the reverse: mirror alive, command path dead. 2 and 3 FAIL, 1 and 4 PASS, request left unconsumed.
@@ -65,15 +67,33 @@ check "$([[ "$OUT" == *'PASS - 1 tick'* && "$OUT" == *'FAIL - 2 list'* && "$OUT"
 check "$([[ "$OUT" == *'2 passed, 2 failed'* ]] && echo true)" "commands dead: summary 2 passed, 2 failed"
 check "$([[ "$(sed -n '/unconsumed requests:/,/last agenthop/p' <<<"$OUT")" == *'.json'* ]] && echo true)" "commands dead: diagnostics list the unconsumed requests"
 
-# D. a budget line written during the run fails check 4 only.
+KILL='WARN stencil_plugins: plugin hook exceeded its budget; disabled until reload plugin="agenthop-agents-bridge" hook="await"'
+KILL2='WARN stencil_tern: plugin handler failed plugin="agenthop-agents-bridge" hook="await" error=runtime error: tern: await exceeded 50 ms'
+
+# D. a kill during the run while the tick keeps going (another VM still writes): half-failure, both columns shown.
+#    Tern's two log lines for ONE kill count as 1.
 : >"$L"; rm -f "$C"/requests/*.json; start_ticker
-( sleep 0.5; echo 'WARN stencil_plugins: plugin hook exceeded its budget; disabled until reload plugin="agenthop-agents-bridge" hook="await"' >>"$L" ) &
+( sleep 0.5; printf '%s\n%s\n' "$KILL" "$KILL2" >>"$L" ) &
 run env
 stop_ticker
-check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 4 budget exceeded'* && "$OUT" == *'3 passed, 1 failed'* ]] && echo true)" "budget line: only check 4 FAILs"
+check "$([ $RC -eq 1 ] && [[ "$OUT" == *'FAIL - 4 kills=1 [await x1]  tick after=yes'* ]] && echo true)" "kill + tick alive: 4 FAILs as kills=1, tick after=yes"
+check "$([[ "$OUT" == *'3 passed, 1 failed'* ]] && echo true)" "kill + tick alive: checks 1-3 unaffected"
+check "$([[ "$OUT" == *'sessions: 2 [agenthop, work]'* && "$OUT" == *'window clients: 1'* ]] && echo true)" "diagnostics print tern session and window-client counts"
+
+# D2. a kill and the tick is frozen afterwards: tick after=no.
+: >"$L"; frozen
+( sleep 0.3; printf '%s\n%s\n%s\n' "$KILL" "$KILL2" "${KILL/await/drain}" >>"$L" ) &
+run env
+check "$([[ "$OUT" == *'FAIL - 4 kills=2 [await x1, drain x1]  tick after=no'* ]] && echo true)" "kill + tick frozen: kills=2 per hook, tick after=no"
+
+# D3. no kill: column form on PASS too.
+: >"$L"; start_ticker
+run env
+stop_ticker
+check "$([[ "$OUT" == *'PASS - 4 kills=0  tick after=n/a'* ]] && echo true)" "no kill: PASS - 4 kills=0  tick after=n/a"
 
 # E. an OLD budget line (before start) is not counted.
-echo 'WARN stencil_plugins: plugin hook exceeded its budget; disabled until reload plugin="agenthop-agents-bridge" hook="await"' >"$L"
+echo "$KILL" >"$L"
 start_ticker
 run env
 stop_ticker
