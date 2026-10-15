@@ -11,6 +11,7 @@ import { dbg } from "./debug.js";
 import { recordSelfObserve, recordLearn, readIdentityLog, buildProjection, legacyInboxKeys, identityLogStamp } from "./bus-identity.js";
 import { ackInbox, claimInbox, recoverStaleClaims, releaseInbox, retryStuckPoison, writeInbox, watchInbox, quarantineInbox, poisonDlqEnabled, poisonDlqThreshold, shouldQuarantinePoison, recordPoisonStrike, clearPoisonStrikes, buildPoisonS19, enqueuePoisonNotice, drainPoisonNotices, poisonNoticeSource } from "./inbox.js";
 import { installInboxWake } from "./swarm/inbox-wake.js";
+import { readSeatShell, selfShell, claimAllowed } from "./swarm/tern-wake.js";
 import { resolveInboxTarget, isValidSessionId } from "./send-fallback.js";
 import { resolveSession, listSessions, probeSessionAlive } from "./swarm/task-liveness.js";
 import { reportCheckIn, deliverToCoordinator } from "./checkin.js";
@@ -129,6 +130,27 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
     for (const k of legacyKeys) if (!out.includes(k)) out.push(k); // legacyInboxKeys already excludes the current keys; dedup defensively
     return out;
   };
+  // Unique-claimant gate (PROGRESS #1025): during the herdr→Tern migration the same sid can be live in BOTH shells. A seat registered
+  // to one shell (~/.agenthop/swarm/seat-shell/<sid>.json, written by tern-restore) must not have its mail claimed by an instance in
+  // the OTHER shell. Refuse ONLY on a positive mismatch; unregistered / unreadable / un-attestable ⇒ allowed (never strand mail).
+  // SCOPE (IWT-CLAIM-SCOPE): the gate blocks NEW CLAIMS only — the refused instance never renames a pending `.json` to its own claim,
+  // never pushes, acks, or quarantines it, so no message is consumed or moved out of the box. It does NOT freeze the directory:
+  // the maintenance that runs before the gate in each flush still runs — recoverStaleClaims turns a DEAD pid's `.json.claim-<pid>`
+  // back into a pending `.json` (that only RETURNS mail to the queue, which the owning instance then claims), plus retry of this
+  // process's own stuck poison/release obligations. Those obligations are kept deliberately: blocking them would strand mail a
+  // crashed instance left behind. Not a directory write lock. Logged once per state.
+  const myShell = selfShell();
+  let lastRefusedSid: string | null = null;
+  const claimGateOpen = (): boolean => {
+    const sid = self.stableId ?? self.id;
+    const ok = claimAllowed(readSeatShell(home, sid), myShell);
+    if (!ok && lastRefusedSid !== sid) {
+      lastRefusedSid = sid;
+      try { process.stderr.write(`[agenthop] stale-shell claim refused: seat ${sid} is registered to another shell; this ${myShell} instance leaves its inbox for the owner\n`); } catch { /* best-effort */ }
+    }
+    if (ok) lastRefusedSid = null;
+    return ok;
+  };
   let flushing = false;
   // Per-process retry set for poison files a claim could neither quarantine nor release (both failed on a transient FS
   // fault). The flush timer re-attempts them via retryStuckPoison once the fault clears (review bb6dad5-P2-4-B).
@@ -204,7 +226,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // claimInbox claims the WHOLE pending batch up front. On the first push failure (channel not ready) we
       // must release this one AND every still-unprocessed claim — otherwise they are orphaned as .claim-<pid>
       // files that no later flush reclaims (claimInbox only sees .json), stranding the message for good.
-      const claimed = claimInbox(home, inboxKeys(), String(process.pid), stuckPoison); // validates + quarantines poison (F28) — msgs here are schema-valid
+      const claimed = claimGateOpen() ? claimInbox(home, inboxKeys(), String(process.pid), stuckPoison) : []; // validates + quarantines poison (F28) — msgs here are schema-valid; [] when this shell is not the seat's registered claimant
       let delivered = 0;
       for (let i = 0; i < claimed.length; i++) {
         // F28 defense-in-depth: a push that THREW (not just returned false) must never escape flushInbox — this runs as
@@ -569,6 +591,7 @@ export function startBusCore(options: BusCoreOptions = {}): BusCore {
       // claimed, a newly-linked same-native box must be picked up. Stamp-gated ⇒ cheap when the log is unchanged.
       const drain = (): BusMessage[] => {
         refreshLegacyKeys();
+        if (!claimGateOpen()) return []; // stale-shell instance: leave the seat's mail for its registered shell
         return claimInbox(home, inboxKeys(), String(process.pid), stuckPoison).map((c) => {
           ackInbox(c.file);
           return { from: c.msg.from, fromLabel: c.msg.fromLabel, text: c.msg.text, via: c.msg.via };

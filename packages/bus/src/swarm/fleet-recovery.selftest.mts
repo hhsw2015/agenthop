@@ -59,7 +59,7 @@ try {
 
   // ── FR-3 (kept) + verdicts + breakpoint ─────────────────────────────────────────────────────────────────────────
   t("FR-3: wake NULL (target env unreadable) ⇒ unknown", dispatcherVerdict({ pidAlive: true, heartbeatFreshSec: 10, wakeStatus: null }, 120) === "unknown");
-  t("verdict confirmed/failed", dispatcherVerdict({ pidAlive: true, heartbeatFreshSec: 10, wakeStatus: "on" }, 120) === "confirmed" && dispatcherVerdict({ pidAlive: false, heartbeatFreshSec: 1, wakeStatus: "on" }, 120) === "failed");
+  t("verdict confirmed/failed", dispatcherVerdict({ pidAlive: true, heartbeatFreshSec: 10, wakeStatus: "on(herdr)" }, 120) === "confirmed" && dispatcherVerdict({ pidAlive: false, heartbeatFreshSec: 1, wakeStatus: "on(herdr)" }, 120) === "failed");
   t("memberVerdict + dispatcherNeedsRelaunch + snapshotStaleSec", memberVerdict(true, false, false) === "confirmed" && dispatcherNeedsRelaunch(goodSnap, false) && snapshotStaleSec({ capturedAtSec: 1000 }, 1600) === 600);
   t("parseDispatcherRecipe argv with spaces round-trips; parseFleetSnapshot ok", parseDispatcherRecipe({ argv: ["/n", "my file.ts"], cwd: "/r", env: {}, source: "self-recorded" })?.argv[1] === "my file.ts" && parseFleetSnapshot(JSON.stringify(goodSnap)) !== null);
   t("buildBreakpointText unreadable⇒'无法读取'; summarize/discharged", buildBreakpointText({ member: "m", grantedItems: null, liveAttempts: null, unreadInbox: null }, "T").includes("无法读取") && deliveryDischarged("published") && !deliveryDischarged("failed"));
@@ -76,7 +76,7 @@ try {
       writeEpisode: (ep) => { state.episodeWrites.push(ep); state.writeOrder.push("episode"); if (o.failWriteEpisodeAfter !== undefined && state.episodeWrites.length > o.failWriteEpisodeAfter) return false; return o.writeEpisodeOk ?? true; },
       dispatcherLive: () => false,
       relaunchDispatcher: () => true,
-      verifyDispatcher: () => o.disp ?? { pidAlive: true, heartbeatFreshSec: 10, wakeStatus: "on" },
+      verifyDispatcher: () => o.disp ?? { pidAlive: true, heartbeatFreshSec: 10, wakeStatus: "on(herdr)" as const },
       peers: () => o.peersAfter ?? [],
       settle: async () => {},
       claimLaunch: () => o.claimReturns ?? true,
@@ -94,7 +94,7 @@ try {
 
   // FR-8 report-with-real-results: dispatcher inert + member absent ⇒ deliverReport MUST receive notConfirmed>0 (not a zeroed placeholder)
   {
-    const h = makeHarness({ disp: { pidAlive: true, heartbeatFreshSec: 10, wakeStatus: "on(inert:no-herdr)" }, peersAfter: [] });
+    const h = makeHarness({ disp: { pidAlive: true, heartbeatFreshSec: 10, wakeStatus: "on(inert:no-transport)" }, peersAfter: [] });
     const r = await orchestrateRecover(goodSnap, roster, h.deps);
     t("FR-8: deliverReport got the REAL result (notConfirmed>0), not a zeroed placeholder", h.state.reportArg !== null && h.state.reportArg.notConfirmed >= 2 && h.state.reportArg.outstanding.length >= 2);
     t("FR-8: final result not falsely 'all confirmed'", r.notConfirmed >= 2 && r.outstanding.some((o) => o.startsWith("dispatcher:")));
@@ -404,4 +404,13 @@ try {
   console.log("\nfleet-recovery r4 selftest: ALL PASS");
 } finally {
   try { rmSync(scratch, { recursive: true, force: true }); } catch { /* best-effort */ }
+}
+
+// #1032: TERN_BIN must survive the dispatcher's self-recorded recipe (else a dispatcher outside a Tern pane loses the Tern wake
+// transport on every restart). Secret names stay denied regardless of prefix.
+{
+  const { envAllowed } = await import("./fleet-recovery.js");
+  if (!envAllowed("TERN_BIN")) throw new Error("FAILED: TERN_BIN is captured by the recipe allowlist");
+  if (envAllowed("TERN_TOKEN")) throw new Error("FAILED: a TERN_* secret-named var is still denied");
+  console.log("ok  #1032: TERN_BIN captured, TERN_TOKEN denied");
 }

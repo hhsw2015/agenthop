@@ -166,7 +166,7 @@ async function main(): Promise<void> {
     relaunchDispatcher,
     verifyDispatcher: () => {
       const pid = dispatcherPid(H);
-      let wakeStatus: "off" | "on" | "on(inert:no-herdr)" | null = null;
+      let wakeStatus: ReturnType<typeof inboxWakeStatus> | null = null;
       if (pid !== null) { const { env, ok } = captureEnvForPid(pid); if (ok) wakeStatus = inboxWakeStatus(env as NodeJS.ProcessEnv); } // FR-3: TARGET env ONLY
       return { pidAlive: dispatcherLive(H), heartbeatFreshSec: heartbeatFreshSec(H, nowSec()), wakeStatus };
     },
