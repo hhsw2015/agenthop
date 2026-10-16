@@ -61,13 +61,26 @@ ACP 耦合面(退役/改写清单,grep `tern acp|cx.agents|agents.json|acp` 2026
 | swarm-soak @7d96245(主审 3P1) | **继续**:Reserve 修 r2(Phase 0 之后) | 壳无关 |
 | master-plan §I 两壳合一、cutover runbook #1056 | **作废** | 本 brief 替代;Phase 3 前由 Platform Dev 重写 runbook |
 
-## 4. 分期与派单
+## 4. 分期与派单(#1121 加速版;user「能不能加快推进」)
 
-- **Phase 0 · U-spike(Reserve b90ccae9,≤2h,不改产线)**:在 Tern 起一个真 claude TUI 块与一个真 codex TUI 块(§1.1 命令),跑 ≥1h;每 30s `tern capture --scrollback` + 调 classify(`~/.agenthop/swarm/tern-eval.sh` 或 Lua 测试入口)记 `state` 序列,与人工真值对照。回答:**U1** idle/working/blocked 真值率(claude、codex 各报);**U2** codex manifest 是否命中;**U3** `tern send text` 多行 + `keys Enter` 是否真提交(含粘贴模式);**U4** presence `.pid` 是否由 hook 自然出现(claude);codex 如何得 pid;**U5** 两席 bus 可达(`agenthop_peers`)。产出 `docs/research/tui-seat-spike.md` + 证据目录;协调者轻审,不进双声。
-- **Phase 1 · 席位原语(Platform Dev 378177a0,[liveness])**:**T1** 哨兵接线 classify → agents.json `screen_state`(每轮一 pane;分类 5ms 上限;整轮 ≤50ms;UNKNOWN=本轮无新信息不当 idle);**T2** `agenthop_tern` / 桥 op 的 TUI 语义:list(tern ls + screen_state)/ ask(send text+Enter,投递先于记账)/ wait(有界轮询单调钟)/ transcript(文件)/ start(tern new)/ stop(tern close,pid 确认)。先用 PROTOCOL §10 的 5 份真实截屏做夹具,Phase 0 数据到了再扩。
-- **Phase 2 · 生命周期(Infra Dev 8a53f4e8,bus.11 r3 之后,[liveness])**:**T3** roster v2(role/tool/model/mode/sid → TUI argv)+ tern-restore TUI + seat-presence 退 ACP 写者 + inbox-wake/tern-wake 门改读 `screen_state`;**T4** L8 继任起的是 TUI 协调者块。
-- **Phase 3 · 逐席切换(协调者 + Reserve)**:序 Reserve → 开发席 ×2 → 审查席(codex TUI)→ **协调者最后**(L8 自继任进 TUI 块)。每席:新块 presence 出现 + 箱可达 + bus 可达 **之后**才 `tern close` 旧块;runbook 每步带回滚。
-- **Phase 4**:三夜 soak 全过 ⇒ 删 `tern acp` 路径。
+原则:**TUI 席位从第一天就能干活**(耐久箱 + bus + 席位自己的 MCP 与壳无关),T1/T2 只加观测与控制 ⇒ 切席不等 T1/T2;Phase 0 的 argv/presence 答案分钟级可得,不等 1h 真值率;并行度拉满(Model Gateway 空闲入列)。
+
+| 阶段 | 内容 | owner | 门 |
+|---|---|---|---|
+| **Phase 0a(即刻)** | 两个真 TUI 块已起 ⇒ 立刻报 argv + U3(提交方式)+ U4(presence)+ U5(bus 可达) | Reserve | 协调者轻审,解锁 T3 与 Phase 3 |
+| **Phase 0b(后台 1h)** | U1 真值率 / U2 codex manifest;产出 docs/research/tui-seat-spike.md | Reserve | 喂 T1b 夹具 |
+| **T1a** 分类器对齐上游 | manifests.luau 从 `~/Dev/vendor/herdr-upstream` 重生成(22 份);新区域 `bottom_non_empty_lines(N)` / `top_non_empty_lines(N)` / `prompt_box_body` / `whole_recent`;engine v3 门;接口冻结 `classify(lines,title,program) → {state,rule,agent,skip_state_update,visible_idle,visible_blocker,visible_working}`;只改 classify.luau / manifests.luau / tools / test | **Model Gateway** e555b371 | [liveness] 双声;rg 差分零差异 |
+| **T1b** 窗口插件接线 | window.luau `screen` 命令(独立 hook/预算,轮转一 pane)→ 滞回状态机(working→idle 3 次确认/700ms;输出变化=working 权威,无 PTY 字节信号则屏哈希代替并注明)→ per-VM `tern-panes/screens/<vm>.json` → agents.json;陈旧/缺失=UNKNOWN;L5 r3 两修复带入 | Platform Dev | [liveness] 双声 |
+| **T2** 控制面 TUI 语义 | agenthop_tern / 桥 op:list / ask(text→300ms→Enter,送达=屏变化)/ wait(有界+单调钟)/ transcript / start / stop | Platform Dev(T1b 后) | [liveness] 双声 |
+| **A r11** codex TUI parent 类 + r10 四 REMAIN | 只影响 codex 审查席(最后切)⇒ 排 T2 之后 | Platform Dev | [liveness] 双声 |
+| **T3** roster v2 + tern-restore TUI + presence 退 ACP 写者 + wake 门读 screen_state | 用 Phase 0a 的 argv 即开工 | Infra Dev(bus.11 r3/r3b 已送审,现在就开) | [liveness] 双声 |
+| **T4** L8 继任起 TUI 协调者块 | | Infra Dev(T3 后) | [liveness] 双声 |
+| **Phase 3 切席** | 序 Reserve(**今天,Phase 0a 过即切**)→ Infra/Platform 开发席 → Model Gateway → 审查席(codex TUI,A r11 后)→ 协调者最后(L8 自继任)。每席:新块 presence + 箱可达 + bus 可达之后才 `tern close` 旧块;T1b 未上前观测靠 transcript mtime / bus 状态 / 箱深 | 协调者 + 各席自切 | 每席一行 PROGRESS + 回滚命令 |
+| **Phase 4** | 三夜 soak 全过 ⇒ 删 `tern acp` 路径 | | |
+
+审查队列(两席同序):bus.11 r3/r3b → **T3 → T1a → T1b → T2 → A r11** → swarm-soak r2(soak 工具今晚用得上但不在切席关键路径)。
+
+不可压缩的:liveness 四道 + 12h soak(并行于开发,不串行);读屏真值率需要真实运行时间(后台跑,不挡切席)。
 
 ## 5. 不变量(审查席按此判)
 
