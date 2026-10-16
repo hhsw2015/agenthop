@@ -86,6 +86,7 @@ import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swa
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
+import { realTernSpawn } from "../packages/bus/src/swarm/tern-env.js";
 import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, bridgeHome, bridgeScriptEnv, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
 import { modelMarketEnabled } from "../packages/bus/src/swarm/model-market.js";
 import { pullModelMarket } from "../packages/bus/src/swarm/model-market-store.js";
@@ -1955,7 +1956,7 @@ async function main(): Promise<void> {
   // a non-default install), while the swarm's own state (seat-shell records, the reload audit) stays under AH_HOME.
   const BRIDGE_HOME = bridgeHome(process.env, homedir());
   const ternBridgeIO = {
-    tern: realTern(process.env),
+    tern: realTern(process.env, realTernSpawn(process.env)),
     readMirror: realMirrorReader(BRIDGE_HOME),
     readSentinel: realSentinelReader(BRIDGE_HOME),
     clearSentinel: realClearSentinel(BRIDGE_HOME),
@@ -1980,10 +1981,8 @@ async function main(): Promise<void> {
   const orphanState = initialOrphanState();
   const herdr = realHerdr(process.env);
   const bridgeDirPath = process.env.AGENTHOP_BRIDGE_DIR || path.join(SCRIPTS_DIR, "..", "tern", "agenthop-agents-bridge");
-  const ternLs = (): string | null => {
-    const r = spawnSync(process.env.TERN_BIN || "tern", ["ls", "--json"], { encoding: "utf8", timeout: 3000 });
-    return r.error || r.status !== 0 ? null : r.stdout;
-  };
+  const ternSpawn = realTernSpawn(process.env); // L3: every tern call from the dispatcher = cleaned env + TERN_PANE_SOCKET + 1.5s
+  const ternLs = (): string | null => { const r = ternSpawn(["ls", "--json"]); return r.ok ? r.stdout : null; };
   const orphanIO = {
     seatRecords: realSeatRecords(HOME), herdrSessions: herdr.sessions, ternBlocks: realTernBlocks(ternLs),
     signalPid: realSignalPid, waitPidGone: (pid: number) => realWaitPidGone(pid), markWorker: realMarkWorker(HOME), whileInstance: realWhileInstance(HOME), socketOwners: realSocketOwners(process.env), gc: realGc(bridgeScriptEnv(process.env, BRIDGE_HOME), bridgeDirPath),

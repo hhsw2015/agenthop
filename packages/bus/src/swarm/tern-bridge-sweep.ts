@@ -22,8 +22,8 @@
  */
 import { readFileSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import path from "node:path";
-import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { cleanTernEnv, realTernSpawn, TERN_SPAWN_TIMEOUT_MS, type TernSpawn } from "./tern-env.js";
 
 export const ACTION = "plugin.agenthop-agents-bridge";
 export const MIRROR_EVERY_MS = 5_000;
@@ -35,7 +35,7 @@ export const READY_WAIT_MS = 4_000;
  *  deadline: ≤ READY_POLLS mirror probes, ≤ READY_WAIT_MS + one TERN_TIMEOUT_MS + one READY_POLL_MS of real time. */
 export const READY_POLL_MS = 250;
 export const READY_POLLS = Math.ceil(READY_WAIT_MS / READY_POLL_MS) + 1;
-export const TERN_TIMEOUT_MS = 3_000;
+export const TERN_TIMEOUT_MS = TERN_SPAWN_TIMEOUT_MS; // 1.5s (L3; was 3s)
 export const ARM_CANCEL_MAX = 64; // bound on arm-cancel iterations (a sentinel that never reaches 0 must not loop forever)
 /** L5: after this many consecutive UNKNOWN ticks (tern not answering) the sweep probes only once per UNKNOWN_BACKOFF_MS. */
 export const UNKNOWN_BACKOFF_AFTER = 3;
@@ -59,8 +59,10 @@ export function bridgeHome(env: NodeJS.ProcessEnv, osHome: string): string {
 
 /** The env every bridge helper SCRIPT (arm-schedule.sh, gc.sh) must run with: the same resolved control dir the TS readers use,
  *  via AGENTHOP_TERN_PANES (both scripts read it, else fall back to OS home). One function so scan/read/schedule/gc cannot split. */
+/** The bridge helper scripts (arm-schedule.sh, gc.sh) call `tern` themselves, so they get the same cleaned env as every other tern
+ *  call (L3) plus the bridge's pane dir. */
 export function bridgeScriptEnv(env: NodeJS.ProcessEnv, home: string): NodeJS.ProcessEnv {
-  return { ...env, AGENTHOP_TERN_PANES: bridgeDir(home) };
+  return { ...cleanTernEnv(env), AGENTHOP_TERN_PANES: bridgeDir(home) };
 }
 
 /** One tern call's outcome. ok=false ⇒ tern itself did not answer (UNKNOWN), not a bridge verdict. */
@@ -348,15 +350,12 @@ function finishAfterReload(st: BridgeState, io: BridgeIO, now: Mirror): TickOutc
 // ---------------- real IO (dispatcher wiring) ----------------
 
 /** tern runner with timeout + TERN_BIN. Any spawn error / timeout / non-zero exit ⇒ ok=false (UNKNOWN). */
-export function realTern(env: NodeJS.ProcessEnv = process.env): TernRun {
-  const bin = env.TERN_BIN || "tern";
-  const sock = env.TERN_PANE_SOCKET || path.join(homedir(), "Library", "Application Support", "Tern", "daemon.sock");
+export function realTern(env: NodeJS.ProcessEnv = process.env, spawn: TernSpawn = realTernSpawn(env)): TernRun {
   return (args) => {
-    // SIGKILL: a short read-only ctl call has nothing to flush, and a child that ignores TERM would hold the sweep past its budget
-    const r = spawnSync(bin, args, { encoding: "utf8", timeout: TERN_TIMEOUT_MS, killSignal: "SIGKILL", env: { ...env, TERN_PANE_SOCKET: sock } });
-    if (r.error) return { ok: false, detail: String(r.error.message ?? r.error) };
-    if (r.status !== 0) return { ok: false, detail: `exit ${r.status}: ${(r.stderr || "").trim().slice(0, 160)}` };
-    if (/"ok"\s*:\s*false/.test(r.stdout || "")) return { ok: false, detail: (r.stdout || "").trim().slice(0, 160) };
+    const r = spawn(args);
+    if (r.error) return { ok: false, detail: r.error };
+    if (r.status !== 0) return { ok: false, detail: `exit ${r.status}: ${r.stderr.trim().slice(0, 160)}` };
+    if (/"ok"\s*:\s*false/.test(r.stdout)) return { ok: false, detail: r.stdout.trim().slice(0, 160) };
     return { ok: true, detail: "" };
   };
 }

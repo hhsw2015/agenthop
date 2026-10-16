@@ -9,6 +9,7 @@
  * Secret discipline (Q1/FR-2): the env subset is name-allowlisted AND value-credential-scrubbed by the pure filterCaptureEnv; at
  * relaunch the shell merges it OVER the live shell env so profile secrets come from the canonical shell.
  */
+import { cleanTernEnv } from "./tern-env.js";
 import { mkdirSync, writeFileSync, renameSync, readFileSync, readdirSync, lstatSync, existsSync, readlinkSync, openSync, closeSync, fstatSync, ftruncateSync, constants as fsConstants } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
@@ -157,7 +158,7 @@ export function recordDispatcherRecipe(home: string, nowSec: number): boolean {
     // normally-tsx-launched `.ts` dispatcher relaunches as `node script.ts` ⇒ ERR_UNKNOWN_FILE_EXTENSION. Full argv = node + execArgv + script+args.
     argv: [process.argv[0]!, ...process.execArgv, ...process.argv.slice(1)],
     cwd: process.cwd(),
-    env: filterCaptureEnv(process.env),
+    env: filterCaptureEnv(cleanTernEnv(process.env)), // L3: never replay the pane this dispatcher happened to start in
     source: "self-recorded",
   };
   writeJsonAtomic(recipePath(home), recipe);

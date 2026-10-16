@@ -16,6 +16,7 @@ import {
   armSequence, ACTION, RELOAD_MIN_MS, TERN_TIMEOUT_MS,
   type BridgeIO, type Mirror, type PendingReq, type TernResult, type ArmStatus,
 } from "./tern-bridge-sweep.js";
+import { realTernSpawn } from "./tern-env.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
@@ -511,7 +512,23 @@ t("control root: explicit AGENTHOP_BRIDGE_HOME wins", bridgeHome({ AH_HOME: "/tm
   t("runner: exit 1 ⇒ UNKNOWN", realTern({ TERN_BIN: mk("b", "echo nope >&2; exit 1") })(["x"]).ok === false);
   t("runner: {\"ok\":false} ⇒ UNKNOWN", realTern({ TERN_BIN: mk("c", 'echo \'{"ok":false,"error":"x"}\'') })(["x"]).ok === false);
   t("runner: missing binary ⇒ UNKNOWN", realTern({ TERN_BIN: path.join(dir, "nope") })(["x"]).ok === false);
-  t("runner: hang ⇒ timeout ⇒ UNKNOWN", realTern({ TERN_BIN: mk("d", "sleep 10") })(["x"]).ok === false);
+  const t0 = Date.now(); const hung = realTern({ TERN_BIN: mk("d", "sleep 10") })(["x"]); const took = Date.now() - t0;
+  t("runner: hang ⇒ timeout ⇒ UNKNOWN", hung.ok === false);
+  t("runner: L3 the hang is cut at 1.5s (not 3s)", took >= 1400 && took < 2500);
+  // L3 env: what the spawned tern actually receives (a fake tern that prints its own env)
+  const envDump = mk("e", 'env | sort');
+  const parent = { TERN_BIN: envDump, TERN_PANE: "1056561954886", TERN_PANE_SOCKET: "/s/daemon.sock", TERN_WINDOW_SOCKET: "/w",
+    TERN_PROMPT_FILE: "/p", CLAUDE_CODE_SESSION_ID: "c", CLAUDECODE: "1", HERDR_PANE_ID: "h", HERDR_ENV: "1", HERDR_BIN_PATH: "/hb",
+    PATH: process.env.PATH ?? "", HOME: "/home/u", SWARM_COORDINATOR: "x" };
+  const seen = realTernSpawn(parent)(["x"]).stdout;
+  const has = (k: string) => new RegExp(`^${k}=`, "m").test(seen);
+  t("L3 env: TERN_PANE_SOCKET kept (tern ctl needs it to find the daemon)", /^TERN_PANE_SOCKET=\/s\/daemon\.sock$/m.test(seen));
+  t("L3 env: TERN_PANE / TERN_WINDOW_* / TERN_PROMPT_* dropped", !has("TERN_PANE") && !has("TERN_WINDOW_SOCKET") && !has("TERN_PROMPT_FILE"));
+  t("L3 env: CLAUDE_* and CLAUDECODE dropped", !has("CLAUDE_CODE_SESSION_ID") && !has("CLAUDECODE"));
+  t("L3 env: HERDR_PANE_ID dropped, HERDR_ENV / HERDR_BIN_PATH kept", !has("HERDR_PANE_ID") && has("HERDR_ENV") && has("HERDR_BIN_PATH"));
+  t("L3 env: HOME / PATH / SWARM_* kept", has("HOME") && has("PATH") && has("SWARM_COORDINATOR"));
+  t("L3 env: no inherited socket ⇒ the default daemon socket is set", /^TERN_PANE_SOCKET=.*\/Library\/Application Support\/Tern\/daemon\.sock$/m.test(realTernSpawn({ TERN_BIN: envDump, PATH: process.env.PATH ?? "" })(["x"]).stdout));
+  t("L3 env: bridge scripts get the same cleaned env", (() => { const e = bridgeScriptEnv(parent, "/home/u"); return e.TERN_PANE === undefined && e.TERN_PANE_SOCKET === "/s/daemon.sock" && e.CLAUDECODE === undefined && e.AGENTHOP_TERN_PANES === "/home/u/.agenthop/tern-panes"; })());
 }
 
 // --- L5-LV-SOURCE-UNKNOWN: requests/ unreadable ⇒ UNKNOWN hold, never "nothing stuck" ---
