@@ -43,7 +43,7 @@ ACP 耦合面(退役/改写清单,grep `tern acp|cx.agents|agents.json|acp` 2026
 | 项 | 上游事实 | 对 T1/T2 的要求 |
 |---|---|---|
 | manifest | **22 份**(+devin/letta/maki/muse/qwen);claude.toml 3.7k→7.5k、codex 1.6k→4.3k;`min_engine_version` 到 3 | `tools/gen-manifests.py` 改从上游路径重生成;新区域 `bottom_non_empty_lines(N)` / `top_non_empty_lines(N)` / `prompt_box_body` / `whole_recent` 要在 classify.luau 实现;engine 版本门照搬 |
-| 状态机(不只分类) | `pane/agent_detection.rs`:working→idle 要 **3 次确认、每 100ms 复查、700ms 上限**,除非屏上有 visible_idle/visible_blocker;稳定 blocker 每 800ms 刷新;启动 3s 宽限;**PTY 有新字节 = working 权威**(`detection_content_seq`),idle 且无新字节则跳过读屏 | T1 的 `screen_state` 必须带这层滞回;Tern 侧找「块有新输出」的信号(`tern events` / `cx` 事件),没有就用屏哈希变化代替,并在 PROTOCOL 注明是代替 |
+| 状态机(不只分类) | `pane/agent_detection.rs`:working→idle 要 **3 次确认、每 100ms 复查、700ms 上限**,除非屏上有 visible_idle/visible_blocker;稳定 blocker 每 800ms 刷新;启动 3s 宽限;**PTY 新字节只用来决定读不读屏**(idle 且无新字节 ⇒ 跳过读屏,`decide_detection_screen_read`),**working 只来自规则命中**(#1122 核 pane.rs:1157-1185;AgentDetection 的「PTY activity is the working authority」注释已过时) | T1b 的 `screen_state` 必须带这层滞回;屏哈希只复刻「idle 且无变化 ⇒ 跳过读屏」的省读优化,不作 working 来源;PROTOCOL 注明 |
 | codex | #5278 **删了 codex turn-status hooks**;codex = 读屏 + OSC 标题(`Action Required` ⇒ blocked,盲文转圈 ⇒ working) | codex 席不要指望 hook;OSC 标题读取是必需区域 |
 | claude hook | `SessionStart` 只报会话身份(session_id/transcript_path),**不报状态**;full-lifecycle 权威只给 pi/omp/opencode/kilo/kimi/mastracode | 我方 presence 走 SessionStart 即可;状态仍靠读屏 |
 | prompt 提交 | `submit_agent_prompt`:text(bracketed paste)→ **300ms**(`AGENT_PROMPT_SUBMIT_DELAY`)→ Enter;Copilot 先发 focus-gained;Windows codex 加 paste 边界 | T2 `ask` = `tern send text` → sleep 300ms → `keys Enter`,送达判据 = 屏/transcript 变化;这就是「codex 第二次 Enter 才提交」的原因 |
@@ -70,7 +70,7 @@ ACP 耦合面(退役/改写清单,grep `tern acp|cx.agents|agents.json|acp` 2026
 | **Phase 0a(即刻)** | 两个真 TUI 块已起 ⇒ 立刻报 argv + U3(提交方式)+ U4(presence)+ U5(bus 可达) | Reserve | 协调者轻审,解锁 T3 与 Phase 3 |
 | **Phase 0b(后台 1h)** | U1 真值率 / U2 codex manifest;产出 docs/research/tui-seat-spike.md | Reserve | 喂 T1b 夹具 |
 | **T1a** 分类器对齐上游 | manifests.luau 从 `~/Dev/vendor/herdr-upstream` 重生成(22 份);新区域 `bottom_non_empty_lines(N)` / `top_non_empty_lines(N)` / `prompt_box_body` / `whole_recent`;engine v3 门;接口冻结 `classify(lines,title,program) → {state,rule,agent,skip_state_update,visible_idle,visible_blocker,visible_working}`;只改 classify.luau / manifests.luau / tools / test | **Model Gateway** e555b371 | [liveness] 双声;rg 差分零差异 |
-| **T1b** 窗口插件接线 | window.luau `screen` 命令(独立 hook/预算,轮转一 pane)→ 滞回状态机(working→idle 3 次确认/700ms;输出变化=working 权威,无 PTY 字节信号则屏哈希代替并注明)→ per-VM `tern-panes/screens/<vm>.json` → agents.json;陈旧/缺失=UNKNOWN;L5 r3 两修复带入 | Platform Dev | [liveness] 双声 |
+| **T1b** 窗口插件接线 | window.luau `screen` 命令(独立 hook/预算,轮转一 pane)→ 滞回状态机(working→idle 3 次确认/700ms;working 只来自规则命中;屏哈希仅作 idle 省读优化)→ per-VM `tern-panes/screens/<vm>.json` → agents.json;陈旧/缺失=UNKNOWN;L5 r3 两修复带入 | Platform Dev | [liveness] 双声 |
 | **T2** 控制面 TUI 语义 | agenthop_tern / 桥 op:list / ask(text→300ms→Enter,送达=屏变化)/ wait(有界+单调钟)/ transcript / start / stop | Platform Dev(T1b 后) | [liveness] 双声 |
 | **A r11** codex TUI parent 类 + r10 四 REMAIN | 只影响 codex 审查席(最后切)⇒ 排 T2 之后 | Platform Dev | [liveness] 双声 |
 | **T3** roster v2 + tern-restore TUI + presence 退 ACP 写者 + wake 门读 screen_state | 用 Phase 0a 的 argv 即开工 | Infra Dev(bus.11 r3/r3b 已送审,现在就开) | [liveness] 双声 |
