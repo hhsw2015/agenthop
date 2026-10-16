@@ -34,7 +34,7 @@ ok(coordinatorLegacyKeys(proj, NEW, { tool: "codex", cwd: CWD }).length === 0, "
 ok(coordinatorLegacyKeys(proj, NEW, { tool: "claude", cwd: "/elsewhere" }).length === 0, "no over-credit: wrong cwd ⇒ nothing");
 ok(coordinatorLegacyKeys(proj, NEW, { tool: null, cwd: CWD }).length === 0 && coordinatorLegacyKeys(proj, NEW, { tool: "claude", cwd: null }).length === 0, "missing fact ⇒ nothing (never guess)");
 ok(coordinatorLegacyKeys(proj, "", { tool: "claude", cwd: CWD }).length === 0, "empty sid ⇒ nothing");
-ok(!coordinatorLegacyKeys(proj, "aad02248-0000-4000-8000-000000000003", { tool: "claude", cwd: CWD }).includes(OLD), "another session's sid never inherits the coordinator's box");
+ok(!coordinatorLegacyKeys(proj, "7e57f1c7-0000-4000-8000-000000000003", { tool: "claude", cwd: CWD }).includes(OLD), "another session's sid never inherits the coordinator's box");
 
 ok(toolFromCommand("claude") === "claude" && toolFromCommand("/opt/bin/codex") === "codex", "tool: executable basename");
 ok(toolFromCommand("node") === null && toolFromCommand("") === null && toolFromCommand("bun") === null, "tool: anything else ⇒ unknown");

@@ -208,15 +208,15 @@ const peer = (over: Partial<PeerLike> = {}): PeerLike => ({ id: "run-1", stableI
 
 // --- DOS-P2-1: handle resolution mirrors the coordinator (task-liveness.resolveSession); ambiguous/unknown ⇒ no guess ---
 {
-  const sid = "aad02248-c76b-4a1a-b191-95da3f0bfb5a";
+  const sid = "7e57f1c7-c76b-4a1a-b191-95da3f0bfb5a";
   const pool = [sid, "bf1199aa-0000-1111-2222-333344445555"];
   t("P2-1: a FULL session id resolves to itself", resolveSession(sid, pool) === sid);
-  t("P2-1: a tool-prefixed bus handle resolves by its short-id tail", resolveSession("claude:OpenDots-aad02248", pool) === sid);
-  t("P2-1: a bare short id resolves by prefix", resolveSession("aad02248", pool) === sid);
+  t("P2-1: a tool-prefixed bus handle resolves by its short-id tail", resolveSession("claude:OpenDots-7e57f1c7", pool) === sid);
+  t("P2-1: a bare short id resolves by prefix", resolveSession("7e57f1c7", pool) === sid);
   t("P2-1: an unknown handle resolves to null (never guess)", resolveSession("claude:X-deadbeef", pool) === null);
   t("P2-1: an AMBIGUOUS short prefix resolves to null (F16)", resolveSession("claude:Y-aaa11111", ["aaa11111-0000-a", "aaa11111-9999-b"]) === null);
   // the entry resolves first, then the pure core stamps the role on the RESOLVED sid (not the raw handle)
-  const resolved = resolveSession("claude:OpenDots-aad02248", pool)!;
+  const resolved = resolveSession("claude:OpenDots-7e57f1c7", pool)!;
   const snap = assembleRoster([peer({ stableId: sid, title: "DO" }), peer({ stableId: "other", title: "X" })], 1, { dialogOfficer: resolved });
   t("P2-1: core stamps dialog-officer on the resolved sid only", snap.members.find((m) => m.member === sid)?.role === "dialog-officer" && snap.members.find((m) => m.member === "other")?.role === null);
 }

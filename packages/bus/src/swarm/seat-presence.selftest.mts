@@ -13,7 +13,7 @@ import { makeFileLiveness } from "./task-liveness.js";
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 const A = "90b58f9c-5bac-4318-a996-2373c179d674";
 const B = "f32a0507-27bd-47d2-adea-9f30b87612ae";
-const C = "01a13284-d361-74a0-a026-ad56f1fdf355";
+const C = "0f1c7e57-d361-74a0-a026-ad56f1fdf355";
 const PS = [
   ` 2935 14473 /Applications/Tern.app/Contents/MacOS/tern acp claude --resume ${A} --mode bypassPermissions`,
   ` 4122  2935 /Users/x/.nvm/versions/node/v20/bin/node /Users/x/Library/Application Support/Tern/agents/claude/index.js`,

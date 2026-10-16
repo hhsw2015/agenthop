@@ -31,9 +31,9 @@ ok("card_id: 16 hex", board.card_id("x", "y", "z"):match("^%x%x%x%x%x%x%x%x%x%x%
 
 -- ============================ PURE: parsers ============================
 do
-  local r = R.parse_review_dir("fleet-recovery-5227c6a-review-01a13284")
-  ok("parse_review_dir", r and r.item == "fleet-recovery" and r.sha == "5227c6a" and r.seat == "01a13284")
-  ok("parse_signoff_dir", (R.parse_signoff_dir("verification-ledger-fb65753-dual-signoff-01a13284") or {}).item == "verification-ledger")
+  local r = R.parse_review_dir("fleet-recovery-5227c6a-review-0f1c7e57")
+  ok("parse_review_dir", r and r.item == "fleet-recovery" and r.sha == "5227c6a" and r.seat == "0f1c7e57")
+  ok("parse_signoff_dir", (R.parse_signoff_dir("verification-ledger-fb65753-dual-signoff-0f1c7e57") or {}).item == "verification-ledger")
   ok("parse_review_dir: signoff not a review", R.parse_review_dir("x-fb65753-dual-signoff-s") == nil)
   ok("parse_board_file", (function() local b = R.parse_board_file("approval-delegation.claimed.90b58f9c.json"); return b and b.item == "approval-delegation" and b.state == "claimed" end)())
   ok("parse_board_file ignores non-board", R.parse_board_file("foo.txt") == nil)
@@ -173,7 +173,7 @@ local function fakeDeps(tmp, review_names, board_names, anc_set, batches, opts)
     write_atomic = R.write_atomic,
   }
 end
-local RNAMES = { "fleet-recovery-5227c6a-review-01a13284", "verification-ledger-fb65753-dual-signoff-01a13284" }
+local RNAMES = { "fleet-recovery-5227c6a-review-0f1c7e57", "verification-ledger-fb65753-dual-signoff-0f1c7e57" }
 local BNAMES = { "alpha.claimed.s1.json", "beta.done.s2.json" }
 local BATCHES = { { branch = "rehearse-batch-21", artifacts = { ["merge-pool"] = "rehearse-batch-21" }, steps_facts = { { name = "merge-pool", exists = true, mtime = 100 }, { name = "regen-presence", exists = true, mtime = 200 }, { name = "gates", exists = false }, { name = "arch-review", exists = true, mtime = 400 }, { name = "ff-main-install", exists = false } } } }
 
