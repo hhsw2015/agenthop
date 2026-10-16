@@ -117,13 +117,15 @@ Then, in the seat: `agenthop_peers` lists the seat's own handle with `(you)`, an
 
 A seat that does not come back: stop here and use the switch runbook rollback line for that seat. Do not go to the next seat.
 
-## 6. Bridge plugin (only after T1a and T1b are merged)
+## 6. Bridge plugin (install day, and once more after T1a)
 
-Install the bridge from main only when main holds the classifier and screen-state changes (T1a `feat/tui-classify-r6`, T1b
-`feat/tui-screen-state`). Before that, the install would put the old classifier in place; skip this step and come back to it.
+T1b (screen state) is on main since a21f9a5, so the bridge is installed on install day. The classifier (T1a, `feat/tui-classify-r6`)
+is not merged yet: install day gives the T1b `screen` command with the classifier main has now. When T1a merges, run this step
+again (same commands) so the installed copy carries the new classifier. `tern-install.sh` skips a plugin only when both its
+installed and its proven commit equal the checkout's, so the post-T1a run installs and proves again.
 
 ```bash
-cd $R && git log --oneline main | grep -E "T1a|T1b" | head -3      # expect both merges listed
+cd $R && git log --oneline -1 && git merge-base --is-ancestor a21f9a5 HEAD && echo "T1b on main"   # expect: T1b on main
 bash scripts/tern-install.sh                                          # dry run: prints what --live would do
 bash scripts/tern-install.sh --live 2>&1 | tail -6
 ```
@@ -200,5 +202,6 @@ Write one PROGRESS line: main SHA, version, the baseline dir `$B`, the result of
 ## 9. After
 
 - 12 h soak from the step 7 restart (`docs/swarm/liveness-tier.md` §3).
+- After T1a merges: step 6 once more (install + reload + load proof), then check `$P/screens/` again.
 - `SWARM_TERN_BRIDGE=1` is a separate decision with its own restart (same block, recipe value `1`).
 - Remove `$B` only after the soak passed.
