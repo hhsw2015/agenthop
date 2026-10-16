@@ -87,7 +87,8 @@ import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleEx
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
 import { realTernSpawn, cleanTernEnv } from "../packages/bus/src/swarm/tern-env.js";
-import { initialWatchState, judgeProgress, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, roleBoxOwned, agentAmong, ROLE_BOX_BUDGET_MS, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
+import { appendEvidence, bridgeTickRecord, inboxOldestRecord, shouldReportEvidenceFailure } from "../packages/bus/src/swarm/soak-evidence.js";
+import { initialWatchState, judgeProgress, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, roleBoxOwned, agentAmong, ROLE_BOX_BUDGET_MS, readBoxMails, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
 import { parsePs, resolveAgentPid3, budgetedExactArgv, safeSpawnSync, type Resolved } from "../packages/bus/src/swarm/seat-presence.js";
 import { ternInjectCommands } from "../packages/bus/src/swarm/tern-wake.js";
 import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
@@ -1510,6 +1511,7 @@ async function main(): Promise<void> {
       return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sid) ? sid : null;
     } catch { return null; }
   };
+  const evidenceFail = new Set<string>(); // soak-evidence surfaces currently failing (one S19 per failure episode)
   const runInboxSentinel = (): void => {
     try {
       const stats = scanInboxes(HOME);
@@ -1555,6 +1557,15 @@ async function main(): Promise<void> {
             : agentAmong(rows.filter((r) => r.argv.join(" ").includes("tern acp")).map((r) => r.pid), (root) => resolveAgentPid3(root, live, "claude", rows, exact));
           if (roleBoxOwned(live, agent)) owned.add(inboxDirName(COORDINATOR));
         }
+      }
+      // soak evidence (liveness-tier §3): the role box's oldest unclaimed mail, every sentinel round, timed
+      if (COORDINATOR && isValidSessionId(COORDINATOR)) {
+        const mails = readBoxMails(path.join(HOME, ".agenthop", "inbox", inboxDirName(COORDINATOR)));
+        const rec = typeof mails === "string"
+          ? inboxOldestRecord(Date.now(), COORDINATOR, mails === "absent" ? [] : null, owned.has(inboxDirName(COORDINATOR)), mails === "absent" ? undefined : "box unreadable or larger than one scan")
+          : inboxOldestRecord(Date.now(), COORDINATOR, mails, owned.has(inboxDirName(COORDINATOR)));
+        const okW = appendEvidence(HOME, "inbox-oldest.jsonl", rec);
+        if (shouldReportEvidenceFailure(evidenceFail, "inbox-oldest.jsonl", okW)) notifyCoordinator("[soak-evidence] could not append ~/.agenthop/swarm/soak/inbox-oldest.jsonl (soak row 3 will be UNKNOWN until it can)", { taskRef: "soak-evidence:inbox-oldest", title: "soak evidence write failed", severity: "stall" });
       }
       const thMin = Math.floor(INBOX_STALL_SEC / 60);
       for (const a of detectStalledInboxes(stats, (key) => owned.has(key), INBOX_STALL_SEC, nowSec())) {
@@ -2093,9 +2104,18 @@ async function main(): Promise<void> {
     signalPid: realSignalPid, waitPidGone: (pid: number) => realWaitPidGone(pid), markWorker: realMarkWorker(HOME), whileInstance: realWhileInstance(HOME), socketOwners: realSocketOwners(process.env), gc: realGc(bridgeScriptEnv(process.env, BRIDGE_HOME), bridgeDirPath),
     ...realTmpFiles(BRIDGE_HOME, () => Date.now()), nowMs: () => Date.now(), log, audit: ternBridgeIO.controlLog,
   };
+  let lastEvidenceTick: number | null = null;
   const runTernBridgeStep = (): void => {
     if (!ternBridgeEnabled()) return;
-    runTernBridgeTick(ternBridgeState, ternBridgeIO, true);
+    const outcome = runTernBridgeTick(ternBridgeState, ternBridgeIO, true);
+    // soak evidence (liveness-tier §3): one timed record per round the sweep actually RAN (throttled/disabled rounds write nothing)
+    if (outcome !== "throttled" && outcome !== "disabled") {
+      const m = ternBridgeIO.readMirror();
+      const tick = m === null ? null : m.tick;
+      const okW = appendEvidence(HOME, "bridge-tick.jsonl", bridgeTickRecord(Date.now(), tick, lastEvidenceTick, outcome));
+      if (tick !== null) lastEvidenceTick = tick;
+      if (shouldReportEvidenceFailure(evidenceFail, "bridge-tick.jsonl", okW)) notifyCoordinator("[soak-evidence] could not append ~/.agenthop/swarm/soak/bridge-tick.jsonl (soak row 5 will be UNKNOWN until it can)", { taskRef: "soak-evidence:bridge-tick", title: "soak evidence write failed", severity: "stall" });
+    }
     runOrphanSweep(orphanState, orphanIO);
   };
 
