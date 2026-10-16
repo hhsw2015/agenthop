@@ -323,13 +323,17 @@ export function spawnTimeout(leftMs: number): number | null {
   const t = Math.floor(leftMs);
   return t >= 1 ? t : null;
 }
-/** spawnSync that never throws and never runs unbounded: a refused budget or a thrown spawn ⇒ { refused | error }. */
+/** spawnSync that never throws and never runs unbounded: a refused budget or a thrown spawn ⇒ { refused | error }; at the deadline
+ *  the child is SIGKILLed (not asked to stop), so the call returns within the budget even if the child ignores SIGTERM. */
 export function safeSpawnSync(bin: string, args: string[], leftMs: number, extra: { env?: NodeJS.ProcessEnv } = {}):
   { status: number | null; stdout: string; timedOut: boolean; refused: boolean; error?: string } {
   const t = spawnTimeout(leftMs);
   if (t === null) return { status: null, stdout: "", timedOut: false, refused: true };
   try {
-    const r = spawnSync(bin, args, { encoding: "utf8", timeout: t, ...(extra.env ? { env: extra.env } : {}) });
+    // killSignal SIGKILL (PW-SV-SWEEP-BUDGET): the default SIGTERM can be ignored, and spawnSync then waits for the child to exit
+    // on its own — a 300ms budget became 4s+ with a child that traps TERM. Every child here (tern ls/process/send, ps, the argv
+    // helper) is a short read-only or one-shot call with no state to flush, so an immediate SIGKILL at the deadline is safe.
+    const r = spawnSync(bin, args, { encoding: "utf8", timeout: t, killSignal: "SIGKILL", ...(extra.env ? { env: extra.env } : {}) });
     const timedOut = (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
     return { status: r.error ? null : r.status, stdout: r.stdout || "", timedOut, refused: false, ...(r.error && !timedOut ? { error: String(r.error.message) } : {}) };
   } catch (e) { return { status: null, stdout: "", timedOut: false, refused: false, error: e instanceof Error ? e.message : String(e) }; }

@@ -344,6 +344,11 @@ for (const bad of ["fail", "badjson", "nochild"] as const) {
   t("safeSpawnSync: < 1ms left ⇒ refused, nothing spawned", r0.refused && r0.status === null);
   const r1 = safeSpawnSync("sleep", ["5"], 300.6); // real timeout, real process
   t("safeSpawnSync: a real call cut at its (floored) timeout ⇒ timedOut", r1.timedOut && r1.status === null);
+  // PW-SV-SWEEP-BUDGET (r6): a child that IGNORES SIGTERM must still be cut at the budget (SIGKILL), not waited for
+  const t0 = performance.now();
+  const r2 = safeSpawnSync("sh", ["-c", "trap '' TERM; sleep 5"], 300.6);
+  const took = performance.now() - t0;
+  t(`safeSpawnSync: a child that traps SIGTERM returns within budget + 0.2s (took ${Math.round(took)}ms), timedOut`, r2.timedOut && took < 500);
   // the default argv reader under a fractional deadline: real budgetedExactArgv + real realExactArgv runner, monotonic clock with fractions
   let clk = 0.25;
   const ex = budgetedExactArgv(2999.75, () => clk);

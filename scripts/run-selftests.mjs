@@ -157,6 +157,9 @@ async function main() {
     try { text = readFileSync(path.join(root, rel), "utf8"); } catch (e) { lintFails.push(`${rel}: source unreadable (${e && e.code}) — check incomplete`); continue; }
     for (const why of fixtureLint(text, live ?? [])) lintFails.push(`${rel}: ${why}`);
   }
+  // discovery is part of the safety check (PW-SV-FIXTURE-LINT-INCOMPLETE): a directory or file that could not be listed/stat'ed may hold
+  // a selftest the lint never saw, so ANY discovery error stops the run before the first test is started (fail-closed)
+  for (const d of discoveryErrors) lintFails.push(`DISCOVERY-FAIL ${d.path}: ${d.why} — check incomplete`);
   if (lintFails.length) {
     console.log(`run-selftests: fixture-safety lint FAILED — nothing was run:\n${lintFails.map((l) => `  LINT ${l}`).join("\n")}`);
     process.exitCode = 1; return;

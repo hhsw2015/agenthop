@@ -5,7 +5,7 @@
 // Each fixture root holds plain *.selftest.mts scripts (no repo imports); the runner resolves tsx from the real repo.
 //   npx tsx scripts/run-selftests.selftest.mts
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,17 +39,20 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
 
 // ── STCI-P2-1: a broken-symlink *.selftest.mts (stat fault) must FAIL LOUD, not shrink to the readable subset ──
 {
-  const root = mkRoot(); goodSelftest(root, "good.selftest.mts");
+  const root = mkRoot(); const mark = path.join(root, "ran.marker");
+  writeFileSync(path.join(root, "good.selftest.mts"), `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(mark)}, "x");\n`);
   symlinkSync(path.join(root, "does-not-exist-target"), path.join(root, "broken.selftest.mts")); // statSync follows ⇒ ENOENT
   const r = runRunner(root);
   ok(r.code === 1, "STCI-P2-1: a stat-fault entry ⇒ exit 1 (not a silent 1/1 green)");
   ok(/DISCOVERY-FAIL/.test(r.out) && /broken\.selftest\.mts/.test(r.out), "STCI-P2-1: the failing path is NAMED");
+  ok(!existsSync(mark), "STCI-P2-1 (r6): the READABLE test beside a stat fault never ran (fail-closed before the first test)");
   rmSync(root, { recursive: true, force: true });
 }
 
 // ── STCI-P2-1b: an unreadable subdirectory (readdir fault) must FAIL LOUD (can't prove no selftests hide under it) ──
 {
-  const root = mkRoot(); goodSelftest(root, "good.selftest.mts");
+  const root = mkRoot(); const mark = path.join(root, "ran.marker");
+  writeFileSync(path.join(root, "good.selftest.mts"), `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(mark)}, "x");\n`);
   const locked = path.join(root, "locked"); mkdirSync(locked); goodSelftest(locked, "hidden.selftest.mts");
   // chmod 000 so readdir(locked) faults. (Skipped as root, where mode is ignored — then this assertion is vacuously true.)
   const { chmodSync } = await import("node:fs");
@@ -57,7 +60,10 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
   const r = runRunner(root);
   try {
     if (process.getuid && process.getuid() === 0) { ok(true, "STCI-P2-1b: (running as root — mode ignored — skipped)"); }
-    else ok(r.code === 1 && /DISCOVERY-FAIL/.test(r.out) && /locked/.test(r.out), "STCI-P2-1b: an unreadable subdir ⇒ exit 1, named (never fold to empty)");
+    else {
+      ok(r.code === 1 && /DISCOVERY-FAIL/.test(r.out) && /locked/.test(r.out), "STCI-P2-1b: an unreadable subdir ⇒ exit 1, named (never fold to empty)");
+      ok(!existsSync(mark), "STCI-P2-1b (r6): the READABLE test beside an EACCES dir never ran");
+    }
   } finally { chmodSync(locked, 0o700); rmSync(root, { recursive: true, force: true }); }
 }
 
