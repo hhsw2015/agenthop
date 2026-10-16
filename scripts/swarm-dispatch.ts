@@ -253,7 +253,8 @@ const SCALE_CFG: ScaleConfig = {
   minDwellSec: envInt(process.env.SWARM_REVIEW_MIN_DWELL_SEC, 300),
 };
 
-function log(m: string): void { console.error(`[dispatch ${SELF}] ${m}`); }
+// every line carries an ISO time: the log is liveness evidence (soak "dispatcher continuous, no gap > 10s" needs it)
+function log(m: string): void { console.error(`${new Date().toISOString()} [dispatch ${SELF}] ${m}`); }
 function nowSec(): number { return Math.floor(Date.now() / 1000); }
 function atomicWrite(file: string, data: string): void {
   const tmp = `${file}.tmp.${process.pid}`;
