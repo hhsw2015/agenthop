@@ -86,9 +86,9 @@ import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swa
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
-import { realTernSpawn } from "../packages/bus/src/swarm/tern-env.js";
-import { initialWatchState, judgeProgress, planEmits, commitDelivery, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, RETRY_SEC, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
-import { readOrigin } from "../packages/bus/src/swarm/seat-presence.js";
+import { realTernSpawn, cleanTernEnv } from "../packages/bus/src/swarm/tern-env.js";
+import { initialWatchState, judgeProgress, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
+import { parsePs, realExactArgv, resolveAgentPid } from "../packages/bus/src/swarm/seat-presence.js";
 import { ternInjectCommands } from "../packages/bus/src/swarm/tern-wake.js";
 import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, bridgeHome, bridgeScriptEnv, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
@@ -1552,37 +1552,43 @@ async function main(): Promise<void> {
   // facts (unreadable ≠ fine ≠ stalled), delivery committed only on success, owed alerts retried every 60s. SWARM_PROGRESS_WATCH, on.
   const progressWatch = initialWatchState();
   const ternSpawnPW = realTernSpawn(process.env);
-  const presencePid = (sid: string): "absent" | "unknown" | number => {
-    let raw: string;
-    try { raw = readFileSync(path.join(HOME, ".agenthop", "presence", `${sid}.pid`), "utf8").trim(); }
-    catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
-    const n = Number(raw);
-    return /^\d+$/.test(raw) && Number.isSafeInteger(n) && n > 0 ? n : "unknown";
+  /** One tern call with an explicit timeout (the remaining budget): the same cleaned env as realTernSpawn (L3). */
+  const ternEnvPW = cleanTernEnv(process.env); const ternBinPW = ternEnvPW.TERN_BIN || "tern";
+  const ternTimed = (args: string[], timeoutMs: number): { ok: boolean; stdout: string; timedOut: boolean } => {
+    const r = spawnSync(ternBinPW, args, { encoding: "utf8", timeout: Math.max(1, timeoutMs), env: ternEnvPW });
+    const timedOut = (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" || r.signal === "SIGTERM";
+    return { ok: !r.error && r.status === 0, stdout: r.stdout || "", timedOut };
   };
-  const presenceOrigin = (sid: string): "absent" | "unknown" | string => {
-    try { const o = readOrigin(HOME, sid); return o === "unreadable" ? "unknown" : o; } catch { return "unknown"; }
+  /** The live coordinator session: roles/coordinator.sid (written by the coordinator each cycle). Missing / not a sid / older than 1h
+   *  ⇒ null ⇒ no typing (S19 + L0 still go out). SWARM_COORDINATOR is the role BOX key, not a session (two keys, by design). */
+  const liveCoordinatorSid = (): string | null => {
+    const f = path.join(HOME, ".agenthop", "swarm", "roles", "coordinator.sid");
+    try {
+      const st = lstatSync(f); if (!st.isFile() || Date.now() - st.mtimeMs > 3600_000) return null;
+      const sid = readFileSync(f, "utf8").split("\n")[0]!.trim();
+      return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sid) ? sid : null;
+    } catch { return null; }
   };
-  /** The coordinator block, under a 3s budget for the whole lookup (one ls, one process per block, one ps). The authority is the
-   *  dispatcher's own coordinator binding (SWARM_COORDINATOR resolved against presence — the same one notifyCoordinator uses) and
-   *  that session's AGENT presence pid; never "a session that is not a member". */
+  /** The coordinator block, within BLOCK_BUDGET_MS for the whole lookup (ls + one process per block + one ps), every call bounded by
+   *  what is left. The agent is found in the PROCESS TABLE under each block's root (exact argv) — never from the presence .pid file. */
   const coordinatorBlock = (): { block: string } | { none: string } => {
     const budget: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
-    const tern = budgeted((args) => { const r = ternSpawnPW(args); return { ok: r.ok, stdout: r.stdout }; }, budget);
-    let parent: Map<number, number> | null = null;
-    const isAncestor = (pid: number, root: number): boolean | null => {
-      if (parent === null) {
-        if (budget.leftMs <= 0) return null;
+    const tern = budgeted(ternTimed, budget);
+    const sid = liveCoordinatorSid();
+    let rows: ReturnType<typeof parsePs> | null | undefined;
+    const exact = realExactArgv();
+    const agentUnder = (root: number): number | null | "unknown" => {
+      if (rows === undefined) {
+        if (budget.leftMs <= 0) return "unknown";
         const t0 = Date.now();
-        const ps = spawnSync("ps", ["axo", "pid=,ppid="], { encoding: "utf8", timeout: Math.min(1500, budget.leftMs) });
+        const ps = spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8", timeout: budget.leftMs });
         budget.leftMs -= Math.max(1, Date.now() - t0);
-        if (ps.status !== 0) return null;
-        parent = new Map(ps.stdout.split("\n").map((l) => l.trim().split(/\s+/).map(Number)).filter((x) => x.length === 2 && x.every(Number.isSafeInteger)).map(([a, b]) => [a!, b!] as [number, number]));
+        rows = ps.status === 0 && budget.leftMs >= 0 ? parsePs(ps.stdout) : null;
       }
-      for (let p = pid, n = 0; p > 1 && n < 64; n++) { if (p === root) return true; const q = parent.get(p); if (q === undefined) return false; p = q; }
-      return false;
+      return rows === null ? "unknown" : resolveAgentPid(root, sid!, "claude", rows, exact);
     };
-    const sid = COORDINATOR ? resolveSession(COORDINATOR, listSessions(HOME)) : null;
-    return findCoordinatorBlock(sid, presencePid, presenceOrigin, tern, isAncestor);
+    const r = findCoordinatorBlock(sid, tern, agentUnder);
+    return "block" in r && budget.leftMs < 0 ? { none: "lookup finished over budget — not typing" } : r;
   };
   const runProgressWatch = (): void => {
     if (!flagDefaultOn(process.env.SWARM_PROGRESS_WATCH)) return;
@@ -1600,15 +1606,25 @@ async function main(): Promise<void> {
         if (a.key === "coordinator-stalled") {
           const where = coordinatorBlock();
           if ("block" in where) {
-            const [typeCmd, enterCmd] = ternInjectCommands(where.block, a.text); // inbox-wake's send commands, through the L3 runner
-            if (ternSpawnPW(typeCmd).ok && ternSpawnPW(enterCmd).ok) surfaces.push(`block ${where.block}`);
-            else log(`progress-watch: could not type into coordinator block ${where.block}`);
+            // inbox-wake's send commands, through the L3 env, within TYPE_BUDGET_MS for both sends together
+            const tb: Budget = { leftMs: TYPE_BUDGET_MS, calls: 0 }; const send = budgeted(ternTimed, tb);
+            const [typeCmd, enterCmd] = ternInjectCommands(where.block, a.text);
+            const t1 = send(typeCmd); const t2 = t1?.ok ? send(enterCmd) : null;
+            if (t1?.ok && t2?.ok) surfaces.push(`block ${where.block}`);
+            else log(`progress-watch: could not type into coordinator block ${where.block}${t1 === null || t2 === null ? " (send over budget)" : ""}`);
           } else log(`progress-watch: not typing into a block (${where.none}) — S19 + L0 only`);
         }
         commitDelivery(progressWatch, a.key, surfaces.length > 0, now);
         log(`progress-watch: ${a.key} ${surfaces.length ? `delivered via ${surfaces.join(" + ")}` : `NOT delivered (S19 ${n}) — owed, retry in ${RETRY_SEC}s`}`);
       }
-      for (const k of resolved) { log(`progress-watch: ${k} resolved`); notifyCoordinator(`[dispatcher] ${k} resolved`, { taskRef: `progress-watch:${k}`, title: `${k} resolved`, severity: "info" }); }
+      for (const k of resolved) {
+        // the "resolved" notice is its own obligation: committed only when it reached a surface; else retried every RETRY_SEC
+        const n = notifyCoordinator(`[dispatcher] ${k} resolved`, { taskRef: `progress-watch:${k}:resolved`, title: `${k} resolved`, severity: "info" });
+        let l0 = false; try { writeL0Alert(HOME, { key: k, text: `[dispatcher] ${k} resolved` }, now); l0 = true; } catch { /* counted below */ }
+        const ok = n === "delivered" || n === "deduped" || l0;
+        commitResolved(progressWatch, k, ok);
+        log(`progress-watch: ${k} resolved — ${ok ? `notice delivered (${[n === "delivered" || n === "deduped" ? "S19" : "", l0 ? "L0" : ""].filter(Boolean).join(" + ")})` : `notice NOT delivered (S19 ${n}) — owed, retry in ${RETRY_SEC}s`}`);
+      }
     } catch (e) { log(`progress watch failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 

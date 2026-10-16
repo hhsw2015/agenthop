@@ -5,7 +5,7 @@
  * Run: node_modules/.bin/tsx packages/bus/src/swarm/progress-watch.faults.selftest.mts
  */
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { judgeProgress, planEmits, commitDelivery, initialWatchState, readProgressFacts, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS,
@@ -73,10 +73,10 @@ beat(30); handoff(3 * 3600);
 {
   const fake = path.join(home, "tern-hang"); writeFileSync(fake, "#!/bin/sh\nsleep 30\n"); chmodSync(fake, 0o755);
   const b: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 }; const t0 = Date.now();
-  const run = (args: string[]) => { const r = spawnSync(fake, args, { timeout: 1500 }); return { ok: r.status === 0, stdout: String(r.stdout ?? "") }; };
-  const r = findCoordinatorBlock("fb801a23-df75-4c57-bc05-7d89900a924c", () => process.pid, () => "agent", budgeted(run, b), () => false);
+  const run = (args: string[], timeoutMs: number) => { const r = spawnSync(fake, args, { timeout: timeoutMs }); return { ok: r.status === 0, stdout: String(r.stdout ?? ""), timedOut: (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" }; };
+  const r = findCoordinatorBlock("fa801a23-df75-4c57-bc05-7d89900a924c", budgeted(run, b), () => null);
   const ms = Date.now() - t0;
-  row("peer-no-answer", "fake tern that sleeps 30s", "lookup gives up ≤ 3.5s, none, no send", `${"none" in r ? r.none : "block!"} in ${ms}ms`, "none" in r && ms <= 3500);
+  row("peer-no-answer", "fake tern that sleeps 30s", "the first call is cut at the 3s budget; none; ≤ 3.5s", `${"none" in r ? r.none : "block!"} in ${ms}ms`, "none" in r && ms <= 3500);
 }
 // 7. all delivery surfaces fail, then come back: owed, retried after RETRY_SEC, delivered once
 {
@@ -85,17 +85,37 @@ beat(30); handoff(3 * 3600);
     for (const a of attempt) { const okNow = i > 0; commitDelivery(st, a.key, okNow, t); log.push(`${i}:${okNow ? "delivered" : "failed"}`); } }
   row("delivery-all-fail", "S19 + L0 + block all fail on the first attempt, back 5s later", "failed@0 then delivered within RETRY_SEC, once", log.join(","), log.length === 2 && log[0] === "0:failed" && /delivered/.test(log[1]!) && Number(log[1]!.split(":")[0]) * 5 <= RETRY_SEC);
 }
-// 8. double start: two watch states over the same files decide identically (no shared mutable file state to fight over)
+// 8. double start: the second dispatcher is refused by the real single-flight lock (acquireSingleFlight), in two real processes
 {
-  const a = initialWatchState(), b2 = initialWatchState(); const t0 = now();
-  const ra = planEmits(a, judgeProgress(readProgressFacts(home, BOX, t0)), t0), rb = planEmits(b2, judgeProgress(readProgressFacts(home, BOX, t0)), t0);
-  row("double-start", "two dispatchers' watch states over the same files", "same decision; the single-flight lock keeps the second dispatcher from running at all", `${ra.attempt.length}/${rb.attempt.length}`, ra.attempt.length === rb.attempt.length);
+  const lock = path.join(home, "dispatcher.lock");
+  const holder = `import { acquireSingleFlight } from ${JSON.stringify(path.resolve(path.dirname(new URL(import.meta.url).pathname), "single-flight.ts"))};
+import { writeFileSync } from "node:fs";
+const rel = acquireSingleFlight(${JSON.stringify(lock)}); const out = rel ? "acquired" : "refused"; console.log(out);
+if (process.argv[3]) writeFileSync(process.argv[3], out); if (rel) setTimeout(() => { rel(); }, Number(process.argv[2] ?? 0));`;
+  const f = path.join(home, "holder.mts"); writeFileSync(f, holder);
+  const tsx = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..", "..", "..", "node_modules", ".bin", "tsx");
+  const mark = path.join(home, "a.out");
+  const first = spawn(tsx, [f, "6000", mark], { stdio: "ignore" });
+  let firstOut = ""; for (let i = 0; i < 100 && !firstOut; i++) { spawnSync("sleep", ["0.1"]); try { firstOut = readFileSync(mark, "utf8"); } catch { /* not yet */ } }
+  const second = spawnSync(tsx, [f, "0"], { encoding: "utf8", timeout: 15000 }).stdout.trim();
+  first.kill("SIGTERM");
+  row("double-start", "dispatcher A takes dispatcher.lock (real acquireSingleFlight, held 4s); dispatcher B starts meanwhile", "A acquired, B refused", `A=${firstOut.trim()} B=${second}`, firstOut.includes("acquired") && second === "refused");
 }
-// 9. mtime never changes: an open episode on a frozen handoff re-alerts every 30min, never "resolved"
+// 9. mtime never changes: handoff frozen while BOTH heartbeats stay fresh ⇒ coordinator-stalled at 0 / 30 / 60 min, never resolved;
+//    counted per alert key (carly-stale must stay at 0 — her beat is fresh)
 {
-  handoff(3 * 3600); const st = initialWatchState(); const t0 = now(); let fires = 0, res = 0;
-  for (let i = 0; i <= 3700 / 5; i++) { const t = t0 + i * 5; const r = planEmits(st, judgeProgress(readProgressFacts(home, BOX, t)), t); r.attempt.forEach((x) => { fires++; commitDelivery(st, x.key, true, t); }); res += r.resolved.length; }
-  row("mtime-unchanged", "handoff mtime frozen, 3700s of 5s ticks", "fires at 0, 30min, 60min (3), zero resolved", `fires=${fires} resolved=${res}`, fires === 3 && res === 0);
+  const st = initialWatchState(); const t0 = now(); const fires: Record<string, number[]> = {}; let res = 0;
+  handoff(3 * 3600); const hm = now() - 3 * 3600;
+  for (let i = 0; i <= 3700 / 5; i++) {
+    const t = t0 + i * 5;
+    const facts = { ...readProgressFacts(home, BOX, t), beatSec: t - 30, carlyBeatSec: t - 30, handoffMtimeSec: hm }; // beats advance with simulated time
+    const r = planEmits(st, judgeProgress(facts), t);
+    r.attempt.forEach((x) => { (fires[x.key] ??= []).push(t - t0); commitDelivery(st, x.key, true, t); }); res += r.resolved.length;
+  }
+  const cs = fires["coordinator-stalled"] ?? [];
+  row("mtime-unchanged", "handoff mtime frozen, both beats fresh, 3700s of 5s ticks", "coordinator-stalled at 0s, 1800s, 3600s; carly-stale 0; zero resolved",
+    `coordinator-stalled=${JSON.stringify(cs)} carly-stale=${(fires["carly-stale"] ?? []).length} resolved=${res}`,
+    JSON.stringify(cs) === JSON.stringify([0, 1800, 3600]) && !(fires["carly-stale"]?.length) && res === 0);
 }
 // 10. clock goes back: a later round with an EARLIER clock must not re-fire or resolve
 {

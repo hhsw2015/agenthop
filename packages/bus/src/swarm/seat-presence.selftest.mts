@@ -174,7 +174,7 @@ void mkdirSync;
 
 // ---- fresh seats (rotated by the lifecycle runbook, observed live 2026-10-16): no --resume; Tern's ACP adapter passes --session-id ----
 {
-  const F = "8a53f4e8-c756-4302-a8dd-a9b6427c8fca";
+  const F = "0a53f4e8-c756-4302-a8dd-a9b6427c8fca";
   const fps = parsePs([
     `82831 14473 /Applications/Tern.app/Contents/MacOS/tern acp claude --mode bypassPermissions --model cpa-local/claude-opus-5-5[1m]`,
     `83136 82831 /Users/x/.nvm/versions/node/v20/bin/node /Users/x/Library/Application Support/Tern/agents/claude/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js`,

@@ -9,6 +9,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
 
 const RUNNER = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "run-selftests.mjs");
 let pass = 0;
@@ -20,7 +22,7 @@ const ok = (c: boolean, m: string): void => { if (!c) { console.error(`FAIL ${m}
  *  Scrub every SELFTEST_* control from the inherited env; each test re-supplies exactly the knobs it wants via `env`. */
 function runRunner(root: string, env: Record<string, string> = {}): { code: number; out: string } {
   const base: Record<string, string | undefined> = { ...process.env };
-  for (const k of ["SELFTEST_SHARD", "SELFTEST_TIMEOUT", "SELFTEST_KILL_GRACE", "SELFTEST_MAXCAP", "SELFTEST_ROOT"]) delete base[k];
+  for (const k of ["SELFTEST_SHARD", "SELFTEST_TIMEOUT", "SELFTEST_KILL_GRACE", "SELFTEST_MAXCAP", "SELFTEST_ROOT", "SELFTEST_HOME"]) delete base[k];
   const r = spawnSync("node", [RUNNER], { encoding: "utf8", env: { ...base, SELFTEST_ROOT: root, ...env }, timeout: 30000 });
   return { code: r.status ?? -1, out: `${r.stdout || ""}${r.stderr || ""}` };
 }
@@ -132,6 +134,33 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
   const r = runRunner(root);
   ok(r.code === 1 && /LATE_STDERR_MARKER/.test(r.out), "STCI-R2-P3-1: a LATE stderr marker survives early stdout (arrival-order tail, reverse)");
   rmSync(root, { recursive: true, force: true });
+}
+
+// ── fixture-safety lint (incident 2026-10-16): a selftest that kills by pattern or names a live sid is refused, nothing runs ──
+{
+  const fakeHome = mkRoot(); mkdirSync(path.join(fakeHome, ".agenthop", "presence"), { recursive: true }); mkdirSync(path.join(fakeHome, ".agenthop", "swarm", "roles"), { recursive: true });
+  const LIVE = "cccccccc-1111-4222-8333-444444444444", COORD = "dddddddd-1111-4222-8333-444444444444"; // made-up "live" sids in a fake home
+  writeFileSync(path.join(fakeHome, ".agenthop", "presence", `${LIVE}.pid`), "1");
+  writeFileSync(path.join(fakeHome, ".agenthop", "swarm", "roles", "coordinator.sid"), `${COORD}\n`);
+  const ran = (root: string) => path.join(root, "ran.marker");
+  const marker = (root: string, name: string, body: string) => writeFileSync(path.join(root, name), `import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nwriteFileSync(${JSON.stringify(ran(root))}, "x");\n${body}\n`);
+  const cases: Array<[string, string]> = [
+    ["pkill -f in a shell string", 'spawnSync("sh", ["-c", "pkill -f some-fixture-that-matches-nothing-zz"]);'],
+    ["pkill -f as spawn args", 'spawnSync("pkill", ["-f", "some-fixture-that-matches-nothing-zz"]);'],
+    ["a live presence sid", `const sid = "${LIVE}";`],
+    ["the live coordinator sid", `const sid = "${COORD}";`],
+  ];
+  for (const [label, body] of cases) {
+    const root = mkRoot(); goodSelftest(root, "a.selftest.mts"); marker(root, "b.selftest.mts", body);
+    const r = runRunner(root, { SELFTEST_HOME: fakeHome });
+    ok(r.code === 1 && /fixture-safety lint FAILED — nothing was run/.test(r.out) && /LINT b\.selftest\.mts/.test(r.out), `lint: ${label} ⇒ exit 1, named`);
+    ok(!require("node:fs").existsSync(ran(root)), `lint: ${label} ⇒ the file never ran`);
+    rmSync(root, { recursive: true, force: true });
+  }
+  const root = mkRoot(); marker(root, "c.selftest.mts", 'const sid = "eeeeeeee-1111-4222-8333-444444444444"; process.kill(process.pid, 0);');
+  const r = runRunner(root, { SELFTEST_HOME: fakeHome });
+  ok(r.code === 0 && require("node:fs").existsSync(ran(root)), "lint: a made-up sid and kill-by-own-pid pass (positive)");
+  rmSync(root, { recursive: true, force: true }); rmSync(fakeHome, { recursive: true, force: true });
 }
 
 console.log(`\nall run-selftests runner selftests passed (${pass})`);

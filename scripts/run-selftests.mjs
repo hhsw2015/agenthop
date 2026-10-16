@@ -16,7 +16,8 @@
 //   SELFTEST_ROOT=<dir>      node scripts/run-selftests.mjs  # discovery root (default: the repo); used by the runner's own test
 //
 // Exit 0 iff discovery completed AND every selected selftest exited 0. No cherry-picking: the only selection is sharding (ruling c).
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -106,10 +107,39 @@ function runOne(bin, absPath, cwd, timeoutMs, graceMs) {
   });
 }
 
+/** Fixture-safety lint (incident 2026-10-16: a selftest's cleanup `pkill -f <sid>` killed the live coordinator). A selftest may not
+ *  kill by pattern, and may not name a session id that is live on this machine (any ~/.agenthop/presence/<sid>.pid, plus
+ *  roles/coordinator.sid). Fixtures use made-up sids. Pure over (text, liveSids). */
+export function fixtureLint(text, liveSids) {
+  const bad = [];
+  if (/\bpkill\b[^\n]*-f\b|["']pkill["']\s*,\s*\[\s*["']-f["']/.test(text)) bad.push("kills by pattern (pkill -f): match processes by the pid you started instead");
+  for (const sid of liveSids) if (sid && text.includes(sid)) bad.push(`names the live session ${sid}: use a made-up sid`);
+  return bad;
+}
+const LINT_SELF = path.join("scripts", "run-selftests.selftest.mts");
+function liveSessionIds(home) {
+  const out = new Set();
+  try { for (const n of readdirSync(path.join(home, ".agenthop", "presence"))) { const m = /^(.+)\.pid$/.exec(n); if (m) out.add(m[1]); } } catch { /* none */ }
+  try { const s = readFileSync(path.join(home, ".agenthop", "swarm", "roles", "coordinator.sid"), "utf8").trim(); if (s) out.add(s); } catch { /* none */ }
+  return [...out];
+}
+
 async function main() {
   const files = [], discoveryErrors = [];
   collect(root, files, discoveryErrors);
   files.sort();
+  // fixture-safety lint: refuse to RUN a selftest that could hit a live process (checked before anything executes)
+  const live = liveSessionIds(process.env.SELFTEST_HOME || homedir());
+  const lintFails = [];
+  for (const rel of files) {
+    if (rel === LINT_SELF) continue; // the runner's own selftest holds the banned patterns as fixture TEXT it writes, never runs here
+    let text = ""; try { text = readFileSync(path.join(root, rel), "utf8"); } catch { continue; }
+    for (const why of fixtureLint(text, live)) lintFails.push(`${rel}: ${why}`);
+  }
+  if (lintFails.length) {
+    console.log(`run-selftests: fixture-safety lint FAILED — nothing was run:\n${lintFails.map((l) => `  LINT ${l}`).join("\n")}`);
+    process.exitCode = 1; return;
+  }
   // Defend the gate: discovering ZERO selftests (and no error explaining why) means the layout/glob broke — fail LOUD.
   if (files.length === 0 && discoveryErrors.length === 0) { console.error(`run-selftests: found NO *.selftest.mts under ${root} — discovery is broken (not a pass)`); process.exit(2); }
   const shard = parseShard(process.env.SELFTEST_SHARD);

@@ -13,10 +13,13 @@
  *   - real mail is decided from the message's own sender fields (`from` / `fromLabel`); a message whose sender cannot be read is
  *     UNKNOWN, so it can neither make nor break the ≥ MAIL_MIN threshold on its own.
  *   - delivery is committed only on success (PW-EMIT-COMMIT): an episode stays OWED until at least one surface delivered; owed
- *     retries back off (RETRY_SEC) instead of waiting out the 30min re-alert window.
+ *     retries back off (RETRY_SEC) instead of waiting out the 30min re-alert window. The same holds for the "resolved" notice
+ *     (r3, PW-EMIT-COMMIT-RESOLVE): recovery and its notice are tracked apart; the notice stays owed until delivered.
+ *   - r3: every read is bounded (regular files only, non-blocking, capped size/count, deadline) and the block lookup holds unless
+ *     uniqueness is proven over the whole inventory (PW-LOCATOR-UNKNOWN).
  * Each delivered alert re-fires every DEDUP_SEC while it holds; one "resolved" only on affirmative recovery. Pure core + injected IO.
  */
-import { readdirSync, readFileSync, statSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, lstatSync, openSync, readSync, closeSync, writeFileSync, mkdirSync, renameSync, constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { BEAT_STALE_SEC, coordinatorBeatPath, carlyPatrolBeatPath } from "./carly-sweep.js";
 
@@ -100,8 +103,10 @@ export type EpisodeState = { open: boolean; owed: boolean; deliveredAt: number |
   /** progress marker and box condition when the episode opened: recovery = the marker ADVANCED past it, or (an episode opened by the
    *  box alone) the box is affirmatively off */
   openMark: number | null; openedByBoxOnly: boolean };
-export type WatchState = { ep: Map<AlertKey, EpisodeState> };
-export function initialWatchState(): WatchState { return { ep: new Map() }; }
+/** `resolveOwed`: episodes that recovered and whose "resolved" notice is not yet DELIVERED (PW-EMIT-COMMIT-RESOLVE) — the physical
+ *  recovery and the notice are tracked separately; key → last attempt time (null = not attempted yet). */
+export type WatchState = { ep: Map<AlertKey, EpisodeState>; resolveOwed: Map<AlertKey, number | null> };
+export function initialWatchState(): WatchState { return { ep: new Map(), resolveOwed: new Map() }; }
 
 /** What to attempt this round. Mutates only the episode open/owed bookkeeping; delivery success is committed by `commitDelivery`.
  *  - on: open an episode (owed), or re-owe it every DEDUP_SEC after the last delivery; an owed alert is (re)attempted at most every
@@ -128,11 +133,21 @@ export function planEmits(st: WatchState, js: Judgement[], nowSec: number): { at
       const boxCleared = e.openedByBoxOnly && j.boxOn === false;
       if (advanced || boxCleared) {
         st.ep.delete(j.key);
-        if (e.deliveredAt !== null) resolved.push(j.key); // never "resolved" an alert nobody was told about
+        if (e.deliveredAt !== null) st.resolveOwed.set(j.key, null); // never "resolved" an alert nobody was told about
       }
     }
   }
+  // owed "resolved" notices: (re)attempted every RETRY_SEC until delivered; a NEW episode of the same key supersedes the old notice
+  for (const [k, last] of st.resolveOwed) {
+    if (st.ep.get(k)?.open) { st.resolveOwed.delete(k); continue; }
+    if (last === null || nowSec - last >= RETRY_SEC) { st.resolveOwed.set(k, nowSec); resolved.push(k); }
+  }
   return { attempt, resolved };
+}
+
+/** The "resolved" notice for `key` was delivered (≥ 1 surface) ⇒ the obligation is done; not delivered ⇒ it stays owed. Pure. */
+export function commitResolved(st: WatchState, key: AlertKey, delivered: boolean): void {
+  if (delivered) st.resolveOwed.delete(key);
 }
 
 /** Record the outcome of an attempt: delivered on ≥ 1 surface ⇒ no longer owed (the 30min window starts now); else stays owed and
@@ -145,34 +160,55 @@ export function commitDelivery(st: WatchState, key: AlertKey, delivered: boolean
 
 // ---------------- real IO ----------------
 function statMtime(f: string): Fact<number> {
-  try { return Math.floor(statSync(f).mtimeMs / 1000); }
+  try { const st = lstatSync(f); return st.isFile() ? Math.floor(st.mtimeMs / 1000) : "unknown"; } // not a regular file ⇒ unknown
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
 }
 /** The single-integer beat (shell `date +%s`). absent = ENOENT; unknown = unreadable or not an integer. */
 export function readBeat(f: string): Fact<number> {
   let text: string;
-  try { text = readFileSync(f, "utf8"); } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
+  // regular file only, non-blocking, at most 64 bytes (a beat is one integer): a FIFO / device here can never stall the sweep
+  try {
+    const st = lstatSync(f); if (!st.isFile()) return "unknown";
+    const fd = openSync(f, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
+    try { const buf = Buffer.alloc(64); text = buf.subarray(0, readSync(fd, buf, 0, 64, 0)).toString("utf8"); } finally { closeSync(fd); }
+  } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
   const n = Number((text.split("\n")[0] ?? "").trim());
   return Number.isInteger(n) && n > 0 ? n : "unknown";
 }
 
 /** Unclaimed mails in a durable inbox dir: top-level *.json only (processed/ and dot-dirs are not unclaimed). The sender is the
  *  message's `fromLabel` (or `from` when there is no label); a body that cannot be read/parsed has sender null (unknown). */
-export function readBoxMails(dir: string): Fact<Mail[]> {
+/** Mail bodies larger than this are not read (a sender field sits at the top of a few-KB message): the mail counts, sender unknown. */
+export const MAIL_BODY_MAX = 64 * 1024;
+
+/** Unclaimed mails in a durable inbox dir: top-level *.json only (processed/ and dot-dirs are not unclaimed). Bounded: lstat only
+ *  (a FIFO / device / symlink is never opened — PW-SV-SWEEP-BUDGET), at most `max` mails opened, each read capped at MAIL_BODY_MAX
+ *  with O_NONBLOCK, and the whole scan stops at `deadlineMs`. A box bigger than `max`, or a scan cut by the deadline, is UNKNOWN
+ *  (the round cannot prove the threshold either way; next round scans again). The sender is the message's `fromLabel` (or `from`);
+ *  a body that cannot be read/parsed has sender null (unknown). */
+export function readBoxMails(dir: string, max = MAIL_SCAN_MAX, deadlineMs = Date.now() + FACTS_BUDGET_MS, clock: () => number = Date.now): Fact<Mail[]> {
   let names: string[];
   try { names = readdirSync(dir).filter((n) => n.endsWith(".json") && !n.startsWith(".")); }
   catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
+  if (names.length > max) return "unknown";
   const out: Mail[] = [];
   for (const n of names) {
+    if (clock() > deadlineMs) return "unknown";
     const f = path.join(dir, n);
-    const m = statMtime(f);
-    if (m === "absent") continue; // claimed between readdir and stat
-    if (m === "unknown") return "unknown"; // a mail we cannot even stat makes the box unknown
+    let st;
+    try { st = lstatSync(f); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; return "unknown"; }
+    if (!st.isFile()) return "unknown"; // a FIFO / symlink / dir in the box: cannot be judged without risk of blocking
+    const m = Math.floor(st.mtimeMs / 1000);
     let sender: string | null = null;
-    try {
-      const j = JSON.parse(readFileSync(f, "utf8")) as { fromLabel?: unknown; from?: unknown };
-      sender = typeof j.fromLabel === "string" && j.fromLabel ? j.fromLabel : typeof j.from === "string" && j.from ? j.from : null;
-    } catch { sender = null; }
+    if (st.size <= MAIL_BODY_MAX) {
+      let fd: number | null = null;
+      try {
+        fd = openSync(f, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
+        const buf = Buffer.alloc(st.size); const got = readSync(fd, buf, 0, st.size, 0);
+        const j = JSON.parse(buf.subarray(0, got).toString("utf8")) as { fromLabel?: unknown; from?: unknown };
+        sender = typeof j.fromLabel === "string" && j.fromLabel ? j.fromLabel : typeof j.from === "string" && j.from ? j.from : null;
+      } catch { sender = null; } finally { if (fd !== null) try { closeSync(fd); } catch { /* closed */ } }
+    }
     out.push({ sender, mtimeSec: m });
   }
   return out;
@@ -200,29 +236,41 @@ export function writeL0Alert(home: string, a: { key: AlertKey; text: string }, n
   return f;
 }
 
-// ---------------- the coordinator's block (PW-COORDINATOR-OWNERSHIP + PW-SWEEP-BUDGET) ----------------
-/** A bounded tern runner: every call spends from one per-round budget; once spent, calls are refused (not run). */
+// ---------------- the coordinator's block (PW-COORDINATOR-OWNERSHIP + PW-LOCATOR-UNKNOWN + PW-SWEEP-BUDGET) ----------------
+/** A bounded runner: every call is given the REMAINING budget as its own timeout and spends what it actually took; a call that did
+ *  not finish within what was left, or any call once the budget is spent, returns null (refused / over budget) — never a result. */
 export type Budget = { leftMs: number; calls: number };
-/** Whole-round budget for the block lookup: one `tern ls` + one `tern process` per live block + one `ps`, all spent from this; out of
- *  budget ⇒ "none" (no typing this round). The sweep step's total is bounded by: fact reads (constant: 4 stats + one box readdir)
- *  + BLOCK_BUDGET_MS + 2 send calls × TERN_SPAWN_TIMEOUT_MS (1.5s) + notifyCoordinator/L0 writes ⇒ ≤ ~6.5s worst case per round. */
+/** Whole-step budgets (liveness-tier §2.5). The progress-watch step per round is bounded by FACTS_BUDGET_MS (fact reads: beat, handoff,
+ *  carly beat, role-box scan) + BLOCK_BUDGET_MS (ls + process per block + ps) + TYPE_BUDGET_MS (two sends) + the S19/L0 writes
+ *  (local files) ⇒ ≤ ~6.5s worst case, independent of the number of mails or blocks. */
+export const FACTS_BUDGET_MS = 1_000;
 export const BLOCK_BUDGET_MS = 3_000;
+export const TYPE_BUDGET_MS = 2_000;
+/** At most this many mails are opened per round; the rest of a larger box is UNKNOWN for this round (scan resumes next round). */
+export const MAIL_SCAN_MAX = 50;
 
-/** The ONE block to type into, or why there is none. Authority: the presence record of SWARM_COORDINATOR's role sid only — its .pid
- *  is the agent pid (written by seat-presence set, origin=agent) — and the block whose process tree contains that pid. Nothing is
- *  inferred from "who is not a member". One inventory per round, every tern call spent from `budget`; out of budget ⇒ unknown. */
+export function budgeted(run: (args: string[], timeoutMs: number) => { ok: boolean; stdout: string; timedOut?: boolean }, b: Budget, clock: () => number = Date.now) {
+  return (args: string[]): { ok: boolean; stdout: string } | null => {
+    if (b.leftMs <= 0) return null;
+    const t0 = clock(); const r = run(args, b.leftMs); const took = Math.max(1, clock() - t0);
+    b.leftMs -= took; b.calls++;
+    if (r.timedOut || b.leftMs < 0) return null; // finished late or was cut at the budget ⇒ not a result
+    return { ok: r.ok, stdout: r.stdout };
+  };
+}
+
+/** The ONE block to type into, or why there is none.
+ *  Authority (coordinator rulings 2026-10-16): the live coordinator session is roles/coordinator.sid (read by the caller), and the
+ *  agent for it is found from the PROCESS TABLE (resolveAgentPid over each live block's tern root, exact argv) — never from the
+ *  presence .pid file (a projection; a stale or bus-written pid proves nothing about the current process).
+ *  Uniqueness must be PROVEN over the whole inventory: any block whose child cannot be read (process call failed / bad JSON / no
+ *  child / argv unreadable / budget spent) makes the answer HOLD — that block could be a second match (PW-LOCATOR-UNKNOWN). */
 export function findCoordinatorBlock(
   coordinatorSid: string | null,
-  presencePid: (sid: string) => Fact<number>,
-  origin: (sid: string) => Fact<string>,
-  tern: (args: string[]) => { ok: boolean; stdout: string } | null, // null = refused (budget)
-  isAncestor: (pid: number, rootPid: number) => boolean | null,     // null = cannot tell
+  tern: (args: string[]) => { ok: boolean; stdout: string } | null, // null = refused / over budget
+  agentUnder: (rootPid: number) => number | null | "unknown",      // the agent pid for coordinatorSid under that root
 ): { block: string } | { none: string } {
-  if (!coordinatorSid) return { none: "SWARM_COORDINATOR unset" };
-  const pid = presencePid(coordinatorSid);
-  if (typeof pid !== "number") return { none: `coordinator presence ${pid}` };
-  const o = origin(coordinatorSid);
-  if (o !== "agent") return { none: `coordinator presence origin ${o === "unknown" || o === "absent" ? o : JSON.stringify(o)} (not an agent pid)` };
+  if (!coordinatorSid) return { none: "no live coordinator session (roles/coordinator.sid missing/stale/not a sid)" };
   const ls = tern(["ls", "--json"]);
   if (ls === null) return { none: "tern budget spent" };
   if (!ls.ok) return { none: "tern ls did not answer" };
@@ -235,23 +283,14 @@ export function findCoordinatorBlock(
   const hits: string[] = [];
   for (const id of ids) {
     const pr = tern(["process", String(id), "--json"]);
-    if (pr === null) return { none: "tern budget spent before every block was checked" };
-    if (!pr.ok) continue;
+    if (pr === null) return { none: `tern budget spent before block ${id} was checked — HOLD` };
+    if (!pr.ok) return { none: `tern process ${id} did not answer — HOLD (cannot prove uniqueness)` };
     let root: unknown;
-    try { root = (JSON.parse(pr.stdout) as { child?: { pid?: unknown } }).child?.pid; } catch { continue; }
-    if (!Number.isSafeInteger(root)) continue;
-    const anc = isAncestor(pid, root as number);
-    if (anc === null) return { none: `process tree unreadable for block ${id}` };
-    if (anc) hits.push(String(id));
+    try { root = (JSON.parse(pr.stdout) as { child?: { pid?: unknown } }).child?.pid; } catch { return { none: `tern process ${id} unparseable — HOLD` }; }
+    if (!Number.isSafeInteger(root)) return { none: `block ${id} has no readable child — HOLD` };
+    const a = agentUnder(root as number);
+    if (a === "unknown") return { none: `process argv unreadable under block ${id} — HOLD` };
+    if (a !== null) hits.push(String(id));
   }
-  return hits.length === 1 ? { block: hits[0]! } : { none: `${hits.length} blocks contain the coordinator pid ${pid}` };
-}
-
-/** Wrap a tern runner with a per-round budget (wall time measured around each call). Pure apart from the clock. */
-export function budgeted(run: (args: string[]) => { ok: boolean; stdout: string }, b: Budget, clock: () => number = Date.now) {
-  return (args: string[]): { ok: boolean; stdout: string } | null => {
-    if (b.leftMs <= 0) return null;
-    const t0 = clock(); const r = run(args); b.leftMs -= Math.max(1, clock() - t0); b.calls++;
-    return r;
-  };
+  return hits.length === 1 ? { block: hits[0]! } : { none: `${hits.length} blocks run ${coordinatorSid}` };
 }

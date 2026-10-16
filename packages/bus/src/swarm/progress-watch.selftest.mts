@@ -3,11 +3,12 @@
  * real file readers on a private home + the coordinator-block lookup (authority, budget). Each reviewer counterexample is a case.
  * Run: node_modules/.bin/tsx packages/bus/src/swarm/progress-watch.selftest.mts  (from repo root)
  */
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { judgeProgress, planEmits, commitDelivery, initialWatchState, readProgressFacts, readBoxMails, writeL0Alert, findCoordinatorBlock,
-  budgeted, HANDOFF_STALE_SEC, CARLY_STALE_SEC, DEDUP_SEC, RETRY_SEC, BLOCK_BUDGET_MS, type ProgressFacts, type Mail, type Budget } from "./progress-watch.js";
+import { judgeProgress, planEmits, commitDelivery, commitResolved, initialWatchState, readProgressFacts, readBoxMails, writeL0Alert, findCoordinatorBlock,
+  budgeted, HANDOFF_STALE_SEC, CARLY_STALE_SEC, DEDUP_SEC, RETRY_SEC, BLOCK_BUDGET_MS, MAIL_SCAN_MAX, MAIL_BODY_MAX, type ProgressFacts, type Mail, type Budget } from "./progress-watch.js";
+import { spawnSync } from "node:child_process";
 import { BEAT_STALE_SEC } from "./carly-sweep.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
@@ -162,74 +163,114 @@ const stalled = J(ok({ handoffMtimeSec: NOW - 3 * 3600 }));
   t("L0 alert: no temp left", readdirSync(path.dirname(f)).every((n) => !n.includes(".tmp-")));
 }
 
-// --- coordinator block: authority (PW-COORDINATOR-OWNERSHIP) ---
-const COORD = "fb801a23-df75-4c57-bc05-7d89900a924c", MEMBER = "11111111-2222-4333-8444-555555555555";
-// world: block 100 runs the coordinator (agent pid 5001 under root 5000), block 200 runs a member (agent 6001 under 6000)
-const world = (over: Partial<{ pid: Record<string, "absent" | "unknown" | number>; origin: Record<string, string>; parent: Record<number, number> }> = {}) => {
-  const pid = { [COORD]: 5001, [MEMBER]: 6001, ...(over.pid ?? {}) } as Record<string, "absent" | "unknown" | number>;
-  const origin = { [COORD]: "agent", [MEMBER]: "agent", ...(over.origin ?? {}) } as Record<string, string>;
-  const parent: Record<number, number> = { 5001: 5000, 5000: 1, 6001: 6000, 6000: 1, ...(over.parent ?? {}) };
-  const sent: string[] = []; let calls = 0;
+// --- coordinator block: authority (ownership = process table; L8 ruling) + uniqueness over the WHOLE inventory (PW-LOCATOR-UNKNOWN) ---
+const COORD = "fa801a23-df75-4c57-bc05-7d89900a924c"; // made-up
+type Proc = { ok: boolean; stdout: string } | "fail" | "badjson" | "nochild";
+const world = (procs: Record<number, Proc> = {}, agentAt: Record<number, number | null | "unknown"> = { 5000: 5001, 6000: null }) => {
+  let calls = 0;
   const tern = (args: string[]) => {
     calls++;
     if (args[0] === "ls") return { ok: true, stdout: JSON.stringify({ sessions: [{ tabs: [{ blocks: [{ id: 100, live: true }, { id: 200, live: true }] }] }] }) };
-    if (args[0] === "process") return { ok: true, stdout: JSON.stringify({ child: { pid: args[1] === "100" ? 5000 : 6000 } }) };
-    sent.push(args.join(" ")); return { ok: true, stdout: "" };
+    const id = Number(args[1]); const p = procs[id];
+    if (p === "fail") return { ok: false, stdout: "" };
+    if (p === "badjson") return { ok: true, stdout: "{not json" };
+    if (p === "nochild") return { ok: true, stdout: "{}" };
+    return p ?? { ok: true, stdout: JSON.stringify({ child: { pid: id === 100 ? 5000 : 6000 } }) };
   };
-  const isAncestor = (p: number, root: number) => { for (let x = p, n = 0; x > 1 && n < 64; n++) { if (x === root) return true; x = parent[x] ?? 1; } return false; };
-  return { pid: (s: string) => pid[s] ?? "absent", origin: (s: string) => origin[s] ?? "absent", tern, isAncestor, sent, calls: () => calls };
+  return { tern, agentUnder: (root: number) => agentAt[root] ?? null, calls: () => calls };
 };
+{ const w = world(); const r = findCoordinatorBlock(COORD, w.tern, w.agentUnder);
+  t("block: the coordinator's claude runs under exactly block 100, the other block proven clear ⇒ 100", "block" in r && r.block === "100"); }
+{ const w = world(); const r = findCoordinatorBlock(null, w.tern, w.agentUnder);
+  t("block: no live coordinator session ⇒ none, zero tern calls", "none" in r && w.calls() === 0); }
+{ const w = world({}, { 5000: null, 6000: null }); const r = findCoordinatorBlock(COORD, w.tern, w.agentUnder);
+  t("block: coordinator runs under no block (stale presence irrelevant) ⇒ none, never a member's block", "none" in r); }
+{ const w = world({}, { 5000: 5001, 6000: 6001 }); const r = findCoordinatorBlock(COORD, w.tern, w.agentUnder);
+  t("block: two blocks run the sid ⇒ none", "none" in r); }
+// Chief Review's three variants: one block is a known hit, the OTHER block's process call fails / is bad JSON / has no child
+for (const bad of ["fail", "badjson", "nochild"] as const) {
+  const w = world({ 200: bad }); const r = findCoordinatorBlock(COORD, w.tern, w.agentUnder);
+  t(`block: known hit + other block ${bad} ⇒ HOLD (uniqueness not proven)`, "none" in r && /HOLD/.test(r.none));
+}
+{ const w = world({}, { 5000: 5001, 6000: "unknown" }); const r = findCoordinatorBlock(COORD, w.tern, w.agentUnder);
+  t("block: known hit + other block's argv unreadable ⇒ HOLD", "none" in r && /HOLD/.test(r.none)); }
+
+// --- budget (PW-SWEEP-BUDGET): the remaining budget is the call's own timeout; a late result is refused ---
 {
-  const w = world(); const r = findCoordinatorBlock(COORD, w.pid, w.origin, w.tern, w.isAncestor);
-  t("block: the coordinator's agent pid sits under exactly block 100 ⇒ 100", "block" in r && r.block === "100");
+  let clock = 0;
+  // calls take 900 / 1500 / 1500 ms (Chief Review's figures): the 3rd would end at 3900ms > 3000 ⇒ refused, lookup HOLDs
+  const durations = [900, 1500, 1500]; let i = 0; const seenTimeouts: number[] = [];
+  const run = (args: string[], timeoutMs: number) => { seenTimeouts.push(timeoutMs); const d = durations[i++] ?? 1500; const took = Math.min(d, timeoutMs); clock += took;
+    const ok = { ok: true, stdout: args[0] === "ls" ? JSON.stringify({ sessions: [{ tabs: [{ blocks: [{ id: 100, live: true }, { id: 200, live: true }] }] }] }) : JSON.stringify({ child: { pid: args[1] === "100" ? 5000 : 6000 } }) };
+    return d > timeoutMs ? { ok: false, stdout: "", timedOut: true } : ok; };
+  const b: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
+  const r = findCoordinatorBlock(COORD, budgeted(run, b, () => clock), (root) => (root === 5000 ? 5001 : null));
+  t("budget: each call gets the REMAINING budget as its timeout (3000, 2100, 600)", JSON.stringify(seenTimeouts) === JSON.stringify([3000, 2100, 600]));
+  t("budget: the call cut at the budget is refused ⇒ HOLD, no block, total ≤ 3000ms", "none" in r && clock <= BLOCK_BUDGET_MS);
 }
 {
-  const w = world(); const r = findCoordinatorBlock(null, w.pid, w.origin, w.tern, w.isAncestor);
-  t("block: SWARM_COORDINATOR unresolved ⇒ none, and no tern call at all", "none" in r && w.calls() === 0);
+  let clock = 0; let calls = 0;
+  const slow = (args: string[], timeoutMs: number) => { calls++; const took = Math.min(1500, timeoutMs); clock += took;
+    return args[0] === "ls" ? { ok: true, stdout: JSON.stringify({ sessions: [{ tabs: [{ blocks: Array.from({ length: 8 }, (_, k) => ({ id: k + 1, live: true })) }] }] }) }
+      : { ok: false, stdout: "", timedOut: took < 1500 }; };
+  const b: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
+  const r = findCoordinatorBlock(COORD, budgeted(slow, b, () => clock), () => null);
+  t("budget: 8 blocks × 1.5s ⇒ stops within 3s, answer none", "none" in r && clock <= BLOCK_BUDGET_MS && calls <= 2);
 }
 {
-  // reviewers' case: the coordinator has no identifiable block (its presence is gone) — a member must never be chosen instead
-  const w = world({ pid: { [COORD]: "absent" } }); const r = findCoordinatorBlock(COORD, w.pid, w.origin, w.tern, w.isAncestor);
-  t("block: coordinator presence absent ⇒ none (never a member's block)", "none" in r && w.calls() === 0);
+  // a call that IGNORES its timeout and returns a good answer after the budget is gone must not be used (PW-SWEEP-BUDGET)
+  let clock = 0; const w = world();
+  const late = (args: string[]) => { clock += args[0] === "process" && args[1] === "200" ? 2700 : 200; return { ...w.tern(args), timedOut: false }; };
+  const b: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
+  const r = findCoordinatorBlock(COORD, budgeted(late, b, () => clock), w.agentUnder);
+  t("budget: a result that arrives after the budget is spent is refused ⇒ HOLD, never a block", "none" in r && b.leftMs < 0);
 }
+{ const w = world(); const b: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
+  findCoordinatorBlock(COORD, budgeted((a) => w.tern(a), b), w.agentUnder);
+  t("budget: one ls + one process per block, per round (2 blocks ⇒ 3 calls)", b.calls === 3); }
+
+// --- bounded fact reads (PW-SV-SWEEP-BUDGET / PW-SWEEP-BUDGET) ---
 {
-  const w = world({ pid: { [COORD]: "unknown" } }); const r = findCoordinatorBlock(COORD, w.pid, w.origin, w.tern, w.isAncestor);
-  t("block: coordinator presence unreadable ⇒ none", "none" in r);
-}
-{
-  const w = world({ origin: { [COORD]: "bus" } }); const r = findCoordinatorBlock(COORD, w.pid, w.origin, w.tern, w.isAncestor);
-  t("block: presence written by the bus process (origin=bus) is not an agent pid ⇒ none", "none" in r && w.calls() === 0);
-}
-{
-  const w = world({ parent: { 5001: 6000 } }); // the coordinator pid now lives under the MEMBER's root
-  const r = findCoordinatorBlock(COORD, w.pid, w.origin, w.tern, w.isAncestor);
-  t("block: answer follows the process tree, not names", "block" in r && r.block === "200");
-}
-{
-  const w = world({ parent: { 6000: 5000 } }); // both roots contain the pid chain ⇒ ambiguous
-  const r = findCoordinatorBlock(COORD, w.pid, w.origin, w.tern, (p, root) => (root === 5000 || root === 6000 ? true : false));
-  t("block: two blocks contain the pid ⇒ none (never guess)", "none" in r);
-}
-{
-  const w = world(); const r = findCoordinatorBlock(COORD, w.pid, w.origin, w.tern, () => null);
-  t("block: process tree unreadable ⇒ none", "none" in r);
+  const home = mkdtempSync(path.join(os.tmpdir(), "pwb-")); const box = path.join(home, "box"); mkdirSync(box);
+  for (let i = 0; i < MAIL_SCAN_MAX; i++) writeFileSync(path.join(box, `m${i}.json`), JSON.stringify({ fromLabel: "x" }));
+  t("box: exactly MAIL_SCAN_MAX mails are scanned", Array.isArray(readBoxMails(box)));
+  writeFileSync(path.join(box, "one-more.json"), "{}");
+  t("box: more than MAIL_SCAN_MAX ⇒ unknown (this round cannot prove either way)", readBoxMails(box) === "unknown");
+  const box2 = path.join(home, "box2"); mkdirSync(box2); spawnSync("mkfifo", [path.join(box2, "fifo.json")]);
+  const t0 = Date.now(); const r = readBoxMails(box2);
+  t("box: a FIFO named *.json ⇒ unknown, immediately (never opened)", r === "unknown" && Date.now() - t0 < 500);
+  const box3 = path.join(home, "box3"); mkdirSync(box3); for (let i = 0; i < 5; i++) writeFileSync(path.join(box3, `m${i}.json`), "{}");
+  let clk = 0; const r3 = readBoxMails(box3, MAIL_SCAN_MAX, 2, () => clk++); // deadline after 2 ticks of a fake clock
+  t("box: a scan cut by its deadline ⇒ unknown", r3 === "unknown");
+  const big = path.join(home, "box4"); mkdirSync(big); writeFileSync(path.join(big, "big.json"), JSON.stringify({ fromLabel: "claude:x", pad: "y".repeat(MAIL_BODY_MAX) }));
+  const r4 = readBoxMails(big) as Mail[];
+  t("box: a body over MAIL_BODY_MAX is counted, not read (sender unknown)", Array.isArray(r4) && r4.length === 1 && r4[0]!.sender === null);
+  const sw = path.join(home, ".agenthop", "swarm"); mkdirSync(sw, { recursive: true });
+  spawnSync("mkfifo", [path.join(sw, "coordinator.beat")]); spawnSync("mkfifo", [path.join(sw, "coordinator-handoff.md")]);
+  const t1 = Date.now(); const f = readProgressFacts(home, null, NOW);
+  t("facts: FIFO beat / handoff ⇒ unknown, immediately", f.beatSec === "unknown" && f.handoffMtimeSec === "unknown" && Date.now() - t1 < 500);
+  rmSync(home, { recursive: true, force: true });
 }
 
-// --- budget (PW-SWEEP-BUDGET): one inventory, bounded wall time ---
+// --- the "resolved" notice is its own obligation (PW-EMIT-COMMIT-RESOLVE / PW-SV-DELIVERY-COMMIT) ---
 {
-  // 8 live blocks, every `tern process` takes 1.5s on a virtual clock ⇒ the lookup must stop at the 3s budget
-  let clock = 0; let calls = 0;
-  const slow = (args: string[]) => { calls++; clock += 1500;
-    return args[0] === "ls" ? { ok: true, stdout: JSON.stringify({ sessions: [{ tabs: [{ blocks: Array.from({ length: 8 }, (_, i) => ({ id: i + 1, live: true })) }] }] }) }
-      : { ok: false, stdout: "" }; };
-  const b: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
-  const r = findCoordinatorBlock(COORD, () => 5001, () => "agent", budgeted(slow, b, () => clock), () => false);
-  t("budget: 8 blocks × 1.5s ⇒ stops at the 3s budget (≤ 2 calls), answer none", "none" in r && calls <= 2 && clock <= BLOCK_BUDGET_MS);
-  t("budget: says why", "none" in r && /budget/.test(r.none));
+  const st = initialWatchState(); const delivered: string[] = [];
+  planEmits(st, stalled, NOW); commitDelivery(st, "coordinator-stalled", true, NOW); // alert delivered
+  let up = false;
+  for (let tick = 1; tick <= 30; tick++) {
+    const now = NOW + tick * 5;
+    const { resolved } = planEmits(st, J(ok({ nowSec: now, handoffMtimeSec: NOW + 1 })), now); // handoff really advanced
+    for (const k of resolved) { commitResolved(st, k, up); if (up) delivered.push(`${tick}:${k}`); }
+    if (tick === 2) up = true; // the notice failed on its first attempt; IO comes back 5s later
+  }
+  t("resolved: alert ok → resolved notice fails → IO back → exactly one delivered notice, within RETRY_SEC", delivered.length === 1 && Number(delivered[0]!.split(":")[0]) * 5 - 5 <= RETRY_SEC + 5);
+  t("resolved: then nothing more", st.resolveOwed.size === 0);
 }
 {
-  const w = world(); const b: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
-  findCoordinatorBlock(COORD, w.pid, w.origin, budgeted(w.tern, b), w.isAncestor);
-  t("budget: one ls + one process per block, per round (2 blocks ⇒ 3 calls)", b.calls === 3);
+  const st = initialWatchState();
+  planEmits(st, stalled, NOW); commitDelivery(st, "coordinator-stalled", true, NOW);
+  planEmits(st, J(ok({ nowSec: NOW + 5, handoffMtimeSec: NOW + 1 })), NOW + 5); // recovered, notice owed, not delivered
+  const r = planEmits(st, J(ok({ nowSec: NOW + 10, handoffMtimeSec: NOW - 3 * 3600 + 10 })), NOW + 10);
+  t("resolved: a NEW stall before the notice went out supersedes it (no stale resolved)", !st.resolveOwed.has("coordinator-stalled") && r.resolved.length === 0);
 }
 console.log("PASS progress-watch");
