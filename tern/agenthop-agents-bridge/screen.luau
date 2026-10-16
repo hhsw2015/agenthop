@@ -30,6 +30,7 @@ M.STARTUP_GRACE_MS = 3000   -- AGENT_STARTUP_GRACE_WINDOW
 M.PENDING_IDLE_CONFIRMATIONS = 3
 M.PENDING_IDLE_CAP_MS = 700 -- AGENT_PENDING_IDLE_CAP
 M.STABLE_REFRESH_MS = 800   -- STABLE_VISIBLE_SIGNAL_REFRESH
+M.STATES = { idle = true, working = true, blocked = true, unknown = true }
 
 -- next pane to read: round-robin over `eligible` (sorted pane ids), continuing after `last`. nil when there is none. Pure.
 function M.pick(eligible, last)
@@ -80,7 +81,8 @@ function M.record(states, pane, read, program, title, agent, classify, mono, wal
 
   if type(read) ~= "table" or type(read.lines) ~= "table" or #read.lines == 0 then e.try = "unreadable"; return e end
   local ok, cls = pcall(classify, read.lines, title, program)
-  if not ok or type(cls) ~= "table" or type(cls.state) ~= "string" then e.try = "error"; return e end
+  -- T1B-SV-CLASSIFIER-ENUM: only the four published states; anything else is a failed attempt (state, hold and clocks untouched)
+  if not ok or type(cls) ~= "table" or not M.STATES[cls.state] then e.try = "error"; return e end
   if cls.rule == "slow" then e.try = "slow"; return e end -- classify's own budget ran out: no new information
   if cls.skip_state_update == true then e.pending_since, e.pending_n = nil, nil; e.try = "skip"; return e end
 

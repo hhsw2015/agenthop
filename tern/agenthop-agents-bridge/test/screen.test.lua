@@ -155,6 +155,24 @@ do
   e = S.record(st, P, READ, CLAUDE, "", "claude", function() return { state = 7 } end, t + 600, 174)
   ck("classify returned junk: try=error, kept", e.try == "error" and e.state == "working")
 end
+-- ---- an out-of-enum state string is a failed attempt, never a publish, and it does not clear the working→idle hold ----
+do
+  local cls = script({ W, { state = "not-a-state" }, I, I })
+  local st, t = settled(cls)
+  S.record(st, P, READ, CLAUDE, "", "claude", cls, t + 100, 110)
+  local e = S.record(st, P, READ, CLAUDE, "", "claude", cls, t + 200, 111)
+  ck("enum: \"not-a-state\" ⇒ try=error, working kept, observed_at not moved", e.try == "error" and e.state == "working" and e.observed_at == 110)
+  e = S.record(st, P, READ, CLAUDE, "", "claude", cls, t + 300, 112)
+  ck("enum: the plain idle after it is HELD (the bad sample did not stand in for a confirmation)", e.state == "working" and e.try == "held")
+end
+do
+  local cls = script({ W, I, { state = "sleeping" }, I })
+  local st, t = settled(cls)
+  S.record(st, P, READ, CLAUDE, "", "claude", cls, t + 100, 110)
+  S.record(st, P, READ, CLAUDE, "", "claude", cls, t + 200, 111) -- held, pending n=0
+  S.record(st, P, READ, CLAUDE, "", "claude", cls, t + 300, 112) -- bad
+  ck("enum: a bad sample inside a hold keeps the pending clock (no reset, no publish)", st[K].pending_since == t + 200 and st[K].state == "working")
+end
 -- ---- agent change ⇒ unknown + new grace ----
 do
   local cls = script({ W })
