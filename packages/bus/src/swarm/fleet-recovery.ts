@@ -44,7 +44,10 @@ export function breakpointInjectionEnabled(env: NodeJS.ProcessEnv = process.env)
 // ============================================================================================================
 
 /** Non-family env names recovery explicitly needs: AH_HOME + the endpoint base URLs. */
-export const ENV_NAME_ALLOW: readonly string[] = ["AH_HOME", "ANTHROPIC_BASE_URL", "CPA_BASE_URL"];
+export const ENV_NAME_ALLOW: readonly string[] = ["AH_HOME", "ANTHROPIC_BASE_URL", "CPA_BASE_URL",
+  // the bridge location overrides the dispatcher honours (tern-bridge-sweep bridgeHome / AGENTHOP_BRIDGE_DIR); without them a relaunch
+  // from the recipe silently points the sweep at the default bridge (ENV-NIT-RUNBOOK-OVERRIDES)
+  "AGENTHOP_BRIDGE_HOME", "AGENTHOP_BRIDGE_DIR"];
 
 /** Allowed NAME PREFIXES — the SWARM_ identity+flag family + the HERDR_ and TERN_ reachability families (Q2/F54: HERDR_ENV/HERDR_PANE_ID
  *  gate herdr inbox-wake, HERDR_BIN/HERDR_SOCKET_PATH let the relaunched dispatcher reach herdr; TERN_BIN lets a dispatcher outside a

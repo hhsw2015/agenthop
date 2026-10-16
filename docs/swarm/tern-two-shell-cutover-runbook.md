@@ -133,7 +133,7 @@ d=json.load(open(sys.argv[1]))
 # pane would otherwise carry that pane's TERN_PANE / CLAUDE_* / HERDR_PANE_* forever. TERN_PANE_SOCKET MUST stay: `tern ctl` from
 # outside a pane finds the daemon only through it (without it every mirror call fails with "/tmp/tern.sock: No such file").
 keep={"HOME","PATH","USER","LOGNAME","SHELL","TMPDIR","LANG","LC_ALL","AH_HOME","ANTHROPIC_BASE_URL","CPA_BASE_URL","TERN_BIN","TERN_PANE_SOCKET","HERDR_BIN","HERDR_BIN_PATH","HERDR_SOCKET_PATH","HERDR_ENV"}
-env={k:v for k,v in os.environ.items() if k in keep or k.startswith(("SWARM_","CPA_"))}
+env={k:v for k,v in os.environ.items() if k in keep or k.startswith(("SWARM_","CPA_","AGENTHOP_"))}  # AGENTHOP_*: AGENTHOP_BRIDGE_HOME / AGENTHOP_BRIDGE_DIR overrides
 env.update({k:v for k,v in d["env"].items() if not (k.startswith("TERN_") and k not in ("TERN_BIN","TERN_PANE_SOCKET")) and not k.startswith("CLAUDE") and not k.startswith(("HERDR_PANE","HERDR_TAB","HERDR_WORKSPACE","HERDR_STARTUP"))})
 env.setdefault("TERN_PANE_SOCKET", os.path.expanduser("~/Library/Application Support/Tern/daemon.sock"))
 log=open(os.path.expanduser("~/.agenthop/swarm/dispatcher.log"),"a")

@@ -87,8 +87,8 @@ import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleEx
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
 import { realTernSpawn } from "../packages/bus/src/swarm/tern-env.js";
-import { initialWatchState, judgeProgress, planEmits, readProgressFacts, writeL0Alert, blockForSession } from "../packages/bus/src/swarm/progress-watch.js";
-import { parsePs, realExactArgv, resolveAgentPid } from "../packages/bus/src/swarm/seat-presence.js";
+import { initialWatchState, judgeProgress, planEmits, commitDelivery, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, RETRY_SEC, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
+import { readOrigin } from "../packages/bus/src/swarm/seat-presence.js";
 import { ternInjectCommands } from "../packages/bus/src/swarm/tern-wake.js";
 import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, bridgeHome, bridgeScriptEnv, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
@@ -1545,35 +1545,43 @@ async function main(): Promise<void> {
     } catch (e) { log(`inbox sentinel failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
-  // L4 coordinator progress watch (long-run-liveness, 2026-10-16): "alive but not advancing" — beat fresh while the handoff is >2h old
-  // or ≥3 real mails wait >1h in the coordinator role box ⇒ S19 to the role box + an L0 alert file + one line typed into the
-  // coordinator's Tern block; Carly's patrol beat >30min ⇒ S19 + L0. Pure file reads (I3), fail-soft, deduped 30min, "resolved" once.
-  // The coordinator's dead state (beat stale) is not judged here — the existing death paths own it. SWARM_PROGRESS_WATCH, default ON.
+  // L4 coordinator progress watch (long-run-liveness, 2026-10-16; r2 after Chief Review 0582ae3 + Second Voice be7f170): "alive but
+  // not advancing" — beat fresh while the handoff is >2h old or ≥3 real mails wait >1h in the coordinator role box ⇒ S19 to the role
+  // box + an L0 alert file + one line typed into the coordinator's Tern block; Carly's patrol beat >30min ⇒ S19 + L0. Three-state
+  // facts (unreadable ≠ fine ≠ stalled), delivery committed only on success, owed alerts retried every 60s. SWARM_PROGRESS_WATCH, on.
   const progressWatch = initialWatchState();
   const ternSpawnPW = realTernSpawn(process.env);
-  const rosterMemberSids = (): Set<string> => {
-    try {
-      const r = JSON.parse(readFileSync(path.join(SCRIPTS_DIR, "..", "tern", "restore", "roster.json"), "utf8")) as { seats?: Array<{ role?: string; sid?: string }> };
-      return new Set((r.seats ?? []).filter((x) => x.role !== "Manager" && typeof x.sid === "string").map((x) => x.sid as string));
-    } catch { return new Set(); }
+  const presencePid = (sid: string): "absent" | "unknown" | number => {
+    let raw: string;
+    try { raw = readFileSync(path.join(HOME, ".agenthop", "presence", `${sid}.pid`), "utf8").trim(); }
+    catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
+    const n = Number(raw);
+    return /^\d+$/.test(raw) && Number.isSafeInteger(n) && n > 0 ? n : "unknown";
   };
-  const coordinatorBlock = (sid: string): string | null => {
-    const ls = ternSpawnPW(["ls", "--json"]);
-    if (!ls.ok) return null;
-    const blocks: Array<{ id: string; rootPid: number }> = [];
-    try {
-      for (const se of (JSON.parse(ls.stdout) as { sessions: Array<{ tabs: Array<{ blocks: Array<{ id: number; live: boolean }> }> }> }).sessions)
-        for (const t of se.tabs) for (const b of t.blocks) {
-          if (!b.live) continue;
-          const pr = ternSpawnPW(["process", String(b.id), "--json"]);
-          const root = pr.ok ? (JSON.parse(pr.stdout) as { child?: { pid?: unknown } }).child?.pid : undefined;
-          if (Number.isSafeInteger(root)) blocks.push({ id: String(b.id), rootPid: root as number });
-        }
-    } catch { return null; }
-    const ps = spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8", timeout: 1500 });
-    if (ps.status !== 0) return null;
-    const rows = parsePs(ps.stdout), exact = realExactArgv();
-    return blockForSession(blocks, (root) => resolveAgentPid(root, sid, "claude", rows, exact));
+  const presenceOrigin = (sid: string): "absent" | "unknown" | string => {
+    try { const o = readOrigin(HOME, sid); return o === "unreadable" ? "unknown" : o; } catch { return "unknown"; }
+  };
+  /** The coordinator block, under a 3s budget for the whole lookup (one ls, one process per block, one ps). The authority is the
+   *  dispatcher's own coordinator binding (SWARM_COORDINATOR resolved against presence — the same one notifyCoordinator uses) and
+   *  that session's AGENT presence pid; never "a session that is not a member". */
+  const coordinatorBlock = (): { block: string } | { none: string } => {
+    const budget: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
+    const tern = budgeted((args) => { const r = ternSpawnPW(args); return { ok: r.ok, stdout: r.stdout }; }, budget);
+    let parent: Map<number, number> | null = null;
+    const isAncestor = (pid: number, root: number): boolean | null => {
+      if (parent === null) {
+        if (budget.leftMs <= 0) return null;
+        const t0 = Date.now();
+        const ps = spawnSync("ps", ["axo", "pid=,ppid="], { encoding: "utf8", timeout: Math.min(1500, budget.leftMs) });
+        budget.leftMs -= Math.max(1, Date.now() - t0);
+        if (ps.status !== 0) return null;
+        parent = new Map(ps.stdout.split("\n").map((l) => l.trim().split(/\s+/).map(Number)).filter((x) => x.length === 2 && x.every(Number.isSafeInteger)).map(([a, b]) => [a!, b!] as [number, number]));
+      }
+      for (let p = pid, n = 0; p > 1 && n < 64; n++) { if (p === root) return true; const q = parent.get(p); if (q === undefined) return false; p = q; }
+      return false;
+    };
+    const sid = COORDINATOR ? resolveSession(COORDINATOR, listSessions(HOME)) : null;
+    return findCoordinatorBlock(sid, presencePid, presenceOrigin, tern, isAncestor);
   };
   const runProgressWatch = (): void => {
     if (!flagDefaultOn(process.env.SWARM_PROGRESS_WATCH)) return;
@@ -1581,25 +1589,23 @@ async function main(): Promise<void> {
       const now = nowSec();
       // the role box is the coordinator's stable address (SWARM_COORDINATOR), whichever session currently drains it
       const box = COORDINATOR && isValidSessionId(COORDINATOR) ? inboxDirName(COORDINATOR) : null;
-      const { fire, resolved } = planEmits(progressWatch, judgeProgress(readProgressFacts(HOME, box, now)), now);
-      for (const a of fire) {
-        notifyCoordinator(a.text, { taskRef: `progress-watch:${a.key}`, title: a.key, severity: "stall" });
-        try { log(`progress-watch: L0 alert ${writeL0Alert(HOME, a, now)}`); } catch (e) { log(`progress-watch: L0 alert write failed: ${e instanceof Error ? e.message : e}`); }
+      const { attempt, resolved } = planEmits(progressWatch, judgeProgress(readProgressFacts(HOME, box, now)), now);
+      for (const a of attempt) {
+        const surfaces: string[] = [];
+        const n = notifyCoordinator(a.text, { taskRef: `progress-watch:${a.key}`, title: a.key, severity: "stall" });
+        if (n === "delivered" || n === "deduped") surfaces.push("S19");
+        try { log(`progress-watch: L0 alert ${writeL0Alert(HOME, a, now)}`); surfaces.push("L0"); }
+        catch (e) { log(`progress-watch: L0 alert write failed: ${e instanceof Error ? e.message : e}`); }
         if (a.key === "coordinator-stalled") {
-          // the coordinator's CURRENT session: SWARM_COORDINATOR is the role address, not necessarily the running session (it was
-          // rotated to a clean session). The current one is a live presence session that is NOT a member seat on the restore roster
-          // (tern/restore/roster.json lists every member sid). Exactly one such session with exactly one block, or no typing.
-          const members = rosterMemberSids();
-          const live = listSessions(HOME).filter((sid) => !members.has(sid));
-          const blockIds = [...new Set(live.map((sid) => coordinatorBlock(sid)).filter((b): b is string => b !== null))];
-          if (blockIds.length === 1) {
-            // the same send commands inbox-wake uses, through the L3 runner (cleaned env, 1.5s) like every other dispatcher tern call
-            const [typeCmd, enterCmd] = ternInjectCommands(blockIds[0]!, a.text);
-            const ok = ternSpawnPW(typeCmd).ok && ternSpawnPW(enterCmd).ok;
-            log(`progress-watch: ${ok ? "typed into" : "could not type into"} coordinator block ${blockIds[0]}`);
-          } else log(`progress-watch: coordinator block not identified (${blockIds.length} candidates) — S19 + L0 only`);
+          const where = coordinatorBlock();
+          if ("block" in where) {
+            const [typeCmd, enterCmd] = ternInjectCommands(where.block, a.text); // inbox-wake's send commands, through the L3 runner
+            if (ternSpawnPW(typeCmd).ok && ternSpawnPW(enterCmd).ok) surfaces.push(`block ${where.block}`);
+            else log(`progress-watch: could not type into coordinator block ${where.block}`);
+          } else log(`progress-watch: not typing into a block (${where.none}) — S19 + L0 only`);
         }
-        log(`progress-watch: ${a.key} — ${a.text}`);
+        commitDelivery(progressWatch, a.key, surfaces.length > 0, now);
+        log(`progress-watch: ${a.key} ${surfaces.length ? `delivered via ${surfaces.join(" + ")}` : `NOT delivered (S19 ${n}) — owed, retry in ${RETRY_SEC}s`}`);
       }
       for (const k of resolved) { log(`progress-watch: ${k} resolved`); notifyCoordinator(`[dispatcher] ${k} resolved`, { taskRef: `progress-watch:${k}`, title: `${k} resolved`, severity: "info" }); }
     } catch (e) { log(`progress watch failed (isolated): ${e instanceof Error ? e.message : e}`); }
