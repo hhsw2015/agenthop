@@ -9,6 +9,8 @@
 -- crash-safe exactly-once (tern.fs has no rename/O_EXCL). Recovery is the swarm's job, op-class-specific (PROTOCOL.md §3).
 
 local claim = require("./claim")
+local screen = require("./screen")
+local classify = require("./classify")
 
 local HOME = tern.getenv("HOME") or ""
 local CTL = HOME .. "/.agenthop/tern-panes" -- control-plane dir shared with the bash swarm
@@ -57,6 +59,9 @@ end
 -- agents:list(): it filters panes() to kind=="agent" and builds a minimal table (target <2KB, <3ms/tick). model/state/last_message are
 -- not on PaneInfo and are dropped from the tick; the `list` op (request path, not the tick) still returns the full agents:list().
 local agentPanes = claim.slimAgents -- r7: one shared source with the `list` op (claim.luau)
+-- #1115 T1: per-pane screen state of this window's TUI seats (screen.luau). Filled by the `screen` command, published by mirror.
+local screens = {}
+local lastScreenPane = nil
 
 -- r5 phase breadcrumbs kept as an OPT-IN debug switch (kv `bridge.debug_phase` = true, or env AGENTHOP_BRIDGE_DEBUG_PHASE=1), OFF by
 -- default: each crumb is a file write, which is exactly the cost class the tick must avoid in production.
@@ -94,6 +99,7 @@ local function mirror(cx)
     timer_fired_at = timerFiredAt, -- r11: tern.now() of the last delivered timer callback; absent = never delivered since load
     phase_ms = lastPhase, -- previous completed tick's cumulative ms per segment
     agents = (#agents > 0) and agents or tern.json.array({}),
+    screens = screen.publicAll(screens), -- #1115 T1b: pane id -> published {state, rule, agent, visible_*, observed_at, try, tried_at}
     error = (not ok) and tostring(panes) or nil,
   }
   crumb(dbg, ticks, "encode", t0, string.format(',"panes_ms":%.2f,"build_ms":%.2f', tPanes, tBuild))
@@ -313,6 +319,31 @@ tern.command({ id = "mirror", title = "agenthop bridge: mirror now", run = funct
     mirrorTimer(nil, timerGen)
   end
 end })
+-- #1115 T1 `screen`: ONE pane read + ONE classify per run, on its own hook. Also written to screens/<vm>.json so every window's VM
+-- publishes its own panes (a VM reads only its window); readers merge the files by pane id. Each entry carries observed_at (wall
+-- epoch seconds); stale or missing = UNKNOWN for the reader. A read that fails changes only try/tried_at (no new information).
+local SCREENS_DIR = CTL .. "/screens"
+local function screenRound(cx)
+  local okP, panes = pcall(function() return cx.session:panes() end)
+  if not okP or type(panes) ~= "table" then return end -- UNKNOWN round: nothing learned, nothing changed
+  screen.prune(screens, panes)
+  local id = screen.pick(screen.eligible(panes, classify.agent_for), lastScreenPane)
+  if id ~= nil then
+    lastScreenPane = id
+    local p = nil
+    for _, x in ipairs(panes) do if x.pane == id then p = x end end
+    local okR, read = pcall(function() return cx.session:read(id, { as = "table", lines = 24, scrollback = true }) end)
+    local okW, wall = pcall(os.time)
+    local program = p and p.program
+    screen.record(screens, id, okR and read or nil, program, p and p.title, classify.agent_for(program), classify.classify, tern.now(),
+      (okW and wall) or 0)
+  end
+  pcall(function()
+    if not tern.fs.exists(SCREENS_DIR) then tern.fs.mkdir(SCREENS_DIR) end
+    tern.fs.write(SCREENS_DIR .. "/" .. VM_ID .. ".json", tern.json.encode({ vm = VM_ID, window = WINDOW_KEY, ts = tern.now(), screens = screen.publicAll(screens) }))
+  end)
+end
+tern.command({ id = "screen", title = "agenthop bridge: classify one TUI pane", run = function(cx) ensure(); screenRound(cx) end })
 tern.command({ id = "drain", title = "agenthop bridge: drain requests", run = function(cx) ensure(); pcall(function() drain(cx, false) end) end })
 tern.command({ id = "drain-start", title = "agenthop bridge: drain start requests", run = function(cx) ensure(); pcall(function() drain(cx, true) end) end })
 

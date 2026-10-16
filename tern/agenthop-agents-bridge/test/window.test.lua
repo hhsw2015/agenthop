@@ -153,6 +153,14 @@ _G.tern = {
 }
 
 package.loaded["./claim"] = assert(loadfile(here .. "../claim.luau"))()
+-- #1115 T1: window.luau also requires screen + classify (and classify its manifests / uclasses); load the PRODUCTION files
+package.loaded["./manifests"] = assert(loadfile(here .. "../manifests.luau"))()
+package.loaded["./uclasses"] = assert(loadfile(here .. "../uclasses.luau"))()
+package.loaded["./classify"] = assert(loadfile(here .. "../classify.luau"))()
+-- the tern.now mock advances 7ms per call (so tick_ms is measurable); classify's 5ms budget would then expire at once — give it a
+-- real clock in this fixture (classify's budget itself is covered by test/classify.test.lua and test/screen.test.lua)
+package.loaded["./classify"].clock = function() return os.clock() * 1000 end
+package.loaded["./screen"] = assert(loadfile(here .. "../screen.luau"))()
 -- r10 GATE: load window.luau in an env whose globals are READ-ONLY, like Tern's plugin VM. Any global write (e.g. `_G.x = …` or an
 -- undeclared assignment) raises here exactly as it does live — "passes locally, dies in Tern" (r9 @613e691, 10:56 syntax) turns RED.
 local SANDBOX = setmetatable({}, {
@@ -391,6 +399,47 @@ local pF = runOnly("drain", '{"op":"stop","agent":1}')
 ck("P2-1 controls: plain start → drain-start, plain stop → drain", pS.claimed and pS.start == 1 and pF.claimed and pF.stop == 1)
 local bad = runOnly("drain", '{ not json')
 ck("P2-1: undecodable request goes to fast drain (reported, never stranded on drain-start)", bad.claimed and (files[RES .. "z.json"] or ""):find("bad request json", 1, true) ~= nil)
+
+-- ---- #1115 T1: the `screen` command — one read per run, per-VM file, published in agents.json, UNKNOWN keeps nothing new ----
+do
+  local f = assert(io.open(here .. "fixtures/tui/claude-working-mid.txt")); local txt = f:read("a"); f:close()
+  local lines = {}; for l in (txt .. "\n"):gmatch("(.-)\n") do lines[#lines + 1] = l end
+  local TUI = 12382390714370
+  local reads, readOk = 0, true
+  local panes0, read0 = cx.session.panes, cx.session.read
+  cx.session.panes = function() return {
+    { pane = 1, kind = "agent", program = "tern" },                               -- acp seat: skipped
+    { pane = TUI, kind = "terminal", title = "◐ Claude Code", program = "/u/.local/share/claude/versions/2.1.293" },
+  } end
+  cx.session.read = function(_, id) reads = reads + 1; if not readOk then return nil end; return id == TUI and { lines = lines } or nil end
+  ck("T1: command `screen` registered on its own hook", type(commands["screen"]) == "function")
+  local carly0 = carlyCalls
+  commands["screen"](cx)
+  ck("T1: ONE pane read per run, zero tern.carly calls", reads == 1 and carlyCalls == carly0)
+  local SF; for k in pairs(files) do if k:match("/tern%-panes/screens/.+%.json$") then SF = k end end
+  ck("T1b: a pane seen for the first time publishes unknown (startup grace), not idle",
+    (files[SF] or ""):find('"state":"unknown"', 1, true) ~= nil and (files[SF] or ""):find('"try":"grace"', 1, true) ~= nil)
+  clock = clock + 3500; commands["screen"](cx) -- grace expired on this sample: skipped too (as upstream)
+  clock = clock + 100; commands["screen"](cx)
+  local body = SF and files[SF] or ""
+  ck("T1: screens/<vm>.json written, keyed by the pane id string, state working, try ok",
+    body:find('"' .. tostring(TUI) .. '":{', 1, true) ~= nil and body:find('"state":"working"', 1, true) ~= nil and body:find('"try":"ok"', 1, true) ~= nil)
+  commands["mirror"](cx)
+  ck("T1: the mirror publishes screens in agents.json", (files[AGENTS] or ""):find('"screens":{"' .. tostring(TUI) .. '"', 1, true) ~= nil)
+  readOk = false
+  commands["screen"](cx)
+  local b2 = files[SF] or ""
+  ck("T1: an unreadable round keeps the last observation (working) and records try=unreadable",
+    b2:find('"state":"working"', 1, true) ~= nil and b2:find('"try":"unreadable"', 1, true) ~= nil)
+  cx.session.panes = function() return { { pane = 1, kind = "agent", program = "tern" } } end
+  commands["screen"](cx)
+  ck("T1: a closed TUI pane is pruned (no stale state left for it)", not (files[SF] or ""):find(tostring(TUI), 1, true))
+  cx.session.panes = function() error("panes failed") end
+  local before = files[SF]
+  commands["screen"](cx)
+  ck("T1: panes() failing ⇒ UNKNOWN round, nothing rewritten", files[SF] == before)
+  cx.session.panes, cx.session.read = panes0, read0
+end
 
 print(string.format("\n%s (%d failure(s))", failures == 0 and "PASS" or "FAIL", failures))
 os.exit(failures == 0 and 0 or 1)

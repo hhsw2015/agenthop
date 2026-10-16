@@ -206,6 +206,9 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
   const mirror = io.readMirror();
   // agents.json absent / torn / without tick+vm ⇒ UNKNOWN too (FC-2): an unreadable file is not proof the bridge is stuck.
   if (mirror === null) { io.log("tern-bridge: UNKNOWN (agents.json unreadable or without tick/vm) — no action"); return "unknown"; }
+  // #1115 T1: one `screen` round (one pane read + classify, its own hook) per sweep tick that reached the bridge. Its outcome is
+  // not a liveness signal: a failed or disabled `screen` just lets the screen state go stale, which readers report as UNKNOWN.
+  run(io, "screen");
   if (mirror.tick !== st.lastTick) { st.lastTick = mirror.tick; st.lastTickChangeMs = now; }
   if (st.lastTickChangeMs === -Infinity) st.lastTickChangeMs = now; // first observation starts the stall clock
 

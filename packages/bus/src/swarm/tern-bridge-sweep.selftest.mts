@@ -470,6 +470,21 @@ t("control root: explicit AGENTHOP_BRIDGE_HOME wins", bridgeHome({ AH_HOME: "/tm
   t("ROLLBACK: a stall after the jump is still detected and recovered within a few rounds (not an hour)", reloads(w) === 1);
 }
 
+// --- #1115 T1: each sweep tick that reached the bridge triggers one `screen` round; a failing `screen` is not a stall signal ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  w.calls = [];
+  for (let i = 0; i < 3; i++) { w.clock += 5000; tick(st, b); }
+  t("T1: one screen run per healthy tick", w.calls.filter((c) => c.endsWith(".screen")).length === 3);
+  w.failStep = "screen"; w.calls = [];
+  for (let i = 0; i < 3; i++) { w.clock += 5000; tick(st, b); }
+  t("T1: screen failing ⇒ no reload, the mirror keeps being driven", reloads(w) === 0 && mirrorCalls(w) === 3);
+  w.failStep = undefined; w.ternUp = false; w.calls = [];
+  w.clock += 5000; tick(st, b);
+  t("T1: tern UNKNOWN ⇒ no screen run either (zero further actions)", !w.calls.some((c) => c.endsWith(".screen")));
+}
+
 // --- L5: the unhealthy-but-debounced line is rate-limited too ---
 {
   const w = world(); const st = initialBridgeState(); const b = io(w);
