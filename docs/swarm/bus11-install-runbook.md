@@ -105,10 +105,24 @@ cp $B/presence.mjs ~/.agenthop/presence.mjs.new && mv -f ~/.agenthop/presence.mj
 A running `agenthop mcp` keeps the old program until its seat restarts it. Order: low-risk seats first, the coordinator last:
 Reserve → OpenDot Dev → Model Gateway → Platform Dev → Infra Dev → Second Voice → Chief Review → Manager.
 
-Per seat (TUI and ACP seats alike), in that seat:
+Per seat (TUI and ACP seats alike):
 
-- claude (TUI or ACP): `/mcp`, reconnect `agenthop`. If `/mcp` is not available in that block, restart the block with the seat
-  switch runbook (`tui-seat-switch-runbook.md` §2-§4, same sid).
+- claude TUI seat: `/mcp`, reconnect `agenthop`. `/mcp` is a slash command typed into the block; the seat itself has no tool that
+  runs it, so the coordinator drives the menu from its own seat (found on install day, 2026-10-16):
+  ```bash
+  B=<block id>   # the seat's TUI block (tern ls --json)
+  tern capture $B | tail -4      # the block must be idle: a busy block swallows the first Enter
+  tern send $B text '/mcp' && sleep 0.3 && tern send $B keys Enter    # opens the MCP menu
+  tern capture $B | tail -12     # find agenthop in the list; move to it with keys Down, open it with keys Enter
+  # choose Reconnect (keys Down / keys Enter as the menu shows), then keys Escape to leave the menu
+  tern capture $B | grep -F "Reconnected to agenthop"
+  ```
+  Expect: `Reconnected to agenthop` on screen. The block, its session and its context stay as they were. Read the menu from the
+  screen at each key; do not replay a fixed key sequence blindly, the list order can differ per seat.
+- claude ACP seat: there is no screen menu to drive. Its MCP restarts when the seat moves to TUI (seat switch runbook
+  `tui-seat-switch-runbook.md` §2-§4, same sid); until then it keeps the old program.
+- Never kill an `agenthop mcp` process to restart it: nothing guarantees the client starts a new one, and the seat would lose its
+  bus tools mid-install.
 - codex: its MCP runs under the codex app-server daemon, not under the Tern block (`docs/research/codex-tui-mcp-parent-probe.md`).
   Restart the thread's MCP from inside codex (`/mcp`); closing the Tern block does not restart it.
 
@@ -118,8 +132,9 @@ Check each seat from any shell:
 for p in $(pgrep -f "agenthop mcp"); do printf "%s ppid=%s start=%s\n" "$p" "$(ps -o ppid= -p $p | tr -d ' ')" "$(ps -o lstart= -p $p)"; done
 ```
 
-Expect: for each seat, its `agenthop mcp` process started after step 4. An older start time ⇒ that seat still runs the old program.
-Then, in the seat: `agenthop_peers` lists the seat's own handle with `(you)`, and the tool list includes `agenthop_tui`.
+Expect: for each seat, its `agenthop mcp` process started after step 4, and its old one is gone. An older start time ⇒ that seat
+still runs the old program. Then, in the seat: `agenthop_peers` lists the seat's own handle. `agenthop_tui` is the T2 tool
+(`feat/tui-seat-ops`); it appears only after T2 is merged and installed, so it is not part of this install's acceptance.
 
 A seat that does not come back: stop here and use the switch runbook rollback line for that seat. Do not go to the next seat.
 
