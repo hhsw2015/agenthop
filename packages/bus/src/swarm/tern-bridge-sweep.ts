@@ -33,6 +33,11 @@ export const RELOAD_MIN_MS = 60_000;
 export const READY_WAIT_MS = 4_000;
 export const TERN_TIMEOUT_MS = 3_000;
 export const ARM_CANCEL_MAX = 64; // bound on arm-cancel iterations (a sentinel that never reaches 0 must not loop forever)
+/** L5: after this many consecutive UNKNOWN ticks (tern not answering) the sweep probes only once per UNKNOWN_BACKOFF_MS. */
+export const UNKNOWN_BACKOFF_AFTER = 3;
+export const UNKNOWN_BACKOFF_MS = 60_000;
+/** L5: an owed "ready" (the reload did not take: vm and tick unchanged) for this many rounds, with the debounce passed ⇒ reload again. */
+export const OWED_READY_ROUNDS = 3;
 
 /** SWARM_TERN_BRIDGE — DEFAULT OFF (opt-in). */
 export function ternBridgeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -94,10 +99,17 @@ export type BridgeState = {
     /** TBS-READY-RETRY: the mirror as it was BEFORE the reload. "ready" (now or on a later tick) = vm or tick moved against
      *  THIS baseline — the same rule as the in-reload wait, never merely "the mirror is readable". */
     baseline: Mirror;
+    /** L5: ticks this obligation has been retried without progress, and the last reason logged (logged again only on change). */
+    rounds: number;
+    lastLogged: string;
   } | null;
+  /** L5: consecutive UNKNOWN ticks (reset on the first answer) and the last unhealthy-debounced log time. */
+  unknownStreak: number;
+  lastDebouncedLogMs: number;
 };
 export function initialBridgeState(): BridgeState {
-  return { lastMirrorMs: -Infinity, armedVm: null, lastTick: null, lastTickChangeMs: -Infinity, lastReloadMs: -Infinity, owedAfterReload: null };
+  return { lastMirrorMs: -Infinity, armedVm: null, lastTick: null, lastTickChangeMs: -Infinity, lastReloadMs: -Infinity, owedAfterReload: null,
+    unknownStreak: 0, lastDebouncedLogMs: -Infinity };
 }
 
 export type TickOutcome = "disabled" | "throttled" | "unknown" | "ok" | "rearmed" | "arm-failed" | "reloaded" | "reload-debounced"
@@ -162,12 +174,23 @@ const run = (io: BridgeIO, action: string): TernResult => io.tern(["ctl", "plugi
 export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolean): TickOutcome {
   if (!enabled) return "disabled";
   const now = io.nowMs();
-  if (now - st.lastMirrorMs < MIRROR_EVERY_MS) return "throttled";
+  // L5: once tern has not answered UNKNOWN_BACKOFF_AFTER ticks in a row, probe (and so log) at most once per UNKNOWN_BACKOFF_MS
+  const every = st.unknownStreak >= UNKNOWN_BACKOFF_AFTER ? UNKNOWN_BACKOFF_MS : MIRROR_EVERY_MS;
+  if (now - st.lastMirrorMs < every) return "throttled";
   st.lastMirrorMs = now;
 
   // ① drive the mirror. tern not answering ⇒ UNKNOWN: one line, zero further action (⑤).
   const m = run(io, "mirror");
-  if (!m.ok) { io.log(`tern-bridge: UNKNOWN (tern did not answer: ${m.detail}) — no action`); return "unknown"; }
+  if (!m.ok) {
+    st.unknownStreak++;
+    const backoff = st.unknownStreak === UNKNOWN_BACKOFF_AFTER ? ` — ${st.unknownStreak} in a row, probing once per ${UNKNOWN_BACKOFF_MS / 1000}s` : "";
+    io.log(`tern-bridge: UNKNOWN (tern did not answer: ${m.detail}) — no action${backoff}`);
+    return "unknown";
+  }
+  if (st.unknownStreak > 0) {
+    if (st.unknownStreak >= UNKNOWN_BACKOFF_AFTER) io.log(`tern-bridge: tern answering again after ${st.unknownStreak} UNKNOWN probes`);
+    st.unknownStreak = 0;
+  }
 
   const mirror = io.readMirror();
   // agents.json absent / torn / without tick+vm ⇒ UNKNOWN too (FC-2): an unreadable file is not proof the bridge is stuck.
@@ -184,7 +207,11 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
   if (tickStalled || stuck.length > 0) {
     const why = tickStalled ? `tick ${st.lastTick} not advancing ${now - st.lastTickChangeMs}ms` : `request stuck: ${stuck[0]!.name}`;
     if (now - st.lastReloadMs < RELOAD_MIN_MS) {
-      io.log(`tern-bridge: unhealthy (${why}) — reload debounced (${now - st.lastReloadMs}ms since last)`);
+      // one line per debounce window, not one per tick
+      if (now - st.lastDebouncedLogMs >= RELOAD_MIN_MS) {
+        st.lastDebouncedLogMs = now;
+        io.log(`tern-bridge: unhealthy (${why}) — reload debounced (${now - st.lastReloadMs}ms since last)`);
+      }
       return "reload-debounced";
     }
     st.lastReloadMs = now;
@@ -230,7 +257,7 @@ function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]
   }
   // From here a reload HAPPENED: whatever is left (ready, arm, drain) is an obligation kept across ticks until the WHOLE chain
   // succeeds, never re-entering the reload debounce (TBS-ARM-RETRY, coordinator ruling).
-  st.owedAfterReload = { vm: null, why, startStuck: stuck.some((q) => q.isStart), stage: "ready", reason: "", baseline: before };
+  st.owedAfterReload = { vm: null, why, startStuck: stuck.some((q) => q.isStart), stage: "ready", reason: "", baseline: before, rounds: 0, lastLogged: "" };
   if (!ready) {
     st.owedAfterReload.reason = `not ready within ${READY_WAIT_MS}ms`;
     io.controlLog(`tern-bridge reload (${why}): reloaded but not ready within ${READY_WAIT_MS}ms — owed, retry next tick (no reload)`);
@@ -252,14 +279,32 @@ function finishAfterReload(st: BridgeState, io: BridgeIO, now: Mirror): TickOutc
   const vm = now?.vm ?? null;
   const owed = st.owedAfterReload!;
   const keep = (stage: "ready" | "arm" | "drain", reason: string): TickOutcome => {
-    owed.stage = stage; owed.reason = reason; owed.vm = vm;
-    io.controlLog(`tern-bridge reload (${owed.why}): owed at ${stage} — ${reason} (retry next tick, no reload)`);
+    owed.stage = stage; owed.reason = reason; owed.vm = vm; owed.rounds++;
+    const line = `owed at ${stage} — ${reason}`;
+    if (line !== owed.lastLogged) { // one audit line per distinct state, not one per tick
+      owed.lastLogged = line;
+      io.controlLog(`tern-bridge reload (${owed.why}): ${line} (retry next tick, no reload)`);
+    }
     return "reload-failed";
   };
   if (owed.stage === "ready") {
     // a ready-wait that timed out last time: same rule as the in-reload wait — moved against the pre-reload baseline
-    if (now === null) return keep("ready", "mirror still unreadable");
-    if (!movedSince(owed.baseline, now)) return keep("ready", `mirror unchanged since the reload (vm ${now.vm}, tick ${now.tick})`);
+    const unmoved = now === null ? "mirror still unreadable" : !movedSince(owed.baseline, now) ? `mirror unchanged since the reload (vm ${now.vm}, tick ${now.tick})` : null;
+    if (unmoved !== null) {
+      // L5: the reload did not take (live 2026-10-16: vm and tick frozen for 6h while every tick said "owed, no reload"). After
+      // OWED_READY_ROUNDS rounds without progress, and only once the reload debounce has passed, reload again.
+      const t = io.nowMs();
+      if (owed.rounds + 1 >= OWED_READY_ROUNDS && t - st.lastReloadMs >= RELOAD_MIN_MS) {
+        io.controlLog(`tern-bridge reload (${owed.why}): previous reload did not take after ${owed.rounds + 1} rounds (${unmoved}) — reloading again`);
+        st.lastReloadMs = t;
+        // the existing obligation (baseline, startStuck) stays in place until recover() REPLACES it with a new one — which it
+        // does only once a reload actually ran; a failed / unanswered reload leaves this one intact, retried after the debounce
+        const out = recover(st, io, owed.why, owed.startStuck ? [{ name: "(owed drain-start)", ageMs: 0, isStart: true }] : []);
+        if (st.owedAfterReload === owed) owed.rounds = 0; // still the old one: the reload did not run; count again from here
+        return out;
+      }
+      return keep("ready", unmoved);
+    }
     owed.stage = "arm";
   }
   if (owed.stage === "arm") {
