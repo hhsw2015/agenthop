@@ -63,6 +63,26 @@ ACP 耦合面(退役/改写清单,grep `tern acp|cx.agents|agents.json|acp` 2026
 
 ## 4. 分期与派单(#1121 加速版;user「能不能加快推进」)
 
+**现状(2026-10-16 17:3x,与 `tui-herdr-parity.md` 一致)**:现网 0 件 TUI 能力生效 —— 装的仍是 `agenthop v0.6.1-bus.10` 与 10-15 的桥插件;全部等 bus.11 装机(`bus11-install-runbook.md`)。
+
+| 件 | owner | 分支 @ SHA | 状态 |
+|---|---|---|---|
+| Phase 0a/0b spike | Reserve | spike/tui-seat d323713 | 交付,协调者已收;报告只在 spike 分支,未并 main |
+| T1a 分类器对齐上游(22 manifest、engine v3、codex working overlay) | Model Gateway | feat/tui-classify-r6 a9e876e(r8) | 在审 |
+| T1b 窗口插件 screen 状态 + 读者 | Platform Dev | feat/tui-screen-state 362e673(r5) | **已并 main a21f9a5**;未装 |
+| T2 `agenthop_tui` list/ask/wait/transcript/start/stop | Platform Dev | feat/tui-seat-ops 9a47e25(r2) | 在审 |
+| T3 wake 门读 screen_state(裸 TUI 席可唤醒;blocked ⇒ S19) | Platform Dev | feat/tui-wake-screen 34a6450 | 在审 |
+| T3 roster v2 + tern-restore TUI + presence 修 | Infra Dev | feat/tui-t3 b152bfc(r1) | 在审 |
+| A r11 codex 主线程身份(探针:默认 codex TUI = daemon 路径,无需新 parent 类) | Platform Dev | fix/codex-main-thread-identity fbf9c35 | 在审 |
+| bus.11(presence/L3/L4) | Infra Dev | fix/dispatcher-env-and-presence 38edec3 | 在审 |
+| T4 L8 继任起 TUI 协调者块 | Infra Dev | — | 未开工(T3 后) |
+| 切席 runbook | 协调者 | tui-seat-switch-runbook.md | 已并 main 229ce81 |
+| bus.11 装机 runbook | Platform Dev | bus11-install-runbook.md | 已并 main ae92dda |
+| Phase 3 切席 | 协调者 + 各席 | — | **2/8**:Reserve(块 38306813313026)、Platform Dev(块 40110699577346,PROGRESS #1168);余 Infra Dev、Model Gateway、OpenDot Dev、两审查席(A r11 后)、协调者(最后,T4) |
+| Phase 4 删 `tern acp` 路径 | — | — | 未开始(三夜 soak 后) |
+
+下表为立项时的分期计划(保留原文,供对照)。
+
 原则:**TUI 席位从第一天就能干活**(耐久箱 + bus + 席位自己的 MCP 与壳无关),T1/T2 只加观测与控制 ⇒ 切席不等 T1/T2;Phase 0 的 argv/presence 答案分钟级可得,不等 1h 真值率;并行度拉满(Model Gateway 空闲入列)。
 
 | 阶段 | 内容 | owner | 门 |
