@@ -47,12 +47,17 @@ Rollback: `git reset --hard ORIG_HEAD` before anything is pushed.
 
 ## 2. Version
 
+There are two version files. `agenthop --version` prints `packages/bus/src/version.ts`; `packages/cli/src/version.ts` is the CLI
+package's own. Change both, or step 3 builds a binary that still says bus.10 (found on install day, 2026-10-16).
+
 ```bash
-cd $R && sed -i '' 's/0.6.1-bus.10/0.6.1-bus.11/' packages/cli/src/version.ts && cat packages/cli/src/version.ts
-git commit -qam "chore: version 0.6.1-bus.11" && git log -1 --format='%h %s'
+cd $R && for f in packages/cli/src/version.ts packages/bus/src/version.ts; do sed -i '' 's/0.6.1-bus.10/0.6.1-bus.11/' $f; echo "$f: $(cat $f)"; done
+git grep -n "0.6.1-bus.10" -- 'packages/*/src/version.ts'; echo "old version left: rc=$?"
+git commit -q -m "chore: version 0.6.1-bus.11" -- packages/cli/src/version.ts packages/bus/src/version.ts && git log -1 --format='%h %s'
 ```
 
-Expect: `export const version = "0.6.1-bus.11";` and the commit line.
+Expect: both files print `export const version = "0.6.1-bus.11";`, `old version left: rc=1` (no match), and the commit line. The
+commit names its two files, so nothing else in the tree (for example files left by an earlier build) goes into it.
 
 ## 3. Build
 
@@ -63,7 +68,8 @@ cmp -s dist/agenthop-macos-arm64 ~/.local/bin/agenthop; echo "cmp rc=$?"
 ```
 
 Expect: the build ends without an error; `--version` prints `agenthop v0.6.1-bus.11 (with session bus)`; `cmp rc=1` (the new binary
-differs from the installed one). `rc=0` ⇒ nothing changed, stop and check the version step.
+differs from the installed one). `rc=0` ⇒ nothing changed, stop and check the version step. `--version` still printing `bus.10` ⇒
+`packages/bus/src/version.ts` was not changed: go back to step 2.
 
 The build also regenerates `packages/cli/src/presence-text.ts` (the presence daemon bundle that `install` writes) and the skill text.
 
