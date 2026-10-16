@@ -88,7 +88,7 @@ import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
 import { realTernSpawn, cleanTernEnv } from "../packages/bus/src/swarm/tern-env.js";
 import { initialWatchState, judgeProgress, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, roleBoxOwned, agentAmong, ROLE_BOX_BUDGET_MS, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
-import { parsePs, resolveAgentPid3, budgetedExactArgv, type Resolved } from "../packages/bus/src/swarm/seat-presence.js";
+import { parsePs, resolveAgentPid3, budgetedExactArgv, safeSpawnSync, type Resolved } from "../packages/bus/src/swarm/seat-presence.js";
 import { ternInjectCommands } from "../packages/bus/src/swarm/tern-wake.js";
 import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, bridgeHome, bridgeScriptEnv, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
@@ -1548,7 +1548,7 @@ async function main(): Promise<void> {
         if (live !== null) {
           // one monotonic deadline for ps + every exact-argv query (ROLE_BOX_BUDGET_MS); past it ⇒ unknown ⇒ not credited
           const deadline = performance.now() + ROLE_BOX_BUDGET_MS; const mono = () => performance.now();
-          const ps = spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8", timeout: ROLE_BOX_BUDGET_MS });
+          const ps = safeSpawnSync("ps", ["axo", "pid=,ppid=,command="], deadline - mono());
           const rows = ps.status === 0 && mono() <= deadline ? parsePs(ps.stdout) : null;
           const exact = budgetedExactArgv(deadline, mono);
           const agent = rows === null ? "unknown" as const
@@ -1580,9 +1580,11 @@ async function main(): Promise<void> {
   /** One tern call with an explicit timeout (the remaining budget): the same cleaned env as realTernSpawn (L3). */
   const ternEnvPW = cleanTernEnv(process.env); const ternBinPW = ternEnvPW.TERN_BIN || "tern";
   const ternTimed = (args: string[], timeoutMs: number): { ok: boolean; stdout: string; timedOut: boolean } => {
-    const r = spawnSync(ternBinPW, args, { encoding: "utf8", timeout: Math.max(1, timeoutMs), env: ternEnvPW });
-    const timedOut = (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" || r.signal === "SIGTERM";
-    return { ok: !r.error && r.status === 0, stdout: r.stdout || "", timedOut };
+    // integer timeout ≥ 1ms (a fractional or exhausted remainder never reaches spawnSync); a refused budget or a thrown spawn is
+    // treated as "did not finish in time" — never an exception that aborts the whole round
+    const r = safeSpawnSync(ternBinPW, args, timeoutMs, { env: ternEnvPW });
+    if (r.error) log(`progress-watch: tern ${args[0]} spawn error: ${r.error}`);
+    return { ok: r.status === 0, stdout: r.stdout, timedOut: r.timedOut || r.refused || !!r.error };
   };
   /** The coordinator block, within BLOCK_BUDGET_MS for the whole lookup (ls + one process per block + one ps), every call bounded by
    *  what is left. The agent is found in the PROCESS TABLE under each block's root (exact argv) — never from the presence .pid file. */
@@ -1597,9 +1599,8 @@ async function main(): Promise<void> {
     const exact = budgetedExactArgv(deadline, mono);
     const agentUnder = (root: number): Resolved => {
       if (rows === undefined) {
-        const left = deadline - mono();
-        if (left <= 0) return { kind: "unknown", why: "budget spent before ps" };
-        const ps = spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8", timeout: left });
+        const ps = safeSpawnSync("ps", ["axo", "pid=,ppid=,command="], deadline - mono());
+        if (ps.refused) return { kind: "unknown", why: "budget spent before ps" };
         rows = ps.status === 0 && mono() <= deadline ? parsePs(ps.stdout) : null;
       }
       return rows === null ? { kind: "unknown", why: "process table unreadable" } : resolveAgentPid3(root, sid!, "claude", rows, exact);

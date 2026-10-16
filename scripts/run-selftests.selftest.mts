@@ -145,7 +145,16 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
   writeFileSync(path.join(fakeHome, ".agenthop", "swarm", "roles", "coordinator.sid"), `${COORD}\n`);
   const ran = (root: string) => path.join(root, "ran.marker");
   const marker = (root: string, name: string, body: string) => writeFileSync(path.join(root, name), `import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nwriteFileSync(${JSON.stringify(ran(root))}, "x");\n${body}\n`);
+  // FXL-PATTERN-COVERAGE: the pure matcher on every layout (command word built at run time so this file stays clean)
+  const { killsByPattern } = await import("./run-selftests.mjs");
+  const KA = "kill" + "all";
+  const flagged = [`${PK} -f foo`, `sh -c "${PK} -9 -f foo"`, `${PK} -9f foo`, `${PK} -fx foo`, `${PK} --full foo`, `spawnSync("${PK}", ["-f", "x"])`,
+    `spawnSync("${PK}", ["-9", "-f", "x"])`, `spawnSync(\n  "${PK}",\n  [\n    "-9",\n    "-f",\n    "x",\n  ],\n)`, `${KA} node`];
+  const clean = [`${PK} -9 12345`, `spawnSync("${PK}", ["-9", "12345"])`, `process.kill(pid, "SIGKILL")`];
+  ok(flagged.every((x) => killsByPattern(x)), "lint matcher: every kill-by-pattern layout is flagged (incl. multi-line argv with -f after -9)");
+  ok(clean.every((x) => !killsByPattern(x)), "lint matcher: killing a specific pid is not flagged");
   const cases: Array<[string, string]> = [
+    ["kill-by-pattern, multi-line argv with a signal first", 'spawnSync(\n  "' + PK + '",\n  ["-9",\n   "-f", "some-fixture-that-matches-nothing-zz"],\n);'],
     // the banned text is assembled at run time so THIS file stays clean under the same lint
     ["kill-by-pattern in a shell string", 'spawnSync("sh", ["-c", "' + PK + ' -f some-fixture-that-matches-nothing-zz"]);'],
     ["kill-by-pattern as spawn args", 'spawnSync("' + PK + '", ["-f", "some-fixture-that-matches-nothing-zz"]);'],

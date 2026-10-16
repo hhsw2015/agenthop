@@ -332,4 +332,44 @@ for (const bad of ["fail", "badjson", "nochild"] as const) {
   t("argv budget: three 2.4s queries under a 3s deadline ⇒ 2 started, the 3rd refused (over-budget)", starts.length === 2 && out[2] === "over-budget");
   t("argv budget: the second query was given only what was left", clock <= 3000);
 }
+
+// --- r5 PW-FRACTIONAL-TIMEOUT: the REAL default runners with a fractional monotonic clock never throw, never run unbounded ---
+{
+  const { spawnTimeout, safeSpawnSync } = await import("./seat-presence.js");
+  t("spawnTimeout: 2999.75 ⇒ 2999 (floored)", spawnTimeout(2999.75) === 2999);
+  t("spawnTimeout: 0.4 / 0 / negative / NaN ⇒ refused (never 0 = unbounded)", [0.4, 0, -5, NaN].every((x) => spawnTimeout(x) === null));
+  const r = safeSpawnSync("true", [], 2999.75);
+  t("safeSpawnSync: a fractional budget runs (no ERR_OUT_OF_RANGE)", r.status === 0 && !r.error);
+  const r0 = safeSpawnSync("sleep", ["5"], 0.5);
+  t("safeSpawnSync: < 1ms left ⇒ refused, nothing spawned", r0.refused && r0.status === null);
+  const r1 = safeSpawnSync("sleep", ["5"], 300.6); // real timeout, real process
+  t("safeSpawnSync: a real call cut at its (floored) timeout ⇒ timedOut", r1.timedOut && r1.status === null);
+  // the default argv reader under a fractional deadline: real budgetedExactArgv + real realExactArgv runner, monotonic clock with fractions
+  let clk = 0.25;
+  const ex = budgetedExactArgv(2999.75, () => clk);
+  let threw = false; let out: unknown;
+  try { out = ex(process.pid); } catch { threw = true; }
+  t("budgetedExactArgv: real default runner with a fractional remainder ⇒ no throw, a real answer", !threw && out !== "over-budget" && (out === null || typeof out === "object"));
+  clk = 2999.5; // 0.25ms left
+  t("budgetedExactArgv: a sub-millisecond remainder ⇒ over-budget (not started)", ex(process.pid) === "over-budget");
+}
+// --- r5 PW-INVALID-ROOT: pid 0 / negative / 1 / missing child ⇒ unknown ⇒ HOLD; never a whole-machine search ---
+{
+  const SIDR = "fc0c0c0c-1111-4222-8333-444444444444";
+  // a coordinator running ELSEWHERE (under launchd, pid 1): a search from root 0/1 would find it
+  const rows = parsePs3([`1 0 launchd`, `500 1 claude stream-json --session-id=${SIDR}`, `10 1 tern acp claude`, `11 10 sleep`].join("\n"));
+  const ex = (p: number) => (p === 500 ? { exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", `--session-id=${SIDR}`] } : { exe: "/bin/sleep", argv: ["sleep"] });
+  for (const root of [0, -3, 1]) t(`resolver3: root ${root} ⇒ unknown, not the coordinator elsewhere`, resolveAgentPid3(root, SIDR, "claude", rows, ex).kind === "unknown");
+  t("resolver3: a real root (10) ⇒ none (positive control: the elsewhere-coordinator is not under it)", resolveAgentPid3(10, SIDR, "claude", rows, ex).kind === "none");
+  for (const child of [{ pid: 0 }, { pid: -1 }, { pid: 1 }, {}]) {
+    const tern = (a: string[]) => a[0] === "ls" ? { ok: true, stdout: JSON.stringify({ sessions: [{ tabs: [{ blocks: [{ id: 100, live: true }] }] }] }) } : { ok: true, stdout: JSON.stringify({ child }) };
+    const r = findCoordinatorBlock(SIDR, tern, (root) => resolveAgentPid3(root, SIDR, "claude", rows, ex));
+    t(`locator: block child ${JSON.stringify(child)} ⇒ HOLD, no block`, "none" in r && /HOLD/.test(r.none));
+  }
+  const ok10 = (a: string[]) => a[0] === "ls" ? { ok: true, stdout: JSON.stringify({ sessions: [{ tabs: [{ blocks: [{ id: 100, live: true }] }] }] }) } : { ok: true, stdout: JSON.stringify({ child: { pid: 10 } }) };
+  const rowsHit = parsePs3([`10 1 tern acp claude`, `11 10 claude stream-json --session-id=${SIDR}`].join("\n"));
+  const exHit = () => ({ exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", `--session-id=${SIDR}`] });
+  const rp = findCoordinatorBlock(SIDR, ok10, (root) => resolveAgentPid3(root, SIDR, "claude", rowsHit, exHit));
+  t("locator: a valid root with the coordinator under it ⇒ that block (positive control)", "block" in rp && rp.block === "100");
+}
 console.log("PASS progress-watch");

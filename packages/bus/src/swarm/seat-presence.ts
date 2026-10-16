@@ -278,6 +278,8 @@ export function pidAlive(pid: number): boolean {
 export type Resolved = { kind: "match"; pid: number } | { kind: "none" } | { kind: "unknown"; why: string } | { kind: "ambiguous" };
 export function resolveAgentPid3(rootPid: number, sid: string, tool: SeatTool, rows: PsRow[],
   exact: (pid: number) => ReturnType<ExactArgv> | "over-budget"): Resolved {
+  // PW-INVALID-ROOT: never search from pid 0 / negative / 1 (that is every process on the machine)
+  if (!Number.isSafeInteger(rootPid) || rootPid <= 1) return { kind: "unknown", why: `invalid root pid ${rootPid}` };
   const kids = new Map<number, PsRow[]>();
   for (const r of rows) kids.set(r.ppid, [...(kids.get(r.ppid) ?? []), r]);
   let cands: PsRow[];
@@ -303,12 +305,32 @@ export function resolveAgentPid3(rootPid: number, sid: string, tool: SeatTool, r
  *  took; once the deadline has passed the query is not started ("over-budget"). `deadlineMs` is a performance.now()-style monotonic
  *  value; `now` is injectable for tests. */
 export function budgetedExactArgv(deadlineMs: number, now: () => number,
-  run: (bin: string, args: string[], timeoutMs: number) => string | null = (bin, args, t) => { const r = spawnSync(bin, args, { encoding: "utf8", timeout: Math.max(1, t) }); return r.status === 0 ? r.stdout : null; },
+  run: (bin: string, args: string[], timeoutMs: number) => string | null = (bin, args, t) => { const r = safeSpawnSync(bin, args, t); return r.status === 0 ? r.stdout : null; },
 ): (pid: number) => ReturnType<ExactArgv> | "over-budget" {
   return (pid) => {
     const left = deadlineMs - now();
-    if (left <= 0) return "over-budget";
+    if (spawnTimeout(left) === null) return "over-budget"; // < 1ms left (or a fraction of one) ⇒ never start a query
     const res = realExactArgv((bin, args) => run(bin, args, left))(pid);
     return now() > deadlineMs ? "over-budget" : res; // finished past the deadline ⇒ not used
   };
+}
+
+/** A spawnSync timeout from a remaining budget (PW-FRACTIONAL-TIMEOUT): Node takes only a non-negative INTEGER, and 0 means "no
+ *  timeout at all". Fractional performance.now() remainders are floored (conservative); anything below 1ms is refused (null) so an
+ *  exhausted budget never becomes an unbounded call. Pure. */
+export function spawnTimeout(leftMs: number): number | null {
+  if (!Number.isFinite(leftMs)) return null;
+  const t = Math.floor(leftMs);
+  return t >= 1 ? t : null;
+}
+/** spawnSync that never throws and never runs unbounded: a refused budget or a thrown spawn ⇒ { refused | error }. */
+export function safeSpawnSync(bin: string, args: string[], leftMs: number, extra: { env?: NodeJS.ProcessEnv } = {}):
+  { status: number | null; stdout: string; timedOut: boolean; refused: boolean; error?: string } {
+  const t = spawnTimeout(leftMs);
+  if (t === null) return { status: null, stdout: "", timedOut: false, refused: true };
+  try {
+    const r = spawnSync(bin, args, { encoding: "utf8", timeout: t, ...(extra.env ? { env: extra.env } : {}) });
+    const timedOut = (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
+    return { status: r.error ? null : r.status, stdout: r.stdout || "", timedOut, refused: false, ...(r.error && !timedOut ? { error: String(r.error.message) } : {}) };
+  } catch (e) { return { status: null, stdout: "", timedOut: false, refused: false, error: e instanceof Error ? e.message : String(e) }; }
 }

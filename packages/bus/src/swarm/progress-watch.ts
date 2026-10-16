@@ -290,7 +290,9 @@ export function findCoordinatorBlock(
     if (!pr.ok) return { none: `tern process ${id} did not answer — HOLD (cannot prove uniqueness)` };
     let root: unknown;
     try { root = (JSON.parse(pr.stdout) as { child?: { pid?: unknown } }).child?.pid; } catch { return { none: `tern process ${id} unparseable — HOLD` }; }
-    if (!Number.isSafeInteger(root)) return { none: `block ${id} has no readable child — HOLD` };
+    // PW-INVALID-ROOT: a root must be a real process id (> 1). pid 0 / negative / launchd would turn the search into a whole-machine
+    // tree walk and could return a block for a coordinator running elsewhere ⇒ HOLD
+    if (!Number.isSafeInteger(root) || (root as number) <= 1) return { none: `block ${id} has no valid child pid (${JSON.stringify(root)}) — HOLD` };
     const a = agentUnder(root as number);
     // UNKNOWN (an argv we could not read, or the budget ended first) ⇒ HOLD: that block might run the coordinator too
     if (a.kind === "unknown") return { none: `${a.why} under block ${id} — HOLD` };

@@ -112,9 +112,25 @@ function runOne(bin, absPath, cwd, timeoutMs, graceMs) {
  *  roles/coordinator.sid). Fixtures use made-up sids. FAIL-CLOSED (r4): if the live-sid inventory or any selftest's source cannot be
  *  read, the check is incomplete and NOTHING runs. Every selftest is checked, the runner's own included — negative fixtures build the
  *  banned text at run time (string concatenation) instead of holding it literally. Pure over (text, liveSids). */
+/** Does `text` kill processes by pattern? Recognised by command name + argument SET, not by layout (FXL-PATTERN-COVERAGE): any
+ *  pkill / pgrep-into-kill / killall invocation — as shell text or as a spawn argv array, on one line or across several — whose
+ *  arguments include a full-command-line match flag (-f, or a combined flag like -9f / -fx) or a bare-name match (killall). The
+ *  scan looks at each occurrence of the command word and the ~400 characters after it, newlines included. */
+export function killsByPattern(text) {
+  const re = /\b(pkill|killall)\b/g; let m;
+  while ((m = re.exec(text)) !== null) {
+    const tail = text.slice(m.index, m.index + 400);
+    if (m[1] === "killall") return true; // matches by name by definition
+    // the arguments up to the end of this invocation: a shell line ends at a newline / ; / && ; an argv array ends at "]"
+    const arr = /^pkill["']?\s*,\s*\[([^\]]*)\]/.exec(tail);
+    const args = arr ? (arr[1].match(/["']([^"']*)["']/g) ?? []).map((x) => x.slice(1, -1)) : tail.slice(5).split(/[\n;&|]/)[0].trim().split(/\s+/);
+    if (args.some((a) => /^-[A-Za-z0-9]*f[A-Za-z0-9]*$/.test(a) || a === "--full")) return true;
+  }
+  return false;
+}
 export function fixtureLint(text, liveSids) {
   const bad = [];
-  if (/\bpkill\b[^\n]*-f\b|["']pkill["']\s*,\s*\[\s*["']-f["']/.test(text)) bad.push("kills by pattern (pkill -f): match processes by the pid you started instead");
+  if (killsByPattern(text)) bad.push("kills by pattern (pkill -f / killall): match processes by the pid you started instead");
   for (const sid of liveSids) if (sid && text.includes(sid)) bad.push(`names the live session ${sid}: use a made-up sid`);
   return bad;
 }
@@ -183,4 +199,7 @@ async function main() {
   if (failures.length || discoveryErrors.length) process.exitCode = 1;
 }
 
-main().catch((e) => { console.error(`run-selftests: unexpected: ${e instanceof Error ? e.stack : e}`); process.exitCode = 1; });
+// run only when executed directly (importing the module for its pure helpers, e.g. in a selftest, must not start a whole run)
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((e) => { console.error(`run-selftests: unexpected: ${e instanceof Error ? e.stack : e}`); process.exitCode = 1; });
+}
