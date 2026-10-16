@@ -331,9 +331,14 @@ clock = clock + 5000                   -- 5s pass and the pending callback is NE
 commands["mirror"](cx)                 -- the 5s command sweep
 ck("r9: a stalled chain (callback never delivered) is reported timer=overdue, not running", (files[AGENTS] or ""):find('"timer":"overdue"', 1, true) ~= nil)
 ck("r9: that sweep restarts the accelerator (a new chain is pending)", #timers == pendingNow + 1)
+local DIAGF = "/h/.agenthop/tern-panes/diag.json"
+ck("L5: the restart is recorded in diag.json (event timer-rearm, reason overdue, this vm)", (files[DIAGF] or ""):find('"event":"timer-rearm"', 1, true) ~= nil
+  and (files[DIAGF] or ""):find('"reason":"overdue"', 1, true) ~= nil and (files[DIAGF] or ""):find('"vm":"', 1, true) ~= nil)
 for i = #timers - 1, 1, -1 do table.remove(timers, i) end -- the stalled callback never fires; keep only the fresh one
+files[DIAGF] = nil
 commands["mirror"](cx)
 ck("r9: after the restart the next sweep reports running again", (files[AGENTS] or ""):find('"timer":"running"', 1, true) ~= nil)
+ck("L5: a mirror while the chain is running writes NO diag (only real restarts are recorded)", files[DIAGF] == nil)
 
 -- ---- r13 BTF-R10-P2-1: after an overdue restart, the OLD chain's callback arriving late must not start a second chain ----
 for i = #timers, 1, -1 do table.remove(timers, i) end -- every pending callback lost

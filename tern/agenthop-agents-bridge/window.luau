@@ -295,10 +295,18 @@ tern.command({ id = "arm-scan", title = "agenthop bridge: list patrol tasks (rea
 tern.command({ id = "arm-cancel-next", title = "agenthop bridge: cancel one extra patrol task (keeps the newest)", run = function() ensure(); armCancelNext() end })
 -- `arm` (compatibility: #1033's sweep and agenthop_tern's recovery call it) = arm-scan (read-only). One tern.carly call per hook.
 tern.command({ id = "arm", title = "agenthop bridge: arm step 1 = list patrol tasks (then arm-cancel-next extras / arm-schedule.sh)", run = function() ensure(); armScan() end })
+-- L5: every chain restart is recorded in diag.json (last one wins; the sweep's orphan pass ages the file out), so "Tern stopped
+-- delivering timer callbacks" is readable after the fact. A disabled `mirror` COMMAND hook cannot be healed from inside the VM —
+-- this command then never runs; recovery from that is the sweep's reload (tern-bridge-sweep.ts, L5 owed-ready re-reload).
+local DIAG = CTL .. "/diag.json"
 tern.command({ id = "mirror", title = "agenthop bridge: mirror now", run = function(cx)
   local rep = timerReport()
   mirrorTick(cx) -- publishes the CURRENT timer state (stopped-late / overdue is reported, then the restart below takes effect)
   if rep ~= "running" then -- the accelerator stopped itself or stalled: restart ONE fresh chain (a stalled one never re-fires)
+    pcall(function()
+      tern.fs.write(DIAG, tern.json.encode({ ts = tern.now(), vm = VM_ID, event = "timer-rearm", reason = rep, tick = ticks,
+        timer_fired_at = timerFiredAt }))
+    end)
     timerGen = timerGen + 1 -- supersede the old chain: its pending callback (if Tern ever delivers it) is dropped
     timerState = "running"
     timerDue = nil

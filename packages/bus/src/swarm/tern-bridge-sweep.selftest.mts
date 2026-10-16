@@ -340,7 +340,75 @@ t("control root: explicit AGENTHOP_BRIDGE_HOME wins", bridgeHome({ AH_HOME: "/tm
   for (let i = 0; i < 4; i++) { w.clock += 6000; tick(st, b); }
   t("unknown: only the mirror probe was attempted", w.calls.every((c) => c.endsWith(".mirror")));
   t("unknown: never reload", reloads(w) === 0);
-  t("unknown: one line per tick", w.logs.length === 4 && w.logs.every((l) => /UNKNOWN/.test(l)));
+  t("unknown: one line per probe; the 4th tick (6s later) is inside the backoff and probes nothing", w.logs.length === 3 && w.logs.every((l) => /UNKNOWN/.test(l)) && mirrorCalls(w) === 3);
+}
+
+// --- L5: UNKNOWN backoff — after 3 in a row, at most one probe (and one line) per 60s; recovery says so and returns to 5s ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  w.ternUp = false; w.calls = []; w.logs = [];
+  for (let i = 0; i < 60; i++) { w.clock += 5000; tick(st, b); } // 5 minutes of 5s ticks with tern timing out
+  const probes = mirrorCalls(w);
+  t("L5 backoff: 5 min of tern timeouts ⇒ 3 fast probes + one per 60s (≤ 8 probes, not 60)", probes >= 6 && probes <= 8);
+  t("L5 backoff: logs ≤ 1 line per minute after the first three", w.logs.length === probes && w.logs.length <= 8);
+  t("L5 backoff: the 3rd line announces the backoff", /3 in a row, probing once per 60s/.test(w.logs[2] ?? ""));
+  w.ternUp = true; w.calls = []; w.logs = [];
+  w.clock += 60_000; tick(st, b);
+  t("L5 backoff: first answer ends the backoff with one line", w.logs.some((l) => /answering again after \d+ UNKNOWN/.test(l)));
+  w.calls = []; w.clock += 5000; tick(st, b);
+  t("L5 backoff: back to the 5s cadence", mirrorCalls(w) === 1);
+}
+
+// --- L5: a reload that does not take (vm + tick frozen) ⇒ after 3 owed rounds and the 60s debounce, ONE more reload ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b); // arms vmA
+  w.mirrorAdvances = false; // the mirror command no longer moves the tick (hook disabled)
+  let reloadTakes = false;
+  w.onReload = () => { if (reloadTakes) { w.mirror = { tick: 1, vm: "vmB" }; w.mirrorAdvances = true; } };
+  w.calls = []; w.control = [];
+  w.clock += 6000; tick(st, b); // stall detected (>5s) ⇒ reload #1, which does NOT take
+  t("L5 owed: stall ⇒ reload #1", reloads(w) === 1 && st.owedAfterReload?.stage === "ready");
+  const ctl0 = w.control.length;
+  for (let i = 0; i < 5; i++) { w.clock += 5000; tick(st, b); } // 25s: owed rounds, debounce not passed
+  t("L5 owed: inside the 60s debounce, no second reload", reloads(w) === 1);
+  t("L5 owed: the unchanged owed state is audited ONCE, not once per tick", w.control.length - ctl0 === 1);
+  reloadTakes = true;
+  for (let i = 0; i < 8; i++) { w.clock += 5000; tick(st, b); } // past 60s since reload #1
+  t("L5 owed: after ≥3 owed rounds and the debounce ⇒ exactly one more reload", reloads(w) === 2);
+  t("L5 owed: that reload took ⇒ obligation discharged, armed on the new vm", st.owedAfterReload === null && st.armedVm === "vmB");
+  t("L5 owed: the extra reload is audited with its reason", w.control.some((l) => /did not take after \d+ rounds/.test(l)));
+  w.calls = []; for (let i = 0; i < 4; i++) { w.clock += 5000; tick(st, b); }
+  t("L5 owed: healthy afterwards — the tick advances and no further reload", reloads(w) === 0);
+}
+
+// --- L5 gate (coordinator): the timer chain dies AND the mirror command's hook is disabled ⇒ tick recovers within 2 sweep rounds
+//     of the stall being detectable, through one reload (no prior reload, so the debounce does not apply) ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b); // healthy, armed on vmA
+  w.mirrorAdvances = false; // timer killed + mirror hook disabled: nothing moves the tick
+  w.onReload = () => { w.mirror = { tick: 1, vm: "vmB" }; w.mirrorAdvances = true; };
+  w.calls = [];
+  let rounds = 0; let recovered = false;
+  const startTick = w.mirror!.tick;
+  for (let i = 0; i < 4 && !recovered; i++) {
+    w.clock += 5000; tick(st, b); rounds++;
+    recovered = w.mirror!.vm === "vmB" && w.mirror!.tick > 1;
+  }
+  t("L5 gate: killed timer ⇒ the tick is moving again within 2 rounds after the stall threshold", recovered && rounds <= 2 && startTick > 0);
+  t("L5 gate: that took exactly one reload", reloads(w) === 1);
+}
+
+// --- L5: the unhealthy-but-debounced line is rate-limited too ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  st.lastReloadMs = w.clock; // a reload just happened elsewhere
+  w.mirrorAdvances = false; w.logs = [];
+  for (let i = 0; i < 10; i++) { w.clock += 5000; tick(st, b); }
+  t("L5: 'reload debounced' logged at most once per 60s window", w.logs.filter((l) => /reload debounced/.test(l)).length === 1);
 }
 
 // --- UNKNOWN: agents.json unreadable ⇒ no action ---
