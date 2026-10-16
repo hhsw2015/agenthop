@@ -45,14 +45,19 @@ export function parsePs(text: string): PsRow[] {
   return out;
 }
 
-function hasResume(argv: string[], sid: string): boolean {
-  return argv.some((a, i) => a === `--resume=${sid}` || (a === "--resume" && argv[i + 1] === sid));
+/** The seat's own id on a claude argv, as whole elements: `--resume <sid>` / `--resume=<sid>` (a resumed seat) or `--session-id <sid>`
+ *  / `--session-id=<sid>` (a FRESH seat: Tern's ACP adapter starts a new session with an explicit id — every seat rotated by the
+ *  lifecycle runbook runs this way and has no --resume). Either is an exact, kernel-reported statement of which session the process
+ *  is; nothing weaker (a substring, a ps text split) is accepted. */
+function namesSession(argv: string[], sid: string): boolean {
+  return argv.some((a, i) => a === `--resume=${sid}` || a === `--session-id=${sid}`
+    || ((a === "--resume" || a === "--session-id") && argv[i + 1] === sid));
 }
 
 /** The agent pid under a block's `tern acp` root, or null when not exactly one candidate. The tree comes from `rows`; every
  *  candidate is then identified from its EXACT argv and executable (`exact`): claude ⇒ the executable's argv[0] basename is
- *  "claude" (the native build runs as a versioned file but keeps argv[0] = "claude") AND `stream-json` and `--resume=<sid>` /
- *  `--resume <sid>` are whole, separate elements; codex ⇒ a direct child whose executable basename is "node" and whose argv[1] is
+ *  "claude" (the native build runs as a versioned file but keeps argv[0] = "claude") AND `stream-json` and the seat's id
+ *  (`--resume` or, for a fresh seat, `--session-id`, either form) are whole, separate elements; codex ⇒ a direct child whose executable basename is "node" and whose argv[1] is
  *  a path inside /@agentclientprotocol/codex-acp/. An unreadable exact argv is UNKNOWN: it never matches, and if it might have been
  *  the agent the answer is null (never a guess). */
 export function resolveAgentPid(rootPid: number, sid: string, tool: SeatTool, rows: PsRow[], exact: ExactArgv): number | null {
@@ -73,7 +78,7 @@ export function resolveAgentPid(rootPid: number, sid: string, tool: SeatTool, ro
       if (!r.argv.join(" ").includes(sid)) return false; // cheap prefilter only; the decision is on the exact argv
       const x = exact(r.pid);
       if (x === null) { unknown = true; return false; }
-      return path.basename(x.argv[0] ?? "") === "claude" && x.argv.includes("stream-json") && hasResume(x.argv, sid);
+      return path.basename(x.argv[0] ?? "") === "claude" && x.argv.includes("stream-json") && namesSession(x.argv, sid);
     });
     if (unknown) return null;
   } else {

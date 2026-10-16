@@ -172,4 +172,37 @@ void mkdirSync;
 }
 
 
+// ---- fresh seats (rotated by the lifecycle runbook, observed live 2026-10-16): no --resume; Tern's ACP adapter passes --session-id ----
+{
+  const F = "8a53f4e8-c756-4302-a8dd-a9b6427c8fca";
+  const fps = parsePs([
+    `82831 14473 /Applications/Tern.app/Contents/MacOS/tern acp claude --mode bypassPermissions --model cpa-local/claude-opus-5-5[1m]`,
+    `83136 82831 /Users/x/.nvm/versions/node/v20/bin/node /Users/x/Library/Application Support/Tern/agents/claude/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js`,
+    `83143 83136 claude --output-format stream-json --verbose --input-format stream-json --permission-mode=default --include-partial-messages --session-id=${F}`,
+    `83496 83143 /Users/x/.local/bin/agenthop mcp`,
+  ].join("\n"));
+  const fex: Record<number, { exe: string; argv: string[] }> = {
+    83136: { exe: "/Users/x/.nvm/versions/node/v20/bin/node", argv: ["node", "/Users/x/Library/Application Support/Tern/agents/claude/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"] },
+    83143: { exe: "/Users/x/.local/share/claude/versions/2.1.293", argv: ["claude", "--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--permission-mode=default", "--include-partial-messages", `--session-id=${F}`] },
+    83496: { exe: "/Users/x/.local/bin/agenthop", argv: ["agenthop", "mcp"] },
+  };
+  const fx = (extra: Record<number, { exe: string; argv: string[] }> = {}) => (p: number) => extra[p] ?? fex[p] ?? null;
+  t("fresh seat: --session-id=<sid> (no --resume) resolves", resolveAgentPid(82831, F, "claude", fps, fx()) === 83143);
+  t("fresh seat: --session-id <sid> as two arguments resolves", resolveAgentPid(82831, F, "claude", fps,
+    fx({ 83143: { exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", "--session-id", F] } })) === 83143);
+  t("fresh seat: ANOTHER seat's --session-id is not this seat", resolveAgentPid(82831, A, "claude", fps, fx()) === null);
+  t("fresh seat: a suffixed id is not the seat", resolveAgentPid(82831, F, "claude", fps,
+    fx({ 83143: { exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", `--session-id=${F}-x`] } })) === null);
+  t("fresh seat: no id at all on the argv ⇒ null (never guess from 'the only claude')", resolveAgentPid(82831, F, "claude",
+    parsePs([`82831 1 tern acp claude`, `83136 82831 node adapter`, `83143 83136 claude --output-format stream-json ${F}`].join("\n")),
+    fx({ 83143: { exe: "/x/claude", argv: ["claude", "--output-format", "stream-json"] } })) === null);
+  const two = parsePs([`82831 1 tern acp claude`, `83136 82831 node adapter`, `83143 83136 claude stream-json --session-id=${F}`,
+    `83144 83136 claude stream-json --session-id=${F}`].join("\n"));
+  t("fresh seat: two claude processes naming the same id ⇒ null", resolveAgentPid(82831, F, "claude", two, fx({
+    83143: { exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", `--session-id=${F}`] },
+    83144: { exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", `--session-id=${F}`] } })) === null);
+  t("fresh seat: the id inside ONE argument of a node -e is not the flag", resolveAgentPid(82831, F, "claude",
+    parsePs([`82831 1 tern acp claude`, `83136 82831 node adapter`, `83150 83136 claude stream-json --session-id=${F}`].join("\n")),
+    fx({ 83150: { exe: "/x/claude", argv: ["claude", `stream-json --session-id=${F}`] } })) === null);
+}
 console.log("all seat-presence selftests passed");
