@@ -116,6 +116,28 @@ function runOne(bin, absPath, cwd, timeoutMs, graceMs) {
  *  pkill / pgrep-into-kill / killall invocation — as shell text or as a spawn argv array, on one line or across several — whose
  *  arguments include a full-command-line match flag (-f, or a combined flag like -9f / -fx) or a bare-name match (killall). The
  *  scan looks at each occurrence of the command word and the ~400 characters after it, newlines included. */
+/** The words of ONE shell command line, with ordinary quoting decoded: '…' literal, "…" with backslash escapes, a bare backslash
+ *  escaping the next character (FXL-PATTERN-COVERAGE r7: `pkill "-f" x` / `pkill '--full' x` must reach the option check as -f /
+ *  --full). Stops at an unquoted newline / ; / & / | (end of that command). Not a shell: no expansion, no globbing. Pure. */
+export function shellWords(text) {
+  const words = []; let cur = null; let i = 0;
+  const push = () => { if (cur !== null) { words.push(cur); cur = null; } };
+  while (i < text.length) {
+    const c = text[i];
+    if (c === "'") { const j = text.indexOf("'", i + 1); cur = (cur ?? "") + (j < 0 ? text.slice(i + 1) : text.slice(i + 1, j)); i = j < 0 ? text.length : j + 1; continue; }
+    if (c === '"') {
+      i++; cur = cur ?? "";
+      while (i < text.length && text[i] !== '"') { if (text[i] === "\\" && i + 1 < text.length) { cur += text[i + 1]; i += 2; } else { cur += text[i]; i++; } }
+      i++; continue;
+    }
+    if (c === "\\" && i + 1 < text.length) { cur = (cur ?? "") + text[i + 1]; i += 2; continue; }
+    if (c === "\n" || c === ";" || c === "&" || c === "|" || c === "`" || c === ")") break;
+    if (/\s/.test(c)) { push(); i++; continue; }
+    cur = (cur ?? "") + c; i++;
+  }
+  push();
+  return words;
+}
 export function killsByPattern(text) {
   const re = /\b(pkill|killall)\b/g; let m;
   while ((m = re.exec(text)) !== null) {
@@ -123,7 +145,7 @@ export function killsByPattern(text) {
     if (m[1] === "killall") return true; // matches by name by definition
     // the arguments up to the end of this invocation: a shell line ends at a newline / ; / && ; an argv array ends at "]"
     const arr = /^pkill["']?\s*,\s*\[([^\]]*)\]/.exec(tail);
-    const args = arr ? (arr[1].match(/["']([^"']*)["']/g) ?? []).map((x) => x.slice(1, -1)) : tail.slice(5).split(/[\n;&|]/)[0].trim().split(/\s+/);
+    const args = arr ? (arr[1].match(/["']([^"']*)["']/g) ?? []).map((x) => x.slice(1, -1)) : shellWords(tail.slice(5));
     if (args.some((a) => /^-[A-Za-z0-9]*f[A-Za-z0-9]*$/.test(a) || a === "--full")) return true;
   }
   return false;
