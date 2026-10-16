@@ -383,6 +383,30 @@ t("control root: explicit AGENTHOP_BRIDGE_HOME wins", bridgeHome({ AH_HOME: "/tm
   t("L5 owed: healthy afterwards — the tick advances and no further reload", reloads(w) === 0);
 }
 
+// --- L5 (Second Voice f77230c): the retry reload FAILS ⇒ the original obligation (baseline + startStuck) survives; when the bridge
+//     comes back on its own, the owed arm + drain + drain-start still run on that tick ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b); // armed on vmA
+  w.mirrorAdvances = false;
+  w.reqs = [{ name: "s.json", ageMs: 99_000, isStart: true }]; // a stuck start ⇒ the owed chain must end with drain-start
+  w.clock += 6000; tick(st, b); // reload #1 (does not take)
+  t("L5 keep: setup — reload #1 owed at ready with startStuck", reloads(w) === 1 && st.owedAfterReload?.stage === "ready" && st.owedAfterReload.startStuck === true);
+  const original = st.owedAfterReload;
+  // the retry reload will fail: tern answers the mirror but `plugin reload` times out
+  const realTern = b.tern;
+  b.tern = (args) => (args.join(" ") === "plugin reload" ? (w.calls.push("plugin reload"), { ok: false, detail: "ETIMEDOUT" }) : realTern(args));
+  for (let i = 0; i < 13; i++) { w.clock += 5000; tick(st, b); } // > 60s: the retry fires and fails
+  t("L5 keep: the retry reload was attempted and failed", reloads(w) === 2);
+  t("L5 keep: the ORIGINAL obligation survives the failed retry (same object, startStuck kept)", st.owedAfterReload === original && st.owedAfterReload?.startStuck === true);
+  // the bridge recovers on its own (new vm), tern reload works again
+  b.tern = realTern;
+  w.mirror = { tick: 1, vm: "vmC" }; w.mirrorAdvances = true;
+  w.calls = [];
+  w.clock += 5000; tick(st, b);
+  t("L5 keep: on the recovery tick the owed arm + drain + drain-start run (not 'reload-debounced')", has(w, ".drain-start") && has(w, ".drain") && st.owedAfterReload === null && st.armedVm === "vmC");
+}
+
 // --- L5 gate (coordinator): the timer chain dies AND the mirror command's hook is disabled ⇒ tick recovers within 2 sweep rounds
 //     of the stall being detectable, through one reload (no prior reload, so the debounce does not apply) ---
 {

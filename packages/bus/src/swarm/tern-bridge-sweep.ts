@@ -296,9 +296,12 @@ function finishAfterReload(st: BridgeState, io: BridgeIO, now: Mirror): TickOutc
       const t = io.nowMs();
       if (owed.rounds + 1 >= OWED_READY_ROUNDS && t - st.lastReloadMs >= RELOAD_MIN_MS) {
         io.controlLog(`tern-bridge reload (${owed.why}): previous reload did not take after ${owed.rounds + 1} rounds (${unmoved}) — reloading again`);
-        st.owedAfterReload = null;
         st.lastReloadMs = t;
-        return recover(st, io, owed.why, owed.startStuck ? [{ name: "(owed drain-start)", ageMs: 0, isStart: true }] : []);
+        // the existing obligation (baseline, startStuck) stays in place until recover() REPLACES it with a new one — which it
+        // does only once a reload actually ran; a failed / unanswered reload leaves this one intact, retried after the debounce
+        const out = recover(st, io, owed.why, owed.startStuck ? [{ name: "(owed drain-start)", ageMs: 0, isStart: true }] : []);
+        if (st.owedAfterReload === owed) owed.rounds = 0; // still the old one: the reload did not run; count again from here
+        return out;
       }
       return keep("ready", unmoved);
     }
