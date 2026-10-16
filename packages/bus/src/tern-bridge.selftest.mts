@@ -125,7 +125,7 @@ t("drainActionFor: start ⇒ drain-start; others ⇒ drain", drainActionFor("sta
 
 // ---- placement model (#1034 r2): split beside the caller's seat (default) / how:"tab" new tab same session / no session ----
 t("checkRoleTitle: worker title \"<role> · <task>\" ok", checkRoleTitle("Platform Dev · bridge r8") === null && checkRoleTitle(undefined) === null)
-t("checkRoleTitle: sid-like rejected (uuid + 8-hex)", checkRoleTitle("worker 90b58f9c") !== null && checkRoleTitle("x 01a13284-d361-74a0-a026-ad56f1fdf355") !== null)
+t("checkRoleTitle: sid-like rejected (uuid + 8-hex)", checkRoleTitle("worker 90b58f9c") !== null && checkRoleTitle("x 0f1c7e57-d361-74a0-a026-ad56f1fdf355") !== null)
 t("checkRoleTitle: non-English / empty rejected", checkRoleTitle("审查") !== null && checkRoleTitle("  ") !== null)
 {
   const s = setup("answer");

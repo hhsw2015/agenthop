@@ -17,7 +17,7 @@ import { resolveWakePane, reachableTransports, inboxWakeStatus, wakeSession, typ
 let n = 0;
 const ok = (c: boolean, name: string) => { if (!c) throw new Error("FAILED: " + name); n++; console.log("ok  " + name); };
 const scratch = mkdtempSync(path.join(tmpdir(), "tern-wake-selftest-"));
-const SID = "aad02248-c76b-4a1a-b191-95da3f0bfb5a";
+const SID = "7e57f1c7-c76b-4a1a-b191-95da3f0bfb5a";
 const OTHER = "90b58f9c-5bac-4318-a996-2373c179d674";
 
 // A real-shaped `tern inspect --json` (fields as observed live 2026-10-15).
