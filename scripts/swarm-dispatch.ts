@@ -88,8 +88,8 @@ import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
 import { realTernSpawn, cleanTernEnv } from "../packages/bus/src/swarm/tern-env.js";
 import { appendEvidence, bridgeTickRecord, ownerRound, sampleRoleBox, type OwnerFact, shouldReportEvidenceFailure, commitEvidenceReport } from "../packages/bus/src/swarm/soak-evidence.js";
-import { initialWatchState, judgeProgress, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, roleBoxOwned, agentAmong, ROLE_BOX_BUDGET_MS, readBoxMails, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
-import { parsePs, resolveAgentPid3, budgetedExactArgv, safeSpawnSync, type Resolved } from "../packages/bus/src/swarm/seat-presence.js";
+import { initialWatchState, judgeProgress, roleBoxAgent, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, roleBoxOwned, agentAmong, ROLE_BOX_BUDGET_MS, readBoxMails, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
+import { parsePs, parsePsBudgeted, resolveAgentPid3, budgetedExactArgv, safeSpawnSync, type Resolved } from "../packages/bus/src/swarm/seat-presence.js";
 import { ternInjectCommands } from "../packages/bus/src/swarm/tern-wake.js";
 import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, bridgeHome, bridgeScriptEnv, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
@@ -1566,10 +1566,7 @@ async function main(): Promise<void> {
           // one monotonic deadline for ps + every exact-argv query (ROLE_BOX_BUDGET_MS); past it ⇒ unknown ⇒ not credited
           const deadline = performance.now() + ROLE_BOX_BUDGET_MS; const mono = () => performance.now();
           const ps = safeSpawnSync("ps", ["axo", "pid=,ppid=,command="], deadline - mono());
-          const rows = ps.status === 0 && mono() <= deadline ? parsePs(ps.stdout) : null;
-          const exact = budgetedExactArgv(deadline, mono);
-          const agent = rows === null ? "unknown" as const
-            : agentAmong(rows.filter((r) => r.argv.join(" ").includes("tern acp")).map((r) => r.pid), (root) => resolveAgentPid3(root, live, "claude", rows, exact));
+          const agent = ps.status === 0 && mono() <= deadline ? roleBoxAgent(ps.stdout, live, deadline, mono, budgetedExactArgv(deadline, mono)) : "unknown" as const;
           setOwner(agent === "unknown" ? { owner: null, reason: "coordinator process not provable this round" } : { owner: typeof agent === "number" });
           if (roleBoxOwned(live, agent)) owned.add(inboxDirName(COORDINATOR));
         }
@@ -1619,9 +1616,9 @@ async function main(): Promise<void> {
       if (rows === undefined) {
         const ps = safeSpawnSync("ps", ["axo", "pid=,ppid=,command="], deadline - mono());
         if (ps.refused) return { kind: "unknown", why: "budget spent before ps" };
-        rows = ps.status === 0 && mono() <= deadline ? parsePs(ps.stdout) : null;
+        rows = ps.status === 0 && mono() <= deadline ? parsePsBudgeted(ps.stdout, () => mono() > deadline) : null;
       }
-      return rows === null ? { kind: "unknown", why: "process table unreadable" } : resolveAgentPid3(root, sid!, "claude", rows, exact);
+      return rows === null ? { kind: "unknown", why: "process table unreadable" } : resolveAgentPid3(root, sid!, "claude", rows, exact, () => mono() > deadline);
     };
     const r = findCoordinatorBlock(sid, tern, agentUnder);
     return "block" in r && mono() > deadline ? { none: "lookup finished over budget — not typing" } : r;

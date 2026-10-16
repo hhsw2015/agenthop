@@ -37,12 +37,19 @@ export type SeatTool = "claude" | "codex";
  *  process tree — never to identify the agent (SP-ARGV: one `node -e "… stream-json --resume=<sid>"` argument would split into
  *  fake flags). Identification uses ExactArgv. Pure. */
 export function parsePs(text: string): PsRow[] {
+  return parsePsBudgeted(text, () => false) ?? [];
+}
+
+/** parsePs that checks `overBudget` every 256 lines (PW-SV-SWEEP-BUDGET r9: parsing is part of the bounded round); null = over. */
+export function parsePsBudgeted(text: string, overBudget: () => boolean): PsRow[] | null {
   const out: PsRow[] = [];
+  let n = 0;
   for (const line of text.split("\n")) {
+    if ((++n & 255) === 0 && overBudget()) return null;
     const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
     if (m) out.push({ pid: Number(m[1]), ppid: Number(m[2]), argv: m[3]!.trim().split(/\s+/) });
   }
-  return out;
+  return overBudget() ? null : out;
 }
 
 /** The seat's own id on a claude argv, as whole elements: `--resume <sid>` / `--resume=<sid>` (a resumed seat) or `--session-id <sid>`
@@ -276,16 +283,35 @@ export function pidAlive(pid: number): boolean {
  *  = more than one process is this seat. Same identity rules as resolveAgentPid (which keeps its old null contract for its other
  *  callers). `exact` may return "over-budget" (treated as unknown). */
 export type Resolved = { kind: "match"; pid: number } | { kind: "none" } | { kind: "unknown"; why: string } | { kind: "ambiguous" };
+/** The ppid → children index of one process table. Built ONCE per table and shared by every root resolved against it
+ *  (PW-SV-SWEEP-BUDGET r9: rebuilding it per root made a 1500-root round cost seconds of CPU between deadline checks). */
+export type PsIndex = { rows: PsRow[]; kids: Map<number, PsRow[]> };
+const INDEXES = new WeakMap<PsRow[], PsIndex>();
+export function psIndex(rows: PsRow[]): PsIndex {
+  let ix = INDEXES.get(rows);
+  if (!ix) {
+    const kids = new Map<number, PsRow[]>();
+    for (const r of rows) { const k = kids.get(r.ppid); if (k) k.push(r); else kids.set(r.ppid, [r]); }
+    ix = { rows, kids }; INDEXES.set(rows, ix);
+  }
+  return ix;
+}
+
+/** `overBudget` (optional) is checked during the walk and before every exact-argv read: true ⇒ unknown. */
 export function resolveAgentPid3(rootPid: number, sid: string, tool: SeatTool, rows: PsRow[],
-  exact: (pid: number) => ReturnType<ExactArgv> | "over-budget"): Resolved {
+  exact: (pid: number) => ReturnType<ExactArgv> | "over-budget", overBudget: () => boolean = () => false): Resolved {
   // PW-INVALID-ROOT: never search from pid 0 / negative / 1 (that is every process on the machine)
   if (!Number.isSafeInteger(rootPid) || rootPid <= 1) return { kind: "unknown", why: `invalid root pid ${rootPid}` };
-  const kids = new Map<number, PsRow[]>();
-  for (const r of rows) kids.set(r.ppid, [...(kids.get(r.ppid) ?? []), r]);
+  const { kids } = psIndex(rows);
   let cands: PsRow[];
   if (tool === "claude") {
     const desc: PsRow[] = []; const seen = new Set<number>(); const frontier = [rootPid];
-    while (frontier.length > 0) for (const c of kids.get(frontier.pop()!) ?? []) if (!seen.has(c.pid)) { seen.add(c.pid); desc.push(c); frontier.push(c.pid); }
+    let steps = 0;
+    while (frontier.length > 0) {
+      if ((++steps & 255) === 0 && overBudget()) return { kind: "unknown", why: "budget spent walking the process tree" };
+      for (const c of kids.get(frontier.pop()!) ?? []) if (!seen.has(c.pid)) { seen.add(c.pid); desc.push(c); frontier.push(c.pid); }
+    }
+    if (overBudget()) return { kind: "unknown", why: "budget spent walking the process tree" };
     cands = desc.filter((r) => r.argv.join(" ").includes(sid)); // cheap prefilter only; the decision is on the exact argv
   } else cands = (kids.get(rootPid) ?? []).filter((r) => r.argv.join(" ").includes("/@agentclientprotocol/codex-acp/"));
   const hits: number[] = [];

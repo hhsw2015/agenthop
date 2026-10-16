@@ -9,7 +9,7 @@ import path from "node:path";
 import { judgeProgress, planEmits, commitDelivery, commitResolved, initialWatchState, readProgressFacts, readBoxMails, writeL0Alert, findCoordinatorBlock,
   budgeted, roleBoxOwned, agentAmong, HANDOFF_STALE_SEC, CARLY_STALE_SEC, DEDUP_SEC, RETRY_SEC, BLOCK_BUDGET_MS, MAIL_SCAN_MAX, MAIL_BODY_MAX, type ProgressFacts, type Mail, type Budget } from "./progress-watch.js";
 import { spawnSync } from "node:child_process";
-import { resolveAgentPid3, budgetedExactArgv, parsePs as parsePs3, type Resolved } from "./seat-presence.js";
+import { resolveAgentPid3, budgetedExactArgv, psIndex, parsePs as parsePs3, type Resolved } from "./seat-presence.js";
 import { BEAT_STALE_SEC } from "./carly-sweep.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
@@ -376,5 +376,70 @@ for (const bad of ["fail", "badjson", "nochild"] as const) {
   const exHit = () => ({ exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", `--session-id=${SIDR}`] });
   const rp = findCoordinatorBlock(SIDR, ok10, (root) => resolveAgentPid3(root, SIDR, "claude", rowsHit, exHit));
   t("locator: a valid root with the coordinator under it ⇒ that block (positive control)", "block" in rp && rp.block === "100");
+}
+
+// PW-SV-SWEEP-BUDGET r9: the deadline covers the whole role-box scan (tree build + walk of every root), not only the argv reads.
+// Scale from the Second Voice counterexample: 1500 `tern acp` roots, 3000 ps rows, only the FIRST root holds the coordinator.
+{
+  const SIDC = "fb0b0b0b-1111-4222-8333-444444444444", OTHER = (i: number) => `fc${String(i).padStart(6, "0")}-1111-4222-8333-444444444444`;
+  const lines: string[] = [];
+  for (let i = 0; i < 1500; i++) {
+    const root = 10000 + i * 2, kid = root + 1;
+    lines.push(`${root} 1 /A/tern acp claude --mode bypassPermissions`);
+    lines.push(`${kid} ${root} claude --output-format stream-json --session-id=${i === 0 ? SIDC : OTHER(i)}`);
+  }
+  const rowsBig = parsePs3(lines.join("\n"));
+  const exOk = (pid: number) => ({ exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", `--session-id=${pid === 10001 ? SIDC : "x"}`] });
+  const roots = rowsBig.filter((r) => r.argv.join(" ").includes("tern acp")).map((r) => r.pid);
+  // fake monotonic clock: every call costs 1ms; budget 1500 calls' worth ⇒ the scan must stop and say unknown, never credit
+  let clock = 0; const mono = () => (clock += 1);
+  const deadline = 300; const over = () => mono() > deadline;
+  const a = agentAmong(roots, (root) => resolveAgentPid3(root, SIDC, "claude", rowsBig, exOk, over), over);
+  t("budget r9: 1500 roots over budget ⇒ unknown (never owned=true)", a === "unknown" && roleBoxOwned(SIDC, a) === false);
+  const t0 = performance.now();
+  const b = agentAmong(roots, (root) => resolveAgentPid3(root, SIDC, "claude", rowsBig, exOk));
+  const took = performance.now() - t0;
+  t(`budget r9: the same 1500 roots with no deadline finish fast on a shared index (${Math.round(took)}ms < 500ms) and find the one match`, b === 10001 && took < 500);
+  let clk2 = 0; const over2 = () => (clk2 += 1) > 1e9;
+  t("budget r9: inside budget ⇒ the match (positive control)", agentAmong(roots, (root) => resolveAgentPid3(root, SIDC, "claude", rowsBig, exOk, over2), over2) === 10001);
+  // each layer on its own: agentAmong stops between roots even when the resolver ignores the deadline
+  let calls = 0; let n = 0; const overN = () => calls >= 3;
+  const d = agentAmong(roots, (root) => { calls++; n++; return resolveAgentPid3(root, SIDC, "claude", rowsBig, exOk); }, overN);
+  t("budget r9: agentAmong checks the deadline before each root (stops at 3 of 1500)", d === "unknown" && n === 3);
+  // the resolver stops its own walk when the deadline passes mid-tree (one deep chain)
+  const chain = parsePs3(Array.from({ length: 3000 }, (_, i) => `${20000 + i} ${i === 0 ? 1 : 20000 + i - 1} node x`).join("\n"));
+  let w = 0; const overW = () => (w += 1) > 2;
+  t("budget r9: resolveAgentPid3 checks the deadline during the walk", resolveAgentPid3(20000, SIDC, "claude", chain, exOk, overW).kind === "unknown");
+  t("budget r9: the ps index is built once per table (shared object)", psIndex(rowsBig) === psIndex(rowsBig));
+  let late = false; const overLate = () => late;
+  const c = agentAmong(roots.slice(0, 1), (root) => { const r = resolveAgentPid3(root, SIDC, "claude", rowsBig, exOk); late = true; return r; }, overLate);
+  t("budget r9: a scan that FINISHES past the deadline is not used for credit", c === "unknown");
+}
+
+// PW-SV-SWEEP-BUDGET r9 gate (real clock): the dispatcher's role-box computation (roleBoxAgent = parse ps → roots → walk → argv →
+// credit) on 1500 roots / 3000 rows, only the first root holding the coordinator, returns "unknown" within budget + 0.2s when the
+// budget is too small, and the match when it is not.
+{
+  const { roleBoxAgent, ROLE_BOX_BUDGET_MS: RB } = await import("./progress-watch.js");
+  const SIDG = "fd0d0d0d-1111-4222-8333-444444444444";
+  const ln: string[] = [];
+  for (let i = 0; i < 1500; i++) { const r = 30000 + i * 2; ln.push(`${r} 1 /A/tern acp claude --mode bypassPermissions`, `${r + 1} ${r} claude --output-format stream-json --session-id=${i === 0 ? SIDG : `fe${String(i).padStart(6, "0")}-1111-4222-8333-444444444444`}`); }
+  const psText = ln.join("\n");
+  const ex = (pid: number) => ({ exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", `--session-id=${pid === 30001 ? SIDG : "x"}`] });
+  // every exact-argv read costs 5ms of real CPU here, so the scan cannot finish inside a 2ms budget
+  const slow = (pid: number) => { const e = performance.now() + 5; while (performance.now() < e) { /* spin */ } return ex(pid); };
+  const mono = () => performance.now();
+  let d = mono() + 2; let t0 = mono();
+  const u = roleBoxAgent(psText, SIDG, d, mono, slow);
+  let took = mono() - t0;
+  t(`budget r9 gate: 1500 roots, budget too small ⇒ unknown within budget + 0.2s (took ${took.toFixed(1)}ms)`, u === "unknown" && took < 2 + 200);
+  d = mono() + RB; t0 = mono();
+  const m = roleBoxAgent(psText, SIDG, d, mono, ex);
+  took = mono() - t0;
+  t(`budget r9 gate: same input inside ROLE_BOX_BUDGET_MS ⇒ the one match (took ${took.toFixed(1)}ms)`, m === 30001 && took < RB);
+  t("budget r9 gate: parsing alone over budget ⇒ unknown", roleBoxAgent(psText, SIDG, mono() - 1, mono, ex) === "unknown");
+  const { parsePsBudgeted } = await import("./seat-presence.js");
+  let pc = 0; const overAfter = () => ++pc > 2;
+  t("budget r9 gate: the ps parser itself stops when the deadline passes mid-text", parsePsBudgeted(psText, overAfter) === null && pc <= 4);
 }
 console.log("PASS progress-watch");

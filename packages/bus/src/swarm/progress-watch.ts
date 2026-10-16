@@ -22,7 +22,8 @@
 import { readdirSync, readFileSync, statSync, lstatSync, openSync, readSync, closeSync, writeFileSync, mkdirSync, renameSync, constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { BEAT_STALE_SEC, coordinatorBeatPath, carlyPatrolBeatPath } from "./carly-sweep.js";
-import type { Resolved } from "./seat-presence.js";
+import { parsePsBudgeted, resolveAgentPid3, type Resolved } from "./seat-presence.js";
+import type { ExactArgv } from "./seat-presence.js";
 
 export const HANDOFF_STALE_SEC = 2 * 3600;
 export const MAIL_MIN = 3;
@@ -312,12 +313,30 @@ export function roleBoxOwned(liveSid: string | null, agent: Fact<number>): boole
 }
 
 /** The agent process for a sid among candidate root pids: none ⇒ "absent", exactly one distinct pid ⇒ it, several ⇒ "unknown". Pure. */
-export function agentAmong(roots: number[], resolve: (root: number) => Resolved): Fact<number> {
+export function agentAmong(roots: number[], resolve: (root: number) => Resolved, overBudget: () => boolean = () => false): Fact<number> {
   const pids = new Set<number>();
   for (const r of roots) {
+    if (overBudget()) return "unknown"; // PW-SV-SWEEP-BUDGET r9: the deadline covers the whole scan, not just the argv reads
     const x = resolve(r);
     if (x.kind === "unknown" || x.kind === "ambiguous") return "unknown"; // never folded into "absent"
     if (x.kind === "match") pids.add(x.pid);
   }
+  if (overBudget()) return "unknown"; // finished past the deadline ⇒ not used for credit
   return pids.size === 0 ? "absent" : pids.size === 1 ? [...pids][0]! : "unknown";
+}
+
+/** The coordinator's agent pid for the role-box credit, as ONE bounded computation (PW-SV-SWEEP-BUDGET r9): parse the ps text, pick
+ *  the `tern acp` roots, walk each root's tree and read candidates' exact argv — every phase checks the same monotonic deadline, and
+ *  a result reached after it is not used. Over budget at any point ⇒ "unknown" (never credited). */
+export function roleBoxAgent(psText: string, liveSid: string, deadline: number, mono: () => number,
+  exact: (pid: number) => ReturnType<ExactArgv> | "over-budget"): Fact<number> {
+  const over = () => mono() > deadline;
+  const rows = parsePsBudgeted(psText, over);
+  if (rows === null) return "unknown";
+  const roots: number[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    if ((i & 255) === 0 && over()) return "unknown";
+    if (rows[i]!.argv.join(" ").includes("tern acp")) roots.push(rows[i]!.pid);
+  }
+  return agentAmong(roots, (root) => resolveAgentPid3(root, liveSid, "claude", rows, exact, over), over);
 }
