@@ -182,6 +182,35 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
   }
   ok(worst < 50, `decoder: 1000 random strings of escape-heavy text, none hangs (worst ${worst.toFixed(1)}ms)`);
   ok(DECODE_MAX_STEPS_PER_BYTE >= 1, "decoder: a per-byte step budget is declared");
+  // FXL r10 · FXL-PATTERN-COVERAGE: \u{…} with any number of hex digits (leading zeros are legal JS) decodes to the real code
+  // point; every escape form spelling the kill commands is flagged. Checked against the JS engine itself (eval of the literal).
+  const spell = (word: string, form: number) => [...word].map((ch, i) => {
+    const h = ch.charCodeAt(0).toString(16); const f = (form + i) % 5;
+    return f === 0 ? `\\u{${"0".repeat(1 + ((form * 7 + i) % 9))}${h}}` : f === 1 ? `\\u{${h}}` : f === 2 ? `\\x${h.padStart(2, "0")}` : f === 3 ? `\\u${h.padStart(4, "0")}` : ch;
+  }).join("");
+  let missed = 0, engineAgrees = 0;
+  for (let k = 0; k < 200; k++) {
+    const word = k % 2 ? PK : KA;
+    const lit = spell(word, k);
+    const src = `spawnSync("${lit}", ["x"])`;
+    if ((0, eval)(`"${lit}"`) === word) engineAgrees++;
+    if (!killsByPattern(src)) missed++;
+  }
+  ok(engineAgrees === 200 && missed === 0, `lint r10: 200 escape-spelled kill commands (long \\u{000…}, \\u{}, \\x, \\u) all flagged (${missed} missed)`);
+  ok(killsByPattern('spawnSync("\\u{000000070}kill", ["-9", "x"])'), "lint r10: Second Voice's long \\u{000000070} escape is flagged");
+  // FXL r10 · FXL-SV-DECODE-WORK: unclosed \u{ costs the digits read, not a search to the end ⇒ linear
+  const big = (n: number) => "const b = String.raw`" + "\\u{".repeat(n / 3) + "`;";
+  const time = (n: number) => { const s0 = big(n); const t1 = performance.now(); jsStringLiterals(s0); return performance.now() - t1; };
+  const t150 = time(150_000), t600 = time(600_000);
+  ok(t600 < 100, `decoder r10: 600 KiB of unclosed \\u{ decodes in ${t600.toFixed(1)}ms (< 100ms)`);
+  // Chief's sizes: N = 128,000 / 256,000 unclosed \u{ in valid JS < 200ms each, decoded output identical to his 12-char-window
+  // control (a window decodes the same here: every \u{ is unclosed, so both take it literally)
+  for (const n of [128_000, 256_000]) {
+    const src0 = "const b = String.raw`" + "\\u{".repeat(n) + "`;";
+    const t1 = performance.now(); const got = jsStringLiterals(src0); const dt = performance.now() - t1;
+    ok(dt < 200 && got.length === 1 && got[0] === "u{".repeat(n), `decoder r10: N=${n} unclosed \\u{ ⇒ ${dt.toFixed(1)}ms (< 200ms), output = literal text`);
+  }
+  ok(t600 < 8 * Math.max(t150, 1), `decoder r10: 4× input is not super-linear (${t150.toFixed(1)}ms → ${t600.toFixed(1)}ms)`);
   const cases: Array<[string, string]> = [
     ["kill-by-pattern, multi-line argv with a signal first", 'spawnSync(\n  "' + PK + '",\n  ["-9",\n   "-f", "some-fixture-that-matches-nothing-zz"],\n);'],
     // the banned text is assembled at run time so THIS file stays clean under the same lint

@@ -120,15 +120,18 @@ export function jsStringLiterals(src) {
   // FXL-SV-DECODE-PROGRESS: every step strictly advances the cursor (an escape that cannot be decoded is taken literally, 2 chars),
   // and the whole pass is bounded by DECODE_MAX_STEPS_PER_BYTE × length — past it the rest is not decoded (the raw-text check still runs).
   let budget = DECODE_MAX_STEPS_PER_BYTE * src.length + 16;
+  const hexDigit = (c) => (c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1);
   const hex = (t) => (/^[0-9a-fA-F]+$/.test(t) ? parseInt(t, 16) : NaN);
   const esc = (j) => {
     const c = src[j + 1];
     const simple = { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v", 0: "\0" };
     if (c === "x") { const v = hex(src.slice(j + 2, j + 4)); if (!Number.isNaN(v)) return [String.fromCharCode(v), 4]; }
     if (c === "u" && src[j + 2] === "{") {
-      const k = src.indexOf("}", j + 3);
-      const v = k > j + 3 && k - j < 12 ? hex(src.slice(j + 3, k)) : NaN;
-      if (!Number.isNaN(v) && v <= 0x10ffff) return [String.fromCodePoint(v), k - j + 1];
+      // FXL r10: one forward scan over the hex digits (any count — JS allows leading zeros: \u{000000070} is "p"), then "}".
+      // Work is the digits read, never a search to the end of the source (FXL-SV-DECODE-WORK).
+      let k = j + 3, v = 0;
+      for (let d; k < src.length && (d = hexDigit(src.charCodeAt(k))) >= 0; k++) if (v <= 0x10ffff) v = v * 16 + d;
+      if (k > j + 3 && src[k] === "}" && v <= 0x10ffff) return [String.fromCodePoint(v), k - j + 1];
     } else if (c === "u") { const v = hex(src.slice(j + 2, j + 6)); if (!Number.isNaN(v) && src.slice(j + 2, j + 6).length === 4) return [String.fromCharCode(v), 6]; }
     if (c === "\n") return ["", 2]; // line continuation
     return [simple[c] ?? c ?? "", 2];
