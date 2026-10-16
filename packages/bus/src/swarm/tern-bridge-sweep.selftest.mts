@@ -13,14 +13,14 @@ import os from "node:os";
 import path from "node:path";
 import {
   ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realSentinelReader, realClearSentinel, realPendingRequests, bridgeHome, bridgeScriptEnv, bridgeDir, movedSince,
-  armSequence, ACTION, RELOAD_MIN_MS,
+  armSequence, ACTION, RELOAD_MIN_MS, TERN_TIMEOUT_MS,
   type BridgeIO, type Mirror, type PendingReq, type TernResult, type ArmStatus,
 } from "./tern-bridge-sweep.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
 type World = {
-  clock: number; mirror: Mirror; reqs: PendingReq[]; ternUp: boolean;
+  clock: number; mirror: Mirror; reqs: PendingReq[] | null; ternUp: boolean;
   calls: string[]; logs: string[]; control: string[];
   onReload?: () => void; mirrorAdvances: boolean;
   // fake r11 bridge: live patrol task ids + the status file (arm-cancel-next reads the ids the last scan recorded)
@@ -291,7 +291,7 @@ for (const failing of ["drain", "drain-start"] as const) {
     "e.json": '{torn',
   };
   for (const [n, body] of Object.entries(files)) writeFileSync(path.join(rq, n), body);
-  const got = Object.fromEntries(realPendingRequests(home, () => Date.now())().map((r) => [r.name, r.isStart]));
+  const got = Object.fromEntries((realPendingRequests(home, () => Date.now())() ?? []).map((r) => [r.name, r.isStart]));
   t("request class: escaped \\u0061 'start' is a start", got["a.json"] === true);
   t("request class: escaped key \\u006fp is a start", got["b.json"] === true);
   t("request class: nested op:start is NOT a start", got["c.json"] === false);
@@ -512,6 +512,40 @@ t("control root: explicit AGENTHOP_BRIDGE_HOME wins", bridgeHome({ AH_HOME: "/tm
   t("runner: {\"ok\":false} ⇒ UNKNOWN", realTern({ TERN_BIN: mk("c", 'echo \'{"ok":false,"error":"x"}\'') })(["x"]).ok === false);
   t("runner: missing binary ⇒ UNKNOWN", realTern({ TERN_BIN: path.join(dir, "nope") })(["x"]).ok === false);
   t("runner: hang ⇒ timeout ⇒ UNKNOWN", realTern({ TERN_BIN: mk("d", "sleep 10") })(["x"]).ok === false);
+}
+
+// --- L5-LV-SOURCE-UNKNOWN: requests/ unreadable ⇒ UNKNOWN hold, never "nothing stuck" ---
+{
+  const eio = () => { const e = new Error("EIO") as NodeJS.ErrnoException; e.code = "EIO"; throw e; };
+  const enoent = () => { const e = new Error("ENOENT") as NodeJS.ErrnoException; e.code = "ENOENT"; throw e; };
+  const okFs = { readdir: () => ["r1.json"], read: () => '{"op":"list"}', mtimeMs: () => 0 };
+  t("pending: dir EIO ⇒ null (unknown)", realPendingRequests("/h", () => 1, { ...okFs, readdir: eio })() === null);
+  t("pending: request body EIO ⇒ null (unknown)", realPendingRequests("/h", () => 1, { ...okFs, read: eio })() === null);
+  t("pending: stat EIO ⇒ null (unknown)", realPendingRequests("/h", () => 1, { ...okFs, mtimeMs: eio })() === null);
+  t("pending: no dir (ENOENT) ⇒ [] (none)", JSON.stringify(realPendingRequests("/h", () => 1, { ...okFs, readdir: enoent })()) === "[]");
+  t("pending: request gone (ENOENT, claimed meanwhile) ⇒ skipped", JSON.stringify(realPendingRequests("/h", () => 1, { ...okFs, read: enoent })()) === "[]");
+  const r = realPendingRequests("/h", () => 1000, okFs)();
+  t("pending: readable ⇒ the request with its age", r !== null && r.length === 1 && r[0]!.ageMs === 1000);
+
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b); // armed
+  w.reqs = [{ name: "old.json", ageMs: 10 * 60_000, isStart: false }];
+  const real = w.reqs;
+  w.reqs = null; w.clock += 5000; w.calls = [];
+  t("tick: requests unreadable ⇒ 'unknown', zero reload / arm / drain", tick(st, b) === "unknown" && reloads(w) === 0 && !has(w, ".arm") && !has(w, ".drain"));
+  w.clock += 5000; w.calls = [];
+  t("tick: still unreadable ⇒ still unknown, still no action", tick(st, b) === "unknown" && reloads(w) === 0);
+  w.reqs = real; w.clock += 5000; w.calls = [];
+  const out = tick(st, b);
+  t(`tick: readable again ⇒ the stuck request drives the full recovery chain (${out})`, reloads(w) === 1 && has(w, ".drain"));
+}
+
+// --- STEP-BOUND (small half): a child that ignores SIGTERM cannot hold the runner past its timeout ---
+{
+  const dir = mkdtempSync(path.join(os.tmpdir(), "tbs-kill-"));
+  const bin = path.join(dir, "tern"); writeFileSync(bin, "#!/bin/sh\ntrap '' TERM\nsleep 5\n"); chmodSync(bin, 0o755);
+  const t0 = Date.now(); const r = realTern({ TERN_BIN: bin })(["x"]); const ms = Date.now() - t0;
+  t(`runner: TERM-ignoring child ⇒ UNKNOWN within budget + 0.2s (${ms}ms)`, r.ok === false && ms < TERN_TIMEOUT_MS + 200);
 }
 
 console.log("PASS tern-bridge-sweep");

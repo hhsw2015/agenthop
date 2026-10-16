@@ -82,7 +82,7 @@ export type BridgeIO = {
   clearSentinel: () => boolean;          // delete sentinel.json so only the NEXT write can answer; false = could not (not ENOENT)
   schedule: () => { code: number; detail: string }; // arm-schedule.sh: 0 scheduled+verified, 2 refused (count>0), else failed
   readMirror: () => Mirror;              // agents.json tick+vm, or null (absent/torn/unparseable)
-  pendingRequests: () => PendingReq[];   // requests/*.json with their age
+  pendingRequests: () => PendingReq[] | null; // null = could not read (UNKNOWN), never "none pending"   // requests/*.json with their age
   nowMs: () => number;
   sleep: (ms: number) => void;           // synchronous wait (used only inside the bounded ready-wait)
   log: (line: string) => void;           // dispatcher log
@@ -216,7 +216,10 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
   if (st.owedAfterReload !== null) return finishAfterReload(st, io, mirror);
 
   // ③ health first: a positive stall signal from the bridge's own files (tern answered, so this is not UNKNOWN).
-  const stuck = io.pendingRequests().filter((r) => r.ageMs > REQ_STUCK_MS);
+  const pending = io.pendingRequests();
+  // L5-LV-SOURCE-UNKNOWN: an unreadable requests dir / request is UNKNOWN, not "nothing stuck" — hold (no arm, no drain, no reload)
+  if (pending === null) { io.log("tern-bridge: UNKNOWN (requests/ unreadable) — no action, obligations kept"); return "unknown"; }
+  const stuck = pending.filter((r) => r.ageMs > REQ_STUCK_MS);
   const tickStalled = now - st.lastTickChangeMs > TICK_STALL_MS;
   if (tickStalled || stuck.length > 0) {
     const why = tickStalled ? `tick ${st.lastTick} not advancing ${now - st.lastTickChangeMs}ms` : `request stuck: ${stuck[0]!.name}`;
@@ -347,7 +350,8 @@ export function realTern(env: NodeJS.ProcessEnv = process.env): TernRun {
   const bin = env.TERN_BIN || "tern";
   const sock = env.TERN_PANE_SOCKET || path.join(homedir(), "Library", "Application Support", "Tern", "daemon.sock");
   return (args) => {
-    const r = spawnSync(bin, args, { encoding: "utf8", timeout: TERN_TIMEOUT_MS, env: { ...env, TERN_PANE_SOCKET: sock } });
+    // SIGKILL: a short read-only ctl call has nothing to flush, and a child that ignores TERM would hold the sweep past its budget
+    const r = spawnSync(bin, args, { encoding: "utf8", timeout: TERN_TIMEOUT_MS, killSignal: "SIGKILL", env: { ...env, TERN_PANE_SOCKET: sock } });
     if (r.error) return { ok: false, detail: String(r.error.message ?? r.error) };
     if (r.status !== 0) return { ok: false, detail: `exit ${r.status}: ${(r.stderr || "").trim().slice(0, 160)}` };
     if (/"ok"\s*:\s*false/.test(r.stdout || "")) return { ok: false, detail: (r.stdout || "").trim().slice(0, 160) };
@@ -384,28 +388,33 @@ export function realClearSentinel(home: string): () => boolean {
 /** arm-schedule.sh runner. `bridgeDir` = the bridge checkout the dispatcher uses (AGENTHOP_BRIDGE_DIR, else repo tern/agenthop-agents-bridge). */
 export function realScheduler(env: NodeJS.ProcessEnv, bridgeDir: string): () => { code: number; detail: string } {
   return () => {
-    const r = spawnSync("bash", [path.join(bridgeDir, "arm-schedule.sh")], { encoding: "utf8", timeout: 15_000, env });
+    const r = spawnSync("bash", [path.join(bridgeDir, "arm-schedule.sh")], { encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL", env });
     if (r.error) return { code: -1, detail: String(r.error.message ?? r.error) };
     return { code: r.status ?? -1, detail: ((r.stdout || "") + (r.stderr || "")).trim().slice(0, 200) };
   };
 }
 
-export function realPendingRequests(home: string, nowMs: () => number): () => PendingReq[] {
+/** requests/*.json with their age. Only ENOENT means "not there" (no dir = none pending; a request gone = claimed meanwhile);
+ *  any other read error (EIO, EACCES, …) on the dir or a request ⇒ null = UNKNOWN (L5-LV-SOURCE-UNKNOWN). `fs` is a test seam. */
+export function realPendingRequests(home: string, nowMs: () => number,
+  fs: { readdir: (d: string) => string[]; read: (f: string) => string; mtimeMs: (f: string) => number } =
+    { readdir: (d) => readdirSync(d), read: (f) => readFileSync(f, "utf8"), mtimeMs: (f) => statSync(f).mtimeMs }): () => PendingReq[] | null {
+  const gone = (e: unknown) => (e as NodeJS.ErrnoException)?.code === "ENOENT";
   return () => {
     const dir = path.join(bridgeDir(home), "requests");
     let names: string[];
-    try { names = readdirSync(dir).filter((n) => n.endsWith(".json")); } catch { return []; }
+    try { names = fs.readdir(dir).filter((n) => n.endsWith(".json")); } catch (e) { return gone(e) ? [] : null; }
     const out: PendingReq[] = [];
     for (const n of names) {
+      const f = path.join(dir, n);
+      let raw: string; let mtime: number;
+      try { raw = fs.read(f); mtime = fs.mtimeMs(f); } catch (e) { if (gone(e)) continue; return null; }
+      let isStart = false;
       try {
-        const raw = readFileSync(path.join(dir, n), "utf8");
-        let isStart = false;
-        try {
-          const d = JSON.parse(raw) as unknown;
-          isStart = typeof d === "object" && d !== null && !Array.isArray(d) && (d as { op?: unknown }).op === "start";
-        } catch { isStart = false; }
-        out.push({ name: n, ageMs: nowMs() - statSync(path.join(dir, n)).mtimeMs, isStart });
-      } catch { /* claimed meanwhile: not pending */ }
+        const d = JSON.parse(raw) as unknown;
+        isStart = typeof d === "object" && d !== null && !Array.isArray(d) && (d as { op?: unknown }).op === "start";
+      } catch { isStart = false; }
+      out.push({ name: n, ageMs: nowMs() - mtime, isStart });
     }
     return out;
   };

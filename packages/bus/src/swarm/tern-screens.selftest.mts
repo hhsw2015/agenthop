@@ -132,6 +132,19 @@ const NOW = 1_000_000;
   if (n > MAX_FILES) throw new Error("fixture: total bound unreachable under MAX_FILES");
   const big = { readdir: () => Array.from({ length: n }, (_, i) => `b${i}.json`), lstat: () => ({ isFile: true, size: MAX_FILE_BYTES, mtimeSec: NOW, ino: 1 }), readRegular: () => "x".repeat(MAX_FILE_BYTES) };
   t(`total bytes over MAX_TOTAL_BYTES (${n} × ${MAX_FILE_BYTES}) ⇒ fault`, /in all/.test(readScreensResult("/x", NOW, 60, big).fault ?? ""));
+  // T1B-READ-TOTAL-GROWTH: lstat says 1 byte, each file actually holds 62000 ⇒ 17 files = 1,054,000 > 1 MiB.
+  const pad = (n: number) => { const body = file("g", {}); return body + " ".repeat(n - body.length); };
+  const names17 = () => Array.from({ length: 17 }, (_, i) => `g${String(i).padStart(2, "0")}.json`);
+  const bounds: number[] = [];
+  // (a) a reader that honours its bound like realReadFs (more than `max` bytes ⇒ throws)
+  const honest = { readdir: names17, lstat: () => ({ isFile: true, size: 1, mtimeSec: NOW, ino: 1 }),
+    readRegular: (_p: string, _i: number, max: number) => { bounds.push(max); if (62000 > max) throw new Error(`more than ${max} bytes`); return pad(62000); } };
+  const gr = readScreensResult("/x", NOW, 60, honest);
+  t("growth after lstat: the read that would pass the total is refused ⇒ whole read fault", typeof gr.fault === "string" && gr.screens.size === 0);
+  t("growth after lstat: each read is bounded by what is LEFT of the total", bounds.every((m, i) => m === Math.min(MAX_FILE_BYTES, MAX_TOTAL_BYTES - i * 62000)));
+  // (b) a reader that returns more than it was allowed: the post-read recount still catches it
+  const liar = { ...honest, readRegular: () => pad(62000) };
+  t("growth after lstat: real bytes recounted after each read ⇒ fault even if a read overshoots", /in all/.test(readScreensResult("/x", NOW, 60, liar).fault ?? ""));
   let opened = 0;
   const lie = (isFile: boolean, size: number) => ({ readdir: () => ["a.json"], lstat: () => ({ isFile, size, mtimeSec: NOW, ino: 1 }), readRegular: () => { opened++; return file("A", {}); } });
   t("lstat says not a regular file ⇒ fault, never opened", /not a regular file/.test(readScreensResult("/x", NOW, 60, lie(false, 10)).fault ?? "") && opened === 0);

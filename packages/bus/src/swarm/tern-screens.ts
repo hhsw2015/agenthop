@@ -137,8 +137,10 @@ export function readScreensResult(controlDir: string, nowSec: number, maxAgeSec:
     if (st.size > MAX_FILE_BYTES) return { screens: new Map(), fault: `${name}: ${st.size} bytes (> ${MAX_FILE_BYTES})` };
     if (total + st.size > MAX_TOTAL_BYTES) return { screens: new Map(), fault: `screens files exceed ${MAX_TOTAL_BYTES} bytes in all` };
     let body: string;
-    try { body = fs.readRegular(p, st.ino, MAX_FILE_BYTES); } catch (e) { return { screens: new Map(), fault: `${name}: ${(e as Error).message}` }; }
+    // T1B-READ-TOTAL-GROWTH: the read bound is what is LEFT of the total (a file may have grown since lstat), and the real bytes count
+    try { body = fs.readRegular(p, st.ino, Math.min(MAX_FILE_BYTES, MAX_TOTAL_BYTES - total)); } catch (e) { return { screens: new Map(), fault: `${name}: ${(e as Error).message}` }; }
     total += Buffer.byteLength(body);
+    if (total > MAX_TOTAL_BYTES) return { screens: new Map(), fault: `screens files exceed ${MAX_TOTAL_BYTES} bytes in all` };
     files.push({ name, body });
   }
   return mergeScreensResult(files, nowSec, maxAgeSec);
