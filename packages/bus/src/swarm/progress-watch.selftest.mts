@@ -7,7 +7,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, u
 import os from "node:os";
 import path from "node:path";
 import { judgeProgress, planEmits, commitDelivery, commitResolved, initialWatchState, readProgressFacts, readBoxMails, writeL0Alert, findCoordinatorBlock,
-  budgeted, HANDOFF_STALE_SEC, CARLY_STALE_SEC, DEDUP_SEC, RETRY_SEC, BLOCK_BUDGET_MS, MAIL_SCAN_MAX, MAIL_BODY_MAX, type ProgressFacts, type Mail, type Budget } from "./progress-watch.js";
+  budgeted, roleBoxOwned, agentAmong, HANDOFF_STALE_SEC, CARLY_STALE_SEC, DEDUP_SEC, RETRY_SEC, BLOCK_BUDGET_MS, MAIL_SCAN_MAX, MAIL_BODY_MAX, type ProgressFacts, type Mail, type Budget } from "./progress-watch.js";
 import { spawnSync } from "node:child_process";
 import { BEAT_STALE_SEC } from "./carly-sweep.js";
 
@@ -272,5 +272,27 @@ for (const bad of ["fail", "badjson", "nochild"] as const) {
   planEmits(st, J(ok({ nowSec: NOW + 5, handoffMtimeSec: NOW + 1 })), NOW + 5); // recovered, notice owed, not delivered
   const r = planEmits(st, J(ok({ nowSec: NOW + 10, handoffMtimeSec: NOW - 3 * 3600 + 10 })), NOW + 10);
   t("resolved: a NEW stall before the notice went out supersedes it (no stale resolved)", !st.resolveOwed.has("coordinator-stalled") && r.resolved.length === 0);
+}
+
+// --- inbox-sentinel role box (#1116): owned iff the live coordinator sid's claude is in the PROCESS TABLE (real processes) ---
+{
+  const { parsePs, realExactArgv, resolveAgentPid } = await import("./seat-presence.js");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "rbo-"));
+  writeFileSync(path.join(dir, "tern.c"), '#include <unistd.h>\nint main(int c,char**v){ if(c<4)return 2; if(fork()==0){char*b=v[2];v[2]="claude";execv(b,&v[2]);_exit(127);} for(;;)pause(); }\n');
+  writeFileSync(path.join(dir, "claude.c"), "#include <unistd.h>\nint main(void){for(;;)pause();}\n");
+  const built = ["tern", "claude"].every((n) => spawnSync("cc", ["-o", path.join(dir, n), path.join(dir, `${n}.c`)]).status === 0);
+  t("role box: process fixture builds (cc)", built);
+  const SIDX = "ffffffff-1111-4222-8333-444444444444"; // made-up
+  const { spawn } = await import("node:child_process");
+  const root = spawn(path.join(dir, "tern"), ["acp", path.join(dir, "claude"), "--output-format", "stream-json", `--session-id=${SIDX}`], { stdio: "ignore", detached: true });
+  spawnSync("sleep", ["0.5"]);
+  const look = () => { const rows = parsePs(spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8" }).stdout); const ex = realExactArgv();
+    return agentAmong(rows.filter((r) => r.argv.join(" ").includes("tern acp")).map((r) => r.pid), (r) => resolveAgentPid(r, SIDX, "claude", rows, ex)); };
+  t("role box: live coordinator claude in the process table ⇒ owned (no STALL)", roleBoxOwned(SIDX, look()));
+  t("role box: no live coordinator sid (file missing/stale/not a sid) ⇒ not owned (sentinel unchanged)", !roleBoxOwned(null, look()));
+  process.kill(-root.pid!, "SIGKILL"); spawnSync("sleep", ["0.3"]);
+  t("role box: that claude is gone ⇒ not owned (STALL still fires)", !roleBoxOwned(SIDX, look()));
+  t("role box: process table unknown ⇒ not owned", !roleBoxOwned(SIDX, "unknown"));
+  rmSync(dir, { recursive: true, force: true });
 }
 console.log("PASS progress-watch");

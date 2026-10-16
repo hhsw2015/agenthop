@@ -87,7 +87,7 @@ import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleEx
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
 import { realTernSpawn, cleanTernEnv } from "../packages/bus/src/swarm/tern-env.js";
-import { initialWatchState, judgeProgress, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
+import { initialWatchState, judgeProgress, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, roleBoxOwned, agentAmong, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
 import { parsePs, realExactArgv, resolveAgentPid } from "../packages/bus/src/swarm/seat-presence.js";
 import { ternInjectCommands } from "../packages/bus/src/swarm/tern-wake.js";
 import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
@@ -1500,6 +1500,16 @@ async function main(): Promise<void> {
   // does NOT bypass dedup (F40-5): at most one alert per box per SWARM_NOTIFY_DEDUP_MS, then a bounded reminder. The coordinator
   // box is NOT excluded (that would hide real business mail stranded in it); it just gets the same bounded treatment.
   const inboxDedup = new AlertDedup(NOTIFY_DEDUP_MS); // F44-①: per-box event-identity dedup + cooldown (stable box id, NOT message text)
+  /** The live coordinator session: roles/coordinator.sid (written by the coordinator each cycle). Missing / not a sid / older than 1h
+   *  ⇒ null ⇒ no typing (S19 + L0 still go out). SWARM_COORDINATOR is the role BOX key, not a session (two keys, by design). */
+  const liveCoordinatorSid = (): string | null => {
+    const f = path.join(HOME, ".agenthop", "swarm", "roles", "coordinator.sid");
+    try {
+      const st = lstatSync(f); if (!st.isFile() || Date.now() - st.mtimeMs > 3600_000) return null;
+      const sid = readFileSync(f, "utf8").split("\n")[0]!.trim();
+      return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sid) ? sid : null;
+    } catch { return null; }
+  };
   const runInboxSentinel = (): void => {
     try {
       const stats = scanInboxes(HOME);
@@ -1531,6 +1541,19 @@ async function main(): Promise<void> {
         if (w.kind !== "entity") continue; // ambiguous/unknown identity ⇒ no legacy expansion (direct sid already credited)
         for (const k of legacyInboxKeys(proj, { id: sid, stableId: sid, title: "", tool: w.entity.tool ?? "", cwd: w.entity.cwd ?? "", pid: 0 })) owned.add(inboxDirName(k));
       }
+      // the coordinator ROLE box is drained by the live coordinator session (roles/coordinator.sid), a different key from its own sid;
+      // credited only when that session's claude is found in the process table (presence .pid is a projection). Else: unchanged.
+      if (COORDINATOR && isValidSessionId(COORDINATOR)) {
+        const live = liveCoordinatorSid();
+        if (live !== null) {
+          const ps = spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8", timeout: 1500 });
+          const rows = ps.status === 0 ? parsePs(ps.stdout) : null;
+          const exact = realExactArgv();
+          const agent = rows === null ? "unknown" as const
+            : agentAmong(rows.filter((r) => r.argv.join(" ").includes("tern acp")).map((r) => r.pid), (root) => resolveAgentPid(root, live, "claude", rows, exact));
+          if (roleBoxOwned(live, agent)) owned.add(inboxDirName(COORDINATOR));
+        }
+      }
       const thMin = Math.floor(INBOX_STALL_SEC / 60);
       for (const a of detectStalledInboxes(stats, (key) => owned.has(key), INBOX_STALL_SEC, nowSec())) {
         const dk = alertKey(a.key, "inbox-stall");
@@ -1558,16 +1581,6 @@ async function main(): Promise<void> {
     const r = spawnSync(ternBinPW, args, { encoding: "utf8", timeout: Math.max(1, timeoutMs), env: ternEnvPW });
     const timedOut = (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" || r.signal === "SIGTERM";
     return { ok: !r.error && r.status === 0, stdout: r.stdout || "", timedOut };
-  };
-  /** The live coordinator session: roles/coordinator.sid (written by the coordinator each cycle). Missing / not a sid / older than 1h
-   *  ⇒ null ⇒ no typing (S19 + L0 still go out). SWARM_COORDINATOR is the role BOX key, not a session (two keys, by design). */
-  const liveCoordinatorSid = (): string | null => {
-    const f = path.join(HOME, ".agenthop", "swarm", "roles", "coordinator.sid");
-    try {
-      const st = lstatSync(f); if (!st.isFile() || Date.now() - st.mtimeMs > 3600_000) return null;
-      const sid = readFileSync(f, "utf8").split("\n")[0]!.trim();
-      return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sid) ? sid : null;
-    } catch { return null; }
   };
   /** The coordinator block, within BLOCK_BUDGET_MS for the whole lookup (ls + one process per block + one ps), every call bounded by
    *  what is left. The agent is found in the PROCESS TABLE under each block's root (exact argv) — never from the presence .pid file. */

@@ -294,3 +294,18 @@ export function findCoordinatorBlock(
   }
   return hits.length === 1 ? { block: hits[0]! } : { none: `${hits.length} blocks run ${coordinatorSid}` };
 }
+
+/** inbox-sentinel (#1116 nit): the coordinator ROLE box (SWARM_COORDINATOR) is drained by whichever session is the live coordinator,
+ *  whose own sid is a different key — so the sentinel saw "no live session owns this box" and alerted every minute. The role box is
+ *  owned iff roles/coordinator.sid names a live coordinator whose claude is found in the PROCESS TABLE (the presence .pid is a
+ *  projection and is not used). Anything missing / stale / not a sid / not found / unknown ⇒ false: the sentinel keeps its old
+ *  verdict (never loosened). Pure over injected facts. */
+export function roleBoxOwned(liveSid: string | null, agent: Fact<number>): boolean {
+  return liveSid !== null && typeof agent === "number";
+}
+
+/** The agent process for a sid among candidate root pids: none ⇒ "absent", exactly one distinct pid ⇒ it, several ⇒ "unknown". Pure. */
+export function agentAmong(roots: number[], resolve: (root: number) => number | null): Fact<number> {
+  const pids = new Set(roots.map(resolve).filter((p): p is number => p !== null));
+  return pids.size === 0 ? "absent" : pids.size === 1 ? [...pids][0]! : "unknown";
+}
