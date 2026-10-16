@@ -112,75 +112,51 @@ function runOne(bin, absPath, cwd, timeoutMs, graceMs) {
  *  roles/coordinator.sid). Fixtures use made-up sids. FAIL-CLOSED (r4): if the live-sid inventory or any selftest's source cannot be
  *  read, the check is incomplete and NOTHING runs. Every selftest is checked, the runner's own included — negative fixtures build the
  *  banned text at run time (string concatenation) instead of holding it literally. Pure over (text, liveSids). */
-/** Does `text` kill processes by pattern? Recognised by command name + argument SET, not by layout (FXL-PATTERN-COVERAGE): any
- *  pkill / pgrep-into-kill / killall invocation — as shell text or as a spawn argv array, on one line or across several — whose
- *  arguments include a full-command-line match flag (-f, or a combined flag like -9f / -fx) or a bare-name match (killall). The
- *  scan looks at each occurrence of the command word and the ~400 characters after it, newlines included. */
-/** The words of ONE shell command line, with ordinary quoting decoded: '…' literal, "…" with backslash escapes, a bare backslash
- *  escaping the next character (FXL-PATTERN-COVERAGE r7: `pkill "-f" x` / `pkill '--full' x` must reach the option check as -f /
- *  --full). Stops at an unquoted newline / ; / & / | (end of that command). Not a shell: no expansion, no globbing. Pure. */
-export function shellWords(text) {
-  const words = []; let cur = null; let i = 0;
-  const push = () => { if (cur !== null) { words.push(cur); cur = null; } };
-  while (i < text.length) {
-    const c = text[i];
-    if (c === "'") { const j = text.indexOf("'", i + 1); cur = (cur ?? "") + (j < 0 ? text.slice(i + 1) : text.slice(i + 1, j)); i = j < 0 ? text.length : j + 1; continue; }
-    if (c === '"') {
-      i++; cur = cur ?? "";
-      while (i < text.length && text[i] !== '"') { if (text[i] === "\\" && i + 1 < text.length) { cur += text[i + 1]; i += 2; } else { cur += text[i]; i++; } }
-      i++; continue;
-    }
-    if (c === "\\" && i + 1 < text.length) { cur = (cur ?? "") + text[i + 1]; i += 2; continue; }
-    if (c === "\n" || c === ";" || c === "&" || c === "|" || c === "`" || c === ")") break;
-    if (/\s/.test(c)) { push(); i++; continue; }
-    cur = (cur ?? "") + c; i++;
-  }
-  push();
-  return words;
-}
-/** The static string literals in JS source, decoded the way JS would ('…', "…", and `…` with each ${…} replaced by a space).
- *  FXL r8: a shell line inside a JS string reaches sh only after JS escapes are applied (`"pkill \"-f\" x"` is `pkill "-f" x`). */
+/** Does `text` kill processes by pattern? Any pkill / killall in the raw text or in any JS string literal after decoding its escapes
+ *  (FXL r9: an escaped command name `"\x70kill"` or flag `"\u002df"` is the same call; pkill without -f still matches by name). */
+export const DECODE_MAX_STEPS_PER_BYTE = 4;
 export function jsStringLiterals(src) {
   const out = []; let i = 0;
+  // FXL-SV-DECODE-PROGRESS: every step strictly advances the cursor (an escape that cannot be decoded is taken literally, 2 chars),
+  // and the whole pass is bounded by DECODE_MAX_STEPS_PER_BYTE × length — past it the rest is not decoded (the raw-text check still runs).
+  let budget = DECODE_MAX_STEPS_PER_BYTE * src.length + 16;
+  const hex = (t) => (/^[0-9a-fA-F]+$/.test(t) ? parseInt(t, 16) : NaN);
   const esc = (j) => {
     const c = src[j + 1];
     const simple = { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v", 0: "\0" };
-    if (c === "x") return [String.fromCharCode(parseInt(src.slice(j + 2, j + 4), 16) || 0), 4];
-    if (c === "u" && src[j + 2] === "{") { const k = src.indexOf("}", j); return [String.fromCodePoint(parseInt(src.slice(j + 3, k), 16) || 0), k - j + 1]; }
-    if (c === "u") return [String.fromCharCode(parseInt(src.slice(j + 2, j + 6), 16) || 0), 6];
+    if (c === "x") { const v = hex(src.slice(j + 2, j + 4)); if (!Number.isNaN(v)) return [String.fromCharCode(v), 4]; }
+    if (c === "u" && src[j + 2] === "{") {
+      const k = src.indexOf("}", j + 3);
+      const v = k > j + 3 && k - j < 12 ? hex(src.slice(j + 3, k)) : NaN;
+      if (!Number.isNaN(v) && v <= 0x10ffff) return [String.fromCodePoint(v), k - j + 1];
+    } else if (c === "u") { const v = hex(src.slice(j + 2, j + 6)); if (!Number.isNaN(v) && src.slice(j + 2, j + 6).length === 4) return [String.fromCharCode(v), 6]; }
     if (c === "\n") return ["", 2]; // line continuation
     return [simple[c] ?? c ?? "", 2];
   };
-  while (i < src.length) {
+  while (i < src.length && budget-- > 0) {
     const q = src[i];
     if (q === "/" && src[i + 1] === "/") { const k = src.indexOf("\n", i); i = k < 0 ? src.length : k; continue; }
     if (q === "/" && src[i + 1] === "*") { const k = src.indexOf("*/", i + 2); i = k < 0 ? src.length : k + 2; continue; }
     if (q !== "'" && q !== '"' && q !== "`") { i++; continue; }
     let j = i + 1, cur = "";
-    while (j < src.length && src[j] !== q) {
-      if (src[j] === "\\") { const [v, n] = esc(j); cur += v; j += n; continue; }
+    while (j < src.length && src[j] !== q && budget-- > 0) {
+      if (src[j] === "\\") { const [v, n] = esc(j); cur += v; j += Math.max(2, n); continue; }
       if (q === "`" && src[j] === "$" && src[j + 1] === "{") {
         let d = 1, k = j + 2; while (k < src.length && d > 0) { if (src[k] === "{") d++; else if (src[k] === "}") d--; k++; }
-        cur += " "; j = k; continue;
+        cur += " "; j = Math.max(k, j + 2); continue;
       }
       if (q !== "`" && src[j] === "\n") break; // unterminated: not a literal
       cur += src[j]; j++;
     }
-    out.push(cur); i = j + 1;
+    out.push(cur); i = Math.max(j + 1, i + 1);
   }
   return out;
 }
+/** Any pkill / killall invocation (FXL r9): both select processes by NAME by default (`pkill -9 12345` matches the name "12345",
+ *  not pid 12345) and by full command line with -f, so every form kills by pattern. A fixture kills the pid it started
+ *  (process.kill(pid) / kill <pid>). Word-boundary match on the raw text and on each decoded literal. */
 function killsByPatternRaw(text) {
-  const re = /\b(pkill|killall)\b/g; let m;
-  while ((m = re.exec(text)) !== null) {
-    const tail = text.slice(m.index, m.index + 400);
-    if (m[1] === "killall") return true; // matches by name by definition
-    // the arguments up to the end of this invocation: a shell line ends at a newline / ; / && ; an argv array ends at "]"
-    const arr = /^pkill["']?\s*,\s*\[([^\]]*)\]/.exec(tail);
-    const args = arr ? (arr[1].match(/["']([^"']*)["']/g) ?? []).map((x) => x.slice(1, -1)) : shellWords(tail.slice(5));
-    if (args.some((a) => /^-[A-Za-z0-9]*f[A-Za-z0-9]*$/.test(a) || a === "--full")) return true;
-  }
-  return false;
+  return /(^|[^A-Za-z0-9_-])(pkill|killall)([^A-Za-z0-9_-]|$)/.test(text);
 }
 /** True if the source kills by pattern, read as the source itself OR as any static string literal in it after JS decoding. */
 export function killsByPattern(text) {
@@ -188,7 +164,7 @@ export function killsByPattern(text) {
 }
 export function fixtureLint(text, liveSids) {
   const bad = [];
-  if (killsByPattern(text)) bad.push("kills by pattern (pkill -f / killall): match processes by the pid you started instead");
+  if (killsByPattern(text)) bad.push("kills by pattern (pkill / killall, any form): kill the pid you started instead");
   for (const sid of liveSids) if (sid && text.includes(sid)) bad.push(`names the live session ${sid}: use a made-up sid`);
   return bad;
 }

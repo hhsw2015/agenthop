@@ -158,9 +158,30 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
     `spawnSync("${PK}", ["-9", "-f", "x"])`, `spawnSync(\n  "${PK}",\n  [\n    "-9",\n    "-f",\n    "x",\n  ],\n)`, `${KA} node`, `${PK} "-f" "text-only"`, `${PK} '--full' 'text-only'`, `${PK} -9 \\-f x`];
   const { jsStringLiterals } = await import("./run-selftests.mjs");
   ok(JSON.stringify(jsStringLiterals('a("x\\"y", \'q\\\'r\', `t${n}u`)')) === JSON.stringify(['x"y', "q'r", "t u"]), "js literals: \\\" / \\' decoded, ${} is a word gap");
-  const clean = [`${PK} -9 12345`, `spawnSync("${PK}", ["-9", "12345"])`, `process.kill(pid, "SIGKILL")`];
-  ok(flagged.every((x) => killsByPattern(x)), "lint matcher: every kill-by-pattern layout is flagged (incl. multi-line argv with -f after -9)");
-  ok(clean.every((x) => !killsByPattern(x)), "lint matcher: killing a specific pid is not flagged");
+  // FXL r9: the kill command without -f selects by NAME ("12345" is a name pattern), so it is flagged too; killing a pid you own is not
+  const flagged9 = [`${PK} -9 12345`, `spawnSync("${PK}", ["-9", "claude"])`, `spawnSync("\\x70kill", ["-f", "x"])`, `spawnSync("${PK}", ["\\u002df", "x"])`,
+    `spawnSync("pk\\x69ll", ["x"])`, `spawnSync("${PK.slice(0, 2)}\\u{69}ll", ["x"])`, `spawnSync("${KA.slice(0, 4)}\\u0061ll", ["x"])`];
+  ok(flagged9.every((x) => killsByPattern(x)), "lint matcher r9: kill-by-name without -f, and escaped command names / flags in an argv array, are flagged");
+  const clean = [`process.kill(pid, "SIGKILL")`, `spawnSync("kill", ["-9", String(child.pid)])`, `const skill = 1; ${PK}Count++`, `"un${PK}ed"`];
+  ok(clean.every((x) => !killsByPattern(x)), "lint matcher: killing a pid you own (process.kill / kill <pid>) and look-alike words are not flagged");
+  // FXL-SV-DECODE-PROGRESS: unfinished / unsupported escapes never move the cursor back; bounded on any input
+  const { DECODE_MAX_STEPS_PER_BYTE } = await import("./run-selftests.mjs");
+  const sv43 = "const a = /\\u{/; const b = String.raw`\\u{`;";
+  let t0 = performance.now(); jsStringLiterals(sv43); let took = performance.now() - t0;
+  ok(sv43.length === 43 && took < 50, `decoder: the 43-byte valid JS from Second Voice returns in ${took.toFixed(1)}ms (< 50ms)`);
+  for (const cut of ["'\\u{", "'\\u{12", "'\\x", "'\\x4", "'\\u12", "`${", "`${{", "'\\", "\"\\u{110000}\""]) {
+    t0 = performance.now(); jsStringLiterals(cut + cut + cut); took = performance.now() - t0;
+    ok(took < 50, `decoder: truncated ${JSON.stringify(cut)} ×3 returns (${took.toFixed(1)}ms)`);
+  }
+  let seed = 12345; const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const alpha = "\\'\"`${}u x0123456789abcdef\n/*";
+  let worst = 0;
+  for (let k = 0; k < 1000; k++) {
+    let str = ""; const n = Math.floor(rnd() * 200); for (let q = 0; q < n; q++) str += alpha[Math.floor(rnd() * alpha.length)];
+    t0 = performance.now(); jsStringLiterals(str); worst = Math.max(worst, performance.now() - t0);
+  }
+  ok(worst < 50, `decoder: 1000 random strings of escape-heavy text, none hangs (worst ${worst.toFixed(1)}ms)`);
+  ok(DECODE_MAX_STEPS_PER_BYTE >= 1, "decoder: a per-byte step budget is declared");
   const cases: Array<[string, string]> = [
     ["kill-by-pattern, multi-line argv with a signal first", 'spawnSync(\n  "' + PK + '",\n  ["-9",\n   "-f", "some-fixture-that-matches-nothing-zz"],\n);'],
     // the banned text is assembled at run time so THIS file stays clean under the same lint
@@ -172,6 +193,11 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
     ["kill-by-pattern, JS-escaped shell quotes", 'spawnSync("sh", ["-c", "' + PK + ' \\"-f\\" \\"text-only\\""]);'],
     ["kill-by-pattern, JS unicode escape for the flag", 'spawnSync("sh", ["-c", "' + PK + ' \\u002df text-only"]);'],
     ["kill-by-pattern, single-quoted long flag", 'spawnSync("sh", ["-c", "' + PK + " '--full' 'text-only'" + '"]);'],
+    // FXL r9: escaped command name / escaped flag in a static argv array; the kill command by name (no -f)
+    ["kill-by-pattern, escaped command name in argv", 'function never() { spawnSync("\\x70kill", ["-f", "text-only"]); }'],
+    ["kill-by-pattern, escaped -f in argv", 'function never() { spawnSync("' + PK + '", ["\\u002df", "text-only"]); }'],
+    ["kill-by-name, no -f flag", 'function never() { spawnSync("' + PK + '", ["-9", "text-only"]); }'],
+    // the 43-byte valid JS that hung the r8 decoder: the runner must finish its preflight (it has no kill, so it RUNS)
     ["a live presence sid", `const sid = "${LIVE}";`],
     ["the live coordinator sid", `const sid = "${COORD}";`],
   ];
@@ -181,6 +207,13 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
     ok(r.code === 1 && /fixture-safety lint FAILED — nothing was run/.test(r.out) && /LINT b\.selftest\.mts/.test(r.out), `lint: ${label} ⇒ exit 1, named`);
     ok(!require("node:fs").existsSync(ran(root)), `lint: ${label} ⇒ the file never ran`);
     rmSync(root, { recursive: true, force: true });
+  }
+  {
+    // FXL-SV-DECODE-PROGRESS through the whole runner: the 43-byte valid JS is in a selftest; preflight must finish and schedule it
+    const r43 = mkRoot(); marker(r43, "h.selftest.mts", "const a = /\\u{/; const b = String.raw`\\u{`; void a; void b;");
+    const t0 = performance.now(); const rr = runRunner(r43, { SELFTEST_HOME: fakeHome }); const took = performance.now() - t0;
+    ok(rr.code === 0 && require("node:fs").existsSync(ran(r43)) && took < 20000, `decoder: the 43-byte JS in a selftest ⇒ preflight finishes, the file runs (${Math.round(took)}ms)`);
+    rmSync(r43, { recursive: true, force: true });
   }
   const root = mkRoot(); marker(root, "c.selftest.mts", 'const sid = "eeeeeeee-1111-4222-8333-444444444444"; process.kill(process.pid, 0);');
   const r = runRunner(root, { SELFTEST_HOME: fakeHome });
