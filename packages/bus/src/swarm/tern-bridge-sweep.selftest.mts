@@ -276,7 +276,7 @@ for (const failing of ["drain", "drain-start"] as const) {
   t("movedSince: tick moved, same vm => ready", movedSince({ vm: "A", tick: 3 }, { vm: "A", tick: 4 }));
   t("movedSince: unchanged => not ready", !movedSince({ vm: "A", tick: 3 }, { vm: "A", tick: 3 }));
   t("movedSince: unreadable now => not ready", !movedSince({ vm: "A", tick: 3 }, null));
-  t("movedSince: unreadable baseline, readable now => ready", movedSince(null, { vm: "A", tick: 0 }));
+  t("movedSince (L5-SV-UNKNOWN-BASELINE): unreadable baseline => NOT ready, whatever is read now", !movedSince(null, { vm: "A", tick: 0 }));
 }
 
 // --- r5: TBS-REQUEST-CLASS — start classification comes from the decoded top-level op ---
@@ -423,6 +423,51 @@ t("control root: explicit AGENTHOP_BRIDGE_HOME wins", bridgeHome({ AH_HOME: "/tm
   }
   t("L5 gate: killed timer ⇒ the tick is moving again within 2 rounds after the stall threshold", recovered && rounds <= 2 && startTick > 0);
   t("L5 gate: that took exactly one reload", reloads(w) === 1);
+}
+
+// --- [liveness] L5-SV-UNKNOWN-BASELINE (P1): the stall is observed on an unchanged mirror; the NEXT read in that tick fails
+//     (old code took its baseline from exactly that read). After the reload the same unchanged mirror must NOT count as ready ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  w.mirrorAdvances = false;
+  w.reqs = [{ name: "s.json", ageMs: 99_000, isStart: true }];
+  w.clock += 6000;
+  let readsThisTick = 0;
+  const read0 = b.readMirror;
+  b.readMirror = () => (++readsThisTick === 2 ? null : read0()); // the 1st read (stall decision) works, the 2nd fails
+  const before = w.calls.length;
+  tick(st, b);
+  t("UNKNOWN-BASELINE: an unchanged mirror after the reload is NOT ready (obligation kept at ready)", st.owedAfterReload?.stage === "ready");
+  t("UNKNOWN-BASELINE: no arm / drain / drain-start ran on an unproven reload", !w.calls.slice(before).some((c) => /\.(arm-scan|drain|drain-start)$/.test(c)));
+}
+
+// --- [liveness] L5-SV-READY-CLOCK: a clock that jumps back during the ready wait cannot stretch it; it ends by poll count ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  w.mirrorAdvances = false;
+  w.clock += 6000;
+  let slept = 0;
+  b.sleep = (ms) => { slept++; w.clock -= 3_600_000; void ms; }; // every wait sets the clock back an hour
+  const before = mirrorCalls(w);
+  tick(st, b);
+  const probes = mirrorCalls(w) - before;
+  t("READY-CLOCK: clock rolled back an hour per wait ⇒ the ready wait still ends (≤ READY_POLLS probes, not thousands)", probes <= 18 && slept <= 17);
+  t("READY-CLOCK: the unfinished recovery is kept as an obligation", st.owedAfterReload?.stage === "ready");
+}
+
+// --- [liveness] clock rollback between ticks: the sweep must not go quiet for the length of the jump ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  w.clock -= 3_600_000; // the wall clock jumps back one hour
+  w.calls = [];
+  tick(st, b);
+  t("ROLLBACK: the next tick still drives the mirror (not 'throttled' for an hour)", mirrorCalls(w) === 1);
+  w.mirrorAdvances = false;
+  for (let i = 0; i < 3; i++) { w.clock += 5000; tick(st, b); }
+  t("ROLLBACK: a stall after the jump is still detected and recovered within a few rounds (not an hour)", reloads(w) === 1);
 }
 
 // --- L5: the unhealthy-but-debounced line is rate-limited too ---

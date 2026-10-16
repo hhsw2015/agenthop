@@ -31,6 +31,10 @@ export const TICK_STALL_MS = 5_000;
 export const REQ_STUCK_MS = 2_000;
 export const RELOAD_MIN_MS = 60_000;
 export const READY_WAIT_MS = 4_000;
+/** [liveness] the ready wait is ALSO bounded by poll count (immune to a clock that stalls or goes back) and by a monotonic
+ *  deadline: ≤ READY_POLLS mirror probes, ≤ READY_WAIT_MS + one TERN_TIMEOUT_MS + one READY_POLL_MS of real time. */
+export const READY_POLL_MS = 250;
+export const READY_POLLS = Math.ceil(READY_WAIT_MS / READY_POLL_MS) + 1;
 export const TERN_TIMEOUT_MS = 3_000;
 export const ARM_CANCEL_MAX = 64; // bound on arm-cancel iterations (a sentinel that never reaches 0 must not loop forever)
 /** L5: after this many consecutive UNKNOWN ticks (tern not answering) the sweep probes only once per UNKNOWN_BACKOFF_MS. */
@@ -174,6 +178,13 @@ const run = (io: BridgeIO, action: string): TernResult => io.tern(["ctl", "plugi
 export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolean): TickOutcome {
   if (!enabled) return "disabled";
   const now = io.nowMs();
+  // [liveness] the clock went BACK (wall-clock adjustment; production now uses a monotonic clock, this guards any io.nowMs):
+  // rebase every stored instant to now, so no interval reads as negative ⇒ never "throttled / debounced / not stalled" for the
+  // length of the jump. Effect is bounded: at most one interval of delay.
+  if (st.lastMirrorMs > now) st.lastMirrorMs = -Infinity;
+  if (st.lastTickChangeMs > now) st.lastTickChangeMs = now;
+  if (st.lastReloadMs > now) st.lastReloadMs = now;
+  if (st.lastDebouncedLogMs > now) st.lastDebouncedLogMs = -Infinity;
   // L5: once tern has not answered UNKNOWN_BACKOFF_AFTER ticks in a row, probe (and so log) at most once per UNKNOWN_BACKOFF_MS
   const every = st.unknownStreak >= UNKNOWN_BACKOFF_AFTER ? UNKNOWN_BACKOFF_MS : MIRROR_EVERY_MS;
   if (now - st.lastMirrorMs < every) return "throttled";
@@ -215,7 +226,7 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
       return "reload-debounced";
     }
     st.lastReloadMs = now;
-    return recover(st, io, why, stuck);
+    return recover(st, io, why, stuck, mirror);
   }
 
   // ② re-arm after a reload (new vm id) — once per vm.
@@ -234,8 +245,9 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
 }
 
 /** reload → wait ready → arm → drain (+drain-start). One control-log line whatever happens. */
-function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]): TickOutcome {
-  const before = io.readMirror();
+/** `before` = the mirror the stall was OBSERVED on (the caller just read it), not a fresh read: a fresh read that fails would leave
+ *  no baseline, and an unknown baseline must never make an unchanged mirror look "moved" (L5-SV-UNKNOWN-BASELINE). */
+function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[], before: Mirror): TickOutcome {
   const r = io.tern(["plugin", "reload"]);
   if (!r.ok) {
     io.controlLog(`tern-bridge reload FAILED (${why}): ${r.detail}`);
@@ -244,16 +256,16 @@ function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]
   }
   // ready = after a mirror run, the vm id changed or the tick moved. `tern plugin list` is NOT used: without a reachable daemon it
   // falls back to listing the plugins directory and still says "ready".
-  const deadline = io.nowMs() + READY_WAIT_MS;
+  const t0 = performance.now(); // monotonic: a wall-clock jump cannot stretch this wait
   let ready = false;
-  while (!ready) {
+  for (let poll = 0; poll < READY_POLLS && !ready; poll++) {
     if (run(io, "mirror").ok) {
       const after = io.readMirror();
       ready = movedSince(before, after);
       if (ready) { st.lastTick = after!.tick; st.lastTickChangeMs = io.nowMs(); }
     }
-    if (ready || io.nowMs() >= deadline) break;
-    io.sleep(250);
+    if (ready || poll === READY_POLLS - 1 || performance.now() - t0 >= READY_WAIT_MS) break;
+    io.sleep(READY_POLL_MS);
   }
   // From here a reload HAPPENED: whatever is left (ready, arm, drain) is an obligation kept across ticks until the WHOLE chain
   // succeeds, never re-entering the reload debounce (TBS-ARM-RETRY, coordinator ruling).
@@ -270,9 +282,10 @@ function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]
 /** The post-reload obligation: arm sequence, then drain (+drain-start). A stopped arm keeps the obligation (no drain after a half
  *  arm) and is retried on the next tick WITHOUT another reload. Discharged only when arm completed and the drain trigger was sent. */
 /** The one readiness rule: after a reload the bridge is ready iff the mirror is readable and its vm or tick differs from the
- *  pre-reload baseline (a baseline that was unreadable makes any readable mirror count). */
+ *  pre-reload baseline. UNKNOWN baseline (null) ⇒ NOT ready: without a known "before", no change can be proven
+ *  (L5-SV-UNKNOWN-BASELINE, P1). */
 export function movedSince(baseline: Mirror, now: Mirror): boolean {
-  return now !== null && (baseline === null || now.vm !== baseline.vm || now.tick !== baseline.tick);
+  return now !== null && baseline !== null && (now.vm !== baseline.vm || now.tick !== baseline.tick);
 }
 
 function finishAfterReload(st: BridgeState, io: BridgeIO, now: Mirror): TickOutcome {
@@ -299,7 +312,7 @@ function finishAfterReload(st: BridgeState, io: BridgeIO, now: Mirror): TickOutc
         st.lastReloadMs = t;
         // the existing obligation (baseline, startStuck) stays in place until recover() REPLACES it with a new one — which it
         // does only once a reload actually ran; a failed / unanswered reload leaves this one intact, retried after the debounce
-        const out = recover(st, io, owed.why, owed.startStuck ? [{ name: "(owed drain-start)", ageMs: 0, isStart: true }] : []);
+        const out = recover(st, io, owed.why, owed.startStuck ? [{ name: "(owed drain-start)", ageMs: 0, isStart: true }] : [], owed.baseline);
         if (st.owedAfterReload === owed) owed.rounds = 0; // still the old one: the reload did not run; count again from here
         return out;
       }
