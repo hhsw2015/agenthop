@@ -116,6 +116,7 @@ user 离场期你**代行其可撤决策**(可撤判据见 CORE 代理权节);�
 - **F53 操作回执**:你自己的 spawn/inject **以耐久证据判成**(checkpoint sha 越过出生锚),**非 API 瞬时返回**;unknown ⇒ 呈报 user,不自动重做。详见 `coordinator-ops-succession-runbook.md`。
 - **存活机制不绑角色**(user 2026-10-16):停摆防线只放三处——coordinator SKILL(§1b)、dispatcher(无模型常驻哨:进度看门狗 / 桥自愈 / 自拉起 / 审查席停滞自处理)、Carly(可选)。修法文档的 owner 列是本仓编制,换项目换人,机制不变。
 - **每周期核 dispatcher**:`kill -0 $(cat $AH_HOME/.agenthop/swarm/dispatcher.lock)` 不活 ⇒ 按 recovery runbook ③ 起(setsid + recipe 净化 env,不从席位继承),记 PROGRESS 一行。dispatcher 不开机自启、不进 launchd(user 裁:少改系统);机器重启后由你这一步带回。
+- **每周期写角色→活 sid 映射**:`$AH_HOME/.agenthop/swarm/roles/coordinator.sid` = 你当前会话 sid(一行)。角色箱键(SWARM_COORDINATOR)是稠密地址不随会话换,presence 却按活 sid 记——dispatcher 的 L4/L8 靠这个文件找到你的进程与块;文件缺/旧 ⇒ 它只能 S19+L0 不敢注块。轮换/继任时新席第一轮就写。
 - **liveness 件走更高一级**(user 2026-10-16:「长时间稳定运行是持续推进的基础,持续推进是你的核心职责」):触及消息传递 / 卡点处理 / 哨与自愈 / 席位生命周期 / 协调者例程的改动,按 `docs/swarm/liveness-tier.md`:双声之上叠故障注入逐项夹具 + FC-2 逐行 + 投递先于记账 + 预算上界 + **12h soak 过了才算交付**;你亲自跑一遍注入清单再并;每晚写「夜班起点」行,次晨先填 soak 表。
 
 **席位生命周期 / 轮换(全席位)**——权威 `~/.agenthop/swarm/coordinator-recovery-runbook.md`(v2),要点:
@@ -161,6 +162,17 @@ CLI 读 `AGENTHOP_RULINGS_DIR` 否则脚本所在仓(`rulings.ts:108`)——**�
 - **同号碰撞(实测)**:账本 **R3 = 凭证收窄**;CORE 代理权「R3 判据」= **可撤性**——同号不同义,可撤代行引 CORE 代理权节,不引账本 R3。按「存在且含义相符」核验。
 
 ## 8. 新项目开张流程(spawn-coordinator — 出生即胜任)
+
+**定位(user 2026-10-16 原话):「当前这一套流程只是在开发 agenthop 上做实验,把流程搞到成熟可靠……稳定之后把这套流程去开发其他项目。鸡生蛋、蛋生鸡:先从开发你自己上持续改进,最后成熟到可以去开发其他项目。」** 所以 agenthop 仓是**孵化器不是终点**:每条规则写下时问一句「换个仓、换套编制还成立吗」;本节的开张流程就是毕业考。
+
+**毕业判据(开第二个项目之前全部为真,缺一不开)**:
+1. 连续 **3 个夜班 soak 全过**(liveness-tier §3 八行无「不过」),期间零 user 介入解卡。
+2. 无人值守链全部在现网:dispatcher 看护(L6)/ 协调者自继任(L8)/ 审查席停滞自处理(L7)/ 进度看门狗(L4)/ 桥自愈(L5),各有过现网故障注入。
+3. 技能 + dispatcher 代码里零角色名、零本仓路径硬编码(`grep -rn "Platform Dev\|Infra Dev\|/Dev/agenthop"` 为空);本仓参数全在 workspace 注入(§0)。
+4. 本节 ① spawn-coordinator runbook 在一个**非 agenthop 的玩具仓**上干跑一次:新协调者第一轮(§8 ③)不问人就能派出第一单并收回交付。
+5. retro-learn 环跑过至少一轮完整闭环(记录面 → 草稿 → 协调者裁 → skill 行),证明「持续改进」是机制不是意愿。
+达成即写 PROGRESS「毕业」行,把第二个项目的 projects.json 条目建起来。
+
 
 一个新项目 = 一个新协调者 session 从零到胜任。本节是「出生包」:加载本技能 + 走完下面四步,新 session 即成为该项目的协调者。(下文 `AH_HOME` = §0 的家目录参数;dispatch 所称 `DATA_ROOT` 即此,数据面 = `$AH_HOME/.agenthop`。)
 
