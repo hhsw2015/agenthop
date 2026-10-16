@@ -5,10 +5,12 @@
 // Each fixture root holds plain *.selftest.mts scripts (no repo imports); the runner resolves tsx from the real repo.
 //   npx tsx scripts/run-selftests.selftest.mts
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
 
 const RUNNER = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "run-selftests.mjs");
 let pass = 0;
@@ -20,7 +22,7 @@ const ok = (c: boolean, m: string): void => { if (!c) { console.error(`FAIL ${m}
  *  Scrub every SELFTEST_* control from the inherited env; each test re-supplies exactly the knobs it wants via `env`. */
 function runRunner(root: string, env: Record<string, string> = {}): { code: number; out: string } {
   const base: Record<string, string | undefined> = { ...process.env };
-  for (const k of ["SELFTEST_SHARD", "SELFTEST_TIMEOUT", "SELFTEST_KILL_GRACE", "SELFTEST_MAXCAP", "SELFTEST_ROOT"]) delete base[k];
+  for (const k of ["SELFTEST_SHARD", "SELFTEST_TIMEOUT", "SELFTEST_KILL_GRACE", "SELFTEST_MAXCAP", "SELFTEST_ROOT", "SELFTEST_HOME"]) delete base[k];
   const r = spawnSync("node", [RUNNER], { encoding: "utf8", env: { ...base, SELFTEST_ROOT: root, ...env }, timeout: 30000 });
   return { code: r.status ?? -1, out: `${r.stdout || ""}${r.stderr || ""}` };
 }
@@ -37,17 +39,20 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
 
 // ── STCI-P2-1: a broken-symlink *.selftest.mts (stat fault) must FAIL LOUD, not shrink to the readable subset ──
 {
-  const root = mkRoot(); goodSelftest(root, "good.selftest.mts");
+  const root = mkRoot(); const mark = path.join(root, "ran.marker");
+  writeFileSync(path.join(root, "good.selftest.mts"), `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(mark)}, "x");\n`);
   symlinkSync(path.join(root, "does-not-exist-target"), path.join(root, "broken.selftest.mts")); // statSync follows ⇒ ENOENT
   const r = runRunner(root);
   ok(r.code === 1, "STCI-P2-1: a stat-fault entry ⇒ exit 1 (not a silent 1/1 green)");
   ok(/DISCOVERY-FAIL/.test(r.out) && /broken\.selftest\.mts/.test(r.out), "STCI-P2-1: the failing path is NAMED");
+  ok(!existsSync(mark), "STCI-P2-1 (r6): the READABLE test beside a stat fault never ran (fail-closed before the first test)");
   rmSync(root, { recursive: true, force: true });
 }
 
 // ── STCI-P2-1b: an unreadable subdirectory (readdir fault) must FAIL LOUD (can't prove no selftests hide under it) ──
 {
-  const root = mkRoot(); goodSelftest(root, "good.selftest.mts");
+  const root = mkRoot(); const mark = path.join(root, "ran.marker");
+  writeFileSync(path.join(root, "good.selftest.mts"), `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(mark)}, "x");\n`);
   const locked = path.join(root, "locked"); mkdirSync(locked); goodSelftest(locked, "hidden.selftest.mts");
   // chmod 000 so readdir(locked) faults. (Skipped as root, where mode is ignored — then this assertion is vacuously true.)
   const { chmodSync } = await import("node:fs");
@@ -55,7 +60,10 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
   const r = runRunner(root);
   try {
     if (process.getuid && process.getuid() === 0) { ok(true, "STCI-P2-1b: (running as root — mode ignored — skipped)"); }
-    else ok(r.code === 1 && /DISCOVERY-FAIL/.test(r.out) && /locked/.test(r.out), "STCI-P2-1b: an unreadable subdir ⇒ exit 1, named (never fold to empty)");
+    else {
+      ok(r.code === 1 && /DISCOVERY-FAIL/.test(r.out) && /locked/.test(r.out), "STCI-P2-1b: an unreadable subdir ⇒ exit 1, named (never fold to empty)");
+      ok(!existsSync(mark), "STCI-P2-1b (r6): the READABLE test beside an EACCES dir never ran");
+    }
   } finally { chmodSync(locked, 0o700); rmSync(root, { recursive: true, force: true }); }
 }
 
@@ -132,6 +140,129 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
   const r = runRunner(root);
   ok(r.code === 1 && /LATE_STDERR_MARKER/.test(r.out), "STCI-R2-P3-1: a LATE stderr marker survives early stdout (arrival-order tail, reverse)");
   rmSync(root, { recursive: true, force: true });
+}
+
+// ── fixture-safety lint (incident 2026-10-16): a selftest that kills by pattern or names a live sid is refused, nothing runs ──
+{
+  const fakeHome = mkRoot(); mkdirSync(path.join(fakeHome, ".agenthop", "presence"), { recursive: true }); mkdirSync(path.join(fakeHome, ".agenthop", "swarm", "roles"), { recursive: true });
+  const PK = "p" + "kill"; // never a literal in this file
+  const LIVE = "cccccccc-1111-4222-8333-444444444444", COORD = "dddddddd-1111-4222-8333-444444444444"; // made-up "live" sids in a fake home
+  writeFileSync(path.join(fakeHome, ".agenthop", "presence", `${LIVE}.pid`), "1");
+  writeFileSync(path.join(fakeHome, ".agenthop", "swarm", "roles", "coordinator.sid"), `${COORD}\n`);
+  const ran = (root: string) => path.join(root, "ran.marker");
+  const marker = (root: string, name: string, body: string) => writeFileSync(path.join(root, name), `import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nwriteFileSync(${JSON.stringify(ran(root))}, "x");\n${body}\n`);
+  // FXL-PATTERN-COVERAGE: the pure matcher on every layout (command word built at run time so this file stays clean)
+  const { killsByPattern } = await import("./run-selftests.mjs");
+  const KA = "kill" + "all";
+  const flagged = [`${PK} -f foo`, `sh -c "${PK} -9 -f foo"`, `${PK} -9f foo`, `${PK} -fx foo`, `${PK} --full foo`, `spawnSync("${PK}", ["-f", "x"])`,
+    `spawnSync("${PK}", ["-9", "-f", "x"])`, `spawnSync(\n  "${PK}",\n  [\n    "-9",\n    "-f",\n    "x",\n  ],\n)`, `${KA} node`, `${PK} "-f" "text-only"`, `${PK} '--full' 'text-only'`, `${PK} -9 \\-f x`];
+  const { jsStringLiterals } = await import("./run-selftests.mjs");
+  ok(JSON.stringify(jsStringLiterals('a("x\\"y", \'q\\\'r\', `t${n}u`)')) === JSON.stringify(['x"y', "q'r", "t u"]), "js literals: \\\" / \\' decoded, ${} is a word gap");
+  // FXL r9: the kill command without -f selects by NAME ("12345" is a name pattern), so it is flagged too; killing a pid you own is not
+  const flagged9 = [`${PK} -9 12345`, `spawnSync("${PK}", ["-9", "claude"])`, `spawnSync("\\x70kill", ["-f", "x"])`, `spawnSync("${PK}", ["\\u002df", "x"])`,
+    `spawnSync("pk\\x69ll", ["x"])`, `spawnSync("${PK.slice(0, 2)}\\u{69}ll", ["x"])`, `spawnSync("${KA.slice(0, 4)}\\u0061ll", ["x"])`];
+  ok(flagged9.every((x) => killsByPattern(x)), "lint matcher r9: kill-by-name without -f, and escaped command names / flags in an argv array, are flagged");
+  const clean = [`process.kill(pid, "SIGKILL")`, `spawnSync("kill", ["-9", String(child.pid)])`, `const skill = 1; ${PK}Count++`, `"un${PK}ed"`];
+  ok(clean.every((x) => !killsByPattern(x)), "lint matcher: killing a pid you own (process.kill / kill <pid>) and look-alike words are not flagged");
+  // FXL-SV-DECODE-PROGRESS: unfinished / unsupported escapes never move the cursor back; bounded on any input
+  const { DECODE_MAX_STEPS_PER_BYTE } = await import("./run-selftests.mjs");
+  const sv43 = "const a = /\\u{/; const b = String.raw`\\u{`;";
+  let t0 = performance.now(); jsStringLiterals(sv43); let took = performance.now() - t0;
+  ok(sv43.length === 43 && took < 50, `decoder: the 43-byte valid JS from Second Voice returns in ${took.toFixed(1)}ms (< 50ms)`);
+  for (const cut of ["'\\u{", "'\\u{12", "'\\x", "'\\x4", "'\\u12", "`${", "`${{", "'\\", "\"\\u{110000}\""]) {
+    t0 = performance.now(); jsStringLiterals(cut + cut + cut); took = performance.now() - t0;
+    ok(took < 50, `decoder: truncated ${JSON.stringify(cut)} ×3 returns (${took.toFixed(1)}ms)`);
+  }
+  let seed = 12345; const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const alpha = "\\'\"`${}u x0123456789abcdef\n/*";
+  let worst = 0;
+  for (let k = 0; k < 1000; k++) {
+    let str = ""; const n = Math.floor(rnd() * 200); for (let q = 0; q < n; q++) str += alpha[Math.floor(rnd() * alpha.length)];
+    t0 = performance.now(); jsStringLiterals(str); worst = Math.max(worst, performance.now() - t0);
+  }
+  ok(worst < 50, `decoder: 1000 random strings of escape-heavy text, none hangs (worst ${worst.toFixed(1)}ms)`);
+  ok(DECODE_MAX_STEPS_PER_BYTE >= 1, "decoder: a per-byte step budget is declared");
+  // FXL r10 · FXL-PATTERN-COVERAGE: \u{…} with any number of hex digits (leading zeros are legal JS) decodes to the real code
+  // point; every escape form spelling the kill commands is flagged. Checked against the JS engine itself (eval of the literal).
+  const spell = (word: string, form: number) => [...word].map((ch, i) => {
+    const h = ch.charCodeAt(0).toString(16); const f = (form + i) % 5;
+    return f === 0 ? `\\u{${"0".repeat(1 + ((form * 7 + i) % 9))}${h}}` : f === 1 ? `\\u{${h}}` : f === 2 ? `\\x${h.padStart(2, "0")}` : f === 3 ? `\\u${h.padStart(4, "0")}` : ch;
+  }).join("");
+  let missed = 0, engineAgrees = 0;
+  for (let k = 0; k < 200; k++) {
+    const word = k % 2 ? PK : KA;
+    const lit = spell(word, k);
+    const src = `spawnSync("${lit}", ["x"])`;
+    if ((0, eval)(`"${lit}"`) === word) engineAgrees++;
+    if (!killsByPattern(src)) missed++;
+  }
+  ok(engineAgrees === 200 && missed === 0, `lint r10: 200 escape-spelled kill commands (long \\u{000…}, \\u{}, \\x, \\u) all flagged (${missed} missed)`);
+  ok(killsByPattern('spawnSync("\\u{000000070}kill", ["-9", "x"])'), "lint r10: Second Voice's long \\u{000000070} escape is flagged");
+  // FXL r10 · FXL-SV-DECODE-WORK: unclosed \u{ costs the digits read, not a search to the end ⇒ linear
+  const big = (n: number) => "const b = String.raw`" + "\\u{".repeat(n / 3) + "`;";
+  const time = (n: number) => { const s0 = big(n); const t1 = performance.now(); jsStringLiterals(s0); return performance.now() - t1; };
+  const t150 = time(150_000), t600 = time(600_000);
+  ok(t600 < 100, `decoder r10: 600 KiB of unclosed \\u{ decodes in ${t600.toFixed(1)}ms (< 100ms)`);
+  // Chief's sizes: N = 128,000 / 256,000 unclosed \u{ in valid JS < 200ms each, decoded output identical to his 12-char-window
+  // control (a window decodes the same here: every \u{ is unclosed, so both take it literally)
+  for (const n of [128_000, 256_000]) {
+    const src0 = "const b = String.raw`" + "\\u{".repeat(n) + "`;";
+    const t1 = performance.now(); const got = jsStringLiterals(src0); const dt = performance.now() - t1;
+    ok(dt < 200 && got.length === 1 && got[0] === "u{".repeat(n), `decoder r10: N=${n} unclosed \\u{ ⇒ ${dt.toFixed(1)}ms (< 200ms), output = literal text`);
+  }
+  ok(t600 < 8 * Math.max(t150, 1), `decoder r10: 4× input is not super-linear (${t150.toFixed(1)}ms → ${t600.toFixed(1)}ms)`);
+  const cases: Array<[string, string]> = [
+    ["kill-by-pattern, multi-line argv with a signal first", 'spawnSync(\n  "' + PK + '",\n  ["-9",\n   "-f", "some-fixture-that-matches-nothing-zz"],\n);'],
+    // the banned text is assembled at run time so THIS file stays clean under the same lint
+    ["kill-by-pattern in a shell string", 'spawnSync("sh", ["-c", "' + PK + ' -f some-fixture-that-matches-nothing-zz"]);'],
+    ["kill-by-pattern as spawn args", 'spawnSync("' + PK + '", ["-f", "some-fixture-that-matches-nothing-zz"]);'],
+    // FXL-PATTERN-COVERAGE r7: quoted flags inside a shell string decode to the same argv
+    ["kill-by-pattern, double-quoted flag in sh -c", 'spawnSync("sh", ["-c", `' + PK + ' "-f" "text-only"`]);'],
+    // FXL r8: the shell quotes are JS-escaped inside a JS double-quoted string (the runner must decode JS first, then shell)
+    ["kill-by-pattern, JS-escaped shell quotes", 'spawnSync("sh", ["-c", "' + PK + ' \\"-f\\" \\"text-only\\""]);'],
+    ["kill-by-pattern, JS unicode escape for the flag", 'spawnSync("sh", ["-c", "' + PK + ' \\u002df text-only"]);'],
+    ["kill-by-pattern, single-quoted long flag", 'spawnSync("sh", ["-c", "' + PK + " '--full' 'text-only'" + '"]);'],
+    // FXL r9: escaped command name / escaped flag in a static argv array; the kill command by name (no -f)
+    ["kill-by-pattern, escaped command name in argv", 'function never() { spawnSync("\\x70kill", ["-f", "text-only"]); }'],
+    ["kill-by-pattern, escaped -f in argv", 'function never() { spawnSync("' + PK + '", ["\\u002df", "text-only"]); }'],
+    ["kill-by-name, no -f flag", 'function never() { spawnSync("' + PK + '", ["-9", "text-only"]); }'],
+    // the 43-byte valid JS that hung the r8 decoder: the runner must finish its preflight (it has no kill, so it RUNS)
+    ["a live presence sid", `const sid = "${LIVE}";`],
+    ["the live coordinator sid", `const sid = "${COORD}";`],
+  ];
+  for (const [label, body] of cases) {
+    const root = mkRoot(); goodSelftest(root, "a.selftest.mts"); marker(root, "b.selftest.mts", body);
+    const r = runRunner(root, { SELFTEST_HOME: fakeHome });
+    ok(r.code === 1 && /fixture-safety lint FAILED — nothing was run/.test(r.out) && /LINT b\.selftest\.mts/.test(r.out), `lint: ${label} ⇒ exit 1, named`);
+    ok(!require("node:fs").existsSync(ran(root)), `lint: ${label} ⇒ the file never ran`);
+    rmSync(root, { recursive: true, force: true });
+  }
+  {
+    // FXL-SV-DECODE-PROGRESS through the whole runner: the 43-byte valid JS is in a selftest; preflight must finish and schedule it
+    const r43 = mkRoot(); marker(r43, "h.selftest.mts", "const a = /\\u{/; const b = String.raw`\\u{`; void a; void b;");
+    const t0 = performance.now(); const rr = runRunner(r43, { SELFTEST_HOME: fakeHome }); const took = performance.now() - t0;
+    ok(rr.code === 0 && require("node:fs").existsSync(ran(r43)) && took < 20000, `decoder: the 43-byte JS in a selftest ⇒ preflight finishes, the file runs (${Math.round(took)}ms)`);
+    rmSync(r43, { recursive: true, force: true });
+  }
+  const root = mkRoot(); marker(root, "c.selftest.mts", 'const sid = "eeeeeeee-1111-4222-8333-444444444444"; process.kill(process.pid, 0);');
+  const r = runRunner(root, { SELFTEST_HOME: fakeHome });
+  ok(r.code === 0 && require("node:fs").existsSync(ran(root)), "lint: a made-up sid and kill-by-own-pid pass (positive)");
+  rmSync(root, { recursive: true, force: true });
+  // fail-closed (r4): an unreadable inventory, or an unreadable selftest source, ⇒ nothing runs at all
+  const chmodSync = require("node:fs").chmodSync as (p: string, m: number) => void;
+  const noInv = mkRoot(); marker(noInv, "a.selftest.mts", "");
+  chmodSync(path.join(fakeHome, ".agenthop", "presence"), 0o000);
+  const r1 = runRunner(noInv, { SELFTEST_HOME: fakeHome }); chmodSync(path.join(fakeHome, ".agenthop", "presence"), 0o700);
+  ok(r1.code === 1 && /inventory.*cannot be read/.test(r1.out) && !require("node:fs").existsSync(ran(noInv)), "lint: live-sid inventory unreadable ⇒ exit 1, NOTHING ran");
+  const noSrc = mkRoot(); marker(noSrc, "a.selftest.mts", ""); writeFileSync(path.join(noSrc, "b.selftest.mts"), "console.log(1)\n"); chmodSync(path.join(noSrc, "b.selftest.mts"), 0o000);
+  const r2 = runRunner(noSrc, { SELFTEST_HOME: fakeHome }); chmodSync(path.join(noSrc, "b.selftest.mts"), 0o600);
+  ok(r2.code === 1 && /b\.selftest\.mts: source unreadable/.test(r2.out) && !require("node:fs").existsSync(ran(noSrc)), "lint: one selftest source unreadable ⇒ exit 1, NOTHING ran (not even the readable one)");
+  // no path is exempt: a selftest at scripts/run-selftests.selftest.mts naming a live sid is refused like any other
+  const self = mkRoot(); mkdirSync(path.join(self, "scripts")); marker(self, path.join("scripts", "run-selftests.selftest.mts"), `const s = "${LIVE}";`);
+  const r3 = runRunner(self, { SELFTEST_HOME: fakeHome });
+  ok(r3.code === 1 && /LINT scripts\/run-selftests\.selftest\.mts/.test(r3.out) && !require("node:fs").existsSync(ran(self)), "lint: no path exemption — the runner's own selftest path is checked too");
+  for (const d of [noInv, noSrc, self]) rmSync(d, { recursive: true, force: true });
+  rmSync(fakeHome, { recursive: true, force: true });
 }
 
 console.log(`\nall run-selftests runner selftests passed (${pass})`);

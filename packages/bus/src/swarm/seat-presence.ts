@@ -37,22 +37,34 @@ export type SeatTool = "claude" | "codex";
  *  process tree — never to identify the agent (SP-ARGV: one `node -e "… stream-json --resume=<sid>"` argument would split into
  *  fake flags). Identification uses ExactArgv. Pure. */
 export function parsePs(text: string): PsRow[] {
+  return parsePsBudgeted(text, () => false) ?? [];
+}
+
+/** parsePs that checks `overBudget` every 256 lines (PW-SV-SWEEP-BUDGET r9: parsing is part of the bounded round); null = over. */
+export function parsePsBudgeted(text: string, overBudget: () => boolean): PsRow[] | null {
   const out: PsRow[] = [];
+  let n = 0;
   for (const line of text.split("\n")) {
+    if ((++n & 255) === 0 && overBudget()) return null;
     const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
     if (m) out.push({ pid: Number(m[1]), ppid: Number(m[2]), argv: m[3]!.trim().split(/\s+/) });
   }
-  return out;
+  return overBudget() ? null : out;
 }
 
-function hasResume(argv: string[], sid: string): boolean {
-  return argv.some((a, i) => a === `--resume=${sid}` || (a === "--resume" && argv[i + 1] === sid));
+/** The seat's own id on a claude argv, as whole elements: `--resume <sid>` / `--resume=<sid>` (a resumed seat) or `--session-id <sid>`
+ *  / `--session-id=<sid>` (a FRESH seat: Tern's ACP adapter starts a new session with an explicit id — every seat rotated by the
+ *  lifecycle runbook runs this way and has no --resume). Either is an exact, kernel-reported statement of which session the process
+ *  is; nothing weaker (a substring, a ps text split) is accepted. */
+function namesSession(argv: string[], sid: string): boolean {
+  return argv.some((a, i) => a === `--resume=${sid}` || a === `--session-id=${sid}`
+    || ((a === "--resume" || a === "--session-id") && argv[i + 1] === sid));
 }
 
 /** The agent pid under a block's `tern acp` root, or null when not exactly one candidate. The tree comes from `rows`; every
  *  candidate is then identified from its EXACT argv and executable (`exact`): claude ⇒ the executable's argv[0] basename is
- *  "claude" (the native build runs as a versioned file but keeps argv[0] = "claude") AND `stream-json` and `--resume=<sid>` /
- *  `--resume <sid>` are whole, separate elements; codex ⇒ a direct child whose executable basename is "node" and whose argv[1] is
+ *  "claude" (the native build runs as a versioned file but keeps argv[0] = "claude") AND `stream-json` and the seat's id
+ *  (`--resume` or, for a fresh seat, `--session-id`, either form) are whole, separate elements; codex ⇒ a direct child whose executable basename is "node" and whose argv[1] is
  *  a path inside /@agentclientprotocol/codex-acp/. An unreadable exact argv is UNKNOWN: it never matches, and if it might have been
  *  the agent the answer is null (never a guess). */
 export function resolveAgentPid(rootPid: number, sid: string, tool: SeatTool, rows: PsRow[], exact: ExactArgv): number | null {
@@ -73,7 +85,7 @@ export function resolveAgentPid(rootPid: number, sid: string, tool: SeatTool, ro
       if (!r.argv.join(" ").includes(sid)) return false; // cheap prefilter only; the decision is on the exact argv
       const x = exact(r.pid);
       if (x === null) { unknown = true; return false; }
-      return path.basename(x.argv[0] ?? "") === "claude" && x.argv.includes("stream-json") && hasResume(x.argv, sid);
+      return path.basename(x.argv[0] ?? "") === "claude" && x.argv.includes("stream-json") && namesSession(x.argv, sid);
     });
     if (unknown) return null;
   } else {
@@ -263,4 +275,92 @@ function defaultRunSync(bin: string, args: string[]): string | null {
 /** `kill -0`: alive on success or EPERM. */
 export function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+/** Three-state resolver (bus.11 r4, PW-LOCATOR-UNKNOWN): the agent pid for `sid` under `rootPid`, or why there is none.
+ *  "none" = every candidate's exact argv was READ and none is this seat; "unknown" = some candidate's argv could not be read (or
+ *  the budget ran out before it was read) — it might have been the seat, so the caller must not treat this as absence; "ambiguous"
+ *  = more than one process is this seat. Same identity rules as resolveAgentPid (which keeps its old null contract for its other
+ *  callers). `exact` may return "over-budget" (treated as unknown). */
+export type Resolved = { kind: "match"; pid: number } | { kind: "none" } | { kind: "unknown"; why: string } | { kind: "ambiguous" };
+/** The ppid → children index of one process table. Built ONCE per table and shared by every root resolved against it
+ *  (PW-SV-SWEEP-BUDGET r9: rebuilding it per root made a 1500-root round cost seconds of CPU between deadline checks). */
+export type PsIndex = { rows: PsRow[]; kids: Map<number, PsRow[]> };
+const INDEXES = new WeakMap<PsRow[], PsIndex>();
+export function psIndex(rows: PsRow[]): PsIndex {
+  let ix = INDEXES.get(rows);
+  if (!ix) {
+    const kids = new Map<number, PsRow[]>();
+    for (const r of rows) { const k = kids.get(r.ppid); if (k) k.push(r); else kids.set(r.ppid, [r]); }
+    ix = { rows, kids }; INDEXES.set(rows, ix);
+  }
+  return ix;
+}
+
+/** `overBudget` (optional) is checked during the walk and before every exact-argv read: true ⇒ unknown. */
+export function resolveAgentPid3(rootPid: number, sid: string, tool: SeatTool, rows: PsRow[],
+  exact: (pid: number) => ReturnType<ExactArgv> | "over-budget", overBudget: () => boolean = () => false): Resolved {
+  // PW-INVALID-ROOT: never search from pid 0 / negative / 1 (that is every process on the machine)
+  if (!Number.isSafeInteger(rootPid) || rootPid <= 1) return { kind: "unknown", why: `invalid root pid ${rootPid}` };
+  const { kids } = psIndex(rows);
+  let cands: PsRow[];
+  if (tool === "claude") {
+    const desc: PsRow[] = []; const seen = new Set<number>(); const frontier = [rootPid];
+    let steps = 0;
+    while (frontier.length > 0) {
+      if ((++steps & 255) === 0 && overBudget()) return { kind: "unknown", why: "budget spent walking the process tree" };
+      for (const c of kids.get(frontier.pop()!) ?? []) if (!seen.has(c.pid)) { seen.add(c.pid); desc.push(c); frontier.push(c.pid); }
+    }
+    if (overBudget()) return { kind: "unknown", why: "budget spent walking the process tree" };
+    cands = desc.filter((r) => r.argv.join(" ").includes(sid)); // cheap prefilter only; the decision is on the exact argv
+  } else cands = (kids.get(rootPid) ?? []).filter((r) => r.argv.join(" ").includes("/@agentclientprotocol/codex-acp/"));
+  const hits: number[] = [];
+  for (const r of cands) {
+    const x = exact(r.pid);
+    if (x === "over-budget") return { kind: "unknown", why: `budget spent before pid ${r.pid}'s argv was read` };
+    if (x === null) return { kind: "unknown", why: `argv of pid ${r.pid} unreadable` };
+    const yes = tool === "claude"
+      ? path.basename(x.argv[0] ?? "") === "claude" && x.argv.includes("stream-json") && namesSession(x.argv, sid)
+      : path.basename(x.exe) === "node" && (x.argv[1] ?? "").includes("/@agentclientprotocol/codex-acp/");
+    if (yes) hits.push(r.pid);
+  }
+  return hits.length === 0 ? { kind: "none" } : hits.length === 1 ? { kind: "match", pid: hits[0]! } : { kind: "ambiguous" };
+}
+
+/** realExactArgv under a shared deadline (PW-SV-SWEEP-BUDGET): each query is given what is left as its timeout and charged what it
+ *  took; once the deadline has passed the query is not started ("over-budget"). `deadlineMs` is a performance.now()-style monotonic
+ *  value; `now` is injectable for tests. */
+export function budgetedExactArgv(deadlineMs: number, now: () => number,
+  run: (bin: string, args: string[], timeoutMs: number) => string | null = (bin, args, t) => { const r = safeSpawnSync(bin, args, t); return r.status === 0 ? r.stdout : null; },
+): (pid: number) => ReturnType<ExactArgv> | "over-budget" {
+  return (pid) => {
+    const left = deadlineMs - now();
+    if (spawnTimeout(left) === null) return "over-budget"; // < 1ms left (or a fraction of one) ⇒ never start a query
+    const res = realExactArgv((bin, args) => run(bin, args, left))(pid);
+    return now() > deadlineMs ? "over-budget" : res; // finished past the deadline ⇒ not used
+  };
+}
+
+/** A spawnSync timeout from a remaining budget (PW-FRACTIONAL-TIMEOUT): Node takes only a non-negative INTEGER, and 0 means "no
+ *  timeout at all". Fractional performance.now() remainders are floored (conservative); anything below 1ms is refused (null) so an
+ *  exhausted budget never becomes an unbounded call. Pure. */
+export function spawnTimeout(leftMs: number): number | null {
+  if (!Number.isFinite(leftMs)) return null;
+  const t = Math.floor(leftMs);
+  return t >= 1 ? t : null;
+}
+/** spawnSync that never throws and never runs unbounded: a refused budget or a thrown spawn ⇒ { refused | error }; at the deadline
+ *  the child is SIGKILLed (not asked to stop), so the call returns within the budget even if the child ignores SIGTERM. */
+export function safeSpawnSync(bin: string, args: string[], leftMs: number, extra: { env?: NodeJS.ProcessEnv } = {}):
+  { status: number | null; stdout: string; timedOut: boolean; refused: boolean; error?: string } {
+  const t = spawnTimeout(leftMs);
+  if (t === null) return { status: null, stdout: "", timedOut: false, refused: true };
+  try {
+    // killSignal SIGKILL (PW-SV-SWEEP-BUDGET): the default SIGTERM can be ignored, and spawnSync then waits for the child to exit
+    // on its own — a 300ms budget became 4s+ with a child that traps TERM. Every child here (tern ls/process/send, ps, the argv
+    // helper) is a short read-only or one-shot call with no state to flush, so an immediate SIGKILL at the deadline is safe.
+    const r = spawnSync(bin, args, { encoding: "utf8", timeout: t, killSignal: "SIGKILL", ...(extra.env ? { env: extra.env } : {}) });
+    const timedOut = (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
+    return { status: r.error ? null : r.status, stdout: r.stdout || "", timedOut, refused: false, ...(r.error && !timedOut ? { error: String(r.error.message) } : {}) };
+  } catch (e) { return { status: null, stdout: "", timedOut: false, refused: false, error: e instanceof Error ? e.message : String(e) }; }
 }

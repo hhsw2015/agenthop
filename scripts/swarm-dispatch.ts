@@ -86,6 +86,12 @@ import { idleExplainerEnabled, recoveryConfirmed } from "../packages/bus/src/swa
 import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleExplainer } from "../packages/bus/src/swarm/idle-explainer-store.js";
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
+import { realTernSpawn, cleanTernEnv } from "../packages/bus/src/swarm/tern-env.js";
+import { appendEvidence, bridgeTickRecord, ownerRound, sampleRoleBox, type OwnerFact, shouldReportEvidenceFailure, commitEvidenceReport } from "../packages/bus/src/swarm/soak-evidence.js";
+import { initialWatchState, judgeProgress, roleBoxAgent, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, roleBoxOwned, agentAmong, ROLE_BOX_BUDGET_MS, readBoxMails, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
+import { parsePs, parsePsBudgeted, resolveAgentPid3, budgetedExactArgv, safeSpawnSync, type Resolved } from "../packages/bus/src/swarm/seat-presence.js";
+import { ternInjectCommands } from "../packages/bus/src/swarm/tern-wake.js";
+import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, bridgeHome, bridgeScriptEnv, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
 import { modelMarketEnabled } from "../packages/bus/src/swarm/model-market.js";
 import { pullModelMarket } from "../packages/bus/src/swarm/model-market-store.js";
@@ -248,7 +254,8 @@ const SCALE_CFG: ScaleConfig = {
   minDwellSec: envInt(process.env.SWARM_REVIEW_MIN_DWELL_SEC, 300),
 };
 
-function log(m: string): void { console.error(`[dispatch ${SELF}] ${m}`); }
+// every line carries an ISO time: the log is liveness evidence (soak "dispatcher continuous, no gap > 10s" needs it)
+function log(m: string): void { console.error(`${new Date().toISOString()} [dispatch ${SELF}] ${m}`); }
 function nowSec(): number { return Math.floor(Date.now() / 1000); }
 function atomicWrite(file: string, data: string): void {
   const tmp = `${file}.tmp.${process.pid}`;
@@ -1494,7 +1501,32 @@ async function main(): Promise<void> {
   // does NOT bypass dedup (F40-5): at most one alert per box per SWARM_NOTIFY_DEDUP_MS, then a bounded reminder. The coordinator
   // box is NOT excluded (that would hide real business mail stranded in it); it just gets the same bounded treatment.
   const inboxDedup = new AlertDedup(NOTIFY_DEDUP_MS); // F44-①: per-box event-identity dedup + cooldown (stable box id, NOT message text)
-  const runInboxSentinel = (): void => {
+  /** The live coordinator session: roles/coordinator.sid (written by the coordinator each cycle). Missing / not a sid / older than 1h
+   *  ⇒ null ⇒ no typing (S19 + L0 still go out). SWARM_COORDINATOR is the role BOX key, not a session (two keys, by design). */
+  const liveCoordinatorSid = (): string | null => {
+    const f = path.join(HOME, ".agenthop", "swarm", "roles", "coordinator.sid");
+    try {
+      const st = lstatSync(f); if (!st.isFile() || Date.now() - st.mtimeMs > 3600_000) return null;
+      const sid = readFileSync(f, "utf8").split("\n")[0]!.trim();
+      return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sid) ? sid : null;
+    } catch { return null; }
+  };
+  const evidenceFail = new Set<string>(); // soak-evidence surfaces currently failing (one S19 per failure episode)
+  // SE-EMPTY-ROUND + SE-OWNER-FRESHNESS: the soak sample is taken EVERY round, after the round body however it ends (an empty inbox
+  // set, an early return, a throw), with the owner as measured in THIS round — null + reason when this round did not measure it
+  const sampleInboxEvidence = (owner: OwnerFact): void => {
+    try {
+      if (COORDINATOR && isValidSessionId(COORDINATOR)) {
+        const okW = sampleRoleBox(HOME, inboxDirName(COORDINATOR), owner, Date.now(), (d) => readBoxMails(d));
+        if (shouldReportEvidenceFailure(evidenceFail, "inbox-oldest.jsonl", okW)) {
+          const n = notifyCoordinator("[soak-evidence] could not append ~/.agenthop/swarm/soak/inbox-oldest.jsonl (soak row 3 will be UNKNOWN until it can)", { taskRef: "soak-evidence:inbox-oldest", title: "soak evidence write failed", severity: "stall" });
+          commitEvidenceReport(evidenceFail, "inbox-oldest.jsonl", n === "delivered" || n === "deduped");
+        }
+      }
+    } catch (e) { log(`soak evidence (inbox) failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+  const runInboxSentinel = (): void => ownerRound((setOwner) => runInboxSentinelBody(setOwner), sampleInboxEvidence);
+  const runInboxSentinelBody = (setOwner: (o: OwnerFact) => void): void => {
     try {
       const stats = scanInboxes(HOME);
       if (stats.length === 0) return;
@@ -1525,6 +1557,20 @@ async function main(): Promise<void> {
         if (w.kind !== "entity") continue; // ambiguous/unknown identity ⇒ no legacy expansion (direct sid already credited)
         for (const k of legacyInboxKeys(proj, { id: sid, stableId: sid, title: "", tool: w.entity.tool ?? "", cwd: w.entity.cwd ?? "", pid: 0 })) owned.add(inboxDirName(k));
       }
+      // the coordinator ROLE box is drained by the live coordinator session (roles/coordinator.sid), a different key from its own sid;
+      // credited only when that session's claude is found in the process table (presence .pid is a projection). Else: unchanged.
+      if (COORDINATOR && isValidSessionId(COORDINATOR)) {
+        const live = liveCoordinatorSid();
+        if (live === null) setOwner({ owner: null, reason: "roles/coordinator.sid missing, stale or not a sid" });
+        if (live !== null) {
+          // one monotonic deadline for ps + every exact-argv query (ROLE_BOX_BUDGET_MS); past it ⇒ unknown ⇒ not credited
+          const deadline = performance.now() + ROLE_BOX_BUDGET_MS; const mono = () => performance.now();
+          const ps = safeSpawnSync("ps", ["axo", "pid=,ppid=,command="], deadline - mono());
+          const agent = ps.status === 0 && mono() <= deadline ? roleBoxAgent(ps.stdout, live, deadline, mono, budgetedExactArgv(deadline, mono)) : "unknown" as const;
+          setOwner(agent === "unknown" ? { owner: null, reason: "coordinator process not provable this round" } : { owner: typeof agent === "number" });
+          if (roleBoxOwned(live, agent)) owned.add(inboxDirName(COORDINATOR));
+        }
+      }
       const thMin = Math.floor(INBOX_STALL_SEC / 60);
       for (const a of detectStalledInboxes(stats, (key) => owned.has(key), INBOX_STALL_SEC, nowSec())) {
         const dk = alertKey(a.key, "inbox-stall");
@@ -1538,6 +1584,81 @@ async function main(): Promise<void> {
         if (res !== "failed") inboxDedup.record(dk);
       }
     } catch (e) { log(`inbox sentinel failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
+  // L4 coordinator progress watch (long-run-liveness, 2026-10-16; r2 after Chief Review 0582ae3 + Second Voice be7f170): "alive but
+  // not advancing" — beat fresh while the handoff is >2h old or ≥3 real mails wait >1h in the coordinator role box ⇒ S19 to the role
+  // box + an L0 alert file + one line typed into the coordinator's Tern block; Carly's patrol beat >30min ⇒ S19 + L0. Three-state
+  // facts (unreadable ≠ fine ≠ stalled), delivery committed only on success, owed alerts retried every 60s. SWARM_PROGRESS_WATCH, on.
+  const progressWatch = initialWatchState();
+  const ternSpawnPW = realTernSpawn(process.env);
+  /** One tern call with an explicit timeout (the remaining budget): the same cleaned env as realTernSpawn (L3). */
+  const ternEnvPW = cleanTernEnv(process.env); const ternBinPW = ternEnvPW.TERN_BIN || "tern";
+  const ternTimed = (args: string[], timeoutMs: number): { ok: boolean; stdout: string; timedOut: boolean } => {
+    // integer timeout ≥ 1ms (a fractional or exhausted remainder never reaches spawnSync); a refused budget or a thrown spawn is
+    // treated as "did not finish in time" — never an exception that aborts the whole round
+    const r = safeSpawnSync(ternBinPW, args, timeoutMs, { env: ternEnvPW });
+    if (r.error) log(`progress-watch: tern ${args[0]} spawn error: ${r.error}`);
+    return { ok: r.status === 0, stdout: r.stdout, timedOut: r.timedOut || r.refused || !!r.error };
+  };
+  /** The coordinator block, within BLOCK_BUDGET_MS for the whole lookup (ls + one process per block + one ps), every call bounded by
+   *  what is left. The agent is found in the PROCESS TABLE under each block's root (exact argv) — never from the presence .pid file. */
+  const coordinatorBlock = (): { block: string } | { none: string } => {
+    // ONE monotonic deadline for the whole lookup: tern calls, the ps read and every exact-argv query spend from it (PW-SV-SWEEP-BUDGET)
+    const budget: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
+    const t0 = performance.now(); const deadline = t0 + BLOCK_BUDGET_MS;
+    const mono = () => performance.now();
+    const tern = budgeted((args, timeoutMs) => ternTimed(args, Math.min(timeoutMs, deadline - mono())), budget, mono);
+    const sid = liveCoordinatorSid();
+    let rows: ReturnType<typeof parsePs> | null | undefined;
+    const exact = budgetedExactArgv(deadline, mono);
+    const agentUnder = (root: number): Resolved => {
+      if (rows === undefined) {
+        const ps = safeSpawnSync("ps", ["axo", "pid=,ppid=,command="], deadline - mono());
+        if (ps.refused) return { kind: "unknown", why: "budget spent before ps" };
+        rows = ps.status === 0 && mono() <= deadline ? parsePsBudgeted(ps.stdout, () => mono() > deadline) : null;
+      }
+      return rows === null ? { kind: "unknown", why: "process table unreadable" } : resolveAgentPid3(root, sid!, "claude", rows, exact, () => mono() > deadline);
+    };
+    const r = findCoordinatorBlock(sid, tern, agentUnder);
+    return "block" in r && mono() > deadline ? { none: "lookup finished over budget — not typing" } : r;
+  };
+  const runProgressWatch = (): void => {
+    if (!flagDefaultOn(process.env.SWARM_PROGRESS_WATCH)) return;
+    try {
+      const now = nowSec();
+      // the role box is the coordinator's stable address (SWARM_COORDINATOR), whichever session currently drains it
+      const box = COORDINATOR && isValidSessionId(COORDINATOR) ? inboxDirName(COORDINATOR) : null;
+      const { attempt, resolved } = planEmits(progressWatch, judgeProgress(readProgressFacts(HOME, box, now)), now);
+      for (const a of attempt) {
+        const surfaces: string[] = [];
+        const n = notifyCoordinator(a.text, { taskRef: `progress-watch:${a.key}`, title: a.key, severity: "stall" });
+        if (n === "delivered" || n === "deduped") surfaces.push("S19");
+        try { log(`progress-watch: L0 alert ${writeL0Alert(HOME, a, now)}`); surfaces.push("L0"); }
+        catch (e) { log(`progress-watch: L0 alert write failed: ${e instanceof Error ? e.message : e}`); }
+        if (a.key === "coordinator-stalled") {
+          const where = coordinatorBlock();
+          if ("block" in where) {
+            // inbox-wake's send commands, through the L3 env, within TYPE_BUDGET_MS for both sends together
+            const tb: Budget = { leftMs: TYPE_BUDGET_MS, calls: 0 }; const send = budgeted(ternTimed, tb);
+            const [typeCmd, enterCmd] = ternInjectCommands(where.block, a.text);
+            const t1 = send(typeCmd); const t2 = t1?.ok ? send(enterCmd) : null;
+            if (t1?.ok && t2?.ok) surfaces.push(`block ${where.block}`);
+            else log(`progress-watch: could not type into coordinator block ${where.block}${t1 === null || t2 === null ? " (send over budget)" : ""}`);
+          } else log(`progress-watch: not typing into a block (${where.none}) — S19 + L0 only`);
+        }
+        commitDelivery(progressWatch, a.key, surfaces.length > 0, now);
+        log(`progress-watch: ${a.key} ${surfaces.length ? `delivered via ${surfaces.join(" + ")}` : `NOT delivered (S19 ${n}) — owed, retry in ${RETRY_SEC}s`}`);
+      }
+      for (const k of resolved) {
+        // the "resolved" notice is its own obligation: committed only when it reached a surface; else retried every RETRY_SEC
+        const n = notifyCoordinator(`[dispatcher] ${k} resolved`, { taskRef: `progress-watch:${k}:resolved`, title: `${k} resolved`, severity: "info" });
+        let l0 = false; try { writeL0Alert(HOME, { key: k, text: `[dispatcher] ${k} resolved` }, now); l0 = true; } catch { /* counted below */ }
+        const ok = n === "delivered" || n === "deduped" || l0;
+        commitResolved(progressWatch, k, ok);
+        log(`progress-watch: ${k} resolved — ${ok ? `notice delivered (${[n === "delivered" || n === "deduped" ? "S19" : "", l0 ? "L0" : ""].filter(Boolean).join(" + ")})` : `notice NOT delivered (S19 ${n}) — owed, retry in ${RETRY_SEC}s`}`);
+      }
+    } catch (e) { log(`progress watch failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
   // S14 live sentinel (v2 — herdr-primitive-driven, user "用到极致"): per herdr-IDENTIFIED member run an event-driven watcher
@@ -1955,7 +2076,7 @@ async function main(): Promise<void> {
   // a non-default install), while the swarm's own state (seat-shell records, the reload audit) stays under AH_HOME.
   const BRIDGE_HOME = bridgeHome(process.env, homedir());
   const ternBridgeIO = {
-    tern: realTern(process.env),
+    tern: realTern(process.env, realTernSpawn(process.env)),
     readMirror: realMirrorReader(BRIDGE_HOME),
     readSentinel: realSentinelReader(BRIDGE_HOME),
     clearSentinel: realClearSentinel(BRIDGE_HOME),
@@ -1980,18 +2101,28 @@ async function main(): Promise<void> {
   const orphanState = initialOrphanState();
   const herdr = realHerdr(process.env);
   const bridgeDirPath = process.env.AGENTHOP_BRIDGE_DIR || path.join(SCRIPTS_DIR, "..", "tern", "agenthop-agents-bridge");
-  const ternLs = (): string | null => {
-    const r = spawnSync(process.env.TERN_BIN || "tern", ["ls", "--json"], { encoding: "utf8", timeout: 3000 });
-    return r.error || r.status !== 0 ? null : r.stdout;
-  };
+  const ternSpawn = realTernSpawn(process.env); // L3: every tern call from the dispatcher = cleaned env + TERN_PANE_SOCKET + 1.5s
+  const ternLs = (): string | null => { const r = ternSpawn(["ls", "--json"]); return r.ok ? r.stdout : null; };
   const orphanIO = {
     seatRecords: realSeatRecords(HOME), herdrSessions: herdr.sessions, ternBlocks: realTernBlocks(ternLs),
     signalPid: realSignalPid, waitPidGone: (pid: number) => realWaitPidGone(pid), markWorker: realMarkWorker(HOME), whileInstance: realWhileInstance(HOME), socketOwners: realSocketOwners(process.env), gc: realGc(bridgeScriptEnv(process.env, BRIDGE_HOME), bridgeDirPath),
     ...realTmpFiles(BRIDGE_HOME, () => Date.now()), nowMs: () => Date.now(), log, audit: ternBridgeIO.controlLog,
   };
+  let lastEvidenceTick: number | null = null;
   const runTernBridgeStep = (): void => {
     if (!ternBridgeEnabled()) return;
-    runTernBridgeTick(ternBridgeState, ternBridgeIO, true);
+    const outcome = runTernBridgeTick(ternBridgeState, ternBridgeIO, true);
+    // soak evidence (liveness-tier §3): one timed record per round the sweep actually RAN (throttled/disabled rounds write nothing)
+    if (outcome !== "throttled" && outcome !== "disabled") {
+      const m = ternBridgeIO.readMirror();
+      const tick = m === null ? null : m.tick;
+      const okW = appendEvidence(HOME, "bridge-tick.jsonl", bridgeTickRecord(Date.now(), tick, lastEvidenceTick, outcome));
+      if (tick !== null) lastEvidenceTick = tick;
+      if (shouldReportEvidenceFailure(evidenceFail, "bridge-tick.jsonl", okW)) {
+        const n = notifyCoordinator("[soak-evidence] could not append ~/.agenthop/swarm/soak/bridge-tick.jsonl (soak row 5 will be UNKNOWN until it can)", { taskRef: "soak-evidence:bridge-tick", title: "soak evidence write failed", severity: "stall" });
+        commitEvidenceReport(evidenceFail, "bridge-tick.jsonl", n === "delivered" || n === "deduped");
+      }
+    }
     runOrphanSweep(orphanState, orphanIO);
   };
 
@@ -2317,7 +2448,7 @@ async function main(): Promise<void> {
     sweepTick: async () => runSweepTick({
       // control-INDEPENDENT supervision (DISP1-2): these read their OWN sources (inbox dirs, swap/PID records, review/round/
       // placement ledgers), NOT the control log, so they run EVERY tick — a corrupt control log must never silence them.
-      independent: [runInboxSentinel, runSuccessionHeartbeat, runReviewAutoscaleSuggest, runRoundDoctor, runPlacementSuggest, runObserverWatch],
+      independent: [runInboxSentinel, runProgressWatch, runSuccessionHeartbeat, runReviewAutoscaleSuggest, runRoundDoctor, runPlacementSuggest, runObserverWatch],
       // fail-soft control load: true iff readable; sets the shared ref; escalates (deduped) on a fault (DISP-1 / DISP1-1).
       loadControl: () => { const s = loadControlFailSoft("sweep"); if (s === null) return false; sweepStateRef.s = s; return true; },
       // control-DEPENDENT work — runs ONLY when the control log loaded (sweepPass + projection/verdict + observer completion +

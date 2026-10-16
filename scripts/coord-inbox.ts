@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { writeInbox } from "../packages/bus/src/inbox.js";
 import { resolveCoordinatorInbox, CoordinatorInboxError } from "../packages/bus/src/swarm/coord-inbox.js";
+import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 
 const fail = (m: string): never => { process.stderr.write(`coord-inbox: ${m}\n`); process.exit(2); };
 const args = process.argv.slice(2);
@@ -37,6 +38,13 @@ if (!text.trim()) fail("usage: coord-inbox [--from L] [--title T] [--task-ref R]
 const home = process.env.AH_HOME || homedir();
 let sid: string;
 try { sid = resolveCoordinatorInbox(home, process.env); }
-catch (e) { fail(e instanceof CoordinatorInboxError ? e.message : `resolve failed: ${(e as Error).message}`); }
+catch (e) {
+  // SWARM_COORDINATOR is the coordinator's ROLE box key; the role box has no presence of its own (the live coordinator session has
+  // a different sid), so "does not resolve to a live session" is the normal case. When the key itself is a full, safe session id,
+  // deliver to that durable box directly. Unset / a short handle / an unsafe id still refuse (never guess an address).
+  const ref = (process.env.SWARM_COORDINATOR ?? "").trim();
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(ref) && isValidSessionId(ref)) sid = ref;
+  else fail(e instanceof CoordinatorInboxError ? e.message : `resolve failed: ${(e as Error).message}`);
+}
 const res = writeInbox(home, sid!, { from, fromLabel: from, text, via: "local", ts: Date.now(), ...(title ? { title } : {}), ...(taskRef ? { taskRef } : {}) }, key);
 process.stdout.write(`${res} → ${sid!}\n`);

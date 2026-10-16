@@ -16,7 +16,8 @@
 //   SELFTEST_ROOT=<dir>      node scripts/run-selftests.mjs  # discovery root (default: the repo); used by the runner's own test
 //
 // Exit 0 iff discovery completed AND every selected selftest exited 0. No cherry-picking: the only selection is sharding (ruling c).
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -106,10 +107,100 @@ function runOne(bin, absPath, cwd, timeoutMs, graceMs) {
   });
 }
 
+/** Fixture-safety lint (incident 2026-10-16: a selftest's cleanup `pkill -f <sid>` killed the live coordinator). A selftest may not
+ *  kill by pattern, and may not name a session id that is live on this machine (any ~/.agenthop/presence/<sid>.pid, plus
+ *  roles/coordinator.sid). Fixtures use made-up sids. FAIL-CLOSED (r4): if the live-sid inventory or any selftest's source cannot be
+ *  read, the check is incomplete and NOTHING runs. Every selftest is checked, the runner's own included — negative fixtures build the
+ *  banned text at run time (string concatenation) instead of holding it literally. Pure over (text, liveSids). */
+/** Does `text` kill processes by pattern? Any pkill / killall in the raw text or in any JS string literal after decoding its escapes
+ *  (FXL r9: an escaped command name `"\x70kill"` or flag `"\u002df"` is the same call; pkill without -f still matches by name). */
+export const DECODE_MAX_STEPS_PER_BYTE = 4;
+export function jsStringLiterals(src) {
+  const out = []; let i = 0;
+  // FXL-SV-DECODE-PROGRESS: every step strictly advances the cursor (an escape that cannot be decoded is taken literally, 2 chars),
+  // and the whole pass is bounded by DECODE_MAX_STEPS_PER_BYTE × length — past it the rest is not decoded (the raw-text check still runs).
+  let budget = DECODE_MAX_STEPS_PER_BYTE * src.length + 16;
+  const hexDigit = (c) => (c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1);
+  const hex = (t) => (/^[0-9a-fA-F]+$/.test(t) ? parseInt(t, 16) : NaN);
+  const esc = (j) => {
+    const c = src[j + 1];
+    const simple = { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v", 0: "\0" };
+    if (c === "x") { const v = hex(src.slice(j + 2, j + 4)); if (!Number.isNaN(v)) return [String.fromCharCode(v), 4]; }
+    if (c === "u" && src[j + 2] === "{") {
+      // FXL r10: one forward scan over the hex digits (any count — JS allows leading zeros: \u{000000070} is "p"), then "}".
+      // Work is the digits read, never a search to the end of the source (FXL-SV-DECODE-WORK).
+      let k = j + 3, v = 0;
+      for (let d; k < src.length && (d = hexDigit(src.charCodeAt(k))) >= 0; k++) if (v <= 0x10ffff) v = v * 16 + d;
+      if (k > j + 3 && src[k] === "}" && v <= 0x10ffff) return [String.fromCodePoint(v), k - j + 1];
+    } else if (c === "u") { const v = hex(src.slice(j + 2, j + 6)); if (!Number.isNaN(v) && src.slice(j + 2, j + 6).length === 4) return [String.fromCharCode(v), 6]; }
+    if (c === "\n") return ["", 2]; // line continuation
+    return [simple[c] ?? c ?? "", 2];
+  };
+  while (i < src.length && budget-- > 0) {
+    const q = src[i];
+    if (q === "/" && src[i + 1] === "/") { const k = src.indexOf("\n", i); i = k < 0 ? src.length : k; continue; }
+    if (q === "/" && src[i + 1] === "*") { const k = src.indexOf("*/", i + 2); i = k < 0 ? src.length : k + 2; continue; }
+    if (q !== "'" && q !== '"' && q !== "`") { i++; continue; }
+    let j = i + 1, cur = "";
+    while (j < src.length && src[j] !== q && budget-- > 0) {
+      if (src[j] === "\\") { const [v, n] = esc(j); cur += v; j += Math.max(2, n); continue; }
+      if (q === "`" && src[j] === "$" && src[j + 1] === "{") {
+        let d = 1, k = j + 2; while (k < src.length && d > 0) { if (src[k] === "{") d++; else if (src[k] === "}") d--; k++; }
+        cur += " "; j = Math.max(k, j + 2); continue;
+      }
+      if (q !== "`" && src[j] === "\n") break; // unterminated: not a literal
+      cur += src[j]; j++;
+    }
+    out.push(cur); i = Math.max(j + 1, i + 1);
+  }
+  return out;
+}
+/** Any pkill / killall invocation (FXL r9): both select processes by NAME by default (`pkill -9 12345` matches the name "12345",
+ *  not pid 12345) and by full command line with -f, so every form kills by pattern. A fixture kills the pid it started
+ *  (process.kill(pid) / kill <pid>). Word-boundary match on the raw text and on each decoded literal. */
+function killsByPatternRaw(text) {
+  return /(^|[^A-Za-z0-9_-])(pkill|killall)([^A-Za-z0-9_-]|$)/.test(text);
+}
+/** True if the source kills by pattern, read as the source itself OR as any static string literal in it after JS decoding. */
+export function killsByPattern(text) {
+  return killsByPatternRaw(text) || jsStringLiterals(text).some((lit) => killsByPatternRaw(lit));
+}
+export function fixtureLint(text, liveSids) {
+  const bad = [];
+  if (killsByPattern(text)) bad.push("kills by pattern (pkill / killall, any form): kill the pid you started instead");
+  for (const sid of liveSids) if (sid && text.includes(sid)) bad.push(`names the live session ${sid}: use a made-up sid`);
+  return bad;
+}
+/** Live sids, or null when the inventory cannot be read (ENOENT on the dirs = no live sessions, a real empty answer). */
+function liveSessionIds(home) {
+  const out = new Set();
+  try { for (const n of readdirSync(path.join(home, ".agenthop", "presence"))) { const m = /^(.+)\.pid$/.exec(n); if (m) out.add(m[1]); } }
+  catch (e) { if (e && e.code !== "ENOENT") return null; }
+  try { const s = readFileSync(path.join(home, ".agenthop", "swarm", "roles", "coordinator.sid"), "utf8").trim(); if (s) out.add(s); }
+  catch (e) { if (e && e.code !== "ENOENT") return null; }
+  return [...out];
+}
+
 async function main() {
   const files = [], discoveryErrors = [];
   collect(root, files, discoveryErrors);
   files.sort();
+  // fixture-safety lint: refuse to RUN anything if a selftest could hit a live process — or if that cannot be checked (fail-closed)
+  const live = liveSessionIds(process.env.SELFTEST_HOME || homedir());
+  const lintFails = [];
+  if (live === null) lintFails.push("(inventory): the live-session list (presence/, roles/coordinator.sid) cannot be read — check incomplete");
+  for (const rel of files) {
+    let text;
+    try { text = readFileSync(path.join(root, rel), "utf8"); } catch (e) { lintFails.push(`${rel}: source unreadable (${e && e.code}) — check incomplete`); continue; }
+    for (const why of fixtureLint(text, live ?? [])) lintFails.push(`${rel}: ${why}`);
+  }
+  // discovery is part of the safety check (PW-SV-FIXTURE-LINT-INCOMPLETE): a directory or file that could not be listed/stat'ed may hold
+  // a selftest the lint never saw, so ANY discovery error stops the run before the first test is started (fail-closed)
+  for (const d of discoveryErrors) lintFails.push(`DISCOVERY-FAIL ${d.path}: ${d.why} — check incomplete`);
+  if (lintFails.length) {
+    console.log(`run-selftests: fixture-safety lint FAILED — nothing was run:\n${lintFails.map((l) => `  LINT ${l}`).join("\n")}`);
+    process.exitCode = 1; return;
+  }
   // Defend the gate: discovering ZERO selftests (and no error explaining why) means the layout/glob broke — fail LOUD.
   if (files.length === 0 && discoveryErrors.length === 0) { console.error(`run-selftests: found NO *.selftest.mts under ${root} — discovery is broken (not a pass)`); process.exit(2); }
   const shard = parseShard(process.env.SELFTEST_SHARD);
@@ -148,4 +239,7 @@ async function main() {
   if (failures.length || discoveryErrors.length) process.exitCode = 1;
 }
 
-main().catch((e) => { console.error(`run-selftests: unexpected: ${e instanceof Error ? e.stack : e}`); process.exitCode = 1; });
+// run only when executed directly (importing the module for its pure helpers, e.g. in a selftest, must not start a whole run)
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((e) => { console.error(`run-selftests: unexpected: ${e instanceof Error ? e.stack : e}`); process.exitCode = 1; });
+}

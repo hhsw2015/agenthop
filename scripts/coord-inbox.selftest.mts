@@ -50,8 +50,13 @@ try {
     ok(r.status === 0 && /published → c5beaa7c/.test(r.stdout), "cli: sends to the resolved coordinator");
     const got = pending(h, NEW).map((f) => JSON.parse(readFileSync(path.join(box(h, NEW), f), "utf8")));
     ok(got.length === 1 && got[0].text === "hello there" && got[0].title === "t", "cli: message body + title landed in the CURRENT box");
+    // the ROLE box key (a full sid with no presence of its own) is delivered to directly — that box is the coordinator's address
     r = cli({ SWARM_COORDINATOR: OLD }, "hi");
-    ok(r.status === 2 && !existsSync(box(h, OLD)), "cli: unresolvable coordinator ⇒ exit 2 and NOTHING written (no old-box fallback)");
+    ok(r.status === 0 && pending(h, OLD).length === 1 && /→ fe0376cd/.test(r.stdout), "cli: a full-sid role key with no presence ⇒ delivered to that role box (not exit 2)");
+    r = cli({ SWARM_COORDINATOR: "fe0376cd" }, "hi");
+    ok(r.status === 2, "cli: a short / unresolvable handle still refuses (exit 2), never guessed");
+    r = cli({ SWARM_COORDINATOR: "../../etc/x" }, "hi");
+    ok(r.status === 2, "cli: an unsafe key still refuses (exit 2)");
     r = cli({}, "hi");
     ok(r.status === 2, "cli: SWARM_COORDINATOR unset ⇒ exit 2");
     r = cli({ SWARM_COORDINATOR: NEW }, "--key", "k1", "once"); const r2 = cli({ SWARM_COORDINATOR: NEW }, "--key", "k1", "once");
