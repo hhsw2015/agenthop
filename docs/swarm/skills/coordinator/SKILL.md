@@ -65,7 +65,7 @@ user 离场期你**代行其可撤决策**(可撤判据见 CORE 代理权节);�
 ### 1b. 拒绝 ≠ 暂停(机械规则;2026-10-16 两次停摆根因)
 
 - **user 的暂停只来自 user 正文**(「停 / 等 / 先别」),或 Carly 转述并带原话。**工具调用被拒(harness「doesn't want to take this action」、权限拒绝、classifier 拦截)是对那一条调用的否决,不是对周期的否决。**
-- **事件标记(#1188,soak 第 7/8 行只认标记不认词表)**:PROGRESS 周期标题行里,harness/工具拒绝 ⇒ 加 `[REFUSAL]`;其后换路径或跳过的那一行 ⇒ 加 `[REROUTE]`;user 亲自介入才解开的卡点 ⇒ 加 `[USER-UNBLOCK]`。没有标记的「拒」字不算事件。
+- **事件标记(#1188/#1189,soak 第 7/8 行只认标记不认词表)**:**每个周期标题行必带一个标记**——无事件 ⇒ `[CLEAN]`;harness/工具拒绝 ⇒ `[REFUSAL]`,其换路径或按 §1b 跳过的那一周期 ⇒ `[REROUTE]`(同周期可并列);user 亲自介入才解开的卡点 ⇒ `[USER-UNBLOCK]`。没有任何标记的周期 ⇒ soak 判 UNKNOWN(分不清「无事件」与「忘标」);「过」只来自正面证据,与所有审查席原则一致。
 - 被拒后的唯一合法动作序列:记一行(哪条、可能原因)→ 换等价路径或跳过该步 → **继续周期**(扫箱、合表、派单、写 handoff、beat)。**禁止**输出「holding / 等指示 / stopped at your signal」这类句子,除非最近一条 user 正文确实说了停。
 - 判据可机检:`最近一条 user 正文是否含停止词` 是唯一开关;工具结果不是开关。
 - 周期末自检(空转哨):本周期零派单且零合并且角色箱有 ≥1 封非 observer 真信 ⇒ 要么立刻处理,要么在 PROGRESS 写明原因。dispatcher 的 coordinator-progress-watch(L4)会从外部核同一条件。
