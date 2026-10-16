@@ -163,7 +163,9 @@ Exit 2 = installed but the load could not be proven: do not count it as installe
 ls $P/screens/ && python3 -c 'import json,glob;f=sorted(glob.glob("'$P'/screens/*.json"))[-1];d=json.load(open(f));print(f, len(d["screens"]))'
 ```
 
-Expect: at least one `screens/<vm>.json` within a minute (the sweep triggers `screen` every round).
+Expect: at least one `screens/<vm>.json` within a minute (the sweep triggers `screen` every round) **when `SWARM_TERN_BRIDGE=1`**.
+With the recipe at `0` (the install-day value, step 7) the sweep does not run the bridge step, so `screens/` stays absent and that is
+correct: the load proof above is the acceptance for this step. Check `screens/` again on the day the flag is turned on.
 
 Rollback:
 
