@@ -27,7 +27,7 @@
 ## 6. 第二轮缺口(2026-10-16 09:5x 复盘发现;立项 L6/L7)
 | 线 | 内容 | 本仓执行席(非依赖) | 门 |
 |---|---|---|---|
-| L6 dispatcher 自拉起 | dispatcher 是所有哨的根,自己死了无人管(今无 launchd 项;昨夜 disp-80614 挂住 6h 无人重起)。改为 launchd user agent(KeepAlive;同 Tern 自己的 so.stencil.tern.daemon 模式)按 recipe 的净化 env 起;与 dispatcher.lock 的 reclaim(SUCC-1)对齐:崩溃 ⇒ 秒级重拉,双起 ⇒ 后者退出;runbook ③ 改为 `launchctl kickstart -k` | Infra Dev | 夹具:`kill -9` dispatcher ⇒ ≤10s 新 pid 持锁、sweep 行续写;手动第二份 ⇒ 立即退出不抢锁 |
+| L6 dispatcher 自拉起 | dispatcher 是所有哨的根,自己死了无人管(昨夜 disp-80614 挂住 6h 无人重起)。**不用 launchd、不开机自启、不写系统目录**(user 2026-10-16:「尽量少改系统的东西」)。改为用户会话内看护循环 `swarm-dispatch-supervise`:按 recipe 的 argv + 净化 env 起 dispatcher,退出 3s 后重拉;`dispatcher.stop` 哨兵文件 = 干净停(runbook ③ stop 先 touch 再 kill,start 先 rm);锁被活 pid 持有的退出 ⇒ 循环自退不空转。由协调者按 runbook ③ setsid 起;重启机器不自动回来 —— handoff §恢复第 5 步让协调者核缺则起。配套:Carly 心跳加 `kill -0 $(cat dispatcher.lock)` 不活 ⇒ L0;coordinator skill §1 周期例程核 dispatcher pid | Infra Dev | 夹具:`kill -9` ⇒ ≤5s 新 pid 持锁、sweep 行续写;touch stop + kill ⇒ 不重拉;双起 ⇒ 后者退出 |
 | L7 审查席停滞自处理 | 审核是流水线上的卡点,不能靠协调者手工盯 transcript:席位箱内有信 >10min ∧ transcript 无新 assistant 行 ⇒ dispatcher 按席位通道再唤醒一次(claude ACP:bus/箱 flush;codex 主线程:tern send 直注);再 10min 无效 ⇒ S19 + 投协调者箱「补声或改派」;协调者收到即**自己补第二声**(作者≠审者仍守)或改派,不等 | Infra Dev(dispatcher)+ 协调者(skill §3 一行) | 夹具:伪造审查席 idle 12min + 箱 1 信 ⇒ 恰一次唤醒;再 12min ⇒ 恰一条 S19;活跃席零动作 |
 
 ## 3. 不做
