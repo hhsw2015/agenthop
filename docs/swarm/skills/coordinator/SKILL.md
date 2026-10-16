@@ -110,6 +110,7 @@ user 离场期你**代行其可撤决策**(可撤判据见 CORE 代理权节);�
 - **F53 操作回执**:你自己的 spawn/inject **以耐久证据判成**(checkpoint sha 越过出生锚),**非 API 瞬时返回**;unknown ⇒ 呈报 user,不自动重做。详见 `coordinator-ops-succession-runbook.md`。
 - **存活机制不绑角色**(user 2026-10-16):停摆防线只放三处——coordinator SKILL(§1b)、dispatcher(无模型常驻哨:进度看门狗 / 桥自愈 / 自拉起 / 审查席停滞自处理)、Carly(可选)。修法文档的 owner 列是本仓编制,换项目换人,机制不变。
 - **每周期核 dispatcher**:`kill -0 $(cat $AH_HOME/.agenthop/swarm/dispatcher.lock)` 不活 ⇒ 按 recovery runbook ③ 起(setsid + recipe 净化 env,不从席位继承),记 PROGRESS 一行。dispatcher 不开机自启、不进 launchd(user 裁:少改系统);机器重启后由你这一步带回。
+- **liveness 件走更高一级**(user 2026-10-16:「长时间稳定运行是持续推进的基础,持续推进是你的核心职责」):触及消息传递 / 卡点处理 / 哨与自愈 / 席位生命周期 / 协调者例程的改动,按 `docs/swarm/liveness-tier.md`:双声之上叠故障注入逐项夹具 + FC-2 逐行 + 投递先于记账 + 预算上界 + **12h soak 过了才算交付**;你亲自跑一遍注入清单再并;每晚写「夜班起点」行,次晨先填 soak 表。
 
 **席位生命周期 / 轮换(全席位)**——权威 `~/.agenthop/swarm/coordinator-recovery-runbook.md`(v2),要点:
 - 阈值:transcript ≥60 MiB 计划轮换、≥80 MiB 强制;2h 内第 3 次崩 / resume 首 prompt 即崩 ⇒ 换干净会话。
