@@ -87,7 +87,7 @@ import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleEx
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
 import { realTernSpawn, cleanTernEnv } from "../packages/bus/src/swarm/tern-env.js";
-import { appendEvidence, bridgeTickRecord, sampleRoleBox, shouldReportEvidenceFailure, commitEvidenceReport } from "../packages/bus/src/swarm/soak-evidence.js";
+import { appendEvidence, bridgeTickRecord, ownerRound, sampleRoleBox, type OwnerFact, shouldReportEvidenceFailure, commitEvidenceReport } from "../packages/bus/src/swarm/soak-evidence.js";
 import { initialWatchState, judgeProgress, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, roleBoxOwned, agentAmong, ROLE_BOX_BUDGET_MS, readBoxMails, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
 import { parsePs, resolveAgentPid3, budgetedExactArgv, safeSpawnSync, type Resolved } from "../packages/bus/src/swarm/seat-presence.js";
 import { ternInjectCommands } from "../packages/bus/src/swarm/tern-wake.js";
@@ -1512,20 +1512,21 @@ async function main(): Promise<void> {
     } catch { return null; }
   };
   const evidenceFail = new Set<string>(); // soak-evidence surfaces currently failing (one S19 per failure episode)
-  let roleBoxOwnedLast: boolean | null = null; // the last round's role-box credit (null = not decided yet), for the evidence record
-  const roleBoxCredited = (): boolean | null => roleBoxOwnedLast;
-  const runInboxSentinel = (): void => {
-    // SE-EMPTY-ROUND: the soak sample is taken EVERY round, before any early return — an empty inbox set or an unreadable one is
-    // still a measured round ({oldest_age_s: 0} or {null, reason}), never a missing record
+  // SE-EMPTY-ROUND + SE-OWNER-FRESHNESS: the soak sample is taken EVERY round, after the round body however it ends (an empty inbox
+  // set, an early return, a throw), with the owner as measured in THIS round — null + reason when this round did not measure it
+  const sampleInboxEvidence = (owner: OwnerFact): void => {
     try {
       if (COORDINATOR && isValidSessionId(COORDINATOR)) {
-        const okW = sampleRoleBox(HOME, inboxDirName(COORDINATOR), roleBoxCredited(), Date.now(), (d) => readBoxMails(d));
+        const okW = sampleRoleBox(HOME, inboxDirName(COORDINATOR), owner, Date.now(), (d) => readBoxMails(d));
         if (shouldReportEvidenceFailure(evidenceFail, "inbox-oldest.jsonl", okW)) {
           const n = notifyCoordinator("[soak-evidence] could not append ~/.agenthop/swarm/soak/inbox-oldest.jsonl (soak row 3 will be UNKNOWN until it can)", { taskRef: "soak-evidence:inbox-oldest", title: "soak evidence write failed", severity: "stall" });
           commitEvidenceReport(evidenceFail, "inbox-oldest.jsonl", n === "delivered" || n === "deduped");
         }
       }
     } catch (e) { log(`soak evidence (inbox) failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+  const runInboxSentinel = (): void => ownerRound((setOwner) => runInboxSentinelBody(setOwner), sampleInboxEvidence);
+  const runInboxSentinelBody = (setOwner: (o: OwnerFact) => void): void => {
     try {
       const stats = scanInboxes(HOME);
       if (stats.length === 0) return;
@@ -1560,6 +1561,7 @@ async function main(): Promise<void> {
       // credited only when that session's claude is found in the process table (presence .pid is a projection). Else: unchanged.
       if (COORDINATOR && isValidSessionId(COORDINATOR)) {
         const live = liveCoordinatorSid();
+        if (live === null) setOwner({ owner: null, reason: "roles/coordinator.sid missing, stale or not a sid" });
         if (live !== null) {
           // one monotonic deadline for ps + every exact-argv query (ROLE_BOX_BUDGET_MS); past it ⇒ unknown ⇒ not credited
           const deadline = performance.now() + ROLE_BOX_BUDGET_MS; const mono = () => performance.now();
@@ -1568,8 +1570,8 @@ async function main(): Promise<void> {
           const exact = budgetedExactArgv(deadline, mono);
           const agent = rows === null ? "unknown" as const
             : agentAmong(rows.filter((r) => r.argv.join(" ").includes("tern acp")).map((r) => r.pid), (root) => resolveAgentPid3(root, live, "claude", rows, exact));
-          roleBoxOwnedLast = roleBoxOwned(live, agent);
-          if (roleBoxOwnedLast) owned.add(inboxDirName(COORDINATOR));
+          setOwner(agent === "unknown" ? { owner: null, reason: "coordinator process not provable this round" } : { owner: typeof agent === "number" });
+          if (roleBoxOwned(live, agent)) owned.add(inboxDirName(COORDINATOR));
         }
       }
       const thMin = Math.floor(INBOX_STALL_SEC / 60);

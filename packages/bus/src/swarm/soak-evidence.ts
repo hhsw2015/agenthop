@@ -8,18 +8,30 @@
  * episode — committed only when that S19 was delivered (a failed report stays owed); the next successful write re-arms it.
  * Pure record builders + one tiny appender.
  */
-import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdirSync, openSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, writeSync } from "node:fs";
 import path from "node:path";
 
-export type InboxOldestRecord = { ts: string; box: string; oldest_age_s: number | null; live_owner: boolean | null; reason?: string };
+export type InboxOldestRecord = { ts: string; box: string; oldest_age_s: number | null; live_owner: boolean | null; reason?: string; owner_reason?: string };
+/** The role box's owner as measured in THIS round: true / false, or null + why (not measured, source unreadable, unknown). */
+export type OwnerFact = { owner: boolean | null; reason?: string };
 export type BridgeTickRecord = { ts: string; tick: number | null; moved: boolean | null; outcome: string };
 
 /** The role box's oldest unclaimed mail age. `oldestMtimeSec` null = the box could not be read (reason says why); an empty box = 0. */
-export function inboxOldestRecord(nowMs: number, box: string, pending: { mtimeSec: number }[] | null, liveOwner: boolean | null, reason?: string): InboxOldestRecord {
+export function inboxOldestRecord(nowMs: number, box: string, pending: { mtimeSec: number }[] | null, owner: OwnerFact, reason?: string): InboxOldestRecord {
   const ts = new Date(nowMs).toISOString();
-  if (pending === null) return { ts, box, oldest_age_s: null, live_owner: liveOwner, reason: reason ?? "box unreadable" };
+  const o = owner.owner === null ? { live_owner: null, owner_reason: owner.reason ?? "owner not measured this round" } : { live_owner: owner.owner };
+  if (pending === null) return { ts, box, oldest_age_s: null, ...o, reason: reason ?? "box unreadable" };
   const oldest = pending.length ? Math.min(...pending.map((p) => p.mtimeSec)) : null;
-  return { ts, box, oldest_age_s: oldest === null ? 0 : Math.max(0, Math.round(nowMs / 1000 - oldest)), live_owner: liveOwner };
+  return { ts, box, oldest_age_s: oldest === null ? 0 : Math.max(0, Math.round(nowMs / 1000 - oldest)), ...o };
+}
+
+/** One sentinel round with its owner measured fresh (SE-OWNER-FRESHNESS): the owner starts every round as null ("not measured
+ *  this round"); `body` may set it; the sample runs after the body however it ends (early return, throw). A previous round's
+ *  owner is never carried into this round's record. Never throws from the sample; rethrows the body's error after sampling. */
+export function ownerRound(body: (setOwner: (o: OwnerFact) => void) => void, sample: (o: OwnerFact) => void): void {
+  let o: OwnerFact = { owner: null, reason: "owner not measured this round" };
+  try { body((x) => { o = x; }); }
+  finally { try { sample(o); } catch { /* the sample is best-effort; its failure is reported by its own path */ } }
 }
 
 /** One bridge round: the mirror tick read this round (null = unreadable), whether it moved since the last READ tick, and the tick's
@@ -34,7 +46,10 @@ export const soakDir = (home: string) => path.join(home, ".agenthop", "swarm", "
  *  O_WRONLY|O_APPEND|O_NONBLOCK|O_NOFOLLOW — a FIFO / symlink / device is refused, never waited on — and the opened descriptor is
  *  fstat-checked to be the same regular file that was lstat-ed (no swap between the check and the open). Never throws; false = not
  *  written (the caller reports it). Constant work per call: one lstat, one open, one fstat, one write. */
-export function appendEvidence(home: string, file: "inbox-oldest.jsonl" | "bridge-tick.jsonl", rec: object): boolean {
+export const APPEND_MAX_WRITES = 8;
+type Writer = (fd: number, buf: Buffer, off: number, len: number) => number;
+export function appendEvidence(home: string, file: "inbox-oldest.jsonl" | "bridge-tick.jsonl", rec: object,
+  write: Writer = (fd, buf, off, len) => writeSync(fd, buf, off, len)): boolean {
   let fd: number | null = null;
   try {
     mkdirSync(soakDir(home), { recursive: true, mode: 0o700 });
@@ -45,8 +60,19 @@ export function appendEvidence(home: string, file: "inbox-oldest.jsonl" | "bridg
     fd = openSync(f, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW, 0o600);
     const st = fstatSync(fd);
     if (!st.isFile() || (before !== null && (st.ino !== before.ino || st.dev !== before.dev))) return false;
-    writeSync(fd, `${JSON.stringify(rec)}\n`);
-    return true;
+    // SE-WRITE-RESULT: true only when the WHOLE line is written (bounded continuation of short writes); a line that cannot be
+    // finished is cut back off the file (best effort) so no half record stays behind, and the call is a failure
+    const buf = Buffer.from(`${JSON.stringify(rec)}\n`, "utf8");
+    let off = 0;
+    for (let n = 0; off < buf.length && n < APPEND_MAX_WRITES; n++) {
+      let w: number;
+      try { w = write(fd, buf, off, buf.length - off); } catch { w = 0; }
+      if (!(w > 0)) break;
+      off += w;
+    }
+    if (off === buf.length) return true;
+    try { ftruncateSync(fd, st.size); } catch { /* the reader skips a line that does not parse */ }
+    return false;
   } catch { return false; }
   finally { if (fd !== null) try { closeSync(fd); } catch { /* closed */ } }
 }
@@ -65,7 +91,7 @@ export function commitEvidenceReport(st: Set<string>, file: string, delivered: b
 /** One inbox-oldest sample, end to end: read the role box (bounded scan), build the record, append it. Taken every sentinel round,
  *  independent of the sentinel's alert candidates (SE-EMPTY-ROUND). `readBox` is progress-watch's bounded readBoxMails. Returns
  *  whether the line was written (the caller reports a failure). Never throws. */
-export function sampleRoleBox(home: string, box: string, credited: boolean | null, nowMs: number,
+export function sampleRoleBox(home: string, box: string, credited: OwnerFact, nowMs: number,
   readBox: (dir: string) => { mtimeSec: number }[] | "absent" | "unknown"): boolean {
   let mails: ReturnType<typeof readBox>;
   try { mails = readBox(path.join(home, ".agenthop", "inbox", box)); } catch { mails = "unknown"; }
