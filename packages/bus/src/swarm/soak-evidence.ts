@@ -5,10 +5,10 @@
  *   bridge-tick.jsonl   {ts, tick, moved, outcome}                     — the bridge sweep's mirror tick each round
  * A record that could not be measured says so (oldest_age_s: null + reason; tick: null) — never a made-up value.
  * Writing is best-effort for the SWEEP (it never throws into the caller) but a failure is REPORTED once per surface per
- * episode: `appendEvidence` returns false and the caller sends one S19; the next successful write re-arms the report.
+ * episode — committed only when that S19 was delivered (a failed report stays owed); the next successful write re-arms it.
  * Pure record builders + one tiny appender.
  */
-import { appendFileSync, mkdirSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdirSync, openSync, writeSync } from "node:fs";
 import path from "node:path";
 
 export type InboxOldestRecord = { ts: string; box: string; oldest_age_s: number | null; live_owner: boolean | null; reason?: string };
@@ -30,18 +30,47 @@ export function bridgeTickRecord(nowMs: number, tick: number | null, prevTick: n
 
 export const soakDir = (home: string) => path.join(home, ".agenthop", "swarm", "soak");
 
-/** Append one JSON line. Never throws; false = not written (the caller reports it once). */
+/** Append one JSON line, bounded (SE-APPEND-BOUND): the target must be a regular file (or absent ⇒ created); it is opened
+ *  O_WRONLY|O_APPEND|O_NONBLOCK|O_NOFOLLOW — a FIFO / symlink / device is refused, never waited on — and the opened descriptor is
+ *  fstat-checked to be the same regular file that was lstat-ed (no swap between the check and the open). Never throws; false = not
+ *  written (the caller reports it). Constant work per call: one lstat, one open, one fstat, one write. */
 export function appendEvidence(home: string, file: "inbox-oldest.jsonl" | "bridge-tick.jsonl", rec: object): boolean {
+  let fd: number | null = null;
   try {
     mkdirSync(soakDir(home), { recursive: true, mode: 0o700 });
-    appendFileSync(path.join(soakDir(home), file), `${JSON.stringify(rec)}\n`, { mode: 0o600 });
+    const f = path.join(soakDir(home), file);
+    let before: { ino: number; dev: number } | null = null;
+    try { const st = lstatSync(f); if (!st.isFile()) return false; before = { ino: st.ino, dev: st.dev }; }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+    fd = openSync(f, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW, 0o600);
+    const st = fstatSync(fd);
+    if (!st.isFile() || (before !== null && (st.ino !== before.ino || st.dev !== before.dev))) return false;
+    writeSync(fd, `${JSON.stringify(rec)}\n`);
     return true;
   } catch { return false; }
+  finally { if (fd !== null) try { closeSync(fd); } catch { /* closed */ } }
 }
 
-/** One S19 per failure episode per surface: true ⇒ report now. A success clears the episode. Mutates `st`. Pure otherwise. */
+/** Failure reporting, one S19 per failure episode per surface (SE-FAILURE-COMMIT): `shouldReportEvidenceFailure` only says whether a
+ *  report is OWED; `commitEvidenceReport` records that it was DELIVERED. A report that failed to deliver stays owed and is retried
+ *  on the next failing round. A successful write ends the episode (nothing owed, the next failure reports again). Mutates `st`. */
 export function shouldReportEvidenceFailure(st: Set<string>, file: string, ok: boolean): boolean {
   if (ok) { st.delete(file); return false; }
-  if (st.has(file)) return false;
-  st.add(file); return true;
+  return !st.has(file);
+}
+export function commitEvidenceReport(st: Set<string>, file: string, delivered: boolean): void {
+  if (delivered) st.add(file);
+}
+
+/** One inbox-oldest sample, end to end: read the role box (bounded scan), build the record, append it. Taken every sentinel round,
+ *  independent of the sentinel's alert candidates (SE-EMPTY-ROUND). `readBox` is progress-watch's bounded readBoxMails. Returns
+ *  whether the line was written (the caller reports a failure). Never throws. */
+export function sampleRoleBox(home: string, box: string, credited: boolean | null, nowMs: number,
+  readBox: (dir: string) => { mtimeSec: number }[] | "absent" | "unknown"): boolean {
+  let mails: ReturnType<typeof readBox>;
+  try { mails = readBox(path.join(home, ".agenthop", "inbox", box)); } catch { mails = "unknown"; }
+  const rec = typeof mails === "string"
+    ? inboxOldestRecord(nowMs, box, mails === "absent" ? [] : null, credited, mails === "absent" ? undefined : "box unreadable or larger than one scan")
+    : inboxOldestRecord(nowMs, box, mails, credited);
+  return appendEvidence(home, "inbox-oldest.jsonl", rec);
 }
