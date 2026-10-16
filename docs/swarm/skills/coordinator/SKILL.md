@@ -87,7 +87,7 @@ user 离场期你**代行其可撤决策**(可撤判据见 CORE 代理权节);�
 
 本节是**指派了审查席时**审查如何运作;**不变量**是重要产出须独立对抗审(作者≠审者),**审查席几个/是谁由协调者按任务定**(§9),非固定编制。
 
-**票数策略按工作区写明**(编制自由见 §9;本仓 agenthop 当前 = 主审 + 二声两票,同 SHA 两票 0 REMAIN 才清零)。一轮回 **P1/P2/P3 计数 + N REMAIN + 固定 SHA**;**门持到 0 REMAIN** 才签收;执行方每轮**换新 SHA** 复提。对抗审查;**R13 失实重于缺陷**;**F46** 送对箱(thread-id 非 run-id)。审查席=`REVIEW_SEAT`;忙/mod 排队。claude 席的耐久箱候空闲浮出(不手动 ping);**codex 主线程席不自读箱,送审后须直注一句**(§1a)。
+**票数策略按工作区写明**(编制自由见 §9;本仓 agenthop 当前 = 主审 + 二声两票,同 SHA 两票 0 REMAIN 才清零)。一轮回 **P1/P2/P3 计数 + N REMAIN + 固定 SHA**;**门持到 0 REMAIN** 才签收;执行方每轮**换新 SHA** 复提。对抗审查;**R13 失实重于缺陷**;**F46** 送对箱(thread-id 非 run-id)。审查席=`REVIEW_SEAT`;忙/mod 排队。 **审查席停滞不是等待理由**:席位箱有信 >10min 且无输出 ⇒ 按通道再唤醒一次;再无效 ⇒ 你自己补声(非作者)或改派,记 PROGRESS 一行(dispatcher L7 会替你发现并投箱,你只需处理)。claude 席的耐久箱候空闲浮出(不手动 ping);**codex 主线程席不自读箱,送审后须直注一句**(§1a)。
 
 ## 4. 合并门(merge-gate)
 
@@ -108,6 +108,7 @@ user 离场期你**代行其可撤决策**(可撤判据见 CORE 代理权节);�
 - **功能:定期池检 + 对停滞成员发唤醒 ping**(对应编号 F49/F50 **无律典来源、CLI 退出 2**,待 ruling-backfill 确立;此处按功能用,不作可解析引用)。
 - **F45 换壳继任**:新壳首个动作 `agenthop install --mcp <kind>`(裸 `install` 只打印不注册)。
 - **F53 操作回执**:你自己的 spawn/inject **以耐久证据判成**(checkpoint sha 越过出生锚),**非 API 瞬时返回**;unknown ⇒ 呈报 user,不自动重做。详见 `coordinator-ops-succession-runbook.md`。
+- **存活机制不绑角色**(user 2026-10-16):停摆防线只放三处——coordinator SKILL(§1b)、dispatcher(无模型常驻哨:进度看门狗 / 桥自愈 / 自拉起 / 审查席停滞自处理)、Carly(可选)。修法文档的 owner 列是本仓编制,换项目换人,机制不变。
 
 **席位生命周期 / 轮换(全席位)**——权威 `~/.agenthop/swarm/coordinator-recovery-runbook.md`(v2),要点:
 - 阈值:transcript ≥60 MiB 计划轮换、≥80 MiB 强制;2h 内第 3 次崩 / resume 首 prompt 即崩 ⇒ 换干净会话。

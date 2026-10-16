@@ -21,6 +21,15 @@
 | L4 dispatcher 哨 | 新 sweep 步 `coordinator-progress-watch`:读 beat + handoff mtime + PROGRESS 末周期 + 角色箱真信数(排除 observer);beat 新鲜 ∧ (handoff >2h ∨ 真信 ≥3 且最老 >1h)⇒ `S19 coordinator-stalled`:投协调者箱 **且** 写 L0 alert **且** `tern send` 协调者块一行唤醒 **且** TG 入口(已有旗)。同样对 Carly:carly-patrol.beat >30min ⇒ alert | Infra Dev | 夹具:伪造 handoff 3h 旧 + 箱 5 真信 ⇒ 三路告警;正控:正常周期零告警 |
 | L5 bridge | mirror 定时器链自愈:sweep 发现 tick 不进 ≥3 轮且 reload 防抖已过 ⇒ 允许一次 reload;插件侧 timer_fired_at 超 60s 自重 arm | Platform Dev(桥) | 现网:杀定时器 ⇒ 2 轮内 tick 恢复 |
 
+## 5. 角色无关性(user 2026-10-16:「不能依赖 Platform Dev 这个角色,其他项目可能没有」)
+修法只落在三个**不绑角色**的地方:① coordinator SKILL(任何项目的协调者都加载;§1b 拒绝≠暂停)② dispatcher(无模型、常驻、随 agenthop 二进制走;L3/L4/L5/L6/L7)③ Carly(可选第三哨;没有她时 ①② 仍成立)。§2/§6 的 owner 列是**本仓这次谁来写码**,不是机制依赖——换项目换编制,机制不变。成员侧同理(swarm-member SKILL 授权链一节,角色无关)。
+
+## 6. 第二轮缺口(2026-10-16 09:5x 复盘发现;立项 L6/L7)
+| 线 | 内容 | 本仓执行席(非依赖) | 门 |
+|---|---|---|---|
+| L6 dispatcher 自拉起 | dispatcher 是所有哨的根,自己死了无人管(今无 launchd 项;昨夜 disp-80614 挂住 6h 无人重起)。改为 launchd user agent(KeepAlive;同 Tern 自己的 so.stencil.tern.daemon 模式)按 recipe 的净化 env 起;与 dispatcher.lock 的 reclaim(SUCC-1)对齐:崩溃 ⇒ 秒级重拉,双起 ⇒ 后者退出;runbook ③ 改为 `launchctl kickstart -k` | Infra Dev | 夹具:`kill -9` dispatcher ⇒ ≤10s 新 pid 持锁、sweep 行续写;手动第二份 ⇒ 立即退出不抢锁 |
+| L7 审查席停滞自处理 | 审核是流水线上的卡点,不能靠协调者手工盯 transcript:席位箱内有信 >10min ∧ transcript 无新 assistant 行 ⇒ dispatcher 按席位通道再唤醒一次(claude ACP:bus/箱 flush;codex 主线程:tern send 直注);再 10min 无效 ⇒ S19 + 投协调者箱「补声或改派」;协调者收到即**自己补第二声**(作者≠审者仍守)或改派,不等 | Infra Dev(dispatcher)+ 协调者(skill §3 一行) | 夹具:伪造审查席 idle 12min + 箱 1 信 ⇒ 恰一次唤醒;再 12min ⇒ 恰一条 S19;活跃席零动作 |
+
 ## 3. 不做
 - 不给成员席加「主动催协调者」:成员催只会把噪音加回协调者箱;哨由 dispatcher(无模型、常驻)来做。
 - 不让 Carly 代行协调者裁定:她只升级给 user,不派单。
