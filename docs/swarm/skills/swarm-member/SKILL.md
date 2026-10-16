@@ -108,6 +108,8 @@ console.log(writeInbox(homedir(), "<target full sid>", composeInboxMsg({ from: "
 
 ## 5. 判卷与核销(G)
 
+**证据面放哪(#1217 硬规则)**:审查席的源码整树快照(baseline/、snapshot/、执行副本)只放 `~/Work/review-reports/.snapshots/<票>/`(前导点目录,fff/Spotlight 等索引器默认跳过),票目录本身只留报告 .md、manifest(sha256 清单)、结果 JSON 与日志。2026-10-16 两千多个快照目录让 Reserve 席的 fff-mcp 索引器跑到 350% CPU 五小时,被误判为 Tern 卡。
+
 - 判卷文件:`~/Work/review-reports/<item>-r<n>-review-<sha>-<reviewer>.md`,证据在同名目录。判卷**以文件为准**,bus 只是提醒。
 - 每卷两票:主审 + 二声。同一 SHA 两票都 0 REMAIN = DUAL-VOICE-CLEARED,由协调者入合并池。
 - 每轮修复 = **新 SHA**。P1/P2 修完一次送。
