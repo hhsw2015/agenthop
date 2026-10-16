@@ -36,6 +36,21 @@
 
 ACP 耦合面(退役/改写清单,grep `tern acp|cx.agents|agents.json|acp` 2026-10-16):`packages/bus/src/swarm/{seat-presence,tern-bridge-sweep,tern-wake}.ts`、`scripts/{seat-presence,seat-shell,swarm-dispatch}.ts`、`scripts/tern-install.sh`、`tern/agenthop-agents-bridge/{claim,window}.luau`、`tern/restore/tern-restore.py`、各自测试。
 
+## 2a. herdr 上游对表(克隆 `~/Dev/vendor/herdr-upstream` @143bf5f,v0.9.5,2026-10-16;user 令「参考最新源码,不看本地」)
+
+本地 `~/Dev/herdr` 是 2026-07 的 fork 镜像(31c77f3,17 manifest,AGPL 头);#1041 分类器译自它。上游已走远,T1 以上游为准:
+
+| 项 | 上游事实 | 对 T1/T2 的要求 |
+|---|---|---|
+| manifest | **22 份**(+devin/letta/maki/muse/qwen);claude.toml 3.7k→7.5k、codex 1.6k→4.3k;`min_engine_version` 到 3 | `tools/gen-manifests.py` 改从上游路径重生成;新区域 `bottom_non_empty_lines(N)` / `top_non_empty_lines(N)` / `prompt_box_body` / `whole_recent` 要在 classify.luau 实现;engine 版本门照搬 |
+| 状态机(不只分类) | `pane/agent_detection.rs`:working→idle 要 **3 次确认、每 100ms 复查、700ms 上限**,除非屏上有 visible_idle/visible_blocker;稳定 blocker 每 800ms 刷新;启动 3s 宽限;**PTY 有新字节 = working 权威**(`detection_content_seq`),idle 且无新字节则跳过读屏 | T1 的 `screen_state` 必须带这层滞回;Tern 侧找「块有新输出」的信号(`tern events` / `cx` 事件),没有就用屏哈希变化代替,并在 PROTOCOL 注明是代替 |
+| codex | #5278 **删了 codex turn-status hooks**;codex = 读屏 + OSC 标题(`Action Required` ⇒ blocked,盲文转圈 ⇒ working) | codex 席不要指望 hook;OSC 标题读取是必需区域 |
+| claude hook | `SessionStart` 只报会话身份(session_id/transcript_path),**不报状态**;full-lifecycle 权威只给 pi/omp/opencode/kilo/kimi/mastracode | 我方 presence 走 SessionStart 即可;状态仍靠读屏 |
+| prompt 提交 | `submit_agent_prompt`:text(bracketed paste)→ **300ms**(`AGENT_PROMPT_SUBMIT_DELAY`)→ Enter;Copilot 先发 focus-gained;Windows codex 加 paste 边界 | T2 `ask` = `tern send text` → sleep 300ms → `keys Enter`,送达判据 = 屏/transcript 变化;这就是「codex 第二次 Enter 才提交」的原因 |
+| wait / 探针 API | `agent wait --until … --timeout`、`pane.wait_for_idle/wait_for_screen_change/wait_for_text`、`pane.screen_hash/screen_diff`、`pane.tui_probe` | T2 `wait` 对齐 `--until` 多态 + timeout;screen_hash 作变化探针 |
+| 许可 | 上游 LICENSE = **Apache-2.0** | PROTOCOL §10 的 AGPL 注改为「译自 31c77f3(AGPL 时期);r6 起对齐上游 143bf5f(Apache-2.0)」 |
+
+
 ## 3. 在办件处置(#1115)
 
 | 件 | 处置 | 原因 |
@@ -61,4 +76,4 @@ ACP 耦合面(退役/改写清单,grep `tern acp|cx.agents|agents.json|acp` 2026
 ## 6. user 裁定
 
 1. **解读 (b) 迁进 Tern —— user 已裁 2026-10-16 12:2x(原话「(b) 迁进 Tern 执行」)**。(a) 作废。
-2. 待裁:herdr 许可:GitHub README 现写 **Apache-2.0**;PROTOCOL §10 翻译时记 AGPL-3.0。核实后改注。
+2. herdr 许可已核:上游 143bf5f LICENSE = Apache-2.0;本地 fork 31c77f3 为 AGPL 时期。PROTOCOL §10 注随 T1 改(§2a)。
