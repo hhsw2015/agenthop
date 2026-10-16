@@ -22,6 +22,7 @@
 import { readdirSync, readFileSync, statSync, lstatSync, openSync, readSync, closeSync, writeFileSync, mkdirSync, renameSync, constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { BEAT_STALE_SEC, coordinatorBeatPath, carlyPatrolBeatPath } from "./carly-sweep.js";
+import type { Resolved } from "./seat-presence.js";
 
 export const HANDOFF_STALE_SEC = 2 * 3600;
 export const MAIL_MIN = 3;
@@ -246,6 +247,8 @@ export type Budget = { leftMs: number; calls: number };
 export const FACTS_BUDGET_MS = 1_000;
 export const BLOCK_BUDGET_MS = 3_000;
 export const TYPE_BUDGET_MS = 2_000;
+/** inbox-sentinel role-box credit: ps + every exact-argv query within this; past it ⇒ unknown ⇒ not credited. */
+export const ROLE_BOX_BUDGET_MS = 1_500;
 /** At most this many mails are opened per round; the rest of a larger box is UNKNOWN for this round (scan resumes next round). */
 export const MAIL_SCAN_MAX = 50;
 
@@ -268,7 +271,7 @@ export function budgeted(run: (args: string[], timeoutMs: number) => { ok: boole
 export function findCoordinatorBlock(
   coordinatorSid: string | null,
   tern: (args: string[]) => { ok: boolean; stdout: string } | null, // null = refused / over budget
-  agentUnder: (rootPid: number) => number | null | "unknown",      // the agent pid for coordinatorSid under that root
+  agentUnder: (rootPid: number) => Resolved,                       // three-state: match / none / unknown / ambiguous
 ): { block: string } | { none: string } {
   if (!coordinatorSid) return { none: "no live coordinator session (roles/coordinator.sid missing/stale/not a sid)" };
   const ls = tern(["ls", "--json"]);
@@ -289,8 +292,10 @@ export function findCoordinatorBlock(
     try { root = (JSON.parse(pr.stdout) as { child?: { pid?: unknown } }).child?.pid; } catch { return { none: `tern process ${id} unparseable — HOLD` }; }
     if (!Number.isSafeInteger(root)) return { none: `block ${id} has no readable child — HOLD` };
     const a = agentUnder(root as number);
-    if (a === "unknown") return { none: `process argv unreadable under block ${id} — HOLD` };
-    if (a !== null) hits.push(String(id));
+    // UNKNOWN (an argv we could not read, or the budget ended first) ⇒ HOLD: that block might run the coordinator too
+    if (a.kind === "unknown") return { none: `${a.why} under block ${id} — HOLD` };
+    if (a.kind === "ambiguous") return { none: `several processes run ${coordinatorSid} under block ${id} — HOLD` };
+    if (a.kind === "match") hits.push(String(id));
   }
   return hits.length === 1 ? { block: hits[0]! } : { none: `${hits.length} blocks run ${coordinatorSid}` };
 }
@@ -305,7 +310,12 @@ export function roleBoxOwned(liveSid: string | null, agent: Fact<number>): boole
 }
 
 /** The agent process for a sid among candidate root pids: none ⇒ "absent", exactly one distinct pid ⇒ it, several ⇒ "unknown". Pure. */
-export function agentAmong(roots: number[], resolve: (root: number) => number | null): Fact<number> {
-  const pids = new Set(roots.map(resolve).filter((p): p is number => p !== null));
+export function agentAmong(roots: number[], resolve: (root: number) => Resolved): Fact<number> {
+  const pids = new Set<number>();
+  for (const r of roots) {
+    const x = resolve(r);
+    if (x.kind === "unknown" || x.kind === "ambiguous") return "unknown"; // never folded into "absent"
+    if (x.kind === "match") pids.add(x.pid);
+  }
   return pids.size === 0 ? "absent" : pids.size === 1 ? [...pids][0]! : "unknown";
 }

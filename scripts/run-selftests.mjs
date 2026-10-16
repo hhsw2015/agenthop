@@ -109,18 +109,22 @@ function runOne(bin, absPath, cwd, timeoutMs, graceMs) {
 
 /** Fixture-safety lint (incident 2026-10-16: a selftest's cleanup `pkill -f <sid>` killed the live coordinator). A selftest may not
  *  kill by pattern, and may not name a session id that is live on this machine (any ~/.agenthop/presence/<sid>.pid, plus
- *  roles/coordinator.sid). Fixtures use made-up sids. Pure over (text, liveSids). */
+ *  roles/coordinator.sid). Fixtures use made-up sids. FAIL-CLOSED (r4): if the live-sid inventory or any selftest's source cannot be
+ *  read, the check is incomplete and NOTHING runs. Every selftest is checked, the runner's own included — negative fixtures build the
+ *  banned text at run time (string concatenation) instead of holding it literally. Pure over (text, liveSids). */
 export function fixtureLint(text, liveSids) {
   const bad = [];
   if (/\bpkill\b[^\n]*-f\b|["']pkill["']\s*,\s*\[\s*["']-f["']/.test(text)) bad.push("kills by pattern (pkill -f): match processes by the pid you started instead");
   for (const sid of liveSids) if (sid && text.includes(sid)) bad.push(`names the live session ${sid}: use a made-up sid`);
   return bad;
 }
-const LINT_SELF = path.join("scripts", "run-selftests.selftest.mts");
+/** Live sids, or null when the inventory cannot be read (ENOENT on the dirs = no live sessions, a real empty answer). */
 function liveSessionIds(home) {
   const out = new Set();
-  try { for (const n of readdirSync(path.join(home, ".agenthop", "presence"))) { const m = /^(.+)\.pid$/.exec(n); if (m) out.add(m[1]); } } catch { /* none */ }
-  try { const s = readFileSync(path.join(home, ".agenthop", "swarm", "roles", "coordinator.sid"), "utf8").trim(); if (s) out.add(s); } catch { /* none */ }
+  try { for (const n of readdirSync(path.join(home, ".agenthop", "presence"))) { const m = /^(.+)\.pid$/.exec(n); if (m) out.add(m[1]); } }
+  catch (e) { if (e && e.code !== "ENOENT") return null; }
+  try { const s = readFileSync(path.join(home, ".agenthop", "swarm", "roles", "coordinator.sid"), "utf8").trim(); if (s) out.add(s); }
+  catch (e) { if (e && e.code !== "ENOENT") return null; }
   return [...out];
 }
 
@@ -128,13 +132,14 @@ async function main() {
   const files = [], discoveryErrors = [];
   collect(root, files, discoveryErrors);
   files.sort();
-  // fixture-safety lint: refuse to RUN a selftest that could hit a live process (checked before anything executes)
+  // fixture-safety lint: refuse to RUN anything if a selftest could hit a live process — or if that cannot be checked (fail-closed)
   const live = liveSessionIds(process.env.SELFTEST_HOME || homedir());
   const lintFails = [];
+  if (live === null) lintFails.push("(inventory): the live-session list (presence/, roles/coordinator.sid) cannot be read — check incomplete");
   for (const rel of files) {
-    if (rel === LINT_SELF) continue; // the runner's own selftest holds the banned patterns as fixture TEXT it writes, never runs here
-    let text = ""; try { text = readFileSync(path.join(root, rel), "utf8"); } catch { continue; }
-    for (const why of fixtureLint(text, live)) lintFails.push(`${rel}: ${why}`);
+    let text;
+    try { text = readFileSync(path.join(root, rel), "utf8"); } catch (e) { lintFails.push(`${rel}: source unreadable (${e && e.code}) — check incomplete`); continue; }
+    for (const why of fixtureLint(text, live ?? [])) lintFails.push(`${rel}: ${why}`);
   }
   if (lintFails.length) {
     console.log(`run-selftests: fixture-safety lint FAILED — nothing was run:\n${lintFails.map((l) => `  LINT ${l}`).join("\n")}`);

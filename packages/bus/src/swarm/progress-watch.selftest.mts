@@ -9,6 +9,7 @@ import path from "node:path";
 import { judgeProgress, planEmits, commitDelivery, commitResolved, initialWatchState, readProgressFacts, readBoxMails, writeL0Alert, findCoordinatorBlock,
   budgeted, roleBoxOwned, agentAmong, HANDOFF_STALE_SEC, CARLY_STALE_SEC, DEDUP_SEC, RETRY_SEC, BLOCK_BUDGET_MS, MAIL_SCAN_MAX, MAIL_BODY_MAX, type ProgressFacts, type Mail, type Budget } from "./progress-watch.js";
 import { spawnSync } from "node:child_process";
+import { resolveAgentPid3, budgetedExactArgv, parsePs as parsePs3, type Resolved } from "./seat-presence.js";
 import { BEAT_STALE_SEC } from "./carly-sweep.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
@@ -177,7 +178,8 @@ const world = (procs: Record<number, Proc> = {}, agentAt: Record<number, number 
     if (p === "nochild") return { ok: true, stdout: "{}" };
     return p ?? { ok: true, stdout: JSON.stringify({ child: { pid: id === 100 ? 5000 : 6000 } }) };
   };
-  return { tern, agentUnder: (root: number) => agentAt[root] ?? null, calls: () => calls };
+  const toR = (v: number | null | "unknown" | undefined): Resolved => v === "unknown" ? { kind: "unknown", why: "argv unreadable" } : typeof v === "number" ? { kind: "match", pid: v } : { kind: "none" };
+  return { tern, agentUnder: (root: number) => toR(agentAt[root]), calls: () => calls };
 };
 { const w = world(); const r = findCoordinatorBlock(COORD, w.tern, w.agentUnder);
   t("block: the coordinator's claude runs under exactly block 100, the other block proven clear ⇒ 100", "block" in r && r.block === "100"); }
@@ -204,7 +206,7 @@ for (const bad of ["fail", "badjson", "nochild"] as const) {
     const ok = { ok: true, stdout: args[0] === "ls" ? JSON.stringify({ sessions: [{ tabs: [{ blocks: [{ id: 100, live: true }, { id: 200, live: true }] }] }] }) : JSON.stringify({ child: { pid: args[1] === "100" ? 5000 : 6000 } }) };
     return d > timeoutMs ? { ok: false, stdout: "", timedOut: true } : ok; };
   const b: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
-  const r = findCoordinatorBlock(COORD, budgeted(run, b, () => clock), (root) => (root === 5000 ? 5001 : null));
+  const r = findCoordinatorBlock(COORD, budgeted(run, b, () => clock), (root) => (root === 5000 ? { kind: "match", pid: 5001 } : { kind: "none" }));
   t("budget: each call gets the REMAINING budget as its timeout (3000, 2100, 600)", JSON.stringify(seenTimeouts) === JSON.stringify([3000, 2100, 600]));
   t("budget: the call cut at the budget is refused ⇒ HOLD, no block, total ≤ 3000ms", "none" in r && clock <= BLOCK_BUDGET_MS);
 }
@@ -214,7 +216,7 @@ for (const bad of ["fail", "badjson", "nochild"] as const) {
     return args[0] === "ls" ? { ok: true, stdout: JSON.stringify({ sessions: [{ tabs: [{ blocks: Array.from({ length: 8 }, (_, k) => ({ id: k + 1, live: true })) }] }] }) }
       : { ok: false, stdout: "", timedOut: took < 1500 }; };
   const b: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
-  const r = findCoordinatorBlock(COORD, budgeted(slow, b, () => clock), () => null);
+  const r = findCoordinatorBlock(COORD, budgeted(slow, b, () => clock), () => ({ kind: "none" }));
   t("budget: 8 blocks × 1.5s ⇒ stops within 3s, answer none", "none" in r && clock <= BLOCK_BUDGET_MS && calls <= 2);
 }
 {
@@ -276,7 +278,7 @@ for (const bad of ["fail", "badjson", "nochild"] as const) {
 
 // --- inbox-sentinel role box (#1116): owned iff the live coordinator sid's claude is in the PROCESS TABLE (real processes) ---
 {
-  const { parsePs, realExactArgv, resolveAgentPid } = await import("./seat-presence.js");
+  const { parsePs, realExactArgv, resolveAgentPid3 } = await import("./seat-presence.js");
   const dir = mkdtempSync(path.join(os.tmpdir(), "rbo-"));
   writeFileSync(path.join(dir, "tern.c"), '#include <unistd.h>\nint main(int c,char**v){ if(c<4)return 2; if(fork()==0){char*b=v[2];v[2]="claude";execv(b,&v[2]);_exit(127);} for(;;)pause(); }\n');
   writeFileSync(path.join(dir, "claude.c"), "#include <unistd.h>\nint main(void){for(;;)pause();}\n");
@@ -287,12 +289,47 @@ for (const bad of ["fail", "badjson", "nochild"] as const) {
   const root = spawn(path.join(dir, "tern"), ["acp", path.join(dir, "claude"), "--output-format", "stream-json", `--session-id=${SIDX}`], { stdio: "ignore", detached: true });
   spawnSync("sleep", ["0.5"]);
   const look = () => { const rows = parsePs(spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8" }).stdout); const ex = realExactArgv();
-    return agentAmong(rows.filter((r) => r.argv.join(" ").includes("tern acp")).map((r) => r.pid), (r) => resolveAgentPid(r, SIDX, "claude", rows, ex)); };
+    return agentAmong(rows.filter((r) => r.argv.join(" ").includes("tern acp")).map((r) => r.pid), (r) => resolveAgentPid3(r, SIDX, "claude", rows, ex)); };
   t("role box: live coordinator claude in the process table ⇒ owned (no STALL)", roleBoxOwned(SIDX, look()));
   t("role box: no live coordinator sid (file missing/stale/not a sid) ⇒ not owned (sentinel unchanged)", !roleBoxOwned(null, look()));
   process.kill(-root.pid!, "SIGKILL"); spawnSync("sleep", ["0.3"]);
   t("role box: that claude is gone ⇒ not owned (STALL still fires)", !roleBoxOwned(SIDX, look()));
   t("role box: process table unknown ⇒ not owned", !roleBoxOwned(SIDX, "unknown"));
   rmSync(dir, { recursive: true, force: true });
+}
+
+// --- r4 PW-LOCATOR-UNKNOWN: the real three-state resolver, through both callers ---
+{
+  // a fixture process table: root 10 → claude 11 (this seat); root 20 → claude 21 (unreadable argv); root 30 → claude 31 (other seat)
+  const SIDF = "fa0a0a0a-1111-4222-8333-444444444444";
+  const rows = parsePs3([`10 1 tern acp claude`, `11 10 claude stream-json --session-id=${SIDF}`, `20 1 tern acp claude`, `21 20 claude stream-json --session-id=${SIDF}`,
+    `30 1 tern acp claude`, `31 30 claude stream-json --session-id=fb0b0b0b-1111-4222-8333-444444444444`].join("\n"));
+  const argv: Record<number, { exe: string; argv: string[] } | null> = {
+    11: { exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", `--session-id=${SIDF}`] }, 21: null,
+    31: { exe: "/x/claude", argv: ["claude", "--output-format", "stream-json", "--session-id=fb0b0b0b-1111-4222-8333-444444444444"] } };
+  const ex = (p: number) => argv[p] ?? null;
+  t("resolver3: readable match ⇒ match", JSON.stringify(resolveAgentPid3(10, SIDF, "claude", rows, ex)) === JSON.stringify({ kind: "match", pid: 11 }));
+  t("resolver3: candidate argv unreadable ⇒ unknown (NOT none)", resolveAgentPid3(20, SIDF, "claude", rows, ex).kind === "unknown");
+  t("resolver3: no candidate names the sid ⇒ none", resolveAgentPid3(30, SIDF, "claude", rows, ex).kind === "none");
+  t("resolver3: budget spent before a candidate ⇒ unknown", resolveAgentPid3(10, SIDF, "claude", rows, () => "over-budget").kind === "unknown");
+  // caller 1 (locator): known match under block 100 + unreadable argv under block 200 ⇒ HOLD
+  const tern = (a: string[]) => a[0] === "ls" ? { ok: true, stdout: JSON.stringify({ sessions: [{ tabs: [{ blocks: [{ id: 100, live: true }, { id: 200, live: true }] }] }] }) }
+    : { ok: true, stdout: JSON.stringify({ child: { pid: a[1] === "100" ? 10 : 20 } }) };
+  const loc = findCoordinatorBlock(SIDF, tern, (root) => resolveAgentPid3(root, SIDF, "claude", rows, ex));
+  t("locator: known match + another block's argv unreadable ⇒ HOLD, no block (Second Voice's case)", "none" in loc && /HOLD/.test(loc.none));
+  // caller 2 (sentinel role box): the same table ⇒ agentAmong unknown ⇒ not credited
+  const a = agentAmong([10, 20], (root) => resolveAgentPid3(root, SIDF, "claude", rows, ex));
+  t("role box: known match + unreadable candidate ⇒ unknown ⇒ not owned", a === "unknown" && !roleBoxOwned(SIDF, a));
+  t("role box: two readable matches ⇒ unknown (ambiguous)", agentAmong([10, 10], (root) => resolveAgentPid3(root, SIDF, "claude", rows, ex)) === 11
+    && agentAmong([10], () => ({ kind: "ambiguous" })) === "unknown");
+}
+// --- r4 PW-SV-SWEEP-BUDGET: exact-argv queries share the deadline ---
+{
+  let clock = 0; const starts: number[] = [];
+  const slowRun = (_b: string, _a: string[], timeoutMs: number) => { starts.push(clock); clock += Math.min(2400, timeoutMs); return null; }; // 2.4s each (Second Voice)
+  const ex = budgetedExactArgv(3000, () => clock, slowRun);
+  const out = [ex(1), ex(2), ex(3)];
+  t("argv budget: three 2.4s queries under a 3s deadline ⇒ 2 started, the 3rd refused (over-budget)", starts.length === 2 && out[2] === "over-budget");
+  t("argv budget: the second query was given only what was left", clock <= 3000);
 }
 console.log("PASS progress-watch");

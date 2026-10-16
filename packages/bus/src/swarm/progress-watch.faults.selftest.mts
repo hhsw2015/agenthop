@@ -74,7 +74,7 @@ beat(30); handoff(3 * 3600);
   const fake = path.join(home, "tern-hang"); writeFileSync(fake, "#!/bin/sh\nsleep 30\n"); chmodSync(fake, 0o755);
   const b: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 }; const t0 = Date.now();
   const run = (args: string[], timeoutMs: number) => { const r = spawnSync(fake, args, { timeout: timeoutMs }); return { ok: r.status === 0, stdout: String(r.stdout ?? ""), timedOut: (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" }; };
-  const r = findCoordinatorBlock("fa801a23-df75-4c57-bc05-7d89900a924c", budgeted(run, b), () => null);
+  const r = findCoordinatorBlock("fa801a23-df75-4c57-bc05-7d89900a924c", budgeted(run, b), () => ({ kind: "none" }));
   const ms = Date.now() - t0;
   row("peer-no-answer", "fake tern that sleeps 30s", "the first call is cut at the 3s budget; none; ≤ 3.5s", `${"none" in r ? r.none : "block!"} in ${ms}ms`, "none" in r && ms <= 3500);
 }

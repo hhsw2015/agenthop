@@ -139,14 +139,16 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
 // ── fixture-safety lint (incident 2026-10-16): a selftest that kills by pattern or names a live sid is refused, nothing runs ──
 {
   const fakeHome = mkRoot(); mkdirSync(path.join(fakeHome, ".agenthop", "presence"), { recursive: true }); mkdirSync(path.join(fakeHome, ".agenthop", "swarm", "roles"), { recursive: true });
+  const PK = "p" + "kill"; // never a literal in this file
   const LIVE = "cccccccc-1111-4222-8333-444444444444", COORD = "dddddddd-1111-4222-8333-444444444444"; // made-up "live" sids in a fake home
   writeFileSync(path.join(fakeHome, ".agenthop", "presence", `${LIVE}.pid`), "1");
   writeFileSync(path.join(fakeHome, ".agenthop", "swarm", "roles", "coordinator.sid"), `${COORD}\n`);
   const ran = (root: string) => path.join(root, "ran.marker");
   const marker = (root: string, name: string, body: string) => writeFileSync(path.join(root, name), `import { writeFileSync } from "node:fs";\nimport { spawnSync } from "node:child_process";\nwriteFileSync(${JSON.stringify(ran(root))}, "x");\n${body}\n`);
   const cases: Array<[string, string]> = [
-    ["pkill -f in a shell string", 'spawnSync("sh", ["-c", "pkill -f some-fixture-that-matches-nothing-zz"]);'],
-    ["pkill -f as spawn args", 'spawnSync("pkill", ["-f", "some-fixture-that-matches-nothing-zz"]);'],
+    // the banned text is assembled at run time so THIS file stays clean under the same lint
+    ["kill-by-pattern in a shell string", 'spawnSync("sh", ["-c", "' + PK + ' -f some-fixture-that-matches-nothing-zz"]);'],
+    ["kill-by-pattern as spawn args", 'spawnSync("' + PK + '", ["-f", "some-fixture-that-matches-nothing-zz"]);'],
     ["a live presence sid", `const sid = "${LIVE}";`],
     ["the live coordinator sid", `const sid = "${COORD}";`],
   ];
@@ -160,7 +162,22 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
   const root = mkRoot(); marker(root, "c.selftest.mts", 'const sid = "eeeeeeee-1111-4222-8333-444444444444"; process.kill(process.pid, 0);');
   const r = runRunner(root, { SELFTEST_HOME: fakeHome });
   ok(r.code === 0 && require("node:fs").existsSync(ran(root)), "lint: a made-up sid and kill-by-own-pid pass (positive)");
-  rmSync(root, { recursive: true, force: true }); rmSync(fakeHome, { recursive: true, force: true });
+  rmSync(root, { recursive: true, force: true });
+  // fail-closed (r4): an unreadable inventory, or an unreadable selftest source, ⇒ nothing runs at all
+  const chmodSync = require("node:fs").chmodSync as (p: string, m: number) => void;
+  const noInv = mkRoot(); marker(noInv, "a.selftest.mts", "");
+  chmodSync(path.join(fakeHome, ".agenthop", "presence"), 0o000);
+  const r1 = runRunner(noInv, { SELFTEST_HOME: fakeHome }); chmodSync(path.join(fakeHome, ".agenthop", "presence"), 0o700);
+  ok(r1.code === 1 && /inventory.*cannot be read/.test(r1.out) && !require("node:fs").existsSync(ran(noInv)), "lint: live-sid inventory unreadable ⇒ exit 1, NOTHING ran");
+  const noSrc = mkRoot(); marker(noSrc, "a.selftest.mts", ""); writeFileSync(path.join(noSrc, "b.selftest.mts"), "console.log(1)\n"); chmodSync(path.join(noSrc, "b.selftest.mts"), 0o000);
+  const r2 = runRunner(noSrc, { SELFTEST_HOME: fakeHome }); chmodSync(path.join(noSrc, "b.selftest.mts"), 0o600);
+  ok(r2.code === 1 && /b\.selftest\.mts: source unreadable/.test(r2.out) && !require("node:fs").existsSync(ran(noSrc)), "lint: one selftest source unreadable ⇒ exit 1, NOTHING ran (not even the readable one)");
+  // no path is exempt: a selftest at scripts/run-selftests.selftest.mts naming a live sid is refused like any other
+  const self = mkRoot(); mkdirSync(path.join(self, "scripts")); marker(self, path.join("scripts", "run-selftests.selftest.mts"), `const s = "${LIVE}";`);
+  const r3 = runRunner(self, { SELFTEST_HOME: fakeHome });
+  ok(r3.code === 1 && /LINT scripts\/run-selftests\.selftest\.mts/.test(r3.out) && !require("node:fs").existsSync(ran(self)), "lint: no path exemption — the runner's own selftest path is checked too");
+  for (const d of [noInv, noSrc, self]) rmSync(d, { recursive: true, force: true });
+  rmSync(fakeHome, { recursive: true, force: true });
 }
 
 console.log(`\nall run-selftests runner selftests passed (${pass})`);

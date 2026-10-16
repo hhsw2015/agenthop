@@ -269,3 +269,46 @@ function defaultRunSync(bin: string, args: string[]): string | null {
 export function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
 }
+
+/** Three-state resolver (bus.11 r4, PW-LOCATOR-UNKNOWN): the agent pid for `sid` under `rootPid`, or why there is none.
+ *  "none" = every candidate's exact argv was READ and none is this seat; "unknown" = some candidate's argv could not be read (or
+ *  the budget ran out before it was read) — it might have been the seat, so the caller must not treat this as absence; "ambiguous"
+ *  = more than one process is this seat. Same identity rules as resolveAgentPid (which keeps its old null contract for its other
+ *  callers). `exact` may return "over-budget" (treated as unknown). */
+export type Resolved = { kind: "match"; pid: number } | { kind: "none" } | { kind: "unknown"; why: string } | { kind: "ambiguous" };
+export function resolveAgentPid3(rootPid: number, sid: string, tool: SeatTool, rows: PsRow[],
+  exact: (pid: number) => ReturnType<ExactArgv> | "over-budget"): Resolved {
+  const kids = new Map<number, PsRow[]>();
+  for (const r of rows) kids.set(r.ppid, [...(kids.get(r.ppid) ?? []), r]);
+  let cands: PsRow[];
+  if (tool === "claude") {
+    const desc: PsRow[] = []; const seen = new Set<number>(); const frontier = [rootPid];
+    while (frontier.length > 0) for (const c of kids.get(frontier.pop()!) ?? []) if (!seen.has(c.pid)) { seen.add(c.pid); desc.push(c); frontier.push(c.pid); }
+    cands = desc.filter((r) => r.argv.join(" ").includes(sid)); // cheap prefilter only; the decision is on the exact argv
+  } else cands = (kids.get(rootPid) ?? []).filter((r) => r.argv.join(" ").includes("/@agentclientprotocol/codex-acp/"));
+  const hits: number[] = [];
+  for (const r of cands) {
+    const x = exact(r.pid);
+    if (x === "over-budget") return { kind: "unknown", why: `budget spent before pid ${r.pid}'s argv was read` };
+    if (x === null) return { kind: "unknown", why: `argv of pid ${r.pid} unreadable` };
+    const yes = tool === "claude"
+      ? path.basename(x.argv[0] ?? "") === "claude" && x.argv.includes("stream-json") && namesSession(x.argv, sid)
+      : path.basename(x.exe) === "node" && (x.argv[1] ?? "").includes("/@agentclientprotocol/codex-acp/");
+    if (yes) hits.push(r.pid);
+  }
+  return hits.length === 0 ? { kind: "none" } : hits.length === 1 ? { kind: "match", pid: hits[0]! } : { kind: "ambiguous" };
+}
+
+/** realExactArgv under a shared deadline (PW-SV-SWEEP-BUDGET): each query is given what is left as its timeout and charged what it
+ *  took; once the deadline has passed the query is not started ("over-budget"). `deadlineMs` is a performance.now()-style monotonic
+ *  value; `now` is injectable for tests. */
+export function budgetedExactArgv(deadlineMs: number, now: () => number,
+  run: (bin: string, args: string[], timeoutMs: number) => string | null = (bin, args, t) => { const r = spawnSync(bin, args, { encoding: "utf8", timeout: Math.max(1, t) }); return r.status === 0 ? r.stdout : null; },
+): (pid: number) => ReturnType<ExactArgv> | "over-budget" {
+  return (pid) => {
+    const left = deadlineMs - now();
+    if (left <= 0) return "over-budget";
+    const res = realExactArgv((bin, args) => run(bin, args, left))(pid);
+    return now() > deadlineMs ? "over-budget" : res; // finished past the deadline ⇒ not used
+  };
+}

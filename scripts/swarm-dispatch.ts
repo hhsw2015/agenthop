@@ -87,8 +87,8 @@ import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleEx
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
 import { realTernSpawn, cleanTernEnv } from "../packages/bus/src/swarm/tern-env.js";
-import { initialWatchState, judgeProgress, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, roleBoxOwned, agentAmong, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
-import { parsePs, realExactArgv, resolveAgentPid } from "../packages/bus/src/swarm/seat-presence.js";
+import { initialWatchState, judgeProgress, planEmits, commitDelivery, commitResolved, readProgressFacts, writeL0Alert, findCoordinatorBlock, budgeted, BLOCK_BUDGET_MS, TYPE_BUDGET_MS, RETRY_SEC, roleBoxOwned, agentAmong, ROLE_BOX_BUDGET_MS, type Budget } from "../packages/bus/src/swarm/progress-watch.js";
+import { parsePs, resolveAgentPid3, budgetedExactArgv, type Resolved } from "../packages/bus/src/swarm/seat-presence.js";
 import { ternInjectCommands } from "../packages/bus/src/swarm/tern-wake.js";
 import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, bridgeHome, bridgeScriptEnv, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
@@ -1546,11 +1546,13 @@ async function main(): Promise<void> {
       if (COORDINATOR && isValidSessionId(COORDINATOR)) {
         const live = liveCoordinatorSid();
         if (live !== null) {
-          const ps = spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8", timeout: 1500 });
-          const rows = ps.status === 0 ? parsePs(ps.stdout) : null;
-          const exact = realExactArgv();
+          // one monotonic deadline for ps + every exact-argv query (ROLE_BOX_BUDGET_MS); past it ⇒ unknown ⇒ not credited
+          const deadline = performance.now() + ROLE_BOX_BUDGET_MS; const mono = () => performance.now();
+          const ps = spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8", timeout: ROLE_BOX_BUDGET_MS });
+          const rows = ps.status === 0 && mono() <= deadline ? parsePs(ps.stdout) : null;
+          const exact = budgetedExactArgv(deadline, mono);
           const agent = rows === null ? "unknown" as const
-            : agentAmong(rows.filter((r) => r.argv.join(" ").includes("tern acp")).map((r) => r.pid), (root) => resolveAgentPid(root, live, "claude", rows, exact));
+            : agentAmong(rows.filter((r) => r.argv.join(" ").includes("tern acp")).map((r) => r.pid), (root) => resolveAgentPid3(root, live, "claude", rows, exact));
           if (roleBoxOwned(live, agent)) owned.add(inboxDirName(COORDINATOR));
         }
       }
@@ -1585,23 +1587,25 @@ async function main(): Promise<void> {
   /** The coordinator block, within BLOCK_BUDGET_MS for the whole lookup (ls + one process per block + one ps), every call bounded by
    *  what is left. The agent is found in the PROCESS TABLE under each block's root (exact argv) — never from the presence .pid file. */
   const coordinatorBlock = (): { block: string } | { none: string } => {
+    // ONE monotonic deadline for the whole lookup: tern calls, the ps read and every exact-argv query spend from it (PW-SV-SWEEP-BUDGET)
     const budget: Budget = { leftMs: BLOCK_BUDGET_MS, calls: 0 };
-    const tern = budgeted(ternTimed, budget);
+    const t0 = performance.now(); const deadline = t0 + BLOCK_BUDGET_MS;
+    const mono = () => performance.now();
+    const tern = budgeted((args, timeoutMs) => ternTimed(args, Math.min(timeoutMs, deadline - mono())), budget, mono);
     const sid = liveCoordinatorSid();
     let rows: ReturnType<typeof parsePs> | null | undefined;
-    const exact = realExactArgv();
-    const agentUnder = (root: number): number | null | "unknown" => {
+    const exact = budgetedExactArgv(deadline, mono);
+    const agentUnder = (root: number): Resolved => {
       if (rows === undefined) {
-        if (budget.leftMs <= 0) return "unknown";
-        const t0 = Date.now();
-        const ps = spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8", timeout: budget.leftMs });
-        budget.leftMs -= Math.max(1, Date.now() - t0);
-        rows = ps.status === 0 && budget.leftMs >= 0 ? parsePs(ps.stdout) : null;
+        const left = deadline - mono();
+        if (left <= 0) return { kind: "unknown", why: "budget spent before ps" };
+        const ps = spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8", timeout: left });
+        rows = ps.status === 0 && mono() <= deadline ? parsePs(ps.stdout) : null;
       }
-      return rows === null ? "unknown" : resolveAgentPid(root, sid!, "claude", rows, exact);
+      return rows === null ? { kind: "unknown", why: "process table unreadable" } : resolveAgentPid3(root, sid!, "claude", rows, exact);
     };
     const r = findCoordinatorBlock(sid, tern, agentUnder);
-    return "block" in r && budget.leftMs < 0 ? { none: "lookup finished over budget — not typing" } : r;
+    return "block" in r && mono() > deadline ? { none: "lookup finished over budget — not typing" } : r;
   };
   const runProgressWatch = (): void => {
     if (!flagDefaultOn(process.env.SWARM_PROGRESS_WATCH)) return;
