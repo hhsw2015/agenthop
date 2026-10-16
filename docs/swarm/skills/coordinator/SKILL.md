@@ -120,7 +120,7 @@ user 离场期你**代行其可撤决策**(可撤判据见 CORE 代理权节);�
 
 **席位生命周期 / 轮换(全席位)**——权威 `~/.agenthop/swarm/coordinator-recovery-runbook.md`(v2),要点:
 - 阈值:transcript ≥60 MiB 计划轮换、≥80 MiB 强制;2h 内第 3 次崩 / resume 首 prompt 即崩 ⇒ 换干净会话。
-- 授权:下属席轮换 = 协调者自主运维(记 PROGRESS 一行);协调者自身轮换 = user 点头(经对话官看门狗)。
+- 授权:下属席轮换 = 协调者自主运维(记 PROGRESS 一行);**协调者自身轮换 = 你在安全点自己做**(user 2026-10-16「必须无人值守还能持续推进」);你死/卡 ⇒ dispatcher L8 自动起继任席读 handoff。两者都**事后** S19 告知 user,不事前请示。
 - 安全点:交付信已投 + 工作树 clean + 箱空;**有未提交改动不轮换**。
 - 席位三类:开发席近似无状态(git + 箱 + 送审信三要素);审查席靠判卷目录 + 直注清单;**只有协调者需要 handoff 文件**。
 - 操作:`tern close <旧 block>` → `tern new tab <session> --cwd <cwd> -- tern acp <tool> …`(按 roster 行的 tool/model/mode)→ `tern rename <block> <角色>` → 等 presence 新 `.pid` → 交接单 `writeInbox` + 开场一句直注(§1a 的两条命令)。
