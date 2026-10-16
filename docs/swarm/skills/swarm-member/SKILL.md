@@ -87,6 +87,8 @@ console.log(writeInbox(homedir(), "<target full sid>", composeInboxMsg({ from: "
 
 ## 4. 送审信三要素
 
+**投递面(#1155 硬规则)**:送审信**三投**——主审席箱、二声席箱、协调者角色箱(`writeInbox` 各一次,同 key 幂等);只投角色箱等于没送审(审查席不读角色箱)。codex 主审席另加一句 `tern send` 直注。
+
 每封送审 / 交付信必须写全:
 
 ```text
