@@ -87,6 +87,10 @@ import { readControlLogSignals, countRosterMembers, readIdleSignals, writeIdleEx
 import { carlyProjectionEnabled, runCarlySweep } from "../packages/bus/src/swarm/carly-sweep.js";
 import { initialOrphanState, runOrphanSweep, realSeatRecords, realMarkWorker, realWhileInstance, realSocketOwners, realSignalPid, realWaitPidGone, realHerdr, realTernBlocks, realTmpFiles, realGc } from "../packages/bus/src/swarm/tern-orphan-sweep.js";
 import { realTernSpawn } from "../packages/bus/src/swarm/tern-env.js";
+import { initialWatchState, judgeProgress, planEmits, readProgressFacts, writeL0Alert, blockForSession } from "../packages/bus/src/swarm/progress-watch.js";
+import { parsePs, realExactArgv, resolveAgentPid } from "../packages/bus/src/swarm/seat-presence.js";
+import { ternInjectCommands } from "../packages/bus/src/swarm/tern-wake.js";
+import { isValidSessionId } from "../packages/bus/src/send-fallback.js";
 import { ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realMirrorReader, realSentinelReader, realClearSentinel, realScheduler, bridgeHome, bridgeScriptEnv, realPendingRequests, sleepSync } from "../packages/bus/src/swarm/tern-bridge-sweep.js";
 import { modelMarketEnabled } from "../packages/bus/src/swarm/model-market.js";
 import { pullModelMarket } from "../packages/bus/src/swarm/model-market-store.js";
@@ -1541,6 +1545,66 @@ async function main(): Promise<void> {
     } catch (e) { log(`inbox sentinel failed (isolated): ${e instanceof Error ? e.message : e}`); }
   };
 
+  // L4 coordinator progress watch (long-run-liveness, 2026-10-16): "alive but not advancing" — beat fresh while the handoff is >2h old
+  // or ≥3 real mails wait >1h in the coordinator role box ⇒ S19 to the role box + an L0 alert file + one line typed into the
+  // coordinator's Tern block; Carly's patrol beat >30min ⇒ S19 + L0. Pure file reads (I3), fail-soft, deduped 30min, "resolved" once.
+  // The coordinator's dead state (beat stale) is not judged here — the existing death paths own it. SWARM_PROGRESS_WATCH, default ON.
+  const progressWatch = initialWatchState();
+  const ternSpawnPW = realTernSpawn(process.env);
+  const rosterMemberSids = (): Set<string> => {
+    try {
+      const r = JSON.parse(readFileSync(path.join(SCRIPTS_DIR, "..", "tern", "restore", "roster.json"), "utf8")) as { seats?: Array<{ role?: string; sid?: string }> };
+      return new Set((r.seats ?? []).filter((x) => x.role !== "Manager" && typeof x.sid === "string").map((x) => x.sid as string));
+    } catch { return new Set(); }
+  };
+  const coordinatorBlock = (sid: string): string | null => {
+    const ls = ternSpawnPW(["ls", "--json"]);
+    if (!ls.ok) return null;
+    const blocks: Array<{ id: string; rootPid: number }> = [];
+    try {
+      for (const se of (JSON.parse(ls.stdout) as { sessions: Array<{ tabs: Array<{ blocks: Array<{ id: number; live: boolean }> }> }> }).sessions)
+        for (const t of se.tabs) for (const b of t.blocks) {
+          if (!b.live) continue;
+          const pr = ternSpawnPW(["process", String(b.id), "--json"]);
+          const root = pr.ok ? (JSON.parse(pr.stdout) as { child?: { pid?: unknown } }).child?.pid : undefined;
+          if (Number.isSafeInteger(root)) blocks.push({ id: String(b.id), rootPid: root as number });
+        }
+    } catch { return null; }
+    const ps = spawnSync("ps", ["axo", "pid=,ppid=,command="], { encoding: "utf8", timeout: 1500 });
+    if (ps.status !== 0) return null;
+    const rows = parsePs(ps.stdout), exact = realExactArgv();
+    return blockForSession(blocks, (root) => resolveAgentPid(root, sid, "claude", rows, exact));
+  };
+  const runProgressWatch = (): void => {
+    if (!flagDefaultOn(process.env.SWARM_PROGRESS_WATCH)) return;
+    try {
+      const now = nowSec();
+      // the role box is the coordinator's stable address (SWARM_COORDINATOR), whichever session currently drains it
+      const box = COORDINATOR && isValidSessionId(COORDINATOR) ? inboxDirName(COORDINATOR) : null;
+      const { fire, resolved } = planEmits(progressWatch, judgeProgress(readProgressFacts(HOME, box, now)), now);
+      for (const a of fire) {
+        notifyCoordinator(a.text, { taskRef: `progress-watch:${a.key}`, title: a.key, severity: "stall" });
+        try { log(`progress-watch: L0 alert ${writeL0Alert(HOME, a, now)}`); } catch (e) { log(`progress-watch: L0 alert write failed: ${e instanceof Error ? e.message : e}`); }
+        if (a.key === "coordinator-stalled") {
+          // the coordinator's CURRENT session: SWARM_COORDINATOR is the role address, not necessarily the running session (it was
+          // rotated to a clean session). The current one is a live presence session that is NOT a member seat on the restore roster
+          // (tern/restore/roster.json lists every member sid). Exactly one such session with exactly one block, or no typing.
+          const members = rosterMemberSids();
+          const live = listSessions(HOME).filter((sid) => !members.has(sid));
+          const blockIds = [...new Set(live.map((sid) => coordinatorBlock(sid)).filter((b): b is string => b !== null))];
+          if (blockIds.length === 1) {
+            // the same send commands inbox-wake uses, through the L3 runner (cleaned env, 1.5s) like every other dispatcher tern call
+            const [typeCmd, enterCmd] = ternInjectCommands(blockIds[0]!, a.text);
+            const ok = ternSpawnPW(typeCmd).ok && ternSpawnPW(enterCmd).ok;
+            log(`progress-watch: ${ok ? "typed into" : "could not type into"} coordinator block ${blockIds[0]}`);
+          } else log(`progress-watch: coordinator block not identified (${blockIds.length} candidates) — S19 + L0 only`);
+        }
+        log(`progress-watch: ${a.key} — ${a.text}`);
+      }
+      for (const k of resolved) { log(`progress-watch: ${k} resolved`); notifyCoordinator(`[dispatcher] ${k} resolved`, { taskRef: `progress-watch:${k}`, title: `${k} resolved`, severity: "info" }); }
+    } catch (e) { log(`progress watch failed (isolated): ${e instanceof Error ? e.message : e}`); }
+  };
+
   // S14 live sentinel (v2 — herdr-primitive-driven, user "用到极致"): per herdr-IDENTIFIED member run an event-driven watcher
   // (superviseMember) on herdr's BLOCKING primitives — `agent wait --until` (①), `pane wait-output` (②), `agent explain` (④)
   // — INSTEAD of tick-polling. A bus-presence-only member (herdr can't wait on it) falls back to a per-tick self-reported-
@@ -2316,7 +2380,7 @@ async function main(): Promise<void> {
     sweepTick: async () => runSweepTick({
       // control-INDEPENDENT supervision (DISP1-2): these read their OWN sources (inbox dirs, swap/PID records, review/round/
       // placement ledgers), NOT the control log, so they run EVERY tick — a corrupt control log must never silence them.
-      independent: [runInboxSentinel, runSuccessionHeartbeat, runReviewAutoscaleSuggest, runRoundDoctor, runPlacementSuggest, runObserverWatch],
+      independent: [runInboxSentinel, runProgressWatch, runSuccessionHeartbeat, runReviewAutoscaleSuggest, runRoundDoctor, runPlacementSuggest, runObserverWatch],
       // fail-soft control load: true iff readable; sets the shared ref; escalates (deduped) on a fault (DISP-1 / DISP1-1).
       loadControl: () => { const s = loadControlFailSoft("sweep"); if (s === null) return false; sweepStateRef.s = s; return true; },
       // control-DEPENDENT work — runs ONLY when the control log loaded (sweepPass + projection/verdict + observer completion +
