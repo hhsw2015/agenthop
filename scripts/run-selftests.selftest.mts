@@ -156,6 +156,8 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
   const KA = "kill" + "all";
   const flagged = [`${PK} -f foo`, `sh -c "${PK} -9 -f foo"`, `${PK} -9f foo`, `${PK} -fx foo`, `${PK} --full foo`, `spawnSync("${PK}", ["-f", "x"])`,
     `spawnSync("${PK}", ["-9", "-f", "x"])`, `spawnSync(\n  "${PK}",\n  [\n    "-9",\n    "-f",\n    "x",\n  ],\n)`, `${KA} node`, `${PK} "-f" "text-only"`, `${PK} '--full' 'text-only'`, `${PK} -9 \\-f x`];
+  const { jsStringLiterals } = await import("./run-selftests.mjs");
+  ok(JSON.stringify(jsStringLiterals('a("x\\"y", \'q\\\'r\', `t${n}u`)')) === JSON.stringify(['x"y', "q'r", "t u"]), "js literals: \\\" / \\' decoded, ${} is a word gap");
   const clean = [`${PK} -9 12345`, `spawnSync("${PK}", ["-9", "12345"])`, `process.kill(pid, "SIGKILL")`];
   ok(flagged.every((x) => killsByPattern(x)), "lint matcher: every kill-by-pattern layout is flagged (incl. multi-line argv with -f after -9)");
   ok(clean.every((x) => !killsByPattern(x)), "lint matcher: killing a specific pid is not flagged");
@@ -166,6 +168,9 @@ const goodSelftest = (dir: string, name: string): void => writeFileSync(path.joi
     ["kill-by-pattern as spawn args", 'spawnSync("' + PK + '", ["-f", "some-fixture-that-matches-nothing-zz"]);'],
     // FXL-PATTERN-COVERAGE r7: quoted flags inside a shell string decode to the same argv
     ["kill-by-pattern, double-quoted flag in sh -c", 'spawnSync("sh", ["-c", `' + PK + ' "-f" "text-only"`]);'],
+    // FXL r8: the shell quotes are JS-escaped inside a JS double-quoted string (the runner must decode JS first, then shell)
+    ["kill-by-pattern, JS-escaped shell quotes", 'spawnSync("sh", ["-c", "' + PK + ' \\"-f\\" \\"text-only\\""]);'],
+    ["kill-by-pattern, JS unicode escape for the flag", 'spawnSync("sh", ["-c", "' + PK + ' \\u002df text-only"]);'],
     ["kill-by-pattern, single-quoted long flag", 'spawnSync("sh", ["-c", "' + PK + " '--full' 'text-only'" + '"]);'],
     ["a live presence sid", `const sid = "${LIVE}";`],
     ["the live coordinator sid", `const sid = "${COORD}";`],

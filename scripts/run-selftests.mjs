@@ -138,7 +138,39 @@ export function shellWords(text) {
   push();
   return words;
 }
-export function killsByPattern(text) {
+/** The static string literals in JS source, decoded the way JS would ('…', "…", and `…` with each ${…} replaced by a space).
+ *  FXL r8: a shell line inside a JS string reaches sh only after JS escapes are applied (`"pkill \"-f\" x"` is `pkill "-f" x`). */
+export function jsStringLiterals(src) {
+  const out = []; let i = 0;
+  const esc = (j) => {
+    const c = src[j + 1];
+    const simple = { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v", 0: "\0" };
+    if (c === "x") return [String.fromCharCode(parseInt(src.slice(j + 2, j + 4), 16) || 0), 4];
+    if (c === "u" && src[j + 2] === "{") { const k = src.indexOf("}", j); return [String.fromCodePoint(parseInt(src.slice(j + 3, k), 16) || 0), k - j + 1]; }
+    if (c === "u") return [String.fromCharCode(parseInt(src.slice(j + 2, j + 6), 16) || 0), 6];
+    if (c === "\n") return ["", 2]; // line continuation
+    return [simple[c] ?? c ?? "", 2];
+  };
+  while (i < src.length) {
+    const q = src[i];
+    if (q === "/" && src[i + 1] === "/") { const k = src.indexOf("\n", i); i = k < 0 ? src.length : k; continue; }
+    if (q === "/" && src[i + 1] === "*") { const k = src.indexOf("*/", i + 2); i = k < 0 ? src.length : k + 2; continue; }
+    if (q !== "'" && q !== '"' && q !== "`") { i++; continue; }
+    let j = i + 1, cur = "";
+    while (j < src.length && src[j] !== q) {
+      if (src[j] === "\\") { const [v, n] = esc(j); cur += v; j += n; continue; }
+      if (q === "`" && src[j] === "$" && src[j + 1] === "{") {
+        let d = 1, k = j + 2; while (k < src.length && d > 0) { if (src[k] === "{") d++; else if (src[k] === "}") d--; k++; }
+        cur += " "; j = k; continue;
+      }
+      if (q !== "`" && src[j] === "\n") break; // unterminated: not a literal
+      cur += src[j]; j++;
+    }
+    out.push(cur); i = j + 1;
+  }
+  return out;
+}
+function killsByPatternRaw(text) {
   const re = /\b(pkill|killall)\b/g; let m;
   while ((m = re.exec(text)) !== null) {
     const tail = text.slice(m.index, m.index + 400);
@@ -149,6 +181,10 @@ export function killsByPattern(text) {
     if (args.some((a) => /^-[A-Za-z0-9]*f[A-Za-z0-9]*$/.test(a) || a === "--full")) return true;
   }
   return false;
+}
+/** True if the source kills by pattern, read as the source itself OR as any static string literal in it after JS decoding. */
+export function killsByPattern(text) {
+  return killsByPatternRaw(text) || jsStringLiterals(text).some((lit) => killsByPatternRaw(lit));
 }
 export function fixtureLint(text, liveSids) {
   const bad = [];
