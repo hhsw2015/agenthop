@@ -540,6 +540,29 @@ t("control root: explicit AGENTHOP_BRIDGE_HOME wins", bridgeHome({ AH_HOME: "/tm
   t(`tick: readable again ⇒ the stuck request drives the full recovery chain (${out})`, reloads(w) === 1 && has(w, ".drain"));
 }
 
+// --- L5-LV-SOURCE-UNKNOWN × owed work: an unreadable requests/ holds owed ready / arm / drain too (no exception) ---
+for (const stage of ["drain", "ready"] as const) {
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  if (stage === "drain") { w.onReload = () => { w.mirror = { tick: 1, vm: "vmQ" }; }; w.reqs = [{ name: "s.json", ageMs: 3000, isStart: true }]; w.failStep = "drain"; }
+  else { w.mirrorAdvances = false; w.onReload = () => { /* the bridge does not come back */ }; }
+  w.clock += 6000; w.calls = [];
+  tick(st, b);
+  const owed = st.owedAfterReload;
+  t(`owed ${stage}: set up (stage ${owed?.stage})`, owed !== null);
+  w.failStep = undefined; const real = w.reqs; w.reqs = null;
+  for (let k = 0; k < 2; k++) {
+    w.clock += RELOAD_MIN_MS + 1000; w.calls = []; // past the debounce: a reload would be allowed
+    const out = tick(st, b);
+    t(`owed ${stage} + requests unreadable (${k + 1}) ⇒ unknown; zero reload / arm / drain; obligation kept as it was`,
+      out === "unknown" && reloads(w) === 0 && !has(w, ".arm") && !has(w, ".drain") && st.owedAfterReload !== null && st.owedAfterReload?.stage === owed?.stage);
+  }
+  if (stage === "ready") { w.mirrorAdvances = true; w.mirror = { tick: 77, vm: "vmBack" }; }
+  w.reqs = real; w.clock += 5000; w.calls = [];
+  tick(st, b);
+  t(`owed ${stage}: readable again ⇒ the owed chain finishes (drain ran, obligation cleared)`, has(w, ".drain") && st.owedAfterReload === null);
+}
+
 // --- STEP-BOUND (small half): a child that ignores SIGTERM cannot hold the runner past its timeout ---
 {
   const dir = mkdtempSync(path.join(os.tmpdir(), "tbs-kill-"));

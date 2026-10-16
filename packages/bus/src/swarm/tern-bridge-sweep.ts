@@ -212,13 +212,15 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
   if (mirror.tick !== st.lastTick) { st.lastTick = mirror.tick; st.lastTickChangeMs = now; }
   if (st.lastTickChangeMs === -Infinity) st.lastTickChangeMs = now; // first observation starts the stall clock
 
+  // L5-LV-SOURCE-UNKNOWN: an unreadable requests dir / request is UNKNOWN, not "nothing stuck" — hold BEFORE anything else,
+  // including owed ready/arm/drain work from an earlier reload: no arm, no drain, no reload; every obligation is kept.
+  const pending = io.pendingRequests();
+  if (pending === null) { io.log("tern-bridge: UNKNOWN (requests/ unreadable) — no action, obligations kept"); return "unknown"; }
+
   // owed work from an earlier successful reload (arm → drain) comes first, before any new reload decision
   if (st.owedAfterReload !== null) return finishAfterReload(st, io, mirror);
 
   // ③ health first: a positive stall signal from the bridge's own files (tern answered, so this is not UNKNOWN).
-  const pending = io.pendingRequests();
-  // L5-LV-SOURCE-UNKNOWN: an unreadable requests dir / request is UNKNOWN, not "nothing stuck" — hold (no arm, no drain, no reload)
-  if (pending === null) { io.log("tern-bridge: UNKNOWN (requests/ unreadable) — no action, obligations kept"); return "unknown"; }
   const stuck = pending.filter((r) => r.ageMs > REQ_STUCK_MS);
   const tickStalled = now - st.lastTickChangeMs > TICK_STALL_MS;
   if (tickStalled || stuck.length > 0) {
