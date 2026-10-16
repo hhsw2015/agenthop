@@ -24,7 +24,7 @@
 | herdr | 蜂群用途 | Tern TUI 等价 | 现状 / 单 |
 |---|---|---|---|
 | `agent list` 状态 working/blocked/idle(PTY 读屏 + 17 manifest) | 状态板、哨兵、sweep、L4/L7、autoscale | 哨兵每轮 `cx.session:read` **一个** pane → `classify(lines,title,program)` → agents.json 每席 `screen_state` | 分类器在 main;哨兵接线**未证**(sentinel.luau:91 只有接口注释)→ **T1** |
-| `agent prompt` | 派单直注、唤醒、开场 | `tern send BLOCK text '…'` + `tern send BLOCK keys Enter` | 已有(tern-wake.ts:159);TUI 多行提交待验 **U3** |
+| `agent prompt` | 派单直注、唤醒、开场 | `tern send BLOCK text '…'` + `tern send BLOCK keys Enter` | 已有(tern-wake.ts:159);**Platform Dev 探针:codex TUI 第一次 Enter 不提交,要第二次**(Reserve U3 复核;ask 的「送达」判据须是提交后屏幕变化,不是 Enter 返回 ok) |
 | `agent wait --until` | `agenthop_tern wait` / `wait_peer` | 轮询 `screen_state`,有界次数 + 单调钟(L5 r3 的教训) | **T2** |
 | `agent read` / `explain` | 卡点取证、F44-⑩、F57 | `tern capture BLOCK --scrollback` + `stripTui`(herdr.ts:318)+ classify 命中的 `rule` | **T2** |
 | `agent send-keys` | 审批弹窗 | `tern send BLOCK keys …`;策略不变:**只报不批**(R16;WHITELIST_V1 为空) | 已有 |
@@ -40,7 +40,7 @@ ACP 耦合面(退役/改写清单,grep `tern acp|cx.agents|agents.json|acp` 2026
 
 | 件 | 处置 | 原因 |
 |---|---|---|
-| A r10 @7dfa33b(codex app-server 主线程身份;主审 2P1/2P2、二声 1P2) | **PAUSE**,分支与两票留档 | TUI 下 codex 无 app-server 子线程;Platform Dev 在 Phase 0 核 codex TUI + MCP 的 bus 身份是否仍有同类问题,有则复活 |
+| A r10 @7dfa33b(codex 主线程身份;主审 2P1/2P2、二声 1P2) | **复活 → A r11**(#1117) | Platform Dev 探针(codex 0.162.1 TUI):MCP 父进程 = codex TUI 本身,**每个子代理各起一个 MCP**(同一父),与 ACP 下「一席多 MCP」同题;r10 的 classifyParent 把 TUI 父 argv 判成 unknown 才碰巧走保守路。r11 = 加「codex TUI parent」类(身份只取 thread_source=user 且为父进程唯一主线程的元数据;子代理 MCP 不认领)+ r10 四 REMAIN(CID-CLAIM-READ-UNKNOWN P1 / CID-CLAUDE-FALSE-SUCCESS P1 / CM-FLUSH-BUDGET / CID-GAP-CORE-GATE)+ 唤醒改走 T2 `tern send`(TUI 不在共享 daemon 36869) |
 | L5 r3 @feed5df(A1 桥自愈;主审 1P1/1P2、二声 1P1/1P2) | **PAUSE** | 桥的 ACP mirror 退役;T1 若沿用桥的 tick/mirror 机制,L5 修复搬进新 mirror(Platform Dev 在 T1 决定并带回) |
 | bus.11 r2 @d66fdea(presence/L3/L4;主审 1P1/3P2、二声 3P2+nit) | **继续**:Infra Dev 修 **r3** | 壳无关;并在 TUI 席上复验 L4 定位链(presence 来源改 hook) |
 | swarm-soak @7d96245(主审 3P1) | **继续**:Reserve 修 r2(Phase 0 之后) | 壳无关 |
@@ -58,7 +58,7 @@ ACP 耦合面(退役/改写清单,grep `tern acp|cx.agents|agents.json|acp` 2026
 
 耐久箱真理源 · 投递先于记账 · UNKNOWN 零动作(读不到 ≠ 正常,=P1)· 只报不批 · 分类 5ms/哨兵整轮 50ms · 读屏单源不作安全判定 · 预算有界且单调钟 · 零角色名零本仓路径(skill §8 毕业判据)。
 
-## 6. 待 user 裁(不阻塞)
+## 6. user 裁定
 
-1. 解读 (b) 默认(§1.3)。
-2. herdr 许可:GitHub README 现写 **Apache-2.0**;PROTOCOL §10 翻译时记 AGPL-3.0。核实后改注。
+1. **解读 (b) 迁进 Tern —— user 已裁 2026-10-16 12:2x(原话「(b) 迁进 Tern 执行」)**。(a) 作废。
+2. 待裁:herdr 许可:GitHub README 现写 **Apache-2.0**;PROTOCOL §10 翻译时记 AGPL-3.0。核实后改注。
