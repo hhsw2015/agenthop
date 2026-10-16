@@ -13,14 +13,14 @@ import os from "node:os";
 import path from "node:path";
 import {
   ternBridgeEnabled, runTernBridgeTick, initialBridgeState, realTern, realSentinelReader, realClearSentinel, realPendingRequests, bridgeHome, bridgeScriptEnv, bridgeDir, movedSince,
-  armSequence, ACTION, RELOAD_MIN_MS,
+  armSequence, ACTION, RELOAD_MIN_MS, TERN_TIMEOUT_MS,
   type BridgeIO, type Mirror, type PendingReq, type TernResult, type ArmStatus,
 } from "./tern-bridge-sweep.js";
 
 const t = (n: string, c: boolean) => { if (!c) throw new Error("FAILED: " + n); console.log("ok  " + n); };
 
 type World = {
-  clock: number; mirror: Mirror; reqs: PendingReq[]; ternUp: boolean;
+  clock: number; mirror: Mirror; reqs: PendingReq[] | null; ternUp: boolean;
   calls: string[]; logs: string[]; control: string[];
   onReload?: () => void; mirrorAdvances: boolean;
   // fake r11 bridge: live patrol task ids + the status file (arm-cancel-next reads the ids the last scan recorded)
@@ -276,7 +276,7 @@ for (const failing of ["drain", "drain-start"] as const) {
   t("movedSince: tick moved, same vm => ready", movedSince({ vm: "A", tick: 3 }, { vm: "A", tick: 4 }));
   t("movedSince: unchanged => not ready", !movedSince({ vm: "A", tick: 3 }, { vm: "A", tick: 3 }));
   t("movedSince: unreadable now => not ready", !movedSince({ vm: "A", tick: 3 }, null));
-  t("movedSince: unreadable baseline, readable now => ready", movedSince(null, { vm: "A", tick: 0 }));
+  t("movedSince (L5-SV-UNKNOWN-BASELINE): unreadable baseline => NOT ready, whatever is read now", !movedSince(null, { vm: "A", tick: 0 }));
 }
 
 // --- r5: TBS-REQUEST-CLASS — start classification comes from the decoded top-level op ---
@@ -291,7 +291,7 @@ for (const failing of ["drain", "drain-start"] as const) {
     "e.json": '{torn',
   };
   for (const [n, body] of Object.entries(files)) writeFileSync(path.join(rq, n), body);
-  const got = Object.fromEntries(realPendingRequests(home, () => Date.now())().map((r) => [r.name, r.isStart]));
+  const got = Object.fromEntries((realPendingRequests(home, () => Date.now())() ?? []).map((r) => [r.name, r.isStart]));
   t("request class: escaped \\u0061 'start' is a start", got["a.json"] === true);
   t("request class: escaped key \\u006fp is a start", got["b.json"] === true);
   t("request class: nested op:start is NOT a start", got["c.json"] === false);
@@ -425,6 +425,66 @@ t("control root: explicit AGENTHOP_BRIDGE_HOME wins", bridgeHome({ AH_HOME: "/tm
   t("L5 gate: that took exactly one reload", reloads(w) === 1);
 }
 
+// --- [liveness] L5-SV-UNKNOWN-BASELINE (P1): the stall is observed on an unchanged mirror; the NEXT read in that tick fails
+//     (old code took its baseline from exactly that read). After the reload the same unchanged mirror must NOT count as ready ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  w.mirrorAdvances = false;
+  w.reqs = [{ name: "s.json", ageMs: 99_000, isStart: true }];
+  w.clock += 6000;
+  let readsThisTick = 0;
+  const read0 = b.readMirror;
+  b.readMirror = () => (++readsThisTick === 2 ? null : read0()); // the 1st read (stall decision) works, the 2nd fails
+  const before = w.calls.length;
+  tick(st, b);
+  t("UNKNOWN-BASELINE: an unchanged mirror after the reload is NOT ready (obligation kept at ready)", st.owedAfterReload?.stage === "ready");
+  t("UNKNOWN-BASELINE: no arm / drain / drain-start ran on an unproven reload", !w.calls.slice(before).some((c) => /\.(arm-scan|drain|drain-start)$/.test(c)));
+}
+
+// --- [liveness] L5-SV-READY-CLOCK: a clock that jumps back during the ready wait cannot stretch it; it ends by poll count ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  w.mirrorAdvances = false;
+  w.clock += 6000;
+  let slept = 0;
+  b.sleep = (ms) => { slept++; w.clock -= 3_600_000; void ms; }; // every wait sets the clock back an hour
+  const before = mirrorCalls(w);
+  tick(st, b);
+  const probes = mirrorCalls(w) - before;
+  t("READY-CLOCK: clock rolled back an hour per wait ⇒ the ready wait still ends (≤ READY_POLLS probes, not thousands)", probes <= 18 && slept <= 17);
+  t("READY-CLOCK: the unfinished recovery is kept as an obligation", st.owedAfterReload?.stage === "ready");
+}
+
+// --- [liveness] clock rollback between ticks: the sweep must not go quiet for the length of the jump ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  w.clock -= 3_600_000; // the wall clock jumps back one hour
+  w.calls = [];
+  tick(st, b);
+  t("ROLLBACK: the next tick still drives the mirror (not 'throttled' for an hour)", mirrorCalls(w) === 1);
+  w.mirrorAdvances = false;
+  for (let i = 0; i < 3; i++) { w.clock += 5000; tick(st, b); }
+  t("ROLLBACK: a stall after the jump is still detected and recovered within a few rounds (not an hour)", reloads(w) === 1);
+}
+
+// --- #1115 T1: each sweep tick that reached the bridge triggers one `screen` round; a failing `screen` is not a stall signal ---
+{
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  w.calls = [];
+  for (let i = 0; i < 3; i++) { w.clock += 5000; tick(st, b); }
+  t("T1: one screen run per healthy tick", w.calls.filter((c) => c.endsWith(".screen")).length === 3);
+  w.failStep = "screen"; w.calls = [];
+  for (let i = 0; i < 3; i++) { w.clock += 5000; tick(st, b); }
+  t("T1: screen failing ⇒ no reload, the mirror keeps being driven", reloads(w) === 0 && mirrorCalls(w) === 3);
+  w.failStep = undefined; w.ternUp = false; w.calls = [];
+  w.clock += 5000; tick(st, b);
+  t("T1: tern UNKNOWN ⇒ no screen run either (zero further actions)", !w.calls.some((c) => c.endsWith(".screen")));
+}
+
 // --- L5: the unhealthy-but-debounced line is rate-limited too ---
 {
   const w = world(); const st = initialBridgeState(); const b = io(w);
@@ -452,6 +512,63 @@ t("control root: explicit AGENTHOP_BRIDGE_HOME wins", bridgeHome({ AH_HOME: "/tm
   t("runner: {\"ok\":false} ⇒ UNKNOWN", realTern({ TERN_BIN: mk("c", 'echo \'{"ok":false,"error":"x"}\'') })(["x"]).ok === false);
   t("runner: missing binary ⇒ UNKNOWN", realTern({ TERN_BIN: path.join(dir, "nope") })(["x"]).ok === false);
   t("runner: hang ⇒ timeout ⇒ UNKNOWN", realTern({ TERN_BIN: mk("d", "sleep 10") })(["x"]).ok === false);
+}
+
+// --- L5-LV-SOURCE-UNKNOWN: requests/ unreadable ⇒ UNKNOWN hold, never "nothing stuck" ---
+{
+  const eio = () => { const e = new Error("EIO") as NodeJS.ErrnoException; e.code = "EIO"; throw e; };
+  const enoent = () => { const e = new Error("ENOENT") as NodeJS.ErrnoException; e.code = "ENOENT"; throw e; };
+  const okFs = { readdir: () => ["r1.json"], read: () => '{"op":"list"}', mtimeMs: () => 0 };
+  t("pending: dir EIO ⇒ null (unknown)", realPendingRequests("/h", () => 1, { ...okFs, readdir: eio })() === null);
+  t("pending: request body EIO ⇒ null (unknown)", realPendingRequests("/h", () => 1, { ...okFs, read: eio })() === null);
+  t("pending: stat EIO ⇒ null (unknown)", realPendingRequests("/h", () => 1, { ...okFs, mtimeMs: eio })() === null);
+  t("pending: no dir (ENOENT) ⇒ [] (none)", JSON.stringify(realPendingRequests("/h", () => 1, { ...okFs, readdir: enoent })()) === "[]");
+  t("pending: request gone (ENOENT, claimed meanwhile) ⇒ skipped", JSON.stringify(realPendingRequests("/h", () => 1, { ...okFs, read: enoent })()) === "[]");
+  const r = realPendingRequests("/h", () => 1000, okFs)();
+  t("pending: readable ⇒ the request with its age", r !== null && r.length === 1 && r[0]!.ageMs === 1000);
+
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b); // armed
+  w.reqs = [{ name: "old.json", ageMs: 10 * 60_000, isStart: false }];
+  const real = w.reqs;
+  w.reqs = null; w.clock += 5000; w.calls = [];
+  t("tick: requests unreadable ⇒ 'unknown', zero reload / arm / drain", tick(st, b) === "unknown" && reloads(w) === 0 && !has(w, ".arm") && !has(w, ".drain"));
+  w.clock += 5000; w.calls = [];
+  t("tick: still unreadable ⇒ still unknown, still no action", tick(st, b) === "unknown" && reloads(w) === 0);
+  w.reqs = real; w.clock += 5000; w.calls = [];
+  const out = tick(st, b);
+  t(`tick: readable again ⇒ the stuck request drives the full recovery chain (${out})`, reloads(w) === 1 && has(w, ".drain"));
+}
+
+// --- L5-LV-SOURCE-UNKNOWN × owed work: an unreadable requests/ holds owed ready / arm / drain too (no exception) ---
+for (const stage of ["drain", "ready"] as const) {
+  const w = world(); const st = initialBridgeState(); const b = io(w);
+  tick(st, b);
+  if (stage === "drain") { w.onReload = () => { w.mirror = { tick: 1, vm: "vmQ" }; }; w.reqs = [{ name: "s.json", ageMs: 3000, isStart: true }]; w.failStep = "drain"; }
+  else { w.mirrorAdvances = false; w.onReload = () => { /* the bridge does not come back */ }; }
+  w.clock += 6000; w.calls = [];
+  tick(st, b);
+  const owed = st.owedAfterReload;
+  t(`owed ${stage}: set up (stage ${owed?.stage})`, owed !== null);
+  w.failStep = undefined; const real = w.reqs; w.reqs = null;
+  for (let k = 0; k < 2; k++) {
+    w.clock += RELOAD_MIN_MS + 1000; w.calls = []; // past the debounce: a reload would be allowed
+    const out = tick(st, b);
+    t(`owed ${stage} + requests unreadable (${k + 1}) ⇒ unknown; zero reload / arm / drain; obligation kept as it was`,
+      out === "unknown" && reloads(w) === 0 && !has(w, ".arm") && !has(w, ".drain") && st.owedAfterReload !== null && st.owedAfterReload?.stage === owed?.stage);
+  }
+  if (stage === "ready") { w.mirrorAdvances = true; w.mirror = { tick: 77, vm: "vmBack" }; }
+  w.reqs = real; w.clock += 5000; w.calls = [];
+  tick(st, b);
+  t(`owed ${stage}: readable again ⇒ the owed chain finishes (drain ran, obligation cleared)`, has(w, ".drain") && st.owedAfterReload === null);
+}
+
+// --- STEP-BOUND (small half): a child that ignores SIGTERM cannot hold the runner past its timeout ---
+{
+  const dir = mkdtempSync(path.join(os.tmpdir(), "tbs-kill-"));
+  const bin = path.join(dir, "tern"); writeFileSync(bin, "#!/bin/sh\ntrap '' TERM\nsleep 5\n"); chmodSync(bin, 0o755);
+  const t0 = Date.now(); const r = realTern({ TERN_BIN: bin })(["x"]); const ms = Date.now() - t0;
+  t(`runner: TERM-ignoring child ⇒ UNKNOWN within budget + 0.2s (${ms}ms)`, r.ok === false && ms < TERN_TIMEOUT_MS + 200);
 }
 
 console.log("PASS tern-bridge-sweep");

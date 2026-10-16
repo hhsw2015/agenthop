@@ -220,3 +220,14 @@ tern plugin link <repo>/tern/agenthop-agents-bridge     # 原地用(开发/本�
 - 去重键:`tui-sub-<start|stop>-<seat8>-<agent_id>`;`tui-perm-<seat8>-<tool_use_id|事件秒>`(Claude Code 2.1.293 不给 tool_use_id ⇒ 每席每秒至多一条权限消息,已知上限)。
 - 永远 exit 0;每次结果一行日志 `~/.agenthop/logs/subagent-hook.log`(`AGENTHOP_SUBAGENT_HOOK_LOG` 可覆盖)。
 - 时延:`bin.ts` 见 `hook subagent` 即只载 `hook-entry.js`(不载完整 CLI 模块图)。目标 **< 200ms / 次**。实测(2026-10-15,macOS arm64,bun --compile 单二进制,21 次中位):本钩子 ~90ms;拆分前 ~117–135ms;空程序编译底 ~18–36ms。余量主要是编译二进制解析整包的固定开销。
+
+## 12. #1115 T1b — TUI 席屏状态(`screen` 命令 + 发布状态机)
+
+- **谁读、读几个**:window 插件新增命令 `screen`(自己的 hook,与 mirror / drain 的 50ms 预算互不影响)。每次运行**只读一个 pane**(`cx.session:read`,约 23ms),在本窗口里 `classify.agent_for(program)` 认得的、未退出的 pane 之间轮转;`tern acp` 块的 program 是 "tern",不算。sweep 在每个到达桥的 tick 里与 mirror 一起触发它(约 5s 一次)。`screen` 失败或被禁用**不算停滞信号**,只会让屏状态变旧,读者据此判为 UNKNOWN。
+- **一个 VM 只看得见自己窗口**:有几个 window 就有几个插件 VM,各写 `tern-panes/screens/<vm>.json`(`{vm, window, ts, screens:{"<pane id>": {...}}}`),agents.json 里另带一份 `screens`(本 VM 的)。读者(`packages/bus/src/swarm/tern-screens.ts`)按 pane id 合并,两个 VM 报同一个 pane 时取 observed_at 新的那份。
+- **发布状态机**按上游 herdr 143bf5f `src/pane/agent_detection.rs`(详见 `UPSTREAM-DETECTION.md` §4,Apache-2.0),常量照搬,时钟用 Tern 的单调钟 `tern.now()`:新 pane 或 agent 变化 ⇒ 发布 unknown,宽限 3000ms;宽限到期的那一次也跳过;working → 普通 idle 先 hold,第 4 个连续 idle 样本或距第一个 ≥700ms 才发布 idle(本桥采样间隔是秒级,通常第二个 idle 样本就因 700ms 上限放行);visible_idle、转 working、转 blocked 立即发布;持续的 visible_blocker 每 ≥800ms 重新发布;`skip_state_update` 不发布并清 hold;visible_* 按状态屏蔽。
+- **PTY 字节**:上游在这个 commit **不**把新字节当 working 信号,只用来在 idle 且内容未变时跳过读屏。插件 VM 看不到 PTY 字节,所以本桥每次都读所选的那个 pane;状态结果不受影响。这是有意的差异,不是用屏哈希冒充的 working 信号。
+- **每条记录**(读者可见):`state / rule / agent / visible_idle / visible_blocker / visible_working`(已发布的值)、`observed_at`(确认该状态的最后一个样本的墙钟 epoch 秒)、`try / tried_at`(最后一次尝试:ok | grace | held | skip | unreadable | slow | error)。单调钟字段(宽限、hold、refresh 时刻)不对外写出。
+- **UNKNOWN**:读失败、classify 超出 5ms 预算或抛错、返回值不对,只改 try / tried_at,已发布的状态不动;从没成功分类过的 pane 没有 state。读者端:没有条目、文件读不出或格式不对、observed_at 早于新鲜度上限、或在未来(时钟回拨)⇒ unknown,**永不当 idle**。
+- **预算**:每次运行 = panes() 约 0.2ms + 一次 read 约 23ms + classify ≤5ms(`BUDGET_MS`,超了返回 slow)+ 记录与一次文件写入 ⇒ 远低于 50ms。
+- **接口**:按冻结接口 `classify(lines,title,program) → {state, rule, agent, skip_state_update, visible_idle, visible_blocker, visible_working}` 编写;T1a(Model Gateway)合并前,现有 classify 少的几个布尔一律当 false。

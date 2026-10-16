@@ -31,6 +31,10 @@ export const TICK_STALL_MS = 5_000;
 export const REQ_STUCK_MS = 2_000;
 export const RELOAD_MIN_MS = 60_000;
 export const READY_WAIT_MS = 4_000;
+/** [liveness] the ready wait is ALSO bounded by poll count (immune to a clock that stalls or goes back) and by a monotonic
+ *  deadline: ≤ READY_POLLS mirror probes, ≤ READY_WAIT_MS + one TERN_TIMEOUT_MS + one READY_POLL_MS of real time. */
+export const READY_POLL_MS = 250;
+export const READY_POLLS = Math.ceil(READY_WAIT_MS / READY_POLL_MS) + 1;
 export const TERN_TIMEOUT_MS = 3_000;
 export const ARM_CANCEL_MAX = 64; // bound on arm-cancel iterations (a sentinel that never reaches 0 must not loop forever)
 /** L5: after this many consecutive UNKNOWN ticks (tern not answering) the sweep probes only once per UNKNOWN_BACKOFF_MS. */
@@ -78,7 +82,7 @@ export type BridgeIO = {
   clearSentinel: () => boolean;          // delete sentinel.json so only the NEXT write can answer; false = could not (not ENOENT)
   schedule: () => { code: number; detail: string }; // arm-schedule.sh: 0 scheduled+verified, 2 refused (count>0), else failed
   readMirror: () => Mirror;              // agents.json tick+vm, or null (absent/torn/unparseable)
-  pendingRequests: () => PendingReq[];   // requests/*.json with their age
+  pendingRequests: () => PendingReq[] | null; // null = could not read (UNKNOWN), never "none pending"   // requests/*.json with their age
   nowMs: () => number;
   sleep: (ms: number) => void;           // synchronous wait (used only inside the bounded ready-wait)
   log: (line: string) => void;           // dispatcher log
@@ -174,6 +178,13 @@ const run = (io: BridgeIO, action: string): TernResult => io.tern(["ctl", "plugi
 export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolean): TickOutcome {
   if (!enabled) return "disabled";
   const now = io.nowMs();
+  // [liveness] the clock went BACK (wall-clock adjustment; production now uses a monotonic clock, this guards any io.nowMs):
+  // rebase every stored instant to now, so no interval reads as negative ⇒ never "throttled / debounced / not stalled" for the
+  // length of the jump. Effect is bounded: at most one interval of delay.
+  if (st.lastMirrorMs > now) st.lastMirrorMs = -Infinity;
+  if (st.lastTickChangeMs > now) st.lastTickChangeMs = now;
+  if (st.lastReloadMs > now) st.lastReloadMs = now;
+  if (st.lastDebouncedLogMs > now) st.lastDebouncedLogMs = -Infinity;
   // L5: once tern has not answered UNKNOWN_BACKOFF_AFTER ticks in a row, probe (and so log) at most once per UNKNOWN_BACKOFF_MS
   const every = st.unknownStreak >= UNKNOWN_BACKOFF_AFTER ? UNKNOWN_BACKOFF_MS : MIRROR_EVERY_MS;
   if (now - st.lastMirrorMs < every) return "throttled";
@@ -195,14 +206,22 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
   const mirror = io.readMirror();
   // agents.json absent / torn / without tick+vm ⇒ UNKNOWN too (FC-2): an unreadable file is not proof the bridge is stuck.
   if (mirror === null) { io.log("tern-bridge: UNKNOWN (agents.json unreadable or without tick/vm) — no action"); return "unknown"; }
+  // #1115 T1: one `screen` round (one pane read + classify, its own hook) per sweep tick that reached the bridge. Its outcome is
+  // not a liveness signal: a failed or disabled `screen` just lets the screen state go stale, which readers report as UNKNOWN.
+  run(io, "screen");
   if (mirror.tick !== st.lastTick) { st.lastTick = mirror.tick; st.lastTickChangeMs = now; }
   if (st.lastTickChangeMs === -Infinity) st.lastTickChangeMs = now; // first observation starts the stall clock
+
+  // L5-LV-SOURCE-UNKNOWN: an unreadable requests dir / request is UNKNOWN, not "nothing stuck" — hold BEFORE anything else,
+  // including owed ready/arm/drain work from an earlier reload: no arm, no drain, no reload; every obligation is kept.
+  const pending = io.pendingRequests();
+  if (pending === null) { io.log("tern-bridge: UNKNOWN (requests/ unreadable) — no action, obligations kept"); return "unknown"; }
 
   // owed work from an earlier successful reload (arm → drain) comes first, before any new reload decision
   if (st.owedAfterReload !== null) return finishAfterReload(st, io, mirror);
 
   // ③ health first: a positive stall signal from the bridge's own files (tern answered, so this is not UNKNOWN).
-  const stuck = io.pendingRequests().filter((r) => r.ageMs > REQ_STUCK_MS);
+  const stuck = pending.filter((r) => r.ageMs > REQ_STUCK_MS);
   const tickStalled = now - st.lastTickChangeMs > TICK_STALL_MS;
   if (tickStalled || stuck.length > 0) {
     const why = tickStalled ? `tick ${st.lastTick} not advancing ${now - st.lastTickChangeMs}ms` : `request stuck: ${stuck[0]!.name}`;
@@ -215,7 +234,7 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
       return "reload-debounced";
     }
     st.lastReloadMs = now;
-    return recover(st, io, why, stuck);
+    return recover(st, io, why, stuck, mirror);
   }
 
   // ② re-arm after a reload (new vm id) — once per vm.
@@ -234,8 +253,9 @@ export function runTernBridgeTick(st: BridgeState, io: BridgeIO, enabled: boolea
 }
 
 /** reload → wait ready → arm → drain (+drain-start). One control-log line whatever happens. */
-function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]): TickOutcome {
-  const before = io.readMirror();
+/** `before` = the mirror the stall was OBSERVED on (the caller just read it), not a fresh read: a fresh read that fails would leave
+ *  no baseline, and an unknown baseline must never make an unchanged mirror look "moved" (L5-SV-UNKNOWN-BASELINE). */
+function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[], before: Mirror): TickOutcome {
   const r = io.tern(["plugin", "reload"]);
   if (!r.ok) {
     io.controlLog(`tern-bridge reload FAILED (${why}): ${r.detail}`);
@@ -244,16 +264,16 @@ function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]
   }
   // ready = after a mirror run, the vm id changed or the tick moved. `tern plugin list` is NOT used: without a reachable daemon it
   // falls back to listing the plugins directory and still says "ready".
-  const deadline = io.nowMs() + READY_WAIT_MS;
+  const t0 = performance.now(); // monotonic: a wall-clock jump cannot stretch this wait
   let ready = false;
-  while (!ready) {
+  for (let poll = 0; poll < READY_POLLS && !ready; poll++) {
     if (run(io, "mirror").ok) {
       const after = io.readMirror();
       ready = movedSince(before, after);
       if (ready) { st.lastTick = after!.tick; st.lastTickChangeMs = io.nowMs(); }
     }
-    if (ready || io.nowMs() >= deadline) break;
-    io.sleep(250);
+    if (ready || poll === READY_POLLS - 1 || performance.now() - t0 >= READY_WAIT_MS) break;
+    io.sleep(READY_POLL_MS);
   }
   // From here a reload HAPPENED: whatever is left (ready, arm, drain) is an obligation kept across ticks until the WHOLE chain
   // succeeds, never re-entering the reload debounce (TBS-ARM-RETRY, coordinator ruling).
@@ -270,9 +290,10 @@ function recover(st: BridgeState, io: BridgeIO, why: string, stuck: PendingReq[]
 /** The post-reload obligation: arm sequence, then drain (+drain-start). A stopped arm keeps the obligation (no drain after a half
  *  arm) and is retried on the next tick WITHOUT another reload. Discharged only when arm completed and the drain trigger was sent. */
 /** The one readiness rule: after a reload the bridge is ready iff the mirror is readable and its vm or tick differs from the
- *  pre-reload baseline (a baseline that was unreadable makes any readable mirror count). */
+ *  pre-reload baseline. UNKNOWN baseline (null) ⇒ NOT ready: without a known "before", no change can be proven
+ *  (L5-SV-UNKNOWN-BASELINE, P1). */
 export function movedSince(baseline: Mirror, now: Mirror): boolean {
-  return now !== null && (baseline === null || now.vm !== baseline.vm || now.tick !== baseline.tick);
+  return now !== null && baseline !== null && (now.vm !== baseline.vm || now.tick !== baseline.tick);
 }
 
 function finishAfterReload(st: BridgeState, io: BridgeIO, now: Mirror): TickOutcome {
@@ -299,7 +320,7 @@ function finishAfterReload(st: BridgeState, io: BridgeIO, now: Mirror): TickOutc
         st.lastReloadMs = t;
         // the existing obligation (baseline, startStuck) stays in place until recover() REPLACES it with a new one — which it
         // does only once a reload actually ran; a failed / unanswered reload leaves this one intact, retried after the debounce
-        const out = recover(st, io, owed.why, owed.startStuck ? [{ name: "(owed drain-start)", ageMs: 0, isStart: true }] : []);
+        const out = recover(st, io, owed.why, owed.startStuck ? [{ name: "(owed drain-start)", ageMs: 0, isStart: true }] : [], owed.baseline);
         if (st.owedAfterReload === owed) owed.rounds = 0; // still the old one: the reload did not run; count again from here
         return out;
       }
@@ -331,7 +352,8 @@ export function realTern(env: NodeJS.ProcessEnv = process.env): TernRun {
   const bin = env.TERN_BIN || "tern";
   const sock = env.TERN_PANE_SOCKET || path.join(homedir(), "Library", "Application Support", "Tern", "daemon.sock");
   return (args) => {
-    const r = spawnSync(bin, args, { encoding: "utf8", timeout: TERN_TIMEOUT_MS, env: { ...env, TERN_PANE_SOCKET: sock } });
+    // SIGKILL: a short read-only ctl call has nothing to flush, and a child that ignores TERM would hold the sweep past its budget
+    const r = spawnSync(bin, args, { encoding: "utf8", timeout: TERN_TIMEOUT_MS, killSignal: "SIGKILL", env: { ...env, TERN_PANE_SOCKET: sock } });
     if (r.error) return { ok: false, detail: String(r.error.message ?? r.error) };
     if (r.status !== 0) return { ok: false, detail: `exit ${r.status}: ${(r.stderr || "").trim().slice(0, 160)}` };
     if (/"ok"\s*:\s*false/.test(r.stdout || "")) return { ok: false, detail: (r.stdout || "").trim().slice(0, 160) };
@@ -368,28 +390,33 @@ export function realClearSentinel(home: string): () => boolean {
 /** arm-schedule.sh runner. `bridgeDir` = the bridge checkout the dispatcher uses (AGENTHOP_BRIDGE_DIR, else repo tern/agenthop-agents-bridge). */
 export function realScheduler(env: NodeJS.ProcessEnv, bridgeDir: string): () => { code: number; detail: string } {
   return () => {
-    const r = spawnSync("bash", [path.join(bridgeDir, "arm-schedule.sh")], { encoding: "utf8", timeout: 15_000, env });
+    const r = spawnSync("bash", [path.join(bridgeDir, "arm-schedule.sh")], { encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL", env });
     if (r.error) return { code: -1, detail: String(r.error.message ?? r.error) };
     return { code: r.status ?? -1, detail: ((r.stdout || "") + (r.stderr || "")).trim().slice(0, 200) };
   };
 }
 
-export function realPendingRequests(home: string, nowMs: () => number): () => PendingReq[] {
+/** requests/*.json with their age. Only ENOENT means "not there" (no dir = none pending; a request gone = claimed meanwhile);
+ *  any other read error (EIO, EACCES, …) on the dir or a request ⇒ null = UNKNOWN (L5-LV-SOURCE-UNKNOWN). `fs` is a test seam. */
+export function realPendingRequests(home: string, nowMs: () => number,
+  fs: { readdir: (d: string) => string[]; read: (f: string) => string; mtimeMs: (f: string) => number } =
+    { readdir: (d) => readdirSync(d), read: (f) => readFileSync(f, "utf8"), mtimeMs: (f) => statSync(f).mtimeMs }): () => PendingReq[] | null {
+  const gone = (e: unknown) => (e as NodeJS.ErrnoException)?.code === "ENOENT";
   return () => {
     const dir = path.join(bridgeDir(home), "requests");
     let names: string[];
-    try { names = readdirSync(dir).filter((n) => n.endsWith(".json")); } catch { return []; }
+    try { names = fs.readdir(dir).filter((n) => n.endsWith(".json")); } catch (e) { return gone(e) ? [] : null; }
     const out: PendingReq[] = [];
     for (const n of names) {
+      const f = path.join(dir, n);
+      let raw: string; let mtime: number;
+      try { raw = fs.read(f); mtime = fs.mtimeMs(f); } catch (e) { if (gone(e)) continue; return null; }
+      let isStart = false;
       try {
-        const raw = readFileSync(path.join(dir, n), "utf8");
-        let isStart = false;
-        try {
-          const d = JSON.parse(raw) as unknown;
-          isStart = typeof d === "object" && d !== null && !Array.isArray(d) && (d as { op?: unknown }).op === "start";
-        } catch { isStart = false; }
-        out.push({ name: n, ageMs: nowMs() - statSync(path.join(dir, n)).mtimeMs, isStart });
-      } catch { /* claimed meanwhile: not pending */ }
+        const d = JSON.parse(raw) as unknown;
+        isStart = typeof d === "object" && d !== null && !Array.isArray(d) && (d as { op?: unknown }).op === "start";
+      } catch { isStart = false; }
+      out.push({ name: n, ageMs: nowMs() - mtime, isStart });
     }
     return out;
   };

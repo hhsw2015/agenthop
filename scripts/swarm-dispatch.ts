@@ -1963,8 +1963,8 @@ async function main(): Promise<void> {
     // the readers and gc use, so an explicit AGENTHOP_BRIDGE_HOME override cannot split scan/read from schedule.
     schedule: realScheduler(bridgeScriptEnv(process.env, BRIDGE_HOME),
       process.env.AGENTHOP_BRIDGE_DIR || path.join(SCRIPTS_DIR, "..", "tern", "agenthop-agents-bridge")),
-    pendingRequests: realPendingRequests(BRIDGE_HOME, () => Date.now()),
-    nowMs: () => Date.now(),
+    pendingRequests: realPendingRequests(BRIDGE_HOME, () => Date.now()), // request ages compare with file mtimes: wall clock
+    nowMs: () => performance.timeOrigin + performance.now(), // [liveness] monotonic: intervals cannot go negative on a clock change
     sleep: sleepSync,
     log,
     // audit line per reload: the control-log proper is a typed CAS store with no free-text kind, so reload events go to an append-only
