@@ -111,4 +111,31 @@ rmSync(home, { recursive: true, force: true });
   void size0; rmSync(h, { recursive: true, force: true });
 }
 
+
+// SE-WRITE-RESULT r9: short write + FAILED cut-back ⇒ the next append separates the half line, stays a failure, and only a later
+// clean append ends the episode; every whole record reads back
+{
+  const h = mkdtempSync(path.join(os.tmpdir(), "soakdirty-"));
+  const f = path.join(soakDir(h), "bridge-tick.jsonl");
+  t("dirty: a first whole record", appendEvidence(h, "bridge-tick.jsonl", b1));
+  let c = 0; const stuck = (fd: number, buf: Buffer, off: number) => (c++ === 0 ? writeSync(fd, buf, off, 8) : 0);
+  const eio = () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); };
+  const st = new Set<string>();
+  const ok1 = appendEvidence(h, "bridge-tick.jsonl", b2, stuck, eio);
+  t("dirty: short write + cut-back EIO ⇒ false, report owed", ok1 === false && shouldReportEvidenceFailure(st, "bridge-tick.jsonl", ok1));
+  commitEvidenceReport(st, "bridge-tick.jsonl", true);
+  t("dirty: the half line is really there (8 bytes, no newline)", !readFileSync(f, "utf8").endsWith("\n"));
+  const ok2 = appendEvidence(h, "bridge-tick.jsonl", { ...b3, outcome: "recovered" });
+  t("dirty: the next normal append returns false (episode NOT ended by it)", ok2 === false && !shouldReportEvidenceFailure(st, "bridge-tick.jsonl", ok2) && st.has("bridge-tick.jsonl"));
+  const lines1 = readFileSync(f, "utf8").split("\n").filter(Boolean);
+  const parsed1 = lines1.flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } });
+  t("dirty: that record is on its own line and parses (the half line is isolated)", parsed1.some((r) => r.outcome === "recovered") && readFileSync(f, "utf8").endsWith("\n"));
+  const ok3 = appendEvidence(h, "bridge-tick.jsonl", b4);
+  t("dirty: a later append at a clean boundary ⇒ true, the episode ends", ok3 === true && !shouldReportEvidenceFailure(st, "bridge-tick.jsonl", ok3) && !st.has("bridge-tick.jsonl"));
+  const all = readFileSync(f, "utf8").split("\n").filter(Boolean);
+  t("dirty: every line except the one isolated half line parses", all.filter((l) => { try { JSON.parse(l); return false; } catch { return true; } }).length === 1);
+  t("dirty: a clean file never gets a stray separator (positive control)", (() => { const h2 = mkdtempSync(path.join(os.tmpdir(), "soakclean-")); appendEvidence(h2, "bridge-tick.jsonl", b1); appendEvidence(h2, "bridge-tick.jsonl", b2); const x = readFileSync(path.join(soakDir(h2), "bridge-tick.jsonl"), "utf8"); rmSync(h2, { recursive: true, force: true }); return x.split("\n").length === 3 && !x.includes("\n\n"); })());
+  rmSync(h, { recursive: true, force: true });
+}
+
 console.log("PASS soak-evidence");

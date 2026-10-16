@@ -8,7 +8,7 @@
  * episode — committed only when that S19 was delivered (a failed report stays owed); the next successful write re-arms it.
  * Pure record builders + one tiny appender.
  */
-import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readSync, writeSync } from "node:fs";
 import path from "node:path";
 
 export type InboxOldestRecord = { ts: string; box: string; oldest_age_s: number | null; live_owner: boolean | null; reason?: string; owner_reason?: string };
@@ -43,13 +43,14 @@ export function bridgeTickRecord(nowMs: number, tick: number | null, prevTick: n
 export const soakDir = (home: string) => path.join(home, ".agenthop", "swarm", "soak");
 
 /** Append one JSON line, bounded (SE-APPEND-BOUND): the target must be a regular file (or absent ⇒ created); it is opened
- *  O_WRONLY|O_APPEND|O_NONBLOCK|O_NOFOLLOW — a FIFO / symlink / device is refused, never waited on — and the opened descriptor is
+ *  O_RDWR|O_APPEND|O_NONBLOCK|O_NOFOLLOW (read: its last byte, for the line boundary) — a FIFO / symlink / device is refused, never waited on — and the opened descriptor is
  *  fstat-checked to be the same regular file that was lstat-ed (no swap between the check and the open). Never throws; false = not
  *  written (the caller reports it). Constant work per call: one lstat, one open, one fstat, one write. */
 export const APPEND_MAX_WRITES = 8;
 type Writer = (fd: number, buf: Buffer, off: number, len: number) => number;
 export function appendEvidence(home: string, file: "inbox-oldest.jsonl" | "bridge-tick.jsonl", rec: object,
-  write: Writer = (fd, buf, off, len) => writeSync(fd, buf, off, len)): boolean {
+  write: Writer = (fd, buf, off, len) => writeSync(fd, buf, off, len),
+  truncate: (fd: number, size: number) => void = (fd, size) => ftruncateSync(fd, size)): boolean {
   let fd: number | null = null;
   try {
     mkdirSync(soakDir(home), { recursive: true, mode: 0o700 });
@@ -57,12 +58,20 @@ export function appendEvidence(home: string, file: "inbox-oldest.jsonl" | "bridg
     let before: { ino: number; dev: number } | null = null;
     try { const st = lstatSync(f); if (!st.isFile()) return false; before = { ino: st.ino, dev: st.dev }; }
     catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return false; }
-    fd = openSync(f, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW, 0o600);
+    fd = openSync(f, fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW, 0o600);
     const st = fstatSync(fd);
     if (!st.isFile() || (before !== null && (st.ino !== before.ino || st.dev !== before.dev))) return false;
-    // SE-WRITE-RESULT: true only when the WHOLE line is written (bounded continuation of short writes); a line that cannot be
-    // finished is cut back off the file (best effort) so no half record stays behind, and the call is a failure
-    const buf = Buffer.from(`${JSON.stringify(rec)}\n`, "utf8");
+    // SE-WRITE-RESULT r9: the file's line boundary is checked on EVERY append from its last byte (no memory of earlier calls, so
+    // it holds across restarts). A file that does not end in "\n" holds a half line (a short write whose cut-back failed): this call
+    // writes a separating "\n" first, so the new record parses on its own, and still returns false — the failure episode (owed S19)
+    // ends only on a later append that finds a clean boundary and writes a whole line.
+    let dirty = false;
+    if (st.size > 0) {
+      const last = Buffer.alloc(1);
+      if (readSync(fd, last, 0, 1, st.size - 1) !== 1) return false;
+      dirty = last[0] !== 0x0a;
+    }
+    const buf = Buffer.from(`${dirty ? "\n" : ""}${JSON.stringify(rec)}\n`, "utf8");
     let off = 0;
     for (let n = 0; off < buf.length && n < APPEND_MAX_WRITES; n++) {
       let w: number;
@@ -70,8 +79,8 @@ export function appendEvidence(home: string, file: "inbox-oldest.jsonl" | "bridg
       if (!(w > 0)) break;
       off += w;
     }
-    if (off === buf.length) return true;
-    try { ftruncateSync(fd, st.size); } catch { /* the reader skips a line that does not parse */ }
+    if (off === buf.length) return !dirty;
+    try { truncate(fd, st.size); } catch { /* the reader skips a line that does not parse */ }
     return false;
   } catch { return false; }
   finally { if (fd !== null) try { closeSync(fd); } catch { /* closed */ } }
